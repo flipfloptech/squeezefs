@@ -4167,7 +4167,10 @@ impl KvMetaBackend {
                         explicit.len()
                     };
                     let worst = self.leased_puts_worst_len(slots)?;
-                    Some(self.admit_user_budget(&self.ring, 0, worst).await?)
+                    // The park pass is dropped with the admission's use
+                    // here: a control entry, not a user batch (its own
+                    // durable write is the verb's terminal outcome).
+                    Some(self.admit_user_budget(&self.ring, 0, worst).await?.0)
                 }
             }
         };
@@ -11673,6 +11676,24 @@ impl KvMetaBackend {
             self.ckpt_wake.notify_one();
             return Ok(());
         }
+        // PR 8 (review round 1, Issue 18): the leave of a PARKED symmetric
+        // appender is REFUSED, loud — its region may already be under a
+        // successor's recovery, so nothing more is admitted into its ring:
+        // the door closes on the committers parked at it (they never
+        // landed — `EIO`), the held acks of LANDED entries are released
+        // (in ring 0, replayable), and the page stays `Live` for the next
+        // open of this identity to recover as own residue. PR 10 owns the
+        // leave-vs-recovery interplay; this is the boundary it inherits.
+        if crate::park_gate::is_parked() && self.appenders.is_some() {
+            crate::park_gate::close_at_leave();
+            return Err(KvError::Busy(format!(
+                "{}: this symmetric appender is PARKED (its membership lease is being \
+                 reclaimed under the successor's grace) — the clean leave is refused: the \
+                 parked committers are failed, the landed entries' acks released, and the \
+                 appender page stays Live for the next open's own-residue recovery",
+                self.path.display()
+            )));
+        }
         // PR M6: make parked pending-times refinements durable while the
         // write gate is still open (best-effort — they are µs-grade time
         // polish; a failing volume loses them like a kill-9 would).
@@ -14245,6 +14266,13 @@ struct QueuedTx {
     /// flush, so no admitted tx can land after the flush's snapshot.
     /// `None` on an unarmed mount.
     _door: Option<super::slot_lease::DoorPass>,
+    /// PR 8 (review round 1, Issue 8): the park gate's pass the batch took
+    /// at `admit_user_budget`, owned by THIS entry to its terminal outcome
+    /// — dropped at fan-out, AFTER the lane's `hold_acks` — so the parker's
+    /// in-flight count is exactly the commits whose acks the park holds
+    /// (the Dekker pair `park_core` models is what production relies on).
+    /// `None` until admitted.
+    _park_pass: Option<Arc<crate::park_gate::AdmissionPass>>,
     /// Fan-out channel. A dead receiver (dropped committer future) is
     /// harmless — semantically identical to timeout-fires-after-commit.
     done: squeezefs_ipc::sqz_channel::oneshot::Sender<std::result::Result<(), KvError>>,
@@ -16432,6 +16460,7 @@ impl KvMetaBackend {
                 site,
                 _guards: tx.guards,
                 _door: door,
+                _park_pass: None,
                 done,
             },
             rx,
@@ -16875,7 +16904,13 @@ impl KvMetaBackend {
         // rung moved verbatim from the per-tx pipeline.
         let t_adm = std::time::Instant::now();
         match self.admit_user_budget(&s.ring, s.region, total_len).await {
-            Ok(adm) => s.admission = Some(adm),
+            Ok((adm, pass)) => {
+                s.admission = Some(adm);
+                let pass = Arc::new(pass);
+                for q in s.entries.iter_mut() {
+                    q._park_pass = Some(Arc::clone(&pass));
+                }
+            }
             Err(e) => {
                 self.fail_batch(s, &e);
                 return;
@@ -17062,7 +17097,13 @@ impl KvMetaBackend {
                     .admit_user_budget(&s.ring, s.region, survivors_len)
                     .await
                 {
-                    Ok(adm) => s.admission = Some(adm),
+                    Ok((adm, pass)) => {
+                        s.admission = Some(adm);
+                        let pass = Arc::new(pass);
+                        for q in s.entries.iter_mut() {
+                            q._park_pass = Some(Arc::clone(&pass));
+                        }
+                    }
                     Err(e) => {
                         self.fail_batch(s, &e);
                         return;
@@ -17618,7 +17659,13 @@ impl KvMetaBackend {
         ring: &JournalRing,
         region: u32,
         len: u64,
-    ) -> std::result::Result<super::journal_core::Admission, KvError> {
+    ) -> std::result::Result<
+        (
+            super::journal_core::Admission,
+            crate::park_gate::AdmissionPass,
+        ),
+        KvError,
+    > {
         // PR 8 (design-symmetric-metadata §5.5.3): the symmetric
         // appender's PARK is a distinct PRE-admission state — a parked
         // pass waits here, before ring admission, holding nothing the
@@ -17626,15 +17673,18 @@ impl KvMetaBackend {
         // (the D1.b escalation cannot turn a legitimate park into a
         // fail-stop; `T_park_max` > `SQUEEZEFS_TIMEOUT` by construction).
         // One relaxed load on every mount that never parks. The pass is
-        // held to the batch's terminal outcome (the lane's `hold_acks`).
-        let _park_pass = crate::park_gate::pre_admission()
+        // RETURNED with the admission and owned by the batch's queue
+        // entries to their terminal outcome (`QueuedTx::_park_pass`,
+        // dropped at fan-out after the lane's `hold_acks` — review round
+        // 1, Issue 8).
+        let park_pass = crate::park_gate::pre_admission()
             .await
             .map_err(|e| KvError::Io(crate::error::SqueezefsError::Io(e)))?;
         let threshold = self.timeout_threshold;
         let mut parked_since: Option<std::time::Instant> = None;
         loop {
             if let Some(adm) = ring.try_admit(len, AdmissionClass::User) {
-                return Ok(adm);
+                return Ok((adm, park_pass));
             }
             self.stalls.fetch_add(1, Ordering::Relaxed);
             if let Some(r) = self.appenders.as_ref().and_then(|a| a.region(region)) {
@@ -17642,7 +17692,7 @@ impl KvMetaBackend {
             }
             let notified = ring.space_notified();
             if let Some(adm) = ring.try_admit(len, AdmissionClass::User) {
-                return Ok(adm);
+                return Ok((adm, park_pass));
             }
             // Re-check liveness flags after each park so shutdown/failure
             // cannot strand a parked pass (its queued txs fail out below).

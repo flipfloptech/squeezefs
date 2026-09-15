@@ -56,8 +56,8 @@ use super::superblock::ExtentRef;
 use super::KvError;
 use crate::block_grant::{BlockGrant, BlockGrantLedger, CarveOutcome};
 use crate::data_alloc_bitmap::DataAllocBitmap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 // ---------------------------------------------------------------------------
 // Keys and records
@@ -362,19 +362,45 @@ pub struct AllocLeaseGrant {
 // The holder's RAM: one holding per data volume this mount leases
 // ---------------------------------------------------------------------------
 
+/// One queued bitmap mutation awaiting its ring write, in RAM order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QueuedDelta {
+    block: u64,
+    set: bool,
+}
+
 /// One data volume's allocation lease as this mount HOLDS it: the bitmap,
-/// the open grants, the pages' home.
+/// the open grants, the pages' home — and **the ordering law's one lock**
+/// (review round 1, Issue 2): every bit mutation (a carve's SET, a
+/// return's CLEAR, `finish_free`'s CLEAR) moves the bit AND queues its
+/// delta under `mutations`, in one critical section, so the queue's order
+/// IS the RAM order; one drainer at a time (`drain`) journals the queue
+/// head-first into the HOME volume's ring, so record-seq order is queue
+/// order — and the replay's per-key LWW fold by seq reads the RAM order.
+/// A CLEAR is journaled at the instant of its decision: `finish_free` is
+/// synchronous (the reclaim worker's thread, the grace harvest), so it
+/// queues under the lock and kicks the single-flight journaler
+/// (`kick_journaler`); a carve drains the queue itself and answers only
+/// once its SET (and everything queued before it) is durable.
 pub struct AllocHolding {
     pub vol_tag: u64,
     pub term: u64,
     pub home_vol: u16,
+    /// The HOME backend — the one whose ring the deltas journal into and
+    /// whose device carries the pages; `write_data_alloc_pages` acts only
+    /// on the backend this points at (review round 1, Issue 3).
+    home: Weak<KvMetaBackend>,
     pub bitmap: DataAllocBitmap,
     pub ledger: BlockGrantLedger,
     /// The pages' extents on the home volume (device offsets).
     pub pages: Vec<ExtentRef>,
-    /// Terminal frees whose bit was cleared in RAM at `finish_free` and
-    /// whose CLEAR delta the next checkpoint journals.
-    pending_clears: parking_lot::Mutex<Vec<u64>>,
+    /// The ordered mutation stream: pushed under this lock together with
+    /// the bit it records.
+    mutations: parking_lot::Mutex<std::collections::VecDeque<QueuedDelta>>,
+    /// One drainer at a time journals the stream head-first.
+    drain: crate::sqz_sync::SqzMutex<()>,
+    /// The single-flight latch of the `finish_free` journaler task.
+    journaler_running: AtomicBool,
     /// Deltas journaled (`data_alloc_bitmap_{set,clear}_bits` count the
     /// bits; these count the entries).
     pub deltas_journaled: AtomicU64,
@@ -401,31 +427,140 @@ impl AllocHolding {
         self.pages.first().map_or(0, |e| e.start)
     }
 
-    /// `finish_free` cleared `block` in RAM; the delta is journaled at the
-    /// holder's next checkpoint.
-    pub fn note_finish_free(&self, block: u64) -> bool {
-        if self.bitmap.clear(block) {
-            self.pending_clears.lock().push(block);
-            true
-        } else {
-            false
+    /// `true` ⇔ `be` is this holding's home backend.
+    pub fn is_homed_on(&self, be: &KvMetaBackend) -> bool {
+        std::ptr::eq(self.home.as_ptr(), be)
+    }
+
+    /// **Carve for `writer`** (the holder's `BlockGrant`): bits SET and
+    /// their deltas queued in one critical section. The caller drains
+    /// (`KvMetaBackend::drain_deltas`) before it answers.
+    pub fn carve(&self, writer: &str, want: u64, floor: u64, held_unconsumed: u64) -> CarveOutcome {
+        let mut q = self.mutations.lock();
+        let outcome = self
+            .ledger
+            .carve(&self.bitmap, writer, want, floor, held_unconsumed);
+        if let CarveOutcome::Granted(g) = &outcome {
+            q.extend((g.start..g.end()).map(|block| QueuedDelta { block, set: true }));
+        }
+        outcome
+    }
+
+    /// **Return `range` of `writer`'s grant**: bits CLEAR and their deltas
+    /// queued in one critical section (`None` = not the writer's).
+    pub fn return_blocks(&self, writer: &str, range: BlockGrant) -> Option<u64> {
+        let mut q = self.mutations.lock();
+        let cleared = self.ledger.return_blocks(&self.bitmap, writer, range)?;
+        q.extend((range.start..range.end()).map(|block| QueuedDelta { block, set: false }));
+        Some(cleared)
+    }
+
+    /// `finish_free` cleared `block`: the bit clears and its CLEAR is
+    /// queued in one critical section, then the journaler is kicked — the
+    /// delta lands NOW, in order, with no checkpoint in its path. `false`
+    /// ⇔ the bit was already clear (a double free's shape).
+    pub fn note_finish_free(self: &Arc<Self>, block: u64) -> bool {
+        let was_set = {
+            let mut q = self.mutations.lock();
+            let was = self.bitmap.clear(block);
+            if was {
+                q.push_back(QueuedDelta { block, set: false });
+            }
+            was
+        };
+        if was_set {
+            self.kick_journaler();
+        }
+        was_set
+    }
+
+    /// Revoke a dead writer's grants (the death record's arm — the bits
+    /// stay SET for the quarantine).
+    pub fn revoke_dead(&self, writer: &str) -> Vec<BlockGrant> {
+        self.ledger.revoke_dead(writer)
+    }
+
+    /// Deltas queued and not yet journaled (the tests' witness that a
+    /// CLEAR waits for no checkpoint).
+    pub fn queued_deltas(&self) -> usize {
+        self.mutations.lock().len()
+    }
+
+    /// Take the queue's head — up to `max` deltas, in order.
+    fn take_queued(&self, max: usize) -> Vec<QueuedDelta> {
+        let mut q = self.mutations.lock();
+        let n = q.len().min(max);
+        q.drain(..n).collect()
+    }
+
+    /// Put an undrained chunk BACK at the head (a failed ring write —
+    /// order preserved: nothing after it was journaled meanwhile, since
+    /// the drainer holds `drain`).
+    fn requeue_front(&self, chunk: Vec<QueuedDelta>) {
+        let mut q = self.mutations.lock();
+        for d in chunk.into_iter().rev() {
+            q.push_front(d);
         }
     }
 
-    /// Take the pending clears.
-    pub fn take_pending_clears(&self) -> Vec<u64> {
-        std::mem::take(&mut *self.pending_clears.lock())
-    }
-
-    /// Pending clears.
-    pub fn pending_clears(&self) -> usize {
-        self.pending_clears.lock().len()
+    /// The single-flight journaler: one detached task drains the stream
+    /// into the home ring; a kick while one runs is absorbed — the running
+    /// task releases its latch and re-checks the queue before it exits,
+    /// so a delta queued after its last drain is journaled by it or by
+    /// the kick that took the latch, never left waiting.
+    fn kick_journaler(self: &Arc<Self>) {
+        if self
+            .journaler_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let me = Arc::clone(self);
+        crate::meta_exec::spawn_meta("data_alloc_delta_journaler", async move {
+            // Releases the latch on every exit, a contained panic included.
+            struct Latch<'a>(&'a AtomicBool, bool);
+            impl Drop for Latch<'_> {
+                fn drop(&mut self) {
+                    if self.1 {
+                        self.0.store(false, Ordering::Release);
+                    }
+                }
+            }
+            let mut latch = Latch(&me.journaler_running, true);
+            let Some(home) = me.home.upgrade() else {
+                return;
+            };
+            loop {
+                if let Err(e) = home.drain_deltas(&me).await {
+                    log::error!(
+                        "data allocation bitmap of volume {:#018x}: journaling the queued \
+                         deltas failed ({e}); {} delta(s) stay queued for the next drainer \
+                         (the checkpoint's page step, the next grant)",
+                        me.vol_tag,
+                        me.queued_deltas()
+                    );
+                    return;
+                }
+                latch.1 = false;
+                me.journaler_running.store(false, Ordering::Release);
+                if me.queued_deltas() == 0
+                    || me
+                        .journaler_running
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                {
+                    return;
+                }
+                latch.1 = true;
+            }
+        });
     }
 }
 
 static HOLDINGS: once_cell::sync::Lazy<scc::HashMap<u64, Arc<AllocHolding>>> =
     once_cell::sync::Lazy::new(scc::HashMap::new);
-/// Holdings registered (the terminal free's one-load probe).
+/// Holdings registered (the terminal free's one acquire-load probe).
 static HOLDINGS_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// `true` ⇔ this process holds at least one allocation lease.
@@ -465,8 +600,9 @@ pub fn test_clear_holdings() {
 }
 
 /// `finish_free`'s hook (the block allocator's terminal free): clear the
-/// bit on the holder of `vol_tag` if this process holds its lease. One
-/// probe of an empty map on every unarmed mount.
+/// bit on the holder of `vol_tag` if this process holds its lease and
+/// journal the CLEAR at once, in order. One probe of an empty map on
+/// every unarmed mount (behind `holds_any`'s one acquire load).
 pub fn note_finish_free(vol_tag: u64, block: u64) -> bool {
     holding(vol_tag).is_some_and(|h| h.note_finish_free(block))
 }
@@ -541,13 +677,77 @@ pub fn install_coordinator_volume(vol0: Option<&Arc<KvMetaBackend>>) {
     COORDINATOR.store(vol0.map(|v| Arc::new(Arc::downgrade(v))));
 }
 
+/// One metadata volume's heap geometry as the manager validates a wire
+/// bitmap ref against it (review round 1, Issue 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeHeap {
+    pub heap_start: u64,
+    pub heap_len: u64,
+    pub node_size: u64,
+}
+
+/// The routed set's per-volume heap geometry, by ordinal — installed at
+/// the arm (the manager's derived-state witness for `home_vol` and every
+/// bitmap ref a wire frame carries).
+static SET_HEAPS: once_cell::sync::Lazy<arc_swap::ArcSwap<Vec<VolumeHeap>>> =
+    once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(Vec::new()));
+
+/// The set's volume heaps in ordinal order (empty on an unarmed mount —
+/// the manager's own volume is then the one witness).
+pub fn set_heaps() -> Arc<Vec<VolumeHeap>> {
+    SET_HEAPS.load_full()
+}
+
+/// Install the set's heap geometry (the arm; `Vec::new()` withdraws it).
+pub fn install_set_heaps(heaps: Vec<VolumeHeap>) {
+    SET_HEAPS.store(Arc::new(heaps));
+}
+
+/// Every data volume's block count this node DERIVES from its allocators
+/// (capacity ÷ block size), by `vol_tag` — the witness a wire `blocks`
+/// is validated against (review round 1, Issue 6). Registered by the
+/// allocation arm; the contracts register their data volume as the seam.
+static DATA_VOLUME_BLOCKS: once_cell::sync::Lazy<scc::HashMap<u64, u64>> =
+    once_cell::sync::Lazy::new(scc::HashMap::new);
+
+/// Register data volume `vol_tag`'s derived block count.
+pub fn register_data_volume_blocks(vol_tag: u64, blocks: u64) {
+    let _ = DATA_VOLUME_BLOCKS.upsert_sync(vol_tag, blocks);
+}
+
+/// The derived block count of data volume `vol_tag` (`None` = not a data
+/// volume of this set as this node knows it).
+pub fn data_volume_blocks(vol_tag: u64) -> Option<u64> {
+    DATA_VOLUME_BLOCKS.read_sync(&vol_tag, |_, v| *v)
+}
+
+/// The allocators the arm registered, by `vol_tag` — the quarantine sink
+/// a death record's revoke reaches (`record_death` → `revoke_dead` →
+/// `data_custody::quarantine_offsets`).
+static ALLOCATORS: once_cell::sync::Lazy<
+    scc::HashMap<u64, std::sync::Weak<crate::block_allocator::BlockAllocator>>,
+> = once_cell::sync::Lazy::new(scc::HashMap::new);
+
+/// The registered allocator of data volume `vol_tag`, if live.
+pub fn allocator_for(vol_tag: u64) -> Option<Arc<crate::block_allocator::BlockAllocator>> {
+    ALLOCATORS.read_sync(&vol_tag, |_, w| w.upgrade()).flatten()
+}
+
+/// `T_park_max` for a failover bound and the S6 clocks in force: the
+/// GRACE term is `LeaseClocks::grace` (the owner-failover window) read
+/// off the derivation (review round 1, Issue 16).
+pub fn t_park_max_for(failover_bound_ms: u64, clocks: &crate::membership::LeaseClocks) -> u64 {
+    crate::park_gate::t_park_max_for(failover_bound_ms, clocks)
+}
+
 /// **Arm the symmetric ROLES of a routed set** (the routed open's last
 /// step): when the slot-0 volume armed the plane, it is the coordinator's
 /// home (KD-SYM-2) and this mount is a symmetric APPENDER homed there
 /// (`home_volume` = the slot-0 volume's ordinal until PR 12's join ladder
 /// chooses a home) whose `T_self` action is the PARK, bounded by
-/// `T_park_max = manager_failover_bound_ms + T_owner` (the S6 grace
-/// window is one owner TTL). Inert on an unarmed set.
+/// `T_park_max = manager_failover_bound_ms + grace` (the S6 owner-failover
+/// window, `LeaseClocks::grace`). The set's heap geometry is installed for
+/// the manager's wire validation. Inert on an unarmed set.
 pub fn arm_symmetric_roles(routed: &crate::meta_backend::RoutedMetaBackend) {
     let slot0 = routed.route_ino(1).0;
     let Some(vol0) = routed.volumes.get(slot0) else {
@@ -557,18 +757,40 @@ pub fn arm_symmetric_roles(routed: &crate::meta_backend::RoutedMetaBackend) {
         return;
     }
     install_coordinator_volume(Some(vol0));
-    let failover = vol0.appender_stats().map_or(0, |s| s.failover_bound_ms);
-    let grace_ms = crate::membership::LeaseClocks::derive(std::time::Duration::ZERO)
-        .map(|c| c.t_owner.as_millis() as u64)
-        .unwrap_or(0);
-    crate::park_gate::arm_symmetric_appender(
-        slot0 as u16,
-        crate::park_gate::t_park_max_ms(failover, grace_ms),
+    install_set_heaps(
+        routed
+            .volumes
+            .iter()
+            .map(|v| VolumeHeap {
+                heap_start: v.superblock().heap.start,
+                heap_len: v.superblock().heap.len,
+                node_size: v.node_cache().config().layout.node_size() as u64,
+            })
+            .collect(),
     );
+    let failover = vol0.appender_stats().map_or(0, |s| s.failover_bound_ms);
+    let t_park_max = match crate::membership::LeaseClocks::derive(std::time::Duration::ZERO) {
+        Ok(clocks) => t_park_max_for(failover, &clocks),
+        Err(_) => failover,
+    };
+    crate::park_gate::arm_symmetric_appender(slot0 as u16, t_park_max);
 }
 
-/// Disarm the roles (the leave / the plane's drop).
+/// Disarm the roles (the leave / the plane's drop): the holdings this
+/// process kept are forgotten (their pages were written by the final
+/// checkpoint — the lease record itself SURVIVES a clean leave, the next
+/// open of the same identity re-holds it), the kept replay window of the
+/// home volume is dropped, the allocators unregistered.
 pub fn disarm_symmetric_roles() {
+    if let Some(vol0) = COORDINATOR.load().as_ref().and_then(|w| w.upgrade()) {
+        crate::data_alloc_bitmap::drop_replayed_deltas_for(vol0.device_path());
+    }
+    for h in holdings() {
+        drop_holding(h.vol_tag);
+        crate::block_grant::uninstall_free_target(h.vol_tag);
+    }
+    ALLOCATORS.clear_sync();
+    install_set_heaps(Vec::new());
     install_coordinator_volume(None);
     crate::park_gate::disarm_symmetric_appender();
 }
@@ -658,13 +880,88 @@ impl KvMetaBackend {
         }
     }
 
+    /// **The service edge's screen for `AllocLeaseAcquire`** (review round
+    /// 1, Issue 6 — PR 3/4's bounded-execution law): `blocks` must equal a
+    /// data volume this node knows (its derived block count — a peer's
+    /// integer is never the successor's allocation authority), `home_vol`
+    /// must name a volume of the set. A failed screen is `Rejected`
+    /// (`STATUS_REJECTED`, `manager_verb_rejected`), nothing written.
+    pub fn screen_alloc_lease_acquire(
+        &self,
+        vol_tag: u64,
+        home_vol: u16,
+        blocks: u64,
+    ) -> Result<(), KvError> {
+        let Some(known) = data_volume_blocks(vol_tag) else {
+            return Err(KvError::Rejected(format!(
+                "{}: AllocLeaseAcquire names data volume {vol_tag:#018x}, which this set's \
+                 allocation arm does not know — REJECTED (manager_verb_rejected)",
+                self.device_path().display()
+            )));
+        };
+        if blocks == 0 || blocks > known {
+            return Err(KvError::Rejected(format!(
+                "{}: AllocLeaseAcquire for data volume {vol_tag:#018x} asks for {blocks} \
+                 blocks; the volume has {known} — a wire integer is never an allocation \
+                 authority — REJECTED (manager_verb_rejected)",
+                self.device_path().display()
+            )));
+        }
+        let heaps = set_heaps();
+        let width = if heaps.is_empty() { 1 } else { heaps.len() };
+        if usize::from(home_vol) >= width {
+            return Err(KvError::Rejected(format!(
+                "{}: AllocLeaseAcquire names home volume {home_vol} of a {width}-volume set — \
+                 REJECTED (manager_verb_rejected)",
+                self.device_path().display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// **The service edge's screen for `AllocLeaseBitmap`** (review round
+    /// 1, Issue 6 — the PR 4 root-witness discipline): every ref names a
+    /// volume of the set, lies inside that volume's heap, is node-aligned
+    /// (a whole number of nodes from the heap's start, a whole number of
+    /// nodes long, non-empty, no overflow), and the refs together hold at
+    /// least the region the record's `blocks` need and no more than the
+    /// claim that region rounds up to. A failed screen is `Rejected`,
+    /// nothing written.
+    pub fn screen_alloc_lease_bitmap(
+        &self,
+        blocks: u64,
+        bitmap: &[(u16, ExtentRef)],
+    ) -> Result<(), KvError> {
+        let heaps = set_heaps();
+        let own = VolumeHeap {
+            heap_start: self.superblock().heap.start,
+            heap_len: self.superblock().heap.len,
+            node_size: self.node_cache().config().layout.node_size() as u64,
+        };
+        let heap_of = |vol: u16| -> Option<VolumeHeap> {
+            if heaps.is_empty() {
+                (vol == 0).then_some(own)
+            } else {
+                heaps.get(usize::from(vol)).copied()
+            }
+        };
+        screen_bitmap_refs(blocks, bitmap, heap_of).map_err(|why| {
+            KvError::Rejected(format!(
+                "{}: AllocLeaseBitmap {why} — REJECTED (manager_verb_rejected)",
+                self.device_path().display()
+            ))
+        })
+    }
+
     /// **`AllocLeaseAcquire`** on volume 0's manager (§5.5.1's ordering
     /// law): a first-come grant at term 1; the holder's own ask answers
-    /// `already`; a LIVE holder refuses everyone else (`Busy` — the
-    /// requester allocates through grants from that holder); a DEAD holder
-    /// (`dead_member:` present) is succeeded ONLY once
-    /// `recovered:{holder, home_vol}` exists — before it the ask is
-    /// DEFERRED (`GrantDeferred`, the requester retries); the successor's
+    /// `already` WITH the record's pages and block count (crash row 8 — a
+    /// successor that died before its copy retries and still learns what
+    /// to copy; review round 1, Issue 14); a LIVE holder refuses everyone
+    /// else (`Busy` — the requester allocates through grants from that
+    /// holder); a DEAD holder (`dead_member:` present) is succeeded ONLY
+    /// once `recovered:{holder, home_vol}` exists — before it the ask is
+    /// DEFERRED (`LeaseDeferred`, the requester retries); the successor's
     /// record names the predecessor's pages until it publishes its copy
     /// ([`Self::manager_alloc_lease_bitmap`]).
     pub async fn manager_alloc_lease_acquire(
@@ -677,6 +974,10 @@ impl KvMetaBackend {
         blocks: u64,
     ) -> Result<AllocLeaseGrant, KvError> {
         let set = self.manager_gate(false)?;
+        if let Err(e) = self.screen_alloc_lease_acquire(vol_tag, home_vol, blocks) {
+            set.verbs.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err(e);
+        }
         let prior = self.alloc_lease_record(vol_tag).await?;
         let (term, predecessor_bitmap, predecessor_blocks) = match &prior {
             None => (1, Vec::new(), 0),
@@ -685,8 +986,8 @@ impl KvMetaBackend {
                 return Ok(AllocLeaseGrant {
                     term: rec.term,
                     already: true,
-                    predecessor_bitmap: Vec::new(),
-                    predecessor_blocks: 0,
+                    predecessor_bitmap: rec.bitmap.clone(),
+                    predecessor_blocks: rec.blocks,
                 });
             }
             Some(rec) => {
@@ -753,7 +1054,8 @@ impl KvMetaBackend {
     /// **`AllocLeaseBitmap`**: the holder at `term` publishes where its
     /// pages live (the successor's copy, or a first holder's fresh pages).
     /// Idempotent (`already` = the record already names them); a caller
-    /// that is not the holder at that term refuses.
+    /// that is not the holder at that term refuses; refs the screen
+    /// rejects are never persisted.
     pub async fn manager_alloc_lease_bitmap(
         &self,
         vol_tag: u64,
@@ -779,6 +1081,10 @@ impl KvMetaBackend {
                 rec.holder.node_token,
                 rec.holder.mount_slot
             )));
+        }
+        if let Err(e) = self.screen_alloc_lease_bitmap(rec.blocks, &bitmap) {
+            set.verbs.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err(e);
         }
         if rec.bitmap == bitmap {
             set.verbs.replays.fetch_add(1, Ordering::Relaxed);
@@ -859,7 +1165,13 @@ impl KvMetaBackend {
     /// **The death ledger's RECORD** (§5.5.2): `dead_member:{member} →
     /// { epoch, ts }` in tree 0 of volume 0. In-process only — PR 10's
     /// recovery driver is the production writer (the wire's `RecordDeath`
-    /// refuses naming it); the contracts drive it as the seam. Idempotent.
+    /// refuses naming it); the allocation arm's same-node takeover and the
+    /// contracts drive it. Idempotent. **The record's arm on the holder**
+    /// (review round 1, Issue 7): every allocation lease this process
+    /// holds REVOKES the dead writer's open grants and QUARANTINES their
+    /// blocks on the volume's allocator under a dead epoch (S7 — the bits
+    /// stay SET until a drain proof releases them); `dead_members_acted`
+    /// counts the act.
     pub async fn record_death(
         &self,
         member: AppenderIdentity,
@@ -884,6 +1196,44 @@ impl KvMetaBackend {
         .await?;
         set.verbs.verbs.fetch_add(1, Ordering::Relaxed);
         DEAD_MEMBERS_RECORDED.fetch_add(1, Ordering::Relaxed);
+        let name = crate::meta_ship::manager::wire_writer_name(&member.into());
+        for holding in holdings() {
+            let revoked = holding.revoke_dead(&name);
+            if revoked.is_empty() {
+                continue;
+            }
+            let Some(alloc) = allocator_for(holding.vol_tag) else {
+                log::warn!(
+                    "death record for node {:#018x} slot {}: {} grant(s) on data volume \
+                     {:#018x} revoked, but no allocator is registered for the quarantine — the \
+                     bits stay SET (the census releases them as a leak)",
+                    member.node_token,
+                    member.mount_slot,
+                    revoked.len(),
+                    holding.vol_tag
+                );
+                continue;
+            };
+            let dead = crate::data_custody::declare_dead_epoch(&format!(
+                "allocation holder of data volume {:#018x}: writer node {:#018x} slot {} named \
+                 by the death ledger (epoch {epoch})",
+                holding.vol_tag, member.node_token, member.mount_slot
+            ));
+            let chunk = alloc.chunk_size();
+            let offsets = revoked
+                .iter()
+                .flat_map(|g| (g.start..g.end()).map(move |b| b * chunk));
+            let quarantined = crate::data_custody::quarantine_offsets(&alloc, offsets, dead);
+            log::warn!(
+                "death record for node {:#018x} slot {}: {} grant(s) on data volume {:#018x} \
+                 revoked, {quarantined} block(s) quarantined under {dead} (dead_members_acted)",
+                member.node_token,
+                member.mount_slot,
+                revoked.len(),
+                holding.vol_tag
+            );
+            note_dead_member_acted(rec.ts_ms);
+        }
         Ok(false)
     }
 
@@ -891,25 +1241,73 @@ impl KvMetaBackend {
     // The holder half — this backend is the holder's HOME volume
     // -----------------------------------------------------------------
 
+    /// Register `holding` (the process-wide map, one per data volume).
+    fn register_holding(holding: &Arc<AllocHolding>) {
+        if HOLDINGS
+            .upsert_sync(holding.vol_tag, Arc::clone(holding))
+            .is_none()
+        {
+            HOLDINGS_COUNT.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn new_holding(
+        self: &Arc<Self>,
+        vol_tag: u64,
+        term: u64,
+        bitmap: DataAllocBitmap,
+        pages: Vec<ExtentRef>,
+    ) -> Arc<AllocHolding> {
+        let holding = Arc::new(AllocHolding {
+            vol_tag,
+            term,
+            home_vol: crate::park_gate::home_volume(),
+            home: Arc::downgrade(self),
+            bitmap,
+            ledger: BlockGrantLedger::new(),
+            pages,
+            mutations: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+            drain: crate::sqz_sync::SqzMutex::new(()),
+            journaler_running: AtomicBool::new(false),
+            deltas_journaled: AtomicU64::new(0),
+            timeout_deferrals: AtomicU64::new(0),
+        });
+        Self::register_holding(&holding);
+        holding
+    }
+
     /// **Hold `vol_tag`'s allocation lease at `term`** on this home
     /// volume: claim heap extents for the pages from the manager's own
     /// bitmap (appender 0 claims directly — its alloc deltas journaled in
     /// ring 0 like every claim of its own), write the pages — a COPY of
-    /// `predecessor` (a recovered region image) or fresh all-clear pages —
-    /// barrier, register the holding. Returns it with the extents the
-    /// caller publishes through [`Self::manager_alloc_lease_bitmap`].
+    /// `predecessor` (a recovered region image) or fresh all-clear pages
+    /// — barrier, register the holding. Returns it with the extents the
+    /// caller publishes through [`Self::manager_alloc_lease_bitmap`]. A
+    /// failed page write releases the claims (review round 1, Issue 15).
     pub async fn hold_alloc_lease(
-        &self,
+        self: &Arc<Self>,
         vol_tag: u64,
         blocks: u64,
         term: u64,
         predecessor: Option<&[u8]>,
     ) -> Result<Arc<AllocHolding>, KvError> {
         let set = self.manager_gate(false)?;
+        // The image is decoded BEFORE any claim: a corrupt predecessor
+        // region refuses here with nothing to undo.
+        let bitmap = match predecessor {
+            Some(image) => DataAllocBitmap::from_region_image(vol_tag, blocks, image)?,
+            None => DataAllocBitmap::new(vol_tag, blocks),
+        };
+        let image = bitmap.region_image(term)?;
         let node_size = self.node_cache().config().layout.node_size() as u64;
         let region = crate::data_alloc_bitmap::region_len(blocks);
         let extents_needed = region.div_ceil(node_size).max(1);
         let mut claimed: Vec<u64> = Vec::with_capacity(extents_needed as usize);
+        let release_claims = |claimed: &[u64]| {
+            for c in claimed {
+                self.allocator().release_unpublished(*c);
+            }
+        };
         let mut recs: Vec<(u8, Record)> = Vec::new();
         for _ in 0..extents_needed {
             match self.allocator().claim_internal() {
@@ -918,20 +1316,13 @@ impl KvMetaBackend {
                     recs.push(super::alloc_ext::alloc_record(e, 0));
                 }
                 Err(e) => {
-                    for c in claimed {
-                        self.allocator().release_unpublished(c);
-                    }
+                    release_claims(&claimed);
                     return Err(e);
                 }
             }
         }
         // The pages are written into the claimed extents in claim order;
         // the record names them as runs.
-        let bitmap = match predecessor {
-            Some(image) => DataAllocBitmap::from_region_image(vol_tag, blocks, image),
-            None => DataAllocBitmap::new(vol_tag, blocks),
-        };
-        let image = bitmap.region_image(term)?;
         let mut ops: Vec<(u64, bytes::Bytes)> = Vec::new();
         let mut written = 0usize;
         for e in &claimed {
@@ -942,11 +1333,17 @@ impl KvMetaBackend {
             }
             written = end;
         }
-        crate::uring_fs::write_at_batch(self.device_path(), ops)
+        if let Err(e) = crate::uring_fs::write_at_batch(self.device_path(), ops).await {
+            release_claims(&claimed);
+            return Err(KvError::Io(e));
+        }
+        if let Err(e) = self
+            .write_control_entry(recs, super::backend::EntryAdmission::Try)
             .await
-            .map_err(KvError::Io)?;
-        self.write_control_entry(recs, super::backend::EntryAdmission::Try)
-            .await?;
+        {
+            release_claims(&claimed);
+            return Err(e);
+        }
         let pages: Vec<ExtentRef> =
             super::slot_state::ExtentGrantRecord::from_extents(claimed.iter().copied())
                 .runs
@@ -957,34 +1354,70 @@ impl KvMetaBackend {
                 })
                 .collect();
         set.verbs.verbs.fetch_add(1, Ordering::Relaxed);
-        let holding = Arc::new(AllocHolding {
-            vol_tag,
-            term,
-            home_vol: crate::park_gate::home_volume(),
-            bitmap,
-            ledger: BlockGrantLedger::new(),
-            pages,
-            pending_clears: parking_lot::Mutex::new(Vec::new()),
-            deltas_journaled: AtomicU64::new(0),
-            timeout_deferrals: AtomicU64::new(0),
-        });
-        if HOLDINGS
-            .upsert_sync(vol_tag, Arc::clone(&holding))
-            .is_none()
-        {
-            HOLDINGS_COUNT.fetch_add(1, Ordering::AcqRel);
+        Ok(self.new_holding(vol_tag, term, bitmap, pages))
+    }
+
+    /// **Re-hold a lease this identity already holds** (a clean remount,
+    /// or the own-residue recovery after a crash — the record still names
+    /// OUR pages on this volume): read them, fold the kept replay window
+    /// and the ring's window of THIS term over them (the recovery arm),
+    /// write the changed pages + barrier, register the holding on the SAME
+    /// extents. No claim, no copy.
+    pub async fn rehold_alloc_lease(
+        self: &Arc<Self>,
+        vol_tag: u64,
+        rec: &AllocLeaseRecord,
+    ) -> Result<Arc<AllocHolding>, KvError> {
+        let refs: Vec<ExtentRef> = rec.bitmap.iter().map(|(_, e)| *e).collect();
+        self.screen_alloc_lease_bitmap(rec.blocks, &rec.bitmap)?;
+        let image = self.read_alloc_bitmap_image(&refs, rec.blocks).await?;
+        let bitmap = DataAllocBitmap::from_region_image(vol_tag, rec.blocks, &image)?;
+        let changed = self.replay_data_alloc_deltas(&bitmap, rec.term).await?;
+        if changed > 0 {
+            let base = refs.first().map_or(0, |e| e.start);
+            bitmap
+                .write_dirty_pages(
+                    self.device_path(),
+                    base,
+                    self.checkpoint_seq.load(Ordering::Acquire) + 1,
+                )
+                .await?;
+            self.sync_device().await.map_err(KvError::Io)?;
+            log::warn!(
+                "data volume {vol_tag:#018x}: re-held its allocation lease at term {} — the \
+                 window's {changed} delta(s) folded onto the pages (own-residue recovery)",
+                rec.term
+            );
         }
-        Ok(holding)
+        Ok(self.new_holding(vol_tag, rec.term, bitmap, refs))
     }
 
     /// Read a bitmap region image off `refs` on THIS volume (the
     /// predecessor's pages, when its home volume is this one — the
     /// in-process shape; a foreign home volume's reader is PR 10's driver).
+    /// `blocks` and every ref are screened against this volume's heap
+    /// before anything proportional to them is allocated (Issue 6).
     pub async fn read_alloc_bitmap_image(
         &self,
         refs: &[ExtentRef],
         blocks: u64,
     ) -> Result<Vec<u8>, KvError> {
+        let heap = self.superblock().heap;
+        let node = self.node_cache().config().layout.node_size() as u64;
+        let refs_here: Vec<(u16, ExtentRef)> = refs.iter().map(|e| (0u16, *e)).collect();
+        screen_bitmap_refs(blocks, &refs_here, |v| {
+            (v == 0).then_some(VolumeHeap {
+                heap_start: heap.start,
+                heap_len: heap.len,
+                node_size: node,
+            })
+        })
+        .map_err(|why| {
+            KvError::Rejected(format!(
+                "{}: allocation bitmap refs {why}",
+                self.device_path().display()
+            ))
+        })?;
         let want = crate::data_alloc_bitmap::region_len(blocks) as usize;
         let mut out = Vec::with_capacity(want);
         for r in refs {
@@ -999,42 +1432,55 @@ impl KvMetaBackend {
         Ok(out)
     }
 
-    async fn journal_data_alloc_deltas(
-        &self,
-        holding: &AllocHolding,
-        blocks: impl Iterator<Item = u64>,
-        set: bool,
-    ) -> Result<(), KvError> {
-        let mut chunk: Vec<(u8, Record)> = Vec::with_capacity(DELTAS_PER_ENTRY);
-        for b in blocks {
-            chunk.push(if set {
-                crate::data_alloc_bitmap::set_record(holding.vol_tag, b, 0)
-            } else {
-                crate::data_alloc_bitmap::clear_record(holding.vol_tag, b, 0)
-            });
-            if chunk.len() == DELTAS_PER_ENTRY {
-                self.write_control_entry(
-                    std::mem::take(&mut chunk),
-                    super::backend::EntryAdmission::Try,
-                )
-                .await?;
-                holding.deltas_journaled.fetch_add(1, Ordering::Relaxed);
+    /// **Drain `holding`'s queued deltas into this ring**, head-first, one
+    /// drainer at a time — the ordering law's journal half. A failed
+    /// entry puts its chunk back at the head (nothing behind it was
+    /// journaled) and returns the error.
+    pub async fn drain_deltas(&self, holding: &AllocHolding) -> Result<(), KvError> {
+        let _one = holding.drain.lock().await;
+        loop {
+            let chunk = holding.take_queued(DELTAS_PER_ENTRY);
+            if chunk.is_empty() {
+                return Ok(());
             }
-        }
-        if !chunk.is_empty() {
-            self.write_control_entry(chunk, super::backend::EntryAdmission::Try)
-                .await?;
+            let recs: Vec<(u8, Record)> = chunk
+                .iter()
+                .map(|d| {
+                    if d.set {
+                        crate::data_alloc_bitmap::set_record(
+                            holding.vol_tag,
+                            d.block,
+                            holding.term,
+                            0,
+                        )
+                    } else {
+                        crate::data_alloc_bitmap::clear_record(
+                            holding.vol_tag,
+                            d.block,
+                            holding.term,
+                            0,
+                        )
+                    }
+                })
+                .collect();
+            if let Err(e) = self
+                .write_control_entry(recs, super::backend::EntryAdmission::Try)
+                .await
+            {
+                holding.requeue_front(chunk);
+                return Err(e);
+            }
             holding.deltas_journaled.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(())
     }
 
     /// **`BlockGrant { vol_tag, writer, want }`** on the holder: carve
-    /// (bits SET in RAM), journal the SET deltas in this ring and BARRIER,
-    /// then answer — a grant a writer holds is always journaled (the
-    /// `LaneReservation` law). `want == 0` = the derivation over the
-    /// holder's known writers. A journal failure gives the bits back and
-    /// refuses.
+    /// (bits SET and deltas queued in one critical section), DRAIN the
+    /// stream into this ring — the SET and everything queued before it
+    /// journaled and BARRIERED — then answer: a grant a writer holds is
+    /// always journaled (the `LaneReservation` law). `want == 0` = the
+    /// derivation over the holder's known writers. A journal failure
+    /// gives the bits back and refuses.
     pub async fn holder_block_grant(
         &self,
         vol_tag: u64,
@@ -1048,6 +1494,13 @@ impl KvMetaBackend {
                 self.device_path().display()
             ))
         })?;
+        if !holding.is_homed_on(self) {
+            return Err(KvError::Busy(format!(
+                "{}: data volume {vol_tag:#018x}'s allocation lease is homed on another \
+                 metadata volume of this set",
+                self.device_path().display()
+            )));
+        }
         let writers = holding.ledger.writers().len() as u64 + 1;
         let want = if want == 0 {
             crate::block_grant::block_grant_derived(
@@ -1065,15 +1518,10 @@ impl KvMetaBackend {
             ))
         };
         let floor = holding.ledger.grant_frontier().unwrap_or(0);
-        let outcome = holding
-            .ledger
-            .carve(&holding.bitmap, writer, want, floor, held_unconsumed);
+        let outcome = holding.carve(writer, want, floor, held_unconsumed);
         if let CarveOutcome::Granted(g) = &outcome {
-            if let Err(e) = self
-                .journal_data_alloc_deltas(&holding, g.start..g.end(), true)
-                .await
-            {
-                let _ = holding.ledger.return_blocks(&holding.bitmap, writer, *g);
+            if let Err(e) = self.drain_deltas(&holding).await {
+                let _ = holding.return_blocks(writer, *g);
                 return Err(e);
             }
         }
@@ -1081,8 +1529,8 @@ impl KvMetaBackend {
     }
 
     /// **`ReturnBlocks`** on the holder: the writer gives back an
-    /// unconsumed range — bits CLEAR, CLEAR deltas journaled. `None` ⇔ the
-    /// range is not the writer's (refused, nothing cleared).
+    /// unconsumed range — bits CLEAR, CLEAR deltas journaled in order.
+    /// `None` ⇔ the range is not the writer's (refused, nothing cleared).
     pub async fn holder_return_blocks(
         &self,
         vol_tag: u64,
@@ -1095,28 +1543,28 @@ impl KvMetaBackend {
                 self.device_path().display()
             ))
         })?;
-        let Some(cleared) = holding.ledger.return_blocks(&holding.bitmap, writer, range) else {
+        let Some(cleared) = holding.return_blocks(writer, range) else {
             return Ok(None);
         };
-        self.journal_data_alloc_deltas(&holding, range.start..range.end(), false)
-            .await?;
+        self.drain_deltas(&holding).await?;
         Ok(Some(cleared))
     }
 
-    /// **The holder's checkpoint step**: journal the pending `finish_free`
-    /// clears, write every dirty page into its alternate slot. Called by
-    /// the checkpoint task after the appender pages; a no-op on a mount
-    /// holding no lease (one probe of an empty map).
+    /// **The holder's checkpoint step** — run BEFORE barrier #1 and the
+    /// ledger record, beside the meta bitmap's own page write (review
+    /// round 1, Issue 1: the record's tail passes every delta journaled
+    /// below the cycle's head, so the pages must already carry them; a
+    /// delta journaled after the head is inside the window the tail
+    /// keeps): drain the queue as a belt, then write every dirty page
+    /// into its alternate slot — for the holdings HOMED ON THIS backend
+    /// only (Issue 3: another volume's checkpoint touches neither the
+    /// pages nor the dirty bits). A no-op on a mount holding no lease.
     pub async fn write_data_alloc_pages(&self, ckpt_seq: u64) -> Result<(), KvError> {
         for holding in holdings() {
-            if holding.home_vol != crate::park_gate::home_volume() {
+            if !holding.is_homed_on(self) {
                 continue;
             }
-            let clears = holding.take_pending_clears();
-            if !clears.is_empty() {
-                self.journal_data_alloc_deltas(&holding, clears.into_iter(), false)
-                    .await?;
-            }
+            self.drain_deltas(&holding).await?;
             holding
                 .bitmap
                 .write_dirty_pages(self.device_path(), holding.page_base(), ckpt_seq)
@@ -1127,11 +1575,17 @@ impl KvMetaBackend {
 
     /// **`replay_data_alloc_deltas`** (§5.5.1's recovery arm): scan THIS
     /// volume's fixed ring from the ledger's tail (the window a dead
-    /// holder's crash left) and apply its kind-4 data deltas to `bitmap`
-    /// — the pages loaded from the dead holder's extents. Returns the bits
+    /// holder's crash left) and apply its kind-4 data deltas of holder
+    /// `term` to `bitmap` — the pages loaded from the dead holder's
+    /// extents — together with the window's deltas the mount's own replay
+    /// KEPT for exactly this (volume, term, home). Returns the bits
     /// changed. PR 10's recovery driver runs it before `recovered:`; the
-    /// contracts call it as the seam.
-    pub async fn replay_data_alloc_deltas(&self, bitmap: &DataAllocBitmap) -> Result<u64, KvError> {
+    /// re-hold and the contracts call it.
+    pub async fn replay_data_alloc_deltas(
+        &self,
+        bitmap: &DataAllocBitmap,
+        term: u64,
+    ) -> Result<u64, KvError> {
         let ring = Self::fixed_ring_extent(self.superblock());
         let pages = ring.len / super::journal::JOURNAL_PAGE_LEN;
         let (_, recovery) = super::journal::JournalRing::recover(
@@ -1142,10 +1596,11 @@ impl KvMetaBackend {
             self.ledger_tail(),
         )
         .await?;
-        // The window's deltas the mount's own replay met (kept because the
-        // bring-up checkpoint may already have advanced the tail past
-        // them) plus whatever the ring still holds — one fold, LWW by seq.
-        let kept = crate::data_alloc_bitmap::take_replayed_deltas(bitmap.vol_tag());
+        let kept = crate::data_alloc_bitmap::take_replayed_deltas(
+            self.device_path(),
+            bitmap.vol_tag(),
+            term,
+        );
         let changed = bitmap.replay(
             kept.iter()
                 .map(|r| (super::record::TREE_ALLOC_RESERVED, r))
@@ -1154,6 +1609,7 @@ impl KvMetaBackend {
                         .iter()
                         .map(|(t, r)| (super::journal::untag(*t).0, r))
                 })),
+            term,
         );
         Ok(changed)
     }
@@ -1285,4 +1741,352 @@ impl KvMetaBackend {
         cov.covered = cov.leased + cov.unleased;
         Ok(cov)
     }
+}
+
+// ---------------------------------------------------------------------------
+// The service edge's pure screens (fuzzed by `manager_call_frame`'s PR-8
+// arm, mirrored in `tests/decoder_property_tests.rs`)
+// ---------------------------------------------------------------------------
+
+/// **Screen a set of bitmap refs against the volumes' heaps** (review
+/// round 1, Issue 6): every ref names a volume `heap_of` knows, lies inside
+/// its heap, starts a whole number of nodes from the heap's start, is a
+/// whole number of nodes long, non-empty, does not overflow; together the
+/// refs cover at least `region_len(blocks)` and at most the nodes that
+/// region rounds up to. Pure — the manager's and the reader's one screen.
+pub fn screen_bitmap_refs(
+    blocks: u64,
+    bitmap: &[(u16, ExtentRef)],
+    heap_of: impl Fn(u16) -> Option<VolumeHeap>,
+) -> Result<(), String> {
+    if blocks == 0 {
+        return Err("names a zero-block volume".to_string());
+    }
+    if bitmap.is_empty() {
+        return Err("names no page extent".to_string());
+    }
+    let region = crate::data_alloc_bitmap::region_len(blocks);
+    let mut total: u64 = 0;
+    let mut node_size_max = 0u64;
+    for (vol, e) in bitmap {
+        let Some(heap) = heap_of(*vol) else {
+            return Err(format!("ref {e:?} names volume {vol}, which the set lacks"));
+        };
+        node_size_max = node_size_max.max(heap.node_size);
+        let Some(end) = e.start.checked_add(e.len) else {
+            return Err(format!("ref {e:?} overflows"));
+        };
+        let Some(heap_end) = heap.heap_start.checked_add(heap.heap_len) else {
+            return Err(format!("volume {vol}'s heap geometry overflows"));
+        };
+        if e.len == 0 {
+            return Err(format!("ref {e:?} is empty"));
+        }
+        if e.start < heap.heap_start || end > heap_end {
+            return Err(format!(
+                "ref {e:?} lies outside volume {vol}'s heap [{:#x}, {heap_end:#x})",
+                heap.heap_start
+            ));
+        }
+        if heap.node_size == 0
+            || (e.start - heap.heap_start) % heap.node_size != 0
+            || e.len % heap.node_size != 0
+        {
+            return Err(format!(
+                "ref {e:?} is not node-aligned on volume {vol} (node {})",
+                heap.node_size
+            ));
+        }
+        total = total.saturating_add(e.len);
+    }
+    if total < region {
+        return Err(format!(
+            "refs hold {total} B, the {blocks}-block bitmap needs {region} B"
+        ));
+    }
+    let needed_nodes = region.div_ceil(node_size_max.max(1)).max(1);
+    let cap = needed_nodes.saturating_mul(node_size_max);
+    if total > cap {
+        return Err(format!(
+            "refs hold {total} B, the {blocks}-block bitmap claims at most {cap} B"
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The PRODUCTION allocation arm (review round 1, Issue 7)
+// ---------------------------------------------------------------------------
+
+/// The in-process holder's grant sink for a writer named `writer`:
+/// `holder_block_grant` on the home volume.
+pub fn holder_block_grant_sink(
+    home: &Arc<KvMetaBackend>,
+    vol_tag: u64,
+    writer: String,
+) -> crate::block_grant::BlockGrantSink {
+    let home = Arc::downgrade(home);
+    Arc::new(move |want, held| {
+        let home = home.clone();
+        let writer = writer.clone();
+        Box::pin(async move {
+            let home = home.upgrade()?;
+            match home.holder_block_grant(vol_tag, &writer, want, held).await {
+                Ok(CarveOutcome::Granted(g)) => Some(vec![g]),
+                Ok(CarveOutcome::Already(gs)) => Some(gs),
+                Ok(CarveOutcome::Full) => None,
+                Err(e) => {
+                    log::warn!(
+                        "block grant on data volume {vol_tag:#018x} refused by the holder: {e}"
+                    );
+                    None
+                }
+            }
+        })
+    })
+}
+
+/// A WIRE writer's grant sink: `ManagerCall::BlockGrant` to the manager
+/// venue at `endpoint` (one storage-trust session, reconnected on
+/// failure). PR 12's second daemon is the production caller; the
+/// contracts drive it here.
+pub fn wire_block_grant_sink(
+    endpoint: String,
+    secret: Vec<u8>,
+    writer: crate::meta_ship::manager::WireIdentity,
+    volume: u16,
+    vol_tag: u64,
+) -> crate::block_grant::BlockGrantSink {
+    let client: Arc<crate::sqz_sync::SqzMutex<Option<crate::meta_ship::manager::ManagerClient>>> =
+        Arc::new(crate::sqz_sync::SqzMutex::new(None));
+    Arc::new(move |want, held| {
+        let client = Arc::clone(&client);
+        let endpoint = endpoint.clone();
+        let secret = secret.clone();
+        Box::pin(async move {
+            let mut slot = client.lock().await;
+            if slot.is_none() {
+                let peer = format!("appender-{:#x}-{}", writer.node_token, writer.mount_slot);
+                match crate::meta_ship::manager::ManagerClient::connect(
+                    &endpoint, &secret, &peer, volume,
+                )
+                .await
+                {
+                    Ok(c) => *slot = Some(c),
+                    Err(e) => {
+                        log::warn!("block grant venue {endpoint} unreachable: {e}");
+                        return None;
+                    }
+                }
+            }
+            let c = slot.as_mut()?;
+            // The holder's derivation answers `want == 0`; the wire carries
+            // a u32 ask.
+            let ask = u32::try_from(want).unwrap_or(u32::MAX);
+            match c.block_grant(vol_tag, writer, ask, held).await {
+                Ok(g) => g,
+                Err(e) => {
+                    log::warn!("block grant over the wire failed: {e}; reconnecting next ask");
+                    *slot = None;
+                    None
+                }
+            }
+        })
+    })
+}
+
+/// Install the manager venue at `endpoint` as the FREE TARGET of data
+/// volume `vol_tag` — where a wire writer's terminal frees ship
+/// (`cowriter::ship_displaced_frees` routes to it). `true` ⇔ newly
+/// installed or moved.
+pub fn install_wire_free_target(vol_tag: u64, endpoint: &str) -> bool {
+    let moved = crate::block_grant::free_target_for(vol_tag).as_deref() != Some(endpoint);
+    crate::block_grant::install_free_target(vol_tag, endpoint.to_string());
+    moved
+}
+
+/// **Arm the ARMED plane's data allocation** (the mount path, after the
+/// multi-writer arm; review round 1, Issue 7 — the delivered arm): for
+/// every data volume this mount writes (`allocators`), register its
+/// derived block count, acquire its allocation lease FIRST-COME through
+/// volume 0's manager (this mount — the D0 winner), hold it (fresh pages
+/// at term 1; a re-hold of our own record after a clean remount or a
+/// crash — the own-residue recovery folds the window's deltas onto the
+/// pages; a same-node predecessor of another mount slot is DEAD by the
+/// D0 flock's proof — its death and its home's recovery are recorded here
+/// and its lease succeeded), publish the refs, and install the grant arm
+/// on the allocator with the in-process holder as its sink — from here
+/// the allocator's fresh mint comes from the granted window and its
+/// terminal frees clear the holder's bits. Inert on an unarmed mount
+/// (`Ok(0)`, one load). A live FOREIGN holder of a data volume this
+/// manager writes is a shape PR 8 cannot reach (a wire joiner's venue is
+/// PR 12's) and refuses loud rather than allocate beside it unarmed.
+pub async fn arm_symmetric_allocation(
+    routed: &Arc<crate::meta_backend::RoutedMetaBackend>,
+    allocators: &[Arc<crate::block_allocator::BlockAllocator>],
+) -> Result<usize, crate::error::SqueezefsError> {
+    if !crate::park_gate::symmetric_appender_armed() {
+        return Ok(0);
+    }
+    let slot0 = routed.route_ino(1).0;
+    let Some(vol0) = routed.volumes.get(slot0) else {
+        return Ok(0);
+    };
+    let Some(set) = vol0.appenders_public() else {
+        return Ok(0);
+    };
+    let me = set.identity;
+    let home_vol = crate::park_gate::home_volume();
+    let mut held = 0usize;
+    for alloc in allocators {
+        let vol_tag = crate::meta_backend::kv::block_refs::volume_tag(alloc.volume_id());
+        let chunk = alloc.chunk_size().max(1);
+        let blocks = alloc.capacity_bytes() / chunk;
+        if blocks == 0 {
+            log::warn!(
+                "symmetric allocation arm: data volume '{}' reports no capacity — not leased",
+                alloc.volume_id()
+            );
+            continue;
+        }
+        register_data_volume_blocks(vol_tag, blocks);
+        let _ = ALLOCATORS.upsert_sync(vol_tag, Arc::downgrade(alloc));
+        let holding = acquire_and_hold(vol0, me, home_vol, vol_tag, blocks)
+            .await
+            .map_err(|e| {
+                crate::error::SqueezefsError::InvalidOperation(format!(
+                    "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): {e}",
+                    alloc.volume_id()
+                ))
+            })?;
+        let writer = crate::meta_ship::manager::wire_writer_name(&me.into());
+        alloc.install_block_grant_arm(vol_tag, holder_block_grant_sink(vol0, vol_tag, writer));
+        log::info!(
+            "symmetric allocation arm: data volume '{}' leased at term {} ({} block(s), pages \
+             at {:?}); this mount mints from ranged block grants of its own holding",
+            alloc.volume_id(),
+            holding.term,
+            blocks,
+            holding.pages
+        );
+        held += 1;
+    }
+    Ok(held)
+}
+
+/// One data volume's acquire-and-hold ladder on the in-process manager.
+async fn acquire_and_hold(
+    vol0: &Arc<KvMetaBackend>,
+    me: AppenderIdentity,
+    home_vol: u16,
+    vol_tag: u64,
+    blocks: u64,
+) -> Result<Arc<AllocHolding>, KvError> {
+    // Bounded: one same-node takeover + one deferred retry at most.
+    for _attempt in 0..4 {
+        match vol0
+            .manager_alloc_lease_acquire(vol_tag, me, 0, home_vol, super::builder::ROOT_INO, blocks)
+            .await
+        {
+            Ok(g) if g.already => {
+                let rec = vol0.alloc_lease_record(vol_tag).await?.ok_or_else(|| {
+                    KvError::Corrupt(format!(
+                        "allocation lease of {vol_tag:#018x} answered `already` with no record"
+                    ))
+                })?;
+                if rec.bitmap.is_empty() {
+                    // Our own prior incarnation died between the acquire
+                    // and the publish: fresh pages at the same term.
+                    return hold_fresh_and_publish(vol0, me, vol_tag, rec.blocks, rec.term, None)
+                        .await;
+                }
+                return vol0.rehold_alloc_lease(vol_tag, &rec).await;
+            }
+            Ok(g) if g.term == 1 => {
+                return hold_fresh_and_publish(vol0, me, vol_tag, blocks, 1, None).await;
+            }
+            Ok(g) => {
+                // A successor: copy the RECOVERED predecessor pages.
+                let refs: Vec<ExtentRef> = g.predecessor_bitmap.iter().map(|(_, e)| *e).collect();
+                let image = vol0
+                    .read_alloc_bitmap_image(&refs, g.predecessor_blocks)
+                    .await?;
+                return hold_fresh_and_publish(
+                    vol0,
+                    me,
+                    vol_tag,
+                    g.predecessor_blocks,
+                    g.term,
+                    Some(&image),
+                )
+                .await;
+            }
+            Err(KvError::Busy(why)) => {
+                let Some(rec) = vol0.alloc_lease_record(vol_tag).await? else {
+                    return Err(KvError::Busy(why));
+                };
+                if !rec.holder.owned_by_node(me.node_token) {
+                    return Err(KvError::Busy(format!(
+                        "{why}; a live FOREIGN holder of a data volume this manager writes is \
+                         PR 12's shape (a wire joiner's venue) — refusing to arm beside it"
+                    )));
+                }
+                // A same-node predecessor of another mount slot: the D0
+                // flock this open holds is the kernel's proof it is dead.
+                // Record the death, recover its home (the window's deltas
+                // onto its pages), record the recovery, then succeed it.
+                let refs: Vec<ExtentRef> = rec.bitmap.iter().map(|(_, e)| *e).collect();
+                vol0.record_death(rec.holder, crate::dlm::durable_term())
+                    .await?;
+                if !refs.is_empty() {
+                    let image = vol0.read_alloc_bitmap_image(&refs, rec.blocks).await?;
+                    let pages = DataAllocBitmap::from_region_image(vol_tag, rec.blocks, &image)?;
+                    let changed = vol0.replay_data_alloc_deltas(&pages, rec.term).await?;
+                    if changed > 0 {
+                        let base = refs.first().map_or(0, |e| e.start);
+                        pages
+                            .write_dirty_pages(
+                                vol0.device_path(),
+                                base,
+                                vol0.checkpoint_seq.load(Ordering::Acquire) + 1,
+                            )
+                            .await?;
+                        vol0.sync_device().await.map_err(KvError::Io)?;
+                    }
+                }
+                vol0.manager_record_recovered(rec.holder, rec.home_vol)
+                    .await?;
+                note_dead_member_acted(unix_now_ms());
+            }
+            Err(KvError::LeaseDeferred(_)) => {
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(KvError::Busy(format!(
+        "data volume {vol_tag:#018x}'s allocation lease could not be acquired after the \
+         same-node takeover"
+    )))
+}
+
+async fn hold_fresh_and_publish(
+    vol0: &Arc<KvMetaBackend>,
+    me: AppenderIdentity,
+    vol_tag: u64,
+    blocks: u64,
+    term: u64,
+    predecessor: Option<&[u8]>,
+) -> Result<Arc<AllocHolding>, KvError> {
+    let holding = vol0
+        .hold_alloc_lease(vol_tag, blocks, term, predecessor)
+        .await?;
+    let refs: Vec<(u16, ExtentRef)> = holding
+        .pages
+        .iter()
+        .map(|e| (crate::park_gate::home_volume(), *e))
+        .collect();
+    vol0.manager_alloc_lease_bitmap(vol_tag, me, term, refs)
+        .await?;
+    Ok(holding)
 }

@@ -1586,6 +1586,13 @@ async fn tick(
     Ok(())
 }
 
+/// TEST seam ONLY (`false` in production, one relaxed load): halt the
+/// checkpoint cycle right after its ledger record landed — the PR 8
+/// crash-window pin for "pages before the tail-advancing record"
+/// (`tests/sym_block_grant_tests.rs`).
+pub static TEST_CHECKPOINT_HALT_AFTER_LEDGER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl KvMetaBackend {
     /// One §4.6 pt 2 checkpoint cycle (module docs pin the order).
     /// Serialized by the SMO mutex the caller holds. `barrier_now` makes
@@ -1826,6 +1833,15 @@ impl KvMetaBackend {
                 ckpt_seq,
             )
             .await?;
+        // PR 8 (design-symmetric-metadata §5.5.1): the DATA allocation
+        // bitmap pages of every allocation lease HOMED on this volume —
+        // the SAME order as the meta bitmap's, and for the same reason
+        // (review round 1, Issue 1): the ledger record below advances the
+        // tail past every delta journaled under the cycle's head `h`, so
+        // the pages that cover them must be on the device — and durable
+        // by barrier #1 — BEFORE that record lands. A no-op on a mount
+        // holding no lease.
+        self.write_data_alloc_pages(ckpt_seq).await?;
 
         // ---- Barrier #1: node appends + bitmap pages + every completed
         // journal write + any previously-written ledger record become
@@ -1960,6 +1976,15 @@ impl KvMetaBackend {
         }
         self.checkpoint_seq.store(ckpt_seq, Ordering::Release);
         self.last_ledger_tail.store(tail, Ordering::Release);
+        // TEST seam (PR 8 review round 1, Issue 1 — the crash window the
+        // ordering law exists for): the cycle stops the instant its ledger
+        // record landed, so nothing the cycle writes AFTER the record
+        // reaches the device — a kill −9 in that window, made deterministic.
+        if TEST_CHECKPOINT_HALT_AFTER_LEDGER.load(Ordering::Relaxed) {
+            return Err(KvError::Corrupt(
+                "test seam: checkpoint halted after its ledger record landed".to_string(),
+            ));
+        }
         // The NEXT record's seq still stamps the historical retire tag in
         // free-record VALUES (byte-for-byte format compat) — the release
         // GATE itself rides the tail (design-smo-replay-currency §2-A).
@@ -1985,16 +2010,6 @@ impl KvMetaBackend {
             .write_appender_pages(tail, ckpt_seq, h, &region_tails)
             .await
         {
-            self.node_cache()
-                .restore_dying_leaf_floors(dying_leaf_floors);
-            return Err(e);
-        }
-        // PR 8 (design-symmetric-metadata §5.5.1): the DATA allocation
-        // bitmap pages of every allocation lease this mount holds — the
-        // pending `finish_free` clears journaled, the dirty pages written
-        // into their alternate slots (the meta-bitmap law on one device).
-        // A no-op on a mount holding no lease.
-        if let Err(e) = self.write_data_alloc_pages(ckpt_seq).await {
             self.node_cache()
                 .restore_dying_leaf_floors(dying_leaf_floors);
             return Err(e);

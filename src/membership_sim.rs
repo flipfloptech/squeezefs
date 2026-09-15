@@ -461,7 +461,11 @@ pub async fn run(cfg: SimConfig) -> Result<SimReport> {
 /// presenting its epoch) and the park releases; `park_expiries` counts
 /// the parks a bounded `T_park_max` would have expired (0 here — the
 /// successor arms inside the bound by construction). Direct mode only —
-/// the scale instrument.
+/// the scale instrument. **The park leg is API-level**: it drives fresh
+/// `ParkCore`s per member (the protocol at scale), not the production
+/// `MemberSession::self_fence_as` → `park_gate` → `RenewalTick::Parked`
+/// arm, which `tests/sym_block_grant_tests.rs` drives through the real
+/// renewal tick over the wire.
 pub async fn run_sharded(cfg: SimConfig, shards: usize) -> Result<SimReport> {
     if shards <= 1 {
         return run(cfg).await;

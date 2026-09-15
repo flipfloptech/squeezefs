@@ -2132,11 +2132,21 @@ pub fn op_watchdog_tick(threshold: Duration) -> Vec<OverdueOp> {
             .unwrap_or("unknown");
         let ino = slot.ino.load(Ordering::Relaxed);
         let age_ms = age / 1_000_000;
-        let station = op_station::name(slot.station.load(Ordering::Relaxed));
+        let station_id = slot.station.load(Ordering::Relaxed);
+        let station = op_station::name(station_id);
         // PR 8 (design-symmetric-metadata §5.5.3): an op held by the
         // symmetric appender's PARK is labelled as such — a legitimate
-        // wait for the successor's grace, never counted overdue.
-        if crate::park_gate::is_parked() {
+        // wait for the successor's grace, never counted overdue. ONLY the
+        // ops the park can hold (review round 1, Issue 13): one whose
+        // last station precedes its publish (it is at the commit door or
+        // its ack is held) and that is no older than the park plus the
+        // threshold — an op past its publish (a lost reply) or one wedged
+        // BEFORE the park (a parked device) stays on the overdue arm.
+        let parked_for_ms = crate::park_gate::parked_age_mono_ms();
+        if parked_for_ms > 0
+            && station_id < op_station::PUBLISH
+            && age_ms <= parked_for_ms.saturating_add(threshold.as_millis() as u64)
+        {
             warn!(
                 "FUSE op watchdog: {op} (ino {ino}) in flight for {age_ms} ms past station \
                  [{station}] — PARKED (appender_parked: the appender's membership lease is \
@@ -8640,7 +8650,9 @@ pub struct Metrics {
     /// to the LESSEE of their slot. 0 on every unarmed pass.
     pub fsck_inode_plane_foreign_slot_scoped: Align64<AtomicU64>,
     /// `fsck_inode_plane_slots_covered` — `leased ∪ unleased` summed over
-    /// the pass's volumes (every hosted slot on an unarmed volume).
+    /// the pass's volumes: on an unarmed FOREST volume the native slot +
+    /// every `slot_state` record it hosts; 1 on a FLAT volume (one shard,
+    /// every slot its own).
     pub fsck_inode_plane_slots_covered: Align64<AtomicU64>,
 }
 

@@ -22,9 +22,20 @@
 //!   `vol_tag` prefix ([`data_alloc_key`]: 16 bytes, where the meta
 //!   heap's extent key is 8 — the length IS the discriminator, and every
 //!   meta-heap decoder that meets a 16-byte kind-4 key skips it through
-//!   [`is_data_alloc_delta_key`]): a `BlockGrant` SETS its range BEFORE
-//!   the reply, a terminal `FreeBlocks` CLEARS bits only at `finish_free`,
-//!   so a clear bit means "reallocatable now";
+//!   [`is_data_alloc_delta_key`]); the VALUE carries the holder's TERM
+//!   ([`DATA_ALLOC_VALUE_LEN`] — review round 1, Issue 9: a recovery folds
+//!   the deltas of exactly the term it recovers, never another holder's
+//!   stale residue): a `BlockGrant` SETS its range BEFORE the reply, a
+//!   terminal `FreeBlocks` CLEARS bits at `finish_free`, so a clear bit
+//!   means "reallocatable now";
+//! * **the ordering law** (review round 1, Issue 2): every bit mutation
+//!   and its delta are queued under ONE per-holding lock in RAM order and
+//!   journaled in that order by one drainer at a time
+//!   (`kv::alloc_lease::AllocHolding`), so the replay's per-key LWW fold
+//!   by record seq IS the RAM order — a CLEAR is never journaled after a
+//!   later re-grant's SET; and the pages are written BEFORE the ledger
+//!   record that advances the tail past their deltas (Issue 1 — the meta
+//!   bitmap's exact order in the checkpoint cycle);
 //! * **recovery + the ordering law**: the dead holder's ring replay applies
 //!   the deltas to the pages ([`DataAllocBitmap::replay`] — the arm PR 10's
 //!   recovery driver runs; `KvMetaBackend::replay_data_alloc_deltas_for_
@@ -85,6 +96,8 @@ pub const DATA_ALLOC_KEY_LEN: usize = 16;
 pub const DATA_ALLOC_REC_SET: u8 = 0x11;
 /// `Clear` delta value tag (`finish_free` — reallocatable now).
 pub const DATA_ALLOC_REC_CLEAR: u8 = 0x12;
+/// Delta value length: `tag: u8 ‖ holder term: u64 BE`.
+pub const DATA_ALLOC_VALUE_LEN: usize = 9;
 
 /// Slot marker for a page never yet written.
 const SLOT_NONE: u64 = 2;
@@ -233,13 +246,22 @@ pub fn is_data_alloc_delta_key(key: &[u8]) -> bool {
     key.len() == DATA_ALLOC_KEY_LEN
 }
 
-/// One decoded data bitmap delta.
+/// One decoded data bitmap delta, stamped with the holder TERM that
+/// journaled it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataAllocDelta {
     /// The block was granted (or otherwise claimed) — the bit is set.
-    Set { vol_tag: u64, block_idx: u64 },
+    Set {
+        vol_tag: u64,
+        block_idx: u64,
+        term: u64,
+    },
     /// The block reached `finish_free` — the bit is clear.
-    Clear { vol_tag: u64, block_idx: u64 },
+    Clear {
+        vol_tag: u64,
+        block_idx: u64,
+        term: u64,
+    },
 }
 
 impl DataAllocDelta {
@@ -256,30 +278,44 @@ impl DataAllocDelta {
             Self::Set { block_idx, .. } | Self::Clear { block_idx, .. } => *block_idx,
         }
     }
+
+    /// The holder term that journaled it.
+    pub fn term(&self) -> u64 {
+        match self {
+            Self::Set { term, .. } | Self::Clear { term, .. } => *term,
+        }
+    }
+}
+
+fn delta_value(tag: u8, term: u64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(DATA_ALLOC_VALUE_LEN);
+    v.push(tag);
+    v.extend_from_slice(&term.to_be_bytes());
+    v
 }
 
 /// The journal record for a SET delta: `(TREE_ALLOC_RESERVED, Put)` in the
-/// §4.4 staging shape. `seq` is the entry seq (re-stamped by the
-/// reservation like every control record).
-pub fn set_record(vol_tag: u64, block_idx: u64, seq: u64) -> (u8, Record) {
+/// §4.4 staging shape, journaled by the holder at `term`. `seq` is the
+/// entry seq (re-stamped by the reservation like every control record).
+pub fn set_record(vol_tag: u64, block_idx: u64, term: u64, seq: u64) -> (u8, Record) {
     (
         TREE_ALLOC_RESERVED,
         Record::put(
             data_alloc_key(vol_tag, block_idx).to_vec(),
             seq,
-            vec![DATA_ALLOC_REC_SET],
+            delta_value(DATA_ALLOC_REC_SET, term),
         ),
     )
 }
 
 /// The journal record for a CLEAR delta.
-pub fn clear_record(vol_tag: u64, block_idx: u64, seq: u64) -> (u8, Record) {
+pub fn clear_record(vol_tag: u64, block_idx: u64, term: u64, seq: u64) -> (u8, Record) {
     (
         TREE_ALLOC_RESERVED,
         Record::put(
             data_alloc_key(vol_tag, block_idx).to_vec(),
             seq,
-            vec![DATA_ALLOC_REC_CLEAR],
+            delta_value(DATA_ALLOC_REC_CLEAR, term),
         ),
     )
 }
@@ -297,12 +333,28 @@ pub fn decode_data_alloc_record(rec: &Record) -> Result<DataAllocDelta, KvError>
     }
     let vol_tag = be64(&rec.key, 0);
     let block_idx = be64(&rec.key, 8);
-    match rec.value.as_slice() {
-        [DATA_ALLOC_REC_SET] => Ok(DataAllocDelta::Set { vol_tag, block_idx }),
-        [DATA_ALLOC_REC_CLEAR] => Ok(DataAllocDelta::Clear { vol_tag, block_idx }),
+    if rec.value.len() != DATA_ALLOC_VALUE_LEN {
+        return Err(KvError::Corrupt(format!(
+            "data bitmap delta record for vol_tag {vol_tag:#018x} block {block_idx} carries a \
+             {}-byte value (expected {DATA_ALLOC_VALUE_LEN})",
+            rec.value.len()
+        )));
+    }
+    let term = be64(&rec.value, 1);
+    match rec.value[0] {
+        DATA_ALLOC_REC_SET => Ok(DataAllocDelta::Set {
+            vol_tag,
+            block_idx,
+            term,
+        }),
+        DATA_ALLOC_REC_CLEAR => Ok(DataAllocDelta::Clear {
+            vol_tag,
+            block_idx,
+            term,
+        }),
         other => Err(KvError::Corrupt(format!(
             "data bitmap delta record for vol_tag {vol_tag:#018x} block {block_idx} carries an \
-             unknown value {other:02x?}"
+             unknown tag {other:#04x}"
         ))),
     }
 }
@@ -383,43 +435,61 @@ impl DataAllocBitmap {
 
     /// Load from a region image (`region_len(blocks)` bytes, or shorter —
     /// a short image zero-extends and reads as fresh pages): per page the
-    /// newest VALID slot wins; a page with no valid slot reads as clear.
-    pub fn from_region_image(vol_tag: u64, blocks: u64, image: &[u8]) -> Self {
+    /// newest VALID slot wins; a page whose two slots are both ALL-ZERO
+    /// is fresh (clear). A page with NO valid slot and a non-zero byte in
+    /// either is REFUSED (review round 1, Issue 6): bogus refs, a torn
+    /// pair, an unreadable predecessor region must never read as an
+    /// all-free bitmap — this bitmap has no second witness until fsck's
+    /// census runs, where the meta bitmap's "invalid ⇒ fresh" posture is
+    /// protected by the ledger's generation and the reachability census.
+    pub fn from_region_image(vol_tag: u64, blocks: u64, image: &[u8]) -> Result<Self, KvError> {
         let me = Self::new(vol_tag, blocks);
         let page_len = DATA_ALLOC_PAGE_LEN as usize;
         for page in 0..me.pages {
             let page_base = (page * 2 * DATA_ALLOC_PAGE_LEN) as usize;
             let mut newest: Option<(u64, u64, &[u8])> = None;
+            let mut nonzero_invalid = false;
             for slot in 0..2u64 {
                 let start = page_base + (slot as usize) * page_len;
                 let Some(buf) = image.get(start..start + page_len) else {
+                    // Past the image's end: zero-extended, fresh.
                     continue;
                 };
-                if let Ok((generation, bits)) = decode_data_alloc_page(buf, vol_tag, page as u32) {
-                    if newest.is_none_or(|(g, _, _)| generation > g) {
-                        newest = Some((generation, slot, bits));
+                match decode_data_alloc_page(buf, vol_tag, page as u32) {
+                    Ok((generation, bits)) => {
+                        if newest.is_none_or(|(g, _, _)| generation > g) {
+                            newest = Some((generation, slot, bits));
+                        }
                     }
+                    Err(_) => nonzero_invalid |= buf.iter().any(|b| *b != 0),
                 }
             }
-            if let Some((generation, slot, bits)) = newest {
-                let first = page * DATA_ALLOC_PAGE_BITS;
-                let last = (first + DATA_ALLOC_PAGE_BITS).min(blocks);
-                for block in first..last {
-                    let off = (block - first) as usize;
-                    if bits[off / 8] & (1 << (off % 8)) != 0 {
-                        me.words[(block / 64) as usize]
-                            .fetch_or(1 << (block % 64), Ordering::Relaxed);
-                    }
+            let Some((generation, slot, bits)) = newest else {
+                if nonzero_invalid {
+                    return Err(KvError::Corrupt(format!(
+                        "data allocation bitmap of volume {vol_tag:#018x}: page {page} has no \
+                         valid slot and is not zero — a torn pair or a misdirected region read; \
+                         refusing to read it as FREE"
+                    )));
                 }
-                me.page_states[page as usize]
-                    .generation
-                    .store(generation, Ordering::Relaxed);
-                me.page_states[page as usize]
-                    .slot
-                    .store(slot, Ordering::Relaxed);
+                continue;
+            };
+            let first = page * DATA_ALLOC_PAGE_BITS;
+            let last = (first + DATA_ALLOC_PAGE_BITS).min(blocks);
+            for block in first..last {
+                let off = (block - first) as usize;
+                if bits[off / 8] & (1 << (off % 8)) != 0 {
+                    me.words[(block / 64) as usize].fetch_or(1 << (block % 64), Ordering::Relaxed);
+                }
             }
+            me.page_states[page as usize]
+                .generation
+                .store(generation, Ordering::Relaxed);
+            me.page_states[page as usize]
+                .slot
+                .store(slot, Ordering::Relaxed);
         }
-        me
+        Ok(me)
     }
 
     /// Read the region at `base` of `path` and load it.
@@ -430,7 +500,7 @@ impl DataAllocBitmap {
         blocks: u64,
     ) -> Result<Self, KvError> {
         let got = crate::uring_fs::read_at(path, base, region_len(blocks) as usize).await?;
-        Ok(Self::from_region_image(vol_tag, blocks, &got))
+        Self::from_region_image(vol_tag, blocks, &got)
     }
 
     /// The volume the bitmap describes.
@@ -626,7 +696,11 @@ impl DataAllocBitmap {
                 let state = &self.page_states[page as usize];
                 let cur = state.slot.load(Ordering::Acquire);
                 let next = if cur == SLOT_NONE { 0 } else { 1 - cur };
-                let gen = state.generation.load(Ordering::Acquire).max(generation - 1) + 1;
+                let gen = state
+                    .generation
+                    .load(Ordering::Acquire)
+                    .max(generation.saturating_sub(1))
+                    + 1;
                 let image = encode_data_alloc_page(
                     self.vol_tag,
                     page,
@@ -695,12 +769,17 @@ impl DataAllocBitmap {
     }
 
     /// **The recovery arm** (§5.5.1): apply the window's kind-4 deltas of
-    /// THIS volume to the loaded pages, per-key LWW by record seq FIRST
-    /// (the K1 fold shape — a grant's SET superseded by a later CLEAR of
-    /// the same block folds to the clear), then the survivors. Records of
-    /// other volumes and non-delta keys are ignored. Returns the bits the
-    /// replay changed.
-    pub fn replay<'a>(&self, records: impl IntoIterator<Item = (u8, &'a Record)>) -> u64 {
+    /// THIS volume journaled by the holder at `term` to the loaded pages,
+    /// per-key LWW by record seq FIRST (the K1 fold shape — a grant's SET
+    /// superseded by a later CLEAR of the same block folds to the clear;
+    /// the holder's ordering law makes seq order the RAM order), then the
+    /// survivors. Records of other volumes, other TERMS and non-delta keys
+    /// are ignored. Returns the bits the replay changed.
+    pub fn replay<'a>(
+        &self,
+        records: impl IntoIterator<Item = (u8, &'a Record)>,
+        term: u64,
+    ) -> u64 {
         let mut folded: std::collections::BTreeMap<u64, (u64, DataAllocDelta)> =
             std::collections::BTreeMap::new();
         for (tree_id, rec) in records {
@@ -710,7 +789,7 @@ impl DataAllocBitmap {
             let Ok(delta) = decode_data_alloc_record(rec) else {
                 continue;
             };
-            if delta.vol_tag() != self.vol_tag {
+            if delta.vol_tag() != self.vol_tag || delta.term() != term {
                 continue;
             }
             match folded.entry(delta.block_idx()) {
@@ -763,44 +842,87 @@ impl DataAllocBitmap {
 }
 
 // ---------------------------------------------------------------------------
-// The replayed window's deltas — kept until a holding adopts them
+// The replayed window's deltas — kept until the recovery arm of THAT
+// holder term consumes them
 // ---------------------------------------------------------------------------
 
+/// The identity of one kept group: the DATA volume, the holder TERM that
+/// journaled the deltas, and the metadata volume (device) whose ring 0
+/// held them — the ring's identity (review round 1, Issue 9: a group is
+/// consumed only by a recovery of that term on that home volume; a later
+/// recovery of the same data volume at another term never folds it in).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct KeptKey {
+    pub vol_tag: u64,
+    pub term: u64,
+    pub home: std::path::PathBuf,
+}
+
 /// The data deltas the mount's journal replay met in the window, by
-/// volume tag, kept until the recovery arm applies them to that volume's
-/// pages. Load-bearing: the mount's own bring-up checkpoint advances the
-/// ledger tail past the window BEFORE any allocation lease is re-held on
-/// it, so a replay that read the ring alone would find nothing — while
-/// the pages on the device still show a journaled grant as FREE (§5.5.1's
-/// headline row). Bounded by the window's size; drained per volume by
-/// [`take_replayed_deltas`]. Empty on every flat volume (nothing writes a
-/// 16-byte kind-4 key there).
-static REPLAYED_DELTAS: once_cell::sync::Lazy<parking_lot::Mutex<Vec<(u64, Record)>>> =
-    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(Vec::new()));
+/// [`KeptKey`], kept until the recovery arm of that term applies them to
+/// the volume's pages. Load-bearing: the mount's own bring-up checkpoint
+/// advances the ledger tail past the window BEFORE any allocation lease is
+/// re-held on it, so a replay that read the ring alone would find nothing
+/// — while the pages on the device still show a journaled grant as FREE
+/// (§5.5.1's headline row). BOUNDED: one open's replay window per group
+/// (the replay hands over a window, never more); a group of a NEWER term
+/// for the same volume + home evicts the older ones (a newer term exists
+/// only after the older's recovery — the `recovered:` gate), the recovery
+/// arm takes its group, and the leave drops the home volume's groups —
+/// so the map is empty at steady state. Empty on every flat volume
+/// (nothing writes a 16-byte kind-4 key there).
+static REPLAYED_DELTAS: once_cell::sync::Lazy<
+    parking_lot::Mutex<std::collections::BTreeMap<KeptKey, Vec<Record>>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::BTreeMap::new()));
 
-/// The journal replay met a data delta record in the window.
-pub fn note_replayed_delta(rec: &Record) {
-    if !is_data_alloc_delta_key(&rec.key) {
+/// The journal replay of `home`'s ring 0 met a data delta record in the
+/// window.
+pub fn note_replayed_delta(home: &std::path::Path, rec: &Record) {
+    let Ok(delta) = decode_data_alloc_record(rec) else {
         return;
-    }
-    let vol_tag = be64(&rec.key, 0);
-    REPLAYED_DELTAS.lock().push((vol_tag, rec.clone()));
-}
-
-/// Take the window's deltas kept for `vol_tag` (the recovery arm's input
-/// beside the live ring scan).
-pub fn take_replayed_deltas(vol_tag: u64) -> Vec<Record> {
+    };
+    let key = KeptKey {
+        vol_tag: delta.vol_tag(),
+        term: delta.term(),
+        home: home.to_path_buf(),
+    };
     let mut kept = REPLAYED_DELTAS.lock();
-    let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *kept)
-        .into_iter()
-        .partition(|(t, _)| *t == vol_tag);
-    *kept = rest;
-    mine.into_iter().map(|(_, r)| r).collect()
+    kept.retain(|k, _| k.vol_tag != key.vol_tag || k.home != key.home || k.term >= key.term);
+    kept.entry(key).or_default().push(rec.clone());
 }
 
-/// Deltas kept across every volume (the tests' witness).
+/// Take the window's deltas kept for `vol_tag` at holder `term` on home
+/// volume `home` (the recovery arm's input beside the live ring scan).
+pub fn take_replayed_deltas(home: &std::path::Path, vol_tag: u64, term: u64) -> Vec<Record> {
+    REPLAYED_DELTAS
+        .lock()
+        .remove(&KeptKey {
+            vol_tag,
+            term,
+            home: home.to_path_buf(),
+        })
+        .unwrap_or_default()
+}
+
+/// Drop every group kept for home volume `home` (the leave: the pages
+/// this mount wrote cover the window, and a group nobody re-held is a
+/// released lease's).
+pub fn drop_replayed_deltas_for(home: &std::path::Path) {
+    REPLAYED_DELTAS.lock().retain(|k, _| k.home != home);
+}
+
+/// The kept groups (the tests' witness of the map's shape).
+pub fn replayed_delta_groups() -> Vec<(KeptKey, usize)> {
+    REPLAYED_DELTAS
+        .lock()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.len()))
+        .collect()
+}
+
+/// Deltas kept across every group (the tests' witness).
 pub fn replayed_deltas_kept() -> usize {
-    REPLAYED_DELTAS.lock().len()
+    REPLAYED_DELTAS.lock().values().map(Vec::len).sum()
 }
 
 /// Test seam: forget every kept delta.
@@ -856,14 +978,16 @@ mod tests {
         let (s, l) = bm.first_clear_run(10, 64).unwrap();
         assert_eq!((s, l), (15, 64));
         let recs = [
-            set_record(1, 3, 1),
-            clear_record(1, 3, 2),
-            set_record(1, 4, 3),
-            set_record(2, 5, 4),
+            set_record(1, 3, 7, 1),
+            clear_record(1, 3, 7, 2),
+            set_record(1, 4, 7, 3),
+            set_record(2, 5, 7, 4),
+            set_record(1, 6, 8, 5),
         ];
-        let changed = bm.replay(recs.iter().map(|(t, r)| (*t, r)));
+        let changed = bm.replay(recs.iter().map(|(t, r)| (*t, r)), 7);
         assert_eq!(changed, 1);
         assert!(!bm.is_set(3) && bm.is_set(4) && !bm.is_set(5));
+        assert!(!bm.is_set(6), "another term's delta never folds in");
         assert_eq!(bm.highest_set(), Some(14));
     }
 }

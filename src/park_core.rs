@@ -197,6 +197,18 @@ impl ParkCore {
         moved
     }
 
+    /// **The leave over a standing park** (PR 8 review round 1, Issue 18):
+    /// `Parked → Expired` WITHOUT an expiry count — the door closes on the
+    /// parked committers (they never landed; a leave admits nothing into a
+    /// ring whose region a successor may already have recovered), while
+    /// the caller releases the held acks of LANDED entries as `Ok` (they
+    /// are in the ring, replayable). `true` ⇔ this call moved it.
+    pub fn close_at_leave(&self) -> bool {
+        self.state
+            .compare_exchange(PARKED, EXPIRED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
     /// The park's age at `now_ms` (0 when not parked).
     pub fn parked_for_ms(&self, now_ms: u64) -> u64 {
         let since = self.parked_since_ms.load(Ordering::Acquire);

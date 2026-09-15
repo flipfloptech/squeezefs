@@ -459,6 +459,10 @@ struct BlockGrantArm {
     /// over the wire).
     sink: crate::block_grant::BlockGrantSink,
     topups: AtomicU64,
+    /// One proactive ask in flight at a time.
+    topup_inflight: std::sync::atomic::AtomicBool,
+    /// The allocator, for the detached proactive ask.
+    me: std::sync::Weak<BlockAllocator>,
 }
 
 /// One mount's data-plane allocation partition (see
@@ -942,7 +946,7 @@ impl BlockAllocator {
     /// `vol_tag`, topped up through `sink`. The first arm wins (a mount's
     /// grant source never moves under live offsets).
     pub fn install_block_grant_arm(
-        &self,
+        self: &Arc<Self>,
         vol_tag: u64,
         sink: crate::block_grant::BlockGrantSink,
     ) -> bool {
@@ -952,6 +956,8 @@ impl BlockAllocator {
                 window: crate::block_grant::GrantWindow::new(),
                 sink,
                 topups: AtomicU64::new(0),
+                topup_inflight: std::sync::atomic::AtomicBool::new(false),
+                me: Arc::downgrade(self),
             })
             .is_ok()
     }
@@ -1007,10 +1013,42 @@ impl BlockAllocator {
             return false;
         }
         arm.topups.fetch_add(1, Ordering::Relaxed);
-        match (arm.sink)(0).await {
-            Some(g) => arm.window.install(g),
+        let held = arm.window.remaining();
+        match (arm.sink)(0, held).await {
+            Some(grants) => grants
+                .into_iter()
+                .fold(false, |any, g| arm.window.install(g) || any),
             None => false,
         }
+    }
+
+    /// The PROACTIVE half of the 50 % law (review round 1, Issue 7): a
+    /// mint that left the window below its refill point asks for the
+    /// top-up off the write path — one detached ask in flight per
+    /// allocator, so a burst of mints costs one wire round trip, and the
+    /// exhausted mint's inline ask stays the belt.
+    fn kick_block_grant_topup(&self) {
+        let Some(arm) = self.block_grant.get() else {
+            return;
+        };
+        if !arm.window.wants_topup()
+            || arm
+                .topup_inflight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        let Some(me) = arm.me.upgrade() else {
+            arm.topup_inflight.store(false, Ordering::Release);
+            return;
+        };
+        crate::meta_exec::spawn_meta("block_grant_topup", async move {
+            let _ = me.block_grant_topup().await;
+            if let Some(arm) = me.block_grant.get() {
+                arm.topup_inflight.store(false, Ordering::Release);
+            }
+        });
     }
 
     // -----------------------------------------------------------------
@@ -3216,6 +3254,7 @@ impl BlockAllocator {
             return match arm.window.mint() {
                 Some(idx) => {
                     self.highest_block.fetch_max(idx + 1, Ordering::AcqRel);
+                    self.kick_block_grant_topup();
                     Ok(idx)
                 }
                 None => {
@@ -3892,13 +3931,34 @@ impl BlockAllocator {
         let block_idx = offset / self.chunk_size;
         // PR 8 (§5.5.1): on the volume's allocation HOLDER a terminal free
         // clears the block's bit here — after quarantine and grace, so a
-        // clear bit means "reallocatable now"; the CLEAR delta rides the
-        // holder's next checkpoint. One relaxed load when no lease is held.
+        // clear bit means "reallocatable now" — and its CLEAR delta is
+        // journaled at once, in order with every other delta of the
+        // holding (review round 1, Issue 2). One acquire load when no
+        // lease is held.
         if crate::meta_backend::kv::alloc_lease::holds_any() {
-            crate::meta_backend::kv::alloc_lease::note_finish_free(
+            let cleared = crate::meta_backend::kv::alloc_lease::note_finish_free(
                 crate::meta_backend::kv::block_refs::volume_tag(&self._volume_id),
                 block_idx,
             );
+            // On a grant-armed allocator the bitmap IS the free list
+            // (review round 1, Issue 7): a freed block is reallocated only
+            // through a GRANT — whose carve SETS its bit again — never off
+            // a local list with its bit clear (the double allocation a
+            // successor's re-grant of that clear bit would be). The
+            // holder's `false` here is the double-free shape the list's
+            // tripwire below reports on the unarmed path.
+            if self.block_grant_armed() {
+                if !cleared {
+                    log::error!(
+                        "DOUBLE FREE: offset {offset} (block {block_idx}) was already clear on \
+                         the allocation holder's bitmap; see block_double_frees"
+                    );
+                    crate::fuse_client::METRICS
+                        .block_double_frees
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
         }
         // FIND-RW5-A forensics (env-gated, diagnostic-only): record every
         // free's capture so a DOUBLE FREE names BOTH call sites.

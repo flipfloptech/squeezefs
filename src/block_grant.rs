@@ -136,12 +136,16 @@ impl BlockGrantLedger {
     }
 
     /// **Carve up to `want` blocks for `writer`** from `bitmap`: the lowest
-    /// run of clear bits at or above `floor` (the holder's fresh cursor —
-    /// the bitmap's highest set bit + 1 for a holder that prefers fresh
-    /// space, 0 to reuse the lowest hole), its bits SET here, before any
-    /// reply. Idempotent against the ledger: a writer whose unconsumed
-    /// grants (`held` = what the writer says it still holds) already cover
-    /// `want` is answered them verbatim.
+    /// run of clear bits at or above `floor` (the holder's PREFERENCE for
+    /// fresh space — the open grants' end; a hole below it is genuinely
+    /// free, since every granted bit is SET, so the carve falls back to
+    /// the lowest hole when nothing is clear above the floor), its bits
+    /// SET here, before any reply. Idempotent against the ledger: a writer
+    /// whose unconsumed grants (`held` = what the writer says it still
+    /// holds) already cover `want` is answered them verbatim. The bits
+    /// move under the ledger's lock; the HOLDING wraps this call in its
+    /// mutation lock and queues the deltas in the same critical section
+    /// (the ordering law — `kv::alloc_lease::AllocHolding::carve`).
     pub fn carve(
         &self,
         bitmap: &crate::data_alloc_bitmap::DataAllocBitmap,
@@ -220,8 +224,11 @@ impl BlockGrantLedger {
         if mine.is_empty() {
             grants.remove(writer);
         }
-        drop(grants);
+        // The bits move UNDER the lock (review round 1, Issue 2c): a
+        // racing carve of the same block cannot interleave between the
+        // table's change and the bitmap's.
         let cleared = bitmap.clear_run(range.start, u64::from(range.len));
+        drop(grants);
         self.blocks_returned.fetch_add(cleared, Ordering::Relaxed);
         Some(cleared)
     }
@@ -299,11 +306,12 @@ impl BlockGrantLedger {
 // ---------------------------------------------------------------------------
 
 /// The writer's open grants on one data volume and its position inside
-/// them. `next` is the CAS word every fresh mint advances; a refused mint
-/// (the window exhausted) never moves it. The window is refilled by
-/// APPENDING grants (a top-up), never by replacing one — a block already
-/// handed out is inside a grant that stays in the list until it is fully
-/// consumed.
+/// them: a mutex-held list of ranges consumed lowest-first (the fresh
+/// mint takes the list's lock — the grant cadence's scale, never a
+/// per-byte path); a refused mint (the window exhausted) moves nothing.
+/// The window is refilled by APPENDING grants (a top-up), never by
+/// replacing one — a block already handed out is inside a grant that
+/// stays in the list until it is fully consumed.
 #[derive(Debug, Default)]
 pub struct GrantWindow {
     grants: parking_lot::Mutex<Vec<BlockGrant>>,
@@ -401,13 +409,20 @@ impl GrantWindow {
     }
 }
 
-/// The writer's top-up sink: asked for `want` more blocks on this volume,
-/// answers the grant the holder carved (in-process: the holder's ledger
-/// directly; over the wire: `ManagerCall::BlockGrant`). `None` = the
-/// holder had nothing (full, or unreachable — the caller refuses
-/// `StorageFull`-class, never `ENOSPC`-poisons anything).
+/// The writer's top-up sink: asked for `want` more blocks on this volume
+/// (`0` = the holder's derivation) while it still holds `held_unconsumed`
+/// blocks of earlier grants (the §5.3.5 idempotency witness), answers the
+/// grants the holder carved or re-attested (in-process: the holder's
+/// ledger directly — `kv::alloc_lease::holder_block_grant_sink`; over the
+/// wire: `ManagerCall::BlockGrant` — `kv::alloc_lease::wire_block_grant_
+/// sink`). `None` = the holder had nothing (full, or unreachable — the
+/// caller refuses `StorageFull`-class, never `ENOSPC`-poisons anything).
 pub type BlockGrantSink = Arc<
-    dyn Fn(u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<BlockGrant>> + Send>>
+    dyn Fn(
+            u64,
+            u64,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<BlockGrant>>> + Send>>
         + Send
         + Sync,
 >;
@@ -421,8 +436,12 @@ static FREE_TARGETS: once_cell::sync::Lazy<scc::HashMap<u64, String>> =
 
 /// Register (or move) the allocation holder of data volume `vol_tag` —
 /// the endpoint a co-writer ships that volume's terminal frees to
-/// (`execute_shipped_frees` runs there verbatim). Learned from
-/// `alloc_lease:{vol_tag}` at every projection refresh.
+/// (`execute_shipped_frees` runs there verbatim). Installed by
+/// `kv::alloc_lease::install_wire_free_target` for a writer whose
+/// grants come over the wire from the holder's manager venue (the
+/// in-process holder itself clears its bits at `finish_free` and needs
+/// no target); PR 12's join ladder is the production installer for a
+/// second daemon, the contracts drive it here.
 pub fn install_free_target(vol_tag: u64, endpoint: String) {
     let _ = FREE_TARGETS.upsert_sync(vol_tag, endpoint);
 }

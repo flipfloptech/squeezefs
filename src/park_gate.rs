@@ -60,6 +60,10 @@ static HOME_VOLUME: AtomicU64 = AtomicU64::new(0);
 static T_PARK_MAX_MS: AtomicU64 = AtomicU64::new(0);
 /// `appender_park_ns` — exact-sum `wait_successor / reclaim_rtt / total`.
 static PARK_NS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// The park's raise instant on the process monotonic clock (0 = not
+/// parked) — the FUSE watchdog's age witness (the lease clock the park is
+/// judged by is the member's own, a manual one in the contracts).
+static PARKED_AT_MONO_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Which fence class an object's lease falls in at `T_self`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,15 +102,54 @@ pub fn arm_symmetric_appender(home_volume: u16, t_park_max: u64) {
     SYMMETRIC_APPENDER.store(true, Ordering::Release);
 }
 
-/// Disarm the posture (the plane's drop / test teardown). A standing park
-/// is released so no committer stays parked behind a plane that is gone.
+/// `T_park_max` for a failover bound under the S6 clocks in force: the
+/// grace term is `LeaseClocks::grace` — the owner-failover window — read
+/// off the derivation (review round 1, Issue 16).
+pub fn t_park_max_for(failover_bound_ms: u64, clocks: &crate::membership::LeaseClocks) -> u64 {
+    t_park_max_ms(failover_bound_ms, clocks.grace.as_millis() as u64)
+}
+
+/// The leave is releasing the held acks of LANDED entries over a standing
+/// park (Issue 18): `hold_acks` hands them back `Ok` while the door is
+/// closed to the committers that never landed.
+static LEAVE_RELEASING_ACKS: AtomicBool = AtomicBool::new(false);
+
+/// Disarm the posture (the plane's drop / the leave / test teardown). Over
+/// a STANDING park the leave splits the two populations (review round 1,
+/// Issue 18): the held acks of LANDED entries are released `Ok` — the
+/// entries are in ring 0, replayable, and the successor's recovery reads
+/// them — while the committers parked at the door are FAILED (`EIO`): the
+/// leave admits nothing into a ring whose region a successor may already
+/// have recovered (PR 10 owns the leave-vs-recovery interplay; this is the
+/// boundary it inherits).
 pub fn disarm_symmetric_appender() {
     SYMMETRIC_APPENDER.store(false, Ordering::Release);
     T_PARK_MAX_MS.store(0, Ordering::Release);
-    if GATE.release() {
-        ADMISSION_WAKE.notify_waiters();
-        ACK_WAKE.notify_waiters();
+    close_at_leave();
+}
+
+/// **The leave over a standing park** (Issue 18): the held acks of LANDED
+/// entries are released as they are (the entries are in ring 0,
+/// replayable), the door closes on the committers parked at it (`EIO` —
+/// they never landed, and a leave admits nothing into a region a
+/// successor may already have recovered). `true` ⇔ a park was standing.
+/// Not an expiry: `appender_park_expiries` does not move.
+pub fn close_at_leave() -> bool {
+    if !GATE.is_parked() {
+        return false;
     }
+    LEAVE_RELEASING_ACKS.store(true, Ordering::SeqCst);
+    ACK_WAKE.notify_waiters();
+    let closed = GATE.close_at_leave();
+    if closed {
+        ADMISSION_WAKE.notify_waiters();
+        log::warn!(
+            "symmetric appender LEAVING while parked: the landed entries' held acks are \
+             released (in ring 0, replayable); the committers parked at the door are failed — \
+             nothing is admitted into a region a successor may have recovered"
+        );
+    }
+    closed
 }
 
 /// `true` ⇔ this mount's `T_self` class is the park.
@@ -134,6 +177,10 @@ pub fn fence_at_t_self(class: FenceClass, now_ms: u64, reason: &str) -> TSelfAct
         }
         FenceClass::SymmetricAppender => match GATE.park(now_ms) {
             Some(inflight) => {
+                PARKED_AT_MONO_NS.store(
+                    crate::mono_core::monotonic_ns_u64().max(1),
+                    Ordering::Release,
+                );
                 log::warn!(
                     "symmetric appender PARKED at T_self ({reason}): {inflight} commit(s) in \
                      flight will land with their acks HELD, admission waits, reads and the \
@@ -208,7 +255,13 @@ pub async fn pre_admission() -> std::result::Result<AdmissionPass, std::io::Erro
 /// parked the outcomes wait here — in journal order, since the lane
 /// answers windows in handoff order and every later window queues behind
 /// this hold — and are handed back on the release; at expiry every `Ok`
-/// becomes `EIO`. Running ⇒ passed through untouched (one relaxed load).
+/// becomes `EIO`; at the LEAVE they are handed back as they are (Issue
+/// 18). Running ⇒ passed through untouched (one relaxed load). The hold
+/// rests on the TOKEN (review round 1, Issue 8): every entry here still
+/// owns its `AdmissionPass` (taken at the door, dropped at fan-out), so
+/// the parker's in-flight count is exactly the commits whose acks this
+/// hold will keep — the Dekker pair `park_core` models is what production
+/// relies on.
 pub async fn hold_acks<T, E>(
     outcomes: Vec<(T, std::result::Result<(), E>)>,
     expired: impl Fn(std::io::Error) -> E,
@@ -219,6 +272,9 @@ pub async fn hold_acks<T, E>(
     GATE.note_acks_held(outcomes.len() as u64);
     loop {
         let released = ACK_WAKE.notified();
+        if LEAVE_RELEASING_ACKS.load(Ordering::SeqCst) {
+            return outcomes;
+        }
         match GATE.state() {
             crate::park_core::PARKED => released.await,
             crate::park_core::EXPIRED => {
@@ -293,6 +349,19 @@ pub fn parked_for_ms(now_ms: u64) -> u64 {
     GATE.parked_for_ms(now_ms)
 }
 
+/// The standing park's age on the process monotonic clock, ms (0 when not
+/// parked) — what the FUSE op watchdog compares an op's age against.
+pub fn parked_age_mono_ms() -> u64 {
+    if !GATE.is_parked() {
+        return 0;
+    }
+    let since = PARKED_AT_MONO_NS.load(Ordering::Acquire);
+    if since == 0 {
+        return 0;
+    }
+    crate::mono_core::monotonic_ns_u64().saturating_sub(since) / 1_000_000
+}
+
 /// Commits in flight past the door.
 pub fn inflight() -> u64 {
     GATE.inflight()
@@ -332,6 +401,7 @@ pub fn park_ns() -> [u64; 3] {
 /// several parks in one process.
 pub fn test_reset() {
     disarm_symmetric_appender();
+    LEAVE_RELEASING_ACKS.store(false, Ordering::SeqCst);
     GATE.test_reset();
     for w in &PARK_NS {
         w.store(0, Ordering::Relaxed);

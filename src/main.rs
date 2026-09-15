@@ -6875,6 +6875,27 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 fs_engine.install_extent_assembler();
             }
 
+            // Symmetric metadata PR 8 (design-symmetric-metadata §5.5): on
+            // an ARMED symmetric mount every data volume's ALLOCATION LEASE
+            // is acquired first-come through volume 0's manager (this
+            // mount), held (fresh pages, or the own-residue re-hold), and
+            // each allocator is armed to mint from RANGED BLOCK GRANTS of
+            // that holding — the S9 lane partition above is superseded for
+            // the armed writer. `Ok(0)` and one load on every unarmed
+            // mount (the shipped posture exactly).
+            let held = squeezefs::meta_backend::kv::alloc_lease::arm_symmetric_allocation(
+                &routed_meta_backend,
+                &fs_engine.router.backend_router.lane_allocators(),
+            )
+            .await
+            .map_err(|e| format!("symmetric allocation lease refused to arm: {e}"))?;
+            if held > 0 {
+                log::info!(
+                    "symmetric metadata: {held} data volume allocation lease(s) held; fresh \
+                     blocks mint from ranged grants of this mount's holdings"
+                );
+            }
+
             // DLM S9: the CO-WRITER's own arm — the client halves of the same
             // three planes the authority serves. It installs the ownership map
             // (the authority owns EVERY volume, so every metadata verb ships),

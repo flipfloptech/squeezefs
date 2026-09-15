@@ -637,7 +637,7 @@ impl ExtentAllocator {
                 // kind; it is the allocation holder's and is applied by
                 // its own replay arm, never to the heap bitmap.
                 if crate::data_alloc_bitmap::is_data_alloc_delta_key(&rec.key) {
-                    crate::data_alloc_bitmap::note_replayed_delta(rec);
+                    crate::data_alloc_bitmap::note_replayed_delta(path, rec);
                     continue;
                 }
                 let delta = decode_alloc_record(rec)?;

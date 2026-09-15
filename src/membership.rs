@@ -2473,68 +2473,19 @@ impl MemberSession {
         self.words.fenced()
     }
 
-    /// PR 8: the SHIPPED terminal fence, bypassing the park arm — the
-    /// park expired or the reclaim was answered not-custody: the session
-    /// fences and a Writer's custody is poisoned exactly as before the
-    /// split.
-    pub fn self_fence_terminal(&self, reason: &str) -> SelfFence {
-        let first = self.words.fence();
-        if first {
-            METRICS
-                .membership_self_fences
-                .fetch_add(1, Ordering::Relaxed);
-            log::error!(
-                "membership member '{}' ({}) SELF-FENCED (terminal): {reason}",
-                self.id,
-                self.role.as_str()
-            );
-            if self.role == MemberRole::Writer {
-                crate::data_custody::poison(&format!(
-                    "membership lease of '{}' not reclaimable: {reason}",
-                    self.id
-                ));
-            }
-        }
-        SelfFence {
-            role: self.role,
-            poisoned_data_custody: self.role == MemberRole::Writer,
-            purge_requested: self.role == MemberRole::Reader,
-            first,
-            parked: false,
-        }
-    }
-
     /// **Fail-stop the affected objects ourselves** (§6.7): a writer
     /// poisons process data custody so no DMA can land after the owner may
     /// have re-granted; a reader is told to purge everything it caches.
     /// False-positive eviction then costs availability, never divergence.
+    ///
+    /// This is the SHIPPED terminal fence for EVERY object whose lease is
+    /// not reclaimable under the S6 grace contract — the S9 remote-custody
+    /// client's `T_self` (`data_grant::WriteCustodyClient::self_fence`
+    /// delegates here), the lane-redefinition and publish-era refusals,
+    /// the not-custody answer. It never parks (review round 1, Issue 4:
+    /// the class is decided by the OBJECT, at its caller — see
+    /// [`Self::self_fence_as`]).
     pub fn self_fence(&self, reason: &str) -> SelfFence {
-        // PR 8 — the `data_custody::poison` SPLIT (design-symmetric-
-        // metadata §5.5.3): a symmetric appender's Writer lease IS
-        // reclaimable under the S6 grace contract, so its `T_self` action
-        // is the PARK — the session stays unfenced and re-asserts as a
-        // reclaim every beat until the successor admits it or the park
-        // outlives `T_park_max` (then the shipped poison, below, via
-        // `park_gate::expire_if_due`).
-        if self.role == MemberRole::Writer && crate::park_gate::symmetric_appender_armed() {
-            let action = crate::park_gate::fence_at_t_self(
-                crate::park_gate::FenceClass::SymmetricAppender,
-                self.clock.now_ms(),
-                &format!(
-                    "membership lease of '{}' not renewed by T_self: {reason}",
-                    self.id
-                ),
-            );
-            if action != crate::park_gate::TSelfAction::Poisoned {
-                return SelfFence {
-                    role: self.role,
-                    poisoned_data_custody: false,
-                    purge_requested: false,
-                    first: action == crate::park_gate::TSelfAction::Parked,
-                    parked: true,
-                };
-            }
-        }
         let first = self.words.fence();
         if first {
             METRICS
@@ -2572,6 +2523,43 @@ impl MemberSession {
                 parked: false,
             },
         }
+    }
+
+    /// **The `T_self` fence of a NAMED class** (PR 8 — the
+    /// `data_custody::poison` SPLIT, design-symmetric-metadata §5.5.3):
+    /// [`crate::park_gate::FenceClass::RemoteCustody`] is
+    /// [`Self::self_fence`] verbatim; [`crate::park_gate::FenceClass::
+    /// SymmetricAppender`] — the symmetric appender's OWN membership lease,
+    /// whose slot leases and region ARE reclaimable in the successor's
+    /// grace window — PARKS a Writer on an armed mount (the session stays
+    /// unfenced and re-asserts as a reclaim every beat until the successor
+    /// admits it or the park outlives `T_park_max`, when the shipped poison
+    /// follows through `park_gate::expire_if_due`). The membership renewal
+    /// tick is the ONE caller that passes the appender class.
+    pub fn self_fence_as(&self, class: crate::park_gate::FenceClass, reason: &str) -> SelfFence {
+        if class == crate::park_gate::FenceClass::SymmetricAppender
+            && self.role == MemberRole::Writer
+            && crate::park_gate::symmetric_appender_armed()
+        {
+            let action = crate::park_gate::fence_at_t_self(
+                class,
+                self.clock.now_ms(),
+                &format!(
+                    "membership lease of '{}' not renewed by T_self: {reason}",
+                    self.id
+                ),
+            );
+            if action != crate::park_gate::TSelfAction::Poisoned {
+                return SelfFence {
+                    role: self.role,
+                    poisoned_data_custody: false,
+                    purge_requested: false,
+                    first: action == crate::park_gate::TSelfAction::Parked,
+                    parked: true,
+                };
+            }
+        }
+        self.self_fence(reason)
     }
 }
 
@@ -3098,8 +3086,12 @@ async fn arm_owner(
     for be in &rendezvous {
         publish_owner_record(be, &rec).await?;
     }
-    // PR 8 (KD-SYM-15): one shard per rendezvous volume served.
-    MEMBERSHIP_SHARDS.store(rendezvous.len() as u64, Ordering::Relaxed);
+    // PR 8 (KD-SYM-15): the shards this owner SERVES — one: its plane
+    // (review round 1, Issue 11: the records it WRITES number the
+    // rendezvous volumes, which is not a shard count; the owner-role
+    // fusion that makes volume `v`'s manager the S6 owner of the mounts
+    // homed on `v` — V shards served by V managers — is PR 12's).
+    MEMBERSHIP_SHARDS.store(1, Ordering::Relaxed);
     for be in volumes.iter().filter(|v| !v.is_read_only()) {
         if let Some(set) = ClaimSet::load(be).await {
             for m in set.writers() {
@@ -3463,17 +3455,25 @@ async fn member_renewal_tick_decided(
         // — returning it here stranded the mount fenced-forever with
         // `membership_mode` still reading `member`). A WRITER's fence
         // poisoned process data custody (S7) — terminal, never fresh.
-        let fence = session.self_fence(&format!("renewal failed: {e}"));
+        // PR 8 (§5.5.3): THIS lease — the membership lease of a symmetric
+        // appender — is the one object whose `T_self` action is the PARK
+        // (review round 1, Issue 4: the class is the object's, decided
+        // here; every other caller of `self_fence` is remote custody and
+        // poisons). The park stands; past `T_park_max` it expires into the
+        // shipped poison. While it stands the member RECLAIMS — one join
+        // presenting the epoch it holds, which is what a successor's grace
+        // window admits — every beat, against the successor the ledger
+        // names; the tick answers `Parked`, which the loop RETRIES.
+        let fence = session.self_fence_as(
+            crate::park_gate::FenceClass::SymmetricAppender,
+            &format!("renewal failed: {e}"),
+        );
         if fence.parked {
-            // PR 8 (§5.5.3): the park stands; past `T_park_max` it expires
-            // into the shipped poison. While it stands the member RECLAIMS
-            // — one renewal presenting the epoch it holds, which is what a
-            // successor's grace window admits — every beat.
             if crate::park_gate::expire_if_due(
                 clock.now_ms(),
                 "the successor never admitted the reclaim",
             ) {
-                let _ = session.self_fence_terminal("park expired");
+                let _ = session.self_fence("park expired past T_park_max");
                 return RenewalTick::Fenced;
             }
             return match reclaim_under_park(client, endpoint, secret, req, clock).await {
@@ -3535,6 +3535,9 @@ async fn member_renewal_tick_decided(
     // stale caches. The wire states this contract on
     // RPC_MEMBERSHIP_UNKNOWN_LEASE verbatim: "the member's correct
     // response is self-fence then re-join, not retry."
+    // Terminal on EVERY posture (review round 1, Issue 5): the owner's own
+    // verdict says the lease is gone — a park would stand for nothing and
+    // the loop-terminal `Fenced` below would leave it standing for ever.
     let reason = not_custody.expect("set on both arms above");
     let fence = session.self_fence(&reason);
     if fence.purge_requested {
@@ -3614,9 +3617,13 @@ async fn reclaim_under_park(
     let waited_ms = crate::park_gate::parked_for_ms(clock.now_ms());
     let mut reclaim = req.clone();
     reclaim.prior_epoch = Some(session.epoch());
+    // The successor the home volume's ledger names (review round 1, Issue
+    // 10 — design §5.5.3 item 2: the member watches for it through the
+    // fixed ledger's `writer_claim`); the venue the loop was spawned with
+    // until one is observed (an owner that was merely slow).
+    let venue = successor_endpoint().unwrap_or_else(|| endpoint.to_string());
     let t0 = std::time::Instant::now();
-    match crate::membership_wire::MemberClient::join(endpoint, secret, reclaim, clock.clone()).await
-    {
+    match crate::membership_wire::MemberClient::join(&venue, secret, reclaim, clock.clone()).await {
         Ok(fresh) => {
             install_member(Arc::clone(fresh.session()));
             *client = fresh;
@@ -3630,14 +3637,43 @@ async fn reclaim_under_park(
             // Evicted (a non-reclaimer past grace, or a live owner that
             // never lost us): the lease is not custody — terminal.
             crate::park_gate::expire_now(&reason);
-            let _ = session.self_fence_terminal(&reason);
+            let _ = session.self_fence(&reason);
             Some(RenewalTick::Fenced)
         }
         Err(e) => {
-            log::warn!("membership: reclaim under park refused ({e}); the park stands");
+            log::warn!(
+                "membership: reclaim under park against {venue} refused ({e}); the park stands \
+                 (next beat, or the ledger's successor observation)"
+            );
             None
         }
     }
+}
+
+/// The successor venue the home volume's ledger observation named (PR 8
+/// §5.5.3 item 2): `None` until observed. The parked reclaim joins it;
+/// PR 10's ledger poll is the production writer, the contracts the seam.
+static SUCCESSOR_ENDPOINT: once_cell::sync::Lazy<arc_swap::ArcSwapOption<String>> =
+    once_cell::sync::Lazy::new(arc_swap::ArcSwapOption::empty);
+/// Wakes the PARKED renewal loop the instant a successor is observed
+/// (it otherwise paces at the renewal beat — review round 1, Issue 10:
+/// never a 1 ms spin against the dead venue).
+static SUCCESSOR_WAKE: squeezefs_ipc::sqz_notify::Notify = squeezefs_ipc::sqz_notify::Notify::new();
+
+/// The ledger observation: a successor manager (its S6 venue) was seen
+/// on the home volume — `None` withdraws it (the observation aged out, a
+/// leave). Wakes a parked renewal loop.
+pub fn note_successor_observed(endpoint: Option<String>) {
+    SUCCESSOR_ENDPOINT.store(endpoint.map(Arc::new));
+    SUCCESSOR_WAKE.notify_waiters();
+}
+
+/// The successor venue in force, if observed.
+pub fn successor_endpoint() -> Option<String> {
+    SUCCESSOR_ENDPOINT
+        .load()
+        .as_ref()
+        .map(|s| s.as_ref().clone())
 }
 
 /// PR 8: the membership BEAT in force — `T_renewal`, the ranged block
@@ -3653,14 +3689,20 @@ pub fn renewal_beat_ms() -> u64 {
     }
     LeaseClocks::derive(Duration::ZERO)
         .map(|c| c.renew_interval.as_millis() as u64)
-        .unwrap_or(10_000)
+        .unwrap_or(RENEWAL_BEAT_FALLBACK_MS)
         .max(1)
 }
 
-/// PR 8 (KD-SYM-15): the membership SHARDS this owner serves — one per
-/// volume it wrote a rendezvous record to (the per-volume `membership_
-/// owner` record; volume `v`'s manager is the S6 owner for mounts homed on
-/// `v`). 0 on a mount that is not an owner.
+/// The beat's fallback when the clocks refuse to derive: the shipped
+/// heartbeat's physical default (`CLIENT_HEARTBEAT_INTERVAL_SECS` — the
+/// same constant `LeaseClocks::with_params` floors the renewal interval
+/// on), named so the tie test can read it (review round 1, Issue 17).
+pub const RENEWAL_BEAT_FALLBACK_MS: u64 = crate::fuse_client::CLIENT_HEARTBEAT_INTERVAL_SECS * 1000;
+
+/// PR 8 (KD-SYM-15): the membership SHARDS this owner SERVES — its one
+/// plane (volume `v`'s manager as the S6 owner of the mounts homed on `v`,
+/// V shards over V managers, is PR 12's owner-role fusion). 0 on a mount
+/// that is not an owner.
 static MEMBERSHIP_SHARDS: AtomicU64 = AtomicU64::new(0);
 
 /// `membership_shards`.
@@ -3708,20 +3750,39 @@ fn spawn_member_renewal(
     crate::meta_exec::spawn_lease("membership_renewal", async move {
         loop {
             let now = clock.now_ms();
-            let due = client.session().renew_at_ms().saturating_sub(now).max(1);
+            // PR 8 (review round 1, Issue 10): a PARKED member's
+            // `renew_at_ms` is in the past — its beat is the renewal
+            // interval (never a 1 ms spin against the dead venue), cut
+            // short by the ledger's successor observation.
+            let parked = crate::park_gate::is_parked();
+            let due = if parked {
+                client.session().renew_interval_ms().max(1)
+            } else {
+                client.session().renew_at_ms().saturating_sub(now).max(1)
+            };
             // The beat's due instant — a routine renewal's DECISION
             // instant for `membership_renew_phase_ns.carry_wait`.
             let beat_due = std::time::Instant::now() + Duration::from_millis(due);
             // The beat is the authority; a wake (lever (b): a promoted
             // acknowledgement) only brings the renewal forward — as a
             // CARRIAGE renewal, which leaves the beat and the label to
-            // the routine one.
-            let carriage = squeezefs_ipc::sqz_time::timeout(
-                Duration::from_millis(due),
-                renewal_wake().notified(),
-            )
-            .await
-            .is_ok();
+            // the routine one. A parked loop wakes on the successor
+            // observation instead.
+            let carriage = if parked {
+                let _ = squeezefs_ipc::sqz_time::timeout(
+                    Duration::from_millis(due),
+                    SUCCESSOR_WAKE.notified(),
+                )
+                .await;
+                false
+            } else {
+                squeezefs_ipc::sqz_time::timeout(
+                    Duration::from_millis(due),
+                    renewal_wake().notified(),
+                )
+                .await
+                .is_ok()
+            };
             if stop.load(Ordering::Acquire) {
                 let _ = client.leave().await;
                 return;

@@ -2655,6 +2655,21 @@ impl NodeCache {
             .unwrap_or(0)
     }
 
+    /// Every slot with a noted frontier ABOVE `tail`, ascending — the
+    /// slots whose records a ring's window still holds (a grant's
+    /// clearing set; review round 5, Issue 28).
+    pub fn slot_record_frontiers_above(&self, tail: u64) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.slot_frontiers.iter_sync(|slot, c| {
+            if c.load(Ordering::Acquire) > tail {
+                out.push(*slot);
+            }
+            true
+        });
+        out.sort_unstable();
+        out
+    }
+
     /// Fold a departing NODE's `dirty_floor` (see [`Self::note_dying_floor`])
     /// into the accumulator its ring owns: a slot-stamped node's — leaf
     /// or interior, since PR 3 journals a leased slot tree's flips into

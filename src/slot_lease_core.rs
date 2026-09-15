@@ -275,6 +275,22 @@ impl LeaseGate {
         self.foreign[w].load(Ordering::Acquire) & bit != 0
     }
 
+    /// Mark `slot` as another appender's AHEAD of the durable grant (the
+    /// RAM table already names the holder — review round 5, Issue 28):
+    /// a structural pass that starts from here skips it. Rolled back with
+    /// the table by [`Self::clear_foreign`] when the grant's write fails;
+    /// the next whole-set [`Self::install_foreign`] is idempotent over it.
+    pub fn mark_foreign(&self, slot: Slot) {
+        let (w, bit) = Self::index(slot);
+        self.foreign[w].fetch_or(bit, Ordering::Release);
+    }
+
+    /// Withdraw a [`Self::mark_foreign`] (a failed grant, a release).
+    pub fn clear_foreign(&self, slot: Slot) {
+        let (w, bit) = Self::index(slot);
+        self.foreign[w].fetch_and(!bit, Ordering::Release);
+    }
+
     /// Publish a lease of `slot` to the commit path.
     pub fn grant(&self, slot: Slot) {
         let (w, bit) = Self::index(slot);

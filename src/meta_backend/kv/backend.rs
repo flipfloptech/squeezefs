@@ -3395,16 +3395,28 @@ impl KvMetaBackend {
                         last_written,
                         seq_floor,
                         ..
-                    } => crate::slot_lease_core::SlotLease::unleased(
-                        g,
-                        last_written,
-                        crate::slot_lease_core::SlotWords {
-                            root: (root.addr, root.seq),
-                            cursor,
-                            extents: slot_tree_extents,
-                            seq_floor,
-                        },
-                    ),
+                    } => {
+                        // An UNLEASED tree's structure is the manager's
+                        // (Issue 25), so its records are ring 0's from
+                        // here: ring 0 stamps above the departing ring's
+                        // frontier the release recorded — the seq-space
+                        // law's grant step, taken for the manager's
+                        // structural custody (review round 5, Issue 28:
+                        // a merge's parent flips stamped below the
+                        // lessee's split pointers were SHADOWED by the
+                        // leaf fold and routed to retired leaves).
+                        self.ring.raise_seq_floor(seq_floor);
+                        crate::slot_lease_core::SlotLease::unleased(
+                            g,
+                            last_written,
+                            crate::slot_lease_core::SlotWords {
+                                root: (root.addr, root.seq),
+                                cursor,
+                                extents: slot_tree_extents,
+                                seq_floor,
+                            },
+                        )
+                    }
                     super::slot_state::SlotState::Leased {
                         appender_id,
                         g,
@@ -3902,6 +3914,94 @@ impl KvMetaBackend {
         entry_len_for(&puts)
     }
 
+    /// Roll back the grants of one `manager_acquire_slots` call that were
+    /// not yet written: the RAM table must not run ahead of tree 0. The
+    /// rolled-back entry keeps the `g` the grant minted (one ahead of
+    /// tree 0's) and `last_written = 0` — harmless by construction: `g`
+    /// only ever needs to be strictly monotone per slot (the next grant
+    /// mints above it), and a never-written rank puts the slot first for
+    /// `prefer: unleased-then-idle`, which is where a slot nobody wrote
+    /// belongs (Issue 18). A wire appender's `foreign` marks go with the
+    /// table (Issue 28).
+    fn roll_back_unwritten_grants(
+        &self,
+        plane: &super::slot_lease::SlotLeasePlane,
+        appender_id: u32,
+        fresh: &[super::record::ForestSlot],
+        wire_appender: bool,
+    ) {
+        for s in fresh {
+            let l = plane.table.get(*s);
+            let _ = plane.table.release(
+                *s,
+                appender_id,
+                l.map_or(0, |l| l.g),
+                l.map_or_else(Default::default, |l| l.words),
+                0,
+            );
+            if wire_appender {
+                plane.gate.clear_foreign(*s);
+            }
+        }
+    }
+
+    /// Cycle the checkpoint under the caller's SMO hold until ring 0's
+    /// window is CLEAR of every UNLEASED slot's records (`explicit` names
+    /// the slots a grant will hand out; empty = every unleased slot with
+    /// a frontier above the tail — a rotor ask's candidates are picked
+    /// later, under the verb mutex). The manager's structural moves on an
+    /// unleased tree journal into ring 0 (Issue 25), and the next open
+    /// judges them against tree 0's FINAL lessee (`Lease` — the detector
+    /// is window-scoped, never ordered): a slot handed to another appender
+    /// while its records sit in ring 0's window would refuse that open.
+    /// The handover's post-condition law (`flush_slot_clear_of_region`)
+    /// for the manager's side; bounded, loud on a stuck tail. Nothing can
+    /// add to a cleared slot before the grant: SMOs need the mutex this
+    /// caller holds, content needs a first-touch acquire that would make
+    /// the slot the manager's and refuse the grant (Issue 28).
+    async fn clear_ring0_window_of_unleased(
+        &self,
+        smo: &mut super::tree::SmoContext,
+        explicit: &[super::record::ForestSlot],
+    ) -> std::result::Result<(), KvError> {
+        const CLEAR_CYCLES_MAX: u32 = 64;
+        let Some(plane) = self.slot_leases() else {
+            return Ok(());
+        };
+        let pending = |tail: u64| -> Vec<super::record::ForestSlot> {
+            self.cache
+                .slot_record_frontiers_above(tail)
+                .into_iter()
+                .filter(|s| explicit.is_empty() || explicit.contains(s))
+                .filter(|s| !plane.gate.is_leased(*s) && !plane.gate.is_foreign(*s))
+                .collect()
+        };
+        for cycle in 0..=CLEAR_CYCLES_MAX {
+            let tail = self.ring.core().reusable_upto();
+            let slots = pending(tail);
+            if slots.is_empty() {
+                if cycle > 2 {
+                    log::info!(
+                        "meta volume {}: ring 0's window cleared of the unleased slots a grant \
+                         hands out after {cycle} checkpoint cycles",
+                        self.path.display()
+                    );
+                }
+                return Ok(());
+            }
+            if cycle == CLEAR_CYCLES_MAX {
+                return Err(KvError::Corrupt(format!(
+                    "{}: ring 0's window did not clear of unleased slot(s) {slots:?} in \
+                     {CLEAR_CYCLES_MAX} checkpoint cycles (tail {tail}) — a stuck tail is a \
+                     defect, never a longer wait",
+                    self.path.display()
+                )));
+            }
+            self.checkpoint_cycle(smo, true).await?;
+        }
+        Ok(())
+    }
+
     /// The manager's `AcquireSlots` / `AcquireSlot` executor for
     /// `appender_id` (§5.1.2 / §5.3.5): `explicit` names the slots (first-
     /// writer-takes-it, the native slot, a declared region's seam slots),
@@ -3962,8 +4062,33 @@ impl KvMetaBackend {
         // Released on drop from here to the write — every early return
         // and `?` below hands the budget back (Issue 27).
         let pre_admission = HeldAdmission::new(self.ring.core(), pre_admission);
+        // A grant to ANY OTHER appender serializes with the manager's
+        // structural passes over the tree it hands out (review round 5,
+        // Issue 28): the SMO mutex — taken BEFORE `manager_verbs`, the
+        // checkpoint task's own order — so no manager SMO on the slot is
+        // in flight while the lease moves (an in-flight `try_merge_node`
+        // would land its records in ring 0 for a slot tree 0 now leases
+        // elsewhere, its root published nowhere) and no pass can span the
+        // grant (the pass holds the mutex, so its per-pass filter and the
+        // gate's belt can never disagree — a legal race never reaches the
+        // belt). Under it, ring 0's window is cycled CLEAR of every
+        // unleased slot the grant may hand out: the manager's merge
+        // records for the slot would otherwise be judged at the next open
+        // against tree 0's final lessee (`Lease`). The manager's own
+        // first touch takes neither: its SMOs are region 0's whatever the
+        // gate bit says. A wire ask is `Try`, so nothing parks under the
+        // mutex; the cadence's tick waits out one grant.
+        let _smo_guard = if appender_id != 0 {
+            let mut smo = self.smo.lock().await;
+            self.clear_ring0_window_of_unleased(&mut smo, explicit)
+                .await?;
+            Some(smo)
+        } else {
+            None
+        };
         let _g = self.manager_verbs.lock().await;
         plane.acquires.fetch_add(1, Ordering::Relaxed);
+        let wire_appender = set.region(appender_id).is_none();
         let now = crate::mono_core::monotonic_ns_u64();
         let m = plane.mint_slots();
         let candidates: Vec<super::record::ForestSlot> = if rotor_ask {
@@ -3995,6 +4120,13 @@ impl KvMetaBackend {
         for slot in candidates {
             match plane.table.acquire(slot, appender_id, now, rotor_ask) {
                 crate::slot_lease_core::AcquireOutcome::Granted { g, words } => {
+                    // RAM ahead of the durable write (Issue 28): the gate
+                    // reads the slot as another appender's from the
+                    // acquire on, rolled back with the table on a failed
+                    // write.
+                    if wire_appender {
+                        plane.gate.mark_foreign(slot);
+                    }
                     let value = super::slot_state::SlotState::Leased {
                         appender_id,
                         g,
@@ -4042,16 +4174,7 @@ impl KvMetaBackend {
                         // never-written rank puts the slot first for
                         // `prefer: unleased-then-idle`, which is where a
                         // slot nobody wrote belongs (Issue 18).
-                        for s in &fresh {
-                            let l = plane.table.get(*s);
-                            let _ = plane.table.release(
-                                *s,
-                                appender_id,
-                                l.map_or(0, |l| l.g),
-                                l.map_or_else(Default::default, |l| l.words),
-                                0,
-                            );
-                        }
+                        self.roll_back_unwritten_grants(&plane, appender_id, &fresh, wire_appender);
                         // The "ship to the holder" answer — §5.1.4's
                         // normal reply, never a witness contradiction
                         // (Issue 14: its own gauge).
@@ -4070,40 +4193,39 @@ impl KvMetaBackend {
             // through its own context is one its grant claims.
             let mut arriving: Vec<u64> = Vec::new();
             if appender_id != 0 {
-                for s in &fresh {
-                    arriving.extend(self.slot_tree_image_extents(*s).await?);
+                let staged = async {
+                    for s in &fresh {
+                        arriving.extend(self.slot_tree_image_extents(*s).await?);
+                    }
+                    arriving.sort_unstable();
+                    arriving.dedup();
+                    if !arriving.is_empty() {
+                        let record = self.extent_grant_record(appender_id).await?;
+                        let merged = super::slot_state::ExtentGrantRecord::from_extents(
+                            record.extents().chain(arriving.iter().copied()),
+                        );
+                        puts.push((
+                            tag,
+                            Record::put(
+                                super::slot_state::extent_grant_key(appender_id),
+                                0,
+                                merged.encode()?,
+                            ),
+                        ));
+                    }
+                    Ok::<(), KvError>(())
                 }
-                arriving.sort_unstable();
-                arriving.dedup();
-                if !arriving.is_empty() {
-                    let record = self.extent_grant_record(appender_id).await?;
-                    let merged = super::slot_state::ExtentGrantRecord::from_extents(
-                        record.extents().chain(arriving.iter().copied()),
-                    );
-                    puts.push((
-                        tag,
-                        Record::put(
-                            super::slot_state::extent_grant_key(appender_id),
-                            0,
-                            merged.encode()?,
-                        ),
-                    ));
+                .await;
+                if let Err(e) = staged {
+                    self.roll_back_unwritten_grants(&plane, appender_id, &fresh, wire_appender);
+                    return Err(e);
                 }
             }
             if let Err(e) = self
                 .write_control_entry(puts, pre_admission.into_entry())
                 .await
             {
-                for s in &fresh {
-                    let l = plane.table.get(*s);
-                    let _ = plane.table.release(
-                        *s,
-                        appender_id,
-                        l.map_or(0, |l| l.g),
-                        l.map_or_else(Default::default, |l| l.words),
-                        0,
-                    );
-                }
+                self.roll_back_unwritten_grants(&plane, appender_id, &fresh, wire_appender);
                 return Err(e);
             }
             if let Some(r) = set.region(appender_id).filter(|_| !arriving.is_empty()) {
@@ -4491,6 +4613,20 @@ impl KvMetaBackend {
         if let Some(r) = set.region(appender_id).filter(|_| !leaving.is_empty()) {
             r.grant().transfer_out(&leaving);
         }
+        // Unleased: the tree's structure is the MANAGER's from here (Issue
+        // 25) — the seq-space law's GRANT step, taken for ring 0: it
+        // stamps above the departing ring's frontier from now on (a
+        // manager merge's parent flips stamped below the lessee's split
+        // pointers were shadowed by the fold and routed to retired leaves
+        // — review round 5, Issue 28), the slot's record frontier becomes
+        // a position in ring 0 (reset to its head — the departing ring's
+        // positions are not comparable; a grant's clearing would otherwise
+        // wait on them, Issue 22's law on the release side), and the gate
+        // no longer reads the slot as another appender's.
+        self.ring.raise_seq_floor(words.seq_floor);
+        self.cache
+            .reset_slot_record_frontier(slot, self.ring.core().head());
+        plane.gate.clear_foreign(slot);
         plane.clear_recall(appender_id, slot);
         plane.holders.forget(slot);
         match plane

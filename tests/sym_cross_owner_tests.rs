@@ -116,6 +116,31 @@ fn set_opts(dir: &std::path::Path) -> FormatV3Options {
     }
 }
 
+/// A stamped SET of `n` metadata volumes (one plan, one set uuid — the
+/// per-volume stamps of `plan_meta_slot_set(n)`); the format config
+/// rides volume 0.
+async fn format_stamped_set(dir: &std::path::Path, n: usize) -> Vec<String> {
+    let plan = plan_meta_slot_set(n).expect("derived plan");
+    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
+    let mut uris = Vec::with_capacity(n);
+    for i in 0..n {
+        let p = dir.join(format!("meta{i}"));
+        std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+        let opts = FormatV3Options {
+            format_config_xattr: (i == 0).then(|| format_config_for(dir)),
+            ..set_opts(dir)
+        };
+        let r = format_v3_stamped(&p, VOL_LEN, &opts, plan.stamps[i].clone()).await;
+        if r.is_err() {
+            std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        }
+        r.expect("format set member");
+        uris.push(p.display().to_string());
+    }
+    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    uris
+}
+
 async fn format_member(dir: &std::path::Path, name: &str, stamped: bool) -> String {
     let p = dir.join(name);
     std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
@@ -981,6 +1006,29 @@ async fn a_file_rename_never_takes_the_dir_rename_lock_and_every_directory_renam
     fsck_clean(&uris).await;
 }
 
+/// A wire joiner on the manager's listener: joined through
+/// `JoinAppender` (PR 3/4's fixture), so its appender id names a `Live`
+/// directory page — the identity every slot verb, and since review
+/// round 1 the two lock verbs, is screened against.
+fn joiner_identity(n: u64) -> squeezefs::meta_backend::kv::appender::AppenderIdentity {
+    squeezefs::meta_backend::kv::appender::AppenderIdentity {
+        node_token: 0x5EED_0000_0000_0000 | n,
+        mount_slot: 0x1000 + n as u32,
+        writer_id: 0xABCD_0000 + u128::from(n),
+    }
+}
+
+async fn wire_joiner(endpoint: &str, n: u64, volume: u16) -> (ManagerClient, u32) {
+    let mut client = ManagerClient::connect(endpoint, SECRET, &format!("joiner-{n}"), volume)
+        .await
+        .expect("storage-trust enrollment");
+    let reply = client.join(joiner_identity(n), 0).await.unwrap();
+    let ManagerReply::Joined { appender_id, .. } = reply else {
+        panic!("{reply:?}");
+    };
+    (client, appender_id)
+}
+
 /// The lock is a DURABLE record in tree 0 of volume 0 (`dir_rename`),
 /// served by the manager's verbs on the wire: `DirRenameLock` grants or
 /// answers `already` to its holder and `busy` to another; `DirRenameUnlock`
@@ -1001,22 +1049,25 @@ async fn the_dir_rename_lock_is_durable_in_tree0_and_a_dead_holders_lock_is_rele
     )
     .unwrap();
     let endpoint = host.endpoint().to_string();
-    let mut client = ManagerClient::connect(&endpoint, SECRET, "joiner-7", 0)
-        .await
-        .unwrap();
+    let (mut a, id_a) = wire_joiner(&endpoint, 7, 0).await;
+    let (mut b, id_b) = wire_joiner(&endpoint, 9, 0).await;
     assert!(vol.dir_rename_record().await.unwrap().is_none());
-    match client.dir_rename_lock(7).await.unwrap() {
+    match a.dir_rename_lock(id_a).await.unwrap() {
         ManagerReply::DirRenameLocked { already } => assert!(!already),
         other => panic!("{other:?}"),
     }
     let rec = vol.dir_rename_record().await.unwrap().expect("durable");
-    assert_eq!(rec.holder, 7);
-    match client.dir_rename_lock(7).await.unwrap() {
+    assert_eq!(rec.holder, id_a);
+    assert!(
+        rec.since_ns > 1_600_000_000 * 1_000_000_000,
+        "a realtime stamp"
+    );
+    match a.dir_rename_lock(id_a).await.unwrap() {
         ManagerReply::DirRenameLocked { already } => assert!(already, "KD-SYM-7"),
         other => panic!("{other:?}"),
     }
-    match client.dir_rename_lock(9).await.unwrap() {
-        ManagerReply::DirRenameBusy { holder } => assert_eq!(holder, 7),
+    match b.dir_rename_lock(id_b).await.unwrap() {
+        ManagerReply::DirRenameBusy { holder } => assert_eq!(holder, id_a),
         other => panic!("{other:?}"),
     }
     // The in-process manager's own take parks behind the wire holder;
@@ -1027,16 +1078,93 @@ async fn the_dir_rename_lock_is_durable_in_tree0_and_a_dead_holders_lock_is_rele
     };
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     assert!(!waiter.is_finished(), "the manager parks behind the holder");
-    vol.manager_dir_rename_release_dead(7).await.unwrap();
+    vol.manager_dir_rename_release_dead(id_a).await.unwrap();
     let lock = waiter.await.unwrap().expect("granted after the release");
     assert_eq!(vol.dir_rename_record().await.unwrap().unwrap().holder, 0);
     lock.release().await.unwrap();
     assert!(vol.dir_rename_record().await.unwrap().is_none());
-    match client.dir_rename_unlock(7).await.unwrap() {
+    match a.dir_rename_unlock(id_a).await.unwrap() {
         ManagerReply::DirRenameUnlocked { already } => assert!(already),
         other => panic!("{other:?}"),
     }
     assert_eq!(vol.appender_stats().unwrap().manager_verb_refusals, 0);
+    assert_eq!(vol.appender_stats().unwrap().manager_verb_rejected, 0);
+    host.shutdown();
+    shutdown(&routed).await;
+}
+
+/// The lock verbs' wire words are SCREENED (review round 1, Issue 3 —
+/// PR 4 round 6's law for every slot verb): the id must name a `Live`
+/// directory page and never one of this mount's own regions; an unlock
+/// naming an id that is not the holder while another holds the lock is a
+/// foreign release — `Rejected` + `manager_verb_rejected`, nothing
+/// written; the verbs are volume 0's manager's alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_lock_verbs_reject_a_foreign_unlock_a_dead_id_and_any_volume_but_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = format_stamped_set(dir.path(), 2).await;
+    let routed = open_under(&uris, true, None).await;
+    let vol0 = Arc::clone(&routed.volumes[0]);
+    let host = cw::RpcListener::start_async(
+        listener_cfg(),
+        SECRET.to_vec(),
+        Arc::new(AsyncVerbRouter::new().with_manager(ManagerSetService::new(&routed.volumes))),
+    )
+    .unwrap();
+    let endpoint = host.endpoint().to_string();
+    let (mut a, id_a) = wire_joiner(&endpoint, 7, 0).await;
+    let (mut b, id_b) = wire_joiner(&endpoint, 9, 0).await;
+    let rejected_before = vol0.appender_stats().unwrap().manager_verb_rejected;
+    match a.dir_rename_lock(id_a).await.unwrap() {
+        ManagerReply::DirRenameLocked { already } => assert!(!already),
+        other => panic!("{other:?}"),
+    }
+    // The client surfaces `STATUS_REJECTED` as `Err` (the slot verbs'
+    // convention); the record is what says nothing was written.
+    let rejected = |r: squeezefs::error::Result<ManagerReply>| {
+        matches!(r, Err(squeezefs::error::SqueezefsError::InvalidOperation(ref m))
+            if m.contains("manager_verb_rejected"))
+    };
+    // A foreign unlock: B releases A's lock — rejected, the record stays.
+    assert!(
+        rejected(b.dir_rename_unlock(id_b).await),
+        "an unlock by a non-holder while another holds is a foreign release"
+    );
+    assert_eq!(
+        vol0.dir_rename_record().await.unwrap().unwrap().holder,
+        id_a
+    );
+    // A lock under an id with no Live page — rejected, nothing parked.
+    assert!(rejected(b.dir_rename_lock(4242).await));
+    // A lock naming the manager's OWN region from the wire — rejected.
+    assert!(rejected(b.dir_rename_lock(vol0.own_appender_id()).await));
+    match a.dir_rename_unlock(id_a).await.unwrap() {
+        ManagerReply::DirRenameUnlocked { already } => assert!(!already),
+        other => panic!("{other:?}"),
+    }
+    assert!(vol0.dir_rename_record().await.unwrap().is_none());
+    // The verbs on volume 1: rejected — the set-wide lock is volume 0's.
+    let mut on_vol1 = ManagerClient::connect(&endpoint, SECRET, "joiner-7", 1)
+        .await
+        .unwrap();
+    assert!(rejected(on_vol1.dir_rename_lock(id_a).await));
+    assert!(rejected(on_vol1.dir_rename_unlock(id_a).await));
+    assert!(routed.volumes[1]
+        .dir_rename_record()
+        .await
+        .unwrap()
+        .is_none());
+    let rejected = vol0.appender_stats().unwrap().manager_verb_rejected - rejected_before
+        + routed.volumes[1]
+            .appender_stats()
+            .unwrap()
+            .manager_verb_rejected;
+    assert_eq!(
+        rejected, 5,
+        "every screen refusal counted on manager_verb_rejected"
+    );
+    assert_eq!(vol0.appender_stats().unwrap().manager_verb_refusals, 0);
     host.shutdown();
     shutdown(&routed).await;
 }

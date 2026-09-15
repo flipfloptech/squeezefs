@@ -1022,6 +1022,37 @@ proptest! {
         );
     }
 
+    /// Symmetric PR 6 (review round 1, Issue 3): the two lock verbs' wire
+    /// screen is total and admits exactly volume 0 + a Live non-own id +
+    /// the holder for an unlock (the fuzz target `manager_call_frame`'s
+    /// `check_dir_rename_screen`, on stable).
+    #[test]
+    fn dir_rename_lock_words_are_screened_before_any_effect(
+        volume in prop::option::of(any::<u16>()),
+        appender_id in any::<u32>(),
+        is_own in any::<bool>(),
+        live in any::<bool>(),
+        holder_class in 0u8..4,
+        other in any::<u32>(),
+    ) {
+        use squeezefs::meta_backend::kv::backend::screen_dir_rename_words;
+        let unlock_of = match holder_class {
+            0 => None,
+            1 => Some(None),
+            2 => Some(Some(appender_id)),
+            _ => Some(Some(other)),
+        };
+        let admissible = volume == Some(0)
+            && !is_own
+            && live
+            && !matches!(unlock_of, Some(Some(h)) if h != appender_id);
+        let verdict = screen_dir_rename_words(volume, appender_id, is_own, live, unlock_of);
+        prop_assert_eq!(verdict.is_ok(), admissible, "{:?}", verdict);
+        if let Err(reason) = verdict {
+            prop_assert!(!reason.is_empty());
+        }
+    }
+
     /// The cluster wire's `RpcFrame` reader (every distributed plane's
     /// transport) and the S8 verb-body decoders are total over an
     /// arbitrary byte STREAM under every class cap; an arbitrary tag never

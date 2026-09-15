@@ -1889,6 +1889,61 @@ async fn a_failed_windows_rollback_recalls_the_readers_holding_its_records() {
     shutdown(&writer).await;
 }
 
+/// **The `..` reconnect scan fails CLOSED on a token reader** (review
+/// round 1, Issue 19): `LOOKUP(dir, "..")` off the `open_by_handle_at`
+/// reconnect path resolves the parent by a reverse dentry-tree scan —
+/// on a token reader that scan would read the S5 projection, a
+/// bounded-staleness read of user-visible metadata (R-SYM-4's second
+/// method) on a cold rare path. The reader refuses `ESTALE` (the
+/// reconnect path's own errno), the projection is never read, and the
+/// connected `..` (the kernel's dcache) is untouched; the writer's own
+/// scan serves as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_dotdot_reconnect_scan_fails_closed_on_a_token_reader() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let d = Metadata::create(writer.as_ref(), 1, "d", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let sub = Metadata::create(writer.as_ref(), d, "sub", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-dotdot").await;
+    let scans0 = squeezefs::fuse_client::METRICS
+        .meta_parent_scans
+        .load(Ordering::Relaxed);
+    let err = Metadata::lookup(reader.as_ref(), sub, "..")
+        .await
+        .expect_err("the reconnect scan is refused on a token reader");
+    assert_eq!(err.to_errno(), libc::ESTALE, "{err}");
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .meta_parent_scans
+            .load(Ordering::Relaxed),
+        scans0,
+        "the projection was never scanned"
+    );
+    // The writer's own reconnect scan is untouched.
+    let p = Metadata::lookup(writer.as_ref(), sub, "..").await.unwrap();
+    assert_eq!(p.ino, d);
+    // Every other resolve on the reader serves under tokens.
+    assert_eq!(
+        Metadata::lookup(reader.as_ref(), d, "sub")
+            .await
+            .unwrap()
+            .ino,
+        sub
+    );
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
 /// The negative contract: `SQUEEZEFS_SYMMETRIC_META=0` and a flat volume
 /// carry NO token plane — no holder, no reader, the recall gate off, the
 /// Token family 0 — and an unarmed forest's frames are v2 under the

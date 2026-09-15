@@ -2471,6 +2471,159 @@ async fn the_manager_merges_an_unleased_slot_tree_and_skips_a_foreign_leased_one
     shutdown(&routed).await;
 }
 
+/// **Issue 28 (round 5): a wire grant of an UNLEASED tree serializes with
+/// the manager's structural pass on it and clears ring 0's window of the
+/// slot before tree 0 names the lessee.** Region 1 releases slot 4 with
+/// underfull pairs; the manager's sweep parks INSIDE `try_merge_node` on
+/// that tree (the build-pause seam — successor built, no locks held); a
+/// wire joiner's `AcquireSlot` for the slot is issued while it is parked.
+/// The grant must WAIT for the pass (the SMO mutex — the sweep holds it
+/// for its whole pass), then cycle ring 0's tail past the slot's record
+/// frontier (the merge's interior records would otherwise be the `Lease`
+/// violation the next open refuses, judged by tree 0's final lessee),
+/// mark the slot foreign in RAM ahead of the durable write, and only then
+/// publish the lease with the tree's CURRENT root. Before the fix the
+/// grant landed during the park and the released merge either landed on a
+/// slot tree 0 now leases elsewhere (records in ring 0, an unpublished
+/// root, the merged-away leaves freed under the lessee's root) or hit the
+/// belt (`Corrupt`, the must-stay-0 gauge, the pass aborted). ×10 in the
+/// battery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wire_grant_of_an_unleased_tree_waits_for_the_sweep_and_clears_its_window() {
+    use squeezefs::meta_backend::kv::tree::{
+        test_smo_build_pause_arm_slot, test_smo_build_pause_release, TEST_SMO_BUILD_PAUSED,
+    };
+    use squeezefs::meta_backend::kv::META_KV_NODE_MERGES;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let refusals0 = META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed);
+    let value = vec![0x42u8; 12 * 1024];
+    for k in 0..40u64 {
+        vol.setxattr_internal(ino_in_slot(SLOT4, 1 + k), "user.payload", &value)
+            .await
+            .unwrap();
+    }
+    vol.checkpoint_now().await.unwrap();
+    for k in 0..40u64 {
+        if k % 10 != 0 {
+            vol.removexattr_internal(ino_in_slot(SLOT4, 1 + k), "user.payload")
+                .await
+                .unwrap();
+        }
+    }
+    vol.checkpoint_now().await.unwrap();
+    vol.checkpoint_now().await.unwrap();
+    vol.release_slot_handover(1, SLOT4).await.unwrap();
+    assert!(!vol.slot_leases().unwrap().gate.is_leased(SLOT4));
+    let (host, mut client, joiner) = wire_joiner(&vol, 28).await;
+    // The manager's sweep parks inside the merge of slot 4's tree.
+    test_smo_build_pause_arm_slot(SLOT4);
+    let sweep = {
+        let vol = Arc::clone(&vol);
+        tokio::spawn(async move { vol.defrag_merge_sweep(None).await })
+    };
+    let mut parked = false;
+    for _ in 0..20_000 {
+        if TEST_SMO_BUILD_PAUSED
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|p| p.forest_slot == Some(SLOT4) && p.is_merge)
+        {
+            parked = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    if !parked {
+        test_smo_build_pause_release();
+        panic!("the fixture: the sweep never reached a merge of slot 4's tree");
+    }
+    // The wire grant, issued while the pass is parked: it must wait.
+    let merges0 = META_KV_NODE_MERGES.load(Ordering::Relaxed);
+    let grant = tokio::spawn(async move {
+        let r = client.acquire_slot(joiner, 3).await;
+        (client, r)
+    });
+    for _ in 0..2_000 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !grant.is_finished(),
+        "the grant of a tree under the manager's structural pass waits for the pass"
+    );
+    test_smo_build_pause_release();
+    let report = sweep
+        .await
+        .unwrap()
+        .expect("the sweep completes its pass — the merge landed on a still-unleased tree");
+    assert!(report.lap_complete);
+    assert!(
+        META_KV_NODE_MERGES.load(Ordering::Relaxed) > merges0,
+        "the parked merge landed"
+    );
+    let (mut client, reply) = grant.await.unwrap();
+    match reply.unwrap() {
+        ManagerReply::SlotsGranted { slots, already } => {
+            assert!(!already);
+            assert_eq!((slots[0].slot, slots[0].g), (3, 2));
+            // The lessee's root is the tree's root AFTER the merge.
+            let root = vol.slot_tree(SLOT4).unwrap().root();
+            assert_eq!(
+                slots[0].words.root,
+                (root.addr, root.seq),
+                "the grant carries the merged tree's CURRENT root"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed),
+        refusals0,
+        "never the belt on a legal race"
+    );
+    let plane = Arc::clone(vol.slot_leases().unwrap());
+    assert!(plane.gate.is_foreign(SLOT4));
+    // Ring 0's window is CLEAR of the slot: the manager's merge records
+    // sit below the tail tree 0's lessee is judged against.
+    assert!(
+        vol.journal_ring().core().reusable_upto() >= vol.node_cache().slot_record_frontier(SLOT4),
+        "ring 0's tail passed the slot's record frontier before the lease was published"
+    );
+    // The next sweep skips the foreign tree, counted.
+    let skips0 = lease_stats(&vol).merge_sweep_foreign_skips;
+    let again = vol.defrag_merge_sweep(None).await.unwrap();
+    assert!(again.lap_complete);
+    assert!(lease_stats(&vol).merge_sweep_foreign_skips > skips0);
+    assert_eq!(
+        META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed),
+        refusals0
+    );
+    // A crash-remount replays ring 0's window with no Lease violation and
+    // tree 0 leasing slot 4 to the joiner.
+    let _ = client.resolve_slot(3).await;
+    host.shutdown();
+    drop(plane);
+    drop(vol);
+    drop(routed);
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION_ALT)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(META_KV_REPLAY_LEASE_VIOLATIONS.load(Ordering::Relaxed), 0);
+    let states = tree0_states(&vol).await;
+    assert!(
+        matches!(
+            states.iter().find(|(s, _)| *s == SLOT4).map(|(_, st)| st),
+            Some(SlotState::Leased { appender_id, g: 2, .. }) if *appender_id == joiner
+        ),
+        "{states:?}"
+    );
+    assert!(vol.slot_leases().unwrap().gate.is_foreign(SLOT4));
+    shutdown(&routed).await;
+}
+
 /// **Issue 24 (round 3): a first-touch acquire never parks for ring space
 /// under `manager_verbs`.** With the cadence parked and ring 0's user
 /// window exhausted, a first-touch commit's door acquire PARKS at ring

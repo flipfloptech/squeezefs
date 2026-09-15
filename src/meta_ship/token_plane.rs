@@ -499,6 +499,17 @@ fn note_member_departed(client: &str) {
 }
 
 /// The holder's side of the token plane for ONE volume.
+///
+/// **Two users** (review round 2, Issue 23): the conveyor PASS task
+/// (stage A — `recall_and_wait` before its apply, `settle` after) and the
+/// durability lane's ROLLBACK of a failed window (stage B, Issue 14 — the
+/// same pair around its removal); the two overlap by design (D-2), so the
+/// gate's in-flight set is a REFCOUNT (`token_grant_core`): an object
+/// leaves the flight with its LAST user, and a grant registered under
+/// either window parks. The RTT phase cuts (`last_send_ns` / `last_ack_ns`)
+/// are per BATCH and clamp monotone, so two concurrent batches read each
+/// other's cuts as bounds, never as holes; `pending_frames` is per client
+/// and the lane issues one frame per client at a time.
 pub struct TokenHolderPlane {
     lane: RecallLane,
     /// Frames issued by [`Self::recall_and_wait`], per client, waiting for

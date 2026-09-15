@@ -33,9 +33,17 @@
 //! two steps SWAPPED (read before write) loom finds the schedule where the
 //! pass reads no holder AND the grant reads no mark.
 //!
-//! The in-flight set is a mutexed `BTreeSet` (control plane — one lock
-//! per pass on an ARMED holder, never the unarmed hot path, which stops
-//! at the `token_holder()` probe); the holder table is the S10
+//! The in-flight set is a mutexed REFCOUNT map (`BTreeMap<object, users>`
+//! — review round 2, Issue 23): the gate has TWO users that overlap by
+//! design — the conveyor pass task (stage A) and the durability lane's
+//! rollback of a FAILED window (stage B, Issue 14) — and both may hold
+//! the same object in flight at once (a rollback's undo key and a later
+//! pass's other key of one ino). A set would let the first `settle`
+//! clear the other's mark and a grant registered between proceed against
+//! a rollback still in progress; with the count an object leaves the
+//! flight only when its LAST user settles. Control plane — one lock per
+//! pass on an ARMED holder, never the unarmed hot path, which stops at
+//! the `token_holder()` probe; the holder table is the S10
 //! `RecallLane`'s, reached through [`HolderTable`].
 
 #[cfg(loom)]
@@ -47,7 +55,7 @@ pub(crate) mod sync {
     pub use std::sync::Mutex;
 }
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use sync::Mutex;
 
 /// The holder table the gate registers grants in and reads holders from
@@ -70,16 +78,17 @@ pub enum GrantAdmission {
     Park,
 }
 
-/// The gate: the pass's in-flight set.
+/// The gate: the in-flight objects, each with the count of its users
+/// (passes and rollbacks between their `pass_begin` and their `settle`).
 #[derive(Debug, Default)]
 pub struct GrantPassGate {
-    inflight: Mutex<BTreeSet<u64>>,
+    inflight: Mutex<BTreeMap<u64, usize>>,
 }
 
 impl GrantPassGate {
     pub fn new() -> Self {
         Self {
-            inflight: Mutex::new(BTreeSet::new()),
+            inflight: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -92,19 +101,27 @@ impl GrantPassGate {
         {
             let mut g = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
             for o in objects {
-                g.insert(*o);
+                *g.entry(*o).or_insert(0) += 1;
             }
         }
         objects.iter().map(|o| (*o, table.holders(*o))).collect()
     }
 
-    /// The pass's apply landed (or failed as a unit): the objects leave
-    /// the in-flight set. Returns whether anything was in flight.
+    /// This user's apply landed (or failed as a unit): its count on each
+    /// object drops; an object leaves the flight when its LAST user
+    /// settles. Returns whether any object left the flight (the parked
+    /// grants' wake).
     pub fn settle(&self, objects: &[u64]) -> bool {
         let mut g = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
         let mut any = false;
         for o in objects {
-            any |= g.remove(o);
+            if let Some(n) = g.get_mut(o) {
+                *n -= 1;
+                if *n == 0 {
+                    g.remove(o);
+                    any = true;
+                }
+            }
         }
         any
     }
@@ -126,12 +143,12 @@ impl GrantPassGate {
         (!fresh, admission)
     }
 
-    /// Is `object` in some pass's flight right now?
+    /// Is `object` in some user's flight right now?
     pub fn is_inflight(&self, object: u64) -> bool {
         self.inflight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(&object)
+            .contains_key(&object)
     }
 
     /// Objects in flight right now (the stats face).

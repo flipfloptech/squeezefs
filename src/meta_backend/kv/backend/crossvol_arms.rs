@@ -499,7 +499,7 @@ impl KvMetaBackend {
     /// rename — a TICKET under this process's lease: a second directory
     /// rename of this process joins the held lease (no verb), and the
     /// record is released with the LAST ticket; otherwise the take loops
-    /// on [`Self::dir_rename_lock_locked`], parking on the release wake
+    /// on `dir_rename_lock_locked`, parking on the release wake
     /// while another appender holds it. Volume 0's manager is this process
     /// on every set this codebase mounts (the wire initiator's take is
     /// PR 12's join ladder over `ManagerClient::dir_rename_lock`).

@@ -2693,7 +2693,7 @@ pub async fn recover_open_intents(routed: &RoutedMetaBackend) -> Result<usize> {
 /// S3.5 recovery over the shipped applier, run after the holders'
 /// endpoints are bound. Adoption is by REGISTER STATE, never by elapsed
 /// time (review round 1, Issue 4): a live op's intent is its own however
-/// long it runs, and [`recover_one`] re-reads every intent under the
+/// long it runs, and `recover_one` re-reads every intent under the
 /// guards it acquires, so a scan an intervening retirement outdated
 /// applies nothing. Returns how many retired; an intent whose holder is
 /// still unreachable stays open and, past the grace window, counts on

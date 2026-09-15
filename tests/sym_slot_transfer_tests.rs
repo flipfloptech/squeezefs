@@ -2494,9 +2494,27 @@ async fn a_wire_grant_of_an_unleased_tree_waits_for_the_sweep_and_clears_its_win
         test_smo_build_pause_arm_slot, test_smo_build_pause_release, TEST_SMO_BUILD_PAUSED,
     };
     use squeezefs::meta_backend::kv::META_KV_NODE_MERGES;
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_SYM_RING_KB");
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    let _cleanup = Cleanup;
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
-    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    // The cadence PARKED and region 1's ring wide enough for the fixture's
+    // writes (a parked commit at a full declared ring waits for the tick):
+    // every SMO of this test is one the test runs, so the build-pause seam
+    // parks the sweep's merge and nothing else. The volume is sized so the
+    // 4 MiB rings fit the appender budget (`heap/16 ÷ ring`) with the
+    // wire joiner's ring beside the two in-process regions'.
+    let uris = vec![
+        format_stamped_member_sized(dir.path(), "meta0", 320 * 1024 * 1024, 8 * 1024 * 1024).await,
+    ];
+    std::env::set_var("SQUEEZEFS_SYM_RING_KB", "4096");
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
     let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
     let vol = Arc::clone(&routed.volumes[0]);
     let refusals0 = META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed);
@@ -2603,9 +2621,12 @@ async fn a_wire_grant_of_an_unleased_tree_waits_for_the_sweep_and_clears_its_win
         refusals0
     );
     // A crash-remount replays ring 0's window with no Lease violation and
-    // tree 0 leasing slot 4 to the joiner.
+    // tree 0 leasing slot 4 to the joiner (the client's connection goes
+    // first: the service lane holds the volume while it is open).
     let _ = client.resolve_slot(3).await;
+    drop(client);
     host.shutdown();
+    drop(host);
     drop(plane);
     drop(vol);
     drop(routed);

@@ -911,15 +911,6 @@ pub fn drop_replayed_deltas_for(home: &std::path::Path) {
     REPLAYED_DELTAS.lock().retain(|k, _| k.home != home);
 }
 
-/// The kept groups (the tests' witness of the map's shape).
-pub fn replayed_delta_groups() -> Vec<(KeptKey, usize)> {
-    REPLAYED_DELTAS
-        .lock()
-        .iter()
-        .map(|(k, v)| (k.clone(), v.len()))
-        .collect()
-}
-
 /// Deltas kept across every group (the tests' witness).
 pub fn replayed_deltas_kept() -> usize {
     REPLAYED_DELTAS.lock().values().map(Vec::len).sum()

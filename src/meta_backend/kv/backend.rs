@@ -11684,7 +11684,13 @@ impl KvMetaBackend {
         // (in ring 0, replayable), and the page stays `Live` for the next
         // open of this identity to recover as own residue. PR 10 owns the
         // leave-vs-recovery interplay; this is the boundary it inherits.
-        if crate::park_gate::is_parked() && self.appenders.is_some() {
+        // Set-wide (review round 2, Issue 24): the FIRST volume's refusal
+        // latches `leave_refused` for the process — the gate word itself
+        // is cleared by `close_at_leave` — so every later volume of the
+        // set refuses too and no region of this parked appender is left.
+        if self.appenders.is_some()
+            && (crate::park_gate::is_parked() || crate::park_gate::leave_refused())
+        {
             crate::park_gate::close_at_leave();
             return Err(KvError::Busy(format!(
                 "{}: this symmetric appender is PARKED (its membership lease is being \

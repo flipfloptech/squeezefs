@@ -13976,6 +13976,10 @@ impl SqueezefsFilesystem {
                         hold(&|s| s.deltas_journaled),
                     );
                     metrics.insert(
+                        "data_alloc_bitmap_deltas_deferred".into(),
+                        hold(&|s| s.deltas_deferred),
+                    );
+                    metrics.insert(
                         "data_alloc_bitmap_drift".into(),
                         load(&crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_DRIFT),
                     );

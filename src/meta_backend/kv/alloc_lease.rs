@@ -404,6 +404,11 @@ pub struct AllocHolding {
     /// Deltas journaled (`data_alloc_bitmap_{set,clear}_bits` count the
     /// bits; these count the entries).
     pub deltas_journaled: AtomicU64,
+    /// Drains the ring's USER window refused (`JournalReserveExhausted`)
+    /// — the deltas stayed queued for the next drainer, the checkpoint
+    /// cycle untouched (review round 2, Issue 22;
+    /// `data_alloc_bitmap_deltas_deferred`).
+    pub deltas_deferred: AtomicU64,
     /// Frees held past the routine bound — the ring's timeout path
     /// (`free_grace_timeout_deferrals`).
     pub timeout_deferrals: AtomicU64,
@@ -508,7 +513,7 @@ impl AllocHolding {
     /// task releases its latch and re-checks the queue before it exits,
     /// so a delta queued after its last drain is journaled by it or by
     /// the kick that took the latch, never left waiting.
-    fn kick_journaler(self: &Arc<Self>) {
+    pub fn kick_journaler(self: &Arc<Self>) {
         if self
             .journaler_running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -533,13 +538,27 @@ impl AllocHolding {
             };
             loop {
                 if let Err(e) = home.drain_deltas(&me).await {
-                    log::error!(
-                        "data allocation bitmap of volume {:#018x}: journaling the queued \
-                         deltas failed ({e}); {} delta(s) stay queued for the next drainer \
-                         (the checkpoint's page step, the next grant)",
-                        me.vol_tag,
-                        me.queued_deltas()
-                    );
+                    me.deltas_deferred.fetch_add(1, Ordering::Relaxed);
+                    match e {
+                        // The user window is full (the checkpoint cycle is
+                        // what frees it): the deltas stay queued — the
+                        // page write covers the bits, the next kick or the
+                        // next carve journals them (Issue 22).
+                        KvError::JournalReserveExhausted { .. } => log::debug!(
+                            "data allocation bitmap of volume {:#018x}: the ring's user window \
+                             is full; {} queued delta(s) deferred to the next drainer \
+                             (data_alloc_bitmap_deltas_deferred)",
+                            me.vol_tag,
+                            me.queued_deltas()
+                        ),
+                        other => log::error!(
+                            "data allocation bitmap of volume {:#018x}: journaling the queued \
+                             deltas failed ({other}); {} delta(s) stay queued for the next \
+                             drainer",
+                            me.vol_tag,
+                            me.queued_deltas()
+                        ),
+                    }
                     return;
                 }
                 latch.1 = false;
@@ -620,6 +639,7 @@ pub struct AllocLeaseStats {
     pub bitmap_clear_bits: u64,
     pub bitmap_population: u64,
     pub deltas_journaled: u64,
+    pub deltas_deferred: u64,
     pub free_grace_timeout_deferrals: u64,
 }
 
@@ -636,6 +656,7 @@ impl AllocHolding {
             bitmap_clear_bits: self.bitmap.clear_count(),
             bitmap_population: self.bitmap.population(),
             deltas_journaled: self.deltas_journaled.load(Ordering::Relaxed),
+            deltas_deferred: self.deltas_deferred.load(Ordering::Relaxed),
             free_grace_timeout_deferrals: self.timeout_deferrals.load(Ordering::Relaxed),
         }
     }
@@ -881,10 +902,11 @@ impl KvMetaBackend {
     }
 
     /// **The service edge's screen for `AllocLeaseAcquire`** (review round
-    /// 1, Issue 6 — PR 3/4's bounded-execution law): `blocks` must equal a
-    /// data volume this node knows (its derived block count — a peer's
-    /// integer is never the successor's allocation authority), `home_vol`
-    /// must name a volume of the set. A failed screen is `Rejected`
+    /// 1, Issue 6 — PR 3/4's bounded-execution law): `blocks` must be
+    /// non-zero and AT MOST the derived block count of a data volume this
+    /// node knows (a peer's integer is never the successor's allocation
+    /// authority; a smaller ask is a smaller bitmap over the same volume),
+    /// `home_vol` must name a volume of the set. A failed screen is `Rejected`
     /// (`STATUS_REJECTED`, `manager_verb_rejected`), nothing written.
     pub fn screen_alloc_lease_acquire(
         &self,
@@ -1270,6 +1292,7 @@ impl KvMetaBackend {
             drain: crate::sqz_sync::SqzMutex::new(()),
             journaler_running: AtomicBool::new(false),
             deltas_journaled: AtomicU64::new(0),
+            deltas_deferred: AtomicU64::new(0),
             timeout_deferrals: AtomicU64::new(0),
         });
         Self::register_holding(&holding);
@@ -1291,13 +1314,49 @@ impl KvMetaBackend {
         term: u64,
         predecessor: Option<&[u8]>,
     ) -> Result<Arc<AllocHolding>, KvError> {
-        let set = self.manager_gate(false)?;
         // The image is decoded BEFORE any claim: a corrupt predecessor
         // region refuses here with nothing to undo.
         let bitmap = match predecessor {
             Some(image) => DataAllocBitmap::from_region_image(vol_tag, blocks, image)?,
             None => DataAllocBitmap::new(vol_tag, blocks),
         };
+        self.hold_bitmap(vol_tag, bitmap, term).await
+    }
+
+    /// **The FIRST hold of a POPULATED volume** (review round 2, Issue 23):
+    /// a fresh bitmap SEEDED from the allocator's derived truth at this
+    /// instant — every block in `set` (the refcount map's population plus
+    /// every offset that is neither on the free list nor above the cursor:
+    /// in-limbo between `begin_free` and `finish_free`, quarantined,
+    /// grace-held, inside a trim window) reads SET; the free list's blocks
+    /// read CLEAR. The seeded pages are written and barriered before the
+    /// lease record names them (the caller publishes). A `None` seed is
+    /// the fresh volume.
+    pub async fn hold_alloc_lease_seeded(
+        self: &Arc<Self>,
+        vol_tag: u64,
+        blocks: u64,
+        term: u64,
+        set: impl IntoIterator<Item = u64>,
+    ) -> Result<Arc<AllocHolding>, KvError> {
+        let bitmap = DataAllocBitmap::new(vol_tag, blocks);
+        for b in set {
+            bitmap.set(b);
+        }
+        self.hold_bitmap(vol_tag, bitmap, term).await
+    }
+
+    /// Claim the page extents, write `bitmap`'s image into them, journal
+    /// the claims, barrier, register the holding (the shared body of the
+    /// two holds above).
+    async fn hold_bitmap(
+        self: &Arc<Self>,
+        vol_tag: u64,
+        bitmap: DataAllocBitmap,
+        term: u64,
+    ) -> Result<Arc<AllocHolding>, KvError> {
+        let set = self.manager_gate(false)?;
+        let blocks = bitmap.blocks();
         let image = bitmap.region_image(term)?;
         let node_size = self.node_cache().config().layout.node_size() as u64;
         let region = crate::data_alloc_bitmap::region_len(blocks);
@@ -1555,16 +1614,25 @@ impl KvMetaBackend {
     /// round 1, Issue 1: the record's tail passes every delta journaled
     /// below the cycle's head, so the pages must already carry them; a
     /// delta journaled after the head is inside the window the tail
-    /// keeps): drain the queue as a belt, then write every dirty page
-    /// into its alternate slot — for the holdings HOMED ON THIS backend
-    /// only (Issue 3: another volume's checkpoint touches neither the
-    /// pages nor the dirty bits). A no-op on a mount holding no lease.
+    /// keeps): write every dirty page into its alternate slot — for the
+    /// holdings HOMED ON THIS backend only (Issue 3: another volume's
+    /// checkpoint touches neither the pages nor the dirty bits). The
+    /// queue is NOT drained here (review round 2, Issue 22 — §4.4 pt 5:
+    /// no USER-class admission ever decides the cycle's outcome): the
+    /// page snapshot already carries every RAM mutation, a queued SET only
+    /// ever costs a leak and a queued CLEAR reads a genuinely free block,
+    /// and the carve/return drains are synchronous — a non-empty queue is
+    /// handed to the single-flight journaler OFF the cycle (drain-and-
+    /// retry), counted on `deltas_deferred` when it was a refused window.
+    /// A no-op on a mount holding no lease.
     pub async fn write_data_alloc_pages(&self, ckpt_seq: u64) -> Result<(), KvError> {
         for holding in holdings() {
             if !holding.is_homed_on(self) {
                 continue;
             }
-            self.drain_deltas(&holding).await?;
+            if holding.queued_deltas() > 0 {
+                holding.kick_journaler();
+            }
             holding
                 .bitmap
                 .write_dirty_pages(self.device_path(), holding.page_base(), ckpt_seq)
@@ -1951,7 +2019,15 @@ pub async fn arm_symmetric_allocation(
         }
         register_data_volume_blocks(vol_tag, blocks);
         let _ = ALLOCATORS.upsert_sync(vol_tag, Arc::downgrade(alloc));
-        let holding = acquire_and_hold(vol0, me, home_vol, vol_tag, blocks)
+        // The allocator's DERIVED truth at this instant (review round 2,
+        // Issue 23): the FIRST hold is seeded from it, and every hold is
+        // checked against it in the LOSS direction — a block the derived
+        // allocator holds live that the bitmap reads CLEAR would be re-
+        // granted, so the arm refuses loud rather than allocate beside it.
+        // The arm runs before FUSE serves (the mount path), so the snapshot
+        // is quiescent.
+        let derived = alloc.derived_allocation_snapshot();
+        let holding = acquire_and_hold(vol0, me, home_vol, vol_tag, blocks, &derived.set)
             .await
             .map_err(|e| {
                 crate::error::SqueezefsError::InvalidOperation(format!(
@@ -1959,8 +2035,40 @@ pub async fn arm_symmetric_allocation(
                     alloc.volume_id()
                 ))
             })?;
+        let loss: Vec<u64> = derived
+            .set
+            .iter()
+            .copied()
+            .filter(|b| !holding.bitmap.is_set(*b))
+            .collect();
+        if !loss.is_empty() {
+            let report = crate::data_alloc_bitmap::DriftReport {
+                loss: loss.clone(),
+                leak: Vec::new(),
+            };
+            crate::data_alloc_bitmap::note_drift(&report);
+            return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): {} block(s) the \
+                 derived allocator holds LIVE read CLEAR in the recovered allocation bitmap \
+                 (first: {:?}) — the loss direction; refusing to arm rather than re-grant them \
+                 (data_alloc_bitmap_drift; fsck's C6/C8 census is the oracle)",
+                alloc.volume_id(),
+                loss.len(),
+                loss.first()
+            )));
+        }
+        // The bitmap IS the free list from here: the local list's blocks
+        // read CLEAR in the bitmap and return through carves; the flat
+        // free-list-first pass is gated on the armed allocator.
+        let drained = alloc.drain_free_list_into_grants();
         let writer = crate::meta_ship::manager::wire_writer_name(&me.into());
         alloc.install_block_grant_arm(vol_tag, holder_block_grant_sink(vol0, vol_tag, writer));
+        log::info!(
+            "symmetric allocation arm: data volume '{}' — {} derived-live block(s) seeded/verified \
+             SET, {drained} free-listed block(s) drained into the bitmap",
+            alloc.volume_id(),
+            derived.set.len()
+        );
         log::info!(
             "symmetric allocation arm: data volume '{}' leased at term {} ({} block(s), pages \
              at {:?}); this mount mints from ranged block grants of its own holding",
@@ -1981,6 +2089,7 @@ async fn acquire_and_hold(
     home_vol: u16,
     vol_tag: u64,
     blocks: u64,
+    derived_set: &[u64],
 ) -> Result<Arc<AllocHolding>, KvError> {
     // Bounded: one same-node takeover + one deferred retry at most.
     for _attempt in 0..4 {
@@ -1996,14 +2105,21 @@ async fn acquire_and_hold(
                 })?;
                 if rec.bitmap.is_empty() {
                     // Our own prior incarnation died between the acquire
-                    // and the publish: fresh pages at the same term.
-                    return hold_fresh_and_publish(vol0, me, vol_tag, rec.blocks, rec.term, None)
-                        .await;
+                    // and the publish: seeded pages at the same term.
+                    return hold_seeded_and_publish(
+                        vol0,
+                        me,
+                        vol_tag,
+                        rec.blocks,
+                        rec.term,
+                        derived_set,
+                    )
+                    .await;
                 }
                 return vol0.rehold_alloc_lease(vol_tag, &rec).await;
             }
             Ok(g) if g.term == 1 => {
-                return hold_fresh_and_publish(vol0, me, vol_tag, blocks, 1, None).await;
+                return hold_seeded_and_publish(vol0, me, vol_tag, blocks, 1, derived_set).await;
             }
             Ok(g) => {
                 // A successor: copy the RECOVERED predecessor pages.
@@ -2058,8 +2174,13 @@ async fn acquire_and_hold(
                     .await?;
                 note_dead_member_acted(unix_now_ms());
             }
-            Err(KvError::LeaseDeferred(_)) => {
-                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(50)).await;
+            Err(KvError::LeaseDeferred(why)) => {
+                // A dead FOREIGN holder whose home is not yet recovered:
+                // the recovery is PR 10's driver's, and the mount path is
+                // not a retry loop — the deferral is the caller's (loud).
+                return Err(KvError::LeaseDeferred(format!(
+                    "{why}; the arm does not wait for a foreign recovery (PR 10's driver)"
+                )));
             }
             Err(e) => return Err(e),
         }
@@ -2081,6 +2202,34 @@ async fn hold_fresh_and_publish(
     let holding = vol0
         .hold_alloc_lease(vol_tag, blocks, term, predecessor)
         .await?;
+    publish_holding(vol0, me, vol_tag, term, &holding).await?;
+    Ok(holding)
+}
+
+/// The FIRST hold of a volume this identity has never held: the pages
+/// seeded from the derived truth, then published.
+async fn hold_seeded_and_publish(
+    vol0: &Arc<KvMetaBackend>,
+    me: AppenderIdentity,
+    vol_tag: u64,
+    blocks: u64,
+    term: u64,
+    derived_set: &[u64],
+) -> Result<Arc<AllocHolding>, KvError> {
+    let holding = vol0
+        .hold_alloc_lease_seeded(vol_tag, blocks, term, derived_set.iter().copied())
+        .await?;
+    publish_holding(vol0, me, vol_tag, term, &holding).await?;
+    Ok(holding)
+}
+
+async fn publish_holding(
+    vol0: &Arc<KvMetaBackend>,
+    me: AppenderIdentity,
+    vol_tag: u64,
+    term: u64,
+    holding: &AllocHolding,
+) -> Result<(), KvError> {
     let refs: Vec<(u16, ExtentRef)> = holding
         .pages
         .iter()
@@ -2088,5 +2237,5 @@ async fn hold_fresh_and_publish(
         .collect();
     vol0.manager_alloc_lease_bitmap(vol_tag, me, term, refs)
         .await?;
-    Ok(holding)
+    Ok(())
 }

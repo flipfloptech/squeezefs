@@ -450,6 +450,17 @@ pub struct BlockAllocator {
     block_grant: std::sync::OnceLock<BlockGrantArm>,
 }
 
+/// The allocator's derived allocation truth at one instant (PR 8 —
+/// [`BlockAllocator::derived_allocation_snapshot`]): the dense cursor,
+/// the blocks below it that are NOT reallocatable now (`set`), and the
+/// free list's blocks below it (`free`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DerivedAllocation {
+    pub highest: u64,
+    pub set: Vec<u64>,
+    pub free: Vec<u64>,
+}
+
 /// The writer's grant arm on one data volume (see
 /// [`BlockAllocator::install_block_grant_arm`]).
 struct BlockGrantArm {
@@ -1049,6 +1060,54 @@ impl BlockAllocator {
                 arm.topup_inflight.store(false, Ordering::Release);
             }
         });
+    }
+
+    /// **The allocator's derived truth for the allocation bitmap's FIRST
+    /// hold** (PR 8 review round 2, Issue 23): every block below the dense
+    /// cursor that is NOT on the local free list — the refcount map's
+    /// population plus every offset in limbo between `begin_free` and
+    /// `finish_free`, quarantined under a dead epoch, held in the grace
+    /// ring or inside a trim window — is "not reallocatable now" and
+    /// reads SET; the free list's blocks read CLEAR. The complement of the
+    /// free list below the cursor is exactly the free-list definition the
+    /// durable-refs seed / the derived walk already produced at mount.
+    /// Taken at the arm, before FUSE serves — quiescent by construction.
+    pub fn derived_allocation_snapshot(&self) -> DerivedAllocation {
+        let highest = self.highest_block.load(Ordering::Acquire);
+        let free: std::collections::BTreeSet<u64> = self
+            .free_blocks
+            .iter()
+            .map(|item| *item)
+            .filter(|b| *b < highest)
+            .collect();
+        let set: Vec<u64> = (0..highest).filter(|b| !free.contains(b)).collect();
+        DerivedAllocation {
+            highest,
+            set,
+            free: free.into_iter().collect(),
+        }
+    }
+
+    /// **Drain the local free list into the grant plane** (Issue 23): the
+    /// list's blocks read CLEAR in the seeded bitmap and return only
+    /// through a carve — the list is emptied so no path can hand them out
+    /// beside the window. Returns the blocks drained.
+    pub fn drain_free_list_into_grants(&self) -> usize {
+        let idxs: Vec<u64> = self.free_blocks.iter().map(|item| *item).collect();
+        let mut drained = 0;
+        for idx in idxs {
+            if self.free_blocks.remove(&idx).is_some() {
+                drained += 1;
+            }
+        }
+        drained
+    }
+
+    /// TEST seam (Issue 23's gate pin): plant `block_idx` on the LOCAL free
+    /// list the way the mount-time gap fill or a pre-arm free would — an
+    /// armed allocator must never mint it.
+    pub fn test_plant_free_list(&self, block_idx: u64) {
+        self.free_blocks.insert(block_idx);
     }
 
     // -----------------------------------------------------------------
@@ -3621,6 +3680,19 @@ impl BlockAllocator {
         // preference is unchanged and no allocation path can observe a
         // released offset late. One relaxed load when nothing is held.
         self.harvest_grace();
+        // PR 8 (review round 2, Issue 23): on a grant-armed allocator the
+        // bitmap IS the free list — the flat list is never a mint source
+        // (the mount-time gap fill, a pre-arm free, a trim window's return
+        // would otherwise be handed out with their bits CLEAR, or SET
+        // inside another writer's grant); the window is the one source.
+        // One `OnceLock` probe on every unarmed mount.
+        if self.block_grant.get().is_some() {
+            let block_idx = self.next_fresh_block()?;
+            crate::fuse_client::METRICS
+                .alloc_fresh_mints
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(self.claim_block_idx(block_idx));
+        }
         loop {
             // DLM S9: reuse obeys the same residue class as a fresh mint —
             // a free block in a peer's lane is that peer's to reuse, which

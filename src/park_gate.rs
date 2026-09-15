@@ -113,6 +113,18 @@ pub fn t_park_max_for(failover_bound_ms: u64, clocks: &crate::membership::LeaseC
 /// park (Issue 18): `hold_acks` hands them back `Ok` while the door is
 /// closed to the committers that never landed.
 static LEAVE_RELEASING_ACKS: AtomicBool = AtomicBool::new(false);
+/// The leave was REFUSED over a park — the process-wide latch every volume
+/// of the set consults at its own `shutdown` (review round 2, Issue 24):
+/// the refusal must be set-wide, and the gate word alone is cleared by the
+/// first volume's `close_at_leave`. Sticky for the process (a parked
+/// appender's dismount is the crash shape on every volume).
+static LEAVE_REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// `true` ⇔ this process's leave was refused over a standing park: every
+/// volume's clean leave is refused from here (the pages stay `Live`).
+pub fn leave_refused() -> bool {
+    LEAVE_REFUSED.load(Ordering::SeqCst)
+}
 
 /// Disarm the posture (the plane's drop / the leave / test teardown). Over
 /// a STANDING park the leave splits the two populations (review round 1,
@@ -138,6 +150,7 @@ pub fn close_at_leave() -> bool {
     if !GATE.is_parked() {
         return false;
     }
+    LEAVE_REFUSED.store(true, Ordering::SeqCst);
     LEAVE_RELEASING_ACKS.store(true, Ordering::SeqCst);
     ACK_WAKE.notify_waiters();
     let closed = GATE.close_at_leave();
@@ -402,6 +415,7 @@ pub fn park_ns() -> [u64; 3] {
 pub fn test_reset() {
     disarm_symmetric_appender();
     LEAVE_RELEASING_ACKS.store(false, Ordering::SeqCst);
+    LEAVE_REFUSED.store(false, Ordering::SeqCst);
     GATE.test_reset();
     for w in &PARK_NS {
         w.store(0, Ordering::Relaxed);

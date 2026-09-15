@@ -25,16 +25,33 @@ use crate::meta_backend::kv::slot_state::{DirRenameRecord, DIR_RENAME_KEY};
 static DIR_RENAME_RELEASED: once_cell::sync::Lazy<squeezefs_ipc::sqz_notify::Notify> =
     once_cell::sync::Lazy::new(squeezefs_ipc::sqz_notify::Notify::new);
 
-/// The in-process TICKET count under a held lease, per `(volume, lock
-/// identity)` (the volume by its `Arc` address): two directory renames
-/// of one initiator run under ONE record, and the record is released
-/// only when the LAST of them releases — before it, the first to finish
-/// released the record while the second still ran, and a third node
-/// could take the lease beside it (review round 1, Issue 5). Mutated
-/// under the volume's `manager_verbs` mutex.
-static DIR_RENAME_LOCAL_TICKETS: once_cell::sync::Lazy<
-    parking_lot::Mutex<std::collections::HashMap<(usize, u32), u32>>,
+/// The in-process SERIALIZATION of one identity's directory renames, per
+/// `(volume uuid, lock identity)`: a one-permit semaphore each op holds
+/// with its lease (review round 2, Issues 23/24 — the lease serializes
+/// OPS: the second directory rename of one identity WAITS for the first's
+/// release rather than joining its record, so the law never leans on the
+/// kernel's `s_vfs_rename_mutex`, which an S8-served `Rename` or an
+/// offline `RoutedMetaBackend` caller never passes through). Keyed by the
+/// volume's durable uuid, never an address; the permit is RAII on the
+/// lease and drops in the same scope as the record's unlock.
+static DIR_RENAME_LOCAL_PERMITS: once_cell::sync::Lazy<
+    parking_lot::Mutex<
+        std::collections::HashMap<(u128, u32), Arc<squeezefs_ipc::sqz_semaphore::Semaphore>>,
+    >,
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// The one-permit semaphore of `(volume, identity)` (created on first use).
+fn dir_rename_permit_of(
+    volume: u128,
+    identity: u32,
+) -> Arc<squeezefs_ipc::sqz_semaphore::Semaphore> {
+    Arc::clone(
+        DIR_RENAME_LOCAL_PERMITS
+            .lock()
+            .entry((volume, identity))
+            .or_insert_with(|| Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(1))),
+    )
+}
 
 /// The verdict of a `DirRenameLock`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,25 +105,30 @@ pub fn screen_dir_rename_words(
     Ok(())
 }
 
-/// The in-process manager's held lock (one TICKET under this process's
-/// lease). Released by [`Self::release`] — the awaited fast path — or,
-/// for a lease whose future is dropped (an unwound handler task, a
-/// cancellation), by `Drop`, which spawns the same release so a live
-/// process never leaks the set's lock (review round 1, Issue 6; the
-/// `DlmGuard::external` pattern). A holder that DIES is the recovery
-/// driver's.
+/// The in-process manager's held lock: the record's lease AND this
+/// identity's one permit (the op-serialization above). Released by
+/// [`Self::release`] — the awaited fast path — or, for a lease whose
+/// future is dropped (an unwound handler task, a cancellation), by
+/// `Drop`, which spawns the same release so a live process never leaks
+/// the set's lock (review round 1, Issue 6; the `DlmGuard::external`
+/// pattern); the permit travels into that release and drops with it. A
+/// holder that DIES is the recovery driver's.
 pub struct DirRenameLease {
     volume: Arc<KvMetaBackend>,
     appender_id: u32,
+    permit: Option<squeezefs_ipc::sqz_semaphore::OwnedSemaphorePermit>,
     released: bool,
 }
 
 impl DirRenameLease {
-    /// Release the ticket; the record goes with the last ticket
-    /// (idempotent against the record).
+    /// Release the record, then the permit (idempotent against the
+    /// record).
     pub async fn release(mut self) -> std::result::Result<(), KvError> {
         self.released = true;
-        self.volume.dir_rename_local_release(self.appender_id).await
+        let permit = self.permit.take();
+        let out = self.volume.dir_rename_local_release(self.appender_id).await;
+        drop(permit);
+        out
     }
 }
 
@@ -117,6 +139,7 @@ impl Drop for DirRenameLease {
         }
         let volume = Arc::clone(&self.volume);
         let appender_id = self.appender_id;
+        let permit = self.permit.take();
         crate::meta_exec::spawn_meta("dir_rename_lease_drop", async move {
             if let Err(e) = volume.dir_rename_local_release(appender_id).await {
                 log::error!(
@@ -125,6 +148,7 @@ impl Drop for DirRenameLease {
                     volume.path.display()
                 );
             }
+            drop(permit);
         });
     }
 }
@@ -467,84 +491,53 @@ impl KvMetaBackend {
         Ok(released)
     }
 
-    /// Release one of this process's tickets; the record goes with the
-    /// last one.
+    /// Release this identity's record (the permit drops in the caller's
+    /// scope, after).
     async fn dir_rename_local_release(
         self: &Arc<Self>,
         appender_id: u32,
     ) -> std::result::Result<(), KvError> {
         let set = self.manager_gate(true)?;
         let _g = self.manager_verbs.lock().await;
-        let key = (Arc::as_ptr(self) as usize, appender_id);
-        let last = {
-            let mut tickets = DIR_RENAME_LOCAL_TICKETS.lock();
-            match tickets.get_mut(&key) {
-                Some(n) if *n > 1 => {
-                    *n -= 1;
-                    false
-                }
-                _ => {
-                    tickets.remove(&key);
-                    true
-                }
-            }
-        };
-        if last {
-            self.dir_rename_unlock_locked(set, appender_id).await?;
-        }
+        self.dir_rename_unlock_locked(set, appender_id).await?;
         Ok(())
     }
 
     /// The in-process manager's take of the lock for its own directory
-    /// rename — a TICKET under this process's lease: a second directory
-    /// rename of this process joins the held lease (no verb), and the
-    /// record is released with the LAST ticket; otherwise the take loops
-    /// on `dir_rename_lock_locked`, parking on the release wake
-    /// while another appender holds it. Volume 0's manager is this process
-    /// on every set this codebase mounts (the wire initiator's take is
-    /// PR 12's join ladder over `ManagerClient::dir_rename_lock`).
+    /// rename: this identity's one PERMIT first (a second directory rename
+    /// of the same identity waits here — ops serialize, never join), then
+    /// the record, looping on `dir_rename_lock_locked` and parking on the
+    /// release wake while another identity holds it. Volume 0's manager
+    /// is this process on every set this codebase mounts (the wire
+    /// initiator's take is PR 12's join ladder over `ManagerClient::
+    /// dir_rename_lock`).
     pub async fn dir_rename_lock_held(
         self: &Arc<Self>,
         appender_id: u32,
     ) -> std::result::Result<DirRenameLease, KvError> {
-        let key = (Arc::as_ptr(self) as usize, appender_id);
+        let permit = dir_rename_permit_of(self.volume_uuid(), appender_id)
+            .acquire_owned()
+            .await
+            .map_err(|e| {
+                KvError::Corrupt(format!(
+                    "{}: the directory-rename permit of appender {appender_id} is closed ({e:?})",
+                    self.path.display()
+                ))
+            })?;
         loop {
             let released = DIR_RENAME_RELEASED.notified();
             let set = self.manager_gate(false)?;
             let outcome = {
                 let _g = self.manager_verbs.lock().await;
-                // Join a lease this process already holds (one ticket
-                // more); the map lock never spans an await.
-                let joined = {
-                    let mut tickets = DIR_RENAME_LOCAL_TICKETS.lock();
-                    match tickets.get_mut(&key) {
-                        Some(n) => {
-                            *n += 1;
-                            true
-                        }
-                        None => false,
-                    }
-                };
-                if joined {
-                    return Ok(DirRenameLease {
-                        volume: Arc::clone(self),
-                        appender_id,
-                        released: false,
-                    });
-                }
-                let outcome = self
-                    .dir_rename_lock_locked(set, appender_id, self.writer_term())
-                    .await?;
-                if matches!(outcome, DirRenameOutcome::Locked { .. }) {
-                    DIR_RENAME_LOCAL_TICKETS.lock().insert(key, 1);
-                }
-                outcome
+                self.dir_rename_lock_locked(set, appender_id, self.writer_term())
+                    .await?
             };
             match outcome {
                 DirRenameOutcome::Locked { .. } => {
                     return Ok(DirRenameLease {
                         volume: Arc::clone(self),
                         appender_id,
+                        permit: Some(permit),
                         released: false,
                     })
                 }

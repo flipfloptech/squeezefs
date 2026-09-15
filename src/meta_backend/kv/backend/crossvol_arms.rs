@@ -1,8 +1,8 @@
 //! **Symmetric PR 6 — the backend's cross-owner arms**
 //! (`docs/design-symmetric-metadata.md` §5.6, §5.6.4; KD-SYM-7/14):
 //!
-//! * the intent's SLOT homing — an intent rides the first local step's
-//!   region, so it keys on local 0 of that slot's namespace
+//! * the intent's SLOT homing — an intent rides step 0's region when
+//!   step 0 is local (its own entry in the mount's rotor slot otherwise), so it keys on local 0 of that slot's namespace
 //!   (`crossvol_tx::intent_ino_for_slot`) and the recovery scan reads
 //!   every intent home a forest volume has;
 //! * the intent-only `tx0` (every step of a plan foreign) and the

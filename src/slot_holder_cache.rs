@@ -60,17 +60,6 @@ impl SlotHolderCache {
         self.endpoints.store(Arc::new(next));
     }
 
-    /// Forget `appender_id`'s endpoint (its leave, or a dead member).
-    pub fn clear_endpoint(&self, appender_id: u32) {
-        let cur = self.endpoints.load();
-        if !cur.contains_key(&appender_id) {
-            return;
-        }
-        let mut next = (**cur).clone();
-        next.remove(&appender_id);
-        self.endpoints.store(Arc::new(next));
-    }
-
     /// The endpoint bound to `appender_id` — one lock-free load.
     pub fn endpoint(&self, appender_id: u32) -> Option<Arc<str>> {
         self.endpoints.load().get(&appender_id).cloned()

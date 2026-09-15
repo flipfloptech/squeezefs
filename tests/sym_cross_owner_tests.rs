@@ -1314,6 +1314,7 @@ fn the_cross_owner_family_is_exported_under_its_published_names() {
         "xv_cross_owner_intents_open",
         "xv_cross_owner_steps_shipped",
         "xv_cross_owner_steps_served",
+        "xv_cross_owner_steps_rejected",
         "xv_cross_owner_intents_stuck",
         "xv_cross_owner_phase_ns",
         "xv_cross_owner_guard_rpcs",
@@ -1321,6 +1322,7 @@ fn the_cross_owner_family_is_exported_under_its_published_names() {
         "xv_cross_owner_guard_expiries",
         "dir_rename_lock_acquires",
         "dir_rename_lock_wait_ns",
+        "dir_rename_parent_scans",
     ] {
         assert!(json.get(key).is_some(), "missing {key}: {json:?}");
     }
@@ -1332,6 +1334,7 @@ fn the_cross_owner_family_is_exported_under_its_published_names() {
         "plan",
         "intent_barrier",
         "ship_rtt",
+        "local_steps",
         "retire",
         "total",
     ] {

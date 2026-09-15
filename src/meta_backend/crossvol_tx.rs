@@ -256,14 +256,15 @@ static XV_CO_GUARDS_PARKED: AtomicU64 = AtomicU64::new(0);
 /// — **must stay 0** on a healthy set (a dead initiator's guards).
 static XV_CO_GUARD_EXPIRIES: AtomicU64 = AtomicU64::new(0);
 
-/// Phases of one cross-owner transaction (`xv_cross_owner_phase_ns`,
-/// exact-sum: `guard_rtt + plan + intent_barrier + ship_rtt + retire ≈
-/// total` — `guard_rtt` is taken in the arm, before `total` starts, so
-/// it is priced beside the transaction rather than inside it).
+/// Phases of one cross-owner transaction (`xv_cross_owner_phase_ns`:
+/// `plan + intent_barrier + Σ ship_rtt + local_steps + retire ≈ total`;
+/// `guard_rtt` is taken in the arm, before `total` starts, so it is
+/// priced beside the transaction rather than inside it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 pub enum XvPhase {
-    /// Guards → tx0 committed (the plan + the first local step).
+    /// Guards → tx0 committed (the plan + step 0 when local; the intent
+    /// alone otherwise).
     Plan = 0,
     /// The initiator ring's barrier after tx0.
     IntentBarrier = 1,
@@ -275,9 +276,14 @@ pub enum XvPhase {
     Total = 4,
     /// Σ of the `XvGuards` round trips (the travelling guards).
     GuardRtt = 5,
+    /// Σ of the LOCAL steps applied after `tx0` and the local
+    /// participants' barriers — so `plan + intent_barrier + Σ ship_rtt +
+    /// local_steps + retire ≈ total` (a live refusal's compensation is
+    /// outside the table).
+    LocalSteps = 6,
 }
 
-const XV_PHASES: usize = 6;
+const XV_PHASES: usize = 7;
 const XV_PHASE_NAMES: [&str; XV_PHASES] = [
     "plan",
     "intent_barrier",
@@ -285,6 +291,7 @@ const XV_PHASE_NAMES: [&str; XV_PHASES] = [
     "retire",
     "total",
     "guard_rtt",
+    "local_steps",
 ];
 
 static XV_PROF: once_cell::sync::Lazy<[crate::fuse_client::LatencyHistogram; XV_PHASES]> =
@@ -580,7 +587,9 @@ static XV_SHIPPER: once_cell::sync::Lazy<
 
 /// Install the process-global step shipper: the S8 client router a
 /// foreign step travels on (its lanes, its same-id resend, its era
-/// learning).
+/// learning). Product caller: PR 12's join ladder (the census binding);
+/// until it lands the contracts install it directly — the shipped plane
+/// is production-inert by design (dark).
 pub fn install_xv_shipper(router: Arc<crate::meta_ship::MetaShipRouter>) {
     XV_SHIPPER.store(Some(router));
 }
@@ -2135,19 +2144,20 @@ fn is_ship_failure(routed: &RoutedMetaBackend, v_idx: usize, local: &XvLocalStep
     )
 }
 
-/// The intent's key ino for a plan whose first LOCAL step is `first_local`
-/// (its slot's local 0), or — every step foreign — the mount's own rotor
-/// slot on the coordinator volume. Flat and unarmed: [`XV_INTENT_INO`].
+/// The intent's key ino: `step0`'s slot's local 0 when step 0 is local
+/// (the intent rides its entry), or — step 0 another appender's — the
+/// mount's own rotor slot on the coordinator volume (the intent's own
+/// entry). Flat and unarmed: [`XV_INTENT_INO`].
 fn intent_ino_for(
     routed: &RoutedMetaBackend,
     coord: usize,
-    first_local: Option<&XvLocalStep>,
+    step0: Option<&XvLocalStep>,
 ) -> Result<Ino> {
     let vol = &routed.volumes[coord];
     let Some(plane) = vol.slot_leases() else {
         return Ok(XV_INTENT_INO);
     };
-    let slot = match first_local {
+    let slot = match step0 {
         Some(step) => super::kv::record::forest_slot_of_ino(step.local_home()),
         None => *plane.rotor.load().first().ok_or_else(|| {
             SqueezefsError::InvalidOperation(
@@ -2268,6 +2278,12 @@ pub async fn execute(
             return Err(seam_error());
         }
         let rider = (i == 0 && step0_local).then_some(&put);
+        let t_step = std::time::Instant::now();
+        let local_step = !(i == 0 && step0_local)
+            && matches!(
+                step_home(routed, *v_idx, local.local_home()),
+                StepHome::Local
+            );
         match apply_or_ship_step(
             routed,
             tx_id,
@@ -2289,6 +2305,8 @@ pub async fn execute(
                     XV_TX_STARTED.fetch_add(1, Ordering::Relaxed);
                     note_intent_durable(tx_id);
                     phase_record(XvPhase::Plan, t_total);
+                } else if local_step {
+                    phase_record(XvPhase::LocalSteps, t_step);
                 }
                 // A LIVE witness refusal at a shipped step: the object
                 // moved at the holder between the plan and the apply. The
@@ -2367,11 +2385,13 @@ pub async fn execute(
         if v == coord {
             continue;
         }
+        let t = std::time::Instant::now();
         if let Err(e) = barrier(routed, v).await {
             escalate_midplan(routed, &localised, tx_id, localised.len(), &e);
             note_intent_abandoned(tx_id);
             return Err(e);
         }
+        phase_record(XvPhase::LocalSteps, t);
     }
     if allowed <= localised.len() {
         note_intent_abandoned(tx_id);

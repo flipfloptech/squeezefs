@@ -83,40 +83,42 @@
 //! reversed) the participant is a SLOT HOLDER, not a volume: a step homed
 //! on a slot another appender leases travels to that appender as the S8
 //! verb `MetaCall::XvStep` — the remote leg replaces the per-volume call
-//! inside [`apply_or_ship_step`] and NOTHING ELSE changes: the record
+//! inside `apply_or_ship_step` and NOTHING ELSE changes: the record
 //! format is the same (steps carry global inos, so the participant is
 //! resolved by routing at apply time — a slot handover between crash and
 //! recovery is handled for free), and the served side is the SAME
-//! `xv_apply_step` under the holder's own 4a guards, so idempotence stays
+//! `xv_apply_step` under the op's travelling guards, so idempotence stays
 //! a property of one code path. The six-step ladder as built:
 //!
 //! ```text
-//! 1. plan            under the op's LOCAL 4a guards (a foreign slot's key
-//!                    takes none here — its guard is the holder's, taken
-//!                    around the served apply)
-//! 2. tx0             ONE entry in the INITIATOR's ring: the first LOCAL
-//!                    step's records + the intent (homed in that step's
-//!                    slot — or the mount's rotor slot when every step is
-//!                    foreign), so the entry lands in ONE region
+//! 1. plan            under the op's 4a guards — foreign-home guards
+//!                    TRAVEL ([`acquire_guards_leased`]: one canonical
+//!                    `lock_many` per table, tables in ascending
+//!                    appender-id order; a foreign holder parks the
+//!                    initiator's guards under the op's scope)
+//! 2. tx0             ONE entry in the INITIATOR's ring: step 0's records
+//!                    + the intent when step 0 is local (the intent homed
+//!                    in that step's slot); the intent ALONE first — its
+//!                    own entry in the mount's rotor slot — when step 0 is
+//!                    another appender's
 //! 3. barrier         the initiator's ring
 //! 4. steps           in plan order: own slot ⇒ the local applier; foreign
-//!                    ⇒ shipped to the holder (tree 0 + the endpoint table;
-//!                    the reply follows the holder's durability lane)
+//!                    ⇒ shipped to the holder under the scope (tree 0 + the
+//!                    endpoint table; the holder applies without taking a
+//!                    guard; the reply follows its durability lane)
 //! 5. barrier         every LOCAL participant volume
-//! 6. retire          Delete the intent (initiator's ring)
+//! 6. retire          Delete the intent (initiator's ring); the guard
+//!                    set's drop releases every travelled scope
 //! ```
 //!
-//! **No foreign 4a guard is HELD across the plan** (an as-built deviation
-//! from §5.6's "foreign-home guards travel"): a guard taken at the holder
-//! beside the initiator's stripe-canonical `lock_many` has no common order
-//! with a peer performing the inverse operation (`A: local X → remote Y`,
-//! `B: local Y → remote X` is a cycle), and Lustre's FID-ordered
-//! acquisition would need every 4a site to order by ino, which the
-//! shipped `lock_many` does not. The holder's apply under ITS guards plus
-//! the `(pre, post)` witness give the same isolation at commit; a witness
-//! refusal on a LIVE shipped step is the op's own errno, with the
-//! initiator's half compensated (a minted child destroyed — the only half
-//! that becomes unreachable), never a fail-stop.
+//! A witness refusal on a LIVE shipped step (the object moved at the
+//! holder between the plan's read and the apply — reachable only through
+//! a stale foreign read, the S5 projection until PR 5's tokens) is the
+//! op's own errno, never a fail-stop: the plan stops at the refusal and
+//! the initiator's applied halves are COMPENSATED under the still-held
+//! guards (`compensate_live_refusal`: a create's minted child destroyed,
+//! a link's raised count restored, a rename's removed source name
+//! re-inserted).
 //!
 //! **A ship that fails leaves the intent OPEN, never fail-stops.** The
 //! S3.5 lattice latch exists because a local mid-plan device error
@@ -213,6 +215,10 @@ static XV_CO_STEPS_SHIPPED: AtomicU64 = AtomicU64::new(0);
 static XV_CO_STEPS_SERVED: AtomicU64 = AtomicU64::new(0);
 /// Set-wide directory-rename lock takes (initiator side).
 static DIR_RENAME_LOCK_ACQUIRES: AtomicU64 = AtomicU64::new(0);
+/// Reverse dentry SCANS the ancestor walk ran under the lease (the
+/// parent memo's misses — one per cold hop; growth per rename on a warm
+/// mount is the memo failing).
+static DIR_RENAME_PARENT_SCANS: AtomicU64 = AtomicU64::new(0);
 /// `XvGuards` this initiator shipped (one per foreign holder table per
 /// op — the design's "foreign-home guards travel: dlm_rpcs += 1 each"
 /// face; the `dlm_rpcs` word itself is the S4 table's).
@@ -273,6 +279,11 @@ fn phase_record(phase: XvPhase, t0: std::time::Instant) {
 pub(crate) fn note_dir_rename_lock(waited: std::time::Duration) {
     DIR_RENAME_LOCK_ACQUIRES.fetch_add(1, Ordering::Relaxed);
     DIR_RENAME_LOCK_WAIT.record(waited);
+}
+
+/// Count one memo-miss reverse scan inside the ancestor walk.
+pub(crate) fn note_dir_rename_parent_scan() {
+    DIR_RENAME_PARENT_SCANS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Count one served shipped step (the holder side).
@@ -342,6 +353,8 @@ pub struct CrossOwnerStats {
     pub intents_stuck: u64,
     pub dir_rename_lock_acquires: u64,
     pub dir_rename_lock_wait_ns_sum: u64,
+    /// Reverse dentry scans the ancestor walk ran (parent-memo misses).
+    pub dir_rename_parent_scans: u64,
     /// `XvGuards` shipped (initiator side).
     pub guard_rpcs: u64,
     /// Scopes parked for remote initiators (holder side).
@@ -362,6 +375,7 @@ pub fn cross_owner_stats() -> CrossOwnerStats {
         intents_stuck,
         dir_rename_lock_acquires: DIR_RENAME_LOCK_ACQUIRES.load(Ordering::Relaxed),
         dir_rename_lock_wait_ns_sum: DIR_RENAME_LOCK_WAIT.sum_ns(),
+        dir_rename_parent_scans: DIR_RENAME_PARENT_SCANS.load(Ordering::Relaxed),
         guard_rpcs: XV_CO_GUARD_RPCS.load(Ordering::Relaxed),
         guards_parked: XV_CO_GUARDS_PARKED.load(Ordering::Relaxed),
         guard_expiries: XV_CO_GUARD_EXPIRIES.load(Ordering::Relaxed),
@@ -414,6 +428,10 @@ pub fn cross_owner_stats_json() -> serde_json::Map<String, serde_json::Value> {
     out.insert(
         "dir_rename_lock_wait_ns".into(),
         DIR_RENAME_LOCK_WAIT.to_json(),
+    );
+    out.insert(
+        "dir_rename_parent_scans".into(),
+        s.dir_rename_parent_scans.into(),
     );
     out
 }
@@ -1598,7 +1616,7 @@ fn localise(routed: &RoutedMetaBackend, step: &XvStep) -> (usize, XvLocalStep) {
     }
 }
 
-/// The public face of [`localise`] — the served side of a shipped step
+/// The public face of `localise` — the served side of a shipped step
 /// resolves the same way (`meta_ship::service`).
 pub fn localise_step(routed: &RoutedMetaBackend, step: &XvStep) -> (usize, XvLocalStep) {
     localise(routed, step)
@@ -1704,7 +1722,11 @@ pub async fn lookup_exact(
 ) -> Result<Option<(Ino, u32)>> {
     let (v_idx, local_parent) = routed.route_ino(parent);
     let (holder, endpoint) = match step_home(routed, v_idx, local_parent) {
-        StepHome::Local => return routed.lookup_dentry(parent, name).await,
+        // Guard-free (Issue 2): the walk holds the initiator's own
+        // exclusive `D{}` guards; a shared guard here could park behind
+        // them on a stripe collision. The set-wide lease is the read's
+        // consistency.
+        StepHome::Local => return routed.lookup_dentry_exact_unguarded(parent, name).await,
         StepHome::Foreign { holder, endpoint } => (holder, endpoint),
         StepHome::Unreachable { holder } => {
             return Err(SqueezefsError::refused(

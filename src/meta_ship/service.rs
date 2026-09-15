@@ -1471,9 +1471,20 @@ impl MetaShipService {
                     }),
                 })
             }
-            MetaCall::LookupExact { parent, name } => Ok(MetaReply::DentryExact(
-                self.inner.lookup_dentry(*parent, name).await?,
-            )),
+            // Guard-free and exact (Issue 2/19): the initiator holds its
+            // own guards across this read, and the answer must be THIS
+            // holder's RAM-authoritative tree — a parent whose slot this
+            // mount does not lease refuses, never answers from a
+            // projection.
+            MetaCall::LookupExact { parent, name } => {
+                self.inner
+                    .refuse_unless_slot_leased_here(*parent, "exact lookup")?;
+                Ok(MetaReply::DentryExact(
+                    self.inner
+                        .lookup_dentry_exact_unguarded(*parent, name)
+                        .await?,
+                ))
+            }
             // The travelling guard's two halves (§5.6 line 1): park the
             // initiator's 4a guards under its scope / release them.
             MetaCall::XvGuards {

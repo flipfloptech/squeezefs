@@ -935,6 +935,27 @@ pub struct RoutedMetaBackend {
     /// emission (bare backends only ever encode STRING records, which
     /// never coalesce).
     map_run_stride: std::sync::OnceLock<MapRunStride>,
+    /// Symmetric PR 6 (review round 1, Issue 10): the DIRECTORY-parent
+    /// memo `dir → (parent, name)` the set-wide directory-rename lock's
+    /// ancestor walk reads first — one O(1) probe per hop instead of a
+    /// whole-set reverse dentry scan while every other directory rename
+    /// in the set waits on the lease. A HINT, never the truth: every hop
+    /// is confirmed by the exact lookup at the link's holder, a denied
+    /// hint is invalidated and the scan runs (`dir_rename_parent_scans`).
+    /// Fed by every directory mint and directory rename this mount
+    /// performs and by every confirmed hop; sized by the dentry-cache
+    /// derivation (one entry per hot directory — the `..` memo's law).
+    dir_parents: moka::sync::Cache<u64, (u64, std::sync::Arc<str>), ahash::RandomState>,
+}
+
+/// The directory-parent memo's capacity: the dentry-cache derivation
+/// (`fuse_client`'s `dir_entry_capacity` — one entry per hot directory,
+/// never a fixed constant).
+fn dir_parent_memo() -> moka::sync::Cache<u64, (u64, std::sync::Arc<str>), ahash::RandomState> {
+    let total_memory = crate::mem_budget::shared_system_ram_bytes();
+    moka::sync::Cache::builder()
+        .max_capacity(std::cmp::max(50_000, total_memory / 200_000))
+        .build_with_hasher(ahash::RandomState::new())
 }
 
 /// See [`RoutedMetaBackend::install_map_entry_encoder`].
@@ -1159,6 +1180,7 @@ impl RoutedMetaBackend {
             map_entry_encoder: std::sync::OnceLock::new(),
             map_entry_decoder: std::sync::OnceLock::new(),
             map_run_stride: std::sync::OnceLock::new(),
+            dir_parents: dir_parent_memo(),
         }
     }
 
@@ -1220,6 +1242,7 @@ impl RoutedMetaBackend {
             map_entry_encoder: std::sync::OnceLock::new(),
             map_entry_decoder: std::sync::OnceLock::new(),
             map_run_stride: std::sync::OnceLock::new(),
+            dir_parents: dir_parent_memo(),
         })
     }
 
@@ -1597,18 +1620,77 @@ impl RoutedMetaBackend {
         Ok(())
     }
 
-    /// The GLOBAL parent of directory `dir` (the one dentry naming it),
-    /// `None` for the root or an unreferenced directory. A reverse
-    /// dentry scan per volume (`find_parent_of_child` — the `..`
-    /// reconnect path's instrument, `meta_parent_scans`); v3 keeps no
-    /// parent pointer, and directory renames — its only other caller —
-    /// are rare by the design's own arithmetic (§1.6).
-    pub async fn parent_of_directory(&self, dir: Ino) -> Result<Option<Ino>> {
-        Ok(self.parent_link_of(dir).await?.map(|(p, _)| p))
+    /// Feed the parent memo after a rename: a moved DIRECTORY's one name
+    /// is `(new_parent, new_name)`; under `RENAME_EXCHANGE` the swapped
+    /// directory's is `(old_parent, old_name)`.
+    fn note_renamed_dir_parents(
+        &self,
+        moved: Option<(Ino, u32)>,
+        dest: Option<(Ino, u32)>,
+        flags: u32,
+        old: (Ino, &str),
+        new: (Ino, &str),
+    ) {
+        if let Some((child, ft)) = moved {
+            if ft == libc::S_IFDIR {
+                self.note_dir_parent(child, new.0, new.1);
+            }
+        }
+        if flags & libc::RENAME_EXCHANGE != 0 {
+            if let Some((child, ft)) = dest {
+                if ft == libc::S_IFDIR {
+                    self.note_dir_parent(child, old.0, old.1);
+                }
+            }
+        } else if let Some((victim, _)) = dest {
+            self.dir_parents.invalidate(&victim);
+        }
     }
 
-    /// [`Self::parent_of_directory`] with the link's NAME.
-    async fn parent_link_of(&self, dir: Ino) -> Result<Option<(Ino, String)>> {
+    /// Refuse (EAGAIN) a served read or step naming an ino whose slot
+    /// this mount does not lease — the initiator's holder view is stale
+    /// and it re-resolves through tree 0. A no-op on an unarmed volume.
+    pub(crate) fn refuse_unless_slot_leased_here(&self, ino: Ino, what: &str) -> Result<()> {
+        let (v_idx, local) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        let Some(plane) = self.volumes[v_idx].slot_leases() else {
+            return Ok(());
+        };
+        let slot = kv::record::forest_slot_of_ino(local);
+        if plane.gate.is_leased(slot) {
+            return Ok(());
+        }
+        let holder = match plane.table.resolve(slot) {
+            crate::slot_lease_core::Resolved::Holder { holder, g } => {
+                format!("appender {holder} at g {g}")
+            }
+            crate::slot_lease_core::Resolved::Unleased { .. } => "nobody".to_string(),
+        };
+        Err(crate::error::SqueezefsError::refused(
+            libc::EAGAIN,
+            format!(
+                "{what} names ino {ino} on forest slot {slot}, which this mount does not lease \
+                 ({holder} does) — the initiator's holder view is stale; it re-resolves \
+                 through tree 0"
+            ),
+        ))
+    }
+
+    /// The GLOBAL parent of directory `dir` (the one dentry naming it),
+    /// `None` for the root or an unreferenced directory — the memo's
+    /// hint, else the reverse dentry scan (`find_parent_of_child`'s
+    /// class, `meta_parent_scans`; v3 keeps no parent pointer). Test
+    /// support for the cross-owner contracts' chain walks (the product
+    /// walk is `refuse_rename_into_own_subtree`, which confirms each hop).
+    pub async fn parent_of_directory(&self, dir: Ino) -> Result<Option<Ino>> {
+        if let Some((p, _)) = self.dir_parents.get(&dir) {
+            return Ok(Some(p));
+        }
+        Ok(self.scan_parent_link_of(dir).await?.map(|(p, _)| p))
+    }
+
+    /// The reverse dentry scan for `dir`'s one name — the memo miss path.
+    async fn scan_parent_link_of(&self, dir: Ino) -> Result<Option<(Ino, String)>> {
         if dir == kv::builder::ROOT_INO {
             return Ok(None);
         }
@@ -1622,16 +1704,43 @@ impl RoutedMetaBackend {
         Ok(None)
     }
 
+    /// Note a directory's one name in the parent memo (a mint, a
+    /// directory rename, a confirmed ancestor hop). A hint only.
+    pub(crate) fn note_dir_parent(&self, dir: Ino, parent: Ino, name: &str) {
+        self.dir_parents
+            .insert(dir, (parent, std::sync::Arc::from(name)));
+    }
+
+    /// The EXACT `(parent, name)` read WITHOUT a 4a guard: the local arm
+    /// of the directory-rename ancestor check and the served
+    /// `LookupExact` (review round 1, Issue 2). The walk runs while the
+    /// initiator HOLDS its own exclusive `D{}` guards, so a shared `D{}`
+    /// guard here would park the initiator behind itself on a stripe
+    /// collision — with the set-wide lease held, wedging every directory
+    /// rename in the set. The lease is what makes the read consistent:
+    /// no other directory rename can move the chain under it, and a
+    /// `mkdir`/`rmdir` never re-parents an existing directory.
+    pub async fn lookup_dentry_exact_unguarded(
+        &self,
+        parent: Ino,
+        name: &str,
+    ) -> Result<Option<(Ino, u32)>> {
+        let (v_idx, local_parent) = self.route_ino(parent);
+        self.check_volume_enabled(v_idx)?;
+        self.find_dentry_routed(v_idx, local_parent, name).await
+    }
+
     /// The directory-rename ANCESTOR CHECK on exact data (§5.6.4): under
     /// the set-wide lock, walk `new_parent`'s chain to the root and refuse
-    /// `EINVAL` if `moved` is on it. Each link `(p, name) → d` the local
-    /// reverse scan reports is CONFIRMED at `p`'s slot holder through an
-    /// exact lookup (its own RAM-authoritative tree — one RPC per foreign
-    /// link); a link the holder denies is a projection not yet showing a
-    /// previous lock holder's rename, re-read after one publication
-    /// ceiling, bounded — `EAGAIN` past the bound, never a guess. The
-    /// name of the link is recovered through the parent's own listing
-    /// (v3 keeps no parent pointer; a directory has exactly one name).
+    /// `EINVAL` if `moved` is on it. Each hop's link `(p, name) → d` comes
+    /// from the parent memo (O(1)) or, on a miss, the reverse dentry scan
+    /// (`dir_rename_parent_scans`), and is CONFIRMED at `p`'s slot holder
+    /// through an exact guard-free lookup (its RAM-authoritative tree —
+    /// one RPC per foreign link, no 4a guard: Issue 2). A denied or
+    /// absent link is a projection not yet showing a previous lock
+    /// holder's rename: a stale memo hint falls to the scan at once, a
+    /// scanned link is re-read after one publication ceiling, bounded —
+    /// `EAGAIN` past the bound, never a guess.
     async fn refuse_rename_into_own_subtree(&self, moved: Ino, new_parent: Ino) -> Result<()> {
         let einval =
             || crate::error::SqueezefsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL));
@@ -1645,19 +1754,35 @@ impl RoutedMetaBackend {
             if cur == moved {
                 return Err(einval());
             }
-            // The link, confirmed exact at its holder; a denied link is
-            // re-read until the projection catches up or the bound trips.
             let mut confirmed: Option<Ino> = None;
-            for _attempt in 0..3u32 {
-                let Some((p, name)) = self.parent_link_of(cur).await? else {
-                    break;
+            let mut memo_hint = self.dir_parents.get(&cur);
+            let mut scans = 0u32;
+            // Three SCANNED attempts a ceiling apart (a stale memo hint
+            // costs no wait — it falls straight to the scan).
+            while scans < 3 {
+                let link = match memo_hint.take() {
+                    Some((p, name)) => Some((p, name.to_string())),
+                    None => {
+                        scans += 1;
+                        crossvol_tx::note_dir_rename_parent_scan();
+                        self.scan_parent_link_of(cur).await?
+                    }
                 };
-                let exact = crossvol_tx::lookup_exact(self, p, &name).await?;
-                if exact.map(|(c, _)| c) == Some(cur) {
-                    confirmed = Some(p);
-                    break;
+                if let Some((p, name)) = link {
+                    let exact = crossvol_tx::lookup_exact(self, p, &name).await?;
+                    if exact.map(|(c, _)| c) == Some(cur) {
+                        self.note_dir_parent(cur, p, &name);
+                        confirmed = Some(p);
+                        break;
+                    }
+                    self.dir_parents.invalidate(&cur);
+                    if scans == 0 {
+                        continue;
+                    }
                 }
-                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(ceiling)).await;
+                if scans < 3 {
+                    squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(ceiling)).await;
+                }
             }
             let Some(p) = confirmed else {
                 return Err(crate::error::SqueezefsError::refused(
@@ -2962,6 +3087,9 @@ impl RoutedMetaBackend {
             }
             out?;
 
+            if is_dir_flag {
+                self.note_dir_parent(global_child_ino, parent, name);
+            }
             Ok(Inode {
                 ino: global_child_ino,
                 ..child_inode
@@ -3048,6 +3176,9 @@ impl RoutedMetaBackend {
                 "cross-owner create: the mint step produced no record".into(),
             )
         })?;
+        if is_dir {
+            self.note_dir_parent(child, parent, name);
+        }
         Ok(Inode {
             ino: child,
             mode: v.mode,
@@ -3366,6 +3497,13 @@ impl RoutedMetaBackend {
             if let Some((v, l)) = dest_remote {
                 self.touch_ctime_routed(v, l, guards.clone()).await?;
             }
+            self.note_renamed_dir_parents(
+                old_dentry_opt,
+                new_dentry_opt,
+                flags,
+                (old_parent, old_name),
+                (new_parent, new_name),
+            );
             Ok(true)
         } else if flags & libc::RENAME_EXCHANGE != 0 {
             let (old_child, old_ft) = old_dentry_opt.ok_or_else(|| {
@@ -3423,6 +3561,13 @@ impl RoutedMetaBackend {
                 ],
             };
             crossvol_tx::execute(self, &plan, guards).await?;
+            self.note_renamed_dir_parents(
+                old_dentry_opt,
+                new_dentry_opt,
+                flags,
+                (old_parent, old_name),
+                (new_parent, new_name),
+            );
             Ok(true)
         } else {
             if flags & libc::RENAME_NOREPLACE != 0 && new_dentry_opt.is_some() {
@@ -3578,6 +3723,13 @@ impl RoutedMetaBackend {
                     steps,
                 };
                 crossvol_tx::execute(self, &plan, guards).await?;
+                self.note_renamed_dir_parents(
+                    old_dentry_opt,
+                    None,
+                    flags,
+                    (old_parent, old_name),
+                    (new_parent, new_name),
+                );
                 Ok(true)
             } else {
                 Err(crate::error::SqueezefsError::Io(std::io::Error::new(
@@ -4153,7 +4305,8 @@ impl Metadata for RoutedMetaBackend {
         let mut lease: Option<kv::backend::DirRenameLease> = None;
         let mut want_lock = armed
             && matches!(
-                self.lookup_dentry(old_parent, old_name).await,
+                self.lookup_dentry_exact_unguarded(old_parent, old_name)
+                    .await,
                 Ok(Some((_, ft))) if ft == libc::S_IFDIR
             );
         loop {

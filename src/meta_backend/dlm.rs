@@ -321,9 +321,9 @@ pub struct DlmGuard {
 }
 
 impl DlmGuard {
-    /// A guard held in another table under `scope` (see
-    /// [`DlmGuardInner::External`]); `on_drop` runs exactly once, at the
-    /// drop.
+    /// A guard held in another table under `scope` (the `External` form
+    /// described on the guard's inner enum); `on_drop` runs exactly once,
+    /// at the drop.
     pub fn external(scope: u64, on_drop: impl FnOnce() + Send + Sync + 'static) -> Self {
         Self {
             _inner: DlmGuardInner::External {

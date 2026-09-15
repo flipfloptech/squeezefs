@@ -1166,6 +1166,11 @@ pub struct KvMetaBackend {
     /// every unarmed forest mount — one `OnceLock` probe per read verb.
     tokens_holder: std::sync::OnceLock<Arc<crate::meta_ship::token_plane::TokenHolderPlane>>,
     tokens_reader: std::sync::OnceLock<Arc<crate::meta_ship::token_plane::TokenReaderPlane>>,
+    /// The frame stamp's generation FLOOR per slot (§5.8.2): the highest
+    /// `g` this mount has stamped a slot's frame with, kept past the
+    /// plane's leave so a flush after the disarm never stamps below it
+    /// (rule 3 would screen the frame at the next load).
+    frame_g_floor: scc::HashMap<super::record::ForestSlot, u32>,
     /// Rewrite-publish-drain Lever B (2026-08-01): the per-volume
     /// layout-merge conveyor — delta-class layout saves aggregate into
     /// ONE multi-ino KvTx per pass (one journal entry, one ring write,
@@ -1701,6 +1706,11 @@ impl KvMetaBackend {
         // gate refusal: the claim record stays (crash-equivalent — the
         // same-host dead-pid proof reclaims it instantly), the PR and
         // flock release deterministically.
+        if let Err(e) = be.prime_frame_stamps().await {
+            be.release_reservation().await;
+            drop(be.guard_fd.lock().unwrap().take());
+            return Err(e);
+        }
         if let Err(e) = be.cover_bring_up_residue().await {
             be.release_reservation().await;
             drop(be.guard_fd.lock().unwrap().take());
@@ -2803,6 +2813,7 @@ impl KvMetaBackend {
             conveyor_self: std::sync::OnceLock::new(),
             tokens_holder: std::sync::OnceLock::new(),
             tokens_reader: std::sync::OnceLock::new(),
+            frame_g_floor: scc::HashMap::new(),
             layout_conveyor: Arc::new(ConveyorCore::new()),
             batch_max_txs: resolve_commit_batch_txs(
                 std::env::var(COMMIT_BATCH_TXS_ENV).ok().as_deref(),
@@ -2964,10 +2975,22 @@ impl KvMetaBackend {
     // -----------------------------------------------------------------
 
     /// The `(appender, g)` a write to a node of `slot` carries NOW: the
-    /// slot's journaling region and its lease generation off the armed
-    /// plane's table (`Unleased { g }` for a tree the manager maintains);
-    /// `(0, 0)` for tree 0 and on an unarmed forest (the manager's
-    /// structural stamp).
+    /// slot's journaling region and its lease generation off the plane's
+    /// table (`Unleased { g }` for a tree the manager maintains); `(0, 0)`
+    /// for tree 0 and on a forest with no plane (the manager's structural
+    /// stamp).
+    ///
+    /// The table is read whether or not the gate is armed, and the
+    /// generation carries a per-slot FLOOR for the mount's life
+    /// (`frame_g_floor`): the leave DROPS the plane before the shutdown's
+    /// final flush passes, and a frame stamped `(0, 0)` then — below the
+    /// leased generation the leaf's earlier frames carry — is exactly rule
+    /// 3's non-monotone `g`, screened at the next load (found at the
+    /// rebase onto PR 6/8, whose leave dirties native leaves after the
+    /// plane is gone: every commit of the partitioned open's last cycle
+    /// read EMPTY at the remount — `sym_cross_owner_tests`, ten contracts,
+    /// both layouts). A slot's generations are ONE sequence; the stamp
+    /// never moves backwards.
     pub fn frame_stamp_for_slot(
         &self,
         slot: Option<super::record::ForestSlot>,
@@ -2975,12 +2998,38 @@ impl KvMetaBackend {
         let Some(slot) = slot else {
             return super::node::FrameStamp::default();
         };
-        let g = match self.slot_leases() {
+        let table_g = match self.appenders.as_ref().and_then(|a| a.slot_leases()) {
             Some(plane) => match plane.table.resolve(slot) {
+                // BEFORE the arm (the bring-up cover and the join's cycle
+                // flush the D0 claim's leaf): the manager's native slot is
+                // acquired at the arm UNCONDITIONALLY (KD-SYM-2), and an
+                // `Unleased { g }` acquire lands at `g + 1` — so its frames
+                // written now carry the generation the arm will hold, or
+                // rule 2 screens them past the previous leave's tail (a
+                // frame of generation `g` past `g`'s recorded tail is the
+                // zombie shape). A re-adopted `Leased { 0, g }` stays `g`.
+                crate::slot_lease_core::Resolved::Unleased { g }
+                    if slot == super::record::NATIVE_FOREST_SLOT && !plane.gate.is_armed() =>
+                {
+                    g.saturating_add(1)
+                }
                 crate::slot_lease_core::Resolved::Unleased { g } => g,
                 crate::slot_lease_core::Resolved::Holder { g, .. } => g,
             },
             None => 0,
+        };
+        // Monotone per slot for the mount's life: the floor survives the
+        // plane (the leave drops it before the last flush passes).
+        let g = match self.frame_g_floor.entry_sync(slot) {
+            scc::hash_map::Entry::Occupied(mut o) => {
+                let floor = o.get_mut();
+                *floor = (*floor).max(table_g);
+                *floor
+            }
+            scc::hash_map::Entry::Vacant(v) => {
+                v.insert_entry(table_g);
+                table_g
+            }
         };
         super::node::FrameStamp {
             appender_id: self.region_of_slot(slot),
@@ -3865,6 +3914,30 @@ impl KvMetaBackend {
             if page.len() < 512 {
                 break;
             }
+        }
+        Ok(())
+    }
+
+    /// **Prime the frame stamps** (§5.8.2 — PR 5, the rebase onto PR 6/8):
+    /// on an armed-to-be writer, load tree 0's lease population into the
+    /// plane's table and install the frame fence BEFORE the bring-up
+    /// cover — the first flush of a slot-tree leaf (the D0 claim's) —
+    /// so every pre-arm frame carries the slot's generation (the native
+    /// slot's arm generation, `frame_stamp_for_slot`) instead of the
+    /// manager's structural `(0, 0)`, which rule 3 screened below the
+    /// leaf's earlier frames at the next load — ending the log there and
+    /// losing every later frame (ten cross-owner contracts read the
+    /// partitioned open's commits EMPTY at the remount). The arm re-loads
+    /// the table (idempotent) and its fence install is the refused second
+    /// one.
+    async fn prime_frame_stamps(self: &Arc<Self>) -> std::result::Result<(), KvError> {
+        let Some(plane) = self.appenders.as_ref().and_then(|a| a.slot_leases()) else {
+            return Ok(());
+        };
+        self.load_slot_leases(plane).await?;
+        if let Ok(weak) = self.conveyor_identity() {
+            self.cache
+                .install_frame_fence(Arc::new(SlotFrameFence { be: weak }));
         }
         Ok(())
     }

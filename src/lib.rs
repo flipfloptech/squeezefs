@@ -243,6 +243,9 @@ pub mod build_profile_core;
 // tree, `#[path]`-included here (the ipc service lanes) and by the fuse3
 // fork (the FUSE-over-io_uring queue workers, R-4), so both spin
 // populations fold parks and read box headroom through the ONE law.
+/// The per-block SHARED mark of the clone protocol (symmetric metadata
+/// PR 7, §5.4.4) — the third word of the W1 patch × clone composition.
+pub mod shared_ref_core;
 pub mod slot_holder_cache;
 pub mod slot_lease_core;
 #[path = "../crates/squeezefs-ipc/src/spin_governor_core.rs"]

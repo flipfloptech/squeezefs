@@ -13815,11 +13815,7 @@ impl KvTx {
         for op in ops {
             let key = op.reference.key().to_vec();
             if op.take {
-                self.stage_put(
-                    super::record::TREE_BLOCK_REFS,
-                    key,
-                    op.reference.value().to_vec(),
-                );
+                self.stage_put(super::record::TREE_BLOCK_REFS, key, op.value().to_vec());
             } else {
                 self.stage_delete(super::record::TREE_BLOCK_REFS, key);
             }

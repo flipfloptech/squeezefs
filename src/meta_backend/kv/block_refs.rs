@@ -158,6 +158,19 @@ pub const BLOCK_REF_VALUE_VERSION: u8 = 1;
 /// [`BLOCK_INDEX_MAP_BLOB`] in the key.
 pub const BLOCK_REF_FLAG_MAP_BLOB: u8 = 1 << 0;
 
+/// `flags` bit 1: the block is **SHARED** across slot trees through the
+/// clone protocol (design-symmetric-metadata §5.4.4, PR 7). Set on the
+/// SOURCE's record by `MarkShared` before the cloner publishes its own
+/// record with the bit set (a clone of a clone inherits it); read by the
+/// W1 sole-owner predicate (`patch_ineligible_shared`) and by the
+/// terminal-free decision, which a SHARED block never takes locally —
+/// the shared index's holder decides (`ReleaseShared`). Never written on
+/// a bit-17-absent volume: the protocol runs on the armed forest alone.
+pub const BLOCK_REF_FLAG_SHARED: u8 = 1 << 1;
+
+/// Every flag bit this binary knows; anything else in the value refuses.
+const BLOCK_REF_FLAGS_KNOWN: u8 = BLOCK_REF_FLAG_MAP_BLOB | BLOCK_REF_FLAG_SHARED;
+
 /// The `block_index` sentinel for the indirect-map-blob reference. `u32`
 /// block indices address `2^32 × block_size` bytes (16 EiB at the
 /// shipped 4 MiB block), so the top value is unreachable as a real map
@@ -214,13 +227,21 @@ impl BlockRef {
         )
     }
 
-    /// The record value for this reference.
+    /// The record value for this reference (SHARED clear).
     pub fn value(&self) -> [u8; BLOCK_REF_VALUE_LEN] {
-        let flags = if self.is_map_blob() {
+        self.value_with(false)
+    }
+
+    /// The record value for this reference with the SHARED bit as given.
+    pub fn value_with(&self, shared: bool) -> [u8; BLOCK_REF_VALUE_LEN] {
+        let mut flags = if self.is_map_blob() {
             BLOCK_REF_FLAG_MAP_BLOB
         } else {
             0
         };
+        if shared {
+            flags |= BLOCK_REF_FLAG_SHARED;
+        }
         [BLOCK_REF_VALUE_VERSION, flags, 0, 0]
     }
 }
@@ -234,6 +255,9 @@ pub struct BlockRefOp {
     /// `true` = the reference is taken (`Put`); `false` = dropped
     /// (`Delete`).
     pub take: bool,
+    /// The taken record carries [`BLOCK_REF_FLAG_SHARED`] (a cloner's
+    /// record, §5.4.4 step 3). Meaningless on a drop.
+    pub shared: bool,
 }
 
 impl BlockRefOp {
@@ -242,6 +266,17 @@ impl BlockRefOp {
         Self {
             reference,
             take: true,
+            shared: false,
+        }
+    }
+
+    /// The reference is taken with the SHARED bit set — the cloner's own
+    /// record (§5.4.4 step 3; a clone of a clone inherits the bit).
+    pub fn taken_shared(reference: BlockRef) -> Self {
+        Self {
+            reference,
+            take: true,
+            shared: true,
         }
     }
 
@@ -250,7 +285,13 @@ impl BlockRefOp {
         Self {
             reference,
             take: false,
+            shared: false,
         }
+    }
+
+    /// The record value a `take` stages.
+    pub fn value(&self) -> [u8; BLOCK_REF_VALUE_LEN] {
+        self.reference.value_with(self.shared)
     }
 }
 
@@ -419,6 +460,8 @@ pub fn decode_block_ref_key(key: &[u8]) -> Result<BlockRef, KvError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockRefValue {
     pub map_blob: bool,
+    /// [`BLOCK_REF_FLAG_SHARED`] is set.
+    pub shared: bool,
 }
 
 /// Decode + validate a reference value: version-gated, reserved-zero
@@ -440,7 +483,7 @@ pub fn decode_block_ref_value(value: &[u8]) -> Result<BlockRefValue, KvError> {
             value[0]
         )));
     }
-    if value[1] & !BLOCK_REF_FLAG_MAP_BLOB != 0 {
+    if value[1] & !BLOCK_REF_FLAGS_KNOWN != 0 {
         return Err(KvError::Corrupt(format!(
             "block-ref value carries unknown flags {:#04x}",
             value[1]
@@ -453,6 +496,7 @@ pub fn decode_block_ref_value(value: &[u8]) -> Result<BlockRefValue, KvError> {
     }
     Ok(BlockRefValue {
         map_blob: value[1] & BLOCK_REF_FLAG_MAP_BLOB != 0,
+        shared: value[1] & BLOCK_REF_FLAG_SHARED != 0,
     })
 }
 
@@ -548,6 +592,38 @@ mod tests {
         assert!(decode_block_ref_value(&[2, 0, 0, 0]).is_err(), "version");
         assert!(decode_block_ref_value(&[1, 0x80, 0, 0]).is_err(), "flags");
         assert!(decode_block_ref_value(&[1, 0, 1, 0]).is_err(), "reserved");
+    }
+
+    /// PR 7 (§5.4.4): the SHARED bit rides the value beside the map-blob
+    /// bit — a plain take stays byte-identical to the pre-PR-7 value, the
+    /// cloner's take carries the bit, and the decoder reads it back.
+    #[test]
+    fn shared_flag_rides_the_value_and_a_plain_take_is_unchanged() {
+        let r = BlockRef {
+            vol_tag: 1,
+            block_idx: 2,
+            owner_ino: 3,
+            block_index: 4,
+        };
+        assert_eq!(
+            BlockRefOp::taken(r).value(),
+            [BLOCK_REF_VALUE_VERSION, 0, 0, 0]
+        );
+        let shared = BlockRefOp::taken_shared(r);
+        assert!(shared.take && shared.shared);
+        assert_eq!(
+            shared.value(),
+            [BLOCK_REF_VALUE_VERSION, BLOCK_REF_FLAG_SHARED, 0, 0]
+        );
+        let decoded = decode_block_ref_value(&shared.value()).unwrap();
+        assert!(decoded.shared && !decoded.map_blob);
+        let blob = BlockRef {
+            block_index: BLOCK_INDEX_MAP_BLOB,
+            ..r
+        };
+        let both = decode_block_ref_value(&blob.value_with(true)).unwrap();
+        assert!(both.shared && both.map_blob);
+        assert!(!BlockRefOp::released(r).shared);
     }
 
     /// The refcount read's range must contain exactly the block's

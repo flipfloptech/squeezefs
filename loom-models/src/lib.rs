@@ -273,6 +273,15 @@
 //!   label's Release/Acquire pair to Relaxed, admits the skewed pair);
 //!   and the self-fence latch runs its side effects exactly once under
 //!   racing fencers (swap — a load-then-store double-fires).
+//! - [`shared_ref_core`] (symmetric metadata PR 7, design §5.4.4): the
+//!   per-block SHARED mark composed with the W1 patch × clone fence
+//!   protocol — invariants: a patch never proceeds in place once a
+//!   cloner's mark is visible to its fenced load, and never after a
+//!   cloner validated a pre-patch snapshot (the two-word model's law
+//!   holding with the third word); an owner's release never takes the
+//!   terminal verdict LOCALLY while a cloner has pinned or marked ahead
+//!   of it (rc conservation + the fenced mark read); weakening either
+//!   `SeqCst` fence fails the model exactly as it fails the two-word one.
 //!
 //! `cargo test` here compiles the cores against std atomics and runs
 //! nothing.
@@ -333,6 +342,8 @@ pub mod placed_core;
 pub mod range_custody_core;
 #[path = "../../src/refcount_core.rs"]
 pub mod refcount_core;
+#[path = "../../src/shared_ref_core.rs"]
+pub mod shared_ref_core;
 #[path = "../../src/meta_backend/kv/slot_cursor_core.rs"]
 pub mod slot_cursor_core;
 #[path = "../../src/meta_backend/slot_gate_core.rs"]
@@ -7142,6 +7153,134 @@ mod slot_lease_models {
                 table.acquire(SLOT, 2, 0, false),
                 AcquireOutcome::Granted { g: 2, words: w } if w == words
             ));
+        });
+    }
+}
+
+#[cfg(all(test, loom))]
+mod shared_ref_models {
+    //! [`shared_ref_core`] (design-symmetric-metadata §5.4.4, PR 7): the
+    //! per-block SHARED mark composed with the §5.1 patch × clone fence
+    //! protocol — the W1 patcher and the terminal-free decision read a
+    //! THIRD word after their existing `SeqCst` fence, the cloner stores
+    //! it ahead of its pin.
+    use crate::{incarnation_core, patch_clone_core, refcount_core, shared_ref_core};
+    use loom::sync::atomic::{AtomicU32, AtomicU64};
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// THE COMPOSED THREE-WORD MODEL: patcher × cloner × owner-free on one
+    /// sole-owned block. Patcher = `begin_patch_sole_owner` as shipped
+    /// with the mark read (`retire` → fence → `peek == 1 && !is_shared`).
+    /// Cloner = §5.4.4 steps 1 and 3 in one thread (`mark` → fence →
+    /// `try_acquire` → fence → `snapshot`, the `pin_block_validated`
+    /// sequence behind the mark). Owner = a release that may be terminal
+    /// (`release` → fence → `is_shared`; the terminal verdict is LOCAL
+    /// only when the mark is clear — a marked block's verdict is the
+    /// shared index holder's, §5.4.4 step 4).
+    ///
+    /// Invariants: (1) ¬(patched ∧ pinned ∧ snapshot == pre-patch) — the
+    /// two-word law holds with the third word; (2) ¬(patched ∧ the
+    /// patcher's fenced load saw the mark) — by construction of the load,
+    /// stated so a refactor that moves the load ahead of the fence fails
+    /// here; (3) ¬(local terminal free ∧ pinned) — rc conservation: a pin
+    /// that succeeded made the release nonterminal; (4) a local terminal
+    /// free never observes the mark set — the marked block's verdict is
+    /// never taken locally.
+    ///
+    /// Weakening verified (development runs): the PATCHER's fence to
+    /// `Release` fails (1); the cloner's fences fail (1) only when BOTH
+    /// are weakened — its post-mark fence stands in for its post-pin one
+    /// (either one sequenced between the pin and the snapshot closes the
+    /// store-buffering pair), so the cloner's load-bearing statement is
+    /// "at least one `SeqCst` fence between the pin and the snapshot"; in
+    /// the product the two acts are separated by `MarkShared`'s ack (a
+    /// durability-lane barrier), which is why the model carries both.
+    #[test]
+    fn shared_ref_core_composed_never_patches_or_frees_a_marked_block() {
+        loom::model(|| {
+            let word = Arc::new(AtomicU64::new(incarnation_core::STABLE_FIRST));
+            let rc = Arc::new(AtomicU32::new(1));
+            let mark = Arc::new(shared_ref_core::new_word());
+
+            let patcher = {
+                let word = word.clone();
+                let rc = rc.clone();
+                let mark = mark.clone();
+                thread::spawn(move || {
+                    incarnation_core::retire(&word);
+                    patch_clone_core::cross_word_fence();
+                    let count_sole = refcount_core::peek(&rc) == 1;
+                    let marked = shared_ref_core::is_shared(&mark);
+                    let sole = count_sole && !marked;
+                    // Both exits re-stabilize (content unchanged on the
+                    // back-off; the in-place DMA on the proceed).
+                    incarnation_core::publish(&word);
+                    (sole, marked)
+                })
+            };
+
+            let owner = {
+                let rc = rc.clone();
+                let mark = mark.clone();
+                thread::spawn(move || {
+                    let terminal = refcount_core::release(&rc);
+                    patch_clone_core::cross_word_fence();
+                    let marked = shared_ref_core::is_shared(&mark);
+                    // LOCAL terminal free iff terminal and unmarked; a
+                    // marked terminal release ships to the index holder.
+                    (terminal && !marked, terminal && marked)
+                })
+            };
+
+            // Cloner: step 1 (the mark at the source's holder), then step
+            // 3's pin + validate.
+            shared_ref_core::mark(&mark);
+            patch_clone_core::cross_word_fence();
+            let pinned = refcount_core::try_acquire(&rc);
+            let snap = if pinned {
+                patch_clone_core::cross_word_fence();
+                incarnation_core::snapshot(&word)
+            } else {
+                None
+            };
+
+            let (patched, patcher_saw_mark) = patcher.join().unwrap();
+            let (freed_locally, shipped) = owner.join().unwrap();
+
+            // (1) The two-word law survives the third word.
+            assert!(
+                !(patched && pinned && snap == Some(incarnation_core::STABLE_FIRST)),
+                "store-buffering outcome: a clone validated against the pre-patch \
+                 incarnation while the patch proceeded in place"
+            );
+            // (2) A patch never proceeds past a visible mark.
+            assert!(
+                !(patched && patcher_saw_mark),
+                "the patcher proceeded in place on a block it read as SHARED"
+            );
+            // (3) A pin that landed made the owner's release nonterminal —
+            // and a terminal release that read the mark SHIPPED instead of
+            // freeing (the cloner marks before it pins, so a pin the
+            // release beat to the count still leaves its mark for the
+            // release's fenced read whenever that read is ordered after
+            // it; the local-free arm is reached only with the mark clear).
+            assert!(
+                !(freed_locally && pinned),
+                "the owner freed locally a block a cloner had pinned"
+            );
+            assert!(
+                !(shipped && pinned),
+                "a pin that landed made the release nonterminal — nothing ships"
+            );
+            // Progress: an unvalidated pin retries against a re-stabilized
+            // word.
+            if pinned && snap.is_none() {
+                assert!(incarnation_core::snapshot(&word).is_some());
+            }
+            // Conservation: the count is 1 + pin − release.
+            let expect = 1 + u32::from(pinned) - 1;
+            assert_eq!(refcount_core::peek(&rc), expect);
         });
     }
 }

@@ -353,9 +353,14 @@ pub enum LeaseVerdict {
     /// The reader's membership lease is LIVE — a recall it did not ack
     /// inside the bound is the must-stay-0 stuck-reader class.
     Live,
-    /// The reader's lease expired (or it never held one — its token's
-    /// expiry IS the derived bound).
+    /// The membership owner sees the reader's lease EXPIRED: its tokens
+    /// died with it — swept at once, no wait.
     Expired,
+    /// No lease to read (no membership plane, or a client the owner never
+    /// granted): recalled and waited for like a live reader, and at the
+    /// deadline its token's expiry IS the derived bound (counted with the
+    /// lease, never the stuck-reader class).
+    Unknown,
 }
 
 /// The lease oracle: `client id → verdict`. The default reads the
@@ -393,10 +398,12 @@ pub struct TokenHolderPlane {
     frame_wake: squeezefs_ipc::sqz_notify::Notify,
     /// The pass parks here for acks (and the expiry sweep's ticks).
     ack_wake: squeezefs_ipc::sqz_notify::Notify,
-    /// Objects recalled by a pass whose commit has not yet APPLIED: a
-    /// grant on one parks here, else it would hand out the pre-commit
-    /// records with no recall coming.
-    inflight: scc::HashSet<u64>,
+    /// The grant ∥ pass gate (`token_grant_core`): every object of a
+    /// pass's union is IN FLIGHT from the union to the apply's settle; a
+    /// grant registers its token first and parks while its object is in
+    /// flight, so it is either recalled by the pass or served the
+    /// post-commit records — never handed the pre-commit ones.
+    gate: crate::token_grant_core::GrantPassGate,
     inflight_done: squeezefs_ipc::sqz_notify::Notify,
     lease_oracle: parking_lot::RwLock<Option<Arc<LeaseOracle>>>,
     /// The plane's monotonic origin, and on it the instants the batch's
@@ -412,6 +419,10 @@ pub struct TokenHolderPlane {
     recalls: AtomicU64,
     recall_acks: AtomicU64,
     expired_with_lease: AtomicU64,
+    /// Grants a DEAD member held that no recall ever reached — swept the
+    /// moment its lease was seen expired (beside the recalls on it, which
+    /// count `expired_with_lease`; the closure's terms stay exact).
+    lease_swept_grants: AtomicU64,
     timeouts_live: AtomicU64,
     releases: AtomicU64,
     /// Conveyor passes that recalled at least one object (the batching
@@ -426,7 +437,7 @@ impl std::fmt::Debug for TokenHolderPlane {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenHolderPlane")
             .field("outstanding", &self.lane.outstanding_now())
-            .field("inflight", &self.inflight.len())
+            .field("inflight", &self.gate.inflight_len())
             .finish()
     }
 }
@@ -444,7 +455,7 @@ impl TokenHolderPlane {
             pending_frames: parking_lot::Mutex::new(HashMap::new()),
             frame_wake: squeezefs_ipc::sqz_notify::Notify::new(),
             ack_wake: squeezefs_ipc::sqz_notify::Notify::new(),
-            inflight: scc::HashSet::new(),
+            gate: crate::token_grant_core::GrantPassGate::new(),
             inflight_done: squeezefs_ipc::sqz_notify::Notify::new(),
             lease_oracle: parking_lot::RwLock::new(None),
             epoch: Instant::now(),
@@ -454,6 +465,7 @@ impl TokenHolderPlane {
             recalls: AtomicU64::new(0),
             recall_acks: AtomicU64::new(0),
             expired_with_lease: AtomicU64::new(0),
+            lease_swept_grants: AtomicU64::new(0),
             timeouts_live: AtomicU64::new(0),
             releases: AtomicU64::new(0),
             recall_batches: AtomicU64::new(0),
@@ -481,31 +493,81 @@ impl TokenHolderPlane {
         }
         match crate::membership::installed_owner() {
             // A member whose lease deadline is still ahead of the owner's
-            // clock is LIVE.
+            // clock is LIVE; one past it is EXPIRED; one the owner never
+            // granted has no lease to read.
             Some(owner) => match owner.lease_deadline_ms(client) {
                 Some(deadline) if owner.now_ms() < deadline => LeaseVerdict::Live,
-                _ => LeaseVerdict::Expired,
+                Some(_) => LeaseVerdict::Expired,
+                None => LeaseVerdict::Unknown,
             },
             // No membership plane: no lease to outlive — the derived bound
             // is the token's expiry.
-            None => LeaseVerdict::Expired,
+            None => LeaseVerdict::Unknown,
         }
     }
 
-    /// The grant gate: park while `object`'s recalled commit is in
-    /// flight (bounded by the recall deadline — past it the object is
-    /// wedged, and the grant refuses rather than serving pre-commit
-    /// records).
-    async fn await_object_settled(&self, object: u64) -> bool {
-        if !self.inflight.contains_sync(&object) {
-            return true;
+    /// How long `client`'s membership lease still has on the owner's
+    /// clock — the wait the pass parks for at most, so a dead reader's
+    /// recall completes AT its lease expiry, never a tick later (`None`
+    /// = unknown: an installed oracle, or no plane).
+    fn lease_remaining(&self, client: &str) -> Option<Duration> {
+        if self.lease_oracle.read().is_some() {
+            return None;
         }
+        let owner = crate::membership::installed_owner()?;
+        let deadline = owner.lease_deadline_ms(client)?;
+        Some(Duration::from_millis(
+            deadline.saturating_sub(owner.now_ms()),
+        ))
+    }
+
+    /// **The lease sweep**: every client of `clients` whose lease the
+    /// membership owner sees EXPIRED loses everything it holds or owes.
+    /// `wanted` = the grants of each such client the CURRENT pass needed
+    /// gone (its objects' tokens): those complete as recalls that expired
+    /// with the lease (`recalls` + `expired_with_lease`, the closure's
+    /// terms); the recalls already outstanding on it count the same way;
+    /// every other grant it held is `lease_swept_grants`. Returns whether
+    /// anything was retired.
+    fn sweep_expired(&self, clients: impl IntoIterator<Item = (String, usize)>) -> bool {
+        let mut any = false;
+        for (c, wanted) in clients {
+            if self.lease_verdict(&c) != LeaseVerdict::Expired {
+                continue;
+            }
+            let (pending, grants) = self.lane.retire_client(&c);
+            if pending + grants == 0 {
+                continue;
+            }
+            any = true;
+            self.pending_frames.lock().remove(&c);
+            let wanted = wanted.min(grants.saturating_sub(pending));
+            let swept = grants.saturating_sub(pending + wanted);
+            self.recalls.fetch_add(wanted as u64, Ordering::Relaxed);
+            self.expired_with_lease
+                .fetch_add((pending + wanted) as u64, Ordering::Relaxed);
+            self.lease_swept_grants
+                .fetch_add(swept as u64, Ordering::Relaxed);
+            log::info!(
+                "read tokens: reader '{c}' left its membership lease — {} recall(s) completed \
+                 as expired_with_lease and {swept} unrecalled grant(s) swept",
+                pending + wanted
+            );
+        }
+        any
+    }
+
+    /// The grant gate: park while `object` is in a pass's flight (bounded
+    /// by the recall deadline — past it the object is wedged, and the
+    /// grant refuses rather than serving pre-commit records). Counts the
+    /// park.
+    async fn await_object_settled(&self, object: u64) -> bool {
         self.grant_parks.fetch_add(1, Ordering::Relaxed);
         let bound = self.lane.config().deadline;
         let started = Instant::now();
         loop {
             let notified = self.inflight_done.notified();
-            if !self.inflight.contains_sync(&object) {
+            if !self.gate.is_inflight(object) {
                 return true;
             }
             let left = bound.saturating_sub(started.elapsed());
@@ -516,9 +578,14 @@ impl TokenHolderPlane {
         }
     }
 
-    /// Serve a grant: the valve-less lane records the `(object, client)`
-    /// pair (idempotent — `already`), the records come from `volume`'s
-    /// RAM-authoritative trees.
+    /// Serve a grant under the grant ∥ pass gate (`token_grant_core`):
+    /// the token is REGISTERED in the lane before anything is read, so a
+    /// pass beginning from here on recalls it; a pass already holding the
+    /// object in flight parks the read until its apply settled, and a
+    /// pass that began DURING the read (it saw the registration and is
+    /// recalling us) makes the read repeat after its settle — the records
+    /// served are always the post-commit ones. A read that finds nothing
+    /// retracts a fresh registration.
     async fn serve_grant(
         &self,
         volume: &KvMetaBackend,
@@ -527,32 +594,53 @@ impl TokenHolderPlane {
         wants: TokenWants,
         after: u64,
     ) -> TokenReply {
-        if !self.await_object_settled(object).await {
+        use crate::token_grant_core::GrantAdmission;
+        let (already, admission) = self.gate.grant_register(object, client, &self.lane);
+        let retract = |plane: &Self| {
+            if !already {
+                plane.lane.surrender(object, client);
+            }
+        };
+        if admission == GrantAdmission::Park && !self.await_object_settled(object).await {
+            retract(self);
             return TokenReply::Refused {
                 reason: format!(
                     "object {object}: a recalled commit did not apply inside the recall bound"
                 ),
             };
         }
-        let records = match volume.token_records_for(object, wants, after).await {
-            Ok(Some(r)) => r,
-            Ok(None) => return TokenReply::Gone,
-            Err(e) => {
-                return TokenReply::Refused {
-                    reason: format!("object {object}: {e}"),
+        let records = loop {
+            let read = volume.token_records_for(object, wants, after).await;
+            if self.gate.is_inflight(object) {
+                // A pass took the object in flight during the read: its
+                // apply may straddle what was read. It saw this
+                // registration and recalls it; the grant answers the
+                // post-commit records once the pass settles.
+                if !self.await_object_settled(object).await {
+                    retract(self);
+                    return TokenReply::Refused {
+                        reason: format!(
+                            "object {object}: a recalled commit did not apply inside the \
+                             recall bound"
+                        ),
+                    };
+                }
+                continue;
+            }
+            match read {
+                Ok(Some(r)) => break r,
+                Ok(None) => {
+                    retract(self);
+                    return TokenReply::Gone;
+                }
+                Err(e) => {
+                    retract(self);
+                    return TokenReply::Refused {
+                        reason: format!("object {object}: {e}"),
+                    };
                 }
             }
         };
-        // The grant is recorded AFTER the records are read: a recall
-        // racing this read is ordered by the in-flight gate above (the
-        // pass marks its objects before it recalls), and a pass that
-        // starts after this grant lands finds the holder in the table.
-        let already = self.lane.holds(object, client);
-        if !already {
-            // The valve is off on this lane, so the decision is always
-            // `Granted`.
-            let _ = self.lane.try_grant(object, client, Instant::now());
-        }
         self.grants_served.fetch_add(1, Ordering::Relaxed);
         TokenReply::Granted { records, already }
     }
@@ -610,31 +698,46 @@ impl TokenHolderPlane {
     }
 
     /// **The commit-path recall** (§5.7.1, the conveyor pass's hook):
-    /// recall every outstanding token on `objects` ONCE (the pass's union),
-    /// hand the frames to the readers' standing polls, and wait until
-    /// every recalled grant is gone — acked, or expired with the reader's
-    /// lease. Returns the objects it recalled (the pass marks them in
-    /// flight until its apply lands — [`Self::settle`]). One relaxed load
-    /// when nothing is delegated.
+    /// take the pass's UNION in flight (the gate's pass half — every
+    /// object, holders or not, so a first-touch grant registered from
+    /// here on parks until the settle), recall every outstanding token on
+    /// it ONCE, hand the frames to the readers' standing polls, and wait
+    /// until every recalled grant is gone — acked, or its reader's
+    /// membership lease EXPIRED as the owner sees it (the wait parks no
+    /// longer than the earliest live lease has left, so a dead reader's
+    /// recall completes AT its expiry). Returns the union the pass settles
+    /// after its apply ([`Self::settle`]) — never empty on a non-empty
+    /// union.
     pub async fn recall_and_wait(&self, objects: &[u64]) -> Vec<u64> {
-        if self.lane.outstanding_now() == 0 || objects.is_empty() {
+        if objects.is_empty() {
             return Vec::new();
         }
         let now = Instant::now();
-        let mut recalled: Vec<u64> = Vec::new();
-        for &o in objects {
-            let holders = self.lane.holders(o);
+        // Dead members first: a reader whose lease the owner already saw
+        // expire holds nothing — its grants are swept, no frame is issued
+        // to it, and the pass waits for nobody on its account.
+        let seen = self.gate.pass_begin(objects, &self.lane);
+        let mut recalled = false;
+        for (o, holders) in seen {
             if holders == 0 {
                 continue;
             }
-            let _ = self.inflight.insert_sync(o);
+            let holders = if self.sweep_expired(self.lane.holders_of(o).into_iter().map(|c| (c, 1)))
+            {
+                self.lane.holders(o)
+            } else {
+                holders
+            };
+            if holders == 0 {
+                continue;
+            }
             let n = self.lane.recall_object(o, now);
             self.fanout.record(holders);
             self.recalls.fetch_add(n as u64, Ordering::Relaxed);
-            recalled.push(o);
+            recalled = true;
         }
-        if recalled.is_empty() {
-            return recalled;
+        if !recalled {
+            return objects.to_vec();
         }
         self.recall_batches.fetch_add(1, Ordering::Relaxed);
         let t0 = now.saturating_duration_since(self.epoch).as_nanos() as u64;
@@ -644,8 +747,9 @@ impl TokenHolderPlane {
         self.last_ack_ns.fetch_max(t0, Ordering::AcqRel);
         let cfg = self.lane.config();
         // The expiry sweep's tick: a quarter of the deadline, floored at
-        // the timer grain — the wait is woken by acks; the tick only
-        // bounds how late a dead reader's expiry is observed.
+        // the timer grain — the wait is woken by acks and cut short at the
+        // earliest live lease's expiry; the tick only bounds how late a
+        // lease whose remaining time is unknown is re-read.
         let tick = (cfg.deadline / 4).max(Duration::from_millis(1));
         loop {
             // Issue what can be issued (one in-flight frame per client);
@@ -660,19 +764,29 @@ impl TokenHolderPlane {
                 self.frame_wake.notify_waiters();
             }
             let notified = self.ack_wake.notified();
-            if recalled.iter().all(|o| self.lane.holders(*o) == 0) {
+            if objects.iter().all(|o| self.lane.holders(*o) == 0) {
                 break;
             }
-            let _ = squeezefs_ipc::sqz_time::timeout(tick, notified).await;
-            // Frames past their deadline: classify each by the reader's
-            // lease (`expired_with_lease` — the token died with the
-            // lease; `timeouts_live` — a LIVE member that did not answer,
-            // the must-stay-0 stuck-reader class) and let the lane retire
-            // the grants; the commit proceeds either way.
+            // The wait: to the next ack, the earliest live lease's expiry,
+            // or the tick — whichever comes first.
+            let clients = self.lane.recall_clients();
+            let mut wait = tick;
+            for c in &clients {
+                if let Some(left) = self.lease_remaining(c) {
+                    wait = wait.min(left.max(Duration::from_millis(1)));
+                }
+            }
+            let _ = squeezefs_ipc::sqz_time::timeout(wait, notified).await;
+            // Leases the owner now sees expired: their recalls complete as
+            // `expired_with_lease`, their other grants are swept.
+            self.sweep_expired(self.lane.recall_clients().into_iter().map(|c| (c, 0)));
+            // Frames past the DEADLINE on a member whose lease is still
+            // live: the must-stay-0 stuck-reader class — the token is
+            // retired and the commit proceeds.
             for t in self.lane.expire_overdue(Instant::now()) {
                 self.pending_frames.lock().remove(&t.client);
                 match self.lease_verdict(&t.client) {
-                    LeaseVerdict::Expired => {
+                    LeaseVerdict::Expired | LeaseVerdict::Unknown => {
                         self.expired_with_lease.fetch_add(1, Ordering::Relaxed);
                     }
                     LeaseVerdict::Live => {
@@ -695,7 +809,7 @@ impl TokenHolderPlane {
         // pass's call → the last frame handed to a reader's poll; `drain`
         // = → the last ack's arrival (the readers' in-flight serve drain +
         // purge + the ack's travel); `ack` = → the pass observing it (the
-        // wake hop, or the expiry tick that ended a batch no ack closed).
+        // wake hop, or the expiry that ended a batch no ack closed).
         // The cuts are clamped monotone into `[t0, t_end]`, so
         // `send + drain + ack ≡ total` to the nanosecond.
         let t_end = self.epoch.elapsed().as_nanos() as u64;
@@ -708,16 +822,14 @@ impl TokenHolderPlane {
         self.rtt[RTT_DRAIN].record(Duration::from_nanos(t_ack - t_send));
         self.rtt[RTT_ACK].record(Duration::from_nanos(t_end - t_ack));
         self.rtt[RTT_TOTAL].record(Duration::from_nanos(t_end - t0));
-        recalled
+        objects.to_vec()
     }
 
-    /// The recalled commit APPLIED (its records are visible in RAM):
-    /// grants on `objects` may be served again.
+    /// The pass's commit APPLIED (its records are visible in RAM) or
+    /// failed as a unit: its union leaves the gate's flight and the
+    /// parked grants read.
     pub fn settle(&self, objects: &[u64]) {
-        for o in objects {
-            let _ = self.inflight.remove_sync(o);
-        }
-        if !objects.is_empty() {
+        if self.gate.settle(objects) {
             self.inflight_done.notify_waiters();
         }
     }
@@ -739,6 +851,7 @@ impl TokenHolderPlane {
             recalls: self.recalls.load(Ordering::Relaxed),
             recall_acks: self.recall_acks.load(Ordering::Relaxed),
             expired_with_lease: self.expired_with_lease.load(Ordering::Relaxed),
+            lease_swept_grants: self.lease_swept_grants.load(Ordering::Relaxed),
             timeouts_live: self.timeouts_live.load(Ordering::Relaxed),
             releases: self.releases.load(Ordering::Relaxed),
             recall_batches: self.recall_batches.load(Ordering::Relaxed),
@@ -812,6 +925,7 @@ pub struct TokenHolderStats {
     pub recalls: u64,
     pub recall_acks: u64,
     pub expired_with_lease: u64,
+    pub lease_swept_grants: u64,
     pub timeouts_live: u64,
     pub releases: u64,
     pub recall_batches: u64,
@@ -1758,6 +1872,7 @@ pub fn holder_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
         "dlm_token_recalls": per(&|s| s.recalls),
         "dlm_token_recall_acks": per(&|s| s.recall_acks),
         "dlm_token_recall_expired_with_lease": per(&|s| s.expired_with_lease),
+        "dlm_token_lease_swept_grants": per(&|s| s.lease_swept_grants),
         "dlm_token_recall_timeouts_live": per(&|s| s.timeouts_live),
         "dlm_token_releases": per(&|s| s.releases),
         "dlm_token_recall_batches": per(&|s| s.recall_batches),

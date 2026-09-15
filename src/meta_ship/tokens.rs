@@ -1422,6 +1422,65 @@ impl RecallLane {
             .unwrap_or(0)
     }
 
+    /// The holders of `ino` by identity (the token plane's lease sweep
+    /// reads each one's membership verdict before it recalls).
+    pub fn holders_of(&self, ino: u64) -> Vec<String> {
+        self.state
+            .lock()
+            .grants
+            .get(&ino)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Every client with a recall PENDING or IN FLIGHT — the population
+    /// the token plane's wait loop reads lease verdicts for.
+    pub fn recall_clients(&self) -> Vec<String> {
+        let st = self.state.lock();
+        let mut out: Vec<String> = st.inflight.keys().cloned().collect();
+        for c in st.pending.keys() {
+            if !out.contains(c) {
+                out.push(c.clone());
+            }
+        }
+        out
+    }
+
+    /// **The lease sweep** (PR 5, design-symmetric-metadata §5.7.1 "a
+    /// dead reader's tokens die with its lease"): retire EVERYTHING
+    /// `client` holds or owes — its in-flight frame, its pending queue,
+    /// its requested set and every grant it holds on any object — the
+    /// moment its membership lease is seen expired, so a dead reader costs
+    /// the volume's commit stream at most one wait to its lease expiry and
+    /// never a second one. Returns `(recalls retired, grants retired)` —
+    /// the recalls that were outstanding on it, and EVERY grant it held
+    /// (the recalled ones included).
+    pub fn retire_client(&self, client: &str) -> (usize, usize) {
+        let mut st = self.state.lock();
+        let mut recalls = 0usize;
+        if let Some(f) = st.inflight.remove(client) {
+            recalls += f.recalls.len();
+            self.timed_out
+                .fetch_add(f.recalls.len() as u64, Ordering::Relaxed);
+        }
+        if let Some(q) = st.pending.remove(client) {
+            recalls += q.len();
+        }
+        st.requested.remove(client);
+        let mut grants = 0usize;
+        st.grants.retain(|_, hs| {
+            if hs.remove(client) {
+                grants += 1;
+            }
+            !hs.is_empty()
+        });
+        if grants > 0 {
+            self.outstanding_fast
+                .fetch_sub(grants as u64, Ordering::Relaxed);
+        }
+        (recalls, grants)
+    }
+
     /// Outstanding holders of `ino` EXCLUDING `client` (rung 13: the
     /// intent apply's gate waits out every FOREIGN holder while the
     /// flushing UPDATE holder's own grant stays live — surrendering it
@@ -1532,6 +1591,24 @@ impl RecallLane {
 /// A recall reached its terminal outcome (ack or timeout): the grant and
 /// the dedupe entry retire together. Returns whether a grant was actually
 /// removed (the caller maintains the lock-free outstanding gauge).
+/// The token plane's grant ∥ pass gate reads and registers holders
+/// through the lane (`token_grant_core::HolderTable`): `register` is a
+/// `holds`-then-`try_grant` (the valve is off on the token lane, so the
+/// decision is always `Granted`).
+impl crate::token_grant_core::HolderTable for RecallLane {
+    fn register(&self, object: u64, client: &str) -> bool {
+        if self.holds(object, client) {
+            return false;
+        }
+        let _ = self.try_grant(object, client, Instant::now());
+        true
+    }
+
+    fn holders(&self, object: u64) -> usize {
+        RecallLane::holders(self, object)
+    }
+}
+
 fn retire_recall(st: &mut LaneState, client: &str, ino: u64) -> bool {
     let removed = match st.grants.get_mut(&ino) {
         Some(hs) => {

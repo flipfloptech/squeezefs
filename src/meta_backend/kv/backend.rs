@@ -3167,16 +3167,14 @@ impl KvMetaBackend {
     /// the conveyor pass): under the batch's 4a guards, before any ring
     /// admission or node lock, recall every outstanding token on the
     /// UNION of the batch's objects once and wait until each recall is
-    /// acked or expired with its reader's lease. Returns the recalled
-    /// objects the pass settles after its apply. One relaxed load when no
-    /// holder plane is armed or nothing is delegated.
+    /// acked or expired with its reader's lease. Returns the union the
+    /// pass settles after its apply (the gate holds it in flight so a
+    /// first-touch grant registered meanwhile parks — review round 1,
+    /// Issue 2). One `OnceLock` probe when no holder plane is armed.
     async fn recall_tokens_for_batch(&self, batch: &[QueuedTx]) -> Vec<u64> {
         let Some(plane) = self.token_holder() else {
             return Vec::new();
         };
-        if plane.outstanding() == 0 {
-            return Vec::new();
-        }
         let forest = self.forest().is_some();
         let objects = crate::meta_ship::token_plane::union_objects(
             batch

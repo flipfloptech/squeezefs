@@ -61,15 +61,57 @@ Not measured here (owed to gate 5 / the box bracket): grant RTT p99 and recall-a
 ## 4. Verification
 
 - `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo clippy --all-targets --all-features -- -D warnings`: clean at every commit.
-- `cargo test --test sym_coherence_tests -- --test-threads=1`: 16/16 green flat; **×10 stamped from zero: see the summary's table** (`/tmp/grok-justin/pr5-x10-stamped.log`).
+- `cargo test --test sym_coherence_tests -- --test-threads=1`: 16/16 green flat; **×10 stamped from zero: 10/10 green**, 25.3–27.2 s each (`/tmp/grok-justin/pr5-x10-stamped.log`).
 - Touched-neighbour suites green (serialized): `readonly_mount_tests` 33, `reader_free_grace_tests` 64, `mw_recall_valve_tests` 12, `sym_slot_transfer_tests` 45, `dlm_membership_tests` 51, `dlm_cowriter_tests` 18, `kvmap_read_tests` 10, `kv_node_cache_coherence_tests` 21, `mw_delegation_tests` 14, `mw_intent_batch_tests` 20, `mw_slot_placement_tests` 9, `sym_forest_tests` 31, `env_knob_convention_tests` 22, `docs_parity_tests` 5, `derivation_sweep_tests` 54; the frame commit's leg (`sym_forest` / `sym_appender` / `sym_convert` / `sym_manager` / `crash_contract` / `kv_node` / `kv_finding_a` / `decoder_property`) green both ways.
-- The matrix `tests/run_sym_forest_suites.sh` (29 suites, `sym_coherence_tests` appended) both legs + the live-FUSE trio under `SQUEEZEFS_TEST_REQUIRE_MOUNT=1`: **see the summary** (run after this note's first draft; the results table is appended to the summary and mirrored in §4a below once complete).
+- The matrix `tests/run_sym_forest_suites.sh` (29 suites, `sym_coherence_tests` appended) both legs: **PASS / PASS** (§4a). The live-FUSE trio under `SQUEEZEFS_TEST_REQUIRE_MOUNT=1` both ways: §4a.
 - `cd fuzz && cargo check --bins && cargo fmt --check`: clean (the `bset_frame_v2` target).
 - The fidelity tier was NOT run: `reservation.rs` / `data_custody.rs` / `nvmeof` are untouched.
 
 ### 4a. Matrix + trio results
 
-_Filled in by the summary at completion._
+Both legs **PASS** (29 suites, `sym_coherence_tests` appended; first run from zero red at `kv_node_cache_coherence_tests` stamped — §6 finding 8, fixture fixed, the whole matrix re-run from zero), no ratio NOTE (`SQZ_SYM_RATIO_NOTE` 2.0; the highest, 1.46 on the 4 s `meta_slot_migration_tests`, is scheduler noise on a box three sibling PRs were building on; `sym_coherence_tests` 24.9 s flat / 24.8 s stamped — 1.00). Log: `/tmp/grok-justin/pr5-matrix.log`.
+
+| suite | flat (s) | stamped (s) | ratio |
+|---|---|---|---|
+| `kv_tree_tests` | 53.5 | 45.7 | 0.85 |
+| `kv_node_tests` | 0.2 | 0.1 | 0.94 |
+| `kv_backend_tests` | 135.3 | 149.2 | 1.10 |
+| `kv_journal_tests` | 0.1 | 0.1 | 1.18 |
+| `kv_partitioned_append_tests` | 0.1 | 0.1 | 1.01 |
+| `kv_leaf_merge_tests` | 40.2 | 43.1 | 1.07 |
+| `kv_node_cache_coherence_tests` | 0.4 | 0.5 | 1.27 |
+| `kvmap_tree_tests` | 0.4 | 0.4 | 1.08 |
+| `kv_scale_tests` | 31.8 | 36.6 | 1.15 |
+| `durable_block_refs_tests` | 10.0 | 11.1 | 1.11 |
+| `fsck_tests` | 12.5 | 13.9 | 1.12 |
+| `fsck_c9_tests` | 2.6 | 2.8 | 1.08 |
+| `fsck_c10_tests` | 3.9 | 4.1 | 1.05 |
+| `fsck_c12_tests` | 4.1 | 3.7 | 0.91 |
+| `fsck_repair_tests` | 17.3 | 12.4 | 0.72 |
+| `crash_contract_tests` | 0.4 | 0.5 | 1.24 |
+| `crash_kill_tests` | 4.5 | 5.0 | 1.12 |
+| `writer_scoped_staging_tests` | 2.8 | 3.0 | 1.05 |
+| `readonly_mount_tests` | 4.5 | 4.7 | 1.05 |
+| `meta_slot_migration_tests` | 4.0 | 5.8 | 1.46 |
+| `pv_coordinator_tests` | 4.0 | 4.8 | 1.21 |
+| `kv_smo_crash_completeness_tests` | 30.7 | 19.0 | 0.62 |
+| `sym_appender_tests` | 13.6 | 13.6 | 1.00 |
+| `sym_manager_tests` | 6.5 | 6.5 | 0.99 |
+| `sym_fence_tests` | 0.4 | 0.4 | 0.94 |
+| `sym_slot_transfer_tests` | 34.5 | 33.8 | 0.98 |
+| `rename_lock_set_tests` | 0.8 | 0.8 | 0.98 |
+| `sym_convert_tests` | 21.6 | 20.9 | 0.96 |
+| `sym_coherence_tests` | 24.9 | 24.8 | 1.00 |
+
+**The live-FUSE trio under `SQUEEZEFS_TEST_REQUIRE_MOUNT=1`, both ways:**
+
+| suite | flat | stamped |
+|---|---|---|
+| `posix_mount_semantics_tests` | 3 passed, 39.2 s | 3 passed, 39.5 s |
+| `corpse_sweep_tests` | 4 passed, 172.9 s | 4 passed, 155.8 s |
+| `inline_raise_tests` | 7 passed, 112.0 s | 7 passed, 101.6 s |
+
+`/dev/fuse` present, `fusermount3` on PATH, `fuse.enable_uring=Y`; every mount-class contract RAN (`SQUEEZEFS_TEST_REQUIRE_MOUNT=1` turns a self-skip into a failure). Log: `/tmp/grok-justin/pr5-trio.log`.
 
 ## 5. Where a contract needed PR 6/7/8/10/12 machinery — stopped and stated
 
@@ -87,6 +129,7 @@ _Filled in by the summary at completion._
 5. **`record_object_ino`** carried two `.expect("8-byte slice")` in library code — replaced by a fallible slice → array conversion.
 6. **A `-o ro` zero-writes pin over a LIVE writer must settle the writer first**: a checkpoint's tail releases the pending frees it covers AFTER its bitmap pages landed, so the next cadence cycle writes them (the PR-11 shipped-bug fix closed the clean-UNMOUNT face; the live face is legitimate). The contract samples the image one checkpoint landing ceiling apart until two samples agree, then measures the reader alone — the first 500 ms settle window sat inside a quiet gap between cycles (1 in 3 red).
 7. **The predicted-slot read on a young volume**: a never-written slot decodes as neither a record nor a torn frame; treating it as torn would have paid the 128 KiB fallback on every idle poll of a volume with fewer than 32 checkpoints — an all-zero slot is the stop, not the fallback.
+8. **Found by the matrix's stamped leg (first run red at `kv_node_cache_coherence_tests`)**: a harness that reads a PRODUCT-written volume through a hand-built `NodeCache` with `NodeLayout::new(sb.node_size)` reads every v2 frame as foreign under the seam (the frame version is the LAYOUT's) — the bare-cache reader served nothing. The fixture now asks `KvMetaBackend::node_layout_for(&sb)`, the product's own resolver, and the matrix re-ran from zero. The same class exists in `kv_finding_a_tests` / `kv_leaf_merge_tests` (superblock-derived `NodeLayout::new`), which pass both legs today because their walks tolerate it; a sibling PR or PR 14 touching those fixtures should switch them to the resolver too.
 
 ## 7. Owed
 

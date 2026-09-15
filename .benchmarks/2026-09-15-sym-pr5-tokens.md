@@ -203,4 +203,15 @@ Tree `15267a3c` (the code tree; the ledger's own docs commit follows). Logs `/tm
 
 ### 9.1 Run ledger (the final tree)
 
-RUN_LEDGER_3
+Tree `6695fa45` (the code tree; the ledger's own docs commit follows). `CARGO_INCREMENTAL=0` throughout (disk 83 %). Logs `/tmp/grok-justin/pr5-logs/round3/`.
+
+| Run | Result |
+|---|---|
+| `cargo fmt --check` (root, `fuzz/`, `loom-models/`) | clean |
+| `cargo clippy --all-targets --all-features -- -D warnings` / `cargo clippy --all-targets -- -D warnings` | clean / clean |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | green |
+| `cd fuzz && cargo check --bins` | clean |
+| loom check (`RUSTFLAGS="--cfg loom -D warnings" cargo build --release --tests`) / `tests/run_loom.sh` | clean / **110 passed** (the two-user model added) |
+| `sym_coherence_tests` ×5 stamped / ×2 flat, `--test-threads=1`, from zero | 7/7 — **29 passed** each (26 → 29 contracts), 47.8–48.8 s |
+| `readonly_mount_tests` (35) / `reader_free_grace_tests` (66) / `dlm_membership_tests` (51) / `docs_parity_tests` (5) / `env_knob_convention_tests` (22), flat AND stamped | green on both legs (10/10) |
+| `tests/run_sym_forest_suites.sh` (29 suites, both legs, once) | **PASS / PASS**, no ratio NOTE; `sym_coherence_tests` 47.9 / 47.7 s (1.00), `sym_slot_transfer_tests` 33.7 / 33.8 s (1.00) |

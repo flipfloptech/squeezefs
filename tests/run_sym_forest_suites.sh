@@ -65,6 +65,13 @@
 # and arm the plane, its unarmed/flat pin (the S3.5 paths ship and lock
 # nothing) runs on both legs, and the S3.5 suites it generalizes stay in
 # the list above it.
+# `sym_coherence_tests` (PR 5 — read tokens + the bset frame v2 screen)
+# rides the list like PR 2–4's suites: its token fixtures stamp under the
+# seam themselves (an armed writer, its token service on a listener, a
+# read-only token client on the same file), its frame pins forge v2 logs
+# on a fresh image whatever the leg, and its negative contract (`=0` and
+# a flat volume carry no token plane; v1 frames byte-identical on flat)
+# runs on both legs.
 #
 # WALL TIME IS A ROW (review round 4, Issue 26): each suite runs under
 # its own timer per leg, and the summary prints `flat`, `stamped` and the
@@ -122,6 +129,7 @@ DEFAULT_SUITES=(
   sym_shared_refs_tests
   sym_cross_owner_tests
   sym_block_grant_tests
+  sym_coherence_tests
 )
 read -r -a SUITES <<<"${SQZ_SYM_SUITES:-${DEFAULT_SUITES[*]}}"
 RATIO_NOTE="${SQZ_SYM_RATIO_NOTE:-2.0}"

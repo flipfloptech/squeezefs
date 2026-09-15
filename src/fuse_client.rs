@@ -17268,7 +17268,15 @@ impl SqueezefsFilesystem {
         // refcount re-check. A clone whose pin lands before this re-check
         // is observed here (count 2 ⇒ CoW fallback); one that lands after
         // observes instability at its validate-after-pin and retries.
-        if !allocator.begin_patch_sole_owner(dev_offset) {
+        // Symmetric PR 7: on an ARMED set the RAM verdict is confirmed by
+        // ONE probe of the ino's slot tree (`DataRouter::sole_owner_durably`
+        // — `true` without a read unarmed).
+        if !allocator.begin_patch_sole_owner(dev_offset)
+            || !self
+                .router
+                .sole_owner_durably(ino, &allocator, dev_offset)
+                .await
+        {
             // Back off: re-stabilize (content never changed) and CoW.
             allocator.publish_block(dev_offset);
             METRICS

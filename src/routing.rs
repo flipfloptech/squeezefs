@@ -7898,6 +7898,55 @@ impl DataRouter {
         crate::meta_backend::kv::record::forest_slot_of_ino(local)
     }
 
+    /// **The W1 predicate's durable clause** (design-symmetric-metadata
+    /// §5.4.3 law 2): on an ARMED set, `refcount(b)` for the sole-owner
+    /// patch is ONE range probe of the patching ino's slot tree — which by
+    /// the pack law holds every reference of a block nobody cloned (a
+    /// cloned one carries the SHARED mark `begin_patch_sole_owner` already
+    /// refuses on). The RAM count this mount seeded at its open knows
+    /// nothing of a reference a PREDECESSOR lessee committed into a tree
+    /// handed over since, so the durable population decides: anything but
+    /// exactly one reference refuses (the CoW fallback, counted by the
+    /// caller on `patch_ineligible_shared`). Unarmed / flat: `true`
+    /// without a read — the shipped predicate stands alone.
+    pub async fn sole_owner_durably(
+        &self,
+        ino: u64,
+        allocator: &std::sync::Arc<crate::block_allocator::BlockAllocator>,
+        offset: u64,
+    ) -> bool {
+        if !self.symmetric_armed() {
+            return true;
+        }
+        let Some(mb) = self.inner.meta_backend.get() else {
+            return true;
+        };
+        let (v_idx, local) = mb.route_ino(ino);
+        let Some(vol) = mb.volumes.get(v_idx) else {
+            return false;
+        };
+        let slot = crate::meta_backend::kv::record::forest_slot_of_ino(local);
+        let vol_tag = crate::meta_backend::kv::block_refs::volume_tag(allocator.volume_id());
+        match vol
+            .block_ref_probe(vol_tag, offset / allocator.chunk_size(), Some(slot))
+            .await
+        {
+            Ok(1) => true,
+            Ok(_) => false,
+            Err(e) => {
+                // A probe that cannot read is the leak-safe direction: no
+                // in-place rewrite on a population this mount cannot see.
+                log::warn!(
+                    "W1 durable clause: probe of ino {ino} block {} on {} failed ({e}) — \
+                     the patch takes the CoW fallback",
+                    offset / allocator.chunk_size(),
+                    allocator.volume_id()
+                );
+                false
+            }
+        }
+    }
+
     /// The inline-layout ceiling in force for `ino` — [`inline_max_bytes_for_cap`]
     /// over its home volume's xattr value cap (a mixed-`node_size` set
     /// derives per volume, exactly as the inline block-map spill does). A

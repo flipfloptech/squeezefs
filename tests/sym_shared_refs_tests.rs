@@ -556,6 +556,76 @@ async fn the_one_slot_probe_agrees_with_the_derived_census_on_every_published_bl
     rig.shutdown().await;
 }
 
+/// **The W1 predicate's durable clause** (§5.4.3 law 2): on an armed set
+/// the sole-owner patch confirms the RAM verdict with ONE probe of the
+/// patching ino's slot tree — a second durable reference the RAM map
+/// never saw (the shape a handed-over tree leaves behind: its records
+/// were committed by a predecessor lessee) refuses the patch; unarmed
+/// the clause is absent and the gauge never moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_w1_predicate_confirms_sole_ownership_in_the_inos_slot_tree_on_an_armed_set() {
+    let dir = tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let data = data_file();
+    {
+        let rig = mount(&uris, data.path(), &Knobs::armed()).await;
+        let f = rig.mk_file("f").await;
+        let offset = rig.publish_block(f, 0).await;
+        assert_eq!(rig.alloc.refcount(offset), Some(1));
+        let probes = BLOCK_REF_PROBES.load(Ordering::Relaxed);
+        assert!(
+            rig.router.sole_owner_durably(f, &rig.alloc, offset).await,
+            "one durable reference in f's slot tree: the RAM verdict stands"
+        );
+        assert_eq!(BLOCK_REF_PROBES.load(Ordering::Relaxed), probes + 1);
+        // A predecessor's record: another ino of f's SLOT, committed at
+        // the backend — the allocator's count is untouched.
+        let (_v, local_f) = rig.routed.route_ino(f);
+        let slot = slot_of_global(&rig.routed, f);
+        assert!(
+            slot >= 1,
+            "a child of `/` rides the rotor, never the native slot"
+        );
+        let ghost = ino_in_slot(slot, (local_f & 0xFF_FFFF_FFFF) + 7_777);
+        let block_idx = offset / rig.alloc.chunk_size();
+        rig.vol()
+            .commit_block_refs(
+                ghost,
+                &[BlockRefOp::taken(BlockRef {
+                    vol_tag: rig.tag(),
+                    block_idx,
+                    owner_ino: ghost,
+                    block_index: 0,
+                })],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rig.alloc.refcount(offset), Some(1), "RAM never saw it");
+        assert_eq!(probe(&rig, offset, Some(slot)).await, 2);
+        let probes = BLOCK_REF_PROBES.load(Ordering::Relaxed);
+        assert!(
+            !rig.router.sole_owner_durably(f, &rig.alloc, offset).await,
+            "two durable references: the patch is refused whatever RAM reads"
+        );
+        assert_eq!(BLOCK_REF_PROBES.load(Ordering::Relaxed), probes + 1);
+        rig.shutdown().await;
+    }
+    {
+        let rig = mount(&uris, data.path(), &Knobs::unarmed()).await;
+        let f = rig.mk_file("u").await;
+        let offset = rig.publish_block(f, 0).await;
+        let probes = BLOCK_REF_PROBES.load(Ordering::Relaxed);
+        assert!(rig.router.sole_owner_durably(f, &rig.alloc, offset).await);
+        assert_eq!(
+            BLOCK_REF_PROBES.load(Ordering::Relaxed),
+            probes,
+            "unarmed: no clause, no probe"
+        );
+        rig.shutdown().await;
+    }
+}
+
 /// The three verbs ride the manager wire (the S8 listener, the volume
 /// ordinal dispatch) and answer the same durable outcomes the local
 /// executors do — `ManagerClient::{mark_shared, share_block,

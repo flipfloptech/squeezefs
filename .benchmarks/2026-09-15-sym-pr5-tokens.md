@@ -42,7 +42,7 @@ Under bit 17 **and** `SQUEEZEFS_SYMMETRIC_META=1` a foreign object is read under
 
 ## 2. The negative contract — `SQUEEZEFS_SYMMETRIC_META=0` and a bit-17-absent volume are untouched
 
-`symmetric_meta_off_carries_no_token_plane`: a stamped volume opened without the knob and a flat volume each hold no token holder / reader, the recall gate reads `Off`, `foreign_frames_screened` / `recall_gated_frees` / `timeout_deferrals` do not move, a read-only open serves the S5 bound; `frame_v1_stays_byte_identical_and_the_two_versions_are_foreign_to_each_other` pins the shipped 32 B header field by field; `the_mount_path_token_arm_is_the_s5_reader_verbatim_when_the_knob_is_off` pins the mount arm's `Ok(0)`; `an_unarmed_token_gate_leaves_the_ring_in_charge_and_moves_no_face` pins the free path. The flat leg of the matrix (§4) is the whole pre-PR-5 KV contract set on the shipped path.
+`symmetric_meta_off_carries_no_token_plane`: a stamped volume opened without the knob and a flat volume each hold no token holder / reader, the recall gate reads `Off`, `foreign_frames_screened` / `recall_gated_frees` / `recall_timeout_deferrals` do not move, a read-only open serves the S5 bound; `frame_v1_stays_byte_identical_and_the_two_versions_are_foreign_to_each_other` pins the shipped 32 B header field by field; `the_mount_path_token_arm_is_the_s5_reader_verbatim_when_the_knob_is_off` pins the mount arm's `Ok(0)`; `an_unarmed_token_gate_leaves_the_ring_in_charge_and_moves_no_face` pins the free path. The flat leg of the matrix (§4) is the whole pre-PR-5 KV contract set on the shipped path.
 
 ## 3. Measurements (dev box — SCOPING; both arms in-process; debug build)
 

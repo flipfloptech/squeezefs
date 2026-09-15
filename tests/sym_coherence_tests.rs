@@ -24,7 +24,7 @@
 //! Part C — **recall-driven free-grace** (§5.7.3): a terminal free of a
 //! block whose freeing publish recalled every token bypasses the grace ring
 //! (`free_grace_recall_gated_frees`); a free issued while a LIVE member's
-//! recall is unacked rides the ring (`free_grace_timeout_deferrals`), the
+//! recall is unacked rides the ring (`free_grace_recall_timeout_deferrals`), the
 //! ring's surviving role.
 
 use squeezefs::meta_backend::kv::node::{
@@ -1357,11 +1357,11 @@ async fn a_free_never_ships_before_every_recall_is_acked_or_expired() {
 
     // A live-timeout window: the ring is the timeout path.
     free_grace::test_open_recall_window_ms(1_000);
-    let def0 = free_grace::timeout_deferrals();
+    let def0 = free_grace::recall_timeout_deferrals();
     let b2 = ba.allocate_block().await.unwrap();
     ba.free_block(b2).await.unwrap();
     assert_eq!(ba.grace_len(), 2, "a free inside the window rides the ring");
-    assert_eq!(free_grace::timeout_deferrals(), def0 + 1);
+    assert_eq!(free_grace::recall_timeout_deferrals(), def0 + 1);
     // The window closes: gated again.
     ticks.fetch_add(1_001, Ordering::SeqCst);
     assert_eq!(
@@ -2972,7 +2972,7 @@ async fn symmetric_meta_off_carries_no_token_plane() {
     free_grace::reset_for_test();
     let screened0 = META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed);
     let gated0 = free_grace::recall_gated_frees();
-    let deferred0 = free_grace::timeout_deferrals();
+    let deferred0 = free_grace::recall_timeout_deferrals();
     let dir = tempfile::tempdir().unwrap();
     let stamped = format_stamped(dir.path(), "meta0").await;
     let flat = dir.path().join("flat");
@@ -3012,7 +3012,7 @@ async fn symmetric_meta_off_carries_no_token_plane() {
         screened0
     );
     assert_eq!(free_grace::recall_gated_frees(), gated0);
-    assert_eq!(free_grace::timeout_deferrals(), deferred0);
+    assert_eq!(free_grace::recall_timeout_deferrals(), deferred0);
 }
 
 /// A minimal data plane for the mount-path arm (its recall sink drains

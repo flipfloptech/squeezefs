@@ -4060,7 +4060,7 @@ pub fn reset_for_test() {
 // RING survives as the TIMEOUT path: while a LIVE member's recall is
 // unacked past the bound (the must-stay-0 `dlm_token_recall_timeouts_
 // live` class), frees ride the ring exactly as before (`free_grace_
-// timeout_deferrals`), released by the ring's own law — the epoch-ack
+// recall_timeout_deferrals`), released by the ring's own law — the epoch-ack
 // bound the membership plane still composes, and the fence that evicts
 // the non-acker at `T_owner`. The epoch fan-in itself stays LIVE code:
 // it is the flat / unarmed posture's mechanism until the PR-14 flip, and
@@ -4249,8 +4249,11 @@ pub fn recall_gated_frees() -> u64 {
     RECALL_GATED_FREES.load(Ordering::Relaxed)
 }
 
-/// `free_grace_timeout_deferrals`.
-pub fn timeout_deferrals() -> u64 {
+/// `free_grace_recall_timeout_deferrals` — frees the recall gate sent to
+/// the ring because a LIVE member's recall was unacked past the bound
+/// (distinct from PR 8's per-ring `free_grace_timeout_deferrals`, the
+/// ring's own forced/tightened releases).
+pub fn recall_timeout_deferrals() -> u64 {
     TIMEOUT_DEFERRALS.load(Ordering::Relaxed)
 }
 

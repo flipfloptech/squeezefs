@@ -5707,7 +5707,7 @@ async fn a_recall_gated_free_publishes_without_a_deferral() {
     assert_eq!(free_grace::deferrals(), 0);
     assert_eq!(free_grace::held_offsets(), 0);
     assert_eq!(free_grace::recall_gated_frees(), 1);
-    assert_eq!(free_grace::timeout_deferrals(), 0);
+    assert_eq!(free_grace::recall_timeout_deferrals(), 0);
     let again = ba.allocate_block().await.expect("reallocate");
     assert_eq!(again, victim, "served straight back");
     closure_holds();
@@ -5717,7 +5717,7 @@ async fn a_recall_gated_free_publishes_without_a_deferral() {
 /// The ring is the TIMEOUT path: while a LIVE member's recall is unacked
 /// past the bound (the holder's `dlm_token_recall_timeouts_live` arm
 /// opened the window), a free rides the ring exactly as under S5 —
-/// counted `free_grace_timeout_deferrals` AND `free_grace_deferrals`,
+/// counted `free_grace_recall_timeout_deferrals` AND `free_grace_deferrals`,
 /// held, released by the ring's own law (the reader's acknowledgement) —
 /// and once the window has passed on the owner's clock the gate is direct
 /// again. The closure holds throughout.
@@ -5741,7 +5741,7 @@ async fn a_live_unacked_recall_makes_the_ring_the_timeout_path() {
         "inside the window a free rides the ring"
     );
     assert_eq!(ba.grace_len(), 1);
-    assert_eq!(free_grace::timeout_deferrals(), 1);
+    assert_eq!(free_grace::recall_timeout_deferrals(), 1);
     assert_eq!(free_grace::deferrals(), 1);
     assert_eq!(free_grace::held_offsets(), 1);
     assert_eq!(free_grace::recall_gated_frees(), 0);
@@ -5763,7 +5763,7 @@ async fn a_live_unacked_recall_makes_the_ring_the_timeout_path() {
     ba.free_block(later).await.expect("free");
     assert!(free_listed(&ba, later), "the window closed: direct again");
     assert_eq!(free_grace::recall_gated_frees(), 1);
-    assert_eq!(free_grace::timeout_deferrals(), 1, "no new deferral");
+    assert_eq!(free_grace::recall_timeout_deferrals(), 1, "no new deferral");
     closure_holds();
     free_grace::disarm_recall_gate();
 }
@@ -5786,7 +5786,7 @@ async fn an_unarmed_token_gate_leaves_the_ring_in_charge_and_moves_no_face() {
     assert!(!free_listed(&ba, victim), "the S5 ring holds it");
     assert_eq!(free_grace::deferrals(), 1);
     assert_eq!(free_grace::recall_gated_frees(), 0);
-    assert_eq!(free_grace::timeout_deferrals(), 0);
+    assert_eq!(free_grace::recall_timeout_deferrals(), 0);
     closure_holds();
 }
 

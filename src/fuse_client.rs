@@ -14167,8 +14167,8 @@ impl SqueezefsFilesystem {
                     serde_json::json!(crate::free_grace::recall_gated_frees()),
                 );
                 metrics.insert(
-                    "free_grace_timeout_deferrals".into(),
-                    serde_json::json!(crate::free_grace::timeout_deferrals()),
+                    "free_grace_recall_timeout_deferrals".into(),
+                    serde_json::json!(crate::free_grace::recall_timeout_deferrals()),
                 );
                 metrics.insert(
                     "free_grace_s5_reader_deferrals".into(),

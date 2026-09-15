@@ -783,6 +783,21 @@ async fn wire_joiner(
     (host, client, appender_id)
 }
 
+/// The words a wire lessee that journaled NOTHING under its lease
+/// presents at its release: the grant's words verbatim (root, cursor,
+/// extents — it moved nothing) with the frontier its offset raise left —
+/// `seq_floor + 1` (`raise_seq_floor` puts the ring's next stamp one above
+/// the granted floor; head 0 + offset `floor + 1`). The manager's screen
+/// (review round 6, Issue 29) admits exactly this shape.
+fn lessee_release_words(
+    grant: &squeezefs::meta_ship::manager::WireSlotWords,
+) -> squeezefs::meta_ship::manager::WireSlotWords {
+    squeezefs::meta_ship::manager::WireSlotWords {
+        seq_floor: grant.seq_floor + 1,
+        ..*grant
+    }
+}
+
 /// First-writer-takes-it (§5.1.2): a wire joiner's `AcquireSlot` on an
 /// unleased slot is granted at `g = 1` and recorded `Leased { joiner }`
 /// in tree 0 and on the joiner's page; the manager's own ask for it is
@@ -2645,6 +2660,289 @@ async fn a_wire_grant_of_an_unleased_tree_waits_for_the_sweep_and_clears_its_win
     shutdown(&routed).await;
 }
 
+/// **Issue 29 (round 6): every slot word a wire `ReleaseSlot` carries is
+/// screened against durable / derived state BEFORE any RAM or durable
+/// effect — PR 3's bounded-execution law for the slot words.** Round 5
+/// made a release's `seq_floor` act on ring 0's seq space immediately; a
+/// wire `cursor` becomes the slot's never-lowered ino floor at the next
+/// grant; a wire `root` overwrites tree 0's. A poisoned word is REJECTED
+/// (`STATUS_REJECTED`, `manager_verb_rejected` — never the must-stay-0
+/// witness gauge) with the volume byte-identical: sector 0, ring 0's
+/// offset, ring 0's written entries, tree 0, the slot's cursor and the
+/// lease all unchanged; the legitimate release — the grant's words with
+/// the frontier the lessee's raise left — is still accepted. The frame's
+/// `appender_id` and an offer's `to` are screened the same way (an id no
+/// Live page names, one of this mount's own regions, the holder itself).
+/// Before the fix `seq_floor = u64::MAX` landed: ring 0's offset jumped to
+/// ≈ `u64::MAX − head`, every later stamp saturated, and the next replay
+/// would have skipped every window record as "already materialized".
+/// **Issue 30**: the manager's own release of a slot raises nothing on
+/// ring 0 (its floor IS ring 0's frontier — the one-seq gap is gone).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wire_releases_slot_words_are_screened_before_any_effect() {
+    use squeezefs::cluster_wire::{RpcAsyncService, RpcRequest};
+    use squeezefs::meta_ship::manager::{
+        encode_request, ManagerCall, ManagerRequestFrame, WireSlotWords, MANAGER_SCHEMA,
+        STATUS_REJECTED, VERB_MANAGER_CALL,
+    };
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    let _cleanup = Cleanup;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    // The cadence parked: ring 0's written-entry count is the "nothing
+    // written" instrument below.
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let routing: u16 = 3;
+    // The manager mints slot 4's tree (first touch) and gives the slot a
+    // cursor, then releases it: tree 0 `Unleased` with a real root, a
+    // cursor and a floor for the wire grant to carry.
+    let value = vec![0x51u8; 8 * 1024];
+    for k in 1..=3u64 {
+        vol.setxattr_internal(ino_in_slot(SLOT4, k), "user.seed", &value)
+            .await
+            .unwrap();
+    }
+    vol.reserve_guest_ino_range(routing, 16).unwrap();
+    vol.checkpoint_now().await.unwrap();
+    let offset_before_self_release = vol.journal_ring().seq_offset();
+    vol.release_slot_handover(0, SLOT4).await.unwrap();
+    assert_eq!(
+        vol.journal_ring().seq_offset(),
+        offset_before_self_release,
+        "the manager's own release moves nothing between rings — no seq gap (Issue 30)"
+    );
+    let (host, mut client, joiner) = wire_joiner(&vol, 29).await;
+    let granted = match client.acquire_slot(joiner, routing).await.unwrap() {
+        ManagerReply::SlotsGranted { slots, already } => {
+            assert!(!already);
+            assert_eq!((slots[0].slot, slots[0].g), (routing, 2));
+            slots[0].words
+        }
+        other => panic!("{other:?}"),
+    };
+    assert!(granted.root.0 != 0 && granted.cursor >= 18 && granted.seq_floor > 0);
+    // The snapshot every poisoned frame must leave byte-identical.
+    let path = std::path::Path::new(&uris[0]);
+    let sector0 = || std::fs::read(path).unwrap()[..4096].to_vec();
+    let s0 = sector0();
+    let offset0 = vol.journal_ring().seq_offset();
+    let entries0 = vol.journal_ring().written_entries();
+    let states0 = tree0_states(&vol).await;
+    let cursor0 = vol.guest_cursor_snapshot(routing);
+    let stats0 = vol.appender_stats().unwrap();
+    let lease0 = vol.slot_leases().unwrap().table.get(SLOT4).unwrap();
+    let tree0_root = vol.forest_control_tree().unwrap().root();
+    let poisoned: Vec<(&str, WireSlotWords)> = vec![
+        (
+            "seq_floor = u64::MAX (would saturate ring 0's seq space)",
+            WireSlotWords {
+                seq_floor: u64::MAX,
+                ..granted
+            },
+        ),
+        (
+            "seq_floor at the grant's floor (not above it)",
+            WireSlotWords {
+                seq_floor: granted.seq_floor,
+                ..granted
+            },
+        ),
+        (
+            "cursor = u64::MAX (past the slot's namespace)",
+            WireSlotWords {
+                cursor: u64::MAX,
+                seq_floor: granted.seq_floor + 1,
+                ..granted
+            },
+        ),
+        (
+            "cursor below the grant's",
+            WireSlotWords {
+                cursor: granted.cursor - 1,
+                seq_floor: granted.seq_floor + 1,
+                ..granted
+            },
+        ),
+        (
+            "slot_tree_extents past the volume",
+            WireSlotWords {
+                slot_tree_extents: u32::MAX,
+                seq_floor: granted.seq_floor + 1,
+                ..granted
+            },
+        ),
+        (
+            "root (0, 0) — below the heap, not the recorded root",
+            WireSlotWords {
+                root: (0, 0),
+                seq_floor: granted.seq_floor + 1,
+                ..granted
+            },
+        ),
+        (
+            "root = tree 0's root — an extent outside the appender's grant",
+            WireSlotWords {
+                root: (tree0_root.addr, tree0_root.seq),
+                seq_floor: granted.seq_floor + 1,
+                ..granted
+            },
+        ),
+        (
+            "root at the recorded address with another incarnation stamp",
+            WireSlotWords {
+                root: (granted.root.0, granted.root.1 + 1),
+                seq_floor: granted.seq_floor + 1,
+                ..granted
+            },
+        ),
+    ];
+    let mut rejected = stats0.manager_verb_rejected;
+    for (why, words) in &poisoned {
+        let err = client
+            .release_slot(joiner, routing, 2, *words, Vec::new())
+            .await
+            .expect_err(why);
+        assert!(
+            err.to_string().contains("rejected"),
+            "{why}: the rejection names its class: {err}"
+        );
+        rejected += 1;
+        let stats = vol.appender_stats().unwrap();
+        assert_eq!(stats.manager_verb_rejected, rejected, "{why}: counted");
+        assert_eq!(
+            stats.manager_verb_refusals, stats0.manager_verb_refusals,
+            "{why}: never the witness gauge"
+        );
+        assert_eq!(sector0(), s0, "{why}: sector 0 untouched");
+        assert_eq!(
+            vol.journal_ring().seq_offset(),
+            offset0,
+            "{why}: ring 0's offset"
+        );
+        assert_eq!(
+            vol.journal_ring().written_entries(),
+            entries0,
+            "{why}: nothing written to ring 0"
+        );
+        assert_eq!(tree0_states(&vol).await, states0, "{why}: tree 0 untouched");
+        assert_eq!(
+            vol.guest_cursor_snapshot(routing),
+            cursor0,
+            "{why}: the cursor"
+        );
+        assert_eq!(
+            vol.slot_leases().unwrap().table.get(SLOT4),
+            Some(lease0),
+            "{why}: the lease"
+        );
+        assert!(vol.slot_leases().unwrap().gate.is_foreign(SLOT4));
+    }
+    // The status on the wire is REJECTED, not REFUSED (the service edge
+    // directly).
+    let service = ManagerService::new(Arc::clone(&vol));
+    let body = encode_request(&ManagerRequestFrame {
+        schema: MANAGER_SCHEMA,
+        request_id: 77,
+        volume: 0,
+        call: ManagerCall::ReleaseSlot {
+            appender_id: joiner,
+            slot: routing,
+            g: 2,
+            words: poisoned[0].1,
+            tails: Vec::new(),
+        },
+    })
+    .unwrap();
+    let resp = service
+        .call(RpcRequest {
+            id: 7,
+            verb: VERB_MANAGER_CALL,
+            body,
+        })
+        .await;
+    assert_eq!(resp.status, STATUS_REJECTED);
+    rejected += 1;
+    // The identity screen: an appender no Live page names, one of this
+    // mount's own regions, an offer to nobody, an offer to oneself.
+    let err = client
+        .acquire_slot(4242, 100)
+        .await
+        .expect_err("unknown appender");
+    assert!(err.to_string().contains("rejected"), "{err}");
+    let err = client
+        .acquire_slot(0, 100)
+        .await
+        .expect_err("the manager's own id");
+    assert!(err.to_string().contains("rejected"), "{err}");
+    let err = client
+        .offer_slot(joiner, routing, 4242)
+        .await
+        .expect_err("an offer to nobody");
+    assert!(err.to_string().contains("rejected"), "{err}");
+    let err = client
+        .offer_slot(joiner, routing, joiner)
+        .await
+        .expect_err("an offer to oneself");
+    assert!(err.to_string().contains("rejected"), "{err}");
+    let err = client
+        .release_slot(4242, routing, 2, lessee_release_words(&granted), Vec::new())
+        .await
+        .expect_err("a release by an unknown appender");
+    assert!(err.to_string().contains("rejected"), "{err}");
+    rejected += 5;
+    let stats = vol.appender_stats().unwrap();
+    assert_eq!(stats.manager_verb_rejected, rejected);
+    assert_eq!(stats.manager_verb_refusals, stats0.manager_verb_refusals);
+    assert_eq!(tree0_states(&vol).await, states0);
+    assert_eq!(vol.slot_leases().unwrap().table.get(SLOT4), Some(lease0));
+    // The legitimate release lands: tree 0 `Unleased` at g 2 with the
+    // grant's root and cursor and the lessee's frontier; ring 0 stamps
+    // above it.
+    let already = client
+        .release_slot(
+            joiner,
+            routing,
+            2,
+            lessee_release_words(&granted),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert!(!already);
+    let states = tree0_states(&vol).await;
+    match states.iter().find(|(s, _)| *s == SLOT4).map(|(_, st)| st) {
+        Some(SlotState::Unleased {
+            root,
+            cursor,
+            g: 2,
+            seq_floor,
+            ..
+        }) => {
+            assert_eq!((root.addr, root.seq), granted.root);
+            assert_eq!(*cursor, granted.cursor);
+            assert_eq!(*seq_floor, granted.seq_floor + 1);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(vol.journal_ring().seq_frontier() > granted.seq_floor + 1);
+    assert!(!vol.slot_leases().unwrap().gate.is_foreign(SLOT4));
+    assert_eq!(
+        vol.appender_stats().unwrap().manager_verb_rejected,
+        rejected,
+        "the legitimate release is not a rejection"
+    );
+    host.shutdown();
+    shutdown(&routed).await;
+}
+
 /// **Issue 24 (round 3): a first-touch acquire never parks for ring space
 /// under `manager_verbs`.** With the cadence parked and ring 0's user
 /// window exhausted, a first-touch commit's door acquire PARKS at ring
@@ -3670,10 +3968,10 @@ async fn the_renewal_grant_carries_the_members_slot_leases_recalls_and_offers() 
     // The joiner leases routing slot 400.
     let routing: u16 = 400;
     let fslot = guest_forest_slot(routing);
-    match client.acquire_slot(joiner, routing).await.unwrap() {
-        ManagerReply::SlotsGranted { .. } => {}
+    let granted_words = match client.acquire_slot(joiner, routing).await.unwrap() {
+        ManagerReply::SlotsGranted { slots, .. } => slots[0].words,
         other => panic!("{other:?}"),
-    }
+    };
     // The membership owner (the S6 plane, in-process): the joiner's join
     // grant attests its lease.
     let owner = MembershipOwner::arm(
@@ -3735,14 +4033,15 @@ async fn the_renewal_grant_carries_the_members_slot_leases_recalls_and_offers() 
     };
     assert_eq!(grant.slot_release_notices, vec![routing]);
     // The holder releases (its flush-then-transfer is its own; the tree
-    // was never minted, so the words are empty), the recall clears, the
-    // requester's retry is granted at g + 1.
+    // was never minted, so the words are the grant's with the frontier
+    // its raise left), the recall clears, the requester's retry is
+    // granted at g + 1.
     let already = client
         .release_slot(
             joiner,
             routing,
             1,
-            squeezefs::meta_ship::manager::WireSlotWords::default(),
+            lessee_release_words(&granted_words),
             Vec::new(),
         )
         .await
@@ -3871,14 +4170,15 @@ async fn two_armed_volumes_each_with_a_wire_joiner_compose_one_owner_table() {
         let ManagerReply::Joined { appender_id, .. } = reply else {
             panic!("{reply:?}");
         };
-        match client.acquire_slot(appender_id, slot).await.unwrap() {
+        let words = match client.acquire_slot(appender_id, slot).await.unwrap() {
             ManagerReply::SlotsGranted { slots, already } => {
                 assert!(!already);
                 assert_eq!((slots[0].slot, slots[0].g), (slot, 1));
+                slots[0].words
             }
             other => panic!("{other:?}"),
-        }
-        clients.push((client, appender_id));
+        };
+        clients.push((client, appender_id, words));
     }
     // The composed table: both foreign, everything else local.
     assert_eq!(squeezefs::dlm_slot::dlm_mode(), "slot-homed");
@@ -3889,7 +4189,7 @@ async fn two_armed_volumes_each_with_a_wire_joiner_compose_one_owner_table() {
     // Each volume's tree 0 names ITS lessee only.
     for (ordinal, (mine, other)) in [(0usize, (slot_a, slot_b)), (1usize, (slot_b, slot_a))] {
         let states = tree0_states(&routed.volumes[ordinal]).await;
-        let (_, joiner) = clients[ordinal];
+        let (_, joiner, _) = clients[ordinal];
         assert!(
             matches!(
                 states
@@ -3910,8 +4210,8 @@ async fn two_armed_volumes_each_with_a_wire_joiner_compose_one_owner_table() {
     }
     // Joiner A releases its slot on volume 0: slot A is local again, slot
     // B stays foreign (the withdrawal is per volume).
-    let (client_a, joiner_a) = &mut clients[0];
-    let words = squeezefs::meta_ship::manager::WireSlotWords::default();
+    let (client_a, joiner_a, granted_a) = &mut clients[0];
+    let words = lessee_release_words(granted_a);
     client_a
         .release_slot(*joiner_a, slot_a, 1, words, Vec::new())
         .await

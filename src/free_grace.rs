@@ -4097,9 +4097,24 @@ static S5_READER_DEFERRALS: AtomicU64 = AtomicU64::new(0);
 static TOKEN_CLIENT_PROBE: once_cell::sync::Lazy<ArcSwapOption<TokenClientProbe>> =
     once_cell::sync::Lazy::new(ArcSwapOption::empty);
 
-/// "Is this member id a token client of this holder?" — the token
-/// plane's registry, installed at the holder's arm.
-pub type TokenClientProbe = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+/// The token plane's client registry, installed at the holder's arm:
+/// "is this member id a token client of this holder?" and the registry's
+/// generation (bumped per new client — the reader-class cache's second
+/// key beside the membership census generation).
+pub struct TokenClientProbe {
+    pub is_client: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    pub generation: Arc<dyn Fn() -> u64 + Send + Sync>,
+}
+
+/// The reader-class verdict CACHED against `(census generation, token-
+/// client generation)` (review round 2, Issue 22): one word — the census
+/// generation's low 32 bits `<< 32`, the token generation's low 31 bits
+/// `<< 1`, the verdict bit; `u64::MAX` = never computed. The O(members)
+/// scan runs when either generation moved, never per free.
+static S5_CLASS_CACHE: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Scans the cache missed on (`free_grace_s5_class_scans`) — ≈ the number
+/// of census changes, never the number of frees.
+static S5_CLASS_SCANS: AtomicU64 = AtomicU64::new(0);
 
 /// The recall gate's verdict for one terminal free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4159,11 +4174,28 @@ fn s5_reader_enrolled() -> bool {
         return false;
     };
     let probe = TOKEN_CLIENT_PROBE.load();
-    owner.live_reader_ids().iter().any(|id| {
-        !probe
-            .as_deref()
-            .is_some_and(|is_token_client| is_token_client(id))
-    })
+    // The generations are read BEFORE the scan and stored with its
+    // verdict: a change landing mid-scan leaves the OLD key behind, so
+    // the next free recomputes.
+    let census = crate::membership::census_generation();
+    let tokens = probe.as_deref().map_or(0, |p| (p.generation)());
+    let key = (u64::from(census as u32) << 32) | ((u64::from(tokens as u32) & 0x7FFF_FFFF) << 1);
+    let cached = S5_CLASS_CACHE.load(Ordering::Acquire);
+    if cached != u64::MAX && cached & !1 == key {
+        return cached & 1 == 1;
+    }
+    S5_CLASS_SCANS.fetch_add(1, Ordering::Relaxed);
+    let verdict = owner
+        .live_reader_ids()
+        .iter()
+        .any(|id| !probe.as_deref().is_some_and(|p| (p.is_client)(id)));
+    S5_CLASS_CACHE.store(key | u64::from(verdict), Ordering::Release);
+    verdict
+}
+
+/// `free_grace_s5_class_scans`.
+pub fn s5_class_scans() -> u64 {
+    S5_CLASS_SCANS.load(Ordering::Relaxed)
 }
 
 /// **The verdict** (`BlockAllocator::finish_free`'s first gate): one
@@ -4237,4 +4269,6 @@ fn reset_recall_gate_for_test() {
     RECALL_GATED_FREES.store(0, Ordering::Relaxed);
     TIMEOUT_DEFERRALS.store(0, Ordering::Relaxed);
     S5_READER_DEFERRALS.store(0, Ordering::Relaxed);
+    S5_CLASS_CACHE.store(u64::MAX, Ordering::Relaxed);
+    S5_CLASS_SCANS.store(0, Ordering::Relaxed);
 }

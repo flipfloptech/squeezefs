@@ -14174,6 +14174,10 @@ impl SqueezefsFilesystem {
                     "free_grace_s5_reader_deferrals".into(),
                     serde_json::json!(crate::free_grace::s5_reader_deferrals()),
                 );
+                metrics.insert(
+                    "free_grace_s5_class_scans".into(),
+                    serde_json::json!(crate::free_grace::s5_class_scans()),
+                );
                 // The control-plane poll's economy (PR 5's predicted-slot-
                 // first ledger read): bytes ÷ `meta_kv_revalidate_polls` is
                 // the poll's cost (4 KiB idle), `full_reads` the torn-slot

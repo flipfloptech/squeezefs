@@ -3061,9 +3061,10 @@ impl KvMetaBackend {
             // when every live reader of the set is a token client of this
             // holder. One holder counted per armed volume; the clean leave
             // (`shutdown`) uncounts it.
-            crate::free_grace::install_token_client_probe(Arc::new(
-                crate::meta_ship::token_plane::is_token_client,
-            ));
+            crate::free_grace::install_token_client_probe(crate::free_grace::TokenClientProbe {
+                is_client: Arc::new(crate::meta_ship::token_plane::is_token_client),
+                generation: Arc::new(crate::meta_ship::token_plane::token_clients_generation),
+            });
             crate::free_grace::arm_recall_gate();
             let plane = Arc::new(crate::meta_ship::token_plane::TokenHolderPlane::new());
             // The membership departure sweep reaches this holder.

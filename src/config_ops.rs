@@ -5717,12 +5717,11 @@ fn control_records_planned(
                 root: RootPtr { addr: 0, seq: 0 },
                 cursor: 0,
                 g: 0,
-                tails: Vec::new(),
+                slot_tree_extents: 0,
+                last_written: 0,
+                seq_floor: 0,
             };
-            state
-                .encode()
-                .ok()
-                .map(|v| Record::put(slot_state_key(*slot), 0, v))
+            Some(Record::put(slot_state_key(*slot), 0, state.encode()))
         })
         .collect()
 }
@@ -6510,8 +6509,17 @@ async fn convert_volume_to_forest(
     for slot in slots {
         let mut records = by_slot.remove(&slot).unwrap_or_default();
         records.sort_by(|a, b| a.key.cmp(&b.key));
+        let nodes_before = writer.nodes_written();
         let (addr, seq) = writer.write_tree(KIND_INTERIOR, records).await?;
         let root = RootPtr { addr, seq };
+        // One heap extent per node written for this slot tree.
+        let slot_tree_extents =
+            u32::try_from(writer.nodes_written() - nodes_before).map_err(|_| {
+                SqueezefsError::InvalidOperation(
+                    "volume enable-symmetric: a slot tree exceeds the page's extent-count width"
+                        .to_string(),
+                )
+            })?;
         if slot == NATIVE_FOREST_SLOT {
             native_root = Some(root);
             continue;
@@ -6526,13 +6534,18 @@ async fn convert_volume_to_forest(
         })?;
         let live_cursor = flat.max_local_ino.get(&slot).map_or(0, |m| m + 1);
         let cursor = stamp.cursor_for(guest).unwrap_or(0).max(live_cursor);
+        // Offline: no lessee ever wrote the slot; the seq floor is the kept
+        // quiesced tail so every later stamp on any ring exceeds ring 0's
+        // pre-conversion history (the seq-space law, design §5.1.4).
         let state = SlotState::Unleased {
             root,
             cursor,
             g: 0,
-            tails: Vec::new(),
+            slot_tree_extents,
+            last_written: 0,
+            seq_floor: ledger.journal_tail_seq,
         };
-        control.push(Record::put(slot_state_key(slot), 0, state.encode()?));
+        control.push(Record::put(slot_state_key(slot), 0, state.encode()));
     }
     let native_root = native_root.ok_or_else(|| {
         SqueezefsError::InvalidOperation(

@@ -1069,7 +1069,21 @@ pub fn checkpoint_landing_ceiling_for_elastic(decision_ms: u64, flush_interval_m
 /// cycle-break the RESOLVABLE pinned-floor shape always converges that
 /// way — what remains for the terminal is a tail pinned by something no
 /// flush pass can discharge (a stuck in-flight reservation).
-const PENDING_FREE_FORCE_CYCLES: u64 = 8;
+pub const PENDING_FREE_FORCE_CYCLES: u64 = 8;
+
+/// The ONE bound every "cycle the checkpoint until the tail covers X"
+/// loop runs to (the mount's bring-up cover, the mount gate's pre-claim
+/// drain, the handover's flush-then-transfer post-condition, a grant's
+/// ring-0 window clearing — four declarations of one law before PR 4
+/// review round 6, Issue 30): **eight clause-b rounds**. A tail that does
+/// not move at all fails the volume loud INSIDE the eighth barriered
+/// cycle by the §4.7 audit itself ([`PENDING_FREE_FORCE_CYCLES`]), so a
+/// loop that reaches this bound has a tail that MOVES and still has not
+/// covered its target — a schedule (a slow device, a long in-flight
+/// window), never a wedge; what each caller does at the bound is its own
+/// class (a grant defers, the mount refuses). Tie-tested in
+/// `tests/sym_slot_transfer_tests.rs`.
+pub const COVER_CYCLES_MAX: u32 = 8 * PENDING_FREE_FORCE_CYCLES as u32;
 
 /// Spawn the per-volume checkpoint/writeback task (called by
 /// `KvMetaBackend::open`). The task holds a `Weak` backend reference —

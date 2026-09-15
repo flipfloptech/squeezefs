@@ -27,7 +27,13 @@
 //!   `ExtentGrant { want }` is clamped to the derivation's cap
 //!   (`appender::{validate_return_runs, coalesce_runs, intersect_coalesced_with_record,
 //!   clamp_grant_want}` — the pure edge `KvMetaBackend::manager_return_runs`
-//!   / `manager_extent_grant_class` run).
+//!   / `manager_extent_grant_class` run); and (review round 6, Issue 29)
+//!   **no wire slot word reaches a RAM or durable effect unvalidated** — a
+//!   `ReleaseSlot` frame's `seq_floor` / `cursor` / `root` /
+//!   `slot_tree_extents` are screened against durable and derived bounds
+//!   (`appender::{screen_release_words, release_seq_floor_bound,
+//!   root_extent_of}`, the pure edge `manager_release_slot_wire` runs
+//!   first); a poisoned word is `STATUS_REJECTED` with nothing written.
 //!
 //! Three arms: the raw bytes (the reject ladder), an `Arbitrary`-built
 //! frame encoded then decoded — the constructive mirror that reaches
@@ -41,8 +47,9 @@
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use squeezefs::meta_backend::kv::appender::{
-    clamp_grant_want, coalesce_runs, intersect_coalesced_with_record, runs_extent_count,
-    validate_return_runs, GrantRun,
+    clamp_grant_want, coalesce_runs, intersect_coalesced_with_record, release_seq_floor_bound,
+    root_extent_of, runs_extent_count, screen_release_words, validate_return_runs, GrantRun,
+    ReleaseWordBounds, SEQ_FRONTIER_SANE_MAX,
 };
 use squeezefs::meta_backend::kv::slot_state::{
     ExtentGrantRecord, SlotState, SlotTails, SlotTailsRecord, TAILS_SPILLED,
@@ -124,7 +131,7 @@ fn check_service_edge(call: &ManagerCall, total_extents: u64, record_seed: &[u8]
         // the count, and the tails record's inline arm encodes for every
         // count below the spill sentinel.
         ManagerCall::ReleaseSlot { words, tails, .. } => {
-            let record = SlotState::Unleased {
+            let state = SlotState::Unleased {
                 root: RootPtr {
                     addr: words.root.0,
                     seq: words.root.1,
@@ -135,10 +142,7 @@ fn check_service_edge(call: &ManagerCall, total_extents: u64, record_seed: &[u8]
                 last_written: 0,
                 seq_floor: words.seq_floor,
             };
-            assert_eq!(
-                SlotState::decode(&record.encode()).expect("decodes"),
-                record
-            );
+            assert_eq!(SlotState::decode(&state.encode()).expect("decodes"), state);
             if tails.len() < usize::from(TAILS_SPILLED) {
                 let rec = SlotTailsRecord {
                     g: 1,
@@ -148,6 +152,55 @@ fn check_service_edge(call: &ManagerCall, total_extents: u64, record_seed: &[u8]
                     .encode()
                     .expect("a tails count below the spill sentinel encodes inline");
                 assert_eq!(SlotTailsRecord::decode(&img).expect("decodes"), rec);
+            }
+            // The POISONED-FRAME arm (review round 6, Issue 29): no wire
+            // slot word reaches a RAM or durable effect unvalidated. The
+            // screen the release's wire face runs BEFORE any effect is
+            // pure over the words and the durable bounds; against small
+            // arbitrary bounds its verdict is exactly the predicate — a
+            // word outside its bound is refused (the service answers
+            // `STATUS_REJECTED`, nothing written), words inside pass — and
+            // the derived frontier bound never leaves the sane seq space
+            // whatever the page says.
+            let seed = |i: usize| u64::from(record_seed.get(i).copied().unwrap_or(0));
+            let node = 4096u64 << (seed(0) % 7); // 4 KiB .. 256 KiB
+            let bounds = ReleaseWordBounds {
+                seq_floor_recorded: seed(1) * 64,
+                seq_floor_max: release_seq_floor_bound(
+                    seed(2) * 64,
+                    (seed(3) > 0).then_some(seed(1) * 64),
+                    seed(4) * 16,
+                    node * (1 + seed(5)),
+                ),
+                cursor_recorded: seed(6),
+                cursor_max: 1 << 40,
+                root_recorded: ((1 << 20) + node * (seed(7) % total_extents.max(1)), seed(8)),
+                heap_base: 1 << 20,
+                node_size: node,
+                total_extents,
+            };
+            assert!(bounds.seq_floor_max <= SEQ_FRONTIER_SANE_MAX);
+            let w: squeezefs::slot_lease_core::SlotWords = (*words).into();
+            let root_ok = w.root == bounds.root_recorded
+                || root_extent_of(w.root.0, &bounds).is_some_and(|e| record.contains(e));
+            let inside = w.seq_floor > bounds.seq_floor_recorded
+                && w.seq_floor <= bounds.seq_floor_max
+                && w.cursor >= bounds.cursor_recorded
+                && w.cursor <= bounds.cursor_max
+                && u64::from(w.extents) <= bounds.total_extents
+                && root_ok;
+            let verdict = screen_release_words(&w, &bounds, &record);
+            assert_eq!(
+                verdict.is_ok(),
+                inside,
+                "the screen's verdict is the predicate: {w:?} against {bounds:?} → {verdict:?}"
+            );
+            if let Err(e) = verdict {
+                assert!(!e.to_string().is_empty(), "every refusal names its class");
+            }
+            if let Some(e) = root_extent_of(w.root.0, &bounds) {
+                assert!(e < total_extents);
+                assert_eq!(bounds.heap_base + e * node, w.root.0);
             }
         }
         ManagerCall::JoinAppender { .. }

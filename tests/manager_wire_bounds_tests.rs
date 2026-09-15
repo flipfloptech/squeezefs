@@ -140,3 +140,158 @@ fn duplicated_and_overlapping_runs_count_once_after_the_coalesce() {
         vec![11, 12, 13, 30]
     );
 }
+
+/// Review round 6, Issue 29 — the slot words a wire `ReleaseSlot` carries
+/// are screened against DURABLE / derived bounds before any RAM or durable
+/// effect (`screen_release_words`, the pure edge `KvMetaBackend::
+/// manager_release_slot_wire` runs): every poisoned word is refused with
+/// its own class, the legitimate words — the grant's with the frontier the
+/// lessee's raise left — pass, and the derived frontier bound
+/// (`release_seq_floor_bound`) never exceeds the sane seq-space maximum
+/// whatever the page says.
+#[test]
+fn a_release_frames_slot_words_are_screened_against_durable_bounds() {
+    use squeezefs::meta_backend::kv::appender::{
+        release_seq_floor_bound, root_extent_of, screen_release_words, ReleaseWordBounds,
+        ReleaseWordRefusal, SEQ_FRONTIER_SANE_MAX,
+    };
+    use squeezefs::slot_lease_core::SlotWords;
+    const NODE: u64 = 64 * 1024;
+    const HEAP: u64 = 1 << 20;
+    let grant = ExtentGrantRecord::from_extents([5u64, 6, 7, 40, 41]);
+    let bounds = ReleaseWordBounds {
+        seq_floor_recorded: 1_000,
+        seq_floor_max: release_seq_floor_bound(0, Some(1_000), 4096, 512 * 1024),
+        cursor_recorded: 18,
+        cursor_max: 1 << 40,
+        root_recorded: (HEAP + 6 * NODE, 9),
+        heap_base: HEAP,
+        node_size: NODE,
+        total_extents: 5_120,
+    };
+    assert_eq!(bounds.seq_floor_max, 1_001 + 4096 + 2 * 512 * 1024);
+    let legit = SlotWords {
+        root: (HEAP + 6 * NODE, 9),
+        cursor: 18,
+        extents: 3,
+        seq_floor: 1_001,
+    };
+    assert_eq!(screen_release_words(&legit, &bounds, &grant), Ok(()));
+    // A moved root inside the grant passes the pure screen (the header
+    // read is the caller's second witness).
+    let moved = SlotWords {
+        root: (HEAP + 41 * NODE, 12),
+        ..legit
+    };
+    assert_eq!(screen_release_words(&moved, &bounds, &grant), Ok(()));
+    let cases = [
+        (
+            SlotWords {
+                seq_floor: 1_000,
+                ..legit
+            },
+            ReleaseWordRefusal::SeqFloorBelowGrant {
+                floor: 1_000,
+                recorded: 1_000,
+            },
+        ),
+        (
+            SlotWords {
+                seq_floor: u64::MAX,
+                ..legit
+            },
+            ReleaseWordRefusal::SeqFloorAboveBound {
+                floor: u64::MAX,
+                bound: bounds.seq_floor_max,
+            },
+        ),
+        (
+            SlotWords {
+                cursor: 17,
+                ..legit
+            },
+            ReleaseWordRefusal::CursorBelowGrant {
+                cursor: 17,
+                recorded: 18,
+            },
+        ),
+        (
+            SlotWords {
+                cursor: (1 << 40) + 1,
+                ..legit
+            },
+            ReleaseWordRefusal::CursorAboveNamespace {
+                cursor: (1 << 40) + 1,
+                max: 1 << 40,
+            },
+        ),
+        (
+            SlotWords {
+                extents: 5_121,
+                ..legit
+            },
+            ReleaseWordRefusal::ExtentsAboveVolume {
+                extents: 5_121,
+                total: 5_120,
+            },
+        ),
+        (
+            SlotWords {
+                root: (0, 0),
+                ..legit
+            },
+            ReleaseWordRefusal::RootOutsideGrant { addr: 0 },
+        ),
+        (
+            SlotWords {
+                root: (HEAP + 8 * NODE, 1),
+                ..legit
+            },
+            ReleaseWordRefusal::RootOutsideGrant {
+                addr: HEAP + 8 * NODE,
+            },
+        ),
+        (
+            SlotWords {
+                root: (HEAP + 6 * NODE + 4096, 9),
+                ..legit
+            },
+            ReleaseWordRefusal::RootOutsideGrant {
+                addr: HEAP + 6 * NODE + 4096,
+            },
+        ),
+        (
+            SlotWords {
+                root: (HEAP + 6_000 * NODE, 9),
+                ..legit
+            },
+            ReleaseWordRefusal::RootOutsideGrant {
+                addr: HEAP + 6_000 * NODE,
+            },
+        ),
+    ];
+    for (words, want) in cases {
+        assert_eq!(
+            screen_release_words(&words, &bounds, &grant),
+            Err(want),
+            "{words:?}"
+        );
+        assert!(!want.to_string().is_empty());
+    }
+    // The address → extent step refuses everything off the node grid.
+    assert_eq!(root_extent_of(HEAP + 7 * NODE, &bounds), Some(7));
+    assert_eq!(root_extent_of(HEAP - 1, &bounds), None);
+    assert_eq!(root_extent_of(HEAP + 1, &bounds), None);
+    assert_eq!(root_extent_of(HEAP + 5_120 * NODE, &bounds), None);
+    // The derived bound: the page's offset or the granted floor + 1,
+    // whichever is higher, plus the head hint and two ring lengths — and
+    // never past the sane maximum however the page lies.
+    assert_eq!(release_seq_floor_bound(500, Some(1_000), 0, 0), 1_001);
+    assert_eq!(release_seq_floor_bound(5_000, Some(1_000), 0, 0), 5_000);
+    assert_eq!(release_seq_floor_bound(0, None, 10, 100), 210);
+    assert_eq!(
+        release_seq_floor_bound(u64::MAX, Some(u64::MAX), u64::MAX, u64::MAX),
+        SEQ_FRONTIER_SANE_MAX
+    );
+    assert_eq!(SEQ_FRONTIER_SANE_MAX, u64::MAX / 2);
+}

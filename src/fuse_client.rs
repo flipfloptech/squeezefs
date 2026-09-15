@@ -13816,6 +13816,7 @@ impl SqueezefsFilesystem {
                     "slot_rotor_cap_refusals".into(),
                     lease(&|s| s.rotor_cap_refusals),
                 );
+                metrics.insert("slot_grant_deferrals".into(), lease(&|s| s.grant_deferrals));
                 metrics.insert("slot_offers_busy".into(), lease(&|s| s.offers_busy));
                 metrics.insert(
                     "meta_kv_leaf_lease_refusals".into(),

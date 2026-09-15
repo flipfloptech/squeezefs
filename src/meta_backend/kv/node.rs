@@ -839,6 +839,33 @@ pub async fn load_node(
     verify_node_extent(buf, layout, node_addr, durable_tail)
 }
 
+/// One node's HEADER page alone — decoded, checksum-verified, self-address
+/// checked; the node's bsets are not read. The manager's second witness
+/// for a wire release's `root` word (review round 6, Issue 29): the
+/// address must hold a node image whose incarnation stamp is the one the
+/// word names — one 4 KiB read, never the extent.
+pub async fn read_node_header(
+    path: impl AsRef<Path>,
+    node_addr: u64,
+) -> Result<NodeHeader, KvError> {
+    check_addr_alignment(node_addr)?;
+    let buf = uring_fs::read_at(path, node_addr, NODE_PAGE).await?;
+    if buf.len() != NODE_PAGE {
+        return Err(KvError::Corrupt(format!(
+            "short header read at {node_addr:#x}: {} of {NODE_PAGE} bytes",
+            buf.len()
+        )));
+    }
+    let header = NodeHeader::decode_page(&buf[..NODE_PAGE])?;
+    if header.node_addr != node_addr {
+        return Err(KvError::Corrupt(format!(
+            "node self-address mismatch: header says {:#x}, read from {node_addr:#x}",
+            header.node_addr
+        )));
+    }
+    Ok(header)
+}
+
 /// The **pure** half of [`load_node`]: everything after the device read —
 /// header decode, self-address/geometry checks, the §4.5 append walk, and
 /// the torn-tail diagnosis pass. Split out so the whole on-disk node

@@ -936,6 +936,29 @@ pub enum KvError {
         cap: u64,
     },
 
+    /// A grant of an UNLEASED slot whose records ring 0's window still
+    /// holds after the bounded clearing cycles (design-symmetric-metadata
+    /// §5.1.4's structural door — PR 4 review round 5 Issue 28, typed by
+    /// round 6 Issue 30): the manager's structural records for the tree
+    /// are not yet covered by the tail tree 0's next lessee is judged
+    /// against. A SCHEDULE — a slow device, a long in-flight stage-B
+    /// window — never a wedge: the tail MOVED (a tail that does not move
+    /// at all is the stuck-reservation class, `Corrupt`), the volume is
+    /// healthy, nothing was written; the requester retries (EAGAIN).
+    /// Counted `slot_grant_deferrals`, never `manager_verb_refusals`.
+    #[error(
+        "grant of forest slot {slot} deferred: ring 0's window still holds the unleased tree's \
+         records after {cycles} barriered checkpoint cycles (record frontier {frontier}, tail \
+         {tail_start} → {tail}) — a schedule, not a wedge; retry (EAGAIN)"
+    )]
+    GrantDeferred {
+        slot: u32,
+        cycles: u32,
+        frontier: u64,
+        tail_start: u64,
+        tail: u64,
+    },
+
     /// A manager verb REJECTED at the service edge (design-symmetric-
     /// metadata §5.3.5; review round 1 Issue 2): a wire-carried integer
     /// names what the durable state cannot — a return run outside the
@@ -1011,6 +1034,11 @@ impl From<KvError> for crate::error::SqueezefsError {
             // A foreign slot lease at the commit door: EAGAIN — the ship
             // to the holder is PR 6/12's; the caller retries.
             e @ KvError::SlotBusy { .. } => E::refused(libc::EAGAIN, format!("kv metadata: {e}")),
+            // A grant deferred behind ring 0's window: the schedule's
+            // EAGAIN — the requester's next ask finds the window clear.
+            e @ KvError::GrantDeferred { .. } => {
+                E::refused(libc::EAGAIN, format!("kv metadata: {e}"))
+            }
             // The rotor cap names a holder-side limit — EBUSY, like the
             // other manager refusals that name a holder.
             e @ KvError::RotorAtCap { .. } => E::busy(format!("kv metadata: {e}")),

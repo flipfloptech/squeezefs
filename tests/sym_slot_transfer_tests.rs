@@ -2943,6 +2943,18 @@ async fn a_wire_releases_slot_words_are_screened_before_any_effect() {
     shutdown(&routed).await;
 }
 
+/// **Issue 30 (round 6): the four "cycle until the tail covers X" loops
+/// run to ONE bound** — eight clause-b rounds: a tail that does not move
+/// at all fails loud inside the eighth barriered cycle by the §4.7 audit
+/// itself, so a loop reaching the bound has a tail that MOVES and still
+/// has not covered its target — a schedule, never a wedge. Drift is red.
+#[test]
+fn the_cover_cycles_bound_is_eight_clause_b_rounds() {
+    use squeezefs::meta_backend::kv::checkpoint::{COVER_CYCLES_MAX, PENDING_FREE_FORCE_CYCLES};
+    assert_eq!(u64::from(COVER_CYCLES_MAX), 8 * PENDING_FREE_FORCE_CYCLES);
+    assert_eq!(COVER_CYCLES_MAX, 64, "the shipped bound, unchanged");
+}
+
 /// **Issue 24 (round 3): a first-touch acquire never parks for ring space
 /// under `manager_verbs`.** With the cadence parked and ring 0's user
 /// window exhausted, a first-touch commit's door acquire PARKS at ring

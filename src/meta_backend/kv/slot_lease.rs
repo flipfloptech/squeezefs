@@ -323,6 +323,11 @@ pub struct SlotLeasePlane {
     /// Rotor asks refused past `2 × M` (legal — the overflow arm's
     /// designed past-cap answer).
     pub rotor_cap_refusals: AtomicU64,
+    /// Grants of an UNLEASED slot DEFERRED because ring 0's window still
+    /// held the tree's records after the bounded clearing cycles (legal —
+    /// a schedule; the requester retries `EAGAIN`; review round 6, Issue
+    /// 30). 0 on every healthy cadence.
+    pub grant_deferrals: AtomicU64,
     /// Slot trees another appender leases that a structural pass (the
     /// merge sweep, the heap-full recovery, the D4 arm) SKIPPED — never
     /// this mount's to maintain (review round 4, Issue 25; the gate's
@@ -361,6 +366,7 @@ impl SlotLeasePlane {
             door_refusals: AtomicU64::new(0),
             acquire_refusals: AtomicU64::new(0),
             rotor_cap_refusals: AtomicU64::new(0),
+            grant_deferrals: AtomicU64::new(0),
             merge_sweep_foreign_skips: AtomicU64::new(0),
             offers_busy: AtomicU64::new(0),
             table: SlotLeaseTable::new(),
@@ -598,6 +604,7 @@ impl SlotLeasePlane {
             door_refusals: self.door_refusals.load(Relaxed),
             acquire_refusals: self.acquire_refusals.load(Relaxed),
             rotor_cap_refusals: self.rotor_cap_refusals.load(Relaxed),
+            grant_deferrals: self.grant_deferrals.load(Relaxed),
             merge_sweep_foreign_skips: self.merge_sweep_foreign_skips.load(Relaxed),
             offers_busy: self.offers_busy.load(Relaxed),
         }
@@ -869,6 +876,9 @@ pub struct SlotLeaseStats {
     /// Rotor asks refused past `2 × M` (legal — the overflow arm's
     /// designed answer).
     pub rotor_cap_refusals: u64,
+    /// Grants of an unleased slot deferred behind ring 0's window (legal,
+    /// retryable — Issue 30). 0 on a healthy cadence.
+    pub grant_deferrals: u64,
     /// Slot trees another appender leases that a structural pass skipped
     /// (never this mount's to maintain — Issue 25). 0 on a solo mount.
     pub merge_sweep_foreign_skips: u64,

@@ -428,157 +428,98 @@ impl ManagerService {
         // Every executor validates the frame's integers against DURABLE
         // state before anything proportional to them is allocated
         // (`want` clamped to the derivation's cap; return runs checked
-        // against the volume and the caller's record run by run) —
-        // "bounded codec = bounded execution" (Issue 2). A rejection is
-        // its own status so the peer can tell its own defect from a
-        // witness refusal.
-        let mut rejected = false;
-        let (reply, refusal) = match &frame.call {
-            ManagerCall::JoinAppender {
-                identity,
-                ring_want_bytes,
-            } => match self
-                .volume
-                .manager_join_appender((*identity).into(), *ring_want_bytes)
-                .await
-            {
-                Ok(JoinOutcome {
-                    appender_id,
-                    page_addr,
-                    ring_segments,
-                    grant,
-                    already,
-                }) => (
-                    ManagerReply::Joined {
-                        appender_id,
-                        page_addr,
-                        ring_segments: ring_segments.iter().map(|s| (s.start, s.len)).collect(),
-                        grant: runs_to_wire(&grant),
-                        already,
-                    },
-                    false,
-                ),
-                Err(e) => (
-                    ManagerReply::Refused {
-                        reason: e.to_string(),
-                    },
-                    true,
-                ),
-            },
-            ManagerCall::ExtentGrant { appender_id, want } => {
-                match self.volume.manager_extent_grant(*appender_id, *want).await {
-                    Ok(runs) => (
-                        ManagerReply::Granted {
-                            runs: runs_to_wire(&runs),
+        // against the volume and the caller's record run by run; the
+        // slot verbs' identity and words screened at their wire faces —
+        // review round 6, Issue 29) — "bounded codec = bounded
+        // execution" (Issue 2). A rejection is its own status so the peer
+        // can tell its own defect from a witness refusal: ONE classifier
+        // over every verb's error (before round 6 only `ReturnExtents`
+        // read the class, so every other verb's `Rejected` left as
+        // `STATUS_REFUSED`).
+        let served: std::result::Result<ManagerReply, crate::meta_backend::kv::KvError> =
+            match &frame.call {
+                ManagerCall::JoinAppender {
+                    identity,
+                    ring_want_bytes,
+                } => self
+                    .volume
+                    .manager_join_appender((*identity).into(), *ring_want_bytes)
+                    .await
+                    .map(
+                        |JoinOutcome {
+                             appender_id,
+                             page_addr,
+                             ring_segments,
+                             grant,
+                             already,
+                         }| ManagerReply::Joined {
+                            appender_id,
+                            page_addr,
+                            ring_segments: ring_segments.iter().map(|s| (s.start, s.len)).collect(),
+                            grant: runs_to_wire(&grant),
+                            already,
                         },
-                        false,
                     ),
-                    Err(e) => (
-                        ManagerReply::Refused {
-                            reason: e.to_string(),
-                        },
-                        true,
-                    ),
-                }
-            }
-            ManagerCall::ReturnExtents { appender_id, runs } => {
-                // The runs travel as RUNS: the executor intersects them
-                // with the record run by run; the only allocation
-                // proportional to the frame here is the run list itself,
-                // bounded by the frame cap.
-                match self
+                ManagerCall::ExtentGrant { appender_id, want } => self
+                    .volume
+                    .manager_extent_grant(*appender_id, *want)
+                    .await
+                    .map(|runs| ManagerReply::Granted {
+                        runs: runs_to_wire(&runs),
+                    }),
+                // The runs travel as RUNS: the executor intersects them with
+                // the record run by run; the only allocation proportional to
+                // the frame here is the run list itself, bounded by the frame
+                // cap.
+                ManagerCall::ReturnExtents { appender_id, runs } => self
                     .volume
                     .manager_return_runs(*appender_id, &runs_from_wire(runs))
                     .await
-                {
-                    Ok((cleared, already)) => (ManagerReply::Returned { cleared, already }, false),
-                    Err(e) => {
-                        rejected = matches!(e, crate::meta_backend::kv::KvError::Rejected(_));
-                        (
-                            ManagerReply::Refused {
-                                reason: e.to_string(),
-                            },
-                            true,
-                        )
-                    }
-                }
-            }
-            ManagerCall::AcquireSlots { appender_id, want } => {
-                match self
+                    .map(|(cleared, already)| ManagerReply::Returned { cleared, already }),
+                ManagerCall::AcquireSlots { appender_id, want } => self
                     .volume
                     .manager_acquire_slots_wire(*appender_id, *want)
                     .await
-                {
-                    Ok((slots, already)) => (ManagerReply::SlotsGranted { slots, already }, false),
-                    Err(e) => (
-                        ManagerReply::Refused {
-                            reason: e.to_string(),
-                        },
-                        true,
-                    ),
+                    .map(|(slots, already)| ManagerReply::SlotsGranted { slots, already }),
+                ManagerCall::AcquireSlot { appender_id, slot } => {
+                    self.volume
+                        .manager_acquire_slot_wire(*appender_id, *slot)
+                        .await
                 }
-            }
-            ManagerCall::AcquireSlot { appender_id, slot } => {
-                match self
+                ManagerCall::OfferSlot {
+                    appender_id,
+                    slot,
+                    to,
+                } => self
                     .volume
-                    .manager_acquire_slot_wire(*appender_id, *slot)
+                    .manager_offer_slot_wire(*appender_id, *slot, *to)
                     .await
-                {
-                    Ok(reply) => (reply, false),
-                    Err(e) => (
-                        ManagerReply::Refused {
-                            reason: e.to_string(),
-                        },
-                        true,
-                    ),
-                }
+                    .map(|()| ManagerReply::Offered),
+                ManagerCall::ReleaseSlot {
+                    appender_id,
+                    slot,
+                    g,
+                    words,
+                    tails,
+                } => self
+                    .volume
+                    .manager_release_slot_wire(*appender_id, *slot, *g, *words, tails)
+                    .await
+                    .map(|already| ManagerReply::Released { already }),
+                ManagerCall::ResolveSlot { slot } => self.volume.manager_resolve_slot_wire(*slot),
+            };
+        let (reply, refusal, rejected) = match served {
+            Ok(reply) => (reply, false, false),
+            Err(e) => {
+                let rejected = matches!(e, crate::meta_backend::kv::KvError::Rejected(_));
+                (
+                    ManagerReply::Refused {
+                        reason: e.to_string(),
+                    },
+                    true,
+                    rejected,
+                )
             }
-            ManagerCall::OfferSlot {
-                appender_id,
-                slot,
-                to,
-            } => match self
-                .volume
-                .manager_offer_slot_wire(*appender_id, *slot, *to)
-                .await
-            {
-                Ok(()) => (ManagerReply::Offered, false),
-                Err(e) => (
-                    ManagerReply::Refused {
-                        reason: e.to_string(),
-                    },
-                    true,
-                ),
-            },
-            ManagerCall::ReleaseSlot {
-                appender_id,
-                slot,
-                g,
-                words,
-                tails,
-            } => match self
-                .volume
-                .manager_release_slot_wire(*appender_id, *slot, *g, *words, tails)
-                .await
-            {
-                Ok(already) => (ManagerReply::Released { already }, false),
-                Err(e) => (
-                    ManagerReply::Refused {
-                        reason: e.to_string(),
-                    },
-                    true,
-                ),
-            },
-            ManagerCall::ResolveSlot { slot } => match self.volume.manager_resolve_slot_wire(*slot)
-            {
-                Ok(reply) => (reply, false),
-                Err(e) => (
-                    ManagerReply::Refused {
-                        reason: e.to_string(),
-                    },
-                    true,
-                ),
-            },
         };
         let execute_ns = t_execute.elapsed().as_nanos() as u64;
         let t_reply = Instant::now();

@@ -918,6 +918,110 @@ proptest! {
         prop_assert_eq!(clamp_grant_want(0, cap), cap);
     }
 
+    /// Review round 6, Issue 29 — no wire slot word reaches a RAM or
+    /// durable effect unvalidated: the screen a wire `ReleaseSlot` runs
+    /// BEFORE any effect (`appender::screen_release_words`) answers exactly
+    /// the predicate over arbitrary words and bounds — `seq_floor` strictly
+    /// above the grant's and at most the derived frontier bound, `cursor`
+    /// at least the grant's and inside the slot's namespace,
+    /// `slot_tree_extents` inside the volume, `root` the recorded one or a
+    /// node-aligned heap address whose extent the appender's grant holds;
+    /// every refusal names its class; and the derived frontier bound never
+    /// leaves the sane seq space however the page lies (the fuzz target
+    /// `manager_call_frame`'s poisoned-frame arm, on stable).
+    #[test]
+    fn manager_release_words_are_screened_before_any_effect(
+        root_addr in any::<u64>(),
+        root_seq in any::<u64>(),
+        cursor in any::<u64>(),
+        extents in any::<u32>(),
+        seq_floor in any::<u64>(),
+        recorded_floor in 0u64..(1 << 40),
+        page_offset in 0u64..(1 << 40),
+        head_hint in 0u64..(1 << 32),
+        ring_shift in 0u32..6,
+        node_shift in 0u32..7,
+        cursor_recorded in 0u64..=(1 << 40),
+        total in 1u64..(1 << 20),
+        grant_seed in prop::collection::vec(0u64..(1 << 20), 0..32),
+        recorded_extent in 0u64..(1 << 20),
+        recorded_seq in any::<u64>(),
+        use_recorded_root in any::<bool>(),
+    ) {
+        use squeezefs::meta_backend::kv::appender::{
+            release_seq_floor_bound, root_extent_of, screen_release_words, ReleaseWordBounds,
+            SEQ_FRONTIER_SANE_MAX,
+        };
+        use squeezefs::meta_backend::kv::slot_state::ExtentGrantRecord;
+        use squeezefs::slot_lease_core::SlotWords;
+        let node = 4096u64 << node_shift;
+        let heap = 1u64 << 20;
+        let grant = ExtentGrantRecord::from_extents(grant_seed.iter().map(|e| e % total));
+        let bounds = ReleaseWordBounds {
+            seq_floor_recorded: recorded_floor,
+            seq_floor_max: release_seq_floor_bound(
+                page_offset,
+                Some(recorded_floor),
+                head_hint,
+                (512 * 1024) << ring_shift,
+            ),
+            cursor_recorded,
+            cursor_max: 1 << 40,
+            root_recorded: (heap + node * (recorded_extent % total), recorded_seq),
+            heap_base: heap,
+            node_size: node,
+            total_extents: total,
+        };
+        prop_assert!(bounds.seq_floor_max <= SEQ_FRONTIER_SANE_MAX);
+        prop_assert!(bounds.seq_floor_max > bounds.seq_floor_recorded);
+        let words = SlotWords {
+            root: if use_recorded_root { bounds.root_recorded } else { (root_addr, root_seq) },
+            cursor,
+            extents,
+            seq_floor,
+        };
+        let root_ok = words.root == bounds.root_recorded
+            || root_extent_of(words.root.0, &bounds).is_some_and(|e| grant.contains(e));
+        let inside = words.seq_floor > bounds.seq_floor_recorded
+            && words.seq_floor <= bounds.seq_floor_max
+            && words.cursor >= bounds.cursor_recorded
+            && words.cursor <= bounds.cursor_max
+            && u64::from(words.extents) <= bounds.total_extents
+            && root_ok;
+        let verdict = screen_release_words(&words, &bounds, &grant);
+        prop_assert_eq!(verdict.is_ok(), inside, "{:?} against {:?} → {:?}", words, bounds, verdict);
+        if let Err(e) = verdict {
+            prop_assert!(!e.to_string().is_empty());
+        }
+        // The address → extent step: node-aligned heap addresses below the
+        // volume's end and nothing else.
+        match root_extent_of(words.root.0, &bounds) {
+            Some(e) => {
+                prop_assert!(e < total);
+                prop_assert_eq!(heap + e * node, words.root.0);
+            }
+            None => prop_assert!(
+                words.root.0 < heap
+                    || (words.root.0 - heap) % node != 0
+                    || (words.root.0 - heap) / node >= total
+            ),
+        }
+        // The legitimate shape passes: the grant's words with the frontier
+        // the lessee's raise left.
+        let legit = SlotWords {
+            root: bounds.root_recorded,
+            cursor: cursor_recorded,
+            extents: 0,
+            seq_floor: recorded_floor + 1,
+        };
+        prop_assert_eq!(screen_release_words(&legit, &bounds, &grant), Ok(()));
+        // The sane cap holds for any page.
+        prop_assert!(
+            release_seq_floor_bound(u64::MAX, Some(u64::MAX), u64::MAX, u64::MAX)
+                == SEQ_FRONTIER_SANE_MAX
+        );
+    }
+
     /// The cluster wire's `RpcFrame` reader (every distributed plane's
     /// transport) and the S8 verb-body decoders are total over an
     /// arbitrary byte STREAM under every class cap; an arbitrary tag never

@@ -1105,6 +1105,194 @@ pub fn clamp_grant_want(want: u32, cap: u64) -> u64 {
     }
 }
 
+/// The highest record seq any ring of this volume can have stamped: half
+/// the `u64` space. A seq is a ring POSITION plus an offset, positions are
+/// journal bytes, and every offset raise sets a frontier at most one above
+/// another ring's frontier — so the seq space grows by the bytes journaled
+/// plus one per grant, and 2⁶³ journal bytes is provably not a frontier
+/// (review round 6, Issue 29: a frontier past it would saturate every
+/// later stamp to `u64::MAX`, collapsing the leaf fold's per-key LWW to
+/// insertion order and making the next replay skip every window record as
+/// "already materialized").
+pub const SEQ_FRONTIER_SANE_MAX: u64 = u64::MAX / 2;
+
+/// The highest record-seq frontier a WIRE appender can legitimately
+/// present as a release's `seq_floor`, derived from DURABLE state the
+/// manager reads (review round 6, Issue 29 — PR 3's bounded-execution law
+/// for the slot words): its page's `seq_offset` — or the highest floor
+/// this manager granted it plus one, when that grant's raise is not yet on
+/// its page — plus its page's `head_hint`, plus TWICE its ring's length.
+/// The newest durable page is at most one checkpoint stale (the in-flight
+/// write), a ring's head advances at most its length past the tail the
+/// page declared before another checkpoint writes the page again, so two
+/// lengths bound the head at any instant. Capped at
+/// [`SEQ_FRONTIER_SANE_MAX`], so a corrupt page cannot admit an insane
+/// floor either.
+pub fn release_seq_floor_bound(
+    page_seq_offset: u64,
+    granted_floor_max: Option<u64>,
+    head_hint: u64,
+    ring_len: u64,
+) -> u64 {
+    let offset = page_seq_offset.max(granted_floor_max.map_or(0, |f| f.saturating_add(1)));
+    offset
+        .saturating_add(head_hint)
+        .saturating_add(ring_len.saturating_mul(2))
+        .min(SEQ_FRONTIER_SANE_MAX)
+}
+
+/// The DURABLE / derived state a wire release's slot words are screened
+/// against ([`screen_release_words`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseWordBounds {
+    /// The grant-time floor (the lease's recorded `seq_floor`): the
+    /// lessee's offset raise put its next stamp at `floor + 1` at the
+    /// least, so a legitimate frontier is STRICTLY above it — and a floor
+    /// at or below it would leave ring 0 stamping below the departing
+    /// ring's records (the Issue-28 find's shape).
+    pub seq_floor_recorded: u64,
+    /// [`release_seq_floor_bound`]'s value: the highest frontier the
+    /// departing ring can have reached.
+    pub seq_floor_max: u64,
+    /// The grant-time cursor: a mint cursor is never lowered (§5.1.8 — a
+    /// remount installs tree 0's value as the slot's floor, so a lower
+    /// one would re-mint live inos).
+    pub cursor_recorded: u64,
+    /// The slot's local-ino ceiling (`GUEST_NS_BASE`: a guest local is 40
+    /// bits — the routing namespace's own bound).
+    pub cursor_max: u64,
+    /// The grant-time root — accepted verbatim (a lessee that moved
+    /// nothing).
+    pub root_recorded: (u64, u64),
+    /// The heap's first byte and the node size: a root is a node-aligned
+    /// heap address.
+    pub heap_base: u64,
+    pub node_size: u64,
+    /// The volume's extent count: a root's extent lies inside it, and
+    /// `slot_tree_extents` never exceeds it.
+    pub total_extents: u64,
+}
+
+/// Why a wire release's slot words are REJECTED (`manager_verb_rejected`
+/// — the buggy/hostile-peer class, kept off the must-stay-0 witness
+/// gauge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseWordRefusal {
+    /// `seq_floor` at or below the grant's floor.
+    SeqFloorBelowGrant { floor: u64, recorded: u64 },
+    /// `seq_floor` above what the departing ring can have stamped.
+    SeqFloorAboveBound { floor: u64, bound: u64 },
+    /// `cursor` below the grant's cursor.
+    CursorBelowGrant { cursor: u64, recorded: u64 },
+    /// `cursor` past the slot's local-ino namespace.
+    CursorAboveNamespace { cursor: u64, max: u64 },
+    /// `slot_tree_extents` past the volume.
+    ExtentsAboveVolume { extents: u32, total: u64 },
+    /// `root` neither the recorded root nor a node-aligned heap address
+    /// whose extent the appender's grant record holds.
+    RootOutsideGrant { addr: u64 },
+}
+
+impl std::fmt::Display for ReleaseWordRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SeqFloorBelowGrant { floor, recorded } => write!(
+                f,
+                "seq_floor {floor} is not above the grant's floor {recorded}"
+            ),
+            Self::SeqFloorAboveBound { floor, bound } => write!(
+                f,
+                "seq_floor {floor} is above the departing ring's derived frontier bound {bound}"
+            ),
+            Self::CursorBelowGrant { cursor, recorded } => {
+                write!(f, "cursor {cursor} is below the grant's cursor {recorded}")
+            }
+            Self::CursorAboveNamespace { cursor, max } => {
+                write!(
+                    f,
+                    "cursor {cursor} is past the slot's local-ino namespace {max}"
+                )
+            }
+            Self::ExtentsAboveVolume { extents, total } => write!(
+                f,
+                "slot_tree_extents {extents} exceeds the volume's {total} extents"
+            ),
+            Self::RootOutsideGrant { addr } => write!(
+                f,
+                "root {addr:#x} is neither the grant's root nor a node inside the appender's \
+                 extent grant"
+            ),
+        }
+    }
+}
+
+/// The extent index of a node-aligned heap address under `bounds`, or
+/// `None` for an address below the heap, off the node grid, or past the
+/// volume.
+pub fn root_extent_of(addr: u64, bounds: &ReleaseWordBounds) -> Option<u64> {
+    if bounds.node_size == 0 || addr < bounds.heap_base {
+        return None;
+    }
+    let off = addr - bounds.heap_base;
+    if off % bounds.node_size != 0 {
+        return None;
+    }
+    let extent = off / bounds.node_size;
+    (extent < bounds.total_extents).then_some(extent)
+}
+
+/// Screen a wire release's slot words against the durable / derived
+/// bounds BEFORE any RAM or durable effect (review round 6, Issue 29):
+/// `seq_floor` strictly above the grant's floor and at most the derived
+/// frontier bound; `cursor` at least the grant's and inside the slot's
+/// namespace; `slot_tree_extents` inside the volume; `root` the recorded
+/// one verbatim, or a node-aligned heap address whose extent `grant`
+/// holds (the header at that address is the caller's second witness —
+/// I/O, so not here). Pure over the integers, allocation-free; fuzzed by
+/// `manager_call_frame`, mirrored in `decoder_property_tests`.
+pub fn screen_release_words(
+    words: &crate::slot_lease_core::SlotWords,
+    bounds: &ReleaseWordBounds,
+    grant: &super::slot_state::ExtentGrantRecord,
+) -> Result<(), ReleaseWordRefusal> {
+    if words.seq_floor <= bounds.seq_floor_recorded {
+        return Err(ReleaseWordRefusal::SeqFloorBelowGrant {
+            floor: words.seq_floor,
+            recorded: bounds.seq_floor_recorded,
+        });
+    }
+    if words.seq_floor > bounds.seq_floor_max {
+        return Err(ReleaseWordRefusal::SeqFloorAboveBound {
+            floor: words.seq_floor,
+            bound: bounds.seq_floor_max,
+        });
+    }
+    if words.cursor < bounds.cursor_recorded {
+        return Err(ReleaseWordRefusal::CursorBelowGrant {
+            cursor: words.cursor,
+            recorded: bounds.cursor_recorded,
+        });
+    }
+    if words.cursor > bounds.cursor_max {
+        return Err(ReleaseWordRefusal::CursorAboveNamespace {
+            cursor: words.cursor,
+            max: bounds.cursor_max,
+        });
+    }
+    if u64::from(words.extents) > bounds.total_extents {
+        return Err(ReleaseWordRefusal::ExtentsAboveVolume {
+            extents: words.extents,
+            total: bounds.total_extents,
+        });
+    }
+    if words.root != bounds.root_recorded
+        && !root_extent_of(words.root.0, bounds).is_some_and(|e| grant.contains(e))
+    {
+        return Err(ReleaseWordRefusal::RootOutsideGrant { addr: words.root.0 });
+    }
+    Ok(())
+}
+
 /// Why a RAM grant refuses to drop an extent for a return
 /// ([`RegionGrant::drop_returned`]): it holds a live image, or its free is
 /// still parked on the region's tail.

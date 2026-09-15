@@ -3404,7 +3404,11 @@ impl KvMetaBackend {
                         // structural custody (review round 5, Issue 28:
                         // a merge's parent flips stamped below the
                         // lessee's split pointers were SHADOWED by the
-                        // leaf fold and routed to retired leaves).
+                        // leaf fold and routed to retired leaves). A slot
+                        // the manager itself released names a ring-0
+                        // frontier this ring has reached: a no-op, or one
+                        // seq of gap when nothing was stamped since —
+                        // harmless, seqs need only be monotone.
                         self.ring.raise_seq_floor(seq_floor);
                         crate::slot_lease_core::SlotLease::unleased(
                             g,
@@ -3955,16 +3959,21 @@ impl KvMetaBackend {
     /// is window-scoped, never ordered): a slot handed to another appender
     /// while its records sit in ring 0's window would refuse that open.
     /// The handover's post-condition law (`flush_slot_clear_of_region`)
-    /// for the manager's side; bounded, loud on a stuck tail. Nothing can
-    /// add to a cleared slot before the grant: SMOs need the mutex this
-    /// caller holds, content needs a first-touch acquire that would make
-    /// the slot the manager's and refuse the grant (Issue 28).
+    /// for the manager's side, bounded at `COVER_CYCLES_MAX` (Issue 30 —
+    /// the one law's one constant). At the bound: a tail that MOVED and
+    /// still holds the slot is a schedule (a slow device, a long in-flight
+    /// stage-B window) — the grant is DEFERRED, retryable, nothing
+    /// written, counted `slot_grant_deferrals`; a tail that did not move
+    /// at all is the stuck-reservation class (`Corrupt`). Nothing can add
+    /// to a cleared slot before the grant: SMOs need the mutex this caller
+    /// holds, content needs a first-touch acquire that would make the slot
+    /// the manager's and refuse the grant (Issue 28).
     async fn clear_ring0_window_of_unleased(
         &self,
         smo: &mut super::tree::SmoContext,
         explicit: &[super::record::ForestSlot],
     ) -> std::result::Result<(), KvError> {
-        const CLEAR_CYCLES_MAX: u32 = 64;
+        use super::checkpoint::COVER_CYCLES_MAX;
         let Some(plane) = self.slot_leases() else {
             return Ok(());
         };
@@ -3976,7 +3985,8 @@ impl KvMetaBackend {
                 .filter(|s| !plane.gate.is_leased(*s) && !plane.gate.is_foreign(*s))
                 .collect()
         };
-        for cycle in 0..=CLEAR_CYCLES_MAX {
+        let tail_start = self.ring.core().reusable_upto();
+        for cycle in 0..=COVER_CYCLES_MAX {
             let tail = self.ring.core().reusable_upto();
             let slots = pending(tail);
             if slots.is_empty() {
@@ -3989,13 +3999,32 @@ impl KvMetaBackend {
                 }
                 return Ok(());
             }
-            if cycle == CLEAR_CYCLES_MAX {
-                return Err(KvError::Corrupt(format!(
-                    "{}: ring 0's window did not clear of unleased slot(s) {slots:?} in \
-                     {CLEAR_CYCLES_MAX} checkpoint cycles (tail {tail}) — a stuck tail is a \
-                     defect, never a longer wait",
+            if cycle == COVER_CYCLES_MAX {
+                let slot = slots[0];
+                let frontier = self.cache.slot_record_frontier(slot);
+                if tail == tail_start {
+                    return Err(KvError::Corrupt(format!(
+                        "{}: ring 0's tail did not move in {COVER_CYCLES_MAX} barriered \
+                         checkpoint cycles (stuck at {tail}) while unleased slot(s) {slots:?} \
+                         hold records above it (frontier {frontier}) — a stuck tail is a \
+                         defect, never a longer wait",
+                        self.path.display()
+                    )));
+                }
+                plane.grant_deferrals.fetch_add(1, Ordering::Relaxed);
+                log::warn!(
+                    "meta volume {}: grant of unleased slot(s) {slots:?} deferred — ring 0's \
+                     window still holds their records after {COVER_CYCLES_MAX} barriered cycles \
+                     (frontier {frontier}, tail {tail_start} → {tail}); the requester retries",
                     self.path.display()
-                )));
+                );
+                return Err(KvError::GrantDeferred {
+                    slot,
+                    cycles: COVER_CYCLES_MAX,
+                    frontier,
+                    tail_start,
+                    tail,
+                });
             }
             self.checkpoint_cycle(smo, true).await?;
         }
@@ -4309,12 +4338,72 @@ impl KvMetaBackend {
         self.sync_device().await.map_err(KvError::Io)
     }
 
+    /// A wire frame's `appender_id`, screened against the DIRECTORY before
+    /// any RAM or durable effect (review round 6, Issue 29 — the slot
+    /// words' law applied to the identity every slot verb carries): the
+    /// id must name a `Live` page and never one of this mount's own
+    /// regions (a wire peer is not this process; a frame naming the
+    /// manager's or a declared region's id would drive their RAM grant and
+    /// gate). Anything else is REJECTED (`manager_verb_rejected`, the
+    /// buggy/hostile-peer class), nothing written. Answers the page — the
+    /// release screen's durable witness.
+    async fn wire_appender_page(
+        &self,
+        set: &super::appender::AppenderSet,
+        appender_id: u32,
+        verb: &str,
+    ) -> std::result::Result<super::appender::AppenderPage, KvError> {
+        if set.region(appender_id).is_some() {
+            set.verbs.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err(KvError::Rejected(format!(
+                "{}: {verb} from the wire names appender {appender_id}, one of this mount's own \
+                 regions — a wire peer never is (manager_verb_rejected)",
+                self.path.display()
+            )));
+        }
+        let entries = super::appender::read_directory(&self.path, &self.sb).await?;
+        let live = entries.into_iter().find_map(|e| {
+            e.page.filter(|p| {
+                p.appender_id == appender_id && p.state == super::appender::AppenderState::Live
+            })
+        });
+        live.ok_or_else(|| {
+            set.verbs.rejected.fetch_add(1, Ordering::Relaxed);
+            KvError::Rejected(format!(
+                "{}: {verb} from the wire names appender {appender_id}, which holds no Live \
+                 directory page (manager_verb_rejected)",
+                self.path.display()
+            ))
+        })
+    }
+
+    /// Whether `id` names an appender this manager knows: one of its own
+    /// regions or a `Live` directory page (`OfferSlot`'s `to`).
+    async fn appender_known(
+        &self,
+        set: &super::appender::AppenderSet,
+        id: u32,
+    ) -> std::result::Result<bool, KvError> {
+        if set.region(id).is_some() {
+            return Ok(true);
+        }
+        let entries = super::appender::read_directory(&self.path, &self.sb).await?;
+        Ok(entries.iter().any(|e| {
+            e.page.as_ref().is_some_and(|p| {
+                p.appender_id == id && p.state == super::appender::AppenderState::Live
+            })
+        }))
+    }
+
     /// The wire face of [`Self::manager_acquire_slots`].
     pub async fn manager_acquire_slots_wire(
         &self,
         appender_id: u32,
         want: u16,
     ) -> std::result::Result<(Vec<crate::meta_ship::manager::WireSlotGrant>, bool), KvError> {
+        let set = self.manager_gate(false)?;
+        self.wire_appender_page(set, appender_id, "AcquireSlots")
+            .await?;
         let grants = self
             .manager_acquire_slots(appender_id, want, &[], ControlAdmit::Try)
             .await?;
@@ -4448,6 +4537,9 @@ impl KvMetaBackend {
         slot: u16,
     ) -> std::result::Result<crate::meta_ship::manager::ManagerReply, KvError> {
         use crate::meta_ship::manager::{ManagerReply, WireSlotGrant};
+        let set = self.manager_gate(false)?;
+        self.wire_appender_page(set, appender_id, "AcquireSlot")
+            .await?;
         let fslot = self.forest_slot_of_routing(slot);
         Ok(match self.manager_acquire_slot(appender_id, fslot).await? {
             AcquireSlotReply::Granted(g) | AcquireSlotReply::Already(g) => {
@@ -4505,13 +4597,33 @@ impl KvMetaBackend {
             })
     }
 
-    /// The wire face of [`Self::manager_offer_slot`].
+    /// The wire face of [`Self::manager_offer_slot`]: the offering holder
+    /// is a wire appender with a `Live` page, `to` an appender this
+    /// manager knows and not the holder itself — else REJECTED (Issue 29;
+    /// an offer to nobody would hold the slot `Offered` against every
+    /// other requester for a beat).
     pub async fn manager_offer_slot_wire(
         &self,
         appender_id: u32,
         slot: u16,
         to: u32,
     ) -> std::result::Result<(), KvError> {
+        let set = self.manager_gate(false)?;
+        self.wire_appender_page(set, appender_id, "OfferSlot")
+            .await?;
+        if to == appender_id || !self.appender_known(set, to).await? {
+            set.verbs.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err(KvError::Rejected(format!(
+                "{}: OfferSlot from appender {appender_id} names appender {to} as the offeree — \
+                 {} (manager_verb_rejected)",
+                self.path.display(),
+                if to == appender_id {
+                    "the holder itself"
+                } else {
+                    "no region of this mount and no Live directory page"
+                }
+            )));
+        }
         let fslot = self.forest_slot_of_routing(slot);
         self.manager_offer_slot(appender_id, fslot, to).await
     }
@@ -4622,11 +4734,16 @@ impl KvMetaBackend {
         // a position in ring 0 (reset to its head — the departing ring's
         // positions are not comparable; a grant's clearing would otherwise
         // wait on them, Issue 22's law on the release side), and the gate
-        // no longer reads the slot as another appender's.
-        self.ring.raise_seq_floor(words.seq_floor);
-        self.cache
-            .reset_slot_record_frontier(slot, self.ring.core().head());
-        plane.gate.clear_foreign(slot);
+        // no longer reads the slot as another appender's. The manager's
+        // OWN release moves nothing between rings: its floor IS ring 0's
+        // frontier (the raise would only open a one-seq gap — Issue 30),
+        // its frontier already a ring-0 position, its slot never foreign.
+        if appender_id != 0 {
+            self.ring.raise_seq_floor(words.seq_floor);
+            self.cache
+                .reset_slot_record_frontier(slot, self.ring.core().head());
+            plane.gate.clear_foreign(slot);
+        }
         plane.clear_recall(appender_id, slot);
         plane.holders.forget(slot);
         match plane
@@ -4669,7 +4786,25 @@ impl KvMetaBackend {
         Ok(false)
     }
 
-    /// The wire face of [`Self::manager_release_slot`].
+    /// The wire face of [`Self::manager_release_slot`]: every slot word
+    /// the frame carries is screened against DURABLE / derived state
+    /// BEFORE any RAM or durable effect (review round 6, Issue 29 — PR 3's
+    /// bounded-execution law; round 5 made `seq_floor` act on ring 0's
+    /// seq space immediately, `cursor` is the slot's never-lowered ino
+    /// floor at the next grant, `root` overwrites tree 0's). The witness
+    /// is the appender's own `Live` page — its `seq_offset`, `head_hint`
+    /// and ring length derive the frontier bound (`release_seq_floor_
+    /// bound`, with the floors this manager granted it) — the lease's
+    /// recorded words, the volume's geometry and the appender's grant
+    /// record; a `root` other than the recorded one must ALSO decode as a
+    /// node header at its address carrying the word's incarnation stamp
+    /// (one 4 KiB read — the price). A word outside its bound is REJECTED
+    /// (`manager_verb_rejected`, `STATUS_REJECTED`), nothing written; `g`
+    /// stays the witness check's (`check_release` — a `g` other than the
+    /// lease's is the durable witness contradicting the caller,
+    /// `STATUS_REFUSED`). A frame naming a slot this appender does not
+    /// hold reaches the witness check unscreened: it refuses before any
+    /// effect, and there is no recorded lease to screen against.
     pub async fn manager_release_slot_wire(
         &self,
         appender_id: u32,
@@ -4678,10 +4813,87 @@ impl KvMetaBackend {
         words: crate::meta_ship::manager::WireSlotWords,
         tails: &[(u64, u32)],
     ) -> std::result::Result<bool, KvError> {
+        use super::appender::{release_seq_floor_bound, screen_release_words, ReleaseWordBounds};
+        let set = self.manager_gate(true)?;
+        let page = self
+            .wire_appender_page(set, appender_id, "ReleaseSlot")
+            .await?;
+        let fslot = self.forest_slot_of_routing(slot);
+        let words: crate::slot_lease_core::SlotWords = words.into();
+        let plane = Arc::clone(set.slot_leases().ok_or_else(|| {
+            KvError::Busy(format!(
+                "{}: the symmetric plane is not armed — no slot lease exists",
+                self.path.display()
+            ))
+        })?);
+        let held = plane.table.get(fslot).filter(|l| {
+            l.holder == appender_id && l.state != crate::slot_lease_core::LeaseState::Unleased
+        });
+        if let Some(lease) = held {
+            let granted_floor_max = plane
+                .table
+                .held_by(appender_id)
+                .into_iter()
+                .filter_map(|s| plane.table.get(s))
+                .map(|l| l.words.seq_floor)
+                .max();
+            let ring_len: u64 = page
+                .segments
+                .iter()
+                .fold(0u64, |n, s| n.saturating_add(s.len));
+            let cfg = self.cache.config();
+            let bounds = ReleaseWordBounds {
+                seq_floor_recorded: lease.words.seq_floor,
+                seq_floor_max: release_seq_floor_bound(
+                    page.seq_offset,
+                    granted_floor_max,
+                    page.head_hint,
+                    ring_len,
+                ),
+                cursor_recorded: lease.words.cursor,
+                cursor_max: crate::meta_backend::GUEST_NS_BASE,
+                root_recorded: lease.words.root,
+                heap_base: cfg.heap_base,
+                node_size: cfg.layout.node_size() as u64,
+                total_extents: self.alloc.total_extents(),
+            };
+            let grant = self.extent_grant_record(appender_id).await?;
+            let reject = |why: String| {
+                set.verbs.rejected.fetch_add(1, Ordering::Relaxed);
+                KvError::Rejected(format!(
+                    "{}: ReleaseSlot {fslot} from appender {appender_id} rejected — {why} \
+                     (manager_verb_rejected)",
+                    self.path.display()
+                ))
+            };
+            if let Err(e) = screen_release_words(&words, &bounds, &grant) {
+                return Err(reject(e.to_string()));
+            }
+            if words.root != lease.words.root {
+                // The second witness: the address holds a node image whose
+                // incarnation stamp is the word's (a lessee's SMO wrote it
+                // and flushed before the release).
+                match super::node::read_node_header(&self.path, words.root.0).await {
+                    Ok(h) if h.node_seq == words.root.1 && h.tree_id == 0 => {}
+                    Ok(h) => {
+                        return Err(reject(format!(
+                            "root {:#x} holds a node stamped seq {} (tree id {}), not the \
+                             word's seq {}",
+                            words.root.0, h.node_seq, h.tree_id, words.root.1
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(reject(format!(
+                            "root {:#x} holds no readable node header: {e}",
+                            words.root.0
+                        )));
+                    }
+                }
+            }
+        }
         // Any count: the release site records the set inline or spilled
         // (the wire frame's own class cap bounds what arrives).
-        let fslot = self.forest_slot_of_routing(slot);
-        self.manager_release_slot(appender_id, fslot, words.into(), g, tails.to_vec())
+        self.manager_release_slot(appender_id, fslot, words, g, tails.to_vec())
             .await
     }
 
@@ -5045,8 +5257,8 @@ impl KvMetaBackend {
         region: &super::appender::AppenderRegion,
         slot: super::record::ForestSlot,
     ) -> std::result::Result<(), KvError> {
-        const HANDOVER_FLUSH_CYCLES_MAX: u32 = 64;
-        for cycle in 1..=HANDOVER_FLUSH_CYCLES_MAX {
+        use super::checkpoint::COVER_CYCLES_MAX;
+        for cycle in 1..=COVER_CYCLES_MAX {
             self.checkpoint_now().await?;
             if let Some(forest) = self.forest() {
                 if let Some(tree) = forest.tree(slot) {
@@ -5070,7 +5282,7 @@ impl KvMetaBackend {
         }
         Err(KvError::Corrupt(format!(
             "{}: slot {slot}'s records did not clear appender {}'s window in \
-             {HANDOVER_FLUSH_CYCLES_MAX} checkpoint cycles (frontier {}, tail {}) — a stuck \
+             {COVER_CYCLES_MAX} checkpoint cycles (frontier {}, tail {}) — a stuck \
              tail is a defect, never a longer wait",
             self.path.display(),
             region.id,
@@ -11084,12 +11296,12 @@ impl KvMetaBackend {
     /// — convergence is bounded by the SMO cascade height; the bound is
     /// defensive and a stuck tail fails the mount loud.
     pub async fn cover_bring_up_residue(&self) -> std::result::Result<(), KvError> {
-        // The preclaim-recovery bound, not the shutdown fixpoint's 16: a
+        // The cover bound, not the shutdown fixpoint's 16: a
         // crash-remount's residue includes the whole replay window (the
         // wedged pinned-floor shapes recover HERE now — remount IS
         // recovery), and every cycle is progress-audited (clause b), so
         // a genuine wedge fails loud long before the bound.
-        const BRING_UP_COVER_CYCLES: u32 = 64;
+        use super::checkpoint::COVER_CYCLES_MAX;
         if self.read_only {
             return Ok(());
         }
@@ -11103,7 +11315,7 @@ impl KvMetaBackend {
             }
         }
         let mut smo = self.smo.lock().await;
-        for _ in 0..BRING_UP_COVER_CYCLES {
+        for _ in 0..COVER_CYCLES_MAX {
             self.checkpoint_cycle(&mut smo, true).await?;
             let core = self.ring.core();
             if core.head() == core.reusable_upto() {
@@ -11112,7 +11324,7 @@ impl KvMetaBackend {
         }
         Err(KvError::Corrupt(format!(
             "{}: bring-up journal residue did not cover within \
-             {BRING_UP_COVER_CYCLES} barriered cycles (head={}, reusable_upto={}) — \
+             {COVER_CYCLES_MAX} barriered cycles (head={}, reusable_upto={}) — \
              refusing to serve with a reclaimable tail (the D1.b wedge-crumb class)",
             self.path.display(),
             self.ring.core().head(),
@@ -12787,7 +12999,7 @@ impl KvMetaBackend {
     /// genuinely wedged tail fails loud long before the bound with a
     /// named cause — never a 30 s-per-rung silent park.
     async fn preclaim_ring_recovery(&self) -> std::result::Result<(), KvError> {
-        const PRECLAIM_RECOVERY_CYCLES: u32 = 64;
+        use super::checkpoint::COVER_CYCLES_MAX;
         // One max-size user entry, clamped to what this ring can EVER
         // admit (a floor-size ring's user slice is slightly under
         // MAX_ENTRY_LEN once page-header slots are excluded — the clamp
@@ -12811,7 +13023,7 @@ impl KvMetaBackend {
             core.reusable_upto(),
         );
         let mut smo = self.smo.lock().await;
-        for cycle in 0..PRECLAIM_RECOVERY_CYCLES {
+        for cycle in 0..COVER_CYCLES_MAX {
             self.checkpoint_cycle(&mut smo, true).await?;
             if let Some(adm) = preflight() {
                 self.ring.core().release(adm);
@@ -12825,7 +13037,7 @@ impl KvMetaBackend {
         }
         Err(KvError::Corrupt(format!(
             "{}: pre-claim ring recovery did not reclaim admissible space within \
-             {PRECLAIM_RECOVERY_CYCLES} barriered cycles (head={}, reusable_upto={}) — \
+             {COVER_CYCLES_MAX} barriered cycles (head={}, reusable_upto={}) — \
              the durable tail is wedged below the replay window",
             self.path.display(),
             self.ring.core().head(),

@@ -3297,6 +3297,12 @@ impl KvMetaBackend {
         self.forest().and_then(|f| f.tree(slot))
     }
 
+    /// Every slot tree that exists on this volume in slot order (empty on
+    /// a flat volume) — the per-slot probe contracts' census (PR 7).
+    pub fn slot_trees(&self) -> Vec<(super::record::ForestSlot, Arc<KvTree>)> {
+        self.forest().map(|f| f.slot_trees()).unwrap_or_default()
+    }
+
     /// The Slot-lease family (§11), `None` unarmed.
     pub fn slot_lease_stats(&self) -> Option<super::slot_lease::SlotLeaseStats> {
         let plane = self.slot_leases()?;

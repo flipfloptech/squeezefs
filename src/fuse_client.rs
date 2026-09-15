@@ -6474,6 +6474,11 @@ pub struct Metrics {
     /// clip nested share) never count. **Must stay 0** — the live
     /// tripwire (`pack_tenant_overlap_findings` in the design's table).
     pub fsck_tenant_overlap_findings: Align64<AtomicU64>,
+    /// C16 (design-symmetric-metadata §5.8.5, PR 7): confirmed shared-
+    /// index drift — a SHARED-flagged reference the index home does not
+    /// name, or an entry whose ino holds no SHARED reference. Report-only;
+    /// 0 on every healthy set and on every mount without an armed forest.
+    pub fsck_shared_index_drift: Align64<AtomicU64>,
     /// `fsck_repair_classC12` — **structurally 0**, the C8 posture: two
     /// overlapping tenants means at least one is wrong and nothing on the
     /// volume says which, so the class is reported and never
@@ -11714,6 +11719,7 @@ impl SqueezefsFilesystem {
                 // PK5 — C12 (tenant-range consistency): the must-stay-0
                 // tripwire and the structurally-0 repair gauge (report-only).
                 "fsck_tenant_overlap_findings": METRICS.fsck_tenant_overlap_findings.load(Ordering::Relaxed),
+                "fsck_shared_index_drift": METRICS.fsck_shared_index_drift.load(Ordering::Relaxed),
                 "fsck_repair_classC12": METRICS.fsck_repair_class_c12.load(Ordering::Relaxed),
                 // Symmetric PR 3 — C13 (orphan image extent): returned
                 // grant extents; 0 on every flat volume.

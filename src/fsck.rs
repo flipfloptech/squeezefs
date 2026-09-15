@@ -689,6 +689,21 @@ pub enum FindingId {
         appender: u32,
         extent: u64,
     },
+    /// C16 (design-symmetric-metadata §5.8.5, PR 7): **shared-index
+    /// drift** — a SHARED-flagged reference the index home does not name
+    /// (source or target ino), or an index entry whose ino holds no SHARED
+    /// reference. Report-only, the C8 posture: the flag and the index are
+    /// two durable homes of one fact, and restating one from the other
+    /// would erase the evidence of which side lied.
+    C16SharedIndexDrift {
+        vol_tag: u64,
+        block_idx: u64,
+        owner_ino: u64,
+        block_index: u32,
+        /// `true` = a flag without an entry; `false` = an entry without a
+        /// flag.
+        flag_side: bool,
+    },
 }
 
 /// The §10 `fsck_*` / `scrub_*` counter families, per run (the process
@@ -809,6 +824,10 @@ pub struct FsckCounters {
     /// grain, or undecodable). **Must stay 0** on healthy volumes: the
     /// live `fsck_tenant_overlap_findings` tripwire.
     pub tenant_overlap_findings: u64,
+    /// C16 (design-symmetric-metadata §5.8.5, PR 7): confirmed shared-
+    /// index drift findings — report-only; the live
+    /// `fsck_shared_index_drift` gauge. 0 on every healthy set.
+    pub shared_index_drift: u64,
     pub findings: u64,
     pub scan_secs: u64,
     pub scrub_blocks_scanned: u64,
@@ -1461,6 +1480,14 @@ enum SuspectKind {
         appender: u32,
         extent: u64,
     },
+    /// C16: shared-index drift (design-symmetric-metadata §5.8.5, PR 7).
+    C16SharedIndexDrift {
+        vol_tag: u64,
+        block_idx: u64,
+        owner_ino: u64,
+        block_index: u32,
+        flag_side: bool,
+    },
 }
 
 /// One referencer's device window on its block, as C12 judges it:
@@ -1790,6 +1817,11 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
             // of the appender grants — a per-volume question over the
             // whole tree population, so unsharded like C8.
             evaluate_c13(ctx, &mut suspects).await;
+            // C16 (design §5.8.5, PR 7): shared-index drift — the
+            // flag side and the index side of one data volume's shared
+            // blocks; unsharded like C8 (the ONE-walk census PR 1 owed is
+            // still per kind, so the class rides C8's pass beside it).
+            evaluate_c16(ctx, &mut suspects).await;
         }
 
         // C9 (the class design-cow-kv-metadata §4.10a owed): live
@@ -2006,6 +2038,7 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         counters.map_run_foreign_shadows += r.counters.map_run_foreign_shadows;
         counters.crossing_exempted += r.counters.crossing_exempted;
         counters.tenant_overlap_findings += r.counters.tenant_overlap_findings;
+        counters.shared_index_drift += r.counters.shared_index_drift;
         counters.scrub_blocks_scanned += r.counters.scrub_blocks_scanned;
         counters.scrub_bytes_scanned += r.counters.scrub_bytes_scanned;
         counters.scrub_aead_verified += r.counters.scrub_aead_verified;
@@ -2084,6 +2117,7 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     // C12 rides the finalize like C8 (the merged mapping list is the one
     // whole census; shards judge no tenant ranges).
     dst.tenant_overlap_findings += fin.tenant_overlap_findings;
+    dst.shared_index_drift += fin.shared_index_drift;
     // **The inode plane's counters are the union of the ADMITTED shards
     // and this finalize** (KD-PV-16, §5.8.2 F4 — the premise that the
     // plane "exists only here" is what that decision retires). The two
@@ -2548,6 +2582,7 @@ pub async fn run_fleet(
             &mut fin_suspects,
         );
         evaluate_c8(ctx, &mut fin_suspects).await;
+        evaluate_c16(ctx, &mut fin_suspects).await;
         // C12 over the fleet-merged mapping list — the one place a pair of
         // tenants split across two members' residues meets.
         evaluate_c12_tenant_ranges(&census, &mut fin_suspects);
@@ -2825,6 +2860,7 @@ fn fold_worker_counters(dst: &mut FsckCounters, src: &FsckCounters) {
     dst.pack_ledger_exempted += src.pack_ledger_exempted;
     dst.foreign_lane_exempted += src.foreign_lane_exempted;
     dst.tenant_overlap_findings += src.tenant_overlap_findings;
+    dst.shared_index_drift += src.shared_index_drift;
     dst.scrub_blocks_scanned += src.scrub_blocks_scanned;
     dst.scrub_bytes_scanned += src.scrub_bytes_scanned;
     dst.scrub_aead_verified += src.scrub_aead_verified;
@@ -3939,6 +3975,42 @@ async fn evaluate_c13(ctx: &FsckCtx, suspects: &mut Vec<Suspect>) {
     }
 }
 
+/// C16 nomination (design-symmetric-metadata §5.8.5, PR 7): per data
+/// volume, the shared-index drift census — the SHARED flags of every
+/// mounted meta volume against the index home's entries. Empty on a set
+/// without a forest home (the census returns nothing to compare).
+async fn evaluate_c16(ctx: &FsckCtx, suspects: &mut Vec<Suspect>) {
+    for (vol_tag, _alloc) in ctx.router.backend_router.durable_ref_volumes() {
+        match crate::meta_backend::kv::shared_refs::shared_index_drift(&ctx.meta, vol_tag).await {
+            Ok(drift) => {
+                for d in drift {
+                    let (r, flag_side) = match d {
+                        crate::meta_backend::kv::shared_refs::SharedIndexDrift::FlagWithoutEntry(
+                            r,
+                        ) => (r, true),
+                        crate::meta_backend::kv::shared_refs::SharedIndexDrift::EntryWithoutFlag(
+                            r,
+                        ) => (r, false),
+                    };
+                    suspects.push(Suspect {
+                        kind: SuspectKind::C16SharedIndexDrift {
+                            vol_tag,
+                            block_idx: r.block_idx,
+                            owner_ino: r.owner_ino,
+                            block_index: r.block_index,
+                            flag_side,
+                        },
+                    });
+                }
+            }
+            Err(e) => log::warn!(
+                "fsck C16: shared-index drift census failed for data volume {vol_tag:#x}: {e} \
+                 (no verdict recorded — the class is skipped for this volume, never guessed)"
+            ),
+        }
+    }
+}
+
 /// One owner's tree-7 record count, paged (`block_map_range`, the same
 /// primitive the shared extraction rides) — C11's evidence unit. A
 /// decode failure ends the count at what was read (conservative; C1's
@@ -4756,6 +4828,11 @@ async fn recheck_suspects(
         usize,
         Option<Vec<crate::meta_backend::kv::backend::OrphanImageExtent>>,
     > = HashMap::new();
+    // C16's fresh census, ONCE per data volume (the same law).
+    let mut c16_fresh: HashMap<
+        u64,
+        Option<Vec<crate::meta_backend::kv::shared_refs::SharedIndexDrift>>,
+    > = HashMap::new();
     for s in pending {
         if opts.cancel.load(Ordering::Relaxed) {
             break;
@@ -5041,6 +5118,74 @@ async fn recheck_suspects(
                         vol: *vol,
                         appender: *appender,
                         extent: *extent,
+                    }),
+                })
+            }
+            SuspectKind::C16SharedIndexDrift {
+                vol_tag,
+                block_idx,
+                owner_ino,
+                block_index,
+                flag_side,
+            } => {
+                // Verify-before-report: ONE fresh census per data volume for
+                // the confirm pass (the C8/C13 shape); a drift a clone's
+                // steps 1–3 were mid-way through at the nomination has
+                // closed by now and clears.
+                let fresh = match c16_fresh.entry(*vol_tag) {
+                    std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(v) => v.insert(
+                        crate::meta_backend::kv::shared_refs::shared_index_drift(
+                            &ctx.meta, *vol_tag,
+                        )
+                        .await
+                        .ok(),
+                    ),
+                };
+                let still = fresh.as_ref().is_some_and(|d| {
+                    d.iter().any(|x| {
+                        let (r, side) = match x {
+                            crate::meta_backend::kv::shared_refs::SharedIndexDrift::FlagWithoutEntry(r) => (r, true),
+                            crate::meta_backend::kv::shared_refs::SharedIndexDrift::EntryWithoutFlag(r) => (r, false),
+                        };
+                        side == *flag_side
+                            && r.block_idx == *block_idx
+                            && r.owner_ino == *owner_ino
+                            && r.block_index == *block_index
+                    })
+                });
+                if !still {
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                counters.shared_index_drift += 1;
+                Some(FsckFinding {
+                    class: "C16".to_string(),
+                    object: format!("{vol_tag:#x}:{block_idx}/ino{owner_ino}#{block_index}"),
+                    evidence: if *flag_side {
+                        format!(
+                            "shared-index drift: ino {owner_ino}'s reference to block \
+                             {block_idx} (map index {block_index}) carries SHARED but the index \
+                             home names no entry for it, stable across two censuses — a clone \
+                             that died between its MarkShared and its ShareBlock, or a lost \
+                             index entry. REPORT-ONLY: the block's terminal free consults the \
+                             index and frees it when nothing remains"
+                        )
+                    } else {
+                        format!(
+                            "shared-index drift: the index home names ino {owner_ino} on block \
+                             {block_idx} (map index {block_index}) but that ino holds no SHARED \
+                             reference to it, stable across two censuses — a cloner that died \
+                             after its ShareBlock and before its publish. REPORT-ONLY: the \
+                             home's GC arm drops the entry at the block's next release"
+                        )
+                    },
+                    identity: Some(FindingId::C16SharedIndexDrift {
+                        vol_tag: *vol_tag,
+                        block_idx: *block_idx,
+                        owner_ino: *owner_ino,
+                        block_index: *block_index,
+                        flag_side: *flag_side,
                     }),
                 })
             }
@@ -6102,6 +6247,8 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.crossing_exempted, Ordering::Relaxed);
     m.fsck_tenant_overlap_findings
         .fetch_add(c.tenant_overlap_findings, Ordering::Relaxed);
+    m.fsck_shared_index_drift
+        .fetch_add(c.shared_index_drift, Ordering::Relaxed);
     m.fsck_findings.fetch_add(c.findings, Ordering::Relaxed);
     m.fsck_scan_secs.store(c.scan_secs, Ordering::Relaxed);
     m.scrub_blocks_scanned
@@ -6632,6 +6779,20 @@ fn planned_action(id: &FindingId) -> (&'static str, String) {
                  frees it in its OWN ring (a `free` gated on its tail, the SMO retirement \
                  shape) and the cadence's ReturnExtents clears the bit and rewrites the grant \
                  record — nothing routes to the image, so nothing is quarantined"
+            ),
+        ),
+        FindingId::C16SharedIndexDrift {
+            vol_tag,
+            block_idx,
+            owner_ino,
+            ..
+        } => (
+            "report-only",
+            format!(
+                "shared-index drift on block {block_idx} of data volume {vol_tag:#x} (ino \
+                 {owner_ino}) is REPORT-ONLY: the SHARED flag and the index are two durable \
+                 homes of one fact, and the block's next release re-derives the truth from \
+                 both (design-symmetric-metadata §5.4.4's crash windows)"
             ),
         ),
     }
@@ -7193,6 +7354,23 @@ pub async fn repair(
             }
             // ------------------------------------ C13 orphan image extent
             //
+            // C16 is report-only by design (§5.8.5): the SHARED flag and
+            // the index entry are two durable homes of one fact; the
+            // block's next release consults both.
+            FindingId::C16SharedIndexDrift {
+                vol_tag, block_idx, ..
+            } => {
+                refuse(
+                    &mut out,
+                    f,
+                    format!(
+                        "shared-index drift on block {block_idx} of data volume {vol_tag:#x} \
+                         is reported, never auto-repaired: the block's terminal free \
+                         re-derives the truth from the flag and the index together"
+                    ),
+                );
+                continue;
+            }
             // Verify-before-repair is the backend's: `c13_return_orphan`
             // re-runs the census under the volume's SMO + mint
             // serialization and acts only on an extent still claimed and

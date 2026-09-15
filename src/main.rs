@@ -6424,6 +6424,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             fs_engine
                 .router
                 .set_meta_backend(routed_meta_backend.clone());
+            // Symmetric PR 7: the shared-block index's router half — the
+            // RAM SHARED marks seeded from the home's index and the
+            // terminal-free gate installed. Inert (nothing scanned, nothing
+            // installed) unless the symmetric plane is armed.
+            fs_engine
+                .router
+                .arm_shared_refs()
+                .await
+                .map_err(|e| format!("shared-block index arm failed: {e}"))?;
 
             // DLM S7 (pre-RC spec §6.9 / §6.7 / RES-6): arm the data
             // plane's custody posture. Single-writer (the default) states

@@ -231,6 +231,15 @@ pub struct BlockAllocator {
     /// EIO investigation.
     capacity_blocks: AtomicU64,
     refcounts: scc::HashMap<u64, AtomicU32>,
+    /// Symmetric metadata PR 7 (design §5.4.3 / §5.4.4): the per-block
+    /// **SHARED mark** — the RAM projection of the shared-block index for
+    /// THIS data volume (`crate::shared_ref_core`'s word; an absent entry
+    /// reads unshared). Seeded from the index at an armed forest mount's
+    /// open, set by `MarkShared`, cleared by the index home's `Freed`
+    /// verdict; read by the W1 predicate after the §5.1 fence and by the
+    /// terminal-free decision. Empty for the life of every flat / unarmed
+    /// mount (nothing marks) — those paths read one absent-key probe.
+    shared: scc::HashMap<u64, AtomicU32>,
     /// PR VL6a (design-volume-lifecycle §5.6): the fsck **allocation
     /// epoch** — one monotonic atomic, bumped by the fsck coordinator at
     /// scan start and again at re-check. Explicitly a SEPARATE side map
@@ -873,6 +882,7 @@ impl BlockAllocator {
             highest_block: AtomicU64::new(0),
             capacity_blocks: AtomicU64::new(0),
             refcounts: scc::HashMap::new(),
+            shared: scc::HashMap::new(),
             fsck_scan_epoch: AtomicU64::new(0),
             fsck_scan_active: std::sync::atomic::AtomicBool::new(false),
             fsck_epoch_map: scc::HashMap::new(),
@@ -2917,7 +2927,70 @@ impl BlockAllocator {
         }
         self.mark_incarnation_unstable(offset);
         crate::patch_clone_core::cross_word_fence();
-        self.refcount(offset) == Some(1)
+        // The SHARED clause (symmetric PR 7, §5.4.4): a clone protocol
+        // marks the source's block BEFORE the cloner holds a pin, so a
+        // count of 1 is not sole ownership while the mark stands — read
+        // after the same fence (`shared_ref_core`'s composed model).
+        self.refcount(offset) == Some(1) && !self.is_shared(offset)
+    }
+
+    // -----------------------------------------------------------------
+    // Symmetric metadata PR 7 — the SHARED mark (design §5.4.3 / §5.4.4;
+    // `crate::shared_ref_core`).
+    // -----------------------------------------------------------------
+
+    /// Set the SHARED mark on `offset` (`MarkShared` landed at this
+    /// process, or the index named the block at the armed forest's open).
+    pub fn mark_shared(&self, offset: u64) {
+        match self.shared.entry_sync(offset) {
+            scc::hash_map::Entry::Occupied(occ) => crate::shared_ref_core::mark(occ.get()),
+            scc::hash_map::Entry::Vacant(vac) => {
+                let word = crate::shared_ref_core::new_word();
+                crate::shared_ref_core::mark(&word);
+                let _ = vac.insert_entry(word);
+            }
+        }
+    }
+
+    /// Clear the mark — the index home's `Freed` verdict (no clone
+    /// remains) or the block's terminal free.
+    pub fn clear_shared(&self, offset: u64) {
+        if let Some(word) = self.shared.remove_sync(&offset) {
+            crate::shared_ref_core::clear(&word.1);
+        }
+    }
+
+    /// Is `offset` SHARED? One absent-key probe on every mount that never
+    /// marked (the flat / unarmed posture).
+    pub fn is_shared(&self, offset: u64) -> bool {
+        self.shared
+            .read_sync(&offset, |_, w| crate::shared_ref_core::is_shared(w))
+            .unwrap_or(false)
+    }
+
+    /// `shared_blocks`: the marked population on this data volume.
+    pub fn shared_blocks(&self) -> u64 {
+        self.shared.len() as u64
+    }
+
+    /// Release one RAM reference of a SHARED block whose terminal verdict
+    /// the index home answered `Held`: the count decrements only while
+    /// above 1 — the entry never reaches 0 under a standing index entry
+    /// (a holder in a slot tree this process's RAM map never seeded, e.g.
+    /// a handed-over tree, has no RAM reference here; the 1 stands for
+    /// it). `true` ⇔ a reference was released.
+    pub fn release_shared_held(&self, offset: u64) -> bool {
+        self.refcounts
+            .read_sync(&offset, |_, v| {
+                let cur = crate::refcount_core::peek(v);
+                if cur > 1 {
+                    v.compare_exchange(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false)
     }
 
     /// W1 **clause 7** — whole-inode exclusive custody (DLM stage S11;
@@ -3597,6 +3670,9 @@ impl BlockAllocator {
         {
             if terminal {
                 self.refcounts.remove_sync(&offset);
+                // A block that frees leaves no mark behind (the index home
+                // decided `Freed` before a SHARED block reaches here).
+                self.clear_shared(offset);
                 log::debug!("begin_free terminal: offset {offset}");
                 true
             } else {

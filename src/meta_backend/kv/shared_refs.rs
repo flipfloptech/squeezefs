@@ -269,28 +269,57 @@ impl KvMetaBackend {
     /// `owner` is the reference's key form on THIS volume (the local key
     /// ino on a forest — the routed layer's translation).
     pub async fn mark_block_ref_shared(&self, reference: &BlockRef) -> Result<MarkOutcome> {
+        Ok(self
+            .mark_block_refs_shared(std::slice::from_ref(reference))
+            .await?
+            .pop()
+            .unwrap_or(MarkOutcome::Gone))
+    }
+
+    /// [`Self::mark_block_ref_shared`] over every reference of ONE owner
+    /// (a clone's whole source map): one 4a guard, one tx — the bits a
+    /// record already carries and the records that do not exist stage
+    /// nothing; the per-reference outcomes come back in order.
+    pub async fn mark_block_refs_shared(&self, refs: &[BlockRef]) -> Result<Vec<MarkOutcome>> {
         MARK_SHARED_CALLS.fetch_add(1, Ordering::Relaxed);
+        let Some(first) = refs.first() else {
+            return Ok(Vec::new());
+        };
         if !self.block_refs_engaged() {
-            return Ok(MarkOutcome::Gone);
+            return Ok(vec![MarkOutcome::Gone; refs.len()]);
+        }
+        if refs.iter().any(|r| r.owner_ino != first.owner_ino) {
+            return Err(crate::error::SqueezefsError::InvalidOperation(
+                "MarkShared: one call marks one owner's references".to_string(),
+            ));
         }
         self.write_gate()?;
         // F's 4a guard: the same lock its layout commits and its W1
         // predicate's caller hold, so the mark is ordered against both
         // (the design's "in ONE process, the fence pair composes").
-        let guards: Arc<[DlmGuard]> = Arc::from(vec![
-            self.dlm.lock_inode_exclusive(reference.owner_ino).await,
-        ]);
-        let Some(v) = self.lookup_kind(TREE_BLOCK_REFS, &reference.key()).await? else {
-            return Ok(MarkOutcome::Gone);
-        };
-        if decode_block_ref_value(&v)?.shared {
-            return Ok(MarkOutcome::Already);
+        let guards: Arc<[DlmGuard]> =
+            Arc::from(vec![self.dlm.lock_inode_exclusive(first.owner_ino).await]);
+        let mut outcomes = Vec::with_capacity(refs.len());
+        let mut ops = Vec::new();
+        for r in refs {
+            match self.lookup_kind(TREE_BLOCK_REFS, &r.key()).await? {
+                None => outcomes.push(MarkOutcome::Gone),
+                Some(v) if decode_block_ref_value(&v)?.shared => {
+                    outcomes.push(MarkOutcome::Already);
+                }
+                Some(_) => {
+                    ops.push(BlockRefOp::taken_shared(*r));
+                    outcomes.push(MarkOutcome::Marked);
+                }
+            }
         }
-        let mut tx = KvTx::new();
-        tx.stage_block_refs(&[BlockRefOp::taken_shared(*reference)]);
-        tx.hold_guards(guards);
-        self.commit_tx(tx).await?;
-        Ok(MarkOutcome::Marked)
+        if !ops.is_empty() {
+            let mut tx = KvTx::new();
+            tx.stage_block_refs(&ops);
+            tx.hold_guards(guards);
+            self.commit_tx(tx).await?;
+        }
+        Ok(outcomes)
     }
 
     /// **`ShareBlock { b, inos }` at the index home** (§5.4.4 step 2): one
@@ -448,6 +477,65 @@ impl KvMetaBackend {
 /// probe's inverse. Pure; the routing itself is the routed layer's.
 pub fn with_owner(r: &BlockRef, owner_ino: u64) -> BlockRef {
     BlockRef { owner_ino, ..*r }
+}
+
+/// **fsck C16 — shared-index drift** (design §5.8.5, report-only): over
+/// one data volume, the SHARED-flagged references of every mounted meta
+/// volume (their owners resolved to the routed GLOBAL identity) against
+/// the index home's entries — a flag without an entry on the source OR
+/// the target ino, an entry whose ino holds no SHARED reference. Both
+/// sets are read once per call; the caller confirms a finding by a
+/// second call (the verify-before-report ladder). Empty on a set without
+/// a forest home.
+pub async fn shared_index_drift(
+    mb: &crate::meta_backend::RoutedMetaBackend,
+    vol_tag: u64,
+) -> std::result::Result<Vec<SharedIndexDrift>, KvError> {
+    let Some(home) = mb.volumes.get(index_home_volume()) else {
+        return Ok(Vec::new());
+    };
+    if !home.symmetric_forest() {
+        return Ok(Vec::new());
+    }
+    let mut flagged: std::collections::BTreeSet<(u64, u64, u32)> =
+        std::collections::BTreeSet::new();
+    let mut flagged_refs: std::collections::BTreeMap<(u64, u64, u32), BlockRef> =
+        std::collections::BTreeMap::new();
+    for (v, vol) in mb.volumes.iter().enumerate() {
+        for r in vol.shared_flagged_refs(vol_tag).await? {
+            // A forest keys the owner's LOCAL KEY form; the index keys the
+            // GLOBAL ino. A raw control local with no global form cannot
+            // own a data block — skipped, never invented.
+            let owner = if vol.symmetric_forest() {
+                match mb.try_make_global_ino(r.owner_ino, v) {
+                    Some(g) => g,
+                    None => continue,
+                }
+            } else {
+                r.owner_ino
+            };
+            let id = (owner, r.block_idx, r.block_index);
+            flagged.insert(id);
+            flagged_refs.insert(id, with_owner(&r, owner));
+        }
+    }
+    let mut indexed: std::collections::BTreeSet<(u64, u64, u32)> =
+        std::collections::BTreeSet::new();
+    let mut indexed_refs: std::collections::BTreeMap<(u64, u64, u32), BlockRef> =
+        std::collections::BTreeMap::new();
+    for r in home.shared_index_scan(vol_tag).await? {
+        let id = (r.owner_ino, r.block_idx, r.block_index);
+        indexed.insert(id);
+        indexed_refs.insert(id, r);
+    }
+    let mut out = Vec::new();
+    for id in flagged.difference(&indexed) {
+        out.push(SharedIndexDrift::FlagWithoutEntry(flagged_refs[id]));
+    }
+    for id in indexed.difference(&flagged) {
+        out.push(SharedIndexDrift::EntryWithoutFlag(indexed_refs[id]));
+    }
+    Ok(out)
 }
 
 /// A GLOBAL ino's LOCAL KEY form on a volume whose legacy keyspace hosts

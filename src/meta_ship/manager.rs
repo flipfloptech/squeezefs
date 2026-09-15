@@ -632,16 +632,13 @@ impl ManagerService {
                     block_idx,
                     owner_ino,
                 } => {
-                    // The GC arm probes THIS volume's ledger; an entry whose
-                    // owner homes on another volume is left standing (the
-                    // service sees one volume — never GC across a boundary
-                    // it cannot read).
-                    let vol = Arc::clone(&self.volume);
+                    // The wire arm takes NO GC verdict: the index keys the
+                    // routed GLOBAL owner and this service sees one volume's
+                    // ledger in its own key form — an entry whose reference
+                    // it cannot read stands. The routed executor
+                    // (`DataRouter::release_shared_at`) is the GC arm.
                     self.volume
-                        .release_shared(*vol_tag, *block_idx, *owner_ino, |r| {
-                            let vol = Arc::clone(&vol);
-                            async move { Ok(vol.block_ref_flags(&r).await?.is_some()) }
-                        })
+                        .release_shared(*vol_tag, *block_idx, *owner_ino, |_| async { Ok(true) })
                         .await
                         .map(|v| match v {
                             shared_refs::SharedRelease::NotShared => ManagerReply::SharedReleased {

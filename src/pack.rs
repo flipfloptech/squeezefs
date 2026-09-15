@@ -69,6 +69,11 @@ use crate::routing::BackendRouter;
 pub struct OpenPack {
     /// The data volume the block was placed on (the routed backend id).
     pub(crate) be_id: String,
+    /// The pack's SCOPE (design-symmetric-metadata §5.4.3 law 1, KD-SYM-8):
+    /// the tenants' forest slot on an armed set — every reference of the
+    /// block then lives in ONE slot tree — and `0` (the one scope per data
+    /// volume, PK2's) everywhere else. `DataRouter::pack_scope_of` decides.
+    pub(crate) scope: u32,
     pub(crate) allocator: Arc<BlockAllocator>,
     pub(crate) device: Arc<NvmeBlockDev>,
     /// Device offset of the block.
@@ -184,13 +189,29 @@ pub enum SealKind {
     Batch,
 }
 
-/// The packer: the router's per-data-volume open packs, the single-flighted
-/// refill, the batch-scoped `StorageFull` stop and the dismount close.
+/// A pack table key: the data volume the block was placed on and the
+/// tenants' scope (§5.4.3 law 1). Unarmed every scope is `0`, so the key
+/// is PK2's per-data-volume one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PackKey {
+    be_id: String,
+    scope: u32,
+}
+
+/// The packer: the router's per-`(data volume, scope)` open packs, the
+/// single-flighted refill, the batch-scoped `StorageFull` stop and the
+/// dismount close.
 pub struct Packer {
-    /// One slot per data volume the packer has opened a block on, keyed by
-    /// the routed backend id `allocate_placed_block` answered — so at most
-    /// one open pack per data volume (the G-PK1 tail bound).
-    open: scc::HashMap<String, Arc<arc_swap::ArcSwapOption<OpenPack>>>,
+    /// One slot per `(data volume, scope)` the packer has opened a block
+    /// on — the volume keyed by the routed backend id
+    /// `allocate_placed_block` answered — so at most one open pack per
+    /// data volume per scope (the G-PK1 tail bound; PK2's one per volume
+    /// when every scope is `0`). On an armed forest set the scope is the
+    /// tenant's SLOT: open packs per data volume ≤ leased slots being
+    /// written, up to 64 rotor packs + affinity packs on a solo mount
+    /// (design §5.4.3's population; the seal residue rides
+    /// `pack_blocks_sealed_dismount`).
+    open: scc::HashMap<PackKey, Arc<arc_swap::ArcSwapOption<OpenPack>>>,
     /// The single-flighted refill (the R1a `inflight_block_reads` shape):
     /// the leader allocates and installs, the cohort awaits its outcome and
     /// retries the reservation. One flight per router — a refill is one
@@ -229,18 +250,24 @@ impl Packer {
         self.stopped.load(Ordering::Relaxed)
     }
 
-    /// Reserve a `slot`-byte slot in an open pack — steps 3 of §5.2's
-    /// `prepare`: the reservation (one `fetch_add`), the tenant's own
-    /// in-flight registration and its reference. `Ok(None)` = the arm is
-    /// stopped (OQ-1): the caller answers the promotion resident-and-
+    /// Reserve a `slot`-byte slot in an open pack of `scope` — steps 3 of
+    /// §5.2's `prepare`: the reservation (one `fetch_add`), the tenant's
+    /// own in-flight registration and its reference. `Ok(None)` = the arm
+    /// is stopped (OQ-1): the caller answers the promotion resident-and-
     /// counted. A `StorageFull` refill stops the arm and answers `None`;
-    /// any other allocation error propagates.
-    pub async fn reserve(&self, router: &BackendRouter, slot: u64) -> Result<Option<PackTenant>> {
+    /// any other allocation error propagates. `scope` is the tenant's
+    /// pack scope (`DataRouter::pack_scope_of` — `0` unarmed).
+    pub async fn reserve(
+        &self,
+        router: &BackendRouter,
+        slot: u64,
+        scope: u32,
+    ) -> Result<Option<PackTenant>> {
         loop {
             if self.stopped.load(Ordering::Relaxed) {
                 return Ok(None);
             }
-            if let Some(pack) = self.any_open() {
+            if let Some(pack) = self.any_open(scope) {
                 match pack.try_reserve(slot) {
                     Some(off) => {
                         let inflight = pack.allocator.inflight_register(pack.base);
@@ -279,7 +306,7 @@ impl Packer {
                     }
                 }
             }
-            match self.refill(router).await {
+            match self.refill(router, scope).await {
                 // A leader that died without answering (its sender gone):
                 // this waiter re-runs the loop and claims the next flight.
                 None | Some(RefillOutcome::Opened) => continue,
@@ -293,10 +320,14 @@ impl Packer {
         }
     }
 
-    /// Any UNSEALED open pack (≤ one per data volume — a tiny scan).
-    fn any_open(&self) -> Option<Arc<OpenPack>> {
+    /// Any UNSEALED open pack of `scope` (≤ one per data volume per scope
+    /// — a tiny scan).
+    fn any_open(&self, scope: u32) -> Option<Arc<OpenPack>> {
         let mut found = None;
-        self.open.iter_sync(|_, slot| {
+        self.open.iter_sync(|key, slot| {
+            if key.scope != scope {
+                return true;
+            }
             if let Some(p) = slot.load_full() {
                 if !p.is_sealed() {
                     found = Some(p);
@@ -308,10 +339,17 @@ impl Packer {
         found
     }
 
+    fn key_of(pack: &OpenPack) -> PackKey {
+        PackKey {
+            be_id: pack.be_id.clone(),
+            scope: pack.scope,
+        }
+    }
+
     /// Vacate `pack`'s table slot if it still holds it (idempotent —
     /// the sealer and a refill leader may both reach for it).
     fn vacate(&self, pack: &Arc<OpenPack>) {
-        if let Some(slot) = self.open.read_sync(&pack.be_id, |_, s| s.clone()) {
+        if let Some(slot) = self.open.read_sync(&Self::key_of(pack), |_, s| s.clone()) {
             let cur = slot.load();
             if cur.as_ref().is_some_and(|p| Arc::ptr_eq(p, pack)) {
                 let _ = slot.compare_and_swap(&*cur, None);
@@ -325,7 +363,7 @@ impl Packer {
     /// the cohort awaits the outcome. No lock is held across the
     /// allocation's park (an ENOSPC park is bounded by
     /// `free_grace::pressure_park_wall_ms`).
-    async fn refill(&self, router: &BackendRouter) -> Option<RefillOutcome> {
+    async fn refill(&self, router: &BackendRouter, scope: u32) -> Option<RefillOutcome> {
         let (tx, _rx) = squeezefs_ipc::sqz_flight::channel::<RefillOutcome>();
         let flight = Arc::new(tx);
         let prev = self
@@ -339,10 +377,10 @@ impl Packer {
         }
         // Leader. A pack another leader installed between this thread's
         // scan and its claim serves the cohort without an allocation.
-        let outcome = if self.any_open().is_some() {
+        let outcome = if self.any_open(scope).is_some() {
             RefillOutcome::Opened
         } else {
-            match self.open_block(router).await {
+            match self.open_block(router, scope).await {
                 Ok(pack) => {
                     METRICS
                         .pack_reservation_refills
@@ -368,7 +406,7 @@ impl Packer {
     /// uncovered), the cursor at 0, the pin = the allocation's own
     /// reference. Shared by the table refill and the co-writer's private
     /// packs; the caller owns the `StorageFull` disposition.
-    async fn open_block(&self, router: &BackendRouter) -> Result<Arc<OpenPack>> {
+    async fn open_block(&self, router: &BackendRouter, scope: u32) -> Result<Arc<OpenPack>> {
         let (be_id, allocator, device, offset) = router.allocate_placed_block().await?;
         let base_key = router.persist_block_key(&be_id, offset);
         // The pack-open ledger entry precedes any window in which the
@@ -379,6 +417,7 @@ impl Packer {
         drop(cover);
         Ok(Arc::new(OpenPack {
             be_id,
+            scope,
             allocator,
             device,
             base: offset,
@@ -417,7 +456,9 @@ impl Packer {
         if self.stopped.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        match self.open_block(router).await {
+        // A private pack is batch-scoped, never in the table: the scope
+        // word is not its key.
+        match self.open_block(router, 0).await {
             Ok(pack) => {
                 METRICS.pack_blocks_opened.fetch_add(1, Ordering::Relaxed);
                 Ok(Some(pack))
@@ -482,7 +523,7 @@ impl Packer {
     /// abandoned (never published, nothing durable named it) and the
     /// cohort is served the existing one.
     async fn install(&self, pack: Arc<OpenPack>) -> RefillOutcome {
-        let slot = match self.open.entry_sync(pack.be_id.clone()) {
+        let slot = match self.open.entry_sync(Self::key_of(&pack)) {
             scc::hash_map::Entry::Occupied(occ) => occ.get().clone(),
             scc::hash_map::Entry::Vacant(vac) => {
                 let s = Arc::new(arc_swap::ArcSwapOption::from(None));
@@ -664,9 +705,33 @@ impl Packer {
     /// open pack already has room for its live windows; two or more
     /// victims below half always net a block).
     pub fn open_room_bytes(&self) -> u64 {
-        self.any_open()
-            .map(|p| CHUNK_SIZE.saturating_sub(p.reserved_bytes()))
-            .unwrap_or(0)
+        // The largest room among the open packs: a victim's windows land
+        // in the packs of THEIR tenants' scopes (`repack_window` scopes by
+        // the tenant), so on an armed set the plan reads the roomiest
+        // scope — the one scope's pack, verbatim, everywhere else.
+        let mut room = 0u64;
+        self.open.iter_sync(|_, slot| {
+            if let Some(p) = slot.load_full() {
+                if !p.is_sealed() {
+                    room = room.max(CHUNK_SIZE.saturating_sub(p.reserved_bytes()));
+                }
+            }
+            true
+        });
+        room
+    }
+
+    /// Open (unsealed) packs per scope — the armed set's per-slot pack
+    /// population (`pack_open_scopes`).
+    pub fn open_scopes(&self) -> u64 {
+        let mut scopes = std::collections::BTreeSet::new();
+        self.open.iter_sync(|key, slot| {
+            if slot.load_full().is_some_and(|p| !p.is_sealed()) {
+                scopes.insert(key.scope);
+            }
+            true
+        });
+        scopes.len() as u64
     }
 
     /// The open packs' base keys (the opt-in census row).

@@ -326,8 +326,13 @@ async fn a_solo_armed_mount_leases_its_native_slot_and_sixty_four_rotor_slots() 
     shutdown(&routed).await;
     // The clean leave released every lease: tree 0 says Unleased at g = 1
     // with the release seq, for the next joiner's `unleased-then-idle`.
-    let routed = open_under(&uris, &Knobs::unarmed()).await;
-    let states = tree0_states(&routed.volumes[0]).await;
+    // Read through a PROBE: a once-armed volume takes no writer without
+    // the plane (PR 5 review round 3, Issue 25 — the frame-stamp law has
+    // no unarmed writer), and a probe appends nothing.
+    let probe = KvMetaBackend::open_probe(std::path::Path::new(&uris[0]))
+        .await
+        .expect("a probe of the once-armed volume");
+    let states = tree0_states(&probe).await;
     assert!(
         states
             .iter()
@@ -337,7 +342,15 @@ async fn a_solo_armed_mount_leases_its_native_slot_and_sixty_four_rotor_slots() 
     assert!(states.iter().any(
         |(_, st)| matches!(st, SlotState::Unleased { last_written, .. } if *last_written > 0)
     ));
-    shutdown(&routed).await;
+    drop(probe);
+    // And the `=0` WRITER is refused loud, naming the knob.
+    Knobs::unarmed().apply();
+    let refused = open_routed_meta_set(&uris).await;
+    Knobs::clear();
+    let e = refused
+        .err()
+        .expect("a =0 writer of a once-armed volume refuses");
+    assert!(e.to_string().contains("SQUEEZEFS_SYMMETRIC_META=1"), "{e}");
 }
 
 /// `SQUEEZEFS_SYMMETRIC_META=0` is the PR 1–3 forest exactly: no plane,

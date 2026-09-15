@@ -70,10 +70,12 @@ pub struct OpenPack {
     /// The data volume the block was placed on (the routed backend id).
     pub(crate) be_id: String,
     /// The pack's SCOPE (design-symmetric-metadata §5.4.3 law 1, KD-SYM-8):
-    /// the tenants' forest slot on an armed set — every reference of the
-    /// block then lives in ONE slot tree — and `0` (the one scope per data
-    /// volume, PK2's) everywhere else. `DataRouter::pack_scope_of` decides.
-    pub(crate) scope: u32,
+    /// the tenants' `(meta volume, forest slot)` on an armed set
+    /// (`routing::pack_scope_key`) — every reference of the block then
+    /// lives in ONE slot tree of one volume — and `0` (the one scope per
+    /// data volume, PK2's) everywhere else. `DataRouter::pack_scope_of`
+    /// decides.
+    pub(crate) scope: u64,
     pub(crate) allocator: Arc<BlockAllocator>,
     pub(crate) device: Arc<NvmeBlockDev>,
     /// Device offset of the block.
@@ -166,14 +168,11 @@ pub struct PackTenant {
 }
 
 impl PackTenant {
-    /// The pack block's base key (the tenant mapping's prefix).
+    /// The pack block's base key (the tenant mapping's prefix) — the
+    /// scope contracts' accessor (`tests/sym_pack_tests.rs`: two tenants of
+    /// one scope share a block, two scopes never do); no product reader.
     pub fn base_key(&self) -> &str {
         &self.pack.base_key
-    }
-
-    /// The pack's scope (the tenant's slot on an armed set, `0` otherwise).
-    pub fn scope(&self) -> u32 {
-        self.pack.scope
     }
 }
 
@@ -207,7 +206,7 @@ pub enum SealKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PackKey {
     be_id: String,
-    scope: u32,
+    scope: u64,
 }
 
 /// The packer: the router's per-`(data volume, scope)` open packs, the
@@ -273,7 +272,7 @@ impl Packer {
         &self,
         router: &BackendRouter,
         slot: u64,
-        scope: u32,
+        scope: u64,
     ) -> Result<Option<PackTenant>> {
         loop {
             if self.stopped.load(Ordering::Relaxed) {
@@ -334,7 +333,7 @@ impl Packer {
 
     /// Any UNSEALED open pack of `scope` (≤ one per data volume per scope
     /// — a tiny scan).
-    fn any_open(&self, scope: u32) -> Option<Arc<OpenPack>> {
+    fn any_open(&self, scope: u64) -> Option<Arc<OpenPack>> {
         let mut found = None;
         self.open.iter_sync(|key, slot| {
             if key.scope != scope {
@@ -375,7 +374,7 @@ impl Packer {
     /// the cohort awaits the outcome. No lock is held across the
     /// allocation's park (an ENOSPC park is bounded by
     /// `free_grace::pressure_park_wall_ms`).
-    async fn refill(&self, router: &BackendRouter, scope: u32) -> Option<RefillOutcome> {
+    async fn refill(&self, router: &BackendRouter, scope: u64) -> Option<RefillOutcome> {
         let (tx, _rx) = squeezefs_ipc::sqz_flight::channel::<RefillOutcome>();
         let flight = Arc::new(tx);
         let prev = self
@@ -418,7 +417,7 @@ impl Packer {
     /// uncovered), the cursor at 0, the pin = the allocation's own
     /// reference. Shared by the table refill and the co-writer's private
     /// packs; the caller owns the `StorageFull` disposition.
-    async fn open_block(&self, router: &BackendRouter, scope: u32) -> Result<Arc<OpenPack>> {
+    async fn open_block(&self, router: &BackendRouter, scope: u64) -> Result<Arc<OpenPack>> {
         let (be_id, allocator, device, offset) = router.allocate_placed_block().await?;
         let base_key = router.persist_block_key(&be_id, offset);
         // The pack-open ledger entry precedes any window in which the

@@ -13871,6 +13871,14 @@ impl SqueezefsFilesystem {
                     "pack_open_scopes".into(),
                     serde_json::json!(self.router.packer.open_scopes()),
                 );
+                // `shared_release_failures` MUST STAY 0: a SHARED block's
+                // release the index home could not decide — the reference
+                // and mark KEPT, the block allocated (leak-safe), the
+                // failure named, never discarded (review round 1, Issue 3).
+                metrics.insert(
+                    "shared_release_failures".into(),
+                    load(&meta_kv::shared_refs::SHARED_RELEASE_FAILURES),
+                );
                 // THE FENCING FAMILY (§5.8.1 / KD-SYM-18): the Reservation
                 // Report read SIZED BY REGCTL — per metadata AND data
                 // namespace this mount registered on: registrants the last
@@ -17268,15 +17276,24 @@ impl SqueezefsFilesystem {
         // refcount re-check. A clone whose pin lands before this re-check
         // is observed here (count 2 ⇒ CoW fallback); one that lands after
         // observes instability at its validate-after-pin and retries.
-        // Symmetric PR 7: on an ARMED set the RAM verdict is confirmed by
-        // ONE probe of the ino's slot tree (`DataRouter::sole_owner_durably`
-        // — `true` without a read unarmed).
-        if !allocator.begin_patch_sole_owner(dev_offset)
-            || !self
-                .router
-                .sole_owner_durably(ino, &allocator, dev_offset)
-                .await
+        // Symmetric PR 7: on an ARMED set the durable clause runs FIRST —
+        // ONE probe of the ino's slot tree (`DataRouter::sole_owner_durably`:
+        // exactly one reference, none SHARED; `true` without a read
+        // unarmed). A static question, asked before the incarnation word is
+        // retired so a non-resident leaf's read never sits inside the
+        // unstable window (racing validated fills and a clone's pin would
+        // otherwise fail their re-checks for the probe's duration).
+        if !self
+            .router
+            .sole_owner_durably(ino, &allocator, dev_offset)
+            .await
         {
+            METRICS
+                .patch_ineligible_shared
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        if !allocator.begin_patch_sole_owner(dev_offset) {
             // Back off: re-stabilize (content never changed) and CoW.
             allocator.publish_block(dev_offset);
             METRICS

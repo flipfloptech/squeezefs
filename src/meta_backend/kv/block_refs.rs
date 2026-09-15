@@ -295,6 +295,38 @@ impl BlockRefOp {
     }
 }
 
+/// Drop every `(released r, taken r)` pair over ONE reference from a
+/// translated op list — the re-description of an existing record (the
+/// passthrough `bk:off:len → bk:off:len'` clip; any map swap whose old
+/// and new keys resolve to one `BlockRef`). The record survives the
+/// transaction unchanged, so staging the pair would only REWRITE its value
+/// from scratch — and strip a durable SHARED bit (symmetric PR 7's C16
+/// tripwire, tripped by a legal truncate). The ONE law for a re-Put of an
+/// existing reference: none is written. A taken op that carries SHARED
+/// itself (a cloner's own record) is never cancelled: its pair is not a
+/// re-description but the bit's first landing, and no released op names
+/// the cloner's reference in the same list.
+pub fn cancel_same_reference_pairs(ops: &mut Vec<BlockRefOp>) {
+    let mut i = 0;
+    while i < ops.len() {
+        let released = !ops[i].take;
+        let key = ops[i].reference;
+        let partner = ops.iter().enumerate().position(|(j, o)| {
+            j != i && o.reference == key && o.take == released && !(o.take && o.shared)
+        });
+        match partner {
+            Some(j) if !(ops[i].take && ops[i].shared) => {
+                let (lo, hi) = if i < j { (i, j) } else { (j, i) };
+                ops.remove(hi);
+                ops.remove(lo);
+                // Both indices moved: rescan from the lower one.
+                i = lo;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
 /// What a standalone reference RELEASE commit (the reclaim path's
 /// `delete_file`, the mount-time corpse sweep) can say about the
 /// references it dropped — the input to the RAM-refcount gate that closed
@@ -624,6 +656,57 @@ mod tests {
         let both = decode_block_ref_value(&blob.value_with(true)).unwrap();
         assert!(both.shared && both.map_blob);
         assert!(!BlockRefOp::released(r).shared);
+    }
+
+    /// A re-description of one reference (released + taken over the same
+    /// key) is dropped as a pair; a genuine move (two keys), a lone take,
+    /// a lone release and a cloner's SHARED take all survive untouched.
+    #[test]
+    fn same_reference_pairs_cancel_and_nothing_else_moves() {
+        let r = BlockRef {
+            vol_tag: 1,
+            block_idx: 2,
+            owner_ino: 3,
+            block_index: 4,
+        };
+        let other = BlockRef { block_idx: 9, ..r };
+        // The clip: released r + taken r → nothing.
+        let mut ops = vec![BlockRefOp::released(r), BlockRefOp::taken(r)];
+        cancel_same_reference_pairs(&mut ops);
+        assert!(ops.is_empty());
+        // Order-blind, and the pair may be separated by other ops.
+        let mut ops = vec![
+            BlockRefOp::taken(r),
+            BlockRefOp::taken(other),
+            BlockRefOp::released(r),
+        ];
+        cancel_same_reference_pairs(&mut ops);
+        assert_eq!(ops, vec![BlockRefOp::taken(other)]);
+        // A move: two different references, both kept.
+        let mut ops = vec![BlockRefOp::released(r), BlockRefOp::taken(other)];
+        cancel_same_reference_pairs(&mut ops);
+        assert_eq!(ops.len(), 2);
+        // Lone ops stand.
+        let mut ops = vec![BlockRefOp::taken(r)];
+        cancel_same_reference_pairs(&mut ops);
+        assert_eq!(ops, vec![BlockRefOp::taken(r)]);
+        let mut ops = vec![BlockRefOp::released(r)];
+        cancel_same_reference_pairs(&mut ops);
+        assert_eq!(ops, vec![BlockRefOp::released(r)]);
+        // A cloner's SHARED take is the bit's first landing, never a
+        // re-description: kept beside a release of the same key.
+        let mut ops = vec![BlockRefOp::released(r), BlockRefOp::taken_shared(r)];
+        cancel_same_reference_pairs(&mut ops);
+        assert_eq!(ops.len(), 2);
+        // Two pairs over two references both cancel.
+        let mut ops = vec![
+            BlockRefOp::released(r),
+            BlockRefOp::released(other),
+            BlockRefOp::taken(other),
+            BlockRefOp::taken(r),
+        ];
+        cancel_same_reference_pairs(&mut ops);
+        assert!(ops.is_empty());
     }
 
     /// The refcount read's range must contain exactly the block's

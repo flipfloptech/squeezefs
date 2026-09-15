@@ -3304,7 +3304,8 @@ impl KvMetaBackend {
     }
 
     /// Every slot tree that exists on this volume in slot order (empty on
-    /// a flat volume) — the per-slot probe contracts' census (PR 7).
+    /// a flat volume) — the per-slot probe contracts' census (PR 7; a
+    /// contract accessor, no product reader).
     pub fn slot_trees(&self) -> Vec<(super::record::ForestSlot, Arc<KvTree>)> {
         self.forest().map(|f| f.slot_trees()).unwrap_or_default()
     }

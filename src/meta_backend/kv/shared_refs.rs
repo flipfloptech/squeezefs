@@ -51,9 +51,10 @@ use super::super::block_refs::{
     BLOCK_REF_KEY_LEN,
 };
 use super::super::forest::SlotTrees;
+use super::super::journal::entry_len_for;
 use super::super::record::{ForestSlot, Record, TREE_BLOCK_REFS, TREE_CONTROL};
 use super::super::KvError;
-use super::{EntryAdmission, KvMetaBackend, KvTx};
+use super::{HeldAdmission, KvMetaBackend, KvTx};
 use crate::error::Result;
 use crate::meta_backend::dlm::DlmGuard;
 use crate::meta_backend::kv::node::key_successor;
@@ -74,6 +75,17 @@ pub static SHARE_BLOCK_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static RELEASE_SHARED_CALLS: AtomicU64 = AtomicU64::new(0);
 /// `mark_shared_calls`: `MarkShared` executions at a source's holder.
 pub static MARK_SHARED_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `shared_release_failures` (must-stay-0): a SHARED block's release the
+/// index home could not decide (the journal-failure class) — its
+/// reference and mark were KEPT, the block stays allocated; never a
+/// discarded failure.
+pub static SHARED_RELEASE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// How many times `release_shared` re-sizes its parking pre-admission
+/// when the index population grows under it (a racing `ShareBlock` of
+/// the same block — a clone storm on one block; each attempt re-reads
+/// the population, so the bound is a loud-refusal belt, never a wait).
+const RELEASE_RESIZE_ATTEMPTS: u32 = 8;
 
 /// The index HOME's volume ordinal in the routed set — **the ONE function
 /// PR 8 re-points** to the data volume's allocation-lease holder. PR 7:
@@ -190,6 +202,58 @@ pub enum SharedRelease {
     Freed,
 }
 
+/// The one-slot probe's answer: the population of `(vol_tag, block_idx)`
+/// in the probed slot tree and whether ANY of those references carries
+/// SHARED — the W1 durable clause reads both (design §5.4.3 law 2: the
+/// predicate "adds the SHARED flag"; a count of 1 under a set flag is a
+/// clone's source between its `MarkShared` and its publish, never sole
+/// ownership).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RefProbe {
+    pub count: usize,
+    pub shared: bool,
+}
+
+/// What the ROUTED layer lends the volume-level executors (installed by
+/// `DataRouter::arm_shared_refs`; absent on every mount without an armed
+/// forest): the durable flags of a reference named by its GLOBAL owner
+/// (the served `ShareBlock`'s screen — PR 3/4's law that a wire word acts
+/// on nothing until durable state confirms it — and `ReleaseShared`'s GC
+/// arm), and the RAM SHARED mark a served `MarkShared` sets beside its
+/// durable bit (the accelerator the W1 predicate reads synchronously; the
+/// durable flag stays the authority).
+pub trait RoutedSharedRefs: Send + Sync {
+    /// `Some(shared)` when `owner_ino` (GLOBAL) holds a reference to the
+    /// block at `block_index` on its own volume, `None` when no record
+    /// exists.
+    fn ref_flags(
+        &self,
+        r: BlockRef,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::result::Result<Option<bool>, KvError>>
+                + Send
+                + '_,
+        >,
+    >;
+    /// The RAM mark of `(vol_tag, block_idx)` set on this mount.
+    fn note_marked(&self, vol_tag: u64, block_idx: u64);
+}
+
+static ROUTED: arc_swap::ArcSwapOption<Arc<dyn RoutedSharedRefs>> =
+    arc_swap::ArcSwapOption::const_empty();
+
+/// Install the routed layer's hooks (one per process — the armed mount's;
+/// a later arm replaces an earlier rig's in the same process).
+pub fn install_routed(hooks: Arc<dyn RoutedSharedRefs>) {
+    ROUTED.store(Some(Arc::new(hooks)));
+}
+
+/// The installed hooks, `None` on a mount that never armed.
+pub fn routed() -> Option<Arc<dyn RoutedSharedRefs>> {
+    ROUTED.load_full().map(|h| Arc::clone(&*h))
+}
+
 /// One C16 finding (report-only; `fsck_shared_index_drift`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SharedIndexDrift {
@@ -214,15 +278,43 @@ impl KvMetaBackend {
         block_idx: u64,
         slot: Option<ForestSlot>,
     ) -> std::result::Result<usize, KvError> {
+        Ok(self
+            .block_ref_probe_flags(vol_tag, block_idx, slot)
+            .await?
+            .count)
+    }
+
+    /// [`Self::block_ref_probe`] with the SHARED flag folded over the
+    /// probed records — the W1 durable clause's face (`RefProbe`). The
+    /// whole-volume arm (`slot == None` / a flat volume) walks the by-block
+    /// window it already reads for the count.
+    pub async fn block_ref_probe_flags(
+        &self,
+        vol_tag: u64,
+        block_idx: u64,
+        slot: Option<ForestSlot>,
+    ) -> std::result::Result<RefProbe, KvError> {
         BLOCK_REF_PROBES.fetch_add(1, Ordering::Relaxed);
         if !self.block_refs_engaged() {
-            return Ok(0);
+            return Ok(RefProbe::default());
         }
-        let (Some(forest), Some(slot)) = (self.forest(), slot) else {
-            return self.block_ref_count(vol_tag, block_idx).await;
-        };
         let (start, end) = block_range(vol_tag, block_idx);
-        Ok(forest.refs_probe(slot, &start, &end).await?.len())
+        let records = match (self.forest(), slot) {
+            (Some(forest), Some(slot)) => forest.refs_probe(slot, &start, &end).await?,
+            _ => self.block_refs_window(&start, &end).await?,
+        };
+        let mut probe = RefProbe {
+            count: records.len(),
+            shared: false,
+        };
+        // Both halves decoded for every record (the by-block family's
+        // discipline): a malformed accounting record is loud corruption,
+        // never a silently skipped — or silently counted — reference.
+        for (k, v) in &records {
+            decode_block_ref_key(k)?;
+            probe.shared |= decode_block_ref_value(v)?.shared;
+        }
+        Ok(probe)
     }
 
     /// Every SHARED-flagged reference of one data volume on THIS volume
@@ -333,6 +425,14 @@ impl KvMetaBackend {
     ) -> std::result::Result<(usize, usize), KvError> {
         SHARE_BLOCK_CALLS.fetch_add(1, Ordering::Relaxed);
         let _set = self.manager_gate(false)?;
+        // The USER clone path: admit the entry's worst case — every named
+        // reference a fresh put — PARKING, before the verb mutex (PR 4's
+        // door law: a park under `manager_verbs` deadlocks with the
+        // checkpoint task's grant verbs; a `Try` fails the clone on a busy
+        // ring 0). The exact length is split off under the mutex, the
+        // rest released; every early return hands the budget back.
+        let worst = entry_len_for(&self.shared_index_puts(refs))?;
+        let pre = self.pre_admit_control(worst).await?;
         let _g = self.manager_verbs.lock().await;
         let control = self.control_tree()?;
         let mut recs = Vec::with_capacity(refs.len());
@@ -350,9 +450,73 @@ impl KvMetaBackend {
         }
         let inserted = recs.len();
         if inserted > 0 {
-            self.write_control_entry(recs, EntryAdmission::Try).await?;
+            self.write_control_entry(recs, pre.into_entry()).await?;
         }
         Ok((inserted, already))
+    }
+
+    /// The served `ShareBlock` (the wire's untrusted words — PR 3/4's law:
+    /// a frame acts on nothing until durable state confirms every word):
+    /// each named `(owner_ino, block_index)` must hold a reference to the
+    /// block on its own volume AND carry SHARED (the cloner's `MarkShared`
+    /// precedes its `ShareBlock`, so a legitimate frame always does);
+    /// otherwise the WHOLE frame is `Rejected` and nothing is written. The
+    /// screen reads the routed view the arm installed; a mount without it
+    /// (no armed router) cannot confirm and rejects.
+    pub async fn share_block_screened(
+        &self,
+        refs: &[BlockRef],
+    ) -> std::result::Result<(usize, usize), KvError> {
+        let set = self.manager_gate(false)?;
+        let reject = |why: String| {
+            set.verbs.rejected.fetch_add(1, Ordering::Relaxed);
+            KvError::Rejected(format!("ShareBlock: {why} (manager_verb_rejected)"))
+        };
+        let Some(routed) = routed() else {
+            return Err(reject(
+                "no routed view to confirm the frame's references against".to_string(),
+            ));
+        };
+        for r in refs {
+            match routed.ref_flags(*r).await? {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(reject(format!(
+                        "ino {}'s reference to block {} of data volume {:#x} is not SHARED — \
+                         MarkShared precedes ShareBlock",
+                        r.owner_ino, r.block_idx, r.vol_tag
+                    )));
+                }
+                None => {
+                    return Err(reject(format!(
+                        "ino {} holds no reference to block {} of data volume {:#x}",
+                        r.owner_ino, r.block_idx, r.vol_tag
+                    )));
+                }
+            }
+        }
+        self.share_block(refs).await
+    }
+
+    /// Every named reference as a fresh index put — the worst case
+    /// `share_block` pre-admits for.
+    fn shared_index_puts(&self, refs: &[BlockRef]) -> Vec<(u8, Record)> {
+        refs.iter()
+            .map(|r| {
+                (
+                    super::super::journal::tag_for(TREE_CONTROL, 0),
+                    Record::put(shared_ref_key(r), 0, shared_ref_value().to_vec()),
+                )
+            })
+            .collect()
+    }
+
+    /// A PARKING ring-0 admission for a control entry of at most `len`
+    /// bytes, taken holding nothing (the door's pre-admission shape);
+    /// released on drop unless handed into the entry.
+    async fn pre_admit_control(&self, len: u64) -> std::result::Result<HeldAdmission<'_>, KvError> {
+        let adm = self.admit_user_budget(&self.ring, 0, len).await?;
+        Ok(HeldAdmission::new(self.ring.core(), Some(adm)))
     }
 
     /// The index's entries for one block at the home: the referencing
@@ -408,20 +572,24 @@ impl KvMetaBackend {
         Ok(out)
     }
 
-    /// **`ReleaseShared { b, ino }` at the index home** (§5.4.4 step 4):
-    /// delete `ino`'s entries for `b` (every `block_index`), then decide
-    /// from what remains — `still_referenced` answers, per remaining
-    /// entry, whether its ino still holds a reference to `b` (the GC arm
-    /// for the "cloner died after step 2" window: an entry whose
-    /// reference is gone is deleted too, never counted). ONE control entry
-    /// carries every delete. `NotShared` when the index never named the
-    /// block; `Freed` when nothing remains; `Held` otherwise. Idempotent:
-    /// a replay finds the releaser's entries gone and re-decides.
+    /// **`ReleaseShared { b, (ino, block_index) }` at the index home**
+    /// (§5.4.4 step 4): delete the releaser's ONE entry for `b` — keyed on
+    /// `(owner_ino, block_index)`, since the legal same-`off` nested
+    /// clone+clip class gives one ino two references to one block and the
+    /// other must stand — then decide from what remains:
+    /// `still_referenced` answers, per remaining entry, whether its ino
+    /// still holds a reference to `b` (the GC arm for the "cloner died
+    /// after step 2" window: an entry whose reference is gone is deleted
+    /// too, never counted). ONE control entry carries every delete, its
+    /// admission taken PARKING before the verb mutex (the FREE path never
+    /// fails on a busy ring — Issue 3). `NotShared` when the index never
+    /// named the block; `Freed` when nothing remains; `Held` otherwise.
+    /// Idempotent: a replay finds the releaser's entry gone and re-decides.
     pub async fn release_shared<F, Fut>(
         &self,
         vol_tag: u64,
         block_idx: u64,
-        releaser: Option<u64>,
+        releaser: Option<(u64, u32)>,
         still_referenced: F,
     ) -> std::result::Result<SharedRelease, KvError>
     where
@@ -430,33 +598,72 @@ impl KvMetaBackend {
     {
         RELEASE_SHARED_CALLS.fetch_add(1, Ordering::Relaxed);
         let _set = self.manager_gate(false)?;
-        let _g = self.manager_verbs.lock().await;
-        let population = self.shared_index_population(vol_tag, block_idx).await?;
-        if population.is_empty() {
-            return Ok(SharedRelease::NotShared);
-        }
-        let mut deletes = Vec::new();
-        let mut remaining = 0usize;
-        for r in population {
-            let mine = releaser == Some(r.owner_ino);
-            if mine || !still_referenced(r).await? {
-                deletes.push((
-                    super::super::journal::tag_for(TREE_CONTROL, 0),
-                    Record::delete(shared_ref_key(&r), 0),
-                ));
-            } else {
-                remaining += 1;
+        // The pre-admission is sized from a population read holding
+        // nothing; under the mutex the population is re-read, and one that
+        // GREW past the admission (a racing `ShareBlock`) releases it and
+        // re-sizes — a bounded loop, never a park under the mutex.
+        let mut attempts = 0u32;
+        loop {
+            let sizing = self.shared_index_population(vol_tag, block_idx).await?;
+            if sizing.is_empty() {
+                return Ok(SharedRelease::NotShared);
             }
+            let worst = entry_len_for(&Self::shared_index_deletes(&sizing))?;
+            let pre = self.pre_admit_control(worst).await?;
+            let _g = self.manager_verbs.lock().await;
+            let population = self.shared_index_population(vol_tag, block_idx).await?;
+            if population.is_empty() {
+                return Ok(SharedRelease::NotShared);
+            }
+            if population.len() > sizing.len() {
+                attempts += 1;
+                if attempts < RELEASE_RESIZE_ATTEMPTS {
+                    drop(_g);
+                    drop(pre);
+                    continue;
+                }
+                return Err(KvError::Busy(format!(
+                    "{}: ReleaseShared of block {block_idx} on data volume {vol_tag:#x}: the \
+                     index population grew under {RELEASE_RESIZE_ATTEMPTS} sizing attempts",
+                    self.path.display()
+                )));
+            }
+            let mut deletes = Vec::new();
+            let mut remaining = 0usize;
+            for r in population {
+                let mine = releaser == Some((r.owner_ino, r.block_index));
+                if mine || !still_referenced(r).await? {
+                    deletes.push((
+                        super::super::journal::tag_for(TREE_CONTROL, 0),
+                        Record::delete(shared_ref_key(&r), 0),
+                    ));
+                } else {
+                    remaining += 1;
+                }
+            }
+            if !deletes.is_empty() {
+                self.write_control_entry(deletes, pre.into_entry()).await?;
+            }
+            return Ok(if remaining == 0 {
+                SharedRelease::Freed
+            } else {
+                SharedRelease::Held { remaining }
+            });
         }
-        if !deletes.is_empty() {
-            self.write_control_entry(deletes, EntryAdmission::Try)
-                .await?;
-        }
-        Ok(if remaining == 0 {
-            SharedRelease::Freed
-        } else {
-            SharedRelease::Held { remaining }
-        })
+    }
+
+    /// Every entry of a population as a delete — the worst case
+    /// `release_shared` pre-admits for.
+    fn shared_index_deletes(population: &[BlockRef]) -> Vec<(u8, Record)> {
+        population
+            .iter()
+            .map(|r| {
+                (
+                    super::super::journal::tag_for(TREE_CONTROL, 0),
+                    Record::delete(shared_ref_key(r), 0),
+                )
+            })
+            .collect()
     }
 
     /// Tree 0, or the refusal every index verb answers on a volume that

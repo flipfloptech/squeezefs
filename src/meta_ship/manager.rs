@@ -191,13 +191,15 @@ pub enum ManagerCall {
         block_idx: u64,
         refs: Vec<(u64, u32)>,
     },
-    /// **Step 4, served by the index HOME**: the releasing ino drops its
-    /// entries for the block (`owner_ino = None` = a GC-only probe) and
-    /// the home decides from what remains.
+    /// **Step 4, served by the index HOME**: the releasing reference —
+    /// `(owner_ino, block_index)`, ONE entry: the legal same-`off` nested
+    /// clone+clip class gives one ino two references to one block and the
+    /// other stands — leaves the index (`None` = a GC-only probe) and the
+    /// home decides from what remains.
     ReleaseShared {
         vol_tag: u64,
         block_idx: u64,
-        owner_ino: Option<u64>,
+        owner: Option<(u64, u32)>,
     },
 }
 
@@ -597,10 +599,25 @@ impl ManagerService {
                         block_index: *block_index,
                     })
                     .await
-                    .map(|o| match o {
-                        shared_refs::MarkOutcome::Marked => ManagerReply::Marked { already: false },
-                        shared_refs::MarkOutcome::Already => ManagerReply::Marked { already: true },
-                        shared_refs::MarkOutcome::Gone => ManagerReply::SharedGone,
+                    .map(|o| {
+                        // The durable bit is the authority; the RAM mark the
+                        // W1 predicate reads synchronously is set beside it
+                        // on the serving mount through the routed hooks
+                        // (absent = no armed router here, nothing to set).
+                        if o != shared_refs::MarkOutcome::Gone {
+                            if let Some(routed) = shared_refs::routed() {
+                                routed.note_marked(*vol_tag, *block_idx);
+                            }
+                        }
+                        match o {
+                            shared_refs::MarkOutcome::Marked => {
+                                ManagerReply::Marked { already: false }
+                            }
+                            shared_refs::MarkOutcome::Already => {
+                                ManagerReply::Marked { already: true }
+                            }
+                            shared_refs::MarkOutcome::Gone => ManagerReply::SharedGone,
+                        }
                     })
                     .map_err(|e| crate::meta_backend::kv::KvError::Busy(e.to_string())),
                 ManagerCall::ShareBlock {
@@ -619,8 +636,12 @@ impl ManagerService {
                             }
                         })
                         .collect();
+                    // PR 3/4's law for the wire words: every named reference
+                    // is confirmed against durable state (exists, SHARED)
+                    // before the index moves; a frame with one bad word is
+                    // REJECTED whole (`manager_verb_rejected`).
                     self.volume
-                        .share_block(&refs)
+                        .share_block_screened(&refs)
                         .await
                         .map(|(inserted, already)| ManagerReply::Shared {
                             inserted: inserted as u32,
@@ -630,7 +651,7 @@ impl ManagerService {
                 ManagerCall::ReleaseShared {
                     vol_tag,
                     block_idx,
-                    owner_ino,
+                    owner,
                 } => {
                     // The wire arm takes NO GC verdict: the index keys the
                     // routed GLOBAL owner and this service sees one volume's
@@ -638,7 +659,7 @@ impl ManagerService {
                     // it cannot read stands. The routed executor
                     // (`DataRouter::release_shared_at`) is the GC arm.
                     self.volume
-                        .release_shared(*vol_tag, *block_idx, *owner_ino, |_| async { Ok(true) })
+                        .release_shared(*vol_tag, *block_idx, *owner, |_| async { Ok(true) })
                         .await
                         .map(|v| match v {
                             shared_refs::SharedRelease::NotShared => ManagerReply::SharedReleased {
@@ -1056,18 +1077,19 @@ impl ManagerClient {
         }
     }
 
-    /// `ReleaseShared` at the index home — `Ok((shared, remaining))`.
+    /// `ReleaseShared` at the index home — `Ok((shared, remaining))`;
+    /// `owner` = the releasing `(ino, block_index)`.
     pub async fn release_shared(
         &mut self,
         vol_tag: u64,
         block_idx: u64,
-        owner_ino: Option<u64>,
+        owner: Option<(u64, u32)>,
     ) -> Result<(bool, u32)> {
         match self
             .call(ManagerCall::ReleaseShared {
                 vol_tag,
                 block_idx,
-                owner_ino,
+                owner,
             })
             .await?
         {

@@ -4093,6 +4093,43 @@ impl RoutedMetaBackend {
         out
     }
 
+    /// Symmetric PR 7 — `MarkShared { F, b… }` through the routed layer's
+    /// DOOR (the shape of [`Self::commit_block_refs`], every 4a-guarded
+    /// mutation of `ino`'s records takes): a peer-owned ino (S9's verb
+    /// router names an owner) refuses loud — the wire `MarkShared` at a
+    /// foreign holder is PR 12's; the S10 delegation gate and the §5.5.2a
+    /// cutover gate (a slot mid-`migrate-meta-slot` parks the mark before
+    /// 4a exactly as it parks a layout commit), the volume's enabled
+    /// check, then the volume's one-tx executor on `refs` — which the
+    /// caller already keys in the VOLUME's key form (the local key ino on
+    /// a forest — the clone path builds them beside the index's global
+    /// entries).
+    pub async fn mark_block_refs_shared(
+        &self,
+        ino: Ino,
+        refs: &[crate::meta_backend::kv::block_refs::BlockRef],
+    ) -> Result<Vec<crate::meta_backend::kv::shared_refs::MarkOutcome>> {
+        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
+            let owner = r
+                .owner_for_ino(ino)
+                .map(|o| o.endpoint.clone())
+                .unwrap_or_else(|| "a peer".to_string());
+            return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                "MarkShared: ino {ino} is owned by {owner} — the wire MarkShared at a foreign \
+                 slot holder lands with the symmetric program's PR 12"
+            )));
+        }
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
+        let _gate = self.slot_gate_enter(&[ino]).await;
+        let (v_idx, _local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        let out = self.volumes[v_idx].mark_block_refs_shared(refs).await;
+        if out.is_err() {
+            self.mirror_volume_failure(v_idx);
+        }
+        out
+    }
+
     /// PR 2 (kvmap): is the block-map tree engaged on `ino`'s HOME volume
     /// (incompat bit 16 stamped, tree mounted)? The crossing decision's
     /// probe — `false` keeps the legacy indirect-blob arm.

@@ -309,7 +309,7 @@ enum ArbCall {
     ReleaseShared {
         vol_tag: u64,
         block_idx: u64,
-        owner_ino: Option<u64>,
+        owner: Option<(u64, u32)>,
     },
 }
 
@@ -400,11 +400,11 @@ impl From<ArbCall> for ManagerCall {
             ArbCall::ReleaseShared {
                 vol_tag,
                 block_idx,
-                owner_ino,
+                owner,
             } => ManagerCall::ReleaseShared {
                 vol_tag,
                 block_idx,
-                owner_ino,
+                owner,
             },
         }
     }

@@ -1827,6 +1827,74 @@ pub type SharedFreeGate = std::sync::Arc<
         + Sync,
 >;
 
+/// The packer's scope key on an armed set (design §5.4.3 law 1): the
+/// META VOLUME ordinal over the forest slot — the native forest slot is
+/// `0` on every meta volume, so the slot alone would pool two volumes'
+/// natives into one pack block whose references live in two slot trees.
+/// The slot needs 17 bits; the volume rides the high word.
+pub fn pack_scope_key(
+    meta_volume: usize,
+    slot: crate::meta_backend::kv::record::ForestSlot,
+) -> u64 {
+    ((meta_volume as u64) << 32) | u64::from(slot)
+}
+
+/// The durable flags of a reference named by its GLOBAL owner, read on
+/// the owner's own volume in that volume's key form (`Some(shared)`;
+/// `None` = no record) — the routed view the shared-block index's GC arm
+/// and the served `ShareBlock`'s screen resolve through.
+async fn routed_ref_flags(
+    mb: &crate::meta_backend::RoutedMetaBackend,
+    r: crate::meta_backend::kv::block_refs::BlockRef,
+) -> std::result::Result<Option<bool>, crate::meta_backend::kv::KvError> {
+    let (v, local) = mb.route_ino(r.owner_ino);
+    let Some(vol) = mb.volumes.get(v) else {
+        return Ok(None);
+    };
+    let owner = if vol.symmetric_forest() {
+        local
+    } else {
+        r.owner_ino
+    };
+    vol.block_ref_flags(&crate::meta_backend::kv::shared_refs::with_owner(&r, owner))
+        .await
+}
+
+/// What the router lends the volume-level index executors (symmetric PR
+/// 7 — `shared_refs::RoutedSharedRefs`): the routed reference-flag read
+/// and the RAM SHARED mark a served `MarkShared` sets on this mount.
+struct RoutedSharedRefHooks {
+    meta: std::sync::Weak<crate::meta_backend::RoutedMetaBackend>,
+    backend_router: std::sync::Arc<BackendRouter>,
+}
+
+impl crate::meta_backend::kv::shared_refs::RoutedSharedRefs for RoutedSharedRefHooks {
+    fn ref_flags(
+        &self,
+        r: crate::meta_backend::kv::block_refs::BlockRef,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<Option<bool>, crate::meta_backend::kv::KvError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let Some(mb) = self.meta.upgrade() else {
+                return Ok(None);
+            };
+            routed_ref_flags(&mb, r).await
+        })
+    }
+
+    fn note_marked(&self, vol_tag: u64, block_idx: u64) {
+        if let Some((alloc, offset)) = self.backend_router.allocator_for_tag(vol_tag, block_idx) {
+            alloc.mark_shared(offset);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct BackendRouter {
     pub default_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
@@ -2620,7 +2688,9 @@ impl BackendRouter {
         self.shared_free_gate.set(gate).is_ok()
     }
 
-    /// Is the shared-block index's free gate armed on this router?
+    /// Is the shared-block index's free gate armed on this router? A
+    /// contract accessor (`tests/sym_shared_refs_tests.rs` pins the arm on
+    /// an armed set and its absence unarmed); no product reader.
     pub fn shared_free_gate_armed(&self) -> bool {
         self.shared_free_gate.get().is_some()
     }
@@ -4721,13 +4791,32 @@ impl BackendRouter {
                 std::collections::BTreeMap::new();
             let mut refs: Vec<crate::meta_backend::kv::block_refs::BlockRef> = Vec::new();
             for kv in &routed.volumes {
-                for r in kv.block_ref_scan(vol_tag).await.map_err(|e| {
+                // A forest volume keys a reference's owner in its LOCAL KEY
+                // form (`forest_ref_ops`); the drift log below names owners
+                // an operator can `find -inum`, so fold them back to the
+                // GLOBAL ino the stamp's width and native slot decode to.
+                let keying = if kv.symmetric_forest() {
+                    kv.mounted_ledger()
+                        .membership_stamp
+                        .as_ref()
+                        .map(|st| (u64::from(st.routing_width), st.resolved_native_slot()))
+                } else {
+                    None
+                };
+                for mut r in kv.block_ref_scan(vol_tag).await.map_err(|e| {
                     SqueezefsError::InvalidOperation(format!(
                         "durable block-reference scan failed on {}: {e}",
                         kv.device_path().display()
                     ))
                 })? {
                     *durable.entry(r.block_idx).or_insert(0) += 1;
+                    if let Some((width, native)) = keying {
+                        r.owner_ino = crate::meta_backend::kv::shared_refs::global_owner(
+                            r.owner_ino,
+                            width,
+                            native,
+                        );
+                    }
                     refs.push(r);
                 }
                 for (idx, n) in alloc.derived_block_census(kv, self).await? {
@@ -5102,7 +5191,25 @@ impl BackendRouter {
             if let Some(gate) = self.shared_free_gate.get() {
                 let vol_tag =
                     crate::meta_backend::kv::block_refs::volume_tag(allocator.volume_id());
-                match gate(vol_tag, offset / allocator.chunk_size()).await? {
+                let verdict = match gate(vol_tag, offset / allocator.chunk_size()).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // The home could not decide (the journal-failure
+                        // class — the ring admission parks, so a busy ring
+                        // never lands here): the reference and the mark
+                        // STAY, the block stays allocated (the leak-safe
+                        // direction — a local verdict on a shared block
+                        // could free a peer's data), counted on the
+                        // must-stay-0 gauge and named, never discarded.
+                        crate::meta_backend::kv::shared_refs::SHARED_RELEASE_FAILURES
+                            .fetch_add(1, Ordering::Relaxed);
+                        log::warn!(
+                            "router free_block: {block_key} is SHARED and the index home could                              not decide its release ({e}) — the reference is kept (the block                              stays allocated until the next release or derivation)"
+                        );
+                        return Ok(false);
+                    }
+                };
+                match verdict {
                     crate::meta_backend::kv::shared_refs::SharedRelease::Held { remaining } => {
                         // Still shared: this owner's reference is released
                         // in RAM (never to 0 — a holder the RAM map never
@@ -5424,6 +5531,11 @@ pub struct DataRouterInner {
     /// gains NO teardown authority (the MARK-only rule's structural
     /// form).
     pub(crate) overlay_hooks: once_cell::sync::OnceCell<OverlayMergeHooks>,
+    /// Symmetric PR 7: the set's symmetric plane is ARMED — latched once
+    /// at `arm_shared_refs` (the mount path's arm, after the meta backend
+    /// is wired) so the W1 hot path and the packer read one relaxed load,
+    /// never a scan of the volumes.
+    pub(crate) symmetric_armed: std::sync::atomic::AtomicBool,
     pub cache: TieredCache,
     pub block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
     pub nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
@@ -7687,9 +7799,8 @@ impl DataRouter {
     /// shipped ones verbatim.
     pub fn symmetric_armed(&self) -> bool {
         self.inner
-            .meta_backend
-            .get()
-            .is_some_and(|mb| mb.volumes.iter().any(|v| v.slot_lease_armed()))
+            .symmetric_armed
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// **The shared-block index's HOME** — resolved behind ONE function
@@ -7714,21 +7825,25 @@ impl DataRouter {
             })
     }
 
-    /// Arm the router half on an ARMED forest set: seed every data
-    /// volume's RAM SHARED marks from the index (one range scan of the
-    /// home's tree 0 per data volume — the W1 predicate reads the mark
-    /// synchronously, so it must be present before the first write) and
-    /// install the terminal-free gate. A no-op — nothing installed,
-    /// nothing scanned — on every other set. Returns the marks seeded.
+    /// Arm the router half on an ARMED forest set (the mount path's arm,
+    /// after the meta backend is wired): latch `symmetric_armed`, seed
+    /// every data volume's RAM SHARED marks from the index (one range scan
+    /// of the home's tree 0 per data volume — the W1 predicate reads the
+    /// mark synchronously, so it must be present before the first write),
+    /// install the terminal-free gate and lend the volume-level executors
+    /// the routed hooks (`shared_refs::install_routed`). A no-op — nothing
+    /// latched, installed or scanned — on every other set. Returns the
+    /// marks seeded.
     pub async fn arm_shared_refs(&self) -> Result<u64> {
-        if !self.symmetric_armed() {
+        let Some(mb) = self.inner.meta_backend.get() else {
+            return Ok(0);
+        };
+        if !mb.volumes.iter().any(|v| v.slot_lease_armed()) {
             return Ok(0);
         }
-        let mb = self
-            .inner
-            .meta_backend
-            .get()
-            .expect("symmetric_armed read the backend");
+        self.inner
+            .symmetric_armed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let home = self.shared_index_home()?;
         let mut seeded = 0u64;
         for (tag, alloc) in self.backend_router.durable_ref_volumes() {
@@ -7739,11 +7854,15 @@ impl DataRouter {
                 seeded += 1;
             }
         }
-        let weak = std::sync::Arc::downgrade(mb);
+        let hooks = std::sync::Arc::new(RoutedSharedRefHooks {
+            meta: std::sync::Arc::downgrade(mb),
+            backend_router: std::sync::Arc::clone(&self.backend_router),
+        });
+        crate::meta_backend::kv::shared_refs::install_routed(hooks.clone());
         let gate: SharedFreeGate = std::sync::Arc::new(move |vol_tag: u64, block_idx: u64| {
-            let weak = weak.clone();
+            let hooks = hooks.clone();
             Box::pin(async move {
-                let Some(mb) = weak.upgrade() else {
+                let Some(mb) = hooks.meta.upgrade() else {
                     // Teardown: nothing to ask — the local verdict stands.
                     return Ok(crate::meta_backend::kv::shared_refs::SharedRelease::NotShared);
                 };
@@ -7758,15 +7877,16 @@ impl DataRouter {
         Ok(seeded)
     }
 
-    /// `ReleaseShared { b, ino }` at the index home with the routed GC
-    /// arm: an index entry whose owner no longer holds a reference to `b`
-    /// (its volume's ledger, through `route_ino`) is dropped, never
-    /// counted — the "cloner died after step 2" window's remedy.
+    /// `ReleaseShared { b, (ino, block_index) }` at the index home with
+    /// the routed GC arm: an index entry whose owner no longer holds a
+    /// reference to `b` (its volume's ledger, through `route_ino`) is
+    /// dropped, never counted — the "cloner died after step 2" window's
+    /// remedy.
     async fn release_shared_at(
         mb: &crate::meta_backend::RoutedMetaBackend,
         vol_tag: u64,
         block_idx: u64,
-        releaser: Option<u64>,
+        releaser: Option<(u64, u32)>,
     ) -> Result<crate::meta_backend::kv::shared_refs::SharedRelease> {
         let home = mb
             .volumes
@@ -7777,48 +7897,60 @@ impl DataRouter {
                 )
             })?;
         home.release_shared(vol_tag, block_idx, releaser, |r| async move {
-            let (v, local) = mb.route_ino(r.owner_ino);
-            let Some(vol) = mb.volumes.get(v) else {
-                return Ok(false);
-            };
-            Ok(vol
-                .block_ref_flags(&crate::meta_backend::kv::shared_refs::with_owner(&r, local))
-                .await?
-                .is_some())
+            Ok(routed_ref_flags(mb, r).await?.is_some())
         })
         .await
         .map_err(|e| SqueezefsError::InvalidOperation(format!("ReleaseShared at the home: {e}")))
     }
 
     /// **Steps 1–2 of the clone protocol for one dest map** (§5.4.4), on
-    /// an ARMED forest set: `MarkShared` on every source reference at the
-    /// source's holder (ONE tx under F's 4a guard; `Gone` on any block
-    /// aborts — the cloner never publishes a reference to a block that may
-    /// be freed), the RAM marks set, then `ShareBlock` naming BOTH inos'
-    /// entries at the home (chunked under the control entry's cap). The
-    /// caller publishes the dest's references WITH the SHARED bit only
-    /// after this returns — the ordering law. `Ok(false)` = the plane is
-    /// not armed (nothing done; the caller publishes plain references).
+    /// an ARMED forest set, over the entries the dest map SHARES with the
+    /// source (a landed spill copy is the caller's to exclude — nothing of
+    /// it is shared). A block goes through the protocol iff the two inos'
+    /// references would live in two slot trees — the source and dest live
+    /// in different slots, or the source's reference already carries
+    /// SHARED (a clone of a clone: the population is cross-slot whatever
+    /// this pair's slots are); a same-slot clone of an unshared block
+    /// keeps its whole population in ONE tree (§5.4.3 law 1) and needs no
+    /// mark, no index and no bit. For the shared set: `MarkShared` on
+    /// every source reference through the ROUTED face (the cutover /
+    /// delegation / S9 gates every mutation of that ino takes, then ONE tx
+    /// under F's 4a guard; `Gone` on any block aborts — the cloner never
+    /// publishes a reference to a block that may be freed), the RAM marks
+    /// set, then `ShareBlock` naming BOTH inos' entries at the home
+    /// (chunked under the control entry's cap). Returns the map indices
+    /// whose dest references the caller publishes WITH the SHARED bit —
+    /// only after this returns (the ordering law). Empty = nothing shared
+    /// (the plane is not armed, or every entry is a same-slot unshared
+    /// block).
     async fn clone_share_blocks(
         &self,
         src_ino: u64,
         dest_ino: u64,
         map: &std::collections::HashMap<u32, String>,
-    ) -> Result<bool> {
+    ) -> Result<std::collections::HashSet<u32>> {
+        let mut shared_idx = std::collections::HashSet::new();
         if !self.symmetric_armed() || map.is_empty() {
-            return Ok(false);
+            return Ok(shared_idx);
         }
-        let mb = self
-            .inner
-            .meta_backend
-            .get()
-            .expect("symmetric_armed read the backend");
+        let Some(mb) = self.inner.meta_backend.get() else {
+            return Ok(shared_idx);
+        };
         let (src_v, src_local) = mb.route_ino(src_ino);
         let src_vol = mb.volumes.get(src_v).ok_or_else(|| {
             SqueezefsError::InvalidOperation(format!(
                 "clone: source ino {src_ino} homes on an unmounted volume {src_v}"
             ))
         })?;
+        let src_key_owner = if src_vol.symmetric_forest() {
+            src_local
+        } else {
+            src_ino
+        };
+        let (dest_v, dest_local) = mb.route_ino(dest_ino);
+        let same_slot = src_v == dest_v
+            && crate::meta_backend::kv::record::forest_slot_of_ino(src_local)
+                == crate::meta_backend::kv::record::forest_slot_of_ino(dest_local);
         // The source's references in the SOURCE volume's key form (the
         // local key ino on a forest — `forest_ref_ops`' law) and the
         // index's entries in the routed identity (GLOBAL — the index is
@@ -7829,24 +7961,34 @@ impl DataRouter {
             let Some(r) = self.backend_router.block_ref_for(key, src_ino, *idx) else {
                 continue;
             };
-            src_refs.push(crate::meta_backend::kv::shared_refs::with_owner(
-                &r,
-                if src_vol.symmetric_forest() {
-                    src_local
-                } else {
-                    src_ino
-                },
-            ));
+            let src_ref = crate::meta_backend::kv::shared_refs::with_owner(&r, src_key_owner);
+            if same_slot {
+                // One tree holds both references unless the source's is
+                // already cross-slot shared; a missing record is the
+                // `Gone` class, decided by the mark below.
+                match src_vol.block_ref_flags(&src_ref).await.map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!("clone: source reference probe: {e}"))
+                })? {
+                    Some(false) => continue,
+                    Some(true) | None => {}
+                }
+            }
+            shared_idx.insert(*idx);
+            src_refs.push(src_ref);
             index_refs.push(r);
             index_refs.push(crate::meta_backend::kv::shared_refs::with_owner(
                 &r, dest_ino,
             ));
         }
+        if src_refs.is_empty() {
+            return Ok(shared_idx);
+        }
         // Step 1 — at F's holder (this mount holds every slot it can
         // publish into; a foreign holder's is PR 12's `ManagerClient::
-        // mark_shared`). Every block must be present: `Gone` on any means
-        // the source map is stale — abort, the caller's pins are undone.
-        let outcomes = src_vol.mark_block_refs_shared(&src_refs).await?;
+        // mark_shared`), through the routed layer's door. Every block must
+        // be present: `Gone` on any means the source map is stale — abort,
+        // the caller's pins are undone.
+        let outcomes = mb.mark_block_refs_shared(src_ino, &src_refs).await?;
         if let Some(gone) = outcomes
             .iter()
             .zip(&src_refs)
@@ -7877,38 +8019,45 @@ impl DataRouter {
                 SqueezefsError::InvalidOperation(format!("ShareBlock at the home: {e}"))
             })?;
         }
-        Ok(true)
+        Ok(shared_idx)
     }
 
     /// The packer's scope key for a tenant ino (design §5.4.3 law 1, KD-
-    /// SYM-8): its FOREST slot on an armed set — a pack block's tenants
-    /// are then inos of one slot, so every reference of the block lives
-    /// in one slot tree — and the ONE scope (`0`) everywhere else, which
-    /// is PK2's one open pack per data volume verbatim.
-    pub fn pack_scope_of(&self, ino: u64) -> u32 {
+    /// SYM-8): `(meta volume, forest slot)` on an armed set — a pack
+    /// block's tenants are then inos of one slot OF ONE VOLUME, so every
+    /// reference of the block lives in one slot tree (the native forest
+    /// slot is `0` on EVERY meta volume: a converted set's pre-arm inos sit
+    /// there on each, and the volume ordinal is what keeps two volumes'
+    /// natives apart) — and the ONE scope (`0`) everywhere else, which is
+    /// PK2's one open pack per data volume verbatim.
+    pub fn pack_scope_of(&self, ino: u64) -> u64 {
         if !self.symmetric_armed() {
             return 0;
         }
-        let mb = self
-            .inner
-            .meta_backend
-            .get()
-            .expect("symmetric_armed read the backend");
-        let (_v, local) = mb.route_ino(ino);
-        crate::meta_backend::kv::record::forest_slot_of_ino(local)
+        let Some(mb) = self.inner.meta_backend.get() else {
+            return 0;
+        };
+        let (v, local) = mb.route_ino(ino);
+        pack_scope_key(
+            v,
+            crate::meta_backend::kv::record::forest_slot_of_ino(local),
+        )
     }
 
     /// **The W1 predicate's durable clause** (design-symmetric-metadata
     /// §5.4.3 law 2): on an ARMED set, `refcount(b)` for the sole-owner
     /// patch is ONE range probe of the patching ino's slot tree — which by
-    /// the pack law holds every reference of a block nobody cloned (a
-    /// cloned one carries the SHARED mark `begin_patch_sole_owner` already
-    /// refuses on). The RAM count this mount seeded at its open knows
-    /// nothing of a reference a PREDECESSOR lessee committed into a tree
-    /// handed over since, so the durable population decides: anything but
-    /// exactly one reference refuses (the CoW fallback, counted by the
-    /// caller on `patch_ineligible_shared`). Unarmed / flat: `true`
-    /// without a read — the shipped predicate stands alone.
+    /// the pack law holds every reference of a block nobody cloned — and
+    /// the probe's records carry the SHARED flag the predicate "adds": a
+    /// count of exactly one WITHOUT the flag is sole ownership; anything
+    /// else refuses (the CoW fallback, counted by the caller on
+    /// `patch_ineligible_shared`). The RAM count this mount seeded at its
+    /// open knows nothing of a reference a PREDECESSOR lessee committed
+    /// into a tree handed over since, and the RAM mark is an accelerator a
+    /// mark that landed elsewhere never set — the durable records decide
+    /// both. Runs BEFORE `begin_patch_sole_owner` retires the incarnation
+    /// word (a static question needs no unstable window). Unarmed / flat:
+    /// `true` without a read — the shipped predicate stands alone.
     pub async fn sole_owner_durably(
         &self,
         ino: u64,
@@ -7928,11 +8077,10 @@ impl DataRouter {
         let slot = crate::meta_backend::kv::record::forest_slot_of_ino(local);
         let vol_tag = crate::meta_backend::kv::block_refs::volume_tag(allocator.volume_id());
         match vol
-            .block_ref_probe(vol_tag, offset / allocator.chunk_size(), Some(slot))
+            .block_ref_probe_flags(vol_tag, offset / allocator.chunk_size(), Some(slot))
             .await
         {
-            Ok(1) => true,
-            Ok(_) => false,
+            Ok(probe) => probe.count == 1 && !probe.shared,
             Err(e) => {
                 // A probe that cannot read is the leak-safe direction: no
                 // in-place rewrite on a population this mount cannot see.
@@ -8832,6 +8980,15 @@ impl DataRouter {
                 }
             }
         }
+        // A re-description of the SAME reference (`bk:off:len` →
+        // `bk:off:len'` — the passthrough truncate-shrink clip, or any
+        // swap whose old and new keys resolve to one `BlockRef`) arrives
+        // as a released + a taken op for one record: the record survives
+        // unchanged, so BOTH ops are dropped — a from-scratch Put would
+        // rewrite its flags and strip a durable SHARED bit (symmetric PR
+        // 7, the C16 tripwire's one legal-op trip). The ONE law for every
+        // re-Put of an existing reference: none is written.
+        crate::meta_backend::kv::block_refs::cancel_same_reference_pairs(&mut out);
         // W-5: the fsync touched-namespace stamp rides the SAME
         // translation the durable-reference ledger does — every block a
         // layout gains is a block whose device the ino's next fsync must
@@ -11064,6 +11221,7 @@ impl DataRouter {
                 meta_backend: once_cell::sync::OnceCell::new(),
                 reclaim_probe: once_cell::sync::OnceCell::new(),
                 overlay_hooks: once_cell::sync::OnceCell::new(),
+                symmetric_armed: std::sync::atomic::AtomicBool::new(false),
                 cache,
                 block_allocator,
                 nvme_writer,
@@ -22319,31 +22477,43 @@ impl DataRouter {
             .map(|m| m.iter().map(|(b, k)| (*b, k.clone(), true)).collect())
             .unwrap_or_default();
         let mut clone_refs = self.block_ref_ops(dest_ino, &clone_changes);
-        // Symmetric PR 7 (design §5.4.4): on an ARMED forest set the two
-        // inos' references live in two slot trees, so the block is shared
-        // through the index — `MarkShared` at the source's holder and
-        // `ShareBlock` at the home run BEFORE the dest publishes (the
-        // ordering law), and the dest's own references carry the SHARED
-        // bit (a clone of a clone inherits it). A `Gone` aborts the clone
-        // ENOENT-class with every pin undone; nothing is armed on a flat
-        // or unarmed mount (`Ok(false)` — the shipped clone verbatim).
-        if let Some(map) = updated_meta.block_map.as_deref() {
-            match self.clone_share_blocks(_src_ino, dest_ino, map).await {
-                Ok(true) => {
-                    for op in &mut clone_refs {
-                        op.shared = true;
+        // Symmetric PR 7 (design §5.4.4): on an ARMED forest set two inos
+        // whose references live in two slot trees share the block through
+        // the index — `MarkShared` at the source's holder and `ShareBlock`
+        // at the home run BEFORE the dest publishes (the ordering law), and
+        // the dest's references to those blocks carry the SHARED bit (a
+        // clone of a clone inherits it). The protocol runs over the entries
+        // the dest map SHARES with the source — the pinned set: a striped
+        // source's whole map, a promoted staged source's mapping — never
+        // over a landed spill (`spill_site`): that block is a FRESH copy
+        // the source never referenced, so there is nothing to mark and a
+        // `MarkShared` on it would answer `Gone` for a healthy clone. A
+        // `Gone` aborts the clone ENOENT-class with every pin undone ONCE
+        // (the spill site, when there is one, is released by the save arm
+        // below — one release per site); nothing is armed on a flat or
+        // unarmed mount (an empty set — the shipped clone verbatim).
+        if spill_site.is_none() {
+            if let Some(map) = updated_meta.block_map.as_deref() {
+                match self.clone_share_blocks(_src_ino, dest_ino, map).await {
+                    Ok(shared_idx) => {
+                        for op in &mut clone_refs {
+                            if shared_idx.contains(&op.reference.block_index) {
+                                op.shared = true;
+                            }
+                        }
                     }
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    for bk in map.values() {
-                        let _ = self.backend_router.free_block(bk).await;
+                    Err(e) => {
+                        for bk in map.values() {
+                            if let Err(undo) = self.backend_router.free_block(bk).await {
+                                log::warn!(
+                                    "clone {src} -> {dest} aborted ({e}); undoing the pin of \
+                                     {bk} failed ({undo}) — the reference leaks until the \
+                                     next derivation"
+                                );
+                            }
+                        }
+                        return Err(e);
                     }
-                    if let Some(site) = spill_site.take() {
-                        self.release_landed_site(site, pack_publish_outcome(&e))
-                            .await;
-                    }
-                    return Err(e);
                 }
             }
         }

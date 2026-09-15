@@ -6540,6 +6540,11 @@ impl PublishService {
                     resolve(prev, *b, false, &mut out);
                 }
             }
+            // A re-description of one reference (`bk:off:len` →
+            // `bk:off:len'`) is a released + a taken op over ONE record —
+            // dropped as a pair, never re-Put from scratch (the router's
+            // `block_ref_ops` law; symmetric PR 7's SHARED bit survives).
+            crate::meta_backend::kv::block_refs::cancel_same_reference_pairs(&mut out);
             // Finding 15: the caller frame's RAM-only lifetimes — blocks
             // it took AND released inside this frame that neither the
             // head nor the composed map names (see the kv backend's

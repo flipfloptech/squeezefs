@@ -949,12 +949,13 @@ pub struct RoutedMetaBackend {
 }
 
 /// The directory-parent memo's capacity: the dentry-cache derivation
-/// (`fuse_client`'s `dir_entry_capacity` — one entry per hot directory,
-/// never a fixed constant).
+/// (`mem_budget::dir_entry_capacity` — one entry per hot directory, the
+/// same function the FUSE dentry cache sizes by; never a fixed constant).
 fn dir_parent_memo() -> moka::sync::Cache<u64, (u64, std::sync::Arc<str>), ahash::RandomState> {
-    let total_memory = crate::mem_budget::shared_system_ram_bytes();
     moka::sync::Cache::builder()
-        .max_capacity(std::cmp::max(50_000, total_memory / 200_000))
+        .max_capacity(crate::mem_budget::dir_entry_capacity(
+            crate::mem_budget::shared_system_ram_bytes(),
+        ))
         .build_with_hasher(ahash::RandomState::new())
 }
 

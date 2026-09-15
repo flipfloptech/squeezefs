@@ -1028,6 +1028,16 @@ pub fn shared_system_ram_bytes() -> u64 {
     fleet_shared_root(system_ram_bytes(), crate::cpu::fleet_share())
 }
 
+/// The dentry-class entry-count capacity over `total_memory` bytes:
+/// `max(50_000, total / 200_000)` — one entry per 200 KB of the shared
+/// RAM, floored at the shipped posture. The ONE derivation the FUSE
+/// dentry cache, its `..` parent memo and the cross-owner directory-parent
+/// memo size by (review round 2, Issue 27 — two literals became this;
+/// tie-tested in `derivation_sweep_tests`).
+pub fn dir_entry_capacity(total_memory: u64) -> u64 {
+    std::cmp::max(50_000, total_memory / 200_000)
+}
+
 /// §5.6's floor-refusal arithmetic, pure (the tie-test form): floors are
 /// NEVER divided, so a share whose divided derived budget cannot hold
 /// the kernel-mandated transport floor — `possible_cpus ×

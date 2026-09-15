@@ -5,7 +5,7 @@
 | **Date** | 2026-09-15 |
 | **Branch** | `feat/sym-cross-owner-tx` (cut from `dev` @ `6f8d44e6` — PR 1, 2, 3, 4, 11 and 16 in) |
 | **Design** | [`docs/design-symmetric-metadata.md`](../docs/design-symmetric-metadata.md) §5.6 (D18 reversed), §5.6.4 (the set-wide lock), §5.3.5 (idempotent verbs), §5.4.2, §11 (the Cross-owner family); PR-plan row 6; KD-SYM-14 |
-| **Contracts** | [`tests/sym_cross_owner_tests.rs`](../tests/sym_cross_owner_tests.rs) — 23 contracts + the `#[ignore]`d scoping instrument (15 at round 1, 8 added by review round 2 — §8), appended to `tests/run_sym_forest_suites.sh`'s list |
+| **Contracts** | [`tests/sym_cross_owner_tests.rs`](../tests/sym_cross_owner_tests.rs) — 28 contracts + the `#[ignore]`d scoping instrument (15 at round 1, 8 added by review round 2 — §8, 5 by round 3 — §9), appended to `tests/run_sym_forest_suites.sh`'s list |
 | **Venue** | the dev laptop — **SCOPING only** (the venue rule: no acceptance row is this rung's; the `tar -x` / shared-directory brackets are PR 13/14's on squeeze-test). Four implementers shared the box during every number below. |
 | **Instrument** | in-process file-backed volumes (64 KiB nodes, a 1 MiB ring, one 64 MiB volume, one file-backed data volume for the offline fsck), the two-appender declared-partition model over a real `cluster_wire` loopback session; `cargo test --release` for the rate row, debug for the contracts |
 | **Status** | landed dark: bit 17 AND `SQUEEZEFS_SYMMETRIC_META=1`; `=0` and every bit-17-absent mount take the S3.5 paths verbatim (pinned on both layouts) |
@@ -158,4 +158,20 @@ Every gauge added by the round is on the stats inode and in `docs/operations.md`
 
 - The recovery-side ABORT marker: a plan a live refusal stopped is compensated under the op's guards, and since review round 2 (Issue 26) the retirement RIDES the last inverse's own entry when that inverse is local to the intent's volume (the rider pattern — compensation + retirement are one commit, pinned: a link's live refusal is `tx0` + ONE entry). The window that remains is a kill between an applied step and that last inverse — and, when the last inverse is FOREIGN (a plan whose step 0 shipped), until the separate retirement lands — after which the roll-forward completes the plan FORWARD (re-meeting the refusal; the applied halves stand for the C9/C10 census, the just-undone half returning because the compensation restored exactly the forward witness). Recording the abort on the intent record and recovering it as an undo is the answer; not built here.
 - The lock verbs' caller identity: `appender_id` is screened against the directory (a `Live` non-own page) and the record (the holder), not against the SESSION — the session→appender binding is PR 12's join ladder (PR 4's slot verbs carry the same limitation).
+
+## 9. Review round 3 (2026-09-15) — the seven open items closed
+
+| Issue | The change | Pin |
+|---|---|---|
+| 21 | the intent scan is SCOPED to homes whose slot this mount's step-home is `Local` for — a peer slot's intent is never adopted here; the cross-process face (a dead initiator's intents adopted by the mount that recovers its ring; an intent inherited with a re-leased slot scanned at its lease install) is PR 12's obligation (§8a, the design row) | `an_intent_homed_in_a_slot_another_appender_leases_is_never_adopted_here` (a record planted in the declared region's slot home: the raw scan sees it, the roll-forward adopts nothing) |
+| 22 | the lease-gated sweep keeps a client the installed owner does NOT know for the grace window (the doc's law; the code released it at the next tick) — the safety argument on the line: an early release costs isolation, never correctness | the plane-armed contract gained the unknown-client leg |
+| 23 | the ticket JOIN is gone: one permit per `(volume uuid, identity)` — the lease serializes OPS; the second directory rename of one identity waits for the first's release; no dependency on the kernel's `s_vfs_rename_mutex` (an S8-served `Rename` and the offline `RoutedMetaBackend` callers never pass through it) | `two_directory_renames_of_one_identity_serialize_under_the_lease` (disjoint 4a sets; red pre-fix: r2 joined and completed beside r1) |
+| 24 | keyed by the volume's durable uuid, never an `Arc` address; the permit is RAII on the lease and drops in the release's own scope (also on the `Drop` path) | — (the ticket counter no longer exists) |
+| 25 | `b`'s name chosen off `D{root,shared1}`'s stripe and the fixed pair asserted disjoint; pins for the coverage-checked `Covered` (a step outside its scope's parked keys PARKS behind a local holder — verified to fail with the coverage test removed, reverted) and the `xv_local_step_unguarded` tripwire (a plan on B under guards acquired over A trips once; the covered shape never) | `a_step_outside_its_scopes_parked_keys_takes_its_own_guards_and_parks`, `a_local_step_outside_its_scopes_keys_trips_the_invariant_tripwire` |
+| 26 | the retirement RIDES the last local inverse's own entry (compensation + retirement = ONE commit, `xv_destroy_unnamed` takes the rider too); the remaining window stated to its true end — before that inverse, or before the separate retirement when the last inverse is foreign | the compensation pin asserts a link's live refusal is `tx0` + ONE journal entry |
+| 27 | `mem_budget::dir_entry_capacity` is the ONE derivation the FUSE dentry cache, its `..` memo and the directory-parent memo size by (the `fuse_client.rs` site is a one-line call — noted for the rebase); tie test `dir_entry_capacity_is_one_derivation_with_the_shipped_floor`; the AGENTS count says 28 | `derivation_sweep_tests` |
+
+### 9a. Run ledger (round 3, the final tree)
+
+Filled in the round-3 implementation summary in the review file; the same table.
 

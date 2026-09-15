@@ -142,6 +142,34 @@ fn node_cache_budget_derives_from_memory_budget() {
 }
 
 // ---------------------------------------------------------------------------
+// Dentry-class entry-count capacity: max(50_000, RAM / 200_000) — ONE fn
+// ---------------------------------------------------------------------------
+
+/// `mem_budget::dir_entry_capacity` is the one derivation the FUSE dentry
+/// cache, its `..` parent memo and the cross-owner directory-parent memo
+/// size by (PR 6 review round 2, Issue 27): one entry per 200 KB of the
+/// shared RAM, floored at the shipped 50 000. A second literal is the
+/// drift this tie makes red.
+#[test]
+fn dir_entry_capacity_is_one_derivation_with_the_shipped_floor() {
+    use squeezefs::mem_budget::dir_entry_capacity;
+    // Field shape: 176 GiB / 200 KB ≈ 944 k entries.
+    assert_eq!(dir_entry_capacity(176 * GIB), 176 * GIB / 200_000);
+    // Floor shape: 2.8 GiB / 200 KB ≈ 15 k < 50 k ⇒ the shipped floor.
+    assert_eq!(dir_entry_capacity(FLOOR_BUDGET), 50_000);
+    // The boundary: exactly at the floor's RAM the two agree.
+    assert_eq!(dir_entry_capacity(50_000 * 200_000), 50_000);
+    assert_eq!(dir_entry_capacity(50_001 * 200_000), 50_001);
+    // The literal the two sites once carried, as the tie.
+    for total in [0u64, 1 << 30, 64 << 30, 1 << 40] {
+        assert_eq!(
+            dir_entry_capacity(total),
+            std::cmp::max(50_000, total / 200_000)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // A5 — checkpoint dirty-node cap: budget/32 ÷ node_size, shipped floor
 // ---------------------------------------------------------------------------
 

@@ -9773,7 +9773,7 @@ impl SqueezefsFilesystem {
         // at the root, the entry-count slopes below untouched; share 1
         // is the raw probe, byte-identical).
         let total_memory = crate::mem_budget::shared_system_ram_bytes();
-        let dir_entry_capacity = std::cmp::max(50_000, total_memory / 200_000);
+        let dir_entry_capacity = crate::mem_budget::dir_entry_capacity(total_memory);
         // DLM S5 item 4 — TTL alignment (spec §6.8: "`dir_entry_cache_v3`'s
         // 300 s TTL cut to match"). §6.3 lists this cache first among the
         // coherence obligations precisely because its TTL is 300 s and its

@@ -1635,6 +1635,82 @@ async fn a_recall_purges_the_recalled_objects_block_keys_and_leaves_the_rest() {
     shutdown(&writer).await;
 }
 
+/// **The holder answers `NotHolder` for a slot it does not lease**
+/// (review round 1, Issue 12): a wire joiner acquires a slot; a reader's
+/// grant on an object of that slot is answered `NotHolder { holder }` —
+/// one lease-table read BEFORE anything is registered or read — and the
+/// reader fails closed naming the holder (PR 12's redirect trigger),
+/// never a grant of this manager's stale-by-construction view of a tree
+/// another appender is RAM-authoritative for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_on_a_slot_another_appender_leases_is_answered_not_holder() {
+    use squeezefs::meta_backend::guest_local_ino;
+    use squeezefs::meta_backend::kv::appender::AppenderIdentity;
+    use squeezefs::meta_ship::manager::{ManagerClient, ManagerReply, ManagerService};
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let vol = Arc::clone(&writer.volumes[0]);
+    let (host, endpoint) = holder_listener(&vol);
+    let holder = vol.token_holder().unwrap().clone();
+    // A wire joiner takes routing slot 100 (forest slot 101 — unleased on
+    // a fresh solo mount, the rotor took 1..=64).
+    let mgr = cw::RpcListener::start_async(
+        listener_cfg(),
+        SECRET.to_vec(),
+        ManagerService::new(Arc::clone(&vol)),
+    )
+    .expect("manager listener");
+    let mut client = ManagerClient::connect(&mgr.endpoint().to_string(), SECRET, "joiner-1", 0)
+        .await
+        .expect("enrollment");
+    let ManagerReply::Joined { appender_id, .. } = client
+        .join(
+            AppenderIdentity {
+                node_token: 0x5EED_0000_0000_0001,
+                mount_slot: 0x1001,
+                writer_id: 0xABCD_0001,
+            },
+            0,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("join");
+    };
+    let routing: u16 = 100;
+    assert!(matches!(
+        client.acquire_slot(appender_id, routing).await.unwrap(),
+        ManagerReply::SlotsGranted { .. }
+    ));
+
+    let (_reader, plane) = open_token_reader(&path, &endpoint, "reader-nh").await;
+    let object = guest_local_ino(routing, 5);
+    let err = match plane.serve(object, TokenWants::default()).await {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a foreign slot's object is never served by this manager"),
+    };
+    assert!(
+        err.contains(&format!("appender {appender_id}")),
+        "the refusal names the holder: {err}"
+    );
+    assert_eq!(holder.stats().not_holder_redirects, 1);
+    assert_eq!(holder.stats().grants_served, 0, "nothing was granted");
+    assert_eq!(holder.holders(object), 0, "nothing was registered");
+    // An object of a slot THIS manager leases is served as before.
+    assert!(plane
+        .serve(1, TokenWants::default())
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(holder.stats().grants_served, 1);
+    plane.stop().await;
+    mgr.shutdown();
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
 /// The negative contract: `SQUEEZEFS_SYMMETRIC_META=0` and a flat volume
 /// carry NO token plane — no holder, no reader, the recall gate off, the
 /// Token family 0 — and an unarmed forest's frames are v2 under the

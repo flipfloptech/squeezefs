@@ -784,6 +784,95 @@ async fn a_token_is_recalled_before_the_conflicting_commit_lands() {
     shutdown(&writer).await;
 }
 
+/// **The first-touch grant ∥ pass race** (review round 1, Issue 2 — the
+/// central law's hole). Schedule: a pass mutating the root (a create)
+/// computes its recall union while NO reader holds the root, and is held
+/// between that union and its apply; a reader's FIRST-TOUCH grant on the
+/// root is served inside the hold; the pass then applies. Before the fix
+/// the grant read the pre-commit records and was recorded AFTER its read,
+/// so the pass — which saw no holder — never recalled it: the reader
+/// cached a stale dentry set for ever. The law: the grant registers
+/// BEFORE it reads and PARKS while the object is in flight
+/// (`dlm_token_grant_parks` +1), and the reader sees the committed record
+/// at its next resolve — exact, with no recall needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_touch_grant_inside_the_pass_window_serves_the_committed_records() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-ft").await;
+    let holder = writer.volumes[0].token_holder().unwrap().clone();
+    assert!(
+        !plane.holds(1),
+        "nothing cached yet — the grant is a first touch"
+    );
+    assert_eq!(holder.holders(1), 0);
+
+    // Hold the pass AFTER its recall union (which sees no holder) and
+    // BEFORE its apply.
+    let parked0 = squeezefs::meta_backend::kv::backend::test_conveyor_post_recall_parked();
+    TEST_CONVEYOR_HOLD_STAGE.store(
+        squeezefs::meta_backend::kv::backend::TEST_CONVEYOR_HOLD_POST_RECALL,
+        Ordering::SeqCst,
+    );
+    let w = Arc::clone(&writer);
+    let create = tokio::spawn(async move {
+        Metadata::create(w.as_ref(), 1, "late", libc::S_IFREG | 0o644, 0, 0).await
+    });
+    wait_until("the pass parked in the post-recall window", || {
+        squeezefs::meta_backend::kv::backend::test_conveyor_post_recall_parked() > parked0
+    })
+    .await;
+    assert_eq!(
+        holder.stats().recalls,
+        0,
+        "the union saw no holder: nothing was recalled"
+    );
+
+    // The reader's first-touch grant on the root, inside the window.
+    let r = Arc::clone(&reader);
+    let lookup = tokio::spawn(async move { Metadata::lookup(r.as_ref(), 1, "late").await });
+    wait_until(
+        "the grant registered and parked on the in-flight object",
+        || holder.stats().grant_parks >= 1,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !lookup.is_finished(),
+        "a grant on an object a pass holds in flight is served only after the apply"
+    );
+
+    // Release the pass: it applies and settles; the parked grant reads the
+    // committed records.
+    TEST_CONVEYOR_HOLD_STAGE.store(0, Ordering::SeqCst);
+    test_conveyor_hold_release();
+    let created = create.await.unwrap().unwrap();
+    let seen = lookup
+        .await
+        .unwrap()
+        .expect("the reader's first resolve sees the committed create — exact");
+    assert_eq!(seen.ino, created.ino);
+    assert!(plane.holds(1), "the root's token is cached, post-commit");
+    assert_eq!(holder.holders(1), 1, "the grant is in the holder table");
+    // And the cache stays exact: a second foreign create recalls it.
+    let c2 = Metadata::create(writer.as_ref(), 1, "later", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        Metadata::lookup(reader.as_ref(), 1, "later")
+            .await
+            .unwrap()
+            .ino,
+        c2.ino
+    );
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
 /// §5.7.1 — the batching law: a conveyor pass recalls the UNION of its
 /// batch's objects ONCE. Sixteen creates held into one pass under the
 /// conveyor's pre-drain seam recall the directory's token once (one
@@ -927,13 +1016,19 @@ async fn a_reader_past_t_self_serves_nothing_from_cache() {
     shutdown(&writer).await;
 }
 
-/// §5.7.1 — an unacked recall completes at the reader's LEASE EXPIRY:
-/// with the reader's channel stopped (a dead reader), the commit waits the
-/// derived bound (the lease TTL — 1 s here, the knob's floor), the lane
-/// retires the grant, `expired_with_lease` counts it and
-/// `timeouts_live` — the must-stay-0 stuck-reader class — does not.
-/// The same shape under a LIVE lease verdict counts `timeouts_live` and
-/// opens the free-grace recall window (the ring's timeout path).
+/// §5.7.1 — a recall completes when the reader acks OR when the
+/// membership owner sees its LEASE EXPIRED — never at a timer's deadline
+/// (review round 1, Issue 5). A dead reader (`test_die` — its channel
+/// gone without a release) holds the root and 64 file tokens; a create in
+/// the root recalls the root's token while the oracle still calls the
+/// lease LIVE, then the lease expires: the commit completes AT the
+/// expiry — well inside the 1 s deadline — `expired_with_lease` counts
+/// the recall, `timeouts_live` (the stuck-reader class) does not, the
+/// closure `recalls ≡ acks + expired_with_lease` holds, and the dead
+/// reader's 64 OTHER grants are swept with it (`lease_swept_grants`), so a
+/// second pass on one of those files waits for nobody. The same shape
+/// under a lease the oracle keeps LIVE past the deadline counts
+/// `timeouts_live` and opens the free-grace recall window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unacked_recall_completes_at_the_readers_lease_expiry() {
     let _g = SEAM.lock().await;
@@ -943,25 +1038,53 @@ async fn an_unacked_recall_completes_at_the_readers_lease_expiry() {
     let (host, endpoint) = holder_listener(&writer.volumes[0]);
     let holder = writer.volumes[0].token_holder().unwrap().clone();
     std::env::set_var("SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS", "1000");
-    let verdict = Arc::new(std::sync::Mutex::new(LeaseVerdict::Expired));
+    let verdict = Arc::new(std::sync::Mutex::new(LeaseVerdict::Live));
     let v = Arc::clone(&verdict);
     holder.install_lease_oracle(Arc::new(move |_client: &str| {
         *v.lock().unwrap_or_else(|p| p.into_inner())
     }));
+    const N: usize = 64;
+    let mut files = Vec::with_capacity(N);
+    for i in 0..N {
+        files.push(
+            Metadata::create(
+                writer.as_ref(),
+                1,
+                &format!("f{i}"),
+                libc::S_IFREG | 0o644,
+                0,
+                0,
+            )
+            .await
+            .unwrap()
+            .ino,
+        );
+    }
 
-    // A dead reader: its token is held at the holder, its channel gone
-    // WITHOUT a release (`die` — never the clean leave's `stop`).
+    // A dead reader: the root's and the 64 files' tokens are held at the
+    // holder, its channel gone WITHOUT a release (`die` — never the clean
+    // leave's `stop`).
     let (reader, plane) = open_token_reader(&path, &endpoint, "reader-dead").await;
     let _ = Metadata::getattr(reader.as_ref(), 1).await.unwrap();
+    for ino in &files {
+        let _ = Metadata::getattr(reader.as_ref(), *ino).await.unwrap();
+    }
     assert_eq!(holder.holders(1), 1);
+    assert_eq!(holder.outstanding(), (N + 1) as u64);
     plane.test_die();
     tokio::time::sleep(Duration::from_millis(1_200)).await; // past the channel's park bound
     assert_eq!(
         holder.holders(1),
         1,
-        "a dead reader's grant stays until the lease bound"
+        "a dead reader's grant stays while its lease is live"
     );
 
+    // The lease expires 300 ms into the recall.
+    let v = Arc::clone(&verdict);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        *v.lock().unwrap_or_else(|p| p.into_inner()) = LeaseVerdict::Expired;
+    });
     let t0 = std::time::Instant::now();
     Metadata::create(writer.as_ref(), 1, "d", libc::S_IFREG | 0o644, 0, 0)
         .await
@@ -980,16 +1103,46 @@ async fn an_unacked_recall_completes_at_the_readers_lease_expiry() {
     );
     assert_eq!(holder.holders(1), 0, "the dead reader's grant is retired");
     assert!(
-        wall >= Duration::from_millis(900) && wall < Duration::from_secs(10),
-        "the commit waited the lease bound, not for ever: {wall:?}"
+        wall >= Duration::from_millis(280) && wall < Duration::from_millis(900),
+        "the commit completed at the lease's expiry, never at the 1 s deadline: {wall:?}"
+    );
+    assert_eq!(
+        hs.lease_swept_grants, N as u64,
+        "the dead reader's other grants were swept with its lease"
+    );
+    assert_eq!(holder.outstanding(), 0);
+    // The second pass, on one of the swept files: nobody to recall.
+    let t1 = std::time::Instant::now();
+    Metadata::setattr(
+        writer.as_ref(),
+        files[7],
+        Some(0o640),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        t1.elapsed() < Duration::from_millis(200),
+        "the second pass never waits on the dead reader"
+    );
+    assert_eq!(
+        holder.stats().recalls,
+        hs.recalls,
+        "no new recall was issued"
     );
     assert_eq!(
         free_grace::recall_gate_verdict(),
         free_grace::RecallGate::Gated
     );
 
-    // The LIVE shape: a second dead reader whose lease the oracle calls
-    // live — the tripwire class, and the free path takes the ring.
+    // The LIVE shape: a second dead reader whose lease the oracle keeps
+    // live past the deadline — the tripwire class, and the free path takes
+    // the ring.
     *verdict.lock().unwrap() = LeaseVerdict::Live;
     let (reader2, plane2) = open_token_reader(&path, &endpoint, "reader-stuck").await;
     let _ = Metadata::getattr(reader2.as_ref(), 1).await.unwrap();
@@ -1007,9 +1160,14 @@ async fn an_unacked_recall_completes_at_the_readers_lease_expiry() {
         Duration::from_millis(4_000),
         Duration::from_millis(2_000),
     );
+    let t2 = std::time::Instant::now();
     Metadata::create(writer.as_ref(), 1, "e", libc::S_IFREG | 0o644, 0, 0)
         .await
         .unwrap();
+    assert!(
+        t2.elapsed() >= Duration::from_millis(900),
+        "a LIVE lease that never acks waits the whole deadline"
+    );
     let hs = holder.stats();
     assert_eq!(hs.timeouts_live, 1);
     assert_eq!(hs.expired_with_lease, 1);

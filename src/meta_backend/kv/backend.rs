@@ -276,6 +276,22 @@ pub const TEST_CONVEYOR_HOLD_PRE_ROLLBACK: u64 = 4;
 /// schedule formed.
 static TEST_CONVEYOR_PRE_ROLLBACK_PARKED: AtomicU64 = AtomicU64::new(0);
 
+/// [`TEST_CONVEYOR_HOLD_STAGE`] value (PR 5, review round 1 Issue 2):
+/// park the apply pass AFTER its token recall computed the batch's union
+/// and BEFORE the pipeline applies — the window a first-touch grant races
+/// (the pass saw no holder; the grant's read would land pre-commit
+/// records no recall reaches).
+pub const TEST_CONVEYOR_HOLD_POST_RECALL: u64 = 5;
+
+/// Monotonic count of passes that PARKED on
+/// [`TEST_CONVEYOR_HOLD_POST_RECALL`] — the test-side barrier.
+static TEST_CONVEYOR_POST_RECALL_PARKED: AtomicU64 = AtomicU64::new(0);
+
+/// Passes parked on [`TEST_CONVEYOR_HOLD_POST_RECALL`] so far.
+pub fn test_conveyor_post_recall_parked() -> u64 {
+    TEST_CONVEYOR_POST_RECALL_PARKED.load(Ordering::Acquire)
+}
+
 /// Lane groups parked on [`TEST_CONVEYOR_HOLD_PRE_ROLLBACK`] so far.
 pub fn test_conveyor_hold_parked() -> u64 {
     TEST_CONVEYOR_PRE_ROLLBACK_PARKED.load(Ordering::Acquire)
@@ -17307,6 +17323,20 @@ impl KvMetaBackend {
         // batch's objects is recalled once and the pass waits for the
         // acks (or the readers' lease expiry). One relaxed load unarmed.
         let recalled = self.recall_tokens_for_batch(&batch).await;
+        // Test seam: the post-recall / pre-apply window (register-recheck).
+        if TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed) == TEST_CONVEYOR_HOLD_POST_RECALL {
+            TEST_CONVEYOR_POST_RECALL_PARKED.fetch_add(1, Ordering::AcqRel);
+            while TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed) == TEST_CONVEYOR_HOLD_POST_RECALL
+            {
+                let notified = TEST_CONVEYOR_HOLD_NOTIFY.notified();
+                if TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed)
+                    != TEST_CONVEYOR_HOLD_POST_RECALL
+                {
+                    break;
+                }
+                notified.await;
+            }
+        }
         let ring = self.ring_of_region(region);
         let mut sentinel = PassSentinel {
             be: self,

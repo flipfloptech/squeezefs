@@ -266,6 +266,7 @@ pub mod sqz_sync_core;
 pub mod storage;
 pub mod stripe_locks;
 pub mod supervisor;
+pub mod token_grant_core;
 // The S8 client token cache's word protocol (spec §6.9's
 // `token_cache_core` loom obligation, KD-MW-10) — the monotone grant
 // slot + era floor `meta_ship/tokens.rs` runs on.

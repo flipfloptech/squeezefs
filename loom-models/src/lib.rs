@@ -177,6 +177,17 @@
 //!   yield exactly one holder and one `g` increment; an offer lapsing
 //!   under an accept never yields two holders; a release by a stale
 //!   holder or `g` is refused and the live holder's words stand.
+//! - [`token_grant_core`]: the read-token holder's GRANT ∥ PASS gate
+//!   (design-symmetric-metadata §5.7.1, PR 5 — review round 1, Issue 2)
+//!   — invariant: a first-touch grant racing the conveyor pass that
+//!   mutates its object is either RECALLED by that pass (the pass's
+//!   holder read saw the registration) or PARKED until the pass settles
+//!   (the grant's in-flight read saw the mark) — never neither, the
+//!   schedule under which a reader installs pre-commit records no recall
+//!   ever reaches. Weakening-verified: with either side's two steps
+//!   SWAPPED loom finds the pass reading no holder AND the grant reading
+//!   no mark (the two tables are mutexed, so the ORDER of the steps is
+//!   the load-bearing part — the locks' own chains order them).
 //! - [`lane_core`]: the pre-RC spec §6.2 items 5/6 per-writer LANE cursor
 //!   (per-writer ino cursors + block-key incarnation stamps) — invariants:
 //!   two appenders' concurrent mints are never equal and never leave their
@@ -366,6 +377,8 @@ pub mod slot_lease_core;
 pub mod sqz_sync_core;
 #[path = "../../src/token_cache_core.rs"]
 pub mod token_cache_core;
+#[path = "../../src/token_grant_core.rs"]
+pub mod token_grant_core;
 #[path = "../../crates/fuse3/src/raw/connection/wake_core.rs"]
 pub mod wake_core;
 #[path = "../../src/write_pipeline_core.rs"]
@@ -7397,6 +7410,109 @@ mod park_gate_models {
                 assert!(gate.park(2_000).is_none(), "expired is sticky");
                 assert_eq!(gate.try_enter(), EnterVerdict::Expired);
             }
+        });
+    }
+}
+
+mod token_grant_models {
+    //! [`token_grant_core`] (design-symmetric-metadata §5.7.1, PR 5 —
+    //! review round 1, Issue 2): the holder's grant ∥ pass Dekker.
+    //!
+    //! The two tables are the pass's IN-FLIGHT set and the lane's HOLDER
+    //! table, both mutexed; each side takes both locks, one per step, so
+    //! the locks' acquire/release chains order the steps and no extra
+    //! fence is claimed. The model checks the ORDER the shipped code
+    //! fixes: mark-then-read-holders on the pass, register-then-read-
+    //! marks on the grant.
+    //!
+    //! Weakening evidence (verified RED 2026-09-15, then restored): with
+    //! the grant's two steps SWAPPED in `token_grant_core` (the in-flight
+    //! read before the registration — the first build's order) loom finds
+    //! the schedule where `holders == 0` AND the grant reads `Proceed`,
+    //! and the two-reader model reads `holders 1, parked 0`. (Removing
+    //! `SeqCst` fences between the steps changes nothing — the mutexes
+    //! already order them — which is why none is in the code.)
+    use crate::token_grant_core::{GrantAdmission, GrantPassGate, HolderTable};
+    use loom::sync::{Arc, Mutex};
+    use loom::thread;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const X: u64 = 4242;
+
+    /// A mutexed holder table — the S10 `RecallLane`'s `grants` map by
+    /// shape (its interior mutex is the real one's).
+    #[derive(Default)]
+    struct Table(Mutex<BTreeMap<u64, BTreeSet<String>>>);
+
+    impl HolderTable for Table {
+        fn register(&self, object: u64, client: &str) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .entry(object)
+                .or_default()
+                .insert(client.to_string())
+        }
+        fn holders(&self, object: u64) -> usize {
+            self.0.lock().unwrap().get(&object).map_or(0, |s| s.len())
+        }
+    }
+
+    /// One first-touch grant on X racing one pass whose union is {X}:
+    /// the pass sees the holder (and recalls it) OR the grant parks —
+    /// never neither.
+    #[test]
+    fn a_first_touch_grant_racing_the_pass_is_recalled_or_parked() {
+        loom::model(|| {
+            let gate = Arc::new(GrantPassGate::new());
+            let table = Arc::new(Table::default());
+            let grant = {
+                let gate = Arc::clone(&gate);
+                let table = Arc::clone(&table);
+                thread::spawn(move || gate.grant_register(X, "reader", &*table))
+            };
+            let seen = gate.pass_begin(&[X], &*table);
+            let (already, admission) = grant.join().unwrap();
+            assert!(!already, "a first touch is never `already`");
+            let holders = seen[0].1;
+            assert!(
+                holders >= 1 || admission == GrantAdmission::Park,
+                "the pass read no holder AND the grant read no mark — a reader would install \
+                 pre-commit records no recall reaches (holders {holders}, {admission:?})"
+            );
+            // The apply settles; a grant that parked is admitted after it.
+            assert!(gate.settle(&[X]));
+            assert!(!gate.is_inflight(X));
+        });
+    }
+
+    /// Two grants (two readers) racing one pass: every reader is either
+    /// counted by the pass or parked; the pass's holder count never
+    /// exceeds the readers that registered.
+    #[test]
+    fn two_readers_racing_the_pass_are_each_recalled_or_parked() {
+        loom::model(|| {
+            let gate = Arc::new(GrantPassGate::new());
+            let table = Arc::new(Table::default());
+            let spawn = |name: &'static str| {
+                let gate = Arc::clone(&gate);
+                let table = Arc::clone(&table);
+                thread::spawn(move || gate.grant_register(X, name, &*table))
+            };
+            let a = spawn("a");
+            let b = spawn("b");
+            let holders = gate.pass_begin(&[X], &*table)[0].1;
+            let (_, adm_a) = a.join().unwrap();
+            let (_, adm_b) = b.join().unwrap();
+            let parked = usize::from(adm_a == GrantAdmission::Park)
+                + usize::from(adm_b == GrantAdmission::Park);
+            assert!(
+                holders + parked >= 2,
+                "a reader was neither counted by the pass nor parked (holders {holders}, \
+                 parked {parked})"
+            );
+            assert!(holders <= 2);
+            gate.settle(&[X]);
         });
     }
 }

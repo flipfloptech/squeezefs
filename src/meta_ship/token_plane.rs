@@ -548,6 +548,9 @@ pub struct TokenHolderPlane {
     /// appender that is not one of this mount's regions (PR 12's redirect
     /// trigger; review round 1, Issue 12).
     not_holder_redirects: AtomicU64,
+    /// Verbs refused because this holder's appender park EXPIRED (PR 8's
+    /// `park_gate::admits_token_service` — the successor owns the slots).
+    park_expired_refusals: AtomicU64,
     timeouts_live: AtomicU64,
     releases: AtomicU64,
     /// Conveyor passes that recalled at least one object (the batching
@@ -592,6 +595,7 @@ impl TokenHolderPlane {
             expired_with_lease: AtomicU64::new(0),
             lease_swept_grants: AtomicU64::new(0),
             not_holder_redirects: AtomicU64::new(0),
+            park_expired_refusals: AtomicU64::new(0),
             timeouts_live: AtomicU64::new(0),
             releases: AtomicU64::new(0),
             recall_batches: AtomicU64::new(0),
@@ -1020,6 +1024,7 @@ impl TokenHolderPlane {
             expired_with_lease: self.expired_with_lease.load(Ordering::Relaxed),
             lease_swept_grants: self.lease_swept_grants.load(Ordering::Relaxed),
             not_holder_redirects: self.not_holder_redirects.load(Ordering::Relaxed),
+            park_expired_refusals: self.park_expired_refusals.load(Ordering::Relaxed),
             timeouts_live: self.timeouts_live.load(Ordering::Relaxed),
             releases: self.releases.load(Ordering::Relaxed),
             recall_batches: self.recall_batches.load(Ordering::Relaxed),
@@ -1060,6 +1065,7 @@ pub struct TokenHolderStats {
     pub expired_with_lease: u64,
     pub lease_swept_grants: u64,
     pub not_holder_redirects: u64,
+    pub park_expired_refusals: u64,
     pub timeouts_live: u64,
     pub releases: u64,
     pub recall_batches: u64,
@@ -1123,6 +1129,20 @@ impl TokenService {
                 "this volume serves no read tokens (no armed symmetric plane)".to_string(),
             );
         };
+        // PR 8 (KD-SYM-15 extended): a PARKED lessee is still the lock
+        // master for its slots — grants and recalls continue through the
+        // park; a park that EXPIRED poisoned custody and its slots are the
+        // successor's, so nothing is granted off this holder's view.
+        if !crate::park_gate::admits_token_service() {
+            plane.park_expired_refusals.fetch_add(1, Ordering::Relaxed);
+            return Self::refuse(
+                req_id,
+                STATUS_NOT_HOLDER,
+                "this holder's appender park EXPIRED (custody poisoned): its slots are the \
+                 successor's — resolve the holder again"
+                    .to_string(),
+            );
+        }
         // Every verb names its client: a member that reached this service
         // is a TOKEN client — the class the recall-gated free bypasses the
         // ring for (an S5 reader never dials it).
@@ -2500,6 +2520,7 @@ pub fn holder_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
         "dlm_token_recall_expired_with_lease": per(&|s| s.expired_with_lease),
         "dlm_token_lease_swept_grants": per(&|s| s.lease_swept_grants),
         "dlm_token_not_holder_redirects": per(&|s| s.not_holder_redirects),
+        "dlm_token_park_expired_refusals": per(&|s| s.park_expired_refusals),
         "dlm_token_recall_timeouts_live": per(&|s| s.timeouts_live),
         "dlm_token_releases": per(&|s| s.releases),
         "dlm_token_recall_batches": per(&|s| s.recall_batches),

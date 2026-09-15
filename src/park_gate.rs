@@ -227,8 +227,10 @@ pub fn bounded_timers_suspended() -> bool {
 }
 
 /// A parked lessee is still the lock master for its slots: token grants
-/// and recalls continue (PR 5's token plane reads this; the seam-level
-/// stand-in until it lands).
+/// and recalls continue; an EXPIRED park poisoned custody and its slots
+/// are the successor's. Read by the token holder's dispatch
+/// (`meta_ship::token_plane::TokenService` — every verb refuses past the
+/// expiry, `dlm_token_park_expired_refusals`).
 pub fn admits_token_service() -> bool {
     !GATE.is_expired()
 }

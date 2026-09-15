@@ -1697,10 +1697,86 @@ async fn the_shared_index_home_follows_the_allocation_holder() {
     let holding = alloc_lease::holding(DATA_TAG).expect("held");
     assert_eq!(
         index_home_volume_for(DATA_TAG),
-        usize::from(holding.home_vol)
+        usize::from(holding.home_vol())
     );
     assert_eq!(index_home_volume_for(DATA_TAG), slot0_of(&routed));
     assert_eq!(index_home_volume_for(DATA_TAG + 99), index_home_volume());
+    // The re-point is DISTINGUISHABLE from the default (review round 4,
+    // Issue 34): a holder homed elsewhere — PR 12's join ladder's shape —
+    // moves the index home with it, PR 7's default stays where it was.
+    holding.test_set_home_vol(1);
+    assert_eq!(index_home_volume_for(DATA_TAG), 1);
+    assert_ne!(index_home_volume_for(DATA_TAG), index_home_volume());
+    assert_eq!(index_home_volume_for(DATA_TAG + 99), index_home_volume());
+    holding.test_set_home_vol(slot0_of(&routed) as u16);
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
+/// Review round 4, Issue 33 — the population the supply term reads is a
+/// MAINTAINED counter: the allocation funnel performs NO full-bitmap scan
+/// (`population_scans` flat across N allocations and N supply reads), and
+/// the checkpoint's page write re-derives it once as a drift check (the
+/// counter equals the popcount, `invariant_tripwires` untouched).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_funnel_reads_the_population_in_o1_and_the_checkpoint_checks_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set(dir.path(), 1).await;
+    let routed = open_armed(&uris).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let a = data_allocator(DATA_ID).await;
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&routed, &[Arc::clone(&a)])
+            .await
+            .unwrap(),
+        1
+    );
+    let holding = alloc_lease::holding(DATA_TAG).expect("held");
+    let tripwires = squeezefs::fuse_client::METRICS
+        .invariant_tripwires
+        .load(Ordering::Relaxed);
+    let scans = squeezefs::data_alloc_bitmap::population_scans();
+    let mut minted = Vec::new();
+    for _ in 0..300 {
+        minted.push(a.allocate_block().await.unwrap());
+        // The valve's supply term, as the funnel's head reads it while a
+        // grace ring is non-empty.
+        assert!(a.free_supply_blocks() > 0);
+    }
+    for off in &minted[..50] {
+        assert!(a.begin_free(*off));
+        a.finish_free(*off);
+    }
+    assert_eq!(
+        squeezefs::data_alloc_bitmap::population_scans(),
+        scans,
+        "the funnel performed a full-bitmap scan"
+    );
+    // Every granted block SET, the 50 freed CLEAR — the proactive ask
+    // decides how many grants of 64 the 300 mints drew (five or six), so
+    // the witness is the ledger's own count, read once an ask in flight
+    // has landed.
+    wait_until("the population settles at granted − freed", || {
+        holding.bitmap.population() + 50 == holding.ledger.blocks_granted()
+    })
+    .await;
+    assert!(holding.bitmap.population() >= 320 - 50);
+    // The checkpoint's page write: ONE scan, the drift check, no tripwire.
+    vol.checkpoint_now().await.unwrap();
+    assert_eq!(squeezefs::data_alloc_bitmap::population_scans(), scans + 1);
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .invariant_tripwires
+            .load(Ordering::Relaxed),
+        tripwires
+    );
+    // The counter equals the popcount (this read is the pin's own scan).
+    assert_eq!(
+        holding.bitmap.population(),
+        holding.bitmap.population_scan()
+    );
     shutdown(&routed).await;
     reset_process_state();
 }

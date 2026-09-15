@@ -498,6 +498,47 @@ enum ArbCall {
     DirRenameUnlock {
         appender_id: u32,
     },
+    // PR 8 (review round 4, Issue 30): the 0x80 block's constructive
+    // mirror — encode ∘ decode = id over the encoder's domain.
+    BlockGrant {
+        vol_tag: u64,
+        writer: ArbIdentity,
+        want: u32,
+        held_unconsumed: u64,
+    },
+    ReturnBlocks {
+        vol_tag: u64,
+        writer: ArbIdentity,
+        start: u64,
+        len: u32,
+    },
+    AllocLeaseAcquire {
+        vol_tag: u64,
+        identity: ArbIdentity,
+        appender_id: u32,
+        home_vol: u16,
+        control_ino: u64,
+        blocks: u64,
+    },
+    AllocLeaseBitmap {
+        vol_tag: u64,
+        identity: ArbIdentity,
+        term: u64,
+        bitmap: Vec<(u16, (u64, u64))>,
+    },
+    AllocLeaseRelease {
+        vol_tag: u64,
+        identity: ArbIdentity,
+        term: u64,
+    },
+    RecordRecovered {
+        member: ArbIdentity,
+        vol: u16,
+    },
+    RecordDeath {
+        member: ArbIdentity,
+        epoch: u64,
+    },
 }
 
 #[derive(Arbitrary, Debug, Clone, Copy)]
@@ -597,6 +638,71 @@ impl From<ArbCall> for ManagerCall {
             ArbCall::DirRenameUnlock { appender_id } => {
                 ManagerCall::DirRenameUnlock { appender_id }
             }
+            ArbCall::BlockGrant {
+                vol_tag,
+                writer,
+                want,
+                held_unconsumed,
+            } => ManagerCall::BlockGrant {
+                vol_tag,
+                writer: writer.into(),
+                want,
+                held_unconsumed,
+            },
+            ArbCall::ReturnBlocks {
+                vol_tag,
+                writer,
+                start,
+                len,
+            } => ManagerCall::ReturnBlocks {
+                vol_tag,
+                writer: writer.into(),
+                start,
+                len,
+            },
+            ArbCall::AllocLeaseAcquire {
+                vol_tag,
+                identity,
+                appender_id,
+                home_vol,
+                control_ino,
+                blocks,
+            } => ManagerCall::AllocLeaseAcquire {
+                vol_tag,
+                identity: identity.into(),
+                appender_id,
+                home_vol,
+                control_ino,
+                blocks,
+            },
+            ArbCall::AllocLeaseBitmap {
+                vol_tag,
+                identity,
+                term,
+                bitmap,
+            } => ManagerCall::AllocLeaseBitmap {
+                vol_tag,
+                identity: identity.into(),
+                term,
+                bitmap,
+            },
+            ArbCall::AllocLeaseRelease {
+                vol_tag,
+                identity,
+                term,
+            } => ManagerCall::AllocLeaseRelease {
+                vol_tag,
+                identity: identity.into(),
+                term,
+            },
+            ArbCall::RecordRecovered { member, vol } => ManagerCall::RecordRecovered {
+                member: member.into(),
+                vol,
+            },
+            ArbCall::RecordDeath { member, epoch } => ManagerCall::RecordDeath {
+                member: member.into(),
+                epoch,
+            },
         }
     }
 }
@@ -666,6 +772,24 @@ enum ArbReply {
     DirRenameUnlocked {
         already: bool,
     },
+    // PR 8 (Issue 30).
+    BlocksGranted {
+        grants: Vec<(u64, u32)>,
+        already: bool,
+    },
+    BlocksFull,
+    BlocksReturned {
+        cleared: Option<u64>,
+    },
+    AllocLeaseGranted {
+        term: u64,
+        already: bool,
+        predecessor_bitmap: Vec<(u16, (u64, u64))>,
+        predecessor_blocks: u64,
+    },
+    Recorded {
+        already: bool,
+    },
 }
 
 impl From<ArbReply> for ManagerReply {
@@ -715,6 +839,23 @@ impl From<ArbReply> for ManagerReply {
             ArbReply::DirRenameLocked { already } => ManagerReply::DirRenameLocked { already },
             ArbReply::DirRenameBusy { holder } => ManagerReply::DirRenameBusy { holder },
             ArbReply::DirRenameUnlocked { already } => ManagerReply::DirRenameUnlocked { already },
+            ArbReply::BlocksGranted { grants, already } => {
+                ManagerReply::BlocksGranted { grants, already }
+            }
+            ArbReply::BlocksFull => ManagerReply::BlocksFull,
+            ArbReply::BlocksReturned { cleared } => ManagerReply::BlocksReturned { cleared },
+            ArbReply::AllocLeaseGranted {
+                term,
+                already,
+                predecessor_bitmap,
+                predecessor_blocks,
+            } => ManagerReply::AllocLeaseGranted {
+                term,
+                already,
+                predecessor_bitmap,
+                predecessor_blocks,
+            },
+            ArbReply::Recorded { already } => ManagerReply::Recorded { already },
         }
     }
 }

@@ -1460,6 +1460,94 @@ fn arb_manager_call() -> impl Strategy<Value = ManagerCall> {
                 block_idx,
                 owner,
             }),
+        // PR 8's calls (review round 4, Issue 30).
+        arb_pr8_call(),
+    ]
+}
+
+fn arb_wire_identity() -> impl Strategy<Value = WireIdentity> {
+    (any::<u64>(), any::<u32>(), any::<u128>()).prop_map(|(node_token, mount_slot, writer_id)| {
+        WireIdentity {
+            node_token,
+            mount_slot,
+            writer_id,
+        }
+    })
+}
+
+fn arb_pr8_call() -> impl Strategy<Value = ManagerCall> {
+    prop_oneof![
+        (
+            any::<u64>(),
+            arb_wire_identity(),
+            any::<u32>(),
+            any::<u64>()
+        )
+            .prop_map(
+                |(vol_tag, writer, want, held_unconsumed)| ManagerCall::BlockGrant {
+                    vol_tag,
+                    writer,
+                    want,
+                    held_unconsumed,
+                }
+            ),
+        (
+            any::<u64>(),
+            arb_wire_identity(),
+            any::<u64>(),
+            any::<u32>()
+        )
+            .prop_map(|(vol_tag, writer, start, len)| ManagerCall::ReturnBlocks {
+                vol_tag,
+                writer,
+                start,
+                len,
+            }),
+        (
+            any::<u64>(),
+            arb_wire_identity(),
+            any::<u32>(),
+            any::<u16>(),
+            any::<u64>(),
+            any::<u64>(),
+        )
+            .prop_map(
+                |(vol_tag, identity, appender_id, home_vol, control_ino, blocks)| {
+                    ManagerCall::AllocLeaseAcquire {
+                        vol_tag,
+                        identity,
+                        appender_id,
+                        home_vol,
+                        control_ino,
+                        blocks,
+                    }
+                }
+            ),
+        (
+            any::<u64>(),
+            arb_wire_identity(),
+            any::<u64>(),
+            prop::collection::vec((any::<u16>(), (any::<u64>(), any::<u64>())), 0..6),
+        )
+            .prop_map(
+                |(vol_tag, identity, term, bitmap)| ManagerCall::AllocLeaseBitmap {
+                    vol_tag,
+                    identity,
+                    term,
+                    bitmap,
+                }
+            ),
+        (any::<u64>(), arb_wire_identity(), any::<u64>()).prop_map(|(vol_tag, identity, term)| {
+            ManagerCall::AllocLeaseRelease {
+                vol_tag,
+                identity,
+                term,
+            }
+        }),
+        (arb_wire_identity(), any::<u16>())
+            .prop_map(|(member, vol)| ManagerCall::RecordRecovered { member, vol }),
+        (arb_wire_identity(), any::<u64>())
+            .prop_map(|(member, epoch)| ManagerCall::RecordDeath { member, epoch }),
     ]
 }
 
@@ -1529,6 +1617,35 @@ fn arb_manager_reply() -> impl Strategy<Value = ManagerReply> {
             .prop_map(|(inserted, already)| ManagerReply::Shared { inserted, already }),
         (any::<bool>(), any::<u32>())
             .prop_map(|(shared, remaining)| ManagerReply::SharedReleased { shared, remaining }),
+        // PR 8's replies (Issue 30).
+        arb_pr8_reply(),
+    ]
+}
+
+fn arb_pr8_reply() -> impl Strategy<Value = ManagerReply> {
+    prop_oneof![
+        (
+            prop::collection::vec((any::<u64>(), any::<u32>()), 0..6),
+            any::<bool>(),
+        )
+            .prop_map(|(grants, already)| ManagerReply::BlocksGranted { grants, already }),
+        Just(ManagerReply::BlocksFull),
+        prop::option::of(any::<u64>()).prop_map(|cleared| ManagerReply::BlocksReturned { cleared }),
+        (
+            any::<u64>(),
+            any::<bool>(),
+            prop::collection::vec((any::<u16>(), (any::<u64>(), any::<u64>())), 0..6),
+            any::<u64>(),
+        )
+            .prop_map(|(term, already, predecessor_bitmap, predecessor_blocks)| {
+                ManagerReply::AllocLeaseGranted {
+                    term,
+                    already,
+                    predecessor_bitmap,
+                    predecessor_blocks,
+                }
+            }),
+        any::<bool>().prop_map(|already| ManagerReply::Recorded { already }),
     ]
 }
 

@@ -374,6 +374,11 @@ pub(crate) static BATCHES: AtomicU64 = AtomicU64::new(0);
 /// coalesce factor (≈ 1 on a serial stream, which is R1's cost made
 /// visible rather than hidden).
 pub(crate) static BATCHED_VERBS: AtomicU64 = AtomicU64::new(0);
+/// Frames shipped on the PIPELINED session instead of the stop-and-wait
+/// lane — the verbs that park at the holder by design (PR 6's
+/// `XvGuards` / `XvRelease`; `ShipLane::mux`). ⊆ `batches`; 0 on every
+/// mount without a cross-owner op.
+pub(crate) static PIPELINED_BATCHES: AtomicU64 = AtomicU64::new(0);
 /// Batches resent after a transport failure (same ids — see `router`).
 pub(crate) static RETRIES: AtomicU64 = AtomicU64::new(0);
 /// Replays served from the owner's dedup window.
@@ -448,6 +453,8 @@ pub struct ShipStatsSnapshot {
     pub served_verbs: u64,
     pub batches: u64,
     pub batched_verbs: u64,
+    /// Frames that rode the pipelined session (the holder-parking verbs).
+    pub pipelined_batches: u64,
     pub retries: u64,
     pub dedup_hits: u64,
     pub stale_term_refusals: u64,
@@ -495,6 +502,7 @@ pub fn stats() -> ShipStatsSnapshot {
         served_verbs: SERVED_VERBS.load(Ordering::Relaxed),
         batches: BATCHES.load(Ordering::Relaxed),
         batched_verbs: BATCHED_VERBS.load(Ordering::Relaxed),
+        pipelined_batches: PIPELINED_BATCHES.load(Ordering::Relaxed),
         retries: RETRIES.load(Ordering::Relaxed),
         dedup_hits: DEDUP_HITS.load(Ordering::Relaxed),
         stale_term_refusals: STALE_TERM_REFUSALS.load(Ordering::Relaxed),
@@ -528,6 +536,9 @@ pub fn stats_json() -> serde_json::Value {
         "served_verbs": s.served_verbs,
         "batches": s.batches,
         "batched_verbs": s.batched_verbs,
+        // The holder-parking verbs' venue (PR 6's guards; `ShipLane::mux`):
+        // ⊆ `batches`, 0 without a cross-owner op.
+        "pipelined_batches": s.pipelined_batches,
         "retries": s.retries,
         "dedup_hits": s.dedup_hits,
         "stale_term_refusals": s.stale_term_refusals,

@@ -127,6 +127,18 @@ struct ShipLane {
     /// The owner's era, as learned from its replies. `0` = not yet known
     /// (the first frame asks).
     term: AtomicU64,
+    /// The PIPELINED session to this owner (`MuxSession` — K calls in
+    /// flight on one socket, served concurrently by the owner's session
+    /// lane): the venue of the verbs that PARK at the holder by design
+    /// (PR 6's `XvGuards`, and the `XvRelease` that unparks one). The
+    /// queue above is stop-and-wait and the owner runs a frame's ops
+    /// serially, so a parked `XvGuards` at its head blocked every later
+    /// verb to that owner — including the release of the scope it was
+    /// parked on: head-of-line until the call bound, then the resend
+    /// parked behind the dedup winner (PR 5 review round 3, Issue 26 —
+    /// the load-selected `no reply to call 1 within 10s`). Dialed on
+    /// first use; a dead session is replaced by the next call's dial.
+    mux: parking_lot::Mutex<Option<Arc<crate::cluster_wire::MuxSession>>>,
 }
 
 /// The client-side shipping router: a `Metadata` implementation that
@@ -462,6 +474,22 @@ impl MetaShipRouter {
     ) -> Result<Vec<MetaOpResult>> {
         let count = ops.len() as u64;
         let lane = self.lane(peer)?;
+        // A batch that PARKS at the holder by design never rides the
+        // stop-and-wait queue (see `ShipLane::mux`): it goes out on the
+        // pipelined session beside every other in-flight call, so the
+        // release of the scope it waits on — and every other verb to
+        // this owner — is served concurrently with it.
+        if ops.iter().any(|op| op.call.parks_at_holder()) {
+            let out = self.exchange_pipelined(&lane, owner_term, ops).await?;
+            super::SHIPPED_VERBS.fetch_add(count, Ordering::Relaxed);
+            for result in &out {
+                if let Some(grant) = &result.grant {
+                    tokens::record_grant(grant);
+                }
+                self.absorb_delegation(peer, result).await;
+            }
+            return Ok(out);
+        }
         let (tx, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
         lane.tx
             .send(Submission {
@@ -551,6 +579,7 @@ impl MetaShipRouter {
             peer: Arc::clone(peer),
             tx,
             term: AtomicU64::new(0),
+            mux: parking_lot::Mutex::new(None),
         });
         match self
             .lanes
@@ -584,6 +613,90 @@ impl MetaShipRouter {
     async fn connect(&self, peer: &Arc<PeerOwner>) -> Result<crate::cluster_wire::RpcClient> {
         crate::cluster_wire::RpcClient::connect(&peer.endpoint, &self.secret, &self.peer_id, None)
             .await
+    }
+
+    /// One frame on the lane's PIPELINED session (`ShipLane::mux`): the
+    /// frame travels beside every other in-flight call on that socket and
+    /// the owner serves it concurrently, so a call that PARKS at the
+    /// holder heads no line. A dead session (a transport failure on any
+    /// call, the owner's idle reaper) is replaced by this call's dial — a
+    /// racing pair of dials keeps the first stored (a wasted dial, never a
+    /// wrong session); one resend of the SAME request ids after a
+    /// transport failure, the drain's own discipline (the owner's dedup
+    /// window makes it exactly-once).
+    async fn exchange_pipelined(
+        &self,
+        lane: &Arc<ShipLane>,
+        owner_term: u64,
+        ops: Vec<MetaOp>,
+    ) -> Result<Vec<MetaOpResult>> {
+        let t_encode = Instant::now();
+        let body = encode_request(&MetaRequestFrame {
+            schema: META_SHIP_SCHEMA,
+            client_epoch: self.client_epoch,
+            client_id: self.peer_id.to_string(),
+            owner_term,
+            ops,
+        })?;
+        super::phase_record(ShipPhase::Encode, t_encode);
+        super::BATCHES.fetch_add(1, Ordering::Relaxed);
+        super::PIPELINED_BATCHES.fetch_add(1, Ordering::Relaxed);
+        let mut last: Option<SqueezefsError> = None;
+        for attempt in 0..2 {
+            let live = lane.mux.lock().clone().filter(|s| !s.is_dead());
+            let session = match live {
+                Some(s) => s,
+                None => {
+                    match crate::cluster_wire::MuxSession::connect(
+                        &lane.peer.endpoint,
+                        &self.secret,
+                        &self.peer_id,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(fresh) => {
+                            let mut slot = lane.mux.lock();
+                            match slot.as_ref().filter(|s| !s.is_dead()) {
+                                Some(raced_in) => Arc::clone(raced_in),
+                                None => {
+                                    *slot = Some(Arc::clone(&fresh));
+                                    fresh
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            last = Some(e);
+                            continue;
+                        }
+                    }
+                }
+            };
+            if attempt > 0 {
+                super::RETRIES.fetch_add(1, Ordering::Relaxed);
+            }
+            let t_rtt = Instant::now();
+            let call = session.call(VERB_META_BATCH, body.clone()).await;
+            super::phase_record(ShipPhase::Rtt, t_rtt);
+            super::DLM_RPCS_META.fetch_add(1, Ordering::Relaxed);
+            match call {
+                Ok(reply) => return lane.interpret(reply),
+                Err(e) => {
+                    log::warn!(
+                        "S8: pipelined batch to {} failed ({e}) — redialing and resending the \
+                         same request ids (the owner's dedup window makes the resend exactly-once)",
+                        lane.peer.endpoint
+                    );
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            SqueezefsError::InvalidOperation(format!(
+                "S8: pipelined batch to {} failed without an error",
+                lane.peer.endpoint
+            ))
+        }))
     }
 }
 
@@ -702,7 +815,7 @@ impl LaneDrain {
             super::phase_record(ShipPhase::Rtt, t_rtt);
             super::DLM_RPCS_META.fetch_add(1, Ordering::Relaxed);
             match call {
-                Ok(reply) => return self.interpret(reply),
+                Ok(reply) => return self.lane.interpret(reply),
                 Err(e) => {
                     // A dead session: drop it and retry ONCE with the
                     // same ids.
@@ -723,7 +836,11 @@ impl LaneDrain {
             ))
         }))
     }
+}
 
+/// The reply law both venues share (the drain's stop-and-wait session and
+/// the pipelined one).
+impl ShipLane {
     /// Turn a frame-level reply into results, learning the owner's era and
     /// mapping every frame-level refusal to a loud, named error.
     fn interpret(&self, reply: crate::cluster_wire::RpcResponse) -> Result<Vec<MetaOpResult>> {
@@ -735,7 +852,7 @@ impl LaneDrain {
                     return Err(SqueezefsError::InvalidOperation(format!(
                         "S8: owner {} replied in vocabulary schema {} (this build speaks \
                          {META_SHIP_SCHEMA})",
-                        self.lane.peer.endpoint, frame.schema
+                        self.peer.endpoint, frame.schema
                     )));
                 }
                 self.learn_term(frame.owner_term);
@@ -757,24 +874,24 @@ impl LaneDrain {
                 // failed over, so re-derive its volumes from a FRESH read
                 // — an adoption by a declared successor is followed, a
                 // holder the assignment set does not name POISONS.
-                owners::note_era_relearn(&self.lane.peer.peer_id);
+                owners::note_era_relearn(&self.peer.peer_id);
                 Err(SqueezefsError::InvalidOperation(format!(
                     "S8: owner {} refused the batch — it named a stale writer era; the owner is \
                      now in era {} (a successor bumps `term` durably before arming, so every \
                      old-era request is stale by construction). Nothing was applied.",
-                    self.lane.peer.endpoint,
-                    self.lane.term.load(Ordering::Acquire)
+                    self.peer.endpoint,
+                    self.term.load(Ordering::Acquire)
                 )))
             }
             STATUS_IN_GRACE => Err(SqueezefsError::busy(format!(
                 "S8: owner {} is inside its failover grace window and refuses fresh mutations \
                  ({}) — reclaim first, then retry (spec §6.7 Recovery)",
-                self.lane.peer.endpoint,
+                self.peer.endpoint,
                 String::from_utf8_lossy(&reply.body)
             ))),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "S8: owner {} refused the batch with status {other}: {}",
-                self.lane.peer.endpoint,
+                self.peer.endpoint,
                 String::from_utf8_lossy(&reply.body)
             ))),
         };
@@ -783,7 +900,7 @@ impl LaneDrain {
     }
 
     fn learn_term(&self, term: u64) {
-        self.lane.term.fetch_max(term, Ordering::AcqRel);
+        self.term.fetch_max(term, Ordering::AcqRel);
         tokens::record_owner_term(term);
     }
 }

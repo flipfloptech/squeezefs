@@ -435,6 +435,15 @@ impl MetaCall {
         self.verb().mutating()
     }
 
+    /// Does this call PARK at the holder by design — PR 6's travelling
+    /// guard (`XvGuards` waits on the stripe the previous scope still
+    /// holds) and the `XvRelease` that unparks one? Such a call never
+    /// rides the stop-and-wait lane, where it would head the line in
+    /// front of the very release it waits for (`ShipLane::mux`).
+    pub fn parks_at_holder(&self) -> bool {
+        matches!(self, MetaCall::XvGuards { .. } | MetaCall::XvRelease { .. })
+    }
+
     /// The **primary object**: the inode whose owner executes the call,
     /// and whose grant rides the reply.
     ///

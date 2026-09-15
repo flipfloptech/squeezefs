@@ -230,6 +230,10 @@ static XV_CO_INTENTS_RETIRED: AtomicU64 = AtomicU64::new(0);
 static XV_CO_STEPS_SHIPPED: AtomicU64 = AtomicU64::new(0);
 /// Steps this holder served for a foreign initiator.
 static XV_CO_STEPS_SERVED: AtomicU64 = AtomicU64::new(0);
+/// Served steps REFUSED by the wire-word screen (an insert naming a child
+/// nobody could have minted) — **must stay 0**: the buggy/hostile-peer
+/// class, never a witness verdict.
+static XV_CO_STEPS_REJECTED: AtomicU64 = AtomicU64::new(0);
 /// Set-wide directory-rename lock takes (initiator side).
 static DIR_RENAME_LOCK_ACQUIRES: AtomicU64 = AtomicU64::new(0);
 /// Reverse dentry SCANS the ancestor walk ran under the lease (the
@@ -301,6 +305,11 @@ pub(crate) fn note_dir_rename_lock(waited: std::time::Duration) {
 /// Count one memo-miss reverse scan inside the ancestor walk.
 pub(crate) fn note_dir_rename_parent_scan() {
     DIR_RENAME_PARENT_SCANS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count one served step refused by the wire-word screen.
+pub(crate) fn note_step_rejected() {
+    XV_CO_STEPS_REJECTED.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Count one served shipped step (the holder side).
@@ -460,6 +469,8 @@ pub struct CrossOwnerStats {
     pub intents_open: u64,
     pub steps_shipped: u64,
     pub steps_served: u64,
+    /// **Must stay 0**: served steps the wire-word screen refused.
+    pub steps_rejected: u64,
     /// GAUGE, **must stay 0**: open intents past the grace window.
     pub intents_stuck: u64,
     pub dir_rename_lock_acquires: u64,
@@ -483,6 +494,7 @@ pub fn cross_owner_stats() -> CrossOwnerStats {
         intents_open,
         steps_shipped: XV_CO_STEPS_SHIPPED.load(Ordering::Relaxed),
         steps_served: XV_CO_STEPS_SERVED.load(Ordering::Relaxed),
+        steps_rejected: XV_CO_STEPS_REJECTED.load(Ordering::Relaxed),
         intents_stuck,
         dir_rename_lock_acquires: DIR_RENAME_LOCK_ACQUIRES.load(Ordering::Relaxed),
         dir_rename_lock_wait_ns_sum: DIR_RENAME_LOCK_WAIT.sum_ns(),
@@ -515,6 +527,10 @@ pub fn cross_owner_stats_json() -> serde_json::Map<String, serde_json::Value> {
         s.steps_shipped.into(),
     );
     out.insert("xv_cross_owner_steps_served".into(), s.steps_served.into());
+    out.insert(
+        "xv_cross_owner_steps_rejected".into(),
+        s.steps_rejected.into(),
+    );
     out.insert(
         "xv_cross_owner_intents_stuck".into(),
         s.intents_stuck.into(),
@@ -608,11 +624,17 @@ pub struct GuardScope<'a> {
     pub scope: u64,
 }
 
-/// Scopes THIS process minted whose guards it holds in its own table —
-/// alive exactly while the op's guard set is (the marker guard's drop
-/// removes the entry).
-static LOCAL_SCOPES: once_cell::sync::Lazy<parking_lot::Mutex<std::collections::HashSet<u64>>> =
-    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+/// A set of `(volume, inode class, stripe)` — what a scope's guards cover.
+type StripeSet = std::collections::HashSet<(usize, bool, usize)>;
+
+/// Scopes THIS process minted whose guards it holds in its own table,
+/// with the stripes they cover — alive exactly while the op's guard set
+/// is (the marker guard's drop removes the entry). The served-side
+/// `Covered` verdict compares a step's stripes against this set (review
+/// round 1, Issue 8b).
+static LOCAL_SCOPES: once_cell::sync::Lazy<
+    parking_lot::Mutex<std::collections::HashMap<u64, StripeSet>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
 /// One remote initiator's parked guards: the guards, the stripes they
 /// cover (`(volume, inode class, stripe)` — a later `XvGuards` under the
@@ -620,7 +642,7 @@ static LOCAL_SCOPES: once_cell::sync::Lazy<parking_lot::Mutex<std::collections::
 /// itself) and when the scope was first parked.
 struct ParkedScope {
     guards: Vec<dlm::DlmGuard>,
-    stripes: std::collections::HashSet<(usize, bool, usize)>,
+    stripes: StripeSet,
     since: std::time::Instant,
 }
 
@@ -647,10 +669,60 @@ pub fn scope_of(guards: &[dlm::DlmGuard]) -> u64 {
 /// drop unregisters it (it rides the op's guard set, so the served-side
 /// `Held` verdict lasts exactly as long as the guards do).
 fn register_local_scope(scope: u64) -> dlm::DlmGuard {
-    LOCAL_SCOPES.lock().insert(scope);
+    LOCAL_SCOPES.lock().entry(scope).or_default();
     dlm::DlmGuard::external(scope, move || {
         LOCAL_SCOPES.lock().remove(&scope);
     })
+}
+
+/// Record the stripes a local scope's `lock_many` covered on `v_idx`.
+fn note_local_scope_stripes(
+    scope: u64,
+    dlm: &dlm::DlmLockManager,
+    v_idx: usize,
+    inos: &[(Ino, dlm::LockMode)],
+    dents: &[(Ino, &str, dlm::LockMode)],
+) {
+    let mut scopes = LOCAL_SCOPES.lock();
+    let Some(set) = scopes.get_mut(&scope) else {
+        return;
+    };
+    set.extend(
+        inos.iter()
+            .map(|(l, _)| (v_idx, true, dlm.inode_stripe(*l))),
+    );
+    set.extend(
+        dents
+            .iter()
+            .map(|(l, n, _)| (v_idx, false, dlm.dentry_stripe(*l, n))),
+    );
+}
+
+/// The stripes a step's guards would take on `v_idx` (the served side's
+/// coverage question, and the local applier's tripwire).
+pub(crate) fn step_stripes(
+    dlm: &dlm::DlmLockManager,
+    v_idx: usize,
+    local: &XvLocalStep,
+) -> StripeSet {
+    let (inos, dents) = step_guard_keys(local);
+    inos.iter()
+        .map(|(l, _)| (v_idx, true, dlm.inode_stripe(*l)))
+        .chain(
+            dents
+                .iter()
+                .map(|(l, n)| (v_idx, false, dlm.dentry_stripe(*l, n))),
+        )
+        .collect()
+}
+
+/// Does the scope this op's guards travel under cover `needed` in THIS
+/// table? `None` = the op has no local scope (unarmed / a plain guard set).
+fn local_scope_covers(scope: u64, needed: &StripeSet) -> Option<bool> {
+    LOCAL_SCOPES
+        .lock()
+        .get(&scope)
+        .map(|set| needed.is_subset(set))
 }
 
 /// Release the guards parked under `(client, scope)`; `false` when the
@@ -695,19 +767,24 @@ pub(crate) enum ServeGuards {
     Take,
 }
 
-/// Resolve a served step's guard verdict.
-pub(crate) fn serve_guards_for(scope: GuardScope<'_>) -> ServeGuards {
+/// Resolve a served step's guard verdict: `Covered` only when the scope
+/// is known AND its guards cover every stripe the step would take
+/// (Issue 8b — a scope that parked unrelated keys never lets a step apply
+/// unguarded); anything else takes the step's keys.
+pub(crate) fn serve_guards_for(scope: GuardScope<'_>, needed: &StripeSet) -> ServeGuards {
     if scope.scope == 0 {
         return ServeGuards::Take;
     }
     if let Some(router) = XV_SHIPPER.load_full() {
-        if router.peer_id() == scope.client && LOCAL_SCOPES.lock().contains(&scope.scope) {
+        if router.peer_id() == scope.client && local_scope_covers(scope.scope, needed) == Some(true)
+        {
             return ServeGuards::Covered;
         }
     }
     if PARKED_GUARDS
         .lock()
-        .contains_key(&(scope.client.to_string(), scope.scope))
+        .get(&(scope.client.to_string(), scope.scope))
+        .is_some_and(|p| needed.is_subset(&p.stripes))
     {
         return ServeGuards::Covered;
     }
@@ -737,10 +814,7 @@ pub(crate) fn park_guards(
 }
 
 /// The stripes already parked under `(client, scope)`.
-pub(crate) fn parked_stripes(
-    client: &str,
-    scope: u64,
-) -> std::collections::HashSet<(usize, bool, usize)> {
+pub(crate) fn parked_stripes(client: &str, scope: u64) -> StripeSet {
     PARKED_GUARDS
         .lock()
         .get(&(client.to_string(), scope))
@@ -750,23 +824,31 @@ pub(crate) fn parked_stripes(
 
 /// **The initiator's 4a acquisition on an armed volume** (the two laws
 /// above): `inos` / `dents` are the op's LOCAL keys on volume `v_idx`,
-/// `scope` the op's scope (one per op — every per-volume call of one op
-/// shares it). Keys in this process's table ride one canonical
-/// `lock_many`; keys in a foreign holder's table ride one `XvGuards`
-/// each, tables ascending by appender id; the returned set carries the
-/// scope marker and one external guard per remote table whose drop
-/// releases it. Unarmed (or inside a served verb): the plain `lock_many`.
+/// `scope` the op's scope cell — minted on the FIRST armed acquisition
+/// (review round 1, Issue 11: an unarmed op never mints, so the shipped
+/// path pays no shared-line RMW) and shared by every per-volume call of
+/// one op. Keys in this process's table ride one canonical `lock_many`;
+/// keys in a foreign holder's table ride one `XvGuards` each, tables
+/// ascending by appender id; the returned set carries the scope marker
+/// and one external guard per remote table whose drop releases it.
+/// `discovery` = a first-phase read that revalidates under the op's full
+/// set (the unlink shape): foreign tables are NOT acquired — the read
+/// holds nothing at the holder and the op pays ONE round trip per holder,
+/// at its full acquisition (Issue 13). Unarmed (or inside a served verb):
+/// the plain `lock_many`.
 pub async fn acquire_guards_leased(
     routed: &RoutedMetaBackend,
     v_idx: usize,
-    scope: u64,
+    scope: &mut Option<u64>,
     inos: &[(Ino, dlm::LockMode)],
     dents: &[(Ino, &str, dlm::LockMode)],
+    discovery: bool,
 ) -> Result<Vec<dlm::DlmGuard>> {
     let vol = &routed.volumes[v_idx];
     if !vol.slot_lease_armed() || crate::meta_ship::executing_for_ship_client() {
         return Ok(vol.dlm().lock_many(inos, dents).await);
     }
+    let scope = *scope.get_or_insert_with(mint_guard_scope);
     let force_remote = TEST_XV_GUARDS_FORCE_REMOTE.load(Ordering::Relaxed);
     let own_id = vol.own_appender_id();
     struct RemoteSet {
@@ -802,6 +884,7 @@ pub async fn acquire_guards_leased(
     for &(local, mode) in inos {
         match table_of(local)? {
             None => local_inos.push((local, mode)),
+            Some(_) if discovery => {}
             Some((holder, endpoint)) => remote
                 .entry(holder)
                 .or_insert_with(|| RemoteSet {
@@ -816,6 +899,7 @@ pub async fn acquire_guards_leased(
     for &(local, name, mode) in dents {
         match table_of(local)? {
             None => local_dents.push((local, name, mode)),
+            Some(_) if discovery => {}
             Some((holder, endpoint)) => remote
                 .entry(holder)
                 .or_insert_with(|| RemoteSet {
@@ -838,9 +922,10 @@ pub async fn acquire_guards_leased(
         }
         // Every key in this table: the shipped path verbatim, plus the
         // marker that lets an in-process holder's serve recognize the
-        // scope as held.
+        // scope as held — and the stripes it covers.
         guards.push(register_local_scope(scope));
         guards.extend(vol.dlm().lock_many(&local_inos, &local_dents).await);
+        note_local_scope_stripes(scope, vol.dlm(), v_idx, &local_inos, &local_dents);
         return Ok(guards);
     }
     let Some(router) = XV_SHIPPER.load_full() else {
@@ -852,6 +937,7 @@ pub async fn acquire_guards_leased(
     for (holder, set) in remote {
         if !local_taken && own_id < holder {
             guards.extend(vol.dlm().lock_many(&local_inos, &local_dents).await);
+            note_local_scope_stripes(scope, vol.dlm(), v_idx, &local_inos, &local_dents);
             local_taken = true;
         }
         let peer = Arc::new(crate::meta_ship::PeerOwner::new(
@@ -874,50 +960,73 @@ pub async fn acquire_guards_leased(
         };
         let t = std::time::Instant::now();
         XV_CO_GUARD_RPCS.fetch_add(1, Ordering::Relaxed);
-        let mut results = router.ship_ops(&peer, vec![op]).await?;
+        let acquired = match router.ship_ops(&peer, vec![op]).await {
+            Ok(mut results) => match results.pop() {
+                Some(r) => r
+                    .outcome
+                    .map_err(|e| e.into_error())
+                    .and_then(|reply| match reply {
+                        crate::meta_ship::MetaReply::Unit => Ok(()),
+                        other => Err(SqueezefsError::InvalidOperation(format!(
+                            "cross-owner guards: the holder answered {other:?} where Unit was due"
+                        ))),
+                    }),
+                None => Err(SqueezefsError::InvalidOperation(
+                    "cross-owner guards: the holder returned an empty result set for a one-op \
+                     batch"
+                        .into(),
+                )),
+            },
+            Err(e) => Err(e),
+        };
         phase_record(XvPhase::GuardRtt, t);
-        let result = results.pop().ok_or_else(|| {
-            SqueezefsError::InvalidOperation(
-                "cross-owner guards: the holder returned an empty result set for a one-op batch"
-                    .into(),
-            )
-        })?;
-        match result.outcome {
-            Ok(crate::meta_ship::MetaReply::Unit) => {}
-            Ok(other) => {
-                return Err(SqueezefsError::InvalidOperation(format!(
-                    "cross-owner guards: the holder answered {other:?} where Unit was due"
-                )))
-            }
-            Err(e) => return Err(e.into_error()),
+        if let Err(e) = acquired {
+            // The initiator gives up on this holder (a wire timeout, a
+            // refusal): the holder's serve may still park the guards
+            // late, so a fire-and-forget release rides behind (review
+            // round 1, Issue 7) — the drop of `guards` releases every
+            // table acquired before this one the same way.
+            spawn_scope_release(Arc::clone(&router), Arc::clone(&peer), scope, release_ino);
+            return Err(e);
         }
         // The release rides the guard's drop — the op's terminal outcome
         // — as one fire-and-forget verb; the holder's lease-expiry sweep
         // is the backstop for an initiator that dies first.
         let router_for_release = Arc::clone(&router);
         guards.push(dlm::DlmGuard::external(scope, move || {
-            crate::meta_exec::spawn_meta("xv_guard_release", async move {
-                let op = crate::meta_ship::MetaOp {
-                    id: router_for_release.next_request_id(),
-                    call: crate::meta_ship::MetaCall::XvRelease {
-                        scope,
-                        ino: release_ino,
-                    },
-                };
-                if let Err(e) = router_for_release.ship_ops(&peer, vec![op]).await {
-                    log::warn!(
-                        "cross-owner guards: releasing scope {scope:#x} at {} failed ({e}) — \
-                         the holder's lease-expiry sweep releases it",
-                        peer.endpoint
-                    );
-                }
-            });
+            spawn_scope_release(router_for_release, peer, scope, release_ino);
         }));
     }
     if !local_taken {
         guards.extend(vol.dlm().lock_many(&local_inos, &local_dents).await);
+        note_local_scope_stripes(scope, vol.dlm(), v_idx, &local_inos, &local_dents);
     }
     Ok(guards)
+}
+
+/// One fire-and-forget `XvRelease` of `scope` at `peer`.
+fn spawn_scope_release(
+    router: Arc<crate::meta_ship::MetaShipRouter>,
+    peer: Arc<crate::meta_ship::PeerOwner>,
+    scope: u64,
+    release_ino: u64,
+) {
+    crate::meta_exec::spawn_meta("xv_guard_release", async move {
+        let op = crate::meta_ship::MetaOp {
+            id: router.next_request_id(),
+            call: crate::meta_ship::MetaCall::XvRelease {
+                scope,
+                ino: release_ino,
+            },
+        };
+        if let Err(e) = router.ship_ops(&peer, vec![op]).await {
+            log::warn!(
+                "cross-owner guards: releasing scope {scope:#x} at {} failed ({e}) — the \
+                 holder's lease-expiry sweep releases it",
+                peer.endpoint
+            );
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1958,6 +2067,24 @@ async fn apply_or_ship_step(
 ) -> Result<XvStepOutcome> {
     match step_home(routed, v_idx, local.local_home()) {
         StepHome::Local => {
+            // The op's guard set must cover the step's keys (Issue 8c):
+            // a slot that moved to this initiator between its acquisition
+            // and this step would leave the key unguarded — loud, never
+            // silent.
+            let scope = scope_of(&guards);
+            if scope != 0 {
+                let needed = step_stripes(routed.volumes[v_idx].dlm(), v_idx, local);
+                if local_scope_covers(scope, &needed) == Some(false) {
+                    crate::note_invariant_tripwire(
+                        "xv_local_step_unguarded",
+                        &format!(
+                            "cross-owner transaction {tx_id:016x}: local step {step_idx} ({}) \
+                             is not covered by the op's guard scope {scope:#x}",
+                            step.name()
+                        ),
+                    );
+                }
+            }
             let out = routed.volumes[v_idx]
                 .xv_apply_step(local, rider, guards)
                 .await;
@@ -2666,7 +2793,7 @@ async fn acquire_plan_guards(
         inos.extend(i);
         dentries.extend(d);
     }
-    let scope = mint_guard_scope();
+    let mut scope = None;
     let mut guards = Vec::new();
     for (v_idx, (mut inos, dentries)) in per_vol.into_iter().enumerate() {
         if inos.is_empty() && dentries.is_empty() {
@@ -2678,7 +2805,7 @@ async fn acquire_plan_guards(
             .iter()
             .map(|(p, n)| (*p, n.as_str(), dlm::LockMode::Exclusive))
             .collect();
-        guards.extend(acquire_guards_leased(routed, v_idx, scope, &inos, &d).await?);
+        guards.extend(acquire_guards_leased(routed, v_idx, &mut scope, &inos, &d, false).await?);
     }
     Ok(guards)
 }

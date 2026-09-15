@@ -449,6 +449,10 @@ pub struct TokenHolderPlane {
     /// moment its lease was seen expired (beside the recalls on it, which
     /// count `expired_with_lease`; the closure's terms stay exact).
     lease_swept_grants: AtomicU64,
+    /// Grants answered `NotHolder` — the object's slot is leased to an
+    /// appender that is not one of this mount's regions (PR 12's redirect
+    /// trigger; review round 1, Issue 12).
+    not_holder_redirects: AtomicU64,
     timeouts_live: AtomicU64,
     releases: AtomicU64,
     /// Conveyor passes that recalled at least one object (the batching
@@ -492,6 +496,7 @@ impl TokenHolderPlane {
             recall_acks: AtomicU64::new(0),
             expired_with_lease: AtomicU64::new(0),
             lease_swept_grants: AtomicU64::new(0),
+            not_holder_redirects: AtomicU64::new(0),
             timeouts_live: AtomicU64::new(0),
             releases: AtomicU64::new(0),
             recall_batches: AtomicU64::new(0),
@@ -621,6 +626,13 @@ impl TokenHolderPlane {
         after: u64,
     ) -> TokenReply {
         use crate::token_grant_core::GrantAdmission;
+        // The slot's lessee first (one lease-table read): a slot another
+        // appender leases has its RAM-authoritative records THERE, and a
+        // grant of this manager's view would be stale by construction.
+        if let Some(holder) = volume.foreign_slot_holder(object) {
+            self.not_holder_redirects.fetch_add(1, Ordering::Relaxed);
+            return TokenReply::NotHolder { holder };
+        }
         let (already, admission) = self.gate.grant_register(object, client, &self.lane);
         let retract = |plane: &Self| {
             if !already {
@@ -878,6 +890,7 @@ impl TokenHolderPlane {
             recall_acks: self.recall_acks.load(Ordering::Relaxed),
             expired_with_lease: self.expired_with_lease.load(Ordering::Relaxed),
             lease_swept_grants: self.lease_swept_grants.load(Ordering::Relaxed),
+            not_holder_redirects: self.not_holder_redirects.load(Ordering::Relaxed),
             timeouts_live: self.timeouts_live.load(Ordering::Relaxed),
             releases: self.releases.load(Ordering::Relaxed),
             recall_batches: self.recall_batches.load(Ordering::Relaxed),
@@ -952,6 +965,7 @@ pub struct TokenHolderStats {
     pub recall_acks: u64,
     pub expired_with_lease: u64,
     pub lease_swept_grants: u64,
+    pub not_holder_redirects: u64,
     pub timeouts_live: u64,
     pub releases: u64,
     pub recall_batches: u64,
@@ -2272,6 +2286,7 @@ pub fn holder_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
         "dlm_token_recall_acks": per(&|s| s.recall_acks),
         "dlm_token_recall_expired_with_lease": per(&|s| s.expired_with_lease),
         "dlm_token_lease_swept_grants": per(&|s| s.lease_swept_grants),
+        "dlm_token_not_holder_redirects": per(&|s| s.not_holder_redirects),
         "dlm_token_recall_timeouts_live": per(&|s| s.timeouts_live),
         "dlm_token_releases": per(&|s| s.releases),
         "dlm_token_recall_batches": per(&|s| s.recall_batches),

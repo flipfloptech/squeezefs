@@ -3575,6 +3575,26 @@ impl KvMetaBackend {
         self.slot_leases().is_some()
     }
 
+    /// The appender leasing `object`'s slot when it is NOT one of this
+    /// mount's regions (the token server's `NotHolder { holder }` — review
+    /// round 1, Issue 12): one lease-table read. `None` = this mount's
+    /// (the manager's region 0, an in-process region) or unleased — the
+    /// manager maintains an unleased slot's tree (KD-SYM-2/3), so it is
+    /// the holder of every object in it.
+    pub fn foreign_slot_holder(&self, object: u64) -> Option<u32> {
+        let plane = self.slot_leases()?;
+        let appenders = self.appenders.as_ref()?;
+        let slot = super::record::forest_slot_of_ino(object);
+        match plane.table.resolve(slot) {
+            crate::slot_lease_core::Resolved::Holder { holder, .. }
+                if appenders.region(holder).is_none() =>
+            {
+                Some(holder)
+            }
+            _ => None,
+        }
+    }
+
     /// Tree 0 (the control tree) of a forest volume — the contracts' and
     /// probes' read of `slot_state` / `extent_grant` records; `None` flat.
     pub fn forest_control_tree(&self) -> Option<Arc<KvTree>> {

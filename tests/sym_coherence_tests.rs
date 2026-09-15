@@ -1944,6 +1944,155 @@ async fn the_dotdot_reconnect_scan_fails_closed_on_a_token_reader() {
     shutdown(&writer).await;
 }
 
+/// **Grants ride a session POOL** (review round 1, Issue 16a): a grant
+/// parked at the holder (its object in flight under a pass) must not
+/// serialize every other grant of the volume behind it — a second
+/// object's grant completes while the first is parked. Before the pool
+/// every grant rode ONE mutex-guarded session, so a cold `readdir +
+/// stat` of a C-creator directory was C SERIALIZED round trips and one
+/// parked grant stalled them all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parked_grant_does_not_serialize_the_volumes_other_grants() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let holder = writer.volumes[0].token_holder().unwrap().clone();
+    let a = Metadata::create(writer.as_ref(), 1, "a", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let b = Metadata::create(writer.as_ref(), 1, "b", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-pool").await;
+    assert!(
+        plane.stats().grant_sessions >= 2,
+        "the grant pool is at least two sessions deep: {}",
+        plane.stats().grant_sessions
+    );
+    // A pass on `a` parked after its recall union: a grant on `a` parks.
+    let parked0 = squeezefs::meta_backend::kv::backend::test_conveyor_post_recall_parked();
+    TEST_CONVEYOR_HOLD_STAGE.store(
+        squeezefs::meta_backend::kv::backend::TEST_CONVEYOR_HOLD_POST_RECALL,
+        Ordering::SeqCst,
+    );
+    let w = Arc::clone(&writer);
+    let create = tokio::spawn(async move {
+        Metadata::create(w.as_ref(), a, "child", libc::S_IFREG | 0o644, 0, 0).await
+    });
+    wait_until("the pass parked in the post-recall window", || {
+        squeezefs::meta_backend::kv::backend::test_conveyor_post_recall_parked() > parked0
+    })
+    .await;
+    let r = Arc::clone(&reader);
+    let grant_a = tokio::spawn(async move { Metadata::getattr(r.as_ref(), a).await });
+    wait_until("the grant on `a` parked at the holder", || {
+        holder.stats().grant_parks >= 1
+    })
+    .await;
+    // `b`'s grant completes while `a`'s is parked.
+    let t0 = std::time::Instant::now();
+    let got_b = tokio::time::timeout(
+        Duration::from_secs(5),
+        Metadata::getattr(reader.as_ref(), b),
+    )
+    .await
+    .expect("a grant on another object is not queued behind the parked one")
+    .unwrap();
+    assert_eq!(got_b.ino, b);
+    assert!(t0.elapsed() < Duration::from_secs(2));
+    assert!(!grant_a.is_finished(), "`a`'s grant is still parked");
+    TEST_CONVEYOR_HOLD_STAGE.store(0, Ordering::SeqCst);
+    test_conveyor_hold_release();
+    create.await.unwrap().unwrap();
+    grant_a.await.unwrap().unwrap();
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
+/// **Attrs + xattrs ride the FIRST page and the xattrs page too**
+/// (review round 1, Issue 16b): a directory whose carried xattrs alone
+/// exceed one frame's payload is served — the xattrs are paged by name
+/// under the same byte budget the dentries share, a continuation page
+/// carries no xattrs, and every name and value arrives intact. Before
+/// it the first page carried every xattr beside a full dentry page, so
+/// such an object failed the holder's encode (> 1 MiB) and was
+/// fail-closed EIO for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_objects_xattrs_are_paged_under_the_grant_budget_and_never_resent() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let d = Metadata::create(writer.as_ref(), 1, "wide", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    for i in 0..200 {
+        Metadata::create(
+            writer.as_ref(),
+            d,
+            &format!("e{i:04}"),
+            libc::S_IFREG | 0o644,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+    }
+    // 66 × 16 KiB (the 64 KiB node's value cap) ≈ 1.03 MiB of xattrs —
+    // past the whole frame cap on their own.
+    let value_cap = squeezefs::meta_backend::kv::node::xattr_value_cap(NODE_SIZE);
+    for i in 0..66u32 {
+        let v = vec![(i & 0xFF) as u8; value_cap];
+        Metadata::setxattr(writer.as_ref(), d, &format!("user.x{i:03}"), &v)
+            .await
+            .unwrap();
+    }
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-xattr").await;
+    // The in-process R5 budget is 0, so the records budget sits at its 1
+    // MiB floor — below this object's records; the pin is the PAGING
+    // (Issue 7's byte law has its own contract), so the budget is raised.
+    plane.test_set_records_budget(Some(8 * 1024 * 1024));
+    let names = Metadata::listxattr(reader.as_ref(), d).await.unwrap();
+    assert_eq!(
+        names.iter().filter(|n| n.starts_with("user.x")).count(),
+        66,
+        "every xattr name arrived"
+    );
+    let v65 = Metadata::getxattr(reader.as_ref(), d, "user.x065")
+        .await
+        .unwrap()
+        .expect("the last xattr");
+    assert_eq!(v65, vec![65u8; value_cap]);
+    let v0 = Metadata::getxattr(reader.as_ref(), d, "user.x000")
+        .await
+        .unwrap()
+        .expect("the first xattr");
+    assert_eq!(v0, vec![0u8; value_cap]);
+    let page = Metadata::readdir(reader.as_ref(), d, 0, 1024)
+        .await
+        .unwrap();
+    assert!(page.len() >= 200, "the dentry set arrived too");
+    assert!(
+        plane.stats().grants >= 3,
+        "the object's records were paged: {} grant page(s)",
+        plane.stats().grants
+    );
+    assert!(
+        plane.stats().cached_bytes < 2 * 66 * value_cap as u64,
+        "the xattrs were charged once, never per page"
+    );
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
 /// The negative contract: `SQUEEZEFS_SYMMETRIC_META=0` and a flat volume
 /// carry NO token plane — no holder, no reader, the recall gate off, the
 /// Token family 0 — and an unarmed forest's frames are v2 under the

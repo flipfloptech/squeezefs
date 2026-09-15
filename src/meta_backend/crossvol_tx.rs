@@ -754,11 +754,15 @@ pub fn release_parked_guards(client: &str, scope: u64) -> bool {
 /// round 1, Issue 9 — the expiry law): where this process is the S6
 /// membership authority, a scope is kept exactly while its client is a
 /// live member (`MembershipOwner::epoch_of`) and released the sweep after
-/// the owner evicts it — never by elapsed time; where no plane is armed
-/// (the shipped dark posture, a client the plane does not know) the grace
-/// window is the belt — the lease TTL the eviction would have fired at.
-/// The cadence runs this every tick. Returns the count
-/// (`xv_cross_owner_guard_expiries`).
+/// the owner evicts it — never by elapsed time; a client this owner does
+/// NOT know (a cross-shard initiator, a joiner the ladder has not bound
+/// yet — review round 2, Issue 22) and every client where no plane is
+/// armed (the shipped dark posture) keep the grace window as the belt —
+/// the lease TTL the eviction would have fired at. Safety: a scope
+/// released early costs an initiator its isolation (its steps fall to
+/// `Take` under the witness — never corruption), so the belt errs toward
+/// KEEPING an unknown client's scope. The cadence runs this every tick.
+/// Returns the count (`xv_cross_owner_guard_expiries`).
 pub fn sweep_expired_guards() -> u64 {
     let grace = std::time::Duration::from_millis(stuck_grace_ms());
     let owner = crate::membership::installed_owner();
@@ -766,8 +770,7 @@ pub fn sweep_expired_guards() -> u64 {
     let before = parked.len();
     parked.retain(|(client, _), p| match &owner {
         Some(o) if o.epoch_of(client).is_some() => true,
-        Some(_) => false,
-        None => p.since.elapsed() <= grace,
+        _ => p.since.elapsed() <= grace,
     });
     let expired = (before - parked.len()) as u64;
     if expired > 0 {

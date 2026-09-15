@@ -1814,6 +1814,128 @@ async fn an_initiator_acquires_its_foreign_guards_at_the_holder_and_releases_the
     fsck_clean(&uris).await;
 }
 
+/// Every cross-owner verb pays ONE guard round trip per foreign holder
+/// table (review round 1, Issue 13 — the design's RPC count): under
+/// `TEST_XV_GUARDS_FORCE_REMOTE` a create, an unlink (whose discovery
+/// phase acquires no foreign table), a link and a rename into a foreign
+/// directory each ship exactly one `XvGuards`; a rename across TWO
+/// foreign holders ships two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_cross_owner_verb_pays_one_guard_round_trip_per_foreign_holder_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B, SLOT_C]).await;
+    let (shared, other) = (dirs[0], dirs[1]);
+    let routed = open_under(&uris, true, Some(THREE_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1, 2]).await;
+    let mine = routed
+        .create(ROOT_INO, "mine", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let f = routed
+        .create(mine, "f", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    crossvol_tx::TEST_XV_GUARDS_FORCE_REMOTE.store(true, Ordering::SeqCst);
+    let rpcs = || cross_owner_stats().guard_rpcs;
+    let mut expect = rpcs();
+    for (what, delta, op) in [
+        ("create", 1, 0u8),
+        ("unlink", 1, 1),
+        ("link", 1, 2),
+        ("rename into", 1, 3),
+        ("rename across two holders", 2, 4),
+    ] {
+        match op {
+            0 => {
+                routed
+                    .create(shared, "c", libc::S_IFREG | 0o644, 0, 0)
+                    .await
+                    .unwrap();
+            }
+            1 => {
+                routed.unlink(shared, "c").await.unwrap();
+            }
+            2 => {
+                routed.link(f, shared, "l").await.unwrap();
+            }
+            3 => {
+                routed.rename(mine, "f", shared, "g", 0).await.unwrap();
+            }
+            _ => {
+                routed.rename(shared, "g", other, "h", 0).await.unwrap();
+            }
+        }
+        expect += delta;
+        assert_eq!(
+            rpcs(),
+            expect,
+            "{what}: one XvGuards per foreign holder table"
+        );
+    }
+    crossvol_tx::TEST_XV_GUARDS_FORCE_REMOTE.store(false, Ordering::SeqCst);
+    assert_eq!(names_in(&routed, other).await, vec!["h".to_string()]);
+    assert_eq!(names_in(&routed, shared).await, vec!["l".to_string()]);
+    assert_closed("rpc counts");
+    holders.tear_down();
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
+/// The served insert's `child` is screened (review round 1, Issue 8a):
+/// a step naming a child with no inode record in a slot nobody leases is
+/// refused (`EINVAL`, `xv_cross_owner_steps_rejected`) and plants no
+/// dentry; a scope whose parked guards do not cover the step's keys
+/// never lets it apply unguarded (`Take`, not `Covered` — Issue 8b).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_served_insert_naming_an_unmintable_child_is_refused_and_plants_nothing() {
+    use squeezefs::meta_ship::{MetaCall, MetaOp, PeerOwner};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    let endpoint = holders.host.endpoint().to_string();
+    let remote = MetaShipRouter::new(Arc::clone(&routed), "node-c", SECRET.to_vec());
+    let peer = Arc::new(PeerOwner::new("appender-1", &endpoint));
+    let before = cross_owner_stats();
+    // Routing slot 39 (forest slot 40) is leased by nobody in this set;
+    // local 77 there has no record — `allocate_guest_ino` never minted it.
+    let bogus = make_global_ino_width(77, 39, routed.routing_width());
+    let op = MetaOp {
+        id: remote.next_request_id(),
+        call: MetaCall::XvStep {
+            tx_id: 0x99,
+            step_idx: 0,
+            step: crossvol_tx::XvStep::InsertDentry {
+                parent: shared,
+                name: "planted".into(),
+                child: bogus,
+                ft_bits: libc::S_IFREG,
+                parent_update: 0,
+            },
+            scope: 0,
+        },
+    };
+    let mut r = remote.ship_ops(&peer, vec![op]).await.expect("shipped");
+    let outcome = r.pop().unwrap().outcome;
+    let err = outcome.expect_err("refused");
+    assert_eq!(err.errno, libc::EINVAL, "{err:?}");
+    assert!(
+        names_in(&routed, shared).await.is_empty(),
+        "nothing planted"
+    );
+    let after = cross_owner_stats();
+    assert_eq!(after.steps_rejected - before.steps_rejected, 1);
+    assert_eq!(after.steps_served - before.steps_served, 0);
+    holders.tear_down();
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
 // ---------------------------------------------------------------------------
 // The evidence note's instrument (dev box = SCOPING; `--ignored --nocapture`).
 // ---------------------------------------------------------------------------

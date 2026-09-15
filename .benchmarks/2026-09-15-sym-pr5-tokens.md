@@ -173,4 +173,20 @@ Review: `/tmp/grok-justin/grok-exec-review-dadee1dd-pr-5.md` (OPEN 20 / BUGS 7 a
 
 ### 8.2 Run ledger (the final tree)
 
-RUN_LEDGER_PLACEHOLDER
+Tree `15267a3c` (the code tree; the ledger's own docs commit follows). Logs `/tmp/grok-justin/pr5-logs/round2/`.
+
+| Run | Result |
+|---|---|
+| `cargo fmt --check` (root, `fuzz/`, `loom-models/`) | clean |
+| `cargo clippy --all-targets --all-features -- -D warnings` / `cargo clippy --all-targets -- -D warnings` | clean / clean |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | **green** (red at round 1 — Issue 1) |
+| `cd fuzz && cargo check --bins && cargo fmt --check` | clean (`token_call_frame` + the grown `bset_frame_v2`) |
+| `task check:loom`-equivalent (`RUSTFLAGS="--cfg loom -D warnings" cargo build --release --tests` + fmt) / `tests/run_loom.sh` | clean / **109 passed** (the two `token_grant_models` included) |
+| `sym_coherence_tests` ×10 stamped (`SQUEEZEFS_TEST_STAMP_SYMMETRIC=1`), `--test-threads=1`, from zero | 10/10 — **26 passed** each, 43.6–45.7 s |
+| `sym_coherence_tests` ×3 flat | 3/3 — 26 passed each, 43.6–44.0 s |
+| `readonly_mount_tests` / `reader_free_grace_tests` / `dlm_membership_tests` / `kv_node_tests` / `kv_smo_crash_completeness_tests` / `sym_slot_transfer_tests` / `sym_appender_tests` / `kernel_op_economy_tests` / `docs_parity_tests` / `env_knob_convention_tests` / `derivation_sweep_tests` / `decoder_property_tests` / `audit_instruments_tests`, flat AND stamped | 35 / 65 / 51 / 13 / 13 / 45 / 34 / 3 / 5 / 22 / 55 / 49 / 27 — green on both legs (26/26) |
+| `tests/run_sym_forest_suites.sh` (29 suites, both legs, once) | **PASS / PASS**, `matrix exit 0`, no ratio NOTE; `sym_coherence_tests` 43.8 / 43.6 s (1.00), `sym_slot_transfer_tests` 33.5 / 33.8 s (1.01). **Attempt 1 (kept: `matrix-attempt1-flatFAIL-at-slot-transfer-under-load.log`) FAILED its flat leg at `sym_slot_transfer_tests` (3 of 45: the renewal carriage, the two-volume owner table, the alternating pair — PR-4 contracts whose `N_floor` / offer state derives from MEASURED handover and ship walls) at 79.8 s wall against 33–34 s on every other roll, while a sibling PR's `cargo test --all-features --test fsck_tests` ran beside it; the same binary standalone under `--all-features` and the two ledger legs read 45/45 — attributed to box load, the re-run from zero above is the row.** |
+| The live-FUSE trio, both legs, `SQUEEZEFS_TEST_REQUIRE_MOUNT=1` | flat: `posix_mount_semantics_tests` 3 (9.8 s), `corpse_sweep_tests` 4 (33.5 s), `inline_raise_tests` 7 (7.9 s); stamped: 3 (6.7 s), 4 (21.7 s), 7 (7.3 s) — every mount-class contract RAN (`/dev/fuse`, `fuse.enable_uring=Y`, `fusermount3`; a self-skip panics under the flag) |
+| `tests/check_markdown_links.sh` | PASS (377 files, 632 local links, 0 broken) |
+
+**Found by the ledger itself** (§8.1 row 18): the first build of screen rule 4 read a RELEASED tree empty after its remount — `sym_slot_transfer_tests::a_handover_of_a_tree_with_pending_structure_runs_the_holders_own_smos`, both layouts — because a release keeps `g` and the rule took the manager's 0 as the lessee; fixed in `15267a3c` (rule 4 inert on an unleased slot), the unleased arm pinned, the whole ledger restarted from zero on the fixed tree (the counted-restart discipline).

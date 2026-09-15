@@ -2043,6 +2043,549 @@ async fn a_parked_grant_does_not_serialize_the_volumes_other_grants() {
     shutdown(&writer).await;
 }
 
+/// **Rebase seam (a) onto PR 8 — the recall completes before the
+/// terminal free reaches the allocation HOLDER.** PR 8 re-homed the free
+/// ladder to the data volume's allocation-lease holder (the bitmap IS the
+/// free list; a terminal free CLEARS the block's bit at `finish_free`),
+/// and the recall gate sits in that same `finish_free` beside the grace
+/// ring. The order is structural: the ladder (a local free, or a shipped
+/// one) is issued from the displacing publish's post-commit tail, and the
+/// commit is the conveyor pass that RECALLED the object's readers before
+/// its apply — so no free of a displaced block reaches the holder before
+/// the readers' acks. On a 2-volume armed set with the lease homed on the
+/// slot-0 volume: the block's bit stays SET while the recall is parked
+/// (no free ran), and after the ack the free publishes DIRECTLY under the
+/// gate (`free_grace_recall_gated_frees` +1, no ring deferral) and the
+/// bit CLEARS at the holder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_displacing_publishs_recall_completes_before_the_holders_free_clears_the_bit() {
+    use squeezefs::meta_backend::kv::alloc_lease;
+    let _g = SEAM.lock().await;
+    const DATA_BLOCKS: u64 = 4096;
+    const DATA_TAG: u64 = 0xD0DA_0000_0000_0005;
+    const DATA_ID: &str = "vol-d0da000000000005";
+    alloc_lease::test_clear_holdings();
+    alloc_lease::register_data_volume_blocks(DATA_TAG, DATA_BLOCKS);
+    free_grace::reset_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let plan = plan_meta_slot_set(2).expect("derived plan");
+    let mut uris = Vec::new();
+    for (i, stamp) in plan.stamps.iter().enumerate() {
+        let p = dir.path().join(format!("meta{i}"));
+        std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
+        let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), stamp.clone()).await;
+        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        r.expect("format stamped member");
+        uris.push(p.display().to_string());
+    }
+    std::env::set_var(SYMMETRIC_META_ENV, "1");
+    std::env::set_var("SQUEEZEFS_SYM_ALLOW_NON_PR", "1");
+    let writer = open_routed_meta_set(&uris)
+        .await
+        .expect("armed 2-volume writer");
+    std::env::remove_var(SYMMETRIC_META_ENV);
+    std::env::remove_var("SQUEEZEFS_SYM_ALLOW_NON_PR");
+    let (slot0, _) = writer.route_ino(1);
+    let vol0 = Arc::clone(&writer.volumes[slot0]);
+    assert!(vol0.token_holder().is_some());
+    // The data volume's allocator, minting from the holder's grants.
+    let ba = Arc::new(
+        squeezefs::block_allocator::BlockAllocator::new(DATA_ID)
+            .await
+            .expect("allocator"),
+    );
+    ba.set_capacity_bytes(DATA_BLOCKS * ba.chunk_size());
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&writer, &[Arc::clone(&ba)])
+            .await
+            .unwrap(),
+        1
+    );
+    let holding = alloc_lease::holding(DATA_TAG).expect("the lease is held on the slot-0 volume");
+    let b_off = ba.allocate_block().await.unwrap();
+    let b = b_off / ba.chunk_size();
+    assert!(holding.bitmap.is_set(b), "a granted block's bit is SET");
+
+    let x = Metadata::create(writer.as_ref(), 1, "x", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    // Every volume's holder on its own listener; the reader's plane per
+    // volume (the mint policy homes `x` wherever the rotor says — the
+    // recall rides the plane of its home).
+    let reader = open_routed_meta_set_read_only(&uris)
+        .await
+        .expect("read-only 2-volume open");
+    let mut hosts = Vec::new();
+    let mut planes = Vec::new();
+    let sink = ProbeSink::new(true);
+    for (i, v) in writer.volumes.iter().enumerate() {
+        let (host, endpoint) = holder_listener(v);
+        let plane = reader.volumes[i]
+            .arm_token_reader(TokenClientConfig {
+                endpoint,
+                secret: SECRET.to_vec(),
+                client_id: "reader-seam-a".to_string(),
+                volume: i as u16,
+            })
+            .expect("token client arms");
+        wait_until("the recall channel completes its first round", || {
+            plane.stats().channel_fresh
+        })
+        .await;
+        assert!(plane.install_data_sink(sink.clone()));
+        hosts.push(host);
+        planes.push(plane);
+    }
+    let (x_vol, _) = writer.route_ino(x);
+    let plane = Arc::clone(&planes[x_vol]);
+    let _ = Metadata::getattr(reader.as_ref(), x).await.unwrap();
+    let gated0 = free_grace::recall_gated_frees();
+    let deferrals0 = free_grace::deferrals();
+
+    // The displacing publish on X: its recall parks at the reader.
+    let w = Arc::clone(&writer);
+    let publish = tokio::spawn(async move {
+        Metadata::setattr(
+            w.as_ref(),
+            x,
+            Some(0o600),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    });
+    wait_until("the recall entered the reader's sink", || {
+        sink.calls.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(!publish.is_finished(), "the commit waits on the ack");
+    assert!(
+        holding.bitmap.is_set(b),
+        "no free of the displaced block ran before the recall completed"
+    );
+    assert_eq!(free_grace::recall_gated_frees(), gated0);
+    sink.release();
+    publish.await.unwrap().unwrap();
+    assert_eq!(
+        plane.stats().recalls_acked,
+        1,
+        "the recall was acked before the commit"
+    );
+    // The publish's ladder: the displaced block's terminal free at the
+    // holder — direct under the recall gate, its bit cleared, no ring.
+    assert!(ba.begin_free(b_off));
+    ba.finish_free(b_off);
+    assert!(
+        !holding.bitmap.is_set(b),
+        "the holder cleared the bit at finish_free"
+    );
+    assert_eq!(
+        free_grace::recall_gated_frees(),
+        gated0 + 1,
+        "published directly"
+    );
+    assert_eq!(free_grace::deferrals(), deferrals0, "no ring deferral");
+    for p in &planes {
+        p.stop().await;
+    }
+    for h in &hosts {
+        h.shutdown();
+    }
+    shutdown(&writer).await;
+    alloc_lease::test_clear_holdings();
+}
+
+/// **Rebase seam (c) onto PR 8 — a token READER's `T_self` is the
+/// POISON, never the park.** PR 8 split the member's fence: a symmetric
+/// APPENDER (a `Writer` member on a mount that armed the appender region)
+/// PARKS at `T_self` and reclaims against the successor; every other
+/// lease keeps the shipped poison. A token reader is a `Reader` member
+/// holding no region — even in a process where the appender posture IS
+/// armed, `self_fence_as(SymmetricAppender)` falls through to the poison
+/// (`fenced()`, purge requested, nothing parked), and the token plane's
+/// lease gate reads the poison: the reader drops its tokens and serves
+/// NOTHING from cache (`dlm_token_serve_refusals`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_readers_t_self_poisons_and_never_parks_under_the_appender_posture() {
+    use squeezefs::membership::{
+        self, JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole, MemberSession,
+        MembershipOwner,
+    };
+    use squeezefs::park_gate::{self, FenceClass};
+    let _g = SEAM.lock().await;
+    membership::uninstall();
+    park_gate::test_reset();
+    let ticks = Arc::new(AtomicU64::new(50_000));
+    let clock = LeaseClock::manual(Arc::clone(&ticks));
+    let owner = MembershipOwner::arm(
+        "poison-owner",
+        3,
+        2,
+        LeaseClocks::derive(Duration::from_micros(250)).expect("the shipped derivation"),
+        clock.clone(),
+    )
+    .expect("arm the owner");
+    let JoinOutcome::Granted(grant) = owner.join(JoinRequest {
+        id: "reader-poison".to_string(),
+        role: MemberRole::Reader,
+        endpoint: None,
+        pid: std::process::id(),
+        boot: "boot-poison".to_string(),
+        prior_epoch: None,
+        pr_key: 0,
+        mount: None,
+    }) else {
+        panic!("join");
+    };
+    let session = Arc::new(MemberSession::adopt(
+        "reader-poison",
+        MemberRole::Reader,
+        &grant,
+        clock.now_ms(),
+        clock.clone(),
+    ));
+    membership::install_member(Arc::clone(&session));
+    // The appender posture ARMED in this process (as a co-located armed
+    // writer would arm it): the park class exists, for WRITER members.
+    park_gate::arm_symmetric_appender(0, 60_000);
+    assert!(park_gate::symmetric_appender_armed());
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-poison").await;
+    let _ = Metadata::getattr(reader.as_ref(), 1).await.unwrap();
+    assert!(plane.holds(1));
+
+    // Past T_self on the member's own clock: the renewal tick's fence.
+    ticks.fetch_add(grant.t_owner_ms + 1, Ordering::SeqCst);
+    assert!(session.self_fence_due());
+    let fence = session.self_fence_as(FenceClass::SymmetricAppender, "T_self in the contract");
+    assert!(
+        !fence.parked,
+        "a Reader member never parks — it holds no region"
+    );
+    assert!(fence.purge_requested, "the reader is told to purge");
+    assert!(session.fenced(), "the poison is terminal");
+    assert!(!park_gate::is_parked(), "no park was raised");
+    // The token plane reads the poison: nothing served from cache.
+    let refused = plane.serve(1, TokenWants::default()).await;
+    assert!(refused.is_err(), "a fenced reader serves nothing");
+    assert!(!plane.holds(1), "its tokens were dropped");
+    assert!(plane.stats().serve_refusals >= 1);
+    membership::uninstall();
+
+    // The HOLDER's side of PR 8's park (`park_gate::admits_token_service`,
+    // the stand-in PR 8 left for this plane): a parked lessee still grants
+    // and recalls; a park that EXPIRED poisoned custody, and every token
+    // verb refuses — the successor owns the slots.
+    let holder = writer.volumes[0].token_holder().unwrap().clone();
+    plane.test_set_lease_live(Some(true));
+    assert!(plane
+        .serve(1, TokenWants::default())
+        .await
+        .unwrap()
+        .is_some());
+    // The appender's own T_self: the PARK — grants continue through it.
+    assert_eq!(
+        park_gate::fence_at_t_self(
+            FenceClass::SymmetricAppender,
+            clock.now_ms(),
+            "the contract's park"
+        ),
+        park_gate::TSelfAction::Parked
+    );
+    assert!(park_gate::is_parked() && park_gate::admits_token_service());
+    let reader_p = open_routed_meta_set_read_only(&[path.display().to_string()])
+        .await
+        .expect("read-only open while the holder is parked");
+    let plane_p = reader_p.volumes[0]
+        .arm_token_reader(TokenClientConfig {
+            endpoint: endpoint.clone(),
+            secret: SECRET.to_vec(),
+            client_id: "reader-while-parked".to_string(),
+            volume: 0,
+        })
+        .expect("token client arms");
+    wait_until("the parked holder still answers the channel", || {
+        plane_p.stats().channel_fresh
+    })
+    .await;
+    assert!(
+        plane_p
+            .serve(1, TokenWants::default())
+            .await
+            .unwrap()
+            .is_some(),
+        "a PARKED lessee is still the lock master: it grants"
+    );
+    // The park EXPIRES (the reclaim answered "not custody"): every verb
+    // refuses from here.
+    assert!(park_gate::expire_now("the contract's expiry"));
+    assert!(!park_gate::admits_token_service());
+    // A reader arming against the expired holder: its channel poll is
+    // REFUSED (the channel never becomes fresh), and every serve fails
+    // closed; the already-fresh parked reader's next grant is refused too.
+    let reader2 = open_routed_meta_set_read_only(&[path.display().to_string()])
+        .await
+        .expect("read-only open");
+    let plane2 = reader2.volumes[0]
+        .arm_token_reader(TokenClientConfig {
+            endpoint: endpoint.clone(),
+            secret: SECRET.to_vec(),
+            client_id: "reader-after-expiry".to_string(),
+            volume: 0,
+        })
+        .expect("token client arms");
+    wait_until("the expired holder refused the channel poll", || {
+        holder.stats().park_expired_refusals >= 1
+    })
+    .await;
+    assert!(
+        !plane2.stats().channel_fresh,
+        "no round completes against an expired holder"
+    );
+    assert!(
+        plane2.serve(1, TokenWants::default()).await.is_err(),
+        "an expired holder grants nothing — the reader fails closed"
+    );
+    let err = match plane_p.serve(2, TokenWants::default()).await {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a grant off an expired holder"),
+    };
+    assert!(
+        err.contains("EXPIRED") || err.contains("not fresh"),
+        "the refusal names the expiry or the dead channel: {err}"
+    );
+    drop(reader2);
+    drop(reader_p);
+    park_gate::test_reset();
+    squeezefs::data_custody::test_clear_poison();
+    plane2.stop().await;
+    plane_p.stop().await;
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
+/// **Rebase seam (e) onto PR 6 — a shipped cross-owner STEP is recalled
+/// before it applies.** PR 6's travelling guards are 4a guards the
+/// initiator holds AT THE HOLDER for the op; the step it ships applies
+/// at the holder as an ordinary commit — through the conveyor pass, whose
+/// FIRST act under the batch's guards is the token recall of the batch's
+/// objects. So a create in a directory another appender holds recalls
+/// the directory's token from every reader BEFORE the `InsertDentry`
+/// step lands (the guards travelled first, the recall runs inside the
+/// step's pass, the apply follows the acks), and the reader's next lookup
+/// sees the child — exact. PR 6's own two-holder fixture: a directory
+/// seeded in slot 4, the next open's declared region 1 leasing it, the
+/// S8 venue standing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cross_owner_create_recalls_the_parents_token_before_its_shipped_step_applies() {
+    use squeezefs::data_grant::AsyncVerbRouter;
+    use squeezefs::meta_backend::crossvol_tx::{
+        cross_owner_stats, install_xv_shipper, uninstall_xv_shipper,
+    };
+    use squeezefs::meta_backend::kv::appender::TEST_APPENDER_SLOTS_ENV;
+    use squeezefs::meta_backend::kv::builder::ROOT_INO;
+    use squeezefs::meta_backend::kv::record::ForestSlot;
+    use squeezefs::meta_backend::{make_global_ino_width, IntentCreatePreset};
+    use squeezefs::meta_ship::manager::ManagerSetService;
+    use squeezefs::meta_ship::{MetaShipRouter, MetaShipService};
+    const SLOT_B: ForestSlot = 4;
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    // A data volume in the format config (the cross-owner create's mint).
+    let oss = dir.path().join("oss0");
+    std::fs::File::create(&oss)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let cfg = squeezefs::FormatConfig {
+        name: "squeezefs".to_string(),
+        block_size: 4096,
+        capacity: 1 << 30,
+        inodes: 1_000_000,
+        compression: "none".to_string(),
+        encrypt_algo: "none".to_string(),
+        encrypt_key: None,
+        encrypt_key_ref: None,
+        mem_cache_size: None,
+        disk_cache_size: None,
+        disk_cache_paths: None,
+        data_lv: Some(vec![oss.display().to_string()]),
+        data_volumes: None,
+        read_cache_size: None,
+        write_cache_size: None,
+        read_mem_cache_size: None,
+        write_mem_cache_size: None,
+        dismount_wait: None,
+        upload_delay: None,
+        fuse_io_uring_sqpoll_idle_ms: None,
+        meta_routing_width: None,
+        meta_slot_runs: None,
+        meta_volumes: None,
+    };
+    let p = dir.path().join("meta0");
+    std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+    let plan = plan_meta_slot_set(1).expect("derived plan");
+    let opts = FormatV3Options {
+        format_config_xattr: Some(serde_json::to_vec(&cfg).unwrap()),
+        ..set_opts()
+    };
+    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
+    let r = format_v3_stamped(&p, VOL_LEN, &opts, plan.stamps[0].clone()).await;
+    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    r.expect("format stamped member");
+    let uris = vec![p.display().to_string()];
+
+    // Seed a directory in slot 4 while the slot is the manager's, then
+    // release the slot so the next open's declared region takes it.
+    let writer0 = open_armed_writer(&p).await;
+    let shared = {
+        let vol = &writer0.volumes[0];
+        let width = writer0.routing_width();
+        let routing = u64::from(SLOT_B) - 1;
+        let local = vol
+            .allocate_guest_ino(routing as u16)
+            .expect("a guest cursor");
+        let global = make_global_ino_width(local, routing, width);
+        let ino = writer0
+            .create_with_rdev_preset(
+                ROOT_INO,
+                "shared",
+                libc::S_IFDIR | 0o755,
+                0,
+                0,
+                0,
+                0,
+                Some(IntentCreatePreset {
+                    global_ino: global,
+                    ts_ns: KvMetaBackend::now_ns_pub(),
+                }),
+            )
+            .await
+            .expect("seed dir")
+            .ino;
+        assert_eq!(ino, global);
+        ino
+    };
+    writer0.volumes[0]
+        .release_slot_handover(0, SLOT_B)
+        .await
+        .expect("release to unleased");
+    shutdown(&writer0).await;
+    drop(writer0);
+
+    // The two-holder open: region 1 leases slot 4.
+    std::env::set_var(SYMMETRIC_META_ENV, "1");
+    std::env::set_var("SQUEEZEFS_SYM_ALLOW_NON_PR", "1");
+    std::env::set_var(TEST_APPENDER_SLOTS_ENV, "1:4");
+    let mut opened = None;
+    for _ in 0..200 {
+        match open_routed_meta_set(&uris).await {
+            Ok(r) => {
+                opened = Some(r);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    std::env::remove_var(SYMMETRIC_META_ENV);
+    std::env::remove_var("SQUEEZEFS_SYM_ALLOW_NON_PR");
+    std::env::remove_var(TEST_APPENDER_SLOTS_ENV);
+    let writer = opened.expect("the two-holder open");
+    let vol = Arc::clone(&writer.volumes[0]);
+    let lease_plane = vol.slot_leases().expect("armed");
+    assert_eq!(
+        lease_plane.holders.holder(SLOT_B).map(|h| h.appender_id),
+        Some(1),
+        "the declared region leases the shared directory's slot"
+    );
+    // The S8 venue: the holders' owner service + the initiator's shipper.
+    let venue = cw::RpcListener::start_async(
+        listener_cfg(),
+        SECRET.to_vec(),
+        Arc::new(
+            AsyncVerbRouter::new()
+                .with_meta(MetaShipService::new(Arc::clone(&writer)))
+                .with_manager(ManagerSetService::new(&writer.volumes)),
+        ) as Arc<dyn cw::RpcAsyncService>,
+    )
+    .expect("owner listener");
+    lease_plane
+        .holders
+        .set_endpoint(1, &venue.endpoint().to_string());
+    install_xv_shipper(MetaShipRouter::new(
+        Arc::clone(&writer),
+        "node-b",
+        SECRET.to_vec(),
+    ));
+
+    // The token reader holds the shared directory's dentry set.
+    let (host, endpoint) = holder_listener(&vol);
+    let holder = vol.token_holder().unwrap().clone();
+    let (reader, plane) = open_token_reader(&p, &endpoint, "reader-xv").await;
+    let sink = ProbeSink::new(false);
+    assert!(plane.install_data_sink(sink.clone()));
+    assert!(Metadata::lookup(reader.as_ref(), shared, "out.bin")
+        .await
+        .is_err());
+    let (_v, shared_local) = writer.route_ino(shared);
+    assert!(plane.holds(shared_local), "the directory's token is cached");
+    let steps0 = cross_owner_stats().steps_served;
+
+    // The cross-owner create: its InsertDentry step lands at the holder
+    // through the conveyor pass — recalled BEFORE it applies.
+    sink.parked.store(true, Ordering::SeqCst);
+    let w = Arc::clone(&writer);
+    let create = tokio::spawn(async move {
+        w.create(shared, "out.bin", libc::S_IFREG | 0o644, 0, 0)
+            .await
+    });
+    wait_until("the step's recall reached the reader", || {
+        sink.calls.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    assert!(
+        !plane.holds(shared_local),
+        "the directory's token left the cache"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !create.is_finished(),
+        "the shipped step cannot apply before the reader's ack"
+    );
+    assert_eq!(holder.stats().recall_acks, 0);
+    sink.release();
+    let file = create.await.unwrap().expect("the cross-owner create");
+    assert_eq!(
+        cross_owner_stats().steps_served - steps0,
+        1,
+        "one shipped InsertDentry"
+    );
+    assert!(holder.stats().recall_acks >= 1);
+    // Exact at the next resolve.
+    let seen = Metadata::lookup(reader.as_ref(), shared, "out.bin")
+        .await
+        .unwrap();
+    assert_eq!(seen.ino, file.ino);
+
+    plane.stop().await;
+    host.shutdown();
+    uninstall_xv_shipper();
+    venue.shutdown();
+    shutdown(&writer).await;
+}
+
 /// **The gate's in-flight set is a REFCOUNT** (review round 2, Issue
 /// 23): the plane has two users that overlap by design — the conveyor
 /// pass task and the durability lane's rollback of a failed window — and

@@ -3,7 +3,8 @@
 //! stamped 40 B frame `magic ‖ version=2 ‖ reserved ‖ node_seq ‖ padded_len
 //! ‖ bset_len ‖ appender_id ‖ g ‖ checksum`, dispatched by the LAYOUT
 //! (a v1 frame on a v2 layout and a v2 frame on a v1 layout are both
-//! foreign), walked under the three-rule screen.
+//! foreign), walked under the four-rule screen (rule 4: a current-generation
+//! frame from an appender that is not the lessee).
 //!
 //! Three arms: (1) arbitrary bytes through the screened walk on a v2
 //! layout under an arbitrary screen — total, bsets in bounds, the tail
@@ -29,6 +30,7 @@ const NODE_SIZE: usize = 64 * 1024;
 struct Input {
     raw: Vec<u8>,
     g_current: u32,
+    appender_current: u32,
     tail_g: u32,
     tail_frame: u8,
     pr_fenced: bool,
@@ -58,6 +60,7 @@ fuzz_target!(|input: Input| {
     let v1 = NodeLayout::new(NODE_SIZE).expect("64 KiB is legal");
     let screen = FrameScreen {
         g_current: input.g_current,
+        appender_current: input.appender_current,
         recorded_tail: input.has_tail.then_some((
             input.tail_g,
             (u32::from(input.tail_frame) + 1) * NODE_PAGE as u32,

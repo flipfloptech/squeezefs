@@ -184,6 +184,12 @@ enum FrameFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameScreen {
     pub g_current: u32,
+    /// The appender leasing the slot at `g_current` (tree 0's lessee; 0 =
+    /// the manager maintaining an unleased tree) — rule 4's input: one
+    /// generation has ONE lessee, so a current-generation frame from any
+    /// other appender is a manager bug or a forgery (review round 1,
+    /// Issue 18).
+    pub appender_current: u32,
     /// `(g at the release that recorded it, tail offset)` — `None` when no
     /// release ever recorded this leaf (a leaf minted after the last
     /// release, or a slot never released).
@@ -192,10 +198,28 @@ pub struct FrameScreen {
 }
 
 impl FrameScreen {
-    /// The three-rule verdict on one frame at node-relative offset `pos`
-    /// (design §5.8.2): `Some(rule)` names the rule that classified the
-    /// frame FOREIGN, `None` keeps it. `prev_g` is the generation of the
-    /// nearest earlier frame in the same log (rule 3's input).
+    /// The rule a foreign frame lands on the BREACH class for under a
+    /// device fence (`appender_fence_breach`): a write the reservation
+    /// should have rejected — a generation above the current one (1) or
+    /// a current-generation frame from an appender that is not the lessee
+    /// (4). Rules 2–3 are stale-lessee shapes, never a breach.
+    pub fn is_breach_rule(rule: u8) -> bool {
+        matches!(rule, 1 | 4)
+    }
+
+    /// The lessee's own stamp at the current generation.
+    pub fn current_stamp(&self) -> FrameStamp {
+        FrameStamp {
+            appender_id: self.appender_current,
+            g: self.g_current,
+        }
+    }
+
+    /// The four-rule verdict on one frame at node-relative offset `pos`
+    /// (design §5.8.2 + rule 4): `Some(rule)` names the rule that
+    /// classified the frame FOREIGN, `None` keeps it. `prev_g` is the
+    /// generation of the nearest earlier frame in the same log (rule 3's
+    /// input).
     pub fn foreign_rule(&self, stamp: FrameStamp, pos: usize, prev_g: Option<u32>) -> Option<u8> {
         if stamp.g > self.g_current {
             return Some(1);
@@ -207,6 +231,9 @@ impl FrameScreen {
         }
         if prev_g.is_some_and(|p| stamp.g < p) {
             return Some(3);
+        }
+        if stamp.g == self.g_current && stamp.appender_id != self.appender_current {
+            return Some(4);
         }
         None
     }
@@ -1025,7 +1052,7 @@ pub async fn load_node(
 
 /// [`load_node`] under the §5.8.2 frame screen (design-symmetric-metadata;
 /// PR 5): on a v2 layout every same-incarnation frame is judged by
-/// `screen`'s three rules and the walk STOPS at the first foreign one
+/// `screen`'s four rules and the walk STOPS at the first foreign one
 /// (the frames behind it are not this lessee's log). `None` — every v1
 /// load, and a v2 load with no lease plane to answer for the slot —
 /// applies rule 3 alone (monotone `g` within one log needs no input).
@@ -1172,17 +1199,19 @@ pub fn verify_node_extent_screened(
     if let Some((at, stamp, rule)) = screened_at {
         screened = 1;
         let pr_fenced = screen.is_some_and(|s| s.pr_fenced);
-        if rule == 1 && pr_fenced {
+        if FrameScreen::is_breach_rule(rule) && pr_fenced {
             super::META_KV_APPENDER_FENCE_BREACH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             crate::note_invariant_tripwire(
                 "meta_kv_appender_fence_breach",
                 &format!(
                     "node {node_addr:#x}: a frame at offset {at} carries slot generation {} \
-                     ABOVE the current lease generation {} (appender {}) on a DEVICE-FENCED \
-                     substrate — a write the reservation should have rejected",
+                     from appender {} against the current lease generation {} of appender {} \
+                     (rule {rule}) on a DEVICE-FENCED substrate — a write the reservation \
+                     should have rejected",
                     stamp.g,
+                    stamp.appender_id,
                     screen.map_or(0, |s| s.g_current),
-                    stamp.appender_id
+                    screen.map_or(0, |s| s.appender_current),
                 ),
             );
         } else {
@@ -1197,12 +1226,14 @@ pub fn verify_node_extent_screened(
                 screen.map_or(0, |s| s.g_current),
             );
         }
-        let g_current = screen.map(|s| s.g_current);
+        // The lessee's OWN stamp (generation AND appender — a current-
+        // generation frame from another appender is rule 4's, not ours).
+        let own = screen.map(|s| s.current_stamp());
         let mut probe = at.saturating_add(NODE_PAGE);
         while probe + frame_len <= node_size {
             if let FrameProbe::Frame(f) = probe_frame(&buf, probe, header.node_seq, layout) {
                 if frame_geometry_ok(&f, probe, node_size, frame_len)
-                    && f.stamp.is_some_and(|s| Some(s.g) == g_current)
+                    && f.stamp.is_some_and(|s| Some(s) == own)
                 {
                     super::META_KV_FOREIGN_FRAME_OVERWRITE_DETECTED
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

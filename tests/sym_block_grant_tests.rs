@@ -536,18 +536,22 @@ async fn a_second_volumes_checkpoint_never_writes_the_holders_pages_onto_its_own
     let me = identity_of(&home);
     let (holding, _) = take_fresh_lease(&home, me).await;
     let base = holding.pages[0].start;
-    let before = squeezefs::uring_fs::read_at(other.device_path(), base, 4096)
-        .await
-        .unwrap();
     grant_of(home.holder_block_grant(DATA_TAG, "w", 64, 0).await.unwrap());
     assert!(holding.bitmap.has_dirty_pages());
-    // The OTHER volume's checkpoint: its device untouched at the holder's
-    // page offsets, the holder's dirty bits still pending its OWN cycle.
+    // The OTHER volume's checkpoint: no `KVDA` page lands on its device at
+    // the holder's page offsets (its own heap may legitimately place a
+    // NODE there — the two volumes share a geometry and a claim history —
+    // so the witness is the page magic, never the raw bytes), and the
+    // holder's dirty bits still pend its OWN cycle.
     other.checkpoint_now().await.unwrap();
     let after = squeezefs::uring_fs::read_at(other.device_path(), base, 4096)
         .await
         .unwrap();
-    assert_eq!(before, after, "the other volume's device received a page");
+    assert_ne!(
+        u32::from_le_bytes(after[..4].try_into().unwrap()),
+        squeezefs::data_alloc_bitmap::DATA_ALLOC_PAGE_MAGIC,
+        "the other volume's device received a data bitmap page"
+    );
     assert!(
         holding.bitmap.has_dirty_pages(),
         "the other volume's checkpoint consumed the holder's dirty bits"

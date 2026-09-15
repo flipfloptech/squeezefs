@@ -1701,6 +1701,75 @@ async fn a_directory_rename_whose_ancestor_link_collides_with_its_own_guard_stri
     fsck_clean(&uris).await;
 }
 
+/// The scan ADOPTS only intents homed in slots THIS mount's step-home is
+/// `Local` for (review round 2, Issue 21): an intent in a slot another
+/// appender leases is that appender's (its re-read here would be a
+/// projection, and its retirement by the peer invisible) — skipped by
+/// the cadence and the mount's recovery, never registered. Planted here
+/// as a raw record in the declared region's slot home; the raw scan sees
+/// it, the roll-forward does not adopt it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_intent_homed_in_a_slot_another_appender_leases_is_never_adopted_here() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let before = cross_owner_stats();
+    // A well-formed intent (a TouchCtime of `shared`) planted in slot B's
+    // intent home — appender 1's slot.
+    let tx_id = 0x0000_00ab_cdef_0123u64;
+    let rec = crossvol_tx::IntentRecord {
+        tx_id,
+        op: crossvol_tx::XvOp::Rename,
+        steps: vec![crossvol_tx::XvStep::TouchCtime {
+            ino: shared,
+            ctime: KvMetaBackend::now_ns_pub(),
+        }],
+    };
+    let home = crossvol_tx::intent_ino_for_slot(SLOT_B);
+    vol.xv_write_intent(
+        &crossvol_tx::XvRider::Put {
+            intent_ino: home,
+            tx_id,
+            image: rec.encode().unwrap(),
+        },
+        Arc::from(Vec::new()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        vol.xv_scan_intents_homed().await.unwrap().len(),
+        1,
+        "the raw scan sees it"
+    );
+    assert_eq!(
+        crossvol_tx::roll_forward_open_intents(&routed)
+            .await
+            .unwrap(),
+        0,
+        "not this mount's to roll forward"
+    );
+    let after = cross_owner_stats();
+    assert_eq!(after.intents_minted, before.intents_minted, "never adopted");
+    assert_eq!(after.intents_open, 0);
+    assert_eq!(
+        vol.xv_scan_intents_homed().await.unwrap().len(),
+        1,
+        "the record stays for its lessee"
+    );
+    // Clean up as the lessee would: retire it directly.
+    vol.xv_retire_intent_at(home, tx_id, Arc::from(Vec::new()))
+        .await
+        .unwrap();
+    assert_eq!(open_intents(&routed).await, 0);
+    holders.tear_down();
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
 /// The wire half of the travelling guard: a REMOTE initiator's
 /// `XvGuards` parks the named 4a guards at the holder under its scope
 /// (a local acquirer of the same key waits), the steps it ships under
@@ -1948,7 +2017,11 @@ async fn a_parked_scope_expires_with_its_initiators_membership_lease_when_a_plan
     );
     TEST_XV_STUCK_AFTER_MS.store(1, Ordering::SeqCst);
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    assert_eq!(crossvol_tx::sweep_expired_guards(), 1, "…and expires at the belt");
+    assert_eq!(
+        crossvol_tx::sweep_expired_guards(),
+        1,
+        "…and expires at the belt"
+    );
     TEST_XV_STUCK_AFTER_MS.store(0, Ordering::SeqCst);
     membership::uninstall();
     let after = cross_owner_stats();

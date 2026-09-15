@@ -219,6 +219,12 @@ pub static TEST_DIR_RENAME_IDENTITY_ONCE: std::sync::atomic::AtomicU32 =
 /// every holder shares the process (the contracts' two-appender model).
 pub static TEST_XV_GUARDS_FORCE_REMOTE: AtomicBool = AtomicBool::new(false);
 
+/// Test seam: a scope's fire-and-forget `XvRelease` is held this many ms
+/// before it is submitted — the schedule where the NEXT op's `XvGuards`
+/// on the same keys reaches the holder first (PR 5 review round 3, Issue
+/// 26: the load-selected order made deterministic).
+pub static TEST_XV_RELEASE_HOLD_MS: AtomicU64 = AtomicU64::new(0);
+
 // ---------------------------------------------------------------------------
 // The Cross-owner family (design-symmetric-metadata §11; stats inode
 // `xv_cross_owner_*`, `dir_rename_lock_*`). Every gauge 0 on an unarmed
@@ -989,6 +995,11 @@ pub async fn acquire_guards_leased(
         };
         let t = std::time::Instant::now();
         XV_CO_GUARD_RPCS.fetch_add(1, Ordering::Relaxed);
+        log::debug!(
+            "cross-owner guards: shipping scope {scope:#x} to appender {holder} at {} (local \
+             table taken first: {local_taken})",
+            peer.endpoint
+        );
         let acquired = match router.ship_ops(&peer, vec![op]).await {
             Ok(mut results) => match results.pop() {
                 Some(r) => r
@@ -1041,6 +1052,10 @@ fn spawn_scope_release(
     release_ino: u64,
 ) {
     crate::meta_exec::spawn_meta("xv_guard_release", async move {
+        let hold = TEST_XV_RELEASE_HOLD_MS.load(Ordering::Relaxed);
+        if hold > 0 {
+            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(hold)).await;
+        }
         let op = crate::meta_ship::MetaOp {
             id: router.next_request_id(),
             call: crate::meta_ship::MetaCall::XvRelease {

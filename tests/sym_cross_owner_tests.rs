@@ -2113,6 +2113,9 @@ async fn an_initiator_acquires_its_foreign_guards_at_the_holder_and_releases_the
 /// foreign holders ships two.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_cross_owner_verb_pays_one_guard_round_trip_per_foreign_holder_table() {
+    // The tape a load-selected wire stall needs (PR 5 review round 3,
+    // Issue 26): `RUST_LOG=squeezefs=debug` names the served side's park.
+    let _ = env_logger::builder().is_test(true).try_init();
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B, SLOT_C]).await;
@@ -2170,6 +2173,81 @@ async fn every_cross_owner_verb_pays_one_guard_round_trip_per_foreign_holder_tab
     assert_eq!(names_in(&routed, other).await, vec!["h".to_string()]);
     assert_eq!(names_in(&routed, shared).await, vec!["l".to_string()]);
     assert_closed("rpc counts");
+    holders.tear_down();
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
+/// **A parked `XvGuards` never blocks the release that unparks it** (PR
+/// 5 review round 3, Issue 26 — the attribution of the load-selected `no
+/// reply to call 1 within 10s` of the contract above; both recorded reds
+/// ran 33.9 s = the suite's 13.5 s + TWO 10 s bounds). The S8 lane to one
+/// owner is stop-and-wait and the owner runs a frame's ops serially;
+/// `XvGuards` PARKS at the holder by design (on a stripe the previous
+/// scope still holds) and the previous scope's `XvRelease` was a
+/// fire-and-forget task on that SAME lane — so when the release lost the
+/// race for the lane to the next op's guards, the holder's serve parked
+/// on guards whose release sat BEHIND it: head-of-line until the call
+/// bound (10 s), then the resend parked behind the dedup winner (10 s
+/// more). The schedule made deterministic: the create's release is held
+/// 50 ms (`TEST_XV_RELEASE_HOLD_MS`) so the unlink's guards on the same
+/// `D{shared:"c"}` reach the holder first; the unlink must complete in
+/// the release's hold plus a round trip, never the wire's bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parked_xv_guards_never_blocks_the_release_that_unparks_it() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    crossvol_tx::TEST_XV_GUARDS_FORCE_REMOTE.store(true, Ordering::SeqCst);
+    crossvol_tx::TEST_XV_RELEASE_HOLD_MS.store(50, Ordering::SeqCst);
+    let before = cross_owner_stats();
+    let rounds = 8u32;
+    let bound = std::time::Duration::from_secs(3);
+    for i in 0..rounds {
+        routed
+            .create(shared, "c", libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+        // The create's scope is still parked at the holder (its release
+        // is held); the unlink's guards on the same dentry key park
+        // behind it — and must be unparked by that release, not by the
+        // wire's bound.
+        let t0 = std::time::Instant::now();
+        tokio::time::timeout(bound, routed.unlink(shared, "c"))
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "round {i}: the unlink did not complete within {bound:?} — the create's \
+                     release queued behind the unlink's parked guards"
+                )
+            })
+            .unwrap();
+        assert!(
+            t0.elapsed() < bound,
+            "round {i}: {:?} — a guard round trip waited the wire bound",
+            t0.elapsed()
+        );
+    }
+    crossvol_tx::TEST_XV_RELEASE_HOLD_MS.store(0, Ordering::SeqCst);
+    crossvol_tx::TEST_XV_GUARDS_FORCE_REMOTE.store(false, Ordering::SeqCst);
+    let after = cross_owner_stats();
+    assert_eq!(
+        after.guard_rpcs - before.guard_rpcs,
+        u64::from(rounds) * 2,
+        "one XvGuards per op"
+    );
+    assert_eq!(
+        after.guard_expiries, before.guard_expiries,
+        "no scope expired"
+    );
+    assert!(names_in(&routed, shared).await.is_empty());
+    // The held releases land before the teardown reads the table.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_closed("release ordering");
     holders.tear_down();
     shutdown(&routed).await;
     fsck_clean(&uris).await;

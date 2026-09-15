@@ -2403,9 +2403,12 @@ async fn the_manager_merges_an_unleased_slot_tree_and_skips_a_foreign_leased_one
     }
     vol.checkpoint_now().await.unwrap();
     vol.checkpoint_now().await.unwrap();
+    // The census is a lock-free RAM walk (a background flush pass may be
+    // mid-swap): the precondition is that it finds SOME underfull leaf —
+    // the sweep below, serialized under the SMO mutex, is the verdict.
     let census = vol.dead_bset_census();
     assert!(
-        census.merge_candidates.len() >= 2,
+        !census.merge_candidates.is_empty(),
         "the fixture: underfull leaves in slot 4 ({} of {})",
         census.merge_candidates.len(),
         census.leaves

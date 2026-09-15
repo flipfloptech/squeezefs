@@ -1862,10 +1862,12 @@ async fn routed_ref_flags(
 
 /// What the router lends the volume-level index executors (symmetric PR
 /// 7 — `shared_refs::RoutedSharedRefs`): the routed reference-flag read
-/// and the RAM SHARED mark a served `MarkShared` sets on this mount.
+/// and the RAM SHARED mark a served `MarkShared` sets on this mount. Both
+/// handles are WEAK — the hooks live in a process-global slot and must
+/// never keep a dropped rig's allocators or set alive.
 struct RoutedSharedRefHooks {
     meta: std::sync::Weak<crate::meta_backend::RoutedMetaBackend>,
-    backend_router: std::sync::Arc<BackendRouter>,
+    backend_router: std::sync::Weak<BackendRouter>,
 }
 
 impl crate::meta_backend::kv::shared_refs::RoutedSharedRefs for RoutedSharedRefHooks {
@@ -1889,7 +1891,28 @@ impl crate::meta_backend::kv::shared_refs::RoutedSharedRefs for RoutedSharedRefH
     }
 
     fn note_marked(&self, vol_tag: u64, block_idx: u64) {
-        if let Some((alloc, offset)) = self.backend_router.allocator_for_tag(vol_tag, block_idx) {
+        let Some(router) = self.backend_router.upgrade() else {
+            return;
+        };
+        if let Some((alloc, offset)) = router.allocator_for_tag(vol_tag, block_idx) {
+            // The cross-process W1 window PR 12 owes (review round 2, Issue
+            // 20): a served mark lands after its durable commit and outside
+            // the guard the local patch site holds, so a foreign cloner's
+            // mark can arrive between the patcher's durable probe and its
+            // fenced RAM-mark load. Until the served mark takes that guard,
+            // the window is DETECTED: an unstable incarnation word here IS a
+            // patch in flight on the block being marked.
+            if alloc.fill_incarnation(offset).is_none() {
+                crate::note_invariant_tripwire(
+                    "served_mark_shared_under_patch",
+                    &format!(
+                        "a served MarkShared marked block {block_idx} of data volume \
+                         {vol_tag:#x} ({}) while a W1 patch was in flight on it — the \
+                         cross-process patch-under-clone window PR 12 closes",
+                        alloc.volume_id()
+                    ),
+                );
+            }
             alloc.mark_shared(offset);
         }
     }
@@ -7839,6 +7862,9 @@ impl DataRouter {
             return Ok(0);
         };
         if !mb.volumes.iter().any(|v| v.slot_lease_armed()) {
+            // An unarmed set forgets an earlier rig's hooks in this
+            // process (the served verbs and the GC arm then find none).
+            crate::meta_backend::kv::shared_refs::clear_routed();
             return Ok(0);
         }
         self.inner
@@ -7856,7 +7882,7 @@ impl DataRouter {
         }
         let hooks = std::sync::Arc::new(RoutedSharedRefHooks {
             meta: std::sync::Arc::downgrade(mb),
-            backend_router: std::sync::Arc::clone(&self.backend_router),
+            backend_router: std::sync::Arc::downgrade(&self.backend_router),
         });
         crate::meta_backend::kv::shared_refs::install_routed(hooks.clone());
         let gate: SharedFreeGate = std::sync::Arc::new(move |vol_tag: u64, block_idx: u64| {

@@ -307,23 +307,38 @@ impl BlockRefOp {
 /// re-description but the bit's first landing, and no released op names
 /// the cloner's reference in the same list.
 pub fn cancel_same_reference_pairs(ops: &mut Vec<BlockRefOp>) {
-    let mut i = 0;
-    while i < ops.len() {
-        let released = !ops[i].take;
-        let key = ops[i].reference;
-        let partner = ops.iter().enumerate().position(|(j, o)| {
-            j != i && o.reference == key && o.take == released && !(o.take && o.shared)
-        });
-        match partner {
-            Some(j) if !(ops[i].take && ops[i].shared) => {
-                let (lo, hi) = if i < j { (i, j) } else { (j, i) };
-                ops.remove(hi);
-                ops.remove(lo);
-                // Both indices moved: rescan from the lower one.
-                i = lo;
-            }
-            _ => i += 1,
+    // The streaming publish's batches are take-only and a prune's are
+    // release-only: no pair can exist, nothing to scan.
+    if !(ops.iter().any(|o| o.take) && ops.iter().any(|o| !o.take)) {
+        return;
+    }
+    // O(n log n): the released ops indexed by reference, each matched to at
+    // most one unshared take of the same reference.
+    let mut released: std::collections::BTreeMap<BlockRef, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (i, o) in ops.iter().enumerate() {
+        if !o.take {
+            released.entry(o.reference).or_default().push(i);
         }
+    }
+    let mut drop = vec![false; ops.len()];
+    for (i, o) in ops.iter().enumerate() {
+        if o.take && !o.shared {
+            if let Some(partners) = released.get_mut(&o.reference) {
+                if let Some(j) = partners.pop() {
+                    drop[i] = true;
+                    drop[j] = true;
+                }
+            }
+        }
+    }
+    if drop.iter().any(|d| *d) {
+        let mut i = 0;
+        ops.retain(|_| {
+            let keep = !drop[i];
+            i += 1;
+            keep
+        });
     }
 }
 

@@ -240,18 +240,28 @@ pub trait RoutedSharedRefs: Send + Sync {
     fn note_marked(&self, vol_tag: u64, block_idx: u64);
 }
 
-static ROUTED: arc_swap::ArcSwapOption<Arc<dyn RoutedSharedRefs>> =
-    arc_swap::ArcSwapOption::const_empty();
+/// The installed hooks — a `RwLock` rather than an `ArcSwap` because the
+/// trait object is a fat pointer `ArcSwap` cannot hold without a second
+/// `Arc`; every reader is a served verb or a GC arm, never a hot path.
+static ROUTED: std::sync::RwLock<Option<Arc<dyn RoutedSharedRefs>>> = std::sync::RwLock::new(None);
 
 /// Install the routed layer's hooks (one per process — the armed mount's;
-/// a later arm replaces an earlier rig's in the same process).
+/// a later arm replaces an earlier rig's in the same process). The hooks
+/// hold WEAK handles to the router and the set, so an installed rig's
+/// death leaves them inert, never kept alive.
 pub fn install_routed(hooks: Arc<dyn RoutedSharedRefs>) {
-    ROUTED.store(Some(Arc::new(hooks)));
+    *ROUTED.write().unwrap_or_else(|e| e.into_inner()) = Some(hooks);
+}
+
+/// Forget the installed hooks (an UNARMED arm in a process that armed an
+/// earlier rig — fixture hygiene; production runs one mount per process).
+pub fn clear_routed() {
+    *ROUTED.write().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// The installed hooks, `None` on a mount that never armed.
 pub fn routed() -> Option<Arc<dyn RoutedSharedRefs>> {
-    ROUTED.load_full().map(|h| Arc::clone(&*h))
+    ROUTED.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// One C16 finding (report-only; `fsck_shared_index_drift`).
@@ -527,6 +537,17 @@ impl KvMetaBackend {
         block_idx: u64,
     ) -> std::result::Result<Vec<BlockRef>, KvError> {
         BLOCK_REF_PROBES.fetch_add(1, Ordering::Relaxed);
+        self.index_population_uncounted(vol_tag, block_idx).await
+    }
+
+    /// [`Self::shared_index_population`] without the gauge — the reads
+    /// inside ONE decision (`release_shared`'s sizing read, its re-read
+    /// under the mutex, a re-size), which count as one probe.
+    async fn index_population_uncounted(
+        &self,
+        vol_tag: u64,
+        block_idx: u64,
+    ) -> std::result::Result<Vec<BlockRef>, KvError> {
         let Some(forest) = self.forest() else {
             return Ok(Vec::new());
         };
@@ -597,6 +618,8 @@ impl KvMetaBackend {
         Fut: std::future::Future<Output = std::result::Result<bool, KvError>>,
     {
         RELEASE_SHARED_CALLS.fetch_add(1, Ordering::Relaxed);
+        // ONE probe per release decision, however many reads size it.
+        BLOCK_REF_PROBES.fetch_add(1, Ordering::Relaxed);
         let _set = self.manager_gate(false)?;
         // The pre-admission is sized from a population read holding
         // nothing; under the mutex the population is re-read, and one that
@@ -604,14 +627,14 @@ impl KvMetaBackend {
         // re-sizes — a bounded loop, never a park under the mutex.
         let mut attempts = 0u32;
         loop {
-            let sizing = self.shared_index_population(vol_tag, block_idx).await?;
+            let sizing = self.index_population_uncounted(vol_tag, block_idx).await?;
             if sizing.is_empty() {
                 return Ok(SharedRelease::NotShared);
             }
             let worst = entry_len_for(&Self::shared_index_deletes(&sizing))?;
             let pre = self.pre_admit_control(worst).await?;
             let _g = self.manager_verbs.lock().await;
-            let population = self.shared_index_population(vol_tag, block_idx).await?;
+            let population = self.index_population_uncounted(vol_tag, block_idx).await?;
             if population.is_empty() {
                 return Ok(SharedRelease::NotShared);
             }

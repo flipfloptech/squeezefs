@@ -1692,6 +1692,40 @@ async fn a_ro_mount_under_the_knob_arms_the_token_client_and_writes_nothing() {
     )));
     squeezefs::fuse_client::set_read_only_mount(true);
     std::env::set_var(SYMMETRIC_META_ENV, "1");
+
+    // Issue 17 — the arm PROBES the holder: an endpoint that serves no
+    // token verbs (a listener with an empty verb router — the shape of a
+    // writer whose plane is unarmed) refuses the mount naming the writer's
+    // knobs, never mounts into an EIO-at-every-resolve reader.
+    let dark = cw::RpcListener::start_async(
+        listener_cfg(),
+        SECRET.to_vec(),
+        Arc::new(squeezefs::data_grant::AsyncVerbRouter::new()),
+    )
+    .expect("dark listener");
+    std::env::set_var(
+        squeezefs::cowriter::MW_AUTHORITY_ENV,
+        dark.endpoint().to_string(),
+    );
+    {
+        let probe_reader = open_routed_meta_set_read_only(&[path.display().to_string()])
+            .await
+            .expect("read-only open");
+        let (router, _b) = data_router("ro_mount_tokens_dark").await;
+        let err = ro_coherence::arm_token_readers(&probe_reader.volumes, &router)
+            .await
+            .expect_err("a holder that serves no tokens refuses the arm");
+        assert!(
+            err.contains("does not serve read tokens"),
+            "the refusal names the probe's finding: {err}"
+        );
+        assert!(
+            err.contains("SQUEEZEFS_MULTI_WRITER=1"),
+            "and the writer's knobs: {err}"
+        );
+        shutdown(&probe_reader).await;
+    }
+    dark.shutdown();
     std::env::set_var(squeezefs::cowriter::MW_AUTHORITY_ENV, &endpoint);
 
     // Settle the WRITER's image first: a checkpoint's tail releases the

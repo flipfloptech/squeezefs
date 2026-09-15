@@ -1513,3 +1513,67 @@ async fn the_poll_reads_the_predicted_slot_first_and_falls_back_on_a_torn_one() 
     assert_eq!(s5.ledger_full_reads, s4.ledger_full_reads);
     writer.shutdown().await.expect("shutdown");
 }
+
+/// The token ack law depends on no lever (review round 1, Issue 6): a
+/// `-o ro` mount under the knob with `SQUEEZEFS_FREE_GRACE_DRAIN_OBSERVED=0`
+/// or `SQUEEZEFS_FREE_GRACE_DRAIN_EPOCH_STAMP=0` refuses LOUD naming the
+/// lever — under S5 those `0` postures were safe because the ring's timers
+/// stood behind them; under tokens the recall is the qualification and
+/// there is no timer. The levers govern the `=0` reader alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_mount_path_token_arm_refuses_a_drain_lever_at_zero() {
+    let _serial = TOKEN_POSTURE.lock().await;
+    let _latch = RoLatch::arm();
+    let vol = stamped_volume().await;
+    let reader = KvMetaBackend::open_read_only(vol.path())
+        .await
+        .expect("read-only mount");
+    let (router, _b) = data_router("ro_token_levers").await;
+    let _knob = SymmetricKnob::on();
+    squeezefs::ro_coherence::test_set_drain_observed(Some(false));
+    let err = squeezefs::ro_coherence::arm_token_readers(std::slice::from_ref(&reader), &router)
+        .await
+        .expect_err("the observed drain is not optional under tokens");
+    assert!(
+        err.contains("SQUEEZEFS_FREE_GRACE_DRAIN_OBSERVED"),
+        "names the lever: {err}"
+    );
+    squeezefs::ro_coherence::test_set_drain_observed(None);
+    squeezefs::ro_coherence::test_set_drain_epoch_stamp(Some(false));
+    let err = squeezefs::ro_coherence::arm_token_readers(std::slice::from_ref(&reader), &router)
+        .await
+        .expect_err("the layout-cache step is not optional under tokens");
+    assert!(
+        err.contains("SQUEEZEFS_FREE_GRACE_DRAIN_EPOCH_STAMP"),
+        "names the lever: {err}"
+    );
+    squeezefs::ro_coherence::test_set_drain_epoch_stamp(None);
+    assert!(reader.token_reader().is_none(), "nothing armed on refusal");
+}
+
+/// An explicit non-zero kernel TTL on a token reader is refused (review
+/// round 1, Issue 13): every class derives to 0 under tokens, and an
+/// explicit `-o attr_timeout=` / `SQUEEZEFS_FUSE_*_TTL_MS` would re-create
+/// a bounded-staleness dcache — the second read method R-SYM-4 forbids,
+/// by lever. Zero TTLs pass; with the knob off the check is inert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_kernel_ttl_on_a_token_reader_is_refused_loud() {
+    let _serial = TOKEN_POSTURE.lock().await;
+    let _latch = RoLatch::arm();
+    let zero = KernelCacheTtls::read_only_defaults(Duration::ZERO);
+    let lengthened = zero.with_mount_options("attr_timeout=1");
+    assert!(
+        squeezefs::ro_coherence::refuse_explicit_ttls_under_tokens(&lengthened).is_ok(),
+        "knob off: the S5 precedence stands"
+    );
+    let _knob = SymmetricKnob::on();
+    assert!(squeezefs::ro_coherence::refuse_explicit_ttls_under_tokens(&zero).is_ok());
+    let err = squeezefs::ro_coherence::refuse_explicit_ttls_under_tokens(&lengthened)
+        .expect_err("a non-zero TTL under tokens is refused");
+    assert!(err.contains("attr_timeout"), "names the class: {err}");
+    assert!(err.contains("R-SYM-4"), "names the law: {err}");
+    let negative = zero.with_mount_options("negative_timeout=0.5");
+    let err = squeezefs::ro_coherence::refuse_explicit_ttls_under_tokens(&negative)
+        .expect_err("every class");
+    assert!(err.contains("negative_timeout"), "{err}");
+}

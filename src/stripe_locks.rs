@@ -52,6 +52,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///    promotion's one-guard-across-the-wire shape × N, bounded by the wire)
 ///    and releases them all before any pack reference or displaced key is
 ///    freed (RES-1, again).
+///
+///    **The SHARED-block free's home round trip** (symmetric PR 7, design
+///    §5.4.4 step 4 — `BackendRouter::free_block_verdict`): on an ARMED
+///    set the release of a block carrying the RAM SHARED mark is not a RAM
+///    decrement + a queued reclaim; it is an async ask of the shared-block
+///    index HOME — a tree-0 CONTROL ENTRY (a ring-0 journal write + its
+///    barrier) under the home's `manager_verbs` mutex, its admission
+///    taken PARKING before that mutex (PR 4's door law). The RES-1 rule
+///    covers it verbatim: a terminal `free_block` is already never called
+///    under a 3.5 guard, so the round trip is never inside one either;
+///    `manager_verbs` is a 4-class lock (never held while a 3 / 3.5 guard
+///    is taken, the checkpoint task's own order), so the edge added is
+///    3 → 4 in the existing direction — the VL4 mover's displaced-source
+///    free under `BLOCK_FLUSH_LOCKS` (3) is the one caller that holds a 3
+///    guard across a free, and it now waits on a journal write there.
 /// 4. MetaLV metadata-transaction locks, acquired in this sub-order:
 ///    - a. DLM `I{ino}` / `D{parent:name}` (per-object; MetaLV `DlmLockManager`)
 ///    - b. **format v2**: dentry bucket lock (`dentry_bucket_locks`) — in-RAM

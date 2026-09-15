@@ -7164,6 +7164,25 @@ mod shared_ref_models {
     //! protocol — the W1 patcher and the terminal-free decision read a
     //! THIRD word after their existing `SeqCst` fence, the cloner stores
     //! it ahead of its pin.
+    //!
+    //! **What this model is evidence FOR** (review round 1, Issue 6): the
+    //! DESIGN's three-word protocol — the orderings §5.4.4 prescribes for
+    //! a cloner, an owner and a patcher that share nothing but the three
+    //! words (PR 12's cross-process case, where the mark is the only
+    //! word a foreign cloner can set before its publish). Only the
+    //! PATCHER's arm is the shipped code (`begin_patch_sole_owner`: retire
+    //! → fence → count ∧ ¬mark). The PR-7 PRODUCT runs the owner and the
+    //! cloner differently — `free_block_verdict` reads the mark BEFORE its
+    //! release (an Acquire load, no fence: a marked block's verdict goes to
+    //! the index home whatever the count says), and `clone_file` PINS
+    //! first (`pin_block_validated`: acquire → fence → snapshot) and marks
+    //! after (durable at the holder, then the RAM word) — so in the
+    //! product the composition rests on the two-word §5.1 law plus the
+    //! pin-before-publish invariant (a pin that succeeded made every
+    //! concurrent release nonterminal), with the mark load-bearing only
+    //! where a cloner's pin is not in THIS process's RAM count. This model
+    //! is therefore a SERIALIZABILITY pin of the design's protocol, not a
+    //! proof about the product's clone/free schedules.
     use crate::{incarnation_core, patch_clone_core, refcount_core, shared_ref_core};
     use loom::sync::atomic::{AtomicU32, AtomicU64};
     use loom::sync::Arc;

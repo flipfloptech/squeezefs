@@ -14,14 +14,20 @@
 //!   incarnation word, `patch_clone_core::cross_word_fence`, then
 //!   `refcount == 1 && !is_shared` — a marked block is never patched in
 //!   place (`patch_ineligible_shared`), whatever its count reads.
-//! * **owner free** (`BackendRouter::free_block_verdict`): a release that
-//!   would be terminal reads the mark after the same fence; a marked
-//!   block's terminal verdict is never taken locally — the shared index's
-//!   holder decides from the index (`ReleaseShared`).
-//! * **cloner**: [`mark`](crate::shared_ref_core::mark) (a store), the fence, then the pin
-//!   (`refcount_core::try_acquire`), the fence, the incarnation snapshot
-//!   — the shipped `pin_block_validated` sequence with the mark ahead of
-//!   it.
+//! * **owner free** (`BackendRouter::free_block_verdict`): the mark is
+//!   read FIRST (an Acquire load, before the release) — a marked block's
+//!   verdict is never taken locally whatever its count reads: the shared
+//!   index's home decides (`ReleaseShared`); an unmarked block takes the
+//!   shipped local verdict.
+//! * **cloner** (the design's order, §5.4.4): [`mark`](crate::shared_ref_core::mark)
+//!   (a store), the fence, then the pin (`refcount_core::try_acquire`),
+//!   the fence, the incarnation snapshot. The PR-7 PRODUCT clone pins
+//!   FIRST (`pin_block_validated`) and marks after — durable at the
+//!   holder, then this word — so its composition with the patcher rests
+//!   on the two-word §5.1 law plus pin-before-publish (a pin that
+//!   succeeded made every concurrent release nonterminal); the mark is
+//!   load-bearing where a cloner's pin is NOT in this process's RAM count
+//!   — the cross-process case PR 12 lands.
 //!
 //! **The load-bearing ordering** is the `SeqCst` fence pair the §5.1
 //! model already proves (`patch_clone_core`): each side stores one word
@@ -29,10 +35,11 @@
 //! outcome in which the patcher reads `refcount 1 ∧ unshared` while the
 //! cloner validates a pre-patch snapshot. The mark adds a third loaded
 //! word on the patcher's side and a third stored word on the cloner's,
-//! both on the far side of their existing fences — so the composed
-//! protocol is one model (`loom-models::shared_ref_core_*`), and
-//! weakening either fence to Release/Acquire fails it exactly as it fails
-//! the two-word one.
+//! both on the far side of their existing fences — so the DESIGN's
+//! composed protocol is one model (`loom-models::shared_ref_core_*`,
+//! whose doc states what it does and does not model), and weakening the
+//! patcher's fence to Release fails it exactly as it fails the two-word
+//! one.
 //!
 //! Self-contained (no crate dependencies) so `loom-models/` can
 //! `#[path]`-include it and check the exact shipped word ops.

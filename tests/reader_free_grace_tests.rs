@@ -5799,8 +5799,68 @@ fn token_holder_armed(clients: &[&str]) {
     for c in clients {
         token_plane::note_token_client(c);
     }
-    free_grace::install_token_client_probe(Arc::new(token_plane::is_token_client));
+    free_grace::install_token_client_probe(free_grace::TokenClientProbe {
+        is_client: Arc::new(token_plane::is_token_client),
+        generation: Arc::new(token_plane::token_clients_generation),
+    });
     free_grace::arm_recall_gate();
+}
+
+/// **The reader-class verdict is CACHED against the census** (review round
+/// 2, Issue 22): the O(members) scan behind `recall_gate_verdict` runs
+/// once per census change (a join, a leave, an eviction) or per new token
+/// client — never per free. N frees on a quiet census cost ONE scan; a
+/// join costs one more, and the verdict it recomputes is the truth (the
+/// new S5 reader defers the next free); a token-client registration
+/// recomputes too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_reader_class_verdict_is_recomputed_only_on_a_census_change() {
+    let _serial = serial();
+    let (clock, _ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("the derived bound is safe");
+    let _tok = join(&owner, "r-tok", MemberRole::Reader);
+    token_holder_armed(&["r-tok"]);
+    let ba = allocator("grace-class-cache").await;
+    let scans0 = free_grace::s5_class_scans();
+    for _ in 0..16 {
+        let b = ba.allocate_block().await.expect("allocate");
+        ba.free_block(b).await.expect("free");
+    }
+    assert_eq!(
+        free_grace::recall_gated_frees(),
+        16,
+        "every free was direct"
+    );
+    assert_eq!(
+        free_grace::s5_class_scans() - scans0,
+        1,
+        "sixteen frees on a quiet census cost ONE scan"
+    );
+    // A join changes the census: one more scan, and the verdict is true.
+    let _s5 = join(&owner, "r-s5", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+    let b = ba.allocate_block().await.expect("allocate");
+    ba.free_block(b).await.expect("free");
+    assert_eq!(
+        free_grace::s5_reader_deferrals(),
+        1,
+        "the new S5 reader defers the free"
+    );
+    assert_eq!(free_grace::s5_class_scans() - scans0, 2);
+    // The S5 reader becomes a token client: one more scan, direct again.
+    squeezefs::meta_ship::token_plane::note_token_client("r-s5");
+    let b = ba.allocate_block().await.expect("allocate");
+    ba.free_block(b).await.expect("free");
+    assert_eq!(free_grace::recall_gated_frees(), 17);
+    assert_eq!(free_grace::s5_class_scans() - scans0, 3);
+    // Quiet again: no scan per free.
+    for _ in 0..8 {
+        let b = ba.allocate_block().await.expect("allocate");
+        ba.free_block(b).await.expect("free");
+    }
+    assert_eq!(free_grace::s5_class_scans() - scans0, 3);
+    free_grace::disarm_recall_gate();
 }
 
 /// **The reader-class law** (review round 1, Issue 3): the ring bypass

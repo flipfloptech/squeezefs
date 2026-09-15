@@ -136,6 +136,22 @@ The round-1 review (`/tmp/grok-justin/grok-exec-review-dadee1dd-pr-6.md`) found 
 
 Every gauge added by the round is on the stats inode and in `docs/operations.md` (`docs_parity_tests` green): `xv_cross_owner_steps_rejected`, `dir_rename_parent_scans`, the `local_steps` phase. New seams: `TEST_XV_SERVE_HOLD_MS`, `TEST_XV_CADENCE_HOLD_AFTER_SCAN_MS`, `TEST_XV_SERVE_SKIP_ONCE`, `TEST_DIR_RENAME_IDENTITY_ONCE`. No knob.
 
+### 8b. Run ledger (round 2, the final tree `cbfdef6d`)
+
+| Run | Result |
+|---|---|
+| `cargo fmt --check` (root, `fuzz/`) | clean / clean |
+| `cargo clippy --all-targets --all-features -- -D warnings` / shipped config | clean / clean |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | **green** (red at round 1 on three links; two more caught and fixed inside this round) |
+| `fuzz/` `cargo check` | clean |
+| `sym_cross_owner_tests` ×10 stamped from zero, `--test-threads=1` | 10/10 — 23 passed each, 11.6–13.2 s |
+| `sym_cross_owner_tests` ×3 flat | 3/3 — 13.0 / 20.4 / 22.9 s |
+| `sym_cross_owner_tests` `--test-threads=4`, flat / stamped | 23/23 (22.1 s) / 23/23 (15.6 s) |
+| `crossvol_tx_tests` / `pv_partial_open_tests` / `rename_lock_set_tests` / `meta_ship_tests` / `posix_semantics_tests` / `sym_slot_transfer_tests` / `kernel_op_economy_tests` / `docs_parity_tests` / `env_knob_convention_tests` / `derivation_sweep_tests` / `decoder_property_tests`, flat AND stamped | 14 / 22 / 2 / 15 / 13 / 45 / 3 / 5 / 22 / 54 / 45 — green on both legs |
+| `tests/run_sym_forest_suites.sh` (29 suites) | flat PASS, stamped PASS; `sym_cross_owner_tests` 11.3 / 17.6 s (1.56); ONE ratio NOTE `sym_convert_tests` 20.8 / 101.4 s (4.89) — **attributed to box load** (load average 7.4 during the stamped leg, four implementers' builds): re-run alone right after, 20.39 s flat / 20.33 s stamped = 1.00 |
+| the live-FUSE trio, both legs, `SQUEEZEFS_TEST_REQUIRE_MOUNT=1` | flat: `posix_mount_semantics_tests` 3 (43 s), `corpse_sweep_tests` 4 (154 s), `inline_raise_tests` 7 (98 s); stamped: 3 (35 s), 4 (147 s), 7 (92 s) — all green, no mount-class skip |
+| `tests/check_markdown_links.sh` | PASS |
+
 ### 8a. Owed after round 2
 
 - The recovery-side ABORT marker: a plan a live refusal stopped is compensated under the op's guards, but a kill inside that compensation leaves an intent the roll-forward completes FORWARD (re-meeting the refusal; the applied halves stand for the C9/C10 census). Recording the abort on the intent record and recovering it as an undo is the answer; not built here.

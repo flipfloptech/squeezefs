@@ -190,6 +190,12 @@ pub static TEST_XV_SERVE_REFUSE: AtomicBool = AtomicBool::new(false);
 /// initiator never released it EXPIRES (the same lease law).
 pub static TEST_XV_STUCK_AFTER_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Test seam (the served side): the NEXT shipped step answers
+/// `ForeignSkipped` WITHOUT applying — the holder's witness refusing a
+/// step planned on a stale foreign read (the object moved at the holder
+/// between the plan and the apply); the seam clears.
+pub static TEST_XV_SERVE_SKIP_ONCE: AtomicBool = AtomicBool::new(false);
+
 /// Test seam (the served side): every shipped STEP is held this many ms
 /// at the holder before it applies — a live op that spans cadence passes
 /// (the review-round-1 Issue 4 shape).
@@ -2290,17 +2296,20 @@ pub async fn execute(
                 // insert never undoes a committed removal), the op answers
                 // the step's errno, and a create's minted child — the one
                 // half nothing names — is destroyed before the retirement.
-                if o.status == XvStepStatus::ForeignSkipped
+                let refused_here = o.status == XvStepStatus::ForeignSkipped
                     && armed
-                    && foreign_refusal.is_none()
                     && !matches!(
                         step_home(routed, *v_idx, local.local_home()),
                         StepHome::Local
-                    )
-                {
+                    );
+                outcomes.push(o);
+                if refused_here {
+                    // The plan STOPS here (review round 1, Issue 15): the
+                    // applied steps before it are compensated below, so
+                    // the op's halves never outlive its errno.
                     foreign_refusal = Some((i, foreign_skipped_errno(&plan.steps[i])));
+                    break;
                 }
-                outcomes.push(o)
             }
             Err(e) => {
                 if i == 0 && step0_local {
@@ -2369,7 +2378,16 @@ pub async fn execute(
         return Err(seam_error());
     }
     if let Some((at, errno)) = foreign_refusal {
-        compensate_live_refusal(routed, plan, &localised, guards.clone()).await?;
+        compensate_live_refusal(
+            routed,
+            tx_id,
+            plan,
+            &localised,
+            &outcomes,
+            at,
+            guards.clone(),
+        )
+        .await?;
         let e = SqueezefsError::refused(
             errno,
             format!(
@@ -2417,32 +2435,110 @@ async fn retire(
     Ok(())
 }
 
-/// The live-refusal compensation: a `Create` whose insert the holder
-/// refused leaves a minted child nothing names — destroyed here, in the
-/// creator's own ring, before the intent retires (a crash before this
-/// point leaves it to the C9 census, the class the intent's roll-forward
-/// re-meets as the same refusal). Every other op's halves stay: a count
-/// that moved and a name that was already gone are each consistent on
-/// their own, and undoing an acked-visible removal would be the lie
-/// roll-forward exists to avoid.
+/// The live-refusal compensation (review round 1, Issue 15): the plan
+/// stopped at step `at`, a shipped step the holder's witness refused
+/// (the object moved at the holder between the plan's read and the
+/// apply — a stale foreign read, the S5 projection until PR 5). Every
+/// step APPLIED before it is undone in reverse under the op's still-held
+/// guards, through the same applier: a count step by its inverse CAS
+/// (`SetNlink { post → pre }` — a `link`'s raised count comes back), a
+/// removed dentry re-inserted (a `rename`'s source name returns, with the
+/// child's type read from its record), an applied insert removed, a
+/// minted child destroyed (nothing names it); a `TouchCtime` is
+/// monotone and stands. A foreign inverse ships to its holder under the
+/// same scope. The intent then retires and the op answers the step's
+/// errno. **The crash window**: a kill between an applied step and its
+/// compensation leaves the intent open, and the roll-forward applies the
+/// FORWARD plan — re-meeting the refusal at the holder and leaving the
+/// applied halves (a raised count with no name, a removed source name):
+/// the C9/C10 census classes, stated in the note; an abort marker on the
+/// record is the recovery-side answer this rung does not build.
 async fn compensate_live_refusal(
     routed: &RoutedMetaBackend,
+    tx_id: u64,
     plan: &XvPlan,
     localised: &[(usize, XvLocalStep)],
+    outcomes: &[XvStepOutcome],
+    at: usize,
     guards: Arc<[dlm::DlmGuard]>,
 ) -> Result<()> {
-    if plan.op != XvOp::Create {
-        return Ok(());
-    }
-    for (v_idx, local) in localised {
-        if let XvLocalStep::CreateInode { local_ino, .. } = local {
-            let out = routed.volumes[*v_idx]
-                .xv_destroy_unnamed(*local_ino, guards.clone())
-                .await;
-            if out.is_err() {
-                routed.mirror_volume_failure(*v_idx);
+    for i in (0..at).rev() {
+        if outcomes.get(i).map(|o| o.status) != Some(XvStepStatus::Applied) {
+            continue;
+        }
+        let inverse = match &plan.steps[i] {
+            XvStep::SetNlink { ino, pre, post, .. } => Some(XvStep::SetNlink {
+                ino: *ino,
+                pre: *post,
+                post: *pre,
+                ctime: None,
+            }),
+            XvStep::RemoveDentry {
+                parent,
+                name,
+                expect_child,
+                parent_update,
+            } => {
+                let (cv, cl) = routed.route_ino(*expect_child);
+                let Some(child) = routed.volumes[cv].read_inode_value_routed(cl).await? else {
+                    continue;
+                };
+                Some(XvStep::InsertDentry {
+                    parent: *parent,
+                    name: name.clone(),
+                    child: *expect_child,
+                    ft_bits: child.mode & libc::S_IFMT,
+                    parent_update: *parent_update,
+                })
             }
-            out?;
+            XvStep::InsertDentry {
+                parent,
+                name,
+                child,
+                parent_update,
+                ..
+            } => Some(XvStep::RemoveDentry {
+                parent: *parent,
+                name: name.clone(),
+                expect_child: *child,
+                parent_update: *parent_update,
+            }),
+            XvStep::TouchCtime { .. } => None,
+            XvStep::MintInode { .. } | XvStep::CreateInode { .. } => {
+                let (v_idx, local) = &localised[i];
+                let local_ino = local.local_home();
+                let out = routed.volumes[*v_idx]
+                    .xv_destroy_unnamed(local_ino, guards.clone())
+                    .await;
+                if out.is_err() {
+                    routed.mirror_volume_failure(*v_idx);
+                }
+                out?;
+                None
+            }
+        };
+        let Some(inverse) = inverse else {
+            continue;
+        };
+        let (v_idx, local) = localise(routed, &inverse);
+        let out = apply_or_ship_step(
+            routed,
+            tx_id,
+            i,
+            v_idx,
+            &inverse,
+            &local,
+            None,
+            guards.clone(),
+        )
+        .await?;
+        if out.status == XvStepStatus::ForeignSkipped {
+            log::error!(
+                "cross-owner transaction {tx_id:016x} ({:?}): compensating step {i} ({}) found \
+                 its object moved again — the half stays for the census (C9/C10)",
+                plan.op,
+                inverse.name()
+            );
         }
     }
     Ok(())

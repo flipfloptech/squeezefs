@@ -1464,6 +1464,16 @@ impl MetaShipService {
                         "TEST_XV_SERVE_REFUSE: the holder is down before its commit".to_string(),
                     ));
                 }
+                if crate::meta_backend::crossvol_tx::TEST_XV_SERVE_SKIP_ONCE
+                    .swap(false, Ordering::SeqCst)
+                {
+                    return Ok(MetaReply::XvStep {
+                        status: crate::meta_backend::crossvol_tx::status_code(
+                            crate::meta_backend::crossvol_tx::XvStepStatus::ForeignSkipped,
+                        ),
+                        inode: None,
+                    });
+                }
                 let scope = crate::meta_backend::crossvol_tx::GuardScope {
                     client: client_id,
                     scope: *scope,

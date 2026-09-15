@@ -1927,9 +1927,32 @@ async fn a_parked_scope_expires_with_its_initiators_membership_lease_when_a_plan
     .await
     .expect("the lease's death frees the stripe");
     drop(local);
+    // A client this owner does NOT know (review round 2, Issue 22 — a
+    // cross-shard initiator, a joiner the ladder has not bound yet): its
+    // scope keeps the grace-window BELT, never an immediate release.
+    let unknown = MetaShipRouter::new(Arc::clone(&routed), "node-d", SECRET.to_vec());
+    let op = MetaOp {
+        id: unknown.next_request_id(),
+        call: MetaCall::XvGuards {
+            scope: 92,
+            inodes: vec![(shared, true)],
+            dentries: vec![],
+        },
+    };
+    let mut r = unknown.ship_ops(&peer, vec![op]).await.unwrap();
+    assert!(matches!(r.pop().unwrap().outcome, Ok(MetaReply::Unit)));
+    assert_eq!(
+        crossvol_tx::sweep_expired_guards(),
+        0,
+        "an unknown client's scope survives a sweep inside the grace window"
+    );
+    TEST_XV_STUCK_AFTER_MS.store(1, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert_eq!(crossvol_tx::sweep_expired_guards(), 1, "…and expires at the belt");
+    TEST_XV_STUCK_AFTER_MS.store(0, Ordering::SeqCst);
     membership::uninstall();
     let after = cross_owner_stats();
-    assert_eq!(after.guard_expiries - before.guard_expiries, 1);
+    assert_eq!(after.guard_expiries - before.guard_expiries, 2);
     holders.tear_down();
     shutdown(&routed).await;
     fsck_clean(&uris).await;

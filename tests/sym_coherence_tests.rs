@@ -2043,6 +2043,156 @@ async fn a_parked_grant_does_not_serialize_the_volumes_other_grants() {
     shutdown(&writer).await;
 }
 
+/// **A dead reader's grants die at the owner's EVICTION, never at the
+/// recall deadline** (review round 2, Issue 5's residual). The REAL S6
+/// owner on a manual clock, installed for the process; the reader joins
+/// as a `Reader` member and takes 64 tokens; then it is KILLED (no ack
+/// will ever travel). Arm (a): a pass recalling one of its tokens parks;
+/// the owner's cadence sweep (`expire_due`) EVICTS the dead reader — the
+/// member is REMOVED, so its lease reads `None` — and the pass must
+/// complete AT the eviction (the holder is told at the eviction instant
+/// and the verdict for a token client the owner no longer lists is
+/// `Expired`), never `Unknown`-waited to the 45 s deadline. Arm (b): the
+/// dead member's other 63 grants are swept with it, so a second pass on
+/// one of them recalls nobody and waits for nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_evicted_readers_grants_are_swept_at_the_owners_eviction_not_at_the_deadline() {
+    use squeezefs::membership::{
+        self, JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole, MembershipOwner,
+    };
+    let _g = SEAM.lock().await;
+    membership::uninstall();
+    let ticks = Arc::new(AtomicU64::new(10_000));
+    let owner = MembershipOwner::arm(
+        "tok-owner",
+        3,
+        2,
+        LeaseClocks::derive(Duration::from_micros(250)).expect("the shipped derivation"),
+        LeaseClock::manual(Arc::clone(&ticks)),
+    )
+    .expect("arm the owner");
+    membership::install_owner(Arc::clone(&owner));
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let holder = writer.volumes[0].token_holder().unwrap().clone();
+    let mut files = Vec::new();
+    for i in 0..64 {
+        files.push(
+            Metadata::create(
+                writer.as_ref(),
+                1,
+                &format!("f{i}"),
+                libc::S_IFREG | 0o644,
+                0,
+                0,
+            )
+            .await
+            .unwrap()
+            .ino,
+        );
+    }
+    let client = "reader-dead";
+    let JoinOutcome::Granted(_) = owner.join(JoinRequest {
+        id: client.to_string(),
+        role: MemberRole::Reader,
+        endpoint: None,
+        pid: std::process::id(),
+        boot: "boot-sym-coherence".to_string(),
+        prior_epoch: None,
+        pr_key: 0,
+        mount: None,
+    }) else {
+        panic!("the reader joins as a member");
+    };
+    let (reader, plane) = open_token_reader(&path, &endpoint, client).await;
+    for &f in &files {
+        let _ = Metadata::getattr(reader.as_ref(), f).await.unwrap();
+    }
+    assert_eq!(holder.stats().outstanding, 64);
+    // Killed: the channel is gone and no ack ever travels.
+    plane.test_kill();
+    wait_until("the reader's channel task exited", || {
+        !plane.stats().channel_alive
+    })
+    .await;
+
+    // (a) A pass recalling one of its tokens parks on the dead reader.
+    let w = Arc::clone(&writer);
+    let f0 = files[0];
+    let commit = tokio::spawn(async move {
+        Metadata::setattr(
+            w.as_ref(),
+            f0,
+            Some(0o600),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    });
+    wait_until("the recall was issued", || holder.stats().recalls == 1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!commit.is_finished(), "the pass waits on the dead reader");
+    // The owner's cadence sweep: the lease is past, the member is EVICTED.
+    ticks.fetch_add(
+        owner.clocks().t_owner.as_millis() as u64 + 1,
+        Ordering::SeqCst,
+    );
+    let evicted = owner.expire_due();
+    assert!(
+        evicted.iter().any(|e| e.id == client),
+        "the sweep evicted the dead reader"
+    );
+    assert!(
+        owner.lease_deadline_ms(client).is_none(),
+        "the owner no longer lists it"
+    );
+    let t = std::time::Instant::now();
+    commit.await.unwrap().unwrap();
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "the pass completed AT the eviction ({:?}), not at a tick or the deadline",
+        t.elapsed()
+    );
+    let s = holder.stats();
+    assert_eq!(s.recall_acks, 0);
+    assert_eq!(
+        s.expired_with_lease, 1,
+        "the recalled grant expired with the lease"
+    );
+    assert_eq!(
+        s.lease_swept_grants, 63,
+        "the dead member's other grants are gone with it"
+    );
+    assert_eq!(s.timeouts_live, 0);
+    assert_eq!(s.outstanding, 0);
+    // (b) A second pass on one of them recalls nobody.
+    let t = std::time::Instant::now();
+    Metadata::setattr(
+        writer.as_ref(),
+        files[1],
+        Some(0o600),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(t.elapsed() < Duration::from_millis(500));
+    assert_eq!(holder.stats().recalls, 1, "no new recall");
+    membership::uninstall();
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
 /// **The reader's install is conditional on the generation it read
 /// under** (review round 2, Issue 21 — the reader-side half of Issue 2).
 /// Schedule: the reader's fetch of B evicts A to make room — the eviction

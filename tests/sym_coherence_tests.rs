@@ -2043,6 +2043,95 @@ async fn a_parked_grant_does_not_serialize_the_volumes_other_grants() {
     shutdown(&writer).await;
 }
 
+/// **The reader's install is conditional on the generation it read
+/// under** (review round 2, Issue 21 — the reader-side half of Issue 2).
+/// Schedule: the reader's fetch of B evicts A to make room — the eviction
+/// runs the sink's drain (parked here); the holder had REGISTERED B's
+/// grant before its read, so a commit on B recalls this reader while the
+/// fetch sits inside its eviction; the recall handler bumps B's revoke
+/// generation, finds nothing to remove, drains (parked on the same sink)
+/// and acks; the pass applies. Before the fix the fetch re-checked the
+/// generation BEFORE the eviction's await and installed the PRE-COMMIT
+/// records LIVE after it — nothing recalled them until the next commit on
+/// B. The law: the generation check is atomic with the install (under
+/// the cache entry), a moved generation retries the fetch, and the
+/// reader's next resolve sees the committed record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recall_landing_inside_the_fetchs_eviction_never_installs_pre_commit_records() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let holder = writer.volumes[0].token_holder().unwrap().clone();
+    let a = Metadata::create(writer.as_ref(), 1, "a", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let b = Metadata::create(writer.as_ref(), 1, "b", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-i21").await;
+    let sink = ProbeSink::new(false);
+    assert!(plane.install_data_sink(sink.clone()));
+    let (_v, b_local) = writer.route_ino(b);
+    let _ = Metadata::getattr(reader.as_ref(), a).await.unwrap();
+    let held = plane.stats().cached_bytes;
+    plane.test_set_records_budget(Some(held + held / 2));
+
+    // B's fetch: the grant is registered and read, then the eviction of A
+    // parks in the sink.
+    sink.parked.store(true, Ordering::SeqCst);
+    let r = Arc::clone(&reader);
+    let fetch_b = tokio::spawn(async move { Metadata::getattr(r.as_ref(), b).await });
+    wait_until("the eviction entered the sink", || {
+        sink.calls.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(holder.holders(b_local), 1, "B's grant is registered");
+    // The conflicting commit on B recalls the reader inside the window.
+    let w = Arc::clone(&writer);
+    let commit = tokio::spawn(async move {
+        Metadata::setattr(
+            w.as_ref(),
+            b,
+            Some(0o600),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    });
+    wait_until(
+        "the recall of B reached the reader and entered the sink",
+        || plane.stats().recalls_received == 1 && sink.calls.load(Ordering::SeqCst) == 2,
+    )
+    .await;
+    sink.release();
+    commit.await.unwrap().unwrap();
+    fetch_b.await.unwrap().unwrap();
+    // The law: the reader's next resolve sees the committed mode — never
+    // the pre-commit records the fetch read.
+    let seen = Metadata::getattr(reader.as_ref(), b).await.unwrap();
+    assert_eq!(
+        seen.mode & 0o777,
+        0o600,
+        "a recall inside the fetch's eviction must not leave pre-commit records live"
+    );
+    assert!(plane.holds(b_local));
+    assert!(
+        plane.stats().fetch_retries >= 1,
+        "the fetch that spanned the recall retried"
+    );
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
 /// **Attrs + xattrs ride the FIRST page and the xattrs page too**
 /// (review round 1, Issue 16b): a directory whose carried xattrs alone
 /// exceed one frame's payload is served — the xattrs are paged by name

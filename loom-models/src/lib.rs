@@ -7414,6 +7414,7 @@ mod park_gate_models {
     }
 }
 
+#[cfg(all(test, loom))]
 mod token_grant_models {
     //! [`token_grant_core`] (design-symmetric-metadata §5.7.1, PR 5 —
     //! review round 1, Issue 2): the holder's grant ∥ pass Dekker.

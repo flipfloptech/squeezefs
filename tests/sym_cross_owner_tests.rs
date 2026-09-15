@@ -900,13 +900,20 @@ async fn two_nodes_cannot_rename_directories_into_a_cycle() {
     let vol = Arc::clone(&routed.volumes[0]);
     let (mut joiner, other_identity) =
         wire_joiner(&holders.host.endpoint().to_string(), 5, 0).await;
+    let dlm = vol.dlm();
+    let local = |ino: u64| routed.route_ino(ino).1;
+    // The two FIXED held dentry keys — r1's `D{a,b}` and r2's
+    // `D{root,shared1}` — must not share a stripe either (review round 2,
+    // Issue 25a): `b`'s name is chosen off `shared1`'s stripe.
+    let b_name = (0u64..)
+        .map(|i| format!("b{i}"))
+        .find(|n| dlm.dentry_stripe(local(a), n) != dlm.dentry_stripe(local(ROOT_INO), "shared1"))
+        .unwrap();
     let b = routed
-        .create(a, "b", libc::S_IFDIR | 0o755, 0, 0)
+        .create(a, &b_name, libc::S_IFDIR | 0o755, 0, 0)
         .await
         .unwrap()
         .ino;
-    let dlm = vol.dlm();
-    let local = |ino: u64| routed.route_ino(ino).1;
     // r1 = rename(a, "b", d, "e"): guards I{a} I{d} I{b} D{a,b} D{d,e}.
     // r2 = rename(root, "shared1", x, "y"): guards I{root} I{x} I{c}
     // D{root,shared1} D{x,y}. Mint `x` and `d` until every inode stripe of
@@ -955,9 +962,13 @@ async fn two_nodes_cannot_rename_directories_into_a_cycle() {
             .unwrap(),
     );
     let taken: Vec<usize> = vec![
-        dlm.dentry_stripe(local(a), "b"),
+        dlm.dentry_stripe(local(a), &b_name),
         dlm.dentry_stripe(local(ROOT_INO), "shared1"),
     ];
+    assert_ne!(
+        taken[0], taken[1],
+        "the fixed pair is disjoint by construction"
+    );
     let e_name = (0u64..)
         .map(|i| format!("e{i}"))
         .find(|n| !taken.contains(&dlm.dentry_stripe(local(d), n)))
@@ -994,7 +1005,8 @@ async fn two_nodes_cannot_rename_directories_into_a_cycle() {
     let r1 = {
         let routed = Arc::clone(&routed);
         let e = e_name.clone();
-        tokio::spawn(async move { routed.rename(a, "b", d, &e, 0).await })
+        let b_name = b_name.clone();
+        tokio::spawn(async move { routed.rename(a, &b_name, d, &e, 0).await })
     };
     let (r1, r2) = (r1.await.unwrap(), r2.await.unwrap());
     crossvol_tx::TEST_XV_SERVE_HOLD_MS.store(0, Ordering::SeqCst);
@@ -2159,6 +2171,151 @@ async fn every_cross_owner_verb_pays_one_guard_round_trip_per_foreign_holder_tab
     assert_eq!(names_in(&routed, shared).await, vec!["l".to_string()]);
     assert_closed("rpc counts");
     holders.tear_down();
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
+/// `Covered` requires COVERAGE (review round 1, Issue 8b; pinned in
+/// round 2, Issue 25b): a scope that parked guards on one key does not
+/// let a step needing another apply unguarded — the step falls to `Take`
+/// and PARKS behind a local exclusive holder of its key until the holder
+/// releases (under a bare `Covered` it would apply at once beside it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_outside_its_scopes_parked_keys_takes_its_own_guards_and_parks() {
+    use squeezefs::meta_backend::dlm::LockMode;
+    use squeezefs::meta_ship::{MetaCall, MetaOp, MetaReply, PeerOwner};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    let endpoint = holders.host.endpoint().to_string();
+    let remote = MetaShipRouter::new(Arc::clone(&routed), "node-c", SECRET.to_vec());
+    let peer = Arc::new(PeerOwner::new("appender-1", &endpoint));
+    let ship = |call: MetaCall| {
+        let remote = Arc::clone(&remote);
+        let peer = Arc::clone(&peer);
+        async move {
+            let op = MetaOp {
+                id: remote.next_request_id(),
+                call,
+            };
+            let mut r = remote.ship_ops(&peer, vec![op]).await.expect("shipped");
+            r.pop().expect("one result").outcome
+        }
+    };
+    let (_, local_shared) = routed.route_ino(shared);
+    let dlm = routed.volumes[0].dlm();
+    // The scope parks ONLY `D{shared, "other"}` — not `I{shared}`.
+    let parked = ship(MetaCall::XvGuards {
+        scope: 81,
+        inodes: vec![],
+        dentries: vec![(shared, "other".to_string(), true)],
+    })
+    .await;
+    assert!(matches!(parked, Ok(MetaReply::Unit)), "{parked:?}");
+    // A local exclusive holder of I{shared}.
+    let held = dlm
+        .lock_many(&[(local_shared, LockMode::Exclusive)], &[])
+        .await;
+    // A TouchCtime(shared) under scope 81 needs I{shared}: not covered ⇒
+    // `Take` ⇒ parks behind the holder.
+    let now = KvMetaBackend::now_ns_pub();
+    let step = tokio::spawn(ship(MetaCall::XvStep {
+        tx_id: 0x81,
+        step_idx: 0,
+        step: crossvol_tx::XvStep::TouchCtime {
+            ino: shared,
+            ctime: now,
+        },
+        scope: 81,
+    }));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !step.is_finished(),
+        "the step PARKED behind the local holder — never Covered"
+    );
+    drop(held);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(5), step)
+        .await
+        .expect("released")
+        .unwrap();
+    assert!(
+        matches!(out, Ok(MetaReply::XvStep { status: 0, .. })),
+        "{out:?}"
+    );
+    let released = ship(MetaCall::XvRelease {
+        scope: 81,
+        ino: shared,
+    })
+    .await;
+    assert!(matches!(released, Ok(MetaReply::Unit)));
+    holders.tear_down();
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
+/// The LOCAL applier's belt (review round 1, Issue 8c; pinned in round
+/// 2, Issue 25b): a local step whose keys the op's guard scope does not
+/// cover trips `invariant_tripwires` (`xv_local_step_unguarded`) — loud,
+/// never silent. Built from the public faces: a scope acquired over ino
+/// A's key, a plan whose step names ino B under those guards; the
+/// covered shape trips nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_step_outside_its_scopes_keys_trips_the_invariant_tripwire() {
+    use squeezefs::meta_backend::dlm::LockMode;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_member(dir.path(), "meta0", true).await];
+    let routed = open_under(&uris, true, None).await;
+    let a = routed
+        .create(ROOT_INO, "a", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let b = routed
+        .create(ROOT_INO, "b", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let tripwires = || {
+        squeezefs::fuse_client::METRICS
+            .invariant_tripwires
+            .load(Ordering::Relaxed)
+    };
+    let plan = crossvol_tx::XvPlan {
+        op: crossvol_tx::XvOp::Rename,
+        steps: vec![crossvol_tx::XvStep::TouchCtime {
+            ino: b,
+            ctime: KvMetaBackend::now_ns_pub(),
+        }],
+    };
+    for (guarded, expect) in [(a, 1u64), (b, 0)] {
+        let (_, local) = routed.route_ino(guarded);
+        let mut scope = None;
+        let guards: Arc<[squeezefs::meta_backend::dlm::DlmGuard]> = Arc::from(
+            crossvol_tx::acquire_guards_leased(
+                &routed,
+                0,
+                &mut scope,
+                &[(local, LockMode::Exclusive)],
+                &[],
+                false,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(scope.is_some(), "an armed acquisition mints the scope");
+        let before = tripwires();
+        crossvol_tx::execute(&routed, &plan, guards).await.unwrap();
+        assert_eq!(
+            tripwires() - before,
+            expect,
+            "guarding {guarded}: an uncovered local step trips the belt, a covered one does not"
+        );
+    }
+    assert_closed("local tripwire");
     shutdown(&routed).await;
     fsck_clean(&uris).await;
 }

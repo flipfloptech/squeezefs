@@ -2043,6 +2043,64 @@ async fn a_parked_grant_does_not_serialize_the_volumes_other_grants() {
     shutdown(&writer).await;
 }
 
+/// **The gate's in-flight set is a REFCOUNT** (review round 2, Issue
+/// 23): the plane has two users that overlap by design — the conveyor
+/// pass task and the durability lane's rollback of a failed window — and
+/// when both hold one object in flight, the FIRST settle must not clear
+/// the other's mark (a grant registered between would proceed against
+/// the rollback in progress). The object leaves the flight with its LAST
+/// user; a grant registered under either user's window parks.
+#[test]
+fn the_grant_pass_gate_keeps_an_object_in_flight_until_its_last_user_settles() {
+    use squeezefs::token_grant_core::{GrantAdmission, GrantPassGate, HolderTable};
+    use std::collections::{BTreeMap, BTreeSet};
+    struct Table(std::sync::Mutex<BTreeMap<u64, BTreeSet<String>>>);
+    impl HolderTable for Table {
+        fn register(&self, object: u64, client: &str) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .entry(object)
+                .or_default()
+                .insert(client.to_string())
+        }
+        fn holders(&self, object: u64) -> usize {
+            self.0.lock().unwrap().get(&object).map_or(0, |s| s.len())
+        }
+    }
+    let gate = GrantPassGate::new();
+    let table = Table(std::sync::Mutex::new(BTreeMap::new()));
+    const X: u64 = 77;
+    // Two users mark X (the rollback's undo key and a later pass's key of
+    // the same ino).
+    gate.pass_begin(&[X], &table);
+    gate.pass_begin(&[X, 78], &table);
+    assert!(gate.is_inflight(X));
+    // The first user settles: X stays in flight for the second.
+    assert!(!gate.settle(&[X]), "the first settle clears no one's mark");
+    assert!(
+        gate.is_inflight(X),
+        "the second user still holds X in flight"
+    );
+    let (already, admission) = gate.grant_register(X, "r", &table);
+    assert!(!already);
+    assert_eq!(
+        admission,
+        GrantAdmission::Park,
+        "a grant parks under the second user's window"
+    );
+    // The last user settles: X leaves the flight (the parked grants wake).
+    assert!(gate.settle(&[X, 78]));
+    assert!(!gate.is_inflight(X));
+    assert_eq!(gate.inflight_len(), 0);
+    // A settle by nobody's window is inert.
+    assert!(!gate.settle(&[X]));
+    assert_eq!(
+        gate.grant_register(X, "r2", &table).1,
+        GrantAdmission::Proceed
+    );
+}
+
 /// **A dead reader's grants die at the owner's EVICTION, never at the
 /// recall deadline** (review round 2, Issue 5's residual). The REAL S6
 /// owner on a manual clock, installed for the process; the reader joins

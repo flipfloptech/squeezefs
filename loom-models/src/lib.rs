@@ -7516,4 +7516,44 @@ mod token_grant_models {
             gate.settle(&[X]);
         });
     }
+
+    /// **Two users of the gate** (review round 2, Issue 23 — the pass task
+    /// and the durability lane's rollback overlap by design): user 1
+    /// marks X and settles on its own thread while user 2's window on X
+    /// is open; a grant that registers INSIDE user 2's window (after its
+    /// holders read — so user 2 counted no holder) must PARK, whatever
+    /// user 1 does. Weakening (verified RED 2026-09-15 with the refcount
+    /// replaced by a set): user 1's settle lands between user 2's mark and
+    /// the grant's read, clears the mark, and the grant reads `Proceed`
+    /// against a window in progress that recalled nobody.
+    #[test]
+    fn two_overlapping_users_keep_the_object_in_flight_until_the_last_settles() {
+        loom::model(|| {
+            let gate = Arc::new(GrantPassGate::new());
+            let table = Arc::new(Table::default());
+            // User 1's window opens first.
+            assert_eq!(gate.pass_begin(&[X], &*table)[0].1, 0);
+            let user2 = {
+                let gate = Arc::clone(&gate);
+                let table = Arc::clone(&table);
+                thread::spawn(move || {
+                    let seen = gate.pass_begin(&[X], &*table)[0].1;
+                    // The grant runs strictly inside user 2's window.
+                    let (_, admission) = gate.grant_register(X, "reader", &*table);
+                    gate.settle(&[X]);
+                    (seen, admission)
+                })
+            };
+            // User 1 settles concurrently with user 2's window.
+            gate.settle(&[X]);
+            let (seen2, admission) = user2.join().unwrap();
+            assert_eq!(seen2, 0, "the grant registered after user 2's holders read");
+            assert_eq!(
+                admission,
+                GrantAdmission::Park,
+                "a grant inside an open window must park — user 1's settle cleared user 2's mark"
+            );
+            assert!(!gate.is_inflight(X), "both users settled");
+        });
+    }
 }

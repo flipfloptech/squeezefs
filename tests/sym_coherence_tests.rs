@@ -159,6 +159,7 @@ async fn a_predecessors_pre_handover_frames_are_never_screened() {
     // frame; the successor (g = 2) appended there.
     let screen = FrameScreen {
         g_current: 2,
+        appender_current: 2,
         recorded_tail: Some((1, tails[1] as u32)),
         pr_fenced: false,
     };
@@ -189,6 +190,7 @@ async fn frames_past_the_recorded_tail_with_an_older_g_are_screened() {
     // the zombie's.
     let screen = FrameScreen {
         g_current: 2,
+        appender_current: 2,
         recorded_tail: Some((1, tails[1] as u32)),
         pr_fenced: false,
     };
@@ -232,6 +234,7 @@ async fn a_non_monotone_g_in_one_log_is_screened() {
     let tails = forge_log(&vol, b2, &[(b2, 20), (a1, 21)]).await;
     let screen = FrameScreen {
         g_current: 2,
+        appender_current: 2,
         recorded_tail: None,
         pr_fenced: false,
     };
@@ -264,6 +267,7 @@ async fn a_generation_above_the_current_one_is_a_breach_under_a_device_fence() {
     let breach0 = META_KV_APPENDER_FENCE_BREACH.load(Ordering::Relaxed);
     let non_pr = FrameScreen {
         g_current: 2,
+        appender_current: 2,
         recorded_tail: None,
         pr_fenced: false,
     };
@@ -293,6 +297,77 @@ async fn a_generation_above_the_current_one_is_a_breach_under_a_device_fence() {
     );
 }
 
+/// **Rule 4** (review round 1, Issue 18): a frame stamped the CURRENT
+/// generation by an appender that is NOT the slot's lessee passes rules
+/// 1–3 (none reads `appender_id`) — yet one generation has ONE lessee by
+/// construction, so such a frame is a manager bug or a forged frame: the
+/// breach class under a device fence, screened otherwise, like rule 1.
+/// The lessee's own frames at the current generation are kept, and a
+/// screened rule-4 frame with the LESSEE's frame behind it is the
+/// overwrite class, refused loud.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_current_generation_frame_from_a_foreign_appender_is_screened() {
+    let _c = COUNTERS.lock().await;
+    let vol = fresh_volume();
+    let b2 = stamp(2, 2);
+    let x2 = stamp(7, 2);
+    forge_log(&vol, b2, &[(b2, 10), (x2, 11)]).await;
+    let screened0 = META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed);
+    let breach0 = META_KV_APPENDER_FENCE_BREACH.load(Ordering::Relaxed);
+    let non_pr = FrameScreen {
+        g_current: 2,
+        appender_current: 2,
+        recorded_tail: None,
+        pr_fenced: false,
+    };
+    assert_eq!(non_pr.foreign_rule(x2, 8192, Some(2)), Some(4));
+    assert_eq!(non_pr.foreign_rule(b2, 8192, Some(2)), None);
+    let loaded = load_node_screened(vol.path(), &v2(), ADDR, 0, Some(&non_pr))
+        .await
+        .expect("load");
+    assert_eq!(
+        loaded.bset_count(),
+        1,
+        "the lessee's frame is kept, the foreign one screened"
+    );
+    assert_eq!(
+        META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed),
+        screened0 + 1
+    );
+    assert_eq!(
+        META_KV_APPENDER_FENCE_BREACH.load(Ordering::Relaxed),
+        breach0
+    );
+    let pr = FrameScreen {
+        pr_fenced: true,
+        ..non_pr
+    };
+    let loaded = load_node_screened(vol.path(), &v2(), ADDR, 0, Some(&pr))
+        .await
+        .expect("load");
+    assert_eq!(loaded.bset_count(), 1);
+    assert_eq!(
+        META_KV_APPENDER_FENCE_BREACH.load(Ordering::Relaxed),
+        breach0 + 1,
+        "under a device fence a foreign current-generation frame is the breach class"
+    );
+    // The overwrite face: the foreign frame sits BEFORE the lessee's own.
+    let vol2 = fresh_volume();
+    forge_log(&vol2, b2, &[(b2, 10), (x2, 11), (b2, 12)]).await;
+    let before = META_KV_FOREIGN_FRAME_OVERWRITE_DETECTED.load(Ordering::Relaxed);
+    let err = load_node_screened(vol2.path(), &v2(), ADDR, 0, Some(&non_pr))
+        .await
+        .expect_err("a foreign frame under the lessee's frame refuses");
+    assert!(
+        matches!(err, KvError::Corrupt(ref m) if m.contains("foreign_frame_overwrite_detected")),
+        "{err}"
+    );
+    assert_eq!(
+        META_KV_FOREIGN_FRAME_OVERWRITE_DETECTED.load(Ordering::Relaxed),
+        before + 1
+    );
+}
+
 /// §5.8.2 residual class (ii), the after-the-fact face: a zombie's frame at
 /// a position the successor had ALREADY written — screened by rule 2 with
 /// the successor's own frame BEHIND it — is acked loss; the load refuses
@@ -310,6 +385,7 @@ async fn a_zombie_frame_under_a_successors_frame_is_an_overwrite_refused_loud() 
     overwrite_frame(&vol, tails[0], a1, 13).await;
     let screen = FrameScreen {
         g_current: 2,
+        appender_current: 2,
         recorded_tail: Some((1, tails[0] as u32)),
         pr_fenced: false,
     };

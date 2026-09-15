@@ -372,6 +372,7 @@ proptest! {
     fn bset_frame_v2_walk_never_panics(
         seed in prop::collection::vec(any::<u8>(), 0..2048),
         g_current in any::<u32>(),
+        appender_current in any::<u32>(),
         tail_g in any::<u32>(),
         tail_frame in 0u8..15,
         has_tail in any::<bool>(),
@@ -382,6 +383,7 @@ proptest! {
         let v1 = NodeLayout::new(NODE_SIZE).expect("64 KiB node size");
         let screen = FrameScreen {
             g_current,
+            appender_current,
             recorded_tail: has_tail.then_some((tail_g, (u32::from(tail_frame) + 1) * NODE_PAGE as u32)),
             pr_fenced,
         };
@@ -414,6 +416,7 @@ proptest! {
     fn bset_frame_v2_screen_matches_the_rule_function(
         frames in prop::collection::vec((0u8..4, 0u8..4), 1..8),
         g_current in 0u32..4,
+        appender_current in 0u32..4,
         tail_g in 0u32..4,
         tail_frame in 0u8..8,
         has_tail in any::<bool>(),
@@ -422,6 +425,7 @@ proptest! {
         let v2 = NodeLayout::new_symmetric(NODE_SIZE).expect("64 KiB node size");
         let screen = FrameScreen {
             g_current,
+            appender_current,
             recorded_tail: has_tail.then_some((tail_g, (u32::from(tail_frame) + 1) * NODE_PAGE as u32)),
             pr_fenced: false,
         };

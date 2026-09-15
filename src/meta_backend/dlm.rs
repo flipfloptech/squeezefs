@@ -297,6 +297,17 @@ enum DlmGuardInner {
     Exclusive {
         _g: crate::sqz_sync::OwnedSqzRwLockWriteGuard<()>,
     },
+    /// A guard whose lock lives in ANOTHER table (symmetric PR 6, design
+    /// §5.6 line 1 — "foreign-home guards travel"): the holder of the
+    /// object's slot parks the real guards under `scope`, and this
+    /// handle's drop runs `on_drop` — the release toward that holder —
+    /// at the SAME instant the op's local guards go, so the travelling
+    /// guard rides every `Arc<[DlmGuard]>` signature unchanged and obeys
+    /// the terminal-outcome release law by construction.
+    External {
+        scope: u64,
+        on_drop: Option<Box<dyn FnOnce() + Send + Sync>>,
+    },
 }
 
 /// One held 4a object lock. Dropping an EXCLUSIVE `I{ino}` guard records
@@ -309,6 +320,30 @@ pub struct DlmGuard {
     trace_id: u64,
 }
 
+impl DlmGuard {
+    /// A guard held in another table under `scope` (see
+    /// [`DlmGuardInner::External`]); `on_drop` runs exactly once, at the
+    /// drop.
+    pub fn external(scope: u64, on_drop: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self {
+            _inner: DlmGuardInner::External {
+                scope,
+                on_drop: Some(Box::new(on_drop)),
+            },
+            acquired: None,
+            trace_id: 0,
+        }
+    }
+
+    /// The scope of an external guard; `None` for a lock in this table.
+    pub fn external_scope(&self) -> Option<u64> {
+        match &self._inner {
+            DlmGuardInner::External { scope, .. } => Some(*scope),
+            DlmGuardInner::Shared { .. } | DlmGuardInner::Exclusive { .. } => None,
+        }
+    }
+}
+
 impl Drop for DlmGuard {
     fn drop(&mut self) {
         if let Some(t) = self.acquired {
@@ -318,6 +353,11 @@ impl Drop for DlmGuard {
                 now.saturating_duration_since(t),
             );
             crate::op_trace::stamp(self.trace_id, crate::op_trace::Stage::DlmGuardReleased, now);
+        }
+        if let DlmGuardInner::External { on_drop, .. } = &mut self._inner {
+            if let Some(release) = on_drop.take() {
+                release();
+            }
         }
     }
 }

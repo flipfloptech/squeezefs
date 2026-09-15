@@ -198,6 +198,12 @@ impl MetaShipRouter {
         self.client_epoch
     }
 
+    /// This client's wire identity — what an owner sees as the frame's
+    /// `client_id`.
+    pub fn peer_id(&self) -> &str {
+        &self.peer_id
+    }
+
     /// The owner of `ino`'s volume, or `None` when it is local.
     pub fn owner_for_ino(&self, ino: Ino) -> Option<Arc<PeerOwner>> {
         if !owners::ownership_armed() {

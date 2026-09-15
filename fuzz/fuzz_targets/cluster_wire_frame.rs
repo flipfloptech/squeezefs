@@ -275,19 +275,36 @@ fn check_xv_step_bodies(data: &[u8]) {
             ts_ns: other ^ tx_id,
         },
     };
+    // The step under a guard scope, plus the travelling guard's own two
+    // verbs in the same frame (the PR 6 block, all four bodies).
     let frame = MetaRequestFrame {
         schema: META_SHIP_SCHEMA,
         client_epoch: tx_id,
         client_id: String::new(),
         owner_term: 0,
-        ops: vec![MetaOp {
-            id: 1,
-            call: MetaCall::XvStep {
-                tx_id,
-                step_idx: 0,
-                step: step.clone(),
+        ops: vec![
+            MetaOp {
+                id: 1,
+                call: MetaCall::XvStep {
+                    tx_id,
+                    step_idx: 0,
+                    step: step.clone(),
+                    scope: other,
+                },
             },
-        }],
+            MetaOp {
+                id: 2,
+                call: MetaCall::XvGuards {
+                    scope: other,
+                    inodes: vec![(ino, word & 1 == 1)],
+                    dentries: vec![(ino, step.name().to_string(), true)],
+                },
+            },
+            MetaOp {
+                id: 3,
+                call: MetaCall::XvRelease { scope: other, ino },
+            },
+        ],
     };
     let wire = encode_request(&frame).expect("a bounded step frame encodes");
     let back = decode_request(&wire).expect("re-decodes");

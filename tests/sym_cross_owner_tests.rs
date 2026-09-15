@@ -1100,6 +1100,9 @@ fn the_cross_owner_family_is_exported_under_its_published_names() {
         "xv_cross_owner_steps_served",
         "xv_cross_owner_intents_stuck",
         "xv_cross_owner_phase_ns",
+        "xv_cross_owner_guard_rpcs",
+        "xv_cross_owner_guards_parked",
+        "xv_cross_owner_guard_expiries",
         "dir_rename_lock_acquires",
         "dir_rename_lock_wait_ns",
     ] {
@@ -1108,7 +1111,356 @@ fn the_cross_owner_family_is_exported_under_its_published_names() {
     let phases = json["xv_cross_owner_phase_ns"]
         .as_object()
         .expect("a phase table");
-    for p in ["plan", "intent_barrier", "ship_rtt", "retire", "total"] {
+    for p in [
+        "guard_rtt",
+        "plan",
+        "intent_barrier",
+        "ship_rtt",
+        "retire",
+        "total",
+    ] {
         assert!(phases.contains_key(p), "missing phase {p}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The 4a guards travel (design §5.6 line 1) — found by the scoping row.
+// ---------------------------------------------------------------------------
+
+/// A served step never PARKS behind the initiator's held guards. The
+/// scoping row's 27th cross-holder directory rename found the holder's
+/// `insert_dentry` waiting on a 4a stripe the initiator held across the
+/// ship — in one process a stripe collision (the shared table), in a
+/// fleet the two-mutual-initiator cycle the design's "foreign-home guards
+/// travel" line exists to make impossible. The collision is forced here
+/// by NAME: the moved file's `D{mine,f}` (held by the initiator) and the
+/// destination's `D{shared,g}` (the served insert's) share a dentry
+/// stripe. Pre-fix: the rename hangs for the wire's two call timeouts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_served_step_never_parks_behind_the_initiators_guards_even_on_a_stripe_collision() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    let mine = routed
+        .create(ROOT_INO, "mine", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    routed
+        .create(mine, "f", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    let dlm = routed.volumes[0].dlm();
+    let (_, local_mine) = routed.route_ino(mine);
+    let (_, local_shared) = routed.route_ino(shared);
+    let colliding = (0u64..)
+        .map(|i| format!("g{i}"))
+        .find(|n| dlm.dentry_stripe(local_shared, n) == dlm.dentry_stripe(local_mine, "f"))
+        .expect("a colliding name exists below the stripe width");
+    let before = cross_owner_stats();
+    let renamed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        routed.rename(mine, "f", shared, &colliding, 0),
+    )
+    .await
+    .expect("the rename completes — the served step waits on no guard the initiator holds");
+    renamed.unwrap();
+    assert_eq!(names_in(&routed, shared).await, vec![colliding.clone()]);
+    assert!(names_in(&routed, mine).await.is_empty());
+    let after = cross_owner_stats();
+    assert!(
+        after.steps_shipped > before.steps_shipped,
+        "the insert shipped to the holder"
+    );
+    assert_closed("collision");
+    holders.tear_down();
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
+/// The wire half of the travelling guard: a REMOTE initiator's
+/// `XvGuards` parks the named 4a guards at the holder under its scope
+/// (a local acquirer of the same key waits), the steps it ships under
+/// that scope apply without taking a guard, `XvRelease` frees them
+/// (idempotent — `already` on a scope the holder no longer has), and a
+/// scope whose initiator died expires with its lease (the grace window,
+/// `xv_cross_owner_guard_expiries` — must-stay-0 on a healthy set).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remote_initiators_guards_park_at_the_holder_until_release_and_expire_with_its_lease() {
+    use squeezefs::meta_backend::dlm::LockMode;
+    use squeezefs::meta_ship::{MetaCall, MetaOp, MetaReply, PeerOwner};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    let endpoint = holders.host.endpoint().to_string();
+    // A SECOND node's router — not this process's installed shipper, so
+    // its scopes are remote to the holder by identity.
+    let remote = MetaShipRouter::new(Arc::clone(&routed), "node-c", SECRET.to_vec());
+    let peer = Arc::new(PeerOwner::new("appender-1", &endpoint));
+    let ship = |call: MetaCall| {
+        let remote = Arc::clone(&remote);
+        let peer = Arc::clone(&peer);
+        async move {
+            let op = MetaOp {
+                id: remote.next_request_id(),
+                call,
+            };
+            let mut r = remote.ship_ops(&peer, vec![op]).await.expect("shipped");
+            r.pop().expect("one result").outcome
+        }
+    };
+    let (_, local_shared) = routed.route_ino(shared);
+    let dlm = routed.volumes[0].dlm();
+    let before = cross_owner_stats();
+
+    // Acquire under scope 77: the holder parks I{shared} + D{shared,z}.
+    let acquired = ship(MetaCall::XvGuards {
+        scope: 77,
+        inodes: vec![(shared, true)],
+        dentries: vec![(shared, "z".to_string(), true)],
+    })
+    .await;
+    assert!(matches!(acquired, Ok(MetaReply::Unit)), "{acquired:?}");
+    // A resend of the same acquisition is answered, never double-parked.
+    let again = ship(MetaCall::XvGuards {
+        scope: 77,
+        inodes: vec![(shared, true)],
+        dentries: vec![],
+    })
+    .await;
+    assert!(matches!(again, Ok(MetaReply::Unit)), "{again:?}");
+    let parked = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        dlm.lock_many(&[(local_shared, LockMode::Exclusive)], &[]),
+    )
+    .await;
+    assert!(
+        parked.is_err(),
+        "a local acquirer waits behind the remote scope"
+    );
+    // A step under the scope applies WITHOUT taking a guard (it would
+    // self-deadlock behind its own scope otherwise).
+    let now = KvMetaBackend::now_ns_pub();
+    let stepped = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ship(MetaCall::XvStep {
+            tx_id: 0x77,
+            step_idx: 0,
+            step: crossvol_tx::XvStep::TouchCtime {
+                ino: shared,
+                ctime: now,
+            },
+            scope: 77,
+        }),
+    )
+    .await
+    .expect("the scoped step never parks");
+    assert!(
+        matches!(stepped, Ok(MetaReply::XvStep { status: 0, .. })),
+        "{stepped:?}"
+    );
+    // Release; the local acquirer proceeds; a second release is `already`.
+    // (A read of `shared` BEFORE the release would take its shared
+    // `I{}` guard and wait behind the parked exclusive one — the lock
+    // being a lock — so the step's effect is read after it.)
+    let released = ship(MetaCall::XvRelease {
+        scope: 77,
+        ino: shared,
+    })
+    .await;
+    assert!(matches!(released, Ok(MetaReply::Unit)), "{released:?}");
+    // The applier stamps `max(step ctime, now)` — the step landed.
+    assert!(routed.getattr(shared).await.unwrap().ctime >= now);
+    let local = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        dlm.lock_many(&[(local_shared, LockMode::Exclusive)], &[]),
+    )
+    .await
+    .expect("the release frees the stripe");
+    drop(local);
+    let released = ship(MetaCall::XvRelease {
+        scope: 77,
+        ino: shared,
+    })
+    .await;
+    assert!(matches!(released, Ok(MetaReply::Unit)), "{released:?}");
+
+    // A scope its initiator never releases (it died) expires with the
+    // initiator's lease — the grace window, swept by the cadence.
+    let acquired = ship(MetaCall::XvGuards {
+        scope: 78,
+        inodes: vec![(shared, true)],
+        dentries: vec![],
+    })
+    .await;
+    assert!(matches!(acquired, Ok(MetaReply::Unit)), "{acquired:?}");
+    assert_eq!(
+        crossvol_tx::sweep_expired_guards(),
+        0,
+        "inside the grace window"
+    );
+    TEST_XV_STUCK_AFTER_MS.store(1, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert_eq!(crossvol_tx::sweep_expired_guards(), 1);
+    TEST_XV_STUCK_AFTER_MS.store(0, Ordering::SeqCst);
+    let local = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        dlm.lock_many(&[(local_shared, LockMode::Exclusive)], &[]),
+    )
+    .await
+    .expect("the expiry frees the stripe");
+    drop(local);
+    let after = cross_owner_stats();
+    assert_eq!(after.guard_expiries - before.guard_expiries, 1);
+    assert_eq!(
+        after.guards_parked - before.guards_parked,
+        2,
+        "scopes 77 and 78"
+    );
+    holders.tear_down();
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
+/// The initiator's half of the travelling guard, forced onto the wire
+/// (`TEST_XV_GUARDS_FORCE_REMOTE` — an in-process holder shares the
+/// initiator's table and is otherwise taken in the ONE canonical
+/// `lock_many`): a create in a foreign directory acquires its foreign
+/// keys as ONE `XvGuards` at the holder (`xv_cross_owner_guard_rpcs`),
+/// ships its step under that scope, and releases at its terminal
+/// outcome — nothing left parked, the stripe free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_initiator_acquires_its_foreign_guards_at_the_holder_and_releases_them_at_the_end() {
+    use squeezefs::meta_backend::dlm::LockMode;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    let before = cross_owner_stats();
+    crossvol_tx::TEST_XV_GUARDS_FORCE_REMOTE.store(true, Ordering::SeqCst);
+    let created = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        routed.create(shared, "remote", libc::S_IFREG | 0o644, 0, 0),
+    )
+    .await
+    .expect("completes");
+    crossvol_tx::TEST_XV_GUARDS_FORCE_REMOTE.store(false, Ordering::SeqCst);
+    created.unwrap();
+    let after = cross_owner_stats();
+    assert_eq!(
+        after.guard_rpcs - before.guard_rpcs,
+        1,
+        "one XvGuards per holder table"
+    );
+    assert_eq!(after.guards_parked - before.guards_parked, 1);
+    assert_eq!(after.steps_shipped - before.steps_shipped, 1);
+    // The release rode the guard set's drop: nothing stays parked.
+    let (_, local_shared) = routed.route_ino(shared);
+    let dlm = routed.volumes[0].dlm();
+    let mut freed = false;
+    for _ in 0..100 {
+        if tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            dlm.lock_many(&[(local_shared, LockMode::Exclusive)], &[]),
+        )
+        .await
+        .is_ok()
+        {
+            freed = true;
+            break;
+        }
+    }
+    assert!(
+        freed,
+        "the remote scope was released at the op's terminal outcome"
+    );
+    assert_eq!(crossvol_tx::sweep_expired_guards(), 0);
+    assert_eq!(names_in(&routed, shared).await, vec!["remote".to_string()]);
+    assert_closed("remote guards");
+    holders.tear_down();
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
+// ---------------------------------------------------------------------------
+// The evidence note's instrument (dev box = SCOPING; `--ignored --nocapture`).
+// ---------------------------------------------------------------------------
+
+/// `.benchmarks/2026-09-15-sym-pr6-cross-owner.md`'s row: N creates into a
+/// foreign directory (one shipped step each) and N directory renames under
+/// the set-wide lock, then the Cross-owner phase table, the S8 client
+/// phases and the lock wait — printed, never asserted (a scoping row on
+/// the laptop; the box brackets are PR 13's).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "the evidence note's scoping instrument — run with --ignored --nocapture"]
+async fn scoping_row_per_verb_wire_and_barrier_cost() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    let n = 200u32;
+    let t = std::time::Instant::now();
+    for i in 0..n {
+        routed
+            .create(shared, &format!("f{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+    }
+    let create_wall = t.elapsed();
+    let mine = routed
+        .create(ROOT_INO, "mine", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    for i in 0..n {
+        routed
+            .create(mine, &format!("d{i}"), libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .unwrap();
+    }
+    let t = std::time::Instant::now();
+    for i in 0..n {
+        routed
+            .rename(mine, &format!("d{i}"), shared, &format!("e{i}"), 0)
+            .await
+            .unwrap();
+    }
+    let dir_rename_wall = t.elapsed();
+    let json = serde_json::Value::Object(crossvol_tx::cross_owner_stats_json());
+    println!(
+        "SCOPING create-in-foreign-dir ×{n}: {:.1} µs/op; dir-rename across holders ×{n}: \
+         {:.1} µs/op",
+        create_wall.as_micros() as f64 / f64::from(n),
+        dir_rename_wall.as_micros() as f64 / f64::from(n)
+    );
+    println!(
+        "SCOPING xv_cross_owner_phase_ns = {}",
+        serde_json::to_string_pretty(&json["xv_cross_owner_phase_ns"]).unwrap()
+    );
+    println!(
+        "SCOPING dir_rename_lock_wait_ns = {}",
+        serde_json::to_string_pretty(&json["dir_rename_lock_wait_ns"]).unwrap()
+    );
+    println!(
+        "SCOPING meta_ship_phase_ns = {}",
+        serde_json::to_string_pretty(&squeezefs::meta_ship::phase_json()).unwrap()
+    );
+    println!(
+        "SCOPING meta_ship_owner_phase_ns = {}",
+        serde_json::to_string_pretty(&squeezefs::meta_ship::owner_phase_json()).unwrap()
+    );
+    println!("SCOPING stats = {:?}", cross_owner_stats());
+    holders.tear_down();
+    shutdown(&routed).await;
 }

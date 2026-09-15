@@ -65,6 +65,16 @@ impl KvMetaBackend {
             .map_or(0, |r| r.id)
     }
 
+    /// Is appender `id` one of THIS mount's regions — i.e. does its 4a
+    /// lock table live in this process (the one-canonical-`lock_many`
+    /// table of `crossvol_tx::acquire_guards_leased`)? Region 0 and the
+    /// declared regions; a wire joiner's is another process's.
+    pub fn is_own_region(&self, id: u32) -> bool {
+        self.appenders
+            .as_ref()
+            .is_some_and(|s| s.regions.iter().any(|r| r.id == id))
+    }
+
     /// The intent-only `tx0`: a plan whose first step is another
     /// appender's writes its intent alone into this initiator's ring
     /// before anything ships.

@@ -195,20 +195,26 @@ const DIR: u32 = libc::S_IFDIR | 0o755;
 /// it was never atomic (mod.rs says so). There is no `statfs` member on
 /// the trait, so none ships. **Symmetric PR 6** appended its own block
 /// (0x60–0x6F): `XvStep` (one step of a cross-owner intent, applied by the
-/// step's slot holder) and `LookupExact` (the directory-rename ancestor
-/// check's exact read) — verbs of the symmetric plane, not trait members.
+/// step's slot holder), `LookupExact` (the directory-rename ancestor
+/// check's exact read) and the travelling guard's pair `XvGuards` /
+/// `XvRelease` — verbs of the symmetric plane, not trait members.
 #[test]
 fn the_wire_vocabulary_covers_every_shipped_trait_member() {
     assert_eq!(
         MetaVerb::ALL.len(),
-        15,
-        "13 wire verbs cover the trait's 13 required members, plus PR 6's two symmetric \
+        17,
+        "13 wire verbs cover the trait's 13 required members, plus PR 6's four symmetric \
          verbs ({:?})",
         MetaVerb::ALL
     );
     assert_eq!(
-        (MetaVerb::XvStep.code(), MetaVerb::LookupExact.code()),
-        (0x60, 0x61),
+        (
+            MetaVerb::XvStep.code(),
+            MetaVerb::LookupExact.code(),
+            MetaVerb::XvGuards.code(),
+            MetaVerb::XvRelease.code(),
+        ),
+        (0x60, 0x61, 0x62, 0x63),
         "PR 6's block is 0x60–0x6F (the level-4 discriminant ranges)"
     );
     let mut seen = HashSet::new();
@@ -249,6 +255,8 @@ fn the_wire_vocabulary_covers_every_shipped_trait_member() {
         (MetaVerb::DestroyInode, true),
         (MetaVerb::XvStep, true),
         (MetaVerb::LookupExact, false),
+        (MetaVerb::XvGuards, true),
+        (MetaVerb::XvRelease, true),
     ] {
         assert_eq!(
             verb.mutating(),
@@ -333,10 +341,20 @@ fn frames_round_trip_and_untrusted_bytes_refuse_loud() {
                 ft_bits: libc::S_IFREG,
                 parent_update: 1,
             },
+            scope: 0,
         },
         MetaCall::LookupExact {
             parent: 1,
             name: "c".into(),
+        },
+        MetaCall::XvGuards {
+            scope: 0x51,
+            inodes: vec![(1, true)],
+            dentries: vec![(1, "c".into(), true)],
+        },
+        MetaCall::XvRelease {
+            scope: 0x51,
+            ino: 1,
         },
     ]
     .into_iter()

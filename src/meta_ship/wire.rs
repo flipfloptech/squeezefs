@@ -203,6 +203,14 @@ pub enum MetaVerb {
     /// slot holder's RAM-authoritative tree — the set-wide directory-
     /// rename lock's ancestor check reads each link through it (§5.6.4).
     LookupExact = 0x61,
+    /// The initiator's 4a guards on objects in the holder's slots, parked
+    /// at the holder under a scope for the op's duration — §5.6 line 1,
+    /// "foreign-home guards travel" (the served step then applies without
+    /// taking a guard, so it can never park behind the initiator).
+    XvGuards = 0x62,
+    /// Release a scope's parked guards (idempotent — `Unit` for a scope
+    /// the holder no longer has).
+    XvRelease = 0x63,
 }
 
 impl MetaVerb {
@@ -223,6 +231,8 @@ impl MetaVerb {
         MetaVerb::DestroyInode,
         MetaVerb::XvStep,
         MetaVerb::LookupExact,
+        MetaVerb::XvGuards,
+        MetaVerb::XvRelease,
     ];
 
     /// The verb's wire code.
@@ -253,6 +263,8 @@ impl MetaVerb {
             MetaVerb::DestroyInode => "destroy_inode",
             MetaVerb::XvStep => "xv_step",
             MetaVerb::LookupExact => "lookup_exact",
+            MetaVerb::XvGuards => "xv_guards",
+            MetaVerb::XvRelease => "xv_release",
         }
     }
 
@@ -278,7 +290,13 @@ impl MetaVerb {
             | MetaVerb::Setxattr
             | MetaVerb::Removexattr
             | MetaVerb::DestroyInode
-            | MetaVerb::XvStep => true,
+            | MetaVerb::XvStep
+            // The guard verbs write no record, but a RESEND must be
+            // answered from the winner's outcome (a second `lock_many`
+            // under a scope already parked would wait behind itself), so
+            // they ride the dedup window like every mutating verb.
+            | MetaVerb::XvGuards
+            | MetaVerb::XvRelease => true,
         }
     }
 }
@@ -361,11 +379,30 @@ pub enum MetaCall {
         tx_id: u64,
         step_idx: u32,
         step: crate::meta_backend::crossvol_tx::XvStep,
+        /// The guard scope the step applies under (`XvGuards`); 0 = none
+        /// travelled (a roll-forward without a scope) — the holder takes
+        /// the step's guards for the apply.
+        scope: u64,
     },
     /// The exact `(parent, name)` resolution (`MetaReply::DentryExact`).
     LookupExact {
         parent: u64,
         name: String,
+    },
+    /// Park the initiator's 4a guards at the holder under `scope`:
+    /// `inodes` = `(global ino, exclusive)`, `dentries` = `(global parent,
+    /// name, exclusive)` — one canonical `lock_many` at the holder, held
+    /// until `XvRelease` or the initiator's lease expiry.
+    XvGuards {
+        scope: u64,
+        inodes: Vec<(u64, bool)>,
+        dentries: Vec<(u64, String, bool)>,
+    },
+    /// Release scope `scope`'s parked guards; `ino` names one of its
+    /// objects (the verb's routing/authority ino).
+    XvRelease {
+        scope: u64,
+        ino: u64,
     },
 }
 
@@ -388,6 +425,8 @@ impl MetaCall {
             MetaCall::DestroyInode { .. } => MetaVerb::DestroyInode,
             MetaCall::XvStep { .. } => MetaVerb::XvStep,
             MetaCall::LookupExact { .. } => MetaVerb::LookupExact,
+            MetaCall::XvGuards { .. } => MetaVerb::XvGuards,
+            MetaCall::XvRelease { .. } => MetaVerb::XvRelease,
         }
     }
 
@@ -419,6 +458,14 @@ impl MetaCall {
             | MetaCall::DestroyInode { ino } => *ino,
             MetaCall::XvStep { step, .. } => step.home_ino(),
             MetaCall::LookupExact { parent, .. } => *parent,
+            MetaCall::XvGuards {
+                inodes, dentries, ..
+            } => inodes
+                .first()
+                .map(|(i, _)| *i)
+                .or_else(|| dentries.first().map(|(p, _, _)| *p))
+                .unwrap_or(0),
+            MetaCall::XvRelease { ino, .. } => *ino,
         }
     }
 
@@ -438,6 +485,13 @@ impl MetaCall {
                 new_parent,
                 ..
             } => vec![*old_parent, *new_parent],
+            MetaCall::XvGuards {
+                inodes, dentries, ..
+            } => inodes
+                .iter()
+                .map(|(i, _)| *i)
+                .chain(dentries.iter().map(|(p, _, _)| *p))
+                .collect(),
             other => vec![other.primary_ino()],
         }
     }

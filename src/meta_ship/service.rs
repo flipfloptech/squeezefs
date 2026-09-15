@@ -939,7 +939,7 @@ impl MetaShipService {
             _ => {}
         }
         let t = Instant::now();
-        let out = self.execute_inner(call).await;
+        let out = self.execute_inner(call, client_id).await;
         super::owner_phase_record(OwnerPhase::Execute, t);
         self.served.fetch_add(1, Ordering::Relaxed);
         super::SERVED_VERBS.fetch_add(1, Ordering::Relaxed);
@@ -1291,7 +1291,11 @@ impl MetaShipService {
         )
     }
 
-    async fn execute_inner(&self, call: &MetaCall) -> crate::error::Result<MetaReply> {
+    async fn execute_inner(
+        &self,
+        call: &MetaCall,
+        client_id: &str,
+    ) -> crate::error::Result<MetaReply> {
         match call {
             MetaCall::LookupDentry { parent, name } => {
                 match self.inner.lookup_dentry(*parent, name).await? {
@@ -1429,6 +1433,7 @@ impl MetaShipService {
                 tx_id,
                 step_idx,
                 step,
+                scope,
             } => {
                 if crate::meta_backend::crossvol_tx::TEST_XV_SERVE_REFUSE.load(Ordering::SeqCst) {
                     return Err(SqueezefsError::refused(
@@ -1436,7 +1441,14 @@ impl MetaShipService {
                         "TEST_XV_SERVE_REFUSE: the holder is down before its commit".to_string(),
                     ));
                 }
-                let out = self.inner.xv_serve_step(*tx_id, *step_idx, step).await?;
+                let scope = crate::meta_backend::crossvol_tx::GuardScope {
+                    client: client_id,
+                    scope: *scope,
+                };
+                let out = self
+                    .inner
+                    .xv_serve_step(*tx_id, *step_idx, step, scope)
+                    .await?;
                 if crate::meta_backend::crossvol_tx::TEST_XV_SERVE_MISDELIVER_ONCE
                     .swap(false, Ordering::SeqCst)
                 {
@@ -1462,6 +1474,22 @@ impl MetaShipService {
             MetaCall::LookupExact { parent, name } => Ok(MetaReply::DentryExact(
                 self.inner.lookup_dentry(*parent, name).await?,
             )),
+            // The travelling guard's two halves (§5.6 line 1): park the
+            // initiator's 4a guards under its scope / release them.
+            MetaCall::XvGuards {
+                scope,
+                inodes,
+                dentries,
+            } => {
+                self.inner
+                    .xv_serve_guards(client_id, *scope, inodes, dentries)
+                    .await?;
+                Ok(MetaReply::Unit)
+            }
+            MetaCall::XvRelease { scope, .. } => {
+                crate::meta_backend::crossvol_tx::release_parked_guards(client_id, *scope);
+                Ok(MetaReply::Unit)
+            }
         }
     }
 

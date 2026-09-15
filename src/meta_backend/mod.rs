@@ -1414,37 +1414,24 @@ impl RoutedMetaBackend {
     // mount: the shipped paths pay one `Option` test.
     // -----------------------------------------------------------------
 
-    /// `lock_many` on `v_idx`'s DLM with every key homed in a slot ANOTHER
-    /// appender leases dropped: a foreign key's 4a guard is its holder's,
-    /// taken around the served apply (a guard held here would be a second
-    /// process's table in the fleet — meaningless — and in the one-process
-    /// two-holder model the SAME table, a self-deadlock against the served
-    /// step). Inside a served verb this mount IS the holder and every key
-    /// is its own. Unarmed: `lock_many` verbatim.
+    /// The cross-owner arms' 4a acquisition (design §5.6 line 1 — "plan
+    /// under the op's 4a guards; foreign-home guards travel"):
+    /// `crossvol_tx::acquire_guards_leased` — every key whose lock lives
+    /// in this process's table in the ONE canonical `lock_many`, every
+    /// foreign holder's keys as one travelling `XvGuards` parked at the
+    /// holder for the op's duration, tables in ascending appender-id
+    /// order (deadlock-free by the hierarchical argument). `scope` is the
+    /// op's, shared by its per-volume calls. Inside a served verb this
+    /// mount IS the holder and every key is its own; unarmed: `lock_many`
+    /// verbatim.
     async fn lock_many_leased(
         &self,
         v_idx: usize,
+        scope: u64,
         inos: &[(Ino, dlm::LockMode)],
         dents: &[(Ino, &str, dlm::LockMode)],
-    ) -> Vec<dlm::DlmGuard> {
-        let vol = &self.volumes[v_idx];
-        if !vol.slot_lease_armed() || crate::meta_ship::executing_for_ship_client() {
-            return vol.dlm().lock_many(inos, dents).await;
-        }
-        let own = |local: Ino| {
-            matches!(
-                crossvol_tx::step_home(self, v_idx, local),
-                crossvol_tx::StepHome::Local
-            )
-        };
-        let inos: Vec<(Ino, dlm::LockMode)> =
-            inos.iter().copied().filter(|(l, _)| own(*l)).collect();
-        let dents: Vec<(Ino, &str, dlm::LockMode)> =
-            dents.iter().copied().filter(|(l, _, _)| own(*l)).collect();
-        if inos.is_empty() && dents.is_empty() {
-            return Vec::new();
-        }
-        vol.dlm().lock_many(&inos, &dents).await
+    ) -> Result<Vec<dlm::DlmGuard>> {
+        crossvol_tx::acquire_guards_leased(self, v_idx, scope, inos, dents).await
     }
 
     /// Whether any of `inos` lives in a slot another appender leases —
@@ -1464,6 +1451,7 @@ impl RoutedMetaBackend {
         tx_id: u64,
         step_idx: u32,
         step: &crossvol_tx::XvStep,
+        scope: crossvol_tx::GuardScope<'_>,
     ) -> Result<crossvol_tx::XvStepOutcome> {
         let (v_idx, local) = crossvol_tx::localise_step(self, step);
         self.check_volume_enabled(v_idx)?;
@@ -1488,13 +1476,21 @@ impl RoutedMetaBackend {
                 ));
             }
         }
-        let (inos, dents) = crossvol_tx::step_guard_keys(&local);
-        let d: Vec<(Ino, &str, dlm::LockMode)> = dents
-            .iter()
-            .map(|(p, n)| (*p, n.as_str(), dlm::LockMode::Exclusive))
-            .collect();
-        let guards: std::sync::Arc<[dlm::DlmGuard]> =
-            std::sync::Arc::from(vol.dlm().lock_many(&inos, &d).await);
+        // Under a scope the guards are HELD for the step already (the
+        // initiator's, in this table or parked here) and the apply takes
+        // nothing — a served step never parks on a 4a guard; without one
+        // it takes the step's keys for the apply's duration.
+        let guards: std::sync::Arc<[dlm::DlmGuard]> = match crossvol_tx::serve_guards_for(scope) {
+            crossvol_tx::ServeGuards::Covered => std::sync::Arc::from(Vec::new()),
+            crossvol_tx::ServeGuards::Take => {
+                let (inos, dents) = crossvol_tx::step_guard_keys(&local);
+                let d: Vec<(Ino, &str, dlm::LockMode)> = dents
+                    .iter()
+                    .map(|(p, n)| (*p, n.as_str(), dlm::LockMode::Exclusive))
+                    .collect();
+                std::sync::Arc::from(vol.dlm().lock_many(&inos, &d).await)
+            }
+        };
         let out = vol.xv_apply_step(&local, None, guards).await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);
@@ -1508,6 +1504,97 @@ impl RoutedMetaBackend {
             out.status
         );
         Ok(out)
+    }
+
+    /// **The served half of a travelling guard** (`MetaCall::XvGuards`):
+    /// park the initiator's 4a guards on `inodes` / `dentries` (global
+    /// keys, one volume) under `(client, scope)` — ONE canonical
+    /// `lock_many` in this table, held until `XvRelease` or the
+    /// initiator's lease expiry. Refuses (EAGAIN) a key whose slot this
+    /// mount does not lease — the initiator's holder view is stale. A
+    /// stripe the scope already parked is skipped (the same scope's
+    /// second call, or a resend past the dedup window, must never wait
+    /// behind itself).
+    pub async fn xv_serve_guards(
+        &self,
+        client: &str,
+        scope: u64,
+        inodes: &[(u64, bool)],
+        dentries: &[(u64, String, bool)],
+    ) -> Result<()> {
+        let mode = |exclusive: bool| {
+            if exclusive {
+                dlm::LockMode::Exclusive
+            } else {
+                dlm::LockMode::Shared
+            }
+        };
+        let mut per_vol: std::collections::BTreeMap<
+            usize,
+            (Vec<(Ino, dlm::LockMode)>, Vec<(Ino, String, dlm::LockMode)>),
+        > = std::collections::BTreeMap::new();
+        for (ino, exclusive) in inodes {
+            let (v, l) = self.route_ino(*ino);
+            per_vol.entry(v).or_default().0.push((l, mode(*exclusive)));
+        }
+        for (parent, name, exclusive) in dentries {
+            let (v, l) = self.route_ino(*parent);
+            per_vol
+                .entry(v)
+                .or_default()
+                .1
+                .push((l, name.clone(), mode(*exclusive)));
+        }
+        for (v_idx, (inos, dents)) in per_vol {
+            self.check_volume_enabled(v_idx)?;
+            let vol = &self.volumes[v_idx];
+            if let Some(plane) = vol.slot_leases() {
+                for local in inos
+                    .iter()
+                    .map(|(l, _)| *l)
+                    .chain(dents.iter().map(|(l, _, _)| *l))
+                {
+                    let slot = kv::record::forest_slot_of_ino(local);
+                    if !plane.gate.is_leased(slot) {
+                        return Err(crate::error::SqueezefsError::refused(
+                            libc::EAGAIN,
+                            format!(
+                                "cross-owner guards for scope {scope:#x} name forest slot \
+                                 {slot}, which this mount does not lease — the initiator's \
+                                 holder view is stale; it re-resolves through tree 0"
+                            ),
+                        ));
+                    }
+                }
+            }
+            let dlm = vol.dlm();
+            let parked = crossvol_tx::parked_stripes(client, scope);
+            let inos: Vec<(Ino, dlm::LockMode)> = inos
+                .into_iter()
+                .filter(|(l, _)| !parked.contains(&(v_idx, true, dlm.inode_stripe(*l))))
+                .collect();
+            let dents: Vec<(Ino, String, dlm::LockMode)> = dents
+                .into_iter()
+                .filter(|(l, n, _)| !parked.contains(&(v_idx, false, dlm.dentry_stripe(*l, n))))
+                .collect();
+            if inos.is_empty() && dents.is_empty() {
+                continue;
+            }
+            let stripes: Vec<(usize, bool, usize)> = inos
+                .iter()
+                .map(|(l, _)| (v_idx, true, dlm.inode_stripe(*l)))
+                .chain(
+                    dents
+                        .iter()
+                        .map(|(l, n, _)| (v_idx, false, dlm.dentry_stripe(*l, n))),
+                )
+                .collect();
+            let d: Vec<(Ino, &str, dlm::LockMode)> =
+                dents.iter().map(|(l, n, m)| (*l, n.as_str(), *m)).collect();
+            let guards = dlm.lock_many(&inos, &d).await;
+            crossvol_tx::park_guards(client, scope, guards, stripes);
+        }
+        Ok(())
     }
 
     /// The GLOBAL parent of directory `dir` (the one dentry naming it),
@@ -2697,15 +2784,17 @@ impl RoutedMetaBackend {
         };
         // PR M7 (Issue 13): the op's guard set travels with each commit
         // (cloned per fragment for the cross-volume shape). ONE canonical
-        // `lock_many` (I before D — the order the two single takes had),
-        // filtered of a foreign parent's keys under the armed plane.
+        // `lock_many` (I before D — the order the two single takes had);
+        // a foreign parent's keys travel to its holder under the armed
+        // plane (symmetric PR 6).
         let guards: std::sync::Arc<[dlm::DlmGuard]> = std::sync::Arc::from(
             self.lock_many_leased(
                 parent_v_idx,
+                crossvol_tx::mint_guard_scope(),
                 &[(local_parent, parent_mode)],
                 &[(local_parent, name, dlm::LockMode::Exclusive)],
             )
-            .await,
+            .await?,
         );
 
         // The preset REPLAY tiebreak (under the dentry guard): a dentry
@@ -3117,10 +3206,11 @@ impl RoutedMetaBackend {
                     .push((l, dlm::LockMode::Exclusive));
             }
             let mut guards = Vec::new();
+            let scope = crossvol_tx::mint_guard_scope();
             for (v_idx, (mut inos, dents)) in per_volume {
                 inos.sort_unstable_by_key(|(l, _)| *l);
                 inos.dedup_by_key(|(l, _)| *l);
-                guards.extend(self.lock_many_leased(v_idx, &inos, &dents).await);
+                guards.extend(self.lock_many_leased(v_idx, scope, &inos, &dents).await?);
             }
             // Revalidate under the guards: both dentries as discovered.
             let old_now = self
@@ -3639,10 +3729,11 @@ impl Metadata for RoutedMetaBackend {
             let phase1 = self
                 .lock_many_leased(
                     parent_v_idx,
+                    crossvol_tx::mint_guard_scope(),
                     &[(local_parent, dlm::LockMode::Shared)],
                     &[(local_parent, name, dlm::LockMode::Exclusive)],
                 )
-                .await;
+                .await?;
             let Some((global_child_ino, file_type)) = self
                 .find_dentry_routed(parent_v_idx, local_parent, name)
                 .await?
@@ -3673,60 +3764,67 @@ impl Metadata for RoutedMetaBackend {
             }
 
             let mut guards = Vec::new();
+            let scope = crossvol_tx::mint_guard_scope();
             if parent == global_child_ino {
                 guards.extend(
                     self.lock_many_leased(
                         parent_v_idx,
+                        scope,
                         &[(local_parent, dlm::LockMode::Exclusive)],
                         &[(local_parent, name, dlm::LockMode::Exclusive)],
                     )
-                    .await,
+                    .await?,
                 );
             } else if child_v_idx == parent_v_idx {
                 guards.extend(
                     self.lock_many_leased(
                         parent_v_idx,
+                        scope,
                         &[
                             (local_parent, parent_mode),
                             (local_child, dlm::LockMode::Exclusive),
                         ],
                         &[(local_parent, name, dlm::LockMode::Exclusive)],
                     )
-                    .await,
+                    .await?,
                 );
             } else if child_v_idx < parent_v_idx {
                 guards.extend(
                     self.lock_many_leased(
                         child_v_idx,
+                        scope,
                         &[(local_child, dlm::LockMode::Exclusive)],
                         &[],
                     )
-                    .await,
+                    .await?,
                 );
                 guards.extend(
                     self.lock_many_leased(
                         parent_v_idx,
+                        scope,
                         &[(local_parent, parent_mode)],
                         &[(local_parent, name, dlm::LockMode::Exclusive)],
                     )
-                    .await,
+                    .await?,
                 );
             } else {
                 guards.extend(
                     self.lock_many_leased(
                         parent_v_idx,
+                        scope,
                         &[(local_parent, parent_mode)],
                         &[(local_parent, name, dlm::LockMode::Exclusive)],
                     )
-                    .await,
+                    .await?,
                 );
                 guards.extend(
                     self.lock_many_leased(
                         child_v_idx,
+                        scope,
                         &[(local_child, dlm::LockMode::Exclusive)],
                         &[],
                     )
-                    .await,
+                    .await?,
                 );
             }
 
@@ -3871,43 +3969,57 @@ impl Metadata for RoutedMetaBackend {
         // canonical (taking I{child} after the D-guard would be an ABBA
         // inversion under stripe collisions).
         let mut _guards = Vec::new();
+        let scope = crossvol_tx::mint_guard_scope();
         if child_v_idx == parent_v_idx {
             _guards.extend(
                 self.lock_many_leased(
                     parent_v_idx,
+                    scope,
                     &[
                         (local_parent, dlm::LockMode::Exclusive),
                         (local_child, dlm::LockMode::Exclusive),
                     ],
                     &[(local_parent, new_name, dlm::LockMode::Exclusive)],
                 )
-                .await,
+                .await?,
             );
         } else if child_v_idx < parent_v_idx {
             _guards.extend(
-                self.lock_many_leased(child_v_idx, &[(local_child, dlm::LockMode::Exclusive)], &[])
-                    .await,
+                self.lock_many_leased(
+                    child_v_idx,
+                    scope,
+                    &[(local_child, dlm::LockMode::Exclusive)],
+                    &[],
+                )
+                .await?,
             );
             _guards.extend(
                 self.lock_many_leased(
                     parent_v_idx,
+                    scope,
                     &[(local_parent, dlm::LockMode::Exclusive)],
                     &[(local_parent, new_name, dlm::LockMode::Exclusive)],
                 )
-                .await,
+                .await?,
             );
         } else {
             _guards.extend(
                 self.lock_many_leased(
                     parent_v_idx,
+                    scope,
                     &[(local_parent, dlm::LockMode::Exclusive)],
                     &[(local_parent, new_name, dlm::LockMode::Exclusive)],
                 )
-                .await,
+                .await?,
             );
             _guards.extend(
-                self.lock_many_leased(child_v_idx, &[(local_child, dlm::LockMode::Exclusive)], &[])
-                    .await,
+                self.lock_many_leased(
+                    child_v_idx,
+                    scope,
+                    &[(local_child, dlm::LockMode::Exclusive)],
+                    &[],
+                )
+                .await?,
             );
         }
 

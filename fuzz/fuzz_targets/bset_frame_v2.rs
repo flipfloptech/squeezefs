@@ -30,7 +30,7 @@ const NODE_SIZE: usize = 64 * 1024;
 struct Input {
     raw: Vec<u8>,
     g_current: u32,
-    appender_current: u32,
+    appender_current: Option<u32>,
     tail_g: u32,
     tail_frame: u8,
     pr_fenced: bool,

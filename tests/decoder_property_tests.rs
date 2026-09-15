@@ -372,7 +372,7 @@ proptest! {
     fn bset_frame_v2_walk_never_panics(
         seed in prop::collection::vec(any::<u8>(), 0..2048),
         g_current in any::<u32>(),
-        appender_current in any::<u32>(),
+        appender_current in proptest::option::of(any::<u32>()),
         tail_g in any::<u32>(),
         tail_frame in 0u8..15,
         has_tail in any::<bool>(),
@@ -416,7 +416,7 @@ proptest! {
     fn bset_frame_v2_screen_matches_the_rule_function(
         frames in prop::collection::vec((0u8..4, 0u8..4), 1..8),
         g_current in 0u32..4,
-        appender_current in 0u32..4,
+        appender_current in proptest::option::of(0u32..4),
         tail_g in 0u32..4,
         tail_frame in 0u8..8,
         has_tail in any::<bool>(),

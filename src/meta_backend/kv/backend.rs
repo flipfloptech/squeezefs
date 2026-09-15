@@ -3003,12 +3003,13 @@ impl KvMetaBackend {
             return Ok(None);
         };
         // The lessee at the current generation (rule 4's input): tree 0's
-        // holder, the manager (0) for a tree it maintains unleased — the
-        // stamp the writer of that tree puts on its frames
-        // (`frame_stamp_for_slot`).
+        // holder while leased — the stamp its writer puts on its frames
+        // (`frame_stamp_for_slot`); `None` unleased, where the former
+        // lessee's frames at `g` and the manager's `(0, g)` are both
+        // legitimate.
         let (g_current, appender_current) = match plane.table.resolve(slot) {
-            crate::slot_lease_core::Resolved::Unleased { g } => (g, 0),
-            crate::slot_lease_core::Resolved::Holder { g, holder } => (g, holder),
+            crate::slot_lease_core::Resolved::Unleased { g } => (g, None),
+            crate::slot_lease_core::Resolved::Holder { g, holder } => (g, Some(holder)),
         };
         let tails = match plane.frame_tails.read_sync(&slot, |_, v| Arc::clone(v)) {
             Some(cached) if cached.0 == g_current => cached,

@@ -159,7 +159,7 @@ async fn a_predecessors_pre_handover_frames_are_never_screened() {
     // frame; the successor (g = 2) appended there.
     let screen = FrameScreen {
         g_current: 2,
-        appender_current: 2,
+        appender_current: Some(2),
         recorded_tail: Some((1, tails[1] as u32)),
         pr_fenced: false,
     };
@@ -190,7 +190,7 @@ async fn frames_past_the_recorded_tail_with_an_older_g_are_screened() {
     // the zombie's.
     let screen = FrameScreen {
         g_current: 2,
-        appender_current: 2,
+        appender_current: Some(2),
         recorded_tail: Some((1, tails[1] as u32)),
         pr_fenced: false,
     };
@@ -234,7 +234,7 @@ async fn a_non_monotone_g_in_one_log_is_screened() {
     let tails = forge_log(&vol, b2, &[(b2, 20), (a1, 21)]).await;
     let screen = FrameScreen {
         g_current: 2,
-        appender_current: 2,
+        appender_current: Some(2),
         recorded_tail: None,
         pr_fenced: false,
     };
@@ -267,7 +267,7 @@ async fn a_generation_above_the_current_one_is_a_breach_under_a_device_fence() {
     let breach0 = META_KV_APPENDER_FENCE_BREACH.load(Ordering::Relaxed);
     let non_pr = FrameScreen {
         g_current: 2,
-        appender_current: 2,
+        appender_current: Some(2),
         recorded_tail: None,
         pr_fenced: false,
     };
@@ -316,12 +316,33 @@ async fn a_current_generation_frame_from_a_foreign_appender_is_screened() {
     let breach0 = META_KV_APPENDER_FENCE_BREACH.load(Ordering::Relaxed);
     let non_pr = FrameScreen {
         g_current: 2,
-        appender_current: 2,
+        appender_current: Some(2),
         recorded_tail: None,
         pr_fenced: false,
     };
     assert_eq!(non_pr.foreign_rule(x2, 8192, Some(2)), Some(4));
     assert_eq!(non_pr.foreign_rule(b2, 8192, Some(2)), None);
+    // UNLEASED at `g` (a release keeps `g`): the former lessee's frames
+    // and the maintaining manager's are both legitimate — rule 4 is
+    // inert, both frames load (the slot-transfer matrix leg's find: a
+    // released tree read empty after its remount).
+    let unleased = FrameScreen {
+        appender_current: None,
+        ..non_pr
+    };
+    assert_eq!(unleased.foreign_rule(x2, 8192, Some(2)), None);
+    let loaded = load_node_screened(vol.path(), &v2(), ADDR, 0, Some(&unleased))
+        .await
+        .expect("load");
+    assert_eq!(
+        loaded.bset_count(),
+        2,
+        "nothing screened on an unleased slot"
+    );
+    assert_eq!(
+        META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed),
+        screened0
+    );
     let loaded = load_node_screened(vol.path(), &v2(), ADDR, 0, Some(&non_pr))
         .await
         .expect("load");
@@ -385,7 +406,7 @@ async fn a_zombie_frame_under_a_successors_frame_is_an_overwrite_refused_loud() 
     overwrite_frame(&vol, tails[0], a1, 13).await;
     let screen = FrameScreen {
         g_current: 2,
-        appender_current: 2,
+        appender_current: Some(2),
         recorded_tail: Some((1, tails[0] as u32)),
         pr_fenced: false,
     };

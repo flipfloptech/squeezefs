@@ -12038,6 +12038,13 @@ impl KvMetaBackend {
                 | ReadOnlyCause::CoWriterMount
                 | ReadOnlyCause::PeerOwnedVolume
         ) {
+            // PR 5: a token reader's clean leave RELEASES its grants at
+            // the holder (a wire call, no device write) — a departed
+            // reader whose tokens stayed would cost the holder a full
+            // recall deadline at its next commit on those objects.
+            if let Some(tokens) = self.token_reader() {
+                tokens.stop().await;
+            }
             self.shutting_down.store(true, Ordering::Release);
             self.ring.wake_parked();
             self.ckpt_wake.notify_one();

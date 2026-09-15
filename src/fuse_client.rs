@@ -9813,8 +9813,10 @@ impl SqueezefsFilesystem {
         // age the snapshot out. On a reader the horizon becomes the
         // checkpoint cadence — the interval the reader can actually prove
         // freshness over — and a write mount keeps the shipped 300 s.
+        // PR 5: under tokens the bound is 0 — the caches hold nothing
+        // across a recall (`ro_coherence::metadata_staleness_bound`).
         let daemon_cache_ttl = if read_only_mount() {
-            reader_daemon_cache_ttl(crate::ro_coherence::reader_staleness_bound())
+            reader_daemon_cache_ttl(crate::ro_coherence::metadata_staleness_bound())
         } else {
             Duration::from_secs(DAEMON_CACHE_TTL_SECS)
         };
@@ -9921,7 +9923,7 @@ impl SqueezefsFilesystem {
             // env-knob precedence law).
             kernel_ttls: if read_only_mount() {
                 KernelCacheTtls::from_env_over(KernelCacheTtls::read_only_defaults(
-                    crate::ro_coherence::reader_staleness_bound(),
+                    crate::ro_coherence::metadata_staleness_bound(),
                 ))
             } else {
                 KernelCacheTtls::from_env()
@@ -25609,6 +25611,19 @@ impl Filesystem for SqueezefsFilesystem {
                     self.dismount_once.clone(),
                     self.dismount_done.clone(),
                 );
+            }
+            // PR 5 (design-symmetric-metadata §5.7.2): a `-o ro` mount under
+            // `SQUEEZEFS_SYMMETRIC_META=1` reads every user-visible object
+            // under a TOKEN from the volume's holder — exact at the next
+            // resolve, the TTLs above derived to 0 — and the S5 poll just
+            // armed stays the control plane. Refused loud (the mount fails)
+            // when the posture's inputs are absent; `Ok(0)` under `=0`.
+            if let Err(msg) =
+                crate::ro_coherence::arm_token_readers(&routed.volumes, &self.router).await
+            {
+                error!("{msg}");
+                eprintln!("squeezefs: {msg}");
+                return Err(libc::EINVAL.into());
             }
         }
 

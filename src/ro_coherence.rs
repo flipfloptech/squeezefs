@@ -609,18 +609,147 @@ pub fn reader_staleness_bound() -> Duration {
     RevalidationPoller::derived().staleness_bound()
 }
 
-/// **The user-visible METADATA staleness bound, ms** — the number
-/// `reader_staleness_bound_ms` publishes (PR 5, design-symmetric-metadata
-/// §5.7.2 / R-SYM-4): **0** once any volume of the set is read under
-/// tokens (a foreign change is visible at the reader's NEXT resolve after
-/// the recall — exact, never bounded; the S5 poll survives as the
-/// control-plane projection and its interval keeps its own gauge), else
-/// the S5 posture's [`reader_staleness_bound`].
+/// Whether this `-o ro` mount is a READ-TOKEN client (PR 5,
+/// design-symmetric-metadata §5.7.2): the read-only latch AND
+/// `SQUEEZEFS_SYMMETRIC_META=1` — the reader's own declaration, the same
+/// knob that arms the writer's plane, read once at the open. `=0` is the
+/// S5 poller verbatim. The volume gate (bit 17) is the arm's to refuse.
+pub fn token_reader_requested() -> bool {
+    crate::fuse_client::read_only_mount()
+        && crate::meta_backend::kv::slot_lease::symmetric_meta_requested()
+}
+
+/// **The user-visible METADATA staleness bound** in force for this
+/// mount's caches (R-SYM-4): **zero** under tokens — a kernel or daemon
+/// cache may hold an entry exactly as long as freshness is proven, and
+/// under a token that is "until the recall", which no TTL can express, so
+/// every TTL derives to 0 and every resolve reaches the token cache — else
+/// the S5 posture's [`reader_staleness_bound`]. The poll keeps its own
+/// bound as the control-plane cadence.
+pub fn metadata_staleness_bound() -> Duration {
+    if token_reader_requested() {
+        Duration::ZERO
+    } else {
+        reader_staleness_bound()
+    }
+}
+
+/// [`metadata_staleness_bound`] as the stats face publishes it
+/// (`reader_staleness_bound_ms`): 0 under tokens — by the mount's request
+/// or by an armed plane on any volume (the contracts arm the plane
+/// directly) — else the S5 bound in ms.
 pub fn metadata_staleness_bound_ms(volumes: &[Arc<KvMetaBackend>]) -> u64 {
-    if volumes.iter().any(|v| v.token_reader().is_some()) {
+    if token_reader_requested() || volumes.iter().any(|v| v.token_reader().is_some()) {
         return 0;
     }
     reader_staleness_bound().as_millis() as u64
+}
+
+/// **The mount-path arm of the token client** (§5.7.2 — `-o ro` =
+/// member-reader + token client; called from `fuse_client::init` beside
+/// the S5 arms): under [`token_reader_requested`] every read-only volume
+/// of the set arms its [`crate::meta_ship::token_plane::TokenReaderPlane`]
+/// against the volume's holder with the mount's data-plane recall sink
+/// (the in-flight serve drain + the R-6 purge before every ack). Returns
+/// the number of volumes armed — `Ok(0)` under `=0`, the shipped S5 reader
+/// verbatim.
+///
+/// Refused LOUD (the mount fails), naming the remedy, when anything the
+/// posture needs is absent: a bit-17-absent volume (no holder exists to
+/// grant a token; a silent fall-back to the poll would be the second
+/// method R-SYM-4 forbids), no membership lease (the holder judges an
+/// unacked recall by the reader's lease — a leaseless reader would be
+/// treated as dead at every recall while still serving from its cache),
+/// no declared holder endpoint, no cluster secret. The holder's endpoint
+/// is the set authority's S8 listener (`SQUEEZEFS_MW_AUTHORITY`, the
+/// co-writer's declaration — a durable endpoint record and the per-slot
+/// holder → endpoint binding are PR 12's join ladder, §5.1.6); the
+/// reader's identity is its membership member id, the key the holder's
+/// lease oracle reads.
+pub async fn arm_token_readers(
+    volumes: &[Arc<KvMetaBackend>],
+    router: &crate::routing::DataRouter,
+) -> std::result::Result<usize, String> {
+    use crate::meta_ship::token_plane::{MountRecallSink, TokenClientConfig};
+    if !token_reader_requested() {
+        return Ok(0);
+    }
+    let Some(first) = volumes.first() else {
+        return Ok(0);
+    };
+    for v in volumes {
+        if !v.symmetric_forest() {
+            return Err(format!(
+                "{}: SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount, but this volume does not \
+                 carry the symmetric forest (incompat bit 17) — no holder exists to grant a \
+                 read token on it, and a reader that fell back to the bounded-staleness poll \
+                 would be the second read method design-symmetric-metadata R-SYM-4 forbids. \
+                 Convert the set offline with `squeezefs volume enable-symmetric`, or mount \
+                 with SQUEEZEFS_SYMMETRIC_META=0",
+                v.device_path().display()
+            ));
+        }
+    }
+    let Some(member) = crate::membership::installed_member() else {
+        return Err(
+            "SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount, but this reader holds no membership \
+             lease: a token client IS a member-reader (design-symmetric-metadata §5.7.2) — the \
+             holder judges an unacked recall by the reader's lease, so a leaseless reader would \
+             be treated as dead at every recall while serving from its cache. Arm \
+             SQUEEZEFS_MEMBERSHIP_BIND on the writer (and its cluster listener, \
+             SQUEEZEFS_JOB_WIRE_BIND) so this mount joins as member-reader, or mount with \
+             SQUEEZEFS_SYMMETRIC_META=0"
+                .to_string(),
+        );
+    };
+    let Some(endpoint) = crate::cowriter::declared_authority() else {
+        return Err(format!(
+            "SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount, but no holder endpoint is declared: \
+             the read tokens of every volume are served on the set authority's S8 listener \
+             (its SQUEEZEFS_MW_BIND endpoint) — set {}=addr:port on this reader",
+            crate::cowriter::MW_AUTHORITY_ENV
+        ));
+    };
+    let Some(secret) = crate::membership::cluster_secret(first).await else {
+        return Err(format!(
+            "{}: SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount, but the volume set carries no \
+             job:enroll record — the cluster wire's root of trust (possession of volume access \
+             IS cluster membership, ruling D2). Enable the writer's cluster listener \
+             (SQUEEZEFS_JOB_WIRE_BIND) so the secret exists",
+            first.device_path().display()
+        ));
+    };
+    let sink = MountRecallSink::new(router.clone());
+    let mut armed = 0usize;
+    for (ordinal, v) in volumes.iter().enumerate() {
+        if !v.is_read_only() {
+            continue;
+        }
+        let plane = v
+            .arm_token_reader(TokenClientConfig {
+                endpoint: endpoint.clone(),
+                secret: secret.clone(),
+                client_id: member.id().to_string(),
+                volume: u16::try_from(ordinal).map_err(|_| {
+                    format!(
+                        "{}: volume ordinal {ordinal} exceeds the wire's u16",
+                        v.device_path().display()
+                    )
+                })?,
+            })
+            .map_err(|e| e.to_string())?;
+        plane.install_data_sink(
+            Arc::clone(&sink) as Arc<dyn crate::meta_ship::token_plane::RecallDataSink>
+        );
+        armed += 1;
+    }
+    log::info!(
+        "-o ro mount: {armed} metadata volume(s) read under TOKENS from {endpoint} as member \
+         '{}' — user-visible metadata is exact at the next resolve (reader_staleness_bound_ms \
+         = 0); the S5 poll stays the control plane (design-symmetric-metadata §5.7.2)",
+        member.id()
+    );
+    Ok(armed)
 }
 
 /// **§6.8 item 5 — purge on revalidation.** "Where the codebase is best

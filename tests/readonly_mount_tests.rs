@@ -1233,3 +1233,166 @@ async fn a_live_reader_set_revalidates_every_meta_volume() {
         vol.shutdown().await.expect("volume shutdown");
     }
 }
+
+// ===========================================================================
+// PR 5 — the S5 reader RE-SCOPED to tokens (design-symmetric-metadata
+// §5.7.2, R-SYM-4 / KD-SYM-19): under `SQUEEZEFS_SYMMETRIC_META=1` a
+// `-o ro` mount is a member-reader + TOKEN CLIENT — user-visible metadata
+// is exact at the next resolve, so its bound reads 0 and every TTL derives
+// from that; every contract above is the `=0` posture, kept verbatim.
+// ===========================================================================
+
+/// The knobs are process-global; the token-posture contracts serialize on
+/// this (the `RoLatch` convention — one mount per daemon process).
+static TOKEN_POSTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct SymmetricKnob;
+
+impl SymmetricKnob {
+    fn on() -> Self {
+        std::env::set_var(
+            squeezefs::meta_backend::kv::slot_lease::SYMMETRIC_META_ENV,
+            "1",
+        );
+        Self
+    }
+}
+
+impl Drop for SymmetricKnob {
+    fn drop(&mut self) {
+        std::env::remove_var(squeezefs::meta_backend::kv::slot_lease::SYMMETRIC_META_ENV);
+    }
+}
+
+async fn stamped_volume() -> NamedTempFile {
+    use squeezefs::meta_backend::kv::builder::format_v3_stamped;
+    let f = NamedTempFile::new().unwrap();
+    f.as_file().set_len(VOL_LEN).unwrap();
+    let plan = squeezefs::meta_backend::plan_meta_slot_set(1).expect("derived plan");
+    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
+    let r = format_v3_stamped(f.path(), VOL_LEN, &opts(), plan.stamps[0].clone()).await;
+    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    r.expect("format the stamped volume");
+    f
+}
+
+/// Item 4 re-scoped: a TOKEN reader's user-visible metadata bound is
+/// **0** — a cache may hold an entry exactly as long as freshness is
+/// proven, and under a token that is "until the recall", which no TTL can
+/// express — so every kernel TTL class and the daemon dentry/attr horizon
+/// derive to 0 and every resolve reaches the token cache. The S5 poller's
+/// own bound is untouched (it keeps its control-plane meaning), and with
+/// the knob off the reader's TTLs are the S5 derivation verbatim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_readers_metadata_bound_is_zero_and_its_ttls_derive_from_it() {
+    let _serial = TOKEN_POSTURE.lock().await;
+    let _latch = RoLatch::arm();
+    assert!(
+        !squeezefs::ro_coherence::token_reader_requested(),
+        "a plain -o ro mount is the S5 poller (the knob is off)"
+    );
+    assert_eq!(
+        squeezefs::ro_coherence::metadata_staleness_bound(),
+        squeezefs::ro_coherence::reader_staleness_bound(),
+        "knob off: the S5 bound verbatim"
+    );
+    let _knob = SymmetricKnob::on();
+    assert!(squeezefs::ro_coherence::token_reader_requested());
+    assert_eq!(
+        squeezefs::ro_coherence::metadata_staleness_bound(),
+        Duration::ZERO,
+        "under tokens the user-visible metadata bound is exact — 0"
+    );
+    assert_ne!(
+        squeezefs::ro_coherence::reader_staleness_bound(),
+        Duration::ZERO,
+        "the S5 poll keeps its own bound as the control-plane cadence"
+    );
+    let t =
+        KernelCacheTtls::read_only_defaults(squeezefs::ro_coherence::metadata_staleness_bound());
+    assert_eq!(t.attr, Duration::ZERO);
+    assert_eq!(t.entry, Duration::ZERO);
+    assert_eq!(t.dir_entry, Duration::ZERO);
+    assert_eq!(t.negative, Duration::ZERO);
+    assert_eq!(
+        reader_daemon_cache_ttl(squeezefs::ro_coherence::metadata_staleness_bound()),
+        Duration::ZERO,
+        "the daemon dentry/attr caches hold nothing across a recall"
+    );
+    // The stats face agrees with the mount's request before any plane is
+    // armed (the two are one law, not two).
+    assert_eq!(squeezefs::ro_coherence::metadata_staleness_bound_ms(&[]), 0);
+}
+
+/// The mount-path arm under `SQUEEZEFS_SYMMETRIC_META=0` is the S5 reader
+/// EXACTLY: nothing armed, no token plane on any volume, `Ok(0)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_mount_path_token_arm_is_the_s5_reader_verbatim_when_the_knob_is_off() {
+    let _serial = TOKEN_POSTURE.lock().await;
+    let _latch = RoLatch::arm();
+    let vol = stamped_volume().await;
+    let reader = KvMetaBackend::open_read_only(vol.path())
+        .await
+        .expect("read-only mount");
+    let (router, _b) = data_router("ro_token_off").await;
+    let armed = squeezefs::ro_coherence::arm_token_readers(std::slice::from_ref(&reader), &router)
+        .await
+        .expect("the knob off arms nothing and refuses nothing");
+    assert_eq!(armed, 0);
+    assert!(reader.token_reader().is_none());
+    assert_eq!(
+        squeezefs::ro_coherence::metadata_staleness_bound_ms(std::slice::from_ref(&reader)),
+        squeezefs::ro_coherence::reader_staleness_bound().as_millis() as u64
+    );
+}
+
+/// `=1` on a bit-17-ABSENT volume refuses the READER's open too, naming
+/// the conversion verb — the writer's law (PR 4) has one reader face:
+/// there is no holder to grant a token on a flat volume, and a reader
+/// that silently fell back to the poll would be the second method
+/// R-SYM-4 forbids.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_mount_path_token_arm_refuses_loud_on_a_flat_volume() {
+    let _serial = TOKEN_POSTURE.lock().await;
+    let _latch = RoLatch::arm();
+    let vol = fresh_volume().await;
+    let reader = KvMetaBackend::open_read_only(vol.path())
+        .await
+        .expect("read-only mount");
+    let (router, _b) = data_router("ro_token_flat").await;
+    let _knob = SymmetricKnob::on();
+    let err = squeezefs::ro_coherence::arm_token_readers(std::slice::from_ref(&reader), &router)
+        .await
+        .expect_err("a flat volume cannot serve tokens");
+    assert!(
+        err.contains("enable-symmetric"),
+        "the refusal names the remedy: {err}"
+    );
+    assert!(reader.token_reader().is_none(), "nothing armed on refusal");
+}
+
+/// A token client IS a member-reader: the holder judges an unacked
+/// recall by the reader's membership lease, so a reader with no lease
+/// would be treated as dead at every recall while serving from its cache
+/// — the posture refuses loud instead, naming the plane the writer must
+/// arm. A reader with a lease and no declared holder endpoint refuses
+/// naming the endpoint knob.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_mount_path_token_arm_refuses_loud_without_a_membership_lease() {
+    let _serial = TOKEN_POSTURE.lock().await;
+    let _latch = RoLatch::arm();
+    let vol = stamped_volume().await;
+    let reader = KvMetaBackend::open_read_only(vol.path())
+        .await
+        .expect("read-only mount");
+    let (router, _b) = data_router("ro_token_lease").await;
+    let _knob = SymmetricKnob::on();
+    let err = squeezefs::ro_coherence::arm_token_readers(std::slice::from_ref(&reader), &router)
+        .await
+        .expect_err("no membership lease ⇒ no token client");
+    assert!(
+        err.contains("SQUEEZEFS_MEMBERSHIP_BIND"),
+        "the refusal names the plane the writer arms: {err}"
+    );
+    assert!(reader.token_reader().is_none(), "nothing armed on refusal");
+}

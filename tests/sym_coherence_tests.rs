@@ -1229,3 +1229,176 @@ async fn symmetric_meta_off_carries_no_token_plane() {
     assert_eq!(free_grace::recall_gated_frees(), gated0);
     assert_eq!(free_grace::timeout_deferrals(), deferred0);
 }
+
+/// A minimal data plane for the mount-path arm (its recall sink drains
+/// the router's in-flight serves and purges its block-key census).
+async fn data_router(vol_id: &str) -> (squeezefs::routing::DataRouter, tempfile::NamedTempFile) {
+    let b = tempfile::NamedTempFile::new().unwrap();
+    b.as_file().set_len(16 * 1024 * 1024).unwrap();
+    let dev = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
+        b.path().to_str().unwrap(),
+    ));
+    let ba = Arc::new(
+        squeezefs::block_allocator::BlockAllocator::new(vol_id)
+            .await
+            .unwrap(),
+    );
+    let cache = squeezefs::cache::TieredCache::new(
+        Vec::new(),
+        Some("8MB"),
+        Some("8MB"),
+        Some("8MB"),
+        Some("8MB"),
+        ba.clone(),
+        dev.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let dlm = squeezefs::dlm::DlmClient::new().unwrap();
+    (squeezefs::routing::DataRouter::new(dlm, cache, ba, dev), b)
+}
+
+fn device_digest(path: &std::path::Path) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(&std::fs::read(path).expect("read volume image"))
+}
+
+/// The image once the live writer has gone quiet: two samples one
+/// checkpoint landing ceiling apart agree (bounded) — a quiet gap
+/// between two cadence cycles is shorter than that.
+async fn settled_device_digest(path: &std::path::Path) -> u64 {
+    let started = std::time::Instant::now();
+    let mut last = device_digest(path);
+    let gap = Duration::from_millis(
+        squeezefs::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_derived() + 100,
+    );
+    loop {
+        tokio::time::sleep(gap).await;
+        let now = device_digest(path);
+        if now == last {
+            return now;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the writer never went quiet"
+        );
+        last = now;
+    }
+}
+
+/// **§5.7.2 — the `-o ro` MOUNT PATH**: with the reader latched, the knob
+/// on, a membership lease held, the holder's endpoint declared and the
+/// cluster secret on the volume, `ro_coherence::arm_token_readers` (the
+/// one call `fuse_client::init` makes) arms the token client on every
+/// read-only volume, the first resolve is served under a GRANT, the
+/// published bound reads 0 — and the reader session writes **zero bytes**
+/// to the volume (S5's Item-1 pin extended to the token posture: a grant
+/// is a wire call, never a device write).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ro_mount_under_the_knob_arms_the_token_client_and_writes_nothing() {
+    use squeezefs::membership::{
+        self, JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole, MemberSession,
+        MembershipOwner,
+    };
+    let _g = SEAM.lock().await;
+    free_grace::reset_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let holder = &writer.volumes[0];
+    let (_listener, endpoint) = holder_listener(holder);
+    // The cluster secret — the wire's root of trust — as the job wire
+    // writes it (`{"secret": hex}` on ino 1).
+    let hex: String = SECRET.iter().map(|b| format!("{b:02x}")).collect();
+    holder
+        .setxattr_internal(
+            1,
+            squeezefs::job_wire::JOB_ENROLL_XATTR,
+            format!("{{\"secret\":\"{hex}\"}}").as_bytes(),
+        )
+        .await
+        .expect("enroll record");
+    let ino = writer
+        .create(1, "seen-through-a-token", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("create")
+        .ino;
+    holder.checkpoint_now().await.expect("checkpoint");
+
+    // The membership lease: this process holds a member-reader session
+    // (the mount path's `arm_mount_membership(read_only = true)` outcome).
+    let clocks = LeaseClocks::derive(Duration::ZERO).expect("shipped clocks");
+    let clock = LeaseClock::monotonic();
+    let owner =
+        MembershipOwner::arm("owner-ro-mount", 5, 4, clocks, clock.clone()).expect("owner arms");
+    let grant = match owner.join(JoinRequest {
+        id: "ro-mount-reader".to_string(),
+        role: MemberRole::Reader,
+        endpoint: None,
+        pid: std::process::id(),
+        boot: "boot-test".to_string(),
+        prior_epoch: None,
+        pr_key: 0,
+        mount: None,
+    }) {
+        JoinOutcome::Granted(g) => g,
+        other => panic!("join must grant: {other:?}"),
+    };
+    membership::install_member(Arc::new(MemberSession::adopt(
+        "ro-mount-reader",
+        MemberRole::Reader,
+        &grant,
+        clock.now_ms(),
+        clock,
+    )));
+    squeezefs::fuse_client::set_read_only_mount(true);
+    std::env::set_var(SYMMETRIC_META_ENV, "1");
+    std::env::set_var(squeezefs::cowriter::MW_AUTHORITY_ENV, &endpoint);
+
+    // Settle the WRITER's image first: a checkpoint's tail releases the
+    // pending frees it covers AFTER its bitmap pages landed, so the next
+    // cadence cycle writes them — the writer is quiet only once two
+    // samples a cadence apart agree.
+    let before = settled_device_digest(&path).await;
+    let reader = open_routed_meta_set_read_only(&[path.display().to_string()])
+        .await
+        .expect("read-only open");
+    let (router, _b) = data_router("ro_mount_tokens").await;
+    let armed = ro_coherence::arm_token_readers(&reader.volumes, &router)
+        .await
+        .expect("the posture's inputs are all present");
+    assert_eq!(armed, 1, "every read-only volume of the set arms");
+    let plane = Arc::clone(reader.volumes[0].token_reader().expect("armed"));
+    wait_until("the recall channel completes its first round", || {
+        plane.stats().channel_fresh
+    })
+    .await;
+    assert_eq!(
+        ro_coherence::metadata_staleness_bound_ms(&reader.volumes),
+        0,
+        "user-visible metadata is exact under tokens"
+    );
+    let hit = reader
+        .lookup(1, "seen-through-a-token")
+        .await
+        .expect("the foreign create resolves");
+    assert_eq!(hit.ino, ino);
+    assert_eq!(
+        plane.stats().grants,
+        2,
+        "the first resolve is served under GRANTS — the root's dentry set, then the child's record"
+    );
+    reader.volumes[0].sync_device().await.expect("sync");
+    assert_eq!(
+        before,
+        device_digest(&path),
+        "a token reader's session must not write ONE byte to the volume"
+    );
+
+    shutdown(&reader).await;
+    membership::uninstall();
+    std::env::remove_var(squeezefs::cowriter::MW_AUTHORITY_ENV);
+    std::env::remove_var(SYMMETRIC_META_ENV);
+    squeezefs::fuse_client::set_read_only_mount(false);
+    shutdown(&writer).await;
+}

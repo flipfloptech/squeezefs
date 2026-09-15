@@ -253,16 +253,6 @@
 //!   `commit_grant_if_current` is what keeps a mid-await revoke from
 //!   minting an orphan grant (the rung-4 STOP finding, RED at commit
 //!   `ea34796c` against the pre-fix unconditional commit).
-//! - [`park_core`] (symmetric metadata PR 8, KD-SYM-15 extended — the
-//!   park gate: a symmetric appender's `T_self` action is PARK, not
-//!   poison). Invariants: a commit entering the pre-admission door
-//!   against the park being raised is EITHER admitted-in-flight (the
-//!   parker sees it, its ack is held) OR parked — never slipping through
-//!   unseen by both (the `SeqCst`-fenced Dekker pair of `try_enter` /
-//!   `park`; weakening the fences is the acked-then-lost shape); and
-//!   `release` vs `expire` racing on a standing park move the word
-//!   EXACTLY once, so a held ack is released or failed, never both and
-//!   never neither.
 //! - [`token_cache_core`] (DLM S8, spec §6.9's named obligation;
 //!   KD-MW-10): the client token cache's word protocol — invariants:
 //!   per-object generations are MONOTONE under racing/replayed owner
@@ -295,6 +285,16 @@
 //!
 //! `cargo test` here compiles the cores against std atomics and runs
 //! nothing.
+//! - [`park_core`] (symmetric metadata PR 8, KD-SYM-15 extended — the
+//!   park gate: a symmetric appender's `T_self` action is PARK, not
+//!   poison). Invariants: a commit entering the pre-admission door
+//!   against the park being raised is EITHER admitted-in-flight (the
+//!   parker sees it, its ack is held) OR parked — never slipping through
+//!   unseen by both (the `SeqCst`-fenced Dekker pair of `try_enter` /
+//!   `park`; weakening the fences is the acked-then-lost shape); and
+//!   `release` vs `expire` racing on a standing park move the word
+//!   EXACTLY once, so a held ack is released or failed, never both and
+//!   never neither.
 
 #[path = "../../src/meta_backend/kv/alloc_ext_core.rs"]
 pub mod alloc_ext_core;
@@ -7312,6 +7312,11 @@ mod shared_ref_models {
             // Conservation: the count is 1 + pin − release.
             let expect = 1 + u32::from(pinned) - 1;
             assert_eq!(refcount_core::peek(&rc), expect);
+        });
+    }
+}
+
+#[cfg(all(test, loom))]
 mod park_gate_models {
     //! [`park_core`] (symmetric metadata PR 8 — design §5.5.3, KD-SYM-15
     //! extended): the park gate's two racing edges.

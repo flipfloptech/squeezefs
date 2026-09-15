@@ -32,9 +32,9 @@ use squeezefs::cluster_wire::{
 };
 use squeezefs::layout_wire::{decode_base_layout, encode_layout, LayoutDelta, LayoutMetadata};
 use squeezefs::meta_backend::kv::appender::{
-    classify_page, newest_valid, AppenderIdentity, AppenderPage, AppenderState, DirHeader,
-    GrantRun, PageRead, SlotEntry, SlotEntryState, APPENDER_PAGE_LEN, GRANT_RUNS_MAX,
-    RING_SEGMENTS_MAX, SLOT_PAGE_BUDGET,
+    classify_page, newest_valid, page_checksum, AppenderIdentity, AppenderPage, AppenderState,
+    DirHeader, GrantRun, PageRead, SlotEntry, SlotEntryState, APPENDER_PAGE_LAYOUT_VERSION,
+    APPENDER_PAGE_LEN, GRANT_RUNS_MAX, RING_SEGMENTS_MAX, SLOT_PAGE_BUDGET,
 };
 use squeezefs::meta_backend::kv::block_map::{
     block_map_key, decode_block_map_key, decode_block_map_value, parse_kvmap_head,
@@ -703,6 +703,14 @@ proptest! {
                 prop_assert!(p.grant.len() <= GRANT_RUNS_MAX);
                 prop_assert!(p.slots.len() <= SLOT_PAGE_BUDGET);
             }
+            PageRead::ForeignLayout { version } => {
+                // A valid checksum under another layout byte: the class
+                // the four-slot reader REFUSES, never falls back past.
+                prop_assert_eq!(data.len(), APPENDER_PAGE_LEN);
+                prop_assert_eq!(data[55], version);
+                prop_assert_ne!(version, APPENDER_PAGE_LAYOUT_VERSION);
+                prop_assert!(newest_valid(&[data.as_slice()]).is_err());
+            }
             PageRead::Corrupt(_) => {}
         }
         if let Ok(h) = DirHeader::decode(&data) {
@@ -778,12 +786,30 @@ proptest! {
         older.generation = generation.wrapping_sub(1);
         let older_img = older.encode().expect("encodes");
         if generation > 0 {
-            let (i, _) = newest_valid(&[older_img.clone(), img.clone()]).expect("valid");
+            let (i, _) = newest_valid(&[older_img.clone(), img.clone()])
+                .expect("no foreign layout")
+                .expect("valid");
             prop_assert_eq!(i, 1);
             let mut torn = img.clone();
             torn[40] ^= 0xFF;
-            let (i, _) = newest_valid(&[older_img, torn]).expect("the predecessor");
+            let (i, _) = newest_valid(&[older_img.clone(), torn])
+                .expect("no foreign layout")
+                .expect("the predecessor");
             prop_assert_eq!(i, 0);
+            // A predecessor of ANOTHER layout (valid checksum) refuses
+            // the whole read — the forward-only law, never a fallback.
+            let mut foreign = img.clone();
+            foreign[55] = APPENDER_PAGE_LAYOUT_VERSION.wrapping_add(1);
+            let sum = page_checksum(&foreign);
+            foreign[16..24].copy_from_slice(&sum.to_le_bytes());
+            let foreign_read = classify_page(&foreign);
+            prop_assert_eq!(
+                foreign_read,
+                PageRead::ForeignLayout {
+                    version: APPENDER_PAGE_LAYOUT_VERSION.wrapping_add(1)
+                }
+            );
+            prop_assert!(newest_valid(&[older_img, foreign]).is_err());
         }
     }
 

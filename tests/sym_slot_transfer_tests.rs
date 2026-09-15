@@ -2649,18 +2649,26 @@ async fn the_rotor_cap_counts_the_re_adopted_rotor_after_a_crash_remount() {
     shutdown(&routed).await;
 }
 
-/// **Issue 23 (round 3): the appender page carries a LAYOUT version and
-/// the PR 2/3 layout is refused, never misread.** A page of this
-/// binary's layout decodes; the same image with the layout byte at its
-/// pre-PR-4 value (0 — the slots then sat at 306 with no `seq_offset`
-/// word) refuses with a message naming the layout law, even with a valid
-/// checksum; a `Free` page written at the leave carries the ring's
-/// offset IN FORCE, not the last checkpoint's; and a door token returned
-/// with none out leaves the count at 0.
+/// **Issue 23 (round 3) + Issue 26 (round 4): the appender page carries a
+/// LAYOUT version and a page of another layout is REFUSED — by the
+/// decoder, by the four-slot reader and by the OPEN — never read as
+/// absent.** A page of this binary's layout decodes; the same image with
+/// the layout byte at its pre-PR-4 value (0 — the slots then sat at 306
+/// with no `seq_offset` word) and a RE-STAMPED checksum classifies
+/// `ForeignLayout { 0 }` (not `Corrupt`: a torn page falls back to a
+/// predecessor, a foreign one must not), `newest_valid` over the four
+/// slots refuses with the forward-only message even beside a newer valid
+/// page, and a volume whose page 0 was written by that layout refuses to
+/// OPEN naming the reformat — the round-3 reader dropped it and tried the
+/// next slot, reading a whole region as never-joined (`manager_lease`
+/// `vacant`, no `seq_offset`, the page-only live roots gone). Also: a
+/// `Free` page written at the leave carries the ring's offset IN FORCE,
+/// and a door token returned with none out leaves the count at 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_page_layout_is_versioned_and_the_free_page_carries_the_offset_in_force() {
+async fn the_page_layout_is_versioned_and_a_foreign_layout_refuses_the_open() {
     use squeezefs::meta_backend::kv::appender::{
-        classify_page, AppenderPage, PageRead, APPENDER_PAGE_LAYOUT_VERSION,
+        classify_page, newest_valid, page_checksum, AppenderPage, PageRead,
+        APPENDER_PAGE_LAYOUT_VERSION,
     };
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
@@ -2677,30 +2685,71 @@ async fn the_page_layout_is_versioned_and_the_free_page_carries_the_offset_in_fo
     let before = read_directory(path, vol.superblock()).await.unwrap();
     let p0 = before[0].page.clone().unwrap();
     assert_eq!(p0.state, AppenderState::Live);
+    let sb = vol.superblock().clone();
     shutdown(&routed).await;
-    let after = read_directory(path, vol.superblock()).await.unwrap();
+    let after = read_directory(path, &sb).await.unwrap();
     let p0 = after[0].page.clone().unwrap();
     assert_eq!(p0.state, AppenderState::Free);
     assert_eq!(
         p0.seq_offset, offset,
         "the Free page names the offset in force"
     );
-    // The layout byte: this binary's value decodes, the pre-PR-4 value
-    // refuses loud.
+    // The layout byte: this binary's value decodes; the pre-PR-4 value
+    // with a valid checksum is its OWN class and refuses the read.
     let img = p0.encode().unwrap();
     assert_eq!(img[55], APPENDER_PAGE_LAYOUT_VERSION);
     assert!(matches!(classify_page(&img), PageRead::Valid(_)));
     let mut old = img.clone();
     old[55] = 0;
-    // Re-checksum so the layout byte — not the checksum — is what refuses.
-    let sum = squeezefs::meta_backend::kv::appender::page_checksum(&old);
+    let sum = page_checksum(&old);
     old[16..24].copy_from_slice(&sum.to_le_bytes());
     let e = AppenderPage::decode(&old).expect_err("the PR 2/3 layout refuses");
     assert!(
         e.to_string().contains("layout version 0"),
         "names the layout law: {e}"
     );
-    assert!(matches!(classify_page(&old), PageRead::Corrupt(_)));
+    assert_eq!(classify_page(&old), PageRead::ForeignLayout { version: 0 });
+    let e = newest_valid(&[img.clone(), old.clone()]).expect_err("the reader refuses");
+    assert!(
+        e.to_string().contains("forward-only") && e.to_string().contains("reformat"),
+        "{e}"
+    );
+    // The OPEN: page 0's NEWEST slot re-stamped to the foreign layout —
+    // the mount refuses naming the layout, never opens over an absent
+    // manager page.
+    let offs0 = squeezefs::meta_backend::kv::appender::appender0_page_offsets(&sb.journal);
+    let newest_slot = {
+        let mut imgs = Vec::new();
+        for off in &offs0 {
+            imgs.push(
+                squeezefs::uring_fs::read_at(path, *off, 4096)
+                    .await
+                    .unwrap(),
+            );
+        }
+        newest_valid(&imgs).unwrap().expect("page 0").0
+    };
+    let mut foreign = squeezefs::uring_fs::read_at(path, offs0[newest_slot], 4096)
+        .await
+        .unwrap()
+        .to_vec();
+    foreign[55] = 0;
+    let sum = page_checksum(&foreign);
+    foreign[16..24].copy_from_slice(&sum.to_le_bytes());
+    squeezefs::uring_fs::write_at(path, offs0[newest_slot], foreign)
+        .await
+        .unwrap();
+    Knobs::armed().apply();
+    let refused = open_routed_meta_set(&uris).await;
+    Knobs::clear();
+    let msg = match refused {
+        Ok(_) => panic!("a foreign-layout manager page must refuse the open"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("layout version 0") && msg.contains("reformat"),
+        "the open names the layout law: {msg}"
+    );
     // The door: a leave with no token out stays at 0.
     let gate = squeezefs::slot_lease_core::LeaseGate::new();
     assert_eq!(gate.leave(3), 0);

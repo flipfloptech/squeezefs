@@ -325,20 +325,22 @@ fn newest_valid_page_wins_and_a_torn_newest_falls_back_to_its_predecessor() {
         p.term = g;
         images.push(p.encode().unwrap());
     }
-    let (slot, newest) = newest_valid(&images).expect("a valid page");
+    let (slot, newest) = newest_valid(&images).unwrap().expect("a valid page");
     assert_eq!((slot, newest.generation), (3, 4));
     // Tear the newest: its predecessor wins.
     images[3][100] ^= 0xFF;
-    let (slot, newest) = newest_valid(&images).expect("a predecessor");
+    let (slot, newest) = newest_valid(&images).unwrap().expect("a predecessor");
     assert_eq!((slot, newest.generation), (2, 3));
     // Tear that too: two of slack (§5.3.2).
     images[2][100] ^= 0xFF;
-    let (slot, newest) = newest_valid(&images).expect("a second predecessor");
+    let (slot, newest) = newest_valid(&images)
+        .unwrap()
+        .expect("a second predecessor");
     assert_eq!((slot, newest.generation), (1, 2));
     // Everything torn / blank ⇒ nothing.
     images[1][100] ^= 0xFF;
     images[0] = vec![0u8; APPENDER_PAGE_LEN];
-    assert!(newest_valid(&images).is_none());
+    assert!(newest_valid(&images).unwrap().is_none());
     // Generation order, not slot order, decides.
     let mut p9 = AppenderPage::free(1, 9);
     p9.term = 9;
@@ -346,7 +348,7 @@ fn newest_valid_page_wins_and_a_torn_newest_falls_back_to_its_predecessor() {
         p9.encode().unwrap(),
         AppenderPage::free(1, 2).encode().unwrap(),
     ];
-    assert_eq!(newest_valid(&imgs).unwrap().0, 0);
+    assert_eq!(newest_valid(&imgs).unwrap().unwrap().0, 0);
 }
 
 #[test]

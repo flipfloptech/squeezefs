@@ -2023,6 +2023,63 @@ async fn a_served_insert_naming_an_unmintable_child_is_refused_and_plants_nothin
     fsck_clean(&uris).await;
 }
 
+/// A LIVE witness refusal at a shipped step compensates every applied
+/// half (review round 1, Issue 15): a `link` whose foreign insert the
+/// holder refuses gets its raised count back (no C10 leak); a `rename`
+/// whose foreign insert is refused after its source removal committed
+/// gets the source name back (no C9 orphan); each op answers `EEXIST`,
+/// the intent retires, the tree is byte-exact and fsck clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_refusal_compensates_a_links_count_and_a_renames_removed_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    let mine = routed
+        .create(ROOT_INO, "mine", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let f = routed
+        .create(mine, "f", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    // link: [SetNlink(f) @ own, InsertDentry(shared) @ holder — refused].
+    crossvol_tx::TEST_XV_SERVE_SKIP_ONCE.store(true, Ordering::SeqCst);
+    let e = routed.link(f, shared, "l").await.expect_err("refused");
+    assert_eq!(e.to_errno(), libc::EEXIST, "{e}");
+    assert_eq!(
+        routed.getattr(f).await.unwrap().nlink,
+        1,
+        "the raised count came back"
+    );
+    assert!(names_in(&routed, shared).await.is_empty());
+    // rename: [RemoveDentry(mine, f) @ own, InsertDentry(shared, g) @
+    // holder — refused, TouchCtime]: the source name returns.
+    crossvol_tx::TEST_XV_SERVE_SKIP_ONCE.store(true, Ordering::SeqCst);
+    let e = routed
+        .rename(mine, "f", shared, "g", 0)
+        .await
+        .expect_err("refused");
+    assert_eq!(e.to_errno(), libc::EEXIST, "{e}");
+    assert_eq!(
+        names_in(&routed, mine).await,
+        vec!["f".to_string()],
+        "the source name returned"
+    );
+    assert!(names_in(&routed, shared).await.is_empty());
+    assert_eq!(routed.lookup(mine, "f").await.unwrap().ino, f);
+    assert!(!crossvol_tx::TEST_XV_SERVE_SKIP_ONCE.load(Ordering::SeqCst));
+    assert_eq!(open_intents(&routed).await, 0, "both intents retired");
+    assert_closed("live refusal compensation");
+    holders.tear_down();
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
 // ---------------------------------------------------------------------------
 // The evidence note's instrument (dev box = SCOPING; `--ignored --nocapture`).
 // ---------------------------------------------------------------------------

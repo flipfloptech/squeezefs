@@ -2779,3 +2779,43 @@ fn sym_block_grant_bitmap_and_park_bound_derive_from_their_terms() {
     );
     assert!(squeezefs::membership::renewal_beat_ms() > 0);
 }
+
+/// PR 5's read-token derivations (design-symmetric-metadata §5.7; review
+/// round 1, Issue 7): the reader's token RECORDS budget is 1/256 of the
+/// R5 memory budget floored at ONE control frame (the physical minimum
+/// under which a grant page can be resident at all — no token could ever
+/// be served below it), never an entry count; the grant's dentry page
+/// budget is half the control frame cap; the token lane's recall
+/// deadline is the membership lease TTL (`SQUEEZEFS_MEMBERSHIP_LEASE_TTL_
+/// MS`, 45 s shipped) — never a measured p99 — and the recall channel's
+/// park is a quarter of it inside the S10 park's floor and one second.
+/// Drift on any of them is red here.
+#[test]
+fn sym_read_token_budget_page_and_deadline_derive_from_r5_the_frame_cap_and_the_lease() {
+    use squeezefs::cluster_wire::CONTROL_MAX_FRAME_BYTES;
+    use squeezefs::meta_ship::token_plane::grant_dentry_budget;
+    use squeezefs::meta_ship::tokens::{
+        records_budget_bytes, RecallLane, RECALL_POLL_PARK_FLOOR, RECORDS_BUDGET_DIVISOR,
+    };
+    let budget = squeezefs::mem_budget::MEM_BUDGET.budget_bytes();
+    assert_eq!(RECORDS_BUDGET_DIVISOR, 256);
+    assert_eq!(
+        records_budget_bytes(),
+        (budget / RECORDS_BUDGET_DIVISOR).max(u64::from(CONTROL_MAX_FRAME_BYTES)),
+        "the records budget is 1/256 of R5, floored at one control frame"
+    );
+    assert_eq!(
+        grant_dentry_budget(),
+        (CONTROL_MAX_FRAME_BYTES / 2) as usize,
+        "a grant page's dentries take half the frame cap"
+    );
+    let ttl = squeezefs::membership::LeaseClocks::derive(std::time::Duration::ZERO)
+        .expect("shipped clocks")
+        .t_owner;
+    assert_eq!(
+        RecallLane::live_tokens().config().deadline,
+        ttl,
+        "the token lane's recall deadline IS the membership lease TTL"
+    );
+    assert!(RECALL_POLL_PARK_FLOOR <= std::time::Duration::from_secs(1));
+}

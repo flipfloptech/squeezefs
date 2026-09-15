@@ -943,9 +943,15 @@ async fn a_recall_storm_on_one_object_is_one_batch_per_pass() {
     shutdown(&writer).await;
 }
 
-/// §5.7.3 — a reader never acks a recall with a read in flight: a serve
-/// of the recalled object held open holds the ack (and therefore the
-/// commit); dropping it releases both.
+/// §5.7.3 — a reader never acks a recall with a READ in flight: the ack
+/// waits on the OBSERVED drain of every data serve that began under the
+/// recalled records (`ro_coherence::ServeStamp` — the DMA hazard's
+/// ledger, the sink the mount installs runs it), so a serve held open
+/// holds the ack and therefore the commit; dropping it releases both.
+/// The token entry itself carries no in-flight count (review round 1,
+/// Issue 15): its records are immutable and a metadata serve that began
+/// before the recall is linearizable at its start — the ledger below is
+/// the one drain there is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reader_never_acks_a_recall_with_a_read_in_flight() {
     let _g = SEAM.lock().await;
@@ -953,15 +959,27 @@ async fn a_reader_never_acks_a_recall_with_a_read_in_flight() {
     let path = format_stamped(dir.path(), "meta0").await;
     let writer = open_armed_writer(&path).await;
     let (host, endpoint) = holder_listener(&writer.volumes[0]);
-    let (_reader, plane) = open_token_reader(&path, &endpoint, "reader-1").await;
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-1").await;
     let holder = writer.volumes[0].token_holder().unwrap().clone();
+    // The mount's sink: the observed drain of the serve ledger (no router
+    // — the purge half is the census walk the mount adds).
+    struct DrainSink;
+    impl RecallDataSink for DrainSink {
+        fn drain_and_purge<'a>(
+            &'a self,
+            _objects: &'a [u64],
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            Box::pin(ro_coherence::drain_in_flight_serves())
+        }
+    }
+    assert!(plane.install_data_sink(Arc::new(DrainSink)));
+    ro_coherence::test_arm_serve_ledger();
+    let _ = Metadata::getattr(reader.as_ref(), 1).await.unwrap();
+    assert!(plane.holds(1));
 
-    // An in-flight serve of the root (a readdir mid-stream).
-    let serve = plane
-        .serve(1, TokenWants { dentries: true })
-        .await
-        .unwrap()
-        .expect("the root exists");
+    // A data serve in flight under the current records (a read of the
+    // root's bytes mid-DMA).
+    let stamp = ro_coherence::ServeStamp::begin();
     let w = Arc::clone(&writer);
     let create = tokio::spawn(async move {
         Metadata::create(w.as_ref(), 1, "c", libc::S_IFREG | 0o644, 0, 0).await
@@ -971,13 +989,14 @@ async fn a_reader_never_acks_a_recall_with_a_read_in_flight() {
     })
     .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!plane.holds(1), "the entry left the cache at the recall");
     assert_eq!(
         plane.stats().recalls_acked,
         0,
         "no ack while a serve is in flight"
     );
-    assert!(!create.is_finished());
-    drop(serve);
+    assert!(!create.is_finished(), "the commit waits on the ack");
+    drop(stamp);
     create.await.unwrap().unwrap();
     assert_eq!(plane.stats().recalls_acked, 1);
     assert_eq!(holder.stats().recall_acks, 1);
@@ -1346,6 +1365,153 @@ async fn the_broadcast_shape_recalls_every_reader_once_per_publish() {
         );
         p.stop().await;
     }
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
+/// **A voluntary release runs the recall's drain + purge FIRST** (review
+/// round 1, Issue 4). The reader's records budget is set so the second
+/// token evicts the first: the eviction must run the installed data sink
+/// (the in-flight serve drain + the R-6 block-key purge) on the retired
+/// object BEFORE the holder is told — with the sink parked, the holder's
+/// `releases` stays put; released, the `Release` lands. Before the fix
+/// the eviction sent the release straight away and the reader's layout /
+/// block-key caches kept the released object for their horizon while the
+/// holder's next free — which recalls nobody for a released object —
+/// published directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voluntary_release_drains_and_purges_before_the_holder_is_told() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let holder = writer.volumes[0].token_holder().unwrap().clone();
+    let a = Metadata::create(writer.as_ref(), 1, "a", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let b = Metadata::create(writer.as_ref(), 1, "b", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-evict").await;
+    let sink = ProbeSink::new(false);
+    assert!(plane.install_data_sink(sink.clone()));
+    let (_v, a_local) = writer.route_ino(a);
+    let (_v, b_local) = writer.route_ino(b);
+
+    let _ = Metadata::getattr(reader.as_ref(), a).await.unwrap();
+    let held = plane.stats().cached_bytes;
+    assert!(held > 0, "the entry is charged");
+    assert!(plane.holds(a_local));
+    // A budget that holds ONE such entry: the next grant evicts `a`.
+    plane.test_set_records_budget(Some(held + held / 2));
+    sink.parked.store(true, Ordering::SeqCst);
+    let r = Arc::clone(&reader);
+    let fetch_b = tokio::spawn(async move { Metadata::getattr(r.as_ref(), b).await });
+    wait_until("the eviction entered the data sink", || {
+        sink.calls.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(
+        sink.objects.load(Ordering::SeqCst),
+        1,
+        "the retired object was purged"
+    );
+    assert!(!plane.holds(a_local), "the evicted entry left the cache");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        holder.stats().releases,
+        0,
+        "the holder is told only after the drain + purge"
+    );
+    assert_eq!(holder.holders(a_local), 1);
+    sink.release();
+    fetch_b.await.unwrap().unwrap();
+    wait_until("the release reached the holder", || {
+        holder.stats().releases == 1
+    })
+    .await;
+    assert_eq!(holder.holders(a_local), 0);
+    assert!(plane.holds(b_local));
+    assert!(
+        plane.stats().cached_bytes <= held + held / 2,
+        "the cache sits inside its budget"
+    );
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
+/// **The records budget is BYTES on the R5 component** (review round 1,
+/// Issue 7): every entry is charged its encoded records (attrs, xattrs,
+/// the dentry set) — `dlm_token_cached_bytes` is live — the cache evicts
+/// by bytes, and ONE entry larger than the whole budget is refused loud
+/// (`dlm_token_oversize_refusals`), never resident beyond it. The
+/// derivation (1/256 of the R5 budget) is tie-tested in
+/// `derivation_sweep_tests`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_token_cache_is_bounded_by_bytes_and_refuses_an_oversize_entry() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    // A directory of 200 names — its token carries them all.
+    let d = Metadata::create(writer.as_ref(), 1, "big", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    for i in 0..200 {
+        Metadata::create(
+            writer.as_ref(),
+            d,
+            &format!("entry-{i:04}"),
+            libc::S_IFREG | 0o644,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+    }
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-bytes").await;
+    let (_v, d_local) = writer.route_ino(d);
+    assert_eq!(plane.stats().cached_bytes, 0);
+    let page = Metadata::readdir(reader.as_ref(), d, 0, 1024)
+        .await
+        .unwrap();
+    assert!(page.len() >= 200, "the whole set is served");
+    let bytes = plane.stats().cached_bytes;
+    assert!(
+        bytes > 200 * 24,
+        "the directory's entry is charged its dentries: {bytes} B"
+    );
+    // Recall credits the bytes back.
+    Metadata::create(writer.as_ref(), d, "one-more", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    wait_until("the recall dropped the directory's entry", || {
+        !plane.holds(d_local)
+    })
+    .await;
+    assert_eq!(plane.stats().cached_bytes, 0, "credited at the recall");
+    // A budget below the directory's records: the grant is refused loud,
+    // nothing resident.
+    plane.test_set_records_budget(Some(bytes / 2));
+    let err = Metadata::readdir(reader.as_ref(), d, 0, 1024)
+        .await
+        .expect_err("an entry larger than the budget is never resident")
+        .to_string();
+    assert!(
+        err.contains("token records budget"),
+        "the refusal names the budget: {err}"
+    );
+    assert_eq!(plane.stats().oversize_refusals, 1);
+    assert_eq!(plane.stats().cached_bytes, 0);
+    assert!(!plane.holds(d_local));
+    plane.test_set_records_budget(None);
+    plane.stop().await;
     host.shutdown();
     shutdown(&writer).await;
 }

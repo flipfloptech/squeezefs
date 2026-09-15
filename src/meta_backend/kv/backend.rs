@@ -3065,7 +3065,10 @@ impl KvMetaBackend {
                 crate::meta_ship::token_plane::is_token_client,
             ));
             crate::free_grace::arm_recall_gate();
-            Arc::new(crate::meta_ship::token_plane::TokenHolderPlane::new())
+            let plane = Arc::new(crate::meta_ship::token_plane::TokenHolderPlane::new());
+            // The membership departure sweep reaches this holder.
+            crate::meta_ship::token_plane::register_holder(&plane);
+            plane
         });
         Arc::clone(plane)
     }

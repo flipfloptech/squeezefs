@@ -1778,6 +1778,7 @@ impl MembershipOwner {
         // old epoch alive would leave custody nobody presents.
         let _ = self.members.remove_sync(&req.id);
         let _ = self.members.insert_sync(req.id.clone(), state);
+        note_census_change();
         METRICS.membership_joins.fetch_add(1, Ordering::Relaxed);
         // A fresh member acknowledges nothing yet, so the §6.8 item-3 bound
         // must drop to 0 BEFORE it can serve a byte — publishing at the
@@ -1899,6 +1900,7 @@ impl MembershipOwner {
             // A departed reader holds nothing: its acknowledgement no
             // longer bounds the writer's reallocation (§6.8 item 3).
             self.refresh_free_grace_bound();
+            note_departure(id);
         }
         left
     }
@@ -2085,6 +2087,7 @@ impl MembershipOwner {
         // none. The cohort id is minted anyway so the two planes keep one
         // vocabulary.)
         self.refresh_free_grace_bound();
+        note_departure(id);
         Some(Eviction {
             id: id.to_string(),
             role: st.role,
@@ -2630,6 +2633,49 @@ enum Installed {
 
 static INSTALLED: once_cell::sync::Lazy<ArcSwapOption<Installed>> =
     once_cell::sync::Lazy::new(ArcSwapOption::empty);
+
+/// **The census generation** (PR 5, review round 2 Issue 22): bumped by
+/// every join, leave and eviction of any owner in the process — the word
+/// a per-free verdict over the census (the recall gate's reader-class
+/// law) caches against, so the O(members) scan runs once per census
+/// change instead of once per free.
+static CENSUS_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn note_census_change() {
+    CENSUS_GENERATION.fetch_add(1, Ordering::Release);
+}
+
+/// The census generation (monotone; 0 = no member ever joined).
+pub fn census_generation() -> u64 {
+    CENSUS_GENERATION.load(Ordering::Acquire)
+}
+
+/// A sink told the id of every member that DEPARTS the census — a clean
+/// leave or an eviction (the cadence sweep's included).
+pub type DepartureSink = Arc<dyn Fn(&str) + Send + Sync>;
+
+static DEPARTURE_SINKS: once_cell::sync::Lazy<arc_swap::ArcSwap<Vec<DepartureSink>>> =
+    once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(Vec::new()));
+
+/// Install a departure sink (PR 5, review round 2 Issue 5: the token
+/// holder sweeps a departed member's grants AT the departure — a member
+/// the owner no longer lists cannot hold a live token, and a pass parked
+/// on its recall must complete then, never at the recall deadline).
+/// Additive: sinks accumulate for the process; each departure reaches
+/// every one, off the owner's cadence task or the leave's caller.
+pub fn install_departure_sink(sink: DepartureSink) {
+    let cur = DEPARTURE_SINKS.load();
+    let mut next: Vec<DepartureSink> = (**cur).clone();
+    next.push(sink);
+    DEPARTURE_SINKS.store(Arc::new(next));
+}
+
+fn note_departure(id: &str) {
+    note_census_change();
+    for sink in DEPARTURE_SINKS.load().iter() {
+        sink(id);
+    }
+}
 
 /// Install this process's role (the stats inode reads it; the
 /// `dlm_slot::SLOT_OWNERS` precedent — lock-free, replaceable wholesale).

@@ -429,11 +429,16 @@ const RTT_PHASE_NAMES: [&str; RTT_PHASES] = ["send", "drain", "ack", "total"];
 /// writer process holds every volume of its set.
 static TOKEN_CLIENTS: once_cell::sync::Lazy<scc::HashSet<String>> =
     once_cell::sync::Lazy::new(scc::HashSet::new);
+/// Bumped when a NEW token client is noted (review round 2, Issue 22:
+/// the recall gate's reader-class verdict caches against it, beside the
+/// membership census generation).
+static TOKEN_CLIENTS_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Record `client` as a token client of this holder.
 pub fn note_token_client(client: &str) {
-    if !TOKEN_CLIENTS.contains_sync(client) {
-        let _ = TOKEN_CLIENTS.insert_sync(client.to_string());
+    if !TOKEN_CLIENTS.contains_sync(client) && TOKEN_CLIENTS.insert_sync(client.to_string()).is_ok()
+    {
+        TOKEN_CLIENTS_GENERATION.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -442,9 +447,55 @@ pub fn is_token_client(client: &str) -> bool {
     TOKEN_CLIENTS.contains_sync(client)
 }
 
+/// The token-client registry's generation (monotone).
+pub fn token_clients_generation() -> u64 {
+    TOKEN_CLIENTS_GENERATION.load(Ordering::Acquire)
+}
+
 /// Test seam: forget every token client (a fresh holder).
 pub fn test_clear_token_clients() {
     TOKEN_CLIENTS.clear_sync();
+    TOKEN_CLIENTS_GENERATION.fetch_add(1, Ordering::Release);
+}
+
+/// Every armed holder plane in the process (weak — a dropped backend
+/// drops its plane): the membership departure sink's fan-out.
+static TOKEN_HOLDER_PLANES: once_cell::sync::Lazy<
+    parking_lot::Mutex<Vec<std::sync::Weak<TokenHolderPlane>>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(Vec::new()));
+
+static DEPARTURE_SINK_INSTALLED: std::sync::Once = std::sync::Once::new();
+
+/// Register an armed holder for the departure sweep and install the
+/// membership departure sink once per process (review round 2, Issue 5):
+/// a member the owner EVICTS (its cadence sweep) or that LEAVES has its
+/// grants retired at that instant on every holder — a pass parked on its
+/// recall wakes and completes there, never at the recall deadline.
+pub fn register_holder(plane: &Arc<TokenHolderPlane>) {
+    {
+        let mut planes = TOKEN_HOLDER_PLANES.lock();
+        planes.retain(|w| w.strong_count() > 0);
+        planes.push(Arc::downgrade(plane));
+    }
+    DEPARTURE_SINK_INSTALLED.call_once(|| {
+        crate::membership::install_departure_sink(Arc::new(note_member_departed));
+    });
+}
+
+/// The membership departure sink: sweep `client`'s grants on every
+/// armed holder (a member that is not a token client holds none).
+fn note_member_departed(client: &str) {
+    if !is_token_client(client) {
+        return;
+    }
+    let planes: Vec<Arc<TokenHolderPlane>> = TOKEN_HOLDER_PLANES
+        .lock()
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect();
+    for plane in planes {
+        plane.sweep_departed(client);
+    }
 }
 
 /// The holder's side of the token plane for ONE volume.
@@ -558,11 +609,18 @@ impl TokenHolderPlane {
         }
         match crate::membership::installed_owner() {
             // A member whose lease deadline is still ahead of the owner's
-            // clock is LIVE; one past it is EXPIRED; one the owner never
-            // granted has no lease to read.
+            // clock is LIVE; one past it is EXPIRED. One the owner does
+            // NOT list: a token client was required to be a member at its
+            // arm, so a token client the owner no longer lists has LEFT or
+            // been EVICTED (the cadence sweep removes a member the moment
+            // its lease passes) — EXPIRED (review round 2, Issue 5: the
+            // `Unknown` verdict here was waited like live to the deadline);
+            // a client that never reached this holder's service has no
+            // lease to read.
             Some(owner) => match owner.lease_deadline_ms(client) {
                 Some(deadline) if owner.now_ms() < deadline => LeaseVerdict::Live,
                 Some(_) => LeaseVerdict::Expired,
+                None if is_token_client(client) => LeaseVerdict::Expired,
                 None => LeaseVerdict::Unknown,
             },
             // No membership plane: no lease to outlive — the derived bound
@@ -898,6 +956,29 @@ impl TokenHolderPlane {
         self.rtt[RTT_ACK].record(Duration::from_nanos(t_end - t_ack));
         self.rtt[RTT_TOTAL].record(Duration::from_nanos(t_end - t0));
         objects.to_vec()
+    }
+
+    /// **The departure sweep** (review round 2, Issue 5): `client` left
+    /// the membership census (a clean leave, or the owner's eviction) —
+    /// every grant it holds is retired NOW: its outstanding recalls
+    /// complete as `expired_with_lease` (a pass parked on them wakes),
+    /// every other grant is `lease_swept_grants`.
+    pub fn sweep_departed(&self, client: &str) {
+        let (pending, grants) = self.lane.retire_client(client);
+        if pending + grants == 0 {
+            return;
+        }
+        self.pending_frames.lock().remove(client);
+        self.expired_with_lease
+            .fetch_add(pending as u64, Ordering::Relaxed);
+        self.lease_swept_grants
+            .fetch_add(grants.saturating_sub(pending) as u64, Ordering::Relaxed);
+        log::info!(
+            "read tokens: reader '{client}' left the membership census — {pending} recall(s) \
+             completed as expired_with_lease and {} unrecalled grant(s) swept at the departure",
+            grants.saturating_sub(pending)
+        );
+        self.ack_wake.notify_waiters();
     }
 
     /// The pass's commit APPLIED (its records are visible in RAM) or
@@ -1342,6 +1423,8 @@ pub struct TokenReaderPlane {
     epoch: Instant,
     data_sink: std::sync::OnceLock<Arc<dyn RecallDataSink>>,
     stop: AtomicBool,
+    /// The recall channel task is running (`dlm_token_channel_alive`).
+    channel_alive: AtomicBool,
     /// Test seam: `0` = read the installed membership session, `1` =
     /// declared live, `2` = declared past `T_self`.
     lease_override: AtomicU8,
@@ -1412,6 +1495,7 @@ impl TokenReaderPlane {
             epoch: Instant::now(),
             data_sink: std::sync::OnceLock::new(),
             stop: AtomicBool::new(false),
+            channel_alive: AtomicBool::new(false),
             lease_override: AtomicU8::new(0),
             cached_bytes: AtomicU64::new(0),
             budget_override: AtomicU64::new(0),
@@ -1927,6 +2011,7 @@ impl TokenReaderPlane {
     /// `stop`. Its own session: the poll parks at the holder, and a
     /// parked call must never block a grant.
     pub async fn run_recall_channel(self: Arc<Self>) {
+        self.channel_alive.store(true, Ordering::Release);
         let mut session: Option<RpcClient> = None;
         let mut backoff = RECONNECT_BACKOFF_FLOOR;
         while !self.stop.load(Ordering::Relaxed) {
@@ -1959,7 +2044,14 @@ impl TokenReaderPlane {
                 },
             };
             let wait_ms = self.channel_park_ms.load(Ordering::Relaxed) as u32;
-            match call_on(client, &self.cfg, TokenCall::Recall { wait_ms }).await {
+            let round = call_on(client, &self.cfg, TokenCall::Recall { wait_ms }).await;
+            // Stopped while the round was parked: a KILLED reader acks
+            // nothing it was handed (the seam models a dead process; the
+            // clean leave released everything before it stopped).
+            if self.stop.load(Ordering::Relaxed) {
+                break;
+            }
+            match round {
                 Ok(TokenReply::Recall { frame_id, objects }) => {
                     self.channel_last_round_ms
                         .store(self.now_ms(), Ordering::Release);
@@ -1999,6 +2091,7 @@ impl TokenReaderPlane {
                 }
             }
         }
+        self.channel_alive.store(false, Ordering::Release);
     }
 
     /// [`Self::handle_recall`] with the ack on the channel's own session.
@@ -2041,6 +2134,14 @@ impl TokenReaderPlane {
                 "the holder answered a RecallAck with {other:?}"
             ))),
         }
+    }
+
+    /// Test seam — DEATH: the channel task exits at its next round
+    /// without acking what it was handed and nothing is released; the
+    /// holder's lease arm (the membership owner's eviction) is what
+    /// retires this reader's grants.
+    pub fn test_kill(&self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 
     /// The clean leave: RELEASE every held token at the holder (a
@@ -2088,6 +2189,7 @@ impl TokenReaderPlane {
             channel_rounds: self.channel_rounds.load(Ordering::Relaxed),
             fetch_retries: self.fetch_retries.load(Ordering::Relaxed),
             channel_fresh: self.channel_fresh(),
+            channel_alive: self.channel_alive.load(Ordering::Acquire),
             grant_sessions: self.sessions.len() as u64,
             grant_sessions_dialed: self.grant_sessions.load(Ordering::Relaxed),
         }
@@ -2130,6 +2232,8 @@ pub struct TokenReaderStats {
     pub channel_rounds: u64,
     pub fetch_retries: u64,
     pub channel_fresh: bool,
+    /// The recall channel task is running.
+    pub channel_alive: bool,
     /// The grant session pool's depth (the derivation in force).
     pub grant_sessions: u64,
     /// Sessions of the pool dialed so far.
@@ -2431,6 +2535,7 @@ pub fn reader_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
         "dlm_token_channel_rounds": per(&|s| s.channel_rounds),
         "dlm_token_fetch_retries": per(&|s| s.fetch_retries),
         "dlm_token_channel_fresh": per(&|s| u64::from(s.channel_fresh)),
+        "dlm_token_channel_alive": per(&|s| u64::from(s.channel_alive)),
         "dlm_token_grant_sessions": per(&|s| s.grant_sessions),
         "dlm_token_grant_sessions_dialed": per(&|s| s.grant_sessions_dialed),
         "dlm_token_grant_rtt_ns": serde_json::Value::Array(

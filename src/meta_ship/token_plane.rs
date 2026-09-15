@@ -388,6 +388,32 @@ const RTT_TOTAL: usize = 3;
 const RTT_PHASES: usize = 4;
 const RTT_PHASE_NAMES: [&str; RTT_PHASES] = ["send", "drain", "ack", "total"];
 
+/// The token CLIENTS this process's holder planes have served — every
+/// member id that reached a token verb. `free_grace`'s recall-gated free
+/// reads it against the membership census: a live `Reader` member NOT in
+/// this set is an S5 reader, whose freed-offset protection is the ring's
+/// epoch law (review round 1, Issue 3). Process-global because one
+/// writer process holds every volume of its set.
+static TOKEN_CLIENTS: once_cell::sync::Lazy<scc::HashSet<String>> =
+    once_cell::sync::Lazy::new(scc::HashSet::new);
+
+/// Record `client` as a token client of this holder.
+pub fn note_token_client(client: &str) {
+    if !TOKEN_CLIENTS.contains_sync(client) {
+        let _ = TOKEN_CLIENTS.insert_sync(client.to_string());
+    }
+}
+
+/// Is `client` a token client of this holder?
+pub fn is_token_client(client: &str) -> bool {
+    TOKEN_CLIENTS.contains_sync(client)
+}
+
+/// Test seam: forget every token client (a fresh holder).
+pub fn test_clear_token_clients() {
+    TOKEN_CLIENTS.clear_sync();
+}
+
 /// The holder's side of the token plane for ONE volume.
 pub struct TokenHolderPlane {
     lane: RecallLane,
@@ -989,6 +1015,10 @@ impl TokenService {
                 "this volume serves no read tokens (no armed symmetric plane)".to_string(),
             );
         };
+        // Every verb names its client: a member that reached this service
+        // is a TOKEN client — the class the recall-gated free bypasses the
+        // ring for (an S5 reader never dials it).
+        note_token_client(&frame.client);
         let reply = match &frame.call {
             TokenCall::Grant {
                 object,

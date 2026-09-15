@@ -3053,6 +3053,11 @@ impl KvMetaBackend {
         let plane = self
             .tokens_holder
             .get_or_init(|| Arc::new(crate::meta_ship::token_plane::TokenHolderPlane::new()));
+        // The gate's reader-class law: a free bypasses the ring only when
+        // every live reader of the set is a token client of this holder.
+        crate::free_grace::install_token_client_probe(Arc::new(
+            crate::meta_ship::token_plane::is_token_client,
+        ));
         crate::free_grace::arm_recall_gate();
         Arc::clone(plane)
     }

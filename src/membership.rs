@@ -1590,6 +1590,22 @@ impl MembershipOwner {
         self.clock.now_ms()
     }
 
+    /// The ids of every `Reader` member whose lease is live on this clock
+    /// — PR 5's recall-gated free reads it to tell a token client from an
+    /// S5 reader still enrolled on the set (design-symmetric-metadata
+    /// §5.7.3: the ring bypass applies only when NO S5 reader is live).
+    pub fn live_reader_ids(&self) -> Vec<String> {
+        let now = self.now_ms();
+        let mut out = Vec::new();
+        self.members.iter_sync(|id, st| {
+            if st.role == MemberRole::Reader && now < st.deadline_ms {
+                out.push(id.clone());
+            }
+            true
+        });
+        out
+    }
+
     fn grant_for(&self, epoch: u64, now: u64) -> Grant {
         Grant {
             epoch,

@@ -4083,15 +4083,32 @@ static TIMEOUT_DEFERRALS: AtomicU64 = AtomicU64::new(0);
 /// — past it its tokens are dead by the S6 law). 0 = no window open.
 static RECALL_UNACKED_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Frees that rode the ring because a LIVE `Reader` member of the set is
+/// NOT a token client — an S5 (`SQUEEZEFS_SYMMETRIC_META=0`) reader whose
+/// protection is the epoch acknowledgement (review round 1, Issue 3: the
+/// ring bypass applies only when every live reader is a token client).
+static S5_READER_DEFERRALS: AtomicU64 = AtomicU64::new(0);
+/// The source that answers "is this member id a token client of this
+/// holder?" — installed by the token plane; absent = nobody is.
+static TOKEN_CLIENT_PROBE: once_cell::sync::Lazy<ArcSwapOption<TokenClientProbe>> =
+    once_cell::sync::Lazy::new(ArcSwapOption::empty);
+
+/// "Is this member id a token client of this holder?" — the token
+/// plane's registry, installed at the holder's arm.
+pub type TokenClientProbe = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// The recall gate's verdict for one terminal free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecallGate {
     /// No token holder armed: the shipped path (the ring's own gate).
     Off,
-    /// Every recall of the freeing publish completed: publish the offset
-    /// to the free list directly.
+    /// Every recall of the freeing publish completed and every live
+    /// reader of the set is a token client: publish the offset to the
+    /// free list directly.
     Gated,
-    /// A live member's recall is unacked inside its lease: the ring.
+    /// A live member's recall is unacked inside its lease, or a live
+    /// reader is NOT a token client (its protection is the epoch
+    /// acknowledgement): the ring.
     Deferred,
 }
 
@@ -4111,9 +4128,33 @@ pub fn recall_gate_armed() -> bool {
     RECALL_GATE.load(Ordering::Relaxed)
 }
 
+/// Install the token-client probe (the token holder's arm).
+pub fn install_token_client_probe(probe: TokenClientProbe) {
+    TOKEN_CLIENT_PROBE.store(Some(Arc::new(probe)));
+}
+
+/// Is a LIVE `Reader` member of the set enrolled that is NOT a token
+/// client? Such a reader's freed-offset protection is the epoch
+/// acknowledgement — the ring must hold the free for it. With no
+/// membership plane no reader is a member, and an S5 reader without a
+/// plane has no protection under S5 either; the answer is `false`.
+fn s5_reader_enrolled() -> bool {
+    let Some(owner) = crate::membership::installed_owner() else {
+        return false;
+    };
+    let probe = TOKEN_CLIENT_PROBE.load();
+    owner.live_reader_ids().iter().any(|id| {
+        !probe
+            .as_deref()
+            .is_some_and(|is_token_client| is_token_client(id))
+    })
+}
+
 /// **The verdict** (`BlockAllocator::finish_free`'s first gate): one
-/// relaxed load unarmed; armed, the ring only while a live-timeout window
-/// is open. Counts its own engagement.
+/// relaxed load unarmed; armed, the ring while a live-timeout window is
+/// open OR while a live reader that is not a token client is enrolled
+/// (its protection is the ring's epoch law); `Gated` otherwise. Counts
+/// its own engagement per class.
 pub fn recall_gate_verdict() -> RecallGate {
     if !RECALL_GATE.load(Ordering::Relaxed) {
         return RecallGate::Off;
@@ -4126,8 +4167,17 @@ pub fn recall_gate_verdict() -> RecallGate {
     if until != 0 {
         RECALL_UNACKED_UNTIL_MS.store(0, Ordering::Relaxed);
     }
+    if s5_reader_enrolled() {
+        S5_READER_DEFERRALS.fetch_add(1, Ordering::Relaxed);
+        return RecallGate::Deferred;
+    }
     RECALL_GATED_FREES.fetch_add(1, Ordering::Relaxed);
     RecallGate::Gated
+}
+
+/// `free_grace_s5_reader_deferrals`.
+pub fn s5_reader_deferrals() -> u64 {
+    S5_READER_DEFERRALS.load(Ordering::Relaxed)
 }
 
 /// A recall of a LIVE member went unacked past the bound (the token
@@ -4169,4 +4219,5 @@ fn reset_recall_gate_for_test() {
     RECALL_UNACKED_UNTIL_MS.store(0, Ordering::Relaxed);
     RECALL_GATED_FREES.store(0, Ordering::Relaxed);
     TIMEOUT_DEFERRALS.store(0, Ordering::Relaxed);
+    S5_READER_DEFERRALS.store(0, Ordering::Relaxed);
 }

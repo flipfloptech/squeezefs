@@ -1476,6 +1476,227 @@ async fn arming_a_populated_volume_seeds_the_bitmap_and_never_regrants_a_live_bl
     reset_process_state();
 }
 
+/// Review round 3, Issue 27 — the seed's truth on a FOREST populated
+/// through the ROUTED layer: the pre-arm era publishes striped layouts
+/// whose references live in the slot trees (PR 7's forest keying); the
+/// remount seeds the allocator the way the mount path does (the ONE
+/// by-block scan — `block_ref_scan`'s union over the set, PR 7's law 2
+/// kept it as the free list's derivation); the first hold is seeded from
+/// that state ∪ the durable ledger, every referenced block reads SET and
+/// no armed mint lands on one. And the structural guard: an UN-SEEDED
+/// allocator (cursor 0) on a set whose ledger names blocks of the volume
+/// REFUSES the arm loud — never an all-clear bitmap over live data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn arming_a_populated_forest_set_seeds_from_the_refs_union_and_refuses_an_unseeded_allocator()
+{
+    use squeezefs::layout_wire::LayoutMetadata;
+    use squeezefs::meta_backend::kv::block_refs::{BlockRef, BlockRefOp};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set(dir.path(), 2).await;
+    // The pre-arm era: an UNARMED routed set, blocks minted by the shipped
+    // loop and published as striped layouts with their durable references.
+    let mut referenced = std::collections::BTreeSet::new();
+    {
+        let routed = open_unarmed(&uris).await;
+        let a0 = data_allocator(DATA_ID).await;
+        for i in 0..6 {
+            let ino = routed
+                .create(ROOT_INO, &format!("f{i}"), libc::S_IFREG | 0o644, 0, 0)
+                .await
+                .unwrap()
+                .ino;
+            let offset = a0.allocate_block().await.unwrap();
+            a0.publish_block(offset);
+            let block_idx = offset / a0.chunk_size();
+            let len = 64 * 1024u64;
+            let layout = LayoutMetadata {
+                file_type: "staged".into(),
+                size: len,
+                file_id: Some(format!("tenant-{i}")),
+                block_map: Some(std::collections::HashMap::from([(
+                    0u32,
+                    format!("{offset}:0:{len}"),
+                )])),
+                ..Default::default()
+            };
+            routed
+                .set_layout_and_size(
+                    ino,
+                    &bincode::serialize(&layout).unwrap(),
+                    len,
+                    &[BlockRefOp::taken(BlockRef {
+                        vol_tag: DATA_TAG,
+                        block_idx,
+                        owner_ino: ino,
+                        block_index: 0,
+                    })],
+                )
+                .await
+                .unwrap();
+            referenced.insert(block_idx);
+        }
+        shutdown(&routed).await;
+    }
+    assert_eq!(referenced.len(), 6);
+    let routed = open_armed(&uris).await;
+    // (a) The guard: a fresh, UN-SEEDED allocator on this populated set.
+    let unseeded = data_allocator(DATA_ID).await;
+    match alloc_lease::arm_symmetric_allocation(&routed, &[Arc::clone(&unseeded)]).await {
+        Err(e) => assert!(e.to_string().contains("UN-SEEDED"), "{e}"),
+        Ok(n) => panic!("an un-seeded allocator seeded an all-clear bitmap ({n} held)"),
+    }
+    assert!(alloc_lease::holding(DATA_TAG).is_none());
+    // (b) The mount path's seed: the ONE by-block scan's union over the
+    // set's volumes (every slot tree on a forest), then the arm.
+    let a1 = data_allocator(DATA_ID).await;
+    let mut indices = Vec::new();
+    for kv in &routed.volumes {
+        for r in kv.block_ref_scan(DATA_TAG).await.unwrap() {
+            indices.push(r.block_idx);
+        }
+    }
+    assert_eq!(
+        indices
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        referenced,
+        "the forest's slot trees carry every reference"
+    );
+    assert_eq!(a1.seed_from_durable_refs(&indices).await, 6);
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&routed, &[Arc::clone(&a1)])
+            .await
+            .unwrap(),
+        1
+    );
+    let holding = alloc_lease::holding(DATA_TAG).expect("held");
+    assert_eq!(holding.bitmap.population(), 6);
+    for b in &referenced {
+        assert!(
+            holding.bitmap.is_set(*b),
+            "referenced block {b} reads CLEAR"
+        );
+    }
+    let mut minted = std::collections::BTreeSet::new();
+    for _ in 0..8 {
+        minted.insert(a1.allocate_block().await.unwrap() / a1.chunk_size());
+    }
+    assert!(
+        minted.is_disjoint(&referenced),
+        "{minted:?} ∩ {referenced:?}"
+    );
+    assert_eq!(DATA_ALLOC_BITMAP_DRIFT.load(Ordering::Relaxed), 0);
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
+/// Review round 3, Issue 28 — the free-grace valve's supply terms on a
+/// GRANT-ARMED allocator read the window's remainder plus (on the holder)
+/// the bitmap's clear population — never the drained flat list and the
+/// virgin tail, which at a FULL cursor read 0 and would make the valve
+/// prod, tighten and fence readers for a writer that is not short of
+/// space.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_armed_holders_supply_terms_read_the_window_and_the_clear_population() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set(dir.path(), 1).await;
+    let routed = open_armed(&uris).await;
+    let a = data_allocator(DATA_ID).await;
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&routed, &[Arc::clone(&a)])
+            .await
+            .unwrap(),
+        1
+    );
+    let holding = alloc_lease::holding(DATA_TAG).expect("held");
+    let prods = squeezefs::free_grace::prods();
+    let tightenings = squeezefs::free_grace::bound_tightenings();
+    let fences = squeezefs::free_grace::laggard_fences();
+    // Mint the whole volume through grants: the cursor reaches capacity,
+    // the virgin tail is 0, the flat list is empty.
+    let mut minted = Vec::with_capacity(DATA_BLOCKS as usize);
+    for _ in 0..DATA_BLOCKS {
+        minted.push(a.allocate_block().await.unwrap());
+    }
+    assert_eq!(a.highest_block_index(), DATA_BLOCKS);
+    assert_eq!(a.free_blocks_count(), 0);
+    assert_eq!(holding.bitmap.population(), DATA_BLOCKS);
+    assert_eq!(a.free_supply_blocks(), 0, "genuinely full");
+    assert_eq!(a.lane_reachable_blocks(), 0);
+    // 100 terminal frees: the bits clear at the holder — that IS the
+    // supply, though the flat list stays empty and the tail stays 0.
+    for off in &minted[..100] {
+        assert!(a.begin_free(*off));
+        a.finish_free(*off);
+    }
+    assert_eq!(a.free_blocks_count(), 0);
+    assert_eq!(
+        a.free_supply_blocks(),
+        100,
+        "the clear population is the supply"
+    );
+    assert_eq!(a.lane_reachable_blocks(), 100);
+    // One mint carves a grant into the holes: supply = the window's
+    // remainder + the clear population, exactly one block fewer.
+    let _ = a.allocate_block().await.unwrap();
+    let clear = DATA_BLOCKS - holding.bitmap.population();
+    assert_eq!(a.free_supply_blocks(), a.block_grant_remaining() + clear);
+    assert_eq!(a.free_supply_blocks(), 99);
+    assert!(
+        a.block_grant_remaining() > 0,
+        "a half-consumed grant is supply"
+    );
+    // No reader plane is armed here, so the valve's rungs are trivially
+    // flat — pinned so a future arm cannot make an armed holder's full
+    // cursor read as a trough.
+    assert_eq!(squeezefs::free_grace::prods(), prods);
+    assert_eq!(squeezefs::free_grace::bound_tightenings(), tightenings);
+    assert_eq!(squeezefs::free_grace::laggard_fences(), fences);
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
+/// The rebase seam onto PR 7 (round 4): the shared-block index's HOME is
+/// resolved behind ONE function, and PR 8 re-points it to the data
+/// volume's allocation-lease holder's home volume — a held volume's index
+/// home is the holder's `home_vol` (the slot-0 volume this mount is homed
+/// on), an unheld volume's is PR 7's default (volume 0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_shared_index_home_follows_the_allocation_holder() {
+    use squeezefs::meta_backend::kv::shared_refs::{index_home_volume, index_home_volume_for};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set(dir.path(), 2).await;
+    let routed = open_armed(&uris).await;
+    assert_eq!(
+        index_home_volume_for(DATA_TAG),
+        index_home_volume(),
+        "unheld: PR 7's default"
+    );
+    let a = data_allocator(DATA_ID).await;
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&routed, &[Arc::clone(&a)])
+            .await
+            .unwrap(),
+        1
+    );
+    let holding = alloc_lease::holding(DATA_TAG).expect("held");
+    assert_eq!(
+        index_home_volume_for(DATA_TAG),
+        usize::from(holding.home_vol)
+    );
+    assert_eq!(index_home_volume_for(DATA_TAG), slot0_of(&routed));
+    assert_eq!(index_home_volume_for(DATA_TAG + 99), index_home_volume());
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
 /// Review round 2, Issue 24 — the parked-leave refusal is SET-WIDE: on a
 /// 2-volume set every volume's `shutdown()` refuses (the latch outlives
 /// the gate word `close_at_leave` clears), so every page stays `Live` and

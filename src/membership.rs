@@ -1583,6 +1583,13 @@ impl MembershipOwner {
         &self.clocks
     }
 
+    /// The owner clock's current reading (the frame
+    /// [`Self::lease_deadline_ms`] is in) — PR 5's token holder reads it
+    /// to classify an unacked recall as expired-with-lease or live.
+    pub fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
+
     fn grant_for(&self, epoch: u64, now: u64) -> Grant {
         Grant {
             epoch,

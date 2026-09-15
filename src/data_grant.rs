@@ -2822,6 +2822,19 @@ impl AsyncVerbRouter {
             service,
         )
     }
+
+    /// Claim the **read-token verb block** (`0x0600`, design-symmetric-
+    /// metadata §5.7 — PR 5) for `service`: an armed symmetric writer
+    /// serves grants, the readers' standing recall channels, acks and
+    /// releases on this SAME listener, dispatched by the frame's volume
+    /// ordinal.
+    pub fn with_tokens(self, service: Arc<crate::meta_ship::token_plane::TokenSetService>) -> Self {
+        self.with(
+            crate::meta_ship::token_plane::VERB_TOKEN_BASE,
+            crate::meta_ship::token_plane::VERB_TOKEN_LAST,
+            service,
+        )
+    }
 }
 
 impl RpcAsyncService for AsyncVerbRouter {

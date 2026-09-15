@@ -4044,4 +4044,127 @@ pub fn reset_for_test() {
     RUNWAY_MS.store(u64::MAX, Ordering::Relaxed);
     LADDER.reset();
     test_set_ack_pipeline(None);
+    reset_recall_gate_for_test();
+}
+
+// ---------------------------------------------------------------------------
+// PR 5 — the RECALL-GATING arm (design-symmetric-metadata §5.7.3, KD-SYM-10)
+// ---------------------------------------------------------------------------
+//
+// Under GPFS-strict tokens the freeing publish RECALLS the file's token
+// BEFORE it commits, and a reader acks only after its in-flight reads on
+// the ino drain and its block-key census is purged — so at the instant a
+// terminal free runs, no live reader holds the old layout or a byte of
+// the block: the recall IS the qualification, and the free may publish to
+// the free list directly (`free_grace_recall_gated_frees`). The grace
+// RING survives as the TIMEOUT path: while a LIVE member's recall is
+// unacked past the bound (the must-stay-0 `dlm_token_recall_timeouts_
+// live` class), frees ride the ring exactly as before (`free_grace_
+// timeout_deferrals`), released by the ring's own law — the epoch-ack
+// bound the membership plane still composes, and the fence that evicts
+// the non-acker at `T_owner`. The epoch fan-in itself stays LIVE code:
+// it is the flat / unarmed posture's mechanism until the PR-14 flip, and
+// the ring's release law under the token plane — its retirement as the
+// QUALIFICATION is this arm; its deletion is the flip's.
+//
+// One relaxed load on every mount without an armed token holder.
+
+/// Set while THIS writer's read-token plane is armed (a holder recalls
+/// before every conflicting commit).
+static RECALL_GATE: AtomicBool = AtomicBool::new(false);
+/// Frees that bypassed the ring because every reader's recall was acked
+/// (or expired with its lease) before the freeing publish committed.
+static RECALL_GATED_FREES: AtomicU64 = AtomicU64::new(0);
+/// Frees parked on the ring because a LIVE member's recall was unacked
+/// past the bound — the ring's surviving role.
+static TIMEOUT_DEFERRALS: AtomicU64 = AtomicU64::new(0);
+/// Owner-clock instant (ms) until which the ring is the free path: the
+/// last live-timeout's instant + `T_owner` (the non-acker's lease expiry
+/// — past it its tokens are dead by the S6 law). 0 = no window open.
+static RECALL_UNACKED_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// The recall gate's verdict for one terminal free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecallGate {
+    /// No token holder armed: the shipped path (the ring's own gate).
+    Off,
+    /// Every recall of the freeing publish completed: publish the offset
+    /// to the free list directly.
+    Gated,
+    /// A live member's recall is unacked inside its lease: the ring.
+    Deferred,
+}
+
+/// Arm the recall gate (the token holder's arm on a writer).
+pub fn arm_recall_gate() {
+    RECALL_GATE.store(true, Ordering::Release);
+}
+
+/// Disarm (the leave / a test's teardown).
+pub fn disarm_recall_gate() {
+    RECALL_GATE.store(false, Ordering::Release);
+    RECALL_UNACKED_UNTIL_MS.store(0, Ordering::Relaxed);
+}
+
+/// Is the recall gate armed?
+pub fn recall_gate_armed() -> bool {
+    RECALL_GATE.load(Ordering::Relaxed)
+}
+
+/// **The verdict** (`BlockAllocator::finish_free`'s first gate): one
+/// relaxed load unarmed; armed, the ring only while a live-timeout window
+/// is open. Counts its own engagement.
+pub fn recall_gate_verdict() -> RecallGate {
+    if !RECALL_GATE.load(Ordering::Relaxed) {
+        return RecallGate::Off;
+    }
+    let until = RECALL_UNACKED_UNTIL_MS.load(Ordering::Relaxed);
+    if until != 0 && owner_now_ms().is_some_and(|now| now < until) {
+        TIMEOUT_DEFERRALS.fetch_add(1, Ordering::Relaxed);
+        return RecallGate::Deferred;
+    }
+    if until != 0 {
+        RECALL_UNACKED_UNTIL_MS.store(0, Ordering::Relaxed);
+    }
+    RECALL_GATED_FREES.fetch_add(1, Ordering::Relaxed);
+    RecallGate::Gated
+}
+
+/// A recall of a LIVE member went unacked past the bound (the token
+/// holder's `timeouts_live` arm): frees ride the ring until that member's
+/// lease can have expired — `now + T_owner` on the owner's clock (the
+/// installed plane's; with no plane there is no lease to expire and the
+/// ring cannot hold, so the window is the bound itself, already spent).
+pub fn note_recall_unacked_live() {
+    let Some(now) = owner_now_ms() else {
+        return;
+    };
+    let t_owner = crate::membership::installed_owner()
+        .map(|o| o.clocks().t_owner.as_millis() as u64)
+        .unwrap_or(0);
+    RECALL_UNACKED_UNTIL_MS.fetch_max(now.saturating_add(t_owner), Ordering::Relaxed);
+}
+
+/// `free_grace_recall_gated_frees`.
+pub fn recall_gated_frees() -> u64 {
+    RECALL_GATED_FREES.load(Ordering::Relaxed)
+}
+
+/// `free_grace_timeout_deferrals`.
+pub fn timeout_deferrals() -> u64 {
+    TIMEOUT_DEFERRALS.load(Ordering::Relaxed)
+}
+
+/// Test seam: open the live-timeout window for `ms` on the owner clock
+/// (what a live-timeout would open), so the ring arm is pinnable
+/// without a stuck reader.
+pub fn test_open_recall_window_ms(ms: u64) {
+    if let Some(now) = owner_now_ms() {
+        RECALL_UNACKED_UNTIL_MS.store(now.saturating_add(ms), Ordering::Relaxed);
+    }
+}
+
+fn reset_recall_gate_for_test() {
+    RECALL_GATE.store(false, Ordering::Relaxed);
+    RECALL_UNACKED_UNTIL_MS.store(0, Ordering::Relaxed);
 }

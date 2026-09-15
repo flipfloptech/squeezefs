@@ -424,3 +424,808 @@ async fn frame_v1_stays_byte_identical_and_the_two_versions_are_foreign_to_each_
         assert_eq!(foreign.tail_offset(), NODE_PAGE);
     }
 }
+
+// ===========================================================================
+// Part B — tokens (§5.7): the in-process fixture is a stamped volume opened
+// by a WRITER under `SQUEEZEFS_SYMMETRIC_META=1` (the manager, the holder),
+// its `TokenService` on an RPC listener, and a READER opened read-only on
+// the same file with its token client armed against that listener — the
+// shape `readonly_mount_tests` uses for the S5 reader with the token plane
+// on top. N daemon processes on one volume is PR 12's join ladder.
+// ===========================================================================
+
+use squeezefs::cluster_wire as cw;
+use squeezefs::meta_backend::kv::backend::{
+    test_conveyor_hold_release, KvMetaBackend, TEST_CONVEYOR_HOLD_PRE_DRAIN,
+    TEST_CONVEYOR_HOLD_STAGE,
+};
+use squeezefs::meta_backend::kv::builder::{format_v3_stamped, FormatV3Options};
+use squeezefs::meta_backend::kv::slot_lease::SYMMETRIC_META_ENV;
+use squeezefs::meta_backend::{
+    open_routed_meta_set, open_routed_meta_set_read_only, plan_meta_slot_set, Metadata,
+    RoutedMetaBackend,
+};
+use squeezefs::meta_ship::token_plane::{
+    LeaseVerdict, RecallDataSink, TokenClientConfig, TokenReaderPlane, TokenService, TokenWants,
+};
+use squeezefs::{free_grace, ro_coherence};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
+use std::time::Duration;
+
+const VOL_LEN: u64 = 64 * 1024 * 1024;
+const RING_LEN: u64 = 1024 * 1024;
+const SECRET: &[u8] = b"sym-coherence-tests-enroll-secret";
+
+/// The knobs are process-global; every token contract serializes on it.
+static SEAM: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn set_opts() -> FormatV3Options {
+    FormatV3Options {
+        node_size: NODE_SIZE,
+        journal_len_override: Some(RING_LEN),
+        force: true,
+        full_wipe: false,
+        format_config_xattr: None,
+    }
+}
+
+async fn format_stamped(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let p = dir.join(name);
+    std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+    let plan = plan_meta_slot_set(1).expect("derived plan");
+    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
+    let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
+    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    r.expect("format stamped volume");
+    p
+}
+
+/// Open the writer ARMED (`SQUEEZEFS_SYMMETRIC_META=1` on the stamped
+/// volume; the knobs cleared after — a mount reads them once) — the
+/// ROUTED set, the mount's own shape (global inos, the mint policy).
+async fn open_armed_writer(path: &std::path::Path) -> Arc<RoutedMetaBackend> {
+    std::env::set_var(SYMMETRIC_META_ENV, "1");
+    std::env::set_var("SQUEEZEFS_SYM_ALLOW_NON_PR", "1");
+    let r = open_routed_meta_set(&[path.display().to_string()]).await;
+    std::env::remove_var(SYMMETRIC_META_ENV);
+    std::env::remove_var("SQUEEZEFS_SYM_ALLOW_NON_PR");
+    let w = r.expect("armed writer open");
+    assert!(
+        w.volumes[0].slot_lease_armed(),
+        "the plane must arm on the stamped volume"
+    );
+    assert!(
+        w.volumes[0].token_holder().is_some(),
+        "an armed writer is a token holder"
+    );
+    w
+}
+
+async fn shutdown(routed: &RoutedMetaBackend) {
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+fn listener_cfg() -> cw::RpcListenerConfig {
+    cw::RpcListenerConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("literal addr"),
+        service_threads: 2,
+        ..cw::RpcListenerConfig::default()
+    }
+}
+
+/// The holder's token service on its own listener.
+fn holder_listener(vol: &Arc<KvMetaBackend>) -> (Arc<cw::RpcListener>, String) {
+    let host = cw::RpcListener::start_async(
+        listener_cfg(),
+        SECRET.to_vec(),
+        TokenService::new(Arc::clone(vol)),
+    )
+    .expect("token listener");
+    let endpoint = host.endpoint().to_string();
+    (host, endpoint)
+}
+
+/// A reader opened read-only on the volume with its token client armed
+/// against `endpoint`, its recall channel FRESH before it returns.
+async fn open_token_reader(
+    path: &std::path::Path,
+    endpoint: &str,
+    client_id: &str,
+) -> (Arc<RoutedMetaBackend>, Arc<TokenReaderPlane>) {
+    let reader = open_routed_meta_set_read_only(&[path.display().to_string()])
+        .await
+        .expect("read-only open");
+    let plane = reader.volumes[0]
+        .arm_token_reader(TokenClientConfig {
+            endpoint: endpoint.to_string(),
+            secret: SECRET.to_vec(),
+            client_id: client_id.to_string(),
+            volume: 0,
+        })
+        .expect("token client arms on a read-only open");
+    wait_until("the recall channel completes its first round", || {
+        plane.stats().channel_fresh
+    })
+    .await;
+    (reader, plane)
+}
+
+async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+    let started = std::time::Instant::now();
+    while !cond() {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "timed out waiting for: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A `RecallDataSink` the contracts park: the ack cannot travel while it
+/// is held, and every call is counted.
+struct ProbeSink {
+    parked: std::sync::atomic::AtomicBool,
+    release: squeezefs_ipc::sqz_notify::Notify,
+    calls: AtomicU64,
+    objects: AtomicU64,
+}
+
+impl ProbeSink {
+    fn new(parked: bool) -> Arc<Self> {
+        Arc::new(Self {
+            parked: std::sync::atomic::AtomicBool::new(parked),
+            release: squeezefs_ipc::sqz_notify::Notify::new(),
+            calls: AtomicU64::new(0),
+            objects: AtomicU64::new(0),
+        })
+    }
+    fn release(&self) {
+        self.parked.store(false, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
+impl RecallDataSink for ProbeSink {
+    fn drain_and_purge<'a>(
+        &'a self,
+        objects: &'a [u64],
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.objects
+                .fetch_add(objects.len() as u64, Ordering::SeqCst);
+            loop {
+                let notified = self.release.notified();
+                if !self.parked.load(Ordering::SeqCst) {
+                    break;
+                }
+                notified.await;
+            }
+        })
+    }
+}
+
+/// Gate 5 / R-SYM-4: a foreign create is visible at the reader's NEXT
+/// resolve — exact, never bounded, no poll between — because the holder
+/// recalled the directory's token before the create committed and the
+/// reader's next lookup re-fetched the dentry set; a foreign setattr the
+/// same way through the file's own token. `reader_staleness_bound_ms`
+/// reads 0 for metadata.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_foreign_create_is_visible_at_the_readers_next_resolve() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let pre = Metadata::create(writer.as_ref(), 1, "pre", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-1").await;
+    let holder = writer.volumes[0].token_holder().unwrap().clone();
+
+    // First touch: the root's token (dentries) + the child's — two grants,
+    // then a RAM hit, then an exact negative.
+    let got = Metadata::lookup(reader.as_ref(), 1, "pre").await.unwrap();
+    assert_eq!(got.ino, pre.ino);
+    assert_eq!(plane.stats().grants, 2, "root (dentries) + child");
+    let _ = Metadata::getattr(reader.as_ref(), pre.ino).await.unwrap();
+    assert_eq!(
+        plane.stats().grants,
+        2,
+        "the second read of the child is a hit"
+    );
+    assert!(plane.stats().hits >= 1);
+    let missing = Metadata::lookup(reader.as_ref(), 1, "a").await;
+    assert!(
+        missing.is_err(),
+        "an exact negative from the token's dentry set"
+    );
+    assert_eq!(holder.outstanding(), 2);
+
+    // The foreign create: the commit recalls the root's token and waits
+    // for the reader's ack; when `create` returns the reader's very next
+    // resolve sees it.
+    let recalls0 = holder.stats().recalls;
+    let a = Metadata::create(writer.as_ref(), 1, "a", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    let hs = holder.stats();
+    assert!(
+        hs.recalls > recalls0,
+        "the create recalled the directory's token"
+    );
+    assert_eq!(hs.recall_acks, hs.recalls, "every recall was acked");
+    assert_eq!(hs.expired_with_lease, 0);
+    assert_eq!(hs.timeouts_live, 0);
+    let seen = Metadata::lookup(reader.as_ref(), 1, "a").await.unwrap();
+    assert_eq!(
+        seen.ino, a.ino,
+        "visible at the NEXT resolve — no poll in between"
+    );
+    let rs = plane.stats();
+    assert_eq!(rs.recalls_received, rs.recalls_acked);
+
+    // A foreign setattr: the file's own token is recalled.
+    Metadata::setattr(
+        writer.as_ref(),
+        a.ino,
+        Some(0o600),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let after = Metadata::getattr(reader.as_ref(), a.ino).await.unwrap();
+    assert_eq!(
+        after.mode & 0o777,
+        0o600,
+        "the setattr is exact at the next getattr"
+    );
+
+    // A foreign unlink: the directory's token again, and the file's
+    // (the record survives at nlink 0 until its destroy — POSIX's
+    // unlinked-but-open shape — and the token says so exactly).
+    Metadata::unlink(writer.as_ref(), 1, "pre").await.unwrap();
+    assert!(Metadata::lookup(reader.as_ref(), 1, "pre").await.is_err());
+    assert_eq!(
+        Metadata::getattr(reader.as_ref(), pre.ino)
+            .await
+            .unwrap()
+            .nlink,
+        0,
+        "the unlinked inode's token is recalled and re-granted at nlink 0"
+    );
+    Metadata::destroy_inode(writer.as_ref(), pre.ino)
+        .await
+        .unwrap();
+    assert!(
+        Metadata::getattr(reader.as_ref(), pre.ino).await.is_err(),
+        "a destroyed object's grant answers Gone"
+    );
+
+    assert_eq!(
+        ro_coherence::metadata_staleness_bound_ms(&reader.volumes),
+        0,
+        "reader_staleness_bound_ms is 0 for metadata under tokens"
+    );
+    assert!(
+        ro_coherence::reader_staleness_bound().as_millis() > 0,
+        "the S5 control-plane bound keeps its own number"
+    );
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
+/// §5.7.1 — the recall rides the commit: a commit that mutates a token's
+/// object cannot be observed (its `create` cannot return) before the
+/// reader has acked; the reader's cached records are gone before the ack
+/// and the mount's data drain + purge sink runs BEFORE it (the sink held
+/// parked holds the commit).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_is_recalled_before_the_conflicting_commit_lands() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-1").await;
+    let sink = ProbeSink::new(true);
+    assert!(plane.install_data_sink(sink.clone()));
+    let holder = writer.volumes[0].token_holder().unwrap().clone();
+
+    assert!(Metadata::lookup(reader.as_ref(), 1, "b").await.is_err());
+    assert!(plane.holds(1), "the root's token is cached");
+
+    let w = Arc::clone(&writer);
+    let create = tokio::spawn(async move {
+        Metadata::create(w.as_ref(), 1, "b", libc::S_IFREG | 0o644, 0, 0).await
+    });
+    // The recall reached the reader: its entry is gone and the sink is
+    // parked — the commit is NOT observable.
+    wait_until("the reader's sink was entered", || {
+        sink.calls.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert!(
+        !plane.holds(1),
+        "the recalled entry left the cache before the ack"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !create.is_finished(),
+        "the create cannot land before the ack"
+    );
+    assert_eq!(holder.stats().recall_acks, 0);
+    assert_eq!(
+        holder.holders(1),
+        1,
+        "the grant is outstanding until the ack"
+    );
+
+    sink.release();
+    let b = create.await.unwrap().unwrap();
+    assert_eq!(holder.stats().recall_acks, 1);
+    assert_eq!(holder.holders(1), 0);
+    let seen = Metadata::lookup(reader.as_ref(), 1, "b").await.unwrap();
+    assert_eq!(seen.ino, b.ino);
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
+/// §5.7.1 — the batching law: a conveyor pass recalls the UNION of its
+/// batch's objects ONCE. Sixteen creates held into one pass under the
+/// conveyor's pre-drain seam recall the directory's token once (one
+/// batch, one recall, one ack).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recall_storm_on_one_object_is_one_batch_per_pass() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-1").await;
+    let holder = writer.volumes[0].token_holder().unwrap().clone();
+    assert!(Metadata::lookup(reader.as_ref(), 1, "none").await.is_err());
+    assert!(plane.holds(1));
+
+    let s0 = holder.stats();
+    TEST_CONVEYOR_HOLD_STAGE.store(TEST_CONVEYOR_HOLD_PRE_DRAIN, Ordering::SeqCst);
+    let mut tasks = Vec::new();
+    for i in 0..16usize {
+        let w = Arc::clone(&writer);
+        tasks.push(tokio::spawn(async move {
+            Metadata::create(
+                w.as_ref(),
+                1,
+                &format!("s_{i}"),
+                libc::S_IFREG | 0o644,
+                0,
+                0,
+            )
+            .await
+        }));
+        let want = i + 1;
+        wait_until("committer enqueued behind the held pass", || {
+            writer.volumes[0].conveyor_pending_len() >= want
+        })
+        .await;
+    }
+    TEST_CONVEYOR_HOLD_STAGE.store(0, Ordering::SeqCst);
+    test_conveyor_hold_release();
+    for t in tasks {
+        t.await.unwrap().unwrap();
+    }
+    let s1 = holder.stats();
+    assert_eq!(
+        s1.recall_batches - s0.recall_batches,
+        1,
+        "one pass, one batch"
+    );
+    assert_eq!(
+        s1.recalls - s0.recalls,
+        1,
+        "sixteen creates, ONE recall of the directory"
+    );
+    assert_eq!(s1.recall_acks - s0.recall_acks, 1);
+    for i in 0..16 {
+        Metadata::lookup(reader.as_ref(), 1, &format!("s_{i}"))
+            .await
+            .unwrap_or_else(|e| panic!("s_{i} must be visible at the next resolve: {e}"));
+    }
+    assert_eq!(
+        plane.stats().grants,
+        1 + 1 + 16,
+        "the root twice (before and after the recall) + sixteen children"
+    );
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
+/// §5.7.3 — a reader never acks a recall with a read in flight: a serve
+/// of the recalled object held open holds the ack (and therefore the
+/// commit); dropping it releases both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_never_acks_a_recall_with_a_read_in_flight() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let (_reader, plane) = open_token_reader(&path, &endpoint, "reader-1").await;
+    let holder = writer.volumes[0].token_holder().unwrap().clone();
+
+    // An in-flight serve of the root (a readdir mid-stream).
+    let serve = plane
+        .serve(1, TokenWants { dentries: true })
+        .await
+        .unwrap()
+        .expect("the root exists");
+    let w = Arc::clone(&writer);
+    let create = tokio::spawn(async move {
+        Metadata::create(w.as_ref(), 1, "c", libc::S_IFREG | 0o644, 0, 0).await
+    });
+    wait_until("the recall reached the reader", || {
+        plane.stats().recalls_received == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        plane.stats().recalls_acked,
+        0,
+        "no ack while a serve is in flight"
+    );
+    assert!(!create.is_finished());
+    drop(serve);
+    create.await.unwrap().unwrap();
+    assert_eq!(plane.stats().recalls_acked, 1);
+    assert_eq!(holder.stats().recall_acks, 1);
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
+/// §13 R20 — a reader past `T_self` serves nothing from cache: every
+/// token is dropped and the read refuses (fail-closed), never a stale
+/// answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_past_t_self_serves_nothing_from_cache() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-1").await;
+    let _ = Metadata::getattr(reader.as_ref(), 1).await.unwrap();
+    assert!(plane.holds(1));
+    plane.test_set_lease_live(Some(false));
+    let err = Metadata::getattr(reader.as_ref(), 1)
+        .await
+        .expect_err("past T_self nothing serves");
+    assert!(err.to_string().contains("T_self"), "{err}");
+    assert!(!plane.holds(1), "the cache is dropped with the lease");
+    assert_eq!(plane.stats().cached, 0);
+    assert!(plane.stats().serve_refusals >= 1);
+    plane.test_set_lease_live(Some(true));
+    let _ = Metadata::getattr(reader.as_ref(), 1)
+        .await
+        .expect("a live lease serves again (re-granted)");
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
+/// §5.7.1 — an unacked recall completes at the reader's LEASE EXPIRY:
+/// with the reader's channel stopped (a dead reader), the commit waits the
+/// derived bound (the lease TTL — 1 s here, the knob's floor), the lane
+/// retires the grant, `expired_with_lease` counts it and
+/// `timeouts_live` — the must-stay-0 stuck-reader class — does not.
+/// The same shape under a LIVE lease verdict counts `timeouts_live` and
+/// opens the free-grace recall window (the ring's timeout path).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unacked_recall_completes_at_the_readers_lease_expiry() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let holder = writer.volumes[0].token_holder().unwrap().clone();
+    std::env::set_var("SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS", "1000");
+    let verdict = Arc::new(std::sync::Mutex::new(LeaseVerdict::Expired));
+    let v = Arc::clone(&verdict);
+    holder.install_lease_oracle(Arc::new(move |_client: &str| {
+        *v.lock().unwrap_or_else(|p| p.into_inner())
+    }));
+
+    // A dead reader: its token is held at the holder, its channel gone
+    // WITHOUT a release (`die` — never the clean leave's `stop`).
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-dead").await;
+    let _ = Metadata::getattr(reader.as_ref(), 1).await.unwrap();
+    assert_eq!(holder.holders(1), 1);
+    plane.test_die();
+    tokio::time::sleep(Duration::from_millis(1_200)).await; // past the channel's park bound
+    assert_eq!(
+        holder.holders(1),
+        1,
+        "a dead reader's grant stays until the lease bound"
+    );
+
+    let t0 = std::time::Instant::now();
+    Metadata::create(writer.as_ref(), 1, "d", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    let wall = t0.elapsed();
+    let hs = holder.stats();
+    assert_eq!(
+        hs.expired_with_lease, 1,
+        "the recall completed with the lease"
+    );
+    assert_eq!(hs.timeouts_live, 0, "never the stuck-reader class");
+    assert_eq!(
+        hs.recalls,
+        hs.recall_acks + hs.expired_with_lease,
+        "the closure law"
+    );
+    assert_eq!(holder.holders(1), 0, "the dead reader's grant is retired");
+    assert!(
+        wall >= Duration::from_millis(900) && wall < Duration::from_secs(10),
+        "the commit waited the lease bound, not for ever: {wall:?}"
+    );
+    assert_eq!(
+        free_grace::recall_gate_verdict(),
+        free_grace::RecallGate::Gated
+    );
+
+    // The LIVE shape: a second dead reader whose lease the oracle calls
+    // live — the tripwire class, and the free path takes the ring.
+    *verdict.lock().unwrap() = LeaseVerdict::Live;
+    let (reader2, plane2) = open_token_reader(&path, &endpoint, "reader-stuck").await;
+    let _ = Metadata::getattr(reader2.as_ref(), 1).await.unwrap();
+    plane2.test_die();
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let (clock, _ticks) = {
+        let ticks = Arc::new(AtomicU64::new(10_000));
+        (
+            squeezefs::membership::LeaseClock::manual(Arc::clone(&ticks)),
+            ticks,
+        )
+    };
+    free_grace::arm_owner_plane_with(
+        clock,
+        Duration::from_millis(4_000),
+        Duration::from_millis(2_000),
+    );
+    Metadata::create(writer.as_ref(), 1, "e", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    let hs = holder.stats();
+    assert_eq!(hs.timeouts_live, 1);
+    assert_eq!(hs.expired_with_lease, 1);
+    // With no installed membership owner `T_owner` reads 0, so the window
+    // the live timeout opened is already closed: the gate stays Gated
+    // (the ring's role needs the plane the mount arms).
+    let _ = free_grace::recall_gate_verdict();
+    free_grace::disarm_owner_plane();
+    std::env::remove_var("SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS");
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
+/// §5.7.3 — recall-driven free-grace: with the holder armed a terminal
+/// free is RECALL-GATED (publishes directly — the recall was the
+/// qualification), while a free issued inside a live-timeout window rides
+/// the ring (`timeout_deferrals`) and publishes when the window closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_free_never_ships_before_every_recall_is_acked_or_expired() {
+    let _g = SEAM.lock().await;
+    free_grace::reset_for_test();
+    let ticks = Arc::new(AtomicU64::new(10_000));
+    let clock = squeezefs::membership::LeaseClock::manual(Arc::clone(&ticks));
+    free_grace::arm_owner_plane_with(
+        clock,
+        Duration::from_millis(4_000),
+        Duration::from_millis(2_000),
+    );
+    // A member holds the ring's bound at 0: every free would be held.
+    free_grace::publish_bound(0, 1);
+    assert!(free_grace::armed());
+    let ba = Arc::new(
+        squeezefs::block_allocator::BlockAllocator::new("recall-gate")
+            .await
+            .unwrap(),
+    );
+    // Unarmed gate: the shipped ring path holds the offset.
+    assert_eq!(
+        free_grace::recall_gate_verdict(),
+        free_grace::RecallGate::Off
+    );
+    let b0 = ba.allocate_block().await.unwrap();
+    ba.free_block(b0).await.unwrap();
+    assert_eq!(
+        ba.grace_len(),
+        1,
+        "the S5 ring holds a free under an unacked member"
+    );
+
+    // Armed gate: the recall was the qualification — a free publishes
+    // directly.
+    free_grace::arm_recall_gate();
+    let gated0 = free_grace::recall_gated_frees();
+    let b1 = ba.allocate_block().await.unwrap();
+    ba.free_block(b1).await.unwrap();
+    assert_eq!(ba.grace_len(), 1, "the recall-gated free bypassed the ring");
+    assert_eq!(free_grace::recall_gated_frees(), gated0 + 1);
+    assert!(
+        ba.free_block_indices().contains(&(b1 / ba.chunk_size())),
+        "published to the free list at once"
+    );
+
+    // A live-timeout window: the ring is the timeout path.
+    free_grace::test_open_recall_window_ms(1_000);
+    let def0 = free_grace::timeout_deferrals();
+    let b2 = ba.allocate_block().await.unwrap();
+    ba.free_block(b2).await.unwrap();
+    assert_eq!(ba.grace_len(), 2, "a free inside the window rides the ring");
+    assert_eq!(free_grace::timeout_deferrals(), def0 + 1);
+    // The window closes: gated again.
+    ticks.fetch_add(1_001, Ordering::SeqCst);
+    assert_eq!(
+        free_grace::recall_gate_verdict(),
+        free_grace::RecallGate::Gated
+    );
+    // The closure law over the ring's own ledger holds throughout.
+    assert_eq!(
+        free_grace::deferrals(),
+        free_grace::releases() + ba.grace_len() as u64
+    );
+    free_grace::disarm_recall_gate();
+    free_grace::disarm_owner_plane();
+    free_grace::reset_for_test();
+}
+
+/// §5.7.4 / gate 5 — the broadcast shape: one writer, R = 64 readers of one
+/// object; the holder's publish recalls all 64 in ONE batch
+/// (`dlm_token_recall_fanout` p99 = 64), every one acked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_broadcast_shape_recalls_every_reader_once_per_publish() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let holder = writer.volumes[0].token_holder().unwrap().clone();
+    let f = Metadata::create(writer.as_ref(), 1, "hot", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    // The planes dial the holder directly (no routed layer between): the
+    // object is the file's LOCAL key ino on volume 0.
+    let (_v, local) = writer.route_ino(f.ino);
+    const R: usize = 64;
+    let mut planes = Vec::with_capacity(R);
+    for i in 0..R {
+        let plane = TokenReaderPlane::new(TokenClientConfig {
+            endpoint: endpoint.clone(),
+            secret: SECRET.to_vec(),
+            client_id: format!("reader-{i}"),
+            volume: 0,
+        });
+        let task = Arc::clone(&plane);
+        tokio::spawn(async move { task.run_recall_channel().await });
+        planes.push(plane);
+    }
+    for p in &planes {
+        let p = Arc::clone(p);
+        wait_until("channel fresh", || p.stats().channel_fresh).await;
+        let serve = p
+            .serve(local, TokenWants::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(serve.entry().attrs.mode & 0o777, 0o644);
+    }
+    assert_eq!(holder.holders(local), R);
+    let s0 = holder.stats();
+    Metadata::setattr(
+        writer.as_ref(),
+        f.ino,
+        Some(0o640),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let s1 = holder.stats();
+    assert_eq!(s1.recall_batches - s0.recall_batches, 1);
+    assert_eq!(s1.recalls - s0.recalls, R as u64);
+    assert_eq!(s1.recall_acks - s0.recall_acks, R as u64);
+    assert_eq!(s1.timeouts_live, 0);
+    assert_eq!(
+        s1.fanout_p99, R as u64,
+        "p99 of the fan-out is the reader count"
+    );
+    assert_eq!(holder.holders(local), 0);
+    for p in &planes {
+        let serve = p
+            .serve(local, TokenWants::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serve.entry().attrs.mode & 0o777,
+            0o640,
+            "exact at the next resolve"
+        );
+        p.stop().await;
+    }
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
+/// The negative contract: `SQUEEZEFS_SYMMETRIC_META=0` and a flat volume
+/// carry NO token plane — no holder, no reader, the recall gate off, the
+/// Token family 0 — and an unarmed forest's frames are v2 under the
+/// manager's stamp with nothing screened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn symmetric_meta_off_carries_no_token_plane() {
+    let _g = SEAM.lock().await;
+    free_grace::reset_for_test();
+    let screened0 = META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed);
+    let gated0 = free_grace::recall_gated_frees();
+    let deferred0 = free_grace::timeout_deferrals();
+    let dir = tempfile::tempdir().unwrap();
+    let stamped = format_stamped(dir.path(), "meta0").await;
+    let flat = dir.path().join("flat");
+    std::fs::File::create(&flat)
+        .unwrap()
+        .set_len(VOL_LEN)
+        .unwrap();
+    let plan = plan_meta_slot_set(1).expect("derived plan");
+    format_v3_stamped(&flat, VOL_LEN, &set_opts(), plan.stamps[0].clone())
+        .await
+        .unwrap();
+    std::env::remove_var(SYMMETRIC_META_ENV);
+    for p in [&stamped, &flat] {
+        let w = KvMetaBackend::open(p).await.unwrap();
+        assert!(w.token_holder().is_none(), "{}", p.display());
+        assert!(w.token_reader().is_none());
+        assert_eq!(
+            free_grace::recall_gate_verdict(),
+            free_grace::RecallGate::Off
+        );
+        Metadata::create(w.as_ref(), 1, "x", libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+        w.checkpoint_now().await.unwrap();
+        w.shutdown().await.unwrap();
+        let r = KvMetaBackend::open_read_only(p).await.unwrap();
+        assert!(r.token_reader().is_none());
+        assert_eq!(
+            ro_coherence::metadata_staleness_bound_ms(&[Arc::clone(&r)]),
+            ro_coherence::reader_staleness_bound().as_millis() as u64,
+            "the S5 bound stands where no token plane exists"
+        );
+        let _ = Metadata::lookup(r.as_ref(), 1, "x").await.unwrap();
+    }
+    assert_eq!(
+        META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed),
+        screened0
+    );
+    assert_eq!(free_grace::recall_gated_frees(), gated0);
+    assert_eq!(free_grace::timeout_deferrals(), deferred0);
+}

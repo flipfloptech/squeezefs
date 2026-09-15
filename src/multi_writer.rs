@@ -1032,6 +1032,20 @@ pub async fn arm_multi_writer(
             meta.volumes.len()
         );
     }
+    // PR 5 — the read-token verbs (design-symmetric-metadata §5.7): every
+    // volume whose symmetric plane armed is a token HOLDER; its readers'
+    // grants, standing recall channels, acks and releases ride this same
+    // listener, dispatched by volume ordinal. Dark on every other mount.
+    if meta.volumes.iter().any(|v| v.token_holder().is_some()) {
+        router = router.with_tokens(crate::meta_ship::token_plane::TokenSetService::new(
+            &meta.volumes,
+        ));
+        log::info!(
+            "read-token verbs served on the S8 listener for {} volume(s) \
+             (design-symmetric-metadata §5.7)",
+            meta.volumes.len()
+        );
+    }
     let listener = match crate::cluster_wire::RpcListener::start_async(
         crate::cluster_wire::RpcListenerConfig {
             bind_addr: bind,

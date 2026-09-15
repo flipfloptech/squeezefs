@@ -4053,6 +4053,19 @@ impl BlockAllocator {
         // into must not become a reader's problem, and an offset a reader
         // may still resolve must not become a new owner's. Unarmed (no
         // reader plane — the shipped default) this is one relaxed load.
+        //
+        // Under GPFS-strict tokens (design-symmetric-metadata §5.7.3, PR
+        // 5) the freeing publish recalled every reader's token before it
+        // committed — the recall IS the qualification — so the free
+        // publishes directly; the ring is the timeout path for a live
+        // member's unacked recall alone. One relaxed load unarmed.
+        if crate::free_grace::recall_gate_verdict() == crate::free_grace::RecallGate::Gated {
+            self.publish_free_list(offset);
+            crate::fuse_client::METRICS
+                .del_obj
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if self.grace.defer(offset, self.chunk_size) {
             // The free COMPLETED — only its free-LIST publish waits on the
             // acknowledgements, so the delete is counted here exactly as it

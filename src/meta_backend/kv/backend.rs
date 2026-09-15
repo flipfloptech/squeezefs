@@ -1142,6 +1142,14 @@ pub struct KvMetaBackend {
     /// immediately after `Arc::new`, on every open path — the
     /// checkpoint-task `Weak` discipline).
     conveyor_self: std::sync::OnceLock<Weak<KvMetaBackend>>,
+    /// PR 5 (design-symmetric-metadata §5.7): the READ-TOKEN planes this
+    /// volume takes part in — as a HOLDER (the armed writer serving
+    /// grants and recalling before its commits; `token_holder()`) and as
+    /// a READER (a `-o ro` mount serving every user-visible object under
+    /// a token; `token_reader()`). Both `None` on every flat volume and
+    /// every unarmed forest mount — one `OnceLock` probe per read verb.
+    tokens_holder: std::sync::OnceLock<Arc<crate::meta_ship::token_plane::TokenHolderPlane>>,
+    tokens_reader: std::sync::OnceLock<Arc<crate::meta_ship::token_plane::TokenReaderPlane>>,
     /// Rewrite-publish-drain Lever B (2026-08-01): the per-volume
     /// layout-merge conveyor — delta-class layout saves aggregate into
     /// ONE multi-ino KvTx per pass (one journal entry, one ring write,
@@ -2777,6 +2785,8 @@ impl KvMetaBackend {
             durability_lane: Arc::new(ConveyorCore::with_gauge(None)),
             journal_lane: std::sync::OnceLock::new(),
             conveyor_self: std::sync::OnceLock::new(),
+            tokens_holder: std::sync::OnceLock::new(),
+            tokens_reader: std::sync::OnceLock::new(),
             layout_conveyor: Arc::new(ConveyorCore::new()),
             batch_max_txs: resolve_commit_batch_txs(
                 std::env::var(COMMIT_BATCH_TXS_ENV).ok().as_deref(),
@@ -3001,6 +3011,165 @@ impl KvMetaBackend {
                 .as_ref()
                 .is_some_and(|a| a.stats().meta_pr_wero),
         }))
+    }
+
+    // -----------------------------------------------------------------
+    // PR 5 — the READ-TOKEN planes (design-symmetric-metadata §5.7).
+    // -----------------------------------------------------------------
+
+    /// This volume's token HOLDER plane (an armed symmetric writer),
+    /// `None` on every flat volume and every unarmed forest mount.
+    pub fn token_holder(&self) -> Option<&Arc<crate::meta_ship::token_plane::TokenHolderPlane>> {
+        self.tokens_holder.get()
+    }
+
+    /// This volume's token READER plane (a `-o ro` mount of an armed
+    /// symmetric volume), `None` otherwise.
+    pub fn token_reader(&self) -> Option<&Arc<crate::meta_ship::token_plane::TokenReaderPlane>> {
+        self.tokens_reader.get()
+    }
+
+    /// Arm the holder plane (the symmetric plane's arm on a writer; the
+    /// contracts arm it directly): from here every conveyor pass recalls
+    /// the tokens its batch's objects hold before it applies, and every
+    /// terminal free runs under the free-grace recall gate. Idempotent.
+    pub fn arm_token_holder(&self) -> Arc<crate::meta_ship::token_plane::TokenHolderPlane> {
+        let plane = self
+            .tokens_holder
+            .get_or_init(|| Arc::new(crate::meta_ship::token_plane::TokenHolderPlane::new()));
+        crate::free_grace::arm_recall_gate();
+        Arc::clone(plane)
+    }
+
+    /// Arm the reader plane (a `-o ro` open of an armed symmetric volume;
+    /// the mount path and the contracts): from here every user-visible
+    /// read of this volume is served under a token from `cfg.endpoint`,
+    /// and the standing recall channel runs until `shutdown`. Refused on
+    /// a writable open (a writer holds its own trees) and when already
+    /// armed.
+    pub fn arm_token_reader(
+        self: &Arc<Self>,
+        cfg: crate::meta_ship::token_plane::TokenClientConfig,
+    ) -> std::result::Result<Arc<crate::meta_ship::token_plane::TokenReaderPlane>, KvError> {
+        if !self.is_read_only() {
+            return Err(KvError::Corrupt(format!(
+                "{}: a read-token client arms on a READ-ONLY open only (this open writes)",
+                self.path.display()
+            )));
+        }
+        let plane = crate::meta_ship::token_plane::TokenReaderPlane::new(cfg);
+        if self.tokens_reader.set(Arc::clone(&plane)).is_err() {
+            return Err(KvError::Corrupt(format!(
+                "{}: the read-token client is already armed",
+                self.path.display()
+            )));
+        }
+        let task = Arc::clone(&plane);
+        crate::meta_exec::spawn_meta("token_recall_channel", async move {
+            task.run_recall_channel().await;
+        });
+        log::info!(
+            "meta volume {}: read tokens ARMED — every user-visible object of this volume is \
+             served under a token from {} and recalled before a conflicting commit \
+             (design-symmetric-metadata §5.7; reader_staleness_bound_ms = 0 for metadata)",
+            self.path.display(),
+            plane.stats().cached
+        );
+        Ok(plane)
+    }
+
+    /// The holder's record read for a grant (§5.7.1 — the grant CARRIES
+    /// the records): the object's folded attrs, every user-visible xattr,
+    /// and — for a directory, when asked — one page of its dentry set
+    /// from `after` bounded by the frame budget, `complete` when the page
+    /// ended the set. `None` = no such object.
+    pub(crate) async fn token_records_for(
+        &self,
+        object: Ino,
+        wants: crate::meta_ship::token_plane::TokenWants,
+        after: u64,
+    ) -> std::result::Result<Option<crate::meta_ship::token_plane::TokenRecords>, KvError> {
+        use crate::meta_ship::token_plane::{DirRecord, TokenRecords};
+        let Some(mut v) = self.read_inode_value(object).await? else {
+            return Ok(None);
+        };
+        self.fold_pending_times(object, &mut v);
+        let mut xattrs = Vec::new();
+        for name in KvMetaBackend::listxattr(self, object).await? {
+            if !crate::meta_ship::token_plane::token_carried_xattr(&name) {
+                continue;
+            }
+            if let Some(value) = KvMetaBackend::getxattr(self, object, &name).await? {
+                xattrs.push((name.into_bytes(), value));
+            }
+        }
+        let is_dir = (v.mode & libc::S_IFMT) == libc::S_IFDIR;
+        let dir = if wants.dentries && is_dir {
+            let budget = crate::meta_ship::token_plane::grant_dentry_budget();
+            let mut entries: Vec<DirRecord> = Vec::new();
+            let mut bytes = 0usize;
+            let mut cursor = after;
+            let mut complete = true;
+            'pages: loop {
+                // Cookie 0 decodes to the directory's start; a real cookie
+                // resumes strictly after it (the §5.1 resume rule).
+                let page = self.readdir_page(object, cursor, SCAN_PAGE).await?;
+                if page.is_empty() {
+                    break;
+                }
+                let short = page.len() < SCAN_PAGE;
+                for (cookie, e) in page {
+                    bytes += 24 + e.name.len();
+                    entries.push(DirRecord {
+                        cookie,
+                        child_ino: e.ino,
+                        file_type: (e.file_type >> 12) as u8,
+                        name: e.name.into_bytes(),
+                    });
+                    cursor = cookie;
+                    if bytes >= budget {
+                        complete = false;
+                        break 'pages;
+                    }
+                }
+                if short {
+                    break;
+                }
+            }
+            Some((entries, complete))
+        } else {
+            None
+        };
+        Ok(Some(TokenRecords {
+            attrs: v.into(),
+            xattrs,
+            dir,
+        }))
+    }
+
+    /// **The commit-path recall hook** (§5.7.1, PR 5 — the ONE call in
+    /// the conveyor pass): under the batch's 4a guards, before any ring
+    /// admission or node lock, recall every outstanding token on the
+    /// UNION of the batch's objects once and wait until each recall is
+    /// acked or expired with its reader's lease. Returns the recalled
+    /// objects the pass settles after its apply. One relaxed load when no
+    /// holder plane is armed or nothing is delegated.
+    async fn recall_tokens_for_batch(&self, batch: &[QueuedTx]) -> Vec<u64> {
+        let Some(plane) = self.token_holder() else {
+            return Vec::new();
+        };
+        if plane.outstanding() == 0 {
+            return Vec::new();
+        }
+        let forest = self.forest().is_some();
+        let objects = crate::meta_ship::token_plane::union_objects(
+            batch
+                .iter()
+                .filter(|q| !q.token_quiet)
+                .flat_map(|q| q.recs.iter())
+                .filter_map(|(kind, r)| record_object_ino(*kind, &r.key, forest)),
+        );
+        plane.recall_and_wait(&objects).await
     }
 
     /// The region a cached node's floor clamps and whose ring its SMOs
@@ -3739,6 +3908,10 @@ impl KvMetaBackend {
             self.cache
                 .install_frame_fence(Arc::new(SlotFrameFence { be: weak }));
         }
+        // PR 5 — the read-token HOLDER (§5.7): this writer grants tokens
+        // on its objects and recalls them before every conflicting
+        // commit; its terminal frees run under the recall gate.
+        self.arm_token_holder();
         plane.gate.arm();
         // The membership carriage (§5.9): every member's renewal grant
         // now names the slots it leases here.
@@ -8719,7 +8892,9 @@ impl KvMetaBackend {
     /// volume (one tree per kind): one bool, so the shipped listing path
     /// pays nothing.
     pub fn filters_unpublished_children(&self) -> bool {
-        self.non_writer && self.forest().is_some()
+        // PR 5: a TOKEN reader's view is complete — every child resolves
+        // through its holder's grant, so nothing is withheld.
+        self.non_writer && self.forest().is_some() && self.token_reader().is_none()
     }
 
     /// Whether this mount HOLDS the slot tree of `local` — the condition
@@ -10906,6 +11081,13 @@ impl KvMetaBackend {
         if name.len() > 255 {
             return Ok(None); // unrepresentable ⇒ cannot exist
         }
+        // PR 5: a token reader answers from the parent's token (its
+        // dentry set), never from a foreign leaf.
+        if let Some(tokens) = self.token_reader() {
+            return crate::meta_ship::token_plane::token_find_dentry(tokens, parent, name)
+                .await
+                .map_err(KvError::from);
+        }
         let hash = dentry_name_hash54(name.as_bytes(), self.sb.hash_seed);
         let start = dentry_key(parent, hash, 0);
         let end = dentry_key(parent, hash, u8::MAX);
@@ -10986,6 +11168,28 @@ impl KvMetaBackend {
     /// folded on top — absorbed echoes are read-visible before they
     /// drain).
     pub async fn getattr(&self, ino: Ino) -> Result<Inode> {
+        // PR 5: a token reader serves the object's attrs from its token
+        // (the holder's folded view at the grant), exact until recalled.
+        if let Some(tokens) = self.token_reader() {
+            let serve = tokens
+                .serve(ino, crate::meta_ship::token_plane::TokenWants::default())
+                .await?
+                .ok_or_else(|| Self::not_found(format!("Inode {ino} not found")))?;
+            let v = serve.entry().attrs;
+            return Ok(Inode {
+                ino,
+                mode: v.mode,
+                uid: v.uid,
+                gid: v.gid,
+                size: v.size,
+                nlink: v.nlink,
+                atime: v.atime,
+                mtime: v.mtime,
+                ctime: v.ctime,
+                flags: v.flags,
+                rdev: v.rdev,
+            });
+        }
         let mut v = self
             .read_inode_value(ino)
             .await?
@@ -11035,6 +11239,38 @@ impl KvMetaBackend {
         if max == 0 {
             return Ok(out);
         }
+        // PR 5: a token reader pages the directory's token (its complete
+        // dentry set, cookie-ordered as the holder served it).
+        if let Some(tokens) = self.token_reader() {
+            let after = match decode_readdir_cookie(offset).map_err(KvError::from)? {
+                ReaddirPos::Start | ReaddirPos::AfterDot | ReaddirPos::AfterDotDot => 0,
+                ReaddirPos::AfterEntry { hash54, coll_seq } => {
+                    encode_readdir_cookie(hash54, coll_seq)
+                }
+            };
+            let Some(serve) = tokens
+                .serve(
+                    dir,
+                    crate::meta_ship::token_plane::TokenWants { dentries: true },
+                )
+                .await?
+            else {
+                return Ok(out); // an ino with no dentries lists empty (the v2 contract)
+            };
+            if let Some(entries) = serve.entry().dir.as_ref() {
+                for d in entries.iter().filter(|d| d.cookie > after).take(max) {
+                    out.push((
+                        d.cookie,
+                        DirEntry {
+                            ino: d.child_ino,
+                            name: String::from_utf8_lossy(&d.name).into_owned(),
+                            file_type: u32::from(d.file_type) << 12,
+                        },
+                    ));
+                }
+            }
+            return Ok(out);
+        }
         // §5.1 resume rule: offsets 0/1/2 ⇒ the directory start (the
         // synthetic ./.. slots belong to the FUSE layer); c > 2 ⇒
         // strictly after the cookie's key suffix.
@@ -11076,6 +11312,26 @@ impl KvMetaBackend {
         if name.len() > 255 {
             return Ok(None);
         }
+        // PR 5: a token reader serves a token-CARRIED xattr (the user-
+        // visible names, `layout`, `system.symlink`) from the object's
+        // token; a control record (`writer_claim`, `job:` …) is the
+        // plane's own, read off the S5 projection as before.
+        if crate::meta_ship::token_plane::token_carried_xattr(name) {
+            if let Some(tokens) = self.token_reader() {
+                let Some(serve) = tokens
+                    .serve(ino, crate::meta_ship::token_plane::TokenWants::default())
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                return Ok(serve
+                    .entry()
+                    .xattrs
+                    .iter()
+                    .find(|(n, _)| n == name.as_bytes())
+                    .map(|(_, v)| v.clone()));
+            }
+        }
         let hash = xattr_name_hash56(name.as_bytes(), self.sb.hash_seed);
         let start = xattr_key(ino, hash, 0);
         let end = xattr_key(ino, hash, u8::MAX);
@@ -11091,6 +11347,21 @@ impl KvMetaBackend {
     /// All xattr names of `ino`; empty for inos without xattrs (v2
     /// contract).
     pub async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {
+        // PR 5: a token reader lists the token's (user-visible) names.
+        if let Some(tokens) = self.token_reader() {
+            let Some(serve) = tokens
+                .serve(ino, crate::meta_ship::token_plane::TokenWants::default())
+                .await?
+            else {
+                return Ok(Vec::new());
+            };
+            return Ok(serve
+                .entry()
+                .xattrs
+                .iter()
+                .map(|(n, _)| String::from_utf8_lossy(n).into_owned())
+                .collect());
+        }
         let mut out = Vec::new();
         let mut cursor: Vec<u8> = xattr_key(ino, 0, 0).to_vec();
         let end = xattr_key(ino, HASH56_MAX, u8::MAX);
@@ -13913,6 +14184,13 @@ pub struct KvTx {
     /// DLM-borne (the pre-arm writer-claim tx — single-writer window by
     /// the flock; compensation records — checkpoint-class).
     guards: Arc<[DlmGuard]>,
+    /// PR 5 (design-symmetric-metadata §5.7.1): `true` = the tx mutates
+    /// no record a read token carries — a CONTROL xattr write on its own
+    /// (`writer_claim`'s heartbeat, `client:`, `job:`, the plane's own
+    /// records; `token_plane::token_carried_xattr` is the one list) — so
+    /// the conveyor pass recalls nothing for it. The heartbeat on ino 1
+    /// would otherwise recall every reader's ROOT token every 10 s.
+    token_quiet: bool,
 }
 
 impl KvTx {
@@ -13930,6 +14208,7 @@ impl KvTx {
             staged: Vec::new(),
             site: std::panic::Location::caller(),
             guards: Arc::from(Vec::new()),
+            token_quiet: false,
         }
     }
 
@@ -14339,6 +14618,26 @@ struct SpilledChainedFull {
     guard: super::indirect_map::IndirectBlobGuard,
 }
 
+/// The OBJECT a staged record mutates, for the token recall (PR 5,
+/// design-symmetric-metadata §5.7.1 — token granularity is the object):
+/// the ino-major kinds' leading ino (an inode's own; a dentry's PARENT —
+/// the directory's token covers its dentry set; an xattr's / a block
+/// map's owner) and a block reference's owner ino; tree 0 / interior /
+/// unknown shapes name no object. Keys are the forest form on a forest
+/// volume (`ino ‖ kind ‖ rest`; refs `0x06 ‖ …`) and the per-kind legacy
+/// form on a flat one — the ino sits first in both ino-major layouts.
+fn record_object_ino(kind: u8, key: &[u8], forest: bool) -> Option<u64> {
+    let be_u64_at = |at: usize| -> Option<u64> {
+        let b: [u8; 8] = key.get(at..at + 8)?.try_into().ok()?;
+        Some(u64::from_be_bytes(b))
+    };
+    match kind {
+        TREE_INODES | TREE_DENTRIES | TREE_XATTRS | super::record::TREE_BLOCK_MAP => be_u64_at(0),
+        super::record::TREE_BLOCK_REFS => be_u64_at(if forest { 17 } else { 16 }),
+        _ => None,
+    }
+}
+
 /// The armed plane's `FrameFenceSource` (PR 5, design-symmetric-metadata
 /// §5.8.2): answers the node cache's stamp and screen questions off the
 /// backend's lease table and tree 0. Holds the backend WEAKLY (the cache
@@ -14385,6 +14684,9 @@ impl super::node_cache::FrameFenceSource for SlotFrameFence {
 }
 
 struct QueuedTx {
+    /// PR 5: the tx mutates no token-carried record (see
+    /// `KvTx::token_quiet`) — the recall hook skips it.
+    token_quiet: bool,
     /// The tx's records, seqs stamped by the pass inside the lock window.
     recs: Vec<(u8, Record)>,
     /// The appender region whose ring this tx journals into (0 on a flat
@@ -16599,6 +16901,7 @@ impl KvMetaBackend {
         crate::op_trace::stamp(trace_id, crate::op_trace::Stage::MetaEnqueue, enqueued_at);
         Ok((
             QueuedTx {
+                token_quiet: tx.token_quiet,
                 recs,
                 region,
                 len,
@@ -16991,6 +17294,12 @@ impl KvMetaBackend {
                 released.await;
             }
         }
+        // PR 5 — the commit-path recall (design-symmetric-metadata
+        // §5.7.1): under the batch's 4a guards, BEFORE the ring admission
+        // and any node lock (§4.4 pt 5 / the lock law), the union of the
+        // batch's objects is recalled once and the pass waits for the
+        // acks (or the readers' lease expiry). One relaxed load unarmed.
+        let recalled = self.recall_tokens_for_batch(&batch).await;
         let ring = self.ring_of_region(region);
         let mut sentinel = PassSentinel {
             be: self,
@@ -17008,6 +17317,14 @@ impl KvMetaBackend {
         self.run_batch_pipeline(&mut sentinel).await;
         if let Some(r) = &growth_gate {
             r.passes_inside.fetch_sub(1, Ordering::SeqCst);
+        }
+        // The recalled commit APPLIED (or failed as a unit): grants on
+        // its objects serve again — from the RAM-authoritative state the
+        // holder's own reads serve from.
+        if !recalled.is_empty() {
+            if let Some(plane) = self.token_holder() {
+                plane.settle(&recalled);
+            }
         }
         debug_assert!(
             sentinel.entries.is_empty()
@@ -21737,6 +22054,7 @@ impl KvMetaBackend {
             // D1.c single-copy staging (no intermediate name/value Vecs).
             XattrValue::encode_parts(name.as_bytes(), value)?,
         );
+        tx.token_quiet = !crate::meta_ship::token_plane::token_carried_xattr(name);
         tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(())
@@ -21763,6 +22081,7 @@ impl KvMetaBackend {
         }
         let mut tx = tx0;
         tx.stage_delete(TREE_XATTRS, key);
+        tx.token_quiet = !crate::meta_ship::token_plane::token_carried_xattr(name);
         tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(())

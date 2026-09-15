@@ -11829,8 +11829,15 @@ impl SqueezefsFilesystem {
                 "reader_revalidate_interval_ms": if self.revalidating_volume_count() > 0 {
                     crate::ro_coherence::reader_revalidate_interval().as_millis() as u64
                 } else { 0 },
+                // PR 5 (design-symmetric-metadata §5.7.2): under READ
+                // TOKENS the user-visible metadata bound is 0 — a foreign
+                // change is visible at the reader's next resolve after
+                // the recall; the gauge stays for tooling, at 0
+                // (`ro_coherence::metadata_staleness_bound_ms`).
                 "reader_staleness_bound_ms": if self.revalidating_volume_count() > 0 {
-                    crate::ro_coherence::reader_staleness_bound().as_millis() as u64
+                    crate::ro_coherence::metadata_staleness_bound_ms(
+                        self.meta_backend.as_ref().map_or(&[][..], |mb| &mb.volumes[..]),
+                    )
                 } else { 0 },
                 // How many distinct OWNERS this mount's projection depends
                 // on (§5.11(a)'s tripwire pair, not a max): 0 on a write
@@ -14067,6 +14074,54 @@ impl SqueezefsFilesystem {
                         serde_json::json!(crate::membership::membership_shards()),
                     );
                 }
+                // THE TOKEN FAMILY (design-symmetric-metadata §5.7 / §11,
+                // PR 5): the holder side (`dlm_token_grants_served`,
+                // `dlm_token_recalls` ≡ `dlm_token_recall_acks` +
+                // `dlm_token_recall_expired_with_lease`, the must-stay-0
+                // `dlm_token_recall_timeouts_live`, `dlm_token_releases`,
+                // the fan-out p50/p99 + distribution, the recall RTT
+                // exact-sum `send / drain / ack / total`) and the reader
+                // side (`dlm_token_grants` = foreign first touches,
+                // `dlm_token_cached`, hits, recalls received/acked, the
+                // grant RTT) — every one 0 / null on an unarmed mount; the
+                // frame screen's three faces and the free-grace recall
+                // gate's two beside them.
+                {
+                    let vols: &[std::sync::Arc<meta_kv::backend::KvMetaBackend>] = self
+                        .meta_backend
+                        .as_ref()
+                        .map_or(&[][..], |mb| &mb.volumes[..]);
+                    for (k, v) in [
+                        crate::meta_ship::token_plane::holder_stats_json(vols),
+                        crate::meta_ship::token_plane::reader_stats_json(vols),
+                    ]
+                    .into_iter()
+                    .filter_map(|v| v.as_object().cloned())
+                    .flatten()
+                    {
+                        metrics.insert(k, v);
+                    }
+                }
+                metrics.insert(
+                    "foreign_frames_screened".into(),
+                    load(&meta_kv::META_KV_FOREIGN_FRAMES_SCREENED),
+                );
+                metrics.insert(
+                    "appender_fence_breach".into(),
+                    load(&meta_kv::META_KV_APPENDER_FENCE_BREACH),
+                );
+                metrics.insert(
+                    "foreign_frame_overwrite_detected".into(),
+                    load(&meta_kv::META_KV_FOREIGN_FRAME_OVERWRITE_DETECTED),
+                );
+                metrics.insert(
+                    "free_grace_recall_gated_frees".into(),
+                    serde_json::json!(crate::free_grace::recall_gated_frees()),
+                );
+                metrics.insert(
+                    "free_grace_timeout_deferrals".into(),
+                    serde_json::json!(crate::free_grace::timeout_deferrals()),
+                );
                 // THE FENCING FAMILY (§5.8.1 / KD-SYM-18): the Reservation
                 // Report read SIZED BY REGCTL — per metadata AND data
                 // namespace this mount registered on: registrants the last

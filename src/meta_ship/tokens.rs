@@ -906,13 +906,19 @@ pub struct RecallConfig {
 impl RecallConfig {
     /// Derive from the live inputs (explicit levers win verbatim).
     pub fn derived() -> Self {
+        Self::derived_with_evidence(super::live_recall_evidence_us(), true)
+    }
+
+    /// [`Self::derived`] with the p99 evidence supplied (the read-token
+    /// lane's own RTT) and the valve as the caller's law.
+    pub fn derived_with_evidence(live_p99_us: Option<u64>, valve: bool) -> Self {
         let batch_max = recall_batch_max_from(
             crate::env_knobs::opt_int_knob::<usize>(RECALL_BATCH_MAX_ENV),
             crate::cluster_wire::CONTROL_MAX_FRAME_BYTES,
         );
         let deadline = recall_deadline_from(
             crate::env_knobs::opt_int_knob::<u64>(RECALL_DEADLINE_ENV),
-            super::live_recall_evidence_us(),
+            live_p99_us,
             recall_lease_ttl(),
         );
         let thrash_window = deadline;
@@ -926,7 +932,7 @@ impl RecallConfig {
             thrash_window,
             thrash_cycles: RECALL_THRASH_CYCLES,
             cooldown,
-            valve: true,
+            valve,
         }
     }
 }
@@ -1050,6 +1056,13 @@ enum ConfigMode {
     /// Re-derived per use, so the deadline tracks the LIVE p99 evidence
     /// (spec R3) instead of freezing at first touch.
     Live,
+    /// PR 5's read-token lane (design-symmetric-metadata §5.7): the
+    /// deadline is the reader's LEASE (`T_owner` — a dead reader's tokens
+    /// die with its lease, §5.7.1; never a p99-derived bound, which would
+    /// declare a reader mid-drain dead), re-read per use, and the thrash
+    /// valve is OFF — under R-SYM-4 a demoted object would have no read
+    /// method at all, so the lane never demotes.
+    LiveTokens,
 }
 
 /// Phase indices for `dlm_revoke_phase_ns`.
@@ -1117,11 +1130,20 @@ impl RecallLane {
         Self::new(ConfigMode::Live)
     }
 
+    /// The read-token plane's lane (PR 5): live derivation off the
+    /// plane's own recall RTT evidence, the valve off (see
+    /// [`ConfigMode::LiveTokens`]).
+    pub fn live_tokens() -> Self {
+        Self::new(ConfigMode::LiveTokens)
+    }
+
     /// The lane's config as of NOW (fixed lanes answer their pin).
     pub fn config(&self) -> RecallConfig {
         match &self.mode {
             ConfigMode::Fixed(c) => *c,
             ConfigMode::Live => RecallConfig::derived(),
+            // No evidence ⇒ `recall_deadline_from` answers the lease TTL.
+            ConfigMode::LiveTokens => RecallConfig::derived_with_evidence(None, false),
         }
     }
 
@@ -1303,7 +1325,7 @@ impl RecallLane {
     /// frees. An ack that matches no in-flight frame (a resend, a
     /// post-timeout straggler) is counted and changes nothing — the
     /// S8-dedup posture applied to acks.
-    pub fn ack_frame(&self, client: &str, frame_id: u64, now: Instant) {
+    pub fn ack_frame(&self, client: &str, frame_id: u64, now: Instant) -> usize {
         let mut st = self.state.lock();
         let matches = st
             .inflight
@@ -1312,7 +1334,7 @@ impl RecallLane {
             .unwrap_or(false);
         if !matches {
             self.stale_acks.fetch_add(1, Ordering::Relaxed);
-            return;
+            return 0;
         }
         let f = st.inflight.remove(client).expect("checked above");
         for r in &f.recalls {
@@ -1324,6 +1346,7 @@ impl RecallLane {
         }
         self.acked
             .fetch_add(f.recalls.len() as u64, Ordering::Relaxed);
+        f.recalls.len()
     }
 
     /// The deadline sweep: every frame past its deadline is DEAD — the

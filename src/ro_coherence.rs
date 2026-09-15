@@ -497,6 +497,31 @@ pub fn test_note_epoch_step() {
     note_reader_epoch_step();
 }
 
+/// **The token recall's drain** (design-symmetric-metadata §5.7.3, PR
+/// 5): a recall is a step on the reader's layout cache — every layout
+/// entry stamped before it misses ([`layout_entry_pre_step`]) — followed
+/// by the OBSERVED drain of every serve that began under an earlier
+/// generation ([`serve_drained_below`]; with the ledger unarmed there is
+/// nothing to wait for). Parked on the drain wake, never a timer; what a
+/// reader runs BEFORE it acks a recall, so the holder's terminal free
+/// can never race a DMA the reader still has in flight.
+pub async fn drain_in_flight_serves() {
+    note_reader_epoch_step();
+    let gen = reader_step_generation();
+    set_drain_wait_gen(gen);
+    loop {
+        let notified = DRAIN_WAKE.notified();
+        if serve_drained_below(gen) {
+            break;
+        }
+        // The wake is `notify_one` and the revalidation task parks on the
+        // same word: the ticked park is the backstop (the ladder's own
+        // law), the tick the timer grain's order.
+        let _ = squeezefs_ipc::sqz_time::timeout(Duration::from_millis(10), notified).await;
+    }
+    set_drain_wait_gen(0);
+}
+
 /// The `SQUEEZEFS_FREE_GRACE_DRAIN_EPOCH_STAMP` lever's latch (the
 /// `free_grace::ACK_PIPELINE` pattern): item 2 — the layout-cache step
 /// gate is live and the ladder's drain drops its `S` term. `0` = the
@@ -582,6 +607,20 @@ pub fn reader_revalidate_interval() -> Duration {
 /// over which the reader can prove freshness.
 pub fn reader_staleness_bound() -> Duration {
     RevalidationPoller::derived().staleness_bound()
+}
+
+/// **The user-visible METADATA staleness bound, ms** — the number
+/// `reader_staleness_bound_ms` publishes (PR 5, design-symmetric-metadata
+/// §5.7.2 / R-SYM-4): **0** once any volume of the set is read under
+/// tokens (a foreign change is visible at the reader's NEXT resolve after
+/// the recall — exact, never bounded; the S5 poll survives as the
+/// control-plane projection and its interval keeps its own gauge), else
+/// the S5 posture's [`reader_staleness_bound`].
+pub fn metadata_staleness_bound_ms(volumes: &[Arc<KvMetaBackend>]) -> u64 {
+    if volumes.iter().any(|v| v.token_reader().is_some()) {
+        return 0;
+    }
+    reader_staleness_bound().as_millis() as u64
 }
 
 /// **§6.8 item 5 — purge on revalidation.** "Where the codebase is best

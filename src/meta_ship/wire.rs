@@ -195,6 +195,14 @@ pub enum MetaVerb {
     Removexattr = 11,
     Listxattr = 12,
     DestroyInode = 13,
+    // PR 6 (symmetric cross-owner transactions): the block 0x60–0x6F.
+    /// ONE step of a cross-owner intent, applied by the step's slot
+    /// holder through `xv_apply_step` (design-symmetric-metadata §5.6).
+    XvStep = 0x60,
+    /// An EXACT `(parent, name)` resolution served from the parent's
+    /// slot holder's RAM-authoritative tree — the set-wide directory-
+    /// rename lock's ancestor check reads each link through it (§5.6.4).
+    LookupExact = 0x61,
 }
 
 impl MetaVerb {
@@ -213,6 +221,8 @@ impl MetaVerb {
         MetaVerb::Removexattr,
         MetaVerb::Listxattr,
         MetaVerb::DestroyInode,
+        MetaVerb::XvStep,
+        MetaVerb::LookupExact,
     ];
 
     /// The verb's wire code.
@@ -241,6 +251,8 @@ impl MetaVerb {
             MetaVerb::Removexattr => "removexattr",
             MetaVerb::Listxattr => "listxattr",
             MetaVerb::DestroyInode => "destroy_inode",
+            MetaVerb::XvStep => "xv_step",
+            MetaVerb::LookupExact => "lookup_exact",
         }
     }
 
@@ -256,7 +268,8 @@ impl MetaVerb {
             | MetaVerb::Readdir
             | MetaVerb::Getattr
             | MetaVerb::Getxattr
-            | MetaVerb::Listxattr => false,
+            | MetaVerb::Listxattr
+            | MetaVerb::LookupExact => false,
             MetaVerb::CreateWithRdev
             | MetaVerb::Unlink
             | MetaVerb::Link
@@ -264,7 +277,8 @@ impl MetaVerb {
             | MetaVerb::Setattr
             | MetaVerb::Setxattr
             | MetaVerb::Removexattr
-            | MetaVerb::DestroyInode => true,
+            | MetaVerb::DestroyInode
+            | MetaVerb::XvStep => true,
         }
     }
 }
@@ -337,6 +351,22 @@ pub enum MetaCall {
     DestroyInode {
         ino: u64,
     },
+    // PR 6 — appended (the enum's serde index grows at the end; the
+    // explicit discriminants live on `MetaVerb`, 0x60–0x6F).
+    /// One step of cross-owner intent `tx_id` (its `step_idx`-th), applied
+    /// by the holder of the step's slot. Idempotent under the step's
+    /// `(pre, post)` witness — a resend, a successor holder's first sight
+    /// of it and a roll-forward all answer the same outcome.
+    XvStep {
+        tx_id: u64,
+        step_idx: u32,
+        step: crate::meta_backend::crossvol_tx::XvStep,
+    },
+    /// The exact `(parent, name)` resolution (`MetaReply::DentryExact`).
+    LookupExact {
+        parent: u64,
+        name: String,
+    },
 }
 
 impl MetaCall {
@@ -356,6 +386,8 @@ impl MetaCall {
             MetaCall::Removexattr { .. } => MetaVerb::Removexattr,
             MetaCall::Listxattr { .. } => MetaVerb::Listxattr,
             MetaCall::DestroyInode { .. } => MetaVerb::DestroyInode,
+            MetaCall::XvStep { .. } => MetaVerb::XvStep,
+            MetaCall::LookupExact { .. } => MetaVerb::LookupExact,
         }
     }
 
@@ -385,6 +417,8 @@ impl MetaCall {
             | MetaCall::Removexattr { ino, .. }
             | MetaCall::Listxattr { ino }
             | MetaCall::DestroyInode { ino } => *ino,
+            MetaCall::XvStep { step, .. } => step.home_ino(),
+            MetaCall::LookupExact { parent, .. } => *parent,
         }
     }
 
@@ -510,6 +544,17 @@ pub enum MetaReply {
     Xattr(Option<Vec<u8>>),
     /// `listxattr`.
     Names(Vec<String>),
+    // PR 6 — appended.
+    /// `xv_step`: the applier's verdict (`crossvol_tx::status_code` — 0
+    /// applied, 1 already applied, 2 the object moved under the plan) and
+    /// the post-image where the step produced one.
+    XvStep {
+        status: u8,
+        inode: Option<WireInode>,
+    },
+    /// `lookup_exact`: `(child ino, S_IFMT bits)` or absent — exact as the
+    /// holder's tree stands.
+    DentryExact(Option<(u64, u32)>),
 }
 
 /// A refusal as it crosses the wire.

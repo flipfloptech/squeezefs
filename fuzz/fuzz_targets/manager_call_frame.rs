@@ -215,6 +215,9 @@ fn check_service_edge(call: &ManagerCall, total_extents: u64, record_seed: &[u8]
         ManagerCall::MarkShared { .. }
         | ManagerCall::ShareBlock { .. }
         | ManagerCall::ReleaseShared { .. } => {}
+        // PR 6: the lock verbs carry one appender id and nothing the
+        // durable state bounds an allocation by.
+        ManagerCall::DirRenameLock { .. } | ManagerCall::DirRenameUnlock { .. } => {}
     }
 }
 
@@ -311,6 +314,13 @@ enum ArbCall {
         block_idx: u64,
         owner: Option<(u64, u32)>,
     },
+    // PR 6.
+    DirRenameLock {
+        appender_id: u32,
+    },
+    DirRenameUnlock {
+        appender_id: u32,
+    },
 }
 
 #[derive(Arbitrary, Debug, Clone, Copy)]
@@ -406,6 +416,10 @@ impl From<ArbCall> for ManagerCall {
                 block_idx,
                 owner,
             },
+            ArbCall::DirRenameLock { appender_id } => ManagerCall::DirRenameLock { appender_id },
+            ArbCall::DirRenameUnlock { appender_id } => {
+                ManagerCall::DirRenameUnlock { appender_id }
+            }
         }
     }
 }
@@ -465,6 +479,16 @@ enum ArbReply {
         shared: bool,
         remaining: u32,
     },
+    // PR 6.
+    DirRenameLocked {
+        already: bool,
+    },
+    DirRenameBusy {
+        holder: u32,
+    },
+    DirRenameUnlocked {
+        already: bool,
+    },
 }
 
 impl From<ArbReply> for ManagerReply {
@@ -511,6 +535,9 @@ impl From<ArbReply> for ManagerReply {
             ArbReply::SharedReleased { shared, remaining } => {
                 ManagerReply::SharedReleased { shared, remaining }
             }
+            ArbReply::DirRenameLocked { already } => ManagerReply::DirRenameLocked { already },
+            ArbReply::DirRenameBusy { holder } => ManagerReply::DirRenameBusy { holder },
+            ArbReply::DirRenameUnlocked { already } => ManagerReply::DirRenameUnlocked { already },
         }
     }
 }

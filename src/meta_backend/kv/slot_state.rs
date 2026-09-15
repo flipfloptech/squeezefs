@@ -704,3 +704,70 @@ fn le32(v: &[u8], off: usize) -> u32 {
     b.copy_from_slice(&v[off..off + 4]);
     u32::from_le_bytes(b)
 }
+
+// ---------------------------------------------------------------------------
+// The set-wide directory-rename lock (design-symmetric-metadata §5.6.4,
+// KD-SYM-14; PR 6) — a tree-0 record on VOLUME 0 only (§5.4.2's control
+// table). Its holder is an appender identity; the record is the durable
+// witness `DirRenameLock` / `DirRenameUnlock` are idempotent against
+// (KD-SYM-7). A crashed holder's record outlives it until the recovery
+// driver releases it — the expiry law is the holder's membership lease,
+// never a TTL on the record.
+// ---------------------------------------------------------------------------
+
+/// The ONE tree-0 key of the set-wide directory-rename lock.
+pub const DIR_RENAME_KEY: &[u8] = b"dir_rename";
+/// Record value version (byte 0).
+pub const DIR_RENAME_VERSION: u8 = 1;
+/// `version ‖ holder: u32 ‖ term: u64 ‖ since_ns: u64`.
+pub const DIR_RENAME_LEN: usize = 1 + 4 + 8 + 8;
+
+/// The lock record: who holds the set-wide directory-rename lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirRenameRecord {
+    /// The holder's appender id (on volume 0).
+    pub holder: u32,
+    /// The holder's writer term at the take — a successor incarnation of
+    /// the same id presents a higher one, and the release-dead arm reads
+    /// which incarnation died.
+    pub term: u64,
+    /// CLOCK_REALTIME ns of the take (operator-facing: how long the set
+    /// has been renaming directories under one lease).
+    pub since_ns: u64,
+}
+
+impl DirRenameRecord {
+    /// LE image, versioned.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(DIR_RENAME_LEN);
+        out.push(DIR_RENAME_VERSION);
+        out.extend_from_slice(&self.holder.to_le_bytes());
+        out.extend_from_slice(&self.term.to_le_bytes());
+        out.extend_from_slice(&self.since_ns.to_le_bytes());
+        out
+    }
+
+    /// Decode + validate (total).
+    pub fn decode(value: &[u8]) -> Result<Self, KvError> {
+        let version = *value
+            .first()
+            .ok_or_else(|| KvError::Corrupt("dir_rename record is empty".to_string()))?;
+        if version != DIR_RENAME_VERSION {
+            return Err(KvError::Corrupt(format!(
+                "dir_rename record version {version} — this binary writes {DIR_RENAME_VERSION} \
+                 and the format is forward-only (upgrade squeezefs)"
+            )));
+        }
+        if value.len() != DIR_RENAME_LEN {
+            return Err(KvError::Corrupt(format!(
+                "dir_rename record must be {DIR_RENAME_LEN} bytes, got {}",
+                value.len()
+            )));
+        }
+        Ok(Self {
+            holder: le32(value, 1),
+            term: le64(value, 5),
+            since_ns: le64(value, 13),
+        })
+    }
+}

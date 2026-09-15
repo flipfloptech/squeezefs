@@ -106,6 +106,12 @@ pub static TEST_INTENT_APPLY_ERRNO: std::sync::atomic::AtomicI32 =
 pub static TEST_INTENT_SUPPLY_CHUNK: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
+/// PR 6's misdelivery seam, consumed by the frame that served the step
+/// `TEST_XV_SERVE_MISDELIVER_ONCE` armed: its reply carries a wrong
+/// correlation id, which the client refuses exactly as it fails a dead
+/// session (the same-id resend follows).
+static XV_MISDELIVER_NEXT_REPLY: AtomicBool = AtomicBool::new(false);
+
 squeezefs_ipc::sqz_task_local! {
     /// The shipping CLIENT whose verb is currently executing on this
     /// owner (set by `run_batch` around the batch's execution) — what
@@ -740,8 +746,14 @@ impl MetaShipService {
             Err(e) => return self.refuse(req.id, STATUS_MALFORMED, format!("reply encode: {e}")),
         };
         super::owner_phase_record(OwnerPhase::ReplyEncode, t_encode);
+        // The seam's misdelivery: a reply the client cannot correlate.
+        let id = if XV_MISDELIVER_NEXT_REPLY.swap(false, Ordering::SeqCst) {
+            req.id ^ (1 << 63)
+        } else {
+            req.id
+        };
         RpcResponse {
-            id: req.id,
+            id,
             status: STATUS_OK,
             body,
         }
@@ -1410,6 +1422,46 @@ impl MetaShipService {
                 self.inner.destroy_inode(*ino).await?;
                 Ok(MetaReply::Unit)
             }
+            // PR 6: the served side of a cross-owner step — the ONE
+            // applier under THIS holder's guards and lease; the reply
+            // follows the commit's durability lane by construction.
+            MetaCall::XvStep {
+                tx_id,
+                step_idx,
+                step,
+            } => {
+                if crate::meta_backend::crossvol_tx::TEST_XV_SERVE_REFUSE.load(Ordering::SeqCst) {
+                    return Err(SqueezefsError::refused(
+                        libc::EIO,
+                        "TEST_XV_SERVE_REFUSE: the holder is down before its commit".to_string(),
+                    ));
+                }
+                let out = self.inner.xv_serve_step(*tx_id, *step_idx, step).await?;
+                if crate::meta_backend::crossvol_tx::TEST_XV_SERVE_MISDELIVER_ONCE
+                    .swap(false, Ordering::SeqCst)
+                {
+                    XV_MISDELIVER_NEXT_REPLY.store(true, Ordering::SeqCst);
+                }
+                Ok(MetaReply::XvStep {
+                    status: crate::meta_backend::crossvol_tx::status_code(out.status),
+                    inode: out.inode.map(|v| WireInode {
+                        ino: step.home_ino(),
+                        mode: v.mode,
+                        uid: v.uid,
+                        gid: v.gid,
+                        size: v.size,
+                        nlink: v.nlink,
+                        atime: v.atime,
+                        mtime: v.mtime,
+                        ctime: v.ctime,
+                        flags: v.flags,
+                        rdev: v.rdev,
+                    }),
+                })
+            }
+            MetaCall::LookupExact { parent, name } => Ok(MetaReply::DentryExact(
+                self.inner.lookup_dentry(*parent, name).await?,
+            )),
         }
     }
 

@@ -175,6 +175,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
+/// Symmetric PR 6: the cross-owner arms of this backend (the served
+/// step, the intent's slot homing, the set-wide directory-rename lock).
+mod crossvol_arms;
+pub use crossvol_arms::{DirRenameLease, DirRenameOutcome};
+
 /// `SQUEEZEFS_META_NODE_CACHE_MB` (§5.1; absolute MiB, explicit wins
 /// verbatim — default derived, see [`resolve_node_cache_budget`]).
 pub const NODE_CACHE_MB_ENV: &str = "SQUEEZEFS_META_NODE_CACHE_MB";
@@ -21585,51 +21590,41 @@ impl KvMetaBackend {
     fn stage_intent_rider(tx: &mut KvTx, rider: Option<&XvRider>) -> Result<()> {
         match rider {
             None => {}
-            Some(XvRider::Put { tx_id, image }) => tx.stage_put(
+            Some(XvRider::Put {
+                intent_ino,
+                tx_id,
+                image,
+            }) => tx.stage_put(
                 TREE_XATTRS,
-                crossvol_tx::intent_key(*tx_id),
+                crossvol_tx::intent_key_at(*intent_ino, *tx_id),
                 XattrValue::encode_parts(crossvol_tx::intent_name(*tx_id).as_bytes(), image)?,
             ),
-            Some(XvRider::Delete { tx_id }) => {
-                tx.stage_delete(TREE_XATTRS, crossvol_tx::intent_key(*tx_id))
+            Some(XvRider::Delete { intent_ino, tx_id }) => {
+                tx.stage_delete(TREE_XATTRS, crossvol_tx::intent_key_at(*intent_ino, *tx_id))
             }
         }
         Ok(())
     }
 
-    /// Retire an intent: a `Delete` of an EXACT key, so it needs no probe
-    /// and cannot disturb another ino-1-class record.
+    /// Retire an intent homed on ino 0: a `Delete` of an EXACT key, so it
+    /// needs no probe and cannot disturb another ino-1-class record.
     pub async fn xv_retire_intent(&self, tx_id: u64, guards: Arc<[DlmGuard]>) -> Result<()> {
-        self.write_gate()?;
-        let mut tx = KvTx::new();
-        Self::stage_intent_rider(&mut tx, Some(&XvRider::Delete { tx_id }))?;
-        tx.hold_guards(guards);
-        self.commit_tx(tx).await?;
-        Ok(())
+        self.xv_retire_intent_at(crossvol_tx::XV_INTENT_INO, tx_id, guards)
+            .await
     }
 
-    /// This volume's OPEN cross-volume intents as `(tx_id, image)` — a
-    /// bounded range scan over the reserved intent ino, empty on a healthy
-    /// volume. The mount-recovery driver's only input.
+    /// This volume's OPEN cross-volume intents as `(tx_id, image)` over
+    /// every intent home (ino 0, and each slot namespace's local 0 on a
+    /// forest) — a bounded range scan per home, empty on a healthy
+    /// volume. The fsck exemption's input; the recovery driver reads the
+    /// homed form ([`Self::xv_scan_intents_homed`]).
     pub async fn xv_scan_intents(&self) -> Result<Vec<(u64, Vec<u8>)>> {
-        let end = xattr_key(crossvol_tx::XV_INTENT_INO, HASH56_MAX, u8::MAX);
-        let mut cursor: Vec<u8> = xattr_key(crossvol_tx::XV_INTENT_INO, 0, 0).to_vec();
-        let mut out = Vec::new();
-        loop {
-            let page = self
-                .range_kind(TREE_XATTRS, &cursor, &end, SCAN_PAGE)
-                .await?;
-            let Some((last_key, _)) = page.last() else {
-                break;
-            };
-            cursor = key_successor(last_key);
-            for (k, v) in &page {
-                let (_ino, hash, coll) = decode_xattr_key(k)?;
-                let tx_id = (u64::from(coll) << 56) | hash;
-                out.push((tx_id, XattrValue::decode(v)?.value));
-            }
-        }
-        Ok(out)
+        Ok(self
+            .xv_scan_intents_homed()
+            .await?
+            .into_iter()
+            .map(|(_, tx_id, image)| (tx_id, image))
+            .collect())
     }
 
     /// Apply ONE localised plan step in ONE whole-tx entry, optionally
@@ -21789,6 +21784,43 @@ impl KvMetaBackend {
                     inode = Some(v);
                 }
             }
+            XvLocalStep::CreateInode {
+                local_ino,
+                mode,
+                uid,
+                gid,
+                rdev,
+                size,
+                ts_ns,
+            } => match self.read_inode_value(*local_ino).await? {
+                // Present ⇒ this create's own earlier apply (the ino was
+                // minted for it alone — §4.8 never re-mints): answered
+                // from the stored record, never EEXIST.
+                Some(v) => {
+                    status = XvStepStatus::AlreadyApplied;
+                    inode = Some(v);
+                }
+                None => {
+                    let v = InodeValue {
+                        mode: *mode,
+                        uid: *uid,
+                        gid: *gid,
+                        nlink: if (*mode & libc::S_IFMT) == libc::S_IFDIR {
+                            2
+                        } else {
+                            1
+                        },
+                        flags: 0,
+                        rdev: *rdev,
+                        size: *size,
+                        atime: *ts_ns,
+                        mtime: *ts_ns,
+                        ctime: *ts_ns,
+                    };
+                    tx.stage_put(TREE_INODES, inode_key(*local_ino), v.encode());
+                    inode = Some(v);
+                }
+            },
         }
 
         tx.hold_guards(guards);

@@ -16,9 +16,14 @@
 //! that caller (the no-dead-code law).
 //!
 //! The holder's ENDPOINT is the membership census's — the appender id →
-//! member identity binding is PR 12's join ladder; until then the cache
-//! answers the appender id and `g`, which is what the in-process manager
-//! and the contracts consume.
+//! member identity binding is PR 12's join ladder. PR 6 gave the cache the
+//! endpoint TABLE that binding fills ([`SlotHolderCache::set_endpoint`] /
+//! [`SlotHolderCache::endpoint`]): the cross-owner step shipper resolves a
+//! foreign slot's holder to its appender id here and to a wire endpoint
+//! there; a holder with no endpoint yet is the un-shippable class the
+//! roll-forward cadence retries (design §5.6, `xv_cross_owner_intents_
+//! stuck`). The contracts fill the table directly; the join ladder is
+//! its product writer.
 
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
@@ -37,11 +42,38 @@ pub struct SlotHolder {
 #[derive(Debug, Default)]
 pub struct SlotHolderCache {
     map: ArcSwap<HashMap<u32, SlotHolder>>,
+    /// Appender id → the wire endpoint its owner service listens on.
+    endpoints: ArcSwap<HashMap<u32, Arc<str>>>,
 }
 
 impl SlotHolderCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Bind `appender_id` to the endpoint its owner service listens on
+    /// (the join ladder's census binding; the contracts' seam).
+    pub fn set_endpoint(&self, appender_id: u32, endpoint: &str) {
+        let cur = self.endpoints.load();
+        let mut next = (**cur).clone();
+        next.insert(appender_id, Arc::from(endpoint));
+        self.endpoints.store(Arc::new(next));
+    }
+
+    /// Forget `appender_id`'s endpoint (its leave, or a dead member).
+    pub fn clear_endpoint(&self, appender_id: u32) {
+        let cur = self.endpoints.load();
+        if !cur.contains_key(&appender_id) {
+            return;
+        }
+        let mut next = (**cur).clone();
+        next.remove(&appender_id);
+        self.endpoints.store(Arc::new(next));
+    }
+
+    /// The endpoint bound to `appender_id` — one lock-free load.
+    pub fn endpoint(&self, appender_id: u32) -> Option<Arc<str>> {
+        self.endpoints.load().get(&appender_id).cloned()
     }
 
     /// Replace the whole view (tree 0's lessee population at a poll /

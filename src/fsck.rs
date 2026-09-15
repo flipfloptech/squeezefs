@@ -5880,7 +5880,8 @@ async fn open_intent_inos(ctx: &FsckCtx) -> std::collections::HashSet<u64> {
                     }
                     XvStep::SetNlink { ino, .. }
                     | XvStep::TouchCtime { ino, .. }
-                    | XvStep::MintInode { ino, .. } => {
+                    | XvStep::MintInode { ino, .. }
+                    | XvStep::CreateInode { ino, .. } => {
                         out.insert(*ino);
                     }
                 }

@@ -13933,6 +13933,19 @@ impl SqueezefsFilesystem {
                     "meta_kv_replay_extent_violations".into(),
                     load(&meta_kv::META_KV_REPLAY_EXTENT_VIOLATIONS),
                 );
+                // THE CROSS-OWNER FAMILY (design-symmetric-metadata §11 —
+                // PR 6, dark): `xv_cross_owner_intents_{minted,retired,open}`
+                // close as `minted ≡ retired + open`; `steps_shipped` /
+                // `steps_served` are the two ends of the wire; `xv_cross_
+                // owner_intents_stuck` MUST STAY 0 (an open intent no holder
+                // serves past the grace window); `xv_cross_owner_phase_ns`
+                // is exact-sum `plan / intent_barrier / ship_rtt / retire /
+                // total`; `dir_rename_lock_{acquires,wait_ns}` is the
+                // set-wide directory-rename lease (§5.6.4). Every one 0 on
+                // an unarmed or bit-17-absent mount by construction.
+                for (k, v) in crate::meta_backend::crossvol_tx::cross_owner_stats_json() {
+                    metrics.insert(k, v);
+                }
                 // LEAF-MERGE finalized (§4.6a (c)/(e)): `interior_merges`
                 // = the level-≥1 subset of `node_merges` (cross-parent
                 // shrinkage's face); `merge_laps` = whole-volume sweep

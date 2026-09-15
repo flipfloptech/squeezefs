@@ -201,6 +201,13 @@ pub enum ManagerCall {
         block_idx: u64,
         owner: Option<(u64, u32)>,
     },
+    // PR 6 (design §5.6.4, KD-SYM-14) — the block 0x60–0x6F, appended:
+    // the set-wide directory-rename lock, VOLUME 0's manager only.
+    /// Take the set-wide `dir_rename` lease for `appender_id` — or learn
+    /// who holds it (`DirRenameBusy`; the caller waits).
+    DirRenameLock { appender_id: u32 },
+    /// Release it (`already` when it was not held by the caller).
+    DirRenameUnlock { appender_id: u32 },
 }
 
 /// The slot tree's words on the wire (§5.1.4 "four words move" — root,
@@ -262,6 +269,8 @@ impl ManagerCall {
             Self::MarkShared { .. } => "mark_shared",
             Self::ShareBlock { .. } => "share_block",
             Self::ReleaseShared { .. } => "release_shared",
+            Self::DirRenameLock { .. } => "dir_rename_lock",
+            Self::DirRenameUnlock { .. } => "dir_rename_unlock",
         }
     }
 }
@@ -364,6 +373,20 @@ pub enum ManagerReply {
     SharedReleased {
         shared: bool,
         remaining: u32,
+    },
+    // PR 6 — appended.
+    /// The set-wide directory-rename lease is the caller's (`already` =
+    /// it was — KD-SYM-7).
+    DirRenameLocked {
+        already: bool,
+    },
+    /// Another appender holds it; the caller waits and retries.
+    DirRenameBusy {
+        holder: u32,
+    },
+    /// Released (`already` = the caller held nothing).
+    DirRenameUnlocked {
+        already: bool,
     },
 }
 
@@ -678,6 +701,27 @@ impl ManagerService {
                             },
                         })
                 }
+                // The lock's term is the SERVING manager's era: a wire
+                // holder's own term is not this volume's writer term, and
+                // the record's term only tells a release-dead which
+                // incarnation of the id died.
+                ManagerCall::DirRenameLock { appender_id } => self
+                    .volume
+                    .manager_dir_rename_lock(*appender_id, self.volume.writer_term())
+                    .await
+                    .map(|out| match out {
+                        crate::meta_backend::kv::backend::DirRenameOutcome::Locked { already } => {
+                            ManagerReply::DirRenameLocked { already }
+                        }
+                        crate::meta_backend::kv::backend::DirRenameOutcome::Busy { holder } => {
+                            ManagerReply::DirRenameBusy { holder }
+                        }
+                    }),
+                ManagerCall::DirRenameUnlock { appender_id } => self
+                    .volume
+                    .manager_dir_rename_unlock(*appender_id)
+                    .await
+                    .map(|already| ManagerReply::DirRenameUnlocked { already }),
             };
         let (reply, status) = match served {
             Ok(reply) => (reply, STATUS_OK),
@@ -1026,6 +1070,29 @@ impl ManagerClient {
     /// `ResolveSlot` — `Ok(reply)` is `Holder` or `Unleased`.
     pub async fn resolve_slot(&mut self, slot: u16) -> Result<ManagerReply> {
         match self.call(ManagerCall::ResolveSlot { slot }).await? {
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Ok(other),
+        }
+    }
+
+    /// `DirRenameLock` (PR 6) — `Ok(reply)` is `DirRenameLocked` or
+    /// `DirRenameBusy`.
+    pub async fn dir_rename_lock(&mut self, appender_id: u32) -> Result<ManagerReply> {
+        match self
+            .call(ManagerCall::DirRenameLock { appender_id })
+            .await?
+        {
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Ok(other),
+        }
+    }
+
+    /// `DirRenameUnlock` (PR 6) — `Ok(reply)` is `DirRenameUnlocked`.
+    pub async fn dir_rename_unlock(&mut self, appender_id: u32) -> Result<ManagerReply> {
+        match self
+            .call(ManagerCall::DirRenameUnlock { appender_id })
+            .await?
+        {
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
             other => Ok(other),
         }

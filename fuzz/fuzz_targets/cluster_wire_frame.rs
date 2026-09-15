@@ -31,8 +31,10 @@ use squeezefs::cluster_wire::{
     hex_decode, hex_encode, mac_eq, read_plain_frame, session_framers, session_key,
     write_plain_frame, FrameClass, Role, RpcFrame, MAC_BYTES,
 };
+use squeezefs::meta_backend::crossvol_tx::{IntentRecord, XvOp, XvStep};
 use squeezefs::meta_ship::wire::{
     decode_reclaim, decode_reply, decode_request, encode_reclaim, encode_reply, encode_request,
+    MetaCall, MetaOp, MetaRequestFrame, META_SHIP_SCHEMA,
 };
 
 /// `RpcFrame` carries no `PartialEq` (it holds nothing the daemon ever
@@ -208,6 +210,99 @@ struct ArbInput {
     frame: ArbRpc,
 }
 
+/// One cross-owner step from the input bytes (the `MetaCall::XvStep`
+/// wire form is bincode, the same as every S8 body): a step that decodes
+/// rides a request frame and an intent record, and both round-trip to the
+/// same step. The record codec is total on the raw bytes beside it.
+fn check_xv_step_bodies(data: &[u8]) {
+    let _ = IntentRecord::decode(data);
+    let mut u = Unstructured::new(data);
+    let Ok(tx_id) = u64::arbitrary(&mut u) else {
+        return;
+    };
+    let Ok(kind) = u8::arbitrary(&mut u) else {
+        return;
+    };
+    let Ok(ino) = u64::arbitrary(&mut u) else {
+        return;
+    };
+    let Ok(other) = u64::arbitrary(&mut u) else {
+        return;
+    };
+    let Ok(word) = u32::arbitrary(&mut u) else {
+        return;
+    };
+    let Ok(name) = String::arbitrary(&mut u) else {
+        return;
+    };
+    // Names on the wire are ≤ 255 bytes (the record codec's bound).
+    let name: String = name.chars().take(60).collect();
+    let step = match kind % 6 {
+        0 => XvStep::RemoveDentry {
+            parent: ino,
+            name,
+            expect_child: other,
+            parent_update: (word & 3) as u8,
+        },
+        1 => XvStep::InsertDentry {
+            parent: ino,
+            name,
+            child: other,
+            ft_bits: word & 0o170000,
+            parent_update: (word >> 8 & 3) as u8,
+        },
+        2 => XvStep::SetNlink {
+            ino,
+            pre: word,
+            post: word.wrapping_add(1),
+            ctime: (other & 1 == 1).then_some(other),
+        },
+        3 => XvStep::TouchCtime { ino, ctime: other },
+        4 => XvStep::MintInode {
+            ino,
+            mode: word,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+        },
+        _ => XvStep::CreateInode {
+            ino,
+            mode: word,
+            uid: 1,
+            gid: 2,
+            rdev: 0,
+            size: other,
+            ts_ns: other ^ tx_id,
+        },
+    };
+    let frame = MetaRequestFrame {
+        schema: META_SHIP_SCHEMA,
+        client_epoch: tx_id,
+        client_id: String::new(),
+        owner_term: 0,
+        ops: vec![MetaOp {
+            id: 1,
+            call: MetaCall::XvStep {
+                tx_id,
+                step_idx: 0,
+                step: step.clone(),
+            },
+        }],
+    };
+    let wire = encode_request(&frame).expect("a bounded step frame encodes");
+    let back = decode_request(&wire).expect("re-decodes");
+    assert_eq!(back, frame, "the S8 body round-trips the step");
+    let record = IntentRecord {
+        tx_id,
+        op: XvOp::Create,
+        steps: vec![step.clone()],
+    };
+    let image = record.encode().expect("one step encodes");
+    let again = IntentRecord::decode(&image).expect("the record decodes");
+    assert_eq!(again, record, "the intent record round-trips the step");
+    assert_eq!(again.steps[0], step, "both codecs name the same step");
+}
+
 const CLASSES: [FrameClass; 3] = [FrameClass::Handshake, FrameClass::Control, FrameClass::Bulk];
 
 fuzz_target!(|data: &[u8]| {
@@ -249,6 +344,11 @@ fuzz_target!(|data: &[u8]| {
         let re = encode_reclaim(&f).expect("an accepted reclaim re-encodes");
         assert_eq!(decode_reclaim(&re).expect("re-decodes"), f);
     }
+
+    // --- arm 3b (PR 6): a cross-owner STEP as the S8 body carries it, and
+    // as the intent RECORD carries it — one step, both codecs, both
+    // round-tripping and never disagreeing about the step.
+    check_xv_step_bodies(data);
 
     // --- arm 4: the proof helpers -------------------------------------------
     if let Ok(s) = std::str::from_utf8(data) {

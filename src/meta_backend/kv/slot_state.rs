@@ -727,12 +727,14 @@ pub const DIR_RENAME_LEN: usize = 1 + 4 + 8 + 8;
 pub struct DirRenameRecord {
     /// The holder's appender id (on volume 0).
     pub holder: u32,
-    /// The holder's writer term at the take — a successor incarnation of
-    /// the same id presents a higher one, and the release-dead arm reads
-    /// which incarnation died.
+    /// The SERVING manager's writer era at the take — operator-facing
+    /// provenance (which manager incarnation granted the lease; the
+    /// release-dead arm names it in its log line). Never a check: a wire
+    /// holder's own term is not this volume's writer term.
     pub term: u64,
-    /// CLOCK_REALTIME ns of the take (operator-facing: how long the set
-    /// has been renaming directories under one lease).
+    /// CLOCK_REALTIME ns of the take (`SystemTime::now()` — operator-
+    /// facing: how long the set has been renaming directories under one
+    /// lease; readable from tree 0 on any process).
     pub since_ns: u64,
 }
 

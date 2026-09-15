@@ -178,7 +178,7 @@ use std::sync::{Arc, Weak};
 /// Symmetric PR 6: the cross-owner arms of this backend (the served
 /// step, the intent's slot homing, the set-wide directory-rename lock).
 mod crossvol_arms;
-pub use crossvol_arms::{DirRenameLease, DirRenameOutcome};
+pub use crossvol_arms::{screen_dir_rename_words, DirRenameLease, DirRenameOutcome};
 
 /// `SQUEEZEFS_META_NODE_CACHE_MB` (§5.1; absolute MiB, explicit wins
 /// verbatim — default derived, see [`resolve_node_cache_budget`]).

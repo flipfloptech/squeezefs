@@ -221,6 +221,51 @@ fn check_service_edge(call: &ManagerCall, total_extents: u64, record_seed: &[u8]
     }
 }
 
+/// PR 6 (review round 1, Issue 3): the two lock verbs' wire screen over
+/// the frame's volume ordinal and the appender id, against every
+/// combination of the durable facts (`screen_dir_rename_words` is total;
+/// it admits exactly volume 0 + a Live non-own id + the holder for an
+/// unlock, and refuses everything else with a reason).
+fn check_dir_rename_screen(frame: &ManagerRequestFrame, facts: u8) {
+    let (appender_id, unlock) = match &frame.call {
+        ManagerCall::DirRenameLock { appender_id } => (*appender_id, false),
+        ManagerCall::DirRenameUnlock { appender_id } => (*appender_id, true),
+        _ => return,
+    };
+    let is_own = facts & 1 == 1;
+    let live = facts & 2 == 2;
+    let holder = match facts >> 2 & 3 {
+        0 => None,
+        1 => Some(None),
+        2 => Some(Some(appender_id)),
+        _ => Some(Some(appender_id.wrapping_add(1))),
+    };
+    let unlock_of = if unlock { holder } else { None };
+    let verdict = squeezefs::meta_backend::kv::backend::screen_dir_rename_words(
+        Some(frame.volume),
+        appender_id,
+        is_own,
+        live,
+        unlock_of,
+    );
+    let admissible = frame.volume == 0
+        && !is_own
+        && live
+        && !matches!(unlock_of, Some(Some(h)) if h != appender_id);
+    assert_eq!(verdict.is_ok(), admissible, "{verdict:?} facts={facts:#b}");
+    assert!(
+        squeezefs::meta_backend::kv::backend::screen_dir_rename_words(
+            None,
+            appender_id,
+            is_own,
+            live,
+            unlock_of
+        )
+        .is_err(),
+        "a service that does not know its ordinal serves no set-wide verb"
+    );
+}
+
 fn check_request(frame: &ManagerRequestFrame) {
     let re = encode_request(frame).expect("an accepted request frame re-encodes");
     let again = decode_request(&re).expect("a re-encoded request frame decodes");
@@ -563,6 +608,7 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(frame) = decode_request(data) {
         check_request(&frame);
         check_service_edge(&frame.call, 1 << 20, &data[..data.len().min(64)]);
+        check_dir_rename_screen(&frame, data.first().copied().unwrap_or(0));
     }
     if let Ok(frame) = decode_reply(data) {
         check_reply(&frame);
@@ -591,6 +637,7 @@ fuzz_target!(|data: &[u8]| {
     };
     // --- arm 3: the service edge over the call's integers -------------------
     check_service_edge(&request.call, input.total_extents, &input.record_seed);
+    check_dir_rename_screen(&request, input.record_seed.first().copied().unwrap_or(0));
     // Past the CONTROL cap the encoder REFUSES (a return of that many
     // runs never rides one frame) — that refusal is the contract, not a
     // failure; below it the frame must round-trip.

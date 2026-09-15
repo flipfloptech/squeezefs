@@ -457,11 +457,27 @@ pub fn decode_reply(bytes: &[u8]) -> Result<ManagerReplyFrame> {
 /// (`manager_service_ns`, exact-sum).
 pub struct ManagerService {
     volume: Arc<KvMetaBackend>,
+    /// The volume's ordinal in the set this service serves for — the
+    /// set-wide verbs (`DirRenameLock/Unlock`, volume 0's) screen on it;
+    /// `None` = a bare per-volume service that does not know its place
+    /// and therefore serves no set-wide verb.
+    ordinal: Option<u16>,
 }
 
 impl ManagerService {
     pub fn new(volume: Arc<KvMetaBackend>) -> Arc<Self> {
-        Arc::new(Self { volume })
+        Arc::new(Self {
+            volume,
+            ordinal: None,
+        })
+    }
+
+    /// The service for the volume at `ordinal` of its set.
+    pub fn new_at(volume: Arc<KvMetaBackend>, ordinal: u16) -> Arc<Self> {
+        Arc::new(Self {
+            volume,
+            ordinal: Some(ordinal),
+        })
     }
 
     fn refuse(&self, id: u64, status: u16, reason: String) -> RpcResponse {
@@ -701,13 +717,13 @@ impl ManagerService {
                             },
                         })
                 }
-                // The lock's term is the SERVING manager's era: a wire
-                // holder's own term is not this volume's writer term, and
-                // the record's term only tells a release-dead which
-                // incarnation of the id died.
+                // The two set-wide verbs: the wire words screened first
+                // (volume 0 only, a Live non-own id, the holder for an
+                // unlock — review round 1, Issue 3), the record's term the
+                // SERVING manager's era (provenance, never a check).
                 ManagerCall::DirRenameLock { appender_id } => self
                     .volume
-                    .manager_dir_rename_lock(*appender_id, self.volume.writer_term())
+                    .manager_dir_rename_lock_wire(self.ordinal, *appender_id)
                     .await
                     .map(|out| match out {
                         crate::meta_backend::kv::backend::DirRenameOutcome::Locked { already } => {
@@ -719,7 +735,7 @@ impl ManagerService {
                     }),
                 ManagerCall::DirRenameUnlock { appender_id } => self
                     .volume
-                    .manager_dir_rename_unlock(*appender_id)
+                    .manager_dir_rename_unlock_wire(self.ordinal, *appender_id)
                     .await
                     .map(|already| ManagerReply::DirRenameUnlocked { already }),
             };
@@ -809,7 +825,8 @@ impl ManagerSetService {
         Arc::new(Self {
             volumes: volumes
                 .iter()
-                .map(|v| ManagerService::new(Arc::clone(v)))
+                .enumerate()
+                .map(|(i, v)| ManagerService::new_at(Arc::clone(v), i as u16))
                 .collect(),
         })
     }

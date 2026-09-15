@@ -1130,9 +1130,9 @@ impl RecallLane {
         Self::new(ConfigMode::Live)
     }
 
-    /// The read-token plane's lane (PR 5): live derivation off the
-    /// plane's own recall RTT evidence, the valve off (see
-    /// [`ConfigMode::LiveTokens`]).
+    /// The read-token plane's lane (PR 5): the recall deadline is the
+    /// reader's lease TTL by derivation, the valve off (the
+    /// `ConfigMode::LiveTokens` mode).
     pub fn live_tokens() -> Self {
         Self::new(ConfigMode::LiveTokens)
     }

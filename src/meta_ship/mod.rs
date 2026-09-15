@@ -118,9 +118,6 @@ pub mod placement;
 pub mod publish;
 pub mod router;
 pub mod service;
-/// Symmetric metadata program PR 5: GPFS-strict read tokens — the S10
-/// delegation generalized to every foreign object (record-carrying
-/// grants, recall before a conflicting commit), its own verb block.
 pub mod token_plane;
 pub mod tokens;
 pub mod wire;

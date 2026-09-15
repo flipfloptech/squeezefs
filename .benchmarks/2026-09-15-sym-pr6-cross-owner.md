@@ -5,7 +5,7 @@
 | **Date** | 2026-09-15 |
 | **Branch** | `feat/sym-cross-owner-tx` (cut from `dev` @ `6f8d44e6` — PR 1, 2, 3, 4, 11 and 16 in) |
 | **Design** | [`docs/design-symmetric-metadata.md`](../docs/design-symmetric-metadata.md) §5.6 (D18 reversed), §5.6.4 (the set-wide lock), §5.3.5 (idempotent verbs), §5.4.2, §11 (the Cross-owner family); PR-plan row 6; KD-SYM-14 |
-| **Contracts** | [`tests/sym_cross_owner_tests.rs`](../tests/sym_cross_owner_tests.rs) — 28 contracts + the `#[ignore]`d scoping instrument (15 at round 1, 8 added by review round 2 — §8, 5 by round 3 — §9), appended to `tests/run_sym_forest_suites.sh`'s list |
+| **Contracts** | [`tests/sym_cross_owner_tests.rs`](../tests/sym_cross_owner_tests.rs) — 27 contracts + the `#[ignore]`d scoping instrument (15 at round 1, 8 added by review round 2 — §8, 4 by round 3 — §9, one round-3 fix pinned as a new leg of an existing contract), appended to `tests/run_sym_forest_suites.sh`'s list |
 | **Venue** | the dev laptop — **SCOPING only** (the venue rule: no acceptance row is this rung's; the `tar -x` / shared-directory brackets are PR 13/14's on squeeze-test). Four implementers shared the box during every number below. |
 | **Instrument** | in-process file-backed volumes (64 KiB nodes, a 1 MiB ring, one 64 MiB volume, one file-backed data volume for the offline fsck), the two-appender declared-partition model over a real `cluster_wire` loopback session; `cargo test --release` for the rate row, debug for the contracts |
 | **Status** | landed dark: bit 17 AND `SQUEEZEFS_SYMMETRIC_META=1`; `=0` and every bit-17-absent mount take the S3.5 paths verbatim (pinned on both layouts) |
@@ -173,5 +173,14 @@ Every gauge added by the round is on the stats inode and in `docs/operations.md`
 
 ### 9a. Run ledger (round 3, the final tree)
 
-Filled in the round-3 implementation summary in the review file; the same table.
+| Run | Result |
+|---|---|
+| `cargo fmt --check` (root, `fuzz/`) / `fuzz/` `cargo check` | clean / clean / clean |
+| `cargo clippy --all-targets --all-features -- -D warnings` / shipped config | clean / clean |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | green |
+| `sym_cross_owner_tests` ×3 stamped, `--test-threads=1` | 27 passed (+1 ignored) ×3 — 13.7 / 13.5 / 13.5 s |
+| `sym_cross_owner_tests` ×1 flat | 27 passed, 13.0 s |
+| `sym_cross_owner_tests` `--test-threads=4`, flat / stamped | 27 / 27 (13.0 s / 13.5 s) |
+| `rename_lock_set_tests` / `crossvol_tx_tests` / `docs_parity_tests` / `derivation_sweep_tests`, flat AND stamped | 2 / 14 / 5 / 55 — both legs |
+| `tests/check_markdown_links.sh` | PASS |
 

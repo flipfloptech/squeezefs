@@ -1234,7 +1234,7 @@ pub fn root_extent_of(addr: u64, bounds: &ReleaseWordBounds) -> Option<u64> {
         return None;
     }
     let off = addr - bounds.heap_base;
-    if off % bounds.node_size != 0 {
+    if !off.is_multiple_of(bounds.node_size) {
         return None;
     }
     let extent = off / bounds.node_size;

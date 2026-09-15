@@ -1002,7 +1002,7 @@ proptest! {
             }
             None => prop_assert!(
                 words.root.0 < heap
-                    || (words.root.0 - heap) % node != 0
+                    || !(words.root.0 - heap).is_multiple_of(node)
                     || (words.root.0 - heap) / node >= total
             ),
         }

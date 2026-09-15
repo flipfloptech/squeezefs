@@ -1061,7 +1061,7 @@ pub fn checkpoint_landing_ceiling_for_elastic(decision_ms: u64, flush_interval_m
 /// clause b; the [`KvMetaBackend::checkpoint_past`] precedent's shape):
 /// consecutive barriered cycles with retirements parked, none released,
 /// and the ledger tail not advancing, before the volume fails loud. The
-/// audit is centralized in [`KvMetaBackend::checkpoint_cycle`] (P2
+/// audit is centralized in `KvMetaBackend::checkpoint_cycle` (P2
 /// 2026-07-26 §9: the pre-fix audit lived only on the maintenance arms,
 /// so direct-cycle callers livelocked silently). A healthy convergence
 /// needs at most a couple of cycles (the first discharges dying floors,

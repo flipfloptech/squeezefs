@@ -1886,14 +1886,31 @@ pub async fn recover_open_intents(routed: &RoutedMetaBackend) -> Result<usize> {
 /// retired; an intent whose holder is still unreachable stays open and,
 /// past the grace window, counts on `xv_cross_owner_intents_stuck`.
 pub async fn roll_forward_open_intents(routed: &RoutedMetaBackend) -> Result<usize> {
+    roll_forward_filtered(routed, |_| true)
+        .await
+        .map(|(n, _)| n)
+}
+
+/// [`roll_forward_open_intents`] over the open intents `aged` admits;
+/// answers `(retired, the tx ids seen open at this scan)` — the cadence's
+/// two-tick rule reads the second.
+async fn roll_forward_filtered(
+    routed: &RoutedMetaBackend,
+    aged: impl Fn(u64) -> bool,
+) -> Result<(usize, Vec<u64>)> {
     let open = scan_open(routed).await?;
+    let seen: Vec<u64> = open.iter().map(|o| o.rec.tx_id).collect();
     let mut rolled = 0usize;
     for o in open {
+        note_intent_open(o.rec.tx_id);
+        if !aged(o.rec.tx_id) {
+            continue;
+        }
         if recover_one(routed, &o).await? {
             rolled += 1;
         }
     }
-    Ok(rolled)
+    Ok((rolled, seen))
 }
 
 /// **Ownership-scoped recovery** (per-volume claim admission §5.4 sweep
@@ -2122,20 +2139,28 @@ pub fn status_code(status: XvStepStatus) -> u8 {
 /// flight task ticking at the checkpoint LANDING ceiling — an intent a
 /// live op left open (its holder down, its endpoint unbound at the mount's
 /// own recovery) is completed within a few ceilings of the holder
-/// returning, never only at the next mount. Ends when the set is dropped.
+/// returning, never only at the next mount. **Two-tick rule**: an intent
+/// is rolled forward only once it was seen open at two consecutive scans
+/// — a live op's own intent (registered at its `tx0`, retired within its
+/// ship's round trip) is never raced by its own cadence. Ends when the
+/// set is dropped.
 pub fn spawn_roll_forward_cadence(routed: std::sync::Weak<RoutedMetaBackend>, tick_ms: u64) {
     crate::meta_exec::spawn_meta("xv_roll_forward_cadence", async move {
         let tick = std::time::Duration::from_millis(tick_ms.max(1));
+        let mut seen_last: Vec<u64> = Vec::new();
         loop {
             squeezefs_ipc::sqz_time::sleep(tick).await;
             let Some(routed) = routed.upgrade() else {
                 return;
             };
             if OPEN_INTENTS.lock().is_empty() {
+                seen_last.clear();
                 continue;
             }
-            if let Err(e) = roll_forward_open_intents(&routed).await {
-                log::warn!("cross-owner roll-forward cadence: {e}");
+            let aged = seen_last.clone();
+            match roll_forward_filtered(&routed, |tx| aged.contains(&tx)).await {
+                Ok((_, seen)) => seen_last = seen,
+                Err(e) => log::warn!("cross-owner roll-forward cadence: {e}"),
             }
         }
     });

@@ -192,12 +192,14 @@ fn listener_cfg() -> cw::RpcListenerConfig {
     }
 }
 
-/// A swappable service front (test-local): the listener keeps one
+/// A sequenced service front (test-local): the listener keeps one
 /// `Arc<dyn RpcAsyncService>`, so a HOLDER RESTART — a fresh
-/// `MetaShipService` with an EMPTY dedup window — is modelled by swapping
-/// what the front dispatches to.
+/// `MetaShipService` with an EMPTY dedup window — is modelled by handing
+/// the N-th call to the N-th service (the last one serves every call
+/// past the list). One service = the ordinary front.
 struct SwapFront {
-    inner: arc_swap::ArcSwap<Arc<dyn cw::RpcAsyncService>>,
+    services: Vec<Arc<dyn cw::RpcAsyncService>>,
+    calls: std::sync::atomic::AtomicUsize,
 }
 
 impl cw::RpcAsyncService for SwapFront {
@@ -206,7 +208,8 @@ impl cw::RpcAsyncService for SwapFront {
         req: cw::RpcRequest,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = cw::RpcResponse> + Send + 'a>> {
         Box::pin(async move {
-            let svc = Arc::clone(&*self.inner.load());
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let svc = &self.services[n.min(self.services.len() - 1)];
             svc.call(req).await
         })
     }
@@ -226,18 +229,28 @@ fn meta_router(routed: &Arc<RoutedMetaBackend>) -> Arc<dyn cw::RpcAsyncService> 
 /// the census.
 struct Holders {
     host: Arc<cw::RpcListener>,
-    front: Arc<SwapFront>,
 }
 
 impl Holders {
     async fn stand_up(routed: &Arc<RoutedMetaBackend>, appenders: &[u32]) -> Self {
+        Self::stand_up_sequenced(routed, appenders, 1).await
+    }
+
+    /// `incarnations` services in sequence — the second one is a holder
+    /// RESTART (an empty dedup window) for the call after the first.
+    async fn stand_up_sequenced(
+        routed: &Arc<RoutedMetaBackend>,
+        appenders: &[u32],
+        incarnations: usize,
+    ) -> Self {
         let front = Arc::new(SwapFront {
-            inner: arc_swap::ArcSwap::from_pointee(meta_router(routed)),
+            services: (0..incarnations).map(|_| meta_router(routed)).collect(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
         });
         let host = cw::RpcListener::start_async(
             listener_cfg(),
             SECRET.to_vec(),
-            Arc::clone(&front) as Arc<dyn cw::RpcAsyncService>,
+            front as Arc<dyn cw::RpcAsyncService>,
         )
         .expect("owner listener");
         let endpoint = host.endpoint().to_string();
@@ -252,7 +265,7 @@ impl Holders {
             "node-b",
             SECRET.to_vec(),
         ));
-        Self { host, front }
+        Self { host }
     }
 
     fn tear_down(self) {
@@ -677,28 +690,22 @@ async fn a_holder_dying_after_commit_before_reply_is_recognized_exactly_once_by_
     let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
     let shared = dirs[0];
     let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
-    let holders = Holders::stand_up(&routed, &[1]).await;
+    // Two incarnations of the holder: the first serves ONE call (the step
+    // it commits and then misdelivers), the second — a fresh service with
+    // an empty dedup window — serves the resend.
+    let holders = Holders::stand_up_sequenced(&routed, &[1], 2).await;
     let applied_before = crossvol_tx::XV_STEPS_APPLIED.load(Ordering::Relaxed);
     let already_before = crossvol_tx::XV_STEPS_ALREADY_APPLIED.load(Ordering::Relaxed);
     let before = cross_owner_stats();
-    // The seam: the NEXT served step commits, then its reply is
-    // misdelivered; the front swaps to a fresh service before the resend.
     TEST_XV_SERVE_MISDELIVER_ONCE.store(true, Ordering::SeqCst);
-    let swap = {
-        let front = Arc::clone(&holders.front);
-        let routed = Arc::clone(&routed);
-        tokio::spawn(async move {
-            while TEST_XV_SERVE_MISDELIVER_ONCE.load(Ordering::SeqCst) {
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-            }
-            front.inner.store(Arc::new(meta_router(&routed)));
-        })
-    };
     let f = routed
         .create(shared, "once", libc::S_IFREG | 0o644, 0, 0)
         .await
         .expect("the resend completes the create");
-    swap.await.unwrap();
+    assert!(
+        !TEST_XV_SERVE_MISDELIVER_ONCE.load(Ordering::SeqCst),
+        "the seam fired on the first served step"
+    );
     assert_eq!(lookup_opt(&routed, shared, "once").await, Some(f.ino));
     assert_eq!(
         names_in(&routed, shared)
@@ -886,10 +893,9 @@ async fn two_nodes_cannot_rename_directories_into_a_cycle() {
     let (r1, r2) = (r1.await.unwrap(), r2.await.unwrap());
     let ok = usize::from(r1.is_ok()) + usize::from(r2.is_ok());
     assert_eq!(ok, 1, "exactly one completes: {r1:?} / {r2:?}");
-    let refused = if r1.is_err() {
-        r1.unwrap_err()
-    } else {
-        r2.unwrap_err()
+    let refused = match (r1, r2) {
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => e,
+        other => panic!("{other:?}"),
     };
     assert_eq!(
         refused.to_errno(),

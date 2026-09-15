@@ -59,6 +59,12 @@
 # (the flat ledger keying the GLOBAL owner verbatim, PK2's one pack scope,
 # the plain clone with every gauge 0, the ignored gather xattr) run on
 # both legs.
+# `sym_cross_owner_tests` (PR 6 — cross-owner transactions over shipped
+# steps + the set-wide directory-rename lock) rides both legs the PR 4
+# way: its two- and three-holder fixtures stamp under the seam themselves
+# and arm the plane, its unarmed/flat pin (the S3.5 paths ship and lock
+# nothing) runs on both legs, and the S3.5 suites it generalizes stay in
+# the list above it.
 #
 # WALL TIME IS A ROW (review round 4, Issue 26): each suite runs under
 # its own timer per leg, and the summary prints `flat`, `stamped` and the
@@ -114,6 +120,7 @@ DEFAULT_SUITES=(
   sym_convert_tests
   sym_pack_tests
   sym_shared_refs_tests
+  sym_cross_owner_tests
 )
 read -r -a SUITES <<<"${SQZ_SYM_SUITES:-${DEFAULT_SUITES[*]}}"
 RATIO_NOTE="${SQZ_SYM_RATIO_NOTE:-2.0}"

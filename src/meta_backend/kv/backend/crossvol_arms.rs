@@ -25,15 +25,15 @@ use crate::meta_backend::kv::slot_state::{DirRenameRecord, DIR_RENAME_KEY};
 static DIR_RENAME_RELEASED: once_cell::sync::Lazy<squeezefs_ipc::sqz_notify::Notify> =
     once_cell::sync::Lazy::new(squeezefs_ipc::sqz_notify::Notify::new);
 
-/// The in-process manager's TICKET count under its own lease, per volume
-/// (keyed by the volume's `Arc` address): two directory renames of this
-/// process run under ONE record, and the record is released only when
-/// the LAST of them releases — before it, the first to finish released
-/// the record while the second still ran, and a third node could take
-/// the lease beside it (review round 1, Issue 5). Mutated under the
-/// volume's `manager_verbs` mutex.
+/// The in-process TICKET count under a held lease, per `(volume, lock
+/// identity)` (the volume by its `Arc` address): two directory renames
+/// of one initiator run under ONE record, and the record is released
+/// only when the LAST of them releases — before it, the first to finish
+/// released the record while the second still ran, and a third node
+/// could take the lease beside it (review round 1, Issue 5). Mutated
+/// under the volume's `manager_verbs` mutex.
 static DIR_RENAME_LOCAL_TICKETS: once_cell::sync::Lazy<
-    parking_lot::Mutex<std::collections::HashMap<usize, u32>>,
+    parking_lot::Mutex<std::collections::HashMap<(usize, u32), u32>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
 /// The verdict of a `DirRenameLock`.
@@ -475,7 +475,7 @@ impl KvMetaBackend {
     ) -> std::result::Result<(), KvError> {
         let set = self.manager_gate(true)?;
         let _g = self.manager_verbs.lock().await;
-        let key = Arc::as_ptr(self) as usize;
+        let key = (Arc::as_ptr(self) as usize, appender_id);
         let last = {
             let mut tickets = DIR_RENAME_LOCAL_TICKETS.lock();
             match tickets.get_mut(&key) {
@@ -507,7 +507,7 @@ impl KvMetaBackend {
         self: &Arc<Self>,
         appender_id: u32,
     ) -> std::result::Result<DirRenameLease, KvError> {
-        let key = Arc::as_ptr(self) as usize;
+        let key = (Arc::as_ptr(self) as usize, appender_id);
         loop {
             let released = DIR_RENAME_RELEASED.notified();
             let set = self.manager_gate(false)?;

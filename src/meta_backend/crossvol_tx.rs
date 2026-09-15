@@ -200,6 +200,13 @@ pub static TEST_XV_SERVE_HOLD_MS: AtomicU64 = AtomicU64::new(0);
 /// what it scanned.
 pub static TEST_XV_CADENCE_HOLD_AFTER_SCAN_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Test seam: the NEXT in-process take of the set-wide directory-rename
+/// lease runs under this appender identity instead of the mount's own
+/// (0 = off; consumed by the take) — a second INITIATOR in one process,
+/// KD-SYM-14's pin. Must name a joined appender (its Live page).
+pub static TEST_DIR_RENAME_IDENTITY_ONCE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
 /// Test seam: acquire an IN-PROCESS holder's guards over the wire (an
 /// `XvGuards` to its endpoint) instead of in the shared table's one
 /// canonical `lock_many` — the initiator's remote arm, exercised where

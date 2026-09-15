@@ -4313,8 +4313,14 @@ impl Metadata for RoutedMetaBackend {
             if want_lock && lease.is_none() {
                 let t = std::time::Instant::now();
                 let vol0 = &self.volumes[0];
+                let identity = match crossvol_tx::TEST_DIR_RENAME_IDENTITY_ONCE
+                    .swap(0, std::sync::atomic::Ordering::SeqCst)
+                {
+                    0 => vol0.own_appender_id(),
+                    other => other,
+                };
                 let held = vol0
-                    .dir_rename_lock_held(vol0.own_appender_id())
+                    .dir_rename_lock_held(identity)
                     .await
                     .map_err(crate::error::SqueezefsError::from)?;
                 crossvol_tx::note_dir_rename_lock(t.elapsed());

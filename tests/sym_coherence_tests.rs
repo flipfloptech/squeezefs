@@ -2109,6 +2109,113 @@ async fn commits_after_a_reopened_writers_join_survive_the_next_remount_unscreen
     // `fsck_clean` (its fixture carries the format config fsck needs).
 }
 
+/// **The once-armed volume takes no writer without the plane** (review
+/// round 3, Issue 25 — the frame-stamp class of the pin above on the
+/// OTHER legal transition). An armed session leaves its native-slot
+/// leaves with frames at `g ≥ 1` and generation `g`'s recorded tails; a
+/// `SQUEEZEFS_SYMMETRIC_META=0` WRITER session on the same bit-17 volume
+/// has no lease plane and no legitimate stamp for the leaves it appends
+/// to (its first commit is the `writer_claim` on ino 1's leaf): `(0, 0)`
+/// is rule 3's non-monotone `g` on itself and rule 2's zombie shape past
+/// the recorded tail on the next armed session — its acked commits gone
+/// at the next load, silently. The law ("a slot's generations are ONE
+/// sequence owned by its lease") has no unarmed writer, so the `=0`
+/// writable open of a once-armed volume REFUSES loud, naming the knob,
+/// before anything is written; readers and probes open as before; a
+/// never-armed stamped volume (every slot at `g = 0` — the PR 1–3 shape)
+/// opens `=0` exactly as shipped. The `Ok` arm below is the defect's own
+/// shape — RED on the tree this lands on by the LOSS it demands be absent
+/// — and the fix takes the `Err` arm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_once_armed_volume_refuses_a_writer_without_the_plane_and_loses_nothing() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let uris = vec![path.display().to_string()];
+    let screened0 = META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed);
+    // A never-armed stamped volume opens `=0` writable: the shipped PR
+    // 1–3 posture, untouched by the gate.
+    std::env::remove_var(SYMMETRIC_META_ENV);
+    let fresh = open_routed_meta_set(&uris)
+        .await
+        .expect("=0 on a never-armed forest");
+    assert!(fresh.volumes[0].slot_lease_stats().is_none());
+    shutdown(&fresh).await;
+
+    let mut expected = Vec::new();
+    let writer = open_armed_writer(&path).await;
+    for i in 0..4 {
+        let name = format!("armed-{i}");
+        let ino = Metadata::create(writer.as_ref(), 1, &name, libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap()
+            .ino;
+        expected.push((name, ino));
+    }
+    shutdown(&writer).await;
+
+    // The `=0` WRITER on the once-armed volume.
+    std::env::remove_var(SYMMETRIC_META_ENV);
+    match open_routed_meta_set(&uris).await {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(msg.contains("SQUEEZEFS_SYMMETRIC_META=1"), "{msg}");
+            assert!(msg.contains("generation"), "{msg}");
+        }
+        Ok(unarmed) => {
+            // The defect's shape: the open succeeded, so its commits must
+            // survive every later mount — they do not on the tree this
+            // pin lands on.
+            for i in 0..4 {
+                let name = format!("unarmed-{i}");
+                let ino = Metadata::create(unarmed.as_ref(), 1, &name, libc::S_IFREG | 0o644, 0, 0)
+                    .await
+                    .unwrap()
+                    .ino;
+                expected.push((name, ino));
+            }
+            shutdown(&unarmed).await;
+        }
+    }
+    // Every acked record of every session is present at the next armed
+    // open and at a read-only open, and nothing was screened.
+    let armed = open_armed_writer(&path).await;
+    for (name, ino) in &expected {
+        assert_eq!(
+            Metadata::lookup(armed.as_ref(), 1, name)
+                .await
+                .unwrap_or_else(|e| panic!("{name} lost at the armed remount: {e}"))
+                .ino,
+            *ino
+        );
+    }
+    shutdown(&armed).await;
+    std::env::remove_var(SYMMETRIC_META_ENV);
+    let reader = open_routed_meta_set_read_only(&uris)
+        .await
+        .expect("a read-only open needs no plane");
+    for (name, ino) in &expected {
+        assert_eq!(
+            Metadata::lookup(reader.as_ref(), 1, name)
+                .await
+                .unwrap_or_else(|e| panic!("{name} lost at the read-only remount: {e}"))
+                .ino,
+            *ino
+        );
+    }
+    shutdown(&reader).await;
+    let probe = KvMetaBackend::open_probe(&path)
+        .await
+        .expect("a probe needs no plane");
+    assert!(probe.slot_lease_stats().is_none());
+    drop(probe);
+    assert_eq!(
+        META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed),
+        screened0,
+        "nothing a legitimate writer wrote was screened"
+    );
+}
+
 /// **Rebase seam (a) onto PR 8 — the recall completes before the
 /// terminal free reaches the allocation HOLDER.** PR 8 re-homed the free
 /// ladder to the data volume's allocation-lease holder (the bitmap IS the

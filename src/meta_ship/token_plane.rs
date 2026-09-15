@@ -383,20 +383,12 @@ const RTT_TOTAL: usize = 3;
 const RTT_PHASES: usize = 4;
 const RTT_PHASE_NAMES: [&str; RTT_PHASES] = ["send", "drain", "ack", "total"];
 
-/// A frame the pass issued, waiting for its reader's poll and ack.
-struct IssuedFrame {
-    frame: RecallFrame,
-    enqueued_at: Instant,
-}
-
 /// The holder's side of the token plane for ONE volume.
 pub struct TokenHolderPlane {
     lane: RecallLane,
     /// Frames issued by [`Self::recall_and_wait`], per client, waiting for
     /// the client's standing poll to take them.
-    pending_frames: parking_lot::Mutex<HashMap<String, VecDeque<IssuedFrame>>>,
-    /// `(client, frame_id) → (enqueued, sent)` of frames on the wire.
-    sent_frames: parking_lot::Mutex<HashMap<(String, u64), (Instant, Instant)>>,
+    pending_frames: parking_lot::Mutex<HashMap<String, VecDeque<RecallFrame>>>,
     /// Pollers park here for a frame.
     frame_wake: squeezefs_ipc::sqz_notify::Notify,
     /// The pass parks here for acks (and the expiry sweep's ticks).
@@ -407,10 +399,13 @@ pub struct TokenHolderPlane {
     inflight: scc::HashSet<u64>,
     inflight_done: squeezefs_ipc::sqz_notify::Notify,
     lease_oracle: parking_lot::RwLock<Option<Arc<LeaseOracle>>>,
-    /// The plane's monotonic origin and the last ack's instant on it
-    /// (`dlm_token_recall_rtt_ns.ack` — the ack's arrival → the pass
-    /// observing it).
+    /// The plane's monotonic origin, and on it the instants the batch's
+    /// phases are cut at: the last frame handed to a reader's poll
+    /// (`send` ends) and the last ack's arrival (`drain` ends, `ack` —
+    /// the wake hop to the pass — begins). One pass per volume, so one
+    /// batch at a time per plane.
     epoch: Instant,
+    last_send_ns: AtomicU64,
     last_ack_ns: AtomicU64,
     // ---- gauges (§11 the Token family) ----
     grants_served: AtomicU64,
@@ -447,13 +442,13 @@ impl TokenHolderPlane {
         Self {
             lane: RecallLane::live_tokens(),
             pending_frames: parking_lot::Mutex::new(HashMap::new()),
-            sent_frames: parking_lot::Mutex::new(HashMap::new()),
             frame_wake: squeezefs_ipc::sqz_notify::Notify::new(),
             ack_wake: squeezefs_ipc::sqz_notify::Notify::new(),
             inflight: scc::HashSet::new(),
             inflight_done: squeezefs_ipc::sqz_notify::Notify::new(),
             lease_oracle: parking_lot::RwLock::new(None),
             epoch: Instant::now(),
+            last_send_ns: AtomicU64::new(0),
             last_ack_ns: AtomicU64::new(0),
             grants_served: AtomicU64::new(0),
             recalls: AtomicU64::new(0),
@@ -572,16 +567,12 @@ impl TokenHolderPlane {
                 let mut pending = self.pending_frames.lock();
                 pending.get_mut(client).and_then(|q| q.pop_front())
             };
-            if let Some(issued) = taken {
-                let now = Instant::now();
-                self.rtt[RTT_SEND].record(now.saturating_duration_since(issued.enqueued_at));
-                self.sent_frames.lock().insert(
-                    (client.to_string(), issued.frame.frame_id),
-                    (issued.enqueued_at, now),
-                );
+            if let Some(frame) = taken {
+                self.last_send_ns
+                    .fetch_max(self.epoch.elapsed().as_nanos() as u64, Ordering::AcqRel);
                 return TokenReply::Recall {
-                    frame_id: issued.frame.frame_id,
-                    objects: issued.frame.inos,
+                    frame_id: frame.frame_id,
+                    objects: frame.inos,
                 };
             }
             let left = wait.saturating_sub(started.elapsed());
@@ -597,16 +588,9 @@ impl TokenHolderPlane {
 
     fn serve_ack(&self, client: &str, frame_id: u64) -> TokenReply {
         let now = Instant::now();
-        if let Some((_enqueued, sent)) = self
-            .sent_frames
-            .lock()
-            .remove(&(client.to_string(), frame_id))
-        {
-            self.rtt[RTT_DRAIN].record(now.saturating_duration_since(sent));
-        }
-        self.last_ack_ns.store(
+        self.last_ack_ns.fetch_max(
             now.saturating_duration_since(self.epoch).as_nanos() as u64,
-            Ordering::Release,
+            Ordering::AcqRel,
         );
         let acked = self.lane.ack_frame(client, frame_id, now) as u64;
         self.recall_acks.fetch_add(acked, Ordering::Relaxed);
@@ -653,6 +637,11 @@ impl TokenHolderPlane {
             return recalled;
         }
         self.recall_batches.fetch_add(1, Ordering::Relaxed);
+        let t0 = now.saturating_duration_since(self.epoch).as_nanos() as u64;
+        // The phase cuts belong to THIS batch: an earlier batch's instants
+        // sit below `t0` and clamp to it.
+        self.last_send_ns.fetch_max(t0, Ordering::AcqRel);
+        self.last_ack_ns.fetch_max(t0, Ordering::AcqRel);
         let cfg = self.lane.config();
         // The expiry sweep's tick: a quarter of the deadline, floored at
         // the timer grain — the wait is woken by acks; the tick only
@@ -665,27 +654,13 @@ impl TokenHolderPlane {
             if !frames.is_empty() {
                 let mut pending = self.pending_frames.lock();
                 for f in frames {
-                    pending
-                        .entry(f.client.clone())
-                        .or_default()
-                        .push_back(IssuedFrame {
-                            frame: f,
-                            enqueued_at: now,
-                        });
+                    pending.entry(f.client.clone()).or_default().push_back(f);
                 }
                 drop(pending);
                 self.frame_wake.notify_waiters();
             }
             let notified = self.ack_wake.notified();
             if recalled.iter().all(|o| self.lane.holders(*o) == 0) {
-                // `ack` = the last ack's arrival → the pass observing it
-                // (the wake hop), the exact-sum's third term.
-                let last_ack = self.last_ack_ns.load(Ordering::Acquire);
-                if last_ack != 0 {
-                    let observed = self.epoch.elapsed().as_nanos() as u64;
-                    self.rtt[RTT_ACK]
-                        .record(Duration::from_nanos(observed.saturating_sub(last_ack)));
-                }
                 break;
             }
             let _ = squeezefs_ipc::sqz_time::timeout(tick, notified).await;
@@ -695,9 +670,6 @@ impl TokenHolderPlane {
             // the must-stay-0 stuck-reader class) and let the lane retire
             // the grants; the commit proceeds either way.
             for t in self.lane.expire_overdue(Instant::now()) {
-                self.sent_frames
-                    .lock()
-                    .remove(&(t.client.clone(), t.frame_id));
                 self.pending_frames.lock().remove(&t.client);
                 match self.lease_verdict(&t.client) {
                     LeaseVerdict::Expired => {
@@ -719,7 +691,23 @@ impl TokenHolderPlane {
                 }
             }
         }
-        self.rtt[RTT_TOTAL].record(now.elapsed());
+        // `dlm_token_recall_rtt_ns`, EXACT-SUM per batch: `send` = the
+        // pass's call → the last frame handed to a reader's poll; `drain`
+        // = → the last ack's arrival (the readers' in-flight serve drain +
+        // purge + the ack's travel); `ack` = → the pass observing it (the
+        // wake hop, or the expiry tick that ended a batch no ack closed).
+        // The cuts are clamped monotone into `[t0, t_end]`, so
+        // `send + drain + ack ≡ total` to the nanosecond.
+        let t_end = self.epoch.elapsed().as_nanos() as u64;
+        let t_send = self.last_send_ns.load(Ordering::Acquire).clamp(t0, t_end);
+        let t_ack = self
+            .last_ack_ns
+            .load(Ordering::Acquire)
+            .clamp(t_send, t_end);
+        self.rtt[RTT_SEND].record(Duration::from_nanos(t_send - t0));
+        self.rtt[RTT_DRAIN].record(Duration::from_nanos(t_ack - t_send));
+        self.rtt[RTT_ACK].record(Duration::from_nanos(t_end - t_ack));
+        self.rtt[RTT_TOTAL].record(Duration::from_nanos(t_end - t0));
         recalled
     }
 

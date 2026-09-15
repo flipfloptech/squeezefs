@@ -4167,4 +4167,6 @@ pub fn test_open_recall_window_ms(ms: u64) {
 fn reset_recall_gate_for_test() {
     RECALL_GATE.store(false, Ordering::Relaxed);
     RECALL_UNACKED_UNTIL_MS.store(0, Ordering::Relaxed);
+    RECALL_GATED_FREES.store(0, Ordering::Relaxed);
+    TIMEOUT_DEFERRALS.store(0, Ordering::Relaxed);
 }

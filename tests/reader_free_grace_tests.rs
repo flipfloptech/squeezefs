@@ -5654,3 +5654,138 @@ async fn the_checkpoint_task_runs_at_the_elastic_ceiling_under_an_ask() {
     assert!(free_grace::test_clear_checkpoint_composite());
     be.shutdown().await.expect("shutdown");
 }
+
+// ---------------------------------------------------------------------------
+// PR 5 — free-grace RE-SCOPED to recall-driven (design-symmetric-metadata
+// §5.7.3): under GPFS-strict tokens the freeing publish recalled every
+// reader's token before it committed — the recall IS the qualification —
+// so a terminal free publishes to the free list directly; the ring survives
+// as the TIMEOUT path for a live member's unacked recall. Every contract
+// above is the unarmed / S5 posture, kept verbatim, and the closure
+// `free_grace_deferrals ≡ releases + offsets` holds on both paths.
+// ---------------------------------------------------------------------------
+
+fn closure_holds() {
+    assert_eq!(
+        free_grace::deferrals(),
+        free_grace::releases() + free_grace::held_offsets(),
+        "the ring's closure law: deferrals ≡ releases + offsets"
+    );
+}
+
+/// With the ring ARMED and a reader that acknowledged nothing (the S5
+/// shape that defers every free), the token holder's recall gate makes a
+/// terminal free publish straight to the free list: no deferral, nothing
+/// held, `free_grace_recall_gated_frees` counts it, the offset serves
+/// again at once — the acknowledgement channel is no longer the
+/// qualification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recall_gated_free_publishes_without_a_deferral() {
+    let _serial = serial();
+    let (clock, _ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("the derived bound is safe");
+    let _reader = join(&owner, "r-tok", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+    assert_eq!(free_grace::bound(), 0, "the S5 ring would hold every free");
+    assert_eq!(
+        free_grace::recall_gate_verdict(),
+        free_grace::RecallGate::Off
+    );
+
+    free_grace::arm_recall_gate();
+    assert!(free_grace::recall_gate_armed());
+    let ba = allocator("grace-recall-gated").await;
+    let victim = ba.allocate_block().await.expect("allocate");
+    ba.free_block(victim).await.expect("free");
+
+    assert!(
+        free_listed(&ba, victim),
+        "under the recall gate the terminal free publishes directly"
+    );
+    assert_eq!(ba.grace_len(), 0, "nothing rides the ring");
+    assert_eq!(free_grace::deferrals(), 0);
+    assert_eq!(free_grace::held_offsets(), 0);
+    assert_eq!(free_grace::recall_gated_frees(), 1);
+    assert_eq!(free_grace::timeout_deferrals(), 0);
+    let again = ba.allocate_block().await.expect("reallocate");
+    assert_eq!(again, victim, "served straight back");
+    closure_holds();
+    free_grace::disarm_recall_gate();
+}
+
+/// The ring is the TIMEOUT path: while a LIVE member's recall is unacked
+/// past the bound (the holder's `dlm_token_recall_timeouts_live` arm
+/// opened the window), a free rides the ring exactly as under S5 —
+/// counted `free_grace_timeout_deferrals` AND `free_grace_deferrals`,
+/// held, released by the ring's own law (the reader's acknowledgement) —
+/// and once the window has passed on the owner's clock the gate is direct
+/// again. The closure holds throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_unacked_recall_makes_the_ring_the_timeout_path() {
+    let _serial = serial();
+    let (clock, ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("the derived bound is safe");
+    let reader = join(&owner, "r-slow", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+    free_grace::arm_recall_gate();
+
+    // The holder's timeouts_live arm: the window is `now + T_owner`.
+    free_grace::note_recall_unacked_live();
+    let ba = allocator("grace-recall-timeout").await;
+    let held = ba.allocate_block().await.expect("allocate");
+    ba.free_block(held).await.expect("free");
+    assert!(
+        !free_listed(&ba, held),
+        "inside the window a free rides the ring"
+    );
+    assert_eq!(ba.grace_len(), 1);
+    assert_eq!(free_grace::timeout_deferrals(), 1);
+    assert_eq!(free_grace::deferrals(), 1);
+    assert_eq!(free_grace::held_offsets(), 1);
+    assert_eq!(free_grace::recall_gated_frees(), 0);
+    closure_holds();
+
+    // The ring's own release law still governs the held offset: the
+    // reader's acknowledgement (carried by its renewal) releases it.
+    let label = ba.grace_oldest_label().expect("held entry");
+    ack(&owner, "r-slow", reader.epoch, label);
+    let reused = ba.allocate_block().await.expect("allocate");
+    assert_eq!(reused, held, "released by the acknowledgement");
+    assert_eq!(free_grace::releases(), 1);
+    closure_holds();
+
+    // Past the window (T_owner on the owner's clock) the gate is direct.
+    let t_owner_ms = owner.clocks().t_owner.as_millis() as u64;
+    ticks.fetch_add(t_owner_ms + 1, Ordering::SeqCst);
+    let later = ba.allocate_block().await.expect("allocate");
+    ba.free_block(later).await.expect("free");
+    assert!(free_listed(&ba, later), "the window closed: direct again");
+    assert_eq!(free_grace::recall_gated_frees(), 1);
+    assert_eq!(free_grace::timeout_deferrals(), 1, "no new deferral");
+    closure_holds();
+    free_grace::disarm_recall_gate();
+}
+
+/// Unarmed, the recall gate is one relaxed load feeding a never-taken
+/// branch: the S5 ring decides every free exactly as before and neither
+/// PR-5 face moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unarmed_token_gate_leaves_the_ring_in_charge_and_moves_no_face() {
+    let _serial = serial();
+    let (clock, _ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("the derived bound is safe");
+    let _reader = join(&owner, "r-s5", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+    assert!(!free_grace::recall_gate_armed());
+    let ba = allocator("grace-recall-unarmed").await;
+    let victim = ba.allocate_block().await.expect("allocate");
+    ba.free_block(victim).await.expect("free");
+    assert!(!free_listed(&ba, victim), "the S5 ring holds it");
+    assert_eq!(free_grace::deferrals(), 1);
+    assert_eq!(free_grace::recall_gated_frees(), 0);
+    assert_eq!(free_grace::timeout_deferrals(), 0);
+    closure_holds();
+}

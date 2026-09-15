@@ -1159,6 +1159,21 @@ async fn the_broadcast_shape_recalls_every_reader_once_per_publish() {
         s1.fanout_p99, R as u64,
         "p99 of the fan-out is the reader count"
     );
+    // The scoping row for the evidence note (§5.7.3: under tokens the
+    // free's hold IS the recall round trip — `free_grace_hold_ms` ≈
+    // `dlm_token_recall_rtt_ns.total`); read with `--nocapture`.
+    let rtt = holder.rtt_json();
+    eprintln!(
+        "SCOPING broadcast R={R}: dlm_token_recall_rtt_ns={rtt} dlm_token_recall_fanout={}",
+        holder.fanout_json()
+    );
+    let sum = |phase: &str| rtt[phase]["sum_ns"].as_u64().expect("phase sum");
+    assert_eq!(
+        sum("send") + sum("drain") + sum("ack"),
+        sum("total"),
+        "dlm_token_recall_rtt_ns is EXACT-SUM per batch"
+    );
+    assert_eq!(rtt["total"]["count"].as_u64(), Some(1), "one batch");
     assert_eq!(holder.holders(local), 0);
     for p in &planes {
         let serve = p

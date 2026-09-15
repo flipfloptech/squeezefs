@@ -27,9 +27,9 @@
 
 use libfuzzer_sys::fuzz_target;
 use squeezefs::meta_backend::kv::appender::{
-    classify_page, newest_valid, AppenderIdentity, AppenderPage, AppenderState, DirHeader,
-    GrantRun, PageRead, SlotEntry, SlotEntryState, APPENDER_PAGE_LEN, GRANT_RUNS_MAX,
-    RING_SEGMENTS_MAX, SLOT_PAGE_BUDGET,
+    classify_page, newest_valid, page_checksum, AppenderIdentity, AppenderPage, AppenderState,
+    DirHeader, GrantRun, PageRead, SlotEntry, SlotEntryState, APPENDER_PAGE_LAYOUT_VERSION,
+    APPENDER_PAGE_LEN, GRANT_RUNS_MAX, RING_SEGMENTS_MAX, SLOT_PAGE_BUDGET,
 };
 use squeezefs::meta_backend::kv::superblock::ExtentRef;
 use squeezefs::meta_backend::kv::tree::RootPtr;
@@ -48,11 +48,20 @@ fuzz_target!(|data: &[u8]| {
                 assert!(w[0].slot < w[1].slot, "slot-ascending");
             }
         }
+        PageRead::ForeignLayout { version } => {
+            // A valid checksum under another layout byte: its own class,
+            // REFUSED by the four-slot reader — never a fallback.
+            assert_eq!(data.len(), APPENDER_PAGE_LEN);
+            assert_eq!(data[55], version);
+            assert_ne!(version, APPENDER_PAGE_LAYOUT_VERSION);
+            assert!(newest_valid(&[data]).is_err());
+        }
         PageRead::Corrupt(_) => {}
     }
     if let Ok(h) = DirHeader::decode(data) {
         assert_eq!(h.encode(), data, "canonical header");
     }
+    // Total over any image pair (a torn / blank / foreign / valid mix).
     let _ = newest_valid(&[data, &[0u8; APPENDER_PAGE_LEN]]);
 
     // --- encode side, over the encoder's domain ------------------------------
@@ -141,16 +150,33 @@ fuzz_target!(|data: &[u8]| {
         let mut torn = img.clone();
         torn[usize::from(data[47]) % APPENDER_PAGE_LEN] ^= 0x01;
         assert!(matches!(classify_page(&torn), PageRead::Corrupt(_)));
-        // Newest-valid-wins over the pair, and the torn newest falls back.
+        // Newest-valid-wins over the pair, and the torn newest falls back;
+        // a predecessor of ANOTHER layout (re-stamped checksum) refuses
+        // the whole read.
         let mut older = page.clone();
         older.generation = page.generation.wrapping_sub(1);
         let older_img = older.encode().expect("encodes");
         if page.generation > 0 {
             assert_eq!(
-                newest_valid(&[older_img.clone(), img.clone()]).unwrap().0,
+                newest_valid(&[older_img.clone(), img.clone()])
+                    .unwrap()
+                    .unwrap()
+                    .0,
                 1
             );
-            assert_eq!(newest_valid(&[older_img, torn]).unwrap().0, 0);
+            assert_eq!(
+                newest_valid(&[older_img.clone(), torn]).unwrap().unwrap().0,
+                0
+            );
+            let mut foreign = img.clone();
+            foreign[55] = APPENDER_PAGE_LAYOUT_VERSION.wrapping_add(1);
+            let sum = page_checksum(&foreign);
+            foreign[16..24].copy_from_slice(&sum.to_le_bytes());
+            assert!(matches!(
+                classify_page(&foreign),
+                PageRead::ForeignLayout { .. }
+            ));
+            assert!(newest_valid(&[older_img, foreign]).is_err());
         }
         // The directory header round-trips and refuses a tear.
         let hdr = DirHeader {

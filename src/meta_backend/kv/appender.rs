@@ -554,7 +554,15 @@ pub fn page_slot_for(generation: u64) -> usize {
     (generation % APPENDER_PAGE_SLOTS as u64) as usize
 }
 
-/// How one page-slot image reads.
+/// How one page-slot image reads — THREE-way (PR 4 review round 4, Issue
+/// 26): a page of another LAYOUT with a valid checksum is its own class,
+/// never "torn". The four-slot reader falls back past `Blank` and
+/// `Corrupt` to a predecessor; it REFUSES on `ForeignLayout` — a volume a
+/// binary of another layout wrote is the forward-only law's "reformat
+/// required", and the round-3 reader that dropped such a page and tried
+/// the next slot read a whole region as never-joined (page 0 →
+/// `manager_lease vacant`, no `seq_offset`, the leased slots' live roots
+/// — which ride the page ONLY — gone).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageRead {
     /// A verified page.
@@ -562,8 +570,19 @@ pub enum PageRead {
     /// All zero — never written (a fresh pair, or a ring-side slot of an
     /// appender that never checkpointed).
     Blank,
-    /// Anything else: torn, foreign bytes, a future layout.
+    /// The magic and the checksum verify but byte 55 is not
+    /// [`APPENDER_PAGE_LAYOUT_VERSION`]: a page another layout wrote.
+    ForeignLayout { version: u8 },
+    /// Anything else: torn or foreign bytes.
     Corrupt(String),
+}
+
+/// Whether a page image's magic and checksum verify (the layout byte is
+/// not consulted) — what tells a page of another layout from a torn one.
+fn page_checksum_verifies(buf: &[u8]) -> bool {
+    buf.len() == APPENDER_PAGE_LEN
+        && le32(buf, OFF_MAGIC) == APPENDER_PAGE_MAGIC
+        && le64(buf, OFF_CHECKSUM) == page_checksum(buf)
 }
 
 /// Classify one image (total).
@@ -571,28 +590,52 @@ pub fn classify_page(buf: &[u8]) -> PageRead {
     if buf.iter().all(|b| *b == 0) {
         return PageRead::Blank;
     }
+    if page_checksum_verifies(buf) && buf[OFF_LAYOUT_VERSION] != APPENDER_PAGE_LAYOUT_VERSION {
+        return PageRead::ForeignLayout {
+            version: buf[OFF_LAYOUT_VERSION],
+        };
+    }
     match AppenderPage::decode(buf) {
         Ok(p) => PageRead::Valid(p),
         Err(e) => PageRead::Corrupt(e.to_string()),
     }
 }
 
+/// The forward-only refusal a foreign-layout page slot produces.
+fn foreign_layout_refusal(slot: usize, version: u8) -> KvError {
+    KvError::Corrupt(format!(
+        "appender page slot {slot} carries layout version {version} with a valid checksum — \
+         this binary writes {APPENDER_PAGE_LAYOUT_VERSION} (PR 4: seq_offset at \
+         {OFF_SEQ_OFFSET}, slot entries at {OFF_SLOTS}) and the format is forward-only: the \
+         volume was written by a binary of another layout; reformat required (a page of the \
+         PR 2/3 layout is REFUSED, never read as absent)"
+    ))
+}
+
 /// Newest-valid-wins over an appender's page-slot images: the valid page
-/// with the highest generation and its slot index; `None` when no image
-/// verifies (a never-joined appender, or every copy torn).
-pub fn newest_valid<B: AsRef<[u8]>>(images: &[B]) -> Option<(usize, AppenderPage)> {
+/// with the highest generation and its slot index; `Ok(None)` when no
+/// image verifies (a never-joined appender, or every copy torn). A
+/// [`PageRead::ForeignLayout`] in ANY slot REFUSES — never a fallback to
+/// a predecessor (Issue 26).
+pub fn newest_valid<B: AsRef<[u8]>>(
+    images: &[B],
+) -> Result<Option<(usize, AppenderPage)>, KvError> {
     let mut best: Option<(usize, AppenderPage)> = None;
     for (i, img) in images.iter().enumerate() {
-        if let PageRead::Valid(p) = classify_page(img.as_ref()) {
-            let newer = best
-                .as_ref()
-                .is_none_or(|(_, b)| p.generation > b.generation);
-            if newer {
-                best = Some((i, p));
+        match classify_page(img.as_ref()) {
+            PageRead::Valid(p) => {
+                let newer = best
+                    .as_ref()
+                    .is_none_or(|(_, b)| p.generation > b.generation);
+                if newer {
+                    best = Some((i, p));
+                }
             }
+            PageRead::ForeignLayout { version } => return Err(foreign_layout_refusal(i, version)),
+            PageRead::Blank | PageRead::Corrupt(_) => {}
         }
     }
-    best
+    Ok(best)
 }
 
 // ---- Routing slot ↔ forest slot ------------------------------------------
@@ -1496,7 +1539,7 @@ pub async fn read_newest_page(
     for off in offsets {
         images.push(read_page(path, *off).await?);
     }
-    Ok(newest_valid(&images))
+    newest_valid(&images)
 }
 
 /// One appender's directory presence: its id, where its page slots live
@@ -1515,10 +1558,13 @@ pub struct AppenderEntry {
     pub dir_pages: [Option<AppenderPage>; 2],
 }
 
+/// One directory image's valid page. Called only after [`newest_valid`]
+/// judged the same images, so a `ForeignLayout` was already refused and
+/// never reaches the `None` arm here.
 fn valid_page(img: &[u8]) -> Option<AppenderPage> {
     match classify_page(img) {
         PageRead::Valid(p) => Some(p),
-        PageRead::Blank | PageRead::Corrupt(_) => None,
+        PageRead::Blank | PageRead::Corrupt(_) | PageRead::ForeignLayout { .. } => None,
     }
 }
 
@@ -1577,10 +1623,11 @@ pub async fn read_directory(
     for off in &offs0 {
         images0.push(read_page(path, *off).await?);
     }
+    let page0 = newest_valid(&images0)?.map(|(_, p)| p);
     out.push(AppenderEntry {
         appender_id: 0,
         dir_offsets: [offs0[0], offs0[1]],
-        page: newest_valid(&images0).map(|(_, p)| p),
+        page: page0,
         dir_pages: [valid_page(&images0[0]), valid_page(&images0[1])],
     });
     if sb.appender_dir.len == 0 {
@@ -1617,17 +1664,18 @@ pub async fn read_directory(
                 read_page(path, offs[1]).await?,
             ];
             // The ring-side pair, once a directory image names the ring.
-            if let Some((_, p)) = newest_valid(&images) {
+            if let Some((_, p)) = newest_valid(&images)? {
                 if let Some(first) = p.segments.first() {
                     for off in ring_side_offsets(first) {
                         images.push(read_page(path, off).await?);
                     }
                 }
             }
+            let page = newest_valid(&images)?.map(|(_, p)| p);
             out.push(AppenderEntry {
                 appender_id: next_id,
                 dir_offsets: offs,
-                page: newest_valid(&images).map(|(_, p)| p),
+                page,
                 dir_pages: [valid_page(&images[0]), valid_page(&images[1])],
             });
             next_id += 1;

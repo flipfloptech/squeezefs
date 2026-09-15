@@ -2043,6 +2043,72 @@ async fn a_parked_grant_does_not_serialize_the_volumes_other_grants() {
     shutdown(&writer).await;
 }
 
+/// **A re-opened writer's pre-arm frames carry the arm's generation**
+/// (found at the rebase onto PR 6/8 — `sym_cross_owner_tests`, ten
+/// contracts red, both layouts). The open's bring-up cover and the join's
+/// cycle flush the D0 claim's leaf BEFORE the arm; the first build
+/// stamped those frames with the manager's structural `(0, 0)` — below
+/// the leased generation the leaf's earlier frames carry — and rule 3
+/// screened the frame at the next load, ENDING the log there: every
+/// commit of the re-opened writer landed behind it read EMPTY at the
+/// remount (the writer saw them in RAM; a reader, fsck and the next open
+/// did not). Now the fence and tree 0's lease table are primed before the
+/// cover and the native slot's pre-arm stamp is its arm generation
+/// (`Unleased { g }` → `g + 1`, the acquire's law), so the log stays
+/// monotone across every open: three armed opens, each committing and
+/// leaving cleanly — every name of every incarnation resolves at a
+/// read-only remount and nothing was ever screened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commits_after_a_reopened_writers_join_survive_the_next_remount_unscreened() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let screened0 = META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed);
+    let mut expected = Vec::new();
+    for incarnation in 0..3 {
+        let writer = open_armed_writer(&path).await;
+        for i in 0..4 {
+            let name = format!("gen{incarnation}-{i}");
+            let ino = Metadata::create(writer.as_ref(), 1, &name, libc::S_IFREG | 0o644, 0, 0)
+                .await
+                .unwrap()
+                .ino;
+            expected.push((name, ino));
+        }
+        // Every earlier incarnation's names are still served by this one.
+        for (name, ino) in &expected {
+            assert_eq!(
+                Metadata::lookup(writer.as_ref(), 1, name)
+                    .await
+                    .unwrap()
+                    .ino,
+                *ino,
+                "{name} in incarnation {incarnation}"
+            );
+        }
+        shutdown(&writer).await;
+    }
+    let reader = open_routed_meta_set_read_only(&[path.display().to_string()])
+        .await
+        .expect("read-only remount");
+    for (name, ino) in &expected {
+        assert_eq!(
+            Metadata::lookup(reader.as_ref(), 1, name)
+                .await
+                .unwrap_or_else(|e| panic!("{name} lost across the remounts: {e}"))
+                .ino,
+            *ino
+        );
+    }
+    assert_eq!(
+        META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed),
+        screened0,
+        "nothing a legitimate writer wrote was screened"
+    );
+    // The C9 oracle over the same shape is `sym_cross_owner_tests`'
+    // `fsck_clean` (its fixture carries the format config fsck needs).
+}
+
 /// **Rebase seam (a) onto PR 8 — the recall completes before the
 /// terminal free reaches the allocation HOLDER.** PR 8 re-homed the free
 /// ladder to the data volume's allocation-lease holder (the bitmap IS the

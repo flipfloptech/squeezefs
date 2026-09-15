@@ -3024,6 +3024,17 @@ impl NodeCache {
         self.env.epoch.probe()
     }
 
+    /// The ledger seq the reader adopted at its last poll (the epoch IS
+    /// that seq) — the predicted-slot-first read's origin; `None` on an
+    /// un-armed cache.
+    pub fn reader_adopted_seq(&self) -> Option<u64> {
+        if self.env.epoch.is_armed() {
+            Some(self.env.epoch.probe())
+        } else {
+            None
+        }
+    }
+
     /// Whether a reader armed revalidation on this cache.
     pub fn is_revalidating(&self) -> bool {
         self.env.epoch.is_armed()

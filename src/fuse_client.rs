@@ -14124,6 +14124,21 @@ impl SqueezefsFilesystem {
                     "free_grace_timeout_deferrals".into(),
                     serde_json::json!(crate::free_grace::timeout_deferrals()),
                 );
+                // The control-plane poll's economy (PR 5's predicted-slot-
+                // first ledger read): bytes ÷ `meta_kv_revalidate_polls` is
+                // the poll's cost (4 KiB idle), `full_reads` the torn-slot
+                // fallbacks. 0 on every write mount.
+                {
+                    let r = meta_kv::revalidate::revalidation_stats();
+                    metrics.insert(
+                        "meta_kv_revalidate_ledger_read_bytes".into(),
+                        r.ledger_read_bytes.into(),
+                    );
+                    metrics.insert(
+                        "meta_kv_revalidate_ledger_full_reads".into(),
+                        r.ledger_full_reads.into(),
+                    );
+                }
                 // THE FENCING FAMILY (§5.8.1 / KD-SYM-18): the Reservation
                 // Report read SIZED BY REGCTL — per metadata AND data
                 // namespace this mount registered on: registrants the last

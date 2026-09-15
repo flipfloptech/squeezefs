@@ -1396,3 +1396,120 @@ async fn the_mount_path_token_arm_refuses_loud_without_a_membership_lease() {
     );
     assert!(reader.token_reader().is_none(), "nothing armed on refusal");
 }
+
+// ===========================================================================
+// PR 5 — the predicted-slot-first ledger read (design-symmetric-metadata
+// §5.7 title item; the control-plane poll's economy)
+// ===========================================================================
+
+/// The poll reads the 4 KiB slot the writer's NEXT record must land in
+/// (`(mounted seq + 1) % 32` — the round-robin law) before anything else:
+/// an idle poll is ONE 4 KiB read that finds an older record and stops; a
+/// poll after k checkpoints reads k + 1 slots (each successor, then the
+/// slot that holds an older record); the 128 KiB whole-ledger read
+/// survives as the FALLBACK for a torn predicted slot (the writer mid-write
+/// — the read finds the newer record in any slot) and is counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_poll_reads_the_predicted_slot_first_and_falls_back_on_a_torn_one() {
+    use squeezefs::meta_backend::kv::checkpoint::{ROOT_LEDGER_SLOTS, ROOT_LEDGER_SLOT_LEN};
+    use squeezefs::meta_backend::kv::revalidate::revalidation_stats;
+
+    let vol = fresh_volume().await;
+    let writer = KvMetaBackend::open(vol.path()).await.expect("writer");
+    Metadata::create(writer.as_ref(), 1, "a", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    writer.checkpoint_now().await.expect("checkpoint");
+    let reader = KvMetaBackend::open_read_only(vol.path())
+        .await
+        .expect("reader");
+    reader.arm_reader_revalidation(None).expect("arm");
+    let slot_len = ROOT_LEDGER_SLOT_LEN;
+
+    // An idle poll: exactly one predicted slot.
+    let s0 = revalidation_stats();
+    let out = reader.revalidate_reader().await.expect("poll");
+    assert!(!out.advanced, "nothing to adopt");
+    let s1 = revalidation_stats();
+    assert_eq!(
+        s1.ledger_read_bytes - s0.ledger_read_bytes,
+        slot_len,
+        "an idle poll reads ONE 4 KiB slot"
+    );
+    assert_eq!(s1.ledger_full_reads, s0.ledger_full_reads, "no fallback");
+
+    // Two writer checkpoints, one poll: the two successors + the stop slot.
+    for name in ["b", "c"] {
+        Metadata::create(writer.as_ref(), 1, name, libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+        writer.checkpoint_now().await.expect("checkpoint");
+    }
+    let out = reader.revalidate_reader().await.expect("poll");
+    assert!(out.advanced, "two checkpoints to adopt");
+    let s2 = revalidation_stats();
+    assert_eq!(
+        s2.ledger_read_bytes - s1.ledger_read_bytes,
+        3 * slot_len,
+        "k new checkpoints cost k + 1 slot reads"
+    );
+    assert_eq!(s2.ledger_full_reads, s1.ledger_full_reads);
+    assert!(
+        Metadata::lookup(reader.as_ref(), 1, "c").await.is_ok(),
+        "the adopted epoch serves the newest checkpoint"
+    );
+
+    // A torn predicted slot: the writer advances once more, then the
+    // slot its record occupies is overwritten with garbage — the poll
+    // falls back to the whole-ledger read, which finds the newest record
+    // anyway (here the torn one IS the newest, so the reader stays put).
+    Metadata::create(writer.as_ref(), 1, "d", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    writer.checkpoint_now().await.expect("checkpoint");
+    let mounted_seq = reader.reader_epoch();
+    let predicted = (mounted_seq + 1) % ROOT_LEDGER_SLOTS;
+    let at = reader.superblock().root_ledger.start + predicted * slot_len;
+    {
+        use std::io::{Seek, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(vol.path())
+            .unwrap();
+        f.seek(std::io::SeekFrom::Start(at)).unwrap();
+        f.write_all(&vec![0xA5u8; slot_len as usize]).unwrap();
+        f.sync_all().unwrap();
+    }
+    let out = reader.revalidate_reader().await.expect("poll");
+    assert!(!out.advanced, "the only newer record is the torn one");
+    let s3 = revalidation_stats();
+    assert_eq!(
+        s3.ledger_full_reads - s2.ledger_full_reads,
+        1,
+        "a torn predicted slot falls back to the whole-ledger read"
+    );
+    assert_eq!(
+        s3.ledger_read_bytes - s2.ledger_read_bytes,
+        slot_len + ROOT_LEDGER_SLOTS * slot_len,
+        "the predicted slot, then the 128 KiB fallback"
+    );
+    // The writer's next checkpoint lands in the following slot; the
+    // predicted slot is still the torn one, so the fallback finds it —
+    // and once adopted, the prediction is current again (one slot per
+    // idle poll).
+    Metadata::create(writer.as_ref(), 1, "e", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    writer.checkpoint_now().await.expect("checkpoint");
+    let out = reader.revalidate_reader().await.expect("poll");
+    assert!(out.advanced, "the record after the torn slot is adopted");
+    assert!(Metadata::lookup(reader.as_ref(), 1, "e").await.is_ok());
+    let s4 = revalidation_stats();
+    assert_eq!(s4.ledger_full_reads - s3.ledger_full_reads, 1);
+    let out = reader.revalidate_reader().await.expect("poll");
+    assert!(!out.advanced);
+    let s5 = revalidation_stats();
+    assert_eq!(s5.ledger_read_bytes - s4.ledger_read_bytes, slot_len);
+    assert_eq!(s5.ledger_full_reads, s4.ledger_full_reads);
+    writer.shutdown().await.expect("shutdown");
+}

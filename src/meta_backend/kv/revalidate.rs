@@ -17,7 +17,9 @@
 //! ```text
 //!  open  ─→ KvMetaBackend::arm_reader_revalidation(purge_sink)    (once)
 //!  loop  ─→ RevalidationPoller::poll_at(&backend, Instant::now()) (cadence)
-//!            └→ read_root_epoch()  one 128 KiB ledger read
+//!            └→ read_root_epoch()  one 4 KiB predicted-slot read (idle),
+//!                                  k + 1 slots after k checkpoints, the
+//!                                  128 KiB ledger on a torn slot
 //!            └→ revalidate_trees() root adoption + the drop pass
 //! ```
 //!
@@ -68,11 +70,15 @@
 //! §4.6 pt 2 checkpoint ceiling: see [`resolve_revalidate_interval_ms`].
 
 use super::backend::KvMetaBackend;
-use super::checkpoint::{read_newest_ledger, CHECKPOINT_MAX_AGE_MS};
+use super::checkpoint::{
+    read_newest_ledger, LedgerRecord, CHECKPOINT_MAX_AGE_MS, ROOT_LEDGER_LEN, ROOT_LEDGER_SLOTS,
+    ROOT_LEDGER_SLOT_LEN,
+};
 use super::node_cache::{EpochPurgeSink, NodeCache, RevalidateOutcome, RootEpoch};
 use super::tree::{KvTree, RootPtr};
 use super::KvError;
 use crate::cache::TieredCache;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -341,6 +347,68 @@ impl EpochPurgeSink for TieredEpochPurge {
     }
 }
 
+/// The whole-ledger read the poll falls back to, counted
+/// (`meta_kv_revalidate_ledger_full_reads` + the bytes).
+async fn full_ledger_read(path: &Path, base: u64) -> Result<Option<LedgerRecord>, KvError> {
+    super::META_KV_REVALIDATE_LEDGER_FULL_READS.fetch_add(1, Ordering::Relaxed);
+    super::META_KV_REVALIDATE_LEDGER_READ_BYTES.fetch_add(ROOT_LEDGER_LEN, Ordering::Relaxed);
+    read_newest_ledger(path, base).await
+}
+
+/// **The predicted-slot-first ledger read** (PR 5, design-symmetric-
+/// metadata §5.7 — the control-plane poll's economy): the writer places
+/// checkpoint `seq` in slot `seq % 32` (§4.1's round-robin), so the record
+/// after the one this reader adopted at `adopted_seq` can only sit in ONE
+/// slot. The poll reads that 4 KiB slot first and walks successors while
+/// each holds the next seq (a writer that raced ahead by more than the
+/// ring — 32 checkpoints inside one poll interval — lands a higher seq of
+/// the same residue there, adopted the same way); a slot holding an OLDER
+/// record, or one never written, is the stop: the writer has not written
+/// that seq. An idle poll is one slot; `k` new checkpoints are `k + 1`
+/// slots — against the 128 KiB whole-ledger read the S5 poller paid at
+/// every cadence tick.
+///
+/// The whole-ledger read survives as the FALLBACK for a slot that decodes
+/// as neither a record nor zeros — a TORN slot (the writer mid-write, or
+/// damage): the newest VALID record is then in some other slot and only
+/// the full read finds it (a permanently torn slot would otherwise park
+/// the reader for ever while the writer round-robins past it). A
+/// partitioned record (bit 8, non-solo — a per-appender slot range) takes
+/// the fallback too: the prediction is the solo law's.
+///
+/// Returns the newest record found at or above `adopted_seq`, `None` when
+/// nothing beyond the adopted record exists yet.
+pub async fn read_newest_ledger_from(
+    path: &Path,
+    base: u64,
+    adopted_seq: u64,
+) -> Result<Option<LedgerRecord>, KvError> {
+    let mut newest: Option<LedgerRecord> = None;
+    let mut expect = adopted_seq.saturating_add(1);
+    for _ in 0..ROOT_LEDGER_SLOTS {
+        let slot = expect % ROOT_LEDGER_SLOTS;
+        let at = base + slot * ROOT_LEDGER_SLOT_LEN;
+        let buf = crate::uring_fs::read_at(path, at, ROOT_LEDGER_SLOT_LEN as usize).await?;
+        super::META_KV_REVALIDATE_LEDGER_READ_BYTES
+            .fetch_add(ROOT_LEDGER_SLOT_LEN, Ordering::Relaxed);
+        match LedgerRecord::decode_slot(&buf) {
+            Ok(rec) if rec.append_partition.is_some_and(|p| !p.is_solo()) => {
+                return full_ledger_read(path, base).await;
+            }
+            Ok(rec) if rec.seq >= expect => {
+                expect = rec.seq.saturating_add(1);
+                newest = Some(rec);
+            }
+            // An older record: `expect` was never written.
+            Ok(_) => break,
+            // Never written: nothing to find here (a young volume).
+            Err(_) if buf.iter().all(|b| *b == 0) => break,
+            Err(_) => return full_ledger_read(path, base).await,
+        }
+    }
+    Ok(newest)
+}
+
 impl KvMetaBackend {
     /// Declare this mount a **coherent reader** and install the optional R-6
     /// purge trigger (spec §6.8 items 2/5). Arms at the record the mount
@@ -355,22 +423,35 @@ impl KvMetaBackend {
     }
 
     /// Read the volume's newest ledger record as a [`RootEpoch`] — **the
-    /// poll**: one 128 KiB `read_at`, no locks, no tree work.
+    /// poll**: the predicted-slot-first read
+    /// ([`read_newest_ledger_from`]) from the record the reader last
+    /// adopted, no locks, no tree work.
     ///
     /// On a partitioned volume (spec §6.2 item 4) the record that carries
-    /// tree roots is the root authority's; `read_newest_ledger` returns the
-    /// newest valid record in any slot, which for the pre-partition and
-    /// solo-authority forms this binary writes is exactly that record.
+    /// tree roots is the root authority's; the whole-ledger fallback
+    /// returns the newest valid record in any slot, which for the
+    /// pre-partition and solo-authority forms this binary writes is
+    /// exactly that record.
     pub async fn read_root_epoch(&self) -> Result<RootEpoch, KvError> {
-        let rec = read_newest_ledger(self.device_path(), self.superblock().root_ledger.start)
-            .await?
-            .ok_or_else(|| {
-                KvError::Corrupt(format!(
+        let base = self.superblock().root_ledger.start;
+        let Some(seq) = self.node_cache().reader_adopted_seq() else {
+            return match full_ledger_read(self.device_path(), base).await? {
+                Some(rec) => Ok(RootEpoch::from_ledger(&rec)),
+                None => Err(KvError::Corrupt(format!(
                     "{}: no valid root-ledger record to revalidate against",
                     self.device_path().display()
-                ))
-            })?;
-        Ok(RootEpoch::from_ledger(&rec))
+                ))),
+            };
+        };
+        // The reader adopted `seq` at its last poll: the writer's next
+        // record can only sit at `(seq + 1) % 32`. Nothing newer = the
+        // adopted epoch restated (a no-op for `revalidate_trees`).
+        Ok(
+            match read_newest_ledger_from(self.device_path(), base, seq).await? {
+                Some(rec) => RootEpoch::from_ledger(&rec),
+                None => RootEpoch::synthetic(seq, 0, &[]),
+            },
+        )
     }
 
     /// One revalidation pass for a declared reader: poll, adopt roots, drop
@@ -498,6 +579,8 @@ pub struct RevalidationStats {
     pub stale_serves: u64,
     pub dirty_skips: u64,
     pub keys_purged: u64,
+    pub ledger_read_bytes: u64,
+    pub ledger_full_reads: u64,
     pub load_retries: u64,
     pub partition_refusals: u64,
 }
@@ -512,6 +595,8 @@ pub fn revalidation_stats() -> RevalidationStats {
         stale_serves: super::META_KV_REVALIDATE_STALE_SERVES.load(Ordering::Relaxed),
         dirty_skips: super::META_KV_REVALIDATE_DIRTY_SKIPS.load(Ordering::Relaxed),
         keys_purged: super::META_KV_REVALIDATE_KEYS_PURGED.load(Ordering::Relaxed),
+        ledger_read_bytes: super::META_KV_REVALIDATE_LEDGER_READ_BYTES.load(Ordering::Relaxed),
+        ledger_full_reads: super::META_KV_REVALIDATE_LEDGER_FULL_READS.load(Ordering::Relaxed),
         load_retries: super::META_KV_READER_LOAD_RETRIES.load(Ordering::Relaxed),
         partition_refusals: super::META_KV_NODE_PARTITION_REFUSALS.load(Ordering::Relaxed),
     }

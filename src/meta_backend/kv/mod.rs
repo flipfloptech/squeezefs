@@ -160,6 +160,19 @@ pub static META_KV_REVALIDATE_DIRTY_SKIPS: AtomicU64 = AtomicU64::new(0);
 /// not wired (honest, and visible, rather than silently absent).
 pub static META_KV_REVALIDATE_KEYS_PURGED: AtomicU64 = AtomicU64::new(0);
 
+/// Ledger bytes the reader's poll read (PR 5's predicted-slot-first read,
+/// `revalidate::read_newest_ledger_from`): one 4 KiB slot per idle poll,
+/// `k + 1` slots after `k` writer checkpoints, the whole 128 KiB ledger
+/// only on the fallback below — `bytes ÷ polls` is the poll's cost.
+pub static META_KV_REVALIDATE_LEDGER_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Polls that fell back to the whole-ledger read: the predicted slot was
+/// TORN (a writer mid-write, or damage) — the full read is what finds the
+/// newest valid record in any slot — or the volume is partitioned (bit 8,
+/// non-solo), where the round-robin prediction does not hold. Steady
+/// growth on a solo volume is the torn-slot class.
+pub static META_KV_REVALIDATE_LEDGER_FULL_READS: AtomicU64 = AtomicU64::new(0);
+
 /// Extent loads a reader retried because the read raced the writer's
 /// in-flight append (a torn frame followed by a complete one — §4.5's loud
 /// verdict on a crashed writer, a plain race here). Bounded per load;

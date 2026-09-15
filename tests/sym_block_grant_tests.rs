@@ -1635,6 +1635,14 @@ async fn an_armed_holders_supply_terms_read_the_window_and_the_clear_population(
         a.finish_free(*off);
     }
     assert_eq!(a.free_blocks_count(), 0);
+    // The last mints left the window under its refill point, so a
+    // PROACTIVE ask may be in flight: it finds the freed holes and carves
+    // one of them into the window — the supply is conserved (`remaining +
+    // clear`), read once the ask has landed both halves.
+    wait_until("the supply settles at the clear population", || {
+        a.free_supply_blocks() == 100
+    })
+    .await;
     assert_eq!(
         a.free_supply_blocks(),
         100,

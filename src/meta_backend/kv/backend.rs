@@ -11180,7 +11180,27 @@ impl KvMetaBackend {
     /// pointer in the inode record; adding one is an inode-value
     /// version bump (a forward-only format change) that this rare path
     /// does not justify.
+    ///
+    /// **On a token reader the scan is REFUSED** (`ESTALE`, the reconnect
+    /// path's own errno — PR 5, review round 1 Issue 19): the dentry tree
+    /// it would walk is the S5 projection, a bounded-staleness read of
+    /// user-visible metadata — the second read method R-SYM-4 forbids —
+    /// and no token names a parent (a reverse index over every
+    /// directory's grant would be the whole tree). The connected `..` is
+    /// the kernel's dcache and never reaches here; the reconnect of an
+    /// evicted directory on a token reader answers `ESTALE`, which is what
+    /// `open_by_handle_at` callers already handle.
     pub async fn find_parent_of_child(&self, child_global: Ino) -> Result<Option<Ino>> {
+        if self.token_reader().is_some() {
+            return Err(crate::error::SqueezefsError::refused(
+                libc::ESTALE,
+                format!(
+                    "\"..\" of ino {child_global} cannot be resolved on a READ-TOKEN reader: \
+                     the reverse dentry scan would read the bounded-staleness projection \
+                     (design-symmetric-metadata R-SYM-4) — the directory handle is stale"
+                ),
+            ));
+        }
         // POSIX-4: the scan is the instrument. `meta_parent_scans` growing
         // per readdir means the `..` parent memo stopped serving and every
         // ls/find/du/rsync/tar walk is paying O(total dentries) again.

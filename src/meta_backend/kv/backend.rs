@@ -3934,7 +3934,7 @@ impl KvMetaBackend {
         // to Try below, loud). The exact length is reserved under the
         // mutex and the remainder released.
         let rotor_ask = explicit.is_empty();
-        let mut pre_admission = match admit {
+        let pre_admission = match admit {
             ControlAdmit::Try => None,
             ControlAdmit::Park => {
                 if appender_id != 0 {
@@ -3959,6 +3959,9 @@ impl KvMetaBackend {
                 }
             }
         };
+        // Released on drop from here to the write — every early return
+        // and `?` below hands the budget back (Issue 27).
+        let pre_admission = HeldAdmission::new(self.ring.core(), pre_admission);
         let _g = self.manager_verbs.lock().await;
         plane.acquires.fetch_add(1, Ordering::Relaxed);
         let now = crate::mono_core::monotonic_ns_u64();
@@ -3971,9 +3974,6 @@ impl KvMetaBackend {
             let want = if want == 0 { m } else { u64::from(want) };
             if held.saturating_add(want) > 2 * m {
                 plane.rotor_cap_refusals.fetch_add(1, Ordering::Relaxed);
-                if let Some(adm) = pre_admission {
-                    self.ring.core().release(adm);
-                }
                 return Err(KvError::RotorAtCap {
                     appender: appender_id,
                     held,
@@ -4056,9 +4056,6 @@ impl KvMetaBackend {
                         // normal reply, never a witness contradiction
                         // (Issue 14: its own gauge).
                         plane.acquire_refusals.fetch_add(1, Ordering::Relaxed);
-                        if let Some(adm) = pre_admission {
-                            self.ring.core().release(adm);
-                        }
                         return Err(KvError::SlotBusy { slot, holder, g });
                     }
                 }
@@ -4093,11 +4090,10 @@ impl KvMetaBackend {
                     ));
                 }
             }
-            let admission = match pre_admission.take() {
-                Some(adm) => EntryAdmission::Held(adm),
-                None => EntryAdmission::Try,
-            };
-            if let Err(e) = self.write_control_entry(puts, admission).await {
+            if let Err(e) = self
+                .write_control_entry(puts, pre_admission.into_entry())
+                .await
+            {
                 for s in &fresh {
                     let l = plane.table.get(*s);
                     let _ = plane.table.release(
@@ -4117,10 +4113,8 @@ impl KvMetaBackend {
                 .grants
                 .fetch_add(fresh.len() as u64, Ordering::Relaxed);
         }
-        // Nothing granted (every slot `Already`): the pre-admission returns.
-        if let Some(adm) = pre_admission.take() {
-            self.ring.core().release(adm);
-        }
+        // Nothing granted (every slot `Already`): the pre-admission, still
+        // held, returns with the guard's drop.
         for g in &grants {
             if !g.already || set.region(appender_id).is_some() {
                 self.install_lease(set, &plane, appender_id, g.slot, g.words, !g.already)
@@ -4648,13 +4642,12 @@ impl KvMetaBackend {
             super::slot_state::SlotTails::Spilled(sp) => {
                 let node_size = self.cache.config().layout.node_size();
                 let per_extent = super::slot_state::tails_per_spill_extent(node_size);
-                let mut all: Vec<(u64, u32)> = Vec::with_capacity(
-                    sp.runs
-                        .iter()
-                        .map(|(_, n)| *n as usize)
-                        .sum::<usize>()
-                        .min(per_extent * sp.runs.len()),
-                );
+                // Grown per run as each is bounds-checked and read — never
+                // pre-sized from the record's counts (a corrupt record's
+                // 65,535 × 21,845 entries would be a 17 GiB allocation
+                // before any run was checked; review round 4, Issue 27 —
+                // the PR 3 "bounded codec = bounded execution" law).
+                let mut all: Vec<(u64, u32)> = Vec::new();
                 for (addr, count) in &sp.runs {
                     let count = *count as usize;
                     if count > per_extent {
@@ -11879,6 +11872,41 @@ pub enum ControlAdmit {
 enum EntryAdmission {
     Try,
     Held(super::journal_core::Admission),
+}
+
+/// The door's pre-admission while `manager_acquire_slots` holds it (Issue
+/// 24): RELEASED ON DROP unless handed into the entry — every early
+/// return and every `?` between the admission and the write returns the
+/// ring budget structurally (review round 4, Issue 27: the error-only
+/// paths leaked it).
+struct HeldAdmission<'a> {
+    core: &'a super::journal_core::JournalCore,
+    adm: Option<super::journal_core::Admission>,
+}
+
+impl<'a> HeldAdmission<'a> {
+    fn new(
+        core: &'a super::journal_core::JournalCore,
+        adm: Option<super::journal_core::Admission>,
+    ) -> Self {
+        Self { core, adm }
+    }
+
+    /// Hand the admission into the entry (`Try` when none was taken).
+    fn into_entry(mut self) -> EntryAdmission {
+        match self.adm.take() {
+            Some(adm) => EntryAdmission::Held(adm),
+            None => EntryAdmission::Try,
+        }
+    }
+}
+
+impl Drop for HeldAdmission<'_> {
+    fn drop(&mut self) {
+        if let Some(adm) = self.adm.take() {
+            self.core.release(adm);
+        }
+    }
 }
 
 /// One slot the clean leave releases (`release_leases_at_leave`): its

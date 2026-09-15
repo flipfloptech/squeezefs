@@ -88,7 +88,10 @@ async fn reader(path: &std::path::Path) -> (Arc<NodeCache>, Vec<Arc<KvTree>>, Ro
     let epoch = RootEpoch::from_ledger(&rec);
     let cache = NodeCache::new(NodeCacheConfig {
         path: path.to_path_buf(),
-        layout: NodeLayout::new(sb.node_size as usize).expect("layout"),
+        // The frame version is the LAYOUT's (PR 5, §5.8.2): a reader over
+        // a stamped volume must read v2 frames, a flat one v1 — the
+        // product's own resolver decides.
+        layout: KvMetaBackend::node_layout_for(&sb).expect("layout"),
         heap_base: sb.heap.start,
         budget_bytes: 64 * 1024 * 1024,
         writeback_delta_bytes: DEFAULT_WRITEBACK_DELTA_BYTES,

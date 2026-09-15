@@ -446,7 +446,8 @@ use squeezefs::meta_backend::{
     RoutedMetaBackend,
 };
 use squeezefs::meta_ship::token_plane::{
-    LeaseVerdict, RecallDataSink, TokenClientConfig, TokenReaderPlane, TokenService, TokenWants,
+    LeaseVerdict, RecallDataSink, RecalledObject, TokenClientConfig, TokenReaderPlane,
+    TokenService, TokenWants,
 };
 use squeezefs::{free_grace, ro_coherence};
 use std::future::Future;
@@ -593,7 +594,7 @@ impl ProbeSink {
 impl RecallDataSink for ProbeSink {
     fn drain_and_purge<'a>(
         &'a self,
-        objects: &'a [u64],
+        objects: &'a [RecalledObject],
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -967,7 +968,7 @@ async fn a_reader_never_acks_a_recall_with_a_read_in_flight() {
     impl RecallDataSink for DrainSink {
         fn drain_and_purge<'a>(
             &'a self,
-            _objects: &'a [u64],
+            _objects: &'a [RecalledObject],
         ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
             Box::pin(ro_coherence::drain_in_flight_serves())
         }
@@ -1511,6 +1512,124 @@ async fn the_token_cache_is_bounded_by_bytes_and_refuses_an_oversize_entry() {
     assert_eq!(plane.stats().cached_bytes, 0);
     assert!(!plane.holds(d_local));
     plane.test_set_records_budget(None);
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
+/// **The recall purge is PER INO** (review round 1, Issue 10): the
+/// mount's recall sink drops the recalled object's layout from the
+/// reader's router cache and purges exactly the block keys its layout
+/// names — every other object's cached blocks SURVIVE the recall, so a
+/// reader on a shared hot tree keeps its warm read tier. The whole
+/// census stays the fallback for an object whose layout the reader
+/// cannot enumerate (counted: `dlm_token_recall_census_purges`, 0 here).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recall_purges_the_recalled_objects_block_keys_and_leaves_the_rest() {
+    use squeezefs::layout_wire::{encode_layout, LayoutMetadata};
+    use squeezefs::meta_ship::token_plane::{recall_purge_counts, MountRecallSink};
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let striped = |keys: &[&str]| LayoutMetadata {
+        file_type: "striped".to_string(),
+        size: 4096 * keys.len() as u64,
+        block_map_id: None,
+        block_prefix: None,
+        file_id: None,
+        data_key: None,
+        block_map: Some(
+            keys.iter()
+                .enumerate()
+                .map(|(b, k)| (b as u32, k.to_string()))
+                .collect(),
+        ),
+    };
+    let x = Metadata::create(writer.as_ref(), 1, "x", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let y = Metadata::create(writer.as_ref(), 1, "y", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let kx = ["nvme://vol-tok/4096", "nvme://vol-tok/8192:0:100"];
+    let ky = ["nvme://vol-tok/12288"];
+    writer
+        .set_layout_and_size(x, &encode_layout(&striped(&kx)).unwrap(), 8192, &[])
+        .await
+        .unwrap();
+    writer
+        .set_layout_and_size(y, &encode_layout(&striped(&ky)).unwrap(), 4096, &[])
+        .await
+        .unwrap();
+
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-scoped").await;
+    let (router, _dev) = data_router("vol-tok").await;
+    router.set_meta_backend(Arc::clone(&reader));
+    // The reader's warm read tier: X's two blocks (one a decorated
+    // mapping — the tier keys on the STORED value) and Y's one.
+    for k in kx.iter().chain(ky.iter()) {
+        router
+            .cache
+            .read_lru
+            .put(k, bytes::Bytes::from_static(b"warm"));
+    }
+    router
+        .cache
+        .hot_block
+        .put(ky[0], bytes::Bytes::from_static(b"hot"));
+    assert!(plane.install_data_sink(MountRecallSink::new(router.clone(), 0)));
+    let before = recall_purge_counts();
+
+    let _ = Metadata::getattr(reader.as_ref(), x).await.unwrap();
+    let _ = Metadata::getattr(reader.as_ref(), y).await.unwrap();
+    let (_v, x_local) = writer.route_ino(x);
+    assert!(plane.holds(x_local));
+
+    // The holder's writeback publish on X displaces its blocks — the
+    // conflicting commit recalls X's token; the reader acks after
+    // purging X's keys and nothing else.
+    let kx2 = ["nvme://vol-tok/16384", "nvme://vol-tok/20480:0:100"];
+    writer
+        .set_layout_and_size(x, &encode_layout(&striped(&kx2)).unwrap(), 8192, &[])
+        .await
+        .unwrap();
+    wait_until("the recall of X was acked", || {
+        plane.stats().recalls_acked >= 1
+    })
+    .await;
+    assert!(!plane.holds(x_local));
+    for k in kx {
+        assert!(
+            router.cache.read_lru.get(k).is_none(),
+            "X's block key {k} left the read tier at the recall"
+        );
+    }
+    assert!(
+        router.cache.read_lru.get(ky[0]).is_some(),
+        "Y's cached block SURVIVES a recall of X"
+    );
+    assert!(
+        router.cache.hot_block.get(ky[0]).is_some(),
+        "Y's hot block survives too"
+    );
+    let after = recall_purge_counts();
+    assert_eq!(
+        after.scoped - before.scoped,
+        1,
+        "one object purged by its layout"
+    );
+    assert_eq!(after.census - before.census, 0, "no census fallback");
+    // X's two stored values + the decorated mapping's free-able base
+    // (the tiers key on the stored value; the base is purged beside it).
+    assert_eq!(
+        after.keys - before.keys,
+        kx.len() as u64 + 1,
+        "exactly X's block keys were purged"
+    );
     plane.stop().await;
     host.shutdown();
     shutdown(&writer).await;

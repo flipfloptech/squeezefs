@@ -2366,6 +2366,108 @@ async fn a_leased_leafs_split_wider_than_the_one_smo_constant_is_refilled_to_its
     shutdown(&routed).await;
 }
 
+/// **Issue 25 (round 4): an UNLEASED slot tree's structure is the
+/// MANAGER's to maintain; a tree another appender leases is SKIPPED,
+/// never refused.** Region 1 fills slot 4 with 12 KiB payloads, deletes
+/// nine in ten (underfull leaf pairs), releases the slot; the manager's
+/// merge sweep (the D4 arm's and the heap-full recovery's shared body)
+/// must MERGE the unleased tree — before the fix the third gate state
+/// refused the manager's structural moves as `NotLeased`, the must-stay-0
+/// `meta_kv_leaf_lease_refusals` counted, the sweep aborted its lap at
+/// that tree and the tick errored every cadence. Then a WIRE joiner takes
+/// the slot: the manager's sweep skips its tree (`merge_sweep_foreign_
+/// skips`), completes the lap, and refuses nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_manager_merges_an_unleased_slot_tree_and_skips_a_foreign_leased_one() {
+    use squeezefs::meta_backend::kv::META_KV_NODE_MERGES;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_under(&uris, &Knobs::armed().partition(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let refusals0 = META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed);
+    // ≈ 10 leaves of 12 KiB payloads in slot 4; keep every tenth.
+    let value = vec![0x42u8; 12 * 1024];
+    for k in 0..40u64 {
+        vol.setxattr_internal(ino_in_slot(SLOT4, 1 + k), "user.payload", &value)
+            .await
+            .unwrap();
+    }
+    vol.checkpoint_now().await.unwrap();
+    for k in 0..40u64 {
+        if k % 10 != 0 {
+            vol.removexattr_internal(ino_in_slot(SLOT4, 1 + k), "user.payload")
+                .await
+                .unwrap();
+        }
+    }
+    vol.checkpoint_now().await.unwrap();
+    vol.checkpoint_now().await.unwrap();
+    let census = vol.dead_bset_census();
+    assert!(
+        census.merge_candidates.len() >= 2,
+        "the fixture: underfull leaves in slot 4 ({} of {})",
+        census.merge_candidates.len(),
+        census.leaves
+    );
+    // Region 1 releases the slot: unleased, the manager's to maintain.
+    vol.release_slot_handover(1, SLOT4).await.unwrap();
+    assert!(!vol.slot_leases().unwrap().gate.is_leased(SLOT4));
+    let merges0 = META_KV_NODE_MERGES.load(Ordering::Relaxed);
+    let report = vol
+        .defrag_merge_sweep(None)
+        .await
+        .expect("the manager's sweep runs over an unleased slot tree");
+    assert!(report.lap_complete, "the lap completes");
+    assert!(
+        META_KV_NODE_MERGES.load(Ordering::Relaxed) > merges0,
+        "the unleased tree's underfull pair merged"
+    );
+    assert_eq!(
+        META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed),
+        refusals0,
+        "the manager's maintenance of an unleased tree is never a lease refusal"
+    );
+    // The survivors read back.
+    for k in (0..40u64).step_by(10) {
+        let v = vol
+            .getxattr(ino_in_slot(SLOT4, 1 + k), "user.payload")
+            .await
+            .unwrap();
+        assert_eq!(v.as_deref(), Some(value.as_slice()));
+    }
+    // A WIRE joiner takes slot 4 (routing 3): its tree is FOREIGN to this
+    // mount's structure — the sweep skips it, completes, refuses nothing.
+    let (host, mut client, joiner) = wire_joiner(&vol, 25).await;
+    match client.acquire_slot(joiner, 3).await.unwrap() {
+        ManagerReply::SlotsGranted { slots, .. } => assert_eq!(slots[0].slot, 3),
+        other => panic!("{other:?}"),
+    }
+    // The joiner's id is never a released in-process region's (page 1
+    // went `Free` with region 1's release — its id stays the region
+    // object's; a joiner handed it would be routed as that region).
+    assert!(
+        joiner >= 2,
+        "a wire joiner never reuses an in-process region's id: {joiner}"
+    );
+    assert!(vol.slot_leases().unwrap().gate.is_foreign(SLOT4));
+    let skips0 = lease_stats(&vol).merge_sweep_foreign_skips;
+    let report = vol.defrag_merge_sweep(None).await.unwrap();
+    assert!(report.lap_complete, "a foreign tree never blocks the lap");
+    assert!(
+        lease_stats(&vol).merge_sweep_foreign_skips > skips0,
+        "the foreign-leased tree was skipped, counted"
+    );
+    assert_eq!(
+        META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed),
+        refusals0,
+        "skipped, never refused"
+    );
+    assert!(!vol.is_failed());
+    host.shutdown();
+    shutdown(&routed).await;
+}
+
 /// **Issue 24 (round 3): a first-touch acquire never parks for ring space
 /// under `manager_verbs`.** With the cadence parked and ring 0's user
 /// window exhausted, a first-touch commit's door acquire PARKS at ring

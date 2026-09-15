@@ -1181,6 +1181,99 @@ async fn the_dir_rename_lock_is_durable_in_tree0_and_a_dead_holders_lock_is_rele
     shutdown(&routed).await;
 }
 
+/// Two directory renames of ONE identity are SERIALIZED in-process
+/// (review round 2, Issue 23): the lease serializes ops, not identities
+/// — the second take waits for the first's release rather than joining
+/// its record, so the law never leans on the kernel's
+/// `s_vfs_rename_mutex` (an S8-served `Rename`, the offline callers and
+/// the contracts reach `RoutedMetaBackend::rename` without it). Pinned
+/// with a directory rename held inside the lease (its shipped step
+/// parked at the holder) while a second same-identity directory rename
+/// is issued: the second completes only after the first releases; the
+/// record is held throughout and free at the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_directory_renames_of_one_identity_serialize_under_the_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let mine = routed
+        .create(ROOT_INO, "mine", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let other = routed
+        .create(ROOT_INO, "other", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    routed
+        .create(mine, "p", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap();
+    routed
+        .create(other, "q", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap();
+    let before = cross_owner_stats();
+    // r1 holds the lease across its shipped steps (400 ms each at the
+    // holder); r2 — same identity, a SAME-SLOT directory rename under a
+    // DISJOINT parent (no 4a key in common), shipping nothing — must not
+    // run beside it.
+    crossvol_tx::TEST_XV_SERVE_HOLD_MS.store(400, Ordering::SeqCst);
+    let r1 = {
+        let routed = Arc::clone(&routed);
+        tokio::spawn(async move { routed.rename(mine, "p", shared, "p2", 0).await })
+    };
+    let mut held = false;
+    for _ in 0..200 {
+        if vol.dir_rename_record().await.unwrap().is_some() {
+            held = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(held, "r1 holds the lease");
+    let t = std::time::Instant::now();
+    let r2 = {
+        let routed = Arc::clone(&routed);
+        tokio::spawn(async move { routed.rename(other, "q", other, "q2", 0).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(
+        !r2.is_finished(),
+        "r2 waits for r1's release — never a join"
+    );
+    r1.await.unwrap().unwrap();
+    r2.await.unwrap().unwrap();
+    crossvol_tx::TEST_XV_SERVE_HOLD_MS.store(0, Ordering::SeqCst);
+    assert!(
+        t.elapsed() >= std::time::Duration::from_millis(300),
+        "r2 completed only after r1's shipped steps: {:?}",
+        t.elapsed()
+    );
+    assert!(vol.dir_rename_record().await.unwrap().is_none(), "released");
+    let after = cross_owner_stats();
+    assert_eq!(
+        after.dir_rename_lock_acquires - before.dir_rename_lock_acquires,
+        2
+    );
+    assert!(
+        after.dir_rename_lock_wait_ns_sum - before.dir_rename_lock_wait_ns_sum >= 200_000_000,
+        "the second take WAITED"
+    );
+    assert_eq!(names_in(&routed, other).await, vec!["q2".to_string()]);
+    assert_eq!(names_in(&routed, shared).await, vec!["p2".to_string()]);
+    assert!(names_in(&routed, mine).await.is_empty());
+    assert_closed("same-identity serialization");
+    holders.tear_down();
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
 /// The lock verbs' wire words are SCREENED (review round 1, Issue 3 —
 /// PR 4 round 6's law for every slot verb): the id must name a `Live`
 /// directory page and never one of this mount's own regions; an unlock

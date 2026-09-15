@@ -25638,6 +25638,13 @@ impl Filesystem for SqueezefsFilesystem {
             // armed stays the control plane. Refused loud (the mount fails)
             // when the posture's inputs are absent; `Ok(0)` under `=0`.
             if let Err(msg) =
+                crate::ro_coherence::refuse_explicit_ttls_under_tokens(&self.kernel_ttls)
+            {
+                error!("{msg}");
+                eprintln!("squeezefs: {msg}");
+                return Err(libc::EINVAL.into());
+            }
+            if let Err(msg) =
                 crate::ro_coherence::arm_token_readers(&routed.volumes, &self.router).await
             {
                 error!("{msg}");

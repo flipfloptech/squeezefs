@@ -645,6 +645,49 @@ pub fn metadata_staleness_bound_ms(volumes: &[Arc<KvMetaBackend>]) -> u64 {
     reader_staleness_bound().as_millis() as u64
 }
 
+/// **Explicit kernel TTLs on a token reader are refused** (review round
+/// 1, Issue 13): every class derives to 0 under tokens
+/// ([`metadata_staleness_bound`]), and the standing precedence lets an
+/// explicit `SQUEEZEFS_FUSE_*_TTL_MS` or `-o *_timeout=` lengthen it —
+/// which on a token reader re-creates a bounded-staleness dcache, the
+/// second read method R-SYM-4 forbids, by lever. Loud, naming the class;
+/// the owed kernel-side `notify_inval_entry` / `notify_inval_inode` on
+/// recall is what would make a non-zero TTL legal.
+pub fn refuse_explicit_ttls_under_tokens(
+    ttls: &crate::fuse_client::KernelCacheTtls,
+) -> std::result::Result<(), String> {
+    if !token_reader_requested() {
+        return Ok(());
+    }
+    let nonzero: Vec<&str> = [
+        ("attr_timeout / SQUEEZEFS_FUSE_ATTR_TTL_MS", ttls.attr),
+        ("entry_timeout / SQUEEZEFS_FUSE_ENTRY_TTL_MS", ttls.entry),
+        (
+            "dir_entry_timeout / SQUEEZEFS_FUSE_DIR_ENTRY_TTL_MS",
+            ttls.dir_entry,
+        ),
+        (
+            "negative_timeout / SQUEEZEFS_FUSE_NEGATIVE_TTL_MS",
+            ttls.negative,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, d)| !d.is_zero())
+    .map(|(name, _)| name)
+    .collect();
+    if nonzero.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount with an explicit non-zero kernel cache TTL \
+         ({}): under read tokens every kernel TTL derives to 0 — a dentry or attribute the \
+         kernel keeps past a recall is a bounded-staleness read method, which \
+         design-symmetric-metadata R-SYM-4 forbids. Drop the option, or mount with \
+         SQUEEZEFS_SYMMETRIC_META=0",
+        nonzero.join(", ")
+    ))
+}
+
 /// **The mount-path arm of the token client** (§5.7.2 — `-o ro` =
 /// member-reader + token client; called from `fuse_client::init` beside
 /// the S5 arms): under [`token_reader_requested`] every read-only volume
@@ -690,6 +733,34 @@ pub async fn arm_token_readers(
             ));
         }
     }
+    // The ack law's two terms are UNCONDITIONAL under tokens (review round
+    // 1, Issue 6): the observed drain of in-flight serves and the layout
+    // cache's epoch step are what the reader's ack ATTESTS — under S5 the
+    // ring's timers stood behind their A/B levers; under tokens the recall
+    // IS the qualification and there is no timer. A lever at `0` refuses
+    // the mount (the ENG-10 way), and the serve ledger is armed here
+    // whatever the S5 cadence task decided.
+    if !drain_observed_enabled() {
+        return Err(
+            "SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount with SQUEEZEFS_FREE_GRACE_DRAIN_OBSERVED=0: \
+             a token reader acks a recall only after the OBSERVED drain of its in-flight serves, \
+             and no timer stands behind that ack (R-SYM-4 — no bounded second method); the lever \
+             governs the SQUEEZEFS_SYMMETRIC_META=0 reader alone. Unset it, or mount with \
+             SQUEEZEFS_SYMMETRIC_META=0"
+                .to_string(),
+        );
+    }
+    if !drain_epoch_stamp_enabled() {
+        return Err(
+            "SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount with SQUEEZEFS_FREE_GRACE_DRAIN_EPOCH_STAMP=0: \
+             a recall steps the reader's layout cache and every pre-step layout must miss, and \
+             no timer stands behind that miss (R-SYM-4 — no bounded second method); the lever \
+             governs the SQUEEZEFS_SYMMETRIC_META=0 reader alone. Unset it, or mount with \
+             SQUEEZEFS_SYMMETRIC_META=0"
+                .to_string(),
+        );
+    }
+    arm_serve_ledger();
     let Some(member) = crate::membership::installed_member() else {
         return Err(
             "SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount, but this reader holds no membership \
@@ -741,6 +812,19 @@ pub async fn arm_token_readers(
         plane.install_data_sink(
             Arc::clone(&sink) as Arc<dyn crate::meta_ship::token_plane::RecallDataSink>
         );
+        // The holder answers the arm's probe or the mount refuses: a
+        // writer with its plane unarmed serves no token verbs, and a
+        // reader that mounted anyway would answer EIO to every resolve.
+        if let Err(e) = plane.probe().await {
+            return Err(format!(
+                "{}: SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount, but the holder at {endpoint} \
+                 does not serve read tokens for volume {ordinal} ({e}) — the writer must be \
+                 mounted with SQUEEZEFS_SYMMETRIC_META=1 and SQUEEZEFS_MULTI_WRITER=1 (its S8 \
+                 listener carries the token verbs), and SQUEEZEFS_MW_AUTHORITY must name that \
+                 listener",
+                v.device_path().display()
+            ));
+        }
         armed += 1;
     }
     log::info!(

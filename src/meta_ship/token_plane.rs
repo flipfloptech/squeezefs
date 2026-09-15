@@ -1376,6 +1376,21 @@ impl TokenReaderPlane {
         plane
     }
 
+    /// **The arm's probe** (review round 1, Issue 17): one empty recall
+    /// round (`Recall { wait_ms: 0 }`) on the grant session — the holder
+    /// must answer it, so a writer whose plane is unarmed (the token verbs
+    /// are not on its listener), a listener that is down, or a wrong
+    /// endpoint is found at the ARM and refuses the mount, never at the
+    /// first resolve as an EIO.
+    pub async fn probe(&self) -> Result<()> {
+        match self.call(TokenCall::Recall { wait_ms: 0 }).await? {
+            TokenReply::Recall { .. } => Ok(()),
+            other => Err(fail_closed(&format!(
+                "the holder answered the arm's probe with {other:?}"
+            ))),
+        }
+    }
+
     /// Test seam: the records budget in force (`None` = the derivation).
     pub fn test_set_records_budget(&self, bytes: Option<u64>) {
         self.budget_override

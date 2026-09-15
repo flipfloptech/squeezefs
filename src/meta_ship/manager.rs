@@ -208,7 +208,74 @@ pub enum ManagerCall {
     DirRenameLock { appender_id: u32 },
     /// Release it (`already` when it was not held by the caller).
     DirRenameUnlock { appender_id: u32 },
+    // ---- PR 8 — verb codes 0x80..=0x8F (design §5.5 / §5.5.1 / §5.5.2;
+    // the allocation lease, ranged block grants, the death ledger's
+    // RECORD half). Bincode encodes a variant by its declaration index,
+    // so the codes are the DOCUMENTED identities ([`VERB_CODE_BLOCK_GRANT`]
+    // …) every same-commit peer agrees on; the enum order is append-only.
+    /// Up to `want` blocks of DATA volume `vol_tag` for `writer` (0 = the
+    /// holder's derivation) — served by the volume's ALLOCATION HOLDER;
+    /// the bits are SET and journaled before the reply.
+    BlockGrant {
+        vol_tag: u64,
+        writer: WireIdentity,
+        want: u32,
+        /// Blocks the writer still holds unconsumed (the idempotent
+        /// replay's witness: a remainder covering `want` is answered
+        /// verbatim).
+        held_unconsumed: u64,
+    },
+    /// An unconsumed range of `writer`'s grant handed back.
+    ReturnBlocks {
+        vol_tag: u64,
+        writer: WireIdentity,
+        start: u64,
+        len: u32,
+    },
+    /// The floating allocation lease of DATA volume `vol_tag` for
+    /// `identity` (homed on `home_vol`, appender `appender_id` there) —
+    /// served by VOLUME 0's manager under the §5.5.1 ordering law.
+    AllocLeaseAcquire {
+        vol_tag: u64,
+        identity: WireIdentity,
+        appender_id: u32,
+        home_vol: u16,
+        control_ino: u64,
+        blocks: u64,
+    },
+    /// The holder at `term` publishes its bitmap pages (volume-qualified
+    /// extents) — the successor's copy.
+    AllocLeaseBitmap {
+        vol_tag: u64,
+        identity: WireIdentity,
+        term: u64,
+        bitmap: Vec<(u16, (u64, u64))>,
+    },
+    /// The holder at `term` gives the lease up.
+    AllocLeaseRelease {
+        vol_tag: u64,
+        identity: WireIdentity,
+        term: u64,
+    },
+    /// The recovering manager of volume `vol` says `member`'s region there
+    /// is `Recovered` — gates the allocation-lease re-grant.
+    RecordRecovered { member: WireIdentity, vol: u16 },
+    /// RESERVED for PR 10's recovery driver (the home shard's eviction →
+    /// the death ledger): this rung REFUSES it naming PR 10; the record it
+    /// will write exists (`KvMetaBackend::record_death`).
+    RecordDeath { member: WireIdentity, epoch: u64 },
 }
+
+/// PR 8's documented verb codes (the range the level-4 coordination
+/// assigned; the wire encodes the enum's declaration index — these are the
+/// identities peers and the notes name).
+pub const VERB_CODE_BLOCK_GRANT: u8 = 0x80;
+pub const VERB_CODE_RETURN_BLOCKS: u8 = 0x81;
+pub const VERB_CODE_ALLOC_LEASE_ACQUIRE: u8 = 0x82;
+pub const VERB_CODE_ALLOC_LEASE_BITMAP: u8 = 0x83;
+pub const VERB_CODE_ALLOC_LEASE_RELEASE: u8 = 0x84;
+pub const VERB_CODE_RECORD_RECOVERED: u8 = 0x85;
+pub const VERB_CODE_RECORD_DEATH: u8 = 0x86;
 
 /// The slot tree's words on the wire (§5.1.4 "four words move" — root,
 /// cursor, extent count — plus §5.8.2's seq-space floor): what a release
@@ -271,6 +338,14 @@ impl ManagerCall {
             Self::ReleaseShared { .. } => "release_shared",
             Self::DirRenameLock { .. } => "dir_rename_lock",
             Self::DirRenameUnlock { .. } => "dir_rename_unlock",
+            // PR 8
+            Self::BlockGrant { .. } => "block_grant",
+            Self::ReturnBlocks { .. } => "return_blocks",
+            Self::AllocLeaseAcquire { .. } => "alloc_lease_acquire",
+            Self::AllocLeaseBitmap { .. } => "alloc_lease_bitmap",
+            Self::AllocLeaseRelease { .. } => "alloc_lease_release",
+            Self::RecordRecovered { .. } => "record_recovered",
+            Self::RecordDeath { .. } => "record_death",
         }
     }
 }
@@ -386,6 +461,33 @@ pub enum ManagerReply {
     },
     /// Released (`already` = the caller held nothing).
     DirRenameUnlocked {
+        already: bool,
+    },
+    // ---- PR 8
+    /// `BlockGrant`: the ranges the writer holds — one fresh range, or
+    /// its unconsumed grants verbatim (`already`).
+    BlocksGranted {
+        grants: Vec<(u64, u32)>,
+        already: bool,
+    },
+    /// `BlockGrant`: no clear block remains on the holder.
+    BlocksFull,
+    /// `ReturnBlocks`: blocks cleared (`None` = the range was not the
+    /// writer's — refused, nothing cleared).
+    BlocksReturned {
+        cleared: Option<u64>,
+    },
+    /// `AllocLeaseAcquire`: granted at `term` (a successor copies
+    /// `predecessor_bitmap`), or `already` the caller's.
+    AllocLeaseGranted {
+        term: u64,
+        already: bool,
+        predecessor_bitmap: Vec<(u16, (u64, u64))>,
+        predecessor_blocks: u64,
+    },
+    /// `AllocLeaseBitmap` / `AllocLeaseRelease` / `RecordRecovered`: the
+    /// durable record landed (`already` = it had).
+    Recorded {
         already: bool,
     },
 }
@@ -738,6 +840,126 @@ impl ManagerService {
                     .manager_dir_rename_unlock_wire(self.ordinal, *appender_id)
                     .await
                     .map(|already| ManagerReply::DirRenameUnlocked { already }),
+                // ---- PR 8
+                ManagerCall::BlockGrant {
+                    vol_tag,
+                    writer,
+                    want,
+                    held_unconsumed,
+                } => self
+                    .volume
+                    .holder_block_grant(
+                        *vol_tag,
+                        &wire_writer_name(writer),
+                        u64::from(*want),
+                        *held_unconsumed,
+                    )
+                    .await
+                    .map(|outcome| match outcome {
+                        crate::block_grant::CarveOutcome::Granted(g) => {
+                            ManagerReply::BlocksGranted {
+                                grants: vec![(g.start, g.len)],
+                                already: false,
+                            }
+                        }
+                        crate::block_grant::CarveOutcome::Already(gs) => {
+                            ManagerReply::BlocksGranted {
+                                grants: gs.iter().map(|g| (g.start, g.len)).collect(),
+                                already: true,
+                            }
+                        }
+                        crate::block_grant::CarveOutcome::Full => ManagerReply::BlocksFull,
+                    }),
+                ManagerCall::ReturnBlocks {
+                    vol_tag,
+                    writer,
+                    start,
+                    len,
+                } => self
+                    .volume
+                    .holder_return_blocks(
+                        *vol_tag,
+                        &wire_writer_name(writer),
+                        crate::block_grant::BlockGrant {
+                            start: *start,
+                            len: *len,
+                        },
+                    )
+                    .await
+                    .map(|cleared| ManagerReply::BlocksReturned { cleared }),
+                ManagerCall::AllocLeaseAcquire {
+                    vol_tag,
+                    identity,
+                    appender_id,
+                    home_vol,
+                    control_ino,
+                    blocks,
+                } => self
+                    .volume
+                    .manager_alloc_lease_acquire(
+                        *vol_tag,
+                        (*identity).into(),
+                        *appender_id,
+                        *home_vol,
+                        *control_ino,
+                        *blocks,
+                    )
+                    .await
+                    .map(|g| ManagerReply::AllocLeaseGranted {
+                        term: g.term,
+                        already: g.already,
+                        predecessor_bitmap: g
+                            .predecessor_bitmap
+                            .iter()
+                            .map(|(v, e)| (*v, (e.start, e.len)))
+                            .collect(),
+                        predecessor_blocks: g.predecessor_blocks,
+                    }),
+                ManagerCall::AllocLeaseBitmap {
+                    vol_tag,
+                    identity,
+                    term,
+                    bitmap,
+                } => self
+                    .volume
+                    .manager_alloc_lease_bitmap(
+                        *vol_tag,
+                        (*identity).into(),
+                        *term,
+                        bitmap
+                            .iter()
+                            .map(|(v, (s, l))| (*v, ExtentRef { start: *s, len: *l }))
+                            .collect(),
+                    )
+                    .await
+                    .map(|already| ManagerReply::Recorded { already }),
+                ManagerCall::AllocLeaseRelease {
+                    vol_tag,
+                    identity,
+                    term,
+                } => self
+                    .volume
+                    .manager_alloc_lease_release(*vol_tag, (*identity).into(), *term)
+                    .await
+                    .map(|already| ManagerReply::Recorded { already }),
+                ManagerCall::RecordRecovered { member, vol } => self
+                    .volume
+                    .manager_record_recovered((*member).into(), *vol)
+                    .await
+                    .map(|already| ManagerReply::Recorded { already }),
+                // The RECORD exists (`KvMetaBackend::record_death`); the
+                // DRIVER that writes it from a home shard's eviction is PR
+                // 10's — until it lands the wire refuses loud rather than
+                // let a peer declare a member dead with no recovery behind
+                // it.
+                ManagerCall::RecordDeath { member, epoch } => {
+                    Err(crate::meta_backend::kv::KvError::Rejected(format!(
+                        "RecordDeath {{ node {:#018x} slot {}, epoch {epoch} }} is RESERVED for \
+                         PR 10's recovery driver (the home shard's eviction → the death \
+                         ledger); this rung writes the record only in-process",
+                        member.node_token, member.mount_slot
+                    )))
+                }
             };
         let (reply, status) = match served {
             Ok(reply) => (reply, STATUS_OK),
@@ -748,6 +970,14 @@ impl ManagerService {
                 STATUS_REJECTED,
             ),
             Err(e @ crate::meta_backend::kv::KvError::GrantDeferred { .. }) => (
+                ManagerReply::Deferred {
+                    reason: e.to_string(),
+                },
+                STATUS_DEFERRED,
+            ),
+            // PR 8: the allocation lease's re-grant waiting on the home
+            // recovery — the same retry class.
+            Err(e @ crate::meta_backend::kv::KvError::LeaseDeferred(_)) => (
                 ManagerReply::Deferred {
                     reason: e.to_string(),
                 },
@@ -1196,5 +1426,164 @@ pub fn joined_segments(reply: &ManagerReply) -> Vec<ExtentRef> {
             .map(|&(start, len)| ExtentRef { start, len })
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+/// PR 8: the ledger's writer key for a wire identity — the KD-MW-2 pair,
+/// the same spelling the membership census uses for a node.
+pub fn wire_writer_name(w: &WireIdentity) -> String {
+    format!("node_{:016x}.m{:08x}", w.node_token, w.mount_slot)
+}
+
+impl ManagerClient {
+    /// `BlockGrant` — `Ok(Some(ranges))` granted (or the unconsumed
+    /// remainder verbatim), `Ok(None)` the holder is full.
+    pub async fn block_grant(
+        &mut self,
+        vol_tag: u64,
+        writer: WireIdentity,
+        want: u32,
+        held_unconsumed: u64,
+    ) -> Result<Option<Vec<crate::block_grant::BlockGrant>>> {
+        match self
+            .call(ManagerCall::BlockGrant {
+                vol_tag,
+                writer,
+                want,
+                held_unconsumed,
+            })
+            .await?
+        {
+            ManagerReply::BlocksGranted { grants, .. } => Ok(Some(
+                grants
+                    .into_iter()
+                    .map(|(start, len)| crate::block_grant::BlockGrant { start, len })
+                    .collect(),
+            )),
+            ManagerReply::BlocksFull => Ok(None),
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Err(SqueezefsError::InvalidOperation(format!(
+                "BlockGrant answered {other:?}"
+            ))),
+        }
+    }
+
+    /// `ReturnBlocks` — `Ok(cleared)`; `None` = the range was refused.
+    pub async fn return_blocks(
+        &mut self,
+        vol_tag: u64,
+        writer: WireIdentity,
+        range: crate::block_grant::BlockGrant,
+    ) -> Result<Option<u64>> {
+        match self
+            .call(ManagerCall::ReturnBlocks {
+                vol_tag,
+                writer,
+                start: range.start,
+                len: range.len,
+            })
+            .await?
+        {
+            ManagerReply::BlocksReturned { cleared } => Ok(cleared),
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Err(SqueezefsError::InvalidOperation(format!(
+                "ReturnBlocks answered {other:?}"
+            ))),
+        }
+    }
+
+    /// `AllocLeaseAcquire` — `Ok(reply)` is `AllocLeaseGranted` or
+    /// `Deferred` (the successor before the home recovery: EAGAIN class).
+    pub async fn alloc_lease_acquire(
+        &mut self,
+        vol_tag: u64,
+        identity: WireIdentity,
+        appender_id: u32,
+        home_vol: u16,
+        control_ino: u64,
+        blocks: u64,
+    ) -> Result<ManagerReply> {
+        match self
+            .call(ManagerCall::AllocLeaseAcquire {
+                vol_tag,
+                identity,
+                appender_id,
+                home_vol,
+                control_ino,
+                blocks,
+            })
+            .await?
+        {
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Ok(other),
+        }
+    }
+
+    /// `AllocLeaseBitmap` — `Ok(already)`.
+    pub async fn alloc_lease_bitmap(
+        &mut self,
+        vol_tag: u64,
+        identity: WireIdentity,
+        term: u64,
+        bitmap: Vec<(u16, (u64, u64))>,
+    ) -> Result<bool> {
+        match self
+            .call(ManagerCall::AllocLeaseBitmap {
+                vol_tag,
+                identity,
+                term,
+                bitmap,
+            })
+            .await?
+        {
+            ManagerReply::Recorded { already } => Ok(already),
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Err(SqueezefsError::InvalidOperation(format!(
+                "AllocLeaseBitmap answered {other:?}"
+            ))),
+        }
+    }
+
+    /// `AllocLeaseRelease` — `Ok(already)`.
+    pub async fn alloc_lease_release(
+        &mut self,
+        vol_tag: u64,
+        identity: WireIdentity,
+        term: u64,
+    ) -> Result<bool> {
+        match self
+            .call(ManagerCall::AllocLeaseRelease {
+                vol_tag,
+                identity,
+                term,
+            })
+            .await?
+        {
+            ManagerReply::Recorded { already } => Ok(already),
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Err(SqueezefsError::InvalidOperation(format!(
+                "AllocLeaseRelease answered {other:?}"
+            ))),
+        }
+    }
+
+    /// `RecordRecovered` — `Ok(already)`.
+    pub async fn record_recovered(&mut self, member: WireIdentity, vol: u16) -> Result<bool> {
+        match self
+            .call(ManagerCall::RecordRecovered { member, vol })
+            .await?
+        {
+            ManagerReply::Recorded { already } => Ok(already),
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Err(SqueezefsError::InvalidOperation(format!(
+                "RecordRecovered answered {other:?}"
+            ))),
+        }
+    }
+
+    /// `RecordDeath` — RESERVED: answers the reservation refusal
+    /// (`STATUS_REJECTED`) until PR 10's driver lands.
+    pub async fn record_death(&mut self, member: WireIdentity, epoch: u64) -> Result<ManagerReply> {
+        self.call(ManagerCall::RecordDeath { member, epoch }).await
     }
 }

@@ -1321,6 +1321,13 @@ pub const INODE_PLANE_SHARD_BASE: u32 = 1 << 20;
 /// predicate is true on all K nodes — K concurrent coordinators over one
 /// set.
 pub fn maintenance_coordinator_refusal() -> Option<String> {
+    // PR 8 (design-symmetric-metadata §5.5): under the armed symmetric
+    // plane the coordinator is VOLUME 0's MANAGER — one predicate ahead
+    // of the per-volume-owner map; `None` on every unarmed mount (one
+    // relaxed load).
+    if let Some(refusal) = crate::meta_backend::kv::alloc_lease::symmetric_coordinator_refusal() {
+        return Some(refusal);
+    }
     let map = crate::meta_ship::owners::owner_map()?;
     if !map.multi_owner() || map.owns_slot_0() {
         return None;

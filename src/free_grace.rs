@@ -1921,6 +1921,15 @@ pub struct GraceRing {
     /// Held device bytes (this volume's share of `free_grace_bytes`).
     bytes: AtomicU64,
     cap: usize,
+    /// PR 8 (design-symmetric-metadata §5.5 / §5.7.3): the PER-VOLUME
+    /// closure terms — `deferrals ≡ releases + len` holds on THIS ring
+    /// (one ring per data volume, one clock), beside the process gauges.
+    deferrals: AtomicU64,
+    releases: AtomicU64,
+    /// Frees released past the ROUTINE bound — the ring's surviving role
+    /// under recall-driven qualification: the TIMEOUT path for a reader
+    /// that never acknowledged (`free_grace_timeout_deferrals`).
+    timeout_deferrals: AtomicU64,
 }
 
 impl Default for GraceRing {
@@ -1959,7 +1968,27 @@ impl GraceRing {
             len: AtomicUsize::new(0),
             bytes: AtomicU64::new(0),
             cap: cap.max(1),
+            deferrals: AtomicU64::new(0),
+            releases: AtomicU64::new(0),
+            timeout_deferrals: AtomicU64::new(0),
         }
+    }
+
+    /// This ring's deferrals (the per-volume closure's left side).
+    pub fn deferrals(&self) -> u64 {
+        self.deferrals.load(Ordering::Relaxed)
+    }
+
+    /// This ring's releases.
+    pub fn releases(&self) -> u64 {
+        self.releases.load(Ordering::Relaxed)
+    }
+
+    /// `free_grace_timeout_deferrals` on this ring: releases that waited
+    /// past the routine bound (a forced release or a tightened deadline —
+    /// a reader that never acked).
+    pub fn timeout_deferrals(&self) -> u64 {
+        self.timeout_deferrals.load(Ordering::Relaxed)
     }
 
     /// A ring on the derived cap ([`derived_ring_cap`]).
@@ -1992,6 +2021,7 @@ impl GraceRing {
         self.len.store(guard.len(), Ordering::Release);
         drop(guard);
         self.bytes.fetch_add(size, Ordering::Relaxed);
+        self.deferrals.fetch_add(1, Ordering::Relaxed);
         DEFERRALS.fetch_add(1, Ordering::Relaxed);
         HELD_OFFSETS.fetch_add(1, Ordering::Relaxed);
         HELD_BYTES.fetch_add(size, Ordering::Relaxed);
@@ -2168,8 +2198,11 @@ impl GraceRing {
             HELD_OFFSETS.fetch_sub(out.len() as u64, Ordering::Relaxed);
             HELD_BYTES.fetch_sub(released_bytes, Ordering::Relaxed);
             RELEASES.fetch_add(out.len() as u64, Ordering::Relaxed);
+            self.releases.fetch_add(out.len() as u64, Ordering::Relaxed);
             if forced {
                 FORCED_RELEASES.fetch_add(out.len() as u64, Ordering::Relaxed);
+                self.timeout_deferrals
+                    .fetch_add(out.len() as u64, Ordering::Relaxed);
             }
             // `free_grace_residence_ms` (sustain campaign §8) — the
             // per-offset loop latency, `now − (label − 1)` — and its

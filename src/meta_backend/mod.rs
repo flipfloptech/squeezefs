@@ -557,6 +557,10 @@ pub async fn open_routed_meta_set(paths: &[String]) -> Result<std::sync::Arc<Rou
             kv::checkpoint::checkpoint_landing_ceiling_derived(),
         );
     }
+    // PR 8 (design-symmetric-metadata §5.5 / KD-SYM-15): under the armed
+    // plane volume 0's manager is the maintenance coordinator and this
+    // mount is a symmetric appender whose `T_self` action is the park.
+    kv::alloc_lease::arm_symmetric_roles(&routed);
     Ok(routed)
 }
 

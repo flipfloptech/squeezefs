@@ -2219,6 +2219,9 @@ pub struct AppenderSet {
     /// Manager-role releases the §5.5.2 vol-0 rule decided
     /// (`manager_vol0_unreachable`).
     pub vol0_unreachable: std::sync::atomic::AtomicU64,
+    /// PR 8: the instant (caller clock ms) volume 0's ledger was first
+    /// probed unreachable; 0 = reachable (`note_vol0_ledger_probe`).
+    pub vol0_unreachable_since_ms: std::sync::atomic::AtomicU64,
     /// The manager verb ledger (`manager_verb_replays` /
     /// `manager_verb_refusals`, the latter must-stay-0) and the service
     /// phase table (`manager_service_ns`).

@@ -253,6 +253,16 @@
 //!   `commit_grant_if_current` is what keeps a mid-await revoke from
 //!   minting an orphan grant (the rung-4 STOP finding, RED at commit
 //!   `ea34796c` against the pre-fix unconditional commit).
+//! - [`park_core`] (symmetric metadata PR 8, KD-SYM-15 extended — the
+//!   park gate: a symmetric appender's `T_self` action is PARK, not
+//!   poison). Invariants: a commit entering the pre-admission door
+//!   against the park being raised is EITHER admitted-in-flight (the
+//!   parker sees it, its ack is held) OR parked — never slipping through
+//!   unseen by both (the `SeqCst`-fenced Dekker pair of `try_enter` /
+//!   `park`; weakening the fences is the acked-then-lost shape); and
+//!   `release` vs `expire` racing on a standing park move the word
+//!   EXACTLY once, so a held ack is released or failed, never both and
+//!   never neither.
 //! - [`token_cache_core`] (DLM S8, spec §6.9's named obligation;
 //!   KD-MW-10): the client token cache's word protocol — invariants:
 //!   per-object generations are MONOTONE under racing/replayed owner
@@ -334,6 +344,8 @@ pub mod node_state_core;
 pub mod op_trace_core;
 #[path = "../../src/overlay_core.rs"]
 pub mod overlay_core;
+#[path = "../../src/park_core.rs"]
+pub mod park_core;
 #[path = "../../src/patch_clone_core.rs"]
 pub mod patch_clone_core;
 #[path = "../../src/placed_core.rs"]
@@ -7300,6 +7312,86 @@ mod shared_ref_models {
             // Conservation: the count is 1 + pin − release.
             let expect = 1 + u32::from(pinned) - 1;
             assert_eq!(refcount_core::peek(&rc), expect);
+mod park_gate_models {
+    //! [`park_core`] (symmetric metadata PR 8 — design §5.5.3, KD-SYM-15
+    //! extended): the park gate's two racing edges.
+    use crate::park_core::{EnterVerdict, ParkCore, EXPIRED, PARKED, RUNNING};
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// A committer entering the door against the park: either the parker
+    /// counted it in flight (its entry lands, its ack is held) or the
+    /// committer parked — never a commit the park neither holds nor
+    /// refuses (the acked-then-lost shape a weakened fence admits).
+    #[test]
+    fn a_commit_entering_against_the_park_is_held_or_parked_never_lost() {
+        loom::model(|| {
+            let gate = Arc::new(ParkCore::new());
+            let committer = {
+                let gate = Arc::clone(&gate);
+                thread::spawn(move || gate.try_enter())
+            };
+            let parker = {
+                let gate = Arc::clone(&gate);
+                thread::spawn(move || gate.park(1_000))
+            };
+            let verdict = committer.join().unwrap();
+            let seen = parker.join().unwrap().expect("a running gate parks once");
+            match verdict {
+                EnterVerdict::Admitted => {
+                    // In flight: the parker must have seen it (its ack is
+                    // held), OR it registered after the park was raised
+                    // — impossible: registered-then-read saw PARKED.
+                    assert_eq!(seen, 1, "an admitted commit is counted by the park");
+                    assert_eq!(gate.inflight(), 1);
+                    gate.leave();
+                }
+                EnterVerdict::Parked => {
+                    // The parker may have COUNTED a committer that then
+                    // withdrew (registered, then read PARKED): an
+                    // over-count holds acks for entries that never land,
+                    // which is harmless — the lane holds what lands. The
+                    // invariant is the other direction: never Admitted
+                    // with `seen == 0`.
+                    assert!(seen <= 1);
+                    assert_eq!(gate.inflight(), 0, "a parked commit is not in flight");
+                }
+                EnterVerdict::Expired => panic!("nothing expired"),
+            }
+            assert_eq!(gate.state(), PARKED);
+            assert_eq!(gate.parks(), 1);
+        });
+    }
+
+    /// Release and expiry racing on a standing park: exactly one moves
+    /// the word — a held ack is released or failed, never both, never
+    /// neither.
+    #[test]
+    fn release_and_expiry_are_exclusive() {
+        loom::model(|| {
+            let gate = Arc::new(ParkCore::new());
+            assert!(gate.park(1_000).is_some());
+            let releaser = {
+                let gate = Arc::clone(&gate);
+                thread::spawn(move || gate.release())
+            };
+            let expirer = {
+                let gate = Arc::clone(&gate);
+                thread::spawn(move || gate.expire(100_000, 50_000))
+            };
+            let (r, e) = (releaser.join().unwrap(), expirer.join().unwrap());
+            assert!(r ^ e, "exactly one edge moves a standing park");
+            if r {
+                assert_eq!(gate.state(), RUNNING);
+                assert_eq!(gate.reclaims(), 1);
+                assert_eq!(gate.expiries(), 0);
+                assert!(gate.park(2_000).is_some(), "a released gate parks again");
+            } else {
+                assert_eq!(gate.state(), EXPIRED);
+                assert_eq!(gate.expiries(), 1);
+                assert!(gate.park(2_000).is_none(), "expired is sticky");
+                assert_eq!(gate.try_enter(), EnterVerdict::Expired);
+            }
         });
     }
 }

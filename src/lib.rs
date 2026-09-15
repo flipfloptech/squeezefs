@@ -95,6 +95,16 @@ pub mod data_alloc_lane;
 // not doc comments: an outer doc comment here merges into the crate root's
 // link scope — see the `data_custody` note above.)
 pub mod alloc_lane_grant;
+// Symmetric metadata program PR 8 (design-symmetric-metadata §5.5, KD-SYM-9):
+// the ARMED plane's data allocation — ranged block grants carved by each
+// data volume's floating allocation-lease holder from a durable per-volume
+// allocation bitmap co-located with the holder's ring; the S9 lane partition
+// above stays the unarmed path, byte-identical. (Plain comments, as above.)
+pub mod block_grant;
+pub mod data_alloc_bitmap;
+// PR 8, KD-SYM-15 (extended): a symmetric appender's `T_self` action is
+// PARK-AND-RECLAIM — the protocol core (`#[path]`-shared into loom-models)
+// and the process plane around it.
 /// RES-8 (pre-RC spec §7): unwind containment + counting for detached
 /// (fire-and-forget) data-path tasks.
 // PR B1 (device-overlay design KD-OV-2): the ONE written-coverage union —
@@ -104,6 +114,8 @@ pub mod alloc_lane_grant;
 // note below).
 pub mod coverage_core;
 pub mod defrag;
+pub mod park_core;
+pub mod park_gate;
 // PR B2 (docs/design-device-overlay.md §2.1/§6.1): the device-overlay
 // registry — volatile per-daemon records over allocated-but-unpublished
 // destinations; the pure laws live in `overlay_core`. A plain comment (the

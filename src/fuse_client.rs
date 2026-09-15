@@ -2133,6 +2133,17 @@ pub fn op_watchdog_tick(threshold: Duration) -> Vec<OverdueOp> {
         let ino = slot.ino.load(Ordering::Relaxed);
         let age_ms = age / 1_000_000;
         let station = op_station::name(slot.station.load(Ordering::Relaxed));
+        // PR 8 (design-symmetric-metadata §5.5.3): an op held by the
+        // symmetric appender's PARK is labelled as such — a legitimate
+        // wait for the successor's grace, never counted overdue.
+        if crate::park_gate::is_parked() {
+            warn!(
+                "FUSE op watchdog: {op} (ino {ino}) in flight for {age_ms} ms past station \
+                 [{station}] — PARKED (appender_parked: the appender's membership lease is \
+                 being reclaimed under the successor's grace; the ack is held, not lost)"
+            );
+            continue;
+        }
         error!(
             "FUSE op watchdog: {op} (ino {ino}) in flight for {age_ms} ms (> {} ms), \
              parked past station [{station}] — op is NOT cancelled (D1.b semantics: no \
@@ -8623,6 +8634,14 @@ pub struct Metrics {
     /// `block_parks ≡ park_redrives` at quiesce — a park the counter
     /// pair cannot account for is a WEDGED op.
     pub ipc_dd_write_park_redrives: Align64<AtomicU64>,
+    // ---- PR 8 (design-symmetric-metadata §5.5 / §11 — the lessee shards
+    // of the maintenance plane). Appended at the END (level-4 rule 3).
+    /// The lessee-shard division of labour: inode-plane candidates left
+    /// to the LESSEE of their slot. 0 on every unarmed pass.
+    pub fsck_inode_plane_foreign_slot_scoped: Align64<AtomicU64>,
+    /// `fsck_inode_plane_slots_covered` — `leased ∪ unleased` summed over
+    /// the pass's volumes (every hosted slot on an unarmed volume).
+    pub fsck_inode_plane_slots_covered: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -11678,6 +11697,8 @@ impl SqueezefsFilesystem {
                 // must stay 0 on a homogeneous fleet.
                 "fsck_inode_plane_volumes_covered": METRICS.fsck_inode_plane_volumes_covered.load(Ordering::Relaxed),
                 "fsck_inode_plane_foreign_scoped": METRICS.fsck_inode_plane_foreign_scoped.load(Ordering::Relaxed),
+                "fsck_inode_plane_foreign_slot_scoped": METRICS.fsck_inode_plane_foreign_slot_scoped.load(Ordering::Relaxed),
+                "fsck_inode_plane_slots_covered": METRICS.fsck_inode_plane_slots_covered.load(Ordering::Relaxed),
                 "fsck_inode_plane_cross_owner_declined": METRICS.fsck_inode_plane_cross_owner_declined.load(Ordering::Relaxed),
                 "fsck_inode_plane_proposals_admitted": METRICS.fsck_inode_plane_proposals_admitted.load(Ordering::Relaxed),
                 "fsck_inode_plane_proposals_stripped": METRICS.fsck_inode_plane_proposals_stripped.load(Ordering::Relaxed),
@@ -13879,6 +13900,157 @@ impl SqueezefsFilesystem {
                     "shared_release_failures".into(),
                     load(&meta_kv::shared_refs::SHARED_RELEASE_FAILURES),
                 );
+                // THE ALLOCATION-LEASE FAMILY + the membership additions
+                // (design-symmetric-metadata §5.5 / §5.5.1 / §5.5.3 / §11 —
+                // PR 8, dark): per DATA volume this mount holds the
+                // allocation lease of (`alloc_lease` names them, `[]` on
+                // every unarmed mount); `block_grants` / `block_grant_
+                // blocks` are the holder's carves, `data_alloc_bitmap_{set,
+                // clear}_bits` its bitmap's deltas, `data_alloc_bitmap_drift`
+                // MUST STAY 0 (the loss direction of the C6/C8 oracle);
+                // `free_grace_timeout_deferrals` is the ring's surviving
+                // role (frees released past the routine bound — a reader
+                // that never acked) with `free_grace_deferrals ≡ releases +
+                // offsets` PER VOLUME on `free_grace_per_volume`; the
+                // death ledger's `dead_members_recorded` / `_acted` (closure
+                // `acted ≡ recorded × regions held`, PR 10's driver counts)
+                // and `dead_member_propagation_ms`; the park posture
+                // `appender_parked` (0/1) with `appender_parks`,
+                // `appender_park_ns` (exact-sum `wait_successor /
+                // reclaim_rtt / total`), `appender_park_expiries` (MUST
+                // STAY 0 on a healthy failover — the one terminal signal),
+                // `slot_lease_reclaims`, `t_park_max_ms` (derived) and
+                // `membership_shards` (one per rendezvous volume served).
+                {
+                    let holdings = meta_kv::alloc_lease::holdings();
+                    let hold = |f: &dyn Fn(&meta_kv::alloc_lease::AllocLeaseStats) -> u64| {
+                        serde_json::Value::Array(
+                            holdings.iter().map(|h| f(&h.stats()).into()).collect(),
+                        )
+                    };
+                    metrics.insert(
+                        "alloc_lease".into(),
+                        serde_json::Value::Array(
+                            holdings
+                                .iter()
+                                .map(|h| {
+                                    serde_json::json!({
+                                        "vol_tag": format!("{:#018x}", h.vol_tag),
+                                        "term": h.term,
+                                        "home_vol": h.home_vol,
+                                    })
+                                })
+                                .collect(),
+                        ),
+                    );
+                    metrics.insert("block_grants".into(), hold(&|s| s.block_grants));
+                    metrics.insert("block_grant_blocks".into(), hold(&|s| s.block_grant_blocks));
+                    metrics.insert("block_grant_returned".into(), hold(&|s| s.blocks_returned));
+                    metrics.insert("block_grant_revoked".into(), hold(&|s| s.grants_revoked));
+                    metrics.insert(
+                        "data_alloc_bitmap_set_bits".into(),
+                        hold(&|s| s.bitmap_set_bits),
+                    );
+                    metrics.insert(
+                        "data_alloc_bitmap_clear_bits".into(),
+                        hold(&|s| s.bitmap_clear_bits),
+                    );
+                    metrics.insert(
+                        "data_alloc_bitmap_population".into(),
+                        hold(&|s| s.bitmap_population),
+                    );
+                    metrics.insert(
+                        "data_alloc_bitmap_deltas_journaled".into(),
+                        hold(&|s| s.deltas_journaled),
+                    );
+                    metrics.insert(
+                        "data_alloc_bitmap_drift".into(),
+                        load(&crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_DRIFT),
+                    );
+                    let rings: Vec<serde_json::Value> = self
+                        .router
+                        .backend_router
+                        .lane_allocators()
+                        .iter()
+                        .map(|a| {
+                            let r = a.grace_ring();
+                            serde_json::json!({
+                                "volume": a.volume_id(),
+                                "deferrals": r.deferrals(),
+                                "releases": r.releases(),
+                                "offsets": r.len() as u64,
+                                "timeout_deferrals": r.timeout_deferrals(),
+                            })
+                        })
+                        .collect();
+                    metrics.insert(
+                        "free_grace_timeout_deferrals".into(),
+                        serde_json::json!(self
+                            .router
+                            .backend_router
+                            .lane_allocators()
+                            .iter()
+                            .map(|a| a.grace_ring().timeout_deferrals())
+                            .sum::<u64>()),
+                    );
+                    metrics.insert(
+                        "free_grace_per_volume".into(),
+                        serde_json::Value::Array(rings),
+                    );
+                    metrics.insert(
+                        "dead_members_recorded".into(),
+                        load(&meta_kv::alloc_lease::DEAD_MEMBERS_RECORDED),
+                    );
+                    metrics.insert(
+                        "dead_members_acted".into(),
+                        load(&meta_kv::alloc_lease::DEAD_MEMBERS_ACTED),
+                    );
+                    metrics.insert(
+                        "recovered_records".into(),
+                        load(&meta_kv::alloc_lease::RECOVERED_RECORDS),
+                    );
+                    metrics.insert(
+                        "dead_member_propagation_ms".into(),
+                        load(&meta_kv::alloc_lease::DEAD_MEMBER_PROPAGATION_MS),
+                    );
+                    metrics.insert(
+                        "appender_parked".into(),
+                        serde_json::json!(u64::from(crate::park_gate::is_parked())),
+                    );
+                    metrics.insert(
+                        "appender_parks".into(),
+                        serde_json::json!(crate::park_gate::parks()),
+                    );
+                    let [wait_successor, reclaim_rtt, total] = crate::park_gate::park_ns();
+                    metrics.insert(
+                        "appender_park_ns".into(),
+                        serde_json::json!({
+                            "wait_successor": wait_successor,
+                            "reclaim_rtt": reclaim_rtt,
+                            "total": total,
+                        }),
+                    );
+                    metrics.insert(
+                        "appender_park_expiries".into(),
+                        serde_json::json!(crate::park_gate::expiries()),
+                    );
+                    metrics.insert(
+                        "appender_park_acks_held".into(),
+                        serde_json::json!(crate::park_gate::acks_held()),
+                    );
+                    metrics.insert(
+                        "slot_lease_reclaims".into(),
+                        serde_json::json!(crate::park_gate::reclaims()),
+                    );
+                    metrics.insert(
+                        "t_park_max_ms".into(),
+                        serde_json::json!(crate::park_gate::t_park_max_in_force_ms()),
+                    );
+                    metrics.insert(
+                        "membership_shards".into(),
+                        serde_json::json!(crate::membership::membership_shards()),
+                    );
+                }
                 // THE FENCING FAMILY (§5.8.1 / KD-SYM-18): the Reservation
                 // Report read SIZED BY REGCTL — per metadata AND data
                 // namespace this mount registered on: registrants the last

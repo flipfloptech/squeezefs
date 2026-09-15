@@ -170,3 +170,12 @@ path = "fuzz_targets/ipc_ring_header.rs"
 test = false
 doc = false
 bench = false
+
+# --- symmetric metadata PR 8: the data allocation bitmap page -------------
+
+[[bin]]
+name = "data_alloc_bitmap_page"
+path = "fuzz_targets/data_alloc_bitmap_page.rs"
+test = false
+doc = false
+bench = false

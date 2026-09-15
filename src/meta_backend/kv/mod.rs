@@ -47,6 +47,7 @@
 
 pub mod alloc_ext;
 pub mod alloc_ext_core;
+pub mod alloc_lease;
 pub mod appender;
 pub mod backend;
 pub mod block_map;
@@ -1005,6 +1006,15 @@ pub enum KvError {
     /// mount exits nonzero.
     #[error("{0}")]
     Busy(String),
+
+    // PR 8 (design-symmetric-metadata §5.5.1 — the allocation lease's
+    // ordering law): a successor asked for a DEAD holder's allocation
+    // lease before the dead holder's home region was recovered (no
+    // `recovered:` record yet). The durable state is healthy, nothing was
+    // written, the requester RETRIES — the `GrantDeferred` class with the
+    // lease's own words (wire: `STATUS_DEFERRED`).
+    #[error("allocation lease deferred: {0}")]
+    LeaseDeferred(String),
 }
 
 /// Map KV-layer errors onto the crate error surface (mount / CLI / trait
@@ -1042,6 +1052,9 @@ impl From<KvError> for crate::error::SqueezefsError {
             e @ KvError::GrantDeferred { .. } => {
                 E::refused(libc::EAGAIN, format!("kv metadata: {e}"))
             }
+            // PR 8: the allocation lease's re-grant waits on the home
+            // recovery — the same EAGAIN class.
+            e @ KvError::LeaseDeferred(_) => E::refused(libc::EAGAIN, format!("kv metadata: {e}")),
             // The rotor cap names a holder-side limit — EBUSY, like the
             // other manager refusals that name a holder.
             e @ KvError::RotorAtCap { .. } => E::busy(format!("kv metadata: {e}")),

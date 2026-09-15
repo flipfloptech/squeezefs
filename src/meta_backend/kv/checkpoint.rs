@@ -1989,6 +1989,16 @@ impl KvMetaBackend {
                 .restore_dying_leaf_floors(dying_leaf_floors);
             return Err(e);
         }
+        // PR 8 (design-symmetric-metadata §5.5.1): the DATA allocation
+        // bitmap pages of every allocation lease this mount holds — the
+        // pending `finish_free` clears journaled, the dirty pages written
+        // into their alternate slots (the meta-bitmap law on one device).
+        // A no-op on a mount holding no lease.
+        if let Err(e) = self.write_data_alloc_pages(ckpt_seq).await {
+            self.node_cache()
+                .restore_dying_leaf_floors(dying_leaf_floors);
+            return Err(e);
+        }
         // §6.8 item 3's hold ledger: the record naming the new roots is on
         // the device — a reader's next poll adopts it — so this is the
         // instant every dereference committed before the cycle became

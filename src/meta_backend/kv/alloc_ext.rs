@@ -632,6 +632,14 @@ impl ExtentAllocator {
                 if *tree_id != TREE_ALLOC_RESERVED {
                     continue;
                 }
+                // PR 8: a DATA allocation bitmap delta (`vol_tag`-prefixed,
+                // 16-byte key — `crate::data_alloc_bitmap`) shares the
+                // kind; it is the allocation holder's and is applied by
+                // its own replay arm, never to the heap bitmap.
+                if crate::data_alloc_bitmap::is_data_alloc_delta_key(&rec.key) {
+                    crate::data_alloc_bitmap::note_replayed_delta(rec);
+                    continue;
+                }
                 let delta = decode_alloc_record(rec)?;
                 let extent = decode_extent_key(&rec.key)?;
                 // Ownership (spec §6.2 item 3): an appender may only name

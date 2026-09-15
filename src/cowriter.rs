@@ -1862,9 +1862,16 @@ pub async fn ship_displaced_frees(
         let request_id = next_ship_request_id();
         let idxs: Vec<u64> = group.entries.iter().map(|(_, _, idx)| *idx).collect();
         let mut attempt = 0u32;
+        // PR 8 (design-symmetric-metadata §5.5): a data volume's terminal
+        // frees ship to THAT volume's allocation-lease holder when the
+        // symmetric plane names one (`execute_shipped_frees` runs there
+        // verbatim); the set authority stays the route everywhere else —
+        // one probe of an empty map on every unarmed mount.
+        let target =
+            crate::block_grant::free_target_for(group.vol_tag).unwrap_or_else(|| endpoint.clone());
         let shipped = loop {
             match crate::meta_ship::publish::ship_free_blocks(
-                &endpoint,
+                &target,
                 group.vol_tag,
                 idxs.clone(),
                 epoch,

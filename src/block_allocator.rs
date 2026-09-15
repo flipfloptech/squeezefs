@@ -442,6 +442,23 @@ pub struct BlockAllocator {
     /// allocation not merely equivalent to the shipped path but literally
     /// it ([`Self::engage_alloc_lanes`] installs nothing at `writers == 1`).
     lanes: std::sync::OnceLock<LanePartition>,
+    /// PR 8 (design-symmetric-metadata §5.5, KD-SYM-9): the ARMED
+    /// symmetric plane's fresh-mint source — ranged block grants from
+    /// this data volume's allocation-lease holder (`crate::block_grant`).
+    /// `None` on every unarmed mount, where `next_fresh_block` is the
+    /// shipped loop verbatim (one `OnceLock` probe).
+    block_grant: std::sync::OnceLock<BlockGrantArm>,
+}
+
+/// The writer's grant arm on one data volume (see
+/// [`BlockAllocator::install_block_grant_arm`]).
+struct BlockGrantArm {
+    vol_tag: u64,
+    window: crate::block_grant::GrantWindow,
+    /// The top-up ask (the holder in-process, `ManagerCall::BlockGrant`
+    /// over the wire).
+    sink: crate::block_grant::BlockGrantSink,
+    topups: AtomicU64,
 }
 
 /// One mount's data-plane allocation partition (see
@@ -910,7 +927,90 @@ impl BlockAllocator {
             share_needed_blocks: AtomicU64::new(0),
             headroom_pct: AtomicU64::new(0),
             lanes: std::sync::OnceLock::new(),
+            block_grant: std::sync::OnceLock::new(),
         })
+    }
+
+    // -----------------------------------------------------------------
+    // PR 8 — ranged block grants (the armed symmetric plane's fresh mint;
+    // `crate::block_grant`, contracts in tests/sym_block_grant_tests.rs).
+    // The unarmed path is byte-identical: without an arm every method
+    // below is one `OnceLock` probe.
+    // -----------------------------------------------------------------
+
+    /// Arm this allocator to mint from ranged block grants of data volume
+    /// `vol_tag`, topped up through `sink`. The first arm wins (a mount's
+    /// grant source never moves under live offsets).
+    pub fn install_block_grant_arm(
+        &self,
+        vol_tag: u64,
+        sink: crate::block_grant::BlockGrantSink,
+    ) -> bool {
+        self.block_grant
+            .set(BlockGrantArm {
+                vol_tag,
+                window: crate::block_grant::GrantWindow::new(),
+                sink,
+                topups: AtomicU64::new(0),
+            })
+            .is_ok()
+    }
+
+    /// Install a grant into the window (the initial grant, a top-up).
+    /// `false` ⇔ no arm, or the grant is already installed.
+    pub fn install_block_grant(&self, grant: crate::block_grant::BlockGrant) -> bool {
+        self.block_grant
+            .get()
+            .is_some_and(|arm| arm.window.install(grant))
+    }
+
+    /// `true` ⇔ this allocator mints from block grants.
+    pub fn block_grant_armed(&self) -> bool {
+        self.block_grant.get().is_some()
+    }
+
+    /// The window's unconsumed blocks (0 unarmed).
+    pub fn block_grant_remaining(&self) -> u64 {
+        self.block_grant.get().map_or(0, |a| a.window.remaining())
+    }
+
+    /// The window's unconsumed ranges (what a clean leave returns).
+    pub fn block_grant_unconsumed(&self) -> Vec<crate::block_grant::BlockGrant> {
+        self.block_grant
+            .get()
+            .map(|a| a.window.unconsumed())
+            .unwrap_or_default()
+    }
+
+    /// Top-ups asked (`block_grant_topups`).
+    pub fn block_grant_topups(&self) -> u64 {
+        self.block_grant
+            .get()
+            .map_or(0, |a| a.topups.load(Ordering::Relaxed))
+    }
+
+    /// Mints refused because the window was empty.
+    pub fn block_grant_exhausted(&self) -> u64 {
+        self.block_grant.get().map_or(0, |a| a.window.exhausted())
+    }
+
+    /// **The top-up** (the extent grant's 50 % law, §5.3.3, applied to
+    /// blocks — refreshed as carriage, never expired): ask the sink for a
+    /// derived-size grant when the window wants one. `true` ⇔ a grant was
+    /// installed. The refill cadence's tick and the exhausted mint both
+    /// run it.
+    pub async fn block_grant_topup(&self) -> bool {
+        let Some(arm) = self.block_grant.get() else {
+            return false;
+        };
+        if !arm.window.wants_topup() {
+            return false;
+        }
+        arm.topups.fetch_add(1, Ordering::Relaxed);
+        match (arm.sink)(0).await {
+            Some(g) => arm.window.install(g),
+            None => false,
+        }
     }
 
     // -----------------------------------------------------------------
@@ -3109,6 +3209,28 @@ impl BlockAllocator {
     /// the lane step is `cur` and this is the shipped loop, instruction for
     /// instruction.
     fn next_fresh_block(&self) -> Result<u64> {
+        // PR 8: a grant-armed allocator mints ONLY inside its grants — the
+        // holder's bitmap already set the bits before the grant reached
+        // us, so a fresh mint here is never a dense-cursor claim.
+        if let Some(arm) = self.block_grant.get() {
+            return match arm.window.mint() {
+                Some(idx) => {
+                    self.highest_block.fetch_max(idx + 1, Ordering::AcqRel);
+                    Ok(idx)
+                }
+                None => {
+                    arm.window.note_exhausted();
+                    Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::StorageFull,
+                        format!(
+                            "data volume '{}': block grant window empty (vol_tag {:#018x}) — a \
+                             top-up from the allocation holder is owed",
+                            self._volume_id, arm.vol_tag
+                        ),
+                    )))
+                }
+            };
+        }
         let cap = self.capacity_blocks.load(Ordering::Relaxed);
         loop {
             let cur = self.highest_block.load(Ordering::Relaxed);
@@ -3355,6 +3477,15 @@ impl BlockAllocator {
         if is_storage_full(&e) && self.harvest_lane_supply().await > 0 {
             if let ok @ Ok(_) = self.try_allocate_block() {
                 return self.hand_out_reserved(ok).await;
+            }
+        }
+        // PR 8: a grant-armed writer's exhausted window asks its holder
+        // for a top-up and retries once; a holder with nothing (full,
+        // unreachable) leaves the refusal in the `StorageFull` class —
+        // never a poison, never `note_journal_failure`.
+        if is_storage_full(&e) && self.block_grant_armed() && self.block_grant_topup().await {
+            if let ok @ Ok(_) = self.try_allocate_block() {
+                return ok;
             }
         }
         if !is_storage_full(&e) {
@@ -3759,6 +3890,16 @@ impl BlockAllocator {
     /// free-forensics tape cover every arm identically.
     fn publish_free_list(&self, offset: u64) {
         let block_idx = offset / self.chunk_size;
+        // PR 8 (§5.5.1): on the volume's allocation HOLDER a terminal free
+        // clears the block's bit here — after quarantine and grace, so a
+        // clear bit means "reallocatable now"; the CLEAR delta rides the
+        // holder's next checkpoint. One relaxed load when no lease is held.
+        if crate::meta_backend::kv::alloc_lease::holds_any() {
+            crate::meta_backend::kv::alloc_lease::note_finish_free(
+                crate::meta_backend::kv::block_refs::volume_tag(&self._volume_id),
+                block_idx,
+            );
+        }
         // FIND-RW5-A forensics (env-gated, diagnostic-only): record every
         // free's capture so a DOUBLE FREE names BOTH call sites.
         if free_forensics_enabled() {
@@ -3946,6 +4087,13 @@ impl BlockAllocator {
     /// Device bytes this volume holds in the grace period.
     pub fn grace_bytes(&self) -> u64 {
         self.grace.bytes()
+    }
+
+    /// PR 8: this volume's grace ring — the per-volume closure
+    /// `deferrals ≡ releases + offsets` and the timeout-path gauge live on
+    /// the ring itself (one ring per data volume, one clock).
+    pub fn grace_ring(&self) -> &crate::free_grace::GraceRing {
+        &self.grace
     }
 
     /// `true` ⇔ `offset` is held in this volume's grace period — the

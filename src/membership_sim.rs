@@ -132,6 +132,16 @@ pub struct SimReport {
     pub wall_secs: f64,
     /// `direct` or `wired`.
     pub mode: &'static str,
+    /// PR 8 (KD-SYM-15): membership shards driven (1 = the shipped single
+    /// owner; [`run_sharded`] arms one owner per shard).
+    pub shards: usize,
+    /// PR 8 (§5.5.3): members of the killed shard that PARKED at `T_self`
+    /// (0 on an unsharded run).
+    pub parked: usize,
+    /// Parked members that RECLAIMED under the successor's grace.
+    pub reclaimed: usize,
+    /// Parks that outlived `T_park_max` (must be 0 on a healthy failover).
+    pub park_expiries: usize,
 }
 
 impl SimReport {
@@ -434,5 +444,192 @@ pub async fn run(cfg: SimConfig) -> Result<SimReport> {
         census_rows,
         wall_secs,
         mode: cfg.mode.as_str(),
+        shards: 1,
+        parked: 0,
+        reclaimed: 0,
+        park_expiries: 0,
+    })
+}
+
+/// **The SHARDED harness** (PR 8, KD-SYM-15 / §5.5.3 — the SIM-1 shape PR
+/// 13 drives at 12,500 × 64): `shards` owners, member `i` homed on shard
+/// `i % shards` and renewing with ITS owner only (the per-shard beat is
+/// `N/V ÷ 10 s`); then the manager of shard 0 DIES: every member homed
+/// there passes `T_self` and PARKS (the [`crate::park_core::ParkCore`]
+/// protocol — acks held, nothing poisoned), a successor arms for the
+/// shard and opens grace, every parked member RECLAIMS in it (one join
+/// presenting its epoch) and the park releases; `park_expiries` counts
+/// the parks a bounded `T_park_max` would have expired (0 here — the
+/// successor arms inside the bound by construction). Direct mode only —
+/// the scale instrument.
+pub async fn run_sharded(cfg: SimConfig, shards: usize) -> Result<SimReport> {
+    if shards <= 1 {
+        return run(cfg).await;
+    }
+    if cfg.clients == 0 {
+        return Err(SqueezefsError::InvalidOperation(
+            "membership harness: `clients` must be at least 1".into(),
+        ));
+    }
+    let clocks = LeaseClocks::derive(std::time::Duration::from_micros(250))?;
+    let clock = LeaseClock::monotonic();
+    let owners: Vec<Arc<MembershipOwner>> = (0..shards)
+        .map(|s| {
+            MembershipOwner::arm(
+                &format!("sim-owner-{s}"),
+                1,
+                0,
+                clocks.clone(),
+                clock.clone(),
+            )
+        })
+        .collect::<Result<_>>()?;
+    let journal_before = META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed);
+    let started = Instant::now();
+    let mut latencies: Vec<f64> = Vec::with_capacity(cfg.clients * cfg.beats);
+    let mut sessions: Vec<(String, MemberRole, usize, Arc<MemberSession>)> = Vec::new();
+    for i in 0..cfg.clients {
+        let id = format!("sim-{i}");
+        let role = role_for(i, cfg.readers_pct);
+        let shard = i % shards;
+        let endpoint = match role {
+            MemberRole::Writer => Some(format!("10.0.0.{}:7100", 1 + i % 250)),
+            MemberRole::Reader => None,
+        };
+        let anchor = clock.now_ms();
+        let grant = match owners[shard].join(join_request(&id, role, endpoint)) {
+            JoinOutcome::Granted(g) => g,
+            JoinOutcome::Refused { reason, .. } | JoinOutcome::UnknownLease { reason } => {
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "membership harness: join of '{id}' refused: {reason}"
+                )))
+            }
+        };
+        sessions.push((
+            id.clone(),
+            role,
+            shard,
+            Arc::new(MemberSession::adopt(
+                &id,
+                role,
+                &grant,
+                anchor,
+                clock.clone(),
+            )),
+        ));
+    }
+    for _ in 0..cfg.beats {
+        for (id, _, shard, session) in &sessions {
+            let t0 = Instant::now();
+            let outcome = owners[*shard].renew(id, session.epoch(), session.acked_free_epoch());
+            latencies.push(t0.elapsed().as_secs_f64() * 1e6);
+            match outcome {
+                RenewOutcome::Renewed(grant) => session.renewed(&grant, clock.now_ms()),
+                RenewOutcome::UnknownLease { reason } => {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "membership harness: live member '{id}' refused: {reason}"
+                    )))
+                }
+            }
+        }
+    }
+    // --- the manager of shard 0 dies: its home-shard members park at
+    //     T_self (the S6 grace contract makes every lease reclaimable, so
+    //     nothing is poisoned), the successor arms and opens grace, every
+    //     parked member reclaims in it.
+    let (parked, reclaimed, park_expiries, grace_completion_us) = if cfg.failover {
+        let dead = &owners[0];
+        let home: Vec<(String, MemberRole)> = sessions
+            .iter()
+            .filter(|(_, _, shard, _)| *shard == 0)
+            .map(|(id, role, _, _)| (id.clone(), *role))
+            .collect();
+        let gates: Vec<crate::park_core::ParkCore> = home
+            .iter()
+            .map(|_| crate::park_core::ParkCore::new())
+            .collect();
+        let now = clock.now_ms();
+        let parked = gates.iter().filter(|g| g.park(now).is_some()).count();
+        let successor = MembershipOwner::arm(
+            "sim-successor-0",
+            dead.term() + 1,
+            dead.term(),
+            clocks.clone(),
+            clock.clone(),
+        )?;
+        successor.open_grace(home.iter().map(|(id, _)| id.clone()).collect());
+        let t0 = Instant::now();
+        let mut reclaimed = 0usize;
+        for ((id, role), gate) in home.iter().zip(&gates) {
+            let mut req = join_request(id, *role, None);
+            req.prior_epoch = dead.epoch_of(id).or(Some(1));
+            match successor.join(req) {
+                JoinOutcome::Granted(_) => {
+                    if gate.release() {
+                        reclaimed += 1;
+                    }
+                }
+                JoinOutcome::Refused { reason, .. } | JoinOutcome::UnknownLease { reason } => {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "membership harness: reclaim of '{id}' refused inside the grace \
+                         window: {reason}"
+                    )))
+                }
+            }
+        }
+        let elapsed = t0.elapsed().as_secs_f64() * 1e6;
+        if successor.grace_active() {
+            return Err(SqueezefsError::InvalidOperation(
+                "membership harness: the grace window did not close after every home-shard \
+                 member reclaimed"
+                    .into(),
+            ));
+        }
+        let t_park_max = crate::park_gate::t_park_max_ms(
+            clocks.t_owner.as_millis() as u64,
+            clocks.t_owner.as_millis() as u64,
+        );
+        let expiries = gates
+            .iter()
+            .filter(|g| g.expire(clock.now_ms(), t_park_max))
+            .count();
+        (parked, reclaimed, expiries, elapsed)
+    } else {
+        (0, 0, 0, 0.0)
+    };
+    let mut census_pages = 0usize;
+    let mut census_rows = 0usize;
+    for owner in &owners {
+        let mut cursor = Some(0u64);
+        while let Some(c) = cursor {
+            let (rows, next) = owner.census(c, crate::membership_wire::CENSUS_PAGE_MAX);
+            census_rows += rows.len();
+            census_pages += 1;
+            cursor = next;
+        }
+    }
+    let wall_secs = started.elapsed().as_secs_f64();
+    let journal_entries_delta = META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed) - journal_before;
+    latencies.sort_by(|a, b| a.partial_cmp(b).expect("finite timings"));
+    Ok(SimReport {
+        clients: cfg.clients,
+        beats: cfg.beats,
+        renewals: latencies.len(),
+        journal_entries_delta,
+        renew_p50_us: pct(&latencies, 0.5),
+        renew_p99_us: pct(&latencies, 0.99),
+        renew_max_us: pct(&latencies, 1.0),
+        revoke_fanout_us: 0.0,
+        grace_completion_us,
+        evictions: 0,
+        self_fences: 0,
+        census_pages,
+        census_rows,
+        wall_secs,
+        mode: cfg.mode.as_str(),
+        shards,
+        parked,
+        reclaimed,
+        park_expiries,
     })
 }

@@ -218,6 +218,99 @@ fn check_service_edge(call: &ManagerCall, total_extents: u64, record_seed: &[u8]
         // PR 6: the lock verbs carry one appender id and nothing the
         // durable state bounds an allocation by.
         ManagerCall::DirRenameLock { .. } | ManagerCall::DirRenameUnlock { .. } => {}
+        // PR 8's arm (its own fn — the level-4 rule): the block-grant and
+        // allocation-lease integers' bounded execution.
+        pr8 => check_pr8_edge(pr8, total_extents),
+    }
+}
+
+/// PR 8's service-edge law over its verbs' integers: a `BlockGrant`'s
+/// `want` is an ASK the holder's derivation caps (never an allocation
+/// authority — the carve is bounded by the volume's clear run), a
+/// `ReturnBlocks` range names nothing outside a grant the ledger holds
+/// (refused, nothing cleared), an `AllocLeaseBitmap`'s extents are
+/// checked by the record codec (an empty or overflowing extent refuses),
+/// and `RecordDeath` is reserved (refused at the service). Pure over the
+/// integers against a SMALL bitmap: nothing here allocates proportional
+/// to a frame integer.
+fn check_pr8_edge(call: &ManagerCall, total_extents: u64) {
+    use squeezefs::block_grant::{block_grant_derived, BlockGrant, BlockGrantLedger, CarveOutcome};
+    use squeezefs::data_alloc_bitmap::DataAllocBitmap;
+    use squeezefs::meta_backend::kv::alloc_lease::AllocLeaseRecord;
+    use squeezefs::meta_backend::kv::appender::AppenderIdentity;
+    use squeezefs::meta_backend::kv::superblock::ExtentRef;
+    let blocks = 512u64;
+    match call {
+        ManagerCall::BlockGrant { want, .. } => {
+            let bm = DataAllocBitmap::new(1, blocks);
+            let ledger = BlockGrantLedger::new();
+            let capped = u64::from(*want).min(block_grant_derived(u64::MAX / 4, 1, blocks, 1));
+            assert!(capped <= blocks.max(64));
+            match ledger.carve(&bm, "w", capped.max(1), 0, 0) {
+                CarveOutcome::Granted(g) => {
+                    assert!(u64::from(g.len) <= capped.max(1));
+                    assert!(g.end() <= blocks, "a carve never leaves the volume");
+                    assert_eq!(bm.population(), u64::from(g.len));
+                }
+                CarveOutcome::Already(_) | CarveOutcome::Full => {}
+            }
+        }
+        ManagerCall::ReturnBlocks { start, len, .. } => {
+            let bm = DataAllocBitmap::new(1, blocks);
+            let ledger = BlockGrantLedger::new();
+            let range = BlockGrant {
+                start: *start,
+                len: *len,
+            };
+            assert!(
+                ledger.return_blocks(&bm, "w", range).is_none(),
+                "no grant exists: every range is refused, nothing cleared"
+            );
+            assert_eq!(bm.population(), 0);
+        }
+        ManagerCall::AllocLeaseBitmap {
+            identity,
+            term,
+            bitmap,
+            ..
+        } => {
+            let rec = AllocLeaseRecord {
+                holder: AppenderIdentity::from(*identity),
+                holder_appender_id: 1,
+                home_vol: 0,
+                control_ino: 1,
+                blocks,
+                term: *term,
+                bitmap: bitmap
+                    .iter()
+                    .take(1024)
+                    .map(|(v, (s, l))| (*v, ExtentRef { start: *s, len: *l }))
+                    .collect(),
+            };
+            match rec.encode() {
+                Ok(img) => {
+                    let valid = rec
+                        .bitmap
+                        .iter()
+                        .all(|(_, e)| e.len != 0 && e.start.checked_add(e.len).is_some());
+                    assert_eq!(AllocLeaseRecord::decode(&img).is_ok(), valid);
+                    if valid {
+                        assert_eq!(AllocLeaseRecord::decode(&img).unwrap(), rec);
+                    }
+                }
+                Err(_) => assert!(rec.bitmap.len() > usize::from(u16::MAX)),
+            }
+        }
+        ManagerCall::AllocLeaseAcquire { blocks: b, .. } => {
+            // The pages' geometry is a function of the ask, bounded by
+            // arithmetic alone.
+            let _ = squeezefs::data_alloc_bitmap::region_len(*b % (1 << 40));
+            let _ = total_extents;
+        }
+        ManagerCall::AllocLeaseRelease { .. }
+        | ManagerCall::RecordRecovered { .. }
+        | ManagerCall::RecordDeath { .. } => {}
+        _ => {}
     }
 }
 

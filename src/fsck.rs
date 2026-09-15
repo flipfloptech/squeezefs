@@ -757,6 +757,17 @@ pub struct FsckCounters {
     /// is a snapshot of a cursor another node advances). The division of
     /// labour, counted rather than silent; 0 on every unscoped pass.
     pub inode_plane_foreign_scoped: u64,
+    /// PR 8 (design-symmetric-metadata §5.5 "Maintenance coordinator" —
+    /// the LESSEE shards): inode-plane candidates left to the LESSEE of
+    /// their slot (this mount neither leases the slot nor, as the volume's
+    /// manager, finds it unleased). 0 on every unarmed pass.
+    pub inode_plane_foreign_slot_scoped: u64,
+    /// PR 8: `fsck_inode_plane_slots_covered` — Σ over the pass's volumes
+    /// of the slots this mount's inode plane judged: the slots it LEASES
+    /// plus, on the volume's manager, the UNLEASED slots (tree 0's) —
+    /// `≡ leased ∪ unleased` by construction; every hosted slot on an
+    /// unarmed volume.
+    pub inode_plane_slots_covered: u64,
     /// The population whose verdict is **undecidable online under
     /// multi-owner**: a dangling name whose dentry lives on a peer's
     /// volume while its child ino homes here. Neither owner may decide
@@ -1910,6 +1921,15 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
 
     counters.findings = findings.len() as u64;
     counters.inode_plane_volumes_covered = inode_plane_covered.len() as u64;
+    // PR 8: the lessee-shard coverage — `leased ∪ unleased` per judged
+    // volume, summed (every hosted slot on an unarmed volume).
+    for &vi in &inode_plane_covered {
+        if let Some(kv) = ctx.meta.volumes.get(vi) {
+            if let Ok(cov) = kv.inode_plane_slot_coverage().await {
+                counters.inode_plane_slots_covered += cov.covered;
+            }
+        }
+    }
     // KD-PV-16: a scoped pass says so. On a mount that owns part of a set
     // the local run covers its own volumes and NOTHING else — the peers'
     // planes are their owners' shards (`run_fleet`), so a bare `run` here
@@ -2012,6 +2032,8 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         counters.dangling_dentries += r.counters.dangling_dentries;
         counters.nlink_transient_cleared += r.counters.nlink_transient_cleared;
         counters.inode_plane_foreign_scoped += r.counters.inode_plane_foreign_scoped;
+        counters.inode_plane_foreign_slot_scoped += r.counters.inode_plane_foreign_slot_scoped;
+        counters.inode_plane_slots_covered += r.counters.inode_plane_slots_covered;
         counters.inode_plane_cross_owner_declined += r.counters.inode_plane_cross_owner_declined;
         counters.inode_plane_proposals_admitted += r.counters.inode_plane_proposals_admitted;
         counters.inode_plane_proposals_stripped += r.counters.inode_plane_proposals_stripped;
@@ -2136,6 +2158,8 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     dst.dangling_dentries += fin.dangling_dentries;
     dst.nlink_transient_cleared += fin.nlink_transient_cleared;
     dst.inode_plane_foreign_scoped += fin.inode_plane_foreign_scoped;
+    dst.inode_plane_foreign_slot_scoped += fin.inode_plane_foreign_slot_scoped;
+    dst.inode_plane_slots_covered += fin.inode_plane_slots_covered;
     dst.inode_plane_cross_owner_declined += fin.inode_plane_cross_owner_declined;
     // `inode_plane_volumes_covered` is deliberately NOT folded: coverage
     // is a UNION of volume identities the caller composes (§5.8.1), and
@@ -2849,6 +2873,8 @@ fn fold_worker_counters(dst: &mut FsckCounters, src: &FsckCounters) {
     dst.dangling_dentries += src.dangling_dentries;
     dst.nlink_transient_cleared += src.nlink_transient_cleared;
     dst.inode_plane_foreign_scoped += src.inode_plane_foreign_scoped;
+    dst.inode_plane_foreign_slot_scoped += src.inode_plane_foreign_slot_scoped;
+    dst.inode_plane_slots_covered += src.inode_plane_slots_covered;
     dst.inode_plane_cross_owner_declined += src.inode_plane_cross_owner_declined;
     dst.blocks_checked += src.blocks_checked;
     dst.refcounts_checked += src.refcounts_checked;
@@ -3641,6 +3667,12 @@ async fn evaluate_c9_unreferenced(
             counters.inode_plane_foreign_scoped += 1;
             continue;
         }
+        // PR 8: the LESSEE shard — a slot another appender leases is its
+        // lessee's candidate (KD-SYM-5's writer-cacher law read by fsck).
+        if !kv.inode_plane_owns_slot(local) {
+            counters.inode_plane_foreign_slot_scoped += 1;
+            continue;
+        }
         // THE guard: an inode this mount minted is never a candidate,
         // because a create legitimately holds its record before its name.
         if !kv.minted_in_prior_era(local) {
@@ -3696,8 +3728,19 @@ async fn evaluate_c10_inode_plane(
             // appends to (its own records are authoritative; a peer's are
             // a projection). The NAME side stays whole-set — that is the
             // §5.8.0 asymmetry.
-            if !opts.owns_volume(ctx.meta.route_ino(ino).0) {
+            let (a_vol, a_local) = ctx.meta.route_ino(ino);
+            if !opts.owns_volume(a_vol) {
                 counters.inode_plane_foreign_scoped += 1;
+                continue;
+            }
+            // PR 8: the lessee shard (see C9's gate).
+            if ctx
+                .meta
+                .volumes
+                .get(a_vol)
+                .is_some_and(|kv| !kv.inode_plane_owns_slot(a_local))
+            {
+                counters.inode_plane_foreign_slot_scoped += 1;
                 continue;
             }
             let records = pass.record_names_of(ino);
@@ -3724,6 +3767,11 @@ async fn evaluate_c10_inode_plane(
             let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
                 continue;
             };
+            // PR 8: the lessee shard (see C9's gate).
+            if !kv.inode_plane_owns_slot(local) {
+                counters.inode_plane_foreign_slot_scoped += 1;
+                continue;
+            }
             let Ok(Some(val)) = kv.read_inode_value_routed(local).await else {
                 continue;
             };
@@ -3796,6 +3844,11 @@ async fn evaluate_c10_inode_plane(
         let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
             continue;
         };
+        // PR 8: the lessee shard (see C9's gate).
+        if !kv.inode_plane_owns_slot(local) {
+            counters.inode_plane_foreign_slot_scoped += 1;
+            continue;
+        }
         match kv.read_inode_value_routed(local).await {
             // No record: the name resolves to nothing.
             Ok(None) => {
@@ -6215,6 +6268,12 @@ fn publish_metrics(c: &FsckCounters) {
     }
     m.fsck_inode_plane_foreign_scoped
         .fetch_add(c.inode_plane_foreign_scoped, Ordering::Relaxed);
+    m.fsck_inode_plane_foreign_slot_scoped
+        .fetch_add(c.inode_plane_foreign_slot_scoped, Ordering::Relaxed);
+    if c.inode_plane_slots_covered > 0 {
+        m.fsck_inode_plane_slots_covered
+            .store(c.inode_plane_slots_covered, Ordering::Relaxed);
+    }
     m.fsck_inode_plane_cross_owner_declined
         .fetch_add(c.inode_plane_cross_owner_declined, Ordering::Relaxed);
     m.fsck_inode_plane_proposals_admitted

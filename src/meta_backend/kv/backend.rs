@@ -3180,6 +3180,9 @@ impl KvMetaBackend {
             }
             // The membership carriage no longer answers for this plane.
             super::slot_lease::unregister_carriage_plane(&plane);
+            // PR 8: the coordinator home and the park posture leave with
+            // the plane.
+            super::alloc_lease::disarm_symmetric_roles();
             if TEST_LEAVE_HOLD_AFTER_RELEASES.load(Ordering::Relaxed) {
                 return Err(KvError::Busy(format!(
                     "{}: TEST_LEAVE_HOLD_AFTER_RELEASES — the mount died after its leases went \
@@ -6396,7 +6399,7 @@ impl KvMetaBackend {
     /// unmount's own return, which runs under the shutdown latch the
     /// write gate refuses everything else on (a failed volume still
     /// refuses).
-    fn manager_gate(
+    pub(super) fn manager_gate(
         &self,
         at_leave: bool,
     ) -> std::result::Result<&Arc<super::appender::AppenderSet>, KvError> {
@@ -6441,7 +6444,7 @@ impl KvMetaBackend {
     /// — the rate bound IS the class. A refused admission is the caller's
     /// retry (the cadence's next cycle, the peer's resend); a failed write
     /// is the journal-failure class.
-    async fn write_control_entry(
+    pub(super) async fn write_control_entry(
         &self,
         mut recs: Vec<(u8, Record)>,
         admit: EntryAdmission,
@@ -11122,8 +11125,19 @@ impl KvMetaBackend {
     /// failures, and a genuinely wedged device keeps producing loud
     /// bounded errors every attempt.
     pub async fn sync_device(&self) -> Result<()> {
+        // PR 8 (§5.5.3): the bounded-error timer is SUSPENDED for the
+        // park's bound while the appender is parked — an `fsync` waiting
+        // on a held ack never returns a bounded error at 30 s.
+        let threshold = if crate::park_gate::bounded_timers_suspended() {
+            self.timeout_threshold
+                .saturating_add(std::time::Duration::from_millis(
+                    crate::park_gate::t_park_max_in_force_ms(),
+                ))
+        } else {
+            self.timeout_threshold
+        };
         self.sync
-            .barrier_bounded(self.timeout_threshold, || async move {
+            .barrier_bounded(threshold, || async move {
                 crate::fuse_client::METRICS
                     .meta_device_syncs
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -12342,7 +12356,7 @@ pub enum ControlAdmit {
 /// receives it: taken now (`try_admit`, the wire verbs' and the
 /// cadence's class) or handed in, already admitted for AT LEAST the
 /// entry's length (the door's pre-admission).
-enum EntryAdmission {
+pub(super) enum EntryAdmission {
     Try,
     Held(super::journal_core::Admission),
 }
@@ -15111,6 +15125,7 @@ impl KvMetaBackend {
             extent_grant_extents: AtomicU64::new(0),
             extent_returns: AtomicU64::new(0),
             vol0_unreachable: AtomicU64::new(0),
+            vol0_unreachable_since_ms: AtomicU64::new(0),
             verbs: Default::default(),
             cadence_last_ns: AtomicU64::new(0),
             appenders_known: AtomicU64::new(0),
@@ -15571,6 +15586,12 @@ impl KvMetaBackend {
                 for (i, (tag, r)) in entry.records.iter().enumerate() {
                     let (tree_id, level) = untag(*tag);
                     if tree_id == super::record::TREE_ALLOC_RESERVED {
+                        // PR 8: a DATA bitmap delta (16-byte key) is the
+                        // allocation holder's, applied by
+                        // `replay_data_alloc_deltas` — never a heap claim.
+                        if crate::data_alloc_bitmap::is_data_alloc_delta_key(&r.key) {
+                            continue;
+                        }
                         if let Some(region) = set.region(*id) {
                             match super::alloc_ext::decode_alloc_record(r)? {
                                 super::alloc_ext::AllocDelta::Allocated { extent } => {
@@ -16655,6 +16676,15 @@ impl KvMetaBackend {
                 }
                 notified.await;
             }
+            // PR 8 (§5.5.3): a PARKED appender's landed entries have their
+            // acks HELD here — in journal order (the lane answers windows
+            // in handoff order and every later window queues behind this
+            // hold) — released on the successor's grant, failed at the
+            // park's expiry. One relaxed load when not parked.
+            let outcomes = crate::park_gate::hold_acks(outcomes, |e| {
+                KvError::Io(crate::error::SqueezefsError::Io(e))
+            })
+            .await;
             Self::fan_out(outcomes);
         }
     }
@@ -17589,6 +17619,17 @@ impl KvMetaBackend {
         region: u32,
         len: u64,
     ) -> std::result::Result<super::journal_core::Admission, KvError> {
+        // PR 8 (design-symmetric-metadata §5.5.3): the symmetric
+        // appender's PARK is a distinct PRE-admission state — a parked
+        // pass waits here, before ring admission, holding nothing the
+        // drain needs, and NEVER reaches `note_journal_failure` below
+        // (the D1.b escalation cannot turn a legitimate park into a
+        // fail-stop; `T_park_max` > `SQUEEZEFS_TIMEOUT` by construction).
+        // One relaxed load on every mount that never parks. The pass is
+        // held to the batch's terminal outcome (the lane's `hold_acks`).
+        let _park_pass = crate::park_gate::pre_admission()
+            .await
+            .map_err(|e| KvError::Io(crate::error::SqueezefsError::Io(e)))?;
         let threshold = self.timeout_threshold;
         let mut parked_since: Option<std::time::Instant> = None;
         loop {

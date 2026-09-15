@@ -61,7 +61,7 @@ fuzz_target!(|data: &[u8]| {
     }
     // --- the deltas and the replay -------------------------------------
     let key = data[..data.len().min(16)].to_vec();
-    let value = data[data.len().min(16)..data.len().min(18)].to_vec();
+    let value = data[data.len().min(16)..data.len().min(26)].to_vec();
     let rec = Record::put(key.clone(), 7, value);
     if is_data_alloc_delta_key(&key) {
         if let Ok(delta) = decode_data_alloc_record(&rec) {
@@ -81,18 +81,33 @@ fuzz_target!(|data: &[u8]| {
             let block = u64::from(c[0]) | (u64::from(*c.get(1).unwrap_or(&0)) << 8);
             let set = c.get(2).is_none_or(|b| b & 1 == 0);
             let (_, r) = if set {
-                squeezefs::data_alloc_bitmap::set_record(0x11, block % 5000, i as u64)
+                squeezefs::data_alloc_bitmap::set_record(0x11, block % 5000, 3, i as u64)
             } else {
-                squeezefs::data_alloc_bitmap::clear_record(0x11, block % 5000, i as u64)
+                squeezefs::data_alloc_bitmap::clear_record(0x11, block % 5000, 3, i as u64)
             };
             r
         })
         .collect();
-    let once = bm.replay(stream.iter().map(|r| (TREE_ALLOC_RESERVED, r)));
+    let once = bm.replay(stream.iter().map(|r| (TREE_ALLOC_RESERVED, r)), 3);
     let after = bm.set_blocks();
-    let twice = bm.replay(stream.iter().map(|r| (TREE_ALLOC_RESERVED, r)));
+    let twice = bm.replay(stream.iter().map(|r| (TREE_ALLOC_RESERVED, r)), 3);
     assert_eq!(twice, 0, "a second pass changes nothing (idempotent)");
     assert_eq!(bm.set_blocks(), after);
     assert!(once as usize <= stream.len());
     assert!(bm.population() <= 4096);
+    let other = DataAllocBitmap::new(0x11, 4096);
+    assert_eq!(
+        other.replay(stream.iter().map(|r| (TREE_ALLOC_RESERVED, r)), 4),
+        0,
+        "another holder term's deltas never fold in"
+    );
+    // The region loader is total: arbitrary bytes either load or refuse,
+    // and an all-zero region is a fresh bitmap.
+    let _ = DataAllocBitmap::from_region_image(0x11, 4096, data);
+    assert_eq!(
+        DataAllocBitmap::from_region_image(0x11, 4096, &[])
+            .expect("all-zero = fresh")
+            .population(),
+        0
+    );
 });

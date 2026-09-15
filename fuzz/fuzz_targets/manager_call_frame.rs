@@ -300,11 +300,50 @@ fn check_pr8_edge(call: &ManagerCall, total_extents: u64) {
                 }
                 Err(_) => assert!(rec.bitmap.len() > usize::from(u16::MAX)),
             }
+            // Review round 1, Issue 6 — the SERVICE EDGE's screen over the
+            // UNCLAMPED refs against a small heap: a set it accepts is
+            // inside the heap, node-aligned, and covers exactly the
+            // region; the screen allocates nothing proportional to a
+            // frame integer.
+            use squeezefs::meta_backend::kv::alloc_lease::{screen_bitmap_refs, VolumeHeap};
+            let heap = VolumeHeap {
+                heap_start: 1 << 20,
+                heap_len: 64 << 16,
+                node_size: 1 << 16,
+            };
+            if screen_bitmap_refs(blocks, &rec.bitmap, |v| (v == 0).then_some(heap)).is_ok() {
+                let region = squeezefs::data_alloc_bitmap::region_len(blocks);
+                let total: u64 = rec.bitmap.iter().map(|(_, e)| e.len).sum();
+                assert!(
+                    total >= region && total <= region.div_ceil(heap.node_size) * heap.node_size
+                );
+                for (v, e) in &rec.bitmap {
+                    assert_eq!(*v, 0);
+                    assert!(e.start >= heap.heap_start);
+                    assert!(e.start + e.len <= heap.heap_start + heap.heap_len);
+                    assert_eq!((e.start - heap.heap_start) % heap.node_size, 0);
+                    assert_eq!(e.len % heap.node_size, 0);
+                }
+            }
         }
-        ManagerCall::AllocLeaseAcquire { blocks: b, .. } => {
-            // The pages' geometry is a function of the ask, bounded by
-            // arithmetic alone.
-            let _ = squeezefs::data_alloc_bitmap::region_len(*b % (1 << 40));
+        ManagerCall::AllocLeaseAcquire {
+            blocks: b,
+            home_vol,
+            ..
+        } => {
+            // The UNCLAMPED integers reach the screen's arithmetic and
+            // nothing else: a `blocks` above the derived block count, a
+            // `home_vol` outside a set, refuse before any region length is
+            // computed for allocation. (The screen itself needs a manager
+            // volume; its arithmetic is the pure part exercised here.)
+            let known = blocks;
+            let admitted = *b != 0 && *b <= known && usize::from(*home_vol) < 2;
+            if admitted {
+                assert!(
+                    squeezefs::data_alloc_bitmap::region_len(*b)
+                        <= squeezefs::data_alloc_bitmap::region_len(known)
+                );
+            }
             let _ = total_extents;
         }
         ManagerCall::AllocLeaseRelease { .. }

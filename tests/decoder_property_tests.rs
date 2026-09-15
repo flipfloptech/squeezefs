@@ -1702,11 +1702,13 @@ proptest! {
         prop_assert!(decode_data_alloc_page(&torn, tag, idx).is_err());
     }
 
-    /// The kind-4 data delta records round-trip, the 16-byte key is the
-    /// one discriminator, and the replay is idempotent over any stream.
+    /// The kind-4 data delta records round-trip (the value carries the
+    /// holder term), the 16-byte key is the one discriminator, the replay
+    /// is idempotent over any stream and folds ONLY the term it recovers.
     #[test]
     fn data_alloc_deltas_round_trip_and_replay_is_idempotent(
         ops in prop::collection::vec((any::<u16>(), any::<bool>()), 0..64),
+        term in any::<u64>(),
     ) {
         use squeezefs::data_alloc_bitmap::{
             clear_record, decode_data_alloc_record, is_data_alloc_delta_key, set_record,
@@ -1718,9 +1720,9 @@ proptest! {
             .enumerate()
             .map(|(i, (b, set))| {
                 let (_, r) = if *set {
-                    set_record(9, u64::from(*b), i as u64)
+                    set_record(9, u64::from(*b), term, i as u64)
                 } else {
-                    clear_record(9, u64::from(*b), i as u64)
+                    clear_record(9, u64::from(*b), term, i as u64)
                 };
                 r
             })
@@ -1729,13 +1731,83 @@ proptest! {
             prop_assert!(is_data_alloc_delta_key(&r.key));
             let d = decode_data_alloc_record(r).expect("decodes");
             prop_assert_eq!(d.block_idx(), u64::from(*b));
+            prop_assert_eq!(d.term(), term);
             prop_assert_eq!(matches!(d, DataAllocDelta::Set { .. }), *set);
         }
         let bm = DataAllocBitmap::new(9, 1 << 16);
-        bm.replay(recs.iter().map(|r| (TREE_ALLOC_RESERVED, r)));
+        bm.replay(recs.iter().map(|r| (TREE_ALLOC_RESERVED, r)), term);
         let once = bm.set_blocks();
-        prop_assert_eq!(bm.replay(recs.iter().map(|r| (TREE_ALLOC_RESERVED, r))), 0);
+        prop_assert_eq!(bm.replay(recs.iter().map(|r| (TREE_ALLOC_RESERVED, r)), term), 0);
         prop_assert_eq!(bm.set_blocks(), once);
+        let other = DataAllocBitmap::new(9, 1 << 16);
+        prop_assert_eq!(
+            other.replay(recs.iter().map(|r| (TREE_ALLOC_RESERVED, r)), term.wrapping_add(1)),
+            0,
+            "another holder term's deltas never fold in"
+        );
+    }
+
+    /// Review round 1, Issue 6 — the PR-8 service edge's screens are pure
+    /// and total, and **no wire integer reaches an effect unvalidated**:
+    /// a ref set the screen accepts lies inside a known volume's heap,
+    /// node-aligned, and covers exactly the region the block count needs;
+    /// everything else is refused before anything proportional to it
+    /// exists (the `manager_call_frame` fuzz target's PR-8 arm, mirrored).
+    #[test]
+    fn alloc_lease_bitmap_refs_the_screen_accepts_are_inside_the_heap_and_aligned(
+        blocks in any::<u64>(),
+        heap_start in 0u64..(1 << 40),
+        heap_nodes in 1u64..4096,
+        node_shift in 12u32..21,
+        refs in prop::collection::vec((any::<u16>(), any::<u64>(), any::<u64>()), 0..8),
+    ) {
+        use squeezefs::meta_backend::kv::alloc_lease::{screen_bitmap_refs, VolumeHeap};
+        use squeezefs::meta_backend::kv::superblock::ExtentRef;
+        let node_size = 1u64 << node_shift;
+        let heap = VolumeHeap { heap_start, heap_len: heap_nodes * node_size, node_size };
+        let bitmap: Vec<(u16, ExtentRef)> = refs
+            .iter()
+            .map(|(v, s, l)| (*v, ExtentRef { start: *s, len: *l }))
+            .collect();
+        let verdict = screen_bitmap_refs(blocks, &bitmap, |v| (v == 0).then_some(heap));
+        if verdict.is_ok() {
+            prop_assert!(blocks > 0 && !bitmap.is_empty());
+            let region = squeezefs::data_alloc_bitmap::region_len(blocks);
+            let mut total = 0u64;
+            for (v, e) in &bitmap {
+                prop_assert_eq!(*v, 0);
+                prop_assert!(e.len > 0 && e.len % node_size == 0);
+                prop_assert!(e.start >= heap_start && (e.start - heap_start) % node_size == 0);
+                prop_assert!(e.start + e.len <= heap_start + heap.heap_len);
+                total += e.len;
+            }
+            prop_assert!(total >= region);
+            prop_assert!(total <= region.div_ceil(node_size).max(1) * node_size);
+        }
+    }
+
+    /// The `data_alloc_bitmap` region loader is total and never reads a
+    /// non-zero undecodable page pair as FREE (Issue 6's safety direction).
+    #[test]
+    fn a_data_alloc_region_with_a_nonzero_invalid_pair_never_loads_as_free(
+        blocks in 1u64..(4 * squeezefs::data_alloc_bitmap::DATA_ALLOC_PAGE_BITS),
+        garbage in prop::collection::vec(any::<u8>(), 1..64),
+        at in any::<u16>(),
+    ) {
+        use squeezefs::data_alloc_bitmap::{region_len, DataAllocBitmap, DATA_ALLOC_PAGE_LEN};
+        let mut region = vec![0u8; region_len(blocks) as usize];
+        let fresh = DataAllocBitmap::from_region_image(3, blocks, &region).expect("all-zero = fresh");
+        prop_assert_eq!(fresh.population(), 0);
+        // Plant garbage inside ONE page pair (both slots): with no valid
+        // slot and a non-zero byte the loader refuses.
+        let pair = (usize::from(at) % (region.len() / (2 * DATA_ALLOC_PAGE_LEN as usize)))
+            * 2 * DATA_ALLOC_PAGE_LEN as usize;
+        for (i, b) in garbage.iter().enumerate() {
+            region[pair + i] = *b;
+        }
+        let nonzero = garbage.iter().any(|b| *b != 0);
+        let loaded = DataAllocBitmap::from_region_image(3, blocks, &region);
+        prop_assert_eq!(loaded.is_err(), nonzero);
     }
 
     /// The `alloc_lease:` / `dead_member:` / `recovered:` records

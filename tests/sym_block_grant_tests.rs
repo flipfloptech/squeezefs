@@ -22,6 +22,7 @@
 //! **`SQUEEZEFS_SYMMETRIC_META=0` is the shipped posture exactly**: no
 //! holding, no park posture, the S9 lane path byte-identical.
 
+use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::block_grant::{
     block_grant_derived, free_target_for, install_free_target, test_clear_free_targets,
     uninstall_free_target, BlockGrant, BlockGrantLedger, CarveOutcome, GrantWindow,
@@ -32,12 +33,14 @@ use squeezefs::data_alloc_bitmap::{
     DataAllocBitmap, DATA_ALLOC_BITMAP_DRIFT, DATA_ALLOC_PAGE_LEN,
 };
 use squeezefs::membership::{
-    self, JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole, MemberSession,
-    MembershipOwner,
+    self, member_renewal_tick, JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole,
+    MemberSession, MembershipOwner, RenewalTick,
 };
 use squeezefs::membership_sim::{run_sharded, SimConfig, SimMode};
+use squeezefs::membership_wire::{MemberClient, MembershipPlane, MembershipPlaneConfig};
 use squeezefs::meta_backend::kv::alloc_lease::{
-    self, dead_member_key, holdings, recovered_key, test_clear_holdings, AllocLeaseRecord,
+    self, dead_member_key, holdings, recovered_key, register_data_volume_blocks,
+    test_clear_holdings, AllocLeaseRecord,
 };
 use squeezefs::meta_backend::kv::appender::AppenderIdentity;
 use squeezefs::meta_backend::kv::backend::{
@@ -45,6 +48,7 @@ use squeezefs::meta_backend::kv::backend::{
     TEST_CONVEYOR_HOLD_STAGE,
 };
 use squeezefs::meta_backend::kv::builder::{format_v3_stamped, FormatV3Options, ROOT_INO};
+use squeezefs::meta_backend::kv::checkpoint::TEST_CHECKPOINT_HALT_AFTER_LEDGER;
 use squeezefs::meta_backend::kv::slot_lease::SYMMETRIC_META_ENV;
 use squeezefs::meta_backend::kv::superblock::ExtentRef;
 use squeezefs::meta_backend::kv::{KvError, META_KV_CHECKPOINTS};
@@ -73,6 +77,8 @@ const RING_LEN: u64 = 1024 * 1024;
 /// one bitmap page.
 const DATA_BLOCKS: u64 = 4096;
 const DATA_TAG: u64 = 0xD0DA_0000_0000_0001;
+/// The durable id whose `volume_tag` is `DATA_TAG` (KD-5).
+const DATA_ID: &str = "vol-d0da000000000001";
 
 /// Every seam here is process-global; the contracts serialize on it.
 static SEAM: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -109,6 +115,31 @@ async fn format_flat_member(dir: &std::path::Path, name: &str) -> String {
     p.display().to_string()
 }
 
+/// A stamped N-volume set under ONE derived plan (review round 1, Issue
+/// 3: "every contract mounts one volume" — the design's shape is N
+/// volumes with every appender homed on the slot-0 volume, and the
+/// second volume is what exposed the misdirected page write).
+async fn format_stamped_set(dir: &std::path::Path, n: usize) -> Vec<String> {
+    let plan = plan_meta_slot_set(n).expect("derived plan");
+    let mut uris = Vec::with_capacity(n);
+    for (i, stamp) in plan.stamps.iter().enumerate() {
+        let p = dir.join(format!("meta{i}"));
+        std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
+        let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), stamp.clone()).await;
+        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        r.expect("format stamped member");
+        uris.push(p.display().to_string());
+    }
+    uris
+}
+
+/// The slot-0 volume's ordinal — the coordinator's home, every appender's
+/// home volume until PR 12's join ladder.
+fn slot0_of(routed: &RoutedMetaBackend) -> usize {
+    routed.route_ino(1).0
+}
+
 /// Reset every process-global the contracts touch (the holdings, the free
 /// targets, the park gate, custody) — a fresh mount in one binary.
 fn reset_process_state() {
@@ -117,7 +148,19 @@ fn reset_process_state() {
     test_clear_free_targets();
     park_gate::test_reset();
     squeezefs::data_custody::test_clear_poison();
+    TEST_CHECKPOINT_HALT_AFTER_LEDGER.store(false, Ordering::SeqCst);
     std::env::remove_var("SQUEEZEFS_TIMEOUT");
+    // The manager's derived-state witness for the contracts' data volume
+    // (review round 1, Issue 6): a wire `blocks` is validated against it.
+    register_data_volume_blocks(DATA_TAG, DATA_BLOCKS);
+}
+
+/// A data volume's allocator for the contracts: `DATA_BLOCKS` blocks of
+/// the shipped 4 MiB chunk, tagged `DATA_TAG` (`volume_tag` of its id).
+async fn data_allocator(id: &str) -> Arc<BlockAllocator> {
+    let a = Arc::new(BlockAllocator::new(id).await.expect("allocator"));
+    a.set_capacity_bytes(DATA_BLOCKS * a.chunk_size());
+    a
 }
 
 async fn open_armed(uris: &[String]) -> Arc<RoutedMetaBackend> {
@@ -158,7 +201,7 @@ fn wire(id: AppenderIdentity) -> WireIdentity {
 
 /// A first holder: acquire at term 1, hold (fresh pages), publish the refs.
 async fn take_fresh_lease(
-    vol: &KvMetaBackend,
+    vol: &Arc<KvMetaBackend>,
     me: AppenderIdentity,
 ) -> (Arc<alloc_lease::AllocHolding>, Vec<(u16, ExtentRef)>) {
     let g = vol
@@ -276,21 +319,37 @@ fn the_block_grant_derivation_is_clamped_between_its_floor_and_cap() {
 // §5.5.1 — the crash table's headline rows
 // ---------------------------------------------------------------------------
 
+/// Where the holder dies relative to its checkpoint (review round 1,
+/// Issue 1: the first build pinned the no-checkpoint window only, and the
+/// data pages were written AFTER the tail-advancing ledger record — a
+/// kill between the two lost every journaled SET below the new tail).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrashWindow {
+    /// No checkpoint between the grant and the kill: the SET deltas are in
+    /// the window, the pages are the fresh image.
+    BeforeAnyCheckpoint,
+    /// A whole checkpoint landed after the grant (pages + ledger).
+    AfterACheckpoint,
+    /// The checkpoint's ledger record landed and the process died before
+    /// anything that follows it — the tail is past the SET deltas, so the
+    /// pages MUST already carry them (the meta bitmap's order).
+    AfterTheLedgerRecord,
+}
+
 /// **The case that matters**: the holder journals a `BlockGrant` SET and
 /// dies before its next page write (the pages still show the range FREE).
 /// The home manager's ring replay applies the delta to the pages BEFORE
 /// `recovered:` is written; the successor cannot be granted the lease
 /// before that; it reads pages that show the range SET and never carves
-/// inside it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_grant_journaled_before_a_holder_death_is_never_regranted() {
+/// inside it. Driven at every crash window of the checkpoint cycle.
+async fn a_journaled_grant_survives_the_holders_death(window: CrashWindow, volumes: usize) {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
-    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let uris = format_stamped_set(dir.path(), volumes).await;
     let (dead, refs, granted) = {
         let routed = open_armed(&uris).await;
-        let vol = Arc::clone(&routed.volumes[0]);
+        let vol = Arc::clone(&routed.volumes[slot0_of(&routed)]);
         let me = identity_of(&vol);
         let (holding, refs) = take_fresh_lease(&vol, me).await;
         // The pages on the device are the FRESH all-clear image.
@@ -299,28 +358,44 @@ async fn a_grant_journaled_before_a_holder_death_is_never_regranted() {
             .await
             .unwrap();
         assert_eq!(
-            DataAllocBitmap::from_region_image(DATA_TAG, DATA_BLOCKS, &on_disk).population(),
+            DataAllocBitmap::from_region_image(DATA_TAG, DATA_BLOCKS, &on_disk)
+                .unwrap()
+                .population(),
             0
         );
         let g = grant_of(vol.holder_block_grant(DATA_TAG, "w", 64, 0).await.unwrap());
-        // The crash: no shutdown, no leave, no checkpoint — the SET
-        // deltas are in the ring, the holding's RAM dies with the mount.
+        match window {
+            CrashWindow::BeforeAnyCheckpoint => {}
+            CrashWindow::AfterACheckpoint => {
+                vol.checkpoint_now().await.unwrap();
+            }
+            CrashWindow::AfterTheLedgerRecord => {
+                // The cycle halts the instant its ledger record landed:
+                // whatever the cycle writes AFTER the record never reaches
+                // the device — exactly a kill −9 in that window.
+                TEST_CHECKPOINT_HALT_AFTER_LEDGER.store(true, Ordering::SeqCst);
+                assert!(vol.checkpoint_now().await.is_err(), "the halt fired");
+            }
+        }
+        // The crash: no shutdown, no leave — the holding's RAM dies with
+        // the mount.
         drop(vol);
         drop(routed);
         test_clear_holdings();
         park_gate::test_reset();
+        TEST_CHECKPOINT_HALT_AFTER_LEDGER.store(false, Ordering::SeqCst);
         (me, refs, g)
     };
     // The home manager remounts (its own-residue recovery replays ring 0
     // for the trees; the bitmap arm is PR 10's driver, driven here).
     let routed = open_armed(&uris).await;
-    let vol = Arc::clone(&routed.volumes[0]);
+    let vol = Arc::clone(&routed.volumes[slot0_of(&routed)]);
     let extents: Vec<ExtentRef> = refs.iter().map(|(_, e)| *e).collect();
     let stale = vol
         .read_alloc_bitmap_image(&extents, DATA_BLOCKS)
         .await
         .unwrap();
-    let pages = DataAllocBitmap::from_region_image(DATA_TAG, DATA_BLOCKS, &stale);
+    let pages = DataAllocBitmap::from_region_image(DATA_TAG, DATA_BLOCKS, &stale).unwrap();
     // Row "successor elected before the home recovery": REFUSED by
     // construction — a live holder refuses everyone, a dead one without
     // `recovered:` defers.
@@ -332,11 +407,12 @@ async fn a_grant_journaled_before_a_holder_death_is_never_regranted() {
         Err(KvError::Busy(m)) => assert!(m.contains("death ledger does not name it"), "{m}"),
         other => panic!("a live holder's lease moved: {other:?}"),
     }
+    let recorded = alloc_lease::DEAD_MEMBERS_RECORDED.load(Ordering::Relaxed);
     assert!(!vol.record_death(dead, 77).await.unwrap());
     assert!(vol.record_death(dead, 77).await.unwrap(), "idempotent");
     assert_eq!(
         alloc_lease::DEAD_MEMBERS_RECORDED.load(Ordering::Relaxed),
-        1
+        recorded + 1
     );
     match vol
         .manager_alloc_lease_acquire(DATA_TAG, succ, 1, 0, ROOT_INO, DATA_BLOCKS)
@@ -345,15 +421,24 @@ async fn a_grant_journaled_before_a_holder_death_is_never_regranted() {
         Err(KvError::LeaseDeferred(m)) => assert!(m.contains("not yet recovered"), "{m}"),
         other => panic!("a successor was elected before `recovered:`: {other:?}"),
     }
-    // The recovery arm: the dead holder's ring replayed onto its pages —
-    // the window's deltas were KEPT across the remount's own bring-up
-    // checkpoint (which advanced the tail past them).
-    assert!(squeezefs::data_alloc_bitmap::replayed_deltas_kept() >= 64);
-    let changed = vol.replay_data_alloc_deltas(&pages).await.unwrap();
-    assert_eq!(changed, 64, "the journaled SET landed on the pages");
+    // The recovery arm: the dead holder's ring replayed onto its pages.
+    // Before any checkpoint the window's deltas were KEPT across the
+    // remount's own bring-up checkpoint (which advanced the tail past
+    // them); after one, the pages themselves carry the grant — the page
+    // write precedes the ledger record that passes the deltas.
+    let changed = vol.replay_data_alloc_deltas(&pages, 1).await.unwrap();
+    match window {
+        CrashWindow::BeforeAnyCheckpoint => {
+            assert_eq!(changed, 64, "the journaled SET landed on the pages")
+        }
+        _ => assert_eq!(changed, 0, "the pages already carried the grant"),
+    }
     assert_eq!(squeezefs::data_alloc_bitmap::replayed_deltas_kept(), 0);
     for blk in granted.start..granted.end() {
-        assert!(pages.is_set(blk));
+        assert!(
+            pages.is_set(blk),
+            "block {blk} of {granted:?} reads FREE ({window:?})"
+        );
     }
     assert!(!vol.manager_record_recovered(dead, 0).await.unwrap());
     assert!(vol.manager_record_recovered(dead, 0).await.unwrap());
@@ -369,6 +454,17 @@ async fn a_grant_journaled_before_a_holder_death_is_never_regranted() {
         g2.predecessor_bitmap, refs,
         "the dead holder's pages, volume-qualified"
     );
+    // Crash row 8 (review round 1, Issue 14): the successor dies before
+    // its copy and RETRIES — `already` answers the record's pages and
+    // block count, so it can still learn what to copy.
+    let again = vol
+        .manager_alloc_lease_acquire(DATA_TAG, succ, 1, 0, ROOT_INO, DATA_BLOCKS)
+        .await
+        .unwrap();
+    assert!(again.already);
+    assert_eq!(again.term, 2);
+    assert_eq!(again.predecessor_bitmap, refs);
+    assert_eq!(again.predecessor_blocks, DATA_BLOCKS);
     let image = pages.region_image(2).unwrap();
     let holding = vol
         .hold_alloc_lease(DATA_TAG, DATA_BLOCKS, 2, Some(&image))
@@ -396,6 +492,145 @@ async fn a_grant_journaled_before_a_holder_death_is_never_regranted() {
     reset_process_state();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_journaled_before_a_holder_death_is_never_regranted() {
+    a_journaled_grant_survives_the_holders_death(CrashWindow::BeforeAnyCheckpoint, 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_journaled_before_a_holder_death_is_never_regranted_after_a_checkpoint() {
+    a_journaled_grant_survives_the_holders_death(CrashWindow::AfterACheckpoint, 1).await;
+}
+
+/// Review round 1, Issue 1 — the headline crash row: a kill between the
+/// ledger record and whatever the cycle writes after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kill_after_the_ledger_record_still_finds_the_journaled_grant_set() {
+    a_journaled_grant_survives_the_holders_death(CrashWindow::AfterTheLedgerRecord, 1).await;
+}
+
+/// The same three windows on the design's 2-volume shape (the holder homed
+/// on the slot-0 volume, a second volume checkpointing beside it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_journaled_grant_survives_the_holders_death_on_a_two_volume_set() {
+    a_journaled_grant_survives_the_holders_death(CrashWindow::BeforeAnyCheckpoint, 2).await;
+    a_journaled_grant_survives_the_holders_death(CrashWindow::AfterACheckpoint, 2).await;
+    a_journaled_grant_survives_the_holders_death(CrashWindow::AfterTheLedgerRecord, 2).await;
+}
+
+/// Review round 1, Issue 3 (reviewer-reproduced): `write_data_alloc_pages`
+/// ran on EVERY volume's checkpoint — volume 1 wrote a `KVDA` page onto
+/// ITS device at volume 0's heap offset and consumed the holder's dirty
+/// bits. The pages are written ONLY by the holder's checkpoint on the
+/// holder's HOME volume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_volumes_checkpoint_never_writes_the_holders_pages_onto_its_own_device() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set(dir.path(), 2).await;
+    let routed = open_armed(&uris).await;
+    let slot0 = slot0_of(&routed);
+    let home = Arc::clone(&routed.volumes[slot0]);
+    let other = Arc::clone(&routed.volumes[1 - slot0]);
+    let me = identity_of(&home);
+    let (holding, _) = take_fresh_lease(&home, me).await;
+    let base = holding.pages[0].start;
+    let before = squeezefs::uring_fs::read_at(other.device_path(), base, 4096)
+        .await
+        .unwrap();
+    grant_of(home.holder_block_grant(DATA_TAG, "w", 64, 0).await.unwrap());
+    assert!(holding.bitmap.has_dirty_pages());
+    // The OTHER volume's checkpoint: its device untouched at the holder's
+    // page offsets, the holder's dirty bits still pending its OWN cycle.
+    other.checkpoint_now().await.unwrap();
+    let after = squeezefs::uring_fs::read_at(other.device_path(), base, 4096)
+        .await
+        .unwrap();
+    assert_eq!(before, after, "the other volume's device received a page");
+    assert!(
+        holding.bitmap.has_dirty_pages(),
+        "the other volume's checkpoint consumed the holder's dirty bits"
+    );
+    // The HOME volume's checkpoint writes them where the record says.
+    home.checkpoint_now().await.unwrap();
+    assert!(!holding.bitmap.has_dirty_pages());
+    let on_home = home
+        .read_alloc_bitmap_image(&holding.pages, DATA_BLOCKS)
+        .await
+        .unwrap();
+    assert_eq!(
+        DataAllocBitmap::from_region_image(DATA_TAG, DATA_BLOCKS, &on_home)
+            .unwrap()
+            .population(),
+        64
+    );
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
+/// Review round 1, Issue 2 (reviewer-reproduced): a terminal free's CLEAR
+/// was journaled at the NEXT checkpoint, after a re-grant's SET of the
+/// same block — the replay's seq-LWW folded the granted block CLEAR. A
+/// delta is journaled at the instant of the decision it records, in RAM
+/// order with every other delta of the holding: the CLEAR lands at
+/// `finish_free` (no checkpoint in its path), the re-grant's SET after it,
+/// and the recovery arm reads the block SET.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_frees_clear_is_journaled_at_finish_free_in_order_with_a_regrants_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set(dir.path(), 2).await;
+    let routed = open_armed(&uris).await;
+    let vol = Arc::clone(&routed.volumes[slot0_of(&routed)]);
+    let me = identity_of(&vol);
+    let (holding, _) = take_fresh_lease(&vol, me).await;
+    // Grant the whole volume so the next carve falls back below the
+    // frontier.
+    let mut first = None;
+    while let CarveOutcome::Granted(g) = vol.holder_block_grant(DATA_TAG, "w", 64, 0).await.unwrap()
+    {
+        first.get_or_insert(g);
+    }
+    let b = first.unwrap().start;
+    let ckpts = META_KV_CHECKPOINTS.load(Ordering::Relaxed);
+    let journaled = holding.stats().deltas_journaled;
+    // The terminal free of `b`: the bit clears in RAM and its CLEAR is
+    // journaled NOW — the queue drains without a checkpoint.
+    assert!(alloc_lease::note_finish_free(DATA_TAG, b));
+    let landed = tokio::time::timeout(Duration::from_secs(5), async {
+        while holding.queued_deltas() != 0 || holding.stats().deltas_journaled == journaled {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await;
+    assert!(landed.is_ok(), "the CLEAR waited for a checkpoint");
+    assert_eq!(META_KV_CHECKPOINTS.load(Ordering::Relaxed), ckpts);
+    // The re-grant of the hole to another writer: its SET journaled after
+    // the CLEAR, in RAM order.
+    let regrant = grant_of(vol.holder_block_grant(DATA_TAG, "v", 1, 0).await.unwrap());
+    assert_eq!(regrant.start, b, "the hole is re-granted");
+    assert!(holding.bitmap.is_set(b));
+    vol.checkpoint_now().await.unwrap();
+    let on_disk = vol
+        .read_alloc_bitmap_image(&holding.pages, DATA_BLOCKS)
+        .await
+        .unwrap();
+    let pages = DataAllocBitmap::from_region_image(DATA_TAG, DATA_BLOCKS, &on_disk).unwrap();
+    assert!(pages.is_set(b));
+    vol.replay_data_alloc_deltas(&pages, 1).await.unwrap();
+    assert!(
+        pages.is_set(b),
+        "block {b} is granted to `v` yet the recovered bitmap reads it CLEAR"
+    );
+    // A holder's own re-mint of a freed block is a grant (the bitmap IS
+    // the free list): the allocator armed on this volume never hands a
+    // freed block back off a local free list with its bit clear.
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
 /// The rest of the §5.5.1 table, driven on the bitmap and the ledger: a
 /// referenced block is never inside a successor's carve across (3) a
 /// clear-then-die, (6) a torn newest page, (7) a re-run recovery and (8)
@@ -413,14 +648,18 @@ async fn an_allocation_lease_successor_never_regrants_a_referenced_block() {
     let g = grant_of(ledger.carve(&pred, "p", 64, 0, 0));
     let referenced: std::collections::BTreeSet<u64> = (g.start..g.start + 3).collect();
     let recs = [
-        set_record(DATA_TAG, 200, 10),
-        clear_record(DATA_TAG, 200, 11),
-        set_record(DATA_TAG, 200, 12),
-        clear_record(DATA_TAG, 201, 13),
+        set_record(DATA_TAG, 200, 1, 10),
+        clear_record(DATA_TAG, 200, 1, 11),
+        set_record(DATA_TAG, 200, 1, 12),
+        clear_record(DATA_TAG, 201, 1, 13),
+        // Another holder TERM's delta never folds into this recovery
+        // (review round 1, Issue 9: the kept window and the ring scan are
+        // keyed per (volume, holder term)).
+        clear_record(DATA_TAG, 200, 2, 14),
     ];
     // Row 3/7: the replay is idempotent — run twice, same bits.
     for _ in 0..2 {
-        pred.replay(recs.iter().map(|(t, r)| (*t, r)));
+        pred.replay(recs.iter().map(|(t, r)| (*t, r)), 1);
         assert!(pred.is_set(200) && !pred.is_set(201));
     }
     // Row 6: a torn NEWEST page falls back to the predecessor copy. Write
@@ -432,17 +671,36 @@ async fn an_allocation_lease_successor_never_regrants_a_referenced_block() {
     let mut torn = encode_data_alloc_page(DATA_TAG, 0, 6, &[0u8; 8]).unwrap();
     torn[100] ^= 0xFF;
     region[DATA_ALLOC_PAGE_LEN as usize..2 * DATA_ALLOC_PAGE_LEN as usize].copy_from_slice(&torn);
-    let loaded = DataAllocBitmap::from_region_image(DATA_TAG, DATA_BLOCKS, &region);
+    let loaded = DataAllocBitmap::from_region_image(DATA_TAG, DATA_BLOCKS, &region).unwrap();
     assert_eq!(loaded.population(), pred.population());
     assert!(decode_data_alloc_page(&torn, DATA_TAG, 0).is_err());
+    // Review round 1, Issue 6: a page pair with NO valid slot is FRESH
+    // only when both slots are all-zero; a non-zero pair nobody can decode
+    // (bogus refs, an unreadable predecessor region) REFUSES the load —
+    // never "all free".
+    let mut corrupt = region.clone();
+    corrupt[..DATA_ALLOC_PAGE_LEN as usize].copy_from_slice(&torn);
+    assert!(
+        DataAllocBitmap::from_region_image(DATA_TAG, DATA_BLOCKS, &corrupt).is_err(),
+        "two invalid non-zero slots read as an all-free bitmap"
+    );
+    assert_eq!(
+        DataAllocBitmap::from_region_image(DATA_TAG, DATA_BLOCKS, &[])
+            .unwrap()
+            .population(),
+        0,
+        "a fresh (all-zero) region is a fresh bitmap"
+    );
     // Row 8: the first successor copies (generation 7) and dies before
     // its refs land; the next successor copies AGAIN from the still-
     // Recovered image — the same bits, and no carve inside the
     // referenced set.
     let copy1 =
-        DataAllocBitmap::from_region_image(DATA_TAG, DATA_BLOCKS, &loaded.region_image(7).unwrap());
+        DataAllocBitmap::from_region_image(DATA_TAG, DATA_BLOCKS, &loaded.region_image(7).unwrap())
+            .unwrap();
     let copy2 =
-        DataAllocBitmap::from_region_image(DATA_TAG, DATA_BLOCKS, &loaded.region_image(8).unwrap());
+        DataAllocBitmap::from_region_image(DATA_TAG, DATA_BLOCKS, &loaded.region_image(8).unwrap())
+            .unwrap();
     assert_eq!(copy1.set_blocks(), copy2.set_blocks());
     let succ = BlockGrantLedger::new();
     succ.adopt("p", g);
@@ -467,21 +725,32 @@ async fn an_allocation_lease_successor_never_regrants_a_referenced_block() {
 // §5.5.2 — the death ledger's records; holder failover keeps quarantine
 // ---------------------------------------------------------------------------
 
-/// A dead holder's OUTSTANDING grants (the unpublished remainder a zombie
-/// may still DMA into) are revoked from the ledger by the death record
-/// and QUARANTINED on the successor's allocator under the dead epoch (S7)
-/// — never carved again until a drain proof; the records themselves are
-/// idempotent and keyed by the KD-MW-2 identity.
+/// A dead WRITER's OUTSTANDING grants (the unpublished remainder a zombie
+/// may still DMA into) are revoked from the holder's ledger BY THE DEATH
+/// RECORD and QUARANTINED on the holder's allocator under a dead epoch
+/// (S7 — `dlm_quarantined_offsets`) — never carved again until a drain
+/// proof; the records themselves are idempotent and keyed by the KD-MW-2
+/// identity. The holder is the production arm's (review round 1, Issue 7:
+/// `record_death` → `revoke_dead` → the quarantine is the wired chain).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn holder_failover_keeps_the_dead_writers_grants_quarantined() {
+async fn a_death_record_revokes_the_dead_writers_grants_into_the_quarantine() {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
-    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let uris = format_stamped_set(dir.path(), 2).await;
     let routed = open_armed(&uris).await;
-    let vol = Arc::clone(&routed.volumes[0]);
+    let vol = Arc::clone(&routed.volumes[slot0_of(&routed)]);
     let me = identity_of(&vol);
-    let (holding, _) = take_fresh_lease(&vol, me).await;
+    let alloc = data_allocator(DATA_ID).await;
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&routed, &[Arc::clone(&alloc)])
+            .await
+            .unwrap(),
+        1,
+        "the armed mount holds its data volume's lease first-come"
+    );
+    let holding = alloc_lease::holding(DATA_TAG).expect("held");
+    assert_eq!(holding.term, 1);
     let w = successor_identity();
     let name = wire_writer_name(&wire(w));
     let g = grant_of(
@@ -489,13 +758,19 @@ async fn holder_failover_keeps_the_dead_writers_grants_quarantined() {
             .await
             .unwrap(),
     );
+    let quarantined_before = alloc.quarantined_count();
     // The death ledger names the writer: its grants leave the table for
     // the quarantine; the bits stay SET (a clear waits on the drain
     // proof).
     assert!(!vol.record_death(w, 5).await.unwrap());
-    let revoked = holding.ledger.revoke_dead(&name);
-    assert_eq!(revoked, vec![g]);
-    assert!(holding.ledger.revoke_dead(&name).is_empty(), "idempotent");
+    assert_eq!(holding.ledger.grants_of(&name), Vec::<BlockGrant>::new());
+    assert_eq!(holding.stats().grants_revoked, 1);
+    assert_eq!(
+        alloc.quarantined_count() - quarantined_before,
+        64,
+        "the dead writer's unpublished remainder is quarantined on the allocator"
+    );
+    assert!(vol.record_death(w, 5).await.unwrap(), "idempotent");
     assert_eq!(holding.stats().grants_revoked, 1);
     for b in g.start..g.end() {
         assert!(holding.bitmap.is_set(b), "quarantined bits stay set");
@@ -509,12 +784,103 @@ async fn holder_failover_keeps_the_dead_writers_grants_quarantined() {
         );
         assert!(!c.overlaps(&g));
     }
-    alloc_lease::note_dead_member_acted(vol.dead_member_record(&w).await.unwrap().unwrap().ts_ms);
-    assert_eq!(alloc_lease::DEAD_MEMBERS_ACTED.load(Ordering::Relaxed), 1);
+    assert!(alloc_lease::DEAD_MEMBERS_ACTED.load(Ordering::Relaxed) >= 1);
     // The records' keys are the identity pair, and volume-qualified for
     // `recovered:`.
     assert_ne!(dead_member_key(&w), dead_member_key(&me));
     assert_ne!(recovered_key(&w, 0), recovered_key(&w, 1));
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
+/// **The undelivered arm delivered** (review round 1, Issue 7): on an
+/// armed mount `BlockAllocator`'s fresh-block mint comes from the writer's
+/// GRANTED WINDOW — the production arm acquires the data volume's
+/// allocation lease first-come and installs the grant arm; a second
+/// writer's allocator (its window fed by the holder over the wire) mints
+/// disjoint ranges; `block_grants` > 0, the S9 lane family flat; a writer's
+/// terminal free clears the bit at the holder (the holder's own allocator
+/// has no local free list under the plane — the bitmap IS the free list),
+/// and a wire writer's frees are re-homed to the holder's endpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_armed_two_writer_set_allocates_disjoint_ranges_from_grants() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set(dir.path(), 2).await;
+    let routed = open_armed(&uris).await;
+    let vol = Arc::clone(&routed.volumes[slot0_of(&routed)]);
+    let a = data_allocator(DATA_ID).await;
+    assert!(!a.block_grant_armed());
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&routed, &[Arc::clone(&a)])
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(a.block_grant_armed(), "the armed mount mints from grants");
+    let lanes = &squeezefs::fuse_client::METRICS;
+    let lane_writers = lanes.alloc_lane_writers.load(Ordering::Relaxed);
+    let lane_reservations = lanes.alloc_lane_reservations.load(Ordering::Relaxed);
+    let holding = alloc_lease::holding(DATA_TAG).expect("held");
+    // Writer B: another daemon's allocator on the same data volume, its
+    // window topped up through the manager's wire venue.
+    let host = squeezefs::cluster_wire::RpcListener::start_async(
+        listener_cfg(),
+        SECRET.to_vec(),
+        ManagerService::new(Arc::clone(&vol)),
+    )
+    .expect("manager listener");
+    let endpoint = host.endpoint().to_string();
+    let b = data_allocator(DATA_ID).await;
+    let w = wire(successor_identity());
+    assert!(b.install_block_grant_arm(
+        DATA_TAG,
+        alloc_lease::wire_block_grant_sink(endpoint.clone(), SECRET.to_vec(), w, 0, DATA_TAG),
+    ));
+    assert!(alloc_lease::install_wire_free_target(DATA_TAG, &endpoint));
+    let mut mine_a = std::collections::BTreeSet::new();
+    let mut mine_b = std::collections::BTreeSet::new();
+    for _ in 0..200 {
+        mine_a.insert(a.allocate_block().await.unwrap() / a.chunk_size());
+        mine_b.insert(b.allocate_block().await.unwrap() / b.chunk_size());
+    }
+    assert_eq!(mine_a.len(), 200);
+    assert_eq!(mine_b.len(), 200);
+    assert!(mine_a.is_disjoint(&mine_b), "two writers minted one block");
+    let s = holding.stats();
+    assert!(s.block_grants >= 2, "{s:?}");
+    assert!(a.block_grant_topups() >= 1, "A topped up past 64 blocks");
+    assert!(b.block_grant_topups() >= 1, "B topped up past 64 blocks");
+    for blk in mine_a.iter().chain(mine_b.iter()) {
+        assert!(holding.bitmap.is_set(*blk), "minted block {blk} not SET");
+    }
+    assert_eq!(
+        lanes.alloc_lane_writers.load(Ordering::Relaxed),
+        lane_writers,
+        "the S9 partition stays disengaged"
+    );
+    assert_eq!(
+        lanes.alloc_lane_reservations.load(Ordering::Relaxed),
+        lane_reservations,
+        "the lane family stays flat"
+    );
+    // A's terminal free clears the bit at the holder and never lands on a
+    // local free list: the next mint is a GRANTED block, never the freed
+    // one off the list with its bit clear.
+    let freed = *mine_a.iter().next().unwrap();
+    a.begin_free(freed * a.chunk_size());
+    a.finish_free(freed * a.chunk_size());
+    assert!(!holding.bitmap.is_set(freed));
+    let next = a.allocate_block().await.unwrap() / a.chunk_size();
+    assert!(holding.bitmap.is_set(next), "a mint whose bit is CLEAR");
+    // B's frees are re-homed: the free target for this data volume is the
+    // holder's venue (what `cowriter::ship_displaced_frees` ships to).
+    assert_eq!(
+        free_target_for(DATA_TAG).as_deref(),
+        Some(endpoint.as_str())
+    );
+    drop(host);
     shutdown(&routed).await;
     reset_process_state();
 }
@@ -600,20 +966,51 @@ fn join_req(id: &str) -> JoinRequest {
     }
 }
 
-/// **The membership half of the home-shard failover**: a Writer member of
-/// a symmetric appender passes `T_self` with its manager dead — it PARKS
-/// (nothing poisoned, the session not fenced), a commit admitted before
-/// the park lands with its ACK HELD, admission waits; the successor arms
-/// and opens grace, the member reclaims with its epoch, the held ack
-/// releases and admission resumes; `appender_park_expiries == 0`.
+/// Wait (bounded, no fixed sleep) until `cond` holds — the contracts'
+/// synchronization on the conveyor's observable words.
+async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !cond() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
+}
+
+/// A manual lease clock plus its tick word.
+fn manual_clock() -> (LeaseClock, Arc<std::sync::atomic::AtomicU64>) {
+    let ticks = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+    (LeaseClock::manual(Arc::clone(&ticks)), ticks)
+}
+
+fn plane_cfg() -> MembershipPlaneConfig {
+    MembershipPlaneConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("literal addr"),
+        service_threads: 2,
+        session_idle: Duration::from_secs(60),
+    }
+}
+
+/// **The membership half of the home-shard failover, through the
+/// PRODUCTION renewal tick** (review round 1, Issues 5/10/12): a Writer
+/// member of a symmetric appender, joined over the wire to owner A,
+/// passes `T_self` with A dead — the tick answers `Parked` (nothing
+/// poisoned, the session not fenced, the renewal loop keeps ticking), a
+/// commit admitted before the park lands with its ACK HELD, admission
+/// waits; the successor B arms at a NEW venue and opens grace; the ledger
+/// observation names it (`note_successor_observed` — PR 10's poll is the
+/// production caller, the seam here) and the parked tick reclaims AGAINST
+/// THE SUCCESSOR with its epoch; the held ack releases and admission
+/// resumes; `appender_park_expiries == 0`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn home_shard_members_park_and_reclaim_across_a_manager_failover() {
+async fn a_parked_member_reclaims_against_the_successor_the_ledger_names() {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
-    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let uris = format_stamped_set(dir.path(), 2).await;
     let routed = open_armed(&uris).await;
-    let vol = Arc::clone(&routed.volumes[0]);
+    let vol = Arc::clone(&routed.volumes[slot0_of(&routed)]);
     assert!(
         park_gate::symmetric_appender_armed(),
         "the armed open arms the park posture"
@@ -623,21 +1020,20 @@ async fn home_shard_members_park_and_reclaim_across_a_manager_failover() {
         "T_park_max > SQUEEZEFS_TIMEOUT"
     );
 
-    // The shard: owner A, our member.
-    let clock = LeaseClock::monotonic();
+    // Owner A's plane at venue E1; our member joins over the wire.
+    let (clock, ticks) = manual_clock();
     let owner_a = MembershipOwner::arm("shard-a", 3, 2, shipped_clocks(), clock.clone()).unwrap();
-    let grant = match owner_a.join(join_req("member-x")) {
-        JoinOutcome::Granted(g) => g,
-        other => panic!("{other:?}"),
-    };
-    let session = Arc::new(MemberSession::adopt(
-        "member-x",
-        MemberRole::Writer,
-        &grant,
-        clock.now_ms(),
-        clock.clone(),
-    ));
+    let plane_a = MembershipPlane::start(plane_cfg(), SECRET.to_vec(), Arc::clone(&owner_a))
+        .expect("owner A listens");
+    let e1 = plane_a.endpoint().to_string();
+    let req = join_req("member-x");
+    let mut client = MemberClient::join(&e1, SECRET, req.clone(), clock.clone())
+        .await
+        .expect("the member joins");
+    let session = Arc::clone(client.session());
     let epoch = session.epoch();
+    let t_self_ms = shipped_clocks().t_self.as_millis() as u64;
+
     // A commit lands and is held at the lane's pre-fanout seam; THEN the
     // park is raised, so its ack is HELD by the park (in-flight entries
     // land, acks wait).
@@ -648,23 +1044,43 @@ async fn home_shard_members_park_and_reclaim_across_a_manager_failover() {
             .await
             .map(|i| i.ino)
     });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_until("the lane at the pre-fanout seam", || {
+        park_gate::inflight() >= 1
+    })
+    .await;
     assert!(!held.is_finished(), "the lane is at the seam");
-    // The manager dies; T_self passes: the member's fence is the PARK.
+
+    // A dies: the venue is gone. Before T_self the tick RE-ASSERTS (a
+    // reclaim, refused unreachable) — never a fence, never a park.
+    plane_a.shutdown();
+    drop(plane_a);
     drop(owner_a);
-    let fence = session.self_fence("renewal failed: connection refused");
-    assert!(fence.parked);
-    assert!(!fence.poisoned_data_custody);
-    assert!(!session.fenced(), "a parked session is not fenced");
+    ticks.fetch_add(1_000, Ordering::SeqCst);
+    match member_renewal_tick(&mut client, &e1, SECRET, &req, &clock, None).await {
+        RenewalTick::RejoinRefused => {}
+        other => panic!("before T_self: {other:?}"),
+    }
+    assert!(!park_gate::is_parked());
+    // T_self passes: the tick's fence is the PARK, and the tick is
+    // RETRYABLE — the loop keeps ticking (a `Fenced` here is the silent
+    // permanent park the review found).
+    ticks.fetch_add(t_self_ms, Ordering::SeqCst);
+    match member_renewal_tick(&mut client, &e1, SECRET, &req, &clock, None).await {
+        RenewalTick::Parked => {}
+        other => panic!("at T_self: {other:?}"),
+    }
     assert!(park_gate::is_parked());
+    assert!(!session.fenced(), "a parked session is not fenced");
     assert!(!squeezefs::data_custody::poisoned());
     assert_eq!(park_gate::parks(), 1);
     // Release the seam: the lane reaches the park's ack hold.
     TEST_CONVEYOR_HOLD_STAGE.store(0, Ordering::SeqCst);
     test_conveyor_hold_release();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_until("the landed entry's ack held", || {
+        park_gate::acks_held() >= 1
+    })
+    .await;
     assert!(!held.is_finished(), "the landed entry's ack is HELD");
-    assert!(park_gate::acks_held() >= 1);
     // A new commit waits at the pre-admission door — never escalates.
     let r2 = Arc::clone(&routed);
     let parked = tokio::spawn(async move {
@@ -672,27 +1088,41 @@ async fn home_shard_members_park_and_reclaim_across_a_manager_failover() {
             .await
             .map(|i| i.ino)
     });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::task::yield_now().await;
     assert!(!parked.is_finished());
     assert!(!vol.is_failed(), "a park is not a fail-stop");
     // Reads keep serving and the token service continues.
     assert!(routed.lookup(ROOT_INO, "nothing").await.is_err());
     assert!(park_gate::admits_token_service());
-    // The successor arms for the shard and opens grace; the member
-    // reclaims with the epoch it holds.
+    // Another parked tick against the dead venue: the park stands
+    // (`Parked` again — the beat paces it, nothing spins), no expiry.
+    ticks.fetch_add(1, Ordering::SeqCst);
+    match member_renewal_tick(&mut client, &e1, SECRET, &req, &clock, None).await {
+        RenewalTick::Parked => {}
+        other => panic!("parked tick: {other:?}"),
+    }
+    assert_eq!(park_gate::expiries(), 0);
+    // The successor B arms at venue E2 and opens grace; the ledger
+    // observation names it; the parked tick reclaims AGAINST B.
     let owner_b = MembershipOwner::arm("shard-b", 4, 3, shipped_clocks(), clock.clone()).unwrap();
     owner_b.open_grace(vec!["member-x".to_string()]);
-    let mut reclaim = join_req("member-x");
-    reclaim.prior_epoch = Some(epoch);
-    let t0 = std::time::Instant::now();
-    match owner_b.join(reclaim) {
-        JoinOutcome::Granted(_) => {}
-        other => panic!("a reclaim in grace was refused: {other:?}"),
+    let plane_b = MembershipPlane::start(plane_cfg(), SECRET.to_vec(), Arc::clone(&owner_b))
+        .expect("owner B listens");
+    let e2 = plane_b.endpoint().to_string();
+    membership::note_successor_observed(Some(e2.clone()));
+    assert_eq!(
+        membership::successor_endpoint().as_deref(),
+        Some(e2.as_str())
+    );
+    match member_renewal_tick(&mut client, &e1, SECRET, &req, &clock, None).await {
+        RenewalTick::Rejoined => {}
+        other => panic!("the reclaim against the successor: {other:?}"),
     }
-    assert!(park_gate::release(
-        park_gate::parked_for_ms(clock.now_ms()) * 1_000_000,
-        t0.elapsed().as_nanos() as u64
-    ));
+    assert_eq!(
+        client.session().epoch(),
+        epoch,
+        "the reclaim kept its epoch"
+    );
     let held_ino = tokio::time::timeout(Duration::from_secs(10), held)
         .await
         .expect("the held ack releases on the grant")
@@ -715,6 +1145,251 @@ async fn home_shard_members_park_and_reclaim_across_a_manager_failover() {
     let [wait, rtt, total] = park_gate::park_ns();
     assert_eq!(wait + rtt, total, "exact-sum");
     assert!(!owner_b.grace_active());
+    client.leave().await.expect("clean leave");
+    plane_b.shutdown();
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
+/// Review round 1, Issue 5 — the not-custody arm never parks: before
+/// `T_self` the owner answers "not custody" (an owner that lost its RAM
+/// leases, an eviction) — the production tick fences TERMINALLY (custody
+/// poisoned, the session fenced, `Fenced`) on an armed appender exactly as
+/// shipped; the gate never stands `Parked`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_not_custody_answer_before_t_self_fences_terminally_and_never_parks() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set(dir.path(), 1).await;
+    let routed = open_armed(&uris).await;
+    assert!(park_gate::symmetric_appender_armed());
+    let (clock, ticks) = manual_clock();
+    let owner = MembershipOwner::arm("shard-a", 3, 2, shipped_clocks(), clock.clone()).unwrap();
+    let plane = MembershipPlane::start(plane_cfg(), SECRET.to_vec(), Arc::clone(&owner))
+        .expect("owner listens");
+    let e = plane.endpoint().to_string();
+    let req = join_req("member-y");
+    let mut client = MemberClient::join(&e, SECRET, req.clone(), clock.clone())
+        .await
+        .expect("joins");
+    let session = Arc::clone(client.session());
+    // The owner forgets the lease (the eviction shape); the member is
+    // well before T_self.
+    assert!(owner
+        .evict("member-y", "the review's not-custody shape")
+        .is_some());
+    ticks.fetch_add(500, Ordering::SeqCst);
+    match member_renewal_tick(&mut client, &e, SECRET, &req, &clock, None).await {
+        RenewalTick::Fenced => {}
+        other => panic!("not-custody before T_self: {other:?}"),
+    }
+    assert!(session.fenced(), "the lease is gone by the owner's verdict");
+    assert!(
+        squeezefs::data_custody::poisoned(),
+        "a Writer's fence poisons"
+    );
+    assert!(!park_gate::is_parked(), "the not-custody arm PARKED");
+    assert_eq!(park_gate::parks(), 0);
+    plane.shutdown();
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
+/// Review round 1, Issue 5 — a park that is never granted EXPIRES at
+/// `T_park_max` through the production tick: the parked committer gets
+/// EIO, the held ack fails, custody is poisoned, `appender_park_expiries`
+/// moves — never a silent permanent park.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_park_never_granted_expires_at_t_park_max_with_eio_never_silent() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set(dir.path(), 1).await;
+    let routed = open_armed(&uris).await;
+    let (clock, ticks) = manual_clock();
+    let owner = MembershipOwner::arm("shard-a", 3, 2, shipped_clocks(), clock.clone()).unwrap();
+    let plane = MembershipPlane::start(plane_cfg(), SECRET.to_vec(), Arc::clone(&owner))
+        .expect("owner listens");
+    let e = plane.endpoint().to_string();
+    let req = join_req("member-z");
+    let mut client = MemberClient::join(&e, SECRET, req.clone(), clock.clone())
+        .await
+        .expect("joins");
+    plane.shutdown();
+    drop(plane);
+    drop(owner);
+    let t_self_ms = shipped_clocks().t_self.as_millis() as u64;
+    ticks.fetch_add(t_self_ms + 1, Ordering::SeqCst);
+    match member_renewal_tick(&mut client, &e, SECRET, &req, &clock, None).await {
+        RenewalTick::Parked => {}
+        other => panic!("{other:?}"),
+    }
+    assert!(park_gate::is_parked());
+    let r = Arc::clone(&routed);
+    let parked = tokio::spawn(async move {
+        r.create(ROOT_INO, "doomed", libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .map(|i| i.ino)
+    });
+    tokio::task::yield_now().await;
+    assert!(!parked.is_finished());
+    // T_park_max passes with no successor: the next tick expires the
+    // park — terminal, loud, counted.
+    ticks.fetch_add(park_gate::t_park_max_in_force_ms() + 1, Ordering::SeqCst);
+    match member_renewal_tick(&mut client, &e, SECRET, &req, &clock, None).await {
+        RenewalTick::Fenced => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(park_gate::expiries(), 1, "the one terminal signal moved");
+    assert!(park_gate::is_expired());
+    assert!(squeezefs::data_custody::poisoned());
+    assert!(client.session().fenced());
+    let outcome = tokio::time::timeout(Duration::from_secs(10), parked)
+        .await
+        .expect("the parked committer is answered, never left parked")
+        .unwrap();
+    assert!(outcome.is_err(), "EIO to the parked op, got {outcome:?}");
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
+/// Review round 1, Issue 18 — the LEAVE over a standing park: the clean
+/// shutdown is REFUSED loud (the region may be under a successor's
+/// recovery, so nothing more is admitted into its ring — the page stays
+/// `Live` for the next open's own-residue recovery), the committers
+/// parked at the door are failed (never landed), and it is not an expiry
+/// (`appender_park_expiries` stays 0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shutdown_over_a_standing_park_is_refused_and_fails_the_parked_committers() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set(dir.path(), 1).await;
+    let routed = open_armed(&uris).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(
+        park_gate::fence_at_t_self(FenceClass::SymmetricAppender, 1_000, "manager dead"),
+        TSelfAction::Parked
+    );
+    let r = Arc::clone(&routed);
+    let parked = tokio::spawn(async move {
+        r.create(ROOT_INO, "never", libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .map(|i| i.ino)
+    });
+    tokio::task::yield_now().await;
+    assert!(!parked.is_finished());
+    match vol.shutdown().await {
+        Err(KvError::Busy(m)) => assert!(m.contains("PARKED"), "{m}"),
+        other => panic!("a parked appender's leave was admitted: {other:?}"),
+    }
+    let outcome = tokio::time::timeout(Duration::from_secs(10), parked)
+        .await
+        .expect("the parked committer is failed at the leave")
+        .unwrap();
+    assert!(outcome.is_err(), "{outcome:?}");
+    assert_eq!(park_gate::expiries(), 0, "a leave is not an expiry");
+    assert!(park_gate::is_expired(), "the door is closed");
+    assert!(routed.lookup(ROOT_INO, "never").await.is_err());
+    drop(vol);
+    drop(routed);
+    reset_process_state();
+}
+
+/// Review round 1, Issue 4 — the `poison` split classifies by OBJECT: on
+/// an armed symmetric appender the S9 remote-custody client's `T_self`
+/// fence POISONS process data custody exactly as shipped (DMA refused,
+/// `membership_self_fences` counts it, the gate untouched), and only the
+/// appender's own membership lease PARKS (counted on `appender_parks`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_s9_custody_clients_fence_poisons_while_the_appenders_lease_parks() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set(dir.path(), 1).await;
+    let routed = open_armed(&uris).await;
+    assert!(park_gate::symmetric_appender_armed());
+    // The S9 custody client — its own authority on its own wire.
+    let clocks = shipped_clocks();
+    let term = squeezefs::dlm::durable_term();
+    let authority = squeezefs::data_grant::WriteCustodyOwner::arm(
+        "authority-pr8",
+        term + 1,
+        term,
+        clocks.clone(),
+        LeaseClock::monotonic(),
+        None,
+    )
+    .expect("the custody authority arms");
+    let router = squeezefs::data_grant::AsyncVerbRouter::new().with_custody(Arc::clone(&authority));
+    let host = squeezefs::cluster_wire::RpcListener::start_async(
+        listener_cfg(),
+        SECRET.to_vec(),
+        Arc::new(router),
+    )
+    .expect("the authority listens");
+    let custody = squeezefs::data_grant::WriteCustodyClient::connect_with_clock(
+        &host.endpoint().to_string(),
+        SECRET,
+        "node-pr8",
+        LeaseClock::monotonic(),
+        0,
+    )
+    .await
+    .expect("the custody client joins");
+    let fences_before = squeezefs::fuse_client::METRICS
+        .membership_self_fences
+        .load(Ordering::Relaxed);
+    let fence = custody.self_fence("custody renewal failed: connection refused");
+    assert!(
+        fence.poisoned_data_custody,
+        "remote custody POISONS at T_self"
+    );
+    assert!(!fence.parked);
+    assert!(squeezefs::data_custody::poisoned(), "DMA refused");
+    assert!(
+        !park_gate::is_parked(),
+        "the custody object PARKED the appender"
+    );
+    assert_eq!(park_gate::parks(), 0);
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .membership_self_fences
+            .load(Ordering::Relaxed),
+        fences_before + 1
+    );
+    // The appender's OWN membership lease — the one object whose lease is
+    // reclaimable under grace — parks, on its own gauge.
+    let clock = LeaseClock::monotonic();
+    let owner = MembershipOwner::arm("shard-a", 3, 2, shipped_clocks(), clock.clone()).unwrap();
+    let grant = match owner.join(join_req("member-x")) {
+        JoinOutcome::Granted(g) => g,
+        other => panic!("{other:?}"),
+    };
+    let session = MemberSession::adopt(
+        "member-x",
+        MemberRole::Writer,
+        &grant,
+        clock.now_ms(),
+        clock,
+    );
+    let parked = session.self_fence_as(FenceClass::SymmetricAppender, "manager dead");
+    assert!(parked.parked);
+    assert!(!parked.poisoned_data_custody);
+    assert!(!session.fenced());
+    assert!(park_gate::is_parked());
+    assert_eq!(park_gate::parks(), 1);
+    // And `self_fence` on that same session is the SHIPPED terminal fence
+    // (the S9 client's delegate) — never the park.
+    let terminal = session.self_fence("terminal");
+    assert!(terminal.poisoned_data_custody && !terminal.parked);
+    assert!(session.fenced());
+    drop(custody);
+    host.shutdown();
+    // The standing park would hold the leave's own commits: release it
+    // (the successor's grant) before the clean shutdown.
+    assert!(park_gate::release(0, 0));
     shutdown(&routed).await;
     reset_process_state();
 }
@@ -884,12 +1559,14 @@ async fn data_custody_poison_splits_by_fence_class() {
     reset_process_state();
 }
 
-/// The sharded harness (KD-SYM-15, the SIM-1 shape): 4 shards, member
-/// `i` renews with shard `i % 4`; shard 0's manager dies — its 16 members
-/// park and every one reclaims in the successor's grace, zero expiries,
-/// zero journal entries.
+/// The sharded harness (KD-SYM-15, the SIM-1 shape) at the CORE's API: 4
+/// shards, member `i` renews with shard `i % 4`; shard 0's manager dies —
+/// its 16 members park and every one reclaims in the successor's grace,
+/// zero expiries, zero journal entries. The park leg here drives
+/// `ParkCore` directly (the production `RenewalTick::Parked` arm is
+/// `a_parked_member_reclaims_against_the_successor_the_ledger_names`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn membership_shards_by_home_volume_and_a_dead_shards_members_park_and_reclaim() {
+async fn the_sharded_sim_parks_and_reclaims_a_dead_shards_members_at_the_cores_api() {
     let _g = SEAM.lock().await;
     reset_process_state();
     let report = run_sharded(
@@ -923,13 +1600,15 @@ async fn membership_shards_by_home_volume_and_a_dead_shards_members_park_and_rec
 // §5.5 — frees to the right holder; the bitmap vs the census oracle
 // ---------------------------------------------------------------------------
 
-/// A data volume's terminal frees route to THAT volume's allocation
-/// holder (the free target the plane learns from `alloc_lease:`), the
-/// authority stays the route for a volume the plane does not name, and on
-/// the holder a terminal free clears the bit at `finish_free` — journaled
-/// as a CLEAR delta and written to the pages at the checkpoint.
+/// The free-target MAP names a data volume's holder (the authority stays
+/// the route for a volume the plane does not name), and on the holder a
+/// terminal free clears the bit at `finish_free` — journaled as a CLEAR
+/// delta at once, written to the pages at the checkpoint, which then
+/// COVERS it. (The production route — `cowriter::ship_displaced_frees`
+/// to the holder's venue, the allocator's own terminal free — is driven
+/// by `an_armed_two_writer_set_allocates_disjoint_ranges_from_grants`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn frees_route_to_the_volumes_allocation_holder_and_clear_its_bit_at_finish_free() {
+async fn the_free_target_map_names_the_holder_and_finish_free_clears_its_bit() {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
@@ -960,15 +1639,14 @@ async fn frees_route_to_the_volumes_allocation_holder_and_clear_its_bit_at_finis
         !alloc_lease::note_finish_free(DATA_TAG + 1, g.start),
         "not our volume"
     );
-    assert_eq!(holding.pending_clears(), 1);
     vol.checkpoint_now().await.unwrap();
-    assert_eq!(holding.pending_clears(), 0);
+    assert_eq!(holding.queued_deltas(), 0);
     assert!(!holding.bitmap.has_dirty_pages());
     let on_disk = vol
         .read_alloc_bitmap_image(&holding.pages, DATA_BLOCKS)
         .await
         .unwrap();
-    let loaded = DataAllocBitmap::from_region_image(DATA_TAG, DATA_BLOCKS, &on_disk);
+    let loaded = DataAllocBitmap::from_region_image(DATA_TAG, DATA_BLOCKS, &on_disk).unwrap();
     assert!(!loaded.is_set(g.start));
     assert!(loaded.is_set(g.start + 1));
     assert_eq!(loaded.population(), 63);
@@ -976,7 +1654,7 @@ async fn frees_route_to_the_volumes_allocation_holder_and_clear_its_bit_at_finis
     // device): a replay from the ledger's tail now finds nothing to apply
     // — the pages are the truth past the tail.
     let fresh = DataAllocBitmap::new(DATA_TAG, DATA_BLOCKS);
-    assert_eq!(vol.replay_data_alloc_deltas(&fresh).await.unwrap(), 0);
+    assert_eq!(vol.replay_data_alloc_deltas(&fresh, 1).await.unwrap(), 0);
     shutdown(&routed).await;
     reset_process_state();
 }
@@ -1013,11 +1691,12 @@ fn the_bitmap_agrees_with_the_census_oracle() {
     assert!(!bm.is_set(g.start), "report-only");
 }
 
-/// `free_grace_deferrals ≡ releases + offsets` PER VOLUME with two rings
-/// (two data volumes, one clock), and the timeout path counts the frees a
-/// forced release moved.
+/// `free_grace_deferrals ≡ releases + offsets` PER RING on two hand-made
+/// rings (the per-data-volume shape — one ring per volume, one clock), and
+/// the timeout path counts the frees a forced release moved. No shard is
+/// stood up here: the rings are the unit the gauge is per.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn free_grace_closure_holds_per_volume_with_two_shards() {
+async fn free_grace_closure_holds_per_ring_on_two_hand_made_rings() {
     let _g = SEAM.lock().await;
     reset_process_state();
     let ms = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
@@ -1278,6 +1957,70 @@ async fn the_wire_serves_pr8s_verbs_and_record_death_is_reserved_for_pr10() {
         }
         other => panic!("{other:?}"),
     }
+    // Review round 1, Issue 6 — PR 3/4's bounded-execution law on the
+    // PR-8 verbs: every wire integer and ref is validated against
+    // durable / derived state BEFORE any effect. `blocks` above the data
+    // volume's block count (or `u64::MAX` — the successor would size its
+    // allocations by it), an unknown data volume, a `home_vol` outside
+    // the set, a bitmap ref outside the home volume's heap / unaligned /
+    // short: each REJECTED on `manager_verb_rejected`, nothing written.
+    let rejected_before = vol.appender_stats().unwrap().manager_verb_rejected;
+    let newcomer = wire(AppenderIdentity {
+        node_token: 0x5ECC_0000_0000_0004,
+        mount_slot: 4,
+        writer_id: 4,
+    });
+    let mut rejections = 0u64;
+    for (tag, blocks, home_vol) in [
+        (DATA_TAG, u64::MAX, 0u16),
+        (DATA_TAG, DATA_BLOCKS + 1, 0),
+        (DATA_TAG, DATA_BLOCKS, 9),
+        (DATA_TAG + 99, DATA_BLOCKS, 0),
+    ] {
+        match client
+            .alloc_lease_acquire(tag, newcomer, 1, home_vol, ROOT_INO, blocks)
+            .await
+        {
+            Err(e) => assert!(e.to_string().contains("REJECTED"), "{e}"),
+            other => panic!("an unvalidated wire integer reached an effect: {other:?}"),
+        }
+        rejections += 1;
+    }
+    assert!(vol
+        .alloc_lease_record(DATA_TAG + 99)
+        .await
+        .unwrap()
+        .is_none());
+    let rec_before = vol.alloc_lease_record(DATA_TAG).await.unwrap().unwrap();
+    assert_eq!(rec_before.holder, succ.into());
+    let heap = vol.superblock().heap;
+    let node = vol.node_cache().config().layout.node_size() as u64;
+    for bad in [
+        (0u16, (heap.end(), node)),  // past the heap
+        (0, (heap.start + 1, node)), // unaligned
+        (0, (heap.start, node / 2)), // not a node multiple
+        (0, (heap.start, 0)),        // empty
+        (0, (u64::MAX - 8, node)),   // overflow
+        (9, (heap.start, node)),     // a volume the set lacks
+    ] {
+        match client
+            .alloc_lease_bitmap(DATA_TAG, succ, 2, vec![bad])
+            .await
+        {
+            Err(e) => assert!(e.to_string().contains("REJECTED"), "{bad:?}: {e}"),
+            other => panic!("an unvalidated bitmap ref reached the record: {bad:?} {other:?}"),
+        }
+        rejections += 1;
+    }
+    assert_eq!(
+        vol.alloc_lease_record(DATA_TAG).await.unwrap().unwrap(),
+        rec_before,
+        "a rejected frame wrote nothing"
+    );
+    assert_eq!(
+        vol.appender_stats().unwrap().manager_verb_rejected,
+        rejected_before + rejections
+    );
     // RecordDeath is RESERVED for PR 10's driver.
     match client.record_death(succ, 1).await.unwrap() {
         ManagerReply::Refused { reason } => assert!(reason.contains("PR 10"), "{reason}"),

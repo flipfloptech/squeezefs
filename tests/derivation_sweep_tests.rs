@@ -2762,4 +2762,20 @@ fn sym_block_grant_bitmap_and_park_bound_derive_from_their_terms() {
         t_park_max_ms(30_000, 0) >= 30_000,
         "T_park_max is never below SQUEEZEFS_TIMEOUT's shipped 30 s when the failover bound is"
     );
+    // Review round 1, Issue 16: the grace term IS `LeaseClocks::grace` (the
+    // S6 owner-failover window), read off the derivation — never `t_owner`
+    // standing in for it. And the term the arm passes is that field.
+    let clocks = squeezefs::membership::LeaseClocks::derive(std::time::Duration::ZERO)
+        .expect("shipped clocks");
+    assert_eq!(
+        squeezefs::park_gate::t_park_max_for(1_234, &clocks),
+        1_234 + clocks.grace.as_millis() as u64
+    );
+    // Review round 1, Issue 17: the beat's fallback is the shipped
+    // heartbeat's physical default, named — never a free literal.
+    assert_eq!(
+        squeezefs::membership::RENEWAL_BEAT_FALLBACK_MS,
+        squeezefs::fuse_client::CLIENT_HEARTBEAT_INTERVAL_SECS * 1000
+    );
+    assert!(squeezefs::membership::renewal_beat_ms() > 0);
 }

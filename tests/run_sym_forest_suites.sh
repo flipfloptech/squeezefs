@@ -52,6 +52,13 @@
 # same conversion; it rides the list so the marker gate, the hybrid
 # ledger and the forest it leaves are exercised whichever leg the
 # environment selects.
+# `sym_pack_tests` and `sym_shared_refs_tests` (PR 7 — pack per (writer,
+# slot, data volume), the one-slot refcount probe, the shared-block index
+# + clone protocol, gather mode) ride the list the same way: their armed
+# fixtures stamp under the seam themselves, and their flat / unarmed pins
+# (the flat ledger keying the GLOBAL owner verbatim, PK2's one pack scope,
+# the plain clone with every gauge 0, the ignored gather xattr) run on
+# both legs.
 #
 # WALL TIME IS A ROW (review round 4, Issue 26): each suite runs under
 # its own timer per leg, and the summary prints `flat`, `stamped` and the
@@ -105,6 +112,8 @@ DEFAULT_SUITES=(
   sym_slot_transfer_tests
   rename_lock_set_tests
   sym_convert_tests
+  sym_pack_tests
+  sym_shared_refs_tests
 )
 read -r -a SUITES <<<"${SQZ_SYM_SUITES:-${DEFAULT_SUITES[*]}}"
 RATIO_NOTE="${SQZ_SYM_RATIO_NOTE:-2.0}"

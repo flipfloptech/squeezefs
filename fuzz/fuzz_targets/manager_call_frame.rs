@@ -208,6 +208,13 @@ fn check_service_edge(call: &ManagerCall, total_extents: u64, record_seed: &[u8]
         | ManagerCall::AcquireSlot { .. }
         | ManagerCall::OfferSlot { .. }
         | ManagerCall::ResolveSlot { .. } => {}
+        // PR 7: the clone protocol's verbs carry block identities and a
+        // reference list bounded by the frame cap; the executors allocate
+        // nothing proportional to a wire integer (one lookup per listed
+        // reference) — nothing to screen at the edge beyond the codec.
+        ManagerCall::MarkShared { .. }
+        | ManagerCall::ShareBlock { .. }
+        | ManagerCall::ReleaseShared { .. } => {}
     }
 }
 
@@ -287,6 +294,23 @@ enum ArbCall {
     ResolveSlot {
         slot: u16,
     },
+    // PR 7
+    MarkShared {
+        vol_tag: u64,
+        block_idx: u64,
+        owner_ino: u64,
+        block_index: u32,
+    },
+    ShareBlock {
+        vol_tag: u64,
+        block_idx: u64,
+        refs: Vec<(u64, u32)>,
+    },
+    ReleaseShared {
+        vol_tag: u64,
+        block_idx: u64,
+        owner_ino: Option<u64>,
+    },
 }
 
 #[derive(Arbitrary, Debug, Clone, Copy)]
@@ -353,6 +377,35 @@ impl From<ArbCall> for ManagerCall {
             ArbCall::ReturnExtents { appender_id, runs } => {
                 ManagerCall::ReturnExtents { appender_id, runs }
             }
+            ArbCall::MarkShared {
+                vol_tag,
+                block_idx,
+                owner_ino,
+                block_index,
+            } => ManagerCall::MarkShared {
+                vol_tag,
+                block_idx,
+                owner_ino,
+                block_index,
+            },
+            ArbCall::ShareBlock {
+                vol_tag,
+                block_idx,
+                refs,
+            } => ManagerCall::ShareBlock {
+                vol_tag,
+                block_idx,
+                refs,
+            },
+            ArbCall::ReleaseShared {
+                vol_tag,
+                block_idx,
+                owner_ino,
+            } => ManagerCall::ReleaseShared {
+                vol_tag,
+                block_idx,
+                owner_ino,
+            },
         }
     }
 }
@@ -399,6 +452,19 @@ enum ArbReply {
     Unleased {
         g: u32,
     },
+    // PR 7
+    Marked {
+        already: bool,
+    },
+    SharedGone,
+    Shared {
+        inserted: u32,
+        already: u32,
+    },
+    SharedReleased {
+        shared: bool,
+        remaining: u32,
+    },
 }
 
 impl From<ArbReply> for ManagerReply {
@@ -439,6 +505,12 @@ impl From<ArbReply> for ManagerReply {
             ArbReply::Returned { cleared, already } => ManagerReply::Returned { cleared, already },
             ArbReply::Refused { reason } => ManagerReply::Refused { reason },
             ArbReply::Deferred { reason } => ManagerReply::Deferred { reason },
+            ArbReply::Marked { already } => ManagerReply::Marked { already },
+            ArbReply::SharedGone => ManagerReply::SharedGone,
+            ArbReply::Shared { inserted, already } => ManagerReply::Shared { inserted, already },
+            ArbReply::SharedReleased { shared, remaining } => {
+                ManagerReply::SharedReleased { shared, remaining }
+            }
         }
     }
 }

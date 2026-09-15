@@ -1400,6 +1400,32 @@ fn arb_manager_call() -> impl Strategy<Value = ManagerCall> {
                 }
             ),
         any::<u16>().prop_map(|slot| ManagerCall::ResolveSlot { slot }),
+        // PR 7's clone-protocol verbs.
+        (any::<u64>(), any::<u64>(), any::<u64>(), any::<u32>()).prop_map(
+            |(vol_tag, block_idx, owner_ino, block_index)| ManagerCall::MarkShared {
+                vol_tag,
+                block_idx,
+                owner_ino,
+                block_index,
+            }
+        ),
+        (
+            any::<u64>(),
+            any::<u64>(),
+            prop::collection::vec((any::<u64>(), any::<u32>()), 0..6),
+        )
+            .prop_map(|(vol_tag, block_idx, refs)| ManagerCall::ShareBlock {
+                vol_tag,
+                block_idx,
+                refs,
+            }),
+        (any::<u64>(), any::<u64>(), prop::option::of(any::<u64>())).prop_map(
+            |(vol_tag, block_idx, owner_ino)| ManagerCall::ReleaseShared {
+                vol_tag,
+                block_idx,
+                owner_ino,
+            }
+        ),
     ]
 }
 
@@ -1462,6 +1488,13 @@ fn arb_manager_reply() -> impl Strategy<Value = ManagerReply> {
             .prop_map(|(appender_id, g)| ManagerReply::Holder { appender_id, g }),
         any::<u32>().prop_map(|g| ManagerReply::Unleased { g }),
         "[ -~]{0,64}".prop_map(|reason| ManagerReply::Deferred { reason }),
+        // PR 7's replies.
+        any::<bool>().prop_map(|already| ManagerReply::Marked { already }),
+        Just(ManagerReply::SharedGone),
+        (any::<u32>(), any::<u32>())
+            .prop_map(|(inserted, already)| ManagerReply::Shared { inserted, already }),
+        (any::<bool>(), any::<u32>())
+            .prop_map(|(shared, remaining)| ManagerReply::SharedReleased { shared, remaining }),
     ]
 }
 

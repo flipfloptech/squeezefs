@@ -1181,6 +1181,63 @@ async fn a_served_step_never_parks_behind_the_initiators_guards_even_on_a_stripe
     fsck_clean(&uris).await;
 }
 
+/// The ancestor check reads WITHOUT 4a guards (review round 1, Issue 2):
+/// its links are confirmed under the set-wide `dir_rename` lease — the
+/// lease is what makes the chain consistent — never under a `D{}` guard,
+/// because the walk runs while the initiator HOLDS its own exclusive
+/// `D{}` guards and a stripe collision would park the initiator behind
+/// itself, holding the lease, wedging every directory rename in the set.
+/// The collision is forced by NAME: the moved directory's `D{mine,sub}`
+/// (held exclusive by the initiator) shares a dentry stripe with the
+/// target's ancestor link `D{root,shared0}` the walk confirms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_directory_rename_whose_ancestor_link_collides_with_its_own_guard_stripe_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    let mine = routed
+        .create(ROOT_INO, "mine", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let dlm = routed.volumes[0].dlm();
+    let (_, local_mine) = routed.route_ino(mine);
+    let (_, local_root) = routed.route_ino(ROOT_INO);
+    let sub = (0u64..)
+        .map(|i| format!("sub{i}"))
+        .find(|n| dlm.dentry_stripe(local_mine, n) == dlm.dentry_stripe(local_root, "shared0"))
+        .expect("a colliding name exists below the stripe width");
+    routed
+        .create(mine, &sub, libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap();
+    let before = cross_owner_stats();
+    let renamed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        routed.rename(mine, &sub, shared, "moved", 0),
+    )
+    .await
+    .expect("the ancestor walk takes no guard the initiator holds — the rename completes");
+    renamed.unwrap();
+    assert_eq!(names_in(&routed, shared).await, vec!["moved".to_string()]);
+    let after = cross_owner_stats();
+    assert_eq!(
+        after.dir_rename_lock_acquires - before.dir_rename_lock_acquires,
+        1
+    );
+    assert!(
+        after.dir_rename_lock_wait_ns_sum - before.dir_rename_lock_wait_ns_sum < 5_000_000_000,
+        "the lock wait is bounded (uncontended: one control entry + barrier)"
+    );
+    assert_closed("ancestor collision");
+    holders.tear_down();
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
 /// The wire half of the travelling guard: a REMOTE initiator's
 /// `XvGuards` parks the named 4a guards at the holder under its scope
 /// (a local acquirer of the same key waits), the steps it ships under

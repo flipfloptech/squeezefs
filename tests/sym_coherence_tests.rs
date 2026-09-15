@@ -436,8 +436,8 @@ async fn frame_v1_stays_byte_identical_and_the_two_versions_are_foreign_to_each_
 
 use squeezefs::cluster_wire as cw;
 use squeezefs::meta_backend::kv::backend::{
-    test_conveyor_hold_release, KvMetaBackend, TEST_CONVEYOR_HOLD_PRE_DRAIN,
-    TEST_CONVEYOR_HOLD_STAGE,
+    test_conveyor_hold_parked, test_conveyor_hold_release, KvMetaBackend,
+    TEST_CONVEYOR_HOLD_PRE_DRAIN, TEST_CONVEYOR_HOLD_PRE_ROLLBACK, TEST_CONVEYOR_HOLD_STAGE,
 };
 use squeezefs::meta_backend::kv::builder::{format_v3_stamped, FormatV3Options};
 use squeezefs::meta_backend::kv::slot_lease::SYMMETRIC_META_ENV;
@@ -1707,6 +1707,108 @@ async fn a_grant_on_a_slot_another_appender_leases_is_answered_not_holder() {
     assert_eq!(holder.stats().grants_served, 1);
     plane.stop().await;
     mgr.shutdown();
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
+/// **A failed window's rollback recalls the readers holding its records**
+/// (review round 1, Issue 14). Grants re-open at the pass's settle (stage
+/// A, the RAM apply); the journal write lands in stage B. Schedule: the
+/// reader holds the root's dentry set; a create on the root recalls it,
+/// applies, settles; the window's write FAILS (a sector fault at the ring
+/// head) and the durability lane is held BEFORE its rollback — inside the
+/// hold the reader re-fetches the root and sees the name the failed
+/// window applied. The rollback then removes the records: it must recall
+/// the undo keys' objects through the same plane FIRST, so the reader's
+/// next resolve misses, re-fetches, and finds the rolled-back name GONE —
+/// never a phantom record the writer's own clients never saw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_windows_rollback_recalls_the_readers_holding_its_records() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let vol = Arc::clone(&writer.volumes[0]);
+    let (host, endpoint) = holder_listener(&vol);
+    let holder = vol.token_holder().unwrap().clone();
+    Metadata::create(writer.as_ref(), 1, "pre", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-rb").await;
+    assert!(plane.install_data_sink(ProbeSink::new(false)));
+    assert!(Metadata::lookup(reader.as_ref(), 1, "never_landed")
+        .await
+        .is_err());
+    assert!(plane.holds(1), "the root's dentry set is cached");
+
+    // The next window's write fails; the lane parks before its rollback.
+    let ring0 = vol.journal_ring();
+    let head = ring0.core().head();
+    squeezefs::uring_fs::arm_sector_write_error(ring0.physical_offset_of(head));
+    let parked0 = test_conveyor_hold_parked();
+    TEST_CONVEYOR_HOLD_STAGE.store(TEST_CONVEYOR_HOLD_PRE_ROLLBACK, Ordering::SeqCst);
+    let w = Arc::clone(&writer);
+    let create = tokio::spawn(async move {
+        Metadata::create(w.as_ref(), 1, "never_landed", libc::S_IFREG | 0o644, 0, 0).await
+    });
+    wait_until("the lane parked before the rollback", || {
+        test_conveyor_hold_parked() > parked0
+    })
+    .await;
+    // Inside the hold: the pass recalled the root (1) and settled — the
+    // reader's re-fetch serves the RAM apply, "never_landed" included.
+    assert_eq!(holder.stats().recalls, 1);
+    let phantom = Metadata::lookup(reader.as_ref(), 1, "never_landed").await;
+    assert!(
+        phantom.is_ok(),
+        "the applied-but-unwritten name is what RAM serves inside the window"
+    );
+    assert!(plane.holds(1));
+
+    TEST_CONVEYOR_HOLD_STAGE.store(0, Ordering::SeqCst);
+    test_conveyor_hold_release();
+    let failed = create.await.unwrap();
+    squeezefs::uring_fs::clear_faults();
+    assert!(failed.is_err(), "the armed ring-head fault fails the write");
+    // The rollback recalled the root's token before it removed the
+    // records: the reader's next resolve re-fetches and the name is gone.
+    wait_until("the rollback's recall reached the reader", || {
+        holder.stats().recalls >= 2
+    })
+    .await;
+    assert!(
+        Metadata::lookup(reader.as_ref(), 1, "never_landed")
+            .await
+            .is_err(),
+        "no reader holds a rolled-back record"
+    );
+    assert!(
+        Metadata::lookup(reader.as_ref(), 1, "pre").await.is_ok(),
+        "the survivors are served"
+    );
+    // Root at the pass; root AND the phantom child's own token (the
+    // in-window lookup took it) at the rollback — every one acked.
+    assert_eq!(holder.stats().recalls, 3);
+    assert_eq!(
+        holder.stats().recall_acks,
+        holder.stats().recalls,
+        "every recall was acked"
+    );
+    // The volume keeps working after the isolated failure.
+    Metadata::create(
+        writer.as_ref(),
+        1,
+        "after_fault",
+        libc::S_IFREG | 0o644,
+        0,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(Metadata::lookup(reader.as_ref(), 1, "after_fault")
+        .await
+        .is_ok());
+    plane.stop().await;
     host.shutdown();
     shutdown(&writer).await;
 }

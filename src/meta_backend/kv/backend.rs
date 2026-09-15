@@ -18636,7 +18636,37 @@ impl KvMetaBackend {
     /// and one key lives in one ring (KD-SYM-4); in the manager's ring it
     /// would be the `Lease` violation the next mount refuses on (review
     /// round 1, Issue 3). On a flat volume this is the one ring there is.
+    ///
+    /// **Under READ TOKENS** (PR 5, review round 1 Issue 14): grants on
+    /// the window's objects re-opened at the pass's settle (stage A) and
+    /// a reader may since hold the very records this removes — so the
+    /// undo keys' objects are RECALLED through the same plane FIRST and
+    /// settled after the removal (the gate holds them in flight between:
+    /// a grant parks and is served the rolled-back state), exactly the
+    /// commit path's hook run for the compensation. Nothing on an
+    /// unarmed mount: one `OnceLock` probe.
     async fn rollback_failed_tx(&self, span: SeqSpan, undo: &[UndoKey], ring: &JournalRing) {
+        let recalled = match self.token_holder() {
+            Some(plane) => {
+                let forest = self.forest().is_some();
+                let objects = crate::meta_ship::token_plane::union_objects(
+                    undo.iter()
+                        .filter_map(|u| record_object_ino(u.tree_id, &u.key, forest)),
+                );
+                plane.recall_and_wait(&objects).await
+            }
+            None => Vec::new(),
+        };
+        self.rollback_failed_records(span, undo, ring).await;
+        if !recalled.is_empty() {
+            if let Some(plane) = self.token_holder() {
+                plane.settle(&recalled);
+            }
+        }
+    }
+
+    /// [`Self::rollback_failed_tx`]'s two phases.
+    async fn rollback_failed_records(&self, span: SeqSpan, undo: &[UndoKey], ring: &JournalRing) {
         // Phase 1: removal under re-acquired ascending locks.
         let mut comp: Vec<(u8, Vec<u8>, RecordKind, Bytes)> = Vec::new();
         for attempt in 0..COMMIT_RETRY_BUDGET {

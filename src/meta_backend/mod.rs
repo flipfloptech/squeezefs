@@ -1925,14 +1925,62 @@ impl RoutedMetaBackend {
         vol.routing_slot_of_forest(forest).ok().map(u64::from)
     }
 
+    /// **Gather mode's mint arm** (design-symmetric-metadata §5.7.5,
+    /// KD-SYM-17; symmetric PR 7): on an ARMED volume, a child of a
+    /// directory that carries [`crate::GATHER_XATTR`] mints into the
+    /// DIRECTORY's slot — from that slot's cursor, whatever the affinity
+    /// ceiling says — so its inode lives beside the directory's entries
+    /// and a `stat` of it needs no per-child token. `None` (the ordinary
+    /// policy decides) when the parent is on another volume, in the
+    /// native slot (control records and `/`'s dentries only — §5.1.2's
+    /// exclusion holds here too), or carries no opt-in. NEVER automatic:
+    /// the opt-in is the operator's `setfattr`, read by one node-cache
+    /// probe of the parent's xattrs per create on an armed volume and
+    /// nowhere else. The holder is this mount when it leases the slot;
+    /// an unleased slot is acquired first-touch by the commit door, and a
+    /// slot another appender leases refuses there (`SlotBusy` — the
+    /// "ship to the holder" class PR 6/12 own), exactly as the parent's
+    /// own dentry record does for every create into that directory.
+    async fn gather_mint_slot(&self, volume_idx: usize, parent: Ino) -> Option<u64> {
+        let (pv, local_parent) = self.route_ino(parent);
+        if pv != volume_idx {
+            return None;
+        }
+        let parent_slot = kv::record::forest_slot_of_ino(local_parent);
+        if parent_slot == kv::record::NATIVE_FOREST_SLOT {
+            return None;
+        }
+        let vol = self.volumes.get(volume_idx)?;
+        let opted_in = vol
+            .getxattr(local_parent, crate::GATHER_XATTR)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|v| crate::gather_xattr_opts_in(&v));
+        if !opted_in {
+            return None;
+        }
+        let routing = vol.routing_slot_of_forest(parent_slot).ok()?;
+        if let Some(plane) = vol.slot_leases() {
+            plane
+                .dir_gather_mints
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some(u64::from(routing))
+    }
+
     /// [`Self::pick_mint_slot`] for a child of `parent` — the create
-    /// path's face: on an armed volume the bounded parent-slot affinity
+    /// path's face: on an armed volume the gather arm first
+    /// ([`Self::gather_mint_slot`]), then the bounded parent-slot affinity
     /// policy with its overflow arm (one more rotor slot from the
     /// manager, up to `2 × M`); everywhere else the shared rotor verbatim.
     pub async fn pick_mint_slot_for(&self, volume_idx: usize, parent: Ino) -> u64 {
         if self.routing_width > 1 {
             if let Some(vol) = self.volumes.get(volume_idx) {
                 if vol.slot_lease_armed() {
+                    if let Some(slot) = self.gather_mint_slot(volume_idx, parent).await {
+                        return slot;
+                    }
                     let parent_slot = self.lease_parent_slot(volume_idx, Some(parent));
                     if let Some(choice) = vol.lease_mint_choice(parent_slot) {
                         if choice == crate::slot_lease_core::MintChoice::Overflow {

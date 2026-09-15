@@ -15,206 +15,66 @@
 mod common;
 
 use common::sym::{
-    format_stamped_member, ino_in_slot, open_under, shutdown, slot_of_global, Knobs, SEAM,
+    data_file, format_stamped_member, ino_in_slot, mount_data, open_under, shutdown,
+    slot_of_global, DataRig, Knobs, DATA_VOL, SEAM,
 };
-use squeezefs::block_allocator::BlockAllocator;
-use squeezefs::cache::TieredCache;
-use squeezefs::dlm::DlmClient;
 use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
 use squeezefs::meta_backend::kv::record::ForestSlot;
 use squeezefs::meta_backend::kv::shared_refs::{
     self, MarkOutcome, SharedIndexDrift, BLOCK_REF_PROBES, MARK_SHARED_CALLS, RELEASE_SHARED_CALLS,
     SHARE_BLOCK_CALLS,
 };
-use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
-use squeezefs::nvme_dev::NvmeBlockDev;
-use squeezefs::routing::{BlockMapOp, DataRouter, LayoutFlip};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tempfile::{tempdir, NamedTempFile, TempDir};
+use tempfile::tempdir;
 
-const DATA_LEN: u64 = 2 * 1024 * 1024 * 1024;
-const DATA_VOL: &str = "vol-00000000000000b3";
-
-/// One armed rig: a stamped meta volume opened through the routed set
-/// (the derived width — guest slots are real), a file-backed data volume,
-/// the router that binds them with the PR-7 arm run.
-struct Rig {
-    router: DataRouter,
-    alloc: Arc<BlockAllocator>,
-    routed: Arc<RoutedMetaBackend>,
-    _staging: TempDir,
-}
-
-fn data_file() -> NamedTempFile {
-    let f = NamedTempFile::new().unwrap();
-    std::fs::File::create(f.path())
-        .unwrap()
-        .set_len(DATA_LEN)
-        .unwrap();
-    f
-}
+type Rig = DataRig;
 
 async fn mount(uris: &[String], data: &std::path::Path, knobs: &Knobs) -> Rig {
-    let routed = open_under(uris, knobs).await;
-    let dlm = DlmClient::new().unwrap();
-    let nvme = Arc::new(NvmeBlockDev::new(data.to_str().unwrap()));
-    let alloc = Arc::new(BlockAllocator::new(DATA_VOL).await.unwrap());
-    alloc.set_capacity_bytes(DATA_LEN);
-    let staging = tempdir().unwrap();
-    let cache = TieredCache::new(
-        vec![staging.path().to_path_buf()],
-        Some("64MB"),
-        Some("64MB"),
-        Some("16MB"),
-        Some("32MB"),
-        alloc.clone(),
-        nvme.clone(),
-        None,
-    )
-    .await
-    .unwrap();
-    let router = DataRouter::new(dlm, cache, alloc.clone(), nvme);
-    router.set_meta_backend(routed.clone());
-    router.arm_shared_refs().await.expect("arm shared refs");
-    Rig {
-        router,
-        alloc,
-        routed,
-        _staging: staging,
-    }
+    mount_data(uris, data, knobs).await
 }
 
-impl Rig {
-    fn vol(&self) -> &Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend> {
-        &self.routed.volumes[0]
-    }
+/// The SHARED bit on `ino`'s reference to `offset` at `block_index`
+/// (`None` = no record).
+async fn flag(rig: &Rig, ino: u64, offset: u64, block_index: u32) -> Option<bool> {
+    let (_v, local) = rig.routed.route_ino(ino);
+    rig.vol()
+        .block_ref_flags(&BlockRef {
+            vol_tag: rig.tag(),
+            block_idx: offset / rig.alloc.chunk_size(),
+            owner_ino: local,
+            block_index,
+        })
+        .await
+        .unwrap()
+}
 
-    fn tag(&self) -> u64 {
-        volume_tag(DATA_VOL)
-    }
+/// The index home's entries for `offset` — GLOBAL owner inos.
+async fn index_owners(rig: &Rig, offset: u64) -> Vec<u64> {
+    let mut v: Vec<u64> = rig
+        .vol()
+        .shared_index_population(rig.tag(), offset / rig.alloc.chunk_size())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.owner_ino)
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
 
-    async fn mk_file(&self, name: &str) -> u64 {
-        self.routed
-            .create(1, name, libc::S_IFREG | 0o644, 1000, 1000)
-            .await
-            .expect("create")
-            .ino
-    }
+async fn probe(rig: &Rig, offset: u64, slot: Option<ForestSlot>) -> usize {
+    rig.vol()
+        .block_ref_probe(rig.tag(), offset / rig.alloc.chunk_size(), slot)
+        .await
+        .unwrap()
+}
 
-    /// A file whose forest slot differs from `not`'s (the rotor spreads
-    /// children of `/` over 64 slots; two creates land apart, but the
-    /// contract states it rather than presumes it).
-    async fn mk_file_apart(&self, prefix: &str, not: ForestSlot) -> u64 {
-        for i in 0..70 {
-            let ino = self.mk_file(&format!("{prefix}{i}")).await;
-            if slot_of_global(&self.routed, ino) != not {
-                return ino;
-            }
-        }
-        panic!("the rotor never left slot {not}");
-    }
-
-    fn token(&self, ino: u64) -> u64 {
-        self.router.dlm.get_fencing_token_ino(ino)
-    }
-
-    /// Allocate a real block and bind it at `block_index` of `ino`
-    /// through the shared merge primitive (the one place a striped map
-    /// changes — where the accounting is computed).
-    async fn publish_block(&self, ino: u64, block_index: u32) -> u64 {
-        let offset = self.alloc.allocate_block().await.expect("allocate");
-        self.alloc.publish_block(offset);
-        let key = offset.to_string();
-        let displaced = self
-            .router
-            .merge_block_mappings(
-                ino,
-                BlockMapOp::Merge(&[(block_index, key)]),
-                (block_index as u64 + 1) * 4 * 1024 * 1024,
-                LayoutFlip::ToStripedKeepStagedIdentity,
-                self.token(ino),
-            )
-            .await
-            .expect("merge published block");
-        // The primitive hands the displaced keys back; the caller frees
-        // them after the guard drops (the write path's own discipline) —
-        // the release that rides `free_block_verdict`'s shared gate.
-        for k in displaced {
-            self.router
-                .backend_router
-                .free_block(&k)
-                .await
-                .expect("free displaced");
-        }
-        offset
-    }
-
-    async fn clone(&self, src: u64, dst: u64) -> squeezefs::error::Result<()> {
-        self.router
-            .clone_file(
-                &squeezefs::keys::inode_path(src),
-                &squeezefs::keys::inode_path(dst),
-                Some(self.token(src)),
-                Some(self.token(dst)),
-            )
-            .await
-    }
-
-    /// The SHARED bit on `ino`'s reference to `offset` at `block_index`
-    /// (`None` = no record).
-    async fn flag(&self, ino: u64, offset: u64, block_index: u32) -> Option<bool> {
-        let (_v, local) = self.routed.route_ino(ino);
-        self.vol()
-            .block_ref_flags(&BlockRef {
-                vol_tag: self.tag(),
-                block_idx: offset / self.alloc.chunk_size(),
-                owner_ino: local,
-                block_index,
-            })
-            .await
-            .unwrap()
-    }
-
-    /// The index home's entries for `offset` — GLOBAL owner inos.
-    async fn index_owners(&self, offset: u64) -> Vec<u64> {
-        let mut v: Vec<u64> = self
-            .vol()
-            .shared_index_population(self.tag(), offset / self.alloc.chunk_size())
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|r| r.owner_ino)
-            .collect();
-        v.sort_unstable();
-        v.dedup();
-        v
-    }
-
-    async fn probe(&self, offset: u64, slot: Option<ForestSlot>) -> usize {
-        self.vol()
-            .block_ref_probe(self.tag(), offset / self.alloc.chunk_size(), slot)
-            .await
-            .unwrap()
-    }
-
-    async fn drift(&self) -> Vec<(String, u64, u32, u32)> {
-        self.router
-            .backend_router
-            .verify_durable_block_refs(&self.routed)
-            .await
-            .expect("C8 oracle")
-    }
-
-    async fn c16(&self) -> Vec<SharedIndexDrift> {
-        shared_refs::shared_index_drift(&self.routed, self.tag())
-            .await
-            .unwrap()
-    }
-
-    async fn shutdown(self) {
-        shutdown(&self.routed).await;
-    }
+async fn c16(rig: &Rig) -> Vec<SharedIndexDrift> {
+    shared_refs::shared_index_drift(&rig.routed, rig.tag())
+        .await
+        .unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +100,7 @@ async fn a_clone_on_an_armed_forest_marks_the_source_shared_and_indexes_both_ino
     let dst_slot = slot_of_global(&rig.routed, dst);
     let offset = rig.publish_block(src, 0).await;
     assert_eq!(
-        rig.flag(src, offset, 0).await,
+        flag(&rig, src, offset, 0).await,
         Some(false),
         "a plain publish is unshared"
     );
@@ -254,16 +114,16 @@ async fn a_clone_on_an_armed_forest_marks_the_source_shared_and_indexes_both_ino
     rig.clone(src, dst).await.expect("clone");
 
     assert_eq!(
-        rig.flag(src, offset, 0).await,
+        flag(&rig, src, offset, 0).await,
         Some(true),
         "step 1: the source's bit"
     );
     assert_eq!(
-        rig.flag(dst, offset, 0).await,
+        flag(&rig, dst, offset, 0).await,
         Some(true),
         "step 3: the cloner's bit"
     );
-    assert_eq!(rig.index_owners(offset).await, {
+    assert_eq!(index_owners(&rig, offset).await, {
         let mut v = vec![src, dst];
         v.sort_unstable();
         v
@@ -275,18 +135,18 @@ async fn a_clone_on_an_armed_forest_marks_the_source_shared_and_indexes_both_ino
     assert_eq!(rig.alloc.shared_blocks(), 1);
     assert_eq!(rig.alloc.refcount(offset), Some(2), "the clone's pin");
     assert_eq!(
-        rig.probe(offset, Some(src_slot)).await,
+        probe(&rig, offset, Some(src_slot)).await,
         1,
         "one reference per slot tree"
     );
-    assert_eq!(rig.probe(offset, Some(dst_slot)).await, 1);
-    assert_eq!(rig.probe(offset, None).await, 2, "two on the volume");
+    assert_eq!(probe(&rig, offset, Some(dst_slot)).await, 1);
+    assert_eq!(probe(&rig, offset, None).await, 2, "two on the volume");
     assert!(MARK_SHARED_CALLS.load(Ordering::Relaxed) > marks);
     assert!(SHARE_BLOCK_CALLS.load(Ordering::Relaxed) > shares);
     assert!(BLOCK_REF_PROBES.load(Ordering::Relaxed) > probes);
     assert!(rig.drift().await.is_empty(), "C8: durable == derived");
     assert!(
-        rig.c16().await.is_empty(),
+        c16(&rig).await.is_empty(),
         "C16: a healthy clone drifts nothing"
     );
     // The W1 predicate: never in place on a shared block, whatever the
@@ -324,7 +184,7 @@ async fn a_clone_racing_a_truncate_never_frees_or_patches_a_shared_block() {
     let fresh = rig.publish_block(src, 0).await;
     assert_ne!(fresh, offset);
     assert_eq!(
-        rig.flag(src, offset, 0).await,
+        flag(&rig, src, offset, 0).await,
         None,
         "the source's reference is gone"
     );
@@ -346,7 +206,7 @@ async fn a_clone_racing_a_truncate_never_frees_or_patches_a_shared_block() {
         "the mark stands while the index names it"
     );
     assert_eq!(
-        rig.index_owners(offset).await,
+        index_owners(&rig, offset).await,
         vec![dst],
         "the source's entry was GC'd"
     );
@@ -356,9 +216,9 @@ async fn a_clone_racing_a_truncate_never_frees_or_patches_a_shared_block() {
         "count 1 with the mark set is not sole ownership"
     );
     rig.alloc.publish_block(offset);
-    assert_eq!(rig.probe(offset, None).await, 1);
+    assert_eq!(probe(&rig, offset, None).await, 1);
     assert!(rig.drift().await.is_empty());
-    assert!(rig.c16().await.is_empty());
+    assert!(c16(&rig).await.is_empty());
 
     // The clone's own release: the last entry goes, the home says Freed,
     // the ordinary terminal free runs, the mark is cleared.
@@ -366,10 +226,10 @@ async fn a_clone_racing_a_truncate_never_frees_or_patches_a_shared_block() {
     assert_ne!(fresh2, offset);
     assert!(rig.alloc.free_list_contains(idx) || rig.alloc.refcount(offset).is_none());
     assert!(!rig.alloc.is_shared(offset));
-    assert!(rig.index_owners(offset).await.is_empty());
+    assert!(index_owners(&rig, offset).await.is_empty());
     assert_eq!(rig.alloc.shared_blocks(), 0);
     assert!(rig.drift().await.is_empty());
-    assert!(rig.c16().await.is_empty());
+    assert!(c16(&rig).await.is_empty());
     rig.shutdown().await;
 }
 
@@ -389,12 +249,12 @@ async fn a_clone_of_a_clone_inherits_the_shared_bit() {
     let offset = rig.publish_block(a, 0).await;
     rig.clone(a, b).await.expect("clone a→b");
     rig.clone(b, c).await.expect("clone b→c");
-    assert_eq!(rig.flag(c, offset, 0).await, Some(true));
+    assert_eq!(flag(&rig, c, offset, 0).await, Some(true));
     let mut want = vec![a, b, c];
     want.sort_unstable();
-    assert_eq!(rig.index_owners(offset).await, want);
+    assert_eq!(index_owners(&rig, offset).await, want);
     assert_eq!(rig.alloc.refcount(offset), Some(3));
-    assert_eq!(rig.probe(offset, None).await, 3);
+    assert_eq!(probe(&rig, offset, None).await, 3);
     // Idempotent step 1: marking an already-marked reference writes nothing.
     let (_v, local_b) = rig.routed.route_ino(b);
     let out = rig
@@ -409,7 +269,7 @@ async fn a_clone_of_a_clone_inherits_the_shared_bit() {
         .unwrap();
     assert_eq!(out, MarkOutcome::Already);
     assert!(rig.drift().await.is_empty());
-    assert!(rig.c16().await.is_empty());
+    assert!(c16(&rig).await.is_empty());
     rig.shutdown().await;
 }
 
@@ -441,7 +301,7 @@ async fn a_cloner_dying_after_mark_shared_leaves_a_harmless_flag_c16_reports() {
         MarkOutcome::Marked
     );
     rig.alloc.mark_shared(offset);
-    let drift = rig.c16().await;
+    let drift = c16(&rig).await;
     assert_eq!(drift.len(), 1);
     assert!(matches!(drift[0], SharedIndexDrift::FlagWithoutEntry(x) if x.owner_ino == src));
     // The mark alone refuses the W1 patch at count 1.
@@ -454,7 +314,7 @@ async fn a_cloner_dying_after_mark_shared_leaves_a_harmless_flag_c16_reports() {
     let idx = offset / rig.alloc.chunk_size();
     assert!(rig.alloc.free_list_contains(idx) || rig.alloc.refcount(offset).is_none());
     assert!(!rig.alloc.is_shared(offset));
-    assert!(rig.c16().await.is_empty(), "the flag went with the record");
+    assert!(c16(&rig).await.is_empty(), "the flag went with the record");
     assert!(rig.drift().await.is_empty());
     rig.shutdown().await;
 }
@@ -510,7 +370,7 @@ async fn a_cloner_dying_after_share_block_is_reported_by_c16_and_gcd_at_the_rele
             .unwrap(),
         (0, 1)
     );
-    let drift = rig.c16().await;
+    let drift = c16(&rig).await;
     assert_eq!(drift.len(), 1, "{drift:?}");
     assert!(matches!(drift[0], SharedIndexDrift::EntryWithoutFlag(x) if x.owner_ino == ghost));
     // The source's release: its entry goes with the release, the ghost's
@@ -519,10 +379,10 @@ async fn a_cloner_dying_after_share_block_is_reported_by_c16_and_gcd_at_the_rele
     assert_ne!(fresh, offset);
     assert!(rig.alloc.free_list_contains(idx) || rig.alloc.refcount(offset).is_none());
     assert!(
-        rig.index_owners(offset).await.is_empty(),
+        index_owners(&rig, offset).await.is_empty(),
         "both entries gone"
     );
-    assert!(rig.c16().await.is_empty());
+    assert!(c16(&rig).await.is_empty());
     assert!(rig.drift().await.is_empty());
     rig.shutdown().await;
 }
@@ -589,12 +449,12 @@ async fn an_unarmed_mount_clones_plain_and_every_gauge_stays_zero() {
     let dst = rig.mk_file("dst").await;
     let offset = rig.publish_block(src, 0).await;
     rig.clone(src, dst).await.expect("clone");
-    assert_eq!(rig.flag(src, offset, 0).await, Some(false));
-    assert_eq!(rig.flag(dst, offset, 0).await, Some(false));
+    assert_eq!(flag(&rig, src, offset, 0).await, Some(false));
+    assert_eq!(flag(&rig, dst, offset, 0).await, Some(false));
     assert!(!rig.alloc.is_shared(offset));
     assert_eq!(rig.alloc.shared_blocks(), 0);
     assert_eq!(rig.alloc.refcount(offset), Some(2));
-    assert!(rig.index_owners(offset).await.is_empty());
+    assert!(index_owners(&rig, offset).await.is_empty());
     assert_eq!(MARK_SHARED_CALLS.load(Ordering::Relaxed), marks);
     assert_eq!(SHARE_BLOCK_CALLS.load(Ordering::Relaxed), shares);
     assert_eq!(RELEASE_SHARED_CALLS.load(Ordering::Relaxed), releases);
@@ -640,9 +500,9 @@ async fn the_shared_marks_are_seeded_from_the_index_at_the_arm() {
     assert_eq!(seeded, 2);
     assert!(!rig.alloc.begin_patch_sole_owner(offset));
     rig.alloc.publish_block(offset);
-    assert_eq!(rig.flag(src, offset, 0).await, Some(true));
+    assert_eq!(flag(&rig, src, offset, 0).await, Some(true));
     assert!(rig.drift().await.is_empty());
-    assert!(rig.c16().await.is_empty());
+    assert!(c16(&rig).await.is_empty());
     rig.shutdown().await;
 }
 
@@ -676,10 +536,10 @@ async fn the_one_slot_probe_agrees_with_the_derived_census_on_every_published_bl
         .unwrap();
     for offset in offsets {
         let idx = offset / rig.alloc.chunk_size();
-        let whole = rig.probe(offset, None).await;
+        let whole = probe(&rig, offset, None).await;
         let mut per_slot = 0usize;
         for (slot, _tree) in rig.vol().slot_trees() {
-            per_slot += rig.probe(offset, Some(slot)).await;
+            per_slot += probe(&rig, offset, Some(slot)).await;
         }
         assert_eq!(
             per_slot, whole,
@@ -692,7 +552,7 @@ async fn the_one_slot_probe_agrees_with_the_derived_census_on_every_published_bl
         );
     }
     assert!(rig.drift().await.is_empty());
-    assert!(rig.c16().await.is_empty());
+    assert!(c16(&rig).await.is_empty());
     rig.shutdown().await;
 }
 
@@ -757,7 +617,7 @@ async fn the_clone_verbs_ride_the_manager_wire() {
             .unwrap(),
         (2, 0)
     );
-    assert_eq!(rig.index_owners(offset).await.len(), 2);
+    assert_eq!(index_owners(&rig, offset).await.len(), 2);
     // The wire release of the ghost's entry: one remains (the source's).
     assert_eq!(
         client

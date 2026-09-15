@@ -13828,6 +13828,49 @@ impl SqueezefsFilesystem {
                     "meta_kv_leaf_lease_refusals".into(),
                     load(&meta_kv::META_KV_LEAF_LEASE_REFUSALS),
                 );
+                // PR 7 (design §5.4.3 / §5.4.4 / §5.7.5 / §11): the pack
+                // law's probe and the clone protocol. `dir_gather_mints`
+                // closes the mint law (`affinity + rotor + gather ≡
+                // mints`); `block_ref_probes` counts every on-demand
+                // refcount probe (one slot tree's range, or the index);
+                // `shared_blocks` is the RAM SHARED-mark population per
+                // data volume (seeded from the home's index at the arm);
+                // `share_block_calls` / `release_shared_calls` /
+                // `mark_shared_calls` are the protocol's executions;
+                // `pack_open_scopes` is the open packs' scope population
+                // (≤ leased slots being written on an armed set, ≤ 1 per
+                // data volume unarmed). Every one 0 on an unarmed mount.
+                metrics.insert("dir_gather_mints".into(), lease(&|s| s.dir_gather_mints));
+                metrics.insert(
+                    "block_ref_probes".into(),
+                    load(&meta_kv::shared_refs::BLOCK_REF_PROBES),
+                );
+                metrics.insert(
+                    "share_block_calls".into(),
+                    load(&meta_kv::shared_refs::SHARE_BLOCK_CALLS),
+                );
+                metrics.insert(
+                    "release_shared_calls".into(),
+                    load(&meta_kv::shared_refs::RELEASE_SHARED_CALLS),
+                );
+                metrics.insert(
+                    "mark_shared_calls".into(),
+                    load(&meta_kv::shared_refs::MARK_SHARED_CALLS),
+                );
+                {
+                    let mut shared: Vec<serde_json::Value> = Vec::new();
+                    for (_tag, alloc) in self.router.backend_router.durable_ref_volumes() {
+                        shared.push(serde_json::json!({
+                            "volume": alloc.volume_id(),
+                            "shared_blocks": alloc.shared_blocks(),
+                        }));
+                    }
+                    metrics.insert("shared_blocks".into(), serde_json::Value::Array(shared));
+                }
+                metrics.insert(
+                    "pack_open_scopes".into(),
+                    serde_json::json!(self.router.packer.open_scopes()),
+                );
                 // THE FENCING FAMILY (§5.8.1 / KD-SYM-18): the Reservation
                 // Report read SIZED BY REGCTL — per metadata AND data
                 // namespace this mount registered on: registrants the last

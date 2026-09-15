@@ -1102,6 +1102,29 @@ pub const OWNER_ASSIGN_MARKER_XATTR: &str = "owner_assign:intent";
 /// ino-1 xattr, which is what lets it outlive the bit-17 stamp.
 pub const SYM_UPGRADE_MARKER_XATTR: &str = "sym_upgrade:intent";
 
+/// **Gather mode's per-directory opt-in** (design-symmetric-metadata
+/// §5.7.5, KD-SYM-17; symmetric PR 7): `setfattr -n user.squeezefs.gather
+/// -v 1 <dir>` makes the directory's slot holder mint every child from
+/// ITS cursor, so the children's inodes live in the directory's slot tree
+/// and a `stat` needs no per-child token — the read-mostly directory's
+/// lever, NEVER automatic (for the checkpoint-directory shape it would
+/// route every creator's later publishes through one holder). The ONE
+/// user-settable name inside the reserved `user.squeezefs.` family
+/// (`xattr_name_allowed` admits it by name); read at every create on an
+/// ARMED forest volume (one node-cache probe in the parent's slot tree),
+/// nowhere else. Values follow the bool-knob law (`1/true/yes/on`).
+pub const GATHER_XATTR: &str = "user.squeezefs.gather";
+
+/// Does a `GATHER_XATTR` value opt the directory in? The env-knob
+/// boolean law's vocabulary, case-insensitive, whitespace-trimmed.
+pub fn gather_xattr_opts_in(value: &[u8]) -> bool {
+    let s = String::from_utf8_lossy(value);
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// The `mw_upgrade:` intent marker's content (§6.2 mechanism i): the
 /// TARGET bit set and the canonical volume list the crashed-or-running
 /// upgrade covers, so a resume can verify it is completing the SAME act

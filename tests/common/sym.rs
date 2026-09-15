@@ -159,3 +159,153 @@ pub async fn shutdown(routed: &RoutedMetaBackend) {
         v.shutdown().await.unwrap();
     }
 }
+
+// ---------------------------------------------------------------------------
+// The DATA rig: the routed set bound to a file-backed data volume through
+// a `DataRouter`, with PR 7's arm run (`arm_shared_refs`).
+// ---------------------------------------------------------------------------
+
+use squeezefs::block_allocator::BlockAllocator;
+use squeezefs::cache::TieredCache;
+use squeezefs::dlm::DlmClient;
+use squeezefs::nvme_dev::NvmeBlockDev;
+use squeezefs::routing::{BlockMapOp, DataRouter, LayoutFlip};
+use tempfile::{tempdir, NamedTempFile, TempDir};
+
+pub const DATA_LEN: u64 = 2 * 1024 * 1024 * 1024;
+pub const DATA_VOL: &str = "vol-00000000000000b3";
+
+pub struct DataRig {
+    pub router: DataRouter,
+    pub alloc: Arc<BlockAllocator>,
+    pub routed: Arc<RoutedMetaBackend>,
+    _staging: TempDir,
+}
+
+pub fn data_file() -> NamedTempFile {
+    let f = NamedTempFile::new().unwrap();
+    std::fs::File::create(f.path())
+        .unwrap()
+        .set_len(DATA_LEN)
+        .unwrap();
+    f
+}
+
+pub async fn mount_data(uris: &[String], data: &std::path::Path, knobs: &Knobs) -> DataRig {
+    let routed = open_under(uris, knobs).await;
+    let dlm = DlmClient::new().unwrap();
+    let nvme = Arc::new(NvmeBlockDev::new(data.to_str().unwrap()));
+    let alloc = Arc::new(BlockAllocator::new(DATA_VOL).await.unwrap());
+    alloc.set_capacity_bytes(DATA_LEN);
+    let staging = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![staging.path().to_path_buf()],
+        Some("64MB"),
+        Some("64MB"),
+        Some("16MB"),
+        Some("32MB"),
+        alloc.clone(),
+        nvme.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let router = DataRouter::new(dlm, cache, alloc.clone(), nvme);
+    router.set_meta_backend(routed.clone());
+    router.arm_shared_refs().await.expect("arm shared refs");
+    DataRig {
+        router,
+        alloc,
+        routed,
+        _staging: staging,
+    }
+}
+
+impl DataRig {
+    pub fn vol(&self) -> &Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend> {
+        &self.routed.volumes[0]
+    }
+
+    pub fn tag(&self) -> u64 {
+        squeezefs::meta_backend::kv::block_refs::volume_tag(DATA_VOL)
+    }
+
+    pub async fn mk_file(&self, name: &str) -> u64 {
+        use squeezefs::meta_backend::Metadata;
+        self.routed
+            .create(1, name, libc::S_IFREG | 0o644, 1000, 1000)
+            .await
+            .expect("create")
+            .ino
+    }
+
+    /// A file whose forest slot differs from `not`'s (the rotor spreads
+    /// children of `/` over 64 slots; two creates land apart, but the
+    /// contract states it rather than presumes it).
+    pub async fn mk_file_apart(&self, prefix: &str, not: ForestSlot) -> u64 {
+        for i in 0..70 {
+            let ino = self.mk_file(&format!("{prefix}{i}")).await;
+            if slot_of_global(&self.routed, ino) != not {
+                return ino;
+            }
+        }
+        panic!("the rotor never left slot {not}");
+    }
+
+    pub fn token(&self, ino: u64) -> u64 {
+        self.router.dlm.get_fencing_token_ino(ino)
+    }
+
+    /// Allocate a real block and bind it at `block_index` of `ino`
+    /// through the shared merge primitive (the one place a striped map
+    /// changes — where the accounting is computed); the displaced keys
+    /// the primitive hands back are freed after the guard drops (the
+    /// write path's own discipline).
+    pub async fn publish_block(&self, ino: u64, block_index: u32) -> u64 {
+        let offset = self.alloc.allocate_block().await.expect("allocate");
+        self.alloc.publish_block(offset);
+        let key = offset.to_string();
+        let displaced = self
+            .router
+            .merge_block_mappings(
+                ino,
+                BlockMapOp::Merge(&[(block_index, key)]),
+                (block_index as u64 + 1) * 4 * 1024 * 1024,
+                LayoutFlip::ToStripedKeepStagedIdentity,
+                self.token(ino),
+            )
+            .await
+            .expect("merge published block");
+        for k in displaced {
+            self.router
+                .backend_router
+                .free_block(&k)
+                .await
+                .expect("free displaced");
+        }
+        offset
+    }
+
+    pub async fn clone(&self, src: u64, dst: u64) -> squeezefs::error::Result<()> {
+        self.router
+            .clone_file(
+                &squeezefs::keys::inode_path(src),
+                &squeezefs::keys::inode_path(dst),
+                Some(self.token(src)),
+                Some(self.token(dst)),
+            )
+            .await
+    }
+
+    pub async fn drift(&self) -> Vec<(String, u64, u32, u32)> {
+        self.router
+            .backend_router
+            .verify_durable_block_refs(&self.routed)
+            .await
+            .expect("C8 oracle")
+    }
+
+    pub async fn shutdown(self) {
+        shutdown(&self.routed).await;
+    }
+}

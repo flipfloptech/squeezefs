@@ -307,6 +307,11 @@ pub struct SlotLeasePlane {
     pub resolve_rpcs: AtomicU64,
     pub affinity_mints: AtomicU64,
     pub rotor_mints: AtomicU64,
+    /// Gather-mode mints (design §5.7.5, PR 7): a child minted into its
+    /// parent's slot because the parent carries `user.squeezefs.gather` —
+    /// outside the affinity/rotor policy, so `affinity_mints + rotor_mints
+    /// + dir_gather_mints ≡ mints` is the closure law.
+    pub dir_gather_mints: AtomicU64,
     pub ceiling_spills: AtomicU64,
     pub ceiling_overflows: AtomicU64,
     pub region_releases: AtomicU64,
@@ -400,6 +405,7 @@ impl SlotLeasePlane {
             resolve_rpcs: AtomicU64::new(0),
             affinity_mints: AtomicU64::new(0),
             rotor_mints: AtomicU64::new(0),
+            dir_gather_mints: AtomicU64::new(0),
             ceiling_spills: AtomicU64::new(0),
             ceiling_overflows: AtomicU64::new(0),
             region_releases: AtomicU64::new(0),
@@ -594,6 +600,7 @@ impl SlotLeasePlane {
             a_max_bytes: self.a_max_bytes.load(Relaxed),
             affinity_mints: self.affinity_mints.load(Relaxed),
             rotor_mints: self.rotor_mints.load(Relaxed),
+            dir_gather_mints: self.dir_gather_mints.load(Relaxed),
             ceiling_spills: self.ceiling_spills.load(Relaxed),
             ceiling_overflows: self.ceiling_overflows.load(Relaxed),
             offer_n_floor: self.n_floor(),
@@ -852,6 +859,8 @@ pub struct SlotLeaseStats {
     pub a_max_bytes: u64,
     pub affinity_mints: u64,
     pub rotor_mints: u64,
+    /// Gather-mode mints (`dir_gather_mints`, PR 7).
+    pub dir_gather_mints: u64,
     pub ceiling_spills: u64,
     pub ceiling_overflows: u64,
     pub offer_n_floor: u64,

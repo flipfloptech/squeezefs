@@ -514,6 +514,12 @@ const PENDING_TIMES_DRAIN_CAP: u64 = 512;
 /// [`KvMetaBackend::removexattr_internal`], and the inherent
 /// `getxattr`/`listxattr`).
 pub fn xattr_name_allowed(name: &str) -> bool {
+    // Gather mode's opt-in (symmetric PR 7, design §5.7.5): the ONE
+    // user-settable name inside the reserved family — admitted by NAME,
+    // never by prefix, so nothing else under `user.squeezefs.` follows it.
+    if name == crate::GATHER_XATTR {
+        return true;
+    }
     if let Some(rest) = name.strip_prefix("user.") {
         // `user.squeezefs.` is the internal family (format config, the L4
         // bootstrap blob, future records); `user.squeezefsX` is not.

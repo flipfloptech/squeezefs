@@ -165,6 +165,18 @@ pub struct PackTenant {
     _inflight: InflightAllocGuard,
 }
 
+impl PackTenant {
+    /// The pack block's base key (the tenant mapping's prefix).
+    pub fn base_key(&self) -> &str {
+        &self.pack.base_key
+    }
+
+    /// The pack's scope (the tenant's slot on an armed set, `0` otherwise).
+    pub fn scope(&self) -> u32 {
+        self.pack.scope
+    }
+}
+
 /// What a refill answered its cohort: a pack is open (retry the
 /// reservation), a `StorageFull` refusal (the arm stops for the batch), or
 /// another allocation error.

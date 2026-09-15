@@ -1610,10 +1610,13 @@ async fn a_directory_rename_whose_ancestor_link_collides_with_its_own_guard_stri
 /// (a local acquirer of the same key waits), the steps it ships under
 /// that scope apply without taking a guard, `XvRelease` frees them
 /// (idempotent — `already` on a scope the holder no longer has), and a
-/// scope whose initiator died expires with its lease (the grace window,
-/// `xv_cross_owner_guard_expiries` — must-stay-0 on a healthy set).
+/// scope whose initiator is gone expires: with NO membership plane armed
+/// at the grace-window BELT (this leg — `xv_cross_owner_guard_expiries`,
+/// must-stay-0 on a healthy set); with one armed, by its LEASE (the next
+/// contract).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_remote_initiators_guards_park_at_the_holder_until_release_and_expire_with_its_lease() {
+async fn a_remote_initiators_guards_park_at_the_holder_until_release_and_expire_at_the_grace_belt()
+{
     use squeezefs::meta_backend::dlm::LockMode;
     use squeezefs::meta_ship::{MetaCall, MetaOp, MetaReply, PeerOwner};
     let dir = tempfile::tempdir().unwrap();
@@ -1747,6 +1750,90 @@ async fn a_remote_initiators_guards_park_at_the_holder_until_release_and_expire_
         2,
         "scopes 77 and 78"
     );
+    holders.tear_down();
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
+/// With the S6 membership authority ARMED in this process, a parked
+/// scope expires with its initiator's LEASE, never with the clock
+/// (review round 1, Issue 9): a live member's scope survives the grace
+/// window; the sweep after the owner EVICTS the member releases it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parked_scope_expires_with_its_initiators_membership_lease_when_a_plane_is_armed() {
+    use squeezefs::membership::{
+        self, JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole, MembershipOwner,
+    };
+    use squeezefs::meta_backend::dlm::LockMode;
+    use squeezefs::meta_ship::{MetaCall, MetaOp, MetaReply, PeerOwner};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    let endpoint = holders.host.endpoint().to_string();
+    // The plane: this process is the lease authority; "node-c" is a live
+    // member of it.
+    let ticks = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+    let clock = LeaseClock::manual(Arc::clone(&ticks));
+    let clocks = LeaseClocks::derive(std::time::Duration::from_micros(250)).unwrap();
+    let owner = MembershipOwner::arm("lease-owner", 3, 2, clocks, clock).unwrap();
+    membership::install_owner(Arc::clone(&owner));
+    let joined = owner.join(JoinRequest {
+        id: "node-c".to_string(),
+        role: MemberRole::Writer,
+        endpoint: None,
+        pid: std::process::id(),
+        boot: "boot-sym-test".to_string(),
+        prior_epoch: None,
+        pr_key: 0,
+        mount: None,
+    });
+    assert!(matches!(joined, JoinOutcome::Granted(_)), "{joined:?}");
+    let remote = MetaShipRouter::new(Arc::clone(&routed), "node-c", SECRET.to_vec());
+    let peer = Arc::new(PeerOwner::new("appender-1", &endpoint));
+    let (_, local_shared) = routed.route_ino(shared);
+    let dlm = routed.volumes[0].dlm();
+    let before = cross_owner_stats();
+    let op = MetaOp {
+        id: remote.next_request_id(),
+        call: MetaCall::XvGuards {
+            scope: 91,
+            inodes: vec![(shared, true)],
+            dentries: vec![],
+        },
+    };
+    let mut r = remote.ship_ops(&peer, vec![op]).await.unwrap();
+    assert!(matches!(r.pop().unwrap().outcome, Ok(MetaReply::Unit)));
+    // Past the grace window with the member LIVE: nothing expires.
+    TEST_XV_STUCK_AFTER_MS.store(1, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert_eq!(
+        crossvol_tx::sweep_expired_guards(),
+        0,
+        "a live member's scope survives the clock"
+    );
+    assert!(tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        dlm.lock_many(&[(local_shared, LockMode::Exclusive)], &[]),
+    )
+    .await
+    .is_err());
+    // The owner evicts the member: the next sweep releases its scope.
+    assert!(owner.evict("node-c", "the contract's death").is_some());
+    assert_eq!(crossvol_tx::sweep_expired_guards(), 1);
+    TEST_XV_STUCK_AFTER_MS.store(0, Ordering::SeqCst);
+    let local = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        dlm.lock_many(&[(local_shared, LockMode::Exclusive)], &[]),
+    )
+    .await
+    .expect("the lease's death frees the stripe");
+    drop(local);
+    membership::uninstall();
+    let after = cross_owner_stats();
+    assert_eq!(after.guard_expiries - before.guard_expiries, 1);
     holders.tear_down();
     shutdown(&routed).await;
     fsck_clean(&uris).await;

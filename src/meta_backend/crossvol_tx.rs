@@ -190,6 +190,16 @@ pub static TEST_XV_SERVE_REFUSE: AtomicBool = AtomicBool::new(false);
 /// initiator never released it EXPIRES (the same lease law).
 pub static TEST_XV_STUCK_AFTER_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Test seam (the served side): every shipped STEP is held this many ms
+/// at the holder before it applies — a live op that spans cadence passes
+/// (the review-round-1 Issue 4 shape).
+pub static TEST_XV_SERVE_HOLD_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Test seam (the cadence): a roll-forward pass parks this many ms between
+/// its scan and its recovery — the window in which another pass retires
+/// what it scanned.
+pub static TEST_XV_CADENCE_HOLD_AFTER_SCAN_MS: AtomicU64 = AtomicU64::new(0);
+
 /// Test seam: acquire an IN-PROCESS holder's guards over the wire (an
 /// `XvGuards` to its endpoint) instead of in the shared table's one
 /// canonical `lock_many` — the initiator's remote arm, exercised where
@@ -291,36 +301,121 @@ pub(crate) fn note_step_served() {
     XV_CO_STEPS_SERVED.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The open-intent register: `tx_id` → the instant this process first
-/// knew it open. Its population IS `xv_cross_owner_intents_open`; an
-/// entry older than the grace window with no holder serving its step is
-/// the STUCK class.
+/// How this process knows an open intent (review round 1, Issue 4 — the
+/// cadence adopts by STATE, never by elapsed time or a tick count).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntentState {
+    /// A live op of THIS process is executing it: its own, whatever its
+    /// wall — the cadence never touches it.
+    InFlight,
+    /// Left open by an op that returned (its holder unreachable, its
+    /// guards unacquirable) or found open at a scan with no live owner in
+    /// this process (a predecessor incarnation's): the cadence's to
+    /// complete; STUCK once older than the grace window.
+    Abandoned,
+}
+
+struct IntentEntry {
+    since: std::time::Instant,
+    state: IntentState,
+    /// Counted on `intents_minted` (once the record is durable).
+    counted: bool,
+}
+
+/// The open-intent register. Its population IS `xv_cross_owner_intents_open`;
+/// an ABANDONED entry older than the grace window is the STUCK class.
 static OPEN_INTENTS: once_cell::sync::Lazy<
-    parking_lot::Mutex<std::collections::HashMap<u64, std::time::Instant>>,
+    parking_lot::Mutex<std::collections::HashMap<u64, IntentEntry>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-/// Note an intent as open (minted here, or found at a scan). Idempotent:
-/// a known intent is not re-counted.
-fn note_intent_open(tx_id: u64) {
+/// A live op registers its intent BEFORE the record is durable, so a
+/// concurrent scan that sees the record always finds the owner; a failed
+/// `tx0` unregisters without a count.
+fn note_intent_in_flight(tx_id: u64) {
+    OPEN_INTENTS.lock().entry(tx_id).or_insert(IntentEntry {
+        since: std::time::Instant::now(),
+        state: IntentState::InFlight,
+        counted: false,
+    });
+}
+
+/// The record is durable: count the mint.
+fn note_intent_durable(tx_id: u64) {
     let mut open = OPEN_INTENTS.lock();
-    if let std::collections::hash_map::Entry::Vacant(v) = open.entry(tx_id) {
-        v.insert(std::time::Instant::now());
+    let e = open.entry(tx_id).or_insert(IntentEntry {
+        since: std::time::Instant::now(),
+        state: IntentState::InFlight,
+        counted: false,
+    });
+    if !e.counted {
+        e.counted = true;
         XV_CO_INTENTS_MINTED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The op left its intent open (its ship failed): the cadence's now; the
+/// stuck window counts from here.
+fn note_intent_abandoned(tx_id: u64) {
+    let mut open = OPEN_INTENTS.lock();
+    if let Some(e) = open.get_mut(&tx_id) {
+        e.state = IntentState::Abandoned;
+        e.since = std::time::Instant::now();
+    }
+}
+
+/// An intent found open at a scan with no live owner in this process
+/// (adopted at discovery — counted as minted here, so `minted ≡ retired +
+/// open` holds per process). Idempotent.
+fn note_intent_adopted(tx_id: u64) {
+    let mut open = OPEN_INTENTS.lock();
+    let e = open.entry(tx_id).or_insert(IntentEntry {
+        since: std::time::Instant::now(),
+        state: IntentState::Abandoned,
+        counted: false,
+    });
+    if !e.counted {
+        e.counted = true;
+        XV_CO_INTENTS_MINTED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Is `tx_id` a live op's own intent in this process?
+fn intent_in_flight(tx_id: u64) -> bool {
+    OPEN_INTENTS
+        .lock()
+        .get(&tx_id)
+        .is_some_and(|e| e.state == IntentState::InFlight)
+}
+
+/// Forget an intent whose record turned out retired (a stale scan met a
+/// completed transaction — no ghost survives).
+fn forget_intent(tx_id: u64) {
+    if let Some(e) = OPEN_INTENTS.lock().remove(&tx_id) {
+        if e.counted {
+            XV_CO_INTENTS_RETIRED.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
 /// Note an intent as retired.
 fn note_intent_retired(tx_id: u64) {
-    if OPEN_INTENTS.lock().remove(&tx_id).is_some() {
-        XV_CO_INTENTS_RETIRED.fetch_add(1, Ordering::Relaxed);
+    if let Some(e) = OPEN_INTENTS.lock().remove(&tx_id) {
+        if e.counted {
+            XV_CO_INTENTS_RETIRED.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
-/// The grace window after which an open cross-owner intent nobody serves
-/// is STUCK: the membership lease TTL (`CLIENT_STALE_TTL_SECS`) — a slot's
-/// dead holder is evicted and its slot recovered inside it (design §5.9),
-/// so an intent still open past it names a slot no live holder serves;
-/// the seam shortens it for the contracts.
+/// A `tx0` that never landed: unregister, uncounted.
+fn note_intent_never_durable(tx_id: u64) {
+    OPEN_INTENTS.lock().remove(&tx_id);
+}
+
+/// The grace window after which an ABANDONED cross-owner intent nobody
+/// serves is STUCK: the membership lease TTL (`CLIENT_STALE_TTL_SECS`) — a
+/// slot's dead holder is evicted and its slot recovered inside it (design
+/// §5.9), so an intent still open past it names a slot no live holder
+/// serves; the seam shortens it for the contracts.
 pub fn stuck_grace_ms() -> u64 {
     match TEST_XV_STUCK_AFTER_MS.load(Ordering::Relaxed) {
         0 => crate::fuse_client::CLIENT_STALE_TTL_SECS * 1000,
@@ -328,16 +423,25 @@ pub fn stuck_grace_ms() -> u64 {
     }
 }
 
-/// `(open, stuck)`: the register's population and how many of them are
-/// older than the grace window — one lock scope.
+/// `(open, stuck)`: the register's population and how many ABANDONED
+/// entries are older than the grace window — one lock scope. A live op's
+/// own intent is never stuck (its wall is the D1.b watchdog's).
 fn open_and_stuck_now() -> (u64, u64) {
     let grace = std::time::Duration::from_millis(stuck_grace_ms());
     let open = OPEN_INTENTS.lock();
     let stuck = open
         .values()
-        .filter(|since| since.elapsed() > grace)
+        .filter(|e| e.state == IntentState::Abandoned && e.since.elapsed() > grace)
         .count();
     (open.len() as u64, stuck as u64)
+}
+
+/// Does the register hold anything the cadence owns (an abandoned intent)?
+fn any_abandoned() -> bool {
+    OPEN_INTENTS
+        .lock()
+        .values()
+        .any(|e| e.state == IntentState::Abandoned)
 }
 
 /// One snapshot of the Cross-owner family.
@@ -1970,8 +2074,12 @@ pub async fn execute(
 
     let mut outcomes = Vec::with_capacity(localised.len());
     let mut foreign_refusal: Option<(usize, i32)> = None;
+    // Registered IN FLIGHT before the record exists: a cadence scan that
+    // sees the record always finds its live owner (Issue 4).
+    note_intent_in_flight(tx_id);
     if !step0_local {
         if allowed == 0 {
+            note_intent_never_durable(tx_id);
             return Err(seam_error());
         }
         // The intent alone: the initiator's half of this plan is nothing
@@ -1981,20 +2089,31 @@ pub async fn execute(
             .await;
         if out.is_err() {
             routed.mirror_volume_failure(coord);
+            note_intent_never_durable(tx_id);
         }
         out?;
         XV_TX_STARTED.fetch_add(1, Ordering::Relaxed);
-        note_intent_open(tx_id);
+        note_intent_durable(tx_id);
         phase_record(XvPhase::Plan, t_total);
         let t = std::time::Instant::now();
         if let Err(e) = barrier(routed, coord).await {
             escalate_midplan(routed, &localised, tx_id, 0, &e);
+            note_intent_abandoned(tx_id);
             return Err(e);
         }
         phase_record(XvPhase::IntentBarrier, t);
     }
     for (i, (v_idx, local)) in localised.iter().enumerate() {
         if i >= allowed {
+            // The severed plan models a dead process: a durable intent is
+            // a predecessor's at the next mount (abandoned here — the
+            // same process's reopen adopts it); one never written is
+            // nobody's.
+            if i == 0 && step0_local {
+                note_intent_never_durable(tx_id);
+            } else {
+                note_intent_abandoned(tx_id);
+            }
             return Err(seam_error());
         }
         let rider = (i == 0 && step0_local).then_some(&put);
@@ -2017,7 +2136,7 @@ pub async fn execute(
                     // intent exists", which is what makes
                     // `started == completed` the steady-state law.
                     XV_TX_STARTED.fetch_add(1, Ordering::Relaxed);
-                    note_intent_open(tx_id);
+                    note_intent_durable(tx_id);
                     phase_record(XvPhase::Plan, t_total);
                 }
                 // A LIVE witness refusal at a shipped step: the object
@@ -2043,6 +2162,7 @@ pub async fn execute(
                     // Step 0 and the intent are ONE entry: a failure here
                     // committed neither, so there is nothing to complete
                     // and nothing to escalate.
+                    note_intent_never_durable(tx_id);
                     return Err(e);
                 }
                 if armed && is_ship_failure(routed, *v_idx, local) {
@@ -2053,9 +2173,11 @@ pub async fn execute(
                         plan.op,
                         localised.len()
                     );
+                    note_intent_abandoned(tx_id);
                     return Err(e);
                 }
                 escalate_midplan(routed, &localised, tx_id, i, &e);
+                note_intent_abandoned(tx_id);
                 return Err(e);
             }
         }
@@ -2069,6 +2191,7 @@ pub async fn execute(
             let t = std::time::Instant::now();
             if let Err(e) = barrier(routed, *v_idx).await {
                 escalate_midplan(routed, &localised, tx_id, i, &e);
+                note_intent_abandoned(tx_id);
                 return Err(e);
             }
             phase_record(XvPhase::IntentBarrier, t);
@@ -2092,10 +2215,12 @@ pub async fn execute(
         }
         if let Err(e) = barrier(routed, v).await {
             escalate_midplan(routed, &localised, tx_id, localised.len(), &e);
+            note_intent_abandoned(tx_id);
             return Err(e);
         }
     }
     if allowed <= localised.len() {
+        note_intent_abandoned(tx_id);
         return Err(seam_error());
     }
     if let Some((at, errno)) = foreign_refusal {
@@ -2138,6 +2263,7 @@ async fn retire(
             "cross-volume transaction {tx_id:016x}: the retirement failed ({e}) — the intent \
              stays durable and the next roll-forward retires it"
         );
+        note_intent_abandoned(tx_id);
         return Err(e);
     }
     phase_record(XvPhase::Retire, t);
@@ -2300,38 +2426,33 @@ pub async fn recover_open_intents(routed: &RoutedMetaBackend) -> Result<usize> {
 }
 
 /// **The roll-forward cadence's body** (symmetric PR 6): re-scan the open
-/// intents and complete every one whose steps can be applied or shipped
-/// now — the S3.5 recovery over the shipped applier, run after the
-/// holders' endpoints are bound (an initiator's own crash residue at the
-/// next mount, a holder that was down while the op ran). Returns how many
-/// retired; an intent whose holder is still unreachable stays open and,
-/// past the grace window, counts on `xv_cross_owner_intents_stuck`.
+/// intents and complete every one this process does NOT have in flight —
+/// an intent an op of this process abandoned (its holder was down), or
+/// one found with no live owner here (a predecessor incarnation's) — the
+/// S3.5 recovery over the shipped applier, run after the holders'
+/// endpoints are bound. Adoption is by REGISTER STATE, never by elapsed
+/// time (review round 1, Issue 4): a live op's intent is its own however
+/// long it runs, and [`recover_one`] re-reads every intent under the
+/// guards it acquires, so a scan an intervening retirement outdated
+/// applies nothing. Returns how many retired; an intent whose holder is
+/// still unreachable stays open and, past the grace window, counts on
+/// `xv_cross_owner_intents_stuck`.
 pub async fn roll_forward_open_intents(routed: &RoutedMetaBackend) -> Result<usize> {
-    roll_forward_filtered(routed, |_| true)
-        .await
-        .map(|(n, _)| n)
-}
-
-/// [`roll_forward_open_intents`] over the open intents `aged` admits;
-/// answers `(retired, the tx ids seen open at this scan)` — the cadence's
-/// two-tick rule reads the second.
-async fn roll_forward_filtered(
-    routed: &RoutedMetaBackend,
-    aged: impl Fn(u64) -> bool,
-) -> Result<(usize, Vec<u64>)> {
     let open = scan_open(routed).await?;
-    let seen: Vec<u64> = open.iter().map(|o| o.rec.tx_id).collect();
+    let hold = TEST_XV_CADENCE_HOLD_AFTER_SCAN_MS.load(Ordering::Relaxed);
+    if hold > 0 {
+        squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(hold)).await;
+    }
     let mut rolled = 0usize;
     for o in open {
-        note_intent_open(o.rec.tx_id);
-        if !aged(o.rec.tx_id) {
+        if intent_in_flight(o.rec.tx_id) {
             continue;
         }
         if recover_one(routed, &o).await? {
             rolled += 1;
         }
     }
-    Ok((rolled, seen))
+    Ok(rolled)
 }
 
 /// **Ownership-scoped recovery** (per-volume claim admission §5.4 sweep
@@ -2399,13 +2520,17 @@ pub async fn recover_open_intents_scoped(
 
 /// Roll ONE intent forward. `Ok(true)` = retired; `Ok(false)` = a shipped
 /// step could not reach its holder and the intent stays open (armed
-/// plane); a LOCAL failure propagates as the mount refusal it always was.
+/// plane), or the record was gone under the guards (retired meanwhile —
+/// a no-op); a LOCAL failure propagates as the mount refusal it always
+/// was. The plan applied is the record as RE-READ under the acquired
+/// guards (Issue 4): the guards the scanned plan names are the record's
+/// (a retirement never changes a plan's keys), and a record that is gone
+/// applies nothing and leaves no register ghost.
 async fn recover_one(routed: &RoutedMetaBackend, o: &OpenIntent) -> Result<bool> {
-    let rec = &o.rec;
-    note_intent_open(rec.tx_id);
+    let scanned = &o.rec;
     let armed = routed.volumes[o.host].slot_lease_armed();
     let localised: Vec<(usize, XvLocalStep)> =
-        rec.steps.iter().map(|s| localise(routed, s)).collect();
+        scanned.steps.iter().map(|s| localise(routed, s)).collect();
     // A holder this mount cannot reach for the plan's guards (its endpoint
     // unbound — at the mount's own recovery every declared region is
     // still to be opened) is the same class as a step it cannot ship: the
@@ -2416,13 +2541,41 @@ async fn recover_one(routed: &RoutedMetaBackend, o: &OpenIntent) -> Result<bool>
             log::warn!(
                 "cross-owner transaction {:016x} ({:?}): its guards could not be acquired at a \
                  holder ({e}) — left open for the next roll-forward",
-                rec.tx_id,
-                rec.op
+                scanned.tx_id,
+                scanned.op
             );
+            note_intent_adopted(scanned.tx_id);
             return Ok(false);
         }
         Err(e) => return Err(e),
     };
+    // The record under the guards: gone ⇒ retired meanwhile, nothing to
+    // apply, no ghost; present ⇒ THIS image is the plan.
+    let Some(image) = routed.volumes[o.host]
+        .xv_read_intent(o.intent_ino, scanned.tx_id)
+        .await?
+    else {
+        forget_intent(scanned.tx_id);
+        return Ok(false);
+    };
+    let current = IntentRecord::decode(&image).map_err(|e| {
+        SqueezefsError::InvalidOperation(format!(
+            "cross-volume intent {:016x} does not decode under its guards ({e})",
+            scanned.tx_id
+        ))
+    })?;
+    if current.steps.len() != localised.len() {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "cross-volume intent {:016x} changed shape under its guards ({} → {} steps)",
+            scanned.tx_id,
+            localised.len(),
+            current.steps.len()
+        )));
+    }
+    let rec = &current;
+    let localised: Vec<(usize, XvLocalStep)> =
+        rec.steps.iter().map(|s| localise(routed, s)).collect();
+    note_intent_adopted(rec.tx_id);
 
     for (i, (v_idx, local)) in localised.iter().enumerate() {
         let out = match apply_or_ship_step(
@@ -2556,32 +2709,29 @@ pub fn status_code(status: XvStepStatus) -> u8 {
 }
 
 /// The roll-forward cadence (symmetric PR 6): an armed set's own single-
-/// flight task ticking at the checkpoint LANDING ceiling — an intent a
-/// live op left open (its holder down, its endpoint unbound at the mount's
-/// own recovery) is completed within a few ceilings of the holder
-/// returning, never only at the next mount. **Two-tick rule**: an intent
-/// is rolled forward only once it was seen open at two consecutive scans
-/// — a live op's own intent (registered at its `tx0`, retired within its
-/// ship's round trip) is never raced by its own cadence. Ends when the
-/// set is dropped.
+/// flight task ticking at the checkpoint LANDING ceiling — an intent an op
+/// of this process left open (its holder down, its endpoint unbound at
+/// the mount's own recovery) is completed within a few ceilings of the
+/// holder returning, never only at the next mount. The pass runs only
+/// while the register holds an ABANDONED intent (a quiet mount scans
+/// nothing) and adopts by register state alone — a live op's intent is
+/// never raced by its own cadence (review round 1, Issue 4: the earlier
+/// two-tick rule was a timer). Each tick also sweeps the parked guard
+/// scopes past the grace window. Ends when the set is dropped.
 pub fn spawn_roll_forward_cadence(routed: std::sync::Weak<RoutedMetaBackend>, tick_ms: u64) {
     crate::meta_exec::spawn_meta("xv_roll_forward_cadence", async move {
         let tick = std::time::Duration::from_millis(tick_ms.max(1));
-        let mut seen_last: Vec<u64> = Vec::new();
         loop {
             squeezefs_ipc::sqz_time::sleep(tick).await;
             let Some(routed) = routed.upgrade() else {
                 return;
             };
             sweep_expired_guards();
-            if OPEN_INTENTS.lock().is_empty() {
-                seen_last.clear();
+            if !any_abandoned() {
                 continue;
             }
-            let aged = seen_last.clone();
-            match roll_forward_filtered(&routed, |tx| aged.contains(&tx)).await {
-                Ok((_, seen)) => seen_last = seen,
-                Err(e) => log::warn!("cross-owner roll-forward cadence: {e}"),
+            if let Err(e) = roll_forward_open_intents(&routed).await {
+                log::warn!("cross-owner roll-forward cadence: {e}");
             }
         }
     });

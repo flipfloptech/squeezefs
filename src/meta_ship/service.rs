@@ -106,11 +106,13 @@ pub static TEST_INTENT_APPLY_ERRNO: std::sync::atomic::AtomicI32 =
 pub static TEST_INTENT_SUPPLY_CHUNK: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
-/// PR 6's misdelivery seam, consumed by the frame that served the step
-/// `TEST_XV_SERVE_MISDELIVER_ONCE` armed: its reply carries a wrong
-/// correlation id, which the client refuses exactly as it fails a dead
-/// session (the same-id resend follows).
-static XV_MISDELIVER_NEXT_REPLY: AtomicBool = AtomicBool::new(false);
+/// PR 6's misdelivery seam, PER REQUEST (review round 1, Issue 20): the
+/// op ids whose step `TEST_XV_SERVE_MISDELIVER_ONCE` armed — the frame
+/// carrying such an op replies with a wrong correlation id, which the
+/// client refuses exactly as it fails a dead session (the same-id resend
+/// follows); a concurrent frame's reply is never the one poisoned.
+static XV_MISDELIVER_OP_IDS: once_cell::sync::Lazy<parking_lot::Mutex<HashSet<u64>>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashSet::new()));
 
 squeezefs_ipc::sqz_task_local! {
     /// The shipping CLIENT whose verb is currently executing on this
@@ -736,6 +738,18 @@ impl MetaShipService {
                 };
             }
         };
+        // The seam's misdelivery: a reply the client cannot correlate —
+        // for the frame that carried the armed op, and no other.
+        let poisoned = {
+            let mut ids = XV_MISDELIVER_OP_IDS.lock();
+            let hit = results.iter().any(|r| ids.contains(&r.id));
+            if hit {
+                for r in &results {
+                    ids.remove(&r.id);
+                }
+            }
+            hit
+        };
         let t_encode = Instant::now();
         let body = match encode_reply(&MetaReplyFrame {
             schema: META_SHIP_SCHEMA,
@@ -746,12 +760,7 @@ impl MetaShipService {
             Err(e) => return self.refuse(req.id, STATUS_MALFORMED, format!("reply encode: {e}")),
         };
         super::owner_phase_record(OwnerPhase::ReplyEncode, t_encode);
-        // The seam's misdelivery: a reply the client cannot correlate.
-        let id = if XV_MISDELIVER_NEXT_REPLY.swap(false, Ordering::SeqCst) {
-            req.id ^ (1 << 63)
-        } else {
-            req.id
-        };
+        let id = if poisoned { req.id ^ (1 << 63) } else { req.id };
         RpcResponse {
             id,
             status: STATUS_OK,
@@ -937,6 +946,20 @@ impl MetaShipService {
                 self.intent_read_gate(*dir, client_id).await;
             }
             _ => {}
+        }
+        if matches!(call, MetaCall::XvStep { .. }) {
+            // PR 6's served-step seams: a HELD step (a live op spanning
+            // cadence passes) and the per-request misdelivery marker.
+            let hold =
+                crate::meta_backend::crossvol_tx::TEST_XV_SERVE_HOLD_MS.load(Ordering::Relaxed);
+            if hold > 0 {
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(hold)).await;
+            }
+            if crate::meta_backend::crossvol_tx::TEST_XV_SERVE_MISDELIVER_ONCE
+                .swap(false, Ordering::SeqCst)
+            {
+                XV_MISDELIVER_OP_IDS.lock().insert(id);
+            }
         }
         let t = Instant::now();
         let out = self.execute_inner(call, client_id).await;
@@ -1449,11 +1472,6 @@ impl MetaShipService {
                     .inner
                     .xv_serve_step(*tx_id, *step_idx, step, scope)
                     .await?;
-                if crate::meta_backend::crossvol_tx::TEST_XV_SERVE_MISDELIVER_ONCE
-                    .swap(false, Ordering::SeqCst)
-                {
-                    XV_MISDELIVER_NEXT_REPLY.store(true, Ordering::SeqCst);
-                }
                 Ok(MetaReply::XvStep {
                     status: crate::meta_backend::crossvol_tx::status_code(out.status),
                     inode: out.inode.map(|v| WireInode {

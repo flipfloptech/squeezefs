@@ -185,6 +185,18 @@ impl KvMetaBackend {
         Ok(())
     }
 
+    /// Re-read one intent's record image (`None` = retired) — the
+    /// roll-forward's read UNDER the guards it acquired (review round 1,
+    /// Issue 4): a plan is applied from the record as it stands then,
+    /// never from a scan an intervening retirement may have outdated.
+    pub async fn xv_read_intent(&self, intent_ino: Ino, tx_id: u64) -> Result<Option<Vec<u8>>> {
+        let key = crossvol_tx::intent_key_at(intent_ino, tx_id);
+        match self.lookup_kind(TREE_XATTRS, &key).await? {
+            Some(v) => Ok(Some(XattrValue::decode(&v)?.value)),
+            None => Ok(None),
+        }
+    }
+
     /// Destroy a freshly minted inode record nothing names (the live-
     /// refusal compensation of a `Create` whose insert the holder
     /// refused): the record alone — a fresh mint has no xattr, no layout,

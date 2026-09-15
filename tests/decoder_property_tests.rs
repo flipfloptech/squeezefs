@@ -2101,14 +2101,22 @@ use squeezefs::meta_ship::token_plane::{
 
 fn arb_token_call() -> impl Strategy<Value = TokenCall> {
     prop_oneof![
-        (any::<u64>(), any::<bool>(), any::<u64>()).prop_map(|(object, dentries, after)| {
-            TokenCall::Grant {
-                object,
-                mode: TokenMode::Read,
-                wants: TokenWants { dentries },
-                after,
-            }
-        }),
+        (
+            any::<u64>(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<u64>(),
+            prop::collection::vec(any::<u8>(), 0..64),
+        )
+            .prop_map(|(object, dentries, records, after, xattr_after)| {
+                TokenCall::Grant {
+                    object,
+                    mode: TokenMode::Read,
+                    wants: TokenWants { dentries, records },
+                    after,
+                    xattr_after,
+                }
+            }),
         any::<u32>().prop_map(|wait_ms| TokenCall::Recall { wait_ms }),
         any::<u64>().prop_map(|frame_id| TokenCall::RecallAck { frame_id }),
         prop::collection::vec(any::<u64>(), 0..32)
@@ -2172,12 +2180,17 @@ fn arb_token_reply() -> impl Strategy<Value = TokenReply> {
         0..8,
     );
     prop_oneof![
-        (arb_wire_attrs(), xattrs, dir, any::<bool>()).prop_map(|(attrs, xattrs, dir, already)| {
-            TokenReply::Granted {
-                records: TokenRecords { attrs, xattrs, dir },
+        (arb_wire_attrs(), xattrs, any::<bool>(), dir, any::<bool>()).prop_map(
+            |(attrs, xattrs, xattrs_complete, dir, already)| TokenReply::Granted {
+                records: TokenRecords {
+                    attrs,
+                    xattrs,
+                    xattrs_complete,
+                    dir,
+                },
                 already,
             }
-        }),
+        ),
         any::<u32>().prop_map(|holder| TokenReply::NotHolder { holder }),
         Just(TokenReply::Gone),
         (any::<u64>(), prop::collection::vec(any::<u64>(), 0..32))

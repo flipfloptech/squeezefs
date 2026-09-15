@@ -3104,36 +3104,64 @@ impl KvMetaBackend {
         Ok(plane)
     }
 
-    /// The holder's record read for a grant (§5.7.1 — the grant CARRIES
-    /// the records): the object's folded attrs, every user-visible xattr,
-    /// and — for a directory, when asked — one page of its dentry set
-    /// from `after` bounded by the frame budget, `complete` when the page
-    /// ended the set. `None` = no such object.
+    /// The holder's record read for ONE grant page (§5.7.1 — the grant
+    /// CARRIES the records): the object's folded attrs (every page — one
+    /// fixed word), a page of its user-visible xattrs by name from
+    /// `xattr_after` when `wants.records` (`xattrs_complete` when it
+    /// ended the set), and — for a directory, when asked, once the
+    /// xattrs are complete — one page of its dentry set from `after`,
+    /// `complete` when the page ended the set. ONE byte budget
+    /// ([`crate::meta_ship::token_plane::grant_dentry_budget`]) covers
+    /// the page's xattrs and dentries together, so a page always encodes
+    /// (review round 1, Issue 16: the first page carried every xattr
+    /// beside a full dentry page and an xattr-heavy directory failed the
+    /// encode for ever). `None` = no such object.
     pub(crate) async fn token_records_for(
         &self,
         object: Ino,
         wants: crate::meta_ship::token_plane::TokenWants,
         after: u64,
+        xattr_after: &[u8],
     ) -> std::result::Result<Option<crate::meta_ship::token_plane::TokenRecords>, KvError> {
         use crate::meta_ship::token_plane::{DirRecord, TokenRecords};
         let Some(mut v) = self.read_inode_value(object).await? else {
             return Ok(None);
         };
         self.fold_pending_times(object, &mut v);
+        let budget = crate::meta_ship::token_plane::grant_dentry_budget();
+        let mut used = 0usize;
         let mut xattrs = Vec::new();
-        for name in KvMetaBackend::listxattr(self, object).await? {
-            if !crate::meta_ship::token_plane::token_carried_xattr(&name) {
-                continue;
-            }
-            if let Some(value) = KvMetaBackend::getxattr(self, object, &name).await? {
+        let mut xattrs_complete = true;
+        if wants.records {
+            let mut names: Vec<String> = KvMetaBackend::listxattr(self, object)
+                .await?
+                .into_iter()
+                .filter(|n| crate::meta_ship::token_plane::token_carried_xattr(n))
+                .filter(|n| n.as_bytes() > xattr_after)
+                .collect();
+            names.sort_unstable();
+            for name in names {
+                let Some(value) = KvMetaBackend::getxattr(self, object, &name).await? else {
+                    continue;
+                };
+                let len = name.len() + value.len();
+                // One value (≤ the record cap) always fits an empty page.
+                if used + len > budget && !xattrs.is_empty() {
+                    xattrs_complete = false;
+                    break;
+                }
+                used += len;
                 xattrs.push((name.into_bytes(), value));
             }
         }
         let is_dir = (v.mode & libc::S_IFMT) == libc::S_IFDIR;
-        let dir = if wants.dentries && is_dir {
-            let budget = crate::meta_ship::token_plane::grant_dentry_budget();
+        let dir = if wants.dentries && is_dir && !xattrs_complete {
+            // The xattr pages first: the dentries follow once the set is
+            // complete (the reader resumes from `after` unchanged).
+            Some((Vec::new(), false))
+        } else if wants.dentries && is_dir {
             let mut entries: Vec<DirRecord> = Vec::new();
-            let mut bytes = 0usize;
+            let mut bytes = used;
             let mut cursor = after;
             let mut complete = true;
             'pages: loop {
@@ -3169,6 +3197,7 @@ impl KvMetaBackend {
         Ok(Some(TokenRecords {
             attrs: v.into(),
             xattrs,
+            xattrs_complete,
             dir,
         }))
     }
@@ -11315,7 +11344,7 @@ impl KvMetaBackend {
             let Some(serve) = tokens
                 .serve(
                     dir,
-                    crate::meta_ship::token_plane::TokenWants { dentries: true },
+                    crate::meta_ship::token_plane::TokenWants::with_dentries(),
                 )
                 .await?
             else {

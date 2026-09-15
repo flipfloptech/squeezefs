@@ -40,7 +40,9 @@ enum ArbCall {
     Grant {
         object: u64,
         dentries: bool,
+        records: bool,
         after: u64,
+        xattr_after: Vec<u8>,
     },
     Recall {
         wait_ms: u32,
@@ -59,12 +61,15 @@ impl ArbCall {
             ArbCall::Grant {
                 object,
                 dentries,
+                records,
                 after,
+                xattr_after,
             } => TokenCall::Grant {
                 object,
                 mode: TokenMode::Read,
-                wants: TokenWants { dentries },
+                wants: TokenWants { dentries, records },
                 after,
+                xattr_after: xattr_after.into_iter().take(256).collect(),
             },
             ArbCall::Recall { wait_ms } => TokenCall::Recall { wait_ms },
             ArbCall::RecallAck { frame_id } => TokenCall::RecallAck { frame_id },
@@ -102,6 +107,7 @@ enum ArbReply {
     Granted {
         attrs: ArbAttrs,
         xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+        xattrs_complete: bool,
         dir: Option<(Vec<ArbDir>, bool)>,
         already: bool,
     },
@@ -128,10 +134,12 @@ impl ArbReply {
             ArbReply::Granted {
                 attrs,
                 xattrs,
+                xattrs_complete,
                 dir,
                 already,
             } => TokenReply::Granted {
                 records: TokenRecords {
+                    xattrs_complete,
                     attrs: WireAttrs {
                         mode: attrs.mode,
                         uid: attrs.uid,

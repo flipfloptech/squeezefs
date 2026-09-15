@@ -104,11 +104,37 @@ pub enum TokenMode {
     Read,
 }
 
-/// What a grant must carry beyond the object's attrs + xattrs (always
-/// carried): a directory's dentry set, paged by the reply cap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// What a grant page must carry: the object's records (attrs — always
+/// carried, they are one fixed word — and the xattrs, paged by name
+/// under the grant budget; `records` is set on the reader's first page
+/// and every xattr continuation, clear on a pure dentry continuation, so
+/// no page re-carries what an earlier one did — review round 1, Issue
+/// 16), and a directory's dentry set, paged by cookie under the same
+/// budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenWants {
     pub dentries: bool,
+    pub records: bool,
+}
+
+impl Default for TokenWants {
+    /// The first page's wants: the records, no dentries.
+    fn default() -> Self {
+        Self {
+            dentries: false,
+            records: true,
+        }
+    }
+}
+
+impl TokenWants {
+    /// The first page of a directory grant: records + dentries.
+    pub fn with_dentries() -> Self {
+        Self {
+            dentries: true,
+            records: true,
+        }
+    }
 }
 
 /// The token verbs (§6.3 — "the S10 delegation verbs": Grant / Recall /
@@ -117,13 +143,16 @@ pub struct TokenWants {
 pub enum TokenCall {
     /// A read token on `object` (a LOCAL key ino of the frame's volume),
     /// the records carried; `after` = the dentry continuation cookie (0 =
-    /// the directory's start) when `wants.dentries`. Idempotent: a holder
-    /// that already granted this client the token answers `already`.
+    /// the directory's start) when `wants.dentries`; `xattr_after` = the
+    /// xattr continuation (the last name carried; empty = from the first
+    /// name) when `wants.records`. Idempotent: a holder that already
+    /// granted this client the token answers `already`.
     Grant {
         object: u64,
         mode: TokenMode,
         wants: TokenWants,
         after: u64,
+        xattr_after: Vec<u8>,
     },
     /// The reader's standing recall channel: the holder PARKS the call
     /// until a recall frame for this client exists (or `wait_ms`
@@ -206,13 +235,17 @@ pub struct DirRecord {
     pub name: Vec<u8>,
 }
 
-/// The records a grant carries (Lustre's intent lock): attrs, every
-/// user-visible xattr, and — when asked — a page of the directory's
-/// entries with a completion flag.
+/// The records one grant PAGE carries (Lustre's intent lock): attrs, a
+/// page of the user-visible xattrs (by name, `xattrs_complete` when it
+/// ended the set; empty on a page that did not ask for records), and —
+/// when asked, once the xattrs are complete — a page of the directory's
+/// entries with a completion flag. One byte budget covers the xattrs
+/// and the dentries of a page ([`grant_dentry_budget`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenRecords {
     pub attrs: WireAttrs,
     pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+    pub xattrs_complete: bool,
     /// `Some((entries, complete))` when dentries were asked for and the
     /// object is a directory.
     pub dir: Option<(Vec<DirRecord>, bool)>,
@@ -624,6 +657,7 @@ impl TokenHolderPlane {
         object: u64,
         wants: TokenWants,
         after: u64,
+        xattr_after: &[u8],
     ) -> TokenReply {
         use crate::token_grant_core::GrantAdmission;
         // The slot's lessee first (one lease-table read): a slot another
@@ -648,7 +682,9 @@ impl TokenHolderPlane {
             };
         }
         let records = loop {
-            let read = volume.token_records_for(object, wants, after).await;
+            let read = volume
+                .token_records_for(object, wants, after, xattr_after)
+                .await;
             if self.gate.is_inflight(object) {
                 // A pass took the object in flight during the read: its
                 // apply may straddle what was read. It saw this
@@ -1039,9 +1075,17 @@ impl TokenService {
                 mode: TokenMode::Read,
                 wants,
                 after,
+                xattr_after,
             } => {
                 plane
-                    .serve_grant(&self.volume, &frame.client, *object, *wants, *after)
+                    .serve_grant(
+                        &self.volume,
+                        &frame.client,
+                        *object,
+                        *wants,
+                        *after,
+                        xattr_after,
+                    )
                     .await
             }
             TokenCall::Recall { wait_ms } => {
@@ -1314,7 +1358,12 @@ fn ensure_records_r5(plane: &Arc<TokenReaderPlane>) {
 /// The reader's side of the token plane for ONE volume.
 pub struct TokenReaderPlane {
     cfg: TokenClientConfig,
-    session: crate::sqz_sync::SqzMutex<Option<RpcClient>>,
+    /// The grant session pool (Issue 16a) — request/reply sessions,
+    /// dialed lazily, one call each at a time.
+    sessions: Vec<crate::sqz_sync::SqzMutex<Option<RpcClient>>>,
+    session_rr: std::sync::atomic::AtomicUsize,
+    /// Sessions the pool has DIALED (`dlm_token_grant_sessions`).
+    grant_sessions: AtomicU64,
     cache: scc::HashMap<u64, Arc<TokenEntry>>,
     /// Single-flight grants per object.
     fetching: scc::HashMap<u64, Arc<squeezefs_ipc::sqz_notify::Notify>>,
@@ -1375,9 +1424,17 @@ fn fail_closed(what: &str) -> SqueezefsError {
 
 impl TokenReaderPlane {
     pub fn new(cfg: TokenClientConfig) -> Arc<Self> {
+        let sessions = crate::meta_ship::publish::publish_ship_depth_from(
+            None,
+            crate::cpu::process_parallelism(),
+        );
         let plane = Arc::new(Self {
             cfg,
-            session: crate::sqz_sync::SqzMutex::new(None),
+            sessions: (0..sessions)
+                .map(|_| crate::sqz_sync::SqzMutex::new(None))
+                .collect(),
+            session_rr: std::sync::atomic::AtomicUsize::new(0),
+            grant_sessions: AtomicU64::new(0),
             cache: scc::HashMap::new(),
             fetching: scc::HashMap::new(),
             revoke_gens: scc::HashMap::new(),
@@ -1512,19 +1569,40 @@ impl TokenReaderPlane {
         Ok(())
     }
 
+    /// One call on the grant session POOL (review round 1, Issue 16a):
+    /// the first free session, else the round-robin one — a grant parked
+    /// at the holder (its object in flight under a pass) holds ONE
+    /// session, and every other grant of the volume rides the others.
+    /// Pool depth = the D-1b session-depth derivation (one per 8 cores,
+    /// 2..=8 — the owner's RPC-lane slope), dialed lazily.
     async fn call(&self, call: TokenCall) -> Result<TokenReply> {
-        let mut guard = self.session.lock().await;
+        let n = self.sessions.len();
+        let start = self.session_rr.fetch_add(1, Ordering::Relaxed) % n;
+        let mut guard = None;
+        for i in 0..n {
+            if let Ok(g) = self.sessions[(start + i) % n].try_lock() {
+                guard = Some(g);
+                break;
+            }
+        }
+        let mut guard = match guard {
+            Some(g) => g,
+            None => self.sessions[start].lock().await,
+        };
         let client = match guard.as_mut() {
             Some(c) => c,
-            None => guard.insert(
-                RpcClient::connect(
-                    &self.cfg.endpoint,
-                    &self.cfg.secret,
-                    &self.cfg.client_id,
-                    None,
+            None => {
+                self.grant_sessions.fetch_add(1, Ordering::Relaxed);
+                guard.insert(
+                    RpcClient::connect(
+                        &self.cfg.endpoint,
+                        &self.cfg.secret,
+                        &self.cfg.client_id,
+                        None,
+                    )
+                    .await?,
                 )
-                .await?,
-            ),
+            }
         };
         match call_on(client, &self.cfg, call).await {
             Ok(r) => Ok(r),
@@ -1580,6 +1658,8 @@ impl TokenReaderPlane {
         let gen0 = self.revoke_gens.read_sync(&object, |_, g| *g).unwrap_or(0);
         let t0 = Instant::now();
         let mut after = 0u64;
+        let mut xattr_after: Vec<u8> = Vec::new();
+        let mut records_done = false;
         let mut attrs: Option<WireAttrs> = None;
         let mut xattrs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut entries: Vec<DirRecord> = Vec::new();
@@ -1588,8 +1668,12 @@ impl TokenReaderPlane {
                 .call(TokenCall::Grant {
                     object,
                     mode: TokenMode::Read,
-                    wants,
+                    wants: TokenWants {
+                        dentries: wants.dentries,
+                        records: !records_done,
+                    },
                     after,
+                    xattr_after: std::mem::take(&mut xattr_after),
                 })
                 .await?;
             match reply {
@@ -1597,7 +1681,23 @@ impl TokenReaderPlane {
                     self.grants.fetch_add(1, Ordering::Relaxed);
                     if attrs.is_none() {
                         attrs = Some(records.attrs);
-                        xattrs = records.xattrs;
+                    }
+                    if !records_done {
+                        // The xattr pages come first; a page that did not
+                        // end the set carries no dentries yet. An
+                        // incomplete page that carried nothing can make
+                        // no progress: refused, never spun on.
+                        if !records.xattrs_complete && records.xattrs.is_empty() {
+                            return Err(fail_closed(
+                                "the holder answered an empty, incomplete xattr page",
+                            ));
+                        }
+                        xattr_after = records.xattrs.last().map_or(Vec::new(), |(n, _)| n.clone());
+                        xattrs.extend(records.xattrs);
+                        if !records.xattrs_complete {
+                            continue;
+                        }
+                        records_done = true;
                     }
                     match records.dir {
                         Some((page, complete)) => {
@@ -1996,6 +2096,8 @@ impl TokenReaderPlane {
             channel_rounds: self.channel_rounds.load(Ordering::Relaxed),
             fetch_retries: self.fetch_retries.load(Ordering::Relaxed),
             channel_fresh: self.channel_fresh(),
+            grant_sessions: self.sessions.len() as u64,
+            grant_sessions_dialed: self.grant_sessions.load(Ordering::Relaxed),
         }
     }
 
@@ -2036,6 +2138,10 @@ pub struct TokenReaderStats {
     pub channel_rounds: u64,
     pub fetch_retries: u64,
     pub channel_fresh: bool,
+    /// The grant session pool's depth (the derivation in force).
+    pub grant_sessions: u64,
+    /// Sessions of the pool dialed so far.
+    pub grant_sessions_dialed: u64,
 }
 
 /// Issue one verb on `client`; a refusal status with a reply body is
@@ -2101,7 +2207,7 @@ pub async fn token_find_dentry(
     parent: Ino,
     name: &str,
 ) -> Result<Option<DentryValue>> {
-    let Some(serve) = plane.serve(parent, TokenWants { dentries: true }).await? else {
+    let Some(serve) = plane.serve(parent, TokenWants::with_dentries()).await? else {
         return Err(SqueezefsError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("Inode {parent} not found"),
@@ -2333,6 +2439,8 @@ pub fn reader_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
         "dlm_token_channel_rounds": per(&|s| s.channel_rounds),
         "dlm_token_fetch_retries": per(&|s| s.fetch_retries),
         "dlm_token_channel_fresh": per(&|s| u64::from(s.channel_fresh)),
+        "dlm_token_grant_sessions": per(&|s| s.grant_sessions),
+        "dlm_token_grant_sessions_dialed": per(&|s| s.grant_sessions_dialed),
         "dlm_token_grant_rtt_ns": serde_json::Value::Array(
             volumes
                 .iter()

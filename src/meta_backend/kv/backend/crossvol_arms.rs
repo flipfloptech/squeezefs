@@ -225,13 +225,22 @@ impl KvMetaBackend {
     /// refusal compensation of a `Create` whose insert the holder
     /// refused): the record alone — a fresh mint has no xattr, no layout,
     /// no block.
-    pub async fn xv_destroy_unnamed(&self, local_ino: Ino, guards: Arc<[DlmGuard]>) -> Result<()> {
+    /// `rider` = the intent's own retirement riding the SAME entry (the
+    /// compensation's last act — review round 2, Issue 26).
+    pub async fn xv_destroy_unnamed(
+        &self,
+        local_ino: Ino,
+        rider: Option<&XvRider>,
+        guards: Arc<[DlmGuard]>,
+    ) -> Result<()> {
         self.write_gate()?;
-        if self.read_inode_value(local_ino).await?.is_none() {
+        let mut tx = KvTx::new();
+        Self::stage_intent_rider(&mut tx, rider)?;
+        if self.read_inode_value(local_ino).await?.is_some() {
+            tx.stage_delete(TREE_INODES, inode_key(local_ino));
+        } else if rider.is_none() {
             return Ok(());
         }
-        let mut tx = KvTx::new();
-        tx.stage_delete(TREE_INODES, inode_key(local_ino));
         tx.hold_guards(guards);
         self.commit_tx(tx).await?;
         Ok(())

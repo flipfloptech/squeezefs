@@ -2397,9 +2397,18 @@ async fn a_live_refusal_compensates_a_links_count_and_a_renames_removed_source()
         .unwrap()
         .ino;
     // link: [SetNlink(f) @ own, InsertDentry(shared) @ holder — refused].
+    // The retirement rides the last inverse's own entry (review round 2,
+    // Issue 26): tx0 + ONE compensating entry, never a third.
+    let entries = || squeezefs::meta_backend::kv::META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed);
+    let entries_before = entries();
     crossvol_tx::TEST_XV_SERVE_SKIP_ONCE.store(true, Ordering::SeqCst);
     let e = routed.link(f, shared, "l").await.expect_err("refused");
     assert_eq!(e.to_errno(), libc::EEXIST, "{e}");
+    assert_eq!(
+        entries() - entries_before,
+        2,
+        "tx0 + one compensating entry carrying the retirement"
+    );
     assert_eq!(
         routed.getattr(f).await.unwrap().nlink,
         1,

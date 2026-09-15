@@ -2401,13 +2401,15 @@ pub async fn execute(
         return Err(seam_error());
     }
     if let Some((at, errno)) = foreign_refusal {
-        compensate_live_refusal(
+        let retired = compensate_live_refusal(
             routed,
             tx_id,
             plan,
             &localised,
             &outcomes,
             at,
+            coord,
+            intent_ino,
             guards.clone(),
         )
         .await?;
@@ -2420,7 +2422,12 @@ pub async fn execute(
                 plan.steps[at].name()
             ),
         );
-        retire(routed, coord, intent_ino, tx_id, guards).await?;
+        if retired {
+            XV_TX_COMPLETED.fetch_add(1, Ordering::Relaxed);
+            note_intent_retired(tx_id);
+        } else {
+            retire(routed, coord, intent_ino, tx_id, guards).await?;
+        }
         return Err(e);
     }
     retire(routed, coord, intent_ino, tx_id, guards).await?;
@@ -2469,13 +2476,20 @@ async fn retire(
 /// child's type read from its record), an applied insert removed, a
 /// minted child destroyed (nothing names it); a `TouchCtime` is
 /// monotone and stands. A foreign inverse ships to its holder under the
-/// same scope. The intent then retires and the op answers the step's
-/// errno. **The crash window**: a kill between an applied step and its
-/// compensation leaves the intent open, and the roll-forward applies the
+/// same scope. **The intent's retirement rides the LAST inverse's own
+/// entry when that inverse is local to the intent's volume** (review
+/// round 2, Issue 26 — the rider pattern), so compensation and
+/// retirement are ONE commit and the plan is either open-and-forward or
+/// gone; the op then answers the step's errno. Returns whether the
+/// retirement rode (the caller retires separately otherwise). **The
+/// crash window that remains**: a kill between an applied step and the
+/// last inverse leaves the intent open, and the roll-forward applies the
 /// FORWARD plan — re-meeting the refusal at the holder and leaving the
 /// applied halves (a raised count with no name, a removed source name):
-/// the C9/C10 census classes, stated in the note; an abort marker on the
+/// the C9/C10 census classes; when the last inverse is FOREIGN the
+/// window extends to the separate retirement — the abort marker on the
 /// record is the recovery-side answer this rung does not build.
+#[allow(clippy::too_many_arguments)]
 async fn compensate_live_refusal(
     routed: &RoutedMetaBackend,
     tx_id: u64,
@@ -2483,12 +2497,31 @@ async fn compensate_live_refusal(
     localised: &[(usize, XvLocalStep)],
     outcomes: &[XvStepOutcome],
     at: usize,
+    coord: usize,
+    intent_ino: Ino,
     guards: Arc<[dlm::DlmGuard]>,
-) -> Result<()> {
-    for i in (0..at).rev() {
-        if outcomes.get(i).map(|o| o.status) != Some(XvStepStatus::Applied) {
-            continue;
-        }
+) -> Result<bool> {
+    let applied: Vec<usize> = (0..at)
+        .rev()
+        .filter(|i| {
+            outcomes.get(*i).map(|o| o.status) == Some(XvStepStatus::Applied)
+                && !matches!(plan.steps[*i], XvStep::TouchCtime { .. })
+        })
+        .collect();
+    let last = applied.last().copied();
+    let delete = XvRider::Delete { intent_ino, tx_id };
+    let mut retired = false;
+    for i in applied {
+        // The retirement rides the last inverse when it commits on the
+        // intent's own volume as a LOCAL apply.
+        let (v_idx, local) = &localised[i];
+        let rides_here = last == Some(i)
+            && *v_idx == coord
+            && matches!(
+                step_home(routed, *v_idx, local.local_home()),
+                StepHome::Local
+            );
+        let rider = rides_here.then_some(&delete);
         let inverse = match &plan.steps[i] {
             XvStep::SetNlink { ino, pre, post, .. } => Some(XvStep::SetNlink {
                 ino: *ino,
@@ -2503,16 +2536,16 @@ async fn compensate_live_refusal(
                 parent_update,
             } => {
                 let (cv, cl) = routed.route_ino(*expect_child);
-                let Some(child) = routed.volumes[cv].read_inode_value_routed(cl).await? else {
-                    continue;
-                };
-                Some(XvStep::InsertDentry {
-                    parent: *parent,
-                    name: name.clone(),
-                    child: *expect_child,
-                    ft_bits: child.mode & libc::S_IFMT,
-                    parent_update: *parent_update,
-                })
+                routed.volumes[cv]
+                    .read_inode_value_routed(cl)
+                    .await?
+                    .map(|child| XvStep::InsertDentry {
+                        parent: *parent,
+                        name: name.clone(),
+                        child: *expect_child,
+                        ft_bits: child.mode & libc::S_IFMT,
+                        parent_update: *parent_update,
+                    })
             }
             XvStep::InsertDentry {
                 parent,
@@ -2528,33 +2561,24 @@ async fn compensate_live_refusal(
             }),
             XvStep::TouchCtime { .. } => None,
             XvStep::MintInode { .. } | XvStep::CreateInode { .. } => {
-                let (v_idx, local) = &localised[i];
-                let local_ino = local.local_home();
                 let out = routed.volumes[*v_idx]
-                    .xv_destroy_unnamed(local_ino, guards.clone())
+                    .xv_destroy_unnamed(local.local_home(), rider, guards.clone())
                     .await;
                 if out.is_err() {
                     routed.mirror_volume_failure(*v_idx);
                 }
                 out?;
+                retired |= rides_here;
                 None
             }
         };
         let Some(inverse) = inverse else {
             continue;
         };
-        let (v_idx, local) = localise(routed, &inverse);
-        let out = apply_or_ship_step(
-            routed,
-            tx_id,
-            i,
-            v_idx,
-            &inverse,
-            &local,
-            None,
-            guards.clone(),
-        )
-        .await?;
+        let (iv, il) = localise(routed, &inverse);
+        let out =
+            apply_or_ship_step(routed, tx_id, i, iv, &inverse, &il, rider, guards.clone()).await?;
+        retired |= rides_here;
         if out.status == XvStepStatus::ForeignSkipped {
             log::error!(
                 "cross-owner transaction {tx_id:016x} ({:?}): compensating step {i} ({}) found \
@@ -2564,7 +2588,7 @@ async fn compensate_live_refusal(
             );
         }
     }
-    Ok(())
+    Ok(retired)
 }
 
 /// A coalesced durability barrier on one volume.

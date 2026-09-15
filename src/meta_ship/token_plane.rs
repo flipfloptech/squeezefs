@@ -1145,6 +1145,24 @@ pub struct TokenClientConfig {
     pub volume: u16,
 }
 
+/// One object of a recall or a release as the data sink sees it: the
+/// LOCAL key ino and the token entry the reader held for it — `None`
+/// when it held none (shed under R5 pressure, or a recall of an object
+/// this reader never fetched). The entry carries the object's `layout`,
+/// which is what lets the sink purge the object's block keys and no
+/// other's (review round 1, Issue 10).
+pub struct RecalledObject {
+    pub ino: u64,
+    pub entry: Option<Arc<TokenEntry>>,
+}
+
+impl RecalledObject {
+    /// An object the reader held no entry for.
+    pub fn bare(ino: u64) -> Self {
+        Self { ino, entry: None }
+    }
+}
+
 /// The mount's data-plane half of a recall ack (§5.7.3): drain the
 /// reader's in-flight DMA serves on the recalled objects and purge its
 /// block-key census — the R-6 purge — BEFORE the ack travels. The mount
@@ -1153,7 +1171,7 @@ pub struct TokenClientConfig {
 pub trait RecallDataSink: Send + Sync {
     fn drain_and_purge<'a>(
         &'a self,
-        objects: &'a [u64],
+        objects: &'a [RecalledObject],
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
@@ -1682,7 +1700,7 @@ impl TokenReaderPlane {
         if self.cached_bytes.load(Ordering::Relaxed) + incoming <= budget {
             return;
         }
-        let mut retired: Vec<u64> = Vec::new();
+        let mut retired: Vec<RecalledObject> = Vec::new();
         for pass in 0..2u8 {
             self.cache.retain_sync(|ino, e| {
                 if self.cached_bytes.load(Ordering::Relaxed) + incoming <= budget {
@@ -1693,7 +1711,10 @@ impl TokenReaderPlane {
                 }
                 e.state.store(ENTRY_REVOKED, Ordering::Release);
                 self.credit(e.bytes);
-                retired.push(*ino);
+                retired.push(RecalledObject {
+                    ino: *ino,
+                    entry: Some(Arc::clone(e)),
+                });
                 false
             });
             if self.cached_bytes.load(Ordering::Relaxed) + incoming <= budget {
@@ -1709,14 +1730,15 @@ impl TokenReaderPlane {
     /// The release path: the data-plane drain + purge on `objects`, then
     /// the holder is told. ONE path, two triggers (eviction, the clean
     /// leave).
-    async fn release_retired(&self, objects: Vec<u64>) {
+    async fn release_retired(&self, retired: Vec<RecalledObject>) {
         if let Some(sink) = self.data_sink.get() {
-            sink.drain_and_purge(&objects).await;
+            sink.drain_and_purge(&retired).await;
         }
         self.releases
-            .fetch_add(objects.len() as u64, Ordering::Relaxed);
+            .fetch_add(retired.len() as u64, Ordering::Relaxed);
         // Best effort: a lost release costs the holder one needless
         // recall, never a wrong answer.
+        let objects = retired.into_iter().map(|o| o.ino).collect();
         let _ = self.call(TokenCall::Release { objects }).await;
     }
 
@@ -1777,11 +1799,14 @@ impl TokenReaderPlane {
     /// without recalling this reader, so no serve under the dropped
     /// records may stay in flight and no block key of theirs cached.
     async fn drop_all_and_purge(&self) {
-        let mut dropped: Vec<u64> = Vec::new();
+        let mut dropped: Vec<RecalledObject> = Vec::new();
         self.cache.retain_sync(|ino, e| {
             e.state.store(ENTRY_REVOKED, Ordering::Release);
             self.credit(e.bytes);
-            dropped.push(*ino);
+            dropped.push(RecalledObject {
+                ino: *ino,
+                entry: Some(Arc::clone(e)),
+            });
             false
         });
         if dropped.is_empty() {
@@ -1879,6 +1904,7 @@ impl TokenReaderPlane {
     ) -> Result<()> {
         self.recalls_received
             .fetch_add(objects.len() as u64, Ordering::Relaxed);
+        let mut recalled: Vec<RecalledObject> = Vec::with_capacity(objects.len());
         for &o in objects {
             match self.revoke_gens.entry_sync(o) {
                 scc::hash_map::Entry::Occupied(mut e) => *e.get_mut() += 1,
@@ -1886,16 +1912,18 @@ impl TokenReaderPlane {
                     v.insert_entry(1);
                 }
             }
-            if let Some((_, entry)) = self.cache.remove_sync(&o) {
+            let entry = self.cache.remove_sync(&o).map(|(_, entry)| {
                 entry.state.store(ENTRY_REVOKED, Ordering::Release);
                 self.credit(entry.bytes);
-            }
+                entry
+            });
+            recalled.push(RecalledObject { ino: o, entry });
         }
         // The data-plane half BEFORE the ack: every serve that began under
         // the recalled records drains (`ServeStamp`) and the objects' block
         // keys are purged — the ack is what lets the holder's free ship.
         if let Some(sink) = self.data_sink.get() {
-            sink.drain_and_purge(objects).await;
+            sink.drain_and_purge(&recalled).await;
         }
         match call_on(client, &self.cfg, TokenCall::RecallAck { frame_id }).await? {
             TokenReply::Acked => {
@@ -1915,9 +1943,12 @@ impl TokenReaderPlane {
     /// reader that dies without this leaves its grants to the holder's
     /// lease-expiry arm.
     pub async fn stop(&self) {
-        let mut held: Vec<u64> = Vec::new();
-        self.cache.iter_sync(|ino, _| {
-            held.push(*ino);
+        let mut held: Vec<RecalledObject> = Vec::new();
+        self.cache.iter_sync(|ino, e| {
+            held.push(RecalledObject {
+                ino: *ino,
+                entry: Some(Arc::clone(e)),
+            });
             true
         });
         if !held.is_empty() && self.channel_ok.load(Ordering::Acquire) {
@@ -2069,33 +2100,156 @@ pub async fn token_find_dentry(
 // The mount path's arms
 // ---------------------------------------------------------------------------
 
-/// The FUSE mount's [`RecallDataSink`]: an epoch step on the reader's
-/// layout cache + the observed in-flight serve drain
-/// (`ro_coherence::drain_in_flight_serves`), then the R-6 purge of the
-/// block-key census (`ro_coherence::purge_reader_block_keys`) — the whole
-/// census, the ONE legal purge, so the ack is never emitted while a
-/// cached block of the recalled object could still serve.
+/// Block keys the scoped recall purge dropped (`dlm_token_recall_purged_keys`).
+static RECALL_PURGE_KEYS: AtomicU64 = AtomicU64::new(0);
+/// Objects purged by their OWN layout (`dlm_token_recall_scoped_purges`).
+static RECALL_PURGE_SCOPED: AtomicU64 = AtomicU64::new(0);
+/// Sink calls that fell back to the WHOLE census
+/// (`dlm_token_recall_census_purges`) — an object whose block keys the
+/// reader could not enumerate (no entry held, an indirect map).
+static RECALL_PURGE_CENSUS: AtomicU64 = AtomicU64::new(0);
+
+/// The scoped-purge ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecallPurgeCounts {
+    pub keys: u64,
+    pub scoped: u64,
+    pub census: u64,
+}
+
+pub fn recall_purge_counts() -> RecallPurgeCounts {
+    RecallPurgeCounts {
+        keys: RECALL_PURGE_KEYS.load(Ordering::Relaxed),
+        scoped: RECALL_PURGE_SCOPED.load(Ordering::Relaxed),
+        census: RECALL_PURGE_CENSUS.load(Ordering::Relaxed),
+    }
+}
+
+/// The block keys a layout value names, as the tiers key them: the STORED
+/// map value (a decorated mapping is keyed verbatim) and, where the
+/// decoration differs from the free-able base, that base too. `None` when
+/// the layout cannot be enumerated from the record alone — an indirect or
+/// kvmap head (its map lives off-record), or a value that does not decode.
+fn layout_block_keys(layout: &[u8], block_size: u64) -> Option<Vec<String>> {
+    let l = crate::layout_wire::decode_layout_any(layout).ok()?;
+    if l.block_map_id.is_some() {
+        return None;
+    }
+    let mut keys: Vec<String> = Vec::new();
+    if let Some(map) = &l.block_map {
+        for v in map.values() {
+            let base = crate::routing::clean_block_key_ref(v);
+            if base != v.as_str() {
+                keys.push(base.to_string());
+            }
+            keys.push(v.clone());
+        }
+    } else if let Some(prefix) = &l.block_prefix {
+        if block_size == 0 {
+            return None;
+        }
+        let blocks = l.size.div_ceil(block_size);
+        keys.extend((0..blocks).map(|b| format!("{prefix}/part_{b}")));
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    Some(keys)
+}
+
+/// The FUSE mount's [`RecallDataSink`], one per metadata volume: an epoch
+/// step on the reader's layout cache + the observed in-flight serve
+/// drain (`ro_coherence::drain_in_flight_serves`), then the R-6 purge
+/// SCOPED to the recalled objects (review round 1, Issue 10) — each
+/// object's layout entry is dropped from the router's cache and the
+/// block keys its `layout` names are purged through the ONE legal purge;
+/// an object whose keys cannot be enumerated (the reader held no entry —
+/// shed, or never granted — or an off-record map) falls back to the
+/// whole census once per call, counted. The step stays GLOBAL: it is the
+/// drain's generation and the stamp gate that makes a layout resolve
+/// racing the recall miss (`ro_coherence::layout_entry_pre_step`) — under
+/// tokens that miss re-decodes off the token cache, an RPC to nobody.
 pub struct MountRecallSink {
     router: crate::routing::DataRouter,
+    /// The volume's index in the routed set — the local → global ino step
+    /// the router's layout cache is keyed by.
+    volume: usize,
 }
 
 impl MountRecallSink {
-    pub fn new(router: crate::routing::DataRouter) -> Arc<Self> {
-        Arc::new(Self { router })
+    pub fn new(router: crate::routing::DataRouter, volume: usize) -> Arc<Self> {
+        Arc::new(Self { router, volume })
+    }
+
+    /// The object's global ino (the router's key), if it has one.
+    fn global_ino(&self, local: u64) -> Option<u64> {
+        self.router
+            .meta_backend
+            .get()
+            .and_then(|routed| routed.try_make_global_ino(local, self.volume))
+    }
+
+    /// Purge one object's keys; `false` = not enumerable (the caller
+    /// falls back to the census).
+    fn purge_scoped(&self, object: &RecalledObject) -> bool {
+        let Some(entry) = object.entry.as_deref() else {
+            return false;
+        };
+        let Some(global) = self.global_ino(object.ino) else {
+            return false;
+        };
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        let layout = entry
+            .xattrs
+            .iter()
+            .find(|(n, _)| n.as_slice() == b"layout")
+            .map(|(_, v)| v.as_slice());
+        // An object with no layout record owns no blocks (a directory, a
+        // symlink, an empty file): its layout entry alone is dropped.
+        let keys = match layout {
+            Some(bytes) => match layout_block_keys(bytes, block_size) {
+                Some(keys) => keys,
+                None => return false,
+            },
+            None => Vec::new(),
+        };
+        self.router.discard_layout_cache(global);
+        for k in &keys {
+            self.router.cache.purge_block_key(k);
+        }
+        RECALL_PURGE_KEYS.fetch_add(keys.len() as u64, Ordering::Relaxed);
+        RECALL_PURGE_SCOPED.fetch_add(1, Ordering::Relaxed);
+        true
     }
 }
 
 impl RecallDataSink for MountRecallSink {
     fn drain_and_purge<'a>(
         &'a self,
-        objects: &'a [u64],
+        objects: &'a [RecalledObject],
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             crate::ro_coherence::drain_in_flight_serves().await;
-            let purged = crate::ro_coherence::purge_reader_block_keys(&self.router.cache);
+            let mut scoped = 0usize;
+            let mut census = false;
+            for o in objects {
+                if census {
+                    break;
+                }
+                if self.purge_scoped(o) {
+                    scoped += 1;
+                } else {
+                    census = true;
+                }
+            }
+            let purged = if census {
+                RECALL_PURGE_CENSUS.fetch_add(1, Ordering::Relaxed);
+                crate::ro_coherence::purge_reader_block_keys(&self.router.cache)
+            } else {
+                0
+            };
             log::debug!(
-                "token recall of {} object(s): in-flight serves drained, {purged} cached block \
-                 key(s) purged before the ack",
+                "token recall of {} object(s): in-flight serves drained, {scoped} purged by \
+                 their layout, census fallback {census} ({purged} key(s)) before the ack",
                 objects.len()
             );
         })
@@ -2170,6 +2324,10 @@ pub fn reader_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
                 .map(|v| v.token_reader().map_or(serde_json::Value::Null, |p| p.grant_rtt_json()))
                 .collect(),
         ),
+        // The mount's recall sink (one ledger — the sinks share it).
+        "dlm_token_recall_purged_keys": RECALL_PURGE_KEYS.load(Ordering::Relaxed),
+        "dlm_token_recall_scoped_purges": RECALL_PURGE_SCOPED.load(Ordering::Relaxed),
+        "dlm_token_recall_census_purges": RECALL_PURGE_CENSUS.load(Ordering::Relaxed),
     })
 }
 

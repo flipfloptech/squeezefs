@@ -790,12 +790,15 @@ pub async fn arm_token_readers(
             first.device_path().display()
         ));
     };
-    let sink = MountRecallSink::new(router.clone());
     let mut armed = 0usize;
     for (ordinal, v) in volumes.iter().enumerate() {
         if !v.is_read_only() {
             continue;
         }
+        // One sink per volume: its recalls name LOCAL key inos, and the
+        // router's layout cache is keyed by the global ino the volume's
+        // ordinal maps them to.
+        let sink = MountRecallSink::new(router.clone(), ordinal);
         let plane = v
             .arm_token_reader(TokenClientConfig {
                 endpoint: endpoint.clone(),
@@ -809,9 +812,7 @@ pub async fn arm_token_readers(
                 })?,
             })
             .map_err(|e| e.to_string())?;
-        plane.install_data_sink(
-            Arc::clone(&sink) as Arc<dyn crate::meta_ship::token_plane::RecallDataSink>
-        );
+        plane.install_data_sink(sink as Arc<dyn crate::meta_ship::token_plane::RecallDataSink>);
         // The holder answers the arm's probe or the mount refuses: a
         // writer with its plane unarmed serves no token verbs, and a
         // reader that mounted anyway would answer EIO to every resolve.

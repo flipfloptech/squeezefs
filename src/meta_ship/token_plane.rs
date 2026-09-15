@@ -1621,7 +1621,7 @@ impl TokenReaderPlane {
     }
 
     async fn fetch_once(&self, object: u64, wants: TokenWants) -> Result<FetchOutcome> {
-        let gen0 = self.revoke_gens.read_sync(&object, |_, g| *g).unwrap_or(0);
+        let gen0 = self.revoke_gen(object);
         let t0 = Instant::now();
         let mut after = 0u64;
         let mut xattr_after: Vec<u8> = Vec::new();
@@ -1692,10 +1692,11 @@ impl TokenReaderPlane {
             }
         }
         self.grant_rtt.record(t0.elapsed());
-        let gen1 = self.revoke_gens.read_sync(&object, |_, g| *g).unwrap_or(0);
-        if gen1 != gen0 {
-            // A recall landed inside the fetch: the pages may straddle
-            // the mutation. Nothing installed.
+        // A recall that landed inside the pages: the pages may straddle
+        // the mutation — nothing installed. (The same check is repeated
+        // ATOMICALLY with the install below, after the eviction's await —
+        // review round 2, Issue 21.)
+        if self.revoke_gen(object) != gen0 {
             return Ok(FetchOutcome::RecalledMidFetch);
         }
         let attrs = attrs.ok_or_else(|| fail_closed("a grant carried no attrs"))?;
@@ -1742,27 +1743,52 @@ impl TokenReaderPlane {
         });
         // Room for the entry under the byte budget: evict (voluntary
         // releases — each one drained and purged before the holder is
-        // told, the recall's own law) until it fits.
+        // told, the recall's own law) until it fits. An AWAIT: a recall
+        // of `object` can land inside it.
         self.evict_to_budget(bytes).await;
-        match self.cache.entry_sync(object) {
+        // The install is conditional on the generation the records were
+        // read under, decided UNDER the cache entry (review round 2, Issue
+        // 21 — the register-before-read discipline on the reader's own
+        // install): the recall handler bumps the generation BEFORE it
+        // removes the entry, so a bump the check sees aborts the install,
+        // and a bump after the check finds the installed entry to remove.
+        let installed = match self.cache.entry_sync(object) {
             scc::hash_map::Entry::Occupied(mut o) => {
-                let prev = o.get().clone();
-                // A concurrent full fetch may have installed a richer
-                // entry; a dentry-bearing one is never displaced by a
-                // bare one.
-                if prev.dir.is_some() && entry.dir.is_none() {
-                    return Ok(FetchOutcome::Installed(prev));
+                if self.revoke_gen(object) != gen0 {
+                    None
+                } else {
+                    let prev = o.get().clone();
+                    // A concurrent full fetch may have installed a richer
+                    // entry; a dentry-bearing one is never displaced by a
+                    // bare one.
+                    if prev.dir.is_some() && entry.dir.is_none() {
+                        return Ok(FetchOutcome::Installed(prev));
+                    }
+                    self.credit(prev.bytes);
+                    prev.state.store(ENTRY_REVOKED, Ordering::Release);
+                    *o.get_mut() = Arc::clone(&entry);
+                    Some(())
                 }
-                self.credit(prev.bytes);
-                prev.state.store(ENTRY_REVOKED, Ordering::Release);
-                *o.get_mut() = Arc::clone(&entry);
             }
             scc::hash_map::Entry::Vacant(v) => {
-                v.insert_entry(Arc::clone(&entry));
+                if self.revoke_gen(object) != gen0 {
+                    None
+                } else {
+                    v.insert_entry(Arc::clone(&entry));
+                    Some(())
+                }
             }
+        };
+        if installed.is_none() {
+            return Ok(FetchOutcome::RecalledMidFetch);
         }
         self.charge(bytes);
         Ok(FetchOutcome::Installed(entry))
+    }
+
+    /// `object`'s recall generation (0 = never recalled).
+    fn revoke_gen(&self, object: u64) -> u64 {
+        self.revoke_gens.read_sync(&object, |_, g| *g).unwrap_or(0)
     }
 
     /// **Eviction = a voluntary release, drained and purged first**

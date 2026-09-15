@@ -2621,11 +2621,24 @@ struct OpenIntent {
 }
 
 /// Scan every volume for open intents (every intent home: ino 0, and on
-/// a forest each slot namespace's local 0), decoded and id-checked.
+/// a forest each slot namespace's local 0), decoded and id-checked —
+/// SCOPED to the homes whose slot this mount's step-home is `Local` for
+/// (review round 2, Issue 21): an intent in a slot another appender
+/// leases is that appender's to complete — its tree here is a projection
+/// (the re-read under the guards would not be RAM-authoritative, a
+/// retirement by the peer's successor invisible), so two mounts never
+/// both adopt one intent. The cross-process face — a dead initiator's
+/// intents adopted by the mount that recovers its ring, an intent
+/// inherited with a re-leased slot scanned at the lease install — is PR
+/// 12's obligation (design row 6, the note §8a); on this tree one process
+/// holds every slot tree, so every intent is its own.
 async fn scan_open(routed: &RoutedMetaBackend) -> Result<Vec<OpenIntent>> {
     let mut open: Vec<OpenIntent> = Vec::new();
     for (idx, vol) in routed.volumes.iter().enumerate() {
         for (intent_ino, tx_id, image) in vol.xv_scan_intents_homed().await? {
+            if !matches!(step_home(routed, idx, intent_ino), StepHome::Local) {
+                continue;
+            }
             let rec = IntentRecord::decode(&image).map_err(|e| {
                 SqueezefsError::InvalidOperation(format!(
                     "metadata volume {}: open cross-volume intent {tx_id:016x} does not \

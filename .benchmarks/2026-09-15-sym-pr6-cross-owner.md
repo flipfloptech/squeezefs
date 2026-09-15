@@ -154,6 +154,8 @@ Every gauge added by the round is on the stats inode and in `docs/operations.md`
 
 ### 8a. Owed after round 2
 
+- **PR 12 — the intent scan's cross-process face** (review round 2, Issue 21): the scan is scoped to intent homes whose slot this mount's step-home is `Local` for (a peer slot's intent is never adopted here — pinned), and the register is process-local; the design's "roll-forward by whoever recovers the initiator's ring" — a dead initiator's intents adopted by the mount that recovers its ring, an intent INHERITED with a re-leased slot (PR 10's re-lease, an LRU release + first-touch) scanned at the lease install so it registers `Abandoned` — is the join ladder's to build. On this tree one process holds every slot tree, so every intent is its own.
+
 - The recovery-side ABORT marker: a plan a live refusal stopped is compensated under the op's guards, but a kill inside that compensation leaves an intent the roll-forward completes FORWARD (re-meeting the refusal; the applied halves stand for the C9/C10 census). Recording the abort on the intent record and recovering it as an undo is the answer; not built here.
 - The lock verbs' caller identity: `appender_id` is screened against the directory (a `Live` non-own page) and the record (the holder), not against the SESSION — the session→appender binding is PR 12's join ladder (PR 4's slot verbs carry the same limitation).
 

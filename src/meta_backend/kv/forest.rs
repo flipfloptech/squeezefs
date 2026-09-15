@@ -550,6 +550,37 @@ impl SlotTrees {
         start: &[u8],
         end: &[u8],
     ) -> Result<Vec<(Bytes, Bytes)>, KvError> {
+        let mut out: Vec<(Bytes, Bytes)> = Vec::new();
+        for (_slot, tree) in self.slot_trees() {
+            Self::refs_window_in(&tree, start, end, &mut out).await?;
+        }
+        Ok(out)
+    }
+
+    /// [`Self::refs_window`] over ONE slot tree — the on-demand refcount
+    /// probe (design §5.4.3 law 2, PR 7): a block nobody cloned has every
+    /// reference in its owner's slot tree (the pack law), so its
+    /// population is this one range. Empty when the slot has no tree
+    /// (nothing was ever written there).
+    pub async fn refs_probe(
+        &self,
+        slot: ForestSlot,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<(Bytes, Bytes)>, KvError> {
+        let mut out: Vec<(Bytes, Bytes)> = Vec::new();
+        if let Some(tree) = self.tree(slot) {
+            Self::refs_window_in(&tree, start, end, &mut out).await?;
+        }
+        Ok(out)
+    }
+
+    async fn refs_window_in(
+        tree: &KvTree,
+        start: &[u8],
+        end: &[u8],
+        out: &mut Vec<(Bytes, Bytes)>,
+    ) -> Result<(), KvError> {
         // The refs prefix sorts after every ino-major key, so the window
         // is the same forest window in every tree.
         let mut fstart = Vec::with_capacity(start.len() + 1);
@@ -561,40 +592,37 @@ impl SlotTrees {
         // One leaf's worth of refs per page: a 29 B key + 4 B value + the
         // record header is ~50 B, so 512 records ≈ 25 KiB — under one node.
         const PAGE: usize = 512;
-        let mut out: Vec<(Bytes, Bytes)> = Vec::new();
-        for (_slot, tree) in self.slot_trees() {
-            let mut cursor = fstart.clone();
-            loop {
-                let page = tree.range(&cursor, &fend, PAGE).await?;
-                let Some((last, _)) = page.last() else {
-                    break;
-                };
-                cursor = super::node::key_successor(last);
-                for (k, v) in &page {
-                    let (k_kind, legacy) = match split_forest_key(k) {
-                        Ok(split) => split,
-                        Err(e) => {
-                            super::META_KV_FOREST_KEY_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
-                            return Err(KvError::Corrupt(format!(
-                                "block-reference record under a key the forest codec refuses \
-                                 ({} bytes, {:02x?}…): {e} — the population is refused, never \
-                                 answered short; fsck class C1 names the record",
-                                k.len(),
-                                &k[..k.len().min(12)]
-                            )));
-                        }
-                    };
-                    if k_kind != TREE_BLOCK_REFS {
-                        continue;
+        let mut cursor = fstart.clone();
+        loop {
+            let page = tree.range(&cursor, &fend, PAGE).await?;
+            let Some((last, _)) = page.last() else {
+                break;
+            };
+            cursor = super::node::key_successor(last);
+            for (k, v) in &page {
+                let (k_kind, legacy) = match split_forest_key(k) {
+                    Ok(split) => split,
+                    Err(e) => {
+                        super::META_KV_FOREST_KEY_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+                        return Err(KvError::Corrupt(format!(
+                            "block-reference record under a key the forest codec refuses \
+                             ({} bytes, {:02x?}…): {e} — the population is refused, never \
+                             answered short; fsck class C1 names the record",
+                            k.len(),
+                            &k[..k.len().min(12)]
+                        )));
                     }
-                    out.push((Bytes::from(legacy), v.clone()));
+                };
+                if k_kind != TREE_BLOCK_REFS {
+                    continue;
                 }
-                if page.len() < PAGE {
-                    break;
-                }
+                out.push((Bytes::from(legacy), v.clone()));
+            }
+            if page.len() < PAGE {
+                break;
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// The live roots of every guest slot tree whose root moved since it

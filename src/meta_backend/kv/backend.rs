@@ -157,6 +157,13 @@ use super::{block_map, block_refs};
 use crate::error::Result;
 use crate::meta_backend::atomicity::META_VOLUME_ATOMICITY_COW;
 use std::borrow::Cow;
+
+/// Symmetric metadata PR 7 — the shared-block index, the on-demand
+/// refcount probe and the clone protocol's durable steps (design §5.4.3 /
+/// §5.4.4). A child module so its executors reach this file's tx, guard
+/// and control-entry primitives without widening them.
+#[path = "shared_refs.rs"]
+pub mod shared_refs;
 // DLM S3.5 (design-cow-kv-metadata §4.10a): the cross-volume plan
 // vocabulary this file's applier consumes.
 use crate::meta_backend::crossvol_tx::{self, XvLocalStep, XvRider, XvStepOutcome, XvStepStatus};

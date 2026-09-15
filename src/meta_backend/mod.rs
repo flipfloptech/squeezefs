@@ -1618,7 +1618,9 @@ impl RoutedMetaBackend {
         let inos: Vec<Ino> = items.iter().map(|&(ino, _)| ino).collect();
         let _gate = self.slot_gate_enter(&inos).await;
         let (v_idx, _) = self.route_ino(first);
-        let mut locals: Vec<(Ino, &[kv::block_refs::BlockRefOp])> = Vec::with_capacity(items.len());
+        let mut translated: Vec<std::borrow::Cow<'_, [kv::block_refs::BlockRefOp]>> =
+            Vec::with_capacity(items.len());
+        let mut local_inos: Vec<Ino> = Vec::with_capacity(items.len());
         for &(ino, ops) in items {
             let (v, local_ino) = self.route_ino(ino);
             if v != v_idx {
@@ -1628,14 +1630,72 @@ impl RoutedMetaBackend {
                      volume first)"
                 )));
             }
-            locals.push((local_ino, ops));
+            local_inos.push(local_ino);
+            translated.push(self.forest_ref_ops(v_idx, ops));
         }
+        let locals: Vec<(Ino, &[kv::block_refs::BlockRefOp])> = local_inos
+            .iter()
+            .copied()
+            .zip(translated.iter().map(|c| c.as_ref()))
+            .collect();
         self.check_volume_enabled(v_idx)?;
         let out = self.volumes[v_idx].destroy_inodes_releasing(&locals).await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);
         }
         Ok(inos.into_iter().zip(out?).collect())
+    }
+
+    /// **A forest volume's block references key their owner's LOCAL KEY
+    /// ino** (symmetric metadata PR 7 — a PR-1 defect, pinned by
+    /// `tests/sym_pack_tests.rs`): the forest codec routes a reference by
+    /// the top 24 bits of the owner at offset 17 — the `(s+1) << 40 |
+    /// local` form whose top bits ARE the slot — while every product site
+    /// keys the owner's GLOBAL ino (the rung-19 law, `refs_owner`), whose
+    /// top bits are zero for any realistic ino. Through the routed layer
+    /// every reference therefore landed in the NATIVE slot tree (the
+    /// manager's) whatever slot its owner lived in: complete as a census,
+    /// wrong for the plane (a publish from another appender named the
+    /// manager's slot — the cross-region refusal) and fatal to the pack
+    /// law's one-slot probe. This layer owns `route_ino`, so it rewrites
+    /// each op's owner to the key form the volume routes by; an owner that
+    /// homes elsewhere (a shipped frame's foreign slice) is left as the
+    /// kv layer keys it. A FLAT volume takes the ops verbatim — its ledger
+    /// stays byte-identical.
+    fn forest_ref_ops<'a>(
+        &self,
+        v_idx: usize,
+        ops: &'a [kv::block_refs::BlockRefOp],
+    ) -> std::borrow::Cow<'a, [kv::block_refs::BlockRefOp]> {
+        if ops.is_empty() || !self.volumes[v_idx].symmetric_forest() {
+            return std::borrow::Cow::Borrowed(ops);
+        }
+        std::borrow::Cow::Owned(
+            ops.iter()
+                .map(|op| {
+                    let (v, local) = self.route_ino(op.reference.owner_ino);
+                    if v == v_idx {
+                        kv::block_refs::BlockRefOp {
+                            reference: kv::shared_refs::with_owner(&op.reference, local),
+                            ..*op
+                        }
+                    } else {
+                        *op
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// The `refs_owner` a volume's recompute paths key their references
+    /// on: the local key ino on a forest ([`Self::forest_ref_ops`]), the
+    /// global ino everywhere else (the rung-19 law verbatim).
+    fn forest_refs_owner(&self, v_idx: usize, ino: Ino, local_ino: Ino) -> Ino {
+        if self.volumes[v_idx].symmetric_forest() {
+            local_ino
+        } else {
+            ino
+        }
     }
 
     /// RECLAIM-ATOMIC residual B: routed
@@ -1650,8 +1710,9 @@ impl RoutedMetaBackend {
         let _gate = self.slot_gate_enter(&[ino]).await;
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
+        let refs = self.forest_ref_ops(v_idx, refs);
         let out = self.volumes[v_idx]
-            .destroy_inode_chunked(local_ino, refs)
+            .destroy_inode_chunked(local_ino, &refs)
             .await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);
@@ -3746,8 +3807,9 @@ impl RoutedMetaBackend {
         let _gate = self.slot_gate_enter(&[ino]).await;
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
+        let block_refs = self.forest_ref_ops(v_idx, block_refs);
         let out = self.volumes[v_idx]
-            .set_layout_and_size(local_ino, layout, size, block_refs)
+            .set_layout_and_size(local_ino, layout, size, &block_refs)
             .await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);
@@ -3891,7 +3953,7 @@ impl RoutedMetaBackend {
                         *local,
                         &item.layout,
                         item.size,
-                        &item.block_refs,
+                        &self.forest_ref_ops(v_idx, &item.block_refs),
                         guards,
                     )
                     .await
@@ -3953,7 +4015,8 @@ impl RoutedMetaBackend {
         let _gate = self.slot_gate_enter(&[ino]).await;
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
-        let out = self.volumes[v_idx].commit_block_refs(local_ino, ops).await;
+        let ops = self.forest_ref_ops(v_idx, ops);
+        let out = self.volumes[v_idx].commit_block_refs(local_ino, &ops).await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);
         }
@@ -3972,8 +4035,9 @@ impl RoutedMetaBackend {
         let _gate = self.slot_gate_enter(&[ino]).await;
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
+        let ops = self.forest_ref_ops(v_idx, ops);
         let out = self.volumes[v_idx]
-            .commit_block_refs_witnessed(local_ino, ops)
+            .commit_block_refs_witnessed(local_ino, &ops)
             .await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);
@@ -4099,19 +4163,32 @@ impl RoutedMetaBackend {
         // records resolve covered indices through the stride census).
         let entry_key =
             |e: &kv::block_map::MapEntry, delta: u32| self.decode_map_entry_at(e, delta);
+        let block_refs = self.forest_ref_ops(v_idx, block_refs);
+        // The train's own reference builder keys the publishing ino: on a
+        // forest volume that is its LOCAL key form (`forest_ref_ops`' law).
+        let refs_owner = self.forest_refs_owner(v_idx, ino, local_ino);
+        let ref_for_keyed = |key: &str, idx: u32| {
+            ref_for(key, idx).map(|r| {
+                if r.owner_ino == ino {
+                    kv::shared_refs::with_owner(&r, refs_owner)
+                } else {
+                    r
+                }
+            })
+        };
         let out = self.volumes[v_idx]
             .migrate_block_map_train(
                 local_ino,
                 layout,
                 size,
-                block_refs,
+                &block_refs,
                 &records,
                 chunk,
                 claims,
-                ino,
+                refs_owner,
                 &entry_key,
                 cursor_floor,
-                ref_for,
+                &ref_for_keyed,
             )
             .await;
         if out.is_err() {
@@ -4157,8 +4234,9 @@ impl RoutedMetaBackend {
         let _gate = self.slot_gate_enter(&[ino]).await;
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
+        let block_refs = self.forest_ref_ops(v_idx, block_refs);
         let out = self.volumes[v_idx]
-            .kvmap_truncate_handoff(local_ino, new_size, k, block_refs)
+            .kvmap_truncate_handoff(local_ino, new_size, k, &block_refs)
             .await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);
@@ -4217,8 +4295,16 @@ impl RoutedMetaBackend {
         let _gate = self.slot_gate_enter(&[ino]).await;
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
+        let block_refs = self.forest_ref_ops(v_idx, &block_refs).into_owned();
         let out = self.volumes[v_idx]
-            .merge_layout_and_size(local_ino, ino, delta, full_layout, size, block_refs)
+            .merge_layout_and_size(
+                local_ino,
+                self.forest_refs_owner(v_idx, ino, local_ino),
+                delta,
+                full_layout,
+                size,
+                block_refs,
+            )
             .await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);
@@ -4264,10 +4350,11 @@ impl RoutedMetaBackend {
         let _gate = self.slot_gate_enter(&[ino]).await;
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
+        let block_refs = self.forest_ref_ops(v_idx, &block_refs).into_owned();
         let out = self.volumes[v_idx]
             .merge_layout_and_size_chained_accounted(
                 local_ino,
-                ino,
+                self.forest_refs_owner(v_idx, ino, local_ino),
                 delta,
                 full_layout,
                 size,

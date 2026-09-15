@@ -67,6 +67,9 @@ pub mod node_cache;
 pub mod node_state_core;
 pub mod record;
 pub mod revalidate;
+/// PR 7 — the shared-block index + refcount probes (`backend`'s child,
+/// re-exported at the design's path).
+pub use backend::shared_refs;
 pub mod slot_cursor_core;
 pub mod slot_lease;
 pub mod slot_set;

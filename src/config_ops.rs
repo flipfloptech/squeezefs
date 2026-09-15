@@ -5578,7 +5578,7 @@ async fn inspect_for_symmetric(path: &str, ordered: &[String]) -> Result<SymInsp
         .membership_stamp
         .as_ref()
         .ok_or_else(|| SqueezefsError::InvalidOperation("stamp checked above".to_string()))?;
-    let mut flat = collect_flat_records(&be).await?;
+    let mut flat = collect_flat_records(&be, stamp).await?;
     if out.marker.is_none() {
         // The marker the verb is about to write rides the build as an
         // ino-1 xattr record of the native slot: plan it, so the plan is
@@ -6259,13 +6259,25 @@ struct FlatRecords {
 /// dentries, xattrs; the block map and the block references when
 /// engaged) through the probe's kind-routed range walks — the same walk
 /// the digest oracle runs, so the forest built from it digests equal.
+///
+/// Block references (kind 6) are re-keyed by their owner's LOCAL KEY ino
+/// on the way in (`shared_refs::local_key_owner` under the stamp's width
+/// and native slot — the routed layer's `forest_ref_ops` law): the flat
+/// ledger keys the GLOBAL owner, and a forest routes a reference by the
+/// owner's slot bits, so a converted reference must carry the form the
+/// live path writes or the pack law's one-slot probe would never see it.
 async fn collect_flat_records(
     be: &crate::meta_backend::kv::backend::KvMetaBackend,
+    stamp: &crate::meta_backend::kv::checkpoint::MembershipStamp,
 ) -> Result<FlatRecords> {
+    use crate::meta_backend::kv::block_refs::{decode_block_ref_key, BLOCK_REF_OWNER_OFF};
     use crate::meta_backend::kv::node::key_successor;
     use crate::meta_backend::kv::record::{
         forest_key, forest_key_slot, Record, TREE_BLOCK_MAP, TREE_BLOCK_REFS, TREE_INODES,
     };
+    use crate::meta_backend::kv::shared_refs::local_key_owner;
+    let width = u64::from(stamp.routing_width);
+    let native = stamp.resolved_native_slot();
     use crate::meta_backend::kv::tree::KEY_SPACE_MAX;
     use crate::meta_backend::GUEST_NS_SHIFT;
 
@@ -6293,7 +6305,17 @@ async fn collect_flat_records(
             };
             cursor = key_successor(last);
             for (k, v) in &page {
-                let key = forest_key(kind, k)?;
+                let keyed: std::borrow::Cow<'_, [u8]> = if kind == TREE_BLOCK_REFS {
+                    let r = decode_block_ref_key(k)?;
+                    let mut re = k.to_vec();
+                    re[BLOCK_REF_OWNER_OFF..BLOCK_REF_OWNER_OFF + 8].copy_from_slice(
+                        &local_key_owner(r.owner_ino, width, native).to_be_bytes(),
+                    );
+                    std::borrow::Cow::Owned(re)
+                } else {
+                    std::borrow::Cow::Borrowed(k)
+                };
+                let key = forest_key(kind, &keyed)?;
                 let slot = forest_key_slot(&key)?;
                 if kind == TREE_INODES {
                     let ino_bytes: [u8; 8] =
@@ -6428,7 +6450,7 @@ async fn convert_volume_to_forest(
 
     // (2b) Read: the ledger, the empty window (asserted before anything
     // is collected), the reachable image set, every live record.
-    let (sb, ledger, reachable, flat) = {
+    let (sb, ledger, reachable, flat, stamp) = {
         let be = KvMetaBackend::open_probe(p).await?;
         if be.symmetric_forest() {
             return Err(SqueezefsError::InvalidOperation(format!(
@@ -6444,15 +6466,15 @@ async fn convert_volume_to_forest(
                 reachable.insert(extent_of(&sb, addr)?);
             }
         }
-        let flat = collect_flat_records(&be).await?;
-        (sb, ledger, reachable, flat)
+        let stamp = ledger.membership_stamp.clone().ok_or_else(|| {
+            SqueezefsError::InvalidOperation(format!(
+                "volume enable-symmetric: {path} carries no membership stamp — not a \
+                 dynamic-routing set member (reformat required)"
+            ))
+        })?;
+        let flat = collect_flat_records(&be, &stamp).await?;
+        (sb, ledger, reachable, flat, stamp)
     };
-    let stamp = ledger.membership_stamp.clone().ok_or_else(|| {
-        SqueezefsError::InvalidOperation(format!(
-            "volume enable-symmetric: {path} carries no membership stamp — not a dynamic-routing \
-             set member (reformat required)"
-        ))
-    })?;
 
     // (2c) The allocator off the durable bitmap; reclaim what no root
     // reaches (a crashed build's forest, the shipped root-swap leak), and

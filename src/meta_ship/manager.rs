@@ -32,6 +32,7 @@ use crate::cluster_wire::{RpcAsyncService, RpcClient, RpcRequest, RpcResponse};
 use crate::error::{Result, SqueezefsError};
 use crate::meta_backend::kv::appender::{AppenderIdentity, GrantRun};
 use crate::meta_backend::kv::backend::{JoinOutcome, KvMetaBackend};
+use crate::meta_backend::kv::shared_refs;
 use crate::meta_backend::kv::superblock::ExtentRef;
 use bincode::Options as _;
 use serde::{Deserialize, Serialize};
@@ -166,6 +167,38 @@ pub enum ManagerCall {
     /// The holder of `slot` (the `SlotHolderCache`'s stale-view fallback,
     /// §5.1.6).
     ResolveSlot { slot: u16 },
+
+    // ---- PR 7 — the clone protocol's verbs (design §5.4.4; the design's
+    // discriminant range 0x70–0x7F — bincode carries the variant index,
+    // and every PR of this level appends its block at the end, so the
+    // ranges name the BLOCKS; `MANAGER_SCHEMA` versions the wire). ----
+    /// **Step 1, served by the SOURCE ino's slot holder**: set the SHARED
+    /// bit on `owner_ino`'s reference to `(vol_tag, block_idx,
+    /// block_index)` under its 4a guard — or `SharedGone` when no record
+    /// exists (the cloner aborts). `owner_ino` is the frame volume's
+    /// LOCAL KEY form (the kv layer's key identity).
+    MarkShared {
+        vol_tag: u64,
+        block_idx: u64,
+        owner_ino: u64,
+        block_index: u32,
+    },
+    /// **Step 2, served by the index HOME**: one index entry per
+    /// `(owner_ino, block_index)` — the source's AND the target's — for
+    /// block `(vol_tag, block_idx)`; idempotent.
+    ShareBlock {
+        vol_tag: u64,
+        block_idx: u64,
+        refs: Vec<(u64, u32)>,
+    },
+    /// **Step 4, served by the index HOME**: the releasing ino drops its
+    /// entries for the block (`owner_ino = None` = a GC-only probe) and
+    /// the home decides from what remains.
+    ReleaseShared {
+        vol_tag: u64,
+        block_idx: u64,
+        owner_ino: Option<u64>,
+    },
 }
 
 /// The slot tree's words on the wire (§5.1.4 "four words move" — root,
@@ -224,6 +257,9 @@ impl ManagerCall {
             Self::OfferSlot { .. } => "offer_slot",
             Self::ReleaseSlot { .. } => "release_slot",
             Self::ResolveSlot { .. } => "resolve_slot",
+            Self::MarkShared { .. } => "mark_shared",
+            Self::ShareBlock { .. } => "share_block",
+            Self::ReleaseShared { .. } => "release_shared",
         }
     }
 }
@@ -304,6 +340,28 @@ pub enum ManagerReply {
     /// is healthy — retry. `reason` names the schedule.
     Deferred {
         reason: String,
+    },
+
+    // ---- PR 7 (design §5.4.4) ----
+    /// `MarkShared`: the bit is durable (`already` = it was — a replay or
+    /// a clone of a clone; nothing written).
+    Marked {
+        already: bool,
+    },
+    /// `MarkShared`: no reference record exists — the block may be freed;
+    /// the cloner aborts (ENOENT-class).
+    SharedGone,
+    /// `ShareBlock`: entries written / already present.
+    Shared {
+        inserted: u32,
+        already: u32,
+    },
+    /// `ReleaseShared`: the home's verdict — `remaining` entries stand
+    /// (`0` with `shared` = the block frees; `shared == false` = the index
+    /// never named it, the caller's local verdict stands).
+    SharedReleased {
+        shared: bool,
+        remaining: u32,
     },
 }
 
@@ -521,6 +579,87 @@ impl ManagerService {
                     .await
                     .map(|already| ManagerReply::Released { already }),
                 ManagerCall::ResolveSlot { slot } => self.volume.manager_resolve_slot_wire(*slot),
+                // PR 7. The frame's owner is the volume's key form; the
+                // executors validate nothing proportional to a wire
+                // integer beyond the frame's own `refs` length (one
+                // lookup each, bounded by the CONTROL cap).
+                ManagerCall::MarkShared {
+                    vol_tag,
+                    block_idx,
+                    owner_ino,
+                    block_index,
+                } => self
+                    .volume
+                    .mark_block_ref_shared(&crate::meta_backend::kv::block_refs::BlockRef {
+                        vol_tag: *vol_tag,
+                        block_idx: *block_idx,
+                        owner_ino: *owner_ino,
+                        block_index: *block_index,
+                    })
+                    .await
+                    .map(|o| match o {
+                        shared_refs::MarkOutcome::Marked => ManagerReply::Marked { already: false },
+                        shared_refs::MarkOutcome::Already => ManagerReply::Marked { already: true },
+                        shared_refs::MarkOutcome::Gone => ManagerReply::SharedGone,
+                    })
+                    .map_err(|e| crate::meta_backend::kv::KvError::Busy(e.to_string())),
+                ManagerCall::ShareBlock {
+                    vol_tag,
+                    block_idx,
+                    refs,
+                } => {
+                    let refs: Vec<crate::meta_backend::kv::block_refs::BlockRef> = refs
+                        .iter()
+                        .map(|&(owner_ino, block_index)| {
+                            crate::meta_backend::kv::block_refs::BlockRef {
+                                vol_tag: *vol_tag,
+                                block_idx: *block_idx,
+                                owner_ino,
+                                block_index,
+                            }
+                        })
+                        .collect();
+                    self.volume
+                        .share_block(&refs)
+                        .await
+                        .map(|(inserted, already)| ManagerReply::Shared {
+                            inserted: inserted as u32,
+                            already: already as u32,
+                        })
+                }
+                ManagerCall::ReleaseShared {
+                    vol_tag,
+                    block_idx,
+                    owner_ino,
+                } => {
+                    // The GC arm probes THIS volume's ledger; an entry whose
+                    // owner homes on another volume is left standing (the
+                    // service sees one volume — never GC across a boundary
+                    // it cannot read).
+                    let vol = Arc::clone(&self.volume);
+                    self.volume
+                        .release_shared(*vol_tag, *block_idx, *owner_ino, |r| {
+                            let vol = Arc::clone(&vol);
+                            async move { Ok(vol.block_ref_flags(&r).await?.is_some()) }
+                        })
+                        .await
+                        .map(|v| match v {
+                            shared_refs::SharedRelease::NotShared => ManagerReply::SharedReleased {
+                                shared: false,
+                                remaining: 0,
+                            },
+                            shared_refs::SharedRelease::Held { remaining } => {
+                                ManagerReply::SharedReleased {
+                                    shared: true,
+                                    remaining: remaining as u32,
+                                }
+                            }
+                            shared_refs::SharedRelease::Freed => ManagerReply::SharedReleased {
+                                shared: true,
+                                remaining: 0,
+                            },
+                        })
+                }
             };
         let (reply, status) = match served {
             Ok(reply) => (reply, STATUS_OK),
@@ -871,6 +1010,75 @@ impl ManagerClient {
         match self.call(ManagerCall::ResolveSlot { slot }).await? {
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
             other => Ok(other),
+        }
+    }
+}
+
+// PR 7 — the clone protocol's client half (design §5.4.4).
+impl ManagerClient {
+    /// `MarkShared` at the source's holder — `Ok(reply)` is `Marked` or
+    /// `SharedGone` (the cloner aborts on the latter).
+    pub async fn mark_shared(
+        &mut self,
+        reference: crate::meta_backend::kv::block_refs::BlockRef,
+    ) -> Result<ManagerReply> {
+        match self
+            .call(ManagerCall::MarkShared {
+                vol_tag: reference.vol_tag,
+                block_idx: reference.block_idx,
+                owner_ino: reference.owner_ino,
+                block_index: reference.block_index,
+            })
+            .await?
+        {
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Ok(other),
+        }
+    }
+
+    /// `ShareBlock` at the index home — `Ok((inserted, already))`.
+    pub async fn share_block(
+        &mut self,
+        vol_tag: u64,
+        block_idx: u64,
+        refs: &[(u64, u32)],
+    ) -> Result<(u32, u32)> {
+        match self
+            .call(ManagerCall::ShareBlock {
+                vol_tag,
+                block_idx,
+                refs: refs.to_vec(),
+            })
+            .await?
+        {
+            ManagerReply::Shared { inserted, already } => Ok((inserted, already)),
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Err(SqueezefsError::InvalidOperation(format!(
+                "ShareBlock answered {other:?}"
+            ))),
+        }
+    }
+
+    /// `ReleaseShared` at the index home — `Ok((shared, remaining))`.
+    pub async fn release_shared(
+        &mut self,
+        vol_tag: u64,
+        block_idx: u64,
+        owner_ino: Option<u64>,
+    ) -> Result<(bool, u32)> {
+        match self
+            .call(ManagerCall::ReleaseShared {
+                vol_tag,
+                block_idx,
+                owner_ino,
+            })
+            .await?
+        {
+            ManagerReply::SharedReleased { shared, remaining } => Ok((shared, remaining)),
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Err(SqueezefsError::InvalidOperation(format!(
+                "ReleaseShared answered {other:?}"
+            ))),
         }
     }
 }

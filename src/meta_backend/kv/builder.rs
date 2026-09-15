@@ -1065,9 +1065,31 @@ pub async fn digest_backend_kind_set(
     if kind == TREE_BLOCK_REFS {
         // The block-major refs family is not legacy-cursor-paged on a
         // forest (a cursor is no resume point across slot trees): the
-        // whole-window scan is its one layout-blind walk.
+        // whole-window scan is its one layout-blind walk. A forest keys a
+        // reference's owner in its LOCAL KEY form (the slot bits route it
+        // — symmetric PR 7, `RoutedMetaBackend::forest_ref_ops`); the flat
+        // ledger keys the GLOBAL ino. The oracle compares the SET the two
+        // layouts agree on, so a forest's owners are folded in the global
+        // form the stamp's width and native slot decode them to.
+        let keying = if backend.symmetric_forest() {
+            backend
+                .mounted_ledger()
+                .membership_stamp
+                .as_ref()
+                .map(|st| (u64::from(st.routing_width), st.resolved_native_slot()))
+        } else {
+            None
+        };
         for (k, v) in backend.block_refs_window(&[], &KEY_SPACE_MAX).await? {
-            fold(&k, &v);
+            match keying {
+                Some((width, native)) => fold(
+                    &super::shared_refs::rekey_owner(&k, |o| {
+                        super::shared_refs::global_owner(o, width, native)
+                    }),
+                    &v,
+                ),
+                None => fold(&k, &v),
+            }
         }
         return Ok((count, sum));
     }

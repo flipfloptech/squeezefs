@@ -5673,12 +5673,12 @@ fn closure_holds() {
     );
 }
 
-/// With the ring ARMED and a reader that acknowledged nothing (the S5
-/// shape that defers every free), the token holder's recall gate makes a
-/// terminal free publish straight to the free list: no deferral, nothing
-/// held, `free_grace_recall_gated_frees` counts it, the offset serves
-/// again at once — the acknowledgement channel is no longer the
-/// qualification.
+/// With the ring ARMED and a TOKEN-CLIENT reader that acknowledged no
+/// epoch (the S5 shape that defers every free), the token holder's recall
+/// gate makes a terminal free publish straight to the free list: no
+/// deferral, nothing held, `free_grace_recall_gated_frees` counts it, the
+/// offset serves again at once — for a token reader the acknowledgement
+/// channel is no longer the qualification (its recall's ack was).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_recall_gated_free_publishes_without_a_deferral() {
     let _serial = serial();
@@ -5693,7 +5693,7 @@ async fn a_recall_gated_free_publishes_without_a_deferral() {
         free_grace::RecallGate::Off
     );
 
-    free_grace::arm_recall_gate();
+    token_holder_armed(&["r-tok"]);
     assert!(free_grace::recall_gate_armed());
     let ba = allocator("grace-recall-gated").await;
     let victim = ba.allocate_block().await.expect("allocate");
@@ -5729,7 +5729,7 @@ async fn a_live_unacked_recall_makes_the_ring_the_timeout_path() {
     free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("the derived bound is safe");
     let reader = join(&owner, "r-slow", MemberRole::Reader);
     owner.refresh_free_grace_bound();
-    free_grace::arm_recall_gate();
+    token_holder_armed(&["r-slow"]);
 
     // The holder's timeouts_live arm: the window is `now + T_owner`.
     free_grace::note_recall_unacked_live();
@@ -5788,4 +5788,84 @@ async fn an_unarmed_token_gate_leaves_the_ring_in_charge_and_moves_no_face() {
     assert_eq!(free_grace::recall_gated_frees(), 0);
     assert_eq!(free_grace::timeout_deferrals(), 0);
     closure_holds();
+}
+
+/// The token holder's arm as the mount runs it (`arm_token_holder`):
+/// the gate armed and the token-client probe installed over the plane's
+/// registry, with `clients` recorded as token clients.
+fn token_holder_armed(clients: &[&str]) {
+    use squeezefs::meta_ship::token_plane;
+    token_plane::test_clear_token_clients();
+    for c in clients {
+        token_plane::note_token_client(c);
+    }
+    free_grace::install_token_client_probe(Arc::new(token_plane::is_token_client));
+    free_grace::arm_recall_gate();
+}
+
+/// **The reader-class law** (review round 1, Issue 3): the ring bypass
+/// applies only when EVERY live `Reader` member is a token client. An
+/// armed writer with one token reader AND one `SQUEEZEFS_SYMMETRIC_META=0`
+/// S5 reader enrolled on the same set (legal until the PR-14 flip) keeps
+/// the S5 reader's protection: a terminal free DEFERS on the epoch ring
+/// exactly as under S5 (`free_grace_s5_reader_deferrals`, and
+/// `free_grace_deferrals` with it), is released by the S5 reader's
+/// acknowledgement, and the closure holds; once the S5 reader is gone
+/// (evicted, or left) the same free publishes directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_s5_reader_on_an_armed_set_keeps_its_epoch_protection() {
+    let _serial = serial();
+    let (clock, _ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("the derived bound is safe");
+    let tok = join(&owner, "r-tok", MemberRole::Reader);
+    let s5 = join(&owner, "r-s5", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+    token_holder_armed(&["r-tok"]);
+    assert!(
+        squeezefs::meta_ship::token_plane::is_token_client("r-tok")
+            && !squeezefs::meta_ship::token_plane::is_token_client("r-s5")
+    );
+
+    let ba = allocator("grace-mixed-readers").await;
+    let victim = ba.allocate_block().await.expect("allocate");
+    ba.free_block(victim).await.expect("free");
+    assert!(
+        !free_listed(&ba, victim),
+        "an S5 reader is enrolled: the free rides the ring"
+    );
+    assert_eq!(ba.grace_len(), 1);
+    assert_eq!(free_grace::s5_reader_deferrals(), 1);
+    assert_eq!(free_grace::deferrals(), 1);
+    assert_eq!(free_grace::recall_gated_frees(), 0);
+    closure_holds();
+
+    // The ring's law governs the mixed set, untouched: the bound is the
+    // MIN acknowledged epoch over every live reader — the S5 reader's ack
+    // and the token reader's (its S5 control-plane poll still carries
+    // one) both count, so on a mixed set a free waits the S5 price.
+    let label = ba.grace_oldest_label().expect("held entry");
+    ack(&owner, "r-s5", s5.epoch, label);
+    assert!(
+        !free_listed(&ba, victim),
+        "the token reader's control-plane ack is still owed under the ring's law"
+    );
+    ack(&owner, "r-tok", tok.epoch, label);
+    let reused = ba.allocate_block().await.expect("allocate");
+    assert_eq!(reused, victim, "released by the acknowledgements");
+    assert_eq!(free_grace::releases(), 1);
+    closure_holds();
+
+    // The S5 reader leaves: every live reader is a token client — direct.
+    owner.evict("r-s5", "left").expect("evict");
+    let later = ba.allocate_block().await.expect("allocate");
+    ba.free_block(later).await.expect("free");
+    assert!(
+        free_listed(&ba, later),
+        "no S5 reader left: the recall gate is direct"
+    );
+    assert_eq!(free_grace::recall_gated_frees(), 1);
+    assert_eq!(free_grace::s5_reader_deferrals(), 1, "no new deferral");
+    closure_holds();
+    free_grace::disarm_recall_gate();
 }

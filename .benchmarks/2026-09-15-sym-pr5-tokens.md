@@ -215,3 +215,33 @@ Tree `6695fa45` (the code tree; the ledger's own docs commit follows). `CARGO_IN
 | `sym_coherence_tests` ×5 stamped / ×2 flat, `--test-threads=1`, from zero | 7/7 — **29 passed** each (26 → 29 contracts), 47.8–48.8 s |
 | `readonly_mount_tests` (35) / `reader_free_grace_tests` (66) / `dlm_membership_tests` (51) / `docs_parity_tests` (5) / `env_knob_convention_tests` (22), flat AND stamped | green on both legs (10/10) |
 | `tests/run_sym_forest_suites.sh` (29 suites, both legs, once) | **PASS / PASS**, no ratio NOTE; `sym_coherence_tests` 47.9 / 47.7 s (1.00), `sym_slot_transfer_tests` 33.7 / 33.8 s (1.00) |
+
+## 10. Round 4 (2026-09-15) — the rebase onto the dev tip `c6683b19` (PR 7 `cdead68d`, PR 6 `78dedf4c`, PR 8 `c6683b19` landed after the base `6f8d44e6`)
+
+`git rebase --onto FETCH_HEAD 6f8d44e6 feat/sym-tokens` — 47 commits replayed; 9 conflict sites, every one composed ADDITIVELY (dev's side first, PR 5's after; marker LINES removed exactly — a first attempt that stripped `=======` by substring joined a `// ====` banner in `fuse_client.rs` and was aborted and redone from the pre-rebase tip):
+
+| File | Composition |
+|---|---|
+| `fuzz/Cargo.toml` | PR 8's `data_alloc_bitmap_page` `[[bin]]` then PR 5's `bset_frame_v2`, each with its own tail |
+| `src/fuse_client.rs` (stats JSON) | PR 7 / PR 6 / PR 8's blocks, then PR 5's Token block (no duplicated key — a sweep of every `"…".into()` key found ONE clash, below) |
+| `docs/operations.md` | PR 7, PR 6, PR 8 sections, then PR 5's |
+| `tests/run_sym_forest_suites.sh` | PR 7's two suites, PR 6's, PR 8's, then `sym_coherence_tests` — **33 suites** (dev's 32 + 1) |
+| `docs/design-symmetric-metadata.md` (PR-plan rows 5/6/7, three commits) | by ROW: PR 5's LANDED row 5 (its round-2/3 clauses), dev's LANDED rows 6 and 7 |
+| `AGENTS.md` | PR 7 / PR 6 / PR 8 paragraphs then PR 5's; the "Pre-RC hardening families" paragraph composed word-wise (PR 6's `cross_owner_refusals` clause, PR 8's allocation clause, PR 5's `reader_staleness_bound_ms` clause — disjoint) |
+| `loom-models/src/lib.rs` (two commits) | PR 7's `shared_ref_models` + PR 8's `park_gate_models` with their OWN closing delimiters, then `token_grant_models` (the unclosed-delimiter class); the `#[cfg(all(test, loom))]` gate re-attached to `token_grant_models` |
+| `tests/derivation_sweep_tests.rs`, `tests/decoder_property_tests.rs` | PR 8's fn/proptest block closed with its own tail, then PR 5's |
+
+**The semantic seams** (each compiled AND re-meant, pinned where it changes behaviour — `tests/sym_coherence_tests.rs`, three new contracts):
+
+| Seam | Verdict | Pin |
+|---|---|---|
+| (a) `finish_free`'s recall gate beside `self.grace.defer` vs PR 8's re-homed free ladder (the allocation HOLDER runs `begin_free → purge → reclaim → finish_free`; the bitmap IS the free list) | The order is STRUCTURAL: a displaced block's free — local or shipped (`cowriter::ship_displaced_frees` → `execute_shipped_frees` at the holder) — is issued from the displacing publish's post-commit tail, and that commit is the conveyor pass that recalled the object's readers before its apply; the gate's process-global window (`RECALL_UNACKED_UNTIL_MS`) covers every ring of the process, which is the holder's today. **Owed to PR 12** (N processes): a live-timeout window opened at the SHIPPER does not reach a holder in another process — the free ship must carry it. | `a_displacing_publishs_recall_completes_before_the_holders_free_clears_the_bit` — 2 volumes, the lease on the slot-0 volume, a granted block's bit SET through the parked recall, CLEARED at `finish_free` after the ack, `free_grace_recall_gated_frees` +1, no ring deferral |
+| (b) `membership.rs`: `live_reader_ids` / `lease_deadline_ms` / the departure sink over PR 8's sharded membership | PR 8's shard is WHICH owner a member renews with (its home volume's manager — V shards over V managers is PR 12's owner-role fusion); in one process `installed_owner()` is the one plane and `members` one map, so the reads and `Unknown ⇒ Expired` hold per shard by construction — a `-o ro` token reader is homed on volume 0 (it arms no appender) and renews with this process's owner. The two hooks sit AFTER `members.remove_sync` in `leave` and `evict` (verified post-rebase) and read nothing of `members`. Owed to PR 12: the verdict must consult the client's HOME shard's owner when the holder's process is not it. | the round-3 eviction pin re-run green on the rebased tree |
+| (c) `lease_live`'s `fenced()/self_fence_due()` under PR 8's `poison` split | `self_fence_as(SymmetricAppender)` parks only a `Writer` member on a mount that armed the appender region; a token READER is a `Reader` member holding no region — its `T_self` falls through to the poison (fenced, purge requested, nothing parked) and the plane's lease gate reads it (serves nothing). **PR 8's stand-in for this plane WIRED**: `park_gate::admits_token_service` — a PARKED lessee is still the lock master and keeps granting/recalling; an EXPIRED park refuses every token verb (`dlm_token_park_expired_refusals`). | `a_token_readers_t_self_poisons_and_never_parks_under_the_appender_posture` (the reader's poison under the armed posture; grants through the park; every verb refused past the expiry, a new reader's channel never fresh) |
+| (d) PR 7's `shared_refs` index home + PR 8's `index_home_volume_for` | no token seam; compiles; `sym_shared_refs_tests` both legs in the ledger | — |
+| (e) PR 6's travelling `XvGuards` and the recall hook at the top of the pass | The guards travel BEFORE the step ships; the step applies at the holder as an ordinary commit through the conveyor pass whose FIRST act under the guards is the recall — so a foreign step never applies before its readers are recalled, by the hook's position, not by a new ordering. | `a_cross_owner_create_recalls_the_parents_token_before_its_shipped_step_applies` (PR 6's two-holder fixture: the reader's parent token is recalled and the `InsertDentry` step cannot apply until the ack; exact at the next lookup) |
+| (f — found by the rebase) one stats key in two PRs | PR 8 exports `free_grace_timeout_deferrals` as Σ of its per-ring forced releases; PR 5's round-1 gauge of the same name (the recall gate's live-timeout deferrals) overwrote it after the composition. PR 5's is renamed `free_grace_recall_timeout_deferrals` everywhere on its side. | the round-1 contracts on the renamed fn |
+
+### 10.1 Run ledger (the rebased tree)
+
+RUN_LEDGER_4

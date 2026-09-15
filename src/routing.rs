@@ -7826,13 +7826,15 @@ impl DataRouter {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// **The shared-block index's HOME** — resolved behind ONE function
-    /// (`shared_refs::index_home_volume`: volume 0's manager in PR 7; PR 8
-    /// re-points it to the data volume's allocation-lease holder, and PR
-    /// 12 makes a non-manager reach it over `ManagerClient::share_block`
-    /// / `release_shared` — this mount's own tree 0 today).
-    fn shared_index_home(
+    /// **The shared-block index's HOME for data volume `vol_tag`** —
+    /// resolved behind ONE function (`shared_refs::index_home_volume_for`:
+    /// the data volume's allocation-lease holder's home volume — PR 8's
+    /// re-point of PR 7's "volume 0's manager"; PR 12 makes a non-manager
+    /// reach it over `ManagerClient::share_block` / `release_shared` —
+    /// this mount's own tree 0 today).
+    fn shared_index_home_for(
         &self,
+        vol_tag: u64,
     ) -> Result<&std::sync::Arc<crate::meta_backend::kv::backend::KvMetaBackend>> {
         let mb = self.inner.meta_backend.get().ok_or_else(|| {
             SqueezefsError::InvalidOperation(
@@ -7840,7 +7842,9 @@ impl DataRouter {
             )
         })?;
         mb.volumes
-            .get(crate::meta_backend::kv::shared_refs::index_home_volume())
+            .get(crate::meta_backend::kv::shared_refs::index_home_volume_for(
+                vol_tag,
+            ))
             .ok_or_else(|| {
                 SqueezefsError::InvalidOperation(
                     "shared-block index: the home volume is not mounted".to_string(),
@@ -7870,9 +7874,9 @@ impl DataRouter {
         self.inner
             .symmetric_armed
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let home = self.shared_index_home()?;
         let mut seeded = 0u64;
         for (tag, alloc) in self.backend_router.durable_ref_volumes() {
+            let home = self.shared_index_home_for(tag)?;
             for r in home.shared_index_scan(tag).await.map_err(|e| {
                 SqueezefsError::InvalidOperation(format!("shared-block index scan failed: {e}"))
             })? {
@@ -7916,7 +7920,9 @@ impl DataRouter {
     ) -> Result<crate::meta_backend::kv::shared_refs::SharedRelease> {
         let home = mb
             .volumes
-            .get(crate::meta_backend::kv::shared_refs::index_home_volume())
+            .get(crate::meta_backend::kv::shared_refs::index_home_volume_for(
+                vol_tag,
+            ))
             .ok_or_else(|| {
                 SqueezefsError::InvalidOperation(
                     "shared-block index: the home volume is not mounted".to_string(),
@@ -8037,13 +8043,22 @@ impl DataRouter {
                 alloc.mark_shared(offset);
             }
         }
-        // Step 2 — at the home, both inos per block, chunked under the
-        // control entry's value/length cap (≈ 50 B per record).
-        let home = self.shared_index_home()?;
-        for chunk in index_refs.chunks(512) {
-            home.share_block(chunk).await.map_err(|e| {
-                SqueezefsError::InvalidOperation(format!("ShareBlock at the home: {e}"))
-            })?;
+        // Step 2 — at each data volume's home, both inos per block,
+        // chunked under the control entry's value/length cap (≈ 50 B per
+        // record). The home is per DATA volume (PR 8's re-point); a
+        // clone's references may span data volumes.
+        let mut by_home: std::collections::BTreeMap<u64, Vec<_>> =
+            std::collections::BTreeMap::new();
+        for r in &index_refs {
+            by_home.entry(r.vol_tag).or_default().push(r.clone());
+        }
+        for (tag, refs) in &by_home {
+            let home = self.shared_index_home_for(*tag)?;
+            for chunk in refs.chunks(512) {
+                home.share_block(chunk).await.map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!("ShareBlock at the home: {e}"))
+                })?;
+            }
         }
         Ok(shared_idx)
     }

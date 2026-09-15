@@ -513,7 +513,7 @@ impl AllocHolding {
     /// task releases its latch and re-checks the queue before it exits,
     /// so a delta queued after its last drain is journaled by it or by
     /// the kick that took the latch, never left waiting.
-    pub fn kick_journaler(self: &Arc<Self>) {
+    fn kick_journaler(self: &Arc<Self>) {
         if self
             .journaler_running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -2024,10 +2024,52 @@ pub async fn arm_symmetric_allocation(
         // checked against it in the LOSS direction — a block the derived
         // allocator holds live that the bitmap reads CLEAR would be re-
         // granted, so the arm refuses loud rather than allocate beside it.
-        // The arm runs before FUSE serves (the mount path), so the snapshot
-        // is quiescent.
+        // The snapshot is 1 bit per block below the cursor (Issue 29a). The
+        // arm runs before FUSE serves (the mount path), so it is quiescent
+        // — and that is CHECKED, not assumed (Issue 29b): a second snapshot
+        // after the hold must equal the first.
         let derived = alloc.derived_allocation_snapshot();
-        let holding = acquire_and_hold(vol0, me, home_vol, vol_tag, blocks, &derived.set)
+        // The seed's structural guard (review round 3, Issue 27): the
+        // derived state is the mount-time by-block seed's — on a forest
+        // PR 7 keeps that ONE scan as the free list's derivation — so an
+        // allocator whose cursor reads 0 while the set's durable reference
+        // ledger names blocks of this volume is UN-SEEDED (a rung that
+        // skipped the scan), and seeding from it would re-grant every live
+        // block. The ledger's union over the set's volumes (every slot tree
+        // on a forest — `block_ref_scan`'s law) is read here, O(refs) once
+        // per data volume at the arm, and is also the loss check's second
+        // witness below.
+        let mut durable: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for kv in &routed.volumes {
+            for r in kv.block_ref_scan(vol_tag).await.map_err(|e| {
+                crate::error::SqueezefsError::InvalidOperation(format!(
+                    "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): the durable \
+                     reference scan on {} failed: {e}",
+                    alloc.volume_id(),
+                    kv.device_path().display()
+                ))
+            })? {
+                durable.insert(r.block_idx);
+            }
+        }
+        if derived.highest == 0 && !durable.is_empty() {
+            return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): the allocator \
+                 reports an UN-SEEDED derived state (cursor 0) while the set's durable \
+                 reference ledger names {} block(s) of it — the mount-time by-block seed did \
+                 not run; refusing to seed the allocation bitmap from an empty truth (every live \
+                 block would be re-granted)",
+                alloc.volume_id(),
+                durable.len()
+            )));
+        }
+        let seed: Vec<u64> = derived
+            .set_blocks()
+            .chain(durable.iter().copied())
+            .collect::<std::collections::BTreeSet<u64>>()
+            .into_iter()
+            .collect();
+        let holding = acquire_and_hold(vol0, me, home_vol, vol_tag, blocks, &seed)
             .await
             .map_err(|e| {
                 crate::error::SqueezefsError::InvalidOperation(format!(
@@ -2035,10 +2077,23 @@ pub async fn arm_symmetric_allocation(
                     alloc.volume_id()
                 ))
             })?;
+        let after = alloc.derived_allocation_snapshot();
+        if after != derived {
+            return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): the allocator \
+                 moved during the arm (cursor {} → {}, {} → {} set) — the seed is a snapshot \
+                 taken before FUSE serves and nothing may allocate or free beside it; refusing \
+                 to arm on a torn snapshot",
+                alloc.volume_id(),
+                derived.highest,
+                after.highest,
+                derived.population(),
+                after.population()
+            )));
+        }
         let loss: Vec<u64> = derived
-            .set
-            .iter()
-            .copied()
+            .set_blocks()
+            .chain(durable.iter().copied())
             .filter(|b| !holding.bitmap.is_set(*b))
             .collect();
         if !loss.is_empty() {
@@ -2064,10 +2119,12 @@ pub async fn arm_symmetric_allocation(
         let writer = crate::meta_ship::manager::wire_writer_name(&me.into());
         alloc.install_block_grant_arm(vol_tag, holder_block_grant_sink(vol0, vol_tag, writer));
         log::info!(
-            "symmetric allocation arm: data volume '{}' — {} derived-live block(s) seeded/verified \
-             SET, {drained} free-listed block(s) drained into the bitmap",
+            "symmetric allocation arm: data volume '{}' — {} derived-live block(s) ({} durably \
+             referenced) seeded/verified SET, {drained} free-listed block(s) drained into the \
+             bitmap",
             alloc.volume_id(),
-            derived.set.len()
+            derived.population(),
+            durable.len()
         );
         log::info!(
             "symmetric allocation arm: data volume '{}' leased at term {} ({} block(s), pages \

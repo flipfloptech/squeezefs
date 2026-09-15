@@ -452,13 +452,39 @@ pub struct BlockAllocator {
 
 /// The allocator's derived allocation truth at one instant (PR 8 —
 /// [`BlockAllocator::derived_allocation_snapshot`]): the dense cursor,
-/// the blocks below it that are NOT reallocatable now (`set`), and the
-/// free list's blocks below it (`free`).
+/// the blocks below it that are NOT reallocatable now as ONE BIT PER
+/// BLOCK (`set_words` — 8 B per 64 blocks: 512 KiB per 4 M-block volume,
+/// the same order as the bitmap it seeds; review round 3, Issue 29a), and
+/// the free list's blocks below it (`free` — bounded by the list).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DerivedAllocation {
     pub highest: u64,
-    pub set: Vec<u64>,
+    set_words: Vec<u64>,
     pub free: Vec<u64>,
+}
+
+impl DerivedAllocation {
+    /// `true` ⇔ `block` is below the cursor and not on the free list.
+    pub fn is_set(&self, block: u64) -> bool {
+        block < self.highest
+            && self
+                .set_words
+                .get((block / 64) as usize)
+                .is_some_and(|w| w & (1u64 << (block % 64)) != 0)
+    }
+
+    /// The SET blocks, ascending.
+    pub fn set_blocks(&self) -> impl Iterator<Item = u64> + '_ {
+        (0..self.highest).filter(move |b| self.is_set(*b))
+    }
+
+    /// The SET population.
+    pub fn population(&self) -> u64 {
+        self.set_words
+            .iter()
+            .map(|w| u64::from(w.count_ones()))
+            .sum()
+    }
 }
 
 /// The writer's grant arm on one data volume (see
@@ -472,6 +498,8 @@ struct BlockGrantArm {
     topups: AtomicU64,
     /// One proactive ask in flight at a time.
     topup_inflight: std::sync::atomic::AtomicBool,
+    /// Wakes an exhausted mint waiting on the proactive ask in flight.
+    topup_done: squeezefs_ipc::sqz_notify::Notify,
     /// The allocator, for the detached proactive ask.
     me: std::sync::Weak<BlockAllocator>,
 }
@@ -968,6 +996,7 @@ impl BlockAllocator {
                 sink,
                 topups: AtomicU64::new(0),
                 topup_inflight: std::sync::atomic::AtomicBool::new(false),
+                topup_done: squeezefs_ipc::sqz_notify::Notify::new(),
                 me: Arc::downgrade(self),
             })
             .is_ok()
@@ -1033,6 +1062,25 @@ impl BlockAllocator {
         }
     }
 
+    /// Wait for a PROACTIVE top-up in flight to land (bounded by the ask's
+    /// own completion — the task always clears the latch). `true` ⇔ one
+    /// was in flight and has completed.
+    async fn block_grant_topup_join(&self) -> bool {
+        let Some(arm) = self.block_grant.get() else {
+            return false;
+        };
+        if !arm.topup_inflight.load(Ordering::Acquire) {
+            return false;
+        }
+        loop {
+            let done = arm.topup_done.notified();
+            if !arm.topup_inflight.load(Ordering::Acquire) {
+                return true;
+            }
+            done.await;
+        }
+    }
+
     /// The PROACTIVE half of the 50 % law (review round 1, Issue 7): a
     /// mint that left the window below its refill point asks for the
     /// top-up off the write path — one detached ask in flight per
@@ -1052,12 +1100,14 @@ impl BlockAllocator {
         }
         let Some(me) = arm.me.upgrade() else {
             arm.topup_inflight.store(false, Ordering::Release);
+            arm.topup_done.notify_waiters();
             return;
         };
         crate::meta_exec::spawn_meta("block_grant_topup", async move {
             let _ = me.block_grant_topup().await;
             if let Some(arm) = me.block_grant.get() {
                 arm.topup_inflight.store(false, Ordering::Release);
+                arm.topup_done.notify_waiters();
             }
         });
     }
@@ -1080,10 +1130,21 @@ impl BlockAllocator {
             .map(|item| *item)
             .filter(|b| *b < highest)
             .collect();
-        let set: Vec<u64> = (0..highest).filter(|b| !free.contains(b)).collect();
+        // 1 bit per block below the cursor (Issue 29a): every bit set,
+        // then the free list's cleared — O(highest / 64) words.
+        let words = highest.div_ceil(64) as usize;
+        let mut set_words = vec![u64::MAX; words];
+        if highest % 64 != 0 {
+            if let Some(last) = set_words.last_mut() {
+                *last = (1u64 << (highest % 64)) - 1;
+            }
+        }
+        for b in &free {
+            set_words[(*b / 64) as usize] &= !(1u64 << (*b % 64));
+        }
         DerivedAllocation {
             highest,
-            set,
+            set_words,
             free: free.into_iter().collect(),
         }
     }
@@ -1923,6 +1984,9 @@ impl BlockAllocator {
     /// releases and provably never did on the motivating row.
     /// `u64::MAX` on an unbounded allocator (space is not a constraint).
     pub fn lane_reachable_blocks(&self) -> u64 {
+        if let Some(armed) = self.grant_supply_blocks() {
+            return armed;
+        }
         let virgin = self.virgin_bytes();
         if virgin == u64::MAX {
             return u64::MAX;
@@ -3578,12 +3642,23 @@ impl BlockAllocator {
             }
         }
         // PR 8: a grant-armed writer's exhausted window asks its holder
-        // for a top-up and retries once; a holder with nothing (full,
+        // for a top-up and retries; a holder with nothing (full,
         // unreachable) leaves the refusal in the `StorageFull` class —
-        // never a poison, never `note_journal_failure`.
-        if is_storage_full(&e) && self.block_grant_armed() && self.block_grant_topup().await {
+        // never a poison, never `note_journal_failure`. The retry runs
+        // whatever the inline ask answered, and once more after a
+        // PROACTIVE ask in flight lands: at the volume's last grant the
+        // two asks race and the holder answers one of them `Full` while
+        // the other carries the grant — the window, not the answer, is
+        // the truth (found by the full-cursor supply pin).
+        if is_storage_full(&e) && self.block_grant_armed() {
+            let _ = self.block_grant_topup().await;
             if let ok @ Ok(_) = self.try_allocate_block() {
                 return ok;
+            }
+            if self.block_grant_topup_join().await {
+                if let ok @ Ok(_) = self.try_allocate_block() {
+                    return ok;
+                }
             }
         }
         if !is_storage_full(&e) {
@@ -4184,11 +4259,31 @@ impl BlockAllocator {
     /// (`grace_supply_blocks` resolves the `DEMAND` lever between this and
     /// the lane-reachable number; the restore-exactly contract reads both).
     pub fn free_supply_blocks(&self) -> u64 {
+        if let Some(armed) = self.grant_supply_blocks() {
+            return armed;
+        }
         let virgin = self.virgin_bytes();
         if virgin == u64::MAX {
             return u64::MAX;
         }
         (virgin / self.chunk_size).saturating_add(self.free_blocks_count())
+    }
+
+    /// The supply a GRANT-ARMED allocator can hand out right now (PR 8
+    /// review round 3, Issue 28): the window's unconsumed remainder plus,
+    /// when this process HOLDS the volume's allocation lease, the bitmap's
+    /// clear population (what the holder can still carve). The flat inputs
+    /// — the virgin tail and the local free list — read 0 on an armed
+    /// allocator at a full cursor (the list is drained at the arm, the
+    /// tail is re-granted holes), which the free-grace valve would read as
+    /// a permanent trough and prod / tighten / fence readers for. `None`
+    /// unarmed (one `OnceLock` probe).
+    fn grant_supply_blocks(&self) -> Option<u64> {
+        let arm = self.block_grant.get()?;
+        let held = crate::meta_backend::kv::alloc_lease::holding(arm.vol_tag).map_or(0, |h| {
+            h.bitmap.blocks().saturating_sub(h.bitmap.population())
+        });
+        Some(arm.window.remaining().saturating_add(held))
     }
 
     /// The PRESSURE harvest: what allocation runs when it is about to

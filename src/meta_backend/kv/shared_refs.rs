@@ -87,11 +87,25 @@ pub static SHARED_RELEASE_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// the population, so the bound is a loud-refusal belt, never a wait).
 const RELEASE_RESIZE_ATTEMPTS: u32 = 8;
 
-/// The index HOME's volume ordinal in the routed set — **the ONE function
-/// PR 8 re-points** to the data volume's allocation-lease holder. PR 7:
-/// volume 0, whose manager holds the set-wide roles (KD-SYM-2).
+/// The index HOME's volume ordinal in the routed set when no allocation
+/// lease is known — PR 7's default: volume 0, whose manager holds the
+/// set-wide roles (KD-SYM-2). [`index_home_volume_for`] is the resolver
+/// every caller uses.
 pub const fn index_home_volume() -> usize {
     0
+}
+
+/// **The index HOME for data volume `vol_tag`** — PR 8's re-point of the
+/// ONE function (design §5.4.4 / §5.5): the volume the data volume's
+/// ALLOCATION-LEASE HOLDER is homed on (`alloc_lease:{vol_tag}.home_vol`,
+/// read off this process's holding — the holder is this mount on every PR
+/// 8 shape), else PR 7's default. A wire writer's projection of a lease it
+/// does not hold (the record read off the coordinator's tree 0) is PR 12's
+/// join ladder's; until then a non-holder reaches the default home.
+pub fn index_home_volume_for(vol_tag: u64) -> usize {
+    crate::meta_backend::kv::alloc_lease::holding(vol_tag)
+        .map(|h| usize::from(h.home_vol))
+        .unwrap_or_else(index_home_volume)
 }
 
 /// Key prefix of every shared-index record in the home's tree 0.
@@ -525,7 +539,10 @@ impl KvMetaBackend {
     /// bytes, taken holding nothing (the door's pre-admission shape);
     /// released on drop unless handed into the entry.
     async fn pre_admit_control(&self, len: u64) -> std::result::Result<HeldAdmission<'_>, KvError> {
-        let adm = self.admit_user_budget(&self.ring, 0, len).await?;
+        // PR 8: the park pass is dropped with the admission's use here — a
+        // control entry, not a user batch (its durable write is the
+        // verb's terminal outcome; the PR-4 manager pre-admission's shape).
+        let (adm, _park_pass) = self.admit_user_budget(&self.ring, 0, len).await?;
         Ok(HeldAdmission::new(self.ring.core(), Some(adm)))
     }
 
@@ -721,7 +738,7 @@ pub async fn shared_index_drift(
     mb: &crate::meta_backend::RoutedMetaBackend,
     vol_tag: u64,
 ) -> std::result::Result<Vec<SharedIndexDrift>, KvError> {
-    let Some(home) = mb.volumes.get(index_home_volume()) else {
+    let Some(home) = mb.volumes.get(index_home_volume_for(vol_tag)) else {
         return Ok(Vec::new());
     };
     if !home.symmetric_forest() {

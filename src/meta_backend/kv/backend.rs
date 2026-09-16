@@ -6012,17 +6012,23 @@ impl KvMetaBackend {
         // the writer releases — a grant never spans a handover. The grants
         // are RECALLED through the S9 pull channel and the handover is
         // DEFERRED in the retryable class (review round 2, Issues 5/9):
-        // the requester's next tick finds them released.
-        if let Some(recalled) =
-            crate::data_grant::defer_handover_for_custody(self.volume_uuid(), slot)
-        {
-            return Err(KvError::HandoverDeferred(format!(
-                "{}: release of slot {slot} by appender {region_id} deferred — a writer holds \
-                 custody of a file in it from this holder; {recalled} grant(s) recalled this \
-                 tick, the writer releases within one renewal beat (the cadence retries)",
-                self.path.display()
-            )));
-        }
+        // the requester's next tick finds them released. The `Clear`
+        // verdict's mark is HELD to this function's terminal outcome
+        // (round 3): a re-acquire inside the transfer below is deferred to
+        // the slot's next holder, never granted at this one.
+        let _custody_mark =
+            match crate::data_grant::defer_handover_for_custody(self.volume_uuid(), slot) {
+                crate::data_grant::HandoverCustody::Deferred { recalled } => {
+                    return Err(KvError::HandoverDeferred(format!(
+                        "{}: release of slot {slot} by appender {region_id} deferred — a writer \
+                         holds custody of a file in it from this holder; {recalled} grant(s) \
+                         recalled this tick, the writer releases within one renewal beat (the \
+                         cadence retries)",
+                        self.path.display()
+                    )));
+                }
+                crate::data_grant::HandoverCustody::Clear(mark) => mark,
+            };
         // 1. Releasing FIRST: the gate stops new commits at the door
         // before the flush takes any node lock (the loom-pinned order),
         // then the door is drained — the release's half of the Dekker

@@ -1127,6 +1127,21 @@ impl TokenHolderPlane {
                 }
             }
         };
+        // The mark read AGAIN after the grant (round 3 — the grant side of
+        // the Dekker pair with the handover's arm-then-census): a handover
+        // that armed the mark between the check above and this grant took
+        // its census without it, so the grant would span the move — it is
+        // released here and the caller told to retry at the next holder.
+        if crate::data_grant::handover_recall_defers(ino) {
+            owner.release(client, &[grant.grant_id]);
+            return TokenReply::CustodyRefused {
+                status: crate::data_grant::CUSTODY_DEFERRED,
+                reason: format!(
+                    "inode_{ino}'s slot went mid-handover as it was granted — released; retry: \
+                     the slot's next holder grants it"
+                ),
+            };
+        }
         match self
             .serve_grant(volume, client, ask.object, TokenWants::default(), 0, &[])
             .await

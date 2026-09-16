@@ -2720,6 +2720,18 @@ impl CustodyService {
                 Ok(frame) if frame.desired.is_some() => {
                     let desired = frame.desired.expect("guarded");
                     match self.owner.grant_ranged(&frame, desired).await {
+                        Ok(grant) if handover_recall_defers(frame.ino) => {
+                            self.owner.release(&frame.client, &[grant.grant_id]);
+                            Self::refuse(
+                                req.id,
+                                CUSTODY_DEFERRED,
+                                format!(
+                                    "inode_{}'s slot went mid-handover as it was granted — \
+                                     released; retry: the slot's next holder grants it",
+                                    frame.ino
+                                ),
+                            )
+                        }
                         Ok(grant) => reply(
                             req.id,
                             &self.acquire_reply(&frame.client, grant),
@@ -2739,6 +2751,23 @@ impl CustodyService {
                     }
                 }
                 Ok(frame) => match self.owner.grant(&frame).await {
+                    // The mark read AGAIN after the grant (round 3 — the
+                    // grant side of the Dekker pair with the handover's
+                    // arm-then-census): a grant a concurrent handover's
+                    // census missed would span the move — released here,
+                    // the writer retries at the next holder.
+                    Ok(grant) if handover_recall_defers(frame.ino) => {
+                        self.owner.release(&frame.client, &[grant.grant_id]);
+                        Self::refuse(
+                            req.id,
+                            CUSTODY_DEFERRED,
+                            format!(
+                                "inode_{}'s slot went mid-handover as it was granted — \
+                                 released; retry: the slot's next holder grants it",
+                                frame.ino
+                            ),
+                        )
+                    }
                     Ok(grant) => reply(req.id, &self.acquire_reply(&frame.client, grant), "grant"),
                     Err(status) => Self::refuse(
                         req.id,
@@ -5751,20 +5780,88 @@ pub async fn acquire_range_at_slot_holder(
 
 // ---- Custody across a handover (design §5.1.4) ----------------------------
 
-/// The slots whose custody grants a handover RECALLED, with the instant
-/// the recall began: a grant of an object in one of them is DEFERRED
+/// The slots marked MID-HANDOVER for the grant paths, with the instant the
+/// mark was armed: a grant of an object in one of them is DEFERRED
 /// (`CUSTODY_DEFERRED`) until the slot has moved — else the recalled
 /// writer's re-acquire would undo the recall and the handover would never
-/// complete. An entry expires after [`handover_recall_bound`] (a
-/// requester that stopped retrying must not leave the slot's files
-/// un-grantable); the next handover attempt re-arms it. Keyed on the
-/// volume's superblock uuid + forest slot.
+/// complete, or (round 3's ×10 finding) land at the OLD holder inside the
+/// flush-then-transfer and span the move. Two lifetimes: a mark armed by
+/// a DEFERRED tick expires after [`handover_recall_bound`] (a requester
+/// that stopped retrying must not leave the slot's files un-grantable;
+/// the next attempt re-arms it); a mark HELD by a completing handover
+/// ([`HandoverCustodyMark`]) or by the leave never expires — it is
+/// cleared at the handover's terminal outcome, or dies with the leaving
+/// process (the disarm clears it). Keyed on the volume's superblock uuid +
+/// forest slot.
 static HANDOVER_RECALLS: Lazy<
-    parking_lot::Mutex<HashMap<(u128, crate::meta_backend::kv::record::ForestSlot), Instant>>,
+    parking_lot::Mutex<HashMap<(u128, crate::meta_backend::kv::record::ForestSlot), HandoverMark>>,
 > = Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
 /// `HANDOVER_RECALLS.len()` — the fast path's one relaxed load: every
 /// shipped acquire reads 0 here and touches nothing else.
 static HANDOVER_RECALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// One mid-handover mark: when it was armed and whether a handover HOLDS
+/// it (held marks do not expire).
+#[derive(Clone, Copy, Debug)]
+struct HandoverMark {
+    since: Instant,
+    held: bool,
+}
+
+type HandoverKey = (u128, crate::meta_backend::kv::record::ForestSlot);
+
+/// Arm (or re-arm) `key`'s mark; returns the stamp written.
+fn arm_handover_mark(key: HandoverKey, held: bool) -> Instant {
+    let since = Instant::now();
+    let mut set = HANDOVER_RECALLS.lock();
+    set.insert(key, HandoverMark { since, held });
+    HANDOVER_RECALL_COUNT.store(set.len(), Ordering::Release);
+    since
+}
+
+/// **A handover in flight holds its slot's mark** (round 3 — the ×10
+/// stamped finding: the completing tick found no live grant, CLEARED the
+/// mark and ran the flush-then-transfer unmarked, so a recalled writer's
+/// retry inside that window was GRANTED at the old holder and the grant
+/// spanned the move — `held() == 1` at the old holder after it). The
+/// mark is armed BEFORE the handover's grant census and dropped at the
+/// handover's TERMINAL outcome (the slot moved, or the release aborted
+/// and the slot stayed) — with the grant paths' post-grant re-check
+/// ([`handover_recall_defers`] read again AFTER `owner.grant`, both
+/// sides under the owner's grant lock and the mark's) this is the Dekker
+/// pair: a grant that landed before the census is seen and recalled, one
+/// that landed after sees the mark and releases itself DEFERRED. A later
+/// re-arm (the next tick's, the leave's) is preserved: the drop clears
+/// the mark only if it still carries this handover's stamp.
+#[must_use = "the mark is cleared when this guard drops — hold it through the transfer"]
+pub struct HandoverCustodyMark {
+    key: HandoverKey,
+    stamp: Instant,
+}
+
+impl Drop for HandoverCustodyMark {
+    fn drop(&mut self) {
+        let mut set = HANDOVER_RECALLS.lock();
+        if set
+            .get(&self.key)
+            .is_some_and(|m| m.held && m.since == self.stamp)
+        {
+            set.remove(&self.key);
+            HANDOVER_RECALL_COUNT.store(set.len(), Ordering::Release);
+        }
+    }
+}
+
+/// [`defer_handover_for_custody`]'s verdict.
+pub enum HandoverCustody {
+    /// Live grants on the slot were RECALLED (`recalled` newly this tick;
+    /// the rest were already recalled) — the handover is DEFERRED; the
+    /// mark stands until the next tick re-arms it or the bound expires.
+    Deferred { recalled: usize },
+    /// No live grant — the handover may proceed; the mark stands while
+    /// the guard lives.
+    Clear(HandoverCustodyMark),
+}
 
 /// How long a slot stays "mid-handover" for the grant path after its
 /// recall began: two renewal beats of the holder's S9 clocks — the recall
@@ -5812,7 +5909,7 @@ pub fn handover_recall_defers(ino: u64) -> bool {
     let bound = handover_recall_bound(&owner);
     let mut set = HANDOVER_RECALLS.lock();
     match set.get(&key) {
-        Some(since) if since.elapsed() < bound => true,
+        Some(m) if m.held || m.since.elapsed() < bound => true,
         Some(_) => {
             set.remove(&key);
             HANDOVER_RECALL_COUNT.store(set.len(), Ordering::Release);
@@ -5888,40 +5985,50 @@ pub fn slot_custody_live(
 /// answers `None` — the slot moves, and the file's next custody comes
 /// from the new holder. A grant never spans a handover: no write lands
 /// under a stale holder's custody, and no acked write is lost (nothing is
-/// voided — the recall is not the `dead_grants` revocation).
+/// voided — the recall is not the `dead_grants` revocation). The
+/// `Clear` verdict carries the HELD mark (round 3): the caller keeps it
+/// through the flush-then-transfer, so a re-acquire inside the transfer
+/// is deferred to the new holder instead of granted at this one.
 pub fn defer_handover_for_custody(
     volume_uuid: u128,
     slot: crate::meta_backend::kv::record::ForestSlot,
-) -> Option<usize> {
-    let recalled = recall_slot_custody(volume_uuid, slot)?;
-    HANDOVER_CUSTODY_DEFERRALS.fetch_add(1, Ordering::Relaxed);
-    Some(recalled)
+) -> HandoverCustody {
+    let key = (volume_uuid, slot);
+    // The mark FIRST, held: the Dekker's arm half (a grant that lands
+    // after the census below reads it and defers itself).
+    let stamp = arm_handover_mark(key, true);
+    match recall_slot_custody(volume_uuid, slot) {
+        Some(recalled) => {
+            // Deferred: the mark stays armed but UNHELD — it expires at the
+            // bound if the requester abandons the handover.
+            {
+                let mut set = HANDOVER_RECALLS.lock();
+                if let Some(m) = set.get_mut(&key) {
+                    m.held = false;
+                }
+            }
+            HANDOVER_CUSTODY_DEFERRALS.fetch_add(1, Ordering::Relaxed);
+            HandoverCustody::Deferred { recalled }
+        }
+        None => HandoverCustody::Clear(HandoverCustodyMark { key, stamp }),
+    }
 }
 
-/// The recall itself (the handover's and the leave's ONE mechanism):
-/// `Some(newly recalled)` while live grants exist on the slot — the slot
-/// marked mid-handover (the mark re-armed), every live grant recalled
-/// (idempotent per grant) — `None` when nothing is live (the mark
-/// cleared).
+/// The recall itself (the handover's and the leave's ONE mechanism), run
+/// with `slot`'s mark ALREADY armed by the caller: `Some(newly recalled)`
+/// while live grants exist on the slot — every live grant recalled
+/// (idempotent per grant) — `None` when nothing is live. Never clears the
+/// mark: its lifetime is the caller's (the handover's guard, the leave's
+/// process, the deferred tick's bound).
 fn recall_slot_custody(
     volume_uuid: u128,
     slot: crate::meta_backend::kv::record::ForestSlot,
 ) -> Option<usize> {
     let inos = slot_custody_inos(volume_uuid, slot);
-    let key = (volume_uuid, slot);
     if inos.is_empty() {
-        let mut set = HANDOVER_RECALLS.lock();
-        if set.remove(&key).is_some() {
-            HANDOVER_RECALL_COUNT.store(set.len(), Ordering::Release);
-        }
         return None;
     }
     let owner = custody_owner()?;
-    {
-        let mut set = HANDOVER_RECALLS.lock();
-        set.insert(key, Instant::now());
-        HANDOVER_RECALL_COUNT.store(set.len(), Ordering::Release);
-    }
     let recalled = owner.recall_grants_on(&inos);
     if recalled > 0 {
         log::info!(
@@ -5952,7 +6059,12 @@ pub fn handover_recalls_pending() -> usize {
 /// (the uncovered-region posture — loud; the next open recovers them as
 /// own residue) rather than let another lessee grant the same file while
 /// a writer still holds this holder's custody. Empty unarmed (no owner /
-/// no arm), the shipped leave verbatim.
+/// no arm), the shipped leave verbatim. Every held slot's mark is armed
+/// HELD before the census and never cleared here (round 3 — the leave's
+/// half of the Dekker pair with the grant paths' re-check): a grant that
+/// lands at a leaving holder after its census sees the mark and defers
+/// itself to the slot's next holder; the marks die with the process (the
+/// disarm clears them).
 pub async fn recall_custody_at_leave(
     volume_uuid: u128,
     slots: &[crate::meta_backend::kv::record::ForestSlot],
@@ -5960,6 +6072,14 @@ pub async fn recall_custody_at_leave(
     let Some(owner) = custody_owner() else {
         return Vec::new();
     };
+    if SLOT_CUSTODY.load().is_none() {
+        // No arm: no grant of this process names a slot (the shipped S9
+        // posture) — nothing to recall, no mark to hold.
+        return Vec::new();
+    }
+    for s in slots {
+        arm_handover_mark((volume_uuid, *s), true);
+    }
     let live: Vec<_> = slots
         .iter()
         .copied()
@@ -5983,9 +6103,6 @@ pub async fn recall_custody_at_leave(
             .filter(|s| slot_custody_live(volume_uuid, *s))
             .collect();
         if still.is_empty() {
-            for s in &live {
-                recall_slot_custody(volume_uuid, *s);
-            }
             return Vec::new();
         }
         if started.elapsed() >= bound {

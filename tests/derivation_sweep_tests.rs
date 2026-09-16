@@ -2857,3 +2857,53 @@ fn sym_custody_handover_park_and_bounds_derive_from_the_lease_clocks() {
         "many retries fit one mark"
     );
 }
+
+/// PR 10's recovery time bound (design-symmetric-metadata §5.9 / §11): a
+/// dead region's window of `ring_bytes` holds at most `ring / 230 B`
+/// entries (the measured journal entry per create, §1.4), clustered into
+/// at most `entries / (800 × node_size / 256 KiB)` leaves — each ONE cold
+/// leaf load at the measured 120 µs upper end — plus 1 µs of fold per
+/// entry and ONE barriered checkpoint cycle (the landing ceiling of the
+/// cadence in force). Monotone in the ring, scaled by the node size, and
+/// the same landing-ceiling derivation the flush ceiling rides. Drift on
+/// any term is red here; the published per-volume gauge is 0 on a flat
+/// volume (no region can die there).
+#[test]
+fn sym_appender_recovery_bound_derives_from_the_ring_the_node_size_and_the_landing_ceiling() {
+    use squeezefs::meta_backend::kv::backend::appender_recovery_bound_ms;
+    use squeezefs::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_ms;
+    let node = 256 * 1024u64;
+    for (ring, flush) in [
+        (512u64 * 1024, 50u64),
+        (1 << 20, 50),
+        (32 << 20, 0),
+        (32 << 20, 5_000),
+    ] {
+        let entries = ring / 230;
+        let leaves = entries.div_ceil(800);
+        let expected = leaves.saturating_mul(120).div_ceil(1_000)
+            + entries.saturating_mul(1_000).div_ceil(1_000_000)
+            + checkpoint_landing_ceiling_ms(flush);
+        assert_eq!(
+            appender_recovery_bound_ms(ring, node, flush),
+            expected,
+            "ring {ring} flush {flush}: leaf loads + fold + one landing ceiling"
+        );
+    }
+    // Monotone in the ring; a smaller node holds fewer files per leaf and
+    // costs more loads for the same window.
+    assert!(
+        appender_recovery_bound_ms(32 << 20, node, 50)
+            > appender_recovery_bound_ms(1 << 20, node, 50)
+    );
+    assert!(
+        appender_recovery_bound_ms(32 << 20, 64 * 1024, 50)
+            > appender_recovery_bound_ms(32 << 20, node, 50)
+    );
+    // The shipped shape: a 32 MiB ring at 256 KiB nodes under the 50 ms
+    // cadence — ≈ 146 k entries, 183 leaves, 22 + 146 + 1,100 ms.
+    assert_eq!(
+        appender_recovery_bound_ms(32 << 20, node, 50),
+        22 + 146 + 1_100
+    );
+}

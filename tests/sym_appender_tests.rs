@@ -1261,14 +1261,16 @@ async fn a_foreign_live_page_refuses_the_writer_open_and_a_probe_lists_it() {
         Ok(_) => panic!("a writer must not mount a declared region over a foreign Live page"),
         Err(e) => e.to_string(),
     };
-    // The refusal names the driver that OWNS the remedy (PR 10) and no
-    // verb this binary lacks; it fires at the JOIN, after the D0 claim
-    // gate — a live foreign holder gets D0's own message first.
+    // The refusal names the remedy this binary HAS (PR 10: the death
+    // ledger's driver recovers a recorded death; `squeezefs appender
+    // clear` attests one the plane never recorded); it fires at the
+    // JOIN, after the D0 claim gate — a live foreign holder gets D0's
+    // own message first.
     assert!(
-        err.contains("PR 10")
-            && err.contains("Refusing to join")
-            && !err.contains("appender clear"),
-        "the refusal names PR 10 as the recovery driver and nothing that does not exist: {err}"
+        err.contains("refusing to join")
+            && err.contains("appender clear")
+            && err.contains("death ledger"),
+        "the refusal names the ledger's driver and the attestation verb: {err}"
     );
     // A probe never writes and lists the page as it stands.
     let probe = squeezefs::meta_backend::kv::backend::KvMetaBackend::open_probe(path)
@@ -1292,29 +1294,45 @@ async fn a_foreign_live_page_refuses_the_writer_open_and_a_probe_lists_it() {
     );
 }
 
-/// A `Recovering` page — a recoverer mid-replay (§5.9; nothing writes the
-/// state before PR 10) — is a join refusal too, of any identity: the
-/// design's joiner PARKS, and adopting it `Free` with a fresh ring would
-/// race the recoverer for the ring.
+/// A `Recovering` page of OUR OWN node (§5.9, PR 10): our dead
+/// predecessor's page, mid-recovery by a recoverer that died (or an
+/// operator's `appender clear` attestation of it) — the D0 winner replays
+/// the fixed ring as its own residue exactly as it does a `Live` one
+/// (the partial recovery folded the same records, idempotent by seq) and
+/// JOINS over it: the page is `Live` under us again and every record the
+/// predecessor acked is served. Before PR 10 the state refused the join
+/// of any identity (nothing wrote it); a FOREIGN node's `Recovering` page
+/// is the mount-path gate's (recovered when the ledger names it, refused
+/// naming the verb when nothing does — `sym_crash_matrix_tests`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_recovering_page_refuses_the_join_of_any_identity() {
+async fn an_own_recovering_page_is_own_residue_and_the_join_takes_it_back() {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     let uris = vec![format_stamped_member(dir.path(), "meta0").await];
     let path = std::path::Path::new(&uris[0]);
     let sb = superblock_of_path(path).await;
     // Our OWN identity, mid-recovery: mount once (page Live under us),
-    // then re-stamp the newest page Recovering.
+    // create under it, then re-stamp the newest page Recovering without
+    // a leave (the ring window stays).
     let routed = open_with_partition(&uris, None).await;
-    for v in &routed.volumes {
-        v.shutdown().await.unwrap();
-    }
+    let ino = routed
+        .create(
+            ROOT_INO,
+            "acked_before_the_kill",
+            libc::S_IFREG | 0o644,
+            0,
+            0,
+        )
+        .await
+        .unwrap()
+        .ino;
     drop(routed);
     let offs = appender0_page_offsets(&sb.journal);
     let mut page = read_directory(path, &sb).await.unwrap()[0]
         .page
         .clone()
         .unwrap();
+    assert_eq!(page.state, AppenderState::Live, "no leave ran");
     page.state = AppenderState::Recovering;
     page.generation += 1;
     write_page(
@@ -1324,14 +1342,28 @@ async fn a_recovering_page_refuses_the_join_of_any_identity() {
     )
     .await
     .unwrap();
-    let err = match open_routed_meta_set(&uris).await {
-        Ok(_) => panic!("a writer must not join over a Recovering page"),
-        Err(e) => e.to_string(),
-    };
-    assert!(
-        err.contains("recovering") && err.contains("PR 10"),
-        "the refusal names the state and PR 10: {err}"
+    let again = open_routed_meta_set(&uris)
+        .await
+        .expect("the join takes our page back");
+    let s = stats(&again.volumes[0]);
+    assert_eq!(s.self_recoveries, 1, "the Recovering page was own residue");
+    assert_eq!(
+        again
+            .lookup(ROOT_INO, "acked_before_the_kill")
+            .await
+            .unwrap()
+            .ino,
+        ino
     );
+    let listed = read_directory(path, &sb).await.unwrap();
+    assert_eq!(
+        listed[0].page.as_ref().unwrap().state,
+        AppenderState::Live,
+        "the join wrote the page Live under us"
+    );
+    for v in &again.volumes {
+        v.shutdown().await.unwrap();
+    }
 }
 
 async fn superblock_of_path(path: &std::path::Path) -> SuperblockV3 {

@@ -145,6 +145,38 @@ async fn seeded_volume(dir: &std::path::Path, slot: ForestSlot) -> (Vec<String>,
     (uris, d)
 }
 
+/// [`seeded_volume`] with `n` files created under the directory by the
+/// manager while it holds the slot and checkpointed before the release —
+/// a slot tree of several leaves ON THE DEVICE before any region takes it.
+async fn seeded_volume_with_files(
+    dir: &std::path::Path,
+    slot: ForestSlot,
+    n: usize,
+) -> (Vec<String>, u64, Vec<(String, u64)>) {
+    let uris = format_stamped_set_with_config(dir, 1).await;
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let d = seed_dir_in_slot(&routed, 0, slot, "shared").await;
+    let mut files = Vec::with_capacity(n);
+    for i in 0..n {
+        let name = format!("k{i:04}");
+        let ino = routed
+            .create(d, &name, libc::S_IFREG | 0o644, 1000, 1000)
+            .await
+            .expect("seed create")
+            .ino;
+        files.push((name, ino));
+    }
+    let vol = Arc::clone(&routed.volumes[0]);
+    vol.checkpoint_now().await.unwrap();
+    vol.release_slot_handover(0, slot)
+        .await
+        .expect("release to unleased");
+    shutdown(&routed).await;
+    drop(vol);
+    drop(routed);
+    (uris, d, files)
+}
+
 async fn assert_all_resolve(routed: &RoutedMetaBackend, dir: u64, files: &[(String, u64)]) {
     for (name, ino) in files {
         let got = routed
@@ -1052,6 +1084,69 @@ async fn set_wide_roles_resume_after_a_volume_0_manager_failover() {
     reset_process_state();
 }
 
+/// §5.5.3 item 2 — the parked member's successor observation, its
+/// PRODUCTION writer (PR 8 left it a seam): the home volume's rendezvous
+/// record naming an owner at a NEWER era than the one the member joined
+/// under IS the successor, and its endpoint becomes the parked reclaim's
+/// venue; the joined era's record (the owner, merely slow) and a stale
+/// predecessor's observe nothing. (Every member parking and reclaiming
+/// against it is PR 8's `a_parked_member_reclaims_against_the_successor_
+/// the_ledger_names`; the 8-member storm on N daemons is PR 12's venue.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parked_members_reclaim_venue_is_the_successor_the_home_volumes_rendezvous_names() {
+    use squeezefs::membership::{
+        note_successor_observed, observe_successor, publish_owner_record, successor_endpoint,
+        OwnerRecord,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    note_successor_observed(None);
+    let rec = |term: u64, endpoint: &str| OwnerRecord {
+        v: 1,
+        id: format!("owner-{term}"),
+        term,
+        endpoint: endpoint.to_string(),
+        ttl_ms: 45_000,
+        owner_claim_id: String::new(),
+        ts: alloc_lease::unix_now_ms() / 1_000,
+        pid: std::process::id(),
+        boot: String::new(),
+    };
+    // The owner we joined under (era 7): nothing to observe.
+    publish_owner_record(&vol, &rec(7, "127.0.0.1:7001"))
+        .await
+        .unwrap();
+    assert_eq!(observe_successor(&vol, 7).await, None);
+    assert_eq!(successor_endpoint(), None);
+    // A stale predecessor's record (era 5): nothing.
+    publish_owner_record(&vol, &rec(5, "127.0.0.1:5001"))
+        .await
+        .unwrap();
+    assert_eq!(observe_successor(&vol, 7).await, None);
+    assert_eq!(successor_endpoint(), None);
+    // The successor (era 8) at a new venue: observed, the venue in force.
+    publish_owner_record(&vol, &rec(8, "127.0.0.1:8001"))
+        .await
+        .unwrap();
+    assert_eq!(
+        observe_successor(&vol, 7).await.as_deref(),
+        Some("127.0.0.1:8001")
+    );
+    assert_eq!(successor_endpoint().as_deref(), Some("127.0.0.1:8001"));
+    // Idempotent at the next beat.
+    assert_eq!(
+        observe_successor(&vol, 7).await.as_deref(),
+        Some("127.0.0.1:8001")
+    );
+    note_successor_observed(None);
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
 /// §5.5.2's vol-0 rule composed with the D0 ladder: a manager whose probe
 /// of volume 0's ledger fails for longer than `T_owner` RELEASES its role
 /// (PR 8's decision) and, from then, STOPS refreshing its writer claim —
@@ -1389,6 +1484,220 @@ async fn a_c14_conflict_is_reported_refused_and_cleared_by_the_attestation() {
     assert_eq!(report.counters.slot_custody_conflicts, 0);
     assert_eq!(report.counters.unrecovered_appenders, 0);
     assert!(!report.has_findings(), "{:?}", report.findings);
+    reset_process_state();
+}
+
+// ---------------------------------------------------------------------------
+// §5.6 × §5.9 — a dead holder's open cross-owner intent
+// ---------------------------------------------------------------------------
+
+/// PR 6's window under PR 10's death path: a cross-owner create whose
+/// shipped step the holder refused BEFORE its commit leaves the intent
+/// OPEN (never a fail-stop); the holder then dies with the slot leased to
+/// it. The remount adopts the intent and cannot complete it (the slot's
+/// holder is unreachable — `Abandoned`, counted stuck past the grace
+/// window); the ledger names the holder; the recovery unleases the slot
+/// to the manager and the SAME projection rolls the intent forward
+/// LOCALLY (`recovery_intents_rolled_forward`): the name resolves, the
+/// intent is retired, `xv_cross_owner_intents_stuck` reads 0 again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_holders_open_intent_is_rolled_forward_by_its_recovery() {
+    use squeezefs::meta_backend::crossvol_tx::{
+        cross_owner_stats, TEST_XV_SERVE_REFUSE, TEST_XV_STUCK_AFTER_MS,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, shared) = seeded_volume(dir.path(), SLOT_A).await;
+    let x = foreign(95);
+    // The holder (region 1) serves one create, then refuses the next
+    // before committing: one acked name, one open intent.
+    let routed = open_under_retry(&uris, &Knobs::armed().partition("1:4"))
+        .await
+        .unwrap();
+    let venue = HoldersVenue::stand_up(&routed, &[1]).await;
+    let acked = routed
+        .create(shared, "acked", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap()
+        .ino;
+    TEST_XV_SERVE_REFUSE.store(true, Ordering::SeqCst);
+    routed
+        .create(shared, "open_intent", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect_err("the holder refused before committing");
+    TEST_XV_SERVE_REFUSE.store(false, Ordering::SeqCst);
+    let mut open = 0;
+    for v in &routed.volumes {
+        open += v.xv_scan_intents().await.unwrap().len();
+    }
+    assert_eq!(open, 1, "the intent stays open for roll-forward");
+    // The kill: holder and initiator die together (one process); the
+    // holder's page is restamped a foreign node's.
+    venue.tear_down();
+    drop(routed);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    restamp_page_identity(&uris[0], 1, x).await;
+
+    // The remount adopts the intent; with the slot leased to a holder no
+    // endpoint names, it stays open — stuck past the (seam-shortened)
+    // grace window.
+    TEST_XV_STUCK_AFTER_MS.store(1, Ordering::SeqCst);
+    let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(vol.xv_scan_intents().await.unwrap().len(), 1);
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let n = squeezefs::meta_backend::crossvol_tx::roll_forward_open_intents(&routed)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "no holder serves slot 4");
+    assert_eq!(cross_owner_stats().intents_stuck, 1);
+    // The ledger names the holder; the recovery unleases its slot and the
+    // projection rolls the intent forward locally.
+    let rolled0 = recovery_stats().intents_rolled_forward;
+    assert!(!vol.record_death_with_key(x, 2, 0).await.unwrap());
+    let rep = recover_dead_appenders_set(&routed).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    assert_eq!(rep.intents_rolled_forward, 1, "{rep:?}");
+    TEST_XV_STUCK_AFTER_MS.store(0, Ordering::SeqCst);
+    assert_eq!(recovery_stats().intents_rolled_forward, rolled0 + 1);
+    assert_eq!(vol.xv_scan_intents().await.unwrap().len(), 0);
+    assert_eq!(cross_owner_stats().intents_stuck, 0);
+    assert_eq!(routed.lookup(shared, "acked").await.unwrap().ino, acked);
+    let later = routed.lookup(shared, "open_intent").await.unwrap();
+    assert_eq!(routed.getattr(later.ino).await.unwrap().nlink, 1);
+    assert!(matches!(
+        tree0_state(&vol, SLOT_A).await,
+        Some(SlotState::Unleased { .. } | SlotState::Leased { appender_id: 0, .. })
+    ));
+    shutdown(&routed).await;
+    drop(vol);
+    drop(routed);
+    fsck_clean(&uris).await;
+    reset_process_state();
+}
+
+// ---------------------------------------------------------------------------
+// §5.8.2 / §5.8.3 — the non-PR zombie after the full tail scan
+// ---------------------------------------------------------------------------
+
+/// §5.8.2 on the death path without a device fence: the recoverer
+/// records EVERY leaf's tail of the dead appender's slot trees (the full
+/// tail scan, `recovery_full_tail_scan_bytes`), so a zombie of the dead
+/// mount that appends one more frame under its old generation — onto a
+/// leaf the recovery never touched, at exactly the recorded tail — is
+/// SCREENED at the next load by PR 5's rule 2 (`g ≤ tails_g` at/past the
+/// tail): the frame is never folded, every acked record still resolves,
+/// and fsck is clean. §5.8.3: what the zombie wrote was never acked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_zombie_frame_on_an_untouched_leaf_is_screened() {
+    use squeezefs::meta_backend::kv::node::{
+        append_bset, load_node, AppendDest, FrameStamp, NodeLayout,
+    };
+    use squeezefs::meta_backend::kv::record::{inode_key, InodeValue, Record};
+    use squeezefs::meta_backend::kv::META_KV_FOREIGN_FRAMES_SCREENED;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    // A slot tree of SEVERAL leaves on the device (the manager's seed,
+    // checkpointed), then the dead region's window over its first leaf
+    // alone (`d0_*` sorts before `k*`): the other leaves are untouched.
+    let (uris, shared, seeded) = seeded_volume_with_files(dir.path(), SLOT_A, 1_500).await;
+    let x = foreign(90);
+    let files = kill_with_region_one_live(&uris, "1:4", &[(0, shared)], 8, x).await;
+    let files = &files[0];
+
+    // The recovery: every leaf of slot 4's tree gets its tail recorded —
+    // the untouched ones READ for it (the full tail scan).
+    let scan0 = recovery_stats().full_tail_scan_bytes;
+    let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert!(!vol.record_death_with_key(x, 3, 0).await.unwrap());
+    let rep = recover_dead_appenders_set(&routed).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    assert!(
+        recovery_stats().full_tail_scan_bytes > scan0,
+        "no device fence: the recoverer read every untouched leaf for its tail"
+    );
+    let (g, tails) = vol
+        .slot_tails(SLOT_A)
+        .await
+        .unwrap()
+        .expect("the death path recorded the slot's tails");
+    assert!(tails.len() >= 2, "a multi-leaf tree: {tails:?}");
+    let node_size = vol.superblock().node_size as usize;
+    shutdown(&routed).await;
+    drop(vol);
+    drop(routed);
+
+    // The zombie: appender 1 at its old generation g, one frame at every
+    // recorded tail (the recorded tail IS the leaf's tail — pinned).
+    let layout = NodeLayout::new_symmetric(node_size).unwrap();
+    let zombie = layout.stamped(FrameStamp { appender_id: 1, g });
+    let path = std::path::Path::new(&uris[0]);
+    for (addr, tail) in &tails {
+        let loaded = load_node(path, &layout, *addr, 0).await.unwrap();
+        let dest = loaded.append_dest();
+        assert_eq!(dest.tail_offset, *tail as usize, "leaf {addr:#x}");
+        let bogus = InodeValue {
+            mode: libc::S_IFREG | 0o600,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            flags: 0,
+            rdev: 0,
+            size: 0xDEAD,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+        };
+        let rec = Record::put(
+            inode_key(ino_in_slot(SLOT_A, 0xFFF0)).to_vec(),
+            u64::MAX / 4,
+            bogus.encode(),
+        );
+        let dest = AppendDest {
+            node_addr: dest.node_addr,
+            node_seq: dest.node_seq,
+            tail_offset: *tail as usize,
+        };
+        append_bset(path, &zombie, &dest, &[rec], u64::MAX / 4)
+            .await
+            .expect("the zombie's append lands on the device");
+    }
+
+    // The next open screens it: every acked record resolves, the screen
+    // counted the frame(s), nothing else changed, fsck clean.
+    let screened0 = META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed);
+    let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();
+    assert_all_resolve(&routed, shared, files).await;
+    assert_all_resolve(&routed, shared, &seeded).await;
+    let names = routed.readdir(shared, 0, 4096).await.unwrap();
+    assert_eq!(
+        names.len(),
+        files.len() + seeded.len(),
+        "the zombie's record is not a name and nothing acked is missing"
+    );
+    assert!(
+        META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed) > screened0,
+        "the zombie frame past the recorded tail was screened"
+    );
+    assert_eq!(
+        squeezefs::meta_backend::kv::META_KV_APPENDER_FENCE_BREACH.load(Ordering::Relaxed),
+        0,
+        "no device fence, no breach class"
+    );
+    assert_eq!(
+        routed.volumes[0]
+            .appender_stats()
+            .unwrap()
+            .manager_verb_refusals,
+        0
+    );
+    shutdown(&routed).await;
+    drop(routed);
+    fsck_clean(&uris).await;
     reset_process_state();
 }
 

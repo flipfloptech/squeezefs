@@ -1373,15 +1373,20 @@ impl KvMetaBackend {
     }
 
     /// **The death ledger's RECORD** (§5.5.2): `dead_member:{member} →
-    /// { epoch, ts }` in tree 0 of volume 0. In-process only — PR 10's
-    /// recovery driver is the production writer (the wire's `RecordDeath`
-    /// refuses naming it); the allocation arm's same-node takeover and the
-    /// contracts drive it. Idempotent. **The record's arm on the holder**
-    /// (review round 1, Issue 7): every allocation lease this process
-    /// holds REVOKES the dead writer's open grants and QUARANTINES their
-    /// blocks on the volume's allocator under a dead epoch (S7 — the bits
-    /// stay SET until a drain proof releases them); `dead_members_acted`
-    /// counts the act.
+    /// { epoch, ts, pr_key }` in tree 0 of volume 0. This key-less form
+    /// is the allocation arm's SAME-NODE takeover's (a predecessor of
+    /// another mount slot on this host, dead by the D0 flock's proof —
+    /// it shares this host's registrant, so there is no key to preempt);
+    /// the production writer is the S6 owner's eviction through
+    /// [`crate::membership::install_death_sink`] →
+    /// [`Self::record_death_with_key`] (PR 10, `backend::recovery::
+    /// install_death_ledger_writer`), and the wire's `RecordDeath` is
+    /// served (screened) into the same call. Idempotent. **The record's
+    /// arm on the holder** (review round 1, Issue 7): every allocation
+    /// lease this process holds REVOKES the dead writer's open grants and
+    /// QUARANTINES their blocks on the volume's allocator under a dead
+    /// epoch (S7 — the bits stay SET until a drain proof releases them);
+    /// `dead_members_acted` counts the act.
     pub async fn record_death(
         &self,
         member: AppenderIdentity,

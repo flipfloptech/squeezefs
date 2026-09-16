@@ -84,6 +84,12 @@
 # the plane, its translator pins run on a FLAT kvmap volume and a bare
 # resolver (layout-blind), and its unarmed/flat pin (no slot-custody arm,
 # every acquire the local arbiter, the two PR-9 gauges flat) runs on both.
+# `sym_crash_matrix_tests` (PR 10 — dead-appender recovery: the death
+# ledger's driver, the §5.9 order, C14/C15, `appender clear`, the non-PR
+# zombie screen) rides the list the PR 4 way: its fixtures stamp under
+# the seam themselves (a stamped volume, a declared region killed without
+# a leave, its page restamped a foreign node's), and its fsck legs run
+# the probe over BOTH layouts' walkers.
 #
 # WALL TIME IS A ROW (review round 4, Issue 26): each suite runs under
 # its own timer per leg, and the summary prints `flat`, `stamped` and the
@@ -144,6 +150,7 @@ DEFAULT_SUITES=(
   sym_coherence_tests
   sym_dir_stripe_tests
   sym_custody_tests
+  sym_crash_matrix_tests
 )
 read -r -a SUITES <<<"${SQZ_SYM_SUITES:-${DEFAULT_SUITES[*]}}"
 RATIO_NOTE="${SQZ_SYM_RATIO_NOTE:-2.0}"

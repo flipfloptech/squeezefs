@@ -213,9 +213,14 @@
 #   create [N|N=<n>] [--cowriters K] [--owners=K] [--vm=V]
 #          [--require-host-scoped-subsys]
 #          [--membership[=auto|addr:port]] [--lease-ttl-ms=N] [--multi-writer]
+#          [--symmetric]
 #                 build substrate + format + records + mount the fleet
 #                 (refuses if state exists — run teardown first); --vm=V
-#                 boots V sqz-kernel guests after the fleet is up
+#                 boots V sqz-kernel guests after the fleet is up;
+#                 --symmetric formats bit 17 (the forest + the appender
+#                 region) and arms the writer's SQUEEZEFS_SYMMETRIC_META
+#                 (implies --membership — the death ledger's writer), the
+#                 `run_mw_matrix.sh sym-crash` leg's fleet (PR 10)
 #   status        member table + capability verdict + identity map + VMs
 #   owners        the recorded per-volume ownership assignment (ids,
 #                 volumes, subtree roots, MW ports) — PR 8's legs read it
@@ -834,6 +839,11 @@ mount_member() { # idx [--netns[=<delay_ms>]]
         if [ "$role" = "set-authority" ]; then
             env_args+=("SQUEEZEFS_MW_ROLE=set-authority")
         fi
+        # PR 10: the symmetric plane on the manager (bit 17 was stamped at
+        # format; `=1` is the arm — PR 4's knob).
+        if [ "${SYMMETRIC:-0}" = "1" ]; then
+            env_args+=("SQUEEZEFS_SYMMETRIC_META=1")
+        fi
         # Rung 9: the operator-declared co-writer roster (enrollment is the
         # AUTHORITY's durable act — ops.md §Multi-writer co-writer mounts).
         # A multi-owner fleet never sets it: `volume set-owners` enrolled
@@ -1333,11 +1343,19 @@ verify_owner_fleet() {
 }
 
 create_fleet() {
-    local n="$N_DEFAULT" cowriters=0 owners=0 require_hs=0 vms=0 mw=0 a
+    local n="$N_DEFAULT" cowriters=0 owners=0 require_hs=0 vms=0 mw=0 symmetric=0 a
     local membership="${SQZ_MWFLEET_MEMBERSHIP:-}" lease_ttl_ms="${SQZ_MWFLEET_LEASE_TTL_MS:-}"
     for a in "$@"; do
         case "$a" in
         N=*) n="${a#N=}" ;;
+        # Symmetric PR 10: format `--symmetric` (incompat bit 17, the
+        # forest + the appender region) and arm the WRITER with
+        # SQUEEZEFS_SYMMETRIC_META=1 — the manager of a one-appender
+        # symmetric set (N daemons on one volume is PR 12's). The kill
+        # legs then exercise the death path this binary HAS: the D0
+        # successor's own-residue recovery, the frame screen, the C14/C15
+        # census and the ledger's driver (`run_mw_matrix.sh sym-crash`).
+        --symmetric) symmetric=1 ;;
         --cowriters)
             die "--cowriters takes a value (--cowriters K)"
             ;;
@@ -1393,6 +1411,17 @@ create_fleet() {
         # cannot be SEEN cannot be EVICTED) — imply the default arm loudly.
         membership="auto"
         log "--multi-writer implies --membership (the S9 arm's rung 4 refuses with the plane off)"
+    fi
+    if [ "$symmetric" = "1" ]; then
+        [ "$owners" -eq 0 ] ||
+            die "--symmetric with --owners=$owners: the per-volume-owner recipe and the symmetric forest are two different metadata planes (design-symmetric-metadata §7.3 — set-owners assignments are DROPPED by the conversion)"
+        if [ -z "$membership" ]; then
+            # The death ledger's PRODUCTION writer is the S6 owner's
+            # eviction (PR 10): a symmetric fleet without the plane records
+            # no death and recovers nothing but its own residue.
+            membership="auto"
+            log "--symmetric implies --membership (the death ledger's writer is the S6 owner's eviction)"
+        fi
     fi
     [ -e "$CONF" ] && die "fleet state exists at $STATE — run 'sudo tests/mw_fleet.sh teardown' first"
     ensure_prereqs
@@ -1501,8 +1530,10 @@ create_fleet() {
     # --- format (multi-writer-capable is the DEFAULT class since the
     # rung-10b Phase-B flip — no flag needed) + the durable endpoint
     # records (rung 2, product verb) ------------------------------------------
-    log "format (default = multi-writer-capable) over sqmeta://$meta_uri sqdata://$data_uri"
-    sqz format "sqmeta://$meta_uri" "sqdata://$data_uri" --force \
+    local fmt_args=(--force)
+    [ "$symmetric" = "1" ] && fmt_args+=(--symmetric)
+    log "format (default = multi-writer-capable$([ "$symmetric" = "1" ] && echo ' + --symmetric: bit 17')) over sqmeta://$meta_uri sqdata://$data_uri"
+    sqz format "sqmeta://$meta_uri" "sqdata://$data_uri" "${fmt_args[@]}" \
         >"$STATE/format.out" 2>&1 || die "format failed: $(tail -3 "$STATE/format.out")"
 
     # vol ids from the PRODUCT verb (never assumed): id -> backing map.
@@ -1621,6 +1652,9 @@ create_fleet() {
         echo "MW='$mw'"
         echo "MW_PORT='${SQZ_MWFLEET_MW_PORT:-45999}'"
         echo "COWRITERS='$cowriters'"
+        # PR 10: the symmetric forest (bit 17) + the armed plane on the
+        # writer; `run_mw_matrix.sh sym-crash` requires it.
+        echo "SYMMETRIC='$symmetric'"
         # PR 8: the multi-owner shape. `OWNERS_ASSIGNED` flips to 1 only
         # when `volume set-owners` has actually written the assignment —
         # the per-volume mount branches read it, so a create that died

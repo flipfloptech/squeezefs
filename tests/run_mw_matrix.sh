@@ -321,6 +321,26 @@
 #                       the matrix restarts from zero on the fixed
 #                       binary. Reader recovery + dirty-skip tripwire
 #                       asserted at matrix end.
+#   sym-crash [--rounds=N]  (symmetric PR 10 — needs `mw_fleet.sh create
+#                       --symmetric`; design §8 gates 3/4's LOCAL fleet
+#                       leg) the s7-kill-matrix body on the SYMMETRIC
+#                       fleet (bit 17 + SQUEEZEFS_SYMMETRIC_META=1 on the
+#                       manager): kill -9 × N of the manager at randomized
+#                       phases under sustained write load; per round the
+#                       successor's own-residue recovery is asserted
+#                       (appender_self_recoveries ≥ 1, live_pages_at_
+#                       mount ≥ 1 — the dead incarnation's Live page),
+#                       the symmetric tripwires flat (meta_kv_forest_key_
+#                       violations, appender_fence_breach, manager_verb_
+#                       refusals, meta_kv_replay_{key,lease,extent}_
+#                       violations, fsck_slot_custody_conflicts,
+#                       fsck_unrecovered_appenders, appender_park_expiries
+#                       all 0), the manager lease `held`, and the FULL
+#                       online fsck with the C8 oracle clean (C14/C15 ride
+#                       it). A foreign appender's recovery (the ledger's
+#                       driver over the wire) needs N daemons on one
+#                       volume — PR 12's venue; the in-process matrix is
+#                       tests/sym_crash_matrix_tests.rs.
 #   s9-fanout [--mb=M]  (rung 10 — needs --multi-writer --cowriters=K;
 #                       design row S9-a) THE FAN-OUT ROW: K co-writers +
 #                       the authority writing DATA concurrently — the
@@ -542,7 +562,7 @@
 #
 # Usage:  sudo tests/run_mw_matrix.sh <leg> [--require-host-scoped-subsys]
 #         [--window=S] [--netem=MS] [--victim=IDX]   (the s6-* legs)
-#         [--rounds=N]                               (s7-kill-matrix, s11-killrange)
+#         [--rounds=N]                               (s7-kill-matrix, s11-killrange, sym-crash)
 #         [--procs=P]                                (s11-mpiio)
 #         [--partial-authority]                      (s10-placement-tarx, PR 8)
 #         [--rewrite-mb=M --rewrite-files=F]         (pv-rewrite-funnel)
@@ -1241,6 +1261,48 @@ def flat(d, out, pfx=""):
 root = json.load(sys.stdin)
 d = flat(root.get("metrics", root), {})  # stats nest under "metrics"
 print(d.get(sys.argv[1], ""))' "$2"
+}
+
+# A per-volume gauge (a JSON array) folded: the SUM of its numeric
+# elements (a scalar is its own sum). The symmetric families publish per
+# volume (PR 2's `appender_*`, PR 4's `symmetric_meta`).
+stat_sum() { # idx json_key -> sum
+    local mnt
+    mnt="$(mnt_of "$1")"
+    cat "$mnt/.stats" | python3 -c '
+import json, sys
+def flat(d, out, pfx=""):
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+root = json.load(sys.stdin)
+v = flat(root.get("metrics", root), {}).get(sys.argv[1], 0)
+if isinstance(v, list):
+    print(sum(x for x in v if isinstance(x, (int, float))))
+elif isinstance(v, (int, float)):
+    print(v)
+else:
+    print(0)' "$2"
+}
+
+# Every element of a per-volume gauge equals `want` (a scalar compared
+# directly); prints 1/0.
+stat_all_eq() { # idx json_key want -> 1|0
+    local mnt
+    mnt="$(mnt_of "$1")"
+    cat "$mnt/.stats" | python3 -c '
+import json, sys
+def flat(d, out, pfx=""):
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+root = json.load(sys.stdin)
+v = flat(root.get("metrics", root), {}).get(sys.argv[1], None)
+want = sys.argv[2]
+vals = v if isinstance(v, list) else [v]
+print(1 if vals and all(str(x) == want for x in vals) else 0)' "$2" "$3"
 }
 
 # --- the row emitter ---------------------------------------------------------
@@ -2717,14 +2779,40 @@ wait_for_unmounted() { # mountpoint
     die "$1 never unmounted"
 }
 
+# The symmetric fleet's precondition (PR 10): `mw_fleet.sh create
+# --symmetric` recorded it, and the manager's stats say the plane is armed.
+require_symmetric() {
+    require_mw
+    [ "${SYMMETRIC:-0}" = "1" ] ||
+        die "this leg needs a SYMMETRIC fleet — create it with: sudo tests/mw_fleet.sh create N=2 --symmetric [--lease-ttl-ms=15000]"
+    [ "$(stat_all_eq 0 symmetric_meta 1)" = "1" ] ||
+        die "member 0 symmetric_meta != 1 on every volume — the symmetric plane is not armed on the manager (SQUEEZEFS_SYMMETRIC_META=1 on a bit-17 set)"
+    [ "$(stat_all_eq 0 manager_lease held)" = "1" ] ||
+        die "member 0 manager_lease != held on every volume — the D0 winner of a symmetric set IS its manager (KD-SYM-3)"
+}
+
+leg_sym_crash() {
+    require_symmetric
+    s7_kill_body sym
+}
+
 leg_s7_kill_matrix() {
     require_mw
+    s7_kill_body
+}
+
+# The kill matrix's body: `sym` = the symmetric fleet's leg (PR 10) — the
+# same rounds with the successor's own-residue recovery and the symmetric
+# tripwires asserted per round.
+s7_kill_body() { # [sym]
+    local sym="${1:-}" leg="s7-kill-matrix" tag="s7kill"
+    [ "$sym" = "sym" ] && leg="sym-crash" && tag="symcrash"
     local rowdir w_mnt reader_idx
-    rowdir="$STATE/rows/s7kill-$(date +%s)"
+    rowdir="$STATE/rows/$tag-$(date +%s)"
     mkdir -p "$rowdir"
     w_mnt="$(mnt_of 0)"
     reader_idx="$(member_idxs | awk '$1!=0' | head -1)"
-    log "s7-kill-matrix: kill -9 x$S7_ROUNDS of the ARMED writer at randomized phases under sustained write load; per round: remount (WERO takeover over the dead incarnation's standing reservation) + FULL online fsck with the C8 oracle. COUNTED-RESTART discipline applies."
+    log "$leg: kill -9 x$S7_ROUNDS of the ARMED writer at randomized phases under sustained write load; per round: remount (WERO takeover over the dead incarnation's standing reservation) + FULL online fsck with the C8 oracle. COUNTED-RESTART discipline applies."
 
     local round phase_ms dd_pid t_kill t_up out findings drift fence_ref trip backstops fm
     printf '%-6s %-9s %-9s %-10s %-6s %-10s %-6s %s\n' ROUND PHASE_MS REMOUNT_S FSCK DRIFT FENCE_REF TRIP VERDICT | tee "$rowdir/matrix.tsv"
@@ -2776,6 +2864,7 @@ $out"
         [ "$trip" = "0" ] || die "round $round: invariant_tripwires=$trip on the successor"
         backstops="$(stat_field 0 mem_budget_hard_backstops)"
         [ "$backstops" = "0" ] || die "round $round: mem_budget_hard_backstops=$backstops (R5 column)"
+        [ "$sym" = "sym" ] && sym_crash_round_asserts "$round" "$rowdir"
         printf '%-6s %-9s %-9s %-10s %-6s %-10s %-6s %s\n' "$round" "$phase_ms" "$((t_up - t_kill))" "findings:$findings" "$drift" "$fence_ref" "$trip" GREEN | tee -a "$rowdir/matrix.tsv"
     done
 
@@ -2793,7 +2882,38 @@ $out"
             die "reader invariant_tripwires != 0 after the matrix"
         log "reader m$reader_idx healthy after the matrix (member, dirty_skips=0, tripwires=0)"
     fi
-    log "s7-kill-matrix GREEN: $S7_ROUNDS/$S7_ROUNDS rounds (table + fsck reports in $rowdir)"
+    log "$leg GREEN: $S7_ROUNDS/$S7_ROUNDS rounds (table + fsck reports in $rowdir)"
+}
+
+# PR 10's per-round assertions on the symmetric successor: the dead
+# incarnation's Live page was OWN RESIDUE (the D0 flock is the proof), the
+# manager role passed with it, and every symmetric must-stay-0 gauge is 0.
+sym_crash_round_asserts() { # round rowdir
+    local round="$1" rowdir="$2" v k
+    cat "$(mnt_of 0)/.stats" >"$rowdir/stats-r$round.json" 2>/dev/null || true
+    v="$(stat_sum 0 appender_self_recoveries)"
+    [ "$v" -ge 1 ] 2>/dev/null ||
+        die "round $round: appender_self_recoveries=$v — the successor did not recover its dead incarnation's page as own residue"
+    v="$(stat_sum 0 appender_live_pages_at_mount)"
+    [ "$v" -ge 1 ] 2>/dev/null ||
+        die "round $round: appender_live_pages_at_mount=$v — the kill left no Live page (the leave ran?)"
+    [ "$(stat_all_eq 0 manager_lease held)" = "1" ] ||
+        die "round $round: manager_lease != held on every volume of the successor"
+    [ "$(stat_all_eq 0 symmetric_meta 1)" = "1" ] ||
+        die "round $round: symmetric_meta != 1 on every volume of the successor"
+    for k in meta_kv_forest_key_violations appender_fence_breach foreign_frame_overwrite_detected \
+        manager_verb_refusals meta_kv_replay_key_violations meta_kv_replay_lease_violations \
+        meta_kv_replay_extent_violations fsck_slot_custody_conflicts fsck_unrecovered_appenders \
+        appender_park_expiries meta_kv_leaf_lease_refusals dlm_token_recall_timeouts_live \
+        appender_flush_ceiling_overruns; do
+        v="$(stat_sum 0 "$k")"
+        [ "$v" = "0" ] || die "round $round: $k=$v on the successor (must stay 0)"
+    done
+    # The ledger's terms on a one-appender fleet: nothing foreign died, so
+    # the driver recovered nothing and acted on nothing.
+    v="$(stat_sum 0 appender_recoveries)"
+    [ "$v" = "0" ] || die "round $round: appender_recoveries=$v on a one-appender fleet (a foreign recovery ran?)"
+    log "round $round: symmetric successor OK (self_recoveries=$(stat_sum 0 appender_self_recoveries), manager held, tripwires 0)"
 }
 
 # --- rung 9: the S8 rows ------------------------------------------------------
@@ -6875,6 +6995,7 @@ s6-fence) leg_s6_fence ;;
 s6-vm-fence) leg_s6_vm_fence ;;
 s7-device-fence) leg_s7_device_fence ;;
 s7-kill-matrix) leg_s7_kill_matrix ;;
+sym-crash) leg_sym_crash ;;
 s8-serial-ab) leg_s8_serial_ab ;;
 s8-crucible) leg_s8_crucible ;;
 s9-fanout) leg_s9_fanout ;;
@@ -6898,5 +7019,5 @@ pv-rand4k-w1) leg_pv_rand4k_w1 ;;
 cowriters-admission) leg_cowriters_admission ;;
 vm-hostscope-validate) leg_vm_hostscope_validate ;;
 vm-multi-identity) leg_vm_multi_identity ;;
-*) die "unknown leg '$LEG' (pv-volume-scaling|smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s11-range|s11-subblock|s11-mpiio|s11-blockcyclic|s11-tiny|s11-killrange|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|pv-rewrite-funnel|pv-cross-owner|pv-rand4k-w1|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
+*) die "unknown leg '$LEG' (pv-volume-scaling|smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|sym-crash|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s11-range|s11-subblock|s11-mpiio|s11-blockcyclic|s11-tiny|s11-killrange|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|pv-rewrite-funnel|pv-cross-owner|pv-rand4k-w1|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
 esac

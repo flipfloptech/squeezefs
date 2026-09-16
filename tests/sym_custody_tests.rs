@@ -376,6 +376,7 @@ impl Drop for Restore {
     fn drop(&mut self) {
         data_grant::TEST_DROP_RECALL_CARRIERS_ALL.store(false, Ordering::SeqCst);
         data_grant::TEST_DROP_RECALL_CARRIER_ONCE.store(false, Ordering::SeqCst);
+        squeezefs::fuse_client::test_lease_insert_park_release();
         // The FUSE-layer hooks hold an `Arc` of the rig — its cached and
         // parked leases live in the process-global lock map — so a
         // contract that panicked mid-way must not leave them installed
@@ -2758,6 +2759,127 @@ async fn an_unleased_slot_on_a_non_manager_answers_not_holder_for_tokens_and_cus
     assert_eq!(holder.stats().grants_served, served0, "nothing granted");
     assert_eq!(venue.owner.held(), 0, "no custody granted");
     gate.test_set_manager(true);
+    venue.tear_down().await;
+    rig.shutdown().await;
+}
+
+/// Review round 4, Issue 35 — **a recall crossing the slow path between the
+/// word's `cache()` and the lease's insert parks the lease AT ONCE** (the
+/// publish-then-recheck): the FUSE layer's first write of a foreign file
+/// is PARKED by the seam exactly there; the handover's recall lands while
+/// it is parked (the writer's poll absorbs it — the revoke finds no lease
+/// to park and clears the word); the insert then publishes the lease
+/// under a cleared word, and the re-read after the publish parks it —
+/// the release travels once the handler's own use ends, within the
+/// handover's beat, never at the next write or the last close. Without
+/// the re-check the lease sat refused-but-unparked and `held()` stayed 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recall_crossing_the_slow_path_between_cache_and_insert_parks_the_lease_at_once() {
+    use squeezefs::fuse_client::{
+        test_lease_insert_park_release, test_lease_insert_parked, TEST_PARK_BEFORE_LEASE_INSERT,
+    };
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let (uris, foreign) = two_holder_volume(dir.path(), data.path()).await;
+    let rig = common::sym::mount_fuse(
+        &uris,
+        data.path(),
+        &Knobs::armed().partition(TWO_HOLDERS),
+        "32MB",
+    )
+    .await;
+    let venue = Venue::stand_up_on(&rig.routed, &[1]).await;
+    rig.fs.install_slot_custody_hooks();
+    let vol = Arc::clone(&rig.routed.volumes[0]);
+
+    // The first write's slow path: parked after `cache()`, before the insert
+    // — the grant is HELD at the holder, nothing is in the map yet.
+    let parked0 = test_lease_insert_parked();
+    TEST_PARK_BEFORE_LEASE_INSERT.store(true, Ordering::Relaxed);
+    let write = {
+        let rig_fs = Arc::clone(&rig.fs);
+        tokio::spawn(async move {
+            use fuse3::raw::Filesystem;
+            rig_fs
+                .write(
+                    common::sym::req(),
+                    foreign,
+                    0,
+                    0,
+                    bytes::Bytes::from(common::sym::pattern(1, 4096)),
+                    0,
+                    0,
+                )
+                .await
+                .map(|w| w.written)
+        })
+    };
+    wait_until("the slow path parks between cache() and the insert", || {
+        test_lease_insert_parked() > parked0
+    })
+    .await;
+    assert_eq!(venue.owner.held(), 1, "the grant is held at the holder");
+    assert_eq!(
+        rig.fs.cached_lease_token(foreign),
+        None,
+        "nothing in the map yet"
+    );
+
+    // The recall crosses the window: the handover is deferred, the grant
+    // recalled, the writer's standing poll absorbs it — the revoke finds
+    // nothing to park and clears the word.
+    let err = vol
+        .release_slot_handover(1, SLOT_B)
+        .await
+        .expect_err("deferred while the writer holds custody");
+    assert!(matches!(
+        &err,
+        squeezefs::meta_backend::kv::KvError::HandoverDeferred(_)
+    ));
+    assert_eq!(venue.owner.recalled(), 1, "the holder recalled the grant");
+    let s_before = data_grant::stats().recalls_absorbed;
+    wait_until("the writer absorbs the recall while parked", || {
+        data_grant::stats().recalls_absorbed >= s_before.max(1)
+    })
+    .await;
+    assert_eq!(
+        venue.owner.held(),
+        1,
+        "the parked slow path's handler use holds the release (its write is still in flight)"
+    );
+
+    // The publish: the lease enters the map under the cleared word — and
+    // the re-check parks it at once. The write completes under the
+    // still-live grant; the release departs behind it.
+    test_lease_insert_park_release();
+    let written = write.await.expect("task").expect("the write succeeds");
+    assert_eq!(written, 4096);
+    assert_eq!(
+        rig.fs.cached_lease_token(foreign),
+        None,
+        "the published lease was parked at once — never served"
+    );
+    wait_until("the recalled grant's release lands at the holder", || {
+        venue.owner.held() == 0
+    })
+    .await;
+    assert_eq!(rig.fs.recalled_leases_pending(), 0, "nothing left parked");
+    // The requester's next tick moves the slot; the writer's next write
+    // re-acquires locally.
+    vol.release_slot_handover(1, SLOT_B)
+        .await
+        .expect("the handover completes once the recalled custody is released");
+    rig.write_at(foreign, 0, &common::sym::pattern(2, 4096))
+        .await;
+    assert_eq!(
+        venue.owner.held(),
+        0,
+        "the re-acquire landed at the new holder"
+    );
+    data_grant::uninstall_recall_hooks();
+    data_grant::uninstall_release_gate();
     venue.tear_down().await;
     rig.shutdown().await;
 }

@@ -2276,6 +2276,112 @@ async fn a_recalled_writers_cached_lease_is_revoked_and_its_writes_reacquire_at_
     rig.shutdown().await;
 }
 
+/// Round 3's ×10 stamped finding (run 4 of the FUSE-layer contract:
+/// `held() == 1` at the OLD holder after the move) — **a grant never lands
+/// at the old holder INSIDE the flush-then-transfer**: the completing tick
+/// finds no live grant and proceeds; a recalled writer's retry (or any
+/// first acquire of a file in the slot) arriving inside the transfer
+/// window must be DEFERRED to the slot's next holder, never granted at
+/// this one — else the grant spans the move. The handover is parked
+/// mid-transfer (after its page, before tree 0) by the PR 4 seam while a
+/// foreign acquire arrives; the mark stands until the handover's terminal
+/// outcome and clears with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_inside_the_flush_then_transfer_is_deferred_to_the_next_holder() {
+    use squeezefs::meta_backend::kv::backend::{
+        test_handover_park_release, test_handover_parked, TEST_HANDOVER_PARK_AFTER_PAGE,
+    };
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let (uris, foreign) = two_holder_volume(dir.path(), data.path()).await;
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(TWO_HOLDERS)).await;
+    let venue = Venue::stand_up(&rig, &[1]).await;
+    let vol = Arc::clone(&rig.routed.volumes[0]);
+    // Dial the holder through one acquire, released before the handover.
+    let lease = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(foreign), None, Duration::from_secs(2))
+        .await
+        .expect("custody from the slot holder");
+    let client = venue.arm.holder_client(&venue.endpoint).await.unwrap();
+    drop(lease);
+    wait_until("the release lands at the holder", || {
+        venue.owner.held() == 0
+    })
+    .await;
+
+    // The handover parks mid-transfer: the page names the slot Releasing,
+    // tree 0 does not yet — the exact window the ×10 run's grant landed in.
+    let parked0 = test_handover_parked();
+    TEST_HANDOVER_PARK_AFTER_PAGE.store(true, Ordering::Relaxed);
+    let handover = {
+        let vol = Arc::clone(&vol);
+        tokio::spawn(async move { vol.release_slot_handover(1, SLOT_B).await })
+    };
+    wait_until("the handover parks after its page", || {
+        test_handover_parked() > parked0
+    })
+    .await;
+    assert!(
+        data_grant::handover_recalls_pending() >= 1,
+        "the completing handover HOLDS the slot's mark through the transfer"
+    );
+
+    // A foreign acquire inside the window: deferred at the old holder,
+    // nothing granted there.
+    let inside = client
+        .acquire_carrying_token(
+            0,
+            rig.routed.route_ino(foreign).1,
+            None,
+            squeezefs::dlm::LockMode::Exclusive,
+            Duration::from_millis(100),
+        )
+        .await;
+    assert!(
+        matches!(inside, Ok(data_grant::CarriedAcquire::Deferred { .. })),
+        "a grant inside the transfer is deferred to the next holder (got {})",
+        match &inside {
+            Ok(data_grant::CarriedAcquire::Granted { .. }) => "Granted".to_string(),
+            Ok(data_grant::CarriedAcquire::NotHolder { .. }) => "NotHolder".to_string(),
+            Ok(data_grant::CarriedAcquire::Deferred { .. }) => "Deferred".to_string(),
+            Err(e) => format!("Err({e})"),
+        }
+    );
+    assert_eq!(
+        venue.owner.held(),
+        0,
+        "the old holder granted nothing inside the transfer"
+    );
+
+    // The handover completes; the mark clears with its terminal outcome.
+    test_handover_park_release();
+    handover
+        .await
+        .expect("task")
+        .expect("the handover completes");
+    assert_eq!(data_grant::handover_recalls_pending(), 0);
+    assert!(
+        data_grant::slot_holder_home(foreign).is_none(),
+        "the slot is the manager's now"
+    );
+    // The blocked write's re-acquire lands LOCALLY at the new holder.
+    let lease = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(foreign), None, Duration::from_secs(2))
+        .await
+        .expect("custody at the new holder");
+    assert!(lease.is_held().await);
+    assert_eq!(venue.owner.held(), 0, "nothing at the old holder");
+    drop(lease);
+    venue.tear_down().await;
+    rig.shutdown().await;
+}
+
 /// Review round 3, Issue 21 — **the recall is STATE, re-gathered on every
 /// carrier**: a carrier whose reply the writer loses (the seam drops one
 /// absorbed batch) does not orphan the recall — it lands on the NEXT

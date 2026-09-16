@@ -1701,6 +1701,71 @@ async fn a_zombie_frame_on_an_untouched_leaf_is_screened() {
     reset_process_state();
 }
 
+// ---------------------------------------------------------------------------
+// The scoping instrument (dev box — SCOPING, never acceptance)
+// ---------------------------------------------------------------------------
+
+/// `appender_recovery_phase_ns` vs the dead window's size, the derived
+/// bound beside the measured total, and `dead_member_propagation_ms` —
+/// the evidence note's table. `#[ignore]`d: it prints, it asserts only
+/// the exact-sum law. Run with
+/// `cargo test --release --test sym_crash_matrix_tests -- --ignored --nocapture scoping_`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn scoping_recovery_phase_ns_vs_window() {
+    let _g = SEAM.lock().await;
+    println!(
+        "{:>7} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10} {:>9} {:>7}",
+        "files",
+        "entries",
+        "preempt",
+        "read",
+        "replay",
+        "flush",
+        "tails",
+        "tree0",
+        "total_us",
+        "bound_ms",
+        "prop_ms"
+    );
+    for (i, files) in [12usize, 200, 600].into_iter().enumerate() {
+        let dir = tempfile::tempdir().unwrap();
+        reset_process_state();
+        let (uris, shared) = seeded_volume(dir.path(), SLOT_A).await;
+        let x = foreign(200 + i as u64);
+        let _ = kill_with_region_one_live(&uris, "1:4", &[(0, shared)], files, x).await;
+        let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();
+        let vol = Arc::clone(&routed.volumes[0]);
+        let p0 = recovery_stats().phase_ns;
+        assert!(!vol.record_death_with_key(x, 1, 0).await.unwrap());
+        let rep = recover_dead_appenders_set(&routed).await.unwrap();
+        assert_eq!(rep.recovered(), 1);
+        let entries = rep.per_volume[0].1.recovered[0].entries;
+        let p1 = recovery_stats().phase_ns;
+        let d: Vec<u64> = p0.iter().zip(p1.iter()).map(|(a, b)| b - a).collect();
+        assert!(d[..6].iter().sum::<u64>() <= d[6] + 6, "exact-sum: {d:?}");
+        let prop = alloc_lease::DEAD_MEMBER_PROPAGATION_MS.load(Ordering::Relaxed);
+        println!(
+            "{:>7} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10} {:>9} {:>7}",
+            files,
+            entries,
+            d[0] / 1_000,
+            d[1] / 1_000,
+            d[2] / 1_000,
+            d[3] / 1_000,
+            d[4] / 1_000,
+            d[5] / 1_000,
+            d[6] / 1_000,
+            vol.appender_recovery_bound_ms(),
+            prop
+        );
+        shutdown(&routed).await;
+        drop(vol);
+        drop(routed);
+    }
+    reset_process_state();
+}
+
 /// The offline fsck over a probe THIS harness opens (the `fsck_clean`
 /// walk with the findings kept): right after a kill the dead holder's
 /// `writer_claim` is heartbeat-fresh for the TTL and `run_offline`'s

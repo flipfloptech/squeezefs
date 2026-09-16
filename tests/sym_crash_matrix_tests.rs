@@ -24,6 +24,7 @@ use squeezefs::meta_backend::kv::backend::recovery::{
     self, mount_path_custody_gate, recover_dead_appenders_set, recovery_stats,
 };
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
+use squeezefs::meta_backend::kv::builder::ROOT_INO;
 use squeezefs::meta_backend::kv::record::ForestSlot;
 use squeezefs::meta_backend::kv::slot_state::SlotState;
 use squeezefs::meta_backend::kv::KvError;
@@ -609,6 +610,507 @@ async fn the_owners_eviction_and_the_grace_deadline_write_the_ledger_never_a_rec
         other => panic!("our own death was admitted: {other:?}"),
     }
     assert!(vol.screen_record_death(&ident(99).into()).is_ok());
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
+// ---------------------------------------------------------------------------
+// §5.9 — multi-volume, multi-death, the empty-window wire lessee
+// ---------------------------------------------------------------------------
+
+/// The forest slot of the first routing slot in `from..` that the set
+/// hosts on volume `vol_idx`.
+fn hosted_slot_on(routed: &RoutedMetaBackend, vol_idx: usize, from: u16) -> ForestSlot {
+    use squeezefs::meta_backend::make_global_ino_width;
+    let width = routed.routing_width();
+    for r in from..from + 4096 {
+        let ino = make_global_ino_width(2, u64::from(r), width);
+        if routed.route_ino(ino).0 == vol_idx {
+            return ForestSlot::from(r) + 1;
+        }
+    }
+    panic!("volume {vol_idx} hosts no routing slot in {from}..");
+}
+
+/// §5.5.2's multi-volume leg (§8 gate 4 (f)): a node holding a region on
+/// THREE volumes dies; ONE death record; ONE projection recovers all
+/// three rings (parallel across managers in a fleet, serial here), every
+/// volume's `recovered:{X, v}` written, three acts on the ledger
+/// (`acted ≡ recorded × regions held`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_holding_regions_on_three_volumes_is_recovered_on_all_three() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config(dir.path(), 3).await;
+    let (slots, dirs, partition) = {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        let slots: Vec<ForestSlot> = (0..3).map(|v| hosted_slot_on(&routed, v, 3)).collect();
+        let mut dirs = Vec::new();
+        for (v, slot) in slots.iter().enumerate() {
+            dirs.push((
+                v,
+                seed_dir_in_slot(&routed, v, *slot, &format!("shared{v}")).await,
+            ));
+            routed.volumes[v]
+                .release_slot_handover(0, *slot)
+                .await
+                .expect("release to unleased");
+        }
+        shutdown(&routed).await;
+        let partition: &'static str =
+            Box::leak(format!("1:{},{},{}", slots[0], slots[1], slots[2]).into_boxed_str());
+        (slots, dirs, partition)
+    };
+    let x = foreign(30);
+    let files = kill_with_region_one_live(&uris, partition, &dirs, 4, x).await;
+    let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();
+    let vol0 = Arc::clone(&routed.volumes[0]);
+    let (rec0, act0) = (recoveries(), acted());
+    assert!(!vol0.record_death_with_key(x, 1, 0).await.unwrap());
+    let rep = recover_dead_appenders_set(&routed).await.unwrap();
+    assert_eq!(rep.recovered(), 3, "{rep:?}");
+    assert_eq!((recoveries(), acted()), (rec0 + 3, act0 + 3));
+    for v in 0..3u16 {
+        assert!(
+            vol0.recovered_record(&x, v).await.unwrap().is_some(),
+            "recovered:{{X, {v}}}"
+        );
+        let vol = &routed.volumes[v as usize];
+        assert!(matches!(
+            tree0_state(vol, slots[v as usize]).await,
+            Some(SlotState::Unleased { .. })
+        ));
+        assert_eq!(
+            page_state(&uris[v as usize], vol, 1).await,
+            Some(AppenderState::Recovered)
+        );
+        assert_all_resolve(&routed, dirs[v as usize].1, &files[v as usize]).await;
+        assert_eq!(vol.appender_stats().unwrap().manager_verb_refusals, 0);
+    }
+    shutdown(&routed).await;
+    drop(vol0);
+    drop(routed);
+    fsck_clean(&uris).await;
+    reset_process_state();
+}
+
+/// Eight appenders die at once (§8 gate 4 (e)): seven declared regions
+/// with windows (the directory's first extent holds seven pairs at 64 KiB
+/// nodes — the eighth would be `JoinAppender`'s chain growth) plus one
+/// wire joiner (an empty window), eight foreign identities, eight
+/// records; ONE projection recovers them all, every file of every region
+/// resolves, eight acts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn eight_simultaneous_deaths_are_recovered_by_one_projection() {
+    use squeezefs::cluster_wire as cw;
+    use squeezefs::data_grant::AsyncVerbRouter;
+    use squeezefs::meta_ship::manager::{ManagerClient, ManagerReply, ManagerSetService};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    // Eight appenders need `appenders_capacity ≥ 8` — heap/16 ÷ ring — so
+    // the member is 128 MiB (the 64 MiB fixture admits seven).
+    let uris = format_stamped_set_with_config_len(dir.path(), 1, 128 * 1024 * 1024).await;
+    // Seven regions on seven slots the rotor never takes (routing ≥ 100).
+    let nreg: u32 = 7;
+    let slots: Vec<ForestSlot> = (0..nreg).map(|i| 101 + i * 3).collect();
+    let dirs = {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        let mut dirs = Vec::new();
+        for (i, slot) in slots.iter().enumerate() {
+            dirs.push(seed_dir_in_slot(&routed, 0, *slot, &format!("d{i}")).await);
+            routed.volumes[0]
+                .release_slot_handover(0, *slot)
+                .await
+                .expect("release to unleased");
+        }
+        shutdown(&routed).await;
+        dirs
+    };
+    let partition: &'static str = Box::leak(
+        slots
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("{}:{s}", i + 1))
+            .collect::<Vec<_>>()
+            .join(";")
+            .into_boxed_str(),
+    );
+    let routed = open_under_retry(&uris, &Knobs::armed().partition(partition))
+        .await
+        .unwrap();
+    let ids: Vec<u32> = (1..=nreg).collect();
+    let venue = HoldersVenue::stand_up(&routed, &ids).await;
+    let mut files: Vec<Vec<(String, u64)>> = Vec::new();
+    for (i, d) in dirs.iter().enumerate() {
+        let mut names = Vec::new();
+        for f in 0..3 {
+            let name = format!("r{i}_f{f}");
+            let ino = routed
+                .create(*d, &name, libc::S_IFREG | 0o644, 1000, 1000)
+                .await
+                .expect("create")
+                .ino;
+            names.push((name, ino));
+        }
+        files.push(names);
+    }
+    venue.tear_down();
+    // The eighth: a wire joiner on the same volume, one slot, no window.
+    let host = cw::RpcListener::start_async(
+        cw::RpcListenerConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            service_threads: 2,
+            ..cw::RpcListenerConfig::default()
+        },
+        VENUE_SECRET.to_vec(),
+        Arc::new(AsyncVerbRouter::new().with_manager(ManagerSetService::new(&routed.volumes))),
+    )
+    .unwrap();
+    let endpoint8 = host.endpoint().to_string();
+    let mut j = ManagerClient::connect(&endpoint8, VENUE_SECRET, "joiner-8", 0)
+        .await
+        .unwrap();
+    let jid = foreign(48);
+    let reply = j.join(jid, 0).await.unwrap();
+    let ManagerReply::Joined {
+        appender_id: wire_id,
+        ..
+    } = reply
+    else {
+        panic!("join: {reply:?}")
+    };
+    match j.acquire_slot(wire_id, 300).await.unwrap() {
+        ManagerReply::SlotsGranted { .. } => {}
+        other => panic!("{other:?}"),
+    }
+    // The listener holds the volumes through its service: shut AND drop
+    // it (and the client) before the kill, or the flock outlives the set.
+    host.shutdown();
+    drop(host);
+    drop(j);
+    drop(routed);
+    park_gate::test_reset();
+    for id in &ids {
+        restamp_page_identity(&uris[0], *id, foreign(40 + u64::from(*id))).await;
+    }
+    let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();
+    let vol = Arc::clone(&routed.volumes[0]);
+    let (rec0, act0) = (recoveries(), acted());
+    for id in &ids {
+        assert!(!vol
+            .record_death_with_key(foreign(40 + u64::from(*id)), 2, 0)
+            .await
+            .unwrap());
+    }
+    assert!(!vol.record_death_with_key(jid, 2, 0).await.unwrap());
+    let rep = recover_dead_appenders_set(&routed).await.unwrap();
+    assert_eq!(rep.recovered(), 8, "{rep:?}");
+    assert_eq!((recoveries(), acted()), (rec0 + 8, act0 + 8));
+    for (i, d) in dirs.iter().enumerate() {
+        assert_all_resolve(&routed, *d, &files[i]).await;
+        assert!(matches!(
+            tree0_state(&vol, slots[i]).await,
+            Some(SlotState::Unleased { .. })
+        ));
+    }
+    assert!(matches!(
+        tree0_state(&vol, 301).await,
+        Some(SlotState::Unleased { g: 1, .. })
+    ));
+    assert_eq!(
+        page_state(&uris[0], &vol, wire_id).await,
+        Some(AppenderState::Recovered)
+    );
+    assert_eq!(vol.appender_stats().unwrap().manager_verb_refusals, 0);
+    shutdown(&routed).await;
+    drop(vol);
+    drop(routed);
+    fsck_clean(&uris).await;
+    reset_process_state();
+}
+
+/// A dead WIRE lessee (an empty window — a wire appender journals
+/// nothing in PR 4): the ledger record arrives OVER THE WIRE
+/// (`RecordDeath`, PR 8's reservation activated — served, idempotent);
+/// the poll releases its slots to tree 0 at their `g`, releases the
+/// set-wide directory-rename lock it held (§5.6.4's expiry law — PR 6's
+/// owed driver), returns its unclaimed grant and marks its page
+/// `Recovered`; a live member the owner lists is never declared dead by
+/// the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_wire_lessees_slots_grant_and_dir_rename_lock_are_released_by_the_ledger() {
+    use squeezefs::cluster_wire as cw;
+    use squeezefs::data_grant::AsyncVerbRouter;
+    use squeezefs::meta_ship::manager::{ManagerClient, ManagerReply, ManagerSetService};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let host = cw::RpcListener::start_async(
+        cw::RpcListenerConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            service_threads: 2,
+            ..cw::RpcListenerConfig::default()
+        },
+        VENUE_SECRET.to_vec(),
+        Arc::new(AsyncVerbRouter::new().with_manager(ManagerSetService::new(&routed.volumes))),
+    )
+    .unwrap();
+    let endpoint = host.endpoint().to_string();
+    let mut j = ManagerClient::connect(&endpoint, VENUE_SECRET, "joiner-j", 0)
+        .await
+        .unwrap();
+    let jid = foreign(50);
+    let ManagerReply::Joined { appender_id, .. } = j.join(jid, 0).await.unwrap() else {
+        panic!("join")
+    };
+    let routing: u16 = 120;
+    let fslot = ForestSlot::from(routing) + 1;
+    match j.acquire_slot(appender_id, routing).await.unwrap() {
+        ManagerReply::SlotsGranted { slots, .. } => assert_eq!(slots[0].g, 1),
+        other => panic!("{other:?}"),
+    }
+    match j.dir_rename_lock(appender_id).await.unwrap() {
+        ManagerReply::DirRenameLocked { already } => assert!(!already),
+        other => panic!("{other:?}"),
+    }
+    let grant_before = vol.extent_grant_record(appender_id).await.unwrap();
+    assert!(!grant_before.is_empty(), "the join minted a grant");
+    // The wire screen: a live member is never declared dead by a peer's
+    // word; this mount's own identity neither.
+    {
+        use squeezefs::membership::{
+            JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole, MembershipOwner,
+        };
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+        let owner = MembershipOwner::arm(
+            "o",
+            1,
+            0,
+            LeaseClocks::derive(std::time::Duration::ZERO).unwrap(),
+            LeaseClock::manual(Arc::clone(&now)),
+        )
+        .unwrap();
+        squeezefs::membership::install_owner(Arc::clone(&owner));
+        let live = foreign(51);
+        let JoinOutcome::Granted(_) = owner.join(JoinRequest {
+            id: squeezefs::cowriter::node_member_id_of(live.node_token, live.mount_slot),
+            role: MemberRole::Writer,
+            endpoint: None,
+            pid: 1,
+            boot: "b".into(),
+            prior_epoch: None,
+            pr_key: 0,
+            mount: None,
+        }) else {
+            panic!("join")
+        };
+        let rejected = vol.appender_stats().unwrap().manager_verb_rejected;
+        assert!(
+            j.record_death(live.into(), 1, 0).await.is_err(),
+            "a live member"
+        );
+        let me = vol.appenders_public().unwrap().identity;
+        assert!(
+            j.record_death(me.into(), 1, 0).await.is_err(),
+            "our own identity"
+        );
+        assert_eq!(
+            vol.appender_stats().unwrap().manager_verb_rejected,
+            rejected + 2
+        );
+        squeezefs::membership::uninstall();
+    }
+    // The death, over the wire, idempotent.
+    let recorded = alloc_lease::DEAD_MEMBERS_RECORDED.load(Ordering::Relaxed);
+    assert!(!j.record_death(jid.into(), 4, 0x77).await.unwrap());
+    assert!(
+        j.record_death(jid.into(), 4, 0x77).await.unwrap(),
+        "already"
+    );
+    assert_eq!(
+        alloc_lease::DEAD_MEMBERS_RECORDED.load(Ordering::Relaxed),
+        recorded + 1
+    );
+    assert_eq!(
+        vol.dead_member_record(&jid).await.unwrap().unwrap().pr_key,
+        0x77
+    );
+    let (rec0, act0) = (recoveries(), acted());
+    let rep = recover_dead_appenders_set(&routed).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    let r = &rep.per_volume[0].1.recovered[0];
+    assert_eq!((r.appender_id, r.entries), (appender_id, 0));
+    assert_eq!(r.slots, vec![fslot]);
+    assert_eq!((recoveries(), acted()), (rec0 + 1, act0 + 1));
+    match tree0_state(&vol, fslot).await {
+        Some(SlotState::Unleased { g, .. }) => assert_eq!(g, 1, "g never moves at a release"),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        vol.dir_rename_record().await.unwrap().is_none(),
+        "the dead holder's lock released"
+    );
+    assert_eq!(
+        page_state(&uris[0], &vol, appender_id).await,
+        Some(AppenderState::Recovered)
+    );
+    assert!(
+        vol.extent_grant_record(appender_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the unclaimed grant returned"
+    );
+    assert!(vol.recovered_record(&jid, 0).await.unwrap().is_some());
+    // The slot is leasable: the manager's own explicit ask lands at g + 1.
+    let g = vol
+        .manager_acquire_slots(
+            0,
+            0,
+            &[fslot],
+            squeezefs::meta_backend::kv::backend::ControlAdmit::Try,
+        )
+        .await
+        .unwrap();
+    assert_eq!(g[0].g, 2);
+    assert_eq!(vol.appender_stats().unwrap().manager_verb_refusals, 0);
+    host.shutdown();
+    drop(host);
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
+// ---------------------------------------------------------------------------
+// §5.9's last note — the manager-death composition; the vol-0 rule
+// ---------------------------------------------------------------------------
+
+/// `set_wide_roles_resume_after_a_volume_0_manager_failover`: volume 0's
+/// manager dies holding the set-wide directory-rename lock, with a file
+/// acked in its ring; the successor wins the D0 ladder (PR 3's arm
+/// adopts the foreign page 0 and replays the dead manager's ring), the
+/// mount-path gate releases the dead incarnation's lock, and every set-
+/// wide role answers on the successor: the manager lease held on both
+/// volumes, the coordinator predicate open, the ledger writable, the
+/// acked file present.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_wide_roles_resume_after_a_volume_0_manager_failover() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config(dir.path(), 2).await;
+    let (acked, term_before) = {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        let vol0 = Arc::clone(&routed.volumes[0]);
+        let ino = routed
+            .create(
+                ROOT_INO,
+                "acked_before_the_death",
+                libc::S_IFREG | 0o644,
+                0,
+                0,
+            )
+            .await
+            .unwrap()
+            .ino;
+        let term = vol0.writer_term();
+        // The manager dies holding the lock — the record as a dead
+        // incarnation leaves it (the RAII lease would release it on its
+        // drop, and a held one keeps the backend alive through the kill).
+        vol0.test_plant_dir_rename_record(0, term).await.unwrap();
+        drop(vol0);
+        drop(routed);
+        park_gate::test_reset();
+        (ino, term)
+    };
+    // Another NODE's dead manager: page 0 of every volume re-stamped.
+    for uri in &uris {
+        restamp_page_identity(uri, 0, foreign(60)).await;
+    }
+    let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();
+    let vol0 = Arc::clone(&routed.volumes[0]);
+    assert!(vol0.writer_term() > term_before, "the successor's era");
+    let held = vol0
+        .dir_rename_record()
+        .await
+        .unwrap()
+        .expect("the dead manager's lock stands");
+    assert_eq!(held.holder, 0);
+    assert!(held.term < vol0.writer_term());
+    let rep = mount_path_custody_gate(&routed).await.unwrap();
+    assert_eq!(
+        rep.recovered(),
+        0,
+        "page 0 passed with the role, not through the ledger"
+    );
+    assert!(
+        vol0.dir_rename_record().await.unwrap().is_none(),
+        "released at the successor's arm"
+    );
+    for v in &routed.volumes {
+        assert_eq!(v.appender_stats().unwrap().manager_lease.word(), "held");
+        assert!(!v.manager_role_released());
+    }
+    assert!(alloc_lease::symmetric_coordinator_refusal().is_none());
+    assert!(
+        !vol0.record_death_with_key(foreign(61), 1, 0).await.unwrap(),
+        "the ledger writes"
+    );
+    assert_eq!(
+        routed
+            .lookup(ROOT_INO, "acked_before_the_death")
+            .await
+            .unwrap()
+            .ino,
+        acked
+    );
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
+/// §5.5.2's vol-0 rule composed with the D0 ladder: a manager whose probe
+/// of volume 0's ledger fails for longer than `T_owner` RELEASES its role
+/// (PR 8's decision) and, from then, STOPS refreshing its writer claim —
+/// the claim ages past the TTL and the ladder re-elects a successor that
+/// can read the ledger (PR 10's successor ladder IS the D0 ladder).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_manager_that_released_its_role_under_the_vol0_rule_stops_heartbeating() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config(dir.path(), 2).await;
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol1 = Arc::clone(&routed.volumes[1]);
+    let t_owner = 45_000u64;
+    assert!(!vol1.note_vol0_ledger_probe(false, 1_000, t_owner));
+    assert!(
+        vol1.note_vol0_ledger_probe(false, 1_000 + t_owner + 1, t_owner),
+        "released"
+    );
+    assert!(vol1.manager_role_released());
+    assert_eq!(
+        vol1.appender_stats().unwrap().manager_lease.word(),
+        "vacant"
+    );
+    let ts0 = vol1.read_writer_claim().await.unwrap().ts;
+    // Two heartbeat beats a second apart: the claim's timestamp never
+    // moves (the heartbeat's stamp is whole seconds).
+    vol1.guard_heartbeat().await;
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    vol1.guard_heartbeat().await;
+    let ts1 = vol1.read_writer_claim().await.unwrap().ts;
+    assert_eq!(ts0, ts1, "a released manager refreshes no claim");
+    // Volume 0's own manager keeps heartbeating: its beat moves the stamp.
+    let vol0 = Arc::clone(&routed.volumes[0]);
+    let t0 = vol0.read_writer_claim().await.unwrap().ts;
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    vol0.guard_heartbeat().await;
+    assert!(vol0.read_writer_claim().await.unwrap().ts > t0);
+    assert!(!vol0.manager_role_released());
     shutdown(&routed).await;
     reset_process_state();
 }

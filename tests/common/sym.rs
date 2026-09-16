@@ -237,17 +237,28 @@ pub fn format_config_for(dir: &std::path::Path) -> Vec<u8> {
 /// A stamped SET of `n` members carrying the format config on volume 0
 /// (the offline fsck's input), `names` = `meta0..meta{n-1}`.
 pub async fn format_stamped_set_with_config(dir: &std::path::Path, n: usize) -> Vec<String> {
+    format_stamped_set_with_config_len(dir, n, VOL_LEN).await
+}
+
+/// [`format_stamped_set_with_config`] at a chosen member length (the
+/// appender capacity is `heap/16 ÷ ring` — a wider fleet needs a wider
+/// volume, never a format-time client count).
+pub async fn format_stamped_set_with_config_len(
+    dir: &std::path::Path,
+    n: usize,
+    len: u64,
+) -> Vec<String> {
     let plan = plan_meta_slot_set(n).expect("derived plan");
     std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
     let mut uris = Vec::with_capacity(n);
     for i in 0..n {
         let p = dir.join(format!("meta{i}"));
-        std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+        std::fs::File::create(&p).unwrap().set_len(len).unwrap();
         let opts = FormatV3Options {
             format_config_xattr: (i == 0).then(|| format_config_for(dir)),
             ..set_opts()
         };
-        let r = format_v3_stamped(&p, VOL_LEN, &opts, plan.stamps[i].clone()).await;
+        let r = format_v3_stamped(&p, len, &opts, plan.stamps[i].clone()).await;
         if r.is_err() {
             std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
         }

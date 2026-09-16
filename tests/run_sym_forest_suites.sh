@@ -72,6 +72,12 @@
 # on a fresh image whatever the leg, and its negative contract (`=0` and
 # a flat volume carry no token plane; v1 frames byte-identical on flat)
 # runs on both legs.
+# `sym_dir_stripe_tests` (PR 7b — directory striping) rides the list the
+# same way: its armed fixtures stamp under the seam themselves (one
+# appender + the declared regions as the stripe holders), and its off
+# postures (`SQUEEZEFS_SYMMETRIC_META=0` on a stamped volume, a flat
+# volume, `SQUEEZEFS_SYM_DIR_STRIPES=1`) run on both legs with every
+# Striping gauge asserted unmoved.
 #
 # WALL TIME IS A ROW (review round 4, Issue 26): each suite runs under
 # its own timer per leg, and the summary prints `flat`, `stamped` and the
@@ -130,6 +136,7 @@ DEFAULT_SUITES=(
   sym_cross_owner_tests
   sym_block_grant_tests
   sym_coherence_tests
+  sym_dir_stripe_tests
 )
 read -r -a SUITES <<<"${SQZ_SYM_SUITES:-${DEFAULT_SUITES[*]}}"
 RATIO_NOTE="${SQZ_SYM_RATIO_NOTE:-2.0}"

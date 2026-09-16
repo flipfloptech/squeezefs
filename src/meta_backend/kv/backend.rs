@@ -3798,9 +3798,13 @@ impl KvMetaBackend {
     /// The appender leasing `object`'s slot when it is NOT one of this
     /// mount's regions (the token server's `NotHolder { holder }` — review
     /// round 1, Issue 12): one lease-table read. `None` = this mount's
-    /// (the manager's region 0, an in-process region) or unleased — the
-    /// manager maintains an unleased slot's tree (KD-SYM-2/3), so it is
-    /// the holder of every object in it.
+    /// (the manager's region 0, an in-process region), or unleased ON THE
+    /// MANAGER — the manager maintains an unleased slot's tree
+    /// (KD-SYM-2/3), so it is the holder of every object in it. An
+    /// unleased slot on a NON-manager answers the manager (appender 0):
+    /// the stale-resolve window (PR 9, round 3 — a request resolved to
+    /// this holder before its slot moved and served one RTT after, when
+    /// the slot read `Unleased` and this appender held nothing to grant).
     pub fn foreign_slot_holder(&self, object: u64) -> Option<u32> {
         let plane = self.slot_leases()?;
         let appenders = self.appenders.as_ref()?;
@@ -3810,6 +3814,9 @@ impl KvMetaBackend {
                 if appenders.region(holder).is_none() =>
             {
                 Some(holder)
+            }
+            crate::slot_lease_core::Resolved::Unleased { .. } if !plane.gate.is_manager() => {
+                Some(0)
             }
             _ => None,
         }

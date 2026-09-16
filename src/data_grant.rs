@@ -725,6 +725,12 @@ static CUSTODY_RECALLED: AtomicU64 = AtomicU64::new(0);
 /// custody grant (`slot_handover_custody_deferrals`, the Slot-lease
 /// family) — the cadence's retries while the recalled writer releases.
 pub static HANDOVER_CUSTODY_DEFERRALS: AtomicU64 = AtomicU64::new(0);
+/// PR 9 (round 3 — the stale-resolve window): grants this writer was
+/// answered by an appender tree 0 no longer named as the slot's holder
+/// (the request resolved before a move and served after it) — released at
+/// once and re-acquired where tree 0 points (`dlm_custody_stale_holder_grants`;
+/// ≈ 0 — one per handover racing an in-flight acquire at most).
+static STALE_HOLDER_GRANTS: AtomicU64 = AtomicU64::new(0);
 /// The token-wire correlation ids of the carried custody grants.
 static CARRIED_REQUEST_IDS: AtomicU64 = AtomicU64::new(1);
 /// **Test seam** (round 3, Issue 21's pin): the writer DROPS the next
@@ -831,6 +837,9 @@ pub struct ClientStats {
     pub recalls_absorbed: u64,
     /// PR 9: grants this process's authorities recalled for handovers.
     pub recalled: u64,
+    /// PR 9 (round 3): grants answered by an appender that no longer held
+    /// the slot — released at once, re-acquired where tree 0 points.
+    pub stale_holder_grants: u64,
 }
 
 /// Read the process's custody ledger.
@@ -850,6 +859,7 @@ pub fn stats() -> ClientStats {
         holder_fences: HOLDER_FENCES.load(Ordering::Relaxed),
         recalls_absorbed: RECALLS_ABSORBED.load(Ordering::Relaxed),
         recalled: CUSTODY_RECALLED.load(Ordering::Relaxed),
+        stale_holder_grants: STALE_HOLDER_GRANTS.load(Ordering::Relaxed),
     }
 }
 
@@ -896,6 +906,7 @@ pub fn stats_json() -> serde_json::Value {
         "dlm_custody_holder_fences": c.holder_fences,
         "dlm_custody_recalls_absorbed": c.recalls_absorbed,
         "dlm_custody_recalled": c.recalled,
+        "dlm_custody_stale_holder_grants": c.stale_holder_grants,
         "dlm_custody_held": OWNER
             .load()
             .as_ref()
@@ -5649,6 +5660,55 @@ pub async fn acquire_at_slot_holder(
             .await?
         {
             CarriedAcquire::Granted { lease, records, .. } => {
+                // The holder re-resolved AFTER the grant (round 3 — the
+                // stale-resolve window the flat ×20 found: a request
+                // resolved to the old holder before the move and served
+                // one RTT after it, when the slot read Unleased and the old
+                // holder held nothing to grant). A grant from an appender
+                // tree 0 no longer names as the slot's holder is RELEASED
+                // (the lease's drop is the release verb) and the acquire
+                // re-runs where tree 0 now points — the writer side of the
+                // same Dekker pair the served side runs.
+                let still_holder = matches!(
+                    slot_holder_home(ino),
+                    Some(CustodyHome::Holder { holder: h, .. }) if h == holder
+                );
+                if !still_holder {
+                    STALE_HOLDER_GRANTS.fetch_add(1, Ordering::Relaxed);
+                    log::info!(
+                        "PR 9: appender {holder} at {endpoint} granted inode_{ino}'s custody \
+                         after its slot moved (a request resolved before the move) — released, \
+                         re-acquiring where tree 0 points (dlm_custody_stale_holder_grants)"
+                    );
+                    drop(lease);
+                    client.drain_releases().await;
+                    if redirected {
+                        return Err(acquire_refusal(
+                            libc::EAGAIN,
+                            format!(
+                                "PR 9: inode_{ino}'s slot moved twice under one acquire (last \
+                                 holder {holder} at {endpoint}) — refusing rather than chasing \
+                                 a handover storm; the caller retries"
+                            ),
+                        ));
+                    }
+                    redirected = true;
+                    match slot_holder_home(ino) {
+                        None => return Ok(HolderAcquire::NowLocal),
+                        Some(CustodyHome::Holder {
+                            holder: next,
+                            endpoint: next_endpoint,
+                            ..
+                        }) => {
+                            holder = next;
+                            endpoint = next_endpoint;
+                            continue;
+                        }
+                        Some(CustodyHome::Unbound { holder: next }) => {
+                            return Err(unbound_holder(next, ino, "acquire"))
+                        }
+                    }
+                }
                 VIA_SLOT_HOLDER.fetch_add(1, Ordering::Relaxed);
                 match tokens
                     .install_carried(object, records, gen0, &TOKEN_CARRIED_PAGES)

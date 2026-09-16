@@ -167,6 +167,242 @@ pub async fn open_under(uris: &[String], knobs: &Knobs) -> Arc<RoutedMetaBackend
     r.expect("open routed set")
 }
 
+/// [`open_under`] after a DROP without shutdown (the in-process kill −9):
+/// a previous incarnation's detached tasks may pin the writer flock for
+/// a few ms after the `Arc` went, so the open is retried (the S3.5 and
+/// PR 6 suites' harness plumbing). Returns the error text of the last
+/// refusal when every attempt fails.
+pub async fn open_under_retry(
+    uris: &[String],
+    knobs: &Knobs,
+) -> Result<Arc<RoutedMetaBackend>, String> {
+    let mut last = String::new();
+    for _ in 0..200 {
+        knobs.apply();
+        let r = open_routed_meta_set(uris).await;
+        Knobs::clear();
+        match r {
+            Ok(r) => return Ok(r),
+            Err(e) => {
+                last = format!("{e}");
+                if !last.contains("writer lock") && !last.contains("flock") {
+                    return Err(last);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+    Err(last)
+}
+
+/// The volume-set format config a member records (what the offline fsck
+/// harness reads back to build its router), naming one file-backed data
+/// volume under `dir` (PR 6's fixture).
+pub fn format_config_for(dir: &std::path::Path) -> Vec<u8> {
+    let oss = dir.join("oss0");
+    if !oss.exists() {
+        std::fs::File::create(&oss)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+    }
+    let cfg = squeezefs::FormatConfig {
+        name: "squeezefs".to_string(),
+        block_size: 4096,
+        capacity: 1 << 30,
+        inodes: 1_000_000,
+        compression: "none".to_string(),
+        encrypt_algo: "none".to_string(),
+        encrypt_key: None,
+        encrypt_key_ref: None,
+        mem_cache_size: None,
+        disk_cache_size: None,
+        disk_cache_paths: None,
+        data_lv: Some(vec![oss.display().to_string()]),
+        data_volumes: None,
+        read_cache_size: None,
+        write_cache_size: None,
+        read_mem_cache_size: None,
+        write_mem_cache_size: None,
+        dismount_wait: None,
+        upload_delay: None,
+        fuse_io_uring_sqpoll_idle_ms: None,
+        meta_routing_width: None,
+        meta_slot_runs: None,
+        meta_volumes: None,
+    };
+    serde_json::to_vec(&cfg).unwrap()
+}
+
+/// A stamped SET of `n` members carrying the format config on volume 0
+/// (the offline fsck's input), `names` = `meta0..meta{n-1}`.
+pub async fn format_stamped_set_with_config(dir: &std::path::Path, n: usize) -> Vec<String> {
+    let plan = plan_meta_slot_set(n).expect("derived plan");
+    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
+    let mut uris = Vec::with_capacity(n);
+    for i in 0..n {
+        let p = dir.join(format!("meta{i}"));
+        std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+        let opts = FormatV3Options {
+            format_config_xattr: (i == 0).then(|| format_config_for(dir)),
+            ..set_opts()
+        };
+        let r = format_v3_stamped(&p, VOL_LEN, &opts, plan.stamps[i].clone()).await;
+        if r.is_err() {
+            std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        }
+        r.expect("format set member");
+        uris.push(p.display().to_string());
+    }
+    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    uris
+}
+
+/// Mint a DIRECTORY under the root whose ino routes to forest slot
+/// `slot` of volume `vol_idx` while the slot is still the manager's (a
+/// preset ino routes itself) — PR 6's `seed_dir_in_slot`, per volume.
+pub async fn seed_dir_in_slot(
+    routed: &RoutedMetaBackend,
+    vol_idx: usize,
+    slot: ForestSlot,
+    name: &str,
+) -> u64 {
+    use squeezefs::meta_backend::kv::backend::KvMetaBackend;
+    use squeezefs::meta_backend::{make_global_ino_width, IntentCreatePreset};
+    let vol = &routed.volumes[vol_idx];
+    let width = routed.routing_width();
+    // Routing slot = forest slot − 1, then the set's slot map places it on
+    // its volume; the caller names a slot the volume hosts.
+    let routing = u64::from(slot) - 1;
+    let local = vol
+        .allocate_guest_ino(routing as u16)
+        .expect("a guest cursor");
+    let global = make_global_ino_width(local, routing, width);
+    let ino = routed
+        .create_with_rdev_preset(
+            squeezefs::meta_backend::kv::builder::ROOT_INO,
+            name,
+            libc::S_IFDIR | 0o755,
+            0,
+            0,
+            0,
+            0,
+            Some(IntentCreatePreset {
+                global_ino: global,
+                ts_ns: KvMetaBackend::now_ns_pub(),
+            }),
+        )
+        .await
+        .expect("seed dir")
+        .ino;
+    assert_eq!(ino, global);
+    ino
+}
+
+/// Re-stamp appender `id`'s page on `uri` with `identity` (the in-process
+/// fixture's "another NODE held this region": a page's identity is the
+/// only thing that distinguishes a foreign appender's residue from this
+/// node's own). Written to BOTH directory slots one generation apart —
+/// the newest valid image over the four page slots.
+pub async fn restamp_page_identity(
+    uri: &str,
+    id: u32,
+    identity: squeezefs::meta_backend::kv::appender::AppenderIdentity,
+) {
+    use squeezefs::meta_backend::kv::appender::{read_directory, write_page};
+    use squeezefs::meta_backend::kv::superblock::{classify_volume, VolumeFormat};
+    let path = std::path::Path::new(uri);
+    let VolumeFormat::V3(sb) = classify_volume(path).await.expect("superblock") else {
+        panic!("{uri}: not a v3 volume");
+    };
+    let entries = read_directory(path, &sb).await.expect("directory");
+    let e = entries
+        .iter()
+        .find(|e| e.appender_id == id)
+        .expect("the appender's page");
+    let mut page = e.page.clone().expect("a valid page");
+    page.identity = identity;
+    for off in e.dir_offsets {
+        page.generation += 1;
+        write_page(path, off, page.encode().unwrap())
+            .await
+            .expect("page write");
+    }
+    squeezefs::uring_fs::fdatasync(path.to_path_buf())
+        .await
+        .expect("fdatasync");
+}
+
+/// The holders' venue (PR 6's `Holders`): the S8 owner service + the
+/// manager set service over `routed` on a loopback listener, every
+/// declared appender's endpoint registered on each volume's plane, and
+/// the initiator's shipper installed — what PR 12's join ladder wires
+/// from the census. A step homed on a declared region's slot ships over
+/// a real `cluster_wire` session and is applied under THAT region's lease
+/// and ring.
+pub struct HoldersVenue {
+    host: Arc<squeezefs::cluster_wire::RpcListener>,
+}
+
+pub const VENUE_SECRET: &[u8] = b"sym-common-holders-venue-enroll-secret";
+
+impl HoldersVenue {
+    pub async fn stand_up(routed: &Arc<RoutedMetaBackend>, appenders: &[u32]) -> Self {
+        use squeezefs::cluster_wire as cw;
+        use squeezefs::data_grant::AsyncVerbRouter;
+        use squeezefs::meta_backend::crossvol_tx::install_xv_shipper;
+        use squeezefs::meta_ship::manager::ManagerSetService;
+        use squeezefs::meta_ship::{MetaShipRouter, MetaShipService};
+        let front: Arc<dyn cw::RpcAsyncService> = Arc::new(
+            AsyncVerbRouter::new()
+                .with_meta(MetaShipService::new(Arc::clone(routed)))
+                .with_manager(ManagerSetService::new(&routed.volumes)),
+        );
+        let host = cw::RpcListener::start_async(
+            cw::RpcListenerConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("literal addr"),
+                service_threads: 2,
+                ..cw::RpcListenerConfig::default()
+            },
+            VENUE_SECRET.to_vec(),
+            front,
+        )
+        .expect("owner listener");
+        let endpoint = host.endpoint().to_string();
+        for vol in &routed.volumes {
+            let plane = vol.slot_leases().expect("armed");
+            for id in appenders {
+                plane.holders.set_endpoint(*id, &endpoint);
+            }
+        }
+        install_xv_shipper(MetaShipRouter::new(
+            Arc::clone(routed),
+            "node-b",
+            VENUE_SECRET.to_vec(),
+        ));
+        Self { host }
+    }
+
+    pub fn tear_down(self) {
+        squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
+        self.host.shutdown();
+    }
+}
+
+/// The offline fsck of `uris` must report nothing.
+pub async fn fsck_clean(uris: &[String]) {
+    let mut opts = squeezefs::fsck::FsckOptions::offline();
+    opts.settle = std::time::Duration::from_millis(10);
+    let report = squeezefs::fsck::run_offline(uris, &opts)
+        .await
+        .expect("offline fsck runs");
+    assert!(
+        !report.has_findings(),
+        "fsck must be clean: {:?}",
+        report.findings
+    );
+}
+
 /// An ino inside forest slot `slot`'s guest keyspace (local key ino).
 pub fn ino_in_slot(slot: ForestSlot, local: u64) -> u64 {
     squeezefs::meta_backend::guest_local_ino((slot - 1) as u16, local)

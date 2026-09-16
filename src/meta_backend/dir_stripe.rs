@@ -1063,26 +1063,11 @@ impl RoutedMetaBackend {
         creators: &[u32],
     ) -> Result<()> {
         let holder = self.holder_of(dir);
-        // The op's guard set covers EVERY key its steps touch — `I{dir}`
-        // and each marker's `D{}` — so a foreign holder serving them under
-        // the travelling scope takes nothing (a key outside the scope
-        // would be taken at the holder while the initiator's parked
-        // `I{dir}` is held: the deadlock PR 6's coverage law forbids).
-        // Taken BEFORE the mints (Issue 20b): a concurrent explicit flip
-        // that won is found here, with nothing minted yet.
-        let marker_names: Vec<String> = (0..k)
-            .map(stripe_marker_name)
-            .chain([MIGRATING_MARKER.to_string(), STRIPED_MARKER.to_string()])
-            .collect();
-        let dents: Vec<(Ino, &str, dlm::LockMode)> = marker_names
-            .iter()
-            .map(|n| (local, n.as_str(), dlm::LockMode::Exclusive))
-            .collect();
-        let mut scope = None;
-        let guards: Arc<[dlm::DlmGuard]> = Arc::from(
-            self.lock_many_leased(v, &mut scope, &[(local, dlm::LockMode::Exclusive)], &dents)
-                .await?,
-        );
+        // Belt 1 (guard-free, after the single-flight slot): a flip that
+        // completed between the caller's map probe and our slot take —
+        // in-process the ONLY way another flip of `dir` "wins" (its
+        // commit is acked, so its marker is visible here) — is found
+        // with nothing asked and nothing minted (Issue 20b).
         if self
             .find_dentry_routed(v, local, STRIPED_MARKER)
             .await?
@@ -1091,20 +1076,27 @@ impl RoutedMetaBackend {
             self.forget_map(dir);
             return Ok(());
         }
-        // The mints: a fresh nameless directory per stripe, each in its
-        // supplier's slot. The mint's own `I{new}` guard is a key nobody
-        // waits for while holding one of ours (only this directory's flip
-        // and rmdir name its marker keys, and both take `I{dir}` first).
-        let mut stripes = Vec::with_capacity(usize::from(k));
+        // Phase A — the SUPPLIED stripes: another appender's mints, each
+        // its own transaction under its own guard (an in-process holder
+        // serves the ask on THIS table), asked while this op holds NO
+        // guard. The 4a law (PR 4 round-1 / D-1c; PR 6's coverage law):
+        // an op's guards are ONE canonical `lock_many` — a guard taken
+        // while another of ours is held self-deadlocks on a stripe
+        // collision, certain at `SQUEEZEFS_DLM_STRIPES=1` (PR 10 review,
+        // Issue 28: the flip held `I{dir}` + the marker keys across `K`
+        // single-key mints — a 64-stripe flip parked for ever ≈ 0.8 % of
+        // the time at the shipped width).
+        let k_us = usize::from(k);
+        let mut stripes: Vec<Option<Ino>> = vec![None; k_us];
+        let mut supplied_by: Vec<Option<u32>> = vec![None; k_us];
         let mut next_creator = creators.iter().copied().filter(|c| Some(*c) != holder);
-        let mut supplied_by: Vec<Option<u32>> = Vec::with_capacity(usize::from(k));
         for i in 0..k {
-            let mut supplied = None;
             // A creator that declines or is gone is replaced by the next.
             for supplier in next_creator.by_ref() {
                 match self.supply_stripe_ino(dir, i, supplier, rec).await {
                     Ok(ino) => {
-                        supplied = Some((ino, Some(supplier)));
+                        stripes[usize::from(i)] = Some(ino);
+                        supplied_by[usize::from(i)] = Some(supplier);
                         break;
                     }
                     Err(e) => log::info!(
@@ -1113,19 +1105,80 @@ impl RoutedMetaBackend {
                     ),
                 }
             }
-            let (ino, by) = match supplied {
-                Some(s) => s,
-                None => match self.mint_stripe_locally(dir, v, holder, rec).await {
-                    Ok(ino) => (ino, None),
-                    Err(e) => {
-                        self.name_unmapped_stripes(dir, &stripes, &supplied_by);
-                        return Err(e);
-                    }
-                },
-            };
-            stripes.push(ino);
-            supplied_by.push(by);
         }
+        // Phase B — the remainder's inos, allocated (no guard: the
+        // §4.8 monotonic allocation; a refused flip burns them).
+        let mut remainder: Vec<(usize, Ino, Ino, u64)> = Vec::new();
+        for (i, s) in stripes.iter().enumerate() {
+            if s.is_none() {
+                let slot = self.remainder_mint_slot(v, holder);
+                let (slocal, sglobal) = self.allocate_local_ino_in_slot(v, slot)?;
+                remainder.push((i, slocal, sglobal, slot));
+            }
+        }
+        // Phase C — the op's ONE guard set, covering EVERY key its steps
+        // touch: `I{dir}`, `I{stripe}` for every stripe minted HERE, and
+        // each marker's `D{}` — canonical order and stripe-deduped by
+        // `lock_many`; a foreign holder serving the intent's steps under
+        // the travelling scope takes nothing (a key outside the scope
+        // would be taken at the holder while the initiator's parked
+        // `I{dir}` is held: the deadlock PR 6's coverage law forbids).
+        let marker_names: Vec<String> = (0..k)
+            .map(stripe_marker_name)
+            .chain([MIGRATING_MARKER.to_string(), STRIPED_MARKER.to_string()])
+            .collect();
+        let dents: Vec<(Ino, &str, dlm::LockMode)> = marker_names
+            .iter()
+            .map(|n| (local, n.as_str(), dlm::LockMode::Exclusive))
+            .collect();
+        let mut inos: Vec<(Ino, dlm::LockMode)> = std::iter::once(local)
+            .chain(remainder.iter().map(|(_, slocal, _, _)| *slocal))
+            .map(|l| (l, dlm::LockMode::Exclusive))
+            .collect();
+        inos.sort_unstable_by_key(|(l, _)| *l);
+        inos.dedup_by_key(|(l, _)| *l);
+        let mut scope = None;
+        let guards: Arc<[dlm::DlmGuard]> =
+            Arc::from(self.lock_many_leased(v, &mut scope, &inos, &dents).await?);
+        // Belt 2 — under the guards: a map that landed meanwhile (no
+        // in-process schedule reaches it past belt 1 — the belt for a
+        // wire flip). The supplied mints are named loud, never silent.
+        if self
+            .find_dentry_routed(v, local, STRIPED_MARKER)
+            .await?
+            .is_some()
+        {
+            self.forget_map(dir);
+            let supplied: Vec<Ino> = stripes.iter().flatten().copied().collect();
+            let by: Vec<Option<u32>> = supplied_by
+                .iter()
+                .filter(|b| b.is_some())
+                .copied()
+                .collect();
+            self.name_unmapped_stripes(dir, &supplied, &by);
+            return Ok(());
+        }
+        // Phase D — the remainder's records, each minted under the ONE
+        // set (its commit co-owns the `Arc` to its terminal outcome).
+        for (i, slocal, sglobal, slot) in remainder {
+            if let Err(e) = self
+                .mint_stripe_record(dir, v, (slocal, sglobal), slot, rec, Arc::clone(&guards))
+                .await
+            {
+                let minted: Vec<Ino> = stripes.iter().flatten().copied().collect();
+                let by: Vec<Option<u32>> = stripes
+                    .iter()
+                    .zip(&supplied_by)
+                    .filter(|(s, _)| s.is_some())
+                    .map(|(_, b)| *b)
+                    .collect();
+                self.name_unmapped_stripes(dir, &minted, &by);
+                return Err(e);
+            }
+            stripes[i] = Some(sglobal);
+        }
+        let stripes: Vec<Ino> = stripes.into_iter().flatten().collect();
+        debug_assert_eq!(stripes.len(), k_us, "every stripe supplied or minted");
         self.dir_stripes.learn_stripes(&stripes);
         let target = stripes[usize::from(MARKER_TARGET_INDEX)];
         let mut steps: Vec<XvStep> = stripes
@@ -1204,23 +1257,16 @@ impl RoutedMetaBackend {
         }
     }
 
-    /// Mint one stripe ino in a slot `holder` leases on `dir`'s volume
-    /// (the flip's remainder): an `S_IFDIR` record with `dir`'s
-    /// permission bits and owner, `nlink 2`, no name.
-    async fn mint_stripe_locally(
-        &self,
-        dir: Ino,
-        v: usize,
-        holder: Option<u32>,
-        rec: &Inode,
-    ) -> Result<Ino> {
-        let slot = match holder {
+    /// The slot a stripe the HOLDER mints lands in (the flip's
+    /// remainder): a slot `holder` leases on `dir`'s volume `v`, else
+    /// this mount's rotor.
+    fn remainder_mint_slot(&self, v: usize, holder: Option<u32>) -> u64 {
+        match holder {
             Some(h) => self
                 .slot_of_appender_on(v, h)
                 .unwrap_or_else(|| self.pick_mint_slot(v)),
             None => self.pick_mint_slot(v),
-        };
-        self.mint_stripe_in_slot(dir, v, slot, rec).await
+        }
     }
 
     /// A ROUTING slot appender `appender` leases on `v` — its rotor when
@@ -1240,12 +1286,36 @@ impl RoutedMetaBackend {
         vol.routing_slot_of_forest(forest).ok().map(u64::from)
     }
 
+    /// Mint one stripe ino of `dir` in `slot` on its volume `v` as a
+    /// STANDALONE act — the served `SupplyStripeIno` and this mount's own
+    /// supply: ONE single-key acquisition (`I{new}`) while the caller
+    /// holds no other guard on the table. The flip's own remainder never
+    /// comes here: it mints under its ONE guard set
+    /// ([`Self::mint_stripe_record`]).
     async fn mint_stripe_in_slot(&self, dir: Ino, v: usize, slot: u64, rec: &Inode) -> Result<Ino> {
         let (local, global) = self.allocate_local_ino_in_slot(v, slot)?;
-        let vol = &self.volumes[v];
-        let guard: Arc<[dlm::DlmGuard]> =
-            Arc::from(vec![vol.dlm().lock_inode_exclusive(local).await]);
-        let out = vol
+        let guard: Arc<[dlm::DlmGuard]> = Arc::from(vec![
+            self.volumes[v].dlm().lock_inode_exclusive(local).await,
+        ]);
+        self.mint_stripe_record(dir, v, (local, global), slot, rec, guard)
+            .await
+    }
+
+    /// The stripe RECORD: an `S_IFDIR` with `dir`'s permission bits and
+    /// owner, `nlink 2`, no name, committed under `guards` (a set that
+    /// covers `I{local}` — the caller's ONE acquisition). `ino` = the
+    /// allocated `(local, global)` pair.
+    async fn mint_stripe_record(
+        &self,
+        dir: Ino,
+        v: usize,
+        ino: (Ino, Ino),
+        slot: u64,
+        rec: &Inode,
+        guards: Arc<[dlm::DlmGuard]>,
+    ) -> Result<Ino> {
+        let (local, global) = ino;
+        let out = self.volumes[v]
             .routed_mint_inode(
                 local,
                 libc::S_IFDIR | (rec.mode & 0o7777),
@@ -1254,7 +1324,7 @@ impl RoutedMetaBackend {
                 0,
                 0,
                 None,
-                guard,
+                guards,
             )
             .await;
         if out.is_err() {

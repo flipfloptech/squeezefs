@@ -3017,6 +3017,47 @@ impl RoutedMetaBackend {
         initial_size: u64,
         preset: Option<IntentCreatePreset>,
     ) -> Result<Inode> {
+        let made = self
+            .create_with_rdev_preset_guarded(
+                parent,
+                name,
+                mode,
+                uid,
+                gid,
+                rdev,
+                initial_size,
+                preset,
+            )
+            .await?;
+        // PR 7b: the `-o stripe_dirs` flip of the directory this mkdir just
+        // named runs HERE — after the create's 4a guards, its slot gate and
+        // its delegation permit have all dropped. The flip takes its own
+        // ONE canonical guard set on the same striped table; run while the
+        // mkdir's `I{parent}` was still held it was a second acquisition,
+        // and a stripe collision parked it for ever (PR 10 review, Issue
+        // 28). Never the mkdir's error (the directory exists; the automatic
+        // trigger can still flip it later).
+        if (mode & libc::S_IFMT) == libc::S_IFDIR {
+            self.stripe_at_mkdir(made.ino, parent).await;
+        }
+        Ok(made)
+    }
+
+    /// [`Self::create_with_rdev_preset`] under the op's guards — everything
+    /// but the `-o stripe_dirs` flip, which the wrapper runs once these
+    /// have dropped.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_with_rdev_preset_guarded(
+        &self,
+        parent: Ino,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        rdev: u32,
+        initial_size: u64,
+        preset: Option<IntentCreatePreset>,
+    ) -> Result<Inode> {
         // PR 7b (design §5.6.5): a name in a STRIPED directory is keyed
         // under its stripe — the op below runs verbatim with the stripe as
         // its parent; the directory itself is the `..`/memo parent and the
@@ -3180,20 +3221,14 @@ impl RoutedMetaBackend {
                     guards,
                 )
                 .await;
-            let made = match made {
-                Ok(m) => m,
+            return match made {
+                Ok(m) => Ok(m),
                 // The holder's witness refusal of an insert into a dying
                 // stripe is the plan's `EEXIST`; the op's errno is `ENOENT`
                 // (one record read, the error path only).
-                Err(e) if striped.is_some() => {
-                    return Err(self.dying_parent_errno(parent, e).await)
-                }
-                Err(e) => return Err(e),
+                Err(e) if striped.is_some() => Err(self.dying_parent_errno(parent, e).await),
+                Err(e) => Err(e),
             };
-            if is_dir {
-                self.stripe_at_mkdir(made.ino, logical_parent).await;
-            }
-            return Ok(made);
         }
 
         if parent_v_idx == target_v_idx {
@@ -3228,11 +3263,8 @@ impl RoutedMetaBackend {
                 self.mirror_volume_failure(target_v_idx);
             }
             let made = out?;
-            if is_dir {
-                if striped.is_some() {
-                    self.note_dir_parent(made.ino, logical_parent, name);
-                }
-                self.stripe_at_mkdir(made.ino, logical_parent).await;
+            if is_dir && striped.is_some() {
+                self.note_dir_parent(made.ino, logical_parent, name);
             }
             Ok(made)
         } else {
@@ -3321,7 +3353,6 @@ impl RoutedMetaBackend {
 
             if is_dir_flag {
                 self.note_dir_parent(global_child_ino, logical_parent, name);
-                self.stripe_at_mkdir(global_child_ino, logical_parent).await;
             }
             Ok(Inode {
                 ino: global_child_ino,

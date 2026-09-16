@@ -553,7 +553,7 @@ impl RoutedMetaBackend {
             .is_some_and(|v| v.slot_lease_armed())
     }
 
-    /// [`Self::stripes_armed`] for GLOBAL `ino`'s volume — the FUSE
+    /// `stripes_armed` for GLOBAL `ino`'s volume — the FUSE
     /// boundary's gate on the `user.squeezefs.stripes` command (an
     /// unarmed mount treats the name as the reserved one it is).
     pub fn striping_armed(&self, ino: Ino) -> bool {
@@ -1715,7 +1715,7 @@ impl RoutedMetaBackend {
     /// concurrent creates/unlinks.
     ///
     /// STREAMED (Issue 10): each stream is refilled only when its head
-    /// is consumed, in pages of [`Self::merge_stream_page`] entries, so a
+    /// is consumed, in pages of `merge_stream_page` entries, so a
     /// merged page reads `≤ max + (K + 1) × page` raw entries whatever
     /// the stripes hold — never `K × max` (the first build materialized
     /// a full page per stripe and kept `max`).

@@ -238,3 +238,49 @@ unarmed or bit-17-absent mount.
   file-backed volume and counted 0.
 - PR 2's drain-then-grow stays owed.
 - `appender_recoveries` is 0 by construction on the one-appender fleet leg.
+
+## 9. Review round 2 (2026-09-16) — the two-backend fixture and the nine bugs
+
+The review's structural finding governed the round: the one-backend fixture
+(one process = one RAM tree, one actor) could not reach the driver's real
+defects. `tests/common/sym.rs` grew the **region-image fixture**
+(`capture_region_image` / `apply_region_image` over
+`KvMetaBackend::region_device_ranges` — a region's ring segments, its two
+directory page slots, its grant's image extents) and the crash matrix's
+`two_backends()`: backend A (the manager + region 1 as PR 6's wire holder)
+checkpoints (image 1), keeps writing until its flush pass MOVES the slot's
+root, checkpoints again (image 2's page names the newer root), writes a
+window past its page's tail and dies; image 1 is re-applied under a foreign
+identity, backend B — the recoverer — opens with the slot at the OLDER root,
+then image 2 lands under B. B's RAM tree is stale against the device exactly
+as another daemon's would be. Every round-2 pin runs on it.
+
+| # | Class | Fix (red-first) | Pin |
+|---|---|---|---|
+| 1 | bug | the open takes the newest root the node's own pages name for an unleased guest; the page-root pass installs writer-legal; `SlotTrees::new` seeds `published` with TREE 0's root (the opened-root seed kept tree 0 stale for ever — the clean leave then dropped 25 dentries of a create storm) | `a_kill_between_a_page_write_and_the_next_publication_remounts_an_unarmed_forest` (bounded rounds until a page-0 root is ahead; every name through the remount AND a probe after its leave) |
+| 2 | bug | `NodeCache::drop_slot_nodes` + `KvTree::install_recovered_root` under the SMO mutex | `a_recoverer_whose_ram_tree_is_stale_installs_the_dead_lessees_newer_root` |
+| 3 | bug | the handover order: `Releasing { dead }` first, every durable step, drain-and-retry admission for tree 0 under the SMO mutex, the table `Unleased` LAST; `RecoveryRollback`; a re-run past tree 0 treats the released slots as absorbed; a `Recovered` page without its `recovered:` record is completed before the release law; `publish_forest_roots` never writes `Unleased { g: 0 }` over a leased slot | `a_recovery_that_fails_at_any_step_resumes_from_the_durable_state_without_loss` (steps 3–9), `a_first_touch_acquire_during_a_recovery_is_refused_and_never_regresses_tree_0` |
+| 4 | bug | `pr_fenced` iff the metadata preempt of a non-zero key landed | the `pr-matrix` leg (landed) + `appender clear`'s key-0 shape taking the scan (`a_zombie_frame_on_an_untouched_leaf_is_screened`) |
+| 5 | bug | the death write pre-admits PARKING; a failed write is parked in RAM and retried by the poll (`dead_member_write_deferrals`) | `a_deferred_death_record_lands_at_the_next_ledger_poll` |
+| 6 | bug | `appender clear` refuses a fresh `writer_claim` on the volume and on volume 0, from a probe read before either writer open | `appender_clear_refuses_a_fresh_writer_claim_on_volume_0` + the C14 contract's killed-claim arm |
+| 7 | bug | the key word screened against the census's registered key (kept through departure), own keys, live keys; unknown ⇒ 0 | the eviction contract's (d) arm + `screen_death_key`'s table + the fuzz arm |
+| 8 | bug | the page re-read under the handover mutex; state/identity/term moved ⇒ skipped | `a_page_that_moves_under_the_polls_snapshot_is_skipped_not_recovered` |
+| 9 | bug | `retire_death_record` at the rejoin (the writer's arm), at the poll (a live member), by the sweep past `2 × T_owner` | `a_rejoined_member_is_never_recovered_and_its_record_is_retired` |
+| 10 | sugg | the orphan census walks the RELEASED slots' trees without loading a leaf; the bound prices three leaf passes | the derivation tie |
+| 11 | sugg | C6 runs the bitmap oracle on a grant-armed allocator; 11a/11b stated in operations.md | — |
+| 12 | sugg | C9/C10 scope out the inos foreign windows name (`fsck_inode_plane_window_scoped`) | the C14 contract's probe (six healthy children judged, none reported) |
+| 13 | sugg | the unarmed pin | `a_flat_volume_and_an_unarmed_forest_arm_no_recovery_driver` |
+| 14 | sugg | the fleet leg's acked-writes oracle (`run_mw_matrix.sh sym-crash`) | the ×10 run below |
+| 15 | sugg | the non-writer screen applies rules 2 and 3 only | the zombie contract (probe) |
+| 16 | sugg | RACQA 2 — `preempt_and_abort_registrants_only` on the death path | the `pr-matrix` leg |
+| 17 | sugg | the dead-initiator half stated (covered by the roll-forward arm; PR 12's venue) | — |
+| 18 | sugg | `dead_members_quarantined` split off `dead_members_acted` | — |
+| 19 | sugg | one volume-0 resolver (`recovery::vol0_of`) for the driver and fsck | — |
+| 20 | nit | `InteriorReplay` (no clippy allow), the doc, `test_clear_death_sinks`, no library `unwrap()` | — |
+| 21 | nit | the bound reads the landing ceiling resolved at open; the mount-path census skips the ring reads; the intent contract polls `intents_stuck` | — |
+
+**Found beside the fixes (shipped, every layout)**: `open_probe`'s
+`shutdown` took the writer branch and ran `checkpoint_now()` — a probe wrote
+a ledger record (and, once `published` was seeded from tree 0, re-published
+a leased slot's root as `Unleased { g: 0 }`) over a volume it holds no lock
+on. Every non-writer door writes nothing at teardown.

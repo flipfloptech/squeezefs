@@ -2826,11 +2826,34 @@ s7_kill_body() { # [sym]
         rm -f "$w_mnt/s7kill.dat" 2>/dev/null || true
         (exec dd if=/dev/zero of="$w_mnt/s7kill.dat" bs=1M count=16384 conv=fsync status=none) &
         dd_pid=$!
+        # The ACKED-WRITES ORACLE (PR 10, review round 1, Issue 14): a
+        # ledger of names the client created and FSYNCED before the kill —
+        # every one MUST resolve on the successor with its content intact.
+        # Runs beside the dd load until the kill so the acked set straddles
+        # the kill phase.
+        local ack_dir ack_ledger ack_pid
+        ack_dir="$w_mnt/acked-r$round"
+        ack_ledger="$rowdir/acked-r$round.ledger"
+        mkdir -p "$ack_dir"
+        : >"$ack_ledger"
+        (
+            i=0
+            while :; do
+                f="$ack_dir/f$(printf '%06d' "$i")"
+                if printf 'r%s:%s\n' "$round" "$i" >"$f" 2>/dev/null && sync -f "$f" 2>/dev/null; then
+                    echo "$f" >>"$ack_ledger"
+                fi
+                i=$((i + 1))
+            done
+        ) &
+        ack_pid=$!
         phase_ms=$((500 + RANDOM % 8000))
         sleep "$(python3 -c "print($phase_ms/1000)")"
         kill -0 "$dd_pid" 2>/dev/null ||
             die "round $round: write load died before the kill phase (${phase_ms}ms)"
         "$MWFLEET" kill 0 --sig 9
+        kill -9 "$ack_pid" 2>/dev/null || true
+        wait "$ack_pid" 2>/dev/null || true
         t_kill="$(date +%s)"
         kill -9 "$dd_pid" 2>/dev/null || true
         wait "$dd_pid" 2>/dev/null || true
@@ -2843,6 +2866,31 @@ s7_kill_body() { # [sym]
         "$MWFLEET" mount 0 ||
             die "round $round: successor remount FAILED (the WERO takeover or the D0 ladder refused)"
         t_up="$(date +%s)"
+        # The oracle's verdict: every acked name resolves with its content.
+        # A name whose fsync returned is in the ledger; a name the kill
+        # caught mid-fsync is not (its presence either way is legal).
+        local acked lost
+        acked="$(wc -l <"$ack_ledger" | tr -d ' ')"
+        lost=0
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if [ ! -f "$f" ]; then
+                lost=$((lost + 1))
+                echo "LOST (absent): $f" >>"$rowdir/acked-r$round.lost"
+                continue
+            fi
+            local want got
+            want="r$round:$((10#${f##*/f}))"
+            got="$(cat "$f" 2>/dev/null || true)"
+            if [ "$got" != "$want" ]; then
+                lost=$((lost + 1))
+                echo "LOST (content '$got' != '$want'): $f" >>"$rowdir/acked-r$round.lost"
+            fi
+        done <"$ack_ledger"
+        [ "$lost" = "0" ] ||
+            die "round $round: ACKED-WRITES ORACLE RED — $lost of $acked fsynced file(s) lost across the kill (see $rowdir/acked-r$round.lost)"
+        log "round $round: acked-writes oracle GREEN ($acked fsynced file(s) all present with content)"
+        rm -rf "$ack_dir" 2>/dev/null || true
         if [ "$sym" = "sym" ]; then
             # The symmetric fleet's device fence is the D0 guard's PR on the
             # METADATA namespaces (`flock+pr` — the death path's preempt
@@ -2922,7 +2970,7 @@ sym_crash_round_asserts() { # round rowdir
         manager_verb_refusals meta_kv_replay_key_violations meta_kv_replay_lease_violations \
         meta_kv_replay_extent_violations fsck_slot_custody_conflicts fsck_unrecovered_appenders \
         appender_park_expiries meta_kv_leaf_lease_refusals dlm_token_recall_timeouts_live \
-        appender_flush_ceiling_overruns; do
+        appender_flush_ceiling_overruns dead_member_write_deferrals data_alloc_bitmap_drift; do
         v="$(stat_sum 0 "$k")"
         [ "$v" = "0" ] || die "round $round: $k=$v on the successor (must stay 0)"
     done

@@ -2845,7 +2845,7 @@ pub fn install_death_sink(sink: DeathSink) {
 
 /// Withdraw every death sink (a leave / the contracts' reset — a sink
 /// holds a mount's volume 0 by `Weak`, so a stale one is inert anyway).
-pub fn clear_death_sinks() {
+pub fn test_clear_death_sinks() {
     DEATH_SINKS.store(Arc::new(Vec::new()));
 }
 

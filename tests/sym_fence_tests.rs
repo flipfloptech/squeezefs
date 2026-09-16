@@ -585,6 +585,9 @@ impl ReservationClient for RegisterAnswers {
     fn preempt_registrants_only(&self, key: u64, victim: u64) -> std::io::Result<()> {
         self.inner.preempt_registrants_only(key, victim)
     }
+    fn preempt_and_abort_registrants_only(&self, key: u64, victim: u64) -> std::io::Result<()> {
+        self.inner.preempt_and_abort_registrants_only(key, victim)
+    }
     fn release(&self, key: u64) -> std::io::Result<()> {
         self.inner.release(key)
     }

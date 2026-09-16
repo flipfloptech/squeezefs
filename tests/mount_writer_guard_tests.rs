@@ -1026,6 +1026,10 @@ impl ReservationClient for RegisterFailingClient {
     fn preempt_registrants_only(&self, key: u64, victim_key: u64) -> std::io::Result<()> {
         self.inner.preempt_registrants_only(key, victim_key)
     }
+    fn preempt_and_abort_registrants_only(&self, key: u64, victim_key: u64) -> std::io::Result<()> {
+        self.inner
+            .preempt_and_abort_registrants_only(key, victim_key)
+    }
     fn release(&self, key: u64) -> std::io::Result<()> {
         self.inner.release(key)
     }

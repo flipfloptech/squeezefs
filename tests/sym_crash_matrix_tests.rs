@@ -43,7 +43,7 @@ fn reset_process_state() {
     squeezefs::block_grant::test_clear_free_targets();
     park_gate::test_reset();
     squeezefs::data_custody::test_clear_poison();
-    squeezefs::membership::clear_death_sinks();
+    squeezefs::membership::test_clear_death_sinks();
     squeezefs::membership::uninstall();
 }
 
@@ -1821,12 +1821,23 @@ async fn a_dead_holders_open_intent_is_rolled_forward_by_its_recovery() {
     let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();
     let vol = Arc::clone(&routed.volumes[0]);
     assert_eq!(vol.xv_scan_intents().await.unwrap().len(), 1);
-    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    let n = squeezefs::meta_backend::crossvol_tx::roll_forward_open_intents(&routed)
-        .await
-        .unwrap();
-    assert_eq!(n, 0, "no holder serves slot 4");
-    assert_eq!(cross_owner_stats().intents_stuck, 1);
+    // The cadence's body, re-run until the seam-shortened grace (1 ms) has
+    // passed and the intent counts stuck — never a sleep (Issue 21).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let n = squeezefs::meta_backend::crossvol_tx::roll_forward_open_intents(&routed)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "no holder serves slot 4");
+        if cross_owner_stats().intents_stuck == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the open intent never counted stuck"
+        );
+        tokio::task::yield_now().await;
+    }
     // The ledger names the holder; the recovery unleases its slot and the
     // projection rolls the intent forward locally.
     let rolled0 = recovery_stats().intents_rolled_forward;

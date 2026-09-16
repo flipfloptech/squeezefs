@@ -534,6 +534,16 @@ pub trait ReservationClient: Send + Sync + std::fmt::Debug {
     /// §5.1.6 rung 2).
     fn preempt_registrants_only(&self, key: u64, victim_key: u64) -> io::Result<()>;
 
+    /// PREEMPT AND ABORT under a standing WERO reservation (RACQA 2 —
+    /// design-symmetric-metadata §5.9 step 1, the death ledger's fence):
+    /// `preempt_registrants_only`'s removal of the victim's registration
+    /// PLUS the controller aborting the victim host's commands still in
+    /// flight, so a dead appender's write that reached the queue before
+    /// its registration went is never completed after the recoverer read
+    /// its ring (PR 10, review round 1, Issue 16). nvmet executes it as
+    /// PREEMPT (it queues no host I/O to abort); a PCIe controller aborts.
+    fn preempt_and_abort_registrants_only(&self, key: u64, victim_key: u64) -> io::Result<()>;
+
     /// Reservation Release (clean unmount).
     fn release(&self, key: u64) -> io::Result<()>;
 
@@ -1109,6 +1119,10 @@ impl ReservationClient for NvmeReservationClient {
         self.resv_acquire(1, RTYPE_WRITE_EXCLUSIVE_REGISTRANTS_ONLY, key, victim_key)
     }
 
+    fn preempt_and_abort_registrants_only(&self, key: u64, victim_key: u64) -> io::Result<()> {
+        self.resv_acquire(2, RTYPE_WRITE_EXCLUSIVE_REGISTRANTS_ONLY, key, victim_key)
+    }
+
     fn release(&self, key: u64) -> io::Result<()> {
         self.resv_release(RTYPE_WRITE_EXCLUSIVE, key)
     }
@@ -1501,6 +1515,12 @@ impl ReservationClient for FakeReservationClient {
     }
 
     fn preempt_registrants_only(&self, key: u64, victim_key: u64) -> io::Result<()> {
+        self.fake_preempt(key, victim_key, RTYPE_WRITE_EXCLUSIVE_REGISTRANTS_ONLY)
+    }
+
+    fn preempt_and_abort_registrants_only(&self, key: u64, victim_key: u64) -> io::Result<()> {
+        // The fake has no in-flight host commands to abort: RACQA 2 is its
+        // RACQA 1.
         self.fake_preempt(key, victim_key, RTYPE_WRITE_EXCLUSIVE_REGISTRANTS_ONLY)
     }
 

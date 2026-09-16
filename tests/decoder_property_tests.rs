@@ -1036,6 +1036,42 @@ proptest! {
         prop_assert_eq!(clamp_grant_want(0, cap), cap);
     }
 
+    /// PR 10 review round 1, Issue 7 — the `RecordDeath` KEY word's screen
+    /// (`recovery::screen_death_key`) is total and answers exactly the
+    /// four-way law over arbitrary words and census facts: a zero word is
+    /// accepted verbatim; a word this process or a live member holds is
+    /// REJECTED whatever the census registered; else the registered key
+    /// decides — equal accepts, different rejects, none = UNVALIDATED (the
+    /// key is dropped to 0, never stored). The fuzz target
+    /// `manager_call_frame`'s `RecordDeath` arm drives the same fn.
+    #[test]
+    fn record_death_key_word_is_screened_before_any_preempt(
+        word in any::<u64>(),
+        registered in prop::option::of(any::<u64>()),
+        own in prop::collection::vec(any::<u64>(), 0..4),
+        live in prop::collection::vec(any::<u64>(), 0..4),
+    ) {
+        use squeezefs::meta_backend::kv::backend::recovery::{screen_death_key, DeathKeyVerdict};
+        let v = screen_death_key(word, registered, &own, &live);
+        let expected = if word == 0 {
+            DeathKeyVerdict::Accept
+        } else if own.contains(&word) || live.contains(&word) {
+            DeathKeyVerdict::Reject
+        } else {
+            match registered {
+                Some(k) if k == word => DeathKeyVerdict::Accept,
+                Some(_) => DeathKeyVerdict::Reject,
+                None => DeathKeyVerdict::Unvalidated,
+            }
+        };
+        prop_assert_eq!(v, expected);
+        // A word the screen accepts under a registration IS the
+        // registration (never a key nobody registered).
+        if v == DeathKeyVerdict::Accept && word != 0 {
+            prop_assert_eq!(registered, Some(word));
+        }
+    }
+
     /// Review round 6, Issue 29 — no wire slot word reaches a RAM or
     /// durable effect unvalidated: the screen a wire `ReleaseSlot` runs
     /// BEFORE any effect (`appender::screen_release_words`) answers exactly

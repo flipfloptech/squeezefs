@@ -347,9 +347,36 @@ fn check_pr8_edge(call: &ManagerCall, total_extents: u64) {
             }
             let _ = total_extents;
         }
-        ManagerCall::AllocLeaseRelease { .. }
-        | ManagerCall::RecordRecovered { .. }
-        | ManagerCall::RecordDeath { .. } => {}
+        ManagerCall::RecordDeath { pr_key, .. } => {
+            // PR 10 (review round 1, Issue 7): the key word's screen is
+            // total and its verdict is the four-way law — accepted only
+            // when it equals the registered key (or is 0), rejected when it
+            // names an own or live key or contradicts the registration,
+            // unvalidated only for an unknown member.
+            use squeezefs::meta_backend::kv::backend::recovery::{
+                screen_death_key, DeathKeyVerdict,
+            };
+            let word = *pr_key;
+            let own = [blocks, total_extents];
+            let live = [blocks.wrapping_add(1)];
+            for registered in [None, Some(word), Some(word.wrapping_add(1))] {
+                let v = screen_death_key(word, registered, &own, &live);
+                if word == 0 {
+                    assert_eq!(v, DeathKeyVerdict::Accept);
+                    continue;
+                }
+                if own.contains(&word) || live.contains(&word) {
+                    assert_eq!(v, DeathKeyVerdict::Reject);
+                    continue;
+                }
+                match registered {
+                    Some(k) if k == word => assert_eq!(v, DeathKeyVerdict::Accept),
+                    Some(_) => assert_eq!(v, DeathKeyVerdict::Reject),
+                    None => assert_eq!(v, DeathKeyVerdict::Unvalidated),
+                }
+            }
+        }
+        ManagerCall::AllocLeaseRelease { .. } | ManagerCall::RecordRecovered { .. } => {}
         _ => {}
     }
 }

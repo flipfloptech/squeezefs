@@ -4408,7 +4408,8 @@ impl C17Shape {
 /// mount's own). The ledger is volume 0's tree 0; a set whose volume 0
 /// is not mounted judges C14 alone.
 async fn evaluate_c14_c15(ctx: &FsckCtx, suspects: &mut Vec<Suspect>) {
-    let vol0 = ctx.meta.volumes.first();
+    // ONE volume-0 resolver across the driver and fsck (Issue 19).
+    let vol0 = crate::meta_backend::kv::backend::recovery::vol0_of(&ctx.meta).map(|(_, v)| v);
     for (vol, kv) in ctx.meta.volumes.iter().enumerate() {
         match kv.slot_custody_census(vol0).await {
             Ok(census) => {
@@ -5979,7 +5980,9 @@ async fn recheck_suspects(
                     std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
                     std::collections::hash_map::Entry::Vacant(v) => {
                         let kv = &ctx.meta.volumes[*vol];
-                        v.insert(kv.slot_custody_census(ctx.meta.volumes.first()).await.ok())
+                        let vol0 = crate::meta_backend::kv::backend::recovery::vol0_of(&ctx.meta)
+                            .map(|(_, v)| v);
+                        v.insert(kv.slot_custody_census(vol0).await.ok())
                     }
                 };
                 let still = fresh.as_ref().is_some_and(|c| {
@@ -6024,7 +6027,9 @@ async fn recheck_suspects(
                     std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
                     std::collections::hash_map::Entry::Vacant(v) => {
                         let kv = &ctx.meta.volumes[*vol];
-                        v.insert(kv.slot_custody_census(ctx.meta.volumes.first()).await.ok())
+                        let vol0 = crate::meta_backend::kv::backend::recovery::vol0_of(&ctx.meta)
+                            .map(|(_, v)| v);
+                        v.insert(kv.slot_custody_census(vol0).await.ok())
                     }
                 };
                 let still = fresh.as_ref().is_some_and(|c| {

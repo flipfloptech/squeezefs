@@ -678,9 +678,24 @@ impl KvMetaBackend {
 
     /// **The C14 / C15 census** (§5.8.5) of this volume against the ledger
     /// on `vol0` (`None` = no ledger reachable: C15 is empty, C14 stands).
+    /// fsck's face — every dead ring read once for C15's window count.
     pub async fn slot_custody_census(
         &self,
         vol0: Option<&Arc<KvMetaBackend>>,
+    ) -> std::result::Result<CustodyCensus, KvError> {
+        self.slot_custody_census_opts(vol0, true).await
+    }
+
+    /// [`Self::slot_custody_census`] with the ring reads optional: the
+    /// mount-path gate needs the `Recovering`-unledgered verdict alone and
+    /// the driver reads every dead ring right after it (review round 1,
+    /// Issue 21 — the ring was read twice per recovery on the mount path).
+    /// `read_windows = false` reports every ledgered page as unrecovered
+    /// with a window count of 0.
+    pub async fn slot_custody_census_opts(
+        &self,
+        vol0: Option<&Arc<KvMetaBackend>>,
+        read_windows: bool,
     ) -> std::result::Result<CustodyCensus, KvError> {
         let mut out = CustodyCensus::default();
         let Some(set) = self.appenders.as_ref() else {
@@ -745,14 +760,22 @@ impl KvMetaBackend {
             let named = dead.iter().any(|(id, _)| same_mount(id, &page.identity));
             match page.state {
                 AppenderState::Live if named => {
-                    let window = self.window_entries_of(page).await.unwrap_or(0);
+                    let window = if read_windows {
+                        self.window_entries_of(page).await.unwrap_or(0)
+                    } else {
+                        0
+                    };
                     let holds = leases.get(&e.appender_id).is_some_and(|s| !s.is_empty());
-                    if window > 0 || holds || page.is_manager {
+                    if window > 0 || holds || page.is_manager || !read_windows {
                         out.unrecovered.push((e.appender_id, page.identity, window));
                     }
                 }
                 AppenderState::Recovering if named => {
-                    let window = self.window_entries_of(page).await.unwrap_or(0);
+                    let window = if read_windows {
+                        self.window_entries_of(page).await.unwrap_or(0)
+                    } else {
+                        0
+                    };
                     out.unrecovered.push((e.appender_id, page.identity, window));
                 }
                 AppenderState::Recovering => {
@@ -2088,11 +2111,18 @@ impl KvMetaBackend {
             return 0;
         };
         let key = self.pr_key;
-        match rsv_call(rsv, move |c| c.preempt_registrants_only(key, victim)).await {
+        // RACQA 2 — PREEMPT AND ABORT (design §5.9 step 1; review round 1,
+        // Issue 16): the victim's in-flight commands go with its
+        // registration.
+        match rsv_call(rsv, move |c| {
+            c.preempt_and_abort_registrants_only(key, victim)
+        })
+        .await
+        {
             Ok(()) => {
                 log::warn!(
-                    "meta volume {}: PREEMPTED dead registrant key {victim:#x} under the \
-                     manager's WERO — the device rejects its writes from here",
+                    "meta volume {}: PREEMPTED AND ABORTED dead registrant key {victim:#x} under \
+                     the manager's WERO — the device rejects its writes from here",
                     self.path.display()
                 );
                 1
@@ -2314,7 +2344,7 @@ impl KvMetaBackend {
             }
         }
         let mut inner = Self::open_inner(path, OpenPosture::Writer).await?;
-        *inner.guard_fd.get_mut().unwrap() = Some(guard_fd);
+        *inner.guard_fd.get_mut().unwrap_or_else(|e| e.into_inner()) = Some(guard_fd);
         let be = Arc::new(inner);
         let _ = be.conveyor_self.set(Arc::downgrade(&be));
         let entries = read_directory(path, &be.sb).await?;
@@ -2394,7 +2424,7 @@ impl KvMetaBackend {
             be.checkpoint_now().await?;
         } else {
             let mut v0 = Self::open_inner(vol0_path, OpenPosture::Writer).await?;
-            *v0.guard_fd.get_mut().unwrap() = vol0_guard;
+            *v0.guard_fd.get_mut().unwrap_or_else(|e| e.into_inner()) = vol0_guard;
             let v0 = Arc::new(v0);
             let _ = v0.conveyor_self.set(Arc::downgrade(&v0));
             v0.write_control_entry(vec![death_put], EntryAdmission::Try)
@@ -2432,8 +2462,14 @@ impl KvMetaBackend {
 // The routed set: the writer's install, the mount-path arm, the poll
 // ---------------------------------------------------------------------------
 
-/// Volume 0 of `routed` (the set-wide ledger's home) and its ordinal.
-fn vol0_of(routed: &RoutedMetaBackend) -> Option<(usize, &Arc<KvMetaBackend>)> {
+/// **THE volume-0 resolver** (review round 1, Issue 19 — one law for the
+/// driver, fsck's C14/C15 census and every other reader of the set-wide
+/// ledger): volume 0 is the volume the ROOT inode routes to — the slot
+/// map's slot-0 member, `route_ino(1).0` — with its ordinal in the routed
+/// set. The offline verbs (`appender clear`) take the same volume by the
+/// set's canonical URI order, which `plan_meta_slot_set` makes the slot-0
+/// member (`docs/operations.md`).
+pub fn vol0_of(routed: &RoutedMetaBackend) -> Option<(usize, &Arc<KvMetaBackend>)> {
     let slot0 = routed.route_ino(1).0;
     routed.volumes.get(slot0).map(|v| (slot0, v))
 }
@@ -2625,7 +2661,7 @@ pub async fn mount_path_custody_gate(
         );
     }
     for vol in &routed.volumes {
-        let census = vol.slot_custody_census(Some(vol0)).await?;
+        let census = vol.slot_custody_census_opts(Some(vol0), false).await?;
         if let Some((id, identity)) = census.recovering_unledgered.first() {
             return Err(KvError::Corrupt(format!(
                 "{}: appender {id}'s page is RECOVERING under node {:#018x} (mount slot {:#x}) \

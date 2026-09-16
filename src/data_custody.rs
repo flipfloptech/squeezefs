@@ -577,9 +577,25 @@ impl WeroHold {
     /// count is the **drain proof** a quarantine release needs. Blocking
     /// (one-shot ioctls).
     pub fn preempt(&self, victim_key: u64) -> u64 {
+        self.preempt_with(victim_key, false)
+    }
+
+    /// [`Self::preempt`] as PREEMPT AND ABORT (RACQA 2): the victim's
+    /// in-flight commands are aborted with its registration — the death
+    /// ledger's fence (design-symmetric-metadata §5.9 step 1, PR 10).
+    pub fn preempt_and_abort(&self, victim_key: u64) -> u64 {
+        self.preempt_with(victim_key, true)
+    }
+
+    fn preempt_with(&self, victim_key: u64, abort: bool) -> u64 {
         let mut n = 0;
         for client in &self.inner.clients {
-            match client.preempt_registrants_only(self.inner.key, victim_key) {
+            let r = if abort {
+                client.preempt_and_abort_registrants_only(self.inner.key, victim_key)
+            } else {
+                client.preempt_registrants_only(self.inner.key, victim_key)
+            };
+            match r {
                 Ok(()) => n += 1,
                 Err(e) => log::warn!("data-plane WERO preempt of key {victim_key:#x} failed: {e}"),
             }
@@ -762,7 +778,7 @@ pub fn preempt_dead_registrant(victim: u64) -> u64 {
         .filter_map(|(_, w)| w.upgrade())
         .map(|inner| WeroHold { inner })
         .collect();
-    holds.iter().map(|h| h.preempt(victim)).sum()
+    holds.iter().map(|h| h.preempt_and_abort(victim)).sum()
 }
 
 /// Every registrant key this process stands on (holder or registrant, any

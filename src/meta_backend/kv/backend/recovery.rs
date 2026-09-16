@@ -1391,6 +1391,47 @@ impl KvMetaBackend {
         }
     }
 
+    /// **The dead MANAGER's own lock** (§5.6.4's expiry law at a manager
+    /// failover — PR 3's successor arm composed): volume 0's manager IS
+    /// appender 0, so a `dir_rename` record naming appender 0 at a writer
+    /// era BELOW this manager's was taken by a predecessor incarnation
+    /// the D0 ladder replaced — dead by D0's proof — and is released
+    /// here, at the successor's arm. `Ok(true)` = released.
+    pub async fn release_stale_manager_dir_rename(&self) -> std::result::Result<bool, KvError> {
+        let Some(rec) = self.dir_rename_record().await? else {
+            return Ok(false);
+        };
+        if rec.holder != self.own_appender_id() || rec.term >= self.writer_term() {
+            return Ok(false);
+        }
+        self.manager_dir_rename_release_dead(rec.holder).await
+    }
+
+    /// Test seam: PLANT a `dir_rename` record as a dead manager incarnation
+    /// leaves it — `holder` at writer era `term` — without the in-process
+    /// RAII lease (whose `Drop` would release it; a held lease keeps the
+    /// backend alive through the kill). The failover contract's fixture.
+    pub async fn test_plant_dir_rename_record(
+        &self,
+        holder: u32,
+        term: u64,
+    ) -> std::result::Result<(), KvError> {
+        let rec = slot_state::DirRenameRecord {
+            holder,
+            term,
+            since_ns: crate::meta_backend::kv::alloc_lease::unix_now_ms() * 1_000_000,
+        };
+        self.write_control_entry(
+            vec![(
+                journal::tag_for(record::TREE_CONTROL, 0),
+                Record::put(slot_state::DIR_RENAME_KEY.to_vec(), 0, rec.encode()),
+            )],
+            EntryAdmission::Try,
+        )
+        .await?;
+        self.sync_device().await.map_err(KvError::Io)
+    }
+
     /// **The `Recovered`-until-released law** (§5.5.1): a `Recovered`
     /// page whose identity no `alloc_lease:` record names as a holder
     /// homed on this volume is RELEASED — its ring extents return to the
@@ -1756,6 +1797,14 @@ pub async fn mount_path_custody_gate(
     let Some((_, vol0)) = vol0_of(routed) else {
         return Ok(RecoverySetReport::default());
     };
+    // A manager failover's composition (§5.9's last note): the successor
+    // replayed the dead manager's ring at its open (PR 3); the set-wide
+    // lock the dead incarnation held is released here.
+    if let Err(e) = vol0.release_stale_manager_dir_rename().await {
+        log::warn!(
+            "recovery: releasing the predecessor manager's directory-rename lock failed ({e})"
+        );
+    }
     for vol in &routed.volumes {
         let census = vol.slot_custody_census(Some(vol0)).await?;
         if let Some((id, identity)) = census.recovering_unledgered.first() {

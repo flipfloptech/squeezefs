@@ -3629,12 +3629,46 @@ impl KvMetaBackend {
         // successor manager takes the native slot at `g + 1` (KD-SYM-2).
         // An uncovered region keeps its leases with its Live page.
         if let Some(plane) = set.slot_leases().cloned() {
+            // Symmetric PR 9 (review round 3, Issue 22): the leave is a
+            // handover to NOBODY — every live custody grant this holder
+            // issued on a covered region's slots is RECALLED and its
+            // release awaited (the handover's own recall, bounded by
+            // `T_owner + renew` and the S9 sweep) BEFORE the slots go
+            // `Unleased`, else the next lessee could grant a file a writer
+            // still holds this holder's custody of. A slot whose grant
+            // survives the bound stays LEASED with its region (the
+            // uncovered posture — loud). Runs OUTSIDE the handover mutex
+            // (the writers' releases need nothing of it).
+            let mut custody_blocked: Vec<u32> = Vec::new();
+            for region in set.regions.iter().filter(|r| !uncovered(r)) {
+                if region.released.load(Ordering::Acquire) {
+                    continue;
+                }
+                let held: Vec<super::record::ForestSlot> =
+                    region.leases().iter().copied().collect();
+                let still =
+                    crate::data_grant::recall_custody_at_leave(self.volume_uuid(), &held).await;
+                if !still.is_empty() {
+                    log::error!(
+                        "meta volume {}: appender {} keeps its leases at the leave — live \
+                         custody grants on slot(s) {still:?} survived the recall and the \
+                         T_owner sweep; its page stays Live",
+                        self.path.display(),
+                        region.id
+                    );
+                    custody_blocked.push(region.id);
+                }
+            }
             // The leave IS a release: under the handover mutex, so a
             // cadence handover in flight on its own task completes (or
             // the leave takes the mutex first and the cadence finds the
             // slot released) — never both on one slot.
             let _handover = self.handover.lock().await;
-            for region in set.regions.iter().filter(|r| !uncovered(r)) {
+            for region in set
+                .regions
+                .iter()
+                .filter(|r| !uncovered(r) && !custody_blocked.contains(&r.id))
+            {
                 if region.released.load(Ordering::Acquire) {
                     continue;
                 }

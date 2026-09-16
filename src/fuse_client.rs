@@ -13,7 +13,7 @@ use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use std::ffi::OsStr;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 pub const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
@@ -3654,6 +3654,29 @@ pub async fn census_meta_lock_acquire(
     MetaLockGuard {
         _g: g,
         acquired: hold_timed.then_some(acquired),
+    }
+}
+
+/// Symmetric PR 9 (review round 3, Issue 20): one mutating op's in-flight
+/// CUSTODY USE of a foreign-custody ino (see
+/// [`SqueezefsFilesystem::custody_use_enter`]). Inert (no counter) for an
+/// own file and on every unarmed mount.
+pub struct CustodyUse {
+    counter: Option<std::sync::Arc<AtomicI64>>,
+}
+
+impl CustodyUse {
+    /// The guard that counts nothing.
+    pub const fn inert() -> Self {
+        Self { counter: None }
+    }
+}
+
+impl Drop for CustodyUse {
+    fn drop(&mut self) {
+        if let Some(c) = &self.counter {
+            c.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -9371,6 +9394,24 @@ pub struct SqueezefsFilesystem {
     /// (KD-MW-12 — empty on every shipped mount); entries retire with
     /// the ino's range leases.
     range_stream_frontier: std::sync::Arc<dashmap::DashMap<u64, u64, ahash::RandomState>>,
+    /// Symmetric PR 9 (review round 3, Issue 20): cached leases a slot
+    /// holder's RECALL parked — removed from `active_leases` (every later
+    /// write re-acquires) but not yet dropped (the drop queues the release
+    /// verb): each is dropped by `settle_recalled_leases` once the ino's
+    /// in-flight custody uses drained. Empty on every unarmed mount.
+    recalled_leases:
+        std::sync::Arc<dashmap::DashMap<u64, crate::dlm::LockLease, ahash::RandomState>>,
+    /// Symmetric PR 9 (round 3, Issue 20): per-ino in-flight CUSTODY USES
+    /// of a FOREIGN-custody file — the mutating handlers (WRITE / SETATTR /
+    /// FALLOCATE / COPY_FILE_RANGE / FLUSH / FSYNC / RELEASE) and the
+    /// detached DMA continuations they spawn, each holding a
+    /// [`CustodyUse`] from its entry to its end. A recall's release waits
+    /// for the count to drain: no handler that took the token before the
+    /// revoke can merge or DMA after the grant left. Entries exist only for
+    /// inos a slot holder serves (`slot_holder_home` — one relaxed load per
+    /// op unarmed, no map touch); own files never enter.
+    custody_use:
+        std::sync::Arc<dashmap::DashMap<u64, std::sync::Arc<AtomicI64>, ahash::RandomState>>,
     lease_locks: std::sync::Arc<StripeLocks<crate::sqz_sync::SqzMutex<()>>>,
     pub active_inode_locks: std::sync::Arc<StripeLocks<crate::sqz_sync::SqzRwLock<()>>>,
     /// P1-4: capacity-bounded attribute cache (moka TTL + max_capacity).
@@ -9714,6 +9755,8 @@ impl Clone for SqueezefsFilesystem {
             active_leases: self.active_leases.clone(),
             active_range_leases: self.active_range_leases.clone(),
             range_stream_frontier: self.range_stream_frontier.clone(),
+            recalled_leases: self.recalled_leases.clone(),
+            custody_use: self.custody_use.clone(),
             lease_locks: self.lease_locks.clone(),
             active_inode_locks: self.active_inode_locks.clone(),
             attr_cache: self.attr_cache.clone(),
@@ -9921,6 +9964,12 @@ impl SqueezefsFilesystem {
                 ahash::RandomState::new(),
             )),
             range_stream_frontier: std::sync::Arc::new(dashmap::DashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
+            recalled_leases: std::sync::Arc::new(dashmap::DashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
+            custody_use: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
             lease_locks: std::sync::Arc::new(StripeLocks::new(INODE_GUARD_STRIPES)),
@@ -13937,6 +13986,13 @@ impl SqueezefsFilesystem {
                     "slot_handover_custody_deferrals".into(),
                     load(&crate::data_grant::HANDOVER_CUSTODY_DEFERRALS),
                 );
+                // Round 3 (Issue 24): the mid-handover mark's bound in
+                // force (2 × the custody authority's renewal beat; 0
+                // without one).
+                metrics.insert(
+                    "slot_handover_recall_bound_ms".into(),
+                    serde_json::Value::from(crate::data_grant::handover_recall_bound_ms()),
+                );
                 metrics.insert("slot_offers_busy".into(), lease(&|s| s.offers_busy));
                 metrics.insert(
                     "meta_kv_leaf_lease_refusals".into(),
@@ -15656,10 +15712,16 @@ impl SqueezefsFilesystem {
         // -- custody (RAM-only; an await-needing shape is INELIGIBLE),
         //    each refusal attributed to its own arm ------------------
         // The cached-lease hot path only: a first-write ino's lease
-        // acquisition is the handler's async job.
+        // acquisition is the handler's async job. A REMOTE lease (a slot
+        // holder's grant — symmetric PR 9) is the handler path's too: its
+        // DMA runs on the service thread outside any handler's custody
+        // use, which a recall's drain could not observe.
         let Some(lease) = self.active_leases.get(&ino) else {
             return Err(I::Lease);
         };
+        if lease.is_remote() || !lease.held_now() {
+            return Err(I::Lease);
+        }
         let token = lease.fencing_token();
         drop(lease);
         // W1 clause 7 — whole-inode exclusive custody. The uncounted
@@ -15934,8 +15996,11 @@ impl SqueezefsFilesystem {
         // Hot path: return cached fencing token without re-validating the DLM map
         // on every write (was a lock/hash hit per op). Stale tokens are rejected by
         // write_file / save_metadata fencing checks; callers invalidate on that path.
-        if let Some(lease) = self.active_leases.get(&ino) {
-            return Ok(lease.fencing_token());
+        // Symmetric PR 9 (round 3, Issue 20): the ONE accessor — a lease a
+        // slot holder recalled or revoked reads NOT held and is never
+        // returned; the slow path below re-acquires.
+        if let Some(token) = self.cached_lease_token(ino) {
+            return Ok(token);
         }
         // S11 rung 15: a file under this mount's RANGE custody serves the
         // newest range token instead of acquiring whole-file — a
@@ -15953,8 +16018,8 @@ impl SqueezefsFilesystem {
         let _guard = lock_arc.lock().await;
         METRICS.lease_lock_wait.record(start_lease_lock.elapsed());
 
-        if let Some(lease) = self.active_leases.get(&ino) {
-            return Ok(lease.fencing_token());
+        if let Some(token) = self.cached_lease_token(ino) {
+            return Ok(token);
         }
         if let Some(token) = self.newest_range_token(ino) {
             return Ok(token);
@@ -16226,16 +16291,22 @@ impl SqueezefsFilesystem {
             // entry alone knows about (the orphaned-blob leak).
             router.discard_layout_cache(ino);
         }));
-        // Finding 34 (rung 1): the range-custody RELEASE GATE — a ranged
-        // release verb departs only when the ino's publish pipeline is
-        // quiescent. The close path releases custody while its flush is
-        // BACKGROUNDED, so an un-gated release verb outran the flush's
-        // full Put and the owner served that Put custody-less + verbatim
-        // (the s11-blockcyclic C8/C2 storm). The gate PROBES synchronously
-        // (the drain runs under the acquire path's order-2 lease stripe —
-        // no order-1 locks, no awaits) and, when busy, kicks ONE detached
-        // fsync-grade flush per ino (latched) and defers the verb to the
-        // next drain cadence.
+        self.install_release_gate_hook();
+    }
+
+    /// Finding 34 (rung 1): the range-custody RELEASE GATE — a ranged
+    /// release verb departs only when the ino's publish pipeline is
+    /// quiescent. The close path releases custody while its flush is
+    /// BACKGROUNDED, so an un-gated release verb outran the flush's
+    /// full Put and the owner served that Put custody-less + verbatim
+    /// (the s11-blockcyclic C8/C2 storm). The gate PROBES synchronously
+    /// (the drain runs under the acquire path's order-2 lease stripe —
+    /// no order-1 locks, no awaits) and, when busy, kicks ONE detached
+    /// fsync-grade flush per ino (latched) and defers the verb to the
+    /// next drain cadence. Installed by the co-writer arm and — symmetric
+    /// PR 9 — by the slot-custody arm (a recalled grant's release is gated
+    /// the same way).
+    fn install_release_gate_hook(&self) {
         let fs = self.clone();
         crate::data_grant::install_release_gate(std::sync::Arc::new(
             move |ino: u64, token_hint: u64| {
@@ -16318,8 +16389,8 @@ impl SqueezefsFilesystem {
         let (start, end) = (offset, offset.saturating_add(len));
         // 1. Whole-file custody covers every span (a mount that took the
         // whole file before the lever engaged keeps its fast path).
-        if let Some(lease) = self.active_leases.get(&ino) {
-            return Ok(lease.fencing_token());
+        if let Some(token) = self.cached_lease_token(ino) {
+            return Ok(token);
         }
         // 2. The covering probe — the cached-token hot path.
         if let Some(token) = crate::meta_ship::tokens::range_token_covering(ino, start, end) {
@@ -16567,6 +16638,138 @@ impl SqueezefsFilesystem {
                 .fetch_add(1, Ordering::Relaxed);
         }
         taken
+    }
+
+    /// **The ONE cached-lease accessor** (symmetric PR 9, review round 3 —
+    /// Issue 20): the cached whole-file lease's fencing token iff the lease
+    /// is still HELD (`LockLease::held_now` — a remote grant's liveness is
+    /// the owner's decision: a recall or a revocation makes it read false).
+    /// A lease that is no longer held is dropped from the cache here (its
+    /// drop queues its release if any is owed) and `None` is answered, so
+    /// the caller's slow path re-acquires through the ladder — at the
+    /// slot's NEXT holder once it moved. Sync: the direct-drive snapshot
+    /// reads it too.
+    pub fn cached_lease_token(&self, ino: u64) -> Option<u64> {
+        let lease = self.active_leases.get(&ino)?;
+        if lease.held_now() {
+            return Some(lease.fencing_token());
+        }
+        drop(lease);
+        if let Some((_, stale)) = self.active_leases.remove_if(&ino, |_, l| !l.held_now()) {
+            drop(stale);
+        }
+        None
+    }
+
+    /// **A slot holder RECALLED this ino's custody** (round 3, Issue 20 —
+    /// the `RecallHooks::revoke` half): the cached lease leaves the cache
+    /// (every later write re-acquires — the old holder answers
+    /// `CUSTODY_DEFERRED` while the slot is mid-handover, the new holder
+    /// after) and is PARKED, not dropped: its drop is what queues the
+    /// release verb, and that must wait for the in-flight custody uses
+    /// that took the token before this instant (`settle_recalled_leases`).
+    /// The range leases and the stream frontier retire as on
+    /// `invalidate_local_lease`.
+    pub fn revoke_local_lease_for_recall(&self, ino: u64) {
+        if let Some((_, lease)) = self.active_leases.remove(&ino) {
+            self.recalled_leases.insert(ino, lease);
+        }
+        // The Dekker with `custody_use_enter`: the removal is visible to
+        // every handler that increments its use AFTER this fence; a
+        // handler that incremented before it is observed by the settle's
+        // load.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if let Some((_, leases)) = self.active_range_leases.remove(&ino) {
+            drop(leases);
+        }
+        self.range_stream_frontier.remove(&ino);
+    }
+
+    /// **Drop every parked recalled lease whose in-flight custody uses
+    /// drained** (the `RecallHooks::settle` half): each drop queues the
+    /// grant's GATED release (the finding-34 gate flushes the ino's acked
+    /// bytes before the verb departs). A parked lease of a grant already
+    /// dead (its holder fenced) drops regardless. Returns the count dropped.
+    pub fn settle_recalled_leases(&self) -> usize {
+        let mut ready: Vec<u64> = Vec::new();
+        for entry in self.recalled_leases.iter() {
+            let ino = *entry.key();
+            let inflight = self
+                .custody_use
+                .get(&ino)
+                .map(|c| c.load(Ordering::SeqCst))
+                .unwrap_or(0);
+            if inflight <= 0 || !entry.value().held_now() {
+                ready.push(ino);
+            }
+        }
+        let mut dropped = 0usize;
+        for ino in ready {
+            if let Some((_, lease)) = self.recalled_leases.remove(&ino) {
+                drop(lease);
+                dropped += 1;
+            }
+        }
+        dropped
+    }
+
+    /// Parked recalled leases still waiting for their uses to drain (the
+    /// `RecallHooks::pending` half; the contracts' probe).
+    pub fn recalled_leases_pending(&self) -> usize {
+        self.recalled_leases.len()
+    }
+
+    /// **The in-flight custody use of a mutating op on `ino`** (round 3,
+    /// Issue 20): a FOREIGN-custody file's handlers and their detached DMA
+    /// continuations each hold one from entry to end, so a recall's
+    /// release waits for every token-holder that predates the revoke. Own
+    /// files (and every unarmed mount) pay one relaxed load and touch no
+    /// map — the guard is inert.
+    pub fn custody_use_enter(&self, ino: u64) -> CustodyUse {
+        if crate::data_grant::slot_holder_home(ino).is_none() {
+            return CustodyUse::inert();
+        }
+        let counter = std::sync::Arc::clone(
+            &*self
+                .custody_use
+                .entry(ino)
+                .or_insert_with(|| std::sync::Arc::new(AtomicI64::new(0))),
+        );
+        counter.fetch_add(1, Ordering::SeqCst);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        CustodyUse {
+            counter: Some(counter),
+        }
+    }
+
+    /// **Test seam**: the in-flight custody uses of `ino` (0 = none, or an
+    /// own file).
+    pub fn custody_uses(&self, ino: u64) -> i64 {
+        self.custody_use
+            .get(&ino)
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    /// **Install the slot-custody plane's FUSE-layer hooks** (the mount
+    /// arm's act when `arm_mount_slot_custody` armed; the FUSE-layer
+    /// contracts directly): the finding-34 RELEASE GATE (a recalled grant's
+    /// release departs only behind the ino's fsync-grade flush — the same
+    /// hook the co-writer arm installs) and the RECALL hooks (revoke /
+    /// settle / pending) a slot holder's `RecallNotice` drives.
+    pub fn install_slot_custody_hooks(&self) {
+        self.install_release_gate_hook();
+        let fs = self.clone();
+        let revoke = std::sync::Arc::new(move |ino: u64| fs.revoke_local_lease_for_recall(ino));
+        let fs = self.clone();
+        let settle = std::sync::Arc::new(move || fs.settle_recalled_leases());
+        let fs = self.clone();
+        let pending = std::sync::Arc::new(move || fs.recalled_leases_pending());
+        crate::data_grant::install_recall_hooks(crate::data_grant::RecallHooks {
+            revoke,
+            settle,
+            pending,
+        });
     }
 
     /// Drop a locally cached lease (e.g. after `FencingTokenExpired` or lock loss).
@@ -18392,7 +18595,9 @@ impl SqueezefsFilesystem {
                     METRICS
                         .overlay_ack_early_bytes
                         .fetch_add(len as u64, Ordering::Relaxed);
+                    let cont_use = self.custody_use_enter(ino);
                     crate::detached::tpc_spawn_guarded("overlay_ack_early_store", async move {
+                        let _custody_use = cont_use;
                         fs.finish_ack_early_store(
                             ino,
                             offset_hint,
@@ -18444,7 +18649,9 @@ impl SqueezefsFilesystem {
                     METRICS
                         .overlay_ack_early_bytes
                         .fetch_add(len as u64, Ordering::Relaxed);
+                    let cont_use = self.custody_use_enter(ino);
                     crate::detached::tpc_spawn_guarded("overlay_ack_early_snapshot", async move {
+                        let _custody_use = cont_use;
                         fs.finish_ack_early_bytes(ino, b, rec2, ticket, dest, len, snap, admission)
                             .await;
                     });
@@ -18499,7 +18706,9 @@ impl SqueezefsFilesystem {
                 METRICS
                     .overlay_ack_early_bytes
                     .fetch_add(len as u64, Ordering::Relaxed);
+                let cont_use = self.custody_use_enter(ino);
                 crate::detached::tpc_spawn_guarded("overlay_ack_early_bytes", async move {
+                    let _custody_use = cont_use;
                     fs.finish_ack_early_bytes(ino, b, rec2, ticket, dest, len, owned, admission)
                         .await;
                 });
@@ -18544,7 +18753,9 @@ impl SqueezefsFilesystem {
                     // write-pipeline upload.
                     rec.core.freeze();
                     let fs = self.clone();
+                    let cont_use = self.custody_use_enter(ino);
                     crate::detached::tpc_spawn_guarded("overlay_publish", async move {
+                        let _custody_use = cont_use;
                         if let Err(e) = fs.drain_device_overlay_block(ino, b, false).await {
                             warn!(
                                 "device-overlay publish for ino {ino} block {b} failed \
@@ -20632,6 +20843,10 @@ impl SqueezefsFilesystem {
                         );
                         let fs = self.clone();
                         let key = cache_key.to_string();
+                        // PR 9 (round 3, Issue 20): the detached upload's
+                        // custody use — taken HERE, while the handler's own
+                        // still holds, and moved into the task.
+                        let upload_use = self.custody_use_enter(ino);
                         // The fuse3 per-core handler lanes — the venue pin
                         // (the 2026-07-26 handoff-economy law: never a
                         // runtime-handle spawn onto the global inject
@@ -20649,6 +20864,7 @@ impl SqueezefsFilesystem {
                         crate::detached::tpc_spawn_guarded(
                             "write_pipeline_upload",
                             crate::op_trace::scope(trace_id, async move {
+                                let _custody_use = upload_use;
                                 pipeline_phase_record(PipelinePhase::DetachLag, t_detach);
                                 fs.pipeline_upload_parked_block(permit, ino, b as u32, key)
                                     .await;
@@ -24582,6 +24798,7 @@ impl SqueezefsFilesystem {
         if let Some((_, lease)) = self.active_leases.remove(&ino) {
             let _ = lease.release().await;
         }
+        self.custody_use.remove(&ino);
         if let Some((_, leases)) = self.active_range_leases.remove(&ino) {
             for lease in leases {
                 let _ = lease.release().await;
@@ -26549,6 +26766,10 @@ impl Filesystem for SqueezefsFilesystem {
         // RW1: sample the concurrent WRITE-handler depth (rig-armed only) —
         // the §12 OQ2 instrument. RAII: released at handler return.
         let _write_inflight = WriteInflight::enter();
+        // Symmetric PR 9 (round 3, Issue 20): a foreign-custody file's
+        // in-flight custody use — a slot holder's recall releases the
+        // grant only after every such use drained. Inert for own files.
+        let _custody_use = self.custody_use_enter(ino);
 
         let prof = OpProf::begin(FuseOpKind::Write, ino);
         let write_future = async {
@@ -27169,6 +27390,9 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE SetAttr: ino = {}, set_attr = {:?}", ino, set_attr);
+        // Symmetric PR 9 (round 3, Issue 20): the op's in-flight custody use
+        // of a foreign-custody file (inert for own files).
+        let _custody_use = self.custody_use_enter(ino);
 
         // Every virtual ino refuses attribute mutation (the guard used to
         // name only CONFIG_INODE; STATS_INODE and the generation inos fell
@@ -28071,6 +28295,9 @@ impl Filesystem for SqueezefsFilesystem {
         let _serve = crate::ro_coherence::ServeStamp::begin();
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
+        // Symmetric PR 9 (round 3, Issue 20): the DESTINATION's in-flight
+        // custody use (the written ino; inert for an own file).
+        let _custody_use = self.custody_use_enter(inode_out);
         // VL8 item 2: register BEFORE the guards — the live wedge's stuck
         // cfr handlers were watchdog-invisible exactly while guard-blocked.
         let _prof = OpProf::begin(FuseOpKind::CopyFileRange, inode);
@@ -28648,6 +28875,9 @@ impl Filesystem for SqueezefsFilesystem {
     async fn flush(&self, _req: Request, ino: u64, _fh: u64, _lock_owner: u64) -> FuseResult<()> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Flush: ino = {}", ino);
+        // Symmetric PR 9 (round 3, Issue 20): the op's in-flight custody use
+        // of a foreign-custody file (inert for own files).
+        let _custody_use = self.custody_use_enter(ino);
 
         if is_virtual_ino(ino) {
             return Ok(());
@@ -28732,6 +28962,9 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<()> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Release: ino = {}", ino);
+        // Symmetric PR 9 (round 3, Issue 20): the op's in-flight custody use
+        // of a foreign-custody file (inert for own files).
+        let _custody_use = self.custody_use_enter(ino);
         // Quiescent-lineage accounting: a buffered handle closed (the
         // kernel echoes the open flags; an O_DIRECT fh never counted, so
         // saturating_sub keeps a missed echo in the SAFE direction —
@@ -28854,6 +29087,9 @@ impl Filesystem for SqueezefsFilesystem {
     async fn fsync(&self, _req: Request, ino: u64, _fh: u64, _datasync: bool) -> FuseResult<()> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Fsync: ino = {}, datasync = {}", ino, _datasync);
+        // Symmetric PR 9 (round 3, Issue 20): the op's in-flight custody use
+        // of a foreign-custody file (inert for own files).
+        let _custody_use = self.custody_use_enter(ino);
 
         if is_virtual_ino(ino) {
             return Ok(());
@@ -29004,6 +29240,9 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<()> {
         self.ro_gate("fallocate")?;
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        // Symmetric PR 9 (round 3, Issue 20): the op's in-flight custody use
+        // of a foreign-custody file (inert for own files).
+        let _custody_use = self.custody_use_enter(ino);
         // VL8 item 2: register BEFORE the inode guard (watchdog visibility).
         let _prof = OpProf::begin(FuseOpKind::Fallocate, ino);
         debug!(

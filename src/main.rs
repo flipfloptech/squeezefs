@@ -6902,9 +6902,20 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // leasing its slot (tree 0 + SlotHolderCache), the grant
             // carrying the file's records; own files stay local. `Ok(false)`
             // and one test per volume on every unarmed mount.
-            squeezefs::data_grant::arm_mount_slot_custody(&routed_meta_backend, &fs_engine.router)
-                .await
-                .map_err(|e| format!("custody by the slot holder refused to arm: {e}"))?;
+            let slot_custody_armed = squeezefs::data_grant::arm_mount_slot_custody(
+                &routed_meta_backend,
+                &fs_engine.router,
+            )
+            .await
+            .map_err(|e| format!("custody by the slot holder refused to arm: {e}"))?;
+            if slot_custody_armed {
+                // Review round 3 (Issue 20): the plane's FUSE-layer half — a
+                // slot holder's RECALL parks this mount's cached lease so
+                // the next write re-acquires, and the recalled grant's
+                // release rides the finding-34 gate (the ino's fsync-grade
+                // flush) once the in-flight custody uses drained.
+                fs_engine.install_slot_custody_hooks();
+            }
 
             // DLM S9: the CO-WRITER's own arm — the client halves of the same
             // three planes the authority serves. It installs the ownership map

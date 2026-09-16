@@ -2051,6 +2051,29 @@ impl LockLease {
             .unwrap_or(false)
     }
 
+    /// [`Self::is_held`]'s SYNCHRONOUS twin (symmetric PR 9, review round
+    /// 3 — Issue 20): the FUSE layer's cached-lease accessor consults it on
+    /// the WRITE hot path, where an `.await` is not available (the direct-
+    /// drive snapshot) and the answer is a relaxed word either way — a
+    /// remote grant's `live()` (the owner's decision, learnt at a recall or
+    /// a renewal), a local one's table entry.
+    pub fn held_now(&self) -> bool {
+        if let Some(remote) = &self.inner.remote {
+            return remote.live();
+        }
+        LOCK_MAP
+            .read_sync(&self.inner.key, |_, custody| {
+                custody.holds(self.inner.fencing_token, self.inner.client_nonce)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Is this lease an OWNER's grant adopted here (DLM S9 — its release
+    /// travels; its liveness is the owner's answer)?
+    pub fn is_remote(&self) -> bool {
+        self.inner.remote.is_some()
+    }
+
     /// The generation this lease was fenced at (snapshot at acquire).
     pub fn fencing_token(&self) -> u64 {
         self.inner.fencing_token

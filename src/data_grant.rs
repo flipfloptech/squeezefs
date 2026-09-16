@@ -727,6 +727,10 @@ static CUSTODY_RECALLED: AtomicU64 = AtomicU64::new(0);
 pub static HANDOVER_CUSTODY_DEFERRALS: AtomicU64 = AtomicU64::new(0);
 /// The token-wire correlation ids of the carried custody grants.
 static CARRIED_REQUEST_IDS: AtomicU64 = AtomicU64::new(1);
+/// **Test seam** (round 3, Issue 21's pin): the writer DROPS the next
+/// carrier's recall notices unabsorbed — a reply lost on the wire; the
+/// recall must re-travel on the following carrier.
+pub static TEST_DROP_RECALL_CARRIER_ONCE: AtomicBool = AtomicBool::new(false);
 
 /// Finding 34 (rung 1): the RELEASE GATE — answers whether `ino`'s
 /// publish pipeline is QUIESCENT (synchronously, lock-order-free: the
@@ -753,6 +757,44 @@ pub fn uninstall_release_gate() {
 
 fn release_gate() -> Option<ReleaseGateHook> {
     RELEASE_GATE.load_full().map(|h| h.as_ref().clone())
+}
+
+/// **Symmetric PR 9 (review round 3, Issue 20) — the recall's FUSE-layer
+/// half.** A handover [`RecallNotice`] must reach the writer's CACHED
+/// lease (the FUSE layer's `active_leases`, held from a file's first write
+/// to its last close), or every later write is admitted under the
+/// released grant: `revoke(ino)` PARKS the cached lease (removed from the
+/// cache — the next write re-acquires through the ladder, at the slot's
+/// NEXT holder once it moved — but not dropped: its drop is what queues
+/// the release verb); `settle()` drops every parked lease whose in-flight
+/// custody uses (the WRITE handlers and detached DMA continuations that
+/// took the token before the revoke) have drained, queueing their gated
+/// releases, and answers how many it dropped; `pending()` counts the
+/// parked leases still waiting. Installed by the FUSE layer beside the
+/// release gate (`install_slot_custody_hooks`); absent (the in-process
+/// contracts, no FUSE layer) a recall releases the grant handle directly.
+pub struct RecallHooks {
+    pub revoke: Arc<dyn Fn(u64) + Send + Sync>,
+    pub settle: Arc<dyn Fn() -> usize + Send + Sync>,
+    pub pending: Arc<dyn Fn() -> usize + Send + Sync>,
+}
+
+static RECALL_HOOKS: Lazy<arc_swap::ArcSwapOption<RecallHooks>> =
+    Lazy::new(arc_swap::ArcSwapOption::empty);
+
+/// Install the recall hooks (the FUSE layer's, when the slot-custody plane
+/// arms; a re-arm replaces).
+pub fn install_recall_hooks(hooks: RecallHooks) {
+    RECALL_HOOKS.store(Some(Arc::new(hooks)));
+}
+
+/// Uninstall the recall hooks (unmount teardown / tests).
+pub fn uninstall_recall_hooks() {
+    RECALL_HOOKS.store(None);
+}
+
+fn recall_hooks() -> Option<Arc<RecallHooks>> {
+    RECALL_HOOKS.load_full()
 }
 
 /// The client-side view of the custody ledger (the owner's own per-instance
@@ -1212,10 +1254,10 @@ pub struct WriteCustodyOwner {
     /// pending-mark hook wakes every parked poll (wake-all is deliberate —
     /// each poll re-gathers ITS client's notices and re-parks on empty).
     notice_notify: Arc<squeezefs_ipc::sqz_notify::Notify>,
-    /// PR 9: the handover recalls queued per client (`RecallNotice`s not
-    /// yet carried), and the grant ids already recalled (idempotent: a
-    /// handover retried every cadence tick re-notices nobody).
-    pending_recalls: parking_lot::Mutex<HashMap<String, Vec<RecallNotice>>>,
+    /// PR 9: the grant ids a handover RECALLED and whose release has not
+    /// landed — the recall SET every carrier re-gathers its client's
+    /// notices from (round 3, Issue 21); a grant leaves it at its release
+    /// or its client's death.
     recalled_grants: parking_lot::Mutex<std::collections::HashSet<u64>>,
     recalled: AtomicU64,
 }
@@ -1323,7 +1365,6 @@ impl WriteCustodyOwner {
             grace_conflicts: AtomicU64::new(0),
             unknown_leases: AtomicU64::new(0),
             notice_notify,
-            pending_recalls: parking_lot::Mutex::new(HashMap::new()),
             recalled_grants: parking_lot::Mutex::new(std::collections::HashSet::new()),
             recalled: AtomicU64::new(0),
         }))
@@ -2130,27 +2171,19 @@ impl WriteCustodyOwner {
         if inos.is_empty() {
             return 0;
         }
-        let targets: Vec<(u64, String, u64)> = self
+        let targets: Vec<u64> = self
             .table
-            .grants_snapshot_with(|id, g| {
-                inos.contains(&g.ino).then(|| (id, g.client.clone(), g.ino))
-            })
+            .grants_snapshot_with(|id, g| inos.contains(&g.ino).then_some(id))
             .into_iter()
             .flatten()
             .collect();
         let mut fresh = 0usize;
         {
             let mut seen = self.recalled_grants.lock();
-            let mut pending = self.pending_recalls.lock();
-            for (grant_id, client, ino) in targets {
-                if !seen.insert(grant_id) {
-                    continue;
+            for grant_id in targets {
+                if seen.insert(grant_id) {
+                    fresh += 1;
                 }
-                fresh += 1;
-                pending
-                    .entry(client)
-                    .or_default()
-                    .push(RecallNotice { ino, grant_id });
             }
         }
         if fresh > 0 {
@@ -2161,16 +2194,29 @@ impl WriteCustodyOwner {
         fresh
     }
 
-    /// The handover recalls queued for `client` — TAKEN (each notice
-    /// travels once; a client that drops the carrier re-learns the recall
-    /// through its grant's death at the handover's bound, never a second
-    /// notice).
+    /// The handover recalls addressed to `client` — GATHERED FROM STATE on
+    /// every carrier (round 3, Issue 21: the demotion / shrink notices'
+    /// own law — a carrier whose reply is lost on the wire re-travels the
+    /// notice at the next; the first build `mem::take`d a queue and a
+    /// lost reply orphaned the recall for the file's lifetime): the
+    /// client's live grants whose ids the handover recalled. The set
+    /// empties as the releases land (a released grant leaves the table
+    /// AND the recalled set); the writer's absorb is idempotent.
     fn take_recalls_for(&self, client: &str) -> Vec<RecallNotice> {
-        let mut pending = self.pending_recalls.lock();
-        match pending.get_mut(client) {
-            Some(q) if !q.is_empty() => std::mem::take(q),
-            _ => Vec::new(),
+        let seen = self.recalled_grants.lock();
+        if seen.is_empty() {
+            return Vec::new();
         }
+        self.table
+            .grants_snapshot_with(|id, g| {
+                (g.client == client && seen.contains(&id)).then_some(RecallNotice {
+                    ino: g.ino,
+                    grant_id: id,
+                })
+            })
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     /// The grant ids of `client`'s live grants on `ino` (PR 9 — the
@@ -2345,7 +2391,6 @@ impl WriteCustodyOwner {
                     seen.remove(id);
                 }
             }
-            self.pending_recalls.lock().remove(client);
         }
         let epoch = crate::data_custody::declare_dead_epoch(&format!(
             "S9: co-writer '{client}' custody revoked by authority '{}' ({reason})",
@@ -3125,6 +3170,10 @@ struct ClientGrant {
     /// state to retire; the S1 mint starts at 1, so 0 is never a token).
     ino: u64,
     token: u64,
+    /// The grant's FENCING token (the S1 mint the owner answered) — the
+    /// release gate's flush hint for a recalled whole-file grant, whose
+    /// `token` (the range-cache span key) is 0.
+    fence_token: u64,
 }
 
 impl ClientGrant {
@@ -3144,7 +3193,9 @@ impl ClientGrant {
 struct PendingRelease {
     id: u64,
     ino: u64,
-    token: u64,
+    /// The gate's flush hint: the range token, else the grant's fencing
+    /// token (a recalled whole-file grant).
+    hint: u64,
     gated: bool,
 }
 
@@ -3155,7 +3206,11 @@ impl crate::dlm::RemoteGrant for ClientGrant {
             self.pending.lock().push(PendingRelease {
                 id: self.grant_id,
                 ino: self.ino,
-                token: self.token,
+                hint: if self.token != 0 {
+                    self.token
+                } else {
+                    self.fence_token
+                },
                 gated: self.token != 0 || self.recalled.load(Ordering::Acquire),
             });
         }
@@ -3232,8 +3287,15 @@ pub struct WriteCustodyClient {
     /// round 2, Issues 7/10).
     scope: CustodyScope,
     /// PR 9: set once this client fenced its own custody (scope
-    /// `SlotHolder`) — every later verb refuses; the arm drops it.
+    /// `SlotHolder`) — set LAST, after the fence's work (the completion
+    /// word a waiter may observe); every later verb refuses; the arm
+    /// drops it.
     fenced: AtomicBool,
+    /// PR 9: the fence's entry latch (ONE fencer runs the work).
+    fencing: AtomicBool,
+    /// PR 9: this client's own `Arc` (set once at connect) — the recall
+    /// absorb spawns its settle loop from a `&self` method.
+    weak_self: std::sync::OnceLock<std::sync::Weak<WriteCustodyClient>>,
 }
 
 /// PR 9 (review round 2, Issues 7/10): the scope of a custody client's
@@ -3371,7 +3433,10 @@ impl WriteCustodyClient {
             clock,
             scope,
             fenced: AtomicBool::new(false),
+            fencing: AtomicBool::new(false),
+            weak_self: std::sync::OnceLock::new(),
         });
+        let _ = client.weak_self.set(Arc::downgrade(&client));
         // Finding 27: the STANDING notice poll — one parked RPC per
         // custody client, so a QUIET incumbent (no verbs in flight)
         // hears a pending demotion/shrink at poll latency instead of its
@@ -3504,8 +3569,11 @@ impl WriteCustodyClient {
     }
 
     fn fence_holder_scoped(&self, reason: &str) -> SelfFence {
-        let first = !self.fenced.swap(true, Ordering::AcqRel);
-        if first {
+        // ONE fencer (the renewal loop is the caller; a second call is
+        // idempotent): the fence's WORK runs first and the observable
+        // `fenced` latch is set LAST (round 3, Issue 27 — the first build
+        // latched before its work and a waiter on the latch raced it).
+        if !self.fencing.swap(true, Ordering::AcqRel) {
             HOLDER_FENCES.fetch_add(1, Ordering::Relaxed);
             log::error!(
                 "PR 9: custody client '{}' at slot holder {} FENCED ITS OWN CUSTODY at T_self \
@@ -3515,17 +3583,38 @@ impl WriteCustodyClient {
                 self.id,
                 self.endpoint
             );
-            self.note_lease_lost(&format!(
-                "T_self at slot holder {}: {reason}",
+            // This client's grants alone (round 3, Issue 23): each marked
+            // dead — its own range span retired with it — never the
+            // process-wide range-cache clear `note_lease_lost` runs for
+            // the set authority's lease.
+            let mut ids = Vec::new();
+            self.grants.iter_sync(|id, _| {
+                ids.push(*id);
+                true
+            });
+            for id in ids {
+                self.mark_dead(id);
+            }
+            crate::data_custody::advance_custody_generation(&format!(
+                "PR 9: this node's custody lease at slot holder {} is no longer custody \
+                 (T_self: {reason})",
                 self.endpoint
             ));
             holder_fenced(&self.endpoint);
+            self.fenced.store(true, Ordering::Release);
+            return SelfFence {
+                role: crate::membership::MemberRole::Writer,
+                poisoned_data_custody: false,
+                purge_requested: false,
+                first: true,
+                parked: false,
+            };
         }
         SelfFence {
             role: crate::membership::MemberRole::Writer,
             poisoned_data_custody: false,
             purge_requested: false,
-            first,
+            first: false,
             parked: false,
         }
     }
@@ -3571,6 +3660,10 @@ impl WriteCustodyClient {
         if recalls.is_empty() {
             return false;
         }
+        if TEST_DROP_RECALL_CARRIER_ONCE.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        let hooks = recall_hooks();
         let mut absorbed = 0u64;
         for n in recalls {
             let Some(g) = self.grants.read_sync(&n.grant_id, |_, g| Arc::clone(g)) else {
@@ -3586,8 +3679,22 @@ impl WriteCustodyClient {
                 );
                 continue;
             }
-            g.recalled.store(true, Ordering::Release);
-            crate::dlm::RemoteGrant::release(&*g);
+            // Idempotent (round 3, Issue 21 — the notice is re-gathered on
+            // every carrier until the release lands): a grant already
+            // recalled is not counted twice.
+            if g.recalled.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            match &hooks {
+                // The FUSE layer parks its cached lease: every later write
+                // re-acquires; the lease's drop (at the settle, once the
+                // in-flight uses drained) queues the gated release.
+                Some(h) => (h.revoke)(g.ino),
+                // No FUSE layer (the in-process contracts): the grant
+                // handle releases directly — the caller's `LockLease`
+                // reads it released.
+                None => crate::dlm::RemoteGrant::release(&*g),
+            }
             absorbed += 1;
         }
         if absorbed > 0 {
@@ -3597,8 +3704,65 @@ impl WriteCustodyClient {
                  handover — released once quiescent (dlm_custody_recalls_absorbed)",
                 self.endpoint
             );
+            if hooks.is_some() {
+                // The settle is driven promptly (the renewal cadence alone
+                // would bound the handover by one shipped beat): a
+                // detached loop drops the parked leases as their uses
+                // drain and drains the releases, until nothing is parked
+                // or the recall's bound passed.
+                if let Some(client) = self.weak_self.get().and_then(|w| w.upgrade()) {
+                    crate::meta_exec::spawn_lease("slot_custody_recall_settle", async move {
+                        client.settle_recalled_until_clear().await;
+                    });
+                }
+            }
         }
         absorbed > 0
+    }
+
+    /// The recall's settle loop (round 3, Issue 20): poll the FUSE layer's
+    /// parked leases at the derived park until none is pending or the
+    /// recall bound passed (a straggler past it is the holder's `T_owner`
+    /// sweep's — loud).
+    async fn settle_recalled_until_clear(&self) {
+        let Some(hooks) = recall_hooks() else {
+            return;
+        };
+        let park = self.handover_retry_park();
+        let bound = self.handover_recall_bound();
+        let started = Instant::now();
+        loop {
+            if (hooks.settle)() > 0 {
+                self.drain_releases().await;
+            }
+            if (hooks.pending)() == 0 {
+                return;
+            }
+            if started.elapsed() >= bound {
+                log::warn!(
+                    "PR 9: {} recalled custody lease(s) still hold in-flight uses after the \
+                     recall bound {bound:?} — their releases travel at the next settle; the \
+                     holder's T_owner sweep bounds the handover",
+                    (hooks.pending)()
+                );
+                return;
+            }
+            squeezefs_ipc::sqz_time::sleep(park).await;
+        }
+    }
+
+    /// The park between two attempts of a DEFERRED acquire and between two
+    /// settle polls — DERIVED from the holder's lease clocks as granted
+    /// (round 3, Issue 25): one twentieth of the renewal beat (50 ms at
+    /// the contracts' 1 s beat; 500 ms at the shipped 10 s), tie-tested.
+    pub fn handover_retry_park(&self) -> Duration {
+        handover_retry_park_for(Duration::from_millis(self.lease.load().renew_interval_ms()))
+    }
+
+    /// The recall's bound as the WRITER derives it from its lease at the
+    /// holder — two renewal beats ([`handover_recall_bound`]'s twin).
+    pub fn handover_recall_bound(&self) -> Duration {
+        handover_recall_bound_for(Duration::from_millis(self.lease.load().renew_interval_ms()))
     }
 
     /// Declare the device offsets this client may still be writing. The set
@@ -3692,6 +3856,7 @@ impl WriteCustodyClient {
             pending: Arc::clone(&self.pending_releases),
             ino: grant.ino,
             token: 0, // plain acquires carry no client-cache range span
+            fence_token: grant.token,
             recalled: AtomicBool::new(false),
         });
         let _ = self.grants.insert_sync(grant.grant_id, Arc::clone(&handle));
@@ -3973,6 +4138,7 @@ impl WriteCustodyClient {
             pending: Arc::clone(&self.pending_releases),
             ino,
             token: grant.token,
+            fence_token: grant.token,
             recalled: AtomicBool::new(false),
         });
         let _ = self.grants.insert_sync(grant.grant_id, Arc::clone(&handle));
@@ -4330,6 +4496,11 @@ impl WriteCustodyClient {
     /// One drain pass; `true` ⇔ the reply queued further releases (a
     /// recall absorbed) and the caller should drain again.
     async fn drain_releases_once(&self) -> bool {
+        // PR 9 (round 3, Issue 20): parked FUSE-layer leases whose in-flight
+        // custody uses drained drop HERE — their releases join this pass.
+        if let Some(h) = recall_hooks() {
+            (h.settle)();
+        }
         let batch: Vec<PendingRelease> = std::mem::take(&mut *self.pending_releases.lock());
         if batch.is_empty() {
             return false;
@@ -4347,7 +4518,7 @@ impl WriteCustodyClient {
                 for r in &batch {
                     if r.gated {
                         let t = inos.entry(r.ino).or_insert(0);
-                        *t = (*t).max(r.token);
+                        *t = (*t).max(r.hint);
                     }
                 }
                 let mut deferred: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -4980,6 +5151,10 @@ struct HolderSlot {
 struct HolderDial {
     custody: Option<Arc<HolderCustody>>,
     failed_at: Option<Instant>,
+    /// Set by the holder's fence (round 3, Issue 27): this slot was
+    /// removed from the arm's map — a dialer still holding it must
+    /// re-look the endpoint up rather than JOIN on an orphaned slot.
+    retired: bool,
 }
 
 /// What the armed plane installs (`arm_slot_custody`): the set to resolve
@@ -5125,25 +5300,29 @@ fn holder_fenced(endpoint: &str) {
     let Some(slot) = slot else {
         return;
     };
-    // The slot's dial mutex may be held by a caller mid-dial toward the
-    // dead holder; the planes are reached through the custody the fence's
-    // own client belongs to, which is set (the client exists).
-    if let Ok(dial) = slot.dial.try_lock() {
-        if let Some(h) = dial.custody.as_ref() {
+    // The slot's dial state is retired UNDER ITS OWN MUTEX (round 3, Issue
+    // 27): a concurrent `holder()` that still holds this slot sees
+    // `retired` and re-looks the endpoint up instead of re-dialing on an
+    // orphan; the planes stop dead through the custody the fenced client
+    // belongs to. A dial in flight holds the mutex (toward the dead
+    // holder — it fails on its own bound): the retire runs behind it.
+    let retire = |dial: &mut HolderDial| {
+        dial.retired = true;
+        if let Some(h) = dial.custody.take() {
             for plane in h.planes.lock().values() {
                 plane.stop_dead();
             }
         }
+    };
+    if let Ok(mut dial) = slot.dial.try_lock() {
+        retire(&mut dial);
         return;
     }
-    // A dial in flight holds the mutex: the planes are stopped by the
-    // dialer's own failure path (its client is the fenced one) — nothing
-    // this mount serves from them after the fence, because the arm no
-    // longer names the slot and `stop_dead` runs at the next touch.
     let slot = Arc::clone(&slot);
     crate::meta_exec::spawn_meta("slot_custody_holder_fenced", async move {
-        let dial = slot.dial.lock().await;
-        if let Some(h) = dial.custody.as_ref() {
+        let mut dial = slot.dial.lock().await;
+        dial.retired = true;
+        if let Some(h) = dial.custody.take() {
             for plane in h.planes.lock().values() {
                 plane.stop_dead();
             }
@@ -5191,6 +5370,19 @@ impl SlotCustodyArm {
         );
         let custody = {
             let mut dial = slot.dial.lock().await;
+            if dial.retired {
+                // The fence retired this slot under us (Issue 27): the
+                // arm's map no longer names it — start over on a fresh
+                // slot rather than JOIN on an orphan.
+                drop(dial);
+                return Err(acquire_refusal(
+                    libc::EAGAIN,
+                    format!(
+                        "PR 9: the slot holder at {endpoint} was fenced under this acquire — \
+                         retry: the next acquire re-dials"
+                    ),
+                ));
+            }
             match dial.custody.as_ref() {
                 Some(h) if !h.client.fenced() => Arc::clone(h),
                 _ => {
@@ -5351,11 +5543,37 @@ fn unbound_holder(holder: u32, ino: u64, what: &str) -> SqueezefsError {
     )
 }
 
-/// The park between two attempts of an acquire the holder DEFERRED (a
-/// slot mid-handover): short against the handover's own bound (one
-/// renewal beat of the recalled writer's release), so the retry lands
-/// just after the slot moved.
-const DEFERRED_RETRY_PARK: Duration = Duration::from_millis(50);
+/// **The handover's derived parks and bounds** (round 3, Issues 24/25 —
+/// every one a function of the S9 lease clocks, tie-tested in
+/// `derivation_sweep_tests`):
+///
+/// * [`handover_retry_park_for`] — the park between two attempts of a
+///   DEFERRED acquire and between two settle polls: `renew / 20` (the
+///   recall lands on the standing poll at once and its release follows
+///   the settle; the retry should land a small fraction of a beat later —
+///   50 ms at the contracts' 1 s beat, 500 ms at the shipped 10 s).
+/// * [`handover_recall_bound_for`] — how long a slot stays MID-HANDOVER
+///   after its recall began: `2 × renew` (the recall's carrier is at
+///   most one beat away, the release one settle behind it; a requester
+///   that stopped retrying must not leave the slot's files un-grantable
+///   longer).
+/// * [`leave_custody_bound_for`] — how long the HOLDER's clean leave
+///   waits for its recalled grants' releases: `T_owner + renew` (a writer
+///   that never polls is dead by the S9 law at `T_owner` — its `T_self`
+///   is strictly earlier — and the sweep retires its grants then).
+pub fn handover_retry_park_for(renew_interval: Duration) -> Duration {
+    (renew_interval / 20).max(Duration::from_millis(1))
+}
+
+/// See [`handover_retry_park_for`].
+pub fn handover_recall_bound_for(renew_interval: Duration) -> Duration {
+    renew_interval * 2
+}
+
+/// See [`handover_retry_park_for`].
+pub fn leave_custody_bound_for(t_owner: Duration, renew_interval: Duration) -> Duration {
+    t_owner + renew_interval
+}
 
 /// **The custody acquire at the slot holder** (`SlotLockManager`'s PR 9
 /// arm): dial the holder (JOIN on first touch), one token-wire round trip
@@ -5462,11 +5680,16 @@ pub async fn acquire_at_slot_holder(
                 }
             }
             CarriedAcquire::Deferred { reason } => {
+                let park = client.handover_retry_park();
                 let elapsed = started.elapsed();
-                if elapsed + DEFERRED_RETRY_PARK > ttl {
-                    return Err(acquire_refusal(libc::EAGAIN, reason));
+                if elapsed + park > ttl {
+                    // The slot is still mid-handover past this attempt's
+                    // budget: the CONFLICT class — the POSIX-5 ladder
+                    // retries it for the op's budget (a write blocks,
+                    // never fails, while the slot moves).
+                    return Err(SqueezefsError::LockFailed { reason });
                 }
-                squeezefs_ipc::sqz_time::sleep(DEFERRED_RETRY_PARK).await;
+                squeezefs_ipc::sqz_time::sleep(park).await;
                 // The slot may have moved meanwhile: re-resolve (to THIS
                 // mount = local; to another holder = redirect; else the
                 // same holder, asked again).
@@ -5550,7 +5773,14 @@ static HANDOVER_RECALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// requester's next cadence tick completes the move. Derived, never a
 /// constant.
 fn handover_recall_bound(owner: &WriteCustodyOwner) -> Duration {
-    owner.clocks.renew_interval * 2
+    handover_recall_bound_for(owner.clocks.renew_interval)
+}
+
+/// The mid-handover mark's bound in force (`slot_handover_recall_bound_ms`
+/// — published beside `slot_handover_custody_deferrals`; 0 with no custody
+/// authority armed).
+pub fn handover_recall_bound_ms() -> u64 {
+    custody_owner().map_or(0, |o| handover_recall_bound(&o).as_millis() as u64)
 }
 
 /// Is `ino`'s slot mid-handover — its custody grants recalled and the
@@ -5663,6 +5893,20 @@ pub fn defer_handover_for_custody(
     volume_uuid: u128,
     slot: crate::meta_backend::kv::record::ForestSlot,
 ) -> Option<usize> {
+    let recalled = recall_slot_custody(volume_uuid, slot)?;
+    HANDOVER_CUSTODY_DEFERRALS.fetch_add(1, Ordering::Relaxed);
+    Some(recalled)
+}
+
+/// The recall itself (the handover's and the leave's ONE mechanism):
+/// `Some(newly recalled)` while live grants exist on the slot — the slot
+/// marked mid-handover (the mark re-armed), every live grant recalled
+/// (idempotent per grant) — `None` when nothing is live (the mark
+/// cleared).
+fn recall_slot_custody(
+    volume_uuid: u128,
+    slot: crate::meta_backend::kv::record::ForestSlot,
+) -> Option<usize> {
     let inos = slot_custody_inos(volume_uuid, slot);
     let key = (volume_uuid, slot);
     if inos.is_empty() {
@@ -5679,12 +5923,11 @@ pub fn defer_handover_for_custody(
         HANDOVER_RECALL_COUNT.store(set.len(), Ordering::Release);
     }
     let recalled = owner.recall_grants_on(&inos);
-    HANDOVER_CUSTODY_DEFERRALS.fetch_add(1, Ordering::Relaxed);
     if recalled > 0 {
         log::info!(
-            "PR 9: handover of forest slot {slot} deferred — {} file(s) under live custody; \
+            "PR 9: forest slot {slot} is mid-handover — {} file(s) under live custody; \
              {recalled} grant(s) recalled through the S9 pull channel (the writers release \
-             once quiescent; the cadence retries)",
+             once quiescent)",
             inos.len()
         );
     }
@@ -5695,6 +5938,89 @@ pub fn defer_handover_for_custody(
 /// volume of this process.
 pub fn handover_recalls_pending() -> usize {
     HANDOVER_RECALL_COUNT.load(Ordering::Relaxed)
+}
+
+/// **The HOLDER's clean leave is a handover to nobody** (round 3, Issue
+/// 22 — design §5.1.4 extended to the leave): before a covered region's
+/// slots are released to `Unleased`, every live custody grant this
+/// holder issued on their files is RECALLED (the same recall as the
+/// handover's — one mechanism) and the leave WAITS for the releases, at
+/// the derived park, up to [`leave_custody_bound_for`] (`T_owner + renew`
+/// — a writer that never polls is dead by the S9 law at `T_owner`; the
+/// sweep at the bound retires its grants). Returns the slots whose grants
+/// are STILL live past the bound: the caller keeps those slots leased
+/// (the uncovered-region posture — loud; the next open recovers them as
+/// own residue) rather than let another lessee grant the same file while
+/// a writer still holds this holder's custody. Empty unarmed (no owner /
+/// no arm), the shipped leave verbatim.
+pub async fn recall_custody_at_leave(
+    volume_uuid: u128,
+    slots: &[crate::meta_backend::kv::record::ForestSlot],
+) -> Vec<crate::meta_backend::kv::record::ForestSlot> {
+    let Some(owner) = custody_owner() else {
+        return Vec::new();
+    };
+    let live: Vec<_> = slots
+        .iter()
+        .copied()
+        .filter(|s| recall_slot_custody(volume_uuid, *s).is_some())
+        .collect();
+    if live.is_empty() {
+        return Vec::new();
+    }
+    let park = handover_retry_park_for(owner.clocks.renew_interval);
+    let bound = leave_custody_bound_for(owner.clocks.t_owner, owner.clocks.renew_interval);
+    log::warn!(
+        "PR 9: the clean leave found live custody grants on {} slot(s) — recalled; waiting up \
+         to {bound:?} for the writers' releases before the slots are released",
+        live.len()
+    );
+    let started = Instant::now();
+    loop {
+        let still: Vec<_> = live
+            .iter()
+            .copied()
+            .filter(|s| slot_custody_live(volume_uuid, *s))
+            .collect();
+        if still.is_empty() {
+            for s in &live {
+                recall_slot_custody(volume_uuid, *s);
+            }
+            return Vec::new();
+        }
+        if started.elapsed() >= bound {
+            // The S9 sweep: a writer that never released past T_owner is
+            // dead by the law (its T_self was strictly earlier).
+            let swept = owner.expire_due();
+            if !swept.is_empty() {
+                log::warn!(
+                    "PR 9: the leave's bound {bound:?} passed with {} recalled writer(s) \
+                     unreleased — swept at T_owner: {:?}",
+                    swept.len(),
+                    swept.iter().map(|d| d.client.as_str()).collect::<Vec<_>>()
+                );
+            }
+            let still: Vec<_> = live
+                .iter()
+                .copied()
+                .filter(|s| slot_custody_live(volume_uuid, *s))
+                .collect();
+            if !still.is_empty() {
+                log::error!(
+                    "PR 9: the clean leave keeps {} slot(s) LEASED — a live custody grant on \
+                     them survived the recall and the T_owner sweep ({still:?}); the next open \
+                     recovers them as own residue",
+                    still.len()
+                );
+            }
+            return still;
+        }
+        // Keep the recall current for grants minted meanwhile.
+        for s in &live {
+            recall_slot_custody(volume_uuid, *s);
+        }
+        squeezefs_ipc::sqz_time::sleep(park).await;
+    }
 }
 
 /// **The mount path's arm** (`main.rs`, after PR 8's allocation arm): on

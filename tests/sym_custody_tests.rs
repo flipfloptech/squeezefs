@@ -2762,6 +2762,157 @@ async fn an_unleased_slot_on_a_non_manager_answers_not_holder_for_tokens_and_cus
     rig.shutdown().await;
 }
 
+/// The PR 7b rebase's seam (c) — **a striped directory's stripes are never
+/// custody objects; a FILE inside one resolves ITS slot holder**: the
+/// custody screen's type rule (`custody_object_mode_admissible` — a
+/// custody object is a regular file) REJECTS a frame naming the striped
+/// directory `D` or any stripe `D_i` (the reserved-name markers' targets
+/// — `\0sqz.stripe:NN → D_i`, `\0sqz.striped → D_0`), counted on
+/// `dlm_token_custody_rejected` with the arbiter untouched, while a file
+/// created inside `D` (its dentry hash-routed to a stripe, its ino in a
+/// declared region's slot) is granted at that slot's holder as any file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_striped_directorys_stripes_are_never_custody_objects_and_its_files_resolve_their_holder()
+{
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    // A volume with a striped directory `work` (flipped explicitly to K =
+    // 4 by the manager) holding one file whose ino lives in SLOT_B; the
+    // slot released so the next open's declared region 1 holds it.
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let (work, inside, stripes) = {
+        let rig = mount_data(&uris, data.path(), &Knobs::armed()).await;
+        let work = rig
+            .routed
+            .create(ROOT_INO, "work", libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .expect("mkdir work")
+            .ino;
+        // The file INSIDE the directory, minted in SLOT_B — BEFORE the
+        // flip (a preset create into a striped directory is refused by
+        // 7b: the stripe is the key parent); the flip then re-homes its
+        // name to a stripe lazily.
+        let vol = &rig.routed.volumes[0];
+        let width = rig.routed.routing_width();
+        let routing = u64::from(SLOT_B) - 1;
+        let local = vol
+            .allocate_guest_ino(routing as u16)
+            .expect("a guest cursor");
+        let global = make_global_ino_width(local, routing, width);
+        let inside = rig
+            .routed
+            .create_with_rdev_preset(
+                work,
+                "inside",
+                libc::S_IFREG | 0o644,
+                1000,
+                1000,
+                0,
+                0,
+                Some(IntentCreatePreset {
+                    global_ino: global,
+                    ts_ns: KvMetaBackend::now_ns_pub(),
+                }),
+            )
+            .await
+            .expect("a file in the striped directory")
+            .ino;
+        assert_eq!(inside, global);
+        rig.publish_block(inside, 0).await;
+        rig.routed
+            .stripe_dir(work, 4)
+            .await
+            .expect("the explicit flip");
+        let map = rig
+            .routed
+            .stripe_map(work)
+            .await
+            .expect("read")
+            .expect("striped");
+        assert_eq!(map.k(), 4);
+        let stripes = map.stripes.clone();
+        // The file's name is served through the striped directory.
+        assert_eq!(
+            rig.routed.lookup(work, "inside").await.expect("lookup").ino,
+            inside
+        );
+        let vol = Arc::clone(&rig.routed.volumes[0]);
+        vol.release_slot_handover(0, SLOT_B)
+            .await
+            .expect("release to unleased");
+        drop(vol);
+        rig.shutdown().await;
+        (work, inside, stripes)
+    };
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(TWO_HOLDERS)).await;
+    let venue = Venue::stand_up(&rig, &[1]).await;
+    assert!(
+        matches!(
+            data_grant::slot_holder_home(inside),
+            Some(data_grant::CustodyHome::Holder { holder: 1, .. })
+        ),
+        "the file inside the striped directory resolves ITS slot's holder"
+    );
+    // The file: granted at its holder, the token carried — a file is a
+    // file whatever directory names it.
+    let lease = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(inside), None, Duration::from_secs(2))
+        .await
+        .expect("custody of the file inside the striped directory from its holder");
+    assert!(lease.is_held().await);
+    assert_eq!(venue.owner.held(), 1);
+    let client = venue.arm.holder_client(&venue.endpoint).await.unwrap();
+    let holder_plane = rig.routed.volumes[0].token_holder().unwrap().clone();
+    let rejected0 = holder_plane.stats().custody_rejected;
+    let granted0 = venue.owner.stats().granted;
+
+    // The directory and every stripe (the markers' targets): REJECTED at
+    // the screen's type rule, the arbiter never asked.
+    let mut objects = vec![work];
+    objects.extend(stripes.iter().copied());
+    for object in &objects {
+        let (_v, local) = rig.routed.route_ino(*object);
+        let err = client
+            .acquire_carrying_token(
+                0,
+                local,
+                None,
+                squeezefs::dlm::LockMode::Exclusive,
+                Duration::from_secs(1),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("directory object {object:#x} was GRANTED custody"));
+        assert!(
+            matches!(
+                &err,
+                squeezefs::error::SqueezefsError::Refused { errno, msg }
+                    if *errno == libc::EIO && msg.contains("rejected") && msg.contains("regular file")
+            ),
+            "a directory is never a custody object — a deterministic REJECTION: {err:?}"
+        );
+    }
+    assert_eq!(
+        holder_plane.stats().custody_rejected,
+        rejected0 + objects.len() as u64,
+        "every directory word counted on dlm_token_custody_rejected"
+    );
+    assert_eq!(
+        venue.owner.stats().granted,
+        granted0,
+        "the arbiter took nothing"
+    );
+    assert_eq!(venue.owner.held(), 1, "only the file's grant is held");
+    assert!(lease.is_held().await);
+    drop(lease);
+    venue.tear_down().await;
+    rig.shutdown().await;
+}
+
 /// Review round 3, Issues 24/25 — the handover's parks and bounds are
 /// DERIVED from the S9 lease clocks and published: the writer's retry park
 /// is one twentieth of its renewal beat, the mid-handover mark stands two

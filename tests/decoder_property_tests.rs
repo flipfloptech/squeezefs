@@ -2365,6 +2365,21 @@ proptest! {
             prop_assert_eq!(u64::from(routing), expect_routing);
         }
     }
+
+    /// The custody screen's TYPE rule (PR 9, the PR 7b rebase's seam (c)):
+    /// total over every mode word and admits exactly `S_IFREG` — a
+    /// directory (a striped directory `D`, any stripe `D_i`, a marker's
+    /// target) is never a custody object. The fuzz target's mirror.
+    #[test]
+    fn custody_object_type_rule_admits_regular_files_only(mode in any::<u32>()) {
+        use squeezefs::meta_ship::token_plane::custody_object_mode_admissible;
+        prop_assert_eq!(
+            custody_object_mode_admissible(mode),
+            (mode & libc::S_IFMT) == libc::S_IFREG
+        );
+        prop_assert!(custody_object_mode_admissible(libc::S_IFREG | (mode & 0o7777)));
+        prop_assert!(!custody_object_mode_admissible(libc::S_IFDIR | (mode & 0o7777)));
+    }
 }
 
 // ---------------------------------------------------------------------------

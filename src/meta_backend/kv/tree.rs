@@ -1119,6 +1119,26 @@ impl KvTree {
         value: Bytes,
         replay: Option<(u64, u64)>,
     ) -> Result<ApplyOutcome, KvError> {
+        self.apply_at_seq_class(leaf, key, kind, value, replay, false)
+            .await
+    }
+
+    /// [`Self::apply_at_seq`] with the lease-gate CLASS chosen: `structural`
+    /// reads [`CachedNode::apply_locked_structural`]'s verdict — the
+    /// MANAGER's maintenance of a slot nobody leases — which is what a
+    /// dead appender's ring replay is (design-symmetric-metadata §5.9,
+    /// PR 10): the recoverer applies the dead lessee's records into trees
+    /// it does not lease and never will; the RAM table already reads them
+    /// UNLEASED, so the content verdict would refuse every record.
+    async fn apply_at_seq_class(
+        &self,
+        leaf: &Arc<CachedNode>,
+        key: &[u8],
+        kind: RecordKind,
+        value: Bytes,
+        replay: Option<(u64, u64)>,
+        structural: bool,
+    ) -> Result<ApplyOutcome, KvError> {
         let mut guard = leaf.lock().write().await;
         if leaf.state().is_superseded() || key < leaf.min_key() || key > leaf.max_key() {
             drop(guard);
@@ -1150,11 +1170,12 @@ impl KvTree {
                 (seq, seq)
             }
         };
-        leaf.apply_locked(
-            &mut guard,
-            vec![OwnedRec::new(Bytes::copy_from_slice(key), seq, kind, value)],
-            floor,
-        )?;
+        let recs = vec![OwnedRec::new(Bytes::copy_from_slice(key), seq, kind, value)];
+        if structural {
+            leaf.apply_locked_structural(&mut guard, recs, floor)?;
+        } else {
+            leaf.apply_locked(&mut guard, recs, floor)?;
+        }
         let over_threshold = guard.overlay_bytes() >= self.cache.config().writeback_delta_bytes;
         drop(guard);
         if over_threshold {
@@ -1198,6 +1219,49 @@ impl KvTree {
         ))
     }
 
+    /// [`Self::apply_replayed`] under the STRUCTURAL lease class — the
+    /// dead-appender recovery's content replay (design-symmetric-metadata
+    /// §5.9, PR 10): the recovering MANAGER applies a dead lessee's ring
+    /// into slot trees the RAM table already reads UNLEASED (the manager's
+    /// to maintain, KD-SYM-2/3). `entry_start` is the record's position in
+    /// the DEAD ring — passed as the floor contribution only when the
+    /// caller's ring is that ring; a recovery passes `u64::MAX` (the
+    /// records' window is the dead ring's, kept by its `Recovering` page,
+    /// never a clamp on the recoverer's own tail).
+    pub async fn apply_replayed_recovery(
+        &self,
+        key: &[u8],
+        seq: u64,
+        kind: RecordKind,
+        value: Bytes,
+        entry_start: u64,
+    ) -> Result<(), KvError> {
+        self.check_key(key)?;
+        self.seq.fetch_max(seq, Ordering::AcqRel);
+        for _ in 0..RETRY_BUDGET {
+            let leaf = self.resolve_leaf(key).await?;
+            match self
+                .apply_at_seq_class(
+                    &leaf,
+                    key,
+                    kind,
+                    value.clone(),
+                    Some((seq, entry_start)),
+                    true,
+                )
+                .await?
+            {
+                ApplyOutcome::Applied => return Ok(()),
+                ApplyOutcome::Stale => continue,
+            }
+        }
+        Err(KvError::Corrupt(
+            "recovery replay retry budget exhausted (revalidation never passed — SMO protocol \
+             bug)"
+                .to_string(),
+        ))
+    }
+
     /// Mount-time replay of an SMO's **interior-pointer record** (K6b;
     /// §4.6 "replay applies the pointer record first"): route to the
     /// level-`level` node covering `key` and apply with the record's
@@ -1221,6 +1285,37 @@ impl KvTree {
         value: Bytes,
         entry_start: u64,
     ) -> Result<bool, KvError> {
+        self.apply_replayed_interior_class(key, level, seq, kind, value, entry_start, false)
+            .await
+    }
+
+    /// [`Self::apply_replayed_interior`] under the STRUCTURAL lease class
+    /// — the dead-appender recovery's phase 1 (see
+    /// [`Self::apply_replayed_recovery`]).
+    pub async fn apply_replayed_interior_recovery(
+        &self,
+        key: &[u8],
+        level: u8,
+        seq: u64,
+        kind: RecordKind,
+        value: Bytes,
+        entry_start: u64,
+    ) -> Result<bool, KvError> {
+        self.apply_replayed_interior_class(key, level, seq, kind, value, entry_start, true)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_replayed_interior_class(
+        &self,
+        key: &[u8],
+        level: u8,
+        seq: u64,
+        kind: RecordKind,
+        value: Bytes,
+        entry_start: u64,
+        structural: bool,
+    ) -> Result<bool, KvError> {
         self.check_interior_key(key)?;
         self.seq.fetch_max(seq, Ordering::AcqRel);
         if self.root_level().await? < level {
@@ -1229,7 +1324,14 @@ impl KvTree {
         for _ in 0..RETRY_BUDGET {
             let target = self.descend(key, level).await?;
             match self
-                .apply_at_seq(&target, key, kind, value.clone(), Some((seq, entry_start)))
+                .apply_at_seq_class(
+                    &target,
+                    key,
+                    kind,
+                    value.clone(),
+                    Some((seq, entry_start)),
+                    structural,
+                )
                 .await?
             {
                 ApplyOutcome::Applied => return Ok(true),

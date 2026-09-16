@@ -741,6 +741,30 @@ pub fn live_wero_key() -> Option<u64> {
         .next()
 }
 
+/// **The death ledger's PREEMPT on the data plane** (design-symmetric-
+/// metadata §5.9 step 1, PR 10): preempt `victim` — the dead member's
+/// registrant key the ledger carried — under every WERO reservation this
+/// process HOLDS (the `HoldRole::Holder` hold: an allocation holder's
+/// fence over its data namespaces; a registrant holds no reservation to
+/// preempt under and an adopted hold mutates nothing). Returns the
+/// namespaces where the preempt landed — S7's drain proof. Blocking
+/// (one-shot ioctls); 0 with no hold, a detection-grade posture, or a
+/// zero key.
+pub fn preempt_dead_registrant(victim: u64) -> u64 {
+    if victim == 0 {
+        return 0;
+    }
+    let holds: Vec<WeroHold> = registry()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|((_, role), _)| *role == HoldRole::Holder)
+        .filter_map(|(_, w)| w.upgrade())
+        .map(|inner| WeroHold { inner })
+        .collect();
+    holds.iter().map(|h| h.preempt(victim)).sum()
+}
+
 /// The process's guarantee class for the data plane: `pr` while a WERO
 /// hold stands on a data-namespace set, else `detection` (the local
 /// custody-epoch fence only). The `data_plane_fence_mode` gauge's word

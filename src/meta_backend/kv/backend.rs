@@ -179,6 +179,13 @@ use std::sync::{Arc, Weak};
 /// step, the intent's slot homing, the set-wide directory-rename lock).
 mod crossvol_arms;
 pub use crossvol_arms::{screen_dir_rename_words, DirRenameLease, DirRenameOutcome};
+/// Symmetric PR 10: dead-appender recovery — the death ledger's driver
+/// (design §5.9), the C14/C15 census, `appender clear`.
+pub mod recovery;
+pub use recovery::{
+    appender_recovery_bound_ms, recovery_stats, AppenderClearOutcome, CustodyCensus,
+    RecoveredRegion, RecoveryReport, RecoverySetReport, RecoveryStats,
+};
 
 /// `SQUEEZEFS_META_NODE_CACHE_MB` (§5.1; absolute MiB, explicit wins
 /// verbatim — default derived, see [`resolve_node_cache_budget`]).
@@ -14440,8 +14447,12 @@ impl KvMetaBackend {
             }
         }
         // B2: refresh the claim heartbeat (one staleness law with the
-        // client registrations).
-        if self.claimed.load(Ordering::Acquire) {
+        // client registrations). A manager that RELEASED its role under
+        // the vol-0 rule (design-symmetric-metadata §5.5.2 — volume 0's
+        // ledger unreachable past `T_owner`) stops refreshing: the claim
+        // ages past the TTL and the D0 ladder re-elects a successor that
+        // can read the ledger (PR 10's successor ladder = the D0 ladder).
+        if self.claimed.load(Ordering::Acquire) && !self.manager_role_released() {
             let claim = WriterClaim {
                 id: self.writer_id.clone(),
                 ts: unix_now_secs(),
@@ -15942,32 +15953,34 @@ impl KvMetaBackend {
         // with the role (§5.9); every OTHER foreign `Live` page is a
         // JOINED appender (`JoinAppender`, §5.3.5) — the directory's
         // normal state on a multi-appender volume, listed on
-        // `appender_live_pages_at_mount`, recovered by PR 10's driver when
-        // its death is proven, never a reason the manager cannot remount.
+        // `appender_live_pages_at_mount`, recovered by the death ledger's
+        // driver when its death is proven (PR 10, `backend::recovery`),
+        // never a reason the manager cannot remount. A `Recovering` page
+        // (a recovery this volume's previous manager died inside, or an
+        // operator's `appender clear` attestation) is the mount-path
+        // gate's: recovered before the set serves when the ledger names
+        // it, refused there when nothing does.
         let join_refusal = if is_writer {
             entries
                 .iter()
                 .find_map(|e| {
                     e.page.as_ref().filter(|p| {
-                        (p.state == AppenderState::Live
+                        p.state == AppenderState::Live
                             && !mine(p)
-                            && partition.contains_key(&p.appender_id))
-                            || p.state == AppenderState::Recovering
+                            && partition.contains_key(&p.appender_id)
                     })
                 })
                 .map(|p| {
                     format!(
-                        "{}: appender page {} is {} under {} identity (node {:#018x}, mount slot \
-                         {:#x}, term {}) — recovering another node's ring is the dead-appender \
-                         recovery driver (design-symmetric-metadata PR 10, not yet available; \
-                         it owns the operator remedy). Refusing to join over it",
+                        "{}: appender page {} is LIVE under a foreign identity (node {:#018x}, \
+                         mount slot {:#x}, term {}) that the declared partition \
+                         ({}) claims — refusing to join over a joined appender's page",
                         path.display(),
                         p.appender_id,
-                        p.state.as_str(),
-                        if mine(p) { "our own" } else { "a foreign" },
                         p.identity.node_token,
                         p.identity.mount_slot,
                         p.term,
+                        super::appender::TEST_APPENDER_SLOTS_ENV,
                     )
                 })
         } else {

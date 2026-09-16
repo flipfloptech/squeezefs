@@ -1473,6 +1473,10 @@ pub struct Eviction {
     pub dead: crate::data_custody::DeadEpoch,
     /// Why (TTL fired, no acknowledgement, operator).
     pub reason: String,
+    /// The member's NVMe registrant key as its join presented it (`0` =
+    /// none) — what the death ledger carries so the recovering manager
+    /// can PREEMPT it (design-symmetric-metadata §5.9; PR 10).
+    pub pr_key: u64,
 }
 
 struct MemberState {
@@ -1489,11 +1493,16 @@ struct MemberState {
     deadline_ms: u64,
     acked_free_epoch: u64,
     mount: Option<String>,
+    /// The registrant key the join presented (the eviction's carriage).
+    pr_key: u64,
 }
 
 struct Grace {
     until_ms: u64,
     expected: std::collections::BTreeSet<String>,
+    /// The registrant key each expected member's claim-set entry carried
+    /// (`0` = none / unknown) — a non-reclaimer's death record carries it.
+    keys: std::collections::BTreeMap<String, u64>,
 }
 
 /// The membership authority: a RAM lease table plus one atomic per
@@ -1772,6 +1781,7 @@ impl MembershipOwner {
             deadline_ms: now + self.clocks.t_owner.as_millis() as u64,
             acked_free_epoch: 0,
             mount: req.mount.clone(),
+            pr_key: req.pr_key,
         };
         // A re-join REPLACES the prior state (same identity, new epoch):
         // the member is telling us it lost its lease view, and keeping the
@@ -1998,6 +2008,16 @@ impl MembershipOwner {
         self.members.read_sync(id, |_, st| st.deadline_ms)
     }
 
+    /// Whether this owner LISTS `id` with a lease still inside `T_owner` —
+    /// the wire-word screen of `RecordDeath` (PR 10): a peer's word never
+    /// declares a member this owner holds live dead.
+    pub fn member_is_live(&self, id: &str) -> bool {
+        let now = self.clock.now_ms();
+        self.members
+            .read_sync(id, |_, st| now < st.deadline_ms)
+            .unwrap_or(false)
+    }
+
     /// **§6.8 item 3's reallocation bound**: the minimum freed-offset epoch
     /// acknowledged across every LIVE member. A writer may reallocate an
     /// offset freed in epoch `E` once this is `>= E`; with no members the
@@ -2088,12 +2108,23 @@ impl MembershipOwner {
         // vocabulary.)
         self.refresh_free_grace_bound();
         note_departure(id);
+        // The death ledger's trigger (design-symmetric-metadata §5.5.2 /
+        // §5.9, PR 10): the home shard's eviction IS the death; the sink
+        // ships `RecordDeath` to volume 0's manager. A member the owner
+        // evicts here passed `T_owner` under a LIVE owner — the successor's
+        // grace window never lists it, so this is never a reclaimer.
+        note_death(DeadMember {
+            id: id.to_string(),
+            epoch: st.epoch,
+            pr_key: st.pr_key,
+        });
         Some(Eviction {
             id: id.to_string(),
             role: st.role,
             epoch: st.epoch,
             dead,
             reason: reason.to_string(),
+            pr_key: st.pr_key,
         })
     }
 
@@ -2134,8 +2165,20 @@ impl MembershipOwner {
     /// deadline. `expected` comes from the predecessor's durable evidence —
     /// the claim set's writers, plus any census snapshot handed over.
     pub fn open_grace(&self, expected: Vec<String>) {
+        self.open_grace_with_keys(expected.into_iter().map(|id| (id, 0)).collect());
+    }
+
+    /// [`Self::open_grace`] with each expected member's registrant key
+    /// (the claim set carries it — `ClaimSet::registrant_keys`'s per-member
+    /// form): a member that never re-asserts is DEAD at the deadline, and
+    /// its death record carries the key the recovering manager preempts
+    /// (design-symmetric-metadata §5.5.3 item 2 — "the shard ships
+    /// `RecordDeath` only AFTER grace, never at `T_owner`"; PR 10).
+    pub fn open_grace_with_keys(&self, expected: Vec<(String, u64)>) {
         let until = self.clock.now_ms() + self.clocks.grace.as_millis() as u64;
-        let expected: std::collections::BTreeSet<String> = expected.into_iter().collect();
+        let keys: std::collections::BTreeMap<String, u64> = expected.iter().cloned().collect();
+        let expected: std::collections::BTreeSet<String> =
+            expected.into_iter().map(|(id, _)| id).collect();
         log::warn!(
             "membership owner '{}' opened a failover grace window for {:?}: reclaim only, \
              conflicting fresh acquires refused; awaiting re-assertion from {} prior \
@@ -2148,6 +2191,7 @@ impl MembershipOwner {
         *self.grace.lock() = Some(Grace {
             until_ms: until,
             expected,
+            keys,
         });
     }
 
@@ -2166,7 +2210,36 @@ impl MembershipOwner {
                 self.id,
                 g.expected.len()
             );
+            // The NON-RECLAIMERS are the dead (design-symmetric-metadata
+            // §5.5.3 item 2): a member that reclaimed in the window left
+            // `expected` at its reclaim and is never named here; every
+            // member still listed at the deadline is evicted from the
+            // predecessor's census it never re-joined, and its death is
+            // shipped NOW — after grace, never at `T_owner`. The epoch is
+            // the PREDECESSOR's grant, unknown to this owner (0); the
+            // ledger's writer mints the dead epoch the quarantine keys on.
+            let dead: Vec<DeadMember> = g
+                .expected
+                .iter()
+                .map(|id| DeadMember {
+                    id: id.clone(),
+                    epoch: 0,
+                    pr_key: g.keys.get(id).copied().unwrap_or(0),
+                })
+                .collect();
             *guard = None;
+            drop(guard);
+            for d in dead {
+                METRICS.membership_evictions.fetch_add(1, Ordering::Relaxed);
+                log::warn!(
+                    "membership owner '{}': prior member '{}' never re-asserted inside the grace \
+                     window — DEAD; its death is recorded for the recovery driver",
+                    self.id,
+                    d.id
+                );
+                note_departure(&d.id);
+                note_death(d);
+            }
             return false;
         }
         true
@@ -2680,6 +2753,51 @@ fn note_departure(id: &str) {
     }
 }
 
+/// A member the owner declared DEAD (design-symmetric-metadata §5.5.2 /
+/// §5.5.3 item 2): evicted past `T_owner` under a live owner, or a
+/// predecessor's member that never re-asserted inside the successor's
+/// grace window. What the death ledger's writer receives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadMember {
+    /// The member's census id (the KD-MW-2 `<node>:<slot>` form when it is
+    /// a mount — [`crate::cowriter::parse_node_member_id`] reads it).
+    pub id: String,
+    /// The lease epoch that died (`0` = the predecessor's grant, unknown
+    /// to the successor owner).
+    pub epoch: u64,
+    /// The member's NVMe registrant key (`0` = none / unknown).
+    pub pr_key: u64,
+}
+
+/// A sink told every member the owner declares dead — PR 10's death
+/// ledger driver installs the one that ships `RecordDeath` to volume 0's
+/// manager. Additive, like the departure sinks.
+pub type DeathSink = Arc<dyn Fn(DeadMember) + Send + Sync>;
+
+static DEATH_SINKS: once_cell::sync::Lazy<arc_swap::ArcSwap<Vec<DeathSink>>> =
+    once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(Vec::new()));
+
+/// Install a death sink (one `rcu`, like [`install_departure_sink`]).
+pub fn install_death_sink(sink: DeathSink) {
+    DEATH_SINKS.rcu(|cur| {
+        let mut next: Vec<DeathSink> = (**cur).clone();
+        next.push(Arc::clone(&sink));
+        next
+    });
+}
+
+/// Withdraw every death sink (a leave / the contracts' reset — a sink
+/// holds a mount's volume 0 by `Weak`, so a stale one is inert anyway).
+pub fn clear_death_sinks() {
+    DEATH_SINKS.store(Arc::new(Vec::new()));
+}
+
+fn note_death(dead: DeadMember) {
+    for sink in DEATH_SINKS.load().iter() {
+        sink(dead.clone());
+    }
+}
+
 /// Install this process's role (the stats inode reads it; the
 /// `dlm_slot::SLOT_OWNERS` precedent — lock-free, replaceable wholesale).
 pub fn install_owner(owner: Arc<MembershipOwner>) {
@@ -3150,7 +3268,7 @@ async fn arm_owner(
         endpoint: Some(endpoint.clone()),
         pr_key: crate::data_custody::live_wero_key().unwrap_or(0),
     };
-    let mut expected: Vec<String> = Vec::new();
+    let mut expected: Vec<(String, u64)> = Vec::new();
     // Sweep row 17(a): the record goes to the rendezvous volumes only, and
     // the claim-set upsert goes to the volumes this mount APPENDS to
     // (sweep row 8) — a peer-owned volume's write gate would refuse it
@@ -3172,20 +3290,21 @@ async fn arm_owner(
                 // grace-expected peer (rung-8 finding #3's phantom grace
                 // windows over the authority's own dead incarnations).
                 if m.identity.id != claim_id {
-                    expected.push(m.identity.id.clone());
+                    expected.push((m.identity.id.clone(), m.identity.pr_key));
                 }
             }
         }
         upsert_writer_member(be, &identity, term).await?;
     }
     expected.sort();
-    expected.dedup();
+    expected.dedup_by(|a, b| a.0 == b.0);
     if prior_term != 0 && !expected.is_empty() {
         // §6.7 Recovery: a successor opens a grace window over the
         // predecessor's membership — reclaim admitted, conflicting fresh
         // acquires refused — so failover does not become a cluster-wide
-        // forced-flush storm.
-        owner.open_grace(expected);
+        // forced-flush storm. Each entry carries its registrant key: a
+        // non-reclaimer's death record names it (PR 10).
+        owner.open_grace_with_keys(expected);
     }
     install_owner(Arc::clone(&owner));
     // The gate's armed word agrees with the census from the first instant

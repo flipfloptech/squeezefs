@@ -260,10 +260,22 @@ pub enum ManagerCall {
     /// The recovering manager of volume `vol` says `member`'s region there
     /// is `Recovered` — gates the allocation-lease re-grant.
     RecordRecovered { member: WireIdentity, vol: u16 },
-    /// RESERVED for PR 10's recovery driver (the home shard's eviction →
-    /// the death ledger): this rung REFUSES it naming PR 10; the record it
-    /// will write exists (`KvMetaBackend::record_death`).
-    RecordDeath { member: WireIdentity, epoch: u64 },
+    /// The home shard's eviction → the death ledger (design §5.5.2, PR 10
+    /// activates PR 8's reservation): volume 0's manager writes
+    /// `dead_member:{member}` carrying the dead epoch and the member's
+    /// registrant key (`0` = none) — the recovering managers preempt it.
+    /// Idempotent against the record (`Recorded { already }`).
+    RecordDeath {
+        member: WireIdentity,
+        epoch: u64,
+        pr_key: u64,
+    },
+    // ---- PR 10 — verb codes 0xA0..=0xAF are RESERVED for the recovery
+    // driver. None is defined: the death ledger and the `recovered:`
+    // records are a SHARED-DISK projection every manager reads off tree 0
+    // of volume 0 (the S5 poller), never a verb; `RecordDeath` /
+    // `RecordRecovered` (PR 8's block) are the two writes the driver
+    // needs, and `appender clear` is offline. The range stays reserved.
 }
 
 /// PR 8's documented verb codes (the range the level-4 coordination
@@ -947,19 +959,25 @@ impl ManagerService {
                     .manager_record_recovered((*member).into(), *vol)
                     .await
                     .map(|already| ManagerReply::Recorded { already }),
-                // The RECORD exists (`KvMetaBackend::record_death`); the
-                // DRIVER that writes it from a home shard's eviction is PR
-                // 10's — until it lands the wire refuses loud rather than
-                // let a peer declare a member dead with no recovery behind
-                // it.
-                ManagerCall::RecordDeath { member, epoch } => {
-                    Err(crate::meta_backend::kv::KvError::Rejected(format!(
-                        "RecordDeath {{ node {:#018x} slot {}, epoch {epoch} }} is RESERVED for \
-                         PR 10's recovery driver (the home shard's eviction → the death \
-                         ledger); this rung writes the record only in-process",
-                        member.node_token, member.mount_slot
-                    )))
-                }
+                // PR 10: the home shard's eviction shipped here. The wire
+                // words are an identity, an epoch and a key — none sizes an
+                // allocation or names an ino; the record is idempotent and
+                // every effect it drives (the quarantine, the recovery)
+                // re-reads durable state. A member this manager LISTS as
+                // live is never declared dead by a peer's word (the
+                // screen below).
+                ManagerCall::RecordDeath {
+                    member,
+                    epoch,
+                    pr_key,
+                } => match self.volume.screen_record_death(member) {
+                    Err(e) => Err(e),
+                    Ok(()) => self
+                        .volume
+                        .record_death_with_key((*member).into(), *epoch, *pr_key)
+                        .await
+                        .map(|already| ManagerReply::Recorded { already }),
+                },
             };
         let (reply, status) = match served {
             Ok(reply) => (reply, STATUS_OK),
@@ -1590,9 +1608,27 @@ impl ManagerClient {
         }
     }
 
-    /// `RecordDeath` — RESERVED: answers the reservation refusal
-    /// (`STATUS_REJECTED`) until PR 10's driver lands.
-    pub async fn record_death(&mut self, member: WireIdentity, epoch: u64) -> Result<ManagerReply> {
-        self.call(ManagerCall::RecordDeath { member, epoch }).await
+    /// `RecordDeath` (PR 10) — `Ok(already)`; a refusal (this manager
+    /// lists the member live) is the error.
+    pub async fn record_death(
+        &mut self,
+        member: WireIdentity,
+        epoch: u64,
+        pr_key: u64,
+    ) -> Result<bool> {
+        match self
+            .call(ManagerCall::RecordDeath {
+                member,
+                epoch,
+                pr_key,
+            })
+            .await?
+        {
+            ManagerReply::Recorded { already } => Ok(already),
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Err(SqueezefsError::InvalidOperation(format!(
+                "RecordDeath answered {other:?}"
+            ))),
+        }
     }
 }

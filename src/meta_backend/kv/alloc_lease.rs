@@ -74,7 +74,12 @@ pub const ALLOC_LEASE_VERSION: u8 = 1;
 
 const ALLOC_LEASE_FIXED_LEN: usize = 1 + 8 + 4 + 16 + 4 + 2 + 8 + 8 + 8 + 2;
 const BITMAP_REF_LEN: usize = 2 + 8 + 8;
-const DEAD_MEMBER_LEN: usize = 1 + 8 + 8;
+/// The PR-8 image: version ‖ epoch ‖ ts.
+const DEAD_MEMBER_LEN_V1: usize = 1 + 8 + 8;
+/// PR 10's image appends the victim's registrant key (the preempt's
+/// input); a v1 image decodes with key 0 — the record is dark, but the
+/// decoder is total over both shapes.
+const DEAD_MEMBER_LEN: usize = DEAD_MEMBER_LEN_V1 + 8;
 const RECOVERED_LEN: usize = 1 + 8 + 8;
 
 /// The tree-0 key of data volume `vol_tag`'s allocation lease.
@@ -110,6 +115,25 @@ pub fn dead_member_key(member: &AppenderIdentity) -> Vec<u8> {
     k.extend_from_slice(&member.node_token.to_be_bytes());
     k.extend_from_slice(&member.mount_slot.to_be_bytes());
     k
+}
+
+/// Decode a `dead_member:` key to its identity (`None` for any other key
+/// the prefix range may return — the range is inclusive of the prefix).
+pub fn decode_dead_member_key(key: &[u8]) -> Option<AppenderIdentity> {
+    let want = DEAD_MEMBER_KEY_PREFIX.len() + 12;
+    if key.len() != want || !key.starts_with(DEAD_MEMBER_KEY_PREFIX) {
+        return None;
+    }
+    let p = DEAD_MEMBER_KEY_PREFIX.len();
+    let mut nt = [0u8; 8];
+    nt.copy_from_slice(&key[p..p + 8]);
+    let mut ms = [0u8; 4];
+    ms.copy_from_slice(&key[p + 8..p + 12]);
+    Some(AppenderIdentity {
+        node_token: u64::from_be_bytes(nt),
+        mount_slot: u32::from_be_bytes(ms),
+        writer_id: 0,
+    })
 }
 
 /// The tree-0 key of `member`'s recovery record on volume `vol`.
@@ -251,6 +275,10 @@ pub struct DeadMemberRecord {
     pub epoch: u64,
     /// Unix ms at the record.
     pub ts_ms: u64,
+    /// The dead member's NVMe registrant key (`0` = none / unknown): what
+    /// the recovering manager PREEMPTS on the volume's namespace before it
+    /// reads the ring (design-symmetric-metadata §5.9; PR 10).
+    pub pr_key: u64,
 }
 
 impl DeadMemberRecord {
@@ -259,20 +287,32 @@ impl DeadMemberRecord {
         out.push(ALLOC_LEASE_VERSION);
         out.extend_from_slice(&self.epoch.to_le_bytes());
         out.extend_from_slice(&self.ts_ms.to_le_bytes());
+        out.extend_from_slice(&self.pr_key.to_le_bytes());
         out
     }
 
     pub fn decode(value: &[u8]) -> Result<Self, KvError> {
-        if value.len() != DEAD_MEMBER_LEN || value[0] != ALLOC_LEASE_VERSION {
+        let keyed = match value.len() {
+            DEAD_MEMBER_LEN_V1 => false,
+            DEAD_MEMBER_LEN => true,
+            _ => {
+                return Err(KvError::Corrupt(format!(
+                    "dead_member record must be {DEAD_MEMBER_LEN_V1} or {DEAD_MEMBER_LEN} bytes \
+                     at version {ALLOC_LEASE_VERSION}, got {} bytes",
+                    value.len()
+                )))
+            }
+        };
+        if value[0] != ALLOC_LEASE_VERSION {
             return Err(KvError::Corrupt(format!(
-                "dead_member record must be {DEAD_MEMBER_LEN} bytes at version \
-                 {ALLOC_LEASE_VERSION}, got {} bytes",
-                value.len()
+                "dead_member record carries version {}, expected {ALLOC_LEASE_VERSION}",
+                value[0]
             )));
         }
         Ok(Self {
             epoch: le64(value, 1),
             ts_ms: le64(value, 9),
+            pr_key: if keyed { le64(value, 17) } else { 0 },
         })
     }
 }
@@ -335,7 +375,8 @@ fn be64(v: &[u8], off: usize) -> u64 {
     u64::from_be_bytes(b)
 }
 
-fn unix_now_ms() -> u64 {
+/// Unix ms now (the ledger records' timestamps).
+pub fn unix_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -974,6 +1015,65 @@ impl KvMetaBackend {
         }
     }
 
+    /// Every death record in this volume's tree 0 (the ledger a manager
+    /// reads as a projection — PR 10's recovery driver; empty off volume
+    /// 0 and on a flat volume). Paged like every tree-0 range.
+    pub async fn dead_member_records(
+        &self,
+    ) -> Result<Vec<(AppenderIdentity, DeadMemberRecord)>, KvError> {
+        let Some(control) = self.forest_control_tree() else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        let mut cursor = DEAD_MEMBER_KEY_PREFIX.to_vec();
+        let mut end = DEAD_MEMBER_KEY_PREFIX.to_vec();
+        end.extend_from_slice(&[0xFF; 12]);
+        loop {
+            let page = control.range(&cursor, &end, 512).await?;
+            let Some((last, _)) = page.last() else {
+                break;
+            };
+            cursor = super::node::key_successor(last);
+            for (k, v) in &page {
+                let Some(member) = decode_dead_member_key(k) else {
+                    continue;
+                };
+                out.push((member, DeadMemberRecord::decode(v)?));
+            }
+            if page.len() < 512 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every allocation-lease record in this volume's tree 0 (volume 0's
+    /// set-wide records; empty elsewhere).
+    pub async fn alloc_lease_records(&self) -> Result<Vec<(u64, AllocLeaseRecord)>, KvError> {
+        let Some(control) = self.forest_control_tree() else {
+            return Ok(Vec::new());
+        };
+        let (mut cursor, end) = alloc_lease_key_range();
+        let mut out = Vec::new();
+        loop {
+            let page = control.range(&cursor, &end, 512).await?;
+            let Some((last, _)) = page.last() else {
+                break;
+            };
+            cursor = super::node::key_successor(last);
+            for (k, v) in &page {
+                let Ok(vol_tag) = decode_alloc_lease_key(k) else {
+                    continue;
+                };
+                out.push((vol_tag, AllocLeaseRecord::decode(v)?));
+            }
+            if page.len() < 512 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Read `member`'s recovery record for volume `vol`.
     pub async fn recovered_record(
         &self,
@@ -1287,6 +1387,19 @@ impl KvMetaBackend {
         member: AppenderIdentity,
         epoch: u64,
     ) -> Result<bool, KvError> {
+        self.record_death_with_key(member, epoch, 0).await
+    }
+
+    /// [`Self::record_death`] carrying the dead member's registrant key
+    /// — the PRODUCTION writer's form (PR 10): the S6 owner's eviction
+    /// knows the key the member's join presented, and the recovering
+    /// manager preempts it on every volume the member appended to.
+    pub async fn record_death_with_key(
+        &self,
+        member: AppenderIdentity,
+        epoch: u64,
+        pr_key: u64,
+    ) -> Result<bool, KvError> {
         let set = self.manager_gate(false)?;
         if self.dead_member_record(&member).await?.is_some() {
             set.verbs.replays.fetch_add(1, Ordering::Relaxed);
@@ -1295,6 +1408,7 @@ impl KvMetaBackend {
         let rec = DeadMemberRecord {
             epoch,
             ts_ms: unix_now_ms(),
+            pr_key,
         };
         self.write_control_entry(
             vec![(

@@ -3079,6 +3079,127 @@ async fn the_holder_grants_members_only_and_refuses_a_ghost_before_it_registers(
     shutdown(&writer).await;
 }
 
+/// **A grant registered inside an eviction's window is judged `Expired`,
+/// never `Unknown`** (review round 4, Issue 29 — Issue 28's departure
+/// prune re-opened Issue 5's stall for a microsecond: a dispatch that
+/// passed the membership check while the member was listed could land
+/// its `grant_register` AFTER the eviction ran `sweep_departed` + the
+/// prune, leaving a grant of a client the owner does not list AND
+/// `is_token_client` false — `Unknown`, waited like live to the
+/// deadline). With members-only granting, any holder the owner does not
+/// list has departed, so the verdict under an installed owner is
+/// `Expired` unconditionally. The window made deterministic
+/// (`TEST_DISPATCH_HOLD_AFTER_CHECK_MS`): the member's grant dispatch
+/// parks after its check, the owner's sweep evicts it inside the park,
+/// the grant lands — and the next recall completes at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_landing_inside_an_evictions_window_is_expired_not_unknown() {
+    use squeezefs::membership::{
+        self, JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole, MembershipOwner,
+    };
+    use squeezefs::meta_ship::token_plane::TEST_DISPATCH_HOLD_AFTER_CHECK_MS;
+    let _g = SEAM.lock().await;
+    membership::uninstall();
+    squeezefs::meta_ship::token_plane::test_clear_token_clients();
+    let ticks = Arc::new(AtomicU64::new(10_000));
+    let owner = MembershipOwner::arm(
+        "tok-owner-29",
+        3,
+        2,
+        LeaseClocks::derive(Duration::from_micros(250)).expect("the shipped derivation"),
+        LeaseClock::manual(Arc::clone(&ticks)),
+    )
+    .expect("arm the owner");
+    membership::install_owner(Arc::clone(&owner));
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let holder = writer.volumes[0].token_holder().unwrap().clone();
+    let f = Metadata::create(writer.as_ref(), 1, "f", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let client = "reader-window";
+    let JoinOutcome::Granted(_) = owner.join(JoinRequest {
+        id: client.to_string(),
+        role: MemberRole::Reader,
+        endpoint: None,
+        pid: std::process::id(),
+        boot: "boot-sym-coherence".to_string(),
+        prior_epoch: None,
+        pr_key: 0,
+        mount: None,
+    }) else {
+        panic!("the reader joins as a member");
+    };
+    let (reader, plane) = open_token_reader(&path, &endpoint, client).await;
+    // The grant dispatch parks after its membership check.
+    TEST_DISPATCH_HOLD_AFTER_CHECK_MS.store(400, Ordering::SeqCst);
+    let r = Arc::clone(&reader);
+    let fetch = tokio::spawn(async move { Metadata::getattr(r.as_ref(), f).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Inside the park: the lease passes and the owner's sweep EVICTS the
+    // member — its (empty) grant set swept, its id pruned from the
+    // token-client registry.
+    ticks.fetch_add(
+        owner.clocks().t_owner.as_millis() as u64 + 1,
+        Ordering::SeqCst,
+    );
+    let evicted = owner.expire_due();
+    assert!(
+        evicted.iter().any(|e| e.id == client),
+        "the sweep evicted it"
+    );
+    assert!(owner.lease_deadline_ms(client).is_none());
+    // The dead member: its channel is gone, so no ack will ever travel
+    // and the recall below can complete only by the lease's verdict.
+    plane.test_kill();
+    wait_until("the reader's channel task exited", || {
+        !plane.stats().channel_alive
+    })
+    .await;
+    // The parked dispatch resumes and the grant LANDS for a departed
+    // client (the fetch itself fails closed at the reader's own gate —
+    // the holder-side registration is the point).
+    let _ = fetch.await.unwrap();
+    TEST_DISPATCH_HOLD_AFTER_CHECK_MS.store(0, Ordering::SeqCst);
+    wait_until("the window's grant is registered", || {
+        holder.stats().outstanding >= 1
+    })
+    .await;
+    // The recall of that grant completes AT ONCE — the departed holder's
+    // lease reads Expired, never Unknown-waited to the deadline.
+    let t = std::time::Instant::now();
+    Metadata::setattr(
+        writer.as_ref(),
+        f,
+        Some(0o600),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "the recall completed at once, not at the deadline ({:?})",
+        t.elapsed()
+    );
+    let s = holder.stats();
+    assert_eq!(s.timeouts_live, 0, "never the stuck-reader class");
+    assert_eq!(s.outstanding, 0);
+    assert!(s.expired_with_lease >= 1 || s.lease_swept_grants >= 1);
+    plane.stop().await;
+    shutdown(&reader).await;
+    membership::uninstall();
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
 /// **The reader's install is conditional on the generation it read
 /// under** (review round 2, Issue 21 — the reader-side half of Issue 2).
 /// Schedule: the reader's fetch of B evicts A to make room — the eviction

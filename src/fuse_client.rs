@@ -16065,13 +16065,21 @@ impl SqueezefsFilesystem {
         };
         METRICS.dlm_acquire_time.record(start_dlm.elapsed());
         let token = lease.fencing_token();
-        // A foreign-custody ino's word reads served BEFORE its lease enters
-        // the map (`custody_revoke_core` pair 1's `cache`): no reader ever
-        // finds a cached lease under a cleared word. The word is minted
-        // here when no handler's use minted it first (the R5 pressure
-        // flusher acquires outside any handler); one relaxed load and no
-        // map touch for an own file or an unarmed mount.
-        if crate::data_grant::slot_holder_home(ino).is_some() {
+        // The ino's word reads served BEFORE its lease enters the map
+        // (`custody_revoke_core` pair 1's `cache`): no reader ever finds a
+        // cached lease under a cleared word. An existing word is set
+        // whatever the ino's custody home now (a slot handed TO this mount
+        // leaves its word behind, cleared by the last recall — a LOCAL
+        // lease cached under it must read served); a word is MINTED only
+        // for a foreign-custody ino (the R5 pressure flusher acquires
+        // outside any handler's use). One relaxed load and no map touch
+        // for an own file on an unarmed mount.
+        let has_word = self
+            .custody_use
+            .get(&ino)
+            .map(|core| core.cache())
+            .is_some();
+        if !has_word && crate::data_grant::slot_holder_home(ino).is_some() {
             self.custody_use.entry(ino).or_default().cache();
         }
         self.active_leases.insert(ino, lease);

@@ -376,6 +376,13 @@ impl Drop for Restore {
     fn drop(&mut self) {
         data_grant::TEST_DROP_RECALL_CARRIERS_ALL.store(false, Ordering::SeqCst);
         data_grant::TEST_DROP_RECALL_CARRIER_ONCE.store(false, Ordering::SeqCst);
+        // The FUSE-layer hooks hold an `Arc` of the rig — its cached and
+        // parked leases live in the process-global lock map — so a
+        // contract that panicked mid-way must not leave them installed
+        // (the next contract's fresh volume mints the same inos and reads
+        // `conflicting custody` off the stranded lease).
+        data_grant::uninstall_recall_hooks();
+        data_grant::uninstall_release_gate();
         data_grant::uninstall_slot_custody();
         data_grant::uninstall_custody_owner();
         data_grant::uninstall_custody_client();

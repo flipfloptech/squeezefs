@@ -2263,12 +2263,9 @@ proptest! {
     /// a marker is never a user-reachable name (its first byte is NUL).
     #[test]
     fn dir_stripe_marker_codec_is_total(data in prop::collection::vec(any::<u8>(), 0..64)) {
-        match parse_marker(&data) {
-            Some(Marker::Stripe(i)) => {
-                prop_assert!(i < STRIPES_MAX);
-                prop_assert_eq!(stripe_marker_name(i).into_bytes(), data.clone());
-            }
-            Some(_) | None => {}
+        if let Some(Marker::Stripe(i)) = parse_marker(&data) {
+            prop_assert!(i < STRIPES_MAX);
+            prop_assert_eq!(stripe_marker_name(i).into_bytes(), data.clone());
         }
         if let Ok(s) = std::str::from_utf8(&data) {
             if parse_marker(&data).is_some() {

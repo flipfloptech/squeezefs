@@ -1555,3 +1555,192 @@ fn the_striping_family_is_exported_under_its_published_names() {
         squeezefs::meta_backend::MINT_SPREAD
     );
 }
+
+// ---------------------------------------------------------------------------
+// fsck C17 — stripe consistency (§5.6.5 / §5.8.5): a healthy striped tree
+// is clean (every contract above ends in `fsck_clean`); each of the four
+// planted shapes is FOUND, report-only.
+// ---------------------------------------------------------------------------
+
+/// Plant each C17 shape on a settled striped tree — a stripe named by a
+/// second directory's map, a map entry naming a destroyed stripe, a name in
+/// the wrong stripe, a name left in the directory's own tree after its
+/// migration — and the offline fsck reports exactly those four, report-
+/// only (`fsck_repair_classC17` does not exist; repair refuses them).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_planted_c17_shape_is_found_and_nothing_else() {
+    use squeezefs::meta_backend::kv::backend::RoutedParentUpdate;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, routed, work) = solo_armed(dir.path()).await;
+    let seed = hash_seed(&routed, work);
+    // Two striped directories, settled.
+    let d1 = routed
+        .create(work, "d1", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let d2 = routed
+        .create(work, "d2", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    routed.stripe_dir(d1, 4).await.unwrap();
+    routed.stripe_dir(d2, 4).await.unwrap();
+    wait_migrated(&routed, d1).await;
+    wait_migrated(&routed, d2).await;
+    create_files(&routed, d1, "ok-", 6).await;
+    let m1 = routed.stripe_map(d1).await.unwrap().unwrap();
+    let vol = Arc::clone(&routed.volumes[0]);
+    let no_guards: Arc<[squeezefs::meta_backend::dlm::DlmGuard]> = Arc::from(Vec::new());
+    let mint = |routed: &RoutedMetaBackend| {
+        let slot = routed.pick_mint_slot(0);
+        routed.allocate_local_ino_in_slot(0, slot).unwrap()
+    };
+
+    // (1) multiply-mapped: d2's map gains a 5th entry naming d1's stripe 0.
+    let (_, d2_local) = routed.route_ino(d2);
+    vol.routed_add_dentry(
+        d2_local,
+        &dir_stripe::stripe_marker_name(4),
+        m1.stripes[0],
+        libc::S_IFDIR,
+        RoutedParentUpdate::None,
+        Arc::clone(&no_guards),
+    )
+    .await
+    .unwrap();
+    // (2) missing stripe: d1's stripe 3 record destroyed under its map.
+    let (_, s3_local) = routed.route_ino(m1.stripes[3]);
+    vol.destroy_unreferenced_inodes(&[s3_local]).await.unwrap();
+    // (3) misrouted: a fresh file named in the WRONG stripe of d1.
+    let (wrong_local, wrong_global) = mint(&routed);
+    vol.routed_mint_inode(
+        wrong_local,
+        libc::S_IFREG | 0o644,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Arc::clone(&no_guards),
+    )
+    .await
+    .unwrap();
+    let (i_right, _) = m1.stripe_for(dentry_name_hash54(b"misrouted", seed));
+    let wrong_stripe = m1.stripes[usize::from((i_right + 1) % 3)];
+    let (_, ws_local) = routed.route_ino(wrong_stripe);
+    vol.routed_add_dentry(
+        ws_local,
+        "misrouted",
+        wrong_global,
+        libc::S_IFREG,
+        RoutedParentUpdate::None,
+        Arc::clone(&no_guards),
+    )
+    .await
+    .unwrap();
+    // (4) unmigrated: a fresh file named in d1's OWN tree, flag long gone.
+    let (left_local, left_global) = mint(&routed);
+    vol.routed_mint_inode(
+        left_local,
+        libc::S_IFREG | 0o644,
+        0,
+        0,
+        0,
+        0,
+        None,
+        Arc::clone(&no_guards),
+    )
+    .await
+    .unwrap();
+    let (_, d1_local) = routed.route_ino(d1);
+    vol.routed_add_dentry(
+        d1_local,
+        "leftover",
+        left_global,
+        libc::S_IFREG,
+        RoutedParentUpdate::None,
+        Arc::clone(&no_guards),
+    )
+    .await
+    .unwrap();
+    shutdown(&routed).await;
+    drop(vol);
+    drop(routed);
+
+    let mut opts = squeezefs::fsck::FsckOptions::offline();
+    opts.settle = std::time::Duration::from_millis(10);
+    let report = squeezefs::fsck::run_offline(&uris, &opts)
+        .await
+        .expect("offline fsck runs");
+    let c17: Vec<&squeezefs::fsck::FsckFinding> = report
+        .findings
+        .iter()
+        .filter(|f| f.class == "C17")
+        .collect();
+    let ids: Vec<(u64, u64, String, String)> = c17
+        .iter()
+        .filter_map(|f| match &f.identity {
+            Some(squeezefs::fsck::FindingId::C17StripeInconsistency {
+                dir,
+                stripe,
+                shape,
+                name,
+            }) => Some((*dir, *stripe, shape.clone(), name.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ids.len(),
+        c17.len(),
+        "every C17 finding carries its identity"
+    );
+    let has = |shape: &str, dir: u64, name: &str| {
+        ids.iter()
+            .filter(|(d, _, s, n)| s == shape && *d == dir && n == name)
+            .count()
+    };
+    assert_eq!(has("multiply-mapped", d1, ""), 1, "{ids:?}");
+    assert_eq!(has("missing-stripe", d1, ""), 1, "{ids:?}");
+    assert_eq!(has("misrouted-name", d1, "misrouted"), 1, "{ids:?}");
+    assert_eq!(has("unmigrated-name", d1, "leftover"), 1, "{ids:?}");
+    // The multiply-mapped stripe's CONSEQUENCE: read as d2's fifth stripe,
+    // d1's names in it route elsewhere under K = 5 — every remaining
+    // finding is that shape on d2, and nothing else.
+    for (d, _, shape, name) in &ids {
+        let planted = (*d == d1 && matches!(shape.as_str(), "multiply-mapped" | "missing-stripe"))
+            || (*d == d1 && shape == "misrouted-name" && name == "misrouted")
+            || (*d == d1 && shape == "unmigrated-name" && name == "leftover");
+        assert!(
+            planted || (*d == d2 && shape == "misrouted-name"),
+            "unexpected C17 finding: {d} {shape} {name:?} — {ids:?}"
+        );
+    }
+    assert_eq!(report.counters.stripe_findings, c17.len() as u64);
+    for f in &c17 {
+        assert!(f.evidence.contains("REPORT-ONLY"), "{}", f.evidence);
+    }
+    // Nothing else — except the ONE face another class legitimately
+    // shares: the destroyed stripe's map entry is a dentry naming an ino
+    // with no record, C10's dangling-dentry shape (the inode plane sees
+    // the same defect from its side).
+    let others: Vec<&squeezefs::fsck::FsckFinding> = report
+        .findings
+        .iter()
+        .filter(|f| f.class != "C17")
+        .collect();
+    assert_eq!(
+        others.len(),
+        1,
+        "only C17 and the missing stripe's C10 face fire: {:?}",
+        others
+            .iter()
+            .map(|f| (&f.class, &f.evidence))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(others[0].class, "C10");
+    assert!(others[0]
+        .evidence
+        .contains(&dir_stripe::stripe_marker_name(3)));
+}

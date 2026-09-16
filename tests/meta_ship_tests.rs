@@ -198,14 +198,25 @@ const DIR: u32 = libc::S_IFDIR | 0o755;
 /// step's slot holder), `LookupExact` (the directory-rename ancestor
 /// check's exact read) and the travelling guard's pair `XvGuards` /
 /// `XvRelease` — verbs of the symmetric plane, not trait members.
+/// **Symmetric PR 7b** appended the striping block (0x90–0x9F):
+/// `SupplyStripeIno`, `IsEmpty`, `DestroyStripe`.
 #[test]
 fn the_wire_vocabulary_covers_every_shipped_trait_member() {
     assert_eq!(
         MetaVerb::ALL.len(),
-        17,
+        20,
         "13 wire verbs cover the trait's 13 required members, plus PR 6's four symmetric \
-         verbs ({:?})",
+         verbs and PR 7b's three striping verbs ({:?})",
         MetaVerb::ALL
+    );
+    assert_eq!(
+        (
+            MetaVerb::SupplyStripeIno.code(),
+            MetaVerb::IsEmpty.code(),
+            MetaVerb::DestroyStripe.code(),
+        ),
+        (0x90, 0x91, 0x92),
+        "PR 7b's block is 0x90–0x9F (the level-5 discriminant ranges)"
     );
     assert_eq!(
         (
@@ -257,6 +268,9 @@ fn the_wire_vocabulary_covers_every_shipped_trait_member() {
         (MetaVerb::LookupExact, false),
         (MetaVerb::XvGuards, true),
         (MetaVerb::XvRelease, true),
+        (MetaVerb::SupplyStripeIno, true),
+        (MetaVerb::IsEmpty, false),
+        (MetaVerb::DestroyStripe, true),
     ] {
         assert_eq!(
             verb.mutating(),
@@ -356,6 +370,16 @@ fn frames_round_trip_and_untrusted_bytes_refuse_loud() {
             scope: 0x51,
             ino: 1,
         },
+        MetaCall::SupplyStripeIno {
+            dir: 1,
+            index: 3,
+            supplier: 2,
+        },
+        MetaCall::IsEmpty {
+            dir: 1,
+            scope: 0x51,
+        },
+        MetaCall::DestroyStripe { stripe: 9 },
     ]
     .into_iter()
     .enumerate()

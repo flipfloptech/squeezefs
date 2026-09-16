@@ -2867,3 +2867,239 @@ async fn every_planted_c17_shape_is_found_and_nothing_else() {
         .evidence
         .contains(&dir_stripe::stripe_marker_name(3)));
 }
+
+// ---------------------------------------------------------------------------
+// The flip's 4a lock law (PR 10 review, Issue 28 — routed to 7b).
+// ---------------------------------------------------------------------------
+
+/// The lock-law pin's child marker AND shape (`explicit` | `mkdir`);
+/// registered `Kind::Harness`.
+const FLIP_LAW_SHAPE_ENV: &str = "SQZ_STRIPE_FLIP_LAW_SHAPE";
+
+/// `-o stripe_dirs` mkdirs the `mkdir` shape runs — each a flip of the
+/// directory the create just named, after the create's guards dropped.
+const FLIP_LAW_MKDIRS: usize = 3;
+
+/// A progress line the parent reads back on a hang: the LAST one names
+/// the phase the child parked in.
+fn flip_law_progress(what: &str) {
+    println!("flip-law: {what}");
+}
+
+/// The child's commit count per shape: the directory's create, `K` stripe
+/// mints, the map intent and the migration's flag clear per flip — the
+/// derivation of its liveness bound (one checkpoint LANDING ceiling per
+/// commit: on a healthy ring no commit outlives the cadence that covers
+/// it, so a child still running past one ceiling per commit is PARKED,
+/// not slow).
+fn flip_law_commits(shape: &str) -> u64 {
+    let per_flip = u64::from(STRIPES_MAX) + 3;
+    match shape {
+        "explicit" => per_flip,
+        "mkdir" => per_flip * FLIP_LAW_MKDIRS as u64,
+        other => panic!("unknown flip-law shape {other:?}"),
+    }
+}
+
+/// Child branch of [`a_flip_takes_its_4a_guards_in_one_acquisition_under_the_width_one_crucible`]:
+/// one flip shape at whatever `SQUEEZEFS_DLM_STRIPES` the parent set. The
+/// 4a table width is a PROCESS-LIFETIME resolution
+/// (`stripe_locks::dlm_stripe_width`), so the width-1 crucible needs its
+/// own process; the DLM's contended-acquire tape is armed so a park names
+/// its stripe and the stripe's last acquirer.
+#[test]
+fn flip_lock_law_child_entry() {
+    let Ok(shape) = std::env::var(FLIP_LAW_SHAPE_ENV) else {
+        return;
+    };
+    let _ = env_logger::builder()
+        .is_test(true)
+        .filter_module("squeezefs::meta_backend::dlm", log::LevelFilter::Debug)
+        .parse_default_env()
+        .try_init();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (uris, routed, work) = solo_armed(dir.path()).await;
+        flip_law_progress(&format!(
+            "open (4a table width {})",
+            routed.volumes[0].dlm().width()
+        ));
+        match shape.as_str() {
+            "explicit" => {
+                flip_law_progress("explicit flip");
+                routed.stripe_dir(work, STRIPES_MAX).await.expect("flip");
+                assert_eq!(
+                    routed.stripe_map(work).await.unwrap().unwrap().k(),
+                    STRIPES_MAX
+                );
+            }
+            "mkdir" => {
+                routed.set_stripe_dirs_at_mkdir(true);
+                for i in 0..FLIP_LAW_MKDIRS {
+                    flip_law_progress(&format!("mkdir {i} under -o stripe_dirs"));
+                    let d = routed
+                        .create(work, &format!("d{i}"), libc::S_IFDIR | 0o755, 0, 0)
+                        .await
+                        .expect("mkdir")
+                        .ino;
+                    assert!(
+                        routed.stripe_map(d).await.unwrap().is_some(),
+                        "directory {d} striped at its mkdir"
+                    );
+                }
+                routed.set_stripe_dirs_at_mkdir(false);
+            }
+            other => panic!("unknown flip-law shape {other:?}"),
+        }
+        flip_law_progress("shutdown");
+        shutdown(&routed).await;
+        flip_law_progress("fsck");
+        fsck_clean(&uris).await;
+        flip_law_progress("done");
+    });
+}
+
+/// Run the child for `shape`; `width_one` = the `SQUEEZEFS_DLM_STRIPES=1`
+/// crucible. A child past `bound` is KILLED and the run is `Err`, naming
+/// the phase it parked in and the last contended 4a acquire — never a
+/// hung suite. `Ok` = the child's wall.
+fn run_flip_law_child(
+    exe: &std::path::Path,
+    log_path: &std::path::Path,
+    shape: &str,
+    width_one: bool,
+    bound: std::time::Duration,
+    bound_why: &str,
+) -> Result<std::time::Duration, String> {
+    use std::process::{Command, Stdio};
+    let log = std::fs::File::create(log_path).expect("child log");
+    let mut cmd = Command::new(exe);
+    cmd.args([
+        "--exact",
+        "flip_lock_law_child_entry",
+        "--test-threads=1",
+        "--nocapture",
+    ])
+    .env(FLIP_LAW_SHAPE_ENV, shape)
+    .stdout(Stdio::from(log.try_clone().expect("dup child log")))
+    .stderr(Stdio::from(log));
+    if width_one {
+        cmd.env(squeezefs::stripe_locks::DLM_STRIPES_ENV, "1");
+    } else {
+        cmd.env_remove(squeezefs::stripe_locks::DLM_STRIPES_ENV);
+    }
+    let width = if width_one { "1" } else { "the shipped width" };
+    let t0 = std::time::Instant::now();
+    let mut child = cmd.spawn().expect("spawn the flip-law child");
+    loop {
+        if let Some(status) = child.try_wait().expect("poll the child") {
+            let text = std::fs::read_to_string(log_path).unwrap_or_default();
+            if !status.success() {
+                return Err(format!(
+                    "flip-law child ({shape} @ width {width}) FAILED ({status}):\n{}",
+                    tail_lines(&text, 40)
+                ));
+            }
+            return Ok(t0.elapsed());
+        }
+        if t0.elapsed() > bound {
+            let _ = child.kill();
+            let _ = child.wait();
+            let text = std::fs::read_to_string(log_path).unwrap_or_default();
+            let phase = text
+                .lines()
+                .rev()
+                .find(|l| l.starts_with("flip-law: "))
+                .unwrap_or("(no progress line)");
+            let park = text
+                .lines()
+                .rev()
+                .find(|l| l.contains("dlm: ") && l.trim_end().ends_with("; parking"))
+                .unwrap_or("(no contended 4a acquire on the tape)");
+            return Err(format!(
+                "flip-law child ({shape} @ width {width}) HUNG past {bound:?} ({bound_why}) — \
+                 parked in phase {phase:?}; the last contended 4a acquire: {park:?}. The flip \
+                 took DLM guards in SEPARATE acquisitions on one striped table (the PR 4 \
+                 round-1 / D-1c law: the op's 4a guards are ONE canonical `lock_many`). The \
+                 child's tail:\n{}",
+                tail_lines(&text, 15)
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+/// **The flip takes its 4a guards in ONE canonical acquisition** (PR 10
+/// review, Issue 28 — the PR 4 round-1 / D-1c law, PR 6's coverage law).
+/// `flip_dir_inner` used to hold `I{dir}` + the `K + 2` marker `D{}`
+/// guards across `K` mints that each took their own `lock_inode_exclusive`
+/// on the SAME striped table — a stripe collision between a held guard
+/// and a later acquire parks the flip FOREVER (≈ 0.8 % per 64-stripe flip
+/// at the shipped 16,384-way width, the matrix's 1-in-9 hang); under
+/// `-o stripe_dirs` the mkdir's own held `I{parent}` was a third stripe.
+/// The registered crucible `SQUEEZEFS_DLM_STRIPES=1` makes every collision
+/// certain, so both shapes hung DETERMINISTICALLY. The pin: each shape
+/// runs at the shipped width first (its flat wall, bounded by one
+/// checkpoint landing ceiling per commit), then under the crucible within
+/// `max(10 × the flat wall, 2 landing ceilings)` — a child past its bound
+/// is killed, both shapes are run whatever the first did, and the failure
+/// names each hung shape's phase and parked acquire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flip_takes_its_4a_guards_in_one_acquisition_under_the_width_one_crucible() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let exe = std::env::current_exe().expect("test binary path");
+    let ceiling = std::time::Duration::from_millis(
+        squeezefs::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_derived(),
+    );
+    let mut failures: Vec<String> = Vec::new();
+    for shape in ["explicit", "mkdir"] {
+        let flat_bound = ceiling * u32::try_from(flip_law_commits(shape)).expect("small");
+        let flat = match run_flip_law_child(
+            &exe,
+            &dir.path().join(format!("{shape}-flat.log")),
+            shape,
+            false,
+            flat_bound,
+            "one checkpoint landing ceiling per commit",
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                failures.push(e);
+                continue;
+            }
+        };
+        let bound = (flat * 10).max(ceiling * 2);
+        match run_flip_law_child(
+            &exe,
+            &dir.path().join(format!("{shape}-width1.log")),
+            shape,
+            true,
+            bound,
+            &format!("max(10 × the flat wall {flat:?}, 2 landing ceilings)"),
+        ) {
+            Ok(crucible) => eprintln!(
+                "flip-law {shape}: flat {flat:?} (bound {flat_bound:?}), width-1 crucible \
+                 {crucible:?} (bound {bound:?})"
+            ),
+            Err(e) => failures.push(e),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} flip shape(s) violate the one-acquisition law:\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}

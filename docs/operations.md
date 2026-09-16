@@ -1681,6 +1681,7 @@ Every knob the tree reads, grouped as the registry groups them (`src/env_knobs.r
 | `SQZ_STRIPE_WAVE_HOLDERS` | harness | `7` | PR 7b creator-wave row (tests/sym_dir_stripe_tests.rs `a_creator_wave_spreads_over_the_stripe_holders`): declared stripe holders N — 7 fits one 64 KiB directory extent of the declared-partition seam; 31 needs SQZ_STRIPE_WAVE_NODE_KIB=256. |
 | `SQZ_STRIPE_WAVE_CREATES` | harness | `2000` | PR 7b creator-wave row: creates into the striped directory (the 12,500-creator wave's local stand-in). |
 | `SQZ_STRIPE_WAVE_NODE_KIB` | harness | `64` | PR 7b creator-wave row: the harness volume's node size in KiB (256 admits 31 declared holders per directory extent). |
+| `SQZ_STRIPE_FLIP_LAW_SHAPE` | harness | `-` | PR 7b flip lock-law pin (tests/sym_dir_stripe_tests.rs `flip_lock_law_child_entry`): the child-process marker and its shape (`explicit` \| `mkdir`) — the parent runs it under SQUEEZEFS_DLM_STRIPES=1, a width the 4a tables resolve once per process. |
 | `SQZ_STORM_PER_THREAD` | harness | `512 release / 64 debug` | D-3 in-process metadata storm: names per committer per phase. |
 | `SQUEEZEFS_TEST_REQUIRE_MOUNT` | harness | `-` | Turn mount-class skips into failures (TEST-2). |
 | `SQUEEZEFS_TEST_REQUIRE_ALL` | harness | `-` | Promote every skip class to a failure. |

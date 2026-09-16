@@ -721,6 +721,36 @@ pub enum FindingId {
         /// The name involved, when the shape has one.
         name: String,
     },
+
+    /// C14 (design-symmetric-metadata §5.8.5, PR 10): **slot custody
+    /// conflict** — forest slot `slot` of meta volume `vol` attested
+    /// `Live` on the pages of two appenders at tree 0's generation, or
+    /// `Live` on `appender_a`'s page while tree 0 leases it to
+    /// `appender_b` at that generation. No legal schedule writes it (a
+    /// grant moves tree 0 before the new lessee's page names the slot,
+    /// and a release clears the page before tree 0 unleases); the mount
+    /// REFUSES on it and the remedy is the operator's attestation,
+    /// `squeezefs appender clear`. Report-only here.
+    C14SlotCustodyConflict {
+        vol: usize,
+        slot: u32,
+        appender_a: u32,
+        appender_b: u32,
+    },
+    /// C15 (design-symmetric-metadata §5.8.5, PR 10): **un-recovered
+    /// appender** — a `Live` or `Recovering` page of meta volume `vol`
+    /// whose identity the death ledger (volume 0's `dead_member:`
+    /// records) names, with acked records still in its ring window
+    /// (`window_entries`) or slots still leased to it. Repair (online,
+    /// on the volume's manager) = the §5.9 recovery run; the mount path
+    /// runs the same recovery before it serves.
+    C15UnrecoveredAppender {
+        vol: usize,
+        appender: u32,
+        node_token: u64,
+        mount_slot: u32,
+        window_entries: u64,
+    },
 }
 
 /// The §10 `fsck_*` / `scrub_*` counter families, per run (the process
@@ -860,6 +890,16 @@ pub struct FsckCounters {
     /// inconsistencies — report-only; the live `fsck_stripe_findings`
     /// gauge. 0 on every healthy striped tree.
     pub stripe_findings: u64,
+    /// C14 (design-symmetric-metadata §5.8.5, PR 10): confirmed slot
+    /// custody conflicts — report-only, the mount refuses on them; the
+    /// live `fsck_slot_custody_conflicts` gauge. **Must stay 0.**
+    pub slot_custody_conflicts: u64,
+    /// C15 (design-symmetric-metadata §5.8.5, PR 10): confirmed
+    /// un-recovered appenders — a ledgered death whose ring window the
+    /// §5.9 recovery has not yet replayed; the live
+    /// `fsck_unrecovered_appenders` gauge. 0 once every manager's poll
+    /// has acted (the mount path recovers before serving).
+    pub unrecovered_appenders: u64,
     pub findings: u64,
     pub scan_secs: u64,
     pub scrub_blocks_scanned: u64,
@@ -1522,6 +1562,24 @@ enum SuspectKind {
     },
     /// C17: stripe consistency (design-symmetric-metadata §5.6.5, PR 7b).
     C17StripeInconsistency(C17Shape),
+    /// C14: slot custody conflict (design-symmetric-metadata §5.8.5,
+    /// PR 10) — the backend's custody census over the appender directory
+    /// against tree 0.
+    C14SlotCustodyConflict {
+        vol: usize,
+        slot: u32,
+        appender_a: u32,
+        appender_b: u32,
+    },
+    /// C15: un-recovered appender (design-symmetric-metadata §5.8.5,
+    /// PR 10) — a ledgered death with a ring window or leased slots.
+    C15UnrecoveredAppender {
+        vol: usize,
+        appender: u32,
+        node_token: u64,
+        mount_slot: u32,
+        window_entries: u64,
+    },
 }
 
 /// One referencer's device window on its block, as C12 judges it:
@@ -1862,6 +1920,11 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
             if let Some(refs) = referenced.as_ref() {
                 evaluate_c17(ctx, &refs.markers, &mut suspects).await;
             }
+            // C14 / C15 (design §5.8.5, PR 10): the slot custody census —
+            // the appender directory's Live attestations against tree 0
+            // and the death ledger; per meta volume, unsharded like C13
+            // (one directory read + one tree-0 scan per volume).
+            evaluate_c14_c15(ctx, &mut suspects).await;
         }
 
         // C9 (the class design-cow-kv-metadata §4.10a owed): live
@@ -1887,11 +1950,28 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         // not frozen ⇒ no verdict (the existing incomplete-pass law), not
         // a verdict taken over a set that may still be growing names.
         let frozen = !opts.multi_owner || peer_volumes_are_assigned(ctx, opts).await;
+        // Symmetric PR 10 (design §5.8.5 / §5.9): a FOREIGN appender's
+        // ring window this open did not replay (a live peer's acked
+        // records ahead of its checkpoint, or a dead appender's window
+        // before its recovery) holds dentries no tree names yet — a
+        // cross-owner create's name lives in the parent's holder's ring
+        // while the child's record is the creator's. The referenced set
+        // is INCOMPLETE over such a window, so the plane records no
+        // verdict (the incomplete-pass law): C15 names the dead window
+        // and its recovery is what makes the next pass complete.
+        let pending_windows = foreign_windows_pending(ctx).await;
+        if pending_windows > 0 {
+            log::warn!(
+                "fsck inode plane: {pending_windows} foreign appender ring window(s) this open \
+                 did not replay — C9/C10 record no verdict this run (a dead appender's window \
+                 is C15's; its recovery completes the referenced set)"
+            );
+        }
         match (
             referenced
                 .as_ref()
                 .filter(|_| opts.inode_plane)
-                .filter(|_| frozen),
+                .filter(|_| frozen && pending_windows == 0),
             census.live.truncated(),
         ) {
             (Some(refs), false) => {
@@ -2091,6 +2171,8 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         counters.tenant_overlap_findings += r.counters.tenant_overlap_findings;
         counters.shared_index_drift += r.counters.shared_index_drift;
         counters.stripe_findings += r.counters.stripe_findings;
+        counters.slot_custody_conflicts += r.counters.slot_custody_conflicts;
+        counters.unrecovered_appenders += r.counters.unrecovered_appenders;
         counters.scrub_blocks_scanned += r.counters.scrub_blocks_scanned;
         counters.scrub_bytes_scanned += r.counters.scrub_bytes_scanned;
         counters.scrub_aead_verified += r.counters.scrub_aead_verified;
@@ -2171,6 +2253,8 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     dst.tenant_overlap_findings += fin.tenant_overlap_findings;
     dst.shared_index_drift += fin.shared_index_drift;
     dst.stripe_findings += fin.stripe_findings;
+    dst.slot_custody_conflicts += fin.slot_custody_conflicts;
+    dst.unrecovered_appenders += fin.unrecovered_appenders;
     // **The inode plane's counters are the union of the ADMITTED shards
     // and this finalize** (KD-PV-16, §5.8.2 F4 — the premise that the
     // plane "exists only here" is what that decision retires). The two
@@ -2919,6 +3003,8 @@ fn fold_worker_counters(dst: &mut FsckCounters, src: &FsckCounters) {
     dst.tenant_overlap_findings += src.tenant_overlap_findings;
     dst.shared_index_drift += src.shared_index_drift;
     dst.stripe_findings += src.stripe_findings;
+    dst.slot_custody_conflicts += src.slot_custody_conflicts;
+    dst.unrecovered_appenders += src.unrecovered_appenders;
     dst.scrub_blocks_scanned += src.scrub_blocks_scanned;
     dst.scrub_bytes_scanned += src.scrub_bytes_scanned;
     dst.scrub_aead_verified += src.scrub_aead_verified;
@@ -4250,6 +4336,49 @@ impl C17Shape {
     }
 }
 
+/// C14 / C15 nomination (design-symmetric-metadata §5.8.5, PR 10): per
+/// meta volume, the backend's slot custody census — every `Live` page's
+/// `Live` slot entries against tree 0's `(g, lessee)` (C14) and every
+/// `Live` / `Recovering` page whose identity volume 0's death ledger
+/// names, with a ring window or leased slots (C15). Empty on a flat
+/// volume and on an unpartitioned forest (no directory page but the
+/// mount's own). The ledger is volume 0's tree 0; a set whose volume 0
+/// is not mounted judges C14 alone.
+async fn evaluate_c14_c15(ctx: &FsckCtx, suspects: &mut Vec<Suspect>) {
+    let vol0 = ctx.meta.volumes.first();
+    for (vol, kv) in ctx.meta.volumes.iter().enumerate() {
+        match kv.slot_custody_census(vol0).await {
+            Ok(census) => {
+                for (slot, a, b) in census.conflicts {
+                    suspects.push(Suspect {
+                        kind: SuspectKind::C14SlotCustodyConflict {
+                            vol,
+                            slot,
+                            appender_a: a,
+                            appender_b: b,
+                        },
+                    });
+                }
+                for (appender, identity, window_entries) in census.unrecovered {
+                    suspects.push(Suspect {
+                        kind: SuspectKind::C15UnrecoveredAppender {
+                            vol,
+                            appender,
+                            node_token: identity.node_token,
+                            mount_slot: identity.mount_slot,
+                            window_entries,
+                        },
+                    });
+                }
+            }
+            Err(e) => log::warn!(
+                "fsck C14/C15: slot custody census failed on vol {vol}: {e} (no verdict \
+                 recorded — the classes are skipped for this volume, never guessed)"
+            ),
+        }
+    }
+}
+
 /// One directory's stripe map as the marker census saw it.
 #[derive(Default, Debug)]
 struct C17Map {
@@ -4470,6 +4599,26 @@ impl C17Fresh {
             }
         }
     }
+}
+
+/// Foreign appender ring windows this open did NOT replay, summed over
+/// the set's meta volumes (design-symmetric-metadata §5.8.5, PR 10) —
+/// the inode plane's completeness gate on a forest. 0 on every flat
+/// volume and every solo forest.
+async fn foreign_windows_pending(ctx: &FsckCtx) -> u64 {
+    let mut total = 0u64;
+    for (vol, kv) in ctx.meta.volumes.iter().enumerate() {
+        match kv.foreign_windows_pending().await {
+            Ok(n) => total += n,
+            Err(e) => {
+                // Unreadable = unknown = pending: the plane takes no
+                // verdict over a window it cannot rule out.
+                log::warn!("fsck inode plane: reading vol {vol}'s appender directory failed: {e}");
+                total += 1;
+            }
+        }
+    }
+    total
 }
 
 /// One owner's tree-7 record count, paged (`block_map_range`, the same
@@ -5296,6 +5445,11 @@ async fn recheck_suspects(
     > = HashMap::new();
     // C17's fresh view, ONCE for the pass (the same law; PR 7b Issue 14).
     let mut c17_fresh: Option<Option<C17Fresh>> = None;
+    // C14 / C15's fresh custody census, ONCE per meta volume (the same
+    // law): a recovery the ledger poll ran since the nomination clears
+    // its C15 suspect here.
+    let mut c1415_fresh: HashMap<usize, Option<crate::meta_backend::kv::backend::CustodyCensus>> =
+        HashMap::new();
     for s in pending {
         if opts.cancel.load(Ordering::Relaxed) {
             break;
@@ -5682,6 +5836,99 @@ async fn recheck_suspects(
                         stripe: shape.stripe(),
                         shape: shape.label().to_string(),
                         name: shape.name(),
+                    }),
+                })
+            }
+
+            SuspectKind::C14SlotCustodyConflict {
+                vol,
+                slot,
+                appender_a,
+                appender_b,
+            } => {
+                let fresh = match c1415_fresh.entry(*vol) {
+                    std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        let kv = &ctx.meta.volumes[*vol];
+                        v.insert(kv.slot_custody_census(ctx.meta.volumes.first()).await.ok())
+                    }
+                };
+                let still = fresh.as_ref().is_some_and(|c| {
+                    c.conflicts.iter().any(|(s, a, b)| {
+                        *s == *slot
+                            && ((*a == *appender_a && *b == *appender_b)
+                                || (*a == *appender_b && *b == *appender_a))
+                    })
+                });
+                if !still {
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                counters.slot_custody_conflicts += 1;
+                Some(FsckFinding {
+                    class: "C14".to_string(),
+                    object: format!("vol{vol}/slot{slot}"),
+                    evidence: format!(
+                        "slot custody conflict: forest slot {slot} is attested Live by appender \
+                         {appender_a}'s page and held by appender {appender_b} (a second Live \
+                         page, or tree 0's lease) at the same generation, stable across two \
+                         censuses — a shape no grant or release writes. The mount REFUSES on \
+                         it; the remedy is the operator's attestation: `squeezefs appender \
+                         clear <sqmeta-uri> <id>` for the page that is dead"
+                    ),
+                    identity: Some(FindingId::C14SlotCustodyConflict {
+                        vol: *vol,
+                        slot: *slot,
+                        appender_a: *appender_a,
+                        appender_b: *appender_b,
+                    }),
+                })
+            }
+            SuspectKind::C15UnrecoveredAppender {
+                vol,
+                appender,
+                node_token,
+                mount_slot,
+                window_entries,
+            } => {
+                let fresh = match c1415_fresh.entry(*vol) {
+                    std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        let kv = &ctx.meta.volumes[*vol];
+                        v.insert(kv.slot_custody_census(ctx.meta.volumes.first()).await.ok())
+                    }
+                };
+                let still = fresh.as_ref().is_some_and(|c| {
+                    c.unrecovered.iter().any(|(id, ident, _)| {
+                        *id == *appender
+                            && ident.node_token == *node_token
+                            && ident.mount_slot == *mount_slot
+                    })
+                });
+                if !still {
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                counters.unrecovered_appenders += 1;
+                Some(FsckFinding {
+                    class: "C15".to_string(),
+                    object: format!("vol{vol}/appender{appender}"),
+                    evidence: format!(
+                        "un-recovered appender: appender {appender}'s page (node {node_token:#018x}, \
+                         mount slot {mount_slot:#x}) is Live or Recovering while volume 0's death \
+                         ledger names its identity dead, with {window_entries} acked entries in \
+                         its ring window or slots still leased to it, stable across two censuses. \
+                         The §5.9 recovery replays the window into its slot trees, records every \
+                         leaf's tail, unleases its slots and returns its grant — the volume's \
+                         manager runs it at its ledger poll and the mount path runs it before \
+                         serving"
+                    ),
+                    identity: Some(FindingId::C15UnrecoveredAppender {
+                        vol: *vol,
+                        appender: *appender,
+                        node_token: *node_token,
+                        mount_slot: *mount_slot,
+                        window_entries: *window_entries,
                     }),
                 })
             }
@@ -6754,6 +7001,10 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.shared_index_drift, Ordering::Relaxed);
     m.fsck_stripe_findings
         .fetch_add(c.stripe_findings, Ordering::Relaxed);
+    m.fsck_slot_custody_conflicts
+        .fetch_add(c.slot_custody_conflicts, Ordering::Relaxed);
+    m.fsck_unrecovered_appenders
+        .fetch_add(c.unrecovered_appenders, Ordering::Relaxed);
     m.fsck_findings.fetch_add(c.findings, Ordering::Relaxed);
     m.fsck_scan_secs.store(c.scan_secs, Ordering::Relaxed);
     m.scrub_blocks_scanned
@@ -7309,6 +7560,37 @@ fn planned_action(id: &FindingId) -> (&'static str, String) {
                  REPORT-ONLY (the C8 posture): the map and the stripes are the durable \
                  homes of one directory's names, and restating one from the other would \
                  erase the evidence of which side lied (design-symmetric-metadata §5.6.5)"
+            ),
+        ),
+
+        FindingId::C14SlotCustodyConflict {
+            vol,
+            slot,
+            appender_a,
+            appender_b,
+        } => (
+            "report-only",
+            format!(
+                "slot {slot} of vol{vol} attested by appenders {appender_a} and {appender_b} at \
+                 once is REPORT-ONLY: which page is dead is the operator's attestation — \
+                 `squeezefs appender clear <sqmeta-uri> <id>` writes the death record and marks \
+                 the page Recovering, and the next mount recovers it (design-symmetric-metadata \
+                 §5.8.5 / §6.2)"
+            ),
+        ),
+        FindingId::C15UnrecoveredAppender {
+            vol,
+            appender,
+            window_entries,
+            ..
+        } => (
+            "recover-dead-appender",
+            format!(
+                "run the §5.9 recovery of appender {appender} on vol{vol} ({window_entries} \
+                 acked entries in its ring window): preempt its registrant, replay the window \
+                 into its slot trees, flush, record every leaf's tail, unlease its slots in \
+                 tree 0, return its grant, mark the page Recovered — online on the volume's \
+                 manager; an offline run names the mount path, which recovers before serving"
             ),
         ),
     }
@@ -7945,6 +8227,104 @@ pub async fn repair(
                         &mut out,
                         f,
                         format!("returning extent {extent} of appender {appender} failed: {e}"),
+                    ),
+                }
+                continue;
+            }
+            // ------------------------------------ C14 slot custody conflict
+            //
+            // Report-only by design (§5.8.5): the census cannot know
+            // which of two Live attestations is the dead one — that is
+            // the operator's attestation, `squeezefs appender clear`.
+            FindingId::C14SlotCustodyConflict {
+                vol,
+                slot,
+                appender_a,
+                appender_b,
+            } => {
+                refuse(
+                    &mut out,
+                    f,
+                    format!(
+                        "slot {slot} of vol{vol} is attested by appenders {appender_a} and \
+                         {appender_b} at once: reported, never auto-repaired — which page is \
+                         dead is the operator's attestation (`squeezefs appender clear \
+                         <sqmeta-uri> <id>`); the mount refuses until it is given"
+                    ),
+                );
+                continue;
+            }
+            // ------------------------------------ C15 un-recovered appender
+            //
+            // Verify-before-repair is the recovery's own: it re-reads the
+            // ledger and the page under the volume's SMO serialization
+            // and acts on a Live/Recovering page of a ledgered identity
+            // only. Online = this mount is the volume's manager (the
+            // recovery is the manager's act — a non-manager answers no
+            // region); offline runs name the mount path, which recovers
+            // before serving.
+            FindingId::C15UnrecoveredAppender { vol, appender, .. } => {
+                let Some(kv) = ctx.meta.volumes.get(*vol) else {
+                    refuse(&mut out, f, format!("meta volume {vol} is not mounted"));
+                    continue;
+                };
+                if !online {
+                    refuse(
+                        &mut out,
+                        f,
+                        format!(
+                            "appender {appender} of vol{vol} is recovered by the volume's \
+                             MANAGER: the next writer mount recovers it before serving (the \
+                             mount-path gate), or the live manager's ledger poll does — an \
+                             offline probe holds no ring and no lease to recover under"
+                        ),
+                    );
+                    continue;
+                }
+                let Some(vol0) = ctx.meta.volumes.first() else {
+                    refuse(&mut out, f, "the set has no volume 0".to_string());
+                    continue;
+                };
+                let Ok(ordinal) = u16::try_from(*vol) else {
+                    refuse(
+                        &mut out,
+                        f,
+                        format!("meta volume ordinal {vol} is out of range"),
+                    );
+                    continue;
+                };
+                match kv.recover_dead_appenders(vol0, ordinal).await {
+                    Ok(rep) if rep.recovered.iter().any(|r| r.appender_id == *appender) => {
+                        crate::fuse_client::METRICS
+                            .fsck_repair_class_c15
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        apply_ok(
+                            &mut out,
+                            f,
+                            "recover-dead-appender",
+                            format!(
+                                "appender {appender}'s window replayed into its slot trees, \
+                                 its slots unleased in tree 0, its grant returned, the page \
+                                 Recovered"
+                            ),
+                        );
+                    }
+                    Ok(rep) => refuse(
+                        &mut out,
+                        f,
+                        format!(
+                            "appender {appender} of vol{vol} was not recovered by this mount \
+                             ({} recovered, {} deferred): it is no longer a ledgered Live / \
+                             Recovering page, this mount is not the volume's manager, or its \
+                             recovery is deferred to the successor — re-run detection",
+                            rep.recovered.len(),
+                            rep.deferred
+                        ),
+                    ),
+                    Err(e) => refuse(
+                        &mut out,
+                        f,
+                        format!("recovering appender {appender} of vol{vol} failed: {e}"),
                     ),
                 }
                 continue;
@@ -9362,6 +9742,21 @@ pub async fn run_offline_repair(
         }
     }
     result
+}
+
+/// The offline body over a set the CALLER opened (a probe or a guarded
+/// writer) and releases — the harness form of [`run_offline`] /
+/// [`run_offline_repair`], which add the live-client preflight, the open
+/// and the release around it. A crashed holder's `writer_claim` stays
+/// heartbeat-fresh for the TTL, so a contract judging a set right after a
+/// kill reaches the census through this door with the probe it holds.
+pub async fn run_offline_over(
+    routed: &Arc<RoutedMetaBackend>,
+    meta_lvs: &[String],
+    opts: &FsckOptions,
+    repair_opts: Option<&RepairOptions>,
+) -> Result<FsckReport> {
+    run_offline_body(routed, meta_lvs, opts, repair_opts).await
 }
 
 async fn run_offline_body(

@@ -18,6 +18,7 @@
 mod common;
 
 use common::sym::*;
+use squeezefs::fsck::FindingId;
 use squeezefs::meta_backend::kv::alloc_lease;
 use squeezefs::meta_backend::kv::appender::{read_directory, AppenderIdentity, AppenderState};
 use squeezefs::meta_backend::kv::backend::recovery::{
@@ -1275,11 +1276,80 @@ async fn a_c14_conflict_is_reported_refused_and_cleared_by_the_attestation() {
         Err(m) => assert!(m.contains("custody conflict"), "{m}"),
         Ok(_) => panic!("a C14 conflict was admitted"),
     }
+    // fsck C14 (the probe): ONE finding, report-only, naming the remedy.
+    {
+        let report = fsck_probe(&uris).await;
+        assert_eq!(report.counters.slot_custody_conflicts, 1, "{report:?}");
+        assert_eq!(report.counters.unrecovered_appenders, 0);
+        let c14: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.class == "C14")
+            .collect();
+        assert_eq!(c14.len(), 1, "{:?}", report.findings);
+        match &c14[0].identity {
+            Some(FindingId::C14SlotCustodyConflict {
+                vol: 0, slot: 4, ..
+            }) => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            c14[0].evidence.contains("appender clear"),
+            "{}",
+            c14[0].evidence
+        );
+    }
     // The remedy: attest the forging page dead.
     let path = std::path::Path::new(&uris[0]);
     match KvMetaBackend::appender_clear(path, path, 2).await {
         Ok(recovery::AppenderClearOutcome::Cleared { .. }) => {}
         other => panic!("{other:?}"),
+    }
+    // fsck C15 (the probe): the ledgered Recovering page is ONE finding
+    // whose plan is the recovery; an OFFLINE apply refuses naming the
+    // mount path (a probe holds no ring and no lease to recover under).
+    {
+        let report = fsck_probe(&uris).await;
+        assert_eq!(report.counters.slot_custody_conflicts, 0, "{report:?}");
+        assert_eq!(report.counters.unrecovered_appenders, 1, "{report:?}");
+        let c15: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.class == "C15")
+            .collect();
+        assert_eq!(c15.len(), 1, "{:?}", report.findings);
+        match &c15[0].identity {
+            Some(FindingId::C15UnrecoveredAppender {
+                vol: 0,
+                appender: 2,
+                node_token,
+                mount_slot,
+                ..
+            }) => assert_eq!((*node_token, *mount_slot), (y.node_token, y.mount_slot)),
+            other => panic!("{other:?}"),
+        }
+        for apply in [false, true] {
+            let ropts = squeezefs::fsck::RepairOptions {
+                apply,
+                quarantine_dir: Some(dir.path().join("quarantine")),
+                multi_owner: false,
+            };
+            let rep = fsck_probe_with(&uris, Some(&ropts)).await;
+            let repair = rep.repair.expect("repair ran");
+            let planned: Vec<_> = repair.planned.iter().filter(|a| a.class == "C15").collect();
+            assert_eq!(planned.len(), 1, "{repair:?}");
+            assert_eq!(planned[0].action, "recover-dead-appender");
+            if apply {
+                assert!(repair.applied.iter().all(|a| a.class != "C15"));
+                let refused = repair
+                    .refused
+                    .iter()
+                    .find(|a| a.class == "C15")
+                    .expect("the offline apply refuses");
+                assert!(refused.detail.contains("mount"), "{}", refused.detail);
+            }
+        }
+        park_gate::test_reset();
     }
     let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();
     let vol = Arc::clone(&routed.volumes[0]);
@@ -1312,5 +1382,39 @@ async fn a_c14_conflict_is_reported_refused_and_cleared_by_the_attestation() {
     }
     assert_eq!(vol.appender_stats().unwrap().manager_verb_refusals, 0);
     shutdown(&routed).await;
+    drop(vol);
+    drop(routed);
+    // Recovered: both classes read 0 and the set is clean.
+    let report = fsck_probe(&uris).await;
+    assert_eq!(report.counters.slot_custody_conflicts, 0);
+    assert_eq!(report.counters.unrecovered_appenders, 0);
+    assert!(!report.has_findings(), "{:?}", report.findings);
     reset_process_state();
+}
+
+/// The offline fsck over a probe THIS harness opens (the `fsck_clean`
+/// walk with the findings kept): right after a kill the dead holder's
+/// `writer_claim` is heartbeat-fresh for the TTL and `run_offline`'s
+/// live-client preflight refuses by design, so the census is reached
+/// through `run_offline_over` with the probe held here.
+async fn fsck_probe_with(
+    uris: &[String],
+    repair: Option<&squeezefs::fsck::RepairOptions>,
+) -> squeezefs::fsck::FsckReport {
+    let mut opts = squeezefs::fsck::FsckOptions::offline();
+    opts.settle = std::time::Duration::from_millis(10);
+    let probe = squeezefs::meta_backend::open_probe_routed_meta_set(uris)
+        .await
+        .expect("probe opens");
+    let report = squeezefs::fsck::run_offline_over(&probe, uris, &opts, repair)
+        .await
+        .expect("offline fsck runs");
+    for v in &probe.volumes {
+        v.shutdown().await.unwrap();
+    }
+    report
+}
+
+async fn fsck_probe(uris: &[String]) -> squeezefs::fsck::FsckReport {
+    fsck_probe_with(uris, None).await
 }

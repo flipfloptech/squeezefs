@@ -328,6 +328,52 @@ impl KvMetaBackend {
                 == appender::ManagerLease::Vacant
     }
 
+    /// This volume's published recovery bound ([`appender_recovery_bound_ms`])
+    /// over the LARGEST ring a dead region of it can hold — PR 2 caps every
+    /// declared ring at the fixed ring's length, so the manager's own ring
+    /// is the ceiling — at the cadence in force. 0 on a bit-17-absent
+    /// volume (no region can die there).
+    pub fn appender_recovery_bound_ms(&self) -> u64 {
+        if self.appenders.is_none() {
+            return 0;
+        }
+        appender_recovery_bound_ms(
+            Self::fixed_ring_extent(&self.sb).len,
+            u64::from(self.sb.node_size),
+            crate::meta_backend::resolve_flush_interval_ms(),
+        )
+    }
+
+    /// FOREIGN appender ring windows this open did not replay — every
+    /// `Live` / `Recovering` page that is not one of this mount's regions
+    /// (a same-node page is own residue, replayed at open) with entries
+    /// past its `ledger_tail_seq`. fsck's inode plane takes no verdict
+    /// while one exists: a cross-owner create's dentry rides the parent
+    /// holder's ring, so the referenced set is incomplete over it. 0 on
+    /// a flat volume, a solo forest, and a set whose peers are checkpointed.
+    pub async fn foreign_windows_pending(&self) -> std::result::Result<u64, KvError> {
+        let Some(set) = self.appenders.as_ref() else {
+            return Ok(0);
+        };
+        let entries = read_directory(&self.path, &self.sb).await?;
+        let mut pending = 0u64;
+        for e in &entries {
+            let Some(page) = e.page.as_ref() else {
+                continue;
+            };
+            if !matches!(page.state, AppenderState::Live | AppenderState::Recovering) {
+                continue;
+            }
+            if set.region(e.appender_id).is_some() || same_mount(&page.identity, &set.identity) {
+                continue;
+            }
+            if self.window_entries_of(page).await? > 0 {
+                pending += 1;
+            }
+        }
+        Ok(pending)
+    }
+
     /// **The C14 / C15 census** (§5.8.5) of this volume against the ledger
     /// on `vol0` (`None` = no ledger reachable: C15 is empty, C14 stands).
     pub async fn slot_custody_census(
@@ -368,14 +414,23 @@ impl KvMetaBackend {
                 if gens.get(&slot).is_some_and(|(g, _)| *g > se.g) {
                     continue; // stale residue, never a conflict
                 }
+                // One finding per UNORDERED pair per slot: a second Live
+                // page and tree 0's lease usually name the same two
+                // appenders, and the census reports the conflict once.
+                let mut note = |a: u32, b: u32| {
+                    let pair = (slot, a.min(b), a.max(b));
+                    if !out.conflicts.contains(&pair) {
+                        out.conflicts.push(pair);
+                    }
+                };
                 if let Some(other) = live_by_slot.insert(slot, e.appender_id) {
                     if other != e.appender_id {
-                        out.conflicts.push((slot, other, e.appender_id));
+                        note(other, e.appender_id);
                     }
                 }
                 if let Some((_, Some(lessee))) = gens.get(&slot) {
                     if *lessee != e.appender_id {
-                        out.conflicts.push((slot, e.appender_id, *lessee));
+                        note(e.appender_id, *lessee);
                     }
                 }
             }

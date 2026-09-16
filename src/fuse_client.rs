@@ -8762,6 +8762,24 @@ pub struct Metrics {
     /// every `slot_state` record it hosts; 1 on a FLAT volume (one shard,
     /// every slot its own).
     pub fsck_inode_plane_slots_covered: Align64<AtomicU64>,
+    // ---- PR 10 (design-symmetric-metadata §5.8.5 / §11 — C14 / C15).
+    // Appended at the END (level-5 rule 3).
+    /// C14 (slot custody conflict): confirmed findings — one forest slot
+    /// attested `Live` on two appender pages, or on a page AND leased to
+    /// another appender in tree 0 at the same generation. **Must stay 0**:
+    /// no grant or release writes the shape; the mount refuses on it and
+    /// `squeezefs appender clear` is the remedy. Report-only.
+    pub fsck_slot_custody_conflicts: Align64<AtomicU64>,
+    /// C15 (un-recovered appender): confirmed findings — a `Live` /
+    /// `Recovering` page whose identity volume 0's death ledger names,
+    /// with acked entries in its ring window or slots still leased to
+    /// it. 0 once every manager's ledger poll has acted; the mount path
+    /// recovers before serving.
+    pub fsck_unrecovered_appenders: Align64<AtomicU64>,
+    /// `fsck_repair_classC15` — C15 repairs APPLIED (the §5.9 recovery
+    /// run by the online repair on the volume's manager). 0 on every
+    /// flat volume and every unarmed mount.
+    pub fsck_repair_class_c15: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -14389,6 +14407,95 @@ impl SqueezefsFilesystem {
                 // findings` (C17) rides the fsck family.
                 for (k, v) in crate::meta_backend::dir_stripe::stats_json() {
                     metrics.insert(k, v);
+                }
+
+                // THE RECOVERY FAMILY (design-symmetric-metadata §5.9 /
+                // §5.8.5 / §11 — PR 10, dark): `appender_recoveries` = dead
+                // regions this mount recovered as a manager (closure with
+                // PR 8's ledger: `dead_members_acted ≡ recorded × regions
+                // held`); `appender_recovery_phase_ns` exact-sum `preempt /
+                // read / replay / flush / tails / tree0 / total`;
+                // `appender_recovery_bound_ms` the DERIVED time-to-reclaim
+                // bound (ring bytes ÷ entry size × fold cost + the leaf
+                // loads + the landing ceiling) the measured `total` is read
+                // against; `recovery_full_tail_scan_bytes` = leaf bytes the
+                // non-PR tail recorder read (0 under a device fence: the
+                // preempt is the fence); `appender_recovery_preempts` = PR
+                // registrant keys preempted; `recovered_regions_released` =
+                // `Recovered` pages returned to `Free` once no allocation
+                // lease named them; `appender_clear_runs` = the operator's
+                // attestations; `recovery_ledger_polls` = the managers'
+                // projections of volume 0's ledger;
+                // `recovery_intents_rolled_forward` = a dead initiator's
+                // open cross-owner intents completed after its recovery.
+                // C14 / C15 beside them: `fsck_slot_custody_conflicts`
+                // MUST STAY 0 (report-only, the mount refuses on it);
+                // `fsck_unrecovered_appenders` reads 0 once every ledgered
+                // death has been acted on; `fsck_repair_classC15` = online
+                // recoveries the repair ran. Every one 0 on an unarmed or
+                // bit-17-absent mount by construction.
+                {
+                    let r = meta_kv::backend::recovery_stats();
+                    metrics.insert(
+                        "appender_recoveries".into(),
+                        serde_json::json!(r.recoveries),
+                    );
+                    metrics.insert(
+                        "appender_recovery_phase_ns".into(),
+                        serde_json::json!({
+                            "preempt": r.phase_ns[0],
+                            "read": r.phase_ns[1],
+                            "replay": r.phase_ns[2],
+                            "flush": r.phase_ns[3],
+                            "tails": r.phase_ns[4],
+                            "tree0": r.phase_ns[5],
+                            "total": r.phase_ns[6],
+                        }),
+                    );
+                    metrics.insert(
+                        "appender_recovery_bound_ms".into(),
+                        per_volume(&|be| be.appender_recovery_bound_ms()),
+                    );
+                    metrics.insert(
+                        "recovery_full_tail_scan_bytes".into(),
+                        serde_json::json!(r.full_tail_scan_bytes),
+                    );
+                    metrics.insert(
+                        "appender_recovery_preempts".into(),
+                        serde_json::json!(r.preempts),
+                    );
+                    metrics.insert(
+                        "recovered_regions_released".into(),
+                        serde_json::json!(r.regions_released),
+                    );
+                    metrics.insert(
+                        "appender_clear_runs".into(),
+                        serde_json::json!(r.clear_runs),
+                    );
+                    metrics.insert(
+                        "recovery_ledger_polls".into(),
+                        serde_json::json!(r.ledger_polls),
+                    );
+                    metrics.insert(
+                        "recovery_intents_rolled_forward".into(),
+                        serde_json::json!(r.intents_rolled_forward),
+                    );
+                    metrics.insert(
+                        "fsck_slot_custody_conflicts".into(),
+                        serde_json::json!(METRICS
+                            .fsck_slot_custody_conflicts
+                            .load(Ordering::Relaxed)),
+                    );
+                    metrics.insert(
+                        "fsck_unrecovered_appenders".into(),
+                        serde_json::json!(METRICS
+                            .fsck_unrecovered_appenders
+                            .load(Ordering::Relaxed)),
+                    );
+                    metrics.insert(
+                        "fsck_repair_classC15".into(),
+                        serde_json::json!(METRICS.fsck_repair_class_c15.load(Ordering::Relaxed)),
+                    );
                 }
                 // LEAF-MERGE finalized (§4.6a (c)/(e)): `interior_merges`
                 // = the level-≥1 subset of `node_merges` (cross-parent

@@ -436,7 +436,7 @@ async fn an_unledgered_live_page_is_never_recovered_and_an_unledgered_recovering
     drop(vol);
     drop(routed);
     // Plant the unledgered Recovering shape.
-    restamp_page_state(&uris[0], 1, AppenderState::Recovering).await;
+    rewrite_page(&uris[0], 1, |p| p.state = AppenderState::Recovering).await;
     let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();
     match mount_path_custody_gate(&routed).await {
         Err(KvError::Corrupt(m)) => {
@@ -452,27 +452,6 @@ async fn an_unledgered_live_page_is_never_recovered_and_an_unledgered_recovering
     assert_eq!(census.recovering_unledgered.len(), 1);
     shutdown(&routed).await;
     reset_process_state();
-}
-
-/// Re-stamp appender `id`'s page STATE (the census fixture).
-async fn restamp_page_state(uri: &str, id: u32, state: AppenderState) {
-    use squeezefs::meta_backend::kv::appender::write_page;
-    use squeezefs::meta_backend::kv::superblock::{classify_volume, VolumeFormat};
-    let path = std::path::Path::new(uri);
-    let VolumeFormat::V3(sb) = classify_volume(path).await.unwrap() else {
-        panic!("v3");
-    };
-    let entries = read_directory(path, &sb).await.unwrap();
-    let e = entries.iter().find(|e| e.appender_id == id).unwrap();
-    let mut page = e.page.clone().unwrap();
-    page.state = state;
-    for off in e.dir_offsets {
-        page.generation += 1;
-        write_page(path, off, page.encode().unwrap()).await.unwrap();
-    }
-    squeezefs::uring_fs::fdatasync(path.to_path_buf())
-        .await
-        .unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -1111,6 +1090,227 @@ async fn a_manager_that_released_its_role_under_the_vol0_rule_stops_heartbeating
     vol0.guard_heartbeat().await;
     assert!(vol0.read_writer_claim().await.unwrap().ts > t0);
     assert!(!vol0.manager_role_released());
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
+// ---------------------------------------------------------------------------
+// §6.2 — `squeezefs appender clear`, the attested offline remedy
+// ---------------------------------------------------------------------------
+
+/// The `claim clear` law for an appender page: a live-mounted volume
+/// refuses; a fresh heartbeat of the appender's node refuses (it may be
+/// alive); this node's own residue refuses (the next mount recovers it
+/// itself); otherwise the attestation writes the death record to volume
+/// 0's ledger and marks the page `Recovering`, and the next mount's gate
+/// recovers the window before serving — the operator's path for a death
+/// the membership plane never recorded, and C14's remedy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn appender_clear_refuses_a_live_lease_and_attests_a_dead_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, shared) = seeded_volume(dir.path(), SLOT_A).await;
+    let x = foreign(70);
+    let member = squeezefs::cowriter::node_member_id_of(x.node_token, x.mount_slot);
+    let files = kill_with_region_one_live(&uris, "1:4", &[(0, shared)], 5, x).await;
+    let path = std::path::Path::new(&uris[0]);
+    let clear = || KvMetaBackend::appender_clear(path, path, 1);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // (a) A fresh heartbeat of the appender's node: refused.
+    {
+        let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();
+        routed.volumes[0]
+            .setxattr_internal(
+                1,
+                &format!("client:{member}"),
+                format!("{{\"ts\":{now},\"pid\":7}}").as_bytes(),
+            )
+            .await
+            .unwrap();
+        // (b) A live-mounted volume: refused.
+        match clear().await {
+            Err(KvError::Busy(m)) => assert!(m.contains("live-mounted"), "{m}"),
+            other => panic!("cleared under a live mount: {other:?}"),
+        }
+        shutdown(&routed).await;
+    }
+    match clear().await {
+        Err(KvError::Busy(m)) => assert!(m.contains("heartbeat"), "{m}"),
+        other => panic!("cleared a heartbeating node: {other:?}"),
+    }
+    // (c) This node's own residue: refused (its own mount recovers it).
+    match KvMetaBackend::appender_clear(path, path, 0).await {
+        Ok(recovery::AppenderClearOutcome::NothingToClear) => {}
+        Err(KvError::Busy(m)) => assert!(m.contains("OWN residue"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    // (d) The heartbeat aged past the TTL: the attestation lands.
+    {
+        let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();
+        routed.volumes[0]
+            .setxattr_internal(
+                1,
+                &format!("client:{member}"),
+                format!("{{\"ts\":{},\"pid\":7}}", now - 3_600).as_bytes(),
+            )
+            .await
+            .unwrap();
+        shutdown(&routed).await;
+    }
+    let runs = recovery_stats().clear_runs;
+    match clear().await {
+        Ok(recovery::AppenderClearOutcome::Cleared {
+            identity,
+            was,
+            window_entries,
+        }) => {
+            assert_eq!(
+                (identity.node_token, identity.mount_slot),
+                (x.node_token, x.mount_slot)
+            );
+            assert_eq!(was, AppenderState::Live);
+            assert!(window_entries >= 1);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(recovery_stats().clear_runs, runs + 1);
+    // Idempotent: the page is Recovering now, the record present.
+    match clear().await {
+        Ok(recovery::AppenderClearOutcome::Cleared { was, .. }) => {
+            assert_eq!(was, AppenderState::Recovering)
+        }
+        other => panic!("{other:?}"),
+    }
+    // The next mount's gate recovers it before serving.
+    let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert!(vol.dead_member_record(&x).await.unwrap().is_some());
+    let rep = mount_path_custody_gate(&routed).await.unwrap();
+    assert_eq!(rep.recovered(), 1);
+    assert_all_resolve(&routed, shared, &files[0]).await;
+    assert_eq!(
+        page_state(&uris[0], &vol, 1).await,
+        Some(AppenderState::Recovered)
+    );
+    shutdown(&routed).await;
+    drop(vol);
+    drop(routed);
+    fsck_clean(&uris).await;
+    reset_process_state();
+}
+
+/// C14 (§5.8.5) meets its remedy: one slot attested `Live` on TWO dead
+/// pages at tree 0's `g` — the non-PR §5.8.2 class (iii) shape a zombie's
+/// page write can leave — is the slot custody conflict the census
+/// reports and the mount refuses at its arm; `appender clear` attests
+/// the forging page dead, and the next mount recovers what tree 0 leases
+/// to it while DROPPING the stale attestation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_c14_conflict_is_reported_refused_and_cleared_by_the_attestation() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    // Two seeded directories, two declared regions (slots 4 and 6).
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    let (d4, d6) = {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        let d4 = seed_dir_in_slot(&routed, 0, 4, "shared4").await;
+        let d6 = seed_dir_in_slot(&routed, 0, 6, "shared6").await;
+        for s in [4u32, 6] {
+            routed.volumes[0].release_slot_handover(0, s).await.unwrap();
+        }
+        shutdown(&routed).await;
+        (d4, d6)
+    };
+    let routed = open_under_retry(&uris, &Knobs::armed().partition("1:4;2:6"))
+        .await
+        .unwrap();
+    let venue = HoldersVenue::stand_up(&routed, &[1, 2]).await;
+    let mut files = Vec::new();
+    for (d, tag) in [(d4, "a"), (d6, "b")] {
+        for f in 0..3 {
+            let name = format!("{tag}{f}");
+            let ino = routed
+                .create(d, &name, libc::S_IFREG | 0o644, 1000, 1000)
+                .await
+                .unwrap()
+                .ino;
+            files.push((d, name, ino));
+        }
+    }
+    venue.tear_down();
+    drop(routed);
+    park_gate::test_reset();
+    let (x, y) = (foreign(80), foreign(81));
+    restamp_page_identity(&uris[0], 1, x).await;
+    // Y's page forged: it attests slot 4 (X's, routing slot 3) at X's g.
+    let x_entry = {
+        use squeezefs::meta_backend::kv::appender::read_directory;
+        use squeezefs::meta_backend::kv::superblock::{classify_volume, VolumeFormat};
+        let path = std::path::Path::new(&uris[0]);
+        let VolumeFormat::V3(sb) = classify_volume(path).await.unwrap() else {
+            panic!()
+        };
+        read_directory(path, &sb)
+            .await
+            .unwrap()
+            .iter()
+            .find(|e| e.appender_id == 1)
+            .and_then(|e| e.page.as_ref())
+            .and_then(|p| p.slots.iter().find(|s| s.slot == 3).copied())
+            .expect("X attests routing slot 3")
+    };
+    rewrite_page(&uris[0], 2, |p| {
+        p.identity = y;
+        p.slots.push(x_entry);
+        p.slots.sort_by_key(|s| s.slot);
+    })
+    .await;
+    // The census names the conflict; the mount refuses it at the arm.
+    match open_under_retry(&uris, &Knobs::armed()).await {
+        Err(m) => assert!(m.contains("custody conflict"), "{m}"),
+        Ok(_) => panic!("a C14 conflict was admitted"),
+    }
+    // The remedy: attest the forging page dead.
+    let path = std::path::Path::new(&uris[0]);
+    match KvMetaBackend::appender_clear(path, path, 2).await {
+        Ok(recovery::AppenderClearOutcome::Cleared { .. }) => {}
+        other => panic!("{other:?}"),
+    }
+    let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();
+    let vol = Arc::clone(&routed.volumes[0]);
+    let census = vol.slot_custody_census(Some(&vol)).await.unwrap();
+    assert!(
+        census.conflicts.is_empty(),
+        "a Recovering page attests nothing: {census:?}"
+    );
+    assert_eq!(census.unrecovered.len(), 1);
+    let stale_before = vol.slot_lease_stats().unwrap().stale_entries;
+    let rep = mount_path_custody_gate(&routed).await.unwrap();
+    assert_eq!(rep.recovered(), 1);
+    let r = &rep.per_volume[0].1.recovered[0];
+    assert_eq!(r.appender_id, 2);
+    assert_eq!(r.slots, vec![6], "tree 0 leased Y slot 6 alone");
+    assert_eq!(
+        r.stale_entries, 1,
+        "the forged slot-4 entry was dropped, not released"
+    );
+    assert!(vol.slot_lease_stats().unwrap().stale_entries > stale_before);
+    // X still leases slot 4 (a joined appender the ledger never named);
+    // Y's files resolve; X's too (its dentries ride its own live page's
+    // ring — served after ITS recovery, which nothing has asked for).
+    assert!(matches!(
+        tree0_state(&vol, 4).await,
+        Some(SlotState::Leased { appender_id: 1, .. })
+    ));
+    for (d, name, ino) in files.iter().filter(|(d, _, _)| *d == d6) {
+        assert_eq!(routed.lookup(*d, name).await.unwrap().ino, *ino);
+    }
+    assert_eq!(vol.appender_stats().unwrap().manager_verb_refusals, 0);
     shutdown(&routed).await;
     reset_process_state();
 }

@@ -310,15 +310,15 @@ pub async fn seed_dir_in_slot(
     ino
 }
 
-/// Re-stamp appender `id`'s page on `uri` with `identity` (the in-process
-/// fixture's "another NODE held this region": a page's identity is the
-/// only thing that distinguishes a foreign appender's residue from this
-/// node's own). Written to BOTH directory slots one generation apart —
-/// the newest valid image over the four page slots.
-pub async fn restamp_page_identity(
+/// Rewrite appender `id`'s newest page on `uri` through `edit` — written
+/// to BOTH directory slots one generation apart, so it is the newest
+/// valid image over the four page slots. The crash matrix's fixture for
+/// everything a page carries that the product never writes for a test:
+/// another node's identity, a state, a forged slot entry.
+pub async fn rewrite_page(
     uri: &str,
     id: u32,
-    identity: squeezefs::meta_backend::kv::appender::AppenderIdentity,
+    edit: impl FnOnce(&mut squeezefs::meta_backend::kv::appender::AppenderPage),
 ) {
     use squeezefs::meta_backend::kv::appender::{read_directory, write_page};
     use squeezefs::meta_backend::kv::superblock::{classify_volume, VolumeFormat};
@@ -332,7 +332,7 @@ pub async fn restamp_page_identity(
         .find(|e| e.appender_id == id)
         .expect("the appender's page");
     let mut page = e.page.clone().expect("a valid page");
-    page.identity = identity;
+    edit(&mut page);
     for off in e.dir_offsets {
         page.generation += 1;
         write_page(path, off, page.encode().unwrap())
@@ -342,6 +342,18 @@ pub async fn restamp_page_identity(
     squeezefs::uring_fs::fdatasync(path.to_path_buf())
         .await
         .expect("fdatasync");
+}
+
+/// Re-stamp appender `id`'s page on `uri` with `identity` (the in-process
+/// fixture's "another NODE held this region": a page's identity is the
+/// only thing that distinguishes a foreign appender's residue from this
+/// node's own).
+pub async fn restamp_page_identity(
+    uri: &str,
+    id: u32,
+    identity: squeezefs::meta_backend::kv::appender::AppenderIdentity,
+) {
+    rewrite_page(uri, id, |p| p.identity = identity).await;
 }
 
 /// The holders' venue (PR 6's `Holders`): the S8 owner service + the

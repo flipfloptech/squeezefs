@@ -2419,7 +2419,7 @@ async fn manager_vol0_unreachable_releases_the_role() {
 }
 
 // ---------------------------------------------------------------------------
-// §6.3 — the wire: PR 8's verbs, RecordDeath reserved
+// §6.3 — the wire: PR 8's verbs, RecordDeath (activated by PR 10)
 // ---------------------------------------------------------------------------
 
 const SECRET: &[u8] = b"sym-block-grant-tests-enroll-secret";
@@ -2436,9 +2436,10 @@ fn listener_cfg() -> squeezefs::cluster_wire::RpcListenerConfig {
 /// verb codes sit in the assigned range, and over the wire: a grant to a
 /// wire writer is served by the holder, a successor before `recovered:`
 /// is answered `Deferred` (the typed retry class), `RecordRecovered`
-/// lands idempotently, and `RecordDeath` is REFUSED naming PR 10.
+/// lands idempotently, and `RecordDeath` — PR 8's reservation — is
+/// SERVED since PR 10's driver (idempotent, the key carried).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_wire_serves_pr8s_verbs_and_record_death_is_reserved_for_pr10() {
+async fn the_wire_serves_pr8s_verbs_and_record_death() {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
@@ -2598,17 +2599,21 @@ async fn the_wire_serves_pr8s_verbs_and_record_death_is_reserved_for_pr10() {
         vol.appender_stats().unwrap().manager_verb_rejected,
         rejected_before + rejections
     );
-    // RecordDeath is RESERVED for PR 10's driver.
-    match client.record_death(succ, 1).await.unwrap() {
-        ManagerReply::Refused { reason } => assert!(reason.contains("PR 10"), "{reason}"),
-        other => panic!("{other:?}"),
-    }
+    // RecordDeath — PR 8's reservation, ACTIVATED by PR 10's driver: the
+    // wire writes the record (idempotent) carrying the registrant key the
+    // recovering managers preempt.
+    assert!(!client.record_death(succ, 1, 0x1234).await.unwrap());
     assert!(
+        client.record_death(succ, 1, 0x1234).await.unwrap(),
+        "already"
+    );
+    assert_eq!(
         vol.dead_member_record(&succ.into())
             .await
             .unwrap()
-            .is_none(),
-        "the wire wrote nothing"
+            .expect("the wire wrote the record")
+            .pr_key,
+        0x1234
     );
     drop(client);
     host.shutdown();

@@ -1664,8 +1664,13 @@ fn arb_pr8_call() -> impl Strategy<Value = ManagerCall> {
         }),
         (arb_wire_identity(), any::<u16>())
             .prop_map(|(member, vol)| ManagerCall::RecordRecovered { member, vol }),
-        (arb_wire_identity(), any::<u64>())
-            .prop_map(|(member, epoch)| ManagerCall::RecordDeath { member, epoch }),
+        (arb_wire_identity(), any::<u64>(), any::<u64>()).prop_map(|(member, epoch, pr_key)| {
+            ManagerCall::RecordDeath {
+                member,
+                epoch,
+                pr_key,
+            }
+        }),
     ]
 }
 
@@ -2081,8 +2086,14 @@ proptest! {
         future[0] = 2;
         prop_assert!(AllocLeaseRecord::decode(&future).is_err());
         prop_assert!(AllocLeaseRecord::decode(&img[..img.len() - 1]).is_err());
-        let d = DeadMemberRecord { epoch, ts_ms: ts };
+        // PR 10: the record carries the victim's registrant key; a PR-8
+        // image (no key) decodes with key 0 — total over both lengths.
+        let d = DeadMemberRecord { epoch, ts_ms: ts, pr_key: term };
         prop_assert_eq!(DeadMemberRecord::decode(&d.encode()).expect("decodes"), d);
+        let v1 = &d.encode()[..17];
+        let decoded_v1 = DeadMemberRecord::decode(v1).expect("a v1 image decodes");
+        prop_assert_eq!((decoded_v1.epoch, decoded_v1.ts_ms, decoded_v1.pr_key), (epoch, ts, 0));
+        prop_assert!(DeadMemberRecord::decode(&d.encode()[..16]).is_err());
         let r = RecoveredRecord { by_term: term, ts_ms: ts };
         prop_assert_eq!(RecoveredRecord::decode(&r.encode()).expect("decodes"), r);
     }

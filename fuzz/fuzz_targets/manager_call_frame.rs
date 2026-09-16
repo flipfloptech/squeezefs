@@ -230,7 +230,8 @@ fn check_service_edge(call: &ManagerCall, total_extents: u64, record_seed: &[u8]
 /// `ReturnBlocks` range names nothing outside a grant the ledger holds
 /// (refused, nothing cleared), an `AllocLeaseBitmap`'s extents are
 /// checked by the record codec (an empty or overflowing extent refuses),
-/// and `RecordDeath` is reserved (refused at the service). Pure over the
+/// and `RecordDeath`'s words (an identity, an epoch, a key — PR 10) size
+/// nothing and are screened against the owner's live census. Pure over the
 /// integers against a SMALL bitmap: nothing here allocates proportional
 /// to a frame integer.
 fn check_pr8_edge(call: &ManagerCall, total_extents: u64) {
@@ -538,6 +539,7 @@ enum ArbCall {
     RecordDeath {
         member: ArbIdentity,
         epoch: u64,
+        pr_key: u64,
     },
 }
 
@@ -699,9 +701,14 @@ impl From<ArbCall> for ManagerCall {
                 member: member.into(),
                 vol,
             },
-            ArbCall::RecordDeath { member, epoch } => ManagerCall::RecordDeath {
+            ArbCall::RecordDeath {
+                member,
+                epoch,
+                pr_key,
+            } => ManagerCall::RecordDeath {
                 member: member.into(),
                 epoch,
+                pr_key,
             },
         }
     }

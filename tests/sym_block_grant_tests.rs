@@ -788,7 +788,10 @@ async fn a_death_record_revokes_the_dead_writers_grants_into_the_quarantine() {
         );
         assert!(!c.overlaps(&g));
     }
-    assert!(alloc_lease::DEAD_MEMBERS_ACTED.load(Ordering::Relaxed) >= 1);
+    // The record's arm on a HOLDER counts on its own gauge (PR 10 review
+    // round 2, Issue 18 — `dead_members_acted` is the recovery driver's
+    // per-region closure).
+    assert!(alloc_lease::DEAD_MEMBERS_QUARANTINED.load(Ordering::Relaxed) >= 1);
     // The records' keys are the identity pair, and volume-qualified for
     // `recovered:`.
     assert_ne!(dead_member_key(&w), dead_member_key(&me));
@@ -2600,8 +2603,10 @@ async fn the_wire_serves_pr8s_verbs_and_record_death() {
         rejected_before + rejections
     );
     // RecordDeath — PR 8's reservation, ACTIVATED by PR 10's driver: the
-    // wire writes the record (idempotent) carrying the registrant key the
-    // recovering managers preempt.
+    // wire writes the record (idempotent). The KEY word is screened (PR
+    // 10 review round 2, Issue 7): no census here registered `succ`, so
+    // the wire's 0x1234 is UNVALIDATED and recorded as 0 — the tail scan
+    // is the fence; a key nobody registered never drives a preempt.
     assert!(!client.record_death(succ, 1, 0x1234).await.unwrap());
     assert!(
         client.record_death(succ, 1, 0x1234).await.unwrap(),
@@ -2613,7 +2618,7 @@ async fn the_wire_serves_pr8s_verbs_and_record_death() {
             .unwrap()
             .expect("the wire wrote the record")
             .pr_key,
-        0x1234
+        0
     );
     drop(client);
     host.shutdown();

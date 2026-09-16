@@ -16986,13 +16986,44 @@ impl KvMetaBackend {
                     last_written: l.last_written,
                     seq_floor: l.words.seq_floor,
                 },
-                None => super::slot_state::SlotState::Unleased {
-                    root: *root,
-                    cursor: 0,
-                    g: 0,
-                    slot_tree_extents: 0,
-                    last_written: 0,
-                    seq_floor: 0,
+                // No table entry: the record's own words are kept and only
+                // the root moves (PR 10 review round 2 — a slot whose tree
+                // opened AHEAD of tree 0 at the mount is re-published here
+                // before any lease plane knows it; the zero form regressed
+                // its release's `g` to 0). A `Leased` record without a
+                // table entry is never rewritten. The zero form is a slot
+                // tree 0 has no record for at all (PR 1–3's mint).
+                None => match forest
+                    .control()
+                    .lookup(&super::slot_state::slot_state_key(*slot))
+                    .await?
+                    .map(|v| super::slot_state::SlotState::decode(&v))
+                    .transpose()?
+                {
+                    Some(super::slot_state::SlotState::Unleased {
+                        cursor,
+                        g,
+                        slot_tree_extents,
+                        last_written,
+                        seq_floor,
+                        ..
+                    }) => super::slot_state::SlotState::Unleased {
+                        root: *root,
+                        cursor,
+                        g,
+                        slot_tree_extents,
+                        last_written,
+                        seq_floor,
+                    },
+                    Some(super::slot_state::SlotState::Leased { .. }) => continue,
+                    None => super::slot_state::SlotState::Unleased {
+                        root: *root,
+                        cursor: 0,
+                        g: 0,
+                        slot_tree_extents: 0,
+                        last_written: 0,
+                        seq_floor: 0,
+                    },
                 },
             };
             let value = state.encode();

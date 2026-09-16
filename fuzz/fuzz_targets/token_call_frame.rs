@@ -42,9 +42,10 @@ use libfuzzer_sys::fuzz_target;
 use squeezefs::data_grant::GrantRecord;
 use squeezefs::meta_backend::kv::record::{FOREST_SLOT_MAX, NATIVE_FOREST_SLOT};
 use squeezefs::meta_ship::token_plane::{
-    decode_reply, decode_request, encode_reply, encode_request, screen_custody_words, DirRecord,
-    TokenCall, TokenMode, TokenRecords, TokenReply, TokenReplyFrame, TokenRequestFrame, TokenWants,
-    WireAttrs, TOKEN_SCHEMA,
+    custody_object_mode_admissible, decode_reply, decode_request, encode_reply, encode_request,
+    screen_custody_words, DirRecord, TokenCall, TokenMode, TokenRecords, TokenReply,
+    TokenReplyFrame, TokenRequestFrame, TokenWants, WireAttrs, CUSTODY_MODE_REGULAR_FILE,
+    CUSTODY_MODE_TYPE_MASK, TOKEN_SCHEMA,
 };
 
 #[derive(Arbitrary, Debug)]
@@ -352,6 +353,16 @@ fuzz_target!(|data: &[u8]| {
         if let TokenCall::CustodyGrant { object, span, .. } = frame.call {
             let _ = screen_custody_words(object, span, &small_forest);
         }
+    }
+    // The screen's TYPE rule (the PR 7b rebase's seam (c)): total over
+    // every mode word; admits exactly S_IFREG — a directory (a striped
+    // directory, a stripe ino, a marker's target) is never a custody
+    // object.
+    if let Ok(mode) = u32::arbitrary(&mut u) {
+        assert_eq!(
+            custody_object_mode_admissible(mode),
+            (mode & CUSTODY_MODE_TYPE_MASK) == CUSTODY_MODE_REGULAR_FILE
+        );
     }
     if let (Ok(object), Ok(span)) = (
         u64::arbitrary(&mut u),

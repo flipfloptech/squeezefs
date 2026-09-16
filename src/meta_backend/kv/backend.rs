@@ -3245,15 +3245,18 @@ impl KvMetaBackend {
         Ok(plane)
     }
 
-    /// PR 9 (review round 2, Issue 3): does LOCAL key ino `object` have a
-    /// durable inode record on this volume? The `CustodyGrant` screen's
-    /// last clause — one leaf read (the grant's record read a moment later
-    /// hits the node cache) before the arbiter is handed the ino.
-    pub(crate) async fn token_records_exist(
+    /// PR 9 (review round 2, Issue 3): LOCAL key ino `object`'s durable
+    /// inode record's `mode` on this volume (`None` = no such object) —
+    /// the `CustodyGrant` screen's last two clauses in one leaf read (the
+    /// grant's record read a moment later hits the node cache): the record
+    /// exists, and it is a REGULAR FILE (the PR 7b rebase's seam (c): a
+    /// directory — a striped directory, any of its stripe inos, the
+    /// markers' targets — is never a custody object).
+    pub(crate) async fn token_record_mode(
         &self,
         object: Ino,
-    ) -> std::result::Result<bool, KvError> {
-        Ok(self.read_inode_value(object).await?.is_some())
+    ) -> std::result::Result<Option<u32>, KvError> {
+        Ok(self.read_inode_value(object).await?.map(|v| v.mode))
     }
 
     /// The holder's record read for ONE grant page (§5.7.1 — the grant

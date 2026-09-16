@@ -556,9 +556,16 @@ pub fn screen_custody_words(
 
 /// [`screen_custody_words`] bound to `volume`, then the DURABLE record:
 /// the object's inode record must exist (one leaf read — the grant reads
-/// it again a moment later through the node cache) before the arbiter is
-/// handed the GLOBAL ino (the key every write of the file takes in the
-/// lock table). `Err(reason)` = REJECTED, nothing acted.
+/// it again a moment later through the node cache) AND be a REGULAR FILE
+/// before the arbiter is handed the GLOBAL ino (the key every write of
+/// the file takes in the lock table). Write custody is the data plane's
+/// word — the FUSE layer acquires it for WRITE / truncate / fallocate /
+/// a dirty handle's flush and fsync, every one a file's op — so a
+/// directory is never a custody object: not a striped directory, not one
+/// of its stripe inos, not the targets of its reserved-name markers (the
+/// PR 7b rebase's seam (c)); a frame naming one is REJECTED like any
+/// wire word the durable state contradicts. `Err(reason)` = REJECTED,
+/// nothing acted.
 async fn screen_custody_object(
     volume: &KvMetaBackend,
     object: u64,
@@ -572,9 +579,15 @@ async fn screen_custody_object(
             || volume.slot_tree(forest_slot).is_some())
         .then_some(routing)
     })?;
-    match volume.token_records_exist(object).await {
-        Ok(true) => {}
-        Ok(false) => {
+    match volume.token_record_mode(object).await {
+        Ok(Some(mode)) if custody_object_mode_admissible(mode) => {}
+        Ok(Some(mode)) => {
+            return Err(format!(
+                "object {object:#x} is not a regular file (mode {mode:#o}) — a directory, a \
+                 stripe ino or a marker target is never a custody object"
+            ))
+        }
+        Ok(None) => {
             return Err(format!(
                 "object {object:#x} has no durable inode record on this volume"
             ))
@@ -587,6 +600,21 @@ async fn screen_custody_object(
         crate::dlm_slot::routing_width(),
     ))
 }
+
+/// **The custody screen's type rule** (pure — the fuzz target and the
+/// proptest mirror drive it): a custody object is a REGULAR FILE. Write
+/// custody guards a file's DMA; a directory takes none (its mutations are
+/// the metadata plane's 4a guards), so a frame naming one — a striped
+/// directory, a stripe ino, a marker's target — is the wire-word class
+/// the durable state refutes.
+pub fn custody_object_mode_admissible(mode: u32) -> bool {
+    (mode & CUSTODY_MODE_TYPE_MASK) == CUSTODY_MODE_REGULAR_FILE
+}
+
+/// `S_IFMT` / `S_IFREG` as the rule reads them — named here so the fuzz
+/// mirror (a workspace without `libc`) states the law in the same words.
+pub const CUSTODY_MODE_TYPE_MASK: u32 = libc::S_IFMT;
+pub const CUSTODY_MODE_REGULAR_FILE: u32 = libc::S_IFREG;
 
 /// The token CLIENTS this process's holder planes have served — every
 /// member id that reached a token verb. `free_grace`'s recall-gated free

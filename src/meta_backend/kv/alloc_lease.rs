@@ -2325,6 +2325,44 @@ pub async fn arm_symmetric_allocation(
                 loss.first()
             )));
         }
+        // The oracle's LEAK half at the (re-)hold (PR 10; §5.5.1 / §5.8.5):
+        // a SET bit that nothing references (derived-live ∪ durable) and
+        // no open grant names is a dead incarnation's — its granted-but-
+        // unminted tail, or a block minted and DMA'd whose publish never
+        // landed (the kill mid-write). The grant window is RAM, so no path
+        // ever returns those bits; the re-hold has nothing granted yet
+        // (the ledger starts empty) and the first hold was seeded from the
+        // truth, so every such bit here is a leak: CLEARED with its delta
+        // journaled in order (the terminal free's own path). Without it
+        // every crash leaked its window's remainder and fsck's C6 counted
+        // the population against the references for ever.
+        let granted = holding.ledger.open_ranges();
+        let in_grant = |b: u64| {
+            granted
+                .iter()
+                .any(|(s, l)| b >= *s && b < s.saturating_add(*l))
+        };
+        let leaks: Vec<u64> = holding
+            .bitmap
+            .set_blocks()
+            .into_iter()
+            .filter(|b| !(derived.is_set(*b) || durable.is_set(*b)) && !in_grant(*b))
+            .collect();
+        for b in &leaks {
+            holding.note_finish_free(*b);
+        }
+        if !leaks.is_empty() {
+            crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_RELEASED
+                .fetch_add(leaks.len() as u64, Ordering::Relaxed);
+            log::warn!(
+                "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): {} SET block(s) \
+                 referenced by nothing and granted to nobody — a dead incarnation's window \
+                 remainder — CLEARED at the hold (data_alloc_bitmap_leaks_released; first: {:?})",
+                alloc.volume_id(),
+                leaks.len(),
+                leaks.first()
+            );
+        }
         // The bitmap IS the free list from here: the local list's blocks
         // read CLEAR in the bitmap and return through carves; the flat
         // free-list-first pass is gated on the armed allocator.

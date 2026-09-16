@@ -14496,6 +14496,14 @@ impl SqueezefsFilesystem {
                         "fsck_repair_classC15".into(),
                         serde_json::json!(METRICS.fsck_repair_class_c15.load(Ordering::Relaxed)),
                     );
+                    // The bitmap oracle's LEAK half at the (re-)hold: a dead
+                    // incarnation's granted-but-unminted tail and its
+                    // minted-but-unpublished blocks, CLEARED (0 on a fleet
+                    // that never crashed; ≈ the window remainder per crash).
+                    metrics.insert(
+                        "data_alloc_bitmap_leaks_released".into(),
+                        load(&crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_RELEASED),
+                    );
                 }
                 // LEAF-MERGE finalized (§4.6a (c)/(e)): `interior_merges`
                 // = the level-≥1 subset of `node_merges` (cross-parent

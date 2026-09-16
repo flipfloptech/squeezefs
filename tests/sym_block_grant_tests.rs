@@ -2681,3 +2681,86 @@ fn the_data_bitmap_is_thirty_two_kib_per_tib() {
     );
     assert_eq!(squeezefs::data_alloc_bitmap::pages_for(DATA_BLOCKS), 1);
 }
+
+/// PR 10 (found by the `sym-crash` fleet leg's first round — PR 8's crash
+/// path): a crashed incarnation's grant window is RAM, so after a kill
+/// its granted-but-unminted tail and its minted-but-unpublished blocks
+/// stay SET in the allocation bitmap with no reference and no open grant
+/// — the bitmap oracle's LEAK half, which nothing released (every crash
+/// leaked its window's remainder for ever and fsck's C6 read the
+/// population against the references). The re-hold CLEARS every such bit
+/// with its delta journaled (`data_alloc_bitmap_leaks_released`), the
+/// oracle reads clean, and the successor's first mints land on the
+/// released blocks again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crashed_incarnations_window_remainder_is_released_at_the_rehold() {
+    use squeezefs::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_RELEASED;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let a = data_allocator(DATA_ID).await;
+    let uris = format_stamped_set(dir.path(), 1).await;
+    let routed = open_armed(&uris).await;
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&routed, &[Arc::clone(&a)])
+            .await
+            .unwrap(),
+        1
+    );
+    // Three armed mints — DMA'd, never published (no layout names them):
+    // the kill lands before their publish.
+    let mut minted = std::collections::BTreeSet::new();
+    for _ in 0..3 {
+        minted.insert(a.allocate_block().await.unwrap() / a.chunk_size());
+    }
+    let holding = alloc_lease::holding(DATA_TAG).expect("held");
+    let window = holding.bitmap.population();
+    assert!(window >= 3, "the carve SET the whole grant: {window}");
+    assert_eq!(holding.ledger.open_ranges().len(), 1, "one open grant");
+    // The kill: no shutdown, no leave — the process's holdings gone, the
+    // replayed deltas KEPT (the mount's own replay hands them to the
+    // re-hold, §5.5.1's headline row).
+    drop(holding);
+    drop(routed);
+    park_gate::test_reset();
+    test_clear_holdings();
+
+    // The successor incarnation derives from the layouts: nothing was
+    // published, so nothing is live; the re-hold folds the window's SET
+    // deltas onto the pages and then finds every one of them a LEAK.
+    let a2 = data_allocator(DATA_ID).await;
+    let routed = open_armed(&uris).await;
+    let leaks0 = DATA_ALLOC_BITMAP_LEAKS_RELEASED.load(Ordering::Relaxed);
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&routed, &[Arc::clone(&a2)])
+            .await
+            .unwrap(),
+        1
+    );
+    let h2 = alloc_lease::holding(DATA_TAG).expect("re-held");
+    assert_eq!(
+        DATA_ALLOC_BITMAP_LEAKS_RELEASED.load(Ordering::Relaxed) - leaks0,
+        window,
+        "every SET bit of the dead window was released"
+    );
+    assert_eq!(
+        h2.bitmap.population(),
+        0,
+        "nothing referenced, nothing granted, nothing SET"
+    );
+    let d = h2
+        .bitmap
+        .drift(&std::collections::BTreeSet::new(), &h2.ledger.open_ranges());
+    assert!(d.loss.is_empty() && d.leak.is_empty(), "{d:?}");
+    assert_eq!(DATA_ALLOC_BITMAP_DRIFT.load(Ordering::Relaxed), 0);
+    // Reallocatable again: the successor's first mint is one of the
+    // released blocks (lowest-first), SET once more by its carve.
+    let again = a2.allocate_block().await.unwrap() / a2.chunk_size();
+    assert!(
+        again < window,
+        "the first armed mint {again} lies past the released window {window}"
+    );
+    assert!(h2.bitmap.is_set(again));
+    shutdown(&routed).await;
+    reset_process_state();
+}

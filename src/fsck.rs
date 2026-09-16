@@ -5060,6 +5060,26 @@ fn evaluate_allocator_classes(
                 v.id,
                 lane_view.map(|(w, _)| w).unwrap_or(1),
             );
+        } else if !sharded && v.alloc.block_grant_armed() {
+            // Symmetric PR 8/10: on a grant-armed allocator the bitmap IS
+            // the free list — the local list was drained into it at the
+            // arm and a freed block returns only through a carve — so
+            // `highest − free_list` counts every bitmap-clear block below
+            // the cursor as used (the `sym-crash` leg read one crash's
+            // released window as a 386-vs-385 finding). The same
+            // single-writer-arithmetic doctrine as the lane partition's:
+            // C6 DECLINES here, counted on the same gauge; the armed
+            // plane's census is PR 8's bitmap oracle
+            // (`DataAllocBitmap::drift` — LOSS on `data_alloc_bitmap_drift`
+            // at every hold, LEAKS released at the hold), C8 the reference
+            // oracle.
+            counters.foreign_lane_exempted += 1;
+            log::info!(
+                "fsck C6: capacity census declined on '{}' — the allocator mints from ranged \
+                 block grants and its free list is the allocation bitmap (fsck_foreign_lane_\
+                 exempted; the bitmap oracle and C8 are the armed plane's census)",
+                v.id
+            );
         } else if !sharded {
             let inflight = v
                 .alloc

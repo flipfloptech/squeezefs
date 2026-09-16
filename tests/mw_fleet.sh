@@ -1377,7 +1377,7 @@ create_fleet() {
     [[ "$vms" =~ ^[0-9]+$ ]] || die "--vm=V needs a non-negative integer (got '$vms')"
     [ -z "$lease_ttl_ms" ] || [[ "$lease_ttl_ms" =~ ^[0-9]+$ ]] ||
         die "--lease-ttl-ms takes milliseconds (got '$lease_ttl_ms')"
-    [ -z "$lease_ttl_ms" ] || [ -n "$membership" ] || [ "$mw" = "1" ] ||
+    [ -z "$lease_ttl_ms" ] || [ -n "$membership" ] || [ "$mw" = "1" ] || [ "$symmetric" = "1" ] ||
         die "--lease-ttl-ms is the OWNER's membership lease knob — it needs --membership"
     [[ "$cowriters" =~ ^[0-9]+$ ]] || die "--cowriters=K needs a non-negative integer (got '$cowriters')"
     # PR 8 — the MULTI-OWNER shape's own preconditions, all before anything

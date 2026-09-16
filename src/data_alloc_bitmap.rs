@@ -978,6 +978,14 @@ pub fn population_scans() -> u64 {
 /// `data_alloc_bitmap_drift` — loss-direction findings (must-stay-0).
 pub static DATA_ALLOC_BITMAP_DRIFT: AtomicU64 = AtomicU64::new(0);
 
+/// `data_alloc_bitmap_leaks_released` — SET bits the (re-)hold found
+/// referenced by nothing and granted to nobody and CLEARED (the oracle's
+/// LEAK half, §5.5.1: a dead incarnation's granted-but-unminted tail and
+/// its minted-but-unpublished blocks after a kill — the grant's window
+/// is RAM, so nothing else returns them; PR 10 wired the release at the
+/// arm, found by the `sym-crash` fleet leg's C6).
+pub static DATA_ALLOC_BITMAP_LEAKS_RELEASED: AtomicU64 = AtomicU64::new(0);
+
 /// Count a drift verdict's loss half on the process gauge; returns it.
 pub fn note_drift(report: &DriftReport) -> u64 {
     let loss = report.loss.len() as u64;

@@ -2782,9 +2782,14 @@ wait_for_unmounted() { # mountpoint
 # The symmetric fleet's precondition (PR 10): `mw_fleet.sh create
 # --symmetric` recorded it, and the manager's stats say the plane is armed.
 require_symmetric() {
-    require_mw
+    # Not `require_mw`: a symmetric fleet arms the S6 plane (the death
+    # ledger's writer) and the D0 guard's WERO on a PR substrate without
+    # the S9 multi-writer opt-in — `--symmetric` alone is the shape.
+    require_membership
     [ "${SYMMETRIC:-0}" = "1" ] ||
         die "this leg needs a SYMMETRIC fleet — create it with: sudo tests/mw_fleet.sh create N=2 --symmetric [--lease-ttl-ms=15000]"
+    [ "$(stat_field 0 data_plane_fence_mode)" = "1" ] ||
+        die "member 0 data_plane_fence_mode != 1 — the S7 WERO hold is not standing (a non-PR substrate?)"
     [ "$(stat_all_eq 0 symmetric_meta 1)" = "1" ] ||
         die "member 0 symmetric_meta != 1 on every volume — the symmetric plane is not armed on the manager (SQUEEZEFS_SYMMETRIC_META=1 on a bit-17 set)"
     [ "$(stat_all_eq 0 manager_lease held)" = "1" ] ||
@@ -2838,6 +2843,10 @@ s7_kill_body() { # [sym]
         "$MWFLEET" mount 0 ||
             die "round $round: successor remount FAILED (the WERO takeover or the D0 ladder refused)"
         t_up="$(date +%s)"
+        # On the symmetric fleet the WERO hold is the allocation lease's
+        # (PR 8's arm, after the mount path's recovery gate), a beat after
+        # the mount verb returns — bounded wait, never a fixed sleep.
+        [ "$sym" = "sym" ] && wait_stat_eq 0 data_plane_fence_mode 1 30 "round $round: the successor's WERO hold"
         fm="$(stat_field 0 data_plane_fence_mode)"
         [ "$fm" = "1" ] || die "round $round: successor data_plane_fence_mode=$fm (want 1)"
         # The oracle: FULL online fsck (C1-C10, C8 ungated on this stamped

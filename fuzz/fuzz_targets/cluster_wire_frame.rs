@@ -34,7 +34,7 @@ use squeezefs::cluster_wire::{
 use squeezefs::meta_backend::crossvol_tx::{IntentRecord, XvOp, XvStep};
 use squeezefs::meta_ship::wire::{
     decode_reclaim, decode_reply, decode_request, encode_reclaim, encode_reply, encode_request,
-    MetaCall, MetaOp, MetaRequestFrame, META_SHIP_SCHEMA,
+    MetaCall, MetaOp, MetaOpResult, MetaReply, MetaReplyFrame, MetaRequestFrame, META_SHIP_SCHEMA,
 };
 
 /// `RpcFrame` carries no `PartialEq` (it holds nothing the daemon ever
@@ -320,6 +320,84 @@ fn check_xv_step_bodies(data: &[u8]) {
     assert_eq!(again.steps[0], step, "both codecs name the same step");
 }
 
+/// PR 7b: the striping verbs (`MetaVerb` 0x90–0x92) and their replies
+/// round-trip the S8 body, and the marker-name codec is total over the
+/// bytes (a NUL-led name that is not a marker decodes to `None`, never a
+/// panic; every stripe index the codec emits decodes back).
+fn check_dir_stripe_bodies(data: &[u8]) {
+    use squeezefs::meta_backend::dir_stripe::{
+        is_marker_name, parse_marker, stripe_marker_name, stripe_of, Marker, STRIPES_MAX,
+    };
+    // The marker codec over arbitrary bytes.
+    let _ = parse_marker(data);
+    if let Some(Marker::Stripe(i)) = parse_marker(data) {
+        assert!(i < STRIPES_MAX);
+        assert_eq!(stripe_marker_name(i).as_bytes(), data);
+    }
+    if let Ok(s) = std::str::from_utf8(data) {
+        if is_marker_name(s) {
+            assert_eq!(s.as_bytes().first(), Some(&0));
+        }
+    }
+    let mut u = Unstructured::new(data);
+    let (Ok(dir), Ok(index), Ok(supplier), Ok(scope)) = (
+        u64::arbitrary(&mut u),
+        u32::arbitrary(&mut u),
+        u32::arbitrary(&mut u),
+        u64::arbitrary(&mut u),
+    ) else {
+        return;
+    };
+    let _ = stripe_of(dir, (index % u32::from(STRIPES_MAX)) as u16 + 1);
+    let frame = MetaRequestFrame {
+        schema: META_SHIP_SCHEMA,
+        client_epoch: scope,
+        client_id: String::new(),
+        owner_term: 0,
+        ops: vec![
+            MetaOp {
+                id: 1,
+                call: MetaCall::SupplyStripeIno {
+                    dir,
+                    index,
+                    supplier,
+                },
+            },
+            MetaOp {
+                id: 2,
+                call: MetaCall::IsEmpty { dir, scope },
+            },
+            MetaOp {
+                id: 3,
+                call: MetaCall::DestroyStripe { stripe: dir },
+            },
+        ],
+    };
+    let wire = encode_request(&frame).expect("a striping frame encodes");
+    let back = decode_request(&wire).expect("re-decodes");
+    assert_eq!(back, frame, "the S8 body round-trips the striping verbs");
+    for reply in [
+        MetaReply::StripeInoSupplied { ino: dir },
+        MetaReply::Empty(scope & 1 == 1),
+    ] {
+        let f = MetaReplyFrame {
+            schema: META_SHIP_SCHEMA,
+            owner_term: 0,
+            results: vec![MetaOpResult {
+                id: 1,
+                outcome: Ok(reply),
+                grant: None,
+                delegs: Vec::new(),
+                revokes: Vec::new(),
+                revoke_fence: 0,
+                intent_grant: None,
+            }],
+        };
+        let wire = encode_reply(&f).expect("a striping reply encodes");
+        assert_eq!(decode_reply(&wire).expect("re-decodes"), f);
+    }
+}
+
 const CLASSES: [FrameClass; 3] = [FrameClass::Handshake, FrameClass::Control, FrameClass::Bulk];
 
 fuzz_target!(|data: &[u8]| {
@@ -366,6 +444,9 @@ fuzz_target!(|data: &[u8]| {
     // as the intent RECORD carries it — one step, both codecs, both
     // round-tripping and never disagreeing about the step.
     check_xv_step_bodies(data);
+
+    // --- arm 3c (PR 7b): the striping verbs + the marker-name codec ------
+    check_dir_stripe_bodies(data);
 
     // --- arm 4: the proof helpers -------------------------------------------
     if let Ok(s) = std::str::from_utf8(data) {

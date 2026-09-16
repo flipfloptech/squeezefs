@@ -704,6 +704,23 @@ pub enum FindingId {
         /// flag.
         flag_side: bool,
     },
+    /// C17 (design-symmetric-metadata §5.6.5 / §5.8.5, PR 7b): **stripe
+    /// consistency** — a stripe ino named by more than one directory's
+    /// map, a map naming a missing stripe (or an incomplete map under a
+    /// commit marker), a dentry in stripe `i` whose `hash % K ≠ i`, or a
+    /// name left in the directory's own tree after `migrating` cleared.
+    /// Report-only (the C8 posture); `fsck_stripe_findings` must stay 0.
+    C17StripeInconsistency {
+        /// The striped directory (0 when the shape names a stripe alone).
+        dir: u64,
+        /// The stripe involved (0 for a directory-only shape).
+        stripe: u64,
+        /// One of `multiply-mapped` / `missing-stripe` / `incomplete-map`
+        /// / `misrouted-name` / `unmigrated-name`.
+        shape: String,
+        /// The name involved, when the shape has one.
+        name: String,
+    },
 }
 
 /// The §10 `fsck_*` / `scrub_*` counter families, per run (the process
@@ -839,6 +856,10 @@ pub struct FsckCounters {
     /// index drift findings — report-only; the live
     /// `fsck_shared_index_drift` gauge. 0 on every healthy set.
     pub shared_index_drift: u64,
+    /// C17 (design-symmetric-metadata §5.6.5, PR 7b): confirmed stripe
+    /// inconsistencies — report-only; the live `fsck_stripe_findings`
+    /// gauge. 0 on every healthy striped tree.
+    pub stripe_findings: u64,
     pub findings: u64,
     pub scan_secs: u64,
     pub scrub_blocks_scanned: u64,
@@ -1499,6 +1520,8 @@ enum SuspectKind {
         block_index: u32,
         flag_side: bool,
     },
+    /// C17: stripe consistency (design-symmetric-metadata §5.6.5, PR 7b).
+    C17StripeInconsistency(C17Shape),
 }
 
 /// One referencer's device window on its block, as C12 judges it:
@@ -1833,6 +1856,12 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
             // blocks; unsharded like C8 (the ONE-walk census PR 1 owed is
             // still per kind, so the class rides C8's pass beside it).
             evaluate_c16(ctx, &mut suspects).await;
+            // C17 (design §5.6.5, PR 7b): stripe consistency over the
+            // marker census the ONE dentry walk carried — the striped
+            // population alone is re-read; unsharded like C8.
+            if let Some(refs) = referenced.as_ref() {
+                evaluate_c17(ctx, &refs.markers, &mut suspects).await;
+            }
         }
 
         // C9 (the class design-cow-kv-metadata §4.10a owed): live
@@ -2061,6 +2090,7 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         counters.crossing_exempted += r.counters.crossing_exempted;
         counters.tenant_overlap_findings += r.counters.tenant_overlap_findings;
         counters.shared_index_drift += r.counters.shared_index_drift;
+        counters.stripe_findings += r.counters.stripe_findings;
         counters.scrub_blocks_scanned += r.counters.scrub_blocks_scanned;
         counters.scrub_bytes_scanned += r.counters.scrub_bytes_scanned;
         counters.scrub_aead_verified += r.counters.scrub_aead_verified;
@@ -2140,6 +2170,7 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     // whole census; shards judge no tenant ranges).
     dst.tenant_overlap_findings += fin.tenant_overlap_findings;
     dst.shared_index_drift += fin.shared_index_drift;
+    dst.stripe_findings += fin.stripe_findings;
     // **The inode plane's counters are the union of the ADMITTED shards
     // and this finalize** (KD-PV-16, §5.8.2 F4 — the premise that the
     // plane "exists only here" is what that decision retires). The two
@@ -2887,6 +2918,7 @@ fn fold_worker_counters(dst: &mut FsckCounters, src: &FsckCounters) {
     dst.foreign_lane_exempted += src.foreign_lane_exempted;
     dst.tenant_overlap_findings += src.tenant_overlap_findings;
     dst.shared_index_drift += src.shared_index_drift;
+    dst.stripe_findings += src.stripe_findings;
     dst.scrub_blocks_scanned += src.scrub_blocks_scanned;
     dst.scrub_bytes_scanned += src.scrub_bytes_scanned;
     dst.scrub_aead_verified += src.scrub_aead_verified;
@@ -3461,6 +3493,11 @@ struct RefPass {
     /// Global ino → its distinct names, for the inos in the caller's
     /// collect set. Empty when nothing was collected.
     names: HashMap<u64, Vec<NameRef>>,
+    /// C17 (PR 7b, design §5.6.5): every stripe-map MARKER the pass saw —
+    /// `(volume, local parent, marker, child)` — bounded by `K + 2` per
+    /// striped directory. The ONE dentry walk carries the map census; the
+    /// class reads the striped population alone from it.
+    markers: Vec<(usize, u64, crate::meta_backend::dir_stripe::Marker, u64)>,
 }
 
 impl RefPass {
@@ -3519,6 +3556,7 @@ async fn build_referenced_inos(
         multi: HashMap::new(),
         multi_complete: true,
         names: HashMap::new(),
+        markers: Vec::new(),
     };
     let budget = c10_count_entry_budget();
     let mut indexed = 0u64;
@@ -3554,6 +3592,13 @@ async fn build_referenced_inos(
                 let Ok(d) = DentryValue::decode(v) else {
                     continue; // C1's business
                 };
+                // C17's census rides this walk: a NUL-led name is a
+                // stripe-map marker (no user name can start with NUL).
+                if let Some(m) = crate::meta_backend::dir_stripe::parse_marker(&d.name) {
+                    if let Ok((local_parent, _, _)) = decode_dentry_key(k) {
+                        pass.markers.push((vol_idx, local_parent, m, d.child_ino));
+                    }
+                }
                 if let Some((k, n)) = shard {
                     if d.child_ino % n as u64 != k as u64 {
                         continue;
@@ -4061,6 +4106,306 @@ async fn evaluate_c16(ctx: &FsckCtx, suspects: &mut Vec<Suspect>) {
                  (no verdict recorded — the class is skipped for this volume, never guessed)"
             ),
         }
+    }
+}
+
+/// One C17 shape as nominated and confirmed (design-symmetric-metadata
+/// §5.6.5): the four defects a striped directory can carry, each with the
+/// objects the confirm pass re-reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum C17Shape {
+    /// A stripe ino named by the maps of `dirs.len() ≥ 2` directories.
+    MultiplyMapped { stripe: u64, dirs: Vec<u64> },
+    /// A map's entry `index` names `stripe`, which has no inode record.
+    MissingStripe { dir: u64, index: u16, stripe: u64 },
+    /// A commit marker over fewer than two stripe entries, or a gap in the
+    /// entry indices.
+    IncompleteMap { dir: u64, entries: u16 },
+    /// A dentry in stripe `index` whose `hash54 % K` is `routes_to`.
+    MisroutedName {
+        dir: u64,
+        index: u16,
+        stripe: u64,
+        name: String,
+        routes_to: u16,
+    },
+    /// A non-marker name in the directory's OWN tree after `migrating`
+    /// cleared — unreachable (the fallback is gone) and, when its stripe
+    /// holds it too, a duplicate the migration's LWW rule left behind.
+    UnmigratedName {
+        dir: u64,
+        name: String,
+        in_stripe_too: bool,
+    },
+}
+
+impl C17Shape {
+    fn dir(&self) -> u64 {
+        match self {
+            Self::MultiplyMapped { dirs, .. } => dirs.first().copied().unwrap_or(0),
+            Self::MissingStripe { dir, .. }
+            | Self::IncompleteMap { dir, .. }
+            | Self::MisroutedName { dir, .. }
+            | Self::UnmigratedName { dir, .. } => *dir,
+        }
+    }
+    fn stripe(&self) -> u64 {
+        match self {
+            Self::MultiplyMapped { stripe, .. }
+            | Self::MissingStripe { stripe, .. }
+            | Self::MisroutedName { stripe, .. } => *stripe,
+            Self::IncompleteMap { .. } | Self::UnmigratedName { .. } => 0,
+        }
+    }
+    fn label(&self) -> &'static str {
+        match self {
+            Self::MultiplyMapped { .. } => "multiply-mapped",
+            Self::MissingStripe { .. } => "missing-stripe",
+            Self::IncompleteMap { .. } => "incomplete-map",
+            Self::MisroutedName { .. } => "misrouted-name",
+            Self::UnmigratedName { .. } => "unmigrated-name",
+        }
+    }
+    fn name(&self) -> String {
+        match self {
+            Self::MisroutedName { name, .. } | Self::UnmigratedName { name, .. } => name.clone(),
+            _ => String::new(),
+        }
+    }
+    fn evidence(&self) -> String {
+        match self {
+            Self::MultiplyMapped { stripe, dirs } => format!(
+                "stripe ino {stripe} is named by the stripe maps of {} directories ({dirs:?}) — \
+                 a stripe belongs to exactly one directory; a create routed through either \
+                 map lands in one tree both list",
+                dirs.len()
+            ),
+            Self::MissingStripe { dir, index, stripe } => format!(
+                "directory {dir}'s stripe map names ino {stripe} as stripe {index}, and no \
+                 inode record exists for it — every name hashing to that stripe is \
+                 unroutable"
+            ),
+            Self::IncompleteMap { dir, entries } => format!(
+                "directory {dir} carries the stripe COMMIT marker over {entries} contiguous \
+                 stripe entries (a live map has ≥ 2, indices 0..K) — the flip's intent \
+                 should have written the whole map before the marker"
+            ),
+            Self::MisroutedName {
+                dir,
+                index,
+                stripe,
+                name,
+                routes_to,
+            } => format!(
+                "name {name:?} sits in stripe {index} (ino {stripe}) of directory {dir} but \
+                 hashes to stripe {routes_to} — a lookup routes by the hash and never finds it"
+            ),
+            Self::UnmigratedName {
+                dir,
+                name,
+                in_stripe_too,
+            } => format!(
+                "name {name:?} is still in directory {dir}'s own tree after its migration \
+                 flag cleared{} — the fallback lookup is gone, so the entry is {}",
+                if *in_stripe_too {
+                    " (its stripe holds it too)"
+                } else {
+                    ""
+                },
+                if *in_stripe_too {
+                    "a duplicate the migration's LWW rule should have dropped"
+                } else {
+                    "unreachable"
+                }
+            ),
+        }
+    }
+}
+
+/// One directory's stripe map as the marker census saw it.
+#[derive(Default, Debug)]
+struct C17Map {
+    striped: bool,
+    migrating: bool,
+    entries: std::collections::BTreeMap<u16, u64>,
+}
+
+/// Fold the marker census into per-directory maps (`global dir → map`).
+fn c17_maps(
+    meta: &RoutedMetaBackend,
+    markers: &[(usize, u64, crate::meta_backend::dir_stripe::Marker, u64)],
+) -> std::collections::BTreeMap<u64, C17Map> {
+    use crate::meta_backend::dir_stripe::Marker;
+    let mut maps: std::collections::BTreeMap<u64, C17Map> = std::collections::BTreeMap::new();
+    for (vol, local_parent, marker, child) in markers {
+        let Some(dir) = meta.try_make_global_ino(*local_parent, *vol) else {
+            continue;
+        };
+        let m = maps.entry(dir).or_default();
+        match marker {
+            Marker::Striped => m.striped = true,
+            Marker::Migrating => m.migrating = true,
+            Marker::Stripe(i) => {
+                m.entries.insert(*i, *child);
+            }
+        }
+    }
+    maps
+}
+
+/// The names of `dir`'s OWN dentry tree, markers excluded (paged).
+async fn c17_own_names(meta: &RoutedMetaBackend, dir: u64) -> Vec<String> {
+    let (v, local) = meta.route_ino(dir);
+    let mut out = Vec::new();
+    let mut cursor = 0u64;
+    loop {
+        let Ok(page) = meta.volumes[v].readdir_page(local, cursor, SCAN_PAGE).await else {
+            break;
+        };
+        let Some((last, _)) = page.last() else { break };
+        cursor = *last;
+        out.extend(
+            page.into_iter()
+                .filter(|(_, e)| !crate::meta_backend::dir_stripe::is_marker_name(&e.name))
+                .map(|(_, e)| e.name),
+        );
+    }
+    out
+}
+
+/// Every C17 shape of ONE directory's map (the nomination's and the
+/// confirm pass's shared derivation): the map's completeness, each
+/// stripe's record and its names' routing, the directory's own leftover
+/// names after the flag cleared.
+async fn c17_shapes_of(meta: &RoutedMetaBackend, dir: u64, map: &C17Map) -> Vec<C17Shape> {
+    use crate::meta_backend::dir_stripe::stripe_of;
+    use crate::meta_backend::kv::record::dentry_name_hash54;
+    let mut out = Vec::new();
+    if !map.striped {
+        return out;
+    }
+    let k = map.entries.len();
+    let contiguous = map
+        .entries
+        .keys()
+        .enumerate()
+        .all(|(i, idx)| usize::from(*idx) == i);
+    if k < 2 || !contiguous {
+        out.push(C17Shape::IncompleteMap {
+            dir,
+            entries: k as u16,
+        });
+        return out;
+    }
+    let (dv, _) = meta.route_ino(dir);
+    let seed = meta.volumes[dv].superblock().hash_seed;
+    let k16 = k as u16;
+    let mut stripe_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (index, stripe) in &map.entries {
+        let (sv, slocal) = meta.route_ino(*stripe);
+        let record = meta.volumes[sv].read_inode_value_routed(slocal).await;
+        if !matches!(record, Ok(Some(_))) {
+            out.push(C17Shape::MissingStripe {
+                dir,
+                index: *index,
+                stripe: *stripe,
+            });
+            continue;
+        }
+        for name in c17_own_names(meta, *stripe).await {
+            let routes_to = stripe_of(dentry_name_hash54(name.as_bytes(), seed), k16);
+            if routes_to != *index {
+                out.push(C17Shape::MisroutedName {
+                    dir,
+                    index: *index,
+                    stripe: *stripe,
+                    name: name.clone(),
+                    routes_to,
+                });
+            }
+            stripe_names.insert(name);
+        }
+    }
+    if !map.migrating {
+        for name in c17_own_names(meta, dir).await {
+            out.push(C17Shape::UnmigratedName {
+                dir,
+                in_stripe_too: stripe_names.contains(&name),
+                name,
+            });
+        }
+    }
+    out
+}
+
+/// C17 nomination (design-symmetric-metadata §5.6.5 / §5.8.5, PR 7b):
+/// the marker census the ONE dentry walk carried, folded into maps; every
+/// striped directory's stripes re-read (the striped population alone);
+/// a stripe named by two maps found over the fold.
+async fn evaluate_c17(
+    ctx: &FsckCtx,
+    markers: &[(usize, u64, crate::meta_backend::dir_stripe::Marker, u64)],
+    suspects: &mut Vec<Suspect>,
+) {
+    let maps = c17_maps(&ctx.meta, markers);
+    let mut named_by: std::collections::BTreeMap<u64, Vec<u64>> = std::collections::BTreeMap::new();
+    for (dir, map) in &maps {
+        if !map.striped {
+            continue;
+        }
+        for stripe in map.entries.values() {
+            named_by.entry(*stripe).or_default().push(*dir);
+        }
+        for shape in c17_shapes_of(&ctx.meta, *dir, map).await {
+            suspects.push(Suspect {
+                kind: SuspectKind::C17StripeInconsistency(shape),
+            });
+        }
+    }
+    for (stripe, dirs) in named_by {
+        if dirs.len() >= 2 {
+            suspects.push(Suspect {
+                kind: SuspectKind::C17StripeInconsistency(C17Shape::MultiplyMapped {
+                    stripe,
+                    dirs,
+                }),
+            });
+        }
+    }
+}
+
+/// The C17 confirm read: does `shape` still hold on a FRESH read of its
+/// directory's markers and stripes (the settle window closed a flip or a
+/// migration that was mid-way at the nomination)?
+async fn c17_still_holds(ctx: &FsckCtx, shape: &C17Shape) -> bool {
+    // The fresh census: one dentry walk (bounded by the tree — the same
+    // walk the nomination rode), then the shape's own directory alone.
+    let (Some(fresh), _) = build_referenced_inos(
+        Arc::clone(&ctx.meta),
+        None,
+        0,
+        Arc::new(AtomicBool::new(false)),
+        None,
+    )
+    .await
+    else {
+        return false;
+    };
+    let maps = c17_maps(&ctx.meta, &fresh.markers);
+    match shape {
+        C17Shape::MultiplyMapped { stripe, .. } => {
+            maps.values()
+                .filter(|m| m.striped && m.entries.values().any(|s| s == stripe))
+                .count()
+                >= 2
+        }
+        other => match maps.get(&other.dir()) {
+            Some(map) => c17_shapes_of(&ctx.meta, other.dir(), map)
+                .await
+                .iter()
+                .any(|s| s == other),
+            None => false,
+        },
     }
 }
 
@@ -5242,6 +5587,32 @@ async fn recheck_suspects(
                     }),
                 })
             }
+            // C17 (PR 7b): verify-before-report — the shape must hold on a
+            // FRESH read of its directory's markers and stripes; a flip or
+            // a migration mid-way at the nomination has settled by now and
+            // clears.
+            SuspectKind::C17StripeInconsistency(shape) => {
+                if !c17_still_holds(ctx, shape).await {
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
+                counters.stripe_findings += 1;
+                Some(FsckFinding {
+                    class: "C17".to_string(),
+                    object: format!("dir{}/stripe{}", shape.dir(), shape.stripe()),
+                    evidence: format!(
+                        "{} — stable across two censuses. REPORT-ONLY (design-symmetric-\
+                         metadata §5.6.5, the C8 posture)",
+                        shape.evidence()
+                    ),
+                    identity: Some(FindingId::C17StripeInconsistency {
+                        dir: shape.dir(),
+                        stripe: shape.stripe(),
+                        shape: shape.label().to_string(),
+                        name: shape.name(),
+                    }),
+                })
+            }
             SuspectKind::C1Record {
                 vol,
                 tree,
@@ -6309,6 +6680,8 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.tenant_overlap_findings, Ordering::Relaxed);
     m.fsck_shared_index_drift
         .fetch_add(c.shared_index_drift, Ordering::Relaxed);
+    m.fsck_stripe_findings
+        .fetch_add(c.stripe_findings, Ordering::Relaxed);
     m.fsck_findings.fetch_add(c.findings, Ordering::Relaxed);
     m.fsck_scan_secs.store(c.scan_secs, Ordering::Relaxed);
     m.scrub_blocks_scanned
@@ -6853,6 +7226,17 @@ fn planned_action(id: &FindingId) -> (&'static str, String) {
                  {owner_ino}) is REPORT-ONLY: the SHARED flag and the index are two durable \
                  homes of one fact, and the block's next release re-derives the truth from \
                  both (design-symmetric-metadata §5.4.4's crash windows)"
+            ),
+        ),
+        FindingId::C17StripeInconsistency {
+            dir, stripe, shape, ..
+        } => (
+            "report-only",
+            format!(
+                "stripe inconsistency `{shape}` on directory {dir} / stripe {stripe} is \
+                 REPORT-ONLY (the C8 posture): the map and the stripes are the durable \
+                 homes of one directory's names, and restating one from the other would \
+                 erase the evidence of which side lied (design-symmetric-metadata §5.6.5)"
             ),
         ),
     }
@@ -7427,6 +7811,20 @@ pub async fn repair(
                         "shared-index drift on block {block_idx} of data volume {vol_tag:#x} \
                          is reported, never auto-repaired: the block's terminal free \
                          re-derives the truth from the flag and the index together"
+                    ),
+                );
+                continue;
+            }
+            // C17 is report-only by design (§5.6.5): the stripe map and
+            // the stripes' entries are the durable homes of one directory.
+            FindingId::C17StripeInconsistency { dir, shape, .. } => {
+                refuse(
+                    &mut out,
+                    f,
+                    format!(
+                        "stripe inconsistency `{shape}` on directory {dir} is reported, \
+                         never auto-repaired (design-symmetric-metadata §5.6.5 — the C8 \
+                         posture)"
                     ),
                 );
                 continue;

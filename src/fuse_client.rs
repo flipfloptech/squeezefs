@@ -6546,6 +6546,13 @@ pub struct Metrics {
     /// name, or an entry whose ino holds no SHARED reference. Report-only;
     /// 0 on every healthy set and on every mount without an armed forest.
     pub fsck_shared_index_drift: Align64<AtomicU64>,
+    /// `fsck_stripe_findings` — C17 (design-symmetric-metadata §5.6.5,
+    /// PR 7b): confirmed stripe inconsistencies of striped directories (a
+    /// stripe named by two maps, a map naming a missing stripe, a
+    /// misrouted name, a name left behind after the migration). Report-
+    /// only; MUST STAY 0 on every healthy striped tree and on every mount
+    /// without an armed forest.
+    pub fsck_stripe_findings: Align64<AtomicU64>,
     /// `fsck_repair_classC12` — **structurally 0**, the C8 posture: two
     /// overlapping tenants means at least one is wrong and nothing on the
     /// volume says which, so the class is reported and never
@@ -11801,6 +11808,7 @@ impl SqueezefsFilesystem {
                 // tripwire and the structurally-0 repair gauge (report-only).
                 "fsck_tenant_overlap_findings": METRICS.fsck_tenant_overlap_findings.load(Ordering::Relaxed),
                 "fsck_shared_index_drift": METRICS.fsck_shared_index_drift.load(Ordering::Relaxed),
+                "fsck_stripe_findings": METRICS.fsck_stripe_findings.load(Ordering::Relaxed),
                 "fsck_repair_classC12": METRICS.fsck_repair_class_c12.load(Ordering::Relaxed),
                 // Symmetric PR 3 — C13 (orphan image extent): returned
                 // grant extents; 0 on every flat volume.
@@ -14258,6 +14266,24 @@ impl SqueezefsFilesystem {
                 // set-wide directory-rename lease (§5.6.4). Every one 0 on
                 // an unarmed or bit-17-absent mount by construction.
                 for (k, v) in crate::meta_backend::crossvol_tx::cross_owner_stats_json() {
+                    metrics.insert(k, v);
+                }
+                // THE STRIPING FAMILY (design-symmetric-metadata §5.6.5 /
+                // §11 — PR 7b, dark): `dir_striped_dirs` (live striped
+                // directories this mount flipped, net of its rmdirs),
+                // `dir_stripe_flips`, `dir_stripe_supply_rpcs` (stripe inos
+                // asked of creators, the holder's own mints included),
+                // `dir_stripe_ships` (the rmdir protocol's IsEmpty /
+                // DestroyStripe verbs shipped to other holders),
+                // `dir_stripe_readdir_merges` (K-way pages served),
+                // `dir_stripe_migrated_names` (names re-homed lazily after a
+                // flip), `dir_stripe_time_batches` (fold persists onto the
+                // directory's record), `dir_stripe_dying_refusals` (inserts
+                // refused into a stripe an rmdir marked — the R26 closer,
+                // legal), `dir_stripe_rmdirs`. Every one 0 on an unarmed or
+                // bit-17-absent mount by construction; `fsck_stripe_
+                // findings` (C17) rides the fsck family.
+                for (k, v) in crate::meta_backend::dir_stripe::stats_json() {
                     metrics.insert(k, v);
                 }
                 // LEAF-MERGE finalized (§4.6a (c)/(e)): `interior_merges`
@@ -29358,6 +29384,24 @@ impl Filesystem for SqueezefsFilesystem {
         if posix_acl_xattr_name(name_str) {
             return Err(Errno::from(libc::EOPNOTSUPP));
         }
+        // Symmetric PR 7b (design §5.6.5): `user.squeezefs.stripes=<K>` is
+        // the explicit stripe FLIP of a directory — a COMMAND the holder
+        // executes, never a stored value; it rides ahead of the VAL-2
+        // screen (the reserved family stays closed to every other name).
+        if name_str == crate::meta_backend::dir_stripe::STRIPES_XATTR {
+            let backend = self
+                .meta_backend
+                .as_ref()
+                .expect("meta_backend must be configured");
+            let k = crate::meta_backend::dir_stripe::clamp_explicit_k(value);
+            backend
+                .stripe_dir(inode, k)
+                .await
+                .map_err(map_squeezefs_err)?;
+            self.bump_dir_generation(inode);
+            self.attr_cache.invalidate(&inode);
+            return Ok(());
+        }
         if !xattr_name_allowed(name_str) {
             METRICS
                 .fuse_reserved_xattr_refusals
@@ -29425,7 +29469,10 @@ impl Filesystem for SqueezefsFilesystem {
         if posix_acl_xattr_name(name_str) {
             return Err(Errno::from(libc::EOPNOTSUPP));
         }
-        if !xattr_name_allowed(name_str) {
+        // PR 7b: the stripe count of a striped directory (absent on an
+        // unstriped one — the command's read face).
+        let stripes_probe = name_str == crate::meta_backend::dir_stripe::STRIPES_XATTR;
+        if !stripes_probe && !xattr_name_allowed(name_str) {
             METRICS
                 .fuse_reserved_xattr_refusals
                 .fetch_add(1, Ordering::Relaxed);
@@ -29439,10 +29486,17 @@ impl Filesystem for SqueezefsFilesystem {
             .meta_backend
             .as_ref()
             .expect("meta_backend must be configured");
-        let value = backend
-            .getxattr(inode, name_str)
-            .await
-            .map_err(map_squeezefs_err)?;
+        let value = if stripes_probe {
+            backend
+                .stripes_xattr_value(inode)
+                .await
+                .map_err(map_squeezefs_err)?
+        } else {
+            backend
+                .getxattr(inode, name_str)
+                .await
+                .map_err(map_squeezefs_err)?
+        };
         if let Some(v) = value {
             if size == 0 {
                 return Ok(fuse3::raw::reply::ReplyXAttr::Size(v.len() as u32));
@@ -29580,6 +29634,9 @@ pub fn parse_custom_options(opts: &str) -> std::ffi::OsString {
                 || key == "negative_timeout"
                 || key == "dir_entry_timeout"
                 || key == "direct_device_true"
+                // PR 7b: the stripe-at-mkdir option (consumed into the
+                // routed metadata backend by `start_mount`).
+                || key == "stripe_dirs"
                 // L4 daemon-level tokens (KD-11 posture keys): consumed by
                 // `resolve_interception_posture`, never kernel options.
                 || key == "interception"
@@ -30133,6 +30190,19 @@ pub async fn start_mount<P: AsRef<Path>>(
                         "Hybrid I/O escape armed (-o direct_device_true): O_DIRECT reads \
                          bypass the read tiers — no serve, no admission (device-true \
                          diagnostic/measurement mode)"
+                    );
+                }
+                // Symmetric PR 7b (design §5.6.5): every `mkdir` under an
+                // ARMED volume stripes at creation (the DNE-2 default);
+                // daemon-level, stripped from the kernel option string.
+                if opt_trimmed == "stripe_dirs" {
+                    if let Some(mb) = fs.meta_backend.as_ref() {
+                        mb.set_stripe_dirs_at_mkdir(true);
+                    }
+                    info!(
+                        "Directory striping at mkdir armed (-o stripe_dirs): a new directory \
+                         on an armed symmetric volume is striped into \
+                         SQUEEZEFS_SYM_DIR_STRIPES stripes at creation"
                     );
                 }
                 let parts: Vec<&str> = opt_trimmed.splitn(2, '=').collect();

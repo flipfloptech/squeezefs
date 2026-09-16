@@ -1529,6 +1529,32 @@ impl MetaShipService {
                 crate::meta_backend::crossvol_tx::release_parked_guards(client_id, *scope);
                 Ok(MetaReply::Unit)
             }
+            // PR 7b — the striping verbs' served sides (design §5.6.5):
+            // every word judged against durable state at the served mount
+            // (`dir_stripe.rs`), nothing sized or unlocked by a peer's word.
+            MetaCall::SupplyStripeIno {
+                dir,
+                index,
+                supplier,
+            } => Ok(MetaReply::StripeInoSupplied {
+                ino: self
+                    .inner
+                    .serve_supply_stripe_ino(*dir, *index, *supplier)
+                    .await?,
+            }),
+            MetaCall::IsEmpty { dir, scope } => {
+                let scope = crate::meta_backend::crossvol_tx::GuardScope {
+                    client: client_id,
+                    scope: *scope,
+                };
+                Ok(MetaReply::Empty(
+                    self.inner.serve_is_empty_scoped(*dir, scope).await?,
+                ))
+            }
+            MetaCall::DestroyStripe { stripe } => {
+                self.inner.serve_destroy_stripe(*stripe).await?;
+                Ok(MetaReply::Unit)
+            }
         }
     }
 

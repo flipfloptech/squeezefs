@@ -1,5 +1,6 @@
 pub mod atomicity;
 pub mod crossvol_tx;
+pub mod dir_stripe;
 pub mod dlm;
 pub mod kv;
 pub mod reservation;
@@ -556,6 +557,9 @@ pub async fn open_routed_meta_set(paths: &[String]) -> Result<std::sync::Arc<Rou
             std::sync::Arc::downgrade(&routed),
             kv::checkpoint::checkpoint_landing_ceiling_derived(),
         );
+        // PR 7b: the striped directories' background flips and
+        // migrations hold the set through this handle.
+        routed.install_stripe_self();
     }
     // PR 8 (design-symmetric-metadata §5.5 / KD-SYM-15): under the armed
     // plane volume 0's manager is the maintenance coordinator and this
@@ -950,6 +954,10 @@ pub struct RoutedMetaBackend {
     /// performs and by every confirmed hop; sized by the dentry-cache
     /// derivation (one entry per hot directory — the `..` memo's law).
     dir_parents: moka::sync::Cache<u64, (u64, std::sync::Arc<str>), ahash::RandomState>,
+    /// Symmetric PR 7b (design §5.6.5): the striped directories' map
+    /// cache, the flip trigger's foreign-creator census and the in-flight
+    /// flips/migrations — inert on an unarmed mount.
+    dir_stripes: dir_stripe::StripeState,
 }
 
 /// The directory-parent memo's capacity: the dentry-cache derivation
@@ -1186,6 +1194,7 @@ impl RoutedMetaBackend {
             map_entry_decoder: std::sync::OnceLock::new(),
             map_run_stride: std::sync::OnceLock::new(),
             dir_parents: dir_parent_memo(),
+            dir_stripes: dir_stripe::StripeState::new(),
         }
     }
 
@@ -1248,6 +1257,7 @@ impl RoutedMetaBackend {
             map_entry_decoder: std::sync::OnceLock::new(),
             map_run_stride: std::sync::OnceLock::new(),
             dir_parents: dir_parent_memo(),
+            dir_stripes: dir_stripe::StripeState::new(),
         })
     }
 
@@ -1527,6 +1537,19 @@ impl RoutedMetaBackend {
         if let crossvol_tx::XvStep::InsertDentry { child, .. } = step {
             self.screen_insert_child(*child, tx_id).await?;
         }
+        // PR 7b (design §5.6.5): a served insert is one foreign ship into
+        // its parent — the flip trigger's census reads the CREATOR off the
+        // child's slot (the child was minted in the creator's rotor); a
+        // parent whose record reads `nlink 0` (a stripe marked dying by an
+        // `rmdir` in flight) refuses the insert `ENOENT` — R26's closer.
+        if let crossvol_tx::XvStep::InsertDentry { parent, child, .. } = step {
+            self.refuse_dying_stripe(*parent).await?;
+            if let Some(creator) = self.holder_of(*child) {
+                if Some(creator) != self.holder_of(*parent) {
+                    self.note_served_insert(*parent, creator);
+                }
+            }
+        }
         // Under a scope whose guards COVER the step's keys they are held
         // already (the initiator's, in this table or parked here) and the
         // apply takes nothing — a served step never parks on a 4a guard;
@@ -1799,6 +1822,14 @@ impl RoutedMetaBackend {
         parent: Ino,
         name: &str,
     ) -> Result<Option<(Ino, u32)>> {
+        // PR 7b: a striped parent's name is read where it lives (its
+        // stripe, or the directory's own tree while migrating).
+        if let Some(route) = self.stripe_route(parent, name).await? {
+            return Ok(self
+                .stripe_locate(parent, name, &route)
+                .await?
+                .map(|(_, child, ft)| (child, ft)));
+        }
         let (v_idx, local_parent) = self.route_ino(parent);
         self.check_volume_enabled(v_idx)?;
         self.find_dentry_routed(v_idx, local_parent, name).await
@@ -2732,6 +2763,19 @@ impl RoutedMetaBackend {
     /// (see [`Metadata::lookup`]'s implementation note on dropping the
     /// D-guard before the I-lock).
     pub async fn lookup_dentry(&self, parent: Ino, name: &str) -> Result<Option<(Ino, u32)>> {
+        // PR 7b: a striped parent's name is read where it lives.
+        if let Some(route) = self.stripe_route(parent, name).await? {
+            let (sv, slocal) = self.route_ino(route.stripe);
+            self.check_volume_enabled(sv)?;
+            let _guard = self.volumes[sv]
+                .dlm()
+                .lock_dentry_shared(slocal, name)
+                .await;
+            return Ok(self
+                .stripe_locate(parent, name, &route)
+                .await?
+                .map(|(_, child, ft)| (child, ft)));
+        }
         let (v_idx, local_parent) = self.route_ino(parent);
         self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx]
@@ -2751,9 +2795,22 @@ impl RoutedMetaBackend {
     pub async fn getattr_local(&self, ino: Ino) -> Result<Inode> {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
-        let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_ino).await;
-        let mut inode = self.read_inode_routed(v_idx, local_ino).await?;
+        let mut inode = {
+            let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_ino).await;
+            self.read_inode_routed(v_idx, local_ino).await?
+        };
         inode.ino = ino;
+        // PR 7b (design §5.6.5): a STRIPED directory's `nlink`/times are
+        // the fold over its stripes (each stripe's record is the exact
+        // delta its own inserts wrote); the persist runs after the shared
+        // guard dropped — it takes the exclusive one.
+        if inode.mode & libc::S_IFMT == libc::S_IFDIR && self.volumes[v_idx].slot_lease_armed() {
+            if let Some(map) = self.stripe_map(ino).await? {
+                if let Some((mtime, ctime)) = self.fold_striped_attrs(&mut inode, &map).await? {
+                    self.persist_striped_times(ino, mtime, ctime).await;
+                }
+            }
+        }
         Ok(inode)
     }
 
@@ -2811,14 +2868,32 @@ impl RoutedMetaBackend {
         offset: u64,
         max: usize,
     ) -> Result<Vec<(u64, DirEntry)>> {
+        // PR 7b (design §5.6.5): a STRIPED directory lists the K-way merge
+        // of its stripes (the stripe map's own marker entries never list —
+        // no user name can start with NUL); an ordinary directory on an
+        // armed volume drops a marker only if one exists, which the codec
+        // makes impossible outside a striped directory.
+        if self.volumes[v_idx].slot_lease_armed() {
+            let dir = self.make_global_ino(local_dir, v_idx);
+            if let Some(map) = self.stripe_map(dir).await? {
+                return self.readdir_striped_page(&map, offset, max).await;
+            }
+        }
         if !self
             .volumes
             .iter()
             .any(|v| v.filters_unpublished_children())
         {
-            return self.volumes[v_idx]
+            let page = self.volumes[v_idx]
                 .readdir_page(local_dir, offset, max)
-                .await;
+                .await?;
+            if self.volumes[v_idx].slot_lease_armed() {
+                return Ok(page
+                    .into_iter()
+                    .filter(|(_, e)| !dir_stripe::is_marker_name(&e.name))
+                    .collect());
+            }
+            return Ok(page);
         }
         let mut out: Vec<(u64, DirEntry)> = Vec::new();
         let mut cursor = offset;
@@ -2834,7 +2909,9 @@ impl RoutedMetaBackend {
             cursor = *last;
             for (cookie, entry) in page {
                 let (child_v, child_local) = self.route_ino(entry.ino);
-                if self.volumes[child_v].holds_slot_of(child_local) {
+                if self.volumes[child_v].holds_slot_of(child_local)
+                    && !dir_stripe::is_marker_name(&entry.name)
+                {
                     out.push((cookie, entry));
                 }
             }
@@ -2916,6 +2993,23 @@ impl RoutedMetaBackend {
         initial_size: u64,
         preset: Option<IntentCreatePreset>,
     ) -> Result<Inode> {
+        // PR 7b (design §5.6.5): a name in a STRIPED directory is keyed
+        // under its stripe — the op below runs verbatim with the stripe as
+        // its parent; the directory itself is the `..`/memo parent and the
+        // `-o stripe_dirs` mkdir's subject. A preset mint is an intent
+        // apply into the owner's own directory and never re-routes.
+        let logical_parent = parent;
+        let striped = match &preset {
+            Some(_) => None,
+            None => self.stripe_route(parent, name).await?,
+        };
+        let parent = match &striped {
+            Some(route) => {
+                self.stripe_insert_parent(logical_parent, name, route)
+                    .await?
+            }
+            None => parent,
+        };
         // S10 coherence law (rung 12) — BEFORE any 4a acquisition, like
         // the cutover gate below: a create mutates the parent's dentry
         // set + times, so every outstanding delegation on the parent is
@@ -2996,6 +3090,11 @@ impl RoutedMetaBackend {
             )
             .await?,
         );
+        // PR 7b: a stripe marked dying by an `rmdir` in flight refuses the
+        // insert under the guard the mark took (R26's closer).
+        if striped.is_some() {
+            self.refuse_dying_stripe(parent).await?;
+        }
 
         // The preset REPLAY tiebreak (under the dentry guard): a dentry
         // already naming exactly the preset ino is this op's own earlier
@@ -3028,9 +3127,15 @@ impl RoutedMetaBackend {
         // (an UPDATE-grant holder's flush, applied by the owner) is the
         // owner's own directory by construction and never reaches here.
         if preset.is_none() && self.spans_foreign_slot(&[parent]) {
-            return self
+            if striped.is_some() {
+                // The metanode cost, spread: one ship to the name's stripe
+                // holder (`dir_stripe_ships`).
+                dir_stripe::DIR_STRIPE_SHIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let made = self
                 .create_in_foreign_directory(
                     parent,
+                    logical_parent,
                     parent_v_idx,
                     local_parent,
                     target_v_idx,
@@ -3043,7 +3148,11 @@ impl RoutedMetaBackend {
                     initial_size,
                     guards,
                 )
-                .await;
+                .await?;
+            if is_dir {
+                self.stripe_at_mkdir(made.ino).await;
+            }
+            return Ok(made);
         }
 
         if parent_v_idx == target_v_idx {
@@ -3077,7 +3186,14 @@ impl RoutedMetaBackend {
             if out.is_err() {
                 self.mirror_volume_failure(target_v_idx);
             }
-            out
+            let made = out?;
+            if is_dir {
+                if striped.is_some() {
+                    self.note_dir_parent(made.ino, logical_parent, name);
+                }
+                self.stripe_at_mkdir(made.ino).await;
+            }
+            Ok(made)
         } else {
             // Cross-volume create: mutate each volume only through its own
             // whole-tx commit (mixed-volume sets stripe directories by
@@ -3163,7 +3279,8 @@ impl RoutedMetaBackend {
             out?;
 
             if is_dir_flag {
-                self.note_dir_parent(global_child_ino, parent, name);
+                self.note_dir_parent(global_child_ino, logical_parent, name);
+                self.stripe_at_mkdir(global_child_ino).await;
             }
             Ok(Inode {
                 ino: global_child_ino,
@@ -3187,6 +3304,7 @@ impl RoutedMetaBackend {
     async fn create_in_foreign_directory(
         &self,
         parent: Ino,
+        logical_parent: Ino,
         parent_v_idx: usize,
         local_parent: Ino,
         target_v_idx: usize,
@@ -3252,7 +3370,7 @@ impl RoutedMetaBackend {
             )
         })?;
         if is_dir {
-            self.note_dir_parent(child, parent, name);
+            self.note_dir_parent(child, logical_parent, name);
         }
         Ok(Inode {
             ino: child,
@@ -3855,7 +3973,14 @@ impl Metadata for RoutedMetaBackend {
             for (v_idx, vol) in self.volumes.iter().enumerate() {
                 self.check_volume_enabled(v_idx)?;
                 if let Some(local_p) = vol.find_parent_of_child(parent).await? {
-                    return self.getattr(self.make_global_ino(local_p, v_idx)).await;
+                    let mut p = self.make_global_ino(local_p, v_idx);
+                    // PR 7b: a child of a STRIPED directory is named by a
+                    // stripe; its `..` is the directory the stripe belongs
+                    // to (one more hop, on this reconnect path only).
+                    if let Some(dir) = self.stripe_parent_dir(p).await? {
+                        p = dir;
+                    }
+                    return self.getattr(p).await;
                 }
             }
             return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
@@ -3868,6 +3993,25 @@ impl Metadata for RoutedMetaBackend {
         // grant recalls it (forcing the holder's intent flush) BEFORE the
         // serve. One relaxed load when no delegation host is armed.
         crate::meta_ship::deleg_read_gate(self, parent).await;
+        // PR 7b: a striped directory's name lives in its stripe (or in the
+        // directory's own tree while the flip's migration runs — the
+        // stripe wins where both hold it).
+        if let Some(route) = self.stripe_route(parent, name).await? {
+            let (key_parent, _) = self.route_ino(route.stripe);
+            let _guard = self.volumes[key_parent]
+                .dlm()
+                .lock_dentry_shared(self.route_ino(route.stripe).1, name)
+                .await;
+            let found = self.stripe_locate(parent, name, &route).await?;
+            drop(_guard);
+            return match found {
+                Some((_, child, _)) => self.getattr(child).await,
+                None => Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Dentry {} not found in striped parent {}", name, parent),
+                ))),
+            };
+        }
         let (v_idx, local_parent) = self.route_ino(parent);
         self.check_volume_enabled(v_idx)?;
         // Drop the D-guard before getattr's I-lock (canonical class order —
@@ -3913,6 +4057,466 @@ impl Metadata for RoutedMetaBackend {
         if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[parent]) {
             return r.unlink(parent, name).await;
         }
+        // PR 7b (design §5.6.5): the name of a STRIPED parent is removed
+        // from its stripe; a striped CHILD directory is taken down by the
+        // rmdir protocol around the ordinary removal of its own name.
+        let (key_parent, striped_child) = self.stripe_unlink_prelude(parent, name).await?;
+        if let Some(map) = &striped_child {
+            self.prepare_striped_rmdir(map.dir, map).await?;
+        }
+        let out = self.unlink_at(key_parent, name).await;
+        if let Some(map) = &striped_child {
+            match &out {
+                Ok(_) => self.finish_striped_rmdir(map.dir, map).await,
+                Err(_) => self.abort_striped_rmdir(map).await,
+            }
+        }
+        out
+    }
+    async fn link(&self, ino: Ino, new_parent: Ino, new_name: &str) -> Result<Inode> {
+        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino, new_parent]) {
+            return r.link(ino, new_parent, new_name).await;
+        }
+        // PR 7b: a new name in a STRIPED directory is keyed under its
+        // stripe (the EEXIST screen covers both homes while migrating).
+        let new_parent = match self.stripe_route(new_parent, new_name).await? {
+            Some(route) => {
+                self.stripe_insert_parent(new_parent, new_name, &route)
+                    .await?
+            }
+            None => new_parent,
+        };
+        // S10 coherence law (rung 12): the parent's dentry set and the
+        // linked inode's nlink/ctime both mutate — both participants are
+        // parameters, so no resolution is needed.
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[new_parent, ino]).await;
+        // §5.5.2a cutover gate — both inos are parameters, both slots
+        // declared before any 4a acquisition (and before route
+        // derivation: a park can span a flip).
+        let _gate = self.slot_gate_enter(&[ino, new_parent]).await;
+        // §5.4a M1: `link`'s participants ARE named, so `route_verb` and
+        // the owner side already refuse a shipped one — this is the same
+        // refusal on the LOCAL path, where no router runs.
+        self.refuse_cross_owner_participants(crate::meta_ship::MetaVerb::Link, &[ino, new_parent])?;
+        let (parent_v_idx, local_parent) = self.route_ino(new_parent);
+        let (child_v_idx, local_child) = self.route_ino(ino);
+        self.check_volume_enabled(parent_v_idx)?;
+        self.check_volume_enabled(child_v_idx)?;
+
+        // Both inodes are parameters: acquire the full set upfront —
+        // per-volume sets in ascending volume order, each internally
+        // canonical (taking I{child} after the D-guard would be an ABBA
+        // inversion under stripe collisions).
+        let mut _guards = Vec::new();
+        let mut scope = None;
+        if child_v_idx == parent_v_idx {
+            _guards.extend(
+                self.lock_many_leased(
+                    parent_v_idx,
+                    &mut scope,
+                    &[
+                        (local_parent, dlm::LockMode::Exclusive),
+                        (local_child, dlm::LockMode::Exclusive),
+                    ],
+                    &[(local_parent, new_name, dlm::LockMode::Exclusive)],
+                )
+                .await?,
+            );
+        } else if child_v_idx < parent_v_idx {
+            _guards.extend(
+                self.lock_many_leased(
+                    child_v_idx,
+                    &mut scope,
+                    &[(local_child, dlm::LockMode::Exclusive)],
+                    &[],
+                )
+                .await?,
+            );
+            _guards.extend(
+                self.lock_many_leased(
+                    parent_v_idx,
+                    &mut scope,
+                    &[(local_parent, dlm::LockMode::Exclusive)],
+                    &[(local_parent, new_name, dlm::LockMode::Exclusive)],
+                )
+                .await?,
+            );
+        } else {
+            _guards.extend(
+                self.lock_many_leased(
+                    parent_v_idx,
+                    &mut scope,
+                    &[(local_parent, dlm::LockMode::Exclusive)],
+                    &[(local_parent, new_name, dlm::LockMode::Exclusive)],
+                )
+                .await?,
+            );
+            _guards.extend(
+                self.lock_many_leased(
+                    child_v_idx,
+                    &mut scope,
+                    &[(local_child, dlm::LockMode::Exclusive)],
+                    &[],
+                )
+                .await?,
+            );
+        }
+
+        // PR M7 (Issue 13): Arc the op's guard set for its commit(s).
+        let guards: std::sync::Arc<[dlm::DlmGuard]> = std::sync::Arc::from(_guards);
+
+        if self
+            .find_dentry_routed(parent_v_idx, local_parent, new_name)
+            .await?
+            .is_some()
+        {
+            return Err(crate::error::SqueezefsError::already_exists(
+                "File already exists",
+            ));
+        }
+
+        // Symmetric PR 6: a parent or inode in another appender's slot
+        // takes the transaction path below — its steps route by slot.
+        if parent_v_idx == child_v_idx && !self.spans_foreign_slot(&[ino, new_parent]) {
+            // Same-volume link: ONE whole-tx entry (nlink+1 + dentry +
+            // parent times).
+            let be = &self.volumes[parent_v_idx];
+            let out = be
+                .routed_link_local(local_parent, new_name, local_child, ino, guards)
+                .await;
+            if out.is_err() {
+                self.mirror_volume_failure(parent_v_idx);
+            }
+            out
+        } else {
+            // **Cross-volume link is ONE cross-volume transaction**
+            // (DUR-7, design-cow-kv-metadata §4.10a). The count half stays
+            // FIRST — it is the half that can refuse (EMLINK), and its
+            // crash residue (`nlink` up, no second name) is a leak rather
+            // than a dentry naming an under-counted inode — and it now
+            // carries the intent record, so the next mount rolls the
+            // second name forward instead of leaking the inode and every
+            // block it names forever.
+            let pre = self.volumes[child_v_idx]
+                .read_inode_value_routed(local_child)
+                .await?
+                .ok_or_else(|| {
+                    crate::error::SqueezefsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Inode {local_child} not found"),
+                    ))
+                })?;
+            if pre.nlink >= 65000 {
+                return Err(crate::error::SqueezefsError::too_many_links(
+                    "Too many links",
+                ));
+            }
+            let plan = crossvol_tx::XvPlan {
+                op: crossvol_tx::XvOp::Link,
+                steps: vec![
+                    crossvol_tx::XvStep::SetNlink {
+                        ino,
+                        pre: pre.nlink,
+                        post: pre.nlink + 1,
+                        ctime: Some(kv::backend::KvMetaBackend::now_ns_pub()),
+                    },
+                    crossvol_tx::XvStep::InsertDentry {
+                        parent: new_parent,
+                        name: new_name.to_string(),
+                        child: ino,
+                        ft_bits: pre.mode & libc::S_IFMT,
+                        parent_update: crossvol_tx::parent_update_code(
+                            kv::backend::RoutedParentUpdate::ExclusiveTimes,
+                        ),
+                    },
+                ],
+            };
+            let done = crossvol_tx::execute(self, &plan, guards).await?;
+            // The reply is served from the count step's post-image (the
+            // applier folds the pending-times refinement into it — the
+            // generic/423 monotone-ctime discipline).
+            let v = done.inode(0).cloned().unwrap_or(pre);
+            Ok(Inode {
+                ino,
+                mode: v.mode,
+                uid: v.uid,
+                gid: v.gid,
+                size: v.size,
+                nlink: v.nlink,
+                atime: v.atime,
+                mtime: v.mtime,
+                ctime: v.ctime,
+                flags: v.flags,
+                rdev: v.rdev,
+            })
+        }
+    }
+
+    async fn rename(
+        &self,
+        old_parent: Ino,
+        old_name: &str,
+        new_parent: Ino,
+        new_name: &str,
+        flags: u32,
+    ) -> Result<()> {
+        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[old_parent, new_parent]) {
+            return r
+                .rename(old_parent, old_name, new_parent, new_name, flags)
+                .await;
+        }
+        if flags & (libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE)
+            == (libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE)
+        {
+            return Err(crate::error::SqueezefsError::Io(
+                std::io::Error::from_raw_os_error(libc::EINVAL),
+            ));
+        }
+        // The VFS forbids WHITEOUT|EXCHANGE; a defensive refusal keeps
+        // the combination unrepresentable below (generic/631 family).
+        if flags & libc::RENAME_WHITEOUT != 0 && flags & libc::RENAME_EXCHANGE != 0 {
+            return Err(crate::error::SqueezefsError::Io(
+                std::io::Error::from_raw_os_error(libc::EINVAL),
+            ));
+        }
+        // PR 7b (design §5.6.5): each side of a rename under a STRIPED
+        // parent is keyed under that name's stripe — the source where the
+        // name IS (its stripe, or the directory's own tree while
+        // migrating), the destination where the new name GOES. A rename
+        // within one striped directory across two stripes is then the
+        // ordinary two-parent rename, cross-owner when the stripes'
+        // holders differ (PR 6's intent). The ancestry walk stays exact
+        // through a stripe: a stripe is a child of its directory in the
+        // dentry graph (the map entry names it), so a hop that lands on
+        // a stripe continues to the directory.
+        let old_parent = match self.stripe_route(old_parent, old_name).await? {
+            Some(route) => match self.stripe_locate(old_parent, old_name, &route).await? {
+                Some((home, _, _)) => home,
+                None => route.stripe,
+            },
+            None => old_parent,
+        };
+        let new_parent = match self.stripe_route(new_parent, new_name).await? {
+            Some(route) => match self.stripe_locate(new_parent, new_name, &route).await? {
+                // The destination exists (an overwrite / exchange): the
+                // op meets it where it is.
+                Some((home, _, _)) => home,
+                None => route.stripe,
+            },
+            None => new_parent,
+        };
+        // Symmetric PR 6 (§5.6.4): the set-wide directory-rename lease is
+        // the OUTERMOST lock — decided on an unguarded read of the
+        // source's type (the body re-decides under its guards and hands
+        // back `false` when the source became a directory meanwhile),
+        // held for the op, released on every exit. Unarmed: one bool.
+        let (old_parent_v_idx, _) = self.route_ino(old_parent);
+        let armed = self
+            .volumes
+            .get(old_parent_v_idx)
+            .is_some_and(|v| v.slot_lease_armed());
+        let mut lease: Option<kv::backend::DirRenameLease> = None;
+        let mut want_lock = armed
+            && matches!(
+                self.lookup_dentry_exact_unguarded(old_parent, old_name)
+                    .await,
+                Ok(Some((_, ft))) if ft == libc::S_IFDIR
+            );
+        loop {
+            if want_lock && lease.is_none() {
+                let t = std::time::Instant::now();
+                let vol0 = &self.volumes[0];
+                let identity = match crossvol_tx::TEST_DIR_RENAME_IDENTITY_ONCE
+                    .swap(0, std::sync::atomic::Ordering::SeqCst)
+                {
+                    0 => vol0.own_appender_id(),
+                    other => other,
+                };
+                let held = vol0
+                    .dir_rename_lock_held(identity)
+                    .await
+                    .map_err(crate::error::SqueezefsError::from)?;
+                crossvol_tx::note_dir_rename_lock(t.elapsed());
+                lease = Some(held);
+            }
+            let out = self
+                .rename_body(
+                    old_parent,
+                    old_name,
+                    new_parent,
+                    new_name,
+                    flags,
+                    lease.is_some(),
+                )
+                .await;
+            if matches!(out, Ok(false)) {
+                want_lock = true;
+                continue;
+            }
+            if let Some(l) = lease.take() {
+                l.release()
+                    .await
+                    .map_err(crate::error::SqueezefsError::from)?;
+            }
+            return out.map(|_| ());
+        }
+    }
+
+    async fn readdir(&self, dir: Ino, offset: u64, max: usize) -> Result<Vec<DirEntry>> {
+        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[dir]) {
+            return r.readdir(dir, offset, max).await;
+        }
+        // Rung 13 — the OQ-2 read gate's LOCAL face (see the trait
+        // lookup's note).
+        crate::meta_ship::deleg_read_gate(self, dir).await;
+        self.readdir_local(dir, offset, max).await
+    }
+
+    // Takes a SHARED 4a lease internally — see the trait-level doc note
+    // (VL8 item 6): exclusive-lease holders on the same stripe self-deadlock.
+    async fn getattr(&self, ino: Ino) -> Result<Inode> {
+        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
+            return r.getattr(ino).await;
+        }
+        self.getattr_local(ino).await
+    }
+
+    async fn setattr(
+        &self,
+        ino: Ino,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+        ctime: Option<u64>,
+    ) -> Result<Inode> {
+        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
+            return r
+                .setattr(ino, mode, uid, gid, size, atime, mtime, ctime)
+                .await;
+        }
+        // S10 coherence law (rung 12): attrs are exactly what a LOOKUP
+        // delegation serves.
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
+        // §5.5.2a cutover gate — before the 4a I-guard (and before
+        // route derivation: a park can span a flip).
+        let _gate = self.slot_gate_enter(&[ino]).await;
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        let guards: std::sync::Arc<[dlm::DlmGuard]> = std::sync::Arc::from(vec![
+            self.volumes[v_idx]
+                .dlm()
+                .lock_inode_exclusive(local_ino)
+                .await,
+        ]);
+        let out = self.volumes[v_idx]
+            .setattr_locked(local_ino, mode, uid, gid, size, atime, mtime, ctime, guards)
+            .await;
+        if out.is_err() {
+            self.mirror_volume_failure(v_idx);
+        }
+        out.map(|mut i| {
+            i.ino = ino;
+            i
+        })
+    }
+
+    async fn getxattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
+        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
+            return r.getxattr(ino, name).await;
+        }
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_ino).await;
+        self.volumes[v_idx].getxattr(local_ino, name).await
+    }
+
+    async fn setxattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
+            return r.setxattr(ino, name, value).await;
+        }
+        // S10 coherence law (rung 12): an xattr change moves ctime — the
+        // delegated getattr's truth.
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
+        // §5.5.2a cutover gate — before the 4a I-guard (and before
+        // route derivation: a park can span a flip).
+        let _gate = self.slot_gate_enter(&[ino]).await;
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        let guards: std::sync::Arc<[dlm::DlmGuard]> = std::sync::Arc::from(vec![
+            self.volumes[v_idx]
+                .dlm()
+                .lock_inode_exclusive(local_ino)
+                .await,
+        ]);
+        let out = self.volumes[v_idx]
+            .setxattr_locked(local_ino, name, value, guards)
+            .await;
+        if out.is_err() {
+            self.mirror_volume_failure(v_idx);
+        }
+        out
+    }
+
+    async fn removexattr(&self, ino: Ino, name: &str) -> Result<()> {
+        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
+            return r.removexattr(ino, name).await;
+        }
+        // S10 coherence law (rung 12): ctime moves (the setxattr twin).
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
+        // §5.5.2a cutover gate — before the 4a I-guard (and before
+        // route derivation: a park can span a flip).
+        let _gate = self.slot_gate_enter(&[ino]).await;
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        let guards: std::sync::Arc<[dlm::DlmGuard]> = std::sync::Arc::from(vec![
+            self.volumes[v_idx]
+                .dlm()
+                .lock_inode_exclusive(local_ino)
+                .await,
+        ]);
+        let out = self.volumes[v_idx]
+            .removexattr_locked(local_ino, name, guards)
+            .await;
+        if out.is_err() {
+            self.mirror_volume_failure(v_idx);
+        }
+        out
+    }
+
+    async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {
+        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
+            return r.listxattr(ino).await;
+        }
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_ino).await;
+        self.volumes[v_idx].listxattr(local_ino).await
+    }
+
+    async fn destroy_inode(&self, ino: Ino) -> Result<()> {
+        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
+            return r.destroy_inode(ino).await;
+        }
+        // S10 coherence law (rung 12): a destroyed record must not stay
+        // servable under a grant (the unlink already recalled the parent;
+        // this covers the object itself).
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
+        // §5.5.2a cutover gate — before the backend's own locks and
+        // before route derivation.
+        let _gate = self.slot_gate_enter(&[ino]).await;
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        Metadata::destroy_inode(self.volumes[v_idx].as_ref(), local_ino).await
+    }
+}
+
+impl RoutedMetaBackend {
+    /// [`Metadata::unlink`]'s body with the KEY parent resolved (PR 7b
+    /// routes a striped parent's name to its stripe before this runs).
+    async fn unlink_at(&self, parent: Ino, name: &str) -> Result<Ino> {
         // S10 coherence law (rung 12): the parent's dentry set mutates,
         // and the CHILD may itself be a delegated object (rmdir of a
         // delegated directory). The child read is paid only while
@@ -4170,410 +4774,6 @@ impl Metadata for RoutedMetaBackend {
             crossvol_tx::execute(self, &plan, guards).await?;
             Ok(global_child_ino)
         }
-    }
-
-    async fn link(&self, ino: Ino, new_parent: Ino, new_name: &str) -> Result<Inode> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino, new_parent]) {
-            return r.link(ino, new_parent, new_name).await;
-        }
-        // S10 coherence law (rung 12): the parent's dentry set and the
-        // linked inode's nlink/ctime both mutate — both participants are
-        // parameters, so no resolution is needed.
-        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[new_parent, ino]).await;
-        // §5.5.2a cutover gate — both inos are parameters, both slots
-        // declared before any 4a acquisition (and before route
-        // derivation: a park can span a flip).
-        let _gate = self.slot_gate_enter(&[ino, new_parent]).await;
-        // §5.4a M1: `link`'s participants ARE named, so `route_verb` and
-        // the owner side already refuse a shipped one — this is the same
-        // refusal on the LOCAL path, where no router runs.
-        self.refuse_cross_owner_participants(crate::meta_ship::MetaVerb::Link, &[ino, new_parent])?;
-        let (parent_v_idx, local_parent) = self.route_ino(new_parent);
-        let (child_v_idx, local_child) = self.route_ino(ino);
-        self.check_volume_enabled(parent_v_idx)?;
-        self.check_volume_enabled(child_v_idx)?;
-
-        // Both inodes are parameters: acquire the full set upfront —
-        // per-volume sets in ascending volume order, each internally
-        // canonical (taking I{child} after the D-guard would be an ABBA
-        // inversion under stripe collisions).
-        let mut _guards = Vec::new();
-        let mut scope = None;
-        if child_v_idx == parent_v_idx {
-            _guards.extend(
-                self.lock_many_leased(
-                    parent_v_idx,
-                    &mut scope,
-                    &[
-                        (local_parent, dlm::LockMode::Exclusive),
-                        (local_child, dlm::LockMode::Exclusive),
-                    ],
-                    &[(local_parent, new_name, dlm::LockMode::Exclusive)],
-                )
-                .await?,
-            );
-        } else if child_v_idx < parent_v_idx {
-            _guards.extend(
-                self.lock_many_leased(
-                    child_v_idx,
-                    &mut scope,
-                    &[(local_child, dlm::LockMode::Exclusive)],
-                    &[],
-                )
-                .await?,
-            );
-            _guards.extend(
-                self.lock_many_leased(
-                    parent_v_idx,
-                    &mut scope,
-                    &[(local_parent, dlm::LockMode::Exclusive)],
-                    &[(local_parent, new_name, dlm::LockMode::Exclusive)],
-                )
-                .await?,
-            );
-        } else {
-            _guards.extend(
-                self.lock_many_leased(
-                    parent_v_idx,
-                    &mut scope,
-                    &[(local_parent, dlm::LockMode::Exclusive)],
-                    &[(local_parent, new_name, dlm::LockMode::Exclusive)],
-                )
-                .await?,
-            );
-            _guards.extend(
-                self.lock_many_leased(
-                    child_v_idx,
-                    &mut scope,
-                    &[(local_child, dlm::LockMode::Exclusive)],
-                    &[],
-                )
-                .await?,
-            );
-        }
-
-        // PR M7 (Issue 13): Arc the op's guard set for its commit(s).
-        let guards: std::sync::Arc<[dlm::DlmGuard]> = std::sync::Arc::from(_guards);
-
-        if self
-            .find_dentry_routed(parent_v_idx, local_parent, new_name)
-            .await?
-            .is_some()
-        {
-            return Err(crate::error::SqueezefsError::already_exists(
-                "File already exists",
-            ));
-        }
-
-        // Symmetric PR 6: a parent or inode in another appender's slot
-        // takes the transaction path below — its steps route by slot.
-        if parent_v_idx == child_v_idx && !self.spans_foreign_slot(&[ino, new_parent]) {
-            // Same-volume link: ONE whole-tx entry (nlink+1 + dentry +
-            // parent times).
-            let be = &self.volumes[parent_v_idx];
-            let out = be
-                .routed_link_local(local_parent, new_name, local_child, ino, guards)
-                .await;
-            if out.is_err() {
-                self.mirror_volume_failure(parent_v_idx);
-            }
-            out
-        } else {
-            // **Cross-volume link is ONE cross-volume transaction**
-            // (DUR-7, design-cow-kv-metadata §4.10a). The count half stays
-            // FIRST — it is the half that can refuse (EMLINK), and its
-            // crash residue (`nlink` up, no second name) is a leak rather
-            // than a dentry naming an under-counted inode — and it now
-            // carries the intent record, so the next mount rolls the
-            // second name forward instead of leaking the inode and every
-            // block it names forever.
-            let pre = self.volumes[child_v_idx]
-                .read_inode_value_routed(local_child)
-                .await?
-                .ok_or_else(|| {
-                    crate::error::SqueezefsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("Inode {local_child} not found"),
-                    ))
-                })?;
-            if pre.nlink >= 65000 {
-                return Err(crate::error::SqueezefsError::too_many_links(
-                    "Too many links",
-                ));
-            }
-            let plan = crossvol_tx::XvPlan {
-                op: crossvol_tx::XvOp::Link,
-                steps: vec![
-                    crossvol_tx::XvStep::SetNlink {
-                        ino,
-                        pre: pre.nlink,
-                        post: pre.nlink + 1,
-                        ctime: Some(kv::backend::KvMetaBackend::now_ns_pub()),
-                    },
-                    crossvol_tx::XvStep::InsertDentry {
-                        parent: new_parent,
-                        name: new_name.to_string(),
-                        child: ino,
-                        ft_bits: pre.mode & libc::S_IFMT,
-                        parent_update: crossvol_tx::parent_update_code(
-                            kv::backend::RoutedParentUpdate::ExclusiveTimes,
-                        ),
-                    },
-                ],
-            };
-            let done = crossvol_tx::execute(self, &plan, guards).await?;
-            // The reply is served from the count step's post-image (the
-            // applier folds the pending-times refinement into it — the
-            // generic/423 monotone-ctime discipline).
-            let v = done.inode(0).cloned().unwrap_or(pre);
-            Ok(Inode {
-                ino,
-                mode: v.mode,
-                uid: v.uid,
-                gid: v.gid,
-                size: v.size,
-                nlink: v.nlink,
-                atime: v.atime,
-                mtime: v.mtime,
-                ctime: v.ctime,
-                flags: v.flags,
-                rdev: v.rdev,
-            })
-        }
-    }
-
-    async fn rename(
-        &self,
-        old_parent: Ino,
-        old_name: &str,
-        new_parent: Ino,
-        new_name: &str,
-        flags: u32,
-    ) -> Result<()> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[old_parent, new_parent]) {
-            return r
-                .rename(old_parent, old_name, new_parent, new_name, flags)
-                .await;
-        }
-        if flags & (libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE)
-            == (libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE)
-        {
-            return Err(crate::error::SqueezefsError::Io(
-                std::io::Error::from_raw_os_error(libc::EINVAL),
-            ));
-        }
-        // The VFS forbids WHITEOUT|EXCHANGE; a defensive refusal keeps
-        // the combination unrepresentable below (generic/631 family).
-        if flags & libc::RENAME_WHITEOUT != 0 && flags & libc::RENAME_EXCHANGE != 0 {
-            return Err(crate::error::SqueezefsError::Io(
-                std::io::Error::from_raw_os_error(libc::EINVAL),
-            ));
-        }
-        // Symmetric PR 6 (§5.6.4): the set-wide directory-rename lease is
-        // the OUTERMOST lock — decided on an unguarded read of the
-        // source's type (the body re-decides under its guards and hands
-        // back `false` when the source became a directory meanwhile),
-        // held for the op, released on every exit. Unarmed: one bool.
-        let (old_parent_v_idx, _) = self.route_ino(old_parent);
-        let armed = self
-            .volumes
-            .get(old_parent_v_idx)
-            .is_some_and(|v| v.slot_lease_armed());
-        let mut lease: Option<kv::backend::DirRenameLease> = None;
-        let mut want_lock = armed
-            && matches!(
-                self.lookup_dentry_exact_unguarded(old_parent, old_name)
-                    .await,
-                Ok(Some((_, ft))) if ft == libc::S_IFDIR
-            );
-        loop {
-            if want_lock && lease.is_none() {
-                let t = std::time::Instant::now();
-                let vol0 = &self.volumes[0];
-                let identity = match crossvol_tx::TEST_DIR_RENAME_IDENTITY_ONCE
-                    .swap(0, std::sync::atomic::Ordering::SeqCst)
-                {
-                    0 => vol0.own_appender_id(),
-                    other => other,
-                };
-                let held = vol0
-                    .dir_rename_lock_held(identity)
-                    .await
-                    .map_err(crate::error::SqueezefsError::from)?;
-                crossvol_tx::note_dir_rename_lock(t.elapsed());
-                lease = Some(held);
-            }
-            let out = self
-                .rename_body(
-                    old_parent,
-                    old_name,
-                    new_parent,
-                    new_name,
-                    flags,
-                    lease.is_some(),
-                )
-                .await;
-            if matches!(out, Ok(false)) {
-                want_lock = true;
-                continue;
-            }
-            if let Some(l) = lease.take() {
-                l.release()
-                    .await
-                    .map_err(crate::error::SqueezefsError::from)?;
-            }
-            return out.map(|_| ());
-        }
-    }
-
-    async fn readdir(&self, dir: Ino, offset: u64, max: usize) -> Result<Vec<DirEntry>> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[dir]) {
-            return r.readdir(dir, offset, max).await;
-        }
-        // Rung 13 — the OQ-2 read gate's LOCAL face (see the trait
-        // lookup's note).
-        crate::meta_ship::deleg_read_gate(self, dir).await;
-        self.readdir_local(dir, offset, max).await
-    }
-
-    // Takes a SHARED 4a lease internally — see the trait-level doc note
-    // (VL8 item 6): exclusive-lease holders on the same stripe self-deadlock.
-    async fn getattr(&self, ino: Ino) -> Result<Inode> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
-            return r.getattr(ino).await;
-        }
-        self.getattr_local(ino).await
-    }
-
-    async fn setattr(
-        &self,
-        ino: Ino,
-        mode: Option<u32>,
-        uid: Option<u32>,
-        gid: Option<u32>,
-        size: Option<u64>,
-        atime: Option<u64>,
-        mtime: Option<u64>,
-        ctime: Option<u64>,
-    ) -> Result<Inode> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
-            return r
-                .setattr(ino, mode, uid, gid, size, atime, mtime, ctime)
-                .await;
-        }
-        // S10 coherence law (rung 12): attrs are exactly what a LOOKUP
-        // delegation serves.
-        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
-        // §5.5.2a cutover gate — before the 4a I-guard (and before
-        // route derivation: a park can span a flip).
-        let _gate = self.slot_gate_enter(&[ino]).await;
-        let (v_idx, local_ino) = self.route_ino(ino);
-        self.check_volume_enabled(v_idx)?;
-        let guards: std::sync::Arc<[dlm::DlmGuard]> = std::sync::Arc::from(vec![
-            self.volumes[v_idx]
-                .dlm()
-                .lock_inode_exclusive(local_ino)
-                .await,
-        ]);
-        let out = self.volumes[v_idx]
-            .setattr_locked(local_ino, mode, uid, gid, size, atime, mtime, ctime, guards)
-            .await;
-        if out.is_err() {
-            self.mirror_volume_failure(v_idx);
-        }
-        out.map(|mut i| {
-            i.ino = ino;
-            i
-        })
-    }
-
-    async fn getxattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
-            return r.getxattr(ino, name).await;
-        }
-        let (v_idx, local_ino) = self.route_ino(ino);
-        self.check_volume_enabled(v_idx)?;
-        let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_ino).await;
-        self.volumes[v_idx].getxattr(local_ino, name).await
-    }
-
-    async fn setxattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
-            return r.setxattr(ino, name, value).await;
-        }
-        // S10 coherence law (rung 12): an xattr change moves ctime — the
-        // delegated getattr's truth.
-        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
-        // §5.5.2a cutover gate — before the 4a I-guard (and before
-        // route derivation: a park can span a flip).
-        let _gate = self.slot_gate_enter(&[ino]).await;
-        let (v_idx, local_ino) = self.route_ino(ino);
-        self.check_volume_enabled(v_idx)?;
-        let guards: std::sync::Arc<[dlm::DlmGuard]> = std::sync::Arc::from(vec![
-            self.volumes[v_idx]
-                .dlm()
-                .lock_inode_exclusive(local_ino)
-                .await,
-        ]);
-        let out = self.volumes[v_idx]
-            .setxattr_locked(local_ino, name, value, guards)
-            .await;
-        if out.is_err() {
-            self.mirror_volume_failure(v_idx);
-        }
-        out
-    }
-
-    async fn removexattr(&self, ino: Ino, name: &str) -> Result<()> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
-            return r.removexattr(ino, name).await;
-        }
-        // S10 coherence law (rung 12): ctime moves (the setxattr twin).
-        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
-        // §5.5.2a cutover gate — before the 4a I-guard (and before
-        // route derivation: a park can span a flip).
-        let _gate = self.slot_gate_enter(&[ino]).await;
-        let (v_idx, local_ino) = self.route_ino(ino);
-        self.check_volume_enabled(v_idx)?;
-        let guards: std::sync::Arc<[dlm::DlmGuard]> = std::sync::Arc::from(vec![
-            self.volumes[v_idx]
-                .dlm()
-                .lock_inode_exclusive(local_ino)
-                .await,
-        ]);
-        let out = self.volumes[v_idx]
-            .removexattr_locked(local_ino, name, guards)
-            .await;
-        if out.is_err() {
-            self.mirror_volume_failure(v_idx);
-        }
-        out
-    }
-
-    async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
-            return r.listxattr(ino).await;
-        }
-        let (v_idx, local_ino) = self.route_ino(ino);
-        self.check_volume_enabled(v_idx)?;
-        let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_ino).await;
-        self.volumes[v_idx].listxattr(local_ino).await
-    }
-
-    async fn destroy_inode(&self, ino: Ino) -> Result<()> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
-            return r.destroy_inode(ino).await;
-        }
-        // S10 coherence law (rung 12): a destroyed record must not stay
-        // servable under a grant (the unlink already recalled the parent;
-        // this covers the object itself).
-        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
-        // §5.5.2a cutover gate — before the backend's own locks and
-        // before route derivation.
-        let _gate = self.slot_gate_enter(&[ino]).await;
-        let (v_idx, local_ino) = self.route_ino(ino);
-        self.check_volume_enabled(v_idx)?;
-        Metadata::destroy_inode(self.volumes[v_idx].as_ref(), local_ino).await
     }
 }
 

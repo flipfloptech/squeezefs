@@ -1101,11 +1101,14 @@ pub const XV_VERSION: u16 = 1;
 const XV_HEADER_LEN: usize = 32;
 /// Offset of the checksum field inside the header.
 const XV_CHECKSUM_OFF: usize = 24;
-/// Encoding-budget cap on a plan's step count (the largest plan the
-/// converted ops build is 9 — a cross-volume directory rename replacing a
-/// destination with `RENAME_WHITEOUT`; the cap is the decoder's bound, not
-/// a tuning knob).
-pub const XV_MAX_STEPS: usize = 32;
+/// Encoding-budget cap on a plan's step count — the decoder's bound, not a
+/// tuning knob. The largest plan the converted ops build is 9 (a
+/// cross-volume directory rename replacing a destination with
+/// `RENAME_WHITEOUT`); symmetric PR 7b's striped-directory plans are the
+/// widest: a flip writes `K + 2` marker inserts and an `rmdir`'s marker
+/// removal `K + 2` removes, with `K ≤ MINT_SPREAD` (64) — so the bound is
+/// `MINT_SPREAD + 8`, the widest plan plus the pre-7b headroom.
+pub const XV_MAX_STEPS: usize = super::MINT_SPREAD + 8;
 
 /// The intent key of `tx_id`: the id IS the key (56 bits in the hash
 /// field, 8 in the collision field — the full 64 bits, injectively).
@@ -1153,6 +1156,12 @@ pub enum XvOp {
     /// A create whose parent directory another appender holds (symmetric
     /// PR 6): `[CreateInode @ own, InsertDentry @ foreign]`.
     Create = 6,
+    /// PR 7b (design §5.6.5): a directory's stripe FLIP (`K + 2` marker
+    /// inserts, the commit marker last), one name's lazy re-homing
+    /// (`[InsertDentry @ stripe, RemoveDentry @ dir]`), or the migration
+    /// flag's clear — every one rolled forward whole by the same
+    /// machinery.
+    StripeDir = 7,
 }
 
 impl XvOp {
@@ -1167,6 +1176,7 @@ impl XvOp {
             4 => Self::Rename,
             5 => Self::Exchange,
             6 => Self::Create,
+            7 => Self::StripeDir,
             _ => return None,
         })
     }
@@ -2035,6 +2045,36 @@ pub async fn lookup_exact(
         ))),
         Err(e) => Err(e.into_error()),
     }
+}
+
+/// Ship ONE metadata call to appender `holder` at `endpoint` through the
+/// installed shipper and answer its reply — the striping verbs' wire
+/// (PR 7b: `SupplyStripeIno` / `IsEmpty` / `DestroyStripe`), the same
+/// one-op batch [`ship_step`] and [`lookup_exact`] ride.
+pub(crate) async fn ship_meta_call(
+    endpoint: &str,
+    holder: u32,
+    call: crate::meta_ship::MetaCall,
+) -> Result<crate::meta_ship::MetaReply> {
+    let verb = call.verb().name();
+    let Some(router) = XV_SHIPPER.load_full() else {
+        return Err(unreachable_error(holder, verb));
+    };
+    let peer = Arc::new(crate::meta_ship::PeerOwner::new(
+        format!("appender-{holder}"),
+        endpoint,
+    ));
+    let op = crate::meta_ship::MetaOp {
+        id: router.next_request_id(),
+        call,
+    };
+    let mut results = router.ship_ops(&peer, vec![op]).await?;
+    let result = results.pop().ok_or_else(|| {
+        SqueezefsError::InvalidOperation(format!(
+            "{verb}: the holder returned an empty result set for a one-op batch"
+        ))
+    })?;
+    result.outcome.map_err(|e| e.into_error())
 }
 
 /// Ship one step to its holder through the installed shipper.

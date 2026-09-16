@@ -211,6 +211,17 @@ pub enum MetaVerb {
     /// Release a scope's parked guards (idempotent — `Unit` for a scope
     /// the holder no longer has).
     XvRelease = 0x63,
+    // PR 7b (directory striping, design §5.6.5): the block 0x90–0x9F.
+    /// The holder of a directory asks a creator to SUPPLY one stripe
+    /// ino minted in a slot the creator leases (the S10 `InoSupply`
+    /// pattern with the holder as the asker).
+    SupplyStripeIno = 0x90,
+    /// Does this directory (a stripe) hold any entry? Read under the
+    /// stripe's exclusive guard at its holder — the `rmdir` probe.
+    IsEmpty = 0x91,
+    /// Destroy a DYING (`nlink 0`, empty) stripe's record at its holder;
+    /// idempotent — an absent record is `Unit`.
+    DestroyStripe = 0x92,
 }
 
 impl MetaVerb {
@@ -233,6 +244,9 @@ impl MetaVerb {
         MetaVerb::LookupExact,
         MetaVerb::XvGuards,
         MetaVerb::XvRelease,
+        MetaVerb::SupplyStripeIno,
+        MetaVerb::IsEmpty,
+        MetaVerb::DestroyStripe,
     ];
 
     /// The verb's wire code.
@@ -265,6 +279,9 @@ impl MetaVerb {
             MetaVerb::LookupExact => "lookup_exact",
             MetaVerb::XvGuards => "xv_guards",
             MetaVerb::XvRelease => "xv_release",
+            MetaVerb::SupplyStripeIno => "supply_stripe_ino",
+            MetaVerb::IsEmpty => "is_empty",
+            MetaVerb::DestroyStripe => "destroy_stripe",
         }
     }
 
@@ -281,8 +298,13 @@ impl MetaVerb {
             | MetaVerb::Getattr
             | MetaVerb::Getxattr
             | MetaVerb::Listxattr
-            | MetaVerb::LookupExact => false,
-            MetaVerb::CreateWithRdev
+            | MetaVerb::LookupExact
+            | MetaVerb::IsEmpty => false,
+            // A supply MINTS (a record in the supplier's slot) and a
+            // destroy deletes one: both ride the dedup window.
+            MetaVerb::SupplyStripeIno
+            | MetaVerb::DestroyStripe
+            | MetaVerb::CreateWithRdev
             | MetaVerb::Unlink
             | MetaVerb::Link
             | MetaVerb::Rename
@@ -404,6 +426,30 @@ pub enum MetaCall {
         scope: u64,
         ino: u64,
     },
+    // PR 7b — appended (`MetaVerb` 0x90–0x9F).
+    /// Supply stripe `index` of directory `dir`: mint an `S_IFDIR`
+    /// record in a slot appender `supplier` leases at the served side
+    /// (`MetaReply::StripeInoSupplied`). Every word is judged against
+    /// durable state there: `dir` a directory record on its volume,
+    /// `index` inside the stripe namespace, `supplier` an appender the
+    /// served mount serves.
+    SupplyStripeIno {
+        dir: u64,
+        index: u32,
+        supplier: u32,
+    },
+    /// Does `dir` (a stripe) hold any non-marker entry? Under `scope`'s
+    /// parked guards when they cover the stripe, else under the stripe's
+    /// exclusive guard (`MetaReply::Empty`).
+    IsEmpty {
+        dir: u64,
+        scope: u64,
+    },
+    /// Destroy the DYING stripe `stripe` (`nlink 0`, empty — refused
+    /// `EBUSY` / `ENOTEMPTY` otherwise; `Unit` for an absent record).
+    DestroyStripe {
+        stripe: u64,
+    },
 }
 
 impl MetaCall {
@@ -427,6 +473,9 @@ impl MetaCall {
             MetaCall::LookupExact { .. } => MetaVerb::LookupExact,
             MetaCall::XvGuards { .. } => MetaVerb::XvGuards,
             MetaCall::XvRelease { .. } => MetaVerb::XvRelease,
+            MetaCall::SupplyStripeIno { .. } => MetaVerb::SupplyStripeIno,
+            MetaCall::IsEmpty { .. } => MetaVerb::IsEmpty,
+            MetaCall::DestroyStripe { .. } => MetaVerb::DestroyStripe,
         }
     }
 
@@ -475,6 +524,8 @@ impl MetaCall {
                 .or_else(|| dentries.first().map(|(p, _, _)| *p))
                 .unwrap_or(0),
             MetaCall::XvRelease { ino, .. } => *ino,
+            MetaCall::SupplyStripeIno { dir, .. } | MetaCall::IsEmpty { dir, .. } => *dir,
+            MetaCall::DestroyStripe { stripe } => *stripe,
         }
     }
 
@@ -618,6 +669,12 @@ pub enum MetaReply {
     /// `lookup_exact`: `(child ino, S_IFMT bits)` or absent — exact as the
     /// holder's tree stands.
     DentryExact(Option<(u64, u32)>),
+    // PR 7b — appended.
+    /// `supply_stripe_ino`: the GLOBAL ino of the stripe the supplier
+    /// minted.
+    StripeInoSupplied { ino: u64 },
+    /// `is_empty`: the stripe holds no entry.
+    Empty(bool),
 }
 
 /// A refusal as it crosses the wire.

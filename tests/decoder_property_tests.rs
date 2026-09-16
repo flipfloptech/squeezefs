@@ -2243,3 +2243,86 @@ proptest! {
         prop_assert_eq!(decode_token_reply(&enc).expect("decodes"), frame);
     }
 }
+
+// ---------------------------------------------------------------------------
+// PR 7b — directory striping: the marker-name codec and the striping verbs
+// (design-symmetric-metadata §5.6.5; the `cluster_wire_frame` arm 3c's
+// per-commit mirror).
+// ---------------------------------------------------------------------------
+
+use squeezefs::meta_backend::dir_stripe::{
+    is_marker_name, parse_marker, stripe_marker_name, stripe_of, Marker, STRIPES_MAX,
+};
+use squeezefs::meta_ship::wire::{
+    encode_request, MetaCall, MetaOp, MetaReply, MetaRequestFrame, META_SHIP_SCHEMA,
+};
+
+proptest! {
+    /// The marker codec is total: any byte string decodes to a marker or
+    /// to `None`, never panics; every name the encoder emits decodes back;
+    /// a marker is never a user-reachable name (its first byte is NUL).
+    #[test]
+    fn dir_stripe_marker_codec_is_total(data in prop::collection::vec(any::<u8>(), 0..64)) {
+        match parse_marker(&data) {
+            Some(Marker::Stripe(i)) => {
+                prop_assert!(i < STRIPES_MAX);
+                prop_assert_eq!(stripe_marker_name(i).into_bytes(), data.clone());
+            }
+            Some(_) | None => {}
+        }
+        if let Ok(s) = std::str::from_utf8(&data) {
+            if parse_marker(&data).is_some() {
+                prop_assert!(is_marker_name(s));
+            }
+        }
+    }
+
+    /// `stripe(name) = hash % K` lands inside `0..K` for every `K` the
+    /// knob admits, and `K = 1` is the identity stripe.
+    #[test]
+    fn dir_stripe_function_stays_in_range(hash in any::<u64>(), k in 1u16..=64) {
+        prop_assert!(stripe_of(hash, k) < k);
+        prop_assert_eq!(stripe_of(hash, 1), 0);
+    }
+
+    /// The striping verbs (`MetaVerb` 0x90–0x92) and their replies
+    /// round-trip the S8 body.
+    #[test]
+    fn dir_stripe_verbs_round_trip_the_meta_ship_body(
+        dir in any::<u64>(),
+        index in any::<u32>(),
+        supplier in any::<u32>(),
+        scope in any::<u64>(),
+    ) {
+        let frame = MetaRequestFrame {
+            schema: META_SHIP_SCHEMA,
+            client_epoch: scope,
+            client_id: String::new(),
+            owner_term: 0,
+            ops: vec![
+                MetaOp { id: 1, call: MetaCall::SupplyStripeIno { dir, index, supplier } },
+                MetaOp { id: 2, call: MetaCall::IsEmpty { dir, scope } },
+                MetaOp { id: 3, call: MetaCall::DestroyStripe { stripe: dir } },
+            ],
+        };
+        let enc = encode_request(&frame).expect("encodes");
+        prop_assert_eq!(decode_request(&enc).expect("decodes"), frame);
+        for reply in [MetaReply::StripeInoSupplied { ino: dir }, MetaReply::Empty(scope & 1 == 1)] {
+            let f = squeezefs::meta_ship::wire::MetaReplyFrame {
+                schema: META_SHIP_SCHEMA,
+                owner_term: 0,
+                results: vec![squeezefs::meta_ship::wire::MetaOpResult {
+                    id: 1,
+                    outcome: Ok(reply),
+                    grant: None,
+                    delegs: Vec::new(),
+                    revokes: Vec::new(),
+                    revoke_fence: 0,
+                    intent_grant: None,
+                }],
+            };
+            let enc = squeezefs::meta_ship::wire::encode_reply(&f).expect("encodes");
+            prop_assert_eq!(decode_reply(&enc).expect("decodes"), f);
+        }
+    }
+}

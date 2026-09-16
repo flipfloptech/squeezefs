@@ -3406,15 +3406,15 @@ async fn arm_member(
     pr_key: u64,
     on_purge: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> Result<Option<MembershipArm>> {
-    let mut best: Option<OwnerRecord> = None;
+    let mut best: Option<(OwnerRecord, std::sync::Weak<KvMetaBackend>)> = None;
     for be in volumes {
         if let Some(rec) = read_owner_record(be).await {
-            if best.as_ref().is_none_or(|b| rec.term > b.term) {
-                best = Some(rec);
+            if best.as_ref().is_none_or(|(b, _)| rec.term > b.term) {
+                best = Some((rec, Arc::downgrade(be)));
             }
         }
     }
-    let Some(rec) = best else {
+    let Some((rec, home)) = best else {
         log::info!(
             "membership: no mount on this volume set serves a membership plane, so this \
              reader stays invisible to `squeezefs clients` (the S5 posture — a reader \
@@ -3430,6 +3430,7 @@ async fn arm_member(
         role,
         pr_key,
         on_purge,
+        Some(home),
     )
     .await
 }
@@ -3454,7 +3455,18 @@ pub async fn join_as_writer_member(
     pr_key: u64,
     on_purge: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> Result<Option<MembershipArm>> {
-    join_member_on(rec, secret, node_id, MemberRole::Writer, pr_key, on_purge).await
+    // The co-writer's rung-4 join runs before its set is opened: no home
+    // volume to watch; its parked reclaim keeps the declared venue.
+    join_member_on(
+        rec,
+        secret,
+        node_id,
+        MemberRole::Writer,
+        pr_key,
+        on_purge,
+        None,
+    )
+    .await
 }
 
 async fn join_member_on(
@@ -3464,6 +3476,7 @@ async fn join_member_on(
     role: MemberRole,
     pr_key: u64,
     on_purge: Option<Arc<dyn Fn() + Send + Sync>>,
+    home: Option<std::sync::Weak<KvMetaBackend>>,
 ) -> Result<Option<MembershipArm>> {
     let id = id.to_string();
     let req = JoinRequest {
@@ -3513,6 +3526,7 @@ async fn join_member_on(
         clock,
         Arc::clone(&stop),
         on_purge,
+        home.map(|h| (h, rec.term)),
     );
     log::info!(
         "membership MEMBER armed: {} '{id}' holds a lease from owner '{}' at {} — visible in \
@@ -3867,6 +3881,33 @@ pub fn successor_endpoint() -> Option<String> {
         .map(|s| s.as_ref().clone())
 }
 
+/// **The production observation** (PR 10; design §5.5.3 item 2 — the
+/// member "watches for the successor through the fixed ledger"): the
+/// home volume's rendezvous record ([`OwnerRecord`], ino 1) naming an
+/// owner at a NEWER era than the one this member joined under IS the
+/// successor — its `endpoint` becomes the parked reclaim's venue
+/// ([`note_successor_observed`]). A record at the joined era (the owner
+/// we hold a lease from, merely slow) or below it (a stale predecessor's)
+/// observes nothing. Read at every parked beat by the renewal loop; a
+/// read that fails observes nothing (the beat retries).
+pub async fn observe_successor(home: &KvMetaBackend, joined_term: u64) -> Option<String> {
+    let rec = read_owner_record(home).await?;
+    if rec.term <= joined_term {
+        return None;
+    }
+    if successor_endpoint().as_deref() != Some(rec.endpoint.as_str()) {
+        log::info!(
+            "membership: the home volume's rendezvous names a successor owner '{}' (era {} > \
+             the joined era {joined_term}) at {} — the parked reclaim re-points to it",
+            rec.id,
+            rec.term,
+            rec.endpoint
+        );
+        note_successor_observed(Some(rec.endpoint.clone()));
+    }
+    Some(rec.endpoint)
+}
+
 /// PR 8: the membership BEAT in force — `T_renewal`, the ranged block
 /// grant's refresh cadence (the grant is topped up as carriage): the
 /// installed member's renewal interval, else the owner's derived clocks,
@@ -3937,6 +3978,7 @@ fn spawn_member_renewal(
     clock: LeaseClock,
     stop: Arc<AtomicBool>,
     on_purge: Option<Arc<dyn Fn() + Send + Sync>>,
+    rendezvous: Option<(std::sync::Weak<KvMetaBackend>, u64)>,
 ) {
     crate::meta_exec::spawn_lease("membership_renewal", async move {
         loop {
@@ -3946,6 +3988,16 @@ fn spawn_member_renewal(
             // interval (never a 1 ms spin against the dead venue), cut
             // short by the ledger's successor observation.
             let parked = crate::park_gate::is_parked();
+            // PR 10 (§5.5.3 item 2): the observation's production writer
+            // — at every parked beat the home volume's rendezvous record
+            // is read for an owner at a newer era than the joined one.
+            if parked {
+                if let Some((home, joined_term)) = rendezvous.as_ref() {
+                    if let Some(home) = home.upgrade() {
+                        let _ = observe_successor(&home, *joined_term).await;
+                    }
+                }
+            }
             let due = if parked {
                 client.session().renew_interval_ms().max(1)
             } else {

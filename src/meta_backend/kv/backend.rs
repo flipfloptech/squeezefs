@@ -1183,6 +1183,12 @@ pub struct KvMetaBackend {
     /// plane's leave so a flush after the disarm never stamps below it
     /// (rule 3 would screen the frame at the next load).
     frame_g_floor: scc::HashMap<super::record::ForestSlot, u32>,
+    /// A NON-WRITER's frame screen inputs per slot (§5.8.2, PR 10): tree
+    /// 0's `(g, lessee)` and `slot_tails:{s}` read once per slot per
+    /// control-tree root (a reader's resync moves the root; a probe's
+    /// never moves). Empty on every writer (the plane's `frame_tails` is
+    /// its cache) and every flat volume.
+    reader_frame_screens: scc::HashMap<super::record::ForestSlot, Arc<ReaderFrameScreen>>,
     /// Rewrite-publish-drain Lever B (2026-08-01): the per-volume
     /// layout-merge conveyor — delta-class layout saves aggregate into
     /// ONE multi-ino KvTx per pass (one journal entry, one ring write,
@@ -1837,6 +1843,7 @@ impl KvMetaBackend {
         // PR M7: probes never mutate, but the conveyor identity is part
         // of construction (a commit without it fails loud, never UB).
         let _ = be.conveyor_self.set(Arc::downgrade(&be));
+        be.install_reader_frame_fence();
         Ok(be)
     }
 
@@ -1905,6 +1912,7 @@ impl KvMetaBackend {
         // PR M7: no commit can ever run here, but the conveyor identity is
         // part of construction (a commit without it fails loud, never UB).
         let _ = be.conveyor_self.set(Arc::downgrade(&be));
+        be.install_reader_frame_fence();
         be.trace_guard_event("reader_admitted");
         log::warn!(
             "meta volume {}: mounted READ-ONLY (DLM S5). No writer_claim, no NVMe \
@@ -1985,6 +1993,7 @@ impl KvMetaBackend {
         // identity is part of construction (a commit without it fails loud,
         // never UB).
         let _ = be.conveyor_self.set(Arc::downgrade(&be));
+        be.install_reader_frame_fence();
         be.trace_guard_event("co_writer_admitted");
         log::warn!(
             "meta volume {}: mounted CO-WRITER (DLM S9) under authority claim '{}' (era {}). No \
@@ -2081,6 +2090,7 @@ impl KvMetaBackend {
         // identity is part of construction (a commit without it fails
         // loud, never UB).
         let _ = be.conveyor_self.set(Arc::downgrade(&be));
+        be.install_reader_frame_fence();
 
         // Layer B2, through the per-volume arm: the claim on this volume
         // must belong to the durable identity the admission admitted.
@@ -2906,6 +2916,7 @@ impl KvMetaBackend {
             tokens_holder: std::sync::OnceLock::new(),
             tokens_reader: std::sync::OnceLock::new(),
             frame_g_floor: scc::HashMap::new(),
+            reader_frame_screens: scc::HashMap::new(),
             layout_conveyor: Arc::new(ConveyorCore::new()),
             batch_max_txs: resolve_commit_batch_txs(
                 std::env::var(COMMIT_BATCH_TXS_ENV).ok().as_deref(),
@@ -3141,7 +3152,7 @@ impl KvMetaBackend {
         addr: u64,
     ) -> std::result::Result<Option<super::node::FrameScreen>, KvError> {
         let Some(plane) = self.slot_leases() else {
-            return Ok(None);
+            return self.reader_frame_screen_for(slot, addr).await;
         };
         // The lessee at the current generation (rule 4's input): tree 0's
         // holder while leased — the stamp its writer puts on its frames
@@ -3174,6 +3185,93 @@ impl KvMetaBackend {
                 .as_ref()
                 .is_some_and(|a| a.stats().meta_pr_wero),
         }))
+    }
+
+    /// The §5.8.2 screen of a NON-WRITER (a probe, a `-o ro` reader, a
+    /// co-writer, a peer-owned open — no lease plane answers for the
+    /// slot) read off TREE 0 alone: the slot's `(g, lessee)` from its
+    /// `slot_state` record and the release's / recovery's recorded tails
+    /// from `slot_tails:{s}`, cached per slot against the control tree's
+    /// root (a reader's resync moves the root and the next load re-reads;
+    /// a probe's root never moves). Without it a zombie's frame past the
+    /// recorded tail — screened by every writer — was FOLDED by offline
+    /// fsck's raw C1 walk and reported as damage on a volume a writer
+    /// reads clean (PR 10's non-PR zombie contract found it). `None` on
+    /// a flat volume and on a forest no slot of which has ever been
+    /// leased (every `g` 0: PR 1–3's shape, rule 3 alone).
+    async fn reader_frame_screen_for(
+        &self,
+        slot: super::record::ForestSlot,
+        addr: u64,
+    ) -> std::result::Result<Option<super::node::FrameScreen>, KvError> {
+        let Some(forest) = self.forest() else {
+            return Ok(None);
+        };
+        let control = forest.control();
+        let control_root = control.root().addr;
+        let cached = self
+            .reader_frame_screens
+            .read_sync(&slot, |_, v| Arc::clone(v))
+            .filter(|c| c.control_root == control_root);
+        let screen = match cached {
+            Some(c) => c,
+            None => {
+                let (g, lessee) = match control
+                    .lookup(&super::slot_state::slot_state_key(slot))
+                    .await?
+                {
+                    Some(v) => match super::slot_state::SlotState::decode(&v)? {
+                        super::slot_state::SlotState::Leased { appender_id, g, .. } => {
+                            (g, Some(appender_id))
+                        }
+                        super::slot_state::SlotState::Unleased { g, .. } => (g, None),
+                    },
+                    None => (0, None),
+                };
+                let (tails_g, tails) = match self.slot_tails(slot).await? {
+                    Some((g, t)) => (g, t.into_iter().collect()),
+                    None => (0, std::collections::HashMap::new()),
+                };
+                let fresh = Arc::new(ReaderFrameScreen {
+                    control_root,
+                    g,
+                    lessee,
+                    tails_g,
+                    tails,
+                });
+                let _ = self.reader_frame_screens.remove_sync(&slot);
+                let _ = self
+                    .reader_frame_screens
+                    .insert_sync(slot, Arc::clone(&fresh));
+                fresh
+            }
+        };
+        if screen.g == 0 && screen.tails.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(super::node::FrameScreen {
+            g_current: screen.g,
+            appender_current: screen.lessee,
+            recorded_tail: screen.tails.get(&addr).map(|t| (screen.tails_g, *t)),
+            pr_fenced: self
+                .appenders
+                .as_ref()
+                .is_some_and(|a| a.stats().meta_pr_wero),
+        }))
+    }
+
+    /// Install the frame fence on a NON-WRITER open of a forest volume
+    /// (the writer's is installed by `prime_frame_stamps`): the stamp
+    /// side is never asked (nothing is written), the screen side reads
+    /// tree 0 ([`Self::reader_frame_screen_for`]). A flat volume installs
+    /// nothing — its v1 layout never consults the fence.
+    fn install_reader_frame_fence(self: &Arc<Self>) {
+        if self.forest().is_none() {
+            return;
+        }
+        self.cache.install_frame_fence(Arc::new(SlotFrameFence {
+            be: Arc::downgrade(self),
+        }));
     }
 
     // -----------------------------------------------------------------
@@ -15088,6 +15186,17 @@ struct SlotFrameFence {
     be: Weak<KvMetaBackend>,
 }
 
+/// One slot's screen inputs as a NON-WRITER read them off tree 0
+/// (`KvMetaBackend::reader_frame_screen_for`), valid while the control
+/// tree's root is `control_root`.
+struct ReaderFrameScreen {
+    control_root: u64,
+    g: u32,
+    lessee: Option<u32>,
+    tails_g: u32,
+    tails: std::collections::HashMap<u64, u32>,
+}
+
 impl super::node_cache::FrameFenceSource for SlotFrameFence {
     fn stamp_for(&self, slot: Option<super::record::ForestSlot>) -> super::node::FrameStamp {
         match self.be.upgrade() {
@@ -15866,16 +15975,19 @@ impl KvMetaBackend {
     /// because the writer holds the D0 flock here and a same-host holder
     /// at ANY mount point is therefore dead (`AppenderIdentity::
     /// owned_by_node`; the kill-9 successor remounting at another mount
-    /// point is the shipped shape). A `Live` page of a FOREIGN node
-    /// refuses a writer open loud — recovering another node's ring is
-    /// PR 10's driver, `squeezefs appender clear` the remedy — and a
+    /// point is the shipped shape). A `Live` page of a FOREIGN node is a
+    /// joined appender's (listed; recovered by the death ledger's driver,
+    /// `backend::recovery`, once its death is recorded — PR 10) unless
+    /// the declared partition claims its id, which refuses the join; a
     /// non-writer (reader / probe) lists it and mounts what tree 0 names.
-    /// A declared region ≥ 1 with an own `Live` page has its ring
-    /// replayed from the page's segments and tail (content only — the
-    /// manager owns every ring's structure in PR 2); `Free` / `Recovered`
-    /// pages get a fresh ring from the heap (`SQUEEZEFS_SYM_RING_KB` or
-    /// the derivation), never replayed. The three per-ring violation
-    /// classes are evaluated over EVERY ring's window and refuse loud.
+    /// A declared region ≥ 1 with an own `Live` (or `Recovering` — a
+    /// recoverer died inside our predecessor's recovery) page has its
+    /// ring replayed from the page's segments and tail (content only —
+    /// the manager owns every ring's structure in PR 2); `Free` /
+    /// `Recovered` pages get a fresh ring from the heap
+    /// (`SQUEEZEFS_SYM_RING_KB` or the derivation), never replayed. The
+    /// three per-ring violation classes are evaluated over EVERY ring's
+    /// window and refuse loud.
     #[allow(clippy::too_many_arguments)]
     async fn open_appender_regions(
         path: &Path,
@@ -15933,54 +16045,57 @@ impl KvMetaBackend {
         // `open`): a same-NODE Live page is a dead predecessor's residue
         // whatever mount slot it carried — see `owned_by_node`.
         let mine = |p: &AppenderPage| p.identity.owned_by_node(scope.0);
-        // A page no PR-2 writer may join over: a FOREIGN node's `Live`
-        // page (recovering another node's ring is PR 10's driver), or a
-        // `Recovering` page of any identity (a recoverer mid-replay,
-        // §5.9 — the design's joiner PARKS; nothing writes the state in
-        // PR 2, so this is the tripwire a PR-10 recoverer would trip).
+        // The ONE page a writer may not join over (PR 10 narrowed PR 2/3's
+        // refusal to it): a FOREIGN node's `Live` / `Recovering` page whose
+        // id the DECLARED partition claims — the seam would stand a fresh
+        // ring up over a joined appender's page, or race its recoverer.
         // The refusal is DEFERRED to the JOIN (step 7 of `open`, after
         // the D0 claim gate has classified the volume's holder): a LIVE
         // foreign writer on a shared non-PR LUN then gets the gate's own
         // "another process holds the writer claim" refusal, and the
         // non-joining Writer opens — `claim clear`, the guarded offline
         // verbs — are not blocked by a page they never write.
-        // PR 3 narrows the refusal to what a manager may not mount OVER:
-        // a `Recovering` page of any identity, and a foreign `Live` page
-        // whose id the DECLARED partition claims (the seam would steal a
-        // joined appender's page). A foreign `Live` page 0 is a manager
+        // Everything else mounts: a foreign `Live` page 0 is a manager
         // the D0 ladder took the claim from — dead by D0's proof, its ring
         // the fixed ring this open replayed — and the successor adopts it
         // with the role (§5.9); every OTHER foreign `Live` page is a
         // JOINED appender (`JoinAppender`, §5.3.5) — the directory's
         // normal state on a multi-appender volume, listed on
         // `appender_live_pages_at_mount`, recovered by the death ledger's
-        // driver when its death is proven (PR 10, `backend::recovery`),
-        // never a reason the manager cannot remount. A `Recovering` page
-        // (a recovery this volume's previous manager died inside, or an
-        // operator's `appender clear` attestation) is the mount-path
-        // gate's: recovered before the set serves when the ledger names
-        // it, refused there when nothing does.
+        // driver (`backend::recovery`) once the S6 owner records its
+        // death; a `Recovering` page (a recovery this volume's previous
+        // manager died inside, or an operator's `appender clear`
+        // attestation) is the mount-path gate's — recovered before the set
+        // serves when the ledger names it, refused there naming the verb
+        // when nothing does. A `Recovering` page of OUR OWN node is our
+        // dead predecessor's, mid-recovery by a recoverer that died: its
+        // ring is replayed as own residue exactly like a `Live` one (the
+        // partial recovery folded the same records — idempotent by seq).
         let join_refusal = if is_writer {
             entries
                 .iter()
                 .find_map(|e| {
                     e.page.as_ref().filter(|p| {
-                        p.state == AppenderState::Live
+                        matches!(p.state, AppenderState::Live | AppenderState::Recovering)
                             && !mine(p)
                             && partition.contains_key(&p.appender_id)
                     })
                 })
                 .map(|p| {
                     format!(
-                        "{}: appender page {} is LIVE under a foreign identity (node {:#018x}, \
-                         mount slot {:#x}, term {}) that the declared partition \
-                         ({}) claims — refusing to join over a joined appender's page",
+                        "{}: appender page {} is {:?} under a foreign identity (node {:#018x}, \
+                         mount slot {:#x}, term {}) that the declared partition ({}) claims — \
+                         refusing to join over a joined appender's page; a dead appender is \
+                         recovered by the death ledger's driver, and `squeezefs appender clear \
+                         <sqmeta-uri> {}` attests a death the membership plane never recorded",
                         path.display(),
                         p.appender_id,
+                        p.state,
                         p.identity.node_token,
                         p.identity.mount_slot,
                         p.term,
                         super::appender::TEST_APPENDER_SLOTS_ENV,
+                        p.appender_id,
                     )
                 })
         } else {
@@ -16065,7 +16180,9 @@ impl KvMetaBackend {
                 p.segments = vec![super::appender::appender0_ring_extent(&sb.journal)];
                 p
             });
-        let self_recovered0 = is_writer && page0.state == AppenderState::Live && mine(&page0);
+        let self_recovered0 = is_writer
+            && matches!(page0.state, AppenderState::Live | AppenderState::Recovering)
+            && mine(&page0);
         if self_recovered0 {
             set.self_recoveries.fetch_add(1, Ordering::Relaxed);
             log::info!(
@@ -16130,7 +16247,8 @@ impl KvMetaBackend {
                 .page
                 .clone()
                 .unwrap_or_else(|| AppenderPage::free(id, 0));
-            let own_live = page.state == AppenderState::Live && mine(&page);
+            let own_live = matches!(page.state, AppenderState::Live | AppenderState::Recovering)
+                && mine(&page);
             let reserve = checkpoint_reserve_bytes(ring_bytes);
             let (ring, self_recovered) = if own_live && !page.segments.is_empty() {
                 // Own residue: replay THIS ring from ITS page's tail.

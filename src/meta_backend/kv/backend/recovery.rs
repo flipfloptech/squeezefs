@@ -1186,7 +1186,7 @@ impl KvMetaBackend {
     ) -> std::result::Result<Vec<(u64, u32)>, KvError> {
         let node_size = self.cache.config().layout.node_size() as u64;
         let mut out = Vec::new();
-        for addr in tree.reachable_node_addrs().await? {
+        for addr in self.leaf_addrs_unloaded(tree).await? {
             let resident = self.cache.try_get(addr).is_some();
             if pr_fenced && !resident {
                 continue;
@@ -1200,6 +1200,70 @@ impl KvMetaBackend {
             out.push((addr, u32::try_from(tail).unwrap_or(u32::MAX)));
         }
         Ok(out)
+    }
+
+    /// Every leaf address of `tree` WITHOUT loading a leaf: the interior
+    /// population is walked (a level-1 node's children are the leaves),
+    /// so a non-resident leaf costs the tail peek's one extent read and
+    /// never a materialized node (`reachable_node_addrs` is C13's — it
+    /// loads everything, which would make every leaf resident and the
+    /// scan's ledger read 0).
+    async fn leaf_addrs_unloaded(&self, tree: &KvTree) -> std::result::Result<Vec<u64>, KvError> {
+        let root = tree.root();
+        let root_node = match self.cache.try_get(root.addr) {
+            Some(n) => n,
+            None => self
+                .cache
+                .load_for_slot(root.addr, tree.forest_slot())
+                .await?
+                .ok_or_else(|| {
+                    KvError::Corrupt(format!(
+                        "{}: slot tree root {:#x} is on a retired extent",
+                        self.path.display(),
+                        root.addr
+                    ))
+                })?,
+        };
+        if root_node.level() == 0 {
+            return Ok(vec![root.addr]);
+        }
+        let mut leaves = Vec::new();
+        let mut frontier: Vec<(u64, u8)> = vec![(root.addr, root_node.level())];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some((addr, level)) = frontier.pop() {
+            if !seen.insert(addr) {
+                continue;
+            }
+            let node = match self.cache.try_get(addr) {
+                Some(n) => n,
+                None => self
+                    .cache
+                    .load_for_slot(addr, tree.forest_slot())
+                    .await?
+                    .ok_or_else(|| {
+                        KvError::Corrupt(format!(
+                            "{}: interior node {addr:#x} is on a retired extent",
+                            self.path.display()
+                        ))
+                    })?,
+            };
+            let snap = node.snapshot();
+            let mut cursor: Vec<u8> = Vec::new();
+            while let Some((key, ptr)) = snap.next_live(&cursor, None)? {
+                let (child, _seq) = crate::meta_backend::kv::tree::decode_interior_value(&ptr)?;
+                if level == 1 {
+                    leaves.push(child);
+                } else {
+                    frontier.push((child, level - 1));
+                }
+                cursor.clear();
+                cursor.extend_from_slice(&key);
+                cursor.push(0);
+            }
+        }
+        leaves.sort_unstable();
+        leaves.dedup();
+        Ok(leaves)
     }
 
     /// The tree-0 step of one recovery (the leave's per-region body for a

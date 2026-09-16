@@ -6,8 +6,10 @@
 //! `TokenReplyFrame` the holder answers (`Granted` with the object's
 //! RECORDS — attrs, xattrs, a dentry page — `NotHolder` / `Gone` /
 //! `Recall` / `Acked` / `Released` / `Refused`; since PR 9
-//! `CustodyGranted` carrying the S9 grant record beside the records, and
-//! `CustodyRefused` with the custody wire's status word).
+//! `CustodyGranted` carrying the S9 grant record beside the records,
+//! `CustodyRefused` with the custody wire's status word, and — review
+//! round 2, Issue 3 — `Rejected`, a wire word screened at the service
+//! edge).
 //!
 //! Threat model: the body arrives on an AUTHENTICATED `cluster_wire`
 //! session, but authentication is membership, not trust — a reader with a
@@ -22,21 +24,27 @@
 //! * **round-trip** — whatever decodes re-encodes to bytes that decode
 //!   to an equal frame, and the re-encode is canonical.
 //!
-//! Two arms: the raw bytes (the reject ladder, both directions) and an
+//! Three arms: the raw bytes (the reject ladder, both directions), an
 //! `Arbitrary`-built frame encoded then decoded — the constructive mirror
-//! that reaches every variant, incl. a `Granted` carrying a dentry page.
-//! The mirrors are local: the wire vocabulary must not grow a derive for
-//! the fuzzer's sake, and a mirror that falls out of step fails to compile
-//! here (a new verb lands with its fuzz arm or not at all).
+//! that reaches every variant, incl. a `Granted` carrying a dentry page —
+//! and the SERVICE EDGE over a decoded `CustodyGrant`'s integers
+//! (`screen_custody_words` — PR 9 review round 2, Issues 3/13: the `object`
+//! word once reached the forest codec's `debug_assert` / release
+//! truncation before any screen; the screen must be total over every
+//! `u64` and reject what the forest does not name). The mirrors are
+//! local: the wire vocabulary must not grow a derive for the fuzzer's
+//! sake, and a mirror that falls out of step fails to compile here (a new
+//! verb lands with its fuzz arm or not at all).
 #![no_main]
 
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use squeezefs::data_grant::GrantRecord;
+use squeezefs::meta_backend::kv::record::{FOREST_SLOT_MAX, NATIVE_FOREST_SLOT};
 use squeezefs::meta_ship::token_plane::{
-    decode_reply, decode_request, encode_reply, encode_request, DirRecord, TokenCall, TokenMode,
-    TokenRecords, TokenReply, TokenReplyFrame, TokenRequestFrame, TokenWants, WireAttrs,
-    TOKEN_SCHEMA,
+    decode_reply, decode_request, encode_reply, encode_request, screen_custody_words, DirRecord,
+    TokenCall, TokenMode, TokenRecords, TokenReply, TokenReplyFrame, TokenRequestFrame, TokenWants,
+    WireAttrs, TOKEN_SCHEMA,
 };
 
 #[derive(Arbitrary, Debug)]
@@ -175,6 +183,9 @@ enum ArbReply {
         status: u16,
         reason: String,
     },
+    Rejected {
+        reason: String,
+    },
 }
 
 /// The bounded `TokenRecords` of a granted reply (both grant shapes).
@@ -262,6 +273,9 @@ impl ArbReply {
                 status,
                 reason: reason.chars().take(256).collect(),
             },
+            ArbReply::Rejected { reason } => TokenReply::Rejected {
+                reason: reason.chars().take(256).collect(),
+            },
             ArbReply::NotHolder { holder } => TokenReply::NotHolder { holder },
             ArbReply::Gone => TokenReply::Gone,
             ArbReply::Recall { frame_id, objects } => TokenReply::Recall {
@@ -328,4 +342,58 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(decode_reply(&enc).expect("decodes"), frame);
         }
     }
+
+    // Arm 3: the service edge — every decoded `CustodyGrant`'s words
+    // through the screen against a small forest (the native slot + the
+    // guest slots 1..=8 named, routing slot = forest slot - 1), and the
+    // raw words directly: total over every u64, and the accept set is
+    // exactly the forest's.
+    if let Ok(frame) = decode_request(data) {
+        if let TokenCall::CustodyGrant { object, span, .. } = frame.call {
+            let _ = screen_custody_words(object, span, &small_forest);
+        }
+    }
+    if let (Ok(object), Ok(span)) = (
+        u64::arbitrary(&mut u),
+        Option::<(u64, u64)>::arbitrary(&mut u),
+    ) {
+        let verdict = screen_custody_words(object, span, &small_forest);
+        let forest_slot = object >> 40;
+        let raw = if forest_slot == u64::from(NATIVE_FOREST_SLOT) {
+            object
+        } else {
+            object & ((1u64 << 40) - 1)
+        };
+        let named = forest_slot == u64::from(NATIVE_FOREST_SLOT) || (1..=8).contains(&forest_slot);
+        let span_ok = span.is_none_or(|(s, e)| s < e);
+        let accept = forest_slot <= u64::from(FOREST_SLOT_MAX) && raw >= 2 && named && span_ok;
+        assert_eq!(
+            verdict.is_ok(),
+            accept,
+            "the screen's accept set is the forest's: {object:#x} {span:?} → {verdict:?}"
+        );
+        if let Ok((routing, r)) = verdict {
+            assert_eq!(r, raw);
+            assert_eq!(
+                u64::from(routing),
+                if forest_slot == u64::from(NATIVE_FOREST_SLOT) {
+                    0
+                } else {
+                    forest_slot - 1
+                }
+            );
+        }
+    }
 });
+
+/// The service-edge arm's forest: the native slot (routing 0) and guest
+/// forest slots 1..=8 (routing slot = forest slot - 1); nothing else.
+fn small_forest(forest_slot: u32) -> Option<u16> {
+    if forest_slot == NATIVE_FOREST_SLOT {
+        Some(0)
+    } else if (1..=8).contains(&forest_slot) {
+        Some((forest_slot - 1) as u16)
+    } else {
+        None
+    }
+}

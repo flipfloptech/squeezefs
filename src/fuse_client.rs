@@ -7901,6 +7901,15 @@ pub struct Metrics {
     pub patch_ineligible_device_overlay: Align64<AtomicU64>,
     /// Predicate 4 failures: block refcount != 1 (clone-shared — CoW).
     pub patch_ineligible_shared: Align64<AtomicU64>,
+    /// Symmetric PR 9 (review round 2, Issue 12): W1 declined because this
+    /// mount holds the file's custody from its SLOT HOLDER — the block's
+    /// references live in the holder's tree, which the durable probe
+    /// cannot read (`routing::SoleOwnerVerdict::ForeignCustody`); the
+    /// write takes the CoW path. Apart from `patch_ineligible_shared` so
+    /// the ledger names the clause: growth here on a foreign-custody
+    /// rand-4k shape is the priced economy cost (a whole-block CoW per
+    /// sub-block overwrite — the pre-W1 class), not predicate rot.
+    pub patch_ineligible_foreign_custody: Align64<AtomicU64>,
     /// **Clause 7** failures (DLM stage S11 — pre-rc spec §6.7/§6.3): the
     /// block's bytes are under BYTE-RANGE custody this writer does not
     /// solely own (a foreign live range overlaps the block, or the
@@ -12423,6 +12432,7 @@ impl SqueezefsFilesystem {
                 "patch_ineligible_overlay": METRICS.patch_ineligible_overlay.load(Ordering::Relaxed),
                 "patch_ineligible_device_overlay": METRICS.patch_ineligible_device_overlay.load(Ordering::Relaxed),
                 "patch_ineligible_shared": METRICS.patch_ineligible_shared.load(Ordering::Relaxed),
+                "patch_ineligible_foreign_custody": METRICS.patch_ineligible_foreign_custody.load(Ordering::Relaxed),
                 "patch_ineligible_range_shared": METRICS.patch_ineligible_range_shared.load(Ordering::Relaxed),
                 "patch_ineligible_transform": METRICS.patch_ineligible_transform.load(Ordering::Relaxed),
                 "patch_ineligible_adjacent": METRICS.patch_ineligible_adjacent.load(Ordering::Relaxed),
@@ -13919,6 +13929,14 @@ impl SqueezefsFilesystem {
                     lease(&|s| s.rotor_cap_refusals),
                 );
                 metrics.insert("slot_grant_deferrals".into(), lease(&|s| s.grant_deferrals));
+                // Symmetric PR 9 (review round 2, Issue 5): handovers
+                // deferred for a live custody grant — the grants recalled
+                // through the S9 pull channel, the requester's retryable
+                // `Deferred`; 0 on every unarmed mount.
+                metrics.insert(
+                    "slot_handover_custody_deferrals".into(),
+                    load(&crate::data_grant::HANDOVER_CUSTODY_DEFERRALS),
+                );
                 metrics.insert("slot_offers_busy".into(), lease(&|s| s.offers_busy));
                 metrics.insert(
                     "meta_kv_leaf_lease_refusals".into(),
@@ -17636,15 +17654,26 @@ impl SqueezefsFilesystem {
         // retired so a non-resident leaf's read never sits inside the
         // unstable window (racing validated fills and a clone's pin would
         // otherwise fail their re-checks for the probe's duration).
-        if !self
+        match self
             .router
-            .sole_owner_durably(ino, &allocator, dev_offset)
+            .sole_owner_verdict(ino, &allocator, dev_offset)
             .await
         {
-            METRICS
-                .patch_ineligible_shared
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(false);
+            crate::routing::SoleOwnerVerdict::Sole => {}
+            crate::routing::SoleOwnerVerdict::Shared => {
+                METRICS
+                    .patch_ineligible_shared
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(false);
+            }
+            // Symmetric PR 9: a foreign-custody file — its own label
+            // (review round 2, Issue 12), never the SHARED clause's.
+            crate::routing::SoleOwnerVerdict::ForeignCustody => {
+                METRICS
+                    .patch_ineligible_foreign_custody
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(false);
+            }
         }
         if !allocator.begin_patch_sole_owner(dev_offset) {
             // Back off: re-stabilize (content never changed) and CoW.

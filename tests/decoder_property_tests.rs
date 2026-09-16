@@ -2263,6 +2263,7 @@ fn arb_token_reply() -> impl Strategy<Value = TokenReply> {
             }),
         (any::<u16>(), "\\PC{0,64}")
             .prop_map(|(status, reason)| TokenReply::CustodyRefused { status, reason }),
+        "\\PC{0,64}".prop_map(|reason| TokenReply::Rejected { reason }),
         any::<u32>().prop_map(|holder| TokenReply::NotHolder { holder }),
         Just(TokenReply::Gone),
         (any::<u64>(), prop::collection::vec(any::<u64>(), 0..32))
@@ -2313,6 +2314,56 @@ proptest! {
         let frame = TokenReplyFrame { schema: TOKEN_SCHEMA, request_id, reply };
         let enc = encode_token_reply(&frame).expect("encodes");
         prop_assert_eq!(decode_token_reply(&enc).expect("decodes"), frame);
+    }
+
+    /// PR 9 review round 2 (Issues 3/13) — the `CustodyGrant` service edge:
+    /// `screen_custody_words` is TOTAL over every `object` word (the forest
+    /// codec's `split_guest_local` debug-asserts the slot word — what a peer
+    /// word reached before the screen) and its accept set is EXACTLY the
+    /// forest's: a slot ≤ the codec's bound that the forest names, a raw
+    /// local ino ≥ 2, a well-formed span. The fuzz target's arm 3 mirror.
+    #[test]
+    fn custody_grant_screen_is_total_and_accepts_exactly_the_forest(
+        object in prop_oneof![
+            any::<u64>(),
+            // The interesting region: slot words around the bound.
+            (0u64..=70_000u64, any::<u64>())
+                .prop_map(|(slot, raw)| (slot << 40) | (raw & ((1u64 << 40) - 1))),
+        ],
+        span in prop::option::of((any::<u64>(), any::<u64>())),
+    ) {
+        use squeezefs::meta_backend::kv::record::{FOREST_SLOT_MAX, NATIVE_FOREST_SLOT};
+        use squeezefs::meta_ship::token_plane::screen_custody_words;
+        let forest = |fs: u32| -> Option<u16> {
+            if fs == NATIVE_FOREST_SLOT {
+                Some(0)
+            } else if (1..=8).contains(&fs) {
+                Some((fs - 1) as u16)
+            } else {
+                None
+            }
+        };
+        let verdict = screen_custody_words(object, span, &forest);
+        let forest_slot = object >> 40;
+        let raw = if forest_slot == u64::from(NATIVE_FOREST_SLOT) {
+            object
+        } else {
+            object & ((1u64 << 40) - 1)
+        };
+        let named =
+            forest_slot == u64::from(NATIVE_FOREST_SLOT) || (1..=8).contains(&forest_slot);
+        let span_ok = span.is_none_or(|(s, e)| s < e);
+        let accept = forest_slot <= u64::from(FOREST_SLOT_MAX) && raw >= 2 && named && span_ok;
+        prop_assert_eq!(verdict.is_ok(), accept, "{:#x} {:?} → {:?}", object, span, verdict);
+        if let Ok((routing, r)) = verdict {
+            prop_assert_eq!(r, raw);
+            let expect_routing = if forest_slot == u64::from(NATIVE_FOREST_SLOT) {
+                0
+            } else {
+                forest_slot - 1
+            };
+            prop_assert_eq!(u64::from(routing), expect_routing);
+        }
     }
 }
 

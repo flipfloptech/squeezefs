@@ -431,7 +431,6 @@ struct Venue {
     owner: Arc<WriteCustodyOwner>,
     arm: Arc<SlotCustodyArm>,
     sink: Arc<ProbeSink>,
-    ms: Arc<AtomicU64>,
 }
 
 impl Venue {
@@ -478,7 +477,6 @@ impl Venue {
             owner,
             arm,
             sink,
-            ms,
         }
     }
 
@@ -1229,6 +1227,8 @@ async fn the_wire_word_object_is_screened_before_the_arbiter_sees_it() {
         .expect("the legit grant dials the holder");
     let granted0 = venue.owner.stats().granted;
     let client = venue.arm.holder_client(&venue.endpoint).await.unwrap();
+    let holder_plane = rig.routed.volumes[0].token_holder().unwrap().clone();
+    let rejected0 = holder_plane.stats().custody_rejected;
 
     // (a) a slot word past FOREST_SLOT_MAX — the codec's debug_assert /
     // release truncation; (b) a control record; (c) a slot the forest does
@@ -1268,6 +1268,11 @@ async fn the_wire_word_object_is_screened_before_the_arbiter_sees_it() {
         "the arbiter never took a lease for a screened word"
     );
     assert_eq!(venue.owner.held(), 1, "only the legit grant is held");
+    assert_eq!(
+        holder_plane.stats().custody_rejected,
+        rejected0 + 4,
+        "every screened word counted on the rejected class (dlm_token_custody_rejected)"
+    );
     assert!(lease.is_held().await, "the legit grant is untouched");
     drop(lease);
     venue.tear_down().await;
@@ -1347,14 +1352,335 @@ async fn a_dead_holder_never_delays_an_acquire_against_a_live_one() {
     rig.shutdown().await;
 }
 
-/// A dead HOLDER's custody: the writer's lease at it runs the S9 law —
-/// past its own `T_self` (strictly before the holder's TTL) the writer
-/// POISONS its custody (PR 8's `FenceClass::RemoteCustody`, never the
-/// appender park), so no DMA lands after the holder may have re-granted;
-/// the holder's sweep at its TTL retires the grant. The holder side of a
-/// dead holder — its slots re-leased — is PR 10's recovery.
+/// One LIVE slot holder among N in this process (the N-holder contracts —
+/// review round 2, Issues 7 and 10): its own S9 custody authority (its own
+/// era and lease-epoch counter), its own listener whose token service
+/// arbitrates custody on THAT authority, registered as appender
+/// `appender`'s endpoint on the plane. Shares the venue's manual clock.
+struct Holder {
+    host: Arc<cw::RpcListener>,
+    endpoint: String,
+    owner: Arc<WriteCustodyOwner>,
+}
+
+impl Holder {
+    /// `term_bump` sets the holder's era above the process's; `prejoin`
+    /// throwaway JOINs raise its lease-epoch counter (a "busier" holder).
+    async fn stand_up(
+        rig: &DataRig,
+        appender: u32,
+        ms: &Arc<AtomicU64>,
+        term_bump: u64,
+        prejoin: usize,
+    ) -> Self {
+        let (c, clock) = clocks(ms);
+        let owner = WriteCustodyOwner::arm(
+            &format!("slot-holder-{appender}"),
+            squeezefs::dlm::durable_term() + term_bump,
+            squeezefs::dlm::durable_term(),
+            c,
+            clock,
+            None,
+        )
+        .expect("the holder's custody authority arms");
+        for i in 0..prejoin {
+            owner
+                .join(&data_grant::JoinFrame {
+                    schema: data_grant::CUSTODY_SCHEMA,
+                    client: format!("filler-{appender}-{i}"),
+                    pr_key: 0,
+                    prior_epoch: None,
+                })
+                .expect("a filler join");
+        }
+        let router = AsyncVerbRouter::new()
+            .with_custody(Arc::clone(&owner))
+            .with_tokens(TokenSetService::with_custody_owner(
+                &rig.routed.volumes,
+                Arc::clone(&owner),
+            ))
+            .with_manager(ManagerSetService::new(&rig.routed.volumes));
+        let host = cw::RpcListener::start_async(listener_cfg(), SECRET.to_vec(), Arc::new(router))
+            .expect("holder listener");
+        let endpoint = host.endpoint().to_string();
+        for vol in &rig.routed.volumes {
+            vol.slot_leases()
+                .expect("armed")
+                .holders
+                .set_endpoint(appender, &endpoint);
+        }
+        Self {
+            host,
+            endpoint,
+            owner,
+        }
+    }
+}
+
+impl Drop for Holder {
+    fn drop(&mut self) {
+        self.host.shutdown();
+        self.owner.revoke_client(WRITER, "test holder dropped");
+    }
+}
+
+/// The two-live-holder venue: holder A (appender 1, slot 4) at the
+/// process's era, holder B (appender 2, slot 5) two eras up and six joins
+/// busier; the arm installed on a MANUAL clock shared with both owners.
+async fn two_live_holders(rig: &DataRig) -> (Holder, Holder, Arc<AtomicU64>, Arc<SlotCustodyArm>) {
+    let ms = Arc::new(AtomicU64::new(1_000));
+    let a = Holder::stand_up(rig, 1, &ms, 1, 0).await;
+    let b = Holder::stand_up(rig, 2, &ms, 3, 6).await;
+    let arm = data_grant::arm_slot_custody_with_clock(
+        &rig.routed,
+        WRITER,
+        SECRET.to_vec(),
+        0,
+        Arc::new(|_v| {
+            Arc::new(ProbeSink {
+                calls: AtomicU64::new(0),
+            }) as Arc<dyn RecallDataSink>
+        }),
+        LeaseClock::manual(Arc::clone(&ms)),
+    );
+    (a, b, ms, arm)
+}
+
+/// Review round 2, Issue 7 — **the custody generation is per holder**: a
+/// grant adopted from a BUSIER holder (a higher lease-epoch counter, a
+/// higher era) never moves this process's custody epoch, so a DMA
+/// authorized under another holder's grant — captured at write-pipeline
+/// admission, submitted later — is never refused (`data_dma_epoch_refusals`
+/// stays 0; a refusal there is a `FenceDrop`, acked data lost). The
+/// process's durable term is untouched too (the holder's era is its
+/// volume's, one of N).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_writer_poisons_at_t_self_when_its_holder_stops_answering_and_never_parks() {
+async fn a_grant_from_a_busier_holder_never_voids_dma_in_flight_under_another() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let (uris, inos) = holders_volume(
+        dir.path(),
+        data.path(),
+        &[(SLOT_B, "a-file"), (SLOT_C, "b-file")],
+        0,
+    )
+    .await;
+    let (file_a, file_b) = (inos[0], inos[1]);
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(THREE_HOLDERS)).await;
+    let (a, b, _ms, _arm) = two_live_holders(&rig).await;
+    let refusals = || {
+        squeezefs::fuse_client::METRICS
+            .data_dma_epoch_refusals
+            .load(Ordering::Relaxed)
+    };
+    let gen0 = data_custody::custody_generation();
+    let term0 = squeezefs::dlm::durable_term();
+
+    // Custody of A's file: the write pipeline captures the epoch at
+    // admission (the permit is the carrier) — here, the same read.
+    let lease_a = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(file_a), None, Duration::from_secs(2))
+        .await
+        .expect("custody from holder A");
+    let in_flight = data_custody::current_epoch();
+    assert_eq!(a.owner.held(), 1);
+
+    // Custody of B's file — B's lease epoch for this writer is 7 (six
+    // fillers joined first) against A's 1, and B's era is two up.
+    let lease_b = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(file_b), None, Duration::from_secs(2))
+        .await
+        .expect("custody from holder B");
+    assert_eq!(b.owner.held(), 1);
+    assert!(
+        b.owner.stats().clients > 6,
+        "premise: B is the busier holder (its lease-epoch counter is higher)"
+    );
+
+    // The DMA under A's grant submits now.
+    let refusals0 = refusals();
+    assert!(
+        data_custody::authorize_dma(Some(in_flight)).is_ok(),
+        "a DMA authorized under holder A's grant is refused after adopting holder B's — \
+         the two holders' epochs were folded into one process word"
+    );
+    assert_eq!(refusals(), refusals0, "zero epoch refusals");
+    assert_eq!(
+        data_custody::custody_generation(),
+        gen0,
+        "no holder's lease epoch moved the process generation"
+    );
+    assert_eq!(
+        squeezefs::dlm::durable_term(),
+        term0,
+        "no holder's era moved the process's durable term"
+    );
+    assert!(lease_a.is_held().await && lease_b.is_held().await);
+    drop(lease_a);
+    drop(lease_b);
+    data_grant::disarm_slot_custody().await;
+    assert_eq!(a.owner.held(), 0);
+    assert_eq!(b.owner.held(), 0);
+    rig.shutdown().await;
+}
+
+/// Review round 2, Issues 10 + 16 — **a dead holder's `T_self` fence is
+/// scoped to that holder's custody**, and it is the renewal CADENCE that
+/// fires it (the listener down, the manual clock past `T_self`): holder
+/// A's grants are dead, this mount's generation advances, A's token plane
+/// serves nothing, the arm forgets A — and the mount LIVES: nothing is
+/// poisoned, no park, holder B's file keeps its custody and a fresh
+/// acquire against B succeeds. A's TTL sweep retires the dead lease. What
+/// remains for PR 10 (the death ledger re-leasing A's slots) and PR 12
+/// (the per-object epoch capture) is stated in the note.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_holders_t_self_fence_is_scoped_to_its_own_custody_and_driven_by_the_cadence() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let (uris, inos) = holders_volume(
+        dir.path(),
+        data.path(),
+        &[(SLOT_B, "a-file"), (SLOT_C, "b-file")],
+        0,
+    )
+    .await;
+    let (file_a, file_b) = (inos[0], inos[1]);
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(THREE_HOLDERS)).await;
+    let (a, b, ms, arm) = two_live_holders(&rig).await;
+    let (_v, local_a) = rig.routed.route_ino(file_a);
+    let lease_a = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(file_a), None, Duration::from_secs(2))
+        .await
+        .expect("custody from holder A");
+    let lease_b = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(file_b), None, Duration::from_secs(2))
+        .await
+        .expect("custody from holder B");
+    let client_a = arm.holder_client(&a.endpoint).await.expect("A dialed");
+    let tokens_a = arm.token_plane(&a.endpoint, 0).await.expect("A's plane");
+    assert!(tokens_a.holds(local_a));
+    let t_self_a = client_a.t_self_deadline_ms();
+    let t_owner_a = a
+        .owner
+        .lease_deadline_ms(WRITER)
+        .expect("A tracks the writer");
+    assert!(
+        t_self_a < t_owner_a,
+        "premise: T_self is strictly before the holder's TTL"
+    );
+    let s0 = data_grant::stats();
+    let gen0 = data_custody::custody_generation();
+
+    // Holder A dies: its listener is gone, and the clock passes T_self.
+    // The renewal cadence's failed renewal past T_self is what fences —
+    // this contract calls no fence itself.
+    a.host.shutdown();
+    ms.store(t_self_a + 1, Ordering::SeqCst);
+    wait_until("holder A's custody client fences itself at T_self", || {
+        client_a.fenced()
+    })
+    .await;
+
+    // The fence is SCOPED: A's custody is gone, the mount lives.
+    assert!(
+        !data_custody::poisoned(),
+        "one dead holder never poisons the mount"
+    );
+    assert!(
+        !squeezefs::park_gate::is_parked(),
+        "the RemoteCustody class never parks"
+    );
+    assert!(
+        data_custody::authorize_dma(None).is_ok(),
+        "fresh DMA authorizations are still minted"
+    );
+    let s1 = data_grant::stats();
+    assert_eq!(
+        s1.holder_fences,
+        s0.holder_fences + 1,
+        "counted on its own gauge"
+    );
+    assert_eq!(
+        s1.self_fences, s0.self_fences,
+        "never on the poison's gauge"
+    );
+    assert!(
+        data_custody::custody_generation() > gen0,
+        "the S9 law for a lost lease: the generation advanced (in-flight DMA under A's grants \
+         is refused at the device gate — the one-word carrier's cost, stated in the note)"
+    );
+    assert!(!lease_a.is_held().await, "A's grant is dead on this side");
+    assert!(
+        !tokens_a.holds(local_a),
+        "A's token plane serves nothing after its holder died"
+    );
+    assert!(
+        arm.holder_client(&a.endpoint).await.is_none(),
+        "the arm forgot the dead holder"
+    );
+    // Holder B is untouched: its grant stands and a fresh acquire lands.
+    assert!(lease_b.is_held().await, "B's custody is untouched");
+    let via0 = data_grant::stats().via_slot_holder;
+    drop(lease_b);
+    let client_b = arm.holder_client(&b.endpoint).await.expect("B dialed");
+    client_b.drain_releases().await;
+    let lease_b2 = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(file_b), None, Duration::from_secs(2))
+        .await
+        .expect("a fresh acquire against the LIVE holder");
+    assert!(lease_b2.is_held().await);
+    assert_eq!(data_grant::stats().via_slot_holder, via0 + 1);
+    // A's file: the dead holder is re-dialed and refused (its slots are
+    // re-leased by PR 10's recovery) — an EAGAIN-class refusal, never a
+    // poison, never a `LockFailed` the POSIX ladder retries for its
+    // whole budget.
+    let err = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(file_a), None, Duration::from_millis(500))
+        .await
+        .expect_err("no custody from a dead holder");
+    assert!(
+        matches!(
+            &err,
+            squeezefs::error::SqueezefsError::Refused { errno, .. } if *errno == libc::EAGAIN
+        ),
+        "the dead holder's refusal is typed EAGAIN: {err:?}"
+    );
+    assert!(!data_custody::poisoned());
+    // A's TTL passes: its sweep retires the dead writer's lease.
+    ms.store(t_owner_a + 1, Ordering::SeqCst);
+    let expired = a.owner.expire_due();
+    assert_eq!(expired.len(), 1, "holder A swept the fenced writer's lease");
+    assert_eq!(a.owner.held(), 0);
+    drop(lease_a);
+    drop(lease_b2);
+    data_grant::disarm_slot_custody().await;
+    assert_eq!(b.owner.held(), 0, "the clean leave released B's grants");
+    rig.shutdown().await;
+}
+
+/// Review round 2, Issue 8 — a carried token whose INSTALL fails after
+/// custody was granted keeps the custody: the caller adopts the lease it
+/// was granted (the holder holds exactly that grant), the failure is
+/// counted on `dlm_custody_token_carry_failures`, and the token is fetched
+/// at the next serve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_token_install_never_throws_away_granted_custody() {
     let _g = SEAM.lock().await;
     let _restore = Restore;
     let dir = tempdir().unwrap();
@@ -1362,63 +1688,228 @@ async fn a_writer_poisons_at_t_self_when_its_holder_stops_answering_and_never_pa
     let (uris, foreign) = two_holder_volume(dir.path(), data.path()).await;
     let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(TWO_HOLDERS)).await;
     let venue = Venue::stand_up(&rig, &[1]).await;
+    let (_v, local) = rig.routed.route_ino(foreign);
+    let s0 = data_grant::stats();
+    squeezefs::meta_ship::token_plane::TEST_INSTALL_CARRIED_FAIL_ONCE.store(true, Ordering::SeqCst);
+    let lease = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(foreign), None, Duration::from_secs(2))
+        .await
+        .expect("custody is the caller's whatever became of the token");
+    assert!(
+        !squeezefs::meta_ship::token_plane::TEST_INSTALL_CARRIED_FAIL_ONCE.load(Ordering::SeqCst),
+        "premise: the seam fired"
+    );
+    assert!(lease.is_held().await);
+    assert_eq!(
+        venue.owner.held(),
+        1,
+        "the holder holds exactly the grant the caller adopted"
+    );
+    let s1 = data_grant::stats();
+    assert_eq!(s1.via_slot_holder, s0.via_slot_holder + 1);
+    assert_eq!(s1.token_carried, s0.token_carried, "no token landed");
+    assert_eq!(s1.token_carry_failures, s0.token_carry_failures + 1);
+    let tokens = venue.arm.token_plane(&venue.endpoint, 0).await.unwrap();
+    assert!(!tokens.holds(local), "nothing installed");
+    // The next serve fetches the token the ordinary way.
+    wait_until(
+        "the writer's recall channel completes its first round",
+        || tokens.stats().channel_fresh,
+    )
+    .await;
+    let serve = tokens
+        .serve(local, TokenWants::default())
+        .await
+        .expect("serve")
+        .expect("the file exists");
+    assert_eq!(serve.entry().attrs.mode & libc::S_IFMT, libc::S_IFREG);
+    assert!(tokens.holds(local), "fetched at the next serve");
+    drop(lease);
+    venue.tear_down().await;
+    rig.shutdown().await;
+}
+
+/// Review round 2, Issue 15 — a `NotHolder` answer re-resolves through
+/// tree 0: when the slot was handed to THIS mount under the acquire, the
+/// acquire answers `NowLocal` and the lock manager falls to its local
+/// arbiter (never an `Unbound` refusal naming appender 0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_not_holder_answer_for_a_slot_now_ours_falls_to_the_local_arbiter() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let (uris, foreign) = two_holder_volume(dir.path(), data.path()).await;
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(TWO_HOLDERS)).await;
+    let venue = Venue::stand_up(&rig, &[1]).await;
+    let vol = Arc::clone(&rig.routed.volumes[0]);
+    // The stale view: resolved while appender 1 still leased the slot.
+    let stale = data_grant::slot_holder_home(foreign).expect("foreign while leased to 1");
+    assert!(matches!(
+        &stale,
+        data_grant::CustodyHome::Holder { holder: 1, .. }
+    ));
+    // The slot moves to THIS mount (the manager) under the writer's view.
+    vol.release_slot_handover(1, SLOT_B)
+        .await
+        .expect("no custody yet — the slot moves");
+    assert!(
+        data_grant::slot_holder_home(foreign).is_none(),
+        "premise: the slot is ours now"
+    );
+    // One process shares tree 0 between the holder's plane and the
+    // writer, so the holder's own view cannot lag the writer's: the seam
+    // answers the cross-process `NotHolder { holder: 0 }` once.
+    squeezefs::meta_ship::token_plane::TEST_CUSTODY_NOT_HOLDER_ONCE.store(0, Ordering::SeqCst);
+    let granted0 = venue.owner.stats().granted;
+    let out = data_grant::acquire_at_slot_holder(
+        stale,
+        foreign,
+        None,
+        squeezefs::dlm::LockMode::Exclusive,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("a NotHolder for a slot now ours is not a refusal");
+    assert!(
+        matches!(out, data_grant::HolderAcquire::NowLocal),
+        "the acquire answers NowLocal — the caller's local arbiter serves"
+    );
+    assert_eq!(
+        venue.owner.stats().granted,
+        granted0,
+        "the old holder granted nothing"
+    );
+    // Through the lock manager end to end: local custody, no RPC counted
+    // past the redirect's own.
+    let lease = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(foreign), None, Duration::from_secs(2))
+        .await
+        .expect("local custody");
+    assert!(lease.is_held().await);
+    drop(lease);
+    venue.tear_down().await;
+    rig.shutdown().await;
+}
+
+/// Review round 2, Issues 5 + 9 — **the deferral is BOUNDED by a recall**
+/// (design §5.1.4 flush-then-transfer): the first deferred handover
+/// RECALLS the slot's live grants through the S9 pull channel; the writer
+/// absorbs the recall on its standing notice poll, marks the grant dead
+/// locally (its next write re-acquires) and releases once quiescent; a
+/// re-acquire at the old holder meanwhile is DEFERRED (the recall cannot be
+/// undone); the requester's next attempt finds the grants gone and the
+/// slot moves — within one renewal beat of the recall, whatever the
+/// writer's open-file lifetime. Nothing was voided: no DMA refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deferred_handover_recalls_the_custody_and_completes_within_a_beat() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let (uris, foreign) = two_holder_volume(dir.path(), data.path()).await;
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(TWO_HOLDERS)).await;
+    let venue = Venue::stand_up(&rig, &[1]).await;
+    let vol = Arc::clone(&rig.routed.volumes[0]);
+    let refusals = || {
+        squeezefs::fuse_client::METRICS
+            .data_dma_epoch_refusals
+            .load(Ordering::Relaxed)
+    };
     let lease = rig
         .router
         .dlm
         .acquire_lock(&lock_path(foreign), None, Duration::from_secs(2))
         .await
         .expect("custody from the slot holder");
+    let in_flight = data_custody::current_epoch();
     let client = venue.arm.holder_client(&venue.endpoint).await.unwrap();
-    let t_owner = venue
-        .owner
-        .lease_deadline_ms(WRITER)
-        .expect("the holder tracks the writer's lease");
+    let s0 = data_grant::stats();
+    let deferrals0 = data_grant::HANDOVER_CUSTODY_DEFERRALS.load(Ordering::Relaxed);
+    let refusals0 = refusals();
+
+    // Attempt 1: deferred, the grant recalled.
+    let err = vol
+        .release_slot_handover(1, SLOT_B)
+        .await
+        .expect_err("deferred while the writer holds custody");
     assert!(
-        !client.self_fence_due(),
-        "premise: the writer's own deadline (T_self, strictly before the holder's TTL by the \
-         S6 formula) has not passed"
+        matches!(
+            &err,
+            squeezefs::meta_backend::kv::KvError::HandoverDeferred(_)
+        ),
+        "the typed deferral: {err:?}"
     );
-    // The holder stops answering: its listener is gone, so no renewal
-    // can complete and the writer's cadence reaches T_self (the S9 loop's
-    // act, pinned on its own clock in the S9 suite); the ACT is what this
-    // pin classifies.
-    venue.host.shutdown();
+    assert_eq!(
+        data_grant::HANDOVER_CUSTODY_DEFERRALS.load(Ordering::Relaxed),
+        deferrals0 + 1
+    );
+    assert_eq!(venue.owner.recalled(), 1, "the holder recalled the grant");
+    assert_eq!(
+        data_grant::handover_recalls_pending(),
+        1,
+        "the slot is mid-handover"
+    );
+
+    // The writer's standing notice poll absorbs the recall and releases.
+    wait_until("the recalled writer releases at the holder", || {
+        venue.owner.held() == 0
+    })
+    .await;
+    assert_eq!(
+        data_grant::stats().recalls_absorbed,
+        s0.recalls_absorbed + 1
+    );
+    assert!(!lease.is_held().await, "the local handle reads the recall");
+    // A re-acquire at the OLD holder mid-handover is deferred, never
+    // granted (the recall cannot be undone); the acquire's own retry loop
+    // answers EAGAIN inside its budget.
+    let err = client
+        .acquire_carrying_token(
+            0,
+            rig.routed.route_ino(foreign).1,
+            None,
+            squeezefs::dlm::LockMode::Exclusive,
+            Duration::from_millis(100),
+        )
+        .await;
     assert!(
-        !squeezefs::park_gate::is_parked(),
-        "premise: nothing parked"
+        matches!(err, Ok(data_grant::CarriedAcquire::Deferred { .. })),
+        "the old holder defers a grant on a slot mid-handover"
     );
-    let fence = client.self_fence("test: the holder stopped answering past T_self");
+    assert_eq!(venue.owner.held(), 0, "nothing granted");
+
+    // Attempt 2 (the cadence's next tick): the grants are gone, the slot
+    // moves; the mid-handover mark clears with it.
+    vol.release_slot_handover(1, SLOT_B)
+        .await
+        .expect("the handover completes once the recalled custody is released");
+    assert_eq!(data_grant::handover_recalls_pending(), 0);
     assert!(
-        fence.poisoned_data_custody,
-        "a WRITER's fence poisons custody"
+        data_grant::slot_holder_home(foreign).is_none(),
+        "the slot is the manager's now"
     );
-    assert!(data_custody::poisoned());
+    // Nothing was voided by the recall.
+    assert_eq!(refusals(), refusals0, "no DMA refusal for a recall");
     assert!(
-        !squeezefs::park_gate::is_parked(),
-        "the RemoteCustody class never parks"
+        data_custody::authorize_dma(Some(in_flight)).is_ok(),
+        "a DMA captured under the recalled grant still submits — the recall is not a revocation"
     );
-    assert_eq!(squeezefs::park_gate::parks(), 0);
-    assert!(
-        data_custody::authorize_dma(None).is_err(),
-        "no DMA lands after the writer fenced itself"
-    );
-    assert!(
-        rig.router
-            .dlm
-            .acquire_lock(&lock_path(foreign), None, Duration::from_millis(200))
-            .await
-            .is_err(),
-        "a poisoned writer acquires nothing"
-    );
-    // The holder's TTL passes: its sweep retires the grant.
-    venue.ms.store(t_owner + 1, Ordering::SeqCst);
-    let expired = venue.owner.expire_due();
-    assert_eq!(expired.len(), 1, "the holder swept the dead writer's lease");
-    assert_eq!(expired[0].client, WRITER);
-    assert_eq!(venue.owner.held(), 0);
+    // The file's next custody comes from the NEW holder — local.
+    let lease2 = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(foreign), None, Duration::from_secs(2))
+        .await
+        .expect("custody from the new holder");
+    assert!(lease2.is_held().await);
     drop(lease);
-    data_grant::disarm_slot_custody().await;
-    data_grant::uninstall_custody_owner();
+    drop(lease2);
+    venue.tear_down().await;
     rig.shutdown().await;
 }
 

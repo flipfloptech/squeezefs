@@ -7093,6 +7093,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(co) = co_writer_arm {
                 co.disarm().await;
             }
+            // Symmetric PR 9: the slot-holder custody plane's leave, in the
+            // same outside-in order — every carried token and every custody
+            // grant this mount holds from any slot holder is RELEASED at
+            // that holder (tokens first, then the grants, drained) BEFORE
+            // the membership leave below, so no holder still believes this
+            // mount holds custody once it stops being a member and no
+            // holder's next commit on those files runs a dead-client
+            // recall to its deadline. A no-op on every unarmed mount.
+            squeezefs::data_grant::disarm_slot_custody().await;
             // PR 7b: the PARTIAL AUTHORITY's teardown, in the same
             // outside-in order — it stops SERVING the volumes it owns, then
             // stops holding custody and shipping, then leaves the membership

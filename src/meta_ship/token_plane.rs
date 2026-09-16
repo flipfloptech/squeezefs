@@ -95,6 +95,14 @@ pub const STATUS_NOT_HOLDER: u16 = super::wire::STATUS_NOT_OWNER;
 /// Frame status: the verb could not be served; the body carries
 /// [`TokenReply::Refused`] with the reason.
 pub const STATUS_REFUSED: u16 = 56;
+/// Frame status (PR 9, review round 2 — Issue 3): a wire word REJECTED at
+/// the service edge before any effect — the buggy/hostile-peer class the
+/// manager wire's `STATUS_REJECTED` names (`CustodyGrant.object` past the
+/// forest codec's bound, a slot this forest never minted, a control
+/// record, an ino with no durable record, a malformed span). The body
+/// carries [`TokenReply::Rejected`]; counted `dlm_token_custody_rejected`
+/// (must-stay-0 on a healthy fleet), never on a refusal gauge.
+pub const STATUS_REJECTED: u16 = 57;
 
 /// The token modes on the wire: `Read` is shared (N holders); the
 /// holder's `Write` is implicit — the lessee needs no token on its own
@@ -300,17 +308,26 @@ pub enum TokenReply {
     // PR 9 — the slot holder's answers to `CustodyGrant`.
     /// Custody granted by the slot holder (the S9 grant record — the
     /// caller adopts it exactly as an authority's), the object's records
-    /// carried beside it.
+    /// carried beside it. `already` is the TOKEN's word (the grant ∥ pass
+    /// gate's re-registration of a token this client already held on the
+    /// object), never custody's: a custody grant is minted fresh at every
+    /// acquire (the S9 arbiter answers `CustodyRefused` where it cannot).
     CustodyGranted {
         grant: crate::data_grant::GrantRecord,
         records: TokenRecords,
         already: bool,
     },
     /// The S9 arbitration refused: `status` is the custody wire's own
-    /// status word (`CUSTODY_CONFLICT` / `CUSTODY_UNKNOWN_LEASE` / …), so
-    /// the caller runs the S9 client's exact refusal ladder.
+    /// status word (`CUSTODY_CONFLICT` / `CUSTODY_UNKNOWN_LEASE` /
+    /// `CUSTODY_DEFERRED` / …), so the caller runs the S9 client's exact
+    /// refusal ladder.
     CustodyRefused {
         status: u16,
+        reason: String,
+    },
+    /// Review round 2, Issue 3: a wire word REJECTED at the service edge
+    /// ([`STATUS_REJECTED`]) — nothing was granted, registered or read.
+    Rejected {
         reason: String,
     },
 }
@@ -471,28 +488,102 @@ struct CustodyAsk {
     lease_epoch: u64,
 }
 
-/// The GLOBAL ino of LOCAL key ino `local` on `volume` — the S9 arbiter's
-/// key (the key every write of the file takes in the lock table). `None`
-/// for a control record (raw local < 2 has no global encoding — the same
-/// law `RoutedMetaBackend::try_make_global_ino` states).
-fn global_ino_of(volume: &KvMetaBackend, local: u64) -> Option<u64> {
-    let (slot, raw) = match crate::meta_backend::split_guest_local(local) {
-        Some((slot, raw)) => (u64::from(slot), raw),
-        None => (
-            u64::from(
-                volume
-                    .routing_slot_of_forest(crate::meta_backend::kv::record::NATIVE_FOREST_SLOT)
-                    .ok()?,
-            ),
-            local,
-        ),
+/// Test seam (PR 9, review round 2 — Issue 8's pin): the NEXT carried
+/// install fails after custody was granted, so the contract can see the
+/// caller keep the lease it was granted.
+pub static TEST_INSTALL_CARRIED_FAIL_ONCE: AtomicBool = AtomicBool::new(false);
+
+/// Test seam (PR 9, review round 2 — Issue 15's pin): the NEXT
+/// `CustodyGrant` is answered `NotHolder { holder }` with this appender
+/// id (`u64::MAX` = off) — the cross-process shape where the holder's
+/// tree 0 moved the slot under the writer's view, which one process's
+/// shared tree 0 cannot produce.
+pub static TEST_CUSTODY_NOT_HOLDER_ONCE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// **PR 9, review round 2 (Issue 3) — the pure screen of a `CustodyGrant`
+/// frame's words** (PR 3's bounded-execution law: every wire-carried
+/// integer is validated against durable / derived state BEFORE anything
+/// acts on it). `object` is the peer's LOCAL key ino; `forest_names`
+/// answers the ROUTING slot of a forest slot this volume's forest names
+/// (`None` = never minted here). Returns the object's `(routing slot,
+/// raw local ino)` — the GLOBAL ino's two words — or the rejection's
+/// reason. Fuzzed by `token_call_frame`'s service-edge arm + the proptest
+/// mirror: total over every `u64`, never a panic (the forest codec's
+/// `split_guest_local` `debug_assert`s the slot word — what a peer word
+/// reached before this screen existed).
+pub fn screen_custody_words(
+    object: u64,
+    span: Option<(u64, u64)>,
+    forest_names: &dyn Fn(crate::meta_backend::kv::record::ForestSlot) -> Option<u16>,
+) -> std::result::Result<(u16, u64), String> {
+    use crate::meta_backend::kv::record::{
+        forest_slot_of_ino, FOREST_SLOT_MAX, NATIVE_FOREST_SLOT,
+    };
+    let forest_slot = forest_slot_of_ino(object);
+    if forest_slot > FOREST_SLOT_MAX {
+        return Err(format!(
+            "object {object:#x} names forest slot {forest_slot}, past the codec's bound \
+             {FOREST_SLOT_MAX}"
+        ));
+    }
+    let raw = if forest_slot == NATIVE_FOREST_SLOT {
+        object
+    } else {
+        object & ((1u64 << crate::meta_backend::GUEST_NS_SHIFT) - 1)
     };
     if raw < 2 {
-        return None;
+        return Err(format!(
+            "object {object:#x} is a control record (raw local ino {raw} has no global \
+             encoding) — nothing to hold custody of"
+        ));
     }
-    Some(crate::meta_backend::make_global_ino_width(
+    let Some(routing) = forest_names(forest_slot) else {
+        return Err(format!(
+            "object {object:#x} names forest slot {forest_slot}, which this volume's forest \
+             never minted"
+        ));
+    };
+    if let Some((start, end)) = span {
+        if start >= end {
+            return Err(format!(
+                "span [{start}, {end}) is malformed — spans are [start, end) with end \
+                 EXCLUSIVE and non-empty"
+            ));
+        }
+    }
+    Ok((routing, raw))
+}
+
+/// [`screen_custody_words`] bound to `volume`, then the DURABLE record:
+/// the object's inode record must exist (one leaf read — the grant reads
+/// it again a moment later through the node cache) before the arbiter is
+/// handed the GLOBAL ino (the key every write of the file takes in the
+/// lock table). `Err(reason)` = REJECTED, nothing acted.
+async fn screen_custody_object(
+    volume: &KvMetaBackend,
+    object: u64,
+    span: Option<(u64, u64)>,
+) -> std::result::Result<u64, String> {
+    let (routing, raw) = screen_custody_words(object, span, &|forest_slot| {
+        let routing = volume.routing_slot_of_forest(forest_slot).ok()?;
+        // The native slot is always this volume's; a guest slot must have
+        // a tree here (the forest names a slot at its first record).
+        (forest_slot == crate::meta_backend::kv::record::NATIVE_FOREST_SLOT
+            || volume.slot_tree(forest_slot).is_some())
+        .then_some(routing)
+    })?;
+    match volume.token_records_exist(object).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(format!(
+                "object {object:#x} has no durable inode record on this volume"
+            ))
+        }
+        Err(e) => return Err(format!("object {object:#x}: the record read failed: {e}")),
+    }
+    Ok(crate::meta_backend::make_global_ino_width(
         raw,
-        slot,
+        u64::from(routing),
         crate::dlm_slot::routing_width(),
     ))
 }
@@ -644,6 +735,11 @@ pub struct TokenHolderPlane {
     /// client. **Must stay 0** on a fleet whose readers arm through
     /// `arm_token_readers` (which requires the lease).
     nonmember_refusals: AtomicU64,
+    /// PR 9 (review round 2, Issue 3): `CustodyGrant` frames REJECTED at
+    /// the service edge — a wire word the durable / derived state does not
+    /// name (`screen_custody_words`). The buggy/hostile-peer class, apart
+    /// from every refusal gauge; **must stay 0** on a healthy fleet.
+    custody_rejected: AtomicU64,
     timeouts_live: AtomicU64,
     releases: AtomicU64,
     /// Conveyor passes that recalled at least one object (the batching
@@ -690,6 +786,7 @@ impl TokenHolderPlane {
             not_holder_redirects: AtomicU64::new(0),
             park_expired_refusals: AtomicU64::new(0),
             nonmember_refusals: AtomicU64::new(0),
+            custody_rejected: AtomicU64::new(0),
             timeouts_live: AtomicU64::new(0),
             releases: AtomicU64::new(0),
             recall_batches: AtomicU64::new(0),
@@ -953,14 +1050,41 @@ impl TokenHolderPlane {
     async fn serve_custody_grant(
         &self,
         volume: &KvMetaBackend,
+        owner: Option<Arc<crate::data_grant::WriteCustodyOwner>>,
         client: &str,
         ask: CustodyAsk,
     ) -> TokenReply {
+        // The wire words FIRST (review round 2, Issue 3 — PR 3's
+        // bounded-execution law): a slot word past the codec's bound
+        // reached `split_guest_local`'s debug_assert (a panic on the
+        // service lane) and, in release, truncated into an exclusive
+        // arbiter lease on an ino the peer never named. The screen answers
+        // the GLOBAL ino — the arbiter's key, the key this holder's own
+        // writes take in the same lock table; the wire carries ONE ino,
+        // derived here, never a second word to trust.
+        let ino = match screen_custody_object(volume, ask.object, ask.span).await {
+            Ok(ino) => ino,
+            Err(reason) => {
+                self.custody_rejected.fetch_add(1, Ordering::Relaxed);
+                log::warn!(
+                    "PR 9: CustodyGrant from '{client}' REJECTED at the service edge \
+                     (dlm_token_custody_rejected): {reason}"
+                );
+                return TokenReply::Rejected { reason };
+            }
+        };
         if let Some(holder) = volume.foreign_slot_holder(ask.object) {
             self.not_holder_redirects.fetch_add(1, Ordering::Relaxed);
             return TokenReply::NotHolder { holder };
         }
-        let Some(owner) = crate::data_grant::custody_owner() else {
+        let seam = TEST_CUSTODY_NOT_HOLDER_ONCE.swap(u64::MAX, Ordering::AcqRel);
+        if seam != u64::MAX {
+            self.not_holder_redirects.fetch_add(1, Ordering::Relaxed);
+            return TokenReply::NotHolder {
+                holder: seam as u32,
+            };
+        }
+        let Some(owner) = owner.or_else(crate::data_grant::custody_owner) else {
             return TokenReply::Refused {
                 reason: "this slot holder arms no write-custody authority (the S9 owner half \
                          the multi-writer arm installs) — custody by the slot holder needs it \
@@ -968,19 +1092,19 @@ impl TokenHolderPlane {
                     .to_string(),
             };
         };
-        // The arbiter keys on the GLOBAL ino — the key this holder's own
-        // writes take in the same lock table (the caller's word is the
-        // LOCAL key ino; the wire carries one ino, derived here, never a
-        // second word to trust).
-        let Some(ino) = global_ino_of(volume, ask.object) else {
-            return TokenReply::Refused {
+        // Review round 2, Issues 5/9 — a slot mid-handover whose custody
+        // grants were RECALLED grants nothing new until the slot has moved
+        // (the writer's re-acquire would otherwise undo the recall and the
+        // handover would never complete): the retryable class.
+        if crate::data_grant::handover_recall_defers(ino) {
+            return TokenReply::CustodyRefused {
+                status: crate::data_grant::CUSTODY_DEFERRED,
                 reason: format!(
-                    "object {} is a control record with no global ino — nothing to hold \
-                     custody of",
-                    ask.object
+                    "inode_{ino}'s slot is mid-handover (its custody grants were recalled) — \
+                     retry: the slot's next holder grants it"
                 ),
             };
-        };
+        }
         let frame = crate::data_grant::AcquireFrame {
             schema: crate::data_grant::CUSTODY_SCHEMA,
             client: client.to_string(),
@@ -1200,6 +1324,7 @@ impl TokenHolderPlane {
             not_holder_redirects: self.not_holder_redirects.load(Ordering::Relaxed),
             park_expired_refusals: self.park_expired_refusals.load(Ordering::Relaxed),
             nonmember_refusals: self.nonmember_refusals.load(Ordering::Relaxed),
+            custody_rejected: self.custody_rejected.load(Ordering::Relaxed),
             timeouts_live: self.timeouts_live.load(Ordering::Relaxed),
             releases: self.releases.load(Ordering::Relaxed),
             recall_batches: self.recall_batches.load(Ordering::Relaxed),
@@ -1242,6 +1367,7 @@ pub struct TokenHolderStats {
     pub not_holder_redirects: u64,
     pub park_expired_refusals: u64,
     pub nonmember_refusals: u64,
+    pub custody_rejected: u64,
     pub timeouts_live: u64,
     pub releases: u64,
     pub recall_batches: u64,
@@ -1255,11 +1381,31 @@ pub struct TokenHolderStats {
 /// holder plane).
 pub struct TokenService {
     volume: Arc<KvMetaBackend>,
+    /// PR 9: the S9 custody authority `CustodyGrant` arbitrates on —
+    /// this service's own when set, else the process-installed owner
+    /// (`data_grant::custody_owner`). The N-holder contracts stand N
+    /// holders up in one process, each with its own authority.
+    custody_owner: Option<Arc<crate::data_grant::WriteCustodyOwner>>,
 }
 
 impl TokenService {
     pub fn new(volume: Arc<KvMetaBackend>) -> Arc<Self> {
-        Arc::new(Self { volume })
+        Arc::new(Self {
+            volume,
+            custody_owner: None,
+        })
+    }
+
+    /// [`Self::new`] arbitrating custody on `owner` instead of the
+    /// process-installed authority.
+    pub fn with_custody_owner(
+        volume: Arc<KvMetaBackend>,
+        owner: Arc<crate::data_grant::WriteCustodyOwner>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            volume,
+            custody_owner: Some(owner),
+        })
     }
 
     fn refuse(id: u64, status: u16, reason: String) -> RpcResponse {
@@ -1393,6 +1539,7 @@ impl TokenService {
                 plane
                     .serve_custody_grant(
                         &self.volume,
+                        self.custody_owner.clone(),
                         &frame.client,
                         CustodyAsk {
                             object: *object,
@@ -1407,6 +1554,7 @@ impl TokenService {
         };
         let status = match reply {
             TokenReply::Refused { .. } | TokenReply::CustodyRefused { .. } => STATUS_REFUSED,
+            TokenReply::Rejected { .. } => STATUS_REJECTED,
             _ => STATUS_OK,
         };
         let body = match encode_reply(&TokenReplyFrame {
@@ -1453,6 +1601,20 @@ impl TokenSetService {
             volumes: volumes
                 .iter()
                 .map(|v| TokenService::new(Arc::clone(v)))
+                .collect(),
+        })
+    }
+
+    /// [`Self::new`] with every volume's `CustodyGrant` arbitrating on
+    /// `owner` (PR 9 — one authority per listener; the N-holder venue).
+    pub fn with_custody_owner(
+        volumes: &[Arc<KvMetaBackend>],
+        owner: Arc<crate::data_grant::WriteCustodyOwner>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            volumes: volumes
+                .iter()
+                .map(|v| TokenService::with_custody_owner(Arc::clone(v), Arc::clone(&owner)))
                 .collect(),
         })
     }
@@ -2059,19 +2221,80 @@ impl TokenReaderPlane {
     /// this client lands in the cache under the SAME law a fetched page
     /// does — nothing installed when a recall of the object landed since
     /// `gen0` was read (the holder's channel already retired it; the next
-    /// serve re-fetches). `Ok(None)` = not installed.
+    /// serve re-fetches). A carried page that did NOT end the xattr set
+    /// (`xattrs_complete == false` — a set wider than one grant page) is
+    /// PAGED to completion from the holder first (review round 2, Issue
+    /// 4: the first build installed the partial page as a complete token
+    /// and a `listxattr` off it misread the file); the pages ride the
+    /// grant the holder already registered (`already`), counted on
+    /// `pages`. `Ok(None)` = not installed.
     pub async fn install_carried(
         &self,
         object: u64,
         records: TokenRecords,
         gen0: u64,
+        pages: &AtomicU64,
     ) -> Result<Option<Arc<TokenEntry>>> {
         if self.revoke_gen(object) != gen0 {
             return Ok(None);
         }
+        if TEST_INSTALL_CARRIED_FAIL_ONCE.swap(false, Ordering::AcqRel) {
+            return Err(fail_closed(
+                "test seam: the carried install failed after custody was granted",
+            ));
+        }
         self.grants.fetch_add(1, Ordering::Relaxed);
+        let TokenRecords {
+            attrs,
+            mut xattrs,
+            mut xattrs_complete,
+            ..
+        } = records;
+        while !xattrs_complete {
+            // An incomplete page that carried nothing can make no
+            // progress: refused, never spun on (the fetch's own law).
+            let Some((last, _)) = xattrs.last() else {
+                return Err(fail_closed(
+                    "the holder carried an empty, incomplete xattr page on a custody grant",
+                ));
+            };
+            let reply = self
+                .call(TokenCall::Grant {
+                    object,
+                    mode: TokenMode::Read,
+                    wants: TokenWants {
+                        dentries: false,
+                        records: true,
+                    },
+                    after: 0,
+                    xattr_after: last.clone(),
+                })
+                .await?;
+            match reply {
+                TokenReply::Granted { records, .. } => {
+                    pages.fetch_add(1, Ordering::Relaxed);
+                    if !records.xattrs_complete && records.xattrs.is_empty() {
+                        return Err(fail_closed(
+                            "the holder answered an empty, incomplete xattr page",
+                        ));
+                    }
+                    xattrs.extend(records.xattrs);
+                    xattrs_complete = records.xattrs_complete;
+                }
+                TokenReply::Gone => return Ok(None),
+                TokenReply::Refused { reason } => return Err(fail_closed(&reason)),
+                other => {
+                    return Err(fail_closed(&format!(
+                        "the holder answered a carried token's xattr page with {other:?}"
+                    )))
+                }
+            }
+            if self.revoke_gen(object) != gen0 {
+                return Ok(None);
+            }
+        }
         match self
-            .install_records(object, gen0, records.attrs, records.xattrs, None)
+            .install_records(object, gen0, attrs, xattrs, None)
             .await?
         {
             FetchOutcome::Installed(e) => Ok(Some(e)),
@@ -2474,7 +2697,16 @@ impl TokenReaderPlane {
             });
             true
         });
-        if !held.is_empty() && self.channel_ok.load(Ordering::Acquire) {
+        // A channel that completed a round, OR one still on its first
+        // (PR 9: a custody grant's carried token installs before the
+        // recall channel's first round lands, and a writer that leaves
+        // inside that window must still release it — every channel
+        // FAILURE drops the cache, so a held entry never means a broken
+        // channel).
+        if !held.is_empty()
+            && (self.channel_ok.load(Ordering::Acquire)
+                || self.channel_alive.load(Ordering::Acquire))
+        {
             self.release_retired(held).await;
         }
         self.stop.store(true, Ordering::Relaxed);
@@ -2487,6 +2719,18 @@ impl TokenReaderPlane {
     pub fn test_die(&self) {
         self.stop.store(true, Ordering::Relaxed);
         self.channel_ok.store(false, Ordering::Release);
+    }
+
+    /// **The HOLDER died** (PR 9, review round 2 — Issue 10: the writer's
+    /// custody client at a slot holder reached its `T_self`): the channel
+    /// task stops, no release travels (nobody answers), and every cached
+    /// entry is DROPPED — a token whose holder may have re-granted the
+    /// object serves nothing (PR 5's `T_self` law for a reader, scoped to
+    /// this one holder's plane).
+    pub fn stop_dead(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.channel_ok.store(false, Ordering::Release);
+        self.drop_all();
     }
 
     /// The reader-side Token family snapshot.
@@ -2807,6 +3051,7 @@ pub fn holder_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
         "dlm_token_not_holder_redirects": per(&|s| s.not_holder_redirects),
         "dlm_token_park_expired_refusals": per(&|s| s.park_expired_refusals),
         "dlm_token_nonmember_refusals": per(&|s| s.nonmember_refusals),
+        "dlm_token_custody_rejected": per(&|s| s.custody_rejected),
         "dlm_token_recall_timeouts_live": per(&|s| s.timeouts_live),
         "dlm_token_releases": per(&|s| s.releases),
         "dlm_token_recall_batches": per(&|s| s.recall_batches),

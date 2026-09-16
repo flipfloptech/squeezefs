@@ -1827,6 +1827,30 @@ pub type SharedFreeGate = std::sync::Arc<
         + Sync,
 >;
 
+/// The W1 durable clause's verdict ([`DataRouter::sole_owner_verdict`]):
+/// which clause let the in-place patch proceed or declined it — the W1
+/// decision ledger's label (`patch_ineligible_shared` vs
+/// `patch_ineligible_foreign_custody`, symmetric PR 9 review round 2 —
+/// Issue 12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoleOwnerVerdict {
+    /// Exactly one unshared durable reference (or unarmed: the shipped
+    /// predicate stands alone) — the patch proceeds.
+    Sole,
+    /// PR 7's clause: more than one reference, a SHARED bit, or a probe
+    /// that could not read — the CoW path.
+    Shared,
+    /// PR 9's clause: this mount holds the file's custody from its SLOT
+    /// HOLDER — the block's references live in the holder's tree, which
+    /// this mount cannot read; the CoW path. The economy cost is the
+    /// random-small-write class W1 exists for (every sub-block overwrite
+    /// of a foreign-custody file pays a whole-block CoW rewrite — the
+    /// pre-W1 ≈ 2,500× amplification on the rand-4k shape); the owed
+    /// lever is a per-block SHARED / reference-count summary carried on
+    /// the custody grant, or a probe verb at the holder (PR 12).
+    ForeignCustody,
+}
+
 /// The packer's scope key on an armed set (design §5.4.3 law 1): the
 /// META VOLUME ordinal over the forest slot — the native forest slot is
 /// `0` on every meta volume, so the slot alone would pool two volumes'
@@ -8113,23 +8137,37 @@ impl DataRouter {
         allocator: &std::sync::Arc<crate::block_allocator::BlockAllocator>,
         offset: u64,
     ) -> bool {
+        self.sole_owner_verdict(ino, allocator, offset).await == SoleOwnerVerdict::Sole
+    }
+
+    /// [`Self::sole_owner_durably`] with the refusal's CLASS (symmetric
+    /// PR 9, review round 2 — Issue 12: the W1 ledger names which clause
+    /// declined): a file whose custody this mount holds from its SLOT
+    /// HOLDER is the co-writer shape — the block's references live in the
+    /// holder's tree, which this probe cannot read (in production it is
+    /// another process's RAM), and the patch would retire a lifetime that
+    /// tree accounts — so W1 declines BEFORE any probe
+    /// ([`SoleOwnerVerdict::ForeignCustody`]); an own file runs PR 7's
+    /// durable probe ([`SoleOwnerVerdict::Shared`] on anything but one
+    /// unshared reference).
+    pub async fn sole_owner_verdict(
+        &self,
+        ino: u64,
+        allocator: &std::sync::Arc<crate::block_allocator::BlockAllocator>,
+        offset: u64,
+    ) -> SoleOwnerVerdict {
         if !self.symmetric_armed() {
-            return true;
+            return SoleOwnerVerdict::Sole;
         }
-        // Symmetric PR 9: a file whose custody this mount holds from its
-        // SLOT HOLDER is the co-writer shape — the block's references live
-        // in the holder's tree, which this probe cannot read (in production
-        // it is another process's RAM), and the patch retires a lifetime
-        // that tree accounts. W1 declines; the write takes the CoW path.
         if crate::data_grant::slot_holder_home(ino).is_some() {
-            return false;
+            return SoleOwnerVerdict::ForeignCustody;
         }
         let Some(mb) = self.inner.meta_backend.get() else {
-            return true;
+            return SoleOwnerVerdict::Sole;
         };
         let (v_idx, local) = mb.route_ino(ino);
         let Some(vol) = mb.volumes.get(v_idx) else {
-            return false;
+            return SoleOwnerVerdict::Shared;
         };
         let slot = crate::meta_backend::kv::record::forest_slot_of_ino(local);
         let vol_tag = crate::meta_backend::kv::block_refs::volume_tag(allocator.volume_id());
@@ -8137,7 +8175,8 @@ impl DataRouter {
             .block_ref_probe_flags(vol_tag, offset / allocator.chunk_size(), Some(slot))
             .await
         {
-            Ok(probe) => probe.count == 1 && !probe.shared,
+            Ok(probe) if probe.count == 1 && !probe.shared => SoleOwnerVerdict::Sole,
+            Ok(_) => SoleOwnerVerdict::Shared,
             Err(e) => {
                 // A probe that cannot read is the leak-safe direction: no
                 // in-place rewrite on a population this mount cannot see.
@@ -8147,7 +8186,7 @@ impl DataRouter {
                     offset / allocator.chunk_size(),
                     allocator.volume_id()
                 );
-                false
+                SoleOwnerVerdict::Shared
             }
         }
     }

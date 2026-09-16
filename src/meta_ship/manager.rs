@@ -983,6 +983,15 @@ impl ManagerService {
                 },
                 STATUS_DEFERRED,
             ),
+            // Symmetric PR 9: a handover deferred for a live custody grant
+            // (the grants recalled; the requester retries) — the same
+            // retry class, never `Refused`.
+            Err(e @ crate::meta_backend::kv::KvError::HandoverDeferred(_)) => (
+                ManagerReply::Deferred {
+                    reason: e.to_string(),
+                },
+                STATUS_DEFERRED,
+            ),
             Err(e) => (
                 ManagerReply::Refused {
                     reason: e.to_string(),

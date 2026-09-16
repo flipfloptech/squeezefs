@@ -358,7 +358,12 @@ impl SlotLockManager {
         // on every unarmed mount, and `None` for every own-slot object.
         if let Some((ino, home)) = crate::data_grant::slot_holder_home_of_path(file_path) {
             DLM_RPCS.fetch_add(1, Ordering::Relaxed);
-            return crate::data_grant::acquire_at_slot_holder(home, ino, range, mode, ttl).await;
+            match crate::data_grant::acquire_at_slot_holder(home, ino, range, mode, ttl).await? {
+                crate::data_grant::HolderAcquire::Granted(lease) => return Ok(lease),
+                // The slot was handed to THIS mount under the acquire
+                // (review round 2, Issue 15): the local arbiter serves.
+                crate::data_grant::HolderAcquire::NowLocal => {}
+            }
         }
         let slot = lock_home_slot(file_path);
         if !is_local_slot(slot) {

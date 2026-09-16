@@ -3245,6 +3245,17 @@ impl KvMetaBackend {
         Ok(plane)
     }
 
+    /// PR 9 (review round 2, Issue 3): does LOCAL key ino `object` have a
+    /// durable inode record on this volume? The `CustodyGrant` screen's
+    /// last clause — one leaf read (the grant's record read a moment later
+    /// hits the node cache) before the arbiter is handed the ino.
+    pub(crate) async fn token_records_exist(
+        &self,
+        object: Ino,
+    ) -> std::result::Result<bool, KvError> {
+        Ok(self.read_inode_value(object).await?.is_some())
+    }
+
     /// The holder's record read for ONE grant page (§5.7.1 — the grant
     /// CARRIES the records): the object's folded attrs (every page — one
     /// fixed word), a page of its user-visible xattrs by name from
@@ -5962,13 +5973,19 @@ impl KvMetaBackend {
                 self.path.display()
             )));
         }
-        // Symmetric PR 9 (§5.1.4): a slot whose files a writer holds
-        // custody of from this holder does not move until the writer
-        // releases — a grant never spans a handover.
-        if crate::data_grant::slot_custody_live(self.volume_uuid(), slot) {
-            return Err(KvError::Busy(format!(
+        // Symmetric PR 9 (§5.1.4, flush-then-transfer): a slot whose files
+        // a writer holds custody of from this holder does not move until
+        // the writer releases — a grant never spans a handover. The grants
+        // are RECALLED through the S9 pull channel and the handover is
+        // DEFERRED in the retryable class (review round 2, Issues 5/9):
+        // the requester's next tick finds them released.
+        if let Some(recalled) =
+            crate::data_grant::defer_handover_for_custody(self.volume_uuid(), slot)
+        {
+            return Err(KvError::HandoverDeferred(format!(
                 "{}: release of slot {slot} by appender {region_id} deferred — a writer holds \
-                 custody of a file in it from this holder (the cadence retries)",
+                 custody of a file in it from this holder; {recalled} grant(s) recalled this \
+                 tick, the writer releases within one renewal beat (the cadence retries)",
                 self.path.display()
             )));
         }
@@ -6430,7 +6447,9 @@ impl KvMetaBackend {
         }
         match self.release_slot_handover(region_id, slot).await {
             Ok(()) => Ok(true),
-            Err(KvError::Busy(why)) => {
+            // PR 9: a handover deferred for live custody is "not this
+            // tick" too — the recalled writer releases within a beat.
+            Err(KvError::Busy(why)) | Err(KvError::HandoverDeferred(why)) => {
                 log::debug!("slot-lease cadence: slot {slot} not released — {why}");
                 Ok(false)
             }

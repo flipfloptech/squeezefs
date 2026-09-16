@@ -214,6 +214,24 @@ pub fn adopt_remote_grant(
     mode: LockMode,
     handle: Arc<dyn RemoteGrant>,
 ) -> Result<LockLease> {
+    adopt_remote_grant_scoped(ino, span, token, mode, handle, true)
+}
+
+/// [`adopt_remote_grant`] naming whether the grant's token TERM is adopted
+/// into this process's durable era (symmetric PR 9, review round 2 —
+/// Issue 7): the set authority's grant carries the SET's era and adopts
+/// it (`true`, the shipped path verbatim); a SLOT HOLDER's grant carries
+/// that holder's own volume era, one of N, and folding it into
+/// `term_base()` would move every in-flight epoch's floor — `false` keeps
+/// the grant's token in the lock table alone.
+pub fn adopt_remote_grant_scoped(
+    ino: u64,
+    span: Option<(u64, u64)>,
+    token: u64,
+    mode: LockMode,
+    handle: Arc<dyn RemoteGrant>,
+    adopt_term: bool,
+) -> Result<LockLease> {
     if let Some((start, end)) = span {
         if start >= end {
             return Err(crate::error::SqueezefsError::LockFailed {
@@ -224,7 +242,9 @@ pub fn adopt_remote_grant(
             });
         }
     }
-    adopt_durable_term(token_term(token));
+    if adopt_term {
+        adopt_durable_term(token_term(token));
+    }
     let key = ObjectKey::Ino(ino);
     let client_nonce = CLIENT_NONCE.fetch_add(1, Ordering::Relaxed);
     let grant = Grant {

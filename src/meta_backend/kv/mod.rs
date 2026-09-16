@@ -1054,6 +1054,17 @@ pub enum KvError {
     // lease's own words (wire: `STATUS_DEFERRED`).
     #[error("allocation lease deferred: {0}")]
     LeaseDeferred(String),
+
+    // Symmetric PR 9 (design §5.1.4 — custody across a handover; review
+    // round 2, Issues 5/9): a slot handover asked while a writer holds
+    // custody of a file in the slot from this holder. The grants were
+    // RECALLED through the S9 pull channel (the writer releases once the
+    // file's pipeline is quiescent, within one renewal beat) and nothing
+    // was written; the requester RETRIES — the `GrantDeferred` class with
+    // the custody's own words (wire: `STATUS_DEFERRED`, `EAGAIN`).
+    // Counted `slot_handover_custody_deferrals`.
+    #[error("slot handover deferred for live custody: {0}")]
+    HandoverDeferred(String),
 }
 
 /// Map KV-layer errors onto the crate error surface (mount / CLI / trait
@@ -1094,6 +1105,11 @@ impl From<KvError> for crate::error::SqueezefsError {
             // PR 8: the allocation lease's re-grant waits on the home
             // recovery — the same EAGAIN class.
             e @ KvError::LeaseDeferred(_) => E::refused(libc::EAGAIN, format!("kv metadata: {e}")),
+            // PR 9: a handover deferred for live custody — the same EAGAIN
+            // class (the recalled writer releases within one renewal beat).
+            e @ KvError::HandoverDeferred(_) => {
+                E::refused(libc::EAGAIN, format!("kv metadata: {e}"))
+            }
             // The rotor cap names a holder-side limit — EBUSY, like the
             // other manager refusals that name a holder.
             e @ KvError::RotorAtCap { .. } => E::busy(format!("kv metadata: {e}")),

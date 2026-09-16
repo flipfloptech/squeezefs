@@ -489,6 +489,18 @@ impl Venue {
     }
 }
 
+impl Drop for Venue {
+    /// Failure hygiene: a contract that panics mid-way must not leave its
+    /// listener's threads holding the owner — whose arbiter leases live in
+    /// the PROCESS-GLOBAL lock map — alive into the next contract (the
+    /// next fresh volume mints the same inos, and its legit acquire read
+    /// `conflicting custody` off this venue's stranded grant).
+    fn drop(&mut self) {
+        self.host.shutdown();
+        self.owner.revoke_client(WRITER, "test venue dropped");
+    }
+}
+
 /// Mint a REGULAR FILE under the root whose ino routes to forest slot
 /// `slot` while the slot is still the manager's (a preset ino routes
 /// itself).
@@ -527,19 +539,68 @@ async fn seed_file_in_slot(rig: &DataRig, slot: ForestSlot, name: &str) -> u64 {
 /// holder shape (appender 0 = the writer, appender 1 = the file's holder).
 /// Returns `(uris, the foreign file's global ino)`.
 async fn two_holder_volume(dir: &Path, data: &Path) -> (Vec<String>, u64) {
+    let (uris, inos) = holders_volume(dir, data, &[(SLOT_B, "foreign")], 0).await;
+    (uris, inos[0])
+}
+
+/// Forest slot 5 (routing slot 4) — the declared appender 2's, the second
+/// holder of the N-holder contracts.
+const SLOT_C: ForestSlot = 5;
+const THREE_HOLDERS: &str = "1:4;2:5";
+
+/// One `user.big.N` xattr's value: 15 KiB — under the fixture's KV value
+/// cap (`min(64 KiB, node_size/4)` = 16 KiB at the 64 KiB test node).
+const BIG_XATTR_BYTES: usize = 15 * 1024;
+
+/// [`two_holder_volume`] generalized: one file per `(slot, name)`, each
+/// slot released to `Unleased` for the next open's declared regions, and
+/// — when `xattr_fill > 0` — that many [`BIG_XATTR_BYTES`] `user.big.N`
+/// xattrs on every file (a carried-token xattr set wider than one grant
+/// page). Returns `(uris, the files' global inos in `slots` order)`.
+async fn holders_volume(
+    dir: &Path,
+    data: &Path,
+    slots: &[(ForestSlot, &str)],
+    xattr_fill: usize,
+) -> (Vec<String>, Vec<u64>) {
     let uris = vec![format_stamped_member(dir, "meta0").await];
     let rig = mount_data(&uris, data, &Knobs::armed()).await;
-    let foreign = seed_file_in_slot(&rig, SLOT_B, "foreign").await;
-    // A block bound at index 0 while the slot is still the manager's, so
-    // the W1 probe has a reference to read.
-    rig.publish_block(foreign, 0).await;
+    let mut inos = Vec::with_capacity(slots.len());
+    for (slot, name) in slots {
+        let ino = seed_file_in_slot(&rig, *slot, name).await;
+        // A block bound at index 0 while the slot is still the manager's,
+        // so the W1 probe has a reference to read.
+        rig.publish_block(ino, 0).await;
+        for i in 0..xattr_fill {
+            rig.routed
+                .setxattr(
+                    ino,
+                    &format!("user.big.{i:02}"),
+                    &vec![b'x'; BIG_XATTR_BYTES],
+                )
+                .await
+                .expect("a 15 KiB xattr fits the KV value cap");
+        }
+        inos.push(ino);
+    }
     let vol = Arc::clone(&rig.routed.volumes[0]);
-    vol.release_slot_handover(0, SLOT_B)
-        .await
-        .expect("release to unleased");
+    for (slot, _) in slots {
+        vol.release_slot_handover(0, *slot)
+            .await
+            .expect("release to unleased");
+    }
     drop(vol);
     rig.shutdown().await;
-    (uris, foreign)
+    (uris, inos)
+}
+
+/// A TCP endpoint that ACCEPTS and never answers — a holder that is up
+/// on the network and dead on the wire (the dial parks to the cluster
+/// wire's `DIAL_TIMEOUT`).
+fn silent_endpoint() -> (std::net::TcpListener, String) {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let ep = l.local_addr().expect("addr").to_string();
+    (l, ep)
 }
 
 async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
@@ -916,8 +977,12 @@ async fn custody_defers_a_handover_of_its_slot_and_moves_with_it_once_released()
         .await
         .expect_err("a slot with live custody does not move");
     assert!(
-        matches!(&err, squeezefs::meta_backend::kv::KvError::Busy(why) if why.contains("custody")),
+        err.to_string().contains("custody"),
         "the deferral names the custody: {err:?}"
+    );
+    assert!(
+        !matches!(&err, squeezefs::meta_backend::kv::KvError::Busy(_)),
+        "the deferral is not the D0 `Busy` refusal class (review round 2, Issue 5): {err:?}"
     );
     assert!(lease.is_held().await, "the writer's custody is untouched");
     assert_eq!(venue.owner.held(), 1);
@@ -959,6 +1024,325 @@ async fn custody_defers_a_handover_of_its_slot_and_moves_with_it_once_released()
         "no grant at the old holder's authority"
     );
     drop(lease2);
+    venue.tear_down().await;
+    rig.shutdown().await;
+}
+
+/// Review round 2, Issue 2 — **the arm's clean leave**: a writer holding a
+/// foreign file's custody (grant + carried token) that leaves cleanly
+/// leaves NOTHING outstanding at the holder — the token released (drain +
+/// purge first, the token plane's one release path), the custody grant
+/// released, in that order — so the holder's next commit on the file
+/// recalls nobody and no dead-client recall runs to its deadline (the
+/// class PR 5 closed for readers). `dlm_custody_held` / the holder's
+/// `outstanding()` read 0 after the leave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clean_leave_releases_every_carried_token_and_custody_grant_at_the_holder() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let (uris, foreign) = two_holder_volume(dir.path(), data.path()).await;
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(TWO_HOLDERS)).await;
+    let venue = Venue::stand_up(&rig, &[1]).await;
+    let holder_plane = rig.routed.volumes[0].token_holder().unwrap().clone();
+
+    let lease = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(foreign), None, Duration::from_secs(2))
+        .await
+        .expect("custody from the slot holder");
+    assert_eq!(venue.owner.held(), 1);
+    assert_eq!(holder_plane.outstanding(), 1);
+    // The FUSE layer's cached lease is still alive at unmount (the
+    // session ended; nothing dropped it yet) — the leave must release the
+    // grant regardless.
+    let recalls0 = holder_plane.stats().recalls;
+    let expired0 = holder_plane.stats().expired_with_lease;
+
+    data_grant::disarm_slot_custody().await;
+
+    assert!(!data_grant::slot_custody_armed());
+    assert_eq!(
+        venue.owner.held(),
+        0,
+        "the clean leave released the writer's custody grant at the holder"
+    );
+    assert_eq!(
+        holder_plane.outstanding(),
+        0,
+        "the clean leave released the writer's carried token at the holder"
+    );
+    assert!(
+        !lease.is_held().await,
+        "the local handle reads the release (the owner's decision)"
+    );
+    // The holder's next commit on the file: nothing to recall, nobody to
+    // wait for.
+    rig.publish_block(foreign, 1).await;
+    let s = holder_plane.stats();
+    assert_eq!(
+        s.recalls, recalls0,
+        "no recall issued for a departed writer"
+    );
+    assert_eq!(
+        s.expired_with_lease, expired0,
+        "no dead-client recall ran to the lease deadline"
+    );
+    drop(lease);
+    data_grant::uninstall_custody_owner();
+    venue.host.shutdown();
+    rig.shutdown().await;
+}
+
+/// Review round 2, Issue 5 — **the deferral's class**: a handover deferred
+/// for a live custody grant is the RETRYABLE class (`EAGAIN` — the wire's
+/// `Deferred`, the requester's `AcquireSlot` retries), never the `Busy` /
+/// `EINVAL` refusal a wire requester reads as terminal; the deferral is
+/// counted on `slot_handover_custody_deferrals`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handover_deferred_for_custody_is_the_retryable_class_the_requester_retries() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let (uris, foreign) = two_holder_volume(dir.path(), data.path()).await;
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(TWO_HOLDERS)).await;
+    let venue = Venue::stand_up(&rig, &[1]).await;
+    let vol = Arc::clone(&rig.routed.volumes[0]);
+    let lease = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(foreign), None, Duration::from_secs(2))
+        .await
+        .expect("custody from the slot holder");
+    let err = vol
+        .release_slot_handover(1, SLOT_B)
+        .await
+        .expect_err("a slot with live custody does not move yet");
+    let surfaced: squeezefs::error::SqueezefsError = err.into();
+    assert!(
+        matches!(
+            &surfaced,
+            squeezefs::error::SqueezefsError::Refused { errno, .. } if *errno == libc::EAGAIN
+        ),
+        "the deferral is the retryable EAGAIN class, not a refusal: {surfaced:?}"
+    );
+    assert!(lease.is_held().await);
+    drop(lease);
+    venue.tear_down().await;
+    rig.shutdown().await;
+}
+
+/// Review round 2, Issue 4 — a custody grant whose carried xattr set is
+/// WIDER than one grant page (`xattrs_complete == false`) is never
+/// installed as a complete token: the writer pages the remainder from the
+/// holder and installs the COMPLETE set (a `listxattr` off the token then
+/// names every xattr), counted `dlm_custody_token_carried` once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_carried_grant_whose_xattrs_exceed_one_page_is_paged_to_completion() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    // 40 × 15 KiB = 600 KiB > the 512 KiB grant page budget: two xattr
+    // pages.
+    const FILL: usize = 40;
+    let (uris, inos) = holders_volume(dir.path(), data.path(), &[(SLOT_B, "wide")], FILL).await;
+    let foreign = inos[0];
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(TWO_HOLDERS)).await;
+    let venue = Venue::stand_up(&rig, &[1]).await;
+    let (_v, local) = rig.routed.route_ino(foreign);
+    let s0 = data_grant::stats();
+    let lease = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(foreign), None, Duration::from_secs(5))
+        .await
+        .expect("custody from the slot holder");
+    let s1 = data_grant::stats();
+    assert_eq!(s1.token_carried, s0.token_carried + 1, "the token landed");
+    let tokens = venue.arm.token_plane(&venue.endpoint, 0).await.unwrap();
+    assert!(tokens.holds(local), "the carried token is resident");
+    wait_until(
+        "the writer's recall channel completes its first round",
+        || tokens.stats().channel_fresh,
+    )
+    .await;
+    let grants_before_serve = tokens.stats().grants;
+    let serve = tokens
+        .serve(local, TokenWants::default())
+        .await
+        .expect("serve")
+        .expect("the file exists");
+    assert_eq!(
+        tokens.stats().grants,
+        grants_before_serve,
+        "the serve is a RAM hit — the carried token was complete, no re-fetch"
+    );
+    let big = serve
+        .entry()
+        .xattrs
+        .iter()
+        .filter(|(n, _)| n.starts_with(b"user.big."))
+        .count();
+    assert_eq!(
+        big, FILL,
+        "the installed token carries the COMPLETE xattr set, not the first page"
+    );
+    assert!(
+        serve
+            .entry()
+            .xattrs
+            .iter()
+            .any(|(n, _)| n.as_slice() == b"layout"),
+        "and the layout"
+    );
+    drop(lease);
+    venue.tear_down().await;
+    rig.shutdown().await;
+}
+
+/// Review round 2, Issue 3 — **the wire word `object` is screened before
+/// the arbiter sees it** (PR 3's bounded-execution law): a slot word past
+/// the forest codec's bound, a control record, a slot this volume's
+/// forest does not name, or an ino with no durable record is REJECTED
+/// (the buggy/hostile-peer class — its own status, never a grant, never
+/// a panic), and the holder's arbiter never takes a lease on an ino the
+/// peer did not name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_wire_word_object_is_screened_before_the_arbiter_sees_it() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let (uris, foreign) = two_holder_volume(dir.path(), data.path()).await;
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(TWO_HOLDERS)).await;
+    let venue = Venue::stand_up(&rig, &[1]).await;
+    let (_v, local) = rig.routed.route_ino(foreign);
+    let lease = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(foreign), None, Duration::from_secs(2))
+        .await
+        .expect("the legit grant dials the holder");
+    let granted0 = venue.owner.stats().granted;
+    let client = venue.arm.holder_client(&venue.endpoint).await.unwrap();
+
+    // (a) a slot word past FOREST_SLOT_MAX — the codec's debug_assert /
+    // release truncation; (b) a control record; (c) a slot the forest does
+    // not name (2^16 - 1 is never minted); (d) a nameable slot, no record.
+    let past_bound = ((u64::from(u16::MAX) + 2) << 40) | 5;
+    let unnamed_slot = (u64::from(u16::MAX) << 40) | 5;
+    let no_record = (local & !((1u64 << 40) - 1)) | 0x00ff_ffff_ffff;
+    for (what, object) in [
+        ("slot past the codec's bound", past_bound),
+        ("a control record", 1),
+        ("a slot the forest never named", unnamed_slot),
+        ("a nameable slot with no durable record", no_record),
+    ] {
+        let err = client
+            .acquire_carrying_token(
+                0,
+                object,
+                None,
+                squeezefs::dlm::LockMode::Exclusive,
+                Duration::from_secs(1),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{what}: object {object:#x} was GRANTED"));
+        assert!(
+            matches!(
+                &err,
+                squeezefs::error::SqueezefsError::Refused { errno, msg }
+                    if *errno == libc::EIO && msg.contains("rejected")
+            ),
+            "{what}: a deterministic REJECTION, never a transport error or a retry class: {err:?}"
+        );
+    }
+    assert_eq!(
+        venue.owner.stats().granted,
+        granted0,
+        "the arbiter never took a lease for a screened word"
+    );
+    assert_eq!(venue.owner.held(), 1, "only the legit grant is held");
+    assert!(lease.is_held().await, "the legit grant is untouched");
+    drop(lease);
+    venue.tear_down().await;
+    rig.shutdown().await;
+}
+
+/// Review round 2, Issue 6 — **a dead holder never delays an acquire
+/// against a live one**: the dial of a holder is single-flight PER HOLDER
+/// (joiners of one holder park on ITS dial; no process-wide lock spans
+/// any I/O), so a holder that accepts and never answers (its dial parks
+/// to the wire's 10 s bound) costs the files of OTHER holders nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_holder_never_delays_an_acquire_against_a_live_one() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let (uris, inos) = holders_volume(
+        dir.path(),
+        data.path(),
+        &[(SLOT_B, "live-holders-file"), (SLOT_C, "dead-holders-file")],
+        0,
+    )
+    .await;
+    let (live_file, dead_file) = (inos[0], inos[1]);
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(THREE_HOLDERS)).await;
+    assert_eq!(slot_of_global(&rig.routed, dead_file), SLOT_C);
+    let venue = Venue::stand_up(&rig, &[1]).await;
+    let (_silent, dead_endpoint) = silent_endpoint();
+    rig.routed.volumes[0]
+        .slot_leases()
+        .unwrap()
+        .holders
+        .set_endpoint(2, &dead_endpoint);
+    assert!(matches!(
+        data_grant::slot_holder_home(dead_file),
+        Some(data_grant::CustodyHome::Holder { holder: 2, .. })
+    ));
+
+    // The dead holder's acquire parks in its dial.
+    let dlm = rig.router.dlm.clone();
+    let path = lock_path(dead_file);
+    let parked =
+        tokio::spawn(async move { dlm.acquire_lock(&path, None, Duration::from_secs(2)).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !parked.is_finished(),
+        "premise: the dead holder's dial is parked"
+    );
+
+    // The live holder's acquire must not wait behind it.
+    let started = std::time::Instant::now();
+    let lease = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(live_file), None, Duration::from_secs(2))
+        .await
+        .expect("custody from the LIVE holder");
+    let wall = started.elapsed();
+    assert!(
+        wall < Duration::from_secs(3),
+        "the live holder's acquire waited {wall:?} — behind the dead holder's dial"
+    );
+    assert!(lease.is_held().await);
+    assert_eq!(venue.owner.held(), 1);
+    drop(lease);
+    // The dead dial resolves on its own bound (an error, never a grant).
+    let dead = tokio::time::timeout(Duration::from_secs(20), parked)
+        .await
+        .expect("the dead dial gave up inside the wire's bound")
+        .expect("task");
+    assert!(
+        dead.is_err(),
+        "no custody from a holder that never answered"
+    );
     venue.tear_down().await;
     rig.shutdown().await;
 }

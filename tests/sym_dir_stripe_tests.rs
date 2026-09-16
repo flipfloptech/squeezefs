@@ -99,13 +99,24 @@ fn format_config_for(dir: &std::path::Path) -> Vec<u8> {
     serde_json::to_vec(&cfg).unwrap()
 }
 
-fn set_opts(dir: &std::path::Path) -> FormatV3Options {
-    // The wave's wider leg formats with 256 KiB nodes (31 declared ids per
-    // directory extent); every other contract keeps the 64 KiB harness.
-    let node_size = std::env::var("SQZ_STRIPE_WAVE_NODE_KIB")
+/// The wave's wider leg formats with 256 KiB nodes (31 declared ids per
+/// directory extent); every other contract keeps the 64 KiB harness.
+fn node_size() -> usize {
+    std::env::var("SQZ_STRIPE_WAVE_NODE_KIB")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .map_or(NODE_SIZE, |kib| kib * 1024);
+        .map_or(NODE_SIZE, |kib| kib * 1024)
+}
+
+/// The volume scales with the node size so the EXTENT population stays
+/// the default harness's (31 declared rings + their slot trees exhausted
+/// a 64 MiB volume of 256 KiB extents at the open).
+fn vol_len() -> u64 {
+    VOL_LEN * (node_size() / NODE_SIZE) as u64
+}
+
+fn set_opts(dir: &std::path::Path) -> FormatV3Options {
+    let node_size = node_size();
     FormatV3Options {
         node_size,
         journal_len_override: Some(RING_LEN),
@@ -117,14 +128,17 @@ fn set_opts(dir: &std::path::Path) -> FormatV3Options {
 
 async fn format_member(dir: &std::path::Path, name: &str, stamped: bool) -> String {
     let p = dir.join(name);
-    std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+    std::fs::File::create(&p)
+        .unwrap()
+        .set_len(vol_len())
+        .unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
     if stamped {
         std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
     } else {
         std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
     }
-    let r = format_v3_stamped(&p, VOL_LEN, &set_opts(dir), plan.stamps[0].clone()).await;
+    let r = format_v3_stamped(&p, vol_len(), &set_opts(dir), plan.stamps[0].clone()).await;
     std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
     r.expect("format member");
     p.display().to_string()
@@ -1388,6 +1402,108 @@ async fn stripes_supplied_by_other_appenders_are_served_by_their_own_holders() {
     }
     holders.tear_down();
     assert_closed("three holders");
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
+/// The evidence note's scoping instrument (SCOPING — the dev laptop; run
+/// with `--ignored --nocapture`, `cargo test --release` for the numbers):
+/// a solo armed volume, `work` with 2,000 names; the FLIP's wall (the K
+/// local mints + the ONE intent of `K + 2` marker steps), the background
+/// MIGRATION's wall (2,000 moved names, one intent each), `readdir` of
+/// the whole directory flat (one stream) vs striped (the K-way merge —
+/// the `ls` row: a token reader's cost is K + 1 grants on first touch,
+/// then 0 RPCs, PR 5's law), and `lookup` per name before and after.
+/// Then the holders' model: a flip whose K stripes are SUPPLIED by N = 7
+/// declared appenders (`dir_stripe_supply_rpcs`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "scoping instrument — the evidence note's rows"]
+async fn scoping_row_flip_migration_and_readdir_cost() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, routed, work) = solo_armed(dir.path()).await;
+    const NAMES: usize = 2_000;
+    const K: u16 = 14;
+    let names = create_files(&routed, work, "f-", NAMES).await;
+
+    let t = std::time::Instant::now();
+    let flat_list = names_in(&routed, work).await;
+    let flat_readdir = t.elapsed();
+    assert_eq!(flat_list, names);
+    let t = std::time::Instant::now();
+    for n in &names {
+        lookup_opt(&routed, work, n).await.expect("resolves");
+    }
+    let flat_lookup = t.elapsed();
+
+    let before = stripe_stats();
+    let t = std::time::Instant::now();
+    routed.stripe_dir(work, K).await.expect("flip");
+    let flip = t.elapsed();
+    let t = std::time::Instant::now();
+    wait_migrated(&routed, work).await;
+    let migration = t.elapsed();
+    let after = stripe_stats();
+    assert_eq!(after.flips - before.flips, 1);
+    assert_eq!(after.migrated_names - before.migrated_names, NAMES as u64);
+
+    let t = std::time::Instant::now();
+    let striped_list = names_in(&routed, work).await;
+    let striped_readdir = t.elapsed();
+    assert_eq!(striped_list, names);
+    let t = std::time::Instant::now();
+    for n in &names {
+        lookup_opt(&routed, work, n).await.expect("resolves");
+    }
+    let striped_lookup = t.elapsed();
+    let map = routed.stripe_map(work).await.unwrap().unwrap();
+    assert_names_route_to_hash_mod_k(&routed, &map, &names).await;
+    eprintln!(
+        "SCOPING solo K={K} names={NAMES}: flip={flip:?} migration={migration:?} \
+         ({:.1} µs/name) readdir flat={flat_readdir:?} striped={striped_readdir:?} \
+         lookup flat={:.1} µs/name striped={:.1} µs/name",
+        migration.as_secs_f64() * 1e6 / NAMES as f64,
+        flat_lookup.as_secs_f64() * 1e6 / NAMES as f64,
+        striped_lookup.as_secs_f64() * 1e6 / NAMES as f64,
+    );
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+
+    // The holders' model: N = 7 suppliers, one stripe each + the remainder.
+    let dir2 = tempfile::tempdir().unwrap();
+    let holders_n: u32 = 7;
+    let slots: Vec<ForestSlot> = (0..holders_n).map(|i| 4 + 2 * i).collect();
+    let partition = (1..=holders_n)
+        .zip(&slots)
+        .map(|(id, s)| format!("{id}:{s}"))
+        .collect::<Vec<_>>()
+        .join(";");
+    let (uris, dirs) = seeded_volume(dir2.path(), &slots).await;
+    let shared = dirs[0];
+    let partition: &'static str = Box::leak(partition.into_boxed_str());
+    let routed = open_under(&uris, true, Some(partition)).await;
+    let appenders: Vec<u32> = (1..=holders_n).collect();
+    let holders = Holders::stand_up(&routed, &appenders).await;
+    let before = stripe_stats();
+    let before_xo = cross_owner_stats();
+    let t = std::time::Instant::now();
+    routed
+        .stripe_dir_with_suppliers(shared, K, &appenders)
+        .await
+        .expect("flip with the holders as suppliers");
+    let flip = t.elapsed();
+    wait_migrated(&routed, shared).await;
+    let after = stripe_stats();
+    let after_xo = cross_owner_stats();
+    eprintln!(
+        "SCOPING holders N={holders_n} K={K}: flip={flip:?} supply_rpcs={} \
+         steps_shipped={} intents={}",
+        after.supply_rpcs - before.supply_rpcs,
+        after_xo.steps_shipped - before_xo.steps_shipped,
+        after_xo.intents_minted - before_xo.intents_minted,
+    );
+    holders.tear_down();
+    assert_closed("scoping holders");
     shutdown(&routed).await;
     fsck_clean(&uris).await;
 }

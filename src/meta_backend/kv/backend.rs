@@ -5962,6 +5962,16 @@ impl KvMetaBackend {
                 self.path.display()
             )));
         }
+        // Symmetric PR 9 (§5.1.4): a slot whose files a writer holds
+        // custody of from this holder does not move until the writer
+        // releases — a grant never spans a handover.
+        if crate::data_grant::slot_custody_live(self.volume_uuid(), slot) {
+            return Err(KvError::Busy(format!(
+                "{}: release of slot {slot} by appender {region_id} deferred — a writer holds \
+                 custody of a file in it from this holder (the cadence retries)",
+                self.path.display()
+            )));
+        }
         // 1. Releasing FIRST: the gate stops new commits at the door
         // before the flush takes any node lock (the loom-pinned order),
         // then the door is drained — the release's half of the Dekker
@@ -10856,8 +10866,11 @@ impl KvMetaBackend {
             let before = out.len();
             super::block_refs::cancel_same_reference_pairs(&mut out);
             if out.len() != before {
-                let live: std::collections::BTreeSet<super::block_refs::BlockRef> =
-                    out.iter().filter(|o| !o.take).map(|o| o.reference).collect();
+                let live: std::collections::BTreeSet<super::block_refs::BlockRef> = out
+                    .iter()
+                    .filter(|o| !o.take)
+                    .map(|o| o.reference)
+                    .collect();
                 let mut i = 0usize;
                 released_keys.retain(|_| {
                     let keep = live.contains(&released[i]);

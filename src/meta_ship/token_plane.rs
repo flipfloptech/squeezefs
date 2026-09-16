@@ -162,6 +162,24 @@ pub enum TokenCall {
     RecallAck { frame_id: u64 },
     /// Voluntary release (the reader's eviction).
     Release { objects: Vec<u64> },
+    // PR 9 — custody by the slot holder (design-symmetric-metadata §5.5
+    // the "S9 custody endpoint" row, §5.1.5): the S9 write-custody ACQUIRE
+    // of `object` (a LOCAL key ino of the frame's volume) served by its
+    // slot HOLDER in ONE round trip that also carries the file's read
+    // token — the S9 arbitration under the caller's custody lease at this
+    // holder (`lease_epoch`, its JOIN's), then the records
+    // (`TokenWants::default()`: the attrs + the carried xattrs, `layout`
+    // among them). The holder's later commit on the object recalls the
+    // token like any reader's. Never retried on a transport failure (the
+    // S9 acquire's law — a re-sent acquire could strand a grant the caller
+    // cannot name).
+    CustodyGrant {
+        object: u64,
+        span: Option<(u64, u64)>,
+        concurrent_write: bool,
+        wait_ms: u64,
+        lease_epoch: u64,
+    },
 }
 
 impl TokenCall {
@@ -172,6 +190,7 @@ impl TokenCall {
             TokenCall::Recall { .. } => "Recall",
             TokenCall::RecallAck { .. } => "RecallAck",
             TokenCall::Release { .. } => "Release",
+            TokenCall::CustodyGrant { .. } => "CustodyGrant",
         }
     }
 }
@@ -276,6 +295,22 @@ pub enum TokenReply {
         count: u64,
     },
     Refused {
+        reason: String,
+    },
+    // PR 9 — the slot holder's answers to `CustodyGrant`.
+    /// Custody granted by the slot holder (the S9 grant record — the
+    /// caller adopts it exactly as an authority's), the object's records
+    /// carried beside it.
+    CustodyGranted {
+        grant: crate::data_grant::GrantRecord,
+        records: TokenRecords,
+        already: bool,
+    },
+    /// The S9 arbitration refused: `status` is the custody wire's own
+    /// status word (`CUSTODY_CONFLICT` / `CUSTODY_UNKNOWN_LEASE` / …), so
+    /// the caller runs the S9 client's exact refusal ladder.
+    CustodyRefused {
+        status: u16,
         reason: String,
     },
 }
@@ -426,6 +461,41 @@ const RTT_PHASE_NAMES: [&str; RTT_PHASES] = ["send", "drain", "ack", "total"];
 /// 29 — an eviction inside that window must leave the grant judged
 /// `Expired`, never `Unknown`).
 pub static TEST_DISPATCH_HOLD_AFTER_CHECK_MS: AtomicU64 = AtomicU64::new(0);
+
+/// PR 9: the words of one `CustodyGrant` as the holder serves them.
+struct CustodyAsk {
+    object: u64,
+    span: Option<(u64, u64)>,
+    concurrent_write: bool,
+    wait_ms: u64,
+    lease_epoch: u64,
+}
+
+/// The GLOBAL ino of LOCAL key ino `local` on `volume` — the S9 arbiter's
+/// key (the key every write of the file takes in the lock table). `None`
+/// for a control record (raw local < 2 has no global encoding — the same
+/// law `RoutedMetaBackend::try_make_global_ino` states).
+fn global_ino_of(volume: &KvMetaBackend, local: u64) -> Option<u64> {
+    let (slot, raw) = match crate::meta_backend::split_guest_local(local) {
+        Some((slot, raw)) => (u64::from(slot), raw),
+        None => (
+            u64::from(
+                volume
+                    .routing_slot_of_forest(crate::meta_backend::kv::record::NATIVE_FOREST_SLOT)
+                    .ok()?,
+            ),
+            local,
+        ),
+    };
+    if raw < 2 {
+        return None;
+    }
+    Some(crate::meta_backend::make_global_ino_width(
+        raw,
+        slot,
+        crate::dlm_slot::routing_width(),
+    ))
+}
 
 /// The token CLIENTS this process's holder planes have served — every
 /// member id that reached a token verb. `free_grace`'s recall-gated free
@@ -868,6 +938,87 @@ impl TokenHolderPlane {
         TokenReply::Released { count }
     }
 
+    /// **PR 9 — the slot holder's custody grant** (design §5.5 the "S9
+    /// custody endpoint" row): the S9 arbitration on this holder's
+    /// installed custody authority under the caller's lease at it, then
+    /// the object's read token with its records — ONE round trip, one
+    /// arbitration, one registered token. Custody first: the arbiter's
+    /// `inode_{ino}` lease is what keeps this holder's own writes off the
+    /// file while the caller holds it; the records then read under the
+    /// grant ∥ pass gate ([`Self::serve_grant`] — register before read),
+    /// so a commit on the object recalls the caller's token whether it
+    /// landed before or after the read. A token that cannot be served
+    /// (`Gone`, a refused read) releases the custody it just took: the
+    /// caller adopts both words or neither.
+    async fn serve_custody_grant(
+        &self,
+        volume: &KvMetaBackend,
+        client: &str,
+        ask: CustodyAsk,
+    ) -> TokenReply {
+        if let Some(holder) = volume.foreign_slot_holder(ask.object) {
+            self.not_holder_redirects.fetch_add(1, Ordering::Relaxed);
+            return TokenReply::NotHolder { holder };
+        }
+        let Some(owner) = crate::data_grant::custody_owner() else {
+            return TokenReply::Refused {
+                reason: "this slot holder arms no write-custody authority (the S9 owner half \
+                         the multi-writer arm installs) — custody by the slot holder needs it \
+                         on every writer (PR 12's join ladder)"
+                    .to_string(),
+            };
+        };
+        // The arbiter keys on the GLOBAL ino — the key this holder's own
+        // writes take in the same lock table (the caller's word is the
+        // LOCAL key ino; the wire carries one ino, derived here, never a
+        // second word to trust).
+        let Some(ino) = global_ino_of(volume, ask.object) else {
+            return TokenReply::Refused {
+                reason: format!(
+                    "object {} is a control record with no global ino — nothing to hold \
+                     custody of",
+                    ask.object
+                ),
+            };
+        };
+        let frame = crate::data_grant::AcquireFrame {
+            schema: crate::data_grant::CUSTODY_SCHEMA,
+            client: client.to_string(),
+            lease_epoch: ask.lease_epoch,
+            ino,
+            span: ask.span,
+            concurrent_write: ask.concurrent_write,
+            wait_ms: ask.wait_ms,
+            desired: None,
+        };
+        let grant = match owner.grant(&frame).await {
+            Ok(grant) => grant,
+            Err(status) => {
+                return TokenReply::CustodyRefused {
+                    status,
+                    reason: format!(
+                        "custody of inode_{ino} {:?} refused to '{client}' by its slot holder",
+                        ask.span
+                    ),
+                }
+            }
+        };
+        match self
+            .serve_grant(volume, client, ask.object, TokenWants::default(), 0, &[])
+            .await
+        {
+            TokenReply::Granted { records, already } => TokenReply::CustodyGranted {
+                grant,
+                records,
+                already,
+            },
+            other => {
+                owner.release(client, &[grant.grant_id]);
+                other
+            }
+        }
+    }
+
     /// **The commit-path recall** (§5.7.1, the conveyor pass's hook):
     /// take the pass's UNION in flight (the gate's pass half — every
     /// object, holders or not, so a first-touch grant registered from
@@ -1232,9 +1383,30 @@ impl TokenService {
             }
             TokenCall::RecallAck { frame_id } => plane.serve_ack(&frame.client, *frame_id),
             TokenCall::Release { objects } => plane.serve_release(&frame.client, objects),
+            TokenCall::CustodyGrant {
+                object,
+                span,
+                concurrent_write,
+                wait_ms,
+                lease_epoch,
+            } => {
+                plane
+                    .serve_custody_grant(
+                        &self.volume,
+                        &frame.client,
+                        CustodyAsk {
+                            object: *object,
+                            span: *span,
+                            concurrent_write: *concurrent_write,
+                            wait_ms: *wait_ms,
+                            lease_epoch: *lease_epoch,
+                        },
+                    )
+                    .await
+            }
         };
         let status = match reply {
-            TokenReply::Refused { .. } => STATUS_REFUSED,
+            TokenReply::Refused { .. } | TokenReply::CustodyRefused { .. } => STATUS_REFUSED,
             _ => STATUS_OK,
         };
         let body = match encode_reply(&TokenReplyFrame {
@@ -1872,6 +2044,54 @@ impl TokenReaderPlane {
         let attrs = attrs.ok_or_else(|| fail_closed("a grant carried no attrs"))?;
         let is_dir = (attrs.mode & libc::S_IFMT) == libc::S_IFDIR;
         let dir = (wants.dentries && is_dir).then_some(entries);
+        self.install_records(object, gen0, attrs, xattrs, dir).await
+    }
+
+    /// `object`'s recall generation before a grant is asked for — the
+    /// witness [`Self::install_carried`] installs under (the fetch's own
+    /// `gen0`).
+    pub fn recall_generation(&self, object: u64) -> u64 {
+        self.revoke_gen(object)
+    }
+
+    /// **PR 9 — install the records a custody grant CARRIED** (the slot
+    /// holder's `CustodyGranted`): the token the holder registered for
+    /// this client lands in the cache under the SAME law a fetched page
+    /// does — nothing installed when a recall of the object landed since
+    /// `gen0` was read (the holder's channel already retired it; the next
+    /// serve re-fetches). `Ok(None)` = not installed.
+    pub async fn install_carried(
+        &self,
+        object: u64,
+        records: TokenRecords,
+        gen0: u64,
+    ) -> Result<Option<Arc<TokenEntry>>> {
+        if self.revoke_gen(object) != gen0 {
+            return Ok(None);
+        }
+        self.grants.fetch_add(1, Ordering::Relaxed);
+        match self
+            .install_records(object, gen0, records.attrs, records.xattrs, None)
+            .await?
+        {
+            FetchOutcome::Installed(e) => Ok(Some(e)),
+            FetchOutcome::Gone | FetchOutcome::RecalledMidFetch => Ok(None),
+        }
+    }
+
+    /// The install tail every grant page set shares: the entry built,
+    /// charged against the records budget (ONE oversize entry refused
+    /// loud), room made by voluntary releases, and installed iff no
+    /// recall of `object` landed since `gen0` — decided UNDER the cache
+    /// entry (review round 2, Issue 21).
+    async fn install_records(
+        &self,
+        object: u64,
+        gen0: u64,
+        attrs: WireAttrs,
+        xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+        dir: Option<Vec<DirRecord>>,
+    ) -> Result<FetchOutcome> {
         let bytes = TOKEN_ENTRY_BYTES
             + xattrs
                 .iter()

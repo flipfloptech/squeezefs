@@ -2121,7 +2121,50 @@ fn arb_token_call() -> impl Strategy<Value = TokenCall> {
         any::<u64>().prop_map(|frame_id| TokenCall::RecallAck { frame_id }),
         prop::collection::vec(any::<u64>(), 0..32)
             .prop_map(|objects| TokenCall::Release { objects }),
+        // PR 9 — custody by the slot holder.
+        (
+            any::<u64>(),
+            prop::option::of((any::<u64>(), any::<u64>())),
+            any::<bool>(),
+            any::<u64>(),
+            any::<u64>(),
+        )
+            .prop_map(|(object, span, concurrent_write, wait_ms, lease_epoch)| {
+                TokenCall::CustodyGrant {
+                    object,
+                    span,
+                    concurrent_write,
+                    wait_ms,
+                    lease_epoch,
+                }
+            }),
     ]
+}
+
+/// PR 9: the S9 grant record a `CustodyGranted` carries.
+fn arb_grant_record() -> impl Strategy<Value = squeezefs::data_grant::GrantRecord> {
+    (
+        any::<u32>(),
+        any::<u64>(),
+        any::<u64>(),
+        prop::option::of((any::<u64>(), any::<u64>())),
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+    )
+        .prop_map(
+            |(schema, grant_id, ino, span, token, term, custody_epoch)| {
+                squeezefs::data_grant::GrantRecord {
+                    schema,
+                    grant_id,
+                    ino,
+                    span,
+                    token,
+                    term,
+                    custody_epoch,
+                }
+            },
+        )
 }
 
 fn arb_wire_attrs() -> impl Strategy<Value = WireAttrs> {
@@ -2180,17 +2223,46 @@ fn arb_token_reply() -> impl Strategy<Value = TokenReply> {
         0..8,
     );
     prop_oneof![
-        (arb_wire_attrs(), xattrs, any::<bool>(), dir, any::<bool>()).prop_map(
-            |(attrs, xattrs, xattrs_complete, dir, already)| TokenReply::Granted {
-                records: TokenRecords {
-                    attrs,
-                    xattrs,
-                    xattrs_complete,
-                    dir,
-                },
-                already,
-            }
-        ),
+        (
+            arb_wire_attrs(),
+            xattrs.clone(),
+            any::<bool>(),
+            dir,
+            any::<bool>()
+        )
+            .prop_map(|(attrs, xattrs, xattrs_complete, dir, already)| {
+                TokenReply::Granted {
+                    records: TokenRecords {
+                        attrs,
+                        xattrs,
+                        xattrs_complete,
+                        dir,
+                    },
+                    already,
+                }
+            }),
+        // PR 9 — the slot holder's custody answers.
+        (
+            arb_grant_record(),
+            arb_wire_attrs(),
+            xattrs,
+            any::<bool>(),
+            any::<bool>(),
+        )
+            .prop_map(|(grant, attrs, xattrs, xattrs_complete, already)| {
+                TokenReply::CustodyGranted {
+                    grant,
+                    records: TokenRecords {
+                        attrs,
+                        xattrs,
+                        xattrs_complete,
+                        dir: None,
+                    },
+                    already,
+                }
+            }),
+        (any::<u16>(), "\\PC{0,64}")
+            .prop_map(|(status, reason)| TokenReply::CustodyRefused { status, reason }),
         any::<u32>().prop_map(|holder| TokenReply::NotHolder { holder }),
         Just(TokenReply::Gone),
         (any::<u64>(), prop::collection::vec(any::<u64>(), 0..32))

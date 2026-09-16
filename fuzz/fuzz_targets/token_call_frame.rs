@@ -2,9 +2,12 @@
 //! design-symmetric-metadata §5.7 / §6.3, `TOKEN_SCHEMA` 1 under
 //! `CLUSTER_WIRE_SCHEMA` 5 — PR 5, review round 1 Issue 9): the
 //! `TokenRequestFrame` a reader ships to its holder (`Grant` / `Recall` /
-//! `RecallAck` / `Release`) and the `TokenReplyFrame` the holder answers
-//! (`Granted` with the object's RECORDS — attrs, xattrs, a dentry page —
-//! `NotHolder` / `Gone` / `Recall` / `Acked` / `Released` / `Refused`).
+//! `RecallAck` / `Release`; since PR 9 the writer's `CustodyGrant`) and the
+//! `TokenReplyFrame` the holder answers (`Granted` with the object's
+//! RECORDS — attrs, xattrs, a dentry page — `NotHolder` / `Gone` /
+//! `Recall` / `Acked` / `Released` / `Refused`; since PR 9
+//! `CustodyGranted` carrying the S9 grant record beside the records, and
+//! `CustodyRefused` with the custody wire's status word).
 //!
 //! Threat model: the body arrives on an AUTHENTICATED `cluster_wire`
 //! session, but authentication is membership, not trust — a reader with a
@@ -29,6 +32,7 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
+use squeezefs::data_grant::GrantRecord;
 use squeezefs::meta_ship::token_plane::{
     decode_reply, decode_request, encode_reply, encode_request, DirRecord, TokenCall, TokenMode,
     TokenRecords, TokenReply, TokenReplyFrame, TokenRequestFrame, TokenWants, WireAttrs,
@@ -53,6 +57,14 @@ enum ArbCall {
     Release {
         objects: Vec<u64>,
     },
+    // PR 9 — custody by the slot holder.
+    CustodyGrant {
+        object: u64,
+        span: Option<(u64, u64)>,
+        concurrent_write: bool,
+        wait_ms: u64,
+        lease_epoch: u64,
+    },
 }
 
 impl ArbCall {
@@ -76,8 +88,33 @@ impl ArbCall {
             ArbCall::Release { objects } => TokenCall::Release {
                 objects: objects.into_iter().take(64).collect(),
             },
+            ArbCall::CustodyGrant {
+                object,
+                span,
+                concurrent_write,
+                wait_ms,
+                lease_epoch,
+            } => TokenCall::CustodyGrant {
+                object,
+                span,
+                concurrent_write,
+                wait_ms,
+                lease_epoch,
+            },
         }
     }
+}
+
+/// PR 9: the S9 grant record a `CustodyGranted` carries.
+#[derive(Arbitrary, Debug)]
+struct ArbGrant {
+    schema: u32,
+    grant_id: u64,
+    ino: u64,
+    span: Option<(u64, u64)>,
+    token: u64,
+    term: u64,
+    custody_epoch: u64,
 }
 
 #[derive(Arbitrary, Debug)]
@@ -126,6 +163,67 @@ enum ArbReply {
     Refused {
         reason: String,
     },
+    // PR 9 — the slot holder's answers to `CustodyGrant`.
+    CustodyGranted {
+        grant: ArbGrant,
+        attrs: ArbAttrs,
+        xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+        xattrs_complete: bool,
+        already: bool,
+    },
+    CustodyRefused {
+        status: u16,
+        reason: String,
+    },
+}
+
+/// The bounded `TokenRecords` of a granted reply (both grant shapes).
+fn records_of(
+    attrs: ArbAttrs,
+    xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+    xattrs_complete: bool,
+    dir: Option<(Vec<ArbDir>, bool)>,
+) -> TokenRecords {
+    TokenRecords {
+        xattrs_complete,
+        attrs: WireAttrs {
+            mode: attrs.mode,
+            uid: attrs.uid,
+            gid: attrs.gid,
+            nlink: attrs.nlink,
+            flags: attrs.flags,
+            rdev: attrs.rdev,
+            size: attrs.size,
+            atime: attrs.atime,
+            mtime: attrs.mtime,
+            ctime: attrs.ctime,
+        },
+        xattrs: xattrs
+            .into_iter()
+            .take(8)
+            .map(|(n, v)| {
+                (
+                    n.into_iter().take(64).collect(),
+                    v.into_iter().take(256).collect(),
+                )
+            })
+            .collect(),
+        dir: dir.map(|(entries, complete)| {
+            (
+                entries
+                    .into_iter()
+                    .take(64)
+                    .map(|d| DirRecord {
+                        cookie: d.cookie,
+                        child_ino: d.child_ino,
+                        file_type: d.file_type,
+                        name: d.name.into_iter().take(255).collect(),
+                    })
+                    .collect(),
+                complete,
+            )
+        }),
+    }
 }
 
 impl ArbReply {
@@ -138,47 +236,31 @@ impl ArbReply {
                 dir,
                 already,
             } => TokenReply::Granted {
-                records: TokenRecords {
-                    xattrs_complete,
-                    attrs: WireAttrs {
-                        mode: attrs.mode,
-                        uid: attrs.uid,
-                        gid: attrs.gid,
-                        nlink: attrs.nlink,
-                        flags: attrs.flags,
-                        rdev: attrs.rdev,
-                        size: attrs.size,
-                        atime: attrs.atime,
-                        mtime: attrs.mtime,
-                        ctime: attrs.ctime,
-                    },
-                    xattrs: xattrs
-                        .into_iter()
-                        .take(8)
-                        .map(|(n, v)| {
-                            (
-                                n.into_iter().take(64).collect(),
-                                v.into_iter().take(256).collect(),
-                            )
-                        })
-                        .collect(),
-                    dir: dir.map(|(entries, complete)| {
-                        (
-                            entries
-                                .into_iter()
-                                .take(64)
-                                .map(|d| DirRecord {
-                                    cookie: d.cookie,
-                                    child_ino: d.child_ino,
-                                    file_type: d.file_type,
-                                    name: d.name.into_iter().take(255).collect(),
-                                })
-                                .collect(),
-                            complete,
-                        )
-                    }),
-                },
+                records: records_of(attrs, xattrs, xattrs_complete, dir),
                 already,
+            },
+            ArbReply::CustodyGranted {
+                grant,
+                attrs,
+                xattrs,
+                xattrs_complete,
+                already,
+            } => TokenReply::CustodyGranted {
+                grant: GrantRecord {
+                    schema: grant.schema,
+                    grant_id: grant.grant_id,
+                    ino: grant.ino,
+                    span: grant.span,
+                    token: grant.token,
+                    term: grant.term,
+                    custody_epoch: grant.custody_epoch,
+                },
+                records: records_of(attrs, xattrs, xattrs_complete, None),
+                already,
+            },
+            ArbReply::CustodyRefused { status, reason } => TokenReply::CustodyRefused {
+                status,
+                reason: reason.chars().take(256).collect(),
             },
             ArbReply::NotHolder { holder } => TokenReply::NotHolder { holder },
             ArbReply::Gone => TokenReply::Gone,

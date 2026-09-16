@@ -351,6 +351,15 @@ impl SlotLockManager {
         mode: LockMode,
         ttl: Duration,
     ) -> Result<LockLease> {
+        // Symmetric PR 9 (design §5.5 "S9 custody endpoint"): under the
+        // armed plane an inode object's custody server is its slot's
+        // HOLDER — resolved through tree 0 + the SlotHolderCache, the
+        // LOCK round trip `dlm_rpcs` has always counted. One relaxed load
+        // on every unarmed mount, and `None` for every own-slot object.
+        if let Some((ino, home)) = crate::data_grant::slot_holder_home_of_path(file_path) {
+            DLM_RPCS.fetch_add(1, Ordering::Relaxed);
+            return crate::data_grant::acquire_at_slot_holder(home, ino, range, mode, ttl).await;
+        }
         let slot = lock_home_slot(file_path);
         if !is_local_slot(slot) {
             // The RPC site — and since **S9** it is a real round trip.
@@ -404,6 +413,15 @@ impl SlotLockManager {
         ttl: Duration,
         geometry: Option<(u64, u64)>,
     ) -> Result<crate::dlm::RangeAcquired> {
+        // Symmetric PR 9: the slot holder serves the ranged acquire too
+        // (see `acquire_lock_mode`).
+        if let Some((ino, home)) = crate::data_grant::slot_holder_home_of_path(file_path) {
+            DLM_RPCS.fetch_add(1, Ordering::Relaxed);
+            return crate::data_grant::acquire_range_at_slot_holder(
+                home, ino, required, desired, ttl,
+            )
+            .await;
+        }
         let slot = lock_home_slot(file_path);
         if !is_local_slot(slot) {
             DLM_RPCS.fetch_add(1, Ordering::Relaxed);

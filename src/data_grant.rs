@@ -92,6 +92,7 @@ use arc_swap::ArcSwapOption;
 use bincode::Options as _;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -649,6 +650,17 @@ static RANGE_EXTENSIONS_CLIENT: AtomicU64 = AtomicU64::new(0);
 /// releases flat means a flush that never completes (read it beside the
 /// writeback error latches).
 static RELEASES_DEFERRED: AtomicU64 = AtomicU64::new(0);
+/// PR 9: grants this node acquired from a file's SLOT HOLDER rather than
+/// the set authority (`dlm_custody_via_slot_holder`) — 0 unarmed, 0 for
+/// every own-slot file (the local arbiter, no RPC).
+static VIA_SLOT_HOLDER: AtomicU64 = AtomicU64::new(0);
+/// PR 9: slot-holder grants whose reply carried the file's records and
+/// installed them as this node's token (`dlm_custody_token_carried`) —
+/// ≤ `via_slot_holder`; the difference is grants whose token a recall
+/// retired mid-flight.
+static TOKEN_CARRIED: AtomicU64 = AtomicU64::new(0);
+/// The token-wire correlation ids of the carried custody grants.
+static CARRIED_REQUEST_IDS: AtomicU64 = AtomicU64::new(1);
 
 /// Finding 34 (rung 1): the RELEASE GATE — answers whether `ino`'s
 /// publish pipeline is QUIESCENT (synchronously, lock-order-free: the
@@ -696,6 +708,10 @@ pub struct ClientStats {
     pub rpcs: u64,
     /// Times this node fail-stopped its own custody at `T_self`.
     pub self_fences: u64,
+    /// PR 9: grants acquired from a file's slot HOLDER (0 unarmed).
+    pub via_slot_holder: u64,
+    /// PR 9: slot-holder grants whose reply carried the file's token.
+    pub token_carried: u64,
 }
 
 /// Read the process's custody ledger.
@@ -708,6 +724,8 @@ pub fn stats() -> ClientStats {
         unknown_leases: UNKNOWN_LEASES.load(Ordering::Relaxed),
         rpcs: RPCS.load(Ordering::Relaxed),
         self_fences: SELF_FENCES.load(Ordering::Relaxed),
+        via_slot_holder: VIA_SLOT_HOLDER.load(Ordering::Relaxed),
+        token_carried: TOKEN_CARRIED.load(Ordering::Relaxed),
     }
 }
 
@@ -744,6 +762,11 @@ pub fn stats_json() -> serde_json::Value {
         "dlm_custody_notice_polls": NOTICE_POLL_ROUNDS.load(Ordering::Relaxed),
         "dlm_custody_notice_poll_notices": NOTICE_POLL_NOTICES.load(Ordering::Relaxed),
         "dlm_custody_notice_poll_failures": NOTICE_POLL_FAILURES.load(Ordering::Relaxed),
+        // Symmetric PR 9 — custody by the slot holder: grants served by a
+        // file's slot holder rather than the set authority, and how many
+        // of those carried the file's token (0 unarmed; 0 on an own file).
+        "dlm_custody_via_slot_holder": c.via_slot_holder,
+        "dlm_custody_token_carried": c.token_carried,
         "dlm_custody_held": OWNER
             .load()
             .as_ref()
@@ -3211,7 +3234,20 @@ impl WriteCustodyClient {
             });
         }
         let r: AcquireReplyFrame = decode(&reply.body, "grant")?;
-        let grant = r.grant;
+        let lease = self.adopt_grant(&r.grant, mode)?;
+        // Finding 16 half (a): the acquire reply is a notice carrier —
+        // absorbed AFTER this acquire's own outcome adopts, so a notice
+        // about another of this client's grants can never reorder ahead
+        // of the custody it rode in on.
+        self.absorb_notices(&r.demotions, &r.shrinks).await;
+        Ok(lease)
+    }
+
+    /// Adopt a whole-file / span grant the authority answered: the client's
+    /// handle, the custody generation, the owner's own token in this
+    /// process's custody table. The ONE adopt for every carrier of a plain
+    /// grant record (the S9 acquire reply; PR 9's token-carried grant).
+    fn adopt_grant(&self, grant: &GrantRecord, mode: LockMode) -> Result<LockLease> {
         let t_adopt = Instant::now();
         let handle = Arc::new(ClientGrant {
             grant_id: grant.grant_id,
@@ -3233,12 +3269,119 @@ impl WriteCustodyClient {
         )?;
         phase_record(CustodyPhase::Adopt, t_adopt);
         GRANTS.fetch_add(1, Ordering::Relaxed);
-        // Finding 16 half (a): the acquire reply is a notice carrier —
-        // absorbed AFTER this acquire's own outcome adopts, so a notice
-        // about another of this client's grants can never reorder ahead
-        // of the custody it rode in on.
-        self.absorb_notices(&r.demotions, &r.shrinks).await;
         Ok(lease)
+    }
+
+    /// **PR 9 — the custody acquire at the file's SLOT HOLDER, the token
+    /// carried** (design §5.5 the "S9 custody endpoint" row): ONE round
+    /// trip on PR 5's token wire (`TokenCall::CustodyGrant`) answers the
+    /// S9 grant record — adopted exactly as an authority's — AND the
+    /// object's records under a read token the holder registered for this
+    /// client. `object` is the LOCAL key ino on `volume`; the grant names
+    /// the GLOBAL ino. Like `acquire`, never retried on a transport
+    /// failure (no dedup window — a re-sent acquire could strand a grant
+    /// this client cannot name). A `NotHolder` answer travels up: the
+    /// caller re-resolves the holder (tree 0 moved under its view).
+    pub async fn acquire_carrying_token(
+        &self,
+        volume: u16,
+        object: u64,
+        span: Option<(u64, u64)>,
+        mode: LockMode,
+        wait: Duration,
+    ) -> Result<CarriedAcquire> {
+        use crate::meta_ship::token_plane as tp;
+        if crate::data_custody::poisoned() {
+            return Err(SqueezefsError::WriterGuardFenced);
+        }
+        self.drain_releases().await;
+        let request_id = CARRIED_REQUEST_IDS.fetch_add(1, Ordering::Relaxed);
+        let body = tp::encode_request(&tp::TokenRequestFrame {
+            schema: tp::TOKEN_SCHEMA,
+            request_id,
+            volume,
+            client: self.id.clone(),
+            call: tp::TokenCall::CustodyGrant {
+                object,
+                span,
+                concurrent_write: mode == LockMode::ConcurrentWrite,
+                wait_ms: wait.as_millis().min(u64::MAX as u128) as u64,
+                lease_epoch: self.lease_epoch.load(Ordering::Acquire),
+            },
+        })?;
+        let t = Instant::now();
+        let reply = self.call_once(tp::VERB_TOKEN_CALL, body).await?;
+        phase_record(CustodyPhase::Rtt, t);
+        if reply.status != tp::STATUS_OK && reply.status != tp::STATUS_REFUSED {
+            return Err(SqueezefsError::LockFailed {
+                reason: format!(
+                    "PR 9: the slot holder at {} refused the custody frame for object \
+                     {object} on volume {volume} with status {}: {}",
+                    self.endpoint,
+                    reply.status,
+                    String::from_utf8_lossy(&reply.body)
+                ),
+            });
+        }
+        let frame = tp::decode_reply(&reply.body)?;
+        if frame.schema != tp::TOKEN_SCHEMA || frame.request_id != request_id {
+            return Err(SqueezefsError::LockFailed {
+                reason: format!(
+                    "PR 9: the slot holder at {} answered request {request_id} with schema {} \
+                     request {} — refusing to adopt custody off a frame that is not this \
+                     acquire's",
+                    self.endpoint, frame.schema, frame.request_id
+                ),
+            });
+        }
+        match frame.reply {
+            tp::TokenReply::CustodyGranted {
+                grant,
+                records,
+                already,
+            } => {
+                let lease = self.adopt_grant(&grant, mode)?;
+                Ok(CarriedAcquire::Granted {
+                    lease,
+                    records,
+                    already,
+                })
+            }
+            tp::TokenReply::NotHolder { holder } => Ok(CarriedAcquire::NotHolder { holder }),
+            tp::TokenReply::CustodyRefused { status, reason } => {
+                if status == CUSTODY_UNKNOWN_LEASE {
+                    self.note_lease_lost(&reason);
+                }
+                Err(SqueezefsError::LockFailed {
+                    reason: format!(
+                        "S9: the slot holder at {} refused custody of object {object} {span:?} \
+                         ({}): {reason}",
+                        self.endpoint,
+                        status_name(status)
+                    ),
+                })
+            }
+            tp::TokenReply::Gone => Err(SqueezefsError::LockFailed {
+                reason: format!(
+                    "PR 9: the slot holder at {} holds no object {object} on volume {volume} — \
+                     nothing to hold custody of",
+                    self.endpoint
+                ),
+            }),
+            tp::TokenReply::Refused { reason } => Err(SqueezefsError::LockFailed {
+                reason: format!(
+                    "PR 9: the slot holder at {} refused the custody grant of object \
+                     {object}: {reason}",
+                    self.endpoint
+                ),
+            }),
+            other => Err(SqueezefsError::LockFailed {
+                reason: format!(
+                    "PR 9: the slot holder at {} answered a CustodyGrant with {other:?}",
+                    self.endpoint
+                ),
+            }),
+        }
     }
 
     /// **S11 rung 15 — acquire EX byte-range custody by the §9.2
@@ -4222,4 +4365,489 @@ pub async fn acquire_remote(
         return Err(SqueezefsError::LockFailed { reason });
     };
     client.acquire(ino, span, mode, ttl).await
+}
+
+// ---------------------------------------------------------------------------
+// Symmetric PR 9 — custody by the SLOT HOLDER (design-symmetric-metadata
+// §5.5 the "S9 custody endpoint" row, §5.1.5 the custody lock class, §5.7.1
+// the holder's implicit Write). Under the armed plane the custody server
+// for an inode object is the appender leasing its slot — resolved through
+// tree 0's lessee + the `SlotHolderCache` exactly as PR 6's shipped steps
+// are (`crossvol_tx::step_home`), never a manager RPC. The S9 protocol is
+// unchanged (JOIN / RENEW / RELEASE / `T_self` / the custody epoch); what
+// moves is WHERE its server is: one JOINed `WriteCustodyClient` per holder
+// endpoint (single-flight — a second JOIN at one holder REPLACES the first
+// lease and revokes its grants), and the grant rides PR 5's token wire so
+// ONE round trip answers custody AND the file's records (Lustre's intent
+// lock), installed into a per-`(holder, volume)` `TokenReaderPlane` whose
+// standing recall channel is what lets the holder's later commit on the
+// file recall the token and this writer re-fetch (gate 5's exactness).
+// Unarmed — and for every own-slot file — nothing here is consulted past
+// one relaxed load: the local arbiter serves, `dlm_rpcs` stays 0.
+// ---------------------------------------------------------------------------
+
+/// The outcome of one slot-holder acquire ([`WriteCustodyClient::acquire_carrying_token`]).
+pub enum CarriedAcquire {
+    /// Custody adopted; the file's records as the holder served them.
+    Granted {
+        lease: LockLease,
+        records: crate::meta_ship::token_plane::TokenRecords,
+        already: bool,
+    },
+    /// The holder's tree 0 leases the object's slot to `holder` — the
+    /// caller re-resolves (a stale `SlotHolderCache` view).
+    NotHolder { holder: u32 },
+}
+
+/// Where an inode object's custody is SERVED under the armed plane, when
+/// it is not this mount's own.
+#[derive(Debug, Clone)]
+pub enum CustodyHome {
+    /// Appender `holder` leases the object's slot and serves at `endpoint`;
+    /// `object` is the LOCAL key ino on set volume `volume`.
+    Holder {
+        holder: u32,
+        endpoint: Arc<str>,
+        volume: u16,
+        object: u64,
+    },
+    /// Appender `holder` leases the slot and this mount knows no endpoint
+    /// for it (the join ladder's census binding — PR 12's): refused loud.
+    Unbound { holder: u32 },
+}
+
+/// The mount's recall sink per set volume (the `MountRecallSink` shape;
+/// the contracts' probe) — what a holder's recall drains and purges on
+/// this writer before the ack travels.
+pub type RecallSinkFor =
+    Arc<dyn Fn(usize) -> Arc<dyn crate::meta_ship::token_plane::RecallDataSink> + Send + Sync>;
+
+/// One dialed holder: its S9 custody client (one lease, renewed on its
+/// own cadence) and, per set volume, the token plane its carried records
+/// install into.
+struct HolderCustody {
+    client: Arc<WriteCustodyClient>,
+    planes: HashMap<u16, Arc<crate::meta_ship::token_plane::TokenReaderPlane>>,
+}
+
+/// What the armed plane installs (`arm_slot_custody`): the set to resolve
+/// through, this mount's dial identity, and the holders it has dialed.
+pub struct SlotCustodyArm {
+    routed: std::sync::Weak<crate::meta_backend::RoutedMetaBackend>,
+    node_id: String,
+    secret: Vec<u8>,
+    pr_key: u64,
+    sink_for: RecallSinkFor,
+    /// Endpoint → the dialed holder. An ASYNC mutex held across the dial:
+    /// two first touches of one holder must never JOIN it twice.
+    holders: crate::sqz_sync::SqzMutex<HashMap<Arc<str>, HolderCustody>>,
+    /// The renewal loops' stop latch (the co-writer arm's own shape).
+    stop: Arc<AtomicBool>,
+}
+
+static SLOT_CUSTODY: Lazy<ArcSwapOption<SlotCustodyArm>> = Lazy::new(ArcSwapOption::empty);
+
+/// Arm custody by the slot holder over `routed` (the mount path on an
+/// armed symmetric set; the contracts directly): `node_id` and `pr_key`
+/// are this mount's KD-MW-2 identity and WERO registrant key — the JOIN's
+/// words at every holder. Idempotent per process (a re-arm replaces).
+pub fn arm_slot_custody(
+    routed: &Arc<crate::meta_backend::RoutedMetaBackend>,
+    node_id: &str,
+    secret: Vec<u8>,
+    pr_key: u64,
+    sink_for: RecallSinkFor,
+) -> Arc<SlotCustodyArm> {
+    let arm = Arc::new(SlotCustodyArm {
+        routed: Arc::downgrade(routed),
+        node_id: node_id.to_string(),
+        secret,
+        pr_key,
+        sink_for,
+        holders: crate::sqz_sync::SqzMutex::new(HashMap::new()),
+        stop: Arc::new(AtomicBool::new(false)),
+    });
+    SLOT_CUSTODY.store(Some(Arc::clone(&arm)));
+    log::info!(
+        "symmetric PR 9: write custody by the SLOT HOLDER armed for '{node_id}' — a foreign \
+         file's custody is acquired from the appender leasing its slot (tree 0 + \
+         SlotHolderCache), the grant carrying the file's records; own files stay local"
+    );
+    arm
+}
+
+/// The clean leave (unmount / the contracts): every dialed holder's tokens
+/// are RELEASED (the drain + purge before the holder is told — the token
+/// plane's one release path), its queued custody releases flushed, and
+/// the renewal loops stopped. A writer that dies without this leaves its
+/// grants to each holder's lease-expiry arm (the S9 law).
+pub async fn disarm_slot_custody() {
+    let Some(arm) = SLOT_CUSTODY.swap(None) else {
+        return;
+    };
+    arm.stop.store(true, Ordering::Release);
+    let holders = std::mem::take(&mut *arm.holders.lock().await);
+    for (_, h) in holders {
+        for plane in h.planes.values() {
+            plane.stop().await;
+        }
+        h.client.drain_releases().await;
+    }
+}
+
+/// Drop the arm WITHOUT the clean leave (a contract's teardown after a
+/// panic; the renewal loops stop at their next tick): every dialed
+/// holder's grants are left to its lease-expiry arm — the death shape.
+pub fn uninstall_slot_custody() {
+    if let Some(arm) = SLOT_CUSTODY.swap(None) {
+        arm.stop.store(true, Ordering::Release);
+    }
+}
+
+/// Is custody by the slot holder armed in this process (the contracts' and
+/// the stats face's probe)?
+pub fn slot_custody_armed() -> bool {
+    SLOT_CUSTODY.load().is_some()
+}
+
+impl SlotCustodyArm {
+    /// The dialed holder at `endpoint`, JOINed on first touch (one lease
+    /// per holder, its renewal cadence spawned), with a token plane for
+    /// set volume `volume` (its standing recall channel started, the
+    /// mount's recall sink installed, the holder probed once — a holder
+    /// that serves no tokens is found here, not at a later serve).
+    async fn holder(
+        &self,
+        endpoint: &Arc<str>,
+        volume: u16,
+    ) -> Result<(
+        Arc<WriteCustodyClient>,
+        Arc<crate::meta_ship::token_plane::TokenReaderPlane>,
+    )> {
+        use crate::meta_ship::token_plane::{TokenClientConfig, TokenReaderPlane};
+        use std::collections::hash_map::Entry;
+        let mut holders = self.holders.lock().await;
+        let h = match holders.entry(Arc::clone(endpoint)) {
+            Entry::Occupied(o) => o.into_mut(),
+            Entry::Vacant(v) => {
+                let client = WriteCustodyClient::connect_with_clock(
+                    endpoint,
+                    &self.secret,
+                    &self.node_id,
+                    LeaseClock::monotonic(),
+                    self.pr_key,
+                )
+                .await
+                .map_err(|e| SqueezefsError::LockFailed {
+                    reason: format!(
+                        "PR 9: the slot holder at {endpoint} refused this mount's custody JOIN \
+                         or could not be reached ({e}) — no custody of its files can be acquired"
+                    ),
+                })?;
+                crate::cowriter::spawn_custody_renewal(Arc::clone(&client), Arc::clone(&self.stop));
+                v.insert(HolderCustody {
+                    client,
+                    planes: HashMap::new(),
+                })
+            }
+        };
+        let plane = match h.planes.entry(volume) {
+            Entry::Occupied(o) => Arc::clone(o.get()),
+            Entry::Vacant(v) => {
+                let plane = TokenReaderPlane::new(TokenClientConfig {
+                    endpoint: endpoint.to_string(),
+                    secret: self.secret.clone(),
+                    client_id: self.node_id.clone(),
+                    volume,
+                });
+                plane.install_data_sink((self.sink_for)(usize::from(volume)));
+                plane
+                    .probe()
+                    .await
+                    .map_err(|e| SqueezefsError::LockFailed {
+                        reason: format!(
+                            "PR 9: the slot holder at {endpoint} serves no read tokens for \
+                             volume {volume} ({e}) — a custody grant there could carry no \
+                             records and its recalls could reach nobody"
+                        ),
+                    })?;
+                let task = Arc::clone(&plane);
+                crate::meta_exec::spawn_meta("slot_custody_recall_channel", async move {
+                    task.run_recall_channel().await;
+                });
+                Arc::clone(v.insert(plane))
+            }
+        };
+        Ok((Arc::clone(&h.client), plane))
+    }
+
+    /// The token plane toward `endpoint` for `volume`, if dialed (the
+    /// contracts' probe of the carried token's cache).
+    pub async fn token_plane(
+        &self,
+        endpoint: &str,
+        volume: u16,
+    ) -> Option<Arc<crate::meta_ship::token_plane::TokenReaderPlane>> {
+        self.holders
+            .lock()
+            .await
+            .get(endpoint)
+            .and_then(|h| h.planes.get(&volume))
+            .cloned()
+    }
+
+    /// The custody client toward `endpoint`, if dialed (the contracts'
+    /// probe of the holder-side lease).
+    pub async fn holder_client(&self, endpoint: &str) -> Option<Arc<WriteCustodyClient>> {
+        self.holders
+            .lock()
+            .await
+            .get(endpoint)
+            .map(|h| Arc::clone(&h.client))
+    }
+}
+
+/// Where GLOBAL ino `ino`'s custody is served when it is NOT this mount's:
+/// `None` unarmed, or for a slot this mount leases / maintains (the local
+/// arbiter — one relaxed load, then PR 6's `step_home`). The lease TABLE
+/// decides, not the S4 lock table: a declared region's slot is another
+/// appender's for every cross-owner decision (PR 6's law).
+pub fn slot_holder_home(ino: u64) -> Option<CustodyHome> {
+    use crate::meta_backend::crossvol_tx::{step_home, StepHome};
+    let guard = SLOT_CUSTODY.load();
+    let arm = guard.as_ref()?;
+    let routed = arm.routed.upgrade()?;
+    let (v, local) = routed.route_ino(ino);
+    match step_home(&routed, v, local) {
+        StepHome::Local => None,
+        StepHome::Foreign { holder, endpoint } => Some(CustodyHome::Holder {
+            holder,
+            endpoint,
+            volume: u16::try_from(v).ok()?,
+            object: local,
+        }),
+        StepHome::Unreachable { holder } => Some(CustodyHome::Unbound { holder }),
+    }
+}
+
+/// [`slot_holder_home`] for a lock object's path form — `Some((ino,
+/// home))` only for an inode object whose custody a holder serves.
+pub fn slot_holder_home_of_path(file_path: &str) -> Option<(u64, CustodyHome)> {
+    let ino = crate::dlm::ino_of_path(file_path)?;
+    slot_holder_home(ino).map(|home| (ino, home))
+}
+
+fn unbound_holder(holder: u32, ino: u64, what: &str) -> SqueezefsError {
+    let reason = format!(
+        "PR 9: inode_{ino}'s slot is leased by appender {holder} and this mount knows no \
+         endpoint for it (the join ladder's census binding is PR 12's; a dead holder's slots \
+         are re-leased by PR 10's recovery) — refusing the {what} rather than granting custody \
+         the holder never issued"
+    );
+    log::error!("{reason}");
+    SqueezefsError::LockFailed { reason }
+}
+
+/// **The custody acquire at the slot holder** (`SlotLockManager`'s PR 9
+/// arm): dial the holder (JOIN on first touch), one token-wire round trip
+/// for custody + the records, the records installed as this writer's
+/// token. A `NotHolder` answer re-resolves the holder through the cache's
+/// endpoint table ONCE (tree 0 moved under our view); a second refuses.
+pub async fn acquire_at_slot_holder(
+    home: CustodyHome,
+    ino: u64,
+    span: Option<(u64, u64)>,
+    mode: LockMode,
+    ttl: Duration,
+) -> Result<LockLease> {
+    let arm = SLOT_CUSTODY
+        .load_full()
+        .ok_or_else(|| SqueezefsError::LockFailed {
+            reason: format!(
+                "PR 9: custody by the slot holder disarmed under inode_{ino}'s acquire"
+            ),
+        })?;
+    let (mut holder, mut endpoint, volume, object) = match home {
+        CustodyHome::Holder {
+            holder,
+            endpoint,
+            volume,
+            object,
+        } => (holder, endpoint, volume, object),
+        CustodyHome::Unbound { holder } => return Err(unbound_holder(holder, ino, "acquire")),
+    };
+    for redirected in [false, true] {
+        let (client, tokens) = arm.holder(&endpoint, volume).await?;
+        let gen0 = tokens.recall_generation(object);
+        match client
+            .acquire_carrying_token(volume, object, span, mode, ttl)
+            .await?
+        {
+            CarriedAcquire::Granted { lease, records, .. } => {
+                VIA_SLOT_HOLDER.fetch_add(1, Ordering::Relaxed);
+                if tokens
+                    .install_carried(object, records, gen0)
+                    .await?
+                    .is_some()
+                {
+                    TOKEN_CARRIED.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(lease);
+            }
+            CarriedAcquire::NotHolder { holder: current } => {
+                if redirected {
+                    break;
+                }
+                let routed = arm
+                    .routed
+                    .upgrade()
+                    .ok_or_else(|| SqueezefsError::LockFailed {
+                        reason: format!("PR 9: the routed set is gone under inode_{ino}'s acquire"),
+                    })?;
+                let next = routed
+                    .volumes
+                    .get(usize::from(volume))
+                    .and_then(|v| v.slot_leases())
+                    .and_then(|p| p.holders.endpoint(current));
+                match next {
+                    Some(next) => {
+                        log::info!(
+                            "PR 9: appender {holder} at {endpoint} no longer leases inode_{ino}'s \
+                             slot — redirected to appender {current} at {next}"
+                        );
+                        holder = current;
+                        endpoint = next;
+                    }
+                    None => return Err(unbound_holder(current, ino, "acquire")),
+                }
+            }
+        }
+    }
+    Err(SqueezefsError::LockFailed {
+        reason: format!(
+            "PR 9: inode_{ino}'s slot moved twice under one acquire (last holder {holder} at \
+             {endpoint}) — refusing rather than chasing a handover storm; the caller retries"
+        ),
+    })
+}
+
+/// The S11 ranged acquire at the slot holder: the custody wire's own
+/// required/desired verb on the holder's JOINed client (the token
+/// carriage is the whole-file grant's — a range holder reads under the
+/// S8 token cache the S11 plane already rides).
+pub async fn acquire_range_at_slot_holder(
+    home: CustodyHome,
+    ino: u64,
+    required: (u64, u64),
+    desired: (u64, u64),
+    ttl: Duration,
+) -> Result<crate::dlm::RangeAcquired> {
+    let arm = SLOT_CUSTODY
+        .load_full()
+        .ok_or_else(|| SqueezefsError::LockFailed {
+            reason: format!(
+                "PR 9: custody by the slot holder disarmed under inode_{ino}'s acquire"
+            ),
+        })?;
+    let (endpoint, volume) = match home {
+        CustodyHome::Holder {
+            endpoint, volume, ..
+        } => (endpoint, volume),
+        CustodyHome::Unbound { holder } => {
+            return Err(unbound_holder(holder, ino, "range acquire"))
+        }
+    };
+    let (client, _) = arm.holder(&endpoint, volume).await?;
+    VIA_SLOT_HOLDER.fetch_add(1, Ordering::Relaxed);
+    match client.acquire_range(ino, required, desired, ttl).await? {
+        RangeAcquireOutcome::New { lease, span, .. } => {
+            Ok(crate::dlm::RangeAcquired::New { lease, span })
+        }
+        RangeAcquireOutcome::Extended { token, span, .. } => {
+            Ok(crate::dlm::RangeAcquired::Extended { token, span })
+        }
+    }
+}
+
+/// **Custody across a handover** (design §5.1.4 — "the departing holder's
+/// outstanding custody leases"): does a live grant this holder issued
+/// name a file of forest `slot` on the volume whose superblock uuid is
+/// `volume_uuid`? A slot whose files a writer holds custody of does NOT
+/// move — the grant is live work (the writer's DMA is authorized under it;
+/// a new holder's arbiter would know nothing of it and could grant the
+/// same bytes twice), and the S9 channel to the writer is PULL-based, so
+/// the honest act is the handover's DEFERRAL (the `Busy` class the
+/// cadence retries at its next tick) until the writer releases: a grant
+/// never spans a handover, so no write ever lands under a stale holder's
+/// custody. O(live grants) per handover decision — a rare-cadence act.
+/// `false` unarmed (no arm, no owner — the shipped S9 posture, where a
+/// co-writer's grants at the authority name no slot lease).
+pub fn slot_custody_live(
+    volume_uuid: u128,
+    slot: crate::meta_backend::kv::record::ForestSlot,
+) -> bool {
+    let Some(owner) = custody_owner() else {
+        return false;
+    };
+    let guard = SLOT_CUSTODY.load();
+    let Some(arm) = guard.as_ref() else {
+        return false;
+    };
+    let Some(routed) = arm.routed.upgrade() else {
+        return false;
+    };
+    owner.grants_snapshot().iter().any(|g| {
+        let (v, local) = routed.route_ino(g.ino);
+        routed
+            .volumes
+            .get(v)
+            .is_some_and(|vol| u128::from_le_bytes(vol.superblock().uuid) == volume_uuid)
+            && crate::meta_backend::kv::record::forest_slot_of_ino(local) == slot
+    })
+}
+
+/// **The mount path's arm** (`main.rs`, after PR 8's allocation arm): on
+/// an ARMED symmetric set — some volume leases slots — arm custody by the
+/// slot holder with this mount's KD-MW-2 member id (the appender page's
+/// identity, the string every plane knows it by), the set's cluster secret
+/// (the `job:enroll` record — possession of volume access IS membership,
+/// ruling D2) and the per-volume `MountRecallSink`. `Ok(false)`, one
+/// `Option` test per volume, on every unarmed mount; `Ok(false)` with a
+/// WARN when the set carries no cluster secret (no cluster listener was
+/// ever enabled, so no holder is dialable — a foreign file's acquire then
+/// meets the S9 refusal naming the multi-writer mount). The registrant
+/// key travels as 0 (the S9 `connect` default): the armed mount's WERO
+/// registration is the metadata namespace's (`SQUEEZEFS_META_PR_WERO`),
+/// and the per-namespace key carriage is PR 12's join ladder.
+pub async fn arm_mount_slot_custody(
+    routed: &Arc<crate::meta_backend::RoutedMetaBackend>,
+    router: &crate::routing::DataRouter,
+) -> Result<bool> {
+    let Some(armed) = routed.volumes.iter().find(|v| v.slot_lease_armed()) else {
+        return Ok(false);
+    };
+    let Some(set) = armed.appenders_public() else {
+        return Ok(false);
+    };
+    let node_id =
+        crate::cowriter::node_member_id_of(set.identity.node_token, set.identity.mount_slot);
+    let Some(first) = routed.volumes.first() else {
+        return Ok(false);
+    };
+    let Some(secret) = crate::membership::cluster_secret(first).await else {
+        log::warn!(
+            "symmetric PR 9: custody by the slot holder NOT armed — the set carries no cluster \
+             secret (no job:enroll record: enable the cluster listener, SQUEEZEFS_JOB_WIRE_BIND, \
+             on the writer that formats it); a foreign file's write custody cannot be acquired \
+             on this mount"
+        );
+        return Ok(false);
+    };
+    let router = router.clone();
+    let sink_for: RecallSinkFor = Arc::new(move |volume: usize| {
+        crate::meta_ship::token_plane::MountRecallSink::new(router.clone(), volume)
+            as Arc<dyn crate::meta_ship::token_plane::RecallDataSink>
+    });
+    arm_slot_custody(routed, &node_id, secret, 0, sink_for);
+    Ok(true)
 }

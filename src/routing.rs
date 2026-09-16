@@ -8116,6 +8116,14 @@ impl DataRouter {
         if !self.symmetric_armed() {
             return true;
         }
+        // Symmetric PR 9: a file whose custody this mount holds from its
+        // SLOT HOLDER is the co-writer shape — the block's references live
+        // in the holder's tree, which this probe cannot read (in production
+        // it is another process's RAM), and the patch retires a lifetime
+        // that tree accounts. W1 declines; the write takes the CoW path.
+        if crate::data_grant::slot_holder_home(ino).is_some() {
+            return false;
+        }
         let Some(mb) = self.inner.meta_backend.get() else {
             return true;
         };

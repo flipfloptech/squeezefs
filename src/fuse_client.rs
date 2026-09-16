@@ -8780,6 +8780,15 @@ pub struct Metrics {
     /// run by the online repair on the volume's manager). 0 on every
     /// flat volume and every unarmed mount.
     pub fsck_repair_class_c15: Align64<AtomicU64>,
+    /// `fsck_alloc_bitmap_leak_candidates` — C6's bitmap-oracle arm on a
+    /// grant-armed allocator (PR 8/10, review round 2): SET bits no
+    /// reference, open grant or in-flight registration names — the dead
+    /// incarnation's remainder the next (re-)hold releases. 0 unarmed.
+    pub fsck_alloc_bitmap_leak_candidates: Align64<AtomicU64>,
+    /// `fsck_inode_plane_window_scoped` — C9/C10 candidates a foreign
+    /// appender's un-replayed ring window names, scoped out this pass
+    /// (PR 10, review round 2). 0 on a flat volume and a solo forest.
+    pub fsck_inode_plane_window_scoped: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -14503,6 +14512,34 @@ impl SqueezefsFilesystem {
                     metrics.insert(
                         "data_alloc_bitmap_leaks_released".into(),
                         load(&crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_RELEASED),
+                    );
+                    // Review round 2 — appended at the END of the block:
+                    // the death ledger's retry / retirement / quarantine
+                    // faces (Issues 5, 9, 18) and fsck C6's bitmap-oracle
+                    // arm (Issue 11).
+                    metrics.insert(
+                        "dead_member_write_deferrals".into(),
+                        load(&meta_kv::alloc_lease::DEAD_MEMBER_WRITE_DEFERRALS),
+                    );
+                    metrics.insert(
+                        "dead_member_records_retired".into(),
+                        load(&meta_kv::alloc_lease::DEAD_MEMBER_RECORDS_RETIRED),
+                    );
+                    metrics.insert(
+                        "dead_members_quarantined".into(),
+                        load(&meta_kv::alloc_lease::DEAD_MEMBERS_QUARANTINED),
+                    );
+                    metrics.insert(
+                        "fsck_alloc_bitmap_leak_candidates".into(),
+                        serde_json::json!(METRICS
+                            .fsck_alloc_bitmap_leak_candidates
+                            .load(Ordering::Relaxed)),
+                    );
+                    metrics.insert(
+                        "fsck_inode_plane_window_scoped".into(),
+                        serde_json::json!(METRICS
+                            .fsck_inode_plane_window_scoped
+                            .load(Ordering::Relaxed)),
                     );
                 }
                 // LEAF-MERGE finalized (§4.6a (c)/(e)): `interior_merges`

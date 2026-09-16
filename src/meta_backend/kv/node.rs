@@ -1122,7 +1122,8 @@ pub fn verify_node_extent_screened(
             buf.len()
         )));
     }
-    let header = NodeHeader::decode_page(&buf[..NODE_PAGE])?;
+    let header = NodeHeader::decode_page(&buf[..NODE_PAGE])
+        .map_err(|e| KvError::Corrupt(format!("node at {node_addr:#x}: {e}")))?;
     if header.node_addr != node_addr {
         return Err(KvError::Corrupt(format!(
             "node self-address mismatch: header says {:#x}, read from {node_addr:#x} \

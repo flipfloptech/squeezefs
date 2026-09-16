@@ -970,11 +970,11 @@ impl ManagerService {
                     member,
                     epoch,
                     pr_key,
-                } => match self.volume.screen_record_death(member) {
+                } => match self.volume.screen_record_death(member, *pr_key) {
                     Err(e) => Err(e),
-                    Ok(()) => self
+                    Ok(key) => self
                         .volume
-                        .record_death_with_key((*member).into(), *epoch, *pr_key)
+                        .record_death_with_key((*member).into(), *epoch, key)
                         .await
                         .map(|already| ManagerReply::Recorded { already }),
                 },

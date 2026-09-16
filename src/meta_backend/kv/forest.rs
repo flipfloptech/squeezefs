@@ -107,18 +107,24 @@ pub struct MintContext<'a> {
 }
 
 impl SlotTrees {
-    /// Assemble the forest from its opened trees (the mount path).
+    /// Assemble the forest from its opened trees (the mount path). Each
+    /// guest comes with the root TREE 0 NAMES for it — its published root.
+    /// A guest opened at a NEWER root (its own node's appender page named
+    /// one a cycle ahead of tree 0's publication — PR 10, the routed
+    /// Issue 1) therefore reads as unpublished, and the first checkpoint
+    /// publishes it; seeding `published` with the OPENED root made tree 0
+    /// keep the stale one for ever, and the clean leave then dropped every
+    /// record the moved root alone held (25 dentries of a create storm).
     pub fn new(
         control: Arc<KvTree>,
         native: Arc<KvTree>,
-        guests: Vec<(ForestSlot, Arc<KvTree>)>,
+        guests: Vec<(ForestSlot, Arc<KvTree>, RootPtr)>,
     ) -> Self {
         let map = scc::HashMap::new();
         let published = scc::HashMap::new();
-        for (slot, tree) in guests {
-            let root = tree.root();
+        for (slot, tree, named_by_tree0) in guests {
             let _ = map.insert_sync(slot, tree);
-            let _ = published.insert_sync(slot, root);
+            let _ = published.insert_sync(slot, named_by_tree0);
         }
         Self {
             control,
@@ -368,6 +374,15 @@ impl SlotTrees {
         let root = tree.root();
         let _ = self.guests.insert_sync(slot, tree);
         let _ = self.published.upsert_sync(slot, root);
+    }
+
+    /// The WRITER's adoption of a guest tree tree 0 does not name (opened
+    /// from its own appender page at the mount): the root stays
+    /// UNPUBLISHED — the first checkpoint writes it into tree 0 — and the
+    /// tree's `root_floor` (set by the caller) clamps the tail until then.
+    pub fn adopt_guest_unpublished(&self, slot: ForestSlot, tree: Arc<KvTree>) {
+        let _ = self.guests.insert_sync(slot, tree);
+        let _ = self.published.remove_sync(&slot);
     }
 
     /// The journal position every UNPUBLISHED guest root came into force

@@ -734,6 +734,56 @@ pub static RECOVERED_RECORDS: AtomicU64 = AtomicU64::new(0);
 /// timestamp to a reader acting on it.
 pub static DEAD_MEMBER_PROPAGATION_MS: AtomicU64 = AtomicU64::new(0);
 
+/// `dead_members_quarantined` — the record's arm on an allocation HOLDER:
+/// dead writers whose open block grants this process revoked and
+/// quarantined (S7) at the record. Split off `dead_members_acted` (review
+/// round 1, Issue 18): the two acts have different closures — this one
+/// counts per (death × holding with grants), the driver's per region.
+pub static DEAD_MEMBERS_QUARANTINED: AtomicU64 = AtomicU64::new(0);
+/// `dead_member_write_deferrals` — death-record writes that did NOT land
+/// at the sink (a full ring 0, a device error) and were parked in RAM for
+/// the ledger poll to retry (review round 1, Issue 5). Must stay 0 on a
+/// healthy manager; a growing count with `dead_members_recorded` flat is
+/// a death the set has not learnt yet.
+pub static DEAD_MEMBER_WRITE_DEFERRALS: AtomicU64 = AtomicU64::new(0);
+/// `dead_member_records_retired` — death records retired: the member
+/// rejoined (its newer incarnation retires the record — §5.5.2), or every
+/// volume of the set recovered its regions and no allocation lease names
+/// it any more (the poll's sweep past `2 × T_owner`).
+pub static DEAD_MEMBER_RECORDS_RETIRED: AtomicU64 = AtomicU64::new(0);
+
+/// A death the sink could not make durable yet (the RAM pending set the
+/// ledger poll drains — §5.5.2 "retried until durable").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingDeath {
+    pub member: AppenderIdentity,
+    pub epoch: u64,
+    pub pr_key: u64,
+}
+
+static PENDING_DEATHS: std::sync::Mutex<Vec<PendingDeath>> = std::sync::Mutex::new(Vec::new());
+
+/// Park a death record the sink failed to write; the next ledger poll
+/// retries it ([`KvMetaBackend::drain_pending_deaths`]).
+pub fn defer_death_record(pending: PendingDeath) {
+    let mut q = PENDING_DEATHS.lock().unwrap_or_else(|e| e.into_inner());
+    if !q.iter().any(|p| {
+        p.member.node_token == pending.member.node_token
+            && p.member.mount_slot == pending.member.mount_slot
+    }) {
+        q.push(pending);
+    }
+    DEAD_MEMBER_WRITE_DEFERRALS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The deaths still parked (the contracts' witness).
+pub fn pending_deaths() -> Vec<PendingDeath> {
+    PENDING_DEATHS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// Count one act on a death record stamped `ts_ms` (PR 10's driver's
 /// hook; the contracts' seam).
 pub fn note_dead_member_acted(ts_ms: u64) {
@@ -1359,14 +1409,12 @@ impl KvMetaBackend {
             by_term: crate::dlm::durable_term(),
             ts_ms: unix_now_ms(),
         };
-        self.write_control_entry(
-            vec![(
-                super::record::TREE_CONTROL,
-                Record::put(recovered_key(&member, vol), 0, rec.encode()),
-            )],
-            super::backend::EntryAdmission::Try,
-        )
-        .await?;
+        let recs = vec![(
+            super::record::TREE_CONTROL,
+            Record::put(recovered_key(&member, vol), 0, rec.encode()),
+        )];
+        let adm = self.pre_admit_control_parking(&recs).await?;
+        self.write_control_entry(recs, adm).await?;
         set.verbs.verbs.fetch_add(1, Ordering::Relaxed);
         RECOVERED_RECORDS.fetch_add(1, Ordering::Relaxed);
         Ok(false)
@@ -1415,14 +1463,17 @@ impl KvMetaBackend {
             ts_ms: unix_now_ms(),
             pr_key,
         };
-        self.write_control_entry(
-            vec![(
-                super::record::TREE_CONTROL,
-                Record::put(dead_member_key(&member), 0, rec.encode()),
-            )],
-            super::backend::EntryAdmission::Try,
-        )
-        .await?;
+        // PARKING admission (review round 1, Issue 5): a full ring 0 parks
+        // the write until the cadence drains it — never a `Try` refusal
+        // that loses the death; a write that still fails (a device error)
+        // is the caller's to park in RAM for the poll's retry
+        // (`defer_death_record`).
+        let recs = vec![(
+            super::record::TREE_CONTROL,
+            Record::put(dead_member_key(&member), 0, rec.encode()),
+        )];
+        let adm = self.pre_admit_control_parking(&recs).await?;
+        self.write_control_entry(recs, adm).await?;
         set.verbs.verbs.fetch_add(1, Ordering::Relaxed);
         DEAD_MEMBERS_RECORDED.fetch_add(1, Ordering::Relaxed);
         let name = crate::meta_ship::manager::wire_writer_name(&member.into());
@@ -1455,15 +1506,135 @@ impl KvMetaBackend {
             let quarantined = crate::data_custody::quarantine_offsets(&alloc, offsets, dead);
             log::warn!(
                 "death record for node {:#018x} slot {}: {} grant(s) on data volume {:#018x} \
-                 revoked, {quarantined} block(s) quarantined under {dead} (dead_members_acted)",
+                 revoked, {quarantined} block(s) quarantined under {dead} \
+                 (dead_members_quarantined)",
                 member.node_token,
                 member.mount_slot,
                 revoked.len(),
                 holding.vol_tag
             );
-            note_dead_member_acted(rec.ts_ms);
+            DEAD_MEMBERS_QUARANTINED.fetch_add(1, Ordering::Relaxed);
         }
         Ok(false)
+    }
+
+    /// **Retire a death record** (§5.5.2's third half): delete
+    /// `dead_member:{member}` and every `recovered:{member, v}` — the
+    /// member REJOINED with a newer incarnation (its own writer arm, or
+    /// the recoverer finding it live with the owner), or every manager
+    /// recovered it and no allocation lease names it any more (the poll's
+    /// sweep). Idempotent: an absent record deletes nothing and answers
+    /// `false`. The recovered records go too, so a LATER death of the same
+    /// identity is gated on ITS recovery, never the previous one's
+    /// (PR 8's `LeaseDeferred` reads `recovered:` for the ordering law).
+    pub async fn retire_death_record(&self, member: &AppenderIdentity) -> Result<bool, KvError> {
+        let set = self.manager_gate(false)?;
+        let Some(control) = self.forest_control_tree() else {
+            return Ok(false);
+        };
+        let mut recs: Vec<(u8, Record)> = Vec::new();
+        if control.lookup(&dead_member_key(member)).await?.is_some() {
+            recs.push((
+                super::record::TREE_CONTROL,
+                Record::delete(dead_member_key(member), 0),
+            ));
+        }
+        let mut cursor = RECOVERED_KEY_PREFIX.to_vec();
+        cursor.extend_from_slice(&member.node_token.to_be_bytes());
+        cursor.extend_from_slice(&member.mount_slot.to_be_bytes());
+        let mut end = cursor.clone();
+        end.extend_from_slice(&[0xFF, 0xFF]);
+        for (k, _) in control.range(&cursor, &end, 512).await? {
+            if k.len() == RECOVERED_KEY_PREFIX.len() + 14 && k.starts_with(RECOVERED_KEY_PREFIX) {
+                recs.push((super::record::TREE_CONTROL, Record::delete(k.to_vec(), 0)));
+            }
+        }
+        if recs.is_empty() {
+            return Ok(false);
+        }
+        let adm = self.pre_admit_control_parking(&recs).await?;
+        self.write_control_entry(recs, adm).await?;
+        set.verbs.verbs.fetch_add(1, Ordering::Relaxed);
+        DEAD_MEMBER_RECORDS_RETIRED.fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    /// **The rejoin's retirement** (§5.5.2; review round 1, Issue 9): a
+    /// writer arming on the set retires any death record naming ITS OWN
+    /// identity — it is the newer incarnation, and a record left standing
+    /// would have the next ledger poll recover a LIVE region. `Ok(true)` =
+    /// a record was retired.
+    pub async fn retire_own_death_records(&self) -> Result<bool, KvError> {
+        let Some(set) = self.appenders() else {
+            return Ok(false);
+        };
+        let me = set.identity;
+        let mut any = false;
+        for (member, _) in self.dead_member_records().await? {
+            if member.node_token == me.node_token && member.mount_slot == me.mount_slot {
+                any |= self.retire_death_record(&member).await?;
+            }
+        }
+        Ok(any)
+    }
+
+    /// **The poll's retirement sweep**: a death record older than `2 ×
+    /// T_owner` whose regions every volume of the set recovered (or never
+    /// held — `regions_pending == 0`) and that no allocation lease names as
+    /// a holder is retired. Answers the records retired.
+    pub async fn sweep_retirable_death_records(
+        &self,
+        now_ms: u64,
+        t_owner_ms: u64,
+        regions_pending: &(dyn Fn(&AppenderIdentity) -> bool + Send + Sync),
+    ) -> Result<u64, KvError> {
+        let mut retired = 0u64;
+        let leases = self.alloc_lease_records().await?;
+        for (member, rec) in self.dead_member_records().await? {
+            if now_ms.saturating_sub(rec.ts_ms) < 2 * t_owner_ms {
+                continue;
+            }
+            if regions_pending(&member) {
+                continue;
+            }
+            if leases.iter().any(|(_, l)| {
+                l.holder.node_token == member.node_token && l.holder.mount_slot == member.mount_slot
+            }) {
+                continue;
+            }
+            if self.retire_death_record(&member).await? {
+                retired += 1;
+            }
+        }
+        Ok(retired)
+    }
+
+    /// **The pending deaths' retry** (Issue 5): every death the sink could
+    /// not write is retried here, at the ledger poll, until it lands.
+    pub async fn drain_pending_deaths(&self) -> Result<u64, KvError> {
+        let pending = {
+            let mut q = PENDING_DEATHS.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *q)
+        };
+        let mut landed = 0u64;
+        for p in pending {
+            match self
+                .record_death_with_key(p.member, p.epoch, p.pr_key)
+                .await
+            {
+                Ok(_) => landed += 1,
+                Err(e) => {
+                    log::warn!(
+                        "death ledger: retrying node {:#018x} slot {:#x}'s death record failed \
+                         again ({e}); parked for the next poll",
+                        p.member.node_token,
+                        p.member.mount_slot
+                    );
+                    defer_death_record(p);
+                }
+            }
+        }
+        Ok(landed)
     }
 
     // -----------------------------------------------------------------

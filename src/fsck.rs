@@ -809,6 +809,10 @@ pub struct FsckCounters {
     /// their slot (this mount neither leases the slot nor, as the volume's
     /// manager, finds it unleased). 0 on every unarmed pass.
     pub inode_plane_foreign_slot_scoped: u64,
+    /// Symmetric PR 10 (review round 2, Issue 12): C9/C10 candidates a
+    /// FOREIGN appender's un-replayed ring window names — in flight at
+    /// their holder, judged by the pass after its checkpoint or recovery.
+    pub inode_plane_window_scoped: u64,
     /// PR 8: `fsck_inode_plane_slots_covered` — Σ over the pass's volumes
     /// of the slots this mount's inode plane judged: the slots it LEASES
     /// plus, on the volume's manager, the UNLEASED slots (tree 0's) —
@@ -860,6 +864,12 @@ pub struct FsckCounters {
     /// partition). The cross-writer oracle stays C8; the lane-aligned
     /// fleet-parallel fsck is rung 10c's (KD-MW-16).
     pub foreign_lane_exempted: u64,
+    /// Symmetric PR 8/10 — C6's bitmap oracle on a grant-armed allocator:
+    /// SET bits no reference, no open grant and no in-flight registration
+    /// names — a dead incarnation's window remainder the next (re-)hold
+    /// releases (`data_alloc_bitmap_leaks_released`). Informational; the
+    /// LOSS direction is the C6 finding.
+    pub alloc_bitmap_leak_candidates: u64,
     /// C11: verified orphan tree-7 map RECORDS (per record, not per owner
     /// — the census the design's must-stay-0 `fsck_map_orphan_records`
     /// gauge accumulates). 0 on healthy volumes.
@@ -1956,36 +1966,51 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         // before its recovery) holds dentries no tree names yet — a
         // cross-owner create's name lives in the parent's holder's ring
         // while the child's record is the creator's. The referenced set
-        // is INCOMPLETE over such a window, so the plane records no
-        // verdict (the incomplete-pass law): C15 names the dead window
-        // and its recovery is what makes the next pass complete.
-        let pending_windows = foreign_windows_pending(ctx).await;
-        if pending_windows > 0 {
+        // is INCOMPLETE over the INOS such a window names, so the plane
+        // SCOPES those inos out (`fsck_inode_plane_window_scoped`) and
+        // judges every other — never skipping a live fleet whole (review
+        // round 1, Issue 12): each foreign ring is read ONCE per census,
+        // its window's inode keys and dentry targets are the exclusion.
+        // `None` = a ring could not be read: unknown = pending, the whole
+        // plane takes no verdict this run.
+        let window_inos = foreign_window_inos(ctx).await;
+        if let Some(w) = window_inos.as_ref().filter(|w| !w.is_empty()) {
             log::warn!(
-                "fsck inode plane: {pending_windows} foreign appender ring window(s) this open \
-                 did not replay — C9/C10 record no verdict this run (a dead appender's window \
-                 is C15's; its recovery completes the referenced set)"
+                "fsck inode plane: {} ino(s) named by foreign appender ring windows this open \
+                 did not replay — scoped out of C9/C10 this run (their holder's checkpoint or \
+                 recovery completes the referenced set)",
+                w.len()
             );
         }
         match (
             referenced
                 .as_ref()
                 .filter(|_| opts.inode_plane)
-                .filter(|_| frozen && pending_windows == 0),
+                .filter(|_| frozen && window_inos.is_some()),
             census.live.truncated(),
         ) {
             (Some(refs), false) => {
+                let window_inos = window_inos.clone().unwrap_or_default();
                 evaluate_c9_unreferenced(
                     ctx,
                     opts,
                     &census.live,
                     &refs.refs,
+                    &window_inos,
                     &mut counters,
                     &mut suspects,
                 )
                 .await;
-                evaluate_c10_inode_plane(ctx, opts, &census, refs, &mut counters, &mut suspects)
-                    .await;
+                evaluate_c10_inode_plane(
+                    ctx,
+                    opts,
+                    &census,
+                    refs,
+                    &window_inos,
+                    &mut counters,
+                    &mut suspects,
+                )
+                .await;
                 inode_plane_covered = opts.covered_volumes(ctx.meta.volumes.len());
             }
             (Some(_), true) => log::warn!(
@@ -2142,6 +2167,7 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         counters.nlink_transient_cleared += r.counters.nlink_transient_cleared;
         counters.inode_plane_foreign_scoped += r.counters.inode_plane_foreign_scoped;
         counters.inode_plane_foreign_slot_scoped += r.counters.inode_plane_foreign_slot_scoped;
+        counters.inode_plane_window_scoped += r.counters.inode_plane_window_scoped;
         counters.inode_plane_slots_covered += r.counters.inode_plane_slots_covered;
         counters.inode_plane_cross_owner_declined += r.counters.inode_plane_cross_owner_declined;
         counters.inode_plane_proposals_admitted += r.counters.inode_plane_proposals_admitted;
@@ -2164,6 +2190,7 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         counters.mover_ledger_exempted += r.counters.mover_ledger_exempted;
         counters.pack_ledger_exempted += r.counters.pack_ledger_exempted;
         counters.foreign_lane_exempted += r.counters.foreign_lane_exempted;
+        counters.alloc_bitmap_leak_candidates += r.counters.alloc_bitmap_leak_candidates;
         counters.map_orphan_records += r.counters.map_orphan_records;
         counters.map_empty_heads += r.counters.map_empty_heads;
         counters.map_run_foreign_shadows += r.counters.map_run_foreign_shadows;
@@ -2242,6 +2269,7 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     dst.mover_ledger_exempted += fin.mover_ledger_exempted;
     dst.pack_ledger_exempted += fin.pack_ledger_exempted;
     dst.foreign_lane_exempted += fin.foreign_lane_exempted;
+    dst.alloc_bitmap_leak_candidates += fin.alloc_bitmap_leak_candidates;
     // C11 runs ONLY in the finalize (shards skip the map plane, so the
     // shard reports carry zeros — no double count).
     dst.map_orphan_records += fin.map_orphan_records;
@@ -2274,6 +2302,7 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     dst.nlink_transient_cleared += fin.nlink_transient_cleared;
     dst.inode_plane_foreign_scoped += fin.inode_plane_foreign_scoped;
     dst.inode_plane_foreign_slot_scoped += fin.inode_plane_foreign_slot_scoped;
+    dst.inode_plane_window_scoped += fin.inode_plane_window_scoped;
     dst.inode_plane_slots_covered += fin.inode_plane_slots_covered;
     dst.inode_plane_cross_owner_declined += fin.inode_plane_cross_owner_declined;
     // `inode_plane_volumes_covered` is deliberately NOT folded: coverage
@@ -2770,16 +2799,21 @@ pub async fn run_fleet(
             // shards collect no kvmap head info).
             evaluate_c11_empty_heads(&ip_census, &mut fin_counters, &mut fin_suspects, &ctx.meta);
             let frozen = !fin_opts.multi_owner || peer_volumes_are_assigned(ctx, &fin_opts).await;
+            // The foreign-window scoping (Issue 12) — the same exclusion the
+            // unsharded pass takes; an unreadable ring = no verdict.
+            let window_inos = foreign_window_inos(ctx).await;
             match (
-                ip_refs.as_ref().filter(|_| frozen),
+                ip_refs.as_ref().filter(|_| frozen && window_inos.is_some()),
                 ip_census.live.truncated(),
             ) {
                 (Some(refs), false) => {
+                    let window_inos = window_inos.clone().unwrap_or_default();
                     evaluate_c9_unreferenced(
                         ctx,
                         &fin_opts,
                         &ip_census.live,
                         &refs.refs,
+                        &window_inos,
                         &mut fin_counters,
                         &mut fin_suspects,
                     )
@@ -2789,6 +2823,7 @@ pub async fn run_fleet(
                         &fin_opts,
                         &ip_census,
                         refs,
+                        &window_inos,
                         &mut fin_counters,
                         &mut fin_suspects,
                     )
@@ -2989,6 +3024,7 @@ fn fold_worker_counters(dst: &mut FsckCounters, src: &FsckCounters) {
     dst.nlink_transient_cleared += src.nlink_transient_cleared;
     dst.inode_plane_foreign_scoped += src.inode_plane_foreign_scoped;
     dst.inode_plane_foreign_slot_scoped += src.inode_plane_foreign_slot_scoped;
+    dst.inode_plane_window_scoped += src.inode_plane_window_scoped;
     dst.inode_plane_slots_covered += src.inode_plane_slots_covered;
     dst.inode_plane_cross_owner_declined += src.inode_plane_cross_owner_declined;
     dst.blocks_checked += src.blocks_checked;
@@ -3000,6 +3036,7 @@ fn fold_worker_counters(dst: &mut FsckCounters, src: &FsckCounters) {
     dst.mover_ledger_exempted += src.mover_ledger_exempted;
     dst.pack_ledger_exempted += src.pack_ledger_exempted;
     dst.foreign_lane_exempted += src.foreign_lane_exempted;
+    dst.alloc_bitmap_leak_candidates += src.alloc_bitmap_leak_candidates;
     dst.tenant_overlap_findings += src.tenant_overlap_findings;
     dst.shared_index_drift += src.shared_index_drift;
     dst.stripe_findings += src.stripe_findings;
@@ -3778,6 +3815,7 @@ async fn evaluate_c9_unreferenced(
     opts: &FsckOptions,
     live: &InoBitmap,
     refs: &InoBitmap,
+    window_inos: &std::collections::BTreeSet<u64>,
     counters: &mut FsckCounters,
     suspects: &mut Vec<Suspect>,
 ) {
@@ -3828,6 +3866,14 @@ async fn evaluate_c9_unreferenced(
             counters.inode_plane_foreign_slot_scoped += 1;
             continue;
         }
+        // Symmetric PR 10 (review round 2, Issue 12): an ino a FOREIGN
+        // appender's un-replayed ring window names is in flight at its
+        // holder — its verdict is the next pass's, after the window is
+        // checkpointed or recovered; every other ino is judged.
+        if window_inos.contains(&ino) {
+            counters.inode_plane_window_scoped += 1;
+            continue;
+        }
         // THE guard: an inode this mount minted is never a candidate,
         // because a create legitimately holds its record before its name.
         if !kv.minted_in_prior_era(local) {
@@ -3869,6 +3915,7 @@ async fn evaluate_c10_inode_plane(
     opts: &FsckOptions,
     census: &CensusOut,
     pass: &RefPass,
+    window_inos: &std::collections::BTreeSet<u64>,
     counters: &mut FsckCounters,
     suspects: &mut Vec<Suspect>,
 ) {
@@ -3898,6 +3945,10 @@ async fn evaluate_c10_inode_plane(
                 counters.inode_plane_foreign_slot_scoped += 1;
                 continue;
             }
+            if window_inos.contains(&ino) {
+                counters.inode_plane_window_scoped += 1;
+                continue;
+            }
             let records = pass.record_names_of(ino);
             // No name at all is C9's object, never C10's (reporting both
             // would double-claim one inode).
@@ -3925,6 +3976,10 @@ async fn evaluate_c10_inode_plane(
             // PR 8: the lessee shard (see C9's gate).
             if !kv.inode_plane_owns_slot(local) {
                 counters.inode_plane_foreign_slot_scoped += 1;
+                continue;
+            }
+            if window_inos.contains(&ino) {
+                counters.inode_plane_window_scoped += 1;
                 continue;
             }
             let Ok(Some(val)) = kv.read_inode_value_routed(local).await else {
@@ -4002,6 +4057,14 @@ async fn evaluate_c10_inode_plane(
         // PR 8: the lessee shard (see C9's gate).
         if !kv.inode_plane_owns_slot(local) {
             counters.inode_plane_foreign_slot_scoped += 1;
+            continue;
+        }
+        // Symmetric PR 10 (review round 2, Issue 12): an ino a FOREIGN
+        // appender's un-replayed ring window names is in flight at its
+        // holder — its verdict is the next pass's, after the window is
+        // checkpointed or recovered; every other ino is judged.
+        if window_inos.contains(&ino) {
+            counters.inode_plane_window_scoped += 1;
             continue;
         }
         match kv.read_inode_value_routed(local).await {
@@ -4601,24 +4664,26 @@ impl C17Fresh {
     }
 }
 
-/// Foreign appender ring windows this open did NOT replay, summed over
-/// the set's meta volumes (design-symmetric-metadata §5.8.5, PR 10) —
-/// the inode plane's completeness gate on a forest. 0 on every flat
-/// volume and every solo forest.
-async fn foreign_windows_pending(ctx: &FsckCtx) -> u64 {
-    let mut total = 0u64;
+/// The GLOBAL inos every FOREIGN appender ring window this open did not
+/// replay names, across the set — C9/C10's per-ino exclusion (each ring
+/// read once). `None` = a ring could not be read: unknown = pending, no
+/// verdict.
+async fn foreign_window_inos(ctx: &FsckCtx) -> Option<std::collections::BTreeSet<u64>> {
+    let mut out = std::collections::BTreeSet::new();
+    let width = ctx.meta.routing_width();
     for (vol, kv) in ctx.meta.volumes.iter().enumerate() {
-        match kv.foreign_windows_pending().await {
-            Ok(n) => total += n,
+        match kv.foreign_window_inos(width).await {
+            Ok(inos) => out.extend(inos),
             Err(e) => {
-                // Unreadable = unknown = pending: the plane takes no
-                // verdict over a window it cannot rule out.
-                log::warn!("fsck inode plane: reading vol {vol}'s appender directory failed: {e}");
-                total += 1;
+                log::warn!(
+                    "fsck inode plane: reading vol {vol}'s foreign appender ring windows \
+                     failed: {e} — the plane takes no verdict this run"
+                );
+                return None;
             }
         }
     }
-    total
+    Some(out)
 }
 
 /// One owner's tree-7 record count, paged (`block_map_range`, the same
@@ -5064,22 +5129,66 @@ fn evaluate_allocator_classes(
             // Symmetric PR 8/10: on a grant-armed allocator the bitmap IS
             // the free list — the local list was drained into it at the
             // arm and a freed block returns only through a carve — so
-            // `highest − free_list` counts every bitmap-clear block below
-            // the cursor as used (the `sym-crash` leg read one crash's
-            // released window as a 386-vs-385 finding). The same
-            // single-writer-arithmetic doctrine as the lane partition's:
-            // C6 DECLINES here, counted on the same gauge; the armed
-            // plane's census is PR 8's bitmap oracle
-            // (`DataAllocBitmap::drift` — LOSS on `data_alloc_bitmap_drift`
-            // at every hold, LEAKS released at the hold), C8 the reference
-            // oracle.
-            counters.foreign_lane_exempted += 1;
-            log::info!(
-                "fsck C6: capacity census declined on '{}' — the allocator mints from ranged \
-                 block grants and its free list is the allocation bitmap (fsck_foreign_lane_\
-                 exempted; the bitmap oracle and C8 are the armed plane's census)",
-                v.id
-            );
+            // `highest − free_list` is single-writer arithmetic that reads
+            // every bitmap-clear block below the cursor as used (the
+            // `sym-crash` leg read one crash's released window as a
+            // 386-vs-385 finding). C6's arm here is PR 8's BITMAP ORACLE
+            // (`DataAllocBitmap::drift`, review round 1, Issue 11 — the
+            // first build declined and lost the fsck-time census): the
+            // bitmap against this census's tracked population, with the
+            // holder's OPEN grant ranges and the in-flight registry as the
+            // live-owner shield. LOSS (referenced ∧ clear — a future carve
+            // would overwrite a live block) is the report-only finding;
+            // LEAK (set ∧ ¬referenced ∧ ¬granted ∧ ¬in-flight) is a dead
+            // incarnation's remainder the next (re-)hold releases, counted.
+            let chunk = v.alloc.chunk_size().max(1);
+            let holding = v
+                .alloc
+                .block_grant_vol_tag()
+                .and_then(crate::meta_backend::kv::alloc_lease::holding);
+            match holding {
+                Some(h) => {
+                    let referenced: std::collections::BTreeSet<u64> =
+                        tracked.keys().map(|off| off / chunk).collect();
+                    let report = h.bitmap.drift(&referenced, &h.ledger.open_ranges());
+                    let inflight: std::collections::BTreeSet<u64> = v
+                        .alloc
+                        .inflight_offsets()
+                        .into_iter()
+                        .map(|off| off / chunk)
+                        .collect();
+                    let leaks = report.leak.iter().filter(|b| !inflight.contains(b)).count() as u64;
+                    counters.alloc_bitmap_leak_candidates += leaks;
+                    if !report.loss.is_empty() {
+                        suspects.push(Suspect {
+                            kind: SuspectKind::C6Drift {
+                                vol: v.id.clone(),
+                                used: h.bitmap.population(),
+                                tracked: referenced.len() as u64,
+                            },
+                        });
+                        log::warn!(
+                            "fsck C6 (bitmap oracle): data volume '{}' — {} referenced block(s) \
+                             read CLEAR in the allocation bitmap (first {:?}); the LOSS class",
+                            v.id,
+                            report.loss.len(),
+                            report.loss.first()
+                        );
+                    }
+                }
+                None => {
+                    // A grant-armed allocator whose holding this process
+                    // does not keep (a wire writer's — PR 12's venue): no
+                    // bitmap to judge against; declined, counted.
+                    counters.foreign_lane_exempted += 1;
+                    log::info!(
+                        "fsck C6: capacity census declined on '{}' — the allocator mints from \
+                         ranged block grants and this process holds no allocation lease for it \
+                         (fsck_foreign_lane_exempted; the holder's bitmap oracle is the census)",
+                        v.id
+                    );
+                }
+            }
         } else if !sharded {
             let inflight = v
                 .alloc
@@ -6980,6 +7089,8 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.inode_plane_foreign_scoped, Ordering::Relaxed);
     m.fsck_inode_plane_foreign_slot_scoped
         .fetch_add(c.inode_plane_foreign_slot_scoped, Ordering::Relaxed);
+    m.fsck_inode_plane_window_scoped
+        .fetch_add(c.inode_plane_window_scoped, Ordering::Relaxed);
     if c.inode_plane_slots_covered > 0 {
         m.fsck_inode_plane_slots_covered
             .store(c.inode_plane_slots_covered, Ordering::Relaxed);
@@ -7007,6 +7118,8 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.pack_ledger_exempted, Ordering::Relaxed);
     m.fsck_foreign_lane_exempted
         .fetch_add(c.foreign_lane_exempted, Ordering::Relaxed);
+    m.fsck_alloc_bitmap_leak_candidates
+        .fetch_add(c.alloc_bitmap_leak_candidates, Ordering::Relaxed);
     m.fsck_map_orphan_records
         .fetch_add(c.map_orphan_records, Ordering::Relaxed);
     m.fsck_map_empty_heads

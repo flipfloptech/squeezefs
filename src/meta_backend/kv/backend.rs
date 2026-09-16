@@ -3216,17 +3216,15 @@ impl KvMetaBackend {
         let screen = match cached {
             Some(c) => c,
             None => {
-                let (g, lessee) = match control
+                let g = match control
                     .lookup(&super::slot_state::slot_state_key(slot))
                     .await?
                 {
                     Some(v) => match super::slot_state::SlotState::decode(&v)? {
-                        super::slot_state::SlotState::Leased { appender_id, g, .. } => {
-                            (g, Some(appender_id))
-                        }
-                        super::slot_state::SlotState::Unleased { g, .. } => (g, None),
+                        super::slot_state::SlotState::Leased { g, .. }
+                        | super::slot_state::SlotState::Unleased { g, .. } => g,
                     },
-                    None => (0, None),
+                    None => 0,
                 };
                 let (tails_g, tails) = match self.slot_tails(slot).await? {
                     Some((g, t)) => (g, t.into_iter().collect()),
@@ -3235,7 +3233,6 @@ impl KvMetaBackend {
                 let fresh = Arc::new(ReaderFrameScreen {
                     control_root,
                     g,
-                    lessee,
                     tails_g,
                     tails,
                 });
@@ -3249,9 +3246,19 @@ impl KvMetaBackend {
         if screen.g == 0 && screen.tails.is_empty() {
             return Ok(None);
         }
+        // Rules 2 and 3 ONLY on a non-writer (review round 1, Issue 15): a
+        // reader's tree 0 lags the writer's by the S5 poll, so a frame the
+        // CURRENT lessee wrote at `g + 1` — legitimate, granted since this
+        // mount's last resync — would land on rule 1 (the breach class,
+        // `appender_fence_breach` under a fence) and rule 4 off a stale
+        // `(g, lessee)`; the two generation-comparing rules are the
+        // writer's, whose lease table IS the truth. `g_current = u32::MAX`
+        // and no lessee make them inert; the recorded tails (rule 2) and
+        // the in-log order (rule 3) are exact off any tree-0 image that
+        // names them.
         Ok(Some(super::node::FrameScreen {
-            g_current: screen.g,
-            appender_current: screen.lessee,
+            g_current: u32::MAX,
+            appender_current: None,
             recorded_tail: screen.tails.get(&addr).map(|t| (screen.tails_g, *t)),
             pr_fenced: self
                 .appenders
@@ -7241,6 +7248,19 @@ impl KvMetaBackend {
             return Err(e);
         }
         self.sync_device().await.map_err(KvError::Io)
+    }
+
+    /// A PARKING ring-0 admission for a control entry of `recs` (the
+    /// door's pre-admission shape — taken holding no mutex the checkpoint
+    /// task needs; a full ring parks the caller until the cadence drains
+    /// it, never a `Try` refusal). Handed into [`Self::write_control_entry`].
+    pub(super) async fn pre_admit_control_parking(
+        &self,
+        recs: &[(u8, Record)],
+    ) -> std::result::Result<EntryAdmission, KvError> {
+        let len = entry_len_for(recs)?;
+        let (adm, _park_pass) = self.admit_user_budget(&self.ring, 0, len).await?;
+        Ok(EntryAdmission::Held(adm))
     }
 
     /// Tree 0's lessee map for content appenders (ids ≥ 1): `appender →
@@ -15191,8 +15211,10 @@ struct SlotFrameFence {
 /// tree's root is `control_root`.
 struct ReaderFrameScreen {
     control_root: u64,
+    /// The slot's generation as this mount's tree 0 names it — read only
+    /// to tell a never-leased forest (rule 3 alone) from an armed one;
+    /// never compared against a frame (Issue 15).
     g: u32,
-    lessee: Option<u32>,
     tails_g: u32,
     tails: std::collections::HashMap<u64, u32>,
 }
@@ -15683,7 +15705,10 @@ impl KvMetaBackend {
             .as_ref()
             .and_then(|s| s.native_slot)
             .unwrap_or(0);
-        let mut guests: Vec<(ForestSlot, Arc<KvTree>)> = Vec::new();
+        // This NODE's identity — the page-root law reads its own pages
+        // only (the same binding `open_appender_regions` makes).
+        let own_node_token = Self::appender_identity_scope(&read_boot_id()).0;
+        let mut guests: Vec<(ForestSlot, Arc<KvTree>, RootPtr)> = Vec::new();
         let (mut cursor, end) = slot_state_key_range();
         loop {
             let page = control.range(&cursor, &end, 512).await?;
@@ -15693,19 +15718,37 @@ impl KvMetaBackend {
             cursor = key_successor(last);
             for (k, v) in &page {
                 let slot = decode_slot_state_key(k)?;
-                let root = match SlotState::decode(v)? {
-                    SlotState::Unleased { root, .. } => root,
+                let (root, recorded) = match SlotState::decode(v)? {
+                    // An UNLEASED slot's live root is tree 0's — or a
+                    // newer one this NODE's own page names (region 0's
+                    // page names every guest root one cycle ahead of tree
+                    // 0's publication on an unarmed forest; PR 10, the
+                    // routed Issue 1): the open takes the max, so the
+                    // page-root pass below has nothing to adopt.
+                    SlotState::Unleased { root, .. } => (
+                        Self::unleased_root_from_directory(
+                            &directory,
+                            native_routing_slot,
+                            own_node_token,
+                            slot,
+                            root,
+                        ),
+                        root,
+                    ),
                     SlotState::Leased {
                         appender_id, root, ..
                     } => {
                         // A LEASED slot's live root is the lessee's page
                         // entry (§5.2.2); the record's grant-time root is
                         // the floor a page not yet written leaves.
-                        Self::leased_root_from_directory(
-                            &directory,
-                            native_routing_slot,
-                            appender_id,
-                            slot,
+                        (
+                            Self::leased_root_from_directory(
+                                &directory,
+                                native_routing_slot,
+                                appender_id,
+                                slot,
+                                root,
+                            ),
                             root,
                         )
                     }
@@ -15722,8 +15765,16 @@ impl KvMetaBackend {
                 }
                 let tree =
                     KvTree::open_slot_tree(Arc::clone(cache), slot, root, Arc::clone(seq)).await?;
+                if root != recorded {
+                    // Opened AHEAD of tree 0: until a checkpoint publishes
+                    // the root, every record it alone holds stays in the
+                    // window — they sit at or past the ledger's tail (the
+                    // cycle that moved the root clamped its tail to the
+                    // moved leaf's dying floor), so the tail is the floor.
+                    tree.set_root_floor(ledger.journal_tail_seq);
+                }
                 seq.fetch_max(root.seq, Ordering::AcqRel);
-                guests.push((slot, Arc::new(tree)));
+                guests.push((slot, Arc::new(tree), recorded));
             }
             if page.len() < 512 {
                 break;
@@ -16561,14 +16612,33 @@ impl KvMetaBackend {
         // region's content rides ITS ring, whose tail the page advanced
         // past the flushed records — the page's root is that content's
         // only durable home.
+        // The install is the WRITER-legal one (PR 10, the routed Issue 1):
+        // before any commit of this open the page's root IS the newest
+        // durable one — `adopt_root` is the reader's, refused on every
+        // writer cache, and refused the remount after a kill between a
+        // checkpoint's page write and the next cycle's tree-0 publication
+        // (page one root ahead of tree 0 on an unarmed forest, whose page
+        // 0 names EVERY guest root). A `Recovering` own page is own
+        // residue like a `Live` one (F1's other half).
         if is_writer {
             for r in &set.regions {
-                let entries: Vec<super::appender::SlotEntry> = {
+                let (entries, page_tail): (Vec<super::appender::SlotEntry>, u64) = {
                     let page = r.page.lock().unwrap_or_else(|e| e.into_inner());
-                    if page.state != AppenderState::Live || !mine(&page) {
+                    if !matches!(page.state, AppenderState::Live | AppenderState::Recovering)
+                        || !mine(&page)
+                    {
                         continue;
                     }
-                    page.slots.clone()
+                    (page.slots.clone(), page.ledger_tail_seq)
+                };
+                // The root's un-published records start at the ring's
+                // durable tail: ring 0's is the ledger's, a declared
+                // region's its page's — the floor is a position in the
+                // ring the slot's records journal into.
+                let floor = if r.id == 0 {
+                    ledger.journal_tail_seq
+                } else {
+                    page_tail
                 };
                 for e in entries {
                     if e.root.addr == 0 {
@@ -16581,7 +16651,9 @@ impl KvMetaBackend {
                     match forest.tree(slot) {
                         Some(t) => {
                             if e.root.seq > t.root().seq {
-                                t.adopt_root(e.root)?;
+                                cache.drop_slot_nodes(slot)?;
+                                t.install_recovered_root(e.root, floor);
+                                seq.fetch_max(e.root.seq, Ordering::AcqRel);
                             }
                         }
                         None => {
@@ -16592,8 +16664,9 @@ impl KvMetaBackend {
                                 Arc::clone(seq),
                             )
                             .await?;
+                            tree.set_root_floor(floor);
                             seq.fetch_max(e.root.seq, Ordering::AcqRel);
-                            forest.adopt_guest(slot, Arc::new(tree));
+                            forest.adopt_guest_unpublished(slot, Arc::new(tree));
                         }
                     }
                 }
@@ -16694,6 +16767,42 @@ impl KvMetaBackend {
         cache.set_durable_tail(ledger.journal_tail_seq);
         Self::publish_slot_durable_tails(&set, cache);
         Ok(set)
+    }
+
+    /// The live root of UNLEASED slot `slot`: the newest entry for it on
+    /// any `Live` / `Recovering` page of THIS node (the manager's page 0
+    /// names every guest root it maintains, one cycle ahead of tree 0's
+    /// publication), else tree 0's `recorded`. A foreign node's page never
+    /// names an unleased slot's root (its entries are its leases).
+    fn unleased_root_from_directory(
+        directory: &[super::appender::AppenderEntry],
+        native_routing_slot: u16,
+        own_node_token: u64,
+        slot: super::record::ForestSlot,
+        recorded: RootPtr,
+    ) -> RootPtr {
+        let mut best = recorded;
+        for e in directory {
+            let Some(p) = e.page.as_ref() else {
+                continue;
+            };
+            if !matches!(
+                p.state,
+                super::appender::AppenderState::Live | super::appender::AppenderState::Recovering
+            ) || !p.identity.owned_by_node(own_node_token)
+            {
+                continue;
+            }
+            for se in &p.slots {
+                if super::appender::forest_slot_of_page_slot(se.slot, native_routing_slot) == slot
+                    && se.root.addr != 0
+                    && se.root.seq > best.seq
+                {
+                    best = se.root;
+                }
+            }
+        }
+        best
     }
 
     /// The live root of LEASED slot `slot`: its lessee's page entry when
@@ -16804,12 +16913,22 @@ impl KvMetaBackend {
                     .collect(),
                 _ => Default::default(),
             };
+        // A slot the RAM table holds in ANY leased state — this mount's
+        // lease (the gate's bits), a foreign lessee's, or a slot mid-
+        // RECOVERY (`Releasing { dead }`, PR 10) — is never published as
+        // `Unleased` here: the recovery's tree-0 step is that root's
+        // publication, with the lease's `g`; the `None` arm below would
+        // write `Unleased { g: 0 }` over a live generation.
         let pending: Vec<(super::record::ForestSlot, RootPtr)> = forest
             .roots_to_publish()
             .into_iter()
             .filter(|(slot, _)| {
                 plane.is_none_or(|p| {
-                    (!p.gate.is_leased(*slot) && !p.gate.is_releasing(*slot))
+                    let table_unleased = p
+                        .table
+                        .get(*slot)
+                        .is_none_or(|l| l.state == crate::slot_lease_core::LeaseState::Unleased);
+                    (table_unleased && !p.gate.is_leased(*slot) && !p.gate.is_releasing(*slot))
                         || (overflow.contains(slot) && !p.gate.is_releasing(*slot))
                 })
             })

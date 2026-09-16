@@ -765,6 +765,19 @@ pub fn preempt_dead_registrant(victim: u64) -> u64 {
     holds.iter().map(|h| h.preempt(victim)).sum()
 }
 
+/// Every registrant key this process stands on (holder or registrant, any
+/// live hold) — the `RecordDeath` key-word screen's "never our own key"
+/// input (PR 10, review round 1, Issue 7).
+pub fn own_registrant_keys() -> Vec<u64> {
+    registry()
+        .lock()
+        .unwrap()
+        .values()
+        .filter_map(Weak::upgrade)
+        .map(|inner| inner.key)
+        .collect()
+}
+
 /// The process's guarantee class for the data plane: `pr` while a WERO
 /// hold stands on a data-namespace set, else `detection` (the local
 /// custody-epoch fence only). The `data_plane_fence_mode` gauge's word

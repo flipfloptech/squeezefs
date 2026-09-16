@@ -1518,7 +1518,16 @@ pub struct MembershipOwner {
     next_epoch: AtomicU64,
     next_join_seq: AtomicU64,
     grace: parking_lot::Mutex<Option<Grace>>,
+    /// The registrant key of every member that DEPARTED (evicted or left),
+    /// keyed by id — what the `RecordDeath` key-word screen judges a
+    /// peer's word against once the member is no longer in the census
+    /// (PR 10, review round 1, Issue 7). Bounded: the newest
+    /// `DEPARTED_KEYS_MAX` departures.
+    departed_keys: parking_lot::Mutex<std::collections::VecDeque<(String, u64)>>,
 }
+
+/// The departed-key memo's bound (departures a screen can still judge).
+const DEPARTED_KEYS_MAX: usize = 4096;
 
 impl std::fmt::Debug for MembershipOwner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1574,12 +1583,51 @@ impl MembershipOwner {
             next_epoch: AtomicU64::new(1),
             next_join_seq: AtomicU64::new(1),
             grace: parking_lot::Mutex::new(None),
+            departed_keys: parking_lot::Mutex::new(std::collections::VecDeque::new()),
         }))
     }
 
     /// The owner's identity.
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// The registrant key this owner REGISTERED for member `id` — its
+    /// live census entry's, else the departed memo's (`None` = never
+    /// listed here). The `RecordDeath` key-word screen's durable-state
+    /// witness (PR 10, review round 1, Issue 7).
+    pub fn registered_key(&self, id: &str) -> Option<u64> {
+        if let Some(k) = self.members.read_sync(id, |_, st| st.pr_key) {
+            return Some(k);
+        }
+        self.departed_keys
+            .lock()
+            .iter()
+            .rev()
+            .find(|(m, _)| m == id)
+            .map(|(_, k)| *k)
+    }
+
+    /// Every LIVE member's non-zero registrant key.
+    pub fn live_keys(&self) -> Vec<u64> {
+        let now = self.clock.now_ms();
+        let mut out = Vec::new();
+        self.members.iter_sync(|_, st| {
+            if now < st.deadline_ms && st.pr_key != 0 {
+                out.push(st.pr_key);
+            }
+            true
+        });
+        out
+    }
+
+    fn remember_departed_key(&self, id: &str, pr_key: u64) {
+        let mut q = self.departed_keys.lock();
+        q.retain(|(m, _)| m != id);
+        q.push_back((id.to_string(), pr_key));
+        while q.len() > DEPARTED_KEYS_MAX {
+            q.pop_front();
+        }
     }
 
     /// The durable era this authority grants in.
@@ -1901,7 +1949,11 @@ impl MembershipOwner {
     /// immediately, so nothing waits out a TTL for a mount that said
     /// goodbye. `true` ⇔ it was a member.
     pub fn leave(&self, id: &str) -> bool {
-        let left = self.members.remove_sync(id).is_some();
+        let removed = self.members.remove_sync(id);
+        let left = removed.is_some();
+        if let Some((_, st)) = removed {
+            self.remember_departed_key(id, st.pr_key);
+        }
         if left {
             log::info!(
                 "membership: member '{id}' left cleanly (owner '{}')",
@@ -2089,6 +2141,7 @@ impl MembershipOwner {
     /// drain proof arrives.
     pub fn evict(&self, id: &str, reason: &str) -> Option<Eviction> {
         let (_, st) = self.members.remove_sync(id)?;
+        self.remember_departed_key(id, st.pr_key);
         let dead = crate::data_custody::declare_dead_epoch(&format!(
             "membership: member '{id}' evicted by owner '{}' ({reason})",
             self.id
@@ -2237,6 +2290,10 @@ impl MembershipOwner {
                     self.id,
                     d.id
                 );
+                // The key the predecessor's claim set registered for it —
+                // the `RecordDeath` key-word screen's witness for a member
+                // this owner never listed live.
+                self.remember_departed_key(&d.id, d.pr_key);
                 note_departure(&d.id);
                 note_death(d);
             }

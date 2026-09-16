@@ -606,6 +606,18 @@ impl std::fmt::Debug for KvTree {
     }
 }
 
+/// One replayed interior-pointer record (the two mount-replay class
+/// entry points share it — the routing key, the target level, the
+/// record's seq / kind / value and the floor contribution).
+pub struct InteriorReplay<'a> {
+    pub key: &'a [u8],
+    pub level: u8,
+    pub seq: u64,
+    pub kind: RecordKind,
+    pub value: Bytes,
+    pub entry_start: u64,
+}
+
 impl KvTree {
     /// The volume-shared record/node seq source this tree stamps with —
     /// what a RUNTIME tree mint ([`Self::create`] after open) must reuse
@@ -834,6 +846,35 @@ impl KvTree {
         }
         self.root.store(Arc::new(root));
         Ok(())
+    }
+
+    /// **The recoverer's root install** (design-symmetric-metadata §5.9,
+    /// PR 10 — the writer-legal counterpart of [`Self::adopt_root`]): a
+    /// dead lessee's slot tree the recovering MANAGER holds in RAM at the
+    /// root it last saw (the grant-time root; the lessee's own checkpoints
+    /// moved it and published the move on the lessee's PAGE alone) takes
+    /// the page's newer root here. Legal because the slot is FOREIGN until
+    /// the recovery's release — no manager SMO can be in flight on it,
+    /// nothing of this mount is dirty under it, and the caller holds the
+    /// volume's SMO mutex and dropped every cached node of the slot first
+    /// (`NodeCache::drop_slot_nodes` — a stale image of the grant-time
+    /// tree would fold the window onto a base missing the lessee's flushed
+    /// bsets). The same install serves the own-residue OPEN, where the
+    /// live root IS the newest durable one. Never a reader's adoption
+    /// (that is `adopt_root`, gated on revalidation) and never on a tree
+    /// this mount writes to. `floor` is the ring position the installed
+    /// root's un-published records start at (the window's tail): until
+    /// tree 0 names the root the checkpoint tail must not pass it.
+    pub fn install_recovered_root(&self, root: RootPtr, floor: u64) {
+        self.root.store(Arc::new(root));
+        self.set_root_floor(floor);
+    }
+
+    /// Mark the live root UNPUBLISHED from `floor` on (see `root_floor`):
+    /// the open's arm for a guest tree opened at a root tree 0 does not
+    /// yet name.
+    pub fn set_root_floor(&self, floor: u64) {
+        self.root_floor.store(floor, Ordering::Release);
     }
 
     /// The tree id (§4.2).
@@ -1222,12 +1263,14 @@ impl KvTree {
     /// [`Self::apply_replayed`] under the STRUCTURAL lease class — the
     /// dead-appender recovery's content replay (design-symmetric-metadata
     /// §5.9, PR 10): the recovering MANAGER applies a dead lessee's ring
-    /// into slot trees the RAM table already reads UNLEASED (the manager's
-    /// to maintain, KD-SYM-2/3). `entry_start` is the record's position in
-    /// the DEAD ring — passed as the floor contribution only when the
-    /// caller's ring is that ring; a recovery passes `u64::MAX` (the
-    /// records' window is the dead ring's, kept by its `Recovering` page,
-    /// never a clamp on the recoverer's own tail).
+    /// into slot trees whose lease it holds mid-recovery (the gate's
+    /// `foreign` bit cleared, the RAM table still naming the dead lessee
+    /// until tree 0 is durable — KD-SYM-2/3). `entry_start` is the floor
+    /// contribution the applied record pins on the RECOVERER's ring: the
+    /// driver passes its own ring's head (the records' durable home is
+    /// the dead ring's window, kept by the `Recovering` page until the
+    /// recovery flushed them; the floor keeps the recoverer's tail from
+    /// passing the cycle that covers the replayed leaves).
     pub async fn apply_replayed_recovery(
         &self,
         key: &[u8],
@@ -1285,8 +1328,18 @@ impl KvTree {
         value: Bytes,
         entry_start: u64,
     ) -> Result<bool, KvError> {
-        self.apply_replayed_interior_class(key, level, seq, kind, value, entry_start, false)
-            .await
+        self.apply_replayed_interior_class(
+            InteriorReplay {
+                key,
+                level,
+                seq,
+                kind,
+                value,
+                entry_start,
+            },
+            false,
+        )
+        .await
     }
 
     /// [`Self::apply_replayed_interior`] under the STRUCTURAL lease class
@@ -1301,35 +1354,39 @@ impl KvTree {
         value: Bytes,
         entry_start: u64,
     ) -> Result<bool, KvError> {
-        self.apply_replayed_interior_class(key, level, seq, kind, value, entry_start, true)
-            .await
+        self.apply_replayed_interior_class(
+            InteriorReplay {
+                key,
+                level,
+                seq,
+                kind,
+                value,
+                entry_start,
+            },
+            true,
+        )
+        .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn apply_replayed_interior_class(
         &self,
-        key: &[u8],
-        level: u8,
-        seq: u64,
-        kind: RecordKind,
-        value: Bytes,
-        entry_start: u64,
+        r: InteriorReplay<'_>,
         structural: bool,
     ) -> Result<bool, KvError> {
-        self.check_interior_key(key)?;
-        self.seq.fetch_max(seq, Ordering::AcqRel);
-        if self.root_level().await? < level {
+        self.check_interior_key(r.key)?;
+        self.seq.fetch_max(r.seq, Ordering::AcqRel);
+        if self.root_level().await? < r.level {
             return Ok(false); // shorter mounted structure: unroutable
         }
         for _ in 0..RETRY_BUDGET {
-            let target = self.descend(key, level).await?;
+            let target = self.descend(r.key, r.level).await?;
             match self
                 .apply_at_seq_class(
                     &target,
-                    key,
-                    kind,
-                    value.clone(),
-                    Some((seq, entry_start)),
+                    r.key,
+                    r.kind,
+                    r.value.clone(),
+                    Some((r.seq, r.entry_start)),
                     structural,
                 )
                 .await?

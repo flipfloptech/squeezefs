@@ -114,6 +114,131 @@ pub static RECOVERY_LEDGER_POLLS: AtomicU64 = AtomicU64::new(0);
 /// the recoverer completed after its ring replay (design §5.6).
 pub static RECOVERY_INTENTS_ROLLED_FORWARD: AtomicU64 = AtomicU64::new(0);
 
+/// Test seam (review round 1, Issue 3's pins): the recovery FAILS with a
+/// retryable error once it reaches step `N` (3 = the ring read done, 4 =
+/// the RAM table `Releasing` + roots installed, 5 = the replay done, 6 =
+/// the flush done, 7 = the tails recorded (before tree 0), 8 = tree 0
+/// written + the RAM table released (before the page), 9 = the page
+/// `Recovered` (before `recovered:`)). `0` = off; consumed by the failure.
+pub static TEST_RECOVERY_FAIL_AT_STEP: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Test seam: the recovery PARKS right before its tree-0 write (after the
+/// tails) while set — the window a concurrent first-touch acquire of a
+/// recovering slot must be refused in. `TEST_RECOVERY_HELD` reads `true`
+/// while it is parked; clearing the hold and `TEST_RECOVERY_HOLD_RELEASE.
+/// notify_waiters()` resumes it.
+pub static TEST_RECOVERY_HOLD_BEFORE_TREE0: AtomicBool = AtomicBool::new(false);
+/// Test seam: the poll PARKS between its directory snapshot and the
+/// decision under the handover mutex (review round 1, Issue 8's TOCTOU
+/// window) while set; `TEST_RECOVERY_HELD` / `TEST_RECOVERY_HOLD_RELEASE`
+/// are shared with the tree-0 hold.
+pub static TEST_RECOVERY_HOLD_BEFORE_REREAD: AtomicBool = AtomicBool::new(false);
+pub static TEST_RECOVERY_HELD: AtomicBool = AtomicBool::new(false);
+pub static TEST_RECOVERY_HOLD_RELEASE: squeezefs_ipc::sqz_notify::Notify =
+    squeezefs_ipc::sqz_notify::Notify::new();
+
+fn test_fail_at_step(step: u32, id: u32) -> std::result::Result<(), KvError> {
+    if TEST_RECOVERY_FAIL_AT_STEP
+        .compare_exchange(step, 0, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        return Err(KvError::Busy(format!(
+            "TEST_RECOVERY_FAIL_AT_STEP — appender {id}'s recovery failed at step {step}"
+        )));
+    }
+    Ok(())
+}
+
+async fn test_hold_at(flag: &AtomicBool) {
+    loop {
+        let n = TEST_RECOVERY_HOLD_RELEASE.notified();
+        if !flag.load(Ordering::SeqCst) {
+            TEST_RECOVERY_HELD.store(false, Ordering::SeqCst);
+            return;
+        }
+        TEST_RECOVERY_HELD.store(true, Ordering::SeqCst);
+        n.await;
+    }
+}
+
+/// Test seam: seconds ADDED to the clock `appender clear` judges a
+/// `writer_claim`'s age against — the operator's wait for the TTL after a
+/// kill, made deterministic (a killed writer's claim is heartbeat-fresh
+/// for `CLIENT_STALE_TTL_SECS`, and the verb refuses it on every volume it
+/// touches). `0` = the wall clock.
+pub static TEST_CLAIM_CLOCK_SKEW_SECS: AtomicU64 = AtomicU64::new(0);
+
+/// The RAM lease table's rollback of a recovery that did not reach its
+/// tree-0 step (review round 1, Issue 3): every slot `begin_release` moved
+/// to `Releasing { dead }` goes back to `Leased { dead }` — the door keeps
+/// refusing first-touch acquires, the page stays `Recovering`, and the
+/// re-run resumes from the durable state. Disarmed by clearing `begun`
+/// once tree 0's records are durable and the table released.
+struct RecoveryRollback<'a> {
+    plane: &'a slot_lease::SlotLeasePlane,
+    id: u32,
+    begun: Vec<record::ForestSlot>,
+}
+
+impl Drop for RecoveryRollback<'_> {
+    fn drop(&mut self) {
+        for slot in self.begun.drain(..) {
+            self.plane.table.abort_release(slot, self.id);
+        }
+    }
+}
+
+/// A tree's node addresses by class ([`KvMetaBackend::node_addrs_unloaded`]).
+struct TreeAddrs {
+    interior: Vec<u64>,
+    leaves: Vec<u64>,
+}
+
+impl TreeAddrs {
+    fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+        self.interior.iter().chain(self.leaves.iter()).copied()
+    }
+}
+
+/// **The `RecordDeath` key word's screen** (review round 1, Issue 7 — the
+/// wire-word law over `pr_key`): the key a peer's word carries drives a
+/// PREEMPT on every namespace this process holds WERO on, so it is judged
+/// against durable / derived state BEFORE it is stored. `registered` is
+/// the key the census REGISTERED for the member (its join's `pr_key`,
+/// kept through its departure); `own` this process's registrant keys;
+/// `live` every live member's key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeathKeyVerdict {
+    /// Stored as carried.
+    Accept,
+    /// The word contradicts the registered key, or names a key this
+    /// process or a live member holds: `Rejected`, nothing written.
+    Reject,
+    /// No census knows the member (a peer owner's — PR 12's carriage):
+    /// the death is recorded with key 0, the tail scan is the fence.
+    Unvalidated,
+}
+
+pub fn screen_death_key(
+    word: u64,
+    registered: Option<u64>,
+    own: &[u64],
+    live: &[u64],
+) -> DeathKeyVerdict {
+    if word == 0 {
+        return DeathKeyVerdict::Accept;
+    }
+    if own.contains(&word) || live.contains(&word) {
+        return DeathKeyVerdict::Reject;
+    }
+    match registered {
+        Some(k) if k == word => DeathKeyVerdict::Accept,
+        Some(_) => DeathKeyVerdict::Reject,
+        None => DeathKeyVerdict::Unvalidated,
+    }
+}
+
 /// Test seam: the recoverer DIES right after the page went `Recovering`
 /// and before anything else moved — §5.5.1's "home manager dies
 /// mid-recovery" row (the successor re-runs it idempotently).
@@ -170,6 +295,24 @@ pub fn recovery_stats() -> RecoveryStats {
 /// force). The bound is what the operator's time-to-reclaim adds to
 /// `T_owner` + propagation (published `appender_recovery_bound_ms`).
 pub fn appender_recovery_bound_ms(ring_bytes: u64, node_size: u64, flush_interval_ms: u64) -> u64 {
+    appender_recovery_bound_with_ceiling_ms(
+        ring_bytes,
+        node_size,
+        crate::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_ms(flush_interval_ms),
+    )
+}
+
+/// [`appender_recovery_bound_ms`] with the checkpoint LANDING ceiling
+/// already resolved (the mounted set's, resolved at open). The scan terms:
+/// the flush's leaves are also the tail scan's (one extent read per leaf
+/// on non-PR — `recovery_full_tail_scan_bytes`) and the orphan census's
+/// interior reads are the leaves ÷ the fan-out, so both ride the
+/// `leaves × LEAF_LOAD_US` term twice over (review round 1, Issue 10).
+pub fn appender_recovery_bound_with_ceiling_ms(
+    ring_bytes: u64,
+    node_size: u64,
+    landing_ceiling_ms: u64,
+) -> u64 {
     /// The measured journal entry per create (design §1.4, ≈ 230 B).
     const ENTRY_BYTES_PER_CREATE: u64 = 230;
     /// Files per 256 KiB leaf at ~330 B per inode + dentry + layout.
@@ -178,14 +321,18 @@ pub fn appender_recovery_bound_ms(ring_bytes: u64, node_size: u64, flush_interva
     const LEAF_LOAD_US: u64 = 120;
     /// The per-entry fold cost (a per-key LWW insert), ns.
     const ENTRY_FOLD_NS: u64 = 1_000;
+    /// The leaf passes the bound prices: the flush's cold loads, the tail
+    /// scan's extent reads, the orphan census's interior reads (≤ leaves).
+    const LEAF_PASSES: u64 = 3;
     let entries = ring_bytes / ENTRY_BYTES_PER_CREATE;
     let files_per_leaf = (FILES_PER_256K_LEAF * node_size.max(1) / (256 * 1024)).max(1);
     let leaves = entries.div_ceil(files_per_leaf);
-    let load_ms = leaves.saturating_mul(LEAF_LOAD_US).div_ceil(1_000);
+    let load_ms = leaves
+        .saturating_mul(LEAF_LOAD_US)
+        .saturating_mul(LEAF_PASSES)
+        .div_ceil(1_000);
     let fold_ms = entries.saturating_mul(ENTRY_FOLD_NS).div_ceil(1_000_000);
-    load_ms
-        + fold_ms
-        + crate::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_ms(flush_interval_ms)
+    load_ms + fold_ms + landing_ceiling_ms
 }
 
 /// One recovered region.
@@ -210,6 +357,14 @@ pub struct RecoveryReport {
     /// `Live` pages the ledger names dead but this volume could not act
     /// on (a failed volume, a non-writer).
     pub deferred: u64,
+    /// Pages the poll snapshotted that had MOVED by the time the decision
+    /// was taken under the handover mutex (another actor's act — Issue 8),
+    /// or whose member is live again (Issue 9): not recovered, not an error.
+    pub skipped: u64,
+    /// `Recovered` pages the ledger names whose `recovered:` record was
+    /// missing (the recoverer died between the two writes) — the record
+    /// completed by this pass.
+    pub completed: u64,
 }
 
 /// What the routed pass did across the set.
@@ -218,6 +373,10 @@ pub struct RecoverySetReport {
     pub per_volume: Vec<(u16, RecoveryReport)>,
     pub regions_released: u64,
     pub intents_rolled_forward: u64,
+    /// Parked death records this projection made durable (Issue 5).
+    pub deaths_landed: u64,
+    /// Death records the retirement sweep retired (§5.5.2).
+    pub records_retired: u64,
 }
 
 impl RecoverySetReport {
@@ -281,11 +440,19 @@ impl KvMetaBackend {
     /// The wire-word screen of `RecordDeath` (the level-5 law): a peer's
     /// word never declares dead (a) this mount's own identity, nor (b) a
     /// member the installed S6 owner lists LIVE — both `Rejected`
-    /// (`STATUS_REJECTED`, `manager_verb_rejected`), nothing written.
+    /// (`STATUS_REJECTED`, `manager_verb_rejected`), nothing written; and
+    /// (c) the KEY word is judged before it can drive a preempt (review
+    /// round 1, Issue 7 — [`screen_death_key`]): against the key the
+    /// owner's census REGISTERED for the member (kept through its
+    /// departure), this process's own registrant keys and every live
+    /// member's — a contradiction is `Rejected`; a member no census knows
+    /// has its key DROPPED to 0 (the tail scan is the fence). Answers the
+    /// key to store.
     pub fn screen_record_death(
         &self,
         member: &crate::meta_ship::manager::WireIdentity,
-    ) -> std::result::Result<(), KvError> {
+        pr_key: u64,
+    ) -> std::result::Result<u64, KvError> {
         let reject = |why: String| {
             if let Some(set) = self.appenders.as_ref() {
                 set.verbs.rejected.fetch_add(1, Ordering::Relaxed);
@@ -304,15 +471,107 @@ impl KvMetaBackend {
                 ));
             }
         }
-        if let Some(owner) = crate::membership::installed_owner() {
-            let id = crate::cowriter::node_member_id_of(member.node_token, member.mount_slot);
+        let id = crate::cowriter::node_member_id_of(member.node_token, member.mount_slot);
+        let owner = crate::membership::installed_owner();
+        if let Some(owner) = owner.as_ref() {
             if owner.member_is_live(&id) {
                 return Err(reject(format!(
                     "member '{id}' holds a LIVE lease with this owner (inside T_owner)"
                 )));
             }
         }
-        Ok(())
+        let registered = owner.as_ref().and_then(|o| o.registered_key(&id));
+        let live: Vec<u64> = owner.as_ref().map(|o| o.live_keys()).unwrap_or_default();
+        let mut own = vec![self.pr_key];
+        own.extend(crate::data_custody::own_registrant_keys());
+        match screen_death_key(pr_key, registered, &own, &live) {
+            DeathKeyVerdict::Accept => Ok(pr_key),
+            DeathKeyVerdict::Reject => Err(reject(format!(
+                "the key word {pr_key:#x} contradicts the census (registered {registered:?}) or \
+                 names a key this process or a live member holds — a preempt it would drive is \
+                 refused"
+            ))),
+            DeathKeyVerdict::Unvalidated => {
+                log::warn!(
+                    "meta volume {}: RecordDeath for '{id}' carries key {pr_key:#x} no census \
+                     here registered — recorded with key 0 (the tail scan is the fence; PR 12's \
+                     carriage of a peer owner's census validates it)",
+                    self.path.display()
+                );
+                Ok(0)
+            }
+        }
+    }
+
+    /// This mount's metadata-namespace registrant key (`0` = none) — what
+    /// the key-word screen refuses as "our own" (the contracts' witness).
+    pub fn pr_key_pub(&self) -> u64 {
+        self.pr_key
+    }
+
+    /// The device byte ranges appender `id`'s REGION owns on this volume —
+    /// its ring segments, its two directory page slots, and every extent
+    /// its `extent_grant` record names (the images its trees reach and
+    /// the unclaimed remainder) — as `(offset, len)`. The two-backend
+    /// fixture's capture set: a foreign lessee's later activity touches
+    /// exactly these bytes and nothing the manager holds cached, so a
+    /// snapshot of them re-applied to the device while the manager is
+    /// open IS another daemon's checkpoint landing under it.
+    pub async fn region_device_ranges(
+        &self,
+        id: u32,
+    ) -> std::result::Result<Vec<(u64, u64)>, KvError> {
+        let mut out = Vec::new();
+        let entries = read_directory(&self.path, &self.sb).await?;
+        let Some(e) = entries.iter().find(|e| e.appender_id == id) else {
+            return Ok(out);
+        };
+        for off in e.dir_offsets {
+            out.push((off, appender::APPENDER_PAGE_LEN as u64));
+        }
+        if let Some(p) = e.page.as_ref() {
+            for s in &p.segments {
+                out.push((s.start, s.len));
+            }
+        }
+        let node_size = self.cache.config().layout.node_size() as u64;
+        for ext in self.extent_grant_record(id).await?.extents() {
+            out.push((self.cache.extent_addr(ext), node_size));
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Test seam: PLANT `claim` as `path`'s `writer_claim` — a foreign
+    /// host's live manager as this host sees it (the `appender clear`
+    /// contracts' fixture; an UNARMED forest, whose frames stamp `(0, 0)`
+    /// like this raw writer's). Takes the flock like the verb.
+    pub async fn test_plant_writer_claim(
+        path: &Path,
+        claim: &WriterClaim,
+    ) -> std::result::Result<(), KvError> {
+        let guard_fd = match Self::acquire_writer_flock(path) {
+            Ok(fd) => fd,
+            Err(FlockOutcome::Held) => {
+                return Err(KvError::Busy(format!(
+                    "{}: live-mounted on this host",
+                    path.display()
+                )));
+            }
+            Err(FlockOutcome::Io(e)) => {
+                return Err(KvError::Io(crate::error::SqueezefsError::Io(e)));
+            }
+        };
+        let mut inner = Self::open_inner(path, OpenPosture::Writer).await?;
+        *inner.guard_fd.get_mut().unwrap_or_else(|e| e.into_inner()) = Some(guard_fd);
+        let be = Arc::new(inner);
+        let _ = be.conveyor_self.set(Arc::downgrade(&be));
+        be.setxattr_internal(1, WRITER_CLAIM_XATTR, &claim.encode())
+            .await?;
+        be.sync_device().await.map_err(KvError::Io)?;
+        be.checkpoint_now().await?;
+        be.shutdown().await
     }
 
     /// Whether this volume's manager role has been RELEASED by the vol-0
@@ -334,29 +593,40 @@ impl KvMetaBackend {
     /// is the ceiling — at the cadence in force. 0 on a bit-17-absent
     /// volume (no region can die there).
     pub fn appender_recovery_bound_ms(&self) -> u64 {
-        if self.appenders.is_none() {
+        let Some(set) = self.appenders.as_ref() else {
             return 0;
-        }
-        appender_recovery_bound_ms(
+        };
+        // The cadence term is the landing ceiling RESOLVED AT OPEN
+        // (`AppenderSet::flush_ceiling_ms` ≡ `checkpoint_landing_ceiling_
+        // ms(interval)`), never an env read per stats serve (review round
+        // 1, Issue 21).
+        appender_recovery_bound_with_ceiling_ms(
             Self::fixed_ring_extent(&self.sb).len,
             u64::from(self.sb.node_size),
-            crate::meta_backend::resolve_flush_interval_ms(),
+            set.flush_ceiling_ms,
         )
     }
 
-    /// FOREIGN appender ring windows this open did not replay — every
-    /// `Live` / `Recovering` page that is not one of this mount's regions
-    /// (a same-node page is own residue, replayed at open) with entries
-    /// past its `ledger_tail_seq`. fsck's inode plane takes no verdict
-    /// while one exists: a cross-owner create's dentry rides the parent
-    /// holder's ring, so the referenced set is incomplete over it. 0 on
-    /// a flat volume, a solo forest, and a set whose peers are checkpointed.
-    pub async fn foreign_windows_pending(&self) -> std::result::Result<u64, KvError> {
+    /// The GLOBAL inos named by every FOREIGN appender ring window this
+    /// open did not replay — every `Live` / `Recovering` page that is not
+    /// one of this mount's regions (a same-node page is own residue,
+    /// replayed at open), its ring read ONCE from its `ledger_tail_seq`:
+    /// the inode keys the window puts or deletes and the child inos its
+    /// dentry records name. fsck's inode plane SCOPES these out of C9/C10
+    /// (review round 1, Issue 12 — never the whole plane): a cross-owner
+    /// create's dentry rides the parent holder's ring while the child's
+    /// record is the creator's, so the referenced set is incomplete over
+    /// exactly these inos and complete over every other. Empty on a flat
+    /// volume, a solo forest, and a set whose peers are checkpointed.
+    pub async fn foreign_window_inos(
+        &self,
+        width: u64,
+    ) -> std::result::Result<std::collections::BTreeSet<u64>, KvError> {
+        let mut out = std::collections::BTreeSet::new();
         let Some(set) = self.appenders.as_ref() else {
-            return Ok(0);
+            return Ok(out);
         };
         let entries = read_directory(&self.path, &self.sb).await?;
-        let mut pending = 0u64;
         for e in &entries {
             let Some(page) = e.page.as_ref() else {
                 continue;
@@ -367,11 +637,43 @@ impl KvMetaBackend {
             if set.region(e.appender_id).is_some() || same_mount(&page.identity, &set.identity) {
                 continue;
             }
-            if self.window_entries_of(page).await? > 0 {
-                pending += 1;
+            if page.segments.is_empty() {
+                continue;
+            }
+            let dead = self.read_dead_ring(page).await?;
+            for entry in &dead.recovery.entries {
+                for (tag, r) in &entry.records {
+                    let (kind, level) = untag(*tag);
+                    if level > 0 || !record::is_slot_tree_kind(kind) {
+                        continue;
+                    }
+                    let Ok((k, legacy)) = record::split_forest_key(&r.key) else {
+                        continue;
+                    };
+                    let mentioned: Option<u64> = match k {
+                        record::TREE_INODES => record::decode_inode_key(&legacy).ok(),
+                        record::TREE_DENTRIES => record::DentryValue::decode(&r.value)
+                            .ok()
+                            .map(|d| d.child_ino),
+                        _ => None,
+                    };
+                    let Some(ino) = mentioned else {
+                        continue;
+                    };
+                    // A guest local-key ino becomes its global form; a
+                    // native or already-global ino (a dentry's child) is
+                    // itself.
+                    let global = match crate::meta_backend::split_guest_local(ino) {
+                        Some((slot, raw)) => {
+                            crate::meta_backend::make_global_ino_width(raw, u64::from(slot), width)
+                        }
+                        None => ino,
+                    };
+                    out.insert(global);
+                }
             }
         }
-        Ok(pending)
+        Ok(out)
     }
 
     /// **The C14 / C15 census** (§5.8.5) of this volume against the ledger
@@ -588,9 +890,6 @@ impl KvMetaBackend {
             let Some(page) = e.page.clone() else {
                 continue;
             };
-            if !matches!(page.state, AppenderState::Live | AppenderState::Recovering) {
-                continue;
-            }
             // Our own regions are never the ledger's to recover: a same-
             // node page is own residue at open (PR 2), never a peer.
             if set.region(e.appender_id).is_some() || same_mount(&page.identity, &set.identity) {
@@ -599,9 +898,52 @@ impl KvMetaBackend {
             let Some((_, rec)) = dead.iter().find(|(id, _)| same_mount(id, &page.identity)) else {
                 continue;
             };
+            // A `Recovered` page the ledger names without its `recovered:`
+            // record: the recoverer died between its page write and the
+            // record (Issue 3's last window) — the record is what PR 8's
+            // re-grant gate waits on, so it is completed here, idempotent.
+            if page.state == AppenderState::Recovered {
+                if vol0
+                    .recovered_record(&page.identity, vol_ordinal)
+                    .await?
+                    .is_none()
+                {
+                    let _handover = self.handover.lock().await;
+                    vol0.manager_record_recovered(page.identity, vol_ordinal)
+                        .await?;
+                    if vol_ordinal == 0 {
+                        if let Err(err) = self.manager_dir_rename_release_dead(e.appender_id).await
+                        {
+                            log::warn!(
+                                "meta volume {}: releasing dead appender {}'s directory-rename \
+                                 lock failed ({err})",
+                                self.path.display(),
+                                e.appender_id
+                            );
+                        }
+                    }
+                    if let Some(plane) = set.slot_leases() {
+                        plane.handover_done.notify_waiters();
+                    }
+                    report.completed += 1;
+                    log::warn!(
+                        "meta volume {}: appender {}'s recovery COMPLETED — its page was \
+                         Recovered without its `recovered:` record (the recoverer died in \
+                         between); the record is written now",
+                        self.path.display(),
+                        e.appender_id
+                    );
+                }
+                continue;
+            }
+            if !matches!(page.state, AppenderState::Live | AppenderState::Recovering) {
+                continue;
+            }
             let rec = *rec;
+            test_hold_at(&TEST_RECOVERY_HOLD_BEFORE_REREAD).await;
             match self.recover_region(vol0, vol_ordinal, e, page, &rec).await {
-                Ok(r) => report.recovered.push(r),
+                Ok(Some(r)) => report.recovered.push(r),
+                Ok(None) => report.skipped += 1,
                 Err(err) => {
                     log::error!(
                         "meta volume {}: recovery of appender {} (node {:#018x}, mount slot \
@@ -623,15 +965,29 @@ impl KvMetaBackend {
     /// with the cadence's releases and the leave) and — for the replay,
     /// the flush and the tree-0 writes — the SMO mutex (the structural
     /// door: no manager SMO on the trees is in flight while their custody
-    /// moves, and no pass spans the move).
+    /// moves, and no pass spans the move). `Ok(None)` = skipped: the page
+    /// the poll snapshotted moved under it (review round 1, Issue 8) or
+    /// the member is live again (Issue 9).
+    ///
+    /// **The order is the handover protocol's** (review round 1, Issue 3
+    /// — §5.8.4's recover-before-grant clause): the RAM lease table marks
+    /// the dead appender's slots `Releasing` FIRST (a first-touch acquire
+    /// at the commit door is refused naming the holder, exactly like a
+    /// slot mid-handover), every durable step follows, and the table goes
+    /// `Unleased` LAST — after tree 0's `Unleased` records are barriered.
+    /// Any `Err` in between aborts the release (`Leased { dead }` again,
+    /// the page left `Recovering`) so the re-run resumes from the durable
+    /// state with nothing acked lost; the first build released the table
+    /// at step 4 and a `Try` refusal at step 7 left tree 0 `Leased {
+    /// dead }` under a `Recovered` page for ever.
     async fn recover_region(
         self: &Arc<Self>,
         vol0: &Arc<KvMetaBackend>,
         vol_ordinal: u16,
         entry: &AppenderEntry,
-        mut page: AppenderPage,
+        snapshot: AppenderPage,
         dead: &DeadMemberRecord,
-    ) -> std::result::Result<RecoveredRegion, KvError> {
+    ) -> std::result::Result<Option<RecoveredRegion>, KvError> {
         use std::time::Instant;
         let t_total = Instant::now();
         let set = self.manager_gate(false)?;
@@ -647,7 +1003,62 @@ impl KvMetaBackend {
         })?;
         let _handover = self.handover.lock().await;
         let id = entry.appender_id;
+        // ---- 0. the decision is taken UNDER the handover mutex on a
+        // FRESH read (Issue 8): the poll's snapshot may have been overtaken
+        // by the mount-path gate, an online fsck repair or a rejoin — a
+        // page no longer `Live` / `Recovering`, or of another identity or
+        // term, is somebody else's act; and the ledger record must still
+        // stand (a rejoined member retired it — Issue 9).
+        let entries_now = read_directory(&self.path, &self.sb).await?;
+        let Some(entry) = entries_now.iter().find(|e| e.appender_id == id) else {
+            return Ok(None);
+        };
+        let Some(mut page) = entry.page.clone() else {
+            return Ok(None);
+        };
+        if !matches!(page.state, AppenderState::Live | AppenderState::Recovering)
+            || !same_mount(&page.identity, &snapshot.identity)
+            || page.term != snapshot.term
+        {
+            log::info!(
+                "meta volume {}: appender {id}'s page moved under the ledger poll (now {} / \
+                 node {:#018x} slot {:#x} term {}) — this projection skips it",
+                self.path.display(),
+                page.state.as_str(),
+                page.identity.node_token,
+                page.identity.mount_slot,
+                page.term
+            );
+            return Ok(None);
+        }
         let identity = page.identity;
+        if vol0.dead_member_record(&identity).await?.is_none() {
+            log::info!(
+                "meta volume {}: appender {id}'s death record was retired under the poll (the \
+                 member rejoined) — not recovered",
+                self.path.display()
+            );
+            return Ok(None);
+        }
+        if let Some(owner) = crate::membership::installed_owner() {
+            let member =
+                crate::cowriter::node_member_id_of(identity.node_token, identity.mount_slot);
+            if owner.member_is_live(&member) {
+                // The incarnation check (Issue 9): a member the owner lists
+                // LIVE again holds a newer lease epoch than the record's —
+                // it rejoined; its record is retired here (idempotent) and
+                // its region is its own.
+                vol0.retire_death_record(&identity).await?;
+                log::warn!(
+                    "meta volume {}: appender {id}'s member '{member}' is LIVE with the \
+                     installed owner (rejoined past its death record, epoch {}) — record \
+                     retired, region left to its holder",
+                    self.path.display(),
+                    dead.epoch
+                );
+                return Ok(None);
+            }
+        }
         log::warn!(
             "meta volume {}: RECOVERING appender {id} (node {:#018x}, mount slot {:#x}, term \
              {}) — named dead by the ledger (epoch {}, {} ms ago); page was {}",
@@ -661,16 +1072,22 @@ impl KvMetaBackend {
         );
 
         // ---- 1. preempt (PR substrates; the fidelity leg's engagement).
+        // `pr_fenced` — the tail scan's fence verdict (§5.8.2) — is TRUE
+        // only when the preempt of a NON-ZERO key LANDED on this volume's
+        // namespace (review round 1, Issue 4): a key-less record (`appender
+        // clear`'s), a failed preempt or a detection-grade substrate all
+        // take the full tail scan, the fence that needs no device.
         let t = Instant::now();
-        let pr_fenced = set.stats().meta_pr_wero;
+        let mut pr_fenced = false;
         if dead.pr_key != 0 {
             let victim = dead.pr_key;
-            let preempted = self.preempt_meta_registrant(victim).await
-                + squeezefs_ipc::sqz_blocking::run_blocking(move || {
-                    crate::data_custody::preempt_dead_registrant(victim)
-                })
-                .await;
-            APPENDER_RECOVERY_PREEMPTS.fetch_add(preempted, Ordering::Relaxed);
+            let meta = self.preempt_meta_registrant(victim).await;
+            let data = squeezefs_ipc::sqz_blocking::run_blocking(move || {
+                crate::data_custody::preempt_dead_registrant(victim)
+            })
+            .await;
+            pr_fenced = set.stats().meta_pr_wero && meta == 1;
+            APPENDER_RECOVERY_PREEMPTS.fetch_add(meta + data, Ordering::Relaxed);
         }
         APPENDER_RECOVERY_PHASE_NS[PH_PREEMPT]
             .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -699,9 +1116,46 @@ impl KvMetaBackend {
         let entries_n = dead_ring
             .as_ref()
             .map_or(0, |d| d.recovery.entries.len() as u64);
-        let leases = Self::read_tree0_lease_map(forest.control()).await?;
+        let mut leases = Self::read_tree0_lease_map(forest.control()).await?;
         let grant_record = self.extent_grant_record(id).await?;
+        // A RE-RUN past its tree-0 step (the page `Recovering`, tree 0
+        // already `Unleased` for slots the window still carries): those
+        // slots were replayed, flushed and released by the run that died
+        // after its tree-0 write (Issue 3's step 8/9 windows) — their
+        // records are ABSORBED, judged legal here and never re-applied
+        // (`absorbed`); only the page's `Recovered` and the `recovered:`
+        // record are owed. A `Live` page's window names only slots tree 0
+        // leases to the appender (PR 2's law), so the set is empty there.
+        let mut absorbed: std::collections::BTreeSet<record::ForestSlot> = Default::default();
         if let Some(d) = dead_ring.as_ref() {
+            if page.state == AppenderState::Recovering {
+                let gens = self.tree0_generations().await?;
+                for e in &d.recovery.entries {
+                    for (tag, r) in &e.records {
+                        let (kind, level) = untag(*tag);
+                        let slot = if kind == record::KIND_INTERIOR && level > 0 {
+                            forest::split_interior_journal_key(&r.key)
+                                .ok()
+                                .map(|(s, _)| s)
+                        } else if level == 0 && record::is_slot_tree_kind(kind) {
+                            record::forest_key_slot(&r.key).ok()
+                        } else {
+                            None
+                        };
+                        if let Some(s) = slot {
+                            if matches!(gens.get(&s), Some((_, None))) {
+                                absorbed.insert(s);
+                            }
+                        }
+                    }
+                }
+                if !absorbed.is_empty() {
+                    leases
+                        .entry(id)
+                        .or_default()
+                        .extend(absorbed.iter().copied());
+                }
+            }
             let owned = vec![(
                 id,
                 journal::JournalRecovery {
@@ -714,7 +1168,23 @@ impl KvMetaBackend {
             let granted = |appender: u32, extent: u64| -> bool {
                 appender == id && grant_record.contains(extent)
             };
-            let violations = journal::detect_appender_violations(&owned, &leases, &granted);
+            // A re-run past its tree-0 step judges nothing: the run that
+            // released the slots judged this same window (a dead ring
+            // never moves) and then MOVED the trees' images out of the
+            // grant record, so the window's alloc deltas would now read as
+            // outside it.
+            let violations = if absorbed.is_empty() {
+                journal::detect_appender_violations(&owned, &leases, &granted)
+            } else {
+                log::info!(
+                    "meta volume {}: appender {id}'s recovery re-runs past its tree-0 step \
+                     ({} slot(s) already released) — the window was judged by the run that \
+                     released them",
+                    self.path.display(),
+                    absorbed.len()
+                );
+                Vec::new()
+            };
             if !violations.is_empty() {
                 let shown: Vec<String> = violations.iter().take(4).map(|v| v.to_string()).collect();
                 return Err(KvError::Corrupt(format!(
@@ -738,14 +1208,24 @@ impl KvMetaBackend {
         }
         APPENDER_RECOVERY_PHASE_NS[PH_READ]
             .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        test_fail_at_step(3, id)?;
 
         // ---- 4. the RAM lease table: the dead appender's slots go
-        // Unleased NOW (the manager maintains them; the stamp reads (0, g)
-        // under no lessee); stale page entries dropped.
+        // RELEASING now — held by the dead id, refusing every first-touch
+        // acquire at the door (`SlotBusy`, the mid-handover verdict) — and
+        // `Unleased` only at step 7b, after tree 0's records are durable;
+        // the `foreign` bit is cleared so the STRUCTURAL class (the
+        // replay, the flush pass's SMOs) is the manager's from here. Stale
+        // page entries dropped.
         let t = Instant::now();
         let held: Vec<record::ForestSlot> = leases
             .get(&id)
-            .map(|s| s.iter().copied().collect())
+            .map(|s| {
+                s.iter()
+                    .copied()
+                    .filter(|s| !absorbed.contains(s))
+                    .collect()
+            })
             .unwrap_or_default();
         let mut stale = 0u64;
         for se in &page.slots {
@@ -755,6 +1235,11 @@ impl KvMetaBackend {
                 plane.stale_entries.fetch_add(1, Ordering::Relaxed);
             }
         }
+        let mut rollback = RecoveryRollback {
+            plane: &plane,
+            id,
+            begun: Vec::new(),
+        };
         // The window's highest local ino per slot (§5.1.8's third term).
         let mut window_max: std::collections::BTreeMap<record::ForestSlot, u64> =
             Default::default();
@@ -781,6 +1266,13 @@ impl KvMetaBackend {
             }
         }
         let dead_frontier = dead_ring.as_ref().map_or(0, |d| d.ring.seq_frontier());
+        // The structural door for everything from the root install on: no
+        // manager SMO on the trees is in flight while their custody moves.
+        let mut smo = self.smo.lock().await;
+        // The recovered records' floor on THIS ring (the replay journals
+        // nothing here; the flush makes them durable) and the installed
+        // roots' un-published floor.
+        let floor = self.ring.core().head();
         let mut released: Vec<(record::ForestSlot, u32, crate::slot_lease_core::SlotWords)> =
             Vec::new();
         for slot in &held {
@@ -790,6 +1282,17 @@ impl KvMetaBackend {
             if lease.state == crate::slot_lease_core::LeaseState::Unleased || lease.holder != id {
                 continue;
             }
+            match plane.table.begin_release(*slot, id) {
+                Ok(_) => rollback.begun.push(*slot),
+                Err(refusal) => {
+                    return Err(KvError::Corrupt(format!(
+                        "{}: the lease table refused to begin the recovery release of slot \
+                         {slot} from dead appender {id} ({refusal:?})",
+                        self.path.display()
+                    )));
+                }
+            }
+            plane.gate.clear_foreign(*slot);
             let page_entry = page
                 .slots
                 .iter()
@@ -810,7 +1313,15 @@ impl KvMetaBackend {
                 match forest.tree(*slot) {
                     Some(tr) => {
                         if root.seq > tr.root().seq {
-                            tr.adopt_root(root)?;
+                            // The recoverer's RAM tree is STALE (Issue 2):
+                            // it holds the slot at the root it last saw
+                            // while the lessee's checkpoints moved it. Every
+                            // cached node of the slot is dropped (the cache
+                            // barrier — a stale image would fold the window
+                            // onto a base missing the lessee's flushed bsets)
+                            // and the page's root installed writer-legal.
+                            self.cache.drop_slot_nodes(*slot)?;
+                            tr.install_recovered_root(root, floor);
                         }
                     }
                     None => {
@@ -821,7 +1332,8 @@ impl KvMetaBackend {
                             self.seq_handle(),
                         )
                         .await?;
-                        forest.adopt_guest(*slot, Arc::new(tree));
+                        tree.set_root_floor(floor);
+                        forest.adopt_guest_unpublished(*slot, Arc::new(tree));
                     }
                 }
             }
@@ -842,40 +1354,18 @@ impl KvMetaBackend {
                 extents: u32::try_from(extents).unwrap_or(u32::MAX),
                 seq_floor: recorded.seq_floor.max(dead_frontier),
             };
-            let outcome = plane
-                .table
-                .release(*slot, id, lease.g, words, self.lease_seq());
-            if !matches!(
-                outcome,
-                crate::slot_lease_core::ReleaseOutcome::Released
-                    | crate::slot_lease_core::ReleaseOutcome::Already
-            ) {
-                return Err(KvError::Corrupt(format!(
-                    "{}: the lease table refused the recovery release of slot {slot} from dead \
-                     appender {id} at g {} ({outcome:?})",
-                    self.path.display(),
-                    lease.g
-                )));
-            }
-            plane.gate.clear_foreign(*slot);
-            plane.gate.revoke(*slot);
-            // The round-5 law: ring 0 stamps above every record the slot
-            // carries before the manager's first structural write to it.
-            if words.seq_floor != 0 {
-                self.ring.raise_seq_floor(words.seq_floor);
-            }
             released.push((*slot, lease.g, words));
         }
-        plane.refresh_holders();
+        test_fail_at_step(4, id)?;
 
         // ---- 5. replay under the structural door.
-        let mut smo = self.smo.lock().await;
-        let floor = self.ring.core().head();
         if let Some(d) = dead_ring.as_ref() {
-            self.replay_dead_window(&d.recovery, floor).await?;
+            self.replay_dead_window(&d.recovery, floor, &absorbed)
+                .await?;
         }
         APPENDER_RECOVERY_PHASE_NS[PH_REPLAY]
             .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        test_fail_at_step(5, id)?;
 
         // The data-bitmap arm (§5.5.1): a lease the dead member held with
         // THIS volume as its home — its pages take the window's deltas.
@@ -922,25 +1412,24 @@ impl KvMetaBackend {
         }
 
         // ---- 6. flush: barriered cycles until no recovered slot holds a
-        // dirty node and every moved root is published (the handover's
-        // post-condition law, `COVER_CYCLES_MAX`).
+        // dirty node (the handover's post-condition law, `COVER_CYCLES_MAX`).
+        // The moved roots stay UNPUBLISHED through these cycles — a slot
+        // mid-recovery is skipped by `publish_forest_roots` exactly like a
+        // slot mid-handover, its floor clamps the tail — and step 7's
+        // `Unleased` records ARE their publication.
         let t = Instant::now();
         let slots: Vec<record::ForestSlot> = released.iter().map(|(s, _, _)| *s).collect();
         for cycle in 0..=checkpoint::COVER_CYCLES_MAX {
             self.checkpoint_cycle(&mut smo, true).await?;
             let dirty = self.dirty_nodes_of_slots(&slots);
-            let unpublished = forest
-                .roots_to_publish()
-                .iter()
-                .any(|(s, _)| slots.contains(s));
-            if dirty == 0 && !unpublished {
+            if dirty == 0 {
                 break;
             }
             if cycle == checkpoint::COVER_CYCLES_MAX {
                 return Err(KvError::Corrupt(format!(
                     "{}: recovery of appender {id} could not flush its slot trees in {} \
-                     barriered cycles ({dirty} dirty node(s), unpublished roots: \
-                     {unpublished}) — a stuck tail is a defect, never a longer wait",
+                     barriered cycles ({dirty} dirty node(s)) — a stuck tail is a defect, \
+                     never a longer wait",
                     self.path.display(),
                     checkpoint::COVER_CYCLES_MAX
                 )));
@@ -948,6 +1437,7 @@ impl KvMetaBackend {
         }
         APPENDER_RECOVERY_PHASE_NS[PH_FLUSH]
             .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        test_fail_at_step(6, id)?;
 
         // ---- 6b. tails: every reachable leaf on non-PR, the resident
         // ones under a device fence (§5.8.2's tail-coverage law).
@@ -962,14 +1452,46 @@ impl KvMetaBackend {
         }
         APPENDER_RECOVERY_PHASE_NS[PH_TAILS]
             .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        test_fail_at_step(7, id)?;
+        test_hold_at(&TEST_RECOVERY_HOLD_BEFORE_TREE0).await;
 
         // ---- 7. tree 0: Unleased + tails per slot, the grant record
-        // minus the trees' images (the leave's chunked entries); the
-        // unclaimed grant returned; the dead appender's orphan images
-        // returned (C13 for a dead appender).
+        // minus the trees' images (the leave's chunked entries), admitted
+        // drain-and-retry under the SMO mutex the recovery holds (a park
+        // here would wait on the checkpoint task, which waits on this
+        // mutex); the unclaimed grant returned; the dead appender's orphan
+        // images returned (C13 for a dead appender).
         let t = Instant::now();
-        self.release_recovered_slots(&plane, id, &released, tails_by_slot)
+        self.release_recovered_slots(&plane, id, &released, tails_by_slot, &mut smo)
             .await?;
+
+        // ---- 7b. the RAM lease table LAST (Issue 3): tree 0's `Unleased`
+        // records are barriered — the slots go `Unleased { g }` here, the
+        // manager maintains them from now on (the stamp reads (0, g)
+        // under no lessee), ring 0's seq offset is raised above the dead
+        // ring's frontier (the round-5 law). From here nothing is rolled
+        // back: every later step is idempotent against durable state.
+        for (slot, g, words) in &released {
+            let outcome = plane.table.release(*slot, id, *g, *words, self.lease_seq());
+            if !matches!(
+                outcome,
+                crate::slot_lease_core::ReleaseOutcome::Released
+                    | crate::slot_lease_core::ReleaseOutcome::Already
+            ) {
+                return Err(KvError::Corrupt(format!(
+                    "{}: the lease table refused the recovery release of slot {slot} from dead \
+                     appender {id} at g {g} ({outcome:?}) AFTER its tree-0 record landed — the \
+                     RAM table and tree 0 disagree",
+                    self.path.display()
+                )));
+            }
+            plane.gate.revoke(*slot);
+            if words.seq_floor != 0 {
+                self.ring.raise_seq_floor(words.seq_floor);
+            }
+        }
+        rollback.begun.clear();
+        plane.refresh_holders();
         // The UNCLAIMED remainder: the page's runs MINUS every extent the
         // window's `alloc` records claimed since that page write — those
         // hold live images the trees now reach (returning one would free
@@ -1012,7 +1534,9 @@ impl KvMetaBackend {
                 ),
             }
         }
-        let orphans = self.dead_appender_orphans(vol0, id, &identity).await?;
+        let orphans = self
+            .dead_appender_orphans(vol0, id, &identity, &slots)
+            .await?;
         if !orphans.is_empty() {
             match self.return_extents_inner(id, &orphans, false).await {
                 Ok((returned, _)) => log::info!(
@@ -1028,9 +1552,13 @@ impl KvMetaBackend {
             }
         }
         drop(smo);
+        test_fail_at_step(8, id)?;
 
         // ---- 8. the page: Recovered, its tail the head it was read to
-        // (§5.8.3 — never replayed again).
+        // (§5.8.3 — never replayed again). The page is re-read: its
+        // generation moved under the flush cycles' own writes of nothing
+        // (a foreign page is never written by a checkpoint) but the
+        // directory-first law wants the newest image edited.
         let entries_now = read_directory(&self.path, &self.sb).await?;
         let entry_now = entries_now
             .iter()
@@ -1052,6 +1580,7 @@ impl KvMetaBackend {
             page.seq_offset = d.ring.seq_offset();
         }
         self.write_foreign_page(entry_now, &mut page).await?;
+        test_fail_at_step(9, id)?;
 
         // ---- 9. recovered:{X, v}; volume 0's dead-holder lock; the doors.
         vol0.manager_record_recovered(identity, vol_ordinal).await?;
@@ -1081,14 +1610,14 @@ impl KvMetaBackend {
             if stale == 1 { "y" } else { "ies" },
             t_total.elapsed().as_millis()
         );
-        Ok(RecoveredRegion {
+        Ok(Some(RecoveredRegion {
             appender_id: id,
             identity,
             slots,
             entries: entries_n,
             stale_entries: stale,
             data_bits_changed: data_bits,
-        })
+        }))
     }
 
     /// The two-phase replay of a dead ring's window into the slot trees
@@ -1100,6 +1629,7 @@ impl KvMetaBackend {
         &self,
         rec: &journal::JournalRecovery,
         floor: u64,
+        absorbed: &std::collections::BTreeSet<record::ForestSlot>,
     ) -> std::result::Result<(), KvError> {
         let forest = self.forest().ok_or_else(|| {
             KvError::Corrupt(format!("{}: not a forest volume", self.path.display()))
@@ -1123,12 +1653,15 @@ impl KvMetaBackend {
         }
         interior.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.seq.cmp(&b.2.seq)));
         for (level, _entry_start, r) in interior {
+            let (slot, separator) = forest::split_interior_journal_key(&r.key)?;
+            if absorbed.contains(&slot) {
+                continue;
+            }
             if r.kind == RecordKind::Put {
                 if let Ok((_addr, child_seq)) = decode_interior_value(&r.value) {
                     self.seq_handle().fetch_max(child_seq, Ordering::AcqRel);
                 }
             }
-            let (slot, separator) = forest::split_interior_journal_key(&r.key)?;
             let tree = forest.slot_or_mint(slot, &mint).await?;
             tree.apply_replayed_interior_recovery(
                 separator,
@@ -1144,6 +1677,9 @@ impl KvMetaBackend {
             for (tag, r) in &entry.records {
                 let (tree_id, level) = untag(*tag);
                 if level > 0 || !record::is_slot_tree_kind(tree_id) {
+                    continue;
+                }
+                if record::forest_key_slot(&r.key).is_ok_and(|s| absorbed.contains(&s)) {
                     continue;
                 }
                 let (_slot, tree) = forest.route_forest_key_or_mint(&r.key, &mint).await?;
@@ -1209,6 +1745,13 @@ impl KvMetaBackend {
     /// loads everything, which would make every leaf resident and the
     /// scan's ledger read 0).
     async fn leaf_addrs_unloaded(&self, tree: &KvTree) -> std::result::Result<Vec<u64>, KvError> {
+        Ok(self.node_addrs_unloaded(tree).await?.leaves)
+    }
+
+    /// Every node address `tree` reaches — interior AND leaf — without
+    /// loading a leaf ([`Self::leaf_addrs_unloaded`]'s walk, both
+    /// populations kept): the dead-appender orphan census's reachable set.
+    async fn node_addrs_unloaded(&self, tree: &KvTree) -> std::result::Result<TreeAddrs, KvError> {
         let root = tree.root();
         let root_node = match self.cache.try_get(root.addr) {
             Some(n) => n,
@@ -1225,15 +1768,20 @@ impl KvMetaBackend {
                 })?,
         };
         if root_node.level() == 0 {
-            return Ok(vec![root.addr]);
+            return Ok(TreeAddrs {
+                interior: Vec::new(),
+                leaves: vec![root.addr],
+            });
         }
         let mut leaves = Vec::new();
+        let mut interior = Vec::new();
         let mut frontier: Vec<(u64, u8)> = vec![(root.addr, root_node.level())];
         let mut seen = std::collections::BTreeSet::new();
         while let Some((addr, level)) = frontier.pop() {
             if !seen.insert(addr) {
                 continue;
             }
+            interior.push(addr);
             let node = match self.cache.try_get(addr) {
                 Some(n) => n,
                 None => self
@@ -1263,7 +1811,35 @@ impl KvMetaBackend {
         }
         leaves.sort_unstable();
         leaves.dedup();
-        Ok(leaves)
+        Ok(TreeAddrs { interior, leaves })
+    }
+
+    /// A PARKING-free admission for a control entry while the caller holds
+    /// the SMO mutex: `try_admit`, and on a full ring one barriered cycle
+    /// (which advances `reusable_upto`) then again — `COVER_CYCLES_MAX`
+    /// cycles, then the wedge class (a ring no cycle drains is pinned by
+    /// something no flush discharges).
+    async fn admit_control_drain_and_retry(
+        &self,
+        recs: &[(u8, Record)],
+        smo: &mut SmoContext,
+    ) -> std::result::Result<EntryAdmission, KvError> {
+        let len = entry_len_for(recs)?;
+        for cycle in 0..=checkpoint::COVER_CYCLES_MAX {
+            if let Some(adm) = self.ring.try_admit(len, AdmissionClass::User) {
+                return Ok(EntryAdmission::Held(adm));
+            }
+            if cycle == checkpoint::COVER_CYCLES_MAX {
+                break;
+            }
+            self.checkpoint_cycle(smo, true).await?;
+        }
+        Err(KvError::Corrupt(format!(
+            "{}: a {len} B control entry found no ring-0 admission in {} barriered cycles — \
+             the ring is pinned by something no flush discharges",
+            self.path.display(),
+            checkpoint::COVER_CYCLES_MAX
+        )))
     }
 
     /// The tree-0 step of one recovery (the leave's per-region body for a
@@ -1276,6 +1852,7 @@ impl KvMetaBackend {
         appender_id: u32,
         released: &[(record::ForestSlot, u32, crate::slot_lease_core::SlotWords)],
         tails_by_slot: Vec<(record::ForestSlot, Vec<(u64, u32)>)>,
+        smo: &mut SmoContext,
     ) -> std::result::Result<(), KvError> {
         if released.is_empty() {
             return Ok(());
@@ -1405,7 +1982,19 @@ impl KvMetaBackend {
             };
             let mut recs: Vec<(u8, Record)> = chunk.iter().flat_map(|s| s.recs.clone()).collect();
             recs.extend(rewrite.put);
-            if let Err(e) = self.write_control_entry(recs, EntryAdmission::Try).await {
+            // The recovery holds the SMO mutex, so the entry's admission is
+            // drain-and-retry (the checkpoint task's own law — §4.4 pt 5):
+            // a ring 0 full of user windows is cycled by THIS task, never
+            // parked on (the checkpoint task would wait on the mutex we
+            // hold). Bounded; the bound is the wedge class.
+            let admission = match self.admit_control_drain_and_retry(&recs, smo).await {
+                Ok(a) => a,
+                Err(e) => {
+                    release_from(range.start);
+                    return Err(e);
+                }
+            };
+            if let Err(e) = self.write_control_entry(recs, admission).await {
                 release_from(range.start);
                 return Err(e);
             }
@@ -1434,11 +2023,20 @@ impl KvMetaBackend {
     /// C13's class for a dead appender, returned by the recoverer (its
     /// ring is `Recovered` from here, so no in-window `alloc` is ever
     /// judged against the rewritten record).
+    ///
+    /// **Scoped and non-materializing** (review round 1, Issue 10): a
+    /// grant's images can be reached only by the trees the appender wrote
+    /// — the slots it leased (`slots`, just released) — so the census walks
+    /// THOSE trees' interior population (one read per interior node; a
+    /// leaf's address is read off its parent, never the leaf) and never the
+    /// whole forest under the SMO mutex. The bound
+    /// `appender_recovery_bound_ms` prices it as the flush's leaves ÷ fan-out.
     async fn dead_appender_orphans(
         &self,
         vol0: &Arc<KvMetaBackend>,
         id: u32,
         identity: &AppenderIdentity,
+        slots: &[record::ForestSlot],
     ) -> std::result::Result<Vec<u64>, KvError> {
         let record = self.extent_grant_record(id).await?;
         if record.is_empty() {
@@ -1449,11 +2047,11 @@ impl KvMetaBackend {
         };
         let _mint = forest.mint_guard().await;
         let mut reachable: std::collections::BTreeSet<u64> = Default::default();
-        let mut trees: Vec<Arc<KvTree>> =
-            vec![Arc::clone(forest.control()), Arc::clone(forest.native())];
-        trees.extend(forest.slot_trees().into_iter().map(|(_, t)| t));
-        for t in &trees {
-            for addr in t.reachable_node_addrs().await? {
+        for slot in slots {
+            let Some(t) = forest.tree(*slot) else {
+                continue;
+            };
+            for addr in self.node_addrs_unloaded(&t).await?.iter() {
                 reachable.insert(self.cache.addr_extent(addr));
             }
         }
@@ -1576,6 +2174,7 @@ impl KvMetaBackend {
             return Ok(0);
         }
         let leases = vol0.alloc_lease_records().await?;
+        let dead = vol0.dead_member_records().await?;
         let entries = read_directory(&self.path, &self.sb).await?;
         let node_size = u64::from(self.sb.node_size);
         let mut released = 0u64;
@@ -1591,6 +2190,18 @@ impl KvMetaBackend {
                 .any(|(_, l)| same_mount(&l.holder, &page.identity) && l.home_vol == vol_ordinal)
             {
                 continue; // its bitmap pages are still the lease's
+            }
+            // The `recovered:` record precedes the release (§5.5.1's
+            // ordering): a `Recovered` page the ledger names whose record
+            // is missing is the recoverer's last window — the driver's
+            // completion arm writes the record first, the release follows.
+            if dead.iter().any(|(id, _)| same_mount(id, &page.identity))
+                && vol0
+                    .recovered_record(&page.identity, vol_ordinal)
+                    .await?
+                    .is_none()
+            {
+                continue;
             }
             let _handover = self.handover.lock().await;
             let segments = std::mem::take(&mut page.segments);
@@ -1671,6 +2282,37 @@ impl KvMetaBackend {
         } else {
             None
         };
+        // The `claim clear` law over EVERY volume the verb touches (review
+        // round 1, Issue 6): a fresh `writer_claim` on `path` OR on volume
+        // 0 — ANY appender's manager, this host's or a foreign one — is a
+        // live manager the verb would write under; refused from a probe
+        // read BEFORE either writer open (nothing of the verb's is opened
+        // when it refuses). The first build gated this on the cleared
+        // page being the manager's, and never read volume 0's claim.
+        let now = unix_now_secs() + TEST_CLAIM_CLOCK_SKEW_SECS.load(Ordering::Relaxed);
+        let mut claim_volumes: Vec<&Path> = vec![path];
+        if vol0_path != path {
+            claim_volumes.push(vol0_path);
+        }
+        for p in claim_volumes {
+            let probe = Self::open_inner(p, OpenPosture::NonWriter).await?;
+            if let Ok(Some(raw)) = probe.getxattr(1, WRITER_CLAIM_XATTR).await {
+                if let Some(c) = WriterClaim::decode(&raw) {
+                    if c.age_secs(now) <= crate::fuse_client::CLIENT_STALE_TTL_SECS {
+                        return Err(KvError::Busy(format!(
+                            "{}: refusing to clear appender {appender_id} — {}'s writer claim \
+                             (holder '{}') heartbeated {}s ago, inside the {}s TTL: a live \
+                             manager holds the set. Stop it (or wait for the TTL), then retry",
+                            path.display(),
+                            p.display(),
+                            c.id,
+                            c.age_secs(now),
+                            crate::fuse_client::CLIENT_STALE_TTL_SECS
+                        )));
+                    }
+                }
+            }
+        }
         let mut inner = Self::open_inner(path, OpenPosture::Writer).await?;
         *inner.guard_fd.get_mut().unwrap() = Some(guard_fd);
         let be = Arc::new(inner);
@@ -1700,10 +2342,9 @@ impl KvMetaBackend {
                 page.identity.node_token
             )));
         }
-        // The liveness probe an offline verb has: a fresh writer claim
-        // (the manager's) or a fresh `client:` registration naming the
-        // appender's node inside the TTL — it may be alive.
-        let now = unix_now_secs();
+        // The liveness probe an offline verb has (the writer claims above,
+        // and) a fresh `client:` registration naming the appender's node
+        // inside the TTL — it may be alive.
         let member =
             crate::cowriter::node_member_id_of(page.identity.node_token, page.identity.mount_slot);
         if let Ok(attrs) = be.listxattr(1).await {
@@ -1727,18 +2368,6 @@ impl KvMetaBackend {
                             crate::fuse_client::CLIENT_STALE_TTL_SECS
                         )));
                     }
-                }
-            }
-        }
-        if let Ok(Some(raw)) = be.getxattr(1, WRITER_CLAIM_XATTR).await {
-            if let Some(c) = WriterClaim::decode(&raw) {
-                if page.is_manager && c.age_secs(now) <= crate::fuse_client::CLIENT_STALE_TTL_SECS {
-                    return Err(KvError::Busy(format!(
-                        "{}: refusing to clear appender {appender_id} (the manager's page) — the \
-                         writer claim heartbeated {}s ago, inside the TTL",
-                        path.display(),
-                        c.age_secs(now)
-                    )));
                 }
             }
         }
@@ -1843,14 +2472,54 @@ pub fn install_death_ledger_writer(routed: &Arc<RoutedMetaBackend>) {
                     dead.id,
                     if already { " (already)" } else { "" }
                 ),
-                Err(e) => log::error!(
-                    "death ledger: recording member '{}' dead FAILED ({e}); the S6 owner's next \
-                     eviction sweep does not retry — `squeezefs appender clear` is the remedy",
-                    dead.id
-                ),
+                Err(e) => {
+                    // §5.5.2 "retried until durable" (review round 1, Issue
+                    // 5): the admission itself PARKS on a full ring, so
+                    // this arm is the device-error class — the death is
+                    // parked in RAM and the next ledger poll retries it.
+                    crate::meta_backend::kv::alloc_lease::defer_death_record(
+                        crate::meta_backend::kv::alloc_lease::PendingDeath {
+                            member: identity,
+                            epoch: dead.epoch,
+                            pr_key: dead.pr_key,
+                        },
+                    );
+                    log::error!(
+                        "death ledger: recording member '{}' dead FAILED ({e}); parked for the \
+                         next ledger poll's retry (dead_member_write_deferrals)",
+                        dead.id
+                    );
+                }
             }
         });
     }));
+}
+
+/// **The rejoin's retirement** (§5.5.2; review round 1, Issue 9): this
+/// writer's own identity is the NEWER incarnation of anything the ledger
+/// names dead under it — the record (and its `recovered:` records) are
+/// retired on volume 0 before the set serves, so no manager's poll ever
+/// recovers a region this mount is live on. Idempotent; `Ok(true)` = a
+/// record was retired. (This mount's own `Live` / `Recovering` pages are
+/// own residue, replayed at its open — PR 2.)
+pub async fn retire_own_death_records(
+    routed: &Arc<RoutedMetaBackend>,
+) -> std::result::Result<bool, KvError> {
+    let Some((_, vol0)) = vol0_of(routed) else {
+        return Ok(false);
+    };
+    if vol0.read_only || vol0.non_writer || vol0.appender_stats().is_none() {
+        return Ok(false);
+    }
+    let retired = vol0.retire_own_death_records().await?;
+    if retired {
+        log::warn!(
+            "recovery: this mount's own death record on {} RETIRED at its arm — the newer \
+             incarnation supersedes it (design-symmetric-metadata §5.5.2)",
+            vol0.device_path().display()
+        );
+    }
+    Ok(retired)
 }
 
 /// **One ledger projection across the set** (the mount-path C15 arm and
@@ -1879,6 +2548,14 @@ pub async fn recover_dead_appenders_set(
     if !reachable {
         return Ok(out);
     }
+    // The deaths the sink could not write (Issue 5) land first — they are
+    // this projection's input.
+    if vol0.appender_stats().is_some() {
+        match vol0.drain_pending_deaths().await {
+            Ok(n) => out.deaths_landed = n,
+            Err(e) => log::warn!("recovery: the pending death records did not land ({e})"),
+        }
+    }
     let mut recovered_any = false;
     for (i, vol) in routed.volumes.iter().enumerate() {
         let ordinal = u16::try_from(i).unwrap_or(u16::MAX);
@@ -1890,6 +2567,29 @@ pub async fn recover_dead_appenders_set(
         let report = vol.recover_dead_appenders(vol0, ordinal).await?;
         recovered_any |= !report.recovered.is_empty();
         out.per_volume.push((ordinal, report));
+    }
+    // The retirement sweep (§5.5.2): a record past `2 × T_owner` whose
+    // regions on EVERY volume of this set are recovered (no `Live` /
+    // `Recovering` page of the identity left) and that no lease names.
+    if vol0.appender_stats().is_some() {
+        let mut pending_pages: Vec<AppenderIdentity> = Vec::new();
+        for vol in &routed.volumes {
+            for e in read_directory(vol.device_path(), vol.superblock()).await? {
+                if let Some(p) = e.page {
+                    if matches!(p.state, AppenderState::Live | AppenderState::Recovering) {
+                        pending_pages.push(p.identity);
+                    }
+                }
+            }
+        }
+        let pending = |m: &AppenderIdentity| pending_pages.iter().any(|p| same_mount(p, m));
+        match vol0
+            .sweep_retirable_death_records(now_ms, t_owner_ms, &pending)
+            .await
+        {
+            Ok(n) => out.records_retired = n,
+            Err(e) => log::warn!("recovery: the death-record retirement sweep failed ({e})"),
+        }
     }
     if recovered_any {
         match crate::meta_backend::crossvol_tx::roll_forward_open_intents(routed).await {
@@ -1975,6 +2675,7 @@ pub async fn arm(
         return Ok(RecoverySetReport::default());
     }
     install_death_ledger_writer(routed);
+    retire_own_death_records(routed).await?;
     let report = mount_path_custody_gate(routed).await?;
     spawn_ledger_poll(
         Arc::downgrade(routed),

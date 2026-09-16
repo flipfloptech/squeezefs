@@ -1015,6 +1015,12 @@ impl BlockAllocator {
         self.block_grant.get().is_some()
     }
 
+    /// The data volume tag the grant arm was installed for (`None` unarmed)
+    /// — fsck's key into the allocation holding (the C6 bitmap oracle).
+    pub fn block_grant_vol_tag(&self) -> Option<u64> {
+        self.block_grant.get().map(|a| a.vol_tag)
+    }
+
     /// The window's unconsumed blocks (0 unarmed).
     pub fn block_grant_remaining(&self) -> u64 {
         self.block_grant.get().map_or(0, |a| a.window.remaining())

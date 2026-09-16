@@ -3195,6 +3195,51 @@ impl NodeCache {
         });
     }
 
+    /// **The recovered slot's cache barrier** (design-symmetric-metadata
+    /// §5.9, PR 10): drop every cached node stamped with forest slot
+    /// `slot` — the images this mount loaded while the slot was a dead
+    /// lessee's (its grant-time tree, or any leaf a foreign read paged in)
+    /// predate the lessee's own appends and flushes, so a fold onto them
+    /// would base the window on a tree missing the lessee's flushed bsets
+    /// and a later `append_frozen` at a stale remembered tail would trip
+    /// the foreign-at-tail refusal. Legal only while nothing of this mount
+    /// is dirty under the slot (a foreign slot never is — the gate refused
+    /// every commit) and under the volume's SMO mutex (no pass mid-walk):
+    /// a dirty or locked node here is a defect, refused loud, nothing
+    /// dropped. Returns the nodes dropped.
+    pub fn drop_slot_nodes(&self, slot: super::record::ForestSlot) -> Result<usize, KvError> {
+        let mut victims: Vec<Arc<CachedNode>> = Vec::new();
+        self.for_each_node(|n| {
+            if n.forest_slot() == Some(slot) {
+                victims.push(Arc::clone(n));
+            }
+        });
+        for node in &victims {
+            if node.dirty_floor() != u64::MAX || node.lock().try_read().is_err() {
+                return Err(KvError::Corrupt(format!(
+                    "slot {slot}'s cache barrier: node {:#x} is dirty or locked on the recoverer \
+                     (dirty floor {}) — a mount wrote to a slot it did not lease",
+                    node.addr(),
+                    node.dirty_floor()
+                )));
+            }
+        }
+        let node_size = self.cfg.layout.node_size() as u64;
+        let mut dropped = 0usize;
+        for node in victims {
+            self.note_node_dying_floor(&node);
+            if self
+                .map
+                .remove_if_sync(&node.addr(), |v| Arc::ptr_eq(v, &node))
+                .is_some()
+            {
+                self.cached_bytes.fetch_sub(node_size, Ordering::AcqRel);
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
+    }
+
     /// Latch-free map read: `Some` is a cache hit (counted). The returned
     /// `Arc` stays valid across eviction — readers keep their snapshots by
     /// refcount.

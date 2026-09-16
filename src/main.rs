@@ -224,6 +224,12 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    // Anchor: design-symmetric-metadata §5.8.5 C14/C15, §6.2 (PR 10).
+    /// Operator-attested remedies for a symmetric-forest appender page
+    Appender {
+        #[command(subcommand)]
+        action: AppenderActions,
+    },
     // Anchors: design-volume-lifecycle §5.3–§5.5/§6 (PR VL3–VL5b).
     /// Manage the volume set: add, list, drain, remove, repair
     ///
@@ -858,6 +864,31 @@ enum ClaimActions {
         ///
         /// Every volume in the set is cleared in order.
         meta_uri: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum AppenderActions {
+    /// Attest a dead appender (operator-attested; the C14/C15 remedy)
+    ///
+    /// The recovery step for a symmetric-forest appender whose node died
+    /// and whose death the membership plane never recorded (a non-PR
+    /// substrate, a set whose managers were all down) — or whose stale
+    /// `Live` page contends for a slot at the next mount (C14). Writes
+    /// the death record to volume 0's ledger and marks the page
+    /// recovering; the next mount replays its ring before serving (C15).
+    /// Refuses a live-mounted volume, a fresh heartbeat of the appender's
+    /// node, and this node's own residue (the next mount recovers that
+    /// itself). Every recovering manager's ledger poll does this
+    /// automatically for a member the plane evicted.
+    Clear {
+        /// Metadata URI (sqmeta://...) naming the set (volume 0 first)
+        meta_uri: String,
+        /// The appender id (`squeezefs appenders` lists them)
+        appender_id: u32,
+        /// The set ordinal of the volume holding the page (default 0)
+        #[arg(long, default_value_t = 0)]
+        volume: usize,
     },
 }
 
@@ -5462,6 +5493,58 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
         }
+        Commands::Appender { action } => {
+            let AppenderActions::Clear {
+                meta_uri,
+                appender_id,
+                volume,
+            } = action;
+            squeezefs::set_fs_prefix("squeezefs");
+            let meta_lvs = parse_block_uri(&meta_uri, "sqmeta://")?;
+            let Some(vol_path) = meta_lvs.get(volume) else {
+                return Err(format!(
+                    "appender clear: --volume {volume} names no member of the set ({} volume(s))",
+                    meta_lvs.len()
+                )
+                .into());
+            };
+            use squeezefs::meta_backend::kv::backend::{AppenderClearOutcome, KvMetaBackend};
+            match KvMetaBackend::appender_clear(
+                std::path::Path::new(vol_path),
+                std::path::Path::new(&meta_lvs[0]),
+                appender_id,
+            )
+            .await
+            {
+                Ok(AppenderClearOutcome::NothingToClear) => {
+                    println!(
+                        "{vol_path}: appender {appender_id} holds no Live or Recovering page — \
+                         nothing to clear"
+                    );
+                }
+                Ok(AppenderClearOutcome::Cleared {
+                    identity,
+                    was,
+                    window_entries,
+                }) => {
+                    println!(
+                        "{vol_path}: appender {appender_id} (node {:#018x}, mount slot {:#x}) \
+                         attested DEAD — death recorded on {}, page {} ⇒ recovering; the next \
+                         mount recovers its {window_entries}-entry window before serving. This \
+                         was an operator attestation that the node is down — if it was merely \
+                         partitioned, stop it before it reconnects.",
+                        identity.node_token,
+                        identity.mount_slot,
+                        meta_lvs[0],
+                        was.as_str()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("\x1b[91mERROR\x1b[0m {vol_path}: {e}");
+                    return Err(format!("appender clear refused/failed on {vol_path}").into());
+                }
+            }
+        }
         Commands::Claim { action } => {
             let ClaimActions::Clear { meta_uri } = action;
             squeezefs::set_fs_prefix("squeezefs");
@@ -6873,6 +6956,30 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // uninstalls them beside the free/harvest executors.
             if multi_writer_arm.is_some() {
                 fs_engine.install_extent_assembler();
+            }
+
+            // Symmetric metadata PR 10 (design-symmetric-metadata §5.9,
+            // §5.8.5 C14/C15): BEFORE the set serves — and before the
+            // allocation arm below, whose successor path waits on a dead
+            // holder's home being `Recovered` — the death ledger's writer
+            // is installed (the S6 owner's evictions ship `RecordDeath`),
+            // every `Live`/`Recovering` page the ledger names dead on a
+            // volume this mount manages is recovered, an unledgered
+            // `Recovering` page refuses the mount naming `appender clear`,
+            // and the ledger poll is spawned. Inert on an unarmed mount.
+            let recovered =
+                squeezefs::meta_backend::kv::backend::recovery::arm(&routed_meta_backend)
+                    .await
+                    .map_err(|e| {
+                        format!("dead-appender recovery at the mount path refused: {e}")
+                    })?;
+            if recovered.recovered() > 0 || recovered.regions_released > 0 {
+                log::warn!(
+                    "symmetric metadata: the mount path recovered {} dead appender region(s) and \
+                     released {} recovered region(s) before serving (C15)",
+                    recovered.recovered(),
+                    recovered.regions_released
+                );
             }
 
             // Symmetric metadata PR 8 (design-symmetric-metadata §5.5): on

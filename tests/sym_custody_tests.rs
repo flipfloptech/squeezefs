@@ -374,6 +374,8 @@ struct Restore;
 
 impl Drop for Restore {
     fn drop(&mut self) {
+        data_grant::TEST_DROP_RECALL_CARRIERS_ALL.store(false, Ordering::SeqCst);
+        data_grant::TEST_DROP_RECALL_CARRIER_ONCE.store(false, Ordering::SeqCst);
         data_grant::uninstall_slot_custody();
         data_grant::uninstall_custody_owner();
         data_grant::uninstall_custody_client();
@@ -2515,6 +2517,241 @@ async fn a_holders_clean_leave_recalls_its_grants_before_its_slots_go_unleased()
         .expect("custody from the new holder — local");
     assert!(lease2.is_held().await);
     drop(lease2);
+    rig.shutdown().await;
+}
+
+/// Review round 4, Issue 28 — **the leave's bound-EXPIRY posture is the
+/// uncovered posture WHOLE**: a writer that keeps renewing and never
+/// releases a recalled grant (every recall carrier dropped) holds the
+/// leave past `T_owner + renew`; the S9 sweep retires nothing (the writer
+/// renews); the region whose slot the grant lives on then stays LEASED
+/// with its page `Live` — roots, tail, ring segments and grant intact,
+/// tree 0 still naming the slot its — never a `Free` page over a leased
+/// slot (KD-SYM-3: a leased slot's root rides its lessee's page). The
+/// next open of the same identity recovers the region as own residue and
+/// every acked record of the slot is present.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leave_whose_grant_survives_the_bound_keeps_the_region_live_and_the_next_open_recovers_it(
+) {
+    use squeezefs::meta_backend::kv::appender::{read_directory, AppenderState};
+    use squeezefs::meta_backend::kv::superblock::{classify_volume, VolumeFormat};
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let (uris, foreign) = two_holder_volume(dir.path(), data.path()).await;
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(TWO_HOLDERS)).await;
+    let venue = Venue::stand_up(&rig, &[1]).await;
+    // Acked records of the slot: xattrs on the foreign file, committed
+    // through region 1's ring under its lease.
+    for i in 0..8u32 {
+        rig.routed
+            .setxattr(
+                foreign,
+                &format!("user.acked.{i}"),
+                format!("v{i}").as_bytes(),
+            )
+            .await
+            .expect("an acked record of slot B");
+    }
+    let lease = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(foreign), None, Duration::from_secs(2))
+        .await
+        .expect("custody from the slot holder");
+    assert_eq!(venue.owner.held(), 1);
+    // The writer never absorbs a recall (a renewing, non-releasing
+    // writer — the failure path the leave's WARN/ERROR lines name).
+    data_grant::TEST_DROP_RECALL_CARRIERS_ALL.store(true, Ordering::SeqCst);
+    let bound = data_grant::leave_custody_bound_for(
+        venue.owner.clocks().t_owner,
+        venue.owner.clocks().renew_interval,
+    );
+    let recalled0 = venue.owner.recalled();
+
+    let started = std::time::Instant::now();
+    rig.shutdown().await;
+    let wall = started.elapsed();
+    assert!(
+        wall >= bound,
+        "the leave waited the whole bound for the release that never came: {wall:?} < {bound:?}"
+    );
+    assert_eq!(venue.owner.recalled(), recalled0 + 1, "the leave recalled");
+    assert_eq!(
+        venue.owner.held(),
+        1,
+        "the grant survived the bound (the writer renews and never releases)"
+    );
+    assert!(
+        lease.is_held().await,
+        "the writer's handle still reads held"
+    );
+
+    // The durable state: region 1's page is LIVE with its slot, roots,
+    // ring and grant — never Free over a leased slot.
+    let path = std::path::Path::new(&uris[0]);
+    let sb = match classify_volume(path).await.expect("classify") {
+        VolumeFormat::V3(sb) => sb,
+        other => panic!("a v3 volume: {other:?}"),
+    };
+    let listed = read_directory(path, &sb)
+        .await
+        .expect("the appender directory");
+    let page1 = listed
+        .iter()
+        .find_map(|e| e.page.as_ref().filter(|p| p.appender_id == 1))
+        .expect("region 1's page");
+    assert_eq!(
+        page1.state,
+        AppenderState::Live,
+        "a custody-blocked region's page stays Live at the leave"
+    );
+    assert!(
+        page1.slots.iter().any(|s| u32::from(s.slot) + 1 == SLOT_B),
+        "the page still names its slot: {:?}",
+        page1.slots
+    );
+    assert!(!page1.segments.is_empty(), "the ring stays claimed");
+    let page0 = listed[0].page.as_ref().expect("appender 0's page");
+    assert_eq!(page0.state, AppenderState::Free, "region 0 left cleanly");
+
+    // The writer's grant is torn down with the venue (its holder is gone
+    // for good in this contract); the next open of the same identity
+    // recovers region 1 as own residue with every acked record.
+    data_grant::TEST_DROP_RECALL_CARRIERS_ALL.store(false, Ordering::SeqCst);
+    drop(lease);
+    venue.tear_down().await;
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(TWO_HOLDERS)).await;
+    let s = rig.routed.volumes[0]
+        .appender_stats()
+        .expect("a forest volume has an appender set");
+    assert_eq!(
+        s.self_recoveries, 1,
+        "the Live page of our own node is own residue at the next open"
+    );
+    assert!(
+        matches!(
+            rig.routed.volumes[0]
+                .slot_leases()
+                .expect("armed")
+                .table
+                .resolve(SLOT_B),
+            squeezefs::slot_lease_core::Resolved::Holder { holder: 1, .. }
+        ),
+        "tree 0 kept the slot leased to appender 1 — the next open recovered it"
+    );
+    for i in 0..8u32 {
+        let v = rig
+            .routed
+            .getxattr(foreign, &format!("user.acked.{i}"))
+            .await
+            .expect("read")
+            .expect("every acked record present");
+        assert_eq!(v, format!("v{i}").as_bytes());
+    }
+    rig.shutdown().await;
+}
+
+/// Review round 4, Issue 32 — **an `Unleased` slot on a NON-manager
+/// answers `NotHolder { 0 }`** (the manager maintains an unleased tree,
+/// KD-SYM-2/3 — it is the holder of every object in it and the only
+/// appender that serves one): the shared predicate PR 5's token grant and
+/// PR 9's custody grant both ride, exercised with the gate's manager word
+/// cleared (PR 12's daemon shape in one process). Round 3's stale-resolve
+/// fix landed this arm without a contract; this is it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unleased_slot_on_a_non_manager_answers_not_holder_for_tokens_and_custody() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let (uris, foreign) = two_holder_volume(dir.path(), data.path()).await;
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(TWO_HOLDERS)).await;
+    let venue = Venue::stand_up(&rig, &[1]).await;
+    let vol = Arc::clone(&rig.routed.volumes[0]);
+    // Dial the holder (custody granted and released), then move the slot
+    // to Unleased.
+    let lease = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(foreign), None, Duration::from_secs(2))
+        .await
+        .expect("custody from the slot holder");
+    let client = venue.arm.holder_client(&venue.endpoint).await.unwrap();
+    let plane = venue
+        .arm
+        .token_plane(&venue.endpoint, 0)
+        .await
+        .expect("the token plane toward the holder");
+    drop(lease);
+    wait_until("the release lands", || venue.owner.held() == 0).await;
+    vol.release_slot_handover(1, SLOT_B)
+        .await
+        .expect("the slot goes Unleased");
+    let holder = vol.token_holder().expect("the token holder").clone();
+    let redirects0 = holder.stats().not_holder_redirects;
+    let gate = vol.slot_leases().expect("armed").gate.clone();
+    let object = rig.routed.route_ino(foreign).1;
+
+    // The MANAGER serves an unleased slot's object (the shipped answer);
+    // the writer's plane serves once its recall channel completed a round.
+    assert!(gate.is_manager());
+    let started = std::time::Instant::now();
+    loop {
+        match plane.serve(object, TokenWants::default()).await {
+            Ok(Some(_)) => break,
+            Ok(None) => panic!("the object exists"),
+            Err(e) => {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "the manager serves an unleased slot's object: {e}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    assert_eq!(holder.stats().not_holder_redirects, redirects0);
+
+    // A NON-manager does not: the token grant AND the custody grant answer
+    // NotHolder { 0 } — nothing granted, nothing registered.
+    gate.test_set_manager(false);
+    let served0 = holder.stats().grants_served;
+    plane.stop().await;
+    let plane = venue
+        .arm
+        .token_plane(&venue.endpoint, 0)
+        .await
+        .expect("the token plane toward the holder");
+    let err = match plane.serve(object, TokenWants::default()).await {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a non-manager never serves an unleased slot's object"),
+    };
+    assert!(
+        err.contains("appender 0"),
+        "the refusal names the manager as the holder: {err}"
+    );
+    let inside = client
+        .acquire_carrying_token(
+            0,
+            object,
+            None,
+            squeezefs::dlm::LockMode::Exclusive,
+            Duration::from_millis(200),
+        )
+        .await;
+    assert!(
+        matches!(
+            inside,
+            Ok(data_grant::CarriedAcquire::NotHolder { holder: 0 })
+        ),
+        "the custody grant answers NotHolder {{ 0 }} on a non-manager"
+    );
+    assert_eq!(holder.stats().not_holder_redirects, redirects0 + 2);
+    assert_eq!(holder.stats().grants_served, served0, "nothing granted");
+    assert_eq!(venue.owner.held(), 0, "no custody granted");
+    gate.test_set_manager(true);
+    venue.tear_down().await;
     rig.shutdown().await;
 }
 

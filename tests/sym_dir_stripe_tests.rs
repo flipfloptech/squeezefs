@@ -516,14 +516,24 @@ async fn fsck_clean_covered(uris: &[String], partition: Option<&str>) {
 /// NAME: every other tripwire in this process must be 0.
 const ROUTED_TRIPWIRE: &str = "xv_local_step_unguarded";
 
-fn assert_closed(what: &str) {
-    let s = cross_owner_stats();
+/// The ledger's closure and "no open intent" are EVENTUAL in a process
+/// with background tasks (a kicked migration's intent is registered in
+/// flight before it is counted minted); bounded wait, then the assert.
+async fn assert_closed(what: &str) {
+    let mut s = cross_owner_stats();
+    for _ in 0..200 {
+        if s.intents_open == 0 && s.intents_minted == s.intents_retired {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        s = cross_owner_stats();
+    }
     assert_eq!(
         s.intents_minted,
         s.intents_retired + s.intents_open,
-        "{what}: minted ≡ retired + open"
+        "{what}: minted ≡ retired + open ({s:?})"
     );
-    assert_eq!(s.intents_open, 0, "{what}: no open intent");
+    assert_eq!(s.intents_open, 0, "{what}: no open intent ({s:?})");
     assert_eq!(
         s.intents_stuck, 0,
         "{what}: xv_cross_owner_intents_stuck must stay 0"
@@ -736,7 +746,7 @@ async fn names_route_to_hash_mod_k_and_are_served_from_exactly_one_place_during_
         "every stripe was supplied — by the holder itself, no creator known"
     );
     assert_eq!(open_intents(&routed).await, 0);
-    assert_closed("flip");
+    assert_closed("flip").await;
     shutdown(&routed).await;
     fsck_clean(&uris).await;
 }
@@ -980,7 +990,7 @@ async fn a_name_in_both_homes_during_migration_is_served_from_the_stripe() {
         .await
         .expect("roll-forward");
     assert_eq!(open_intents(&routed).await, 0);
-    assert_closed("severed move");
+    assert_closed("severed move").await;
     shutdown(&routed).await;
     fsck_clean(&uris).await;
 }
@@ -1126,7 +1136,7 @@ async fn rmdir_of_a_striped_directory_never_races_a_create() {
     }
     assert_eq!(stripe_stats().rmdirs - before.rmdirs, 1);
     assert_eq!(open_intents(&routed).await, 0);
-    assert_closed("rmdir");
+    assert_closed("rmdir").await;
     shutdown(&routed).await;
     fsck_clean(&uris).await;
 }
@@ -1257,7 +1267,7 @@ async fn rmdir_of_a_migrating_directory_with_an_unmigrated_name_answers_enotempt
     assert!(stripe_stats().rehomed_on_touch >= 1);
     routed.unlink(work, "d").await.expect("now empty");
     assert_eq!(lookup_opt(&routed, work, "d").await, None);
-    assert_closed("enotempty");
+    assert_closed("enotempty").await;
     shutdown(&routed).await;
     fsck_clean(&uris).await;
 }
@@ -1517,7 +1527,7 @@ async fn a_directory_flips_at_the_derived_trigger_and_never_below_it() {
     expect.sort();
     assert_eq!(names_in(&routed, shared).await, expect);
     holders.tear_down();
-    assert_closed("trigger");
+    assert_closed("trigger").await;
     shutdown(&routed).await;
     drop(routed);
     fsck_clean_covered(&uris, Some(TWO_HOLDERS)).await;
@@ -1621,7 +1631,7 @@ async fn a_stripe_never_flips_itself() {
         assert!(lookup_opt(&routed, shared, nm).await.is_some());
     }
     holders.tear_down();
-    assert_closed("stripe never flips");
+    assert_closed("stripe never flips").await;
     shutdown(&routed).await;
     fsck_clean_covered(&uris, Some(TWO_HOLDERS)).await;
 }
@@ -1812,7 +1822,7 @@ async fn mutations_racing_the_migration_never_answer_enoent_or_strand_a_name() {
     assert_names_route_to_hash_mod_k(&routed, &m2, &["stale".to_string(), "victim".to_string()])
         .await;
     assert_eq!(lookup_opt(&routed, d2, "stale").await, Some(lg));
-    assert_closed("migration-safe mutations");
+    assert_closed("migration-safe mutations").await;
     shutdown(&routed).await;
     fsck_clean(&uris).await;
 }
@@ -2091,7 +2101,7 @@ async fn a_creator_wave_spreads_over_the_stripe_holders() {
     assert_eq!(after_xo.steps_shipped - before_xo.steps_shipped, ships);
     assert_eq!(names_in(&routed, shared).await.len(), creates);
     holders.tear_down();
-    assert_closed("wave");
+    assert_closed("wave").await;
     shutdown(&routed).await;
     drop(routed);
     // The oracle: the leave COVERED (no own residue at the next open),
@@ -2175,7 +2185,7 @@ async fn stripes_supplied_by_other_appenders_are_served_by_their_own_holders() {
             .is_none());
     }
     holders.tear_down();
-    assert_closed("three holders");
+    assert_closed("three holders").await;
     shutdown(&routed).await;
     drop(routed);
     fsck_clean_covered(&uris, Some(THREE_HOLDERS)).await;
@@ -2278,7 +2288,7 @@ async fn scoping_row_flip_migration_and_readdir_cost() {
         after_xo.intents_minted - before_xo.intents_minted,
     );
     holders.tear_down();
-    assert_closed("scoping holders");
+    assert_closed("scoping holders").await;
     shutdown(&routed).await;
     drop(routed);
     fsck_clean_covered(&uris, Some(partition)).await;

@@ -773,9 +773,12 @@ impl RoutedMetaBackend {
                 name: name.to_string(),
                 file_type: ft,
             };
-            self.migrate_one(parent, pv, plocal, &route.map, &entry)
-                .await?;
-            DIR_STRIPE_REHOMED_ON_TOUCH.fetch_add(1, Ordering::Relaxed);
+            if self
+                .migrate_one(parent, pv, plocal, &route.map, &entry)
+                .await?
+            {
+                DIR_STRIPE_REHOMED_ON_TOUCH.fetch_add(1, Ordering::Relaxed);
+            }
         }
         Ok(route.stripe)
     }
@@ -1544,9 +1547,12 @@ impl RoutedMetaBackend {
                 if is_marker_name(&entry.name) {
                     continue;
                 }
-                self.migrate_one(dir, v, local, map, &entry).await?;
-                moved += 1;
-                DIR_STRIPE_MIGRATED_NAMES.fetch_add(1, Ordering::Relaxed);
+                // Counted only when THIS call moved it (a name a mutation
+                // re-homed or unlinked meanwhile is nobody's move).
+                if self.migrate_one(dir, v, local, map, &entry).await? {
+                    moved += 1;
+                    DIR_STRIPE_MIGRATED_NAMES.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         Ok(moved)
@@ -1569,7 +1575,7 @@ impl RoutedMetaBackend {
         local: Ino,
         map: &StripeMap,
         entry: &DirEntry,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let (index, stripe) = map.stripe_for(self.hash54_on(v, &entry.name));
         let (sv, slocal) = self.route_ino(stripe);
         // Every stripe lives on `dir`'s volume by construction (both mint
@@ -1608,10 +1614,10 @@ impl RoutedMetaBackend {
         // Revalidate under the guards: the name may have been unlinked or
         // migrated by a concurrent op.
         let Some((cur_child, _)) = self.find_dentry_routed(v, local, &entry.name).await? else {
-            return Ok(());
+            return Ok(false);
         };
         if cur_child != entry.ino {
-            return Ok(());
+            return Ok(false);
         }
         let in_stripe = self.find_dentry_routed(sv, slocal, &entry.name).await?;
         let mut steps = Vec::with_capacity(2);
@@ -1635,7 +1641,7 @@ impl RoutedMetaBackend {
                         entry.name,
                         entry.ino
                     );
-                    return Ok(());
+                    return Ok(false);
                 }
                 let Some(loser) = self.volumes[cv].read_inode_value_routed(clocal).await? else {
                     // No record: the dangling name alone goes.
@@ -1650,7 +1656,7 @@ impl RoutedMetaBackend {
                         steps,
                     };
                     crossvol_tx::execute(self, &plan, guards).await?;
-                    return Ok(());
+                    return Ok(true);
                 };
                 log::warn!(
                     "directory {dir}: name {:?} names ino {} in its own tree and ino {winner} \
@@ -1688,7 +1694,7 @@ impl RoutedMetaBackend {
             entry.name,
             done.outcomes.iter().map(|o| o.status).collect::<Vec<_>>()
         );
-        Ok(())
+        Ok(true)
     }
 
     /// The map straight from the markers (no cache) — the migration's

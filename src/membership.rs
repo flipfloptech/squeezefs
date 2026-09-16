@@ -2664,10 +2664,13 @@ static DEPARTURE_SINKS: once_cell::sync::Lazy<arc_swap::ArcSwap<Vec<DepartureSin
 /// Additive: sinks accumulate for the process; each departure reaches
 /// every one, off the owner's cadence task or the leave's caller.
 pub fn install_departure_sink(sink: DepartureSink) {
-    let cur = DEPARTURE_SINKS.load();
-    let mut next: Vec<DepartureSink> = (**cur).clone();
-    next.push(sink);
-    DEPARTURE_SINKS.store(Arc::new(next));
+    // One RMW (`rcu`): two concurrent installs both land — a load / clone
+    // / store pair would lose one (review round 3, Issue 28).
+    DEPARTURE_SINKS.rcu(|cur| {
+        let mut next: Vec<DepartureSink> = (**cur).clone();
+        next.push(Arc::clone(&sink));
+        next
+    });
 }
 
 fn note_departure(id: &str) {

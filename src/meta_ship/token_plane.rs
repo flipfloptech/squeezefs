@@ -426,7 +426,11 @@ const RTT_PHASE_NAMES: [&str; RTT_PHASES] = ["send", "drain", "ack", "total"];
 /// reads it against the membership census: a live `Reader` member NOT in
 /// this set is an S5 reader, whose freed-offset protection is the ring's
 /// epoch law (review round 1, Issue 3). Process-global because one
-/// writer process holds every volume of its set.
+/// writer process holds every volume of its set. BOUNDED by the
+/// membership census: a member's id leaves the set at its departure
+/// (`note_member_departed`, after its grants are swept — review round 3,
+/// Issue 28), so churning reader identities over a long-lived writer
+/// never grow it past the live population.
 static TOKEN_CLIENTS: once_cell::sync::Lazy<scc::HashSet<String>> =
     once_cell::sync::Lazy::new(scc::HashSet::new);
 /// Bumped when a NEW token client is noted (review round 2, Issue 22:
@@ -483,7 +487,10 @@ pub fn register_holder(plane: &Arc<TokenHolderPlane>) {
 }
 
 /// The membership departure sink: sweep `client`'s grants on every
-/// armed holder (a member that is not a token client holds none).
+/// armed holder (a member that is not a token client holds none), then
+/// forget it as a token client — the registry stays bounded by the
+/// census, and a verb from the departed id meets the dispatch's
+/// membership check like any stranger's.
 fn note_member_departed(client: &str) {
     if !is_token_client(client) {
         return;
@@ -495,6 +502,9 @@ fn note_member_departed(client: &str) {
         .collect();
     for plane in planes {
         plane.sweep_departed(client);
+    }
+    if TOKEN_CLIENTS.remove_sync(client).is_some() {
+        TOKEN_CLIENTS_GENERATION.fetch_add(1, Ordering::Release);
     }
 }
 

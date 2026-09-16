@@ -2926,6 +2926,12 @@ async fn an_evicted_readers_grants_are_swept_at_the_owners_eviction_not_at_the_d
         owner.lease_deadline_ms(client).is_none(),
         "the owner no longer lists it"
     );
+    // The token-client registry is bounded by the census (review round 3,
+    // Issue 28): the departed member's id left it with its grants.
+    assert!(
+        !squeezefs::meta_ship::token_plane::is_token_client(client),
+        "a departed member is no longer a token client"
+    );
     let t = std::time::Instant::now();
     commit.await.unwrap().unwrap();
     assert!(

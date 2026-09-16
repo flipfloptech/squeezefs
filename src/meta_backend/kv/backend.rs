@@ -1095,6 +1095,11 @@ pub struct KvMetaBackend {
     /// directory listings filter children of those slots
     /// ([`Self::readdir_page`]). Never true on a write mount.
     non_writer: bool,
+    /// A read-only PROBE (`open_probe` — the offline fsck's, every listing
+    /// verb's): took no lock, spawned no checkpoint task, writes nothing at
+    /// teardown either. Distinct from `non_writer`, which a §4.11-degraded
+    /// WRITE mount shares while keeping its whole shutdown ladder.
+    probe: bool,
     /// WHY this volume is read-only. The write gate and the guarantee-class
     /// row both need to tell a §4.11 forward-compatibility degradation
     /// (unknown `features_ro` bits — an accident of the format) apart from
@@ -1819,7 +1824,9 @@ impl KvMetaBackend {
     /// process has live-mounted therefore cannot corrupt it. Dropping the
     /// returned backend releases everything (there is no task to join).
     pub async fn open_probe(path: &Path) -> std::result::Result<Arc<Self>, KvError> {
-        let be = Arc::new(Self::open_inner(path, OpenPosture::NonWriter).await?);
+        let mut inner = Self::open_inner(path, OpenPosture::NonWriter).await?;
+        inner.probe = true;
+        let be = Arc::new(inner);
         // PR M7: probes never mutate, but the conveyor identity is part
         // of construction (a commit without it fails loud, never UB).
         let _ = be.conveyor_self.set(Arc::downgrade(&be));
@@ -2876,6 +2883,7 @@ impl KvMetaBackend {
             needs_flush: AtomicBool::new(false),
             read_only,
             non_writer: replay_posture == OpenPosture::NonWriter,
+            probe: false,
             ro_cause,
             failed: AtomicBool::new(false),
             journal_failures: AtomicU64::new(0),
@@ -12291,20 +12299,26 @@ impl KvMetaBackend {
         // backend's shutdown is a NO-OP because it took nothing (§5.4's
         // rollback ladder). §4.11's unknown-ro degradation keeps its
         // shipped path: it is a WRITE mount holding Layer A, and its
-        // replay residue is its own to make durable.
+        // replay residue is its own to make durable — it joins its
+        // checkpoint task and runs the whole ladder below.
         //
         // A PROBE (`open_probe` — the offline fsck's, every listing verb's)
-        // is a non-writer too (PR 7b review round 1, Issue 21b's finding):
-        // it opens `Writable`/`read_only = false` with no checkpoint task,
-        // so without this arm its teardown took the `else` branch and
-        // WROTE a checkpoint — on a forest volume whose writer died with
-        // unpublished slot trees, a ledger record advancing the tail past
-        // the window records the probe's own replay SKIPPED (a non-writer
-        // never mints), so the writer's next own-residue open replayed
-        // nothing and every such inode was lost (dangling dentries, fsck
-        // C10). Pinned by `sym_dir_stripe_tests::
-        // a_probe_over_a_live_page_records_no_inode_plane_verdict`.
-        if self.non_writer
+        // is the fourth no-write posture (a SHIPPED-path fix, every layout
+        // — PR 7b review rounds 1–2): it opens `Writable`/`read_only =
+        // false` with no checkpoint task, so its teardown took the `else`
+        // branch and WROTE a checkpoint from a "read-only probe" on every
+        // offline `squeezefs fsck` — content-equivalent on a flat volume
+        // (the probe's replay is complete there), a LOSS on a forest whose
+        // writer died with unpublished slot trees: the ledger advanced
+        // past the window records the probe's own replay SKIPPED (a
+        // non-writer never mints), the writer's next own-residue open
+        // replayed nothing, every such inode was lost (fsck C10 dangling
+        // dentries). Keyed on the PROBE alone — never `non_writer`, which
+        // the §4.11-degraded writer shares. Pinned by
+        // `sym_dir_stripe_tests::{an_offline_probes_shutdown_writes_nothing,
+        // a_probe_over_a_live_page_records_no_inode_plane_verdict,
+        // a_degraded_writers_shutdown_runs_its_whole_ladder}`.
+        if self.probe
             || matches!(
                 self.ro_cause,
                 ReadOnlyCause::ReaderMount

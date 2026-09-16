@@ -449,6 +449,22 @@ pub fn coarse_realtime_ns() -> u64 {
     t.tv_sec.wrapping_mul(1_000_000_000).wrapping_add(t.tv_nsec) as u64
 }
 
+/// The per-SITE census behind `invariant_tripwires` (the total on the
+/// stats inode): what a contract reads to allow-list ONE known, routed
+/// tripwire by name while every other stays must-stay-0. The count is
+/// what a contract observes — never the first fire (a first fire's
+/// `insert` racing another's would drop one; `entry_sync` never does).
+static INVARIANT_TRIPWIRE_SITES: once_cell::sync::Lazy<
+    scc::HashMap<&'static str, std::sync::atomic::AtomicU64>,
+> = once_cell::sync::Lazy::new(scc::HashMap::new);
+
+/// How many times the tripwire `site` fired in this process.
+pub fn invariant_tripwire_count(site: &str) -> u64 {
+    INVARIANT_TRIPWIRE_SITES
+        .read_sync(site, |_, n| n.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 /// RES-22 (pre-RC engineering spec §7): report a runtime
 /// **concurrency-outcome** invariant violation — loud, counted, never
 /// fatal.
@@ -469,32 +485,15 @@ pub fn coarse_realtime_ns() -> u64 {
 /// Counted in `invariant_tripwires` (stats inode; **0 on a healthy
 /// daemon**). The log line is rate-limited to one per site per second so
 /// a violation that fires per-op cannot itself become the outage.
-/// The per-SITE census behind `invariant_tripwires` (the total on the
-/// stats inode): what a contract reads to allow-list ONE known, routed
-/// tripwire by name while every other stays must-stay-0.
-static INVARIANT_TRIPWIRE_SITES: once_cell::sync::Lazy<
-    scc::HashMap<&'static str, std::sync::atomic::AtomicU64>,
-> = once_cell::sync::Lazy::new(scc::HashMap::new);
-
-/// How many times the tripwire `site` fired in this process.
-pub fn invariant_tripwire_count(site: &str) -> u64 {
-    INVARIANT_TRIPWIRE_SITES
-        .read_sync(site, |_, n| n.load(std::sync::atomic::Ordering::Relaxed))
-        .unwrap_or(0)
-}
-
 pub fn note_invariant_tripwire(site: &'static str, detail: &str) {
     crate::fuse_client::METRICS
         .invariant_tripwires
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if INVARIANT_TRIPWIRE_SITES
-        .read_sync(&site, |_, n| {
-            n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        })
-        .is_none()
-    {
-        let _ = INVARIANT_TRIPWIRE_SITES.insert_sync(site, std::sync::atomic::AtomicU64::new(1));
-    }
+    INVARIANT_TRIPWIRE_SITES
+        .entry_sync(site)
+        .or_insert_with(|| std::sync::atomic::AtomicU64::new(0))
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static LAST: once_cell::sync::Lazy<scc::HashMap<&'static str, std::sync::atomic::AtomicU64>> =
         once_cell::sync::Lazy::new(scc::HashMap::new);
     let now = coarse_realtime_ns() / 1_000_000_000;

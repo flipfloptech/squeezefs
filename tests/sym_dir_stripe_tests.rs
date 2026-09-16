@@ -420,6 +420,16 @@ async fn probe_inode_plane(probe: &Arc<RoutedMetaBackend>) -> squeezefs::fsck::F
         .expect("the engine runs")
 }
 
+/// The whole volume image's hash (a 64 MiB file — the "wrote nothing"
+/// oracle).
+fn image_hash(uri: &str) -> u64 {
+    use std::hash::Hasher;
+    let bytes = std::fs::read(uri).expect("the volume image");
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write(&bytes);
+    h.finish()
+}
+
 /// The RAW dentry of `name` in `dir`'s own tree (markers included).
 async fn raw_entry(routed: &RoutedMetaBackend, dir: u64, name: &str) -> Option<u64> {
     let (v, local) = routed.route_ino(dir);
@@ -2383,9 +2393,136 @@ async fn stripe_dirs_at_mkdir_stripes_every_new_directory() {
     assert!(routed.stripe_map(sub).await.unwrap().is_some());
     assert_eq!(lookup_opt(&routed, d, "job-1").await, Some(sub));
     assert_eq!(routed.lookup(sub, "..").await.unwrap().ino, d);
+    // The DNE-2 default pays NO reverse dentry scan per mkdir (review
+    // round 2, Issue 24: the Issue-1 belt ran `find_parent_of_child` for
+    // every mkdir under `-o stripe_dirs`): the mkdir just named the
+    // directory under its parent, so the flip knows it is no stripe.
+    let scans_before = squeezefs::fuse_client::METRICS
+        .meta_parent_scans
+        .load(Ordering::Relaxed);
+    for i in 2..22 {
+        let j = routed
+            .create(d, &format!("job-{i}"), libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .unwrap()
+            .ino;
+        assert!(routed.stripe_map(j).await.unwrap().is_some());
+    }
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .meta_parent_scans
+            .load(Ordering::Relaxed),
+        scans_before,
+        "20 mkdirs under -o stripe_dirs ran no reverse dentry scan"
+    );
+    // The explicit flip of a stripe still runs the belt (one scan) and
+    // refuses; the automatic trigger's belt runs once per candidate.
+    let e = routed
+        .stripe_dir(map.stripes[0], 4)
+        .await
+        .expect_err("a stripe cannot carry a map");
+    assert!(e.to_string().contains("cannot carry a stripe map"), "{e}");
     routed.set_stripe_dirs_at_mkdir(false);
     shutdown(&routed).await;
     fsck_clean(&uris).await;
+}
+
+/// The offline probe's `shutdown` WRITES NOTHING (review round 2, Issue
+/// 23 — a SHIPPED-path fix, every layout: `open_probe` opened `Writable`
+/// with no checkpoint task, so `run_offline`'s `shutdown()` took the
+/// `checkpoint_now` arm and wrote a checkpoint from a "read-only probe"
+/// on every offline `squeezefs fsck` — content-equivalent on flat, the
+/// 50-inode loss on a forest). Bracketed FLAT and STAMPED: a writer
+/// dropped without shutdown (the crash-equivalent), the whole volume
+/// image hashed, a probe opened + the engine run + the probe shut down,
+/// the image hashed again — byte-identical.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_offline_probes_shutdown_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    for stamped in [false, true] {
+        let sub = dir.path().join(if stamped { "stamped" } else { "flat" });
+        std::fs::create_dir_all(&sub).unwrap();
+        let uris = vec![format_member(&sub, "meta0", stamped).await];
+        let routed = open_under(&uris, stamped, None).await;
+        let names = create_files(&routed, ROOT_INO, "p-", 30).await;
+        for v in &routed.volumes {
+            v.sync_device().await.unwrap();
+        }
+        // The crash-equivalent: no shutdown.
+        drop(routed);
+        let before = image_hash(&uris[0]);
+        let probe = squeezefs::meta_backend::open_probe_routed_meta_set(&uris)
+            .await
+            .expect("a probe over the crashed writer");
+        let report = probe_inode_plane(&probe).await;
+        for v in &probe.volumes {
+            v.shutdown().await.unwrap();
+        }
+        drop(probe);
+        assert_eq!(
+            image_hash(&uris[0]),
+            before,
+            "layout {}: the probe's open, census and shutdown wrote nothing",
+            if stamped { "forest" } else { "flat" }
+        );
+        if !stamped {
+            // A flat probe's replay is complete: the census covers the
+            // volume and finds nothing.
+            assert_eq!(report.counters.inode_plane_volumes_covered, 1);
+            assert!(!report.has_findings(), "{:?}", report.findings);
+        }
+        // The writer's own next open finds everything.
+        let routed = open_under(&uris, stamped, None).await;
+        assert_eq!(names_in(&routed, ROOT_INO).await, names);
+        shutdown(&routed).await;
+        drop(routed);
+        fsck_clean(&uris).await;
+    }
+}
+
+/// A §4.11-DEGRADED write mount (unknown `features_ro` bits) keeps its
+/// WHOLE shutdown ladder — it joins its checkpoint task and releases Layer
+/// A (review round 2, Issue 23: the round-2 predicate keyed on
+/// `non_writer`, which this mount shares with a probe, and returned early
+/// with the task unjoined and the flock held). Pinned by the one thing the
+/// ladder alone does: a second open of the volume, with the degraded
+/// backend still alive, succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_degraded_writers_shutdown_runs_its_whole_ladder() {
+    use squeezefs::meta_backend::kv::superblock::write_superblock_v3;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uri = format_member(dir.path(), "meta0", false).await;
+    let path = std::path::Path::new(&uri);
+    let be = KvMetaBackend::open(path).await.expect("writer");
+    be.create(ROOT_INO, "pre-ro", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    be.shutdown().await.unwrap();
+    let mut sb = be.superblock().clone();
+    drop(be);
+    sb.features_ro |= 1 << 5;
+    write_superblock_v3(path, &sb).await.unwrap();
+
+    let degraded = KvMetaBackend::open(path)
+        .await
+        .expect("the degraded writer opens");
+    assert_eq!(degraded.superblock().unknown_ro(), 1 << 5);
+    assert!(degraded.is_read_only());
+    degraded
+        .shutdown()
+        .await
+        .expect("the degraded writer's shutdown");
+    // The ladder released Layer A: a second open succeeds while the first
+    // backend is still alive (the early-return shape held the flock).
+    let again = KvMetaBackend::open(path).await.expect(
+        "Layer A released by the degraded writer's shutdown ladder — the flock must be gone",
+    );
+    assert!(again.lookup(ROOT_INO, "pre-ro").await.is_ok());
+    again.shutdown().await.unwrap();
+    drop(again);
+    drop(degraded);
 }
 
 /// The shipped postures: `SQUEEZEFS_SYMMETRIC_META=0` on a bit-17 volume
@@ -2457,6 +2594,37 @@ fn the_striping_family_is_exported_under_its_published_names() {
     assert_eq!(
         usize::from(STRIPES_MAX),
         squeezefs::meta_backend::MINT_SPREAD
+    );
+    // The module's constants are TIED (review round 2, Issue 26): drift
+    // is a red test and a stated decision.
+    assert_eq!(
+        dir_stripe::CENSUS_DIRS_MAX,
+        squeezefs::meta_backend::DERIVED_ROUTING_WIDTH as usize
+            / squeezefs::meta_backend::MINT_SPREAD,
+        "one hot directory per rotor-sized slice of the slot namespace"
+    );
+    assert_eq!(dir_stripe::CENSUS_DIRS_MAX, 1024);
+    assert_eq!(
+        dir_stripe::UNSTRIPED_CACHE_MAX,
+        squeezefs::meta_backend::DERIVED_ROUTING_WIDTH as usize,
+        "one negative hint per slot of the routing namespace"
+    );
+    assert_eq!(
+        dir_stripe::MIGRATION_SCAN_PAGE,
+        dir_stripe::MERGE_STREAM_PAGE_FLOOR * squeezefs::meta_backend::MINT_SPREAD,
+        "one merge-floor page per stripe of the widest map = the KV walkers' page"
+    );
+    assert_eq!(dir_stripe::MIGRATION_SCAN_PAGE, 512);
+    assert_eq!(
+        RoutedMetaBackend::MIGRATION_ROUNDS_MAX,
+        squeezefs::meta_backend::kv::checkpoint::COVER_CYCLES_MAX as usize,
+        "the bound every bounded cover loop of the program shares"
+    );
+    assert_eq!(
+        dir_stripe::MERGE_STREAM_PAGE_FLOOR,
+        8,
+        "the one SHAPE constant of the module — the smallest useful getdents page; a change \
+         is a stated decision"
     );
 }
 

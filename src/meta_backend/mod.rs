@@ -3191,7 +3191,7 @@ impl RoutedMetaBackend {
                 Err(e) => return Err(e),
             };
             if is_dir {
-                self.stripe_at_mkdir(made.ino).await;
+                self.stripe_at_mkdir(made.ino, logical_parent).await;
             }
             return Ok(made);
         }
@@ -3232,7 +3232,7 @@ impl RoutedMetaBackend {
                 if striped.is_some() {
                     self.note_dir_parent(made.ino, logical_parent, name);
                 }
-                self.stripe_at_mkdir(made.ino).await;
+                self.stripe_at_mkdir(made.ino, logical_parent).await;
             }
             Ok(made)
         } else {
@@ -3321,7 +3321,7 @@ impl RoutedMetaBackend {
 
             if is_dir_flag {
                 self.note_dir_parent(global_child_ino, logical_parent, name);
-                self.stripe_at_mkdir(global_child_ino).await;
+                self.stripe_at_mkdir(global_child_ino, logical_parent).await;
             }
             Ok(Inode {
                 ino: global_child_ino,
@@ -3433,7 +3433,6 @@ impl RoutedMetaBackend {
     /// turned out to be a directory under the guards and the lock is not
     /// held: the wrapper takes it and re-enters (the lock is OUTERMOST —
     /// taken after a 4a guard it would cycle with a peer's shipped step).
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     async fn rename_body(
         &self,

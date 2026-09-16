@@ -400,20 +400,23 @@ impl DirCensus {
     }
 }
 
-/// Directories the census tracks at most — one entry per hot shared
-/// directory; past it the least recently touched is evicted (the
-/// `REQUESTERS_PER_SLOT_MAX` posture one level up).
-const CENSUS_DIRS_MAX: usize = 1024;
+/// Directories the census tracks at most — one hot shared directory per
+/// rotor-sized slice of the slot namespace (`W / MINT_SPREAD` = 1,024):
+/// past it the least recently touched is evicted (the
+/// `REQUESTERS_PER_SLOT_MAX` posture one level up). Tie-tested.
+pub const CENSUS_DIRS_MAX: usize = super::DERIVED_ROUTING_WIDTH as usize / MINT_SPREAD;
 
-/// The migration scan's raw page: the KV walkers' page (`SCAN_PAGE` =
-/// 512 in `kv::backend` and `fsck`) — one bounded read per step, every
-/// page re-read at the next round.
-const MIGRATION_SCAN_PAGE: usize = 512;
+/// The migration scan's raw page: one merge-floor page per stripe of the
+/// widest map (`MERGE_STREAM_PAGE_FLOOR × MINT_SPREAD` = 512 — the KV
+/// walkers' page) — one bounded read per step, every page re-read at the
+/// next round. Tie-tested.
+pub const MIGRATION_SCAN_PAGE: usize = MERGE_STREAM_PAGE_FLOOR * MINT_SPREAD;
 
-/// The negative map cache's bound (the holder's "not striped" hints):
-/// a HINT flushed whole at the cap — 64 Ki entries × 16 B ≈ 1 MiB of RAM,
-/// re-learnt at one tree descent per directory.
-const UNSTRIPED_CACHE_MAX: usize = 65_536;
+/// The negative map cache's bound (the holder's "not striped" hints): one
+/// hint per slot of the routing namespace (`W` = 65,536; 24 B each ≈
+/// 1.5 MiB) — a HINT flushed whole at the cap, re-learnt at one tree
+/// descent per directory. Tie-tested.
+pub const UNSTRIPED_CACHE_MAX: usize = super::DERIVED_ROUTING_WIDTH as usize;
 
 /// The mount's striping state, one per [`RoutedMetaBackend`].
 pub struct StripeState {
@@ -423,10 +426,12 @@ pub struct StripeState {
     /// rmdir.
     maps: scc::HashMap<Ino, Arc<StripeMap>>,
     /// The HOLDER's negative cache: directories this mount holds whose
-    /// tree carries no commit marker. Only the holder flips a directory
-    /// it holds, so its own flip is the one invalidation (Issue 12);
-    /// consulted only while `served_here(dir)`.
-    unstriped: scc::HashMap<Ino, ()>,
+    /// tree carries no commit marker, stamped with the slot's lease
+    /// `(holder, g)` at the read. Only the holder flips a directory it
+    /// holds, so its own flip is the one invalidation (Issue 12); a hint
+    /// whose lease moved since (a handover round trip with a flip in
+    /// between — review round 2, Issue 26) reads as no hint.
+    unstriped: scc::HashMap<Ino, (u32, u32)>,
     /// Inos known to be STRIPES (learnt from every map read and every
     /// mint): never a flip candidate, never a census entry (Issue 1).
     known_stripes: scc::HashSet<Ino>,
@@ -478,11 +483,19 @@ impl StripeState {
         }
     }
 
-    fn note_unstriped(&self, dir: Ino) {
+    fn note_unstriped(&self, dir: Ino, lease: (u32, u32)) {
         if self.unstriped.len() >= UNSTRIPED_CACHE_MAX {
             self.unstriped.retain_sync(|_, _| false);
         }
-        let _ = self.unstriped.insert_sync(dir, ());
+        let _ = self.unstriped.insert_sync(dir, lease);
+    }
+
+    /// The hint for `dir` under the lease `(holder, g)` in force — `None`
+    /// when absent or stale.
+    fn unstriped_hint(&self, dir: Ino, lease: (u32, u32)) -> bool {
+        self.unstriped
+            .read_sync(&dir, |_, l| *l == lease)
+            .unwrap_or(false)
     }
 }
 
@@ -496,8 +509,10 @@ struct MergeStream {
 
 /// The smallest per-stream refill: the shipped readdir's smallest useful
 /// page (a `getdents` of a few entries) — below it the per-refill call
-/// overhead dominates the entries it returns.
-const MERGE_STREAM_PAGE_FLOOR: usize = 8;
+/// overhead dominates the entries it returns. A SHAPE constant (the one
+/// free number of the module), pinned by the tie test so a change is a
+/// red test and a stated decision.
+pub const MERGE_STREAM_PAGE_FLOOR: usize = 8;
 
 /// The 54-bit dentry hash a real-entry readdir cookie was issued for
 /// (the cookie is the dentry key suffix + the shipped bias; `0` for the
@@ -507,6 +522,20 @@ fn readdir_cookie_hash54(cookie: u64) -> u64 {
         Ok(super::kv::record::ReaddirPos::AfterEntry { hash54, .. }) => hash54,
         _ => 0,
     }
+}
+
+/// Whether a flip must run the "is this a STRIPE?" belt (the reverse
+/// dentry scan) before it mints anything: a caller that KNOWS the
+/// directory — the `mkdir` that just named it under its parent, the
+/// automatic trigger that ran the scan already — skips it; the explicit
+/// xattr has no such knowledge and checks once (review round 2, Issue 24:
+/// under `-o stripe_dirs` every mkdir paid a reverse scan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StripeBelt {
+    /// Run the reverse scan; refuse a stripe.
+    Check,
+    /// The caller established that `dir` is not a stripe.
+    KnownDirectory,
 }
 
 /// The flip decision the census answers (§5.6.5 "when to stripe"):
@@ -601,6 +630,19 @@ impl RoutedMetaBackend {
         }
     }
 
+    /// The lease `(holder, g)` of GLOBAL `ino`'s slot per tree 0 — `(0, 0)`
+    /// unarmed / unleased. The negative map cache's stamp.
+    fn lease_of(&self, ino: Ino) -> (u32, u32) {
+        let (v, local) = self.route_ino(ino);
+        let Some(plane) = self.volumes.get(v).and_then(|vol| vol.slot_leases()) else {
+            return (0, 0);
+        };
+        match plane.table.resolve(forest_slot_of_ino(local)) {
+            crate::slot_lease_core::Resolved::Holder { holder, g } => (holder, g),
+            _ => (0, 0),
+        }
+    }
+
     /// Is GLOBAL `ino`'s slot served by THIS process (its own region or a
     /// declared one — the door's "leased here")?
     fn served_here(&self, ino: Ino) -> bool {
@@ -629,12 +671,13 @@ impl RoutedMetaBackend {
             return Ok(Some(m));
         }
         let holder = self.served_here(dir);
-        if holder && self.dir_stripes.unstriped.contains_sync(&dir) {
+        let lease = self.lease_of(dir);
+        if holder && self.dir_stripes.unstriped_hint(dir, lease) {
             return Ok(None);
         }
         let Some(map) = self.read_map_from_markers(dir, v, local).await? else {
             if holder {
-                self.dir_stripes.note_unstriped(dir);
+                self.dir_stripes.note_unstriped(dir, lease);
             }
             return Ok(None);
         };
@@ -863,8 +906,9 @@ impl RoutedMetaBackend {
 
     /// Is GLOBAL `ino` a STRIPE (a nameless directory some map names)?
     /// The known set first (learnt from every map read and mint); else
-    /// the reverse dentry scan — affordable where it runs (a flip
-    /// decision, never a per-op path), and learnt once.
+    /// the reverse dentry scan — run ONCE per flip candidate the caller
+    /// cannot vouch for (the automatic trigger's spawn, the explicit
+    /// xattr), never on a per-op path and never at `mkdir`, and learnt.
     pub async fn is_stripe(&self, ino: Ino) -> Result<bool> {
         if self.dir_stripes.known_stripes.contains_sync(&ino) {
             return Ok(true);
@@ -911,7 +955,7 @@ impl RoutedMetaBackend {
             .get(&dir)
             .map(|c| c.heaviest().into_iter().map(|(c, _)| c).collect())
             .unwrap_or_default();
-        self.flip_dir(dir, k, &creators).await
+        self.flip_dir(dir, k, &creators, StripeBelt::Check).await
     }
 
     /// [`Self::stripe_dir`] with the suppliers NAMED — a CONTRACT face
@@ -924,7 +968,7 @@ impl RoutedMetaBackend {
         k: u16,
         suppliers: &[u32],
     ) -> Result<()> {
-        self.flip_dir(dir, k, suppliers).await
+        self.flip_dir(dir, k, suppliers, StripeBelt::Check).await
     }
 
     /// The refusal every flip of a STRIPE answers (Issue 1: a stripe
@@ -932,9 +976,14 @@ impl RoutedMetaBackend {
     /// so a nested map would strand every name of the stripe).
     fn stripe_cannot_carry_a_map(dir: Ino, of: Ino) -> SqueezefsError {
         SqueezefsError::InvalidOperation(format!(
-            "ino {dir} is a directory STRIPE of directory {of} and cannot carry a stripe map \
-             of its own (design-symmetric-metadata §5.6.5: a stripe's names route by its \
-             directory's map alone)"
+            "ino {dir} is a directory STRIPE{} and cannot carry a stripe map of its own \
+             (design-symmetric-metadata §5.6.5: a stripe's names route by its directory's map \
+             alone)",
+            if of == 0 {
+                String::new()
+            } else {
+                format!(" of directory {of}")
+            }
         ))
     }
 
@@ -944,9 +993,11 @@ impl RoutedMetaBackend {
     /// `migrating` flag, the COMMIT marker LAST — so a reader sees
     /// either no map or the whole map, and a kill at any step rolls
     /// forward to the whole map; then the lazy migration, in the
-    /// background. A STRIPE is never a candidate (the belt behind the
-    /// census's own skip).
-    async fn flip_dir(&self, dir: Ino, k: u16, creators: &[u32]) -> Result<()> {
+    /// background. A STRIPE is never a candidate: `belt` says whether
+    /// this call must run the reverse scan to know (the explicit xattr) or
+    /// the caller already knows (the mkdir that named the directory, the
+    /// trigger that scanned).
+    async fn flip_dir(&self, dir: Ino, k: u16, creators: &[u32], belt: StripeBelt) -> Result<()> {
         let (v, local) = self.route_ino(dir);
         self.check_volume_enabled(v)?;
         if !self.stripes_armed(v) {
@@ -976,10 +1027,16 @@ impl RoutedMetaBackend {
         if self.stripe_map(dir).await?.is_some() {
             return Ok(());
         }
-        if let Some(of) = self.stripe_parent_dir(dir).await? {
-            self.dir_stripes.learn_stripes(&[dir]);
+        if self.dir_stripes.known_stripes.contains_sync(&dir) {
             self.dir_stripes.census().remove(&dir);
-            return Err(Self::stripe_cannot_carry_a_map(dir, of));
+            return Err(Self::stripe_cannot_carry_a_map(dir, 0));
+        }
+        if belt == StripeBelt::Check {
+            if let Some(of) = self.stripe_parent_dir(dir).await? {
+                self.dir_stripes.learn_stripes(&[dir]);
+                self.dir_stripes.census().remove(&dir);
+                return Err(Self::stripe_cannot_carry_a_map(dir, of));
+            }
         }
         // Single-flight per directory: a second trigger while the flip
         // runs (a storm of served inserts) joins nothing and does nothing.
@@ -1382,7 +1439,15 @@ impl RoutedMetaBackend {
                         return;
                     }
                 }
-                if let Err(e) = me.flip_dir(d.dir, stripe_count(), &d.creators).await {
+                if let Err(e) = me
+                    .flip_dir(
+                        d.dir,
+                        stripe_count(),
+                        &d.creators,
+                        StripeBelt::KnownDirectory,
+                    )
+                    .await
+                {
                     log::warn!("automatic stripe flip of directory {} declined: {e}", d.dir);
                 }
             });
@@ -1466,8 +1531,9 @@ impl RoutedMetaBackend {
     /// own tree behind the scan (a create parked on `I{dir}` across the
     /// flip, a stale-route insert) is moved and the scan repeated; past
     /// the bound the flag stays (resumed at the next access) — a clear is
-    /// never blind (Issue 4c).
-    const MIGRATION_ROUNDS_MAX: usize = 64;
+    /// never blind (Issue 4c). The bound every bounded cover loop of the
+    /// program shares (`checkpoint::COVER_CYCLES_MAX` = 64). Tie-tested.
+    pub const MIGRATION_ROUNDS_MAX: usize = super::kv::checkpoint::COVER_CYCLES_MAX as usize;
 
     async fn migrate_dir_inner(&self, dir: Ino) -> Result<u64> {
         let (v, local) = self.route_ino(dir);
@@ -1760,7 +1826,9 @@ impl RoutedMetaBackend {
             else {
                 break;
             };
-            let (cookie, entry) = streams[next].buf.pop_front().expect("a head was seen");
+            let Some((cookie, entry)) = streams[next].buf.pop_front() else {
+                break;
+            };
             if next == own {
                 // `dir`'s own copy of a name its stripe holds too is the
                 // LWW loser: the stripe's entry (same hash, so adjacent
@@ -2283,8 +2351,11 @@ impl RoutedMetaBackend {
         .await?;
         self.dir_stripes.census().remove(&dir);
         drop(guards);
-        // Hygiene: the marked stripes' records.
+        // Hygiene: the marked stripes' records — and the known-stripe set
+        // forgets them whatever their holder (a foreign destroy never
+        // reaches the local prune).
         for stripe in &map.stripes {
+            self.dir_stripes.known_stripes.remove_sync(stripe);
             if let Err(e) = self.destroy_stripe(*stripe).await {
                 log::warn!(
                     "rmdir {dir}: stripe {stripe} not destroyed ({e}) — an nlink-0 corpse named \
@@ -2302,10 +2373,12 @@ impl RoutedMetaBackend {
     }
 
     /// The `mkdir`-time flip under `-o stripe_dirs`: stripe the new
-    /// directory when the option is on and its volume is armed. Failure
-    /// is logged, never the mkdir's error (the directory exists; the
-    /// automatic trigger can still flip it later).
-    pub async fn stripe_at_mkdir(&self, dir: Ino) {
+    /// directory when the option is on and its volume is armed. The mkdir
+    /// JUST NAMED `dir` under `parent`, so it is a directory and never a
+    /// stripe — no reverse scan runs here (Issue 24: the DNE-2 default paid
+    /// one per mkdir). Failure is logged, never the mkdir's error (the
+    /// directory exists; the automatic trigger can still flip it later).
+    pub async fn stripe_at_mkdir(&self, dir: Ino, parent: Ino) {
         if !self.stripe_dirs_at_mkdir() {
             return;
         }
@@ -2313,8 +2386,13 @@ impl RoutedMetaBackend {
         if !self.stripes_armed(v) || stripe_count() <= 1 {
             return;
         }
-        if let Err(e) = self.flip_dir(dir, stripe_count(), &[]).await {
-            log::warn!("-o stripe_dirs: directory {dir} not striped at mkdir ({e})");
+        if let Err(e) = self
+            .flip_dir(dir, stripe_count(), &[], StripeBelt::KnownDirectory)
+            .await
+        {
+            log::warn!(
+                "-o stripe_dirs: directory {dir} (under {parent}) not striped at mkdir ({e})"
+            );
         }
     }
 

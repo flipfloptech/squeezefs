@@ -21694,7 +21694,11 @@ impl KvMetaBackend {
 
     /// The composed-view refs walk over an EXPLICIT head map — the
     /// blob-aware compose arms (rung 20 residual 1) hand it the FULL
-    /// rehydrated map, [`Self::recompute_chained_refs`] the inline head.
+    /// rehydrated map, the private `recompute_chained_refs` the inline head.
+    /// `pub` for PR 9's translator contract (`tests/sym_custody_tests.rs`
+    /// drives it with a bare resolver) — the link above is plain text
+    /// because a public item's doc may not link a private one under the
+    /// rustdoc gate.
     /// Identical in-order composed-view transitions + the caller
     /// `is_map_blob()` verbatim-extend; `None` = no resolver armed (the
     /// caller's ops stand, byte-identical to the pre-rung-19 shape).

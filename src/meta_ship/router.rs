@@ -631,6 +631,12 @@ impl MetaShipRouter {
         ops: Vec<MetaOp>,
     ) -> Result<Vec<MetaOpResult>> {
         let t_encode = Instant::now();
+        // Both terms of the coalesce factor (`batched_verbs ÷ batches`) —
+        // this venue's frames count like the drain's (review round 4,
+        // Issue 29).
+        super::BATCHES.fetch_add(1, Ordering::Relaxed);
+        super::BATCHED_VERBS.fetch_add(ops.len() as u64, Ordering::Relaxed);
+        super::PIPELINED_BATCHES.fetch_add(1, Ordering::Relaxed);
         let body = encode_request(&MetaRequestFrame {
             schema: META_SHIP_SCHEMA,
             client_epoch: self.client_epoch,
@@ -639,8 +645,6 @@ impl MetaShipRouter {
             ops,
         })?;
         super::phase_record(ShipPhase::Encode, t_encode);
-        super::BATCHES.fetch_add(1, Ordering::Relaxed);
-        super::PIPELINED_BATCHES.fetch_add(1, Ordering::Relaxed);
         let mut last: Option<SqueezefsError> = None;
         for attempt in 0..2 {
             let live = lane.mux.lock().clone().filter(|s| !s.is_dead());

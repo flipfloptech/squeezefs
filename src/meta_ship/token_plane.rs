@@ -421,6 +421,12 @@ const RTT_TOTAL: usize = 3;
 const RTT_PHASES: usize = 4;
 const RTT_PHASE_NAMES: [&str; RTT_PHASES] = ["send", "drain", "ack", "total"];
 
+/// Test seam: the token dispatch parks this many ms between its
+/// membership check and the grant's registration (review round 4, Issue
+/// 29 — an eviction inside that window must leave the grant judged
+/// `Expired`, never `Unknown`).
+pub static TEST_DISPATCH_HOLD_AFTER_CHECK_MS: AtomicU64 = AtomicU64::new(0);
+
 /// The token CLIENTS this process's holder planes have served — every
 /// member id that reached a token verb. `free_grace`'s recall-gated free
 /// reads it against the membership census: a live `Reader` member NOT in
@@ -643,18 +649,17 @@ impl TokenHolderPlane {
         match crate::membership::installed_owner() {
             // A member whose lease deadline is still ahead of the owner's
             // clock is LIVE; one past it is EXPIRED. One the owner does
-            // NOT list: a token client was required to be a member at its
-            // arm, so a token client the owner no longer lists has LEFT or
-            // been EVICTED (the cadence sweep removes a member the moment
-            // its lease passes) — EXPIRED (review round 2, Issue 5: the
-            // `Unknown` verdict here was waited like live to the deadline);
-            // a client that never reached this holder's service has no
-            // lease to read.
+            // NOT list is EXPIRED too: the dispatch grants members only
+            // (review round 3, Issue 27), so any holder the owner does not
+            // list has LEFT or been EVICTED (the cadence sweep removes a
+            // member the moment its lease passes) — never waited like
+            // live to the deadline (review round 2, Issue 5; round 4,
+            // Issue 29: the `is_token_client` qualifier this arm once
+            // carried re-opened a sub-ms window at the departure prune,
+            // and with Issue 27 it carries no information).
             Some(owner) => match owner.lease_deadline_ms(client) {
                 Some(deadline) if owner.now_ms() < deadline => LeaseVerdict::Live,
-                Some(_) => LeaseVerdict::Expired,
-                None if is_token_client(client) => LeaseVerdict::Expired,
-                None => LeaseVerdict::Unknown,
+                Some(_) | None => LeaseVerdict::Expired,
             },
             // No membership plane: no lease to outlive — the derived bound
             // is the token's expiry.
@@ -1163,30 +1168,40 @@ impl TokenService {
                     .to_string(),
             );
         }
-        // The membership lease FIRST (review round 3, Issue 27): where an
-        // owner is installed, a caller it does not list holds no lease the
-        // recall could judge — refused before it is granted anything or
-        // registered as a token client. Without an owner (the in-process
-        // contracts, a plane with no membership) nothing is checked.
-        if let Some(owner) = crate::membership::installed_owner() {
-            if owner.lease_deadline_ms(&frame.client).is_none() {
-                plane.nonmember_refusals.fetch_add(1, Ordering::Relaxed);
-                return Self::refuse(
-                    req_id,
-                    STATUS_REFUSED,
-                    format!(
-                        "client '{}' holds no membership lease with this set's owner — a read \
-                         token is granted to members only (join through the membership plane \
-                         first)",
-                        frame.client
-                    ),
-                );
-            }
+        // The membership lease FIRST (review round 3, Issue 27), through
+        // the ONE accessor the recall judges by (`lease_verdict` — round
+        // 4, Issue 30: a member whose deadline has passed but whose
+        // eviction sweep has not run yet is refused a beat earlier): a
+        // caller whose lease the installed owner sees EXPIRED — or does
+        // not list — is refused before it is granted anything or
+        // registered as a token client. `Unknown` (no owner, no oracle:
+        // the in-process contracts, a plane with no membership) checks
+        // nothing.
+        if plane.lease_verdict(&frame.client) == LeaseVerdict::Expired {
+            plane.nonmember_refusals.fetch_add(1, Ordering::Relaxed);
+            return Self::refuse(
+                req_id,
+                STATUS_REFUSED,
+                format!(
+                    "client '{}' holds no live membership lease with this set's owner — a read \
+                     token is granted to members only (join through the membership plane \
+                     first)",
+                    frame.client
+                ),
+            );
         }
         // Every verb names its client: a member that reached this service
         // is a TOKEN client — the class the recall-gated free bypasses the
         // ring for (an S5 reader never dials it).
         note_token_client(&frame.client);
+        // Test seam (review round 4, Issue 29's pin): park the dispatch
+        // here — after the membership check and the client's registration,
+        // before the grant's — so an eviction (its sweep + prune) can run
+        // inside the window.
+        let hold = TEST_DISPATCH_HOLD_AFTER_CHECK_MS.load(Ordering::Relaxed);
+        if hold > 0 {
+            squeezefs_ipc::sqz_time::sleep(Duration::from_millis(hold)).await;
+        }
         let reply = match &frame.call {
             TokenCall::Grant {
                 object,

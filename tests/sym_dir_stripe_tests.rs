@@ -10,8 +10,10 @@
 //! reserved-name (NUL-led) dentries in `D`'s own tree written as ONE PR 6
 //! intent (the commit marker LAST), names re-home lazily under a
 //! `migrating` flag, `readdir` merges the `K` stripes in the shipped
-//! cookie order, and `rmdir` marks every stripe dying under `D`'s
-//! exclusive guard before it probes them empty.
+//! cookie order, and `rmdir` probes every stripe empty under ONE
+//! exclusive guard set and removes the directory, its markers and the
+//! stripes' counts in ONE intent (the dying mark an insert parked behind
+//! it is refused by).
 //!
 //! **The multi-holder shape** is PR 6's: ONE process holds region 0 (the
 //! manager) and the DECLARED regions (`SQUEEZEFS_TEST_SYM_APPENDER_SLOTS`),
@@ -30,7 +32,8 @@ use squeezefs::meta_backend::crossvol_tx::{
 };
 use squeezefs::meta_backend::dir_stripe::{
     self, is_marker_name, stripe_of, stripe_stats, DIR_STRIPES_ENV, MIGRATING_MARKER,
-    STRIPED_MARKER, STRIPES_MAX, TEST_STRIPE_HOLD_MIGRATION,
+    STRIPED_MARKER, STRIPES_MAX, TEST_STRIPE_HOLD_MIGRATION, TEST_STRIPE_RMDIR_GUARDS_HELD,
+    TEST_STRIPE_RMDIR_HOLD_MS,
 };
 use squeezefs::meta_backend::kv::appender::TEST_APPENDER_SLOTS_ENV;
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
@@ -377,6 +380,63 @@ async fn raw_names(routed: &RoutedMetaBackend, dir: u64) -> Vec<String> {
     out
 }
 
+/// The fsck engine's INODE PLANE over an already-open probe set (the
+/// `run_offline` harness's own context minus its live-client preflight,
+/// which this process's live pid trips): a data router with no staging,
+/// the inode-plane-only options.
+async fn probe_inode_plane(probe: &Arc<RoutedMetaBackend>) -> squeezefs::fsck::FsckReport {
+    let dlm = squeezefs::dlm::DlmClient::new().unwrap();
+    let alloc = Arc::new(
+        squeezefs::block_allocator::BlockAllocator::new("vol-probe")
+            .await
+            .unwrap(),
+    );
+    let dev = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new("/dev/null"));
+    let cache = squeezefs::cache::TieredCache::new(
+        Vec::new(),
+        Some("64MB"),
+        Some("64MB"),
+        None,
+        None,
+        alloc.clone(),
+        dev.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let router = squeezefs::routing::DataRouter::new(dlm, cache, alloc, dev);
+    router.set_meta_backend(Arc::clone(probe));
+    let ctx = squeezefs::fsck::FsckCtx {
+        meta: Arc::clone(probe),
+        router,
+        staging_dirs: Vec::new(),
+        expected_generation: None,
+    };
+    let mut opts = squeezefs::fsck::FsckOptions::offline();
+    opts.settle = std::time::Duration::from_millis(10);
+    opts.inode_plane_only = true;
+    squeezefs::fsck::run(&ctx, &opts)
+        .await
+        .expect("the engine runs")
+}
+
+/// The RAW dentry of `name` in `dir`'s own tree (markers included).
+async fn raw_entry(routed: &RoutedMetaBackend, dir: u64, name: &str) -> Option<u64> {
+    let (v, local) = routed.route_ino(dir);
+    let mut cursor = 0u64;
+    loop {
+        let page = routed.volumes[v]
+            .readdir_page(local, cursor, 512)
+            .await
+            .expect("raw page");
+        let (last, _) = page.last()?;
+        cursor = *last;
+        if let Some((_, e)) = page.iter().find(|(_, e)| e.name == name) {
+            return Some(e.ino);
+        }
+    }
+}
+
 /// Wait for a flip's BACKGROUND migration to clear the flag (bounded).
 async fn wait_migrated(routed: &RoutedMetaBackend, dir: u64) {
     for _ in 0..800 {
@@ -397,6 +457,10 @@ async fn lookup_opt(routed: &RoutedMetaBackend, parent: u64, name: &str) -> Opti
     routed.lookup(parent, name).await.ok().map(|i| i.ino)
 }
 
+/// The offline census as the contracts' oracle: clean, AND a census —
+/// the inode plane recorded a verdict for every volume (a probe over an
+/// uncovered ring window records none, so a silently skipped plane can
+/// never read as "clean" — review round 1, Issue 21c).
 async fn fsck_clean(uris: &[String]) {
     let mut opts = squeezefs::fsck::FsckOptions::offline();
     opts.settle = std::time::Duration::from_millis(10);
@@ -412,7 +476,45 @@ async fn fsck_clean(uris: &[String]) {
         report.counters.stripe_findings, 0,
         "fsck_stripe_findings must stay 0"
     );
+    assert_eq!(
+        report.counters.inode_plane_volumes_covered,
+        uris.len() as u64,
+        "the inode plane recorded a verdict for every volume (an uncovered window is not a \
+         census)"
+    );
 }
+
+/// The leave COVERED — asserted before the census (Issue 21c): a writer
+/// re-open under the same partition finds NO own residue to replay
+/// (`appender_self_recoveries == 0` — the belt gauge of an uncovered
+/// leave: PR 3's grant path × PR 2's leave law), leaves again cleanly,
+/// then the offline probe's census is a census.
+async fn fsck_clean_covered(uris: &[String], partition: Option<&str>) {
+    let routed = open_under(uris, true, partition).await;
+    for (i, v) in routed.volumes.iter().enumerate() {
+        let s = v.appender_stats().expect("a forest volume");
+        assert_eq!(
+            s.self_recoveries, 0,
+            "volume {i}: the previous leave left an UNCOVERED ring (own residue replayed at \
+             this open) — the shutdown fixpoint did not converge: {s:?}"
+        );
+        assert_eq!(
+            s.dependency_stalls, 0,
+            "volume {i}: manager_dependency_stalls must stay 0 at the sized grant: {s:?}"
+        );
+    }
+    shutdown(&routed).await;
+    drop(routed);
+    fsck_clean(uris).await;
+}
+
+/// PR 6's `xv_local_step_unguarded` tripwire fires on EVERY cross-owner
+/// create (the child ino is allocated inside `create_in_foreign_directory`
+/// AFTER the op's guards, so the local `CreateInode` step's `I{child}` is
+/// never in the scope's local set — pre-existing, PR 6's own; routed to
+/// its owner / PR 12 in the review file, Issue 22). It is allow-listed BY
+/// NAME: every other tripwire in this process must be 0.
+const ROUTED_TRIPWIRE: &str = "xv_local_step_unguarded";
 
 fn assert_closed(what: &str) {
     let s = cross_owner_stats();
@@ -425,6 +527,15 @@ fn assert_closed(what: &str) {
     assert_eq!(
         s.intents_stuck, 0,
         "{what}: xv_cross_owner_intents_stuck must stay 0"
+    );
+    let total = squeezefs::fuse_client::METRICS
+        .invariant_tripwires
+        .load(Ordering::Relaxed);
+    let routed = squeezefs::invariant_tripwire_count(ROUTED_TRIPWIRE);
+    assert_eq!(
+        total, routed,
+        "{what}: invariant_tripwires must stay 0 beyond the routed `{ROUTED_TRIPWIRE}` \
+         (total {total}, routed {routed})"
     );
 }
 
@@ -878,12 +989,43 @@ async fn a_name_in_both_homes_during_migration_is_served_from_the_stripe() {
 // rmdir (R26) and the attribute fold.
 // ---------------------------------------------------------------------------
 
-/// `rmdir` of a striped directory: a non-empty one answers `ENOTEMPTY`
-/// and leaves every stripe live (a create still lands); an empty one
-/// removes the directory, its markers and every stripe record; a create
-/// into a stripe an rmdir has MARKED dying is refused `ENOENT`
-/// (`dir_stripe_dying_refusals`) — the schedule R26 names, pinned by
-/// running the mark and the create in sequence.
+/// Hold a striped `rmdir` between its probes and its intent for the
+/// test's life; released on drop.
+struct HoldRmdir;
+
+impl HoldRmdir {
+    fn arm(ms: u64) -> Self {
+        TEST_STRIPE_RMDIR_GUARDS_HELD.store(false, Ordering::SeqCst);
+        TEST_STRIPE_RMDIR_HOLD_MS.store(ms, Ordering::SeqCst);
+        Self
+    }
+    async fn wait_held(&self) {
+        for _ in 0..400 {
+            if TEST_STRIPE_RMDIR_GUARDS_HELD.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the rmdir never reached its hold");
+    }
+}
+
+impl Drop for HoldRmdir {
+    fn drop(&mut self) {
+        TEST_STRIPE_RMDIR_HOLD_MS.store(0, Ordering::SeqCst);
+        TEST_STRIPE_RMDIR_GUARDS_HELD.store(false, Ordering::SeqCst);
+    }
+}
+
+/// `rmdir` of a striped directory (R26, review round 1 Issues 2 / 6): a
+/// non-empty one answers `ENOTEMPTY` having written NOTHING (every stripe
+/// still `nlink 2`, a create still lands); an empty one removes the
+/// directory, its markers and every stripe record in ONE intent; and
+/// every stripe-entering mutation that RACES the rmdir — a `create`, a
+/// `link` and a `rename` into the directory, parked behind the rmdir's
+/// exclusive stripe guards while it holds them — is refused `ENOENT`
+/// after it (`dir_stripe_dying_refusals` + 3), never landed in a
+/// destroyed stripe.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rmdir_of_a_striped_directory_never_races_a_create() {
     let dir = tempfile::tempdir().unwrap();
@@ -902,40 +1044,75 @@ async fn rmdir_of_a_striped_directory_never_races_a_create() {
         .expect("create");
     let map = routed.stripe_map(victim).await.unwrap().unwrap();
 
-    // Non-empty: ENOTEMPTY, stripes revived, creates still land.
+    // Non-empty: ENOTEMPTY with nothing written — every stripe live,
+    // creates still land.
     let e = routed.unlink(work, "victim").await.expect_err("non-empty");
     assert_eq!(e.to_errno(), libc::ENOTEMPTY, "{e}");
     for s in &map.stripes {
-        assert_eq!(routed.getattr(*s).await.unwrap().nlink, 2, "revived");
+        assert_eq!(routed.getattr(*s).await.unwrap().nlink, 2, "untouched");
     }
     routed
         .create(victim, "more", libc::S_IFREG | 0o644, 0, 0)
         .await
         .expect("creates still land after a refused rmdir");
     assert_eq!(lookup_opt(&routed, work, "victim").await, Some(victim));
-
-    // The R26 schedule: the mark lands, then a create arrives.
     routed.unlink(victim, "keep").await.expect("unlink");
     routed.unlink(victim, "more").await.expect("unlink");
+
+    // The R26 schedule: the rmdir holds its guards (the probes done, the
+    // intent not yet written); a create, a link and a rename into the
+    // directory arrive meanwhile and park on the stripes' guards; the
+    // rmdir's intent lands; every parked insert resumes to a parent
+    // whose record reads `nlink 0` and refuses `ENOENT`.
+    let src = routed
+        .create(work, "src-file", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("a file to link and rename")
+        .ino;
+    routed
+        .create(work, "moved", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("a file to rename in");
     let before = stripe_stats();
-    routed
-        .prepare_striped_rmdir(victim, &map)
+    let hold = HoldRmdir::arm(600);
+    let r = Arc::clone(&routed);
+    let rmdir = tokio::spawn(async move { r.unlink(work, "victim").await });
+    hold.wait_held().await;
+    let r1 = Arc::clone(&routed);
+    let create = tokio::spawn(async move {
+        r1.create(victim, "late", libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .map(|_| ())
+    });
+    let r2 = Arc::clone(&routed);
+    let link = tokio::spawn(async move { r2.link(src, victim, "late-link").await.map(|_| ()) });
+    let r3 = Arc::clone(&routed);
+    let rename =
+        tokio::spawn(async move { r3.rename(work, "moved", victim, "late-moved", 0).await });
+    rmdir
         .await
-        .expect("mark + probe");
-    let e = routed
-        .create(victim, "late", libc::S_IFREG | 0o644, 0, 0)
-        .await
-        .expect_err("a create after the mark is refused");
-    assert_eq!(e.to_errno(), libc::ENOENT, "{e}");
-    assert_eq!(stripe_stats().dying_refusals - before.dying_refusals, 1);
-    // The removal proper (the FUSE rmdir's unlink): the protocol re-runs
-    // over the already-marked stripes, removes the name, then the
-    // markers and the stripes.
-    routed
-        .unlink(work, "victim")
-        .await
-        .expect("the directory's own removal");
+        .unwrap()
+        .expect("the rmdir completes over the parked inserts");
+    drop(hold);
+    for (what, out) in [
+        ("create", create.await.unwrap()),
+        ("link", link.await.unwrap()),
+        ("rename", rename.await.unwrap()),
+    ] {
+        let e = out.expect_err(&format!("{what} into the removed directory is refused"));
+        assert_eq!(e.to_errno(), libc::ENOENT, "{what}: {e}");
+    }
+    assert_eq!(stripe_stats().dying_refusals - before.dying_refusals, 3);
     assert_eq!(lookup_opt(&routed, work, "victim").await, None);
+    assert!(
+        lookup_opt(&routed, work, "moved").await.is_some(),
+        "the refused rename left its source in place"
+    );
+    assert_eq!(
+        routed.getattr(src).await.unwrap().nlink,
+        1,
+        "the refused link counted nothing"
+    );
     for s in &map.stripes {
         let (v, local) = routed.route_ino(*s);
         assert!(
@@ -950,6 +1127,137 @@ async fn rmdir_of_a_striped_directory_never_races_a_create() {
     assert_eq!(stripe_stats().rmdirs - before.rmdirs, 1);
     assert_eq!(open_intents(&routed).await, 0);
     assert_closed("rmdir");
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
+/// A striped `rmdir` KILLED at every step of its ONE intent (review round
+/// 1, Issue 2 — the first build's mark was its own retired intent, and a
+/// kill after it left `nlink 0` stripes under a LIVE map for the corpse
+/// sweep to destroy): the next lessee rolls the removal FORWARD whole —
+/// the name gone from its parent, every marker gone, every stripe
+/// `nlink 0` or destroyed, no C9/C10/C17 finding — and a sibling striped
+/// directory on the same volume stays fully usable (a create lands, its
+/// names resolve).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_killed_striped_rmdir_rolls_forward_whole_at_every_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let k: u16 = 3;
+    // Steps: the parent dentry, the commit marker, K stripe entries, K
+    // marks, D's own count (the migration finished, so no flag step).
+    let steps = 1 + 1 + usize::from(k) + usize::from(k) + 1;
+    for sever_after in [1usize, 2, 3, steps - 1, steps] {
+        let sub = dir.path().join(format!("w{sever_after}"));
+        std::fs::create_dir_all(&sub).unwrap();
+        let (uris, routed, work) = solo_armed(&sub).await;
+        let victim = routed
+            .create(work, "victim", libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .unwrap()
+            .ino;
+        let sibling = routed
+            .create(work, "sibling", libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .unwrap()
+            .ino;
+        for d in [victim, sibling] {
+            routed.stripe_dir(d, k).await.unwrap();
+            wait_migrated(&routed, d).await;
+        }
+        let kept = create_files(&routed, sibling, "s-", 5).await;
+        let map = routed.stripe_map(victim).await.unwrap().unwrap();
+        TEST_XV_SEAM_AFTER_STEPS.store(sever_after as u64 + 1, Ordering::SeqCst);
+        let r = routed.unlink(work, "victim").await;
+        TEST_XV_SEAM_AFTER_STEPS.store(0, Ordering::SeqCst);
+        assert!(r.is_err(), "window {sever_after}: the rmdir was severed");
+        assert_eq!(open_intents(&routed).await, 1, "window {sever_after}");
+        shutdown(&routed).await;
+        drop(routed);
+
+        let routed = open_under(&uris, true, None).await;
+        assert_eq!(
+            open_intents(&routed).await,
+            0,
+            "window {sever_after}: rolled forward at the next open"
+        );
+        assert_eq!(
+            lookup_opt(&routed, work, "victim").await,
+            None,
+            "window {sever_after}: the directory is gone"
+        );
+        assert_eq!(
+            raw_names(&routed, victim).await,
+            Vec::<String>::new(),
+            "window {sever_after}: every marker gone"
+        );
+        for s in &map.stripes {
+            let (v, local) = routed.route_ino(*s);
+            let rec = routed.volumes[v]
+                .read_inode_value_routed(local)
+                .await
+                .unwrap();
+            assert!(
+                rec.is_none_or(|r| r.nlink == 0),
+                "window {sever_after}: stripe {s} dying or destroyed, never live under no map"
+            );
+        }
+        // The sibling: fully usable after the recovery.
+        assert_eq!(names_in(&routed, sibling).await, kept);
+        routed
+            .create(sibling, "after", libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap_or_else(|e| panic!("window {sever_after}: a create into the sibling: {e}"));
+        assert!(lookup_opt(&routed, sibling, "after").await.is_some());
+        shutdown(&routed).await;
+        drop(routed);
+        fsck_clean(&uris).await;
+    }
+}
+
+/// `rmdir` of a striped directory whose OWN tree still holds a user name
+/// (the migration held; `K = 64` markers ahead of it in hash order)
+/// answers `ENOTEMPTY` through the trait face — review round 1, Issue 5:
+/// the first build read 8 entries and called a directory carrying 66
+/// markers empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rmdir_of_a_migrating_directory_with_an_unmigrated_name_answers_enotempty() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let _hold = HoldMigration::arm();
+    let (uris, routed, work) = solo_armed(dir.path()).await;
+    let d = routed
+        .create(work, "d", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    routed
+        .create(d, "only", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    routed
+        .stripe_dir(d, STRIPES_MAX)
+        .await
+        .expect("flip at K = 64");
+    let map = routed.stripe_map(d).await.unwrap().unwrap();
+    assert_eq!(map.k(), STRIPES_MAX);
+    assert!(map.migrating);
+    let e = routed
+        .unlink(work, "d")
+        .await
+        .expect_err("one unmigrated name");
+    assert_eq!(e.to_errno(), libc::ENOTEMPTY, "{e}");
+    assert_eq!(lookup_opt(&routed, work, "d").await, Some(d));
+    assert!(lookup_opt(&routed, d, "only").await.is_some());
+    // Its removal re-homes the name first, then removes it from the stripe.
+    routed
+        .unlink(d, "only")
+        .await
+        .expect("unlink through the re-home");
+    assert!(stripe_stats().rehomed_on_touch >= 1);
+    routed.unlink(work, "d").await.expect("now empty");
+    assert_eq!(lookup_opt(&routed, work, "d").await, None);
+    assert_closed("enotempty");
     shutdown(&routed).await;
     fsck_clean(&uris).await;
 }
@@ -1033,15 +1341,31 @@ async fn a_striped_directorys_nlink_and_times_are_exact() {
         stripe_stats().time_batches > before.time_batches,
         "the fold was persisted onto the directory's record"
     );
-    // The persisted record agrees with the fold's times.
+    // The persist runs ONCE PER CHECKPOINT CADENCE per directory (review
+    // round 1, Issue 8 — a `stat` never writes at the stat rate): a burst
+    // of `stat`s inside one cadence persists once; past the cadence the
+    // stored record catches up with the fold's times.
+    let batches = stripe_stats().time_batches;
+    for _ in 0..20 {
+        let _ = routed.getattr(work).await.unwrap();
+    }
+    assert_eq!(
+        stripe_stats().time_batches,
+        batches,
+        "stats inside one cadence persist nothing more"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(
+        squeezefs::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_derived() + 50,
+    ))
+    .await;
+    let folded = routed.getattr(work).await.unwrap();
     let (v, local) = routed.route_ino(work);
     let stored = routed.volumes[v]
         .read_inode_value_routed(local)
         .await
         .unwrap()
         .unwrap();
-    let folded = routed.getattr(work).await.unwrap();
-    assert_eq!(stored.mtime, folded.mtime);
+    assert_eq!(stored.mtime, folded.mtime, "persisted at the cadence");
     shutdown(&routed).await;
     fsck_clean(&uris).await;
 }
@@ -1155,7 +1479,7 @@ async fn a_directory_flips_at_the_derived_trigger_and_never_below_it() {
     // A SECOND creator (appender 7 — a peer this mount cannot reach) puts
     // the window over the floor from two creators: the flip fires, the
     // unreachable creator declines and the holder mints its share.
-    routed.note_served_insert(shared, 7);
+    routed.note_served_insert(shared, "x", 7);
     let census = routed.stripe_census(shared);
     assert!(dir_stripe::flip_due(&census, n_floor));
     let mut map = None;
@@ -1195,6 +1519,453 @@ async fn a_directory_flips_at_the_derived_trigger_and_never_below_it() {
     holders.tear_down();
     assert_closed("trigger");
     shutdown(&routed).await;
+    drop(routed);
+    fsck_clean_covered(&uris, Some(TWO_HOLDERS)).await;
+}
+
+/// A STRIPE never flips itself (review round 1, Issue 1 — the design's
+/// own operating point: ≥ 2 creators shipping into one striped directory
+/// past `N_floor` gave every stripe its own creator census, and the flip
+/// of a stripe moved its names into nested stripes nobody routed to).
+/// Three faces: the census hook skips a known stripe; a fresh mount that
+/// knows nothing runs the belt (the reverse scan) and refuses; the
+/// explicit flip of a stripe refuses. Every name stays resolvable, no
+/// stripe carries a map, C17 clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stripe_never_flips_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    let plane = routed.volumes[0].slot_leases().expect("armed");
+    let n_floor = plane.n_floor();
+    routed
+        .stripe_dir_with_suppliers(shared, 4, &[1])
+        .await
+        .expect("flip");
+    wait_migrated(&routed, shared).await;
+    let map = routed.stripe_map(shared).await.unwrap().unwrap();
+    // Creates from appender 0 into the striped foreign directory: every
+    // one a served insert whose PARENT is a stripe — the census must feed
+    // nothing for them.
+    let n = usize::try_from(n_floor).unwrap() * 2 + 8;
+    let names = create_files(&routed, shared, "w-", n).await;
+    let flips_before = stripe_stats().flips;
+    for s in &map.stripes {
+        assert!(
+            routed.stripe_census(*s).is_empty(),
+            "a stripe has no census"
+        );
+        // A second creator on a stripe's census (the old shape's trigger):
+        // the known-stripe skip.
+        for _ in 0..=n_floor {
+            routed.note_served_insert(*s, "x", 7);
+            routed.note_served_insert(*s, "y", 8);
+        }
+        assert!(routed.stripe_census(*s).is_empty());
+        // The explicit flip of a stripe refuses.
+        let e = routed
+            .stripe_dir(*s, 4)
+            .await
+            .expect_err("a stripe cannot carry a map");
+        assert!(e.to_string().contains("cannot carry a stripe map"), "{e}");
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(stripe_stats().flips, flips_before, "no stripe flipped");
+    for s in &map.stripes {
+        assert!(routed.stripe_map(*s).await.unwrap().is_none());
+    }
+    holders.tear_down();
+    shutdown(&routed).await;
+    drop(routed);
+
+    // A fresh mount knows no stripe: the belt (the reverse scan) at the
+    // spawned flip refuses and learns it; the census is dropped.
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    let flips_before = stripe_stats().flips;
+    for s in &map.stripes {
+        for _ in 0..=n_floor {
+            routed.note_served_insert(*s, "x", 7);
+            routed.note_served_insert(*s, "y", 8);
+        }
+    }
+    for _ in 0..200 {
+        if routed.stripe_work_in_flight() == 0
+            && map
+                .stripes
+                .iter()
+                .all(|s| routed.stripe_census(*s).is_empty())
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        stripe_stats().flips,
+        flips_before,
+        "the belt refused every stripe flip"
+    );
+    for s in &map.stripes {
+        assert!(routed.stripe_map(*s).await.unwrap().is_none());
+        assert!(routed.stripe_census(*s).is_empty(), "the census is dropped");
+    }
+    assert_eq!(
+        names_in(&routed, shared).await,
+        names,
+        "every name resolvable"
+    );
+    for nm in &names {
+        assert!(lookup_opt(&routed, shared, nm).await.is_some());
+    }
+    holders.tear_down();
+    assert_closed("stripe never flips");
+    shutdown(&routed).await;
+    fsck_clean_covered(&uris, Some(TWO_HOLDERS)).await;
+}
+
+/// `..` of a striped directory resolves to its PARENT on the reconnect
+/// path whatever the key order (review round 1, Issue 3): the first build's
+/// commit/migrating markers named the directory ITSELF, and the reverse
+/// dentry scan's first hit was that self-reference whenever the directory's
+/// key sorted below its parent's — `..` answered the directory. The markers
+/// now name stripe 0; pinned with a striped directory whose parent sorts
+/// ABOVE it, and with a child's `..` through a stripe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dotdot_of_a_striped_directory_resolves_to_its_parent_whatever_the_key_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, routed, work) = solo_armed(dir.path()).await;
+    // Directories across the rotor: pick a pair `(d, p)` with `d`'s
+    // (slot, local) key BELOW `p`'s, then move `d` under `p`.
+    let mut made: Vec<u64> = Vec::new();
+    for i in 0..12 {
+        made.push(
+            routed
+                .create(work, &format!("c{i}"), libc::S_IFDIR | 0o755, 0, 0)
+                .await
+                .unwrap()
+                .ino,
+        );
+    }
+    let key = |ino: u64| {
+        let (_, local) = routed.route_ino(ino);
+        (slot_of(&routed, ino), local)
+    };
+    let mut sorted = made.clone();
+    sorted.sort_by_key(|i| key(*i));
+    let (d, p) = (sorted[0], sorted[sorted.len() - 1]);
+    assert!(key(d) < key(p));
+    let d_name = format!("c{}", made.iter().position(|i| *i == d).unwrap());
+    routed
+        .rename(work, &d_name, p, "d", 0)
+        .await
+        .expect("move d under p");
+    routed.stripe_dir(d, 4).await.expect("flip");
+    routed.migrate_dir(d).await.expect("migrate");
+    let child = routed
+        .create(d, "child", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    // `..` of the striped directory: its parent, never itself.
+    assert_eq!(routed.lookup(d, "..").await.unwrap().ino, p);
+    // `..` of a child named by a stripe: the directory (through the
+    // stripe), never the stripe.
+    assert_eq!(routed.lookup(child, "..").await.unwrap().ino, d);
+    // No marker names the directory itself: the commit marker names
+    // stripe 0 (the migrating one is gone after the migration).
+    let map = routed.stripe_map(d).await.unwrap().unwrap();
+    assert_eq!(
+        raw_entry(&routed, d, STRIPED_MARKER).await,
+        Some(map.stripes[0]),
+        "the commit marker names stripe 0"
+    );
+    assert_eq!(raw_entry(&routed, d, MIGRATING_MARKER).await, None);
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
+/// The mutation paths are migration-safe (review round 1, Issue 4):
+/// (a) an `unlink` of a name still in the directory's own tree re-homes it
+/// and removes it — never a spurious `ENOENT` — while the background
+/// migration runs beside it; (b) a `rename` onto an unmigrated destination
+/// re-homes the destination first, so the overwritten inode is accounted
+/// and the new name sits in its stripe (never stranded in the directory's
+/// own tree); (c) the flag clear re-verifies the directory's own tree EMPTY
+/// under its guard — a name inserted into it behind the scan is moved
+/// before the flag goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mutations_racing_the_migration_never_answer_enoent_or_strand_a_name() {
+    use squeezefs::meta_backend::kv::backend::RoutedParentUpdate;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let hold = HoldMigration::arm();
+    let (uris, routed, work) = solo_armed(dir.path()).await;
+    let names = create_files(&routed, work, "f-", 40).await;
+    routed.stripe_dir(work, 8).await.expect("flip");
+    let map = routed.stripe_map(work).await.unwrap().unwrap();
+    assert!(map.migrating);
+    let before = stripe_stats();
+
+    // (a) unlink of an unmigrated name, racing the migration: both run
+    // `migrate_one` under the same guards; the unlink lands on the stripe.
+    drop(hold);
+    let r = Arc::clone(&routed);
+    let migration = tokio::spawn(async move { r.migrate_dir(work).await });
+    for nm in names.iter().take(20) {
+        routed
+            .unlink(work, nm)
+            .await
+            .unwrap_or_else(|e| panic!("unlink {nm} racing the migration: {e}"));
+    }
+    migration.await.unwrap().expect("migration");
+    let remaining: Vec<String> = names.iter().skip(20).cloned().collect();
+    assert_eq!(names_in(&routed, work).await, remaining);
+
+    // (b) a rename onto an UNMIGRATED destination: plant the destination
+    // in the directory's own tree (the stale-route insert's shape) with
+    // the flag set again by a second flip of a fresh directory.
+    let hold = HoldMigration::arm();
+    let d2 = routed
+        .create(work, "d2", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let victim = routed
+        .create(d2, "victim", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    routed
+        .create(d2, "source", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    routed.stripe_dir(d2, 4).await.expect("flip d2");
+    let m2 = routed.stripe_map(d2).await.unwrap().unwrap();
+    assert!(m2.migrating);
+    // Both names sit in d2's own tree: the rename overwrites `victim`.
+    routed
+        .rename(d2, "source", d2, "victim", 0)
+        .await
+        .expect("rename onto an unmigrated destination");
+    let (vv, vlocal) = routed.route_ino(victim);
+    assert!(
+        routed.volumes[vv]
+            .read_inode_value_routed(vlocal)
+            .await
+            .unwrap()
+            .is_none_or(|r| r.nlink == 0),
+        "the overwritten inode is accounted (nlink 0 / destroyed), never leaked"
+    );
+    let seed = hash_seed(&routed, d2);
+    let (_, s) = m2.stripe_for(dentry_name_hash54(b"victim", seed));
+    assert!(
+        raw_names(&routed, s).await.contains(&"victim".to_string()),
+        "the new name sits in its stripe"
+    );
+    let own: Vec<String> = raw_names(&routed, d2)
+        .await
+        .into_iter()
+        .filter(|n| !is_marker_name(n))
+        .collect();
+    assert!(own.is_empty(), "nothing stranded in d2's own tree: {own:?}");
+    assert!(stripe_stats().rehomed_on_touch > before.rehomed_on_touch);
+
+    // (c) a name inserted into d2's OWN tree behind the migration's scan
+    // (a stale route): the flag clear finds it under its guard and moves
+    // it before clearing.
+    let (d2v, d2local) = routed.route_ino(d2);
+    let no_guards: Arc<[squeezefs::meta_backend::dlm::DlmGuard]> = Arc::from(Vec::new());
+    let slot = routed.pick_mint_slot(0);
+    let (ll, lg) = routed.allocate_local_ino_in_slot(0, slot).unwrap();
+    routed.volumes[0]
+        .routed_mint_inode(
+            ll,
+            libc::S_IFREG | 0o644,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Arc::clone(&no_guards),
+        )
+        .await
+        .unwrap();
+    routed.volumes[d2v]
+        .routed_add_dentry(
+            d2local,
+            "stale",
+            lg,
+            libc::S_IFREG,
+            RoutedParentUpdate::None,
+            no_guards,
+        )
+        .await
+        .unwrap();
+    drop(hold);
+    routed.migrate_dir(d2).await.expect("migrate d2");
+    let m2 = routed.stripe_map(d2).await.unwrap().unwrap();
+    assert!(!m2.migrating, "the flag cleared");
+    assert_names_route_to_hash_mod_k(&routed, &m2, &["stale".to_string(), "victim".to_string()])
+        .await;
+    assert_eq!(lookup_opt(&routed, d2, "stale").await, Some(lg));
+    assert_closed("migration-safe mutations");
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
+/// A PRESET (delegated) create into a STRIPED parent is refused loud
+/// (review round 1, Issue 20a): the S10 delegation plane names the
+/// directory while the stripe is the key parent — the two do not compose,
+/// and a silent insert into the directory's own tree is exactly the
+/// stranded shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_preset_create_into_a_striped_parent_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, routed, work) = solo_armed(dir.path()).await;
+    routed.stripe_dir(work, 4).await.expect("flip");
+    wait_migrated(&routed, work).await;
+    let slot = routed.pick_mint_slot(0);
+    let (_, global) = routed.allocate_local_ino_in_slot(0, slot).unwrap();
+    let e = routed
+        .create_with_rdev_preset(
+            work,
+            "preset",
+            libc::S_IFREG | 0o644,
+            0,
+            0,
+            0,
+            0,
+            Some(IntentCreatePreset {
+                global_ino: global,
+                ts_ns: KvMetaBackend::now_ns_pub(),
+            }),
+        )
+        .await
+        .expect_err("refused");
+    assert!(e.to_string().contains("STRIPED"), "{e}");
+    assert_eq!(lookup_opt(&routed, work, "preset").await, None);
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
+/// The shutdown fixpoint over an EXHAUSTED grant (review round 1, Issue 21a
+/// — the wave's 2-in-9 red): a declared region whose slot tree took a burst
+/// of inserts under a parked cadence needs its compactions' extents at the
+/// final cycles; the flush pass's reactive refill must be ADMITTED during
+/// the shutdown (the INTERNAL class, bounded by the SMO's own need) or the
+/// pass defers every SMO, the fixpoint never converges and the leave keeps
+/// the region's page `Live` over an uncovered ring — acked records a probe
+/// cannot see. Pinned: `manager_dependency_stalls == 0`, and the next
+/// writer open finds NO own residue (`appender_self_recoveries == 0`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shutdown_over_an_exhausted_grant_refills_and_leaves_covered() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    // The cadence parked: every SMO of appender 1's tree is the shutdown
+    // fixpoint's; the grant at its floor.
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    std::env::set_var("SQUEEZEFS_SYM_GRANT_EXTENTS", "8");
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    // A burst of inserts into the region's slot tree — every create a
+    // shipped `InsertDentry` whose dentry lands in appender 1's tree.
+    let names = create_files(&routed, shared, "b-", 2_000).await;
+    holders.tear_down();
+    shutdown(&routed).await;
+    drop(routed);
+    std::env::remove_var("SQUEEZEFS_SYM_GRANT_EXTENTS");
+    // The next open: no own residue (the leave covered), no stall.
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let s = routed.volumes[0].appender_stats().expect("forest");
+    assert_eq!(
+        s.self_recoveries, 0,
+        "the leave left an uncovered ring — own residue replayed: {s:?}"
+    );
+    assert_eq!(s.dependency_stalls, 0, "{s:?}");
+    assert_eq!(names_in(&routed, shared).await, names);
+    shutdown(&routed).await;
+    drop(routed);
+    fsck_clean(&uris).await;
+}
+
+/// The offline probe over a `Live` appender page records NO inode-plane
+/// verdict (review round 1, Issue 21b): a writer that died with a declared
+/// region left both rings' windows uncovered — acked names durable there
+/// and replayed by nobody but a writer's own-residue open — so a census
+/// over the trees alone would read every such child as C9-unreferenced.
+/// The probe's inode plane covers 0 volumes and finds nothing; the
+/// writer's next clean open + leave makes the census whole (covered 1,
+/// clean).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_probe_over_a_live_page_records_no_inode_plane_verdict() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    let names = create_files(&routed, shared, "c-", 50).await;
+    for v in &routed.volumes {
+        v.sync_device().await.unwrap();
+    }
+    holders.tear_down();
+    // The crash-equivalent: no shutdown, every page stays `Live`. (The
+    // offline CLI's live-client preflight reads this process's own claim
+    // as a live writer — the pid IS alive — so the engine is driven over
+    // a read-only PROBE directly, the harness `run_offline` builds.)
+    drop(routed);
+    let probe = squeezefs::meta_backend::open_probe_routed_meta_set(&uris)
+        .await
+        .expect("a probe over a dead writer's pages");
+    assert!(
+        probe.volumes[0]
+            .appender_stats()
+            .expect("forest")
+            .live_pages_at_mount
+            >= 1,
+        "the dead writer's pages read Live"
+    );
+    let report = probe_inode_plane(&probe).await;
+    for v in &probe.volumes {
+        v.shutdown().await.unwrap();
+    }
+    drop(probe);
+    assert_eq!(
+        report.counters.inode_plane_volumes_covered, 0,
+        "no inode-plane verdict over an uncovered window: {:?}",
+        report.findings
+    );
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| f.class == "C9" || f.class == "C10" || f.class == "C17"),
+        "no C9/C10/C17 verdict from an incomplete census: {:?}",
+        report.findings
+    );
+    // The writer's own-residue open + clean leave: the census is whole.
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    assert!(routed.volumes[0].appender_stats().unwrap().self_recoveries >= 1);
+    assert_eq!(names_in(&routed, shared).await, names);
+    for nm in &names {
+        routed
+            .lookup(shared, nm)
+            .await
+            .unwrap_or_else(|e| panic!("{nm}: the replayed child resolves: {e}"));
+    }
+    shutdown(&routed).await;
+    drop(routed);
     fsck_clean(&uris).await;
 }
 
@@ -1322,7 +2093,10 @@ async fn a_creator_wave_spreads_over_the_stripe_holders() {
     holders.tear_down();
     assert_closed("wave");
     shutdown(&routed).await;
-    fsck_clean(&uris).await;
+    drop(routed);
+    // The oracle: the leave COVERED (no own residue at the next open),
+    // then the census (Issue 21c).
+    fsck_clean_covered(&uris, Some(partition)).await;
 }
 
 /// Three holders: the directory's holder is a declared region, two
@@ -1403,7 +2177,8 @@ async fn stripes_supplied_by_other_appenders_are_served_by_their_own_holders() {
     holders.tear_down();
     assert_closed("three holders");
     shutdown(&routed).await;
-    fsck_clean(&uris).await;
+    drop(routed);
+    fsck_clean_covered(&uris, Some(THREE_HOLDERS)).await;
 }
 
 /// The evidence note's scoping instrument (SCOPING — the dev laptop; run
@@ -1505,7 +2280,8 @@ async fn scoping_row_flip_migration_and_readdir_cost() {
     holders.tear_down();
     assert_closed("scoping holders");
     shutdown(&routed).await;
-    fsck_clean(&uris).await;
+    drop(routed);
+    fsck_clean_covered(&uris, Some(partition)).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1549,8 +2325,8 @@ async fn the_knob_at_one_never_stripes_and_still_routes_an_existing_map() {
     );
     routed.set_stripe_dirs_at_mkdir(false);
     for _ in 0..100 {
-        routed.note_served_insert(plain, 5);
-        routed.note_served_insert(plain, 6);
+        routed.note_served_insert(plain, "x", 5);
+        routed.note_served_insert(plain, "y", 6);
     }
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(
@@ -1659,12 +2435,14 @@ fn the_striping_family_is_exported_under_its_published_names() {
         "dir_stripe_time_batches",
         "dir_stripe_dying_refusals",
         "dir_stripe_rmdirs",
+        "dir_stripe_rehomed_on_touch",
     ] {
         assert!(m.contains_key(k), "{k} exported");
     }
     assert_eq!(
         crossvol_tx::XV_MAX_STEPS,
-        squeezefs::meta_backend::MINT_SPREAD + 8
+        2 * squeezefs::meta_backend::MINT_SPREAD + 8,
+        "the widest plan: the one-intent rmdir of a K = MINT_SPREAD directory"
     );
     assert_eq!(
         usize::from(STRIPES_MAX),
@@ -1674,15 +2452,16 @@ fn the_striping_family_is_exported_under_its_published_names() {
 
 // ---------------------------------------------------------------------------
 // fsck C17 — stripe consistency (§5.6.5 / §5.8.5): a healthy striped tree
-// is clean (every contract above ends in `fsck_clean`); each of the four
+// is clean (every contract above ends in `fsck_clean`); each of the five
 // planted shapes is FOUND, report-only.
 // ---------------------------------------------------------------------------
 
 /// Plant each C17 shape on a settled striped tree — a stripe named by a
 /// second directory's map, a map entry naming a destroyed stripe, a name in
 /// the wrong stripe, a name left in the directory's own tree after its
-/// migration — and the offline fsck reports exactly those four, report-
-/// only (`fsck_repair_classC17` does not exist; repair refuses them).
+/// migration, a commit marker naming the directory itself — and the
+/// offline fsck reports exactly those five, report-only
+/// (`fsck_repair_classC17` does not exist; repair refuses them).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_planted_c17_shape_is_found_and_nothing_else() {
     use squeezefs::meta_backend::kv::backend::RoutedParentUpdate;
@@ -1781,6 +2560,54 @@ async fn every_planted_c17_shape_is_found_and_nothing_else() {
     )
     .await
     .unwrap();
+    // (5) incomplete map: d3 carries a commit marker naming ITSELF over
+    // two stripe entries — the first build's self-reference (Issue 3);
+    // the router ignores such a map and the census reports it.
+    let d3 = routed
+        .create(work, "d3", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let (_, d3_local) = routed.route_ino(d3);
+    for i in 0..2u16 {
+        let (sl, sg) = mint(&routed);
+        vol.routed_mint_inode(
+            sl,
+            libc::S_IFDIR | 0o755,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Arc::clone(&no_guards),
+        )
+        .await
+        .unwrap();
+        vol.routed_add_dentry(
+            d3_local,
+            &dir_stripe::stripe_marker_name(i),
+            sg,
+            libc::S_IFDIR,
+            RoutedParentUpdate::None,
+            Arc::clone(&no_guards),
+        )
+        .await
+        .unwrap();
+    }
+    vol.routed_add_dentry(
+        d3_local,
+        STRIPED_MARKER,
+        d3,
+        libc::S_IFDIR,
+        RoutedParentUpdate::None,
+        Arc::clone(&no_guards),
+    )
+    .await
+    .unwrap();
+    assert!(
+        routed.stripe_map(d3).await.unwrap().is_none(),
+        "a commit marker naming the directory is no map"
+    );
     shutdown(&routed).await;
     drop(vol);
     drop(routed);
@@ -1821,13 +2648,15 @@ async fn every_planted_c17_shape_is_found_and_nothing_else() {
     assert_eq!(has("missing-stripe", d1, ""), 1, "{ids:?}");
     assert_eq!(has("misrouted-name", d1, "misrouted"), 1, "{ids:?}");
     assert_eq!(has("unmigrated-name", d1, "leftover"), 1, "{ids:?}");
+    assert_eq!(has("incomplete-map", d3, ""), 1, "{ids:?}");
     // The multiply-mapped stripe's CONSEQUENCE: read as d2's fifth stripe,
     // d1's names in it route elsewhere under K = 5 — every remaining
     // finding is that shape on d2, and nothing else.
     for (d, _, shape, name) in &ids {
         let planted = (*d == d1 && matches!(shape.as_str(), "multiply-mapped" | "missing-stripe"))
             || (*d == d1 && shape == "misrouted-name" && name == "misrouted")
-            || (*d == d1 && shape == "unmigrated-name" && name == "leftover");
+            || (*d == d1 && shape == "unmigrated-name" && name == "leftover")
+            || (*d == d3 && shape == "incomplete-map");
         assert!(
             planted || (*d == d2 && shape == "misrouted-name"),
             "unexpected C17 finding: {d} {shape} {name:?} — {ids:?}"

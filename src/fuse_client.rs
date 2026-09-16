@@ -29388,7 +29388,15 @@ impl Filesystem for SqueezefsFilesystem {
         // the explicit stripe FLIP of a directory — a COMMAND the holder
         // executes, never a stored value; it rides ahead of the VAL-2
         // screen (the reserved family stays closed to every other name).
-        if name_str == crate::meta_backend::dir_stripe::STRIPES_XATTR {
+        // On an UNARMED mount the name falls through to the screen like
+        // every other reserved name (the shipped posture byte-identical —
+        // review round 1, Issue 18).
+        if name_str == crate::meta_backend::dir_stripe::STRIPES_XATTR
+            && self
+                .meta_backend
+                .as_ref()
+                .is_some_and(|b| b.striping_armed(inode))
+        {
             let backend = self
                 .meta_backend
                 .as_ref()
@@ -29470,8 +29478,14 @@ impl Filesystem for SqueezefsFilesystem {
             return Err(Errno::from(libc::EOPNOTSUPP));
         }
         // PR 7b: the stripe count of a striped directory (absent on an
-        // unstriped one — the command's read face).
-        let stripes_probe = name_str == crate::meta_backend::dir_stripe::STRIPES_XATTR;
+        // unstriped one — the command's read face; `listxattr` never lists
+        // it, `getfattr -d` omits it). On an UNARMED mount the name is a
+        // reserved one for the screen (Issue 18).
+        let stripes_probe = name_str == crate::meta_backend::dir_stripe::STRIPES_XATTR
+            && self
+                .meta_backend
+                .as_ref()
+                .is_some_and(|b| b.striping_armed(inode));
         if !stripes_probe && !xattr_name_allowed(name_str) {
             METRICS
                 .fuse_reserved_xattr_refusals

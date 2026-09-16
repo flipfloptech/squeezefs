@@ -3561,6 +3561,30 @@ async fn build_referenced_inos(
     let budget = c10_count_entry_budget();
     let mut indexed = 0u64;
     for (vol_idx, kv) in meta.volumes.iter().enumerate() {
+        // A forest volume's dentry set is COMPLETE on a non-writer only
+        // when no appender page is `Live` (symmetric PR 7b review round 1,
+        // Issue 21b): a `Live` page at a probe's open is a dead writer's
+        // (or a declared region's) UNCOVERED ring window — acked records
+        // durable in that ring, replayed by a WRITER's own-residue open
+        // and by nothing else — so a census over the trees alone is not a
+        // census. The inode plane records no verdict; the writer's next
+        // clean open (or PR 10's recovery) is what completes the set.
+        if kv.is_read_only() || kv.filters_unpublished_children() {
+            if let Some(live) = kv
+                .appender_stats()
+                .map(|s| s.live_pages_at_mount)
+                .filter(|n| *n > 0)
+            {
+                log::warn!(
+                    "fsck C9/C10/C17: meta volume {vol_idx} carries {live} LIVE appender \
+                     page(s) this read-only probe did not replay — its acked records may sit \
+                     in an uncovered ring window, so the referenced-ino set is incomplete and \
+                     the inode-plane classes record no verdict for this run (a writer's open \
+                     replays its own residue; a dead peer's is PR 10's recovery)"
+                );
+                return (None, indexed);
+            }
+        }
         let mut cursor: Vec<u8> = vec![0u8];
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -4130,8 +4154,11 @@ pub enum C17Shape {
         routes_to: u16,
     },
     /// A non-marker name in the directory's OWN tree after `migrating`
-    /// cleared — unreachable (the fallback is gone) and, when its stripe
-    /// holds it too, a duplicate the migration's LWW rule left behind.
+    /// cleared — a stale-route insert's trace (a create that routed the
+    /// directory unstriped and inserted past the flag clear). Reads still
+    /// serve it (the directory's own tree is the permanent secondary home)
+    /// and its next mutation re-homes it; when its stripe holds the name
+    /// too, the stripe's entry is the one served (the LWW rule).
     UnmigratedName {
         dir: u64,
         name: String,
@@ -4206,16 +4233,17 @@ impl C17Shape {
                 in_stripe_too,
             } => format!(
                 "name {name:?} is still in directory {dir}'s own tree after its migration \
-                 flag cleared{} — the fallback lookup is gone, so the entry is {}",
+                 flag cleared{} — a stale-route insert's trace: reads serve it from the \
+                 directory's own tree{} and its next mutation re-homes it",
                 if *in_stripe_too {
-                    " (its stripe holds it too)"
+                    " (its stripe holds the name too)"
                 } else {
                     ""
                 },
                 if *in_stripe_too {
-                    "a duplicate the migration's LWW rule should have dropped"
+                    " (the stripe's entry wins — the LWW rule)"
                 } else {
-                    "unreachable"
+                    ""
                 }
             ),
         }
@@ -4225,9 +4253,17 @@ impl C17Shape {
 /// One directory's stripe map as the marker census saw it.
 #[derive(Default, Debug)]
 struct C17Map {
-    striped: bool,
+    /// The commit marker's target (`Some` = the marker exists; a live map's
+    /// names stripe 0 — `MARKER_TARGET_INDEX`).
+    commit_target: Option<u64>,
     migrating: bool,
     entries: std::collections::BTreeMap<u16, u64>,
+}
+
+impl C17Map {
+    fn striped(&self) -> bool {
+        self.commit_target.is_some()
+    }
 }
 
 /// Fold the marker census into per-directory maps (`global dir → map`).
@@ -4243,7 +4279,7 @@ fn c17_maps(
         };
         let m = maps.entry(dir).or_default();
         match marker {
-            Marker::Striped => m.striped = true,
+            Marker::Striped => m.commit_target = Some(*child),
             Marker::Migrating => m.migrating = true,
             Marker::Stripe(i) => {
                 m.entries.insert(*i, *child);
@@ -4278,19 +4314,23 @@ async fn c17_own_names(meta: &RoutedMetaBackend, dir: u64) -> Vec<String> {
 /// stripe's record and its names' routing, the directory's own leftover
 /// names after the flag cleared.
 async fn c17_shapes_of(meta: &RoutedMetaBackend, dir: u64, map: &C17Map) -> Vec<C17Shape> {
-    use crate::meta_backend::dir_stripe::stripe_of;
+    use crate::meta_backend::dir_stripe::{stripe_of, MARKER_TARGET_INDEX};
     use crate::meta_backend::kv::record::dentry_name_hash54;
     let mut out = Vec::new();
-    if !map.striped {
+    let Some(commit_target) = map.commit_target else {
         return out;
-    }
+    };
     let k = map.entries.len();
     let contiguous = map
         .entries
         .keys()
         .enumerate()
         .all(|(i, idx)| usize::from(*idx) == i);
-    if k < 2 || !contiguous {
+    // A live map's commit marker names stripe 0 (never the directory —
+    // the reverse scan's self-hit, Issue 3); anything else is torn or
+    // planted and the router ignores the map.
+    let target_ok = map.entries.get(&MARKER_TARGET_INDEX) == Some(&commit_target);
+    if k < 2 || !contiguous || !target_ok {
         out.push(C17Shape::IncompleteMap {
             dir,
             entries: k as u16,
@@ -4350,7 +4390,7 @@ async fn evaluate_c17(
     let maps = c17_maps(&ctx.meta, markers);
     let mut named_by: std::collections::BTreeMap<u64, Vec<u64>> = std::collections::BTreeMap::new();
     for (dir, map) in &maps {
-        if !map.striped {
+        if !map.striped() {
             continue;
         }
         for stripe in map.entries.values() {
@@ -4374,38 +4414,61 @@ async fn evaluate_c17(
     }
 }
 
-/// The C17 confirm read: does `shape` still hold on a FRESH read of its
-/// directory's markers and stripes (the settle window closed a flip or a
-/// migration that was mid-way at the nomination)?
-async fn c17_still_holds(ctx: &FsckCtx, shape: &C17Shape) -> bool {
-    // The fresh census: one dentry walk (bounded by the tree — the same
-    // walk the nomination rode), then the shape's own directory alone.
-    let (Some(fresh), _) = build_referenced_inos(
-        Arc::clone(&ctx.meta),
-        None,
-        0,
-        Arc::new(AtomicBool::new(false)),
-        None,
-    )
-    .await
-    else {
-        return false;
-    };
-    let maps = c17_maps(&ctx.meta, &fresh.markers);
-    match shape {
-        C17Shape::MultiplyMapped { stripe, .. } => {
-            maps.values()
-                .filter(|m| m.striped && m.entries.values().any(|s| s == stripe))
-                .count()
-                >= 2
+/// C17's FRESH view for the whole confirm pass — ONE dentry walk (the
+/// marker census) and each striped directory's shapes derived ONCE, every
+/// C17 suspect judged against the same view (review round 1, Issue 14:
+/// the per-suspect re-walk paid `N` whole-tree dentry walks for `N`
+/// suspects — 64 on the crash shape that nominates every stripe of one
+/// map). `None` = the census could not complete: no verdict (clears).
+struct C17Fresh {
+    maps: std::collections::BTreeMap<u64, C17Map>,
+    shapes: HashMap<u64, Vec<C17Shape>>,
+}
+
+impl C17Fresh {
+    async fn build(ctx: &FsckCtx) -> Option<Self> {
+        let (Some(fresh), _) = build_referenced_inos(
+            Arc::clone(&ctx.meta),
+            None,
+            0,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await
+        else {
+            return None;
+        };
+        Some(Self {
+            maps: c17_maps(&ctx.meta, &fresh.markers),
+            shapes: HashMap::new(),
+        })
+    }
+
+    /// Does `shape` still hold on the fresh view?
+    async fn holds(&mut self, ctx: &FsckCtx, shape: &C17Shape) -> bool {
+        match shape {
+            C17Shape::MultiplyMapped { stripe, .. } => {
+                self.maps
+                    .values()
+                    .filter(|m| m.striped() && m.entries.values().any(|s| s == stripe))
+                    .count()
+                    >= 2
+            }
+            other => {
+                let dir = other.dir();
+                let Some(map) = self.maps.get(&dir) else {
+                    return false;
+                };
+                let shapes = match self.shapes.get(&dir) {
+                    Some(s) => s,
+                    None => {
+                        let derived = c17_shapes_of(&ctx.meta, dir, map).await;
+                        self.shapes.entry(dir).or_insert(derived)
+                    }
+                };
+                shapes.iter().any(|s| s == other)
+            }
         }
-        other => match maps.get(&other.dir()) {
-            Some(map) => c17_shapes_of(&ctx.meta, other.dir(), map)
-                .await
-                .iter()
-                .any(|s| s == other),
-            None => false,
-        },
     }
 }
 
@@ -5231,6 +5294,8 @@ async fn recheck_suspects(
         u64,
         Option<Vec<crate::meta_backend::kv::shared_refs::SharedIndexDrift>>,
     > = HashMap::new();
+    // C17's fresh view, ONCE for the pass (the same law; PR 7b Issue 14).
+    let mut c17_fresh: Option<Option<C17Fresh>> = None;
     for s in pending {
         if opts.cancel.load(Ordering::Relaxed) {
             break;
@@ -5592,7 +5657,14 @@ async fn recheck_suspects(
             // a migration mid-way at the nomination has settled by now and
             // clears.
             SuspectKind::C17StripeInconsistency(shape) => {
-                if !c17_still_holds(ctx, shape).await {
+                if c17_fresh.is_none() {
+                    c17_fresh = Some(C17Fresh::build(ctx).await);
+                }
+                let holds = match c17_fresh.as_mut().and_then(|f| f.as_mut()) {
+                    Some(fresh) => fresh.holds(ctx, shape).await,
+                    None => false,
+                };
+                if !holds {
                     counters.suspects_cleared += 1;
                     continue;
                 }

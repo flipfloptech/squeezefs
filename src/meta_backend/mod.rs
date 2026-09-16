@@ -1537,19 +1537,6 @@ impl RoutedMetaBackend {
         if let crossvol_tx::XvStep::InsertDentry { child, .. } = step {
             self.screen_insert_child(*child, tx_id).await?;
         }
-        // PR 7b (design §5.6.5): a served insert is one foreign ship into
-        // its parent — the flip trigger's census reads the CREATOR off the
-        // child's slot (the child was minted in the creator's rotor); a
-        // parent whose record reads `nlink 0` (a stripe marked dying by an
-        // `rmdir` in flight) refuses the insert `ENOENT` — R26's closer.
-        if let crossvol_tx::XvStep::InsertDentry { parent, child, .. } = step {
-            self.refuse_dying_stripe(*parent).await?;
-            if let Some(creator) = self.holder_of(*child) {
-                if Some(creator) != self.holder_of(*parent) {
-                    self.note_served_insert(*parent, creator);
-                }
-            }
-        }
         // Under a scope whose guards COVER the step's keys they are held
         // already (the initiator's, in this table or parked here) and the
         // apply takes nothing — a served step never parks on a 4a guard;
@@ -1567,6 +1554,43 @@ impl RoutedMetaBackend {
                     std::sync::Arc::from(vol.dlm().lock_many(&inos, &d).await)
                 }
             };
+        // PR 7b (design §5.6.5): a served insert is one foreign ship into
+        // its parent — the flip trigger's census reads the CREATOR off the
+        // child's slot (the child was minted in the creator's rotor). A
+        // parent whose record reads `nlink 0` (a stripe an `rmdir`'s
+        // intent marked dying, a directory removed while open) refuses
+        // the insert — R26's closer, read UNDER the step's guards (the
+        // `Take` arm's included; review round 1, Issue 6) and answered as
+        // a WITNESS refusal: a live plan stops and compensates (the
+        // initiator maps it to `ENOENT` off the parent's record), a
+        // roll-forward retires the intent instead of erroring at every
+        // cadence pass (Issue 13).
+        if let crossvol_tx::XvStep::InsertDentry {
+            parent,
+            child,
+            name,
+            ..
+        } = step
+        {
+            if self.refuse_dying_parent(*parent).await.is_err() {
+                let out = crossvol_tx::XvStepOutcome {
+                    status: crossvol_tx::XvStepStatus::ForeignSkipped,
+                    inode: None,
+                };
+                out.count();
+                crossvol_tx::note_step_served();
+                log::debug!(
+                    "served cross-owner step {step_idx} (insert_dentry) of {tx_id:016x}: the \
+                     parent {parent} is being removed — witness refusal"
+                );
+                return Ok(out);
+            }
+            if let Some(creator) = self.holder_of(*child) {
+                if Some(creator) != self.holder_of(*parent) {
+                    self.note_served_insert(*parent, name, creator);
+                }
+            }
+        }
         let out = vol.xv_apply_step(&local, None, guards).await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);
@@ -2997,12 +3021,19 @@ impl RoutedMetaBackend {
         // under its stripe — the op below runs verbatim with the stripe as
         // its parent; the directory itself is the `..`/memo parent and the
         // `-o stripe_dirs` mkdir's subject. A preset mint is an intent
-        // apply into the owner's own directory and never re-routes.
+        // apply into the owner's own directory (the S10 delegation plane)
+        // and never re-routes: the two planes do not compose today, so a
+        // preset into a STRIPED parent is refused loud (Issue 20a) rather
+        // than inserted into the directory's own tree.
         let logical_parent = parent;
-        let striped = match &preset {
-            Some(_) => None,
-            None => self.stripe_route(parent, name).await?,
-        };
+        let striped = self.stripe_route(parent, name).await?;
+        if preset.is_some() && striped.is_some() {
+            return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                "a preset (delegated) create into STRIPED directory {parent} is not composed \
+                 (symmetric PR 7b × S10 delegation): the stripe is the key parent and a \
+                 delegation names the directory"
+            )));
+        }
         let parent = match &striped {
             Some(route) => {
                 self.stripe_insert_parent(logical_parent, name, route)
@@ -3090,10 +3121,10 @@ impl RoutedMetaBackend {
             )
             .await?,
         );
-        // PR 7b: a stripe marked dying by an `rmdir` in flight refuses the
+        // PR 7b: a stripe an `rmdir`'s intent marked dying refuses the
         // insert under the guard the mark took (R26's closer).
         if striped.is_some() {
-            self.refuse_dying_stripe(parent).await?;
+            self.refuse_dying_parent(parent).await?;
         }
 
         // The preset REPLAY tiebreak (under the dentry guard): a dentry
@@ -3148,7 +3179,17 @@ impl RoutedMetaBackend {
                     initial_size,
                     guards,
                 )
-                .await?;
+                .await;
+            let made = match made {
+                Ok(m) => m,
+                // The holder's witness refusal of an insert into a dying
+                // stripe is the plan's `EEXIST`; the op's errno is `ENOENT`
+                // (one record read, the error path only).
+                Err(e) if striped.is_some() => {
+                    return Err(self.dying_parent_errno(parent, e).await)
+                }
+                Err(e) => return Err(e),
+            };
             if is_dir {
                 self.stripe_at_mkdir(made.ino).await;
             }
@@ -3393,6 +3434,7 @@ impl RoutedMetaBackend {
     /// held: the wrapper takes it and re-enters (the lock is OUTERMOST —
     /// taken after a 4a guard it would cycle with a peer's shipped step).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn rename_body(
         &self,
         old_parent: Ino,
@@ -3401,6 +3443,9 @@ impl RoutedMetaBackend {
         new_name: &str,
         flags: u32,
         dir_lock_held: bool,
+        // PR 7b: `new_parent` is a STRIPE — the dying check runs under the
+        // guards (R26's closer at the rename's insert).
+        dest_is_stripe: bool,
     ) -> Result<bool> {
         // S10 coherence law (rung 12): both parents' dentry sets mutate;
         // the moved child's ctime moves, and a rename-over destroys the
@@ -3557,6 +3602,11 @@ impl RoutedMetaBackend {
             }
             // A child moved under us — rediscover (guards dropped here).
         };
+        // PR 7b: a destination stripe an `rmdir`'s intent marked dying
+        // refuses the insert under the guards (R26's closer).
+        if dest_is_stripe {
+            self.refuse_dying_parent(new_parent).await?;
+        }
 
         // **§5.4a M1**, with the PLURAL participant set the owner side
         // already uses (`service.rs`'s loop over both `(parent, name)`
@@ -4058,30 +4108,25 @@ impl Metadata for RoutedMetaBackend {
             return r.unlink(parent, name).await;
         }
         // PR 7b (design §5.6.5): the name of a STRIPED parent is removed
-        // from its stripe; a striped CHILD directory is taken down by the
-        // rmdir protocol around the ordinary removal of its own name.
+        // from its stripe (re-homed there first if the directory's own
+        // tree still held it); a striped CHILD directory is taken down by
+        // the rmdir protocol — ONE intent under ONE guard set.
         let (key_parent, striped_child) = self.stripe_unlink_prelude(parent, name).await?;
-        if let Some(map) = &striped_child {
-            self.prepare_striped_rmdir(map.dir, map).await?;
+        match striped_child {
+            Some(map) => self.rmdir_striped(key_parent, name, &map).await,
+            None => self.unlink_at(key_parent, name).await,
         }
-        let out = self.unlink_at(key_parent, name).await;
-        if let Some(map) = &striped_child {
-            match &out {
-                Ok(_) => self.finish_striped_rmdir(map.dir, map).await,
-                Err(_) => self.abort_striped_rmdir(map).await,
-            }
-        }
-        out
     }
     async fn link(&self, ino: Ino, new_parent: Ino, new_name: &str) -> Result<Inode> {
         if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino, new_parent]) {
             return r.link(ino, new_parent, new_name).await;
         }
         // PR 7b: a new name in a STRIPED directory is keyed under its
-        // stripe (the EEXIST screen covers both homes while migrating).
-        let new_parent = match self.stripe_route(new_parent, new_name).await? {
+        // stripe (the EEXIST screen covers both homes).
+        let dest_route = self.stripe_route(new_parent, new_name).await?;
+        let new_parent = match &dest_route {
             Some(route) => {
-                self.stripe_insert_parent(new_parent, new_name, &route)
+                self.stripe_insert_parent(new_parent, new_name, route)
                     .await?
             }
             None => new_parent,
@@ -4165,6 +4210,11 @@ impl Metadata for RoutedMetaBackend {
         // PR M7 (Issue 13): Arc the op's guard set for its commit(s).
         let guards: std::sync::Arc<[dlm::DlmGuard]> = std::sync::Arc::from(_guards);
 
+        // PR 7b: a stripe an `rmdir`'s intent marked dying refuses the
+        // insert under the guard (R26's closer — every insert path).
+        if dest_route.is_some() {
+            self.refuse_dying_parent(new_parent).await?;
+        }
         if self
             .find_dentry_routed(parent_v_idx, local_parent, new_name)
             .await?
@@ -4231,7 +4281,15 @@ impl Metadata for RoutedMetaBackend {
                     },
                 ],
             };
-            let done = crossvol_tx::execute(self, &plan, guards).await?;
+            let done = match crossvol_tx::execute(self, &plan, guards).await {
+                Ok(d) => d,
+                // PR 7b: the holder's witness refusal of an insert into a
+                // dying stripe is the plan's `EEXIST`; the op's is `ENOENT`.
+                Err(e) if dest_route.is_some() => {
+                    return Err(self.dying_parent_errno(new_parent, e).await)
+                }
+                Err(e) => return Err(e),
+            };
             // The reply is served from the count step's post-image (the
             // applier folds the pending-times refinement into it — the
             // generic/423 monotone-ctime discipline).
@@ -4280,31 +4338,32 @@ impl Metadata for RoutedMetaBackend {
             ));
         }
         // PR 7b (design §5.6.5): each side of a rename under a STRIPED
-        // parent is keyed under that name's stripe — the source where the
-        // name IS (its stripe, or the directory's own tree while
-        // migrating), the destination where the new name GOES. A rename
-        // within one striped directory across two stripes is then the
-        // ordinary two-parent rename, cross-owner when the stripes'
-        // holders differ (PR 6's intent). The ancestry walk stays exact
-        // through a stripe: a stripe is a child of its directory in the
-        // dentry graph (the map entry names it), so a hop that lands on
-        // a stripe continues to the directory.
+        // parent is keyed under that name's STRIPE — a name still in the
+        // directory's own tree (the source, or an overwrite/exchange
+        // destination) is re-homed there first (`stripe_mutation_parent`,
+        // Issue 4), so the body's revalidation under its guards is exact
+        // against one home. A rename within one striped directory across
+        // two stripes is then the ordinary two-parent rename, cross-owner
+        // when the stripes' holders differ (PR 6's intent). The ancestry
+        // walk stays exact through a stripe: a stripe is a child of its
+        // directory in the dentry graph (the map entry names it), so a hop
+        // that lands on a stripe continues to the directory.
         let old_parent = match self.stripe_route(old_parent, old_name).await? {
-            Some(route) => match self.stripe_locate(old_parent, old_name, &route).await? {
-                Some((home, _, _)) => home,
-                None => route.stripe,
-            },
+            Some(route) => {
+                self.stripe_mutation_parent(old_parent, old_name, &route)
+                    .await?
+            }
             None => old_parent,
         };
-        let new_parent = match self.stripe_route(new_parent, new_name).await? {
-            Some(route) => match self.stripe_locate(new_parent, new_name, &route).await? {
-                // The destination exists (an overwrite / exchange): the
-                // op meets it where it is.
-                Some((home, _, _)) => home,
-                None => route.stripe,
-            },
+        let dest_route = self.stripe_route(new_parent, new_name).await?;
+        let new_parent = match &dest_route {
+            Some(route) => {
+                self.stripe_mutation_parent(new_parent, new_name, route)
+                    .await?
+            }
             None => new_parent,
         };
+        let dest_is_stripe = dest_route.is_some();
         // Symmetric PR 6 (§5.6.4): the set-wide directory-rename lease is
         // the OUTERMOST lock — decided on an unguarded read of the
         // source's type (the body re-decides under its guards and hands
@@ -4347,6 +4406,7 @@ impl Metadata for RoutedMetaBackend {
                     new_name,
                     flags,
                     lease.is_some(),
+                    dest_is_stripe,
                 )
                 .await;
             if matches!(out, Ok(false)) {
@@ -4358,7 +4418,13 @@ impl Metadata for RoutedMetaBackend {
                     .await
                     .map_err(crate::error::SqueezefsError::from)?;
             }
-            return out.map(|_| ());
+            return match out {
+                Ok(_) => Ok(()),
+                // PR 7b: a shipped insert's witness refusal at a dying
+                // stripe is the plan's `EEXIST`; the op's is `ENOENT`.
+                Err(e) if dest_is_stripe => Err(self.dying_parent_errno(new_parent, e).await),
+                Err(e) => Err(e),
+            };
         }
     }
 

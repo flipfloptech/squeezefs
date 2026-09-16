@@ -7200,7 +7200,19 @@ impl KvMetaBackend {
         want: u32,
         class: super::alloc_ext_core::AllocClass,
     ) -> std::result::Result<Vec<super::appender::GrantRun>, KvError> {
-        let set = self.manager_gate(false)?;
+        // The INTERNAL class is the flush pass's own reactive refill — the
+        // grant a region's compactions need to REACH COVERAGE — so it is
+        // admitted during the shutdown fixpoint like the pass itself (the
+        // leave's gate: refused only on a failed volume). Behind the
+        // ordinary write gate it was refused "volume is shutting down"
+        // whenever a burst drained a floor-sized grant inside the final
+        // cycles, the pass deferred every SMO, the fixpoint never
+        // converged and the leave kept the region's page `Live` over an
+        // uncovered ring — acked records a probe could not see (PR 7b
+        // review round 1, Issue 21a; PR 3's grant path × PR 2's leave law).
+        // Bounded by the SMO's own image count (`GrantExhausted{needed}`).
+        let set =
+            self.manager_gate(matches!(class, super::alloc_ext_core::AllocClass::Internal))?;
         if appender_id == 0 {
             set.verbs.refusals.fetch_add(1, Ordering::Relaxed);
             return Err(KvError::Busy(format!(
@@ -12280,12 +12292,26 @@ impl KvMetaBackend {
         // rollback ladder). §4.11's unknown-ro degradation keeps its
         // shipped path: it is a WRITE mount holding Layer A, and its
         // replay residue is its own to make durable.
-        if matches!(
-            self.ro_cause,
-            ReadOnlyCause::ReaderMount
-                | ReadOnlyCause::CoWriterMount
-                | ReadOnlyCause::PeerOwnedVolume
-        ) {
+        //
+        // A PROBE (`open_probe` — the offline fsck's, every listing verb's)
+        // is a non-writer too (PR 7b review round 1, Issue 21b's finding):
+        // it opens `Writable`/`read_only = false` with no checkpoint task,
+        // so without this arm its teardown took the `else` branch and
+        // WROTE a checkpoint — on a forest volume whose writer died with
+        // unpublished slot trees, a ledger record advancing the tail past
+        // the window records the probe's own replay SKIPPED (a non-writer
+        // never mints), so the writer's next own-residue open replayed
+        // nothing and every such inode was lost (dangling dentries, fsck
+        // C10). Pinned by `sym_dir_stripe_tests::
+        // a_probe_over_a_live_page_records_no_inode_plane_verdict`.
+        if self.non_writer
+            || matches!(
+                self.ro_cause,
+                ReadOnlyCause::ReaderMount
+                    | ReadOnlyCause::CoWriterMount
+                    | ReadOnlyCause::PeerOwnedVolume
+            )
+        {
             // PR 5: a token reader's clean leave RELEASES its grants at
             // the holder (a wire call, no device write) — a departed
             // reader whose tokens stayed would cost the holder a full

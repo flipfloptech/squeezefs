@@ -18,19 +18,36 @@
 //! tree** (as built — the design's "`stripes` on the directory record"):
 //! a name whose first byte is NUL can never arrive through FUSE (the VFS
 //! refuses NUL inside a path component), so `\0sqz.stripe:NN → D_i`,
-//! `\0sqz.striped → D` (the COMMIT marker: the map is live iff it exists)
-//! and `\0sqz.migrating → D` are records no user op can name, filtered
-//! from `readdir` at the ONE routed pager. Why dentries and not a new
-//! record codec: (1) the map then RIDES `D`'s token verbatim — PR 5's
-//! grant pages a directory's dentry set — with no token-API change; (2)
-//! the flip is `K + 2` `InsertDentry` steps of ONE PR 6 intent, so the
-//! whole §5.6 protocol (intent, roll-forward, the kill seams) is reused
-//! with no new step kind and no new applier; (3) C9's dentry pass marks
-//! every marker's TARGET, so a stripe ino named by its map is REFERENCED
-//! and an orphan stripe is C9's class exactly as §5.6.5 states. **No
-//! slot-tree KEY kind is added**: bit 17's kind set stays PR 1 + PR 7's;
-//! what this rung adds to the bit's meaning is the reserved NUL name
-//! space inside kind `0x02` (design §7.1).
+//! `\0sqz.striped → D_0` (the COMMIT marker: the map is live iff it
+//! exists and names stripe 0) and `\0sqz.migrating → D_0` are records no
+//! user op can name, filtered from `readdir` at the ONE routed pager. No
+//! marker names `D` itself — a self-reference is the reverse dentry
+//! scan's first hit whenever `D` sorts below its parent, and `..` would
+//! answer `D` (Issue 3). Why dentries and not a new record codec: (1)
+//! the map then RIDES `D`'s token verbatim — PR 5's grant pages a
+//! directory's dentry set — with no token-API change; (2) the flip is
+//! `K + 2` `InsertDentry` steps of ONE PR 6 intent, so the whole §5.6
+//! protocol (intent, roll-forward, the kill seams) is reused with no new
+//! step kind and no new applier; (3) C9's dentry pass marks every
+//! marker's TARGET, so a stripe ino named by its map is REFERENCED and an
+//! orphan stripe is C9's class exactly as §5.6.5 states. **No slot-tree
+//! KEY kind is added**: bit 17's kind set stays PR 1 + PR 7's; what this
+//! rung adds to the bit's meaning is the reserved NUL name space inside
+//! kind `0x02` (design §7.1). **A stripe never carries a map** (Issue 1):
+//! a `DIR_STRIPE` ino is no flip candidate at the trigger, the xattr or
+//! the `-o stripe_dirs` mkdir — the census skips a known stripe, and the
+//! flip's belt is the reverse scan (`is_stripe`), run once per stripe.
+//!
+//! **Where a name IS** (Issue 4 — the mutation paths made migration-
+//! safe): `D`'s own tree is a PERMANENT secondary home of user names for
+//! every READ (`stripe_locate`, the `readdir` merge — the stripe wins
+//! where both hold a name), and every MUTATION keys the STRIPE: a name
+//! found in `D`'s own tree is re-homed first (`rehome_name`, the same
+//! `migrate_one` the background migration runs, under the same guards),
+//! then the op revalidates under its guards against the stripe alone.
+//! The `migrating` marker is the background migration's durable cursor,
+//! not a routing switch, and its clear re-verifies `D`'s tree EMPTY of
+//! user names under the exclusive guard.
 //!
 //! **Where the stripes live**: on `D`'s VOLUME (so every stripe's dentry
 //! keys carry `D`'s volume's hash seed and the K-way `readdir` merge has
@@ -50,19 +67,29 @@
 //! so an offline probe reads a near-current value; nothing ships per
 //! insert, and no delta can be lost or double-applied.
 //!
-//! **`rmdir D`**: under `D`'s exclusive 4a guard and the S10 mutation
-//! permit (the "exclusive token": every reader's token on `D` is recalled
-//! and no new grant issues while it is held), the holder MARKS every
-//! stripe dying (`SetNlink 2 → 0`, one intent), then probes each stripe
-//! `IsEmpty` UNDER the mark — an insert into a dying stripe is refused
-//! `ENOENT` at its holder, so a create that raced the first probe is
-//! either seen by the second or refused — then removes the markers,
-//! unlinks `D` from its parent and destroys the stripes (`DestroyStripe`;
-//! a stripe whose destroy the process did not reach is an `nlink == 0`
-//! corpse the next mount's sweep reclaims). A non-empty stripe under the
-//! mark REVIVES the set and answers `ENOTEMPTY`.
+//! **`rmdir D`** (§5.6.5 "K `DestroyStripe` ships + `D`'s destroy in ONE
+//! intent"; R26): under the S10 mutation permit and ONE guard set held
+//! for the whole act — `I{parent}` + `D{parent, D}`, `I{D}` exclusive,
+//! `I{D_i}` EXCLUSIVE on every stripe (travelling to a foreign holder),
+//! `D{D, marker}` on every marker — the holder probes `D`'s own tree
+//! (markers only), every stripe's count (`nlink 2` — a subdirectory is
+//! `> 2`) and every stripe `IsEmpty` (exact under the exclusive guards:
+//! every insert that took a stripe's guard has landed, none can be in
+//! flight), refuses `ENOTEMPTY` having written NOTHING, and otherwise
+//! writes ONE intent: `D`'s dentry out of its parent, the markers out of
+//! `D` (the commit marker first — a reader between steps sees no map),
+//! `SetNlink 2 → 0` on every stripe (the DYING mark) and on `D`. A kill
+//! at any step rolls FORWARD to the whole removal at the next lessee, so
+//! no window leaves `nlink 0` stripes under a LIVE map for the corpse
+//! sweep to destroy (review round 1, Issue 2). An insert that parked on a
+//! stripe's guard behind the rmdir resumes to a parent whose record reads
+//! `nlink 0` and refuses `ENOENT` (`refuse_dying_parent`, under the
+//! insert's own guard — every insert path: create, link, rename's
+//! destination, the served step; Issue 6). The stripes' records are then
+//! destroyed as hygiene (`DestroyStripe`; a stripe left is an `nlink 0`
+//! corpse named by no map — the sweep's).
 
-use super::crossvol_tx::{self, XvOp, XvPlan, XvStep, XvStepStatus};
+use super::crossvol_tx::{self, XvOp, XvPlan, XvStep};
 use super::dlm;
 use super::kv::backend::{KvMetaBackend, RoutedParentUpdate};
 use super::kv::record::{dentry_name_hash54, forest_slot_of_ino, ForestSlot};
@@ -98,10 +125,19 @@ pub const STRIPES_XATTR: &str = "user.squeezefs.stripes";
 /// NUL byte is unreachable from FUSE (the VFS refuses NUL inside a
 /// component), so no user name can ever collide with one or read one.
 const STRIPE_MARKER: &str = "\u{0}sqz.stripe:";
-/// `\0sqz.striped → D` — the COMMIT marker; the map is live iff present.
+/// `\0sqz.striped → D_0` — the COMMIT marker; the map is live iff present
+/// AND it names stripe 0's ino (a torn or planted marker names nothing
+/// the entries agree with). **Never `D` itself**: a dentry under `D`
+/// naming `D` is the FIRST hit of the reverse dentry scan whenever `D`'s
+/// key sorts below its real parent's, and `..` of `D` would resolve to
+/// `D` on the reconnect path (review round 1, Issue 3) — so no marker
+/// self-references.
 pub const STRIPED_MARKER: &str = "\u{0}sqz.striped";
-/// `\0sqz.migrating → D` — names may still live in `D`'s own tree.
+/// `\0sqz.migrating → D_0` — the lazy re-homing has not finished (the
+/// resume's durable cursor; the same non-self-reference law).
 pub const MIGRATING_MARKER: &str = "\u{0}sqz.migrating";
+/// The stripe index the commit and migrating markers NAME.
+pub const MARKER_TARGET_INDEX: u16 = 0;
 
 /// A decoded marker name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,11 +150,17 @@ pub enum Marker {
     Migrating,
 }
 
-/// The marker name of stripe `i` (two decimal digits — `STRIPES_MAX` is
-/// 64; the decoder accepts up to three so a wider future `K` decodes).
+/// The marker name of stripe `i` — exactly two decimal digits
+/// (`STRIPES_MAX` is 64). The decoder is the encoder's inverse and
+/// nothing wider: a wider `K` needs a wider encoder, and the codec's
+/// law is `parse_marker(stripe_marker_name(i)) == Stripe(i)` AND
+/// `stripe_marker_name(i) == name` for every name that decodes.
 pub fn stripe_marker_name(i: u16) -> String {
     format!("{STRIPE_MARKER}{i:02}")
 }
+
+/// The width the encoder writes (the decoder refuses every other).
+const STRIPE_MARKER_DIGITS: usize = 2;
 
 /// Is `name` in the reserved marker space (any NUL-led name — every
 /// marker starts with NUL and nothing user-reachable does)?
@@ -128,8 +170,11 @@ pub fn is_marker_name(name: &str) -> bool {
 }
 
 /// Decode a marker name; `None` for every name that is not one of the
-/// three shapes (a NUL-led name outside the codec is filtered from
-/// `readdir` like a marker but names nothing). Total: never panics.
+/// three shapes IN THE FORM THE ENCODER WRITES (a NUL-led name outside
+/// the codec is filtered from `readdir` like a marker but names nothing:
+/// `\0sqz.stripe:5` and `\0sqz.stripe:005` are not markers — a canonical
+/// codec is what lets fsck's census and the router agree about one
+/// tree). Total: never panics.
 pub fn parse_marker(name: &[u8]) -> Option<Marker> {
     let name = std::str::from_utf8(name).ok()?;
     if name == STRIPED_MARKER {
@@ -139,7 +184,7 @@ pub fn parse_marker(name: &[u8]) -> Option<Marker> {
         return Some(Marker::Migrating);
     }
     let digits = name.strip_prefix(STRIPE_MARKER)?;
-    if digits.is_empty() || digits.len() > 3 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    if digits.len() != STRIPE_MARKER_DIGITS || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let i: u16 = digits.parse().ok()?;
@@ -189,43 +234,27 @@ pub static DIR_STRIPE_DYING_REFUSALS: AtomicU64 = AtomicU64::new(0);
 /// `rmdir`s of striped directories completed.
 pub static DIR_STRIPE_RMDIRS: AtomicU64 = AtomicU64::new(0);
 
+/// Names a mutation found in `D`'s own tree and re-homed into their
+/// stripe on the way (a stale-route insert's or a mid-migration name's
+/// self-healing; Issue 4).
+pub static DIR_STRIPE_REHOMED_ON_TOUCH: AtomicU64 = AtomicU64::new(0);
+
 /// Test seam: hold the BACKGROUND migration a flip would kick, so a
 /// contract observes the `migrating` state (names in both homes, the
 /// fallback lookup, the LWW rule) and drives [`RoutedMetaBackend::
 /// migrate_dir`] itself. Never set in production.
 pub static TEST_STRIPE_HOLD_MIGRATION: AtomicBool = AtomicBool::new(false);
 
-/// The family as the stats inode publishes it.
-pub fn stats_json() -> serde_json::Map<String, serde_json::Value> {
-    let mut m = serde_json::Map::new();
-    let put = |m: &mut serde_json::Map<String, serde_json::Value>, k: &str, v: &AtomicU64| {
-        m.insert(k.to_string(), serde_json::json!(v.load(Ordering::Relaxed)));
-    };
-    put(&mut m, "dir_striped_dirs", &DIR_STRIPED_DIRS);
-    put(&mut m, "dir_stripe_flips", &DIR_STRIPE_FLIPS);
-    put(&mut m, "dir_stripe_supply_rpcs", &DIR_STRIPE_SUPPLY_RPCS);
-    put(&mut m, "dir_stripe_ships", &DIR_STRIPE_SHIPS);
-    put(
-        &mut m,
-        "dir_stripe_readdir_merges",
-        &DIR_STRIPE_READDIR_MERGES,
-    );
-    put(
-        &mut m,
-        "dir_stripe_migrated_names",
-        &DIR_STRIPE_MIGRATED_NAMES,
-    );
-    put(&mut m, "dir_stripe_time_batches", &DIR_STRIPE_TIME_BATCHES);
-    put(
-        &mut m,
-        "dir_stripe_dying_refusals",
-        &DIR_STRIPE_DYING_REFUSALS,
-    );
-    put(&mut m, "dir_stripe_rmdirs", &DIR_STRIPE_RMDIRS);
-    m
-}
+/// Test seam: a striped `rmdir` holds its whole guard set for this many
+/// ms between the probes and its intent (0 = off), raising
+/// [`TEST_STRIPE_RMDIR_GUARDS_HELD`] meanwhile — the window a racing
+/// create / link / rename parks in, to be refused `ENOENT` after (the
+/// R26 pin, Issue 6). Never set in production.
+pub static TEST_STRIPE_RMDIR_HOLD_MS: AtomicU64 = AtomicU64::new(0);
+pub static TEST_STRIPE_RMDIR_GUARDS_HELD: AtomicBool = AtomicBool::new(false);
 
-/// Every gauge of the family, for the contracts' before/after reads.
+/// Every gauge of the family (the stats inode's JSON and the contracts'
+/// before/after reads are ONE read).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StripeStats {
     pub striped_dirs: u64,
@@ -237,6 +266,7 @@ pub struct StripeStats {
     pub time_batches: u64,
     pub dying_refusals: u64,
     pub rmdirs: u64,
+    pub rehomed_on_touch: u64,
 }
 
 pub fn stripe_stats() -> StripeStats {
@@ -250,7 +280,29 @@ pub fn stripe_stats() -> StripeStats {
         time_batches: DIR_STRIPE_TIME_BATCHES.load(Ordering::Relaxed),
         dying_refusals: DIR_STRIPE_DYING_REFUSALS.load(Ordering::Relaxed),
         rmdirs: DIR_STRIPE_RMDIRS.load(Ordering::Relaxed),
+        rehomed_on_touch: DIR_STRIPE_REHOMED_ON_TOUCH.load(Ordering::Relaxed),
     }
+}
+
+/// The family as the stats inode publishes it (design §11).
+pub fn stats_json() -> serde_json::Map<String, serde_json::Value> {
+    let s = stripe_stats();
+    let mut m = serde_json::Map::new();
+    for (k, v) in [
+        ("dir_striped_dirs", s.striped_dirs),
+        ("dir_stripe_flips", s.flips),
+        ("dir_stripe_supply_rpcs", s.supply_rpcs),
+        ("dir_stripe_ships", s.ships),
+        ("dir_stripe_readdir_merges", s.readdir_merges),
+        ("dir_stripe_migrated_names", s.migrated_names),
+        ("dir_stripe_time_batches", s.time_batches),
+        ("dir_stripe_dying_refusals", s.dying_refusals),
+        ("dir_stripe_rmdirs", s.rmdirs),
+        ("dir_stripe_rehomed_on_touch", s.rehomed_on_touch),
+    ] {
+        m.insert(k.to_string(), serde_json::json!(v));
+    }
+    m
 }
 
 // ---------------------------------------------------------------------------
@@ -291,12 +343,18 @@ pub struct StripeRoute {
 
 /// One directory's foreign-creator census over the `T_idle` half-window
 /// pair (the [`crate::slot_lease_core::DominanceWindow`] shape, keyed by
-/// directory and CREATOR appender id).
+/// directory and CREATOR appender id). The served hot path pays one
+/// `BTreeMap` increment and two O(1) reads (Issue 11); the heaviest-first
+/// SORT runs once, when the decision is due.
 #[derive(Debug, Default)]
 struct DirCensus {
     epoch: u64,
     cur: BTreeMap<u32, u64>,
     prev: BTreeMap<u32, u64>,
+    /// Σ over both halves.
+    total: u64,
+    /// Distinct creators over both halves.
+    distinct: u64,
 }
 
 impl DirCensus {
@@ -308,11 +366,29 @@ impl DirCensus {
                 self.prev.clear();
                 self.cur.clear();
             }
+            self.total = self.prev.values().sum();
+            self.distinct = self.prev.len() as u64;
             self.epoch = epoch;
         }
     }
 
-    /// Creators by ops over the window, heaviest first.
+    /// One served insert from `creator`.
+    fn note(&mut self, creator: u32) {
+        let fresh = !self.cur.contains_key(&creator) && !self.prev.contains_key(&creator);
+        *self.cur.entry(creator).or_default() += 1;
+        self.total += 1;
+        if fresh {
+            self.distinct += 1;
+        }
+    }
+
+    /// The trigger's two inputs without a sort.
+    fn due(&self, n_floor: u64) -> bool {
+        self.distinct >= 2 && self.total > n_floor
+    }
+
+    /// Creators by ops over the window, heaviest first (the sort — run
+    /// when the decision is due, and for the contracts' reads).
     fn heaviest(&self) -> Vec<(u32, u64)> {
         let mut by: BTreeMap<u32, u64> = self.prev.clone();
         for (c, n) in &self.cur {
@@ -329,16 +405,39 @@ impl DirCensus {
 /// `REQUESTERS_PER_SLOT_MAX` posture one level up).
 const CENSUS_DIRS_MAX: usize = 1024;
 
+/// The migration scan's raw page: the KV walkers' page (`SCAN_PAGE` =
+/// 512 in `kv::backend` and `fsck`) — one bounded read per step, every
+/// page re-read at the next round.
+const MIGRATION_SCAN_PAGE: usize = 512;
+
+/// The negative map cache's bound (the holder's "not striped" hints):
+/// a HINT flushed whole at the cap — 64 Ki entries × 16 B ≈ 1 MiB of RAM,
+/// re-learnt at one tree descent per directory.
+const UNSTRIPED_CACHE_MAX: usize = 65_536;
+
 /// The mount's striping state, one per [`RoutedMetaBackend`].
 pub struct StripeState {
-    /// `D → its map`, for directories whose migration finished (a map
-    /// still migrating is re-read per op — the migration is short-lived
-    /// and its flag is the truth). Invalidated by the local rmdir.
+    /// `D → its map` (finished OR migrating — a stale `migrating: true`
+    /// costs one probe of `D`'s tree more, never a wrong answer; the
+    /// clear invalidates it on the holder). Invalidated by the local
+    /// rmdir.
     maps: scc::HashMap<Ino, Arc<StripeMap>>,
+    /// The HOLDER's negative cache: directories this mount holds whose
+    /// tree carries no commit marker. Only the holder flips a directory
+    /// it holds, so its own flip is the one invalidation (Issue 12);
+    /// consulted only while `served_here(dir)`.
+    unstriped: scc::HashMap<Ino, ()>,
+    /// Inos known to be STRIPES (learnt from every map read and every
+    /// mint): never a flip candidate, never a census entry (Issue 1).
+    known_stripes: scc::HashSet<Ino>,
     /// The flip trigger's census: foreign creators per directory.
     census: Mutex<BTreeMap<Ino, DirCensus>>,
     /// Directories whose flip or migration this mount is running.
     in_flight: scc::HashSet<Ino>,
+    /// `D → the monotonic ns of its last times persist` — the fold's
+    /// write-back runs once per checkpoint cadence per directory
+    /// (Issue 8), never per `stat`.
+    times_persisted_ns: scc::HashMap<Ino, u64>,
     /// `-o stripe_dirs`: every `mkdir` under an armed volume stripes at
     /// creation (the DNE-2 default).
     stripe_at_mkdir: AtomicBool,
@@ -359,8 +458,11 @@ impl StripeState {
     pub fn new() -> Self {
         Self {
             maps: scc::HashMap::new(),
+            unstriped: scc::HashMap::new(),
+            known_stripes: scc::HashSet::new(),
             census: Mutex::new(BTreeMap::new()),
             in_flight: scc::HashSet::new(),
+            times_persisted_ns: scc::HashMap::new(),
             stripe_at_mkdir: AtomicBool::new(false),
             me: std::sync::OnceLock::new(),
         }
@@ -368,6 +470,42 @@ impl StripeState {
 
     fn census(&self) -> std::sync::MutexGuard<'_, BTreeMap<Ino, DirCensus>> {
         self.census.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn learn_stripes(&self, stripes: &[Ino]) {
+        for s in stripes {
+            let _ = self.known_stripes.insert_sync(*s);
+        }
+    }
+
+    fn note_unstriped(&self, dir: Ino) {
+        if self.unstriped.len() >= UNSTRIPED_CACHE_MAX {
+            self.unstriped.retain_sync(|_, _| false);
+        }
+        let _ = self.unstriped.insert_sync(dir, ());
+    }
+}
+
+/// One stream of the K-way `readdir` merge: a stripe's (or `D`'s own)
+/// filtered page and its resume cookie.
+struct MergeStream {
+    buf: std::collections::VecDeque<(u64, DirEntry)>,
+    cursor: u64,
+    exhausted: bool,
+}
+
+/// The smallest per-stream refill: the shipped readdir's smallest useful
+/// page (a `getdents` of a few entries) — below it the per-refill call
+/// overhead dominates the entries it returns.
+const MERGE_STREAM_PAGE_FLOOR: usize = 8;
+
+/// The 54-bit dentry hash a real-entry readdir cookie was issued for
+/// (the cookie is the dentry key suffix + the shipped bias; `0` for the
+/// reserved offsets, which no merged entry carries).
+fn readdir_cookie_hash54(cookie: u64) -> u64 {
+    match super::kv::record::decode_readdir_cookie(cookie) {
+        Ok(super::kv::record::ReaddirPos::AfterEntry { hash54, .. }) => hash54,
+        _ => 0,
     }
 }
 
@@ -413,6 +551,13 @@ impl RoutedMetaBackend {
         self.volumes
             .get(volume_idx)
             .is_some_and(|v| v.slot_lease_armed())
+    }
+
+    /// [`Self::stripes_armed`] for GLOBAL `ino`'s volume — the FUSE
+    /// boundary's gate on the `user.squeezefs.stripes` command (an
+    /// unarmed mount treats the name as the reserved one it is).
+    pub fn striping_armed(&self, ino: Ino) -> bool {
+        self.stripes_armed(self.route_ino(ino).0)
     }
 
     /// Install the set's own handle for the background arms (once, at
@@ -467,29 +612,54 @@ impl RoutedMetaBackend {
     }
 
     /// **The stripe map of `dir`**, `None` when `dir` is not striped (or
-    /// the plane is unarmed on its volume). A finished map is cached; a
-    /// migrating one is re-read (its flag is the truth of the moment) and
-    /// its migration kicked single-flight when this mount holds `dir`.
+    /// the plane is unarmed on its volume). Cached — finished or
+    /// migrating (Issue 12); a migrating map re-kicks its migration
+    /// single-flight when this mount holds `dir` (a paused one resumes at
+    /// the next access). The holder keeps a negative cache too, invalidated
+    /// by its own flip — the one act that stripes a directory it holds.
     pub async fn stripe_map(&self, dir: Ino) -> Result<Option<Arc<StripeMap>>> {
         let (v, local) = self.route_ino(dir);
         if !self.stripes_armed(v) {
             return Ok(None);
         }
         if let Some(m) = self.dir_stripes.maps.read_sync(&dir, |_, m| Arc::clone(m)) {
+            if m.migrating && self.served_here(dir) {
+                self.kick_migration(dir);
+            }
             return Ok(Some(m));
         }
+        let holder = self.served_here(dir);
+        if holder && self.dir_stripes.unstriped.contains_sync(&dir) {
+            return Ok(None);
+        }
+        let Some(map) = self.read_map_from_markers(dir, v, local).await? else {
+            if holder {
+                self.dir_stripes.note_unstriped(dir);
+            }
+            return Ok(None);
+        };
+        let map = Arc::new(map);
+        self.dir_stripes.learn_stripes(&map.stripes);
+        let _ = self.dir_stripes.maps.insert_sync(dir, Arc::clone(&map));
+        if map.migrating && holder {
+            self.kick_migration(dir);
+        }
+        Ok(Some(map))
+    }
+
+    /// The map as `dir`'s markers name it — `None` = not striped (no
+    /// commit marker, a commit marker naming anything but stripe 0, or
+    /// fewer than two entries: a torn or planted map is never guessed
+    /// from; fsck C17 reports it).
+    async fn read_map_from_markers(
+        &self,
+        dir: Ino,
+        v: usize,
+        local: Ino,
+    ) -> Result<Option<StripeMap>> {
         let Some((commit, _)) = self.find_dentry_routed(v, local, STRIPED_MARKER).await? else {
             return Ok(None);
         };
-        if commit != dir {
-            // A commit marker naming another ino is a planted or torn
-            // record — the map is not live, never guessed from.
-            log::warn!(
-                "directory {dir}: the stripe commit marker names ino {commit}, not the \
-                 directory — the map is ignored (fsck C17 reports it)"
-            );
-            return Ok(None);
-        }
         let mut stripes = Vec::new();
         for i in 0..STRIPES_MAX {
             match self
@@ -500,11 +670,13 @@ impl RoutedMetaBackend {
                 None => break,
             }
         }
-        if stripes.len() < 2 {
+        if stripes.len() < 2 || stripes[usize::from(MARKER_TARGET_INDEX)] != commit {
             log::warn!(
-                "directory {dir}: the stripe commit marker is present with {} stripe \
-                 marker(s) — the map is ignored (fsck C17 reports it)",
-                stripes.len()
+                "directory {dir}: the stripe commit marker names ino {commit} over {} stripe \
+                 entr{} (a live map has ≥ 2 and its commit marker names stripe 0) — the map is \
+                 ignored (fsck C17 reports it)",
+                stripes.len(),
+                if stripes.len() == 1 { "y" } else { "ies" }
             );
             return Ok(None);
         }
@@ -512,24 +684,18 @@ impl RoutedMetaBackend {
             .find_dentry_routed(v, local, MIGRATING_MARKER)
             .await?
             .is_some();
-        let map = Arc::new(StripeMap {
+        Ok(Some(StripeMap {
             dir,
             stripes,
             migrating,
-        });
-        if migrating {
-            if self.served_here(dir) {
-                self.kick_migration(dir);
-            }
-        } else {
-            let _ = self.dir_stripes.maps.insert_sync(dir, Arc::clone(&map));
-        }
-        Ok(Some(map))
+        }))
     }
 
-    /// Forget a cached map (the local rmdir / the migration's clear).
+    /// Forget a cached map (the local rmdir / the migration's clear / a
+    /// flip's commit — the next read is the markers').
     fn forget_map(&self, dir: Ino) {
         self.dir_stripes.maps.remove_sync(&dir);
+        self.dir_stripes.unstriped.remove_sync(&dir);
     }
 
     /// **The routing arm**: where `(parent, name)` lives when `parent`
@@ -548,9 +714,10 @@ impl RoutedMetaBackend {
     }
 
     /// **Where an EXISTING name of a striped directory is** — the stripe
-    /// when the stripe holds it, `D`'s own tree while `migrating` and the
-    /// stripe misses (the LWW rule: the stripe wins). `None` when the
-    /// name is nowhere.
+    /// when the stripe holds it, `D`'s own tree otherwise (the permanent
+    /// secondary home: a name the migration has not moved, or one a
+    /// stale route inserted after it; the LWW rule: the stripe wins).
+    /// `None` when the name is nowhere.
     pub async fn stripe_locate(
         &self,
         parent: Ino,
@@ -561,38 +728,65 @@ impl RoutedMetaBackend {
         if let Some((child, ft)) = self.find_dentry_routed(sv, slocal, name).await? {
             return Ok(Some((route.stripe, child, ft)));
         }
-        if route.map.migrating {
-            let (pv, plocal) = self.route_ino(parent);
-            if let Some((child, ft)) = self.find_dentry_routed(pv, plocal, name).await? {
-                return Ok(Some((parent, child, ft)));
-            }
+        let (pv, plocal) = self.route_ino(parent);
+        if let Some((child, ft)) = self.find_dentry_routed(pv, plocal, name).await? {
+            return Ok(Some((parent, child, ft)));
         }
         Ok(None)
     }
 
     /// The KEY parent a NEW name in a striped directory is inserted under
-    /// (always the stripe), after the EEXIST screen over BOTH homes while
-    /// migrating.
+    /// (always the stripe), after the EEXIST screen over `D`'s own tree
+    /// (the stripe's own dentry is screened under the insert's guard by
+    /// the routed insert itself).
     pub async fn stripe_insert_parent(
         &self,
         parent: Ino,
         name: &str,
         route: &StripeRoute,
     ) -> Result<Ino> {
-        if route.map.migrating {
-            let (pv, plocal) = self.route_ino(parent);
-            if self.find_dentry_routed(pv, plocal, name).await?.is_some() {
-                return Err(SqueezefsError::already_exists("File already exists"));
-            }
+        let (pv, plocal) = self.route_ino(parent);
+        if self.find_dentry_routed(pv, plocal, name).await?.is_some() {
+            return Err(SqueezefsError::already_exists("File already exists"));
+        }
+        Ok(route.stripe)
+    }
+
+    /// **The KEY parent a MUTATION of an existing name runs against** —
+    /// always the stripe: a name still in `D`'s own tree is re-homed
+    /// FIRST (`rehome_name` — the migration's own move, under the same
+    /// guards, so the two serialize and the second finds the work done),
+    /// then the op revalidates under its guards against the stripe alone
+    /// (Issue 4: a routing decision read once and never re-validated gave
+    /// spurious `ENOENT`s racing the migration and stranded a rename's
+    /// destination in `D`'s tree).
+    pub async fn stripe_mutation_parent(
+        &self,
+        parent: Ino,
+        name: &str,
+        route: &StripeRoute,
+    ) -> Result<Ino> {
+        let (pv, plocal) = self.route_ino(parent);
+        if let Some((child, ft)) = self.find_dentry_routed(pv, plocal, name).await? {
+            let entry = DirEntry {
+                ino: child,
+                name: name.to_string(),
+                file_type: ft,
+            };
+            self.migrate_one(parent, pv, plocal, &route.map, &entry)
+                .await?;
+            DIR_STRIPE_REHOMED_ON_TOUCH.fetch_add(1, Ordering::Relaxed);
         }
         Ok(route.stripe)
     }
 
     /// The `unlink`/`rmdir` prelude: the KEY parent the name is removed
-    /// from (its stripe when `parent` is striped — where the name IS, the
-    /// directory's own tree while migrating), and the map of the CHILD
-    /// when it is a striped directory (the rmdir protocol's subject).
-    /// Unguarded pre-reads: the removal revalidates under its guards.
+    /// from (its stripe when `parent` is striped — the name re-homed there
+    /// first if it still sat in the directory's own tree), and the map of
+    /// the CHILD when it is a striped directory (the rmdir protocol's
+    /// subject — probed and removed by [`Self::rmdir_striped`] under ONE
+    /// guard set). Unguarded pre-reads: the removal revalidates under its
+    /// guards.
     pub async fn stripe_unlink_prelude(
         &self,
         parent: Ino,
@@ -603,10 +797,7 @@ impl RoutedMetaBackend {
             return Ok((parent, None));
         }
         let key_parent = match self.stripe_route(parent, name).await? {
-            Some(route) => match self.stripe_locate(parent, name, &route).await? {
-                Some((home, _, _)) => home,
-                None => route.stripe,
-            },
+            Some(route) => self.stripe_mutation_parent(parent, name, &route).await?,
             None => parent,
         };
         let (kv_idx, klocal) = self.route_ino(key_parent);
@@ -614,41 +805,74 @@ impl RoutedMetaBackend {
             Some((child, ft)) if ft == libc::S_IFDIR => child,
             _ => return Ok((key_parent, None)),
         };
-        let map = self.stripe_map(child).await?;
-        if let Some(m) = &map {
-            // The directory's OWN tree must hold nothing but markers (a
-            // name not yet migrated is an entry): the stripes are probed
-            // under the mark by the protocol proper.
-            if !self.serve_is_empty_covered(child, true).await? {
-                return Err(SqueezefsError::Io(std::io::Error::from_raw_os_error(
-                    libc::ENOTEMPTY,
-                )));
-            }
-            log::debug!("rmdir of striped directory {} ({} stripes)", m.dir, m.k());
-        }
-        Ok((key_parent, map))
+        Ok((key_parent, self.stripe_map(child).await?))
     }
 
-    /// A stripe whose record reads `nlink == 0` is DYING (an `rmdir` in
-    /// flight): an insert into it is refused `ENOENT` — the R26 closer.
-    /// Read under the caller's held `I{stripe}` guard.
-    pub async fn refuse_dying_stripe(&self, stripe: Ino) -> Result<()> {
-        let (v, local) = self.route_ino(stripe);
+    /// A parent whose record reads `nlink == 0` — or has NO record (a
+    /// stripe already destroyed behind its rmdir's intent) — is DYING or
+    /// GONE, and an insert into it is refused `ENOENT`: the R26 closer,
+    /// read under the insert's held `I{parent}` guard at EVERY insert
+    /// path (create, link, rename's destination, the served step —
+    /// Issue 6). An insert that parked on the stripe's guard behind the
+    /// rmdir resumes to exactly one of the two shapes.
+    pub async fn refuse_dying_parent(&self, parent: Ino) -> Result<()> {
+        let (v, local) = self.route_ino(parent);
         match self.volumes[v].read_inode_value_routed(local).await? {
-            Some(rec) if rec.nlink == 0 => {
+            Some(rec) if rec.nlink != 0 => Ok(()),
+            Some(_) => {
                 DIR_STRIPE_DYING_REFUSALS.fetch_add(1, Ordering::Relaxed);
                 Err(SqueezefsError::Io(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
-                    format!("directory stripe {stripe} is being removed (rmdir in flight)"),
+                    format!("directory {parent} is being removed (rmdir in flight)"),
                 )))
             }
-            _ => Ok(()),
+            None => {
+                DIR_STRIPE_DYING_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                Err(SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("directory {parent} was removed (no record)"),
+                )))
+            }
         }
     }
 
+    /// The errno a SHIPPED insert's witness refusal means when the KEY
+    /// parent is a stripe: the holder answers a dying parent as a witness
+    /// refusal (`ForeignSkipped`, so a roll-forward retires the intent
+    /// instead of erroring at every cadence — Issue 13), which the plan
+    /// maps to `EEXIST`; the op's errno for "the directory is being
+    /// removed" is `ENOENT`, decided here on one record read of the error
+    /// path only.
+    pub async fn dying_parent_errno(&self, key_parent: Ino, e: SqueezefsError) -> SqueezefsError {
+        if e.to_errno() != libc::EEXIST {
+            return e;
+        }
+        let (v, local) = self.route_ino(key_parent);
+        match self.volumes[v].read_inode_value_routed(local).await {
+            Ok(Some(rec)) if rec.nlink != 0 => e,
+            Ok(_) => SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("directory {key_parent} is being removed (rmdir in flight)"),
+            )),
+            Err(_) => e,
+        }
+    }
+
+    /// Is GLOBAL `ino` a STRIPE (a nameless directory some map names)?
+    /// The known set first (learnt from every map read and mint); else
+    /// the reverse dentry scan — affordable where it runs (a flip
+    /// decision, never a per-op path), and learnt once.
+    pub async fn is_stripe(&self, ino: Ino) -> Result<bool> {
+        if self.dir_stripes.known_stripes.contains_sync(&ino) {
+            return Ok(true);
+        }
+        Ok(self.stripe_parent_dir(ino).await?.is_some())
+    }
+
     /// The directory a STRIPE belongs to, for the `..` reconnect scan:
-    /// the ONE dentry naming a stripe is its map entry in `D`, so the
-    /// reverse scan of the stripe answers `D`. `None` = not a stripe.
+    /// the ONLY dentries naming a stripe are its map entries in `D` (no
+    /// marker self-references — Issue 3), so the reverse scan of the
+    /// stripe answers `D`. `None` = not a stripe.
     pub async fn stripe_parent_dir(&self, maybe_stripe: Ino) -> Result<Option<Ino>> {
         let (v, _) = self.route_ino(maybe_stripe);
         if !self.stripes_armed(v) {
@@ -667,7 +891,6 @@ impl RoutedMetaBackend {
         };
         Ok(map.stripes.contains(&maybe_stripe).then_some(dir))
     }
-
     // -----------------------------------------------------------------
     // The flip.
     // -----------------------------------------------------------------
@@ -688,9 +911,10 @@ impl RoutedMetaBackend {
         self.flip_dir(dir, k, &creators).await
     }
 
-    /// [`Self::stripe_dir`] with the suppliers NAMED (the fleet-shape
-    /// contracts: the holder asks these appenders, in order, before
-    /// minting the remainder itself).
+    /// [`Self::stripe_dir`] with the suppliers NAMED — a CONTRACT face
+    /// (the fleet-shape contracts name the holders the trigger census
+    /// would have picked; no production caller).
+    #[doc(hidden)]
     pub async fn stripe_dir_with_suppliers(
         &self,
         dir: Ino,
@@ -700,13 +924,25 @@ impl RoutedMetaBackend {
         self.flip_dir(dir, k, suppliers).await
     }
 
+    /// The refusal every flip of a STRIPE answers (Issue 1: a stripe
+    /// cannot carry a map — its directory's routing never consults one,
+    /// so a nested map would strand every name of the stripe).
+    fn stripe_cannot_carry_a_map(dir: Ino, of: Ino) -> SqueezefsError {
+        SqueezefsError::InvalidOperation(format!(
+            "ino {dir} is a directory STRIPE of directory {of} and cannot carry a stripe map \
+             of its own (design-symmetric-metadata §5.6.5: a stripe's names route by its \
+             directory's map alone)"
+        ))
+    }
+
     /// The flip proper (§5.6.5): `K` `SupplyStripeIno`s (the creators
     /// first, the holder's own slots for the remainder), then ONE PR 6
     /// intent of `K + 2` marker inserts — every stripe entry, the
     /// `migrating` flag, the COMMIT marker LAST — so a reader sees
     /// either no map or the whole map, and a kill at any step rolls
     /// forward to the whole map; then the lazy migration, in the
-    /// background.
+    /// background. A STRIPE is never a candidate (the belt behind the
+    /// census's own skip).
     async fn flip_dir(&self, dir: Ino, k: u16, creators: &[u32]) -> Result<()> {
         let (v, local) = self.route_ino(dir);
         self.check_volume_enabled(v)?;
@@ -737,6 +973,11 @@ impl RoutedMetaBackend {
         if self.stripe_map(dir).await?.is_some() {
             return Ok(());
         }
+        if let Some(of) = self.stripe_parent_dir(dir).await? {
+            self.dir_stripes.learn_stripes(&[dir]);
+            self.dir_stripes.census().remove(&dir);
+            return Err(Self::stripe_cannot_carry_a_map(dir, of));
+        }
         // Single-flight per directory: a second trigger while the flip
         // runs (a storm of served inserts) joins nothing and does nothing.
         if self.dir_stripes.in_flight.insert_sync(dir).is_err() {
@@ -762,15 +1003,48 @@ impl RoutedMetaBackend {
         creators: &[u32],
     ) -> Result<()> {
         let holder = self.holder_of(dir);
+        // The op's guard set covers EVERY key its steps touch — `I{dir}`
+        // and each marker's `D{}` — so a foreign holder serving them under
+        // the travelling scope takes nothing (a key outside the scope
+        // would be taken at the holder while the initiator's parked
+        // `I{dir}` is held: the deadlock PR 6's coverage law forbids).
+        // Taken BEFORE the mints (Issue 20b): a concurrent explicit flip
+        // that won is found here, with nothing minted yet.
+        let marker_names: Vec<String> = (0..k)
+            .map(stripe_marker_name)
+            .chain([MIGRATING_MARKER.to_string(), STRIPED_MARKER.to_string()])
+            .collect();
+        let dents: Vec<(Ino, &str, dlm::LockMode)> = marker_names
+            .iter()
+            .map(|n| (local, n.as_str(), dlm::LockMode::Exclusive))
+            .collect();
+        let mut scope = None;
+        let guards: Arc<[dlm::DlmGuard]> = Arc::from(
+            self.lock_many_leased(v, &mut scope, &[(local, dlm::LockMode::Exclusive)], &dents)
+                .await?,
+        );
+        if self
+            .find_dentry_routed(v, local, STRIPED_MARKER)
+            .await?
+            .is_some()
+        {
+            self.forget_map(dir);
+            return Ok(());
+        }
+        // The mints: a fresh nameless directory per stripe, each in its
+        // supplier's slot. The mint's own `I{new}` guard is a key nobody
+        // waits for while holding one of ours (only this directory's flip
+        // and rmdir name its marker keys, and both take `I{dir}` first).
         let mut stripes = Vec::with_capacity(usize::from(k));
         let mut next_creator = creators.iter().copied().filter(|c| Some(*c) != holder);
+        let mut supplied_by: Vec<Option<u32>> = Vec::with_capacity(usize::from(k));
         for i in 0..k {
             let mut supplied = None;
             // A creator that declines or is gone is replaced by the next.
             for supplier in next_creator.by_ref() {
                 match self.supply_stripe_ino(dir, i, supplier, rec).await {
                     Ok(ino) => {
-                        supplied = Some(ino);
+                        supplied = Some((ino, Some(supplier)));
                         break;
                     }
                     Err(e) => log::info!(
@@ -779,12 +1053,21 @@ impl RoutedMetaBackend {
                     ),
                 }
             }
-            let ino = match supplied {
-                Some(ino) => ino,
-                None => self.mint_stripe_locally(dir, v, holder, rec).await?,
+            let (ino, by) = match supplied {
+                Some(s) => s,
+                None => match self.mint_stripe_locally(dir, v, holder, rec).await {
+                    Ok(ino) => (ino, None),
+                    Err(e) => {
+                        self.name_unmapped_stripes(dir, &stripes, &supplied_by);
+                        return Err(e);
+                    }
+                },
             };
             stripes.push(ino);
+            supplied_by.push(by);
         }
+        self.dir_stripes.learn_stripes(&stripes);
+        let target = stripes[usize::from(MARKER_TARGET_INDEX)];
         let mut steps: Vec<XvStep> = stripes
             .iter()
             .enumerate()
@@ -799,60 +1082,66 @@ impl RoutedMetaBackend {
         steps.push(XvStep::InsertDentry {
             parent: dir,
             name: MIGRATING_MARKER.to_string(),
-            child: dir,
+            child: target,
             ft_bits: libc::S_IFDIR,
             parent_update: crossvol_tx::parent_update_code(RoutedParentUpdate::None),
         });
         steps.push(XvStep::InsertDentry {
             parent: dir,
             name: STRIPED_MARKER.to_string(),
-            child: dir,
+            child: target,
             ft_bits: libc::S_IFDIR,
             parent_update: crossvol_tx::parent_update_code(RoutedParentUpdate::ExclusiveTimes),
         });
-        // The op's guard set covers EVERY key its steps touch — `I{dir}`
-        // and each marker's `D{}` — so a foreign holder serving them under
-        // the travelling scope takes nothing (a key outside the scope
-        // would be taken at the holder while the initiator's parked
-        // `I{dir}` is held: the deadlock PR 6's coverage law forbids).
-        let marker_names: Vec<String> = (0..k)
-            .map(stripe_marker_name)
-            .chain([MIGRATING_MARKER.to_string(), STRIPED_MARKER.to_string()])
-            .collect();
-        let dents: Vec<(Ino, &str, dlm::LockMode)> = marker_names
-            .iter()
-            .map(|n| (local, n.as_str(), dlm::LockMode::Exclusive))
-            .collect();
-        let mut scope = None;
-        let guards: Arc<[dlm::DlmGuard]> = Arc::from(
-            self.lock_many_leased(v, &mut scope, &[(local, dlm::LockMode::Exclusive)], &dents)
-                .await?,
-        );
-        // Re-check under the guard: a concurrent explicit flip lost the
-        // race and must not write a second map.
-        if self
-            .find_dentry_routed(v, local, STRIPED_MARKER)
-            .await?
-            .is_some()
-        {
-            return Ok(());
-        }
         let plan = XvPlan {
             op: XvOp::StripeDir,
             steps,
         };
-        crossvol_tx::execute(self, &plan, guards).await?;
+        // The negative cache goes BEFORE the write: a plan severed after
+        // its commit marker landed must not leave "unstriped" cached.
+        self.forget_map(dir);
+        if let Err(e) = crossvol_tx::execute(self, &plan, guards).await {
+            // The intent may or may not be durable (a failure at step 0
+            // committed neither; a later one rolls forward and the
+            // stripes become the map's) — the mints are never destroyed
+            // here, they are named LOUD as C9's class (Issue 20b: an
+            // orphaning that used to be silent).
+            self.name_unmapped_stripes(dir, &stripes, &supplied_by);
+            return Err(e);
+        }
+        self.forget_map(dir);
         DIR_STRIPE_FLIPS.fetch_add(1, Ordering::Relaxed);
         DIR_STRIPED_DIRS.fetch_add(1, Ordering::Relaxed);
         self.dir_stripes.census().remove(&dir);
         log::info!(
             "directory {dir} STRIPED into {k} stripes ({} supplied by creators {:?}, {} minted \
              by the holder) — names re-home lazily",
-            stripes.len().min(creators.len()),
+            supplied_by.iter().filter(|s| s.is_some()).count(),
             creators,
-            stripes.len().saturating_sub(creators.len())
+            supplied_by.iter().filter(|s| s.is_none()).count()
         );
         Ok(())
+    }
+
+    /// Stripes minted for a flip whose intent failed: the mount's own
+    /// mints and every supplied one are nameless `nlink 2` directories
+    /// until the intent rolls forward (durable) or for ever (never
+    /// durable — fsck C9's unreferenced-inode class, reported and
+    /// cleaned by the census). Named LOUD, never silent (Issue 20b).
+    fn name_unmapped_stripes(&self, dir: Ino, stripes: &[Ino], supplied_by: &[Option<u32>]) {
+        for (stripe, by) in stripes.iter().zip(supplied_by) {
+            self.dir_stripes.known_stripes.remove_sync(stripe);
+            log::warn!(
+                "flip of directory {dir} did not commit its map: stripe {stripe} ({}) is an \
+                 unreferenced nlink-2 directory until the flip's intent rolls forward — if \
+                 the intent never landed it is fsck C9's class (unreferenced inode), \
+                 reported and cleaned by the census",
+                match by {
+                    Some(s) => format!("supplied by appender {s}"),
+                    None => "minted by this mount".to_string(),
+                }
+            );
+        }
     }
 
     /// Mint one stripe ino in a slot `holder` leases on `dir`'s volume
@@ -915,6 +1204,7 @@ impl RoutedMetaBackend {
         // Every stripe mint is one supply — asked of a creator or the
         // holder's own (the served side of a wire ask counts here too).
         DIR_STRIPE_SUPPLY_RPCS.fetch_add(1, Ordering::Relaxed);
+        self.dir_stripes.learn_stripes(&[global]);
         log::debug!("minted stripe ino {global} (slot {slot}) for directory {dir}");
         Ok(global)
     }
@@ -1016,17 +1306,26 @@ impl RoutedMetaBackend {
     }
 
     /// **The automatic trigger** (§5.6.5): the holder served one foreign
-    /// insert into `dir` from `creator`. Counted over the `T_idle`
-    /// half-window pair per directory; when the window's foreign ships
-    /// exceed `N_floor` from ≥ 2 creators the flip is spawned (single-
-    /// flight, off the serving path). ONE creator never flips — that is
-    /// a handover candidate, not a striping one.
-    pub fn note_served_insert(&self, dir: Ino, creator: u32) {
+    /// insert of `name` into `dir` from `creator`. Counted over the
+    /// `T_idle` half-window pair per directory — one map increment and
+    /// two O(1) reads on the served path (Issue 11); the heaviest-first
+    /// sort runs once, when the decision is due. When the window's
+    /// foreign ships exceed `N_floor` from ≥ 2 creators the flip is
+    /// spawned (single-flight, off the serving path). ONE creator never
+    /// flips — that is a handover candidate, not a striping one. A known
+    /// STRIPE, an already-striped directory and a marker insert (the
+    /// flip's own steps, shipped to the holder by their suppliers) feed
+    /// nothing (Issue 1 / Issue 11).
+    pub fn note_served_insert(&self, dir: Ino, name: &str, creator: u32) {
         let (v, _) = self.route_ino(dir);
         let Some(plane) = self.volumes.get(v).and_then(|vol| vol.slot_leases()) else {
             return;
         };
-        if stripe_count() <= 1 {
+        if stripe_count() <= 1
+            || is_marker_name(name)
+            || self.dir_stripes.known_stripes.contains_sync(&dir)
+            || self.dir_stripes.maps.contains_sync(&dir)
+        {
             return;
         }
         let now = KvMetaBackend::now_ns_pub();
@@ -1042,11 +1341,10 @@ impl RoutedMetaBackend {
             }
             let c = census.entry(dir).or_default();
             c.align(epoch);
-            *c.cur.entry(creator).or_default() += 1;
-            let heaviest = c.heaviest();
-            flip_due(&heaviest, n_floor).then(|| FlipDecision {
+            c.note(creator);
+            c.due(n_floor).then(|| FlipDecision {
                 dir,
-                creators: heaviest.into_iter().map(|(c, _)| c).collect(),
+                creators: c.heaviest().into_iter().map(|(c, _)| c).collect(),
             })
         };
         if let Some(d) = decision {
@@ -1057,6 +1355,30 @@ impl RoutedMetaBackend {
                 return;
             };
             crate::meta_exec::spawn_meta_contained("dir_stripe_flip", async move {
+                // The belt before the flip: a stripe's census (a served
+                // insert into `D_i` names `D_i` as its parent) must never
+                // reach the flip — learnt once, quiet after.
+                match me.is_stripe(d.dir).await {
+                    Ok(true) => {
+                        me.dir_stripes.learn_stripes(&[d.dir]);
+                        me.dir_stripes.census().remove(&d.dir);
+                        log::debug!(
+                            "directory stripe {}: the trigger census is dropped — a stripe never \
+                             carries a map",
+                            d.dir
+                        );
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        log::warn!(
+                            "automatic stripe flip of directory {}: the stripe check failed \
+                             ({e}) — declined this window",
+                            d.dir
+                        );
+                        return;
+                    }
+                }
                 if let Err(e) = me.flip_dir(d.dir, stripe_count(), &d.creators).await {
                     log::warn!("automatic stripe flip of directory {} declined: {e}", d.dir);
                 }
@@ -1064,14 +1386,16 @@ impl RoutedMetaBackend {
         }
     }
 
-    /// Flips and migrations this mount is running right now (the
-    /// contracts drain it before a shutdown).
+    /// Flips and migrations this mount is running right now — a CONTRACT
+    /// face (the contracts drain it before a shutdown).
+    #[doc(hidden)]
     pub fn stripe_work_in_flight(&self) -> usize {
         self.dir_stripes.in_flight.len()
     }
 
     /// The census as the contracts read it: creators of `dir`, heaviest
-    /// first.
+    /// first — a CONTRACT face.
+    #[doc(hidden)]
     pub fn stripe_census(&self, dir: Ino) -> Vec<(u32, u64)> {
         self.dir_stripes
             .census()
@@ -1115,13 +1439,17 @@ impl RoutedMetaBackend {
         });
     }
 
-    /// **The migration, synchronously** (the contracts' and the resume's
-    /// face): every non-marker name in `dir`'s own tree moves to its
-    /// stripe — insert into the stripe FIRST, remove from `dir` second,
-    /// each pair one intent, so a kill between the two leaves the name in
-    /// both places and the stripe wins — then the `migrating` marker is
-    /// removed. Idempotent: names already in their stripe are dropped from
-    /// `dir` alone. Returns the names moved by this call.
+    /// **The migration, synchronously** — a CONTRACT face (the resume
+    /// runs [`Self::kick_migration`] → `migrate_dir_inner` in the
+    /// background; a contract drives the same body and reads its count):
+    /// every non-marker name in `dir`'s own tree moves to its stripe —
+    /// insert into the stripe FIRST, remove from `dir` second, each pair
+    /// one intent, so a kill between the two leaves the name in both
+    /// places and the stripe wins — then the `migrating` marker is
+    /// removed once `dir`'s tree is re-verified EMPTY of user names under
+    /// the exclusive guard. Idempotent: names already in their stripe are
+    /// dropped from `dir` alone. Returns the names moved by this call.
+    #[doc(hidden)]
     pub async fn migrate_dir(&self, dir: Ino) -> Result<u64> {
         if self.dir_stripes.in_flight.insert_sync(dir).is_err() {
             return Ok(0);
@@ -1130,6 +1458,13 @@ impl RoutedMetaBackend {
         self.dir_stripes.in_flight.remove_sync(&dir);
         out
     }
+
+    /// The flag clear's re-verify rounds: a name that landed in `dir`'s
+    /// own tree behind the scan (a create parked on `I{dir}` across the
+    /// flip, a stale-route insert) is moved and the scan repeated; past
+    /// the bound the flag stays (resumed at the next access) — a clear is
+    /// never blind (Issue 4c).
+    const MIGRATION_ROUNDS_MAX: usize = 64;
 
     async fn migrate_dir_inner(&self, dir: Ino) -> Result<u64> {
         let (v, local) = self.route_ino(dir);
@@ -1141,9 +1476,66 @@ impl RoutedMetaBackend {
             return Ok(0);
         }
         let mut moved = 0u64;
+        for round in 0..Self::MIGRATION_ROUNDS_MAX {
+            moved += self.migrate_scan(dir, v, local, &map).await?;
+            // Nothing but markers left? Decided UNDER the exclusive guard
+            // the clear takes: a name inserted into `dir`'s tree after
+            // its page was scanned would otherwise be stranded by the
+            // clear (review round 1, Issue 4c).
+            let mut scope = None;
+            let guards: Arc<[dlm::DlmGuard]> = Arc::from(
+                self.lock_many_leased(
+                    v,
+                    &mut scope,
+                    &[(local, dlm::LockMode::Exclusive)],
+                    &[(local, MIGRATING_MARKER, dlm::LockMode::Exclusive)],
+                )
+                .await?,
+            );
+            if !self.page_names(dir, 0, 1).await?.is_empty() {
+                drop(guards);
+                log::debug!(
+                    "directory {dir}: a name landed in its own tree behind the migration's \
+                     scan (round {round}) — re-scanning before the flag clears"
+                );
+                continue;
+            }
+            if self
+                .find_dentry_routed(v, local, MIGRATING_MARKER)
+                .await?
+                .is_some()
+            {
+                let plan = XvPlan {
+                    op: XvOp::StripeDir,
+                    steps: vec![XvStep::RemoveDentry {
+                        parent: dir,
+                        name: MIGRATING_MARKER.to_string(),
+                        expect_child: map.stripes[usize::from(MARKER_TARGET_INDEX)],
+                        parent_update: crossvol_tx::parent_update_code(RoutedParentUpdate::None),
+                    }],
+                };
+                crossvol_tx::execute(self, &plan, guards).await?;
+            }
+            self.forget_map(dir);
+            log::info!("directory {dir}: stripe migration complete — {moved} name(s) re-homed");
+            return Ok(moved);
+        }
+        log::warn!(
+            "directory {dir}: names kept landing in its own tree across {} migration rounds — \
+             the flag stays and the migration resumes at the next access ({moved} re-homed)",
+            Self::MIGRATION_ROUNDS_MAX
+        );
+        Ok(moved)
+    }
+
+    /// One scan of `dir`'s own tree: every non-marker name moved.
+    async fn migrate_scan(&self, dir: Ino, v: usize, local: Ino, map: &StripeMap) -> Result<u64> {
+        let mut moved = 0u64;
         let mut cursor = 0u64;
         loop {
-            let page = self.volumes[v].readdir_page(local, cursor, 256).await?;
+            let page = self.volumes[v]
+                .readdir_page(local, cursor, MIGRATION_SCAN_PAGE)
+                .await?;
             let Some((last, _)) = page.last() else {
                 break;
             };
@@ -1152,46 +1544,24 @@ impl RoutedMetaBackend {
                 if is_marker_name(&entry.name) {
                     continue;
                 }
-                self.migrate_one(dir, v, local, &map, &entry).await?;
+                self.migrate_one(dir, v, local, map, &entry).await?;
                 moved += 1;
                 DIR_STRIPE_MIGRATED_NAMES.fetch_add(1, Ordering::Relaxed);
             }
         }
-        // Nothing but markers left: clear the flag (its own intent, so a
-        // kill here re-scans an empty tree and clears it again).
-        let mut scope = None;
-        let guards: Arc<[dlm::DlmGuard]> = Arc::from(
-            self.lock_many_leased(
-                v,
-                &mut scope,
-                &[(local, dlm::LockMode::Exclusive)],
-                &[(local, MIGRATING_MARKER, dlm::LockMode::Exclusive)],
-            )
-            .await?,
-        );
-        if self
-            .find_dentry_routed(v, local, MIGRATING_MARKER)
-            .await?
-            .is_some()
-        {
-            let plan = XvPlan {
-                op: XvOp::StripeDir,
-                steps: vec![XvStep::RemoveDentry {
-                    parent: dir,
-                    name: MIGRATING_MARKER.to_string(),
-                    expect_child: dir,
-                    parent_update: crossvol_tx::parent_update_code(RoutedParentUpdate::None),
-                }],
-            };
-            crossvol_tx::execute(self, &plan, guards).await?;
-        }
-        self.forget_map(dir);
-        log::info!("directory {dir}: stripe migration complete — {moved} name(s) re-homed");
         Ok(moved)
     }
 
     /// Move one name into its stripe: `[InsertDentry @ stripe,
-    /// RemoveDentry @ dir]` under the op's guards on both homes.
+    /// RemoveDentry @ dir]` under the op's guards on both homes — the ONE
+    /// move the background migration and every mutation's re-home run
+    /// (Issue 4), so the two serialize under the same guards and the
+    /// second finds the work done. A stripe already holding the name
+    /// with ANOTHER child is the LWW rule's verdict: the stripe's entry
+    /// wins and `dir`'s is the shadowed loser — its name goes and its
+    /// inode's count follows (a file: `nlink − 1`; a directory loser is
+    /// LEFT and named loud — fsck C17's `unmigrated-name` — rather than
+    /// unlinked over its contents).
     async fn migrate_one(
         &self,
         dir: Ino,
@@ -1202,6 +1572,9 @@ impl RoutedMetaBackend {
     ) -> Result<()> {
         let (index, stripe) = map.stripe_for(self.hash54_on(v, &entry.name));
         let (sv, slocal) = self.route_ino(stripe);
+        // Every stripe lives on `dir`'s volume by construction (both mint
+        // sites mint on `route_ino(dir).0`): ONE volume's lock set.
+        debug_assert_eq!(sv, v, "a stripe lives on its directory's volume");
         let is_dir = entry.file_type & libc::S_IFMT == libc::S_IFDIR;
         let update = if is_dir {
             RoutedParentUpdate::ExclusiveTimesBump
@@ -1209,22 +1582,26 @@ impl RoutedMetaBackend {
             RoutedParentUpdate::None
         };
         let mut scope = None;
-        let mut inos = vec![(local, dlm::LockMode::Exclusive)];
-        let mut dents = vec![(local, entry.name.as_str(), dlm::LockMode::Exclusive)];
-        if sv == v {
-            inos.push((slocal, dlm::LockMode::Exclusive));
-            dents.push((slocal, entry.name.as_str(), dlm::LockMode::Exclusive));
+        let (cv, clocal) = self.route_ino(entry.ino);
+        let mut inos = vec![
+            (local, dlm::LockMode::Exclusive),
+            (slocal, dlm::LockMode::Exclusive),
+        ];
+        if cv == v {
+            // The loser's count step needs `I{child}` (the LWW arm).
+            inos.push((clocal, dlm::LockMode::Exclusive));
         }
+        inos.sort_unstable_by_key(|(l, _)| *l);
+        inos.dedup_by_key(|(l, _)| *l);
+        let dents = vec![
+            (local, entry.name.as_str(), dlm::LockMode::Exclusive),
+            (slocal, entry.name.as_str(), dlm::LockMode::Exclusive),
+        ];
         let mut guards = self.lock_many_leased(v, &mut scope, &inos, &dents).await?;
-        if sv != v {
+        if cv != v {
             guards.extend(
-                self.lock_many_leased(
-                    sv,
-                    &mut scope,
-                    &[(slocal, dlm::LockMode::Exclusive)],
-                    &[(slocal, entry.name.as_str(), dlm::LockMode::Exclusive)],
-                )
-                .await?,
+                self.lock_many_leased(cv, &mut scope, &[(clocal, dlm::LockMode::Exclusive)], &[])
+                    .await?,
             );
         }
         let guards: Arc<[dlm::DlmGuard]> = Arc::from(guards);
@@ -1236,19 +1613,61 @@ impl RoutedMetaBackend {
         if cur_child != entry.ino {
             return Ok(());
         }
-        let in_stripe = self
-            .find_dentry_routed(sv, slocal, &entry.name)
-            .await?
-            .is_some();
+        let in_stripe = self.find_dentry_routed(sv, slocal, &entry.name).await?;
         let mut steps = Vec::with_capacity(2);
-        if !in_stripe {
-            steps.push(XvStep::InsertDentry {
+        match in_stripe {
+            None => steps.push(XvStep::InsertDentry {
                 parent: stripe,
                 name: entry.name.clone(),
                 child: entry.ino,
                 ft_bits: entry.file_type & libc::S_IFMT,
                 parent_update: crossvol_tx::parent_update_code(update),
-            });
+            }),
+            Some((winner, _)) if winner == entry.ino => {}
+            Some((winner, _)) => {
+                // The LWW rule: `dir`'s entry is the shadowed loser.
+                if is_dir {
+                    log::warn!(
+                        "directory {dir}: name {:?} names directory {} in its own tree and \
+                         directory {winner} in stripe {index} — the stripe's wins; the loser \
+                         is LEFT in place (fsck C17 reports it as unmigrated-name) rather \
+                         than unlinked over its contents",
+                        entry.name,
+                        entry.ino
+                    );
+                    return Ok(());
+                }
+                let Some(loser) = self.volumes[cv].read_inode_value_routed(clocal).await? else {
+                    // No record: the dangling name alone goes.
+                    steps.push(XvStep::RemoveDentry {
+                        parent: dir,
+                        name: entry.name.clone(),
+                        expect_child: entry.ino,
+                        parent_update: crossvol_tx::parent_update_code(update),
+                    });
+                    let plan = XvPlan {
+                        op: XvOp::StripeDir,
+                        steps,
+                    };
+                    crossvol_tx::execute(self, &plan, guards).await?;
+                    return Ok(());
+                };
+                log::warn!(
+                    "directory {dir}: name {:?} names ino {} in its own tree and ino {winner} \
+                     in stripe {index} — the stripe's wins (LWW); the shadowed entry is \
+                     unlinked (its inode's nlink {} → {})",
+                    entry.name,
+                    entry.ino,
+                    loser.nlink,
+                    loser.nlink.saturating_sub(1)
+                );
+                steps.push(XvStep::SetNlink {
+                    ino: entry.ino,
+                    pre: loser.nlink,
+                    post: loser.nlink.saturating_sub(1),
+                    ctime: Some(KvMetaBackend::now_ns_pub()),
+                });
+            }
         }
         steps.push(XvStep::RemoveDentry {
             parent: dir,
@@ -1276,9 +1695,8 @@ impl RoutedMetaBackend {
     /// and the rmdir's read.
     async fn read_map_uncached(&self, dir: Ino) -> Result<Option<Arc<StripeMap>>> {
         self.forget_map(dir);
-        // `stripe_map` re-reads and re-caches a finished map; a migrating
-        // one is never cached, and the kick it would spawn is a no-op
-        // while this caller holds the in-flight slot.
+        // `stripe_map` re-reads and re-caches; the kick it would spawn is
+        // a no-op while this caller holds the in-flight slot.
         self.stripe_map(dir).await
     }
 
@@ -1286,14 +1704,21 @@ impl RoutedMetaBackend {
     // readdir + the attribute fold.
     // -----------------------------------------------------------------
 
-    /// **The K-way `readdir` merge** (§5.6.5): one page after `offset`
-    /// from every stripe (and from `dir`'s own tree while migrating),
-    /// merged in `(hash54, coll)` order — the shipped cookie order, since
-    /// every stripe lives on `dir`'s volume and shares its seed — with a
-    /// name present in both a stripe and `dir` served from the stripe.
-    /// The cookie of the last entry is the exact continuation: every
-    /// stream resumes strictly after it, so a name present for the whole
-    /// scan is returned exactly once under concurrent creates/unlinks.
+    /// **The K-way `readdir` merge** (§5.6.5): `max` entries strictly
+    /// after `offset` merged from every stripe and from `dir`'s own tree
+    /// (its permanent secondary home) in `(hash54, coll)` order — the
+    /// shipped cookie order, since every stripe lives on `dir`'s volume
+    /// and shares its seed — with a name present in both a stripe and
+    /// `dir` served from the stripe. The cookie of the last entry is the
+    /// exact continuation: every stream resumes strictly after it, so a
+    /// name present for the whole scan is returned exactly once under
+    /// concurrent creates/unlinks.
+    ///
+    /// STREAMED (Issue 10): each stream is refilled only when its head
+    /// is consumed, in pages of [`Self::merge_stream_page`] entries, so a
+    /// merged page reads `≤ max + (K + 1) × page` raw entries whatever
+    /// the stripes hold — never `K × max` (the first build materialized
+    /// a full page per stripe and kept `max`).
     pub async fn readdir_striped_page(
         &self,
         map: &StripeMap,
@@ -1301,48 +1726,118 @@ impl RoutedMetaBackend {
         max: usize,
     ) -> Result<Vec<(u64, DirEntry)>> {
         DIR_STRIPE_READDIR_MERGES.fetch_add(1, Ordering::Relaxed);
-        let mut merged: BTreeMap<u64, DirEntry> = BTreeMap::new();
-        let mut from_stripes: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for stripe in &map.stripes {
-            for (cookie, entry) in self.page_names(*stripe, offset, max).await? {
-                from_stripes.insert(entry.name.clone());
-                merged.insert(cookie, entry);
-            }
+        let page = Self::merge_stream_page(max, map.k());
+        // Stream K is `dir`'s own tree.
+        let homes: Vec<Ino> = map.stripes.iter().copied().chain([map.dir]).collect();
+        let own = homes.len() - 1;
+        let mut streams: Vec<MergeStream> = homes
+            .iter()
+            .map(|_| MergeStream {
+                buf: std::collections::VecDeque::new(),
+                cursor: offset,
+                exhausted: false,
+            })
+            .collect();
+        for (i, s) in streams.iter_mut().enumerate() {
+            self.refill_stream(homes[i], s, page).await?;
         }
-        if map.migrating {
-            for (cookie, entry) in self.page_names(map.dir, offset, max).await? {
-                if from_stripes.contains(&entry.name) {
-                    continue;
-                }
-                merged.entry(cookie).or_insert(entry);
-            }
-        }
-        Ok(merged.into_iter().take(max).collect())
-    }
-
-    /// One stream's page: `max` NON-marker entries strictly after
-    /// `offset` (a page whose marker entries counted against `max` would
-    /// end short of the names below the merged page's last cookie, and
-    /// the continuation would skip them).
-    async fn page_names(&self, dir: Ino, offset: u64, max: usize) -> Result<Vec<(u64, DirEntry)>> {
-        let (v, local) = self.route_ino(dir);
-        self.check_volume_enabled(v)?;
-        let mut out = Vec::with_capacity(max);
-        let mut cursor = offset;
+        let (v, _) = self.route_ino(map.dir);
+        let mut out: Vec<(u64, DirEntry)> = Vec::with_capacity(max);
         while out.len() < max {
-            let want = max - out.len();
-            let page = self.volumes[v].readdir_page(local, cursor, want).await?;
-            let short = page.len() < want;
-            let Some((last, _)) = page.last() else {
+            // The smallest head across streams.
+            let Some(next) = streams
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| s.buf.front().map(|(c, _)| (*c, i)))
+                .min()
+                .map(|(_, i)| i)
+            else {
                 break;
             };
-            cursor = *last;
-            out.extend(page.into_iter().filter(|(_, e)| !is_marker_name(&e.name)));
-            if short {
-                break;
+            let (cookie, entry) = streams[next].buf.pop_front().expect("a head was seen");
+            if next == own {
+                // `dir`'s own copy of a name its stripe holds too is the
+                // LWW loser: the stripe's entry (same hash, so adjacent
+                // in this order — refill that stream past the hash first)
+                // is the one listed.
+                let h = self.hash54_on(v, &entry.name);
+                let si = usize::from(stripe_of(h, map.k()));
+                while !streams[si].exhausted
+                    && streams[si]
+                        .buf
+                        .back()
+                        .is_none_or(|(c, _)| readdir_cookie_hash54(*c) <= h)
+                {
+                    self.refill_stream(homes[si], &mut streams[si], page)
+                        .await?;
+                }
+                if streams[si].buf.iter().any(|(_, e)| e.name == entry.name)
+                    || out
+                        .iter()
+                        .rev()
+                        .take_while(|(c, _)| readdir_cookie_hash54(*c) == h)
+                        .any(|(_, e)| e.name == entry.name)
+                {
+                    continue;
+                }
+            }
+            out.push((cookie, entry));
+            if streams[next].buf.is_empty() && !streams[next].exhausted {
+                self.refill_stream(homes[next], &mut streams[next], page)
+                    .await?;
             }
         }
         Ok(out)
+    }
+
+    /// The per-stream refill page: `max / (K + 1)` floored at
+    /// [`MERGE_STREAM_PAGE_FLOOR`] — so a merged page's raw read is
+    /// bounded by `max + (K + 1) × page ≈ 2 × max` at the floor's scale,
+    /// and a FUSE page of 4,096 over 64 stripes reads ≈ 64 entries per
+    /// stream per refill.
+    fn merge_stream_page(max: usize, k: u16) -> usize {
+        (max / (usize::from(k) + 1)).max(MERGE_STREAM_PAGE_FLOOR)
+    }
+
+    /// Refill one stream: the next `page` NON-marker entries strictly
+    /// after its cursor (a page whose marker entries counted against the
+    /// budget would end short of the names below the merged page's last
+    /// cookie, and the continuation would skip them).
+    async fn refill_stream(&self, home: Ino, s: &mut MergeStream, page: usize) -> Result<()> {
+        let (v, local) = self.route_ino(home);
+        self.check_volume_enabled(v)?;
+        let mut got = 0usize;
+        while got < page && !s.exhausted {
+            let want = page - got;
+            let raw = self.volumes[v].readdir_page(local, s.cursor, want).await?;
+            if raw.len() < want {
+                s.exhausted = true;
+            }
+            let Some((last, _)) = raw.last() else {
+                break;
+            };
+            s.cursor = *last;
+            for (c, e) in raw {
+                if !is_marker_name(&e.name) {
+                    s.buf.push_back((c, e));
+                    got += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One stream's page: the first `max` NON-marker entries strictly
+    /// after `offset` (the emptiness probes' read — `max = 1` answers "any
+    /// user name?" whatever the marker count, Issue 5).
+    async fn page_names(&self, dir: Ino, offset: u64, max: usize) -> Result<Vec<(u64, DirEntry)>> {
+        let mut s = MergeStream {
+            buf: std::collections::VecDeque::new(),
+            cursor: offset,
+            exhausted: false,
+        };
+        self.refill_stream(dir, &mut s, max).await?;
+        Ok(s.buf.into_iter().collect())
     }
 
     /// **The attribute fold** of a striped directory: `nlink = D.nlink +
@@ -1380,11 +1875,30 @@ impl RoutedMetaBackend {
 
     /// Persist a fold's times onto `D`'s own record — hygiene, off the
     /// serve (the fold is exact from the stripes at every read; a failed
-    /// persist costs nothing but the next one). Only the holder writes.
+    /// persist costs nothing but the next one), ONCE PER CHECKPOINT
+    /// CADENCE per directory (Issue 8: the write recalls every reader's
+    /// token on `D`, so it must never run at the `stat` rate — the
+    /// design's "batched per flush cadence"). Only the holder writes.
     pub async fn persist_striped_times(&self, dir: Ino, mtime: u64, ctime: u64) {
         if !self.served_here(dir) {
             return;
         }
+        let now = crate::mono_core::monotonic_ns_u64();
+        let cadence_ns = super::kv::checkpoint::checkpoint_landing_ceiling_derived() * 1_000_000;
+        let due = self
+            .dir_stripes
+            .times_persisted_ns
+            .read_sync(&dir, |_, last| now.saturating_sub(*last) >= cadence_ns)
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        let _ = self
+            .dir_stripes
+            .times_persisted_ns
+            .entry_sync(dir)
+            .and_modify(|t| *t = now)
+            .or_insert(now);
         let (v, local) = self.route_ino(dir);
         let guards: Arc<[dlm::DlmGuard]> = Arc::from(vec![
             self.volumes[v].dlm().lock_inode_exclusive(local).await,
@@ -1422,22 +1936,26 @@ impl RoutedMetaBackend {
     // rmdir.
     // -----------------------------------------------------------------
 
-    /// Does stripe `stripe` hold any entry? The `rmdir`'s own guard set
-    /// (`scope`) holds `I{stripe}` exclusive — in this table or parked at
-    /// the stripe's holder — so the read needs no lock of its own where
-    /// the scope covers it; a stripe outside the scope is read under an
-    /// exclusive guard at its holder. Either way every insert that took
-    /// the stripe's guard has landed (then it is seen) or arrives after
-    /// the mark (then it is refused, dying).
+    /// Does stripe `stripe` hold any user entry? Read under the rmdir's
+    /// OWN exclusive guard on the stripe — exact: every insert that took
+    /// the stripe's guard has landed and none can be in flight. A stripe
+    /// another appender holds per tree 0 is asked `IsEmpty { dir, scope }`
+    /// (the holder reads under the travelling scope — `Covered` — and
+    /// never takes a lock of its own); a stripe served HERE by a caller
+    /// with NO scope (the S8 owner-execute context, `executing_for_ship_
+    /// client`) is read locally under the guard the caller holds — a
+    /// served `Take` in this same table would wait behind itself (review
+    /// round 1, Issue 9: held-ness is the caller's fact, never inferred
+    /// from the scope word).
     async fn stripe_is_empty(&self, stripe: Ino, scope: u64) -> Result<bool> {
         let (v, _) = self.route_ino(stripe);
-        // PR 6's foreign predicate: the lease TABLE, not the gate — a
-        // declared region's slot is another appender's for every
-        // cross-owner decision (the two-holder model in one process).
         let holder = match self.holder_of(stripe) {
             Some(h) if h != self.volumes[v].own_appender_id() => h,
-            _ => return self.serve_is_empty_covered(stripe, scope != 0).await,
+            _ => return Ok(self.page_names(stripe, 0, 1).await?.is_empty()),
         };
+        if scope == 0 && self.served_here(stripe) {
+            return Ok(self.page_names(stripe, 0, 1).await?.is_empty());
+        }
         let endpoint = self.volumes[v]
             .slot_leases()
             .and_then(|p| p.holders.endpoint(holder))
@@ -1487,9 +2005,10 @@ impl RoutedMetaBackend {
         self.serve_is_empty_covered(dir, covered).await
     }
 
-    /// No non-marker entry under `dir`; `held` = the caller's guard set
-    /// already holds `I{dir}` (never re-taken — it would wait behind
-    /// itself).
+    /// No user entry under `dir` — markers are skipped whatever their
+    /// count (Issue 5: an 8-entry read called a directory carrying 66
+    /// markers empty); `held` = the caller's guard set already holds
+    /// `I{dir}` (never re-taken — it would wait behind itself).
     async fn serve_is_empty_covered(&self, dir: Ino, held: bool) -> Result<bool> {
         let (v, local) = self.route_ino(dir);
         self.check_volume_enabled(v)?;
@@ -1498,20 +2017,14 @@ impl RoutedMetaBackend {
         } else {
             Some(self.volumes[v].dlm().lock_inode_exclusive(local).await)
         };
-        let page = self.volumes[v].readdir_page(local, 0, 8).await?;
-        Ok(page.iter().all(|(_, e)| is_marker_name(&e.name)))
+        Ok(self.page_names(dir, 0, 1).await?.is_empty())
     }
 
-    /// [`Self::serve_is_empty_covered`] taking its own guard — the
-    /// destroy's precondition read.
-    async fn serve_is_empty(&self, dir: Ino) -> Result<bool> {
-        self.serve_is_empty_covered(dir, false).await
-    }
-
-    /// Destroy stripe `stripe` (its record + xattrs — `nlink` is 0 by the
-    /// mark): here when served here, `DestroyStripe` over the wire
-    /// otherwise. Best-effort: a stripe left undestroyed is an `nlink 0`
-    /// corpse the next mount's sweep reclaims.
+    /// Destroy stripe `stripe`'s record (`nlink` is 0 by the rmdir's
+    /// intent): here when this appender holds it, `DestroyStripe` to its
+    /// holder otherwise (the guards are dropped by now — the served side
+    /// takes its own). Hygiene: a stripe left undestroyed is an `nlink 0`
+    /// corpse named by no map — the next mount's sweep reclaims it.
     async fn destroy_stripe(&self, stripe: Ino) -> Result<()> {
         let (v, _) = self.route_ino(stripe);
         let holder = match self.holder_of(stripe) {
@@ -1562,47 +2075,120 @@ impl RoutedMetaBackend {
                 ),
             ));
         }
-        if !self.serve_is_empty(stripe).await? {
+        if !self.serve_is_empty_covered(stripe, false).await? {
             return Err(SqueezefsError::refused(
                 libc::ENOTEMPTY,
                 format!("DestroyStripe: stripe {stripe} still holds entries"),
             ));
         }
+        self.dir_stripes.known_stripes.remove_sync(&stripe);
         vol.destroy_inodes(&[local]).await
     }
 
-    /// **`rmdir` of a striped directory** (§5.6.5, R26). Under the
-    /// caller's exclusive `I{dir}` guard and S10 permit: (1) every stripe
-    /// must read `nlink 2` (a subdirectory makes it `> 2` — `ENOTEMPTY`
-    /// without a mark); (2) MARK every stripe dying (`SetNlink 2 → 0`,
-    /// one intent — a mkdir that raced fails the CAS and the plan reads
-    /// it); (3) probe `IsEmpty` under the mark; a non-empty stripe
-    /// REVIVES the set (`SetNlink 0 → 2`) and answers `ENOTEMPTY`. The
-    /// caller then unlinks `dir` from its parent and calls
-    /// [`Self::finish_striped_rmdir`] (the markers, the stripes).
-    pub async fn prepare_striped_rmdir(&self, dir: Ino, map: &StripeMap) -> Result<()> {
-        let (v, _) = self.route_ino(dir);
-        // The stripes' exclusive guards for the whole mark-probe-revive
-        // sequence: in this table for the stripes served here, parked at
-        // their holders for the rest (PR 6's travelling guard). Every
-        // stripe lives on `dir`'s volume by construction.
-        let mut scope = None;
-        let stripe_keys: Vec<(Ino, dlm::LockMode)> = map
-            .stripes
-            .iter()
-            .map(|s| (self.route_ino(*s).1, dlm::LockMode::Exclusive))
+    /// **`rmdir` of a striped directory** (§5.6.5 — "K `DestroyStripe`
+    /// ships + `D`'s destroy in ONE intent"; R26). `key_parent` is where
+    /// `D`'s own dentry lives (its parent, or the parent's stripe). Under
+    /// the S10 mutation permit and the §5.5.2a slot gate over every
+    /// participant, ONE guard set held for the whole act: `I{key_parent}`
+    /// + `D{key_parent, name}`, `I{D}` exclusive, `I{D_i}` EXCLUSIVE on
+    /// every stripe (a foreign stripe's travels to its holder — PR 6),
+    /// `D{D, marker}` on every marker. Then, having written NOTHING yet:
+    /// the dentry revalidated (`ENOENT` if gone), the map re-read from the
+    /// markers under the guard (it must be the caller's), `D`'s own tree
+    /// probed for a user name, every stripe's count (`nlink 2` — a
+    /// subdirectory is `> 2`) and every stripe `IsEmpty` — exact under the
+    /// exclusive guards; `ENOTEMPTY` refuses with nothing to undo. Then
+    /// ONE intent: the dentry out of its parent, the markers out of `D`
+    /// (the commit marker FIRST — a reader between steps sees no map),
+    /// `SetNlink 2 → 0` on every stripe (the dying mark) and on `D`. A kill
+    /// at any step rolls forward whole at the next lessee (Issue 2). The
+    /// stripes' records are destroyed after, as hygiene.
+    pub async fn rmdir_striped(&self, key_parent: Ino, name: &str, map: &StripeMap) -> Result<Ino> {
+        let dir = map.dir;
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[key_parent, dir]).await;
+        let mut participants: Vec<Ino> = vec![key_parent, dir];
+        participants.extend(map.stripes.iter().copied());
+        let _gate = self.slot_gate_enter(&participants).await;
+        let (pv, plocal) = self.route_ino(key_parent);
+        let (dv, dlocal) = self.route_ino(dir);
+        self.check_volume_enabled(pv)?;
+        self.check_volume_enabled(dv)?;
+        // The stripes live on `dir`'s volume by construction.
+        let marker_names: Vec<String> = (0..map.k())
+            .map(stripe_marker_name)
+            .chain([MIGRATING_MARKER.to_string(), STRIPED_MARKER.to_string()])
             .collect();
-        let guards: Arc<[dlm::DlmGuard]> = Arc::from(
-            self.lock_many_leased(v, &mut scope, &stripe_keys, &[])
-                .await?,
-        );
+        // Per-volume lock sets in ascending volume order, each canonical
+        // (I before D, stripe-deduped by `lock_many`).
+        let mut per_volume: BTreeMap<
+            usize,
+            (Vec<(Ino, dlm::LockMode)>, Vec<(Ino, &str, dlm::LockMode)>),
+        > = BTreeMap::new();
+        {
+            let (inos, dents) = per_volume.entry(pv).or_default();
+            inos.push((plocal, dlm::LockMode::Exclusive));
+            dents.push((plocal, name, dlm::LockMode::Exclusive));
+        }
+        {
+            let (inos, dents) = per_volume.entry(dv).or_default();
+            inos.push((dlocal, dlm::LockMode::Exclusive));
+            for s in &map.stripes {
+                inos.push((self.route_ino(*s).1, dlm::LockMode::Exclusive));
+            }
+            for m in &marker_names {
+                dents.push((dlocal, m.as_str(), dlm::LockMode::Exclusive));
+            }
+        }
+        let mut guards = Vec::new();
+        let mut scope = None;
+        for (v_idx, (mut inos, dents)) in per_volume {
+            inos.sort_unstable_by_key(|(l, _)| *l);
+            inos.dedup_by_key(|(l, _)| *l);
+            guards.extend(
+                self.lock_many_leased(v_idx, &mut scope, &inos, &dents)
+                    .await?,
+            );
+        }
+        let guards: Arc<[dlm::DlmGuard]> = Arc::from(guards);
         let scope_word = crossvol_tx::scope_of(&guards);
-        // (1) live counts.
-        let mut pre = Vec::with_capacity(map.stripes.len());
+
+        // ---- Everything below reads; nothing is written before the intent.
+        match self.find_dentry_routed(pv, plocal, name).await? {
+            Some((child, _)) if child == dir => {}
+            Some((child, _)) => {
+                return Err(SqueezefsError::refused(
+                    libc::EAGAIN,
+                    format!("rmdir {name:?}: the name now names ino {child}, not {dir} — retry"),
+                ))
+            }
+            None => {
+                return Err(SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Dentry not found",
+                )))
+            }
+        }
+        let live = self.read_map_from_markers(dir, dv, dlocal).await?;
+        let Some(live) = live.filter(|m| m.stripes == map.stripes) else {
+            return Err(SqueezefsError::refused(
+                libc::EAGAIN,
+                format!("rmdir of directory {dir}: its stripe map changed under the op — retry"),
+            ));
+        };
+        let dir_rec = self.read_inode_routed(dv, dlocal).await?;
+        if dir_rec.nlink > 2 || !self.page_names(dir, 0, 1).await?.is_empty() {
+            // A user name (or a subdirectory) still in `D`'s own tree: an
+            // unmigrated one, or a stale-route insert — `ENOTEMPTY` (its
+            // next touch re-homes it).
+            return Err(SqueezefsError::Io(std::io::Error::from_raw_os_error(
+                libc::ENOTEMPTY,
+            )));
+        }
+        let mut stripe_counts = Vec::with_capacity(map.stripes.len());
         for stripe in &map.stripes {
             let (sv, slocal) = self.route_ino(*stripe);
-            match self.volumes[sv].read_inode_value_routed(slocal).await? {
-                Some(r) if r.nlink == 2 || r.nlink == 0 => pre.push(r.nlink),
+            let n = match self.volumes[sv].read_inode_value_routed(slocal).await? {
+                Some(r) if r.nlink == 2 || r.nlink == 0 => r.nlink,
                 Some(r) => {
                     log::debug!(
                         "rmdir {dir}: stripe {stripe} nlink {} — holds subdirectories",
@@ -1612,194 +2198,101 @@ impl RoutedMetaBackend {
                         libc::ENOTEMPTY,
                     )));
                 }
-                None => pre.push(0),
-            }
+                None => 0,
+            };
+            stripe_counts.push(n);
         }
-        // (2) the mark.
-        let mark: Vec<XvStep> = map
-            .stripes
-            .iter()
-            .zip(&pre)
-            .filter(|(_, n)| **n == 2)
-            .map(|(s, _)| XvStep::SetNlink {
-                ino: *s,
-                pre: 2,
-                post: 0,
-                ctime: None,
-            })
-            .collect();
-        if !mark.is_empty() {
-            let done = crossvol_tx::execute(
-                self,
-                &XvPlan {
-                    op: XvOp::Rmdir,
-                    steps: mark,
-                },
-                Arc::clone(&guards),
-            )
-            .await?;
-            if done
-                .outcomes
-                .iter()
-                .any(|o| o.status == XvStepStatus::ForeignSkipped)
-            {
-                // A mkdir raced the mark on some stripe: revive the marked
-                // ones and refuse.
-                self.revive_stripes(map, Arc::clone(&guards)).await?;
-                return Err(SqueezefsError::Io(std::io::Error::from_raw_os_error(
-                    libc::ENOTEMPTY,
-                )));
-            }
-        }
-        // (3) probe under the mark.
         for stripe in &map.stripes {
             if !self.stripe_is_empty(*stripe, scope_word).await? {
-                self.revive_stripes(map, Arc::clone(&guards)).await?;
                 return Err(SqueezefsError::Io(std::io::Error::from_raw_os_error(
                     libc::ENOTEMPTY,
                 )));
             }
         }
-        drop(guards);
-        Ok(())
-    }
+        let hold_ms = TEST_STRIPE_RMDIR_HOLD_MS.load(Ordering::Relaxed);
+        if hold_ms > 0 {
+            TEST_STRIPE_RMDIR_GUARDS_HELD.store(true, Ordering::SeqCst);
+            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(hold_ms)).await;
+            TEST_STRIPE_RMDIR_GUARDS_HELD.store(false, Ordering::SeqCst);
+        }
 
-    /// Remove `dir`'s stripe markers (one intent, rolled forward if
-    /// killed) — the LAST act of a striped rmdir, after the directory's
-    /// own name is gone: while they stand, a create into the removed
-    /// directory still routes to a stripe and is refused there.
-    async fn remove_stripe_markers(&self, dir: Ino, map: &StripeMap) -> Result<()> {
-        let (v, local) = self.route_ino(dir);
-        let mut steps: Vec<XvStep> = map
-            .stripes
-            .iter()
-            .enumerate()
-            .map(|(i, s)| XvStep::RemoveDentry {
+        // ---- ONE intent.
+        let none = crossvol_tx::parent_update_code(RoutedParentUpdate::None);
+        let target = map.stripes[usize::from(MARKER_TARGET_INDEX)];
+        let mut steps: Vec<XvStep> = vec![XvStep::RemoveDentry {
+            parent: key_parent,
+            name: name.to_string(),
+            expect_child: dir,
+            parent_update: crossvol_tx::parent_update_code(RoutedParentUpdate::ExclusiveTimesBump),
+        }];
+        steps.push(XvStep::RemoveDentry {
+            parent: dir,
+            name: STRIPED_MARKER.to_string(),
+            expect_child: target,
+            parent_update: none,
+        });
+        if live.migrating {
+            steps.push(XvStep::RemoveDentry {
+                parent: dir,
+                name: MIGRATING_MARKER.to_string(),
+                expect_child: target,
+                parent_update: none,
+            });
+        }
+        for (i, s) in map.stripes.iter().enumerate() {
+            steps.push(XvStep::RemoveDentry {
                 parent: dir,
                 name: stripe_marker_name(i as u16),
                 expect_child: *s,
-                parent_update: crossvol_tx::parent_update_code(RoutedParentUpdate::None),
-            })
-            .collect();
-        for marker in [MIGRATING_MARKER, STRIPED_MARKER] {
-            steps.push(XvStep::RemoveDentry {
-                parent: dir,
-                name: marker.to_string(),
-                expect_child: dir,
-                parent_update: crossvol_tx::parent_update_code(RoutedParentUpdate::None),
+                parent_update: none,
             });
         }
-        let dents: Vec<(Ino, String)> = (0..map.k())
-            .map(stripe_marker_name)
-            .chain([MIGRATING_MARKER.to_string(), STRIPED_MARKER.to_string()])
-            .map(|n| (local, n))
-            .collect();
-        let dents_ref: Vec<(Ino, &str, dlm::LockMode)> = dents
-            .iter()
-            .map(|(p, n)| (*p, n.as_str(), dlm::LockMode::Exclusive))
-            .collect();
-        let mut scope = None;
-        let guards: Arc<[dlm::DlmGuard]> = Arc::from(
-            self.lock_many_leased(
-                v,
-                &mut scope,
-                &[(local, dlm::LockMode::Exclusive)],
-                &dents_ref,
-            )
-            .await?,
-        );
+        for (s, n) in map.stripes.iter().zip(&stripe_counts) {
+            if *n == 2 {
+                steps.push(XvStep::SetNlink {
+                    ino: *s,
+                    pre: 2,
+                    post: 0,
+                    ctime: None,
+                });
+            }
+        }
+        steps.push(XvStep::SetNlink {
+            ino: dir,
+            pre: dir_rec.nlink,
+            post: 0,
+            ctime: Some(KvMetaBackend::now_ns_pub()),
+        });
+        // The cached map goes BEFORE the write: a plan severed mid-way
+        // must not leave the whole map cached over half its markers.
+        self.forget_map(dir);
         crossvol_tx::execute(
             self,
             &XvPlan {
                 op: XvOp::Rmdir,
                 steps,
             },
-            guards,
+            Arc::clone(&guards),
         )
         .await?;
-        self.forget_map(dir);
-        Ok(())
-    }
-
-    /// A striped rmdir whose own removal FAILED after the mark: revive the
-    /// stripes so the directory stays usable (best-effort — a mark left
-    /// standing is resolved by the next `rmdir` attempt).
-    pub async fn abort_striped_rmdir(&self, map: &StripeMap) {
-        let (v, _) = self.route_ino(map.dir);
-        let mut scope = None;
-        let stripe_keys: Vec<(Ino, dlm::LockMode)> = map
-            .stripes
-            .iter()
-            .map(|s| (self.route_ino(*s).1, dlm::LockMode::Exclusive))
-            .collect();
-        let Ok(guards) = self
-            .lock_many_leased(v, &mut scope, &stripe_keys, &[])
-            .await
-        else {
-            return;
-        };
-        if let Err(e) = self.revive_stripes(map, Arc::from(guards)).await {
-            log::warn!("rmdir {}: the stripes stay marked dying ({e})", map.dir);
-        }
-    }
-
-    /// After `dir`'s own removal: the markers go, then the (marked, empty)
-    /// stripes are destroyed.
-    pub async fn finish_striped_rmdir(&self, dir: Ino, map: &StripeMap) {
-        if let Err(e) = self.remove_stripe_markers(dir, map).await {
-            log::warn!(
-                "rmdir {dir}: the stripe markers stay ({e}) — the removed directory's own \
-                 tree keeps them until the next attempt; its stripes are left marked"
-            );
-            return;
-        }
+        self.dir_stripes.census().remove(&dir);
+        drop(guards);
+        // Hygiene: the marked stripes' records.
         for stripe in &map.stripes {
             if let Err(e) = self.destroy_stripe(*stripe).await {
                 log::warn!(
-                    "rmdir {dir}: stripe {stripe} not destroyed ({e}) — an nlink-0 corpse the \
-                     next mount's sweep reclaims"
+                    "rmdir {dir}: stripe {stripe} not destroyed ({e}) — an nlink-0 corpse named \
+                     by no map; the next mount's sweep reclaims it"
                 );
             }
         }
-        self.forget_map(dir);
         DIR_STRIPE_RMDIRS.fetch_add(1, Ordering::Relaxed);
         // Saturating: a directory another mount flipped is not in this
         // mount's count.
         let _ = DIR_STRIPED_DIRS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
             Some(n.saturating_sub(1))
         });
-    }
-
-    /// Undo the dying mark on every stripe that carries it (under the
-    /// rmdir's held stripe guards).
-    async fn revive_stripes(&self, map: &StripeMap, guards: Arc<[dlm::DlmGuard]>) -> Result<()> {
-        let mut steps = Vec::new();
-        for stripe in &map.stripes {
-            let (sv, slocal) = self.route_ino(*stripe);
-            if let Some(r) = self.volumes[sv].read_inode_value_routed(slocal).await? {
-                if r.nlink == 0 {
-                    steps.push(XvStep::SetNlink {
-                        ino: *stripe,
-                        pre: 0,
-                        post: 2,
-                        ctime: None,
-                    });
-                }
-            }
-        }
-        if steps.is_empty() {
-            return Ok(());
-        }
-        crossvol_tx::execute(
-            self,
-            &XvPlan {
-                op: XvOp::Rmdir,
-                steps,
-            },
-            guards,
-        )
-        .await?;
-        Ok(())
+        Ok(dir)
     }
 
     /// The `mkdir`-time flip under `-o stripe_dirs`: stripe the new
@@ -1851,6 +2344,15 @@ mod tests {
         assert_eq!(parse_marker(b"\0sqz.stripe:64"), None);
         assert_eq!(parse_marker(b"\0sqz.stripe:"), None);
         assert_eq!(parse_marker(b"\0sqz.stripe:1234"), None);
+        // Non-canonical widths decode to NOTHING (review round 1, Issue 7:
+        // the fuzz law `stripe_marker_name(i) == name` for every decoded
+        // name was false for these).
+        assert_eq!(parse_marker(b"\0sqz.stripe:5"), None);
+        assert_eq!(parse_marker(b"\0sqz.stripe:005"), None);
+        for i in 0..STRIPES_MAX {
+            let n = stripe_marker_name(i);
+            assert_eq!(parse_marker(n.as_bytes()).map(|_| n.clone()), Some(n));
+        }
         assert_eq!(parse_marker(b"plain"), None);
         assert_eq!(parse_marker(&[0xff, 0, 1]), None);
         assert!(!is_marker_name("file"));

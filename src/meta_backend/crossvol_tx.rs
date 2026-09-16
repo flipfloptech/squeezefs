@@ -1105,10 +1105,13 @@ const XV_CHECKSUM_OFF: usize = 24;
 /// tuning knob. The largest plan the converted ops build is 9 (a
 /// cross-volume directory rename replacing a destination with
 /// `RENAME_WHITEOUT`); symmetric PR 7b's striped-directory plans are the
-/// widest: a flip writes `K + 2` marker inserts and an `rmdir`'s marker
-/// removal `K + 2` removes, with `K ≤ MINT_SPREAD` (64) — so the bound is
-/// `MINT_SPREAD + 8`, the widest plan plus the pre-7b headroom.
-pub const XV_MAX_STEPS: usize = super::MINT_SPREAD + 8;
+/// widest: a flip writes `K + 2` marker inserts and the ONE-intent
+/// `rmdir` of a striped directory (review round 1, Issue 2) removes the
+/// parent dentry + `K + 2` markers and writes `K + 1` counts (`SetNlink`
+/// on every stripe and on the directory), with `K ≤ MINT_SPREAD` (64) —
+/// so the bound is `2 × MINT_SPREAD + 8`, the widest plan plus the pre-7b
+/// headroom (≈ 5 KiB encoded at the widest, inside the KV value cap).
+pub const XV_MAX_STEPS: usize = 2 * super::MINT_SPREAD + 8;
 
 /// The intent key of `tx_id`: the id IS the key (56 bits in the hash
 /// field, 8 in the collision field — the full 64 bits, injectively).

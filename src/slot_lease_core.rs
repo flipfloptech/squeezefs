@@ -252,6 +252,13 @@ impl LeaseGate {
         self.manager.load(Ordering::Relaxed)
     }
 
+    /// **Test seam**: the manager word set or cleared — the in-process
+    /// contracts' way to stand a NON-manager appender's gate (PR 12's
+    /// daemon shape) on a volume whose one process is the manager.
+    pub fn test_set_manager(&self, manager: bool) {
+        self.manager.store(manager, Ordering::Release);
+    }
+
     /// Install the slots ANOTHER appender leases, whole — each word is
     /// stored atomically, so a reader between two words sees every slot
     /// in either its old or its new state, never a torn word.

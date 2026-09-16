@@ -84,6 +84,7 @@
 use crate::cluster_wire::{
     RpcAsyncService, RpcClient, RpcRequest, RpcResponse, RPC_OK, RPC_UNKNOWN_VERB,
 };
+use crate::custody_revoke_core::HandoverMarkCore;
 use crate::data_custody::DeadEpoch;
 use crate::dlm::{LocalLockManager, LockLease, LockMode};
 use crate::error::{Result, SqueezefsError};
@@ -95,7 +96,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -737,6 +738,11 @@ static CARRIED_REQUEST_IDS: AtomicU64 = AtomicU64::new(1);
 /// carrier's recall notices unabsorbed — a reply lost on the wire; the
 /// recall must re-travel on the following carrier.
 pub static TEST_DROP_RECALL_CARRIER_ONCE: AtomicBool = AtomicBool::new(false);
+/// **Test seam** (round 4, Issue 28's pin): the writer DROPS EVERY
+/// carrier's recall notices while set — a writer that keeps renewing and
+/// never releases a recalled grant, the shape the leave's bound-expiry
+/// posture exists for.
+pub static TEST_DROP_RECALL_CARRIERS_ALL: AtomicBool = AtomicBool::new(false);
 
 /// Finding 34 (rung 1): the RELEASE GATE — answers whether `ino`'s
 /// publish pipeline is QUIESCENT (synchronously, lock-order-free: the
@@ -3700,7 +3706,9 @@ impl WriteCustodyClient {
         if recalls.is_empty() {
             return false;
         }
-        if TEST_DROP_RECALL_CARRIER_ONCE.swap(false, Ordering::AcqRel) {
+        if TEST_DROP_RECALL_CARRIER_ONCE.swap(false, Ordering::AcqRel)
+            || TEST_DROP_RECALL_CARRIERS_ALL.load(Ordering::Acquire)
+        {
             return false;
         }
         let hooks = recall_hooks();
@@ -5305,8 +5313,7 @@ pub async fn disarm_slot_custody() {
             h.client.release_all_grants().await;
         }
     }
-    HANDOVER_RECALLS.lock().clear();
-    HANDOVER_RECALL_COUNT.store(0, Ordering::Release);
+    HANDOVER_RECALLS.clear_all();
 }
 
 /// **Test seam**: drop the arm WITHOUT the clean leave (a contract's
@@ -5317,8 +5324,7 @@ pub fn uninstall_slot_custody() {
     if let Some(arm) = SLOT_CUSTODY.swap(None) {
         arm.stop.store(true, Ordering::Release);
     }
-    HANDOVER_RECALLS.lock().clear();
-    HANDOVER_RECALL_COUNT.store(0, Ordering::Release);
+    HANDOVER_RECALLS.clear_all();
 }
 
 /// **Test seam** (also the stats face's probe): is custody by the slot
@@ -5841,44 +5847,23 @@ pub async fn acquire_range_at_slot_holder(
 
 // ---- Custody across a handover (design §5.1.4) ----------------------------
 
-/// The slots marked MID-HANDOVER for the grant paths, with the instant the
-/// mark was armed: a grant of an object in one of them is DEFERRED
-/// (`CUSTODY_DEFERRED`) until the slot has moved — else the recalled
-/// writer's re-acquire would undo the recall and the handover would never
-/// complete, or (round 3's ×10 finding) land at the OLD holder inside the
-/// flush-then-transfer and span the move. Two lifetimes: a mark armed by
-/// a DEFERRED tick expires after [`handover_recall_bound`] (a requester
-/// that stopped retrying must not leave the slot's files un-grantable;
-/// the next attempt re-arms it); a mark HELD by a completing handover
-/// ([`HandoverCustodyMark`]) or by the leave never expires — it is
-/// cleared at the handover's terminal outcome, or dies with the leaving
-/// process (the disarm clears it). Keyed on the volume's superblock uuid +
-/// forest slot.
-static HANDOVER_RECALLS: Lazy<
-    parking_lot::Mutex<HashMap<(u128, crate::meta_backend::kv::record::ForestSlot), HandoverMark>>,
-> = Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
-/// `HANDOVER_RECALLS.len()` — the fast path's one relaxed load: every
-/// shipped acquire reads 0 here and touches nothing else.
-static HANDOVER_RECALL_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-/// One mid-handover mark: when it was armed and whether a handover HOLDS
-/// it (held marks do not expire).
-#[derive(Clone, Copy, Debug)]
-struct HandoverMark {
-    since: Instant,
-    held: bool,
-}
+/// The slots marked MID-HANDOVER for the grant paths (the
+/// [`HandoverMarkCore`] — review round 4, Issue 29: `#[path]`-shared with
+/// `loom-models/`, the mark / re-check pair modeled there): a grant of an
+/// object in one of them is DEFERRED (`CUSTODY_DEFERRED`) until the slot
+/// has moved — else the recalled writer's re-acquire would undo the recall
+/// and the handover would never complete, or (round 3's ×10 finding) land
+/// at the OLD holder inside the flush-then-transfer and span the move. Two
+/// lifetimes: a mark armed by a DEFERRED tick expires after
+/// [`handover_recall_bound`] (a requester that stopped retrying must not
+/// leave the slot's files un-grantable; the next attempt re-arms it); a
+/// mark HELD by a completing handover ([`HandoverCustodyMark`]) or by the
+/// leave never expires — it is cleared at the handover's terminal outcome,
+/// or dies with the leaving process (the disarm clears it). Keyed on the
+/// volume's superblock uuid + forest slot.
+static HANDOVER_RECALLS: Lazy<HandoverMarkCore<HandoverKey>> = Lazy::new(HandoverMarkCore::new);
 
 type HandoverKey = (u128, crate::meta_backend::kv::record::ForestSlot);
-
-/// Arm (or re-arm) `key`'s mark; returns the stamp written.
-fn arm_handover_mark(key: HandoverKey, held: bool) -> Instant {
-    let since = Instant::now();
-    let mut set = HANDOVER_RECALLS.lock();
-    set.insert(key, HandoverMark { since, held });
-    HANDOVER_RECALL_COUNT.store(set.len(), Ordering::Release);
-    since
-}
 
 /// **A handover in flight holds its slot's mark** (round 3 — the ×10
 /// stamped finding: the completing tick found no live grant, CLEARED the
@@ -5893,23 +5878,19 @@ fn arm_handover_mark(key: HandoverKey, held: bool) -> Instant {
 /// pair: a grant that landed before the census is seen and recalled, one
 /// that landed after sees the mark and releases itself DEFERRED. A later
 /// re-arm (the next tick's, the leave's) is preserved: the drop clears
-/// the mark only if it still carries this handover's stamp.
+/// the mark only if it still carries this handover's monotone stamp
+/// (round 4, Issue 30 — never an `Instant`). Its lifetime is a NAMED act:
+/// `release_slot_handover_locked` binds it, runs the transfer, and drops
+/// it at the transfer's one terminal point (round 4, Issue 29).
 #[must_use = "the mark is cleared when this guard drops — hold it through the transfer"]
 pub struct HandoverCustodyMark {
     key: HandoverKey,
-    stamp: Instant,
+    seq: u64,
 }
 
 impl Drop for HandoverCustodyMark {
     fn drop(&mut self) {
-        let mut set = HANDOVER_RECALLS.lock();
-        if set
-            .get(&self.key)
-            .is_some_and(|m| m.held && m.since == self.stamp)
-        {
-            set.remove(&self.key);
-            HANDOVER_RECALL_COUNT.store(set.len(), Ordering::Release);
-        }
+        HANDOVER_RECALLS.clear_if(self.key, self.seq);
     }
 }
 
@@ -5946,7 +5927,7 @@ pub fn handover_recall_bound_ms() -> u64 {
 /// `CustodyGrant` and the custody-wire ACQUIRE alike). One relaxed load
 /// unless a handover is in flight.
 pub fn handover_recall_defers(ino: u64) -> bool {
-    if HANDOVER_RECALL_COUNT.load(Ordering::Relaxed) == 0 {
+    if HANDOVER_RECALLS.pending() == 0 {
         return false;
     }
     let Some(owner) = custody_owner() else {
@@ -5967,17 +5948,7 @@ pub fn handover_recall_defers(ino: u64) -> bool {
         u128::from_le_bytes(vol.superblock().uuid),
         crate::meta_backend::kv::record::forest_slot_of_ino(local),
     );
-    let bound = handover_recall_bound(&owner);
-    let mut set = HANDOVER_RECALLS.lock();
-    match set.get(&key) {
-        Some(m) if m.held || m.since.elapsed() < bound => true,
-        Some(_) => {
-            set.remove(&key);
-            HANDOVER_RECALL_COUNT.store(set.len(), Ordering::Release);
-            false
-        }
-        None => false,
-    }
+    HANDOVER_RECALLS.defers(key, handover_recall_bound(&owner))
 }
 
 /// The live grants this process's custody authority issued on files of
@@ -6057,21 +6028,16 @@ pub fn defer_handover_for_custody(
     let key = (volume_uuid, slot);
     // The mark FIRST, held: the Dekker's arm half (a grant that lands
     // after the census below reads it and defers itself).
-    let stamp = arm_handover_mark(key, true);
+    let seq = HANDOVER_RECALLS.arm(key, true);
     match recall_slot_custody(volume_uuid, slot) {
         Some(recalled) => {
             // Deferred: the mark stays armed but UNHELD — it expires at the
             // bound if the requester abandons the handover.
-            {
-                let mut set = HANDOVER_RECALLS.lock();
-                if let Some(m) = set.get_mut(&key) {
-                    m.held = false;
-                }
-            }
+            HANDOVER_RECALLS.unhold(key);
             HANDOVER_CUSTODY_DEFERRALS.fetch_add(1, Ordering::Relaxed);
             HandoverCustody::Deferred { recalled }
         }
-        None => HandoverCustody::Clear(HandoverCustodyMark { key, stamp }),
+        None => HandoverCustody::Clear(HandoverCustodyMark { key, seq }),
     }
 }
 
@@ -6105,7 +6071,7 @@ fn recall_slot_custody(
 /// **Test seam**: the forest slots currently marked mid-handover on any
 /// volume of this process.
 pub fn handover_recalls_pending() -> usize {
-    HANDOVER_RECALL_COUNT.load(Ordering::Relaxed)
+    HANDOVER_RECALLS.pending()
 }
 
 /// **The HOLDER's clean leave is a handover to nobody** (round 3, Issue
@@ -6139,7 +6105,7 @@ pub async fn recall_custody_at_leave(
         return Vec::new();
     }
     for s in slots {
-        arm_handover_mark((volume_uuid, *s), true);
+        HANDOVER_RECALLS.arm((volume_uuid, *s), true);
     }
     let live: Vec<_> = slots
         .iter()

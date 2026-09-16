@@ -3598,7 +3598,7 @@ impl KvMetaBackend {
         // entries (the grant returns below ride ring 0 — barriered,
         // root-free, replayed idempotently; they are not the window this
         // law guards).
-        let uncovered_ids: std::collections::BTreeSet<u32> = set
+        let mut uncovered_ids: std::collections::BTreeSet<u32> = set
             .regions
             .iter()
             .filter(|r| {
@@ -3608,8 +3608,7 @@ impl KvMetaBackend {
             })
             .map(|r| r.id)
             .collect();
-        let uncovered = |r: &super::appender::AppenderRegion| uncovered_ids.contains(&r.id);
-        for region in set.regions.iter().filter(|r| uncovered(r)) {
+        for region in set.regions.iter().filter(|r| uncovered_ids.contains(&r.id)) {
             let ring = region.ring();
             log::warn!(
                 "meta volume {}: appender {}'s ring is UNCOVERED at the leave (head {}, \
@@ -3636,11 +3635,22 @@ impl KvMetaBackend {
             // `T_owner + renew` and the S9 sweep) BEFORE the slots go
             // `Unleased`, else the next lessee could grant a file a writer
             // still holds this holder's custody of. A slot whose grant
-            // survives the bound stays LEASED with its region (the
-            // uncovered posture — loud). Runs OUTSIDE the handover mutex
-            // (the writers' releases need nothing of it).
+            // survives the bound keeps its REGION in the UNCOVERED posture
+            // whole (review round 4, Issue 28 — the round-3 build excluded
+            // it from the slot release only, and the loops below wrote its
+            // page `Free` and released its ring while tree 0 named its
+            // slots Leased: a leased slot whose page-home root was LOST,
+            // KD-SYM-3): its page stays Live with its roots and tail, its
+            // ring and grant stay claimed, its leases stay, and the next
+            // open of this identity recovers it as own residue — loud.
+            // Runs OUTSIDE the handover mutex (the writers' releases need
+            // nothing of it).
             let mut custody_blocked: Vec<u32> = Vec::new();
-            for region in set.regions.iter().filter(|r| !uncovered(r)) {
+            for region in set
+                .regions
+                .iter()
+                .filter(|r| !uncovered_ids.contains(&r.id))
+            {
                 if region.released.load(Ordering::Acquire) {
                     continue;
                 }
@@ -3652,13 +3662,15 @@ impl KvMetaBackend {
                     log::error!(
                         "meta volume {}: appender {} keeps its leases at the leave — live \
                          custody grants on slot(s) {still:?} survived the recall and the \
-                         T_owner sweep; its page stays Live",
+                         T_owner sweep; its page stays Live, its ring and grant claimed (the \
+                         uncovered posture)",
                         self.path.display(),
                         region.id
                     );
                     custody_blocked.push(region.id);
                 }
             }
+            uncovered_ids.extend(custody_blocked);
             // The leave IS a release: under the handover mutex, so a
             // cadence handover in flight on its own task completes (or
             // the leave takes the mutex first and the cadence finds the
@@ -3667,7 +3679,7 @@ impl KvMetaBackend {
             for region in set
                 .regions
                 .iter()
-                .filter(|r| !uncovered(r) && !custody_blocked.contains(&r.id))
+                .filter(|r| !uncovered_ids.contains(&r.id))
             {
                 if region.released.load(Ordering::Acquire) {
                     continue;
@@ -3690,6 +3702,8 @@ impl KvMetaBackend {
         // §5.1.3: a released region's UNCLAIMED grant (and every free its
         // tail already covered) returns to the heap — one control entry
         // per region, before its page goes Free.
+        // The verdict is FINAL from here: ring-uncovered ∪ custody-blocked.
+        let uncovered = |r: &super::appender::AppenderRegion| uncovered_ids.contains(&r.id);
         for region in set.regions.iter().skip(1).filter(|r| !uncovered(r)) {
             let mut back: Vec<u64> = {
                 let mut g = region.grant();
@@ -5980,16 +5994,51 @@ impl KvMetaBackend {
         )))
     }
 
-    /// The handover body, under the caller's hold of `handover`, in the
-    /// exact order: `Releasing` raised on the gate (no new commit passes
-    /// the door) → the door DRAINED (every admitted commit of the slot at
-    /// its terminal outcome — Issue 6) → flush cycles until the region's
-    /// window is clear of the slot (Issue 11) → the page with the slot in
-    /// `Releasing { root, cursor, g }` + barrier → `ReleaseSlot` (tree 0
-    /// `Unleased`, one tx, barriered) → the page without the slot. Two
-    /// durable homes at every instant; `slot_handover_phase_ns` records
-    /// `flush / page / tree0`.
+    /// The handover under the caller's hold of `handover`: the custody
+    /// act, then the transfer. **The mid-handover mark's lifetime is this
+    /// function's ONE act** (symmetric PR 9, review round 4 — Issue 29):
+    /// `defer_handover_for_custody` arms the slot's mark BEFORE its grant
+    /// census and hands it back HELD; the transfer body runs with it
+    /// standing (a re-acquire inside the flush-then-transfer is deferred to
+    /// the slot's next holder, never granted at this one); the mark is
+    /// dropped at the transfer's terminal outcome — the slot moved, or the
+    /// release aborted and the slot stayed — by the explicit `drop` below,
+    /// whichever way the body returned. A DEFERRED verdict (live grants
+    /// recalled this tick) returns the retryable class before any transfer
+    /// step; the mark it armed stands unheld to the bound.
     async fn release_slot_handover_locked(
+        &self,
+        region_id: u32,
+        slot: super::record::ForestSlot,
+    ) -> std::result::Result<(), KvError> {
+        let mark = match crate::data_grant::defer_handover_for_custody(self.volume_uuid(), slot) {
+            crate::data_grant::HandoverCustody::Deferred { recalled } => {
+                return Err(KvError::HandoverDeferred(format!(
+                    "{}: release of slot {slot} by appender {region_id} deferred — a writer \
+                     holds custody of a file in it from this holder; {recalled} grant(s) \
+                     recalled this tick, the writer releases within one renewal beat (the \
+                     cadence retries)",
+                    self.path.display()
+                )));
+            }
+            crate::data_grant::HandoverCustody::Clear(mark) => mark,
+        };
+        let outcome = self.transfer_slot_locked(region_id, slot).await;
+        // The terminal outcome: the mark's one drop point.
+        drop(mark);
+        outcome
+    }
+
+    /// The transfer body, under the caller's hold of `handover` AND the
+    /// slot's held mid-handover mark, in the exact order: `Releasing`
+    /// raised on the gate (no new commit passes the door) → the door
+    /// DRAINED (every admitted commit of the slot at its terminal outcome
+    /// — Issue 6) → flush cycles until the region's window is clear of the
+    /// slot (Issue 11) → the page with the slot in `Releasing { root,
+    /// cursor, g }` + barrier → `ReleaseSlot` (tree 0 `Unleased`, one tx,
+    /// barriered) → the page without the slot. Two durable homes at every
+    /// instant; `slot_handover_phase_ns` records `flush / page / tree0`.
+    async fn transfer_slot_locked(
         &self,
         region_id: u32,
         slot: super::record::ForestSlot,
@@ -6014,28 +6063,6 @@ impl KvMetaBackend {
                 self.path.display()
             )));
         }
-        // Symmetric PR 9 (§5.1.4, flush-then-transfer): a slot whose files
-        // a writer holds custody of from this holder does not move until
-        // the writer releases — a grant never spans a handover. The grants
-        // are RECALLED through the S9 pull channel and the handover is
-        // DEFERRED in the retryable class (review round 2, Issues 5/9):
-        // the requester's next tick finds them released. The `Clear`
-        // verdict's mark is HELD to this function's terminal outcome
-        // (round 3): a re-acquire inside the transfer below is deferred to
-        // the slot's next holder, never granted at this one.
-        let _custody_mark =
-            match crate::data_grant::defer_handover_for_custody(self.volume_uuid(), slot) {
-                crate::data_grant::HandoverCustody::Deferred { recalled } => {
-                    return Err(KvError::HandoverDeferred(format!(
-                        "{}: release of slot {slot} by appender {region_id} deferred — a writer \
-                         holds custody of a file in it from this holder; {recalled} grant(s) \
-                         recalled this tick, the writer releases within one renewal beat (the \
-                         cadence retries)",
-                        self.path.display()
-                    )));
-                }
-                crate::data_grant::HandoverCustody::Clear(mark) => mark,
-            };
         // 1. Releasing FIRST: the gate stops new commits at the door
         // before the flush takes any node lock (the loom-pinned order),
         // then the door is drained — the release's half of the Dekker

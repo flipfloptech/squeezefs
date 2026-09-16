@@ -323,6 +323,8 @@ pub mod conveyor_core;
 pub mod coverage_core;
 #[path = "../../src/cow_core.rs"]
 pub mod cow_core;
+#[path = "../../src/custody_revoke_core.rs"]
+pub mod custody_revoke_core;
 #[path = "../../src/meta_backend/kv/epoch_core.rs"]
 pub mod epoch_core;
 #[path = "../../crates/squeezefs-ipc/src/exec_core.rs"]
@@ -7554,6 +7556,186 @@ mod token_grant_models {
                 "a grant inside an open window must park — user 1's settle cleared user 2's mark"
             );
             assert!(!gate.is_inflight(X), "both users settled");
+        });
+    }
+}
+
+#[cfg(all(test, loom))]
+mod custody_revoke_models {
+    //! [`custody_revoke_core`] (symmetric metadata PR 9, review round 4 —
+    //! Issue 29; design §5.1.4): the recall design's two Dekker pairs.
+    //!
+    //! **Pair 1 — revoke / enter** (a fence-based Dekker over two words):
+    //! the handler registers its use, fences, reads the cached word; the
+    //! recall clears the word, fences, reads the uses. Weakening evidence
+    //! (verified RED 2026-09-16, then restored): with the two `SeqCst`
+    //! fences removed and the four accesses `Relaxed`, loom finds the
+    //! schedule where the handler reads `cached == 1` AND the settle reads
+    //! `uses == 0` — a write under a released grant; with only the
+    //! handler's fence removed (its use registered `Relaxed`, no fence)
+    //! the same schedule; the pair needs BOTH fences.
+    //!
+    //! **Pair 2 — the handover's mark / the grant's re-check** (mutex-
+    //! ordered on both sides; the `Relaxed` fast-path count inside the
+    //! happens-before chain): the handover arms its mark under the mark
+    //! table's lock and stores the count, then takes its census under the
+    //! REAL grant table's lock ([`grant_table_core`], `#[path]`-shared);
+    //! the grant inserts under the grant table's lock, then reads the
+    //! count (`Relaxed`) and the mark table. Weakening evidence (verified
+    //! RED 2026-09-16, then restored): with the grant's two steps SWAPPED
+    //! (the mark read BEFORE the insertion — the round-2 build's order)
+    //! loom finds the schedule where the census is empty AND the grant
+    //! reads `defers == false` — the grant spans the move. The `Relaxed`
+    //! count is sound as built: a load that happens-after the store (through
+    //! the grant table's unlock/lock) sees it.
+    use crate::custody_revoke_core::{CustodyUseCore, HandoverMarkCore};
+    use crate::grant_table_core::GrantTableCore;
+    use loom::sync::Arc;
+    use loom::thread;
+    use std::time::Duration;
+
+    /// A handler entering against a recall: it either reads the lease
+    /// revoked (and re-acquires) or the settle counts it in flight (and
+    /// the release waits) — never a handler serving the cached lease while
+    /// the settle reads no use.
+    #[test]
+    fn a_handler_that_serves_the_cached_lease_is_counted_before_the_release_departs() {
+        loom::model(|| {
+            let core = Arc::new(CustodyUseCore::new());
+            core.cache();
+            let handler = {
+                let core = Arc::clone(&core);
+                thread::spawn(move || {
+                    core.enter();
+                    core.is_cached()
+                })
+            };
+            let recall = {
+                let core = Arc::clone(&core);
+                thread::spawn(move || {
+                    core.revoke();
+                    core.settle_ready()
+                })
+            };
+            let served = handler.join().unwrap();
+            let released = recall.join().unwrap();
+            assert!(
+                !(served && released),
+                "the handler served the cached lease AND the settle read no use in flight — \
+                 a write under a released grant"
+            );
+            // The handler leaves; the release may depart now.
+            core.leave();
+            assert!(core.settle_ready());
+            assert!(
+                !core.is_cached(),
+                "revoked stays revoked until the next cache"
+            );
+        });
+    }
+
+    /// Two handlers against one recall: every handler that served is
+    /// counted; the settle releases only once both left.
+    #[test]
+    fn two_handlers_against_one_recall_are_each_counted_or_refused() {
+        loom::model(|| {
+            let core = Arc::new(CustodyUseCore::new());
+            core.cache();
+            let spawn = || {
+                let core = Arc::clone(&core);
+                thread::spawn(move || {
+                    core.enter();
+                    core.is_cached()
+                })
+            };
+            let a = spawn();
+            let b = spawn();
+            core.revoke();
+            let released = core.settle_ready();
+            let (sa, sb) = (a.join().unwrap(), b.join().unwrap());
+            assert!(
+                !((sa || sb) && released),
+                "a handler served the cached lease while the settle read no use (a {sa}, b {sb})"
+            );
+            core.leave();
+            assert!(!core.settle_ready(), "one use still in flight");
+            core.leave();
+            assert!(core.settle_ready());
+        });
+    }
+
+    const INO: u64 = 77;
+    const KEY: (u128, u16) = (0xC0FFEE, 4);
+
+    /// One grant racing one handover on the same slot: the handover's
+    /// census sees the grant (and recalls it) OR the grant reads the mark
+    /// (and defers itself) — never a grant neither saw.
+    #[test]
+    fn a_grant_racing_the_handover_is_censused_or_deferred() {
+        loom::model(|| {
+            let marks = Arc::new(HandoverMarkCore::<(u128, u16)>::new());
+            let table = Arc::new(GrantTableCore::<u64>::new());
+            let epoch = table.join("writer", 0, None, 1_000, 10_000, |_| {});
+            let grant = {
+                let marks = Arc::clone(&marks);
+                let table = Arc::clone(&table);
+                thread::spawn(move || {
+                    // Step 1: the grant's insertion under the grant table's
+                    // lock (the arbiter's commit).
+                    let id = table
+                        .commit_grant_if_current("writer", epoch, INO, None, 1u64)
+                        .expect("a current lease grants");
+                    // Step 2: the mark re-read after the grant.
+                    let defers = marks.defers(KEY, Duration::from_secs(60));
+                    (id, defers)
+                })
+            };
+            // The handover: the mark armed HELD, then the census.
+            let seq = marks.arm(KEY, true);
+            let census: Vec<u64> = table
+                .grants_snapshot_with(|id, g| (g.ino == INO).then_some(id))
+                .into_iter()
+                .flatten()
+                .collect();
+            let (id, defers) = grant.join().unwrap();
+            assert!(
+                census.contains(&id) || defers,
+                "the census missed the grant AND the grant read no mark — a grant spanning \
+                 the move"
+            );
+            // The transfer's terminal outcome clears the held mark; a grant
+            // re-check after it sees no mark.
+            assert!(marks.clear_if(KEY, seq));
+            assert_eq!(marks.pending(), 0);
+            assert!(!marks.defers(KEY, Duration::from_secs(60)));
+        });
+    }
+
+    /// The guard clears only the mark it armed: a later re-arm (the
+    /// leave's, the next tick's) survives an older guard's drop.
+    #[test]
+    fn an_older_guards_drop_never_clears_a_newer_held_mark() {
+        loom::model(|| {
+            let marks = Arc::new(HandoverMarkCore::<(u128, u16)>::new());
+            let first = marks.arm(KEY, true);
+            let rearm = {
+                let marks = Arc::clone(&marks);
+                thread::spawn(move || marks.arm(KEY, true))
+            };
+            let cleared = marks.clear_if(KEY, first);
+            let second = rearm.join().unwrap();
+            assert!(second > first, "stamps are monotone");
+            if cleared {
+                // The first guard dropped before the re-arm: the re-arm
+                // stands.
+                assert_eq!(marks.pending(), 1);
+            } else {
+                // The re-arm landed first: the older guard cleared nothing.
+                assert_eq!(marks.pending(), 1);
+            }
+            assert!(marks.defers(KEY, Duration::from_secs(60)));
+            assert!(marks.clear_if(KEY, second));
+            assert_eq!(marks.pending(), 0);
         });
     }
 }

@@ -113,6 +113,10 @@ pub mod data_alloc_bitmap;
 // laws is a red build, not a review item. A plain comment (the `env_knobs`
 // note below).
 pub mod coverage_core;
+// Symmetric PR 9 (review round 4, Issue 29): the recall design's two Dekker
+// pairs — the FUSE layer's revoke/enter words and the handover's mark /
+// the grant's re-check — as one `#[path]`-shared core loom-models checks.
+pub mod custody_revoke_core;
 pub mod defrag;
 pub mod park_core;
 pub mod park_gate;

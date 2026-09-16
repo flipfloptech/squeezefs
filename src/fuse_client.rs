@@ -13,7 +13,7 @@ use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use std::ffi::OsStr;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 pub const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
@@ -3662,20 +3662,20 @@ pub async fn census_meta_lock_acquire(
 /// [`SqueezefsFilesystem::custody_use_enter`]). Inert (no counter) for an
 /// own file and on every unarmed mount.
 pub struct CustodyUse {
-    counter: Option<std::sync::Arc<AtomicI64>>,
+    core: Option<std::sync::Arc<crate::custody_revoke_core::CustodyUseCore>>,
 }
 
 impl CustodyUse {
     /// The guard that counts nothing.
     pub const fn inert() -> Self {
-        Self { counter: None }
+        Self { core: None }
     }
 }
 
 impl Drop for CustodyUse {
     fn drop(&mut self) {
-        if let Some(c) = &self.counter {
-            c.fetch_sub(1, Ordering::SeqCst);
+        if let Some(c) = &self.core {
+            c.leave();
         }
     }
 }
@@ -9409,9 +9409,16 @@ pub struct SqueezefsFilesystem {
     /// for the count to drain: no handler that took the token before the
     /// revoke can merge or DMA after the grant left. Entries exist only for
     /// inos a slot holder serves (`slot_holder_home` — one relaxed load per
-    /// op unarmed, no map touch); own files never enter.
-    custody_use:
-        std::sync::Arc<dashmap::DashMap<u64, std::sync::Arc<AtomicI64>, ahash::RandomState>>,
+    /// op unarmed, no map touch); own files never enter. The words are the
+    /// `#[path]`-shared [`crate::custody_revoke_core::CustodyUseCore`]
+    /// (round 4, Issue 29 — the revoke / enter Dekker loom-models checks).
+    custody_use: std::sync::Arc<
+        dashmap::DashMap<
+            u64,
+            std::sync::Arc<crate::custody_revoke_core::CustodyUseCore>,
+            ahash::RandomState,
+        >,
+    >,
     lease_locks: std::sync::Arc<StripeLocks<crate::sqz_sync::SqzMutex<()>>>,
     pub active_inode_locks: std::sync::Arc<StripeLocks<crate::sqz_sync::SqzRwLock<()>>>,
     /// P1-4: capacity-bounded attribute cache (moka TTL + max_capacity).
@@ -16058,6 +16065,15 @@ impl SqueezefsFilesystem {
         };
         METRICS.dlm_acquire_time.record(start_dlm.elapsed());
         let token = lease.fencing_token();
+        // A foreign-custody ino's word reads served BEFORE its lease enters
+        // the map (`custody_revoke_core` pair 1's `cache`): no reader ever
+        // finds a cached lease under a cleared word. The word is minted
+        // here when no handler's use minted it first (the R5 pressure
+        // flusher acquires outside any handler); one relaxed load and no
+        // map touch for an own file or an unarmed mount.
+        if crate::data_grant::slot_holder_home(ino).is_some() {
+            self.custody_use.entry(ino).or_default().cache();
+        }
         self.active_leases.insert(ino, lease);
         Ok(token)
     }
@@ -16651,7 +16667,17 @@ impl SqueezefsFilesystem {
     /// reads it too.
     pub fn cached_lease_token(&self, ino: u64) -> Option<u64> {
         let lease = self.active_leases.get(&ino)?;
-        if lease.held_now() {
+        // The revoke / enter Dekker's second read (round 4, Issue 29 —
+        // `custody_revoke_core` pair 1): a foreign-custody ino's word is
+        // read AFTER the handler's `custody_use_enter` registered its use
+        // and fenced; a word a recall cleared refuses the lease however
+        // the map read went, so the settle's count of this use is never
+        // the one that lets a release depart under a served token.
+        let revoked = self
+            .custody_use
+            .get(&ino)
+            .is_some_and(|core| !core.is_cached());
+        if !revoked && lease.held_now() {
             return Some(lease.fencing_token());
         }
         drop(lease);
@@ -16674,11 +16700,15 @@ impl SqueezefsFilesystem {
         if let Some((_, lease)) = self.active_leases.remove(&ino) {
             self.recalled_leases.insert(ino, lease);
         }
-        // The Dekker with `custody_use_enter`: the removal is visible to
-        // every handler that increments its use AFTER this fence; a
-        // handler that incremented before it is observed by the settle's
-        // load.
-        std::sync::atomic::fence(Ordering::SeqCst);
+        // The Dekker with `custody_use_enter` (`custody_revoke_core` pair
+        // 1's `revoke`: the word cleared, then the fence): the revoke is
+        // visible to every handler that registers its use AFTER it; a
+        // handler that registered before it is observed by the settle's
+        // load. An ino without a word (no use ever entered) needs none —
+        // the map removal alone is its revoke.
+        if let Some(core) = self.custody_use.get(&ino) {
+            core.revoke();
+        }
         if let Some((_, leases)) = self.active_range_leases.remove(&ino) {
             drop(leases);
         }
@@ -16694,12 +16724,11 @@ impl SqueezefsFilesystem {
         let mut ready: Vec<u64> = Vec::new();
         for entry in self.recalled_leases.iter() {
             let ino = *entry.key();
-            let inflight = self
+            let drained = self
                 .custody_use
                 .get(&ino)
-                .map(|c| c.load(Ordering::SeqCst))
-                .unwrap_or(0);
-            if inflight <= 0 || !entry.value().held_now() {
+                .is_none_or(|core| core.settle_ready());
+            if drained || !entry.value().held_now() {
                 ready.push(ino);
             }
         }
@@ -16729,26 +16758,15 @@ impl SqueezefsFilesystem {
         if crate::data_grant::slot_holder_home(ino).is_none() {
             return CustodyUse::inert();
         }
-        let counter = std::sync::Arc::clone(
-            &*self
-                .custody_use
-                .entry(ino)
-                .or_insert_with(|| std::sync::Arc::new(AtomicI64::new(0))),
-        );
-        counter.fetch_add(1, Ordering::SeqCst);
-        std::sync::atomic::fence(Ordering::SeqCst);
-        CustodyUse {
-            counter: Some(counter),
-        }
+        let core = std::sync::Arc::clone(&*self.custody_use.entry(ino).or_default());
+        core.enter();
+        CustodyUse { core: Some(core) }
     }
 
     /// **Test seam**: the in-flight custody uses of `ino` (0 = none, or an
     /// own file).
-    pub fn custody_uses(&self, ino: u64) -> i64 {
-        self.custody_use
-            .get(&ino)
-            .map(|c| c.load(Ordering::SeqCst))
-            .unwrap_or(0)
+    pub fn custody_uses(&self, ino: u64) -> u64 {
+        self.custody_use.get(&ino).map_or(0, |c| c.uses())
     }
 
     /// **Install the slot-custody plane's FUSE-layer hooks** (the mount

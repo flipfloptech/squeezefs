@@ -2967,6 +2967,113 @@ async fn an_evicted_readers_grants_are_swept_at_the_owners_eviction_not_at_the_d
     shutdown(&writer).await;
 }
 
+/// **The holder grants members only** (review round 3, Issue 27): where
+/// a membership owner is installed, a token verb from a client it does
+/// not list is REFUSED before anything is granted or registered — the
+/// owner-side lease law enforced at the grant, not first at the recall
+/// (a non-member's grant read `Expired` at its first recall and never
+/// blocked a writer, but it served from a token no lease backed and was
+/// counted a token client). A ghost with the cluster secret takes no
+/// token (its read fails closed, `dlm_token_nonmember_refusals` +1, not a
+/// token client, `grants_served` unmoved); a member joined through the
+/// owner is granted as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_holder_grants_members_only_and_refuses_a_ghost_before_it_registers() {
+    use squeezefs::membership::{
+        self, JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole, MembershipOwner,
+    };
+    let _g = SEAM.lock().await;
+    membership::uninstall();
+    squeezefs::meta_ship::token_plane::test_clear_token_clients();
+    let ticks = Arc::new(AtomicU64::new(10_000));
+    let owner = MembershipOwner::arm(
+        "tok-owner-27",
+        3,
+        2,
+        LeaseClocks::derive(Duration::from_micros(250)).expect("the shipped derivation"),
+        LeaseClock::manual(Arc::clone(&ticks)),
+    )
+    .expect("arm the owner");
+    membership::install_owner(Arc::clone(&owner));
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let holder = writer.volumes[0].token_holder().unwrap().clone();
+    let f = Metadata::create(writer.as_ref(), 1, "f", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+
+    // The ghost: the secret, no membership lease. Armed directly (its
+    // recall channel never becomes fresh — every verb is refused).
+    let ghost = open_routed_meta_set_read_only(&[path.display().to_string()])
+        .await
+        .expect("read-only open");
+    let ghost_plane = ghost.volumes[0]
+        .arm_token_reader(TokenClientConfig {
+            endpoint: endpoint.to_string(),
+            secret: SECRET.to_vec(),
+            client_id: "ghost".to_string(),
+            volume: 0,
+        })
+        .expect("the client arms; the holder decides");
+    let served0 = holder.stats().grants_served;
+    // The ghost's standing poll is the first verb the holder sees from it
+    // — refused as a non-member (the channel never becomes fresh).
+    wait_until("the holder refused the ghost's poll", || {
+        holder.stats().nonmember_refusals >= 1
+    })
+    .await;
+    let e = Metadata::getattr(ghost.as_ref(), f)
+        .await
+        .err()
+        .expect("a ghost's read fails closed");
+    assert!(
+        e.to_string().contains("read token unavailable"),
+        "fails closed under R-SYM-4: {e}"
+    );
+    assert_eq!(holder.stats().grants_served, served0, "nothing granted");
+    assert_eq!(holder.stats().outstanding, 0);
+    assert!(
+        !squeezefs::meta_ship::token_plane::is_token_client("ghost"),
+        "a refused ghost is not a token client"
+    );
+    assert_eq!(ghost_plane.stats().grants, 0);
+    ghost_plane.stop().await;
+    shutdown(&ghost).await;
+
+    // A member joined through the owner is granted as before.
+    let member = "reader-member";
+    let JoinOutcome::Granted(_) = owner.join(JoinRequest {
+        id: member.to_string(),
+        role: MemberRole::Reader,
+        endpoint: None,
+        pid: std::process::id(),
+        boot: "boot-sym-coherence".to_string(),
+        prior_epoch: None,
+        pr_key: 0,
+        mount: None,
+    }) else {
+        panic!("the reader joins as a member");
+    };
+    let refusals = holder.stats().nonmember_refusals;
+    let (reader, plane) = open_token_reader(&path, &endpoint, member).await;
+    let _ = Metadata::getattr(reader.as_ref(), f).await.unwrap();
+    assert_eq!(holder.stats().grants_served, served0 + 1);
+    assert_eq!(
+        holder.stats().nonmember_refusals,
+        refusals,
+        "a member is never refused"
+    );
+    assert!(squeezefs::meta_ship::token_plane::is_token_client(member));
+    plane.stop().await;
+    shutdown(&reader).await;
+    membership::uninstall();
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
 /// **The reader's install is conditional on the generation it read
 /// under** (review round 2, Issue 21 — the reader-side half of Issue 2).
 /// Schedule: the reader's fetch of B evicts A to make room — the eviction

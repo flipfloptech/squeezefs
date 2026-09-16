@@ -281,3 +281,22 @@ Attempts 1 and 2 were killed after their finds (the key clash; the pre-arm stamp
 | **Issue 26**: `sym_cross_owner_tests` ×10 flat on the QUIET box (1-min load 0.7–1.0 before every run; `RUST_LOG` tape captured per run) / ×3 stamped | **13/13 — 28 passed** each (14.6–15.0 s); plus the pre-fix quiet ×10 on `8b9a1ea5` (`xo10/`, 10/10 — 27 passed, 13.6–14.0 s, load 1.9 → 1.1): the schedule never fires quiet, and the tape of the deterministic pin names it (`pin26-red.log`: the guards parked on stripe 5283 whose last acquirer is the previous scope's own key, no release served) |
 | `kv_node_tests` (13) / `readonly_mount_tests` (35) / `dlm_membership_tests` (51) / `docs_parity_tests` (5) / `kernel_op_economy_tests` (3) / `sym_slot_transfer_tests` (45) / `sym_block_grant_tests` (37) / `reader_free_grace_tests` (66) / `env_knob_convention_tests` (22), both layouts | 18/18 legs green |
 | `bash tests/run_sym_forest_suites.sh` (**33 suites**, once, both legs) | **flat PASS / stamped PASS**, 1,071 s; ratios `sym_coherence_tests` 1.00, `sym_cross_owner_tests` 0.98, `sym_slot_transfer_tests` 1.00, `sym_pack_tests` 0.99, `sym_shared_refs_tests` 1.00 — no NOTE. (Attempt 1 on `c5abc057` was killed at the matrix's flat leg — `sym_pack_tests`' unarmed half on the once-armed volume, the Issue-25 law — and is `attempt1/`; the fix `9ab6c13b`, a pre-ledger matrix PASS/PASS on it (`matrix-pre.log`), then the count restarted from zero.) |
+
+## 12. Round 6 (2026-09-15) — review round 4's two issues (0 bugs), 3 commits `3b892731`..`0469e35d` over `da60408f`; LANDABLE
+
+| Issue | Verdict | Commits / pin |
+|---|---|---|
+| **29** — `exchange_pipelined` counted `BATCHES` but not `BATCHED_VERBS` (the coalesce factor undercounted the pipelined venue); Issue 28's departure prune re-opened Issue 5's `Unknown` verdict for a grant registered between the dispatch's membership check and the member's eviction | Both terms counted. Under an installed owner `lease_verdict` reads `None ⇒ Expired` unconditionally: the dispatch grants members only (Issue 27), so any holder the owner does not list has departed and the `is_token_client` qualifier carried no information; `Unknown` stays the no-owner / no-oracle verdict. The dispatch's membership check reads that ONE accessor (Issue 30: a member past its deadline but not yet swept is refused a beat earlier). | `3b892731` (pin) + `7aea0b23`; `a_grant_landing_inside_an_evictions_window_is_expired_not_unknown` — the seam `TEST_DISPATCH_HOLD_AFTER_CHECK_MS` parks the dispatch after the client's registration and before the grant's, the owner's `expire_due` evicts inside the park, the reader's channel is killed, the grant lands, the next recall completes at once (< 2 s, `timeouts_live == 0`). **RED under the pre-fix verdict: the recall waited the full deadline — 45.005 s** — Issue 5's stall in the window, reproduced |
+| **30** — nits | `meta_ship.pipelined_batches` in the `meta_ship` row and the coalesce sentence; the post-flip `=0` law stated in three places for PR 14's implementer to confirm (design §7.2's bit-17 row, the knob row, PR 14's plan-row Gate cell): with the `=0` posture code deleted and `1` the default, `=0` on a stamped volume REMAINS a refusal for a writable open; the reader / probe posture is `-o ro`, never a knob value; the refusal pin brackets the refused open with the device image's digest (byte-identical); the two debug lines' `Instant::now()` under `log_enabled!(Debug)`; the Issue-26 pin observes `crossvol_tx::parked_scopes()` reaching 0 (no sleep for synchronization). | `0469e35d` |
+
+### 12.1 Run ledger (the final tree `0469e35d`)
+
+| Gate / run (final tree `0469e35d` over `c6683b19`; `CARGO_INCREMENTAL=0`; logs `/tmp/grok-justin/pr5-logs/round6/`) | Result |
+|---|---|
+| `cargo fmt --check` (root, `fuzz/`, `loom-models/`) | clean / clean / clean |
+| `cargo clippy --all-targets --all-features -- -D warnings` / `cargo clippy --all-targets -- -D warnings` (shipped) | clean / clean |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | green |
+| `sym_coherence_tests` ×3 stamped / ×1 flat | 4/4 — **36 passed** each (62.3–65.9 s) |
+| `sym_cross_owner_tests` ×3 flat | 3/3 — **28 passed** each (14.9–15.1 s) |
+| `meta_ship_tests` (15) / `docs_parity_tests` (5) / `kernel_op_economy_tests` (3), both layouts | 6/6 legs green |
+| `tests/check_markdown_links.sh` | PASS |

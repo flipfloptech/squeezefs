@@ -70,6 +70,7 @@ PR's death path lands here:
 | F4 | **The inode plane judged a set with an unreplayed foreign window**: the C14 contract's probe read six healthy cross-owner children as C9-unreferenced — their dentries live in the dead holder's ring, their records in the creator's slot. | PR 8's `inode_plane_owns_slot` scoping (by the INO's slot) | `foreign_windows_pending` gates C9/C10 to no verdict while a foreign `Live`/`Recovering` page has a window; C15 names the dead one. |
 | F5 | **The C14 census reported one conflict twice** (a second Live page and tree 0's lease name the same pair). | PR 10's first build | One finding per unordered pair per slot. |
 | F6 | **A fresh `writer_claim` blocks offline fsck for the TTL after a kill** (by design — the preflight's freshness law) — the crash contracts could not reach the census. | harness | `fsck::run_offline_over` — the body over a caller-held probe (the CLI keeps the preflight). |
+| F7 | **A crashed incarnation's block-grant window LEAKED for ever** — the `sym-crash` leg's first round read `C6: used-blocks accounting 386 vs 385`: the grant window is RAM, so a kill left its granted-but-unminted tail and its minted-but-unpublished blocks SET in the allocation bitmap with no reference and no open grant — the bitmap oracle's LEAK half PR 8 stated (`DataAllocBitmap::drift`) and wired nowhere; and C6's `highest − free_list` arithmetic is single-writer's (the bitmap IS the free list on a grant-armed allocator — the drained list makes every bitmap-clear block read "used"). | PR 8's crash path | `arm_symmetric_allocation` clears every such bit at the (re-)hold with journaled deltas (`data_alloc_bitmap_leaks_released`; pinned red-first by `sym_block_grant_tests::a_crashed_incarnations_window_remainder_is_released_at_the_rehold` — 0 released without the arm); fsck's C6 DECLINES on a grant-armed allocator (`fsck_foreign_lane_exempted`, the lane partition's doctrine). On the fleet: 156 blocks released at the round-1 re-hold (77 + 79 over two data volumes), 121 at the round-10 re-hold. |
 
 ## 3. Recovery phase ns vs the dead window (SCOPING, debug profile)
 
@@ -135,20 +136,80 @@ row).
   (45/45 ×1 flat); the attribution stays owed to its owner — this rung's
   fixtures do not depend on the handover cadence's timing.
 - `tests/run_sym_forest_suites.sh` grew `sym_crash_matrix_tests` (34
-  suites); the both-ways run and the ×10 stamped count are recorded in
-  the summary (`/tmp/grok-justin/grok-exec-summary-dadee1dd-pr-10.md`).
+  suites): **flat PASS / stamped PASS**, no ratio NOTE (the largest ratio
+  1.31 on the 4 s `meta_slot_migration_tests` — under the runner's own
+  "a suite under 5 s is scheduler noise" rule; `sym_crash_matrix_tests`
+  10.8 / 10.7 s = 0.99). `sym_crash_matrix_tests` **×10 stamped from
+  zero: 10/10** (15 passed each, 10.4–10.7 s). The live-FUSE trio under
+  `SQUEEZEFS_TEST_REQUIRE_MOUNT=1`, both legs: stamped
+  `posix_mount_semantics_tests` 3 (46 s) / `corpse_sweep_tests` 4 /
+  `inline_raise_tests` 7 (127 s); flat `corpse_sweep_tests` 4 (183 s),
+  `inline_raise_tests` 7 (116 s), `posix_mount_semantics_tests` 3 (54 s)
+  on its re-run — its first flat run (concurrent with the 34-suite
+  matrix, the ×10 loop and the fleet legs; load average 18) failed ONE
+  contract at the harness's 90 s mount-readiness bound
+  (`mount_statvfs_ifree_recovers_after_create_delete_loop`: "mount did
+  not become ready in 90s", a debug daemon under the box load) — 2/3 then
+  3/3 alone; no mount-class skip on any leg. Fidelity `quick` (root,
+  nvmet): **PASS 43 / FAIL 0** in 1m37s; fidelity `full` (the `pr-matrix`
+  preempt leg included): **PASS 115 / FAIL 0** in 2m43s.
 
-## 6. Fleet legs (LOCAL, the tcp devsub)
+## 6. Fleet legs (LOCAL, the tcp devsub — nvmet-tcp on 127.0.0.1, a PR substrate)
 
-`sudo tests/mw_fleet.sh create N=2 --symmetric --lease-ttl-ms=15000` then
-`sudo tests/run_mw_matrix.sh sym-crash --rounds=10`: the s7-kill-matrix
-body on the symmetric fleet with per-round successor asserts (own-residue
-recovery ≥ 1, `manager_lease` `held` on every volume, `symmetric_meta` 1,
-every symmetric must-stay-0 gauge 0, `appender_recoveries` 0 — one
-appender, nothing foreign dies) + the online fsck with the C8 oracle
-(C14/C15 riding it). The run's counts are in the summary; a FOREIGN
-appender's recovery over the wire needs N daemons on one volume — PR 12's
-venue.
+`sudo SQZ_MWFLEET_OSS_GB=24 tests/mw_fleet.sh create N=2 --symmetric
+--lease-ttl-ms=15000` (format `--symmetric`, the manager armed with
+`SQUEEZEFS_SYMMETRIC_META=1`, the S6 plane implied, a reader member; the
+release binary of `3d71717d`) then `sudo tests/run_mw_matrix.sh sym-crash
+--rounds=10`: kill -9 of the manager at a randomized phase (0.5–8.5 s)
+into a sustained `dd conv=fsync` load, dead-mount sweep, successor
+remount, the per-round successor asserts (own-residue recovery ≥ 1, the
+dead incarnation's `Live` page listed, `manager_lease` `held` and
+`symmetric_meta` 1 on every volume, `writer_guard_mode` `flock+pr` — the
+metadata PR the death path's preempt fences — and every symmetric
+must-stay-0 gauge 0: `meta_kv_forest_key_violations`,
+`appender_fence_breach`, `foreign_frame_overwrite_detected`,
+`manager_verb_refusals`, the three replay violation classes,
+`fsck_slot_custody_conflicts`, `fsck_unrecovered_appenders`,
+`appender_park_expiries`, `meta_kv_leaf_lease_refusals`,
+`dlm_token_recall_timeouts_live`, `appender_flush_ceiling_overruns`;
+`appender_recoveries` 0 — one appender, nothing foreign dies) + the FULL
+online fsck with the C8 oracle (C14/C15 riding it) + `meta_kv_block_refs_
+drift` 0 + `data_dma_fence_refusals` 0 + `invariant_tripwires` 0 + the R5
+backstops 0; the reader re-joins at the matrix end.
+
+**GREEN 10/10 from zero** (`/run/squeezefs-mwfleet/rows/symcrash-1789549107`):
+
+| round | kill phase ms | remount s | fsck | C8 drift | fence refusals | tripwires |
+|---|---|---|---|---|---|---|
+| 1 | 4,611 | 1 | findings: 0 | 0 | 0 | 0 |
+| 2 | 766 | 1 | 0 | 0 | 0 | 0 |
+| 3 | 6,256 | 1 | 0 | 0 | 0 | 0 |
+| 4 | 7,916 | 1 | 0 | 0 | 0 | 0 |
+| 5 | 7,310 | 2 | 0 | 0 | 0 | 0 |
+| 6 | 1,072 | 1 | 0 | 0 | 0 | 0 |
+| 7 | 1,451 | 1 | 0 | 0 | 0 | 0 |
+| 8 | 7,853 | 1 | 0 | 0 | 0 | 0 |
+| 9 | 6,162 | 1 | 0 | 0 | 0 | 0 |
+| 10 | 3,524 | 1 | 0 | 0 | 0 | 0 |
+
+Final successor: `appender_self_recoveries` [1, 1], `appender_live_pages_
+at_mount` [1, 1], `data_alloc_bitmap_leaks_released` 121 (the dead dd's
+window remainder over two data volumes), `data_alloc_bitmap_drift` 0,
+`writer_guard_pr_reacquires` [0, 0], `recovery_ledger_polls` 19,
+`appender_recovery_bound_ms` [1,185, 1,185] (a 2 MiB fixed ring at 256 KiB
+nodes under the shipped cadence). Teardown: zero residue.
+
+**The counted-restart history (every earlier attempt aborted the count):**
+(1) the first build gated the sym leg on `data_plane_fence_mode` at the
+mount — on a symmetric-only fleet that gauge is the JOB WIRE's WERO,
+re-acquired over the dead incarnation's registration on its own retry
+cadence (≈ 40 s measured), not this plane's guarantee → the leg gates on
+`writer_guard_mode` = `flock+pr` (the metadata PR); (2) `ENOSPC` inside the
+kill phase on the default 2 × 4 GiB OSS (≈ 1.3 GB/s of zeros into zram) →
+`SQZ_MWFLEET_OSS_GB=24`; (3) **round 1's fsck read C6 `386 vs 385`** — F7
+above, the real defect, fixed red-first; (4) the 30 s bounded wait for the
+job wire's WERO expired → the `flock+pr` gate. A FOREIGN appender's recovery
+over the wire needs N daemons on one volume — PR 12's venue.
 
 ## 7. Stats
 
@@ -157,7 +218,8 @@ Appended at the END of the symmetric block: `appender_recoveries`,
 (per volume), `recovery_full_tail_scan_bytes`, `appender_recovery_preempts`,
 `recovered_regions_released`, `appender_clear_runs`, `recovery_ledger_polls`,
 `recovery_intents_rolled_forward`, `fsck_slot_custody_conflicts`
-(must-stay-0), `fsck_unrecovered_appenders`, `fsck_repair_classC15`. PR 8's
+(must-stay-0), `fsck_unrecovered_appenders`, `fsck_repair_classC15`,
+`data_alloc_bitmap_leaks_released`. PR 8's
 `dead_members_recorded` / `_acted` / `recovered_records` /
 `dead_member_propagation_ms` are driven by the plane now. All 0 on an
 unarmed or bit-17-absent mount.

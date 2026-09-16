@@ -2788,8 +2788,8 @@ require_symmetric() {
     require_membership
     [ "${SYMMETRIC:-0}" = "1" ] ||
         die "this leg needs a SYMMETRIC fleet — create it with: sudo tests/mw_fleet.sh create N=2 --symmetric [--lease-ttl-ms=15000]"
-    [ "$(stat_field 0 data_plane_fence_mode)" = "1" ] ||
-        die "member 0 data_plane_fence_mode != 1 — the S7 WERO hold is not standing (a non-PR substrate?)"
+    [ "$(stat_all_eq 0 writer_guard_mode flock+pr)" = "1" ] ||
+        die "member 0 writer_guard_mode != flock+pr on every volume — the metadata PR the death path's preempt fences is not held (a non-PR substrate?)"
     [ "$(stat_all_eq 0 symmetric_meta 1)" = "1" ] ||
         die "member 0 symmetric_meta != 1 on every volume — the symmetric plane is not armed on the manager (SQUEEZEFS_SYMMETRIC_META=1 on a bit-17 set)"
     [ "$(stat_all_eq 0 manager_lease held)" = "1" ] ||
@@ -2843,12 +2843,20 @@ s7_kill_body() { # [sym]
         "$MWFLEET" mount 0 ||
             die "round $round: successor remount FAILED (the WERO takeover or the D0 ladder refused)"
         t_up="$(date +%s)"
-        # On the symmetric fleet the WERO hold is the allocation lease's
-        # (PR 8's arm, after the mount path's recovery gate), a beat after
-        # the mount verb returns — bounded wait, never a fixed sleep.
-        [ "$sym" = "sym" ] && wait_stat_eq 0 data_plane_fence_mode 1 30 "round $round: the successor's WERO hold"
-        fm="$(stat_field 0 data_plane_fence_mode)"
-        [ "$fm" = "1" ] || die "round $round: successor data_plane_fence_mode=$fm (want 1)"
+        if [ "$sym" = "sym" ]; then
+            # The symmetric fleet's device fence is the D0 guard's PR on the
+            # METADATA namespaces (`flock+pr` — the death path's preempt
+            # target); `data_plane_fence_mode` there is the job wire's
+            # WERO, re-acquired over the dead incarnation's registration on
+            # its own retry cadence (~40 s measured) and not this plane's
+            # guarantee, so the sym leg does not gate on it.
+            [ "$(stat_all_eq 0 writer_guard_mode flock+pr)" = "1" ] ||
+                die "round $round: successor writer_guard_mode != flock+pr on every volume (the metadata PR the preempt fences is not held)"
+            fm="$(stat_field 0 data_plane_fence_mode)"
+        else
+            fm="$(stat_field 0 data_plane_fence_mode)"
+            [ "$fm" = "1" ] || die "round $round: successor data_plane_fence_mode=$fm (want 1)"
+        fi
         # The oracle: FULL online fsck (C1-C10, C8 ungated on this stamped
         # format — the durable ledger runs for real).
         out="$("$SQZ" fsck "$w_mnt" 2>&1)" ||

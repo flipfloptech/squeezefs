@@ -153,3 +153,7 @@ The carriage saves one loopback round trip per foreign first touch (≈ 125 µs 
 - `tests/run_sym_forest_suites.sh`: a comment paragraph + `sym_custody_tests` appended to `DEFAULT_SUITES`.
 - `docs/operations.md`: the S9 section's armed-plane paragraph, the PR 9 section after PR 5's, the `dlm_custody` stats row. `AGENTS.md`: the PR 9 paragraph before "### Metadata-throughput program"; the S9 `dlm_custody` sentence amended. `docs/design-symmetric-metadata.md`: row 9 ONLY.
 - `src/env_knobs.rs`, `src/fuse_client.rs`, `src/meta_ship/manager.rs`, `CLUSTER_WIRE_SCHEMA` — untouched.
+
+## 9. The fidelity tier (`quick`, root, nvmet — the release binary at `1ca066e2`)
+
+`sudo -n env … FIDELI_SQZ_BIN=$PWD/target/release/squeezefs bash tests/run_nvmeof_fidelity.sh quick` (`/tmp/grok-justin/pr9-logs/fidelity-quick.log`): **PASS=43 FAIL=0 in 1m37s** — `substrate-up` 1, `roundtrip-nvmet` 15, `pr-registrants` 7, `sym-manager-failover` 18 (the mount path with the PR-9 arm: 196/200 creates acked under the seam with the 4 refusals naming PR 6's cross-owner class — the leg's own expected shape; successor wall 1,408 ms against the 45,011 ms `manager_failover_bound_ms`; acked data byte-intact; WERO re-held by the successor; zero PR residue after the clean unmount), `guard-nvmet-x1` 1, `teardown-zero-residue` 1. The arm reads `Ok(false)` on that leg's mounts (no cluster listener ⇒ no `job:enroll` secret ⇒ the WARN and no holder dialed — §1.1), which is the honest posture: nothing of PR 9 engages without the wire, and the custody plane's device rows are untouched.

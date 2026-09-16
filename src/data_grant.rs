@@ -4633,6 +4633,11 @@ pub fn slot_holder_home(ino: u64) -> Option<CustodyHome> {
 /// [`slot_holder_home`] for a lock object's path form — `Some((ino,
 /// home))` only for an inode object whose custody a holder serves.
 pub fn slot_holder_home_of_path(file_path: &str) -> Option<(u64, CustodyHome)> {
+    // The arm's load before the path parse: the unarmed acquire pays one
+    // relaxed load here and nothing else.
+    if SLOT_CUSTODY.load().is_none() {
+        return None;
+    }
     let ino = crate::dlm::ino_of_path(file_path)?;
     slot_holder_home(ino).map(|home| (ino, home))
 }

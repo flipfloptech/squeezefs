@@ -3224,6 +3224,34 @@ impl NodeCache {
                 )));
             }
         }
+        Ok(self.remove_nodes(victims))
+    }
+
+    /// **The barrier's inverse for a FAILED recovery** (review round 3,
+    /// Issue 29): drop every cached node of `slot`, DIRTY ONES INCLUDED —
+    /// the dirt is the dead window's records the failed run replayed into
+    /// RAM (the ring still holds them; the re-run replays them again) and
+    /// nothing of this mount's own, so nothing is lost and nothing may be
+    /// flushed: a flush of a foreign slot's node under the restored
+    /// `foreign` bit would refuse at the structural gate (the must-stay-0
+    /// belt) or journal the manager's SMO for a slot tree 0 leases to the
+    /// dead appender. Legal only under the volume's SMO mutex (no pass
+    /// mid-walk) — the recovery holds it for the whole of steps 4–7 and
+    /// its rollback runs before the guard drops. Returns the nodes dropped.
+    pub fn discard_slot_nodes(&self, slot: super::record::ForestSlot) -> usize {
+        let mut victims: Vec<Arc<CachedNode>> = Vec::new();
+        self.for_each_node(|n| {
+            if n.forest_slot() == Some(slot) {
+                victims.push(Arc::clone(n));
+            }
+        });
+        self.remove_nodes(victims)
+    }
+
+    /// Remove `victims` from the map (each by identity), noting every
+    /// one's dying floor so the tail keeps respecting a record the node
+    /// carried until the next barrier. Returns the nodes removed.
+    fn remove_nodes(&self, victims: Vec<Arc<CachedNode>>) -> usize {
         let node_size = self.cfg.layout.node_size() as u64;
         let mut dropped = 0usize;
         for node in victims {
@@ -3237,7 +3265,7 @@ impl NodeCache {
                 dropped += 1;
             }
         }
-        Ok(dropped)
+        dropped
     }
 
     /// Latch-free map read: `Some` is a cache hit (counted). The returned

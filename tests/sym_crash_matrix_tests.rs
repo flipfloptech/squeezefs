@@ -2624,6 +2624,97 @@ async fn a_failed_recovery_leaves_the_dead_lessees_tree_foreign_to_the_managers_
     two_backends_teardown();
 }
 
+/// **Review round 3, Issue 29 — a FAILED recovery with NO successful re-run
+/// leaves no floor on ring 0.** Step 4 installs the dead lessee's page root
+/// with a `root_floor` at the run's ring-0 head; the table back at
+/// `Leased { dead }`, that root is published nowhere and unpublishable —
+/// before the fix the rollback left it, so the floor clamped ring 0's
+/// checkpoint tail until a re-run succeeded, and a recovery that never
+/// re-ran successfully (here: the record RETIRED by the member's rejoin)
+/// pinned the tail for ever — the ring fills, every commit parks. Now the
+/// rollback discards the slot's cached nodes and restores the tree's
+/// pre-install `(root, floor)`: after a failure at step 5 and at step 7
+/// (the flush done, the root moved) `unpublished_root_floors()` is EMPTY
+/// and the tree reads its grant-time root; the record retires, the poll
+/// recovers nothing, and after a storm of the manager's own commits ONE
+/// cadence's cycles advance ring 0's tail past the storm's head with
+/// `meta_kv_journal_full_stalls` flat. RED before at the floors assert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_recovery_with_no_re_run_leaves_no_floor_on_ring_0() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let fx = two_backends(dir.path()).await;
+    fx.vol.record_death_with_key(fx.x, 1, 0).await.unwrap();
+    assert!(
+        fx.vol.test_unpublished_root_floors().is_empty(),
+        "the premise: no guest root is unpublished before the recovery"
+    );
+    for step in [5u32, 7] {
+        recovery::TEST_RECOVERY_FAIL_AT_STEP.store(step, Ordering::SeqCst);
+        let rep = recover_dead_appenders_set(&fx.routed).await.unwrap();
+        assert_eq!(rep.per_volume[0].1.deferred, 1, "step {step}: {rep:?}");
+        assert_eq!(
+            fx.vol.test_unpublished_root_floors(),
+            Default::default(),
+            "step {step}: the rollback left no unpublishable root's floor on ring 0"
+        );
+        assert_eq!(
+            fx.vol.slot_tree(fx.slot).map(|t| t.root()),
+            Some(fx.stale_root),
+            "step {step}: the tree is back at the root it held before the install"
+        );
+        assert_eq!(
+            page_state(&fx.uris[0], &fx.vol, 1).await,
+            Some(AppenderState::Recovering),
+            "step {step}: the durable state is the re-run's"
+        );
+    }
+    // The member REJOINS elsewhere: its record retires — no re-run, ever.
+    assert!(fx.vol.retire_death_record(&fx.x).await.unwrap());
+    let rep = recover_dead_appenders_set(&fx.routed).await.unwrap();
+    assert_eq!(rep.recovered(), 0, "{rep:?}");
+    assert!(fx.vol.test_unpublished_root_floors().is_empty());
+    // The manager's own storm, then one cadence's cycles: the tail passes
+    // the storm's head — nothing pins ring 0.
+    let stalls0 = fx.vol.journal_full_stalls();
+    for i in 0..40 {
+        fx.routed
+            .create(
+                ROOT_INO,
+                &format!("own-{i:03}"),
+                libc::S_IFREG | 0o644,
+                1000,
+                1000,
+            )
+            .await
+            .expect("a create in the manager's own slots");
+    }
+    let head = fx.vol.journal_ring().core().head();
+    fx.vol.checkpoint_now().await.unwrap();
+    fx.vol.checkpoint_now().await.unwrap();
+    let tail = fx.vol.journal_ring().core().reusable_upto();
+    assert!(
+        tail >= head,
+        "ring 0's tail ({tail}) advanced past the storm's head ({head}) within one cadence"
+    );
+    assert_eq!(fx.vol.journal_full_stalls(), stalls0, "no full-ring stall");
+    // The re-run law still holds once a record names the member again: a
+    // fresh run from the durable state recovers every acked record.
+    fx.vol.record_death_with_key(fx.x, 2, 0).await.unwrap();
+    let rep = recover_dead_appenders_set(&fx.routed).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    assert_all_resolve(&fx.routed, fx.dir, &fx.files).await;
+    shutdown(&fx.routed).await;
+    let TwoBackends {
+        uris, routed, vol, ..
+    } = fx;
+    drop(vol);
+    drop(routed);
+    fsck_clean(&uris).await;
+    two_backends_teardown();
+}
+
 /// **Review round 2, Issue 24 — the recovered root install raises the
 /// node-seq handle and verifies the pointer.** The fn-level pin of the
 /// ONE install both the own-residue open and the recovery driver run: a

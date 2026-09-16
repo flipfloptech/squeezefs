@@ -106,11 +106,25 @@
 # whether the forest pays for them in TIME, and that is the reviewer's
 # question, not the assertion's.
 #
+# THE PER-SUITE WATCHDOG (PR 10 review round 3, Issue 30): every suite runs
+# under `timeout` with a wall bound DERIVED from the timed table — the
+# suite's own flat wall × SQZ_SYM_HANG_FACTOR (default 4), floored at
+# SQZ_SYM_HANG_FLOOR_S (default 600 s = the first leg's bound, where no
+# wall is measured yet; a suite whose flat leg is fast gets the floor, a
+# slow one 4× its own measured wall). A suite that reaches it is KILLED
+# (TERM, then KILL after 10 s) and reported as a `HUNG` row naming the
+# bound and the last test line it printed — loud, and the leg FAILS —
+# instead of parking the whole matrix for as long as the hung future
+# lives (an 18-minute stall before this line; PR 7b's Issue-28 flip
+# self-deadlock is the shape that found it). Inert on a green suite: no
+# suite's wall comes within an order of magnitude of its bound.
+#
 # Usage:
 #   tests/run_sym_forest_suites.sh                 # both legs, the default list
 #   tests/run_sym_forest_suites.sh stamped         # one leg
 #   SQZ_SYM_SUITES="kv_backend_tests" tests/run_sym_forest_suites.sh
 #   SQZ_SYM_RATIO_NOTE=1.5 tests/run_sym_forest_suites.sh
+#   SQZ_SYM_HANG_FLOOR_S=120 tests/run_sym_forest_suites.sh   # a tighter watchdog
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -154,6 +168,10 @@ DEFAULT_SUITES=(
 )
 read -r -a SUITES <<<"${SQZ_SYM_SUITES:-${DEFAULT_SUITES[*]}}"
 RATIO_NOTE="${SQZ_SYM_RATIO_NOTE:-2.0}"
+HANG_FACTOR="${SQZ_SYM_HANG_FACTOR:-4}"
+HANG_FLOOR_S="${SQZ_SYM_HANG_FLOOR_S:-600}"
+[[ "$HANG_FACTOR" =~ ^[0-9]+$ && "$HANG_FLOOR_S" =~ ^[0-9]+$ && "$HANG_FLOOR_S" -ge 1 ]] ||
+  { echo "SQZ_SYM_HANG_FACTOR / SQZ_SYM_HANG_FLOOR_S must be positive integers" >&2; exit 2; }
 
 LEGS=(flat stamped)
 if [[ $# -ge 1 ]]; then
@@ -172,6 +190,18 @@ cargo test --all-features --no-run "${args[@]}" >/dev/null
 declare -A WALL
 now_ms() { date +%s%3N; }
 
+# The watchdog's bound for `suite`: max(floor, factor × the suite's flat
+# wall) — the flat leg (or a single leg) has no measured wall and takes the
+# floor.
+hang_bound_s() {
+  local s="$1" flat_ms="${WALL["flat/$1"]:-0}"
+  local derived=$(( flat_ms * HANG_FACTOR / 1000 ))
+  if (( derived > HANG_FLOOR_S )); then echo "$derived"; else echo "$HANG_FLOOR_S"; fi
+}
+
+SUITE_LOG="$(mktemp -t sym-forest-suite.XXXXXX)"
+trap 'rm -f "$SUITE_LOG"' EXIT
+
 for leg in "${LEGS[@]}"; do
   case "$leg" in
     flat) unset SQUEEZEFS_TEST_STAMP_SYMMETRIC ;;
@@ -181,15 +211,25 @@ for leg in "${LEGS[@]}"; do
   echo "=== sym-forest suites: $leg leg (${#SUITES[@]} suites) ==="
   leg_rc=0
   for s in "${SUITES[@]}"; do
+    bound=$(hang_bound_s "$s")
     t0=$(now_ms)
-    if cargo test --all-features --test "$s" -- --test-threads=1; then
-      :
-    else
-      leg_rc=1
-    fi
+    # The suite's output streams through AND lands in the log (the HUNG
+    # row names the last test line the suite printed).
+    set +e
+    timeout --signal=TERM --kill-after=10 "$bound" \
+      cargo test --all-features --test "$s" -- --test-threads=1 2>&1 | tee "$SUITE_LOG"
+    rc=${PIPESTATUS[0]}
+    set -e
     t1=$(now_ms)
     WALL["$leg/$s"]=$(( t1 - t0 ))
     printf '=== %s %-32s wall %6.1f s\n' "$leg" "$s" "$(awk "BEGIN{print (${WALL["$leg/$s"]})/1000}")"
+    if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+      last=$(grep -E '^test ' "$SUITE_LOG" | tail -1 || true)
+      echo "=== HUNG: $leg $s killed by the per-suite watchdog after ${bound} s (the last test line: '${last:-none}') ===" >&2
+      leg_rc=1
+    elif [[ $rc -ne 0 ]]; then
+      leg_rc=1
+    fi
     if [[ $leg_rc -ne 0 ]]; then
       echo "=== $leg leg: FAILED at $s ===" >&2
       exit 1

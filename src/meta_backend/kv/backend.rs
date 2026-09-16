@@ -15763,17 +15763,29 @@ impl KvMetaBackend {
                 if root.addr == 0 {
                     continue; // granted, never minted: no tree to open yet
                 }
-                let tree =
-                    KvTree::open_slot_tree(Arc::clone(cache), slot, root, Arc::clone(seq)).await?;
-                if root != recorded {
+                let tree = if root != recorded {
                     // Opened AHEAD of tree 0: until a checkpoint publishes
                     // the root, every record it alone holds stays in the
                     // window — they sit at or past the ledger's tail (the
                     // cycle that moved the root clamped its tail to the
-                    // moved leaf's dying floor), so the tail is the floor.
-                    tree.set_root_floor(ledger.journal_tail_seq);
-                }
-                seq.fetch_max(root.seq, Ordering::AcqRel);
+                    // moved leaf's dying floor), so the tail is the floor —
+                    // the ONE unpublished-root open (its floor + the
+                    // node-seq raise; review round 3, Issue 30).
+                    KvTree::open_unpublished_slot_tree(
+                        Arc::clone(cache),
+                        slot,
+                        root,
+                        Arc::clone(seq),
+                        ledger.journal_tail_seq,
+                    )
+                    .await?
+                } else {
+                    let tree =
+                        KvTree::open_slot_tree(Arc::clone(cache), slot, root, Arc::clone(seq))
+                            .await?;
+                    seq.fetch_max(root.seq, Ordering::AcqRel);
+                    tree
+                };
                 guests.push((slot, Arc::new(tree), recorded));
             }
             if page.len() < 512 {

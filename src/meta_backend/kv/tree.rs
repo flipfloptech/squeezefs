@@ -932,6 +932,24 @@ impl KvTree {
         self.root_floor.store(floor, Ordering::Release);
     }
 
+    /// **The recovery rollback's inverse of [`Self::install_recovered_root`]**
+    /// (review round 3, Issue 29): put the tree back at the `(root, floor)`
+    /// it held BEFORE a recovery installed the dead lessee's page root —
+    /// a failed recovery with no successful re-run (the record retired by
+    /// a rejoin, a permanent failure) would otherwise leave the installed
+    /// root, published nowhere and unpublishable (tree 0 leases the slot
+    /// again), clamping ring 0's tail at its floor for ever. The pointer
+    /// alone is restored — no node read, no pin: the previous root was the
+    /// grant-time root this mount held without traversing (a foreign
+    /// slot's tree is read by nobody here but the census), and its image
+    /// may have been retired by the lessee since; the caller has discarded
+    /// every cached node of the slot first (the barrier's inverse), so the
+    /// next install re-loads from the device.
+    pub fn restore_root(&self, root: RootPtr, floor: u64) {
+        self.root.store(Arc::new(root));
+        self.set_root_floor(floor);
+    }
+
     /// The tree id (§4.2).
     pub fn tree_id(&self) -> u8 {
         self.tree_id

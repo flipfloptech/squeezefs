@@ -385,6 +385,15 @@ impl SlotTrees {
         let _ = self.published.remove_sync(&slot);
     }
 
+    /// The inverse of [`Self::adopt_guest_unpublished`] for a guest a FAILED
+    /// recovery adopted (review round 3, Issue 29): the tree leaves the
+    /// forest, so its never-published root clamps no tail; the re-run
+    /// adopts it again from the page. Answers whether a guest was removed.
+    pub fn remove_guest(&self, slot: ForestSlot) -> bool {
+        let _ = self.published.remove_sync(&slot);
+        self.guests.remove_sync(&slot).is_some()
+    }
+
     /// The journal position every UNPUBLISHED guest root came into force
     /// at, PER SLOT (empty = every guest root is named in tree 0): the
     /// checkpoint tail's clamp while a publication is pending or

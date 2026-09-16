@@ -184,19 +184,60 @@ pub static TEST_CLAIM_CLOCK_SKEW_SECS: AtomicU64 = AtomicU64::new(0);
 ///    of running an SMO on a tree tree 0 still leases to the dead
 ///    appender — ring-0 interior records the next open's `Lease` detector
 ///    refuses (PR 4 round 5's Issue-28 class);
-/// 3. the door's waiters, woken to re-read the table.
+/// 3. the door's waiters, woken to re-read the table;
+/// 4. the slot's RAM TREE (review round 3, Issue 29): the dead lessee's
+///    page root was installed writer-legal with a `root_floor` at this
+///    run's ring-0 head, and tree 0 still names the grant-time root — so
+///    the installed root is `published` nowhere and, with the table back
+///    at `Leased { dead }`, `publish_forest_roots` never publishes it:
+///    left in place its floor clamps ring 0's checkpoint tail until a
+///    re-run succeeds, and a recovery that NEVER re-runs successfully (the
+///    record retired by the member's rejoin; a permanent failure) pinned
+///    the tail for ever — the ring fills, every commit parks, the wedge
+///    class. So every cached node of the slot is DISCARDED (dirty ones
+///    included — the window's records the failed replay folded into RAM,
+///    which the ring still holds and the re-run folds again;
+///    `NodeCache::discard_slot_nodes`) and the tree goes back to the
+///    `(root, floor)` it held before the install (`KvTree::restore_root`),
+///    or leaves the forest when the run adopted it fresh from the page
+///    (`SlotTrees::remove_guest`). The re-run installs from the durable
+///    state exactly as a first run does.
 ///
-/// What stays: the installed root and the RAM tree (idempotent — the
-/// re-run installs the same page root and folds the same window), the
-/// per-slot extent ledger (a max-only word). The page stays
-/// `Recovering`; the re-run resumes from the durable state. Disarmed by
-/// clearing `begun` once tree 0's records are durable and the table
+/// What stays: the per-slot extent ledger (a max-only word). The page
+/// stays `Recovering`; the re-run resumes from the durable state.
+/// Declared AFTER the SMO mutex is taken, so it drops BEFORE the guard
+/// (the discard runs under the mutex — no flush pass mid-walk). Disarmed
+/// by clearing `begun` once tree 0's records are durable and the table
 /// released.
 struct RecoveryRollback<'a> {
     plane: &'a slot_lease::SlotLeasePlane,
+    cache: &'a Arc<NodeCache>,
+    forest: &'a forest::SlotTrees,
     id: u32,
-    /// `(slot, the gate's foreign bit as step 4 found it)`.
-    begun: Vec<(record::ForestSlot, bool)>,
+    begun: Vec<SlotRollback>,
+}
+
+/// One slot's words as step 4 found them.
+struct SlotRollback {
+    slot: record::ForestSlot,
+    /// The gate's `foreign` bit before step 4 cleared it.
+    was_foreign: bool,
+    tree: TreeRollback,
+}
+
+/// What step 4 did to the slot's RAM tree.
+enum TreeRollback {
+    /// Nothing (the page named no newer root, or the install failed).
+    Untouched,
+    /// Re-installed at the page's root over a tree this mount held at
+    /// `(root, floor)`.
+    Installed {
+        tree: Arc<KvTree>,
+        root: RootPtr,
+        floor: u64,
+    },
+    /// Adopted fresh from the page (this mount held no tree of the slot).
+    Adopted,
 }
 
 impl Drop for RecoveryRollback<'_> {
@@ -204,10 +245,34 @@ impl Drop for RecoveryRollback<'_> {
         if self.begun.is_empty() {
             return;
         }
-        for (slot, was_foreign) in self.begun.drain(..) {
+        for SlotRollback {
+            slot,
+            was_foreign,
+            tree,
+        } in self.begun.drain(..)
+        {
             self.plane.table.abort_release(slot, self.id);
             if was_foreign {
                 self.plane.gate.mark_foreign(slot);
+            }
+            match tree {
+                TreeRollback::Untouched => {}
+                TreeRollback::Installed { tree, root, floor } => {
+                    let dropped = self.cache.discard_slot_nodes(slot);
+                    tree.restore_root(root, floor);
+                    log::info!(
+                        "recovery rollback: slot {slot}'s tree back at its pre-install root \
+                         {root:?} (floor {floor}; {dropped} cached node(s) discarded)"
+                    );
+                }
+                TreeRollback::Adopted => {
+                    let dropped = self.cache.discard_slot_nodes(slot);
+                    self.forest.remove_guest(slot);
+                    log::info!(
+                        "recovery rollback: slot {slot}'s freshly adopted tree left the forest \
+                         ({dropped} cached node(s) discarded)"
+                    );
+                }
             }
         }
         self.plane.handover_done.notify_waiters();
@@ -539,6 +604,17 @@ impl KvMetaBackend {
     /// every root install raises (review round 2, Issue 24's witness).
     pub fn test_node_seq_now(&self) -> u64 {
         self.seq_handle().load(Ordering::Acquire)
+    }
+
+    /// Test seam: the forest's UNPUBLISHED guest-root floors per slot —
+    /// the checkpoint tail's clamp (empty on a flat volume; review round 3,
+    /// Issue 29's witness).
+    pub fn test_unpublished_root_floors(
+        &self,
+    ) -> std::collections::BTreeMap<record::ForestSlot, u64> {
+        self.forest()
+            .map(|f| f.unpublished_root_floors())
+            .unwrap_or_default()
     }
 
     /// Test seam: the device byte ranges appender `id`'s REGION owns on
@@ -1310,11 +1386,6 @@ impl KvMetaBackend {
                 plane.stale_entries.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let mut rollback = RecoveryRollback {
-            plane: &plane,
-            id,
-            begun: Vec::new(),
-        };
         // The window's highest local ino per slot (§5.1.8's third term).
         let mut window_max: std::collections::BTreeMap<record::ForestSlot, u64> =
             Default::default();
@@ -1344,6 +1415,15 @@ impl KvMetaBackend {
         // The structural door for everything from the root install on: no
         // manager SMO on the trees is in flight while their custody moves.
         let mut smo = self.smo.lock().await;
+        // Every RAM word step 4 changes goes back on any `Err` before step
+        // 7b; declared under the mutex so its drop runs under it.
+        let mut rollback = RecoveryRollback {
+            plane: &plane,
+            cache: &self.cache,
+            forest,
+            id,
+            begun: Vec::new(),
+        };
         // The recovered records' floor on THIS ring (the replay journals
         // nothing here; the flush makes them durable) and the installed
         // roots' un-published floor.
@@ -1359,7 +1439,11 @@ impl KvMetaBackend {
             }
             let was_foreign = plane.gate.is_foreign(*slot);
             match plane.table.begin_release(*slot, id) {
-                Ok(_) => rollback.begun.push((*slot, was_foreign)),
+                Ok(_) => rollback.begun.push(SlotRollback {
+                    slot: *slot,
+                    was_foreign,
+                    tree: TreeRollback::Untouched,
+                }),
                 Err(refusal) => {
                     return Err(KvError::Corrupt(format!(
                         "{}: the lease table refused to begin the recovery release of slot \
@@ -1392,7 +1476,7 @@ impl KvMetaBackend {
                 // raises it nowhere else, and a recoverer minting below
                 // the dead lessee's stamps would adopt a residue frame in
                 // a returned extent as its own tail (PR 11's class).
-                match forest.tree(*slot) {
+                let tree_rollback = match forest.tree(*slot) {
                     Some(tr) => {
                         if root.seq > tr.root().seq {
                             // The recoverer's RAM tree is STALE (Issue 2):
@@ -1402,8 +1486,16 @@ impl KvMetaBackend {
                             // barrier — a stale image would fold the window
                             // onto a base missing the lessee's flushed bsets)
                             // and the page's root installed writer-legal.
+                            let prior = (tr.root(), tr.root_floor());
                             self.cache.drop_slot_nodes(*slot)?;
                             tr.install_recovered_root(root, floor).await?;
+                            TreeRollback::Installed {
+                                tree: Arc::clone(&tr),
+                                root: prior.0,
+                                floor: prior.1,
+                            }
+                        } else {
+                            TreeRollback::Untouched
                         }
                     }
                     None => {
@@ -1416,7 +1508,11 @@ impl KvMetaBackend {
                         )
                         .await?;
                         forest.adopt_guest_unpublished(*slot, Arc::new(tree));
+                        TreeRollback::Adopted
                     }
+                };
+                if let Some(last) = rollback.begun.last_mut() {
+                    last.tree = tree_rollback;
                 }
             }
             // §5.1.8: the cursor is never lowered.

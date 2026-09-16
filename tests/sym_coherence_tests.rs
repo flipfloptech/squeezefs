@@ -3033,8 +3033,7 @@ async fn the_holder_grants_members_only_and_refuses_a_ghost_before_it_registers(
     .await;
     let e = Metadata::getattr(ghost.as_ref(), f)
         .await
-        .err()
-        .expect("a ghost's read fails closed");
+        .expect_err("a ghost's read fails closed");
     assert!(
         e.to_string().contains("read token unavailable"),
         "fails closed under R-SYM-4: {e}"

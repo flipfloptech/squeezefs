@@ -347,9 +347,9 @@ async fn a_solo_armed_mount_leases_its_native_slot_and_sixty_four_rotor_slots() 
     Knobs::unarmed().apply();
     let refused = open_routed_meta_set(&uris).await;
     Knobs::clear();
-    let e = refused
-        .err()
-        .expect("a =0 writer of a once-armed volume refuses");
+    let Err(e) = refused else {
+        panic!("a =0 writer of a once-armed volume refuses");
+    };
     assert!(e.to_string().contains("SQUEEZEFS_SYMMETRIC_META=1"), "{e}");
 }
 

@@ -245,7 +245,7 @@ The review's structural finding governed the round: the one-backend fixture
 (one process = one RAM tree, one actor) could not reach the driver's real
 defects. `tests/common/sym.rs` grew the **region-image fixture**
 (`capture_region_image` / `apply_region_image` over
-`KvMetaBackend::region_device_ranges` — a region's ring segments, its two
+`KvMetaBackend::test_region_device_ranges` — a region's ring segments, its two
 directory page slots, its grant's image extents) and the crash matrix's
 `two_backends()`: backend A (the manager + region 1 as PR 6's wire holder)
 checkpoints (image 1), keeps writing until its flush pass MOVES the slot's
@@ -283,7 +283,10 @@ as another daemon's would be. Every round-2 pin runs on it.
 `shutdown` took the writer branch and ran `checkpoint_now()` — a probe wrote
 a ledger record (and, once `published` was seeded from tree 0, re-published
 a leased slot's root as `Unleased { g: 0 }`) over a volume it holds no lock
-on. Every non-writer door writes nothing at teardown.
+on. Round 2 keyed the no-write arm on `non_writer`; **that key was WRONG**
+(a §4.11-degraded WRITE mount shares it — its whole teardown ladder skipped)
+and was DROPPED at the round-3 rebase for PR 7b's `KvMetaBackend.probe`
+field, set by `open_probe` alone (§10).
 
 **Round 2 verification (the final tree, `CARGO_INCREMENTAL=0`, the shared
 laptop)**: fmt / both clippy configs / rustdoc `-D warnings` / the fuzz
@@ -295,7 +298,79 @@ suites both layouts + `docs_parity` / `env_knob_convention` /
 flat→stamped AND stamped→flat — PASS; the live-FUSE trio both ways under
 `SQUEEZEFS_TEST_REQUIRE_MOUNT=1` — green, no skip; fidelity `quick` 43/0 +
 `full` 115/0 (root, nvmet); **`sym-crash` ×10 from zero on the tcp devsub
-WITH the acked-writes oracle — 10/10, 426 fsynced files across the ten
+WITH the acked-writes oracle — 10/10, 426 ledgered files across the ten
 kills, every one present with its content on the successor**, every
 per-round must-stay-0 gauge 0 (incl. `dead_member_write_deferrals`,
-`data_alloc_bitmap_drift`).
+`data_alloc_bitmap_drift`). (Round 2's oracle word was `sync -f` =
+`syncfs(2)`, which the FUSE fork does not serve — "create acked + writeback
+pushed", exact for a process kill, an overclaim for power loss; round 3's
+oracle is a per-file `fsync(2)` that returned — §10.)
+
+## 10. Review round 3 (2026-09-16) — the rebase onto PR 7b and Issues 22–27
+
+**The rebase.** `git rebase --onto 6c80d70f c4cb3730` replayed the 19
+round-1/2 commits onto the dev tip carrying PR 7b (directory striping,
+`bddea3e3`). Conflicts and their composition, theirs (7b) then ours:
+
+| File | Hunks | Composition |
+|---|---|---|
+| `src/fsck.rs` | 13 (+1 at `c559f52b`) | 7b's C17 `FindingId` / `SuspectKind` / counters / merge sites / confirm arm / plan text, then PR 10's C14 / C15 — additive; the nomination call order `evaluate_c16 → evaluate_c17 → evaluate_c14_c15`; `foreign_windows_pending`'s header (superseded in round 2) dropped for `foreign_window_inos`; the inode-plane verdict gate now states BOTH laws in one comment — 7b's blanket no-verdict on a NON-WRITER with a `Live` page (`build_referenced_inos` → `None`) fires first, PR 10's per-ino window scoping governs the WRITER's online plane |
+| `src/fuse_client.rs` | 1 | 7b's Striping family block, then PR 10's Recovery family block (the stats order `docs_parity_tests` decides — green) |
+| `tests/run_sym_forest_suites.sh` | 2 | `sym_dir_stripe_tests` then `sym_crash_matrix_tests` — **35 suites** |
+| `docs/operations.md` | 1 | 7b's striping section, then PR 10's recovery section |
+| `src/meta_backend/kv/backend.rs` | 1 (at `c559f52b`) | **Issue 22**: PR 10's `self.non_writer \|\|` shutdown predicate DROPPED, 7b's `self.probe \|\|` (the field, its init, `open_probe`'s set, the predicate + comment) kept verbatim; 7b's `manager_extent_grant_class` shutdown-refill gate and PR 10's `pre_admit_control_parking` / `admit_control_drain_and_retry` compose additively |
+| `meta_ship/` enums | none | 7b's 0x90 block is `MetaCall`'s (`SupplyStripeIno` / `IsEmpty` / `DestroyStripe`), PR 10's activation is `ManagerCall::RecordDeath` (PR 8's reserved variant) — different enums, no split-variant shape; the fuzz mirror compiles and runs |
+| `AGENTS.md`, `docs/design-symmetric-metadata.md`, `loom-models/src/lib.rs` | auto-merged | 7b's paragraph / row then PR 10's; the loom crate untouched by both |
+
+**The 7b seams, checked.** (a) A dead lessee's slot tree may hold a
+STRIPED directory — its `K + 2` reserved-name marker dentries and the
+stripe inos' dentry sets: the §5.9 steps are kind-blind by construction
+(`replay_dead_window` applies every record by `(kind, key)`; the tails
+walk leaves; tree 0 writes per slot), confirmed by the new contract
+`a_striped_directory_in_a_dead_lessees_slot_recovers_with_its_map_and_c17_clean`
+— the declared holder flips its directory into 4 stripes, 24 names land in
+the stripes through the cross-owner shipped steps, the holder dies, the
+recovery replays the window (`entries ≥ 1`), the map reads `k = 4`, every
+name resolves through the stripes, a post-recovery create routes into its
+stripe, and offline fsck is clean with **C17 `stripe_findings` 0** beside
+C14/C15 and the inode plane covered. (b) 7b's `IsEmpty { scope: 0 }` on a
+remote holder under the S8 owner-execute context is stated owed to PR 12
+by 7b — no action here.
+
+**Issues 22–27 as built.**
+
+| # | Class | Fix | Pin (red-first where stated) |
+|---|---|---|---|
+| 22 | bug | resolved BY the rebase — 7b's `probe` field is the shutdown's no-write key; PR 10's `non_writer` key dropped (a §4.11-degraded WRITE mount shares it); every doc reworded to 7b's posture | PR 10's `a_kill_between_a_page_write_and_the_next_publication_remounts_an_unarmed_forest` GREEN against 7b's predicate; 7b's three probe pins GREEN |
+| 23 | bug | `RecoveryRollback` restores EVERY RAM word step 4 changed as one RAII: the table's state (`abort_release`), the gate's `foreign` bit as step 4 FOUND it (`begun: Vec<(slot, was_foreign)>`), the door's waiters; the installed root / RAM tree (idempotent) and the extent ledger (max-only) stay — enumerated in the type's doc | `a_failed_recovery_leaves_the_dead_lessees_tree_foreign_to_the_managers_sweep` — fail at 5 / 6 / 7, after each: `is_foreign`, `Holder { dead }`, one `defrag_merge_sweep` skips the tree (`merge_sweep_foreign_skips` moved, `META_KV_NODE_MERGES` and `META_KV_LEAF_LEASE_REFUSALS` not); RED with `mark_foreign` reverted |
+| 24 | bug | `KvTree::install_recovered_root` is the ONE async install both the open's page-root pass and the driver run — the root node read and its `node_seq` checked against the pointer FIRST (torn ⇒ `Corrupt`, nothing installed), pinned and slot-stamped, the floor set, `seq.fetch_max(root.seq)`; `open_unpublished_slot_tree` is the fresh-tree arm (open + floor + the same raise); the orphan images' residue stamps floor the handle before their extents return (`node::residue_seq_ceiling`, one extent read per orphan) | `the_recovered_root_install_raises_the_node_seq_handle_and_refuses_a_stale_pointer` (RED with the `fetch_max` reverted: handle stayed 0 under a seq-42 root); `an_empty_window_death_leaves_the_recoverers_node_seqs_above_the_recovered_trees` (the `TwoBackendsWindow::Empty` fixture — green on both sides here, stated: the lessee and the recoverer shared one handle through the ledger's watermark) |
+| 25 | sugg | the cross-shard rejoin exposure stated as PR 12's obligation — design row 10 (exact text), operations.md's owed list, AGENTS.md | — |
+| 26 | sugg | `foreign_window_inos` resolves a dentry `Delete`'s child through `lookup_kind` in the parent's tree (the window is unreplayed, the pre-delete dentry stands) | `a_dentry_delete_in_a_foreign_window_scopes_its_child_out_of_the_inode_plane` (`TwoBackendsWindow::UnlinkOne`; the recoverer's ONLINE plane through the new `inode_plane_over` helper); RED before with `C10ZeroNlinkNamed { ino: 67 }` "DATA-LOSS RISK" |
+| 27 | nit | `DEPARTED_KEYS_MAX` gone — the memo is bounded by AGE, `alloc_lease::death_record_retire_age_ms` = `DEATH_RECORD_RETIRE_TTLS` (2, reason on the constant) × `T_owner`, the sweep's own age (ONE law, two readers); `test_pr_key` / `test_region_device_ranges` / `test_pending_deaths`; `admit_control_drain_and_retry` answers `Busy` when the tail moved, `Corrupt` only when it did not; the fleet oracle's "acked" is a per-file `fsync(2)` that returned (`dd conv=fsync`, never `sync -f` = `syncfs`, unserved by the fork) | `derivation_sweep_tests::sym_death_record_retire_age_ties_the_sweep_and_the_departed_key_memo` (90 s at the shipped TTL; an evicted member's key answers at the age and not one tick past); the `sym-crash ×3` below |
+
+The crash matrix is **29 contracts** (+1 ignored instrument) after this
+round; the two-backend fixture grew `TwoBackendsWindow::{Creates(n), Empty,
+UnlinkOne}`.
+
+**Round 3 verification (the rebased tree, `CARGO_INCREMENTAL=0`, the dev
+laptop alone)**:
+
+| Leg | Result |
+|---|---|
+| `cargo fmt --check` (root; the fuzz workspace's own) | clean |
+| `cargo clippy --all-targets --all-features -- -D warnings` / `cargo clippy --all-targets -- -D warnings` | clean / clean |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | clean |
+| `fuzz/`: `cargo check` + `cargo fmt --check` | clean |
+| `task check:loom` + `tests/run_loom.sh` | clean; **113 / 113** models |
+| `sym_crash_matrix_tests` stamped ×5 + flat ×2 from zero (29 contracts + the `#[ignore]`d instrument) | **7 / 7** (20.9–22.8 s) |
+| `sym_dir_stripe_tests` (7b's, incl. the striped-slot recovery seam) both layouts | stamped 27/27; flat 27/27 ×3 + the two matrix flat legs — **ONE HANG** in the first flat run (`stripe_dirs_at_mkdir_stripes_every_new_directory`, parked inside its closing `fsck_clean` → `run_offline` for 18 min at 2 % CPU, every thread in a futex/epoll park, killed; the thread dump `/tmp/grok-justin/pr10-r3/hang-bt.txt`) — NOT reproduced in five later flat runs and three stamped; unattributed (7b's suite over the composed tree; the parked future's frames are not in a thread dump) — stated, not adjudicated |
+| `sym_block_grant_tests` 38 / `sym_slot_transfer_tests` 45 / `sym_appender_tests` 34 / `fsck_tests` 22 / `fsck_c9_tests` 12 / `fsck_c10_tests` 18 / `docs_parity_tests` 5 / `derivation_sweep_tests` 59 / `env_knob_convention_tests` 22 / `decoder_property_tests` 59 / `dlm_membership_tests` 51 — flat AND stamped | **22 / 22 legs green** |
+| `tests/run_sym_forest_suites.sh` (35 suites, flat → stamped) | **PASS** (21.1 min; no ratio NOTE — `sym_crash_matrix_tests` 36.8 / 21.1 s = 0.57) |
+| `tests/run_sym_forest_suites.sh stamped` then `flat` (the other way) | **PASS / PASS** (9.8 + 11.4 min) |
+| `corpse_sweep_tests` stamped ×4, `SQUEEZEFS_TEST_REQUIRE_MOUNT=1` | **4 / 4** runs (4/4 each, 165–168 s) |
+| the live-FUSE trio under `SQUEEZEFS_TEST_REQUIRE_MOUNT=1`, stamped then flat | `posix_mount_semantics_tests` 3/3 + 3/3, `inline_raise_tests` 7/7 + 7/7, `corpse_sweep_tests` 4/4 + 4/4; no mount-class skip |
+| `tests/run_nvmeof_fidelity.sh quick` (root, nvmet; the release binary of the rebased tree) | **PASS 43 / FAIL 0** (1m38s; `sym-manager-failover` successor wall 1,407 ms against the 45,011 ms bound) |
+| `mw_fleet.sh create N=2 --symmetric --lease-ttl-ms=15000` (`SQZ_MWFLEET_OSS_GB=24`, tcp devsub, the release binary) + `run_mw_matrix.sh sym-crash --rounds=3` WITH the per-file-`fsync` oracle; teardown | **3 / 3 GREEN** — kill phases 6,846 / 844 / 3,267 ms, remount 2 / 1 / 1 s; the oracle: **1,146 / 149 / 460 files whose `fsync(2)` returned before the kill, every one present with its content on the successor**; per round fsck findings 0, C8 drift 0, fence refusals 0, tripwires 0, `self_recoveries` 2, manager `held`; the reader healthy after the matrix; teardown zero residue (rows `/run/squeezefs-mwfleet/rows/symcrash-1789580884`, torn down) |
+
+Not run (by rule): `task check`, squeeze-test, anything on `dev` / `main`;
+`.benchmarks/2026-09-12-sym-pr-run.md` untouched.

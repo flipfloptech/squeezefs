@@ -2245,8 +2245,17 @@ async fn a_parked_xv_guards_never_blocks_the_release_that_unparks_it() {
         "no scope expired"
     );
     assert!(names_in(&routed, shared).await.is_empty());
-    // The held releases land before the teardown reads the table.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // The held releases LAND (observed: the holder's parked-scope gauge
+    // reaches 0) before the teardown — never a sleep for synchronization.
+    let started = std::time::Instant::now();
+    while crossvol_tx::parked_scopes() != 0 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the held releases never landed ({} scope(s) still parked)",
+            crossvol_tx::parked_scopes()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
     assert_closed("release ordering");
     holders.tear_down();
     shutdown(&routed).await;

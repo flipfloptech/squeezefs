@@ -2154,13 +2154,21 @@ async fn a_once_armed_volume_refuses_a_writer_without_the_plane_and_loses_nothin
     }
     shutdown(&writer).await;
 
-    // The `=0` WRITER on the once-armed volume.
+    // The `=0` WRITER on the once-armed volume — bracketed by the device
+    // image's digest (sector 0, the ledger, every node): a REFUSED open
+    // writes NOTHING (review round 4, Issue 30).
     std::env::remove_var(SYMMETRIC_META_ENV);
+    let image_before = device_digest(&path);
     match open_routed_meta_set(&uris).await {
         Err(e) => {
             let msg = e.to_string();
             assert!(msg.contains("SQUEEZEFS_SYMMETRIC_META=1"), "{msg}");
             assert!(msg.contains("generation"), "{msg}");
+            assert_eq!(
+                device_digest(&path),
+                image_before,
+                "the refused open left the image byte-identical"
+            );
         }
         Ok(unarmed) => {
             // The defect's shape: the open succeeded, so its commits must

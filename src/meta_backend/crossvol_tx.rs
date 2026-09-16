@@ -848,6 +848,12 @@ pub(crate) fn park_guards(
     entry.stripes.extend(stripes);
 }
 
+/// Scopes currently parked for remote initiators (a gauge — the contracts
+/// observe a fire-and-forget release landing).
+pub fn parked_scopes() -> usize {
+    PARKED_GUARDS.lock().len()
+}
+
 /// The stripes already parked under `(client, scope)`.
 pub(crate) fn parked_stripes(client: &str, scope: u64) -> StripeSet {
     PARKED_GUARDS

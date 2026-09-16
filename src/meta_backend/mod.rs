@@ -1680,13 +1680,15 @@ impl RoutedMetaBackend {
                 inos.len(),
                 d.len()
             );
-            let t0 = std::time::Instant::now();
+            let t0 = log::log_enabled!(log::Level::Debug).then(std::time::Instant::now);
             let guards = dlm.lock_many(&inos, &d).await;
-            log::debug!(
-                "cross-owner guards: scope {scope:#x} for '{client}' on volume {v_idx} parked in \
-                 {:?}",
-                t0.elapsed()
-            );
+            if let Some(t0) = t0 {
+                log::debug!(
+                    "cross-owner guards: scope {scope:#x} for '{client}' on volume {v_idx} \
+                     parked in {:?}",
+                    t0.elapsed()
+                );
+            }
             crossvol_tx::park_guards(client, scope, guards, stripes);
         }
         Ok(())

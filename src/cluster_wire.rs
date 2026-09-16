@@ -2604,17 +2604,20 @@ impl SessionPark {
                 // awaiting arm (S8's metadata verbs) is polled on this
                 // lane beside the session's other in-flight serves.
                 let req = RpcRequest { id, verb, body };
-                let t0 = std::time::Instant::now();
+                // The tape's clock read is paid at the debug level only.
+                let t0 = log::log_enabled!(log::Level::Debug).then(std::time::Instant::now);
                 let reply = match &park.host.service {
                     ServiceArm::Sync(svc) => svc.call(req),
                     ServiceArm::Async(svc) => svc.call(req).await,
                 };
-                log::debug!(
-                    "cluster wire: peer '{}' call {id} served in {:?} (status {}) — replying",
-                    park.peer_id,
-                    t0.elapsed(),
-                    reply.status
-                );
+                if let Some(t0) = t0 {
+                    log::debug!(
+                        "cluster wire: peer '{}' call {id} served in {:?} (status {}) — replying",
+                        park.peer_id,
+                        t0.elapsed(),
+                        reply.status
+                    );
+                }
                 park.host.counters.served.fetch_add(1, Ordering::SeqCst);
                 let mut io = park.io.lock();
                 let SessionIo { stream, tx, .. } = &mut *io;

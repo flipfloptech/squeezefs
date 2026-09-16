@@ -611,16 +611,77 @@ async fn the_owners_eviction_and_the_grace_deadline_write_the_ledger_never_a_rec
     let JoinOutcome::Granted(_) = succ.join(join(20, None)) else {
         panic!("join")
     };
-    match vol.screen_record_death(&ident(20).into()) {
+    match vol.screen_record_death(&ident(20).into(), 0) {
         Err(KvError::Rejected(m)) => assert!(m.contains("LIVE"), "{m}"),
         other => panic!("a live member's death was admitted: {other:?}"),
     }
     let me = vol.appenders_public().unwrap().identity;
-    match vol.screen_record_death(&me.into()) {
+    match vol.screen_record_death(&me.into(), 0) {
         Err(KvError::Rejected(m)) => assert!(m.contains("own identity"), "{m}"),
         other => panic!("our own death was admitted: {other:?}"),
     }
-    assert!(vol.screen_record_death(&ident(99).into()).is_ok());
+    // (d) The KEY word's screen (review round 1, Issue 7 — the wire-word
+    // law over `pr_key`, the word that drives a PREEMPT): a departed
+    // member's word must match the key the census REGISTERED for it
+    // (evicted 17 registered 0x5100 + 17) — a contradiction is REJECTED,
+    // nothing written; a live member's key (20's) and this process's own
+    // key are rejected whatever member they ride; a member no census here
+    // knows (99) has its key DROPPED to 0 — recorded, the tail scan the
+    // fence — while a zero word is accepted verbatim.
+    let rejected_before = vol.appender_stats().unwrap().manager_verb_rejected;
+    assert_eq!(
+        vol.screen_record_death(&ident(17).into(), 0x5100 + 17)
+            .unwrap(),
+        0x5100 + 17,
+        "the registered key is stored as carried"
+    );
+    match vol.screen_record_death(&ident(17).into(), 0xBAD) {
+        Err(KvError::Rejected(m)) => assert!(m.contains("contradicts"), "{m}"),
+        other => panic!("a contradicting key word was admitted: {other:?}"),
+    }
+    match vol.screen_record_death(&ident(17).into(), 0x5100 + 20) {
+        Err(KvError::Rejected(m)) => assert!(m.contains("live member"), "{m}"),
+        other => panic!("a LIVE member's key was admitted on a dead member: {other:?}"),
+    }
+    match vol.screen_record_death(&ident(17).into(), vol.pr_key_pub()) {
+        Err(KvError::Rejected(_)) => {}
+        other => panic!("this process's own key was admitted: {other:?}"),
+    }
+    assert_eq!(
+        vol.appender_stats().unwrap().manager_verb_rejected,
+        rejected_before + 3,
+        "every key-word rejection is counted"
+    );
+    assert_eq!(
+        vol.screen_record_death(&ident(99).into(), 0x7777).unwrap(),
+        0,
+        "an unknown member's key is dropped, never stored"
+    );
+    assert_eq!(vol.screen_record_death(&ident(99).into(), 0).unwrap(), 0);
+    // The pure screen the wire's fuzz arm drives: the same verdicts.
+    use squeezefs::meta_backend::kv::backend::recovery::{screen_death_key, DeathKeyVerdict};
+    assert_eq!(
+        screen_death_key(7, Some(7), &[1], &[2]),
+        DeathKeyVerdict::Accept
+    );
+    assert_eq!(
+        screen_death_key(8, Some(7), &[1], &[2]),
+        DeathKeyVerdict::Reject
+    );
+    assert_eq!(
+        screen_death_key(1, Some(1), &[1], &[2]),
+        DeathKeyVerdict::Reject,
+        "our own key is refused even when the census agrees"
+    );
+    assert_eq!(
+        screen_death_key(2, None, &[1], &[2]),
+        DeathKeyVerdict::Reject
+    );
+    assert_eq!(
+        screen_death_key(9, None, &[1], &[2]),
+        DeathKeyVerdict::Unvalidated
+    );
+    assert_eq!(screen_death_key(0, None, &[], &[]), DeathKeyVerdict::Accept);
     shutdown(&routed).await;
     reset_process_state();
 }
@@ -947,9 +1008,13 @@ async fn a_dead_wire_lessees_slots_grant_and_dir_rename_lock_are_released_by_the
         alloc_lease::DEAD_MEMBERS_RECORDED.load(Ordering::Relaxed),
         recorded + 1
     );
+    // The key word (review round 1, Issue 7): no census here registered
+    // the joiner (the owner is uninstalled), so the wire's 0x77 is
+    // UNVALIDATED — recorded as 0 (the tail scan is the fence), never a
+    // key a preempt would act on.
     assert_eq!(
         vol.dead_member_record(&jid).await.unwrap().unwrap().pr_key,
-        0x77
+        0
     );
     let (rec0, act0) = (recoveries(), acted());
     let rep = recover_dead_appenders_set(&routed).await.unwrap();
@@ -1298,6 +1363,72 @@ async fn appender_clear_refuses_a_live_lease_and_attests_a_dead_one() {
     reset_process_state();
 }
 
+/// The `claim clear` law over EVERY volume the verb touches (review round
+/// 1, Issue 6): `appender clear` on volume 1 of a set whose VOLUME 0 holds
+/// a heartbeat-fresh `writer_claim` — a live manager, on this host or a
+/// foreign one — is refused naming volume 0's claim, before anything of
+/// the verb's is opened; volume 1's own aged claim did not admit it. The
+/// first build gated the claim check on the cleared page being the
+/// manager's and never read volume 0's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn appender_clear_refuses_a_fresh_writer_claim_on_volume_0() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config(dir.path(), 2).await;
+    // A clean writer over both volumes (every claim removed at its leave)…
+    {
+        let routed = open_under(&uris, &Knobs::unarmed()).await;
+        let d = routed
+            .create(ROOT_INO, "d", libc::S_IFDIR | 0o755, 1000, 1000)
+            .await
+            .unwrap()
+            .ino;
+        routed
+            .create(d, "f", libc::S_IFREG | 0o644, 1000, 1000)
+            .await
+            .unwrap();
+        shutdown(&routed).await;
+    }
+    let (vol0, vol1) = (
+        std::path::Path::new(&uris[0]),
+        std::path::Path::new(&uris[1]),
+    );
+    // …then a FOREIGN host's heartbeat-fresh claim planted on volume 0
+    // alone (what a live manager elsewhere looks like from this host).
+    let foreign_claim = squeezefs::meta_backend::kv::backend::WriterClaim {
+        id: "foreign-manager".to_string(),
+        ts: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        pid: 1,
+        boot: "another-boot".to_string(),
+        term: 7,
+    };
+    KvMetaBackend::test_plant_writer_claim(vol0, &foreign_claim)
+        .await
+        .unwrap();
+    match KvMetaBackend::appender_clear(vol1, vol0, 0).await {
+        Err(KvError::Busy(m)) => {
+            assert!(m.contains("writer claim"), "{m}");
+            assert!(m.contains(&uris[0]), "the refusal names volume 0: {m}");
+            assert!(m.contains("foreign-manager"), "{m}");
+        }
+        other => panic!("cleared under volume 0's fresh claim: {other:?}"),
+    }
+    // The operator's wait (the TTL passed on volume 0's claim): the verb
+    // reaches its page checks — page 0 is `Free` after the clean leave.
+    recovery::TEST_CLAIM_CLOCK_SKEW_SECS.store(3_600, Ordering::SeqCst);
+    let out = KvMetaBackend::appender_clear(vol1, vol0, 0).await;
+    recovery::TEST_CLAIM_CLOCK_SKEW_SECS.store(0, Ordering::SeqCst);
+    match out {
+        Ok(recovery::AppenderClearOutcome::NothingToClear) => {}
+        other => panic!("{other:?}"),
+    }
+    reset_process_state();
+}
+
 /// C14 (§5.8.5) meets its remedy: one slot attested `Live` on TWO dead
 /// pages at tree 0's `g` — the non-PR §5.8.2 class (iii) shape a zombie's
 /// page write can leave — is the slot custody conflict the census
@@ -1393,9 +1524,19 @@ async fn a_c14_conflict_is_reported_refused_and_cleared_by_the_attestation() {
             c14[0].evidence
         );
     }
-    // The remedy: attest the forging page dead.
+    // The remedy: attest the forging page dead. The KILLED writer's claim
+    // is heartbeat-fresh for the TTL and the verb refuses it (the `claim
+    // clear` law — review round 1, Issue 6); the operator's wait is the
+    // seam that ages it.
     let path = std::path::Path::new(&uris[0]);
     match KvMetaBackend::appender_clear(path, path, 2).await {
+        Err(KvError::Busy(m)) => assert!(m.contains("writer claim"), "{m}"),
+        other => panic!("cleared under a fresh writer claim: {other:?}"),
+    }
+    recovery::TEST_CLAIM_CLOCK_SKEW_SECS.store(3_600, Ordering::SeqCst);
+    let cleared = KvMetaBackend::appender_clear(path, path, 2).await;
+    recovery::TEST_CLAIM_CLOCK_SKEW_SECS.store(0, Ordering::SeqCst);
+    match cleared {
         Ok(recovery::AppenderClearOutcome::Cleared { .. }) => {}
         other => panic!("{other:?}"),
     }
@@ -1483,6 +1624,140 @@ async fn a_c14_conflict_is_reported_refused_and_cleared_by_the_attestation() {
     assert_eq!(report.counters.slot_custody_conflicts, 0);
     assert_eq!(report.counters.unrecovered_appenders, 0);
     assert!(!report.has_findings(), "{:?}", report.findings);
+    reset_process_state();
+}
+
+// ---------------------------------------------------------------------------
+// The routed Issue 1 (PR 2's base tree): the own page one root ahead
+// ---------------------------------------------------------------------------
+
+/// A kill on an UNARMED stamped writer between a checkpoint's page write
+/// and the next cycle's tree-0 publication: the flush pass split a guest
+/// slot's root leaf (a create storm), so region 0's page names the NEW
+/// root while tree 0 still names the pre-split one — the shape every
+/// post-PR-14 default mount has under write load. The remount opens the
+/// guest at the newest durable root (the page's) through the WRITER-legal
+/// install and serves every acked name; before the fix `adopt_root`
+/// refused the remount ("this mount has not armed reader revalidation" —
+/// `corpse_sweep_tests` stamped 1-in-4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kill_between_a_page_write_and_the_next_publication_remounts_an_unarmed_forest() {
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    let _cleanup = Cleanup;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    // The cadence parked: the TWO cycles below are the test's, so the
+    // second flush pass's root move lands on the page and nowhere else.
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let routed = open_under(&uris, &Knobs::unarmed()).await;
+    // A GUEST slot's directory (the native slot's root rides the ledger,
+    // never tree 0 or the page — KD-SYM-3).
+    let slot = hosted_slot_on(&routed, 0, 7);
+    let d = seed_dir_in_slot(&routed, 0, slot, "storm").await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(slot_of_global(&routed, d), slot);
+    // The write load: rounds of creates (dentries into the directory's
+    // slot tree, inode records across the rotor's slot trees) each
+    // followed by ONE cycle. Threshold maintenance appends a leaf's
+    // delta into its log during the commits; the flush pass COMPACTS a
+    // leaf whose frozen delta no longer fits its log (`Log area full` in
+    // `checkpoint_flush_node`) — a root leaf's compaction MOVES the root
+    // after tree 0's publication step and before the page write, so the
+    // page names a root tree 0 does not. Per round the shape lands on
+    // any of ~64 dirtied root leaves; the bound is loud.
+    let page_roots_ahead = |vol: Arc<KvMetaBackend>, uri: String| async move {
+        use squeezefs::meta_backend::kv::appender::{forest_slot_of_page_slot, read_directory};
+        let native = vol.appenders_public().unwrap().native_slot;
+        let dir = read_directory(std::path::Path::new(&uri), vol.superblock())
+            .await
+            .unwrap();
+        let page = dir
+            .iter()
+            .find(|e| e.appender_id == 0)
+            .and_then(|e| e.page.as_ref())
+            .expect("page 0");
+        let mut ahead = Vec::new();
+        for s in &page.slots {
+            let fs = forest_slot_of_page_slot(s.slot, native);
+            let recorded = match tree0_state(&vol, fs).await {
+                Some(SlotState::Unleased { root, .. }) => root,
+                Some(SlotState::Leased { root, .. }) => root,
+                None => continue,
+            };
+            if s.root.seq > recorded.seq {
+                ahead.push((fs, s.root, recorded));
+            }
+        }
+        ahead
+    };
+    let mut files = Vec::new();
+    let mut ahead = Vec::new();
+    for round in 0..64 {
+        for i in 0..300 {
+            let name = format!("s{round:02}_{i:04}");
+            let ino = routed
+                .create(d, &name, libc::S_IFREG | 0o644, 1000, 1000)
+                .await
+                .unwrap()
+                .ino;
+            files.push((name, ino));
+        }
+        vol.checkpoint_now().await.unwrap();
+        ahead = page_roots_ahead(Arc::clone(&vol), uris[0].clone()).await;
+        if !ahead.is_empty() {
+            break;
+        }
+    }
+    assert!(
+        !ahead.is_empty(),
+        "the fixture's premise: some page-0 root ahead of tree 0's within the bound"
+    );
+    // The kill: no shutdown, no leave.
+    drop(vol);
+    drop(routed);
+    park_gate::test_reset();
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    let again = open_under_retry(&uris, &Knobs::unarmed())
+        .await
+        .expect("the remount opens the guest at the page's root");
+    for (name, ino) in &files {
+        assert_eq!(again.lookup(d, name).await.unwrap().ino, *ino);
+    }
+    assert_eq!(
+        again.readdir(d, 0, 1 << 20).await.unwrap().len(),
+        files.len()
+    );
+    // The guest opened AHEAD of tree 0 reads as UNPUBLISHED: the remount's
+    // first checkpoint publishes the page's root into tree 0 (the first
+    // build seeded the forest's `published` map with the OPENED root, so
+    // tree 0 kept the stale one for ever and the clean leave dropped the
+    // records the moved root alone held — 25 dentries of this storm).
+    let live = again.volumes[0].slot_tree(ahead[0].0).map(|t| t.root());
+    shutdown(&again).await;
+    drop(again);
+    {
+        let probe = squeezefs::meta_backend::open_probe_routed_meta_set(&uris)
+            .await
+            .unwrap();
+        match tree0_state(&probe.volumes[0], ahead[0].0).await {
+            Some(SlotState::Unleased { root, .. }) => assert_eq!(Some(root), live),
+            other => panic!("{other:?}"),
+        }
+        for (name, ino) in &files {
+            assert_eq!(probe.lookup(d, name).await.unwrap().ino, *ino);
+        }
+        for v in &probe.volumes {
+            v.shutdown().await.unwrap();
+        }
+    }
+    fsck_clean(&uris).await;
     reset_process_state();
 }
 
@@ -1790,4 +2065,703 @@ async fn fsck_probe_with(
 
 async fn fsck_probe(uris: &[String]) -> squeezefs::fsck::FsckReport {
     fsck_probe_with(uris, None).await
+}
+
+// ---------------------------------------------------------------------------
+// The two-backend fixture (review round 2 — the reviewer's structural
+// finding): the RECOVERER is a different `KvMetaBackend` than the dead
+// lessee, with its own RAM tree and cache, STALE against the device.
+// ---------------------------------------------------------------------------
+
+/// What the fixture stands up.
+struct TwoBackends {
+    uris: Vec<String>,
+    /// The recoverer (the manager, opened AFTER the lessee's first
+    /// checkpoint image; its tree of `slot` is at the OLDER root).
+    routed: Arc<RoutedMetaBackend>,
+    vol: Arc<KvMetaBackend>,
+    slot: ForestSlot,
+    dir: u64,
+    /// The dead lessee's identity (the ledger's key).
+    x: AppenderIdentity,
+    /// Every file the lessee acked: the ones in its first image, the ones
+    /// its LATER checkpoint moved the root for, and the window past its
+    /// last page write.
+    files: Vec<(String, u64)>,
+    /// The root the recoverer opened the slot at / the root the device
+    /// names after the lessee's later checkpoint.
+    stale_root: squeezefs::meta_backend::kv::tree::RootPtr,
+    newer_root: squeezefs::meta_backend::kv::tree::RootPtr,
+    /// The lease generation tree 0 records for the dead lessee (the
+    /// seeding manager held `g = 1` and released; region 1 took `g = 2`).
+    g: u32,
+}
+
+/// Stand the shape up (the cadence parked throughout — every cycle is
+/// the fixture's):
+///
+/// 1. seed a directory in `slot`, released to tree 0;
+/// 2. backend A (the manager) with region 1 declared on `slot` — the
+///    lessee, PR 6's wire holder in this process: creates under the
+///    directory ship to it and commit into ITS ring; A checkpoints (page 1
+///    names root R1); its region image is CAPTURED (image 1);
+/// 3. A keeps writing until the flush pass MOVES the root (a compaction of
+///    the root leaf — bounded rounds), checkpoints (page 1 names R2 > R1),
+///    then writes a few more files that stay in the WINDOW past page 1's
+///    tail; A is KILLED (no leave); image 2 captured;
+/// 4. image 1 is re-applied under the foreign identity X, so the device
+///    reads as "lessee X, checkpointed at R1";
+/// 5. backend B — the recoverer — opens on the volume: its tree of `slot`
+///    is at R1 (tree 0's `Leased { 1 }`, the page's root);
+/// 6. image 2 is applied under X while B is open: the lessee's later
+///    checkpoint and window landed under B; B's RAM tree is STALE.
+///
+/// The death record is the caller's — every pin below stands its own.
+async fn two_backends(dir: &std::path::Path) -> TwoBackends {
+    // A previous contract's panic may have left a seam armed.
+    recovery::TEST_RECOVERY_FAIL_AT_STEP.store(0, Ordering::SeqCst);
+    recovery::TEST_RECOVERY_HOLD_BEFORE_TREE0.store(false, Ordering::SeqCst);
+    recovery::TEST_RECOVERY_HOLD_BEFORE_REREAD.store(false, Ordering::SeqCst);
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let slot = SLOT_A;
+    let (uris, d) = seeded_volume(dir, slot).await;
+    let x = foreign(31);
+    // ---- A: the lessee.
+    let routed = open_under_retry(&uris, &Knobs::armed().partition("1:4"))
+        .await
+        .expect("A opens with the partition");
+    let venue = HoldersVenue::stand_up(&routed, &[1]).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    async fn storm(
+        routed: &RoutedMetaBackend,
+        d: u64,
+        count: usize,
+        files: &mut Vec<(String, u64)>,
+        n: &mut usize,
+    ) {
+        for _ in 0..count {
+            let name = format!("w{:05}", *n);
+            *n += 1;
+            let ino = routed
+                .create(d, &name, libc::S_IFREG | 0o644, 1000, 1000)
+                .await
+                .expect("create under the lessee's directory")
+                .ino;
+            files.push((name, ino));
+        }
+    }
+    let mut files = Vec::new();
+    let mut n = 0usize;
+    storm(&routed, d, 60, &mut files, &mut n).await;
+    vol.checkpoint_now().await.unwrap();
+    let native = vol.appenders_public().unwrap().native_slot;
+    let page_root = move |img: &RegionImage| {
+        img.page
+            .slots
+            .iter()
+            .find(|s| {
+                squeezefs::meta_backend::kv::appender::forest_slot_of_page_slot(s.slot, native)
+                    == slot
+            })
+            .map(|s| s.root)
+            .expect("page 1 names the slot's root")
+    };
+    let image1 = capture_region_image(&uris[0], &vol, 1).await;
+    let stale_root = page_root(&image1);
+    // ---- A's later work: until the flush pass moves the root.
+    let mut newer_root = stale_root;
+    for _round in 0..40 {
+        storm(&routed, d, 120, &mut files, &mut n).await;
+        vol.checkpoint_now().await.unwrap();
+        let img = capture_region_image(&uris[0], &vol, 1).await;
+        newer_root = page_root(&img);
+        if newer_root.seq > stale_root.seq {
+            break;
+        }
+    }
+    assert!(
+        newer_root.seq > stale_root.seq,
+        "the fixture's premise: the lessee's checkpoints moved the slot's root"
+    );
+    // The window past the last page write.
+    storm(&routed, d, 15, &mut files, &mut n).await;
+    // ---- The kill.
+    venue.tear_down();
+    drop(vol);
+    drop(routed);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    let image2 = {
+        let probe = squeezefs::meta_backend::open_probe_routed_meta_set(&uris)
+            .await
+            .expect("probe");
+        let img = capture_region_image(&uris[0], &probe.volumes[0], 1).await;
+        for v in &probe.volumes {
+            v.shutdown().await.unwrap();
+        }
+        img
+    };
+    assert_eq!(page_root(&image2), newer_root);
+    // ---- The device at the lessee's FIRST checkpoint, under X.
+    apply_region_image(&uris[0], 1, &image1, x).await;
+    // ---- B: the recoverer, its tree of the slot at R1.
+    let routed = open_under_retry(&uris, &Knobs::armed())
+        .await
+        .expect("B opens over the foreign lessee's page");
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(
+        vol.slot_tree(slot).map(|t| t.root()),
+        Some(stale_root),
+        "B holds the slot at the root the page named when it opened"
+    );
+    let g = match tree0_state(&vol, slot).await {
+        Some(SlotState::Leased {
+            appender_id: 1, g, ..
+        }) => g,
+        other => panic!("tree 0 leases the slot to the lessee: {other:?}"),
+    };
+    // ---- The lessee's later checkpoint and window land under B.
+    apply_region_image(&uris[0], 1, &image2, x).await;
+    TwoBackends {
+        uris,
+        routed,
+        vol,
+        slot,
+        dir: d,
+        x,
+        files,
+        stale_root,
+        newer_root,
+        g,
+    }
+}
+
+fn two_backends_teardown() {
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    recovery::TEST_RECOVERY_FAIL_AT_STEP.store(0, Ordering::SeqCst);
+    recovery::TEST_RECOVERY_HOLD_BEFORE_TREE0.store(false, Ordering::SeqCst);
+    recovery::TEST_RECOVERY_HOLD_BEFORE_REREAD.store(false, Ordering::SeqCst);
+    recovery::TEST_RECOVERY_HOLD_RELEASE.notify_waiters();
+    reset_process_state();
+}
+
+/// **Issue 2 — the recoverer's stale RAM tree.** Another backend leased
+/// the slot, checkpointed twice (the root moved) and died with acked
+/// records in its window; the recovering MANAGER holds the slot's tree at
+/// the root it opened with. The poll's recovery installs the page's newer
+/// root writer-legal AFTER dropping every cached node of the slot (the
+/// cache barrier), replays the window onto it, and every acked file —
+/// image 1's, the moved root's, the window's — resolves through the
+/// recoverer; tree 0 `Unleased` at the lease's `g`; fsck clean. Before the
+/// fix `adopt_root` refused the install on the writer's cache and every
+/// poll-path recovery in this shape failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recoverer_whose_ram_tree_is_stale_installs_the_dead_lessees_newer_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let fx = two_backends(dir.path()).await;
+    let recs0 = recoveries();
+    fx.vol.record_death_with_key(fx.x, 1, 0).await.unwrap();
+    let rep = recover_dead_appenders_set(&fx.routed).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    assert_eq!(rep.per_volume[0].1.deferred, 0, "{rep:?}");
+    assert_eq!(recoveries(), recs0 + 1);
+    let live = fx.vol.slot_tree(fx.slot).map(|t| t.root()).unwrap();
+    assert!(
+        live.seq >= fx.newer_root.seq,
+        "the recoverer's tree moved to (or past) the lessee's newer root: {live:?} vs {:?} \
+         (stale {:?})",
+        fx.newer_root,
+        fx.stale_root
+    );
+    assert_all_resolve(&fx.routed, fx.dir, &fx.files).await;
+    match tree0_state(&fx.vol, fx.slot).await {
+        Some(SlotState::Unleased { g, .. }) => assert_eq!(g, fx.g, "g never moves at a release"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        page_state(&fx.uris[0], &fx.vol, 1).await,
+        Some(AppenderState::Recovered)
+    );
+    shutdown(&fx.routed).await;
+    let TwoBackends {
+        uris, routed, vol, ..
+    } = fx;
+    drop(vol);
+    drop(routed);
+    fsck_clean(&uris).await;
+    two_backends_teardown();
+}
+
+/// **Issue 3 — the handover order under every failure.** The recovery
+/// FAILS once at each step boundary in turn (the ring read, the RAM table
+/// gone `Releasing` + roots installed, the replay, the flush, the tails,
+/// tree 0 written + the table released, the page `Recovered`); after
+/// every failure the page stays `Recovering`, tree 0 still leases the
+/// slot to the dead appender until the step that writes it, and the RAM
+/// table has REFUSED nothing durable — the re-run resumes from the durable
+/// state. The clean run then completes with every acked record; `g` never
+/// regressed. Before the fix a `Try` refusal at step 7 left tree 0
+/// `Leased { dead }` for ever under a `Recovered` page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovery_that_fails_at_any_step_resumes_from_the_durable_state_without_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let fx = two_backends(dir.path()).await;
+    fx.vol.record_death_with_key(fx.x, 1, 0).await.unwrap();
+    for step in [3u32, 4, 5, 6, 7, 8, 9] {
+        recovery::TEST_RECOVERY_FAIL_AT_STEP.store(step, Ordering::SeqCst);
+        let rep = recover_dead_appenders_set(&fx.routed).await.unwrap();
+        assert_eq!(
+            recovery::TEST_RECOVERY_FAIL_AT_STEP.load(Ordering::SeqCst),
+            0,
+            "step {step} was reached"
+        );
+        assert_eq!(rep.recovered(), 0, "step {step}: {rep:?}");
+        assert_eq!(rep.per_volume[0].1.deferred, 1, "step {step}: {rep:?}");
+        // The page stays `Recovering` until the step that writes it (9 =
+        // after the page went `Recovered`, before the `recovered:` record).
+        assert_eq!(
+            page_state(&fx.uris[0], &fx.vol, 1).await,
+            Some(if step < 9 {
+                AppenderState::Recovering
+            } else {
+                AppenderState::Recovered
+            }),
+            "step {step}"
+        );
+        assert!(
+            fx.vol.recovered_record(&fx.x, 0).await.unwrap().is_none(),
+            "step {step}: the recovered record is the last write"
+        );
+        match tree0_state(&fx.vol, fx.slot).await {
+            Some(SlotState::Leased {
+                appender_id: 1, g, ..
+            }) if step < 8 => {
+                assert_eq!(g, fx.g, "step {step}");
+                // The RAM table agrees with tree 0 (the rollback): the dead
+                // appender still the holder, no first-touch acquire admitted.
+                let plane = fx.vol.slot_leases().unwrap();
+                assert_eq!(
+                    plane.table.resolve(fx.slot),
+                    squeezefs::slot_lease_core::Resolved::Holder { holder: 1, g: fx.g },
+                    "step {step}"
+                );
+            }
+            Some(SlotState::Unleased { g, .. }) if step >= 8 => {
+                assert_eq!(g, fx.g, "step {step}")
+            }
+            other => panic!("step {step}: {other:?}"),
+        }
+        assert!(
+            fx.vol.dead_member_record(&fx.x).await.unwrap().is_some(),
+            "step {step}: the record stands"
+        );
+    }
+    // The clean run: the page is `Recovered` already, so the pass COMPLETES
+    // the missing `recovered:` record (the poll's arm for the recoverer
+    // that died between its two last writes) — PR 8's re-grant gate opens.
+    let rep = recover_dead_appenders_set(&fx.routed).await.unwrap();
+    assert_eq!(rep.per_volume[0].1.completed, 1, "{rep:?}");
+    assert!(fx.vol.recovered_record(&fx.x, 0).await.unwrap().is_some());
+    assert_all_resolve(&fx.routed, fx.dir, &fx.files).await;
+    match tree0_state(&fx.vol, fx.slot).await {
+        Some(SlotState::Unleased { g, .. }) => assert_eq!(g, fx.g, "g never regressed"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        page_state(&fx.uris[0], &fx.vol, 1).await,
+        Some(AppenderState::Recovered)
+    );
+    shutdown(&fx.routed).await;
+    let TwoBackends {
+        uris, routed, vol, ..
+    } = fx;
+    drop(vol);
+    drop(routed);
+    fsck_clean(&uris).await;
+    two_backends_teardown();
+}
+
+/// **Issue 3 — the door during a recovery.** While the recovery is parked
+/// right before its tree-0 write (the slot `Releasing { dead }` in the RAM
+/// table, every durable step but tree 0 done), a create in the dead
+/// directory — a FIRST-TOUCH acquire of the recovering slot at the commit
+/// door — is REFUSED (the mid-handover verdict), tree 0 still `Leased {
+/// dead, g }`; once the recovery completes the same create lands as the
+/// manager's first-touch acquire at exactly `g + 1`. Before the fix the
+/// table was released at step 4 and the acquire in this window wrote
+/// `Leased { 0, g + 1 }` that step 7 then regressed to `Unleased { g }`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_touch_acquire_during_a_recovery_is_refused_and_never_regresses_tree_0() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let fx = two_backends(dir.path()).await;
+    fx.vol.record_death_with_key(fx.x, 1, 0).await.unwrap();
+    recovery::TEST_RECOVERY_HOLD_BEFORE_TREE0.store(true, Ordering::SeqCst);
+    let routed = Arc::clone(&fx.routed);
+    let poll = tokio::spawn(async move { recover_dead_appenders_set(&routed).await });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !recovery::TEST_RECOVERY_HELD.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the recovery never parked"
+        );
+        tokio::task::yield_now().await;
+    }
+    // The concurrent create: refused, and tree 0 untouched.
+    let late = fx
+        .routed
+        .create(fx.dir, "late", libc::S_IFREG | 0o644, 1000, 1000)
+        .await;
+    assert!(
+        late.is_err(),
+        "a first-touch acquire mid-recovery was admitted"
+    );
+    match tree0_state(&fx.vol, fx.slot).await {
+        Some(SlotState::Leased {
+            appender_id: 1, g, ..
+        }) => assert_eq!(g, fx.g),
+        other => panic!("tree 0 moved under the recovery: {other:?}"),
+    }
+    recovery::TEST_RECOVERY_HOLD_BEFORE_TREE0.store(false, Ordering::SeqCst);
+    recovery::TEST_RECOVERY_HOLD_RELEASE.notify_waiters();
+    let rep = poll.await.unwrap().unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    // The same create lands now — the manager's first-touch acquire at
+    // exactly g + 1.
+    let late = fx
+        .routed
+        .create(fx.dir, "late", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("the create lands after the recovery");
+    assert_eq!(
+        fx.routed.lookup(fx.dir, "late").await.unwrap().ino,
+        late.ino
+    );
+    match tree0_state(&fx.vol, fx.slot).await {
+        Some(SlotState::Leased {
+            appender_id: 0, g, ..
+        }) => assert_eq!(g, fx.g + 1),
+        other => panic!("{other:?}"),
+    }
+    assert_all_resolve(&fx.routed, fx.dir, &fx.files).await;
+    shutdown(&fx.routed).await;
+    let TwoBackends {
+        uris, routed, vol, ..
+    } = fx;
+    drop(vol);
+    drop(routed);
+    fsck_clean(&uris).await;
+    two_backends_teardown();
+}
+
+/// **Issue 8 — the decision under the mutex.** The poll snapshots the
+/// dead page, then — before it takes the handover mutex — the page MOVES
+/// (another actor's act: here the operator's `Recovered` write, the shape
+/// the mount-path gate or an online fsck repair leaves). The recovery
+/// re-reads the page under the mutex, finds it no longer `Live` /
+/// `Recovering` and SKIPS (`skipped`, nothing written, the tree untouched);
+/// the same skip covers a page whose identity or term moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_that_moves_under_the_polls_snapshot_is_skipped_not_recovered() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let fx = two_backends(dir.path()).await;
+    fx.vol.record_death_with_key(fx.x, 1, 0).await.unwrap();
+    recovery::TEST_RECOVERY_HOLD_BEFORE_REREAD.store(true, Ordering::SeqCst);
+    let routed = Arc::clone(&fx.routed);
+    let poll = tokio::spawn(async move { recover_dead_appenders_set(&routed).await });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !recovery::TEST_RECOVERY_HELD.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the poll never parked"
+        );
+        tokio::task::yield_now().await;
+    }
+    // (a) the page's TERM moves (a rejoin of the same identity elsewhere).
+    rewrite_page(&fx.uris[0], 1, |p| p.term += 1).await;
+    recovery::TEST_RECOVERY_HOLD_BEFORE_REREAD.store(false, Ordering::SeqCst);
+    recovery::TEST_RECOVERY_HOLD_RELEASE.notify_waiters();
+    let recs0 = recoveries();
+    let rep = poll.await.unwrap().unwrap();
+    assert_eq!(rep.recovered(), 0, "{rep:?}");
+    assert_eq!(rep.per_volume[0].1.skipped, 1, "{rep:?}");
+    assert_eq!(recoveries(), recs0);
+    assert_eq!(
+        page_state(&fx.uris[0], &fx.vol, 1).await,
+        Some(AppenderState::Live),
+        "nothing written to the page"
+    );
+    assert_eq!(
+        fx.vol.slot_tree(fx.slot).map(|t| t.root()),
+        Some(fx.stale_root)
+    );
+    // (b) the page's STATE moves (another actor recovered it).
+    recovery::TEST_RECOVERY_HOLD_BEFORE_REREAD.store(true, Ordering::SeqCst);
+    let routed = Arc::clone(&fx.routed);
+    let poll = tokio::spawn(async move { recover_dead_appenders_set(&routed).await });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !recovery::TEST_RECOVERY_HELD.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the poll never parked"
+        );
+        tokio::task::yield_now().await;
+    }
+    rewrite_page(&fx.uris[0], 1, |p| p.state = AppenderState::Recovered).await;
+    recovery::TEST_RECOVERY_HOLD_BEFORE_REREAD.store(false, Ordering::SeqCst);
+    recovery::TEST_RECOVERY_HOLD_RELEASE.notify_waiters();
+    let rep = poll.await.unwrap().unwrap();
+    assert_eq!(rep.recovered(), 0, "{rep:?}");
+    assert_eq!(rep.per_volume[0].1.skipped, 1, "{rep:?}");
+    // The snapshot's own state is restored for the teardown's fsck (the
+    // page back to Live, the term as the lessee left it) and the region
+    // recovered for real.
+    rewrite_page(&fx.uris[0], 1, |p| {
+        p.state = AppenderState::Live;
+        p.term -= 1;
+    })
+    .await;
+    let rep = recover_dead_appenders_set(&fx.routed).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    assert_all_resolve(&fx.routed, fx.dir, &fx.files).await;
+    shutdown(&fx.routed).await;
+    let TwoBackends {
+        uris, routed, vol, ..
+    } = fx;
+    drop(vol);
+    drop(routed);
+    fsck_clean(&uris).await;
+    two_backends_teardown();
+}
+
+/// **Issue 9 — the incarnation.** A member the ledger names dead REJOINS:
+/// (a) the installed owner lists its id LIVE again — the poll RETIRES the
+/// record (`dead_member_records_retired`) and recovers nothing, the page
+/// untouched; (b) a writer arming on the set retires any record naming
+/// ITS OWN identity (`retire_own_death_records`) — idempotent, `false` on
+/// a set that names it nowhere. Before the fix a rejoined `(node, slot)`
+/// was recovered while live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejoined_member_is_never_recovered_and_its_record_is_retired() {
+    use squeezefs::membership::{
+        JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole, MembershipOwner,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let fx = two_backends(dir.path()).await;
+    // The fixture's parked cadence (60 s) would derive a `D_purge` no
+    // lease clock admits; B read it at its open, the owner below must not.
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    fx.vol.record_death_with_key(fx.x, 3, 0).await.unwrap();
+    // (a) X rejoins the owner: live again.
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+    let owner = MembershipOwner::arm(
+        "o",
+        1,
+        0,
+        LeaseClocks::derive(std::time::Duration::ZERO).unwrap(),
+        LeaseClock::manual(Arc::clone(&now)),
+    )
+    .unwrap();
+    squeezefs::membership::install_owner(Arc::clone(&owner));
+    let member = squeezefs::cowriter::node_member_id_of(fx.x.node_token, fx.x.mount_slot);
+    let JoinOutcome::Granted(_) = owner.join(JoinRequest {
+        id: member.clone(),
+        role: MemberRole::Writer,
+        endpoint: None,
+        pid: 1,
+        boot: "b".to_string(),
+        prior_epoch: None,
+        pr_key: 0,
+        mount: None,
+    }) else {
+        panic!("the rejoin is granted")
+    };
+    let retired0 = alloc_lease::DEAD_MEMBER_RECORDS_RETIRED.load(Ordering::Relaxed);
+    let recs0 = recoveries();
+    let rep = recover_dead_appenders_set(&fx.routed).await.unwrap();
+    assert_eq!(rep.recovered(), 0, "{rep:?}");
+    assert_eq!(rep.per_volume[0].1.skipped, 1, "{rep:?}");
+    assert_eq!(recoveries(), recs0);
+    assert!(
+        fx.vol.dead_member_record(&fx.x).await.unwrap().is_none(),
+        "the record is retired"
+    );
+    assert_eq!(
+        alloc_lease::DEAD_MEMBER_RECORDS_RETIRED.load(Ordering::Relaxed),
+        retired0 + 1
+    );
+    assert_eq!(
+        page_state(&fx.uris[0], &fx.vol, 1).await,
+        Some(AppenderState::Live),
+        "the live region is left to its holder"
+    );
+    assert!(matches!(
+        tree0_state(&fx.vol, fx.slot).await,
+        Some(SlotState::Leased { appender_id: 1, .. })
+    ));
+    // The next poll: nothing named, nothing recovered.
+    let rep = recover_dead_appenders_set(&fx.routed).await.unwrap();
+    assert_eq!((rep.recovered(), rep.per_volume[0].1.skipped), (0, 0));
+    squeezefs::membership::uninstall();
+    // (b) the writer's own retirement at its arm: a record naming THIS
+    // mount's identity (a predecessor incarnation's death) is retired.
+    let me = fx.vol.appenders_public().unwrap().identity;
+    fx.vol.record_death_with_key(me, 9, 0).await.unwrap();
+    assert!(recovery::retire_own_death_records(&fx.routed)
+        .await
+        .unwrap());
+    assert!(fx.vol.dead_member_record(&me).await.unwrap().is_none());
+    assert!(!recovery::retire_own_death_records(&fx.routed)
+        .await
+        .unwrap());
+    // Teardown: X really dies now, the region recovered for the fsck.
+    fx.vol.record_death_with_key(fx.x, 4, 0).await.unwrap();
+    let rep = recover_dead_appenders_set(&fx.routed).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    assert_all_resolve(&fx.routed, fx.dir, &fx.files).await;
+    shutdown(&fx.routed).await;
+    let TwoBackends {
+        uris, routed, vol, ..
+    } = fx;
+    drop(vol);
+    drop(routed);
+    fsck_clean(&uris).await;
+    two_backends_teardown();
+}
+
+/// **Issue 5 — the death write retried until durable.** A death the sink
+/// could not write is PARKED (`dead_member_write_deferrals`) and the next
+/// ledger projection lands it (`deaths_landed`), then acts on it in the
+/// same pass; the pending set is empty after. (The admission itself PARKS
+/// on a full ring — the PR-4 door's pre-admission — so this arm is the
+/// device-error class.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deferred_death_record_lands_at_the_next_ledger_poll() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let fx = two_backends(dir.path()).await;
+    let deferrals0 = alloc_lease::DEAD_MEMBER_WRITE_DEFERRALS.load(Ordering::Relaxed);
+    alloc_lease::defer_death_record(alloc_lease::PendingDeath {
+        member: fx.x,
+        epoch: 5,
+        pr_key: 0,
+    });
+    // Idempotent over the same identity.
+    alloc_lease::defer_death_record(alloc_lease::PendingDeath {
+        member: fx.x,
+        epoch: 5,
+        pr_key: 0,
+    });
+    assert_eq!(alloc_lease::pending_deaths().len(), 1);
+    assert_eq!(
+        alloc_lease::DEAD_MEMBER_WRITE_DEFERRALS.load(Ordering::Relaxed),
+        deferrals0 + 2
+    );
+    assert!(fx.vol.dead_member_record(&fx.x).await.unwrap().is_none());
+    let rep = recover_dead_appenders_set(&fx.routed).await.unwrap();
+    assert_eq!(rep.deaths_landed, 1, "{rep:?}");
+    assert_eq!(
+        rep.recovered(),
+        1,
+        "the landed death is acted on in the same pass: {rep:?}"
+    );
+    assert!(alloc_lease::pending_deaths().is_empty());
+    assert_eq!(
+        fx.vol
+            .dead_member_record(&fx.x)
+            .await
+            .unwrap()
+            .unwrap()
+            .epoch,
+        5
+    );
+    assert_all_resolve(&fx.routed, fx.dir, &fx.files).await;
+    shutdown(&fx.routed).await;
+    let TwoBackends {
+        uris, routed, vol, ..
+    } = fx;
+    drop(vol);
+    drop(routed);
+    fsck_clean(&uris).await;
+    two_backends_teardown();
+}
+
+/// **Issue 13 — the unarmed pin the AGENTS paragraph claims.** On a FLAT
+/// volume and on an UNARMED forest the driver is inert: `recovery::arm`
+/// installs nothing and recovers nothing, the projection is empty, the
+/// published bound reads 0 on flat, every Recovery gauge stays where it
+/// was, and fsck's foreign-window scoping has nothing to scope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flat_volume_and_an_unarmed_forest_arm_no_recovery_driver() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let before = recovery_stats();
+    let polls0 = before.ledger_polls;
+    // (a) flat — the seam cleared.
+    {
+        let p = dir.path().join("flat");
+        std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+        let plan = squeezefs::meta_backend::plan_meta_slot_set(1).unwrap();
+        squeezefs::meta_backend::kv::builder::format_v3_stamped(
+            &p,
+            VOL_LEN,
+            &set_opts(),
+            plan.stamps[0].clone(),
+        )
+        .await
+        .unwrap();
+        let uris = vec![p.display().to_string()];
+        let routed = open_under(&uris, &Knobs::unarmed()).await;
+        let vol = Arc::clone(&routed.volumes[0]);
+        assert!(!vol.superblock().symmetric_forest_stamped());
+        let rep = recovery::arm(&routed).await.unwrap();
+        assert_eq!(rep, recovery::RecoverySetReport::default());
+        assert_eq!(vol.appender_recovery_bound_ms(), 0);
+        assert!(vol
+            .foreign_window_inos(routed.routing_width())
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(vol.dead_member_records().await.unwrap().is_empty());
+        shutdown(&routed).await;
+    }
+    // (b) an unarmed forest.
+    {
+        let fdir = dir.path().join("forest");
+        std::fs::create_dir_all(&fdir).unwrap();
+        let uris = format_stamped_set_with_config(&fdir, 1).await;
+        let routed = open_under(&uris, &Knobs::unarmed()).await;
+        let vol = Arc::clone(&routed.volumes[0]);
+        assert!(!vol.slot_lease_armed());
+        let rep = recovery::arm(&routed).await.unwrap();
+        assert_eq!(rep, recovery::RecoverySetReport::default());
+        assert!(vol
+            .foreign_window_inos(routed.routing_width())
+            .await
+            .unwrap()
+            .is_empty());
+        let rep = recover_dead_appenders_set(&routed).await.unwrap();
+        assert_eq!(rep.recovered(), 0);
+        shutdown(&routed).await;
+    }
+    let after = recovery_stats();
+    assert_eq!(after.recoveries, before.recoveries);
+    assert_eq!(after.preempts, before.preempts);
+    assert_eq!(after.regions_released, before.regions_released);
+    assert_eq!(after.intents_rolled_forward, before.intents_rolled_forward);
+    // The unarmed forest's explicit projection counted one poll; the arm
+    // counted none (inert).
+    assert_eq!(after.ledger_polls, polls0 + 1);
+    reset_process_state();
 }

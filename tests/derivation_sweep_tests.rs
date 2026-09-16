@@ -2881,13 +2881,16 @@ fn sym_appender_recovery_bound_derives_from_the_ring_the_node_size_and_the_landi
     ] {
         let entries = ring / 230;
         let leaves = entries.div_ceil(800);
-        let expected = leaves.saturating_mul(120).div_ceil(1_000)
+        // Three leaf passes (review round 2, Issue 10): the flush's cold
+        // loads, the tail scan's extent reads, the orphan census's
+        // interior reads.
+        let expected = leaves.saturating_mul(120 * 3).div_ceil(1_000)
             + entries.saturating_mul(1_000).div_ceil(1_000_000)
             + checkpoint_landing_ceiling_ms(flush);
         assert_eq!(
             appender_recovery_bound_ms(ring, node, flush),
             expected,
-            "ring {ring} flush {flush}: leaf loads + fold + one landing ceiling"
+            "ring {ring} flush {flush}: three leaf passes + fold + one landing ceiling"
         );
     }
     // Monotone in the ring; a smaller node holds fewer files per leaf and
@@ -2901,9 +2904,9 @@ fn sym_appender_recovery_bound_derives_from_the_ring_the_node_size_and_the_landi
             > appender_recovery_bound_ms(32 << 20, node, 50)
     );
     // The shipped shape: a 32 MiB ring at 256 KiB nodes under the 50 ms
-    // cadence — ≈ 146 k entries, 183 leaves, 22 + 146 + 1,100 ms.
+    // cadence — ≈ 146 k entries, 183 leaves × 3 passes, 66 + 146 + 1,100 ms.
     assert_eq!(
         appender_recovery_bound_ms(32 << 20, node, 50),
-        22 + 146 + 1_100
+        66 + 146 + 1_100
     );
 }

@@ -412,6 +412,86 @@ impl HoldersVenue {
     }
 }
 
+/// **The two-backend fixture's device image of one appender region**
+/// (PR 10, review round 2 — the reviewer's structural finding): every
+/// byte range a region owns on its volume (`KvMetaBackend::
+/// region_device_ranges` — its ring segments, its two directory page
+/// slots, its grant's image extents) captured at one instant, plus the
+/// page as decoded then. A LESSEE's later activity — its checkpoints
+/// (page → newer root, flushed leaves in fresh grant extents, a moved
+/// root), its acked window — writes exactly these bytes and nothing the
+/// MANAGER holds cached, so re-applying a later image over an earlier one
+/// while a second `KvMetaBackend` (the recoverer) is open on the volume IS
+/// another daemon's checkpoint landing under it: the recoverer's RAM tree
+/// of the slot is stale at the root it opened with, the device names a
+/// newer one, and the window past the page's tail is in the ring.
+pub struct RegionImage {
+    pub ranges: Vec<(u64, Vec<u8>)>,
+    pub page: squeezefs::meta_backend::kv::appender::AppenderPage,
+}
+
+/// Capture appender `id`'s region image on `uri` (the volume a plain file
+/// — the fixtures' venue; the ranges are read with std file I/O, the
+/// test's own instrument).
+pub async fn capture_region_image(
+    uri: &str,
+    vol: &squeezefs::meta_backend::kv::backend::KvMetaBackend,
+    id: u32,
+) -> RegionImage {
+    use squeezefs::meta_backend::kv::appender::read_directory;
+    use std::io::{Read, Seek, SeekFrom};
+    let path = std::path::Path::new(uri);
+    let page = read_directory(path, vol.superblock())
+        .await
+        .expect("directory")
+        .into_iter()
+        .find(|e| e.appender_id == id)
+        .and_then(|e| e.page)
+        .expect("the region's page");
+    let mut f = std::fs::File::open(path).expect("open the volume file");
+    let mut ranges = Vec::new();
+    for (off, len) in vol.region_device_ranges(id).await.expect("ranges") {
+        let mut buf = vec![0u8; len as usize];
+        f.seek(SeekFrom::Start(off)).unwrap();
+        f.read_exact(&mut buf).unwrap();
+        ranges.push((off, buf));
+    }
+    RegionImage { ranges, page }
+}
+
+/// Apply `image` to `uri`: every captured range written back verbatim,
+/// then the page re-written through [`rewrite_page`] under `identity`
+/// (the foreign node the fixture names) at a generation above the one on
+/// the device — the newest valid image over the four page slots.
+pub async fn apply_region_image(
+    uri: &str,
+    id: u32,
+    image: &RegionImage,
+    identity: squeezefs::meta_backend::kv::appender::AppenderIdentity,
+) {
+    use std::io::{Seek, SeekFrom, Write};
+    let path = std::path::Path::new(uri);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open the volume file for writing");
+        for (off, bytes) in &image.ranges {
+            f.seek(SeekFrom::Start(*off)).unwrap();
+            f.write_all(bytes).unwrap();
+        }
+        f.sync_data().unwrap();
+    }
+    let snapshot = image.page.clone();
+    rewrite_page(uri, id, move |p| {
+        let cur = p.generation;
+        *p = snapshot.clone();
+        p.identity = identity;
+        p.generation = cur.max(snapshot.generation);
+    })
+    .await;
+}
+
 /// The offline fsck of `uris` must report nothing.
 pub async fn fsck_clean(uris: &[String]) {
     let mut opts = squeezefs::fsck::FsckOptions::offline();

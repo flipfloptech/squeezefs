@@ -374,3 +374,29 @@ laptop alone)**:
 
 Not run (by rule): `task check`, squeeze-test, anything on `dev` / `main`;
 `.benchmarks/2026-09-12-sym-pr-run.md` untouched.
+
+## 11. Review round 4 (2026-09-16) — Issues 29 and 30
+
+Round 3's verdict attributed the one hang to **PR 7b (Issue 28 — `flip_dir_inner`
+takes DLM guards in separate acquisitions on the same striped tables; deterministic
+under `SQUEEZEFS_DLM_STRIPES=1`)**; it is fixed on dev by 7b's owner and nothing of
+`dir_stripe.rs` is touched here. PR 10's two items:
+
+| # | Class | Fix | Pin |
+|---|---|---|---|
+| 29 | bug | the rollback restores the slot's RAM TREE too: a failed recovery left the installed page root — published nowhere, unpublishable while tree 0 leases the slot to the dead appender — with its `root_floor` at the run's ring-0 head, so `unpublished_root_floors` clamped ring 0's checkpoint tail until a re-run SUCCEEDED; a recovery that never re-ran successfully (the record retired by the member's rejoin, a permanent failure) pinned the tail for ever — the ring fills, every commit parks (the wedge class). Now `RecoveryRollback` DISCARDS every cached node of the slot, dirty ones included (`NodeCache::discard_slot_nodes` — the failed replay's RAM fold of a window the dead ring still holds; nothing of this mount's own, nothing to flush, and a flush would have met the restored `foreign` bit at the structural gate), then puts the tree back at its pre-install `(root, floor)` (`KvTree::restore_root` — the pointer alone, no read, no pin: the grant-time root the mount held without traversing) or removes a guest the run adopted fresh (`SlotTrees::remove_guest`); the RAII is declared UNDER the SMO mutex so its drop runs under it (no flush pass mid-walk). The re-run installs from the durable state exactly as a first run does | `a_failed_recovery_with_no_re_run_leaves_no_floor_on_ring_0` (two-backend fixture): fail at step 5 and at step 7 (the flush done, the root moved) — after each `unpublished_root_floors()` is EMPTY (RED before: `{4: 155791}`), the tree reads its grant-time root, the page stays `Recovering`; `retire_death_record` (the rejoin), the poll recovers nothing; 40 creates in the manager's own slots then TWO cycles — ring 0's `reusable_upto` ≥ the storm's head, `journal_full_stalls` flat; a new record then recovers every acked file from the durable state; fsck clean |
+| 30 | nit | `open_guest_trees` opens a root ahead of tree 0 through `KvTree::open_unpublished_slot_tree` (the ONE law's last inline copy gone); `tests/run_sym_forest_suites.sh` runs every suite under `timeout` with a DERIVED bound — `max(SQZ_SYM_HANG_FLOOR_S = 600 s, SQZ_SYM_HANG_FACTOR = 4 × the suite's flat wall)` (the flat leg, or a single leg, has no measured wall and takes the floor) — kills the whole process tree on expiry (GNU `timeout` signals its process group; verified: no orphaned test binary) and prints `=== HUNG: <leg> <suite> killed by the per-suite watchdog after N s (the last test line: …) ===`, failing the leg; proven to fire (`SQZ_SYM_HANG_FLOOR_S=3` on `sym_appender_tests` → HUNG at 3.0 s, exit 1) and inert on green suites (the matrix run below, 0 HUNG rows) | — |
+
+The crash matrix is **30 contracts** (+1 ignored instrument).
+
+**Round 4 verification (`CARGO_INCREMENTAL=0`, the dev laptop alone)**: fmt /
+both clippy configs / rustdoc `-D warnings` — clean; `sym_crash_matrix_tests`
+stamped ×3 + flat ×1 (30 contracts) — 4 / 4 green (23.4–23.9 s);
+`sym_appender_tests` 34 / `docs_parity_tests` 5 / `derivation_sweep_tests` 59,
+flat AND stamped — 6 / 6 legs green; `bash -n tests/run_sym_forest_suites.sh`
+clean; the 35-suite matrix flat → stamped with the watchdog ARMED — **PASS**
+in 20.8 min with **0 `HUNG` rows** and no ratio NOTE (inert on green suites);
+the watchdog proven to FIRE beside it (`SQZ_SYM_HANG_FLOOR_S=3` on
+`sym_appender_tests` → `HUNG … after 3 s`, the leg failed, no orphaned test
+binary). Not run (by rule): `task check`, squeeze-test, anything on `dev` /
+`main`; `.benchmarks/2026-09-12-sym-pr-run.md` untouched.

@@ -3,10 +3,10 @@
 //! §5.9; KD-SYM-3/4/6/15).
 //!
 //! The ledger's WRITER is the home shard's eviction
-//! ([`install_death_ledger_writer`]: a [`crate::membership::DeathSink`]
+//! ([`install_death_ledger_writer`](crate::meta_backend::kv::backend::recovery::install_death_ledger_writer): a [`crate::membership::DeathSink`]
 //! that ships `RecordDeath` to volume 0's manager — in-process the direct
 //! call, `KvMetaBackend::record_death_with_key`). Every manager READS
-//! tree 0 of volume 0 as a projection ([`spawn_ledger_poll`], and once at
+//! tree 0 of volume 0 as a projection ([`spawn_ledger_poll`](crate::meta_backend::kv::backend::recovery::spawn_ledger_poll), and once at
 //! the mount path BEFORE the set serves — the C15 arm) and, per `Live` /
 //! `Recovering` page on its own volume whose identity the ledger names
 //! dead, runs [`KvMetaBackend::recover_dead_appenders`] in §5.9's order:

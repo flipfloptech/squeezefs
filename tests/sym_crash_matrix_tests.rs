@@ -276,9 +276,8 @@ async fn a_dead_appenders_ring_is_recovered_by_the_ledger_poll_with_no_acked_los
     );
     assert_eq!(vol.appender_stats().unwrap().manager_verb_refusals, 0);
     let ph = recovery_stats().phase_ns;
-    assert_eq!(
+    assert!(
         ph[0] + ph[1] + ph[2] + ph[3] + ph[4] + ph[5] <= ph[6] + 6,
-        true,
         "phases exact-sum within the total: {ph:?}"
     );
     assert!(ph[6] > 0);

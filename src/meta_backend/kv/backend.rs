@@ -2371,7 +2371,8 @@ impl KvMetaBackend {
         } else {
             posture
         };
-        let (trees, max_replayed_ino, max_replayed_guest) = if sb.symmetric_forest_stamped() {
+        let forest_stamped = sb.symmetric_forest_stamped();
+        let (trees, max_replayed_ino, max_replayed_guest, recovering) = if forest_stamped {
             Self::open_forest_and_replay(
                 path,
                 &sb,
@@ -2707,7 +2708,12 @@ impl KvMetaBackend {
                     cell
                 },
             };
-            (trees, max_replayed_ino, max_replayed_guest)
+            (
+                trees,
+                max_replayed_ino,
+                max_replayed_guest,
+                super::appender::RecoveringStructure::default(),
+            )
         };
 
         // 5b. The appender regions of a forest volume (design-symmetric-
@@ -2729,6 +2735,7 @@ impl KvMetaBackend {
                     &recovery,
                     replay_posture,
                     &boot_id,
+                    recovering,
                 )
                 .await?,
             )),
@@ -3161,6 +3168,17 @@ impl KvMetaBackend {
         // legitimate.
         let (g_current, appender_current) = match plane.table.resolve(slot) {
             crate::slot_lease_core::Resolved::Unleased { g } => (g, None),
+            // A lessee MID-RECOVERY (its page `Recovering` — PR 10, review
+            // round 4, Issue 31): the recovery's flush stamps the slot's
+            // frames `(0, g)` and the dead lessee's own stand at `g` too —
+            // both legitimate, so rule 4 is inert for the slot (the
+            // detector's law for the ring-0 interior records, on the
+            // frames).
+            crate::slot_lease_core::Resolved::Holder { g, holder }
+                if plane.recovering_lessees.contains_sync(&holder) =>
+            {
+                (g, None)
+            }
             crate::slot_lease_core::Resolved::Holder { g, holder } => (g, Some(holder)),
         };
         let tails = match plane.frame_tails.read_sync(&slot, |_, v| Arc::clone(v)) {
@@ -15603,7 +15621,15 @@ impl KvMetaBackend {
         alloc: &Arc<ExtentAllocator>,
         recovery: &super::journal::JournalRecovery,
         posture: OpenPosture,
-    ) -> std::result::Result<(TreeSet, u64, std::collections::HashMap<u16, u64>), KvError> {
+    ) -> std::result::Result<
+        (
+            TreeSet,
+            u64,
+            std::collections::HashMap<u16, u64>,
+            super::appender::RecoveringStructure,
+        ),
+        KvError,
+    > {
         use super::record::{
             split_forest_key, ForestSlot, KIND_INTERIOR, NATIVE_FOREST_SLOT, TREE_CONTROL,
         };
@@ -15878,6 +15904,45 @@ impl KvMetaBackend {
             }
         };
 
+        // ---- The slots MID-RECOVERY (PR 10, review round 4, Issue 31):
+        // every forest slot tree 0 leases to an appender whose directory
+        // page is `Recovering`. A recovery in flight owns their STRUCTURE
+        // (§5.9 step 4 clears the gate's `foreign` bit for exactly these),
+        // and its step-6 flush journals their interior records — the
+        // parent flips of its compactions — into RING 0, the recoverer's.
+        // A recoverer that died inside that flush, between a cycle's SMO
+        // records and the cycle's covering ledger record, left them in
+        // this window with tree 0 still leasing the slots to the dead
+        // appender. They are the recovery's own: the detector below
+        // admits them (`recovering.slots`), and this replay does NOT fold
+        // them into a dead lessee's tree (whose root the page names, not
+        // tree 0 — the base they were journaled against) — it stashes them
+        // for the appender open, which applies an own region's onto the
+        // page root it installs and keeps a foreign one's for the C15
+        // re-run. One directory read and one tree-0 scan, forest only;
+        // empty when no page is `Recovering`.
+        let mut recovering = super::appender::RecoveringStructure::default();
+        {
+            let directory = super::appender::read_directory(path, sb).await?;
+            let recovering_ids: Vec<u32> = directory
+                .iter()
+                .filter(|e| {
+                    e.page
+                        .as_ref()
+                        .is_some_and(|p| p.state == super::appender::AppenderState::Recovering)
+                })
+                .map(|e| e.appender_id)
+                .collect();
+            if !recovering_ids.is_empty() {
+                let leases = Self::read_tree0_lease_map(forest.control()).await?;
+                for id in recovering_ids {
+                    if let Some(slots) = leases.get(&id) {
+                        recovering.slots.extend(slots.iter().copied());
+                    }
+                }
+            }
+        }
+
         // ---- The slot trees' window: phase 1 interior records by
         // (level DESC, seq), each routed by its separator's slot.
         let mut interior: Vec<(u8, u64, &Record)> = Vec::new();
@@ -15900,6 +15965,16 @@ impl KvMetaBackend {
             // key (the separator alone cannot — the top one is
             // `KEY_SPACE_MAX` in every tree); strip it for the apply.
             let (slot, separator) = super::forest::split_interior_journal_key(&rec.key)?;
+            if recovering.slots.contains(&slot) {
+                recovering.stash.entry(slot).or_default().push(
+                    super::appender::RecoveringInterior {
+                        level,
+                        entry_seq: entry_start,
+                        record: rec.clone(),
+                    },
+                );
+                continue;
+            }
             let Some(slot) = route(slot, &mut skipped_slots) else {
                 continue;
             };
@@ -16005,6 +16080,7 @@ impl KvMetaBackend {
             },
             max_replayed_ino,
             max_replayed_guest,
+            recovering,
         ))
     }
 
@@ -16064,6 +16140,7 @@ impl KvMetaBackend {
         recovery0: &super::journal::JournalRecovery,
         posture: OpenPosture,
         boot_id: &str,
+        recovering: super::appender::RecoveringStructure,
     ) -> std::result::Result<super::appender::AppenderSet, KvError> {
         use super::appender::{
             appender0_page_offsets, declared_partition, dir_pairs_per_extent,
@@ -16228,6 +16305,7 @@ impl KvMetaBackend {
             cadence_last_ns: AtomicU64::new(0),
             appenders_known: AtomicU64::new(0),
             leases: None,
+            recovering_structure: std::sync::Mutex::new(Default::default()),
         };
         let mut regions: Vec<Arc<AppenderRegion>> = Vec::new();
 
@@ -16544,6 +16622,18 @@ impl KvMetaBackend {
             for r in &regions {
                 plane.note_identity(r.id, set.identity.node_token, set.identity.mount_slot);
             }
+            // A recovery in flight at this open (Issue 31): every foreign
+            // `Recovering` page's appender — the frame screen admits the
+            // manager's frames on its slots until the re-run's tree-0 step.
+            for e in &entries {
+                if e.page
+                    .as_ref()
+                    .is_some_and(|p| p.state == AppenderState::Recovering)
+                    && !regions.iter().any(|r| r.id == e.appender_id)
+                {
+                    let _ = plane.recovering_lessees.insert_sync(e.appender_id);
+                }
+            }
             Arc::new(plane)
         });
         let set = AppenderSet {
@@ -16573,6 +16663,36 @@ impl KvMetaBackend {
                 .iter()
                 .any(|(id, rec)| *id == appender && rec.contains(extent))
         };
+        // A recovery IN FLIGHT (PR 10, review round 4, Issue 31): every
+        // directory page `Recovering` that is NOT one of this mount's
+        // regions is a dead lessee mid-recovery — ours from a previous
+        // incarnation, or a dead recoverer's. Its slots' STRUCTURE is the
+        // recoverer's (§5.9 step 4 clears `foreign` for them), and the
+        // recoverer's step-6 compactions journal their interior records
+        // into RING 0 — a recoverer that died between that flush and the
+        // tree-0 step left them there with tree 0 still leasing the slots
+        // to the dead appender, which the detector below read as a `Lease`
+        // violation on EVERY later open (a mount refusal nobody could
+        // clear). The manager's interior records for these slots are the
+        // recovery's own; the mount path's C15 arm re-runs it.
+        let recovering_pages: std::collections::BTreeSet<u32> = entries
+            .iter()
+            .filter(|e| {
+                e.page
+                    .as_ref()
+                    .is_some_and(|p| p.state == AppenderState::Recovering)
+                    && set.region(e.appender_id).is_none()
+            })
+            .map(|e| e.appender_id)
+            .collect();
+        // The slots mid-recovery and the manager's withheld interior
+        // records for them — computed by the forest replay
+        // (`open_forest_and_replay`), which reads the same directory and
+        // tree 0's lease map before it folds ring 0's window.
+        let super::appender::RecoveringStructure {
+            slots: recovering_slots,
+            stash: mut recovering_stash,
+        } = recovering;
         let owned: Vec<(u32, super::journal::JournalRecovery)> = rings
             .iter()
             .map(|(id, r)| {
@@ -16587,7 +16707,12 @@ impl KvMetaBackend {
                 )
             })
             .collect();
-        let violations = super::journal::detect_appender_violations(&owned, &leases, &granted);
+        let violations = super::journal::detect_appender_violations(
+            &owned,
+            &leases,
+            &granted,
+            &recovering_slots,
+        );
         if !violations.is_empty() {
             let (mut key, mut lease, mut extent) = (0u64, 0u64, 0u64);
             for v in &violations {
@@ -16634,14 +16759,22 @@ impl KvMetaBackend {
         // residue like a `Live` one (F1's other half).
         if is_writer {
             for r in &set.regions {
-                let (entries, page_tail): (Vec<super::appender::SlotEntry>, u64) = {
+                let (entries, page_tail, page_recovering): (
+                    Vec<super::appender::SlotEntry>,
+                    u64,
+                    bool,
+                ) = {
                     let page = r.page.lock().unwrap_or_else(|e| e.into_inner());
                     if !matches!(page.state, AppenderState::Live | AppenderState::Recovering)
                         || !mine(&page)
                     {
                         continue;
                     }
-                    (page.slots.clone(), page.ledger_tail_seq)
+                    (
+                        page.slots.clone(),
+                        page.ledger_tail_seq,
+                        page.state == AppenderState::Recovering,
+                    )
                 };
                 // The root's un-published records start at the ring's
                 // durable tail: ring 0's is the ledger's, a declared
@@ -16663,11 +16796,18 @@ impl KvMetaBackend {
                     // Both arms raise the node-seq handle to the page's
                     // root seq inside the ONE install (review round 2,
                     // Issue 24 — the recovery driver shares them).
-                    match forest.tree(slot) {
+                    let page_root_current = match forest.tree(slot) {
                         Some(t) => {
                             if e.root.seq > t.root().seq {
                                 cache.drop_slot_nodes(slot)?;
                                 t.install_recovered_root(e.root, floor).await?;
+                                true
+                            } else {
+                                // Equal = the tree already stands at the
+                                // page's root; older = a stale entry (a
+                                // `g 0` attestation of a slot since
+                                // released — `slot_lease_stale_entries`).
+                                e.root.seq == t.root().seq
                             }
                         }
                         None => {
@@ -16680,10 +16820,117 @@ impl KvMetaBackend {
                             )
                             .await?;
                             forest.adopt_guest_unpublished(slot, Arc::new(tree));
+                            true
+                        }
+                    };
+                    // An OWN `Recovering` page (own residue — a recoverer
+                    // died mid-way through OUR dead predecessor's region,
+                    // and this node is the volume's manager again): the
+                    // manager's flips the forest replay withheld for its
+                    // slot apply now, onto the page root just installed —
+                    // the base they were journaled against (Issue 31). A
+                    // stale entry naming an OLDER root is nobody's base.
+                    if !page_recovering || !page_root_current {
+                        continue;
+                    }
+                    if let Some(stash) = recovering_stash.remove(&slot) {
+                        let tree = forest.tree(slot).ok_or_else(|| {
+                            KvError::Corrupt(format!(
+                                "{}: slot {slot} has withheld structure but no tree",
+                                path.display()
+                            ))
+                        })?;
+                        let mut ordered = stash;
+                        ordered.sort_by(|a, b| {
+                            b.level.cmp(&a.level).then(a.record.seq.cmp(&b.record.seq))
+                        });
+                        for s in ordered {
+                            let (_slot, separator) =
+                                super::forest::split_interior_journal_key(&s.record.key)?;
+                            tree.apply_replayed_interior(
+                                separator,
+                                s.level,
+                                s.record.seq,
+                                s.record.kind,
+                                Bytes::copy_from_slice(&s.record.value),
+                                s.entry_seq,
+                            )
+                            .await?;
                         }
                     }
                 }
             }
+            // A recovery IN FLIGHT's pages (Issue 31 — see `recovering_
+            // pages` above): the dead lessee's page names the root its
+            // checkpoints reached and a dead recoverer's step-6 flush
+            // rewrote UNDER — its compactions retired leaf images whose
+            // frees ride ring 0's window, parked on the recoverer's
+            // record positions, and a root swap's retirement of the page
+            // root itself among them. The page root is installed HERE,
+            // before `park_replayed_frees` below judges the mounted roots
+            // (a mounted root's free is DROPPED — the §5.3.4 root-swap
+            // law), so the re-run finds the root image it needs; the
+            // slot's tree stays the dead lessee's until the re-run
+            // (foreign — nothing of this open folds into it: the
+            // manager's interior records for it are stashed, not
+            // applied). The floor is ring 0's durable tail: every record
+            // of the recoverer's under this root sits at or past it.
+            for e in &entries {
+                if !recovering_pages.contains(&e.appender_id) {
+                    continue;
+                }
+                let Some(page) = e.page.as_ref() else {
+                    continue;
+                };
+                for se in &page.slots {
+                    if se.root.addr == 0 {
+                        continue;
+                    }
+                    let slot = super::appender::forest_slot_of_page_slot(se.slot, native_slot);
+                    if slot == super::record::NATIVE_FOREST_SLOT
+                        || !recovering_slots.contains(&slot)
+                    {
+                        continue;
+                    }
+                    match forest.tree(slot) {
+                        Some(t) => {
+                            if se.root.seq > t.root().seq {
+                                cache.drop_slot_nodes(slot)?;
+                                t.install_recovered_root(se.root, ledger.journal_tail_seq)
+                                    .await?;
+                            }
+                        }
+                        None => {
+                            let tree = KvTree::open_unpublished_slot_tree(
+                                Arc::clone(cache),
+                                slot,
+                                se.root,
+                                Arc::clone(seq),
+                                ledger.journal_tail_seq,
+                            )
+                            .await?;
+                            forest.adopt_guest_unpublished(slot, Arc::new(tree));
+                        }
+                    }
+                }
+            }
+        }
+        // What the forest replay withheld for FOREIGN slots mid-recovery
+        // is the re-run's (the mount path's C15 arm); a non-writer open
+        // keeps nothing (it folds no window into a slot tree either way).
+        if !recovering_stash.is_empty() {
+            let withheld: usize = recovering_stash.values().map(Vec::len).sum();
+            log::warn!(
+                "meta volume {}: ring 0's window carried {withheld} interior record(s) of a \
+                 recovery in flight over {} slot(s) ({:?}) — a recoverer died between its flush \
+                 and its tree-0 step; held for the recovery re-run",
+                path.display(),
+                recovering_stash.len(),
+                recovering_stash.keys().take(8).collect::<Vec<_>>()
+            );
+            *set.recovering_structure
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = recovering_stash;
         }
 
         // ---- Apply the recovered content rings into the forest (phase 2

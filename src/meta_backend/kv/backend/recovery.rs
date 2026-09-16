@@ -213,6 +213,7 @@ struct RecoveryRollback<'a> {
     plane: &'a slot_lease::SlotLeasePlane,
     cache: &'a Arc<NodeCache>,
     forest: &'a forest::SlotTrees,
+    set: &'a appender::AppenderSet,
     id: u32,
     begun: Vec<SlotRollback>,
 }
@@ -223,6 +224,11 @@ struct SlotRollback {
     /// The gate's `foreign` bit before step 4 cleared it.
     was_foreign: bool,
     tree: TreeRollback,
+    /// A dead recoverer's stashed interior records this run TOOK from
+    /// [`AppenderSet::recovering_structure`] and applied (Issue 31) — put
+    /// back for the re-run; the nodes they dirtied are discarded with the
+    /// tree's.
+    structure: Vec<appender::RecoveringInterior>,
 }
 
 /// What step 4 did to the slot's RAM tree.
@@ -249,11 +255,28 @@ impl Drop for RecoveryRollback<'_> {
             slot,
             was_foreign,
             tree,
+            structure,
         } in self.begun.drain(..)
         {
             self.plane.table.abort_release(slot, self.id);
             if was_foreign {
                 self.plane.gate.mark_foreign(slot);
+            }
+            if !structure.is_empty() {
+                // The stash goes back for the re-run; what it dirtied is
+                // discarded with the tree's nodes (an `Untouched` tree
+                // discards for this alone — the flips are the ring's, the
+                // re-run folds them again).
+                if matches!(tree, TreeRollback::Untouched) {
+                    self.cache.discard_slot_nodes(slot);
+                }
+                self.set
+                    .recovering_structure
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(slot)
+                    .or_default()
+                    .splice(0..0, structure);
             }
             match tree {
                 TreeRollback::Untouched => {}
@@ -604,6 +627,22 @@ impl KvMetaBackend {
     /// every root install raises (review round 2, Issue 24's witness).
     pub fn test_node_seq_now(&self) -> u64 {
         self.seq_handle().load(Ordering::Acquire)
+    }
+
+    /// Test seam: the interior records ring 0's window carried for `slot`
+    /// at this open while its lessee's page was `Recovering` — a dead
+    /// recoverer's flips, stashed for the re-run (Issue 31's witness).
+    pub fn test_recovering_structure_len(&self, slot: record::ForestSlot) -> usize {
+        self.appenders
+            .as_ref()
+            .map(|set| {
+                set.recovering_structure
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&slot)
+                    .map_or(0, Vec::len)
+            })
+            .unwrap_or(0)
     }
 
     /// Test seam: the forest's UNPUBLISHED guest-root floors per slot —
@@ -1249,6 +1288,11 @@ impl KvMetaBackend {
             page.recovered_by_term = self.writer_term();
             self.write_foreign_page(entry, &mut page).await?;
         }
+        // The lessee is mid-recovery from here (Issue 31): the frame
+        // screen admits the manager's `(0, g)` frames on its slots beside
+        // its own — the flush below writes them, and a reload (an eviction
+        // now, the next open after a death) must read them.
+        let _ = plane.recovering_lessees.insert_sync(id);
         if TEST_RECOVERY_HALT_AFTER_RECOVERING_PAGE.load(Ordering::SeqCst) {
             return Err(KvError::Busy(format!(
                 "{}: TEST_RECOVERY_HALT_AFTER_RECOVERING_PAGE — the recoverer died after \
@@ -1325,7 +1369,9 @@ impl KvMetaBackend {
             // grant record, so the window's alloc deltas would now read as
             // outside it.
             let violations = if absorbed.is_empty() {
-                journal::detect_appender_violations(&owned, &leases, &granted)
+                // The dead lessee's OWN ring is judged by the lease map
+                // alone: the recovering exemption is ring 0's (Issue 31).
+                journal::detect_appender_violations(&owned, &leases, &granted, &Default::default())
             } else {
                 log::info!(
                     "meta volume {}: appender {id}'s recovery re-runs past its tree-0 step \
@@ -1421,6 +1467,7 @@ impl KvMetaBackend {
             plane: &plane,
             cache: &self.cache,
             forest,
+            set,
             id,
             begun: Vec::new(),
         };
@@ -1443,6 +1490,7 @@ impl KvMetaBackend {
                     slot: *slot,
                     was_foreign,
                     tree: TreeRollback::Untouched,
+                    structure: Vec::new(),
                 }),
                 Err(refusal) => {
                     return Err(KvError::Corrupt(format!(
@@ -1513,6 +1561,56 @@ impl KvMetaBackend {
                 };
                 if let Some(last) = rollback.begun.last_mut() {
                     last.tree = tree_rollback;
+                }
+                // A dead recoverer's flips of this slot (Issue 31): ring
+                // 0's window carried the manager's interior records for a
+                // tree whose lessee's page was `Recovering` at this
+                // mount's open — a previous recoverer's step-6 compactions
+                // that died before their tree-0 step; the open stashed them
+                // instead of folding them into a foreign tree. They apply
+                // HERE, onto the installed page root (the base they were
+                // journaled against), in the structural class the recovery
+                // holds, before the dead window; the rollback puts them
+                // back. Their floors are their own ring-0 positions.
+                let stash = set
+                    .recovering_structure
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(slot)
+                    .unwrap_or_default();
+                if !stash.is_empty() {
+                    if let Some(last) = rollback.begun.last_mut() {
+                        last.structure = stash.clone();
+                    }
+                    let tree = forest.tree(*slot).ok_or_else(|| {
+                        KvError::Corrupt(format!(
+                            "{}: slot {slot} has stashed recovery structure but no tree",
+                            self.path.display()
+                        ))
+                    })?;
+                    let mut ordered = stash;
+                    ordered.sort_by(|a, b| {
+                        b.level.cmp(&a.level).then(a.record.seq.cmp(&b.record.seq))
+                    });
+                    let applied = ordered.len();
+                    for s in ordered {
+                        let (_slot, separator) = forest::split_interior_journal_key(&s.record.key)?;
+                        tree.apply_replayed_interior_recovery(
+                            separator,
+                            s.level,
+                            s.record.seq,
+                            s.record.kind,
+                            Bytes::copy_from_slice(&s.record.value),
+                            s.entry_seq,
+                        )
+                        .await?;
+                    }
+                    log::warn!(
+                        "meta volume {}: appender {id}'s recovery re-applied {applied} interior \
+                         record(s) a previous recoverer left in ring 0 for slot {slot} (it died \
+                         between its flush and its tree-0 step)",
+                        self.path.display()
+                    );
                 }
             }
             // §5.1.8: the cursor is never lowered.
@@ -1773,6 +1871,9 @@ impl KvMetaBackend {
         page.state = AppenderState::Recovered;
         page.recovered_by_term = self.writer_term();
         page.slots.clear();
+        // Its slots are the manager's now (tree 0 `Unleased`, step 7 —
+        // rule 4 is inert there by the lease alone).
+        plane.recovering_lessees.remove_sync(&id);
         if let Some(d) = dead_ring.as_ref() {
             let head = d.ring.core().head();
             page.head_hint = head;

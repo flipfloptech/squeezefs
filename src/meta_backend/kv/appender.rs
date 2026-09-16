@@ -2238,6 +2238,44 @@ pub struct AppenderSet {
     /// `Some` on a writer's open with `SQUEEZEFS_SYMMETRIC_META=1`; `None`
     /// = the PR 1–3 dark forest verbatim.
     pub leases: Option<std::sync::Arc<super::slot_lease::SlotLeasePlane>>,
+    /// **A dead recoverer's structure, held for the re-run** (PR 10,
+    /// review round 4, Issue 31): the manager's interior records ring 0's
+    /// window carried for a slot whose tree-0 lessee's page is
+    /// `Recovering` — a recovery in flight whose step-6 flush compacted
+    /// the slot's leaves and died before its tree-0 step. The open does
+    /// NOT fold them into the slot's tree (the tree is a dead lessee's,
+    /// foreign to this mount's flush until the recovery re-runs under the
+    /// structural door); it stashes them here, per slot, and the re-run's
+    /// step 4 applies them onto the installed page root before the dead
+    /// window — a failed re-run puts them back. Their ring-0 positions
+    /// stay in the window under the installed root's floor. Empty on
+    /// every open that finds no such page.
+    pub recovering_structure: std::sync::Mutex<
+        std::collections::BTreeMap<super::record::ForestSlot, Vec<RecoveringInterior>>,
+    >,
+}
+
+/// One stashed interior record (see [`AppenderSet::recovering_structure`]).
+#[derive(Debug, Clone)]
+pub struct RecoveringInterior {
+    pub level: u8,
+    /// The record's entry position in ring 0 — its dirty floor when applied.
+    pub entry_seq: u64,
+    pub record: super::record::Record,
+}
+
+/// What the fixed ring's replay WITHHELD for the slots mid-recovery
+/// (Issue 31): `slots` = every forest slot tree 0 leases to an appender
+/// whose directory page is `Recovering` (any identity — the detector's
+/// exemption and the replay's stash filter read the same set); `stash` =
+/// the manager's interior records for them, by slot, in the window's
+/// order. Handed from the forest replay to the appender open, which
+/// applies an OWN region's (own residue, onto the page root it installs)
+/// and keeps a foreign one's for the recovery re-run.
+#[derive(Debug, Default)]
+pub struct RecoveringStructure {
+    pub slots: std::collections::BTreeSet<super::record::ForestSlot>,
+    pub stash: std::collections::BTreeMap<super::record::ForestSlot, Vec<RecoveringInterior>>,
 }
 
 /// Test seam: the manager is UNREACHABLE — the grant cadence issues no

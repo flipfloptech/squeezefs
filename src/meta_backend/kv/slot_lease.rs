@@ -346,6 +346,18 @@ pub struct SlotLeasePlane {
     /// generation moves — one record read per slot per lease generation,
     /// never per load (`KvMetaBackend::frame_screen_for`).
     pub frame_tails: scc::HashMap<ForestSlot, Arc<(u32, u32, std::collections::HashMap<u64, u32>)>>,
+    /// PR 10, review round 4, Issue 31 — the appenders whose directory
+    /// page is `Recovering` (a recovery IN FLIGHT: a dead lessee this
+    /// manager, or a dead recoverer before it, is recovering). Their
+    /// slots' STRUCTURE is the recoverer's — the manager's — so the §5.8.2
+    /// screen's rule 4 admits BOTH the lessee's frames at the current
+    /// generation and the manager's `(0, g)` on those slots (a frame the
+    /// recovery's own flush wrote, re-loaded after an eviction or by the
+    /// next open, was a rule-4 FOREIGN frame while tree 0 still named the
+    /// dead lessee — the recovered leaves read truncated and the next
+    /// compaction refused the fold). Set at open from the directory,
+    /// moved by the driver (step 2 in, step 8 out).
+    pub recovering_lessees: scc::HashSet<u32>,
 }
 
 impl Drop for SlotLeasePlane {
@@ -383,6 +395,7 @@ impl SlotLeasePlane {
             offers_busy: AtomicU64::new(0),
             table: SlotLeaseTable::new(),
             gate,
+            recovering_lessees: scc::HashSet::new(),
             dominance: DominanceWindow::new(),
             mint_slots: AtomicU64::new(mint_slots),
             mint_slots_knob: crate::env_knobs::opt_int_knob::<u64>(SYM_MINT_SLOTS_ENV),

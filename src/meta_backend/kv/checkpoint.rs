@@ -1593,6 +1593,16 @@ async fn tick(
 pub static TEST_CHECKPOINT_HALT_AFTER_LEDGER: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// TEST seam ONLY (`false` in production, one relaxed load): halt the
+/// checkpoint cycle right BEFORE its ledger record — every SMO record the
+/// flush pass journaled sits in the window UNCOVERED, the other crash
+/// window of a cycle. PR 10 review round 4, Issue 31: a recoverer dying
+/// there, inside its step-6 flush of a dead lessee's tree, leaves the
+/// manager's interior records for a slot tree 0 leases to the dead
+/// appender in ring 0 (`tests/sym_crash_matrix_tests.rs`).
+pub static TEST_CHECKPOINT_HALT_BEFORE_LEDGER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl KvMetaBackend {
     /// One §4.6 pt 2 checkpoint cycle (module docs pin the order).
     /// Serialized by the SMO mutex the caller holds. `barrier_now` makes
@@ -1959,6 +1969,18 @@ impl KvMetaBackend {
             // when spec §6.9 S4 hands the backend an appender set.
             append_partition: None,
         };
+        // TEST seam (Issue 31 — the crash window BEFORE the record): the
+        // cycle stops with its flush pass's SMO records journaled and the
+        // covering record unwritten; the floors go back like a failed
+        // record's.
+        if TEST_CHECKPOINT_HALT_BEFORE_LEDGER.load(Ordering::Relaxed) {
+            self.node_cache().restore_dying_floors(dying_floors);
+            self.node_cache()
+                .restore_dying_leaf_floors(dying_leaf_floors);
+            return Err(KvError::Corrupt(
+                "test seam: checkpoint halted before its ledger record".to_string(),
+            ));
+        }
         if let Err(e) = write_ledger_slot(
             self.device_path(),
             self.superblock().root_ledger.start,

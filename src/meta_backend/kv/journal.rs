@@ -1948,10 +1948,24 @@ impl std::fmt::Display for AppenderViolation {
 /// grant of its own (§5.3.3). Window-scoped like
 /// [`detect_partition_violations`]: a key two appenders touched in
 /// different windows leaves no evidence here.
+///
+/// `recovering` (PR 10, review round 4, Issue 31): the forest slots tree 0
+/// leases to an appender whose directory page is `Recovering` — a
+/// recovery IN FLIGHT (§5.9 step 4 clears the gate's `foreign` bit for
+/// exactly these: their STRUCTURE is the recoverer's, the manager's, and
+/// its flush's compactions journal their interior records into RING 0).
+/// The MANAGER's interior records for such a slot are legal; nothing
+/// else changes — a CONTENT record for the slot in ring 0 stays the
+/// `Lease` class (the door refuses the manager's commits into a leased
+/// slot, dead lessee or not), a foreign ring's records are judged by the
+/// lease map alone, and a slot whose lessee's page is `Live` is never in
+/// the set — so the exemption keys on the PAGE STATE of the slot's tree-0
+/// lessee, never on the writer of the record.
 pub fn detect_appender_violations(
     rings: &[(u32, JournalRecovery)],
     leases: &std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>>,
     granted: &dyn Fn(u32, u64) -> bool,
+    recovering: &std::collections::BTreeSet<u32>,
 ) -> Vec<AppenderViolation> {
     let mut out = Vec::new();
     let mut owners: std::collections::HashMap<(u8, Vec<u8>), (u32, u64)> =
@@ -1997,7 +2011,9 @@ pub fn detect_appender_violations(
                         .ok()
                         .map(|(s, _)| s);
                     let legal = match slot {
-                        Some(s) if appender_id == 0 => !leased_by_other(0, s),
+                        Some(s) if appender_id == 0 => {
+                            !leased_by_other(0, s) || recovering.contains(&s)
+                        }
                         Some(s) => leases.get(&appender_id).is_some_and(|set| set.contains(&s)),
                         None => appender_id == 0,
                     };

@@ -400,3 +400,62 @@ the watchdog proven to FIRE beside it (`SQZ_SYM_HANG_FLOOR_S=3` on
 `sym_appender_tests` → `HUNG … after 3 s`, the leg failed, no orphaned test
 binary). Not run (by rule): `task check`, squeeze-test, anything on `dev` /
 `main`; `.benchmarks/2026-09-12-sym-pr-run.md` untouched.
+
+## 12. Review round 5 (2026-09-16) — Issue 31, the recoverer's death inside its flush
+
+Round 4's finding, adjudicated BUILD: a permanent mount refusal on the death
+path. **The shape, corrected by the pin**: a recoverer that dies AFTER step 6
+completes leaves no exposed record (the flush loops until every dirty node is
+covered, and the dead slot's floor — the manager holds no lease on it — never
+clamps ring 0), so the window is the one INSIDE a cycle: between the flush
+pass's SMO records and the cycle's covering ledger record. In the two-backend
+shape the dead lessee's slot is no region of the recoverer's set, so its
+compactions journal their interior records into ring 0; a death there left
+them uncovered with tree 0 still `Leased { dead }`, and every later open
+refused with `appender partition violated … appender 0's ring carries a record
+for slot tree 4 it does not lease` — clearable by nothing.
+
+| Piece | File | Why |
+|---|---|---|
+| `detect_appender_violations(rings, leases, granted, recovering)` — the manager's INTERIOR records for a slot in `recovering` are legal; nothing else moves | `kv/journal.rs` | the exemption itself; `recovering` = the slots tree 0 leases to an appender whose PAGE is `Recovering` — keyed on the page state of the slot's lessee, never on the record's writer. Pinned: a `Live` lessee's slot stays the `Lease` class, a content record for the slot stays it, a third appender's record in its ring stays it, the lessee's own interior record in ITS ring stays legal (`sym_appender_tests::the_recovering_exemption_admits_the_managers_structure_alone_and_only_for_the_named_slots`) |
+| `RecoveringStructure { slots, stash }` / `RecoveringInterior` / `AppenderSet::recovering_structure` | `kv/appender.rs` | the forest replay WITHHOLDS the manager's interior records for those slots (they were journaled against the PAGE root the recoverer installed, not the tree-0 root the open holds — folding them there dirtied a foreign tree, which `drop_slot_nodes` then refused) and hands them to the appender open |
+| the forest replay's directory + tree-0 read, the stash filter; the appender open's install of a foreign `Recovering` page's roots BEFORE `park_replayed_frees` (a root swap's retirement of the page root is among the replayed frees — dropped for a mounted root), an OWN `Recovering` page's stash applied at the open, a foreign page's kept on the set; the screen's `appender_current = None` for a lessee mid-recovery | `kv/backend.rs` | the open's half of the law |
+| step 4 applies the stash onto the installed root (structural class, level DESC / seq ASC) before the dead window; `SlotRollback.structure` puts it back and discards what it dirtied (an `Untouched` tree discards for this alone); `recovering_lessees` in at step 2, out at step 8 | `kv/backend/recovery.rs` | the re-run's half |
+| `SlotLeasePlane::recovering_lessees` | `kv/slot_lease.rs` | the SECOND face of the same law, found by the pin: the recoverer's frames on the dead slot are stamped `(0, g)` and the §5.8.2 screen's rule 4 (`g == g_current ∧ appender ≠ lessee`) read them FOREIGN at every reload while tree 0 named the dead lessee — the recovered leaves loaded TRUNCATED (the base bset itself screened) and the re-run's compaction refused the fold (`SMO fold-source log-view mismatch … disk walk ends at 61440, the live object's append cursor is at 4096`) |
+| `TEST_CHECKPOINT_HALT_BEFORE_LEDGER` | `kv/checkpoint.rs` | the kill inside a cycle, deterministic (the sibling of PR 8's `…_AFTER_LEDGER`) |
+
+**The pin** `a_recoverer_dying_after_its_flush_leaves_a_mount_the_next_open_admits`
+(two-backend fixture, `TwoBackendsWindow::CreatesUnderInterior(600)` — the
+lessee's rounds continue until the slot tree has an INTERIOR root, so a leaf
+compaction's parent flip is an interior record; a root-leaf compaction alone is
+a root swap, which journals none): the recoverer's first step-6 cycle halts
+before its ledger record with ≥ 1 SMO (the premise, asserted; a fixture whose
+flush only appended — the dentry keys hash across leaves the lessee's own
+maintenance left at random fills, so 1 in ≈ 6 fixtures — is rebuilt, bounded at
+6, loud on the bound), the recoverer is dropped without a shutdown, the next
+open ADMITS (`meta_kv_replay_lease_violations` flat), the stash is witnessed
+(`test_recovering_structure_len ≥ 1`), the page's root is the tree's root at
+the open, `mount_path_custody_gate` re-runs the recovery (`recovered 1`, the
+stash consumed), every acked record resolves, tree 0 `Unleased`, the page
+`Recovered`, `recovered:` written, a create under the directory lands, fsck
+clean. **RED before** with the detector's exemption disabled: the reopen
+refused with the exact `Lease` text above. The crash matrix is **31
+contracts** (+1 ignored instrument).
+
+**Stated, not built (PR 12's)**: a dead lessee's NODE that rejoins over its
+own `Recovering` page (own residue) after a FOREIGN recoverer mutated its tree
+and died mid-flush reads the tree from its page root without the recoverer's
+uncovered flips (they sit in the recoverer's ring 0, which the rejoiner never
+reads) — the predecessor images those flips retired are freed once the
+recoverer's tail passes their parks. The `Recovering` page should carry the
+recoverer's identity/term so a rejoin over a foreign recovery REFUSES (or
+waits for the recovery to complete and takes a fresh region) — the
+cross-node rejoin's protocol, Issue 25's obligation widened.
+
+**Verification (`CARGO_INCREMENTAL=0`, the dev laptop)**: fmt / both clippy
+configs / rustdoc `-D warnings` — clean; `sym_crash_matrix_tests` stamped ×3 +
+flat ×1 — 4 / 4 green (31 contracts, 28–31 s); `sym_appender_tests` 35 /
+`crash_contract_tests` 25 / `docs_parity_tests` 5, flat AND stamped — 6 / 6
+legs green; the Issue-31 pin alone ×6 stamped — 6 / 6. Not run (by rule):
+`task check`, squeeze-test, anything on `dev` / `main`;
+`.benchmarks/2026-09-12-sym-pr-run.md` untouched; no rebase.

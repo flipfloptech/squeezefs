@@ -13,7 +13,7 @@ use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use std::ffi::OsStr;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 pub const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
@@ -3655,6 +3655,29 @@ pub async fn census_meta_lock_acquire(
         _g: g,
         acquired: hold_timed.then_some(acquired),
     }
+}
+
+/// **Test seam** (symmetric PR 9, review round 4 — Issue 35's pin): PARK
+/// the lease slow path between the ino's word being set (`cache()`) and
+/// the lease entering `active_leases` — the one window a recall could
+/// cross unseen. Released by [`test_lease_insert_park_release`]; one
+/// relaxed load per slow-path acquire (the cached-lease hot path reads
+/// nothing here).
+pub static TEST_PARK_BEFORE_LEASE_INSERT: AtomicBool = AtomicBool::new(false);
+/// Slow paths that PARKED on [`TEST_PARK_BEFORE_LEASE_INSERT`] so far.
+static TEST_LEASE_INSERT_PARKED: AtomicU64 = AtomicU64::new(0);
+static TEST_LEASE_INSERT_PARK_NOTIFY: once_cell::sync::Lazy<squeezefs_ipc::sqz_notify::Notify> =
+    once_cell::sync::Lazy::new(squeezefs_ipc::sqz_notify::Notify::new);
+
+/// Slow paths parked on [`TEST_PARK_BEFORE_LEASE_INSERT`] so far.
+pub fn test_lease_insert_parked() -> u64 {
+    TEST_LEASE_INSERT_PARKED.load(Ordering::Acquire)
+}
+
+/// Release every slow path parked on [`TEST_PARK_BEFORE_LEASE_INSERT`].
+pub fn test_lease_insert_park_release() {
+    TEST_PARK_BEFORE_LEASE_INSERT.store(false, Ordering::Relaxed);
+    TEST_LEASE_INSERT_PARK_NOTIFY.notify_waiters();
 }
 
 /// Symmetric PR 9 (review round 3, Issue 20): one mutating op's in-flight
@@ -16082,7 +16105,34 @@ impl SqueezefsFilesystem {
         if !has_word && crate::data_grant::slot_holder_home(ino).is_some() {
             self.custody_use.entry(ino).or_default().cache();
         }
+        if TEST_PARK_BEFORE_LEASE_INSERT.load(Ordering::Relaxed) {
+            TEST_LEASE_INSERT_PARKED.fetch_add(1, Ordering::AcqRel);
+            while TEST_PARK_BEFORE_LEASE_INSERT.load(Ordering::Relaxed) {
+                let notified = TEST_LEASE_INSERT_PARK_NOTIFY.notified();
+                if !TEST_PARK_BEFORE_LEASE_INSERT.load(Ordering::Relaxed) {
+                    break;
+                }
+                notified.await;
+            }
+        }
         self.active_leases.insert(ino, lease);
+        // Publish-then-recheck (symmetric PR 9, review round 4 — Issue
+        // 35): a recall that landed between `cache()` and the insert
+        // cleared the word and found nothing to park, so the lease would
+        // enter the map refused-but-unparked — its release travelling only
+        // at the next write's replacing insert or the file's last close.
+        // The word re-read AFTER the publish is the same decision the read
+        // site takes; a cleared word parks the lease at once
+        // (`revoke_local_lease_for_recall` is idempotent). This handler's
+        // own use is counted, so the settle waits for it before the
+        // release departs — the write proceeds under the still-live grant.
+        if self
+            .custody_use
+            .get(&ino)
+            .is_some_and(|core| !core.is_cached())
+        {
+            self.revoke_local_lease_for_recall(ino);
+        }
         Ok(token)
     }
 

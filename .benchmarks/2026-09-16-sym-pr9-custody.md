@@ -61,6 +61,11 @@ PR 7 (review Issue 18b) left `cancel_same_reference_pairs` unapplied at `KvMetaB
 | `a_writer_poisons_at_t_self_when_its_holder_stops_answering_and_never_parks` | no holder client to fence | `52637fbe` |
 | `unarmed_and_flat_mounts_arm_nothing_and_count_nothing` | (the law pinned with the mechanism) | `52637fbe` |
 | `the_mount_arm_needs_a_cluster_secret_and_disarms_clean` | (same) | `52637fbe` |
+| **round 3** `a_recalled_writers_cached_lease_is_revoked_and_its_writes_reacquire_at_the_new_holder` | RED on `2cbe11cf` (`r2/red-round3.log`): *"the write after the move ran under the RELEASED grant's token"* | `873ece2b` → `4f298059` |
+| `a_lost_recall_carrier_re_travels_the_recall_on_the_next_one` | (the seam did not exist) | `873ece2b` → `4f298059` |
+| `a_holders_clean_leave_recalls_its_grants_before_its_slots_go_unleased` | RED on `2cbe11cf`: *"the leave recalled the grant it issued: left 0 right 1"* | `873ece2b` → `4f298059` |
+| `the_handovers_parks_and_bounds_derive_from_the_lease_clocks` + `derivation_sweep_tests::sym_custody_handover_park_and_bounds_derive_from_the_lease_clocks` | (the fns did not exist) | `873ece2b` → `4f298059` |
+| `a_grant_inside_the_flush_then_transfer_is_deferred_to_the_next_holder` | RED on `3823ab22` (`r3/red-transfer-window.log`): the completing handover did not hold the slot's mark through the transfer (`:2328`) | `048c1d47` → `021d1792` |
 
 The fixture is PR 6's two-holder shape: one stamped volume, a file PRESET into forest slot 4 while the slot is the manager's (`create_with_rdev_preset`), the slot released to `Unleased`, the set reopened under `SQUEEZEFS_TEST_SYM_APPENDER_SLOTS=1:4` so declared region 1 takes it; the "venue" is one `RpcListener` serving `AsyncVerbRouter::with_custody(owner).with_tokens(TokenSetService).with_manager(…)` over the same backend (what PR 12's join ladder stands up on every writer), appender 1's endpoint bound on the plane, the S9 owner installed process-wide, the slot-custody arm installed with a probe sink. Every gauge is read as a DELTA (process-global counters; the suite's tests run on libtest's threads).
 
@@ -157,13 +162,16 @@ The carriage saves one loopback round trip per foreign first touch (≈ 125 µs 
 - `fuzz/fuzz_targets/token_call_frame.rs`, `tests/decoder_property_tests.rs`: the PR 9 arms/strategies.
 - `tests/run_sym_forest_suites.sh`: a comment paragraph + `sym_custody_tests` appended to `DEFAULT_SUITES`.
 - `docs/operations.md`: the S9 section's armed-plane paragraph, the PR 9 section after PR 5's, the `dlm_custody` stats row. `AGENTS.md`: the PR 9 paragraph before "### Metadata-throughput program"; the S9 `dlm_custody` sentence amended. `docs/design-symmetric-metadata.md`: row 9 ONLY.
-- `src/env_knobs.rs`, `src/fuse_client.rs`, `src/meta_ship/manager.rs`, `CLUSTER_WIRE_SCHEMA` — untouched.
+- **Round 3's shared-file touches** (all additive; for the rebase): `src/dlm.rs` — `LockLease::held_now` (the sync twin of `is_held`) + `LockLease::is_remote`, after `is_held`; `src/fuse_client.rs` — the fields `recalled_leases` / `custody_use` (+ constructor), the `CustodyUse` RAII guard (before `WriteInflight`), the ONE accessor `cached_lease_token` replacing the four `active_leases` reads, `revoke_local_lease_for_recall` / `settle_recalled_leases` / `recalled_leases_pending` / `custody_use_enter` / `custody_uses` / `install_slot_custody_hooks` (before `invalidate_local_lease`), `install_release_gate_hook` factored out of `install_cowriter_extent_hooks`, the `_custody_use` stamps in `write` / `setattr` / `flush` / `release` / `fsync` / `fallocate` / `copy_file_range` and the `upload_use` / `cont_use` moved into the pipeline-upload task and the four overlay continuations, `reclaim_teardown` dropping the `custody_use` entry, `slot_handover_recall_bound_ms` in the Slot-lease block; `src/main.rs` — `install_slot_custody_hooks()` when the arm engaged (ONE `if`); `src/meta_backend/kv/backend.rs` — `shutdown`'s `recall_custody_at_leave` before `release_leases_at_leave` (+ `custody_blocked` in the uncovered predicate), the handover site's `HandoverCustody` match holding `_custody_mark`, `foreign_slot_holder`'s `Unleased`-on-a-non-manager arm; `src/meta_ship/token_plane.rs` — the post-grant `handover_recall_defers` re-check in `serve_custody_grant`; `src/data_grant.rs` (mine) — `RecallHooks`, `HandoverMark` / `HandoverCustodyMark` / `HandoverCustody`, the derived fns, `recall_custody_at_leave`, `STALE_HOLDER_GRANTS`, the two ACQUIRE-arm re-checks; `tests/derivation_sweep_tests.rs` — one appended tie test.
+- `src/env_knobs.rs`, `src/meta_ship/manager.rs`, `CLUSTER_WIRE_SCHEMA` — untouched.
 
 ## 9. The fidelity tier (`quick`, root, nvmet — the release binary at `1ca066e2`)
 
 `sudo -n env … FIDELI_SQZ_BIN=$PWD/target/release/squeezefs bash tests/run_nvmeof_fidelity.sh quick` (`/tmp/grok-justin/pr9-logs/fidelity-quick.log`): **PASS=43 FAIL=0 in 1m37s** — `substrate-up` 1, `roundtrip-nvmet` 15, `pr-registrants` 7, `sym-manager-failover` 18 (the mount path with the PR-9 arm: 196/200 creates acked under the seam with the 4 refusals naming PR 6's cross-owner class — the leg's own expected shape; successor wall 1,408 ms against the 45,011 ms `manager_failover_bound_ms`; acked data byte-intact; WERO re-held by the successor; zero PR residue after the clean unmount), `guard-nvmet-x1` 1, `teardown-zero-residue` 1. The arm reads `Ok(false)` on that leg's mounts (no cluster listener ⇒ no `job:enroll` secret ⇒ the WARN and no holder dialed — §1.1), which is the honest posture: nothing of PR 9 engages without the wire, and the custody plane's device rows are untouched.
 
 **Round 2's re-run** (the release binary at `1d848b37`; `/tmp/grok-justin/pr9-logs/r2/fidelity-quick.log`): **PASS=43 FAIL=0 in 1m38s** — the same six legs (`substrate-up` 1, `roundtrip-nvmet` 15, `pr-registrants` 7, `sym-manager-failover` 18 — 196/200 creates acked under the seam with the 4 refusals naming PR 6's cross-owner class, the must-stay-0 set clean, successor wall 1,393 ms against the 45,010 ms bound — `guard-nvmet-x1` 1, `teardown-zero-residue` 1). The mount path's teardown now runs the PR 9 leave (`disarm_slot_custody`, a no-op on that leg's mounts — no arm without a cluster secret) beside its arm.
+
+**Round 3's re-run** (the release binary at `2a9fd20a`; `/tmp/grok-justin/pr9-logs/r3/fidelity-quick.log`): **PASS=43 FAIL=0 in 1m35s** — the same six legs (`sym-manager-failover` 18: 196 acked names served by the successor, successor wall 1,372 ms against the 45,011 ms bound, acked data byte-intact, WERO re-held, zero PR residue). The leave's `recall_custody_at_leave` runs in every `shutdown` on that leg and returns before any work (no custody owner, no arm) — the shipped leave verbatim.
 
 ## 10. Review round 1 → round 2 (the 19 issues, all fixed; `/tmp/grok-justin/grok-exec-review-dadee1dd-pr-9.md`)
 
@@ -193,3 +201,82 @@ The review found **8 bugs** (a RED gate line, an unwired leave, an unvalidated w
 | **Live-FUSE trio under `SQUEEZEFS_TEST_REQUIRE_MOUNT=1`, flat + stamped** (Issue 14) — **DEFAULT features** (the shipped jemalloc config, not the gate's `--all-features`; Issue 26) | **6/6 PASS, 0 skip-ledger lines** — `posix_mount_semantics_tests` 3 (3.3 / 3.3 s), `corpse_sweep_tests` 4 (15.9 / 17.5 s), `inline_raise_tests` 7 (5.1 / 6.5 s) (`trio-*.log`) |
 | `cargo build --release` at `1d848b37` + `sudo … tests/run_nvmeof_fidelity.sh quick` (root, nohup, jq on PATH) | **PASS=43 FAIL=0 in 1m38s** (`fidelity-quick.log`) |
 
+
+## 11. Review round 2 → round 3 (Issue 9's three holes + Issues 20–27, all fixed; the ×10's own finding; `/tmp/grok-justin/grok-exec-review-dadee1dd-pr-9.md`)
+
+The round-2 review verified 18 of 19 fixes and left **Issue 9 open with three holes** in the recall design — all three BUGS, all in the writer half and the leave: the recall never reached the FUSE layer's cached lease (Issue 20), the notice was one-shot (Issue 21), the holder's own clean leave never recalled (Issue 22) — plus five suggestions/nits (23–27). Every one is fixed red-first: the pins in `873ece2b` (red on `2cbe11cf` — `red-round3.log`: the leave recalled nothing, `left 0 right 1`; the write after the move ran under the RELEASED grant's token), the fixes in `4f298059`. **The round-3 ×10 stamped run then found a fourth hole of the same class** (run 4 of the FUSE-layer contract: `held() == 1` at the old holder after the move — the completing tick CLEARED the mid-handover mark before the flush-then-transfer, so a recalled writer's retry inside the ≈ 10 ms transfer was GRANTED at the old holder and the grant spanned the move; 1 in 10 runs): pinned deterministically in `048c1d47` (the handover parked mid-transfer by PR 4's seam; RED on `3823ab22`), fixed in `021d1792` — the mark is HELD through the transfer and every grant path re-checks it after the grant (§1.3). **The restarted run's flat ×20 then found the same class from a THIRD side** (1 in 20, the same assertion, on the held-mark tree): a request RESOLVED to the old holder before the move and served one RTT after it, when the slot read `Unleased` and the old holder held nothing to grant — closed at both ends in `2a9fd20a` (the served side's `NotHolder { 0 }` for an unleased slot on a non-manager; the writer's re-resolve after every grant, `dlm_custody_stale_holder_grants`). Per the counted-run discipline each pre-fix run is rate evidence only (`/tmp/grok-justin/pr9-logs/r3-contaminated/`: the ×10 at 9/10 on `3823ab22`; the ×20 flat at 19/20 on `366d1243`); the acceptance count restarted from zero on the final tree after each fix (§11a).
+
+| Issue | Class | Fix (commit) | Pin |
+|---|---|---|---|
+| **9** (round-2 holes) | suggestion → the bound as claimed | Issues 20–22 below make "one renewal beat of the recalled writer's release" TRUE as built; the abandoned-handover and never-polls bounds stated (24) | the three pins below + `a_deferred_handover_recalls_the_custody_and_completes_within_a_beat` (the hazard-as-feature assertion REMOVED) |
+| **20** | **bug** — the recall stopped at the custody client | `4f298059`: the recall hooks (`RecallHooks { revoke, settle, pending }`, installed by `install_slot_custody_hooks` beside the finding-34 gate — `main.rs` installs both when the arm engaged); the ONE accessor `cached_lease_token` (`LockLease::held_now`) at all four `active_leases` sites; the per-ino `CustodyUse` RAII count on every mutating handler + the detached pipeline-upload and the four overlay continuations, drained before the parked lease drops; the GATED release; the deferred acquire's CONFLICT class for the POSIX-5 ladder | `a_recalled_writers_cached_lease_is_revoked_and_its_writes_reacquire_at_the_new_holder` (the FuseRig: a writer every 10 ms across the recall and the move — 0 failed writes, the cached lease revoked, the release landing under the writer, a second file of the slot DELAYED to the move never refused, every write after the move under a FRESH custody, the last write readable, `data_dma_epoch_refusals` flat) |
+| **21** | **bug** — `RecallNotice` one-shot | `4f298059`: `pending_recalls` deleted; `take_recalls_for` = the client's live grants ∩ `recalled_grants` on EVERY carrier (the demotion/shrink law); `absorb_recalls` idempotent (`recalled.swap`) | `a_lost_recall_carrier_re_travels_the_recall_on_the_next_one` (seam `TEST_DROP_RECALL_CARRIER_ONCE`: recalled once, absorbed once, the recall landing on the next carrier) |
+| **22** | **bug** — the holder's leave never recalled | `4f298059`: `recall_custody_at_leave` in `KvMetaBackend::shutdown` BEFORE `release_leases_at_leave` — the same recall as the handover's, the wait at the derived park up to `T_owner + renew` (`expire_due` at the bound), a surviving grant keeps its REGION leased (`custody_blocked` → the uncovered posture, loud); `021d1792`: a HELD mark per held slot before the census | `a_holders_clean_leave_recalls_its_grants_before_its_slots_go_unleased` (recalled at the shutdown, the release waited for — not `T_owner` — `held() == 0` before `Unleased`, the writer's handle released, the next open finds the slot the manager's with custody local) |
+| **the ×10 finding** (window A/B) | **bug** — a grant inside the flush-then-transfer | `021d1792`: `defer_handover_for_custody` → `HandoverCustody::{Deferred, Clear(HandoverCustodyMark)}` — the mark armed BEFORE the census and HELD to the handover's terminal outcome; the token wire's `CustodyGrant` and the custody wire's ACQUIRE (plain + ranged) read `handover_recall_defers` AGAIN after `owner.grant` and release the grant `CUSTODY_DEFERRED` when it stands (the Dekker pair through the owner's grant lock and the mark's); the leave arms held marks | `a_grant_inside_the_flush_then_transfer_is_deferred_to_the_next_holder` (the handover parked after its page; a foreign acquire inside `Deferred`; `held() == 0` at the old holder; the mark cleared at completion — RED on `3823ab22`) |
+| **the ×20 finding** (window C) | **bug** — a stale resolve granted after the move | `2a9fd20a`: `KvMetaBackend::foreign_slot_holder` answers `Some(0)` (the manager) for an `Unleased` slot on a NON-manager — the token wire's `NotHolder` for both the plain token grant and the custody grant (one predicate, PR 5's and PR 9's agree); `acquire_at_slot_holder` re-resolves `slot_holder_home` after every `Granted` and RELEASES a grant from an appender tree 0 no longer names (drained before the retry; the one-move redirect budget covers it) | the FUSE-layer contract (its 10 ms writer is what reaches the window) — ×20 stamped + ×20 flat isolated, the ×10 / ×3 (§11a) |
+| **23** | suggestion — the unstated `clear_range_grants` residue | `4f298059`: the scoped fence marks the fenced client's grants dead one by one (each retiring its own range span), never `note_lease_lost`'s process-wide clear; stated beside the `advance` residue (§1.4, operations, AGENTS) | (the fence contract) |
+| **24** | suggestion — the bounds unstated | `4f298059` + `3823ab22`: `handover_recall_bound_for` = `2 × renew`, `leave_custody_bound_for` = `T_owner + renew`, `handover_retry_park_for` = `renew / 20` — pub, documented, tie-tested; both bounds stated in §1.3, row 9, operations; `slot_handover_recall_bound_ms` published | `derivation_sweep_tests::sym_custody_handover_park_and_bounds_derive_from_the_lease_clocks`; `the_handovers_parks_and_bounds_derive_from_the_lease_clocks` (against the venue's clocks in force) |
+| **25** | nit — the free 50 ms | `4f298059`: `DEFERRED_RETRY_PARK` deleted → `renew / 20` (floor 1 ms), the reason on the fn | (Issue 24's tie tests) |
+| **26** | nit — the trio row's feature config | this note: the round-2 trio row re-labelled DEFAULT features (§4, §10a); the round-3 trio runs `--all-features` (§11a) and names it | — |
+| **27** | suggestion — the fence contract flaky | `4f298059`: `fence_holder_scoped` runs its WORK first (grants dead, generation advanced, `holder_fenced` — the dial slot removed and RETIRED under its own mutex) and latches `fenced` LAST (`fencing` the entry latch); `holder()` on a retired slot refuses `EAGAIN` instead of JOINing on an orphan | the contract's `wait_until(fenced())` waits on completion; ×20 stamped + ×20 flat isolated (§11a) |
+
+**Design statements the round asked for**: (a) **why the recall does NOT advance the custody epoch** — the write pipeline's ONE-word epoch carrier cannot name a permit's holder, so an `advance` on a recall would refuse every OTHER holder's in-flight DMA (`FenceDrop`, acked data lost); the per-ino `CustodyUse` drain makes a straggler under the released grant structurally impossible instead (no handler that took the token before the revoke can merge or DMA after the grant left), which is why `authorize_dma` has nothing to refuse and `data_dma_epoch_refusals` stays flat by construction — the per-object capture stays PR 12's, stated; (b) **the slot-wide mid-handover mark is kept** (a per-ino mark lets a writer opening new files in the slot starve the handover indefinitely); with the writer half fixed the window is one beat + the settle and a grant inside it is delayed, never refused; (c) **the mark's two lifetimes**: armed by a deferred tick it expires at `2 × renew`; held by a completing handover or the leave it never expires — cleared at the handover's terminal outcome or dying with the process.
+
+### 11a. Verification on the FINAL code tree (`2a9fd20a`; `CARGO_INCREMENTAL=0`; logs `/tmp/grok-justin/pr9-logs/r3/`; the run script `run-verify4.sh` — every count from ZERO after the last code change)
+
+| Gate / leg | Result |
+|---|---|
+| `cargo fmt --check` (root / `fuzz/`) | PASS / PASS |
+| `cargo clippy --all-targets --all-features -- -D warnings` | PASS (`clippy-all.log`) |
+| `cargo clippy --all-targets -- -D warnings` (shipped config) | PASS (`clippy-default.log`) |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | PASS (`doc.log`) — one RED between rounds, caught by this line: `WriteCustodyClient::handover_recall_bound`'s doc linked its private free-fn twin (`366d1243`) |
+| `fuzz/` `cargo check` + `cargo fmt --check` | PASS / PASS (`fuzz-check.log`) |
+| `tests/check_markdown_links.sh` (whole tree) | PASS (`mdlinks.log`) |
+| **Isolated ×20 stamped + ×20 flat** of the three load-selected contracts (Issue 27's fence contract, the transfer-window pin, the FUSE-layer recall contract) | **40/40** (`x20-{stamped,flat}-*.log`; the pre-fix runs are rate evidence only: 9/10 on `3823ab22`, 19/20 flat on `366d1243` — `r3-contaminated/`) |
+| `bash tests/run_sym_forest_suites.sh` ONCE (34 suites, flat THEN stamped) | **34/34 PASS both legs**, 68 green results, 0 failures, **no ratio NOTE** (20 min; `matrix-run3-block1.log` — the run's own block; a stray orphaned runner from an earlier killed launch shared the file's tail (`matrix-stray-block2.log`, its own complete PASS table) — box load, not a result change; the SOLO re-run below is the acceptance row). `sym_manager_tests` 6.3 / 5.9 s (0.95) — the earlier 2.04 NOTE on `3823ab22` (`r3-contaminated/`) was box load from sibling worktrees' concurrent cargo runs, not a PR-9 path (the leave's `recall_custody_at_leave` returns before any work with no custody owner installed, which that suite never installs) |
+| `bash tests/run_sym_forest_suites.sh` ONCE MORE, ALONE (the acceptance row) | **34/34 PASS both legs, 68 green results, 0 failures, no ratio NOTE, one summary table** (20 min; `matrix-solo.log`; `sym_custody_tests` 37.4 / 37.5 s (1.00), `sym_manager_tests` 5.6 / 5.7 (1.01), `sym_slot_transfer_tests` 33.3 / 33.2, `sym_coherence_tests` 63.0 / 62.3) — the acceptance row |
+| `sym_custody_tests` ×10 stamped from zero + ×3 flat from zero | **13/13** (23 passed, 1 ignored each; 37.2–38.9 s; `x10-stamped-*.log`, `x3-flat-*.log`) |
+| `dlm_multi_writer_tests`, `dlm_data_fence_tests`, `mw_cowriter_pack_tests`, `mw_cowriter_free_tests`, `sym_coherence_tests`, `sym_slot_transfer_tests`, `docs_parity_tests`, `env_knob_convention_tests`, `derivation_sweep_tests`, `decoder_property_tests` — flat + stamped | **20/20 PASS** (`suite-{flat,stamped}-*.log`; `derivation_sweep_tests` 58 incl. the new tie test; `docs_parity_tests` 5 with the new gauge documented) |
+| **Live-FUSE trio under `SQUEEZEFS_TEST_REQUIRE_MOUNT=1`, flat + stamped — `--all-features` (the gate's configuration, the `dhat-on` allocator; Issue 26)** | **6/6 PASS, 0 skip-ledger lines** — flat `posix_mount_semantics_tests` 3 (41.1 s) / `corpse_sweep_tests` 4 (155.3 s) / `inline_raise_tests` 7 (105.9 s); stamped 3 (40.8 s) / 4 (155.4 s) / 7 (114.7 s) (`trio-*.log`) — the walls match the reviewer's `--all-features` row (42 / 167 / 116 s), which is Issue 26's attribution confirmed from this side |
+| `cargo build --release` at `2a9fd20a` + `sudo -n env PATH=<jq>:$PATH FIDELI_SQZ_BIN=… bash tests/run_nvmeof_fidelity.sh quick` (root, nohup) | **PASS=43 FAIL=0 in 1m35s** (`fidelity-quick.log`: substrate-up 1, roundtrip-nvmet 15, pr-registrants 7, sym-manager-failover 18 — 196 acked names served by the successor, successor wall 1,372 ms against the 45,011 ms bound, acked data byte-intact, WERO re-held, zero PR residue — guard-nvmet-x1 1, teardown-zero-residue 1) |
+
+Not run (per the brief): `task check`, squeeze-test. `.benchmarks/2026-09-12-sym-pr-run.md` untouched. Nothing pushed or merged.
+
+**The round-3 matrix table** (the run's own block, flat THEN stamped; the flat leg paid no compile this time — the ×20 stage built the tree):
+
+| suite | flat | stamped | ratio |
+|---|---|---|---|
+| kv_tree_tests | 47.1 | 46.7 | 0.99 |
+| kv_node_tests | 0.1 | 0.1 | 0.89 |
+| kv_backend_tests | 134.9 | 149.5 | 1.11 |
+| kv_journal_tests | 0.1 | 0.1 | 0.81 |
+| kv_partitioned_append_tests | 0.2 | 0.1 | 0.93 |
+| kv_leaf_merge_tests | 43.1 | 41.8 | 0.97 |
+| kv_node_cache_coherence_tests | 0.4 | 0.4 | 0.97 |
+| kvmap_tree_tests | 0.4 | 0.3 | 0.91 |
+| kv_scale_tests | 32.8 | 29.1 | 0.89 |
+| durable_block_refs_tests | 10.2 | 9.7 | 0.95 |
+| fsck_tests | 13.2 | 14.9 | 1.13 |
+| fsck_c9_tests | 2.9 | 2.9 | 1.02 |
+| fsck_c10_tests | 4.1 | 4.2 | 1.01 |
+| fsck_c12_tests | 3.6 | 3.7 | 1.02 |
+| fsck_repair_tests | 12.4 | 12.5 | 1.01 |
+| crash_contract_tests | 0.4 | 0.4 | 1.08 |
+| crash_kill_tests | 4.6 | 4.8 | 1.05 |
+| writer_scoped_staging_tests | 2.9 | 2.9 | 1.03 |
+| readonly_mount_tests | 4.6 | 4.5 | 0.99 |
+| meta_slot_migration_tests | 4.3 | 5.7 | 1.33 |
+| pv_coordinator_tests | 4.1 | 4.5 | 1.11 |
+| kv_smo_crash_completeness_tests | 21.4 | 22.1 | 1.03 |
+| sym_appender_tests | 13.4 | 13.0 | 0.97 |
+| sym_manager_tests | 6.3 | 5.9 | 0.95 |
+| sym_fence_tests | 0.4 | 0.4 | 0.95 |
+| sym_slot_transfer_tests | 33.9 | 33.5 | 0.99 |
+| rename_lock_set_tests | 0.8 | 0.8 | 0.97 |
+| sym_convert_tests | 22.2 | 19.9 | 0.89 |
+| sym_pack_tests | 0.6 | 0.6 | 0.91 |
+| sym_shared_refs_tests | 18.0 | 17.9 | 0.99 |
+| sym_cross_owner_tests | 16.2 | 14.9 | 0.92 |
+| sym_block_grant_tests | 19.6 | 19.2 | 0.98 |
+| sym_coherence_tests | 62.6 | 62.2 | 0.99 |
+| sym_custody_tests | 37.5 | 38.3 | 1.02 |

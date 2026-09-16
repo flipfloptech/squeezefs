@@ -643,6 +643,10 @@ async fn the_w1_predicate_confirms_sole_ownership_in_the_inos_slot_tree_on_an_ar
         rig.shutdown().await;
     }
     {
+        // The unarmed half's law is the POSTURE's, on a never-armed
+        // volume: a set the plane has stamped takes no writer without the
+        // plane (PR 5 review round 3, Issue 25).
+        let uris = vec![format_stamped_member(dir.path(), "meta-unarmed").await];
         let rig = mount(&uris, data.path(), &Knobs::unarmed()).await;
         let f = rig.mk_file("u").await;
         let offset = rig.publish_block(f, 0).await;

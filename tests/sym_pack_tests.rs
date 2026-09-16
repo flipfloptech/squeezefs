@@ -301,8 +301,12 @@ async fn an_armed_set_packs_per_slot_and_an_unarmed_mount_keeps_pk2s_one_scope()
         assert_eq!(rig.router.packer.open_scopes(), 0);
         rig.shutdown().await;
     }
-    // Unarmed: ONE scope — the same two inos' tenants share one block.
+    // Unarmed: ONE scope — two inos' tenants share one block. On a
+    // never-armed volume: a set the plane has stamped takes no writer
+    // without the plane (PR 5 review round 3, Issue 25 — the frame-stamp
+    // law has no unarmed writer), and this half's law is the POSTURE's.
     {
+        let uris = vec![format_stamped_member(dir.path(), "meta-unarmed").await];
         let rig = mount_data(&uris, data.path(), &Knobs::unarmed()).await;
         let a = rig.mk_file("ua").await;
         let b = rig.mk_file("ub").await;

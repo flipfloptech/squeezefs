@@ -2819,3 +2819,41 @@ fn sym_read_token_budget_page_and_deadline_derive_from_r5_the_frame_cap_and_the_
     );
     assert!(RECALL_POLL_PARK_FLOOR <= std::time::Duration::from_secs(1));
 }
+
+/// Symmetric PR 9 (review round 3, Issues 24/25): the custody handover's
+/// parks and bounds are functions of the S9 lease clocks — the writer's
+/// deferred-retry / settle park is one twentieth of the renewal beat, the
+/// mid-handover mark stands two beats, the holder's clean leave waits
+/// `T_owner + renew` for its recalled grants (the S9 sweep's bound) —
+/// at the shipped clocks and at the contracts' 1 s beat alike.
+#[test]
+fn sym_custody_handover_park_and_bounds_derive_from_the_lease_clocks() {
+    use squeezefs::data_grant::{
+        handover_recall_bound_for, handover_retry_park_for, leave_custody_bound_for,
+    };
+    use std::time::Duration;
+    let shipped =
+        squeezefs::membership::LeaseClocks::derive(Duration::ZERO).expect("shipped clocks");
+    for renew in [shipped.renew_interval, Duration::from_secs(1)] {
+        assert_eq!(
+            handover_retry_park_for(renew),
+            (renew / 20).max(Duration::from_millis(1)),
+            "the retry / settle park is renew / 20"
+        );
+        assert_eq!(
+            handover_recall_bound_for(renew),
+            renew * 2,
+            "the mid-handover mark stands two beats"
+        );
+    }
+    assert_eq!(
+        leave_custody_bound_for(shipped.t_owner, shipped.renew_interval),
+        shipped.t_owner + shipped.renew_interval,
+        "the leave waits T_owner + renew for its recalled grants"
+    );
+    assert!(
+        handover_retry_park_for(shipped.renew_interval)
+            < handover_recall_bound_for(shipped.renew_interval),
+        "many retries fit one mark"
+    );
+}

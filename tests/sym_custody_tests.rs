@@ -435,6 +435,11 @@ struct Venue {
 
 impl Venue {
     async fn stand_up(rig: &DataRig, appenders: &[u32]) -> Self {
+        Self::stand_up_on(&rig.routed, appenders).await
+    }
+
+    /// [`Self::stand_up`] over a routed set directly (the FUSE-layer rig's).
+    async fn stand_up_on(routed: &Arc<RoutedMetaBackend>, appenders: &[u32]) -> Self {
         let ms = Arc::new(AtomicU64::new(1_000));
         let (c, clock) = clocks(&ms);
         let owner = WriteCustodyOwner::arm(
@@ -449,12 +454,12 @@ impl Venue {
         data_grant::install_custody_owner(Arc::clone(&owner));
         let router = AsyncVerbRouter::new()
             .with_custody(Arc::clone(&owner))
-            .with_tokens(TokenSetService::new(&rig.routed.volumes))
-            .with_manager(ManagerSetService::new(&rig.routed.volumes));
+            .with_tokens(TokenSetService::new(&routed.volumes))
+            .with_manager(ManagerSetService::new(&routed.volumes));
         let host = cw::RpcListener::start_async(listener_cfg(), SECRET.to_vec(), Arc::new(router))
             .expect("holder listener");
         let endpoint = host.endpoint().to_string();
-        for vol in &rig.routed.volumes {
+        for vol in &routed.volumes {
             let plane = vol.slot_leases().expect("armed");
             for id in appenders {
                 plane.holders.set_endpoint(*id, &endpoint);
@@ -465,7 +470,7 @@ impl Venue {
         });
         let for_arm = Arc::clone(&sink);
         let arm = data_grant::arm_slot_custody(
-            &rig.routed,
+            routed,
             WRITER,
             SECRET.to_vec(),
             0,
@@ -582,10 +587,15 @@ async fn holders_volume(
         inos.push(ino);
     }
     let vol = Arc::clone(&rig.routed.volumes[0]);
+    let mut released: Vec<ForestSlot> = Vec::new();
     for (slot, _) in slots {
+        if released.contains(slot) {
+            continue;
+        }
         vol.release_slot_handover(0, *slot)
             .await
             .expect("release to unleased");
+        released.push(*slot);
     }
     drop(vol);
     rig.shutdown().await;
@@ -1585,7 +1595,10 @@ async fn a_dead_holders_t_self_fence_is_scoped_to_its_own_custody_and_driven_by_
 
     // Holder A dies: its listener is gone, and the clock passes T_self.
     // The renewal cadence's failed renewal past T_self is what fences —
-    // this contract calls no fence itself.
+    // this contract calls no fence itself. `fenced()` is the fence's
+    // COMPLETION word (review round 3, Issue 27: set after its work — the
+    // grants marked dead, the generation advanced, the planes stopped,
+    // the holder forgotten — never before it).
     a.host.shutdown();
     ms.store(t_self_a + 1, Ordering::SeqCst);
     wait_until("holder A's custody client fences itself at T_self", || {
@@ -1893,11 +1906,18 @@ async fn a_deferred_handover_recalls_the_custody_and_completes_within_a_beat() {
         data_grant::slot_holder_home(foreign).is_none(),
         "the slot is the manager's now"
     );
-    // Nothing was voided by the recall.
+    // Nothing was voided by the recall: the recall is not the
+    // `dead_grants` revocation — the process generation did not move, so
+    // no DMA authorized under ANY other grant is refused (round 3, Issue
+    // 20: a straggler under the RECALLED grant cannot exist — the FUSE
+    // layer drains every in-flight custody use before the release
+    // departs, pinned by the FUSE-layer contract below — so no epoch
+    // retire is needed for it).
     assert_eq!(refusals(), refusals0, "no DMA refusal for a recall");
-    assert!(
-        data_custody::authorize_dma(Some(in_flight)).is_ok(),
-        "a DMA captured under the recalled grant still submits — the recall is not a revocation"
+    assert_eq!(
+        data_custody::current_epoch(),
+        in_flight,
+        "the recall moved no process word"
     );
     // The file's next custody comes from the NEW holder — local.
     let lease2 = rig
@@ -2041,6 +2061,404 @@ async fn the_mount_arm_needs_a_cluster_secret_and_disarms_clean() {
     assert!(data_grant::slot_custody_armed());
     data_grant::disarm_slot_custody().await;
     assert!(!data_grant::slot_custody_armed());
+    rig.shutdown().await;
+}
+
+/// Review round 3, Issue 20 — **the recall reaches the FUSE layer's cached
+/// lease**: a writer holding a foreign file's custody through the FUSE
+/// layer (`active_leases`, held from the first write to the last close)
+/// keeps WRITING; the slot's handover recalls the grant; the FUSE layer's
+/// cached lease is REVOKED (the one accessor refuses it — the busy writer's
+/// next write re-acquires: `CUSTODY_DEFERRED` at the old holder, the NEW
+/// holder after the move), the in-flight custody uses drain, the acked
+/// bytes flush, THEN the grant is released — within the bound, whatever
+/// the writer's cadence — and the handover completes. No write is lost or
+/// refused, no write lands under the released grant (the fencing token
+/// after the move is a fresh local custody's, never the recalled grant's),
+/// and a second file in the slot written during the window is DELAYED,
+/// never failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recalled_writers_cached_lease_is_revoked_and_its_writes_reacquire_at_the_new_holder() {
+    use fuse3::raw::Filesystem;
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let (uris, inos) = holders_volume(
+        dir.path(),
+        data.path(),
+        &[(SLOT_B, "busy"), (SLOT_B, "other")],
+        0,
+    )
+    .await;
+    let (busy, other) = (inos[0], inos[1]);
+    let rig = common::sym::mount_fuse(
+        &uris,
+        data.path(),
+        &Knobs::armed().partition(TWO_HOLDERS),
+        "32MB",
+    )
+    .await;
+    let venue = Venue::stand_up_on(&rig.routed, &[1]).await;
+    rig.fs.install_slot_custody_hooks();
+    let vol = Arc::clone(&rig.routed.volumes[0]);
+    let refusals = || {
+        squeezefs::fuse_client::METRICS
+            .data_dma_epoch_refusals
+            .load(Ordering::Relaxed)
+    };
+    let refusals0 = refusals();
+    let s0 = data_grant::stats();
+
+    // The first write acquires custody from the slot holder and CACHES
+    // the lease in the FUSE layer.
+    rig.write_at(busy, 0, &common::sym::pattern(1, 4096)).await;
+    assert_eq!(venue.owner.held(), 1, "custody from the slot holder");
+    let grant_token = rig.fs.router.dlm.get_fencing_token_ino(busy);
+    assert_eq!(
+        rig.fs.cached_lease_token(busy),
+        Some(grant_token),
+        "the FUSE layer caches the grant's lease"
+    );
+    assert_eq!(rig.fs.custody_uses(busy), 0, "no op in flight");
+
+    // The BUSY writer: a write every 10 ms until told to stop; every
+    // write must succeed (a blocked write is fine, a failed one is not).
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let last = Arc::new(AtomicU64::new(1));
+    let errors = Arc::new(AtomicU64::new(0));
+    let writes = Arc::new(AtomicU64::new(1));
+    let writer = {
+        let fs = Arc::clone(&rig.fs);
+        let (stop, last, errors, writes) = (
+            Arc::clone(&stop),
+            Arc::clone(&last),
+            Arc::clone(&errors),
+            Arc::clone(&writes),
+        );
+        tokio::spawn(async move {
+            let mut i = 2usize;
+            while !stop.load(Ordering::SeqCst) {
+                let payload = bytes::Bytes::from(common::sym::pattern(i, 4096));
+                match fs
+                    .write(common::sym::req(), busy, 0, 0, payload, 0, 0)
+                    .await
+                {
+                    Ok(_) => {
+                        last.store(i as u64, Ordering::SeqCst);
+                        writes.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(e) => {
+                        eprintln!("busy writer: write {i} failed: {e:?}");
+                        errors.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                i += 1;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+    };
+    wait_until("the busy writer is writing", || {
+        writes.load(Ordering::SeqCst) >= 5
+    })
+    .await;
+
+    // The handover: deferred, the grant recalled.
+    let err = vol
+        .release_slot_handover(1, SLOT_B)
+        .await
+        .expect_err("deferred while the writer holds custody");
+    assert!(matches!(
+        &err,
+        squeezefs::meta_backend::kv::KvError::HandoverDeferred(_)
+    ));
+    assert_eq!(venue.owner.recalled(), 1, "the grant was recalled");
+
+    // The writer half: the cached lease is revoked, the in-flight uses
+    // drain, the release lands — the busy writer notwithstanding.
+    wait_until("the FUSE layer's cached lease is revoked", || {
+        rig.fs.cached_lease_token(busy) != Some(grant_token)
+    })
+    .await;
+    wait_until("the recalled grant's release lands at the holder", || {
+        venue.owner.held() == 0
+    })
+    .await;
+    assert_eq!(
+        rig.fs.recalled_leases_pending(),
+        0,
+        "the parked lease was settled (its uses drained) before the release"
+    );
+    assert!(
+        data_grant::handover_recalls_pending() >= 1,
+        "the slot is mid-handover until the move"
+    );
+    // A second file of the slot written inside the window: DELAYED to
+    // the move, never failed.
+    let other_write = {
+        let fs = Arc::clone(&rig.fs);
+        tokio::spawn(async move {
+            fs.write(
+                common::sym::req(),
+                other,
+                0,
+                0,
+                bytes::Bytes::from(common::sym::pattern(77, 4096)),
+                0,
+                0,
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !other_write.is_finished(),
+        "premise: the second file's grant is deferred while the slot is mid-handover"
+    );
+
+    // The requester's next tick: the grants are gone, the slot moves.
+    vol.release_slot_handover(1, SLOT_B)
+        .await
+        .expect("the handover completes once the recalled custody is released");
+    wait_until("the slot is this mount's", || {
+        data_grant::slot_holder_home(busy).is_none()
+    })
+    .await;
+    let other_written = tokio::time::timeout(Duration::from_secs(20), other_write)
+        .await
+        .expect("the second file's write completes after the move")
+        .expect("task");
+    assert!(
+        other_written.is_ok(),
+        "the second file's write landed at the new holder: {other_written:?}"
+    );
+    assert_eq!(data_grant::handover_recalls_pending(), 0);
+
+    // The busy writer kept writing throughout; stop it and audit.
+    let writes_before_stop = writes.load(Ordering::SeqCst);
+    wait_until("the writer lands writes at the new holder", || {
+        writes.load(Ordering::SeqCst) > writes_before_stop + 3
+    })
+    .await;
+    stop.store(true, Ordering::SeqCst);
+    writer.await.expect("writer task");
+    assert_eq!(
+        errors.load(Ordering::SeqCst),
+        0,
+        "no write failed across the recall and the handover"
+    );
+    let token_after = rig.fs.router.dlm.get_fencing_token_ino(busy);
+    assert_ne!(
+        token_after, grant_token,
+        "every write after the move runs under a FRESH local custody — never the released grant"
+    );
+    assert_eq!(
+        rig.fs.cached_lease_token(busy),
+        Some(token_after),
+        "the FUSE layer caches the new custody"
+    );
+    assert_eq!(venue.owner.held(), 0, "nothing held at the old holder");
+    assert_eq!(
+        data_grant::stats().recalls_absorbed,
+        s0.recalls_absorbed + 1
+    );
+    assert_eq!(refusals(), refusals0, "no DMA refusal: nothing was voided");
+    // The last acked write is what the file reads.
+    let want = common::sym::pattern(last.load(Ordering::SeqCst) as usize, 4096);
+    assert_eq!(
+        rig.read(busy, 4096).await,
+        want,
+        "the last write is durable"
+    );
+    venue.tear_down().await;
+    data_grant::uninstall_recall_hooks();
+    data_grant::uninstall_release_gate();
+    rig.shutdown().await;
+}
+
+/// Review round 3, Issue 21 — **the recall is STATE, re-gathered on every
+/// carrier**: a carrier whose reply the writer loses (the seam drops one
+/// absorbed batch) does not orphan the recall — it lands on the NEXT
+/// carrier (the standing poll's next round / the renewal), counted once
+/// at the holder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_recall_carrier_re_travels_the_recall_on_the_next_one() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let (uris, foreign) = two_holder_volume(dir.path(), data.path()).await;
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(TWO_HOLDERS)).await;
+    let venue = Venue::stand_up(&rig, &[1]).await;
+    let vol = Arc::clone(&rig.routed.volumes[0]);
+    let lease = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(foreign), None, Duration::from_secs(2))
+        .await
+        .expect("custody from the slot holder");
+    let s0 = data_grant::stats();
+    // The next carrier's recalls are DROPPED at the writer (a lost reply).
+    data_grant::TEST_DROP_RECALL_CARRIER_ONCE.store(true, Ordering::SeqCst);
+    let err = vol
+        .release_slot_handover(1, SLOT_B)
+        .await
+        .expect_err("deferred while the writer holds custody");
+    assert!(matches!(
+        &err,
+        squeezefs::meta_backend::kv::KvError::HandoverDeferred(_)
+    ));
+    wait_until("the seam fired (one carrier lost)", || {
+        !data_grant::TEST_DROP_RECALL_CARRIER_ONCE.load(Ordering::SeqCst)
+    })
+    .await;
+    // The recall re-travels on the next carrier (the standing poll's next
+    // round — within milliseconds; the renewal at the latest) — no second
+    // recall issued at the holder, one absorbed at the writer.
+    wait_until("the recall lands on the next carrier", || {
+        venue.owner.held() == 0
+    })
+    .await;
+    assert_eq!(venue.owner.recalled(), 1, "recalled ONCE at the holder");
+    assert_eq!(
+        data_grant::stats().recalls_absorbed,
+        s0.recalls_absorbed + 1,
+        "absorbed once at the writer"
+    );
+    assert!(!lease.is_held().await);
+    vol.release_slot_handover(1, SLOT_B)
+        .await
+        .expect("the handover completes");
+    drop(lease);
+    venue.tear_down().await;
+    rig.shutdown().await;
+}
+
+/// Review round 3, Issue 22 — **the holder's clean leave recalls the
+/// grants it issued** before its slots go `Unleased`: a writer holding a
+/// foreign file's custody from this holder sees the recall (the leave's
+/// own recall — the handover's one mechanism), releases, and only then do
+/// the slots move; the next lessee (the manager, here) grants the file
+/// afresh — no window in which two custodies of one file exist. The leave
+/// is bounded by `T_owner + renew` (the S9 sweep); a grant that survives
+/// it keeps its slot leased.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_holders_clean_leave_recalls_its_grants_before_its_slots_go_unleased() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let (uris, foreign) = two_holder_volume(dir.path(), data.path()).await;
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(TWO_HOLDERS)).await;
+    let venue = Venue::stand_up(&rig, &[1]).await;
+    let lease = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(foreign), None, Duration::from_secs(2))
+        .await
+        .expect("custody from the slot holder");
+    assert_eq!(venue.owner.held(), 1);
+    let s0 = data_grant::stats();
+    let recalled0 = venue.owner.recalled();
+
+    // The HOLDER (declared region 1 of this set) leaves cleanly while the
+    // writer holds its grant: the leave recalls, the writer releases, the
+    // slot goes Unleased.
+    let started = std::time::Instant::now();
+    rig.shutdown().await;
+    let wall = started.elapsed();
+    assert_eq!(
+        venue.owner.recalled(),
+        recalled0 + 1,
+        "the leave recalled the grant it issued"
+    );
+    assert_eq!(
+        venue.owner.held(),
+        0,
+        "the release landed BEFORE the slot went Unleased (the leave waited for it)"
+    );
+    assert_eq!(
+        data_grant::stats().recalls_absorbed,
+        s0.recalls_absorbed + 1
+    );
+    assert!(
+        !lease.is_held().await,
+        "the writer's handle reads the recall"
+    );
+    assert!(
+        wall < Duration::from_secs(15),
+        "the leave waited for the release, not for T_owner: {wall:?}"
+    );
+    drop(lease);
+    data_grant::disarm_slot_custody().await;
+    data_grant::uninstall_custody_owner();
+    venue.host.shutdown();
+
+    // The next open: the slot is Unleased — the manager takes it and the
+    // file's next custody is local (the new holder), nothing at the old.
+    let rig = mount_data(&uris, data.path(), &Knobs::armed()).await;
+    assert!(
+        data_grant::slot_holder_home(foreign).is_none(),
+        "the slot is the manager's now"
+    );
+    let lease2 = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(foreign), None, Duration::from_secs(2))
+        .await
+        .expect("custody from the new holder — local");
+    assert!(lease2.is_held().await);
+    drop(lease2);
+    rig.shutdown().await;
+}
+
+/// Review round 3, Issues 24/25 — the handover's parks and bounds are
+/// DERIVED from the S9 lease clocks and published: the writer's retry park
+/// is one twentieth of its renewal beat, the mid-handover mark stands two
+/// beats (`slot_handover_recall_bound_ms`), the leave waits `T_owner +
+/// renew`; every one tie-tested here against the clocks in force.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_handovers_parks_and_bounds_derive_from_the_lease_clocks() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let (uris, foreign) = two_holder_volume(dir.path(), data.path()).await;
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(TWO_HOLDERS)).await;
+    let venue = Venue::stand_up(&rig, &[1]).await;
+    let renew = venue.owner.clocks().renew_interval;
+    let t_owner = venue.owner.clocks().t_owner;
+    assert_eq!(
+        data_grant::handover_recall_bound_ms(),
+        (renew * 2).as_millis() as u64,
+        "the published mark bound is 2 × the authority's renewal beat"
+    );
+    assert_eq!(data_grant::handover_retry_park_for(renew), renew / 20);
+    assert_eq!(data_grant::handover_recall_bound_for(renew), renew * 2);
+    assert_eq!(
+        data_grant::leave_custody_bound_for(t_owner, renew),
+        t_owner + renew
+    );
+    // The writer derives the same words from its lease at the holder.
+    let lease = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(foreign), None, Duration::from_secs(2))
+        .await
+        .expect("custody from the slot holder");
+    let client = venue.arm.holder_client(&venue.endpoint).await.unwrap();
+    // The writer's words are millisecond-granular (the lease frame's).
+    let renew_ms = Duration::from_millis(renew.as_millis() as u64);
+    assert_eq!(
+        client.handover_retry_park(),
+        data_grant::handover_retry_park_for(renew_ms)
+    );
+    assert_eq!(
+        client.handover_recall_bound(),
+        data_grant::handover_recall_bound_for(renew_ms)
+    );
+    drop(lease);
+    venue.tear_down().await;
     rig.shutdown().await;
 }
 

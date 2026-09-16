@@ -551,6 +551,13 @@ pub struct TokenHolderPlane {
     /// Verbs refused because this holder's appender park EXPIRED (PR 8's
     /// `park_gate::admits_token_service` — the successor owns the slots).
     park_expired_refusals: AtomicU64,
+    /// Verbs refused because the caller holds NO membership lease with the
+    /// installed owner (review round 3, Issue 27): a grant is a promise the
+    /// recall's lease law must be able to judge, so the lease is checked
+    /// FIRST — a non-member is never granted, never registered as a token
+    /// client. **Must stay 0** on a fleet whose readers arm through
+    /// `arm_token_readers` (which requires the lease).
+    nonmember_refusals: AtomicU64,
     timeouts_live: AtomicU64,
     releases: AtomicU64,
     /// Conveyor passes that recalled at least one object (the batching
@@ -596,6 +603,7 @@ impl TokenHolderPlane {
             lease_swept_grants: AtomicU64::new(0),
             not_holder_redirects: AtomicU64::new(0),
             park_expired_refusals: AtomicU64::new(0),
+            nonmember_refusals: AtomicU64::new(0),
             timeouts_live: AtomicU64::new(0),
             releases: AtomicU64::new(0),
             recall_batches: AtomicU64::new(0),
@@ -1025,6 +1033,7 @@ impl TokenHolderPlane {
             lease_swept_grants: self.lease_swept_grants.load(Ordering::Relaxed),
             not_holder_redirects: self.not_holder_redirects.load(Ordering::Relaxed),
             park_expired_refusals: self.park_expired_refusals.load(Ordering::Relaxed),
+            nonmember_refusals: self.nonmember_refusals.load(Ordering::Relaxed),
             timeouts_live: self.timeouts_live.load(Ordering::Relaxed),
             releases: self.releases.load(Ordering::Relaxed),
             recall_batches: self.recall_batches.load(Ordering::Relaxed),
@@ -1066,6 +1075,7 @@ pub struct TokenHolderStats {
     pub lease_swept_grants: u64,
     pub not_holder_redirects: u64,
     pub park_expired_refusals: u64,
+    pub nonmember_refusals: u64,
     pub timeouts_live: u64,
     pub releases: u64,
     pub recall_batches: u64,
@@ -1142,6 +1152,26 @@ impl TokenService {
                  successor's — resolve the holder again"
                     .to_string(),
             );
+        }
+        // The membership lease FIRST (review round 3, Issue 27): where an
+        // owner is installed, a caller it does not list holds no lease the
+        // recall could judge — refused before it is granted anything or
+        // registered as a token client. Without an owner (the in-process
+        // contracts, a plane with no membership) nothing is checked.
+        if let Some(owner) = crate::membership::installed_owner() {
+            if owner.lease_deadline_ms(&frame.client).is_none() {
+                plane.nonmember_refusals.fetch_add(1, Ordering::Relaxed);
+                return Self::refuse(
+                    req_id,
+                    STATUS_REFUSED,
+                    format!(
+                        "client '{}' holds no membership lease with this set's owner — a read \
+                         token is granted to members only (join through the membership plane \
+                         first)",
+                        frame.client
+                    ),
+                );
+            }
         }
         // Every verb names its client: a member that reached this service
         // is a TOKEN client — the class the recall-gated free bypasses the
@@ -2521,6 +2551,7 @@ pub fn holder_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
         "dlm_token_lease_swept_grants": per(&|s| s.lease_swept_grants),
         "dlm_token_not_holder_redirects": per(&|s| s.not_holder_redirects),
         "dlm_token_park_expired_refusals": per(&|s| s.park_expired_refusals),
+        "dlm_token_nonmember_refusals": per(&|s| s.nonmember_refusals),
         "dlm_token_recall_timeouts_live": per(&|s| s.timeouts_live),
         "dlm_token_releases": per(&|s| s.releases),
         "dlm_token_recall_batches": per(&|s| s.recall_batches),

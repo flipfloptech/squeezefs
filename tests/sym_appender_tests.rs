@@ -776,14 +776,15 @@ fn appender_violations_key_lease_extent_are_each_detected() {
         (1u32, recovery(vec![(0, vec![content(s5, 1)])])),
     ];
     let no_grant = |_: u32, _: u64| false;
-    assert!(detect_appender_violations(&clean, &leases, &no_grant).is_empty());
+    let none: std::collections::BTreeSet<u32> = Default::default();
+    assert!(detect_appender_violations(&clean, &leases, &no_grant, &none).is_empty());
 
     // Key: the same key in two rings.
     let key_dup = vec![
         (0u32, recovery(vec![(0, vec![content(s6, 1)])])),
         (1u32, recovery(vec![(0, vec![content(s6, 1)])])),
     ];
-    let v = detect_appender_violations(&key_dup, &leases, &no_grant);
+    let v = detect_appender_violations(&key_dup, &leases, &no_grant, &none);
     assert!(
         v.iter().any(|x| matches!(
             x,
@@ -829,7 +830,7 @@ fn appender_violations_key_lease_extent_are_each_detected() {
             ]),
         ),
     ];
-    let v = detect_appender_violations(&lease_bad, &leases, &no_grant);
+    let v = detect_appender_violations(&lease_bad, &leases, &no_grant, &none);
     let lease_hits = v
         .iter()
         .filter(|x| matches!(x, AppenderViolation::Lease { .. }))
@@ -860,7 +861,7 @@ fn appender_violations_key_lease_extent_are_each_detected() {
         (0u32, recovery(vec![(0, vec![alloc.clone()])])),
         (1u32, recovery(vec![(0, vec![alloc])])),
     ];
-    let v = detect_appender_violations(&extent_bad, &leases, &no_grant);
+    let v = detect_appender_violations(&extent_bad, &leases, &no_grant, &none);
     assert_eq!(
         v.len(),
         1,
@@ -876,8 +877,89 @@ fn appender_violations_key_lease_extent_are_each_detected() {
     ));
     let granted = |appender: u32, extent: u64| appender == 1 && (72..80).contains(&extent);
     assert!(
-        detect_appender_violations(&extent_bad, &leases, &granted).is_empty(),
+        detect_appender_violations(&extent_bad, &leases, &granted, &none).is_empty(),
         "inside its grant the delta is appender 1's own"
+    );
+}
+
+/// **PR 10, review round 4, Issue 31 — the `recovering` exemption keys on
+/// the PAGE STATE of the slot's tree-0 lessee, never on the writer of the
+/// record.** Appender 1 leases slot 5. The MANAGER's interior record for
+/// slot 5 in ring 0 is the `Lease` class while appender 1's page is `Live`
+/// (the set is empty); with appender 1's page `Recovering` (slot 5 in the
+/// set — a recovery in flight, whose step-6 flush compacted the slot's
+/// leaves and journaled the flips into ring 0) the SAME record is legal.
+/// Nothing else moves: the manager's CONTENT record for slot 5 stays the
+/// violation (the door refuses the manager's commits into a leased slot,
+/// dead lessee or not), appender 1's own interior record for slot 5 in ITS
+/// ring stays legal (its own-residue replay at a rejoin), appender 2's
+/// interior record for slot 5 in ITS ring stays the violation (a foreign
+/// ring is judged by the lease map alone, whatever the set says), and the
+/// manager's interior record for slot 6 (appender 1's other lease, NOT in
+/// the set) stays the violation.
+#[test]
+fn the_recovering_exemption_admits_the_managers_structure_alone_and_only_for_the_named_slots() {
+    let s5 = guest_forest_slot(5);
+    let s6 = guest_forest_slot(6);
+    let mut leases: std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>> =
+        std::collections::BTreeMap::new();
+    leases.insert(1, [s5, s6].into_iter().collect());
+    let no_grant = |_: u32, _: u64| false;
+    let interior = |slot: u32| {
+        (
+            tag_for(KIND_INTERIOR, 1),
+            Record::put([slot.to_be_bytes().as_slice(), &[0xFF]].concat(), 0, vec![]),
+        )
+    };
+    let none: std::collections::BTreeSet<u32> = Default::default();
+    let recovering: std::collections::BTreeSet<u32> = [s5].into_iter().collect();
+
+    // The manager's flip of slot 5: a violation under a Live lessee, legal
+    // under a Recovering one.
+    let managers_flip = vec![(0u32, recovery(vec![(0, vec![interior(s5)])]))];
+    let v = detect_appender_violations(&managers_flip, &leases, &no_grant, &none);
+    assert!(
+        matches!(
+            v.as_slice(),
+            [AppenderViolation::Lease {
+                appender_id: 0,
+                slot: Some(s),
+                ..
+            }] if *s == s5
+        ),
+        "a live lessee's slot written into ring 0 is the Lease class: {v:?}"
+    );
+    assert!(
+        detect_appender_violations(&managers_flip, &leases, &no_grant, &recovering).is_empty(),
+        "the recovery in flight owns the slot's structure"
+    );
+    // The manager's CONTENT for slot 5: never exempt.
+    let managers_content = vec![(0u32, recovery(vec![(0, vec![content(s5, 3)])]))];
+    let v = detect_appender_violations(&managers_content, &leases, &no_grant, &recovering);
+    assert_eq!(
+        v.len(),
+        1,
+        "content into a leased slot stays the Lease class: {v:?}"
+    );
+    // Slot 6 (the lessee's other lease, not recovering): never exempt.
+    let managers_other_flip = vec![(0u32, recovery(vec![(0, vec![interior(s6)])]))];
+    let v = detect_appender_violations(&managers_other_flip, &leases, &no_grant, &recovering);
+    assert_eq!(v.len(), 1, "only the NAMED slots are exempt: {v:?}");
+    // The lessee's own flip in ITS ring: legal either way (its rejoin's
+    // own-residue replay).
+    let lessees_flip = vec![(1u32, recovery(vec![(0, vec![interior(s5)])]))];
+    assert!(detect_appender_violations(&lessees_flip, &leases, &no_grant, &none).is_empty());
+    assert!(detect_appender_violations(&lessees_flip, &leases, &no_grant, &recovering).is_empty());
+    // A THIRD appender's flip of slot 5 in its ring: the violation either
+    // way — the exemption is the manager's, never a foreign writer's.
+    let strangers_flip = vec![(2u32, recovery(vec![(0, vec![interior(s5)])]))];
+    let v = detect_appender_violations(&strangers_flip, &leases, &no_grant, &recovering);
+    assert!(
+        matches!(
+            v.as_slice(),
+            [AppenderViolation::Lease { appender_id: 2, .. }]
+        ),
+        "{v:?}"
     );
 }
 

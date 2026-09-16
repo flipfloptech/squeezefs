@@ -2145,6 +2145,17 @@ enum TwoBackendsWindow {
     /// 26's shape): the dentry DELETE rides the lessee's ring, the
     /// child's destroy the creator's — ring 0, replayed by the recoverer.
     UnlinkOne,
+    /// `n` creates, with the lessee's rounds continued until the slot's
+    /// tree has an INTERIOR root (a leaf split under it) — Issue 31's
+    /// shape: the recovery's flush of a wide window compacts or splits a
+    /// leaf UNDER the root, and the parent's pointer flip is an interior
+    /// record the recoverer journals into ring 0 (a root-leaf compaction
+    /// alone is a root swap, which journals no pointer record). Whether
+    /// the fold overflows a leaf depends on where the lessee's own
+    /// threshold maintenance left each log at the kill (the dentry keys
+    /// hash across the leaves) — the row asserts the premise and retries
+    /// the fixture, bounded, when a run's flush appended without an SMO.
+    CreatesUnderInterior(usize),
 }
 
 async fn two_backends_with(dir: &std::path::Path, window: TwoBackendsWindow) -> TwoBackends {
@@ -2198,14 +2209,23 @@ async fn two_backends_with(dir: &std::path::Path, window: TwoBackendsWindow) -> 
     };
     let image1 = capture_region_image(&uris[0], &vol, 1).await;
     let stale_root = page_root(&image1);
-    // ---- A's later work: until the flush pass moves the root.
+    // ---- A's later work: until the flush pass moves the root (or, for
+    // `CreatesUnderInterior`, until the root is an interior node).
+    let want_interior = matches!(window, TwoBackendsWindow::CreatesUnderInterior(_));
     let mut newer_root = stale_root;
-    for _round in 0..40 {
+    let mut root_level = 0u8;
+    for _round in 0..(if want_interior { 60 } else { 40 }) {
         storm(&routed, d, 120, &mut files, &mut n).await;
         vol.checkpoint_now().await.unwrap();
         let img = capture_region_image(&uris[0], &vol, 1).await;
         newer_root = page_root(&img);
-        if newer_root.seq > stale_root.seq {
+        root_level = vol
+            .node_cache()
+            .get(newer_root.addr)
+            .await
+            .expect("the page's root node loads")
+            .level();
+        if newer_root.seq > stale_root.seq && (!want_interior || root_level >= 1) {
             break;
         }
     }
@@ -2213,9 +2233,18 @@ async fn two_backends_with(dir: &std::path::Path, window: TwoBackendsWindow) -> 
         newer_root.seq > stale_root.seq,
         "the fixture's premise: the lessee's checkpoints moved the slot's root"
     );
+    if want_interior {
+        assert!(
+            root_level >= 1,
+            "the fixture's premise: the slot's root is an interior node (level {root_level})"
+        );
+    }
     // The window past the last page write.
     match window {
         TwoBackendsWindow::Creates(count) => storm(&routed, d, count, &mut files, &mut n).await,
+        TwoBackendsWindow::CreatesUnderInterior(count) => {
+            storm(&routed, d, count, &mut files, &mut n).await
+        }
         TwoBackendsWindow::Empty => {}
         TwoBackendsWindow::UnlinkOne => {
             // The oldest file (in the lessee's FIRST image): its dentry's
@@ -2282,6 +2311,8 @@ async fn two_backends_with(dir: &std::path::Path, window: TwoBackendsWindow) -> 
 fn two_backends_teardown() {
     std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
     recovery::TEST_RECOVERY_FAIL_AT_STEP.store(0, Ordering::SeqCst);
+    squeezefs::meta_backend::kv::checkpoint::TEST_CHECKPOINT_HALT_BEFORE_LEDGER
+        .store(false, Ordering::SeqCst);
     recovery::TEST_RECOVERY_HOLD_BEFORE_TREE0.store(false, Ordering::SeqCst);
     recovery::TEST_RECOVERY_HOLD_BEFORE_REREAD.store(false, Ordering::SeqCst);
     recovery::TEST_RECOVERY_HOLD_RELEASE.notify_waiters();
@@ -2709,6 +2740,168 @@ async fn a_failed_recovery_with_no_re_run_leaves_no_floor_on_ring_0() {
     let TwoBackends {
         uris, routed, vol, ..
     } = fx;
+    drop(vol);
+    drop(routed);
+    fsck_clean(&uris).await;
+    two_backends_teardown();
+}
+
+/// **Review round 4, Issue 31 — the recoverer DIES inside its step-6 flush,
+/// between a cycle's SMO records and that cycle's ledger record.** In the
+/// two-backend shape the dead lessee's slot is no region of the
+/// recoverer's set, so the flush's compactions journal their interior
+/// records into RING 0 (the manager's) — a leaf compaction UNDER the slot
+/// tree's interior root, whose parent pointer flip is the record (a
+/// root-leaf compaction alone is a root swap, which journals none; the
+/// fixture's `CreatesUnderInterior` rounds give the tree an interior
+/// root first). The recoverer dies before the cycle's covering ledger
+/// record (`TEST_CHECKPOINT_HALT_BEFORE_LEDGER`, then B dropped without a
+/// shutdown): tree 0 still `Leased { dead }`, the page `Recovering`, the
+/// flips UNCOVERED in ring 0. Before the fix the NEXT open's
+/// `detect_appender_violations` read them as `Lease` violations and
+/// REFUSED the mount — on every later open, with no verb to clear ring 0.
+/// Now: the open judges the manager's interior records for a slot whose
+/// tree-0 lessee's page is `Recovering` as the recovery's own
+/// (`meta_kv_replay_lease_violations` flat), installs the page's root
+/// before the replayed frees are judged, STASHES those records instead
+/// of folding them into the foreign tree (witnessed), and the mount
+/// path's C15 arm re-runs the recovery: the stash applies onto the
+/// installed root, the dead window folds, every acked record resolves,
+/// tree 0 `Unleased`, the page `Recovered`, fsck clean. (A death AFTER
+/// step 6 completes leaves NO such record: the flush loops until every
+/// dirty node is covered, and the slot's floor — the manager holds no
+/// lease on it — never clamps ring 0.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recoverer_dying_after_its_flush_leaves_a_mount_the_next_open_admits() {
+    use squeezefs::meta_backend::kv::checkpoint::TEST_CHECKPOINT_HALT_BEFORE_LEDGER;
+    use squeezefs::meta_backend::kv::{
+        META_KV_NODE_COMPACTIONS, META_KV_NODE_SPLITS, META_KV_REPLAY_LEASE_VIOLATIONS,
+    };
+    let _g = SEAM.lock().await;
+    let smos = || {
+        META_KV_NODE_COMPACTIONS.load(Ordering::Relaxed)
+            + META_KV_NODE_SPLITS.load(Ordering::Relaxed)
+    };
+    // The shape's premise — an SMO in the recovery's first flush cycle —
+    // holds on most fixtures (the fold of a 600-record window over leaves
+    // the lessee's own maintenance left at random fills); a fixture whose
+    // flush only appended is torn down and rebuilt, bounded, loud on the
+    // bound (the Issue-1 pin's own pattern).
+    let mut attempts = 0;
+    let (_dir, fx) = loop {
+        attempts += 1;
+        assert!(
+            attempts <= 6,
+            "the premise never held in {} fixtures: the recovery's first flush cycle compacted \
+             or split nothing under the slot tree's root",
+            attempts - 1
+        );
+        let dir = tempfile::tempdir().unwrap();
+        reset_process_state();
+        let fx = two_backends_with(dir.path(), TwoBackendsWindow::CreatesUnderInterior(600)).await;
+        fx.vol.record_death_with_key(fx.x, 1, 0).await.unwrap();
+        let smos0 = smos();
+        // The recoverer's first step-6 cycle: the flush pass journals its
+        // SMOs, then the cycle halts before its ledger record — the
+        // recovery fails (the rollback runs), the SMO records stay
+        // UNCOVERED in ring 0.
+        TEST_CHECKPOINT_HALT_BEFORE_LEDGER.store(true, Ordering::SeqCst);
+        let rep = recover_dead_appenders_set(&fx.routed).await.unwrap();
+        TEST_CHECKPOINT_HALT_BEFORE_LEDGER.store(false, Ordering::SeqCst);
+        assert_eq!(rep.per_volume[0].1.deferred, 1, "{rep:?}");
+        if smos() > smos0 {
+            break (dir, fx);
+        }
+        shutdown(&fx.routed).await;
+        drop(fx);
+        two_backends_teardown();
+    };
+    // ---- The recoverer dies: no shutdown, no leave.
+    let TwoBackends {
+        uris,
+        routed,
+        vol,
+        slot,
+        dir: d,
+        x,
+        files,
+        newer_root: fx_newer_root,
+        ..
+    } = fx;
+    drop(vol);
+    drop(routed);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    let lease_violations0 = META_KV_REPLAY_LEASE_VIOLATIONS.load(Ordering::Relaxed);
+    // ---- The next open ADMITS ring 0's window (RED before: refused with
+    // `appender partition violated … lease`).
+    let routed = open_under_retry(&uris, &Knobs::armed())
+        .await
+        .expect("the next open admits the dead recoverer's structure for a slot mid-recovery");
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(
+        META_KV_REPLAY_LEASE_VIOLATIONS.load(Ordering::Relaxed),
+        lease_violations0,
+        "meta_kv_replay_lease_violations flat"
+    );
+    assert_eq!(
+        page_state(&uris[0], &vol, 1).await,
+        Some(AppenderState::Recovering),
+        "the durable state is the re-run's"
+    );
+    assert!(
+        matches!(
+            tree0_state(&vol, slot).await,
+            Some(SlotState::Leased { appender_id: 1, .. })
+        ),
+        "tree 0 still leases the slot to the dead appender until the re-run"
+    );
+    let stashed = vol.test_recovering_structure_len(slot);
+    assert!(
+        stashed >= 1,
+        "the premise, witnessed: ring 0's window carried the dead recoverer's interior \
+         record(s) for the slot — stashed for the re-run, not folded into the foreign tree"
+    );
+    assert_eq!(
+        vol.slot_tree(slot).map(|t| t.root()),
+        Some(fx_newer_root),
+        "the page's root is installed at the open (before the replayed frees are judged)"
+    );
+    // ---- The mount path's C15 arm re-runs the recovery from the durable
+    // state (the stash applies first, then the dead window).
+    let rep = mount_path_custody_gate(&routed).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    assert_eq!(
+        vol.test_recovering_structure_len(slot),
+        0,
+        "the stash was consumed by the re-run"
+    );
+    assert_all_resolve(&routed, d, &files).await;
+    match tree0_state(&vol, slot).await {
+        Some(SlotState::Unleased { .. }) => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        page_state(&uris[0], &vol, 1).await,
+        Some(AppenderState::Recovered)
+    );
+    assert!(vol.recovered_record(&x, 0).await.unwrap().is_some());
+    assert_eq!(
+        META_KV_REPLAY_LEASE_VIOLATIONS.load(Ordering::Relaxed),
+        lease_violations0
+    );
+    // The slot is leasable again: a create under the directory.
+    routed
+        .create(
+            d,
+            "after-the-second-recoverer",
+            libc::S_IFREG | 0o644,
+            1000,
+            1000,
+        )
+        .await
+        .expect("a create under the recovered directory");
+    shutdown(&routed).await;
     drop(vol);
     drop(routed);
     fsck_clean(&uris).await;

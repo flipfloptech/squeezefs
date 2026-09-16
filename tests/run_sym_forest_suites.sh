@@ -78,6 +78,12 @@
 # postures (`SQUEEZEFS_SYMMETRIC_META=0` on a stamped volume, a flat
 # volume, `SQUEEZEFS_SYM_DIR_STRIPES=1`) run on both legs with every
 # Striping gauge asserted unmoved.
+# `sym_custody_tests` (PR 9 — custody by the slot holder + PR 7's owed
+# no-re-Put law at the backend-side translators) rides both legs the PR 6
+# way: its two-holder fixtures stamp under the seam themselves and arm
+# the plane, its translator pins run on a FLAT kvmap volume and a bare
+# resolver (layout-blind), and its unarmed/flat pin (no slot-custody arm,
+# every acquire the local arbiter, the two PR-9 gauges flat) runs on both.
 #
 # WALL TIME IS A ROW (review round 4, Issue 26): each suite runs under
 # its own timer per leg, and the summary prints `flat`, `stamped` and the
@@ -137,6 +143,7 @@ DEFAULT_SUITES=(
   sym_block_grant_tests
   sym_coherence_tests
   sym_dir_stripe_tests
+  sym_custody_tests
 )
 read -r -a SUITES <<<"${SQZ_SYM_SUITES:-${DEFAULT_SUITES[*]}}"
 RATIO_NOTE="${SQZ_SYM_RATIO_NOTE:-2.0}"

@@ -1168,3 +1168,100 @@ async fn the_mount_arm_needs_a_cluster_secret_and_disarms_clean() {
     assert!(!data_grant::slot_custody_armed());
     rig.shutdown().await;
 }
+
+/// **The scoping instrument** (`#[ignore]`d — PR 6's precedent; the note's
+/// §6 row, dev box = SCOPING): the wall of N foreign-file acquires with the
+/// token CARRIED (one round trip: custody + records) against N plain S9
+/// acquires on the custody wire PLUS N separate token grants (the two
+/// round trips the carriage folds into one), and the handover-with-custody
+/// cost: the deferral's refusal, then the release + the handover itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "scoping instrument — run once for the evidence note"]
+async fn scoping_row_grant_rtt_with_and_without_the_carried_token() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let (uris, foreign) = two_holder_volume(dir.path(), data.path()).await;
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(TWO_HOLDERS)).await;
+    let venue = Venue::stand_up(&rig, &[1]).await;
+    let (_v, local) = rig.routed.route_ino(foreign);
+    const N: u32 = 200;
+
+    // Carried: custody + records in one round trip (the first dial JOINs).
+    let t0 = std::time::Instant::now();
+    for _ in 0..N {
+        let lease = rig
+            .router
+            .dlm
+            .acquire_lock(&lock_path(foreign), None, Duration::from_secs(2))
+            .await
+            .expect("carried acquire");
+        drop(lease);
+        venue
+            .arm
+            .holder_client(&venue.endpoint)
+            .await
+            .unwrap()
+            .drain_releases()
+            .await;
+    }
+    let carried = t0.elapsed();
+    let client = venue.arm.holder_client(&venue.endpoint).await.unwrap();
+    let tokens = venue.arm.token_plane(&venue.endpoint, 0).await.unwrap();
+    wait_until("channel fresh", || tokens.stats().channel_fresh).await;
+
+    // Uncarried: the plain S9 acquire on the custody wire, then the token
+    // as its own Grant (the reader plane's fetch after a drop).
+    let t1 = std::time::Instant::now();
+    for _ in 0..N {
+        let lease = client
+            .acquire(
+                foreign,
+                None,
+                squeezefs::dlm::LockMode::Exclusive,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("plain acquire");
+        tokens.test_drop_entry(local);
+        let _ = tokens
+            .serve(local, TokenWants::default())
+            .await
+            .expect("token grant")
+            .expect("exists");
+        drop(lease);
+        client.drain_releases().await;
+    }
+    let uncarried = t1.elapsed();
+
+    // Handover with custody: the deferral, the release, the handover.
+    let vol = Arc::clone(&rig.routed.volumes[0]);
+    let lease = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(foreign), None, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let t2 = std::time::Instant::now();
+    assert!(vol.release_slot_handover(1, SLOT_B).await.is_err());
+    let deferral = t2.elapsed();
+    drop(lease);
+    client.drain_releases().await;
+    let t3 = std::time::Instant::now();
+    vol.release_slot_handover(1, SLOT_B).await.unwrap();
+    let handover = t3.elapsed();
+    eprintln!(
+        "SCOPING carried {N} acquires: {:?} ({:.1} µs/op); uncarried (acquire + token grant): \
+         {:?} ({:.1} µs/op); handover deferral {:?}; release+handover {:?}; custody phases {}",
+        carried,
+        carried.as_micros() as f64 / f64::from(N),
+        uncarried,
+        uncarried.as_micros() as f64 / f64::from(N),
+        deferral,
+        handover,
+        data_grant::phase_json()
+    );
+    venue.tear_down().await;
+    rig.shutdown().await;
+}

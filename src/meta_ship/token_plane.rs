@@ -2442,6 +2442,16 @@ impl TokenReaderPlane {
         }
     }
 
+    /// Test seam: forget `object`'s cached entry without a release or a
+    /// recall (the holder keeps the grant), so the next serve re-fetches
+    /// — the scoping instrument's way of pricing one token grant.
+    pub fn test_drop_entry(&self, object: u64) {
+        if let Some((_, e)) = self.cache.remove_sync(&object) {
+            e.state.store(ENTRY_REVOKED, Ordering::Release);
+            self.credit(e.bytes);
+        }
+    }
+
     /// Test seam — DEATH: the channel task exits at its next round
     /// without acking what it was handed and nothing is released; the
     /// holder's lease arm (the membership owner's eviction) is what

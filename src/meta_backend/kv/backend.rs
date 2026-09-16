@@ -10848,6 +10848,24 @@ impl KvMetaBackend {
             for (idx, entry) in &ref_takes {
                 resolve(entry, *idx, 0, true);
             }
+            // Symmetric PR 9 (PR 7's owed no-re-Put law at this translator):
+            // a run start re-adopted as a point at the SAME block is one
+            // reference described twice — its pair stages nothing (a re-Put
+            // would strip the record's durable SHARED bit, C16) and its
+            // block leaves the free stream the record still holds it against.
+            let before = out.len();
+            super::block_refs::cancel_same_reference_pairs(&mut out);
+            if out.len() != before {
+                let live: std::collections::BTreeSet<super::block_refs::BlockRef> =
+                    out.iter().filter(|o| !o.take).map(|o| o.reference).collect();
+                let mut i = 0usize;
+                released_keys.retain(|_| {
+                    let keep = live.contains(&released[i]);
+                    i += 1;
+                    keep
+                });
+                released.retain(|r| live.contains(r));
+            }
             out.extend(
                 block_refs
                     .iter()
@@ -14703,10 +14721,11 @@ pub type MergeOutcome = (bool, u64, RecomputedReleases);
 /// frame in the transaction, plus the frame's RAM-only lifetimes (finding
 /// 15 — see `recompute_refs_against_map`), which are staged NOWHERE (no
 /// durable record ever existed) and travel only into the recompute's
-/// post-commit free set.
-struct RecomputedFrame {
-    ops: Vec<super::block_refs::BlockRefOp>,
-    ram_only_releases: Vec<super::block_refs::BlockRef>,
+/// post-commit free set. Public with its translator for the contracts'
+/// probe of the owner-side translation (symmetric PR 9).
+pub struct RecomputedFrame {
+    pub ops: Vec<super::block_refs::BlockRefOp>,
+    pub ram_only_releases: Vec<super::block_refs::BlockRef>,
 }
 
 /// One crossing/migration train's accounting
@@ -21677,7 +21696,7 @@ impl KvMetaBackend {
     /// re-take of a durable block (whose release the diff already carries)
     /// out of the set; it resolves the head's keys only when a candidate
     /// exists (the steady-state frame has none).
-    fn recompute_refs_against_map(
+    pub fn recompute_refs_against_map(
         head: &std::collections::HashMap<u32, String>,
         entries: &[(u32, String)],
         ino: Ino,
@@ -21718,6 +21737,12 @@ impl KvMetaBackend {
             }
             view.insert(*idx, key);
         }
+        // Symmetric PR 9 (PR 7's owed no-re-Put law at this translator): a
+        // displaced and an adopted key resolving to ONE reference (a
+        // decorated clip) stage nothing — a re-Put would strip the record's
+        // durable SHARED bit (C16). The composed view still names the
+        // block, so the RAM-only walk below is unaffected.
+        super::block_refs::cancel_same_reference_pairs(&mut out);
         let mut ram_only_releases = super::block_refs::frame_ram_only_candidates(caller, &out);
         if !ram_only_releases.is_empty() {
             // Every block the head or the composed view names, resolved

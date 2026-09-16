@@ -3789,7 +3789,8 @@ impl WriteCustodyClient {
     }
 
     /// The recall's bound as the WRITER derives it from its lease at the
-    /// holder — two renewal beats ([`handover_recall_bound`]'s twin).
+    /// holder — two renewal beats ([`handover_recall_bound_for`]; the
+    /// holder's own read is [`handover_recall_bound_ms`]).
     pub fn handover_recall_bound(&self) -> Duration {
         handover_recall_bound_for(Duration::from_millis(self.lease.load().renew_interval_ms()))
     }

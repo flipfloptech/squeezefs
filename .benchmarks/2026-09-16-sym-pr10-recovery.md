@@ -284,3 +284,18 @@ as another daemon's would be. Every round-2 pin runs on it.
 a ledger record (and, once `published` was seeded from tree 0, re-published
 a leased slot's root as `Unleased { g: 0 }`) over a volume it holds no lock
 on. Every non-writer door writes nothing at teardown.
+
+**Round 2 verification (the final tree, `CARGO_INCREMENTAL=0`, the shared
+laptop)**: fmt / both clippy configs / rustdoc `-D warnings` / the fuzz
+workspace's check+fmt / loom 113 models — clean; `sym_crash_matrix_tests`
+stamped ×10 + flat ×3 from zero (24 contracts) — green; `corpse_sweep_tests`
+stamped ×10 — 10/10 (round 1: 3/4, the routed Issue 1); the nine named
+suites both layouts + `docs_parity` / `env_knob_convention` /
+`derivation_sweep` / `decoder_property` — green; the 34-suite matrix
+flat→stamped AND stamped→flat — PASS; the live-FUSE trio both ways under
+`SQUEEZEFS_TEST_REQUIRE_MOUNT=1` — green, no skip; fidelity `quick` 43/0 +
+`full` 115/0 (root, nvmet); **`sym-crash` ×10 from zero on the tcp devsub
+WITH the acked-writes oracle — 10/10, 426 fsynced files across the ten
+kills, every one present with its content on the successor**, every
+per-round must-stay-0 gauge 0 (incl. `dead_member_write_deferrals`,
+`data_alloc_bitmap_drift`).

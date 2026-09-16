@@ -1519,15 +1519,26 @@ pub struct MembershipOwner {
     next_join_seq: AtomicU64,
     grace: parking_lot::Mutex<Option<Grace>>,
     /// The registrant key of every member that DEPARTED (evicted or left),
-    /// keyed by id — what the `RecordDeath` key-word screen judges a
-    /// peer's word against once the member is no longer in the census
-    /// (PR 10, review round 1, Issue 7). Bounded: the newest
-    /// `DEPARTED_KEYS_MAX` departures.
-    departed_keys: parking_lot::Mutex<std::collections::VecDeque<(String, u64)>>,
+    /// keyed by id with the departure's instant — what the `RecordDeath`
+    /// key-word screen judges a peer's word against once the member is no
+    /// longer in the census (PR 10, review round 1, Issue 7). Bounded by
+    /// AGE, never a count (review round 2, Issue 27): a departure's key is
+    /// judged only while its death record can still stand —
+    /// [`crate::meta_backend::kv::alloc_lease::death_record_retire_age_ms`]
+    /// (`2 × T_owner`, the poll's sweep age) — and every entry was a
+    /// census member whose state this owner already held, so the memo
+    /// never outgrows the census the owner served across one such window.
+    departed_keys: parking_lot::Mutex<std::collections::VecDeque<DepartedKey>>,
 }
 
-/// The departed-key memo's bound (departures a screen can still judge).
-const DEPARTED_KEYS_MAX: usize = 4096;
+/// One departed member's registrant key with the instant it departed
+/// (the owner's clock).
+#[derive(Debug, Clone)]
+struct DepartedKey {
+    id: String,
+    pr_key: u64,
+    departed_ms: u64,
+}
 
 impl std::fmt::Debug for MembershipOwner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1600,12 +1611,22 @@ impl MembershipOwner {
         if let Some(k) = self.members.read_sync(id, |_, st| st.pr_key) {
             return Some(k);
         }
+        let now = self.clock.now_ms();
+        let retention = self.departed_key_retention_ms();
         self.departed_keys
             .lock()
             .iter()
             .rev()
-            .find(|(m, _)| m == id)
-            .map(|(_, k)| *k)
+            .find(|d| d.id == id && now.saturating_sub(d.departed_ms) <= retention)
+            .map(|d| d.pr_key)
+    }
+
+    /// The departed-key memo's retention: the death record's retirement
+    /// age under this owner's lease TTL (the ONE age law).
+    fn departed_key_retention_ms(&self) -> u64 {
+        crate::meta_backend::kv::alloc_lease::death_record_retire_age_ms(
+            self.clocks.t_owner.as_millis() as u64,
+        )
     }
 
     /// Every LIVE member's non-zero registrant key.
@@ -1622,10 +1643,21 @@ impl MembershipOwner {
     }
 
     fn remember_departed_key(&self, id: &str, pr_key: u64) {
+        let now = self.clock.now_ms();
+        let retention = self.departed_key_retention_ms();
         let mut q = self.departed_keys.lock();
-        q.retain(|(m, _)| m != id);
-        q.push_back((id.to_string(), pr_key));
-        while q.len() > DEPARTED_KEYS_MAX {
+        q.retain(|d| d.id != id);
+        q.push_back(DepartedKey {
+            id: id.to_string(),
+            pr_key,
+            departed_ms: now,
+        });
+        // Departures are pushed in clock order, so the expired prefix is
+        // the front.
+        while q
+            .front()
+            .is_some_and(|d| now.saturating_sub(d.departed_ms) > retention)
+        {
             q.pop_front();
         }
     }

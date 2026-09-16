@@ -16648,24 +16648,25 @@ impl KvMetaBackend {
                     if slot == super::record::NATIVE_FOREST_SLOT {
                         continue; // the ledger's, mirrored
                     }
+                    // Both arms raise the node-seq handle to the page's
+                    // root seq inside the ONE install (review round 2,
+                    // Issue 24 — the recovery driver shares them).
                     match forest.tree(slot) {
                         Some(t) => {
                             if e.root.seq > t.root().seq {
                                 cache.drop_slot_nodes(slot)?;
-                                t.install_recovered_root(e.root, floor);
-                                seq.fetch_max(e.root.seq, Ordering::AcqRel);
+                                t.install_recovered_root(e.root, floor).await?;
                             }
                         }
                         None => {
-                            let tree = KvTree::open_slot_tree(
+                            let tree = KvTree::open_unpublished_slot_tree(
                                 Arc::clone(cache),
                                 slot,
                                 e.root,
                                 Arc::clone(seq),
+                                floor,
                             )
                             .await?;
-                            tree.set_root_floor(floor);
-                            seq.fetch_max(e.root.seq, Ordering::AcqRel);
                             forest.adopt_guest_unpublished(slot, Arc::new(tree));
                         }
                     }

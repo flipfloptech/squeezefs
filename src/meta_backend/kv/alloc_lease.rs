@@ -777,11 +777,29 @@ pub fn defer_death_record(pending: PendingDeath) {
 }
 
 /// The deaths still parked (the contracts' witness).
-pub fn pending_deaths() -> Vec<PendingDeath> {
+pub fn test_pending_deaths() -> Vec<PendingDeath> {
     PENDING_DEATHS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
+}
+
+/// How long a death record stands before the poll's sweep may retire it,
+/// in lease TTLs: TWO — one `T_owner` for every manager's poll to have
+/// projected the record and acted (propagation ≈ poll + ceiling ≪
+/// `T_owner`, and a manager that cannot reach volume 0 for `T_owner`
+/// releases its role — the vol-0 rule), one more for the successor's
+/// grace window (`= T_owner` by derivation) in which a parked member
+/// reclaims — a record retired inside it could race a reclaimer's re-join.
+/// The ONE age law: the sweep reads it, and the S6 owner's departed-key
+/// memo keeps a departure's registrant key exactly this long (the
+/// `RecordDeath` key-word screen judges a peer's word against it only
+/// while the record can still stand). Tie-tested.
+pub const DEATH_RECORD_RETIRE_TTLS: u64 = 2;
+
+/// [`DEATH_RECORD_RETIRE_TTLS`] × the owner's lease TTL, ms.
+pub fn death_record_retire_age_ms(t_owner_ms: u64) -> u64 {
+    DEATH_RECORD_RETIRE_TTLS.saturating_mul(t_owner_ms)
 }
 
 /// Count one act on a death record stamped `ts_ms` (PR 10's driver's
@@ -1578,10 +1596,11 @@ impl KvMetaBackend {
         Ok(any)
     }
 
-    /// **The poll's retirement sweep**: a death record older than `2 ×
-    /// T_owner` whose regions every volume of the set recovered (or never
-    /// held — `regions_pending == 0`) and that no allocation lease names as
-    /// a holder is retired. Answers the records retired.
+    /// **The poll's retirement sweep**: a death record older than
+    /// [`death_record_retire_age_ms`] whose regions every volume of the
+    /// set recovered (or never held — `regions_pending == 0`) and that no
+    /// allocation lease names as a holder is retired. Answers the records
+    /// retired.
     pub async fn sweep_retirable_death_records(
         &self,
         now_ms: u64,
@@ -1591,7 +1610,7 @@ impl KvMetaBackend {
         let mut retired = 0u64;
         let leases = self.alloc_lease_records().await?;
         for (member, rec) in self.dead_member_records().await? {
-            if now_ms.saturating_sub(rec.ts_ms) < 2 * t_owner_ms {
+            if now_ms.saturating_sub(rec.ts_ms) < death_record_retire_age_ms(t_owner_ms) {
                 continue;
             }
             if regions_pending(&member) {

@@ -1960,19 +1960,33 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         // not frozen ⇒ no verdict (the existing incomplete-pass law), not
         // a verdict taken over a set that may still be growing names.
         let frozen = !opts.multi_owner || peer_volumes_are_assigned(ctx, opts).await;
-        // Symmetric PR 10 (design §5.8.5 / §5.9): a FOREIGN appender's
-        // ring window this open did not replay (a live peer's acked
-        // records ahead of its checkpoint, or a dead appender's window
-        // before its recovery) holds dentries no tree names yet — a
-        // cross-owner create's name lives in the parent's holder's ring
-        // while the child's record is the creator's. The referenced set
-        // is INCOMPLETE over the INOS such a window names, so the plane
-        // SCOPES those inos out (`fsck_inode_plane_window_scoped`) and
-        // judges every other — never skipping a live fleet whole (review
-        // round 1, Issue 12): each foreign ring is read ONCE per census,
-        // its window's inode keys and dentry targets are the exclusion.
-        // `None` = a ring could not be read: unknown = pending, the whole
-        // plane takes no verdict this run.
+        // The inode plane's TWO completeness laws on a forest, composed
+        // (the verdict gate the PR 7b / PR 10 rebase names):
+        //
+        // 1. A NON-WRITER (a probe, a `-o ro` reader) with any `Live`
+        //    appender page records NO verdict — `build_referenced_inos`
+        //    answered `None` above (symmetric PR 7b, review round 1,
+        //    Issue 21b). A blanket, and the right one there: the fixed
+        //    ring's records a probe's replay skipped are its OWN region's
+        //    window, which the per-ino scoping below treats as replayed.
+        //
+        // 2. The WRITER's online plane (symmetric PR 10, design §5.8.5 /
+        //    §5.9): a FOREIGN appender's ring window this open did not
+        //    replay (a live peer's acked records ahead of its checkpoint,
+        //    or a dead appender's window before its recovery) holds
+        //    dentries no tree names yet — a cross-owner create's name
+        //    lives in the parent's holder's ring while the child's record
+        //    is the creator's; a cross-owner unlink's DELETE removes a
+        //    name whose child's `nlink` moved in the child's slot. The
+        //    referenced set is INCOMPLETE over the INOS such a window
+        //    names, so the plane SCOPES those inos out
+        //    (`fsck_inode_plane_window_scoped`) and judges every other —
+        //    never skipping a live fleet whole (review round 1, Issue 12):
+        //    each foreign ring is read ONCE per census, its window's inode
+        //    keys and dentry targets (a DELETE's resolved in the tree —
+        //    review round 2, Issue 26) are the exclusion. `None` = a ring
+        //    could not be read: unknown = pending, the whole plane takes no
+        //    verdict this run.
         let window_inos = foreign_window_inos(ctx).await;
         if let Some(w) = window_inos.as_ref().filter(|w| !w.is_empty()) {
             log::warn!(

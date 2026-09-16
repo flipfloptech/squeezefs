@@ -2830,7 +2830,14 @@ s7_kill_body() { # [sym]
         # ledger of names the client created and FSYNCED before the kill —
         # every one MUST resolve on the successor with its content intact.
         # Runs beside the dd load until the kill so the acked set straddles
-        # the kill phase.
+        # the kill phase. "Acked" = a per-file `fsync(2)` RETURNED (`dd
+        # conv=fsync` — the daemon's fsync ladder ran for THAT file: the
+        # journal barrier included), never `sync -f`: that is `syncfs(2)`,
+        # which the FUSE fork does not serve (no `FUSE_SYNCFS`), so the
+        # kernel pushes writeback and returns success with no daemon
+        # barrier behind it — a word for "create acked + writeback pushed",
+        # exact for a process kill and an overclaim for power loss (review
+        # round 2, Issue 27).
         local ack_dir ack_ledger ack_pid
         ack_dir="$w_mnt/acked-r$round"
         ack_ledger="$rowdir/acked-r$round.ledger"
@@ -2840,7 +2847,8 @@ s7_kill_body() { # [sym]
             i=0
             while :; do
                 f="$ack_dir/f$(printf '%06d' "$i")"
-                if printf 'r%s:%s\n' "$round" "$i" >"$f" 2>/dev/null && sync -f "$f" 2>/dev/null; then
+                if printf 'r%s:%s\n' "$round" "$i" |
+                    dd of="$f" conv=fsync status=none 2>/dev/null; then
                     echo "$f" >>"$ack_ledger"
                 fi
                 i=$((i + 1))

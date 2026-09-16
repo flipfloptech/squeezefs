@@ -415,7 +415,7 @@ impl HoldersVenue {
 /// **The two-backend fixture's device image of one appender region**
 /// (PR 10, review round 2 — the reviewer's structural finding): every
 /// byte range a region owns on its volume (`KvMetaBackend::
-/// region_device_ranges` — its ring segments, its two directory page
+/// test_region_device_ranges` — its ring segments, its two directory page
 /// slots, its grant's image extents) captured at one instant, plus the
 /// page as decoded then. A LESSEE's later activity — its checkpoints
 /// (page → newer root, flushed leaves in fresh grant extents, a moved
@@ -450,7 +450,7 @@ pub async fn capture_region_image(
         .expect("the region's page");
     let mut f = std::fs::File::open(path).expect("open the volume file");
     let mut ranges = Vec::new();
-    for (off, len) in vol.region_device_ranges(id).await.expect("ranges") {
+    for (off, len) in vol.test_region_device_ranges(id).await.expect("ranges") {
         let mut buf = vec![0u8; len as usize];
         f.seek(SeekFrom::Start(off)).unwrap();
         f.read_exact(&mut buf).unwrap();

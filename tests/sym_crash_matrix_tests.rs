@@ -643,7 +643,7 @@ async fn the_owners_eviction_and_the_grace_deadline_write_the_ledger_never_a_rec
         Err(KvError::Rejected(m)) => assert!(m.contains("live member"), "{m}"),
         other => panic!("a LIVE member's key was admitted on a dead member: {other:?}"),
     }
-    match vol.screen_record_death(&ident(17).into(), vol.pr_key_pub()) {
+    match vol.screen_record_death(&ident(17).into(), vol.test_pr_key()) {
         Err(KvError::Rejected(_)) => {}
         other => panic!("this process's own key was admitted: {other:?}"),
     }
@@ -2129,6 +2129,25 @@ struct TwoBackends {
 ///
 /// The death record is the caller's — every pin below stands its own.
 async fn two_backends(dir: &std::path::Path) -> TwoBackends {
+    two_backends_with(dir, TwoBackendsWindow::Creates(15)).await
+}
+
+/// What the lessee writes into its ring AFTER its last page write — the
+/// window the recovery replays.
+#[derive(Clone, Copy)]
+enum TwoBackendsWindow {
+    /// `n` creates under the directory (the fixture's default shape).
+    Creates(usize),
+    /// Nothing: the lessee died right after its checkpoint (Issue 24's
+    /// shape — no window record raises the recoverer's handle).
+    Empty,
+    /// One UNLINK of a file the lessee's last checkpoint holds (Issue
+    /// 26's shape): the dentry DELETE rides the lessee's ring, the
+    /// child's destroy the creator's — ring 0, replayed by the recoverer.
+    UnlinkOne,
+}
+
+async fn two_backends_with(dir: &std::path::Path, window: TwoBackendsWindow) -> TwoBackends {
     // A previous contract's panic may have left a seam armed.
     recovery::TEST_RECOVERY_FAIL_AT_STEP.store(0, Ordering::SeqCst);
     recovery::TEST_RECOVERY_HOLD_BEFORE_TREE0.store(false, Ordering::SeqCst);
@@ -2195,7 +2214,20 @@ async fn two_backends(dir: &std::path::Path) -> TwoBackends {
         "the fixture's premise: the lessee's checkpoints moved the slot's root"
     );
     // The window past the last page write.
-    storm(&routed, d, 15, &mut files, &mut n).await;
+    match window {
+        TwoBackendsWindow::Creates(count) => storm(&routed, d, count, &mut files, &mut n).await,
+        TwoBackendsWindow::Empty => {}
+        TwoBackendsWindow::UnlinkOne => {
+            // The oldest file (in the lessee's FIRST image): its dentry's
+            // DELETE is the window's one record; its record is destroyed
+            // in ring 0 (the creator's — nlink 1 → 0).
+            let (name, _) = files.remove(0);
+            routed
+                .unlink(d, &name)
+                .await
+                .expect("unlink under the lessee's directory");
+        }
+    }
     // ---- The kill.
     venue.tear_down();
     drop(vol);
@@ -2394,6 +2426,482 @@ async fn a_recovery_that_fails_at_any_step_resumes_from_the_durable_state_withou
     drop(routed);
     fsck_clean(&uris).await;
     two_backends_teardown();
+}
+
+/// **The PR 7b seam (the rebase onto `6c80d70f`): a dead lessee's slot
+/// tree may hold a STRIPED directory — its `K + 2` reserved-name marker
+/// dentries (the map, the commit marker, the migration flag) and the
+/// stripe inos' own dentry sets — and the §5.9 steps are kind-blind.**
+/// The holder flips its directory into 4 stripes, names land in the
+/// stripes (cross-owner shipped steps into the stripes' holders — the
+/// declared region's ring and ring 0), the holder dies; the recovery
+/// replays every record by `(kind, key)` with no dentry-name inspection,
+/// records the tails, unleases the slot; after it the map reads with
+/// `k = 4`, every name resolves through the stripes, and fsck C17 —
+/// stripe consistency over the recovered map and stripes — is clean
+/// (`fsck_stripe_findings` 0) beside C9/C10/C14/C15.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_striped_directory_in_a_dead_lessees_slot_recovers_with_its_map_and_c17_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, shared) = seeded_volume(dir.path(), SLOT_A).await;
+    let x = foreign(41);
+    let routed = open_under_retry(&uris, &Knobs::armed().partition("1:4"))
+        .await
+        .expect("open with the partition");
+    let venue = HoldersVenue::stand_up(&routed, &[1]).await;
+    routed
+        .stripe_dir(shared, 4)
+        .await
+        .expect("the explicit flip on the declared holder's directory");
+    for _ in 0..800 {
+        let map = routed
+            .stripe_map(shared)
+            .await
+            .expect("read")
+            .expect("striped");
+        if !map.migrating {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let map = routed.stripe_map(shared).await.unwrap().unwrap();
+    assert_eq!(map.k(), 4);
+    assert!(!map.migrating, "the seed's names migrated");
+    let mut files = Vec::new();
+    for f in 0..24 {
+        let name = format!("s{f:03}");
+        let ino = routed
+            .create(shared, &name, libc::S_IFREG | 0o644, 1000, 1000)
+            .await
+            .expect("create into the striped directory")
+            .ino;
+        files.push((name, ino));
+    }
+    // The kill: no shutdown, no leave — the ring windows stay.
+    venue.tear_down();
+    drop(routed);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    restamp_page_identity(&uris[0], 1, x).await;
+
+    let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();
+    let vol = Arc::clone(&routed.volumes[0]);
+    vol.record_death_with_key(x, 3, 0).await.unwrap();
+    let rep = recover_dead_appenders_set(&routed).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    assert!(
+        rep.per_volume[0].1.recovered[0].entries >= 1,
+        "the dead window held the stripes' dentries: {rep:?}"
+    );
+    match tree0_state(&vol, SLOT_A).await {
+        Some(SlotState::Unleased { .. }) => {}
+        other => panic!("{other:?}"),
+    }
+    let map = routed
+        .stripe_map(shared)
+        .await
+        .expect("read")
+        .expect("the recovered directory is still striped");
+    assert_eq!(map.k(), 4, "the map's K + 2 markers replayed kind-blind");
+    assert_all_resolve(&routed, shared, &files).await;
+    for s in &map.stripes {
+        let rec = routed
+            .getattr(*s)
+            .await
+            .expect("every stripe's S_IFDIR record");
+        assert_eq!(rec.mode & libc::S_IFMT, libc::S_IFDIR);
+    }
+    // A create after the recovery routes into its stripe as before.
+    let after = routed
+        .create(shared, "after-recovery", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("create after the recovery")
+        .ino;
+    assert_eq!(
+        routed.lookup(shared, "after-recovery").await.unwrap().ino,
+        after
+    );
+    shutdown(&routed).await;
+    drop(vol);
+    drop(routed);
+    let mut opts = squeezefs::fsck::FsckOptions::offline();
+    opts.settle = std::time::Duration::from_millis(10);
+    let report = squeezefs::fsck::run_offline(&uris, &opts)
+        .await
+        .expect("offline fsck runs");
+    assert!(!report.has_findings(), "{:?}", report.findings);
+    assert_eq!(
+        report.counters.stripe_findings, 0,
+        "C17 clean after the recovery"
+    );
+    assert_eq!(report.counters.slot_custody_conflicts, 0);
+    assert_eq!(report.counters.unrecovered_appenders, 0);
+    assert_eq!(
+        report.counters.inode_plane_volumes_covered, 1,
+        "the inode plane recorded a verdict"
+    );
+}
+
+/// **Review round 2, Issue 23 — a FAILED recovery restores EVERY RAM word
+/// it changed, as one RAII.** Step 4 moves the lease table to `Releasing
+/// { dead }` AND clears the gate's `foreign` bit (the recovery's own flush
+/// is the manager's structure); before the fix the rollback restored the
+/// table alone, so after a failure at steps 5–7 the manager's structural
+/// passes read the dead lessee's tree as THEIRS to maintain until the
+/// re-run — the merge sweep / D4 arm / heap-full recovery could run an
+/// SMO on a tree tree 0 still leases to the dead appender, journaling
+/// ring-0 interior records the next open's `Lease` detector refuses (PR 4
+/// round 5's Issue-28 class). Now: after each failure the bit reads
+/// foreign again, the table says `Leased { dead }`, and one merge sweep
+/// SKIPS the tree (`merge_sweep_foreign_skips` moves, `META_KV_NODE_MERGES`
+/// does not, the must-stay-0 refusal gauge does not) — then the clean run
+/// completes and the tree is the manager's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_recovery_leaves_the_dead_lessees_tree_foreign_to_the_managers_sweep() {
+    use squeezefs::meta_backend::kv::{META_KV_LEAF_LEASE_REFUSALS, META_KV_NODE_MERGES};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let fx = two_backends(dir.path()).await;
+    fx.vol.record_death_with_key(fx.x, 1, 0).await.unwrap();
+    let plane = fx.vol.slot_leases().unwrap();
+    assert!(
+        plane.gate.is_foreign(fx.slot),
+        "the premise: the dead lessee's slot is FOREIGN to the recoverer at its arm"
+    );
+    let refusals0 = META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed);
+    for step in [5u32, 6, 7] {
+        recovery::TEST_RECOVERY_FAIL_AT_STEP.store(step, Ordering::SeqCst);
+        let rep = recover_dead_appenders_set(&fx.routed).await.unwrap();
+        assert_eq!(rep.per_volume[0].1.deferred, 1, "step {step}: {rep:?}");
+        assert!(
+            plane.gate.is_foreign(fx.slot),
+            "step {step}: the rollback restored the gate's foreign bit"
+        );
+        assert_eq!(
+            plane.table.resolve(fx.slot),
+            squeezefs::slot_lease_core::Resolved::Holder { holder: 1, g: fx.g },
+            "step {step}: the table says Leased {{ dead }}"
+        );
+        let skips0 = fx.vol.slot_lease_stats().unwrap().merge_sweep_foreign_skips;
+        let merges0 = META_KV_NODE_MERGES.load(Ordering::Relaxed);
+        let report = fx.vol.defrag_merge_sweep(None).await.unwrap();
+        assert!(
+            report.lap_complete,
+            "step {step}: a foreign tree never blocks the lap"
+        );
+        assert!(
+            fx.vol.slot_lease_stats().unwrap().merge_sweep_foreign_skips > skips0,
+            "step {step}: the sweep SKIPPED the dead lessee's tree (counted)"
+        );
+        assert_eq!(
+            META_KV_NODE_MERGES.load(Ordering::Relaxed),
+            merges0,
+            "step {step}: no SMO ran on a tree tree 0 leases to the dead appender"
+        );
+        assert_eq!(
+            META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed),
+            refusals0,
+            "step {step}: skipped, never refused"
+        );
+    }
+    let rep = recover_dead_appenders_set(&fx.routed).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    assert!(
+        !plane.gate.is_foreign(fx.slot),
+        "released: the tree is the manager's to maintain"
+    );
+    assert_all_resolve(&fx.routed, fx.dir, &fx.files).await;
+    shutdown(&fx.routed).await;
+    let TwoBackends {
+        uris, routed, vol, ..
+    } = fx;
+    drop(vol);
+    drop(routed);
+    fsck_clean(&uris).await;
+    two_backends_teardown();
+}
+
+/// **Review round 2, Issue 24 — the recovered root install raises the
+/// node-seq handle and verifies the pointer.** The fn-level pin of the
+/// ONE install both the own-residue open and the recovery driver run: a
+/// tree opened at a root of seq 7 with the handle at 0 takes a page root
+/// of seq 42 — the handle reads ≥ 42 after (RED before the fix: the
+/// driver's arm stored the root and left the handle where it was, so a
+/// lessee that died with an EMPTY window — no window record to raise it
+/// — left the recoverer minting below the dead tree's stamps, PR 11's
+/// residue-seq collision class); a pointer whose seq the extent does not
+/// hold is REFUSED (`open_inner`'s law — a torn page word never installs
+/// an unverified root) and changes nothing; the fresh-tree arm
+/// (`open_unpublished_slot_tree`) raises the same word and sets the floor.
+#[tokio::test]
+async fn the_recovered_root_install_raises_the_node_seq_handle_and_refuses_a_stale_pointer() {
+    use squeezefs::meta_backend::kv::node::{
+        write_node, NodeLayout, NodeWriteParams, MIN_NODE_SIZE,
+    };
+    use squeezefs::meta_backend::kv::node_cache::{
+        NodeCache, NodeCacheConfig, DEFAULT_WRITEBACK_DELTA_BYTES,
+    };
+    use squeezefs::meta_backend::kv::record::{guest_forest_slot, KIND_INTERIOR};
+    use squeezefs::meta_backend::kv::tree::{KvTree, RootPtr};
+    use std::sync::atomic::AtomicU64;
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let node_size = MIN_NODE_SIZE;
+    file.as_file().set_len(4 * node_size as u64).unwrap();
+    let cache = NodeCache::new(NodeCacheConfig {
+        path: file.path().to_path_buf(),
+        layout: NodeLayout::new(node_size).unwrap(),
+        heap_base: 0,
+        budget_bytes: 4 * node_size as u64,
+        writeback_delta_bytes: DEFAULT_WRITEBACK_DELTA_BYTES,
+    });
+    let slot = guest_forest_slot(3);
+    for (e, seq) in [(0u64, 7u64), (1, 42)] {
+        write_node(
+            cache.config().path.clone(),
+            &cache.config().layout,
+            &NodeWriteParams {
+                node_addr: cache.extent_addr(e),
+                node_seq: seq,
+                tree_id: KIND_INTERIOR,
+                level: 0,
+                min_key: b"",
+                max_key: &[0xff; 8],
+            },
+            &[],
+            0,
+        )
+        .await
+        .unwrap();
+    }
+    let stale = RootPtr {
+        addr: cache.extent_addr(0),
+        seq: 7,
+    };
+    let newer = RootPtr {
+        addr: cache.extent_addr(1),
+        seq: 42,
+    };
+    let handle = Arc::new(AtomicU64::new(0));
+    let tree = KvTree::open_slot_tree(Arc::clone(&cache), slot, stale, Arc::clone(&handle))
+        .await
+        .unwrap();
+    // A pointer the extent does not hold: refused, nothing installed.
+    let torn = RootPtr {
+        addr: newer.addr,
+        seq: 41,
+    };
+    assert!(
+        matches!(
+            tree.install_recovered_root(torn, 9).await,
+            Err(KvError::Corrupt(_))
+        ),
+        "a stale page word never installs an unverified root"
+    );
+    assert_eq!(tree.root(), stale);
+    assert_eq!(tree.root_floor(), 0);
+    // The verified install: the root, the floor AND the handle.
+    tree.install_recovered_root(newer, 9).await.unwrap();
+    assert_eq!(tree.root(), newer);
+    assert_eq!(tree.root_floor(), 9);
+    assert!(
+        handle.load(Ordering::Acquire) >= 42,
+        "the node-seq handle is raised to the installed root's seq (read {})",
+        handle.load(Ordering::Acquire)
+    );
+    // The fresh-tree arm: the same word, the same floor.
+    let handle2 = Arc::new(AtomicU64::new(0));
+    let fresh = KvTree::open_unpublished_slot_tree(
+        Arc::clone(&cache),
+        slot,
+        newer,
+        Arc::clone(&handle2),
+        11,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fresh.root(), newer);
+    assert_eq!(fresh.root_floor(), 11);
+    assert!(handle2.load(Ordering::Acquire) >= 42);
+}
+
+/// **Review round 2, Issue 24 — the driver's arm: an EMPTY-window death.**
+/// The lessee dies right after its checkpoint (no window record raises
+/// the recoverer's handle); the recovery installs its newer root and the
+/// recoverer's node-seq handle reads at or above every node seq the
+/// recovered tree carries — so its next mint is strictly above them
+/// (pinned: a create + checkpoint after the recovery moves the handle
+/// past that maximum, and every reachable node still reads at or below
+/// it). In THIS process the lessee and the recoverer shared one handle
+/// through the ledger's watermark (the manager's checkpoints wrote it),
+/// so the row is green on both sides of the fix; the fn-level pin above
+/// is the red one — this row pins that the driver's arm runs it on the
+/// empty-window shape and that the recovered tree is exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_window_death_leaves_the_recoverers_node_seqs_above_the_recovered_trees() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let fx = two_backends_with(dir.path(), TwoBackendsWindow::Empty).await;
+    fx.vol.record_death_with_key(fx.x, 1, 0).await.unwrap();
+    let rep = recover_dead_appenders_set(&fx.routed).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    let tree = fx.vol.slot_tree(fx.slot).unwrap();
+    assert!(tree.root().seq >= fx.newer_root.seq);
+    let max_seq = async |t: &Arc<squeezefs::meta_backend::kv::tree::KvTree>| -> u64 {
+        let mut max = 0u64;
+        for addr in t.reachable_node_addrs().await.unwrap() {
+            max = max.max(fx.vol.node_cache().get(addr).await.unwrap().node_seq());
+        }
+        max
+    };
+    let tree_max = max_seq(&tree).await;
+    let handle = fx.vol.test_node_seq_now();
+    assert!(
+        handle >= tree_max,
+        "the recoverer's handle ({handle}) is at or above the recovered tree's max node seq \
+         ({tree_max}) with NO window record to raise it"
+    );
+    assert_all_resolve(&fx.routed, fx.dir, &fx.files).await;
+    // The next mints sit strictly above: a create + checkpoint.
+    fx.routed
+        .create(fx.dir, "after-recovery", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap();
+    fx.vol.checkpoint_now().await.unwrap();
+    let handle_after = fx.vol.test_node_seq_now();
+    assert!(handle_after >= handle);
+    let tree_max_after = max_seq(&fx.vol.slot_tree(fx.slot).unwrap()).await;
+    assert!(
+        tree_max_after <= handle_after && tree_max_after >= tree_max,
+        "every reachable node reads at or below the handle ({tree_max_after} ≤ {handle_after})"
+    );
+    shutdown(&fx.routed).await;
+    let TwoBackends {
+        uris, routed, vol, ..
+    } = fx;
+    drop(vol);
+    drop(routed);
+    fsck_clean(&uris).await;
+    two_backends_teardown();
+}
+
+/// **Review round 2, Issue 26 — a dentry DELETE in a foreign window scopes
+/// its child out of the inode plane.** The lessee UNLINKS a file its last
+/// checkpoint holds and dies: the dentry's DELETE sits in its ring (no
+/// value — the child's ino is in the tree's pre-delete dentry alone) while
+/// the child's `nlink 1 → 0` rode ring 0, which the recoverer's open
+/// replayed. The recoverer's online inode plane sees a name still
+/// referencing an `nlink 0` record — C10's LOSS-direction finding
+/// (`C10ZeroNlinkNamed`, "DATA-LOSS RISK") on a healthy fleet, until the
+/// holder's checkpoint — unless the window's DELETE scopes the child:
+/// `foreign_window_inos` resolves the deleted key in the parent's tree
+/// (RED before: the DELETE contributed nothing and the plane reported
+/// exactly that finding). After the recovery the name is gone and the
+/// plane has nothing to scope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dentry_delete_in_a_foreign_window_scopes_its_child_out_of_the_inode_plane() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let fx = two_backends_with(dir.path(), TwoBackendsWindow::UnlinkOne).await;
+    let width = fx.routed.routing_width();
+    let scoped = fx.vol.foreign_window_inos(width).await.unwrap();
+    assert!(
+        !scoped.is_empty(),
+        "the window's one record is a dentry DELETE — its child is scoped"
+    );
+    let report = inode_plane_over(&fx.routed).await;
+    assert_eq!(
+        report.counters.dangling_dentries, 0,
+        "no dangling-dentry finding for the unlinked child while its DELETE is in flight: \
+         {:?}",
+        report.findings
+    );
+    assert_eq!(
+        report.counters.nlink_mismatch_low, 0,
+        "{:?}",
+        report.findings
+    );
+    // The arm the un-fixed tree tripped: the child's record stands at
+    // `nlink 0` (its destroy is the reclaim's) under the name the DELETE
+    // has not yet removed here — `C10ZeroNlinkNamed`, "DATA-LOSS RISK".
+    assert_eq!(report.counters.nlink_zero_named, 0, "{:?}", report.findings);
+    assert!(
+        report.counters.inode_plane_window_scoped >= 1,
+        "the child was scoped out ({:?})",
+        report.counters
+    );
+    // No C10 finding of any direction. (C9 reads the fixture's premise
+    // here — the recoverer's RAM tree of the slot is at the grant-time
+    // root while the lessee's later checkpoint named the newer one on its
+    // page alone, so the names it holds are invisible to this plane until
+    // the recovery installs it; the class this row pins is C10's.)
+    assert!(
+        report.findings.iter().all(|f| f.class != "C10"),
+        "{:?}",
+        report.findings
+    );
+    // The recovery replays the DELETE: the name is gone, the plane clean
+    // with nothing to scope.
+    fx.vol.record_death_with_key(fx.x, 1, 0).await.unwrap();
+    let rep = recover_dead_appenders_set(&fx.routed).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    assert!(fx.vol.foreign_window_inos(width).await.unwrap().is_empty());
+    let report = inode_plane_over(&fx.routed).await;
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+    assert_eq!(report.counters.inode_plane_window_scoped, 0);
+    assert_all_resolve(&fx.routed, fx.dir, &fx.files).await;
+    shutdown(&fx.routed).await;
+    let TwoBackends {
+        uris, routed, vol, ..
+    } = fx;
+    drop(vol);
+    drop(routed);
+    fsck_clean(&uris).await;
+    two_backends_teardown();
+}
+
+/// The fsck engine's INODE PLANE over an already-open WRITER set (the
+/// recoverer's online plane — where PR 10's window scoping governs; a
+/// probe's plane records no verdict over a `Live` page, PR 7b's law): a
+/// data router with no staging, the inode-plane-only options.
+async fn inode_plane_over(routed: &Arc<RoutedMetaBackend>) -> squeezefs::fsck::FsckReport {
+    let dlm = squeezefs::dlm::DlmClient::new().unwrap();
+    let alloc = Arc::new(
+        squeezefs::block_allocator::BlockAllocator::new("vol-plane")
+            .await
+            .unwrap(),
+    );
+    let dev = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new("/dev/null"));
+    let cache = squeezefs::cache::TieredCache::new(
+        Vec::new(),
+        Some("64MB"),
+        Some("64MB"),
+        None,
+        None,
+        alloc.clone(),
+        dev.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let router = squeezefs::routing::DataRouter::new(dlm, cache, alloc, dev);
+    router.set_meta_backend(Arc::clone(routed));
+    let ctx = squeezefs::fsck::FsckCtx {
+        meta: Arc::clone(routed),
+        router,
+        staging_dirs: Vec::new(),
+        expected_generation: None,
+    };
+    let mut opts = squeezefs::fsck::FsckOptions::offline();
+    opts.settle = std::time::Duration::from_millis(10);
+    opts.inode_plane_only = true;
+    squeezefs::fsck::run(&ctx, &opts)
+        .await
+        .expect("the engine runs")
 }
 
 /// **Issue 3 — the door during a recovery.** While the recovery is parked
@@ -2673,7 +3181,7 @@ async fn a_deferred_death_record_lands_at_the_next_ledger_poll() {
         epoch: 5,
         pr_key: 0,
     });
-    assert_eq!(alloc_lease::pending_deaths().len(), 1);
+    assert_eq!(alloc_lease::test_pending_deaths().len(), 1);
     assert_eq!(
         alloc_lease::DEAD_MEMBER_WRITE_DEFERRALS.load(Ordering::Relaxed),
         deferrals0 + 2
@@ -2686,7 +3194,7 @@ async fn a_deferred_death_record_lands_at_the_next_ledger_poll() {
         1,
         "the landed death is acted on in the same pass: {rep:?}"
     );
-    assert!(alloc_lease::pending_deaths().is_empty());
+    assert!(alloc_lease::test_pending_deaths().is_empty());
     assert_eq!(
         fx.vol
             .dead_member_record(&fx.x)

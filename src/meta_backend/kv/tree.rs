@@ -865,9 +865,64 @@ impl KvTree {
     /// this mount writes to. `floor` is the ring position the installed
     /// root's un-published records start at (the window's tail): until
     /// tree 0 names the root the checkpoint tail must not pass it.
-    pub fn install_recovered_root(&self, root: RootPtr, floor: u64) {
+    ///
+    /// ONE install for both callers — the own-residue open's page-root
+    /// pass and the recovery driver's step 4 (review round 2, Issue 24:
+    /// the driver's arm stored the root without raising the seq handle,
+    /// so a lessee that died with an EMPTY window left the recoverer's
+    /// counter below the installed tree's node seqs — the residue-seq
+    /// collision class PR 11 fenced). The root node is read and its
+    /// `node_seq` checked against the pointer FIRST (`open_inner`'s law —
+    /// a torn or stale page word never installs an unverified root), it
+    /// is pinned and stamped with the slot, and the volume's node-seq
+    /// handle is raised to the root's seq — the same word every open
+    /// raises for every root it adopts (§4.5's watermark).
+    pub async fn install_recovered_root(&self, root: RootPtr, floor: u64) -> Result<(), KvError> {
+        let node = self.cache.get(root.addr).await?;
+        if node.node_seq() != root.seq {
+            return Err(KvError::Corrupt(format!(
+                "recovered root pointer stale: the page says node_seq {}, extent {:#x} holds {}",
+                root.seq,
+                root.addr,
+                node.node_seq()
+            )));
+        }
+        if node.tree_id() != self.tree_id {
+            return Err(KvError::Corrupt(format!(
+                "recovered root tree_id mismatch: expected {}, extent {:#x} holds {}",
+                self.tree_id,
+                root.addr,
+                node.tree_id()
+            )));
+        }
+        node.pin();
+        if let Some(slot) = self.forest_slot {
+            node.stamp_forest_slot(slot);
+        }
         self.root.store(Arc::new(root));
         self.set_root_floor(floor);
+        self.seq.fetch_max(root.seq, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// [`Self::open_slot_tree`] for a root a PAGE names and tree 0 does not
+    /// yet (the own-residue open's page-root pass, the recovery driver's
+    /// step 4 for a slot this mount never opened): the tree opened at the
+    /// page's root (`open_inner` verifies the root node's seq), its root
+    /// floor set to `floor`, and the node-seq handle raised to the root's
+    /// seq — the one law [`Self::install_recovered_root`] applies to a tree
+    /// already open.
+    pub async fn open_unpublished_slot_tree(
+        cache: Arc<NodeCache>,
+        slot: super::record::ForestSlot,
+        root: RootPtr,
+        seq: Arc<AtomicU64>,
+        floor: u64,
+    ) -> Result<Self, KvError> {
+        let tree = Self::open_slot_tree(cache, slot, root, seq).await?;
+        tree.set_root_floor(floor);
+        tree.seq.fetch_max(root.seq, Ordering::AcqRel);
+        Ok(tree)
     }
 
     /// Mark the live root UNPUBLISHED from `floor` on (see `root_floor`):

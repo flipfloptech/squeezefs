@@ -2910,3 +2910,79 @@ fn sym_appender_recovery_bound_derives_from_the_ring_the_node_size_and_the_landi
         66 + 146 + 1_100
     );
 }
+
+/// **PR 10, review round 2, Issue 27 — the death record's retirement age
+/// is ONE law with two readers.** `death_record_retire_age_ms` = TWO lease
+/// TTLs (one for every manager's poll to project and act, one for the
+/// successor's grace window — a reclaimer's re-join must never race a
+/// retired record); the poll's sweep reads it, and the S6 owner's
+/// departed-key memo — the `RecordDeath` key-word screen's witness for a
+/// member no longer in the census — keeps a departure's key EXACTLY that
+/// long: at the age the key still answers, one tick past it the memo
+/// answers nothing (the record it would have judged is retirable). The
+/// memo is bounded by age, never a count — every entry was a census
+/// member whose state the owner already held.
+#[test]
+fn sym_death_record_retire_age_ties_the_sweep_and_the_departed_key_memo() {
+    use squeezefs::membership::{
+        JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole, MembershipOwner,
+    };
+    use squeezefs::meta_backend::kv::alloc_lease::{
+        death_record_retire_age_ms, DEATH_RECORD_RETIRE_TTLS,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    assert_eq!(DEATH_RECORD_RETIRE_TTLS, 2);
+    assert_eq!(death_record_retire_age_ms(45_000), 90_000);
+    assert_eq!(death_record_retire_age_ms(u64::MAX), u64::MAX, "saturating");
+    let clocks = LeaseClocks::derive(Duration::from_micros(250)).expect("the shipped derivation");
+    let t_owner_ms = clocks.t_owner.as_millis() as u64;
+    let age = death_record_retire_age_ms(t_owner_ms);
+    let ticks = Arc::new(AtomicU64::new(1_000));
+    let owner = MembershipOwner::arm(
+        "owner-tie",
+        3,
+        2,
+        clocks,
+        LeaseClock::manual(Arc::clone(&ticks)),
+    )
+    .expect("arm");
+    let key = 0x5100_0000_0000_0017u64;
+    match owner.join(JoinRequest {
+        id: "m17".to_string(),
+        role: MemberRole::Writer,
+        endpoint: Some("10.0.0.7:7100".to_string()),
+        pid: std::process::id(),
+        boot: "boot-test".to_string(),
+        prior_epoch: None,
+        pr_key: key,
+        mount: None,
+    }) {
+        JoinOutcome::Granted(_) => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        owner.registered_key("m17"),
+        Some(key),
+        "the live census's key"
+    );
+    owner.evict("m17", "tie test").expect("evicted");
+    assert_eq!(
+        owner.registered_key("m17"),
+        Some(key),
+        "the departed memo answers the key at the departure"
+    );
+    ticks.fetch_add(age, Ordering::SeqCst);
+    assert_eq!(
+        owner.registered_key("m17"),
+        Some(key),
+        "at the retirement age the record may still stand — the key still answers"
+    );
+    ticks.fetch_add(1, Ordering::SeqCst);
+    assert_eq!(
+        owner.registered_key("m17"),
+        None,
+        "one tick past the retirement age the memo answers nothing"
+    );
+}

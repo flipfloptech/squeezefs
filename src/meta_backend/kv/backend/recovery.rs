@@ -169,23 +169,48 @@ async fn test_hold_at(flag: &AtomicBool) {
 /// touches). `0` = the wall clock.
 pub static TEST_CLAIM_CLOCK_SKEW_SECS: AtomicU64 = AtomicU64::new(0);
 
-/// The RAM lease table's rollback of a recovery that did not reach its
-/// tree-0 step (review round 1, Issue 3): every slot `begin_release` moved
-/// to `Releasing { dead }` goes back to `Leased { dead }` — the door keeps
-/// refusing first-touch acquires, the page stays `Recovering`, and the
-/// re-run resumes from the durable state. Disarmed by clearing `begun`
-/// once tree 0's records are durable and the table released.
+/// The RAM words of a recovery that did not reach its tree-0 step, rolled
+/// back as ONE RAII (review round 1, Issue 3; round 2, Issue 23). Step 4
+/// changes exactly these words per slot, and every one goes back:
+///
+/// 1. the lease table: `Leased { dead }` → `Releasing { dead }` goes back
+///    to `Leased { dead }` — the door's state (a first-touch acquire is
+///    refused in either state; the re-run begins the release again);
+/// 2. the gate's `foreign` bit, CLEARED at step 4 so the recovery's own
+///    flush is the manager's structure — restored to what it read before
+///    (marked for another appender's slot; an in-process region's slot
+///    never carried it), so the merge sweep, the heap-full recovery and
+///    the D4 arm SKIP the tree again (`merge_sweep_foreign_skips`) instead
+///    of running an SMO on a tree tree 0 still leases to the dead
+///    appender — ring-0 interior records the next open's `Lease` detector
+///    refuses (PR 4 round 5's Issue-28 class);
+/// 3. the door's waiters, woken to re-read the table.
+///
+/// What stays: the installed root and the RAM tree (idempotent — the
+/// re-run installs the same page root and folds the same window), the
+/// per-slot extent ledger (a max-only word). The page stays
+/// `Recovering`; the re-run resumes from the durable state. Disarmed by
+/// clearing `begun` once tree 0's records are durable and the table
+/// released.
 struct RecoveryRollback<'a> {
     plane: &'a slot_lease::SlotLeasePlane,
     id: u32,
-    begun: Vec<record::ForestSlot>,
+    /// `(slot, the gate's foreign bit as step 4 found it)`.
+    begun: Vec<(record::ForestSlot, bool)>,
 }
 
 impl Drop for RecoveryRollback<'_> {
     fn drop(&mut self) {
-        for slot in self.begun.drain(..) {
-            self.plane.table.abort_release(slot, self.id);
+        if self.begun.is_empty() {
+            return;
         }
+        for (slot, was_foreign) in self.begun.drain(..) {
+            self.plane.table.abort_release(slot, self.id);
+            if was_foreign {
+                self.plane.gate.mark_foreign(slot);
+            }
+        }
+        self.plane.handover_done.notify_waiters();
     }
 }
 
@@ -503,21 +528,28 @@ impl KvMetaBackend {
         }
     }
 
-    /// This mount's metadata-namespace registrant key (`0` = none) — what
-    /// the key-word screen refuses as "our own" (the contracts' witness).
-    pub fn pr_key_pub(&self) -> u64 {
+    /// Test seam: this mount's metadata-namespace registrant key (`0` =
+    /// none) — what the key-word screen refuses as "our own" (the
+    /// contracts' witness).
+    pub fn test_pr_key(&self) -> u64 {
         self.pr_key
     }
 
-    /// The device byte ranges appender `id`'s REGION owns on this volume —
-    /// its ring segments, its two directory page slots, and every extent
-    /// its `extent_grant` record names (the images its trees reach and
-    /// the unclaimed remainder) — as `(offset, len)`. The two-backend
+    /// Test seam: the volume's node-seq handle as it stands — the word
+    /// every root install raises (review round 2, Issue 24's witness).
+    pub fn test_node_seq_now(&self) -> u64 {
+        self.seq_handle().load(Ordering::Acquire)
+    }
+
+    /// Test seam: the device byte ranges appender `id`'s REGION owns on
+    /// this volume — its ring segments, its two directory page slots, and
+    /// every extent its `extent_grant` record names (the images its trees
+    /// reach and the unclaimed remainder) — as `(offset, len)`. The two-backend
     /// fixture's capture set: a foreign lessee's later activity touches
     /// exactly these bytes and nothing the manager holds cached, so a
     /// snapshot of them re-applied to the device while the manager is
     /// open IS another daemon's checkpoint landing under it.
-    pub async fn region_device_ranges(
+    pub async fn test_region_device_ranges(
         &self,
         id: u32,
     ) -> std::result::Result<Vec<(u64, u64)>, KvError> {
@@ -652,9 +684,29 @@ impl KvMetaBackend {
                     };
                     let mentioned: Option<u64> = match k {
                         record::TREE_INODES => record::decode_inode_key(&legacy).ok(),
-                        record::TREE_DENTRIES => record::DentryValue::decode(&r.value)
-                            .ok()
-                            .map(|d| d.child_ino),
+                        record::TREE_DENTRIES => match r.kind {
+                            // A dentry DELETE carries no value, and its
+                            // child is exactly the ino the plane must not
+                            // judge (review round 2, Issue 26): a cross-
+                            // owner unlink's name removal rides the parent
+                            // holder's ring while the child's `nlink`
+                            // decrement landed in the child's slot — read
+                            // as `nlink` BELOW the name count, C10's LOSS
+                            // finding, until the holder's checkpoint. The
+                            // window is unreplayed, so the tree still holds
+                            // the pre-delete dentry: the key resolves it.
+                            record::RecordKind::Delete => {
+                                match self.lookup_kind(k, &legacy).await? {
+                                    Some(v) => {
+                                        record::DentryValue::decode(&v).ok().map(|d| d.child_ino)
+                                    }
+                                    None => None,
+                                }
+                            }
+                            _ => record::DentryValue::decode(&r.value)
+                                .ok()
+                                .map(|d| d.child_ino),
+                        },
                         _ => None,
                     };
                     let Some(ino) = mentioned else {
@@ -1305,8 +1357,9 @@ impl KvMetaBackend {
             if lease.state == crate::slot_lease_core::LeaseState::Unleased || lease.holder != id {
                 continue;
             }
+            let was_foreign = plane.gate.is_foreign(*slot);
             match plane.table.begin_release(*slot, id) {
-                Ok(_) => rollback.begun.push(*slot),
+                Ok(_) => rollback.begun.push((*slot, was_foreign)),
                 Err(refusal) => {
                     return Err(KvError::Corrupt(format!(
                         "{}: the lease table refused to begin the recovery release of slot \
@@ -1333,6 +1386,12 @@ impl KvMetaBackend {
                 }
             }
             if root.addr != 0 {
+                // The ONE install the own-residue open runs too (Issue
+                // 24): the root node's seq verified against the pointer,
+                // the node-seq handle raised to it — an EMPTY window
+                // raises it nowhere else, and a recoverer minting below
+                // the dead lessee's stamps would adopt a residue frame in
+                // a returned extent as its own tail (PR 11's class).
                 match forest.tree(*slot) {
                     Some(tr) => {
                         if root.seq > tr.root().seq {
@@ -1344,18 +1403,18 @@ impl KvMetaBackend {
                             // onto a base missing the lessee's flushed bsets)
                             // and the page's root installed writer-legal.
                             self.cache.drop_slot_nodes(*slot)?;
-                            tr.install_recovered_root(root, floor);
+                            tr.install_recovered_root(root, floor).await?;
                         }
                     }
                     None => {
-                        let tree = KvTree::open_slot_tree(
+                        let tree = KvTree::open_unpublished_slot_tree(
                             Arc::clone(&self.cache),
                             *slot,
                             root,
                             self.seq_handle(),
+                            floor,
                         )
                         .await?;
-                        tree.set_root_floor(floor);
                         forest.adopt_guest_unpublished(*slot, Arc::new(tree));
                     }
                 }
@@ -1561,6 +1620,28 @@ impl KvMetaBackend {
             .dead_appender_orphans(vol0, id, &identity, &slots)
             .await?;
         if !orphans.is_empty() {
+            // The orphan images carry the dead lessee's node-seq stamps
+            // (its retired predecessors and successors — minted from ITS
+            // handle, which this mount's watermark law never covered):
+            // the handle is floored above every stamp they carry BEFORE
+            // the extents return to the heap (PR 11's residue law,
+            // `node::residue_seq_ceiling`; Issue 24) — one extent read per
+            // orphan, the price the offline census pays.
+            let mut ceiling = 0u64;
+            let node_size = self.cache.config().layout.node_size() as u64;
+            for e in &orphans {
+                let image = crate::uring_fs::read_at(
+                    &self.path,
+                    self.sb.heap.start + e * node_size,
+                    node_size as usize,
+                )
+                .await
+                .map_err(KvError::Io)?;
+                ceiling = ceiling.max(crate::meta_backend::kv::node::residue_seq_ceiling(&image));
+            }
+            if ceiling != 0 {
+                self.seq_handle().fetch_max(ceiling, Ordering::AcqRel);
+            }
             match self.return_extents_inner(id, &orphans, false).await {
                 Ok((returned, _)) => log::info!(
                     "meta volume {}: appender {id}'s {returned} orphan image extent(s) returned \
@@ -1848,6 +1929,7 @@ impl KvMetaBackend {
         smo: &mut SmoContext,
     ) -> std::result::Result<EntryAdmission, KvError> {
         let len = entry_len_for(recs)?;
+        let tail_start = self.ring.core().reusable_upto();
         for cycle in 0..=checkpoint::COVER_CYCLES_MAX {
             if let Some(adm) = self.ring.try_admit(len, AdmissionClass::User) {
                 return Ok(EntryAdmission::Held(adm));
@@ -1857,9 +1939,24 @@ impl KvMetaBackend {
             }
             self.checkpoint_cycle(smo, true).await?;
         }
+        // The bound's class is the tail's (PR 4 round 6's law for the
+        // grant's clearing loop; review round 2, Issue 27): a tail that
+        // MOVED is a busy ring the poll's next projection retries —
+        // `Busy`, the `deferred` arm's word; a tail that did not move in
+        // `COVER_CYCLES_MAX` barriered cycles is pinned by something no
+        // flush discharges — a defect, never a longer wait.
+        let tail = self.ring.core().reusable_upto();
+        if tail != tail_start {
+            return Err(KvError::Busy(format!(
+                "{}: a {len} B control entry found no ring-0 admission in {} barriered cycles \
+                 (tail {tail_start} → {tail}) — the ring is busy; the next ledger poll retries",
+                self.path.display(),
+                checkpoint::COVER_CYCLES_MAX
+            )));
+        }
         Err(KvError::Corrupt(format!(
-            "{}: a {len} B control entry found no ring-0 admission in {} barriered cycles — \
-             the ring is pinned by something no flush discharges",
+            "{}: a {len} B control entry found no ring-0 admission in {} barriered cycles with \
+             the tail stuck at {tail} — the ring is pinned by something no flush discharges",
             self.path.display(),
             checkpoint::COVER_CYCLES_MAX
         )))

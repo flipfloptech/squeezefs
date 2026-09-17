@@ -186,6 +186,11 @@ pub use recovery::{
     appender_recovery_bound_ms, recovery_stats, AppenderClearOutcome, CustodyCensus,
     RecoveredRegion, RecoveryReport, RecoverySetReport, RecoveryStats,
 };
+/// Symmetric PR 12b: the JOINED non-manager appender — the fifth door
+/// (`open_joined_appender`), its wire acquires, its own checkpoint cycle
+/// and its leave (design §7.3 / §5.1 / §5.3).
+pub mod joined;
+pub use joined::{JoinedAppenderAdmission, JoinedStats};
 
 /// `SQUEEZEFS_META_NODE_CACHE_MB` (§5.1; absolute MiB, explicit wins
 /// verbatim — default derived, see [`resolve_node_cache_budget`]).
@@ -1107,6 +1112,12 @@ pub struct KvMetaBackend {
     /// teardown either. Distinct from `non_writer`, which a §4.11-degraded
     /// WRITE mount shares while keeping its whole shutdown ladder.
     probe: bool,
+    /// The JOINED non-manager appender's wire (PR 12b, `open_joined_appender`):
+    /// the manager's `ManagerClient` this mount dials for every verb it
+    /// cannot perform itself (`AcquireSlot(s)` / `ReleaseSlot` /
+    /// `ExtentGrant` / `ReturnExtents` / `LeaveAppender`), the endpoint and
+    /// the identity it joined under. `None` on every other door.
+    joined: std::sync::OnceLock<Arc<joined::JoinedWire>>,
     /// WHY this volume is read-only. The write gate and the guarantee-class
     /// row both need to tell a §4.11 forward-compatibility degradation
     /// (unknown `features_ro` bits — an accident of the format) apart from
@@ -1756,7 +1767,7 @@ impl KvMetaBackend {
         }
 
         // (2) Bootstrap replay (sets `boot_id` — shared with probes).
-        let mut inner = Self::open_inner(path, OpenPosture::Writer).await?;
+        let mut inner = Self::open_inner(path, OpenPosture::Writer, None).await?;
         *inner.guard_fd.get_mut().unwrap() = Some(guard_fd);
         // (2b) The `sym_upgrade:` marker gate — before the claim, so a
         // refusal drops `inner` (and its flock) with nothing written.
@@ -1861,7 +1872,7 @@ impl KvMetaBackend {
     /// process has live-mounted therefore cannot corrupt it. Dropping the
     /// returned backend releases everything (there is no task to join).
     pub async fn open_probe(path: &Path) -> std::result::Result<Arc<Self>, KvError> {
-        let mut inner = Self::open_inner(path, OpenPosture::NonWriter).await?;
+        let mut inner = Self::open_inner(path, OpenPosture::NonWriter, None).await?;
         inner.probe = true;
         let be = Arc::new(inner);
         // PR M7: probes never mutate, but the conveyor identity is part
@@ -1926,7 +1937,7 @@ impl KvMetaBackend {
             ),
             SharedProbe::Unknown => {}
         }
-        let mut inner = Self::open_inner(path, OpenPosture::NonWriter).await?;
+        let mut inner = Self::open_inner(path, OpenPosture::NonWriter, None).await?;
         // The mount-option cause OVERRIDES the §4.11 one only in its
         // reporting: `read_only` is already true when unknown-ro bits are
         // present, and a reader is read-only either way.
@@ -2009,7 +2020,7 @@ impl KvMetaBackend {
             ),
             SharedProbe::Unknown => {}
         }
-        let mut inner = Self::open_inner(path, OpenPosture::NonWriter).await?;
+        let mut inner = Self::open_inner(path, OpenPosture::NonWriter, None).await?;
         inner.read_only = true;
         inner.ro_cause = ReadOnlyCause::CoWriterMount;
         let be = Arc::new(inner);
@@ -2106,7 +2117,7 @@ impl KvMetaBackend {
             ),
             SharedProbe::Unknown => {}
         }
-        let mut inner = Self::open_inner(path, OpenPosture::NonWriter).await?;
+        let mut inner = Self::open_inner(path, OpenPosture::NonWriter, None).await?;
         inner.read_only = true;
         inner.ro_cause = ReadOnlyCause::PeerOwnedVolume;
         let be = Arc::new(inner);
@@ -2265,7 +2276,15 @@ impl KvMetaBackend {
         self.read_only
     }
 
-    async fn open_inner(path: &Path, posture: OpenPosture) -> std::result::Result<Self, KvError> {
+    /// `joined` is the JOINED non-manager appender's wire outcome (PR 12b —
+    /// `Some` under [`OpenPosture::JoinedAppender`] alone): the region the
+    /// manager minted for this identity over the wire, stood up beside the
+    /// manager's projection by `open_appender_regions`.
+    async fn open_inner(
+        path: &Path,
+        posture: OpenPosture,
+        joined: Option<joined::JoinedOpen>,
+    ) -> std::result::Result<Self, KvError> {
         let t0 = std::time::Instant::now();
 
         // 1. Superblock (the version gate is the loud unit).
@@ -2284,7 +2303,7 @@ impl KvMetaBackend {
                 )))
             }
         };
-        if posture == OpenPosture::Writer
+        if matches!(posture, OpenPosture::Writer | OpenPosture::JoinedAppender)
             && super::slot_lease::symmetric_meta_requested()
             && !sb.symmetric_forest_stamped()
         {
@@ -2760,6 +2779,7 @@ impl KvMetaBackend {
                     replay_posture,
                     &boot_id,
                     recovering,
+                    joined,
                 )
                 .await?,
             )),
@@ -2932,6 +2952,7 @@ impl KvMetaBackend {
             read_only,
             non_writer: replay_posture == OpenPosture::NonWriter,
             probe: false,
+            joined: std::sync::OnceLock::new(),
             ro_cause,
             failed: AtomicBool::new(false),
             journal_failures: AtomicU64::new(0),
@@ -3907,6 +3928,11 @@ impl KvMetaBackend {
         {
             return Ok(());
         }
+        // PR 12b: a joined appender's leave is its own — every slot handed
+        // to nobody over the wire, then `LeaveAppender`.
+        if set.is_joined_appender() {
+            return self.leave_joined_regions().await;
+        }
         let node_size = u64::from(self.sb.node_size);
         // The belt (review round 2, Issue 16): a declared region whose
         // ring is UNCOVERED at the leave — its window holds records no
@@ -4152,7 +4178,7 @@ impl KvMetaBackend {
         let slot = super::record::forest_slot_of_ino(object);
         match plane.table.resolve(slot) {
             crate::slot_lease_core::Resolved::Holder { holder, .. }
-                if appenders.region(holder).is_none() =>
+                if !appenders.owns_region(holder) =>
             {
                 Some(holder)
             }
@@ -4745,8 +4771,10 @@ impl KvMetaBackend {
         set: &super::appender::AppenderSet,
         plane: &super::slot_lease::SlotLeasePlane,
     ) {
-        let in_process: std::collections::BTreeSet<u32> =
-            set.regions.iter().map(|r| r.id).collect();
+        // The regions THIS MOUNT writes: on a joined appender the
+        // manager's region 0 is a projection, so the manager's slots are
+        // FOREIGN here (their token server and ship target is the manager).
+        let in_process: std::collections::BTreeSet<u32> = set.own_regions().map(|r| r.id).collect();
         // The FOREIGN set off the holder index (O(leased)); this volume's
         // contribution to the process table is MERGED with the other
         // armed volumes' and S8's (review round 2, Issue 13 — the
@@ -4799,6 +4827,60 @@ impl KvMetaBackend {
     /// owner table's per-volume key.
     fn volume_uuid(&self) -> u128 {
         u128::from_le_bytes(self.sb.uuid)
+    }
+
+    /// **The cross-daemon slot barrier** (symmetric PR 12b): a slot tree
+    /// whose lease ARRIVES from another daemon — the manager taking a wire
+    /// lessee's release, a joined appender taking the manager's grant —
+    /// is re-read from the device at `root`. The lessee appends bsets INTO
+    /// the tree's existing node images (the log-structured node), so a
+    /// transfer moves the tree's CONTENT under an unchanged root pointer:
+    /// PR 4's wire release noted the released root in tree 0 and left the
+    /// manager's RAM tree of the slot at the images it loaded at its open
+    /// (same addr, same `node_seq`), and the manager's first-touch
+    /// re-acquire read every dentry the joiner had acked as absent (found
+    /// by the first two-daemon pin). PR 10's recovery barrier for the same
+    /// class (`NodeCache::drop_slot_nodes` + `KvTree::install_recovered_
+    /// root`), run for every transfer: legal because the slot was FOREIGN
+    /// (or unleased on a non-manager) until now — nothing of this mount is
+    /// dirty under it — and under the caller's hold of the SMO mutex (no
+    /// pass mid-walk). A slot this mount never opened is opened at `root`;
+    /// a zero root (a slot tree never minted) leaves the forest untouched.
+    /// The released root is named by tree 0 (the release's own entry or
+    /// the grant's words), so the installed root is PUBLISHED.
+    pub(super) async fn adopt_transferred_slot_tree(
+        &self,
+        slot: super::record::ForestSlot,
+        root: RootPtr,
+    ) -> std::result::Result<(), KvError> {
+        if root.addr == 0 {
+            return Ok(());
+        }
+        let Some(forest) = self.forest() else {
+            return Ok(());
+        };
+        let dropped = self.cache.drop_slot_nodes(slot)?;
+        match forest.tree(slot) {
+            Some(t) => {
+                let floor = t.root_floor();
+                t.install_recovered_root(root, floor).await?;
+            }
+            None => {
+                let tree =
+                    KvTree::open_slot_tree(Arc::clone(&self.cache), slot, root, self.seq_handle())
+                        .await?;
+                forest.adopt_guest(slot, Arc::new(tree));
+            }
+        }
+        forest.note_published(slot, root);
+        log::debug!(
+            "{}: slot {slot} transferred in at root {:#x} (seq {}) — {dropped} stale image(s) \
+             dropped",
+            self.path.display(),
+            root.addr,
+            root.seq
+        );
+        Ok(())
     }
 
     /// Adopt a lease of `slot` for in-process region `region_id`: the
@@ -5784,23 +5866,25 @@ impl KvMetaBackend {
                 )));
             }
         }
-        if let Some(forest) = self.forest() {
-            if words.root.0 != 0 {
-                forest.note_published(
-                    slot,
-                    RootPtr {
-                        addr: words.root.0,
-                        seq: words.root.1,
-                    },
-                );
-            }
-        }
+        let released_root = RootPtr {
+            addr: words.root.0,
+            seq: words.root.1,
+        };
         if set.region(appender_id).is_none() {
+            // A WIRE lessee's tree arrives from another daemon's appends:
+            // the cross-daemon barrier re-reads it at the released root
+            // (the wire face holds the SMO mutex for exactly this).
+            self.adopt_transferred_slot_tree(slot, released_root)
+                .await?;
             self.write_wire_joiner_page_slots(appender_id, &plane)
                 .await?;
             // A wire appender's release returns the slot to the S4
             // plane's local set (an in-process region's changes nothing).
             self.publish_slot_owners(set, &plane);
+        } else if let Some(forest) = self.forest().filter(|_| released_root.addr != 0) {
+            // An in-process region shares this cache: the tree IS current,
+            // only its publication is noted.
+            forest.note_published(slot, released_root);
         }
         Ok(false)
     }
@@ -5941,6 +6025,13 @@ impl KvMetaBackend {
                 }
             }
         }
+        // The wire lessee's release hands the tree's STRUCTURE back to the
+        // manager (Issue 25) and its CONTENT arrives from another daemon's
+        // appends (PR 12b — the cross-daemon barrier inside): the SMO
+        // mutex, taken BEFORE `manager_verbs` exactly as the grant takes it
+        // (review round 5, Issue 28 — the checkpoint task's order), so no
+        // structural pass of this mount spans the transfer.
+        let _smo = self.smo.lock().await;
         // Any count: the release site records the set inline or spilled
         // (the wire frame's own class cap bounds what arrives).
         self.manager_release_slot(appender_id, fslot, words, g, tails.to_vec())
@@ -6390,19 +6481,25 @@ impl KvMetaBackend {
         region_id: u32,
         slot: super::record::ForestSlot,
     ) -> std::result::Result<(), KvError> {
-        let set = self.manager_gate(true)?;
+        // The set gate, not the manager's: a JOINED appender runs the same
+        // flush-then-transfer for its own slots (its tree-0 step travels
+        // over the wire — `release_slot_durably`).
+        let set = self.appender_set_gate(true)?;
         let plane = Arc::clone(set.slot_leases().ok_or_else(|| {
             KvError::Busy(format!(
                 "{}: the symmetric plane is not armed — no slot lease exists",
                 self.path.display()
             ))
         })?);
-        let region = set.region(region_id).ok_or_else(|| {
-            KvError::Busy(format!(
-                "{}: appender {region_id} is not an in-process region",
-                self.path.display()
-            ))
-        })?;
+        let region = set
+            .region(region_id)
+            .filter(|_| set.owns_region(region_id))
+            .ok_or_else(|| {
+                KvError::Busy(format!(
+                    "{}: appender {region_id} is not one of this mount's regions",
+                    self.path.display()
+                ))
+            })?;
         if slot == super::record::NATIVE_FOREST_SLOT && region_id == 0 {
             return Err(KvError::Busy(format!(
                 "{}: the manager's native slot is non-transferable while it holds the role \
@@ -6497,10 +6594,12 @@ impl KvMetaBackend {
                 notified.await;
             }
         }
-        // 4. Tree 0: Unleased { root, cursor, g, extents, tails } — one tx.
+        // 4. Tree 0: Unleased { root, cursor, g, extents, tails } — one tx
+        //    (the manager's own; a joined appender's `ReleaseSlot` over
+        //    the wire).
         let t_tree0 = std::time::Instant::now();
         if let Err(e) = self
-            .manager_release_slot(region_id, slot, words, g, tails)
+            .release_slot_durably(region_id, slot, words, g, tails)
             .await
         {
             return Err(abort(e));
@@ -6703,7 +6802,7 @@ impl KvMetaBackend {
                 }
                 match plane.table.resolve(slot) {
                     crate::slot_lease_core::Resolved::Holder { holder, g }
-                        if set.region(holder).is_none() =>
+                        if !set.owns_region(holder) =>
                     {
                         // The tokens taken so far return with the pass.
                         drop(super::slot_lease::DoorPass::new(
@@ -6716,10 +6815,25 @@ impl KvMetaBackend {
                     _ => {
                         // Unleased, or ours in tree 0 without the gate bit
                         // (a window between the arm and the install):
-                        // acquire for region 0 — first-writer-takes-it —
-                        // then loop to take the token.
-                        self.manager_acquire_slots(0, 0, &[slot], ControlAdmit::Park)
-                            .await?;
+                        // acquire — first-writer-takes-it — then loop to
+                        // take the token. The manager grants itself
+                        // (region 0, one tree-0 put); a JOINED appender
+                        // asks its manager over the wire (PR 12b), whose
+                        // reply is what its projection learns from.
+                        let acquired = if set.is_joined_appender() {
+                            self.joined_acquire_slot(slot).await
+                        } else {
+                            self.manager_acquire_slots(0, 0, &[slot], ControlAdmit::Park)
+                                .await
+                                .map(|_| ())
+                        };
+                        if let Err(e) = acquired {
+                            drop(super::slot_lease::DoorPass::new(
+                                Arc::clone(&plane),
+                                std::mem::take(&mut entered),
+                            ));
+                            return Err(e);
+                        }
                     }
                 }
             }
@@ -7363,6 +7477,24 @@ impl KvMetaBackend {
         &self,
         at_leave: bool,
     ) -> std::result::Result<&Arc<super::appender::AppenderSet>, KvError> {
+        let set = self.appender_set_gate(at_leave)?;
+        // PR 12b: a JOINED appender holds no manager lease — its grants,
+        // returns and slot verbs travel to its manager over the wire
+        // (`joined_control_refusals` counts a site that forgot).
+        if set.is_joined_appender() {
+            self.refuse_joined_control("a manager verb's executor")?;
+        }
+        Ok(set)
+    }
+
+    /// The precondition every appender-set act shares — a joined writer
+    /// (the manager or a joined appender) on a forest volume, under the
+    /// write gate (or the leave's latch). [`Self::manager_gate`] adds the
+    /// manager-lease clause.
+    pub(super) fn appender_set_gate(
+        &self,
+        at_leave: bool,
+    ) -> std::result::Result<&Arc<super::appender::AppenderSet>, KvError> {
         let set = self.appenders.as_ref().ok_or_else(|| {
             KvError::Busy(format!(
                 "{}: not a symmetric-forest volume (bit 17 absent) — no manager lease exists",
@@ -7409,6 +7541,9 @@ impl KvMetaBackend {
         mut recs: Vec<(u8, Record)>,
         admit: EntryAdmission,
     ) -> std::result::Result<(), KvError> {
+        // PR 12b: ring 0 and tree 0 are the manager's — a joined appender
+        // never writes a control entry (its verbs travel over the wire).
+        self.refuse_joined_control("a control entry in ring 0")?;
         let forest = self.forest().ok_or_else(|| {
             KvError::Corrupt(format!(
                 "{}: a control entry on a volume without tree 0",
@@ -8524,6 +8659,17 @@ impl KvMetaBackend {
         let entries = super::appender::read_directory(&self.path, &self.sb).await?;
         if let Some(e) = entries.iter().find(|e| e.appender_id == appender_id) {
             if let Some(mut page) = e.page.clone() {
+                // ONE writer per page (PR 12 / PR 12b): a page the joiner's
+                // OWN writes own (`ckpt_seq ≥ 1` — its join stamps it) is
+                // never rewritten here; the grant's runs reach the joiner
+                // on the reply and ITS page write names them. A manager
+                // rewrite at a newer generation would stand between the
+                // joiner's RAM generation and the device, and the joiner's
+                // next page — its roots, its tail — would never be the
+                // newest image (found by the first two-daemon pin).
+                if page.ckpt_seq > 0 {
+                    return Ok(());
+                }
                 page.grant = grant.to_vec();
                 for off in e.dir_offsets {
                     page.generation += 1;
@@ -8777,6 +8923,15 @@ impl KvMetaBackend {
         &self,
         r: &super::appender::AppenderRegion,
     ) -> std::result::Result<(), KvError> {
+        Self::write_region_page_at(&self.path, r).await
+    }
+
+    /// [`Self::write_region_page`] for a caller without a backend yet (the
+    /// joined open's grant pre-sizing inside `open_appender_regions`).
+    pub(super) async fn write_region_page_at(
+        path: &Path,
+        r: &super::appender::AppenderRegion,
+    ) -> std::result::Result<(), KvError> {
         let images: Vec<(u64, Vec<u8>)> = {
             let mut page = r.page.lock().unwrap_or_else(|e| e.into_inner());
             let mask = r.dir_named.load(Ordering::Acquire);
@@ -8789,7 +8944,7 @@ impl KvMetaBackend {
             out
         };
         for (off, img) in images {
-            super::appender::write_page(&self.path, off, img).await?;
+            super::appender::write_page(path, off, img).await?;
         }
         r.dir_named
             .store(super::appender::DIR_NAMED_ALL, Ordering::Release);
@@ -8824,7 +8979,9 @@ impl KvMetaBackend {
             return Ok(());
         };
         let trees = forest.slot_trees();
-        for r in &set.regions {
+        // Only this mount's pages: a joined appender's region 0 is the
+        // manager's projection, its page the manager's to write.
+        for r in set.own_regions() {
             if r.released.load(Ordering::Acquire) {
                 continue;
             }
@@ -9812,11 +9969,39 @@ impl KvMetaBackend {
                     return Ok(TreeRef::Borrowed(forest.control()));
                 }
                 let slot = forest.slot_of_forest_key(key)?;
-                forest
-                    .slot_or_mint(slot, &self.mint_context_for(slot))
+                self.slot_or_mint_refilled(forest, slot)
                     .await
                     .map(TreeRef::Owned)
             }
+        }
+    }
+
+    /// [`super::forest::SlotTrees::slot_or_mint`] with the JOINED
+    /// appender's reactive refill (§5.3.3 — the exhausted mint is the
+    /// belt, the 50 % ask off the write path the steady state): a mint
+    /// the region's grant cannot cover asks the manager over the wire for
+    /// one SMO's images and retries ONCE; the manager's own mints draw the
+    /// bitmap and never reach the arm, a declared region's keep PR 3's
+    /// EAGAIN (its refill is the cadence's).
+    async fn slot_or_mint_refilled(
+        &self,
+        forest: &super::forest::SlotTrees,
+        slot: super::record::ForestSlot,
+    ) -> std::result::Result<Arc<KvTree>, KvError> {
+        match forest
+            .slot_or_mint(slot, &self.mint_context_for(slot))
+            .await
+        {
+            Err(KvError::GrantExhausted { needed, .. }) if self.is_joined_appender() => {
+                let want = u32::try_from(needed)
+                    .unwrap_or(u32::MAX)
+                    .max(super::appender::SMO_IMAGES_MAX);
+                self.joined_extent_grant(want).await?;
+                forest
+                    .slot_or_mint(slot, &self.mint_context_for(slot))
+                    .await
+            }
+            other => other,
         }
     }
 
@@ -12588,13 +12773,20 @@ impl KvMetaBackend {
                 .map_or(core.head(), |hold| hold.min(core.head()));
             core.reusable_upto() >= target
         };
-        if covered(self.ring.core()) {
+        // PR 12b: a JOINED appender's residue is ITS ring's (a rejoin's
+        // own-residue window) — ring 0 is the manager's, covered by the
+        // manager's cycles, never this mount's to cover.
+        let ring = match self.appenders.as_ref().and_then(|a| a.joined_appender) {
+            Some(id) => self.ring_of_region(id),
+            None => Arc::clone(&self.ring),
+        };
+        if covered(ring.core()) {
             return Ok(());
         }
         let mut smo = self.smo.lock().await;
         for _ in 0..COVER_CYCLES_MAX {
             self.checkpoint_cycle(&mut smo, true).await?;
-            if covered(self.ring.core()) {
+            if covered(ring.core()) {
                 return Ok(());
             }
         }
@@ -12603,8 +12795,8 @@ impl KvMetaBackend {
              {COVER_CYCLES_MAX} barriered cycles (head={}, reusable_upto={}) — \
              refusing to serve with a reclaimable tail (the D1.b wedge-crumb class)",
             self.path.display(),
-            self.ring.core().head(),
-            self.ring.core().reusable_upto(),
+            ring.core().head(),
+            ring.core().reusable_upto(),
         )))
     }
 
@@ -13786,7 +13978,7 @@ impl KvMetaBackend {
     /// THIS host. That classification goes in the mount log beside the
     /// guarantee class, so an operator reading a reader's log knows whether
     /// the writer it lags behind is local or remote.
-    fn probe_shared_lock(path: &Path) -> SharedProbe {
+    pub fn probe_shared_lock(path: &Path) -> SharedProbe {
         let fd = match std::fs::OpenOptions::new().read(true).open(path) {
             Ok(fd) => fd,
             Err(e) => {
@@ -14577,6 +14769,14 @@ impl KvMetaBackend {
         if self.ro_cause == ReadOnlyCause::PeerOwnedVolume {
             return "peer-owned";
         }
+        // Symmetric PR 12b: a JOINED appender holds no lock and no claim
+        // on this volume by design — its exclusion is the slot LEASE
+        // (tree 0's lessee, the commit door) under the manager's WERO on
+        // the metadata namespace, with the death ledger as its liveness;
+        // its own guarantee row in docs/operations.md.
+        if self.is_joined_appender() {
+            return "joined-appender";
+        }
         let guarded = self.guard_fd.lock().unwrap().is_some();
         match (guarded, &self.reservations) {
             (false, _) => "unguarded",
@@ -14891,7 +15091,7 @@ impl KvMetaBackend {
                 return Err(KvError::Io(crate::error::SqueezefsError::Io(e)));
             }
         };
-        let mut inner = Self::open_inner(path, OpenPosture::Writer).await?;
+        let mut inner = Self::open_inner(path, OpenPosture::Writer, None).await?;
         *inner.guard_fd.get_mut().unwrap() = Some(guard_fd);
         let be = Arc::new(inner);
         // PR M7: conveyor identity before the clear's removexattr commit
@@ -15842,6 +16042,20 @@ enum OpenPosture {
     /// slot tree 0 does not name yet are skipped (S5 bounded staleness —
     /// served at the poll after the writer publishes).
     NonWriter,
+    /// A JOINED non-manager appender (PR 12b): the fixed ring is the
+    /// MANAGER's and replays as a non-writer's projection (no mint, the
+    /// unpublished slots skipped — they are the manager's to publish),
+    /// while the region this mount joined over the wire replays as its
+    /// own residue and every later commit lands in that ring.
+    JoinedAppender,
+}
+
+impl OpenPosture {
+    /// Whether the fixed ring's replay may MINT the slot trees its window
+    /// names — the write mount alone (`forest::MintPolicy::Recovery`).
+    fn mints_at_replay(self) -> bool {
+        self == Self::Writer
+    }
 }
 
 /// How a routed dentry mutation updates its parent directory (the v2
@@ -16127,9 +16341,10 @@ impl KvMetaBackend {
             seq,
             alloc,
             floor: ledger.journal_tail_seq,
-            policy: match posture {
-                OpenPosture::Writer => super::forest::MintPolicy::Recovery,
-                OpenPosture::NonWriter => super::forest::MintPolicy::Refuse,
+            policy: if posture.mints_at_replay() {
+                super::forest::MintPolicy::Recovery
+            } else {
+                super::forest::MintPolicy::Refuse
             },
             // A recovery mint draws the bitmap, never a grant: the region
             // set is not yet open here, and a recovered root extent the
@@ -16144,7 +16359,7 @@ impl KvMetaBackend {
         let route = |slot: ForestSlot,
                      skipped: &mut std::collections::BTreeMap<ForestSlot, u64>|
          -> Option<ForestSlot> {
-            if posture == OpenPosture::NonWriter && forest.tree(slot).is_none() {
+            if !posture.mints_at_replay() && forest.tree(slot).is_none() {
                 *skipped.entry(slot).or_insert(0) += 1;
                 super::META_KV_FOREST_READER_WINDOW_SKIPS.fetch_add(1, Ordering::Relaxed);
                 return None;
@@ -16181,7 +16396,7 @@ impl KvMetaBackend {
         // sent a field hunt after phantom device corruption).
         let mint_refused = |e: KvError| -> KvError {
             match e {
-                KvError::NoSpace { free, reserve } if posture == OpenPosture::Writer => {
+                KvError::NoSpace { free, reserve } if posture.mints_at_replay() => {
                     KvError::Io(crate::error::SqueezefsError::no_space(format!(
                         "{}: replaying the journal window needs one root extent for EACH of \
                          the {} slot tree(s) tree 0 does not name yet (slots {:?}; their \
@@ -16383,7 +16598,7 @@ impl KvMetaBackend {
     /// the node token + this process's mount slot; a box without any
     /// node-identity material falls back to a boot-scoped token so two
     /// mounts of one boot still match their own residue.
-    fn appender_identity_scope(boot_id: &str) -> (u64, u32) {
+    pub fn appender_identity_scope(boot_id: &str) -> (u64, u32) {
         if let Some(scope) = crate::writer_scope::engaged_scope() {
             return (scope.node, scope.slot);
         }
@@ -16435,6 +16650,7 @@ impl KvMetaBackend {
         posture: OpenPosture,
         boot_id: &str,
         recovering: super::appender::RecoveringStructure,
+        joined: Option<joined::JoinedOpen>,
     ) -> std::result::Result<super::appender::AppenderSet, KvError> {
         use super::appender::{
             appender0_page_offsets, declared_partition, dir_pairs_per_extent,
@@ -16444,7 +16660,15 @@ impl KvMetaBackend {
         use super::journal::RingSegment;
 
         let entries = read_directory(path, sb).await?;
-        let scope = Self::appender_identity_scope(boot_id);
+        // A JOINED appender's identity is the admission's `(node, mount
+        // slot)` — exact, never the node alone: on one host the manager
+        // and every joiner share the node token, and only the pair names
+        // whose page is whose (§5.3.2's identity binding for a joiner).
+        let is_joined = posture == OpenPosture::JoinedAppender;
+        let scope = match &joined {
+            Some(j) => (j.identity.node_token, j.identity.mount_slot),
+            None => Self::appender_identity_scope(boot_id),
+        };
         let native_slot = ledger
             .membership_stamp
             .as_ref()
@@ -16459,15 +16683,24 @@ impl KvMetaBackend {
             })
             .count() as u64;
         let is_writer = posture == OpenPosture::Writer;
-        let partition = if is_writer {
-            declared_partition()?
-        } else {
-            Default::default()
+        // The regions this mount stands up beside region 0: the seam's
+        // declared partition on the manager; on a joined appender exactly
+        // ONE — the region the manager minted for it over the wire (its
+        // lease set fills from the wire acquires).
+        let partition: std::collections::BTreeMap<
+            u32,
+            std::collections::BTreeSet<super::record::ForestSlot>,
+        > = match &joined {
+            Some(j) => std::iter::once((j.appender_id, Default::default())).collect(),
+            None if is_writer => declared_partition()?,
+            None => Default::default(),
         };
         // The armed plane (PR 4): the seam's declared slots are a WISH-LIST
         // the arm reconciles against tree 0 — a region's lease set starts
-        // empty and fills from the real acquire path.
-        let armed = is_writer && super::slot_lease::symmetric_meta_requested();
+        // empty and fills from the real acquire path. A joined appender
+        // opens under the plane by construction (the door refused the
+        // admission without it).
+        let armed = (is_writer || is_joined) && super::slot_lease::symmetric_meta_requested();
         // The volume length the ring derivation clamps against: the heap's
         // end (the superblock stores no volume length; the redundant
         // superblock copy sits in the one sector past it).
@@ -16477,8 +16710,17 @@ impl KvMetaBackend {
 
         // A writer reaching this point holds the D0 flock (step (1) of
         // `open`): a same-NODE Live page is a dead predecessor's residue
-        // whatever mount slot it carried — see `owned_by_node`.
-        let mine = |p: &AppenderPage| p.identity.owned_by_node(scope.0);
+        // whatever mount slot it carried — see `owned_by_node`. A JOINED
+        // appender holds no flock and shares its node with the manager and
+        // every other joiner on the host: its own page is the one carrying
+        // its exact `(node, mount slot)`.
+        let mine = |p: &AppenderPage| {
+            if is_joined {
+                p.identity.node_token == scope.0 && p.identity.mount_slot == scope.1
+            } else {
+                p.identity.owned_by_node(scope.0)
+            }
+        };
         // The ONE page a writer may not join over (PR 10 narrowed PR 2/3's
         // refusal to it): a FOREIGN node's `Live` / `Recovering` page whose
         // id the DECLARED partition claims — the seam would stand a fresh
@@ -16600,6 +16842,7 @@ impl KvMetaBackend {
             appenders_known: AtomicU64::new(0),
             leases: None,
             recovering_structure: std::sync::Mutex::new(Default::default()),
+            joined_appender: joined.as_ref().map(|j| j.appender_id),
         };
         let mut regions: Vec<Arc<AppenderRegion>> = Vec::new();
 
@@ -16684,6 +16927,27 @@ impl KvMetaBackend {
                 .unwrap_or_else(|| AppenderPage::free(id, 0));
             let own_live = matches!(page.state, AppenderState::Live | AppenderState::Recovering)
                 && mine(&page);
+            // A joined appender's region was minted by the MANAGER's
+            // `JoinAppender` a moment ago — `Live` under this identity,
+            // its ring named (a fresh join's window is empty; a rejoin's
+            // is own residue). Anything else here is a torn or foreign
+            // page: the fresh-ring arm below claims from the manager's
+            // bitmap, which is not this mount's to claim from — refuse.
+            if is_joined && !(own_live && !page.segments.is_empty()) {
+                return Err(KvError::Corrupt(format!(
+                    "{}: appender {id}'s page is {:?} under node {:#018x} / mount slot {:#x} with \
+                     {} ring segment(s) right after this mount's JoinAppender named it Live for \
+                     node {:#018x} / mount slot {:#x} — refusing the joined open (the manager's \
+                     reply and the directory disagree)",
+                    path.display(),
+                    page.state,
+                    page.identity.node_token,
+                    page.identity.mount_slot,
+                    page.segments.len(),
+                    scope.0,
+                    scope.1,
+                )));
+            }
             let reserve = checkpoint_reserve_bytes(ring_bytes);
             let (ring, self_recovered) = if own_live && !page.segments.is_empty() {
                 // Own residue: replay THIS ring from ITS page's tail.
@@ -16709,19 +16973,35 @@ impl KvMetaBackend {
                     page.seq_offset
                         .max(super::journal::seq_offset_of_window(&rec.entries)),
                 );
-                log::info!(
-                    "meta volume {}: appender {id}'s page is LIVE under our own node (mount slot \
-                     {:#x}, term {}) — replaying its ring ({} entries past tail {}) as our own \
-                     residue",
-                    path.display(),
-                    page.identity.mount_slot,
-                    page.term,
-                    rec.entries.len(),
-                    page.ledger_tail_seq
-                );
-                set.self_recoveries.fetch_add(1, Ordering::Relaxed);
+                // A joined appender's FRESH join stands its ring up here
+                // too (the manager wrote the page Live, its window empty):
+                // nothing died, nothing is recovered — only a REJOIN over a
+                // Live page (`already`) is own residue.
+                let fresh_join = joined.as_ref().is_some_and(|j| !j.already);
+                if fresh_join {
+                    log::info!(
+                        "meta volume {}: appender {id} joined over the wire (mount slot {:#x}, \
+                         term {}) — its ring stands at head {} with an empty window",
+                        path.display(),
+                        page.identity.mount_slot,
+                        page.term,
+                        page.head_hint
+                    );
+                } else {
+                    log::info!(
+                        "meta volume {}: appender {id}'s page is LIVE under our own identity \
+                         (mount slot {:#x}, term {}) — replaying its ring ({} entries past tail \
+                         {}) as our own residue",
+                        path.display(),
+                        page.identity.mount_slot,
+                        page.term,
+                        rec.entries.len(),
+                        page.ledger_tail_seq
+                    );
+                    set.self_recoveries.fetch_add(1, Ordering::Relaxed);
+                }
                 recovered.push((id, rec));
-                (ring, true)
+                (ring, !fresh_join)
             } else {
                 // A fresh ring from the heap (`Free`, or `Recovered` — never
                 // replayed, §5.8.3): whole extents claimed internal-class,
@@ -16825,8 +17105,10 @@ impl KvMetaBackend {
             // image was dropped by `free_pending`'s claimed guard: never
             // parked, never returned, invisible to C13 and to the closure
             // gauge — the silent leak on the ordinary clean lifecycle. The
-            // ring window's alloc/free records refine both below.
-            if !self_recovered {
+            // ring window's alloc/free records refine both below. A joined
+            // appender's page is the manager's `JoinAppender` image — its
+            // grant word IS the unclaimed remainder the join minted, kept.
+            if !self_recovered && !is_joined {
                 page.grant.clear();
             }
             let record = match forest
@@ -16913,7 +17195,9 @@ impl KvMetaBackend {
                     }
                 }
             }
-            for r in &regions {
+            // This mount's OWN regions carry its identity — on a joined
+            // appender region 0 is the manager's, noted from its page above.
+            for r in regions.iter().filter(|r| !(is_joined && r.id == 0)) {
                 plane.note_identity(r.id, set.identity.node_token, set.identity.mount_slot);
             }
             // A recovery in flight at this open (Issue 31): every foreign
@@ -17050,8 +17334,9 @@ impl KvMetaBackend {
         // checkpoint's page write and the next cycle's tree-0 publication
         // (page one root ahead of tree 0 on an unarmed forest, whose page
         // 0 names EVERY guest root). A `Recovering` own page is own
-        // residue like a `Live` one (F1's other half).
-        if is_writer {
+        // residue like a `Live` one (F1's other half). A joined appender
+        // runs it for ITS page alone (`mine` is exact there).
+        if is_writer || is_joined {
             for r in &set.regions {
                 let (entries, page_tail, page_recovering): (
                     Vec<super::appender::SlotEntry>,
@@ -17168,8 +17453,9 @@ impl KvMetaBackend {
             // (foreign — nothing of this open folds into it: the
             // manager's interior records for it are stashed, not
             // applied). The floor is ring 0's durable tail: every record
-            // of the recoverer's under this root sits at or past it.
-            for e in &entries {
+            // of the recoverer's under this root sits at or past it. The
+            // manager's arm alone — a joined appender recovers nothing.
+            for e in entries.iter().filter(|_| is_writer) {
                 if !recovering_pages.contains(&e.appender_id) {
                     continue;
                 }
@@ -17227,19 +17513,108 @@ impl KvMetaBackend {
                 .unwrap_or_else(|e| e.into_inner()) = recovering_stash;
         }
 
+        // A joined appender's own-residue replay mints the slot trees its
+        // window names and no root does yet — from ITS grant. The
+        // predecessor may have died with the grant consumed (every extent
+        // of the page's word claimed by the very mints the window records
+        // — phase 1's `claim_exact` below marks them so), which left the
+        // rejoin's replay at `GrantExhausted` and the join refused for
+        // ever (found by the rejoin pin). The need is counted here and
+        // asked over the wire the join already travelled, BEFORE the
+        // replay: one `ExtentGrant` per rejoin at most.
+        if let Some(j) = joined.as_ref() {
+            if let Some((_, rec)) = recovered.iter().find(|(id, _)| *id == j.appender_id) {
+                if let Some(region) = set.region(j.appender_id) {
+                    let mut claimed_in_window = 0u64;
+                    let mut unrooted: std::collections::BTreeSet<super::record::ForestSlot> =
+                        std::collections::BTreeSet::new();
+                    for entry in &rec.entries {
+                        for (tag, r) in &entry.records {
+                            let (tree_id, level) = untag(*tag);
+                            if tree_id == super::record::TREE_ALLOC_RESERVED {
+                                if !crate::data_alloc_bitmap::is_data_alloc_delta_key(&r.key)
+                                    && matches!(
+                                        super::alloc_ext::decode_alloc_record(r)?,
+                                        super::alloc_ext::AllocDelta::Allocated { .. }
+                                    )
+                                {
+                                    claimed_in_window += 1;
+                                }
+                                continue;
+                            }
+                            let slot = if tree_id == super::record::KIND_INTERIOR && level > 0 {
+                                super::forest::split_interior_journal_key(&r.key)?.0
+                            } else if level == 0 && super::record::is_slot_tree_kind(tree_id) {
+                                super::record::forest_key_slot(&r.key)?
+                            } else {
+                                continue;
+                            };
+                            if forest.tree(slot).is_none() {
+                                unrooted.insert(slot);
+                            }
+                        }
+                    }
+                    let need = unrooted.len() as u64;
+                    let have = region.grant().unclaimed().saturating_sub(claimed_in_window);
+                    if need > have {
+                        let want = u32::try_from(need - have)
+                            .unwrap_or(u32::MAX)
+                            .max(super::appender::SMO_IMAGES_MAX);
+                        let got = joined::wire_extent_refill(
+                            path,
+                            sb.heap.start,
+                            cache,
+                            &j.wire,
+                            region,
+                            want,
+                        )
+                        .await?;
+                        log::info!(
+                            "meta volume {}: joined appender {}'s own-residue replay needs {need} \
+                             root extent(s) for {} unrooted slot tree(s) against {have} unclaimed \
+                             — {got} granted over the wire before the replay",
+                            path.display(),
+                            j.appender_id,
+                            unrooted.len()
+                        );
+                    }
+                }
+            }
+        }
+
         // ---- Apply the recovered content rings into the forest (phase 2
         // of §5.3.4 per ring — content by forest key; order-independent
         // across rings because they are key-disjoint in-window, which the
         // check above just proved).
-        let mint = super::forest::MintContext {
-            cache,
-            seq,
-            alloc,
-            floor: ledger.journal_tail_seq,
-            policy: super::forest::MintPolicy::Recovery,
-            region: None,
-        };
         for (id, rec) in &recovered {
+            // A window record of a slot tree no root names yet mints the
+            // tree at replay: from the manager's bitmap on the manager
+            // (the flat mount-time mints' class), from ITS OWN GRANT on a
+            // joined appender (§5.3.3 — a content appender never touches
+            // a bitmap page; the claim is journaled into its own ring by
+            // the mint's own record at the next cycle, PR 3's law).
+            let own_joined = set
+                .region(*id)
+                .filter(|_| set.is_joined_appender() && *id != 0);
+            let region = own_joined.map(|r| super::tree::SmoRegion {
+                appender_id: *id,
+                ring: r.ring(),
+                grant: Arc::clone(&r.grant),
+            });
+            // The minted tree's root floor is a position in the ring ITS
+            // records journal into: the region's page tail on a joined
+            // appender, the ledger's on the manager.
+            let floor = own_joined.map_or(ledger.journal_tail_seq, |r| {
+                r.last_tail.load(Ordering::Acquire)
+            });
+            let mint = super::forest::MintContext {
+                cache,
+                seq,
+                alloc,
+                floor,
+                policy: super::forest::MintPolicy::Recovery,
+                region,
+            };
             // Phase 1: the region's own SMO pointer records by (level
             // DESC, seq) — the lessee's interior flips journal in ITS
             // ring since PR 3 (§5.2.3) — and its allocator deltas, which

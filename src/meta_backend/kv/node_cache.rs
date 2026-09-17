@@ -3248,6 +3248,44 @@ impl NodeCache {
         self.remove_nodes(victims)
     }
 
+    /// **The granted extents' cache barrier** (symmetric PR 12b): drop
+    /// every cached node whose address lies inside `extents` (heap extent
+    /// indices). A JOINED appender's grant is carved from the MANAGER's
+    /// free heap — extents whose previous images this mount may have
+    /// LOADED as its projection (tree 0's root before the manager's next
+    /// compaction moved it; a guest leaf the manager retired) — so a mint
+    /// or an SMO image written there would meet a stale node under its own
+    /// address in RAM and every traversal would restart on the seq
+    /// mismatch for ever (found by the first two-daemon pin). Nothing of
+    /// this mount is ever dirty under a granted extent (it held no image
+    /// of ours): a dirty node here is a defect, refused loud, nothing
+    /// dropped. Returns the nodes dropped.
+    pub fn drop_nodes_in_extents(&self, heap_base: u64, extents: &[u64]) -> Result<usize, KvError> {
+        if extents.is_empty() {
+            return Ok(0);
+        }
+        let node_size = self.cfg.layout.node_size() as u64;
+        let granted: std::collections::BTreeSet<u64> = extents.iter().copied().collect();
+        let mut victims: Vec<Arc<CachedNode>> = Vec::new();
+        self.for_each_node(|n| {
+            let addr = n.addr();
+            if addr >= heap_base && granted.contains(&((addr - heap_base) / node_size)) {
+                victims.push(Arc::clone(n));
+            }
+        });
+        for node in &victims {
+            if node.dirty_floor() != u64::MAX {
+                return Err(KvError::Corrupt(format!(
+                    "granted extent barrier: node {:#x} is DIRTY (floor {}) inside an extent the \
+                     manager just granted — this mount wrote to an image it did not own",
+                    node.addr(),
+                    node.dirty_floor()
+                )));
+            }
+        }
+        Ok(self.remove_nodes(victims))
+    }
+
     /// Remove `victims` from the map (each by identity), noting every
     /// one's dying floor so the tail keeps respecting a record the node
     /// carried until the next barrier. Returns the nodes removed.

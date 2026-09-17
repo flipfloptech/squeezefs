@@ -640,6 +640,164 @@ pub async fn open_routed_meta_set_co_writer(
     ))
 }
 
+/// **Symmetric PR 12b — [`open_routed_meta_set`]'s JOINED-APPENDER twin**
+/// (design-symmetric-metadata §7.3, the join ladder's terminal step for a
+/// non-manager RW mount of an ARMED set): the same §5.5.1a stamp
+/// discovery, the same canonical member ordering and slot-map validation,
+/// each volume opened through [`kv::backend::KvMetaBackend::open_joined_appender`]
+/// against the manager's published listener — the volume's ordinal is the
+/// manager frame's `volume` word, so ONE endpoint serves the whole set.
+///
+/// No guard is taken on any member (the manager holds them), so a mid-set
+/// failure tears down what joined so far through each backend's own
+/// shutdown (its slots released over the wire, its page freed) and nothing
+/// else. The set then runs the WRITER's tail — its own open cross-owner
+/// intents rolled forward (the scan is scoped to the slots this mount's
+/// step-home is `Local` for, so two mounts never both adopt one intent —
+/// PR 6 round 2), the roll-forward cadence, the striping self-handle and
+/// the symmetric roles (a joined appender's `T_self` action is the park,
+/// PR 8) — because a joined appender IS a writer for its slots.
+pub async fn open_routed_meta_set_joined(
+    paths: &[String],
+    admission: &JoinedSetAdmission,
+) -> Result<std::sync::Arc<RoutedMetaBackend>> {
+    let disc = discover_meta_set(paths).await?;
+    validate_slot_map(
+        disc.ordered_paths.len(),
+        disc.routing_width,
+        &disc.slot_to_volume,
+    )?;
+    refuse_mixed_multi_writer_set(&disc.ordered_paths).await?;
+    let mut vols: Vec<std::sync::Arc<kv::backend::KvMetaBackend>> =
+        Vec::with_capacity(disc.ordered_paths.len());
+    for (ordinal, path) in disc.ordered_paths.iter().enumerate() {
+        let per_volume = kv::backend::JoinedAppenderAdmission {
+            manager_endpoint: admission.manager_endpoint.clone(),
+            secret: admission.secret.clone(),
+            peer_id: admission.peer_id.clone(),
+            volume: u16::try_from(ordinal).map_err(|_| {
+                crate::error::SqueezefsError::InvalidOperation(format!(
+                    "joined open: volume ordinal {ordinal} exceeds the manager frame's u16 word"
+                ))
+            })?,
+            identity: admission.identity,
+        };
+        match kv::backend::KvMetaBackend::open_joined_appender(
+            std::path::Path::new(path),
+            &per_volume,
+        )
+        .await
+        {
+            Ok(be) => vols.push(be),
+            Err(e) => {
+                for prior in &vols {
+                    if let Err(te) = prior.shutdown().await {
+                        log::warn!(
+                            "leaving joined appender region on {:?} after a failed set join \
+                             failed too: {te}",
+                            prior.device_path()
+                        );
+                    }
+                }
+                return Err(e.into());
+            }
+        }
+    }
+    let routed = std::sync::Arc::new(RoutedMetaBackend::with_slot_map_and_natives(
+        vols,
+        disc.routing_width,
+        disc.slot_to_volume,
+        disc.native_slots,
+    )?);
+    crossvol_tx::recover_open_intents(&routed).await?;
+    for vol in &routed.volumes {
+        vol.cover_bring_up_residue().await?;
+    }
+    crossvol_tx::spawn_roll_forward_cadence(
+        std::sync::Arc::downgrade(&routed),
+        kv::checkpoint::checkpoint_landing_ceiling_derived(),
+    );
+    routed.install_stripe_self();
+    kv::alloc_lease::arm_symmetric_roles(&routed);
+    Ok(routed)
+}
+
+/// What a non-manager RW mount of an armed set needs to join it — resolved
+/// by [`symmetric_join_target`] off DURABLE state (the manager's page 0
+/// identity → its claim-set entry's published listener; the set's cluster
+/// secret; this node's member id and appender identity).
+#[derive(Debug, Clone)]
+pub struct JoinedSetAdmission {
+    pub manager_endpoint: String,
+    pub secret: Vec<u8>,
+    pub peer_id: String,
+    pub identity: kv::appender::AppenderIdentity,
+}
+
+/// **The join ladder's terminal decision** (design-symmetric-metadata
+/// §7.3, PR 12b): under `SQUEEZEFS_SYMMETRIC_META=1`, does this set already
+/// have a live MANAGER this mount should JOIN rather than claim? Read off
+/// the first volume through a probe (nothing written, no lock): a LOCAL
+/// exclusive holder of the writer lock (a same-host manager) or a
+/// heartbeat-FRESH `writer_claim` of another writer (the D0 gate's own
+/// `FreshForeign` class) means yes — then the manager's endpoint is its
+/// page 0's identity resolved through the claim set (`sym_join::
+/// resolve_holder_endpoint`) and the secret the set's `job:enroll` record.
+/// `Ok(None)` = no live manager (this mount walks the D0 ladder and
+/// becomes it), or the plane is not requested (the shipped posture
+/// exactly). A live manager whose endpoint is unresolvable REFUSES loud:
+/// a second RW mount that can neither claim nor join must not half-join.
+pub async fn symmetric_join_target(paths: &[String]) -> Result<Option<JoinedSetAdmission>> {
+    if !kv::slot_lease::symmetric_meta_requested() {
+        return Ok(None);
+    }
+    let disc = discover_meta_set(paths).await?;
+    let Some(first) = disc.ordered_paths.first() else {
+        return Ok(None);
+    };
+    let probe = open_volume_probe(first).await?;
+    if !probe.superblock().symmetric_forest_stamped() {
+        return Ok(None);
+    }
+    let live_manager = matches!(
+        kv::backend::KvMetaBackend::probe_shared_lock(std::path::Path::new(first)),
+        kv::backend::SharedProbe::LocalExclusiveHolder
+    ) || matches!(
+        probe.claim_standing().await,
+        crate::partial_authority::ClaimStanding::Fresh
+    );
+    if !live_manager {
+        return Ok(None);
+    }
+    let endpoint = crate::sym_join::resolve_holder_endpoint(&probe, 0).await;
+    let secret = crate::membership::cluster_secret(&probe).await;
+    let peer_id = crate::cowriter::node_member_id()?;
+    drop(probe);
+    let (Some(endpoint), Some(secret)) = (endpoint, secret) else {
+        return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+            "refusing to mount: metadata volume {first} has a LIVE manager but this mount cannot \
+             JOIN it — the manager's published listener or the set's cluster secret is missing \
+             (the manager's join ladder publishes its endpoint at rung 7; the secret is the \
+             `job:enroll` record). A second RW mount of an armed set joins as a writer or refuses; \
+             it never half-joins (design-symmetric-metadata §7.3, PR 12b)"
+        )));
+    };
+    // The same `(node, mount slot)` scope the manager's open binds its
+    // pages to — ONE derivation (`appender_identity_scope`).
+    let (node_token, mount_slot) =
+        kv::backend::KvMetaBackend::appender_identity_scope(&kv::backend::read_boot_id());
+    Ok(Some(JoinedSetAdmission {
+        manager_endpoint: endpoint,
+        secret,
+        peer_id,
+        identity: kv::appender::AppenderIdentity {
+            node_token,
+            mount_slot,
+            writer_id: 0,
+        },
+    }))
+}
+
 /// **Per-volume claim admission — [`open_routed_meta_set`]'s PARTIAL twin
 /// and the mount path's entry point** (§5.4 sweep row 18, PR 4), modeled
 /// on [`open_routed_meta_set_co_writer`]:

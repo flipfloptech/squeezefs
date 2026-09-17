@@ -1615,6 +1615,12 @@ impl KvMetaBackend {
         smo: &mut SmoContext,
         barrier_now: bool,
     ) -> Result<(), KvError> {
+        // PR 12b: a JOINED appender's cycle is over ITS ring, ITS slot
+        // trees and ITS page alone — the ledger, the bitmap, tree 0 and
+        // page 0 below are the manager's (`joined_checkpoint_cycle`).
+        if self.is_joined_appender() {
+            return self.joined_checkpoint_cycle(smo, barrier_now).await;
+        }
         let cycle_started = std::time::Instant::now();
         let h = self.journal_ring().core().head();
         // The wedged-tail progress audit's inputs (see the barrier_now

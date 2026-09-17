@@ -155,25 +155,22 @@ impl Drop for DirRenameLease {
 
 impl KvMetaBackend {
     /// The appender id this mount's OWN identity holds on this volume —
-    /// region 0's (the manager's, KD-SYM-3; a joined non-manager
-    /// appender's own region is PR 12's). A declared region's slot is
-    /// another appender's for every cross-owner decision, which is what
-    /// makes the seam PR 2–4 built a two-holder model in one process.
+    /// region 0's on the manager (KD-SYM-3), the joined region's on a
+    /// non-manager (PR 12b). A declared region's slot is another
+    /// appender's for every cross-owner decision, which is what makes the
+    /// seam PR 2–4 built a two-holder model in one process.
     pub fn own_appender_id(&self) -> u32 {
-        self.appenders
-            .as_ref()
-            .and_then(|s| s.regions.first())
-            .map_or(0, |r| r.id)
+        self.appenders.as_ref().map_or(0, |s| s.own_id())
     }
 
     /// Is appender `id` one of THIS mount's regions — i.e. does its 4a
     /// lock table live in this process (the one-canonical-`lock_many`
     /// table of `crossvol_tx::acquire_guards_leased`)? Region 0 and the
-    /// declared regions; a wire joiner's is another process's.
+    /// declared regions on the manager; the joined region alone on a
+    /// non-manager (its region 0 is the manager's projection); a wire
+    /// joiner's is another process's.
     pub fn is_own_region(&self, id: u32) -> bool {
-        self.appenders
-            .as_ref()
-            .is_some_and(|s| s.regions.iter().any(|r| r.id == id))
+        self.appenders.as_ref().is_some_and(|s| s.owns_region(id))
     }
 
     /// The intent-only `tx0`: a plan whose first step is another

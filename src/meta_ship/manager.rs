@@ -276,7 +276,22 @@ pub enum ManagerCall {
     // of volume 0 (the S5 poller), never a verb; `RecordDeath` /
     // `RecordRecovered` (PR 8's block) are the two writes the driver
     // needs, and `appender clear` is offline. The range stays reserved.
+    // ---- PR 12b — the joined appender's LEAVE (design §5.1.3 "region
+    // release": the page goes `Free`, ring extents and the unclaimed grant
+    // return — `appender_leaves`), appended at the end.
+    /// A JOINED appender leaves: its page (Live under `identity`, naming
+    /// no slot — every lease was released first) goes `Free`, its ring
+    /// extents and `unclaimed` (its remainder) return to the heap.
+    /// Idempotent against the page (`Left { already }`).
+    LeaveAppender {
+        identity: WireIdentity,
+        appender_id: u32,
+        unclaimed: Vec<WireRun>,
+    },
 }
+
+/// PR 12b's documented verb code (the wire encodes the declaration index).
+pub const VERB_CODE_LEAVE_APPENDER: u8 = 0xB0;
 
 /// PR 8's documented verb codes (the range the level-4 coordination
 /// assigned; the wire encodes the enum's declaration index — these are the
@@ -358,6 +373,7 @@ impl ManagerCall {
             Self::AllocLeaseRelease { .. } => "alloc_lease_release",
             Self::RecordRecovered { .. } => "record_recovered",
             Self::RecordDeath { .. } => "record_death",
+            Self::LeaveAppender { .. } => "leave_appender",
         }
     }
 }
@@ -500,6 +516,11 @@ pub enum ManagerReply {
     /// `AllocLeaseBitmap` / `AllocLeaseRelease` / `RecordRecovered`: the
     /// durable record landed (`already` = it had).
     Recorded {
+        already: bool,
+    },
+    /// `LeaveAppender` (PR 12b): the page is `Free`, the ring and the
+    /// remainder returned (`already` = it was — a replay).
+    Left {
         already: bool,
     },
 }
@@ -1004,6 +1025,22 @@ impl ManagerService {
                         .await
                         .map(|already| ManagerReply::Recorded { already }),
                 },
+                // PR 12b: the runs travel as RUNS and are intersected with
+                // the appender's record run by run (the ReturnExtents
+                // law); the page and the ring extents are the directory's.
+                ManagerCall::LeaveAppender {
+                    identity,
+                    appender_id,
+                    unclaimed,
+                } => self
+                    .volume
+                    .manager_leave_appender(
+                        (*identity).into(),
+                        *appender_id,
+                        &runs_from_wire(unclaimed),
+                    )
+                    .await
+                    .map(|already| ManagerReply::Left { already }),
             };
         let (reply, status) = match served {
             Ok(reply) => (reply, STATUS_OK),
@@ -1654,6 +1691,29 @@ impl ManagerClient {
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "RecordDeath answered {other:?}"
+            ))),
+        }
+    }
+
+    /// `LeaveAppender` (PR 12b) — `Ok(already)`.
+    pub async fn leave_appender(
+        &mut self,
+        identity: AppenderIdentity,
+        appender_id: u32,
+        unclaimed: &[GrantRun],
+    ) -> Result<bool> {
+        match self
+            .call(ManagerCall::LeaveAppender {
+                identity: identity.into(),
+                appender_id,
+                unclaimed: runs_to_wire(unclaimed),
+            })
+            .await?
+        {
+            ManagerReply::Left { already } => Ok(already),
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Err(SqueezefsError::InvalidOperation(format!(
+                "LeaveAppender answered {other:?}"
             ))),
         }
     }

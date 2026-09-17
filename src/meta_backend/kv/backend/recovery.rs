@@ -793,7 +793,7 @@ impl KvMetaBackend {
                 return Err(KvError::Io(crate::error::SqueezefsError::Io(e)));
             }
         };
-        let mut inner = Self::open_inner(path, OpenPosture::Writer).await?;
+        let mut inner = Self::open_inner(path, OpenPosture::Writer, None).await?;
         *inner.guard_fd.get_mut().unwrap_or_else(|e| e.into_inner()) = Some(guard_fd);
         let be = Arc::new(inner);
         let _ = be.conveyor_self.set(Arc::downgrade(&be));
@@ -2760,7 +2760,7 @@ impl KvMetaBackend {
             claim_volumes.push(vol0_path);
         }
         for p in claim_volumes {
-            let probe = Self::open_inner(p, OpenPosture::NonWriter).await?;
+            let probe = Self::open_inner(p, OpenPosture::NonWriter, None).await?;
             if let Ok(Some(raw)) = probe.getxattr(1, WRITER_CLAIM_XATTR).await {
                 if let Some(c) = WriterClaim::decode(&raw) {
                     if c.age_secs(now) <= crate::fuse_client::CLIENT_STALE_TTL_SECS {
@@ -2778,7 +2778,7 @@ impl KvMetaBackend {
                 }
             }
         }
-        let mut inner = Self::open_inner(path, OpenPosture::Writer).await?;
+        let mut inner = Self::open_inner(path, OpenPosture::Writer, None).await?;
         *inner.guard_fd.get_mut().unwrap_or_else(|e| e.into_inner()) = Some(guard_fd);
         let be = Arc::new(inner);
         let _ = be.conveyor_self.set(Arc::downgrade(&be));
@@ -2863,7 +2863,7 @@ impl KvMetaBackend {
             be.sync_device().await.map_err(KvError::Io)?;
             be.checkpoint_now().await?;
         } else {
-            let mut v0 = Self::open_inner(vol0_path, OpenPosture::Writer).await?;
+            let mut v0 = Self::open_inner(vol0_path, OpenPosture::Writer, None).await?;
             *v0.guard_fd.get_mut().unwrap_or_else(|e| e.into_inner()) = vol0_guard;
             let v0 = Arc::new(v0);
             let _ = v0.conveyor_self.set(Arc::downgrade(&v0));

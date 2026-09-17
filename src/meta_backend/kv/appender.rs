@@ -2253,6 +2253,14 @@ pub struct AppenderSet {
     pub recovering_structure: std::sync::Mutex<
         std::collections::BTreeMap<super::record::ForestSlot, Vec<RecoveringInterior>>,
     >,
+    /// **The joined-appender posture** (design-symmetric-metadata §7.3 /
+    /// §5.3, PR 12b): `Some(id)` on a NON-MANAGER RW mount — this mount's
+    /// own region is `id` (joined over the wire), and `regions[0]` is the
+    /// MANAGER's region read as a PROJECTION (its ring replayed, its page
+    /// never written, its ledger / bitmap / tree 0 another process's).
+    /// `None` on the manager and on every unarmed / flat mount, where
+    /// region 0 is this mount's appender 0 exactly as before.
+    pub joined_appender: Option<u32>,
 }
 
 /// One stashed interior record (see [`AppenderSet::recovering_structure`]).
@@ -2405,6 +2413,25 @@ impl AppenderSet {
         self.regions.iter().find(|r| r.id == id)
     }
 
+    /// Whether region `id` is one THIS MOUNT writes: every region it
+    /// holds, minus the manager's projection on a joined appender (PR 12b
+    /// — `regions[0]` is then another process's ring, held for its
+    /// replay window and its tail, never for a write).
+    pub fn owns_region(&self, id: u32) -> bool {
+        self.region(id).is_some() && !(id == 0 && self.joined_appender.is_some())
+    }
+
+    /// This mount's own appender id: region 0's on the manager, the joined
+    /// region's on a non-manager (PR 12b).
+    pub fn own_id(&self) -> u32 {
+        self.joined_appender.unwrap_or(0)
+    }
+
+    /// Whether this mount is a joined NON-MANAGER appender (PR 12b).
+    pub fn is_joined_appender(&self) -> bool {
+        self.joined_appender.is_some()
+    }
+
     /// Whether more than the manager's region exists.
     pub fn is_partitioned(&self) -> bool {
         self.regions.len() > 1
@@ -2467,8 +2494,7 @@ impl AppenderSet {
         if self.joined.load(std::sync::atomic::Ordering::Acquire) {
             // A region RELEASED at the cadence (§5.1.3 — its last slot
             // went) is `Free` again: one leave, no longer live.
-            self.regions
-                .iter()
+            self.own_regions()
                 .filter(|r| !r.released.load(std::sync::atomic::Ordering::Acquire))
                 .count() as u64
         } else {
@@ -2476,11 +2502,17 @@ impl AppenderSet {
         }
     }
 
-    /// Bytes of ring EXTENTS over every region (the pages' segment
+    /// The regions THIS MOUNT writes ([`Self::owns_region`]) — every gauge
+    /// that reads "this mount's rings / pages" folds over these, so a
+    /// joined appender never reports the manager's ring as its own.
+    pub fn own_regions(&self) -> impl Iterator<Item = &std::sync::Arc<AppenderRegion>> {
+        self.regions.iter().filter(|r| self.owns_region(r.id))
+    }
+
+    /// Bytes of ring EXTENTS over every own region (the pages' segment
     /// tables — what the knob sizes; the ring-side ledger pages included).
     pub fn ring_bytes(&self) -> u64 {
-        self.regions
-            .iter()
+        self.own_regions()
             .map(|r| {
                 r.page
                     .lock()
@@ -2491,15 +2523,13 @@ impl AppenderSet {
     }
 
     pub fn ring_segments(&self) -> u64 {
-        self.regions
-            .iter()
+        self.own_regions()
             .map(|r| r.ring().segments().len() as u64)
             .sum()
     }
 
     pub fn ring_grows(&self) -> u64 {
-        self.regions
-            .iter()
+        self.own_regions()
             .map(|r| r.ring_grows.load(std::sync::atomic::Ordering::Relaxed))
             .sum()
     }
@@ -2510,7 +2540,7 @@ impl AppenderSet {
         let (granted, claimed, returned, unclaimed) = self.grant_closure();
         let now_ns = crate::mono_core::monotonic_ns_u64();
         AppenderStats {
-            appender_id: self.regions.first().map_or(0, |r| r.id),
+            appender_id: self.own_id(),
             native_slot: self.native_slot,
             live: self.live(),
             live_pages_at_mount: self.live_pages_at_mount,

@@ -90,6 +90,12 @@
 # the seam themselves (a stamped volume, a declared region killed without
 # a leave, its page restamped a foreign node's), and its fsck legs run
 # the probe over BOTH layouts' walkers.
+# `sym_mount_posture_tests` (PR 12 — the join ladder, the retired posture
+# knobs and verb, plane_gate by the held lease, the Issue-31 page words)
+# rides the list the PR 4 way: its armed fixtures stamp under the seam
+# themselves and its flat pins (a bit-17-absent set arms nothing, the
+# knobs keep their shipped meaning, `set-owners` runs its shipped gates)
+# run on both legs.
 # `kvmap_read_tests` (the block-map tree's read economy: A7 probation, the
 # leaf-read gauge, the reader bracket) joined the list in PR 12: its two
 # tree-7 leaf contracts were stamped-RED on the base with nobody running
@@ -173,6 +179,7 @@ DEFAULT_SUITES=(
   sym_dir_stripe_tests
   sym_custody_tests
   sym_crash_matrix_tests
+  sym_mount_posture_tests
 )
 read -r -a SUITES <<<"${SQZ_SYM_SUITES:-${DEFAULT_SUITES[*]}}"
 RATIO_NOTE="${SQZ_SYM_RATIO_NOTE:-2.0}"

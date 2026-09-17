@@ -5087,6 +5087,17 @@ impl KvMetaBackend {
 
     /// A WIRE joiner's page names its leased slots — the manager writes
     /// them (its in-process regions' pages are written at the checkpoint).
+    ///
+    /// **One writer per page** (PR 12 — the obligation PR 4 review round 6,
+    /// Issue 31 stated): the manager rewrites a joiner's page ONLY while
+    /// no checkpoint of the joiner's own has written it (`ckpt_seq == 0`
+    /// — every appender checkpoint stamps its seq, ≥ 1, and refreshes
+    /// `head_hint` / `seq_offset` beside it). Once the appender's own
+    /// checkpoint owns the page, the grant's words reach it on the reply
+    /// and ITS page write carries them; a manager rewrite racing that
+    /// checkpoint on the same A/B pair would land an older root and an
+    /// older `head_hint` at a newer generation — the regression the
+    /// release screen's derived bound presumes never happens.
     async fn write_wire_joiner_page_slots(
         &self,
         appender_id: u32,
@@ -5099,6 +5110,15 @@ impl KvMetaBackend {
         let Some(mut page) = e.page.clone() else {
             return Ok(());
         };
+        if page.ckpt_seq > 0 {
+            log::debug!(
+                "meta volume {}: appender {appender_id}'s page is written by its own checkpoint \
+                 (ckpt_seq {}) — the manager leaves it to its owner",
+                self.path.display(),
+                page.ckpt_seq
+            );
+            return Ok(());
+        }
         let mut slots: Vec<super::appender::SlotEntry> = Vec::new();
         for slot in plane.table.held_by(appender_id) {
             let Ok(routing) = self.routing_slot_of_forest(slot) else {

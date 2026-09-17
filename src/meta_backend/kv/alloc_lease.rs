@@ -694,6 +694,17 @@ pub fn drop_holding(vol_tag: u64) -> Option<Arc<AllocHolding>> {
     removed
 }
 
+/// Test seam: re-register a holding [`drop_holding`] handed back — the
+/// "this mount does not hold this volume's lease" shape, undone.
+pub fn test_install_holding(holding: Arc<AllocHolding>) {
+    if HOLDINGS
+        .upsert_sync(holding.vol_tag, Arc::clone(&holding))
+        .is_none()
+    {
+        HOLDINGS_COUNT.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// Test seam: forget every holding.
 pub fn test_clear_holdings() {
     HOLDINGS.clear_sync();

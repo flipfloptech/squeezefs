@@ -1361,6 +1361,40 @@ pub fn uninstall_slot_lease_carriage_source() {
     SLOT_LEASE_CARRIAGE_SOURCE.store(None);
 }
 
+/// **The MEMBER side of the slot-lease carriage** (symmetric PR 12b — the
+/// wire holder's half PR 4 left owed): what a joined appender does with
+/// the `slot_release_notices` and `offered_slots` its renewal grant
+/// carries — flush-then-transfer of every recalled slot, `AcquireSlot` of
+/// every offered one. Installed by the joined open; every adopted grant
+/// (routine or carriage renewal) runs it with the grant's two words.
+/// Never blocks the renewal: the sink spawns its work.
+pub type SlotCarriageSink = Arc<dyn Fn(&[u16], &[(u16, u32)]) + Send + Sync>;
+
+static SLOT_CARRIAGE_SINK: once_cell::sync::Lazy<arc_swap::ArcSwapOption<SlotCarriageSink>> =
+    once_cell::sync::Lazy::new(arc_swap::ArcSwapOption::empty);
+
+/// Install the joined appender's carriage sink (one per process — the
+/// joined set's; a re-install replaces).
+pub fn install_slot_carriage_sink(sink: SlotCarriageSink) {
+    SLOT_CARRIAGE_SINK.store(Some(Arc::new(sink)));
+}
+
+/// Uninstall it (the leave / test teardown).
+pub fn uninstall_slot_carriage_sink() {
+    SLOT_CARRIAGE_SINK.store(None);
+}
+
+/// Hand a grant's slot words to the installed sink (a no-op with none,
+/// or with nothing carried).
+fn deliver_slot_carriage(grant: &Grant) {
+    if grant.slot_release_notices.is_empty() && grant.offered_slots.is_empty() {
+        return;
+    }
+    if let Some(sink) = SLOT_CARRIAGE_SINK.load_full() {
+        sink(&grant.slot_release_notices, &grant.offered_slots);
+    }
+}
+
 /// The carriage for `member_id` — empty with no source installed.
 pub fn slot_lease_carriage_for_member(member_id: &str) -> SlotLeaseCarriage {
     match SLOT_LEASE_CARRIAGE_SOURCE.load_full() {
@@ -2524,6 +2558,7 @@ impl MemberSession {
         // vector FIRST (what the wake's pushed ticks read), then the sum.
         crate::free_grace::note_lane_supply_volumes(&grant.lane_supply_volumes);
         crate::free_grace::note_lane_supply_hint(grant.lane_supply_blocks);
+        deliver_slot_carriage(grant);
     }
 
     /// Adopt a CARRIAGE renewal's grant (hold-time lever (b) — the renewal
@@ -2552,6 +2587,7 @@ impl MemberSession {
         );
         crate::free_grace::note_lane_supply_volumes(&grant.lane_supply_volumes);
         crate::free_grace::note_lane_supply_hint(grant.lane_supply_blocks);
+        deliver_slot_carriage(grant);
     }
 
     /// §6.8 item 3: the label last learned from the owner and the

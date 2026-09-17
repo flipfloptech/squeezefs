@@ -719,7 +719,64 @@ pub async fn open_routed_meta_set_joined(
     );
     routed.install_stripe_self();
     kv::alloc_lease::arm_symmetric_roles(&routed);
+    install_joined_slot_carriage_sink(&routed);
     Ok(routed)
+}
+
+/// The member side of the slot-lease carriage for a JOINED set (PR 12b —
+/// `membership::install_slot_carriage_sink`): every renewal grant's
+/// `slot_release_notices` run flush-then-transfer on the volume hosting
+/// each routing slot, every `offered_slots` entry is accepted there —
+/// spawned on the meta lanes, never inline in the renewal (a release
+/// cycles the checkpoint). The routed set is held weakly: a set that left
+/// makes the sink inert.
+fn install_joined_slot_carriage_sink(routed: &std::sync::Arc<RoutedMetaBackend>) {
+    let weak = std::sync::Arc::downgrade(routed);
+    crate::membership::install_slot_carriage_sink(std::sync::Arc::new(
+        move |release: &[u16], offered: &[(u16, u32)]| {
+            let Some(routed) = weak.upgrade() else {
+                return;
+            };
+            let release = release.to_vec();
+            let offered = offered.to_vec();
+            crate::meta_exec::spawn_meta_contained("sym_joined_slot_carriage", async move {
+                routed.act_on_slot_carriage(&release, &offered).await;
+            });
+        },
+    ));
+}
+
+impl RoutedMetaBackend {
+    /// Route a grant's slot words to the volumes hosting them and act on
+    /// each (`joined_act_on_release_notices` / `joined_accept_offers`).
+    /// Returns `(released, accepted)`.
+    pub async fn act_on_slot_carriage(
+        &self,
+        release: &[u16],
+        offered: &[(u16, u32)],
+    ) -> (usize, usize) {
+        let mut released = 0;
+        let mut accepted = 0;
+        for (v, vol) in self.volumes.iter().enumerate() {
+            let mine_release: Vec<u16> = release
+                .iter()
+                .copied()
+                .filter(|s| self.slot_volume(*s) == Some(v))
+                .collect();
+            let mine_offered: Vec<(u16, u32)> = offered
+                .iter()
+                .copied()
+                .filter(|(s, _)| self.slot_volume(*s) == Some(v))
+                .collect();
+            if !mine_release.is_empty() {
+                released += vol.joined_act_on_release_notices(&mine_release).await;
+            }
+            if !mine_offered.is_empty() {
+                accepted += vol.joined_accept_offers(&mine_offered).await;
+            }
+        }
+        (released, accepted)
+    }
 }
 
 /// What a non-manager RW mount of an armed set needs to join it — resolved

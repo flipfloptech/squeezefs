@@ -1302,6 +1302,9 @@ impl KvMetaBackend {
         }
         super::super::slot_lease::unregister_carriage_plane(&plane);
         super::super::alloc_lease::disarm_symmetric_roles();
+        // The carriage's member side is this set's: a grant adopted after
+        // the leave carries nothing this mount may act on.
+        crate::membership::uninstall_slot_carriage_sink();
         // The unclaimed remainder returns with the region.
         let returnable = {
             let mut g = region.grant();
@@ -1488,6 +1491,85 @@ impl KvMetaBackend {
             unclaimed.len()
         );
         Ok(false)
+    }
+
+    // -----------------------------------------------------------------
+    // The membership carriage's member side (§5.9, §5.1.4).
+    // -----------------------------------------------------------------
+
+    /// **The wire holder's flush-then-transfer on a release notice**
+    /// (§5.1.4 as the design writes it for a member: the manager's recall
+    /// of a slot this joiner holds — a requester's accepted offer — rides
+    /// its renewal grant's `slot_release_notices`, and the holder runs
+    /// `release_slot_handover` exactly as the manager's cadence runs its
+    /// own: door closed and drained, the ring flushed clear of the slot,
+    /// the tokens on it recalled, the page `Releasing`, `ReleaseSlot {
+    /// root, cursor, seq_floor, tails }` over the wire, the page without
+    /// the slot; the requester's `AcquireSlot` then lands at `g + 1`).
+    /// `routing` names ROUTING slots; a slot this joiner does not hold
+    /// (already released, or another volume's) is skipped. Returns the
+    /// slots released; a handover refused `Busy` / deferred for custody
+    /// is "not this beat" (the next renewal carries the notice again).
+    pub async fn joined_act_on_release_notices(&self, routing: &[u16]) -> usize {
+        let Some(wire) = self.joined.get() else {
+            return 0;
+        };
+        let Ok(plane) = self.joined_plane() else {
+            return 0;
+        };
+        let own = wire.appender_id;
+        let mut released = 0;
+        for r in routing {
+            let slot = self.forest_slot_of_routing(*r);
+            let held_here = matches!(
+                plane.table.resolve(slot),
+                crate::slot_lease_core::Resolved::Holder { holder, .. } if holder == own
+            );
+            if !plane.gate.is_leased(slot) || !held_here {
+                continue;
+            }
+            match self.release_slot_handover(own, slot).await {
+                // The wire `ReleaseSlot` inside counts on `wire_releases`.
+                Ok(()) => released += 1,
+                Err(KvError::Busy(why)) | Err(KvError::HandoverDeferred(why)) => {
+                    log::debug!(
+                        "meta volume {}: joined appender {own}'s release of slot {slot} on the \
+                         manager's notice waits a beat — {why}",
+                        self.path.display()
+                    );
+                }
+                Err(e) => log::warn!(
+                    "meta volume {}: joined appender {own} could not release slot {slot} on the \
+                     manager's notice ({e}); the next renewal carries it again",
+                    self.path.display()
+                ),
+            }
+        }
+        released
+    }
+
+    /// **The offer's acceptance** (§5.1.4 — the dominance rule's requester
+    /// side): every `(routing slot, g)` the grant says stands offered to
+    /// this joiner is taken with `AcquireSlot` (the wire first touch —
+    /// `joined_acquire_slot`); an offer that lapsed or moved answers
+    /// `SlotBusy` / `Deferred` and is left to the next beat. Returns the
+    /// slots acquired.
+    pub async fn joined_accept_offers(&self, offered: &[(u16, u32)]) -> usize {
+        if self.joined.get().is_none() {
+            return 0;
+        }
+        let mut taken = 0;
+        for (r, _g) in offered {
+            let slot = self.forest_slot_of_routing(*r);
+            match self.joined_acquire_slot(slot).await {
+                Ok(()) => taken += 1,
+                Err(e) => log::debug!(
+                    "meta volume {}: the offer of slot {slot} was not taken — {e}",
+                    self.path.display()
+                ),
+            }
+        }
+        taken
     }
 
     // -----------------------------------------------------------------

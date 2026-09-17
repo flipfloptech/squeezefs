@@ -1138,6 +1138,156 @@ async fn a_joiner_reads_foreign_slots_through_tokens_and_serves_the_managers_shi
     fsck_clean(&uris).await;
 }
 
+// ---------------------------------------------------------------------------
+// Deliverable 7: the wire holder's flush-then-transfer on a release
+// notice; the offer's acceptance.
+// ---------------------------------------------------------------------------
+
+/// **The wire holder's flush-then-transfer** (§5.1.4 with a REAL wire
+/// holder — PR 4's owed member side): the manager recalls a slot the
+/// joiner holds (a requester's accepted offer — `note_recall`); the
+/// recall rides the joiner's renewal carriage (`carriage_for` its
+/// identity → `slot_release_notices`); the joiner's carriage sink runs
+/// the handover: door closed and drained, ring flushed clear, tokens
+/// recalled, page `Releasing`, `ReleaseSlot { root, cursor, seq_floor,
+/// tails }` over the wire, page without the slot — the manager's tree 0
+/// reads `Unleased` at the lease's `g` with the joiner's root, the recall
+/// is spent, ring 0's seq space stands above the departing ring's
+/// frontier, and the manager's first touch takes the slot at `g + 1` and
+/// reads every acked record. The carriage's OTHER word — an offer standing
+/// for the joiner — is accepted with `AcquireSlot`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wire_holder_releases_a_slot_on_the_managers_notice_and_accepts_an_offer() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "a"), (SLOT_B, "b")]).await;
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let joiner = join(&uris, &venue, &mvol, 41).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jid = jvol.appender_stats().unwrap().appender_id;
+    let ident = jvol.joined_wire().unwrap().identity;
+    // The MANAGER is this process's reading writer here: the children the
+    // joiner mints live in ITS rotor slots, which it keeps after the
+    // release — the manager reads them through the joiner's tokens.
+    let jvenue = DaemonVenue::stand_up(&joiner, false, "joiner-custody-41").await;
+    mvol.slot_leases()
+        .unwrap()
+        .holders
+        .set_endpoint(jid, &jvenue.endpoint);
+    let sink = Arc::new(ProbeSink {
+        calls: std::sync::atomic::AtomicU64::new(0),
+    });
+    let for_arm = Arc::clone(&sink);
+    let _arm = squeezefs::data_grant::arm_slot_custody(
+        &manager,
+        &squeezefs::cowriter::node_member_id_of(ident.node_token, 0),
+        VENUE_SECRET.to_vec(),
+        0,
+        Arc::new(move |_volume| {
+            Arc::clone(&for_arm) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
+        }),
+    );
+    let files = create_files(&joiner, dirs[0], "n", 16).await;
+    let g_lease = match tree0_state(&mvol, SLOT_A).await {
+        Some(SlotState::Leased { appender_id, g, .. }) if appender_id == jid => g,
+        other => panic!("{other:?}"),
+    };
+    let mplane = Arc::clone(mvol.slot_leases().unwrap());
+    let routing_a = squeezefs::meta_backend::kv::appender::page_slot_of_forest_slot(
+        SLOT_A,
+        mvol.appender_stats().unwrap().native_slot,
+    )
+    .unwrap();
+    let routing_b = squeezefs::meta_backend::kv::appender::page_slot_of_forest_slot(
+        SLOT_B,
+        mvol.appender_stats().unwrap().native_slot,
+    )
+    .unwrap();
+
+    // The manager's recall (a requester's accepted offer) and what the
+    // joiner's next renewal grant carries for its identity.
+    mplane.note_recall(jid, SLOT_A);
+    let carriage = mplane.carriage_for(ident.node_token, ident.mount_slot);
+    assert_eq!(carriage.release_notices, vec![routing_a]);
+    assert!(
+        carriage
+            .leases
+            .iter()
+            .any(|(r, g)| *r == routing_a && *g == g_lease),
+        "the carriage attests the lease: {:?}",
+        carriage.leases
+    );
+    let departing_frontier = jvol.ring_of_region(jid).seq_frontier();
+    let releases0 = jvol.joined_stats().unwrap().wire_releases;
+
+    // The carriage's member side: the release notice and an offer of the
+    // (unleased) second directory's slot, acted on by the joined set.
+    let (released, accepted) = joiner
+        .act_on_slot_carriage(&carriage.release_notices, &[(routing_b, 0)])
+        .await;
+    assert_eq!((released, accepted), (1, 1));
+    assert_eq!(jvol.joined_stats().unwrap().wire_releases, releases0 + 1);
+    match tree0_state(&mvol, SLOT_A).await {
+        Some(SlotState::Unleased { g, root, .. }) => {
+            assert_eq!(g, g_lease, "a release keeps g");
+            assert!(root.addr != 0, "the joiner's root travelled");
+        }
+        other => panic!("tree 0 after the wire release: {other:?}"),
+    }
+    assert!(
+        mplane.recalls_of(jid).is_empty(),
+        "the recall is spent by the ReleaseSlot"
+    );
+    assert!(
+        !jvol.slot_leases().unwrap().gate.is_leased(SLOT_A),
+        "the joiner's door no longer passes the slot"
+    );
+    assert!(
+        mvol.journal_ring().seq_frontier() >= departing_frontier,
+        "ring 0's seq space stands above the departing ring's frontier"
+    );
+    assert!(
+        matches!(
+            tree0_state(&mvol, SLOT_B).await,
+            Some(SlotState::Leased { appender_id, .. }) if appender_id == jid
+        ),
+        "the offer was accepted with AcquireSlot"
+    );
+    // The manager's first touch takes the released slot at g + 1 and reads
+    // every record the joiner acked (the transferred tree is exact).
+    let more = create_files(&manager, dirs[0], "m", 2).await;
+    match tree0_state(&mvol, SLOT_A).await {
+        Some(SlotState::Leased { appender_id, g, .. }) => {
+            assert_eq!(appender_id, 0);
+            assert_eq!(g, g_lease + 1);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_all_resolve(&manager, dirs[0], &files).await;
+    assert_all_resolve(&manager, dirs[0], &more).await;
+    let jholder = jvol.token_holder().expect("the joiner is a token holder");
+    assert!(
+        jholder.stats().grants_served >= 16,
+        "the children in the joiner's rotor slots were read through ITS tokens: {}",
+        jholder.stats().grants_served
+    );
+    assert_must_stay_zero(&jvol, "joiner");
+    assert_must_stay_zero(&mvol, "manager");
+    squeezefs::data_grant::disarm_slot_custody().await;
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    jvenue.tear_down();
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
 /// **The refusals**: a joined open needs the plane (`SQUEEZEFS_SYMMETRIC_
 /// META=1`) — without it the D0 guard's refusal stands, never a join; a
 /// joiner's control writes refuse loud (the must-stay-0 gauge moves

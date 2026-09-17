@@ -178,18 +178,45 @@ pub struct JoinReport {
     pub endpoint: String,
 }
 
+/// Whether `SQUEEZEFS_MEMBERSHIP_BIND` is EXPLICITLY `off` — the knob law's
+/// distinction rung 3 turns on: `membership::resolve_bind` folds unset and
+/// `off` into one word because the S6 plane's own default IS off, but the
+/// ladder's default is `auto`, so here the two must be told apart.
+fn membership_bind_explicitly_off() -> bool {
+    std::env::var(MEMBERSHIP_BIND_ENV)
+        .map(|v| v.trim().eq_ignore_ascii_case("off"))
+        .unwrap_or(false)
+}
+
+/// The membership plane's bind knob (S6's; the ladder's rung 3 reads it).
+pub const MEMBERSHIP_BIND_ENV: &str = "SQUEEZEFS_MEMBERSHIP_BIND";
+
 /// Rung 3 (the membership shard): arm the S6 plane on an armed set when
 /// the operator declared no bind — the death ledger's writer is the
 /// owner's eviction (PR 10), so an armed set without membership would
-/// record no death. `SQUEEZEFS_MEMBERSHIP_BIND` explicit wins verbatim
-/// (the mount path arms it before the ladder runs); this runs only when
-/// it answered `off`.
+/// record no death. The knob law (ENG-10 — explicit wins verbatim, never a
+/// silent override): `SQUEEZEFS_MEMBERSHIP_BIND` UNSET is the ladder's
+/// `auto`; an explicit `auto` / `addr:port` is the mount path's own arm
+/// (armed before the ladder runs — this returns `Ok(None)`); an EXPLICIT
+/// `off` is REFUSED here naming the knob — a writer that cannot be seen
+/// cannot be evicted, and an operator who wrote `off` asked for exactly
+/// the posture the plane cannot run under (review round 1, Issue 2: the
+/// first build armed it at `auto` on `0.0.0.0:0` over the operator's word).
 pub async fn arm_membership_shard(
     meta: &Arc<RoutedMetaBackend>,
     on_purge: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> Result<Option<crate::membership::MembershipArm>> {
     if crate::membership::membership_mode() != "off" {
         return Ok(None);
+    }
+    if membership_bind_explicitly_off() {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "symmetric join ladder rung 3 (membership) refuses: {MEMBERSHIP_BIND_ENV}=off was \
+             DECLARED on an armed set — a writer that cannot be SEEN cannot be EVICTED, and the \
+             S6 eviction is what records a death for the recovery driver (PR 10). The ladder \
+             arms the shard at `auto` only when the knob is UNSET (explicit wins verbatim, \
+             ENG-10); unset it, or give it `auto` / an addr:port"
+        )));
     }
     let arm = crate::membership::arm_mount_membership_at(
         meta,

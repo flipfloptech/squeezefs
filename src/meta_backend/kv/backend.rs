@@ -1191,6 +1191,15 @@ pub struct KvMetaBackend {
     reader_holder_planes:
         scc::HashMap<Arc<str>, Arc<crate::meta_ship::token_plane::TokenReaderPlane>>,
     reader_holder_endpoints: scc::HashMap<u32, Arc<str>>,
+    /// The NEGATIVE cache of the binding: holders whose durable resolve
+    /// answered nothing THIS epoch step. A resolve costs a device read of
+    /// the appender directory plus the claim set's `getxattr`, and a reader
+    /// hammering one object of an unpublished holder paid both per FUSE op
+    /// with no bound (review round 1, Issue 10); the refusal stands, its
+    /// cost is bounded to one resolve per holder per epoch step —
+    /// `forest_reader_resync` (the S5 poll's tree-0 re-read) clears it, and
+    /// an explicit binding removes its holder.
+    reader_holder_unresolved: scc::HashSet<u32>,
     /// The frame stamp's generation FLOOR per slot (§5.8.2): the highest
     /// `g` this mount has stamped a slot's frame with, kept past the
     /// plane's leave so a flush after the disarm never stamps below it
@@ -2939,6 +2948,7 @@ impl KvMetaBackend {
             tokens_reader: std::sync::OnceLock::new(),
             reader_holder_planes: scc::HashMap::new(),
             reader_holder_endpoints: scc::HashMap::new(),
+            reader_holder_unresolved: scc::HashSet::new(),
             frame_g_floor: scc::HashMap::new(),
             reader_frame_screens: scc::HashMap::new(),
             layout_conveyor: Arc::new(ConveyorCore::new()),
@@ -3333,13 +3343,16 @@ impl KvMetaBackend {
     }
 
     /// PR 12 — bind appender `appender_id`'s token endpoint on this reader
-    /// (§5.1.6: tree 0 names the LESSEE, the census names its endpoint).
-    /// The join ladder's census resolution and the contracts write it; a
-    /// later binding for the same id replaces the first (a holder that
-    /// moved its listener) and the next resolve dials the new one.
+    /// (§5.1.6: tree 0 names the LESSEE, durable state names its endpoint).
+    /// `token_reader_for` writes it with the durable resolution
+    /// (`sym_join::resolve_holder_endpoint`) and the contracts write it
+    /// directly; a later binding for the same id replaces the first (a
+    /// holder that moved its listener) and the next resolve dials the new
+    /// one. A binding clears the holder's negative-cache entry.
     pub fn bind_reader_holder_endpoint(&self, appender_id: u32, endpoint: &str) {
         self.reader_holder_endpoints
             .upsert_sync(appender_id, Arc::from(endpoint));
+        self.reader_holder_unresolved.remove_sync(&appender_id);
     }
 
     /// The endpoint bound for appender `appender_id` on this reader, if any
@@ -3398,21 +3411,31 @@ impl KvMetaBackend {
         let bound = self
             .reader_holder_endpoints
             .read_sync(&holder, |_, e| Arc::clone(e));
-        // An unbound holder is resolved off durable state once (its page's
-        // identity → its claim-set entry's published listener) and bound.
-        // Boxed: the resolver reads the claim set through `getxattr`, a
-        // control record no token carries — the type-level cycle is not a
-        // runtime one.
+        // An unbound holder is resolved off durable state ONCE per epoch
+        // step (its page's identity → its claim-set entry's published
+        // listener) and bound; a holder the resolve answered nothing for
+        // is refused without another device read until the next epoch
+        // step re-reads tree 0 (or a binding lands). Boxed: the resolver
+        // reads the claim set through `getxattr`, a control record no
+        // token carries — the type-level cycle is not a runtime one.
         let resolved = match bound {
             Some(e) => Some(e),
-            None => Box::pin(crate::sym_join::resolve_holder_endpoint(self, holder))
-                .await
-                .map(|e| {
-                    let e: Arc<str> = Arc::from(e);
-                    self.reader_holder_endpoints
-                        .upsert_sync(holder, Arc::clone(&e));
-                    e
-                }),
+            None if self.reader_holder_unresolved.contains_sync(&holder) => None,
+            None => {
+                crate::meta_ship::token_plane::note_reader_holder_resolve();
+                let resolved =
+                    Box::pin(crate::sym_join::resolve_holder_endpoint(self, holder)).await;
+                match resolved {
+                    Some(e) => {
+                        self.bind_reader_holder_endpoint(holder, &e);
+                        Some(Arc::from(e))
+                    }
+                    None => {
+                        let _ = self.reader_holder_unresolved.insert_sync(holder);
+                        None
+                    }
+                }
+            }
         };
         let Some(endpoint) = resolved else {
             crate::meta_ship::token_plane::note_reader_unbound_holder();
@@ -17683,6 +17706,9 @@ impl KvMetaBackend {
     /// writer minted after the reader mounted). A no-op on a flat volume.
     /// The reader mints nothing and publishes nothing.
     pub(super) async fn forest_reader_resync(&self) -> std::result::Result<(), KvError> {
+        // The epoch step is the negative binding cache's invalidation: a
+        // holder unresolved last step may have published since.
+        self.reader_holder_unresolved.clear_sync();
         let Some(forest) = self.forest() else {
             return Ok(());
         };

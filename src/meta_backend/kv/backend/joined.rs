@@ -651,6 +651,12 @@ impl KvMetaBackend {
         self.publish_slot_owners(set, &plane);
         plane.refresh_holders();
         plane.seed_n_floor_inputs();
+        // The manager's endpoint is the one binding the join already
+        // knows: appender 0's tokens (every unleased slot's reads, the
+        // manager's own slots' objects), its shipped steps and its
+        // custody are served there. Every other appender's is resolved
+        // off durable state (`sym_join::bind_live_appender_endpoints`).
+        plane.holders.set_endpoint(0, &wire.endpoint);
         // PR 5 — the frame fence (every frame of ours carries `(own, g)`),
         // the token HOLDER (this writer grants tokens on the objects of
         // its slots and recalls them before its conflicting commits).

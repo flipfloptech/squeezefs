@@ -5568,6 +5568,63 @@ pub fn slot_holder_home(ino: u64) -> Option<CustodyHome> {
     }
 }
 
+/// **A WRITER's token plane for a FOREIGN object** (symmetric PR 12b —
+/// PR 9's deviation 4 and PR 12's owed "the writer's read divert to its
+/// per-holder planes"): volume `vol`'s object lives in a slot appender
+/// `holder` serves — another appender's lease, or on a JOINED appender
+/// an unleased slot the manager maintains (KD-SYM-2/3) — so its reads are
+/// token reads at that holder, through the SAME per-holder plane PR 9's
+/// custody arm dials for custody (one JOIN per holder; the plane's
+/// standing recall channel + the mount's recall sink come with it).
+/// `Ok(None)` = read locally: no arm (a mount without the mount path's
+/// `arm_mount_slot_custody` — the in-process fixtures' default), or
+/// `vol` is not one of the armed set's volumes (two backends of one
+/// process, the arm's routed set another daemon's). A holder with no
+/// bound endpoint REFUSES `EAGAIN`-class — the writer's stale projection
+/// of a foreign tree is never served in its place (KD-SYM-19, R-SYM-4).
+pub async fn foreign_read_plane(
+    vol: &crate::meta_backend::kv::backend::KvMetaBackend,
+    object: u64,
+    holder: u32,
+) -> Result<Option<Arc<crate::meta_ship::token_plane::TokenReaderPlane>>> {
+    let guard = SLOT_CUSTODY.load();
+    let Some(arm) = guard.as_ref() else {
+        return Ok(None);
+    };
+    let Some(routed) = arm.routed.upgrade() else {
+        return Ok(None);
+    };
+    let Some(v) = routed
+        .volumes
+        .iter()
+        .position(|x| std::ptr::eq(Arc::as_ptr(x), vol))
+    else {
+        return Ok(None);
+    };
+    let endpoint = routed.volumes[v]
+        .slot_leases()
+        .and_then(|p| p.holders.endpoint(holder));
+    let Some(endpoint) = endpoint else {
+        crate::meta_ship::token_plane::note_reader_unbound_holder();
+        return Err(unbound_holder(
+            holder,
+            object,
+            "the read of an object in its slot",
+        ));
+    };
+    let volume = u16::try_from(v).map_err(|_| {
+        SqueezefsError::InvalidOperation(format!(
+            "volume ordinal {v} exceeds the wire's u16 volume word"
+        ))
+    })?;
+    let (_client, plane) = arm.holder(&endpoint, volume).await?;
+    // A freshly dialed plane serves nothing until its recall channel's
+    // first round lands (`serve_gate`): bounded wait, the serve's own
+    // refusal is the honest answer past it.
+    plane.await_channel_fresh().await;
+    Ok(Some(plane))
+}
+
 /// [`slot_holder_home`] for a lock object's path form — `Some((ino,
 /// home))` only for an inode object whose custody a holder serves.
 pub fn slot_holder_home_of_path(file_path: &str) -> Option<(u64, CustodyHome)> {

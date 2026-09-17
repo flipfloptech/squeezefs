@@ -1351,6 +1351,28 @@ impl TokenHolderPlane {
         self.ack_wake.notify_waiters();
     }
 
+    /// **The slot transfer's recall** (symmetric PR 12b — the token half
+    /// of flush-then-transfer, §5.7.1 applied to §5.1.4): every
+    /// outstanding token on an object of forest slot `slot` is recalled
+    /// and waited for exactly as a commit's would be, then settled at
+    /// once (no apply follows — from the tree-0 write on, this plane
+    /// answers `NotHolder` for the slot). Without it a token the DEPARTING
+    /// holder granted stood after the move, and the NEW lessee's commits
+    /// recall at ITS plane alone — a reader's cached view of the moved
+    /// directory would have served stale until its next epoch step, the
+    /// bounded staleness R-SYM-4 forbids. Returns the objects recalled.
+    pub async fn recall_slot(&self, slot: crate::meta_backend::kv::record::ForestSlot) -> usize {
+        let objects = self
+            .lane
+            .objects_where(|o| crate::meta_backend::kv::record::forest_slot_of_ino(o) == slot);
+        if objects.is_empty() {
+            return 0;
+        }
+        let union = self.recall_and_wait(&objects).await;
+        self.settle(&union);
+        objects.len()
+    }
+
     /// The pass's commit APPLIED (its records are visible in RAM) or
     /// failed as a unit: its union leaves the gate's flight and the
     /// parked grants read.
@@ -2102,6 +2124,27 @@ impl TokenReaderPlane {
             .saturating_sub(self.channel_last_round_ms.load(Ordering::Acquire));
         age <= self.channel_park_ms.load(Ordering::Relaxed) * 2
             + super::tokens::DELEG_FRESH_SLACK_MS
+    }
+
+    /// Wait — at most the freshness window itself — for the standing
+    /// recall channel's FIRST round (symmetric PR 12b: a writer's lazily
+    /// dialed per-holder plane serves its first foreign read right after
+    /// the dial, and `serve_gate` refuses an object under a channel that
+    /// has not yet completed a round; a bounded park here turns that
+    /// refusal into the round's latency). Returns whether the channel is
+    /// fresh; a `false` is the caller's honest refusal.
+    pub async fn await_channel_fresh(&self) -> bool {
+        let bound = std::time::Duration::from_millis(
+            self.channel_park_ms.load(Ordering::Relaxed) * 2 + super::tokens::DELEG_FRESH_SLACK_MS,
+        );
+        let started = Instant::now();
+        while !self.channel_fresh() {
+            if started.elapsed() >= bound || self.stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        true
     }
 
     fn serve_gate(&self) -> Result<()> {

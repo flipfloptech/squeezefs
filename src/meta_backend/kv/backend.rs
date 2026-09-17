@@ -3424,7 +3424,7 @@ impl KvMetaBackend {
     ) -> std::result::Result<Option<Arc<crate::meta_ship::token_plane::TokenReaderPlane>>, KvError>
     {
         let Some(default) = self.tokens_reader.get() else {
-            return Ok(None);
+            return self.writer_read_plane_for(object).await;
         };
         let Some(holder) = self.reader_holder_of(object).await? else {
             return Ok(Some(Arc::clone(default)));
@@ -3515,6 +3515,51 @@ impl KvMetaBackend {
                     .read_sync(&endpoint, |_, p| Arc::clone(p)))
             }
         }
+    }
+
+    /// **The WRITER's read divert** (symmetric PR 12b — PR 9's deviation
+    /// 4 closed): on an ARMED writer an object in a slot this mount does
+    /// not hold is read through its HOLDER's token plane — the lessee tree
+    /// 0 names (the table), or on a JOINED appender the manager for an
+    /// unleased slot (KD-SYM-2/3: the manager maintains what nobody
+    /// leases; a joiner's RAM tree of it is the projection its open took)
+    /// — dialed through PR 9's per-holder custody arm
+    /// (`data_grant::foreign_read_plane`). `None` = read locally: an
+    /// unarmed mount (one `Option` test), a slot this mount leases or
+    /// maintains, or no custody arm on this backend's set. The check is
+    /// the gate's bit first (a leased slot's read pays no table lock), the
+    /// table's resolve only for a slot the gate does not hold.
+    async fn writer_read_plane_for(
+        &self,
+        object: Ino,
+    ) -> std::result::Result<Option<Arc<crate::meta_ship::token_plane::TokenReaderPlane>>, KvError>
+    {
+        let Some(plane) = self.slot_leases() else {
+            return Ok(None);
+        };
+        let Some(set) = self.appenders.as_ref() else {
+            return Ok(None);
+        };
+        let slot = super::record::forest_slot_of_ino(object);
+        if plane.gate.is_leased(slot) {
+            return Ok(None);
+        }
+        let joined = set.is_joined_appender();
+        if !joined && !plane.gate.is_foreign(slot) {
+            // The manager maintains every unleased tree itself.
+            return Ok(None);
+        }
+        let holder = match plane.table.resolve(slot) {
+            crate::slot_lease_core::Resolved::Holder { holder, .. } if !set.owns_region(holder) => {
+                holder
+            }
+            crate::slot_lease_core::Resolved::Holder { .. } => return Ok(None),
+            crate::slot_lease_core::Resolved::Unleased { .. } if joined => 0,
+            crate::slot_lease_core::Resolved::Unleased { .. } => return Ok(None),
+        };
+        crate::data_grant::foreign_read_plane(self, object, holder)
+            .await
+            .map_err(KvError::Io)
     }
 
     /// Every per-holder reader plane (the leave's release pass and the
@@ -5357,6 +5402,16 @@ impl KvMetaBackend {
             // A wire appender's grant makes the slots foreign to the S4
             // plane (an in-process region's leaves the table untouched).
             self.publish_slot_owners(set, &plane);
+            // The token half of the transfer (PR 12b): the tokens this
+            // manager granted on the moved slots' objects while it
+            // maintained the unleased trees are recalled BEFORE the reply
+            // — the slot is foreign here already (no new grant lands), the
+            // grantee commits only once it holds the reply.
+            if let Some(holder) = self.tokens_holder.get() {
+                for s in &fresh {
+                    holder.recall_slot(*s).await;
+                }
+            }
         }
         Ok(grants)
     }
@@ -6554,6 +6609,13 @@ impl KvMetaBackend {
         // tree 0's lessee).
         if let Err(e) = self.flush_slot_clear_of_region(region, slot).await {
             return Err(abort(e));
+        }
+        // 2b. The token half of the transfer (PR 12b): every token this
+        // holder granted on the slot's objects is recalled and waited for
+        // — the door is closed (no commit of ours can mutate them again),
+        // and the next lessee's commits recall at ITS plane alone.
+        if let Some(holder) = self.tokens_holder.get() {
+            holder.recall_slot(slot).await;
         }
         let flush_ns = t_flush.elapsed().as_nanos() as u64;
         let words = self.slot_words_now(&plane, slot);

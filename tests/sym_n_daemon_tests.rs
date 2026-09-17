@@ -855,6 +855,289 @@ async fn three_daemons_hold_disjoint_slots_and_commit_into_three_rings() {
     fsck_clean(&uris).await;
 }
 
+// ---------------------------------------------------------------------------
+// Deliverables 5–6: foreign reads under tokens; serving from the joiner's
+// listener (a shipped step initiated by the manager).
+// ---------------------------------------------------------------------------
+
+/// A writer's recall sink: counts the data-plane drains a recall runs
+/// before its ack travels (the in-process stand-in for `MountRecallSink`).
+struct ProbeSink {
+    calls: std::sync::atomic::AtomicU64,
+}
+
+impl squeezefs::meta_ship::token_plane::RecallDataSink for ProbeSink {
+    fn drain_and_purge<'a>(
+        &'a self,
+        _objects: &'a [squeezefs::meta_ship::token_plane::RecalledObject],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+    }
+}
+
+/// ONE daemon's listener: what the join ladder's rung 7 stands up on
+/// every writer — the S9 custody owner, the S8 meta service (shipped
+/// steps served on ITS backend), the token service over ITS holder
+/// planes; the manager verbs on the MANAGER's alone.
+struct DaemonVenue {
+    host: Arc<squeezefs::cluster_wire::RpcListener>,
+    endpoint: String,
+}
+
+impl DaemonVenue {
+    async fn stand_up(routed: &Arc<RoutedMetaBackend>, manager: bool, name: &str) -> Self {
+        use squeezefs::cluster_wire as cw;
+        use squeezefs::data_grant::{AsyncVerbRouter, WriteCustodyOwner};
+        use squeezefs::membership::{LeaseClock, LeaseClocks};
+        use squeezefs::meta_ship::manager::ManagerSetService;
+        use squeezefs::meta_ship::token_plane::TokenSetService;
+        use squeezefs::meta_ship::MetaShipService;
+        let clocks = LeaseClocks::with_params(
+            std::time::Duration::from_millis(3_000),
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_millis(400),
+        )
+        .expect("2*skew + purge < TTL");
+        let owner = WriteCustodyOwner::arm(
+            name,
+            squeezefs::dlm::durable_term() + 1,
+            squeezefs::dlm::durable_term(),
+            clocks,
+            LeaseClock::monotonic(),
+            None,
+        )
+        .expect("the custody authority arms");
+        let mut router = AsyncVerbRouter::new()
+            .with_custody(Arc::clone(&owner))
+            .with_meta(MetaShipService::new(Arc::clone(routed)))
+            .with_tokens(TokenSetService::with_custody_owner(
+                &routed.volumes,
+                Arc::clone(&owner),
+            ));
+        if manager {
+            router = router.with_manager(ManagerSetService::new(&routed.volumes));
+        }
+        let host = cw::RpcListener::start_async(
+            cw::RpcListenerConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("literal addr"),
+                service_threads: 2,
+                ..cw::RpcListenerConfig::default()
+            },
+            VENUE_SECRET.to_vec(),
+            Arc::new(router),
+        )
+        .expect("listener");
+        let endpoint = host.endpoint().to_string();
+        Self { host, endpoint }
+    }
+
+    fn tear_down(self) {
+        self.host.shutdown();
+    }
+}
+
+/// **Foreign reads under tokens across two daemons, and a shipped step
+/// served from the joiner's listener** (deliverables 5 and 6; PR 9's
+/// deviation 4 and PR 12's owed "the writer's read divert"): the joiner
+/// reads the ROOT directory — the manager's native slot — and an UNLEASED
+/// directory through TOKENS granted by the manager (`dlm_token_grants_
+/// served` at the manager, `grants` at the joiner's plane), a manager
+/// create into the root RECALLS the joiner's token before it applies and
+/// the joiner's next lookup is exact; the joiner's first touch of the
+/// unleased directory acquires its slot and the manager's grant recalls
+/// the tokens it had granted on that slot (the transfer's token half);
+/// then the MANAGER creates a file in the directory the JOINER now holds
+/// — PR 6's shipped `XvStep`, dialed through tree 0's lessee and the
+/// bound endpoint, served on the joiner's listener under the joiner's
+/// lease and ring — and the joiner reads it locally. The custody arm is
+/// process-global, so the in-process venue arms the JOINER as the reading
+/// writer; the reverse direction is the two-process fleet leg's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiner_reads_foreign_slots_through_tokens_and_serves_the_managers_shipped_step() {
+    use squeezefs::meta_backend::crossvol_tx::{cross_owner_stats, install_xv_shipper};
+    use squeezefs::meta_ship::MetaShipRouter;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mvenue = DaemonVenue::stand_up(&manager, true, "manager-custody").await;
+    let venue_endpoint = mvenue.endpoint.clone();
+    // The manager's own files in its native slot (the root's), made
+    // BEFORE the joiner exists: the joiner's projection at its open holds
+    // them, so a token-served read is told apart by what lands AFTER.
+    manager
+        .create(1, "before", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap();
+
+    let joiner = {
+        Knobs::armed().apply();
+        let r = open_routed_meta_set_joined(
+            &uris,
+            &JoinedSetAdmission {
+                manager_endpoint: venue_endpoint.clone(),
+                secret: VENUE_SECRET.to_vec(),
+                peer_id: "joiner-31".into(),
+                identity: joiner_identity(&mvol, 31).await,
+            },
+        )
+        .await;
+        Knobs::clear();
+        r.expect("the joined open")
+    };
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jid = jvol.appender_stats().unwrap().appender_id;
+    let jvenue = DaemonVenue::stand_up(&joiner, false, "joiner-custody").await;
+    // The bindings the ladders make: the manager dials the joiner where it
+    // serves; the joiner learnt the manager's at its join.
+    mvol.slot_leases()
+        .unwrap()
+        .holders
+        .set_endpoint(jid, &jvenue.endpoint);
+    // The step shipper (process-global): the manager's, over its set.
+    install_xv_shipper(MetaShipRouter::new(
+        Arc::clone(&manager),
+        "manager-node",
+        VENUE_SECRET.to_vec(),
+    ));
+    // The JOINER is this process's reading writer: PR 9's custody arm
+    // over ITS set (the mount path's `arm_mount_slot_custody`).
+    let sink = Arc::new(ProbeSink {
+        calls: std::sync::atomic::AtomicU64::new(0),
+    });
+    let for_arm = Arc::clone(&sink);
+    let _arm = squeezefs::data_grant::arm_slot_custody(
+        &joiner,
+        &squeezefs::cowriter::node_member_id_of(
+            jvol.joined_wire().unwrap().identity.node_token,
+            jvol.joined_wire().unwrap().identity.mount_slot,
+        ),
+        VENUE_SECRET.to_vec(),
+        0,
+        Arc::new(move |_volume| {
+            Arc::clone(&for_arm) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
+        }),
+    );
+    let mholder = mvol.token_holder().expect("the manager is a token holder");
+    let served0 = mholder.stats().grants_served;
+
+    // A. The joiner reads the manager's ROOT through a token: a file the
+    // manager creates AFTER the joiner's open is visible at the joiner's
+    // next resolve — never the projection.
+    manager
+        .create(1, "after", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap();
+    let got = joiner
+        .lookup(1, "after")
+        .await
+        .expect("the joiner reads the root through the manager's token");
+    assert!(got.ino > 1);
+    joiner.lookup(1, "before").await.unwrap();
+    let served1 = mholder.stats().grants_served;
+    assert!(
+        served1 > served0,
+        "the root's dentries were GRANTED by the manager ({served0} → {served1})"
+    );
+    // The recall before the conflicting commit: the manager's next create
+    // in the root recalls the joiner's token and waits for its ack; the
+    // joiner's next lookup re-fetches and is exact.
+    let recalls0 = mholder.stats().recalls;
+    manager
+        .create(1, "after2", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap();
+    assert!(
+        mholder.stats().recalls > recalls0,
+        "the manager's commit recalled the joiner's token on the root"
+    );
+    joiner
+        .lookup(1, "after2")
+        .await
+        .expect("exact at the next resolve after the recall");
+    assert_eq!(
+        mholder.stats().timeouts_live,
+        0,
+        "the joiner acked every recall inside the deadline"
+    );
+
+    // B. An UNLEASED slot's directory is read through the manager (it
+    // maintains what nobody leases); the joiner's first touch then takes
+    // the slot and the manager's grant recalls the token it had granted
+    // on it (the transfer's token half).
+    let listed = joiner.readdir(shared, 0, 100).await.unwrap();
+    assert!(listed.iter().all(|d| !d.name.starts_with('j')));
+    let served_before_touch = mholder.stats().grants_served;
+    assert!(
+        served_before_touch > served1,
+        "the unleased directory came as a token"
+    );
+    let recalls_before_touch = mholder.stats().recalls;
+    let files = create_files(&joiner, shared, "j", 4).await;
+    assert!(
+        matches!(
+            tree0_state(&mvol, SLOT_A).await,
+            Some(SlotState::Leased { appender_id, .. }) if appender_id == jid
+        ),
+        "the first touch took the slot over the wire"
+    );
+    assert!(
+        mholder.stats().recalls > recalls_before_touch,
+        "the grant recalled the manager's tokens on the moved slot"
+    );
+    assert_all_resolve(&joiner, shared, &files).await;
+
+    // C. The MANAGER creates into the directory the JOINER holds: PR 6's
+    // shipped step, served from the joiner's listener.
+    let shipped0 = cross_owner_stats().steps_shipped;
+    let served_steps0 = cross_owner_stats().steps_served;
+    let from_manager = manager
+        .create(shared, "from_manager", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("a create into a foreign-held directory is an ordinary op");
+    assert!(
+        cross_owner_stats().steps_shipped > shipped0,
+        "the step travelled"
+    );
+    assert!(
+        cross_owner_stats().steps_served > served_steps0,
+        "the joiner served it"
+    );
+    let seen = joiner
+        .lookup(shared, "from_manager")
+        .await
+        .expect("the joiner holds the slot: the dentry is in its tree");
+    assert_eq!(seen.ino, from_manager.ino);
+    assert_all_resolve(&joiner, shared, &files).await;
+    assert_must_stay_zero(&jvol, "joiner");
+    assert_must_stay_zero(&mvol, "manager");
+    assert_eq!(
+        squeezefs::invariant_tripwire_count("xv_local_step_unguarded"),
+        0
+    );
+
+    squeezefs::data_grant::disarm_slot_custody().await;
+    squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    jvenue.tear_down();
+    // Every file — the joiner's and the manager's shipped one — resolves
+    // at the manager after the leave (the released root is exact).
+    assert_all_resolve(&manager, shared, &files).await;
+    manager.lookup(shared, "from_manager").await.unwrap();
+    mvenue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
 /// **The refusals**: a joined open needs the plane (`SQUEEZEFS_SYMMETRIC_
 /// META=1`) — without it the D0 guard's refusal stands, never a join; a
 /// joiner's control writes refuse loud (the must-stay-0 gauge moves

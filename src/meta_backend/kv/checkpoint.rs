@@ -1555,11 +1555,20 @@ async fn tick(
         // later mount (the clean-unmount leak PR 11's census found). One
         // more cycle persists them; with nothing dirty it journals no SMO,
         // so the term converges in that cycle.
+        // A JOINED appender (PR 12b) is judged by ITS ring alone: ring 0
+        // and the bitmap are the manager's — its projection of them holds
+        // the manager's uncovered window and the replayed deltas' dirty
+        // bits, which no cycle of a joiner may write (the first build
+        // looped its bound on them and warned of a residue that was never
+        // its own).
+        let joined = be.is_joined_appender();
         let uncovered = |be: &KvMetaBackend| {
+            let regions = be.appenders().is_some_and(|a| a.rings_uncovered());
+            if joined {
+                return regions;
+            }
             let core = be.journal_ring().core();
-            core.head() != core.reusable_upto()
-                || be.appenders().is_some_and(|a| a.rings_uncovered())
-                || be.allocator().has_dirty_pages()
+            core.head() != core.reusable_upto() || regions || be.allocator().has_dirty_pages()
         };
         for _ in 0..bound {
             if !uncovered(be) {
@@ -1881,9 +1890,8 @@ impl KvMetaBackend {
         // volume every slot is region 0's and they fold into `tail`.
         let dying_leaf_floors = self.node_cache().take_dying_leaf_floors();
         let partitioned = self.appenders().is_some_and(|a| a.is_partitioned());
-        let mut tail = h
-            .min(self.journal_ring().min_inflight_start())
-            .min(dying_floors);
+        let inflight_start = self.journal_ring().min_inflight_start();
+        let mut tail = h.min(inflight_start).min(dying_floors);
         // The forest's clamp: a guest root tree 0 does not yet name (a
         // deferred or failed publication above) keeps every record
         // applied under it in the window. A root floor is a position in
@@ -1891,12 +1899,13 @@ impl KvMetaBackend {
         // clamp the ledger's tail, a leased slot's clamps ITS region's.
         let mut live_leaf_floors: std::collections::BTreeMap<super::record::ForestSlot, u64> =
             std::collections::BTreeMap::new();
-        for (slot, f) in self.unpublished_root_floors() {
-            if !partitioned || self.region_of_slot(slot) == 0 {
-                tail = tail.min(f);
+        let unpublished = self.unpublished_root_floors();
+        for (slot, f) in &unpublished {
+            if !partitioned || self.region_of_slot(*slot) == 0 {
+                tail = tail.min(*f);
             } else {
-                let e = live_leaf_floors.entry(slot).or_insert(u64::MAX);
-                *e = (*e).min(f);
+                let e = live_leaf_floors.entry(*slot).or_insert(u64::MAX);
+                *e = (*e).min(*f);
             }
         }
         for (slot, f) in &dying_leaf_floors {
@@ -1904,6 +1913,7 @@ impl KvMetaBackend {
                 tail = tail.min(*f);
             }
         }
+        let mut dirty_floor_min = u64::MAX;
         self.node_cache().for_each_node(|n| {
             let floor = n.dirty_floor();
             if floor == u64::MAX {
@@ -1921,8 +1931,26 @@ impl KvMetaBackend {
                     }
                 }
             }
+            dirty_floor_min = dirty_floor_min.min(floor);
             tail = tail.min(floor);
         });
+        if tail < h {
+            // The tail's attribution: which clamp bound this cycle's
+            // record (a stuck tail is read off this line).
+            log::debug!(
+                "checkpoint tail {tail} < head {h}: inflight {inflight_start}, dying floors \
+                 {dying_floors}, unpublished roots {:?}, dying leaf floors {:?}, dirty node \
+                 floor {dirty_floor_min}",
+                unpublished
+                    .iter()
+                    .filter(|(s, _)| !partitioned || self.region_of_slot(**s) == 0)
+                    .collect::<Vec<_>>(),
+                dying_leaf_floors
+                    .iter()
+                    .filter(|(s, _)| !partitioned || self.region_of_slot(**s) == 0)
+                    .collect::<Vec<_>>()
+            );
+        }
         let region_tails = self.appender_region_tails(&dying_leaf_floors, &live_leaf_floors);
 
         // ---- The ledger record naming the synced roots + that tail.

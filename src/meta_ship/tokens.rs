@@ -1445,6 +1445,20 @@ impl RecallLane {
             .unwrap_or(0)
     }
 
+    /// Every object with an outstanding grant that `keep` selects — the
+    /// slot transfer's census (symmetric PR 12b: the objects of ONE forest
+    /// slot, by the key ino's slot bits). One lock hold, O(objects
+    /// outstanding).
+    pub fn objects_where(&self, keep: impl Fn(u64) -> bool) -> Vec<u64> {
+        self.state
+            .lock()
+            .grants
+            .keys()
+            .copied()
+            .filter(|o| keep(*o))
+            .collect()
+    }
+
     /// The holders of `ino` by identity (the token plane's lease sweep
     /// reads each one's membership verdict before it recalls).
     pub fn holders_of(&self, ino: u64) -> Vec<String> {

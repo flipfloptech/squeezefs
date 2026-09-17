@@ -375,6 +375,48 @@ async fn plaintext_transport_forces_mandatory_verify_reads() {
     host.shutdown().await;
 }
 
+/// THE endpoint law on the job wire's publication (PR 12 review round 2,
+/// Issue 26): the endpoint the mount registration publishes
+/// (`JobWireHost::advertised_endpoint`) is an explicit
+/// `SQUEEZEFS_JOB_WIRE_BIND` IP verbatim with the BOUND port — before it
+/// `main` published `local_advertise_ip():port` whatever the bind said, so
+/// an explicit interface (or `127.0.0.1`) sent remote workers to an
+/// address nothing listened on; the unspecified bind advertises the
+/// route-derived IP and never `0.0.0.0`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_job_wire_publishes_an_explicit_bind_ip_verbatim_and_never_the_unspecified_one() {
+    let (meta, _mf) = meta_fixture().await;
+    let fab = fabric(&meta, 0).await;
+    let host = JobWireHost::start(fab, wire_cfg(30_000, 10_000), FakeShardDevice::new(0, 0))
+        .await
+        .expect("host start");
+    let bound = host.endpoint();
+    assert_eq!(
+        host.advertised_endpoint(),
+        format!("127.0.0.1:{}", bound.port()),
+        "an explicit bind IP is advertised verbatim, with the bound port"
+    );
+    host.shutdown().await;
+
+    let (meta, _mf) = meta_fixture().await;
+    let fab = fabric(&meta, 0).await;
+    let mut cfg = wire_cfg(30_000, 10_000);
+    cfg.bind_addr = "0.0.0.0:0".parse().expect("literal addr");
+    let host = JobWireHost::start(fab, cfg, FakeShardDevice::new(0, 0))
+        .await
+        .expect("host start");
+    let advertised = host.advertised_endpoint();
+    assert!(
+        advertised.ends_with(&format!(":{}", host.endpoint().port())),
+        "the unspecified bind advertises the BOUND port ({advertised})"
+    );
+    assert!(
+        !advertised.starts_with("0.0.0.0"),
+        "the unspecified address is never advertised ({advertised})"
+    );
+    host.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tls_transport_round_trip_keeps_sampling() {
     // TLS via sync rustls over the ClusterSecurityConfig cert/CA/

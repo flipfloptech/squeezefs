@@ -2283,12 +2283,16 @@ async fn a_grace_window_reclaim_is_continuity_and_never_fences() {
 /// must advertise THAT address — advertising the primary-interface IP
 /// names a place where nothing listens, and every member of that fleet
 /// stays silently invisible (found building the S6-b netns venue, where
-/// the dialable address and the primary IP genuinely differ).
+/// the dialable address and the primary IP genuinely differ). Since PR 12
+/// (review round 2, Issue 26) the law lives in ONE function every
+/// publisher reads — `cluster_wire::advertised_endpoint` — so this is the
+/// two-arm unit pin of the law itself (the S9 arms, the job wire and the
+/// join ladder publish through it).
 #[test]
 fn an_explicit_membership_bind_advertises_the_bound_address() {
     let bind: std::net::SocketAddr = "10.11.12.13:7401".parse().expect("literal");
     assert_eq!(
-        membership::owner_advertise_endpoint(bind, 7401),
+        squeezefs::cluster_wire::advertised_endpoint(bind, 7401),
         "10.11.12.13:7401",
         "an explicit bind is the operator saying WHERE the plane is served"
     );
@@ -2296,7 +2300,7 @@ fn an_explicit_membership_bind_advertises_the_bound_address() {
     // listens 'at' the unspecified address, so the advertised IP is the
     // primary-interface derivation.
     let auto: std::net::SocketAddr = "0.0.0.0:0".parse().expect("literal");
-    let advertised = membership::owner_advertise_endpoint(auto, 4567);
+    let advertised = squeezefs::cluster_wire::advertised_endpoint(auto, 4567);
     assert!(
         advertised.ends_with(":4567"),
         "auto advertises the BOUND port ({advertised})"

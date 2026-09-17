@@ -381,11 +381,13 @@ async fn rung_3_refuses_an_explicit_membership_off_and_arms_auto_only_when_unset
 
 /// A SECOND RW mount of an ARMED set is refused at the D0 gate — loud, at
 /// the OPEN, before any page goes `Live` or any claim-set entry is written
-/// (nothing half-joins) — and the refusal NAMES the posture it met: the
-/// N-daemon backend posture is PR 12b, until it lands the D0 guard applies
-/// to RW mounts and `-o ro` readers join as token clients (review round 1,
-/// Issue 6). Without the plane the same refusal is the shipped
-/// single-writer text verbatim.
+/// (nothing half-joins — witnessed on the DEVICE directory) — and the
+/// refusal NAMES the posture it met: the MANY-writer posture (N unbounded
+/// by design — the second daemon is only what meets the gate first) is PR
+/// 12b; until it lands the D0 guard applies to RW mounts and `-o ro`
+/// readers join as token clients (review rounds 1/2, Issues 6, 21, 25).
+/// Without the plane the same refusal is the shipped single-writer text
+/// verbatim.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_rw_mount_of_an_armed_set_is_refused_naming_the_plane_and_pr_12b() {
     let _g = SEAM.lock().await;
@@ -393,7 +395,7 @@ async fn a_second_rw_mount_of_an_armed_set_is_refused_naming_the_plane_and_pr_12
     let dir = tempfile::tempdir().unwrap();
     let uris = format_stamped_set_with_config(dir.path(), 1).await;
     let first = open_under(&uris, &Knobs::armed()).await;
-    let pages_before = read_directory_live_count(&first).await;
+    let pages_before = live_pages_on_device(&uris[0], &first).await;
 
     // Armed: refused, naming the plane and PR 12b; nothing half-joined
     // (`open_under` clears the knobs after its open — the second mount
@@ -413,13 +415,18 @@ async fn a_second_rw_mount_of_an_armed_set_is_refused_naming_the_plane_and_pr_12
         "names the posture and the rung that lands it: {err}"
     );
     assert!(
-        err.contains("-o ro") && err.contains("N-daemon"),
-        "names what a second mount may be today: {err}"
+        err.contains("many-writer") && err.contains("N unbounded"),
+        "the posture is the MANY-writer one, N unbounded by design — the second daemon is \
+         only what meets the gate first: {err}"
+    );
+    assert!(
+        err.contains("-o ro") && err.contains("joins as a WRITER once PR 12b"),
+        "names what a second mount may be today and will be: {err}"
     );
     assert_eq!(
-        read_directory_live_count(&first).await,
+        live_pages_on_device(&uris[0], &first).await,
         pages_before,
-        "the refused mount left no Live page — nothing half-joined"
+        "the refused mount left no Live page ON THE DEVICE — nothing half-joined"
     );
 
     // Unarmed: the shipped text, verbatim — the note is the plane's alone.
@@ -437,12 +444,21 @@ async fn a_second_rw_mount_of_an_armed_set_is_refused_naming_the_plane_and_pr_12
     shutdown(&first).await;
 }
 
-/// The appender directory's `Live` page count as a probe reads it.
-async fn read_directory_live_count(routed: &RoutedMetaBackend) -> usize {
-    routed.volumes[0]
-        .appender_stats()
-        .map(|s| s.live as usize)
-        .unwrap_or(0)
+/// The appender directory's `Live` page count read off the DEVICE (the
+/// page slots — `appender::read_directory`), never a backend's RAM stat: a
+/// page another open wrote is visible only there (review round 2, Issue
+/// 25).
+async fn live_pages_on_device(uri: &str, routed: &RoutedMetaBackend) -> usize {
+    read_directory(std::path::Path::new(uri), routed.volumes[0].superblock())
+        .await
+        .expect("directory")
+        .iter()
+        .filter(|e| {
+            e.page.as_ref().is_some_and(|p| {
+                p.state == squeezefs::meta_backend::kv::appender::AppenderState::Live
+            })
+        })
+        .count()
 }
 
 // ===========================================================================

@@ -2911,6 +2911,61 @@ fn sym_appender_recovery_bound_derives_from_the_ring_the_node_size_and_the_landi
     );
 }
 
+/// **PR 10, review round 8, Issue 36 — the death-path custody quarantine's
+/// bound is `T_owner + 2 × skew_max` of the custody lease clocks.** The
+/// OWNER's view: `T_owner` is the instant past which a holder may re-grant
+/// a lease it issued (the member's `T_self = T_owner − 2·skew_max −
+/// D_purge` is the STRICTER self-fence — the wrong side for an owner-side
+/// quarantine), and the death record's `ts_ms` is the RECORDER's wall
+/// clock compared against the quarantining node's, so the bound absorbs
+/// `2 × skew_max` of disagreement. With no custody authority installed the
+/// process-wide bound is the shipped derivation's; the bound outlives no
+/// death record (`death_record_retire_age_ms` = 2 × T_owner ≥ it, since
+/// `2·skew_max < T_owner` by the clocks' own admissibility).
+#[test]
+fn sym_custody_quarantine_bound_derives_from_t_owner_and_skew_max() {
+    use squeezefs::data_grant::{custody_quarantine_bound_for, custody_quarantine_bound_ms};
+    use squeezefs::membership::LeaseClocks;
+    use squeezefs::meta_backend::kv::alloc_lease::death_record_retire_age_ms;
+    use std::time::Duration;
+    for (t_owner, skew, purge) in [
+        (3_000u64, 200u64, 400u64),
+        (45_000, 22, 1_100),
+        (600, 100, 100),
+    ] {
+        let clocks = LeaseClocks::with_params(
+            Duration::from_millis(t_owner),
+            Duration::from_millis(skew),
+            Duration::from_millis(purge),
+        )
+        .expect("admissible clocks");
+        assert_eq!(
+            custody_quarantine_bound_for(&clocks),
+            t_owner + 2 * skew,
+            "T_owner {t_owner} skew {skew}: the owner-side bound"
+        );
+        assert!(
+            custody_quarantine_bound_for(&clocks) > clocks.t_self.as_millis() as u64,
+            "strictly past the member's self-fence"
+        );
+        assert!(
+            custody_quarantine_bound_for(&clocks) <= 2 * t_owner,
+            "never past the record's retirement age"
+        );
+    }
+    squeezefs::data_grant::uninstall_custody_owner();
+    let shipped = LeaseClocks::derive(Duration::ZERO).expect("the shipped clocks derive");
+    assert_eq!(
+        custody_quarantine_bound_ms(),
+        custody_quarantine_bound_for(&shipped),
+        "no authority installed: the shipped derivation's bound"
+    );
+    assert!(
+        custody_quarantine_bound_ms()
+            <= death_record_retire_age_ms(shipped.t_owner.as_millis() as u64)
+    );
+}
+
 /// **PR 10, review round 2, Issue 27 — the death record's retirement age
 /// is ONE law with two readers.** `death_record_retire_age_ms` = TWO lease
 /// TTLs (one for every manager's poll to project and act, one for the

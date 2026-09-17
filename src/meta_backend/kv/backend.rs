@@ -1706,9 +1706,10 @@ impl KvMetaBackend {
                             format!(
                                 "{}: another squeezefs process holds the writer lock{} — \
                                  concurrent mounts of one metadata volume are refused \
-                                 (single-writer guard)",
+                                 (single-writer guard){}",
                                 path.display(),
                                 holder_suffix(&holder),
+                                symmetric_second_writer_note(),
                             )
                         } else {
                             format!(
@@ -1718,9 +1719,10 @@ impl KvMetaBackend {
                                  of taking the lock, so the holder is an external flock on \
                                  the device node (udevd's change-event probe releases \
                                  quickly; this one did not). Concurrent mounts of one \
-                                 metadata volume are refused (single-writer guard)",
+                                 metadata volume are refused (single-writer guard){}",
                                 path.display(),
                                 TRANSIENT_FLOCK_WAIT.as_secs(),
+                                symmetric_second_writer_note(),
                             )
                         }));
                     }
@@ -13447,6 +13449,22 @@ pub enum SharedProbe {
 
 /// Compose the `(claim: id=…, pid=…, boot=…, age=…s)` holder suffix for
 /// refusal messages (design §6: refusals name the holder).
+/// The sentence a D0 refusal appends when the symmetric plane is REQUESTED
+/// (`SQUEEZEFS_SYMMETRIC_META=1` — PR 12, review round 1 Issue 6): the
+/// manual says every RW mount of an armed set is a writer, so a second RW
+/// mount's refusal must name the posture it met and the rung that lands it
+/// instead of reading as the single-writer guard alone. Empty on an
+/// unarmed process — the shipped text verbatim.
+fn symmetric_second_writer_note() -> &'static str {
+    if super::slot_lease::symmetric_meta_requested() {
+        " (symmetric plane armed: a SECOND RW writer on one set is the N-daemon backend \
+         posture — PR 12b; until it lands the D0 guard applies to RW mounts and `-o ro` \
+         readers join as token clients)"
+    } else {
+        ""
+    }
+}
+
 fn holder_suffix(holder: &Option<(WriterClaim, u64)>) -> String {
     match holder {
         Some((c, now)) => format!(
@@ -13986,12 +14004,13 @@ impl KvMetaBackend {
             (ClaimEvidence::FreshForeign(c), _) => {
                 return Err(KvError::Busy(format!(
                     "{}: metadata volume is claimed by a live writer{} — concurrent \
-                     mounts of one metadata volume are refused (single-writer guard). \
+                     mounts of one metadata volume are refused (single-writer guard){}. \
                      A crashed holder on THIS host is reclaimed automatically once its \
                      pid is provably dead; otherwise stop that writer or wait for its \
                      claim to expire (ttl {}s)",
                     self.path.display(),
                     holder_suffix(&Some((c.clone(), now))),
+                    symmetric_second_writer_note(),
                     crate::fuse_client::CLIENT_STALE_TTL_SECS,
                 )));
             }

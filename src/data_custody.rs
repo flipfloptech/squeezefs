@@ -564,10 +564,37 @@ impl std::fmt::Debug for WeroHold {
     }
 }
 
+/// A NON-owning reference to a [`WeroHold`]: a background task that only
+/// OBSERVES the hold (the S9 custody sweep's re-verify and dead-epoch
+/// preempt) must never keep it alive — the release ioctl runs in
+/// [`WeroInner`]'s drop, so a strong clone parked on a 10 s cadence would
+/// outlive the arm's `disarm` and die with the process, leaving this
+/// mount's registrant on the data namespace (found by the fidelity tier's
+/// `sym-join-ladder` leg: `regctl data=1` after a clean leave — the
+/// successor's OWN key). Upgrade per use; `None` once the owner released.
+#[derive(Clone)]
+pub struct WeroHoldRef {
+    inner: Weak<WeroInner>,
+}
+
+impl WeroHoldRef {
+    /// The hold, if its owner still holds it.
+    pub fn upgrade(&self) -> Option<WeroHold> {
+        self.inner.upgrade().map(|inner| WeroHold { inner })
+    }
+}
+
 impl WeroHold {
     /// The reservation key this hold stands on.
     pub fn key(&self) -> u64 {
         self.inner.key
+    }
+
+    /// A non-owning reference for observers (see [`WeroHoldRef`]).
+    pub fn downgrade(&self) -> WeroHoldRef {
+        WeroHoldRef {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 
     /// PREEMPT `victim_key`'s registration under the standing WERO — the

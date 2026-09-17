@@ -1211,7 +1211,12 @@ pub(crate) async fn arm_authority_planes(
     );
 
     let stop = Arc::new(AtomicBool::new(false));
-    spawn_cadence(Arc::clone(&owner), wero.clone(), Arc::clone(&stop), renew);
+    spawn_cadence(
+        Arc::clone(&owner),
+        wero.as_ref().map(WeroHold::downgrade),
+        Arc::clone(&stop),
+        renew,
+    );
     // PR 7b: the endpoint halves. A set authority under a multi-owner map
     // both PUBLISHES where it serves (its own roster entry carries the
     // membership plane's port, not this listener's) and WAITS for its
@@ -2067,7 +2072,7 @@ async fn cluster_secret(meta: &Arc<RoutedMetaBackend>) -> Option<Vec<u8>> {
 /// reallocation.
 fn spawn_cadence(
     owner: Arc<WriteCustodyOwner>,
-    wero: Option<WeroHold>,
+    wero: Option<crate::data_custody::WeroHoldRef>,
     stop: Arc<AtomicBool>,
     cadence: Duration,
 ) {
@@ -2077,6 +2082,12 @@ fn spawn_cadence(
             if stop.load(Ordering::Acquire) {
                 return;
             }
+            // The sweep OBSERVES the hold (a weak reference upgraded per
+            // tick): a strong clone here outlived `disarm` by up to one
+            // cadence and took the release ioctl with it out of the
+            // process — the arm's own reference is the LAST one, so its
+            // drop inside `disarm` is what releases the reservation.
+            let wero = wero.as_ref().and_then(|w| w.upgrade());
             // Rung-9 finding #2: RE-VERIFY the standing WERO against the
             // device every sweep — before this, the fence-mode gauge read
             // 1 forever, even over a reservation the device no longer

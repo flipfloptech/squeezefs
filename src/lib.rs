@@ -270,8 +270,6 @@ pub mod sqz_sync_core;
 pub mod storage;
 pub mod stripe_locks;
 pub mod supervisor;
-/// The symmetric JOIN LADDER — every RW mount of an armed set is a writer
-/// (design-symmetric-metadata §7.3, PR 12).
 pub mod sym_join;
 pub mod token_grant_core;
 // The S8 client token cache's word protocol (spec §6.9's

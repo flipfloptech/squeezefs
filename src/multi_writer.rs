@@ -427,7 +427,7 @@ fn resolve_bind() -> Result<Bind> {
         })
 }
 
-/// [`resolve_bind`] for the symmetric join ladder's rung 7
+/// `resolve_bind` for the symmetric join ladder's rung 7
 /// (`crate::sym_join`): `Ok(Some(addr))` = where to serve (`auto` = ruling
 /// D2's `0.0.0.0:0`), `Ok(None)` = an explicit `off` (the ladder refuses
 /// it under its own text), `Err` = a malformed address.

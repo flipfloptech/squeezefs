@@ -421,7 +421,7 @@ for slot tree 4 it does not lease` — clearable by nothing.
 | `RecoveringStructure { slots, stash }` / `RecoveringInterior` / `AppenderSet::recovering_structure` | `kv/appender.rs` | the forest replay WITHHOLDS the manager's interior records for those slots (they were journaled against the PAGE root the recoverer installed, not the tree-0 root the open holds — folding them there dirtied a foreign tree, which `drop_slot_nodes` then refused) and hands them to the appender open |
 | the forest replay's directory + tree-0 read, the stash filter; the appender open's install of a foreign `Recovering` page's roots BEFORE `park_replayed_frees` (a root swap's retirement of the page root is among the replayed frees — dropped for a mounted root), an OWN `Recovering` page's stash applied at the open, a foreign page's kept on the set; the screen's `appender_current = None` for a lessee mid-recovery | `kv/backend.rs` | the open's half of the law |
 | step 4 applies the stash onto the installed root (structural class, level DESC / seq ASC) before the dead window; `SlotRollback.structure` puts it back and discards what it dirtied (an `Untouched` tree discards for this alone); `recovering_lessees` in at step 2, out at step 8 | `kv/backend/recovery.rs` | the re-run's half |
-| `SlotLeasePlane::recovering_lessees` | `kv/slot_lease.rs` | the SECOND face of the same law, found by the pin: the recoverer's frames on the dead slot are stamped `(0, g)` and the §5.8.2 screen's rule 4 (`g == g_current ∧ appender ≠ lessee`) read them FOREIGN at every reload while tree 0 named the dead lessee — the recovered leaves loaded TRUNCATED (the base bset itself screened) and the re-run's compaction refused the fold (`SMO fold-source log-view mismatch … disk walk ends at 61440, the live object's append cursor is at 4096`) |
+| `SlotLeasePlane::recovering_lessees` | `kv/slot_lease.rs` | the SECOND face of the same law, found by the pin: the recoverer's frames on the dead slot are stamped `(0, g)` and the §5.8.2 screen's rule 4 (`g == g_current ∧ appender ≠ lessee`) read them FOREIGN at every reload while tree 0 named the dead lessee — the recovered leaves loaded TRUNCATED (the base bset itself screened) and the re-run's compaction refused the fold (`SMO fold-source log-view mismatch … disk walk ends at 61440, the live object's append cursor is at 4096`). **The suspension's window and class (round 7, Issue 33)**: rule 4 is inert on the slot from the page's `Recovering` write to the recovery's tree-0 step (the next grant moves `g`); what it admits at `g` is a frame from an appender that is neither the dead lessee nor `0` on a slot it never leased — a corrupted or hostile appender; rules 1–3 stay armed (a former lessee at `g − 1`, a frame past the recorded tail) and on PR the preempt fences the dead lessee's key regardless |
 | `TEST_CHECKPOINT_HALT_BEFORE_LEDGER` | `kv/checkpoint.rs` | the kill inside a cycle, deterministic (the sibling of PR 8's `…_AFTER_LEDGER`) |
 
 **The pin** `a_recoverer_dying_after_its_flush_leaves_a_mount_the_next_open_admits`
@@ -507,3 +507,83 @@ N=2 --symmetric`) — 3 / 3 GREEN, the acked-writes oracle 729 / 306 / 948
 fsynced files all present, `self_recoveries=2`, manager `held`, tripwires 0,
 `findings:0` every round. Not run (by rule): `task check`, squeeze-test,
 anything on `dev` / `main`; `.benchmarks/2026-09-12-sym-pr-run.md` untouched.
+
+## 14. Review round 7 (2026-09-16) — Issues 32–35
+
+**Issue 32 (bug) — a live foreign lessee's page root ahead of tree 0 floored
+ring 0 for the mount's life.** Round 2 seeded `published` with tree 0's root
+and round 3 floored every root opened AHEAD of it; the `Leased` arm of the
+forest replay took the same law for a slot a FOREIGN appender leases, whose
+page root is ahead of tree 0's grant-time record in the wire venue's steady
+state — and `publish_forest_roots` never publishes a leased slot by law, so
+nothing could lift it. **Building the pin found the in-process masking, and
+the masking was itself a hole**: the bring-up's `publish_forest_roots`
+(before the plane arms — `plane` = `None`) listed the leased slot as pending,
+skipped its record (`Leased => continue`) and then noted EVERY pending root
+published — lifting the floor with nothing durable naming the root. That is
+how every two-backend fixture opened B at all: with the hole closed alone and
+the seeding unfixed, B's open over image 1 (root R1 ahead of tree 0's R0)
+REFUSED — `bring-up journal residue did not cover within 64 barriered cycles
+(head=155686, reusable_upto=150770)` — the wedge as a mount refusal. The same
+hole lifted Issue 31's hold (a foreign `Recovering` page's floor) at the
+open, so between the bring-up and the mount path's C15 re-run the dead
+recoverer's flips were coverable — a narrow death window the hold existed to
+close.
+
+| Piece | File | Law |
+|---|---|---|
+| the forest replay's `Leased` arm decides `publication_ours` = the lessee's page is this node's OR `Recovering`; a live FOREIGN lessee's slot opens at its page root with `published = root`, no floor | `kv/backend.rs` (`open_forest_and_replay`) | the lessee's page is its publication; its records sit in ITS ring; a ring-0 floor protects nothing |
+| `SlotTrees::new` takes each guest's PUBLISHED root (tree 0's where ours, the opened root where the lessee's) | `kv/forest.rs` | the seeding, stated |
+| `KvMetaBackend::unpublished_root_floors` — the LEASE FILTER: a slot leased to a live foreign appender (not an in-process region, not mid-recovery) never floors, whatever the forest's map says | `kv/backend.rs` | the belt behind the seeding, armed plane only |
+| `publish_forest_roots`: `written` ≠ `pending` — only roots whose record this entry writes are noted; an OWN region's `Leased` record without a table entry (the bring-up window) is REWRITTEN with the moved root (the page-budget overflow arm's exact shape: the lease's words verbatim, only the root moves — durable in tree 0, the record `leased_root_from_directory` falls back to); a FOREIGN lessee's is never rewritten and never noted; an entry with nothing to write returns early | `kv/backend.rs` | closes the skip-yet-note hole; an own region's root moved by the bring-up's own flush is named durably before the tail passes its records |
+| `cover_bring_up_residue` covers DOWN TO the recovery hold (`recovery_hold_floor` — the lowest floor of a slot whose lessee is a foreign appender in `recovering_lessees`), never past it | `kv/backend.rs`, `kv/backend/recovery.rs` | Issue 31's hold made real across the open: the re-run's tree-0 step lifts it; the D1.b law holds for everything but the recovery's own window |
+| `test_unpublished_root_floors` reads the checkpoint's filtered view | `kv/backend/recovery.rs` | the Issue-29 witness and the Issue-32 pin read what the tail reads |
+
+**The pin** `a_live_foreign_lessees_page_root_ahead_of_tree_0_floors_nothing_at_the_managers_open`:
+the two-backend fixture, the manager's clean leave, one publication deferred
+across the reopen (`TEST_FOREST_PUBLISH_DEFER` — the shape that keeps a
+floor standing), the manager reopens over X's `Live` page at R2 with tree 0
+`Leased { 1, root: R1 }`: the slot at R2, tree 0 untouched, **no floor for
+the slot**, a 200-create storm in the manager's own slots + the cadence
+passes the storm's start within `COVER_CYCLES_MAX`, the lessee's tree
+untouched; then X's death recovers the published-at-open tree whole, no
+floor left. **RED before** (with the masking hole closed): the fixture's own
+open refused at the bring-up. **The hold, witnessed**: the Issue-31 pin now
+asserts the slot's floor STANDS after the reopen's bring-up (`reusable_upto ≤
+hold`) and is lifted by the re-run — before this round the same assertion
+would have failed (the hole lifted it).
+
+**Issue 34 (suggestion, built) — the custody quarantine on the death path.**
+`DeadMemberRecord` carries its RECORDER class (a 26th byte; the 17 B PR-8 and
+25 B round-1..6 images decode as the plane's own, `early = false`; a class
+byte outside 0/1 refuses — the proptest mirror covers the three lengths and
+the poison): `record_death_with_key` (the S6 eviction, the wire) writes
+`false`; `record_death` (PR 8's same-node takeover) and `appender_clear` write
+`true`. At step 7b a recovery from an EARLY record calls
+`data_grant::quarantine_slot_custody(uuid, slot, ts_ms + T_self)` for every
+released slot (`T_self` from the installed custody authority's clocks, else
+the shipped derivation); both grant paths consult
+`custody_quarantine_remaining(ino)` after PR 9's mid-handover mark — the
+local acquire (plain and ranged, `dlm_slot.rs`) answers `Refused { EAGAIN }`
+naming the quarantine, the served `CustodyGrant` `CUSTODY_DEFERRED` with the
+same reason — one relaxed load on every mount without a quarantine; gauges
+`slot_custody_quarantine_refusals` / `slot_custody_quarantined`. The pin
+`an_early_death_record_quarantines_the_recovered_slots_custody_for_t_self`:
+two regular files preset into the slot, the lessee killed, `appender clear`
+(the early record), the next mount with PR 9's owner (2.2 s `T_self`) + arm,
+the gate recovers: the slot is ours (`foreign_slot_holder` = `None`) yet the
+acquire is refused `EAGAIN` naming the quarantine inside `T_self` of the
+record, then granted no earlier than `ts_ms + T_self`, the quarantine gone;
+the plane-record control is the seam-(b) pin's tail (an immediate local grant
+after a `record_death_with_key` recovery).
+
+**Issue 33** — §5.8.2 gained rule 4 with its suspension window (page
+`Recovering` → the re-run's tree-0 step, when the next grant moves `g`) and
+the class it admits (a frame at `g` from an appender that is neither the dead
+lessee nor `0` on a slot it never leased — corrupted or hostile; rules 1–3
+armed; the PR preempt regardless); the same sentence in operations.md's stats
+row and §12's table above. **Issue 35** — `SQZ_SYM_HANG_FACTOR` /
+`SQZ_SYM_HANG_FLOOR_S` registered `Kind::Harness` with their operations.md
+rows.
+
+The crash matrix is **34 contracts** (+1 ignored instrument).

@@ -600,3 +600,34 @@ the commits, with the Issue-32 fix alone: `sym_convert_tests` 38 /
 `crash_contract_tests` 25 both layouts green. Not run (by rule): `task check`,
 squeeze-test, anything on `dev` / `main`; `.benchmarks/2026-09-12-sym-pr-run.md`
 untouched.
+
+## 15. Review round 8 (2026-09-17) — Issue 36, the quarantine's bound and durability
+
+Round 7's quarantine compared the RECORDER's wall clock (`ts_ms`) against the
+manager's with the MEMBER's `T_self` as the window, and kept the word in RAM.
+Now: the bound is the OWNER's — `T_owner + 2 × skew_max` past `ts_ms`
+(`data_grant::custody_quarantine_bound_for`; `T_owner` is the instant past
+which a holder may re-grant a lease it issued, `T_self = T_owner − 2·skew_max −
+D_purge` the member's stricter self-fence — the wrong side for an owner-side
+quarantine; the `2 × skew_max` absorbs the two wall clocks' disagreement; the
+bound never outlives the record's retirement age `2 × T_owner`, since
+`2·skew_max < T_owner` by the clocks' own admissibility — tie-tested in
+`derivation_sweep_tests::sym_custody_quarantine_bound_derives_from_t_owner_and_skew_max`
+over three clock sets + the shipped derivation). And it is DURABLE: the
+recovery's step-7 tree-0 entry carries `custody_quarantine:{slot} → { version
+‖ until_ms }` (a 9 B record under a new tree-0 prefix; `slot_state.rs`) beside
+each released slot's `Unleased`; the mount path's C15 gate re-derives the RAM
+word from those records before the set serves (`load_custody_quarantines` —
+one range read per armed volume; expired records retired in one `Try` control
+entry, best effort) — the codec fuzzed by `slot_state_record` + the proptest
+mirror. Pins: `a_custody_quarantine_survives_a_manager_restart_inside_the_window`
+(the first incarnation recovers, is refused, leaves cleanly; the process word
+CLEARED — the restart; the second incarnation's gate recovers nothing and
+re-derives ONE quarantine, the acquire refused naming it until the bound past
+the ORIGINAL record, then granted; a third load retires the record) — **RED**
+without the gate's re-derivation (`the quarantine is re-derived from the
+durable record: left 0, right 1`); the Issue-34 pin re-targeted to the bound
+and asserting the durable record's deadline + its retirement. The crash matrix
+is **36 contracts** (+1 ignored instrument).
+
+**Verification (`CARGO_INCREMENTAL=0`, the dev laptop)**: filled in below.

@@ -89,6 +89,15 @@ pub fn retired_knob_refusal() -> Option<String> {
         if raw.is_empty() {
             continue;
         }
+        // The BOOL knob at an OFF spelling (`0` / `false` / `no` / `off`)
+        // asks for nothing: the knob law reads it as DISABLED, i.e. absent
+        // — a fleet env that writes the shipped default out declares no
+        // posture (review round 1, Issue 19). A malformed value never
+        // reaches here (the registry gate refused the process first). The
+        // enum / string knobs have no off spelling: `authority` is a role.
+        if *key == "SQUEEZEFS_MULTI_WRITER" && !crate::env_knobs::bool_knob(key, false) {
+            continue;
+        }
         lines.push(format!(
             "{key}='{raw}' was RETIRED on a symmetric mount (forward-only — never a silent \
              alias): {successor}"
@@ -108,8 +117,9 @@ pub fn retired_knob_refusal() -> Option<String> {
         s.push('\n');
     }
     s.push_str(
-        "  (unset them; on an UNARMED mount — SQUEEZEFS_SYMMETRIC_META unset — they keep their \
-         shipped meaning until the PR-14 flip)",
+        "  (unset them — SQUEEZEFS_MULTI_WRITER at an OFF spelling (`0`/`false`/`no`/`off`) is \
+         the absent knob and is admitted; on an UNARMED mount — SQUEEZEFS_SYMMETRIC_META unset \
+         — they keep their shipped meaning until the PR-14 flip)",
     );
     Some(s)
 }

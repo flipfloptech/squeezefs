@@ -1306,6 +1306,20 @@ pub async fn discover_peers(
 /// boxes, where same-host peers still reach it. The publication half of
 /// DISC-1: a peer is discoverable because it wrote where to reach it, not
 /// because anyone configured it.
+/// The endpoint a listener bound at `bind` ADVERTISES: an explicit bind IP
+/// verbatim (the operator named the interface — advertising the route
+/// lookup's IP instead sent peers to another interface, and an explicit
+/// `127.0.0.1` to one nothing listened on), else the route-derived IP for
+/// the unspecified address, with the listener's actual port either way.
+pub fn advertised_endpoint(bind: std::net::SocketAddr, bound: std::net::SocketAddr) -> String {
+    let ip = if bind.ip().is_unspecified() {
+        local_advertise_ip()
+    } else {
+        bind.ip()
+    };
+    format!("{ip}:{}", bound.port())
+}
+
 pub fn local_advertise_ip() -> std::net::IpAddr {
     std::net::UdpSocket::bind(("0.0.0.0", 0))
         .and_then(|s| {

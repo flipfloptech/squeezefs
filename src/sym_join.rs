@@ -390,6 +390,17 @@ pub async fn arm(
     // `resolve_holder_endpoint` reads for its appender id on any mount
     // (a reader's per-slot planes, a peer's shipped steps), no knob.
     crate::multi_writer::publish_symmetric_endpoint(meta, &report.endpoint).await;
+    // The binding's WRITER half, the other direction (PR 6's owed "the
+    // endpoint binding + the wire initiator's lock take"): the step shipper
+    // a cross-owner op's foreign steps and travelling guards ride — the S8
+    // client router over this set under the cluster secret — and, for
+    // every appender the directory names Live, the endpoint its own ladder
+    // published, bound into the slot holder table `step_home` reads. A
+    // holder that joins AFTER this ladder is bound by PR 12b's wire
+    // `JoinAppender` (the joiner's endpoint word at the verb), not by a
+    // re-read here.
+    install_step_shipper(meta, &report.endpoint).await;
+    bind_live_appender_endpoints(meta).await;
     install_report(report.clone());
     log::warn!(
         "SYMMETRIC WRITER JOINED (design-symmetric-metadata §7.3): rungs {:?}; {} data \
@@ -438,15 +449,78 @@ pub async fn resolve_holder_endpoint(
         .filter(|e| !e.is_empty())
 }
 
+/// Install the cross-owner step shipper for this writer (rung 7): the S8
+/// client router under the set's cluster secret, keyed by this node's
+/// member id so a served step's scope names the initiator (`serve_guards_for`
+/// compares `router.peer_id()` with the scope's client).
+async fn install_step_shipper(meta: &Arc<RoutedMetaBackend>, endpoint: &str) {
+    let Some(first) = meta.volumes.first() else {
+        return;
+    };
+    let Some(secret) = crate::membership::cluster_secret(first).await else {
+        log::warn!(
+            "symmetric join ladder rung 7: no cluster secret on the set — the step shipper is              not installed (a foreign step is the un-shippable class the roll-forward cadence              retries); the S8 listener on {endpoint} still serves"
+        );
+        return;
+    };
+    let Ok(node_id) = crate::cowriter::node_member_id() else {
+        return;
+    };
+    crate::meta_backend::crossvol_tx::install_xv_shipper(crate::meta_ship::MetaShipRouter::new(
+        Arc::clone(meta),
+        &node_id,
+        secret,
+    ));
+}
+
+/// Bind every Live appender's PUBLISHED endpoint into each volume's slot
+/// holder table (rung 7's census binding, the writer side): the ONE table
+/// `crossvol_tx::step_home` and `data_grant`'s slot-holder custody read.
+/// The directory is read once per volume; an appender whose ladder has not
+/// reached its publish is left unbound (`StepHome::Unreachable` — the
+/// retryable class), never guessed. Returns the bindings made.
+pub async fn bind_live_appender_endpoints(meta: &Arc<RoutedMetaBackend>) -> usize {
+    let mut bound = 0;
+    for vol in &meta.volumes {
+        let Some(plane) = vol.slot_leases() else {
+            continue;
+        };
+        let own = vol.own_appender_id();
+        let Ok(entries) =
+            crate::meta_backend::kv::appender::read_directory(vol.device_path(), vol.superblock())
+                .await
+        else {
+            continue;
+        };
+        for entry in entries {
+            let Some(page) = entry.page.as_ref() else {
+                continue;
+            };
+            if entry.appender_id == own
+                || page.state != crate::meta_backend::kv::appender::AppenderState::Live
+            {
+                continue;
+            }
+            if let Some(endpoint) = resolve_holder_endpoint(vol, entry.appender_id).await {
+                plane.holders.set_endpoint(entry.appender_id, &endpoint);
+                bound += 1;
+            }
+        }
+    }
+    bound
+}
+
 static REPORT: arc_swap::ArcSwapOption<JoinReport> = arc_swap::ArcSwapOption::const_empty();
 
 fn install_report(report: JoinReport) {
     REPORT.store(Some(Arc::new(report)));
 }
 
-/// Forget the report (the leave / test teardown).
+/// Forget the report and the step shipper (the leave / test teardown) —
+/// the planes the ladder stood up leave together.
 pub fn clear_report() {
     REPORT.store(None);
+    crate::meta_backend::crossvol_tx::uninstall_xv_shipper();
 }
 
 /// The ladder's report for the stats inode (`symmetric_join`), `None`

@@ -16,7 +16,9 @@
 //! that caller (the no-dead-code law).
 //!
 //! The holder's ENDPOINT is the membership census's — the appender id →
-//! member identity binding is PR 12's join ladder. PR 6 gave the cache the
+//! member identity binding is the join ladder's rung 7 (PR 12:
+//! `sym_join::bind_live_appender_endpoints`, every Live appender's published
+//! listener; a later joiner's arrives with PR 12b's wire `JoinAppender`). PR 6 gave the cache the
 //! endpoint TABLE that binding fills ([`SlotHolderCache::set_endpoint`] /
 //! [`SlotHolderCache::endpoint`]): the cross-owner step shipper resolves a
 //! foreign slot's holder to its appender id here and to a wire endpoint

@@ -513,7 +513,7 @@ impl AllocHolding {
     }
 
     /// TEST seam (review round 4, Issue 34): a holder homed on another
-    /// volume — what PR 12's join ladder mints — so the index-home
+    /// volume — what PR 12b's second daemon mints — so the index-home
     /// resolver's re-point is distinguishable from PR 7's default.
     pub fn test_set_home_vol(&self, home_vol: u16) {
         self.home_vol.store(home_vol, Ordering::Release);
@@ -998,7 +998,7 @@ pub fn t_park_max_for(failover_bound_ms: u64, clocks: &crate::membership::LeaseC
 /// **Arm the symmetric ROLES of a routed set** (the routed open's last
 /// step): when the slot-0 volume armed the plane, it is the coordinator's
 /// home (KD-SYM-2) and this mount is a symmetric APPENDER homed there
-/// (`home_volume` = the slot-0 volume's ordinal until PR 12's join ladder
+/// (`home_volume` = the slot-0 volume's ordinal until PR 12b's second daemon
 /// chooses a home) whose `T_self` action is the PARK, bounded by
 /// `T_park_max = manager_failover_bound_ms + grace` (the S6 owner-failover
 /// window, `LeaseClocks::grace`). The set's heap geometry is installed for
@@ -2371,7 +2371,7 @@ pub fn holder_block_grant_sink(
 
 /// A WIRE writer's grant sink: `ManagerCall::BlockGrant` to the manager
 /// venue at `endpoint` (one storage-trust session, reconnected on
-/// failure). PR 12's second daemon is the production caller; the
+/// failure). PR 12b's second daemon is the production caller; the
 /// contracts drive it here.
 pub fn wire_block_grant_sink(
     endpoint: String,
@@ -2443,7 +2443,7 @@ pub fn install_wire_free_target(vol_tag: u64, endpoint: &str) -> bool {
 /// terminal frees clear the holder's bits. Inert on an unarmed mount
 /// (`Ok(0)`, one load). A live FOREIGN holder of a data volume this
 /// manager writes is a shape PR 8 cannot reach (a wire joiner's venue is
-/// PR 12's) and refuses loud rather than allocate beside it unarmed.
+/// PR 12b's) and refuses loud rather than allocate beside it unarmed.
 pub async fn arm_symmetric_allocation(
     routed: &Arc<crate::meta_backend::RoutedMetaBackend>,
     allocators: &[Arc<crate::block_allocator::BlockAllocator>],
@@ -2697,7 +2697,8 @@ async fn acquire_and_hold<I: Iterator<Item = u64>>(
                 if !rec.holder.owned_by_node(me.node_token) {
                     return Err(KvError::Busy(format!(
                         "{why}; a live FOREIGN holder of a data volume this manager writes is \
-                         PR 12's shape (a wire joiner's venue) — refusing to arm beside it"
+                         PR 12b's shape (a wire joiner's venue — the N-daemon backend posture) \
+                         — refusing to arm beside it"
                     )));
                 }
                 // A same-node predecessor of another mount slot: the D0

@@ -3602,7 +3602,7 @@ impl WriteCustodyClient {
     /// holder. What remains whole-mount is the `advance`'s retire of DMA
     /// in flight under OTHER holders' grants at that instant — the
     /// one-word epoch carrier's cost, stated in the note and owed to the
-    /// per-object capture PR 12's write-path arm can make.
+    /// per-object capture PR 12b's write-path arm can make.
     pub fn self_fence(&self, reason: &str) -> SelfFence {
         if self.scope == CustodyScope::SlotHolder {
             return self.fence_holder_scoped(reason);
@@ -5155,7 +5155,9 @@ pub enum CustodyHome {
         object: u64,
     },
     /// Appender `holder` leases the slot and this mount knows no endpoint
-    /// for it (the join ladder's census binding — PR 12's): refused loud.
+    /// for it — its ladder has not published one (PR 12 binds every Live
+    /// appender's published endpoint at rung 7; a later joiner's arrives
+    /// with PR 12b's wire `JoinAppender`): refused loud.
     Unbound { holder: u32 },
 }
 
@@ -5583,7 +5585,8 @@ fn unbound_holder(holder: u32, ino: u64, what: &str) -> SqueezefsError {
         libc::EAGAIN,
         format!(
             "PR 9: inode_{ino}'s slot is leased by appender {holder} and this mount knows no \
-             endpoint for it (the join ladder's census binding is PR 12's; a dead holder's \
+             endpoint for it (its ladder has published none — a later joiner is bound by PR \
+             12b's wire JoinAppender; a dead holder's \
              slots are re-leased by PR 10's recovery) — refusing the {what} rather than \
              granting custody the holder never issued"
         ),
@@ -6292,7 +6295,7 @@ pub async fn recall_custody_at_leave(
 /// meets the S9 refusal naming the multi-writer mount). The registrant
 /// key travels as 0 (the S9 `connect` default): the armed mount's WERO
 /// registration is the metadata namespace's (`SQUEEZEFS_META_PR_WERO`),
-/// and the per-namespace key carriage is PR 12's join ladder. The leave is
+/// and the per-namespace key carriage is the join ladder's rung 4 (PR 12). The leave is
 /// [`disarm_slot_custody`], in the teardown's outside-in order.
 pub async fn arm_mount_slot_custody(
     routed: &Arc<crate::meta_backend::RoutedMetaBackend>,

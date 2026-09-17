@@ -583,8 +583,9 @@ pub fn cross_owner_stats_json() -> serde_json::Map<String, serde_json::Value> {
 }
 
 // ---------------------------------------------------------------------------
-// The step shipper (the initiator's client half — PR 12's join ladder
-// installs it from the census; the contracts install it directly).
+// The step shipper (the initiator's client half — the join ladder's rung 7
+// installs it under the set's cluster secret, `sym_join::install_step_shipper`;
+// the contracts that stand up their own listeners install it directly).
 // ---------------------------------------------------------------------------
 
 static XV_SHIPPER: once_cell::sync::Lazy<
@@ -593,9 +594,10 @@ static XV_SHIPPER: once_cell::sync::Lazy<
 
 /// Install the process-global step shipper: the S8 client router a
 /// foreign step travels on (its lanes, its same-id resend, its era
-/// learning). Product caller: PR 12's join ladder (the census binding);
-/// until it lands the contracts install it directly — the shipped plane
-/// is production-inert by design (dark).
+/// learning). Product caller: the join ladder's rung 7
+/// (`sym_join::install_step_shipper`, PR 12); the contracts with their own
+/// listeners install it directly. Inert on an unarmed mount (no step is
+/// ever foreign there).
 pub fn install_xv_shipper(router: Arc<crate::meta_ship::MetaShipRouter>) {
     XV_SHIPPER.store(Some(router));
 }

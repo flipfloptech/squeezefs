@@ -1415,6 +1415,13 @@ create_fleet() {
     if [ "$symmetric" = "1" ]; then
         [ "$owners" -eq 0 ] ||
             die "--symmetric with --owners=$owners: the per-volume-owner recipe and the symmetric forest are two different metadata planes (design-symmetric-metadata §7.3 — set-owners assignments are DROPPED by the conversion)"
+        # PR 12: the posture knobs are RETIRED spellings beside
+        # SQUEEZEFS_SYMMETRIC_META=1 (the daemon refuses them at its startup
+        # gate naming the plane) — every RW mount of a symmetric set is a
+        # writer through the join ladder; there is no authority to declare
+        # and no co-writer to admit.
+        [ "$mw" != "1" ] && [ "$cowriters" -eq 0 ] ||
+            die "--symmetric with --multi-writer / --cowriters: under the symmetric plane SQUEEZEFS_MULTI_WRITER and SQUEEZEFS_MW_ROLE are RETIRED spellings (design-symmetric-metadata §6.1 / §7.3, PR 12) — every RW mount is a writer through the join ladder; drop them"
         if [ -z "$membership" ]; then
             # The death ledger's PRODUCTION writer is the S6 owner's
             # eviction (PR 10): a symmetric fleet without the plane records

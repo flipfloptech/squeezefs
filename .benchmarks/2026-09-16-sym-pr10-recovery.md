@@ -628,6 +628,13 @@ the ORIGINAL record, then granted; a third load retires the record) — **RED**
 without the gate's re-derivation (`the quarantine is re-derived from the
 durable record: left 0, right 1`); the Issue-34 pin re-targeted to the bound
 and asserting the durable record's deadline + its retirement. The crash matrix
-is **36 contracts** (+1 ignored instrument).
+is **35 contracts** (+1 ignored instrument).
 
-**Verification (`CARGO_INCREMENTAL=0`, the dev laptop)**: filled in below.
+**Verification (`CARGO_INCREMENTAL=0`, the dev laptop)**: fmt (root / `fuzz/`),
+`fuzz` check, both clippy configs, rustdoc `-D warnings`, the markdown link
+check — all clean; `sym_crash_matrix_tests` stamped ×3 + flat ×1 — 4 / 4 green
+(35 contracts, 42–44 s); `sym_custody_tests` 27 / `derivation_sweep_tests` 61 /
+`docs_parity_tests` 5 / `decoder_property_tests` 61 / `env_knob_convention_tests`
+22 / `sym_slot_transfer_tests` 45 — flat AND stamped, 12 / 12 legs green. Not
+run (by rule): `task check`, squeeze-test, anything on `dev` / `main`;
+`.benchmarks/2026-09-12-sym-pr-run.md` untouched.

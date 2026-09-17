@@ -11,7 +11,7 @@
 //! | Layer B2 / B1 / `writer_claim` | **none** — the manager's claim stands; this mount is a REGISTRANT on the metadata namespace (PR 3's `join_wero_as_registrant`, the ladder's rung 4) |
 //! | `JoinAppender` | **over the wire** to the manager, BEFORE `open_inner`: the region (page + ring + grant) the manager mints is stood up beside the projection as this mount's own — a rejoin over an own `Live` page replays its ring as own residue |
 //! | `AcquireSlots` | **over the wire**: `M` rotor slots installed into the own region; every first touch of an unleased slot is a wire `AcquireSlot`; a slot another appender leases refuses `SlotBusy` at the commit door |
-//! | checkpoint + times-drain tasks | **spawned** — the checkpoint cycle is the JOINED one ([`KvMetaBackend::joined_checkpoint_cycle`]): its slot trees' flushes, its page (the Issue-31 words), its tail, its SMOs in its ring under its grant, its extent returns and refills over the wire; never the ledger, the bitmap, tree 0 or page 0 |
+//! | checkpoint + times-drain tasks | **spawned** — the checkpoint cycle is the JOINED one (`joined_checkpoint_cycle`, dispatched from the shared `checkpoint_cycle`): its slot trees' flushes, its page (the Issue-31 words), its tail, its SMOs in its ring under its grant, its extent returns and refills over the wire; never the ledger, the bitmap, tree 0 or page 0 |
 //!
 //! `regions[0]` of the joined backend is the MANAGER's region held for its
 //! replay window and its tail only — `AppenderSet::owns_region(0)` is
@@ -154,7 +154,7 @@ fn wire_err(verb: &str, e: crate::error::SqueezefsError) -> KvError {
 
 /// **One extent refill over the wire** (§5.3.3): `ExtentGrant { own, want }`
 /// to the manager, the fresh runs landed in `region`'s RAM grant. Shared
-/// by the mounted joiner ([`KvMetaBackend::joined_extent_grant`]) and the
+/// by the mounted joiner (`KvMetaBackend::joined_extent_grant`, `pub(super)`) and the
 /// joined OPEN's grant pre-sizing before its own-residue replay (no
 /// backend exists yet there). Returns the extents received.
 ///

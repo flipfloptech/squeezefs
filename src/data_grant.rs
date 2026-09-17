@@ -5609,7 +5609,7 @@ pub async fn foreign_read_plane(
         return Err(unbound_holder(
             holder,
             object,
-            "the read of an object in its slot",
+            "read of an object in its slot",
         ));
     };
     let volume = u16::try_from(v).map_err(|_| {

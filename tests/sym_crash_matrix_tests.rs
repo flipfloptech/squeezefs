@@ -3887,6 +3887,23 @@ async fn a_custody_grant_of_a_slot_mid_recovery_is_the_dead_holders_never_the_re
     // multi-writer arm's half) + the slot-custody arm (the mount path's),
     // both process globals.
     let _hygiene = CustodyArmGuard;
+    let volume_uuid = u128::from_le_bytes(fx.vol.superblock().uuid);
+    let (_, ino) = fx.seeded[0];
+    let (v, local) = fx.routed.route_ino(ino);
+    assert_eq!(
+        squeezefs::meta_backend::kv::record::forest_slot_of_ino(local),
+        fx.slot,
+        "premise: the custody object is a regular file OF the recovering slot"
+    );
+    // The premise read runs BEFORE the custody arm: with it armed, a
+    // writer's read of an object in a slot a dead appender leases is a
+    // TOKEN read at that holder (PR 12b's divert) and refuses EAGAIN
+    // while no endpoint is bound — never the projection (KD-SYM-19).
+    assert_eq!(
+        fx.routed.getattr(ino).await.expect("its record").mode & libc::S_IFMT,
+        libc::S_IFREG,
+        "premise: a custody object is a regular file"
+    );
     let owner = WriteCustodyOwner::arm(
         "recoverer",
         squeezefs::dlm::durable_term() + 1,
@@ -3911,19 +3928,6 @@ async fn a_custody_grant_of_a_slot_mid_recovery_is_the_dead_holders_never_the_re
         Arc::new(move |_volume| {
             Arc::clone(&sink) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
         }),
-    );
-    let volume_uuid = u128::from_le_bytes(fx.vol.superblock().uuid);
-    let (_, ino) = fx.seeded[0];
-    let (v, local) = fx.routed.route_ino(ino);
-    assert_eq!(
-        squeezefs::meta_backend::kv::record::forest_slot_of_ino(local),
-        fx.slot,
-        "premise: the custody object is a regular file OF the recovering slot"
-    );
-    assert_eq!(
-        fx.routed.getattr(ino).await.expect("its record").mode & libc::S_IFMT,
-        libc::S_IFREG,
-        "premise: a custody object is a regular file"
     );
     let dlm = squeezefs::dlm::DlmClient::new().unwrap();
     let via0 = data_grant::stats().via_slot_holder;

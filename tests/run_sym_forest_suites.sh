@@ -96,6 +96,14 @@
 # themselves and its flat pins (a bit-17-absent set arms nothing, the
 # knobs keep their shipped meaning, `set-owners` runs its shipped gates)
 # run on both legs.
+# `sym_n_daemon_tests` (PR 12b — the N-daemon posture: two and three REAL
+# `KvMetaBackend`s open on one volume at once, the manager through `open`
+# and the joiners through the joined door over a real wire, all
+# committing; the storm + remount, the rejoin, the dead joiner's
+# recovery, the token divert, the shipped step served on the joiner, the
+# wire holder's release on the manager's notice) rides the list the PR 4
+# way: its fixtures stamp under the seam themselves and its refusal pin
+# runs on both legs.
 # `kvmap_read_tests` (the block-map tree's read economy: A7 probation, the
 # leaf-read gauge, the reader bracket) joined the list in PR 12: its two
 # tree-7 leaf contracts were stamped-RED on the base with nobody running
@@ -180,6 +188,7 @@ DEFAULT_SUITES=(
   sym_custody_tests
   sym_crash_matrix_tests
   sym_mount_posture_tests
+  sym_n_daemon_tests
 )
 read -r -a SUITES <<<"${SQZ_SYM_SUITES:-${DEFAULT_SUITES[*]}}"
 RATIO_NOTE="${SQZ_SYM_RATIO_NOTE:-2.0}"

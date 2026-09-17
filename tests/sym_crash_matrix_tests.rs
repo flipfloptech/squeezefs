@@ -177,6 +177,35 @@ async fn seeded_volume_with_files(
     (uris, d, files)
 }
 
+/// [`seeded_volume`] with `n` REGULAR FILES preset INTO the slot under the
+/// root by the manager while it holds the slot (their inode records live
+/// in the slot's tree — the custody pin's objects), checkpointed before
+/// the release.
+async fn seeded_volume_with_slot_files(
+    dir: &std::path::Path,
+    slot: ForestSlot,
+    n: usize,
+) -> (Vec<String>, u64, Vec<(String, u64)>) {
+    let uris = format_stamped_set_with_config(dir, 1).await;
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let d = seed_dir_in_slot(&routed, 0, slot, "shared").await;
+    let mut files = Vec::with_capacity(n);
+    for i in 0..n {
+        let name = format!("s{i:04}");
+        let ino = seed_file_in_slot(&routed, 0, slot, &name).await;
+        files.push((name, ino));
+    }
+    let vol = Arc::clone(&routed.volumes[0]);
+    vol.checkpoint_now().await.unwrap();
+    vol.release_slot_handover(0, slot)
+        .await
+        .expect("release to unleased");
+    shutdown(&routed).await;
+    drop(vol);
+    drop(routed);
+    (uris, d, files)
+}
+
 async fn assert_all_resolve(routed: &RoutedMetaBackend, dir: u64, files: &[(String, u64)]) {
     for (name, ino) in files {
         let got = routed
@@ -2106,6 +2135,12 @@ struct TwoBackends {
     /// The lease generation tree 0 records for the dead lessee (the
     /// seeding manager held `g = 1` and released; region 1 took `g = 2`).
     g: u32,
+    /// Regular files the seeding manager preset INTO the slot (under the
+    /// root) before its release — their inode records live in the dead
+    /// lessee's tree, where the lessee's own creates put only the
+    /// dentries (PR 6 mints a shipped create's child in the CREATOR's
+    /// rotor). Empty unless the fixture was asked to seed them.
+    seeded: Vec<(String, u64)>,
 }
 
 /// Stand the shape up (the cadence parked throughout — every cycle is
@@ -2159,13 +2194,29 @@ enum TwoBackendsWindow {
 }
 
 async fn two_backends_with(dir: &std::path::Path, window: TwoBackendsWindow) -> TwoBackends {
+    two_backends_seeded(dir, window, 0).await
+}
+
+/// [`two_backends_with`] with `seed_files` regular files minted in the
+/// slot by the seeding manager before its release (the custody pin's
+/// objects: a custody object is a regular file OF the recovering slot).
+async fn two_backends_seeded(
+    dir: &std::path::Path,
+    window: TwoBackendsWindow,
+    seed_files: usize,
+) -> TwoBackends {
     // A previous contract's panic may have left a seam armed.
     recovery::TEST_RECOVERY_FAIL_AT_STEP.store(0, Ordering::SeqCst);
     recovery::TEST_RECOVERY_HOLD_BEFORE_TREE0.store(false, Ordering::SeqCst);
     recovery::TEST_RECOVERY_HOLD_BEFORE_REREAD.store(false, Ordering::SeqCst);
     std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
     let slot = SLOT_A;
-    let (uris, d) = seeded_volume(dir, slot).await;
+    let (uris, d, seeded) = if seed_files == 0 {
+        let (uris, d) = seeded_volume(dir, slot).await;
+        (uris, d, Vec::new())
+    } else {
+        seeded_volume_with_slot_files(dir, slot, seed_files).await
+    };
     let x = foreign(31);
     // ---- A: the lessee.
     let routed = open_under_retry(&uris, &Knobs::armed().partition("1:4"))
@@ -2305,6 +2356,7 @@ async fn two_backends_with(dir: &std::path::Path, window: TwoBackendsWindow) -> 
         stale_root,
         newer_root,
         g,
+        seeded,
     }
 }
 
@@ -3252,6 +3304,215 @@ async fn a_first_touch_acquire_during_a_recovery_is_refused_and_never_regresses_
         other => panic!("{other:?}"),
     }
     assert_all_resolve(&fx.routed, fx.dir, &fx.files).await;
+    shutdown(&fx.routed).await;
+    let TwoBackends {
+        uris, routed, vol, ..
+    } = fx;
+    drop(vol);
+    drop(routed);
+    fsck_clean(&uris).await;
+    two_backends_teardown();
+}
+
+/// PR 9's writer-side recall sink for the recoverer's slot-custody arm: a
+/// recall drains nothing here (no data plane under the fixture).
+struct NoopRecallSink;
+
+impl squeezefs::meta_ship::token_plane::RecallDataSink for NoopRecallSink {
+    fn drain_and_purge<'a>(
+        &'a self,
+        _objects: &'a [squeezefs::meta_ship::token_plane::RecalledObject],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+}
+
+/// Failure hygiene for the custody pin: the arm and the owner are
+/// process globals — a panic mid-contract must not leave them to the next
+/// one.
+struct CustodyArmGuard;
+
+impl Drop for CustodyArmGuard {
+    fn drop(&mut self) {
+        squeezefs::data_grant::uninstall_slot_custody();
+        squeezefs::data_grant::uninstall_custody_owner();
+    }
+}
+
+/// **The rebase onto PR 9 (custody by the slot holder) — seams (a)/(b): a
+/// custody grant INSIDE a recovery is the same class as one inside a
+/// handover.** The recovery arms no mid-handover mark
+/// (`HandoverCustodyMark` is `release_slot_handover_locked`'s, which the
+/// driver never runs): its door is the lease TABLE — the slot `Releasing
+/// { dead }` from step 4 to the terminal outcome — and BOTH grant paths
+/// consult it before anything is granted: the served `CustodyGrant`'s
+/// `foreign_slot_holder` answers `NotHolder { dead }` (nothing granted at
+/// the recoverer), and the local acquire's `slot_holder_home` resolves the
+/// DEAD holder — unbound here, the natural post-death state (PR 9's holder
+/// fence forgets a dead holder's dial slot; the census binding is PR 12's)
+/// — so `SlotLockManager::acquire_lock` refuses EAGAIN-class without
+/// dialing anybody, never falling to the local arbiter. The recoverer
+/// holds no custody of the dead slot's files (nothing to recall: the dead
+/// holder's grants died with its process and are retired at their WRITERS
+/// by the S9 law — PR 9's `a_dead_holders_t_self_fence_…`; the driver's
+/// preempt fences the dead HOLDER's registrant). Once the recovery
+/// completes the slot is the manager's: the same acquire lands at the
+/// local arbiter with no holder dialed, and no mark was ever armed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_custody_grant_of_a_slot_mid_recovery_is_the_dead_holders_never_the_recoverers() {
+    use squeezefs::data_grant::{self, CustodyHome, WriteCustodyOwner};
+    use squeezefs::membership::{LeaseClock, LeaseClocks};
+    use squeezefs::meta_backend::crossvol_tx::{step_home, StepHome};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    // Two regular files OF the slot (preset by the seeding manager): the
+    // custody objects. The lessee's own creates put only DENTRIES in its
+    // tree — a shipped create's child is minted in the creator's rotor.
+    let fx = two_backends_seeded(dir.path(), TwoBackendsWindow::Creates(15), 2).await;
+    // The recoverer as a slot holder: PR 9's S9 custody owner (the S9
+    // multi-writer arm's half) + the slot-custody arm (the mount path's),
+    // both process globals.
+    let _hygiene = CustodyArmGuard;
+    let owner = WriteCustodyOwner::arm(
+        "recoverer",
+        squeezefs::dlm::durable_term() + 1,
+        squeezefs::dlm::durable_term(),
+        LeaseClocks::with_params(
+            std::time::Duration::from_millis(3_000),
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_millis(400),
+        )
+        .expect("2*skew + purge < TTL"),
+        LeaseClock::monotonic(),
+        None,
+    )
+    .expect("the recoverer's custody authority arms");
+    data_grant::install_custody_owner(Arc::clone(&owner));
+    let sink = Arc::new(NoopRecallSink);
+    data_grant::arm_slot_custody(
+        &fx.routed,
+        "recoverer",
+        VENUE_SECRET.to_vec(),
+        0,
+        Arc::new(move |_volume| {
+            Arc::clone(&sink) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
+        }),
+    );
+    let volume_uuid = u128::from_le_bytes(fx.vol.superblock().uuid);
+    let (_, ino) = fx.seeded[0];
+    let (v, local) = fx.routed.route_ino(ino);
+    assert_eq!(
+        squeezefs::meta_backend::kv::record::forest_slot_of_ino(local),
+        fx.slot,
+        "premise: the custody object is a regular file OF the recovering slot"
+    );
+    assert_eq!(
+        fx.routed.getattr(ino).await.expect("its record").mode & libc::S_IFMT,
+        libc::S_IFREG,
+        "premise: a custody object is a regular file"
+    );
+    let dlm = squeezefs::dlm::DlmClient::new().unwrap();
+    let via0 = data_grant::stats().via_slot_holder;
+
+    fx.vol.record_death_with_key(fx.x, 1, 0).await.unwrap();
+    recovery::TEST_RECOVERY_HOLD_BEFORE_TREE0.store(true, Ordering::SeqCst);
+    let routed = Arc::clone(&fx.routed);
+    let poll = tokio::spawn(async move { recover_dead_appenders_set(&routed).await });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !recovery::TEST_RECOVERY_HELD.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the recovery never parked"
+        );
+        tokio::task::yield_now().await;
+    }
+    // Mid-recovery: the table names the dead holder, both consults follow
+    // it, no mark is armed, and the recoverer holds nothing to recall.
+    assert_eq!(
+        fx.vol.foreign_slot_holder(local),
+        Some(1),
+        "the served CustodyGrant answers NotHolder {{ dead }} mid-recovery"
+    );
+    assert!(
+        matches!(
+            step_home(&fx.routed, v, local),
+            StepHome::Unreachable { holder: 1 }
+        ),
+        "the local acquire resolves the dead holder (unbound)"
+    );
+    assert!(
+        matches!(
+            data_grant::slot_holder_home(ino),
+            Some(CustodyHome::Unbound { holder: 1 })
+        ),
+        "the custody home is the dead holder's, never this mount's"
+    );
+    assert_eq!(
+        data_grant::handover_recalls_pending(),
+        0,
+        "the recovery arms no mid-handover mark — the table is its door"
+    );
+    assert!(
+        !data_grant::slot_custody_live(volume_uuid, fx.slot),
+        "the recoverer issued no grant on the dead slot's files — nothing to recall"
+    );
+    let err = dlm
+        .acquire_lock(
+            &squeezefs::keys::inode_path(ino),
+            None,
+            std::time::Duration::from_millis(500),
+        )
+        .await
+        .expect_err("no custody of a recovering slot's file is granted at the recoverer");
+    assert!(
+        matches!(
+            &err,
+            squeezefs::error::SqueezefsError::Refused { errno, .. } if *errno == libc::EAGAIN
+        ),
+        "the dead holder's refusal is typed EAGAIN (the caller retries): {err:?}"
+    );
+    assert_eq!(
+        data_grant::stats().via_slot_holder,
+        via0,
+        "no holder was dialed (the dead one is unbound)"
+    );
+    assert_eq!(owner.held(), 0, "the recoverer's authority granted nothing");
+    match tree0_state(&fx.vol, fx.slot).await {
+        Some(SlotState::Leased {
+            appender_id: 1, g, ..
+        }) => assert_eq!(g, fx.g),
+        other => panic!("tree 0 moved under the recovery: {other:?}"),
+    }
+
+    recovery::TEST_RECOVERY_HOLD_BEFORE_TREE0.store(false, Ordering::SeqCst);
+    recovery::TEST_RECOVERY_HOLD_RELEASE.notify_waiters();
+    let rep = poll.await.unwrap().unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+
+    // After the terminal outcome: the slot is the manager's — every
+    // consult answers "ours", the same acquire lands at the local arbiter
+    // with no holder dialed, and still no mark.
+    assert_eq!(fx.vol.foreign_slot_holder(local), None);
+    assert!(matches!(step_home(&fx.routed, v, local), StepHome::Local));
+    assert!(data_grant::slot_holder_home(ino).is_none());
+    let lease = dlm
+        .acquire_lock(
+            &squeezefs::keys::inode_path(ino),
+            None,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect("custody of the recovered slot's file is the local arbiter's");
+    assert!(lease.is_held().await);
+    assert_eq!(data_grant::stats().via_slot_holder, via0);
+    assert_eq!(data_grant::handover_recalls_pending(), 0);
+    assert!(!data_grant::slot_custody_live(volume_uuid, fx.slot));
+    drop(lease);
+    data_grant::disarm_slot_custody().await;
+    data_grant::uninstall_custody_owner();
+    assert_all_resolve(&fx.routed, fx.dir, &fx.files).await;
+    assert_all_resolve(&fx.routed, ROOT_INO, &fx.seeded).await;
     shutdown(&fx.routed).await;
     let TwoBackends {
         uris, routed, vol, ..

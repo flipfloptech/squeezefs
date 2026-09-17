@@ -278,6 +278,29 @@ pub async fn seed_dir_in_slot(
     slot: ForestSlot,
     name: &str,
 ) -> u64 {
+    seed_preset_in_slot(routed, vol_idx, slot, name, libc::S_IFDIR | 0o755).await
+}
+
+/// [`seed_dir_in_slot`] for a REGULAR FILE under the root — a custody
+/// object OF `slot` (PR 9: a custody object is a regular file; a child a
+/// create mints lands by the affinity policy, which at the fixtures' node
+/// size caps at one leaf, so a file IN a named slot is preset).
+pub async fn seed_file_in_slot(
+    routed: &RoutedMetaBackend,
+    vol_idx: usize,
+    slot: ForestSlot,
+    name: &str,
+) -> u64 {
+    seed_preset_in_slot(routed, vol_idx, slot, name, libc::S_IFREG | 0o644).await
+}
+
+async fn seed_preset_in_slot(
+    routed: &RoutedMetaBackend,
+    vol_idx: usize,
+    slot: ForestSlot,
+    name: &str,
+    mode: u32,
+) -> u64 {
     use squeezefs::meta_backend::kv::backend::KvMetaBackend;
     use squeezefs::meta_backend::{make_global_ino_width, IntentCreatePreset};
     let vol = &routed.volumes[vol_idx];
@@ -293,7 +316,7 @@ pub async fn seed_dir_in_slot(
         .create_with_rdev_preset(
             squeezefs::meta_backend::kv::builder::ROOT_INO,
             name,
-            libc::S_IFDIR | 0o755,
+            mode,
             0,
             0,
             0,

@@ -379,6 +379,72 @@ async fn rung_3_refuses_an_explicit_membership_off_and_arms_auto_only_when_unset
     shutdown(&routed).await;
 }
 
+/// A SECOND RW mount of an ARMED set is refused at the D0 gate — loud, at
+/// the OPEN, before any page goes `Live` or any claim-set entry is written
+/// (nothing half-joins) — and the refusal NAMES the posture it met: the
+/// N-daemon backend posture is PR 12b, until it lands the D0 guard applies
+/// to RW mounts and `-o ro` readers join as token clients (review round 1,
+/// Issue 6). Without the plane the same refusal is the shipped
+/// single-writer text verbatim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_rw_mount_of_an_armed_set_is_refused_naming_the_plane_and_pr_12b() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempfile::tempdir().unwrap();
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    let first = open_under(&uris, &Knobs::armed()).await;
+    let pages_before = read_directory_live_count(&first).await;
+
+    // Armed: refused, naming the plane and PR 12b; nothing half-joined
+    // (`open_under` clears the knobs after its open — the second mount
+    // declares the plane itself, as a second daemon would).
+    Knobs::armed().apply();
+    let err = squeezefs::meta_backend::open_routed_meta_set(&uris)
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .expect("a second RW mount of an armed set is refused at the D0 gate");
+    assert!(
+        err.contains("single-writer guard"),
+        "the D0 guard's own text stands: {err}"
+    );
+    assert!(
+        err.contains("symmetric plane armed") && err.contains("PR 12b"),
+        "names the posture and the rung that lands it: {err}"
+    );
+    assert!(
+        err.contains("-o ro") && err.contains("N-daemon"),
+        "names what a second mount may be today: {err}"
+    );
+    assert_eq!(
+        read_directory_live_count(&first).await,
+        pages_before,
+        "the refused mount left no Live page — nothing half-joined"
+    );
+
+    // Unarmed: the shipped text, verbatim — the note is the plane's alone.
+    std::env::remove_var(SYMMETRIC_META_ENV);
+    let err = squeezefs::meta_backend::open_routed_meta_set(&uris)
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .expect("refused");
+    assert!(err.contains("single-writer guard"), "{err}");
+    assert!(
+        !err.contains("PR 12b") && !err.contains("symmetric plane"),
+        "an unarmed refusal is the shipped text: {err}"
+    );
+    shutdown(&first).await;
+}
+
+/// The appender directory's `Live` page count as a probe reads it.
+async fn read_directory_live_count(routed: &RoutedMetaBackend) -> usize {
+    routed.volumes[0]
+        .appender_stats()
+        .map(|s| s.live as usize)
+        .unwrap_or(0)
+}
+
 // ===========================================================================
 // 5. The headline: a solo armed mount walks the ladder
 // ===========================================================================

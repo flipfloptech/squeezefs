@@ -792,6 +792,11 @@ async fn a_token_reader_dials_each_objects_slot_holder_and_refuses_an_unbound_on
         .await
         .expect("read-only open");
     let rv = Arc::clone(&reader.volumes[0]);
+    // The S5 poll stays the reader's control plane under tokens (the
+    // mount path arms it in `ro_coherence`); here it is what the
+    // negative-cache pin below steps.
+    rv.arm_reader_revalidation(None)
+        .expect("the reader's revalidation arms");
     let default = rv
         .arm_token_reader(TokenClientConfig {
             endpoint: endpoint_a.clone(),
@@ -835,7 +840,8 @@ async fn a_token_reader_dials_each_objects_slot_holder_and_refuses_an_unbound_on
     // A foreign-held object with NO endpoint bound for its holder: refused
     // loud, naming the holder — never the projection.
     let (_, shared_local) = reader.route_ino(shared);
-    let unbound_before = squeezefs::meta_ship::token_plane::reader_unbound_holders();
+    let unbound_before = squeezefs::meta_ship::token_plane::test_reader_unbound_holders();
+    let resolves_before = squeezefs::meta_ship::token_plane::test_reader_holder_resolves();
     let err = rv
         .token_reader_for(shared_local)
         .await
@@ -847,14 +853,52 @@ async fn a_token_reader_dials_each_objects_slot_holder_and_refuses_an_unbound_on
         "and refuses the projection: {msg}"
     );
     assert_eq!(
-        squeezefs::meta_ship::token_plane::reader_unbound_holders(),
+        squeezefs::meta_ship::token_plane::test_reader_unbound_holders(),
         unbound_before + 1
     );
+    assert_eq!(
+        squeezefs::meta_ship::token_plane::test_reader_holder_resolves(),
+        resolves_before + 1,
+        "the first miss paid ONE durable resolve"
+    );
+    // The refusal's COST is bounded (review round 1, Issue 10): a second
+    // divert on the same holder is refused off the negative cache — no
+    // appender-directory read, no claim-set getxattr — while the refusal
+    // gauge keeps counting refusals.
     let err = reader
         .getattr(shared)
         .await
         .expect_err("the divert refuses too");
     assert!(err.to_string().contains("appender 1"), "{err}");
+    assert_eq!(
+        squeezefs::meta_ship::token_plane::test_reader_unbound_holders(),
+        unbound_before + 2,
+        "every refusal counts"
+    );
+    assert_eq!(
+        squeezefs::meta_ship::token_plane::test_reader_holder_resolves(),
+        resolves_before + 1,
+        "the second refusal paid NO device read"
+    );
+    // The epoch step re-reads tree 0 and is the negative cache's
+    // invalidation: after the writer's next checkpoint the reader's poll
+    // advances, and the next divert resolves again (the holder may have
+    // published since).
+    writer.volumes[0]
+        .checkpoint_now()
+        .await
+        .expect("the writer's checkpoint");
+    let out = rv.revalidate_reader().await.expect("the reader polls");
+    assert!(out.advanced, "the poll adopted the writer's new epoch");
+    let _ = rv
+        .token_reader_for(shared_local)
+        .await
+        .expect_err("still unbound");
+    assert_eq!(
+        squeezefs::meta_ship::token_plane::test_reader_holder_resolves(),
+        resolves_before + 2,
+        "the epoch step cleared the negative cache — one resolve per holder per step"
+    );
 
     // Bind holder 1 → B: the first resolve dials a SEPARATE plane to B,
     // while the manager's plane keeps dialing A.

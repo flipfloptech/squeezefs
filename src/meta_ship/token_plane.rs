@@ -2973,14 +2973,29 @@ static RECALL_PURGE_CENSUS: AtomicU64 = AtomicU64::new(0);
 /// bound endpoint (`dlm_token_reader_unbound_holders` — PR 12's per-slot
 /// binding; the projection is never served instead).
 static READER_UNBOUND_HOLDERS: AtomicU64 = AtomicU64::new(0);
+/// Durable holder resolves ATTEMPTED by a reader (each = one appender
+/// directory read + one claim-set `getxattr`) — the binding's cost face,
+/// bounded to one per (holder, epoch step) by the negative cache.
+static READER_HOLDER_RESOLVES: AtomicU64 = AtomicU64::new(0);
 
 pub fn note_reader_unbound_holder() {
     READER_UNBOUND_HOLDERS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The unbound-holder refusal count (the contracts' witness).
-pub fn reader_unbound_holders() -> u64 {
+pub fn note_reader_holder_resolve() {
+    READER_HOLDER_RESOLVES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The unbound-holder refusal count (the contracts' witness; the stats
+/// face is `dlm_token_reader_unbound_holders`).
+pub fn test_reader_unbound_holders() -> u64 {
     READER_UNBOUND_HOLDERS.load(Ordering::Relaxed)
+}
+
+/// The durable-resolve count (the contracts' witness; the stats face is
+/// `dlm_token_reader_holder_resolves`).
+pub fn test_reader_holder_resolves() -> u64 {
+    READER_HOLDER_RESOLVES.load(Ordering::Relaxed)
 }
 
 /// The scoped-purge ledger.
@@ -3217,6 +3232,7 @@ pub fn reader_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
                 .collect(),
         ),
         "dlm_token_reader_unbound_holders": READER_UNBOUND_HOLDERS.load(Ordering::Relaxed),
+        "dlm_token_reader_holder_resolves": READER_HOLDER_RESOLVES.load(Ordering::Relaxed),
         // The mount's recall sink (one ledger — the sinks share it).
         "dlm_token_recall_purged_keys": RECALL_PURGE_KEYS.load(Ordering::Relaxed),
         "dlm_token_recall_scoped_purges": RECALL_PURGE_SCOPED.load(Ordering::Relaxed),

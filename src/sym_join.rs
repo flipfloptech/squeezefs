@@ -12,7 +12,7 @@
 //! | 1 **declaration** | the knob, and NONE of the retired posture knobs beside it | [`retired_knob_refusal`] at the top of the mount path, before any volume is opened | the retired knob and its successor (the plane) |
 //! | 2 **bits** | every volume carries 7/9/10/11/13/14/15/16 **and 17** | [`check_bits`] right after the routed open | the volume, the bit, the verb that stamps it |
 //! | 3 **membership** | this mount is a member of its HOME shard — the shard's S6 owner when it holds the manager lease | the mount path's membership arm, at `auto` when the operator declared no bind | `SQUEEZEFS_MEMBERSHIP_BIND` |
-//! | 4 **registrant** | WERO on the metadata namespaces (PR 3's `meta_wero`, taken at the open) AND the data namespaces (S7's hold, joined here), the registrant cap probed (PR 3) | [`arm`] | the namespace, the cap, `SQUEEZEFS_SYM_ALLOW_NON_PR` |
+//! | 4 **registrant** | WERO on the metadata namespaces (PR 3's `meta_wero`, taken at the open — since PR 12 for the knob-armed shape too) AND the data namespaces (S7's hold, joined here); the registrant cap is probed on a registrant JOIN (PR 3's `join_wero_as_registrant`, PR 12b's joiner path) — the solo HOLDER's own REGISTER learns it (`pr_registrant_cap`) | [`arm`] | the namespace, the cap, `SQUEEZEFS_SYM_ALLOW_NON_PR` |
 //! | 5 **`JoinAppender`** | the region goes `Live` under this mount's identity (PR 2's `join_appender_regions`, at the open) | the open | the page, PR 10's driver |
 //! | 6 **`AcquireSlots`** | the native slot + `M` rotor slots (PR 4's arm, at the open) | the open | the manager |
 //! | 7 **the planes** | the custody owner, the publish/meta/manager/token services on ONE listener, the ownership plane, the cadence — what a co-writer used to dial and what a solo mount never stood up | [`arm`] → `multi_writer::arm_authority_planes` | `SQUEEZEFS_MW_BIND=off` |
@@ -176,7 +176,13 @@ pub fn set_armed(meta: &RoutedMetaBackend) -> bool {
 /// What the ladder armed on this mount (the role gauges' source).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct JoinReport {
-    /// Rungs walked, in order, as the stats inode publishes them.
+    /// The rungs the ladder REQUIRED and passed, named in the DESIGN's
+    /// numbering (§7.3: declaration, bits, membership, registrant,
+    /// join_appender, acquire_slots, planes) — a checklist, not a trace:
+    /// rungs 5–6 run inside the routed OPEN, before rung 3 (the mount
+    /// path) and before rungs 2 / 4 / 7 (`arm`). Every rung is required,
+    /// so the published list is the full set or the report does not exist
+    /// (a refused ladder installs none).
     pub rungs: Vec<&'static str>,
     /// The data namespaces registered under the WERO hold (0 on the
     /// detection-grade lab posture).
@@ -327,13 +333,17 @@ pub async fn arm(
         .extend(["registrant", "join_appender", "acquire_slots"]);
 
     // Rung 7: the planes. The bind is the operator's word or D2's posture;
-    // `off` is not a posture for a writer that serves.
-    let bind = match crate::multi_writer::resolve_bind_public() {
-        Ok(Some(addr)) => addr,
-        Ok(None) => {
-            if let Some(hold) = wero {
-                crate::data_custody::release_hold(hold).await;
-            }
+    // `off` is not a posture for a writer that serves. EVERY refusal of the
+    // prelude releases the rung-4 hold OFF the runtime (its ioctls are
+    // blocking — the declared arm's law on each of its paths); a `?` here
+    // would drop the hold at scope exit and run the release inline on the
+    // `sqz-meta` lane (review round 1, Issue 11).
+    let prelude: Result<(
+        std::net::SocketAddr,
+        String,
+        Arc<crate::meta_ship::OwnerMap>,
+    )> = async {
+        let Some(bind) = crate::multi_writer::resolve_bind_public()? else {
             return Err(SqueezefsError::InvalidOperation(format!(
                 "symmetric join ladder rung 7 (planes) refuses: {}=off — every writer of a \
                  symmetric set serves its slots' tokens, custody and shipped steps, so a \
@@ -341,7 +351,14 @@ pub async fn arm(
                  (ruling D2) or an addr:port",
                 crate::multi_writer::MW_BIND_ENV
             )));
-        }
+        };
+        let node_id = crate::cowriter::node_member_id()?;
+        let map = crate::multi_writer::derive_symmetric_ownership(meta, &node_id).await?;
+        Ok((bind, node_id, map))
+    }
+    .await;
+    let (bind, node_id, map) = match prelude {
+        Ok(v) => v,
         Err(e) => {
             if let Some(hold) = wero {
                 crate::data_custody::release_hold(hold).await;
@@ -349,8 +366,6 @@ pub async fn arm(
             return Err(e);
         }
     };
-    let node_id = crate::cowriter::node_member_id()?;
-    let map = crate::multi_writer::derive_symmetric_ownership(meta, &node_id).await?;
     let arm = crate::multi_writer::arm_authority_planes(
         meta,
         wero,

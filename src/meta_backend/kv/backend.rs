@@ -14419,8 +14419,9 @@ impl KvMetaBackend {
         if !pr_capable {
             if !allow_non_pr {
                 return Err(KvError::Busy(format!(
-                    "{}: the symmetric metadata plane is armed (a declared appender partition) \
-                     but this namespace advertises no NVMe Persistent Reservations (RESCAP=0 or \
+                    "{}: the symmetric metadata plane is armed (SQUEEZEFS_SYMMETRIC_META=1, or a \
+                     declared appender partition) but this namespace advertises no NVMe \
+                     Persistent Reservations (RESCAP=0 or \
                      not an NVMe namespace) — fencing between appenders would be \
                      detection-grade only, and detection-grade is not loss-free (a zombie's \
                      frame past the recorded tail is an ACKED-loss class, \

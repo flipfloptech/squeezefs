@@ -1545,7 +1545,7 @@ leg_sym_join_ladder() {
     [ "$grade" = "false" ] && ok "SYMJOIN: the ladder is DEVICE-ENFORCED on this substrate (detection_grade=false)" || bad "SYMJOIN: detection_grade=$grade on a PR substrate"
     [ "${regs:-0}" = "1" ] && ok "SYMJOIN: symmetric_join.data_namespaces_registered=1" || bad "SYMJOIN: data_namespaces_registered=$regs (want 1)"
     case "$rungs" in
-    "declaration > bits > membership > registrant > join_appender > acquire_slots > planes") ok "SYMJOIN: the report names every rung in order [$rungs]" ;;
+    "declaration > bits > membership > registrant > join_appender > acquire_slots > planes") ok "SYMJOIN: the report names every required rung (the design's numbering — a checklist, not a trace) [$rungs]" ;;
     *) bad "SYMJOIN: rungs=[$rungs]" ;;
     esac
     [ -n "$endpoint" ] && [ "$endpoint" != "null" ] && ok "SYMJOIN: the writer published its S8 listener ($endpoint) — the binding half of §5.1.6" || bad "SYMJOIN: no endpoint published"

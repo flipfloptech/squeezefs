@@ -440,7 +440,8 @@ async fn a_solo_armed_mount_walks_the_ladder_to_its_planes_with_dlm_rpcs_zero() 
             "acquire_slots",
             "planes"
         ],
-        "every rung, in the design's order"
+        "every rung the ladder requires, named in the design's numbering — a checklist, not a \
+         trace (rungs 5–6 ran inside the open, before 3 and before 2 / 4 / 7)"
     );
     assert_eq!(report.data_namespaces_registered, 1);
     assert!(!report.detection_grade, "a PR substrate is device-enforced");

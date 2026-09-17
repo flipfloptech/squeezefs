@@ -587,3 +587,16 @@ row and §12's table above. **Issue 35** — `SQZ_SYM_HANG_FACTOR` /
 rows.
 
 The crash matrix is **34 contracts** (+1 ignored instrument).
+
+**Verification (`CARGO_INCREMENTAL=0`, the dev laptop)**: fmt (root / `fuzz/`
+/ `loom-models/`), `fuzz` check, both clippy configs, rustdoc `-D warnings`,
+the markdown link check — all clean; `sym_crash_matrix_tests` stamped ×3 +
+flat ×1 — 4 / 4 green (34 contracts, 33 s); `sym_custody_tests` 27 /
+`sym_slot_transfer_tests` 45 / `sym_appender_tests` 35 / `kv_leaf_merge_tests`
+14 / `env_knob_convention_tests` 22 / `docs_parity_tests` 5 /
+`derivation_sweep_tests` 60 / `decoder_property_tests` 61 / `sym_forest_tests`
+31 / `sym_manager_tests` 29 — flat AND stamped, 20 / 20 legs green; before
+the commits, with the Issue-32 fix alone: `sym_convert_tests` 38 /
+`crash_contract_tests` 25 both layouts green. Not run (by rule): `task check`,
+squeeze-test, anything on `dev` / `main`; `.benchmarks/2026-09-12-sym-pr-run.md`
+untouched.

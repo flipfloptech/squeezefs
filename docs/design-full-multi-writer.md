@@ -1,5 +1,7 @@
 # Design: FULL MULTI-WRITER — arm S6–S9, build S10–S11, single-node client fleets
 
+> **SUPERSEDED BY THE SYMMETRIC PLANE (PR 12, 2026-09-16 — `docs/design-symmetric-metadata.md` §7.3).** On an armed symmetric set every RW mount is a WRITER through the join ladder; the authority / co-writer postures and `SQUEEZEFS_MULTI_WRITER` / `SQUEEZEFS_MW_ROLE` / `SQUEEZEFS_MW_AUTHORITY` / `SQUEEZEFS_MW_MEMBERS` are RETIRED spellings there (refused loud, forward-only). The planes this program built (S6 membership, S7 fencing, S8 shipping, S9 custody, S10 delegations, S11 range custody) are what the symmetric rungs REUSE — the ladder's rungs 3/4/7 stand them up on every writer — and every unarmed / bit-17-absent mount still runs this document's postures verbatim until the PR-14 flip deletes them. Kept as the record of what it built and measured; not a design for new work.
+
 | | |
 |---|---|
 | **Title** | The FULL MULTI-WRITER program: arming the built planes, subtree delegation (S10), byte-range custody (S11), and same-machine multi-mount client fleets |

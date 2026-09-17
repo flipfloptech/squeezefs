@@ -1,5 +1,7 @@
 # Design: PER-VOLUME CLAIM ADMISSION — the fleet-of-authorities recipe (§6.10 R4)
 
+> **SUPERSEDED BY THE SYMMETRIC PLANE (PR 12, 2026-09-16 — `docs/design-symmetric-metadata.md` §7.3, rulings D18/D19/D20 reversed).** On a symmetric-forest set (incompat bit 17) there are no per-volume owners: ownership is a slot LEASE, `volume set-owners` is RETIRED (refused loud), and `SQUEEZEFS_MW_ROLE=set-authority|partial-authority` are RETIRED spellings beside `SQUEEZEFS_SYMMETRIC_META=1`. This document describes the FLAT multi-writer-class recipe, which every unarmed and bit-17-absent mount runs verbatim until the PR-14 flip deletes it. Kept as the record of what it built and measured; not a design for new work.
+
 | | |
 |---|---|
 | **Title** | Per-volume claim admission: partial-writer opens, per-volume metadata owners, and the inversion of `mint_redirects` |

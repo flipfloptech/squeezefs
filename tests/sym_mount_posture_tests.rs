@@ -712,6 +712,119 @@ async fn a_knob_armed_writer_holds_wero_on_a_pr_capable_metadata_namespace() {
     fsck_clean(&uris).await;
 }
 
+/// The binding's WRITER half (PR 6's owed "the endpoint binding + the wire
+/// initiator's lock take" — review round 1, Issue 8 (i)): rung 7 installs
+/// the cross-owner step shipper under the set's cluster secret and binds
+/// every Live appender's PUBLISHED endpoint into the slot holder table
+/// `step_home` reads — so a create under a directory another appender
+/// leases SHIPS through the ladder's own wiring, with no contract-side
+/// `set_endpoint` / `install_xv_shipper`. In one process the second
+/// appender is the declared region, whose page carries THIS node's
+/// identity, so its published endpoint IS this writer's listener and the
+/// step is served by this daemon's own S8 service (PR 12b's second daemon
+/// is served by its own). The leave uninstalls the shipper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_ladder_binds_every_live_appenders_published_endpoint_and_installs_the_step_shipper() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempfile::tempdir().unwrap();
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    // Seed a directory in slot B while the slot is the manager's, release
+    // it, reopen with the declared region leasing it (PR 6's fixture).
+    let shared = {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        plant_secret(&routed, b"pr12-binding-secret").await;
+        let shared = seed_dir_in_slot(&routed, 0, SLOT_B, "shared").await;
+        routed.volumes[0]
+            .release_slot_handover(0, SLOT_B)
+            .await
+            .expect("release to unleased");
+        shutdown(&routed).await;
+        shared
+    };
+    let routed = open_under(&uris, &Knobs::armed().partition(TWO_HOLDERS)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let plane = vol.slot_leases().expect("armed");
+    assert_eq!(
+        plane.holders.holder(SLOT_B).map(|h| h.appender_id),
+        Some(1),
+        "the declared region leases the shared directory's slot"
+    );
+    assert!(
+        plane.holders.endpoint(1).is_none(),
+        "before the ladder the holder is unbound"
+    );
+    let membership = squeezefs::sym_join::arm_membership_shard(&routed, None)
+        .await
+        .expect("rung 3 arms at auto")
+        .expect("an owner arm");
+    let data = dir.path().join("data-pr");
+    std::fs::File::create(&data)
+        .unwrap()
+        .set_len(1 << 20)
+        .unwrap();
+    let ns = FakeNvmeNamespace::new();
+    install_override(
+        &data,
+        FakeReservationClient::new(ns.clone(), "nqn-pr12b", "host-pr12b"),
+    );
+    std::env::set_var("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    let (arm, report) = squeezefs::sym_join::arm(&routed, std::slice::from_ref(&data), None, None)
+        .await
+        .expect("the ladder walks")
+        .expect("armed");
+
+    // The binding landed off DURABLE state: the declared region's page
+    // carries this node's identity, whose claim-set entry names the
+    // listener rung 7 just published.
+    assert_eq!(
+        plane.holders.endpoint(1).as_deref(),
+        Some(report.endpoint.as_str()),
+        "rung 7 bound the Live appender's published endpoint"
+    );
+    let before = squeezefs::meta_backend::crossvol_tx::cross_owner_stats();
+    let file = routed
+        .create(shared, "out.bin", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("a create in a foreign directory ships through the ladder's own wiring");
+    let after = squeezefs::meta_backend::crossvol_tx::cross_owner_stats();
+    assert_eq!(
+        after.steps_shipped,
+        before.steps_shipped + 1,
+        "the insert shipped to the holder's bound endpoint"
+    );
+    assert_eq!(
+        after.steps_served,
+        before.steps_served + 1,
+        "and this daemon's own S8 service served it"
+    );
+    assert_eq!(
+        after.intents_open, 0,
+        "the intent retired — nothing left for the roll-forward cadence"
+    );
+    assert_eq!(
+        routed.lookup(shared, "out.bin").await.expect("lookup").ino,
+        file.ino
+    );
+
+    // The leave takes the shipper with the planes: the same create is now
+    // the un-shippable class the cadence retries, never a silent local
+    // apply.
+    arm.disarm().await;
+    squeezefs::sym_join::clear_report();
+    let err = routed
+        .create(shared, "after-leave", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect_err("no shipper after the leave");
+    assert!(
+        err.to_string().contains("appender 1"),
+        "names the holder it could not reach: {err}"
+    );
+    membership.disarm().await;
+    clear_override(&data);
+    shutdown(&routed).await;
+}
+
 // ===========================================================================
 // 5b. The reader's PER-SLOT binding (PR 5's declared-authority seam collapsed)
 // ===========================================================================

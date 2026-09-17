@@ -2037,6 +2037,27 @@ impl TokenReaderPlane {
         self.data_sink.set(sink).is_ok()
     }
 
+    /// The installed data sink, shared with a per-holder plane of the same
+    /// volume (PR 12 — one purge per volume, whichever holder recalls).
+    pub fn data_sink(&self) -> Option<Arc<dyn RecallDataSink>> {
+        self.data_sink.get().map(Arc::clone)
+    }
+
+    /// This plane's config with the endpoint replaced — how a reader dials
+    /// a second HOLDER of the same volume under the same identity, secret
+    /// and volume ordinal (PR 12's per-slot binding).
+    pub fn config_for_endpoint(&self, endpoint: &str) -> TokenClientConfig {
+        TokenClientConfig {
+            endpoint: endpoint.to_string(),
+            ..self.cfg.clone()
+        }
+    }
+
+    /// The endpoint this plane dials.
+    pub fn endpoint(&self) -> &str {
+        &self.cfg.endpoint
+    }
+
     /// Test seam: declare the reader's lease live (`Some(true)`), past
     /// `T_self` (`Some(false)`), or read the membership session (`None`).
     pub fn test_set_lease_live(&self, live: Option<bool>) {
@@ -2239,9 +2260,15 @@ impl TokenReaderPlane {
                 }
                 TokenReply::Gone => return Ok(FetchOutcome::Gone),
                 TokenReply::NotHolder { holder } => {
+                    // PR 12: the reader resolved the holder off ITS tree 0
+                    // before dialing (`KvMetaBackend::token_reader_for`),
+                    // so this is a slot that MOVED between the reader's
+                    // last poll and the grant — refused now, exact at the
+                    // next resolve after the epoch step re-reads tree 0.
                     return Err(fail_closed(&format!(
-                        "object {object}'s slot is held by appender {holder} (the redirect to a \
-                         second holder is PR 12's join ladder)"
+                        "object {object}'s slot is held by appender {holder}, not the holder \
+                         this plane dials — the reader's tree 0 lags the lease; the next \
+                         resolve after its epoch step dials the holder tree 0 names"
                     )));
                 }
                 TokenReply::Refused { reason } => return Err(fail_closed(&reason)),
@@ -2942,6 +2969,20 @@ static RECALL_PURGE_SCOPED: AtomicU64 = AtomicU64::new(0);
 /// reader could not enumerate (no entry held, an indirect map).
 static RECALL_PURGE_CENSUS: AtomicU64 = AtomicU64::new(0);
 
+/// Resolves a reader REFUSED because the object's slot holder had no
+/// bound endpoint (`dlm_token_reader_unbound_holders` — PR 12's per-slot
+/// binding; the projection is never served instead).
+static READER_UNBOUND_HOLDERS: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_reader_unbound_holder() {
+    READER_UNBOUND_HOLDERS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The unbound-holder refusal count (the contracts' witness).
+pub fn reader_unbound_holders() -> u64 {
+    READER_UNBOUND_HOLDERS.load(Ordering::Relaxed)
+}
+
 /// The scoped-purge ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecallPurgeCounts {
@@ -3164,6 +3205,18 @@ pub fn reader_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
                 .map(|v| v.token_reader().map_or(serde_json::Value::Null, |p| p.grant_rtt_json()))
                 .collect(),
         ),
+        // PR 12 — the per-slot binding: planes dialed to holders OTHER
+        // than the manager (one per (volume, holder), lazily), and
+        // resolves REFUSED because the object's holder had no bound
+        // endpoint (never served from the projection — must-stay-0 on a
+        // fleet whose join ladder binds every holder).
+        "dlm_token_reader_holder_planes": serde_json::Value::Array(
+            volumes
+                .iter()
+                .map(|v| (v.reader_holder_planes().len() as u64).into())
+                .collect(),
+        ),
+        "dlm_token_reader_unbound_holders": READER_UNBOUND_HOLDERS.load(Ordering::Relaxed),
         // The mount's recall sink (one ledger — the sinks share it).
         "dlm_token_recall_purged_keys": RECALL_PURGE_KEYS.load(Ordering::Relaxed),
         "dlm_token_recall_scoped_purges": RECALL_PURGE_SCOPED.load(Ordering::Relaxed),

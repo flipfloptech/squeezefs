@@ -333,6 +333,11 @@ pub async fn arm(
     };
     report.rungs.push("planes");
     report.endpoint = arm.endpoint().to_string();
+    // The binding's WRITER half (§5.1.6): this writer's listener into its
+    // own claim-set entry on every volume it appends to — what
+    // `resolve_holder_endpoint` reads for its appender id on any mount
+    // (a reader's per-slot planes, a peer's shipped steps), no knob.
+    crate::multi_writer::publish_symmetric_endpoint(meta, &report.endpoint).await;
     install_report(report.clone());
     log::warn!(
         "SYMMETRIC WRITER JOINED (design-symmetric-metadata §7.3): rungs {:?}; {} data \
@@ -347,6 +352,38 @@ pub async fn arm(
         report.endpoint
     );
     Ok(Some((arm, report)))
+}
+
+/// **The holder → endpoint binding, off DURABLE state** (§5.1.6 — "the
+/// holder's identity → its endpoint from the membership census"): appender
+/// `appender_id`'s directory page names its KD-MW-2 identity, the
+/// identity is the member id every plane knows the node by
+/// (`cowriter::node_member_id_of`), and the volume's durable claim set
+/// carries that member's published listener — the endpoint the join
+/// ladder's rung 7 writes into its own entry (`publish_owner_endpoint`).
+/// `None` = no page, or the holder has not published (a joiner whose
+/// ladder has not reached rung 7; a PR 4-era wire joiner). One directory
+/// read + one claim-set read, no wire.
+pub async fn resolve_holder_endpoint(
+    vol: &crate::meta_backend::kv::backend::KvMetaBackend,
+    appender_id: u32,
+) -> Option<String> {
+    let entries =
+        crate::meta_backend::kv::appender::read_directory(vol.device_path(), vol.superblock())
+            .await
+            .ok()?;
+    let page = entries
+        .into_iter()
+        .find(|e| e.appender_id == appender_id)
+        .and_then(|e| e.page)?;
+    let member =
+        crate::cowriter::node_member_id_of(page.identity.node_token, page.identity.mount_slot);
+    let set = crate::membership::ClaimSet::load(vol).await?;
+    set.members
+        .iter()
+        .find(|m| crate::membership::member_id_matches(&m.identity.id, &member))
+        .and_then(|m| m.identity.endpoint.clone())
+        .filter(|e| !e.is_empty())
 }
 
 static REPORT: arc_swap::ArcSwapOption<JoinReport> = arc_swap::ArcSwapOption::const_empty();

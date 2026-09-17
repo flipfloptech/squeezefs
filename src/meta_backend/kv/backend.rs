@@ -1178,6 +1178,19 @@ pub struct KvMetaBackend {
     /// every unarmed forest mount — one `OnceLock` probe per read verb.
     tokens_holder: std::sync::OnceLock<Arc<crate::meta_ship::token_plane::TokenHolderPlane>>,
     tokens_reader: std::sync::OnceLock<Arc<crate::meta_ship::token_plane::TokenReaderPlane>>,
+    /// PR 12 — the reader's PER-HOLDER token planes (§5.1.6 / §5.7.2): an
+    /// object in a slot ANOTHER appender leases is served by a plane
+    /// dialing THAT holder's listener — keyed by ENDPOINT, so two appenders
+    /// one daemon serves (one listener) share one plane and one recall
+    /// channel, the holder's recall of either's object reaching the plane
+    /// that holds it; `tokens_reader` above is the manager's (appender 0's
+    /// — every unleased tree is the manager's to serve, KD-SYM-2/3). The
+    /// endpoint table is the binding the join ladder's published listener
+    /// resolves into (`bind_reader_holder_endpoint`); an object whose
+    /// holder is unbound refuses LOUD, never a projection (KD-SYM-19).
+    reader_holder_planes:
+        scc::HashMap<Arc<str>, Arc<crate::meta_ship::token_plane::TokenReaderPlane>>,
+    reader_holder_endpoints: scc::HashMap<u32, Arc<str>>,
     /// The frame stamp's generation FLOOR per slot (§5.8.2): the highest
     /// `g` this mount has stamped a slot's frame with, kept past the
     /// plane's leave so a flush after the disarm never stamps below it
@@ -2922,6 +2935,8 @@ impl KvMetaBackend {
             conveyor_self: std::sync::OnceLock::new(),
             tokens_holder: std::sync::OnceLock::new(),
             tokens_reader: std::sync::OnceLock::new(),
+            reader_holder_planes: scc::HashMap::new(),
+            reader_holder_endpoints: scc::HashMap::new(),
             frame_g_floor: scc::HashMap::new(),
             reader_frame_screens: scc::HashMap::new(),
             layout_conveyor: Arc::new(ConveyorCore::new()),
@@ -3313,6 +3328,160 @@ impl KvMetaBackend {
     /// symmetric volume), `None` otherwise.
     pub fn token_reader(&self) -> Option<&Arc<crate::meta_ship::token_plane::TokenReaderPlane>> {
         self.tokens_reader.get()
+    }
+
+    /// PR 12 — bind appender `appender_id`'s token endpoint on this reader
+    /// (§5.1.6: tree 0 names the LESSEE, the census names its endpoint).
+    /// The join ladder's census resolution and the contracts write it; a
+    /// later binding for the same id replaces the first (a holder that
+    /// moved its listener) and the next resolve dials the new one.
+    pub fn bind_reader_holder_endpoint(&self, appender_id: u32, endpoint: &str) {
+        self.reader_holder_endpoints
+            .upsert_sync(appender_id, Arc::from(endpoint));
+    }
+
+    /// The endpoint bound for appender `appender_id` on this reader, if any
+    /// (the explicit binding; the durable resolution is
+    /// `sym_join::resolve_holder_endpoint`).
+    pub fn reader_holder_endpoint(&self, appender_id: u32) -> Option<Arc<str>> {
+        self.reader_holder_endpoints
+            .read_sync(&appender_id, |_, e| Arc::clone(e))
+    }
+
+    /// The lessee of `object`'s slot per THIS mount's tree 0 (the S5
+    /// projection of the control plane — refreshed at every epoch step),
+    /// `None` for an unleased slot or the manager's own lease (appender 0
+    /// serves both, KD-SYM-2/3) and on a flat volume.
+    async fn reader_holder_of(&self, object: Ino) -> std::result::Result<Option<u32>, KvError> {
+        let Some(control) = self.forest_control_tree() else {
+            return Ok(None);
+        };
+        let slot = super::record::forest_slot_of_ino(object);
+        let Some(raw) = control
+            .lookup(&super::slot_state::slot_state_key(slot))
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(match super::slot_state::SlotState::decode(&raw)? {
+            super::slot_state::SlotState::Leased { appender_id, .. } if appender_id != 0 => {
+                Some(appender_id)
+            }
+            _ => None,
+        })
+    }
+
+    /// **The reader's per-slot binding** (PR 12, design §5.1.6 / §5.7.2 —
+    /// PR 5's "the reader dials the declared set authority as every
+    /// volume's holder" seam collapsed): the token plane that serves
+    /// `object` — the manager's plane for an unleased slot or the
+    /// manager's own, the HOLDER's plane for a slot another appender
+    /// leases, dialed lazily on the bound endpoint with the same identity,
+    /// secret and volume ordinal the manager's plane carries. `None` on a
+    /// mount that is no token reader. An object whose holder has no bound
+    /// endpoint REFUSES (`EAGAIN`-class, naming the holder) — the
+    /// bounded-staleness projection is never served as a stand-in
+    /// (KD-SYM-19: one read method).
+    pub async fn token_reader_for(
+        &self,
+        object: Ino,
+    ) -> std::result::Result<Option<Arc<crate::meta_ship::token_plane::TokenReaderPlane>>, KvError>
+    {
+        let Some(default) = self.tokens_reader.get() else {
+            return Ok(None);
+        };
+        let Some(holder) = self.reader_holder_of(object).await? else {
+            return Ok(Some(Arc::clone(default)));
+        };
+        let bound = self
+            .reader_holder_endpoints
+            .read_sync(&holder, |_, e| Arc::clone(e));
+        // An unbound holder is resolved off durable state once (its page's
+        // identity → its claim-set entry's published listener) and bound.
+        // Boxed: the resolver reads the claim set through `getxattr`, a
+        // control record no token carries — the type-level cycle is not a
+        // runtime one.
+        let resolved = match bound {
+            Some(e) => Some(e),
+            None => Box::pin(crate::sym_join::resolve_holder_endpoint(self, holder))
+                .await
+                .map(|e| {
+                    let e: Arc<str> = Arc::from(e);
+                    self.reader_holder_endpoints
+                        .upsert_sync(holder, Arc::clone(&e));
+                    e
+                }),
+        };
+        let Some(endpoint) = resolved else {
+            crate::meta_ship::token_plane::note_reader_unbound_holder();
+            return Err(KvError::Io(crate::error::SqueezefsError::refused(
+                libc::EAGAIN,
+                format!(
+                    "{}: object {object} lives in a slot appender {holder} leases, and this \
+                     reader has no endpoint bound for that holder (tree 0 names the lessee; \
+                     the membership census names its endpoint — design-symmetric-metadata \
+                     §5.1.6). Its token cannot be granted here and the bounded-staleness \
+                     projection is never served in its place (R-SYM-4) — refused until the \
+                     holder is bound (dlm_token_reader_unbound_holders)",
+                    self.path.display()
+                ),
+            )));
+        };
+        // One plane per LISTENER: the manager's own endpoint is the
+        // manager's plane (a holder the manager's daemon also serves), and
+        // an endpoint already dialed for another holder is reused.
+        if *endpoint == *default.endpoint() {
+            return Ok(Some(Arc::clone(default)));
+        }
+        if let Some(plane) = self
+            .reader_holder_planes
+            .read_sync(&endpoint, |_, p| Arc::clone(p))
+        {
+            return Ok(Some(plane));
+        }
+        let cfg = default.config_for_endpoint(&endpoint);
+        let plane = crate::meta_ship::token_plane::TokenReaderPlane::new(cfg);
+        if let Some(sink) = default.data_sink() {
+            plane.install_data_sink(sink);
+        }
+        match self
+            .reader_holder_planes
+            .insert_sync(Arc::clone(&endpoint), Arc::clone(&plane))
+        {
+            Ok(()) => {
+                let task = Arc::clone(&plane);
+                crate::meta_exec::spawn_meta("token_recall_channel_holder", async move {
+                    task.run_recall_channel().await;
+                });
+                log::info!(
+                    "meta volume {}: read tokens for appender {holder}'s slots served from \
+                     {endpoint} (the reader's per-slot binding, design-symmetric-metadata \
+                     §5.1.6)",
+                    self.path.display()
+                );
+                Ok(Some(plane))
+            }
+            // A racing resolve dialed first: its plane stands, ours dies.
+            Err(_) => {
+                plane.stop_dead();
+                Ok(self
+                    .reader_holder_planes
+                    .read_sync(&endpoint, |_, p| Arc::clone(p)))
+            }
+        }
+    }
+
+    /// Every per-holder reader plane (the leave's release pass and the
+    /// stats face).
+    pub fn reader_holder_planes(
+        &self,
+    ) -> Vec<Arc<crate::meta_ship::token_plane::TokenReaderPlane>> {
+        let mut out = Vec::new();
+        self.reader_holder_planes.iter_sync(|_, p| {
+            out.push(Arc::clone(p));
+            true
+        });
+        out
     }
 
     /// Arm the holder plane (the symmetric plane's arm on a writer; the
@@ -11622,9 +11791,10 @@ impl KvMetaBackend {
             return Ok(None); // unrepresentable ⇒ cannot exist
         }
         // PR 5: a token reader answers from the parent's token (its
-        // dentry set), never from a foreign leaf.
-        if let Some(tokens) = self.token_reader() {
-            return crate::meta_ship::token_plane::token_find_dentry(tokens, parent, name)
+        // dentry set), never from a foreign leaf — PR 12: from the plane
+        // of the PARENT's slot holder.
+        if let Some(tokens) = self.token_reader_for(parent).await? {
+            return crate::meta_ship::token_plane::token_find_dentry(&tokens, parent, name)
                 .await
                 .map_err(KvError::from);
         }
@@ -11729,8 +11899,9 @@ impl KvMetaBackend {
     /// drain).
     pub async fn getattr(&self, ino: Ino) -> Result<Inode> {
         // PR 5: a token reader serves the object's attrs from its token
-        // (the holder's folded view at the grant), exact until recalled.
-        if let Some(tokens) = self.token_reader() {
+        // (the holder's folded view at the grant), exact until recalled —
+        // PR 12: granted by the object's slot holder.
+        if let Some(tokens) = self.token_reader_for(ino).await? {
             let serve = tokens
                 .serve(ino, crate::meta_ship::token_plane::TokenWants::default())
                 .await?
@@ -11800,8 +11971,9 @@ impl KvMetaBackend {
             return Ok(out);
         }
         // PR 5: a token reader pages the directory's token (its complete
-        // dentry set, cookie-ordered as the holder served it).
-        if let Some(tokens) = self.token_reader() {
+        // dentry set, cookie-ordered as the holder served it) — PR 12:
+        // from the directory's slot holder.
+        if let Some(tokens) = self.token_reader_for(dir).await? {
             let after = match decode_readdir_cookie(offset).map_err(KvError::from)? {
                 ReaddirPos::Start | ReaddirPos::AfterDot | ReaddirPos::AfterDotDot => 0,
                 ReaddirPos::AfterEntry { hash54, coll_seq } => {
@@ -11875,7 +12047,7 @@ impl KvMetaBackend {
         // token; a control record (`writer_claim`, `job:` …) is the
         // plane's own, read off the S5 projection as before.
         if crate::meta_ship::token_plane::token_carried_xattr(name) {
-            if let Some(tokens) = self.token_reader() {
+            if let Some(tokens) = self.token_reader_for(ino).await? {
                 let Some(serve) = tokens
                     .serve(ino, crate::meta_ship::token_plane::TokenWants::default())
                     .await?
@@ -11905,8 +12077,9 @@ impl KvMetaBackend {
     /// All xattr names of `ino`; empty for inos without xattrs (v2
     /// contract).
     pub async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {
-        // PR 5: a token reader lists the token's (user-visible) names.
-        if let Some(tokens) = self.token_reader() {
+        // PR 5: a token reader lists the token's (user-visible) names —
+        // PR 12: from the object's slot holder.
+        if let Some(tokens) = self.token_reader_for(ino).await? {
             let Some(serve) = tokens
                 .serve(ino, crate::meta_ship::token_plane::TokenWants::default())
                 .await?
@@ -12633,6 +12806,10 @@ impl KvMetaBackend {
             // recall deadline at its next commit on those objects.
             if let Some(tokens) = self.token_reader() {
                 tokens.stop().await;
+            }
+            // PR 12: every per-holder plane releases at ITS holder too.
+            for plane in self.reader_holder_planes() {
+                plane.stop().await;
             }
             self.shutting_down.store(true, Ordering::Release);
             self.ring.wake_parked();

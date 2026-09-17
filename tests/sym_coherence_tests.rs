@@ -2354,11 +2354,13 @@ async fn a_displacing_publishs_recall_completes_before_the_holders_free_clears_t
     assert_eq!(free_grace::recall_gated_frees(), gated0);
     sink.release();
     publish.await.unwrap().unwrap();
-    assert_eq!(
-        plane.stats().recalls_acked,
-        1,
-        "the recall was acked before the commit"
-    );
+    // The commit returned on the holder OBSERVING the ack; the reader's
+    // own `recalls_acked` word moves after its reply left, so the pin
+    // waits for it (PR 12 — the test-side race PR 5's note named).
+    wait_until("the reader counted its ack", || {
+        plane.stats().recalls_acked == 1
+    })
+    .await;
     // The publish's ladder: the displaced block's terminal free at the
     // holder — direct under the recall gate, its bit cleared, no ring.
     assert!(ba.begin_free(b_off));
@@ -2714,13 +2716,31 @@ async fn a_cross_owner_create_recalls_the_parents_token_before_its_shipped_step_
     // The token reader holds the shared directory's dentry set.
     let (host, endpoint) = holder_listener(&vol);
     let holder = vol.token_holder().unwrap().clone();
-    let (reader, plane) = open_token_reader(&p, &endpoint, "reader-xv").await;
+    let (reader, manager_plane) = open_token_reader(&p, &endpoint, "reader-xv").await;
     let sink = ProbeSink::new(false);
-    assert!(plane.install_data_sink(sink.clone()));
+    assert!(manager_plane.install_data_sink(sink.clone()));
+    // PR 12 — the reader's per-slot binding: the shared directory lives
+    // in the DECLARED region's slot, so its token is granted by holder 1's
+    // plane (dialed on the bound endpoint — this process's listener, which
+    // serves the declared region too), never the manager's.
+    reader.volumes[0].bind_reader_holder_endpoint(1, &endpoint);
+    let (_v, shared_local) = writer.route_ino(shared);
+    let plane = reader.volumes[0]
+        .token_reader_for(shared_local)
+        .await
+        .expect("resolves through tree 0")
+        .expect("a token reader");
+    // One plane per LISTENER: holder 1 is served by the manager's daemon
+    // here, so its objects ride the manager's plane and its ONE recall
+    // channel (a second channel under one client id would take the
+    // recall the other plane's cache needs).
+    assert!(
+        Arc::ptr_eq(&plane, &manager_plane),
+        "one listener, one plane"
+    );
     assert!(Metadata::lookup(reader.as_ref(), shared, "out.bin")
         .await
         .is_err());
-    let (_v, shared_local) = writer.route_ino(shared);
     assert!(plane.holds(shared_local), "the directory's token is cached");
     let steps0 = cross_owner_stats().steps_served;
 
@@ -3563,14 +3583,33 @@ async fn a_ro_mount_under_the_knob_arms_the_token_client_and_writes_nothing() {
         Arc::new(squeezefs::data_grant::AsyncVerbRouter::new()),
     )
     .expect("dark listener");
-    std::env::set_var(
-        squeezefs::cowriter::MW_AUTHORITY_ENV,
-        dark.endpoint().to_string(),
-    );
+    // PR 12: the reader dials no DECLARED authority (the knob is retired
+    // under the plane) — the manager's endpoint is the binding, or the
+    // listener its join ladder published into its claim-set entry. The
+    // contracts bind it directly; an unpublished, unbound manager refuses.
     {
         let probe_reader = open_routed_meta_set_read_only(&[path.display().to_string()])
             .await
             .expect("read-only open");
+        let (router, _b) = data_router("ro_mount_tokens_unbound").await;
+        let err = ro_coherence::arm_token_readers(&probe_reader.volumes, &router)
+            .await
+            .expect_err("a manager that published no listener refuses the arm");
+        assert!(
+            err.contains("published no listener"),
+            "the refusal names the missing binding: {err}"
+        );
+        assert!(
+            !err.contains("SQUEEZEFS_MW_AUTHORITY"),
+            "and never the retired knob: {err}"
+        );
+        shutdown(&probe_reader).await;
+    }
+    {
+        let probe_reader = open_routed_meta_set_read_only(&[path.display().to_string()])
+            .await
+            .expect("read-only open");
+        probe_reader.volumes[0].bind_reader_holder_endpoint(0, &dark.endpoint().to_string());
         let (router, _b) = data_router("ro_mount_tokens_dark").await;
         let err = ro_coherence::arm_token_readers(&probe_reader.volumes, &router)
             .await
@@ -3580,13 +3619,12 @@ async fn a_ro_mount_under_the_knob_arms_the_token_client_and_writes_nothing() {
             "the refusal names the probe's finding: {err}"
         );
         assert!(
-            err.contains("SQUEEZEFS_MULTI_WRITER=1"),
-            "and the writer's knobs: {err}"
+            err.contains("join ladder"),
+            "and the writer's posture: {err}"
         );
         shutdown(&probe_reader).await;
     }
     dark.shutdown();
-    std::env::set_var(squeezefs::cowriter::MW_AUTHORITY_ENV, &endpoint);
 
     // Settle the WRITER's image first: a checkpoint's tail releases the
     // pending frees it covers AFTER its bitmap pages landed, so the next
@@ -3596,6 +3634,7 @@ async fn a_ro_mount_under_the_knob_arms_the_token_client_and_writes_nothing() {
     let reader = open_routed_meta_set_read_only(&[path.display().to_string()])
         .await
         .expect("read-only open");
+    reader.volumes[0].bind_reader_holder_endpoint(0, &endpoint);
     let (router, _b) = data_router("ro_mount_tokens").await;
     let armed = ro_coherence::arm_token_readers(&reader.volumes, &router)
         .await
@@ -3630,7 +3669,6 @@ async fn a_ro_mount_under_the_knob_arms_the_token_client_and_writes_nothing() {
 
     shutdown(&reader).await;
     membership::uninstall();
-    std::env::remove_var(squeezefs::cowriter::MW_AUTHORITY_ENV);
     std::env::remove_var(SYMMETRIC_META_ENV);
     squeezefs::fuse_client::set_read_only_mount(false);
     shutdown(&writer).await;

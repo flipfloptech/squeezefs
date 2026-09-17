@@ -773,14 +773,6 @@ pub async fn arm_token_readers(
                 .to_string(),
         );
     };
-    let Some(endpoint) = crate::cowriter::declared_authority() else {
-        return Err(format!(
-            "SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount, but no holder endpoint is declared: \
-             the read tokens of every volume are served on the set authority's S8 listener \
-             (its SQUEEZEFS_MW_BIND endpoint) — set {}=addr:port on this reader",
-            crate::cowriter::MW_AUTHORITY_ENV
-        ));
-    };
     let Some(secret) = crate::membership::cluster_secret(first).await else {
         return Err(format!(
             "{}: SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount, but the volume set carries no \
@@ -791,10 +783,35 @@ pub async fn arm_token_readers(
         ));
     };
     let mut armed = 0usize;
+    let mut endpoint = String::new();
     for (ordinal, v) in volumes.iter().enumerate() {
         if !v.is_read_only() {
             continue;
         }
+        // PR 12 — the MANAGER's endpoint (appender 0, the holder of every
+        // unleased tree and its own) off the binding or DURABLE state: its
+        // page's identity → its claim-set entry's published listener (the
+        // join ladder's rung 7 writes it). Never a knob: the declared
+        // authority is a RETIRED spelling under the plane (§6.1). Objects
+        // in slots OTHER appenders lease are served by per-holder planes
+        // the backend dials at the first resolve (`token_reader_for`).
+        endpoint = match v.reader_holder_endpoint(0) {
+            Some(e) => e.to_string(),
+            None => match crate::sym_join::resolve_holder_endpoint(v, 0).await {
+                Some(e) => e,
+                None => {
+                    return Err(format!(
+                        "{}: SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount, but the volume's \
+                         manager (appender 0) has published no listener — its claim-set entry \
+                         carries no endpoint. The writer must be mounted under \
+                         SQUEEZEFS_SYMMETRIC_META=1 (its join ladder publishes the S8 listener \
+                         every token, custody and shipped step rides — design-symmetric-metadata \
+                         §5.1.6 / §7.3); a reader dials no declared authority",
+                        v.device_path().display()
+                    ));
+                }
+            },
+        };
         // One sink per volume: its recalls name LOCAL key inos, and the
         // router's layout cache is keyed by the global ino the volume's
         // ordinal maps them to.
@@ -820,9 +837,8 @@ pub async fn arm_token_readers(
             return Err(format!(
                 "{}: SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount, but the holder at {endpoint} \
                  does not serve read tokens for volume {ordinal} ({e}) — the writer must be \
-                 mounted with SQUEEZEFS_SYMMETRIC_META=1 and SQUEEZEFS_MULTI_WRITER=1 (its S8 \
-                 listener carries the token verbs), and SQUEEZEFS_MW_AUTHORITY must name that \
-                 listener",
+                 mounted with SQUEEZEFS_SYMMETRIC_META=1 (its join ladder's listener carries \
+                 the token verbs; the endpoint it published is what this reader dialed)",
                 v.device_path().display()
             ));
         }

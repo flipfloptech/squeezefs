@@ -463,6 +463,205 @@ async fn the_ladder_on_a_non_pr_substrate_is_detection_grade_only_under_the_lab_
 }
 
 // ===========================================================================
+// 5b. The reader's PER-SLOT binding (PR 5's declared-authority seam collapsed)
+// ===========================================================================
+
+/// A `-o ro` token reader resolves every object's HOLDER through its tree 0
+/// (§5.1.6): an object in a slot the manager holds (or nobody does) is
+/// served by the manager's plane — the one the reader dialed first — while
+/// an object in a slot ANOTHER appender leases is served by a plane dialed
+/// to THAT holder's bound endpoint, created at the first resolve (one plane
+/// per LISTENER — a holder the manager's daemon also serves rides the
+/// manager's plane and its one recall channel); an object
+/// whose holder has no bound endpoint REFUSES loud (`EAGAIN`, naming the
+/// holder, `dlm_token_reader_unbound_holders`), never the projection. The
+/// contracts bind the endpoints directly (the join ladder's rung 7 publishes
+/// a writer's into its claim-set entry, which `resolve_holder_endpoint`
+/// reads on any mount). In one process the second holder is the declared
+/// region, whose objects this process's token service serves too; a second
+/// PROCESS serving them is the N-daemon venue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_reader_dials_each_objects_slot_holder_and_refuses_an_unbound_one() {
+    use squeezefs::cluster_wire as cw;
+    use squeezefs::meta_ship::token_plane::{TokenClientConfig, TokenSetService};
+    const SECRET: &[u8] = b"pr12-per-slot-binding-secret";
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempfile::tempdir().unwrap();
+    let uris = vec![format_stamped_member(dir.path(), "sym0").await];
+    // A directory in slot B seeded while the slot is the manager's, then
+    // released, then leased to the declared region (PR 6's fixture).
+    let (shared, mine) = {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        let shared = seed_dir_in_slot(&routed, 0, SLOT_B, "shared").await;
+        let mine = routed
+            .create(ROOT, "mine", libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("an own file")
+            .ino;
+        routed.volumes[0]
+            .release_slot_handover(0, SLOT_B)
+            .await
+            .expect("release to unleased");
+        shutdown(&routed).await;
+        (shared, mine)
+    };
+    let writer = open_under(&uris, &Knobs::armed().partition(TWO_HOLDERS)).await;
+    let holder_vol = Arc::clone(&writer.volumes[0]);
+    assert_eq!(
+        holder_vol
+            .slot_leases()
+            .expect("armed")
+            .holders
+            .holder(SLOT_B)
+            .map(|h| h.appender_id),
+        Some(1),
+        "slot B is the declared region's"
+    );
+    holder_vol.checkpoint_now().await.expect("publish tree 0");
+    // Two listeners: A is the manager's (appender 0), B stands for the
+    // second holder's — both served by this process's token service.
+    let listener = |name: &'static str| {
+        cw::RpcListener::start_async(
+            cw::RpcListenerConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("literal addr"),
+                service_threads: 2,
+                ..cw::RpcListenerConfig::default()
+            },
+            SECRET.to_vec(),
+            TokenSetService::new(&writer.volumes),
+        )
+        .unwrap_or_else(|e| panic!("listener {name}: {e}"))
+    };
+    let a = listener("A");
+    let b = listener("B");
+    let endpoint_a = a.endpoint().to_string();
+    let endpoint_b = b.endpoint().to_string();
+
+    let reader = squeezefs::meta_backend::open_routed_meta_set_read_only(&uris)
+        .await
+        .expect("read-only open");
+    let rv = Arc::clone(&reader.volumes[0]);
+    let default = rv
+        .arm_token_reader(TokenClientConfig {
+            endpoint: endpoint_a.clone(),
+            secret: SECRET.to_vec(),
+            client_id: "pr12-reader".to_string(),
+            volume: 0,
+        })
+        .expect("the manager's plane arms");
+    assert_eq!(default.endpoint(), endpoint_a);
+    let wait_fresh = |plane: Arc<squeezefs::meta_ship::token_plane::TokenReaderPlane>| async move {
+        let started = std::time::Instant::now();
+        while !plane.stats().channel_fresh {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "the recall channel never completed its first round"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    wait_fresh(Arc::clone(&default)).await;
+
+    // An own-slot object: the manager's plane, and it SERVES.
+    let (_, mine_local) = reader.route_ino(mine);
+    let plane = rv
+        .token_reader_for(mine_local)
+        .await
+        .expect("resolves")
+        .expect("a token reader");
+    assert!(
+        Arc::ptr_eq(&plane, &default),
+        "the manager's plane serves its own slot"
+    );
+    let grants_before = default.stats().grants;
+    reader
+        .getattr(mine)
+        .await
+        .expect("served under a token from A");
+    assert_eq!(default.stats().grants, grants_before + 1);
+    assert!(rv.reader_holder_planes().is_empty(), "no second plane yet");
+
+    // A foreign-held object with NO endpoint bound for its holder: refused
+    // loud, naming the holder — never the projection.
+    let (_, shared_local) = reader.route_ino(shared);
+    let unbound_before = squeezefs::meta_ship::token_plane::reader_unbound_holders();
+    let err = rv
+        .token_reader_for(shared_local)
+        .await
+        .expect_err("an unbound holder refuses");
+    let msg = err.to_string();
+    assert!(msg.contains("appender 1"), "names the holder: {msg}");
+    assert!(
+        msg.contains("never served in its place"),
+        "and refuses the projection: {msg}"
+    );
+    assert_eq!(
+        squeezefs::meta_ship::token_plane::reader_unbound_holders(),
+        unbound_before + 1
+    );
+    let err = reader
+        .getattr(shared)
+        .await
+        .expect_err("the divert refuses too");
+    assert!(err.to_string().contains("appender 1"), "{err}");
+
+    // Bind holder 1 → B: the first resolve dials a SEPARATE plane to B,
+    // while the manager's plane keeps dialing A.
+    rv.bind_reader_holder_endpoint(1, &endpoint_b);
+    let plane_b = rv
+        .token_reader_for(shared_local)
+        .await
+        .expect("resolves")
+        .expect("a token reader");
+    assert!(!Arc::ptr_eq(&plane_b, &default), "a per-holder plane");
+    assert_eq!(
+        plane_b.endpoint(),
+        endpoint_b,
+        "dialed to the holder's endpoint"
+    );
+    assert_eq!(
+        default.endpoint(),
+        endpoint_a,
+        "the manager's plane unchanged"
+    );
+    assert_eq!(rv.reader_holder_planes().len(), 1);
+    let again = rv
+        .token_reader_for(shared_local)
+        .await
+        .expect("resolves")
+        .expect("a token reader");
+    assert!(
+        Arc::ptr_eq(&again, &plane_b),
+        "one plane per listener, reused"
+    );
+    wait_fresh(Arc::clone(&plane_b)).await;
+    // A holder bound to the manager's OWN listener rides the manager's
+    // plane — one recall channel per (client, listener).
+    rv.bind_reader_holder_endpoint(2, &endpoint_a);
+    assert_eq!(rv.reader_holder_planes().len(), 1);
+    // The foreign object is served under a token from B (this process
+    // holds the declared region too, so its service answers for it), and
+    // the manager's plane was never asked.
+    reader
+        .getattr(shared)
+        .await
+        .expect("served under a token from the holder's plane");
+    assert_eq!(plane_b.stats().grants, 1, "one grant from B");
+    assert_eq!(
+        default.stats().grants,
+        grants_before + 1,
+        "the manager's plane was never asked for the foreign object"
+    );
+    assert!(plane_b.holds(shared_local) && !default.holds(shared_local));
+
+    shutdown(&reader).await;
+    a.shutdown();
+    b.shutdown();
+    shutdown(&writer).await;
+}
+
+// ===========================================================================
 // 6. plane_gate keys on the held ALLOCATION LEASE
 // ===========================================================================
 

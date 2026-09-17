@@ -439,6 +439,21 @@ pub fn resolve_bind_public() -> Result<Option<std::net::SocketAddr>> {
     })
 }
 
+/// The symmetric join ladder's binding half (`crate::sym_join`, §5.1.6):
+/// publish this writer's S8 listener into its own claim-set entry on
+/// EVERY volume of the set (a symmetric map is all-local), so any mount
+/// resolves this appender's endpoint off durable state. Idempotent at the
+/// same address; a volume that does not enroll this node is announced.
+pub async fn publish_symmetric_endpoint(meta: &Arc<RoutedMetaBackend>, endpoint: &str) {
+    let Ok(node_id) = crate::cowriter::node_member_id() else {
+        return;
+    };
+    let Ok(map) = OwnerMap::for_volumes(meta, Vec::new()) else {
+        return;
+    };
+    publish_owner_endpoint(meta, &map, &node_id, endpoint, crate::dlm::durable_term()).await;
+}
+
 /// The ownership map a SYMMETRIC writer arms its planes over: derived
 /// from the durable records with no per-volume admission — on a
 /// symmetric set every `set-owners` assignment was dropped by the

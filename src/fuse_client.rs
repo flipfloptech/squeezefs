@@ -14050,6 +14050,21 @@ impl SqueezefsFilesystem {
                     "slot_handover_recall_bound_ms".into(),
                     serde_json::Value::from(crate::data_grant::handover_recall_bound_ms()),
                 );
+                // PR 10 (review round 7, Issue 34): the death-path custody
+                // quarantine — fresh grants refused on a slot recovered
+                // from an EARLY death record inside its writers' T_self,
+                // and the slots under it now; 0 on every unarmed mount.
+                {
+                    let (refusals, live) = crate::data_grant::custody_quarantine_stats();
+                    metrics.insert(
+                        "slot_custody_quarantine_refusals".into(),
+                        serde_json::Value::from(refusals),
+                    );
+                    metrics.insert(
+                        "slot_custody_quarantined".into(),
+                        serde_json::Value::from(live as u64),
+                    );
+                }
                 metrics.insert("slot_offers_busy".into(), lease(&|s| s.offers_busy));
                 metrics.insert(
                     "meta_kv_leaf_lease_refusals".into(),

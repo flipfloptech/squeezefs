@@ -6074,6 +6074,98 @@ pub fn handover_recalls_pending() -> usize {
     HANDOVER_RECALLS.pending()
 }
 
+// ---- The custody quarantine on the death path (PR 10, Issue 34) ---------
+
+/// Slots recovered from an EARLY death record (`squeezefs appender clear`,
+/// PR 8's same-node takeover — recorders that can run INSIDE a surviving
+/// custody writer's `T_self`; the plane's own recorders cannot, `T_self <
+/// T_owner`): the dead holder's grants on the slot's files may still stand
+/// at their writers, so the recovered slot's arbiter grants NOTHING fresh
+/// on those files until `record.ts_ms + T_self` — the S7 dead-epoch
+/// quarantine's shape, per slot (the dead holder's grant table died with
+/// it, so its files are not enumerable; the slot is the unit). Keyed on
+/// the volume's superblock uuid + forest slot, valued the Unix-ms deadline;
+/// entries expire lazily. Empty on every mount that never recovered an
+/// early record.
+static CUSTODY_QUARANTINE: Lazy<parking_lot::Mutex<HashMap<HandoverKey, u64>>> =
+    Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
+/// The map's population — the grant paths' one relaxed load on every
+/// mount with no quarantine (never the mutex).
+static CUSTODY_QUARANTINE_LIVE: AtomicU64 = AtomicU64::new(0);
+static CUSTODY_QUARANTINE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// The recovery's arm (step 7b, after the slots went `Unleased`): refuse
+/// fresh custody grants on forest `slot`'s files until `until_ms` (Unix
+/// ms). A later, longer quarantine of the same slot extends it; a shorter
+/// one never shortens it.
+pub fn quarantine_slot_custody(
+    volume_uuid: u128,
+    slot: crate::meta_backend::kv::record::ForestSlot,
+    until_ms: u64,
+) {
+    let mut q = CUSTODY_QUARANTINE.lock();
+    let e = q.entry((volume_uuid, slot)).or_insert(0);
+    *e = (*e).max(until_ms);
+    CUSTODY_QUARANTINE_LIVE.store(q.len() as u64, Ordering::Release);
+}
+
+/// `T_self` for the quarantine's deadline: the installed custody
+/// authority's clocks (the same fleet configuration the dead holder's
+/// writers ran under), else the shipped derivation.
+pub fn custody_quarantine_t_self_ms() -> u64 {
+    custody_owner()
+        .map(|o| o.clocks().t_self)
+        .or_else(|| LeaseClocks::derive(Duration::ZERO).ok().map(|c| c.t_self))
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Is GLOBAL ino `ino`'s slot under the death-path custody quarantine?
+/// `Some(remaining)` while it is — the grant paths' one question beside
+/// [`handover_recall_defers`], answered with the retryable class. One
+/// relaxed load on every mount with no quarantine.
+pub fn custody_quarantine_remaining(ino: u64) -> Option<Duration> {
+    if CUSTODY_QUARANTINE_LIVE.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let guard = SLOT_CUSTODY.load();
+    let arm = guard.as_ref()?;
+    let routed = arm.routed.upgrade()?;
+    let (v, local) = routed.route_ino(ino);
+    let vol = routed.volumes.get(v)?;
+    let key = (
+        u128::from_le_bytes(vol.superblock().uuid),
+        crate::meta_backend::kv::record::forest_slot_of_ino(local),
+    );
+    let now = crate::meta_backend::kv::alloc_lease::unix_now_ms();
+    let mut q = CUSTODY_QUARANTINE.lock();
+    let until = *q.get(&key)?;
+    if now >= until {
+        q.remove(&key);
+        CUSTODY_QUARANTINE_LIVE.store(q.len() as u64, Ordering::Release);
+        return None;
+    }
+    CUSTODY_QUARANTINE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+    Some(Duration::from_millis(until - now))
+}
+
+/// The quarantine's refusals (`slot_custody_quarantine_refusals`), and the
+/// slots under quarantine right now (`slot_custody_quarantined`).
+pub fn custody_quarantine_stats() -> (u64, usize) {
+    let now = crate::meta_backend::kv::alloc_lease::unix_now_ms();
+    let live = CUSTODY_QUARANTINE
+        .lock()
+        .values()
+        .filter(|until| **until > now)
+        .count();
+    (CUSTODY_QUARANTINE_REFUSALS.load(Ordering::Relaxed), live)
+}
+
+/// **Test seam**: drop every quarantine (a contract's teardown).
+pub fn test_clear_custody_quarantine() {
+    CUSTODY_QUARANTINE.lock().clear();
+    CUSTODY_QUARANTINE_LIVE.store(0, Ordering::Release);
+}
+
 /// **The HOLDER's clean leave is a handover to nobody** (round 3, Issue
 /// 22 — design §5.1.4 extended to the leave): before a covered region's
 /// slots are released to `Unleased`, every live custody grant this

@@ -43,6 +43,7 @@ fn reset_process_state() {
     squeezefs::block_grant::test_clear_free_targets();
     park_gate::test_reset();
     squeezefs::data_custody::test_clear_poison();
+    squeezefs::data_grant::test_clear_custody_quarantine();
     squeezefs::membership::test_clear_death_sinks();
     squeezefs::membership::uninstall();
 }
@@ -1381,6 +1382,171 @@ async fn appender_clear_refuses_a_live_lease_and_attests_a_dead_one() {
     let rep = mount_path_custody_gate(&routed).await.unwrap();
     assert_eq!(rep.recovered(), 1);
     assert_all_resolve(&routed, shared, &files[0]).await;
+    assert_eq!(
+        page_state(&uris[0], &vol, 1).await,
+        Some(AppenderState::Recovered)
+    );
+    shutdown(&routed).await;
+    drop(vol);
+    drop(routed);
+    fsck_clean(&uris).await;
+    reset_process_state();
+}
+
+/// **Review round 7, Issue 34 — the custody QUARANTINE on the death
+/// path.** The plane's own recorders (the S6 eviction, the grace
+/// deadline) cannot write a death record before `T_owner`, and a writer
+/// holding custody from the dead holder self-fences at `T_self <
+/// T_owner` — so a slot they recover grants fresh custody at once (the
+/// seam-(b) pin's tail). The two EARLY recorders — `squeezefs appender
+/// clear` (the operator's attestation) and PR 8's same-node takeover —
+/// can run INSIDE a surviving writer's `T_self`, and the recovered slot's
+/// arbiter granting a NEW writer then would put two custody holders on
+/// one file (PR 9 Issue 20's class, which the handover defers for). The
+/// record carries its recorder class; a slot recovered from an EARLY
+/// record is QUARANTINED until `ts_ms + T_self`: both grant paths refuse
+/// the retryable class (`Refused { EAGAIN }` locally, `CUSTODY_DEFERRED`
+/// on the wire) naming the quarantine, then grant. The surviving writer
+/// is the premise (its grant lived in the dead holder's process); the
+/// observable is the arbiter's window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_early_death_record_quarantines_the_recovered_slots_custody_for_t_self() {
+    use squeezefs::data_grant::{self, WriteCustodyOwner};
+    use squeezefs::membership::{LeaseClock, LeaseClocks};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, shared, seeded) = seeded_volume_with_slot_files(dir.path(), SLOT_A, 2).await;
+    let x = foreign(71);
+    let files = kill_with_region_one_live(&uris, "1:4", &[(0, shared)], 5, x).await;
+    let path = std::path::Path::new(&uris[0]);
+    // The killed manager's claim is heartbeat-fresh: one clean mount cycle
+    // of this node releases it (the verb refuses a fresh claim by law).
+    {
+        let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();
+        shutdown(&routed).await;
+    }
+    // The operator's attestation — an EARLY record.
+    let t0 = squeezefs::meta_backend::kv::alloc_lease::unix_now_ms();
+    match KvMetaBackend::appender_clear(path, path, 1).await {
+        Ok(recovery::AppenderClearOutcome::Cleared { was, .. }) => {
+            assert_eq!(was, AppenderState::Live)
+        }
+        other => panic!("{other:?}"),
+    }
+    // The next mount: PR 9's custody owner + slot-custody arm (the
+    // recovered slot's arbiter), short clocks so the window is measurable.
+    let _hygiene = CustodyArmGuard;
+    let clocks = LeaseClocks::with_params(
+        std::time::Duration::from_millis(3_000),
+        std::time::Duration::from_millis(200),
+        std::time::Duration::from_millis(400),
+    )
+    .expect("2*skew + purge < TTL");
+    let t_self_ms = clocks.t_self.as_millis() as u64;
+    let owner = WriteCustodyOwner::arm(
+        "recoverer",
+        squeezefs::dlm::durable_term() + 1,
+        squeezefs::dlm::durable_term(),
+        clocks,
+        LeaseClock::monotonic(),
+        None,
+    )
+    .expect("the recoverer's custody authority arms");
+    data_grant::install_custody_owner(Arc::clone(&owner));
+    let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();
+    let vol = Arc::clone(&routed.volumes[0]);
+    let sink = Arc::new(NoopRecallSink);
+    data_grant::arm_slot_custody(
+        &routed,
+        "recoverer",
+        VENUE_SECRET.to_vec(),
+        0,
+        Arc::new(move |_volume| {
+            Arc::clone(&sink) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
+        }),
+    );
+    let rec = vol
+        .dead_member_record(&x)
+        .await
+        .unwrap()
+        .expect("the attestation's record");
+    assert!(rec.early, "appender clear writes an EARLY record");
+    assert!(rec.ts_ms >= t0);
+    let rep = mount_path_custody_gate(&routed).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    assert_all_resolve(&routed, shared, &files[0]).await;
+    assert_all_resolve(&routed, ROOT_INO, &seeded).await;
+    // The recovered slot is the manager's, yet its custody is quarantined:
+    // a fresh acquire on a file OF the slot refuses the retryable class
+    // naming the quarantine — not the local arbiter's grant.
+    let (_, ino) = seeded[0];
+    let (_, local) = routed.route_ino(ino);
+    assert_eq!(
+        squeezefs::meta_backend::kv::record::forest_slot_of_ino(local),
+        SLOT_A
+    );
+    assert_eq!(vol.foreign_slot_holder(local), None, "the slot is ours");
+    let dlm = squeezefs::dlm::DlmClient::new().unwrap();
+    let (refusals0, live) = data_grant::custody_quarantine_stats();
+    assert_eq!(live, 1, "one slot under quarantine");
+    let err = dlm
+        .acquire_lock(
+            &squeezefs::keys::inode_path(ino),
+            None,
+            std::time::Duration::from_millis(500),
+        )
+        .await
+        .expect_err("custody of a quarantined slot's file is refused");
+    match &err {
+        squeezefs::error::SqueezefsError::Refused { errno, msg } => {
+            assert_eq!(*errno, libc::EAGAIN, "{err:?}");
+            assert!(msg.contains("quarantined"), "{msg}");
+        }
+        other => panic!("the quarantine's refusal is typed EAGAIN: {other:?}"),
+    }
+    assert!(data_grant::custody_quarantine_stats().0 > refusals0);
+    assert!(
+        squeezefs::meta_backend::kv::alloc_lease::unix_now_ms() < rec.ts_ms + t_self_ms,
+        "premise: the refusal happened inside T_self of the record"
+    );
+    // Then granted — once T_self has elapsed since the record.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let lease = loop {
+        match dlm
+            .acquire_lock(
+                &squeezefs::keys::inode_path(ino),
+                None,
+                std::time::Duration::from_millis(500),
+            )
+            .await
+        {
+            Ok(lease) => break lease,
+            Err(squeezefs::error::SqueezefsError::Refused { errno, .. })
+                if errno == libc::EAGAIN =>
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the quarantine never lifted"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(other) => panic!("{other:?}"),
+        }
+    };
+    assert!(lease.is_held().await);
+    assert!(
+        squeezefs::meta_backend::kv::alloc_lease::unix_now_ms() >= rec.ts_ms + t_self_ms,
+        "granted no earlier than T_self past the record"
+    );
+    assert_eq!(
+        data_grant::custody_quarantine_stats().1,
+        0,
+        "the quarantine expired"
+    );
+    drop(lease);
+    data_grant::disarm_slot_custody().await;
+    data_grant::uninstall_custody_owner();
     assert_eq!(
         page_state(&uris[0], &vol, 1).await,
         Some(AppenderState::Recovered)

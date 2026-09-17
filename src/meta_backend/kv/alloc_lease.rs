@@ -79,7 +79,12 @@ const DEAD_MEMBER_LEN_V1: usize = 1 + 8 + 8;
 /// PR 10's image appends the victim's registrant key (the preempt's
 /// input); a v1 image decodes with key 0 — the record is dark, but the
 /// decoder is total over both shapes.
-const DEAD_MEMBER_LEN: usize = DEAD_MEMBER_LEN_V1 + 8;
+const DEAD_MEMBER_LEN_V2: usize = DEAD_MEMBER_LEN_V1 + 8;
+/// PR 10 review round 7 (Issue 34) appends the RECORDER class — one
+/// byte, `1` = an EARLY attestation (`squeezefs appender clear`, PR 8's
+/// same-node takeover) that carries no lease-ordering guarantee; a v1 /
+/// v2 image decodes as the plane's own record (`early = false`).
+const DEAD_MEMBER_LEN: usize = DEAD_MEMBER_LEN_V2 + 1;
 const RECOVERED_LEN: usize = 1 + 8 + 8;
 
 /// The tree-0 key of data volume `vol_tag`'s allocation lease.
@@ -279,6 +284,14 @@ pub struct DeadMemberRecord {
     /// the recovering manager PREEMPTS on the volume's namespace before it
     /// reads the ring (design-symmetric-metadata §5.9; PR 10).
     pub pr_key: u64,
+    /// An EARLY attestation (PR 10 review round 7, Issue 34): the record
+    /// was written by `squeezefs appender clear` or PR 8's same-node
+    /// takeover — recorders that can run INSIDE a surviving custody
+    /// writer's `T_self` (the plane's own recorders, the S6 eviction and
+    /// the grace deadline, cannot: `T_self < T_owner`). The recovery
+    /// QUARANTINES fresh custody grants on the recovered slots' files
+    /// until `ts_ms + T_self` for such a record.
+    pub early: bool,
 }
 
 impl DeadMemberRecord {
@@ -288,17 +301,19 @@ impl DeadMemberRecord {
         out.extend_from_slice(&self.epoch.to_le_bytes());
         out.extend_from_slice(&self.ts_ms.to_le_bytes());
         out.extend_from_slice(&self.pr_key.to_le_bytes());
+        out.push(u8::from(self.early));
         out
     }
 
     pub fn decode(value: &[u8]) -> Result<Self, KvError> {
-        let keyed = match value.len() {
-            DEAD_MEMBER_LEN_V1 => false,
-            DEAD_MEMBER_LEN => true,
+        let (keyed, classed) = match value.len() {
+            DEAD_MEMBER_LEN_V1 => (false, false),
+            DEAD_MEMBER_LEN_V2 => (true, false),
+            DEAD_MEMBER_LEN => (true, true),
             _ => {
                 return Err(KvError::Corrupt(format!(
-                    "dead_member record must be {DEAD_MEMBER_LEN_V1} or {DEAD_MEMBER_LEN} bytes \
-                     at version {ALLOC_LEASE_VERSION}, got {} bytes",
+                    "dead_member record must be {DEAD_MEMBER_LEN_V1}, {DEAD_MEMBER_LEN_V2} or \
+                     {DEAD_MEMBER_LEN} bytes at version {ALLOC_LEASE_VERSION}, got {} bytes",
                     value.len()
                 )))
             }
@@ -309,10 +324,21 @@ impl DeadMemberRecord {
                 value[0]
             )));
         }
+        let early = match (classed, value.get(25)) {
+            (true, Some(0)) => false,
+            (true, Some(1)) => true,
+            (true, Some(other)) => {
+                return Err(KvError::Corrupt(format!(
+                    "dead_member record carries recorder class {other}, expected 0 or 1"
+                )))
+            }
+            _ => false,
+        };
         Ok(Self {
             epoch: le64(value, 1),
             ts_ms: le64(value, 9),
             pr_key: if keyed { le64(value, 17) } else { 0 },
+            early,
         })
     }
 }
@@ -1458,7 +1484,10 @@ impl KvMetaBackend {
         member: AppenderIdentity,
         epoch: u64,
     ) -> Result<bool, KvError> {
-        self.record_death_with_key(member, epoch, 0).await
+        // The same-node takeover is an EARLY recorder (Issue 34): the D0
+        // flock proves the predecessor PROCESS dead, not that its custody
+        // writers' `T_self` has elapsed.
+        self.record_death_classed(member, epoch, 0, true).await
     }
 
     /// [`Self::record_death`] carrying the dead member's registrant key
@@ -1471,6 +1500,20 @@ impl KvMetaBackend {
         epoch: u64,
         pr_key: u64,
     ) -> Result<bool, KvError> {
+        self.record_death_classed(member, epoch, pr_key, false)
+            .await
+    }
+
+    /// The ONE writer: `early` classes the recorder (Issue 34 — the
+    /// plane's own recorders write `false`; `squeezefs appender clear`
+    /// and the same-node takeover `true`).
+    pub(crate) async fn record_death_classed(
+        &self,
+        member: AppenderIdentity,
+        epoch: u64,
+        pr_key: u64,
+        early: bool,
+    ) -> Result<bool, KvError> {
         let set = self.manager_gate(false)?;
         if self.dead_member_record(&member).await?.is_some() {
             set.verbs.replays.fetch_add(1, Ordering::Relaxed);
@@ -1480,6 +1523,7 @@ impl KvMetaBackend {
             epoch,
             ts_ms: unix_now_ms(),
             pr_key,
+            early,
         };
         // PARKING admission (review round 1, Issue 5): a full ring 0 parks
         // the write until the cadence drains it — never a `Try` refusal

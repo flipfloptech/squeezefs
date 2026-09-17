@@ -2101,6 +2101,7 @@ proptest! {
         refs in prop::collection::vec((any::<u16>(), 0u64..(1 << 40), 1u64..(1 << 30)), 0..8),
         epoch in any::<u64>(),
         ts in any::<u64>(),
+        early in any::<bool>(),
     ) {
         use squeezefs::meta_backend::kv::alloc_lease::{
             AllocLeaseRecord, DeadMemberRecord, RecoveredRecord,
@@ -2122,13 +2123,28 @@ proptest! {
         future[0] = 2;
         prop_assert!(AllocLeaseRecord::decode(&future).is_err());
         prop_assert!(AllocLeaseRecord::decode(&img[..img.len() - 1]).is_err());
-        // PR 10: the record carries the victim's registrant key; a PR-8
-        // image (no key) decodes with key 0 — total over both lengths.
-        let d = DeadMemberRecord { epoch, ts_ms: ts, pr_key: term };
+        // PR 10: the record carries the victim's registrant key and (round
+        // 7, Issue 34) the RECORDER class; a PR-8 image (no key) decodes
+        // with key 0 and a round-1..6 image (no class) as the plane's own
+        // record — total over the three lengths, a class byte outside 0/1
+        // refused.
+        let d = DeadMemberRecord { epoch, ts_ms: ts, pr_key: term, early };
         prop_assert_eq!(DeadMemberRecord::decode(&d.encode()).expect("decodes"), d);
         let v1 = &d.encode()[..17];
         let decoded_v1 = DeadMemberRecord::decode(v1).expect("a v1 image decodes");
-        prop_assert_eq!((decoded_v1.epoch, decoded_v1.ts_ms, decoded_v1.pr_key), (epoch, ts, 0));
+        prop_assert_eq!(
+            (decoded_v1.epoch, decoded_v1.ts_ms, decoded_v1.pr_key, decoded_v1.early),
+            (epoch, ts, 0, false)
+        );
+        let v2 = &d.encode()[..25];
+        let decoded_v2 = DeadMemberRecord::decode(v2).expect("a v2 image decodes");
+        prop_assert_eq!(
+            (decoded_v2.epoch, decoded_v2.ts_ms, decoded_v2.pr_key, decoded_v2.early),
+            (epoch, ts, term, false)
+        );
+        let mut poisoned = d.encode();
+        poisoned[25] = 2;
+        prop_assert!(DeadMemberRecord::decode(&poisoned).is_err());
         prop_assert!(DeadMemberRecord::decode(&d.encode()[..16]).is_err());
         let r = RecoveredRecord { by_term: term, ts_ms: ts };
         prop_assert_eq!(RecoveredRecord::decode(&r.encode()).expect("decodes"), r);

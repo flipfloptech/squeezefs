@@ -1801,6 +1801,30 @@ impl KvMetaBackend {
         // slot's file was refused as a foreign home until the volume's next
         // grant or release republished the owners.
         self.publish_slot_owners(set, &plane);
+        // The death-path custody QUARANTINE (review round 7, Issue 34): an
+        // EARLY record — `appender clear`, the same-node takeover — can be
+        // written inside a surviving custody writer's `T_self` (the plane's
+        // own recorders cannot: `T_self < T_owner`), so this arbiter grants
+        // nothing fresh on the recovered slots' files until `ts_ms + T_self`
+        // — the S7 dead-epoch quarantine's shape, per slot. Idempotent
+        // across a re-run (the deadline is the record's).
+        if dead.early {
+            let until = dead
+                .ts_ms
+                .saturating_add(crate::data_grant::custody_quarantine_t_self_ms());
+            for (slot, _, _) in &released {
+                crate::data_grant::quarantine_slot_custody(self.volume_uuid(), *slot, until);
+            }
+            if !released.is_empty() {
+                log::warn!(
+                    "meta volume {}: appender {id}'s death record is an EARLY attestation — \
+                     fresh custody grants on its {} recovered slot(s) are quarantined until \
+                     Unix ms {until} (the dead holder's writers' T_self)",
+                    self.path.display(),
+                    released.len()
+                );
+            }
+        }
         // The UNCLAIMED remainder: the page's runs MINUS every extent the
         // window's `alloc` records claimed since that page write — those
         // hold live images the trees now reach (returning one would free
@@ -2731,10 +2755,15 @@ impl KvMetaBackend {
         let window = be.window_entries_of(&page).await.unwrap_or(0);
         // The death record — on volume 0's tree 0 (this open when `path`
         // IS volume 0, a guarded open of volume 0 otherwise).
+        // The operator's attestation is an EARLY recorder (Issue 34): it
+        // may run inside a surviving custody writer's `T_self`, so the
+        // recovery quarantines fresh custody grants on the recovered slots
+        // until `ts_ms + T_self`.
         let dead = DeadMemberRecord {
             epoch: 0,
             ts_ms: crate::meta_backend::kv::alloc_lease::unix_now_ms(),
             pr_key: 0,
+            early: true,
         };
         let death_put = (
             journal::tag_for(record::TREE_CONTROL, 0),

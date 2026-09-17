@@ -1133,6 +1133,20 @@ impl TokenHolderPlane {
                 ),
             };
         }
+        // The death-path custody quarantine (PR 10, Issue 34): a slot
+        // recovered from an EARLY death record grants nothing fresh until
+        // the dead holder's writers' `T_self` has elapsed since the record
+        // — the same retryable class as the handover's deferral.
+        if let Some(remaining) = crate::data_grant::custody_quarantine_remaining(ino) {
+            return TokenReply::CustodyRefused {
+                status: crate::data_grant::CUSTODY_DEFERRED,
+                reason: format!(
+                    "inode_{ino}'s slot was recovered from an early death record — its custody \
+                     is quarantined for another {remaining:?} (the dead holder's writers' \
+                     T_self); retry"
+                ),
+            };
+        }
         let frame = crate::data_grant::AcquireFrame {
             schema: crate::data_grant::CUSTODY_SCHEMA,
             client: client.to_string(),

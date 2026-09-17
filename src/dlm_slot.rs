@@ -365,6 +365,25 @@ impl SlotLockManager {
                 crate::data_grant::HolderAcquire::NowLocal => {}
             }
         }
+        // The death-path custody quarantine (symmetric PR 10, Issue 34):
+        // this mount is the arbiter of an object whose slot it recovered
+        // from an EARLY death record — the dead holder's writers may still
+        // hold its custody inside their `T_self` — so nothing fresh is
+        // granted until that has elapsed since the record. EAGAIN-class:
+        // the caller retries (the POSIX-5 ladder's budget). One map read
+        // on every mount with no quarantine.
+        if let Some(ino) = crate::dlm::ino_of_path(file_path) {
+            if let Some(remaining) = crate::data_grant::custody_quarantine_remaining(ino) {
+                return Err(SqueezefsError::refused(
+                    libc::EAGAIN,
+                    format!(
+                        "PR 10: inode_{ino}'s slot was recovered from an early death record — \
+                         its custody is quarantined for another {remaining:?} (the dead \
+                         holder's writers' T_self); retry"
+                    ),
+                ));
+            }
+        }
         let slot = lock_home_slot(file_path);
         if !is_local_slot(slot) {
             // The RPC site — and since **S9** it is a real round trip.
@@ -426,6 +445,19 @@ impl SlotLockManager {
                 home, ino, required, desired, ttl,
             )
             .await;
+        }
+        // The death-path custody quarantine (see `acquire_lock_mode`).
+        if let Some(ino) = crate::dlm::ino_of_path(file_path) {
+            if let Some(remaining) = crate::data_grant::custody_quarantine_remaining(ino) {
+                return Err(SqueezefsError::refused(
+                    libc::EAGAIN,
+                    format!(
+                        "PR 10: inode_{ino}'s slot was recovered from an early death record — \
+                         its custody is quarantined for another {remaining:?} (the dead \
+                         holder's writers' T_self); retry"
+                    ),
+                ));
+            }
         }
         let slot = lock_home_slot(file_path);
         if !is_local_slot(slot) {

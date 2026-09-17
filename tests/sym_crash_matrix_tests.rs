@@ -2362,6 +2362,7 @@ async fn two_backends_seeded(
 
 fn two_backends_teardown() {
     std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    squeezefs::meta_backend::kv::backend::TEST_FOREST_PUBLISH_DEFER.store(0, Ordering::SeqCst);
     recovery::TEST_RECOVERY_FAIL_AT_STEP.store(0, Ordering::SeqCst);
     squeezefs::meta_backend::kv::checkpoint::TEST_CHECKPOINT_HALT_BEFORE_LEDGER
         .store(false, Ordering::SeqCst);
@@ -2798,6 +2799,144 @@ async fn a_failed_recovery_with_no_re_run_leaves_no_floor_on_ring_0() {
     two_backends_teardown();
 }
 
+/// **Review round 7, Issue 32 — a LIVE foreign lessee's page root ahead of
+/// tree 0 floors nothing at the manager's open.** The manager RESTARTS
+/// over a wire lessee whose checkpoints moved its slot's root past tree
+/// 0's grant-time record (PR 12's steady state; here appender X's `Live`
+/// page at R2 over tree 0's `Leased { 1, root: R1 }`). Before the fix the
+/// open took round 2's "root ahead of tree 0 ⇒ unpublished" law for the
+/// leased slot too and floored it at the open's ledger tail; nothing can
+/// publish a leased slot's root (`publish_forest_roots` skips it by law —
+/// the lessee's page is the venue), so ring 0's tail was clamped for the
+/// mount's life: every commit past the ring's admissible window parked —
+/// the wedge. Now the slot opens at its page root PUBLISHED (the lessee's
+/// page IS its publication; its records sit in ITS ring — a ring-0 floor
+/// protects nothing), the checkpoint's floor view carries no entry for it,
+/// and after a storm in the manager's own slots ring 0's tail passes the
+/// storm's start within the cover bound; tree 0 still names R1 under the
+/// lease (the manager publishes nothing for it). The lessee's later death
+/// recovers the published-at-open tree whole (the recovery's own floors
+/// are its SMOs' and its tree-0 step's, Issue 31's hold untouched — its
+/// pin runs beside this one).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_foreign_lessees_page_root_ahead_of_tree_0_floors_nothing_at_the_managers_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let fx = two_backends(dir.path()).await;
+    // The manager's clean leave, then its restart over the device as the
+    // lessee left it: X's page LIVE at R2, tree 0 `Leased { 1, root: R1 }`.
+    shutdown(&fx.routed).await;
+    let TwoBackends {
+        uris,
+        routed,
+        vol,
+        slot,
+        dir: d,
+        x,
+        files,
+        stale_root,
+        newer_root,
+        ..
+    } = fx;
+    drop(vol);
+    drop(routed);
+    assert!(
+        newer_root.seq > stale_root.seq,
+        "premise: the page root is ahead of tree 0's"
+    );
+    // The reopen's FIRST root publication is deferred (the reserve-
+    // exhausted arm, `TEST_FOREST_PUBLISH_DEFER` — a legal cycle): before
+    // the fix the bring-up cycle's publish skipped the leased slot's
+    // record and still NOTED it published, which lifted the floor by
+    // accident on the in-process shape; a deferral keeps every floor the
+    // open took standing, which is the wire venue's steady state (the
+    // manager never publishes a leased slot's root at all).
+    squeezefs::meta_backend::kv::backend::TEST_FOREST_PUBLISH_DEFER.store(1, Ordering::SeqCst);
+    let routed = open_under_retry(&uris, &Knobs::armed())
+        .await
+        .expect("the manager reopens over the live foreign lessee's page");
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(
+        vol.slot_tree(slot).map(|t| t.root()),
+        Some(newer_root),
+        "the slot opens at the lessee's page root"
+    );
+    match tree0_state(&vol, slot).await {
+        Some(SlotState::Leased {
+            appender_id: 1,
+            root,
+            ..
+        }) => assert_eq!(
+            root, stale_root,
+            "tree 0 keeps the grant-time root under the lease"
+        ),
+        other => panic!("tree 0 leases the slot to the lessee: {other:?}"),
+    }
+    let floors = vol.test_unpublished_root_floors();
+    assert!(
+        !floors.contains_key(&slot),
+        "a slot a LIVE foreign appender leases takes no ring-0 floor at the open: {floors:?}"
+    );
+    // A storm in the manager's own slots, then the cadence: ring 0's tail
+    // passes the storm's start within the cover bound (a standing floor
+    // would hold it at the open's tail for ever).
+    let ring = vol.journal_ring().core();
+    let h0 = ring.head();
+    for i in 0..200u32 {
+        routed
+            .create(
+                ROOT_INO,
+                &format!("storm{i:04}"),
+                libc::S_IFREG | 0o644,
+                1000,
+                1000,
+            )
+            .await
+            .expect("a create in the manager's own slots");
+    }
+    let mut cleared = false;
+    for _ in 0..squeezefs::meta_backend::kv::checkpoint::COVER_CYCLES_MAX {
+        vol.checkpoint_now().await.unwrap();
+        if ring.reusable_upto() >= h0 {
+            cleared = true;
+            break;
+        }
+    }
+    assert!(
+        cleared,
+        "ring 0's tail never passed the storm's start (reusable_upto {} < head-before-storm {h0}) \
+         — a floor stands for the foreign lessee's slot: {:?}",
+        ring.reusable_upto(),
+        vol.test_unpublished_root_floors()
+    );
+    assert!(
+        vol.slot_tree(slot).is_some_and(|t| t.root() == newer_root),
+        "the lessee's tree is untouched by the manager's cadence"
+    );
+    squeezefs::meta_backend::kv::backend::TEST_FOREST_PUBLISH_DEFER.store(0, Ordering::SeqCst);
+    // The lessee's death: the published-at-open tree recovers whole (the
+    // window's records included), and nothing is left floored.
+    vol.record_death_with_key(x, 1, 0).await.unwrap();
+    let rep = recover_dead_appenders_set(&routed).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    assert!(
+        vol.test_unpublished_root_floors().is_empty(),
+        "{:?}",
+        vol.test_unpublished_root_floors()
+    );
+    assert_all_resolve(&routed, d, &files).await;
+    match tree0_state(&vol, slot).await {
+        Some(SlotState::Unleased { .. }) => {}
+        other => panic!("tree 0 after the recovery: {other:?}"),
+    }
+    shutdown(&routed).await;
+    drop(vol);
+    drop(routed);
+    fsck_clean(&uris).await;
+    two_backends_teardown();
+}
+
 /// **Review round 4, Issue 31 — the recoverer DIES inside its step-6 flush,
 /// between a cycle's SMO records and that cycle's ledger record.** In the
 /// two-backend shape the dead lessee's slot is no region of the
@@ -2919,6 +3058,19 @@ async fn a_recoverer_dying_after_its_flush_leaves_a_mount_the_next_open_admits()
         Some(fx_newer_root),
         "the page's root is installed at the open (before the replayed frees are judged)"
     );
+    // The HOLD is real across the open (review round 7, Issue 32): the
+    // slot's floor stands after the bring-up cycles — the dead recoverer's
+    // records stay in ring 0's window until the re-run publishes the root
+    // (before round 7 the bring-up's publish step lifted it by accident).
+    let hold = vol.test_unpublished_root_floors();
+    assert!(
+        hold.contains_key(&slot),
+        "the recovery hold stands for the slot at the open: {hold:?}"
+    );
+    assert!(
+        vol.journal_ring().core().reusable_upto() <= hold[&slot],
+        "ring 0's tail never passed the hold"
+    );
     // ---- The mount path's C15 arm re-runs the recovery from the durable
     // state (the stash applies first, then the dead window).
     let rep = mount_path_custody_gate(&routed).await.unwrap();
@@ -2927,6 +3079,11 @@ async fn a_recoverer_dying_after_its_flush_leaves_a_mount_the_next_open_admits()
         vol.test_recovering_structure_len(slot),
         0,
         "the stash was consumed by the re-run"
+    );
+    assert!(
+        vol.test_unpublished_root_floors().is_empty(),
+        "the re-run's tree-0 step lifted the hold: {:?}",
+        vol.test_unpublished_root_floors()
     );
     assert_all_resolve(&routed, d, &files).await;
     match tree0_state(&vol, slot).await {

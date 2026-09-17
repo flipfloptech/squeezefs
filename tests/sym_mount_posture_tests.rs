@@ -189,6 +189,33 @@ async fn the_retired_posture_knobs_refuse_only_beside_the_plane_naming_the_succe
     std::env::remove_var("SQUEEZEFS_MULTI_WRITER");
     std::env::remove_var("SQUEEZEFS_MW_ROLE");
     assert!(squeezefs::sym_join::retired_knob_refusal().is_none());
+    // The BOOL knob at an OFF spelling asks for nothing — the knob law reads
+    // `0` / `false` / `no` / `off` as DISABLED, i.e. absent (a fleet env that
+    // writes the shipped default out is not a posture declaration; review
+    // round 1, Issue 19). Every ON spelling is the retired spelling.
+    for off in ["0", "false", "no", "OFF", " off "] {
+        std::env::set_var("SQUEEZEFS_MULTI_WRITER", off);
+        assert!(
+            squeezefs::sym_join::retired_knob_refusal().is_none(),
+            "SQUEEZEFS_MULTI_WRITER={off:?} beside the plane is the absent knob"
+        );
+    }
+    for on in ["1", "true", "yes", "ON"] {
+        std::env::set_var("SQUEEZEFS_MULTI_WRITER", on);
+        let refusal = squeezefs::sym_join::retired_knob_refusal()
+            .unwrap_or_else(|| panic!("SQUEEZEFS_MULTI_WRITER={on:?} beside the plane refuses"));
+        assert!(
+            refusal.contains("OFF spelling"),
+            "the refusal says the OFF spelling is admitted, so the operator reads a law, not a \
+             bug: {refusal}"
+        );
+    }
+    std::env::remove_var("SQUEEZEFS_MULTI_WRITER");
+    // The ROLE enum has no off spelling: its default word `authority` is a
+    // role, and there are no roles under the plane.
+    std::env::set_var("SQUEEZEFS_MW_ROLE", "authority");
+    assert!(squeezefs::sym_join::retired_knob_refusal().is_some());
+    std::env::remove_var("SQUEEZEFS_MW_ROLE");
     // `SQUEEZEFS_MW_BIND` is NOT retired: every writer serves, and the
     // bind is where (§6.1 retires the four, never the bind).
     std::env::remove_var("SQUEEZEFS_MW_AUTHORITY");

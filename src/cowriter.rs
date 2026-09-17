@@ -1841,19 +1841,34 @@ pub async fn ship_displaced_frees(
         };
     }
 
-    let Some(client) = crate::data_grant::custody_client() else {
-        let blocks: u64 = groups.iter().map(|g| g.entries.len() as u64).sum();
-        crate::meta_ship::publish::note_free_ship_failure(blocks);
-        let msg = format!(
-            "S9: {} displaced-block free(s) cannot ship — this co-writer holds no custody \
-             client, so there is no lease epoch to present and no authority to execute the \
-             ladder. Nothing moved locally (leak-safe: the offsets are durably unreferenced and \
-             the authority's next derivation returns them); arm the co-writer mount, which \
-             installs the client",
-            blocks
-        );
-        log::error!("{msg}");
-        return Err(SqueezefsError::InvalidOperation(msg));
+    // The lease the free presents: the co-writer's set-authority client, or
+    // (symmetric PR 12b) a joined appender's custody client at the data
+    // volume's HOLDER — PR 9's per-holder arm, dialed on demand for the
+    // free target the grant arm named.
+    let client = match crate::data_grant::custody_client() {
+        Some(c) => c,
+        None => {
+            let target = groups
+                .iter()
+                .find_map(|g| crate::block_grant::free_target_for(g.vol_tag));
+            match target {
+                Some(t) => crate::data_grant::slot_holder_client(&t).await?,
+                None => {
+                    let blocks: u64 = groups.iter().map(|g| g.entries.len() as u64).sum();
+                    crate::meta_ship::publish::note_free_ship_failure(blocks);
+                    let msg = format!(
+                        "S9: {} displaced-block free(s) cannot ship — this co-writer holds no \
+                         custody client, so there is no lease epoch to present and no authority \
+                         to execute the ladder. Nothing moved locally (leak-safe: the offsets are \
+                         durably unreferenced and the authority's next derivation returns them); \
+                         arm the co-writer mount, which installs the client",
+                        blocks
+                    );
+                    log::error!("{msg}");
+                    return Err(SqueezefsError::InvalidOperation(msg));
+                }
+            }
+        }
     };
     let endpoint = client.endpoint().to_string();
 

@@ -3515,6 +3515,51 @@ pub fn owner_claim_identity(incarnation: &str) -> String {
     }
 }
 
+/// **The JOINED appender's membership** (symmetric PR 12b — the join
+/// ladder's rung 3 on a non-manager RW mount): a WRITER member of the
+/// manager's shard, joined against the rendezvous record the manager's
+/// own arm wrote, under this node's durable member id (the identity its
+/// appender page carries — `cowriter::node_member_id`) and the registrant
+/// key rung 4 registered. Its lease is the liveness the death ledger
+/// reads (the S6 eviction records its death), its `T_self` action the
+/// PARK (PR 8), its renewal grant the slot-lease carriage's vehicle. `Ok
+/// (None)` = no manager serves a plane on this set (refused by the
+/// ladder, which cannot run a writer nobody can evict).
+pub async fn arm_joined_member(
+    meta: &Arc<crate::meta_backend::RoutedMetaBackend>,
+    on_purge: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> Result<Option<MembershipArm>> {
+    let Some(first) = meta.volumes.first() else {
+        return Ok(None);
+    };
+    let Some(secret) = cluster_secret(first).await else {
+        return Ok(None);
+    };
+    let node_id = crate::cowriter::node_member_id()?;
+    let volumes = rendezvous_volumes(meta);
+    let mut best: Option<(OwnerRecord, std::sync::Weak<KvMetaBackend>)> = None;
+    for be in &volumes {
+        if let Some(rec) = read_owner_record(be).await {
+            if best.as_ref().is_none_or(|(b, _)| rec.term > b.term) {
+                best = Some((rec, Arc::downgrade(be)));
+            }
+        }
+    }
+    let Some((rec, home)) = best else {
+        return Ok(None);
+    };
+    join_member_on(
+        &rec,
+        secret,
+        &node_id,
+        MemberRole::Writer,
+        crate::data_custody::live_wero_key().unwrap_or(0),
+        on_purge,
+        Some(home),
+    )
+    .await
+}
+
 async fn arm_member(
     volumes: &[Arc<KvMetaBackend>],
     secret: Vec<u8>,

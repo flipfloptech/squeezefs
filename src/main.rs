@@ -6453,6 +6453,25 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
 
+            // Symmetric PR 12b — the join ladder's TERMINAL decision
+            // (design-symmetric-metadata §7.3): under the plane, a set with
+            // a LIVE manager is JOINED (rungs 5–6 over the wire, the
+            // joined-appender door — no flock, no claim) instead of
+            // claimed; with none this mount walks the D0 ladder and becomes
+            // the manager. Two mounts racing for an unclaimed set: the D0
+            // loser re-reads the target and joins the winner. `None` on
+            // every unarmed process — the shipped open exactly.
+            let mut joined_admission = if reader_mount || mw_client_mount {
+                None
+            } else {
+                match squeezefs::meta_backend::symmetric_join_target(&meta_lvs).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("\x1b[91mERROR\x1b[0m mount refused: {e}");
+                        return Err(e.into());
+                    }
+                }
+            };
             let routed_meta_backend = match if reader_mount {
                 squeezefs::meta_backend::open_routed_meta_set_read_only(&meta_lvs).await
             } else if let Some(pre) = co_writer_preflight.as_ref() {
@@ -6461,8 +6480,31 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else if let Some(pre) = pv_preflight.as_ref() {
                 squeezefs::meta_backend::open_routed_meta_set_partial(&meta_lvs, &pre.admission)
                     .await
+            } else if let Some(adm) = joined_admission.as_ref() {
+                squeezefs::meta_backend::open_routed_meta_set_joined(&meta_lvs, adm).await
             } else {
-                squeezefs::meta_backend::open_routed_meta_set(&meta_lvs).await
+                match squeezefs::meta_backend::open_routed_meta_set(&meta_lvs).await {
+                    Ok(r) => Ok(r),
+                    Err(e) => {
+                        // The D0 loser of a race for an unclaimed armed
+                        // set: a manager now stands — join it.
+                        match squeezefs::meta_backend::symmetric_join_target(&meta_lvs).await {
+                            Ok(Some(adm)) => {
+                                log::warn!(
+                                    "symmetric join ladder: the D0 claim was refused ({e}) and a \
+                                     manager now stands — joining it as a writer"
+                                );
+                                let r = squeezefs::meta_backend::open_routed_meta_set_joined(
+                                    &meta_lvs, &adm,
+                                )
+                                .await;
+                                joined_admission = Some(adm);
+                                r
+                            }
+                            _ => Err(e),
+                        }
+                    }
+                }
             } {
                 Ok(routed) => routed,
                 Err(e) => {
@@ -6470,6 +6512,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     return Err(e.into());
                 }
             };
+            let joined_mount = joined_admission.is_some();
             for be in &routed_meta_backend.volumes {
                 // §10 mount log: format version, ledger seq chosen,
                 // replay entries/dropped/ms, free extents — plus BOTH
@@ -6598,12 +6641,20 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // would declare every gap below the cursor free over offsets its
             // peers own.
             let mut verify_block_refs_after_sweep = false;
-            if reader_mount || mw_client_mount {
+            if reader_mount || mw_client_mount || joined_mount {
+                // PR 12b: a JOINED appender mints from the holder's ranged
+                // grants and ships its terminal frees — the holder's bitmap
+                // is the free list, so its open performs ZERO by-block
+                // census reads (design-symmetric-metadata §5.5.1).
                 log::info!(
                     "{} mount: block-ownership recovery skipped entirely (this mount \
                      allocates nothing outside a granted lane and frees nothing locally; the \
                      walk's free-completing arm must never run on a snapshot view)",
-                    squeezefs::fuse_client::mount_posture().as_str()
+                    if joined_mount {
+                        "joined-appender"
+                    } else {
+                        squeezefs::fuse_client::mount_posture().as_str()
+                    }
                 );
             } else {
                 match fs_engine
@@ -6899,6 +6950,27 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     // preflight and handed to its arm, whose disarm leaves the
                     // plane.
                     None
+                } else if joined_mount {
+                    // Symmetric PR 12b — rung 3 on a JOINED appender: a
+                    // WRITER MEMBER of the manager's shard, never an owner
+                    // (the manager is the set's S6 owner; a second owner
+                    // would be a second lease plane over one set).
+                    let arm = squeezefs::membership::arm_joined_member(
+                        &routed_meta_backend,
+                        Some(membership_purge.clone()),
+                    )
+                    .await
+                    .map_err(|e| format!("membership plane refused to arm: {e}"))?;
+                    if arm.is_none() {
+                        return Err("symmetric join ladder rung 3 (membership) refuses on a \
+                                    joined appender: the manager serves no membership plane \
+                                    on this set (its own ladder arms one at `auto`; \
+                                    SQUEEZEFS_MEMBERSHIP_BIND=off on the manager is refused \
+                                    there) — a writer that cannot be SEEN cannot be EVICTED"
+                            .to_string()
+                            .into());
+                    }
+                    arm
                 } else {
                     squeezefs::membership::arm_mount_membership(
                         &routed_meta_backend,
@@ -6915,6 +6987,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // explicit bind above wins verbatim; unarmed sets are untouched.
             let symmetric_set = !reader_mount
                 && !mw_client_mount
+                && !joined_mount
                 && squeezefs::sym_join::set_armed(&routed_meta_backend);
             if symmetric_set && membership_arm.is_none() {
                 membership_arm = squeezefs::sym_join::arm_membership_shard(
@@ -6957,7 +7030,22 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // (rung 7) — with no role knob (`SQUEEZEFS_MULTI_WRITER` and its
             // siblings are RETIRED here, refused at startup). Unarmed sets
             // take the declared arm below, byte-identical.
-            let multi_writer_arm = if symmetric_set {
+            let multi_writer_arm = if joined_mount {
+                // PR 12b: the same planes on a JOINED appender — never the
+                // manager verbs — and the listener published through the
+                // manager into this mount's claim-set entry.
+                Some(
+                    squeezefs::sym_join::arm_joined(
+                        &routed_meta_backend,
+                        &data_lv_paths,
+                        Some(mw_quarantine),
+                        Some(&fs_engine.router.backend_router),
+                    )
+                    .await
+                    .map_err(|e| format!("symmetric join ladder (joined appender) refused: {e}"))?
+                    .0,
+                )
+            } else if symmetric_set {
                 squeezefs::sym_join::arm(
                     &routed_meta_backend,
                     &data_lv_paths,
@@ -7010,19 +7098,25 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // volume this mount manages is recovered, an unledgered
             // `Recovering` page refuses the mount naming `appender clear`,
             // and the ledger poll is spawned. Inert on an unarmed mount.
-            let recovered =
-                squeezefs::meta_backend::kv::backend::recovery::arm(&routed_meta_backend)
-                    .await
-                    .map_err(|e| {
-                        format!("dead-appender recovery at the mount path refused: {e}")
-                    })?;
-            if recovered.recovered() > 0 || recovered.regions_released > 0 {
-                log::warn!(
-                    "symmetric metadata: the mount path recovered {} dead appender region(s) and \
-                     released {} recovered region(s) before serving (C15)",
-                    recovered.recovered(),
-                    recovered.regions_released
-                );
+            // PR 12b: the driver is the MANAGER's (the ledger's poll, the
+            // C15 gate, the death-record retirement are control writes on
+            // volume 0); a joined appender's death is recorded by the S6
+            // owner it is a member of and recovered by that manager.
+            if !joined_mount {
+                let recovered =
+                    squeezefs::meta_backend::kv::backend::recovery::arm(&routed_meta_backend)
+                        .await
+                        .map_err(|e| {
+                            format!("dead-appender recovery at the mount path refused: {e}")
+                        })?;
+                if recovered.recovered() > 0 || recovered.regions_released > 0 {
+                    log::warn!(
+                        "symmetric metadata: the mount path recovered {} dead appender region(s) \
+                         and released {} recovered region(s) before serving (C15)",
+                        recovered.recovered(),
+                        recovered.regions_released
+                    );
+                }
             }
 
             // Symmetric metadata PR 8 (design-symmetric-metadata §5.5): on
@@ -7033,17 +7127,34 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // that holding — the S9 lane partition above is superseded for
             // the armed writer. `Ok(0)` and one load on every unarmed
             // mount (the shipped posture exactly).
-            let held = squeezefs::meta_backend::kv::alloc_lease::arm_symmetric_allocation(
-                &routed_meta_backend,
-                &fs_engine.router.backend_router.lane_allocators(),
-            )
-            .await
-            .map_err(|e| format!("symmetric allocation lease refused to arm: {e}"))?;
-            if held > 0 {
-                log::info!(
-                    "symmetric metadata: {held} data volume allocation lease(s) held; fresh \
-                     blocks mint from ranged grants of this mount's holdings"
+            if let Some(adm) = joined_admission.as_ref() {
+                // PR 12b: a JOINED appender holds no allocation lease — it
+                // mints from the manager's ranged grants over the wire and
+                // ships its terminal frees to the holder.
+                let armed = squeezefs::meta_backend::kv::alloc_lease::arm_joined_allocation(
+                    &fs_engine.router.backend_router.lane_allocators(),
+                    &adm.manager_endpoint,
+                    &adm.secret,
+                    adm.identity,
                 );
+                log::info!(
+                    "symmetric metadata (joined appender): {armed} data volume allocator(s) mint \
+                     from the manager's ranged block grants at {}",
+                    adm.manager_endpoint
+                );
+            } else {
+                let held = squeezefs::meta_backend::kv::alloc_lease::arm_symmetric_allocation(
+                    &routed_meta_backend,
+                    &fs_engine.router.backend_router.lane_allocators(),
+                )
+                .await
+                .map_err(|e| format!("symmetric allocation lease refused to arm: {e}"))?;
+                if held > 0 {
+                    log::info!(
+                        "symmetric metadata: {held} data volume allocation lease(s) held; fresh \
+                         blocks mint from ranged grants of this mount's holdings"
+                    );
+                }
             }
 
             // Symmetric metadata PR 9 (design-symmetric-metadata §5.5 the

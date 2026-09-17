@@ -5625,6 +5625,28 @@ pub async fn foreign_read_plane(
     Ok(Some(plane))
 }
 
+/// **A JOINED appender's custody client at `endpoint`** (symmetric PR
+/// 12b): the per-holder client PR 9's arm dials — JOINed on first touch,
+/// renewed on its own cadence — for the shipped-free path's lease epoch
+/// when this mount is no co-writer (`custody_client()` is `None`) and its
+/// data volume's allocation holder is the manager the grant arm named.
+/// Refuses `EIO` with no arm (a mount path that armed no slot custody
+/// cannot present a lease anywhere).
+pub async fn slot_holder_client(endpoint: &str) -> Result<Arc<WriteCustodyClient>> {
+    let guard = SLOT_CUSTODY.load();
+    let Some(arm) = guard.as_ref() else {
+        return Err(acquire_refusal(
+            libc::EIO,
+            format!(
+                "PR 12b: a shipped free to the allocation holder at {endpoint} needs this \
+                 mount's custody client there, and custody by the slot holder is not armed"
+            ),
+        ));
+    };
+    let (client, _plane) = arm.holder(&Arc::from(endpoint), 0).await?;
+    Ok(client)
+}
+
 /// [`slot_holder_home`] for a lock object's path form — `Some((ino,
 /// home))` only for an inode object whose custody a holder serves.
 pub fn slot_holder_home_of_path(file_path: &str) -> Option<(u64, CustodyHome)> {

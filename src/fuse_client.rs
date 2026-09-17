@@ -14046,6 +14046,65 @@ impl SqueezefsFilesystem {
                     "slot_lease_stale_entries".into(),
                     lease(&|s| s.stale_entries),
                 );
+                // Symmetric PR 12b — the Joined family (§11): a NON-manager
+                // RW mount's wire ledger, `null` per volume on the manager
+                // and on every unarmed mount. `joined_control_refusals` is
+                // must-stay-0: a control write (tree 0, the bitmap, a
+                // manager verb's executor) reached a joined appender.
+                {
+                    let joined: Vec<Option<meta_kv::backend::JoinedStats>> = self
+                        .meta_backend
+                        .as_ref()
+                        .map(|mb| mb.volumes.iter().map(|be| be.joined_stats()).collect())
+                        .unwrap_or_default();
+                    let word = |f: &dyn Fn(&meta_kv::backend::JoinedStats) -> u64| {
+                        serde_json::Value::Array(
+                            joined
+                                .iter()
+                                .map(|s| {
+                                    s.as_ref().map_or(serde_json::Value::Null, |s| f(s).into())
+                                })
+                                .collect(),
+                        )
+                    };
+                    metrics.insert(
+                        "joined_appender_id".into(),
+                        word(&|s| u64::from(s.appender_id)),
+                    );
+                    metrics.insert(
+                        "joined_manager_endpoint".into(),
+                        serde_json::Value::Array(
+                            joined
+                                .iter()
+                                .map(|s| {
+                                    s.as_ref().map_or(serde_json::Value::Null, |s| {
+                                        s.manager_endpoint.clone().into()
+                                    })
+                                })
+                                .collect(),
+                        ),
+                    );
+                    metrics.insert("joined_wire_verbs".into(), word(&|s| s.wire_verbs));
+                    metrics.insert("joined_wire_acquires".into(), word(&|s| s.wire_acquires));
+                    metrics.insert("joined_wire_releases".into(), word(&|s| s.wire_releases));
+                    metrics.insert(
+                        "joined_wire_extent_grants".into(),
+                        word(&|s| s.wire_extent_grants),
+                    );
+                    metrics.insert(
+                        "joined_wire_extent_returns".into(),
+                        word(&|s| s.wire_extent_returns),
+                    );
+                    metrics.insert("joined_wire_failures".into(), word(&|s| s.wire_failures));
+                    metrics.insert(
+                        "joined_control_refusals".into(),
+                        word(&|s| s.control_refusals),
+                    );
+                    metrics.insert(
+                        "joined_ring_grow_declined".into(),
+                        word(&|s| s.ring_grow_declined),
+                    );
+                }
                 // The door's ledger (review round 2, Issue 6): parks are a
                 // legal wait for a bounded handover, refusals the "ship to
                 // the holder" class (0 on a solo mount — no foreign holder

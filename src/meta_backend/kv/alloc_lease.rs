@@ -2635,6 +2635,62 @@ pub async fn arm_symmetric_allocation(
     Ok(held)
 }
 
+/// **Arm a JOINED appender's data allocation** (symmetric PR 12b — the
+/// production caller of the wire halves PR 8 built for it): for every data
+/// volume this mount writes, register its derived block count and install
+/// the grant arm with the WIRE sink (`BlockGrant` to the manager's venue —
+/// volume 0's manager holds every allocation lease in the one-shard shape
+/// this rung ships; an appender home ≠ volume 0 is 12b's owed second
+/// shard) and the wire free target (its terminal frees SHIP to the holder,
+/// which runs the ladder against the bitmap — `execute_shipped_frees`).
+/// The joiner holds no lease, seeds nothing and walks no census: the
+/// bitmap at the holder IS the free list, so a joined open performs ZERO
+/// by-block census reads (the mount path skips the ownership recovery on
+/// this posture exactly as it does on a co-writer's). Returns the
+/// allocators armed.
+pub fn arm_joined_allocation(
+    allocators: &[Arc<crate::block_allocator::BlockAllocator>],
+    manager_endpoint: &str,
+    secret: &[u8],
+    identity: AppenderIdentity,
+) -> usize {
+    let mut armed = 0usize;
+    for alloc in allocators {
+        let vol_tag = crate::meta_backend::kv::block_refs::volume_tag(alloc.volume_id());
+        let chunk = alloc.chunk_size().max(1);
+        let blocks = alloc.capacity_bytes() / chunk;
+        if blocks == 0 {
+            log::warn!(
+                "joined allocation arm: data volume '{}' reports no capacity — not armed",
+                alloc.volume_id()
+            );
+            continue;
+        }
+        register_data_volume_blocks(vol_tag, blocks);
+        let _ = ALLOCATORS.upsert_sync(vol_tag, Arc::downgrade(alloc));
+        if alloc.install_block_grant_arm(
+            vol_tag,
+            wire_block_grant_sink(
+                manager_endpoint.to_string(),
+                secret.to_vec(),
+                identity.into(),
+                0,
+                vol_tag,
+            ),
+        ) {
+            install_wire_free_target(vol_tag, manager_endpoint);
+            armed += 1;
+            log::info!(
+                "joined allocation arm: data volume '{}' ({vol_tag:#018x}, {blocks} block(s)) \
+                 mints from ranged block grants of the manager's holding at {manager_endpoint}; \
+                 its terminal frees ship there",
+                alloc.volume_id()
+            );
+        }
+    }
+    armed
+}
+
 /// One data volume's acquire-and-hold ladder on the in-process manager.
 async fn acquire_and_hold<I: Iterator<Item = u64>>(
     vol0: &Arc<KvMetaBackend>,

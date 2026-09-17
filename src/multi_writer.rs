@@ -908,13 +908,24 @@ pub(crate) async fn arm_authority_planes(
     // With NO enrolled co-writer this is lane 0 of 1 = SOLO, which installs
     // nothing at all: the authority's own allocation is then not "equivalent
     // to" the shipped path, it IS the shipped path.
-    let assignment = match derive_lane_assignment(meta, &map).await {
-        Ok(a) => a,
-        Err(e) => {
-            if let Some(hold) = wero {
-                data_custody::release_hold(hold).await;
+    // Under the ARMED symmetric plane the data-plane allocation is PR 8's
+    // ranged block grants off the per-volume bitmap — the lane partition
+    // is SUPERSEDED (design-symmetric-metadata §5.5), so the assignment is
+    // SOLO by law whatever the claim set enrolls: every joined appender is
+    // a writer member of the roster (PR 12b), and deriving a width from
+    // them would engage the lanes beside the grants on one allocator.
+    let symmetric_armed = meta.volumes.iter().any(|v| v.slot_lease_armed());
+    let assignment = if symmetric_armed {
+        crate::alloc_lane_grant::LaneAssignment::derive("", &[])?
+    } else {
+        match derive_lane_assignment(meta, &map).await {
+            Ok(a) => a,
+            Err(e) => {
+                if let Some(hold) = wero {
+                    data_custody::release_hold(hold).await;
+                }
+                return Err(e);
             }
-            return Err(e);
         }
     };
     owner.install_lane_assignment(Arc::clone(&assignment));
@@ -1092,7 +1103,16 @@ pub(crate) async fn arm_authority_planes(
     // volume), this node is those volumes' manager and serves
     // `JoinAppender` / the grants / the slot leases on this SAME listener,
     // dispatched by the frame's volume ordinal. Dark on every other mount.
-    if meta.volumes.iter().any(|v| v.slot_lease_armed()) {
+    // A JOINED appender (PR 12b) serves NO manager verb: its listener
+    // carries its slots' tokens, custody and shipped steps; the manager
+    // verbs are page 0's daemon's, and a peer dialing them here would
+    // meet `refuse_joined_control` (the must-stay-0 class) instead of the
+    // wire's own "no such verb".
+    if meta
+        .volumes
+        .iter()
+        .any(|v| v.slot_lease_armed() && !v.is_joined_appender())
+    {
         router = router.with_manager(crate::meta_ship::manager::ManagerSetService::new(
             &meta.volumes,
         ));

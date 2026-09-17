@@ -419,6 +419,162 @@ pub async fn arm(
     Ok(Some((arm, report)))
 }
 
+/// **The ladder's rungs 4 and 7 on a JOINED appender** (PR 12b — the
+/// many-writer posture): after `open_routed_meta_set_joined` walked rungs
+/// 5–6 over the wire and the mount path joined the manager's membership
+/// shard as a WRITER MEMBER (rung 3 — `membership::arm_joined_member`),
+/// this stands up the same planes `arm` does on the manager — the data
+/// WERO join (or the announced detection-grade posture), the custody
+/// owner, the publish / meta / token services on ONE listener (never the
+/// manager verbs: `arm_authority_planes` leaves them off a joiner) — then
+/// PUBLISHES the listener through the manager (`PublishEndpoint` → the
+/// joiner's claim-set entry on every volume + the manager's holder
+/// table), installs the step shipper and binds every Live appender's
+/// published endpoint. `mount_posture` reads `writer`; `manager_lease`
+/// reads `peer:<manager>`.
+pub async fn arm_joined(
+    meta: &Arc<RoutedMetaBackend>,
+    data_paths: &[PathBuf],
+    quarantine: Option<Arc<dyn crate::data_grant::CustodyQuarantine>>,
+    backend: Option<&Arc<crate::routing::BackendRouter>>,
+) -> Result<(crate::multi_writer::MultiWriterArm, JoinReport)> {
+    let mut report = JoinReport {
+        rungs: vec!["declaration", "bits"],
+        ..JoinReport::default()
+    };
+    check_bits(meta)?;
+    if crate::membership::membership_mode() != "member" {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "symmetric join ladder rung 3 (membership) refuses on a joined appender: this mount \
+             is no MEMBER of the manager's shard (membership_mode = {}) — a writer that cannot \
+             be SEEN cannot be EVICTED, and the S6 eviction is what records its death for the \
+             recovery driver (PR 10)",
+            crate::membership::membership_mode()
+        )));
+    }
+    report.rungs.push("membership");
+    let pr_capable = data_paths
+        .iter()
+        .all(|p| crate::meta_backend::reservation::resolve_for_mount(p).is_some());
+    let allow_non_pr = crate::env_knobs::bool_knob("SQUEEZEFS_SYM_ALLOW_NON_PR", false);
+    let wero = if pr_capable {
+        let paths = data_paths.to_vec();
+        let hold = squeezefs_ipc::sqz_blocking::run_blocking(move || {
+            crate::data_custody::arm_data_plane(
+                crate::data_custody::CustodyPosture::MultiWriter,
+                &paths,
+                true,
+            )
+        })
+        .await
+        .map_err(|e| {
+            SqueezefsError::InvalidOperation(format!(
+                "symmetric join ladder rung 4 (registrant) refuses on a joined appender: {e}"
+            ))
+        })?;
+        report.data_namespaces_registered = data_paths.len();
+        hold
+    } else if allow_non_pr {
+        report.detection_grade = true;
+        log::warn!(
+            "symmetric join ladder rung 4 (registrant), joined appender: {} data namespace(s) \
+             advertise no NVMe reservation support — DETECTION-GRADE under \
+             SQUEEZEFS_SYM_ALLOW_NON_PR=1 (KD-SYM-13)",
+            data_paths.len()
+        );
+        None
+    } else {
+        return Err(SqueezefsError::InvalidOperation(
+            "symmetric join ladder rung 4 (registrant) refuses on a joined appender: a data \
+             namespace advertises no NVMe reservation support (design-symmetric-metadata \
+             §5.8.1). Use a PR-capable namespace, or opt into the detection-grade lab posture \
+             with SQUEEZEFS_SYM_ALLOW_NON_PR=1"
+                .to_string(),
+        ));
+    };
+    report
+        .rungs
+        .extend(["registrant", "join_appender", "acquire_slots"]);
+    let prelude: Result<(
+        std::net::SocketAddr,
+        String,
+        Arc<crate::meta_ship::OwnerMap>,
+    )> = async {
+        let Some(bind) = crate::multi_writer::resolve_bind_public()? else {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "symmetric join ladder rung 7 (planes) refuses on a joined appender: {}=off — \
+                 every writer of a symmetric set serves its slots' tokens, custody and shipped \
+                 steps. Give it `auto` (ruling D2) or an addr:port",
+                crate::multi_writer::MW_BIND_ENV
+            )));
+        };
+        let node_id = crate::cowriter::node_member_id()?;
+        let map = crate::multi_writer::derive_symmetric_ownership(meta, &node_id).await?;
+        Ok((bind, node_id, map))
+    }
+    .await;
+    let (bind, node_id, map) = match prelude {
+        Ok(v) => v,
+        Err(e) => {
+            if let Some(hold) = wero {
+                crate::data_custody::release_hold(hold).await;
+            }
+            return Err(e);
+        }
+    };
+    let arm = crate::multi_writer::arm_authority_planes(
+        meta,
+        wero,
+        bind,
+        Vec::new(),
+        quarantine,
+        backend,
+        map,
+        node_id,
+    )
+    .await?;
+    let Some(arm) = arm else {
+        return Err(SqueezefsError::InvalidOperation(
+            "symmetric join ladder rung 7 (planes) refuses on a joined appender: the planes did \
+             not arm"
+                .to_string(),
+        ));
+    };
+    report.rungs.push("planes");
+    report.endpoint = arm.endpoint().to_string();
+    // The binding's JOINER half (§5.1.6): the listener travels to the
+    // manager, which writes it into this mount's claim-set entry and binds
+    // it in its own holder table; every other Live appender's published
+    // endpoint is bound here off the same durable state.
+    let pr_key = crate::data_custody::live_wero_key().unwrap_or(0);
+    for vol in &meta.volumes {
+        if let Err(e) = vol.joined_publish_endpoint(&report.endpoint, pr_key).await {
+            log::warn!(
+                "symmetric join ladder rung 7 (joined appender): publishing the listener {} on \
+                 {} failed ({e}) — peers resolve this holder as unbound until the next publish",
+                report.endpoint,
+                vol.device_path().display()
+            );
+        }
+    }
+    install_step_shipper(meta, &report.endpoint).await;
+    bind_live_appender_endpoints(meta).await;
+    install_report(report.clone());
+    log::warn!(
+        "SYMMETRIC WRITER JOINED as a NON-MANAGER appender (design-symmetric-metadata §7.3, PR \
+         12b): rungs {:?}; {} data namespace(s) registered{}; serving on {}",
+        report.rungs,
+        report.data_namespaces_registered,
+        if report.detection_grade {
+            " (detection-grade)"
+        } else {
+            ""
+        },
+        report.endpoint
+    );
+    Ok((arm, report))
+}
+
 /// **The holder → endpoint binding, off DURABLE state** (§5.1.6 — "the
 /// holder's identity → its endpoint from the membership census"): appender
 /// `appender_id`'s directory page names its KD-MW-2 identity, the

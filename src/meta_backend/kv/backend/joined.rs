@@ -1493,6 +1493,125 @@ impl KvMetaBackend {
         Ok(false)
     }
 
+    /// **The manager's `PublishEndpoint`** (PR 12b — the joiner's half of
+    /// the holder → endpoint binding, §5.1.6): the joined appender's
+    /// listener into ITS claim-set member entry on this volume (the id
+    /// `cowriter::node_member_id_of(node, mount slot)` — what
+    /// `sym_join::resolve_holder_endpoint` reads for its page on any mount;
+    /// the process-less form, `pid 0`, which the same-boot dead-writer
+    /// prune exempts — the entry is REPLACED by the identity's next
+    /// publish and read as unreachable while its listener is down) and
+    /// into this manager's slot holder table. Screened before any effect:
+    /// the page must be `Live` under `identity`, the endpoint a socket
+    /// address. `Ok(already)` when the same address already stood.
+    pub async fn manager_publish_endpoint(
+        &self,
+        identity: AppenderIdentity,
+        appender_id: u32,
+        endpoint: &str,
+        pr_key: u64,
+    ) -> Result<bool, KvError> {
+        use super::super::appender::read_directory;
+        let set = self.manager_gate(false)?;
+        let reject = |why: String| {
+            set.verbs.rejected.fetch_add(1, Ordering::Relaxed);
+            KvError::Rejected(format!(
+                "{}: PublishEndpoint of appender {appender_id} rejected — {why} \
+                 (manager_verb_rejected)",
+                self.path.display()
+            ))
+        };
+        if endpoint.parse::<std::net::SocketAddr>().is_err() {
+            return Err(reject(format!("{endpoint:?} is not a socket address")));
+        }
+        if set.owns_region(appender_id) {
+            return Err(reject("one of this mount's own regions".to_string()));
+        }
+        let entries = read_directory(&self.path, &self.sb).await?;
+        let page = entries
+            .iter()
+            .find(|e| e.appender_id == appender_id)
+            .and_then(|e| e.page.as_ref())
+            .filter(|p| p.state == AppenderState::Live)
+            .ok_or_else(|| reject("no Live page".to_string()))?;
+        if !page
+            .identity
+            .is_mount(identity.node_token, identity.mount_slot)
+        {
+            return Err(reject(format!(
+                "the page is Live under node {:#018x} / mount slot {:#x}, not the caller's \
+                 {:#018x} / {:#x}",
+                page.identity.node_token,
+                page.identity.mount_slot,
+                identity.node_token,
+                identity.mount_slot
+            )));
+        }
+        let member_id =
+            crate::cowriter::node_member_id_of(identity.node_token, identity.mount_slot);
+        let already = crate::membership::ClaimSet::load(self)
+            .await
+            .and_then(|s| {
+                s.members
+                    .iter()
+                    .find(|m| crate::membership::member_id_matches(&m.identity.id, &member_id))
+                    .map(|m| m.identity.endpoint.as_deref() == Some(endpoint))
+            })
+            .unwrap_or(false);
+        if !already {
+            let member = crate::membership::MemberIdentity {
+                id: member_id,
+                role: crate::membership::MemberRole::Writer,
+                pid: 0,
+                boot: String::new(),
+                endpoint: Some(endpoint.to_string()),
+                pr_key,
+            };
+            crate::membership::upsert_writer_member(self, &member, crate::dlm::durable_term())
+                .await
+                .map_err(|e| {
+                    KvError::Busy(format!(
+                        "{}: PublishEndpoint of appender {appender_id} could not write the \
+                         claim-set entry: {e}",
+                        self.path.display()
+                    ))
+                })?;
+        }
+        if let Some(plane) = set.slot_leases() {
+            plane.holders.set_endpoint(appender_id, endpoint);
+        }
+        if already {
+            set.verbs.replays.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(already)
+    }
+
+    /// The joiner's half of [`Self::manager_publish_endpoint`]: publish
+    /// this mount's listener through the manager (the join ladder's rung 7
+    /// on a joined appender) and bind it as our own in the holder table.
+    /// `Ok(already)`.
+    pub async fn joined_publish_endpoint(
+        &self,
+        endpoint: &str,
+        pr_key: u64,
+    ) -> Result<bool, KvError> {
+        let wire = Arc::clone(self.joined.get().ok_or_else(|| {
+            KvError::Corrupt(format!("{}: joined wire unset", self.path.display()))
+        })?);
+        let already = {
+            let mut c = wire.client.lock().await;
+            wire.note(
+                c.publish_endpoint(wire.identity, wire.appender_id, endpoint, pr_key)
+                    .await
+                    .map_err(|e| wire_err("PublishEndpoint", e)),
+            )?
+        };
+        if let Ok(plane) = self.joined_plane() {
+            plane.holders.set_endpoint(wire.appender_id, endpoint);
+        }
+        Ok(already)
+    }
+
     // -----------------------------------------------------------------
     // The membership carriage's member side (§5.9, §5.1.4).
     // -----------------------------------------------------------------

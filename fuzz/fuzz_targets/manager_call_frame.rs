@@ -573,6 +573,12 @@ enum ArbCall {
         appender_id: u32,
         unclaimed: Vec<(u64, u32)>,
     },
+    PublishEndpoint {
+        identity: ArbIdentity,
+        appender_id: u32,
+        endpoint: String,
+        pr_key: u64,
+    },
 }
 
 #[derive(Arbitrary, Debug, Clone, Copy)]
@@ -751,6 +757,17 @@ impl From<ArbCall> for ManagerCall {
                 appender_id,
                 unclaimed,
             },
+            ArbCall::PublishEndpoint {
+                identity,
+                appender_id,
+                endpoint,
+                pr_key,
+            } => ManagerCall::PublishEndpoint {
+                identity: identity.into(),
+                appender_id,
+                endpoint,
+                pr_key,
+            },
         }
     }
 }
@@ -841,6 +858,9 @@ enum ArbReply {
     Left {
         already: bool,
     },
+    Published {
+        already: bool,
+    },
 }
 
 impl From<ArbReply> for ManagerReply {
@@ -908,6 +928,7 @@ impl From<ArbReply> for ManagerReply {
             },
             ArbReply::Recorded { already } => ManagerReply::Recorded { already },
             ArbReply::Left { already } => ManagerReply::Left { already },
+            ArbReply::Published { already } => ManagerReply::Published { already },
         }
     }
 }

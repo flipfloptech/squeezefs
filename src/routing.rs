@@ -5027,6 +5027,23 @@ impl BackendRouter {
     /// free path's client-side resolution, `crate::cowriter::
     /// ship_displaced_frees`). `None` = unknown/offline backend, the same
     /// silent skip the local free ladder takes.
+    /// Symmetric PR 12b: does `block_key`'s terminal free SHIP to its data
+    /// volume's allocation-lease HOLDER? True on a grant-armed allocator
+    /// whose lease this process does not hold (a joined appender mints
+    /// from the holder's grants; the holder's bitmap is the free list, so
+    /// the release runs its ladder there — `execute_shipped_frees`). One
+    /// `OnceLock` read on an unarmed allocator; a holder's own frees run
+    /// the local ladder.
+    fn frees_ship_to_holder(&self, block_key: &str) -> bool {
+        self.with_allocator_for_key(block_key, |alloc, _| {
+            alloc.block_grant_vol_tag().is_some_and(|tag| {
+                crate::meta_backend::kv::alloc_lease::holding(tag).is_none()
+                    && crate::block_grant::free_target_for(tag).is_some()
+            })
+        })
+        .unwrap_or(false)
+    }
+
     pub fn allocator_for_be_id(
         &self,
         be_id: &str,
@@ -5216,7 +5233,7 @@ impl BackendRouter {
         // freed anywhere, forever). The scope check keeps the owner-side
         // executor's own ladder — which runs THROUGH this function — off
         // the ship branch (`crate::cowriter` owns both halves).
-        if crate::fuse_client::co_writer_mount()
+        if (crate::fuse_client::co_writer_mount() || self.frees_ship_to_holder(block_key))
             && !crate::cowriter::authority_accounting_scope_active()
         {
             crate::cowriter::ship_displaced_frees(self, &[block_key]).await?;
@@ -5449,7 +5466,8 @@ impl BackendRouter {
     pub async fn free_blocks(&self, block_keys: &[&str]) -> Result<()> {
         // DLM S9: the batch form ships ONE free verb per data volume
         // instead of one per displaced block (see `free_block` above).
-        if crate::fuse_client::co_writer_mount()
+        if (crate::fuse_client::co_writer_mount()
+            || block_keys.iter().any(|k| self.frees_ship_to_holder(k)))
             && !crate::cowriter::authority_accounting_scope_active()
         {
             let _ = crate::cowriter::ship_displaced_frees(self, block_keys).await;

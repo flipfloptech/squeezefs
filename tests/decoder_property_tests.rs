@@ -1727,7 +1727,7 @@ fn arb_pr8_call() -> impl Strategy<Value = ManagerCall> {
                 pr_key,
             }
         }),
-        // PR 12b: the joined appender's leave.
+        // PR 12b: the joined appender's leave and its endpoint publication.
         (arb_wire_identity(), any::<u32>(), arb_runs()).prop_map(
             |(identity, appender_id, unclaimed)| ManagerCall::LeaveAppender {
                 identity,
@@ -1735,6 +1735,20 @@ fn arb_pr8_call() -> impl Strategy<Value = ManagerCall> {
                 unclaimed,
             }
         ),
+        (
+            arb_wire_identity(),
+            any::<u32>(),
+            "[ -~]{0,64}",
+            any::<u64>(),
+        )
+            .prop_map(|(identity, appender_id, endpoint, pr_key)| {
+                ManagerCall::PublishEndpoint {
+                    identity,
+                    appender_id,
+                    endpoint,
+                    pr_key,
+                }
+            }),
     ]
 }
 
@@ -1834,6 +1848,7 @@ fn arb_pr8_reply() -> impl Strategy<Value = ManagerReply> {
             }),
         any::<bool>().prop_map(|already| ManagerReply::Recorded { already }),
         any::<bool>().prop_map(|already| ManagerReply::Left { already }),
+        any::<bool>().prop_map(|already| ManagerReply::Published { already }),
     ]
 }
 

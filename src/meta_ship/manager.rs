@@ -288,10 +288,25 @@ pub enum ManagerCall {
         appender_id: u32,
         unclaimed: Vec<WireRun>,
     },
+    /// **`PublishEndpoint`** (PR 12b — the holder → endpoint binding's
+    /// JOINER half, §5.1.6): the joined appender's S8 listener, written by
+    /// the manager into the joiner's claim-set member entry on every
+    /// volume it appends to (`sym_join::resolve_holder_endpoint` reads it
+    /// on any mount — a reader's per-slot planes, a peer's shipped steps)
+    /// and bound into the manager's own slot holder table. Screened: the
+    /// page of `appender_id` must be `Live` under `identity`, the endpoint
+    /// a socket address. Idempotent (`Published { already }`).
+    PublishEndpoint {
+        identity: WireIdentity,
+        appender_id: u32,
+        endpoint: String,
+        pr_key: u64,
+    },
 }
 
-/// PR 12b's documented verb code (the wire encodes the declaration index).
+/// PR 12b's documented verb codes (the wire encodes the declaration index).
 pub const VERB_CODE_LEAVE_APPENDER: u8 = 0xB0;
+pub const VERB_CODE_PUBLISH_ENDPOINT: u8 = 0xB1;
 
 /// PR 8's documented verb codes (the range the level-4 coordination
 /// assigned; the wire encodes the enum's declaration index — these are the
@@ -374,6 +389,7 @@ impl ManagerCall {
             Self::RecordRecovered { .. } => "record_recovered",
             Self::RecordDeath { .. } => "record_death",
             Self::LeaveAppender { .. } => "leave_appender",
+            Self::PublishEndpoint { .. } => "publish_endpoint",
         }
     }
 }
@@ -521,6 +537,11 @@ pub enum ManagerReply {
     /// `LeaveAppender` (PR 12b): the page is `Free`, the ring and the
     /// remainder returned (`already` = it was — a replay).
     Left {
+        already: bool,
+    },
+    /// `PublishEndpoint` (PR 12b): the joiner's listener is in its
+    /// claim-set entry (`already` = the same address stood — a replay).
+    Published {
         already: bool,
     },
 }
@@ -1041,6 +1062,16 @@ impl ManagerService {
                     )
                     .await
                     .map(|already| ManagerReply::Left { already }),
+                ManagerCall::PublishEndpoint {
+                    identity,
+                    appender_id,
+                    endpoint,
+                    pr_key,
+                } => self
+                    .volume
+                    .manager_publish_endpoint((*identity).into(), *appender_id, endpoint, *pr_key)
+                    .await
+                    .map(|already| ManagerReply::Published { already }),
             };
         let (reply, status) = match served {
             Ok(reply) => (reply, STATUS_OK),
@@ -1714,6 +1745,31 @@ impl ManagerClient {
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "LeaveAppender answered {other:?}"
+            ))),
+        }
+    }
+
+    /// `PublishEndpoint` (PR 12b) — `Ok(already)`.
+    pub async fn publish_endpoint(
+        &mut self,
+        identity: AppenderIdentity,
+        appender_id: u32,
+        endpoint: &str,
+        pr_key: u64,
+    ) -> Result<bool> {
+        match self
+            .call(ManagerCall::PublishEndpoint {
+                identity: identity.into(),
+                appender_id,
+                endpoint: endpoint.to_string(),
+                pr_key,
+            })
+            .await?
+        {
+            ManagerReply::Published { already } => Ok(already),
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Err(SqueezefsError::InvalidOperation(format!(
+                "PublishEndpoint answered {other:?}"
             ))),
         }
     }

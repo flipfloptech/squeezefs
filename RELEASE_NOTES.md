@@ -74,6 +74,23 @@ stands as history.
   its retirement), the `nvmeof connect`/`disconnect` initiator half, the
   ledger's §6.4 laws, and every nvmet share verb.
 
+**S9 multi-writer authority: a clean unmount now releases its data-namespace
+WERO registration before exit.** (Symmetric PR 12, found by the fidelity
+tier's new `sym-join-ladder` leg on the real nvmet target; record
+[.benchmarks/2026-09-16-sym-pr12-mount-posture.md](.benchmarks/2026-09-16-sym-pr12-mount-posture.md).)
+Every clean unmount of a `SQUEEZEFS_MULTI_WRITER=1` authority left its OWN
+registrant key on every data namespace: the custody sweep kept a reference
+to the WERO hold alive across its 10 s cadence, and the release ioctl runs
+in the hold's drop — which died with the process. `nvme resv-report` listed
+the departed writer's key until the next mount's register ladder recovered
+it as own-stale; **no fence was lost** (the hold's reservation went with the
+process's association; the residue was the symptom), but zero residue after
+a clean leave is the fidelity tier's law and the shipped binary broke it.
+The sweep now observes the hold through a weak reference and the disarm's
+own release is the last one. Contracts: `dlm_multi_writer_tests`
+(`a_shipped_authoritys_clean_leave_releases_its_data_namespace_wero_before_returning`,
+the flat layout) and `sym_mount_posture_tests` (the armed layout).
+
 ---
 
 # SqueezeFS 1.2.4

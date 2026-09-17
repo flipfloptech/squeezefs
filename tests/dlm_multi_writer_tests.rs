@@ -1480,3 +1480,102 @@ async fn a_revoke_during_a_parked_acquire_never_commits_custody() {
     assert_eq!(owner.release("node-c", &[regrant.grant_id]), 1);
     assert_eq!(owner.held(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// The SHIPPED authority's clean leave releases its data-namespace WERO
+// (symmetric PR 12, review round 1 Issue 7 — the FLAT-layout pin of a
+// shipped S9 defect).
+// ---------------------------------------------------------------------------
+
+/// A `SQUEEZEFS_MULTI_WRITER=1` authority — the SHIPPED S9 arm on a flat
+/// multi-writer-class volume, no forest, no symmetric knob — that `disarm`s
+/// leaves ZERO residue on its data namespaces: the reservation released and
+/// its registrant key gone BEFORE `disarm` returns. Before `343f8750` the
+/// custody sweep (`spawn_cadence`) held a CLONE of the `WeroHold` across its
+/// 10 s cadence sleep and the release ioctl lives in the hold's drop, so the
+/// arm's own release was never the last reference and the drop died with
+/// the process — every clean unmount of a shipped multi-writer authority
+/// left its key registered until the next mount's register ladder recovered
+/// it as own-stale. RED on `964749be` (the pre-fix `disarm`): `ns.holder()`
+/// still `Some` and `live_wero_key()` still `Some` after `disarm`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shipped_authoritys_clean_leave_releases_its_data_namespace_wero_before_returning() {
+    use squeezefs::meta_backend::reservation::{
+        clear_override, install_override, FakeNvmeNamespace, FakeReservationClient,
+        ReservationClient,
+    };
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    // The shipped multi-writer-class volume (the nine bits), no bit 17.
+    let (routed, _paths) = sandbox_stamped(dir.path(), "leave", 1, true).await;
+    let enroll = serde_json::json!({ "secret": cw::hex_encode(SECRET) });
+    routed.volumes[0]
+        .setxattr_internal(
+            1,
+            squeezefs::job_wire::JOB_ENROLL_XATTR,
+            enroll.to_string().as_bytes(),
+        )
+        .await
+        .expect("write the enroll record");
+    let data = make_file(dir.path(), "leave-data", 1 << 20);
+    let ns = FakeNvmeNamespace::new();
+    install_override(
+        &data,
+        FakeReservationClient::new(ns.clone(), "nqn-s9-leave", "host-s9-leave"),
+    );
+    // The S9 arm's rung 4 needs the membership plane (an unseeable
+    // co-writer is an unevictable one).
+    let membership = squeezefs::membership::arm_mount_membership_at(
+        &routed,
+        false,
+        None,
+        squeezefs::membership::MembershipBind::Auto,
+    )
+    .await
+    .expect("membership arms")
+    .expect("an owner arm");
+    std::env::set_var("SQUEEZEFS_MULTI_WRITER", "1");
+    std::env::set_var("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+
+    let arm = squeezefs::multi_writer::arm_multi_writer(
+        &routed,
+        std::slice::from_ref(&data),
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("the shipped authority arms on a PR-capable data namespace")
+    .expect("armed");
+    assert!(ns.holder().is_some(), "the WERO hold is taken at the arm");
+    assert!(data_custody::live_wero_key().is_some());
+
+    arm.disarm().await;
+    assert!(
+        ns.holder().is_none(),
+        "the clean leave releases the data namespace's reservation BEFORE disarm returns — \
+         not at process exit"
+    );
+    assert_eq!(
+        data_custody::live_wero_key(),
+        None,
+        "no live hold after the leave"
+    );
+    let report = FakeReservationClient::new(ns.clone(), "nqn-s9-probe", "probe")
+        .report()
+        .expect("report");
+    assert_eq!(
+        report.regctl(),
+        0,
+        "the registrant key went with the release — zero residue on the namespace"
+    );
+
+    std::env::remove_var("SQUEEZEFS_MULTI_WRITER");
+    std::env::remove_var("SQUEEZEFS_MW_BIND");
+    membership.disarm().await;
+    squeezefs::membership::uninstall();
+    clear_override(&data);
+    shutdown(&routed).await;
+}

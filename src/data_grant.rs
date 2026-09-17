@@ -6323,6 +6323,11 @@ pub async fn arm_mount_slot_custody(
         crate::meta_ship::token_plane::MountRecallSink::new(router.clone(), volume)
             as Arc<dyn crate::meta_ship::token_plane::RecallDataSink>
     });
-    arm_slot_custody(routed, &node_id, secret, 0, sink_for);
+    // PR 12 (PR 9's deviation 6): the registrant key a holder's JOIN
+    // carries is the one the join ladder's rung 4 registered on the data
+    // namespaces (S7's standing hold) — 0 on the detection-grade lab
+    // posture, where no key exists (the S9 `connect` default).
+    let pr_key = crate::data_custody::live_wero_key().unwrap_or(0);
+    arm_slot_custody(routed, &node_id, secret, pr_key, sink_for);
     Ok(true)
 }

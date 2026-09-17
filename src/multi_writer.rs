@@ -1134,7 +1134,7 @@ pub(crate) async fn arm_authority_planes(
             return Err(e);
         }
     };
-    let endpoint = crate::cluster_wire::advertised_endpoint(bind, listener.endpoint());
+    let endpoint = crate::cluster_wire::advertised_endpoint(bind, listener.endpoint().port());
     // Rung 18 (the zeros-interleave conviction,
     // `.benchmarks/2026-08-17-s11-zeros-interleave-fix.md`): the §9.2
     // RANGE GEOMETRY source, from the authority's OWN planes. Until this
@@ -1677,7 +1677,7 @@ async fn arm_partial_halves(
         Arc::new(svc),
     )
     .inspect_err(|_| crate::meta_ship::uninstall_delegation_host())?;
-    let endpoint = crate::cluster_wire::advertised_endpoint(bind, listener.endpoint());
+    let endpoint = crate::cluster_wire::advertised_endpoint(bind, listener.endpoint().port());
 
     // The owner-side compose hooks (rungs 19/20), for the same reason the
     // set authority installs them: a SERVED layout publish recomputes its

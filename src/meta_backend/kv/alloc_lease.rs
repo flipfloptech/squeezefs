@@ -2697,8 +2697,8 @@ async fn acquire_and_hold<I: Iterator<Item = u64>>(
                 if !rec.holder.owned_by_node(me.node_token) {
                     return Err(KvError::Busy(format!(
                         "{why}; a live FOREIGN holder of a data volume this manager writes is \
-                         PR 12b's shape (a wire joiner's venue — the N-daemon backend posture) \
-                         — refusing to arm beside it"
+                         PR 12b's shape (a wire joiner's venue — the many-writer posture) — \
+                         refusing to arm beside it"
                     )));
                 }
                 // A same-node predecessor of another mount slot: the D0

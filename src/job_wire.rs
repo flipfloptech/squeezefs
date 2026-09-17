@@ -1476,6 +1476,16 @@ impl JobWireHost {
         self.endpoint
     }
 
+    /// The endpoint this wire PUBLISHES (the mount registration's
+    /// `job_wire_endpoint`): THE endpoint law — an explicit
+    /// `SQUEEZEFS_JOB_WIRE_BIND` IP verbatim, the route-derived IP for the
+    /// unspecified address, the bound port either way. Before it the
+    /// registration named `local_advertise_ip()` whatever the bind said
+    /// (the class PR 12's review found on the S9 arms).
+    pub fn advertised_endpoint(&self) -> String {
+        cluster_wire::advertised_endpoint(self.cfg.bind_addr, self.endpoint.port())
+    }
+
     /// `"plaintext"` or `"mtls"` — the only two classes that exist since
     /// S3. `"tls-unauthenticated"` (a TLS object with no CA pin, which
     /// VAL-6 had to carve out of the ladder) is gone: that configuration

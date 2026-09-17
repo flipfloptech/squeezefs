@@ -6840,11 +6840,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .await
                     .map_err(|e| format!("job wire start failed: {e}"))?;
                 if wire.listening() {
-                    let advertised = format!(
-                        "{}:{}",
-                        squeezefs::cluster_wire::local_advertise_ip(),
-                        wire.endpoint().port()
-                    );
+                    let advertised = wire.advertised_endpoint();
                     let _ = fs_engine.job_wire_endpoint.set(advertised.clone());
                     log::info!(
                         "job wire: endpoint {advertised} (published via the mount registration)"

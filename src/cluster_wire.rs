@@ -1306,18 +1306,25 @@ pub async fn discover_peers(
 /// boxes, where same-host peers still reach it. The publication half of
 /// DISC-1: a peer is discoverable because it wrote where to reach it, not
 /// because anyone configured it.
-/// The endpoint a listener bound at `bind` ADVERTISES: an explicit bind IP
-/// verbatim (the operator named the interface — advertising the route
-/// lookup's IP instead sent peers to another interface, and an explicit
-/// `127.0.0.1` to one nothing listened on), else the route-derived IP for
-/// the unspecified address, with the listener's actual port either way.
-pub fn advertised_endpoint(bind: std::net::SocketAddr, bound: std::net::SocketAddr) -> String {
+/// THE endpoint law — the ONE function every publisher of a listener's
+/// address reads (the S9 authority and partial-authority arms, the
+/// membership owner's rendezvous record, the job wire's mount
+/// registration, PR 12's join ladder): a listener bound at `bind`
+/// advertises an explicit bind IP VERBATIM (the operator named the
+/// interface — advertising the route lookup's IP instead sent peers to
+/// another interface, and an explicit `127.0.0.1` to one nothing listened
+/// on), else the route-derived IP for the unspecified address (`auto` =
+/// `0.0.0.0:0` — nothing is dialable AT the unspecified address), with the
+/// listener's actual `bound_port` either way. Pinned two-armed in
+/// `dlm_membership_tests::an_explicit_membership_bind_advertises_the_bound_address`
+/// and per publisher (`job_wire_tests`, `sym_mount_posture_tests`).
+pub fn advertised_endpoint(bind: std::net::SocketAddr, bound_port: u16) -> String {
     let ip = if bind.ip().is_unspecified() {
         local_advertise_ip()
     } else {
         bind.ip()
     };
-    format!("{ip}:{}", bound.port())
+    format!("{ip}:{bound_port}")
 }
 
 pub fn local_advertise_ip() -> std::net::IpAddr {

@@ -13474,15 +13474,16 @@ pub enum SharedProbe {
 /// refusal messages (design §6: refusals name the holder).
 /// The sentence a D0 refusal appends when the symmetric plane is REQUESTED
 /// (`SQUEEZEFS_SYMMETRIC_META=1` — PR 12, review round 1 Issue 6): the
-/// manual says every RW mount of an armed set is a writer, so a second RW
-/// mount's refusal must name the posture it met and the rung that lands it
-/// instead of reading as the single-writer guard alone. Empty on an
-/// unarmed process — the shipped text verbatim.
+/// manual says every RW mount of an armed set is a writer, so a second or
+/// later RW mount's refusal must name the posture it met and the rung
+/// that lands it — the MANY-writer posture, N unbounded by design (PR
+/// 12b) — instead of reading as the single-writer guard alone. Empty on
+/// an unarmed process — the shipped text verbatim.
 fn symmetric_second_writer_note() -> &'static str {
     if super::slot_lease::symmetric_meta_requested() {
-        " (symmetric plane armed: a SECOND RW writer on one set is the N-daemon backend \
-         posture — PR 12b; until it lands the D0 guard applies to RW mounts and `-o ro` \
-         readers join as token clients)"
+        " (symmetric plane armed: a second or later RW mount joins as a WRITER once PR 12b \
+         — the many-writer posture, N unbounded by design — lands; until then the D0 guard \
+         applies to RW mounts and `-o ro` readers join as token clients)"
     } else {
         ""
     }

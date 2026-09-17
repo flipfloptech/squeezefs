@@ -31,13 +31,15 @@
 //! the ladder as built is walked in full by the SOLO armed mount — the
 //! shape every in-process fixture and the fleet rig reach — and its rungs
 //! 3/4/7 are what a plain armed mount never had (a listener, a custody
-//! owner, a data WERO join, a membership shard). A SECOND RW daemon on the
-//! same volume — the wire joiner whose `JoinAppender` / `AcquireSlots`
-//! travel to a manager in another process and whose backend commits into a
-//! region it does not manage — is the N-daemon backend posture the design's
-//! row 12 costs at three weeks; it is not in this rung (its rungs 5–6 over
-//! the wire refuse at the D0 gate exactly as before), and the note names it
-//! as the one piece of row 12 left standing.
+//! owner, a data WERO join, a membership shard). The MANY-writer posture —
+//! N RW daemons on one set, N unbounded by design: every non-manager RW
+//! daemon is a wire joiner whose `JoinAppender` / `AcquireSlots` travel to
+//! a manager in another process and whose backend commits into a region
+//! it does not manage, with its own ring, page writes, checkpoint task and
+//! listener; "the second daemon" is only its first pin — is PR 12b (the
+//! design's row 12b, three weeks); it is not in this rung (its rungs 5–6
+//! over the wire refuse at the D0 gate, which names the posture), and the
+//! note names it as the one piece of row 12 left standing.
 
 use crate::error::{Result, SqueezefsError};
 use crate::meta_backend::RoutedMetaBackend;
@@ -425,8 +427,11 @@ pub async fn arm(
 /// carries that member's published listener — the endpoint the join
 /// ladder's rung 7 writes into its own entry (`publish_owner_endpoint`).
 /// `None` = no page, or the holder has not published (a joiner whose
-/// ladder has not reached rung 7; a PR 4-era wire joiner). One directory
-/// read + one claim-set read, no wire.
+/// ladder has not reached rung 7; a PR 4-era wire joiner). The one-shot
+/// form — one directory read + one claim-set read, no wire — for a
+/// single holder (the reader's per-slot binding); a caller with the
+/// directory and the claim set in hand resolves through
+/// [`resolve_holder_endpoint_from`] without re-reading either.
 pub async fn resolve_holder_endpoint(
     vol: &crate::meta_backend::kv::backend::KvMetaBackend,
     appender_id: u32,
@@ -436,12 +441,22 @@ pub async fn resolve_holder_endpoint(
             .await
             .ok()?;
     let page = entries
-        .into_iter()
+        .iter()
         .find(|e| e.appender_id == appender_id)
-        .and_then(|e| e.page)?;
+        .and_then(|e| e.page.as_ref())?;
+    let set = crate::membership::ClaimSet::load(vol).await?;
+    resolve_holder_endpoint_from(page, &set)
+}
+
+/// [`resolve_holder_endpoint`] over an already-read page and claim set —
+/// the pure step both resolvers share: the page's KD-MW-2 identity → the
+/// member id → that member's published listener (non-empty).
+pub fn resolve_holder_endpoint_from(
+    page: &crate::meta_backend::kv::appender::AppenderPage,
+    set: &crate::membership::ClaimSet,
+) -> Option<String> {
     let member =
         crate::cowriter::node_member_id_of(page.identity.node_token, page.identity.mount_slot);
-    let set = crate::membership::ClaimSet::load(vol).await?;
     set.members
         .iter()
         .find(|m| crate::membership::member_id_matches(&m.identity.id, &member))
@@ -459,7 +474,9 @@ async fn install_step_shipper(meta: &Arc<RoutedMetaBackend>, endpoint: &str) {
     };
     let Some(secret) = crate::membership::cluster_secret(first).await else {
         log::warn!(
-            "symmetric join ladder rung 7: no cluster secret on the set — the step shipper is              not installed (a foreign step is the un-shippable class the roll-forward cadence              retries); the S8 listener on {endpoint} still serves"
+            "symmetric join ladder rung 7: no cluster secret on the set — the step shipper is \
+             not installed (a foreign step is the un-shippable class the roll-forward cadence \
+             retries); the S8 listener on {endpoint} still serves"
         );
         return;
     };
@@ -476,9 +493,13 @@ async fn install_step_shipper(meta: &Arc<RoutedMetaBackend>, endpoint: &str) {
 /// Bind every Live appender's PUBLISHED endpoint into each volume's slot
 /// holder table (rung 7's census binding, the writer side): the ONE table
 /// `crossvol_tx::step_home` and `data_grant`'s slot-holder custody read.
-/// The directory is read once per volume; an appender whose ladder has not
-/// reached its publish is left unbound (`StepHome::Unreachable` — the
-/// retryable class), never guessed. Returns the bindings made.
+/// Per volume the directory is read ONCE and the claim set ONCE — every
+/// Live appender resolves off those two reads
+/// ([`resolve_holder_endpoint_from`]), so a join costs two device reads
+/// per volume whatever N is (review round 2, Issue 22: the first build
+/// re-read both per appender). An appender whose ladder has not reached
+/// its publish is left unbound (`StepHome::Unreachable` — the retryable
+/// class), never guessed. Returns the bindings made.
 pub async fn bind_live_appender_endpoints(meta: &Arc<RoutedMetaBackend>) -> usize {
     let mut bound = 0;
     for vol in &meta.volumes {
@@ -492,17 +513,25 @@ pub async fn bind_live_appender_endpoints(meta: &Arc<RoutedMetaBackend>) -> usiz
         else {
             continue;
         };
-        for entry in entries {
-            let Some(page) = entry.page.as_ref() else {
-                continue;
-            };
-            if entry.appender_id == own
-                || page.state != crate::meta_backend::kv::appender::AppenderState::Live
-            {
-                continue;
-            }
-            if let Some(endpoint) = resolve_holder_endpoint(vol, entry.appender_id).await {
-                plane.holders.set_endpoint(entry.appender_id, &endpoint);
+        let live: Vec<_> = entries
+            .iter()
+            .filter(|e| e.appender_id != own)
+            .filter_map(|e| {
+                e.page
+                    .as_ref()
+                    .filter(|p| p.state == crate::meta_backend::kv::appender::AppenderState::Live)
+                    .map(|p| (e.appender_id, p))
+            })
+            .collect();
+        if live.is_empty() {
+            continue;
+        }
+        let Some(set) = crate::membership::ClaimSet::load(vol).await else {
+            continue;
+        };
+        for (appender_id, page) in live {
+            if let Some(endpoint) = resolve_holder_endpoint_from(page, &set) {
+                plane.holders.set_endpoint(appender_id, &endpoint);
                 bound += 1;
             }
         }

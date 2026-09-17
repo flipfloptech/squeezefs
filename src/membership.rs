@@ -3256,32 +3256,6 @@ pub async fn arm_mount_membership_at(
     arm_owner(meta, volumes, secret, bind_addr).await
 }
 
-/// The endpoint the rendezvous record ([`OwnerRecord::endpoint`])
-/// advertises — the address every member (host readers, netns'd members,
-/// qemu guests) will DIAL, composed from the owner's bind posture and the
-/// port the plane actually bound.
-///
-/// An EXPLICIT bind on a specific address advertises **that address**: the
-/// operator said where the plane is served, and advertising the
-/// primary-interface derivation instead names a place where nothing
-/// listens — every member of that fleet then stays silently invisible
-/// (rung-7 finding, pinned by
-/// `an_explicit_membership_bind_advertises_the_bound_address`). The
-/// unspecified address (`auto` = `0.0.0.0:0`) keeps the primary-interface
-/// derivation: the listener answers on every interface, and `0.0.0.0` is
-/// not dialable.
-pub fn owner_advertise_endpoint(bind_addr: std::net::SocketAddr, bound_port: u16) -> String {
-    if bind_addr.ip().is_unspecified() {
-        format!(
-            "{}:{}",
-            crate::cluster_wire::local_advertise_ip(),
-            bound_port
-        )
-    } else {
-        format!("{}:{}", bind_addr.ip(), bound_port)
-    }
-}
-
 async fn arm_owner(
     meta: &Arc<crate::meta_backend::RoutedMetaBackend>,
     volumes: Vec<Arc<KvMetaBackend>>,
@@ -3344,7 +3318,9 @@ async fn arm_owner(
         secret,
         Arc::clone(&owner),
     )?;
-    let endpoint = owner_advertise_endpoint(bind_addr, plane.endpoint().port());
+    // THE endpoint law (`cluster_wire::advertised_endpoint`): an explicit
+    // bind advertises the operator's address, `auto` the route-derived one.
+    let endpoint = crate::cluster_wire::advertised_endpoint(bind_addr, plane.endpoint().port());
     // The ONE durable write of the whole liveness plane, per volume, at
     // arm. A predecessor's grace window opens over the membership its
     // evidence names.

@@ -488,6 +488,22 @@ the same (pinned where the check found a gap):
 
 The crash matrix is **32 contracts** (+1 ignored instrument).
 
-**Verification (`CARGO_INCREMENTAL=0`, the dev laptop; filled in below as the
-legs land)**: see the round-6 Implementation Summary in the review file for the
-table.
+**Verification (`CARGO_INCREMENTAL=0`, the dev laptop; the rebased tree at the
+fix)**: fmt (root / `fuzz/` / `loom-models/`), both clippy configs, rustdoc
+`-D warnings`, `fuzz` check, `task check:loom`, `tests/run_loom.sh` (117 ok) —
+all clean; `sym_crash_matrix_tests` stamped ×5 + flat ×2 — 7 / 7 green (32
+contracts, 27–31 s); `sym_custody_tests` 27 / `sym_dir_stripe_tests` 29 /
+`sym_block_grant_tests` 38 / `sym_slot_transfer_tests` 45 / `sym_appender_tests`
+35 / `fsck_tests` 22 / `fsck_c9_tests` 12 / `docs_parity_tests` 5 /
+`env_knob_convention_tests` 22 / `derivation_sweep_tests` 60 — flat AND stamped,
+20 / 20 legs green; the matrix `tests/run_sym_forest_suites.sh` (36 suites, flat
+→ stamped) PASS in 21.9 min, no ratio NOTE, no `HUNG`; `corpse_sweep_tests`
+stamped ×4 under `SQUEEZEFS_TEST_REQUIRE_MOUNT=1` — 4 / 4; the live-FUSE trio
+(`posix_mount_semantics_tests` 3, `inline_raise_tests` 7, `corpse_sweep_tests`
+4) stamped AND flat under `REQUIRE_MOUNT=1` — 6 / 6; fidelity `quick` PASS=43
+FAIL=0 (1m38s) and `full` PASS=115 FAIL=0 (2m44s; `pr-matrix` 11 / 11) as root
+on the release binary; `sym-crash` ×3 on the tcp devsub (`mw_fleet.sh create
+N=2 --symmetric`) — 3 / 3 GREEN, the acked-writes oracle 729 / 306 / 948
+fsynced files all present, `self_recoveries=2`, manager `held`, tripwires 0,
+`findings:0` every round. Not run (by rule): `task check`, squeeze-test,
+anything on `dev` / `main`; `.benchmarks/2026-09-12-sym-pr-run.md` untouched.

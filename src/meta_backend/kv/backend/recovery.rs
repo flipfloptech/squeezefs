@@ -1768,6 +1768,14 @@ impl KvMetaBackend {
         }
         rollback.begun.clear();
         plane.refresh_holders();
+        // The S4 lock plane and the gate's structural belt follow the
+        // table (the grant's and the release's own step): the recovered
+        // slots leave the process-wide FOREIGN set, so a custody acquire on
+        // their files is the local arbiter's from here — the seam PR 9's
+        // rebase found: without it every `acquire_lock` on a recovered
+        // slot's file was refused as a foreign home until the volume's next
+        // grant or release republished the owners.
+        self.publish_slot_owners(set, &plane);
         // The UNCLAIMED remainder: the page's runs MINUS every extent the
         // window's `alloc` records claimed since that page write — those
         // hold live images the trees now reach (returning one would free

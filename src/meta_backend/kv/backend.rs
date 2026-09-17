@@ -14390,7 +14390,16 @@ impl KvMetaBackend {
     /// subject): a declared appender partition — or, from PR 4, a join or
     /// a lease. A solo forest mount is NOT the arm.
     pub fn symmetric_arm_engaged(&self) -> bool {
-        self.appenders.as_ref().is_some_and(|a| a.is_partitioned())
+        // PR 3's shape (a declared test partition) OR PR 12's (the plane
+        // requested by the knob on a bit-17 volume — `appenders` is `Some`
+        // only under bit 17, so a flat volume never reaches the posture
+        // decision through the knob). The real-device leg found the
+        // knob-armed manager holding the shipped rtype 1 on its metadata
+        // namespace: no second host's appender could ever have registered
+        // to write its own ring (§5.8.1).
+        self.appenders
+            .as_ref()
+            .is_some_and(|a| a.is_partitioned() || super::slot_lease::symmetric_meta_requested())
     }
 
     /// KD-SYM-13: decide the metadata namespace's fence posture for this

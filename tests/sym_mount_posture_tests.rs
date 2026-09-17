@@ -48,7 +48,7 @@ use squeezefs::meta_backend::kv::record::ForestSlot;
 use squeezefs::meta_backend::kv::slot_lease::SYMMETRIC_META_ENV;
 use squeezefs::meta_backend::kv::slot_state::ExtentGrantRecord;
 use squeezefs::meta_backend::reservation::{
-    clear_override, install_override, FakeNvmeNamespace, FakeReservationClient,
+    clear_override, install_override, FakeNvmeNamespace, FakeReservationClient, ReservationClient,
 };
 use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
 use squeezefs::slot_lease_core::SlotWords;
@@ -406,6 +406,21 @@ async fn a_solo_armed_mount_walks_the_ladder_to_its_planes_with_dlm_rpcs_zero() 
         squeezefs::data_grant::custody_owner().is_none(),
         "the leave uninstalls the planes the ladder stood up"
     );
+    // The leave RELEASES the data namespace's reservation and unregisters
+    // this writer's key before `disarm` returns — zero residue, the
+    // fidelity tier's law. The S9 custody sweep held a strong clone of the
+    // hold across its 10 s cadence, so the arm's release never reached the
+    // device before the process exited (the real-device leg read
+    // `regctl data=1` after every clean leave — the successor's OWN key).
+    assert!(
+        ns.holder().is_none(),
+        "the data namespace's WERO is released at the leave, not at process exit"
+    );
+    assert_eq!(
+        squeezefs::data_custody::live_wero_key(),
+        None,
+        "no live hold after the leave"
+    );
     membership.disarm().await;
     clear_override(&data);
     shutdown(&routed).await;
@@ -459,6 +474,93 @@ async fn the_ladder_on_a_non_pr_substrate_is_detection_grade_only_under_the_lab_
     membership.disarm().await;
     clear_override(&data);
     shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
+/// §5.8.1 on the PRODUCT shape: the knob-armed writer — no declared test
+/// partition, the shape every field mount takes — holds WERO (rtype 3) on
+/// a PR-capable METADATA namespace, so a second host's appender can
+/// REGISTER under it to write its own ring and be fenced by a preempt of
+/// its key. PR 3 keyed the posture on PR 2's declared partition alone, so
+/// the knob-armed manager held the shipped rtype 1 (found by the fidelity
+/// tier's `sym-join-ladder` leg on the real nvmet target: `meta_pr_wero=0`,
+/// device rtype 1, beside `data_plane_fence_mode=1`). The unarmed forest
+/// keeps rtype 1 verbatim, and the knob-armed writer on a NON-PR namespace
+/// is the detection-grade lab posture under the opt-in (KD-SYM-13),
+/// refused without it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_knob_armed_writer_holds_wero_on_a_pr_capable_metadata_namespace() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempfile::tempdir().unwrap();
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    let meta = std::path::PathBuf::from(&uris[0]);
+    let ns = FakeNvmeNamespace::lenient_register();
+    install_override(
+        &meta,
+        FakeReservationClient::new(Arc::clone(&ns), "nqn.pr12.meta", "pr12-meta-host"),
+    );
+    // Unarmed (the knob off): the shipped Write Exclusive, rtype 1.
+    {
+        let routed = open_under(&uris, &Knobs::unarmed()).await;
+        let s = routed.volumes[0].appender_stats().expect("a forest volume");
+        assert!(!s.meta_pr_wero, "an unarmed forest keeps rtype 1: {s:?}");
+        let report = FakeReservationClient::new(Arc::clone(&ns), "nqn.probe", "probe")
+            .report()
+            .expect("report");
+        assert_eq!(report.rtype, 1, "the shipped Write Exclusive");
+        shutdown(&routed).await;
+    }
+    // Armed by the knob alone (no partition): WERO, rtype 3 — the device
+    // can fence a registered peer appender.
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        let s = routed.volumes[0].appender_stats().expect("a forest volume");
+        assert!(
+            s.meta_pr_wero,
+            "the knob-armed manager holds WERO on the metadata namespace: {s:?}"
+        );
+        assert_eq!(s.manager_lease.word(), "held");
+        assert_eq!(routed.volumes[0].writer_guard_mode(), "flock+pr");
+        let report = FakeReservationClient::new(Arc::clone(&ns), "nqn.probe", "probe")
+            .report()
+            .expect("report");
+        assert_eq!(report.rtype, 3, "Write Exclusive – Registrants Only");
+        assert!(report.is_wero());
+        shutdown(&routed).await;
+        assert!(
+            ns.holder().is_none(),
+            "the clean leave releases the hold — zero residue"
+        );
+    }
+    clear_override(&meta);
+    // The same knob-armed writer on a NON-PR namespace: refused without the
+    // opt-in, detection-grade with it (the in-process suites' posture).
+    let ns_nonpr = FakeNvmeNamespace::without_pr_support();
+    install_override(
+        &meta,
+        FakeReservationClient::new(Arc::clone(&ns_nonpr), "nqn.pr12.nonpr", "pr12-nonpr-host"),
+    );
+    {
+        Knobs::armed().apply();
+        std::env::remove_var("SQUEEZEFS_SYM_ALLOW_NON_PR");
+        let err = squeezefs::meta_backend::open_routed_meta_set(&uris)
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .expect("an armed writer on a non-PR metadata namespace refuses without the opt-in");
+        assert!(
+            err.contains("SQUEEZEFS_SYM_ALLOW_NON_PR") && err.contains("KD-SYM-13"),
+            "names the opt-in and the rule: {err}"
+        );
+    }
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        let s = routed.volumes[0].appender_stats().expect("a forest volume");
+        assert!(!s.meta_pr_wero, "detection-grade: no reservation to hold");
+        shutdown(&routed).await;
+    }
+    clear_override(&meta);
     fsck_clean(&uris).await;
 }
 

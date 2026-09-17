@@ -24,6 +24,7 @@ use squeezefs::meta_backend::kv::backend::recovery::{recover_dead_appenders_set,
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::record::ForestSlot;
 use squeezefs::meta_backend::kv::slot_state::SlotState;
+use squeezefs::meta_backend::reservation::{self, FakeNvmeNamespace, FakeReservationClient};
 use squeezefs::meta_backend::{
     open_routed_meta_set_joined, JoinedSetAdmission, Metadata, RoutedMetaBackend,
 };
@@ -1351,4 +1352,289 @@ async fn the_joined_door_refuses_without_the_plane_and_never_writes_a_control_en
     shutdown(&manager).await;
     drop(mvol);
     drop(manager);
+}
+
+// ---------------------------------------------------------------------------
+// Rung 4 on a joiner: the device half the file-backed fixture cannot see.
+// ---------------------------------------------------------------------------
+
+/// The fidelity tier's fake PR device on the METADATA volume: the manager
+/// holds WERO (rtype 3) under its derived key, the joiner's `resolve_for_
+/// mount` answers the SAME association (one host, one head — every daemon
+/// on a box).
+fn install_meta_pr_fake(uri: &str) -> (Arc<FakeNvmeNamespace>, std::path::PathBuf) {
+    let ns = FakeNvmeNamespace::new();
+    let p = std::path::PathBuf::from(uri);
+    reservation::install_override(
+        &p,
+        FakeReservationClient::new(ns.clone(), "nqn-pr12b-host", "host-pr12b"),
+    );
+    (ns, p)
+}
+
+/// **Rung 4 on a JOINED appender never ACQUIRES** (design-symmetric-
+/// metadata §5.8.1 — the manager holds, every other appender is a
+/// REGISTRANT; KD-SYM-22 — co-located appenders SHARE one registrant):
+/// on a PR-capable metadata namespace a CO-LOCATED joiner ADOPTS the
+/// manager's standing hold (the holder key cross-checked against the key
+/// the manager's durable `writer_claim` derives — `WriterClaim::pr_key`,
+/// the ONE derivation the manager's own guard uses), performs ZERO device
+/// mutations at the join and at the leave, and publishes NO key of its
+/// own (there is none to preempt — a same-host death is the flock's
+/// proof); a REMOTE joiner REGISTERS under the hold with one key for
+/// every namespace class and unregisters exactly that at its leave. The
+/// data half is the same law (`join_wero_as_appender`), never
+/// `arm_data_plane`'s acquire — the first build's second acquire under a
+/// spec-strict target unregistered the manager's HOLDER key through the
+/// register ladder's own-stale proof and took the fence for itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiners_registrant_rung_adopts_co_located_and_registers_remote_never_acquires() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let (ns, p) = install_meta_pr_fake(&uris[0]);
+    let _restore = ClearOverride(vec![p.clone()]);
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mkey = mvol.writer_guard_pr_key();
+    assert_ne!(mkey, 0, "a PR-capable namespace: the manager registered");
+    assert_eq!(ns.holder(), Some(mkey), "the manager HOLDS (rtype 3)");
+    assert_eq!(
+        mvol.read_writer_claim().await.expect("the claim").pr_key(),
+        mkey,
+        "the durable claim derives the manager's key — what a joiner cross-checks the holder \
+         against"
+    );
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+
+    // The co-located joiner (the manager's flock is held on this host):
+    // ADOPTS — the device untouched, no key of its own.
+    let joiner = join(&uris, &venue, &mvol, 31).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let wire = jvol.joined_wire().expect("joined");
+    assert!(wire.colocated, "the same host: the flock's proof");
+    assert_eq!(wire.registrant_key, 0, "an adopted hold is not OUR key");
+    assert!(
+        wire.meta_hold_standing(),
+        "rung 4 ran at the door: the adopted hold is held for the mount's life"
+    );
+    assert_eq!(
+        jvol.joined_stats().unwrap().registrant_posture,
+        "adopted",
+        "the posture word the stats inode publishes"
+    );
+    assert_eq!(ns.holder(), Some(mkey), "the hold stands");
+    assert!(ns.is_registered(mkey));
+    assert_eq!(ns.unregister_count(), 0, "adoption unregisters NOTHING");
+    assert_eq!(
+        squeezefs::data_custody::own_registered_key(),
+        None,
+        "the key a joiner publishes (membership, PublishEndpoint) is 0 when it adopted"
+    );
+    let files = create_files(&joiner, dirs[0], "pr", 8).await;
+    assert_all_resolve(&joiner, dirs[0], &files).await;
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    assert_eq!(
+        ns.holder(),
+        Some(mkey),
+        "the leave leaves the device as found"
+    );
+    assert!(ns.is_registered(mkey));
+    assert_eq!(ns.unregister_count(), 0);
+
+    // The REMOTE shape's device act (another host's association on the
+    // same namespace): REGISTER under the hold — the holder untouched,
+    // one key, unregistered at the leave.
+    let remote = FakeReservationClient::new(ns.clone(), "nqn-remote", "host-remote");
+    reservation::install_override(&p, remote);
+    let key = 0x12b0_0000_0000_0001;
+    let joined = squeezefs::data_custody::join_wero_as_appender(
+        std::slice::from_ref(&p),
+        false,
+        &[],
+        Some(key),
+    )
+    .expect("a remote appender registers under the standing WERO");
+    assert_eq!(
+        joined.evidence().key,
+        key,
+        "the caller's key, not a fresh mint"
+    );
+    assert!(ns.is_registered(key), "registered");
+    assert_eq!(ns.holder(), Some(mkey), "the manager still holds");
+    assert_eq!(
+        squeezefs::data_custody::own_registered_key(),
+        Some(key),
+        "a registered key IS the joiner's to publish"
+    );
+    drop(joined);
+    assert!(!ns.is_registered(key), "the leave unregisters exactly ours");
+    assert_eq!(ns.holder(), Some(mkey));
+    assert!(ns.is_registered(mkey));
+    assert_eq!(
+        ns.unregister_count(),
+        1,
+        "the remote leave's ONE unregister — its own key"
+    );
+    // The co-located shape through the same door: adopt, never register.
+    let adopted = squeezefs::data_custody::join_wero_as_appender(
+        std::slice::from_ref(&p),
+        true,
+        &[mkey],
+        None,
+    )
+    .expect("adopts");
+    assert_eq!(adopted.evidence().key, mkey);
+    drop(adopted);
+    assert_eq!(
+        ns.unregister_count(),
+        1,
+        "adoption's leave unregisters nothing"
+    );
+    assert_eq!(ns.holder(), Some(mkey));
+
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+}
+
+/// **A joiner refuses a manager whose metadata hold is not
+/// registrants-only** (`SQUEEZEFS_META_PR_WERO=0` — rtype 1, the lab
+/// posture): under rtype 1 no registration grants write access, so a
+/// join would produce a writer whose every ring write the device rejects.
+/// The refusal names the knob; nothing is registered, nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiner_refuses_a_manager_holding_rtype_1_on_the_metadata_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, _dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let (ns, p) = install_meta_pr_fake(&uris[0]);
+    let _restore = ClearOverride(vec![p.clone()]);
+    std::env::set_var("SQUEEZEFS_META_PR_WERO", "0");
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    std::env::remove_var("SQUEEZEFS_META_PR_WERO");
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mkey = mvol.writer_guard_pr_key();
+    assert_eq!(ns.holder(), Some(mkey));
+    assert!(!mvol.appender_stats().unwrap().meta_pr_wero, "rtype 1");
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let dir_before = read_directory(mvol.device_path(), mvol.superblock())
+        .await
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            e.page
+                .as_ref()
+                .is_some_and(|p| p.state == AppenderState::Live)
+        })
+        .count();
+    let err = try_join(&uris, &venue, &mvol, 41)
+        .await
+        .err()
+        .expect("refused");
+    assert!(
+        err.contains("SQUEEZEFS_META_PR_WERO") && err.contains("rtype"),
+        "names the knob and the rtype: {err}"
+    );
+    assert_eq!(ns.holder(), Some(mkey), "nothing moved on the device");
+    assert_eq!(ns.unregister_count(), 0);
+    let dir_after = read_directory(mvol.device_path(), mvol.superblock())
+        .await
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            e.page
+                .as_ref()
+                .is_some_and(|p| p.state == AppenderState::Live)
+        })
+        .count();
+    assert_eq!(
+        dir_after, dir_before,
+        "the refusal precedes JoinAppender: no page went Live"
+    );
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+}
+
+/// **The recovery driver never preempts a key this process holds** (PR
+/// 10's manager-only assumption under KD-SYM-22): a dead co-located
+/// appender's published key can be the manager's OWN (an adopted hold's
+/// word — or a peer's `RecordDeath` carrying it), and a preempt-and-abort
+/// of one's own key is the S9 sweep's own-key law
+/// (`multi_writer.rs`: "would take down the authority's own fence") —
+/// the recovery takes the full tail scan instead, `pr_fenced` false,
+/// `appender_recovery_preempts` unmoved, the hold and the registration
+/// exactly as they stood. Red before the fix: the fake's self-preempt
+/// dropped the manager's own registration under its standing hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovery_never_preempts_the_managers_own_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let (ns, p) = install_meta_pr_fake(&uris[0]);
+    let _restore = ClearOverride(vec![p.clone()]);
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mkey = mvol.writer_guard_pr_key();
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+
+    let joiner = join(&uris, &venue, &mvol, 51).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let id = jvol.appender_stats().unwrap().appender_id;
+    let identity = jvol.joined_wire().unwrap().identity;
+    let files = create_files(&joiner, dirs[0], "own", 8).await;
+    drop(jvol);
+    drop(joiner);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+
+    let preempts_before = recovery_stats().preempts;
+    let device_preempts = ns.preempt_count();
+    // The death recorded with the MANAGER's own key — the adopted shape's
+    // word.
+    assert!(!mvol.record_death_with_key(identity, 3, mkey).await.unwrap());
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    assert_eq!(rep.per_volume[0].1.recovered[0].appender_id, id);
+    assert_eq!(
+        recovery_stats().preempts,
+        preempts_before,
+        "no preempt was driven"
+    );
+    assert_eq!(
+        ns.preempt_count(),
+        device_preempts,
+        "none reached the device"
+    );
+    assert_eq!(ns.holder(), Some(mkey), "the manager's hold stands");
+    assert!(
+        ns.is_registered(mkey),
+        "the manager's registration stands — a self-preempt would have removed it"
+    );
+    assert_all_resolve(&manager, dirs[0], &files).await;
+    assert_must_stay_zero(&mvol, "manager");
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+/// Restore the process-global reservation overrides after a contract.
+struct ClearOverride(Vec<std::path::PathBuf>);
+
+impl Drop for ClearOverride {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            reservation::clear_override(p);
+        }
+    }
 }

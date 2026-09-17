@@ -1352,7 +1352,22 @@ impl KvMetaBackend {
         // take the full tail scan, the fence that needs no device.
         let t = Instant::now();
         let mut pr_fenced = false;
-        if dead.pr_key != 0 {
+        if dead.pr_key != 0 && self.is_own_registrant_key(dead.pr_key) {
+            // The S9 sweep's own-key law (`multi_writer.rs`) on the death
+            // ledger: a CO-LOCATED appender shares this host's registrant
+            // (KD-SYM-22 — its adopted word IS this manager's key, or a
+            // peer's `RecordDeath` carried it), and a preempt-and-abort of
+            // one's own key takes down one's own fence. A same-host death
+            // is the flock's / the S6 eviction's proof; the full tail scan
+            // is its fence.
+            log::warn!(
+                "meta volume {}: dead appender {id}'s record carries key {:#x}, which THIS \
+                 process holds (the co-located shared-registrant shape) — no preempt is driven; \
+                 the full tail scan is the fence for this recovery",
+                self.path.display(),
+                dead.pr_key
+            );
+        } else if dead.pr_key != 0 {
             let victim = dead.pr_key;
             let meta = self.preempt_meta_registrant(victim).await;
             let data = squeezefs_ipc::sqz_blocking::run_blocking(move || {
@@ -2531,6 +2546,16 @@ impl KvMetaBackend {
             .extents()
             .filter(|e| !reachable.contains(e) && !named.contains(e))
             .collect())
+    }
+
+    /// Whether `key` is one THIS process stands on — the metadata guard's
+    /// own key or any hold in the data-plane registry (a holder's, a
+    /// registrant's, an ADOPTED co-located hold's — that last word is the
+    /// manager's own key seen from a joiner). The death ledger's preempt
+    /// never drives such a key (§5.9 step 1 under KD-SYM-22).
+    fn is_own_registrant_key(&self, key: u64) -> bool {
+        key != 0
+            && (key == self.pr_key || crate::data_custody::own_registrant_keys().contains(&key))
     }
 
     /// Preempt `victim` on this volume's metadata namespace under the

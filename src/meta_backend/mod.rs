@@ -670,6 +670,16 @@ pub async fn open_routed_meta_set_joined(
     refuse_mixed_multi_writer_set(&disc.ordered_paths).await?;
     let mut vols: Vec<std::sync::Arc<kv::backend::KvMetaBackend>> =
         Vec::with_capacity(disc.ordered_paths.len());
+    // ONE registrant key for the set: every metadata namespace a remote
+    // joiner registers on at its door and every data namespace its
+    // ladder's rung 4 registers on carry it, so the death ledger's one
+    // key preempts this member on every namespace class.
+    let registrant_key = loop {
+        let k = rand::Rng::gen::<u64>(&mut rand::thread_rng());
+        if k != 0 {
+            break k;
+        }
+    };
     for (ordinal, path) in disc.ordered_paths.iter().enumerate() {
         let per_volume = kv::backend::JoinedAppenderAdmission {
             manager_endpoint: admission.manager_endpoint.clone(),
@@ -681,6 +691,7 @@ pub async fn open_routed_meta_set_joined(
                 ))
             })?,
             identity: admission.identity,
+            registrant_key,
         };
         match kv::backend::KvMetaBackend::open_joined_appender(
             std::path::Path::new(path),

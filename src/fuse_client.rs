@@ -14104,6 +14104,22 @@ impl SqueezefsFilesystem {
                         "joined_ring_grow_declined".into(),
                         word(&|s| s.ring_grow_declined),
                     );
+                    // Rung 4's posture: `adopted` (co-located, KD-SYM-22),
+                    // `registrant` (remote, our key under the manager's
+                    // hold) or `detection` (the KD-SYM-13 opt-in).
+                    metrics.insert(
+                        "joined_registrant_posture".into(),
+                        serde_json::Value::Array(
+                            joined
+                                .iter()
+                                .map(|s| {
+                                    s.as_ref().map_or(serde_json::Value::Null, |s| {
+                                        s.registrant_posture.into()
+                                    })
+                                })
+                                .collect(),
+                        ),
+                    );
                 }
                 // The door's ledger (review round 2, Issue 6): parks are a
                 // legal wait for a bounded handover, refusals the "ship to

@@ -8,7 +8,7 @@
 //! | Layer A `flock(LOCK_EX)` | **not taken** (the manager holds it on a shared host; N joiners coexist) |
 //! | DUR-5 superblock repair | **skipped** — sector 0 is the manager's |
 //! | Bootstrap replay of the FIXED ring | as a PROJECTION: tree 0 + the manager's slot trees replayed like a non-writer's (no mint, unpublished slots skipped — they are the manager's to publish) |
-//! | Layer B2 / B1 / `writer_claim` | **none** — the manager's claim stands; this mount is a REGISTRANT on the metadata namespace (PR 3's `join_wero_as_registrant`, the ladder's rung 4) |
+//! | Layer B2 / B1 / `writer_claim` | **none** — the manager's claim stands; **rung 4's metadata half runs HERE, before any wire verb or device write**: on a PR-capable namespace a CO-LOCATED joiner (the manager's flock on this host, or its claim's boot) ADOPTS the manager's standing rtype-3 hold — zero device mutation, the holder cross-checked against the key the manager's durable claim derives (`WriterClaim::pr_key`) — and a REMOTE joiner REGISTERS under it with the set's one registrant key (`data_custody::join_wero_as_appender`); a manager holding rtype 1 refuses the join naming `SQUEEZEFS_META_PR_WERO`; a non-PR namespace needs KD-SYM-13's opt-in |
 //! | `JoinAppender` | **over the wire** to the manager, BEFORE `open_inner`: the region (page + ring + grant) the manager mints is stood up beside the projection as this mount's own — a rejoin over an own `Live` page replays its ring as own residue |
 //! | `AcquireSlots` | **over the wire**: `M` rotor slots installed into the own region; every first touch of an unleased slot is a wire `AcquireSlot`; a slot another appender leases refuses `SlotBusy` at the commit door |
 //! | checkpoint + times-drain tasks | **spawned** — the checkpoint cycle is the JOINED one (`joined_checkpoint_cycle`, dispatched from the shared `checkpoint_cycle`): its slot trees' flushes, its page (the Issue-31 words), its tail, its SMOs in its ring under its grant, its extent returns and refills over the wire; never the ledger, the bitmap, tree 0 or page 0 |
@@ -53,6 +53,11 @@ pub struct JoinedAppenderAdmission {
     /// `writer_id` is minted per open. On one host every daemon shares the
     /// node token, so the mount slot is what tells the pages apart.
     pub identity: AppenderIdentity,
+    /// The ONE registrant key this mount registers under on every
+    /// namespace class of the set when it is REMOTE to the manager
+    /// (minted once per set open by `open_routed_meta_set_joined`; unused
+    /// by a co-located joiner, which adopts). `0` = mint at the door.
+    pub registrant_key: u64,
 }
 
 /// The wire join's outcome, handed into `open_inner` so the appender open
@@ -114,6 +119,18 @@ pub struct JoinedWire {
     /// grow — PR 2's drain-then-grow bound holds: it drains at
     /// `admissible ÷ cadence` per tick instead; `joined_ring_grow_declined`).
     pub grow_declined: AtomicU64,
+    /// The manager is on THIS host (its D0 flock is held here, or its
+    /// claim carries this boot): rung 4 ADOPTED its holds (KD-SYM-22) and
+    /// this mount publishes no registrant key of its own.
+    pub colocated: bool,
+    /// The registrant key this mount REGISTERED on the metadata namespace
+    /// (a remote joiner's; the data half registers the same one) — `0`
+    /// when it adopted or the substrate is detection-grade.
+    pub registrant_key: u64,
+    /// Rung 4's metadata-namespace hold (an adopted or registrant
+    /// `WeroHold`; `None` detection-grade), released at the END of the
+    /// leave — after the last ring write and the wire `LeaveAppender`.
+    meta_hold: std::sync::Mutex<Option<crate::data_custody::WeroHold>>,
 }
 
 impl JoinedWire {
@@ -124,6 +141,22 @@ impl JoinedWire {
             self.failures.fetch_add(1, Ordering::Relaxed);
         }
         r
+    }
+
+    /// Release rung 4's metadata-namespace hold (an adopted hold releases
+    /// nothing at the device; a registrant unregisters its key) —
+    /// off-runtime, once: the leave's last act and every failed open's.
+    pub async fn release_meta_hold(&self) {
+        let hold = self.meta_hold.lock().unwrap().take();
+        if let Some(hold) = hold {
+            crate::data_custody::release_hold(hold).await;
+        }
+    }
+
+    /// Whether rung 4's metadata hold is still held (the leave drops it
+    /// last).
+    pub fn meta_hold_standing(&self) -> bool {
+        self.meta_hold.lock().unwrap().is_some()
     }
 }
 
@@ -141,6 +174,10 @@ pub struct JoinedStats {
     pub wire_failures: u64,
     pub control_refusals: u64,
     pub ring_grow_declined: u64,
+    /// Rung 4's posture word: `adopted` (co-located — the manager's hold
+    /// shared, no key of ours), `registrant` (remote — our key under it)
+    /// or `detection` (a non-PR substrate under KD-SYM-13's opt-in).
+    pub registrant_posture: &'static str,
 }
 
 /// The one-line error a wire verb's unexpected reply becomes.
@@ -239,60 +276,121 @@ pub(super) async fn wire_extent_refill(
 }
 
 impl KvMetaBackend {
-    /// **Open one volume as a JOINED non-manager appender** (the fifth door
-    /// — see the module doc for the step table). The wire `JoinAppender`
-    /// runs FIRST, idempotent against the directory (§5.3.5): a `Live`
-    /// page already carrying this `(node, mount slot)` is a predecessor
-    /// that died un-recovered, and its identity is what the join presents
-    /// so the manager answers `already` and the open replays that ring as
-    /// own residue (§5.3.2's identity binding); a `Recovering` page of this
-    /// identity is mid-recovery by the manager — refused as the retryable
-    /// class (the joiner parks one beat, PR 10's law); a `Recovered` page is
-    /// never re-adopted (§5.8.3 — the join mints a fresh region).
-    pub async fn open_joined_appender(
+    /// **Rung 4's METADATA half on a joiner** (design §5.8.1: the manager
+    /// holds rtype 3, every other appender is a registrant; KD-SYM-13's
+    /// opt-in on a substrate without reservations): runs BEFORE the wire
+    /// join and before any device write of this mount. Returns the hold
+    /// to keep for the mount's life and the key this mount REGISTERED
+    /// (`0` when it adopted or the substrate is detection-grade).
+    ///
+    /// * PR-capable + co-located: ADOPT the manager's standing hold, the
+    ///   holder cross-checked against the key its durable claim derives.
+    /// * PR-capable + remote: REGISTER under it with the set's one key.
+    /// * A standing hold that is not registrants-only (`SQUEEZEFS_META_PR_
+    ///   WERO=0` on the manager) refuses — under rtype 1 no registration
+    ///   grants write access, so every ring write would be rejected.
+    /// * No reservation support: refuse without `SQUEEZEFS_SYM_ALLOW_NON_
+    ///   PR=1`; detection-grade, announced, with it.
+    async fn joined_meta_registrant(
         path: &Path,
         admission: &JoinedAppenderAdmission,
-    ) -> Result<Arc<Self>, KvError> {
-        if !super::super::slot_lease::symmetric_meta_requested() {
-            return Err(KvError::Busy(format!(
-                "{}: a joined-appender open needs the symmetric plane (SQUEEZEFS_SYMMETRIC_META=1) \
-                 — a second RW mount without it is the D0 single-writer guard's refusal, never a \
-                 join (design-symmetric-metadata §7.3)",
-                path.display()
-            )));
-        }
-        match Self::probe_shared_lock(path) {
-            super::SharedProbe::LocalExclusiveHolder => log::info!(
-                "meta volume {}: joined-appender open — a LOCAL exclusive holder (the manager's \
-                 write mount on this host) holds the writer lock; this mount takes no lock and \
-                 joins over the wire",
-                path.display()
-            ),
-            super::SharedProbe::NoLocalExclusiveHolder => log::info!(
-                "meta volume {}: joined-appender open — the manager is on another host",
-                path.display()
-            ),
-            super::SharedProbe::Unknown => {}
-        }
-        // The predecessor's page, if any: presented to the join so the
-        // manager answers the SAME region (`already`).
-        let sb = match super::classify_volume(path).await? {
-            super::VolumeFormat::V3(sb) => sb,
-            _ => {
-                return Err(KvError::Corrupt(format!(
-                    "{} is not a v3 volume — nothing to join",
+        colocated: bool,
+        claim: Option<&super::WriterClaim>,
+    ) -> Result<(Option<crate::data_custody::WeroHold>, u64), KvError> {
+        let pr_capable = {
+            let p = path.to_path_buf();
+            squeezefs_ipc::sqz_blocking::run_blocking(move || {
+                crate::meta_backend::reservation::resolve_for_mount(&p).is_some()
+            })
+            .await
+        };
+        let allow_non_pr = crate::env_knobs::bool_knob("SQUEEZEFS_SYM_ALLOW_NON_PR", false);
+        if !pr_capable {
+            if !allow_non_pr {
+                return Err(KvError::Busy(format!(
+                    "{}: a joined appender needs a PR-capable metadata namespace (design-\
+                     symmetric-metadata §5.8.1 — the manager holds Write Exclusive – Registrants \
+                     Only and every other appender writes as a REGISTRANT); this namespace \
+                     advertises no NVMe Persistent Reservations, so a fenced joiner's ring write \
+                     could only be DETECTED. KD-SYM-13: set SQUEEZEFS_SYM_ALLOW_NON_PR=1 to join \
+                     DETECTION-GRADE (lab use) or use a PR-capable namespace (the kernel nvmet \
+                     target)",
                     path.display()
-                )))
+                )));
+            }
+            log::warn!(
+                "meta volume {}: JOINED APPENDER ON A NON-PR METADATA NAMESPACE under \
+                 SQUEEZEFS_SYM_ALLOW_NON_PR=1 (KD-SYM-13) — its fence is detection-grade: the \
+                 frame screen's tail scan, never the device",
+                path.display()
+            );
+            return Ok((None, 0));
+        }
+        let enrolled: Vec<u64> = claim.map(|c| c.pr_key()).into_iter().collect();
+        let key = if admission.registrant_key != 0 {
+            admission.registrant_key
+        } else {
+            loop {
+                let k = rand::Rng::gen::<u64>(&mut rand::thread_rng());
+                if k != 0 {
+                    break k;
+                }
             }
         };
-        if !sb.symmetric_forest_stamped() {
-            return Err(KvError::Corrupt(format!(
-                "{}: not symmetric-forest capable (incompat bit 17 absent) — a joined appender \
-                 needs the forest; run `squeezefs volume enable-symmetric` or format `--symmetric`",
-                path.display()
-            )));
-        }
-        let entries = super::super::appender::read_directory(path, &sb).await?;
+        let paths = vec![path.to_path_buf()];
+        let joined = squeezefs_ipc::sqz_blocking::run_blocking(move || {
+            crate::data_custody::join_wero_as_appender(&paths, colocated, &enrolled, Some(key))
+        })
+        .await
+        .map_err(|e| {
+            KvError::Busy(format!(
+                "{}: the join ladder's rung 4 (registrant) refuses on the METADATA namespace \
+                 ({}): {e}. A joined appender writes its ring under the manager's Write \
+                 Exclusive – Registrants Only hold (rtype 3, SQUEEZEFS_META_PR_WERO=1 at the \
+                 manager); no other rtype admits it",
+                path.display(),
+                if colocated {
+                    "co-located — adopting the manager's standing hold"
+                } else {
+                    "remote — registering under the manager's standing hold"
+                }
+            ))
+        })?;
+        let hold = joined.hold().clone();
+        let registered = if colocated { 0 } else { joined.evidence().key };
+        log::info!(
+            "meta volume {}: joined appender's rung 4 on the METADATA namespace — {} (holder key \
+             {:#x}{})",
+            path.display(),
+            if colocated {
+                "ADOPTED the co-located manager's rtype-3 hold, nothing registered (KD-SYM-22: \
+                 one host, one registrant)"
+            } else {
+                "REGISTERED under the manager's rtype-3 hold"
+            },
+            joined.evidence().key,
+            if registered != 0 {
+                format!(", our key {registered:#x}")
+            } else {
+                String::new()
+            }
+        );
+        Ok((Some(hold), registered))
+    }
+
+    /// **Rung 5 — the wire `JoinAppender`**: the predecessor page of this
+    /// identity (if any) decides what is PRESENTED (a `Live` one's
+    /// identity, so the manager answers `already`; a `Recovering` one
+    /// refuses — the retryable class), the manager is dialed, the join
+    /// asked. Returns the connected client, the identity presented, the
+    /// appender id and the `already` word.
+    async fn wire_join_appender(
+        path: &Path,
+        admission: &JoinedAppenderAdmission,
+        sb: &super::super::superblock::SuperblockV3,
+        writer_id: u128,
+    ) -> Result<(ManagerClient, AppenderIdentity, u32, bool), KvError> {
+        let entries = super::super::appender::read_directory(path, sb).await?;
         let predecessor = entries.iter().find_map(|e| {
             e.page.as_ref().filter(|p| {
                 p.identity.node_token == admission.identity.node_token
@@ -311,7 +409,6 @@ impl KvMetaBackend {
                 p.identity.mount_slot
             )));
         }
-        let writer_id = uuid::Uuid::new_v4().as_u128();
         let presented = match predecessor {
             Some(p) => p.identity,
             None => AppenderIdentity {
@@ -351,6 +448,96 @@ impl KvMetaBackend {
             }
             other => return Err(unexpected("JoinAppender", &other)),
         };
+        Ok((client, presented, appender_id, already))
+    }
+
+    /// **Open one volume as a JOINED non-manager appender** (the fifth door
+    /// — see the module doc for the step table). The wire `JoinAppender`
+    /// runs FIRST, idempotent against the directory (§5.3.5): a `Live`
+    /// page already carrying this `(node, mount slot)` is a predecessor
+    /// that died un-recovered, and its identity is what the join presents
+    /// so the manager answers `already` and the open replays that ring as
+    /// own residue (§5.3.2's identity binding); a `Recovering` page of this
+    /// identity is mid-recovery by the manager — refused as the retryable
+    /// class (the joiner parks one beat, PR 10's law); a `Recovered` page is
+    /// never re-adopted (§5.8.3 — the join mints a fresh region).
+    pub async fn open_joined_appender(
+        path: &Path,
+        admission: &JoinedAppenderAdmission,
+    ) -> Result<Arc<Self>, KvError> {
+        if !super::super::slot_lease::symmetric_meta_requested() {
+            return Err(KvError::Busy(format!(
+                "{}: a joined-appender open needs the symmetric plane (SQUEEZEFS_SYMMETRIC_META=1) \
+                 — a second RW mount without it is the D0 single-writer guard's refusal, never a \
+                 join (design-symmetric-metadata §7.3)",
+                path.display()
+            )));
+        }
+        let local_flock = match Self::probe_shared_lock(path) {
+            super::SharedProbe::LocalExclusiveHolder => {
+                log::info!(
+                    "meta volume {}: joined-appender open — a LOCAL exclusive holder (the \
+                     manager's write mount on this host) holds the writer lock; this mount takes \
+                     no lock and joins over the wire",
+                    path.display()
+                );
+                true
+            }
+            super::SharedProbe::NoLocalExclusiveHolder => {
+                log::info!(
+                    "meta volume {}: joined-appender open — the manager is on another host",
+                    path.display()
+                );
+                false
+            }
+            super::SharedProbe::Unknown => false,
+        };
+        // The predecessor's page, if any: presented to the join so the
+        // manager answers the SAME region (`already`).
+        let sb = match super::classify_volume(path).await? {
+            super::VolumeFormat::V3(sb) => sb,
+            _ => {
+                return Err(KvError::Corrupt(format!(
+                    "{} is not a v3 volume — nothing to join",
+                    path.display()
+                )))
+            }
+        };
+        if !sb.symmetric_forest_stamped() {
+            return Err(KvError::Corrupt(format!(
+                "{}: not symmetric-forest capable (incompat bit 17 absent) — a joined appender \
+                 needs the forest; run `squeezefs volume enable-symmetric` or format `--symmetric`",
+                path.display()
+            )));
+        }
+        // The manager's durable claim: whose fence stands on this
+        // namespace (its derived key), and whether it is THIS host's
+        // (the flock above is the kernel's proof; the claim's boot the
+        // co-writer ladder's — either makes the join co-located).
+        let claim = {
+            let probe = crate::meta_backend::open_volume_probe(&path.to_string_lossy()).await?;
+            probe.read_writer_claim().await
+        };
+        let colocated = local_flock
+            || claim
+                .as_ref()
+                .is_some_and(|c| !c.boot.is_empty() && c.boot == super::read_boot_id());
+        let (meta_hold, registrant_key) =
+            Self::joined_meta_registrant(path, admission, colocated, claim.as_ref()).await?;
+        // Rung 5 — the wire join. Every refusal from here releases rung
+        // 4's hold off-runtime (a registrant's key never outlives a
+        // refused join).
+        let writer_id = uuid::Uuid::new_v4().as_u128();
+        let joined = match Self::wire_join_appender(path, admission, &sb, writer_id).await {
+            Ok(j) => j,
+            Err(e) => {
+                if let Some(hold) = meta_hold {
+                    crate::data_custody::release_hold(hold).await;
+                }
+                return Err(e);
+            }
+        };
+        let (client, presented, appender_id, already) = joined;
         let wire = Arc::new(JoinedWire {
             client: crate::sqz_sync::SqzMutex::new(client),
             endpoint: admission.manager_endpoint.clone(),
@@ -367,8 +554,11 @@ impl KvMetaBackend {
             failures: AtomicU64::new(0),
             control_refusals: AtomicU64::new(0),
             grow_declined: AtomicU64::new(0),
+            colocated,
+            registrant_key,
+            meta_hold: std::sync::Mutex::new(meta_hold),
         });
-        let mut inner = Self::open_inner(
+        let mut inner = match Self::open_inner(
             path,
             OpenPosture::JoinedAppender,
             Some(JoinedOpen {
@@ -378,7 +568,14 @@ impl KvMetaBackend {
                 wire: Arc::clone(&wire),
             }),
         )
-        .await?;
+        .await
+        {
+            Ok(inner) => inner,
+            Err(e) => {
+                wire.release_meta_hold().await;
+                return Err(e);
+            }
+        };
         inner.writer_id = uuid::Uuid::from_u128(writer_id).to_string();
         inner.ro_cause = ReadOnlyCause::Writable;
         let be = Arc::new(inner);
@@ -397,7 +594,7 @@ impl KvMetaBackend {
         super::super::checkpoint::spawn_times_drain_task(&be);
         log::warn!(
             "meta volume {}: mounted as a JOINED symmetric appender {appender_id} (manager at {}, \
-             {}) — no writer_claim, no metadata reservation of its own; its ring, page and slot \
+             {}, {}) — no writer_claim, no reservation of its own; its ring, page and slot \
              trees are its own, tree 0 and the manager's trees a projection. Guarantee class: {}",
             path.display(),
             admission.manager_endpoint,
@@ -405,6 +602,13 @@ impl KvMetaBackend {
                 "rejoined over own residue"
             } else {
                 "fresh join"
+            },
+            if colocated {
+                "co-located: the manager's hold adopted"
+            } else if registrant_key != 0 {
+                "remote: a registrant under the manager's hold"
+            } else {
+                "detection-grade"
             },
             be.writer_guard_mode()
         );
@@ -437,6 +641,13 @@ impl KvMetaBackend {
             wire_failures: w.failures.load(Ordering::Relaxed),
             control_refusals: w.control_refusals.load(Ordering::Relaxed),
             ring_grow_declined: w.grow_declined.load(Ordering::Relaxed),
+            registrant_posture: if w.colocated {
+                "adopted"
+            } else if w.registrant_key != 0 {
+                "registrant"
+            } else {
+                "detection"
+            },
         })
     }
 
@@ -533,6 +744,9 @@ impl KvMetaBackend {
     async fn abandon_joined_open(&self) {
         self.shutting_down.store(true, Ordering::Release);
         self.ring.wake_parked();
+        if let Some(wire) = self.joined.get() {
+            wire.release_meta_hold().await;
+        }
     }
 
     // -----------------------------------------------------------------
@@ -1351,6 +1565,10 @@ impl KvMetaBackend {
                 );
             }
         }
+        // Rung 4's metadata hold goes LAST — after this mount's final
+        // ring write and its LeaveAppender: a registrant's key must cover
+        // every write it issued (an adopted hold releases nothing).
+        wire.release_meta_hold().await;
         Ok(())
     }
 

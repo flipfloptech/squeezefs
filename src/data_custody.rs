@@ -1153,6 +1153,20 @@ pub fn adopt_wero_colocated(
 /// Blocking (reservation ioctls) — call via `spawn_blocking` from async
 /// paths.
 pub fn join_wero_as_registrant(data_paths: &[PathBuf]) -> Result<WeroRegistrantJoin> {
+    join_wero_as_registrant_keyed(data_paths, None)
+}
+
+/// [`join_wero_as_registrant`] under a CALLER-CHOSEN key (`None` mints
+/// one): a JOINED appender (PR 12b) registers on the metadata namespace
+/// at its door and on the data namespaces at its ladder's rung 4, and the
+/// death ledger carries ONE key per member that the recovering manager
+/// preempts on every namespace class — two mints would leave one class
+/// unfenced. A process-standing registration on the same namespace set
+/// is joined verbatim whatever key is asked (one process, one key).
+pub fn join_wero_as_registrant_keyed(
+    data_paths: &[PathBuf],
+    key: Option<u64>,
+) -> Result<WeroRegistrantJoin> {
     if data_paths.is_empty() {
         return Err(SqueezefsError::InvalidOperation(
             "co-writer WERO join refuses: the mount names no data namespace, so there is \
@@ -1184,11 +1198,14 @@ pub fn join_wero_as_registrant(data_paths: &[PathBuf]) -> Result<WeroRegistrantJ
             },
         });
     }
-    let key = loop {
-        let k = rand::Rng::gen::<u64>(&mut rand::thread_rng());
-        if k != 0 {
-            break k;
-        }
+    let key = match key.filter(|k| *k != 0) {
+        Some(k) => k,
+        None => loop {
+            let k = rand::Rng::gen::<u64>(&mut rand::thread_rng());
+            if k != 0 {
+                break k;
+            }
+        },
     };
     let mut clients: Vec<Arc<dyn ReservationClient>> = Vec::new();
     for path in &key_set {
@@ -1288,6 +1305,57 @@ pub fn join_wero_as_registrant(data_paths: &[PathBuf]) -> Result<WeroRegistrantJ
             namespaces,
         },
     })
+}
+
+/// **Rung 4 on a JOINED appender** (symmetric PR 12b; design §5.8.1 —
+/// the manager HOLDS, every other appender is a REGISTRANT; KD-SYM-22 —
+/// co-located appenders SHARE one registrant): NEVER an acquire.
+///
+/// * `colocated` (the manager's D0 flock or its claim's boot is this
+///   host's — one head, one association, the device sees ONE host):
+///   [`adopt_wero_colocated`] — zero device mutation at the join and at
+///   the leave, the standing holder cross-checked against
+///   `enrolled_keys` (the data namespaces: the claim set's writer keys;
+///   the metadata namespace: the key the manager's `writer_claim`
+///   derives). A register here is the rung-9 finding #1 (the ladder's
+///   own-stale proof names the LIVE manager's holder key).
+/// * remote (its own association): [`join_wero_as_registrant_keyed`]
+///   under `key` — one key for every namespace class, so the death
+///   ledger's preempt of it fences the member everywhere.
+///
+/// `arm_data_plane`'s MultiWriter arm is the MANAGER's (it acquires); a
+/// joiner that ran it under a spec-strict target unregistered the
+/// manager's holder key through the ladder's own-stale proof and took the
+/// fence for itself. Blocking — call via `spawn_blocking`.
+pub fn join_wero_as_appender(
+    paths: &[PathBuf],
+    colocated: bool,
+    enrolled_keys: &[u64],
+    key: Option<u64>,
+) -> Result<WeroRegistrantJoin> {
+    if colocated {
+        adopt_wero_colocated(paths, enrolled_keys)
+    } else {
+        join_wero_as_registrant_keyed(paths, key)
+    }
+}
+
+/// The key this process REGISTERED itself — a `Holder`'s or a
+/// `Registrant`'s, never an `Adopted` hold's (that word is the
+/// co-located manager's own key: publishing it as ours would make the
+/// death ledger preempt the manager). `None` = nothing of ours stands
+/// on any namespace (the adopted and detection-grade postures) — the
+/// joined appender publishes 0 then (membership join, `PublishEndpoint`),
+/// PR 8's key-less same-host law: "there is no key to preempt".
+pub fn own_registered_key() -> Option<u64> {
+    registry()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|((_, role), _)| *role != HoldRole::Adopted)
+        .filter_map(|(_, w)| w.upgrade())
+        .map(|inner| inner.key)
+        .next()
 }
 
 /// `true` ⇔ this mount was asked to arm the multi-writer data plane

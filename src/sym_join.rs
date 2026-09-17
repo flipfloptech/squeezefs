@@ -457,23 +457,54 @@ pub async fn arm_joined(
         .iter()
         .all(|p| crate::meta_backend::reservation::resolve_for_mount(p).is_some());
     let allow_non_pr = crate::env_knobs::bool_knob("SQUEEZEFS_SYM_ALLOW_NON_PR", false);
+    // Rung 4's DATA half — NEVER an acquire (the manager holds; §5.8.1):
+    // the door decided co-located-or-remote per volume off the manager's
+    // flock and claim (one manager process per set, so the words agree)
+    // and minted the set's one registrant key; a co-located joiner ADOPTS
+    // the manager's standing data holds (KD-SYM-22 — the holder key
+    // cross-checked against the claim set's enrolled writer keys), a
+    // remote one REGISTERS under them with the same key its metadata
+    // registration carries. The first build ran `arm_data_plane`'s
+    // MultiWriter arm here — the manager's acquire — which under a
+    // spec-strict target unregistered the manager's holder key through
+    // the register ladder's own-stale proof and took the fence.
+    let (colocated, registrant_key) = meta
+        .volumes
+        .iter()
+        .filter_map(|v| v.joined_wire())
+        .fold((true, 0u64), |(c, k), w| {
+            (c && w.colocated, if k == 0 { w.registrant_key } else { k })
+        });
     let wero = if pr_capable {
+        let enrolled: Vec<u64> = match meta.volumes.first() {
+            Some(first) => crate::membership::ClaimSet::load(first)
+                .await
+                .map(|set| set.registrant_keys())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
         let paths = data_paths.to_vec();
-        let hold = squeezefs_ipc::sqz_blocking::run_blocking(move || {
-            crate::data_custody::arm_data_plane(
-                crate::data_custody::CustodyPosture::MultiWriter,
+        let joined = squeezefs_ipc::sqz_blocking::run_blocking(move || {
+            crate::data_custody::join_wero_as_appender(
                 &paths,
-                true,
+                colocated,
+                &enrolled,
+                (registrant_key != 0).then_some(registrant_key),
             )
         })
         .await
         .map_err(|e| {
             SqueezefsError::InvalidOperation(format!(
-                "symmetric join ladder rung 4 (registrant) refuses on a joined appender: {e}"
+                "symmetric join ladder rung 4 (registrant) refuses on a joined appender ({}): {e}",
+                if colocated {
+                    "co-located — adopting the manager's standing data holds"
+                } else {
+                    "remote — registering under the manager's standing data holds"
+                }
             ))
         })?;
         report.data_namespaces_registered = data_paths.len();
-        hold
+        Some(joined.hold().clone())
     } else if allow_non_pr {
         report.detection_grade = true;
         log::warn!(
@@ -545,8 +576,10 @@ pub async fn arm_joined(
     // The binding's JOINER half (§5.1.6): the listener travels to the
     // manager, which writes it into this mount's claim-set entry and binds
     // it in its own holder table; every other Live appender's published
-    // endpoint is bound here off the same durable state.
-    let pr_key = crate::data_custody::live_wero_key().unwrap_or(0);
+    // endpoint is bound here off the same durable state. The key is OURS
+    // alone (0 when rung 4 adopted — the manager's key is never published
+    // as a joiner's).
+    let pr_key = crate::data_custody::own_registered_key().unwrap_or(0);
     for vol in &meta.volumes {
         if let Err(e) = vol.joined_publish_endpoint(&report.endpoint, pr_key).await {
             log::warn!(

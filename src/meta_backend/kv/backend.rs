@@ -650,6 +650,22 @@ impl WriterClaim {
     pub fn age_secs(&self, now: u64) -> u64 {
         now.saturating_sub(self.ts)
     }
+
+    /// The holder's reservation key on the metadata namespace, DERIVED
+    /// from the two words the record carries — the ONE derivation the
+    /// guard mints its own key by ([`Self::derive_pr_key`]). A JOINED
+    /// appender (PR 12b) cross-checks the standing WERO holder against it
+    /// before adopting a co-located manager's hold: the durable claim
+    /// names whose fence it is.
+    pub fn pr_key(&self) -> u64 {
+        Self::derive_pr_key(&self.id, &self.boot)
+    }
+
+    /// `xxh3_64(writer_id ‖ NUL ‖ boot_id)` — the metadata namespace's
+    /// reservation key of the mount whose claim carries those words.
+    pub fn derive_pr_key(writer_id: &str, boot_id: &str) -> u64 {
+        xxhash_rust::xxh3::xxh3_64(format!("{writer_id}\u{0}{boot_id}").as_bytes())
+    }
 }
 
 /// The root-ino xattr key prefix of a mount registration
@@ -1789,9 +1805,7 @@ impl KvMetaBackend {
             crate::meta_backend::reservation::resolve_for_mount(&probe_path)
         })
         .await;
-        inner.pr_key = xxhash_rust::xxh3::xxh3_64(
-            format!("{}\u{0}{}", inner.writer_id, inner.boot_id).as_bytes(),
-        );
+        inner.pr_key = WriterClaim::derive_pr_key(&inner.writer_id, &inner.boot_id);
         // KD-SYM-13 (design-symmetric-metadata §5.8.1 / §5.8.2): the
         // symmetric arm refuses a substrate that cannot fence — and a
         // detection-grade posture on one that can — without the loud

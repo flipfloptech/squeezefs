@@ -3548,12 +3548,16 @@ pub async fn arm_joined_member(
     let Some((rec, home)) = best else {
         return Ok(None);
     };
+    // The key the S6 eviction hands the death ledger — ours alone (a
+    // co-located joiner ADOPTED the manager's hold: that key is the
+    // manager's, and a preempt of it would be a self-fence; PR 8's
+    // key-less same-host law publishes 0).
     join_member_on(
         &rec,
         secret,
         &node_id,
         MemberRole::Writer,
-        crate::data_custody::live_wero_key().unwrap_or(0),
+        crate::data_custody::own_registered_key().unwrap_or(0),
         on_purge,
         Some(home),
     )

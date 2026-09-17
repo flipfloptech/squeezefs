@@ -2694,15 +2694,33 @@ async fn acquire_and_hold<I: Iterator<Item = u64>>(
                 let Some(rec) = vol0.alloc_lease_record(vol_tag).await? else {
                     return Err(KvError::Busy(why));
                 };
-                if !rec.holder.owned_by_node(me.node_token) {
+                // The D0 flock this open holds proves dead exactly ONE
+                // same-node holder: the predecessor MANAGER (its page is
+                // page 0 — the flock holder's page). A same-node holder
+                // whose page is any other is a JOINED appender of this
+                // host (PR 12b — alive as readily as dead; its death is
+                // the ledger's, never the flock's), and every other node's
+                // is a live foreign holder: the arm joins neither.
+                let dead_by_flock =
+                    super::appender::read_directory(vol0.device_path(), vol0.superblock())
+                        .await?
+                        .iter()
+                        .any(|e| {
+                            e.appender_id == 0
+                                && e.page.as_ref().is_some_and(|p| {
+                                    p.identity
+                                        .is_mount(rec.holder.node_token, rec.holder.mount_slot)
+                                })
+                        });
+                if !dead_by_flock {
                     return Err(KvError::Busy(format!(
-                        "{why}; a live FOREIGN holder of a data volume this manager writes is \
-                         PR 12b's shape (a wire joiner's venue — the many-writer posture) — \
-                         refusing to arm beside it"
+                        "{why}; the holder is a live writer of another mount — a joined \
+                         appender's or a foreign node's (the many-writer posture); this mount \
+                         allocates through it, and its death is the ledger's to record"
                     )));
                 }
-                // A same-node predecessor of another mount slot: the D0
-                // flock this open holds is the kernel's proof it is dead.
+                // A same-node predecessor MANAGER of another mount slot: the
+                // D0 flock this open holds is the kernel's proof it is dead.
                 // Record the death, recover its home (the window's deltas
                 // onto its pages), record the recovery, then succeed it.
                 let refs: Vec<ExtentRef> = rec.bitmap.iter().map(|(_, e)| *e).collect();

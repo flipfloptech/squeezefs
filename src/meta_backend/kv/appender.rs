@@ -207,12 +207,48 @@ impl AppenderIdentity {
     /// derived — can only be a dead predecessor's: the kill-9 successor
     /// remounting at another mount point is the shipped same-host
     /// crash-remount shape, and the flat path reclaims it instantly. The
-    /// `(node_token, mount_slot)` narrowing is PR 10's, where the death
-    /// ledger names WHICH of a node's live mounts holds a page; until
-    /// then two live mounts of one node on one volume are unrepresentable
-    /// (the flock). The writer id changes per mount and never binds.
+    /// writer id changes per mount and never binds.
+    ///
+    /// **The proof reaches page 0 alone since PR 12b** (the N-daemon
+    /// posture): the flock is held by the MANAGER, whose page is page 0 —
+    /// every other page is a JOINED appender's, which holds no flock, so
+    /// a same-node `Live` page at another mount slot there is a LIVE
+    /// daemon of this host as readily as a dead one. Those pages are
+    /// judged by [`Self::is_mount`] (the exact `(node, mount slot)`
+    /// binding) and a dead one is the death ledger's (PR 10) — see
+    /// [`page_is_own`].
     pub fn owned_by_node(&self, node_token: u64) -> bool {
         self.node_token == node_token
+    }
+
+    /// The exact KD-MW-2 mount identity — `(node_token, mount_slot)`; the
+    /// per-open writer id never binds.
+    pub fn is_mount(&self, node_token: u64, mount_slot: u32) -> bool {
+        self.node_token == node_token && self.mount_slot == mount_slot
+    }
+}
+
+/// **The ONE "is this page OURS" predicate** (§5.3.2 identity binding as
+/// PR 12b narrows it): page 0 of a WRITER open is this node's whatever
+/// mount slot it carries (the D0 flock is the same-host proof for the
+/// manager's page — `AppenderIdentity::owned_by_node`); every other page
+/// — and every page on a JOINED open — is ours iff it carries this exact
+/// `(node, mount slot)`. Before the narrowing every same-node page was
+/// own residue, which under N daemons on one host would have adopted a
+/// LIVE joiner's ring at the manager's remount, floored ring 0 on its
+/// leased slots for the mount's life (the PR 10 Issue-32 wedge, reachable
+/// again) and named its allocation lease dead at the arm.
+pub fn page_is_own(
+    appender_id: u32,
+    page_identity: &AppenderIdentity,
+    own_node: u64,
+    own_slot: u32,
+    writer_open: bool,
+) -> bool {
+    if appender_id == 0 && writer_open {
+        page_identity.owned_by_node(own_node)
+    } else {
+        page_identity.is_mount(own_node, own_slot)
     }
 }
 

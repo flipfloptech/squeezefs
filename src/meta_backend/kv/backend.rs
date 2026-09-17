@@ -16206,9 +16206,11 @@ impl KvMetaBackend {
             .as_ref()
             .and_then(|s| s.native_slot)
             .unwrap_or(0);
-        // This NODE's identity — the page-root law reads its own pages
-        // only (the same binding `open_appender_regions` makes).
-        let own_node_token = Self::appender_identity_scope(&read_boot_id()).0;
+        // This mount's identity — the page-root law reads its own pages
+        // only (the same binding `open_appender_regions` makes:
+        // `appender::page_is_own`).
+        let (own_node_token, own_mount_slot) = Self::appender_identity_scope(&read_boot_id());
+        let writer_open = posture == OpenPosture::Writer;
         let mut guests: Vec<(ForestSlot, Arc<KvTree>, RootPtr)> = Vec::new();
         let (mut cursor, end) = slot_state_key_range();
         loop {
@@ -16243,7 +16245,7 @@ impl KvMetaBackend {
                         Self::unleased_root_from_directory(
                             &directory,
                             native_routing_slot,
-                            own_node_token,
+                            (own_node_token, own_mount_slot, writer_open),
                             slot,
                             root,
                         ),
@@ -16267,8 +16269,13 @@ impl KvMetaBackend {
                             .find(|e| e.appender_id == appender_id)
                             .and_then(|e| e.page.as_ref());
                         let ours = lessee_page.is_none_or(|p| {
-                            p.identity.owned_by_node(own_node_token)
-                                || p.state == super::appender::AppenderState::Recovering
+                            super::appender::page_is_own(
+                                appender_id,
+                                &p.identity,
+                                own_node_token,
+                                own_mount_slot,
+                                writer_open,
+                            ) || p.state == super::appender::AppenderState::Recovering
                         });
                         (
                             Self::leased_root_from_directory(
@@ -16709,17 +16716,14 @@ impl KvMetaBackend {
         let capacity = super::appender::appenders_capacity(sb.heap.len, ring_bytes);
 
         // A writer reaching this point holds the D0 flock (step (1) of
-        // `open`): a same-NODE Live page is a dead predecessor's residue
-        // whatever mount slot it carried — see `owned_by_node`. A JOINED
-        // appender holds no flock and shares its node with the manager and
-        // every other joiner on the host: its own page is the one carrying
-        // its exact `(node, mount slot)`.
+        // `open`): a same-NODE Live PAGE 0 is a dead predecessor's residue
+        // whatever mount slot it carried — the manager's page is the flock
+        // holder's. Every other page is a JOINED appender's, which holds
+        // no flock and shares its node with the manager and every other
+        // joiner on the host: ours iff it carries this exact `(node, mount
+        // slot)` (`appender::page_is_own`, PR 12b).
         let mine = |p: &AppenderPage| {
-            if is_joined {
-                p.identity.node_token == scope.0 && p.identity.mount_slot == scope.1
-            } else {
-                p.identity.owned_by_node(scope.0)
-            }
+            super::appender::page_is_own(p.appender_id, &p.identity, scope.0, scope.1, is_writer)
         };
         // The ONE page a writer may not join over (PR 10 narrowed PR 2/3's
         // refusal to it): a FOREIGN node's `Live` / `Recovering` page whose
@@ -17706,7 +17710,7 @@ impl KvMetaBackend {
     fn unleased_root_from_directory(
         directory: &[super::appender::AppenderEntry],
         native_routing_slot: u16,
-        own_node_token: u64,
+        own: (u64, u32, bool),
         slot: super::record::ForestSlot,
         recorded: RootPtr,
     ) -> RootPtr {
@@ -17718,7 +17722,7 @@ impl KvMetaBackend {
             if !matches!(
                 p.state,
                 super::appender::AppenderState::Live | super::appender::AppenderState::Recovering
-            ) || !p.identity.owned_by_node(own_node_token)
+            ) || !super::appender::page_is_own(e.appender_id, &p.identity, own.0, own.1, own.2)
             {
                 continue;
             }

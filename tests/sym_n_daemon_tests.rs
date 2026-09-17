@@ -572,6 +572,199 @@ async fn a_dead_joiners_region_is_recovered_by_the_manager_and_a_third_daemon_ta
     fsck_clean(&uris).await;
 }
 
+/// One daemon's storm into `dir`: `n` creates, every other one renamed
+/// (a `Delta` on the moved inode + two dentry records), every fourth one
+/// unlinked — the record shapes a replay must fold in seq order. Returns
+/// the names that must resolve afterwards and those that must not.
+async fn storm(
+    routed: &RoutedMetaBackend,
+    dir: u64,
+    prefix: &str,
+    n: usize,
+) -> (Vec<(String, u64)>, Vec<String>) {
+    let created = create_files(routed, dir, prefix, n).await;
+    let mut live = Vec::new();
+    let mut gone = Vec::new();
+    for (i, (name, ino)) in created.into_iter().enumerate() {
+        if i % 4 == 3 {
+            routed
+                .unlink(dir, &name)
+                .await
+                .unwrap_or_else(|e| panic!("unlink {name}: {e}"));
+            gone.push(name);
+        } else if i % 2 == 1 {
+            let renamed = format!("{name}.moved");
+            routed
+                .rename(dir, &name, dir, &renamed, 0)
+                .await
+                .unwrap_or_else(|e| panic!("rename {name}: {e}"));
+            gone.push(name);
+            live.push((renamed, ino));
+        } else {
+            live.push((name, ino));
+        }
+    }
+    (live, gone)
+}
+
+fn replay_violations() -> (u64, u64, u64) {
+    use squeezefs::meta_backend::kv::{
+        META_KV_REPLAY_EXTENT_VIOLATIONS, META_KV_REPLAY_KEY_VIOLATIONS,
+        META_KV_REPLAY_LEASE_VIOLATIONS,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        META_KV_REPLAY_KEY_VIOLATIONS.load(Relaxed),
+        META_KV_REPLAY_LEASE_VIOLATIONS.load(Relaxed),
+        META_KV_REPLAY_EXTENT_VIOLATIONS.load(Relaxed),
+    )
+}
+
+/// **The two-daemon storm and the manager's remount** (deliverable 2's
+/// pin, §5.3.4's violation classes on two REAL rings): the manager and two
+/// joiners storm THREE directories at once (creates, renames, unlinks —
+/// every record shape), all three die without a leave, the manager
+/// remounts: its own page 0 is own residue (`self_recoveries` 1), the two
+/// joiners' `Live` pages under this node's OTHER mount slots are NOT
+/// adopted (PR 2's "a same-node page is own residue" law narrowed to page
+/// 0 — a same-host joiner is a live daemon as readily as a dead one; the
+/// death ledger decides), their slots stay leased to them (the manager's
+/// door refuses `SlotBusy`), and once the ledger names both dead ONE
+/// recovery pass replays both rings into the trees: every acked name
+/// resolves, every unlinked one is gone, the Key / Lease / Extent
+/// violation classes read 0, fsck is clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_two_daemon_storm_survives_the_managers_remount_with_zero_violations() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "a"), (SLOT_B, "b")]).await;
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let mdir = manager
+        .create(1, "m", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .unwrap()
+        .ino;
+    let j1 = join(&uris, &venue, &mvol, 21).await;
+    let j2 = join(&uris, &venue, &mvol, 22).await;
+    let v1 = Arc::clone(&j1.volumes[0]);
+    let v2 = Arc::clone(&j2.volumes[0]);
+    let (id1, id2) = (
+        v1.appender_stats().unwrap().appender_id,
+        v2.appender_stats().unwrap().appender_id,
+    );
+    let (ident1, ident2) = (
+        v1.joined_wire().unwrap().identity,
+        v2.joined_wire().unwrap().identity,
+    );
+    let violations_before = replay_violations();
+
+    // The storm: three daemons at once, one checkpoint in the middle of
+    // each joiner's stream so its window holds records on both sides.
+    let ((la, ga), (lb, gb), (lm, gm)) = tokio::join!(
+        async {
+            let first = storm(&j1, dirs[0], "a", 24).await;
+            v1.checkpoint_now().await.unwrap();
+            let second = storm(&j1, dirs[0], "A", 24).await;
+            ([first.0, second.0].concat(), [first.1, second.1].concat())
+        },
+        async {
+            let first = storm(&j2, dirs[1], "b", 24).await;
+            v2.checkpoint_now().await.unwrap();
+            let second = storm(&j2, dirs[1], "B", 24).await;
+            ([first.0, second.0].concat(), [first.1, second.1].concat())
+        },
+        storm(&manager, mdir, "m", 48),
+    );
+    for (v, who) in [(&v1, "j1"), (&v2, "j2"), (&mvol, "manager")] {
+        assert_must_stay_zero(v, who);
+    }
+    // The syncs the acks stood on: every ring's entries are on the device
+    // (a joiner's fsync-class durability is its ring write + barrier).
+    v1.sync_device().await.unwrap();
+    v2.sync_device().await.unwrap();
+    mvol.sync_device().await.unwrap();
+
+    // The kill: every daemon dies without a leave.
+    venue.tear_down();
+    drop((v1, v2));
+    drop((j1, j2));
+    drop(mvol);
+    drop(manager);
+    reset_process_state();
+
+    // The manager's remount.
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let ms = mvol.appender_stats().unwrap();
+    assert_eq!(
+        ms.self_recoveries, 1,
+        "page 0 alone is own residue; the joiners' pages are other daemons'"
+    );
+    assert_eq!(
+        ms.live_pages_at_mount, 3,
+        "page 0 + both joiners' Live pages listed, the joiners' adopted by nobody"
+    );
+    for (id, slot) in [(id1, SLOT_A), (id2, SLOT_B)] {
+        assert_eq!(
+            page_of(&uris[0], &mvol, id).await.map(|p| p.state),
+            Some(AppenderState::Live),
+            "appender {id}'s page stays Live until the ledger names it"
+        );
+        assert!(
+            matches!(
+                tree0_state(&mvol, slot).await,
+                Some(SlotState::Leased { appender_id, .. }) if appender_id == id
+            ),
+            "slot {slot} stays leased to appender {id}: {:?}",
+            tree0_state(&mvol, slot).await
+        );
+    }
+    // The manager's door refuses a slot another daemon leases.
+    let refused = manager
+        .create(dirs[0], "intruder", libc::S_IFREG | 0o644, 1000, 1000)
+        .await;
+    assert!(
+        matches!(&refused, Err(e) if e.to_string().contains("EAGAIN") || e.to_string().contains("lease")),
+        "a create into a foreign-leased slot refuses at the door: {refused:?}"
+    );
+    // The manager's own storm survived its own ring's replay.
+    assert_all_resolve(&manager, mdir, &lm).await;
+    for name in &gm {
+        assert!(
+            manager.lookup(mdir, name).await.is_err(),
+            "{name} was unlinked"
+        );
+    }
+
+    // The ledger names both dead; ONE projection recovers both rings.
+    assert!(!mvol.record_death_with_key(ident1, 7, 0).await.unwrap());
+    assert!(!mvol.record_death_with_key(ident2, 7, 0).await.unwrap());
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(rep.recovered(), 2, "{rep:?}");
+    for (dir, live, gone) in [(dirs[0], &la, &ga), (dirs[1], &lb, &gb)] {
+        assert_all_resolve(&manager, dir, live).await;
+        for name in gone {
+            assert!(
+                manager.lookup(dir, name).await.is_err(),
+                "{name} was unlinked or renamed away"
+            );
+        }
+    }
+    assert_eq!(
+        replay_violations(),
+        violations_before,
+        "Key / Lease / Extent violation classes never moved"
+    );
+    assert_must_stay_zero(&mvol, "manager after recovery");
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
 /// **N = 3 in one process** (N is unbounded by design; three is the pin):
 /// two joiners beside the manager, each acquiring a DIFFERENT released
 /// slot first-touch, each committing into its own ring; `dlm_rpcs`

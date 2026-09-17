@@ -2799,12 +2799,24 @@ impl KvMetaBackend {
                 path.display()
             ))
         })?;
-        if page.identity.owned_by_node(set.identity.node_token) {
+        // The manager's page under this node, or any page under this exact
+        // mount identity, is own residue the next mount recovers itself; a
+        // same-node JOINED appender's page (PR 12b) is another daemon's —
+        // attestable once the flock-free liveness probes below pass.
+        if super::super::appender::page_is_own(
+            appender_id,
+            &page.identity,
+            set.identity.node_token,
+            set.identity.mount_slot,
+            true,
+        ) {
             return Err(KvError::Busy(format!(
-                "{}: appender {appender_id}'s page is this node's OWN residue (node {:#018x}) — \
-                 the next mount of this node recovers it itself; nothing to attest",
+                "{}: appender {appender_id}'s page is this node's OWN residue (node {:#018x}, \
+                 mount slot {:#x}) — the next mount of this node recovers it itself; nothing to \
+                 attest",
                 path.display(),
-                page.identity.node_token
+                page.identity.node_token,
+                page.identity.mount_slot
             )));
         }
         // The liveness probe an offline verb has (the writer claims above,

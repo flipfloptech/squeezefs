@@ -180,6 +180,13 @@ async fn stamp_capabilities(path: &Path) {
 }
 
 async fn volume_set(dir: &Path, tag: &str, n: usize) -> Vec<PathBuf> {
+    // PR 12: the per-volume-owner recipe is the FLAT multi-writer class's
+    // — on a bit-17 set `volume set-owners` is RETIRED (ownership is a slot
+    // lease), so these fixtures format FLAT whatever leg the environment
+    // selects (the seam is the forest suites' stamp, cleared around the
+    // format the way `sym_convert_tests` does).
+    let prior_seam = std::env::var_os("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
     let plan = squeezefs::meta_backend::plan_meta_slot_set(n).expect("derived slot plan");
     let mut out = Vec::new();
     for (i, stamp) in plan.stamps.iter().enumerate().take(n) {
@@ -195,6 +202,9 @@ async fn volume_set(dir: &Path, tag: &str, n: usize) -> Vec<PathBuf> {
         .expect("format stamped meta volume");
         stamp_capabilities(&p).await;
         out.push(p);
+    }
+    if let Some(v) = prior_seam {
+        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", v);
     }
     out
 }

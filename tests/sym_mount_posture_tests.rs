@@ -749,6 +749,106 @@ async fn plane_gate_keys_on_the_allocation_lease_of_a_grant_armed_allocator() {
 }
 
 // ===========================================================================
+// 6b. PR 7's owed window — the served MarkShared under the W1 site's guard
+// ===========================================================================
+
+/// The served `MarkShared` runs UNDER the source file's block guard
+/// (`BLOCK_FLUSH_LOCKS(global ino, block index)`, lock-order rung 3 — the
+/// guard the local W1 patch site holds from its sole-owner predicate through
+/// its DMA), so a foreign cloner's mark lands wholly before a patch's fenced
+/// mark load or wholly after its DMA — never between the patcher's durable
+/// probe and its mark load (PR 7 review round 2, Issue 20's window). The
+/// detection tripwire `served_mark_shared_under_patch` stays as the
+/// must-stay-0 belt behind the guard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_served_mark_shared_waits_out_the_patch_sites_block_guard() {
+    use squeezefs::meta_backend::kv::block_refs::BlockRef;
+    use squeezefs::meta_ship::manager::{ManagerClient, ManagerReply};
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempfile::tempdir().unwrap();
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    let data = data_file();
+    let rig = mount_data(&uris, data.path(), &Knobs::armed()).await;
+    let src = rig.mk_file("src").await;
+    let offset = rig.publish_block(src, 0).await;
+    let idx = offset / rig.alloc.chunk_size();
+    let (_v, local) = rig.routed.route_ino(src);
+    let venue = HoldersVenue::stand_up(&rig.routed, &[]).await;
+    let endpoint = venue.endpoint();
+    let tripwires_before = squeezefs::fuse_client::METRICS
+        .invariant_tripwires
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    // A W1 patch in flight on (src, block 0): the patch site's guard held,
+    // the incarnation word unstable.
+    let guard = squeezefs::fuse_client::BLOCK_FLUSH_LOCKS
+        .get_lock(src, 0)
+        .lock()
+        .await;
+    assert!(
+        rig.alloc.begin_patch_sole_owner(offset),
+        "the patch is admitted"
+    );
+
+    // A foreign cloner's MarkShared over the wire: it must WAIT for the
+    // guard — the mark lands only after the patch completes.
+    let mut client = ManagerClient::connect(&endpoint, common::sym::VENUE_SECRET, "pr12-cloner", 0)
+        .await
+        .expect("dial the manager");
+    let reference = BlockRef {
+        vol_tag: rig.tag(),
+        block_idx: idx,
+        owner_ino: local,
+        block_index: 0,
+    };
+    let marked = tokio::spawn(async move { client.mark_shared(reference).await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !marked.is_finished(),
+        "the served mark waits on the patch site's guard"
+    );
+    assert!(
+        !rig.alloc.is_shared(offset),
+        "no RAM mark under a patch in flight"
+    );
+
+    // The patch completes (its DMA lands, stability restored) and releases
+    // the guard: the mark lands, the RAM mark set, the tripwire untouched.
+    rig.alloc.publish_block(offset);
+    drop(guard);
+    let reply = marked
+        .await
+        .unwrap()
+        .expect("the mark lands after the patch");
+    assert_eq!(reply, ManagerReply::Marked { already: false });
+    assert!(
+        rig.alloc.is_shared(offset),
+        "the RAM mark landed after the guard"
+    );
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .invariant_tripwires
+            .load(std::sync::atomic::Ordering::Relaxed),
+        tripwires_before,
+        "served_mark_shared_under_patch is unreachable under the guard"
+    );
+    // And the NEXT patch attempt declines: the block is SHARED.
+    let guard = squeezefs::fuse_client::BLOCK_FLUSH_LOCKS
+        .get_lock(src, 0)
+        .lock()
+        .await;
+    assert!(
+        !rig.alloc.begin_patch_sole_owner(offset),
+        "W1 declines a shared block"
+    );
+    rig.alloc.publish_block(offset);
+    drop(guard);
+    venue.tear_down();
+    rig.shutdown().await;
+}
+
+// ===========================================================================
 // 7. PR 4 review round 6, Issue 31 — the appender's own checkpoint refreshes
 //    its page's words, and the release bound reads them
 // ===========================================================================

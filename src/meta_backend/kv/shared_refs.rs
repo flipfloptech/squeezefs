@@ -252,6 +252,11 @@ pub trait RoutedSharedRefs: Send + Sync {
     >;
     /// The RAM mark of `(vol_tag, block_idx)` set on this mount.
     fn note_marked(&self, vol_tag: u64, block_idx: u64);
+    /// The GLOBAL ino of LOCAL key ino `local` on `volume` — the FUSE
+    /// layer's key for the block guard a served `MarkShared` takes (PR 12:
+    /// the patch site holds `BLOCK_FLUSH_LOCKS(global ino, block index)`).
+    /// `None` when `volume` is not one of the routed set's.
+    fn global_ino(&self, volume: &KvMetaBackend, local: u64) -> Option<u64>;
 }
 
 /// The installed hooks — a `RwLock` rather than an `ArcSwap` because the

@@ -429,6 +429,11 @@ impl HoldersVenue {
         Self { host }
     }
 
+    /// The listener's address (a wire client's dial).
+    pub fn endpoint(&self) -> String {
+        self.host.endpoint().to_string()
+    }
+
     pub fn tear_down(self) {
         squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
         self.host.shutdown();

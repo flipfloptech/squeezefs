@@ -1919,26 +1919,39 @@ impl crate::meta_backend::kv::shared_refs::RoutedSharedRefs for RoutedSharedRefH
             return;
         };
         if let Some((alloc, offset)) = router.allocator_for_tag(vol_tag, block_idx) {
-            // The cross-process W1 window PR 12 owes (review round 2, Issue
-            // 20): a served mark lands after its durable commit and outside
-            // the guard the local patch site holds, so a foreign cloner's
-            // mark can arrive between the patcher's durable probe and its
-            // fenced RAM-mark load. Until the served mark takes that guard,
-            // the window is DETECTED: an unstable incarnation word here IS a
-            // patch in flight on the block being marked.
+            // The cross-process W1 window (PR 7 review round 2, Issue 20;
+            // CLOSED by PR 12): the served mark runs under the source
+            // file's block guard — the one the local patch site holds from
+            // its predicate through its DMA — so an unstable incarnation
+            // word here is unreachable by any legal schedule and stays the
+            // must-stay-0 belt behind the guard.
             if alloc.fill_incarnation(offset).is_none() {
                 crate::note_invariant_tripwire(
                     "served_mark_shared_under_patch",
                     &format!(
                         "a served MarkShared marked block {block_idx} of data volume \
                          {vol_tag:#x} ({}) while a W1 patch was in flight on it — the \
-                         cross-process patch-under-clone window PR 12 closes",
+                         served mark holds the block guard, so this is a guard the patch \
+                         site did not take",
                         alloc.volume_id()
                     ),
                 );
             }
             alloc.mark_shared(offset);
         }
+    }
+
+    fn global_ino(
+        &self,
+        volume: &crate::meta_backend::kv::backend::KvMetaBackend,
+        local: u64,
+    ) -> Option<u64> {
+        let mb = self.meta.upgrade()?;
+        let v_idx = mb
+            .volumes
+            .iter()
+            .position(|v| std::ptr::eq(std::sync::Arc::as_ptr(v), volume))?;
+        mb.try_make_global_ino(local, v_idx)
     }
 }
 

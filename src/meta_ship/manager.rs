@@ -743,36 +743,62 @@ impl ManagerService {
                     block_idx,
                     owner_ino,
                     block_index,
-                } => self
-                    .volume
-                    .mark_block_ref_shared(&crate::meta_backend::kv::block_refs::BlockRef {
-                        vol_tag: *vol_tag,
-                        block_idx: *block_idx,
-                        owner_ino: *owner_ino,
-                        block_index: *block_index,
-                    })
-                    .await
-                    .map(|o| {
-                        // The durable bit is the authority; the RAM mark the
-                        // W1 predicate reads synchronously is set beside it
-                        // on the serving mount through the routed hooks
-                        // (absent = no armed router here, nothing to set).
-                        if o != shared_refs::MarkOutcome::Gone {
-                            if let Some(routed) = shared_refs::routed() {
-                                routed.note_marked(*vol_tag, *block_idx);
+                } => {
+                    // PR 12 (PR 7's owed window, review round 2 Issue 20): the
+                    // served mark runs UNDER the source file's block guard —
+                    // `BLOCK_FLUSH_LOCKS(owner_ino, block_index)`, lock-order
+                    // rung 3, the guard the local W1 patch site holds from its
+                    // sole-owner predicate through its DMA — so the durable
+                    // bit and the RAM mark land either wholly BEFORE a patch's
+                    // fenced mark load (the patch declines) or wholly AFTER a
+                    // patch's DMA (a legitimate patch of a then-unshared
+                    // block). Rung 3 before the commit's rung-4 locks: the
+                    // shipped order. The metadata plane never held this guard
+                    // before, so a served mark could land between the
+                    // patcher's durable probe and its mark load.
+                    let guard_key =
+                        shared_refs::routed().and_then(|r| r.global_ino(&self.volume, *owner_ino));
+                    let _block_guard = match guard_key {
+                        Some(global) => Some(
+                            crate::fuse_client::BLOCK_FLUSH_LOCKS
+                                .get_lock(global, *block_index)
+                                .lock()
+                                .await,
+                        ),
+                        // No routed set (a bare-volume rig): nothing patches.
+                        None => None,
+                    };
+                    self.volume
+                        .mark_block_ref_shared(&crate::meta_backend::kv::block_refs::BlockRef {
+                            vol_tag: *vol_tag,
+                            block_idx: *block_idx,
+                            owner_ino: *owner_ino,
+                            block_index: *block_index,
+                        })
+                        .await
+                        .map(|o| {
+                            // The durable bit is the authority; the RAM mark
+                            // the W1 predicate reads synchronously is set
+                            // beside it on the serving mount through the
+                            // routed hooks (absent = no armed router here,
+                            // nothing to set).
+                            if o != shared_refs::MarkOutcome::Gone {
+                                if let Some(routed) = shared_refs::routed() {
+                                    routed.note_marked(*vol_tag, *block_idx);
+                                }
                             }
-                        }
-                        match o {
-                            shared_refs::MarkOutcome::Marked => {
-                                ManagerReply::Marked { already: false }
+                            match o {
+                                shared_refs::MarkOutcome::Marked => {
+                                    ManagerReply::Marked { already: false }
+                                }
+                                shared_refs::MarkOutcome::Already => {
+                                    ManagerReply::Marked { already: true }
+                                }
+                                shared_refs::MarkOutcome::Gone => ManagerReply::SharedGone,
                             }
-                            shared_refs::MarkOutcome::Already => {
-                                ManagerReply::Marked { already: true }
-                            }
-                            shared_refs::MarkOutcome::Gone => ManagerReply::SharedGone,
-                        }
-                    })
-                    .map_err(|e| crate::meta_backend::kv::KvError::Busy(e.to_string())),
+                        })
+                        .map_err(|e| crate::meta_backend::kv::KvError::Busy(e.to_string()))
+                }
                 ManagerCall::ShareBlock {
                     vol_tag,
                     block_idx,

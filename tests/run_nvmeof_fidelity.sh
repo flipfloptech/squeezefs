@@ -1440,6 +1440,182 @@ leg_sym_manager_failover() {
 # kill -9 with the successor re-walking the ladder inside the derived bound,
 # and the clean leave's ZERO residue on both namespaces.
 # ---------------------------------------------------------------------------
+# PR 12b — the N-daemon leg inside `sym-join-ladder`: joiners 2 and 3
+# mount at their own mount points while the manager (mounted at
+# $STATE/mnt-sym-join by the caller) serves. Every assertion here is a
+# `bad` that names the daemon; the manager's mount is left as found.
+sym_n_daemon_leg() { # meta data out
+    local meta="$1" data="$2" out="$3"
+    local mnt="$STATE/mnt-sym-join" j2="$STATE/mnt-sym-join-j2" j3="$STATE/mnt-sym-join-j3"
+    local j2log="$STATE/sym-join-j2.log" j3log="$STATE/sym-join-j3.log"
+    local reg_m0 reg_d0 reg_m reg_d v id2 id3 t0 t1 pid n
+    mkdir -p "$j2" "$j3"
+    : > "$j2log"
+    : > "$j3log"
+    reg_m0=$(nvme resv-report "$meta" --eds -o json 2>/dev/null | jq -r .regctl)
+    reg_d0=$(nvme resv-report "$data" --eds -o json 2>/dev/null | jq -r .regctl)
+    jstat() { # mnt field
+        mnt_stat "$1" "$2"
+    }
+    mount_joiner() { # log mnt
+        udevadm settle --timeout=10 2>/dev/null || true
+        SQUEEZEFS_SYMMETRIC_META=1 RUST_LOG=info \
+            "$FIDELI_BIN" --log-file "$1" mount "sqmeta://$meta" "$2" --daemon --allow-other >> "$out" 2>&1
+    }
+    wait_mnt() { # mnt
+        local i
+        for i in $(seq 1 60); do
+            awk -v m="$1" '$2==m{f=1} END{exit !f}' /proc/mounts && return 0
+            sleep 0.5
+        done
+        return 1
+    }
+    joiner_asserts() { # mnt name
+        local m="$1" who="$2" posture symm lease jid jpost held mmode
+        posture=$(jstat "$m" mount_posture)
+        symm=$(jstat "$m" symmetric_meta)
+        lease=$(jstat "$m" manager_lease)
+        jid=$(jstat "$m" joined_appender_id)
+        jpost=$(jstat "$m" joined_registrant_posture)
+        held=$(jstat "$m" slot_leases_held)
+        mmode=$(jstat "$m" membership_mode)
+        log "SYMJOIN/N: $who mount_posture=$posture symmetric_meta=$symm manager_lease=$lease joined_appender_id=$jid joined_registrant_posture=$jpost slot_leases_held=$held membership_mode=$mmode"
+        [ "$posture" = "writer" ] && ok "SYMJOIN/N: $who is a WRITER (every RW mount of an armed set)" || bad "SYMJOIN/N: $who mount_posture=$posture"
+        [ "$symm" = "1" ] || bad "SYMJOIN/N: $who symmetric_meta=$symm"
+        case "$lease" in
+        peer:*) ok "SYMJOIN/N: $who holds no manager lease (manager_lease=$lease) — a joined appender" ;;
+        *) bad "SYMJOIN/N: $who manager_lease=$lease (want peer:…)" ;;
+        esac
+        [ -n "$jid" ] && [ "$jid" != "null" ] && [ "$jid" -ge 1 ] 2>/dev/null && ok "SYMJOIN/N: $who joined as appender $jid (its own page + ring)" || bad "SYMJOIN/N: $who joined_appender_id=$jid"
+        [ "$jpost" = "adopted" ] && ok "SYMJOIN/N: $who rung 4 ADOPTED the co-located manager's holds (KD-SYM-22: one host, one registrant)" || bad "SYMJOIN/N: $who joined_registrant_posture=$jpost (want adopted on one host)"
+        [ "${held:-0}" -ge 1 ] 2>/dev/null && ok "SYMJOIN/N: $who slot_leases_held=$held (its rotor over the wire)" || bad "SYMJOIN/N: $who slot_leases_held=$held"
+        [ "$mmode" = "member" ] && ok "SYMJOIN/N: $who is a MEMBER of the manager's shard (membership_mode=member)" || bad "SYMJOIN/N: $who membership_mode=$mmode"
+    }
+    t0=$(date +%s%3N)
+    mount_joiner "$j2log" "$j2"
+    if ! wait_mnt "$j2"; then
+        bad "SYMJOIN/N: joiner 2 did not mount — $(tail -12 "$j2log"; tail -3 "$out")"
+        return
+    fi
+    mount_joiner "$j3log" "$j3"
+    if ! wait_mnt "$j3"; then
+        bad "SYMJOIN/N: joiner 3 did not mount — $(tail -12 "$j3log"; tail -3 "$out")"
+        umount "$j2" 2>/dev/null
+        return
+    fi
+    t1=$(date +%s%3N)
+    sleep 2
+    log "SYMJOIN/N: two joiners mounted in $((t1 - t0)) ms; registrants — meta [$(regkeys "$meta")] data [$(regkeys "$data")]"
+    joiner_asserts "$j2" "joiner 2"
+    joiner_asserts "$j3" "joiner 3"
+    id2=$(jstat "$j2" joined_appender_id)
+    id3=$(jstat "$j3" joined_appender_id)
+    [ "$id2" != "$id3" ] && ok "SYMJOIN/N: disjoint appender ids ($id2, $id3)" || bad "SYMJOIN/N: both joiners got appender id $id2"
+    v=$(jstat "$mnt" appenders_known)
+    [ "${v:-0}" -ge 3 ] 2>/dev/null && ok "SYMJOIN/N: the manager's directory names $v Live appenders (itself + 2 joiners — appenders_known)" || bad "SYMJOIN/N: manager appenders_known=$v (want ≥ 3)"
+    reg_m=$(nvme resv-report "$meta" --eds -o json 2>/dev/null | jq -r .regctl)
+    reg_d=$(nvme resv-report "$data" --eds -o json 2>/dev/null | jq -r .regctl)
+    [ "$reg_m" = "$reg_m0" ] && [ "$reg_d" = "$reg_d0" ] && ok "SYMJOIN/N: the joins registered NOTHING (regctl meta $reg_m0→$reg_m, data $reg_d0→$reg_d — adoption)" || bad "SYMJOIN/N: the joins moved the registrant count (meta $reg_m0→$reg_m, data $reg_d0→$reg_d)"
+    [ "$(nvme resv-report "$meta" --eds -o json 2>/dev/null | jq -r .rtype)" = "3" ] && ok "SYMJOIN/N: the manager's rtype-3 hold on the METADATA namespace stands under the joiners" || bad "SYMJOIN/N: meta rtype moved under the joiners"
+
+    # Every daemon writes its own directory: 100 creates each, every one
+    # acked, in each joiner's OWN ring (the manager's appenders_live says
+    # who; `joined_wire_failures` must stay 0).
+    local acked2 acked3 i
+    mkdir -p "$j2/from-j2" "$j3/from-j3"
+    acked2=0
+    acked3=0
+    for i in $(seq 1 100); do
+        echo "j2 $i" > "$j2/from-j2/f$i" 2>> "$out" && acked2=$((acked2 + 1))
+        echo "j3 $i" > "$j3/from-j3/f$i" 2>> "$out" && acked3=$((acked3 + 1))
+    done
+    dd if=/dev/urandom of="$j2/from-j2/big.bin" bs=1M count=4 status=none 2>> "$out"
+    sync
+    [ "$acked2" = "100" ] && [ "$acked3" = "100" ] && ok "SYMJOIN/N: 100 + 100 creates acked on the joiners" || bad "SYMJOIN/N: acked j2=$acked2 j3=$acked3 of 100 each"
+    for m in "$j2" "$j3"; do
+        v=$(jstat "$m" joined_wire_failures)
+        [ "${v:-x}" = "0" ] || bad "SYMJOIN/N: $m joined_wire_failures=$v"
+        v=$(jstat "$m" joined_control_refusals)
+        [ "${v:-x}" = "0" ] || bad "SYMJOIN/N: $m joined_control_refusals=$v (a control write reached a joiner)"
+    done
+    # Cross-daemon reads: exact at the next resolve — the manager reads a
+    # joiner's directory through its token, joiner 2 reads joiner 3's and
+    # the manager's, the reader would too. The count and one content.
+    n=$(ls "$mnt/from-j2" 2>> "$out" | grep -c '^f')
+    [ "$n" = "100" ] && ok "SYMJOIN/N: the manager lists joiner 2's 100 names (a foreign slot through its holder's token)" || bad "SYMJOIN/N: manager lists $n of joiner 2's 100"
+    [ "$(cat "$mnt/from-j3/f7" 2>> "$out")" = "j3 7" ] && ok "SYMJOIN/N: the manager reads joiner 3's content exact" || bad "SYMJOIN/N: manager read of joiner 3's f7: '$(cat "$mnt/from-j3/f7" 2>&1)'"
+    n=$(ls "$j2/from-j3" 2>> "$out" | grep -c '^f')
+    [ "$n" = "100" ] && ok "SYMJOIN/N: joiner 2 lists joiner 3's 100 names (a joiner reading a joiner)" || bad "SYMJOIN/N: joiner 2 lists $n of joiner 3's 100"
+    n=$(ls "$j3" 2>> "$out" | grep -c '^f')
+    [ "$n" = "200" ] && ok "SYMJOIN/N: joiner 3 lists the manager's 200 names" || bad "SYMJOIN/N: joiner 3 lists $n of the manager's 200"
+    [ "$(md5sum "$j3/from-j2/big.bin" 2>/dev/null | cut -d' ' -f1)" = "$(md5sum "$j2/from-j2/big.bin" | cut -d' ' -f1)" ] && ok "SYMJOIN/N: joiner 3 reads joiner 2's 4 MiB byte-exact (its data through the holder's grants)" || bad "SYMJOIN/N: joiner 3's read of joiner 2's big.bin differs"
+    # A create INTO a foreign directory (PR 6's shipped step served by the
+    # joiner): the manager creates under joiner 2's directory.
+    echo "from manager" > "$mnt/from-j2/by-manager" 2>> "$out" && ok "SYMJOIN/N: the manager created into joiner 2's directory (a cross-owner op — one intent, the step served by the joiner)" || bad "SYMJOIN/N: the manager's create into joiner 2's directory failed"
+    [ "$(cat "$j2/from-j2/by-manager" 2>> "$out")" = "from manager" ] && ok "SYMJOIN/N: joiner 2 reads the manager's create in its own directory" || bad "SYMJOIN/N: joiner 2 does not see the manager's create"
+    local ms0 k
+    ms0=""
+    for m in "$mnt" "$j2" "$j3"; do
+        for k in manager_verb_refusals meta_kv_replay_key_violations meta_kv_replay_lease_violations meta_kv_replay_extent_violations meta_kv_leaf_lease_refusals slot_lease_conflicts data_dma_fence_refusals invariant_tripwires dlm_token_recall_timeouts_live appender_fence_breach xv_cross_owner_intents_stuck; do
+            v=$(stats "$m" "$k")
+            [ "${v:-0}" = "0" ] || ms0="$ms0 $(basename "$m"):$k=$v"
+        done
+    done
+    [ -z "$ms0" ] && ok "SYMJOIN/N: the must-stay-0 set is 0 on all three daemons" || bad "SYMJOIN/N: must-stay-0 moved:$ms0"
+
+    # Joiner 3 dies (kill -9) and its successor remounts at the SAME mount
+    # point — the same `(node, mount slot)` identity — so the manager's
+    # `JoinAppender` answers `already` and the successor replays its dead
+    # incarnation's ring as OWN RESIDUE: every acked name back, nothing
+    # the manager had to recover.
+    pid=$(pgrep -f "squeezefs.*mount sqmeta://$meta $j3" | head -1)
+    if [ -n "$pid" ]; then
+        kill -9 "$pid"
+        sleep 1
+        umount -l "$j3" 2>/dev/null
+        cp "$j3log" "$STATE/sym-join-j3-predecessor.log" 2>/dev/null
+        : > "$j3log"
+        t0=$(date +%s%3N)
+        mount_joiner "$j3log" "$j3"
+        if wait_mnt "$j3"; then
+            t1=$(date +%s%3N)
+            sleep 2
+            v=$(jstat "$j3" appender_self_recoveries)
+            [ "${v:-0}" -ge 1 ] 2>/dev/null && ok "SYMJOIN/N: joiner 3's successor recovered its dead incarnation's ring as OWN RESIDUE (appender_self_recoveries=$v, $((t1 - t0)) ms)" || bad "SYMJOIN/N: joiner 3's successor appender_self_recoveries=$v"
+            [ "$(jstat "$j3" joined_appender_id)" = "$id3" ] && ok "SYMJOIN/N: the successor rejoined its own region (appender $id3, `already`)" || bad "SYMJOIN/N: successor appender id $(jstat "$j3" joined_appender_id) != $id3"
+            n=$(ls "$j3/from-j3" 2>> "$out" | grep -c '^f')
+            [ "$n" = "100" ] && ok "SYMJOIN/N: every acked name (100) served by joiner 3's successor" || bad "SYMJOIN/N: joiner 3's successor lists $n of 100"
+            v=$(jstat "$mnt" appender_recoveries)
+            [ "${v:-0}" = "0" ] && ok "SYMJOIN/N: the manager recovered nothing (a same-identity rejoin is its own residue)" || bad "SYMJOIN/N: manager appender_recoveries=$v"
+        else
+            bad "SYMJOIN/N: joiner 3's successor did not mount — $(tail -12 "$j3log")"
+        fi
+    else
+        bad "SYMJOIN/N: no pid for joiner 3"
+    fi
+
+    # Clean leaves: pages Free, rings returned, nothing registered to
+    # unregister — the registrant counts as before the joins, the
+    # manager's hold standing, the manager alone in the directory.
+    umount "$j3" >> "$out" 2>&1
+    umount "$j2" >> "$out" 2>&1
+    sleep 2
+    reg_m=$(nvme resv-report "$meta" --eds -o json 2>/dev/null | jq -r .regctl)
+    reg_d=$(nvme resv-report "$data" --eds -o json 2>/dev/null | jq -r .regctl)
+    [ "$reg_m" = "$reg_m0" ] && [ "$reg_d" = "$reg_d0" ] && ok "SYMJOIN/N: the leaves left the registrant counts as found (meta $reg_m, data $reg_d)" || bad "SYMJOIN/N: the leaves moved the registrant count (meta $reg_m0→$reg_m, data $reg_d0→$reg_d)"
+    [ "$(nvme resv-report "$meta" --eds -o json 2>/dev/null | jq -r .rtype)" = "3" ] && ok "SYMJOIN/N: the manager's rtype-3 hold survived two joiners' leaves" || bad "SYMJOIN/N: meta rtype after the leaves != 3"
+    v=$(jstat "$mnt" appenders_known)
+    [ "${v:-0}" = "1" ] && ok "SYMJOIN/N: appenders_known back to 1 (both pages Free)" || bad "SYMJOIN/N: appenders_known=$v after the leaves"
+    n=$(ls "$mnt/from-j2" 2>> "$out" | grep -c '^f')
+    [ "$n" = "100" ] && ok "SYMJOIN/N: joiner 2's 100 names served by the manager after its leave (the released slot is the manager's to maintain)" || bad "SYMJOIN/N: after the leave the manager lists $n of joiner 2's 100"
+    [ "$(cat "$mnt/from-j3/f42" 2>> "$out")" = "j3 42" ] && ok "SYMJOIN/N: joiner 3's content served by the manager after its leave" || bad "SYMJOIN/N: manager read of joiner 3's f42 after the leave: '$(cat "$mnt/from-j3/f42" 2>&1)'"
+    if "$FIDELI_BIN" fsck "$mnt" > "$STATE/legs/sym-n-fsck.txt" 2>&1 && grep -q "findings: 0" "$STATE/legs/sym-n-fsck.txt"; then
+        ok "SYMJOIN/N: online fsck clean after three daemons wrote (findings: 0)"
+    else
+        bad "SYMJOIN/N: online fsck after the N-daemon leg — $(tail -5 "$STATE/legs/sym-n-fsck.txt")"
+    fi
+}
+
 leg_sym_join_ladder() {
     local out="$STATE/legs/sym-join-ladder.txt" dlog="$STATE/sym-join-daemon.log" rlog="$STATE/sym-join-reader.log"
     local mnt="$STATE/mnt-sym-join" rmnt="$STATE/mnt-sym-join-ro" meta data dev k rc t0 t1 pid
@@ -1613,6 +1789,16 @@ leg_sym_join_ladder() {
     else
         bad "SYMJOIN: the --read-only token reader did not mount — $(tail -12 "$rlog"; tail -3 "$out")"
     fi
+
+    # PR 12b — N = 3 REAL daemons on the volume: two more RW mounts of the
+    # armed set at other mount points (their own processes, their own
+    # `(node, mount slot)` identities) JOIN the live manager through the
+    # ladder — no knob but the plane — as full writers: their own rings,
+    # pages and slot leases, tree 0 a projection, tokens for each other's
+    # slots. One host = one PR association, so rung 4 ADOPTS the manager's
+    # holds (KD-SYM-22): the registrant counts on BOTH namespaces are
+    # unchanged by the joins and by the leaves.
+    sym_n_daemon_leg "$meta" "$data" "$out"
 
     # The manager dies; the successor re-walks the ladder (same host: the
     # flock reclaims instantly, the strict target's stale keys ride the

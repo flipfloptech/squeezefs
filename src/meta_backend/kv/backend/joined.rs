@@ -1830,6 +1830,51 @@ impl KvMetaBackend {
         Ok(already)
     }
 
+    /// **The manager's `ResolveEndpoint`** (PR 12b, N ≥ 3): appender
+    /// `appender_id`'s published listener off this manager's holder table
+    /// (every `PublishEndpoint` it served, its own arm's binding) or, for
+    /// an appender that published to a PREDECESSOR manager, off its live
+    /// claim set through the durable resolver. One `u32` word, one table
+    /// lookup, at most one directory read + one claim-set read; `None` =
+    /// not published. A joined appender refuses (a control read it cannot
+    /// answer freshly — its projection is its open's).
+    pub async fn manager_resolve_endpoint(
+        &self,
+        appender_id: u32,
+    ) -> Result<Option<String>, KvError> {
+        let set = self.manager_gate(false)?;
+        if let Some(e) = set
+            .slot_leases()
+            .and_then(|p| p.holders.endpoint(appender_id))
+        {
+            return Ok(Some(e.to_string()));
+        }
+        let resolved = crate::sym_join::resolve_holder_endpoint(self, appender_id).await;
+        if let (Some(e), Some(plane)) = (resolved.as_ref(), set.slot_leases()) {
+            plane.holders.set_endpoint(appender_id, e);
+        }
+        Ok(resolved)
+    }
+
+    /// The joiner's half of [`Self::manager_resolve_endpoint`]: ask the
+    /// manager for `appender_id`'s listener over the wire — the manager's
+    /// table is exact where this joiner's claim-set projection is its
+    /// open's. `Ok(None)` = not published.
+    pub async fn joined_resolve_endpoint(
+        &self,
+        appender_id: u32,
+    ) -> Result<Option<String>, KvError> {
+        let wire = Arc::clone(self.joined.get().ok_or_else(|| {
+            KvError::Corrupt(format!("{}: joined wire unset", self.path.display()))
+        })?);
+        let mut c = wire.client.lock().await;
+        wire.note(
+            c.resolve_endpoint(appender_id)
+                .await
+                .map_err(|e| wire_err("ResolveEndpoint", e)),
+        )
+    }
+
     // -----------------------------------------------------------------
     // The membership carriage's member side (§5.9, §5.1.4).
     // -----------------------------------------------------------------

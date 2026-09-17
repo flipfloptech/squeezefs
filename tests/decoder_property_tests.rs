@@ -1749,6 +1749,7 @@ fn arb_pr8_call() -> impl Strategy<Value = ManagerCall> {
                     pr_key,
                 }
             }),
+        any::<u32>().prop_map(|appender_id| ManagerCall::ResolveEndpoint { appender_id }),
     ]
 }
 
@@ -1849,6 +1850,8 @@ fn arb_pr8_reply() -> impl Strategy<Value = ManagerReply> {
         any::<bool>().prop_map(|already| ManagerReply::Recorded { already }),
         any::<bool>().prop_map(|already| ManagerReply::Left { already }),
         any::<bool>().prop_map(|already| ManagerReply::Published { already }),
+        proptest::option::of("[ -~]{0,64}")
+            .prop_map(|endpoint| ManagerReply::Endpoint { endpoint }),
     ]
 }
 

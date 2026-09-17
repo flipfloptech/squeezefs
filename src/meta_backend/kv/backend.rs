@@ -3531,6 +3531,77 @@ impl KvMetaBackend {
         }
     }
 
+    /// **The divert sites' ONE serve** (`find_dentry` / `getattr` /
+    /// `readdir_page` / `getxattr` / `listxattr`): the holder's plane
+    /// (`token_reader_for`), the serve — and, on a WRITER whose lease
+    /// projection lagged the manager's checkpoint (PR 12b: a joiner's tree
+    /// 0 is the ledger's newest record, a lease the manager granted since
+    /// is not in it, so the divert dials the manager for a slot another
+    /// appender now holds and the manager answers `NotHolder { holder }`),
+    /// ONE refresh of the projection and a retry at the holder the
+    /// manager named — inside the same op, so a foreign create is exact at
+    /// the next resolve on a writer too. A READER keeps PR 5's law (fail
+    /// closed until its epoch step). `Ok(None)` = no divert (read
+    /// locally); `Ok(Some(None))` = gone at its holder.
+    async fn token_serve(
+        &self,
+        object: Ino,
+        wants: crate::meta_ship::token_plane::TokenWants,
+    ) -> std::result::Result<Option<Option<crate::meta_ship::token_plane::TokenServe>>, KvError>
+    {
+        let Some(tokens) = self.token_reader_for(object).await? else {
+            return Ok(None);
+        };
+        match tokens.serve(object, wants).await {
+            Ok(serve) => Ok(Some(serve)),
+            Err(e) => {
+                let Some(redirect) = crate::meta_ship::token_plane::not_holder_redirect(&e) else {
+                    return Err(e.into());
+                };
+                if self.tokens_reader.get().is_some()
+                    || !self
+                        .appenders
+                        .as_ref()
+                        .is_some_and(|s| s.is_joined_appender())
+                {
+                    return Err(e.into());
+                }
+                log::info!(
+                    "meta volume {}: the manager answered NotHolder {{ {} }} for object {object} — \
+                     this joiner's lease projection lagged the manager's checkpoint; retried at \
+                     the holder the manager named",
+                    self.path.display(),
+                    redirect.holder
+                );
+                // The projection catches up where the ledger moved; the
+                // retry dials the holder the MANAGER named regardless —
+                // its word is the lease's, fresher than any ledger record
+                // (a grant is a ring-0 entry, its root in the ledger only
+                // at the next cycle).
+                self.refresh_control_projection().await?;
+                let holder = redirect.holder;
+                let Some(tokens) = (if self
+                    .appenders
+                    .as_ref()
+                    .is_some_and(|s| s.owns_region(holder))
+                {
+                    None
+                } else {
+                    crate::data_grant::foreign_read_plane(self, object, holder)
+                        .await
+                        .map_err(KvError::Io)?
+                }) else {
+                    return Ok(None);
+                };
+                tokens
+                    .serve(object, wants)
+                    .await
+                    .map(Some)
+                    .map_err(KvError::from)
+            }
+        }
+    }
+
     /// **The WRITER's read divert** (symmetric PR 12b — PR 9's deviation
     /// 4 closed): on an ARMED writer an object in a slot this mount does
     /// not hold is read through its HOLDER's token plane — the lessee tree
@@ -12079,10 +12150,22 @@ impl KvMetaBackend {
         // PR 5: a token reader answers from the parent's token (its
         // dentry set), never from a foreign leaf — PR 12: from the plane
         // of the PARENT's slot holder.
-        if let Some(tokens) = self.token_reader_for(parent).await? {
-            return crate::meta_ship::token_plane::token_find_dentry(&tokens, parent, name)
-                .await
-                .map_err(KvError::from);
+        if let Some(serve) = self
+            .token_serve(
+                parent,
+                crate::meta_ship::token_plane::TokenWants::with_dentries(),
+            )
+            .await?
+        {
+            let Some(serve) = serve else {
+                return Err(KvError::from(Self::not_found(format!(
+                    "Inode {parent} not found"
+                ))));
+            };
+            return Ok(serve
+                .entry()
+                .find(name.as_bytes())
+                .map(crate::meta_ship::token_plane::dentry_of));
         }
         let hash = dentry_name_hash54(name.as_bytes(), self.sb.hash_seed);
         let start = dentry_key(parent, hash, 0);
@@ -12187,11 +12270,11 @@ impl KvMetaBackend {
         // PR 5: a token reader serves the object's attrs from its token
         // (the holder's folded view at the grant), exact until recalled —
         // PR 12: granted by the object's slot holder.
-        if let Some(tokens) = self.token_reader_for(ino).await? {
-            let serve = tokens
-                .serve(ino, crate::meta_ship::token_plane::TokenWants::default())
-                .await?
-                .ok_or_else(|| Self::not_found(format!("Inode {ino} not found")))?;
+        if let Some(serve) = self
+            .token_serve(ino, crate::meta_ship::token_plane::TokenWants::default())
+            .await?
+        {
+            let serve = serve.ok_or_else(|| Self::not_found(format!("Inode {ino} not found")))?;
             let v = serve.entry().attrs;
             return Ok(Inode {
                 ino,
@@ -12259,20 +12342,20 @@ impl KvMetaBackend {
         // PR 5: a token reader pages the directory's token (its complete
         // dentry set, cookie-ordered as the holder served it) — PR 12:
         // from the directory's slot holder.
-        if let Some(tokens) = self.token_reader_for(dir).await? {
+        if let Some(serve) = self
+            .token_serve(
+                dir,
+                crate::meta_ship::token_plane::TokenWants::with_dentries(),
+            )
+            .await?
+        {
             let after = match decode_readdir_cookie(offset).map_err(KvError::from)? {
                 ReaddirPos::Start | ReaddirPos::AfterDot | ReaddirPos::AfterDotDot => 0,
                 ReaddirPos::AfterEntry { hash54, coll_seq } => {
                     encode_readdir_cookie(hash54, coll_seq)
                 }
             };
-            let Some(serve) = tokens
-                .serve(
-                    dir,
-                    crate::meta_ship::token_plane::TokenWants::with_dentries(),
-                )
-                .await?
-            else {
+            let Some(serve) = serve else {
                 return Ok(out); // an ino with no dentries lists empty (the v2 contract)
             };
             for d in serve.entry().page_after(after, max) {
@@ -12333,11 +12416,11 @@ impl KvMetaBackend {
         // token; a control record (`writer_claim`, `job:` …) is the
         // plane's own, read off the S5 projection as before.
         if crate::meta_ship::token_plane::token_carried_xattr(name) {
-            if let Some(tokens) = self.token_reader_for(ino).await? {
-                let Some(serve) = tokens
-                    .serve(ino, crate::meta_ship::token_plane::TokenWants::default())
-                    .await?
-                else {
+            if let Some(serve) = self
+                .token_serve(ino, crate::meta_ship::token_plane::TokenWants::default())
+                .await?
+            {
+                let Some(serve) = serve else {
                     return Ok(None);
                 };
                 return Ok(serve
@@ -12365,11 +12448,11 @@ impl KvMetaBackend {
     pub async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {
         // PR 5: a token reader lists the token's (user-visible) names —
         // PR 12: from the object's slot holder.
-        if let Some(tokens) = self.token_reader_for(ino).await? {
-            let Some(serve) = tokens
-                .serve(ino, crate::meta_ship::token_plane::TokenWants::default())
-                .await?
-            else {
+        if let Some(serve) = self
+            .token_serve(ino, crate::meta_ship::token_plane::TokenWants::default())
+            .await?
+        {
+            let Some(serve) = serve else {
                 return Ok(Vec::new());
             };
             return Ok(serve

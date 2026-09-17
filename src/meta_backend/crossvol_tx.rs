@@ -894,6 +894,20 @@ pub async fn acquire_guards_leased(
     let scope = *scope.get_or_insert_with(mint_guard_scope);
     let force_remote = TEST_XV_GUARDS_FORCE_REMOTE.load(Ordering::Relaxed);
     let own_id = vol.own_appender_id();
+    // A holder the rung-7 census did not know (it joined after this
+    // mount's ladder — PR 12b, N ≥ 3) is bound ON DEMAND before the
+    // table is consulted, once per key population.
+    for local in inos
+        .iter()
+        .map(|(l, _)| *l)
+        .chain(dents.iter().map(|(p, _, _)| *p))
+    {
+        if let StepHome::Unreachable { holder } = step_home(routed, v_idx, local) {
+            if !vol.is_own_region(holder) {
+                crate::sym_join::bind_holder_endpoint_on_demand(vol, holder).await;
+            }
+        }
+    }
     struct RemoteSet {
         endpoint: Arc<str>,
         inos: Vec<(u64, bool)>,
@@ -1979,6 +1993,21 @@ pub fn step_home(routed: &RoutedMetaBackend, v_idx: usize, local_ino: Ino) -> St
     }
 }
 
+/// [`step_home`] with the holder's endpoint bound ON DEMAND when the
+/// table does not know it (an appender that joined after this mount's
+/// ladder ran — PR 12b, N ≥ 3; `sym_join::bind_holder_endpoint_on_demand`
+/// off durable state, once). The async form for the sites that SHIP;
+/// the sync form stays the `Local`-or-not predicate.
+pub async fn step_home_bound(routed: &RoutedMetaBackend, v_idx: usize, local_ino: Ino) -> StepHome {
+    match step_home(routed, v_idx, local_ino) {
+        StepHome::Unreachable { holder } if !routed.volumes[v_idx].is_own_region(holder) => {
+            crate::sym_join::bind_holder_endpoint_on_demand(&routed.volumes[v_idx], holder).await;
+            step_home(routed, v_idx, local_ino)
+        }
+        home => home,
+    }
+}
+
 /// Whether any of `inos` (GLOBAL) lives in a slot another appender
 /// leases — the arms' "this op is cross-owner" predicate. One `Option`
 /// test per ino on an unarmed mount.
@@ -2014,7 +2043,7 @@ pub async fn lookup_exact(
     name: &str,
 ) -> Result<Option<(Ino, u32)>> {
     let (v_idx, local_parent) = routed.route_ino(parent);
-    let (holder, endpoint) = match step_home(routed, v_idx, local_parent) {
+    let (holder, endpoint) = match step_home_bound(routed, v_idx, local_parent).await {
         // Guard-free (Issue 2): the walk holds the initiator's own
         // exclusive `D{}` guards; a shared guard here could park behind
         // them on a stripe collision. The set-wide lease is the read's
@@ -2168,7 +2197,7 @@ async fn apply_or_ship_step(
     rider: Option<&XvRider>,
     guards: Arc<[dlm::DlmGuard]>,
 ) -> Result<XvStepOutcome> {
-    match step_home(routed, v_idx, local.local_home()) {
+    match step_home_bound(routed, v_idx, local.local_home()).await {
         StepHome::Local => {
             // The op's guard set must cover the step's keys (Issue 8c):
             // a slot that moved to this initiator between its acquisition

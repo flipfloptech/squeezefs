@@ -302,11 +302,20 @@ pub enum ManagerCall {
         endpoint: String,
         pr_key: u64,
     },
+    /// **`ResolveEndpoint`** (PR 12b, N ≥ 3): the published listener of
+    /// appender `appender_id`, off the MANAGER's slot holder table (every
+    /// `PublishEndpoint` it served) or its live claim set. A joiner asks
+    /// it for a holder its own ladder never saw — its projection of the
+    /// claim set is its open's, so the durable resolve is stale there
+    /// while the manager's is exact. One `u32` word, one table lookup;
+    /// `Endpoint { endpoint: None }` for a holder that has not published.
+    ResolveEndpoint { appender_id: u32 },
 }
 
 /// PR 12b's documented verb codes (the wire encodes the declaration index).
 pub const VERB_CODE_LEAVE_APPENDER: u8 = 0xB0;
 pub const VERB_CODE_PUBLISH_ENDPOINT: u8 = 0xB1;
+pub const VERB_CODE_RESOLVE_ENDPOINT: u8 = 0xB2;
 
 /// PR 8's documented verb codes (the range the level-4 coordination
 /// assigned; the wire encodes the enum's declaration index — these are the
@@ -390,6 +399,7 @@ impl ManagerCall {
             Self::RecordDeath { .. } => "record_death",
             Self::LeaveAppender { .. } => "leave_appender",
             Self::PublishEndpoint { .. } => "publish_endpoint",
+            Self::ResolveEndpoint { .. } => "resolve_endpoint",
         }
     }
 }
@@ -543,6 +553,11 @@ pub enum ManagerReply {
     /// claim-set entry (`already` = the same address stood — a replay).
     Published {
         already: bool,
+    },
+    /// `ResolveEndpoint` (PR 12b): the appender's published listener, or
+    /// `None` (it has not published).
+    Endpoint {
+        endpoint: Option<String>,
     },
 }
 
@@ -1072,6 +1087,11 @@ impl ManagerService {
                     .manager_publish_endpoint((*identity).into(), *appender_id, endpoint, *pr_key)
                     .await
                     .map(|already| ManagerReply::Published { already }),
+                ManagerCall::ResolveEndpoint { appender_id } => self
+                    .volume
+                    .manager_resolve_endpoint(*appender_id)
+                    .await
+                    .map(|endpoint| ManagerReply::Endpoint { endpoint }),
             };
         let (reply, status) = match served {
             Ok(reply) => (reply, STATUS_OK),
@@ -1770,6 +1790,21 @@ impl ManagerClient {
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "PublishEndpoint answered {other:?}"
+            ))),
+        }
+    }
+
+    /// `ResolveEndpoint` (PR 12b) — `Ok(None)` = the appender has not
+    /// published.
+    pub async fn resolve_endpoint(&mut self, appender_id: u32) -> Result<Option<String>> {
+        match self
+            .call(ManagerCall::ResolveEndpoint { appender_id })
+            .await?
+        {
+            ManagerReply::Endpoint { endpoint } => Ok(endpoint),
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Err(SqueezefsError::InvalidOperation(format!(
+                "ResolveEndpoint answered {other:?}"
             ))),
         }
     }

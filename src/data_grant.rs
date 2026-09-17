@@ -5568,6 +5568,17 @@ pub fn slot_holder_home(ino: u64) -> Option<CustodyHome> {
     }
 }
 
+/// [`slot_holder_home`] after binding `holder`'s endpoint ON DEMAND
+/// (`sym_join::bind_holder_endpoint_on_demand`) — the `Unbound` arm's one
+/// retry: `None` when the holder has not published or the home moved to
+/// this mount meanwhile.
+async fn bind_holder_home(arm: &SlotCustodyArm, ino: u64, holder: u32) -> Option<CustodyHome> {
+    let routed = arm.routed.upgrade()?;
+    let (v, _) = routed.route_ino(ino);
+    crate::sym_join::bind_holder_endpoint_on_demand(routed.volumes.get(v)?, holder).await?;
+    slot_holder_home(ino)
+}
+
 /// **A WRITER's token plane for a FOREIGN object** (symmetric PR 12b —
 /// PR 9's deviation 4 and PR 12's owed "the writer's read divert to its
 /// per-holder planes"): volume `vol`'s object lives in a slot appender
@@ -5601,9 +5612,16 @@ pub async fn foreign_read_plane(
     else {
         return Ok(None);
     };
-    let endpoint = routed.volumes[v]
-        .slot_leases()
-        .and_then(|p| p.holders.endpoint(holder));
+    // The table first; a holder that joined after this mount's ladder is
+    // bound ON DEMAND off durable state (PR 12b, N ≥ 3). Boxed: the
+    // resolve reads the claim set through this same divert (ino 1's slot
+    // is the manager's — bound at the arm, so the recursion is one level
+    // deep by construction).
+    let endpoint = Box::pin(crate::sym_join::bind_holder_endpoint_on_demand(
+        &routed.volumes[v],
+        holder,
+    ))
+    .await;
     let Some(endpoint) = endpoint else {
         crate::meta_ship::token_plane::note_reader_unbound_holder();
         return Err(unbound_holder(
@@ -5736,7 +5754,18 @@ pub async fn acquire_at_slot_holder(
             volume,
             object,
         } => (holder, endpoint, volume, object),
-        CustodyHome::Unbound { holder } => return Err(unbound_holder(holder, ino, "acquire")),
+        // A holder that joined after this mount's ladder ran: bound ON
+        // DEMAND off durable state (PR 12b, N ≥ 3), else the retryable
+        // refusal.
+        CustodyHome::Unbound { holder } => match bind_holder_home(&arm, ino, holder).await {
+            Some(CustodyHome::Holder {
+                holder,
+                endpoint,
+                volume,
+                object,
+            }) => (holder, endpoint, volume, object),
+            _ => return Err(unbound_holder(holder, ino, "acquire")),
+        },
     };
     let started = Instant::now();
     let mut redirected = false;

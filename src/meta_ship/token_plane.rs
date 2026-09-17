@@ -57,7 +57,6 @@ use crate::error::{Result, SqueezefsError};
 use crate::fuse_client::{LatencyHistogram, QueueDepthHistogram};
 use crate::meta_backend::kv::backend::KvMetaBackend;
 use crate::meta_backend::kv::record::{DentryValue, InodeValue};
-use crate::meta_backend::Ino;
 use bincode::Options as _;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1962,6 +1961,44 @@ impl std::fmt::Debug for TokenReaderPlane {
     }
 }
 
+/// The typed word of a `NotHolder` answer: `object`'s slot is served by
+/// appender `holder`, not the one this plane dials. A READER fails closed
+/// on it until its epoch step re-reads tree 0 (R-SYM-4); a WRITER's
+/// divert (PR 12b) refreshes its lease projection and retries ONCE at
+/// `holder` inside the same op — the manager's word is fresher than the
+/// projection the ledger cadence hands a joiner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotHolderRedirect {
+    pub object: u64,
+    pub holder: u32,
+}
+
+impl std::fmt::Display for NotHolderRedirect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "read token unavailable: object {}'s slot is held by appender {}, not the holder \
+             this plane dials — the reader's tree 0 lags the lease; the next resolve after its \
+             epoch step dials the holder tree 0 names (R-SYM-4: a foreign object is served under \
+             a token or not at all)",
+            self.object, self.holder
+        )
+    }
+}
+
+impl std::error::Error for NotHolderRedirect {}
+
+/// The `NotHolder` redirect an error carries, if it is one.
+pub fn not_holder_redirect(e: &SqueezefsError) -> Option<NotHolderRedirect> {
+    match e {
+        SqueezefsError::Io(io) => io
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<NotHolderRedirect>())
+            .copied(),
+        _ => None,
+    }
+}
+
 /// Why a token could not be served (never a stale answer).
 fn fail_closed(what: &str) -> SqueezefsError {
     SqueezefsError::Io(std::io::Error::other(format!(
@@ -2308,10 +2345,10 @@ impl TokenReaderPlane {
                     // so this is a slot that MOVED between the reader's
                     // last poll and the grant — refused now, exact at the
                     // next resolve after the epoch step re-reads tree 0.
-                    return Err(fail_closed(&format!(
-                        "object {object}'s slot is held by appender {holder}, not the holder \
-                         this plane dials — the reader's tree 0 lags the lease; the next \
-                         resolve after its epoch step dials the holder tree 0 names"
+                    // TYPED (PR 12b): a WRITER's divert re-resolves on it
+                    // inside the same op (`KvMetaBackend::token_serve`).
+                    return Err(SqueezefsError::Io(std::io::Error::other(
+                        NotHolderRedirect { object, holder },
                     )));
                 }
                 TokenReply::Refused { reason } => return Err(fail_closed(&reason)),
@@ -2980,23 +3017,6 @@ pub fn dentry_of(rec: &DirRecord) -> DentryValue {
         file_type: rec.file_type,
         name: rec.name.clone(),
     }
-}
-
-/// The reader's `find_dentry`: the parent's token (dentries) searched by
-/// name. `Ok(None)` = the parent exists and has no such name; a missing
-/// parent is `NotFound`.
-pub async fn token_find_dentry(
-    plane: &TokenReaderPlane,
-    parent: Ino,
-    name: &str,
-) -> Result<Option<DentryValue>> {
-    let Some(serve) = plane.serve(parent, TokenWants::with_dentries()).await? else {
-        return Err(SqueezefsError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Inode {parent} not found"),
-        )));
-    };
-    Ok(serve.entry().find(name.as_bytes()).map(dentry_of))
 }
 
 // ---------------------------------------------------------------------------

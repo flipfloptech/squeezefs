@@ -12186,6 +12186,10 @@ impl SqueezefsFilesystem {
                 "symmetric_join": crate::sym_join::report()
                     .map(|r| serde_json::to_value(&*r).unwrap_or(serde_json::Value::Null))
                     .unwrap_or(serde_json::Value::Null),
+                // PR 12b, N ≥ 3: holder endpoints resolved off durable
+                // state at a first foreign act (an appender that joined
+                // after this mount's ladder ran); 0 on a solo mount.
+                "sym_holder_binds_on_demand": crate::sym_join::holder_binds_on_demand(),
                 "cowriter": crate::cowriter::stats_json(),
                 // DLM S6 (spec §6.5 item 3): the membership plane's
                 // counters. `membership_renewals` is the beat that used to

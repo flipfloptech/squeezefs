@@ -1139,6 +1139,167 @@ async fn a_joiner_reads_foreign_slots_through_tokens_and_serves_the_managers_shi
     fsck_clean(&uris).await;
 }
 
+/// **N ≥ 3: a daemon that joined AFTER another's ladder is bound ON
+/// DEMAND at its first foreign act** (the third daemon's endpoint): the
+/// slot holder table knows the appenders that were Live when a mount's
+/// rung 7 ran (`bind_live_appender_endpoints`) and, on the manager, every
+/// `PublishEndpoint` it served — but joiner 3 is unknown to joiner 2,
+/// whose ladder ran first. Joiner 2's first read of a file in joiner 3's
+/// slot resolves the endpoint off durable state — the page's identity,
+/// the claim-set entry joiner 3's publish wrote (read through the
+/// manager's tokens, so fresh) — binds it once
+/// (`sym_holder_binds_on_demand` +1) and reads through joiner 3's token;
+/// `dlm_token_reader_unbound_holders` never moves. Red before the
+/// binding: the read refused `EAGAIN` ("no endpoint bound") for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_that_joined_after_anothers_ladder_is_bound_on_demand_at_its_first_foreign_act() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared"), (SLOT_B, "other")]).await;
+    let (shared, other) = (dirs[0], dirs[1]);
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mvenue = DaemonVenue::stand_up(&manager, true, "manager-custody-n3").await;
+    // The manager's claim-set entry (its rung 7's publish) — what a
+    // joiner's `PublishEndpoint` lands beside.
+    squeezefs::multi_writer::publish_symmetric_endpoint(&manager, &mvenue.endpoint).await;
+
+    let join_at = |n: u32, ep: String| {
+        let uris = uris.clone();
+        let mvol = Arc::clone(&mvol);
+        async move {
+            Knobs::armed().apply();
+            let r = open_routed_meta_set_joined(
+                &uris,
+                &JoinedSetAdmission {
+                    manager_endpoint: ep,
+                    secret: VENUE_SECRET.to_vec(),
+                    peer_id: format!("joiner-{n}"),
+                    identity: joiner_identity(&mvol, n).await,
+                },
+            )
+            .await;
+            Knobs::clear();
+            r.expect("the joined open")
+        }
+    };
+    // Joiner 2 first: its ladder's census binds NOTHING but the manager.
+    let j2 = join_at(61, mvenue.endpoint.clone()).await;
+    let j2vol = Arc::clone(&j2.volumes[0]);
+    let j2venue = DaemonVenue::stand_up(&j2, false, "joiner-2-custody").await;
+    j2vol
+        .joined_publish_endpoint(&j2venue.endpoint, 0)
+        .await
+        .expect("joiner 2 publishes its listener through the manager");
+    squeezefs::sym_join::bind_live_appender_endpoints(&j2).await;
+    // Joiner 2 is this process's reading writer (PR 9's custody arm).
+    let sink = Arc::new(ProbeSink {
+        calls: std::sync::atomic::AtomicU64::new(0),
+    });
+    let for_arm = Arc::clone(&sink);
+    let _arm = squeezefs::data_grant::arm_slot_custody(
+        &j2,
+        &squeezefs::cowriter::node_member_id_of(
+            j2vol.joined_wire().unwrap().identity.node_token,
+            j2vol.joined_wire().unwrap().identity.mount_slot,
+        ),
+        VENUE_SECRET.to_vec(),
+        0,
+        Arc::new(move |_volume| {
+            Arc::clone(&for_arm) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
+        }),
+    );
+
+    // Joiner 3 joins AFTER joiner 2's ladder, publishes, and takes SLOT_B
+    // first-touch with 6 creates.
+    let j3 = join_at(62, mvenue.endpoint.clone()).await;
+    let j3vol = Arc::clone(&j3.volumes[0]);
+    let j3id = j3vol.appender_stats().unwrap().appender_id;
+    let j3venue = DaemonVenue::stand_up(&j3, false, "joiner-3-custody").await;
+    j3vol
+        .joined_publish_endpoint(&j3venue.endpoint, 0)
+        .await
+        .expect("joiner 3 publishes its listener through the manager");
+    let files = create_files(&j3, other, "n3", 6).await;
+    assert!(
+        matches!(
+            tree0_state(&mvol, SLOT_B).await,
+            Some(SlotState::Leased { appender_id, .. }) if appender_id == j3id
+        ),
+        "joiner 3 holds SLOT_B"
+    );
+    j2vol.refresh_control_projection().await.unwrap();
+    assert!(
+        j2vol
+            .slot_leases()
+            .unwrap()
+            .holders
+            .endpoint(j3id)
+            .is_none(),
+        "joiner 2's table does not know joiner 3 — it joined after joiner 2's ladder"
+    );
+    let binds0 = squeezefs::sym_join::holder_binds_on_demand();
+    let unbound0 = squeezefs::meta_ship::token_plane::test_reader_unbound_holders();
+    let j3holder = j3vol.token_holder().expect("joiner 3 is a token holder");
+    let served0 = j3holder.stats().grants_served;
+
+    // Joiner 2's first foreign act on joiner 3's slot: bound on demand,
+    // read through joiner 3's token, exact.
+    assert_all_resolve(&j2, other, &files).await;
+    assert_eq!(
+        squeezefs::sym_join::holder_binds_on_demand(),
+        binds0 + 1,
+        "ONE on-demand binding — the table knows joiner 3 from here"
+    );
+    assert_eq!(
+        j2vol
+            .slot_leases()
+            .unwrap()
+            .holders
+            .endpoint(j3id)
+            .as_deref(),
+        Some(j3venue.endpoint.as_str()),
+        "the bound endpoint is the one joiner 3 published"
+    );
+    assert!(
+        j3holder.stats().grants_served > served0,
+        "joiner 3 served the grants"
+    );
+    assert_eq!(
+        squeezefs::meta_ship::token_plane::test_reader_unbound_holders(),
+        unbound0,
+        "no unbound-holder refusal"
+    );
+    // A second read pays no resolve.
+    assert_all_resolve(&j2, other, &files).await;
+    assert_eq!(squeezefs::sym_join::holder_binds_on_demand(), binds0 + 1);
+    // And joiner 2's slot from joiner 3's side, the other direction: the
+    // shipped step (a create by joiner 3 into joiner 2's directory) finds
+    // joiner 2 through the same durable binding.
+    let mine = create_files(&j2, shared, "n2", 2).await;
+    assert_all_resolve(&j2, shared, &mine).await;
+
+    squeezefs::data_grant::disarm_slot_custody().await;
+    assert_must_stay_zero(&j2vol, "joiner 2");
+    assert_must_stay_zero(&j3vol, "joiner 3");
+    assert_must_stay_zero(&mvol, "manager");
+    shutdown(&j3).await;
+    drop(j3vol);
+    drop(j3);
+    j3venue.tear_down();
+    shutdown(&j2).await;
+    drop(j2vol);
+    drop(j2);
+    j2venue.tear_down();
+    assert_all_resolve(&manager, other, &files).await;
+    mvenue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
 // ---------------------------------------------------------------------------
 // Deliverable 7: the wire holder's flush-then-transfer on a release
 // notice; the offer's acceptance.

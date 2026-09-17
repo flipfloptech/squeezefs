@@ -579,6 +579,9 @@ enum ArbCall {
         endpoint: String,
         pr_key: u64,
     },
+    ResolveEndpoint {
+        appender_id: u32,
+    },
 }
 
 #[derive(Arbitrary, Debug, Clone, Copy)]
@@ -768,6 +771,9 @@ impl From<ArbCall> for ManagerCall {
                 endpoint,
                 pr_key,
             },
+            ArbCall::ResolveEndpoint { appender_id } => {
+                ManagerCall::ResolveEndpoint { appender_id }
+            }
         }
     }
 }
@@ -861,6 +867,9 @@ enum ArbReply {
     Published {
         already: bool,
     },
+    Endpoint {
+        endpoint: Option<String>,
+    },
 }
 
 impl From<ArbReply> for ManagerReply {
@@ -929,6 +938,7 @@ impl From<ArbReply> for ManagerReply {
             ArbReply::Recorded { already } => ManagerReply::Recorded { already },
             ArbReply::Left { already } => ManagerReply::Left { already },
             ArbReply::Published { already } => ManagerReply::Published { already },
+            ArbReply::Endpoint { endpoint } => ManagerReply::Endpoint { endpoint },
         }
     }
 }

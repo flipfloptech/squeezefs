@@ -728,6 +728,67 @@ pub async fn bind_live_appender_endpoints(meta: &Arc<RoutedMetaBackend>) -> usiz
     bound
 }
 
+/// Holder endpoints bound ON DEMAND (`sym_holder_binds_on_demand`): a
+/// holder the rung-7 census did not know — an appender that joined AFTER
+/// this mount's ladder ran — resolved off durable state at its first
+/// foreign act. 0 on a solo mount and on every mount that joined last.
+static HOLDER_BINDS_ON_DEMAND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The on-demand holder bindings so far (`sym_holder_binds_on_demand`).
+pub fn holder_binds_on_demand() -> u64 {
+    HOLDER_BINDS_ON_DEMAND.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// **The holder → endpoint binding ON DEMAND** (PR 12b, N ≥ 3): the slot
+/// holder table knows every appender that was Live when this mount's
+/// rung 7 ran ([`bind_live_appender_endpoints`]) and, on the manager,
+/// every joiner whose `PublishEndpoint` it served — but an appender that
+/// joined AFTER this mount's ladder is unknown to every OTHER joiner. Its
+/// first foreign act here (a read of its slot, a shipped step, a custody
+/// acquire, a travelling guard) resolves the endpoint off the SAME
+/// durable state the census read — the page's identity, the claim set's
+/// published listener ([`resolve_holder_endpoint`]; on a joiner the claim
+/// set is read through the manager's tokens, so it is fresh) — and binds
+/// it, once. A holder whose ladder has not published stays unbound (the
+/// caller's retryable class). Returns the endpoint, bound or already
+/// known.
+pub async fn bind_holder_endpoint_on_demand(
+    vol: &crate::meta_backend::kv::backend::KvMetaBackend,
+    holder: u32,
+) -> Option<Arc<str>> {
+    let plane = vol.slot_leases()?;
+    if let Some(e) = plane.holders.endpoint(holder) {
+        return Some(e);
+    }
+    // A JOINED appender asks the manager (`ResolveEndpoint` — its table
+    // is exact where this mount's claim-set projection is its open's);
+    // the manager and a reader resolve off the durable state they read
+    // fresh.
+    let endpoint = if vol.is_joined_appender() {
+        match vol.joined_resolve_endpoint(holder).await {
+            Ok(e) => e?,
+            Err(e) => {
+                log::warn!(
+                    "meta volume {}: ResolveEndpoint for appender {holder} failed ({e}) — the \
+                     holder stays unbound for this act",
+                    vol.device_path().display()
+                );
+                return None;
+            }
+        }
+    } else {
+        resolve_holder_endpoint(vol, holder).await?
+    };
+    plane.holders.set_endpoint(holder, &endpoint);
+    HOLDER_BINDS_ON_DEMAND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    log::info!(
+        "meta volume {}: appender {holder}'s endpoint {endpoint} bound ON DEMAND (it joined after \
+         this mount's ladder ran)",
+        vol.device_path().display()
+    );
+    plane.holders.endpoint(holder)
+}
+
 static REPORT: arc_swap::ArcSwapOption<JoinReport> = arc_swap::ArcSwapOption::const_empty();
 
 fn install_report(report: JoinReport) {

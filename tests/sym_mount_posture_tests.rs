@@ -298,6 +298,60 @@ async fn rung_2_names_the_missing_bit_and_rung_3_the_membership_plane() {
     shutdown(&routed).await;
 }
 
+/// Rung 3's knob law (ENG-10: explicit wins verbatim, never a silent
+/// override): `SQUEEZEFS_MEMBERSHIP_BIND` UNSET on an armed set is the
+/// ladder's `auto` — the shard's S6 owner armed by rung 3 itself — while an
+/// EXPLICIT `off` is REFUSED at rung 3 naming the knob, exactly as every
+/// document said and the first build did not do (`membership::resolve_bind`
+/// folds unset and `off` into one word, and rung 3 read only
+/// `membership_mode() == "off"`, so an operator's `off` was armed at `auto`
+/// on `0.0.0.0:0` — review round 1, Issue 2). An explicit `auto` or
+/// `addr:port` is the mount path's own arm and rung 3 leaves it alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rung_3_refuses_an_explicit_membership_off_and_arms_auto_only_when_unset() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempfile::tempdir().unwrap();
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    plant_secret(&routed, b"pr12-rung3-secret").await;
+    assert_eq!(squeezefs::membership::membership_mode(), "off");
+
+    // Explicit `off`: refused, naming the rung and the knob; nothing armed.
+    std::env::set_var("SQUEEZEFS_MEMBERSHIP_BIND", "off");
+    let err = squeezefs::sym_join::arm_membership_shard(&routed, None)
+        .await
+        .expect_err("an explicit off is a declaration the ladder never overrides");
+    let msg = err.to_string();
+    assert!(msg.contains("rung 3 (membership)"), "names the rung: {msg}");
+    assert!(
+        msg.contains("SQUEEZEFS_MEMBERSHIP_BIND=off"),
+        "names the knob and the value: {msg}"
+    );
+    assert_eq!(
+        squeezefs::membership::membership_mode(),
+        "off",
+        "a refused rung arms nothing"
+    );
+    // The case-insensitive spelling is the same declaration.
+    std::env::set_var("SQUEEZEFS_MEMBERSHIP_BIND", " OFF ");
+    squeezefs::sym_join::arm_membership_shard(&routed, None)
+        .await
+        .expect_err("`OFF` is `off`");
+    assert_eq!(squeezefs::membership::membership_mode(), "off");
+
+    // Unset: the ladder's `auto`.
+    std::env::remove_var("SQUEEZEFS_MEMBERSHIP_BIND");
+    let arm = squeezefs::sym_join::arm_membership_shard(&routed, None)
+        .await
+        .expect("unset ⇒ the ladder arms at auto")
+        .expect("an owner arm");
+    assert_eq!(arm.mode(), "owner");
+    assert_eq!(squeezefs::membership::membership_mode(), "owner");
+    arm.disarm().await;
+    shutdown(&routed).await;
+}
+
 // ===========================================================================
 // 5. The headline: a solo armed mount walks the ladder
 // ===========================================================================

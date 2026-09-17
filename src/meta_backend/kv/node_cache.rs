@@ -3393,6 +3393,16 @@ impl NodeCache {
             if self.retired.contains_sync(&addr) {
                 return Ok(None);
             }
+            // The A7 verdict is read off the LOADED image, before the
+            // cache node takes it: every slot tree's header carries tree
+            // id 0 (`KIND_INTERIOR`), so on a forest the leaf's KIND — not
+            // its tree id — says whether it holds block-map records. The
+            // header decides, not the `slot` argument: a slot tree's root
+            // leaf is loaded by the tree open without one.
+            let block_map_leaf = loaded.header().level == 0
+                && (loaded.header().tree_id == super::record::TREE_BLOCK_MAP
+                    || (loaded.header().tree_id == super::record::KIND_INTERIOR
+                        && Self::leaf_carries_block_map_records(&loaded)));
             let node = CachedNode::from_loaded(
                 loaded,
                 false,
@@ -3406,8 +3416,8 @@ impl NodeCache {
             }
             if node.level() > 0 {
                 node.pin(); // §4.5: interior nodes always pinned.
-            } else if node.tree_id() == super::record::TREE_BLOCK_MAP {
-                // Demand-paged tree-7 LEAVES only (design-kvmap §8 #3 /
+            } else if block_map_leaf {
+                // Demand-paged block-map LEAVES only (design-kvmap §8 #3 /
                 // A7): probation + the §5 leaf-read gauge. Interior and
                 // pinned behavior untouched; a root-leaf loaded here is
                 // pinned by the tree open right after, and pinned nodes
@@ -3420,6 +3430,24 @@ impl NodeCache {
             drop(guard);
             return Ok(Some(node));
         }
+    }
+
+    /// Whether a demand-loaded SLOT-TREE leaf carries block-map records
+    /// (kind `0x07`) — the forest's face of the flat `tree_id ==
+    /// TREE_BLOCK_MAP` test, which no slot-tree node can ever pass (every
+    /// one carries header tree id 0). Scans the leaf's keys in append
+    /// order and stops at the first kind-7 record; a key the codec
+    /// refuses is skipped (the kind-routed walks' law), so a malformed
+    /// record never decides the admission class of its neighbours.
+    fn leaf_carries_block_map_records(loaded: &super::node::LoadedNode) -> bool {
+        (0..loaded.bset_count()).any(|i| {
+            loaded.bset(i).is_ok_and(|view| {
+                (0..view.len()).any(|j| {
+                    super::record::forest_key_kind(view.record(j).key)
+                        .is_ok_and(|kind| kind == super::record::TREE_BLOCK_MAP)
+                })
+            })
+        })
     }
 
     /// The log tail of LEAF `addr` without materializing it: a resident

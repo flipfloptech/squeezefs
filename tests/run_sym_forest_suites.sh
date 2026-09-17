@@ -90,6 +90,13 @@
 # the seam themselves (a stamped volume, a declared region killed without
 # a leave, its page restamped a foreign node's), and its fsck legs run
 # the probe over BOTH layouts' walkers.
+# `kvmap_read_tests` (the block-map tree's read economy: A7 probation, the
+# leaf-read gauge, the reader bracket) joined the list in PR 12: its two
+# tree-7 leaf contracts were stamped-RED on the base with nobody running
+# them under the seam — the A7 admission keyed on the leaf's TREE ID, which
+# every slot-tree node carries as 0, so no forest leaf ever entered the
+# clock on probation and none counted as a leaf read. The admission keys
+# on the leaf's KIND now (a slot-tree leaf carrying kind-7 records).
 #
 # WALL TIME IS A ROW (review round 4, Issue 26): each suite runs under
 # its own timer per leg, and the summary prints `flat`, `stamped` and the
@@ -137,6 +144,7 @@ DEFAULT_SUITES=(
   kv_leaf_merge_tests
   kv_node_cache_coherence_tests
   kvmap_tree_tests
+  kvmap_read_tests
   kv_scale_tests
   durable_block_refs_tests
   fsck_tests

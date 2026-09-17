@@ -108,13 +108,18 @@ pub struct MintContext<'a> {
 
 impl SlotTrees {
     /// Assemble the forest from its opened trees (the mount path). Each
-    /// guest comes with the root TREE 0 NAMES for it — its published root.
-    /// A guest opened at a NEWER root (its own node's appender page named
-    /// one a cycle ahead of tree 0's publication — PR 10, the routed
-    /// Issue 1) therefore reads as unpublished, and the first checkpoint
-    /// publishes it; seeding `published` with the OPENED root made tree 0
-    /// keep the stale one for ever, and the clean leave then dropped every
-    /// record the moved root alone held (25 dentries of a create storm).
+    /// guest comes with its PUBLISHED root: the root TREE 0 NAMES for it
+    /// where this mount owns the publication — a guest opened at a NEWER
+    /// root (its own node's appender page named one a cycle ahead of tree
+    /// 0's publication — PR 10, the routed Issue 1) therefore reads as
+    /// unpublished, and the first checkpoint publishes it; seeding
+    /// `published` with the OPENED root made tree 0 keep the stale one for
+    /// ever, and the clean leave then dropped every record the moved root
+    /// alone held (25 dentries of a create storm) — or the OPENED root for
+    /// a slot a live FOREIGN appender leases (PR 10, review round 7 —
+    /// Issue 32): its page is its publication, its records sit in its
+    /// ring, and this mount never publishes it, so an unpublished state
+    /// here would floor ring 0 for the mount's life.
     pub fn new(
         control: Arc<KvTree>,
         native: Arc<KvTree>,
@@ -122,9 +127,9 @@ impl SlotTrees {
     ) -> Self {
         let map = scc::HashMap::new();
         let published = scc::HashMap::new();
-        for (slot, tree, named_by_tree0) in guests {
+        for (slot, tree, published_root) in guests {
             let _ = map.insert_sync(slot, tree);
-            let _ = published.insert_sync(slot, named_by_tree0);
+            let _ = published.insert_sync(slot, published_root);
         }
         Self {
             control,

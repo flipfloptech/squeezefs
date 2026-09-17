@@ -12355,17 +12355,28 @@ impl KvMetaBackend {
         if TEST_BRING_UP_COVER_DISABLED.load(Ordering::Relaxed) {
             return Ok(());
         }
-        {
-            let core = self.ring.core();
-            if core.head() == core.reusable_upto() {
-                return Ok(());
-            }
+        // A recovery in flight at this open (PR 10, Issue 31 — the hold a
+        // foreign `Recovering` page's slot takes): the dead recoverer's
+        // records for it sit in ring 0's window and stay there until the
+        // mount path's re-run publishes the root, so the bring-up covers
+        // DOWN TO the hold — everything else in the residue — and no
+        // further (review round 7, Issue 32: the first build's publish
+        // step lifted the hold by accident, which is how the bring-up
+        // covered whole; the hold is what keeps the recovery's window
+        // replayable across a death between this open and the re-run).
+        let covered = |core: &super::journal_core::JournalCore| {
+            let target = self
+                .recovery_hold_floor()
+                .map_or(core.head(), |hold| hold.min(core.head()));
+            core.reusable_upto() >= target
+        };
+        if covered(self.ring.core()) {
+            return Ok(());
         }
         let mut smo = self.smo.lock().await;
         for _ in 0..COVER_CYCLES_MAX {
             self.checkpoint_cycle(&mut smo, true).await?;
-            let core = self.ring.core();
-            if core.head() == core.reusable_upto() {
+            if covered(self.ring.core()) {
                 return Ok(());
             }
         }
@@ -15744,7 +15755,20 @@ impl KvMetaBackend {
             cursor = key_successor(last);
             for (k, v) in &page {
                 let slot = decode_slot_state_key(k)?;
-                let (root, recorded) = match SlotState::decode(v)? {
+                // Whether a root opened AHEAD of tree 0's record is THIS
+                // mount's to publish — the floor below is meaningful only
+                // then (PR 10, review round 7 — Issue 32): an own page's
+                // root (this node's regions — the next checkpoint's page
+                // write or tree-0 entry publishes it, the floor folds into
+                // the region's tail) and a `Recovering` page's root (the
+                // recovery re-run's hold, Issue 31) are; a LIVE FOREIGN
+                // lessee's page root is NOT — its page IS its publication
+                // and its records sit in ITS ring, so a ring-0 floor
+                // protects nothing and, with `publish_forest_roots`
+                // skipping leased slots by law, would clamp ring 0's tail
+                // for the mount's life (the wedge). Such a slot opens at
+                // its page root PUBLISHED.
+                let (root, recorded, publication_ours) = match SlotState::decode(v)? {
                     // An UNLEASED slot's live root is tree 0's — or a
                     // newer one this NODE's own page names (region 0's
                     // page names every guest root one cycle ahead of tree
@@ -15760,13 +15784,28 @@ impl KvMetaBackend {
                             root,
                         ),
                         root,
+                        true,
                     ),
                     SlotState::Leased {
                         appender_id, root, ..
                     } => {
                         // A LEASED slot's live root is the lessee's page
                         // entry (§5.2.2); the record's grant-time root is
-                        // the floor a page not yet written leaves.
+                        // the floor a page not yet written leaves. A
+                        // FOREIGN lessee's `Recovering` page is a recovery
+                        // in flight (Issue 31): the dead recoverer's
+                        // records for the slot sit in ring 0's window, so
+                        // the slot takes the HOLD (the bring-up covers down
+                        // to it — `cover_bring_up_residue`) until the
+                        // re-run's tree-0 step lifts it.
+                        let lessee_page = directory
+                            .iter()
+                            .find(|e| e.appender_id == appender_id)
+                            .and_then(|e| e.page.as_ref());
+                        let ours = lessee_page.is_none_or(|p| {
+                            p.identity.owned_by_node(own_node_token)
+                                || p.state == super::appender::AppenderState::Recovering
+                        });
                         (
                             Self::leased_root_from_directory(
                                 &directory,
@@ -15776,6 +15815,7 @@ impl KvMetaBackend {
                                 root,
                             ),
                             root,
+                            ours,
                         )
                     }
                 };
@@ -15789,7 +15829,7 @@ impl KvMetaBackend {
                 if root.addr == 0 {
                     continue; // granted, never minted: no tree to open yet
                 }
-                let tree = if root != recorded {
+                let (tree, published) = if root != recorded && publication_ours {
                     // Opened AHEAD of tree 0: until a checkpoint publishes
                     // the root, every record it alone holds stays in the
                     // window — they sit at or past the ledger's tail (the
@@ -15797,22 +15837,26 @@ impl KvMetaBackend {
                     // moved leaf's dying floor), so the tail is the floor —
                     // the ONE unpublished-root open (its floor + the
                     // node-seq raise; review round 3, Issue 30).
-                    KvTree::open_unpublished_slot_tree(
+                    let tree = KvTree::open_unpublished_slot_tree(
                         Arc::clone(cache),
                         slot,
                         root,
                         Arc::clone(seq),
                         ledger.journal_tail_seq,
                     )
-                    .await?
+                    .await?;
+                    (tree, recorded)
                 } else {
+                    // Tree 0's root, or a live foreign lessee's page root:
+                    // published either way (Issue 32 — the lessee's page
+                    // is the venue; no ring-0 floor).
                     let tree =
                         KvTree::open_slot_tree(Arc::clone(cache), slot, root, Arc::clone(seq))
                             .await?;
                     seq.fetch_max(root.seq, Ordering::AcqRel);
-                    tree
+                    (tree, root)
                 };
-                guests.push((slot, Arc::new(tree), recorded));
+                guests.push((slot, Arc::new(tree), published));
             }
             if page.len() < 512 {
                 break;
@@ -17198,6 +17242,14 @@ impl KvMetaBackend {
         }
         let tag = super::journal::tag_for(super::record::TREE_CONTROL, 0);
         let mut recs: Vec<(u8, Record)> = Vec::with_capacity(pending.len());
+        // The roots this entry actually PUBLISHES (PR 10, review round 7 —
+        // Issue 32's masking hole): a `Leased` record with no table entry
+        // — the bring-up window before the plane arms — is skipped below,
+        // and noting it published anyway lifted its floor with no durable
+        // publication (a `Recovering` page's hold, Issue 31, or an own
+        // region's root a cycle early).
+        let mut written: Vec<(super::record::ForestSlot, RootPtr)> =
+            Vec::with_capacity(pending.len());
         for (slot, root) in &pending {
             if overflow.contains(slot) {
                 let Some(l) = plane
@@ -17222,6 +17274,7 @@ impl KvMetaBackend {
                     tag,
                     Record::put(super::slot_state::slot_state_key(*slot), 0, value),
                 ));
+                written.push((*slot, *root));
                 continue;
             }
             // The UNARMED forest (PR 1–3): one appender, one cursor — the
@@ -17251,8 +17304,18 @@ impl KvMetaBackend {
                 // opened AHEAD of tree 0 at the mount is re-published here
                 // before any lease plane knows it; the zero form regressed
                 // its release's `g` to 0). A `Leased` record without a
-                // table entry is never rewritten. The zero form is a slot
-                // tree 0 has no record for at all (PR 1–3's mint).
+                // table entry — the bring-up window before the plane arms
+                // — is rewritten with the moved root ONLY for a lessee that
+                // is one of THIS mount's regions (the page-budget overflow
+                // arm's exact shape: the lease's words verbatim, only the
+                // root moves — review round 7, Issue 32: the first build
+                // skipped the write and still noted the root published,
+                // which lifted its floor with nothing durable naming a
+                // root the bring-up's own flush had moved); a FOREIGN
+                // lessee's record is never rewritten and never noted (a
+                // `Recovering` page's hold stands until the re-run's tree-0
+                // step). The zero form is a slot tree 0 has no record for
+                // at all (PR 1–3's mint).
                 None => match forest
                     .control()
                     .lookup(&super::slot_state::slot_state_key(*slot))
@@ -17275,6 +17338,29 @@ impl KvMetaBackend {
                         last_written,
                         seq_floor,
                     },
+                    Some(super::slot_state::SlotState::Leased {
+                        appender_id,
+                        g,
+                        page_addr,
+                        cursor,
+                        slot_tree_extents,
+                        seq_floor,
+                        ..
+                    }) if self
+                        .appenders
+                        .as_ref()
+                        .is_some_and(|set| set.region(appender_id).is_some()) =>
+                    {
+                        super::slot_state::SlotState::Leased {
+                            appender_id,
+                            g,
+                            page_addr,
+                            root: *root,
+                            cursor,
+                            slot_tree_extents,
+                            seq_floor,
+                        }
+                    }
                     Some(super::slot_state::SlotState::Leased { .. }) => continue,
                     None => super::slot_state::SlotState::Unleased {
                         root: *root,
@@ -17291,6 +17377,13 @@ impl KvMetaBackend {
                 tag,
                 Record::put(super::slot_state::slot_state_key(*slot), 0, value),
             ));
+            written.push((*slot, *root));
+        }
+        if recs.is_empty() {
+            // Every pending root was a leased slot's this mount may not
+            // publish (the bring-up window): nothing to write, nothing
+            // published — their floors stand.
+            return Ok(());
         }
         let len = entry_len_for(&recs)?;
         // Test seam: a deferred publication (the reserve-exhausted arm)
@@ -17340,7 +17433,7 @@ impl KvMetaBackend {
             self.note_journal_failure();
             return Err(e);
         }
-        for (slot, root) in pending {
+        for (slot, root) in written {
             forest.note_published(slot, root);
             // The RAM table's unleased words follow the record (a later
             // grant hands the requester the root the record names).
@@ -17425,12 +17518,47 @@ impl KvMetaBackend {
 
     /// The unpublished guest roots' floors per slot (empty on a flat
     /// volume) — folded into each slot's REGION tail by the checkpoint.
+    /// **The lease filter** (PR 10, review round 7 — Issue 32): a floor is
+    /// a position in the ring the slot's records journal into, and this
+    /// mount clamps a tail only for a publication IT owns — its own
+    /// slots (unleased, or leased to one of its regions) and a slot mid-
+    /// RECOVERY (`Releasing { dead }`, or a lessee whose page is
+    /// `Recovering` — the recovery's hold, Issue 31). A slot a LIVE
+    /// FOREIGN appender leases is dropped here whatever the forest's map
+    /// says: its root is published by ITS page, never by this mount, and
+    /// a ring-0 floor for it would stand for the mount's life (the belt
+    /// behind the open's published seeding).
     pub(super) fn unpublished_root_floors(
         &self,
     ) -> std::collections::BTreeMap<super::record::ForestSlot, u64> {
-        self.forest()
+        let mut floors = self
+            .forest()
             .map(|f| f.unpublished_root_floors())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if floors.is_empty() {
+            return floors;
+        }
+        if let (Some(plane), Some(set)) = (self.slot_leases(), self.appenders.as_ref()) {
+            floors.retain(|slot, _| match plane.table.get(*slot) {
+                Some(l)
+                    if l.state != crate::slot_lease_core::LeaseState::Unleased
+                        && l.state != crate::slot_lease_core::LeaseState::Releasing
+                        && set.region(l.holder).is_none()
+                        && !plane.recovering_lessees.contains_sync(&l.holder) =>
+                {
+                    log::debug!(
+                        "meta volume {}: slot {slot}'s root is ahead of its publication while \
+                         appender {} leases it — not this mount's to publish; no floor is \
+                         taken for it",
+                        self.path.display(),
+                        l.holder
+                    );
+                    false
+                }
+                _ => true,
+            });
+        }
+        floors
     }
 
     /// The tree a defrag census target `(header tree id, node addr)`

@@ -645,15 +645,40 @@ impl KvMetaBackend {
             .unwrap_or(0)
     }
 
-    /// Test seam: the forest's UNPUBLISHED guest-root floors per slot —
-    /// the checkpoint tail's clamp (empty on a flat volume; review round 3,
-    /// Issue 29's witness).
+    /// Test seam: the UNPUBLISHED guest-root floors per slot AS THE
+    /// CHECKPOINT READS THEM — the tail's clamp after the lease filter
+    /// (empty on a flat volume; review round 3, Issue 29's witness; round
+    /// 7, Issue 32's).
     pub fn test_unpublished_root_floors(
         &self,
     ) -> std::collections::BTreeMap<record::ForestSlot, u64> {
-        self.forest()
-            .map(|f| f.unpublished_root_floors())
-            .unwrap_or_default()
+        self.unpublished_root_floors()
+    }
+
+    /// **The recovery HOLD** (Issue 31, made real in review round 7): the
+    /// lowest unpublished-root floor of a slot whose lessee is a foreign
+    /// appender mid-recovery — its page `Recovering` at this open, or the
+    /// driver between its `Recovering` write and its tree-0 step. Those
+    /// floors are the dead recoverer's records in ring 0's window (its
+    /// flips and root swaps, stashed at the open; its parked frees), which
+    /// only the re-run's tree-0 publication may release: the bring-up
+    /// covers down to the hold, never past it. `None` with no hold (every
+    /// flat mount, every open without a recovery in flight).
+    pub(super) fn recovery_hold_floor(&self) -> Option<u64> {
+        let set = self.appenders.as_ref()?;
+        let plane = set.slot_leases()?;
+        let forest = self.forest()?;
+        forest
+            .unpublished_root_floors()
+            .into_iter()
+            .filter(|(slot, _)| match plane.table.resolve(*slot) {
+                crate::slot_lease_core::Resolved::Holder { holder, .. } => {
+                    set.region(holder).is_none() && plane.recovering_lessees.contains_sync(&holder)
+                }
+                crate::slot_lease_core::Resolved::Unleased { .. } => false,
+            })
+            .map(|(_, floor)| floor)
+            .min()
     }
 
     /// Test seam: the device byte ranges appender `id`'s REGION owns on

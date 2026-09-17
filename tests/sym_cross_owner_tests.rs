@@ -443,6 +443,9 @@ async fn a_create_in_a_foreign_directory_ships_one_insert_dentry_and_mints_in_th
     let holders = Holders::stand_up(&routed, &[1]).await;
     let before = cross_owner_stats();
     let before_rpcs = squeezefs::dlm_slot::dlm_rpcs();
+    let tripwires_before = squeezefs::fuse_client::METRICS
+        .invariant_tripwires
+        .load(Ordering::Relaxed);
 
     let file = routed
         .create(shared, "out.bin", libc::S_IFREG | 0o644, 0, 0)
@@ -452,6 +455,19 @@ async fn a_create_in_a_foreign_directory_ships_one_insert_dentry_and_mints_in_th
         .create(shared, "sub", libc::S_IFDIR | 0o755, 0, 0)
         .await
         .expect("mkdir in a foreign directory");
+    // PR 12: the local `CreateInode` step is a FRESH mint — nothing names
+    // the child until the shipped insert lands, the 4a law takes no
+    // `I{child}` on it (the local create path holds none), so the
+    // coverage belt has nothing to judge and must not fire (it fired on
+    // every cross-owner create before, hidden until 7b read the gauge).
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .invariant_tripwires
+            .load(Ordering::Relaxed),
+        tripwires_before,
+        "a cross-owner create trips no invariant tripwire (xv_local_step_unguarded on a \
+         fresh mint is a predicate error, not a lock-law violation)"
+    );
 
     let rotor = plane.rotor.load();
     for child in [file.ino, sub.ino] {

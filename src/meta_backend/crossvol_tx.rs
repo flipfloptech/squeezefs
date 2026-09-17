@@ -1657,6 +1657,14 @@ impl XvLocalStep {
             | Self::CreateInode { local_ino, .. } => *local_ino,
         }
     }
+
+    /// Whether the step writes a record for an ino THIS op minted — one
+    /// nothing else can name until the op's own dentry step lands. The 4a
+    /// law takes no `I{ino}` guard on a fresh mint (the local create path
+    /// holds none), so a coverage check has nothing to judge here.
+    pub fn is_fresh_mint(&self) -> bool {
+        matches!(self, Self::MintInode { .. } | Self::CreateInode { .. })
+    }
 }
 
 /// The intent record's rider on a step's transaction: the `Put` rides step
@@ -2163,9 +2171,14 @@ async fn apply_or_ship_step(
             // The op's guard set must cover the step's keys (Issue 8c):
             // a slot that moved to this initiator between its acquisition
             // and this step would leave the key unguarded — loud, never
-            // silent.
+            // silent. A FRESH MINT is exempt (PR 12): its ino was
+            // allocated by this op and nothing names it until the op's
+            // own dentry step lands, so the 4a law takes no `I{ino}` on
+            // it — the local create path holds none either — and there
+            // is no guard the scope could cover. Judging it fired the
+            // tripwire on every cross-owner create and whiteout rename.
             let scope = scope_of(&guards);
-            if scope != 0 {
+            if scope != 0 && !local.is_fresh_mint() {
                 let needed = step_stripes(routed.volumes[v_idx].dlm(), v_idx, local);
                 if local_scope_covers(scope, &needed) == Some(false) {
                     crate::note_invariant_tripwire(

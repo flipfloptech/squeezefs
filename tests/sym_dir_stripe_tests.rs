@@ -518,14 +518,6 @@ async fn fsck_clean_covered(uris: &[String], partition: Option<&str>) {
     fsck_clean(uris).await;
 }
 
-/// PR 6's `xv_local_step_unguarded` tripwire fires on EVERY cross-owner
-/// create (the child ino is allocated inside `create_in_foreign_directory`
-/// AFTER the op's guards, so the local `CreateInode` step's `I{child}` is
-/// never in the scope's local set — pre-existing, PR 6's own; routed to
-/// its owner / PR 12 in the review file, Issue 22). It is allow-listed BY
-/// NAME: every other tripwire in this process must be 0.
-const ROUTED_TRIPWIRE: &str = "xv_local_step_unguarded";
-
 /// The ledger's closure and "no open intent" are EVENTUAL in a process
 /// with background tasks (a kicked migration's intent is registered in
 /// flight before it is counted minted); bounded wait, then the assert.
@@ -548,14 +540,16 @@ async fn assert_closed(what: &str) {
         s.intents_stuck, 0,
         "{what}: xv_cross_owner_intents_stuck must stay 0"
     );
+    // PR 12 fixed the one tripwire 7b allow-listed by name (PR 6's
+    // `xv_local_step_unguarded` on every cross-owner create — a fresh
+    // mint's `I{child}` has no guard to be covered by): every tripwire in
+    // this process must be 0.
     let total = squeezefs::fuse_client::METRICS
         .invariant_tripwires
         .load(Ordering::Relaxed);
-    let routed = squeezefs::invariant_tripwire_count(ROUTED_TRIPWIRE);
     assert_eq!(
-        total, routed,
-        "{what}: invariant_tripwires must stay 0 beyond the routed `{ROUTED_TRIPWIRE}` \
-         (total {total}, routed {routed})"
+        total, 0,
+        "{what}: invariant_tripwires must stay 0 (total {total})"
     );
 }
 

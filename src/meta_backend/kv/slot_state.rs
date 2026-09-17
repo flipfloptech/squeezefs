@@ -245,6 +245,87 @@ impl SlotState {
 // Issue 21).
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// The custody QUARANTINE record — `custody_quarantine:{slot}` (PR 10, review
+// round 8, Issue 36): a slot recovered from an EARLY death record refuses
+// fresh custody grants until `until_ms`; the record is written in the
+// recovery's own tree-0 entry (beside the slot's `Unleased`), read at every
+// arm so a manager restart inside the window keeps the quarantine, and
+// deleted once expired.
+// ---------------------------------------------------------------------------
+
+/// Key prefix of every custody-quarantine record in tree 0.
+pub const CUSTODY_QUARANTINE_KEY_PREFIX: &[u8] = b"custody_quarantine:";
+/// `prefix ‖ slot: u32 BE`.
+pub const CUSTODY_QUARANTINE_KEY_LEN: usize = CUSTODY_QUARANTINE_KEY_PREFIX.len() + 4;
+/// Record value version (byte 0).
+pub const CUSTODY_QUARANTINE_VERSION: u8 = 1;
+/// `version ‖ until_ms: u64 LE`.
+pub const CUSTODY_QUARANTINE_LEN: usize = 1 + 8;
+
+/// The tree-0 key of slot `slot`'s custody-quarantine record.
+pub fn custody_quarantine_key(slot: ForestSlot) -> Vec<u8> {
+    let mut k = Vec::with_capacity(CUSTODY_QUARANTINE_KEY_LEN);
+    k.extend_from_slice(CUSTODY_QUARANTINE_KEY_PREFIX);
+    k.extend_from_slice(&slot.to_be_bytes());
+    k
+}
+
+/// Inclusive `[start, end]` bounds covering every custody-quarantine record.
+pub fn custody_quarantine_key_range() -> (Vec<u8>, Vec<u8>) {
+    (
+        custody_quarantine_key(0),
+        custody_quarantine_key(ForestSlot::MAX),
+    )
+}
+
+/// Decode a custody-quarantine key back to its slot.
+pub fn decode_custody_quarantine_key(key: &[u8]) -> Result<ForestSlot, KvError> {
+    if key.len() != CUSTODY_QUARANTINE_KEY_LEN || !key.starts_with(CUSTODY_QUARANTINE_KEY_PREFIX) {
+        return Err(KvError::Corrupt(format!(
+            "custody_quarantine key must be {CUSTODY_QUARANTINE_KEY_LEN} bytes under the {:?} \
+             prefix, got {} bytes",
+            String::from_utf8_lossy(CUSTODY_QUARANTINE_KEY_PREFIX),
+            key.len()
+        )));
+    }
+    let p = CUSTODY_QUARANTINE_KEY_PREFIX.len();
+    Ok(ForestSlot::from_be_bytes([
+        key[p],
+        key[p + 1],
+        key[p + 2],
+        key[p + 3],
+    ]))
+}
+
+/// Encode a custody-quarantine value: `version ‖ until_ms` (Unix ms).
+pub fn encode_custody_quarantine(until_ms: u64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(CUSTODY_QUARANTINE_LEN);
+    v.push(CUSTODY_QUARANTINE_VERSION);
+    v.extend_from_slice(&until_ms.to_le_bytes());
+    v
+}
+
+/// Decode a custody-quarantine value to its `until_ms`; total over every
+/// byte string (a wrong length or version refuses).
+pub fn decode_custody_quarantine(value: &[u8]) -> Result<u64, KvError> {
+    if value.len() != CUSTODY_QUARANTINE_LEN {
+        return Err(KvError::Corrupt(format!(
+            "custody_quarantine record must be {CUSTODY_QUARANTINE_LEN} bytes, got {}",
+            value.len()
+        )));
+    }
+    if value[0] != CUSTODY_QUARANTINE_VERSION {
+        return Err(KvError::Corrupt(format!(
+            "custody_quarantine record carries version {}, expected {CUSTODY_QUARANTINE_VERSION}",
+            value[0]
+        )));
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&value[1..9]);
+    Ok(u64::from_le_bytes(b))
+}
+
 /// Key prefix of every slot-tails record in tree 0.
 pub const SLOT_TAILS_KEY_PREFIX: &[u8] = b"slot_tails:";
 /// `prefix ‖ slot: u32 BE`.

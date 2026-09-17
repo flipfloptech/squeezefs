@@ -655,6 +655,64 @@ impl KvMetaBackend {
         self.unpublished_root_floors()
     }
 
+    /// **The custody quarantines' re-derivation** (review round 8, Issue
+    /// 36): every `custody_quarantine:{slot}` record in this volume's tree
+    /// 0 — written by a recovery from an EARLY death record beside the
+    /// slot's `Unleased` — installs its deadline into the process's RAM
+    /// quarantine when still in the future, so a manager restart inside
+    /// the window keeps refusing fresh custody grants on the slot's files;
+    /// expired records are retired in ONE control entry (best effort — a
+    /// refused write leaves them for the next open). Returns the count
+    /// installed. A no-op (no read) on a flat volume or an unarmed forest.
+    pub async fn load_custody_quarantines(&self) -> std::result::Result<usize, KvError> {
+        let Some(forest) = self.forest() else {
+            return Ok(0);
+        };
+        if !self.slot_lease_armed() {
+            return Ok(0);
+        }
+        let control = Arc::clone(forest.control());
+        let (start, end) = slot_state::custody_quarantine_key_range();
+        let page = control.range(&start, &end, 4096).await?;
+        if page.is_empty() {
+            return Ok(0);
+        }
+        let now = crate::meta_backend::kv::alloc_lease::unix_now_ms();
+        let mut installed = 0usize;
+        let mut expired: Vec<(u8, Record)> = Vec::new();
+        for (k, v) in &page {
+            let slot = slot_state::decode_custody_quarantine_key(k)?;
+            let until = slot_state::decode_custody_quarantine(v)?;
+            if until > now {
+                crate::data_grant::quarantine_slot_custody(self.volume_uuid(), slot, until);
+                installed += 1;
+            } else {
+                expired.push((
+                    journal::tag_for(record::TREE_CONTROL, 0),
+                    Record::delete(k.to_vec(), 0),
+                ));
+            }
+        }
+        if installed > 0 {
+            log::warn!(
+                "meta volume {}: {installed} slot(s) under a custody quarantine a previous \
+                 incarnation wrote — fresh custody grants on their files stay refused until \
+                 the bound",
+                self.path.display()
+            );
+        }
+        if !expired.is_empty() {
+            if let Err(e) = self.write_control_entry(expired, EntryAdmission::Try).await {
+                log::warn!(
+                    "meta volume {}: retiring expired custody-quarantine records failed ({e}); \
+                     the next open retries",
+                    self.path.display()
+                );
+            }
+        }
+        Ok(installed)
+    }
+
     /// **The recovery HOLD** (Issue 31, made real in review round 7): the
     /// lowest unpublished-root floor of a slot whose lessee is a foreign
     /// appender mid-recovery — its page `Recovering` at this open, or the
@@ -1763,8 +1821,29 @@ impl KvMetaBackend {
         // mutex); the unclaimed grant returned; the dead appender's orphan
         // images returned (C13 for a dead appender).
         let t = Instant::now();
-        self.release_recovered_slots(&plane, id, &released, tails_by_slot, &mut smo)
-            .await?;
+        // The death-path custody QUARANTINE's deadline (review round 7,
+        // Issue 34; round 8, Issue 36): an EARLY record — `appender clear`,
+        // the same-node takeover — can be written inside a surviving
+        // custody writer's `T_self` (the plane's own recorders cannot:
+        // `T_self < T_owner`), so this arbiter grants nothing fresh on the
+        // recovered slots' files until the OWNER-side bound — `T_owner`
+        // past the record, plus `2 × skew_max` for the recorder's wall
+        // clock against ours — has elapsed; the S7 dead-epoch quarantine's
+        // shape, per slot. Written beside each slot's `Unleased` (durable
+        // across a restart inside the window), installed in RAM at 7b.
+        let custody_quarantine_until = dead.early.then(|| {
+            dead.ts_ms
+                .saturating_add(crate::data_grant::custody_quarantine_bound_ms())
+        });
+        self.release_recovered_slots(
+            &plane,
+            id,
+            &released,
+            tails_by_slot,
+            custody_quarantine_until,
+            &mut smo,
+        )
+        .await?;
 
         // ---- 7b. the RAM lease table LAST (Issue 3): tree 0's `Unleased`
         // records are barriered — the slots go `Unleased { g }` here, the
@@ -1801,17 +1880,7 @@ impl KvMetaBackend {
         // slot's file was refused as a foreign home until the volume's next
         // grant or release republished the owners.
         self.publish_slot_owners(set, &plane);
-        // The death-path custody QUARANTINE (review round 7, Issue 34): an
-        // EARLY record — `appender clear`, the same-node takeover — can be
-        // written inside a surviving custody writer's `T_self` (the plane's
-        // own recorders cannot: `T_self < T_owner`), so this arbiter grants
-        // nothing fresh on the recovered slots' files until `ts_ms + T_self`
-        // — the S7 dead-epoch quarantine's shape, per slot. Idempotent
-        // across a re-run (the deadline is the record's).
-        if dead.early {
-            let until = dead
-                .ts_ms
-                .saturating_add(crate::data_grant::custody_quarantine_t_self_ms());
+        if let Some(until) = custody_quarantine_until {
             for (slot, _, _) in &released {
                 crate::data_grant::quarantine_slot_custody(self.volume_uuid(), *slot, until);
             }
@@ -1819,7 +1888,7 @@ impl KvMetaBackend {
                 log::warn!(
                     "meta volume {}: appender {id}'s death record is an EARLY attestation — \
                      fresh custody grants on its {} recovered slot(s) are quarantined until \
-                     Unix ms {until} (the dead holder's writers' T_self)",
+                     Unix ms {until} (T_owner + 2 × skew_max past the record)",
                     self.path.display(),
                     released.len()
                 );
@@ -2226,6 +2295,7 @@ impl KvMetaBackend {
         appender_id: u32,
         released: &[(record::ForestSlot, u32, crate::slot_lease_core::SlotWords)],
         tails_by_slot: Vec<(record::ForestSlot, Vec<(u64, u32)>)>,
+        custody_quarantine_until: Option<u64>,
         smo: &mut SmoContext,
     ) -> std::result::Result<(), KvError> {
         if released.is_empty() {
@@ -2267,6 +2337,20 @@ impl KvMetaBackend {
                     .encode(),
                 ),
             )];
+            // The custody quarantine's DURABLE word (Issue 36): beside the
+            // slot's `Unleased`, in the same entry — a manager restart
+            // inside the window re-derives the RAM quarantine from it at
+            // its arm.
+            if let Some(until) = custody_quarantine_until {
+                recs.push((
+                    tag,
+                    Record::put(
+                        slot_state::custody_quarantine_key(*slot),
+                        0,
+                        slot_state::encode_custody_quarantine(until),
+                    ),
+                ));
+            }
             let tails = tails_by_slot
                 .iter()
                 .find(|(s, _)| s == slot)
@@ -3017,6 +3101,10 @@ pub async fn mount_path_custody_gate(
         );
     }
     for vol in &routed.volumes {
+        // The custody quarantines a previous incarnation of this manager
+        // wrote (Issue 36): re-derived from tree 0 before the set serves,
+        // expired ones retired — one range read per armed volume.
+        vol.load_custody_quarantines().await?;
         let census = vol.slot_custody_census_opts(Some(vol0), false).await?;
         if let Some((id, identity)) = census.recovering_unledgered.first() {
             return Err(KvError::Corrupt(format!(

@@ -60,9 +60,10 @@ use squeezefs::meta_backend::kv::record::{
     TREE_XATTRS, XATTR_KEY_LEN,
 };
 use squeezefs::meta_backend::kv::slot_state::{
-    decode_slot_state_key, decode_slot_tails_key, slot_state_key, slot_tails_key, SlotState,
-    SlotTails, SlotTailsRecord, TailsSpill, SLOT_STATE_KEY_LEN, SLOT_STATE_VERSION,
-    SLOT_TAILS_KEY_LEN, SLOT_TAILS_VERSION, TAILS_SPILLED,
+    custody_quarantine_key, decode_custody_quarantine, decode_custody_quarantine_key,
+    decode_slot_state_key, decode_slot_tails_key, encode_custody_quarantine, slot_state_key,
+    slot_tails_key, SlotState, SlotTails, SlotTailsRecord, TailsSpill, CUSTODY_QUARANTINE_KEY_LEN,
+    SLOT_STATE_KEY_LEN, SLOT_STATE_VERSION, SLOT_TAILS_KEY_LEN, SLOT_TAILS_VERSION, TAILS_SPILLED,
 };
 use squeezefs::meta_backend::kv::superblock::{ExtentRef, SuperblockV3};
 use squeezefs::meta_backend::kv::tree::RootPtr;
@@ -742,7 +743,18 @@ proptest! {
             ),
         }
         if let Ok(rec) = SlotTailsRecord::decode(&data) {
-            prop_assert_eq!(rec.encode().expect("re-encodes"), data);
+            prop_assert_eq!(rec.encode().expect("re-encodes"), data.clone());
+        }
+        // PR 10 review round 8 (Issue 36): the custody-quarantine record.
+        match decode_custody_quarantine_key(&data) {
+            Ok(slot) => prop_assert_eq!(custody_quarantine_key(slot), data.clone()),
+            Err(_) => prop_assert!(
+                data.len() != CUSTODY_QUARANTINE_KEY_LEN
+                    || !data.starts_with(b"custody_quarantine:")
+            ),
+        }
+        if let Ok(until) = decode_custody_quarantine(&data) {
+            prop_assert_eq!(encode_custody_quarantine(until), data);
         }
     }
 
@@ -764,6 +776,14 @@ proptest! {
     ) {
         prop_assert_eq!(decode_slot_state_key(&slot_state_key(slot)).ok(), Some(slot));
         prop_assert_eq!(decode_slot_tails_key(&slot_tails_key(slot)).ok(), Some(slot));
+        prop_assert_eq!(
+            decode_custody_quarantine_key(&custody_quarantine_key(slot)).ok(),
+            Some(slot)
+        );
+        prop_assert_eq!(
+            decode_custody_quarantine(&encode_custody_quarantine(last_written)).ok(),
+            Some(last_written)
+        );
         let unleased = SlotState::Unleased {
             root: RootPtr { addr, seq }, cursor, g, slot_tree_extents, last_written,
             seq_floor: last_written.rotate_left(7),

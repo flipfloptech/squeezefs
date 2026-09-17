@@ -32,9 +32,12 @@
 
 use libfuzzer_sys::fuzz_target;
 use squeezefs::meta_backend::kv::slot_state::{
-    decode_slot_state_key, decode_slot_tails_key, slot_state_key, slot_state_key_range,
-    slot_tails_key, slot_tails_key_range, SlotState, SlotTails, SlotTailsRecord, TailsSpill,
-    LEASED_LEN, SLOT_STATE_KEY_LEN, SLOT_STATE_VERSION, SLOT_TAILS_FIXED_LEN, SLOT_TAILS_KEY_LEN,
+    custody_quarantine_key, custody_quarantine_key_range, decode_custody_quarantine,
+    decode_custody_quarantine_key, decode_slot_state_key, decode_slot_tails_key,
+    encode_custody_quarantine, slot_state_key, slot_state_key_range, slot_tails_key,
+    slot_tails_key_range, SlotState, SlotTails, SlotTailsRecord, TailsSpill,
+    CUSTODY_QUARANTINE_KEY_LEN, CUSTODY_QUARANTINE_LEN, CUSTODY_QUARANTINE_VERSION, LEASED_LEN,
+    SLOT_STATE_KEY_LEN, SLOT_STATE_VERSION, SLOT_TAILS_FIXED_LEN, SLOT_TAILS_KEY_LEN,
     SLOT_TAILS_VERSION, TAILS_SPILLED, TAIL_ENTRY_LEN, UNLEASED_LEN,
 };
 use squeezefs::meta_backend::kv::tree::RootPtr;
@@ -68,6 +71,30 @@ fuzz_target!(|data: &[u8]| {
             "only a wrong prefix or length refuses"
         ),
     }
+    // PR 10 review round 8 (Issue 36): the custody-quarantine record.
+    match decode_custody_quarantine_key(data) {
+        Ok(slot) => {
+            assert_eq!(data.len(), CUSTODY_QUARANTINE_KEY_LEN);
+            assert_eq!(custody_quarantine_key(slot), data, "the key is byte-exact");
+            let (lo, hi) = custody_quarantine_key_range();
+            assert!(lo <= data.to_vec() && data.to_vec() <= hi);
+        }
+        Err(_) => assert!(
+            data.len() != CUSTODY_QUARANTINE_KEY_LEN || !data.starts_with(b"custody_quarantine:"),
+            "only a wrong prefix or length refuses"
+        ),
+    }
+    match decode_custody_quarantine(data) {
+        Ok(until) => {
+            assert_eq!(data.len(), CUSTODY_QUARANTINE_LEN);
+            assert_eq!(data[0], CUSTODY_QUARANTINE_VERSION);
+            assert_eq!(encode_custody_quarantine(until), data, "byte-exact");
+        }
+        Err(_) => assert!(
+            data.len() != CUSTODY_QUARANTINE_LEN || data[0] != CUSTODY_QUARANTINE_VERSION,
+            "only a wrong length or version refuses"
+        ),
+    }
     if data.len() >= 4 {
         let slot = u32::from_be_bytes(data[0..4].try_into().unwrap());
         assert_eq!(
@@ -77,6 +104,17 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(
             decode_slot_tails_key(&slot_tails_key(slot)).ok(),
             Some(slot)
+        );
+        assert_eq!(
+            decode_custody_quarantine_key(&custody_quarantine_key(slot)).ok(),
+            Some(slot)
+        );
+    }
+    if data.len() >= 8 {
+        let until = u64::from_le_bytes(data[0..8].try_into().unwrap());
+        assert_eq!(
+            decode_custody_quarantine(&encode_custody_quarantine(until)).ok(),
+            Some(until)
         );
     }
 

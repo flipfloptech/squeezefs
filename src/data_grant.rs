@@ -6109,14 +6109,35 @@ pub fn quarantine_slot_custody(
     CUSTODY_QUARANTINE_LIVE.store(q.len() as u64, Ordering::Release);
 }
 
-/// `T_self` for the quarantine's deadline: the installed custody
-/// authority's clocks (the same fleet configuration the dead holder's
-/// writers ran under), else the shipped derivation.
-pub fn custody_quarantine_t_self_ms() -> u64 {
-    custody_owner()
-        .map(|o| o.clocks().t_self)
-        .or_else(|| LeaseClocks::derive(Duration::ZERO).ok().map(|c| c.t_self))
-        .map_or(0, |d| d.as_millis() as u64)
+/// **The quarantine's bound** (review round 8, Issue 36): `T_owner + 2 ×
+/// skew_max` past the death record's `ts_ms`. `T_owner` is the OWNER's
+/// view of a custody lease — the instant past which a holder may re-grant
+/// (`T_self = T_owner − 2·skew_max − D_purge` is the MEMBER's stricter
+/// self-fence, the wrong side for an owner-side quarantine); `ts_ms` is
+/// the RECORDER's wall clock compared against the quarantining node's, so
+/// the bound absorbs `2 × skew_max` of disagreement between them. The
+/// clocks are the installed custody authority's (the fleet configuration
+/// the dead holder's writers ran under), else the shipped derivation;
+/// tie-tested in `derivation_sweep_tests`.
+pub fn custody_quarantine_bound_ms() -> u64 {
+    custody_quarantine_bound_for(
+        &custody_owner()
+            .map(|o| o.clocks().clone())
+            .or_else(|| LeaseClocks::derive(Duration::ZERO).ok())
+            .unwrap_or_else(|| {
+                LeaseClocks::with_params(
+                    Duration::from_secs(crate::fuse_client::CLIENT_STALE_TTL_SECS),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .expect("a zero-skew, zero-purge clock set is admissible")
+            }),
+    )
+}
+
+/// The bound's law over one clock set (the tie test's subject).
+pub fn custody_quarantine_bound_for(clocks: &LeaseClocks) -> u64 {
+    (clocks.t_owner + 2 * clocks.skew_max).as_millis() as u64
 }
 
 /// Is GLOBAL ino `ino`'s slot under the death-path custody quarantine?

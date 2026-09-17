@@ -1526,15 +1526,39 @@ impl BlockAllocator {
     /// lacks. Writing bytes into an offset it was granted is a different
     /// question, asked at a different door.
     ///
-    /// Associated (not `&self`) deliberately: the posture is the MOUNT's,
-    /// never one allocator's, so no per-volume state can drift out of
-    /// agreement with it.
+    /// **Under the ARMED symmetric plane the gate keys on a held LEASE**
+    /// (design-symmetric-metadata §7.3, PR 12 — "`plane_gate` keys on 'do
+    /// I hold this plane's lease'"): a grant-armed allocator (PR 8's
+    /// `install_block_grant_arm` — the armed writer's fresh mint) answers
+    /// for ITS data volume, and the ownership-accounting plane of that
+    /// volume is the ALLOCATION LEASE — the bitmap, the terminal free, the
+    /// grace ring, the quarantine live with its holder (§5.5). This mount
+    /// passes iff it holds that lease (`alloc_lease::holding`) or is
+    /// running the holder's own served-free act; a non-holder's terminal
+    /// frees SHIP to the holder (`block_grant::free_target_for`), never
+    /// run here. Every unarmed allocator takes the two shipped arms above
+    /// verbatim — the posture-word arm never reads a lease, so `=0` and a
+    /// bit-17-absent mount stay byte-identical.
+    ///
+    /// `&self` since PR 12 for exactly that reason: the armed question is
+    /// per VOLUME (which lease), where the shipped one was the mount's
+    /// (which posture).
     #[inline]
-    fn plane_gate(what: &str) -> Result<()> {
+    fn plane_gate(&self, what: &str) -> Result<()> {
         if crate::fuse_client::read_only_mount() {
             let e = crate::fuse_client::read_only_refusal(what);
             log::error!("{e}");
             return Err(e);
+        }
+        if let Some(vol_tag) = self.block_grant_vol_tag() {
+            if crate::meta_backend::kv::alloc_lease::holding(vol_tag).is_none()
+                && !crate::cowriter::authority_accounting_scope_active()
+            {
+                let e = crate::fuse_client::lease_refusal(what, vol_tag);
+                log::error!("{e}");
+                return Err(e);
+            }
+            return Ok(());
         }
         // DLM S9 free path: the scope probe runs only INSIDE the co-writer
         // branch (a write mount never pays it). It marks the ONE venue that
@@ -1578,12 +1602,21 @@ impl BlockAllocator {
     /// actually needs — *is THIS volume's index space partitioned for me* —
     /// which is per-volume state by construction (each volume engages its
     /// own).
+    ///
+    /// **Armed (PR 12)**: the allocation plane's lease is the GRANT WINDOW
+    /// — a grant-armed allocator mints from ranges its data volume's
+    /// holder carved (PR 8), so the arm passes on the arm's existence and
+    /// asks the posture word nothing; the posture arms below are the
+    /// unarmed allocator's, byte-identical.
     #[inline]
     fn alloc_plane_gate(&self, what: &str) -> Result<()> {
         if crate::fuse_client::read_only_mount() {
             let e = crate::fuse_client::read_only_refusal(what);
             log::error!("{e}");
             return Err(e);
+        }
+        if self.block_grant_armed() {
+            return Ok(());
         }
         if crate::fuse_client::co_writer_mount() && self.lanes.get().is_none() {
             let e = crate::fuse_client::co_writer_refusal(what);
@@ -3189,7 +3222,7 @@ impl BlockAllocator {
         // product ladders on both postures — and a counter that can only
         // ever read 0 is exactly the dead weight the ledger's
         // rot-detection value depends on not having.
-        if Self::plane_gate("W1 in-place sub-block patch").is_err() {
+        if self.plane_gate("W1 in-place sub-block patch").is_err() {
             return false;
         }
         self.mark_incarnation_unstable(offset);
@@ -3984,7 +4017,7 @@ impl BlockAllocator {
     /// remaining legitimate caller (fsck's C2Leaked apply refuses untracked
     /// offsets itself before freeing).
     pub fn begin_free(&self, offset: u64) -> bool {
-        if Self::plane_gate("terminal block free").is_err() {
+        if self.plane_gate("terminal block free").is_err() {
             return false;
         }
         let should_free = if let Some(terminal) = self
@@ -4363,7 +4396,7 @@ impl BlockAllocator {
         // `false`, because a `false` here is indistinguishable from a
         // legitimate NON-TERMINAL release — and a reader reaching this path
         // at all is a bug worth a loud error, not a silent `Ok`.
-        Self::plane_gate("block free")?;
+        self.plane_gate("block free")?;
         if self.begin_free(offset) {
             self.finish_free(offset);
         }
@@ -4618,7 +4651,7 @@ impl BlockAllocator {
     }
 
     pub async fn allocate_specific_block(&self, block_idx: u64) -> Result<()> {
-        Self::plane_gate("specific block allocation")?;
+        self.plane_gate("specific block allocation")?;
         let cur_highest = self.highest_block.load(Ordering::Relaxed);
         if block_idx >= cur_highest {
             // Rev 2 correction C (device-overlay KD-OV-14): the honest
@@ -4773,7 +4806,7 @@ impl BlockAllocator {
         // writer allocated after it would be free-listed here. A reader
         // allocates nothing and frees nothing, so the whole pass is
         // refused rather than made "harmless".
-        Self::plane_gate("block-ownership recovery walk")?;
+        self.plane_gate("block-ownership recovery walk")?;
         // Two passes' worth of work in one: collect the owned indices
         // under the walk (which borrows `self` immutably), then seed.
         // `recover_block` is `async`, so it cannot run inside the

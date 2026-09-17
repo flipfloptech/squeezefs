@@ -893,6 +893,27 @@ pub(crate) fn read_only_refusal(what: &str) -> crate::error::SqueezefsError {
 /// upstream as `patch_ineligible_posture`), the recovery walk, direct
 /// device reclaim — plus any free arm not yet routed through either
 /// sanctioned exit, which is a bug worth the loud error.
+/// Symmetric PR 12 — the standard refusal for **ownership accounting** on
+/// a data volume whose ALLOCATION LEASE this armed writer does not hold
+/// (design-symmetric-metadata §5.5 / §7.3): the bitmap, the terminal
+/// free, the grace ring and the quarantine are the holder's, and a
+/// non-holder's frees SHIP to it. Counted on the co-writer accounting
+/// gauge — it is the same class one lease finer.
+pub(crate) fn lease_refusal(what: &str, vol_tag: u64) -> crate::error::SqueezefsError {
+    METRICS
+        .cowriter_accounting_refusals
+        .fetch_add(1, Ordering::Relaxed);
+    crate::error::SqueezefsError::InvalidOperation(format!(
+        "{what} refused: this armed symmetric writer does not hold the ALLOCATION LEASE of \
+         data volume {vol_tag:#018x} (design-symmetric-metadata §5.5 — the durable allocation \
+         bitmap, the terminal free, the freed-offset grace ring and the dead-epoch quarantine \
+         live with the lease holder; `alloc_lease` on the stats inode names what this mount \
+         holds). Fresh allocation is admitted from the block GRANTS the holder carves; a \
+         terminal free is admitted by SHIPPING to the holder — an accounting arm reaching this \
+         text came through neither sanctioned exit."
+    ))
+}
+
 pub(crate) fn co_writer_refusal(what: &str) -> crate::error::SqueezefsError {
     METRICS
         .cowriter_accounting_refusals
@@ -12154,6 +12175,17 @@ impl SqueezefsFilesystem {
                 // watch — nonzero means a daemon surface still commits
                 // metadata directly instead of shipping it.
                 "mount_posture": mount_posture().as_str(),
+                // Symmetric PR 12 (design-symmetric-metadata §7.3 / §11): the
+                // join ladder's report — the rungs a writer of an ARMED set
+                // walked, the data namespaces it registered (or the
+                // detection-grade lab posture), the listener it serves on.
+                // `null` on every unarmed mount; WHICH leases the writer
+                // holds is what `manager_lease`, `alloc_lease`,
+                // `slot_leases_held` and `membership_mode` say — there are
+                // no roles under the plane.
+                "symmetric_join": crate::sym_join::report()
+                    .map(|r| serde_json::to_value(&*r).unwrap_or(serde_json::Value::Null))
+                    .unwrap_or(serde_json::Value::Null),
                 "cowriter": crate::cowriter::stats_json(),
                 // DLM S6 (spec §6.5 item 3): the membership plane's
                 // counters. `membership_renewals` is the beat that used to

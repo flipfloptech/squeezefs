@@ -2963,6 +2963,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Error: {report}");
         std::process::exit(1);
     }
+    // Symmetric PR 12 — the join ladder's rung 1 (design-symmetric-metadata
+    // §6.1 / §7.3): under SQUEEZEFS_SYMMETRIC_META=1 the multi-writer
+    // posture knobs are RETIRED spellings — refused here in the registry's
+    // own form, naming the successor. Fires only on an ARMED process; an
+    // unarmed one keeps their shipped meaning until the PR-14 flip.
+    if let Some(report) = squeezefs::sym_join::retired_knob_refusal() {
+        eprintln!("Error: {report}");
+        std::process::exit(1);
+    }
 
     // KD-MW-14 rung 3c: feed squeezefs-ipc's blocking pool the fleet-
     // share-DIVIDED sizing root before its first offload (the crate
@@ -6888,20 +6897,37 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // A SET authority arms here as the plane's OWNER — under D20 it is
             // the membership owner, which is why its own preflight only READ
             // the rendezvous record.
-            let membership_arm: Option<squeezefs::membership::MembershipArm> = if mw_client_mount {
-                // The preflight's arm is carried inside the posture's own
-                // preflight and handed to its arm, whose disarm leaves the
-                // plane.
-                None
-            } else {
-                squeezefs::membership::arm_mount_membership(
+            let mut membership_arm: Option<squeezefs::membership::MembershipArm> =
+                if mw_client_mount {
+                    // The preflight's arm is carried inside the posture's own
+                    // preflight and handed to its arm, whose disarm leaves the
+                    // plane.
+                    None
+                } else {
+                    squeezefs::membership::arm_mount_membership(
+                        &routed_meta_backend,
+                        reader_mount,
+                        Some(membership_purge.clone()),
+                    )
+                    .await
+                    .map_err(|e| format!("membership plane refused to arm: {e}"))?
+                };
+            // Symmetric PR 12 — the join ladder's rung 3: an ARMED set whose
+            // operator declared no membership bind arms its shard at `auto`
+            // (the death ledger's writer is the S6 eviction — PR 10; an
+            // armed set without the plane would record no death). An
+            // explicit bind above wins verbatim; unarmed sets are untouched.
+            let symmetric_set = !reader_mount
+                && !mw_client_mount
+                && squeezefs::sym_join::set_armed(&routed_meta_backend);
+            if symmetric_set && membership_arm.is_none() {
+                membership_arm = squeezefs::sym_join::arm_membership_shard(
                     &routed_meta_backend,
-                    reader_mount,
                     Some(membership_purge),
                 )
                 .await
-                .map_err(|e| format!("membership plane refused to arm: {e}"))?
-            };
+                .map_err(|e| format!("{e}"))?;
+            }
 
             // DLM S9 (spec §6.9 S9): arm the multi-writer planes.
             //
@@ -6923,30 +6949,51 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 squeezefs::multi_writer::RouterQuarantine::new(
                     fs_engine.router.backend_router.clone(),
                 );
-            let multi_writer_arm = squeezefs::multi_writer::arm_mount_multi_writer(
-                &routed_meta_backend,
-                &resolved_data_lvs
-                    .iter()
-                    .map(std::path::PathBuf::from)
-                    .collect::<Vec<_>>(),
-                reader_mount,
-                Some(mw_quarantine),
-                // DLM S9 blocker #3's admission: the authority engages its OWN
-                // allocation lane (lane 0 of the era's width) on these
-                // allocators, and serves every co-writer's lane OPEN from
-                // their live cursors. An arm that enrolls co-writers without
-                // it refuses, rather than minting dense offsets across their
-                // residue classes.
-                Some(&fs_engine.router.backend_router),
-                // Per-volume claim admission: the decision the partial
-                // open was taken under. It supplies the SET authority's
-                // declared endpoint and this node's registrant key —
-                // never the ownership itself, which the arm DERIVES from
-                // the durable records (KD-PV-3).
-                pv_preflight.as_ref().map(|p| &p.admission),
-            )
-            .await
-            .map_err(|e| format!("multi-writer refused to arm: {e}"))?;
+            let data_lv_paths: Vec<std::path::PathBuf> = resolved_data_lvs
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect();
+            // Symmetric PR 12 — the join LADDER (design-symmetric-metadata
+            // §7.3): on an ARMED set every RW mount is a writer and stands
+            // up the planes a declared multi-writer authority used to —
+            // the data-namespace WERO join (rung 4), the custody owner, the
+            // publish / meta / manager / token services on ONE listener
+            // (rung 7) — with no role knob (`SQUEEZEFS_MULTI_WRITER` and its
+            // siblings are RETIRED here, refused at startup). Unarmed sets
+            // take the declared arm below, byte-identical.
+            let multi_writer_arm = if symmetric_set {
+                squeezefs::sym_join::arm(
+                    &routed_meta_backend,
+                    &data_lv_paths,
+                    Some(mw_quarantine),
+                    Some(&fs_engine.router.backend_router),
+                )
+                .await
+                .map_err(|e| format!("symmetric join ladder refused: {e}"))?
+                .map(|(arm, _report)| arm)
+            } else {
+                squeezefs::multi_writer::arm_mount_multi_writer(
+                    &routed_meta_backend,
+                    &data_lv_paths,
+                    reader_mount,
+                    Some(mw_quarantine),
+                    // DLM S9 blocker #3's admission: the authority engages its
+                    // OWN allocation lane (lane 0 of the era's width) on these
+                    // allocators, and serves every co-writer's lane OPEN from
+                    // their live cursors. An arm that enrolls co-writers
+                    // without it refuses, rather than minting dense offsets
+                    // across their residue classes.
+                    Some(&fs_engine.router.backend_router),
+                    // Per-volume claim admission: the decision the partial
+                    // open was taken under. It supplies the SET authority's
+                    // declared endpoint and this node's registrant key —
+                    // never the ownership itself, which the arm DERIVES from
+                    // the durable records (KD-PV-3).
+                    pv_preflight.as_ref().map(|p| &p.admission),
+                )
+                .await
+                .map_err(|e| format!("multi-writer refused to arm: {e}"))?
+            };
 
             // Rung 17 (KD-MW-8): the AUTHORITY's extent ASSEMBLER — the
             // production merge/flush executors over this mount's own
@@ -7199,6 +7246,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(mw) = multi_writer_arm {
                 mw.disarm().await;
             }
+            // Symmetric PR 12: the join ladder's report leaves with its
+            // planes (the stats inode's `symmetric_join` reads `null`).
+            squeezefs::sym_join::clear_report();
             // DLM S9: the CO-WRITER's teardown, in the same
             // outside-in order and for the same reason — stop holding
             // custody and stop shipping BEFORE this node stops being a

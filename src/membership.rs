@@ -3182,6 +3182,21 @@ pub async fn arm_mount_membership(
     on_purge: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> Result<Option<MembershipArm>> {
     let bind = resolve_bind()?;
+    arm_mount_membership_at(meta, read_only, on_purge, bind).await
+}
+
+/// [`arm_mount_membership`] under a bind decided by the caller — the
+/// symmetric join ladder's rung 3 (`crate::sym_join`, PR 12): an armed set
+/// whose operator declared no bind arms its membership shard at `auto`,
+/// because the death ledger's writer is this plane's eviction (PR 10) and
+/// an armed set without it would record no death. The shipped mount path
+/// passes the knob's own resolution verbatim.
+pub async fn arm_mount_membership_at(
+    meta: &Arc<crate::meta_backend::RoutedMetaBackend>,
+    read_only: bool,
+    on_purge: Option<Arc<dyn Fn() + Send + Sync>>,
+    bind: MembershipBind,
+) -> Result<Option<MembershipArm>> {
     let volumes: Vec<Arc<KvMetaBackend>> = meta.volumes.clone();
     let Some(first) = volumes.first() else {
         return Ok(None);

@@ -2753,6 +2753,25 @@ async fn set_owners_inner(
                 crate::meta_backend::kv::superblock::VolumeFormat::V3(s) => s.features_incompat,
                 _ => 0,
             };
+        // Symmetric PR 12 (design-symmetric-metadata §6.2 / §7.3, D19
+        // reversed): on a symmetric-forest set ownership is a RAM slot
+        // lease — first-writer-takes-it, handed over, recovered — so an
+        // offline assignment names nothing any mount reads. Refused
+        // forward-only naming the successor; a flat set keeps the verb
+        // verbatim until the PR-14 flip deletes it.
+        if features & crate::meta_backend::kv::superblock::FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST != 0
+        {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "volume set-owners was RETIRED for a symmetric-forest set (forward-only — \
+                 never a silent alias): metadata volume {} ({}) carries incompat bit 17, and \
+                 under the symmetric plane every RW mount is a writer whose ownership is a \
+                 slot LEASE (first-writer-takes-it, handed over by the holder, recovered on \
+                 death — design-symmetric-metadata §5.1, ruling D19 reversed). There is \
+                 nothing to assign: mount with SQUEEZEFS_SYMMETRIC_META=1 on every node; \
+                 `squeezefs volume get-owners` / `locate` still read the set",
+                vol_ids[idx], path
+            )));
+        }
         if !crate::membership::claim_set_engaged(features) {
             return Err(SqueezefsError::InvalidOperation(format!(
                 "volume set-owners: metadata volume {} ({}) does not carry the claim-set \

@@ -427,6 +427,30 @@ fn resolve_bind() -> Result<Bind> {
         })
 }
 
+/// [`resolve_bind`] for the symmetric join ladder's rung 7
+/// (`crate::sym_join`): `Ok(Some(addr))` = where to serve (`auto` = ruling
+/// D2's `0.0.0.0:0`), `Ok(None)` = an explicit `off` (the ladder refuses
+/// it under its own text), `Err` = a malformed address.
+pub fn resolve_bind_public() -> Result<Option<std::net::SocketAddr>> {
+    Ok(match resolve_bind()? {
+        Bind::Off => None,
+        Bind::Auto => Some("0.0.0.0:0".parse().expect("literal addr")),
+        Bind::Addr(a) => Some(a),
+    })
+}
+
+/// The ownership map a SYMMETRIC writer arms its planes over: derived
+/// from the durable records with no per-volume admission — on a
+/// symmetric set every `set-owners` assignment was dropped by the
+/// conversion (§7.3), so the map is all-local and the S8 client half is
+/// structurally inert (`dlm_rpcs == 0` on a solo mount by construction).
+pub async fn derive_symmetric_ownership(
+    meta: &Arc<RoutedMetaBackend>,
+    node_id: &str,
+) -> Result<Arc<OwnerMap>> {
+    derive_ownership(meta, node_id, None).await
+}
+
 /// What a multi-writer mount armed, and the teardown that undoes it.
 pub struct MultiWriterArm {
     listener: Option<Arc<crate::cluster_wire::RpcListener>>,
@@ -671,7 +695,6 @@ pub async fn arm_multi_writer(
     let node_id = crate::cowriter::node_member_id()?;
     let map = derive_ownership(meta, &node_id, pv).await?;
     let set_authority = map.owns_slot_0();
-    let peer_owned = map.volume_count() - map.local_volumes();
     if !set_authority {
         // A PARTIAL AUTHORITY: it appends to a subset and ships the rest,
         // and under D20 it must not take the set-singular planes. The
@@ -726,6 +749,62 @@ pub async fn arm_multi_writer(
         ));
     }
 
+    // Rung 6: where the authority serves.
+    let bind = match resolve_bind() {
+        Ok(Bind::Off) => {
+            if let Some(hold) = wero {
+                data_custody::release_hold(hold).await;
+            }
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "multi-writer refuses to arm: {MW_BIND_ENV}=off, so this mount would grant no \
+                 custody and serve no peer's publish path — an inert multi-writer mount is a \
+                 misconfiguration, not a posture. Give it `auto` (an ephemeral port on every \
+                 interface — ruling D2) or an addr:port, or unset SQUEEZEFS_MULTI_WRITER."
+            )));
+        }
+        Ok(Bind::Auto) => "0.0.0.0:0".parse().expect("literal addr"),
+        Ok(Bind::Addr(a)) => a,
+        Err(e) => {
+            if let Some(hold) = wero {
+                data_custody::release_hold(hold).await;
+            }
+            return Err(e);
+        }
+    };
+
+    arm_authority_planes(
+        meta,
+        wero,
+        bind,
+        crate::cowriter::rostered_members(),
+        quarantine,
+        backend,
+        map,
+        node_id,
+    )
+    .await
+}
+
+/// The authority planes proper — everything after the substrate and the
+/// bind are decided: the durable era, the roster, the custody owner, the
+/// lane assignment, the S8/publish/manager/token services on ONE listener,
+/// the ownership plane and the cadence. Shared by the declared
+/// multi-writer arm and the symmetric JOIN LADDER
+/// ([`crate::sym_join`], PR 12), whose rungs decide the substrate posture
+/// and the bind under their own law and then stand up exactly these
+/// planes on every armed writer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn arm_authority_planes(
+    meta: &Arc<RoutedMetaBackend>,
+    wero: Option<WeroHold>,
+    bind: std::net::SocketAddr,
+    roster: Vec<String>,
+    quarantine: Option<Arc<dyn CustodyQuarantine>>,
+    backend: Option<&Arc<crate::routing::BackendRouter>>,
+    map: Arc<OwnerMap>,
+    node_id: String,
+) -> Result<Option<MultiWriterArm>> {
+    let peer_owned = map.volume_count() - map.local_volumes();
     // Rung 5: a durable era. Bit 7 is required above, so the D0 gate has
     // published one — a zero era here means the gate did not run.
     let term = crate::dlm::durable_term();
@@ -753,7 +832,6 @@ pub async fn arm_multi_writer(
     // Deliberately BEFORE the listener starts: a co-writer that dials before
     // its enrollment is durable would be refused at rung 3, and an operator
     // reading the two logs would see the refusal without its cause.
-    let roster = crate::cowriter::rostered_members();
     if !roster.is_empty() {
         match crate::cowriter::enroll_members(&meta.volumes, &roster, term).await {
             Ok(0) => log::warn!(
@@ -774,29 +852,6 @@ pub async fn arm_multi_writer(
             }
         }
     }
-
-    // Rung 6: where the authority serves.
-    let bind = match resolve_bind() {
-        Ok(Bind::Off) => {
-            if let Some(hold) = wero {
-                data_custody::release_hold(hold).await;
-            }
-            return Err(SqueezefsError::InvalidOperation(format!(
-                "multi-writer refuses to arm: {MW_BIND_ENV}=off, so this mount would grant no \
-                 custody and serve no peer's publish path — an inert multi-writer mount is a \
-                 misconfiguration, not a posture. Give it `auto` (an ephemeral port on every \
-                 interface — ruling D2) or an addr:port, or unset SQUEEZEFS_MULTI_WRITER."
-            )));
-        }
-        Ok(Bind::Auto) => "0.0.0.0:0".parse().expect("literal addr"),
-        Ok(Bind::Addr(a)) => a,
-        Err(e) => {
-            if let Some(hold) = wero {
-                data_custody::release_hold(hold).await;
-            }
-            return Err(e);
-        }
-    };
 
     // Everything demanded is present. Arm, in dependency order.
     let secret = cluster_secret(meta).await.ok_or_else(|| {

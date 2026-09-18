@@ -2059,6 +2059,161 @@ async fn a_live_joiner_follows_a_manager_failover_to_the_successors_listener() {
     fsck_clean(&uris).await;
 }
 
+/// **A joiner's CHECKPOINT CYCLE whose wire verb meets a dead manager
+/// completes — and follows the successor** (PR 12b round 3, F3 — the
+/// `sym-storm` fleet leg's second face: the manager closed a joiner's
+/// idle wire session, the joiner's next cadence `ReturnExtents` failed
+/// transport-class inside its checkpoint cycle, and the re-dial's
+/// projection refresh took the volume's SMO mutex — the mutex the
+/// checkpoint task HOLDS for the whole cycle. The task deadlocked on
+/// itself, its ring never drained, the conveyor parked at admission and
+/// the D1.b lattice fail-stopped the volume 15 s later: `3 consecutive
+/// journal write failures — volume marked FAILED` on a healthy device,
+/// under an `rm -rf`). Here: the joiner leases a slot, a forced
+/// compaction retires its root image (a returnable extent for its next
+/// cadence), the manager LEAVES and a successor publishes a NEW listener,
+/// and the joiner's very next act is `checkpoint_now` — the cycle must
+/// COMPLETE inside a bound (red before: never), re-dial ONCE to the
+/// successor, land the return there (the retired extent free in the
+/// successor's bitmap), and the joiner's ring must keep draining (a
+/// commit lands after it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiners_checkpoint_cycle_meeting_a_dead_manager_completes_and_follows_the_successor() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared"), (SLOT_B, "other")]).await;
+    let (shared, other) = (dirs[0], dirs[1]);
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    enroll_manager(&mvol, &venue.endpoint()).await;
+
+    let joiner = join(&uris, &venue, &mvol, 73).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jwire = Arc::clone(jvol.joined_wire().expect("joined"));
+    let old_endpoint = venue.endpoint();
+    // The joiner leases SLOT_A (a first touch over the wire) and its tree
+    // has a durable root once a cycle flushed it.
+    let files = create_files(&joiner, shared, "cc", 8).await;
+    jvol.checkpoint_now().await.unwrap();
+    let tree = jvol.slot_tree(SLOT_A).expect("the joiner's tree of SLOT_A");
+    let old_root = tree.root();
+    assert_ne!(old_root.addr, 0, "a flushed root");
+    let sb = jvol.superblock();
+    let old_ext = (old_root.addr - sb.heap.start) / u64::from(sb.node_size);
+    // The custody transfer's wire half: the manager's grant entry moved
+    // SLOT_A's live image into the joiner's `extent_grant` record, and the
+    // joiner's RAM grant CLAIMS it (before: the record named it, the RAM
+    // grant did not — every retirement of an inherited image was dropped
+    // at `free_pending`'s claimed guard, an orphan only C13 reached).
+    assert!(
+        mvol.extent_grant_record(1).await.unwrap().contains(old_ext),
+        "the manager's record names the inherited image {old_ext}"
+    );
+    let region_stats = |v: &KvMetaBackend| {
+        v.appender_stats()
+            .unwrap()
+            .regions
+            .into_iter()
+            .find(|r| r.id == 1)
+            .expect("the joiner's own region")
+    };
+    let before = region_stats(&jvol);
+    // A forced compaction retires the root image: parked on the joiner's
+    // tail, returnable at its next cycle's barrier — the cadence's
+    // `ReturnExtents` is that cycle's wire verb.
+    assert_eq!(
+        jvol.defrag_compact_nodes(&[(0, old_root.addr)])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_ne!(tree.root().addr, old_root.addr);
+    let after = region_stats(&jvol);
+    assert_eq!(
+        after.grant_pending,
+        before.grant_pending + 1,
+        "the retired inherited image is PARKED on the joiner's grant: before {before:?} after \
+         {after:?}"
+    );
+    let returns0 = jvol.joined_stats().unwrap().wire_extent_returns;
+    assert_eq!(jvol.joined_stats().unwrap().wire_redials, 0);
+
+    // The manager leaves; its listener dies; a SUCCESSOR wins the ladder
+    // and publishes at a new address.
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    let successor = open_under(&uris, &Knobs::armed()).await;
+    let svol = Arc::clone(&successor.volumes[0]);
+    let venue2 = HoldersVenue::stand_up(&successor, &[]).await;
+    assert_ne!(venue2.endpoint(), old_endpoint, "a new listener address");
+    squeezefs::multi_writer::publish_symmetric_endpoint(&successor, &venue2.endpoint()).await;
+    svol.checkpoint_now()
+        .await
+        .expect("the successor's checkpoint names the new entry");
+    assert_eq!(svol.appender_stats().unwrap().manager_lease.word(), "held");
+
+    // The joiner's NEXT act is its checkpoint cycle: the barrier makes the
+    // retired image returnable, the cadence's `ReturnExtents` fails at
+    // the dead endpoint, and the re-dial runs INSIDE the cycle — under
+    // the SMO mutex the cycle holds. Red before: the refresh re-took it
+    // and the task never returned (the bound is the storm leg's 15 s
+    // fail-stop, generously).
+    let cycled = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        // Two cycles: the first's barrier parks the retirement past the
+        // tail, the second's cadence returns it (the manager's own shape,
+        // `a_clean_remount_recovers_the_grant_from_tree_zero_…`).
+        for _ in 0..4 {
+            jvol.checkpoint_now().await.unwrap();
+            if jvol.joined_stats().unwrap().wire_extent_returns > returns0 {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        cycled.is_ok(),
+        "the joiner's checkpoint cycle DEADLOCKED meeting the dead manager (its re-dial's \
+         projection refresh re-took the SMO mutex the cycle holds)"
+    );
+    let js = jvol.joined_stats().unwrap();
+    assert_eq!(js.wire_redials, 1, "ONE re-dial, inside the cycle: {js:?}");
+    assert!(
+        js.wire_extent_returns > returns0,
+        "the cadence's ReturnExtents landed at the successor: {js:?}"
+    );
+    assert_eq!(
+        jwire.endpoint(),
+        venue2.endpoint(),
+        "the wire follows the successor"
+    );
+    assert!(
+        !svol.allocator().is_allocated(old_ext),
+        "the retired image {old_ext} returned to the SUCCESSOR's bitmap"
+    );
+    // The ring keeps draining: a commit after the cycle lands and every
+    // acked record reads at the successor.
+    let more = create_files(&joiner, other, "cd", 4).await;
+    assert_all_resolve(&joiner, other, &more).await;
+    assert_all_resolve(&joiner, shared, &files).await;
+    assert_must_stay_zero(&jvol, "joiner");
+    assert_must_stay_zero(&svol, "successor");
+
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    assert_all_resolve(&successor, shared, &files).await;
+    assert_all_resolve(&successor, other, &more).await;
+    venue2.tear_down();
+    shutdown(&successor).await;
+    drop(svol);
+    drop(successor);
+    fsck_clean(&uris).await;
+}
+
 /// **A joiner's rotor SHRINKS to the derived `M`, and its census is the
 /// set's** (review round 1, Issue 10 — a PR 4 manager-only assumption the
 /// §3 sweep missed): the §5.1.3 forced shrink released idle rotor slots

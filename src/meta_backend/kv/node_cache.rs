@@ -3248,6 +3248,30 @@ impl NodeCache {
         self.remove_nodes(victims)
     }
 
+    /// **The control-tree projection's cache barrier** (symmetric PR 12b):
+    /// discard every cached node of tree `tree_id`, DIRTY ONES INCLUDED —
+    /// a JOINED appender's tree 0 is a PROJECTION of the manager's: its
+    /// open folded the manager's ring-0 window into these images (the
+    /// writer-style replay, so they read dirty at the records' ring
+    /// positions) and never flushes them — their durable home is the
+    /// manager's ring and, after its next checkpoint, the images the new
+    /// ledger record names. The manager appends its lease records INTO
+    /// the node images the projection holds (a log-structured node's root
+    /// pointer does not move on an append), so a refresh that compared
+    /// roots alone re-read stale leaves; the refresh drops the whole
+    /// projection and re-reads it under the new root. Legal only on a tree
+    /// this mount never writes, under the SMO mutex (no pass mid-walk).
+    /// Returns the nodes dropped.
+    pub fn discard_tree_nodes(&self, tree_id: u8) -> usize {
+        let mut victims: Vec<Arc<CachedNode>> = Vec::new();
+        self.for_each_node(|n| {
+            if n.tree_id() == tree_id && n.forest_slot().is_none() {
+                victims.push(Arc::clone(n));
+            }
+        });
+        self.remove_nodes(victims)
+    }
+
     /// **The granted extents' cache barrier** (symmetric PR 12b): drop
     /// every cached node whose address lies inside `extents` (heap extent
     /// indices). A JOINED appender's grant is carved from the MANAGER's

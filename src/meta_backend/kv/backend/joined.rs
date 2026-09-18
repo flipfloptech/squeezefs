@@ -91,8 +91,21 @@ impl std::fmt::Debug for JoinedOpen {
 /// verbs (the Joined family, §11).
 pub struct JoinedWire {
     client: crate::sqz_sync::SqzMutex<ManagerClient>,
-    /// The manager's endpoint this mount dialed.
-    pub endpoint: String,
+    /// The manager's endpoint this mount dialed — the CURRENT one: a
+    /// manager failover moves it (the successor publishes its listener at
+    /// its rung 7), and the re-dial after a failed verb follows.
+    endpoint: std::sync::RwLock<String>,
+    /// The wire's credentials, kept for the re-dial.
+    secret: Vec<u8>,
+    peer_id: String,
+    volume: u16,
+    /// A verb failed since the last dial: the next verb RE-DIALS the
+    /// manager at its current endpoint first (`joined_wire_redials`).
+    redial: std::sync::atomic::AtomicBool,
+    pub redials: AtomicU64,
+    /// The manager's ledger seq this mount's projection of its trees
+    /// stands on (`refresh_control_projection` advances it).
+    pub projection_seq: AtomicU64,
     /// This mount's appender id on the volume.
     pub appender_id: u32,
     /// The identity the page carries (`(node, mount slot)` + this open's
@@ -134,13 +147,130 @@ pub struct JoinedWire {
 }
 
 impl JoinedWire {
-    /// One verb's ledger step: counted, and a failure counted too.
-    fn note<T>(&self, r: Result<T, KvError>) -> Result<T, KvError> {
-        self.verbs.fetch_add(1, Ordering::Relaxed);
-        if r.is_err() {
-            self.failures.fetch_add(1, Ordering::Relaxed);
+    /// The manager's current endpoint.
+    pub fn endpoint(&self) -> String {
+        self.endpoint
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// **One manager verb, with the failover retry**: `verb` runs on the
+    /// (re-dialed) client; a TRANSPORT-class failure (`cluster_wire::
+    /// is_transport_failure` — the socket died, the session closed: the
+    /// manager left or was killed) arms the re-dial and the
+    /// verb runs ONCE more on the fresh client — every manager verb is
+    /// idempotent against durable state (§5.3.5), so the retry of a verb
+    /// the dead manager had applied answers `already`. A refusal (the
+    /// manager's word) is returned as is. `vol` is `None` only for the
+    /// open's own refill (no backend yet: the re-dial goes to the last
+    /// known endpoint). Counted on `verbs` / `failures`.
+    async fn with_client<T, F>(
+        &self,
+        vol: Option<&KvMetaBackend>,
+        verb: &str,
+        f: F,
+    ) -> Result<T, KvError>
+    where
+        F: for<'a> Fn(
+            &'a mut ManagerClient,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<T>> + Send + 'a>,
+        >,
+    {
+        let mut retried = false;
+        loop {
+            let out = {
+                let mut c = self.client_at(vol).await?;
+                f(&mut c).await
+            };
+            self.verbs.fetch_add(1, Ordering::Relaxed);
+            match out {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let transport = crate::cluster_wire::is_transport_failure(&e);
+                    if transport {
+                        self.redial.store(true, Ordering::Release);
+                    }
+                    if transport && !retried {
+                        // Absorbed by the re-dial: the caller sees no
+                        // failure (`redials` is its ledger).
+                        retried = true;
+                        log::info!(
+                            "joined appender {}: {verb} failed on the wire ({e}) — re-dialing the \
+                             manager and retrying once",
+                            self.appender_id
+                        );
+                        continue;
+                    }
+                    self.failures.fetch_add(1, Ordering::Relaxed);
+                    return Err(wire_err(verb, e));
+                }
+            }
         }
-        r
+    }
+
+    /// **The wire's client, re-dialed after a failure** (PR 12b — a live
+    /// joiner across a manager FAILOVER): every verb takes the client
+    /// through here; when the previous verb failed, the manager's CURRENT
+    /// listener is resolved off durable state — the volume's projection
+    /// refreshed from the ledger (the successor's checkpoint), then its
+    /// page-0 identity → its claim-set entry's published endpoint
+    /// (`sym_join::resolve_holder_endpoint(vol, 0)`; the same endpoint the
+    /// join dialed when nothing moved) — and dialed anew, the holder
+    /// table's word for appender 0 following. A re-dial that fails keeps
+    /// the flag armed and answers the retryable class (the caller's own
+    /// retry; the cadence's next tick). `vol` is `None` for the open's own
+    /// refill, before a backend exists (the re-dial goes to the last
+    /// known endpoint).
+    async fn client_at(
+        &self,
+        vol: Option<&KvMetaBackend>,
+    ) -> Result<crate::sqz_sync::SqzMutexGuard<'_, ManagerClient>, KvError> {
+        let mut c = self.client.lock().await;
+        if !self.redial.load(Ordering::Acquire) {
+            return Ok(c);
+        }
+        let mut endpoint = self.endpoint();
+        if let Some(vol) = vol {
+            if let Err(e) = vol.refresh_control_projection().await {
+                log::debug!(
+                    "meta volume {}: projection refresh before the manager re-dial failed ({e}) \
+                     — dialing the last known endpoint",
+                    vol.device_path().display()
+                );
+            }
+            if let Some(e) = crate::sym_join::resolve_holder_endpoint(vol, 0).await {
+                endpoint = e;
+            }
+        }
+        match ManagerClient::connect(&endpoint, &self.secret, &self.peer_id, self.volume).await {
+            Ok(fresh) => {
+                *c = fresh;
+                let moved = endpoint != self.endpoint();
+                *self.endpoint.write().unwrap_or_else(|e| e.into_inner()) = endpoint.clone();
+                if let Some(plane) = vol.and_then(|v| v.slot_leases()) {
+                    plane.holders.set_endpoint(0, &endpoint);
+                }
+                self.redial.store(false, Ordering::Release);
+                self.redials.fetch_add(1, Ordering::Relaxed);
+                log::warn!(
+                    "joined appender {} RE-DIALED the manager at {endpoint}{}",
+                    self.appender_id,
+                    if moved {
+                        " (the manager MOVED — a successor's listener)"
+                    } else {
+                        ""
+                    }
+                );
+                Ok(c)
+            }
+            Err(e) => Err(KvError::Busy(format!(
+                "joined appender {}'s re-dial of the manager at {endpoint} failed: {e} — the verb \
+                 is retried at the next act (EAGAIN class)",
+                self.appender_id
+            ))),
+        }
     }
 
     /// Release rung 4's metadata-namespace hold (an adopted hold releases
@@ -174,6 +304,9 @@ pub struct JoinedStats {
     pub wire_failures: u64,
     pub control_refusals: u64,
     pub ring_grow_declined: u64,
+    /// Re-dials of the manager after a failed verb (`joined_wire_redials`;
+    /// a manager failover reads ≥ 1 on every live joiner).
+    pub wire_redials: u64,
     /// Rung 4's posture word: `adopted` (co-located — the manager's hold
     /// shared, no key of ours), `registrant` (remote — our key under it)
     /// or `detection` (a non-PR substrate under KD-SYM-13's opt-in).
@@ -228,14 +361,10 @@ pub(super) async fn wire_extent_refill(
     };
     name_remainder_on_page(region);
     KvMetaBackend::write_region_page_at(path, region).await?;
-    let runs: Vec<GrantRun> = {
-        let mut c = wire.client.lock().await;
-        wire.note(
-            c.extent_grant(wire.appender_id, want)
-                .await
-                .map_err(|e| wire_err("ExtentGrant", e)),
-        )?
-    };
+    let own = wire.appender_id;
+    let runs: Vec<GrantRun> = wire
+        .with_client(None, "ExtentGrant", |c| Box::pin(c.extent_grant(own, want)))
+        .await?;
     // §5.3.5: the manager answers the caller's unclaimed remainder
     // VERBATIM when it covers the ask — only the runs the RAM grant does
     // not hold at all (unclaimed, claimed or parked) are new.
@@ -540,7 +669,13 @@ impl KvMetaBackend {
         let (client, presented, appender_id, already) = joined;
         let wire = Arc::new(JoinedWire {
             client: crate::sqz_sync::SqzMutex::new(client),
-            endpoint: admission.manager_endpoint.clone(),
+            endpoint: std::sync::RwLock::new(admission.manager_endpoint.clone()),
+            secret: admission.secret.clone(),
+            peer_id: admission.peer_id.clone(),
+            volume: admission.volume,
+            redial: std::sync::atomic::AtomicBool::new(false),
+            redials: AtomicU64::new(0),
+            projection_seq: AtomicU64::new(0),
             appender_id,
             identity: AppenderIdentity {
                 writer_id,
@@ -632,7 +767,7 @@ impl KvMetaBackend {
         let w = self.joined.get()?;
         Some(JoinedStats {
             appender_id: w.appender_id,
-            manager_endpoint: w.endpoint.clone(),
+            manager_endpoint: w.endpoint(),
             wire_verbs: w.verbs.load(Ordering::Relaxed),
             wire_acquires: w.acquires.load(Ordering::Relaxed),
             wire_releases: w.releases.load(Ordering::Relaxed),
@@ -641,6 +776,7 @@ impl KvMetaBackend {
             wire_failures: w.failures.load(Ordering::Relaxed),
             control_refusals: w.control_refusals.load(Ordering::Relaxed),
             ring_grow_declined: w.grow_declined.load(Ordering::Relaxed),
+            wire_redials: w.redials.load(Ordering::Relaxed),
             registrant_posture: if w.colocated {
                 "adopted"
             } else if w.registrant_key != 0 {
@@ -687,7 +823,7 @@ impl KvMetaBackend {
              (design-symmetric-metadata KD-SYM-3; joined_control_refusals must stay 0)",
             self.path.display(),
             w.appender_id,
-            w.endpoint
+            w.endpoint()
         )))
     }
 
@@ -830,14 +966,11 @@ impl KvMetaBackend {
         let rotor_now = plane.table.rotor_held_by(own);
         if rotor_now < m {
             let want = u16::try_from(m - rotor_now).unwrap_or(u16::MAX);
-            let (grants, _already) = {
-                let mut c = wire.client.lock().await;
-                wire.note(
-                    c.acquire_slots(own, want)
-                        .await
-                        .map_err(|e| wire_err("AcquireSlots", e)),
-                )?
-            };
+            let (grants, _already) = wire
+                .with_client(Some(self), "AcquireSlots", |c| {
+                    Box::pin(c.acquire_slots(own, want))
+                })
+                .await?;
             for g in grants {
                 let slot = self.install_wire_grant(&plane, &wire, &g, true).await?;
                 plane.rotor_update(|rotor| {
@@ -870,7 +1003,7 @@ impl KvMetaBackend {
         // manager's own slots' objects), its shipped steps and its
         // custody are served there. Every other appender's is resolved
         // off durable state (`sym_join::bind_live_appender_endpoints`).
-        plane.holders.set_endpoint(0, &wire.endpoint);
+        plane.holders.set_endpoint(0, &wire.endpoint());
         // PR 5 — the frame fence (every frame of ours carries `(own, g)`),
         // the token HOLDER (this writer grants tokens on the objects of
         // its slots and recalls them before its conflicting commits).
@@ -887,7 +1020,7 @@ impl KvMetaBackend {
             self.path.display(),
             plane.gate.leased_count(),
             plane.rotor.load().len(),
-            wire.endpoint
+            wire.endpoint()
         );
         Ok(())
     }
@@ -1060,14 +1193,11 @@ impl KvMetaBackend {
         })?);
         let own = wire.appender_id;
         let routing = self.routing_slot_of_forest(slot)?;
-        let reply = {
-            let mut c = wire.client.lock().await;
-            wire.note(
-                c.acquire_slot(own, routing)
-                    .await
-                    .map_err(|e| wire_err("AcquireSlot", e)),
-            )?
-        };
+        let reply = wire
+            .with_client(Some(self), "AcquireSlot", |c| {
+                Box::pin(c.acquire_slot(own, routing))
+            })
+            .await?;
         match reply {
             ManagerReply::SlotsGranted { slots, .. } => {
                 for g in &slots {
@@ -1125,12 +1255,14 @@ impl KvMetaBackend {
         tails: Vec<(u64, u32)>,
     ) -> Result<bool, KvError> {
         let routing = self.routing_slot_of_forest(slot)?;
-        let mut c = wire.client.lock().await;
-        let out = wire.note(
-            c.release_slot(wire.appender_id, routing, g, words.into(), tails)
-                .await
-                .map_err(|e| wire_err("ReleaseSlot", e)),
-        )?;
+        let own = wire.appender_id;
+        let words: crate::meta_ship::manager::WireSlotWords = words.into();
+        let out = wire
+            .with_client(Some(self), "ReleaseSlot", move |c| {
+                let tails = tails.clone();
+                Box::pin(async move { c.release_slot(own, routing, g, words, tails).await })
+            })
+            .await?;
         wire.releases.fetch_add(1, Ordering::Relaxed);
         Ok(out)
     }
@@ -1403,14 +1535,13 @@ impl KvMetaBackend {
                 returnable.iter().copied(),
             )
             .runs;
-            let out = {
-                let mut c = wire.client.lock().await;
-                wire.note(
-                    c.return_extents(wire.appender_id, &runs)
-                        .await
-                        .map_err(|e| wire_err("ReturnExtents", e)),
-                )
-            };
+            let own = wire.appender_id;
+            let out = wire
+                .with_client(Some(self), "ReturnExtents", |c| {
+                    let runs = runs.clone();
+                    Box::pin(async move { c.return_extents(own, &runs).await })
+                })
+                .await;
             match out {
                 Ok(_) => {
                     wire.extent_returns.fetch_add(1, Ordering::Relaxed);
@@ -1529,14 +1660,13 @@ impl KvMetaBackend {
         let runs =
             super::super::slot_state::ExtentGrantRecord::from_extents(returnable.iter().copied())
                 .runs;
-        let out = {
-            let mut c = wire.client.lock().await;
-            wire.note(
-                c.leave_appender(wire.identity, own, &runs)
-                    .await
-                    .map_err(|e| wire_err("LeaveAppender", e)),
-            )
-        };
+        let identity = wire.identity;
+        let out = wire
+            .with_client(Some(self), "LeaveAppender", |c| {
+                let runs = runs.clone();
+                Box::pin(async move { c.leave_appender(identity, own, &runs).await })
+            })
+            .await;
         match out {
             Ok(already) => {
                 {
@@ -1816,14 +1946,14 @@ impl KvMetaBackend {
         let wire = Arc::clone(self.joined.get().ok_or_else(|| {
             KvError::Corrupt(format!("{}: joined wire unset", self.path.display()))
         })?);
-        let already = {
-            let mut c = wire.client.lock().await;
-            wire.note(
-                c.publish_endpoint(wire.identity, wire.appender_id, endpoint, pr_key)
-                    .await
-                    .map_err(|e| wire_err("PublishEndpoint", e)),
-            )?
-        };
+        let (identity, own) = (wire.identity, wire.appender_id);
+        let ep = endpoint.to_string();
+        let already = wire
+            .with_client(Some(self), "PublishEndpoint", |c| {
+                let ep = ep.clone();
+                Box::pin(async move { c.publish_endpoint(identity, own, &ep, pr_key).await })
+            })
+            .await?;
         if let Ok(plane) = self.joined_plane() {
             plane.holders.set_endpoint(wire.appender_id, endpoint);
         }
@@ -1867,12 +1997,10 @@ impl KvMetaBackend {
         let wire = Arc::clone(self.joined.get().ok_or_else(|| {
             KvError::Corrupt(format!("{}: joined wire unset", self.path.display()))
         })?);
-        let mut c = wire.client.lock().await;
-        wire.note(
-            c.resolve_endpoint(appender_id)
-                .await
-                .map_err(|e| wire_err("ResolveEndpoint", e)),
-        )
+        wire.with_client(Some(self), "ResolveEndpoint", |c| {
+            Box::pin(c.resolve_endpoint(appender_id))
+        })
+        .await
     }
 
     // -----------------------------------------------------------------
@@ -1958,15 +2086,24 @@ impl KvMetaBackend {
     // The control-plane projection.
     // -----------------------------------------------------------------
 
-    /// **Refresh the joined appender's tree-0 PROJECTION** (§5.2 — tree 0
-    /// on a non-manager is read at open and POLLED; §5.7.1's control-plane
-    /// row): read the manager's newest ledger record (the predicted-slot
-    /// read, PR 5's), and when tree 0's root moved install it writer-legal
-    /// (`install_recovered_root` — the node seq verified against the
-    /// pointer, the seq handle raised) and reload the lease table from it
-    /// (every slot NOT ours takes the manager's word; ours are RAM-
-    /// authoritative and never overwritten). Returns whether the root
-    /// moved. Never runs on the manager (its tree 0 is live).
+    /// **Refresh the joined appender's PROJECTION of the manager's trees**
+    /// (§5.2 — tree 0 on a non-manager is read at open and POLLED; §5.7.1's
+    /// control-plane row): read the manager's newest ledger record (the
+    /// predicted-slot read, PR 5's) and, when its SEQ advanced past the
+    /// one this projection stands on, re-adopt what the record names —
+    /// tree 0 and the manager's NATIVE slot tree (ino 1: the claim set
+    /// every durable resolve reads, the rendezvous record) — through the
+    /// transfer barrier (`drop_tree_nodes` / `adopt_transferred_slot_
+    /// tree`: the cached images DROPPED, the root installed writer-legal),
+    /// then reload the lease table from tree 0 (every slot NOT ours takes
+    /// the manager's word; ours are RAM-authoritative and never
+    /// overwritten). Keyed on the ledger SEQ, never on the root pointer:
+    /// a log-structured node's root does not move on an append, and the
+    /// manager appends its lease records and its claim-set entries INTO
+    /// the images this projection holds (the first build compared roots
+    /// and re-read stale leaves for as long as no SMO moved them). Returns
+    /// whether the projection advanced. Never runs on the manager (its
+    /// trees are live).
     pub async fn refresh_control_projection(&self) -> Result<bool, KvError> {
         let Some(wire) = self.joined.get() else {
             return Ok(false);
@@ -1980,6 +2117,9 @@ impl KvMetaBackend {
         else {
             return Ok(false);
         };
+        if rec.seq <= wire.projection_seq.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         let Some(root) = rec
             .tree_roots
             .iter()
@@ -1987,15 +2127,49 @@ impl KvMetaBackend {
         else {
             return Ok(false);
         };
-        let control = forest.control();
-        let root = RootPtr {
+        let control_root = RootPtr {
             addr: root.node_addr,
             seq: root.node_seq,
         };
-        if root == control.root() {
-            return Ok(false);
+        let native_root = rec
+            .tree_roots
+            .iter()
+            .find(|r| r.tree_id == super::super::record::KIND_INTERIOR)
+            .map(|n| RootPtr {
+                addr: n.node_addr,
+                seq: n.node_seq,
+            });
+        {
+            // Under the SMO mutex like every root move (no pass mid-walk).
+            // The projection's images go WHOLE, the open's window fold
+            // included (`discard_*`: dirty ones too — never this mount's
+            // records, never flushed by it; the new root's images carry
+            // what the manager checkpointed since, the ring what it did
+            // not — the reader's bounded-staleness law for a projection).
+            let _smo = self.smo.lock().await;
+            let native_slot = super::super::record::NATIVE_FOREST_SLOT;
+            let mut dropped = 0usize;
+            if let Some(ptr) = native_root.filter(|_| !plane.gate.is_leased(native_slot)) {
+                if let Some(tree) = forest.tree(native_slot) {
+                    dropped += self.cache.discard_slot_nodes(native_slot);
+                    let floor = tree.root_floor();
+                    tree.install_recovered_root(ptr, floor).await?;
+                    forest.note_published(native_slot, ptr);
+                }
+            }
+            let control = forest.control();
+            dropped += self
+                .cache
+                .discard_tree_nodes(super::super::record::TREE_CONTROL);
+            control.install_recovered_root(control_root, 0).await?;
+            log::debug!(
+                "meta volume {}: projection advanced to ledger seq {} (control root {:#x}, \
+                 {dropped} projected image(s) dropped)",
+                self.path.display(),
+                rec.seq,
+                control_root.addr
+            );
         }
-        control.install_recovered_root(root, 0).await?;
         // The projection's lease words for every slot that is not ours.
         let own = wire.appender_id;
         let before: std::collections::BTreeMap<ForestSlot, crate::slot_lease_core::SlotLease> =
@@ -2015,6 +2189,7 @@ impl KvMetaBackend {
             self.publish_slot_owners(set, &plane);
         }
         plane.refresh_holders();
+        wire.projection_seq.fetch_max(rec.seq, Ordering::AcqRel);
         Ok(true)
     }
 }

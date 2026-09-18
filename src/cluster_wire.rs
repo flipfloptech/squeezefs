@@ -2774,6 +2774,21 @@ pub fn client_exporter(conn: &rustls::ClientConnection) -> Option<[u8; 32]> {
 // The dial side
 // ---------------------------------------------------------------------------
 
+/// Whether `e` is the WIRE's own failure — the socket died, the session
+/// was closed, no reply came, the dial failed — as opposed to the peer's
+/// word (a refusal the service decoded and returned). The wire's errors
+/// are `Io` or carry the `cluster wire:` prefix every producer in this
+/// module writes (load-bearing: a verb client that resends on a transport
+/// failure — the joined appender's manager wire, PR 12b — reads it here,
+/// never a refusal).
+pub fn is_transport_failure(e: &SqueezefsError) -> bool {
+    match e {
+        SqueezefsError::Io(_) => true,
+        SqueezefsError::InvalidOperation(m) => m.starts_with("cluster wire:"),
+        _ => false,
+    }
+}
+
 /// A dialed session's I/O state — owned as one unit so [`RpcClient::call`]
 /// can move it onto the blocking pool and back (the async API is
 /// preserved; the roundtrip itself is sync socket I/O).

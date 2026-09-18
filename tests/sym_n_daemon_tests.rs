@@ -48,6 +48,27 @@ fn reset_process_state() {
     squeezefs::membership::uninstall();
 }
 
+/// Enroll this process's manager identity in the volume's claim set with
+/// `endpoint` as its published listener — what the mount path's
+/// membership arm + `publish_symmetric_endpoint` write for a real manager
+/// (the in-process venue arms no membership plane). The entry is what
+/// `sym_join::resolve_holder_endpoint(vol, 0)` reads on every mount.
+async fn enroll_manager(vol: &KvMetaBackend, endpoint: &str) {
+    use squeezefs::membership::{MemberIdentity, MemberRole};
+    let identity = MemberIdentity {
+        id: squeezefs::cowriter::node_member_id().expect("this node's member id"),
+        role: MemberRole::Writer,
+        pid: std::process::id(),
+        boot: squeezefs::meta_backend::kv::backend::read_boot_id(),
+        endpoint: Some(endpoint.to_string()),
+        pr_key: 0,
+    };
+    squeezefs::membership::upsert_writer_member(vol, &identity, squeezefs::dlm::durable_term())
+        .await
+        .expect("the claim-set entry");
+    vol.checkpoint_now().await.expect("checkpoint");
+}
+
 /// The joiner's identity: the manager's NODE (one host) at its own mount
 /// slot `n` — what tells N daemons' pages apart on one box.
 async fn joiner_identity(manager: &KvMetaBackend, n: u32) -> AppenderIdentity {
@@ -1163,7 +1184,7 @@ async fn a_daemon_that_joined_after_anothers_ladder_is_bound_on_demand_at_its_fi
     let mvenue = DaemonVenue::stand_up(&manager, true, "manager-custody-n3").await;
     // The manager's claim-set entry (its rung 7's publish) — what a
     // joiner's `PublishEndpoint` lands beside.
-    squeezefs::multi_writer::publish_symmetric_endpoint(&manager, &mvenue.endpoint).await;
+    enroll_manager(&mvol, &mvenue.endpoint).await;
 
     let join_at = |n: u32, ep: String| {
         let uris = uris.clone();
@@ -1297,6 +1318,93 @@ async fn a_daemon_that_joined_after_anothers_ladder_is_bound_on_demand_at_its_fi
     shutdown(&manager).await;
     drop(mvol);
     drop(manager);
+    fsck_clean(&uris).await;
+}
+
+/// **A live joiner follows a manager FAILOVER to the successor's
+/// listener** (PR 10's "busy appender across a manager failover" row, the
+/// N-daemon shape it named as PR 12's): the manager leaves and a
+/// SUCCESSOR wins the D0 ladder with the joiner still mounted, publishing
+/// its listener at a NEW address; the joiner's next wire verb fails at
+/// the dead endpoint ONCE, re-dials the manager at the endpoint the
+/// successor's claim-set entry names (the projection of the manager's
+/// native tree refreshed off the successor's ledger record — no wire, no
+/// knob) and the verb lands: a first-touch acquire over the re-dialed
+/// wire, `joined_wire_redials` = 1, the holder table's word for appender 0
+/// moved, every acked record readable by the successor. Red before the
+/// re-dial: every joiner verb failed at the dead endpoint for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_joiner_follows_a_manager_failover_to_the_successors_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared"), (SLOT_B, "other")]).await;
+    let (shared, other) = (dirs[0], dirs[1]);
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    enroll_manager(&mvol, &venue.endpoint()).await;
+
+    let joiner = join(&uris, &venue, &mvol, 71).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jwire = Arc::clone(jvol.joined_wire().expect("joined"));
+    let old_endpoint = venue.endpoint();
+    assert_eq!(jwire.endpoint(), old_endpoint);
+    let files = create_files(&joiner, shared, "fo", 8).await;
+    assert_eq!(jvol.joined_stats().unwrap().wire_redials, 0);
+
+    // The manager leaves; its listener dies; a SUCCESSOR wins the ladder
+    // and publishes at a new address.
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    let successor = open_under(&uris, &Knobs::armed()).await;
+    let svol = Arc::clone(&successor.volumes[0]);
+    let venue2 = HoldersVenue::stand_up(&successor, &[]).await;
+    assert_ne!(venue2.endpoint(), old_endpoint, "a new listener address");
+    squeezefs::multi_writer::publish_symmetric_endpoint(&successor, &venue2.endpoint()).await;
+    svol.checkpoint_now()
+        .await
+        .expect("the successor's checkpoint names the new entry");
+    assert_eq!(svol.appender_stats().unwrap().manager_lease.word(), "held");
+
+    // The joiner's next wire act: a first-touch acquire of SLOT_B (the
+    // dead endpoint fails once, the re-dial follows the successor).
+    let more = create_files(&joiner, other, "fb", 4).await;
+    let js = jvol.joined_stats().unwrap();
+    assert_eq!(js.wire_redials, 1, "ONE re-dial: {js:?}");
+    assert_eq!(
+        jwire.endpoint(),
+        venue2.endpoint(),
+        "the wire follows the successor"
+    );
+    assert_eq!(
+        jvol.slot_leases().unwrap().holders.endpoint(0).as_deref(),
+        Some(venue2.endpoint().as_str()),
+        "the holder table's word for the manager moved with it"
+    );
+    assert!(
+        matches!(
+            tree0_state(&svol, SLOT_B).await,
+            Some(SlotState::Leased { appender_id, .. }) if appender_id == js.appender_id
+        ),
+        "the acquire landed at the successor"
+    );
+    assert_all_resolve(&joiner, other, &more).await;
+    assert_all_resolve(&joiner, shared, &files).await;
+    assert_must_stay_zero(&jvol, "joiner");
+    assert_must_stay_zero(&svol, "successor");
+
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    assert_all_resolve(&successor, shared, &files).await;
+    assert_all_resolve(&successor, other, &more).await;
+    venue2.tear_down();
+    shutdown(&successor).await;
+    drop(svol);
+    drop(successor);
     fsck_clean(&uris).await;
 }
 

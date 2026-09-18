@@ -14108,6 +14108,9 @@ impl SqueezefsFilesystem {
                         "joined_ring_grow_declined".into(),
                         word(&|s| s.ring_grow_declined),
                     );
+                    // A manager failover: every live joiner re-dials the
+                    // successor's listener at its next verb (≥ 1 there).
+                    metrics.insert("joined_wire_redials".into(), word(&|s| s.wire_redials));
                     // Rung 4's posture: `adopted` (co-located, KD-SYM-22),
                     // `registrant` (remote, our key under the manager's
                     // hold) or `detection` (the KD-SYM-13 opt-in).
@@ -16267,6 +16270,18 @@ impl SqueezefsFilesystem {
         let Some(backend) = self.meta_backend.as_ref() else {
             return;
         };
+        // Symmetric PR 12b: a JOINED appender's ino 1 is the manager's
+        // native slot — its commit door refuses the write (`SlotBusy`,
+        // "ship to the holder") and would count a door refusal per beat.
+        // Its liveness is its membership lease (the S6 census lists it as
+        // a member-writer; the death ledger reads the eviction), and its
+        // page is protected by the manager's flock while the manager
+        // lives. A durable `client:` heartbeat for a joiner (the offline
+        // `appender clear`'s freshness check on a manager-less set) is
+        // PR 13's item, stated in the PR 12b note.
+        if backend.volumes.iter().any(|v| v.is_joined_appender()) {
+            return;
+        }
         let ts = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)

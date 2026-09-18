@@ -1093,12 +1093,23 @@ pub struct SlotCoverage {
     /// owner installed — the in-process fixtures') is PR 10's class: its
     /// tree is frozen at its page root and its window is scoped out.
     pub foreign_live: u64,
-    /// The `foreign_live` slots themselves (PR 12b round 4): the raw C1
-    /// walk skips their trees — a live lessee appends INTO the images
-    /// this mount holds under an unchanged root, so a raw walk of the
-    /// projection reads a routing loop (`root-seq` restarts to the
-    /// budget) and reported `C1Torn` over a healthy tree.
-    pub foreign_live_slots: Vec<super::record::ForestSlot>,
+    /// **The slots this mount's census takes NO verdict over** (PR 12b
+    /// rounds 4/5 — the ONE predicate the dentry pass and the raw C1 walk
+    /// read): their trees are PROJECTIONS here, held at a root the lessee
+    /// (or the manager) has moved past and appended into, so a raw walk
+    /// reads a routing loop (`root-seq` restarts to the budget) and a
+    /// dentry census reads removals behind. On the volume's MANAGER (the
+    /// process with the S6 owner's word) these are the `foreign_live`
+    /// slots — a lessee NOT known live is PR 10's frozen-tree class and
+    /// is judged. On a MEMBER (a joined appender, a `-o ro` token reader
+    /// — KD-MW-16's fleet census shard runs on both) there is no owner
+    /// word at all, so the honest bound is every slot NOT leased by this
+    /// mount: the ones another appender leases (whichever it is — the
+    /// manager's rotor roots ride its page, never tree 0) AND the
+    /// unleased ones (the manager's, re-rooted by its SMOs between this
+    /// mount's projection refreshes). Coverage is INCOMPLETE where this
+    /// is non-empty — counted, never a finding.
+    pub unjudged_slots: Vec<super::record::ForestSlot>,
     /// `leased + unleased` — what this mount's pass covers.
     pub covered: u64,
 }
@@ -2224,6 +2235,13 @@ impl KvMetaBackend {
     /// slots: leased ∪ (unleased, on the manager); `covered` is the
     /// `fsck_inode_plane_slots_covered` gauge's per-volume term. On an
     /// unarmed volume every hosted slot is covered.
+    ///
+    /// **The liveness word is ONE owner's** — the process's installed S6
+    /// owner, which on this rung is the manager of the ONE shard every
+    /// lessee is homed on (volume 0's). PR 13's second shard (a lessee
+    /// homed on another volume, listed by THAT home's owner) must read the
+    /// lessee's HOME owner here; until it lands a lessee this owner does
+    /// not list reads "not known live" (PR 10's class) on the manager.
     pub async fn inode_plane_slot_coverage(&self) -> Result<SlotCoverage, KvError> {
         let mut cov = SlotCoverage::default();
         let gate = self.node_cache().lease_gate();
@@ -2233,12 +2251,18 @@ impl KvMetaBackend {
             cov.covered = 1;
             return Ok(cov);
         };
+        // A MEMBER of an armed set (a joined appender; a `-o ro` token
+        // reader): no owner word, every tree not its own a projection.
+        let member = self.is_joined_appender() || self.token_reader().is_some();
         // The native slot is the manager's by KD-SYM-2.
         let native_ours = !gate.is_armed() || gate.is_leased(super::record::NATIVE_FOREST_SLOT);
-        if native_ours {
+        if native_ours && !member {
             cov.leased += 1;
         } else {
             cov.foreign += 1;
+            if member {
+                cov.unjudged_slots.push(super::record::NATIVE_FOREST_SLOT);
+            }
         }
         // The foreign lessees' liveness, read once per census: the
         // directory's page identities → member ids → the installed S6
@@ -2246,7 +2270,7 @@ impl KvMetaBackend {
         let owner = crate::membership::installed_owner();
         let mut live_lessee: std::collections::HashMap<u32, bool> =
             std::collections::HashMap::new();
-        if owner.is_some() && gate.is_armed() {
+        if owner.is_some() && gate.is_armed() && !member {
             if let Ok(entries) =
                 super::appender::read_directory(self.device_path(), self.superblock()).await
             {
@@ -2276,21 +2300,27 @@ impl KvMetaBackend {
                 if slot == super::record::NATIVE_FOREST_SLOT {
                     continue;
                 }
+                let ours = gate.is_armed() && gate.is_leased(slot);
                 match super::slot_state::SlotState::decode(v)? {
-                    super::slot_state::SlotState::Leased { .. } if gate.is_leased(slot) => {
-                        cov.leased += 1
-                    }
-                    super::slot_state::SlotState::Leased { appender_id, .. } if gate.is_armed() => {
+                    super::slot_state::SlotState::Leased { .. } if ours => cov.leased += 1,
+                    super::slot_state::SlotState::Leased { appender_id, .. }
+                        if gate.is_armed() || member =>
+                    {
                         cov.foreign += 1;
-                        if live_lessee.get(&appender_id).copied().unwrap_or(false) {
+                        if member {
+                            cov.unjudged_slots.push(slot);
+                        } else if live_lessee.get(&appender_id).copied().unwrap_or(false) {
                             cov.foreign_live += 1;
-                            cov.foreign_live_slots.push(slot);
+                            cov.unjudged_slots.push(slot);
                         }
                     }
                     super::slot_state::SlotState::Leased { .. } => cov.leased += 1,
                     super::slot_state::SlotState::Unleased { .. } => {
-                        if gate.is_leased(slot) {
+                        if ours {
                             cov.leased += 1;
+                        } else if member {
+                            cov.foreign += 1;
+                            cov.unjudged_slots.push(slot);
                         } else if !gate.is_armed() || gate.is_manager() {
                             cov.unleased += 1;
                         } else {

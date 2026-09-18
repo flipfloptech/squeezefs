@@ -820,12 +820,14 @@ pub struct FsckCounters {
     /// remounted joiner's 1,444 removals as 442 dangling names) — so the
     /// inode plane recorded NO verdict this run. One per volume so met.
     pub inode_plane_foreign_dentry_scoped: u64,
-    /// Symmetric PR 12b round 4: slot trees the raw C1 walk SKIPPED because
-    /// a LIVE foreign appender leases them (`fsck_c1_foreign_live_slots_scoped`)
-    /// — the lessee appends into this mount's projected images under an
-    /// unchanged root, so a raw walk here reads a routing loop over a
-    /// healthy tree (the `sym-storm` leg's false `C1Torn`).
-    pub c1_foreign_live_slots_scoped: u64,
+    /// Symmetric PR 12b rounds 4/5: slot trees the raw C1 walk SKIPPED as
+    /// PROJECTIONS (`fsck_c1_projection_slots_scoped` —
+    /// `SlotCoverage::unjudged_slots`): at the manager a LIVE foreign
+    /// lessee's, at a member every tree not its own — their images are
+    /// appended into and re-rooted past this mount's root word, so a raw
+    /// walk reads a routing loop over a healthy tree (the `sym-storm`
+    /// leg's false `C1Torn`). The pass is INCOMPLETE over them.
+    pub c1_projection_slots_scoped: u64,
     /// PR 8: `fsck_inode_plane_slots_covered` — Σ over the pass's volumes
     /// of the slots this mount's inode plane judged: the slots it LEASES
     /// plus, on the volume's manager, the UNLEASED slots (tree 0's) —
@@ -1795,7 +1797,7 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
             )> = Vec::new();
             for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
                 let (vol_units, scoped) = c1_units(kv).await;
-                counters.c1_foreign_live_slots_scoped += scoped;
+                counters.c1_projection_slots_scoped += scoped;
                 for unit in vol_units {
                     units.push((vol_idx, kv.clone(), unit));
                 }
@@ -2226,7 +2228,7 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         counters.inode_plane_foreign_slot_scoped += r.counters.inode_plane_foreign_slot_scoped;
         counters.inode_plane_window_scoped += r.counters.inode_plane_window_scoped;
         counters.inode_plane_foreign_dentry_scoped += r.counters.inode_plane_foreign_dentry_scoped;
-        counters.c1_foreign_live_slots_scoped += r.counters.c1_foreign_live_slots_scoped;
+        counters.c1_projection_slots_scoped += r.counters.c1_projection_slots_scoped;
         counters.inode_plane_slots_covered += r.counters.inode_plane_slots_covered;
         counters.inode_plane_cross_owner_declined += r.counters.inode_plane_cross_owner_declined;
         counters.inode_plane_proposals_admitted += r.counters.inode_plane_proposals_admitted;
@@ -2363,7 +2365,7 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     dst.inode_plane_foreign_slot_scoped += fin.inode_plane_foreign_slot_scoped;
     dst.inode_plane_window_scoped += fin.inode_plane_window_scoped;
     dst.inode_plane_foreign_dentry_scoped += fin.inode_plane_foreign_dentry_scoped;
-    dst.c1_foreign_live_slots_scoped += fin.c1_foreign_live_slots_scoped;
+    dst.c1_projection_slots_scoped += fin.c1_projection_slots_scoped;
     dst.inode_plane_slots_covered += fin.inode_plane_slots_covered;
     dst.inode_plane_cross_owner_declined += fin.inode_plane_cross_owner_declined;
     // `inode_plane_volumes_covered` is deliberately NOT folded: coverage
@@ -3123,7 +3125,7 @@ fn fold_worker_counters(dst: &mut FsckCounters, src: &FsckCounters) {
     dst.inode_plane_foreign_scoped += src.inode_plane_foreign_scoped;
     dst.inode_plane_foreign_slot_scoped += src.inode_plane_foreign_slot_scoped;
     dst.inode_plane_foreign_dentry_scoped += src.inode_plane_foreign_dentry_scoped;
-    dst.c1_foreign_live_slots_scoped += src.c1_foreign_live_slots_scoped;
+    dst.c1_projection_slots_scoped += src.c1_projection_slots_scoped;
     dst.inode_plane_window_scoped += src.inode_plane_window_scoped;
     dst.inode_plane_slots_covered += src.inode_plane_slots_covered;
     dst.inode_plane_cross_owner_declined += src.inode_plane_cross_owner_declined;
@@ -3243,33 +3245,40 @@ enum C1Unit {
 }
 
 /// The C1 walk units of one volume, and the count of slot trees SCOPED
-/// OUT because a LIVE foreign appender leases them (symmetric PR 12b
-/// round 4 — the `sym-storm` leg's round-3 red: the manager's raw walk of
-/// a joiner's slot tree, which the joiner appends into under an
-/// unchanged root, exhausted the traversal's `root-seq` restart budget
-/// on the manager's projection and reported `C1Torn` over a healthy
-/// tree). The same S6-owner word the dentry pass judges by
-/// (`SlotCoverage::foreign_live`): a lessee not known live is PR 10's
-/// frozen-tree class and is walked; a live lessee's tree is its own to
-/// census (`fsck_c1_foreign_live_slots_scoped`).
+/// OUT because this mount's census takes no verdict over them
+/// (`SlotCoverage::unjudged_slots` — the ONE predicate the dentry pass
+/// reads; symmetric PR 12b rounds 4/5): on the manager, a slot tree a
+/// LIVE foreign appender leases — appended into and re-rooted by the
+/// lessee under grants the manager handed out, so the manager's raw walk
+/// from ITS root word read a routing loop (`root-seq` restarts to the
+/// budget) and reported `C1Torn` over a healthy tree (the `sym-storm`
+/// leg's round-3 red); on a MEMBER (a joined appender or a `-o ro` token
+/// reader running KD-MW-16's fleet census shard) every slot tree not its
+/// own — no owner word exists there, and the coordinator admits the
+/// shard's C1 findings whole (Issue 24). A lessee the manager's owner
+/// does not list live is PR 10's frozen-tree class and is walked. Counted
+/// on `fsck_c1_projection_slots_scoped`.
 async fn c1_units(kv: &crate::meta_backend::kv::backend::KvMetaBackend) -> (Vec<C1Unit>, u64) {
     if kv.symmetric_forest() {
-        let live_foreign: std::collections::BTreeSet<_> = match kv.inode_plane_slot_coverage().await
-        {
-            Ok(cov) => cov.foreign_live_slots.into_iter().collect(),
+        // A coverage read that FAILS walks nothing rather than everything
+        // (Issue 24): a projected tree's loop is a false finding, an
+        // unwalked tree an incomplete pass — the honest one.
+        let unjudged: std::collections::BTreeSet<_> = match kv.inode_plane_slot_coverage().await {
+            Ok(cov) => cov.unjudged_slots.into_iter().collect(),
             Err(e) => {
                 log::warn!(
-                    "fsck C1: meta volume {}'s slot coverage could not be read ({e}) — every \
-                     slot tree is walked",
+                    "fsck C1: meta volume {}'s slot coverage could not be read ({e}) — no slot \
+                     tree is walked this run (an incomplete pass, never a finding over a \
+                     projection)",
                     kv.device_path().display()
                 );
-                std::collections::BTreeSet::new()
+                return (Vec::new(), kv.forest_roots().len() as u64);
             }
         };
         let mut units = Vec::new();
         let mut scoped = 0u64;
         for (slot, _) in kv.forest_roots() {
-            if live_foreign.contains(&slot) {
+            if unjudged.contains(&slot) {
                 scoped += 1;
             } else {
                 units.push(C1Unit::Slot(slot));
@@ -3277,8 +3286,9 @@ async fn c1_units(kv: &crate::meta_backend::kv::backend::KvMetaBackend) -> (Vec<
         }
         if scoped > 0 {
             log::info!(
-                "fsck C1: meta volume {}: {scoped} slot tree(s) leased to a LIVE appender are \
-                 that lessee's to walk — skipped (fsck_c1_foreign_live_slots_scoped)",
+                "fsck C1: meta volume {}: {scoped} slot tree(s) are PROJECTIONS here (another \
+                 appender's, or the manager's at a member) — skipped, the pass INCOMPLETE over \
+                 them (fsck_c1_projection_slots_scoped)",
                 kv.device_path().display()
             );
         }
@@ -3419,7 +3429,7 @@ async fn walk_trees_c1(
 ) {
     for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
         let (vol_units, scoped) = c1_units(kv).await;
-        counters.c1_foreign_live_slots_scoped += scoped;
+        counters.c1_projection_slots_scoped += scoped;
         for unit in vol_units {
             if opts.cancel.load(Ordering::Relaxed) {
                 return;
@@ -3847,16 +3857,17 @@ async fn build_referenced_inos(
         // counted (`fsck_inode_plane_foreign_dentry_scoped`), never a
         // finding over a tree whose staleness it cannot bound.
         match kv.inode_plane_slot_coverage().await {
-            Ok(cov) if cov.foreign_live > 0 => {
+            Ok(cov) if !cov.unjudged_slots.is_empty() => {
                 foreign_dentry_scoped += 1;
                 log::warn!(
-                    "fsck C9/C10: meta volume {vol_idx} has {} slot(s) leased to another LIVE \
-                     appender — their dentries are that lessee's, held here as a projection \
-                     of unbounded staleness, so the referenced-ino set is not this mount's to \
+                    "fsck C9/C10: meta volume {vol_idx} has {} slot(s) whose trees are \
+                     PROJECTIONS here (another LIVE appender's, or every non-own tree at a \
+                     member) — their dentries are the lessee's, held here at a staleness the \
+                     census cannot bound, so the referenced-ino set is not this mount's to \
                      census and the inode-plane classes record NO verdict this run \
                      (fsck_inode_plane_foreign_dentry_scoped; the lessee's clean leave or its \
                      recovery makes the set this mount's again)",
-                    cov.foreign_live
+                    cov.unjudged_slots.len()
                 );
                 return (None, indexed, foreign_dentry_scoped);
             }
@@ -7283,8 +7294,8 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.inode_plane_window_scoped, Ordering::Relaxed);
     m.fsck_inode_plane_foreign_dentry_scoped
         .fetch_add(c.inode_plane_foreign_dentry_scoped, Ordering::Relaxed);
-    m.fsck_c1_foreign_live_slots_scoped
-        .fetch_add(c.c1_foreign_live_slots_scoped, Ordering::Relaxed);
+    m.fsck_c1_projection_slots_scoped
+        .fetch_add(c.c1_projection_slots_scoped, Ordering::Relaxed);
     if c.inode_plane_slots_covered > 0 {
         m.fsck_inode_plane_slots_covered
             .store(c.inode_plane_slots_covered, Ordering::Relaxed);

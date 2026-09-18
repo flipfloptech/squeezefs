@@ -1195,6 +1195,18 @@ impl KvMetaBackend {
         }
         self.install_lease(set, plane, own, slot, words, true)
             .await?;
+        // The custody transfer's SECOND half on the wire (PR 12b round 3,
+        // F3): the manager's grant entry moved the tree's live images
+        // into THIS appender's `extent_grant` record (`transfer_in` at an
+        // in-process region — a wire lessee has no region there), so this
+        // RAM grant must claim them too, or every later retirement of an
+        // inherited image through this mount's SMOs is dropped by
+        // `free_pending`'s claimed guard: never parked, never returned —
+        // an orphan image only C13 or the leave reaches.
+        let arriving = self.slot_tree_image_extents(slot).await?;
+        if !arriving.is_empty() {
+            self.joined_region()?.grant().transfer_in(&arriving);
+        }
         plane.holders.learn(
             slot,
             crate::slot_holder_cache::SlotHolder {

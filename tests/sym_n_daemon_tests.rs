@@ -2984,11 +2984,12 @@ async fn a_re_holds_deferred_leaks_converge_on_the_live_peers_declared_windows()
 
     let mut prior_holding = alloc_lease::holding(data_tag).expect("manager 1 holds");
     let mut plane = plane1;
-    let mut successor_term = 4u64;
     let mut current_manager = manager;
     let mut current_vol = mvol;
     let mut current_venue = venue;
-    for failover in 1..=2u32 {
+    // The successor's membership term: 3 was the first manager's, each
+    // failover bumps it.
+    for (failover, successor_term) in (1..=2u32).zip(4u64..) {
         // The manager DIES with its listener and its membership plane; the
         // joiner's remainder and the dead manager's own remainder are RAM
         // at a ledger that died.
@@ -3135,7 +3136,6 @@ async fn a_re_holds_deferred_leaks_converge_on_the_live_peers_declared_windows()
 
         prior_holding = sholding;
         plane = plane2;
-        successor_term += 1;
         current_manager = successor;
         current_vol = svol;
         current_venue = venue2;

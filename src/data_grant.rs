@@ -654,8 +654,17 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T>
 static GRANTS: AtomicU64 = AtomicU64::new(0);
 static RENEWALS: AtomicU64 = AtomicU64::new(0);
 /// A failed renewal's retry pace floor, ms (`renew_retry_pace_ms`): the
-/// smallest interval two dials of one dead venue may be apart — the
-/// kernel's connect refusal is instant, so below this the loop is a spin.
+/// smallest interval two dials of one dead venue may be apart. The
+/// physical bound below it is the connect refusal's one RTT (µs on a LAN
+/// — an RST, never a timeout), so any pace under this is a spin against
+/// a dead address at ≥ 10 dials/s per client; 100 ms is the bounded-park
+/// quantum this tree already uses where a wait must not spin and must not
+/// sit (the transport queue worker's park, the fuse3 zc bridge law), and
+/// at the shipped clocks it is ≈ 1/40 of `T_self` — the pace measured at
+/// 14 dials over the `T_self` window on the flat pin (round 4, Issue 22),
+/// against the 25 ms sleep's 66. Not tied to the wire's dial deadline: a
+/// dead venue REFUSES (RTT-fast); the dial deadline governs a venue that
+/// does not answer at all, which is `T_self`'s class.
 const RENEW_RETRY_FLOOR_MS: u64 = 100;
 /// Failed renewals retried at the paced cadence (`dlm_custody_renew_retries`).
 static RENEW_RETRIES: AtomicU64 = AtomicU64::new(0);

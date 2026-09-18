@@ -2374,6 +2374,16 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     // set covered whole.
 }
 
+/// The FLOOR of the fleet collect loop's progress deadline: the job wire's
+/// own dial/handshake deadline — a worker's proposal is one wire round
+/// trip, and "late" cannot be judged below the bound the wire itself
+/// grants a single dial (PR 12b review round 2, Issue 27; tie-tested in
+/// `derivation_sweep_tests`). Below the lease TTL in every shipped
+/// configuration; the floor binds only where a harness shortens the TTL.
+pub fn fleet_collect_progress_floor() -> Duration {
+    crate::job_wire::ENROLL_DIAL_TIMEOUT
+}
+
 /// The **fleet fsck detect pass** (KD-MW-16, `docs/design-mw-fleet-jobs.md`
 /// §4): shard the census across enrolled fleet read workers, merge their
 /// fencing-checked proposals through the EXISTING `merge_reports` union
@@ -2520,13 +2530,19 @@ pub async fn run_fleet(
     // just ran as shard 0, so a proposal is due within a bounded multiple
     // of that wall — floored at the lease TTL (a shard that beats its
     // lease but never proposes is a WEDGED worker, which the lease law
-    // alone never notices). Past it every outstanding census shard is
-    // treated as lost: re-leased or run locally, and the job TERMINATES.
+    // alone never notices) and at the wire's own dial deadline (a shard 0
+    // that finished in microseconds on an empty set must not read a
+    // worker still inside its first round trip as wedged —
+    // `fleet_collect_progress_floor`). Past it every outstanding census
+    // shard is treated as lost: re-leased or run locally, and the job
+    // TERMINATES.
     let shard0_wall = shard0_started.elapsed();
     let progress_deadline = std::time::Instant::now()
-        + fleet
-            .shard_lease_ttl()
-            .max(shard0_wall.saturating_mul(4).max(Duration::from_secs(1)));
+        + fleet.shard_lease_ttl().max(
+            shard0_wall
+                .saturating_mul(4)
+                .max(fleet_collect_progress_floor()),
+        );
     for k in std::mem::take(&mut local_residues) {
         METRICS
             .job_fleet_shards_relocal

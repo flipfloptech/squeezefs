@@ -200,8 +200,10 @@ pub use crate::cluster_wire::{
 
 /// Worker-side bound on the enrollment exchange (dial → challenge →
 /// hello → reply). The coordinator's own gate is
-/// `JobWireConfig::handshake_timeout`.
-const ENROLL_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// `JobWireConfig::handshake_timeout`. Also the floor of the fleet fsck
+/// collect loop's progress deadline (`fsck::fleet_collect_progress_floor`):
+/// one dial's own bound is the least a proposal may be granted.
+pub const ENROLL_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Worker-side DMA/task batch size for per-batch lease re-validation
 /// (§5.1.6 rung 1: a woken zombie aborts before its next batch).

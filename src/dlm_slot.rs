@@ -282,6 +282,28 @@ pub(crate) fn install_lease_foreign_slots(volume: u128, foreign: Option<&[u16]>)
     rebuild_owner_table(&src);
 }
 
+/// Whether `slot` is foreign by a symmetric slot LEASE (PR 4's
+/// contribution — another appender leases it), as opposed to S8's
+/// ownership plane. A fencing read there is served differently: the
+/// lease plane issues no metadata RPC (its reads are PR 5's tokens), so
+/// the S8 grant cache is empty by design, not by violation.
+pub fn is_lease_foreign_slot(slot: u64) -> bool {
+    let src = OWNER_SOURCES.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(s) = u16::try_from(slot) else {
+        return false;
+    };
+    src.lease_foreign.values().any(|f| f.contains(&s))
+}
+
+/// Fencing reads of a symmetric-plane foreign-slot object this mount holds
+/// no custody on, served the era base (`dlm_slot_lease_foreign_reads`).
+static LEASE_FOREIGN_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `dlm_slot_lease_foreign_reads` — the counter above.
+pub fn lease_foreign_reads() -> u64 {
+    LEASE_FOREIGN_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Compose the table in force from its contributors and publish it.
 fn rebuild_owner_table(src: &OwnerSources) {
     if src.ownership_local.is_none() && src.lease_foreign.is_empty() {
@@ -514,8 +536,8 @@ impl SlotLockManager {
     /// Cost on the shipped (unarmed) path: **one relaxed load**. Nothing
     /// else about this read changed.
     pub fn get_fencing_token_ino(&self, ino: u64) -> u64 {
-        if crate::meta_ship::ownership_armed() && !is_local_slot(slot_of_ino(ino, routing_width()))
-        {
+        let slot = slot_of_ino(ino, routing_width());
+        if crate::meta_ship::ownership_armed() && !is_local_slot(slot) {
             // **S9**: an ADOPTED remote grant is the owner's own answer,
             // recorded in this process's custody table at adoption — exact,
             // and strictly better than a cached grant (it is the same
@@ -525,6 +547,19 @@ impl SlotLockManager {
             // tripwire meaningful.
             if let Some(generation) = crate::dlm::live_custody_generation(ino) {
                 return generation;
+            }
+            // **Symmetric PR 12b**: a slot another appender LEASES is
+            // foreign by the lease plane, whose foreign reads are PR 5's
+            // tokens — no metadata RPC ever fills the S8 grant cache for
+            // it, so a fencing read of a foreign-slot file this mount holds
+            // no custody on (a read, a getattr) is the era base by
+            // construction, never the S8 miss tripwire (which fired on
+            // every foreign read of the fidelity tier's real second
+            // daemon). A WRITE acquires custody at the slot holder first
+            // (PR 9) and reads the adopted generation above.
+            if is_lease_foreign_slot(slot) {
+                LEASE_FOREIGN_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return crate::meta_ship::owner_era_base();
             }
             return crate::meta_ship::foreign_fencing_token(ino);
         }

@@ -1379,7 +1379,7 @@ leg_sym_manager_failover() {
     # flock reclaims instantly, the strict target's stale key rides the
     # register ladder), so its wall is far inside the cross-host bound —
     # both numbers are the row.
-    pid=$(pgrep -f "squeezefs.*mount sqmeta://$meta" | head -1)
+    pid=$(pgrep -f "squeezefs.*mount sqmeta://$meta $mnt " | head -1)
     [ -n "$pid" ] || { bad "SYMMGR: no daemon pid"; return; }
     t0=$(date +%s%3N)
     kill -9 "$pid"
@@ -1522,14 +1522,14 @@ sym_n_daemon_leg() { # meta data out
     # acked, in each joiner's OWN ring (the manager's appenders_live says
     # who; `joined_wire_failures` must stay 0).
     local acked2 acked3 i
-    mkdir -p "$j2/from-j2" "$j3/from-j3"
+    mkdir -p "$j2/w2-dir" "$j3/w3-dir"
     acked2=0
     acked3=0
     for i in $(seq 1 100); do
-        echo "j2 $i" > "$j2/from-j2/f$i" 2>> "$out" && acked2=$((acked2 + 1))
-        echo "j3 $i" > "$j3/from-j3/f$i" 2>> "$out" && acked3=$((acked3 + 1))
+        echo "j2 $i" > "$j2/w2-dir/f$i" 2>> "$out" && acked2=$((acked2 + 1))
+        echo "j3 $i" > "$j3/w3-dir/f$i" 2>> "$out" && acked3=$((acked3 + 1))
     done
-    dd if=/dev/urandom of="$j2/from-j2/big.bin" bs=1M count=4 status=none 2>> "$out"
+    dd if=/dev/urandom of="$j2/w2-dir/big.bin" bs=1M count=4 status=none 2>> "$out"
     sync
     [ "$acked2" = "100" ] && [ "$acked3" = "100" ] && ok "SYMJOIN/N: 100 + 100 creates acked on the joiners" || bad "SYMJOIN/N: acked j2=$acked2 j3=$acked3 of 100 each"
     for m in "$j2" "$j3"; do
@@ -1541,18 +1541,39 @@ sym_n_daemon_leg() { # meta data out
     # Cross-daemon reads: exact at the next resolve — the manager reads a
     # joiner's directory through its token, joiner 2 reads joiner 3's and
     # the manager's, the reader would too. The count and one content.
-    n=$(ls "$mnt/from-j2" 2>> "$out" | grep -c '^f')
+    n=$(ls "$mnt/w2-dir" 2>> "$out" | grep -c '^f')
     [ "$n" = "100" ] && ok "SYMJOIN/N: the manager lists joiner 2's 100 names (a foreign slot through its holder's token)" || bad "SYMJOIN/N: manager lists $n of joiner 2's 100"
-    [ "$(cat "$mnt/from-j3/f7" 2>> "$out")" = "j3 7" ] && ok "SYMJOIN/N: the manager reads joiner 3's content exact" || bad "SYMJOIN/N: manager read of joiner 3's f7: '$(cat "$mnt/from-j3/f7" 2>&1)'"
-    n=$(ls "$j2/from-j3" 2>> "$out" | grep -c '^f')
+    [ "$(cat "$mnt/w3-dir/f7" 2>> "$out")" = "j3 7" ] && ok "SYMJOIN/N: the manager reads joiner 3's content exact" || bad "SYMJOIN/N: manager read of joiner 3's f7: '$(cat "$mnt/w3-dir/f7" 2>&1)'"
+    n=$(ls "$j2/w3-dir" 2>> "$out" | grep -c '^f')
     [ "$n" = "100" ] && ok "SYMJOIN/N: joiner 2 lists joiner 3's 100 names (a joiner reading a joiner)" || bad "SYMJOIN/N: joiner 2 lists $n of joiner 3's 100"
     n=$(ls "$j3" 2>> "$out" | grep -c '^f')
     [ "$n" = "200" ] && ok "SYMJOIN/N: joiner 3 lists the manager's 200 names" || bad "SYMJOIN/N: joiner 3 lists $n of the manager's 200"
-    [ "$(md5sum "$j3/from-j2/big.bin" 2>/dev/null | cut -d' ' -f1)" = "$(md5sum "$j2/from-j2/big.bin" | cut -d' ' -f1)" ] && ok "SYMJOIN/N: joiner 3 reads joiner 2's 4 MiB byte-exact (its data through the holder's grants)" || bad "SYMJOIN/N: joiner 3's read of joiner 2's big.bin differs"
+    [ "$(md5sum "$j3/w2-dir/big.bin" 2>/dev/null | cut -d' ' -f1)" = "$(md5sum "$j2/w2-dir/big.bin" | cut -d' ' -f1)" ] && ok "SYMJOIN/N: joiner 3 reads joiner 2's 4 MiB byte-exact (its data through the holder's grants)" || bad "SYMJOIN/N: joiner 3's read of joiner 2's big.bin differs"
     # A create INTO a foreign directory (PR 6's shipped step served by the
     # joiner): the manager creates under joiner 2's directory.
-    echo "from manager" > "$mnt/from-j2/by-manager" 2>> "$out" && ok "SYMJOIN/N: the manager created into joiner 2's directory (a cross-owner op — one intent, the step served by the joiner)" || bad "SYMJOIN/N: the manager's create into joiner 2's directory failed"
-    [ "$(cat "$j2/from-j2/by-manager" 2>> "$out")" = "from manager" ] && ok "SYMJOIN/N: joiner 2 reads the manager's create in its own directory" || bad "SYMJOIN/N: joiner 2 does not see the manager's create"
+    echo "from manager" > "$mnt/w2-dir/by-manager" 2>> "$out" && ok "SYMJOIN/N: the manager created into joiner 2's directory (a cross-owner op — one intent, the step served by the joiner)" || bad "SYMJOIN/N: the manager's create into joiner 2's directory failed"
+    [ "$(cat "$j2/w2-dir/by-manager" 2>> "$out")" = "from manager" ] && ok "SYMJOIN/N: joiner 2 reads the manager's create in its own directory" || bad "SYMJOIN/N: joiner 2 does not see the manager's create"
+    # A joiner's TERMINAL FREE ships to the allocation-lease holder (PR 8's
+    # law on a real second daemon): joiner 2 truncates its 4 MiB file, the
+    # displaced block's free travels as `FreeBlocks` to the manager, whose
+    # executor runs the ladder against the bitmap (Freed — never refused,
+    # never abandoned: round 5 of this leg found the executor uninstalled
+    # under the plane, every joiner free ABANDONED after 3 attempts).
+    : > "$j2/w2-dir/big.bin"
+    sync
+    for i in $(seq 1 40); do
+        v=$(jstat "$j2" meta_ship_publish.free_shipped_blocks)
+        [ "${v:-0}" -ge 1 ] 2>/dev/null && break
+        sleep 0.25
+    done
+    v=$(jstat "$j2" meta_ship_publish.free_shipped_blocks)
+    [ "${v:-0}" -ge 1 ] 2>/dev/null && ok "SYMJOIN/N: joiner 2's displaced block's terminal free SHIPPED to the holder (free_shipped_blocks=$v)" || bad "SYMJOIN/N: joiner 2 shipped no free (free_shipped_blocks=$v)"
+    v=$(jstat "$j2" meta_ship_publish.free_ship_failures)
+    [ "${v:-x}" = "0" ] && ok "SYMJOIN/N: no shipped free abandoned at joiner 2 (free_ship_failures=0)" || bad "SYMJOIN/N: joiner 2 free_ship_failures=$v (a leaked block per failure)"
+    v=$(jstat "$mnt" meta_ship_publish.free_served_blocks)
+    [ "${v:-0}" -ge 1 ] 2>/dev/null && ok "SYMJOIN/N: the manager's executor SERVED the joiner's free against its bitmap (free_served_blocks=$v)" || bad "SYMJOIN/N: manager free_served_blocks=$v"
+    v=$(jstat "$mnt" meta_ship_publish.free_refused_blocks)
+    [ "${v:-x}" = "0" ] && ok "SYMJOIN/N: the manager refused no shipped free (free_refused_blocks=0)" || bad "SYMJOIN/N: manager free_refused_blocks=$v"
     local ms0 k
     ms0=""
     for m in "$mnt" "$j2" "$j3"; do
@@ -1583,7 +1604,7 @@ sym_n_daemon_leg() { # meta data out
             v=$(jstat "$j3" appender_self_recoveries)
             [ "${v:-0}" -ge 1 ] 2>/dev/null && ok "SYMJOIN/N: joiner 3's successor recovered its dead incarnation's ring as OWN RESIDUE (appender_self_recoveries=$v, $((t1 - t0)) ms)" || bad "SYMJOIN/N: joiner 3's successor appender_self_recoveries=$v"
             [ "$(jstat "$j3" joined_appender_id)" = "$id3" ] && ok "SYMJOIN/N: the successor rejoined its own region (appender $id3, `already`)" || bad "SYMJOIN/N: successor appender id $(jstat "$j3" joined_appender_id) != $id3"
-            n=$(ls "$j3/from-j3" 2>> "$out" | grep -c '^f')
+            n=$(ls "$j3/w3-dir" 2>> "$out" | grep -c '^f')
             [ "$n" = "100" ] && ok "SYMJOIN/N: every acked name (100) served by joiner 3's successor" || bad "SYMJOIN/N: joiner 3's successor lists $n of 100"
             v=$(jstat "$mnt" appender_recoveries)
             [ "${v:-0}" = "0" ] && ok "SYMJOIN/N: the manager recovered nothing (a same-identity rejoin is its own residue)" || bad "SYMJOIN/N: manager appender_recoveries=$v"
@@ -1599,16 +1620,36 @@ sym_n_daemon_leg() { # meta data out
     # manager's hold standing, the manager alone in the directory.
     umount "$j3" >> "$out" 2>&1
     umount "$j2" >> "$out" 2>&1
-    sleep 2
+    # The FUSE unmount returns before the daemon's leave (65 ReleaseSlot +
+    # LeaveAppender over the wire — and, when a grant this holder issued
+    # is held by the DEAD joiner-3 incarnation, PR 9's recall-at-leave
+    # waits the S9 sweep out: T_owner + one renewal). Wait for both
+    # PROCESSES to exit, bounded past that law, before judging the
+    # directory — a lingering joiner is what round 5's guard leg killed
+    # instead of its own daemon (`pgrep | head -1`).
+    t0=$(date +%s)
+    for i in $(seq 1 240); do
+        pgrep -f "squeezefs.*mount sqmeta://$meta $j2 " > /dev/null 2>&1 || pgrep -f "squeezefs.*mount sqmeta://$meta $j3 " > /dev/null 2>&1 || break
+        sleep 0.5
+    done
+    if pgrep -f "squeezefs.*mount sqmeta://$meta $j2 " > /dev/null 2>&1 || pgrep -f "squeezefs.*mount sqmeta://$meta $j3 " > /dev/null 2>&1; then
+        bad "SYMJOIN/N: a joiner daemon is still alive $(( $(date +%s) - t0 )) s after its umount (the leave never completed)"
+    else
+        ok "SYMJOIN/N: both joiner daemons exited after their umount ($(( $(date +%s) - t0 )) s; PR 9's dead-grant recall bounds the leave at T_owner + renew)"
+    fi
+    for i in $(seq 1 40); do
+        [ "$(jstat "$mnt" appenders_known)" = "1" ] && break
+        sleep 0.5
+    done
     reg_m=$(nvme resv-report "$meta" --eds -o json 2>/dev/null | jq -r .regctl)
     reg_d=$(nvme resv-report "$data" --eds -o json 2>/dev/null | jq -r .regctl)
     [ "$reg_m" = "$reg_m0" ] && [ "$reg_d" = "$reg_d0" ] && ok "SYMJOIN/N: the leaves left the registrant counts as found (meta $reg_m, data $reg_d)" || bad "SYMJOIN/N: the leaves moved the registrant count (meta $reg_m0→$reg_m, data $reg_d0→$reg_d)"
     [ "$(nvme resv-report "$meta" --eds -o json 2>/dev/null | jq -r .rtype)" = "3" ] && ok "SYMJOIN/N: the manager's rtype-3 hold survived two joiners' leaves" || bad "SYMJOIN/N: meta rtype after the leaves != 3"
     v=$(jstat "$mnt" appenders_known)
     [ "${v:-0}" = "1" ] && ok "SYMJOIN/N: appenders_known back to 1 (both pages Free)" || bad "SYMJOIN/N: appenders_known=$v after the leaves"
-    n=$(ls "$mnt/from-j2" 2>> "$out" | grep -c '^f')
+    n=$(ls "$mnt/w2-dir" 2>> "$out" | grep -c '^f')
     [ "$n" = "100" ] && ok "SYMJOIN/N: joiner 2's 100 names served by the manager after its leave (the released slot is the manager's to maintain)" || bad "SYMJOIN/N: after the leave the manager lists $n of joiner 2's 100"
-    [ "$(cat "$mnt/from-j3/f42" 2>> "$out")" = "j3 42" ] && ok "SYMJOIN/N: joiner 3's content served by the manager after its leave" || bad "SYMJOIN/N: manager read of joiner 3's f42 after the leave: '$(cat "$mnt/from-j3/f42" 2>&1)'"
+    [ "$(cat "$mnt/w3-dir/f42" 2>> "$out")" = "j3 42" ] && ok "SYMJOIN/N: joiner 3's content served by the manager after its leave" || bad "SYMJOIN/N: manager read of joiner 3's f42 after the leave: '$(cat "$mnt/w3-dir/f42" 2>&1)'"
     if "$FIDELI_BIN" fsck "$mnt" > "$STATE/legs/sym-n-fsck.txt" 2>&1 && grep -q "findings: 0" "$STATE/legs/sym-n-fsck.txt"; then
         ok "SYMJOIN/N: online fsck clean after three daemons wrote (findings: 0)"
     else
@@ -1803,7 +1844,7 @@ leg_sym_join_ladder() {
     # The manager dies; the successor re-walks the ladder (same host: the
     # flock reclaims instantly, the strict target's stale keys ride the
     # register ladder on BOTH namespaces).
-    pid=$(pgrep -f "squeezefs.*mount sqmeta://$meta" | head -1)
+    pid=$(pgrep -f "squeezefs.*mount sqmeta://$meta $mnt " | head -1)
     [ -n "$pid" ] || { bad "SYMJOIN: no daemon pid"; return; }
     log "SYMJOIN: registrants before the kill — meta [$(regkeys "$meta")] data [$(regkeys "$data")]"
     t0=$(date +%s%3N)

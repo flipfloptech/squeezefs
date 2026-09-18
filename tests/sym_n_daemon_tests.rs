@@ -1897,6 +1897,189 @@ async fn a_recovery_never_preempts_the_managers_own_key() {
     fsck_clean(&uris).await;
 }
 
+/// **The joiner's durable writer ERA is its appender page's TERM** (found
+/// by the fidelity tier's first real second daemon: rung 7's custody
+/// owner refused to arm on a process with `dlm_term = 0` — the D0 claim
+/// gate publishes the manager's era, and a joiner runs no claim). The
+/// page term is bumped at every join of the identity and barriered by
+/// the manager's page write, so the successor of a dead joiner at the
+/// same mount point dominates its predecessor's tokens on their shared
+/// staging root (§6.11); `adopt_durable_term` never regresses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiners_durable_writer_term_is_its_page_term_and_rises_at_a_rejoin() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let manager_term = squeezefs::dlm::durable_term();
+
+    let joiner = join(&uris, &venue, &mvol, 81).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let id = jvol.appender_stats().unwrap().appender_id;
+    let page_term = page_of(&uris[0], &mvol, id).await.expect("the page").term;
+    assert!(page_term >= 1, "a joined page carries a term");
+    assert!(
+        squeezefs::dlm::durable_term() >= page_term && squeezefs::dlm::durable_term() != 0,
+        "the process era covers the joiner's page term ({} ≥ {page_term})",
+        squeezefs::dlm::durable_term()
+    );
+    assert!(
+        squeezefs::dlm::durable_term() >= manager_term,
+        "the era never regresses below the manager's (one process here)"
+    );
+    // The joiner dies; its successor at the same identity rejoins over
+    // the Live page: term + 1, and the era rises with it.
+    let files = create_files(&joiner, dirs[0], "era", 4).await;
+    drop(jvol);
+    drop(joiner);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    let back = join(&uris, &venue, &mvol, 81).await;
+    let bvol = Arc::clone(&back.volumes[0]);
+    let page_term2 = page_of(&uris[0], &mvol, id).await.expect("the page").term;
+    assert_eq!(page_term2, page_term + 1, "the rejoin bumped the term");
+    assert!(
+        squeezefs::dlm::durable_term() >= page_term2,
+        "the successor's era dominates its predecessor's"
+    );
+    assert_all_resolve(&back, dirs[0], &files).await;
+    shutdown(&back).await;
+    drop(bvol);
+    drop(back);
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+}
+
+/// **The manager's claim-set entry carries its DATA registrant key** (found
+/// by the fidelity tier's first real second daemon: under the join ladder
+/// the membership arm enrolls the node at rung 3 — BEFORE rung 4 takes the
+/// data WERO hold — so the entry read `pr_key 0`, and every co-located
+/// joiner's adoption found no enrolled key to cross-check the standing
+/// holder against). The rung-7 publish refreshes the key from the live
+/// hold, so the entry names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_managers_published_claim_set_entry_names_its_live_data_registrant_key() {
+    use squeezefs::membership::{ClaimSet, MemberIdentity, MemberRole};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, _dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    // Rung 3's shape: the node enrolled with NO key (no hold stands yet).
+    let node = squeezefs::cowriter::node_member_id().unwrap();
+    squeezefs::membership::upsert_writer_member(
+        &mvol,
+        &MemberIdentity {
+            id: node.clone(),
+            role: MemberRole::Writer,
+            pid: std::process::id(),
+            boot: squeezefs::meta_backend::kv::backend::read_boot_id(),
+            endpoint: None,
+            pr_key: 0,
+        },
+        squeezefs::dlm::durable_term(),
+    )
+    .await
+    .unwrap();
+    // Rung 4: a PR-capable data namespace, the hold taken.
+    let data = dir.path().join("data-pr");
+    std::fs::File::create(&data)
+        .unwrap()
+        .set_len(1 << 20)
+        .unwrap();
+    let ns = FakeNvmeNamespace::new();
+    reservation::install_override(
+        &data,
+        FakeReservationClient::new(ns.clone(), "nqn-pr12b-data", "host-pr12b-data"),
+    );
+    let _restore = ClearOverride(vec![data.clone()]);
+    let hold = squeezefs::data_custody::acquire_wero(std::slice::from_ref(&data))
+        .expect("the manager's data hold");
+    let key = ns.holder().expect("held");
+    assert_eq!(squeezefs::data_custody::live_wero_key(), Some(key));
+    // Rung 7: the publish names the key beside the endpoint.
+    squeezefs::multi_writer::publish_symmetric_endpoint(&manager, "127.0.0.1:4242").await;
+    let set = ClaimSet::load(&mvol).await.expect("the claim set");
+    let me = set
+        .members
+        .iter()
+        .find(|m| squeezefs::membership::member_id_matches(&m.identity.id, &node))
+        .expect("enrolled");
+    assert_eq!(me.identity.endpoint.as_deref(), Some("127.0.0.1:4242"));
+    assert_eq!(
+        me.identity.pr_key, key,
+        "the entry names the live data hold's key — what a co-located joiner's adoption \
+         cross-checks the standing holder against"
+    );
+    assert_eq!(set.registrant_keys(), vec![key]);
+    drop(hold);
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+}
+
+/// **The manager's custody owner admits a joiner's JOIN with NO lane**
+/// (found by the fidelity tier's first real second daemon: every op on
+/// the joiner's mount answered EAGAIN because the owner's join gate read
+/// it as "not in this era's allocation partition"). Under the armed plane
+/// the S9 lane partition is SUPERSEDED by PR 8's block grants, so the
+/// owner runs NO partition at all — `arm_authority_planes` installs no
+/// lane map — and answers `(0, 1)` (SOLO, no partition) to every member;
+/// a map naming nobody (the first build's "SOLO") refused everyone. The
+/// owner's law pinned at its own door: with no map installed the join
+/// lands SOLO; with an empty map installed it refuses naming the
+/// partition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_custody_owner_with_no_lane_map_admits_every_joiner_solo() {
+    use squeezefs::data_grant::{JoinFrame, WriteCustodyOwner, CUSTODY_SCHEMA};
+    use squeezefs::membership::{LeaseClock, LeaseClocks};
+    let clocks = LeaseClocks::with_params(
+        std::time::Duration::from_millis(3_000),
+        std::time::Duration::from_millis(200),
+        std::time::Duration::from_millis(400),
+    )
+    .expect("clocks");
+    let owner = WriteCustodyOwner::arm(
+        "manager-no-lanes",
+        7,
+        6,
+        clocks,
+        LeaseClock::monotonic(),
+        None,
+    )
+    .expect("arms");
+    let join = |client: &str| JoinFrame {
+        schema: CUSTODY_SCHEMA,
+        client: client.to_string(),
+        pr_key: 0,
+        prior_epoch: None,
+    };
+    let lease = owner
+        .join(&join("node_joiner.m1"))
+        .expect("no partition: every member joins SOLO");
+    assert_eq!(
+        (lease.writer_lane, lease.writers),
+        (0, 1),
+        "SOLO — no partition"
+    );
+    // The first build's shape: a map naming NOBODY refuses everyone.
+    owner.install_lane_assignment(
+        squeezefs::alloc_lane_grant::LaneAssignment::derive("", &[]).expect("derives"),
+    );
+    let err = owner
+        .join(&join("node_joiner.m2"))
+        .err()
+        .map(|e| e.to_string())
+        .expect("an empty map refuses");
+    assert!(err.contains("allocation partition"), "{err}");
+}
+
 /// Restore the process-global reservation overrides after a contract.
 struct ClearOverride(Vec<std::path::PathBuf>);
 

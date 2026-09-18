@@ -914,6 +914,14 @@ pub(crate) async fn arm_authority_planes(
     // SOLO by law whatever the claim set enrolls: every joined appender is
     // a writer member of the roster (PR 12b), and deriving a width from
     // them would engage the lanes beside the grants on one allocator.
+    //
+    // "SOLO by law" means NO map installed at all — the owner then answers
+    // `(0, 1)` (no partition) to every joiner's custody JOIN, exactly as an
+    // authority with no enrolled co-writer does. The first build installed
+    // a map naming NOBODY: the owner's join gate read every joiner as
+    // "not in this era's partition" and refused it, so a joined appender
+    // could read nothing of the manager's (found by the fidelity tier's
+    // first real second daemon — every op on its mount EAGAIN).
     let symmetric_armed = meta.volumes.iter().any(|v| v.slot_lease_armed());
     let assignment = if symmetric_armed {
         crate::alloc_lane_grant::LaneAssignment::derive("", &[])?
@@ -928,7 +936,9 @@ pub(crate) async fn arm_authority_planes(
             }
         }
     };
-    owner.install_lane_assignment(Arc::clone(&assignment));
+    if !symmetric_armed {
+        owner.install_lane_assignment(Arc::clone(&assignment));
+    }
     // Rung 10 — phantom-era frontier hygiene (rung-8 finding #4's named
     // residual): records of a width no live era runs are pruned HERE, at
     // the one node that both knows the era's width (it just derived it
@@ -940,7 +950,16 @@ pub(crate) async fn arm_authority_planes(
     // An undecodable record refuses the arm loud (the load law: a
     // watermark we cannot read is a floor we cannot honour — and one we
     // must not delete).
-    match crate::data_alloc_lane::prune_stale_lane_records(meta, assignment.writers()).await {
+    // A JOINED appender (PR 12b) owns no lane hygiene — the records live on
+    // ino 1, the manager's slot, and the partition is superseded under the
+    // plane; the manager's arm runs the pass for the set.
+    let joined = meta.volumes.iter().any(|v| v.is_joined_appender());
+    let prune = if joined {
+        Ok(crate::data_alloc_lane::LanePruneReport::default())
+    } else {
+        crate::data_alloc_lane::prune_stale_lane_records(meta, assignment.writers()).await
+    };
+    match prune {
         Ok(report) if report.pruned > 0 => {
             log::warn!(
                 "multi-writer arm: pruned {} stale allocation-lane record(s) ({} folded into \
@@ -965,6 +984,26 @@ pub(crate) async fn arm_authority_planes(
         }
     }
     let authority_lane = assignment.authority_partition();
+    // PR 12b (found by the fidelity tier's N = 3 leg): under the ARMED
+    // plane the era runs NO lane partition — a joiner mints from ranged
+    // block grants (PR 8) — yet its displaced blocks' terminal frees still
+    // SHIP to this holder (`block_grant::free_target_for` names the
+    // allocation-lease holder, and `cowriter::ship_displaced_frees` routes
+    // there). The executor rode the lane branch below, so a joined
+    // appender's every free was REFUSED (status 82) and ABANDONED after
+    // three attempts: the bit stayed SET in the holding's bitmap with no
+    // reference — one leaked block per displaced block (PR 8's C6 LEAK
+    // half). The ladder is the holder's law: `execute_shipped_frees` on
+    // a grant-armed allocator ends in `finish_free`'s bitmap CLEAR.
+    if symmetric_armed && authority_lane.is_solo() {
+        if let Some(backend) = backend {
+            publish::install_free_executor(crate::cowriter::router_free_executor(
+                Arc::clone(backend),
+                Arc::clone(meta),
+                crate::cowriter::live_owner_view(),
+            ));
+        }
+    }
     if !authority_lane.is_solo() {
         let Some(backend) = backend else {
             if let Some(hold) = wero {
@@ -1955,10 +1994,19 @@ async fn publish_owner_endpoint(
             );
             continue;
         };
-        if identity.endpoint.as_deref() == Some(endpoint) {
+        // The registrant key the entry carries is the one the MEMBERSHIP
+        // arm read when it enrolled this node — under the symmetric join
+        // ladder that is rung 3, BEFORE rung 4 takes the data WERO hold,
+        // so the entry read 0 and every co-located joiner's adoption found
+        // no enrolled key to cross-check the standing holder against
+        // (found by the fidelity tier's first real second daemon). The
+        // publish runs at rung 7: the live hold's key is known here.
+        let key = crate::data_custody::live_wero_key().unwrap_or(identity.pr_key);
+        if identity.endpoint.as_deref() == Some(endpoint) && identity.pr_key == key {
             continue; // idempotent: a remount at the same address writes nothing
         }
         identity.endpoint = Some(endpoint.to_string());
+        identity.pr_key = key;
         if let Err(e) = crate::membership::upsert_writer_member(vol, &identity, term).await {
             log::warn!(
                 "ownership map: publishing this mount's endpoint {endpoint} on volume {} failed \

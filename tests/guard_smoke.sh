@@ -148,7 +148,7 @@ run() {
     return $rc
 }
 is_mounted() { awk -v m="$MNT" '$2==m{f=1} END{exit !f}' /proc/mounts; }
-daemon_pid() { pgrep -f "squeezefs.*mount sqmeta://$META" | head -1; }
+daemon_pid() { pgrep -f "squeezefs.*mount sqmeta://$META $MNT " | head -1; }
 mount_it() {
     # Drain the udev queue first: our own wipe/format write-then-close fires
     # a `change` uevent, and systemd-udevd holds a BSD flock on the block

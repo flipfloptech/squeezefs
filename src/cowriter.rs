@@ -2107,8 +2107,18 @@ pub async fn execute_shipped_frees(
                     FreeVerdict::Refused
                 }
                 None => {
+                    // PR 12b: on a grant-armed allocator the bitmap IS the
+                    // free list (PR 8) — the local list is drained into it,
+                    // so `free_list_contains` cannot see a joiner-minted
+                    // block's earlier release; its bit, CLEAR, can.
+                    let bit_clear = alloc
+                        .block_grant_vol_tag()
+                        .and_then(crate::meta_backend::kv::alloc_lease::holding)
+                        .is_some_and(|h| !h.bitmap.is_set(idx));
                     let already = if alloc.free_list_contains(idx) {
                         Some("already on the free list")
+                    } else if bit_clear {
+                        Some("already CLEAR in the allocation bitmap (the holder's free list)")
                     } else if alloc.grace_holds(offset) {
                         Some("held in the freed-offset grace ring")
                     } else if alloc.is_quarantined(offset) {

@@ -148,6 +148,15 @@ pub fn owner_term() -> u64 {
     OWNER_TERM.get()
 }
 
+/// The owner era's BASE — the token a foreign-home object with no grant
+/// reads (`compose(owner_term, 0)`): pre-era stamps stale, current-era
+/// stamps live, never a local grant. The S8 miss serves it loud
+/// ([`foreign_fencing_token`]); a symmetric-plane foreign-slot read serves
+/// it by construction (`dlm_slot`, PR 12b).
+pub fn owner_era_base() -> u64 {
+    compose_token(owner_term(), 0)
+}
+
 /// Record a grant an owner sent us. Monotone per object: a reordered or
 /// replayed reply can never lower an object's generation.
 ///

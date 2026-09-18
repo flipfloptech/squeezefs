@@ -7163,6 +7163,14 @@ pub struct Metrics {
     /// Reclaims ADMITTED inside a failover grace window — recovery by
     /// re-assertion, NFSv4 style.
     pub membership_grace_reclaims: Align64<AtomicU64>,
+    /// Reclaims a MEMBER re-asserted that the venue REFUSED (unreachable,
+    /// or an owner that would not admit it) before `T_self` — one per
+    /// attempt, so it is also the retry cadence's face: PR 12b found the
+    /// un-parked arm re-asserting at 1 ms against a dead manager for its
+    /// whole `T_self` (≈ 900 refusals a second per joiner); it now beats
+    /// at the cadence law over the window left, against the successor
+    /// the rendezvous names.
+    pub membership_reclaim_refusals: Align64<AtomicU64>,
     /// DURABLE membership commits — the rendezvous record at arm and the
     /// §6.2 item-7 claim set on membership CHANGE. **Bounded by mounts and
     /// membership changes, never by beats**: growth proportional to
@@ -12212,6 +12220,7 @@ impl SqueezefsFilesystem {
                 "membership_census_serves": METRICS.membership_census_serves.load(Ordering::Relaxed),
                 "membership_grace_refusals": METRICS.membership_grace_refusals.load(Ordering::Relaxed),
                 "membership_grace_reclaims": METRICS.membership_grace_reclaims.load(Ordering::Relaxed),
+                "membership_reclaim_refusals": METRICS.membership_reclaim_refusals.load(Ordering::Relaxed),
                 "membership_registration_commits": METRICS.membership_registration_commits.load(Ordering::Relaxed),
                 // Finding 2 (2026-08-20): the lease-venue starvation
                 // instrument — max intended-wake → actual-run lag of the
@@ -12957,6 +12966,12 @@ impl SqueezefsFilesystem {
                 "dlm_mode": crate::dlm_slot::dlm_mode(),
                 "dlm_rpcs": crate::dlm_slot::dlm_rpcs(),
                 "dlm_term": crate::dlm::durable_term(),
+                // Symmetric PR 12b: fencing reads of a foreign-SLOT object
+                // this mount holds no custody on (a read, a getattr through
+                // the holder's token), served the era base — the lease
+                // plane issues no S8 metadata RPC, so the grant cache is
+                // empty by design there; 0 on a solo mount.
+                "dlm_slot_lease_foreign_reads": crate::dlm_slot::lease_foreign_reads(),
                 // DLM S8 (spec §6.7 decision 1, §6.9 S8): function-shipped
                 // metadata. `meta_ship` carries the shipped-vs-local
                 // ledger, the pipelining factor (batched_verbs/batches),

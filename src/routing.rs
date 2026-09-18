@@ -8940,9 +8940,16 @@ impl DataRouter {
             // destroyed nothing, silently (`doomed == 0` is an early Ok).
             // `try_make_global_ino` is the tree-walk inverse fsck uses; a
             // local this volume's stamps cannot express is skipped loud.
+            // Symmetric PR 12b: a corpse in a slot ANOTHER appender leases
+            // is that appender's to destroy (its door refuses ours as a
+            // foreign mutation, per corpse); this mount sweeps the slots it
+            // may mutate — its leased ones, plus the unleased ones on the
+            // manager (`inode_plane_owns_slot`, the C9/C10 shard law). An
+            // unarmed volume owns every slot.
             let corpses: Vec<u64> = crate::block_allocator::collect_corpse_inos(be)
                 .await?
                 .into_iter()
+                .filter(|local| be.inode_plane_owns_slot(*local))
                 .filter_map(|local| {
                     let global = backend.try_make_global_ino(local, v_idx);
                     if global.is_none() {

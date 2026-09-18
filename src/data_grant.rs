@@ -5635,7 +5635,24 @@ pub async fn foreign_read_plane(
             "volume ordinal {v} exceeds the wire's u16 volume word"
         ))
     })?;
-    let (_client, plane) = arm.holder(&endpoint, volume).await?;
+    let (_client, plane) = match arm.holder(&endpoint, volume).await {
+        Ok(h) => h,
+        Err(e) => {
+            // The holder at `endpoint` is dead or moved: a SUCCESSOR at the
+            // same identity publishes a new listener (PR 12b) — re-resolve
+            // once and retry there; the same address stays the refusal.
+            let Some(moved) = Box::pin(crate::sym_join::rebind_holder_endpoint_if_moved(
+                &routed.volumes[v],
+                holder,
+                &endpoint,
+            ))
+            .await
+            else {
+                return Err(e);
+            };
+            arm.holder(&moved, volume).await?
+        }
+    };
     // A freshly dialed plane serves nothing until its recall channel's
     // first round lands (`serve_gate`): bounded wait, the serve's own
     // refusal is the honest answer past it.
@@ -5770,7 +5787,30 @@ pub async fn acquire_at_slot_holder(
     let started = Instant::now();
     let mut redirected = false;
     loop {
-        let (client, tokens) = arm.holder(&endpoint, volume).await?;
+        let (client, tokens) = match arm.holder(&endpoint, volume).await {
+            Ok(h) => h,
+            Err(e) => {
+                // A dead holder's SUCCESSOR publishes a new listener (PR
+                // 12b): re-resolve once, retry there; the same address
+                // stays the refusal.
+                let moved = arm
+                    .routed
+                    .upgrade()
+                    .and_then(|r| r.volumes.get(usize::from(volume)).cloned());
+                let Some(vol) = moved else {
+                    return Err(e);
+                };
+                let Some(fresh) = Box::pin(crate::sym_join::rebind_holder_endpoint_if_moved(
+                    &vol, holder, &endpoint,
+                ))
+                .await
+                else {
+                    return Err(e);
+                };
+                endpoint = fresh;
+                arm.holder(&endpoint, volume).await?
+            }
+        };
         let gen0 = tokens.recall_generation(object);
         match client
             .acquire_carrying_token(volume, object, span, mode, ttl)

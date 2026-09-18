@@ -870,7 +870,22 @@ impl KvMetaBackend {
             Ordering::Relaxed,
         );
         self.write_region_page(region).await?;
-        self.sync_device().await.map_err(KvError::Io)
+        self.sync_device().await.map_err(KvError::Io)?;
+        // The joiner's DURABLE WRITER ERA (DLM S2's term — the high bits of
+        // every fencing token this process mints, the custody owner's
+        // era at rung 7): its appender page's TERM, bumped at every join
+        // of this identity and barriered just above — monotone across
+        // this appender's incarnations, so a successor at the same mount
+        // point dominates its predecessor's tokens on the staging root
+        // bound to their shared client scope (§6.11). The manager's era
+        // is its claim's; the two never compare — a slot holder's grants
+        // are SCOPED at every client (PR 9, `CustodyScope::SlotHolder`),
+        // and staging roots are per client scope. Without it the custody
+        // owner refused to arm (`dlm_term = 0`) — found by the fidelity
+        // tier's first real second daemon.
+        let term = region.page.lock().unwrap_or_else(|e| e.into_inner()).term;
+        crate::dlm::adopt_durable_term(term);
+        Ok(())
     }
 
     /// A failed joined open tears down what it stood up: the checkpoint

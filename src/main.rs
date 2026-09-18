@@ -6774,7 +6774,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // `job:` xattrs on ino 1 — the coordinator role belongs to the
             // D0 writer-claim holder by definition (VL2/VL2b), which a
             // reader is not and must never appear to be.
-            if reader_mount || mw_client_mount {
+            if reader_mount || mw_client_mount || joined_mount {
                 // Rung-9 finding #4: a CO-WRITER took the coordinator arm
                 // here and died at mount — JobWireHost::start writes
                 // `job:enroll` and the fabric's crash-resume adoption
@@ -6784,6 +6784,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // A co-writer takes the READER posture on this surface;
                 // fleet-parallel job WORKERS arrive by membership
                 // (KD-MW-16, rung 10c), never by hosting a coordinator.
+                //
+                // Symmetric PR 12b: a JOINED appender is the same shape one
+                // plane over — `job:` records live on ino 1, the MANAGER's
+                // native slot, and the joiner's commit door refuses a
+                // foreign slot's mutation ("ships to its holder") — found
+                // by the fidelity tier's first real second daemon, which
+                // died at `job:enroll` with its backend already joined.
+                // Maintenance coordination is the manager's (the
+                // symmetric coordinator = volume 0's manager, PR 8).
                 //
                 // PR 7b: KD-PV-14 says the same thing about a PARTIAL
                 // AUTHORITY in per-volume terms — the maintenance

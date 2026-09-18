@@ -789,6 +789,40 @@ pub async fn bind_holder_endpoint_on_demand(
     plane.holders.endpoint(holder)
 }
 
+/// **Re-resolve a holder whose bound endpoint went DEAD** (PR 12b, N ≥ 3):
+/// a dead holder's SUCCESSOR at the same identity rejoins its region
+/// (same appender id) and publishes a NEW listener, while every peer's
+/// table still names the old one — the peer's dials fail for ever. On a
+/// dial failure at `stale` the caller asks here: the endpoint is resolved
+/// FRESH (past the table — a joiner asks the manager, the manager and a
+/// reader read the durable state the successor's publish wrote) and, when
+/// it MOVED, bound in place and returned; the same address (the holder is
+/// simply down) answers `None` and the caller keeps its retry class.
+/// Counted with the on-demand bindings.
+pub async fn rebind_holder_endpoint_if_moved(
+    vol: &crate::meta_backend::kv::backend::KvMetaBackend,
+    holder: u32,
+    stale: &str,
+) -> Option<Arc<str>> {
+    let plane = vol.slot_leases()?;
+    let fresh = if vol.is_joined_appender() {
+        vol.joined_resolve_endpoint(holder).await.ok().flatten()?
+    } else {
+        resolve_holder_endpoint(vol, holder).await?
+    };
+    if fresh == stale {
+        return None;
+    }
+    plane.holders.set_endpoint(holder, &fresh);
+    HOLDER_BINDS_ON_DEMAND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    log::info!(
+        "meta volume {}: appender {holder} MOVED its listener {stale} → {fresh} (a successor at \
+         the same identity) — re-bound",
+        vol.device_path().display()
+    );
+    plane.holders.endpoint(holder)
+}
+
 static REPORT: arc_swap::ArcSwapOption<JoinReport> = arc_swap::ArcSwapOption::const_empty();
 
 fn install_report(report: JoinReport) {

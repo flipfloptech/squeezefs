@@ -677,3 +677,213 @@ async fn a_wedged_renewal_attempt_never_occupies_the_lease_venue_past_its_bound(
     arm.disarm().await;
     plane.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// 5. A refused reclaim beats at the cadence law — never a spin — and lands
+//    at the successor the observation names
+// ---------------------------------------------------------------------------
+
+/// **The un-parked reclaim arm's spin** (symmetric PR 12b, found by the
+/// fidelity tier's N = 3 leg): a member whose owner died re-asserted its
+/// reclaim against the DEAD listener at 1 ms for its whole `T_self`
+/// (≈ 900 refusals a second per joiner — `renew_at_ms` sits in the past
+/// after a failed renewal, so the shell's due read 1 ms), and it never
+/// reached the successor whose record already stood in the rendezvous:
+/// the un-parked arm dialed the venue it was spawned with, and only the
+/// PARKED arm (PR 8, Issue 10) read `successor_endpoint()`. ONE law now,
+/// before and after `T_self`: the beat is the cadence law over the window
+/// left (`min(renew_interval, remaining / 3)`), cut short by the successor
+/// observation, and the venue is the successor's when one is observed.
+///
+/// Two shapes, with the shipped 45 s clocks scaled to `short_clocks`
+/// (`T_self` 1.3 s, cadence ≈ 433 ms):
+/// (a) no successor — the writer member fences at `T_self` exactly as
+///     before, having re-asserted a HANDFUL of times (the spin re-asserted
+///     ≈ 900);
+/// (b) a successor observed after the first refusal — the paced wait wakes
+///     and the reclaim lands in the successor's grace window: no fence,
+///     the member's lease custody at the successor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_reclaim_beats_at_the_cadence_law_never_a_spin() {
+    let _serial = serial();
+    let _restore = restore();
+    membership::note_successor_observed(None);
+    let clocks = short_clocks();
+    let t_owner_ms = clocks.t_owner.as_millis() as u64;
+    let owner = MembershipOwner::arm(
+        "owner-dies-a",
+        7,
+        6,
+        clocks.clone(),
+        LeaseClock::monotonic(),
+    )
+    .expect("the owner arms");
+    let plane = MembershipPlane::start(
+        MembershipPlaneConfig::loopback(),
+        SECRET.to_vec(),
+        Arc::clone(&owner),
+    )
+    .expect("plane binds loopback");
+    let rec = OwnerRecord {
+        v: 1,
+        id: "owner-dies-a".to_string(),
+        term: 7,
+        endpoint: plane.endpoint().to_string(),
+        ttl_ms: t_owner_ms,
+        owner_claim_id: String::new(),
+        ts: 0,
+        pid: std::process::id(),
+        boot: "boot-dies-a".to_string(),
+    };
+    let refusals0 = METRICS.membership_reclaim_refusals.load(Ordering::Relaxed);
+    let fences0 = METRICS.membership_self_fences.load(Ordering::Relaxed);
+    let renewals0 = METRICS.membership_renewals.load(Ordering::Relaxed);
+    let arm = membership::join_as_writer_member(&rec, SECRET.to_vec(), "reclaim-node-a", 0, None)
+        .await
+        .expect("the join must be admitted")
+        .expect("a rendezvous record exists, so a member arms");
+    let alive_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while METRICS.membership_renewals.load(Ordering::Relaxed) == renewals0 {
+        assert!(
+            std::time::Instant::now() < alive_deadline,
+            "the renewal loop must land its first heartbeat on a healthy host"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The owner DIES (its listener closes); no successor ever appears.
+    plane.shutdown();
+    let fence_deadline = std::time::Instant::now() + Duration::from_millis(4 * t_owner_ms);
+    while METRICS.membership_self_fences.load(Ordering::Relaxed) == fences0 {
+        assert!(
+            std::time::Instant::now() < fence_deadline,
+            "a WRITER member with no successor fences at T_self through the ordinary ladder"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let refused = METRICS.membership_reclaim_refusals.load(Ordering::Relaxed) - refusals0;
+    assert!(
+        (1..=60).contains(&refused),
+        "a refused reclaim re-asserts at the cadence law over the window left (a handful of \
+         attempts before T_self), never at 1 ms against the dead venue (got {refused} \
+         refusals in ≈ {} ms)",
+        clocks.t_self.as_millis()
+    );
+    arm.disarm().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_reclaim_lands_at_the_successor_the_observation_names() {
+    let _serial = serial();
+    let _restore = restore();
+    membership::note_successor_observed(None);
+    let clocks = short_clocks();
+    let t_owner_ms = clocks.t_owner.as_millis() as u64;
+    let owner = MembershipOwner::arm(
+        "owner-dies-b",
+        7,
+        6,
+        clocks.clone(),
+        LeaseClock::monotonic(),
+    )
+    .expect("the owner arms");
+    let plane = MembershipPlane::start(
+        MembershipPlaneConfig::loopback(),
+        SECRET.to_vec(),
+        Arc::clone(&owner),
+    )
+    .expect("plane binds loopback");
+    let rec = OwnerRecord {
+        v: 1,
+        id: "owner-dies-b".to_string(),
+        term: 7,
+        endpoint: plane.endpoint().to_string(),
+        ttl_ms: t_owner_ms,
+        owner_claim_id: String::new(),
+        ts: 0,
+        pid: std::process::id(),
+        boot: "boot-dies-b".to_string(),
+    };
+    let refusals0 = METRICS.membership_reclaim_refusals.load(Ordering::Relaxed);
+    let fences0 = METRICS.membership_self_fences.load(Ordering::Relaxed);
+    let renewals0 = METRICS.membership_renewals.load(Ordering::Relaxed);
+    let arm = membership::join_as_writer_member(&rec, SECRET.to_vec(), "reclaim-node-b", 0, None)
+        .await
+        .expect("the join must be admitted")
+        .expect("a rendezvous record exists, so a member arms");
+    let alive_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while METRICS.membership_renewals.load(Ordering::Relaxed) == renewals0 {
+        assert!(
+            std::time::Instant::now() < alive_deadline,
+            "the renewal loop must land its first heartbeat on a healthy host"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The owner DIES; the member's next renewal fails and its reclaim
+    // against the dead venue is refused once.
+    plane.shutdown();
+    let first_refusal = std::time::Instant::now() + Duration::from_millis(2 * t_owner_ms);
+    while METRICS.membership_reclaim_refusals.load(Ordering::Relaxed) == refusals0 {
+        assert!(
+            std::time::Instant::now() < first_refusal,
+            "the renewal against the dead venue fails and the reclaim is refused"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The SUCCESSOR arms (term 8 over the predecessor's 7 — its grace
+    // window admits reclaims) and the rendezvous observation names it: the
+    // paced wait wakes, the reclaim re-points, the lease is custody there.
+    let successor = MembershipOwner::arm(
+        "owner-successor-b",
+        8,
+        7,
+        clocks.clone(),
+        LeaseClock::monotonic(),
+    )
+    .expect("the successor arms");
+    // The successor's grace window (the mount path opens it from the
+    // predecessor's durable claim set): reclaim admitted, fresh refused.
+    successor.open_grace(vec!["reclaim-node-b".to_string()]);
+    let succ_plane = MembershipPlane::start(
+        MembershipPlaneConfig::loopback(),
+        SECRET.to_vec(),
+        Arc::clone(&successor),
+    )
+    .expect("successor plane binds loopback");
+    membership::note_successor_observed(Some(succ_plane.endpoint().to_string()));
+    let landed = std::time::Instant::now() + Duration::from_millis(t_owner_ms);
+    while successor.epoch_of("reclaim-node-b").is_none() {
+        assert!(
+            std::time::Instant::now() < landed,
+            "the refused reclaim must land at the observed successor inside one lease \
+             period — the un-parked arm read no successor before PR 12b"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        METRICS.membership_self_fences.load(Ordering::Relaxed),
+        fences0,
+        "the member never fenced: its reclaim landed in the successor's grace window"
+    );
+    let refused = METRICS.membership_reclaim_refusals.load(Ordering::Relaxed) - refusals0;
+    assert!(
+        refused <= 8,
+        "between the owner's death and the successor's observation the member re-asserted \
+         at the cadence law, never a spin (got {refused} refusals)"
+    );
+    // The lease stays custody at the successor across a renewal.
+    tokio::time::sleep(Duration::from_millis(
+        clocks.renew_interval.as_millis() as u64 + 200,
+    ))
+    .await;
+    let _ = successor.expire_due();
+    assert!(
+        successor.epoch_of("reclaim-node-b").is_some(),
+        "the reclaimed lease renews at the successor on its cadence"
+    );
+
+    membership::note_successor_observed(None);
+    arm.disarm().await;
+    succ_plane.shutdown();
+}

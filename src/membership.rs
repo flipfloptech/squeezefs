@@ -3878,13 +3878,21 @@ async fn member_renewal_tick_decided(
         _ => None,
     };
     if not_custody.is_none() {
+        // The reclaim's VENUE is the successor the home volume's ledger
+        // names when it names one (PR 12b — the fidelity tier's N = 3
+        // leg: a joiner whose manager died re-asserted against the DEAD
+        // listener for its whole `T_self`, refused ≈ 900 times a second,
+        // while the successor's record already stood in the rendezvous —
+        // `reclaim_under_park`'s law, now ONE law before and after
+        // `T_self`).
+        let venue = successor_endpoint().unwrap_or_else(|| endpoint.to_string());
         log::warn!(
-            "membership: renewal failed ({e}) — re-asserting as a reclaim before my \
-             own deadline (T_self)"
+            "membership: renewal failed ({e}) — re-asserting as a reclaim against {venue} \
+             before my own deadline (T_self)"
         );
         let mut reclaim = req.clone();
         reclaim.prior_epoch = Some(session.epoch());
-        match crate::membership_wire::MemberClient::join(endpoint, secret, reclaim, clock.clone())
+        match crate::membership_wire::MemberClient::join(&venue, secret, reclaim, clock.clone())
             .await
         {
             Ok(fresh) => {
@@ -3894,7 +3902,13 @@ async fn member_renewal_tick_decided(
             }
             Err(SqueezefsError::MembershipLeaseNotCustody(reason)) => not_custody = Some(reason),
             Err(e) => {
-                log::warn!("membership: reclaim refused ({e}); retrying");
+                METRICS
+                    .membership_reclaim_refusals
+                    .fetch_add(1, Ordering::Relaxed);
+                log::warn!(
+                    "membership: reclaim against {venue} refused ({e}); retrying at the renewal \
+                     beat (or the ledger's successor observation)"
+                );
                 return RenewalTick::RejoinRefused;
             }
         }
@@ -4056,6 +4070,12 @@ pub fn successor_endpoint() -> Option<String> {
 /// observes nothing. Read at every parked beat by the renewal loop; a
 /// read that fails observes nothing (the beat retries).
 pub async fn observe_successor(home: &KvMetaBackend, joined_term: u64) -> Option<String> {
+    // PR 12b: on a JOINED appender the rendezvous record is a projection
+    // of the manager's slot — refreshed here (keyed on the ledger seq;
+    // one predicted-slot read when nothing moved) so the successor's
+    // record is seen at the beat it landed, not at the next wire re-dial.
+    // A no-op on every other posture.
+    let _ = home.refresh_control_projection().await;
     let rec = read_owner_record(home).await?;
     if rec.term <= joined_term {
         return None;
@@ -4146,6 +4166,12 @@ fn spawn_member_renewal(
     rendezvous: Option<(std::sync::Weak<KvMetaBackend>, u64)>,
 ) {
     crate::meta_exec::spawn_lease("membership_renewal", async move {
+        // The last tick's reclaim was REFUSED (the owner unreachable
+        // before `T_self`): `renew_at_ms` is in the past exactly as a
+        // parked member's is, so the next beat is the parked beat's law
+        // (PR 12b — the un-parked arm spun at 1 ms against the dead venue
+        // for its whole `T_self`).
+        let mut refused = false;
         loop {
             let now = clock.now_ms();
             // PR 8 (review round 1, Issue 10): a PARKED member's
@@ -4153,10 +4179,12 @@ fn spawn_member_renewal(
             // interval (never a 1 ms spin against the dead venue), cut
             // short by the ledger's successor observation.
             let parked = crate::park_gate::is_parked();
+            let paced = parked || refused;
             // PR 10 (§5.5.3 item 2): the observation's production writer
-            // — at every parked beat the home volume's rendezvous record
-            // is read for an owner at a newer era than the joined one.
-            if parked {
+            // — at every parked (or refused) beat the home volume's
+            // rendezvous record is read for an owner at a newer era than
+            // the joined one.
+            if paced {
                 if let Some((home, joined_term)) = rendezvous.as_ref() {
                     if let Some(home) = home.upgrade() {
                         let _ = observe_successor(&home, *joined_term).await;
@@ -4165,6 +4193,16 @@ fn spawn_member_renewal(
             }
             let due = if parked {
                 client.session().renew_interval_ms().max(1)
+            } else if refused {
+                // The refused reclaim's beat: the cadence law
+                // (`renew_interval = min(beat, T_self / 3)` — three attempts
+                // before the deadline) applied to the window that is LEFT,
+                // never above the routine beat — the retries concentrate
+                // toward `T_self`, where a landed reclaim matters most.
+                let remaining = client.session().t_self_deadline_ms().saturating_sub(now);
+                (remaining / 3)
+                    .min(client.session().renew_interval_ms())
+                    .max(1)
             } else {
                 client.session().renew_at_ms().saturating_sub(now).max(1)
             };
@@ -4176,7 +4214,7 @@ fn spawn_member_renewal(
             // CARRIAGE renewal, which leaves the beat and the label to
             // the routine one. A parked loop wakes on the successor
             // observation instead.
-            let carriage = if parked {
+            let carriage = if paced {
                 let _ = squeezefs_ipc::sqz_time::timeout(
                     Duration::from_millis(due),
                     SUCCESSOR_WAKE.notified(),
@@ -4229,13 +4267,13 @@ fn spawn_member_renewal(
             .await
             {
                 Ok(RenewalTick::Fenced) => return,
+                Ok(RenewalTick::RejoinRefused) => refused = true,
                 Ok(
                     RenewalTick::Renewed
                     | RenewalTick::Rejoined
                     | RenewalTick::FencedAndRejoined
-                    | RenewalTick::RejoinRefused
                     | RenewalTick::Parked,
-                ) => {}
+                ) => refused = false,
                 Err(_) => {
                     // The per-attempt warning the field lacked (finding 2:
                     // >45 s of silence). No fence here — a cancelled

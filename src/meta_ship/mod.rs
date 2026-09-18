@@ -135,11 +135,12 @@ pub use service::{
 pub use tokens::{
     cache_cap, deleg_kernel_ttl_stretch, delegation_enabled, delegation_stats,
     delegation_stats_json, foreign_fencing_token, global_recall_lane, install_delegation,
-    recall_batch_max_from, recall_cooldown_from, recall_deadline_from, recall_rate_cap_per_s,
-    recall_stats_json, record_grant, revoke_phase_json, set_deleg_inval_sink,
-    test_clear_delegations, test_clear_token_cache, token_cache_stats, DelegationStats,
-    GrantDecision, RecallConfig, RecallFrame, RecallLane, RecallLaneStats, TimedOutRecall,
-    TokenCacheStats, DELEGATION_ENV, RECALL_THRASH_CYCLES, TEST_DELEGATION_OVERRIDE,
+    owner_era_base, recall_batch_max_from, recall_cooldown_from, recall_deadline_from,
+    recall_rate_cap_per_s, recall_stats_json, record_grant, revoke_phase_json,
+    set_deleg_inval_sink, test_clear_delegations, test_clear_token_cache, token_cache_stats,
+    DelegationStats, GrantDecision, RecallConfig, RecallFrame, RecallLane, RecallLaneStats,
+    TimedOutRecall, TokenCacheStats, DELEGATION_ENV, RECALL_THRASH_CYCLES,
+    TEST_DELEGATION_OVERRIDE,
 };
 pub use wire::*;
 

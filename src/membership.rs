@@ -1564,12 +1564,25 @@ struct MemberState {
     pr_key: u64,
 }
 
+/// The failover grace window — TWO halves on ONE deadline (PR 12b review
+/// round 2, Issue 26): the FRESH-REFUSAL half (`fresh_refused`) protects
+/// the durable roster's leases and closes EARLY once every `expected`
+/// member re-asserted; the RE-ASSERTION half admits a member presenting a
+/// prior lease epoch until `until_ms`, whatever the first half did — a
+/// RAM-only member (a `-o ro` reader: in no claim set, so never in
+/// `expected`) polls the rendezvous once per beat, and the deadline
+/// (`grace = T_owner ≥ T_self`) is the only bound its own clock can meet.
+/// Closing both halves at the early close fenced the acceptance fleet's
+/// reader at every manager failover.
 struct Grace {
     until_ms: u64,
     expected: std::collections::BTreeSet<String>,
     /// The registrant key each expected member's claim-set entry carried
     /// (`0` = none / unknown) — a non-reclaimer's death record carries it.
     keys: std::collections::BTreeMap<String, u64>,
+    /// `true` while a FRESH acquire is refused (some expected member has
+    /// not re-asserted yet).
+    fresh_refused: bool,
 }
 
 /// The membership authority: a RAM lease table plus one atomic per
@@ -1614,6 +1627,7 @@ impl std::fmt::Debug for MembershipOwner {
             .field("term", &self.term)
             .field("members", &self.members.len())
             .field("grace_active", &self.grace_active())
+            .field("reassertion_open", &self.reassertion_open())
             .finish_non_exhaustive()
     }
 }
@@ -1858,7 +1872,11 @@ impl MembershipOwner {
                 .members
                 .read_sync(&req.id, |_, st| st.epoch == prior)
                 .unwrap_or(false);
-            if !live_here && !self.grace_active() {
+            // The RE-ASSERTION half of the window, not the fresh-refusal
+            // half: a RAM-only member's prior lease is admitted until the
+            // deadline even after the durable roster closed the window
+            // to strangers (Issue 26).
+            if !live_here && !self.reassertion_open() {
                 // The same refusal class the renewal verb counts: the
                 // presented lease is not custody, whichever verb carried it.
                 METRICS
@@ -2342,66 +2360,104 @@ impl MembershipOwner {
         );
         *self.grace.lock() = Some(Grace {
             until_ms: until,
+            fresh_refused: !expected.is_empty(),
             expected,
             keys,
         });
     }
 
-    /// `true` ⇔ the grace window is open (it closes on re-assertion or at
-    /// its deadline, whichever comes first).
-    pub fn grace_active(&self) -> bool {
-        let mut guard = self.grace.lock();
-        let Some(g) = guard.as_ref() else {
-            return false;
-        };
-        if self.clock.now_ms() >= g.until_ms {
-            log::info!(
-                "membership owner '{}': grace window closed on its deadline with {} \
-                 member(s) never re-asserting — their leases are gone and fresh acquires \
-                 are admitted again",
-                self.id,
-                g.expected.len()
-            );
-            // The NON-RECLAIMERS are the dead (design-symmetric-metadata
-            // §5.5.3 item 2): a member that reclaimed in the window left
-            // `expected` at its reclaim and is never named here; every
-            // member still listed at the deadline is evicted from the
-            // predecessor's census it never re-joined, and its death is
-            // shipped NOW — after grace, never at `T_owner`. The epoch is
-            // the PREDECESSOR's grant, unknown to this owner (0); the
-            // ledger's writer mints the dead epoch the quarantine keys on.
-            let dead: Vec<DeadMember> = g
-                .expected
-                .iter()
-                .map(|id| DeadMember {
-                    id: id.clone(),
-                    epoch: 0,
-                    pr_key: g.keys.get(id).copied().unwrap_or(0),
-                })
-                .collect();
-            *guard = None;
-            drop(guard);
-            for d in dead {
-                METRICS.membership_evictions.fetch_add(1, Ordering::Relaxed);
-                log::warn!(
-                    "membership owner '{}': prior member '{}' never re-asserted inside the grace \
-                     window — DEAD; its death is recorded for the recovery driver",
-                    self.id,
-                    d.id
-                );
-                // The key the predecessor's claim set registered for it —
-                // the `RecordDeath` key-word screen's witness for a member
-                // this owner never listed live.
-                self.remember_departed_key(&d.id, d.pr_key);
-                note_departure(&d.id);
-                note_death(d);
-            }
-            return false;
+    /// Reap the window at its DEADLINE: `Some(dead)` when this read closed
+    /// it — the caller acts on the non-reclaimers AFTER releasing the lock
+    /// (the death sink and the departure sink take their own locks) —
+    /// `None` when it is still open or was already closed.
+    fn reap_grace_deadline(&self, guard: &mut Option<Grace>) -> Option<Vec<DeadMember>> {
+        let g = guard.as_ref()?;
+        if self.clock.now_ms() < g.until_ms {
+            return None;
         }
-        true
+        log::info!(
+            "membership owner '{}': grace window closed on its deadline with {} \
+             member(s) never re-asserting — their leases are gone; a prior lease is \
+             no longer custody and fresh acquires are admitted",
+            self.id,
+            g.expected.len()
+        );
+        // The NON-RECLAIMERS are the dead (design-symmetric-metadata
+        // §5.5.3 item 2): a member that reclaimed in the window left
+        // `expected` at its reclaim and is never named here; every
+        // member still listed at the deadline is evicted from the
+        // predecessor's census it never re-joined, and its death is
+        // shipped NOW — after grace, never at `T_owner`. The epoch is
+        // the PREDECESSOR's grant, unknown to this owner (0); the
+        // ledger's writer mints the dead epoch the quarantine keys on.
+        let dead: Vec<DeadMember> = g
+            .expected
+            .iter()
+            .map(|id| DeadMember {
+                id: id.clone(),
+                epoch: 0,
+                pr_key: g.keys.get(id).copied().unwrap_or(0),
+            })
+            .collect();
+        *guard = None;
+        Some(dead)
     }
 
-    /// Milliseconds left in the grace window (`0` = closed).
+    fn act_on_grace_deadline(&self, dead: Vec<DeadMember>) {
+        for d in dead {
+            METRICS.membership_evictions.fetch_add(1, Ordering::Relaxed);
+            log::warn!(
+                "membership owner '{}': prior member '{}' never re-asserted inside the grace \
+                 window — DEAD; its death is recorded for the recovery driver",
+                self.id,
+                d.id
+            );
+            // The key the predecessor's claim set registered for it —
+            // the `RecordDeath` key-word screen's witness for a member
+            // this owner never listed live.
+            self.remember_departed_key(&d.id, d.pr_key);
+            note_departure(&d.id);
+            note_death(d);
+        }
+    }
+
+    /// `true` ⇔ the window's FRESH-REFUSAL half is open: a conflicting
+    /// fresh acquire is refused. It closes on the durable roster's full
+    /// re-assertion or at the deadline, whichever comes first — the
+    /// operator gauge `membership_grace_remaining_ms` reads this half.
+    pub fn grace_active(&self) -> bool {
+        let (open, dead) = {
+            let mut guard = self.grace.lock();
+            let dead = self.reap_grace_deadline(&mut guard);
+            (guard.as_ref().is_some_and(|g| g.fresh_refused), dead)
+        };
+        if let Some(dead) = dead {
+            self.act_on_grace_deadline(dead);
+        }
+        open
+    }
+
+    /// `true` ⇔ the window's RE-ASSERTION half is open: a member
+    /// presenting a prior lease epoch this owner never granted is admitted
+    /// as the reclaim §6.7 describes. Bounded by the DEADLINE alone — it
+    /// survives the fresh half's early close, because the members the
+    /// durable roster cannot name (a `-o ro` reader, a RAM-only member of
+    /// any kind) are exactly the ones whose re-assertion the early close
+    /// would otherwise turn into a self-fence (PR 12b, Issue 26).
+    pub fn reassertion_open(&self) -> bool {
+        let (open, dead) = {
+            let mut guard = self.grace.lock();
+            let dead = self.reap_grace_deadline(&mut guard);
+            (guard.is_some(), dead)
+        };
+        if let Some(dead) = dead {
+            self.act_on_grace_deadline(dead);
+        }
+        open
+    }
+
+    /// Milliseconds left in the fresh-refusal half (`0` = fresh acquires
+    /// admitted).
     pub fn grace_remaining_ms(&self) -> u64 {
         if !self.grace_active() {
             return 0;
@@ -2441,13 +2497,14 @@ impl MembershipOwner {
         // client id just re-asserted.
         g.expected
             .retain(|e| !(member_id_matches(e, id) || member_id_matches(id, e)));
-        if g.expected.is_empty() {
+        if g.expected.is_empty() && g.fresh_refused {
             log::info!(
-                "membership owner '{}': every prior member has re-asserted — grace window \
-                 closed early, fresh acquires admitted",
+                "membership owner '{}': every prior member of the durable roster has \
+                 re-asserted — fresh acquires admitted; a prior lease still re-asserts until \
+                 the window's deadline (a RAM-only member has no roster entry to be awaited by)",
                 self.id
             );
-            *guard = None;
+            g.fresh_refused = false;
         }
     }
 }
@@ -3447,12 +3504,16 @@ async fn arm_owner(
     }
     expected.sort();
     expected.dedup_by(|a, b| a.0 == b.0);
-    if prior_term != 0 && !expected.is_empty() {
+    if prior_term != 0 {
         // §6.7 Recovery: a successor opens a grace window over the
         // predecessor's membership — reclaim admitted, conflicting fresh
         // acquires refused — so failover does not become a cluster-wide
         // forced-flush storm. Each entry carries its registrant key: a
-        // non-reclaimer's death record names it (PR 10).
+        // non-reclaimer's death record names it (PR 10). Opened with an
+        // EMPTY roster too (Issue 26): nothing is refused then, but the
+        // predecessor's RAM-only members — its `-o ro` readers, in no
+        // claim set — re-assert their prior leases until the deadline
+        // instead of fencing at a successor that never awaited them.
         owner.open_grace_with_keys(expected);
     }
     install_owner(Arc::clone(&owner));

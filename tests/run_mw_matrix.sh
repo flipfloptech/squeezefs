@@ -2897,6 +2897,18 @@ ack_verify() { # ledger tag orig_mnt read_mnt lostfile
 # Recovered ring is never rejoined), reading every name too; online
 # fsck clean; the symmetric must-stay-0 set flat on every daemon. Per
 # round; COUNTED-RESTART discipline applies.
+#
+# WHAT THE GREEN FSCK ROW PROVES (PR 12b review round 2, Issue 27): the
+# block plane (C2–C8, the C8 oracle and the bitmap oracle) and C1 over
+# every tree but the LIVE lessees' — while joiners live their slot trees
+# are projections at the censusing mount and are SCOPED OUT
+# (`fsck_c1_projection_slots_scoped`), and the inode plane (C9/C10)
+# records NO verdict over a volume with a slot leased to a live appender
+# (every row's transcript reads "the inode plane covered 0 of 2 volumes —
+# this pass is INCOMPLETE"). A clean row here is NOT a C9/C10 verdict;
+# the inode plane's verdict on this fleet is the census at each lessee
+# over its own slots (PR 13's shipped census), or a run with every joiner
+# left.
 leg_sym_storm() {
     require_symmetric
     local joiners victim survivors m_mnt rowdir round ttl_ms phase_ms
@@ -3189,12 +3201,19 @@ s7_kill_body() { # [sym]
             fm="$(stat_field 0 data_plane_fence_mode)"
             [ "$fm" = "1" ] || die "round $round: successor data_plane_fence_mode=$fm (want 1)"
         fi
+        # PR 12b review round 2, Issue 26: the `-o ro` READER follows the
+        # failover WITHOUT fencing (its prior lease re-asserts until the
+        # successor's grace deadline — the re-assertion half survives the
+        # writers' early close), and its fleet WORKER re-enrolls at the
+        # successor's coordinator so the round's fsck runs a MEMBER-SIDE
+        # census shard (Issue 24's law on the real fleet).
+        [ "$sym" = "sym" ] && [ -n "$reader_idx" ] && sym_crash_reader_follows "$round" "$reader_idx"
         # Every daemon's .stats BEFORE the fsck verdict (review round 1,
         # Issue 9), then the oracle: FULL online fsck (C1-C10, C8 ungated on
         # this stamped format — the durable ledger runs for real), BOUNDED
         # (Issue 13) with its transcript kept whatever the verdict.
         local sidx
-        for sidx in 0 $(joiner_idxs); do
+        for sidx in 0 $(joiner_idxs) $reader_idx; do
             cat "$(mnt_of "$sidx")/.stats" >"$rowdir/stats-m$sidx-r$round.json" 2>/dev/null || true
         done
         local frc=0
@@ -3223,6 +3242,7 @@ $out"
         backstops="$(stat_field 0 mem_budget_hard_backstops)"
         [ "$backstops" = "0" ] || die "round $round: mem_budget_hard_backstops=$backstops (R5 column)"
         [ "$sym" = "sym" ] && sym_crash_round_asserts "$round" "$rowdir"
+        [ "$sym" = "sym" ] && [ -n "$reader_idx" ] && sym_crash_reader_shard_asserts "$round" "$reader_idx"
         printf '%-6s %-9s %-9s %-10s %-6s %-10s %-6s %s\n' "$round" "$phase_ms" "$((t_up - t_kill))" "findings:$findings" "$drift" "$fence_ref" "$trip" GREEN | tee -a "$rowdir/matrix.tsv"
     done
 
@@ -3392,6 +3412,117 @@ sym_crash_round_asserts() { # round rowdir
         done
         log "round $round: the freed-offset epoch fan-in advances with $(joiner_idxs | wc -l) joined writers as members (min_acked_free_epoch=$v)"
     fi
+    # PR 12b review round 2, Issue 25 — the successor's re-hold DEFERRED the
+    # dead incarnation's bitmap leaks while peer pages were Live; every
+    # live joiner DECLARES its block-grant windows on its renewal, the
+    # successor ADOPTS the declared ranges into its ledger and RELEASES
+    # the rest once every live peer has declared (the ledger poll's
+    # cadence). Closure `deferred ≡ released + adopted + pending`, and
+    # pending → 0 within a renewal beat + the lease TTL + one poll — the
+    # bound on a fleet whose peers all live. Round 4's acceptance tape read
+    # 53 → 340 SET-and-unreferenced blocks per volume across two failovers.
+    local deferred released adopted pending beat_ms2
+    beat_ms2="$(stat_field 0 membership_renew_cadence_ms)"
+    if [ -n "$(joiner_idxs)" ]; then
+        beat_ms2="$(stat_field "$(joiner_idxs | head -1)" membership_renew_cadence_ms)"
+    fi
+    [ -n "$beat_ms2" ] && [ "$beat_ms2" != "0" ] || beat_ms2=10000
+    t0="$(date +%s)"
+    while :; do
+        pending="$(stat_field 0 data_alloc_bitmap_leaks_pending)"
+        [ "${pending:-0}" = "0" ] && break
+        [ $(($(date +%s) - t0)) -lt $((beat_ms2 / 1000 + ttl_ms / 1000 + 15)) ] ||
+            die "round $round: data_alloc_bitmap_leaks_pending=$pending on the successor $(($(date +%s) - t0)) s after its arm — the deferred leak release never converged (deferred=$(stat_field 0 data_alloc_bitmap_leaks_deferred) released=$(stat_field 0 data_alloc_bitmap_leaks_released) adopted=$(stat_field 0 data_alloc_bitmap_leaks_adopted); a live peer never declared its windows?)"
+        sleep 1
+    done
+    deferred="$(stat_field 0 data_alloc_bitmap_leaks_deferred)"
+    released="$(stat_field 0 data_alloc_bitmap_leaks_released)"
+    adopted="$(stat_field 0 data_alloc_bitmap_leaks_adopted)"
+    [ "$((released + adopted))" = "$deferred" ] ||
+        die "round $round: deferred-leak closure broken on the successor: deferred=$deferred != released=$released + adopted=$adopted (pending 0)"
+    log "round $round: the dead incarnation's deferred bitmap leaks converged on the successor (deferred=$deferred = released $released + adopted $adopted, pending 0 after $(($(date +%s) - t0)) s)"
+}
+
+# PR 12b review round 2, Issue 26 — the READER across a manager failover,
+# asserted BEFORE the round's fsck: (1) it re-joins the successor as a
+# `member` WITHOUT a self-fence — a `-o ro` reader is a RAM-only member in
+# no claim set, so the successor's window never awaits it; its prior
+# lease re-asserts until the window's DEADLINE (the re-assertion half
+# survives the writers' early close), and `membership_self_fences` is
+# must-stay-0 on every member kind; (2) its fleet WORKER (KD-MW-16 — the
+# only member-side census venue on this fleet: joiners arm no worker)
+# re-enrolls at the SUCCESSOR's coordinator, so the fsck that follows
+# dispatches a member-side shard. The worker discovers the coordinator
+# off the heartbeat-fresh `client:` records, and the dead incarnations'
+# stay fresh for CLIENT_STALE_TTL (45 s) — the bound below is that TTL
+# plus the worker's retry grain and the wire's dial deadline.
+SYMC_SHARDS0=0
+SYMC_RSHARDS0=0
+SYMC_RSCOPED0=0
+sym_crash_reader_follows() { # round reader_idx
+    local round="$1" r="$2" ttl ttl_s renew_est v t0
+    ttl="$(stat_field 0 membership_lease_ttl_ms)"
+    ttl_s=$((ttl / 1000))
+    renew_est="$(owner_renew_est_s)"
+    # The successor's roster listing a READER is the witness that the
+    # reader's re-assertion LANDED (a member-side word would read `member`
+    # through the whole re-assert loop); the fence counter is cumulative,
+    # so a purge-then-fresh-join before the listing is caught too.
+    wait_stat_ge 0 membership_readers 1 $((ttl_s + 6 * renew_est + 90)) "round $round: the reader's re-assertion at the successor" >/dev/null
+    wait_stat_eq "$r" membership_mode member 30 "round $round: reader membership_mode"
+    v="$(stat_field "$r" membership_self_fences)"
+    [ "$v" = "0" ] ||
+        die "round $round: the reader m$r SELF-FENCED across the manager failover (membership_self_fences=$v) — its prior lease was refused at the successor (the re-assertion half closed with the writers' early close?)"
+    [ "$(stat_field "$r" membership_self_fenced)" = "False" ] || # python's rendering of the JSON bool
+        die "round $round: reader m$r membership_self_fenced=$(stat_field "$r" membership_self_fenced)"
+    [ "$(stat_field "$r" invariant_tripwires)" = "0" ] ||
+        die "round $round: reader m$r invariant_tripwires != 0 after the failover"
+    log "round $round: reader m$r followed the failover as a member without fencing (self_fences=0, reclaim_refusals=$(stat_field "$r" membership_reclaim_refusals))"
+    # The member-side census venue: the reader's worker enrolled at the
+    # successor. Snapshot the shard ledgers the post-fsck assert reads.
+    t0="$(date +%s)"
+    while :; do
+        v="$(stat_field 0 job_remote_workers)"
+        [ "${v:-0}" -ge 1 ] 2>/dev/null && break
+        [ $(($(date +%s) - t0)) -lt $((45 + 10 + 10 + 15)) ] ||
+            die "round $round: no fleet worker enrolled at the successor's coordinator $(($(date +%s) - t0)) s after its arm (job_remote_workers=$v) — the reader's worker never re-discovered the coordinator (its log: 'fleet worker: enrollment at')"
+        sleep 1
+    done
+    log "round $round: a member worker is enrolled at the successor (job_remote_workers=$v, waited $(($(date +%s) - t0)) s) — the fsck dispatches a member-side shard"
+    SYMC_SHARDS0="$(stat_field 0 job_fleet_shards_completed)"
+    SYMC_RSHARDS0="$(stat_field "$r" job_fleet_worker_shards)"
+    SYMC_RSCOPED0="$(stat_field "$r" fsck_c1_projection_slots_scoped)"
+}
+
+# After the round's fsck: a MEMBER-SIDE shard ran on the reader and walked
+# only what it may judge — a reader leases NO slot, so every slot tree is
+# a projection to it and `fsck_c1_projection_slots_scoped` grows by the
+# forest's slot-tree count (Issue 24: coverage incomplete, never a
+# finding; the fsck's `findings: 0` above is the coordinator's admitted
+# total, this member's included) — and the reader reads a joined writer's
+# POST-failover name through its per-holder token plane.
+sym_crash_reader_shard_asserts() { # round reader_idx
+    local round="$1" r="$2" v j t0
+    v="$(stat_field 0 job_fleet_shards_completed)"
+    [ "${v:-0}" -gt "${SYMC_SHARDS0:-0}" ] 2>/dev/null ||
+        die "round $round: job_fleet_shards_completed=$v (was $SYMC_SHARDS0) — the fsck completed no member-side shard although a worker was enrolled"
+    v="$(stat_field "$r" job_fleet_worker_shards)"
+    [ "${v:-0}" -gt "${SYMC_RSHARDS0:-0}" ] 2>/dev/null ||
+        die "round $round: reader m$r job_fleet_worker_shards=$v (was $SYMC_RSHARDS0) — its worker served no census shard"
+    v="$(stat_field "$r" fsck_c1_projection_slots_scoped)"
+    [ "${v:-0}" -gt "${SYMC_RSCOPED0:-0}" ] 2>/dev/null ||
+        die "round $round: reader m$r fsck_c1_projection_slots_scoped=$v (was $SYMC_RSCOPED0) — its census shard walked the projected slot trees as its own (Issue 24's class)"
+    log "round $round: member-side census shard on reader m$r (worker shards $SYMC_RSHARDS0 → $v; C1 scoped $SYMC_RSCOPED0 → $(stat_field "$r" fsck_c1_projection_slots_scoped) projected trees, findings admitted 0)"
+    for j in $(joiner_idxs); do
+        t0="$(date +%s)"
+        while :; do
+            [ "$(cat "$(mnt_of "$r")/after-failover-r$round-m$j/mark" 2>/dev/null)" = "r$round" ] && break
+            [ $(($(date +%s) - t0)) -lt 60 ] ||
+                die "round $round: the reader m$r does not read joined writer m$j's post-failover name 60 s after it landed"
+            sleep 1
+        done
+    done
+    log "round $round: reader m$r reads every joined writer's post-failover name"
 }
 
 # --- rung 9: the S8 rows ------------------------------------------------------

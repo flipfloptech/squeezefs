@@ -612,9 +612,11 @@
 
 set -euo pipefail
 # A `set -e` exit is never SILENT (PR 12b round 3: a `sym-storm` round
-# died between its fsck and its row with rc 1 and no line — a `.stats`
-# read inside a `$(stat_sum …)` assignment failed and the leg ended with
-# nothing naming it). Every non-zero exit names its line and command.
+# died between its fsck and its row with rc 1 and no line — the
+# "deleted stays deleted" arm's bare `timeout … stat`, whose EXPECTED
+# failure `set -e` took as the leg's). Every non-zero exit names its line
+# and command; `-E` carries the trap into the legs' functions.
+set -E
 trap 'rc=$?; [ "$rc" = "0" ] || echo "[mwmatrix] ERROR: exit $rc at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -3022,8 +3024,15 @@ $out"
         local reader_idx stale=0 src
         for idx in 0 "${joiners[@]}"; do
             for reader_idx in 0 "${joiners[@]}"; do
-                timeout 60 stat "$(mnt_of "$reader_idx")/storm-w$idx-r$round" >/dev/null 2>&1
-                src=$?
+                # The EXPECTED verdict is a failing `stat` (ENOENT): read
+                # its status inside the condition — a bare `timeout … stat`
+                # under `set -e` exited the leg silently right here (the
+                # round-3 re-runs' `rc 1` with no line after the fsck).
+                if timeout 60 stat "$(mnt_of "$reader_idx")/storm-w$idx-r$round" >/dev/null 2>&1; then
+                    src=0
+                else
+                    src=$?
+                fi
                 if [ "$src" = "124" ]; then
                     die "round $round: stat of removed storm-w$idx-r$round through m$reader_idx HUNG past 60 s — a parked lookup (m$reader_idx's log: fuse_op_watchdog_overdue)"
                 elif [ "$src" = "0" ]; then

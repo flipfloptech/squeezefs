@@ -60,6 +60,20 @@ pub struct BlockGrant {
     pub len: u32,
 }
 
+/// **A writer's declared window on one data volume** (symmetric PR 12b
+/// review round 2, Issue 25): the unconsumed ranges of the grants it holds,
+/// carried on its membership renewal every beat (`membership::window_decls`)
+/// — the holder's ONLY word on a window a predecessor's ledger granted
+/// (the ledger is RAM; it died with the predecessor). The holder ADOPTS a
+/// declared range whose bits are SET and no grant names into its ledger
+/// under the writer's name (revocable at its death, returnable at its
+/// leave), never the other way round: a wire word sets no bit.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WindowDecl {
+    pub vol_tag: u64,
+    pub ranges: Vec<BlockGrant>,
+}
+
 impl BlockGrant {
     /// One past the last granted block — the zombie floor.
     pub fn end(&self) -> u64 {

@@ -14712,6 +14712,16 @@ impl SqueezefsFilesystem {
                         "data_alloc_bitmap_leaks_deferred".into(),
                         load(&crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_DEFERRED),
                     );
+                    // Round 5 (Issue 25): the deferral's closure
+                    // `deferred ≡ released + adopted + pending`.
+                    metrics.insert(
+                        "data_alloc_bitmap_leaks_adopted".into(),
+                        load(&crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_ADOPTED),
+                    );
+                    metrics.insert(
+                        "data_alloc_bitmap_leaks_pending".into(),
+                        serde_json::json!(meta_kv::alloc_lease::leaks_pending_total()),
+                    );
                     // Review round 2 — appended at the END of the block:
                     // the death ledger's retry / retirement / quarantine
                     // faces (Issues 5, 9, 18) and fsck C6's bitmap-oracle

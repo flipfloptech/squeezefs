@@ -222,6 +222,13 @@ pub struct RenewFrame {
     pub epoch: u64,
     /// §6.8 item 3: the freed-offset epoch this member has passed.
     pub acked_free_epoch: u64,
+    /// Symmetric PR 12b (review round 2, Issue 25): the unconsumed ranges
+    /// of every ranged block grant this member holds, per data volume —
+    /// the allocation holder's word on a LIVE writer's window after a
+    /// failover (the predecessor's ledger died with it). Empty from a
+    /// member holding none. The program's unreleased wire: same-commit
+    /// fleets (KD-7), `CLUSTER_WIRE_SCHEMA` unchanged.
+    pub block_grant_windows: Vec<crate::block_grant::WindowDecl>,
 }
 
 /// `VERB_MEMBERSHIP_LEAVE` body.
@@ -338,11 +345,24 @@ impl RpcService for MembershipService {
                 let t0 = Instant::now();
                 let reply = match decode::<RenewFrame>(&req.body) {
                     Ok(r) => match self.owner.renew(&r.id, r.epoch, r.acked_free_epoch) {
-                        RenewOutcome::Renewed(grant) => RpcResponse {
-                            id: req.id,
-                            status: RPC_OK,
-                            body: encode(&grant).unwrap_or_default(),
-                        },
+                        RenewOutcome::Renewed(grant) => {
+                            // Issue 25: a LIVE member's declared windows
+                            // reach the allocation holdings this process
+                            // keeps (the owner IS volume 0's manager on
+                            // this rung) — adopted into their ledgers, the
+                            // deferred leak release re-judged. Sync, no
+                            // I/O: the convergence's directory read runs
+                            // off the renewal, on the ledger poll.
+                            crate::meta_backend::kv::alloc_lease::note_peer_windows(
+                                &r.id,
+                                &r.block_grant_windows,
+                            );
+                            RpcResponse {
+                                id: req.id,
+                                status: RPC_OK,
+                                body: encode(&grant).unwrap_or_default(),
+                            }
+                        }
                         RenewOutcome::UnknownLease { reason } => Self::refuse(
                             req.id,
                             RPC_MEMBERSHIP_UNKNOWN_LEASE,
@@ -708,6 +728,7 @@ impl MemberClient {
             id: self.id.clone(),
             epoch: self.session.epoch(),
             acked_free_epoch: self.session.acked_free_epoch(),
+            block_grant_windows: crate::membership::window_decls(),
         })?;
         let lane = renew_lane_enabled().then_some(&LEASE_IO);
         if lane.is_some() {

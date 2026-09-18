@@ -3283,6 +3283,12 @@ pub fn spawn_ledger_poll(routed: std::sync::Weak<RoutedMetaBackend>, tick_ms: u6
             if let Err(e) = recover_dead_appenders_set(&routed).await {
                 log::warn!("recovery: the ledger poll failed ({e}); next tick");
             }
+            // The deferred leak release's verdict rides the same cadence
+            // (PR 12b round 5, Issue 25): a dead peer's page left `Live`
+            // by the poll's recovery above, a live peer's declaration
+            // landed on its renewal since the last tick — either moves
+            // the pending set toward 0.
+            crate::meta_backend::kv::alloc_lease::converge_deferred_leaks().await;
         }
     });
 }

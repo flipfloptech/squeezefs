@@ -1929,6 +1929,9 @@ impl KvMetaBackend {
         // The carriage's member side is this set's: a grant adopted after
         // the leave carries nothing this mount may act on.
         crate::membership::uninstall_slot_carriage_sink();
+        // The window declaration too: a leaving member returns its
+        // remainders (`ReturnBlocks`), it declares none.
+        crate::membership::uninstall_window_decl_source();
         // The unclaimed remainder returns with the region.
         let returnable = {
             let mut g = region.grant();

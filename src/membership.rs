@@ -1384,6 +1384,39 @@ pub fn uninstall_slot_carriage_sink() {
     SLOT_CARRIAGE_SINK.store(None);
 }
 
+/// **The MEMBER's block-grant window declaration** (symmetric PR 12b
+/// review round 2, Issue 25): the unconsumed ranges of every ranged block
+/// grant this mount holds, per data volume — what its renewal carries to
+/// the S6 owner every beat, so an allocation holder that re-held a lease
+/// after its predecessor died (whose ledger — the grants' only record —
+/// died with it) learns within one beat which SET-but-unreferenced bits
+/// are a LIVE writer's window and which are nobody's. Installed by the
+/// joined allocation arm; a mount that holds no window (an unarmed
+/// member, a reader) declares nothing.
+pub type WindowDeclSource = Arc<dyn Fn() -> Vec<crate::block_grant::WindowDecl> + Send + Sync>;
+
+static WINDOW_DECL_SOURCE: once_cell::sync::Lazy<arc_swap::ArcSwapOption<WindowDeclSource>> =
+    once_cell::sync::Lazy::new(arc_swap::ArcSwapOption::empty);
+
+/// Install the member's window declaration source (the joined allocation
+/// arm; a re-install replaces).
+pub fn install_window_decl_source(src: WindowDeclSource) {
+    WINDOW_DECL_SOURCE.store(Some(Arc::new(src)));
+}
+
+/// Uninstall it (the leave / test teardown).
+pub fn uninstall_window_decl_source() {
+    WINDOW_DECL_SOURCE.store(None);
+}
+
+/// The windows this member declares on its renewal — empty with no
+/// source installed.
+pub fn window_decls() -> Vec<crate::block_grant::WindowDecl> {
+    WINDOW_DECL_SOURCE
+        .load_full()
+        .map_or_else(Vec::new, |s| s())
+}
+
 /// Hand a grant's slot words to the installed sink (a no-op with none,
 /// or with nothing carried).
 fn deliver_slot_carriage(grant: &Grant) {

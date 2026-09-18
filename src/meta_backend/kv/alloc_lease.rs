@@ -482,6 +482,37 @@ pub struct AllocHolding {
     /// Frees held past the routine bound — the ring's timeout path
     /// (`free_grace_timeout_deferrals`).
     pub timeout_deferrals: AtomicU64,
+    /// The (re-)hold's DEFERRED leak candidates and the peers whose word
+    /// decides them (symmetric PR 12b review round 2, Issue 25).
+    deferred: parking_lot::Mutex<DeferredLeaks>,
+}
+
+/// **The re-hold's deferred leak release** (symmetric PR 12b, review round
+/// 2 — Issue 25): a SET bit nothing references and no grant names is
+/// either a dead incarnation's remainder (the predecessor holder's own
+/// window, a dead writer's) or a LIVE writer's window the predecessor's
+/// RAM ledger granted and died with — indistinguishable from the bitmap
+/// alone. Round 1 deferred every such bit while any peer page was `Live`
+/// and released only at a peer-less re-hold: on a fleet that keeps writing
+/// the set grew ≈ G/2 blocks per writer per failover for ever (53 → 340 of
+/// 4,096 blocks per volume across two failovers in the acceptance tape).
+/// The release now CONVERGES: every live member DECLARES its windows on
+/// its renewal (`membership::window_decls` → `RenewFrame::block_grant_
+/// windows`, one beat); a declared range whose bits are pending is ADOPTED
+/// into the ledger under the writer's name (its death revokes it, its
+/// leave returns it — PR 8's arms); once every `Live` peer page's writer
+/// has declared — or its page is no longer `Live` (dead: recovered by the
+/// ledger poll) — what is still pending is provably nobody's and is
+/// released. Bounded by the renewal beat + the lease TTL + one poll.
+/// Closure: `deferred ≡ released + adopted + pending`.
+#[derive(Debug, Default)]
+struct DeferredLeaks {
+    /// Blocks awaiting a verdict.
+    pending: std::collections::BTreeSet<u64>,
+    /// Members (`node_{token:016x}.m{slot:08x}` — the ledger's writer
+    /// name and the membership id are one string) that have declared
+    /// since this holding armed.
+    declared: std::collections::BTreeSet<String>,
 }
 
 impl std::fmt::Debug for AllocHolding {
@@ -565,6 +596,127 @@ impl AllocHolding {
     /// stay SET for the quarantine).
     pub fn revoke_dead(&self, writer: &str) -> Vec<BlockGrant> {
         self.ledger.revoke_dead(writer)
+    }
+
+    /// The (re-)hold's leak candidates enter the deferral (Issue 25):
+    /// counted `data_alloc_bitmap_leaks_deferred`; the verdict is
+    /// [`Self::converge_deferred`]'s.
+    pub fn defer_leaks(&self, blocks: impl IntoIterator<Item = u64>) -> u64 {
+        let mut d = self.deferred.lock();
+        let before = d.pending.len();
+        d.pending.extend(blocks);
+        let added = (d.pending.len() - before) as u64;
+        crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_DEFERRED
+            .fetch_add(added, Ordering::Relaxed);
+        added
+    }
+
+    /// Blocks still awaiting a verdict (`data_alloc_bitmap_leaks_pending`).
+    pub fn leaks_pending(&self) -> u64 {
+        self.deferred.lock().pending.len() as u64
+    }
+
+    /// **A live writer DECLARED its windows** (its renewal's word): every
+    /// declared range whose blocks are pending is ADOPTED into the ledger
+    /// under the writer's name — the bits stay SET (they are its to mint),
+    /// its death revokes them, its leave returns them — and leaves the
+    /// pending set; a block that is not pending is not this holding's to
+    /// judge (already granted here, or referenced) and is left alone.
+    /// Counted `data_alloc_bitmap_leaks_adopted`. The writer joins the
+    /// declared set whatever it declared (an empty declaration is the word
+    /// "I hold no window here").
+    pub fn adopt_declared(&self, writer: &str, ranges: &[BlockGrant]) -> u64 {
+        let mut adopted = 0u64;
+        {
+            let mut d = self.deferred.lock();
+            for r in ranges {
+                // Adopt the pending sub-runs of the declared range.
+                let mut run_start: Option<u64> = None;
+                let flush = |d: &mut DeferredLeaks, start: u64, end: u64, adopted: &mut u64| {
+                    for b in start..end {
+                        d.pending.remove(&b);
+                    }
+                    let len = u32::try_from(end - start).unwrap_or(u32::MAX);
+                    self.ledger.adopt(writer, BlockGrant { start, len });
+                    *adopted += u64::from(len);
+                };
+                for b in r.start..r.end() {
+                    let pending = d.pending.contains(&b) && self.bitmap.is_set(b);
+                    match (pending, run_start) {
+                        (true, None) => run_start = Some(b),
+                        (false, Some(s)) => {
+                            flush(&mut d, s, b, &mut adopted);
+                            run_start = None;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(s) = run_start {
+                    flush(&mut d, s, r.end(), &mut adopted);
+                }
+            }
+            d.declared.insert(writer.to_string());
+        }
+        if adopted > 0 {
+            crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_ADOPTED
+                .fetch_add(adopted, Ordering::Relaxed);
+            log::info!(
+                "allocation holder: data volume {:#018x}: {adopted} deferred block(s) are writer \
+                 '{writer}''s declared window — adopted into the ledger \
+                 (data_alloc_bitmap_leaks_adopted)",
+                self.vol_tag
+            );
+        }
+        adopted
+    }
+
+    /// **The deferral's verdict** (Issue 25): with `live_peers` the
+    /// writers whose page on this holding's home volume is `Live` (not
+    /// this mount's own) — every one must have declared; a page no longer
+    /// `Live` is a dead writer's, recovered by the ledger poll, whose
+    /// remainder is nobody's — the pending blocks are released (the
+    /// terminal free's own path: bit CLEAR + delta, in order) and counted
+    /// `data_alloc_bitmap_leaks_released`. Returns the blocks released;
+    /// `None` while a live peer's word is still awaited.
+    pub fn converge_deferred(self: &Arc<Self>, live_peers: &[String]) -> Option<u64> {
+        let to_release: Vec<u64> = {
+            let mut d = self.deferred.lock();
+            if d.pending.is_empty() {
+                d.declared.clear();
+                return Some(0);
+            }
+            let awaiting: Vec<&String> = live_peers
+                .iter()
+                .filter(|p| !d.declared.contains(*p))
+                .collect();
+            if !awaiting.is_empty() {
+                log::debug!(
+                    "allocation holder: data volume {:#018x}: {} deferred block(s) await the \
+                     window declaration of {} live peer(s) ({:?})",
+                    self.vol_tag,
+                    d.pending.len(),
+                    awaiting.len(),
+                    awaiting
+                );
+                return None;
+            }
+            std::mem::take(&mut d.pending).into_iter().collect()
+        };
+        let mut released = 0u64;
+        for b in &to_release {
+            if self.note_finish_free(*b) {
+                released += 1;
+            }
+        }
+        crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_RELEASED
+            .fetch_add(released, Ordering::Relaxed);
+        log::warn!(
+            "allocation holder: data volume {:#018x}: {released} SET block(s) referenced by \
+             nothing, granted to nobody and claimed by no live writer's declared window — a \
+             dead incarnation's remainder — CLEARED (data_alloc_bitmap_leaks_released)",
+            self.vol_tag
+        );
+        Some(released)
     }
 
     /// Deltas queued and not yet journaled (the tests' witness that a
@@ -717,6 +869,56 @@ pub fn test_clear_holdings() {
 /// every unarmed mount (behind `holds_any`'s one acquire load).
 pub fn note_finish_free(vol_tag: u64, block: u64) -> bool {
     holding(vol_tag).is_some_and(|h| h.note_finish_free(block))
+}
+
+/// **A live member's renewal declared its windows** (Issue 25 — the S6
+/// owner's serve arm, one call per renewal; sync, no I/O): every holding
+/// this process keeps adopts the member's declared ranges on its volume
+/// and notes the member declared — for a holding the member named no
+/// window on, the word "none". The verdict (the directory's `Live` pages
+/// against the declared set) is the ledger poll's
+/// ([`converge_deferred_leaks`]) — never a device read on the heartbeat.
+pub fn note_peer_windows(member: &str, decls: &[crate::block_grant::WindowDecl]) {
+    if !holds_any() {
+        return;
+    }
+    for h in holdings() {
+        let ranges: Vec<BlockGrant> = decls
+            .iter()
+            .filter(|d| d.vol_tag == h.vol_tag)
+            .flat_map(|d| d.ranges.iter().copied())
+            .collect();
+        h.adopt_declared(member, &ranges);
+    }
+}
+
+/// **The deferred leak release's verdict, at the ledger poll's cadence**
+/// (Issue 25): for every holding with pending blocks, the `Live` peer
+/// pages of its home volume (not this mount's own) are the writers whose
+/// declaration is awaited — once every one has declared (or its page is no
+/// longer `Live`: dead, recovered), the pending blocks are released.
+/// Returns the blocks released across holdings.
+pub async fn converge_deferred_leaks() -> u64 {
+    let mut released = 0u64;
+    for h in holdings() {
+        if h.leaks_pending() == 0 {
+            continue;
+        }
+        let Some(home) = h.home.upgrade() else {
+            continue;
+        };
+        let live = live_peer_writers(&home).await;
+        if let Some(n) = h.converge_deferred(&live) {
+            released += n;
+        }
+    }
+    released
+}
+
+/// Σ pending deferred blocks over every holding
+/// (`data_alloc_bitmap_leaks_pending`).
+pub fn leaks_pending_total() -> u64 {
+    holdings().iter().map(|h| h.leaks_pending()).sum()
 }
 
 /// The Allocation-lease family's per-holding face.
@@ -1771,6 +1973,7 @@ impl KvMetaBackend {
             deltas_journaled: AtomicU64::new(0),
             deltas_deferred: AtomicU64::new(0),
             timeout_deferrals: AtomicU64::new(0),
+            deferred: parking_lot::Mutex::new(DeferredLeaks::default()),
         });
         Self::register_holding(&holding);
         holding
@@ -2831,33 +3034,38 @@ pub async fn arm_symmetric_allocation(
             .into_iter()
             .filter(|b| !(derived.is_set(*b) || durable.is_set(*b)) && !in_grant(*b))
             .collect();
-        if !leaks.is_empty() && live_peers > 0 {
-            crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_DEFERRED
-                .fetch_add(leaks.len() as u64, Ordering::Relaxed);
-            log::warn!(
-                "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): {} SET block(s) \
-                 referenced by nothing and granted to nobody, with {live_peers} other LIVE \
-                 appender(s) on the set — a live writer's window remainder reads exactly like a \
-                 dead incarnation's, so the release is DEFERRED to a re-hold with no live peer \
-                 (data_alloc_bitmap_leaks_deferred; fsck C6 names the candidates; first: {:?})",
-                alloc.volume_id(),
-                leaks.len(),
-                leaks.first()
-            );
-        } else if !leaks.is_empty() {
-            for b in &leaks {
-                holding.note_finish_free(*b);
+        // Every candidate enters the DEFERRAL (round 5, Issue 25 — the
+        // closure `deferred ≡ released + adopted + pending` is exact), and
+        // the verdict runs at once: with no live peer every block is
+        // released here (the round-1 shape verbatim); with live peers the
+        // release waits for their declared windows (one renewal beat) or
+        // their death (the ledger poll's recovery), never a peer-less
+        // re-hold. `live_peers` is the count the warning names; the
+        // verdict reads the writers.
+        if !leaks.is_empty() {
+            holding.defer_leaks(leaks.iter().copied());
+            let live = live_peer_writers(vol0).await;
+            match holding.converge_deferred(&live) {
+                Some(n) => log::warn!(
+                    "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): {n} SET \
+                     block(s) referenced by nothing and granted to nobody — a dead \
+                     incarnation's window remainder — CLEARED at the hold \
+                     (data_alloc_bitmap_leaks_released; first: {:?})",
+                    alloc.volume_id(),
+                    leaks.first()
+                ),
+                None => log::warn!(
+                    "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): {} SET \
+                     block(s) referenced by nothing and granted to nobody, with {live_peers} \
+                     other LIVE appender(s) on the set — a live writer's window remainder reads \
+                     exactly like a dead incarnation's, so the release waits for every live \
+                     peer's declared window (one renewal beat) or its death (data_alloc_bitmap_\
+                     leaks_pending; fsck C6 names the candidates meanwhile; first: {:?})",
+                    alloc.volume_id(),
+                    leaks.len(),
+                    leaks.first()
+                ),
             }
-            crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_RELEASED
-                .fetch_add(leaks.len() as u64, Ordering::Relaxed);
-            log::warn!(
-                "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): {} SET block(s) \
-                 referenced by nothing and granted to nobody — a dead incarnation's window \
-                 remainder — CLEARED at the hold (data_alloc_bitmap_leaks_released; first: {:?})",
-                alloc.volume_id(),
-                leaks.len(),
-                leaks.first()
-            );
         }
         // The bitmap IS the free list from here: the local list's blocks
         // read CLEAR in the bitmap and return through carves; the flat
@@ -2884,6 +3092,44 @@ pub async fn arm_symmetric_allocation(
         held += 1;
     }
     Ok(held)
+}
+
+/// The WRITERS (member ids — the ledger's writer names) whose appender
+/// page on `vol`'s directory is `Live` and not this mount's own: the
+/// peers whose window declaration the deferred leak release awaits
+/// (Issue 25). Empty when the directory is unreadable — the honest answer
+/// is then "nobody is known to hold a window", which releases; the shape
+/// has no peers by construction on an unarmed or one-writer set, and a
+/// readable directory is every armed volume's.
+async fn live_peer_writers(vol: &KvMetaBackend) -> Vec<String> {
+    let Some(own) = vol.appender_stats().map(|s| s.appender_id) else {
+        return Vec::new();
+    };
+    match super::appender::read_directory(vol.device_path(), vol.superblock()).await {
+        Ok(entries) => entries
+            .iter()
+            .filter(|e| e.appender_id != own)
+            .filter_map(|e| {
+                e.page
+                    .as_ref()
+                    .filter(|p| p.state == super::appender::AppenderState::Live)
+                    .map(|p| {
+                        crate::cowriter::node_member_id_of(
+                            p.identity.node_token,
+                            p.identity.mount_slot,
+                        )
+                    })
+            })
+            .collect(),
+        Err(e) => {
+            log::warn!(
+                "meta volume {}: the appender directory is unreadable at the deferred leak \
+                 verdict ({e}) — treating the set as peer-less",
+                vol.device_path().display()
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Appender pages of `vol`'s directory that are `Live` and not this
@@ -2974,7 +3220,59 @@ pub fn arm_joined_allocation(
             );
         }
     }
+    if armed > 0 {
+        // Issue 25: this member's renewal declares its window remainders
+        // every beat — the successor holder's only word on them.
+        crate::membership::install_window_decl_source(Arc::new(window_decls_of_allocators));
+    }
     armed
+}
+
+/// The joined member's window declaration (`membership::window_decls`'s
+/// source): every armed allocator's HELD blocks, per data volume — the
+/// unconsumed grant ranges AND the offsets minted but not yet published
+/// (`inflight_offsets`: a write between its mint and its layout commit
+/// holds a block that is neither in the window nor referenced, and a
+/// failover inside that window must not read it as nobody's). O(grants +
+/// in flight) off RAM, never a device read on the heartbeat.
+pub fn window_decls_of_allocators() -> Vec<crate::block_grant::WindowDecl> {
+    let mut out = Vec::new();
+    ALLOCATORS.iter_sync(|vol_tag, weak| {
+        if let Some(alloc) = weak.upgrade() {
+            let ranges = held_block_ranges(&alloc);
+            if !ranges.is_empty() {
+                out.push(crate::block_grant::WindowDecl {
+                    vol_tag: *vol_tag,
+                    ranges,
+                });
+            }
+        }
+        true
+    });
+    out
+}
+
+/// The blocks `alloc` HOLDS as a writer — its unconsumed grant ranges plus
+/// its in-flight (minted, unpublished) offsets as block indices — as
+/// coalesced ranges: what its renewal declares (Issue 25).
+pub fn held_block_ranges(
+    alloc: &crate::block_allocator::BlockAllocator,
+) -> Vec<crate::block_grant::BlockGrant> {
+    let chunk = alloc.chunk_size().max(1);
+    let mut blocks: std::collections::BTreeSet<u64> = alloc
+        .block_grant_unconsumed()
+        .iter()
+        .flat_map(|g| g.start..g.end())
+        .collect();
+    blocks.extend(alloc.inflight_offsets().into_iter().map(|off| off / chunk));
+    let mut out: Vec<crate::block_grant::BlockGrant> = Vec::new();
+    for b in blocks {
+        match out.last_mut() {
+            Some(last) if last.end() == b && last.len < u32::MAX => last.len += 1,
+            _ => out.push(crate::block_grant::BlockGrant { start: b, len: 1 }),
+        }
+    }
+    out
 }
 
 /// One data volume's acquire-and-hold ladder on the in-process manager.

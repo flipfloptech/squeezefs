@@ -986,14 +986,22 @@ pub static DATA_ALLOC_BITMAP_DRIFT: AtomicU64 = AtomicU64::new(0);
 /// arm, found by the `sym-crash` fleet leg's C6).
 pub static DATA_ALLOC_BITMAP_LEAKS_RELEASED: AtomicU64 = AtomicU64::new(0);
 
-/// `data_alloc_bitmap_leaks_deferred` — leak candidates the (re-)hold
-/// found while another appender of the set was LIVE and left SET (PR 12b:
-/// a live joiner's grant window is RAM at the joiner and reads exactly
-/// like a dead incarnation's remainder; clearing it re-carves blocks the
-/// joiner still mints from). Released by a later re-hold with no live
-/// peer; fsck C6's `fsck_alloc_bitmap_leak_candidates` names them until
-/// then.
+/// `data_alloc_bitmap_leaks_deferred` — every leak candidate the (re-)hold
+/// found (PR 12b: a live joiner's grant window is RAM at the joiner and
+/// reads exactly like a dead incarnation's remainder; clearing it re-carves
+/// blocks the joiner still mints from). Each converges (review round 2,
+/// Issue 25) to `released` (nobody's — the hold with no live peer, or once
+/// every live peer's declared window excluded it), `adopted` (a live
+/// writer's declared window — its grant now) or stays `pending` (awaiting
+/// a live peer's declaration, one renewal beat; its death, one poll):
+/// `deferred ≡ released + adopted + pending`. fsck C6's
+/// `fsck_alloc_bitmap_leak_candidates` names the pending until then.
 pub static DATA_ALLOC_BITMAP_LEAKS_DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+/// `data_alloc_bitmap_leaks_adopted` — deferred candidates a live writer's
+/// renewal DECLARED as its window remainder, adopted into the holder's
+/// ledger under its name (Issue 25).
+pub static DATA_ALLOC_BITMAP_LEAKS_ADOPTED: AtomicU64 = AtomicU64::new(0);
 
 /// Count a drift verdict's loss half on the process gauge; returns it.
 pub fn note_drift(report: &DriftReport) -> u64 {

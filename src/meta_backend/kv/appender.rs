@@ -1329,6 +1329,47 @@ pub fn screen_release_words(
     Ok(())
 }
 
+/// Screen one word of a wire `PublishRoots` (PR 12b round 4 — the
+/// overflow law's wire form) against the same bounds a release's words
+/// meet, MINUS the seq-floor clauses: a publication moves no floor (the
+/// lease's stays), only the root, the cursor and the extent count.
+/// `cursor` at least the grant's and inside the slot's namespace;
+/// `slot_tree_extents` inside the volume; `root` the recorded one
+/// verbatim, or a node-aligned heap address whose extent `grant` holds
+/// (the node at that address is the caller's second witness — I/O, so
+/// not here). Pure, allocation-free; fuzzed by `manager_call_frame`,
+/// mirrored in `decoder_property_tests`.
+pub fn screen_publish_root_words(
+    words: &crate::slot_lease_core::SlotWords,
+    bounds: &ReleaseWordBounds,
+    grant: &super::slot_state::ExtentGrantRecord,
+) -> Result<(), ReleaseWordRefusal> {
+    if words.cursor < bounds.cursor_recorded {
+        return Err(ReleaseWordRefusal::CursorBelowGrant {
+            cursor: words.cursor,
+            recorded: bounds.cursor_recorded,
+        });
+    }
+    if words.cursor > bounds.cursor_max {
+        return Err(ReleaseWordRefusal::CursorAboveNamespace {
+            cursor: words.cursor,
+            max: bounds.cursor_max,
+        });
+    }
+    if u64::from(words.extents) > bounds.total_extents {
+        return Err(ReleaseWordRefusal::ExtentsAboveVolume {
+            extents: words.extents,
+            total: bounds.total_extents,
+        });
+    }
+    if words.root != bounds.root_recorded
+        && !root_extent_of(words.root.0, bounds).is_some_and(|e| grant.contains(e))
+    {
+        return Err(ReleaseWordRefusal::RootOutsideGrant { addr: words.root.0 });
+    }
+    Ok(())
+}
+
 /// Why a RAM grant refuses to drop an extent for a return
 /// ([`RegionGrant::drop_returned`]): it holds a live image, or its free is
 /// still parked on the region's tail.

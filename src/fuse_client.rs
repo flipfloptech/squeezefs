@@ -14045,6 +14045,11 @@ impl SqueezefsFilesystem {
                 );
                 metrics.insert("slot_ships".into(), lease(&|s| s.ships));
                 metrics.insert("slot_lru_releases".into(), lease(&|s| s.lru_releases));
+                metrics.insert("slot_roots_shipped".into(), lease(&|s| s.roots_shipped));
+                metrics.insert(
+                    "slot_roots_published_for_lessees".into(),
+                    lease(&|s| s.roots_published_for_lessees),
+                );
                 metrics.insert("slot_forced_shrinks".into(), lease(&|s| s.forced_shrinks));
                 metrics.insert("slot_lease_conflicts".into(), lease(&|s| s.conflicts));
                 metrics.insert("slot_resolve_rpcs".into(), lease(&|s| s.resolve_rpcs));

@@ -310,12 +310,42 @@ pub enum ManagerCall {
     /// while the manager's is exact. One `u32` word, one table lookup;
     /// `Endpoint { endpoint: None }` for a holder that has not published.
     ResolveEndpoint { appender_id: u32 },
+    /// **`PublishRoots`** (PR 12b round 4 — the WIRE form of PR 4's
+    /// page-budget overflow law): a wire lessee holding more slots than
+    /// its page names (`SLOT_PAGE_BUDGET`) has roots with no durable home
+    /// — an unpublished root is a floor on its ring's tail, and a lessee
+    /// that first-touched 64 unleased slots inside one `T_idle` wedged
+    /// its ring and fail-stopped the volume. Its checkpoint ships the
+    /// roots its page cannot hold (the manager's own overflow selection,
+    /// `region_page_overflow`); the manager rewrites tree 0's `Leased`
+    /// records with them under ONE entry (the lease itself untouched —
+    /// lessee, `g`, seq floor kept), every word screened against the
+    /// caller's leased set at its `g`, its grant and the node at the
+    /// address; idempotent against tree 0's current words
+    /// (`RootsPublished { already }`). The lessee lifts the floors at
+    /// the reply — the entry is durable before the manager answers.
+    PublishRoots {
+        appender_id: u32,
+        roots: Vec<WireSlotRoot>,
+    },
 }
 
 /// PR 12b's documented verb codes (the wire encodes the declaration index).
 pub const VERB_CODE_LEAVE_APPENDER: u8 = 0xB0;
 pub const VERB_CODE_PUBLISH_ENDPOINT: u8 = 0xB1;
 pub const VERB_CODE_RESOLVE_ENDPOINT: u8 = 0xB2;
+pub const VERB_CODE_PUBLISH_ROOTS: u8 = 0xB3;
+
+/// One published root on the wire (`PublishRoots`): the routing slot,
+/// the lease generation the lessee holds it at, and the tree's words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireSlotRoot {
+    pub slot: u16,
+    pub g: u32,
+    pub root: (u64, u64),
+    pub cursor: u64,
+    pub slot_tree_extents: u32,
+}
 
 /// PR 8's documented verb codes (the range the level-4 coordination
 /// assigned; the wire encodes the enum's declaration index — these are the
@@ -400,6 +430,7 @@ impl ManagerCall {
             Self::LeaveAppender { .. } => "leave_appender",
             Self::PublishEndpoint { .. } => "publish_endpoint",
             Self::ResolveEndpoint { .. } => "resolve_endpoint",
+            Self::PublishRoots { .. } => "publish_roots",
         }
     }
 }
@@ -558,6 +589,12 @@ pub enum ManagerReply {
     /// `None` (it has not published).
     Endpoint {
         endpoint: Option<String>,
+    },
+    /// `PublishRoots` (PR 12b round 4): `published` records rewritten in
+    /// tree 0, `already` words tree 0 held verbatim (a replay's).
+    RootsPublished {
+        published: u32,
+        already: u32,
     },
 }
 
@@ -1178,6 +1215,14 @@ impl ManagerService {
                         .manager_resolve_endpoint(*appender_id)
                         .await
                         .map(|endpoint| ManagerReply::Endpoint { endpoint }),
+                    ManagerCall::PublishRoots { appender_id, roots } => self
+                        .volume
+                        .manager_publish_roots_wire(*appender_id, roots)
+                        .await
+                        .map(|(published, already)| ManagerReply::RootsPublished {
+                            published,
+                            already,
+                        }),
                 }
             };
         let (reply, status) = match served {
@@ -1575,6 +1620,24 @@ impl ManagerClient {
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "ReleaseSlot answered {other:?}"
+            ))),
+        }
+    }
+
+    /// `PublishRoots` (PR 12b round 4): `(published, already)`.
+    pub async fn publish_roots(
+        &mut self,
+        appender_id: u32,
+        roots: Vec<WireSlotRoot>,
+    ) -> Result<(u32, u32)> {
+        match self
+            .call(ManagerCall::PublishRoots { appender_id, roots })
+            .await?
+        {
+            ManagerReply::RootsPublished { published, already } => Ok((published, already)),
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Err(SqueezefsError::InvalidOperation(format!(
+                "PublishRoots answered {other:?}"
             ))),
         }
     }

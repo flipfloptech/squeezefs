@@ -72,7 +72,7 @@ use squeezefs::meta_ship::manager::{
     decode_reply as decode_manager_reply, decode_request as decode_manager_request,
     encode_reply as encode_manager_reply, encode_request as encode_manager_request, ManagerCall,
     ManagerReply, ManagerReplyFrame, ManagerRequestFrame, WireIdentity, WireSlotGrant,
-    WireSlotWords, MANAGER_SCHEMA,
+    WireSlotRoot, WireSlotWords, MANAGER_SCHEMA,
 };
 use squeezefs::meta_ship::publish::{
     decode_reply_frame, decode_request_frame, encode_reply_frame, encode_request_frame,
@@ -1196,6 +1196,79 @@ proptest! {
         );
     }
 
+    /// Symmetric PR 12b round 4 — the page-budget overflow law's WIRE form:
+    /// a `PublishRoots` word is screened like a release's words MINUS the
+    /// seq-floor clauses (a publication moves no floor — the lease's
+    /// stays): `cursor` at least the grant's and inside the namespace,
+    /// `slot_tree_extents` inside the volume, `root` the recorded one or a
+    /// node-aligned heap address inside the caller's grant; the verdict is
+    /// exactly the predicate, every refusal names its class, and the
+    /// lease's own floor — a release refusal — is no publication clause
+    /// (the fuzz target `manager_call_frame`'s arm, on stable).
+    #[test]
+    fn manager_published_roots_are_screened_before_tree_zero_moves(
+        root_addr in any::<u64>(),
+        root_seq in any::<u64>(),
+        cursor in any::<u64>(),
+        extents in any::<u32>(),
+        recorded_floor in 0u64..(1 << 40),
+        node_shift in 0u32..7,
+        cursor_recorded in 0u64..=(1 << 40),
+        total in 1u64..(1 << 20),
+        grant_seed in prop::collection::vec(0u64..(1 << 20), 0..32),
+        recorded_extent in 0u64..(1 << 20),
+        recorded_seq in any::<u64>(),
+        use_recorded_root in any::<bool>(),
+    ) {
+        use squeezefs::meta_backend::kv::appender::{
+            root_extent_of, screen_publish_root_words, screen_release_words, ReleaseWordBounds,
+            SEQ_FRONTIER_SANE_MAX,
+        };
+        use squeezefs::meta_backend::kv::slot_state::ExtentGrantRecord;
+        use squeezefs::slot_lease_core::SlotWords;
+        let node = 4096u64 << node_shift;
+        let heap = 1u64 << 20;
+        let grant = ExtentGrantRecord::from_extents(grant_seed.iter().map(|e| e % total));
+        let bounds = ReleaseWordBounds {
+            seq_floor_recorded: recorded_floor,
+            seq_floor_max: SEQ_FRONTIER_SANE_MAX,
+            cursor_recorded,
+            cursor_max: 1 << 40,
+            root_recorded: (heap + node * (recorded_extent % total), recorded_seq),
+            heap_base: heap,
+            node_size: node,
+            total_extents: total,
+        };
+        let words = SlotWords {
+            root: if use_recorded_root { bounds.root_recorded } else { (root_addr, root_seq) },
+            cursor,
+            extents,
+            seq_floor: recorded_floor,
+        };
+        let root_ok = words.root == bounds.root_recorded
+            || root_extent_of(words.root.0, &bounds).is_some_and(|e| grant.contains(e));
+        let inside = words.cursor >= bounds.cursor_recorded
+            && words.cursor <= bounds.cursor_max
+            && u64::from(words.extents) <= bounds.total_extents
+            && root_ok;
+        let verdict = screen_publish_root_words(&words, &bounds, &grant);
+        prop_assert_eq!(verdict.is_ok(), inside, "{:?} against {:?} → {:?}", words, bounds, verdict);
+        if let Err(e) = verdict {
+            prop_assert!(!e.to_string().is_empty());
+        }
+        // The lease's own floor is a RELEASE refusal and no publication
+        // clause: the same words fail the release screen on it.
+        prop_assert!(screen_release_words(&words, &bounds, &grant).is_err());
+        // The legitimate shape passes: the grant's words verbatim.
+        let legit = SlotWords {
+            root: bounds.root_recorded,
+            cursor: cursor_recorded,
+            extents: 0,
+            seq_floor: recorded_floor,
+        };
+        prop_assert_eq!(screen_publish_root_words(&legit, &bounds, &grant), Ok(()));
+    }
+
     /// Symmetric PR 6 (review round 1, Issue 3): the two lock verbs' wire
     /// screen is total and admits exactly volume 0 + a Live non-own id +
     /// the holder for an unlock (the fuzz target `manager_call_frame`'s
@@ -1803,6 +1876,29 @@ fn arb_pr8_call() -> impl Strategy<Value = ManagerCall> {
                 }
             }),
         any::<u32>().prop_map(|appender_id| ManagerCall::ResolveEndpoint { appender_id }),
+        (
+            any::<u32>(),
+            prop::collection::vec(
+                (
+                    any::<u16>(),
+                    any::<u32>(),
+                    (any::<u64>(), any::<u64>()),
+                    any::<u64>(),
+                    any::<u32>(),
+                )
+                    .prop_map(|(slot, g, root, cursor, slot_tree_extents)| {
+                        WireSlotRoot {
+                            slot,
+                            g,
+                            root,
+                            cursor,
+                            slot_tree_extents,
+                        }
+                    }),
+                0..8,
+            ),
+        )
+            .prop_map(|(appender_id, roots)| ManagerCall::PublishRoots { appender_id, roots }),
     ]
 }
 
@@ -1905,6 +2001,9 @@ fn arb_pr8_reply() -> impl Strategy<Value = ManagerReply> {
         any::<bool>().prop_map(|already| ManagerReply::Published { already }),
         proptest::option::of("[ -~]{0,64}")
             .prop_map(|endpoint| ManagerReply::Endpoint { endpoint }),
+        (any::<u32>(), any::<u32>()).prop_map(|(published, already)| {
+            ManagerReply::RootsPublished { published, already }
+        }),
     ]
 }
 

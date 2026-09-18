@@ -305,6 +305,13 @@ pub struct SlotLeasePlane {
     pub forced_shrinks: AtomicU64,
     pub conflicts: AtomicU64,
     pub resolve_rpcs: AtomicU64,
+    /// PR 12b round 4 — the page-budget overflow law's WIRE form: roots a
+    /// wire lessee's checkpoint shipped as `PublishRoots` because its page
+    /// could not hold them (`slot_roots_shipped`, the lessee's face) and
+    /// roots this manager wrote into tree 0 for its wire lessees
+    /// (`slot_roots_published_for_lessees`, the manager's face).
+    pub roots_shipped: AtomicU64,
+    pub roots_published_for_lessees: AtomicU64,
     pub affinity_mints: AtomicU64,
     pub rotor_mints: AtomicU64,
     /// Gather-mode mints (design §5.7.5, PR 7): a child minted into its
@@ -423,6 +430,8 @@ impl SlotLeasePlane {
             forced_shrinks: AtomicU64::new(0),
             conflicts: AtomicU64::new(0),
             resolve_rpcs: AtomicU64::new(0),
+            roots_shipped: AtomicU64::new(0),
+            roots_published_for_lessees: AtomicU64::new(0),
             affinity_mints: AtomicU64::new(0),
             rotor_mints: AtomicU64::new(0),
             dir_gather_mints: AtomicU64::new(0),
@@ -613,6 +622,8 @@ impl SlotLeasePlane {
             forced_shrinks: self.forced_shrinks.load(Relaxed),
             conflicts: self.conflicts.load(Relaxed),
             resolve_rpcs: self.resolve_rpcs.load(Relaxed),
+            roots_shipped: self.roots_shipped.load(Relaxed),
+            roots_published_for_lessees: self.roots_published_for_lessees.load(Relaxed),
             tree_inos_p50: percentile(&inos, 50),
             tree_inos_p99: percentile(&inos, 99),
             tree_inos_max: inos.iter().copied().max().unwrap_or(0),
@@ -868,6 +879,10 @@ pub struct SlotLeaseStats {
     pub forced_shrinks: u64,
     /// **Must-stay-0**: two live attestations of one slot (C14's live face).
     pub conflicts: u64,
+    /// The overflow law's wire form (PR 12b round 4): roots shipped as
+    /// `PublishRoots` by this lessee / written into tree 0 by this manager.
+    pub roots_shipped: u64,
+    pub roots_published_for_lessees: u64,
     /// `ResolveSlot` verbs served (the wire's stale-view fallback; 0 on a
     /// solo mount — the warm path is the holder cache).
     pub resolve_rpcs: u64,

@@ -3131,6 +3131,22 @@ impl KvMetaBackend {
         self.appenders.as_ref()
     }
 
+    /// The ring window `(head, reusable_upto)` of in-process region
+    /// `appender_id` (a joined appender's own region, a declared one) —
+    /// the contracts' drain oracle: `head == reusable_upto` is a covered
+    /// ring, a gap that survives cycles is a pinned tail. `None` for the
+    /// manager's own ring or an unknown region.
+    pub fn region_ring_window(&self, appender_id: u32) -> Option<(u64, u64)> {
+        let set = self.appenders.as_ref()?;
+        if appender_id == 0 {
+            return None;
+        }
+        let r = set.region(appender_id)?;
+        let ring = r.ring();
+        let core = ring.core();
+        Some((core.head(), core.reusable_upto()))
+    }
+
     /// The UNCLAIMED extents of in-process region `appender_id`'s RAM
     /// grant (the contracts' way to drain a grant through
     /// `ReturnExtents`); empty for the manager or an unknown region.
@@ -6332,6 +6348,211 @@ impl KvMetaBackend {
             .await
     }
 
+    /// **`PublishRoots` served** (PR 12b round 4 — the wire form of the
+    /// page-budget overflow law, `publish_forest_roots`'s in-process arm):
+    /// a wire lessee's checkpoint names the roots its page cannot hold;
+    /// each word is screened against the lease it claims (held by the
+    /// caller at that `g` — the wire-word law: every root validated
+    /// against the caller's leased set and its grant BEFORE tree 0
+    /// moves; a moved root's node is the second witness, as a release's),
+    /// tree 0's `Leased` record is rewritten with the root, cursor and
+    /// extent count (lessee, `g`, page address and seq floor kept — the
+    /// lease itself untouched) under ONE control entry, durable before
+    /// the reply; a word tree 0 already holds verbatim is `already`. The
+    /// RAM lease table follows the record so a later handover or recovery
+    /// reads the published words. Answers `(published, already)`.
+    pub async fn manager_publish_roots_wire(
+        &self,
+        appender_id: u32,
+        roots: &[crate::meta_ship::manager::WireSlotRoot],
+    ) -> std::result::Result<(u32, u32), KvError> {
+        use super::appender::{screen_publish_root_words, ReleaseWordBounds};
+        let set = self.manager_gate(false)?;
+        let _page = self
+            .wire_appender_page(set, appender_id, "PublishRoots")
+            .await?;
+        let plane = Arc::clone(set.slot_leases().ok_or_else(|| {
+            KvError::Busy(format!(
+                "{}: the symmetric plane is not armed — no slot lease exists",
+                self.path.display()
+            ))
+        })?);
+        let reject = |why: String| {
+            set.verbs.rejected.fetch_add(1, Ordering::Relaxed);
+            KvError::Rejected(format!(
+                "{}: PublishRoots from appender {appender_id} rejected — {why} \
+                 (manager_verb_rejected)",
+                self.path.display()
+            ))
+        };
+        if roots.is_empty() {
+            return Ok((0, 0));
+        }
+        let cfg = self.cache.config();
+        let grant = self.extent_grant_record(appender_id).await?;
+        let forest = self.forest().ok_or_else(|| {
+            KvError::Corrupt(format!("{}: not a forest volume", self.path.display()))
+        })?;
+        let page_addr = self.page_addr_of(appender_id).await?;
+        let tag = super::journal::tag_for(super::record::TREE_CONTROL, 0);
+        // Screened and staged FIRST (nothing written on any rejection);
+        // one node read per moved root — the second witness.
+        let mut staged: Vec<(super::record::ForestSlot, crate::slot_lease_core::SlotLease)> =
+            Vec::with_capacity(roots.len());
+        let mut recs: Vec<(u8, Record)> = Vec::with_capacity(roots.len());
+        let mut already = 0u32;
+        let mut seen = std::collections::BTreeSet::new();
+        for w in roots {
+            let fslot = self.forest_slot_of_routing(w.slot);
+            if !seen.insert(fslot) {
+                return Err(reject(format!("slot {fslot} named twice in one frame")));
+            }
+            let Some(lease) = plane.table.get(fslot).filter(|l| {
+                l.holder == appender_id
+                    && l.g == w.g
+                    && l.state != crate::slot_lease_core::LeaseState::Unleased
+            }) else {
+                return Err(reject(format!(
+                    "slot {fslot} is not leased to appender {appender_id} at g {}",
+                    w.g
+                )));
+            };
+            let words = crate::slot_lease_core::SlotWords {
+                root: w.root,
+                cursor: w.cursor,
+                extents: w.slot_tree_extents,
+                seq_floor: lease.words.seq_floor,
+            };
+            let bounds = ReleaseWordBounds {
+                seq_floor_recorded: lease.words.seq_floor,
+                seq_floor_max: super::appender::SEQ_FRONTIER_SANE_MAX,
+                cursor_recorded: lease.words.cursor,
+                cursor_max: crate::meta_backend::GUEST_NS_BASE,
+                root_recorded: lease.words.root,
+                heap_base: cfg.heap_base,
+                node_size: cfg.layout.node_size() as u64,
+                total_extents: self.alloc.total_extents(),
+            };
+            if let Err(e) = screen_publish_root_words(&words, &bounds, &grant) {
+                return Err(reject(format!("slot {fslot}: {e}")));
+            }
+            if words.root != lease.words.root && words.root.0 != 0 {
+                let node =
+                    match super::node::load_node(&self.path, &cfg.layout, words.root.0, 0).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            return Err(reject(format!(
+                                "slot {fslot}: root {:#x} holds no readable node: {e}",
+                                words.root.0
+                            )));
+                        }
+                    };
+                let h = node.header();
+                if h.node_seq != words.root.1 || h.tree_id != 0 {
+                    return Err(reject(format!(
+                        "slot {fslot}: root {:#x} holds a node stamped seq {} (tree id {}), not \
+                         the word's seq {}",
+                        words.root.0, h.node_seq, h.tree_id, words.root.1
+                    )));
+                }
+                if let Some(named) = Self::node_records_slot(&node) {
+                    if named != fslot {
+                        return Err(reject(format!(
+                            "slot {fslot}: root {:#x} holds slot {named}'s records",
+                            words.root.0
+                        )));
+                    }
+                }
+            }
+            // Idempotent against tree 0's current words.
+            let current = forest
+                .control()
+                .lookup(&super::slot_state::slot_state_key(fslot))
+                .await?
+                .map(|v| super::slot_state::SlotState::decode(&v))
+                .transpose()?;
+            if let Some(super::slot_state::SlotState::Leased {
+                appender_id: rec_id,
+                g,
+                root,
+                cursor,
+                slot_tree_extents,
+                ..
+            }) = current
+            {
+                if rec_id == appender_id
+                    && g == w.g
+                    && (root.addr, root.seq) == words.root
+                    && cursor == words.cursor
+                    && slot_tree_extents == words.extents
+                {
+                    already += 1;
+                    continue;
+                }
+            }
+            let value = super::slot_state::SlotState::Leased {
+                appender_id,
+                g: lease.g,
+                page_addr,
+                root: RootPtr {
+                    addr: words.root.0,
+                    seq: words.root.1,
+                },
+                cursor: words.cursor,
+                slot_tree_extents: words.extents,
+                seq_floor: lease.words.seq_floor,
+            }
+            .encode();
+            recs.push((
+                tag,
+                Record::put(super::slot_state::slot_state_key(fslot), 0, value),
+            ));
+            let mut published = lease;
+            published.words = words;
+            staged.push((fslot, published));
+        }
+        if recs.is_empty() {
+            return Ok((0, already));
+        }
+        // The door law: the ring admission PARKING before the verb mutex.
+        let adm = self.pre_admit_control_parking(&recs).await?;
+        let _g = self.manager_verbs.lock().await;
+        // Re-validated under the mutex: a lease that moved meanwhile (a
+        // release, a recovery) makes the frame stale — refused whole, the
+        // caller's next cycle re-reads its leases.
+        let moved = staged.iter().find(|(fslot, lease)| {
+            !plane.table.get(*fslot).is_some_and(|l| {
+                l.holder == appender_id
+                    && l.g == lease.g
+                    && l.state != crate::slot_lease_core::LeaseState::Unleased
+            })
+        });
+        if let Some((fslot, _)) = moved {
+            if let EntryAdmission::Held(a) = adm {
+                self.ring.core().release(a);
+            }
+            return Err(KvError::Busy(format!(
+                "{}: PublishRoots — slot {fslot}'s lease moved under the frame; retry",
+                self.path.display()
+            )));
+        }
+        self.write_control_entry(recs, adm).await?;
+        set.verbs.verbs.fetch_add(1, Ordering::Relaxed);
+        for (fslot, lease) in staged.iter() {
+            plane.table.load(*fslot, *lease);
+        }
+        plane
+            .roots_published_for_lessees
+            .fetch_add(staged.len() as u64, Ordering::Relaxed);
+        log::debug!(
+            "meta volume {}: PublishRoots — {} root(s) of appender {appender_id} written into \
+             tree 0 ({already} already)",
+            self.path.display(),
+            staged.len()
+        );
+        Ok((staged.len() as u32, already))
+    }
+
     /// `ResolveSlot` (§5.1.6): the holder of `slot` as the manager's
     /// table records it.
     pub fn manager_resolve_slot(
@@ -8207,9 +8428,28 @@ impl KvMetaBackend {
             return Ok(remainder);
         }
         // The extents leave this mount's custody: whatever this mount once
-        // retired there, the grantee's node is what stands next.
+        // retired there, the grantee's node is what stands next — and
+        // whatever image this mount CACHED there is stale from here (PR 12b
+        // round 4: a lessee's retired root extent returned, was re-granted
+        // and re-written by another of its slots while the manager kept the
+        // old slot's image; the recovery of that lessee read the stale
+        // image under the new pointer — `recovered root pointer stale`).
+        // A grant to an IN-PROCESS region shares this cache and its images
+        // are its own: the barrier is the WIRE lessee's.
         for e in &claimed {
             self.cache.unretire_extent(*e);
+        }
+        if set.region(appender_id).is_none() {
+            let dropped = self
+                .cache
+                .drop_nodes_in_extents(self.sb.heap.start, &claimed)?;
+            if dropped > 0 {
+                log::debug!(
+                    "meta volume {}: ExtentGrant to wire appender {appender_id} dropped {dropped} \
+                     stale cached image(s) inside the granted extents",
+                    self.path.display()
+                );
+            }
         }
         let runs = super::slot_state::ExtentGrantRecord::from_extents(claimed.iter().copied()).runs;
         let mut recs: Vec<(u8, Record)> = claimed

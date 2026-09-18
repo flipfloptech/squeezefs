@@ -48,8 +48,8 @@ use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use squeezefs::meta_backend::kv::appender::{
     clamp_grant_want, coalesce_runs, intersect_coalesced_with_record, release_seq_floor_bound,
-    root_extent_of, runs_extent_count, screen_release_words, validate_return_runs, GrantRun,
-    ReleaseWordBounds, SEQ_FRONTIER_SANE_MAX,
+    root_extent_of, runs_extent_count, screen_publish_root_words, screen_release_words,
+    validate_return_runs, GrantRun, ReleaseWordBounds, SEQ_FRONTIER_SANE_MAX,
 };
 use squeezefs::meta_backend::kv::slot_state::{
     ExtentGrantRecord, SlotState, SlotTails, SlotTailsRecord, TAILS_SPILLED,
@@ -57,8 +57,8 @@ use squeezefs::meta_backend::kv::slot_state::{
 use squeezefs::meta_backend::kv::tree::RootPtr;
 use squeezefs::meta_ship::manager::{
     decode_reply, decode_request, encode_reply, encode_request, ManagerCall, ManagerReply,
-    ManagerReplyFrame, ManagerRequestFrame, WireIdentity, WireSlotGrant, WireSlotWords,
-    MANAGER_SCHEMA,
+    ManagerReplyFrame, ManagerRequestFrame, WireIdentity, WireSlotGrant, WireSlotRoot,
+    WireSlotWords, MANAGER_SCHEMA,
 };
 
 /// Arm 3: the service-edge law over a decoded call's integers. `record`
@@ -218,6 +218,56 @@ fn check_service_edge(call: &ManagerCall, total_extents: u64, record_seed: &[u8]
         // PR 6: the lock verbs carry one appender id and nothing the
         // durable state bounds an allocation by.
         ManagerCall::DirRenameLock { .. } | ManagerCall::DirRenameUnlock { .. } => {}
+        // PR 12b round 4: the overflow law's wire form — every published
+        // root's words screened like a release's MINUS the seq-floor
+        // clauses (a publication moves no floor): the verdict is exactly
+        // the predicate, every refusal names its class.
+        ManagerCall::PublishRoots { roots, .. } => {
+            let seed = |i: usize| u64::from(record_seed.get(i).copied().unwrap_or(0));
+            let node = 4096u64 << (seed(0) % 7);
+            let bounds = ReleaseWordBounds {
+                seq_floor_recorded: seed(1) * 64,
+                seq_floor_max: SEQ_FRONTIER_SANE_MAX,
+                cursor_recorded: seed(6),
+                cursor_max: 1 << 40,
+                root_recorded: ((1 << 20) + node * (seed(7) % total_extents.max(1)), seed(8)),
+                heap_base: 1 << 20,
+                node_size: node,
+                total_extents,
+            };
+            for w in roots {
+                let words = squeezefs::slot_lease_core::SlotWords {
+                    root: w.root,
+                    cursor: w.cursor,
+                    extents: w.slot_tree_extents,
+                    seq_floor: bounds.seq_floor_recorded,
+                };
+                let root_ok = words.root == bounds.root_recorded
+                    || root_extent_of(words.root.0, &bounds).is_some_and(|e| record.contains(e));
+                let inside = words.cursor >= bounds.cursor_recorded
+                    && words.cursor <= bounds.cursor_max
+                    && u64::from(words.extents) <= bounds.total_extents
+                    && root_ok;
+                let verdict = screen_publish_root_words(&words, &bounds, &record);
+                assert_eq!(
+                    verdict.is_ok(),
+                    inside,
+                    "the publish screen's verdict is the predicate: {words:?} against {bounds:?} \
+                     → {verdict:?}"
+                );
+                if let Err(e) = verdict {
+                    assert!(!e.to_string().is_empty(), "every refusal names its class");
+                }
+                // The seq-floor word is the lease's — never a clause here:
+                // the release screen refuses the SAME words on it while
+                // the publish screen passes them.
+                assert_eq!(
+                    screen_release_words(&words, &bounds, &record).is_ok(),
+                    false,
+                    "a floor equal to the recorded one is a release refusal, not a publication's"
+                );
+            }
+        }
         // PR 8's arm (its own fn — the level-4 rule): the block-grant and
         // allocation-lease integers' bounded execution.
         pr8 => check_pr8_edge(pr8, total_extents),
@@ -619,6 +669,31 @@ enum ArbCall {
     ResolveEndpoint {
         appender_id: u32,
     },
+    PublishRoots {
+        appender_id: u32,
+        roots: Vec<ArbRoot>,
+    },
+}
+
+#[derive(Arbitrary, Debug, Clone, Copy)]
+struct ArbRoot {
+    slot: u16,
+    g: u32,
+    root: (u64, u64),
+    cursor: u64,
+    slot_tree_extents: u32,
+}
+
+impl From<ArbRoot> for WireSlotRoot {
+    fn from(r: ArbRoot) -> Self {
+        Self {
+            slot: r.slot,
+            g: r.g,
+            root: r.root,
+            cursor: r.cursor,
+            slot_tree_extents: r.slot_tree_extents,
+        }
+    }
 }
 
 #[derive(Arbitrary, Debug, Clone, Copy)]
@@ -811,6 +886,10 @@ impl From<ArbCall> for ManagerCall {
             ArbCall::ResolveEndpoint { appender_id } => {
                 ManagerCall::ResolveEndpoint { appender_id }
             }
+            ArbCall::PublishRoots { appender_id, roots } => ManagerCall::PublishRoots {
+                appender_id,
+                roots: roots.into_iter().map(Into::into).collect(),
+            },
         }
     }
 }
@@ -907,6 +986,10 @@ enum ArbReply {
     Endpoint {
         endpoint: Option<String>,
     },
+    RootsPublished {
+        published: u32,
+        already: u32,
+    },
 }
 
 impl From<ArbReply> for ManagerReply {
@@ -976,6 +1059,9 @@ impl From<ArbReply> for ManagerReply {
             ArbReply::Left { already } => ManagerReply::Left { already },
             ArbReply::Published { already } => ManagerReply::Published { already },
             ArbReply::Endpoint { endpoint } => ManagerReply::Endpoint { endpoint },
+            ArbReply::RootsPublished { published, already } => {
+                ManagerReply::RootsPublished { published, already }
+            }
         }
     }
 }

@@ -878,7 +878,22 @@ impl KvTree {
     /// handle is raised to the root's seq — the same word every open
     /// raises for every root it adopts (§4.5's watermark).
     pub async fn install_recovered_root(&self, root: RootPtr, floor: u64) -> Result<(), KvError> {
-        let node = self.cache.get(root.addr).await?;
+        let mut node = self.cache.get(root.addr).await?;
+        if node.node_seq() < root.seq {
+            // A cached image OLDER than the pointer is this mount's stale
+            // copy of an extent ANOTHER daemon rewrote since — the extent
+            // left one slot's tree (retired, returned, re-granted) and now
+            // holds another's node (PR 12b round 4); the slot barrier
+            // (`drop_slot_nodes`) drops by the OLD owner's stamp and misses
+            // it. Re-read from the device before judging the pointer.
+            let cfg = self.cache.config();
+            let node_size = cfg.layout.node_size() as u64;
+            if root.addr >= cfg.heap_base && node_size > 0 {
+                let extent = (root.addr - cfg.heap_base) / node_size;
+                self.cache.drop_nodes_in_extents(cfg.heap_base, &[extent])?;
+                node = self.cache.get(root.addr).await?;
+            }
+        }
         if node.node_seq() != root.seq {
             return Err(KvError::Corrupt(format!(
                 "recovered root pointer stale: the page says node_seq {}, extent {:#x} holds {}",

@@ -2476,6 +2476,42 @@ impl HolderVenue {
     }
 }
 
+/// The holder venue behind each data volume's FREE TARGET on a wire
+/// writer (PR 12b round 3, F5): the free path re-resolves the holder
+/// through it after a transport failure at the target — before, only the
+/// grant sink's failure moved the target, so a failover the joiner's
+/// window covered (no grant ask) left every terminal free shipping to the
+/// dead holder's address for the mount's life (the `sym-crash` leg's
+/// round 2: `free_shipped_blocks` flat 60 s after the rewrite).
+static FREE_VENUES: once_cell::sync::Lazy<scc::HashMap<u64, Arc<HolderVenue>>> =
+    once_cell::sync::Lazy::new(scc::HashMap::new);
+
+/// Register `venue` as data volume `vol_tag`'s free-target venue (a
+/// re-arm upserts; the table lives as long as the joined daemon — its
+/// free targets do the same).
+fn install_free_venue(vol_tag: u64, venue: &Arc<HolderVenue>) {
+    let _ = FREE_VENUES.upsert_sync(vol_tag, Arc::clone(venue));
+}
+
+/// **Re-resolve data volume `vol_tag`'s free target off durable state**
+/// (the free path's arm after a transport failure at the target): the
+/// venue's resolver reads the allocation holder's current listener; a
+/// MOVED venue re-homes the free target with it. Answers the endpoint now
+/// in force and whether it moved; `None` when no venue is registered (an
+/// unarmed or in-process mount — the free target stands).
+pub async fn refresh_free_target(vol_tag: u64) -> Option<(String, bool)> {
+    let venue = FREE_VENUES.read_sync(&vol_tag, |_, v| Arc::clone(v))?;
+    let (endpoint, moved) = venue.refresh().await;
+    if moved {
+        install_wire_free_target(vol_tag, &endpoint);
+        log::warn!(
+            "data volume {vol_tag:#018x}: the allocation holder MOVED to {endpoint} — the free \
+             target follows it (re-resolved at a free's transport failure)"
+        );
+    }
+    Some((endpoint, moved))
+}
+
 /// A WIRE writer's grant sink: `ManagerCall::BlockGrant` to the holder's
 /// `venue` (one storage-trust session, reconnected on failure). A
 /// TRANSPORT-class failure re-resolves the venue and retries the ask ONCE
@@ -2882,9 +2918,16 @@ pub fn arm_joined_allocation(
         let endpoint = venue.current();
         if alloc.install_block_grant_arm(
             vol_tag,
-            wire_block_grant_sink(venue, secret.to_vec(), identity.into(), 0, vol_tag),
+            wire_block_grant_sink(
+                Arc::clone(&venue),
+                secret.to_vec(),
+                identity.into(),
+                0,
+                vol_tag,
+            ),
         ) {
             install_wire_free_target(vol_tag, &endpoint);
+            install_free_venue(vol_tag, &venue);
             armed += 1;
             log::info!(
                 "joined allocation arm: data volume '{}' ({vol_tag:#018x}, {blocks} block(s)) \

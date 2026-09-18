@@ -1764,6 +1764,29 @@ pub fn retire_displaced_locally(router: &crate::routing::BackendRouter, block_ke
     }
 }
 
+/// The joined appender's custody client at data volume `vol_tag`'s free
+/// target (`data_grant::slot_holder_client`), re-resolving the target off
+/// durable state ONCE when the dial fails (PR 12b round 3, F5): a
+/// failover the joiner's grant window covered moved the holder's listener
+/// with no grant ask to notice it, so the first free after it met a dead
+/// address here.
+async fn holder_client_following(
+    vol_tag: u64,
+    target: &str,
+) -> Result<Arc<crate::data_grant::WriteCustodyClient>> {
+    match crate::data_grant::slot_holder_client(target).await {
+        Ok(c) => Ok(c),
+        Err(e) => {
+            if let Some((moved_to, true)) =
+                crate::meta_backend::kv::alloc_lease::refresh_free_target(vol_tag).await
+            {
+                return crate::data_grant::slot_holder_client(&moved_to).await;
+            }
+            Err(e)
+        }
+    }
+}
+
 pub async fn ship_displaced_frees(
     router: &crate::routing::BackendRouter,
     block_keys: &[&str],
@@ -1848,11 +1871,11 @@ pub async fn ship_displaced_frees(
     let client = match crate::data_grant::custody_client() {
         Some(c) => c,
         None => {
-            let target = groups
-                .iter()
-                .find_map(|g| crate::block_grant::free_target_for(g.vol_tag));
+            let target = groups.iter().find_map(|g| {
+                crate::block_grant::free_target_for(g.vol_tag).map(|t| (g.vol_tag, t))
+            });
             match target {
-                Some(t) => crate::data_grant::slot_holder_client(&t).await?,
+                Some((vol_tag, t)) => holder_client_following(vol_tag, &t).await?,
                 None => {
                     let blocks: u64 = groups.iter().map(|g| g.entries.len() as u64).sum();
                     crate::meta_ship::publish::note_free_ship_failure(blocks);
@@ -1873,16 +1896,22 @@ pub async fn ship_displaced_frees(
     let endpoint = client.endpoint().to_string();
 
     for group in groups {
-        let epoch = client.lease_epoch();
-        let request_id = next_ship_request_id();
+        let mut client = Arc::clone(&client);
+        let mut epoch = client.lease_epoch();
+        let mut request_id = next_ship_request_id();
         let idxs: Vec<u64> = group.entries.iter().map(|(_, _, idx)| *idx).collect();
         let mut attempt = 0u32;
+        // The holder MOVED under us once already (a re-resolve at a
+        // transport failure below): the ship is re-keyed ONCE — a fresh
+        // client (its lease at the successor), a fresh request id — the
+        // dead holder executed nothing under the old id.
+        let mut followed = false;
         // PR 8 (design-symmetric-metadata §5.5): a data volume's terminal
         // frees ship to THAT volume's allocation-lease holder when the
         // symmetric plane names one (`execute_shipped_frees` runs there
         // verbatim); the set authority stays the route everywhere else —
         // one probe of an empty map on every unarmed mount.
-        let target =
+        let mut target =
             crate::block_grant::free_target_for(group.vol_tag).unwrap_or_else(|| endpoint.clone());
         let shipped = loop {
             match crate::meta_ship::publish::ship_free_blocks(
@@ -1897,6 +1926,33 @@ pub async fn ship_displaced_frees(
                 Ok(verdicts) => break Ok(verdicts),
                 Err(e) => {
                     attempt += 1;
+                    // The holder's venue re-resolved off durable state at a
+                    // TRANSPORT failure (PR 12b round 3, F5): a moved
+                    // venue re-homes the free target and this ship follows
+                    // it once with a client JOINed there — the old id
+                    // never reached anyone, so the re-key correlates with
+                    // nothing (the dead address executed nothing).
+                    if !followed
+                        && crate::cluster_wire::is_transport_failure(&e)
+                        && crate::data_grant::custody_client().is_none()
+                    {
+                        followed = true;
+                        if let Some((moved_to, true)) =
+                            crate::meta_backend::kv::alloc_lease::refresh_free_target(group.vol_tag)
+                                .await
+                        {
+                            match crate::data_grant::slot_holder_client(&moved_to).await {
+                                Ok(c) => {
+                                    client = c;
+                                    epoch = client.lease_epoch();
+                                    request_id = next_ship_request_id();
+                                    target = moved_to;
+                                    continue;
+                                }
+                                Err(je) => break Err(je),
+                            }
+                        }
+                    }
                     // A retry NEVER re-keys: if the lease epoch moved (a
                     // revocation → re-join happened under us), abandon —
                     // the window cannot correlate a new epoch's resend

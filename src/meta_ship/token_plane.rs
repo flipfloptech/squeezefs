@@ -2232,11 +2232,42 @@ impl TokenReaderPlane {
                 )
             }
         };
-        match call_on(client, &self.cfg, call).await {
+        match call_on(client, &self.cfg, call.clone()).await {
             Ok(r) => Ok(r),
             Err(e) => {
                 *guard = None;
-                Err(e)
+                // A TRANSPORT failure on a pooled session — the peer closed
+                // it idle (the wire's 60 s idle close), a reset — is
+                // re-dialed and the call runs once more (every token verb
+                // is idempotent against the holder's state: a re-grant
+                // answers `already`, an ack / a release of nothing is a
+                // no-op). Before it, a session the holder closed cost ONE
+                // user op per pooled session: the `sym-storm` fleet leg's
+                // manager read a live joiner's first four names of a round
+                // `EINVAL` — its four pooled grant sessions to that holder
+                // had idled past a minute since the previous round (four
+                // misses = the pool depth, the fifth name on a fresh
+                // session). A refusal the holder decoded is returned as is.
+                if !crate::cluster_wire::is_transport_failure(&e) {
+                    return Err(e);
+                }
+                self.grant_sessions.fetch_add(1, Ordering::Relaxed);
+                let fresh = guard.insert(
+                    RpcClient::connect(
+                        &self.cfg.endpoint,
+                        &self.cfg.secret,
+                        &self.cfg.client_id,
+                        None,
+                    )
+                    .await?,
+                );
+                match call_on(fresh, &self.cfg, call).await {
+                    Ok(r) => Ok(r),
+                    Err(e) => {
+                        *guard = None;
+                        Err(e)
+                    }
+                }
             }
         }
     }

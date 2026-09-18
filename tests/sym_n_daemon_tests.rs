@@ -1262,6 +1262,30 @@ async fn a_members_census_shard_walks_only_its_own_slot_trees() {
     let mine = fsck_all_classes_over(&manager).await;
     assert!(!mine.has_findings(), "{:?}", mine.findings);
 
+    // The S5 `-o ro` READER — the fleet's actual census-shard venue
+    // (`mw_fleet.sh` mounts its reader without the plane: no token client,
+    // no lease, every slot tree a poll-refreshed projection). Round 5's
+    // first fleet run found it judged EVERY tree as its own (the member
+    // predicate named joined appenders and token readers only): a
+    // non-writer that is not an offline probe holds nothing and judges
+    // nothing.
+    let reader = squeezefs::meta_backend::open_routed_meta_set_read_only(&uris)
+        .await
+        .expect("an S5 reader opens beside the live writers");
+    let report = census_shard_over(&reader).await;
+    assert!(
+        !report.has_findings(),
+        "an S5 reader's census takes no verdict over the writers' trees: {:?}",
+        report.findings
+    );
+    assert!(
+        report.counters.c1_projection_slots_scoped >= 2,
+        "the S5 reader skipped both writers' trees as projections ({} ≥ 2)",
+        report.counters.c1_projection_slots_scoped
+    );
+    shutdown(&reader).await;
+    drop(reader);
+
     shutdown(&joiner).await;
     drop(jvol);
     drop(joiner);

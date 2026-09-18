@@ -8818,6 +8818,12 @@ pub struct Metrics {
     /// appender's un-replayed ring window names, scoped out this pass
     /// (PR 10, review round 2). 0 on a flat volume and a solo forest.
     pub fsck_inode_plane_window_scoped: Align64<AtomicU64>,
+    /// `fsck_inode_plane_foreign_dentry_scoped` — inode-plane passes that
+    /// recorded NO verdict because a slot of the volume is leased to a
+    /// LIVE foreign appender (its dentries are the lessee's; this mount's
+    /// projection of them is of unbounded staleness — symmetric PR 12b,
+    /// review round 1, Issue 1). 0 on every mount with no foreign lessee.
+    pub fsck_inode_plane_foreign_dentry_scoped: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -14142,6 +14148,12 @@ impl SqueezefsFilesystem {
                                 .collect(),
                         ),
                     );
+                    // Rung 4's metadata-namespace hold is standing (1 for
+                    // the mount's life on a joiner; the leave drops it last).
+                    metrics.insert(
+                        "joined_meta_hold_standing".into(),
+                        word(&|s| u64::from(s.meta_hold_standing)),
+                    );
                 }
                 // The door's ledger (review round 2, Issue 6): parks are a
                 // legal wait for a bounded handover, refusals the "ship to
@@ -14155,6 +14167,12 @@ impl SqueezefsFilesystem {
                     lease(&|s| s.merge_sweep_foreign_skips),
                 );
                 metrics.insert("slot_door_refusals".into(), lease(&|s| s.door_refusals));
+                // A token holder's apply under `Releasing` (Issue 11 of
+                // PR 12b's review): the drain's own commits landing.
+                metrics.insert(
+                    "slot_door_draining_admits".into(),
+                    lease(&|s| s.door_draining_admits),
+                );
                 metrics.insert(
                     "slot_acquire_refusals".into(),
                     lease(&|s| s.acquire_refusals),
@@ -14657,6 +14675,13 @@ impl SqueezefsFilesystem {
                         "data_alloc_bitmap_leaks_released".into(),
                         load(&crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_RELEASED),
                     );
+                    // PR 12b: candidates left SET because another appender
+                    // of the set was LIVE at the re-hold (a live joiner's
+                    // window reads like a dead incarnation's remainder).
+                    metrics.insert(
+                        "data_alloc_bitmap_leaks_deferred".into(),
+                        load(&crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_DEFERRED),
+                    );
                     // Review round 2 — appended at the END of the block:
                     // the death ledger's retry / retirement / quarantine
                     // faces (Issues 5, 9, 18) and fsck C6's bitmap-oracle
@@ -14683,6 +14708,12 @@ impl SqueezefsFilesystem {
                         "fsck_inode_plane_window_scoped".into(),
                         serde_json::json!(METRICS
                             .fsck_inode_plane_window_scoped
+                            .load(Ordering::Relaxed)),
+                    );
+                    metrics.insert(
+                        "fsck_inode_plane_foreign_dentry_scoped".into(),
+                        serde_json::json!(METRICS
+                            .fsck_inode_plane_foreign_dentry_scoped
                             .load(Ordering::Relaxed)),
                     );
                 }

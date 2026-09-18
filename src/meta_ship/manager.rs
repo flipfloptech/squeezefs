@@ -673,14 +673,16 @@ impl ManagerService {
             Ok(f) => f,
             Err(e) => return self.refuse(req.id, STATUS_MALFORMED, e.to_string()),
         };
-        self.serve_frame(req.id, frame, t_admit).await
+        self.serve_frame(req.id, &req.peer, frame, t_admit).await
     }
 
     /// Serve an already-decoded frame (the set dispatcher decodes once to
-    /// read the volume ordinal, then hands the frame here).
+    /// read the volume ordinal, then hands the frame here). `peer` is the
+    /// session's authenticated peer id.
     async fn serve_frame(
         &self,
         req_id: u64,
+        peer: &str,
         frame: ManagerRequestFrame,
         t_admit: Instant,
     ) -> RpcResponse {
@@ -688,6 +690,7 @@ impl ManagerService {
             id: req_id,
             verb: VERB_MANAGER_CALL,
             body: Vec::new(),
+            peer: peer.to_string(),
         };
         if frame.schema != MANAGER_SCHEMA {
             return self.refuse(
@@ -707,6 +710,26 @@ impl ManagerService {
                 "this volume is not a symmetric-forest volume (bit 17 absent)".to_string(),
             );
         };
+        // The identity-carrying appender verbs bind their `identity` word
+        // to the SESSION's authenticated peer (PR 12b review round 1,
+        // Issue 6 — the D2 trust boundary's inside, but PR 3's bounded-
+        // execution law binds every other identity word tighter): a
+        // `PublishEndpoint` naming ANOTHER live appender would redirect
+        // every peer's token / custody / step traffic to the caller's
+        // listener; a `LeaveAppender` of another appender would free its
+        // region. A production appender's session peer IS its member id
+        // (`cowriter::node_member_id()` — what `PublishEndpoint` writes);
+        // a frame whose identity derives another member id is REJECTED
+        // (`manager_verb_rejected`). `JoinAppender` is bound the same way
+        // when the session's peer is a member id (the production shape);
+        // a session under an ad-hoc peer id (PR 3's contracts, which
+        // pre-date the rule) keeps the join's own witness laws.
+        let identity_screen = screen_identity_peer(&frame.call, &req.peer);
+        if identity_screen.is_some() {
+            set.verbs
+                .rejected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let admit_ns = t_admit.elapsed().as_nanos() as u64;
         let t_execute = Instant::now();
         // Every executor validates the frame's integers against DURABLE
@@ -720,378 +743,397 @@ impl ManagerService {
         // over every verb's error (before round 6 only `ReturnExtents`
         // read the class, so every other verb's `Rejected` left as
         // `STATUS_REFUSED`).
+        // The identity screen's verdict rides the executor's own
+        // `Rejected` class so the reply frame is the encoded one every
+        // peer decodes.
         let served: std::result::Result<ManagerReply, crate::meta_backend::kv::KvError> =
-            match &frame.call {
-                ManagerCall::JoinAppender {
-                    identity,
-                    ring_want_bytes,
-                } => self
-                    .volume
-                    .manager_join_appender((*identity).into(), *ring_want_bytes)
-                    .await
-                    .map(
-                        |JoinOutcome {
-                             appender_id,
-                             page_addr,
-                             ring_segments,
-                             grant,
-                             already,
-                         }| ManagerReply::Joined {
-                            appender_id,
-                            page_addr,
-                            ring_segments: ring_segments.iter().map(|s| (s.start, s.len)).collect(),
-                            grant: runs_to_wire(&grant),
-                            already,
-                        },
-                    ),
-                ManagerCall::ExtentGrant { appender_id, want } => self
-                    .volume
-                    .manager_extent_grant(*appender_id, *want)
-                    .await
-                    .map(|runs| ManagerReply::Granted {
-                        runs: runs_to_wire(&runs),
-                    }),
-                // The runs travel as RUNS: the executor intersects them with
-                // the record run by run; the only allocation proportional to
-                // the frame here is the run list itself, bounded by the frame
-                // cap.
-                ManagerCall::ReturnExtents { appender_id, runs } => self
-                    .volume
-                    .manager_return_runs(*appender_id, &runs_from_wire(runs))
-                    .await
-                    .map(|(cleared, already)| ManagerReply::Returned { cleared, already }),
-                ManagerCall::AcquireSlots { appender_id, want } => self
-                    .volume
-                    .manager_acquire_slots_wire(*appender_id, *want)
-                    .await
-                    .map(|(slots, already)| ManagerReply::SlotsGranted { slots, already }),
-                ManagerCall::AcquireSlot { appender_id, slot } => {
-                    self.volume
-                        .manager_acquire_slot_wire(*appender_id, *slot)
+            if let Some(reason) = identity_screen {
+                Err(crate::meta_backend::kv::KvError::Rejected(reason))
+            } else {
+                match &frame.call {
+                    ManagerCall::JoinAppender {
+                        identity,
+                        ring_want_bytes,
+                    } => self
+                        .volume
+                        .manager_join_appender((*identity).into(), *ring_want_bytes)
                         .await
-                }
-                ManagerCall::OfferSlot {
-                    appender_id,
-                    slot,
-                    to,
-                } => self
-                    .volume
-                    .manager_offer_slot_wire(*appender_id, *slot, *to)
-                    .await
-                    .map(|()| ManagerReply::Offered),
-                ManagerCall::ReleaseSlot {
-                    appender_id,
-                    slot,
-                    g,
-                    words,
-                    tails,
-                } => self
-                    .volume
-                    .manager_release_slot_wire(*appender_id, *slot, *g, *words, tails)
-                    .await
-                    .map(|already| ManagerReply::Released { already }),
-                ManagerCall::ResolveSlot { slot } => self.volume.manager_resolve_slot_wire(*slot),
-                // PR 7. The frame's owner is the volume's key form; the
-                // executors validate nothing proportional to a wire
-                // integer beyond the frame's own `refs` length (one
-                // lookup each, bounded by the CONTROL cap).
-                ManagerCall::MarkShared {
-                    vol_tag,
-                    block_idx,
-                    owner_ino,
-                    block_index,
-                } => {
-                    // PR 12 (PR 7's owed window, review round 2 Issue 20): the
-                    // served mark runs UNDER the source file's block guard —
-                    // `BLOCK_FLUSH_LOCKS(owner_ino, block_index)`, lock-order
-                    // rung 3, the guard the local W1 patch site holds from its
-                    // sole-owner predicate through its DMA — so the durable
-                    // bit and the RAM mark land either wholly BEFORE a patch's
-                    // fenced mark load (the patch declines) or wholly AFTER a
-                    // patch's DMA (a legitimate patch of a then-unshared
-                    // block). Rung 3 before the commit's rung-4 locks: the
-                    // shipped order. The metadata plane never held this guard
-                    // before, so a served mark could land between the
-                    // patcher's durable probe and its mark load.
-                    let guard_key =
-                        shared_refs::routed().and_then(|r| r.global_ino(&self.volume, *owner_ino));
-                    let _block_guard = match guard_key {
-                        Some(global) => Some(
-                            crate::fuse_client::BLOCK_FLUSH_LOCKS
-                                .get_lock(global, *block_index)
-                                .lock()
-                                .await,
+                        .map(
+                            |JoinOutcome {
+                                 appender_id,
+                                 page_addr,
+                                 ring_segments,
+                                 grant,
+                                 already,
+                             }| ManagerReply::Joined {
+                                appender_id,
+                                page_addr,
+                                ring_segments: ring_segments
+                                    .iter()
+                                    .map(|s| (s.start, s.len))
+                                    .collect(),
+                                grant: runs_to_wire(&grant),
+                                already,
+                            },
                         ),
-                        // No routed set (a bare-volume rig): nothing patches.
-                        None => None,
-                    };
-                    self.volume
-                        .mark_block_ref_shared(&crate::meta_backend::kv::block_refs::BlockRef {
-                            vol_tag: *vol_tag,
-                            block_idx: *block_idx,
-                            owner_ino: *owner_ino,
-                            block_index: *block_index,
-                        })
+                    ManagerCall::ExtentGrant { appender_id, want } => self
+                        .volume
+                        .manager_extent_grant(*appender_id, *want)
                         .await
-                        .map(|o| {
-                            // The durable bit is the authority; the RAM mark
-                            // the W1 predicate reads synchronously is set
-                            // beside it on the serving mount through the
-                            // routed hooks (absent = no armed router here,
-                            // nothing to set).
-                            if o != shared_refs::MarkOutcome::Gone {
-                                if let Some(routed) = shared_refs::routed() {
-                                    routed.note_marked(*vol_tag, *block_idx);
-                                }
-                            }
-                            match o {
-                                shared_refs::MarkOutcome::Marked => {
-                                    ManagerReply::Marked { already: false }
-                                }
-                                shared_refs::MarkOutcome::Already => {
-                                    ManagerReply::Marked { already: true }
-                                }
-                                shared_refs::MarkOutcome::Gone => ManagerReply::SharedGone,
-                            }
-                        })
-                        .map_err(|e| crate::meta_backend::kv::KvError::Busy(e.to_string()))
-                }
-                ManagerCall::ShareBlock {
-                    vol_tag,
-                    block_idx,
-                    refs,
-                } => {
-                    let refs: Vec<crate::meta_backend::kv::block_refs::BlockRef> = refs
-                        .iter()
-                        .map(|&(owner_ino, block_index)| {
-                            crate::meta_backend::kv::block_refs::BlockRef {
+                        .map(|runs| ManagerReply::Granted {
+                            runs: runs_to_wire(&runs),
+                        }),
+                    // The runs travel as RUNS: the executor intersects them with
+                    // the record run by run; the only allocation proportional to
+                    // the frame here is the run list itself, bounded by the frame
+                    // cap.
+                    ManagerCall::ReturnExtents { appender_id, runs } => self
+                        .volume
+                        .manager_return_runs(*appender_id, &runs_from_wire(runs))
+                        .await
+                        .map(|(cleared, already)| ManagerReply::Returned { cleared, already }),
+                    ManagerCall::AcquireSlots { appender_id, want } => self
+                        .volume
+                        .manager_acquire_slots_wire(*appender_id, *want)
+                        .await
+                        .map(|(slots, already)| ManagerReply::SlotsGranted { slots, already }),
+                    ManagerCall::AcquireSlot { appender_id, slot } => {
+                        self.volume
+                            .manager_acquire_slot_wire(*appender_id, *slot)
+                            .await
+                    }
+                    ManagerCall::OfferSlot {
+                        appender_id,
+                        slot,
+                        to,
+                    } => self
+                        .volume
+                        .manager_offer_slot_wire(*appender_id, *slot, *to)
+                        .await
+                        .map(|()| ManagerReply::Offered),
+                    ManagerCall::ReleaseSlot {
+                        appender_id,
+                        slot,
+                        g,
+                        words,
+                        tails,
+                    } => self
+                        .volume
+                        .manager_release_slot_wire(*appender_id, *slot, *g, *words, tails)
+                        .await
+                        .map(|already| ManagerReply::Released { already }),
+                    ManagerCall::ResolveSlot { slot } => {
+                        self.volume.manager_resolve_slot_wire(*slot)
+                    }
+                    // PR 7. The frame's owner is the volume's key form; the
+                    // executors validate nothing proportional to a wire
+                    // integer beyond the frame's own `refs` length (one
+                    // lookup each, bounded by the CONTROL cap).
+                    ManagerCall::MarkShared {
+                        vol_tag,
+                        block_idx,
+                        owner_ino,
+                        block_index,
+                    } => {
+                        // PR 12 (PR 7's owed window, review round 2 Issue 20): the
+                        // served mark runs UNDER the source file's block guard —
+                        // `BLOCK_FLUSH_LOCKS(owner_ino, block_index)`, lock-order
+                        // rung 3, the guard the local W1 patch site holds from its
+                        // sole-owner predicate through its DMA — so the durable
+                        // bit and the RAM mark land either wholly BEFORE a patch's
+                        // fenced mark load (the patch declines) or wholly AFTER a
+                        // patch's DMA (a legitimate patch of a then-unshared
+                        // block). Rung 3 before the commit's rung-4 locks: the
+                        // shipped order. The metadata plane never held this guard
+                        // before, so a served mark could land between the
+                        // patcher's durable probe and its mark load.
+                        let guard_key = shared_refs::routed()
+                            .and_then(|r| r.global_ino(&self.volume, *owner_ino));
+                        let _block_guard = match guard_key {
+                            Some(global) => Some(
+                                crate::fuse_client::BLOCK_FLUSH_LOCKS
+                                    .get_lock(global, *block_index)
+                                    .lock()
+                                    .await,
+                            ),
+                            // No routed set (a bare-volume rig): nothing patches.
+                            None => None,
+                        };
+                        self.volume
+                            .mark_block_ref_shared(&crate::meta_backend::kv::block_refs::BlockRef {
                                 vol_tag: *vol_tag,
                                 block_idx: *block_idx,
-                                owner_ino,
-                                block_index,
-                            }
-                        })
-                        .collect();
-                    // PR 3/4's law for the wire words: every named reference
-                    // is confirmed against durable state (exists, SHARED)
-                    // before the index moves; a frame with one bad word is
-                    // REJECTED whole (`manager_verb_rejected`).
-                    self.volume
-                        .share_block_screened(&refs)
-                        .await
-                        .map(|(inserted, already)| ManagerReply::Shared {
-                            inserted: inserted as u32,
-                            already: already as u32,
-                        })
-                }
-                ManagerCall::ReleaseShared {
-                    vol_tag,
-                    block_idx,
-                    owner,
-                } => {
-                    // The wire arm takes NO GC verdict: the index keys the
-                    // routed GLOBAL owner and this service sees one volume's
-                    // ledger in its own key form — an entry whose reference
-                    // it cannot read stands. The routed executor
-                    // (`DataRouter::release_shared_at`) is the GC arm.
-                    self.volume
-                        .release_shared(*vol_tag, *block_idx, *owner, |_| async { Ok(true) })
-                        .await
-                        .map(|v| match v {
-                            shared_refs::SharedRelease::NotShared => ManagerReply::SharedReleased {
-                                shared: false,
-                                remaining: 0,
-                            },
-                            shared_refs::SharedRelease::Held { remaining } => {
-                                ManagerReply::SharedReleased {
+                                owner_ino: *owner_ino,
+                                block_index: *block_index,
+                            })
+                            .await
+                            .map(|o| {
+                                // The durable bit is the authority; the RAM mark
+                                // the W1 predicate reads synchronously is set
+                                // beside it on the serving mount through the
+                                // routed hooks (absent = no armed router here,
+                                // nothing to set).
+                                if o != shared_refs::MarkOutcome::Gone {
+                                    if let Some(routed) = shared_refs::routed() {
+                                        routed.note_marked(*vol_tag, *block_idx);
+                                    }
+                                }
+                                match o {
+                                    shared_refs::MarkOutcome::Marked => {
+                                        ManagerReply::Marked { already: false }
+                                    }
+                                    shared_refs::MarkOutcome::Already => {
+                                        ManagerReply::Marked { already: true }
+                                    }
+                                    shared_refs::MarkOutcome::Gone => ManagerReply::SharedGone,
+                                }
+                            })
+                            .map_err(|e| crate::meta_backend::kv::KvError::Busy(e.to_string()))
+                    }
+                    ManagerCall::ShareBlock {
+                        vol_tag,
+                        block_idx,
+                        refs,
+                    } => {
+                        let refs: Vec<crate::meta_backend::kv::block_refs::BlockRef> = refs
+                            .iter()
+                            .map(|&(owner_ino, block_index)| {
+                                crate::meta_backend::kv::block_refs::BlockRef {
+                                    vol_tag: *vol_tag,
+                                    block_idx: *block_idx,
+                                    owner_ino,
+                                    block_index,
+                                }
+                            })
+                            .collect();
+                        // PR 3/4's law for the wire words: every named reference
+                        // is confirmed against durable state (exists, SHARED)
+                        // before the index moves; a frame with one bad word is
+                        // REJECTED whole (`manager_verb_rejected`).
+                        self.volume
+                            .share_block_screened(&refs)
+                            .await
+                            .map(|(inserted, already)| ManagerReply::Shared {
+                                inserted: inserted as u32,
+                                already: already as u32,
+                            })
+                    }
+                    ManagerCall::ReleaseShared {
+                        vol_tag,
+                        block_idx,
+                        owner,
+                    } => {
+                        // The wire arm takes NO GC verdict: the index keys the
+                        // routed GLOBAL owner and this service sees one volume's
+                        // ledger in its own key form — an entry whose reference
+                        // it cannot read stands. The routed executor
+                        // (`DataRouter::release_shared_at`) is the GC arm.
+                        self.volume
+                            .release_shared(*vol_tag, *block_idx, *owner, |_| async { Ok(true) })
+                            .await
+                            .map(|v| match v {
+                                shared_refs::SharedRelease::NotShared => {
+                                    ManagerReply::SharedReleased {
+                                        shared: false,
+                                        remaining: 0,
+                                    }
+                                }
+                                shared_refs::SharedRelease::Held { remaining } => {
+                                    ManagerReply::SharedReleased {
+                                        shared: true,
+                                        remaining: remaining as u32,
+                                    }
+                                }
+                                shared_refs::SharedRelease::Freed => ManagerReply::SharedReleased {
                                     shared: true,
-                                    remaining: remaining as u32,
+                                    remaining: 0,
+                                },
+                            })
+                    }
+                    // The two set-wide verbs: the wire words screened first
+                    // (volume 0 only, a Live non-own id, the holder for an
+                    // unlock — review round 1, Issue 3), the record's term the
+                    // SERVING manager's era (provenance, never a check).
+                    ManagerCall::DirRenameLock { appender_id } => self
+                        .volume
+                        .manager_dir_rename_lock_wire(self.ordinal, *appender_id)
+                        .await
+                        .map(|out| match out {
+                            crate::meta_backend::kv::backend::DirRenameOutcome::Locked {
+                                already,
+                            } => ManagerReply::DirRenameLocked { already },
+                            crate::meta_backend::kv::backend::DirRenameOutcome::Busy { holder } => {
+                                ManagerReply::DirRenameBusy { holder }
+                            }
+                        }),
+                    ManagerCall::DirRenameUnlock { appender_id } => self
+                        .volume
+                        .manager_dir_rename_unlock_wire(self.ordinal, *appender_id)
+                        .await
+                        .map(|already| ManagerReply::DirRenameUnlocked { already }),
+                    // ---- PR 8
+                    ManagerCall::BlockGrant {
+                        vol_tag,
+                        writer,
+                        want,
+                        held_unconsumed,
+                    } => self
+                        .volume
+                        .holder_block_grant(
+                            *vol_tag,
+                            &wire_writer_name(writer),
+                            u64::from(*want),
+                            *held_unconsumed,
+                        )
+                        .await
+                        .map(|outcome| match outcome {
+                            crate::block_grant::CarveOutcome::Granted(g) => {
+                                ManagerReply::BlocksGranted {
+                                    grants: vec![(g.start, g.len)],
+                                    already: false,
                                 }
                             }
-                            shared_refs::SharedRelease::Freed => ManagerReply::SharedReleased {
-                                shared: true,
-                                remaining: 0,
-                            },
-                        })
-                }
-                // The two set-wide verbs: the wire words screened first
-                // (volume 0 only, a Live non-own id, the holder for an
-                // unlock — review round 1, Issue 3), the record's term the
-                // SERVING manager's era (provenance, never a check).
-                ManagerCall::DirRenameLock { appender_id } => self
-                    .volume
-                    .manager_dir_rename_lock_wire(self.ordinal, *appender_id)
-                    .await
-                    .map(|out| match out {
-                        crate::meta_backend::kv::backend::DirRenameOutcome::Locked { already } => {
-                            ManagerReply::DirRenameLocked { already }
-                        }
-                        crate::meta_backend::kv::backend::DirRenameOutcome::Busy { holder } => {
-                            ManagerReply::DirRenameBusy { holder }
-                        }
-                    }),
-                ManagerCall::DirRenameUnlock { appender_id } => self
-                    .volume
-                    .manager_dir_rename_unlock_wire(self.ordinal, *appender_id)
-                    .await
-                    .map(|already| ManagerReply::DirRenameUnlocked { already }),
-                // ---- PR 8
-                ManagerCall::BlockGrant {
-                    vol_tag,
-                    writer,
-                    want,
-                    held_unconsumed,
-                } => self
-                    .volume
-                    .holder_block_grant(
-                        *vol_tag,
-                        &wire_writer_name(writer),
-                        u64::from(*want),
-                        *held_unconsumed,
-                    )
-                    .await
-                    .map(|outcome| match outcome {
-                        crate::block_grant::CarveOutcome::Granted(g) => {
-                            ManagerReply::BlocksGranted {
-                                grants: vec![(g.start, g.len)],
-                                already: false,
+                            crate::block_grant::CarveOutcome::Already(gs) => {
+                                ManagerReply::BlocksGranted {
+                                    grants: gs.iter().map(|g| (g.start, g.len)).collect(),
+                                    already: true,
+                                }
                             }
-                        }
-                        crate::block_grant::CarveOutcome::Already(gs) => {
-                            ManagerReply::BlocksGranted {
-                                grants: gs.iter().map(|g| (g.start, g.len)).collect(),
-                                already: true,
-                            }
-                        }
-                        crate::block_grant::CarveOutcome::Full => ManagerReply::BlocksFull,
-                    }),
-                ManagerCall::ReturnBlocks {
-                    vol_tag,
-                    writer,
-                    start,
-                    len,
-                } => self
-                    .volume
-                    .holder_return_blocks(
-                        *vol_tag,
-                        &wire_writer_name(writer),
-                        crate::block_grant::BlockGrant {
-                            start: *start,
-                            len: *len,
-                        },
-                    )
-                    .await
-                    .map(|cleared| ManagerReply::BlocksReturned { cleared }),
-                ManagerCall::AllocLeaseAcquire {
-                    vol_tag,
-                    identity,
-                    appender_id,
-                    home_vol,
-                    control_ino,
-                    blocks,
-                } => self
-                    .volume
-                    .manager_alloc_lease_acquire(
-                        *vol_tag,
-                        (*identity).into(),
-                        *appender_id,
-                        *home_vol,
-                        *control_ino,
-                        *blocks,
-                    )
-                    .await
-                    .map(|g| ManagerReply::AllocLeaseGranted {
-                        term: g.term,
-                        already: g.already,
-                        predecessor_bitmap: g
-                            .predecessor_bitmap
-                            .iter()
-                            .map(|(v, e)| (*v, (e.start, e.len)))
-                            .collect(),
-                        predecessor_blocks: g.predecessor_blocks,
-                    }),
-                ManagerCall::AllocLeaseBitmap {
-                    vol_tag,
-                    identity,
-                    term,
-                    bitmap,
-                } => self
-                    .volume
-                    .manager_alloc_lease_bitmap(
-                        *vol_tag,
-                        (*identity).into(),
-                        *term,
-                        bitmap
-                            .iter()
-                            .map(|(v, (s, l))| (*v, ExtentRef { start: *s, len: *l }))
-                            .collect(),
-                    )
-                    .await
-                    .map(|already| ManagerReply::Recorded { already }),
-                ManagerCall::AllocLeaseRelease {
-                    vol_tag,
-                    identity,
-                    term,
-                } => self
-                    .volume
-                    .manager_alloc_lease_release(*vol_tag, (*identity).into(), *term)
-                    .await
-                    .map(|already| ManagerReply::Recorded { already }),
-                ManagerCall::RecordRecovered { member, vol } => self
-                    .volume
-                    .manager_record_recovered((*member).into(), *vol)
-                    .await
-                    .map(|already| ManagerReply::Recorded { already }),
-                // PR 10: the home shard's eviction shipped here. The wire
-                // words are an identity, an epoch and a key — none sizes an
-                // allocation or names an ino; the record is idempotent and
-                // every effect it drives (the quarantine, the recovery)
-                // re-reads durable state. A member this manager LISTS as
-                // live is never declared dead by a peer's word (the
-                // screen below).
-                ManagerCall::RecordDeath {
-                    member,
-                    epoch,
-                    pr_key,
-                } => match self.volume.screen_record_death(member, *pr_key) {
-                    Err(e) => Err(e),
-                    Ok(key) => self
+                            crate::block_grant::CarveOutcome::Full => ManagerReply::BlocksFull,
+                        }),
+                    ManagerCall::ReturnBlocks {
+                        vol_tag,
+                        writer,
+                        start,
+                        len,
+                    } => self
                         .volume
-                        .record_death_with_key((*member).into(), *epoch, key)
+                        .holder_return_blocks(
+                            *vol_tag,
+                            &wire_writer_name(writer),
+                            crate::block_grant::BlockGrant {
+                                start: *start,
+                                len: *len,
+                            },
+                        )
+                        .await
+                        .map(|cleared| ManagerReply::BlocksReturned { cleared }),
+                    ManagerCall::AllocLeaseAcquire {
+                        vol_tag,
+                        identity,
+                        appender_id,
+                        home_vol,
+                        control_ino,
+                        blocks,
+                    } => self
+                        .volume
+                        .manager_alloc_lease_acquire(
+                            *vol_tag,
+                            (*identity).into(),
+                            *appender_id,
+                            *home_vol,
+                            *control_ino,
+                            *blocks,
+                        )
+                        .await
+                        .map(|g| ManagerReply::AllocLeaseGranted {
+                            term: g.term,
+                            already: g.already,
+                            predecessor_bitmap: g
+                                .predecessor_bitmap
+                                .iter()
+                                .map(|(v, e)| (*v, (e.start, e.len)))
+                                .collect(),
+                            predecessor_blocks: g.predecessor_blocks,
+                        }),
+                    ManagerCall::AllocLeaseBitmap {
+                        vol_tag,
+                        identity,
+                        term,
+                        bitmap,
+                    } => self
+                        .volume
+                        .manager_alloc_lease_bitmap(
+                            *vol_tag,
+                            (*identity).into(),
+                            *term,
+                            bitmap
+                                .iter()
+                                .map(|(v, (s, l))| (*v, ExtentRef { start: *s, len: *l }))
+                                .collect(),
+                        )
                         .await
                         .map(|already| ManagerReply::Recorded { already }),
-                },
-                // PR 12b: the runs travel as RUNS and are intersected with
-                // the appender's record run by run (the ReturnExtents
-                // law); the page and the ring extents are the directory's.
-                ManagerCall::LeaveAppender {
-                    identity,
-                    appender_id,
-                    unclaimed,
-                } => self
-                    .volume
-                    .manager_leave_appender(
-                        (*identity).into(),
-                        *appender_id,
-                        &runs_from_wire(unclaimed),
-                    )
-                    .await
-                    .map(|already| ManagerReply::Left { already }),
-                ManagerCall::PublishEndpoint {
-                    identity,
-                    appender_id,
-                    endpoint,
-                    pr_key,
-                } => self
-                    .volume
-                    .manager_publish_endpoint((*identity).into(), *appender_id, endpoint, *pr_key)
-                    .await
-                    .map(|already| ManagerReply::Published { already }),
-                ManagerCall::ResolveEndpoint { appender_id } => self
-                    .volume
-                    .manager_resolve_endpoint(*appender_id)
-                    .await
-                    .map(|endpoint| ManagerReply::Endpoint { endpoint }),
+                    ManagerCall::AllocLeaseRelease {
+                        vol_tag,
+                        identity,
+                        term,
+                    } => self
+                        .volume
+                        .manager_alloc_lease_release(*vol_tag, (*identity).into(), *term)
+                        .await
+                        .map(|already| ManagerReply::Recorded { already }),
+                    ManagerCall::RecordRecovered { member, vol } => self
+                        .volume
+                        .manager_record_recovered((*member).into(), *vol)
+                        .await
+                        .map(|already| ManagerReply::Recorded { already }),
+                    // PR 10: the home shard's eviction shipped here. The wire
+                    // words are an identity, an epoch and a key — none sizes an
+                    // allocation or names an ino; the record is idempotent and
+                    // every effect it drives (the quarantine, the recovery)
+                    // re-reads durable state. A member this manager LISTS as
+                    // live is never declared dead by a peer's word (the
+                    // screen below).
+                    ManagerCall::RecordDeath {
+                        member,
+                        epoch,
+                        pr_key,
+                    } => match self.volume.screen_record_death(member, *pr_key) {
+                        Err(e) => Err(e),
+                        Ok(key) => self
+                            .volume
+                            .record_death_with_key((*member).into(), *epoch, key)
+                            .await
+                            .map(|already| ManagerReply::Recorded { already }),
+                    },
+                    // PR 12b: the runs travel as RUNS and are intersected with
+                    // the appender's record run by run (the ReturnExtents
+                    // law); the page and the ring extents are the directory's.
+                    ManagerCall::LeaveAppender {
+                        identity,
+                        appender_id,
+                        unclaimed,
+                    } => self
+                        .volume
+                        .manager_leave_appender(
+                            (*identity).into(),
+                            *appender_id,
+                            &runs_from_wire(unclaimed),
+                        )
+                        .await
+                        .map(|already| ManagerReply::Left { already }),
+                    ManagerCall::PublishEndpoint {
+                        identity,
+                        appender_id,
+                        endpoint,
+                        pr_key,
+                    } => self
+                        .volume
+                        .manager_publish_endpoint(
+                            (*identity).into(),
+                            *appender_id,
+                            endpoint,
+                            *pr_key,
+                        )
+                        .await
+                        .map(|already| ManagerReply::Published { already }),
+                    ManagerCall::ResolveEndpoint { appender_id } => self
+                        .volume
+                        .manager_resolve_endpoint(*appender_id)
+                        .await
+                        .map(|endpoint| ManagerReply::Endpoint { endpoint }),
+                }
             };
         let (reply, status) = match served {
             Ok(reply) => (reply, STATUS_OK),
@@ -1168,6 +1210,36 @@ impl ManagerService {
     }
 }
 
+/// **The identity word against the session's peer** (PR 12b review round
+/// 1, Issue 6) — pure, fuzzed by `manager_call_frame`'s poisoned-frame arm
+/// + the proptest mirror: `Some(reason)` = REJECT. `PublishEndpoint` and
+/// `LeaveAppender` (PR 12b's verbs — a production appender's session peer
+/// is its member id, `cowriter::node_member_id()`) REQUIRE the frame's
+/// identity to derive the peer; `JoinAppender` requires it whenever the
+/// peer IS a member id (an ad-hoc peer keeps the join's own witness laws
+/// — PR 3's contracts pre-date the rule). Every other verb passes.
+pub fn screen_identity_peer(call: &ManagerCall, peer: &str) -> Option<String> {
+    let (verb, identity, strict) = match call {
+        ManagerCall::PublishEndpoint { identity, .. } => ("PublishEndpoint", identity, true),
+        ManagerCall::LeaveAppender { identity, .. } => ("LeaveAppender", identity, true),
+        ManagerCall::JoinAppender { identity, .. } => ("JoinAppender", identity, false),
+        _ => return None,
+    };
+    let derived = crate::cowriter::node_member_id_of(identity.node_token, identity.mount_slot);
+    if derived == peer {
+        return None;
+    }
+    if !strict && crate::cowriter::parse_node_member_id(peer).is_none() {
+        return None;
+    }
+    Some(format!(
+        "{verb}: the frame's identity ({:#x}, mount slot {}) derives member id '{derived}' but \
+         the session's authenticated peer is '{peer}' — an appender speaks for itself alone \
+         (REJECTED)",
+        identity.node_token, identity.mount_slot
+    ))
+}
+
 impl RpcAsyncService for ManagerService {
     fn call<'a>(
         &'a self,
@@ -1240,7 +1312,7 @@ impl ManagerSetService {
                 body: reason.into_bytes(),
             };
         };
-        svc.serve_frame(req.id, frame, t_admit).await
+        svc.serve_frame(req.id, &req.peer, frame, t_admit).await
     }
 }
 

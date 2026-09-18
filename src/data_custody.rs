@@ -859,7 +859,7 @@ pub fn acquire_wero(paths: &[PathBuf]) -> Option<WeroHold> {
         return None;
     }
     let key_set = canonical(paths);
-    let mut reg = registry().lock().unwrap();
+    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(existing) = reg
         .get(&(key_set.clone(), HoldRole::Holder))
         .and_then(Weak::upgrade)
@@ -1024,7 +1024,7 @@ pub fn adopt_wero_colocated(
         ));
     }
     let key_set = canonical(data_paths);
-    let mut reg = registry().lock().unwrap();
+    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(existing) = reg
         .get(&(key_set.clone(), HoldRole::Adopted))
         .and_then(Weak::upgrade)
@@ -1175,7 +1175,7 @@ pub fn join_wero_as_registrant_keyed(
         ));
     }
     let key_set = canonical(data_paths);
-    let mut reg = registry().lock().unwrap();
+    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(existing) = reg
         .get(&(key_set.clone(), HoldRole::Registrant))
         .and_then(Weak::upgrade)

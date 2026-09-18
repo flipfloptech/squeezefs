@@ -986,6 +986,15 @@ pub static DATA_ALLOC_BITMAP_DRIFT: AtomicU64 = AtomicU64::new(0);
 /// arm, found by the `sym-crash` fleet leg's C6).
 pub static DATA_ALLOC_BITMAP_LEAKS_RELEASED: AtomicU64 = AtomicU64::new(0);
 
+/// `data_alloc_bitmap_leaks_deferred` — leak candidates the (re-)hold
+/// found while another appender of the set was LIVE and left SET (PR 12b:
+/// a live joiner's grant window is RAM at the joiner and reads exactly
+/// like a dead incarnation's remainder; clearing it re-carves blocks the
+/// joiner still mints from). Released by a later re-hold with no live
+/// peer; fsck C6's `fsck_alloc_bitmap_leak_candidates` names them until
+/// then.
+pub static DATA_ALLOC_BITMAP_LEAKS_DEFERRED: AtomicU64 = AtomicU64::new(0);
+
 /// Count a drift verdict's loss half on the process gauge; returns it.
 pub fn note_drift(report: &DriftReport) -> u64 {
     let loss = report.loss.len() as u64;

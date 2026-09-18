@@ -2888,8 +2888,31 @@ impl NodeCache {
     /// extents it later granted a joiner; at the joiner's death the veto
     /// made four of its slot trees unreadable, their extents censused as
     /// reached-by-no-root and RETURNED — 84 acked files gone. Called at
-    /// every carve that hands `extent` out; a pointer into the extent's
-    /// previous life is still caught by the §4.2 `node_seq` check.
+    /// every carve that hands `extent` out and at a joiner's return of it.
+    ///
+    /// **Why the belt's narrowing is an invariant, not a patch** (PR 12b
+    /// review round 1, Issue 5): the veto guards ONE hazard — a traversal
+    /// holding a PRE-SMO parent snapshot (RAM) whose pointer names this
+    /// address, demand-loading the LAGGING disk image (the superseded
+    /// node's open delta lives only in the successors' RAM; the image's
+    /// `node_seq` is the same node's, so the §4.2 pointer check passes
+    /// it). An extent reaches a carve only through §4.7's pending-free
+    /// protocol: the SMO's retirement parks its free on the region's tail
+    /// and `advance_durable` releases it ONLY once the SMO's entry is
+    /// checkpoint-covered — the successors are durable and the tree's
+    /// published root routes through them, so every snapshot taken since
+    /// that checkpoint routes AROUND this address; only a traversal older
+    /// than a whole checkpoint cycle + the grant cadence could still name
+    /// it, and every traversal is one `descend` (bounded by `RETRY_BUDGET`
+    /// yields — milliseconds, never a cycle). Once the grantee publishes
+    /// a node here the image is ANOTHER life (a different `node_seq`),
+    /// which the pointer check refuses on its own; between the carve and
+    /// that first write a pointer into the extent's previous life is the
+    /// aged-traversal class above. Clearing at the carve rather than at
+    /// the adoption of the grantee's tree is what makes a PROJECTION read
+    /// (a joiner's tree 0 / manager-tree refresh naming a node in an
+    /// extent this mount returned) exact — no adoption event exists for
+    /// it.
     pub fn unretire_extent(&self, extent: u64) {
         self.retired.remove_sync(&self.extent_addr(extent));
     }
@@ -3329,6 +3352,16 @@ impl NodeCache {
     /// Remove `victims` from the map (each by identity), noting every
     /// one's dying floor so the tail keeps respecting a record the node
     /// carried until the next barrier. Returns the nodes removed.
+    /// **Test seam**: drop one CLEAN cached node (the loader-collision
+    /// stress's miss/collide cycle — `kv_loader_lock_style_tests`). A
+    /// dirty node is left in place (`false`).
+    pub fn test_drop_clean_node(&self, node: &Arc<CachedNode>) -> bool {
+        if node.dirty_floor() != u64::MAX {
+            return false;
+        }
+        self.remove_nodes(vec![Arc::clone(node)]) == 1
+    }
+
     fn remove_nodes(&self, victims: Vec<Arc<CachedNode>>) -> usize {
         let node_size = self.cfg.layout.node_size() as u64;
         let mut dropped = 0usize;
@@ -3395,8 +3428,19 @@ impl NodeCache {
         addr: u64,
         slot: Option<super::record::ForestSlot>,
     ) -> Result<Option<Arc<CachedNode>>, KvError> {
+        // ONE acquisition style per scc table (review round 1 of PR 12b,
+        // Issue 13 — the lock law's "never held across an await" read at
+        // the table): every other user of `map` and `inflight` takes the
+        // bucket SYNC, and mixing an `*_async` waiter into a table with
+        // sync users is a self-deadlock on a lane pool — saa hands a
+        // released bucket to the next QUEUED waiter, an async waiter
+        // granted the bucket resumes only when its task is polled, and the
+        // lanes that would poll it sit in a sync wait on that very bucket
+        // (the fleet's `-o ro` reader wedged both meta lanes under the C1
+        // walk's fan-out; `squeezefs fsck` hung 31 min). No bucket here is
+        // ever held across an `await`, so the sync form is exact.
         loop {
-            if let Some(node) = self.map.read_async(&addr, |_, v| v.clone()).await {
+            if let Some(node) = self.map.read_sync(&addr, |_, v| v.clone()) {
                 // The same lazy staleness gate as `try_get`: a stale-stamped
                 // mapping must be re-read from the device, not served.
                 if node.epoch_stamp() != self.env.epoch.probe() {
@@ -3423,7 +3467,7 @@ impl NodeCache {
             }
             // Miss: exactly one loader per address; losers wait and re-check.
             let guard = {
-                match self.inflight.entry_async(addr).await {
+                match self.inflight.entry_sync(addr) {
                     scc::hash_map::Entry::Occupied(e) => {
                         let rx = e.get().subscribe();
                         drop(e);

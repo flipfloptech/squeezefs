@@ -2967,11 +2967,29 @@ leg_sym_storm() {
             lost=$((lost + l))
         done
         [ "$lost" = "0" ] || die "round $round: the remounted joiner $victim misses $lost acked name(s)"
-        # fsck at the manager; the must-stay-0 set on every daemon.
-        local out
-        out="$("$SQZ" fsck "$m_mnt" 2>&1)" || die "round $round: online fsck FAILED or found:
-$out"
+        # Every daemon's .stats BEFORE the fsck verdict (review round 1,
+        # Issue 9: round 3's attribution had to be reconstructed from INFO
+        # lines because the verdict died first).
+        for idx in 0 "${joiners[@]}"; do
+            cat "$(mnt_of "$idx")/.stats" >"$rowdir/stats-m$idx-r$round.json" 2>/dev/null || true
+        done
+        # fsck at the manager — BOUNDED (Issue 13: a wedged fleet worker
+        # hung the coordinator's fsck for 31 min; the census's own progress
+        # deadline terminates the job now, and the harness bounds the verb
+        # the way the matrix's watchdog bounds a suite); its output is kept
+        # whatever the verdict. The manager's inode-plane census takes NO
+        # verdict over a volume with a slot leased to a LIVE joiner (Issue
+        # 1 — a projection's staleness it cannot bound; counted on
+        # `fsck_inode_plane_foreign_dentry_scoped`), so the verdict here is
+        # honest with joiners live: the block classes judged, the dentry
+        # classes deferred to a census with no foreign lessee.
+        local out rc
+        out="$(timeout 900 "$SQZ" fsck "$m_mnt" 2>&1)"
+        rc=$?
         echo "$out" >"$rowdir/fsck-r$round.out"
+        [ "$rc" != "124" ] || die "round $round: online fsck HUNG past 900 s (the fleet census never terminated) — transcript $rowdir/fsck-r$round.out"
+        [ "$rc" = "0" ] || die "round $round: online fsck FAILED or found:
+$out"
         echo "$out" | grep -q "findings: 0" || die "round $round: fsck findings != 0:
 $out"
         sym_storm_daemon_asserts "$round" 0
@@ -2981,6 +2999,20 @@ $out"
         for idx in 0 "${joiners[@]}"; do
             rm -rf "$(mnt_of "$idx")/storm-w$idx-r$round" 2>/dev/null || true
         done
+        # "Deleted stays deleted" (Issue 1's oracle half): every round
+        # directory just removed must be GONE through every mount — the
+        # manager, the survivors and the remounted victim — never a name
+        # a stale projection still serves.
+        local reader_idx stale=0
+        for idx in 0 "${joiners[@]}"; do
+            for reader_idx in 0 "${joiners[@]}"; do
+                if stat "$(mnt_of "$reader_idx")/storm-w$idx-r$round" >/dev/null 2>&1; then
+                    stale=$((stale + 1))
+                    echo "STALE: m$reader_idx still resolves storm-w$idx-r$round" >>"$rowdir/stale-r$round.txt"
+                fi
+            done
+        done
+        [ "$stale" = "0" ] || die "round $round: $stale removed round directory(ies) still resolve through a mount (see $rowdir/stale-r$round.txt)"
         printf '%-6s %-9s %-8s %-10s %-10s %-8s %s\n' "$round" "$phase_ms" "m$victim" "$((t_rec - t_kill))" "$acked" 0 GREEN | tee -a "$rowdir/matrix.tsv"
     done
     log "sym-storm GREEN: $S7_ROUNDS/$S7_ROUNDS rounds (table + fsck reports in $rowdir)"
@@ -3116,12 +3148,22 @@ s7_kill_body() { # [sym]
             fm="$(stat_field 0 data_plane_fence_mode)"
             [ "$fm" = "1" ] || die "round $round: successor data_plane_fence_mode=$fm (want 1)"
         fi
-        # The oracle: FULL online fsck (C1-C10, C8 ungated on this stamped
-        # format — the durable ledger runs for real).
-        out="$("$SQZ" fsck "$w_mnt" 2>&1)" ||
+        # Every daemon's .stats BEFORE the fsck verdict (review round 1,
+        # Issue 9), then the oracle: FULL online fsck (C1-C10, C8 ungated on
+        # this stamped format — the durable ledger runs for real), BOUNDED
+        # (Issue 13) with its transcript kept whatever the verdict.
+        local sidx
+        for sidx in 0 $(joiner_idxs); do
+            cat "$(mnt_of "$sidx")/.stats" >"$rowdir/stats-m$sidx-r$round.json" 2>/dev/null || true
+        done
+        local frc
+        out="$(timeout 900 "$SQZ" fsck "$w_mnt" 2>&1)"
+        frc=$?
+        echo "$out" >"$rowdir/fsck-r$round.out"
+        [ "$frc" != "124" ] || die "round $round: online fsck HUNG past 900 s (the fleet census never terminated) — transcript $rowdir/fsck-r$round.out"
+        [ "$frc" = "0" ] ||
             die "round $round: online fsck FAILED or found:
 $out"
-        echo "$out" >"$rowdir/fsck-r$round.out"
         echo "$out" | grep -q "findings: 0" ||
             die "round $round: fsck findings != 0:
 $out"
@@ -3222,8 +3264,55 @@ sym_crash_round_asserts() { # round rowdir
             die "round $round: joined writer m$j joined_wire_redials=$v — its wire never re-dialed the successor"
         [ "$(cat "$(mnt_of 0)/after-failover-r$round-m$j/mark" 2>/dev/null)" = "r$round" ] ||
             die "round $round: the successor does not read joined writer m$j's post-failover name"
+        # PR 12b review round 1, Issue 2 — the DATA plane follows too: a
+        # STRIPED write (≥ 1 block, never the inline `mark`) needs a block
+        # GRANT from the allocation holder — the SUCCESSOR now — and its
+        # displaced free must reach the successor's ladder. Before the
+        # fix the joiner's grant sink and free target kept the dead
+        # manager's endpoint for the mount's life (the 7-byte inline mark
+        # hid it). `dd conv=fsync`: the acked-writes oracle's own shape.
+        local grants0 striped0 shipped0 served0 sum
+        grants0="$(stat_sum 0 block_grants)"
+        striped0="$(stat_sum "$j" layout_striped_writes)"
+        shipped0="$(stat_sum "$j" meta_ship_publish.free_shipped_blocks)"
+        served0="$(stat_sum 0 meta_ship_publish.free_served_blocks)"
+        dd if=/dev/urandom of="$f/striped.bin" bs=1M count=5 conv=fsync status=none ||
+            die "round $round: joined writer m$j could not write a STRIPED file after the manager failover (its block grants never followed the successor?)"
+        sum="$(sha256sum <"$f/striped.bin" | cut -d' ' -f1)"
+        # A whole-file rewrite displaces every block: the frees SHIP to
+        # the holder at the fsync (KD-1.6: fsync closes the rewrite epoch).
+        dd if=/dev/urandom of="$f/striped.bin" bs=1M count=5 conv=fsync,notrunc status=none ||
+            die "round $round: joined writer m$j could not rewrite after the manager failover"
+        v="$(stat_sum "$j" layout_striped_writes)"
+        [ "$v" -gt "$striped0" ] 2>/dev/null ||
+            die "round $round: joined writer m$j layout_striped_writes=$v (was $striped0) — the post-failover write never went striped"
+        v="$(stat_sum 0 block_grants)"
+        [ "$v" -gt "$grants0" ] 2>/dev/null ||
+            die "round $round: the successor's block_grants=$v (was $grants0) — joined writer m$j's post-failover block grant did not land at the SUCCESSOR"
+        [ "$(sha256sum <"$(mnt_of 0)/after-failover-r$round-m$j/striped.bin" | cut -d' ' -f1)" != "$sum" ] ||
+            die "round $round: the successor reads joined writer m$j's PRE-rewrite bytes (the rewrite was not published?)"
+        [ "$(stat -c %s "$(mnt_of 0)/after-failover-r$round-m$j/striped.bin")" = "$((5 * 1024 * 1024))" ] ||
+            die "round $round: the successor reads joined writer m$j's striped file at the wrong size"
+        t0="$(date +%s)"
+        while :; do
+            v="$(stat_sum "$j" meta_ship_publish.free_shipped_blocks)"
+            [ "${v:-0}" -gt "${shipped0:-0}" ] 2>/dev/null && break
+            [ $(($(date +%s) - t0)) -lt 60 ] ||
+                die "round $round: joined writer m$j free_shipped_blocks=$v (was $shipped0) 60 s after its rewrite — the displaced free never shipped to the successor"
+            sleep 1
+        done
+        t0="$(date +%s)"
+        while :; do
+            v="$(stat_sum 0 meta_ship_publish.free_served_blocks)"
+            [ "${v:-0}" -gt "${served0:-0}" ] 2>/dev/null && break
+            [ $(($(date +%s) - t0)) -lt 60 ] ||
+                die "round $round: the successor's free_served_blocks=$v (was $served0) — joined writer m$j's displaced free never reached the SUCCESSOR's ladder"
+            sleep 1
+        done
+        v="$(stat_sum "$j" meta_ship_publish.free_ship_failures)"
+        [ "${v:-0}" = "0" ] || die "round $round: joined writer m$j free_ship_failures=$v"
         sym_storm_daemon_asserts "$round" "$j"
-        log "round $round: joined writer m$j followed the failover (redials=$v, writes land, the successor reads them)"
+        log "round $round: joined writer m$j followed the failover (redials=$(stat_sum "$j" joined_wire_redials), a striped write granted at the successor, its free served there)"
     done
     # PR 12b: the successor's §6.8 item-3 bound advances with JOINED
     # writers as members — every member acknowledges the label its grant

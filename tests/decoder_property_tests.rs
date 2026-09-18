@@ -1227,6 +1227,59 @@ proptest! {
         }
     }
 
+    /// PR 12b (review round 1, Issue 6): the identity-carrying appender
+    /// verbs bind their identity word to the session's authenticated peer
+    /// — total over an arbitrary peer: the identity's own member id passes,
+    /// `PublishEndpoint` / `LeaveAppender` refuse every other peer,
+    /// `JoinAppender` refuses another MEMBER id and admits an ad-hoc one.
+    #[test]
+    fn manager_identity_verbs_bind_to_the_session_peer(
+        node in any::<u64>(),
+        slot in any::<u32>(),
+        other_node in any::<u64>(),
+        other_slot in any::<u32>(),
+        adhoc in "[a-z0-9-]{0,24}",
+        verb in 0u8..3,
+    ) {
+        use squeezefs::meta_ship::manager::{screen_identity_peer, ManagerCall, WireIdentity};
+        let identity = WireIdentity { node_token: node, mount_slot: slot, writer_id: 7 };
+        let call = match verb {
+            0 => ManagerCall::PublishEndpoint {
+                identity,
+                appender_id: 3,
+                endpoint: "127.0.0.1:1".into(),
+                pr_key: 0,
+            },
+            1 => ManagerCall::LeaveAppender {
+                identity,
+                appender_id: 3,
+                unclaimed: Vec::new(),
+            },
+            _ => ManagerCall::JoinAppender {
+                identity,
+                ring_want_bytes: 0,
+            },
+        };
+        let own = squeezefs::cowriter::node_member_id_of(node, slot);
+        prop_assert!(screen_identity_peer(&call, &own).is_none());
+        let foreign = squeezefs::cowriter::node_member_id_of(other_node, other_slot);
+        if foreign != own {
+            prop_assert!(screen_identity_peer(&call, &foreign).is_some(), "another member id");
+        }
+        let adhoc_verdict = screen_identity_peer(&call, &adhoc);
+        if adhoc == own {
+            prop_assert!(adhoc_verdict.is_none());
+        } else if verb == 2 {
+            prop_assert_eq!(
+                adhoc_verdict.is_some(),
+                squeezefs::cowriter::parse_node_member_id(&adhoc).is_some(),
+                "a join under an ad-hoc peer keeps the join's own laws"
+            );
+        } else {
+            prop_assert!(adhoc_verdict.is_some(), "the PR 12b verbs are strict");
+        }
+    }
+
     /// The cluster wire's `RpcFrame` reader (every distributed plane's
     /// transport) and the S8 verb-body decoders are total over an
     /// arbitrary byte STREAM under every class cap; an arbitrary tag never

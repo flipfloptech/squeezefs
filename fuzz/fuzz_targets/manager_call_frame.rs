@@ -426,6 +426,40 @@ fn check_dir_rename_screen(frame: &ManagerRequestFrame, facts: u8) {
     );
 }
 
+/// PR 12b (review round 1, Issue 6): the identity-carrying appender verbs
+/// bind their `identity` word to the session's authenticated peer —
+/// total over an arbitrary peer string: the identity's own member id
+/// always passes; `PublishEndpoint` / `LeaveAppender` refuse every other
+/// peer; `JoinAppender` refuses another MEMBER id and admits an ad-hoc
+/// one; every other verb passes whatever the peer.
+fn check_identity_peer_screen(frame: &ManagerRequestFrame, peer_bytes: &[u8]) {
+    use squeezefs::meta_ship::manager::screen_identity_peer;
+    let peer = String::from_utf8_lossy(peer_bytes);
+    let verdict = screen_identity_peer(&frame.call, &peer);
+    let identity = match &frame.call {
+        ManagerCall::PublishEndpoint { identity, .. }
+        | ManagerCall::LeaveAppender { identity, .. }
+        | ManagerCall::JoinAppender { identity, .. } => Some(*identity),
+        _ => None,
+    };
+    let Some(identity) = identity else {
+        assert!(verdict.is_none(), "a verb carrying no identity passes any peer");
+        return;
+    };
+    let own = squeezefs::cowriter::node_member_id_of(identity.node_token, identity.mount_slot);
+    assert!(
+        screen_identity_peer(&frame.call, &own).is_none(),
+        "the identity's own member id always passes"
+    );
+    let strict = !matches!(frame.call, ManagerCall::JoinAppender { .. });
+    let foreign_member = squeezefs::cowriter::parse_node_member_id(&peer).is_some();
+    let expect_reject = peer != own && (strict || foreign_member);
+    assert_eq!(verdict.is_some(), expect_reject, "peer={peer:?} own={own}");
+    if let Some(reason) = verdict {
+        assert!(!reason.is_empty());
+    }
+}
+
 fn check_request(frame: &ManagerRequestFrame) {
     let re = encode_request(frame).expect("an accepted request frame re-encodes");
     let again = decode_request(&re).expect("a re-encoded request frame decodes");
@@ -965,6 +999,7 @@ fuzz_target!(|data: &[u8]| {
         check_request(&frame);
         check_service_edge(&frame.call, 1 << 20, &data[..data.len().min(64)]);
         check_dir_rename_screen(&frame, data.first().copied().unwrap_or(0));
+        check_identity_peer_screen(&frame, &data[..data.len().min(48)]);
     }
     if let Ok(frame) = decode_reply(data) {
         check_reply(&frame);
@@ -994,6 +1029,7 @@ fuzz_target!(|data: &[u8]| {
     // --- arm 3: the service edge over the call's integers -------------------
     check_service_edge(&request.call, input.total_extents, &input.record_seed);
     check_dir_rename_screen(&request, input.record_seed.first().copied().unwrap_or(0));
+    check_identity_peer_screen(&request, &input.record_seed);
     // Past the CONTROL cap the encoder REFUSES (a return of that many
     // runs never rides one frame) — that refusal is the contract, not a
     // failure; below it the frame must round-trip.

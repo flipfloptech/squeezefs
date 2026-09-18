@@ -813,6 +813,13 @@ pub struct FsckCounters {
     /// FOREIGN appender's un-replayed ring window names — in flight at
     /// their holder, judged by the pass after its checkpoint or recovery.
     pub inode_plane_window_scoped: u64,
+    /// Symmetric PR 12b (review round 1, Issue 1): the DENTRY pass met a
+    /// slot a LIVE foreign appender leases — its dentries live in the
+    /// lessee's tree, which this mount holds only as a projection whose
+    /// staleness the census cannot bound (the `sym-storm` leg read a
+    /// remounted joiner's 1,444 removals as 442 dangling names) — so the
+    /// inode plane recorded NO verdict this run. One per volume so met.
+    pub inode_plane_foreign_dentry_scoped: u64,
     /// PR 8: `fsck_inode_plane_slots_covered` — Σ over the pass's volumes
     /// of the slots this mount's inode plane judged: the slots it LEASES
     /// plus, on the volume's manager, the UNLEASED slots (tree 0's) —
@@ -1753,25 +1760,51 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
                 async move { build_referenced_inos(meta, None, pct, cancel, None).await }
             });
             let census = walk_census(ctx, opts, &mut counters).await?;
-            let (refs, indexed) = refs_pass.await.map_err(|e| {
+            let (refs, indexed, foreign_dentry) = refs_pass.await.map_err(|e| {
                 crate::error::SqueezefsError::InvalidOperation(format!(
                     "fsck C9 referenced-ino pass failed: {e}"
                 ))
             })?;
             counters.dentry_refs_indexed += indexed;
+            counters.inode_plane_foreign_dentry_scoped += foreign_dentry;
             counters.inodes_scanned = census.inodes_scanned;
             (census, refs)
         } else if unthrottled {
-            let mut walks = Vec::new();
+            // The C1 fan-out is BOUNDED by the meta lane population (the
+            // census's own throttle law — review round 1 of PR 12b, Issue
+            // 13): on a forest a unit is one SLOT TREE, and an N-writer set
+            // holds hundreds (64 rotor + first-touched slots per writer per
+            // volume), so one task per unit put hundreds of concurrent
+            // walks on a two-lane pool — the venue where the loader's
+            // mixed-style bucket lock wedged the fleet's reader. The walks
+            // run in waves of `lanes × 4`, each wave awaited before the
+            // next is spawned (results only accumulate — order is free).
+            let wave = crate::meta_exec::meta_lanes_from(crate::cpu::process_parallelism())
+                .saturating_mul(4)
+                .max(1);
+            let mut units: Vec<(
+                usize,
+                Arc<crate::meta_backend::kv::backend::KvMetaBackend>,
+                C1Unit,
+            )> = Vec::new();
             for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
                 for unit in c1_units(kv) {
-                    let kv = kv.clone();
+                    units.push((vol_idx, kv.clone(), unit));
+                }
+            }
+            let mut walks = Vec::with_capacity(units.len());
+            for chunk in units.chunks(wave) {
+                let mut inflight = Vec::with_capacity(chunk.len());
+                for (vol_idx, kv, unit) in chunk.iter().cloned() {
                     let cancel = opts.cancel.clone();
                     let pct = opts.throttle_pct;
-                    walks.push(crate::meta_exec::spawn_meta_join(
+                    inflight.push(crate::meta_exec::spawn_meta_join(
                         "fsck_c1_walk",
                         async move { walk_one_tree_c1(kv, vol_idx, unit, pct, cancel).await },
                     ));
+                }
+                for w in inflight {
+                    walks.push(w.await);
                 }
             }
             // The C4/C5 staging scan overlaps too (its own dirs +
@@ -1803,7 +1836,7 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
             // All walks must land before the pass proceeds; awaiting in
             // submission order is equivalent (results only accumulate).
             for walk in walks {
-                let (nodes_walked, walk_suspects) = walk.await.map_err(|e| {
+                let (nodes_walked, walk_suspects) = walk.map_err(|e| {
                     crate::error::SqueezefsError::InvalidOperation(format!(
                         "fsck C1 walk task failed: {e}"
                     ))
@@ -1816,12 +1849,13 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
                     "fsck staging scan task failed: {e}"
                 ))
             })?);
-            let (refs, indexed) = refs_pass.await.map_err(|e| {
+            let (refs, indexed, foreign_dentry) = refs_pass.await.map_err(|e| {
                 crate::error::SqueezefsError::InvalidOperation(format!(
                     "fsck C9 referenced-ino pass failed: {e}"
                 ))
             })?;
             counters.dentry_refs_indexed += indexed;
+            counters.inode_plane_foreign_dentry_scoped += foreign_dentry;
             counters.inodes_scanned = census.inodes_scanned;
             if opts.shard.is_some() {
                 shard_refs = Some(PartialCensus {
@@ -1854,7 +1888,7 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
             )
             .await;
             suspects.extend(staging);
-            let (refs, indexed) = build_referenced_inos(
+            let (refs, indexed, foreign_dentry) = build_referenced_inos(
                 ctx.meta.clone(),
                 opts.shard,
                 opts.throttle_pct,
@@ -1863,6 +1897,7 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
             )
             .await;
             counters.dentry_refs_indexed += indexed;
+            counters.inode_plane_foreign_dentry_scoped += foreign_dentry;
             (census, refs)
         };
 
@@ -2182,6 +2217,7 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         counters.inode_plane_foreign_scoped += r.counters.inode_plane_foreign_scoped;
         counters.inode_plane_foreign_slot_scoped += r.counters.inode_plane_foreign_slot_scoped;
         counters.inode_plane_window_scoped += r.counters.inode_plane_window_scoped;
+        counters.inode_plane_foreign_dentry_scoped += r.counters.inode_plane_foreign_dentry_scoped;
         counters.inode_plane_slots_covered += r.counters.inode_plane_slots_covered;
         counters.inode_plane_cross_owner_declined += r.counters.inode_plane_cross_owner_declined;
         counters.inode_plane_proposals_admitted += r.counters.inode_plane_proposals_admitted;
@@ -2317,6 +2353,7 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     dst.inode_plane_foreign_scoped += fin.inode_plane_foreign_scoped;
     dst.inode_plane_foreign_slot_scoped += fin.inode_plane_foreign_slot_scoped;
     dst.inode_plane_window_scoped += fin.inode_plane_window_scoped;
+    dst.inode_plane_foreign_dentry_scoped += fin.inode_plane_foreign_dentry_scoped;
     dst.inode_plane_slots_covered += fin.inode_plane_slots_covered;
     dst.inode_plane_cross_owner_declined += fin.inode_plane_cross_owner_declined;
     // `inode_plane_volumes_covered` is deliberately NOT folded: coverage
@@ -2464,7 +2501,20 @@ pub async fn run_fleet(
         o.inode_plane = false;
         o
     };
+    let shard0_started = std::time::Instant::now();
     let mut reports = vec![run(ctx, &local_shard(0)).await?];
+    // The collect loop's PROGRESS deadline (review round 1 of PR 12b,
+    // Issue 13): a worker's shard is the same partition this coordinator
+    // just ran as shard 0, so a proposal is due within a bounded multiple
+    // of that wall — floored at the lease TTL (a shard that beats its
+    // lease but never proposes is a WEDGED worker, which the lease law
+    // alone never notices). Past it every outstanding census shard is
+    // treated as lost: re-leased or run locally, and the job TERMINATES.
+    let shard0_wall = shard0_started.elapsed();
+    let progress_deadline = std::time::Instant::now()
+        + fleet
+            .shard_lease_ttl()
+            .max(shard0_wall.saturating_mul(4).max(Duration::from_secs(1)));
     for k in std::mem::take(&mut local_residues) {
         METRICS
             .job_fleet_shards_relocal
@@ -2493,6 +2543,29 @@ pub async fn run_fleet(
         let Ok(recv) =
             squeezefs_ipc::sqz_time::timeout(Duration::from_millis(250), rx.recv()).await
         else {
+            if std::time::Instant::now() >= progress_deadline {
+                let stuck: Vec<u32> = outstanding.iter().copied().collect();
+                log::warn!(
+                    "fsck fleet ({job_id}): census shard(s) {stuck:?} of {n} and {} inode-plane \
+                     shard(s) proposed nothing within the progress deadline (lease TTL {:?} / \
+                     4 x the coordinator's own shard wall {:?}) — a wedged or gone worker; the \
+                     job's fleet shards are RETIRED (a late proposal is refused), the census \
+                     shards run locally (job_fleet_shards_relocal), an owner's plane shard \
+                     leaves the pass INCOMPLETE",
+                    plane_outstanding.len(),
+                    fleet.shard_lease_ttl(),
+                    shard0_wall
+                );
+                fleet.retire_fleet_shards(job_id);
+                for k in stuck {
+                    outstanding.remove(&k);
+                    METRICS
+                        .job_fleet_shards_relocal
+                        .fetch_add(1, Ordering::Relaxed);
+                    reports.push(run(ctx, &local_shard(k)).await?);
+                }
+                break;
+            }
             continue;
         };
         let Some(out) = recv else {
@@ -2798,7 +2871,7 @@ pub async fn run_fleet(
         // `recheck_suspects` machinery, shared with the allocator classes'
         // finalize.
         if !opts.cancel.load(Ordering::Relaxed) {
-            let (ip_refs, ip_indexed) = build_referenced_inos(
+            let (ip_refs, ip_indexed, ip_foreign_dentry) = build_referenced_inos(
                 ctx.meta.clone(),
                 None,
                 opts.throttle_pct,
@@ -2807,6 +2880,7 @@ pub async fn run_fleet(
             )
             .await;
             fin_counters.dentry_refs_indexed += ip_indexed;
+            fin_counters.inode_plane_foreign_dentry_scoped += ip_foreign_dentry;
             let ip_census = walk_census(ctx, &fin_opts, &mut fin_counters).await?;
             // C11 (b): the finalize's own unsharded census carries the
             // empty-head nominations (the merged shard census cannot —
@@ -3038,6 +3112,7 @@ fn fold_worker_counters(dst: &mut FsckCounters, src: &FsckCounters) {
     dst.nlink_transient_cleared += src.nlink_transient_cleared;
     dst.inode_plane_foreign_scoped += src.inode_plane_foreign_scoped;
     dst.inode_plane_foreign_slot_scoped += src.inode_plane_foreign_slot_scoped;
+    dst.inode_plane_foreign_dentry_scoped += src.inode_plane_foreign_dentry_scoped;
     dst.inode_plane_window_scoped += src.inode_plane_window_scoped;
     dst.inode_plane_slots_covered += src.inode_plane_slots_covered;
     dst.inode_plane_cross_owner_declined += src.inode_plane_cross_owner_declined;
@@ -3686,7 +3761,7 @@ async fn build_referenced_inos(
     throttle_pct: u32,
     cancel: Arc<AtomicBool>,
     collect: Option<&std::collections::HashSet<u64>>,
-) -> (Option<RefPass>, u64) {
+) -> (Option<RefPass>, u64, u64) {
     use crate::meta_backend::kv::record::{decode_dentry_key, DentryValue};
     let mut pass = RefPass {
         refs: ino_bitmap(&meta),
@@ -3697,7 +3772,49 @@ async fn build_referenced_inos(
     };
     let budget = c10_count_entry_budget();
     let mut indexed = 0u64;
+    let mut foreign_dentry_scoped = 0u64;
     for (vol_idx, kv) in meta.volumes.iter().enumerate() {
+        // A slot a LIVE foreign appender leases (symmetric PR 12b, review
+        // round 1, Issue 1): its dentries live in the LESSEE's tree, which
+        // this mount holds only as a projection — the images it flushed at
+        // the last transfer or recovery, appended into by the lessee under
+        // an unchanged root (KD-SYM-5: a non-lessee's cache of a leased
+        // slot is not authoritative) — so a dentry read here may be
+        // removals behind, and every such name whose child slot this
+        // mount DOES judge reads as a dangling dentry (the `sym-storm`
+        // leg: a remounted joiner's 1,444 unlinks, its 40 LRU-released
+        // child slots re-read fresh, 442 false C10 findings). PR 8's
+        // lessee-shard law scoped the INODE side only; the NAME side is
+        // scoped here: the dentry set is complete on this mount only when
+        // no slot of the volume is leased elsewhere. Reading a live
+        // lessee's dentries through its holder (a census verb on the S8
+        // wire) is the instrument that restores the verdict with joiners
+        // live — PR 13's; until it lands the plane records NO verdict,
+        // counted (`fsck_inode_plane_foreign_dentry_scoped`), never a
+        // finding over a tree whose staleness it cannot bound.
+        match kv.inode_plane_slot_coverage().await {
+            Ok(cov) if cov.foreign > 0 => {
+                foreign_dentry_scoped += 1;
+                log::warn!(
+                    "fsck C9/C10: meta volume {vol_idx} has {} slot(s) leased to another LIVE \
+                     appender — their dentries are that lessee's, held here as a projection \
+                     of unbounded staleness, so the referenced-ino set is not this mount's to \
+                     census and the inode-plane classes record NO verdict this run \
+                     (fsck_inode_plane_foreign_dentry_scoped; the lessee's clean leave or its \
+                     recovery makes the set this mount's again)",
+                    cov.foreign
+                );
+                return (None, indexed, foreign_dentry_scoped);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                log::warn!(
+                    "fsck C9/C10: meta volume {vol_idx}'s slot coverage could not be read \
+                     ({e}) — the inode-plane classes record no verdict this run"
+                );
+                return (None, indexed, foreign_dentry_scoped);
+            }
+        }
         // A forest volume's dentry set is COMPLETE on a non-writer only
         // when no appender page is `Live` (symmetric PR 7b review round 1,
         // Issue 21b): a `Live` page at a probe's open is a dead writer's
@@ -3719,13 +3836,13 @@ async fn build_referenced_inos(
                      the inode-plane classes record no verdict for this run (a writer's open \
                      replays its own residue; a dead peer's is PR 10's recovery)"
                 );
-                return (None, indexed);
+                return (None, indexed, foreign_dentry_scoped);
             }
         }
         let mut cursor: Vec<u8> = vec![0u8];
         loop {
             if cancel.load(Ordering::Relaxed) {
-                return (None, indexed);
+                return (None, indexed, foreign_dentry_scoped);
             }
             let t0 = std::time::Instant::now();
             let page = match kv
@@ -3744,7 +3861,7 @@ async fn build_referenced_inos(
                          referenced-ino set is incomplete, so the inode-plane classes \
                          record no verdict for this run (C1 owns the unreadable node)"
                     );
-                    return (None, indexed);
+                    return (None, indexed, foreign_dentry_scoped);
                 }
             };
             let Some((last, _)) = page.last() else { break };
@@ -3813,11 +3930,11 @@ async fn build_referenced_inos(
                      partial set would report named inodes as unreferenced)",
                     ino_set_byte_budget()
                 );
-                return (None, indexed);
+                return (None, indexed, foreign_dentry_scoped);
             }
         }
     }
-    (Some(pass), indexed)
+    (Some(pass), indexed, foreign_dentry_scoped)
 }
 
 /// The C9 difference: live inodes with no dentry, filtered to those
@@ -4108,7 +4225,7 @@ async fn evaluate_c10_inode_plane(
     // One extra dentry walk, paid only when a name really does resolve to
     // nothing: the dangling arm's object is the dentry RECORD (a collision
     // chain holds several keys for one name), so repair needs its identity.
-    let (identities, _) = build_referenced_inos(
+    let (identities, _, _) = build_referenced_inos(
         ctx.meta.clone(),
         opts.shard,
         opts.throttle_pct,
@@ -4634,7 +4751,7 @@ struct C17Fresh {
 
 impl C17Fresh {
     async fn build(ctx: &FsckCtx) -> Option<Self> {
-        let (Some(fresh), _) = build_referenced_inos(
+        let (Some(fresh), _, _) = build_referenced_inos(
             Arc::clone(&ctx.meta),
             None,
             0,
@@ -5535,7 +5652,7 @@ async fn recheck_suspects(
         }
     }
     let fresh_pass = if (online && c9_pending) || !c10_judged.is_empty() {
-        let (refs, indexed) = build_referenced_inos(
+        let (refs, indexed, _) = build_referenced_inos(
             ctx.meta.clone(),
             opts.shard,
             opts.throttle_pct,
@@ -7110,6 +7227,8 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.inode_plane_foreign_slot_scoped, Ordering::Relaxed);
     m.fsck_inode_plane_window_scoped
         .fetch_add(c.inode_plane_window_scoped, Ordering::Relaxed);
+    m.fsck_inode_plane_foreign_dentry_scoped
+        .fetch_add(c.inode_plane_foreign_dentry_scoped, Ordering::Relaxed);
     if c.inode_plane_slots_covered > 0 {
         m.fsck_inode_plane_slots_covered
             .store(c.inode_plane_slots_covered, Ordering::Relaxed);

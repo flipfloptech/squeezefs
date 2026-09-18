@@ -630,6 +630,7 @@ impl SlotLeasePlane {
             stale_entries: self.stale_entries.load(Relaxed),
             door_parks: self.door_parks.load(Relaxed),
             door_refusals: self.door_refusals.load(Relaxed),
+            door_draining_admits: self.gate.draining_admits(),
             acquire_refusals: self.acquire_refusals.load(Relaxed),
             rotor_cap_refusals: self.rotor_cap_refusals.load(Relaxed),
             grant_deferrals: self.grant_deferrals.load(Relaxed),
@@ -901,6 +902,10 @@ pub struct SlotLeaseStats {
     /// Commits refused `SlotBusy` at the door: another appender leases
     /// the slot (the "ship to the holder" class — PR 6/12's ship).
     pub door_refusals: u64,
+    /// Content applies admitted under `Releasing` as a door-token
+    /// holder's — the release's drain waiting for exactly them (PR 12b
+    /// review round 1, Issue 11; legal, the belt's law kept).
+    pub door_draining_admits: u64,
     /// Explicit acquires of a slot another appender holds (legal).
     pub acquire_refusals: u64,
     /// Rotor asks refused past `2 × M` (legal — the overflow arm's

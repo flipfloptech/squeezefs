@@ -1292,9 +1292,17 @@ impl JobWireHost {
         // manager failover `mac invalid` for the member's life (the
         // sym-crash fleet leg: the joiners parked at `T_self` against a
         // successor whose grace window would have admitted them).
-        let secret = match read_enroll_secret(fabric.meta_handle()).await {
-            Ok(existing) if existing.len() == 32 => existing,
-            _ => {
+        //
+        // Three outcomes, never conflated (PR 12b review round 1, Issue
+        // 3): ABSENT ⇒ mint (the first coordinator of the set); a record
+        // PRESENT but of another length or undecodable ⇒ REFUSE loud
+        // naming it (a reserved-xattr corruption is never overwritten
+        // silently — the operator's rotation lever is REMOVING the record,
+        // `docs/operations.md`); an I/O error ⇒ PROPAGATE — re-minting on
+        // a transient read failure would bring the rotation, and the `mac
+        // invalid` class it produced, back on exactly the bad day.
+        let secret = match fabric.meta_handle().getxattr(1, JOB_ENROLL_XATTR).await? {
+            None => {
                 let mut fresh = vec![0u8; 32];
                 rand::Rng::fill(&mut rand::thread_rng(), &mut fresh[..]);
                 let record =
@@ -1304,6 +1312,19 @@ impl JobWireHost {
                     .setxattr(1, JOB_ENROLL_XATTR, record.to_string().as_bytes())
                     .await?;
                 fresh
+            }
+            Some(_) => {
+                let existing = read_enroll_secret(fabric.meta_handle()).await?;
+                if existing.len() != 32 {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "the set's `{JOB_ENROLL_XATTR}` record carries a {}-byte secret (32 \
+                         expected) — a corrupt reserved xattr is never overwritten silently; \
+                         remove the record on a quiesced set to mint a fresh secret (every \
+                         member re-enrolls at its next arm)",
+                        existing.len()
+                    )));
+                }
+                existing
             }
         };
 
@@ -2727,6 +2748,10 @@ impl JobWireHost {
 impl crate::jobs::FleetDispatch for JobWireHost {
     fn read_capacity(&self) -> usize {
         self.fleet_read_capacity()
+    }
+
+    fn shard_lease_ttl(&self) -> std::time::Duration {
+        self.cfg.lease_ttl
     }
 
     fn dispatch_read_shard(

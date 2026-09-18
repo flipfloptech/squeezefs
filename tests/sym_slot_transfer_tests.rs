@@ -1130,6 +1130,127 @@ async fn a_commit_during_a_handover_parks_at_the_door_and_never_fails_einval() {
     shutdown(&routed).await;
 }
 
+/// **PR 12b review round 1, Issue 11 — a token holder's apply under a
+/// release is never the belt.** The round-1 matrix fail-stopped a volume
+/// on a LEGAL schedule: a first-touch commit took its door token (and
+/// acquired the slot — a barriered control entry) before its holder op
+/// was noted at `build_queued_tx`; the cadence's LRU release read the
+/// slot IDLE, raised `Releasing` and drained the door — waiting for that
+/// very token — while the pass applied the token-holding commit under the
+/// node lock and `apply_locked`'s verdict refused it (`meta_kv_leaf_
+/// lease_refusals`), failing its batch and escalating the volume. Two
+/// fixes, both pinned here: the holder op is noted INSIDE the door (a
+/// slot with a token out never reads idle), and a mutation under
+/// `Releasing` with a door token out is ADMITTED (`slot_door_draining_
+/// admits`) — the drain waits for exactly it. The schedule is forced with
+/// the post-door seam: the committer parks with its token out, the
+/// release begins and drains against it, the committer resumes and its
+/// commit LANDS; the belt stays at its pre-run value and the volume is
+/// never fail-stopped. Red before both fixes at the `commit.expect`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_holding_commit_lands_under_the_release_that_drains_it() {
+    use squeezefs::meta_backend::kv::backend::{
+        test_conveyor_hold_release, test_conveyor_post_door_parked, TEST_CONVEYOR_HOLD_POST_DOOR,
+        TEST_CONVEYOR_HOLD_STAGE,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let plane = vol.slot_leases().expect("armed");
+    let tag = 0xD011;
+    let belt_before = META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed);
+    let admits_before = lease_stats(&vol).door_draining_admits;
+
+    // A slot this mount already leases (the seed commit's first touch).
+    let slot: ForestSlot = 5;
+    let owner = ino_in_slot(slot, 31);
+    vol.commit_block_refs(owner, &refs(tag, owner, 0, 1))
+        .await
+        .unwrap();
+    assert!(plane.gate.is_leased(slot));
+    let now = squeezefs::mono_core::monotonic_ns_u64();
+    let ops_before = plane.holder_ops(slot, now);
+
+    // The committer parks right after the door: its token is out, its
+    // tx not yet queued — Issue 11's window.
+    let parked_before = test_conveyor_post_door_parked();
+    TEST_CONVEYOR_HOLD_STAGE.store(TEST_CONVEYOR_HOLD_POST_DOOR, Ordering::SeqCst);
+    let commit = {
+        let vol = Arc::clone(&vol);
+        tokio::spawn(async move {
+            vol.commit_block_refs(owner, &refs(tag, owner, 300, 1))
+                .await
+        })
+    };
+    while test_conveyor_post_door_parked() == parked_before {
+        assert!(!commit.is_finished(), "the committer must park at the seam");
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(plane.gate.inflight(slot), 1, "the door token is out");
+    // Fix (a): the op was noted INSIDE the door — the slot never reads
+    // idle to a cadence that runs now.
+    let now = squeezefs::mono_core::monotonic_ns_u64();
+    assert!(
+        plane.holder_ops(slot, now) > ops_before,
+        "the holder op is noted before the token, not after the acquire"
+    );
+
+    // The release begins against the parked committer: `Releasing` is
+    // raised and the drain waits for the token.
+    let release = {
+        let vol = Arc::clone(&vol);
+        tokio::spawn(async move { vol.release_slot_handover(0, slot).await })
+    };
+    while !plane.gate.is_releasing(slot) {
+        assert!(!release.is_finished(), "the release must wait on the drain");
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !release.is_finished(),
+        "the drain waits for the parked committer's token"
+    );
+
+    // The committer resumes: its tx is queued and applied UNDER
+    // `Releasing` as a token holder — it lands (fix b), the release then
+    // completes.
+    TEST_CONVEYOR_HOLD_STAGE.store(0, Ordering::SeqCst);
+    test_conveyor_hold_release();
+    commit
+        .await
+        .unwrap()
+        .expect("the token-holding commit lands under the release that drains it");
+    release
+        .await
+        .unwrap()
+        .expect("the release completes after the drain");
+    assert!(!plane.gate.is_leased(slot), "the slot was released");
+    assert_eq!(vol.block_ref_count(tag, 300).await.unwrap(), 1);
+    assert_eq!(
+        META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed),
+        belt_before,
+        "the belt never fires on a legal schedule"
+    );
+    assert!(
+        lease_stats(&vol).door_draining_admits > admits_before,
+        "the apply was admitted as the drain's own commit"
+    );
+    assert!(
+        !vol.is_failed(),
+        "the volume is never fail-stopped on a legal schedule"
+    );
+    // The released tree holds the record at the next open.
+    shutdown(&routed).await;
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_eq!(vol.block_ref_count(tag, 300).await.unwrap(), 1);
+    shutdown(&routed).await;
+}
+
 /// **Issue 5 (review round 2) — one writer discipline per RAM set.** The
 /// region's lease set and the plane's rotor are `ArcSwap`s mutated by
 /// clone-and-store from different critical sections (a grant under
@@ -2970,6 +3091,7 @@ async fn a_wire_releases_slot_words_are_screened_before_any_effect() {
             id: 7,
             verb: VERB_MANAGER_CALL,
             body,
+            peer: "probe".into(),
         })
         .await;
     assert_eq!(resp.status, STATUS_REJECTED);

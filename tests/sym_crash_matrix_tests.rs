@@ -1310,6 +1310,21 @@ async fn appender_clear_refuses_a_live_lease_and_attests_a_dead_one() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
+    // (0) The manager's claim went stale ONE second ago (PR 12b review
+    // round 1, Issue 4(ii)): a live JOINED appender may be PARKED at
+    // `T_self` reclaiming against the successor — the verb refuses inside
+    // the derived `T_park_max`, naming it; a clear there would recover a
+    // live writer's ring.
+    recovery::TEST_CLAIM_CLOCK_SKEW_SECS.store(
+        squeezefs::fuse_client::CLIENT_STALE_TTL_SECS + 1,
+        Ordering::SeqCst,
+    );
+    let parked_window = clear().await;
+    recovery::TEST_CLAIM_CLOCK_SKEW_SECS.store(0, Ordering::SeqCst);
+    match parked_window {
+        Err(KvError::Busy(m)) => assert!(m.contains("T_park_max"), "{m}"),
+        other => panic!("cleared inside the parked-joiner window: {other:?}"),
+    }
     // (a) A fresh heartbeat of the appender's node: refused.
     {
         let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();

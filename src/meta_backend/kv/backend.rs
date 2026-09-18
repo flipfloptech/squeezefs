@@ -304,6 +304,23 @@ pub fn test_conveyor_post_recall_parked() -> u64 {
     TEST_CONVEYOR_POST_RECALL_PARKED.load(Ordering::Acquire)
 }
 
+/// [`TEST_CONVEYOR_HOLD_STAGE`] value (PR 12b review round 1, Issue 11):
+/// park a committer right AFTER the commit door handed it its slot tokens
+/// and BEFORE its tx is queued — the window in which a release of one of
+/// its slots (the cadence's LRU arm, a handover) raises `Releasing` and
+/// drains the door against this very commit; the commit then applies
+/// under `Releasing` as a TOKEN HOLDER and must land.
+pub const TEST_CONVEYOR_HOLD_POST_DOOR: u64 = 6;
+
+/// Committers parked on [`TEST_CONVEYOR_HOLD_POST_DOOR`] so far — the
+/// test-side barrier.
+static TEST_CONVEYOR_POST_DOOR_PARKED: AtomicU64 = AtomicU64::new(0);
+
+/// Committers parked on [`TEST_CONVEYOR_HOLD_POST_DOOR`] so far.
+pub fn test_conveyor_post_door_parked() -> u64 {
+    TEST_CONVEYOR_POST_DOOR_PARKED.load(Ordering::Acquire)
+}
+
 /// Lane groups parked on [`TEST_CONVEYOR_HOLD_PRE_ROLLBACK`] so far.
 pub fn test_conveyor_hold_parked() -> u64 {
     TEST_CONVEYOR_PRE_ROLLBACK_PARKED.load(Ordering::Acquire)
@@ -3563,10 +3580,32 @@ impl KvMetaBackend {
         // next checkpoint) and, when the projection moved, resolves and
         // reads again through the holder it names now (the manager for an
         // unleased slot).
+        // A projection refresh that FAILS never replaces the divert's own
+        // error (review round 1, Issue 8): it is logged and the original
+        // error stands.
+        let projection_moved = |e: String| async move {
+            if !joined {
+                return false;
+            }
+            match self.refresh_control_projection().await {
+                Ok(moved) => moved,
+                Err(re) => {
+                    log::debug!(
+                        "meta volume {}: projection refresh after a divert failure ({e}) failed \
+                         itself ({re}) — the divert's own error stands",
+                        self.path.display()
+                    );
+                    false
+                }
+            }
+        };
         let tokens = match self.token_reader_for(object).await {
             Ok(Some(t)) => t,
             Ok(None) => return Ok(None),
-            Err(e) if joined && self.refresh_control_projection().await? => {
+            Err(e) => {
+                if !projection_moved(e.to_string()).await {
+                    return Err(e);
+                }
                 log::info!(
                     "meta volume {}: object {object}'s holder was unreachable ({e}); the lease \
                      projection moved — resolved again",
@@ -3577,13 +3616,12 @@ impl KvMetaBackend {
                     None => return Ok(None),
                 }
             }
-            Err(e) => return Err(e),
         };
         match tokens.serve(object, wants).await {
             Ok(serve) => Ok(Some(serve)),
             Err(e) => {
                 let Some(redirect) = crate::meta_ship::token_plane::not_holder_redirect(&e) else {
-                    if joined && self.refresh_control_projection().await? {
+                    if projection_moved(e.to_string()).await {
                         if let Some(t) = self.token_reader_for(object).await? {
                             return t
                                 .serve(object, wants)
@@ -6898,31 +6936,6 @@ impl KvMetaBackend {
         verdict
     }
 
-    /// One own commit's slots noted on the holder's window (called per
-    /// staged tx on an armed mount — a lock-free bump per distinct slot).
-    fn note_slot_ops(&self, recs: &[(u8, Record)]) {
-        let Some(plane) = self.slot_leases() else {
-            return;
-        };
-        let now = crate::mono_core::monotonic_ns_u64();
-        let t_idle = plane.t_idle_ns();
-        let mut last: Option<super::record::ForestSlot> = None;
-        for (tag, r) in recs {
-            let (kind, level) = untag(*tag);
-            if level > 0 || !super::record::is_slot_tree_kind(kind) {
-                continue;
-            }
-            let Ok(slot) = super::record::forest_key_slot(&r.key) else {
-                continue;
-            };
-            if last == Some(slot) {
-                continue;
-            }
-            last = Some(slot);
-            plane.note_holder_op(slot, now, t_idle);
-        }
-    }
-
     /// **The commit door** (§5.1.2 first-writer-takes-it + §5.4.1's
     /// door law; review round 2, Issue 6): every slot a tx's records name
     /// must be this mount's before the tx is queued, and the tx holds a
@@ -6958,6 +6971,18 @@ impl KvMetaBackend {
         }
         if slots.is_empty() {
             return Ok(None);
+        }
+        // The holder-op note INSIDE the door, before any token (PR 12b
+        // review round 1, Issue 11): the cadence's LRU release reads a
+        // slot's idleness off this window, and the round-1 build noted
+        // the op at `build_queued_tx` — AFTER a first touch's acquire
+        // (a barriered control entry). In that gap the slot read idle
+        // with its commit's token out: the cadence began its release and
+        // the belt refused the very commit the drain was waiting for.
+        let now = crate::mono_core::monotonic_ns_u64();
+        let t_idle = plane.t_idle_ns();
+        for slot in &slots {
+            plane.note_holder_op(*slot, now, t_idle);
         }
         let mut entered: Vec<super::record::ForestSlot> = Vec::with_capacity(slots.len());
         for slot in slots {
@@ -7260,7 +7285,12 @@ impl KvMetaBackend {
                 if plane.rotor.load().len() as u64 <= m {
                     break;
                 }
-                if self.release_for_cadence(0, slot).await? {
+                // The rotor is the mount's OWN region's (PR 12b review
+                // round 1, Issue 10): region 0 is the manager's, and on a
+                // joined appender `transfer_slot_locked(0, …)` answered
+                // "not one of this mount's regions" — swallowed as "not
+                // this tick", so a joiner never shrank its rotor.
+                if self.release_for_cadence(set.own_id(), slot).await? {
                     plane.forced_shrinks.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -17586,24 +17616,41 @@ impl KvMetaBackend {
                     // reads); one below it is a stale attestation of a
                     // lease since released (`slot_lease_stale_entries`);
                     // a slot tree 0 has no record for is this page's alone.
-                    let lease_g = match forest
+                    // An entry is CURRENT when tree 0 leases the slot to THIS
+                    // region at the entry's generation; an `Unleased` slot's
+                    // entry is stale whatever its `g` (a release keeps `g` —
+                    // tree 0 is an unleased slot's root's home, KD-SYM-3);
+                    // a slot tree 0 has no record for is this page's alone.
+                    let current = match forest
                         .control()
                         .lookup(&super::slot_state::slot_state_key(slot))
                         .await?
                         .map(|v| super::slot_state::SlotState::decode(&v))
                         .transpose()?
                     {
-                        Some(super::slot_state::SlotState::Leased { g, .. })
-                        | Some(super::slot_state::SlotState::Unleased { g, .. }) => g,
-                        None => 0,
+                        Some(super::slot_state::SlotState::Leased { g, appender_id, .. }) => {
+                            appender_id == r.id && e.g >= g
+                        }
+                        Some(super::slot_state::SlotState::Unleased { .. }) => false,
+                        None => true,
                     };
-                    let current = e.g >= lease_g;
                     // Both arms raise the node-seq handle to the page's
                     // root seq inside the ONE install (review round 2,
                     // Issue 24 — the recovery driver shares them).
                     let page_root_current = match forest.tree(slot) {
                         Some(t) => {
-                            if current && e.root != t.root() {
+                            // Against the mount's OWN tree the page root and
+                            // the replayed window's SMO records are ONE
+                            // writer's seq space, and the newer wins (PR 10's
+                            // guard): a root swap journaled AFTER the page
+                            // write moved the tree past the page's word at
+                            // the replay, and installing the page's OLDER
+                            // root over it lost the move (or refused the
+                            // open on the replay's dirty nodes — review
+                            // round 1, Issue 12). The generation gate orders
+                            // this page against tree 0's record; it never
+                            // orders it against the window.
+                            if current && e.root.seq > t.root().seq {
                                 cache.drop_slot_nodes(slot)?;
                                 t.install_recovered_root(e.root, floor).await?;
                                 true
@@ -17695,14 +17742,16 @@ impl KvMetaBackend {
                     {
                         continue;
                     }
-                    // The dead lessee's page root, whenever the RAM tree
-                    // stands elsewhere (never a node-seq comparison — the
-                    // lessee's seqs are its own handle's, PR 12b; the
-                    // forest open already chose this root by generation,
-                    // so the arm is the between-two-reads belt).
+                    // The dead lessee's page root when the RAM tree stands
+                    // BEHIND it (the forest open already chose this root by
+                    // generation, so the arm is the between-two-reads
+                    // belt); a tree the replay carried past the page (a
+                    // root swap in the window) keeps its newer root — the
+                    // page's and the window's seqs are the dead lessee's
+                    // one handle (Issue 12's law).
                     match forest.tree(slot) {
                         Some(t) => {
-                            if se.root != t.root() {
+                            if se.root.seq > t.root().seq {
                                 cache.drop_slot_nodes(slot)?;
                                 t.install_recovered_root(se.root, ledger.journal_tail_seq)
                                     .await?;
@@ -18642,6 +18691,23 @@ impl KvMetaBackend {
         // foreign one refuses `SlotBusy`; the tokens ride the queue entry
         // to the terminal outcome. A no-op unarmed.
         let door = self.ensure_leases_for_tx(&tx).await?;
+        // Test seam (Issue 11's schedule): park HERE — the door tokens
+        // out, nothing queued — so a release of one of the tx's slots
+        // can begin and drain against this very commit. Register-
+        // recheck-await on the conveyor hold's notify.
+        if door.is_some()
+            && TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed) == TEST_CONVEYOR_HOLD_POST_DOOR
+        {
+            TEST_CONVEYOR_POST_DOOR_PARKED.fetch_add(1, Ordering::AcqRel);
+            while TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed) == TEST_CONVEYOR_HOLD_POST_DOOR {
+                let notified = TEST_CONVEYOR_HOLD_NOTIFY.notified();
+                if TEST_CONVEYOR_HOLD_STAGE.load(Ordering::Relaxed) != TEST_CONVEYOR_HOLD_POST_DOOR
+                {
+                    break;
+                }
+                notified.await;
+            }
+        }
         // (1) Exact size before anything is queued (§4.4 pt 5) — an
         // oversized / undecodable tx fails ALONE, never inside a batch.
         let weak = self.conveyor_identity()?;
@@ -18860,7 +18926,6 @@ impl KvMetaBackend {
         }
         let len = entry_len_for(&recs)?;
         let region = self.region_of_records(&recs)?;
-        self.note_slot_ops(&recs);
 
         let (done, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
         // op-trace (audit A2): the tx carries the ORIGINATING op's id

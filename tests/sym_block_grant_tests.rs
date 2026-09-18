@@ -843,7 +843,13 @@ async fn an_armed_two_writer_set_allocates_disjoint_ranges_from_grants() {
     let w = wire(successor_identity());
     assert!(b.install_block_grant_arm(
         DATA_TAG,
-        alloc_lease::wire_block_grant_sink(endpoint.clone(), SECRET.to_vec(), w, 0, DATA_TAG),
+        alloc_lease::wire_block_grant_sink(
+            alloc_lease::HolderVenue::fixed(endpoint.clone()),
+            SECRET.to_vec(),
+            w,
+            0,
+            DATA_TAG,
+        ),
     ));
     assert!(alloc_lease::install_wire_free_target(DATA_TAG, &endpoint));
     let mut mine_a = std::collections::BTreeSet::new();

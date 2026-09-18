@@ -2369,12 +2369,88 @@ pub fn holder_block_grant_sink(
     })
 }
 
-/// A WIRE writer's grant sink: `ManagerCall::BlockGrant` to the manager
-/// venue at `endpoint` (one storage-trust session, reconnected on
-/// failure). PR 12b's second daemon is the production caller; the
-/// contracts drive it here.
+/// Resolves the CURRENT listener of a data volume's allocation-lease
+/// holder off durable state (`None` = unresolvable right now).
+pub type HolderVenueResolver = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// **The venue a wire writer's DATA plane dials for one data volume** —
+/// the allocation-lease HOLDER's listener (PR 12b review round 1, Issue
+/// 2): a manager failover moves the holder's listener, and a joiner's KV
+/// wire followed it (`JoinedWire::client_at`) while its block-grant sink
+/// and free target kept the endpoint the join dialed — every post-failover
+/// block ask failed at the dead address and every terminal free shipped
+/// nowhere. The venue keeps the endpoint in force and RE-RESOLVES it after
+/// a transport failure through `resolver` (the joined arm's reads the
+/// `alloc_lease:` record's holder → its published endpoint; a
+/// contract's fixed venue has none and stays put).
+pub struct HolderVenue {
+    endpoint: std::sync::RwLock<String>,
+    resolver: Option<HolderVenueResolver>,
+    /// Moves observed (`joined_holder_venue_moves` — ≥ 1 on a live joiner
+    /// across a manager failover).
+    pub moves: std::sync::atomic::AtomicU64,
+}
+
+impl HolderVenue {
+    /// A venue that never moves (the in-process contracts').
+    pub fn fixed(endpoint: String) -> Arc<Self> {
+        Arc::new(Self {
+            endpoint: std::sync::RwLock::new(endpoint),
+            resolver: None,
+            moves: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// A venue re-resolved off durable state after a failure.
+    pub fn resolved(endpoint: String, resolver: HolderVenueResolver) -> Arc<Self> {
+        Arc::new(Self {
+            endpoint: std::sync::RwLock::new(endpoint),
+            resolver: Some(resolver),
+            moves: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// The endpoint in force.
+    pub fn current(&self) -> String {
+        self.endpoint
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Re-resolve the holder's listener; answers the endpoint now in force
+    /// and whether it MOVED. A resolver that answers nothing keeps the
+    /// last endpoint (the next failure asks again).
+    pub async fn refresh(&self) -> (String, bool) {
+        let Some(resolver) = self.resolver.as_ref() else {
+            return (self.current(), false);
+        };
+        let Some(fresh) = resolver().await else {
+            return (self.current(), false);
+        };
+        let moved = fresh != self.current();
+        if moved {
+            *self.endpoint.write().unwrap_or_else(|e| e.into_inner()) = fresh.clone();
+            self.moves.fetch_add(1, Ordering::Relaxed);
+        }
+        (fresh, moved)
+    }
+}
+
+/// A WIRE writer's grant sink: `ManagerCall::BlockGrant` to the holder's
+/// `venue` (one storage-trust session, reconnected on failure). A
+/// TRANSPORT-class failure re-resolves the venue and retries the ask ONCE
+/// (a block grant is idempotent — `Already` for a covered remainder), and
+/// a venue that MOVED re-homes the data volume's free target with it
+/// (`install_wire_free_target`) — the two halves of a wire writer's data
+/// plane follow the holder together. PR 12b's joined daemon is the
+/// production caller; the contracts drive it here.
 pub fn wire_block_grant_sink(
-    endpoint: String,
+    venue: Arc<HolderVenue>,
     secret: Vec<u8>,
     writer: crate::meta_ship::manager::WireIdentity,
     volume: u16,
@@ -2382,36 +2458,73 @@ pub fn wire_block_grant_sink(
 ) -> crate::block_grant::BlockGrantSink {
     let client: Arc<crate::sqz_sync::SqzMutex<Option<crate::meta_ship::manager::ManagerClient>>> =
         Arc::new(crate::sqz_sync::SqzMutex::new(None));
+    // A failed ask since the last dial: the next ask re-resolves the
+    // venue before it connects.
+    let stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
     Arc::new(move |want, held| {
         let client = Arc::clone(&client);
-        let endpoint = endpoint.clone();
+        let venue = Arc::clone(&venue);
         let secret = secret.clone();
+        let stale = Arc::clone(&stale);
         Box::pin(async move {
             let mut slot = client.lock().await;
-            if slot.is_none() {
-                let peer = format!("appender-{:#x}-{}", writer.node_token, writer.mount_slot);
-                match crate::meta_ship::manager::ManagerClient::connect(
-                    &endpoint, &secret, &peer, volume,
-                )
-                .await
-                {
-                    Ok(c) => *slot = Some(c),
-                    Err(e) => {
-                        log::warn!("block grant venue {endpoint} unreachable: {e}");
-                        return None;
+            let mut retried = false;
+            loop {
+                if slot.is_none() {
+                    let endpoint = if stale.swap(false, Ordering::AcqRel) {
+                        let (endpoint, moved) = venue.refresh().await;
+                        if moved {
+                            install_wire_free_target(vol_tag, &endpoint);
+                            log::warn!(
+                                "data volume {vol_tag:#018x}: the allocation holder MOVED to \
+                                 {endpoint} — block grants and terminal frees follow it"
+                            );
+                        }
+                        endpoint
+                    } else {
+                        venue.current()
+                    };
+                    // The writer's MEMBER id — the one peer id an appender
+                    // speaks under (the manager's identity verbs bind to it).
+                    let peer =
+                        crate::cowriter::node_member_id_of(writer.node_token, writer.mount_slot);
+                    match crate::meta_ship::manager::ManagerClient::connect(
+                        &endpoint, &secret, &peer, volume,
+                    )
+                    .await
+                    {
+                        Ok(c) => *slot = Some(c),
+                        Err(e) => {
+                            log::warn!("block grant venue {endpoint} unreachable: {e}");
+                            stale.store(true, Ordering::Release);
+                            if !retried {
+                                retried = true;
+                                continue;
+                            }
+                            return None;
+                        }
                     }
                 }
-            }
-            let c = slot.as_mut()?;
-            // The holder's derivation answers `want == 0`; the wire carries
-            // a u32 ask.
-            let ask = u32::try_from(want).unwrap_or(u32::MAX);
-            match c.block_grant(vol_tag, writer, ask, held).await {
-                Ok(g) => g,
-                Err(e) => {
-                    log::warn!("block grant over the wire failed: {e}; reconnecting next ask");
-                    *slot = None;
-                    None
+                let c = slot.as_mut()?;
+                // The holder's derivation answers `want == 0`; the wire
+                // carries a u32 ask.
+                let ask = u32::try_from(want).unwrap_or(u32::MAX);
+                match c.block_grant(vol_tag, writer, ask, held).await {
+                    Ok(g) => return g,
+                    Err(e) => {
+                        *slot = None;
+                        stale.store(true, Ordering::Release);
+                        if crate::cluster_wire::is_transport_failure(&e) && !retried {
+                            retried = true;
+                            log::info!(
+                                "block grant over the wire failed ({e}) — re-resolving the \
+                                 holder's venue and retrying once"
+                            );
+                            continue;
+                        }
+                        log::warn!("block grant over the wire failed: {e}; reconnecting next ask");
+                        return None;
+                    }
                 }
             }
         })
@@ -2581,6 +2694,23 @@ pub async fn arm_symmetric_allocation(
         // journaled in order (the terminal free's own path). Without it
         // every crash leaked its window's remainder and fsck's C6 counted
         // the population against the references for ever.
+        //
+        // PR 12b (review round 1, Issue 2 — the obligation PR 10 stated):
+        // that argument holds only while NO PEER holds a grant window on
+        // the volume. A live JOINER's window is RAM at the joiner and
+        // granted by the DEAD manager's ledger, which died with it — at
+        // the successor's re-hold its remainder reads exactly like a dead
+        // incarnation's, and clearing it re-carves blocks the joiner is
+        // still minting from (the failover pin's 200 mints → 144 distinct:
+        // a DOUBLE ALLOCATION). While any other appender page of the home
+        // volume is `Live` the release is DEFERRED (`data_alloc_bitmap_
+        // leaks_deferred` — a bounded leak: at most one window remainder
+        // per writer per failover, fsck C6's `fsck_alloc_bitmap_leak_
+        // candidates` names it; released by the next re-hold with no live
+        // peer). A joiner that died before the failover holds its page
+        // `Live` too and is deferred with the living — its remainder is
+        // reclaimed the same way.
+        let live_peers = live_peer_appenders(vol0).await;
         let granted = holding.ledger.open_ranges();
         let in_grant = |b: u64| {
             granted
@@ -2593,10 +2723,23 @@ pub async fn arm_symmetric_allocation(
             .into_iter()
             .filter(|b| !(derived.is_set(*b) || durable.is_set(*b)) && !in_grant(*b))
             .collect();
-        for b in &leaks {
-            holding.note_finish_free(*b);
-        }
-        if !leaks.is_empty() {
+        if !leaks.is_empty() && live_peers > 0 {
+            crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_DEFERRED
+                .fetch_add(leaks.len() as u64, Ordering::Relaxed);
+            log::warn!(
+                "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): {} SET block(s) \
+                 referenced by nothing and granted to nobody, with {live_peers} other LIVE \
+                 appender(s) on the set — a live writer's window remainder reads exactly like a \
+                 dead incarnation's, so the release is DEFERRED to a re-hold with no live peer \
+                 (data_alloc_bitmap_leaks_deferred; fsck C6 names the candidates; first: {:?})",
+                alloc.volume_id(),
+                leaks.len(),
+                leaks.first()
+            );
+        } else if !leaks.is_empty() {
+            for b in &leaks {
+                holding.note_finish_free(*b);
+            }
             crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_RELEASED
                 .fetch_add(leaks.len() as u64, Ordering::Relaxed);
             log::warn!(
@@ -2635,6 +2778,36 @@ pub async fn arm_symmetric_allocation(
     Ok(held)
 }
 
+/// Appender pages of `vol`'s directory that are `Live` and not this
+/// mount's own — the peers that may hold a grant window on a data volume
+/// this mount is about to (re-)hold. `0` when the directory is unreadable
+/// (the release then runs as before — the shape has no peers by
+/// construction on an unarmed or one-writer set).
+async fn live_peer_appenders(vol: &KvMetaBackend) -> usize {
+    let Some(own) = vol.appender_stats().map(|s| s.appender_id) else {
+        return 0;
+    };
+    match super::appender::read_directory(vol.device_path(), vol.superblock()).await {
+        Ok(entries) => entries
+            .iter()
+            .filter(|e| {
+                e.appender_id != own
+                    && e.page
+                        .as_ref()
+                        .is_some_and(|p| p.state == super::appender::AppenderState::Live)
+            })
+            .count(),
+        Err(e) => {
+            log::warn!(
+                "meta volume {}: the appender directory is unreadable at the allocation arm \
+                 ({e}) — treating the set as peer-less",
+                vol.device_path().display()
+            );
+            0
+        }
+    }
+}
+
 /// **Arm a JOINED appender's data allocation** (symmetric PR 12b — the
 /// production caller of the wire halves PR 8 built for it): for every data
 /// volume this mount writes, register its derived block count and install
@@ -2646,11 +2819,13 @@ pub async fn arm_symmetric_allocation(
 /// The joiner holds no lease, seeds nothing and walks no census: the
 /// bitmap at the holder IS the free list, so a joined open performs ZERO
 /// by-block census reads (the mount path skips the ownership recovery on
-/// this posture exactly as it does on a co-writer's). Returns the
-/// allocators armed.
+/// this posture exactly as it does on a co-writer's). `venue_for` names
+/// each data volume's holder venue — the mount path's follows a manager
+/// failover off durable state (`sym_join::joined_holder_venue`; review
+/// round 1, Issue 2). Returns the allocators armed.
 pub fn arm_joined_allocation(
     allocators: &[Arc<crate::block_allocator::BlockAllocator>],
-    manager_endpoint: &str,
+    venue_for: &dyn Fn(u64) -> Arc<HolderVenue>,
     secret: &[u8],
     identity: AppenderIdentity,
 ) -> usize {
@@ -2668,22 +2843,18 @@ pub fn arm_joined_allocation(
         }
         register_data_volume_blocks(vol_tag, blocks);
         let _ = ALLOCATORS.upsert_sync(vol_tag, Arc::downgrade(alloc));
+        let venue = venue_for(vol_tag);
+        let endpoint = venue.current();
         if alloc.install_block_grant_arm(
             vol_tag,
-            wire_block_grant_sink(
-                manager_endpoint.to_string(),
-                secret.to_vec(),
-                identity.into(),
-                0,
-                vol_tag,
-            ),
+            wire_block_grant_sink(venue, secret.to_vec(), identity.into(), 0, vol_tag),
         ) {
-            install_wire_free_target(vol_tag, manager_endpoint);
+            install_wire_free_target(vol_tag, &endpoint);
             armed += 1;
             log::info!(
                 "joined allocation arm: data volume '{}' ({vol_tag:#018x}, {blocks} block(s)) \
-                 mints from ranged block grants of the manager's holding at {manager_endpoint}; \
-                 its terminal frees ship there",
+                 mints from ranged block grants of the holder's venue at {endpoint}; its \
+                 terminal frees ship there (both follow the holder across a failover)",
                 alloc.volume_id()
             );
         }

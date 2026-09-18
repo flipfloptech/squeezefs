@@ -1369,6 +1369,12 @@ pub struct RpcRequest {
     pub verb: u16,
     /// Verb-defined body.
     pub body: Vec<u8>,
+    /// **The session's authenticated peer id** — the `peer_id` the HELLO
+    /// proved with the storage-trust MAC (PR 12b review round 1, Issue
+    /// 6): an identity-carrying verb binds its frame's identity word to
+    /// it. Filled by the listener for every served request; a direct
+    /// in-process `call` (the contracts') names its peer itself.
+    pub peer: String,
 }
 
 /// One RPC response.
@@ -2624,7 +2630,12 @@ impl SessionPark {
                 // thread, §6.7's venue rule: never the conveyor's task. An
                 // awaiting arm (S8's metadata verbs) is polled on this
                 // lane beside the session's other in-flight serves.
-                let req = RpcRequest { id, verb, body };
+                let req = RpcRequest {
+                    id,
+                    verb,
+                    body,
+                    peer: park.peer_id.clone(),
+                };
                 // The tape's clock read is paid at the debug level only.
                 let t0 = log::log_enabled!(log::Level::Debug).then(std::time::Instant::now);
                 let reply = match &park.host.service {

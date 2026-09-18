@@ -637,6 +637,58 @@ pub async fn resolve_holder_endpoint(
     resolve_holder_endpoint_from(page, &set)
 }
 
+/// **A joined appender's holder venue for data volume `vol_tag`** (PR 12b
+/// review round 1, Issue 2 — the DATA plane follows a manager failover):
+/// the venue starts at the manager the join dialed and, after a transport
+/// failure, RE-RESOLVES the allocation-lease holder's listener off durable
+/// state — the set's volume 0 projection refreshed from the successor's
+/// ledger record (`refresh_control_projection`), its `alloc_lease:{vol_tag}`
+/// record's `holder_appender_id` on its `home_vol` (PR 8's gate: a
+/// successor re-holds the lease at `term + 1` under its own page), and
+/// that appender's published endpoint (`resolve_holder_endpoint`); an
+/// unleased volume resolves to volume 0's manager (appender 0). The set is
+/// held weakly — a venue outliving its set answers nothing and keeps the
+/// last endpoint.
+pub fn joined_holder_venue(
+    routed: &Arc<crate::meta_backend::RoutedMetaBackend>,
+    vol_tag: u64,
+    initial_endpoint: String,
+) -> Arc<crate::meta_backend::kv::alloc_lease::HolderVenue> {
+    let weak = Arc::downgrade(routed);
+    let resolver: crate::meta_backend::kv::alloc_lease::HolderVenueResolver = Arc::new(move || {
+        let weak = weak.clone();
+        Box::pin(async move {
+            let routed = weak.upgrade()?;
+            let (_, vol0) = crate::meta_backend::kv::backend::recovery::vol0_of(&routed)?;
+            if let Err(e) = vol0.refresh_control_projection().await {
+                log::debug!(
+                    "data volume {vol_tag:#018x}: projection refresh before the holder \
+                         venue's re-resolve failed ({e}) — reading the projection in hand"
+                );
+            }
+            let (home, holder) = match vol0.alloc_lease_record(vol_tag).await {
+                Ok(Some(rec)) => (
+                    routed
+                        .volumes
+                        .get(usize::from(rec.home_vol))
+                        .unwrap_or(vol0),
+                    rec.holder_appender_id,
+                ),
+                Ok(None) => (vol0, 0),
+                Err(e) => {
+                    log::warn!(
+                        "data volume {vol_tag:#018x}: its allocation-lease record is \
+                             unreadable ({e}) — resolving the manager's venue"
+                    );
+                    (vol0, 0)
+                }
+            };
+            resolve_holder_endpoint(home, holder).await
+        })
+    });
+    crate::meta_backend::kv::alloc_lease::HolderVenue::resolved(initial_endpoint, resolver)
+}
+
 /// [`resolve_holder_endpoint`] over an already-read page and claim set —
 /// the pure step both resolvers share: the page's KD-MW-2 identity → the
 /// member id → that member's published listener (non-empty).

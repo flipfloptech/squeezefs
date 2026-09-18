@@ -1917,6 +1917,9 @@ pub struct TokenReaderPlane {
     revoke_gens: scc::HashMap<u64, u64>,
     channel_ok: AtomicBool,
     channel_last_round_ms: AtomicU64,
+    /// Woken at every completed channel round — `await_channel_fresh`'s
+    /// park (register-recheck; never a poll).
+    channel_round_wake: squeezefs_ipc::sqz_notify::Notify,
     channel_park_ms: AtomicU64,
     epoch: Instant,
     data_sink: std::sync::OnceLock<Arc<dyn RecallDataSink>>,
@@ -2025,6 +2028,7 @@ impl TokenReaderPlane {
             revoke_gens: scc::HashMap::new(),
             channel_ok: AtomicBool::new(false),
             channel_last_round_ms: AtomicU64::new(0),
+            channel_round_wake: squeezefs_ipc::sqz_notify::Notify::new(),
             // The S10 channel's birth park (the first poll's reply
             // replaces it with the holder's bound).
             channel_park_ms: AtomicU64::new(super::tokens::DELEG_PARK_DEFAULT_MS),
@@ -2175,11 +2179,21 @@ impl TokenReaderPlane {
             self.channel_park_ms.load(Ordering::Relaxed) * 2 + super::tokens::DELEG_FRESH_SLACK_MS,
         );
         let started = Instant::now();
+        // Register-recheck-await on the round's wake (PR 12b review round
+        // 1, Issue 8 — never a 1 ms poll): the loop registers, re-reads
+        // the word, then parks bounded by what is left of the window.
         while !self.channel_fresh() {
-            if started.elapsed() >= bound || self.stop.load(Ordering::Relaxed) {
+            if self.stop.load(Ordering::Relaxed) {
                 return false;
             }
-            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(1)).await;
+            let Some(left) = bound.checked_sub(started.elapsed()) else {
+                return false;
+            };
+            let woken = self.channel_round_wake.notified();
+            if self.channel_fresh() {
+                return true;
+            }
+            let _ = squeezefs_ipc::sqz_time::timeout(left, woken).await;
         }
         true
     }
@@ -2781,6 +2795,7 @@ impl TokenReaderPlane {
                         .store(self.now_ms(), Ordering::Release);
                     self.channel_ok.store(true, Ordering::Release);
                     self.channel_rounds.fetch_add(1, Ordering::Relaxed);
+                    self.channel_round_wake.notify_waiters();
                     if frame_id != 0 && !objects.is_empty() {
                         // The ack rides the SAME session (the S10 law:
                         // the next call on the channel carries the acks).

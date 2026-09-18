@@ -71,6 +71,14 @@ async fn enroll_manager(vol: &KvMetaBackend, endpoint: &str) {
 
 /// The joiner's identity: the manager's NODE (one host) at its own mount
 /// slot `n` — what tells N daemons' pages apart on one box.
+/// The session peer id a production joiner dials with — its MEMBER id
+/// derived from its identity (`cowriter::node_member_id()`); the manager's
+/// identity-carrying verbs bind the frame's identity to it (review round
+/// 1, Issue 6).
+fn peer_of(identity: &AppenderIdentity) -> String {
+    squeezefs::cowriter::node_member_id_of(identity.node_token, identity.mount_slot)
+}
+
 async fn joiner_identity(manager: &KvMetaBackend, n: u32) -> AppenderIdentity {
     let node = read_directory(manager.device_path(), manager.superblock())
         .await
@@ -100,7 +108,7 @@ async fn join(
         &JoinedSetAdmission {
             manager_endpoint: venue.endpoint(),
             secret: VENUE_SECRET.to_vec(),
-            peer_id: format!("joiner-{n}"),
+            peer_id: peer_of(&joiner_identity(manager, n).await),
             identity: joiner_identity(manager, n).await,
         },
     )
@@ -122,7 +130,7 @@ async fn try_join(
         &JoinedSetAdmission {
             manager_endpoint: venue.endpoint(),
             secret: VENUE_SECRET.to_vec(),
-            peer_id: format!("joiner-{n}"),
+            peer_id: peer_of(&joiner_identity(manager, n).await),
             identity: joiner_identity(manager, n).await,
         },
     )
@@ -1004,7 +1012,7 @@ async fn a_joiner_reads_foreign_slots_through_tokens_and_serves_the_managers_shi
             &JoinedSetAdmission {
                 manager_endpoint: venue_endpoint.clone(),
                 secret: VENUE_SECRET.to_vec(),
-                peer_id: "joiner-31".into(),
+                peer_id: peer_of(&joiner_identity(&mvol, 31).await),
                 identity: joiner_identity(&mvol, 31).await,
             },
         )
@@ -1160,6 +1168,186 @@ async fn a_joiner_reads_foreign_slots_through_tokens_and_serves_the_managers_shi
     fsck_clean(&uris).await;
 }
 
+/// **A dead JOINER's half-applied cross-owner unlink is rolled forward at
+/// the manager** (review round 1, Issue 4(i) — the PR 6/10 dead-INITIATOR
+/// row, on the two-backend venue; the storm's `rm -rf` on a joiner is
+/// exactly N such intents): the joiner unlinks a file whose dentry lives
+/// in the MANAGER's directory (PR 6's `RemoveDentry` ships) and whose
+/// record lives in the joiner's rotor — the seam, scoped to the joiner's
+/// appender id (`TEST_XV_SEAM_INITIATOR`, so the manager's own ops run on),
+/// severs its plan after the shipped step: the name is gone at the
+/// manager, the child's `nlink` still 1, the intent open in the joiner's
+/// ring. The joiner dies; the manager's death-ledger recovery takes its
+/// slots and — the recovery's own roll-forward arm — adopts the intent
+/// (its home slot is the manager's now, KD-SYM-2/3) and completes the
+/// plan: the child reads `nlink 0`, the intent is retired
+/// (`recovery_intents_rolled_forward` +1, `xv_cross_owner_intents_open`
+/// back to 0), fsck reads no C9/C10 finding. Red before the scoped seam:
+/// the process-global seam halted the manager's recovery-side ops too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_joiners_half_applied_cross_owner_unlink_is_rolled_forward_at_the_manager() {
+    use squeezefs::meta_backend::crossvol_tx::{
+        cross_owner_stats, install_xv_shipper, uninstall_xv_shipper, TEST_XV_SEAM_AFTER_STEPS,
+        TEST_XV_SEAM_INITIATOR,
+    };
+    use squeezefs::meta_ship::MetaShipRouter;
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mvenue = DaemonVenue::stand_up(&manager, true, "manager-custody-dead-init").await;
+    // The MANAGER holds the directory's slot (its first touch).
+    manager
+        .create(shared, "m0", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap();
+    assert!(matches!(
+        tree0_state(&mvol, SLOT_A).await,
+        Some(SlotState::Leased { appender_id: 0, .. })
+    ));
+
+    let joiner = {
+        Knobs::armed().apply();
+        let r = open_routed_meta_set_joined(
+            &uris,
+            &JoinedSetAdmission {
+                manager_endpoint: mvenue.endpoint.clone(),
+                secret: VENUE_SECRET.to_vec(),
+                peer_id: peer_of(&joiner_identity(&mvol, 51).await),
+                identity: joiner_identity(&mvol, 51).await,
+            },
+        )
+        .await;
+        Knobs::clear();
+        r.expect("the joined open")
+    };
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jid = jvol.appender_stats().unwrap().appender_id;
+    let identity = jvol.joined_wire().unwrap().identity;
+    // The JOINER is the initiator: its shipper over its set.
+    install_xv_shipper(MetaShipRouter::new(
+        Arc::clone(&joiner),
+        "joiner-node",
+        VENUE_SECRET.to_vec(),
+    ));
+    // The joiner's file in the manager's directory: the dentry at the
+    // manager (shipped), the record in the joiner's rotor.
+    let shipped0 = cross_owner_stats().steps_shipped;
+    let victim = joiner
+        .create(shared, "victim", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("a create into the manager's directory ships its dentry");
+    assert!(cross_owner_stats().steps_shipped > shipped0);
+    let victim_slot =
+        squeezefs::meta_backend::kv::record::forest_slot_of_ino(manager.route_ino(victim.ino).1);
+    assert!(
+        matches!(
+            tree0_state(&mvol, victim_slot).await,
+            Some(SlotState::Leased { appender_id, .. }) if appender_id == jid
+        ),
+        "the child was minted in the joiner's rotor"
+    );
+    // The manager's directory names it (the record itself lives in the
+    // joiner's slot — a token read on a custody-armed manager; here the
+    // directory's own tree is what the manager owns).
+    let names = |list: Vec<squeezefs::meta_backend::DirEntry>| -> Vec<String> {
+        list.into_iter().map(|d| d.name).collect()
+    };
+    assert!(names(manager.readdir(shared, 0, 100).await.unwrap()).contains(&"victim".to_string()));
+
+    // The joiner reads the manager's directory through the manager's
+    // TOKENS (PR 9's custody arm over the joiner's set — the mount path's
+    // `arm_mount_slot_custody`); the dentry it shipped is exact there.
+    let sink = Arc::new(ProbeSink {
+        calls: std::sync::atomic::AtomicU64::new(0),
+    });
+    let for_arm = Arc::clone(&sink);
+    let _arm = squeezefs::data_grant::arm_slot_custody(
+        &joiner,
+        &squeezefs::cowriter::node_member_id_of(identity.node_token, identity.mount_slot),
+        VENUE_SECRET.to_vec(),
+        0,
+        Arc::new(move |_volume| {
+            Arc::clone(&for_arm) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
+        }),
+    );
+    assert!(names(joiner.readdir(shared, 0, 100).await.unwrap()).contains(&"victim".to_string()));
+
+    // The severed unlink: ONE step commits (the shipped `RemoveDentry` at
+    // the manager), the plan dies before the child's `SetNlink`.
+    let open0 = cross_owner_stats().intents_open;
+    TEST_XV_SEAM_INITIATOR.store(u64::from(jid) + 1, Relaxed);
+    TEST_XV_SEAM_AFTER_STEPS.store(2, Relaxed);
+    let e = joiner
+        .unlink(shared, "victim")
+        .await
+        .expect_err("the severed plan errors like a dead process");
+    TEST_XV_SEAM_AFTER_STEPS.store(0, Relaxed);
+    TEST_XV_SEAM_INITIATOR.store(0, Relaxed);
+    assert!(e.to_string().contains("seam"), "{e}");
+    assert!(
+        !names(manager.readdir(shared, 0, 100).await.unwrap()).contains(&"victim".to_string()),
+        "the shipped RemoveDentry landed at the manager"
+    );
+    assert_eq!(
+        joiner.getattr(victim.ino).await.unwrap().nlink,
+        1,
+        "the child's SetNlink never ran — the half-applied shape"
+    );
+    assert_eq!(cross_owner_stats().intents_open, open0 + 1);
+    // The manager's own ops ran on under the joiner-scoped seam.
+    manager
+        .create(shared, "m1", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("the manager's plan is never severed by the joiner's seam");
+
+    // The joiner dies (no leave, no shutdown); the manager records it and
+    // recovers: its slots are the manager's, and the recovery's roll-
+    // forward adopts and completes the dead initiator's intent.
+    uninstall_xv_shipper();
+    squeezefs::data_grant::disarm_slot_custody().await;
+    drop(jvol);
+    drop(joiner);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    let rolled0 = recovery_stats().intents_rolled_forward;
+    assert!(!mvol.record_death_with_key(identity, 11, 0).await.unwrap());
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    assert!(
+        recovery_stats().intents_rolled_forward > rolled0,
+        "the dead initiator's intent was rolled forward"
+    );
+    assert_eq!(cross_owner_stats().intents_open, open0, "retired");
+    // The child's slot is the manager's now: released by the recovery,
+    // then first-touched by the roll-forward's own `SetNlink`.
+    assert!(
+        matches!(
+            tree0_state(&mvol, victim_slot).await,
+            Some(SlotState::Unleased { .. }) | Some(SlotState::Leased { appender_id: 0, .. })
+        ),
+        "the child's slot is the manager's to maintain now: {:?}",
+        tree0_state(&mvol, victim_slot).await
+    );
+    // (An `Err` here is the corpse sweep having taken the record already.)
+    if let Ok(attr) = manager.getattr(victim.ino).await {
+        assert_eq!(attr.nlink, 0, "the roll-forward ran the child's SetNlink");
+    }
+    assert!(manager.lookup(shared, "victim").await.is_err());
+    manager.lookup(shared, "m0").await.unwrap();
+    manager.lookup(shared, "m1").await.unwrap();
+    assert_must_stay_zero(&mvol, "manager");
+    mvenue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
 /// **N ≥ 3: a daemon that joined AFTER another's ladder is bound ON
 /// DEMAND at its first foreign act** (the third daemon's endpoint): the
 /// slot holder table knows the appenders that were Live when a mount's
@@ -1196,7 +1384,7 @@ async fn a_daemon_that_joined_after_anothers_ladder_is_bound_on_demand_at_its_fi
                 &JoinedSetAdmission {
                     manager_endpoint: ep,
                     secret: VENUE_SECRET.to_vec(),
-                    peer_id: format!("joiner-{n}"),
+                    peer_id: peer_of(&joiner_identity(&mvol, n).await),
                     identity: joiner_identity(&mvol, n).await,
                 },
             )
@@ -1333,8 +1521,25 @@ async fn a_daemon_that_joined_after_anothers_ladder_is_bound_on_demand_at_its_fi
 /// wire, `joined_wire_redials` = 1, the holder table's word for appender 0
 /// moved, every acked record readable by the successor. Red before the
 /// re-dial: every joiner verb failed at the dead endpoint for ever.
+///
+/// **And its DATA plane follows too** (review round 1, Issue 2): the
+/// joiner's allocator mints from the manager's ranged block grants over
+/// the wire (`arm_joined_allocation`'s sink) and ships its terminal frees
+/// to the holder's venue — after the failover its next block ask fails at
+/// the dead venue once, RE-RESOLVES the allocation holder off durable
+/// state (`alloc_lease:` → the successor's page-0 identity → its
+/// published listener — `sym_join::joined_holder_venue`) and lands at the
+/// SUCCESSOR's holding (`block_grants` advanced there, the minted blocks
+/// SET in its bitmap), and the data volume's FREE TARGET moves with it.
+/// Red before: the sink and the free target kept the join-time endpoint
+/// for the mount's life — every post-failover striped write was refused a
+/// block and every free shipped to a dead address (the leg's
+/// post-failover write was 7 inline bytes, never a block).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_live_joiner_follows_a_manager_failover_to_the_successors_listener() {
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::meta_backend::kv::alloc_lease;
+    use std::sync::atomic::Ordering::Relaxed;
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
@@ -1344,6 +1549,18 @@ async fn a_live_joiner_follows_a_manager_failover_to_the_successors_listener() {
     let mvol = Arc::clone(&manager.volumes[0]);
     let venue = HoldersVenue::stand_up(&manager, &[]).await;
     enroll_manager(&mvol, &venue.endpoint()).await;
+    // The manager HOLDS the data volume's allocation lease (PR 8's arm).
+    let data_id = "vol-failover-data";
+    let data_tag = squeezefs::meta_backend::kv::block_refs::volume_tag(data_id);
+    let data_blocks = 4096u64;
+    let a = Arc::new(BlockAllocator::new(data_id).await.unwrap());
+    a.set_capacity_bytes(data_blocks * a.chunk_size());
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&manager, &[Arc::clone(&a)])
+            .await
+            .unwrap(),
+        1
+    );
 
     let joiner = join(&uris, &venue, &mvol, 71).await;
     let jvol = Arc::clone(&joiner.volumes[0]);
@@ -1352,11 +1569,42 @@ async fn a_live_joiner_follows_a_manager_failover_to_the_successors_listener() {
     assert_eq!(jwire.endpoint(), old_endpoint);
     let files = create_files(&joiner, shared, "fo", 8).await;
     assert_eq!(jvol.joined_stats().unwrap().wire_redials, 0);
+    // The joiner's DATA plane: the production venue (re-resolved off
+    // durable state) behind the wire grant sink + the free target.
+    let hv = squeezefs::sym_join::joined_holder_venue(&joiner, data_tag, old_endpoint.clone());
+    let b = Arc::new(BlockAllocator::new(data_id).await.unwrap());
+    b.set_capacity_bytes(data_blocks * b.chunk_size());
+    assert!(b.install_block_grant_arm(
+        data_tag,
+        alloc_lease::wire_block_grant_sink(
+            Arc::clone(&hv),
+            VENUE_SECRET.to_vec(),
+            jwire.identity.into(),
+            0,
+            data_tag,
+        ),
+    ));
+    assert!(alloc_lease::install_wire_free_target(
+        data_tag,
+        &old_endpoint
+    ));
+    let mut minted_before = std::collections::BTreeSet::new();
+    for _ in 0..8 {
+        minted_before.insert(b.allocate_block().await.unwrap() / b.chunk_size());
+    }
+    assert_eq!(
+        minted_before.len(),
+        8,
+        "the joiner mints from the manager's grants"
+    );
+    let grants_at_old = alloc_lease::holding(data_tag).unwrap().stats().block_grants;
+    assert!(grants_at_old >= 1);
 
     // The manager leaves; its listener dies; a SUCCESSOR wins the ladder
     // and publishes at a new address.
     venue.tear_down();
     shutdown(&manager).await;
+    alloc_lease::disarm_symmetric_roles();
     drop(mvol);
     drop(manager);
     let successor = open_under(&uris, &Knobs::armed()).await;
@@ -1368,6 +1616,45 @@ async fn a_live_joiner_follows_a_manager_failover_to_the_successors_listener() {
         .await
         .expect("the successor's checkpoint names the new entry");
     assert_eq!(svol.appender_stats().unwrap().manager_lease.word(), "held");
+    // The successor re-holds the data volume's lease (the same identity's
+    // record; PR 8's own-residue re-hold).
+    let a2 = Arc::new(BlockAllocator::new(data_id).await.unwrap());
+    a2.set_capacity_bytes(data_blocks * a2.chunk_size());
+    let released0 = squeezefs::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_RELEASED.load(Relaxed);
+    let deferred0 = squeezefs::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_DEFERRED.load(Relaxed);
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&successor, &[Arc::clone(&a2)])
+            .await
+            .unwrap(),
+        1
+    );
+    let sholding = alloc_lease::holding(data_tag).expect("the successor holds the lease");
+    // The LIVE joiner's window remainder reads exactly like a dead
+    // incarnation's at the re-hold (RAM at the joiner, granted by a ledger
+    // that died with the manager): with the joiner's page `Live` the
+    // release is DEFERRED, never cleared under its feet — before it, the
+    // re-hold cleared the remainder and re-carved the same blocks (200
+    // mints → 144 distinct: a double allocation).
+    assert_eq!(
+        squeezefs::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_RELEASED.load(Relaxed),
+        released0,
+        "a re-hold beside a LIVE peer releases nothing"
+    );
+    assert!(
+        squeezefs::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_DEFERRED.load(Relaxed) > deferred0,
+        "the joiner's window remainder is a DEFERRED candidate"
+    );
+    for blk in &minted_before {
+        assert!(
+            sholding.bitmap.is_set(*blk),
+            "the joiner's pre-failover block {blk} stays SET at the successor"
+        );
+    }
+    let grants_at_successor0 = sholding.stats().block_grants;
+    // In one process the manager's leave uninstalled the free target it
+    // shared with the joiner (the process-global table): the re-resolve
+    // must RE-HOME it — a second daemon's stale entry is the same word.
+    assert!(squeezefs::block_grant::free_target_for(data_tag).is_none());
 
     // The joiner's next wire act: a first-touch acquire of SLOT_B (the
     // dead endpoint fails once, the re-dial follows the successor).
@@ -1393,6 +1680,52 @@ async fn a_live_joiner_follows_a_manager_failover_to_the_successors_listener() {
     );
     assert_all_resolve(&joiner, other, &more).await;
     assert_all_resolve(&joiner, shared, &files).await;
+
+    // The joiner's DATA plane after the failover: enough mints to exhaust
+    // the window the dead manager granted — the ask fails at the dead
+    // venue once, re-resolves the holder to the successor and lands there;
+    // every minted block is SET in the successor's bitmap; the free target
+    // moved with the venue.
+    let mut minted_after = std::collections::BTreeSet::new();
+    for _ in 0..200 {
+        minted_after.insert(b.allocate_block().await.unwrap() / b.chunk_size());
+    }
+    assert_eq!(minted_after.len(), 200);
+    assert!(
+        minted_before.is_disjoint(&minted_after),
+        "a block minted twice across the failover"
+    );
+    assert_eq!(
+        hv.moves.load(Relaxed),
+        1,
+        "the holder venue MOVED once (to the successor)"
+    );
+    assert_eq!(hv.current(), venue2.endpoint());
+    let sstats = sholding.stats();
+    assert!(
+        sstats.block_grants > grants_at_successor0,
+        "block_grants advanced at the SUCCESSOR's holding: {sstats:?}"
+    );
+    for blk in &minted_after {
+        assert!(
+            sholding.bitmap.is_set(*blk),
+            "minted block {blk} not SET at the successor"
+        );
+    }
+    assert_eq!(
+        squeezefs::block_grant::free_target_for(data_tag).as_deref(),
+        Some(venue2.endpoint().as_str()),
+        "the data volume's free target followed the holder"
+    );
+    // A terminal free of a post-failover block clears the bit at the
+    // successor (the joiner's frees route to the holder's ladder).
+    let freed = *minted_after.iter().next().unwrap();
+    b.begin_free(freed * b.chunk_size());
+    b.finish_free(freed * b.chunk_size());
+    assert!(
+        !sholding.bitmap.is_set(freed),
+        "the free reached the successor's bitmap"
+    );
     assert_must_stay_zero(&jvol, "joiner");
     assert_must_stay_zero(&svol, "successor");
 
@@ -1405,6 +1738,114 @@ async fn a_live_joiner_follows_a_manager_failover_to_the_successors_listener() {
     shutdown(&successor).await;
     drop(svol);
     drop(successor);
+    fsck_clean(&uris).await;
+}
+
+/// **A joiner's rotor SHRINKS to the derived `M`, and its census is the
+/// set's** (review round 1, Issue 10 — a PR 4 manager-only assumption the
+/// §3 sweep missed): the §5.1.3 forced shrink released idle rotor slots
+/// through region id 0 — the MANAGER's — so on a joiner every release
+/// answered "not one of this mount's regions", swallowed as "not this
+/// tick", and a joiner NEVER shrank its rotor; and its `appenders_known`
+/// was frozen at the join, so `M` never re-derived there either.
+/// Unreachable below 512 writers (`M = clamp(W/(2 × writers), 1, 64)`
+/// stays 64) — the rung's headline is N UNBOUNDED, and at ≥ 512 writers
+/// the joiners hoarded 64 each while the derivation said 32. Here: the
+/// census seam names 1,024 writers on the joiner, one cadence tick
+/// releases its idle rotor down to 32 (`slot_forced_shrinks`, tree 0
+/// `Unleased` at the manager), and a THIRD daemon's join is read by the
+/// first joiner's next cadence (`appenders_known` 2 → 3). Red before:
+/// the rotor stayed at 64 with `forced_shrinks == 0`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiners_rotor_shrinks_to_the_derived_m_and_its_census_follows_the_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, _dirs) = seeded_volume(dir.path(), &[(SLOT_A, "a")]).await;
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let joiner = join(&uris, &venue, &mvol, 81).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jplane = Arc::clone(jvol.slot_leases().expect("armed"));
+    let jid = jvol.appender_stats().unwrap().appender_id;
+    let rotor0 = jplane.rotor.load_full();
+    assert_eq!(rotor0.len(), 64, "a fresh joiner's rotor is the full M");
+    assert_eq!(jvol.appender_stats().unwrap().appenders_known, 2);
+
+    // The census seam: 1,024 writers ⇒ M = 65,536 / 2,048 = 32.
+    jplane
+        .test_writers_known
+        .store(1024, std::sync::atomic::Ordering::Relaxed);
+    jvol.slot_lease_cadence()
+        .await
+        .expect("the joiner's cadence");
+    let st = jvol.slot_lease_stats().unwrap();
+    let rotor1 = jplane.rotor.load_full();
+    assert_eq!(
+        rotor1.len(),
+        32,
+        "the rotor shrank to the derived M: {st:?}"
+    );
+    assert!(
+        st.forced_shrinks >= 32,
+        "the shrink released through the joiner's OWN region: {st:?}"
+    );
+    let released: Vec<ForestSlot> = rotor0
+        .iter()
+        .copied()
+        .filter(|s| !rotor1.contains(s))
+        .collect();
+    assert_eq!(released.len(), 32);
+    for s in &released {
+        assert!(
+            matches!(
+                tree0_state(&mvol, *s).await,
+                Some(SlotState::Unleased { .. })
+            ),
+            "slot {s} released at the manager"
+        );
+    }
+    for s in rotor1.iter() {
+        assert!(
+            matches!(
+                tree0_state(&mvol, *s).await,
+                Some(SlotState::Leased { appender_id, .. }) if appender_id == jid
+            ),
+            "slot {s} still the joiner's"
+        );
+    }
+    jplane
+        .test_writers_known
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+
+    // A THIRD daemon joins: the first joiner's next cadence reads the
+    // census in force from the directory.
+    let third = join(&uris, &venue, &mvol, 82).await;
+    let tvol = Arc::clone(&third.volumes[0]);
+    jvol.checkpoint_now()
+        .await
+        .expect("the joiner's checkpoint");
+    assert_eq!(
+        jvol.appender_stats().unwrap().appenders_known,
+        3,
+        "the joiner's census followed the third daemon's join"
+    );
+    assert_must_stay_zero(&jvol, "joiner");
+    assert_must_stay_zero(&tvol, "third");
+    assert_must_stay_zero(&mvol, "manager");
+
+    shutdown(&third).await;
+    drop(tvol);
+    drop(third);
+    shutdown(&joiner).await;
+    drop(jplane);
+    drop(jvol);
+    drop(joiner);
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
     fsck_clean(&uris).await;
 }
 
@@ -1614,6 +2055,63 @@ async fn the_joined_door_refuses_without_the_plane_and_never_writes_a_control_en
         .map(|e| e.to_string())
         .expect("busy");
     assert!(e.contains("release them first"), "{e}");
+    // Review round 1, Issue 6: the identity-carrying verbs bind the
+    // frame's identity to the SESSION's authenticated peer — an
+    // authenticated IMPOSTOR (volume access, another peer id) cannot
+    // `PublishEndpoint` a listener for the joiner (redirecting every
+    // peer's traffic to it) nor `LeaveAppender` its region; both are
+    // REJECTED on `manager_verb_rejected`, nothing written. The joiner's
+    // own session (its member id as the peer) is what the door admits.
+    {
+        let rejected0 = mvol.appender_stats().unwrap().manager_verb_rejected;
+        let mut impostor = squeezefs::meta_ship::manager::ManagerClient::connect(
+            &venue.endpoint(),
+            VENUE_SECRET,
+            "node_deadbeefdeadbeef.m00000007",
+            0,
+        )
+        .await
+        .expect("an authenticated session under another peer id");
+        let e = impostor
+            .publish_endpoint(identity, id, "127.0.0.1:9", 0)
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .expect("PublishEndpoint for another appender's identity is REJECTED");
+        assert!(
+            e.contains("REJECTED") && e.contains("speaks for itself"),
+            "{e}"
+        );
+        let e = impostor
+            .leave_appender(identity, id, &[])
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .expect("LeaveAppender for another appender's identity is REJECTED");
+        assert!(
+            e.contains("REJECTED") && e.contains("speaks for itself"),
+            "{e}"
+        );
+        assert_eq!(
+            mvol.appender_stats().unwrap().manager_verb_rejected,
+            rejected0 + 2,
+            "two rejections, the buggy/hostile-peer class"
+        );
+        assert_eq!(
+            squeezefs::sym_join::resolve_holder_endpoint(&mvol, id)
+                .await
+                .as_deref(),
+            None,
+            "nothing was published for the joiner by the impostor"
+        );
+        assert!(
+            matches!(
+                page_of(&uris[0], &mvol, id).await.map(|p| p.state),
+                Some(AppenderState::Live)
+            ),
+            "the joiner's page stays Live"
+        );
+    }
     shutdown(&joiner).await;
     drop(jvol);
     drop(joiner);
@@ -1685,7 +2183,7 @@ async fn a_joiners_registrant_rung_adopts_co_located_and_registers_remote_never_
     assert!(wire.colocated, "the same host: the flock's proof");
     assert_eq!(wire.registrant_key, 0, "an adopted hold is not OUR key");
     assert!(
-        wire.meta_hold_standing(),
+        jvol.joined_stats().unwrap().meta_hold_standing,
         "rung 4 ran at the door: the adopted hold is held for the mount's life"
     );
     assert_eq!(
@@ -2244,4 +2742,263 @@ async fn a_dead_joiners_root_swapped_into_an_extent_the_manager_once_retired_is_
     drop(mvol);
     drop(manager);
     fsck_clean(&uris).await;
+}
+
+/// **The KV loader's single-flight table is taken in ONE acquisition
+/// style** (review round 1, Issue 13 — pre-existing, made ordinary by the
+/// N-daemon posture's C1 population): `load_for_slot` took `inflight`'s
+/// bucket ASYNC (`entry_async`) while the guard's `Drop` and every other
+/// user took it SYNC — on a two-lane meta pool an async waiter GRANTED the
+/// bucket resumes only when its task is polled, and the lanes that would
+/// poll it sat in a sync wait on that very bucket: the fleet's `-o ro`
+/// reader wedged both meta lanes under the fsck C1 walk's fan-out
+/// (hundreds of slot-tree walks colliding on the same uncached nodes) and
+/// `squeezefs fsck` hung 31 minutes. The shape: a forest of many slot
+/// trees, every cached image dropped, hundreds of concurrent loads of the
+/// SAME addresses through the meta pool — bounded here; a wedge is a
+/// timeout, never a hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hundreds_of_colliding_node_loads_on_the_meta_lanes_never_wedge() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let slots: Vec<ForestSlot> = (4..20).collect();
+    let names: Vec<String> = slots.iter().map(|s| format!("d{s}")).collect();
+    let seeds: Vec<(ForestSlot, &str)> = slots
+        .iter()
+        .zip(names.iter())
+        .map(|(s, n)| (*s, n.as_str()))
+        .collect();
+    let (uris, dirs) = seeded_volume(dir.path(), &seeds).await;
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    for d in &dirs {
+        create_files(&manager, *d, "f", 60).await;
+    }
+    mvol.checkpoint_now().await.unwrap();
+    mvol.checkpoint_now().await.unwrap();
+    // Every slot tree's images dropped from the cache: the loads below
+    // MISS and collide on the single-flight table.
+    let roots: Vec<(ForestSlot, u64)> = slots
+        .iter()
+        .map(|s| (*s, mvol.slot_tree(*s).expect("seeded tree").root().addr))
+        .collect();
+    for (s, _) in &roots {
+        mvol.node_cache()
+            .drop_slot_nodes(*s)
+            .expect("clean nodes drop");
+    }
+    let mut joins = Vec::new();
+    for round in 0..40u32 {
+        for (s, addr) in &roots {
+            let cache = Arc::clone(mvol.node_cache());
+            let (s, addr) = (*s, *addr);
+            joins.push(squeezefs::meta_exec::spawn_meta_join(
+                "colliding_load",
+                async move {
+                    let loaded = cache.load_for_slot(addr, Some(s)).await;
+                    if round % 8 == 7 {
+                        // Some loaders drop the image again behind the
+                        // others — the miss/collide cycle repeats.
+                        let _ = cache.drop_slot_nodes(s);
+                    }
+                    loaded.map(|n| n.is_some()).unwrap_or(false)
+                },
+            ));
+        }
+    }
+    let all = async {
+        let mut ok = 0usize;
+        for j in joins {
+            if j.await.unwrap_or(false) {
+                ok += 1;
+            }
+        }
+        ok
+    };
+    let ok = tokio::time::timeout(std::time::Duration::from_secs(120), all)
+        .await
+        .expect("640 colliding loads on the meta lanes must complete — a wedge here is the mixed-style single-flight lock");
+    assert_eq!(ok, 640, "every load answered its node");
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+}
+
+/// The fsck engine's INODE PLANE over an already-open WRITER set (the
+/// `sym_crash_matrix_tests` door: a data router with no staging, the
+/// inode-plane-only options).
+async fn inode_plane_over(routed: &Arc<RoutedMetaBackend>) -> squeezefs::fsck::FsckReport {
+    let dlm = squeezefs::dlm::DlmClient::new().unwrap();
+    let alloc = Arc::new(
+        squeezefs::block_allocator::BlockAllocator::new("vol-plane")
+            .await
+            .unwrap(),
+    );
+    let dev = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new("/dev/null"));
+    let cache = squeezefs::cache::TieredCache::new(
+        Vec::new(),
+        Some("64MB"),
+        Some("64MB"),
+        None,
+        None,
+        alloc.clone(),
+        dev.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let router = squeezefs::routing::DataRouter::new(dlm, cache, alloc, dev);
+    router.set_meta_backend(Arc::clone(routed));
+    let ctx = squeezefs::fsck::FsckCtx {
+        meta: Arc::clone(routed),
+        router,
+        staging_dirs: Vec::new(),
+        expected_generation: None,
+    };
+    let mut opts = squeezefs::fsck::FsckOptions::offline();
+    opts.settle = std::time::Duration::from_millis(10);
+    opts.inode_plane_only = true;
+    squeezefs::fsck::run(&ctx, &opts)
+        .await
+        .expect("the engine runs")
+}
+
+/// **The manager's inode-plane census over a LIVE foreign lessee's
+/// directory** (review round 1, Issue 1 — the `sym-storm` round-3 finding
+/// ATTRIBUTED: 442 false C10 dangling names). The dentry pass walked
+/// every slot tree of the volume from the manager's own cache — for a slot
+/// a live JOINER leases that is a PROJECTION whose staleness the census
+/// cannot bound (KD-SYM-5), while the child slots the joiner had just
+/// released were re-read FRESH at the transfer — so every unlink the
+/// joiner had performed in its directory read as a dangling name at the
+/// manager. PR 8's lessee-shard law scoped the INODE side alone; the NAME
+/// side is scoped now: with any slot of the volume leased to a live
+/// foreign appender the plane records NO verdict, counted on
+/// `fsck_inode_plane_foreign_dentry_scoped`, never a finding. The storm's
+/// shape: the joiner first-touches D (slot A) and fills it past the
+/// affinity cap so its children SPILL into its rotor slots, unlinks them
+/// all (the dentries removed in A's tree, the records destroyed in the
+/// rotor slots — every tx the joiner's own), releases the rotor slots that
+/// held children (the manager re-reads them at the transfer: records
+/// gone) and keeps A. Pre-fix: one `C10` dangling finding per spilled
+/// child; post-fix: none, the plane scoped out; after the joiner's clean
+/// leave the plane judges again and finds nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_managers_census_takes_no_verdict_over_a_live_joiners_stale_projected_dentries() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "d")]).await;
+    let d = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let joiner = join(&uris, &venue, &mvol, 3).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jid = jvol.appender_stats().unwrap().appender_id;
+
+    // The joiner's directory, filled past the affinity cap: the children
+    // spill into the joiner's ROTOR slots (their slot ≠ A).
+    let files = create_files(&joiner, d, "f", 900).await;
+    let spilled: std::collections::BTreeSet<ForestSlot> = files
+        .iter()
+        .map(|(_, ino)| {
+            let (_, local) = joiner.route_ino(*ino);
+            squeezefs::meta_backend::kv::record::forest_slot_of_ino(local)
+        })
+        .filter(|s| *s != SLOT_A)
+        .collect();
+    assert!(
+        !spilled.is_empty(),
+        "the fixture's premise: children spilled past the parent's slot"
+    );
+    jvol.checkpoint_now().await.unwrap();
+    // The manager's cache of A's tree holds the dentries: the storm's
+    // manager had flushed them itself at the first incarnation's RECOVERY
+    // — here the joiner releases A (the manager adopts the tree FRESH, its
+    // 900 dentries in its images) and re-acquires it at its next touch.
+    jvol.release_slot_handover(jid, SLOT_A)
+        .await
+        .expect("the joiner releases A");
+    mvol.checkpoint_now().await.unwrap();
+    assert_eq!(
+        manager.readdir(d, 0, 2_000).await.unwrap().len(),
+        files.len()
+    );
+    jvol.refresh_control_projection().await.unwrap();
+    // The storm's `rm -rf`: every child unlinked at the joiner (A first-
+    // touched again at g + 1) — the dentries out of A's tree, the records
+    // destroyed in their slots — every tx the joiner's own.
+    for (name, _) in &files {
+        joiner.unlink(d, name).await.expect("unlink");
+    }
+    // The corpse sweep's act (the FUSE layer's batched destroys): the
+    // unlinked records leave their slot trees.
+    let inos: Vec<u64> = files.iter().map(|(_, ino)| *ino).collect();
+    for chunk in inos.chunks(64) {
+        joiner
+            .destroy_inodes(chunk)
+            .await
+            .expect("destroy the corpses");
+    }
+    for _ in 0..3 {
+        jvol.checkpoint_now().await.unwrap();
+    }
+    // The child slots released (the LRU release's act); A stays leased.
+    for s in &spilled {
+        jvol.release_slot_handover(jid, *s)
+            .await
+            .expect("release a child slot");
+    }
+    mvol.checkpoint_now().await.unwrap();
+    assert!(
+        matches!(tree0_state(&mvol, SLOT_A).await, Some(SlotState::Leased { appender_id, .. }) if appender_id == jid),
+        "slot A stays the joiner's"
+    );
+
+    let report = inode_plane_over(&manager).await;
+    // The defect's observable: the plane took a VERDICT over the volume
+    // (`inode_plane_volumes_covered` 1) off a projection — 901 stale
+    // dentries indexed in the storm's direction (A's names present, the
+    // released children's records gone: 442 dangling), the inverse here
+    // (A's names gone at the manager, the released children's records
+    // still cached: 838 era-floor-shielded C9 ghosts) — the SAME defect,
+    // a census over a tree whose staleness it cannot bound. Post-fix: no
+    // verdict, no finding, the reason counted.
+    assert_eq!(
+        report.counters.inode_plane_volumes_covered, 0,
+        "a volume with a LIVE foreign lessee's slot is NOT covered by this mount's inode plane"
+    );
+    assert_eq!(report.findings.len(), 0, "{:?}", report.findings);
+    assert!(
+        report.counters.inode_plane_foreign_dentry_scoped >= 1,
+        "the plane records why it took no verdict (fsck_inode_plane_foreign_dentry_scoped)"
+    );
+
+    // The joiner's clean leave makes the set the manager's again: the
+    // census judges, and finds nothing.
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    mvol.checkpoint_now().await.unwrap();
+    let report = inode_plane_over(&manager).await;
+    assert_eq!(report.findings.len(), 0, "{:?}", report.findings);
+    assert!(report.counters.inode_plane_volumes_covered >= 1);
+    assert!(joiner_gone_names(&manager, d, &files).await);
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+/// Every unlinked name is gone through `routed` ("deleted stays deleted").
+async fn joiner_gone_names(routed: &RoutedMetaBackend, dir: u64, files: &[(String, u64)]) -> bool {
+    for (name, _) in files.iter().take(64) {
+        if routed.lookup(dir, name).await.is_ok() {
+            return false;
+        }
+    }
+    true
 }

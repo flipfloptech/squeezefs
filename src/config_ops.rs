@@ -608,6 +608,32 @@ pub async fn set_cache_paths(
     Ok(())
 }
 
+/// `squeezefs job rotate-enroll <sqmeta-uri>` — the ONE rotation lever
+/// for the set's job-wire enrollment secret (1.3.0: the record is minted
+/// once and reused by every coordinator — a per-mount re-mint broke every
+/// member that outlives a coordinator's incarnation). Offline, on a
+/// quiesced set: the live-client gate on EVERY volume, then the record
+/// removed on the config home volume under the D0 guard (the daemon's own
+/// unscreened remover — the FUSE screen keeps `job:` invisible to
+/// clients). Returns whether a record was removed.
+pub async fn rotate_enroll_secret(meta_lvs: &[String]) -> Result<bool> {
+    let first = config_home_volume(meta_lvs).await?;
+    for path in meta_lvs {
+        crate::meta_backend::kv::builder::format_preflight(Path::new(path), true).await?;
+    }
+    let vol = crate::meta_backend::open_volume_for_mount(&first).await?;
+    let present = vol
+        .getxattr(1, crate::job_wire::JOB_ENROLL_XATTR)
+        .await?
+        .is_some();
+    if present {
+        vol.removexattr_internal(1, crate::job_wire::JOB_ENROLL_XATTR)
+            .await?;
+    }
+    vol.shutdown().await.map_err(SqueezefsError::from)?;
+    Ok(present)
+}
+
 /// `squeezefs config set-fabric-endpoints <sqmeta-uri>
 /// <vol-id>=<traddr>:<trsvcid>:<subnqn> ...` — the spec-grammar parser
 /// (KD-MW-15). Splits at the FIRST `=`, then the first two `:`

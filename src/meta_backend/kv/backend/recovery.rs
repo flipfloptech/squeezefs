@@ -2815,10 +2815,16 @@ impl KvMetaBackend {
         if vol0_path != path {
             claim_volumes.push(vol0_path);
         }
+        // The manager's claim age (volume 0's) — the park bound below reads
+        // it: `None` = no claim ever written.
+        let mut manager_claim_age_secs: Option<u64> = None;
         for p in claim_volumes {
             let probe = Self::open_inner(p, OpenPosture::NonWriter, None).await?;
             if let Ok(Some(raw)) = probe.getxattr(1, WRITER_CLAIM_XATTR).await {
                 if let Some(c) = WriterClaim::decode(&raw) {
+                    if p == vol0_path {
+                        manager_claim_age_secs = Some(c.age_secs(now));
+                    }
                     if c.age_secs(now) <= crate::fuse_client::CLIENT_STALE_TTL_SECS {
                         return Err(KvError::Busy(format!(
                             "{}: refusing to clear appender {appender_id} — {}'s writer claim \
@@ -2874,6 +2880,44 @@ impl KvMetaBackend {
                 page.identity.node_token,
                 page.identity.mount_slot
             )));
+        }
+        // **The parked-joiner bound** (PR 12b review round 1, Issue 4(ii)):
+        // a JOINED appender writes no `client:` heartbeat (PR 13's), so on
+        // a MANAGER-LESS set the probes below cannot tell a live joiner
+        // PARKED at `T_self` (PR 8's law — it reclaims against the
+        // successor the ledger names for up to `T_park_max`, then poisons
+        // itself: `appender_park_expiries`) from a dead one. Inside that
+        // window after the manager's claim went stale the verb REFUSES —
+        // clearing a live parked writer's page would hand its ring to a
+        // successor's recovery while it still holds acked custody. Past it
+        // the joiner is dead or self-fenced by derivation, and the verb's
+        // other probes govern. The bound is DERIVED (`park_gate::
+        // t_park_max_for` over the volume's failover bound), never a knob.
+        if !super::super::appender::page_is_own(
+            appender_id,
+            &page.identity,
+            set.identity.node_token,
+            set.identity.mount_slot,
+            true,
+        ) && appender_id != 0
+        {
+            if let Some(age) = manager_claim_age_secs {
+                let failover_ms = be.appender_stats().map_or(0, |s| s.failover_bound_ms);
+                let park_max_ms =
+                    match crate::membership::LeaseClocks::derive(std::time::Duration::ZERO) {
+                        Ok(clocks) => crate::park_gate::t_park_max_for(failover_ms, &clocks),
+                        Err(_) => failover_ms,
+                    };
+                let stale_for_ms = age
+                    .saturating_sub(crate::fuse_client::CLIENT_STALE_TTL_SECS)
+                    .saturating_mul(1000);
+                if stale_for_ms < park_max_ms {
+                    return Err(KvError::Busy(format!(
+                        "{}: refusing to clear appender {appender_id} — the set's manager claim                          went stale only {stale_for_ms} ms ago and a LIVE joined appender parked                          at T_self reclaims against the successor for up to T_park_max =                          {park_max_ms} ms before it fences itself (appender_park_expiries); a                          clear inside that window would recover a live writer's ring. Mount the                          successor (its death ledger recovers what is dead) or retry after the                          bound",
+                        path.display()
+                    )));
+                }
+            }
         }
         // The liveness probe an offline verb has (the writer claims above,
         // and) a fresh `client:` registration naming the appender's node

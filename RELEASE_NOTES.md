@@ -91,6 +91,43 @@ own release is the last one. Contracts: `dlm_multi_writer_tests`
 (`a_shipped_authoritys_clean_leave_releases_its_data_namespace_wero_before_returning`,
 the flat layout) and `sym_mount_posture_tests` (the armed layout).
 
+**The job wire's enrollment secret (`job:enroll`) is minted ONCE per set and
+reused by every later coordinator.** (Symmetric PR 12b, found by the
+`sym-crash` fleet leg — a manager failover with joined writers mounted;
+record
+[.benchmarks/2026-09-17-sym-pr12b-n-daemon.md](.benchmarks/2026-09-17-sym-pr12b-n-daemon.md).)
+Every coordinator start used to write a FRESH 32-byte secret over the set's
+`job:enroll` record — an accidental rotation on every restart that nothing
+documented and nothing relied on for security: under ruling D2 (possession
+of volume access IS membership) a member that can read the record is
+already inside the trust boundary, so a permanent per-set secret adds no
+reach. It DID break every member that outlives a coordinator's incarnation
+(a joined writer, an S9 co-writer, an S6 member reader): its sessions to the
+successor failed `mac invalid` for the member's life, and on the fleet the
+joiners parked at `T_self` against a successor whose grace window would have
+admitted them. The record is now read first: absent ⇒ minted; present and
+well-formed ⇒ reused verbatim; present but corrupt (another length,
+undecodable) ⇒ the coordinator REFUSES loud naming the record; an I/O error
+⇒ propagated, never re-minted. **Operators who rotated the secret by
+restarting the coordinator** now rotate it by REMOVING the record on a
+quiesced set (every member re-enrolls at its next arm). Contract:
+`job_wire_tests::a_coordinators_restart_keeps_the_sets_enroll_secret`
+(layout-blind).
+
+**A mixed sync/async `scc` bucket acquisition in the KV node loader could
+wedge a mount's two metadata lanes for ever.** (Symmetric PR 12b review
+round 1, Issue 13 — pre-existing on every layout, made ordinary by the
+N-daemon posture's fsck C1 population; the fleet's `-o ro` reader hung
+`squeezefs fsck` for 31 minutes and its own `umount` with it.) The
+single-flight table was taken async by the loader and sync by the loader
+guard's drop; `saa` hands a released bucket to a queued async waiter that
+resumes only when polled, and both lanes that could poll it were parked in
+a sync wait on that bucket. Every node-cache table is now taken in ONE
+style (sync — no bucket is ever held across an await); the static rail
+`kv_loader_lock_style_tests` keeps it so, and the fleet fsck's collect
+loop is bounded by the shard lease (a wedged worker's shard is retired and
+re-run locally) so `squeezefs fsck` always returns.
+
 ---
 
 # SqueezeFS 1.2.4

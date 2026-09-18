@@ -1287,6 +1287,13 @@ pub trait FleetDispatch: Send + Sync {
     /// still refuses stale after retirement — the unknown-shard arm is
     /// the same refusal class.
     fn retire_fleet_shards(&self, job_id: &str);
+    /// The shard lease TTL the wire runs (its heartbeat law's bound) —
+    /// the coordinator's collect loop derives its PROGRESS deadline from
+    /// it: a worker whose heartbeats keep beating while its shard never
+    /// proposes (a wedged worker) is otherwise waited on for ever
+    /// (review round 1 of PR 12b, Issue 13 — the fleet's `squeezefs fsck`
+    /// hung 31 min behind a wedged reader shard).
+    fn shard_lease_ttl(&self) -> std::time::Duration;
 }
 
 /// The shard-number space KD-PV-16's inode-plane shards live in, disjoint

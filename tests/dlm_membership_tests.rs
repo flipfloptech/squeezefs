@@ -1409,6 +1409,7 @@ fn the_verb_router_composes_services_additively() {
         id: 1,
         verb: squeezefs::cluster_wire::VERB_PING,
         body: b"hi".to_vec(),
+        peer: "probe".into(),
     });
     assert_eq!(ping.status, squeezefs::cluster_wire::RPC_OK);
     assert_eq!(ping.body, b"hi");
@@ -1417,6 +1418,7 @@ fn the_verb_router_composes_services_additively() {
         id: 2,
         verb: VERB_MEMBERSHIP_CENSUS,
         body: membership_wire_census_body(),
+        peer: "probe".into(),
     });
     assert_eq!(census.status, squeezefs::cluster_wire::RPC_OK);
 
@@ -1424,6 +1426,7 @@ fn the_verb_router_composes_services_additively() {
         id: 3,
         verb: 0xfffe,
         body: Vec::new(),
+        peer: "probe".into(),
     });
     assert_eq!(
         unknown.status,

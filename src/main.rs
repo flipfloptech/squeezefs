@@ -1600,6 +1600,16 @@ enum JobActions {
         /// Metadata URI (sqmeta://...) of the volume set
         meta_uri: String,
     },
+    /// Rotate the set's job-wire enrollment secret (`job:enroll`) —
+    /// OFFLINE, on a quiesced set: the record is removed under the D0
+    /// guard and the next coordinator mints a fresh one; every member
+    /// re-enrolls at its next arm. The secret is minted once per set and
+    /// reused by every coordinator (1.3.0) — this verb is the only
+    /// rotation lever.
+    RotateEnroll {
+        /// Metadata URI (sqmeta://...) of the volume set
+        meta_uri: String,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -5418,6 +5428,21 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 JobActions::Worker { meta_uri } => {
                     run_job_worker(&meta_uri).await?;
                 }
+                JobActions::RotateEnroll { meta_uri } => {
+                    let meta_lvs = parse_block_uri(&meta_uri, "sqmeta://")?;
+                    let removed = squeezefs::config_ops::rotate_enroll_secret(&meta_lvs)
+                        .await
+                        .map_err(|e| format!("job rotate-enroll refused: {e}"))?;
+                    if removed {
+                        println!(
+                            "job rotate-enroll: the set's job:enroll record was removed — the \
+                             next coordinator mints a fresh secret and every member re-enrolls \
+                             at its next arm"
+                        );
+                    } else {
+                        println!("job rotate-enroll: no job:enroll record on this set (nothing to rotate)");
+                    }
+                }
             }
         }
         Commands::Fsck {
@@ -7140,9 +7165,17 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // PR 12b: a JOINED appender holds no allocation lease — it
                 // mints from the manager's ranged grants over the wire and
                 // ships its terminal frees to the holder.
+                let routed_for_venue = std::sync::Arc::clone(&routed_meta_backend);
+                let manager_endpoint = adm.manager_endpoint.clone();
                 let armed = squeezefs::meta_backend::kv::alloc_lease::arm_joined_allocation(
                     &fs_engine.router.backend_router.lane_allocators(),
-                    &adm.manager_endpoint,
+                    &|vol_tag| {
+                        squeezefs::sym_join::joined_holder_venue(
+                            &routed_for_venue,
+                            vol_tag,
+                            manager_endpoint.clone(),
+                        )
+                    },
                     &adm.secret,
                     adm.identity,
                 );

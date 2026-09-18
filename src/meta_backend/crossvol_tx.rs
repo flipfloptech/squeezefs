@@ -173,6 +173,13 @@ pub static XV_MIDPLAN_ESCALATIONS: AtomicU64 = AtomicU64::new(0);
 /// NO fail-stop escalation: it models a dead process, not a device error.
 pub static TEST_XV_SEAM_AFTER_STEPS: AtomicU64 = AtomicU64::new(0);
 
+/// Companion of [`TEST_XV_SEAM_AFTER_STEPS`] (PR 12b review round 1,
+/// Issue 4): `0` = the seam severs EVERY initiator's plan (the one-process
+/// suites); `id + 1` = only a plan whose coordinating volume's OWN
+/// appender id is `id` is severed — the two-backend venue's way to kill
+/// ONE daemon's op mid-plan while the manager's own ops run on.
+pub static TEST_XV_SEAM_INITIATOR: AtomicU64 = AtomicU64::new(0);
+
 /// Test seam (the served side): the NEXT shipped step commits and its
 /// reply is MISDELIVERED (a wrong correlation id — the client refuses it
 /// exactly as it fails a dead session), then the seam clears. Models a
@@ -2315,7 +2322,11 @@ pub async fn execute(
         routed.check_volume_enabled(v)?;
     }
     let seam = TEST_XV_SEAM_AFTER_STEPS.load(Ordering::Relaxed);
-    let allowed = if seam == 0 {
+    let seam_mine = match TEST_XV_SEAM_INITIATOR.load(Ordering::Relaxed) {
+        0 => true,
+        id => u64::from(routed.volumes[coord].own_appender_id()) + 1 == id,
+    };
+    let allowed = if seam == 0 || !seam_mine {
         usize::MAX
     } else {
         (seam - 1) as usize
@@ -2770,6 +2781,21 @@ async fn scan_open(routed: &RoutedMetaBackend) -> Result<Vec<OpenIntent>> {
         for (intent_ino, tx_id, image) in vol.xv_scan_intents_homed().await? {
             if !matches!(step_home(routed, idx, intent_ino), StepHome::Local) {
                 continue;
+            }
+            // A JOINED appender adopts only the intents homed in slots it
+            // LEASES — its own rings' residue (PR 12b review round 1,
+            // Issue 7): `step_home` answers `Local` for every UNLEASED
+            // slot on every posture, so a joiner's open adopted every
+            // intent of the set homed on an unleased slot — a dead peer's,
+            // the manager's own in-flight one — beside the manager's
+            // cadence, which is the lessee of record for an unleased slot
+            // (KD-SYM-2/3) and completes them alone.
+            if vol.is_joined_appender() {
+                let slot = super::kv::record::forest_slot_of_ino(intent_ino);
+                let leased = vol.slot_leases().is_some_and(|p| p.gate.is_leased(slot));
+                if !leased {
+                    continue;
+                }
             }
             let rec = IntentRecord::decode(&image).map_err(|e| {
                 SqueezefsError::InvalidOperation(format!(

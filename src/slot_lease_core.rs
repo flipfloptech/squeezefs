@@ -148,6 +148,10 @@ pub struct LeaseGate {
     /// moves a slot to or from a wire appender).
     foreign: Box<[AtomicU64]>,
     inflight: Box<[AtomicU32]>,
+    /// Content applies admitted under `Releasing` because a door token
+    /// was out (`slot_door_draining_admits`) — the release's drain
+    /// waiting for exactly them (PR 12b review round 1, Issue 11).
+    draining_admits: AtomicU64,
 }
 
 impl Default for LeaseGate {
@@ -172,6 +176,7 @@ impl LeaseGate {
             releasing: (0..GATE_WORDS).map(|_| AtomicU64::new(0)).collect(),
             foreign: (0..GATE_WORDS).map(|_| AtomicU64::new(0)).collect(),
             inflight: (0..slots).map(|_| AtomicU32::new(0)).collect(),
+            draining_admits: AtomicU64::new(0),
         }
     }
 
@@ -348,6 +353,20 @@ impl LeaseGate {
 
     /// The verdict on a leaf mutation of `slot` — read UNDER the node's
     /// write lock (see the module docs for why).
+    ///
+    /// **A token holder's apply under `Releasing` is ADMITTED** (PR 12b
+    /// review round 1, Issue 11): the release raised the bit and is
+    /// DRAINING the door — the tokens out are the commits it waits for
+    /// before its flush, and refusing their applies fails the very
+    /// commits the drain exists to complete (the round-1 matrix's
+    /// fail-stop: the cadence's LRU release beside a first touch whose
+    /// op was noted after its acquire). A `Releasing` slot is still
+    /// `leased` and the belt's law is ONE writer-cacher, which the
+    /// lessee's admitted commit satisfies; a mutation with NO token out
+    /// is the rogue the belt refuses (after the drain the door admits
+    /// nobody, so `inflight` can only be a token holder's — a
+    /// committer's transient bump inside `enter` returns it without a
+    /// mutation of its own).
     #[inline]
     pub fn verdict(&self, slot: Slot) -> CommitVerdict {
         if !self.is_armed() {
@@ -358,9 +377,18 @@ impl LeaseGate {
             return CommitVerdict::NotLeased;
         }
         if self.releasing[w].load(Ordering::Acquire) & bit != 0 {
+            if self.inflight[slot as usize].load(Ordering::Acquire) > 0 {
+                self.draining_admits.fetch_add(1, Ordering::Relaxed);
+                return CommitVerdict::Allowed;
+            }
             return CommitVerdict::Releasing;
         }
         CommitVerdict::Allowed
+    }
+
+    /// Content applies admitted under `Releasing` as a token holder's.
+    pub fn draining_admits(&self) -> u64 {
+        self.draining_admits.load(Ordering::Relaxed)
     }
 
     /// The verdict on the SMO task's OWN moves (an SMO's leftover overlay
@@ -1369,6 +1397,31 @@ mod tests {
         g.end_release(3);
         assert!(g.enter(3));
         assert_eq!(g.leave(3), 0);
+    }
+
+    /// PR 12b review round 1, Issue 11: a TOKEN HOLDER's apply under
+    /// `Releasing` is admitted (the release's drain waits for exactly
+    /// it); once every token is back the belt refuses again.
+    #[test]
+    fn a_token_holders_apply_is_admitted_while_the_release_drains() {
+        let g = LeaseGate::with_namespace(8);
+        g.arm();
+        g.grant(3);
+        assert!(g.enter(3));
+        g.begin_release(3);
+        assert_eq!(
+            g.verdict(3),
+            CommitVerdict::Allowed,
+            "the drained token's apply lands"
+        );
+        assert_eq!(g.draining_admits(), 1);
+        assert_eq!(g.leave(3), 0);
+        assert_eq!(
+            g.verdict(3),
+            CommitVerdict::Releasing,
+            "no token out: a mutation now is the rogue the belt refuses"
+        );
+        assert_eq!(g.draining_admits(), 1);
     }
 
     #[test]

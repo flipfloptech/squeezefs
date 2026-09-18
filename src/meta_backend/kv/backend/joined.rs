@@ -277,16 +277,23 @@ impl JoinedWire {
     /// nothing at the device; a registrant unregisters its key) —
     /// off-runtime, once: the leave's last act and every failed open's.
     pub async fn release_meta_hold(&self) {
-        let hold = self.meta_hold.lock().unwrap().take();
+        let hold = self
+            .meta_hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(hold) = hold {
             crate::data_custody::release_hold(hold).await;
         }
     }
 
     /// Whether rung 4's metadata hold is still held (the leave drops it
-    /// last).
-    pub fn meta_hold_standing(&self) -> bool {
-        self.meta_hold.lock().unwrap().is_some()
+    /// last) — the stats face's `meta_hold_standing` word.
+    fn meta_hold_standing(&self) -> bool {
+        self.meta_hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 }
 
@@ -311,6 +318,9 @@ pub struct JoinedStats {
     /// shared, no key of ours), `registrant` (remote — our key under it)
     /// or `detection` (a non-PR substrate under KD-SYM-13's opt-in).
     pub registrant_posture: &'static str,
+    /// Rung 4's metadata-namespace hold is standing (held for the mount's
+    /// life; the leave drops it last) — `joined_meta_hold_standing`.
+    pub meta_hold_standing: bool,
 }
 
 /// The one-line error a wire verb's unexpected reply becomes.
@@ -784,6 +794,7 @@ impl KvMetaBackend {
             } else {
                 "detection"
             },
+            meta_hold_standing: w.meta_hold_standing(),
         })
     }
 
@@ -1544,6 +1555,33 @@ impl KvMetaBackend {
         })?);
         let region = self.joined_region()?;
         region.fold_smo_rate(cycle_ms);
+        // The census in force (PR 12b review round 1, Issue 10): a
+        // joiner's `appenders_known` was frozen at its join, so the
+        // derived rotor size `M` never re-derived there — refreshed from
+        // the directory's `Live` count at every cadence (one directory
+        // read, the manager's own word for the same gauge).
+        if let Some(set) = self.appenders.as_ref() {
+            match super::super::appender::read_directory(&self.path, &self.sb).await {
+                Ok(entries) => {
+                    let live = entries
+                        .iter()
+                        .filter(|e| {
+                            e.page.as_ref().is_some_and(|p| {
+                                p.state == super::super::appender::AppenderState::Live
+                            })
+                        })
+                        .count() as u64;
+                    if live > 0 {
+                        set.appenders_known.store(live, Ordering::Relaxed);
+                    }
+                }
+                Err(e) => log::debug!(
+                    "meta volume {}: the appender directory is unreadable at the joined \
+                     cadence ({e}) — the census in force stands",
+                    self.path.display()
+                ),
+            }
+        }
         let returnable = region.grant().take_returnable();
         if !returnable.is_empty() {
             let runs = super::super::slot_state::ExtentGrantRecord::from_extents(

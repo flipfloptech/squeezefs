@@ -2164,6 +2164,116 @@ async fn a_live_joiner_follows_a_manager_failover_to_the_successors_listener() {
     fsck_clean(&uris).await;
 }
 
+/// **A joiner's FREE TARGET follows a manager failover with NO grant ask
+/// in between** (PR 12b round 3, F5 — the `sym-crash` leg's round 2: the
+/// second failover's successor moved the holder's listener while the
+/// joiner's grant WINDOW still covered its writes, so the grant sink —
+/// the only arm that re-resolved the venue — never ran, the data volume's
+/// free target kept the dead holder's address for the mount's life, the
+/// per-holder custody JOIN there was refused (`Connection refused …
+/// declined until the next renewal beat`) and `free_shipped_blocks` sat
+/// flat 60 s after the rewrite). The free path re-resolves the venue off
+/// durable state at its own transport failure
+/// (`alloc_lease::refresh_free_target`): here the joiner's allocation arm
+/// registers the venue, the manager leaves and a successor publishes a
+/// new listener, nothing mints, and the refresh moves the free target to
+/// the successor (`moves` = 1) — the grant sink untouched (`block_grant_
+/// topups` flat).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiners_free_target_follows_a_failover_the_grant_window_covered() {
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::meta_backend::kv::alloc_lease;
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, _dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    enroll_manager(&mvol, &venue.endpoint()).await;
+    let data_id = "vol-free-follows-data";
+    let data_tag = squeezefs::meta_backend::kv::block_refs::volume_tag(data_id);
+    let data_blocks = 4096u64;
+    let a = Arc::new(BlockAllocator::new(data_id).await.unwrap());
+    a.set_capacity_bytes(data_blocks * a.chunk_size());
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&manager, &[Arc::clone(&a)])
+            .await
+            .unwrap(),
+        1
+    );
+
+    let joiner = join(&uris, &venue, &mvol, 77).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jwire = Arc::clone(jvol.joined_wire().expect("joined"));
+    let old_endpoint = venue.endpoint();
+    // The production arm: the venue registered behind the grant sink AND
+    // the free target.
+    let hv = squeezefs::sym_join::joined_holder_venue(&joiner, data_tag, old_endpoint.clone());
+    let b = Arc::new(BlockAllocator::new(data_id).await.unwrap());
+    b.set_capacity_bytes(data_blocks * b.chunk_size());
+    assert_eq!(
+        alloc_lease::arm_joined_allocation(
+            &[Arc::clone(&b)],
+            &|_| Arc::clone(&hv),
+            VENUE_SECRET,
+            jwire.identity,
+        ),
+        1
+    );
+    assert_eq!(
+        squeezefs::block_grant::free_target_for(data_tag).as_deref(),
+        Some(old_endpoint.as_str())
+    );
+    let topups0 = b.block_grant_topups();
+
+    // The failover: the manager leaves, a successor publishes elsewhere.
+    // (In one process the manager's leave uninstalled the free target it
+    // shared with the joiner — the process-global table; a second daemon's
+    // would stand at the dead address. Either way the refresh re-homes it.)
+    venue.tear_down();
+    shutdown(&manager).await;
+    alloc_lease::disarm_symmetric_roles();
+    drop(mvol);
+    drop(manager);
+    let successor = open_under(&uris, &Knobs::armed()).await;
+    let svol = Arc::clone(&successor.volumes[0]);
+    let venue2 = HoldersVenue::stand_up(&successor, &[]).await;
+    assert_ne!(venue2.endpoint(), old_endpoint);
+    squeezefs::multi_writer::publish_symmetric_endpoint(&successor, &venue2.endpoint()).await;
+    svol.checkpoint_now().await.unwrap();
+
+    // No mint, no ask: the free path's re-resolve alone moves the target.
+    assert_eq!(hv.moves.load(Relaxed), 0);
+    let (endpoint, moved) = alloc_lease::refresh_free_target(data_tag)
+        .await
+        .expect("the joiner's venue is registered behind its free target");
+    assert!(moved, "the venue re-resolved to the successor");
+    assert_eq!(endpoint, venue2.endpoint());
+    assert_eq!(hv.moves.load(Relaxed), 1);
+    assert_eq!(
+        squeezefs::block_grant::free_target_for(data_tag).as_deref(),
+        Some(venue2.endpoint().as_str()),
+        "the free target followed the holder with no grant ask"
+    );
+    assert_eq!(b.block_grant_topups(), topups0, "the grant sink never ran");
+    // A second refresh is a no-op (the venue stands).
+    assert_eq!(
+        alloc_lease::refresh_free_target(data_tag).await,
+        Some((venue2.endpoint(), false))
+    );
+
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    venue2.tear_down();
+    shutdown(&successor).await;
+    drop(svol);
+    drop(successor);
+    fsck_clean(&uris).await;
+}
+
 /// **A joiner's CHECKPOINT CYCLE whose wire verb meets a dead manager
 /// completes — and follows the successor** (PR 12b round 3, F3 — the
 /// `sym-storm` fleet leg's second face: the manager closed a joiner's

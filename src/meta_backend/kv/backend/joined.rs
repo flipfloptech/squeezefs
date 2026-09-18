@@ -175,20 +175,25 @@ impl JoinedWire {
     /// manager's word) is returned as is. `vol` is `None` only for the
     /// open's own refill (no backend yet: the re-dial goes to the last
     /// known endpoint). Counted on `verbs` / `failures`.
-    async fn with_client<T, F>(
-        &self,
-        vol: Option<&KvMetaBackend>,
-        verb: &str,
+    fn with_client<'s, T, F>(
+        &'s self,
+        vol: Option<&'s KvMetaBackend>,
+        verb: &'s str,
         f: F,
-    ) -> Result<T, KvError>
+    ) -> impl std::future::Future<Output = Result<T, KvError>> + Send + 's
     where
+        T: Send + 's,
         F: for<'a> Fn(
-            &'a mut ManagerClient,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = crate::error::Result<T>> + Send + 'a>,
-        >,
+                &'a mut ManagerClient,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<T>> + Send + 'a>,
+            > + Send
+            + 's,
     {
-        self.with_client_at(vol, SmoHeld::No, verb, f).await
+        // Not an `async fn`: one future layer, not two — the read divert's
+        // future sits deep inside the handler and the Send proof overflowed
+        // the test crates' recursion limit with the wrapper inlined.
+        self.with_client_at(vol, SmoHeld::No, verb, f)
     }
 
     /// [`Self::with_client`] for a caller that HOLDS `vol`'s SMO mutex —
@@ -196,22 +201,24 @@ impl JoinedWire {
     /// round 3, F3): the re-dial's projection refresh runs on the held
     /// guard instead of re-taking the mutex. `smo` is the witness (the
     /// guard's contents), never read.
-    async fn with_client_under_smo<T, F>(
-        &self,
-        vol: &KvMetaBackend,
+    fn with_client_under_smo<'s, T, F>(
+        &'s self,
+        vol: &'s KvMetaBackend,
         smo: &super::super::tree::SmoContext,
-        verb: &str,
+        verb: &'s str,
         f: F,
-    ) -> Result<T, KvError>
+    ) -> impl std::future::Future<Output = Result<T, KvError>> + Send + 's
     where
+        T: Send + 's,
         F: for<'a> Fn(
-            &'a mut ManagerClient,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = crate::error::Result<T>> + Send + 'a>,
-        >,
+                &'a mut ManagerClient,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<T>> + Send + 'a>,
+            > + Send
+            + 's,
     {
         let _ = smo;
-        self.with_client_at(Some(vol), SmoHeld::Yes, verb, f).await
+        self.with_client_at(Some(vol), SmoHeld::Yes, verb, f)
     }
 
     async fn with_client_at<T, F>(
@@ -2267,8 +2274,10 @@ impl KvMetaBackend {
     /// and re-read stale leaves for as long as no SMO moved them). Returns
     /// whether the projection advanced. Never runs on the manager (its
     /// trees are live).
-    pub async fn refresh_control_projection(&self) -> Result<bool, KvError> {
-        self.refresh_control_projection_at(SmoHeld::No).await
+    pub fn refresh_control_projection(
+        &self,
+    ) -> impl std::future::Future<Output = Result<bool, KvError>> + Send + '_ {
+        self.refresh_control_projection_at(SmoHeld::No)
     }
 
     /// [`Self::refresh_control_projection`] with the SMO-mutex posture

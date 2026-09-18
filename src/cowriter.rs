@@ -1770,21 +1770,47 @@ pub fn retire_displaced_locally(router: &crate::routing::BackendRouter, block_ke
 /// failover the joiner's grant window covered moved the holder's listener
 /// with no grant ask to notice it, so the first free after it met a dead
 /// address here.
-async fn holder_client_following(
+fn holder_client_following(
     vol_tag: u64,
-    target: &str,
-) -> Result<Arc<crate::data_grant::WriteCustodyClient>> {
-    match crate::data_grant::slot_holder_client(target).await {
-        Ok(c) => Ok(c),
-        Err(e) => {
-            if let Some((moved_to, true)) =
-                crate::meta_backend::kv::alloc_lease::refresh_free_target(vol_tag).await
-            {
-                return crate::data_grant::slot_holder_client(&moved_to).await;
-            }
-            Err(e)
+    target: String,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<Arc<crate::data_grant::WriteCustodyClient>>> + Send,
+    >,
+> {
+    Box::pin(async move {
+        match crate::data_grant::slot_holder_client(&target).await {
+            Ok(c) => Ok(c),
+            Err(e) => match follow_moved_holder(vol_tag).await? {
+                Some((_, c)) => Ok(c),
+                None => Err(e),
+            },
         }
-    }
+    })
+}
+
+/// Re-resolve data volume `vol_tag`'s allocation holder off durable state;
+/// a MOVED venue answers the new target and a custody client JOINed there.
+/// Boxed: the free path's future is already deep inside the write
+/// pipeline, and the auto-trait proof overflowed with this arm inlined.
+fn follow_moved_holder(
+    vol_tag: u64,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<Option<(String, Arc<crate::data_grant::WriteCustodyClient>)>>,
+            > + Send,
+    >,
+> {
+    Box::pin(async move {
+        match crate::meta_backend::kv::alloc_lease::refresh_free_target(vol_tag).await {
+            Some((moved_to, true)) => {
+                let c = crate::data_grant::slot_holder_client(&moved_to).await?;
+                Ok(Some((moved_to, c)))
+            }
+            _ => Ok(None),
+        }
+    })
 }
 
 pub async fn ship_displaced_frees(
@@ -1875,7 +1901,7 @@ pub async fn ship_displaced_frees(
                 crate::block_grant::free_target_for(g.vol_tag).map(|t| (g.vol_tag, t))
             });
             match target {
-                Some((vol_tag, t)) => holder_client_following(vol_tag, &t).await?,
+                Some((vol_tag, t)) => holder_client_following(vol_tag, t).await?,
                 None => {
                     let blocks: u64 = groups.iter().map(|g| g.entries.len() as u64).sum();
                     crate::meta_ship::publish::note_free_ship_failure(blocks);
@@ -1937,20 +1963,16 @@ pub async fn ship_displaced_frees(
                         && crate::data_grant::custody_client().is_none()
                     {
                         followed = true;
-                        if let Some((moved_to, true)) =
-                            crate::meta_backend::kv::alloc_lease::refresh_free_target(group.vol_tag)
-                                .await
-                        {
-                            match crate::data_grant::slot_holder_client(&moved_to).await {
-                                Ok(c) => {
-                                    client = c;
-                                    epoch = client.lease_epoch();
-                                    request_id = next_ship_request_id();
-                                    target = moved_to;
-                                    continue;
-                                }
-                                Err(je) => break Err(je),
+                        match follow_moved_holder(group.vol_tag).await {
+                            Ok(Some((moved_to, c))) => {
+                                client = c;
+                                epoch = client.lease_epoch();
+                                request_id = next_ship_request_id();
+                                target = moved_to;
+                                continue;
                             }
+                            Ok(None) => {}
+                            Err(je) => break Err(je),
                         }
                     }
                     // A retry NEVER re-keys: if the lease epoch moved (a

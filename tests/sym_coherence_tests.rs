@@ -3072,6 +3072,24 @@ async fn the_holder_grants_members_only_and_refuses_a_ghost_before_it_registers(
         !squeezefs::meta_ship::token_plane::is_token_client("ghost"),
         "a refused ghost is not a token client"
     );
+    // The refusal's OWN text reaches the client (PR 12b round 3, F8): the
+    // membership screen answers STATUS_REFUSED with a reason string, not
+    // an encoded reply — decoded as one it read `invalid value: integer
+    // 99` and a joiner re-enrolling at a failover successor surfaced a
+    // user op's EIO off the garbage; it is the retryable class.
+    let e = ghost_plane
+        .probe()
+        .await
+        .expect_err("a ghost's probe is refused");
+    assert!(
+        e.to_string().contains("holds no live membership lease"),
+        "the refusal's own text, never a decode of it: {e}"
+    );
+    assert!(!e.to_string().contains("undecodable"), "{e}");
+    assert!(
+        matches!(&e, squeezefs::error::SqueezefsError::Refused { errno, .. } if *errno == libc::EAGAIN),
+        "the retryable class: {e:?}"
+    );
     assert_eq!(ghost_plane.stats().grants, 0);
     ghost_plane.stop().await;
     shutdown(&ghost).await;

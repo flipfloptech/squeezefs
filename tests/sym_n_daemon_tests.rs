@@ -1626,6 +1626,207 @@ async fn a_daemon_that_joined_after_anothers_ladder_is_bound_on_demand_at_its_fi
     fsck_clean(&uris).await;
 }
 
+/// **A redirect to a DEAD holder is never handed out; a peer's lookup of
+/// a removed name answers within the bound** (round 3, F2 — the storm
+/// leg's 24-minute park): joiner 3 holds a slot with files; joiner 2 reads
+/// them through joiner 3's token (the manager's `NotHolder { 3 }`
+/// redirect). Joiner 3 DIES and the S6 owner (the manager) EVICTS it —
+/// tree 0 still leases the slot to the dead id until the ledger poll
+/// recovers it. Joiner 2's next read: the manager answers `HolderDead`
+/// (never `NotHolder` to an address nobody answers at —
+/// `slot_resolve_dead_redirects`), the reader refuses EAGAIN INSIDE the
+/// bound with no dial; after the recovery the slot is the manager's and
+/// the read is exact there; the manager removes a name and the peer's
+/// lookup of it is ENOENT, never a park. Red before: `NotHolder { 3 }`
+/// handed out for a dead lessee (`slot_resolve_dead_redirects == 0`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peers_lookup_through_a_dead_holder_is_refused_inside_the_bound_and_exact_after_recovery()
+{
+    use squeezefs::membership::{
+        self, JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole, MembershipOwner,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared"), (SLOT_B, "other")]).await;
+    let other = dirs[1];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mvenue = DaemonVenue::stand_up(&manager, true, "manager-custody-f2").await;
+    enroll_manager(&mvol, &mvenue.endpoint).await;
+    // The manager is the S6 owner of the joiners' shard (the mount path's
+    // rung 3): liveness is its word.
+    let owner = MembershipOwner::arm(
+        "f2-owner",
+        3,
+        2,
+        LeaseClocks::derive(std::time::Duration::from_micros(250)).expect("derived clocks"),
+        LeaseClock::monotonic(),
+    )
+    .expect("arm the owner");
+    membership::install_owner(Arc::clone(&owner));
+    let enroll = |ident: AppenderIdentity| {
+        let owner = Arc::clone(&owner);
+        move || {
+            let member = squeezefs::cowriter::node_member_id_of(ident.node_token, ident.mount_slot);
+            let JoinOutcome::Granted(_) = owner.join(JoinRequest {
+                id: member.clone(),
+                role: MemberRole::Writer,
+                endpoint: None,
+                pid: std::process::id(),
+                boot: "boot-f2".to_string(),
+                prior_epoch: None,
+                pr_key: 0,
+                mount: None,
+            }) else {
+                panic!("the joiner joins the shard");
+            };
+            member
+        }
+    };
+    let join_at = |n: u32, ep: String| {
+        let uris = uris.clone();
+        let mvol = Arc::clone(&mvol);
+        async move {
+            Knobs::armed().apply();
+            let r = open_routed_meta_set_joined(
+                &uris,
+                &JoinedSetAdmission {
+                    manager_endpoint: ep,
+                    secret: VENUE_SECRET.to_vec(),
+                    peer_id: peer_of(&joiner_identity(&mvol, n).await),
+                    identity: joiner_identity(&mvol, n).await,
+                },
+            )
+            .await;
+            Knobs::clear();
+            r.expect("the joined open")
+        }
+    };
+    let j2 = join_at(71, mvenue.endpoint.clone()).await;
+    let j2vol = Arc::clone(&j2.volumes[0]);
+    let j2venue = DaemonVenue::stand_up(&j2, false, "joiner-2-f2").await;
+    j2vol
+        .joined_publish_endpoint(&j2venue.endpoint, 0)
+        .await
+        .expect("joiner 2 publishes");
+    let _m2 = enroll(j2vol.joined_wire().unwrap().identity)();
+    squeezefs::sym_join::bind_live_appender_endpoints(&j2).await;
+    let sink = Arc::new(ProbeSink {
+        calls: std::sync::atomic::AtomicU64::new(0),
+    });
+    let for_arm = Arc::clone(&sink);
+    let _arm = squeezefs::data_grant::arm_slot_custody(
+        &j2,
+        &squeezefs::cowriter::node_member_id_of(
+            j2vol.joined_wire().unwrap().identity.node_token,
+            j2vol.joined_wire().unwrap().identity.mount_slot,
+        ),
+        VENUE_SECRET.to_vec(),
+        0,
+        Arc::new(move |_volume| {
+            Arc::clone(&for_arm) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
+        }),
+    );
+
+    let j3 = join_at(72, mvenue.endpoint.clone()).await;
+    let j3vol = Arc::clone(&j3.volumes[0]);
+    let j3id = j3vol.appender_stats().unwrap().appender_id;
+    let j3ident = j3vol.joined_wire().unwrap().identity;
+    let j3venue = DaemonVenue::stand_up(&j3, false, "joiner-3-f2").await;
+    j3vol
+        .joined_publish_endpoint(&j3venue.endpoint, 0)
+        .await
+        .expect("joiner 3 publishes");
+    let m3 = enroll(j3ident)();
+    let files = create_files(&j3, other, "f2", 6).await;
+    j3vol.checkpoint_now().await.unwrap();
+    assert!(matches!(
+        tree0_state(&mvol, SLOT_B).await,
+        Some(SlotState::Leased { appender_id, .. }) if appender_id == j3id
+    ));
+    // Joiner 2 reads joiner 3's files through its token (the redirect).
+    assert_all_resolve(&j2, other, &files).await;
+    let mholder = mvol.token_holder().expect("the manager is a token holder");
+    let redirects0 = mholder.stats().not_holder_redirects;
+    let dead0 = mholder.stats().dead_redirects;
+    assert!(
+        redirects0 >= 1,
+        "the redirect to joiner 3 was handed out while it lived"
+    );
+
+    // Joiner 3 DIES (its listener with it); the owner EVICTS it — tree 0
+    // still leases the slot to the dead id (no recovery yet).
+    j3venue.tear_down();
+    drop(j3vol);
+    drop(j3);
+    park_gate::test_reset();
+    assert!(owner.evict(&m3, "the F2 pin's kill").is_some());
+    assert!(!owner.member_is_live(&m3));
+    assert!(matches!(
+        tree0_state(&mvol, SLOT_B).await,
+        Some(SlotState::Leased { appender_id, .. }) if appender_id == j3id
+    ));
+    // Joiner 2's read now: refused INSIDE the bound, no redirect to the
+    // dead address, no dial.
+    let (name, _) = &files[0];
+    let t0 = std::time::Instant::now();
+    let out = tokio::time::timeout(std::time::Duration::from_secs(30), j2.lookup(other, name))
+        .await
+        .expect("the lookup returns inside the bound — never a park");
+    let e = out.expect_err("a dead holder's slot is refused, never served stale");
+    assert!(
+        e.to_string().contains("DEAD"),
+        "the manager's word, not a dial's failure: {e} (after {:?})",
+        t0.elapsed()
+    );
+    let st = mholder.stats();
+    assert!(
+        st.dead_redirects > dead0,
+        "the manager withheld the redirect to the dead holder (slot_resolve_dead_redirects): {st:?}"
+    );
+    assert_eq!(
+        st.not_holder_redirects, redirects0,
+        "no NotHolder to a dead lessee was handed out"
+    );
+
+    // The recovery makes the slot the manager's: the read is exact there
+    // (joiner 3's files), and a name the manager removes is ENOENT at the
+    // peer — never a park.
+    assert!(!mvol.record_death_with_key(j3ident, 21, 0).await.unwrap());
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    j2vol.refresh_control_projection().await.unwrap();
+    assert_all_resolve(&j2, other, &files).await;
+    manager
+        .unlink(other, name)
+        .await
+        .expect("the manager removes a recovered name");
+    let out = tokio::time::timeout(std::time::Duration::from_secs(30), j2.lookup(other, name))
+        .await
+        .expect("bounded");
+    let e = out.expect_err("a removed name is ENOENT at the peer");
+    assert!(
+        e.to_string().contains("not found") || e.to_string().contains("ENOENT"),
+        "{e}"
+    );
+    assert_all_resolve(&j2, other, &files[1..]).await;
+
+    squeezefs::data_grant::disarm_slot_custody().await;
+    membership::uninstall();
+    assert_must_stay_zero(&j2vol, "joiner 2");
+    assert_must_stay_zero(&mvol, "manager");
+    shutdown(&j2).await;
+    drop(j2vol);
+    drop(j2);
+    j2venue.tear_down();
+    mvenue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
 /// **A live joiner follows a manager FAILOVER to the successor's
 /// listener** (PR 10's "busy appender across a manager failover" row, the
 /// N-daemon shape it named as PR 12's): the manager leaves and a

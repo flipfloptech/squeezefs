@@ -1093,6 +1093,12 @@ pub struct SlotCoverage {
     /// owner installed — the in-process fixtures') is PR 10's class: its
     /// tree is frozen at its page root and its window is scoped out.
     pub foreign_live: u64,
+    /// The `foreign_live` slots themselves (PR 12b round 4): the raw C1
+    /// walk skips their trees — a live lessee appends INTO the images
+    /// this mount holds under an unchanged root, so a raw walk of the
+    /// projection reads a routing loop (`root-seq` restarts to the
+    /// budget) and reported `C1Torn` over a healthy tree.
+    pub foreign_live_slots: Vec<super::record::ForestSlot>,
     /// `leased + unleased` — what this mount's pass covers.
     pub covered: u64,
 }
@@ -2278,6 +2284,7 @@ impl KvMetaBackend {
                         cov.foreign += 1;
                         if live_lessee.get(&appender_id).copied().unwrap_or(false) {
                             cov.foreign_live += 1;
+                            cov.foreign_live_slots.push(slot);
                         }
                     }
                     super::slot_state::SlotState::Leased { .. } => cov.leased += 1,

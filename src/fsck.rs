@@ -820,6 +820,12 @@ pub struct FsckCounters {
     /// remounted joiner's 1,444 removals as 442 dangling names) — so the
     /// inode plane recorded NO verdict this run. One per volume so met.
     pub inode_plane_foreign_dentry_scoped: u64,
+    /// Symmetric PR 12b round 4: slot trees the raw C1 walk SKIPPED because
+    /// a LIVE foreign appender leases them (`fsck_c1_foreign_live_slots_scoped`)
+    /// — the lessee appends into this mount's projected images under an
+    /// unchanged root, so a raw walk here reads a routing loop over a
+    /// healthy tree (the `sym-storm` leg's false `C1Torn`).
+    pub c1_foreign_live_slots_scoped: u64,
     /// PR 8: `fsck_inode_plane_slots_covered` — Σ over the pass's volumes
     /// of the slots this mount's inode plane judged: the slots it LEASES
     /// plus, on the volume's manager, the UNLEASED slots (tree 0's) —
@@ -1788,7 +1794,9 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
                 C1Unit,
             )> = Vec::new();
             for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
-                for unit in c1_units(kv) {
+                let (vol_units, scoped) = c1_units(kv).await;
+                counters.c1_foreign_live_slots_scoped += scoped;
+                for unit in vol_units {
                     units.push((vol_idx, kv.clone(), unit));
                 }
             }
@@ -2218,6 +2226,7 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         counters.inode_plane_foreign_slot_scoped += r.counters.inode_plane_foreign_slot_scoped;
         counters.inode_plane_window_scoped += r.counters.inode_plane_window_scoped;
         counters.inode_plane_foreign_dentry_scoped += r.counters.inode_plane_foreign_dentry_scoped;
+        counters.c1_foreign_live_slots_scoped += r.counters.c1_foreign_live_slots_scoped;
         counters.inode_plane_slots_covered += r.counters.inode_plane_slots_covered;
         counters.inode_plane_cross_owner_declined += r.counters.inode_plane_cross_owner_declined;
         counters.inode_plane_proposals_admitted += r.counters.inode_plane_proposals_admitted;
@@ -2354,6 +2363,7 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     dst.inode_plane_foreign_slot_scoped += fin.inode_plane_foreign_slot_scoped;
     dst.inode_plane_window_scoped += fin.inode_plane_window_scoped;
     dst.inode_plane_foreign_dentry_scoped += fin.inode_plane_foreign_dentry_scoped;
+    dst.c1_foreign_live_slots_scoped += fin.c1_foreign_live_slots_scoped;
     dst.inode_plane_slots_covered += fin.inode_plane_slots_covered;
     dst.inode_plane_cross_owner_declined += fin.inode_plane_cross_owner_declined;
     // `inode_plane_volumes_covered` is deliberately NOT folded: coverage
@@ -3113,6 +3123,7 @@ fn fold_worker_counters(dst: &mut FsckCounters, src: &FsckCounters) {
     dst.inode_plane_foreign_scoped += src.inode_plane_foreign_scoped;
     dst.inode_plane_foreign_slot_scoped += src.inode_plane_foreign_slot_scoped;
     dst.inode_plane_foreign_dentry_scoped += src.inode_plane_foreign_dentry_scoped;
+    dst.c1_foreign_live_slots_scoped += src.c1_foreign_live_slots_scoped;
     dst.inode_plane_window_scoped += src.inode_plane_window_scoped;
     dst.inode_plane_slots_covered += src.inode_plane_slots_covered;
     dst.inode_plane_cross_owner_declined += src.inode_plane_cross_owner_declined;
@@ -3231,18 +3242,55 @@ enum C1Unit {
     Slot(crate::meta_backend::kv::record::ForestSlot),
 }
 
-/// The C1 walk units of one volume.
-fn c1_units(kv: &crate::meta_backend::kv::backend::KvMetaBackend) -> Vec<C1Unit> {
+/// The C1 walk units of one volume, and the count of slot trees SCOPED
+/// OUT because a LIVE foreign appender leases them (symmetric PR 12b
+/// round 4 — the `sym-storm` leg's round-3 red: the manager's raw walk of
+/// a joiner's slot tree, which the joiner appends into under an
+/// unchanged root, exhausted the traversal's `root-seq` restart budget
+/// on the manager's projection and reported `C1Torn` over a healthy
+/// tree). The same S6-owner word the dentry pass judges by
+/// (`SlotCoverage::foreign_live`): a lessee not known live is PR 10's
+/// frozen-tree class and is walked; a live lessee's tree is its own to
+/// census (`fsck_c1_foreign_live_slots_scoped`).
+async fn c1_units(kv: &crate::meta_backend::kv::backend::KvMetaBackend) -> (Vec<C1Unit>, u64) {
     if kv.symmetric_forest() {
-        kv.forest_roots()
-            .into_iter()
-            .map(|(slot, _)| C1Unit::Slot(slot))
-            .collect()
+        let live_foreign: std::collections::BTreeSet<_> = match kv.inode_plane_slot_coverage().await
+        {
+            Ok(cov) => cov.foreign_live_slots.into_iter().collect(),
+            Err(e) => {
+                log::warn!(
+                    "fsck C1: meta volume {}'s slot coverage could not be read ({e}) — every \
+                     slot tree is walked",
+                    kv.device_path().display()
+                );
+                std::collections::BTreeSet::new()
+            }
+        };
+        let mut units = Vec::new();
+        let mut scoped = 0u64;
+        for (slot, _) in kv.forest_roots() {
+            if live_foreign.contains(&slot) {
+                scoped += 1;
+            } else {
+                units.push(C1Unit::Slot(slot));
+            }
+        }
+        if scoped > 0 {
+            log::info!(
+                "fsck C1: meta volume {}: {scoped} slot tree(s) leased to a LIVE appender are \
+                 that lessee's to walk — skipped (fsck_c1_foreign_live_slots_scoped)",
+                kv.device_path().display()
+            );
+        }
+        (units, scoped)
     } else {
-        crate::meta_backend::kv::backend::KvMetaBackend::USER_KINDS
-            .into_iter()
-            .map(C1Unit::Kind)
-            .collect()
+        (
+            crate::meta_backend::kv::backend::KvMetaBackend::USER_KINDS
+                .into_iter()
+                .map(C1Unit::Kind)
+                .collect(),
+            0,
+        )
     }
 }
 
@@ -3370,7 +3418,9 @@ async fn walk_trees_c1(
     suspects: &mut Vec<Suspect>,
 ) {
     for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
-        for unit in c1_units(kv) {
+        let (vol_units, scoped) = c1_units(kv).await;
+        counters.c1_foreign_live_slots_scoped += scoped;
+        for unit in vol_units {
             if opts.cancel.load(Ordering::Relaxed) {
                 return;
             }
@@ -7233,6 +7283,8 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.inode_plane_window_scoped, Ordering::Relaxed);
     m.fsck_inode_plane_foreign_dentry_scoped
         .fetch_add(c.inode_plane_foreign_dentry_scoped, Ordering::Relaxed);
+    m.fsck_c1_foreign_live_slots_scoped
+        .fetch_add(c.c1_foreign_live_slots_scoped, Ordering::Relaxed);
     if c.inode_plane_slots_covered > 0 {
         m.fsck_inode_plane_slots_covered
             .store(c.inode_plane_slots_covered, Ordering::Relaxed);

@@ -8824,6 +8824,9 @@ pub struct Metrics {
     /// projection of them is of unbounded staleness — symmetric PR 12b,
     /// review round 1, Issue 1). 0 on every mount with no foreign lessee.
     pub fsck_inode_plane_foreign_dentry_scoped: Align64<AtomicU64>,
+    /// `fsck_c1_foreign_live_slots_scoped` — slot trees the raw C1 walk
+    /// skipped because a LIVE foreign appender leases them (PR 12b round 4).
+    pub fsck_c1_foreign_live_slots_scoped: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -14741,6 +14744,12 @@ impl SqueezefsFilesystem {
                         "fsck_inode_plane_foreign_dentry_scoped".into(),
                         serde_json::json!(METRICS
                             .fsck_inode_plane_foreign_dentry_scoped
+                            .load(Ordering::Relaxed)),
+                    );
+                    metrics.insert(
+                        "fsck_c1_foreign_live_slots_scoped".into(),
+                        serde_json::json!(METRICS
+                            .fsck_c1_foreign_live_slots_scoped
                             .load(Ordering::Relaxed)),
                     );
                 }

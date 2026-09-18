@@ -2914,6 +2914,13 @@ leg_sym_storm() {
         done
         phase_ms=$((2000 + RANDOM % 6000))
         sleep "$(python3 -c "print($phase_ms/1000)")"
+        # Every daemon's .stats MID-STORM, bounded (round 3: a round whose
+        # first ops parked 17 s at every daemon acked 25 files and died at
+        # its oracle with no gauge of the stall on record — the stall's
+        # recall / guard / ship faces are read off these).
+        for idx in 0 "${joiners[@]}"; do
+            timeout 15 cat "$(mnt_of "$idx")/.stats" >"$rowdir/stats-m$idx-r$round-storm.json" 2>/dev/null || true
+        done
         local recov0 t_kill t_rec
         recov0="$(stat_sum 0 appender_recoveries)"
         "$MWFLEET" kill "$victim" --sig 9

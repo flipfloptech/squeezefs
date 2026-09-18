@@ -6015,6 +6015,25 @@ impl KvMetaBackend {
                 return Err(e);
             }
         };
+        // A WIRE lessee's tree arrives from another daemon's appends: the
+        // cross-daemon barrier re-reads it at the RELEASED root BEFORE the
+        // image walk below (PR 12b round 3, F1 — the storm leg's P0): the
+        // walk over the manager's STALE RAM tree subtracted the images the
+        // manager loaded at its open and left the lessee's CURRENT images
+        // CLAIMED in its record; at the lessee's death the orphan census
+        // (over the slots it still leased — this one was unleased) read
+        // them "claimed, reached by no root", RETURNED them, and the
+        // rejoined writer's first SMO on the re-acquired tree wrote into
+        // its own source extent (`CoW violation … in place`, fail-stop).
+        let released_root = RootPtr {
+            addr: words.root.0,
+            seq: words.root.1,
+        };
+        let wire_lessee = set.region(appender_id).is_none();
+        if wire_lessee {
+            self.adopt_transferred_slot_tree(slot, released_root)
+                .await?;
+        }
         // The custody of the tree's live images leaves the departing
         // grant with the slot (C13's candidate set is the grant-claimed
         // unreachable extents — an image the requester later retires
@@ -6076,16 +6095,10 @@ impl KvMetaBackend {
                 )));
             }
         }
-        let released_root = RootPtr {
-            addr: words.root.0,
-            seq: words.root.1,
-        };
-        if set.region(appender_id).is_none() {
-            // A WIRE lessee's tree arrives from another daemon's appends:
-            // the cross-daemon barrier re-reads it at the released root
-            // (the wire face holds the SMO mutex for exactly this).
-            self.adopt_transferred_slot_tree(slot, released_root)
-                .await?;
+        if wire_lessee {
+            // The tree was adopted at the released root ABOVE (the wire
+            // face holds the SMO mutex for exactly this); the page and
+            // the S4 plane follow the durable release.
             self.write_wire_joiner_page_slots(appender_id, &plane)
                 .await?;
             // A wire appender's release returns the slot to the S4
@@ -8416,7 +8429,7 @@ impl KvMetaBackend {
     /// The tree is flushed and gated (a release) or unleased (a grant) at
     /// every call, so no image of it is between its claim and its
     /// publication.
-    async fn slot_tree_image_extents(
+    pub async fn slot_tree_image_extents(
         &self,
         slot: super::record::ForestSlot,
     ) -> std::result::Result<Vec<u64>, KvError> {
@@ -8432,6 +8445,13 @@ impl KvMetaBackend {
         out.sort_unstable();
         out.dedup();
         Ok(out)
+    }
+
+    /// Whether heap `extent` is CLAIMED in this volume's extent bitmap —
+    /// the contracts' probe that a live image's extent was never returned
+    /// (PR 12b round 3, F1).
+    pub fn heap_extent_allocated(&self, extent: u64) -> bool {
+        self.alloc.is_allocated(extent)
     }
 
     /// Whether appender `id`'s RAM grant holds `extent` in ANY set

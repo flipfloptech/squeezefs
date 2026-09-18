@@ -1653,9 +1653,20 @@ impl KvMetaBackend {
                 // root is at most the page's — equal or stale, never ahead
                 // (a re-run past a rollback is back at its pre-install
                 // root; equal roots are left untouched).
+                // A lessee of ANOTHER daemon appends into node IMAGES under
+                // an unchanged root pointer (the log-structured node's
+                // bset append — the root `(addr, seq)` names the same
+                // node): equality of roots says nothing about the cached
+                // images here. For a wire lessee the barrier runs whatever
+                // the roots read (PR 12b round 3, the F1 pin's `keep`
+                // slot: 40 records appended into the grant-time root leaf
+                // were invisible at the recoverer, whose cached image of
+                // that leaf predated them); an in-process region shares
+                // this cache and equal roots ARE the same images.
+                let foreign_daemon = set.region(id).is_none();
                 let tree_rollback = match forest.tree(*slot) {
                     Some(tr) => {
-                        if root != tr.root() {
+                        if root != tr.root() || foreign_daemon {
                             // The recoverer's RAM tree is STALE (Issue 2):
                             // it holds the slot at the root it last saw
                             // while the lessee's checkpoints moved it. Every
@@ -2550,11 +2561,32 @@ impl KvMetaBackend {
             return Ok(Vec::new());
         };
         let _mint = forest.mint_guard().await;
+        // The law (PR 12b round 3, F1): an extent ANY slot-tree root
+        // reaches is never returned — the released slots' trees AND every
+        // other slot tree this volume holds (the dead appender's record
+        // can claim images of a slot it released BEFORE dying — a wire
+        // release whose image walk ran over a stale tree left them
+        // claimed — and of a slot the manager maintains unleased). Walking
+        // a tree that is a projection here can only KEEP an extent claimed
+        // (the leak direction, C13's), never return a live one.
         let mut reachable: std::collections::BTreeSet<u64> = Default::default();
+        let mut walked: std::collections::BTreeSet<record::ForestSlot> = Default::default();
         for slot in slots {
             let Some(t) = forest.tree(*slot) else {
                 continue;
             };
+            walked.insert(*slot);
+            for addr in self.node_addrs_unloaded(&t).await?.iter() {
+                reachable.insert(self.cache.addr_extent(addr));
+            }
+        }
+        for t in self.all_trees() {
+            let Some(slot) = t.forest_slot() else {
+                continue;
+            };
+            if !walked.insert(slot) {
+                continue;
+            }
             for addr in self.node_addrs_unloaded(&t).await?.iter() {
                 reachable.insert(self.cache.addr_extent(addr));
             }

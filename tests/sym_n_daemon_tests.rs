@@ -117,6 +117,31 @@ async fn join(
     r.expect("the joined open")
 }
 
+/// [`join`] under the contract's own knobs (a small rotor, a short
+/// `T_idle`) — the process-global knobs are what `open_routed_meta_set_
+/// joined` reads, so the joiner's derivations follow `knobs`.
+async fn join_knobs(
+    knobs: &Knobs,
+    uris: &[String],
+    venue: &HoldersVenue,
+    manager: &KvMetaBackend,
+    n: u32,
+) -> Arc<RoutedMetaBackend> {
+    knobs.apply();
+    let r = open_routed_meta_set_joined(
+        uris,
+        &JoinedSetAdmission {
+            manager_endpoint: venue.endpoint(),
+            secret: VENUE_SECRET.to_vec(),
+            peer_id: peer_of(&joiner_identity(manager, n).await),
+            identity: joiner_identity(manager, n).await,
+        },
+    )
+    .await;
+    Knobs::clear();
+    r.expect("the joined open")
+}
+
 /// [`join`] whose refusal is the contract's subject.
 async fn try_join(
     uris: &[String],
@@ -817,6 +842,311 @@ async fn a_rejoined_identitys_fresh_region_is_never_recovered_under_its_predeces
     drop(bvol);
     drop(back);
     assert_all_resolve(&manager, shared, &more).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+/// The first slot of the page-budget contracts' seeded directories; 128
+/// of them, one per forest slot — past `SLOT_PAGE_BUDGET` (108) by 20
+/// even before the joiner's rotor.
+const OVERFLOW_SEED_BASE: ForestSlot = 12;
+const OVERFLOW_SEED_COUNT: u32 = 128;
+
+/// `OVERFLOW_SEED_COUNT` directories seeded one per slot from
+/// `OVERFLOW_SEED_BASE`, every slot `Unleased` afterwards.
+async fn overflow_seeded_volume(dir: &std::path::Path) -> (Vec<String>, Vec<u64>, Vec<ForestSlot>) {
+    let slots: Vec<ForestSlot> =
+        (OVERFLOW_SEED_BASE..OVERFLOW_SEED_BASE + OVERFLOW_SEED_COUNT).collect();
+    let names: Vec<String> = slots.iter().map(|s| format!("d{s:03}")).collect();
+    let pairs: Vec<(ForestSlot, &str)> = slots
+        .iter()
+        .zip(names.iter())
+        .map(|(s, n)| (*s, n.as_str()))
+        .collect();
+    let (uris, dirs) = seeded_volume(dir, &pairs).await;
+    (uris, dirs, slots)
+}
+
+/// **A wire lessee past its PAGE BUDGET keeps committing, and every
+/// overflow root rides tree 0 through the manager** (PR 12b round 4, F9
+/// / Issue 23 — the storm leg's remaining red: the rejoined joiner's
+/// `rm -rf` of its dead incarnation's tree first-touched 64 `Unleased`
+/// slots inside one `T_idle`, 128 held against a page that names 108; a
+/// wire lessee had no tree-0 publication for the 20 overflow roots (PR
+/// 4's overflow law, `publish_forest_roots`, is in-process), an
+/// unpublished root is a ring-tail FLOOR, the ring filled and D1.b
+/// fail-stopped the volume — 7,713 "absent" files that were one FAILED
+/// volume's refusals). The wire form: the joiner's checkpoint ships the
+/// roots its page cannot hold as `PublishRoots` (the manager's own
+/// overflow selection), the manager writes them into tree 0's `Leased`
+/// records under ONE durable entry, the floors lift at its reply. Here,
+/// with a one-slot rotor: 128 first touches (129 held), two cycles, the
+/// ring COVERED (`head == reusable_upto` — red before: the tail pinned
+/// behind 21 floors for ever), every overflow slot's tree-0 record naming
+/// the joiner's live root, a further storm landing, no manager refusal or
+/// rejection; then the joiner DIES after a checkpoint and the recovery
+/// finds every file through tree 0's roots (red before: "NO page entry —
+/// the grant-time root 0x0 stands", every flushed file of the overflow
+/// slots lost), and a manager remount opens every one of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wire_lessee_past_its_page_budget_keeps_committing_and_its_overflow_roots_ride_tree_zero()
+{
+    use squeezefs::meta_backend::kv::appender::SLOT_PAGE_BUDGET;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs, slots) = overflow_seeded_volume(dir.path()).await;
+    let knobs = Knobs::armed().mint_slots("1");
+    let manager = open_under(&uris, &knobs).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    enroll_manager(&mvol, &venue.endpoint()).await;
+
+    let joiner = join_knobs(&knobs, &uris, &venue, &mvol, 91).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jid = jvol.appender_stats().unwrap().appender_id;
+    let identity = jvol.joined_wire().unwrap().identity;
+    let plane = jvol.slot_leases().expect("armed");
+    let rotor = plane.rotor.load().len();
+    assert!(
+        rotor <= 2,
+        "a one-slot rotor keeps the count the first touches': {rotor}"
+    );
+
+    // 128 first touches: one file in each seeded directory (affinity —
+    // the child lands in its parent's slot; the parent's slot is
+    // `Unleased`, so the door acquires it over the wire).
+    let mut files: Vec<(u64, Vec<(String, u64)>)> = Vec::with_capacity(dirs.len());
+    for (i, d) in dirs.iter().enumerate() {
+        files.push((*d, create_files(&joiner, *d, &format!("s{i:03}-"), 1).await));
+    }
+    let held = plane.gate.leased_count();
+    assert!(
+        held > SLOT_PAGE_BUDGET,
+        "the lessee holds {held} slots — past the page budget {SLOT_PAGE_BUDGET}"
+    );
+    for slot in &slots {
+        assert!(plane.gate.is_leased(*slot), "slot {slot} is the joiner's");
+    }
+    // The records flushed, then every held tree's ROOT MOVES (a forced
+    // compaction — the storm's shape is a fresh mint or a split; any move
+    // leaves the root unpublished until a durable home names it): 129
+    // roots ahead of their publication, 21 of them past the page.
+    jvol.checkpoint_now().await.unwrap();
+    for slot in &slots {
+        let root = jvol.slot_tree(*slot).expect("the joiner's tree").root();
+        let mut attempts = 0;
+        loop {
+            match jvol.defrag_compact_nodes(&[(0, root.addr)]).await {
+                Ok(n) => {
+                    assert_eq!(n, 1, "slot {slot}'s root compacts");
+                    break;
+                }
+                // The joiner's grant refills at its cadence (the reactive
+                // refill is the flush pass's, not the D4 arm's).
+                Err(squeezefs::meta_backend::kv::KvError::GrantExhausted { .. })
+                    if attempts < 8 =>
+                {
+                    attempts += 1;
+                    jvol.checkpoint_now().await.unwrap();
+                }
+                Err(e) => panic!("slot {slot}: {e}"),
+            }
+        }
+    }
+
+    // Two cycles: the page names its budget, the overflow ships, the
+    // floors lift at the reply, the ring drains.
+    jvol.checkpoint_now().await.unwrap();
+    jvol.checkpoint_now().await.unwrap();
+    let (head, upto) = jvol.region_ring_window(jid).expect("the joined region");
+    assert_eq!(
+        head, upto,
+        "the joiner's ring is COVERED after two cycles — a pinned tail is the overflow floors \
+         (head {head}, reusable_upto {upto})"
+    );
+    // At least `seeded − budget` of the SEEDED slots are past the page
+    // (the one-slot rotor may sit on either side of the cut).
+    let overflow_min = slots.len() - SLOT_PAGE_BUDGET;
+    let shipped = plane
+        .roots_shipped
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        shipped as usize >= overflow_min,
+        "every overflow root shipped ({shipped} ≥ {overflow_min})"
+    );
+    let mplane = mvol.slot_leases().expect("armed");
+    assert!(
+        mplane
+            .roots_published_for_lessees
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= overflow_min as u64
+    );
+    // Every seeded slot's tree-0 record names the joiner's LIVE root — the
+    // page-held ones through the page's own publication law (their record
+    // keeps the grant-time root; the page is their home), the overflow
+    // ones through the wire.
+    let mut published_by_wire = 0usize;
+    for slot in &slots {
+        let live = jvol.slot_tree(*slot).expect("the joiner's tree").root();
+        match tree0_state(&mvol, *slot).await {
+            Some(SlotState::Leased {
+                appender_id, root, ..
+            }) => {
+                assert_eq!(appender_id, jid);
+                if root == live {
+                    published_by_wire += 1;
+                }
+            }
+            other => panic!("slot {slot}: {other:?}"),
+        }
+    }
+    assert!(
+        published_by_wire >= overflow_min,
+        "tree 0 names the live root of at least every overflow slot ({published_by_wire} ≥ \
+         {overflow_min})"
+    );
+    let ms = mvol.appender_stats().unwrap();
+    assert_eq!(ms.manager_verb_refusals, 0, "{ms:?}");
+    assert_eq!(ms.manager_verb_rejected, 0, "{ms:?}");
+
+    // The storm goes on: a further burst lands and the ring drains again.
+    let more = create_files(&joiner, dirs[0], "more", 300).await;
+    jvol.checkpoint_now().await.unwrap();
+    jvol.checkpoint_now().await.unwrap();
+    let (head, upto) = jvol.region_ring_window(jid).expect("the joined region");
+    assert_eq!(head, upto, "covered after the burst");
+    assert!(!jvol.is_failed(), "the volume never fail-stopped");
+    assert_must_stay_zero(&jvol, "joiner");
+    assert_must_stay_zero(&mvol, "manager");
+
+    // The lessee DIES after its checkpoint: the recovery's root for an
+    // overflow slot is tree 0's published one (red before: "NO page entry
+    // — the grant-time root 0x0 stands", the flushed files gone).
+    drop(jvol);
+    drop(joiner);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    assert!(!mvol.record_death_with_key(identity, 31, 0).await.unwrap());
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    for (d, fs) in &files {
+        assert_all_resolve(&manager, *d, fs).await;
+    }
+    assert_all_resolve(&manager, dirs[0], &more).await;
+    assert_must_stay_zero(&mvol, "manager after the recovery");
+
+    // A manager remount opens every one of them.
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    let again = open_under(&uris, &knobs).await;
+    for (d, fs) in &files {
+        assert_all_resolve(&again, *d, fs).await;
+    }
+    assert_all_resolve(&again, dirs[0], &more).await;
+    shutdown(&again).await;
+    drop(again);
+    fsck_clean(&uris).await;
+}
+
+/// **A wire lessee sheds its overflow to the page budget within one
+/// beat** (PR 12b round 4, Issue 23's bound — PR 4's LRU release on a
+/// joined appender): past `SLOT_PAGE_BUDGET` the cadence releases
+/// non-rotor slots no requester is shipping to (`holder_ops == 0` — a
+/// dominated slot is a handover candidate, never an LRU one), least-
+/// recently-written first, through the region's own wire `ReleaseSlot`
+/// (flush-then-transfer: the door drained, the covering cycles, tree 0
+/// `Unleased` at the manager with the root the lessee moved), back to
+/// the budget in ONE tick once `T_idle` has passed (a slot written inside
+/// the window is a live holder's — the count alone never moves it). The
+/// arm was wired on a joined appender already (green-first — the bound's
+/// contract); what starved it on the storm leg was F9's floors: a release
+/// waits for the region's tail to pass the slot's frontier, and a tail
+/// pinned behind the sibling overflow floors never does (`slot_lru_
+/// releases` stayed 0 through the 15-s wedge — the first contract's
+/// ring-drain assertion is that pin). Here, `T_idle` = 300 ms: 128 first
+/// touches, one checkpoint, one cadence tick past the window → held ≤ the
+/// budget, every
+/// released slot `Unleased` at the manager naming a live root, every
+/// file readable at both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wire_lessee_sheds_its_idle_overflow_to_the_page_budget_within_one_beat() {
+    use squeezefs::meta_backend::kv::appender::SLOT_PAGE_BUDGET;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs, slots) = overflow_seeded_volume(dir.path()).await;
+    let knobs = Knobs::armed().mint_slots("1").t_idle_ms("300");
+    let manager = open_under(&uris, &knobs).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    enroll_manager(&mvol, &venue.endpoint()).await;
+
+    let joiner = join_knobs(&knobs, &uris, &venue, &mvol, 92).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jid = jvol.appender_stats().unwrap().appender_id;
+    let plane = jvol.slot_leases().expect("armed");
+    let mut files: Vec<(u64, Vec<(String, u64)>)> = Vec::with_capacity(dirs.len());
+    for (i, d) in dirs.iter().enumerate() {
+        files.push((*d, create_files(&joiner, *d, &format!("s{i:03}-"), 1).await));
+    }
+    let held0 = plane.gate.leased_count();
+    assert!(held0 > SLOT_PAGE_BUDGET);
+    jvol.checkpoint_now().await.unwrap();
+    // Past `T_idle` (a slot written inside the window is a live holder's
+    // — the count alone never moves it): ONE beat brings the held set to
+    // the budget.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    jvol.slot_lease_cadence().await.unwrap();
+    let held = plane.gate.leased_count();
+    assert!(
+        held <= SLOT_PAGE_BUDGET,
+        "one beat past T_idle sheds the overflow: held {held} ≤ {SLOT_PAGE_BUDGET} (was {held0})"
+    );
+    assert!(
+        plane
+            .lru_releases
+            .load(std::sync::atomic::Ordering::Relaxed) as usize
+            >= held0 - SLOT_PAGE_BUDGET
+    );
+    let mut released = 0usize;
+    for slot in &slots {
+        match tree0_state(&mvol, *slot).await {
+            Some(SlotState::Unleased { root, .. }) => {
+                released += 1;
+                assert_ne!(
+                    root.addr, 0,
+                    "the released tree's root travelled: slot {slot}"
+                );
+            }
+            Some(SlotState::Leased { appender_id, .. }) => assert_eq!(appender_id, jid),
+            other => panic!("slot {slot}: {other:?}"),
+        }
+    }
+    assert!(
+        released >= held0 - SLOT_PAGE_BUDGET,
+        "{released} released at the manager"
+    );
+    // Every file reads at the joiner (the released directories' dentries
+    // through the manager's plane, the inode records — its rotor slot's —
+    // locally); the manager reads them all once the leave handed the rest
+    // over (this fixture's manager has no custody arm to dial a lessee).
+    for (d, fs) in &files {
+        assert_all_resolve(&joiner, *d, fs).await;
+    }
+    assert_must_stay_zero(&jvol, "joiner");
+    assert_must_stay_zero(&mvol, "manager");
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    for (d, fs) in &files {
+        assert_all_resolve(&manager, *d, fs).await;
+    }
     venue.tear_down();
     shutdown(&manager).await;
     drop(mvol);

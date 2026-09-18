@@ -492,6 +492,123 @@ async fn a_joiners_rejoin_over_its_live_page_replays_its_window_as_own_residue()
     fsck_clean(&uris).await;
 }
 
+/// **A live image's extent is NEVER returned by a dead joiner's recovery —
+/// the storm leg's P0 (round 3, F1).** The shape the fleet ran: a joiner
+/// fills a directory it leases (its tree's leaves land in extents of ITS
+/// grant), RELEASES the slot over the wire (an LRU release), keeps
+/// writing, DIES; the manager records the death, recovers its remaining
+/// slots and RELEASES the region (step 8 returns "the unclaimed grant"
+/// and "the orphan images"); the SAME identity rejoins (a fresh region —
+/// the released one is `Free`), first-touches the directory's slot again
+/// and STORMS it. Red before the fix at two lines: the served wire
+/// `ReleaseSlot` walked the manager's STALE RAM tree of the slot for the
+/// images to move out of the lessee's grant record (`grant_record_minus_
+/// images` BEFORE the cross-daemon adoption barrier), so the lessee's
+/// live images stayed CLAIMED in its record; at its death the orphan
+/// census walked only the slots it still leased — the released slot's
+/// live images read "claimed, reached by no root" and were RETURNED to
+/// the heap (`… 2 orphan image extent(s) returned` on the one volume that
+/// fail-stopped), re-granted to the rejoined writer, whose first SMO on
+/// the re-acquired tree wrote into its own source extent (`CoW violation
+/// … in place`, ×3,276, then the fail-stop). Pinned: every extent the
+/// released tree reaches stays CLAIMED across the recovery, the rejoined
+/// writer's storm lands, every record resolves, fsck reads clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_joiners_recovery_never_returns_an_extent_a_released_trees_root_still_reaches() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "d"), (SLOT_B, "keep")]).await;
+    let (d, keep) = (dirs[0], dirs[1]);
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let joiner = join(&uris, &venue, &mvol, 5).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jid = jvol.appender_stats().unwrap().appender_id;
+    let identity = jvol.joined_wire().unwrap().identity;
+
+    // The joiner's directory tree, several leaves deep in ITS grant's
+    // extents; then the slot RELEASED over the wire (the cadence's LRU
+    // shape) while the joiner keeps a second slot and keeps writing.
+    let files = create_files(&joiner, d, "f", 700).await;
+    jvol.checkpoint_now().await.unwrap();
+    jvol.release_slot_handover(jid, SLOT_A)
+        .await
+        .expect("the joiner releases the directory's slot over the wire");
+    assert!(matches!(
+        tree0_state(&mvol, SLOT_A).await,
+        Some(SlotState::Unleased { .. })
+    ));
+    let kept = create_files(&joiner, keep, "k", 40).await;
+    jvol.checkpoint_now().await.unwrap();
+    // The released tree's live images, as the MANAGER now reaches them
+    // (its tree adopted at the released root).
+    let live_images = mvol.slot_tree_image_extents(SLOT_A).await.unwrap();
+    assert!(live_images.len() >= 2, "several leaves: {live_images:?}");
+    for e in &live_images {
+        assert!(
+            mvol.heap_extent_allocated(*e),
+            "live image {e} claimed before the death"
+        );
+    }
+
+    // The joiner dies; the death is recorded; the manager recovers its
+    // remaining slots and RELEASES the region (the storm's 20 s window).
+    drop(jvol);
+    drop(joiner);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    assert!(!mvol.record_death_with_key(identity, 13, 0).await.unwrap());
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert!(
+        rep.regions_released >= 1,
+        "the recovered region is released: {rep:?}"
+    );
+    for e in &live_images {
+        assert!(
+            mvol.heap_extent_allocated(*e),
+            "live image extent {e} of the released slot's tree was RETURNED by the recovery"
+        );
+    }
+    assert_all_resolve(&manager, d, &files).await;
+    assert_all_resolve(&manager, keep, &kept).await;
+
+    // The SAME identity rejoins (a fresh region), re-acquires the
+    // directory's slot first-touch and STORMS it: every SMO lands in a
+    // fresh extent, never its own source.
+    let again = join(&uris, &venue, &mvol, 5).await;
+    let avol = Arc::clone(&again.volumes[0]);
+    let more = create_files(&again, d, "g", 700).await;
+    avol.checkpoint_now().await.unwrap();
+    avol.checkpoint_now().await.unwrap();
+    assert_all_resolve(&again, d, &more).await;
+    assert_all_resolve(&again, d, &files).await;
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .data_dma_fence_refusals
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert!(
+        !avol.is_failed(),
+        "the rejoined writer's volume never fail-stopped"
+    );
+    assert_must_stay_zero(&avol, "rejoined");
+    assert_must_stay_zero(&mvol, "manager");
+    shutdown(&again).await;
+    drop(avol);
+    drop(again);
+    assert_all_resolve(&manager, d, &more).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
 /// **The joiner's death, the manager's recovery, a third daemon** (§5.9
 /// end to end with a REAL second daemon — deliverable 4b): the joiner dies
 /// with acked records in its window; the death ledger names its identity

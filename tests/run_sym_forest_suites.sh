@@ -157,6 +157,7 @@ DEFAULT_SUITES=(
   kv_partitioned_append_tests
   kv_leaf_merge_tests
   kv_node_cache_coherence_tests
+  kv_loader_lock_style_tests
   kvmap_tree_tests
   kvmap_read_tests
   kv_scale_tests

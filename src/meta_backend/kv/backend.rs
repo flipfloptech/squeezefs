@@ -17935,6 +17935,7 @@ impl KvMetaBackend {
                             &j.wire,
                             region,
                             want,
+                            None,
                         )
                         .await?;
                         log::info!(

@@ -87,6 +87,16 @@ impl std::fmt::Debug for JoinedOpen {
     }
 }
 
+/// Whether the caller of a wire verb HOLDS the volume's SMO mutex (the
+/// checkpoint cycle does, for its whole cycle): the re-dial's projection
+/// refresh takes the mutex itself under `No` and runs on the held guard
+/// under `Yes` (PR 12b round 3, F3 — the re-take deadlocked the cycle).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::meta_backend::kv) enum SmoHeld {
+    No,
+    Yes,
+}
+
 /// The joined appender's wire to its manager and the gauges of its
 /// verbs (the Joined family, §11).
 pub struct JoinedWire {
@@ -178,10 +188,50 @@ impl JoinedWire {
             Box<dyn std::future::Future<Output = crate::error::Result<T>> + Send + 'a>,
         >,
     {
+        self.with_client_at(vol, SmoHeld::No, verb, f).await
+    }
+
+    /// [`Self::with_client`] for a caller that HOLDS `vol`'s SMO mutex —
+    /// the checkpoint cycle's verbs (`ReturnExtents`, the refills; PR 12b
+    /// round 3, F3): the re-dial's projection refresh runs on the held
+    /// guard instead of re-taking the mutex. `smo` is the witness (the
+    /// guard's contents), never read.
+    async fn with_client_under_smo<T, F>(
+        &self,
+        vol: &KvMetaBackend,
+        smo: &super::super::tree::SmoContext,
+        verb: &str,
+        f: F,
+    ) -> Result<T, KvError>
+    where
+        F: for<'a> Fn(
+            &'a mut ManagerClient,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<T>> + Send + 'a>,
+        >,
+    {
+        let _ = smo;
+        self.with_client_at(Some(vol), SmoHeld::Yes, verb, f).await
+    }
+
+    async fn with_client_at<T, F>(
+        &self,
+        vol: Option<&KvMetaBackend>,
+        smo_held: SmoHeld,
+        verb: &str,
+        f: F,
+    ) -> Result<T, KvError>
+    where
+        F: for<'a> Fn(
+            &'a mut ManagerClient,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<T>> + Send + 'a>,
+        >,
+    {
         let mut retried = false;
         loop {
             let out = {
-                let mut c = self.client_at(vol).await?;
+                let mut c = self.client_at(vol, smo_held).await?;
                 f(&mut c).await
             };
             self.verbs.fetch_add(1, Ordering::Relaxed);
@@ -226,6 +276,7 @@ impl JoinedWire {
     async fn client_at(
         &self,
         vol: Option<&KvMetaBackend>,
+        smo_held: SmoHeld,
     ) -> Result<crate::sqz_sync::SqzMutexGuard<'_, ManagerClient>, KvError> {
         let mut c = self.client.lock().await;
         if !self.redial.load(Ordering::Acquire) {
@@ -233,7 +284,10 @@ impl JoinedWire {
         }
         let mut endpoint = self.endpoint();
         if let Some(vol) = vol {
-            if let Err(e) = vol.refresh_control_projection().await {
+            // The refresh takes the SMO mutex — unless the caller is the
+            // checkpoint cycle, which holds it (F3: the re-take deadlocked
+            // the checkpoint task on itself; the ring never drained).
+            if let Err(e) = vol.refresh_control_projection_at(smo_held).await {
                 log::debug!(
                     "meta volume {}: projection refresh before the manager re-dial failed ({e}) \
                      — dialing the last known endpoint",
@@ -359,6 +413,7 @@ pub(super) async fn wire_extent_refill(
     wire: &JoinedWire,
     region: &AppenderRegion,
     want: u32,
+    under_smo: Option<(&KvMetaBackend, &super::super::tree::SmoContext)>,
 ) -> Result<u64, KvError> {
     if super::super::appender::test_manager_unreachable() {
         return Ok(0);
@@ -372,9 +427,22 @@ pub(super) async fn wire_extent_refill(
     name_remainder_on_page(region);
     KvMetaBackend::write_region_page_at(path, region).await?;
     let own = wire.appender_id;
-    let runs: Vec<GrantRun> = wire
-        .with_client(None, "ExtentGrant", |c| Box::pin(c.extent_grant(own, want)))
-        .await?;
+    // The re-dial's posture: from inside the checkpoint cycle the refresh
+    // rides the held SMO guard and follows a failover (F3); from the open
+    // (no backend yet) and the commit path (under the mint guard) it goes
+    // to the last known endpoint.
+    let runs: Vec<GrantRun> = match under_smo {
+        Some((vol, smo)) => {
+            wire.with_client_under_smo(vol, smo, "ExtentGrant", |c| {
+                Box::pin(c.extent_grant(own, want))
+            })
+            .await?
+        }
+        None => {
+            wire.with_client(None, "ExtentGrant", |c| Box::pin(c.extent_grant(own, want)))
+                .await?
+        }
+    };
     // §5.3.5: the manager answers the caller's unclaimed remainder
     // VERBATIM when it covers the ask — only the runs the RAM grant does
     // not hold at all (unclaimed, claimed or parked) are new.
@@ -1408,7 +1476,7 @@ impl KvMetaBackend {
                 let want = u32::try_from(*needed)
                     .unwrap_or(u32::MAX)
                     .max(super::super::appender::SMO_IMAGES_MAX);
-                match self.joined_extent_grant(want).await {
+                match self.joined_extent_grant_at(want, Some(&*smo)).await {
                     Ok(n) if n > 0 => {
                         out = tree.checkpoint_flush_node(smo, addr).await;
                     }
@@ -1535,14 +1603,28 @@ impl KvMetaBackend {
         } else {
             now.saturating_sub(last) / 1_000_000
         };
-        self.joined_grant_cadence(cycle_ms).await
+        self.joined_grant_cadence(cycle_ms, smo).await
     }
 
     /// `ExtentGrant { own, want }` over the wire: the manager carves and
     /// journals; the runs land in the own region's RAM grant (the page
     /// names the remainder at the next checkpoint). Returns the extents
-    /// received.
+    /// received. The commit path's form (`slot_or_mint_refilled`) — the
+    /// re-dial goes to the last known endpoint: under the forest's mint
+    /// guard a projection refresh would take the SMO mutex the other way
+    /// round from the census (SMO mutex → mint guard).
     pub(super) async fn joined_extent_grant(&self, want: u32) -> Result<u64, KvError> {
+        self.joined_extent_grant_at(want, None).await
+    }
+
+    /// [`Self::joined_extent_grant`] from INSIDE the checkpoint cycle
+    /// (`smo` = the held guard's contents — F3): the re-dial follows a
+    /// manager failover through the projection refresh on the held guard.
+    async fn joined_extent_grant_at(
+        &self,
+        want: u32,
+        smo: Option<&super::super::tree::SmoContext>,
+    ) -> Result<u64, KvError> {
         let wire = Arc::clone(self.joined.get().ok_or_else(|| {
             KvError::Corrupt(format!("{}: joined wire unset", self.path.display()))
         })?);
@@ -1554,14 +1636,20 @@ impl KvMetaBackend {
             &wire,
             region,
             want,
+            smo.map(|s| (self, s)),
         )
         .await
     }
 
     /// The joined appender's grant cadence (§5.3.3): fold the SMO rate,
     /// ship the extents this cycle's barrier released as `ReturnExtents`
-    /// over the wire, refill at 50 % consumption.
-    async fn joined_grant_cadence(&self, cycle_ms: u64) -> Result<(), KvError> {
+    /// over the wire, refill at 50 % consumption. `smo` is the cycle's
+    /// held guard: every wire verb here re-dials through it (F3).
+    async fn joined_grant_cadence(
+        &self,
+        cycle_ms: u64,
+        smo: &super::super::tree::SmoContext,
+    ) -> Result<(), KvError> {
         let wire = Arc::clone(self.joined.get().ok_or_else(|| {
             KvError::Corrupt(format!("{}: joined wire unset", self.path.display()))
         })?);
@@ -1602,7 +1690,7 @@ impl KvMetaBackend {
             .runs;
             let own = wire.appender_id;
             let out = wire
-                .with_client(Some(self), "ReturnExtents", |c| {
+                .with_client_under_smo(self, smo, "ReturnExtents", |c| {
                     let runs = runs.clone();
                     Box::pin(async move { c.return_extents(own, &runs).await })
                 })
@@ -1633,7 +1721,7 @@ impl KvMetaBackend {
             g.refill_due()
         };
         if due && !super::super::appender::test_manager_unreachable() {
-            if let Err(e) = self.joined_extent_grant(0).await {
+            if let Err(e) = self.joined_extent_grant_at(0, Some(smo)).await {
                 log::warn!(
                     "meta volume {}: joined appender {}'s ExtentGrant refill deferred ({e})",
                     self.path.display(),
@@ -2180,6 +2268,17 @@ impl KvMetaBackend {
     /// whether the projection advanced. Never runs on the manager (its
     /// trees are live).
     pub async fn refresh_control_projection(&self) -> Result<bool, KvError> {
+        self.refresh_control_projection_at(SmoHeld::No).await
+    }
+
+    /// [`Self::refresh_control_projection`] with the SMO-mutex posture
+    /// explicit: `SmoHeld::Yes` from inside the checkpoint cycle (the
+    /// wire re-dial's refresh — F3), which already holds the mutex for
+    /// its whole cycle; the root moves below run under the caller's guard.
+    pub(in crate::meta_backend::kv) async fn refresh_control_projection_at(
+        &self,
+        smo_held: SmoHeld,
+    ) -> Result<bool, KvError> {
         let Some(wire) = self.joined.get() else {
             return Ok(false);
         };
@@ -2215,13 +2314,17 @@ impl KvMetaBackend {
                 seq: n.node_seq,
             });
         {
-            // Under the SMO mutex like every root move (no pass mid-walk).
+            // Under the SMO mutex like every root move (no pass mid-walk)
+            // — the caller's guard when it is the checkpoint cycle.
             // The projection's images go WHOLE, the open's window fold
             // included (`discard_*`: dirty ones too — never this mount's
             // records, never flushed by it; the new root's images carry
             // what the manager checkpointed since, the ring what it did
             // not — the reader's bounded-staleness law for a projection).
-            let _smo = self.smo.lock().await;
+            let _smo = match smo_held {
+                SmoHeld::No => Some(self.smo.lock().await),
+                SmoHeld::Yes => None,
+            };
             let native_slot = super::super::record::NATIVE_FOREST_SLOT;
             let mut dropped = 0usize;
             if let Some(ptr) = native_root.filter(|_| !plane.gate.is_leased(native_slot)) {

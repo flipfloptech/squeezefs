@@ -633,6 +633,11 @@ pub struct ManagerService {
     /// `None` = a bare per-volume service that does not know its place
     /// and therefore serves no set-wide verb.
     ordinal: Option<u16>,
+    /// The set's LEDGER volume (ordinal 0 — the death ledger's home): a
+    /// served `JoinAppender` retires the joining identity's standing
+    /// `dead_member:` record there BEFORE any page goes Live under it
+    /// (PR 12b round 3, F7). `None` on a bare per-volume service.
+    vol0: Option<Arc<KvMetaBackend>>,
 }
 
 impl ManagerService {
@@ -640,15 +645,53 @@ impl ManagerService {
         Arc::new(Self {
             volume,
             ordinal: None,
+            vol0: None,
         })
     }
 
-    /// The service for the volume at `ordinal` of its set.
-    pub fn new_at(volume: Arc<KvMetaBackend>, ordinal: u16) -> Arc<Self> {
+    /// The service for the volume at `ordinal` of its set whose ledger
+    /// volume is `vol0`.
+    pub fn new_at(volume: Arc<KvMetaBackend>, ordinal: u16, vol0: Arc<KvMetaBackend>) -> Arc<Self> {
         Arc::new(Self {
             volume,
             ordinal: Some(ordinal),
+            vol0: Some(vol0),
         })
+    }
+
+    /// **The join is the identity's newer incarnation** (PR 12b round 3,
+    /// F7 — PR 10 review round 3's Issue-25 obligation): a `dead_member:`
+    /// record naming the joining `(node, mount slot)` is a PREDECESSOR's
+    /// — retired at the ledger volume before the join writes a page Live,
+    /// or the next ledger poll, reading the fresh Live page with the
+    /// record still standing (the member's membership join is the
+    /// ladder's rung 3, AFTER the open), recovers the live rejoiner's
+    /// region and its region open refuses. Ordered before the page: a
+    /// poll that sees the Live page re-reads the record and finds it gone.
+    /// A ledger volume that is not a manager retires nothing (a joined
+    /// appender serves no `JoinAppender`).
+    async fn retire_joiners_death_record(
+        &self,
+        identity: &crate::meta_backend::kv::appender::AppenderIdentity,
+    ) -> std::result::Result<(), crate::meta_backend::kv::KvError> {
+        let Some(vol0) = self.vol0.as_ref() else {
+            return Ok(());
+        };
+        if vol0.appender_stats().is_none() || vol0.is_joined_appender() {
+            return Ok(());
+        }
+        if vol0.retire_death_record(identity).await? {
+            log::warn!(
+                "meta volume {}: JoinAppender by node {:#018x} / mount slot {:#x} RETIRED the \
+                 identity's standing death record at the ledger volume — the join is its newer \
+                 incarnation (the predecessor's regions are the recovery's; a live one would \
+                 have been recovered under the record)",
+                vol0.device_path().display(),
+                identity.node_token,
+                identity.mount_slot
+            );
+        }
+        Ok(())
     }
 
     fn refuse(&self, id: u64, status: u16, reason: String) -> RpcResponse {
@@ -754,28 +797,30 @@ impl ManagerService {
                     ManagerCall::JoinAppender {
                         identity,
                         ring_want_bytes,
-                    } => self
-                        .volume
-                        .manager_join_appender((*identity).into(), *ring_want_bytes)
-                        .await
-                        .map(
-                            |JoinOutcome {
-                                 appender_id,
-                                 page_addr,
-                                 ring_segments,
-                                 grant,
-                                 already,
-                             }| ManagerReply::Joined {
-                                appender_id,
-                                page_addr,
-                                ring_segments: ring_segments
-                                    .iter()
-                                    .map(|s| (s.start, s.len))
-                                    .collect(),
-                                grant: runs_to_wire(&grant),
-                                already,
-                            },
-                        ),
+                    } => async {
+                        let identity: crate::meta_backend::kv::appender::AppenderIdentity =
+                            (*identity).into();
+                        self.retire_joiners_death_record(&identity).await?;
+                        self.volume
+                            .manager_join_appender(identity, *ring_want_bytes)
+                            .await
+                    }
+                    .await
+                    .map(
+                        |JoinOutcome {
+                             appender_id,
+                             page_addr,
+                             ring_segments,
+                             grant,
+                             already,
+                         }| ManagerReply::Joined {
+                            appender_id,
+                            page_addr,
+                            ring_segments: ring_segments.iter().map(|s| (s.start, s.len)).collect(),
+                            grant: runs_to_wire(&grant),
+                            already,
+                        },
+                    ),
                     ManagerCall::ExtentGrant { appender_id, want } => self
                         .volume
                         .manager_extent_grant(*appender_id, *want)
@@ -1265,11 +1310,18 @@ pub struct ManagerSetService {
 
 impl ManagerSetService {
     pub fn new(volumes: &[Arc<KvMetaBackend>]) -> Arc<Self> {
+        // The ledger volume is ordinal 0 (`recovery::vol0_of`'s law: the
+        // volume hosting routing slot 0 — the first of the set).
+        let Some(vol0) = volumes.first() else {
+            return Arc::new(Self {
+                volumes: Vec::new(),
+            });
+        };
         Arc::new(Self {
             volumes: volumes
                 .iter()
                 .enumerate()
-                .map(|(i, v)| ManagerService::new_at(Arc::clone(v), i as u16))
+                .map(|(i, v)| ManagerService::new_at(Arc::clone(v), i as u16, Arc::clone(vol0)))
                 .collect(),
         })
     }

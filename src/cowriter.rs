@@ -1463,11 +1463,31 @@ pub fn spawn_custody_renewal(
                         client.self_fence(&format!("custody renewal failed: {e}"));
                         return;
                     }
+                    // PR 12b round 4 (Issue 22): a failed renewal re-resolves
+                    // the HOLDER once per beat and retries at the derived
+                    // pace — never the retired 25 ms storm at a dead address.
+                    // A holder that MOVED is the owner's word that the lease
+                    // died with its listener: fenced by the word now; a
+                    // venue that is merely down keeps the S9 law — `T_self`
+                    // from the LAST successful renewal, never from a failed
+                    // dial.
+                    if let Some(moved_to) = client.holder_moved().await {
+                        crate::data_grant::WriteCustodyClient::note_holder_moved();
+                        client.self_fence(&format!(
+                            "custody renewal failed ({e}) and the holder MOVED to {moved_to} — \
+                             the lease at {} died with its listener",
+                            client.endpoint()
+                        ));
+                        return;
+                    }
+                    let pace = client.renew_retry_pace_ms();
+                    crate::data_grant::WriteCustodyClient::note_renew_retry();
                     log::warn!(
-                        "co-writer custody renewal failed ({e}) — retrying before my own \
-                         deadline (T_self, strictly earlier than the authority's TTL)"
+                        "co-writer custody renewal failed ({e}) — retried in {pace} ms (the \
+                         cadence law over the window left to T_self, strictly earlier than the \
+                         authority's TTL)"
                     );
-                    squeezefs_ipc::sqz_time::sleep(Duration::from_millis(25)).await;
+                    squeezefs_ipc::sqz_time::sleep(Duration::from_millis(pace)).await;
                 }
                 Err(_) => {
                     // The per-attempt warning the field lacked. Unlike an
@@ -1482,13 +1502,15 @@ pub fn spawn_custody_renewal(
                         ));
                         return;
                     }
+                    let pace = client.renew_retry_pace_ms();
+                    crate::data_grant::WriteCustodyClient::note_renew_retry();
                     log::warn!(
                         "co-writer custody renewal attempt exceeded its {bound} ms deadline \
                          (max(remaining-to-T_self/3, one cadence)) — abandoning it so the \
                          lease venue keeps its cadence; the abandoned wire session \
-                         reconnects on the next attempt"
+                         reconnects on the next attempt, in {pace} ms"
                     );
-                    squeezefs_ipc::sqz_time::sleep(Duration::from_millis(25)).await;
+                    squeezefs_ipc::sqz_time::sleep(Duration::from_millis(pace)).await;
                 }
             }
         }

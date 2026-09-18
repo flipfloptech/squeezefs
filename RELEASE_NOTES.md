@@ -114,6 +114,28 @@ quiesced set (every member re-enrolls at its next arm). Contract:
 `job_wire_tests::a_coordinators_restart_keeps_the_sets_enroll_secret`
 (layout-blind).
 
+**The S9 co-writer's custody renewal retries a FAILED renewal at the cadence
+law, never a 25 ms storm.** (Symmetric PR 12b review round 3, Issue 22 —
+found by the `sym-crash` fleet leg at every manager failover; an UNARMED
+S9 surface the shipped co-writer shares; record
+[.benchmarks/2026-09-17-sym-pr12b-n-daemon.md](.benchmarks/2026-09-17-sym-pr12b-n-daemon.md).)
+The renewal loop (`spawn_custody_renewal`) slept a fixed 25 ms after a
+failed renewal, so a dead authority was dialed ≈ 80 times a second (two
+dials per attempt — the verb's one reconnect-and-resend) with two warnings
+per attempt for the whole `T_self` window. The retry now waits
+`clamp(remaining-to-T_self / 3, 100 ms, one renewal cadence)` — three
+retries always fit before the deadline, none comes faster than the floor —
+and the §6.7 fence is byte-identical: `T_self` from the LAST successful
+renewal, never from a failed dial (the pin measured 66 → 14 dials over the
+window, the fence unmoved). Under the ARMED symmetric plane the per-holder
+custody client also re-resolves its holder off durable state at every paced
+retry (tree 0's lessee → its published listener) and fences at once when
+the holder MOVED — the owner's word that the lease died with its listener
+(`dlm_custody_holder_moves`; 0 on every unarmed mount, where no resolver is
+installed). New gauge `dlm_custody_renew_retries`. Contract:
+`membership_liveness_tests::a_custody_renewal_at_a_dead_authority_paces_its_dials_and_fences_at_t_self`
+(the flat, shipped shape).
+
 **A mixed sync/async `scc` bucket acquisition in the KV node loader could
 wedge a mount's two metadata lanes for ever.** (Symmetric PR 12b review
 round 1, Issue 13 — pre-existing on every layout, made ordinary by the

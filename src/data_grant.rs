@@ -653,6 +653,15 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T>
 
 static GRANTS: AtomicU64 = AtomicU64::new(0);
 static RENEWALS: AtomicU64 = AtomicU64::new(0);
+/// A failed renewal's retry pace floor, ms (`renew_retry_pace_ms`): the
+/// smallest interval two dials of one dead venue may be apart — the
+/// kernel's connect refusal is instant, so below this the loop is a spin.
+const RENEW_RETRY_FLOOR_MS: u64 = 100;
+/// Failed renewals retried at the paced cadence (`dlm_custody_renew_retries`).
+static RENEW_RETRIES: AtomicU64 = AtomicU64::new(0);
+/// Holders observed MOVED by the renewal loop's re-resolve
+/// (`dlm_custody_holder_moves`): the lease fenced by the owner's word.
+static HOLDER_MOVES: AtomicU64 = AtomicU64::new(0);
 static RELEASES: AtomicU64 = AtomicU64::new(0);
 static CONFLICTS: AtomicU64 = AtomicU64::new(0);
 static REVOKES: AtomicU64 = AtomicU64::new(0);
@@ -882,6 +891,8 @@ pub fn stats_json() -> serde_json::Value {
         "dlm_custody_conflicts": c.conflicts,
         "dlm_custody_unknown_leases": c.unknown_leases,
         "dlm_custody_self_fences": c.self_fences,
+        "dlm_custody_renew_retries": RENEW_RETRIES.load(Ordering::Relaxed),
+        "dlm_custody_holder_moves": HOLDER_MOVES.load(Ordering::Relaxed),
         "dlm_rpcs_custody": c.rpcs,
         "dlm_revokes_issued": REVOKES.load(Ordering::Relaxed),
         "dlm_revokes_expired": EXPIRIES.load(Ordering::Relaxed),
@@ -3342,7 +3353,23 @@ pub struct WriteCustodyClient {
     /// PR 9: this client's own `Arc` (set once at connect) — the recall
     /// absorb spawns its settle loop from a `&self` method.
     weak_self: std::sync::OnceLock<std::sync::Weak<WriteCustodyClient>>,
+    /// PR 12b round 4 (Issue 22): the holder's CURRENT listener off durable
+    /// state (tree 0's lessee → its published endpoint) — the renewal
+    /// loop's once-per-beat re-resolve after a failed renewal. A holder
+    /// that MOVED (a manager failover, a rejoin at another address) is the
+    /// owner's word that the lease died with the listener: fenced by the
+    /// word, never a retry storm at the dead address. `None` = a client
+    /// with no resolver (the set authority's — its endpoint is declared).
+    holder_resolver: arc_swap::ArcSwapOption<HolderResolver>,
 }
+
+/// The renewal loop's holder re-resolve: the holder's CURRENT listener
+/// (`None` = unresolvable now — the last known one stands).
+pub type HolderResolver = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// PR 9 (review round 2, Issues 7/10): the scope of a custody client's
 /// lease — what its JOIN adopts into the process and what its `T_self`
@@ -3481,6 +3508,7 @@ impl WriteCustodyClient {
             fenced: AtomicBool::new(false),
             fencing: AtomicBool::new(false),
             weak_self: std::sync::OnceLock::new(),
+            holder_resolver: arc_swap::ArcSwapOption::empty(),
         });
         let _ = client.weak_self.set(Arc::downgrade(&client));
         // Finding 27: the STANDING notice poll — one parked RPC per
@@ -3585,6 +3613,50 @@ impl WriteCustodyClient {
             / 3)
         .max(lease.renew_interval_ms())
         .max(1)
+    }
+
+    /// The pace of a FAILED renewal's retry, ms (PR 12b round 4, Issue 22
+    /// — the S6 reclaim's cadence law applied to the custody heartbeat):
+    /// `clamp(remaining-to-T_self / 3, RENEW_RETRY_FLOOR_MS, one renewal
+    /// cadence)` in the client's own clock domain — three retries always
+    /// fit before `T_self`, none comes faster than the floor, and a dead
+    /// venue is dialed once per beat, never at the retired 25 ms (≈ 37
+    /// dials and 74 log lines per second per lease for the whole `T_self`
+    /// window at every manager failover of the `sym-crash` legs).
+    pub fn renew_retry_pace_ms(&self) -> u64 {
+        let lease = self.lease.load();
+        let remaining = lease
+            .t_self_deadline_ms()
+            .saturating_sub(self.clock.now_ms());
+        (remaining / 3).clamp(RENEW_RETRY_FLOOR_MS, lease.renew_interval_ms().max(1))
+    }
+
+    /// Count a paced retry of a failed renewal (`dlm_custody_renew_retries`).
+    pub fn note_renew_retry() {
+        RENEW_RETRIES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a holder observed MOVED (`dlm_custody_holder_moves`).
+    pub fn note_holder_moved() {
+        HOLDER_MOVES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Install the holder re-resolve (the per-holder custody arm's, at the
+    /// dial — `SlotCustodyArm::holder`).
+    pub fn install_holder_resolver(&self, resolver: HolderResolver) {
+        self.holder_resolver.store(Some(Arc::new(resolver)));
+    }
+
+    /// **Did the holder MOVE?** (Issue 22): the holder's current listener
+    /// off durable state, `Some(new)` when it differs from the one this
+    /// client dialed — the owner's word that the lease died with the old
+    /// listener (a successor's owner opens no grace for it). `None` = no
+    /// resolver, unresolvable now, or unmoved (a dead venue that may come
+    /// back — the paced retries continue to `T_self`).
+    pub async fn holder_moved(&self) -> Option<String> {
+        let resolver = self.holder_resolver.load_full()?;
+        let now = (resolver)().await?;
+        (now != self.endpoint).then_some(now)
     }
 
     /// **Fail-stop our own custody** (§6.7's stricter client clock): a
@@ -5391,6 +5463,34 @@ fn acquire_refusal(errno: libc::c_int, reason: String) -> SqueezefsError {
 }
 
 impl SlotCustodyArm {
+    /// The renewal loop's holder re-resolve for a client dialed at
+    /// `endpoint` (Issue 22): the appender the set's slot holder table
+    /// binds to that address at the dial, resolved again off durable
+    /// state at every failed renewal (`sym_join::resolve_holder_endpoint`
+    /// — the appender's page identity → its claim-set entry's listener).
+    /// `None` when no volume of the set binds the address to an appender
+    /// (a contract's ad-hoc venue) — the loop then paces without a
+    /// re-resolve.
+    fn holder_resolver_for(&self, endpoint: &Arc<str>) -> Option<HolderResolver> {
+        let routed = self.routed.upgrade()?;
+        let (vol_idx, appender_id) = routed.volumes.iter().enumerate().find_map(|(i, v)| {
+            let plane = v.slot_leases()?;
+            plane
+                .holders
+                .appender_at_endpoint(endpoint)
+                .map(|id| (i, id))
+        })?;
+        let weak = std::sync::Weak::clone(&self.routed);
+        Some(Arc::new(move || {
+            let weak = std::sync::Weak::clone(&weak);
+            Box::pin(async move {
+                let routed = weak.upgrade()?;
+                let vol = routed.volumes.get(vol_idx)?;
+                crate::sym_join::resolve_holder_endpoint(vol, appender_id).await
+            })
+        }))
+    }
+
     /// The dialed holder at `endpoint`, JOINed on first touch (one lease
     /// per holder, its renewal cadence spawned), with a token plane for
     /// set volume `volume` (its standing recall channel started, the
@@ -5460,6 +5560,14 @@ impl SlotCustodyArm {
                     .await
                     {
                         Ok(client) => {
+                            // Issue 22: the holder this endpoint is bound
+                            // to NOW (the slot holder table's word) is what
+                            // the renewal loop re-resolves once per beat
+                            // after a failed renewal — a moved listener
+                            // fences the lease by the owner's word.
+                            if let Some(resolver) = self.holder_resolver_for(endpoint) {
+                                client.install_holder_resolver(resolver);
+                            }
                             crate::cowriter::spawn_custody_renewal(
                                 Arc::clone(&client),
                                 Arc::clone(&self.stop),

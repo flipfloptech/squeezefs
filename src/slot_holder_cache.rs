@@ -72,6 +72,19 @@ impl SlotHolderCache {
         self.endpoints.load().get(&appender_id).cloned()
     }
 
+    /// The appender bound to `endpoint` (the custody renewal loop's
+    /// re-resolve key — PR 12b round 4, Issue 22); the lowest id when one
+    /// listener serves several appenders of a daemon (one page identity,
+    /// one claim-set entry — every id at the address resolves alike).
+    pub fn appender_at_endpoint(&self, endpoint: &str) -> Option<u32> {
+        self.endpoints
+            .load()
+            .iter()
+            .filter(|(_, bound)| bound.as_ref() == endpoint)
+            .map(|(id, _)| *id)
+            .min()
+    }
+
     /// Remember `appender_id`'s member id (learnt wherever its page
     /// identity is in hand: the ladder's census binding, a served join or
     /// publish).

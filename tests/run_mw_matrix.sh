@@ -3007,9 +3007,11 @@ leg_sym_storm() {
         # `fsck_inode_plane_foreign_dentry_scoped`), so the verdict here is
         # honest with joiners live: the block classes judged, the dentry
         # classes deferred to a census with no foreign lessee.
-        local out rc
-        out="$(timeout 900 "$SQZ" fsck "$m_mnt" 2>&1)"
-        rc=$?
+        # The verb's status is read WITHOUT `set -e` exiting the leg on a
+        # failing substitution (round 4: a red fsck died here before its
+        # transcript was kept — the finding read only in the daemon log).
+        local out rc=0
+        out="$(timeout 900 "$SQZ" fsck "$m_mnt" 2>&1)" || rc=$?
         echo "$out" >"$rowdir/fsck-r$round.out"
         [ "$rc" != "124" ] || die "round $round: online fsck HUNG past 900 s (the fleet census never terminated) — transcript $rowdir/fsck-r$round.out"
         [ "$rc" = "0" ] || die "round $round: online fsck FAILED or found:
@@ -3195,9 +3197,8 @@ s7_kill_body() { # [sym]
         for sidx in 0 $(joiner_idxs); do
             cat "$(mnt_of "$sidx")/.stats" >"$rowdir/stats-m$sidx-r$round.json" 2>/dev/null || true
         done
-        local frc
-        out="$(timeout 900 "$SQZ" fsck "$w_mnt" 2>&1)"
-        frc=$?
+        local frc=0
+        out="$(timeout 900 "$SQZ" fsck "$w_mnt" 2>&1)" || frc=$?
         echo "$out" >"$rowdir/fsck-r$round.out"
         [ "$frc" != "124" ] || die "round $round: online fsck HUNG past 900 s (the fleet census never terminated) — transcript $rowdir/fsck-r$round.out"
         [ "$frc" = "0" ] ||

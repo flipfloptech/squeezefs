@@ -1303,9 +1303,11 @@ pub struct SlotCoverage {
     /// dentry census reads removals behind. On the volume's MANAGER (the
     /// process with the S6 owner's word) these are the `foreign_live`
     /// slots — a lessee NOT known live is PR 10's frozen-tree class and
-    /// is judged. On a MEMBER (a joined appender, a `-o ro` token reader
-    /// — KD-MW-16's fleet census shard runs on both) there is no owner
-    /// word at all, so the honest bound is every slot NOT leased by this
+    /// is judged. On a MEMBER (a joined appender, a `-o ro` reader — S5 or
+    /// token — a co-writer, a peer-owned open: `KvMetaBackend::
+    /// census_is_member`; KD-MW-16's fleet census shard runs on the reader
+    /// and the joiners) there is no owner word at all, so the honest bound
+    /// is every slot NOT leased by this
     /// mount: the ones another appender leases (whichever it is — the
     /// manager's rotor roots ride its page, never tree 0) AND the
     /// unleased ones (the manager's, re-rooted by its SMOs between this
@@ -2454,9 +2456,12 @@ impl KvMetaBackend {
             cov.covered = 1;
             return Ok(cov);
         };
-        // A MEMBER of an armed set (a joined appender; a `-o ro` token
-        // reader): no owner word, every tree not its own a projection.
-        let member = self.is_joined_appender() || self.token_reader().is_some();
+        // A MEMBER of the set (a joined appender; a `-o ro` reader — S5 or
+        // token; a co-writer; a peer-owned open — `census_is_member`): no
+        // owner word, every tree not its own a projection. The first
+        // round-5 fleet run found the S5 reader missing from this word and
+        // judging every writer's tree as its own.
+        let member = self.census_is_member();
         // The native slot is the manager's by KD-SYM-2.
         let native_ours = !gate.is_armed() || gate.is_leased(super::record::NATIVE_FOREST_SLOT);
         if native_ours && !member {

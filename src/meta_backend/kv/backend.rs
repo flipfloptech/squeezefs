@@ -2307,6 +2307,21 @@ impl KvMetaBackend {
         self.read_only
     }
 
+    /// `true` ⇔ this open judges NOTHING it does not lease in a census
+    /// (symmetric PR 12b, Issue 24): a joined appender, a token reader,
+    /// and every OTHER non-writer open beside live writers — the S5
+    /// `-o ro` reader (the fleet census shard's actual venue: no plane, no
+    /// lease, every slot tree a poll-refreshed projection), a co-writer, a
+    /// peer-owned open. An offline PROBE is the one non-writer that judges
+    /// everything: it runs only where no writer is live (the offline verb's
+    /// preflight refuses a heartbeat-fresh claim), so its trees are no
+    /// one's projection.
+    pub fn census_is_member(&self) -> bool {
+        self.is_joined_appender()
+            || self.token_reader().is_some()
+            || (self.non_writer && !self.probe)
+    }
+
     /// `joined` is the JOINED non-manager appender's wire outcome (PR 12b —
     /// `Some` under [`OpenPosture::JoinedAppender`] alone): the region the
     /// manager minted for this identity over the wire, stood up beside the

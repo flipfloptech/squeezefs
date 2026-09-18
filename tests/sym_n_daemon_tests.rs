@@ -1054,6 +1054,162 @@ async fn a_wire_lessee_past_its_page_budget_keeps_committing_and_its_overflow_ro
     fsck_clean(&uris).await;
 }
 
+/// **The manager's raw C1 walk skips the slot trees a LIVE joiner leases**
+/// (PR 12b round 4 — the `sym-storm` leg's round-3 red on the fixed tree:
+/// after three rounds the manager's online fsck reported `C1Torn` on
+/// `vol1/slot312` — a slot a live joiner leases and appends into. The
+/// manager holds that tree only as a PROJECTION: the joiner moves its
+/// root and rewrites its images under grants the manager handed out, so
+/// the manager's raw walk from ITS root word read a routing loop —
+/// `root-seq` restarts to the traversal budget — over a healthy tree.
+/// Round 1 scoped the DENTRY pass out of a live lessee's trees by the S6
+/// owner's word; the raw C1 units take the same law here. A lessee not
+/// known live stays PR 10's frozen-tree class and is walked.
+///
+/// The shape: the F9 pin's joiner (128 first touches past the page
+/// budget, every root moved by a forced compaction, two cycles) LIVE and
+/// listed live by the installed owner; the FULL fsck engine at the
+/// manager → no finding, the skipped trees counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_managers_c1_walk_skips_the_slot_trees_a_live_joiner_leases() {
+    use squeezefs::membership::{
+        self, JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole, MembershipOwner,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs, slots) = overflow_seeded_volume(dir.path()).await;
+    let knobs = Knobs::armed().mint_slots("1");
+    let manager = open_under(&uris, &knobs).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    enroll_manager(&mvol, &venue.endpoint()).await;
+    // The manager is the S6 owner of the joiner's shard; the joiner is a
+    // LIVE member of it (the mount path's rung 3).
+    let owner = MembershipOwner::arm(
+        "c1-owner",
+        3,
+        2,
+        LeaseClocks::derive(std::time::Duration::from_micros(250)).expect("derived clocks"),
+        LeaseClock::monotonic(),
+    )
+    .expect("arm the owner");
+    membership::install_owner(Arc::clone(&owner));
+
+    let joiner = join_knobs(&knobs, &uris, &venue, &mvol, 92).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let identity = jvol.joined_wire().unwrap().identity;
+    let member = squeezefs::cowriter::node_member_id_of(identity.node_token, identity.mount_slot);
+    let JoinOutcome::Granted(_) = owner.join(JoinRequest {
+        id: member.clone(),
+        role: MemberRole::Writer,
+        endpoint: None,
+        pid: std::process::id(),
+        boot: "boot-c1".to_string(),
+        prior_epoch: None,
+        pr_key: 0,
+        mount: None,
+    }) else {
+        panic!("the joiner joins the shard");
+    };
+    assert!(owner.member_is_live(&member));
+
+    let mut files: Vec<(u64, Vec<(String, u64)>)> = Vec::with_capacity(dirs.len());
+    for (i, d) in dirs.iter().enumerate() {
+        files.push((*d, create_files(&joiner, *d, &format!("c{i:03}-"), 1).await));
+    }
+    jvol.checkpoint_now().await.unwrap();
+    for slot in &slots {
+        let root = jvol.slot_tree(*slot).expect("the joiner's tree").root();
+        let mut attempts = 0;
+        loop {
+            match jvol.defrag_compact_nodes(&[(0, root.addr)]).await {
+                Ok(n) => {
+                    assert_eq!(n, 1, "slot {slot}'s root compacts");
+                    break;
+                }
+                Err(squeezefs::meta_backend::kv::KvError::GrantExhausted { .. })
+                    if attempts < 8 =>
+                {
+                    attempts += 1;
+                    jvol.checkpoint_now().await.unwrap();
+                }
+                Err(e) => panic!("slot {slot}: {e}"),
+            }
+        }
+    }
+    jvol.checkpoint_now().await.unwrap();
+    jvol.checkpoint_now().await.unwrap();
+    let more = create_files(&joiner, dirs[0], "more", 200).await;
+    jvol.checkpoint_now().await.unwrap();
+
+    // The FULL engine at the manager with the joiner live.
+    let report = fsck_all_classes_over(&manager).await;
+    assert!(
+        !report.has_findings(),
+        "the manager's fsck takes no verdict over a live lessee's tree: {:?}",
+        report.findings
+    );
+    assert!(
+        report.counters.c1_foreign_live_slots_scoped >= slots.len() as u64,
+        "every slot tree the live joiner leases was skipped by the raw C1 walk ({} ≥ {})",
+        report.counters.c1_foreign_live_slots_scoped,
+        slots.len()
+    );
+    // The joiner is unharmed by the census: every file resolves there.
+    for (d, fs) in &files {
+        assert_all_resolve(&joiner, *d, fs).await;
+    }
+    assert_all_resolve(&joiner, dirs[0], &more).await;
+
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+/// The FULL fsck engine (every class, the offline options' settle) over
+/// an already-open WRITER set — the manager's online census the fleet
+/// legs run after each round.
+async fn fsck_all_classes_over(routed: &Arc<RoutedMetaBackend>) -> squeezefs::fsck::FsckReport {
+    let dlm = squeezefs::dlm::DlmClient::new().unwrap();
+    let alloc = Arc::new(
+        squeezefs::block_allocator::BlockAllocator::new("vol-c1")
+            .await
+            .unwrap(),
+    );
+    let dev = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new("/dev/null"));
+    let cache = squeezefs::cache::TieredCache::new(
+        Vec::new(),
+        Some("64MB"),
+        Some("64MB"),
+        None,
+        None,
+        alloc.clone(),
+        dev.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let router = squeezefs::routing::DataRouter::new(dlm, cache, alloc, dev);
+    router.set_meta_backend(Arc::clone(routed));
+    let ctx = squeezefs::fsck::FsckCtx {
+        meta: Arc::clone(routed),
+        router,
+        staging_dirs: Vec::new(),
+        expected_generation: None,
+    };
+    let mut opts = squeezefs::fsck::FsckOptions::offline();
+    opts.settle = std::time::Duration::from_millis(10);
+    squeezefs::fsck::run(&ctx, &opts)
+        .await
+        .expect("the engine runs")
+}
+
 /// **A wire lessee sheds its overflow to the page budget within one
 /// beat** (PR 12b round 4, Issue 23's bound — PR 4's LRU release on a
 /// joined appender): past `SLOT_PAGE_BUDGET` the cadence releases

@@ -1151,9 +1151,9 @@ async fn the_managers_c1_walk_skips_the_slot_trees_a_live_joiner_leases() {
         report.findings
     );
     assert!(
-        report.counters.c1_foreign_live_slots_scoped >= slots.len() as u64,
+        report.counters.c1_projection_slots_scoped >= slots.len() as u64,
         "every slot tree the live joiner leases was skipped by the raw C1 walk ({} ≥ {})",
-        report.counters.c1_foreign_live_slots_scoped,
+        report.counters.c1_projection_slots_scoped,
         slots.len()
     );
     // The joiner is unharmed by the census: every file resolves there.
@@ -1170,6 +1170,146 @@ async fn the_managers_c1_walk_skips_the_slot_trees_a_live_joiner_leases() {
     drop(mvol);
     drop(manager);
     fsck_clean(&uris).await;
+}
+
+/// **A member's census shard walks only its OWN slot trees** (PR 12b
+/// review round 2, Issue 24): KD-MW-16's fleet fsck dispatches a census
+/// shard to a MEMBER — the `-o ro` reader in every fleet fsck, a joined
+/// writer where one is idle — which runs `fsck::run` over its own view
+/// and whose C1 findings the coordinator admits whole. Round 4's law
+/// ("a slot tree a LIVE lessee holds is not censused here") read ONE
+/// owner's word — the process's installed S6 owner — and a member has
+/// none, so its raw C1 walk covered every slot tree it holds as a
+/// PROJECTION: a tree another appender leases at the root tree 0 named
+/// when the lease was granted, appended into and re-rooted since (F12's
+/// `C1Torn` shape — clean in the round-4 tapes only because the reader's
+/// roots happened not to move under its walk). ONE predicate now
+/// (`SlotCoverage::unjudged_slots`, read by the dentry pass and the raw
+/// C1 walk alike): at the manager the live lessees' trees; at a member
+/// every tree not leased by it — no liveness word exists there, so
+/// "leased to anyone else (or unleased — the manager's)" is its honest
+/// bound. Coverage INCOMPLETE over them, counted, never a finding.
+///
+/// The shape: the joiner joined at the seeded roots of two unleased
+/// slots; the MANAGER then first-touches both, grows and compacts their
+/// trees (the roots move, the retired extents return and are re-claimed
+/// under other images) while the joiner's projection stands at the
+/// seeded roots; the joiner runs a census shard. RED before: both of the
+/// manager's trees WALKED by the member (0 skipped — the false finding
+/// itself needs the retired root extents re-claimed under other images,
+/// which the fleet's storm supplies and this shape only sometimes does);
+/// green: 0 findings, both trees counted as projections skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_members_census_shard_walks_only_its_own_slot_trees() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared"), (SLOT_B, "other")]).await;
+    let (shared, other) = (dirs[0], dirs[1]);
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    enroll_manager(&mvol, &venue.endpoint()).await;
+    let joiner = join(&uris, &venue, &mvol, 93).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    // The joiner holds both seeded trees as projections at their seeded
+    // roots (tree 0 named them at its open).
+    assert!(jvol.slot_tree(SLOT_A).is_some() && jvol.slot_tree(SLOT_B).is_some());
+
+    // The manager first-touches both slots and re-roots their trees,
+    // three compactions apart, the retired extents returned and re-used.
+    let mut files = Vec::new();
+    for round in 0..3 {
+        files.extend(create_files(&manager, shared, &format!("ma{round}-"), 60).await);
+        files.extend(create_files(&manager, other, &format!("mb{round}-"), 60).await);
+        mvol.checkpoint_now().await.unwrap();
+        for slot in [SLOT_A, SLOT_B] {
+            let root = mvol.slot_tree(slot).expect("the manager's tree").root();
+            assert_eq!(
+                mvol.defrag_compact_nodes(&[(0, root.addr)]).await.unwrap(),
+                1,
+                "slot {slot}'s root compacts"
+            );
+        }
+        mvol.checkpoint_now().await.unwrap();
+        mvol.checkpoint_now().await.unwrap();
+    }
+    for slot in [SLOT_A, SLOT_B] {
+        assert!(
+            matches!(
+                tree0_state(&mvol, slot).await,
+                Some(SlotState::Leased { appender_id: 0, .. })
+            ),
+            "slot {slot} is the manager's"
+        );
+    }
+
+    // The MEMBER's census shard (the fleet worker's shape: the census
+    // partition, no inode plane) over its own view.
+    let report = census_shard_over(&joiner).await;
+    assert!(
+        !report.has_findings(),
+        "a member's census takes no verdict over the trees it holds as projections: {:?}",
+        report.findings
+    );
+    assert!(
+        report.counters.c1_projection_slots_scoped >= 2,
+        "both of the manager's trees were skipped as projections ({} ≥ 2)",
+        report.counters.c1_projection_slots_scoped
+    );
+    // The lessee's own census judges them — and finds them healthy.
+    let mine = fsck_all_classes_over(&manager).await;
+    assert!(!mine.has_findings(), "{:?}", mine.findings);
+
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    assert_all_resolve(&manager, shared, &files[..60]).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+/// KD-MW-16's fleet CENSUS shard as a member runs it (`fleet_worker.rs`):
+/// the census partition, no inode plane, over the member's own view.
+async fn census_shard_over(routed: &Arc<RoutedMetaBackend>) -> squeezefs::fsck::FsckReport {
+    let dlm = squeezefs::dlm::DlmClient::new().unwrap();
+    let alloc = Arc::new(
+        squeezefs::block_allocator::BlockAllocator::new("vol-shard")
+            .await
+            .unwrap(),
+    );
+    let dev = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new("/dev/null"));
+    let cache = squeezefs::cache::TieredCache::new(
+        Vec::new(),
+        Some("64MB"),
+        Some("64MB"),
+        None,
+        None,
+        alloc.clone(),
+        dev.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let router = squeezefs::routing::DataRouter::new(dlm, cache, alloc, dev);
+    router.set_meta_backend(Arc::clone(routed));
+    let ctx = squeezefs::fsck::FsckCtx {
+        meta: Arc::clone(routed),
+        router,
+        staging_dirs: Vec::new(),
+        expected_generation: None,
+    };
+    let mut opts = squeezefs::fsck::FsckOptions::offline();
+    opts.settle = std::time::Duration::from_millis(10);
+    opts.shard = Some((1, 2));
+    opts.staging_full = true;
+    opts.inode_plane = false;
+    squeezefs::fsck::run(&ctx, &opts)
+        .await
+        .expect("the engine runs")
 }
 
 /// The FULL fsck engine (every class, the offline options' settle) over

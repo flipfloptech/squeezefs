@@ -3003,10 +3003,18 @@ $out"
         # directory just removed must be GONE through every mount — the
         # manager, the survivors and the remounted victim — never a name
         # a stale projection still serves.
-        local reader_idx stale=0
+        # Every stat is BOUNDED: a lookup that parks (the round-2 run: a
+        # live joiner's lookup of a removed directory whose child's holder
+        # had died and rejoined parked 24 min at station [entry]) is a red
+        # with its daemon named, never a leg that hangs.
+        local reader_idx stale=0 src
         for idx in 0 "${joiners[@]}"; do
             for reader_idx in 0 "${joiners[@]}"; do
-                if stat "$(mnt_of "$reader_idx")/storm-w$idx-r$round" >/dev/null 2>&1; then
+                timeout 60 stat "$(mnt_of "$reader_idx")/storm-w$idx-r$round" >/dev/null 2>&1
+                src=$?
+                if [ "$src" = "124" ]; then
+                    die "round $round: stat of removed storm-w$idx-r$round through m$reader_idx HUNG past 60 s — a parked lookup (m$reader_idx's log: fuse_op_watchdog_overdue)"
+                elif [ "$src" = "0" ]; then
                     stale=$((stale + 1))
                     echo "STALE: m$reader_idx still resolves storm-w$idx-r$round" >>"$rowdir/stale-r$round.txt"
                 fi

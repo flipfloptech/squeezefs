@@ -104,6 +104,9 @@
 # wire holder's release on the manager's notice) rides the list the PR 4
 # way: its fixtures stamp under the seam themselves and its refusal pin
 # runs on both legs.
+# `kv_loader_lock_style_tests` (PR 12b review round 1, Issue 13 — one
+# acquisition style per node-cache scc table: the static rail + a bounded
+# flat load-collision stress) is layout-blind and runs on both legs.
 # `kvmap_read_tests` (the block-map tree's read economy: A7 probation, the
 # leaf-read gauge, the reader bracket) joined the list in PR 12: its two
 # tree-7 leaf contracts were stamped-RED on the base with nobody running

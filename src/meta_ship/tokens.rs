@@ -1304,10 +1304,17 @@ impl RecallLane {
             .map(|(c, _)| c.clone())
             .collect();
         for client in clients {
-            if st.inflight.contains_key(&client) {
+            if let Some(f) = st.inflight.get(&client) {
                 let waiting = st.pending.get(&client).map(|q| q.len()).unwrap_or(0);
                 self.rate_deferred
                     .fetch_add(waiting as u64, Ordering::Relaxed);
+                log::debug!(
+                    "recall lane: {waiting} recall(s) for '{client}' deferred behind its \
+                     in-flight frame {} ({:?} old, {} recall(s))",
+                    f.frame_id,
+                    now.saturating_duration_since(f.issued_at),
+                    f.recalls.len()
+                );
                 continue;
             }
             let Some(q) = st.pending.get_mut(&client) else {
@@ -1452,6 +1459,37 @@ impl RecallLane {
             .get(&ino)
             .map(|s| s.len())
             .unwrap_or(0)
+    }
+
+    /// Is a recall of `client`'s grant on `ino` REQUESTED — queued or in
+    /// an unacked frame? (Symmetric PR 12b round 4: a grant that finds the
+    /// client already registered under such a recall is riding a
+    /// registration the ack is about to retire — the holder waits the
+    /// recall out and registers afresh, or the served token is never
+    /// recalled again.)
+    pub fn recall_requested(&self, ino: u64, client: &str) -> bool {
+        self.state
+            .lock()
+            .requested
+            .get(client)
+            .is_some_and(|r| r.contains(&ino))
+    }
+
+    /// Holders of `ino` whose recall is REQUESTED (queued or in an unacked
+    /// frame) — what a commit's recall pass waits for (symmetric PR 12b
+    /// round 4). A holder registered AFTER the pass took the object in
+    /// flight was never recalled: it is parked on the gate until the
+    /// pass settles and reads the post-commit records, so it is not the
+    /// pass's to wait for — counted among `holders`, it held every pass
+    /// to the grant's park bound (the storm legs' 18.75 s stall at every
+    /// contended directory).
+    pub fn holders_under_recall(&self, ino: u64) -> usize {
+        let st = self.state.lock();
+        st.grants.get(&ino).map_or(0, |hs| {
+            hs.iter()
+                .filter(|c| st.requested.get(*c).is_some_and(|r| r.contains(&ino)))
+                .count()
+        })
     }
 
     /// Every object with an outstanding grant that `keep` selects — the

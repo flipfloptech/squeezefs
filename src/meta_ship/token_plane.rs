@@ -783,6 +783,11 @@ pub struct TokenHolderPlane {
     /// law's denominator: a storm on one object is ONE batch per pass).
     recall_batches: AtomicU64,
     grant_parks: AtomicU64,
+    /// Grants that found the client's registration under a PENDING recall
+    /// and waited it out before registering afresh (symmetric PR 12b round
+    /// 4 — the storm legs' stale negative: served on the doomed
+    /// registration, the token stood at the reader untracked here).
+    regrant_under_recall_waits: AtomicU64,
     fanout: QueueDepthHistogram,
     rtt: [LatencyHistogram; RTT_PHASES],
 }
@@ -829,6 +834,7 @@ impl TokenHolderPlane {
             releases: AtomicU64::new(0),
             recall_batches: AtomicU64::new(0),
             grant_parks: AtomicU64::new(0),
+            regrant_under_recall_waits: AtomicU64::new(0),
             fanout: QueueDepthHistogram::default(),
             rtt: std::array::from_fn(|_| LatencyHistogram::default()),
         }
@@ -944,6 +950,25 @@ impl TokenHolderPlane {
         }
     }
 
+    /// Wait until no recall of `client`'s grant on `object` is requested
+    /// — the ack (or the expiry sweep) retired it; `false` past the recall
+    /// bound. Woken by every ack.
+    async fn await_recall_retired(&self, object: u64, client: &str) -> bool {
+        let bound = self.lane.config().deadline;
+        let started = Instant::now();
+        loop {
+            let notified = self.ack_wake.notified();
+            if !self.lane.recall_requested(object, client) {
+                return true;
+            }
+            let left = bound.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return false;
+            }
+            let _ = squeezefs_ipc::sqz_time::timeout(left, notified).await;
+        }
+    }
+
     /// Serve a grant under the grant ∥ pass gate (`token_grant_core`):
     /// the token is REGISTERED in the lane before anything is read, so a
     /// pass beginning from here on recalls it; a pass already holding the
@@ -973,21 +998,61 @@ impl TokenHolderPlane {
             self.not_holder_redirects.fetch_add(1, Ordering::Relaxed);
             return TokenReply::NotHolder { holder };
         }
-        let (already, admission) = self.gate.grant_register(object, client, &self.lane);
-        let retract = |plane: &Self| {
+        // **The registration this grant is served on must be the one that
+        // survives the reply** (symmetric PR 12b round 4 — the `sym-storm`
+        // legs' stale negative). Two ways the registration `register`
+        // finds or makes can be RETIRED before the records go out: (a)
+        // the client's previous token on `object` is under a PENDING
+        // recall — its frame queued or in flight, its ack about to retire
+        // the registration `register` just found (`already`); (b) this
+        // grant registered fresh, then a pass took the object in flight,
+        // saw the registration and recalled it — the reader (holding
+        // nothing yet) acks at once and the ack retires it while the
+        // grant parks for the settle. Served on either, the token stands
+        // at the reader untracked here and is never recalled again (the
+        // reader read its recall generation before or after the frame —
+        // nothing at its end catches a registration retired underneath).
+        // So: a recall of this (client, object) is WAITED OUT (the ack
+        // retires; the reader's next resolve is this very fetch), the
+        // registration is RE-ARMED before every read (idempotent — the
+        // gate's register-then-check order, so a pass beginning from here
+        // sees it), and the read repeats until no pass straddles it.
+        let (mut already, mut admission) = self.gate.grant_register(object, client, &self.lane);
+        let retract = |plane: &Self, already: bool| {
             if !already {
                 plane.lane.surrender(object, client);
             }
         };
-        if admission == GrantAdmission::Park && !self.await_object_settled(object).await {
-            retract(self);
-            return TokenReply::Refused {
-                reason: format!(
-                    "object {object}: a recalled commit did not apply inside the recall bound"
-                ),
-            };
-        }
         let records = loop {
+            if self.lane.recall_requested(object, client) {
+                self.regrant_under_recall_waits
+                    .fetch_add(1, Ordering::Relaxed);
+                log::debug!(
+                    "token grant for '{client}' on object {object} found its registration under \
+                     a pending recall — waiting the recall out before registering afresh"
+                );
+                if !self.await_recall_retired(object, client).await {
+                    return TokenReply::Refused {
+                        reason: format!(
+                            "object {object}: the client's previous token's recall did not \
+                             complete inside the recall bound"
+                        ),
+                    };
+                }
+                (already, admission) = self.gate.grant_register(object, client, &self.lane);
+            } else if crate::token_grant_core::HolderTable::register(&self.lane, object, client) {
+                // Retired by an ack while this grant parked: fresh again.
+                already = false;
+            }
+            if admission == GrantAdmission::Park && !self.await_object_settled(object).await {
+                retract(self, already);
+                return TokenReply::Refused {
+                    reason: format!(
+                        "object {object}: a recalled commit did not apply inside the recall bound"
+                    ),
+                };
+            }
+            admission = GrantAdmission::Proceed;
             let read = volume
                 .token_records_for(object, wants, after, xattr_after)
                 .await;
@@ -995,9 +1060,10 @@ impl TokenHolderPlane {
                 // A pass took the object in flight during the read: its
                 // apply may straddle what was read. It saw this
                 // registration and recalls it; the grant answers the
-                // post-commit records once the pass settles.
+                // post-commit records once the pass settles, on a
+                // registration re-armed at the top of the loop.
                 if !self.await_object_settled(object).await {
-                    retract(self);
+                    retract(self, already);
                     return TokenReply::Refused {
                         reason: format!(
                             "object {object}: a recalled commit did not apply inside the \
@@ -1007,14 +1073,20 @@ impl TokenHolderPlane {
                 }
                 continue;
             }
+            if self.lane.recall_requested(object, client) {
+                // A pass that settled inside the read recalled this
+                // registration: its ack retires it — waited out and
+                // re-armed at the top, the records read again.
+                continue;
+            }
             match read {
                 Ok(Some(r)) => break r,
                 Ok(None) => {
-                    retract(self);
+                    retract(self, already);
                     return TokenReply::Gone;
                 }
                 Err(e) => {
-                    retract(self);
+                    retract(self, already);
                     return TokenReply::Refused {
                         reason: format!("object {object}: {e}"),
                     };
@@ -1038,6 +1110,11 @@ impl TokenHolderPlane {
             if let Some(frame) = taken {
                 self.last_send_ns
                     .fetch_max(self.epoch.elapsed().as_nanos() as u64, Ordering::AcqRel);
+                log::debug!(
+                    "token recall frame {} handed to '{client}''s poll ({} object(s))",
+                    frame.frame_id,
+                    frame.inos.len()
+                );
                 return TokenReply::Recall {
                     frame_id: frame.frame_id,
                     objects: frame.inos,
@@ -1061,6 +1138,12 @@ impl TokenHolderPlane {
             Ordering::AcqRel,
         );
         let acked = self.lane.ack_frame(client, frame_id, now) as u64;
+        if acked == 0 {
+            log::debug!(
+                "token recall frame {frame_id} acked by '{client}' matched no in-flight frame \
+                 (a resend or a post-expiry straggler — nothing retired)"
+            );
+        }
         self.recall_acks.fetch_add(acked, Ordering::Relaxed);
         self.ack_wake.notify_waiters();
         TokenReply::Acked
@@ -1279,13 +1362,30 @@ impl TokenHolderPlane {
             if !frames.is_empty() {
                 let mut pending = self.pending_frames.lock();
                 for f in frames {
+                    log::debug!(
+                        "token recall frame {} issued to '{}' for object(s) {:?}",
+                        f.frame_id,
+                        f.client,
+                        f.inos
+                    );
                     pending.entry(f.client.clone()).or_default().push_back(f);
                 }
                 drop(pending);
                 self.frame_wake.notify_waiters();
             }
             let notified = self.ack_wake.notified();
-            if objects.iter().all(|o| self.lane.holders(*o) == 0) {
+            // The pass waits for the recalls it ISSUED (symmetric PR 12b
+            // round 4): a holder registered after the union went in
+            // flight was never recalled — it is parked on the gate and
+            // reads the post-commit records at the settle — so counting
+            // it here held every pass to that grant's park bound (the
+            // recall deadline: the storm legs' 18.75 s stall at a
+            // contended directory, four daemons' `mkdir -p` under one
+            // root at once).
+            if objects
+                .iter()
+                .all(|o| self.lane.holders_under_recall(*o) == 0)
+            {
                 break;
             }
             // The wait: to the next ack, the earliest live lease's expiry,
@@ -1433,6 +1533,7 @@ impl TokenHolderPlane {
             releases: self.releases.load(Ordering::Relaxed),
             recall_batches: self.recall_batches.load(Ordering::Relaxed),
             grant_parks: self.grant_parks.load(Ordering::Relaxed),
+            regrant_under_recall_waits: self.regrant_under_recall_waits.load(Ordering::Relaxed),
             outstanding: self.lane.outstanding_now(),
             fanout_p50: self.fanout_percentile(50),
             fanout_p99: self.fanout_percentile(99),
@@ -1479,6 +1580,7 @@ pub struct TokenHolderStats {
     pub releases: u64,
     pub recall_batches: u64,
     pub grant_parks: u64,
+    pub regrant_under_recall_waits: u64,
     pub outstanding: u64,
     pub fanout_p50: u64,
     pub fanout_p99: u64,
@@ -3338,6 +3440,7 @@ pub fn holder_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
         "dlm_token_releases": per(&|s| s.releases),
         "dlm_token_recall_batches": per(&|s| s.recall_batches),
         "dlm_token_grant_parks": per(&|s| s.grant_parks),
+        "dlm_token_regrant_under_recall_waits": per(&|s| s.regrant_under_recall_waits),
         "dlm_token_outstanding": per(&|s| s.outstanding),
         "dlm_token_recall_fanout_p50": per(&|s| s.fanout_p50),
         "dlm_token_recall_fanout_p99": per(&|s| s.fanout_p99),

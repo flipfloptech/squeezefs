@@ -2855,13 +2855,23 @@ ack_writer() { # dir ledger tag
 # under `orig_mnt` is re-rooted): every acked name present with content.
 # Prints the lost count; the misses go to `lostfile`.
 ack_verify() { # ledger tag orig_mnt read_mnt lostfile
-    local ledger="$1" tag="$2" orig="$3" read_mnt="$4" lostfile="$5" f g want got lost=0
+    local ledger="$1" tag="$2" orig="$3" read_mnt="$4" lostfile="$5" f g want got lost=0 kind
     while IFS= read -r f; do
         [ -n "$f" ] || continue
         g="$read_mnt${f#"$orig"}"
-        if [ ! -f "$g" ]; then
+        # The stat's OWN error travels into the finding (round 4: a
+        # "LOST (absent)" that was 36 EAGAIN refusals at one survivor read
+        # as lost data until the daemon logs said otherwise) — an absent
+        # name is ENOENT, a refused read names its errno.
+        if ! kind="$(stat -c %F "$g" 2>&1 >/dev/null)"; then
             lost=$((lost + 1))
-            echo "LOST (absent): $g" >>"$lostfile"
+            echo "LOST (absent: ${kind##*: }): $g" >>"$lostfile"
+            continue
+        fi
+        kind="$(stat -c %F "$g" 2>/dev/null)"
+        if [ "$kind" != "regular file" ]; then
+            lost=$((lost + 1))
+            echo "LOST (not a regular file: $kind): $g" >>"$lostfile"
             continue
         fi
         want="$tag:$((10#${f##*/f}))"

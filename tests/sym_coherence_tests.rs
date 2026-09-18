@@ -1111,6 +1111,105 @@ async fn a_reader_never_acks_a_recall_with_a_read_in_flight() {
     shutdown(&writer).await;
 }
 
+/// **A grant that lands while the client's previous token is being
+/// recalled registers AFRESH — never on the registration the ack is
+/// about to retire** (symmetric PR 12b round 4 — the `sym-storm` legs'
+/// stale negative: a joiner's `mkdir -p` probe re-read the root's
+/// dentries while its previous root token's recall was unacked; the
+/// holder found the client "already" registered and served on it; the
+/// ack then RETIRED that registration, so the token the reader installed
+/// was tracked by nobody — the reader answered ENOENT for its OWN
+/// directory for the rest of the round, `rm -rf` removed nothing, and
+/// the oracle read 36 acked files as absent).
+///
+/// The window: the recall reached the reader (its entry dropped) and the
+/// ack is held behind an in-flight data serve; a fresh read of the object
+/// arrives at the holder inside it. RED before: `holders(1) == 0` with
+/// the reader holding a token, and the next commit on the object recalls
+/// nobody.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_under_a_pending_recall_registers_afresh_and_stays_recallable() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-1").await;
+    let holder = writer.volumes[0].token_holder().unwrap().clone();
+    struct DrainSink;
+    impl RecallDataSink for DrainSink {
+        fn drain_and_purge<'a>(
+            &'a self,
+            _objects: &'a [RecalledObject],
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            Box::pin(ro_coherence::drain_in_flight_serves())
+        }
+    }
+    assert!(plane.install_data_sink(Arc::new(DrainSink)));
+    ro_coherence::test_arm_serve_ledger();
+    let _ = Metadata::getattr(reader.as_ref(), 1).await.unwrap();
+    assert!(plane.holds(1));
+    assert_eq!(holder.holders(1), 1);
+
+    // The recall of the reader's root token, its ack held behind a serve.
+    let stamp = ro_coherence::ServeStamp::begin();
+    let w = Arc::clone(&writer);
+    let create = tokio::spawn(async move {
+        Metadata::create(w.as_ref(), 1, "c", libc::S_IFREG | 0o644, 0, 0).await
+    });
+    wait_until("the recall reached the reader", || {
+        plane.stats().recalls_received == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!plane.holds(1), "the entry left the cache at the recall");
+    assert_eq!(plane.stats().recalls_acked, 0, "the ack is held");
+
+    // A fresh read of the object INSIDE the window: its grant reaches the
+    // holder while the client's registration is still the recalled one.
+    let r = Arc::clone(&reader);
+    let regrant = tokio::spawn(async move { Metadata::getattr(r.as_ref(), 1).await });
+    wait_until("the grant met the pending recall at the holder", || {
+        holder.stats().regrant_under_recall_waits == 1
+    })
+    .await;
+    drop(stamp);
+    create.await.unwrap().unwrap();
+    regrant.await.unwrap().unwrap();
+    assert_eq!(plane.stats().recalls_acked, 1);
+    assert!(plane.holds(1), "the re-fetched token is installed");
+    assert_eq!(
+        holder.holders(1),
+        1,
+        "the re-granted token is TRACKED at the holder — the ack retired the old registration, \
+         never the new one"
+    );
+
+    // The proof the token is recallable: the next commit on the object
+    // recalls it, and the reader sees the change at its next resolve.
+    let w = Arc::clone(&writer);
+    let create2 = tokio::spawn(async move {
+        Metadata::create(w.as_ref(), 1, "d", libc::S_IFREG | 0o644, 0, 0).await
+    });
+    wait_until("the second recall reached the reader", || {
+        plane.stats().recalls_received == 2
+    })
+    .await;
+    create2.await.unwrap().unwrap();
+    wait_until("the second recall was acked", || {
+        plane.stats().recalls_acked == 2
+    })
+    .await;
+    let seen = Metadata::lookup(reader.as_ref(), 1, "d").await;
+    assert!(
+        seen.is_ok(),
+        "the reader's next resolve sees the commit: {seen:?}"
+    );
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
 /// §13 R20 — a reader past `T_self` serves nothing from cache: every
 /// token is dropped and the read refuses (fail-closed), never a stale
 /// answer.

@@ -46,6 +46,11 @@ pub struct SlotHolderCache {
     map: ArcSwap<HashMap<u32, SlotHolder>>,
     /// Appender id → the wire endpoint its owner service listens on.
     endpoints: ArcSwap<HashMap<u32, Arc<str>>>,
+    /// Appender id → its MEMBER id (`cowriter::node_member_id_of` over its
+    /// page identity) — the liveness key the S6 owner answers for (PR 12b
+    /// round 3, F2: a redirect to a holder the owner no longer lists live
+    /// is never handed out).
+    members: ArcSwap<HashMap<u32, Arc<str>>>,
 }
 
 impl SlotHolderCache {
@@ -65,6 +70,29 @@ impl SlotHolderCache {
     /// The endpoint bound to `appender_id` — one lock-free load.
     pub fn endpoint(&self, appender_id: u32) -> Option<Arc<str>> {
         self.endpoints.load().get(&appender_id).cloned()
+    }
+
+    /// Remember `appender_id`'s member id (learnt wherever its page
+    /// identity is in hand: the ladder's census binding, a served join or
+    /// publish).
+    pub fn set_member_id(&self, appender_id: u32, member: &str) {
+        if self
+            .members
+            .load()
+            .get(&appender_id)
+            .is_some_and(|m| **m == *member)
+        {
+            return;
+        }
+        let cur = self.members.load();
+        let mut next = (**cur).clone();
+        next.insert(appender_id, Arc::from(member));
+        self.members.store(Arc::new(next));
+    }
+
+    /// The member id remembered for `appender_id` — one lock-free load.
+    pub fn member_id(&self, appender_id: u32) -> Option<Arc<str>> {
+        self.members.load().get(&appender_id).cloned()
     }
 
     /// Replace the whole view (tree 0's lessee population at a poll /

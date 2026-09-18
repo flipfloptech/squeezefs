@@ -329,6 +329,13 @@ pub enum TokenReply {
     Rejected {
         reason: String,
     },
+    /// PR 12b round 3, F2: the object's slot is leased to an appender the
+    /// S6 owner no longer lists LIVE — its slots are the recovery's within
+    /// the ledger poll; the client is NOT redirected to an address nobody
+    /// answers at, it retries (EAGAIN) and reads the recovered tree here.
+    HolderDead {
+        holder: u32,
+    },
 }
 
 /// One request frame: the schema, the client's correlation id, the volume
@@ -752,6 +759,9 @@ pub struct TokenHolderPlane {
     /// appender that is not one of this mount's regions (PR 12's redirect
     /// trigger; review round 1, Issue 12).
     not_holder_redirects: AtomicU64,
+    /// Redirects NOT handed out because the lessee is dead
+    /// (`slot_resolve_dead_redirects`).
+    dead_redirects: AtomicU64,
     /// Verbs refused because this holder's appender park EXPIRED (PR 8's
     /// `park_gate::admits_token_service` — the successor owns the slots).
     park_expired_refusals: AtomicU64,
@@ -811,6 +821,7 @@ impl TokenHolderPlane {
             expired_with_lease: AtomicU64::new(0),
             lease_swept_grants: AtomicU64::new(0),
             not_holder_redirects: AtomicU64::new(0),
+            dead_redirects: AtomicU64::new(0),
             park_expired_refusals: AtomicU64::new(0),
             nonmember_refusals: AtomicU64::new(0),
             custody_rejected: AtomicU64::new(0),
@@ -955,6 +966,10 @@ impl TokenHolderPlane {
         // appender leases has its RAM-authoritative records THERE, and a
         // grant of this manager's view would be stale by construction.
         if let Some(holder) = volume.foreign_slot_holder(object) {
+            if holder != 0 && !volume.foreign_slot_holder_live(holder) {
+                self.dead_redirects.fetch_add(1, Ordering::Relaxed);
+                return TokenReply::HolderDead { holder };
+            }
             self.not_holder_redirects.fetch_add(1, Ordering::Relaxed);
             return TokenReply::NotHolder { holder };
         }
@@ -1101,6 +1116,10 @@ impl TokenHolderPlane {
             }
         };
         if let Some(holder) = volume.foreign_slot_holder(ask.object) {
+            if holder != 0 && !volume.foreign_slot_holder_live(holder) {
+                self.dead_redirects.fetch_add(1, Ordering::Relaxed);
+                return TokenReply::HolderDead { holder };
+            }
             self.not_holder_redirects.fetch_add(1, Ordering::Relaxed);
             return TokenReply::NotHolder { holder };
         }
@@ -1392,6 +1411,12 @@ impl TokenHolderPlane {
     }
 
     /// The Token family's holder-side snapshot.
+    /// Count a redirect withheld because the lessee is dead (the manager's
+    /// own divert's face of `slot_resolve_dead_redirects`).
+    pub fn note_dead_redirect(&self) {
+        self.dead_redirects.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn stats(&self) -> TokenHolderStats {
         TokenHolderStats {
             grants_served: self.grants_served.load(Ordering::Relaxed),
@@ -1400,6 +1425,7 @@ impl TokenHolderPlane {
             expired_with_lease: self.expired_with_lease.load(Ordering::Relaxed),
             lease_swept_grants: self.lease_swept_grants.load(Ordering::Relaxed),
             not_holder_redirects: self.not_holder_redirects.load(Ordering::Relaxed),
+            dead_redirects: self.dead_redirects.load(Ordering::Relaxed),
             park_expired_refusals: self.park_expired_refusals.load(Ordering::Relaxed),
             nonmember_refusals: self.nonmember_refusals.load(Ordering::Relaxed),
             custody_rejected: self.custody_rejected.load(Ordering::Relaxed),
@@ -1443,6 +1469,9 @@ pub struct TokenHolderStats {
     pub expired_with_lease: u64,
     pub lease_swept_grants: u64,
     pub not_holder_redirects: u64,
+    /// `slot_resolve_dead_redirects` — a `NotHolder` withheld because the
+    /// lessee is dead at the S6 owner (F2).
+    pub dead_redirects: u64,
     pub park_expired_refusals: u64,
     pub nonmember_refusals: u64,
     pub custody_rejected: u64,
@@ -2384,6 +2413,18 @@ impl TokenReaderPlane {
                     }
                 }
                 TokenReply::Gone => return Ok(FetchOutcome::Gone),
+                TokenReply::HolderDead { holder } => {
+                    // F2: the lessee is dead at the owner; nobody answers at
+                    // its address — the retryable class, never a dial.
+                    return Err(SqueezefsError::refused(
+                        libc::EAGAIN,
+                        format!(
+                            "object {object}'s slot is leased to appender {holder}, which the \
+                             membership owner lists DEAD — its slots are the recovery's within \
+                             the ledger poll; retry (slot_resolve_dead_redirects)"
+                        ),
+                    ));
+                }
                 TokenReply::NotHolder { holder } => {
                     // PR 12: the reader resolved the holder off ITS tree 0
                     // before dialing (`KvMetaBackend::token_reader_for`),
@@ -3271,6 +3312,7 @@ pub fn holder_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
         "dlm_token_recall_expired_with_lease": per(&|s| s.expired_with_lease),
         "dlm_token_lease_swept_grants": per(&|s| s.lease_swept_grants),
         "dlm_token_not_holder_redirects": per(&|s| s.not_holder_redirects),
+        "slot_resolve_dead_redirects": per(&|s| s.dead_redirects),
         "dlm_token_park_expired_refusals": per(&|s| s.park_expired_refusals),
         "dlm_token_nonmember_refusals": per(&|s| s.nonmember_refusals),
         "dlm_token_custody_rejected": per(&|s| s.custody_rejected),

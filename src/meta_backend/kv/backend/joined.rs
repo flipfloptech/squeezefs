@@ -1986,6 +1986,10 @@ impl KvMetaBackend {
         }
         if let Some(plane) = set.slot_leases() {
             plane.holders.set_endpoint(appender_id, endpoint);
+            plane.holders.set_member_id(
+                appender_id,
+                &crate::cowriter::node_member_id_of(identity.node_token, identity.mount_slot),
+            );
         }
         if already {
             set.verbs.replays.fetch_add(1, Ordering::Relaxed);

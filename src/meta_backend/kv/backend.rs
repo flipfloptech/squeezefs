@@ -3599,21 +3599,54 @@ impl KvMetaBackend {
                 }
             }
         };
+        // **The dead-holder fallback** (PR 12b round 3, F2): a JOINER whose
+        // per-holder read failed at the holder's address (the dial refused,
+        // the plane's recall channel dead) asks the MANAGER once — the
+        // lease's word: `HolderDead` (the S6 owner lists the lessee dead —
+        // the retryable class, `slot_resolve_dead_redirects`; no second
+        // dial), `NotHolder { moved }` (followed once), or the record
+        // itself once the recovery made the slot the manager's. The storm
+        // leg's reader parked 24 minutes behind a dead holder's address;
+        // ONE bounded dial then tree 0's word is the law.
+        let manager_word = |e: KvError| async move {
+            if !joined || self.tokens_reader.get().is_some() {
+                return Err(e);
+            }
+            let Some(plane) = crate::data_grant::foreign_read_plane(self, object, 0)
+                .await
+                .map_err(KvError::Io)?
+            else {
+                return Err(e);
+            };
+            log::info!(
+                "meta volume {}: object {object}'s holder did not answer ({e}) — the manager's \
+                 word is asked once (F2: never a second dial at a dead address)",
+                self.path.display()
+            );
+            plane
+                .serve(object, wants)
+                .await
+                .map(Some)
+                .map_err(KvError::from)
+        };
         let tokens = match self.token_reader_for(object).await {
             Ok(Some(t)) => t,
             Ok(None) => return Ok(None),
             Err(e) => {
                 if !projection_moved(e.to_string()).await {
-                    return Err(e);
+                    return manager_word(e).await;
                 }
                 log::info!(
                     "meta volume {}: object {object}'s holder was unreachable ({e}); the lease \
                      projection moved — resolved again",
                     self.path.display()
                 );
-                match self.token_reader_for(object).await? {
-                    Some(t) => t,
-                    None => return Ok(None),
+                match self.token_reader_for(object).await {
+                    Ok(Some(t)) => t,
+                    Ok(None) => return Ok(None),
+                    // The moved projection still names an unreachable
+                    // holder: the manager's word, never a third dial.
+                    Err(e) => return manager_word(e).await,
                 }
             }
         };
@@ -3622,16 +3655,16 @@ impl KvMetaBackend {
             Err(e) => {
                 let Some(redirect) = crate::meta_ship::token_plane::not_holder_redirect(&e) else {
                     if projection_moved(e.to_string()).await {
-                        if let Some(t) = self.token_reader_for(object).await? {
-                            return t
-                                .serve(object, wants)
-                                .await
-                                .map(Some)
-                                .map_err(KvError::from);
-                        }
-                        return Ok(None);
+                        return match self.token_reader_for(object).await {
+                            Ok(Some(t)) => match t.serve(object, wants).await {
+                                Ok(serve) => Ok(Some(serve)),
+                                Err(e) => manager_word(e.into()).await,
+                            },
+                            Ok(None) => Ok(None),
+                            Err(e) => manager_word(e).await,
+                        };
                     }
-                    return Err(e.into());
+                    return manager_word(e.into()).await;
                 };
                 if self.tokens_reader.get().is_some() || !joined {
                     return Err(e.into());
@@ -3712,6 +3745,23 @@ impl KvMetaBackend {
             crate::slot_lease_core::Resolved::Unleased { .. } if joined => 0,
             crate::slot_lease_core::Resolved::Unleased { .. } => return Ok(None),
         };
+        // F2 at the lease's own home: a lessee the S6 owner lists DEAD is
+        // never dialed — the retryable class until the recovery makes the
+        // slot this manager's (`slot_resolve_dead_redirects`).
+        if holder != 0 && !self.foreign_slot_holder_live(holder) {
+            if let Some(h) = self.tokens_holder.get() {
+                h.note_dead_redirect();
+            }
+            return Err(KvError::Io(crate::error::SqueezefsError::refused(
+                libc::EAGAIN,
+                format!(
+                    "{}: object {object}'s slot is leased to appender {holder}, which the \
+                     membership owner lists DEAD — its slots are the recovery's within the \
+                     ledger poll; retry (slot_resolve_dead_redirects)",
+                    self.path.display()
+                ),
+            )));
+        }
         crate::data_grant::foreign_read_plane(self, object, holder)
             .await
             .map_err(KvError::Io)
@@ -4386,6 +4436,27 @@ impl KvMetaBackend {
                 Some(0)
             }
             _ => None,
+        }
+    }
+
+    /// **Is foreign lessee `holder` LIVE?** (PR 12b round 3, F2): `false`
+    /// when the installed S6 owner no longer lists its member id inside
+    /// `T_owner` (dead — its slots are the recovery's within the poll) or
+    /// the lease table already holds one of its slots mid-recovery; `true`
+    /// when nothing says otherwise (no owner installed, the member id not
+    /// yet learnt — the redirect is followed, ONE bounded dial). A
+    /// redirect to a dead holder parked the storm leg's reader for 24
+    /// minutes behind an address nobody answered at.
+    pub fn foreign_slot_holder_live(&self, holder: u32) -> bool {
+        let Some(plane) = self.slot_leases() else {
+            return true;
+        };
+        let Some(member) = plane.holders.member_id(holder) else {
+            return true;
+        };
+        match crate::membership::installed_owner() {
+            Some(owner) => owner.member_is_live(&member),
+            None => true,
         }
     }
 

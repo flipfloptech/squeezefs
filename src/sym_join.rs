@@ -771,6 +771,13 @@ pub async fn bind_live_appender_endpoints(meta: &Arc<RoutedMetaBackend>) -> usiz
             continue;
         };
         for (appender_id, page) in live {
+            plane.holders.set_member_id(
+                appender_id,
+                &crate::cowriter::node_member_id_of(
+                    page.identity.node_token,
+                    page.identity.mount_slot,
+                ),
+            );
             if let Some(endpoint) = resolve_holder_endpoint_from(page, &set) {
                 plane.holders.set_endpoint(appender_id, &endpoint);
                 bound += 1;

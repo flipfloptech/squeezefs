@@ -611,6 +611,11 @@
 # Requires: root, a live fleet (sudo tests/mw_fleet.sh create N=2), python3.
 
 set -euo pipefail
+# A `set -e` exit is never SILENT (PR 12b round 3: a `sym-storm` round
+# died between its fsck and its row with rc 1 and no line — a `.stats`
+# read inside a `$(stat_sum …)` assignment failed and the leg ended with
+# nothing naming it). Every non-zero exit names its line and command.
+trap 'rc=$?; [ "$rc" = "0" ] || echo "[mwmatrix] ERROR: exit $rc at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SQZ="${SQZ_BIN:-$REPO/target/release/squeezefs}"
@@ -3279,8 +3284,10 @@ sym_crash_round_asserts() { # round rowdir
         # fix the joiner's grant sink and free target kept the dead
         # manager's endpoint for the mount's life (the 7-byte inline mark
         # hid it). `dd conv=fsync`: the acked-writes oracle's own shape.
-        local grants0 striped0 shipped0 served0 sum
+        local grants0 striped0 shipped0 served0 sum topups0 topups remaining
         grants0="$(stat_sum 0 block_grants)"
+        topups0="$(stat_sum "$j" block_grant_topups)"
+        remaining="$(stat_sum "$j" block_grant_window_remaining)"
         striped0="$(stat_sum "$j" layout_striped_writes)"
         shipped0="$(stat_sum "$j" meta_ship_publish.free_shipped_blocks)"
         served0="$(stat_sum 0 meta_ship_publish.free_served_blocks)"
@@ -3294,9 +3301,24 @@ sym_crash_round_asserts() { # round rowdir
         v="$(stat_sum "$j" layout_striped_writes)"
         [ "$v" -gt "$striped0" ] 2>/dev/null ||
             die "round $round: joined writer m$j layout_striped_writes=$v (was $striped0) — the post-failover write never went striped"
+        # The grant half of "the data plane follows": a write the joiner's
+        # WINDOW still covers asks nothing — the grant the DEAD manager
+        # carved stays the joiner's (the successor's re-hold leaves a live
+        # page's remainder alone, `data_alloc_bitmap_leaks_deferred`), so
+        # the successor's `block_grants` moves only when the joiner asked
+        # a top-up. The arm is judged on the joiner's ASK count (round 3:
+        # round 2's window of 60+ blocks covered the 2-block write and the
+        # successor's flat `block_grants` was read as a lost grant); the
+        # free half below is asked of every round regardless.
+        topups="$(stat_sum "$j" block_grant_topups)"
         v="$(stat_sum 0 block_grants)"
-        [ "$v" -gt "$grants0" ] 2>/dev/null ||
-            die "round $round: the successor's block_grants=$v (was $grants0) — joined writer m$j's post-failover block grant did not land at the SUCCESSOR"
+        if [ "${topups:-0}" -gt "${topups0:-0}" ] 2>/dev/null; then
+            [ "$v" -gt "$grants0" ] 2>/dev/null ||
+                die "round $round: joined writer m$j asked $((topups - topups0)) block grant(s) after the failover and the successor's block_grants=$v (was $grants0) — the ask never landed at the SUCCESSOR"
+            log "round $round: joined writer m$j's post-failover block grant landed at the successor (block_grants $grants0 → $v)"
+        else
+            log "round $round: joined writer m$j's window ($remaining blocks, granted before the failover) covered its post-failover write — no ask; the free half proves the venue"
+        fi
         [ "$(sha256sum <"$(mnt_of 0)/after-failover-r$round-m$j/striped.bin" | cut -d' ' -f1)" != "$sum" ] ||
             die "round $round: the successor reads joined writer m$j's PRE-rewrite bytes (the rewrite was not published?)"
         [ "$(stat -c %s "$(mnt_of 0)/after-failover-r$round-m$j/striped.bin")" = "$((5 * 1024 * 1024))" ] ||
@@ -3320,7 +3342,7 @@ sym_crash_round_asserts() { # round rowdir
         v="$(stat_sum "$j" meta_ship_publish.free_ship_failures)"
         [ "${v:-0}" = "0" ] || die "round $round: joined writer m$j free_ship_failures=$v"
         sym_storm_daemon_asserts "$round" "$j"
-        log "round $round: joined writer m$j followed the failover (redials=$(stat_sum "$j" joined_wire_redials), a striped write granted at the successor, its free served there)"
+        log "round $round: joined writer m$j followed the failover (redials=$(stat_sum "$j" joined_wire_redials), a striped write from its window or a grant at the successor, its free served there)"
     done
     # PR 12b: the successor's §6.8 item-3 bound advances with JOINED
     # writers as members — every member acknowledges the label its grant

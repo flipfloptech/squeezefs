@@ -14315,6 +14315,28 @@ impl SqueezefsFilesystem {
                     metrics.insert("block_grant_blocks".into(), hold(&|s| s.block_grant_blocks));
                     metrics.insert("block_grant_returned".into(), hold(&|s| s.blocks_returned));
                     metrics.insert("block_grant_revoked".into(), hold(&|s| s.grants_revoked));
+                    // The WRITER's window faces (per grant-armed allocator,
+                    // summed): asks issued and blocks still unconsumed. A
+                    // write the window covers asks nothing — the holder's
+                    // `block_grants` moves only on a top-up (PR 12b round
+                    // 3: the `sym-crash` leg's post-failover arm read the
+                    // successor's grants flat while the joiner minted from
+                    // the window the dead manager had granted).
+                    let lane_allocators = self.router.backend_router.lane_allocators();
+                    metrics.insert(
+                        "block_grant_topups".into(),
+                        serde_json::json!(lane_allocators
+                            .iter()
+                            .map(|a| a.block_grant_topups())
+                            .sum::<u64>()),
+                    );
+                    metrics.insert(
+                        "block_grant_window_remaining".into(),
+                        serde_json::json!(lane_allocators
+                            .iter()
+                            .map(|a| a.block_grant_remaining())
+                            .sum::<u64>()),
+                    );
                     metrics.insert(
                         "data_alloc_bitmap_set_bits".into(),
                         hold(&|s| s.bitmap_set_bits),

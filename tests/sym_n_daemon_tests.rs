@@ -719,6 +719,111 @@ async fn a_dead_joiners_region_is_recovered_by_the_manager_and_a_third_daemon_ta
     fsck_clean(&uris).await;
 }
 
+/// **A rejoined identity's FRESH region is never recovered under its
+/// predecessor's death record** (PR 12b round 3, F7 — PR 10 review round
+/// 3's stated obligation for PR 12, Issue 25, met in-shard by the storm
+/// leg: the victim's region was recovered and RELEASED, the same identity
+/// remounted 16 s later and `JoinAppender` reused the Free page (term 2),
+/// and the manager's next ledger poll — the `dead_member:` record still
+/// standing, the member not yet re-listed live (its membership join is
+/// the ladder's rung 3, AFTER the open) — RECOVERED the live rejoiner's
+/// fresh region: `RECOVERING appender 1 (term 2) … 0 window entries
+/// replayed`, its page left `Recovered`, the joiner's own region open
+/// refusing `the manager's reply and the directory disagree`; the remount
+/// FAILED). The law: the join IS the identity's newer incarnation — the
+/// manager retires its standing death record at volume 0 BEFORE any page
+/// goes Live under it, so a poll that reads the fresh Live page re-reads
+/// the record and finds it gone. Here: kill → record → recover → release
+/// → the same identity rejoins → the poll's body runs → nothing recovered,
+/// the page `Live`, the record retired, the rejoiner writes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejoined_identitys_fresh_region_is_never_recovered_under_its_predecessors_death_record()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+
+    let joiner = join(&uris, &venue, &mvol, 5).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let id = jvol.appender_stats().unwrap().appender_id;
+    let identity = jvol.joined_wire().unwrap().identity;
+    let files = create_files(&joiner, shared, "x", 16).await;
+    drop(jvol);
+    drop(joiner);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+
+    // The death: recorded, recovered, and the region RELEASED (page Free)
+    // by the next projection — the storm leg's shape.
+    assert!(!mvol.record_death_with_key(identity, 9, 0).await.unwrap());
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert!(rep.regions_released >= 1, "{rep:?}");
+    assert_eq!(
+        page_of(&uris[0], &mvol, id).await.map(|p| p.state),
+        Some(AppenderState::Free)
+    );
+    assert!(
+        mvol.dead_member_record(&identity).await.unwrap().is_some(),
+        "the record stands until a retirement arm runs"
+    );
+    assert_all_resolve(&manager, shared, &files).await;
+
+    // The same identity REJOINS (a fresh region — the Free page reused).
+    let back = join(&uris, &venue, &mvol, 5).await;
+    let bvol = Arc::clone(&back.volumes[0]);
+    let bs = bvol.appender_stats().unwrap();
+    assert_eq!(bs.self_recoveries, 0, "a Recovered ring is never rejoined");
+    let bid = bs.appender_id;
+    let bpage = page_of(&uris[0], &mvol, bid)
+        .await
+        .expect("the rejoiner's page");
+    assert_eq!(bpage.state, AppenderState::Live);
+    assert_eq!(bpage.identity.node_token, identity.node_token);
+    assert_eq!(bpage.identity.mount_slot, identity.mount_slot);
+    assert!(
+        mvol.dead_member_record(&identity).await.unwrap().is_none(),
+        "the join retired the identity's death record — it is the newer incarnation"
+    );
+
+    // The poll's body right after the join (the storm leg's schedule):
+    // nothing is recovered, the fresh page stays Live.
+    let recoveries0 = recovery_stats().recoveries;
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(
+        rep.recovered(),
+        0,
+        "the live rejoiner's fresh region was RECOVERED under its predecessor's record: {rep:?}"
+    );
+    assert_eq!(recovery_stats().recoveries, recoveries0);
+    assert_eq!(
+        page_of(&uris[0], &mvol, bid).await.map(|p| p.state),
+        Some(AppenderState::Live)
+    );
+    // The rejoiner writes on and every record reads everywhere.
+    let more = create_files(&back, shared, "y", 8).await;
+    assert_all_resolve(&back, shared, &more).await;
+    assert_all_resolve(&back, shared, &files).await;
+    assert_must_stay_zero(&bvol, "rejoiner");
+    assert_must_stay_zero(&mvol, "manager");
+
+    shutdown(&back).await;
+    drop(bvol);
+    drop(back);
+    assert_all_resolve(&manager, shared, &more).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
 /// One daemon's storm into `dir`: `n` creates, every other one renamed
 /// (a `Delta` on the moved inode + two dentry records), every fourth one
 /// unlinked — the record shapes a replay must fold in seq order. Returns

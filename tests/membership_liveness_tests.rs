@@ -887,3 +887,170 @@ async fn a_refused_reclaim_lands_at_the_successor_the_observation_names() {
     arm.disarm().await;
     succ_plane.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// 6. A custody renewal at a DEAD authority paces its dials at the cadence
+//    law and fences at T_self from the LAST success — never a 25 ms storm
+// ---------------------------------------------------------------------------
+
+/// **The custody twin of contract 5** (symmetric PR 12b review round 3,
+/// Issue 22 — the `sym-crash` legs' per-holder renewal after a manager
+/// failover, an UNARMED S9 surface the shipped co-writer shares): a failed
+/// renewal retried after a fixed 25 ms sleep, so a dead authority was
+/// dialed ≈ 80 times a second (two dials per attempt — the verb's one
+/// reconnect-and-resend) for the whole `T_self` window, with two log lines
+/// per attempt. The S9 fence law itself was right — `T_self` from the
+/// LAST successful renewal — and stays byte-identical; what changes is the
+/// retry's PACE: the cadence law over the window left to `T_self`
+/// (`clamp(remaining / 3, floor, one cadence)`), so a dead venue is dialed
+/// a handful of times before the fence, never a storm.
+///
+/// The venue is the authority's OWN address after its listener died — a
+/// raw acceptor counts every dial and closes each socket at once (the
+/// handshake fails without a challenge, the shape of a daemon that died
+/// and a successor that answers elsewhere).
+///
+/// RED against the 25 ms sleep: ≈ 100 dials inside the 1.3 s `T_self`
+/// window (the bound below admits ≤ 30).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_custody_renewal_at_a_dead_authority_paces_its_dials_and_fences_at_t_self() {
+    let _serial = serial();
+    let _restore = restore();
+    let clocks = short_clocks();
+    let t_self_ms = clocks.t_self.as_millis() as u64;
+    let cadence_ms = clocks.renew_interval.as_millis() as u64;
+    let term = squeezefs::dlm::durable_term();
+    let owner = WriteCustodyOwner::arm(
+        "authority-dies",
+        term + 1,
+        term,
+        clocks.clone(),
+        LeaseClock::monotonic(),
+        None,
+    )
+    .expect("the custody authority arms");
+    let router = data_grant::AsyncVerbRouter::new().with_custody(Arc::clone(&owner));
+    let cfg = cw::RpcListenerConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("literal addr"),
+        service_threads: 2,
+        ..cw::RpcListenerConfig::default()
+    };
+    let listener = cw::RpcListener::start_async(cfg, SECRET.to_vec(), Arc::new(router))
+        .expect("the authority listens");
+    let addr = listener.endpoint();
+    let client = WriteCustodyClient::connect_with_clock(
+        &addr.to_string(),
+        SECRET,
+        "node-outlives-its-authority",
+        LeaseClock::monotonic(),
+        0,
+    )
+    .await
+    .expect("the co-writer joins");
+    let stop = Arc::new(AtomicBool::new(false));
+    let renewals_before = data_grant::stats().renewals;
+    let fences_before = data_grant::stats().self_fences;
+    assert!(
+        !squeezefs::data_custody::poisoned(),
+        "the fixture starts unpoisoned"
+    );
+    squeezefs::cowriter::spawn_custody_renewal(Arc::clone(&client), Arc::clone(&stop));
+
+    // The loop lands its first heartbeat on the live authority.
+    let alive_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while data_grant::stats().renewals == renewals_before {
+        assert!(
+            std::time::Instant::now() < alive_deadline,
+            "the custody renewal loop must land its first heartbeat on a healthy host"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let last_success = std::time::Instant::now();
+
+    // The authority dies at its address; a raw acceptor at the SAME
+    // address counts every dial and closes it at once.
+    listener.shutdown();
+    drop(listener);
+    let acceptor = {
+        let bind_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::net::TcpListener::bind(addr) {
+                Ok(l) => break l,
+                Err(e) => {
+                    assert!(
+                        std::time::Instant::now() < bind_deadline,
+                        "the dead authority's address must be re-bindable: {e}"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    };
+    let dials = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let accepting = Arc::new(AtomicBool::new(true));
+    let acceptor_thread = {
+        let dials = Arc::clone(&dials);
+        let accepting = Arc::clone(&accepting);
+        acceptor
+            .set_nonblocking(true)
+            .expect("a non-blocking acceptor");
+        std::thread::spawn(move || {
+            while accepting.load(Ordering::Acquire) {
+                match acceptor.accept() {
+                    Ok((sock, _)) => {
+                        dials.fetch_add(1, Ordering::Relaxed);
+                        drop(sock);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+
+    // The loop retries until its OWN deadline, then fences — the S9 law:
+    // `T_self` from the LAST successful renewal, never from a failed dial.
+    // A set authority's lease is the whole mount's custody, so its fence
+    // is the process POISON (the shipped terminal fence for this scope).
+    let fence_deadline = last_success + Duration::from_millis(t_self_ms + 2 * cadence_ms + 500);
+    while !squeezefs::data_custody::poisoned() {
+        assert!(
+            std::time::Instant::now() < fence_deadline,
+            "a co-writer whose authority died must reach the §6.7 self-fence at T_self \
+             ({t_self_ms} ms) — the paced retry never weakens the fence (dials so far: {})",
+            dials.load(Ordering::Relaxed)
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let fenced_after = last_success.elapsed();
+    accepting.store(false, Ordering::Release);
+    acceptor_thread.join().expect("the acceptor thread");
+    stop.store(true, Ordering::Release);
+
+    assert_eq!(
+        data_grant::stats().self_fences - fences_before,
+        1,
+        "the fence fires exactly once (the S9 terminal fence for the set authority's lease)"
+    );
+    assert!(
+        fenced_after >= Duration::from_millis(t_self_ms.saturating_sub(cadence_ms + 100)),
+        "the fence is T_self from the last successful renewal ({t_self_ms} ms) — never \
+         earlier because a dial failed (fenced {fenced_after:?} after the last success)"
+    );
+    let dialed = dials.load(Ordering::Relaxed);
+    assert!(
+        dialed >= 2,
+        "the loop retried the dead venue before its deadline (dials: {dialed})"
+    );
+    // Two dials per attempt (the verb's one reconnect-and-resend), attempts
+    // no closer than the 100 ms pace floor across the T_self window, plus
+    // the first failed cadence tick and the fencing attempt.
+    let bound = 2 * (t_self_ms / 100 + 2);
+    assert!(
+        dialed <= bound,
+        "a dead authority is dialed at the cadence law over the window left to T_self, \
+         never a 25 ms storm: {dialed} dials in {fenced_after:?} (bound {bound})"
+    );
+}

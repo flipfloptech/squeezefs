@@ -2090,3 +2090,158 @@ impl Drop for ClearOverride {
         }
     }
 }
+
+/// **A dead joiner's root, swapped into an extent the MANAGER once
+/// retired, is recovered whole** (the `sym-storm` fleet leg's class — 84
+/// of a dead joiner's 1,300 acked files absent at the manager, four of
+/// its slot trees; found RED here by the fixture: the recovery FAILED with
+/// "node … is a retired extent (stale pointer outside a traversal)"). The
+/// node cache's `retired` veto — an extent this mount retired stays dead
+/// until THIS mount publishes a node there — is a one-writer law: under
+/// the plane a retired extent returns to the heap and is GRANTED to a
+/// joiner, whose node there the manager must read back at the joiner's
+/// death (and at every transfer). The carve un-retires what it hands out
+/// (`NodeCache::unretire_extent`); a joiner's `ReturnExtents` does the
+/// same for its projection. The shape: the manager swaps its root 120
+/// times (120 retired extents, freed, back in the heap), releases the
+/// slot; the joiner acquires it, grows it, swaps ITS root (into one of
+/// those extents — its grant carves lowest-free-first), checkpoints
+/// (the records live under its page root alone), dies; the manager
+/// recovers every flushed record and its own. KD-SYM-3's page-root rule
+/// (by generation, never node seq) rides the same path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_joiners_root_swapped_into_an_extent_the_manager_once_retired_is_recovered_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+
+    // The joiner opens FIRST: its node-seq handle starts at the ledger's
+    // watermark of this instant and advances by ITS mints alone.
+    let joiner = join(&uris, &venue, &mvol, 3).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let id = jvol.appender_stats().unwrap().appender_id;
+    let identity = jvol.joined_wire().unwrap().identity;
+
+    // The MANAGER grows the slot's tree (first touch, many mints — its
+    // seqs run far past the joiner's watermark), flushes it and RELEASES
+    // the slot: tree 0's `Unleased { root }` names a manager-minted root.
+    let managers = create_files(&manager, shared, "m", 1_500).await;
+    mvol.checkpoint_now().await.unwrap();
+    // The manager's handle runs AHEAD of the joiner's: a long-lived
+    // manager mints node seqs at every SMO of every tree it maintains —
+    // here its own root swapped 120 times (the D4 nudge), a checkpoint
+    // between each dozen to keep the grant and the reserve honest.
+    for i in 0..120 {
+        let root = mvol.slot_tree(SLOT_A).expect("the slot's tree").root();
+        let n = mvol
+            .defrag_compact_nodes(&[(0, root.addr)])
+            .await
+            .expect("the manager compacts its root");
+        assert_eq!(n, 1, "root swap {i}");
+        if i % 12 == 11 {
+            mvol.checkpoint_now().await.unwrap();
+        }
+    }
+    mvol.checkpoint_now().await.unwrap();
+    mvol.release_slot_handover(0, SLOT_A)
+        .await
+        .expect("the manager releases the slot it grew");
+    // The release is a ring-0 control entry; the joiner's projection is
+    // keyed on the ledger seq, so the manager's next checkpoint is what
+    // lets the joiner see the slot unleased.
+    mvol.checkpoint_now().await.unwrap();
+    let record_root = match tree0_state(&mvol, SLOT_A).await {
+        Some(SlotState::Unleased { root, .. }) => root,
+        other => panic!("{other:?}"),
+    };
+
+    // The JOINER acquires it at g + 1 (first touch), grows it enough to
+    // SPLIT (a root move — an append alone leaves the root pointer where
+    // it was) and CHECKPOINTS: its records leave its window and live under
+    // its page root alone — a root whose seq is BELOW the record's.
+    jvol.refresh_control_projection().await.unwrap();
+    let flushed = create_files(&joiner, shared, "j", 400).await;
+    // The root MOVES under the joiner's own SMO (the D4 compaction nudge
+    // = `smo_replace` on the root: a root swap in ITS ring under ITS
+    // grant, the fleet's shape where the joiner's flush pass compacted a
+    // leaf the manager had grown), then its checkpoint publishes it.
+    // (The nudge draws on the region's grant, which the flush pass's
+    // cadence refills — one checkpoint first.)
+    jvol.checkpoint_now().await.unwrap();
+    let root_before = jvol.slot_tree(SLOT_A).expect("the slot's tree").root();
+    let compacted = jvol
+        .defrag_compact_nodes(&[(0, root_before.addr)])
+        .await
+        .expect("the joiner compacts its own root");
+    assert_eq!(compacted, 1, "the root was compacted (a root swap)");
+    jvol.checkpoint_now().await.unwrap();
+    let page = page_of(&uris[0], &mvol, id)
+        .await
+        .expect("the joiner's page");
+    let page_root = page
+        .slots
+        .iter()
+        .find(|e| {
+            squeezefs::meta_backend::kv::appender::forest_slot_of_page_slot(
+                e.slot,
+                mvol.appender_stats().unwrap().native_slot,
+            ) == SLOT_A
+        })
+        .map(|e| e.root)
+        .expect("the page names the slot's root");
+    assert_ne!(
+        page_root, record_root,
+        "the fixture's premise: the joiner's own SMO MOVED the root"
+    );
+    // In ONE process the two handles cannot be pulled apart: every install
+    // of a manager root at the joiner (its projection refresh, the grant's
+    // transfer barrier) RAISES its handle to that root's seq, so its later
+    // mints always sit above the record's — the seq rule and the
+    // generation rule coincide here, and the rule's RED venue was the
+    // fleet (two processes, two handles). What this pin holds is the path:
+    // a joiner's own root swap in its ring under its grant, flushed under
+    // its page root alone, recovered whole by the manager.
+    let g_lease = match tree0_state(&mvol, SLOT_A).await {
+        Some(SlotState::Leased { g, appender_id, .. }) => {
+            assert_eq!(appender_id, id);
+            g
+        }
+        other => panic!("{other:?}"),
+    };
+
+    // The joiner dies; the ledger names it; the manager recovers it.
+    drop(jvol);
+    drop(joiner);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    assert!(!mvol.record_death_with_key(identity, 9, 0).await.unwrap());
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    match tree0_state(&mvol, SLOT_A).await {
+        Some(SlotState::Unleased { g, root, .. }) => {
+            assert_eq!(g, g_lease);
+            assert_eq!(
+                root, page_root,
+                "the recovered slot stands at the dead lessee's PAGE root (KD-SYM-3), not the \
+                 grant-time root a seq comparison preferred"
+            );
+        }
+        other => panic!("tree 0 after recovery: {other:?}"),
+    }
+    // Every flushed record of the dead joiner AND every manager record it
+    // inherited resolve at the manager.
+    assert_all_resolve(&manager, shared, &flushed).await;
+    assert_all_resolve(&manager, shared, &managers).await;
+    assert_must_stay_zero(&mvol, "manager");
+
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}

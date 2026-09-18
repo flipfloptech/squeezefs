@@ -2878,6 +2878,22 @@ impl NodeCache {
         (addr - self.cfg.heap_base) / self.cfg.layout.node_size() as u64
     }
 
+    /// **An extent leaves this mount's custody** (symmetric PR 12b): the
+    /// `retired` veto — "a node this mount retired stays dead until this
+    /// mount publishes a node there" — is a ONE-writer law. Under the
+    /// plane a retired extent returns to the heap and is GRANTED to another
+    /// appender, whose node there this mount must read back: at a slot
+    /// transfer, at the dead appender's recovery, in a projection. The
+    /// `sym-storm` fleet leg: the manager's own root swaps had retired the
+    /// extents it later granted a joiner; at the joiner's death the veto
+    /// made four of its slot trees unreadable, their extents censused as
+    /// reached-by-no-root and RETURNED — 84 acked files gone. Called at
+    /// every carve that hands `extent` out; a pointer into the extent's
+    /// previous life is still caught by the §4.2 `node_seq` check.
+    pub fn unretire_extent(&self, extent: u64) {
+        self.retired.remove_sync(&self.extent_addr(extent));
+    }
+
     /// Current durable journal tail (§4.6 pt 2's checkpoint output; a test
     /// / K6b input here).
     pub fn durable_tail(&self) -> u64 {

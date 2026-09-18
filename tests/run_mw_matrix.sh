@@ -337,10 +337,28 @@
 #                       fsck_unrecovered_appenders, appender_park_expiries
 #                       all 0), the manager lease `held`, and the FULL
 #                       online fsck with the C8 oracle clean (C14/C15 ride
-#                       it). A foreign appender's recovery (the ledger's
-#                       driver over the wire) needs N daemons on one
-#                       volume — PR 12's venue; the in-process matrix is
+#                       it). On a `--writers=K` fleet (PR 12b) every
+#                       JOINED WRITER must survive the manager's death and
+#                       follow the SUCCESSOR (joined_wire_redials ≥ 1, its
+#                       post-failover writes land and are read by the
+#                       successor). The in-process matrix is
 #                       tests/sym_crash_matrix_tests.rs.
+#   sym-storm [--rounds=N]  (symmetric PR 12b — needs `mw_fleet.sh create
+#                       --symmetric --writers=K` with K ≥ 2, a short
+#                       --lease-ttl-ms) THE N-DAEMON ROW: the manager and
+#                       every joined writer run the acked-writes oracle at
+#                       once (per-file `dd conv=fsync`, a ledger of names
+#                       whose fsync RETURNED); at a randomized phase ONE
+#                       JOINER is killed -9; the manager's S6 eviction
+#                       records its death past the lease TTL and the
+#                       ledger poll RECOVERS its region (PR 10's driver on
+#                       a real second daemon — appender_recoveries +1);
+#                       every acked name of every writer is then present
+#                       with content at the manager AND at a surviving
+#                       joiner; the victim remounts into a FRESH region
+#                       (§5.8.3, appender_self_recoveries 0) and reads
+#                       every name; fsck clean; the symmetric must-stay-0
+#                       set flat on every daemon. COUNTED-RESTART applies.
 #   s9-fanout [--mb=M]  (rung 10 — needs --multi-writer --cowriters=K;
 #                       design row S9-a) THE FAN-OUT ROW: K co-writers +
 #                       the authority writing DATA concurrently — the
@@ -2801,6 +2819,191 @@ leg_sym_crash() {
     s7_kill_body sym
 }
 
+# The joined-writer member indices of a symmetric fleet (PR 12b —
+# `mw_fleet.sh create --symmetric --writers=K`; empty on the one-appender
+# shape).
+joiner_idxs() {
+    awk -F'\t' '$2=="joiner" {print $1}' "$MEMBERS" 2>/dev/null | sort -n
+}
+
+# One acked-writes oracle writer (the s7 kill body's, made a function so
+# the N-daemon legs run one per writer mount): per-file `dd conv=fsync`
+# into `dir`, every name whose fsync RETURNED appended to `ledger`; runs
+# until killed. Content `<tag>:<i>`.
+ack_writer() { # dir ledger tag
+    local dir="$1" ledger="$2" tag="$3" i f
+    mkdir -p "$dir"
+    : >"$ledger"
+    i=0
+    while :; do
+        f="$dir/f$(printf '%06d' "$i")"
+        if printf '%s:%s\n' "$tag" "$i" | dd of="$f" conv=fsync status=none 2>/dev/null; then
+            echo "$f" >>"$ledger"
+        fi
+        i=$((i + 1))
+    done
+}
+
+# The oracle's verdict over one ledger, read through `read_mnt` (a path
+# under `orig_mnt` is re-rooted): every acked name present with content.
+# Prints the lost count; the misses go to `lostfile`.
+ack_verify() { # ledger tag orig_mnt read_mnt lostfile
+    local ledger="$1" tag="$2" orig="$3" read_mnt="$4" lostfile="$5" f g want got lost=0
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        g="$read_mnt${f#"$orig"}"
+        if [ ! -f "$g" ]; then
+            lost=$((lost + 1))
+            echo "LOST (absent): $g" >>"$lostfile"
+            continue
+        fi
+        want="$tag:$((10#${f##*/f}))"
+        got="$(cat "$g" 2>/dev/null || true)"
+        if [ "$got" != "$want" ]; then
+            lost=$((lost + 1))
+            echo "LOST (content '$got' != '$want'): $g" >>"$lostfile"
+        fi
+    done <"$ledger"
+    echo "$lost"
+}
+
+# **sym-storm (PR 12b)**: every RW daemon of the symmetric fleet — the
+# manager and K joined writers — runs the acked-writes oracle into its
+# own directory at once; at a randomized phase ONE JOINER is killed -9;
+# the manager's S6 eviction records its death after the lease TTL, the
+# ledger poll RECOVERS its region (its ring replayed into the slot trees,
+# its slots unleased — PR 10's driver on a REAL second daemon); every
+# acked name of every writer is then present with content at the manager
+# AND at a surviving joiner (the dead writer's through the recovery, the
+# live writers' through their holders' tokens); the killed writer
+# remounts at the same point and joins a FRESH region (§5.8.3 — a
+# Recovered ring is never rejoined), reading every name too; online
+# fsck clean; the symmetric must-stay-0 set flat on every daemon. Per
+# round; COUNTED-RESTART discipline applies.
+leg_sym_storm() {
+    require_symmetric
+    local joiners victim survivors m_mnt rowdir round ttl_ms phase_ms
+    mapfile -t joiners < <(joiner_idxs)
+    [ "${#joiners[@]}" -ge 2 ] ||
+        die "sym-storm needs a symmetric fleet with ≥ 2 joined writers — create it with: sudo tests/mw_fleet.sh create N=2 --symmetric --writers=3 --lease-ttl-ms=15000"
+    m_mnt="$(mnt_of 0)"
+    rowdir="$STATE/rows/symstorm-$(date +%s)"
+    mkdir -p "$rowdir"
+    ttl_ms="$(stat_field 0 membership_lease_ttl_ms)"
+    log "sym-storm: ${#joiners[@]} joined writer(s) + the manager write under the acked-writes oracle; one joiner killed -9 per round, recovered by the manager's ledger (lease TTL ${ttl_ms} ms); x$S7_ROUNDS rounds"
+    printf '%-6s %-9s %-8s %-10s %-10s %-8s %s\n' ROUND PHASE_MS VICTIM RECOVER_S ACKED LOST VERDICT | tee "$rowdir/matrix.tsv"
+    for ((round = 1; round <= S7_ROUNDS; round++)); do
+        victim="${joiners[$(((round - 1) % ${#joiners[@]}))]}"
+        survivors=()
+        local j
+        for j in "${joiners[@]}"; do
+            [ "$j" = "$victim" ] || survivors+=("$j")
+        done
+        # The writers: one oracle per RW mount (the manager's is m0's).
+        local pids=() idx dir ledger
+        for idx in 0 "${joiners[@]}"; do
+            dir="$(mnt_of "$idx")/storm-w$idx-r$round"
+            ledger="$rowdir/acked-w$idx-r$round.ledger"
+            ack_writer "$dir" "$ledger" "w$idx:r$round" &
+            pids+=($!)
+        done
+        phase_ms=$((2000 + RANDOM % 6000))
+        sleep "$(python3 -c "print($phase_ms/1000)")"
+        local recov0 t_kill t_rec
+        recov0="$(stat_sum 0 appender_recoveries)"
+        "$MWFLEET" kill "$victim" --sig 9
+        t_kill="$(date +%s)"
+        # Stop every oracle (the victim's died with its daemon; the ledger
+        # holds what was ACKED).
+        for p in "${pids[@]}"; do
+            kill -9 "$p" 2>/dev/null || true
+            wait "$p" 2>/dev/null || true
+        done
+        umount -l "$(mnt_of "$victim")" 2>/dev/null || true
+        wait_for_unmounted "$(mnt_of "$victim")"
+        # The recovery: the S6 eviction past the lease TTL, the record, the
+        # poll's projection — bounded by TTL + the recovery bound + slack.
+        local bound_ms deadline
+        bound_ms="$(stat_sum 0 appender_recovery_bound_ms)"
+        deadline=$(((ttl_ms + bound_ms) / 1000 + 90))
+        local t0 now v
+        t0="$(date +%s)"
+        while :; do
+            v="$(stat_sum 0 appender_recoveries)"
+            [ "$v" -gt "$recov0" ] 2>/dev/null && break
+            now="$(date +%s)"
+            [ $((now - t0)) -lt "$deadline" ] ||
+                die "round $round: the manager never recovered joiner $victim's region (appender_recoveries $recov0 → $v within ${deadline}s; dead_members_recorded=$(stat_sum 0 dead_members_recorded))"
+            sleep 1
+        done
+        t_rec="$(date +%s)"
+        log "round $round: joiner $victim's region RECOVERED by the manager $((t_rec - t_kill)) s after the kill (appender_recoveries $recov0 → $v)"
+        # The oracle at the MANAGER and at one survivor, over EVERY writer's
+        # ledger (the victim's names through the recovery).
+        local acked=0 lost=0 n l
+        for idx in 0 "${joiners[@]}"; do
+            ledger="$rowdir/acked-w$idx-r$round.ledger"
+            n="$(wc -l <"$ledger" | tr -d ' ')"
+            acked=$((acked + n))
+            l="$(ack_verify "$ledger" "w$idx:r$round" "$(mnt_of "$idx")" "$m_mnt" "$rowdir/lost-r$round.txt")"
+            lost=$((lost + l))
+            l="$(ack_verify "$ledger" "w$idx:r$round" "$(mnt_of "$idx")" "$(mnt_of "${survivors[0]}")" "$rowdir/lost-r$round.txt")"
+            lost=$((lost + l))
+        done
+        [ "$lost" = "0" ] ||
+            die "round $round: ACKED-WRITES ORACLE RED — $lost miss(es) over $acked fsynced file(s) across the manager and joiner ${survivors[0]} (see $rowdir/lost-r$round.txt)"
+        log "round $round: acked-writes oracle GREEN ($acked fsynced file(s) from ${#joiners[@]} joiners + the manager, all present at the manager and at joiner ${survivors[0]})"
+        # The victim remounts: a FRESH region (its Recovered ring is never
+        # rejoined), every name readable there too.
+        "$MWFLEET" mount "$victim" ||
+            die "round $round: joiner $victim's remount FAILED"
+        v="$(stat_sum "$victim" appender_self_recoveries)"
+        [ "$v" = "0" ] ||
+            die "round $round: the remounted joiner $victim recovered its own residue ($v) — a Recovered ring was rejoined (§5.8.3)"
+        lost=0
+        for idx in 0 "${joiners[@]}"; do
+            ledger="$rowdir/acked-w$idx-r$round.ledger"
+            l="$(ack_verify "$ledger" "w$idx:r$round" "$(mnt_of "$idx")" "$(mnt_of "$victim")" "$rowdir/lost-r$round.txt")"
+            lost=$((lost + l))
+        done
+        [ "$lost" = "0" ] || die "round $round: the remounted joiner $victim misses $lost acked name(s)"
+        # fsck at the manager; the must-stay-0 set on every daemon.
+        local out
+        out="$("$SQZ" fsck "$m_mnt" 2>&1)" || die "round $round: online fsck FAILED or found:
+$out"
+        echo "$out" >"$rowdir/fsck-r$round.out"
+        echo "$out" | grep -q "findings: 0" || die "round $round: fsck findings != 0:
+$out"
+        sym_storm_daemon_asserts "$round" 0
+        for j in "${joiners[@]}"; do
+            sym_storm_daemon_asserts "$round" "$j"
+        done
+        for idx in 0 "${joiners[@]}"; do
+            rm -rf "$(mnt_of "$idx")/storm-w$idx-r$round" 2>/dev/null || true
+        done
+        printf '%-6s %-9s %-8s %-10s %-10s %-8s %s\n' "$round" "$phase_ms" "m$victim" "$((t_rec - t_kill))" "$acked" 0 GREEN | tee -a "$rowdir/matrix.tsv"
+    done
+    log "sym-storm GREEN: $S7_ROUNDS/$S7_ROUNDS rounds (table + fsck reports in $rowdir)"
+}
+
+# The symmetric must-stay-0 set on one daemon of the N-daemon fleet (the
+# manager's `sym_crash_round_asserts` set plus the Joined family's).
+sym_storm_daemon_asserts() { # round idx
+    local round="$1" idx="$2" k v
+    cat "$(mnt_of "$idx")/.stats" >"$STATE/rows/stats-m$idx-r$round.json" 2>/dev/null || true
+    for k in meta_kv_forest_key_violations appender_fence_breach foreign_frame_overwrite_detected \
+        manager_verb_refusals meta_kv_replay_key_violations meta_kv_replay_lease_violations \
+        meta_kv_replay_extent_violations fsck_slot_custody_conflicts \
+        appender_park_expiries meta_kv_leaf_lease_refusals dlm_token_recall_timeouts_live \
+        appender_flush_ceiling_overruns dead_member_write_deferrals data_alloc_bitmap_drift \
+        joined_control_refusals xv_cross_owner_intents_stuck invariant_tripwires; do
+        v="$(stat_sum "$idx" "$k")"
+        [ "$v" = "0" ] || die "round $round: $k=$v on m$idx (must stay 0)"
+    done
+    [ "$(stat_all_eq "$idx" symmetric_meta 1)" = "1" ] ||
+        die "round $round: symmetric_meta != 1 on every volume of m$idx"
+}
+
 leg_s7_kill_matrix() {
     require_mw
     s7_kill_body
@@ -2982,11 +3185,67 @@ sym_crash_round_asserts() { # round rowdir
         v="$(stat_sum 0 "$k")"
         [ "$v" = "0" ] || die "round $round: $k=$v on the successor (must stay 0)"
     done
-    # The ledger's terms on a one-appender fleet: nothing foreign died, so
-    # the driver recovered nothing and acted on nothing.
+    # The ledger's terms: nothing foreign died (the joiners, if any, are
+    # alive), so the driver recovered nothing and acted on nothing.
     v="$(stat_sum 0 appender_recoveries)"
-    [ "$v" = "0" ] || die "round $round: appender_recoveries=$v on a one-appender fleet (a foreign recovery ran?)"
+    [ "$v" = "0" ] || die "round $round: appender_recoveries=$v (a foreign recovery ran on a fleet whose every other appender is alive?)"
     log "round $round: symmetric successor OK (self_recoveries=$(stat_sum 0 appender_self_recoveries), manager held, tripwires 0)"
+    # PR 12b: every JOINED WRITER survived the manager's death — its next
+    # wire act re-dials the SUCCESSOR's listener (published at its rung 7)
+    # and lands: a create in a fresh directory (a first-touch acquire over
+    # the re-dialed wire), `joined_wire_redials` ≥ 1, its must-stay-0 set
+    # flat, and the successor reads the name it made.
+    local j jm f ttl_ms parked t0
+    ttl_ms="$(stat_field 0 membership_lease_ttl_ms)"
+    for j in $(joiner_idxs); do
+        jm="$(mnt_of "$j")"
+        # /proc/mounts, never `mountpoint -q`: a joiner PARKED at T_self
+        # (PR 8's law while the successor's grace window is not yet
+        # reached) answers its root stat EAGAIN and is very much mounted.
+        grep -q " $jm " /proc/mounts || die "round $round: joined writer m$j is no longer mounted after the manager's death"
+        # The park releases when the reclaim lands at the successor (its
+        # grace window admits it) — within a renewal beat of the
+        # successor's arm; bounded by the lease TTL + the failover bound.
+        t0="$(date +%s)"
+        while :; do
+            parked="$(stat_sum "$j" appender_parked)"
+            [ "${parked:-0}" = "0" ] && break
+            [ $(($(date +%s) - t0)) -lt $((ttl_ms / 1000 + 60)) ] ||
+                die "round $round: joined writer m$j is still PARKED $(($(date +%s) - t0)) s after the successor armed (appender_parked=$parked; its reclaim never landed — membership_reclaim_refusals=$(stat_sum "$j" membership_reclaim_refusals))"
+            sleep 1
+        done
+        f="$jm/after-failover-r$round-m$j"
+        mkdir -p "$f" || die "round $round: joined writer m$j could not create after the manager failover"
+        echo "r$round" >"$f/mark" || die "round $round: joined writer m$j could not write after the manager failover"
+        v="$(stat_sum "$j" joined_wire_redials)"
+        [ "$v" -ge 1 ] 2>/dev/null ||
+            die "round $round: joined writer m$j joined_wire_redials=$v — its wire never re-dialed the successor"
+        [ "$(cat "$(mnt_of 0)/after-failover-r$round-m$j/mark" 2>/dev/null)" = "r$round" ] ||
+            die "round $round: the successor does not read joined writer m$j's post-failover name"
+        sym_storm_daemon_asserts "$round" "$j"
+        log "round $round: joined writer m$j followed the failover (redials=$v, writes land, the successor reads them)"
+    done
+    # PR 12b: the successor's §6.8 item-3 bound advances with JOINED
+    # writers as members — every member acknowledges the label its grant
+    # carried (a joiner at once: its bindings are token-governed; the S5
+    # reader through its ladder). A member that never acks holds the min
+    # at 0 and the manager's every deferred free in the grace ring until
+    # ENOSPC (round 5 of the first run: `free_grace_releases 0`,
+    # `data_alloc_bitmap_population` at the volume). Bounded by two beats.
+    if [ -n "$(joiner_idxs)" ]; then
+        local beat_ms
+        beat_ms="$(stat_field "$(joiner_idxs | head -1)" membership_renew_cadence_ms)"
+        [ -n "$beat_ms" ] && [ "$beat_ms" != "0" ] || beat_ms=10000
+        t0="$(date +%s)"
+        while :; do
+            v="$(stat_sum 0 membership_min_acked_free_epoch)"
+            [ "${v:-0}" -gt 0 ] 2>/dev/null && break
+            [ $(($(date +%s) - t0)) -lt $((3 * beat_ms / 1000 + 15)) ] ||
+                die "round $round: the successor's membership_min_acked_free_epoch is still 0 $(($(date +%s) - t0)) s after its arm — a member never acknowledged a freed-offset label (ack lag: $(stat_field 0 free_grace_member_ack_lag_ms))"
+            sleep 1
+        done
+        log "round $round: the freed-offset epoch fan-in advances with $(joiner_idxs | wc -l) joined writers as members (min_acked_free_epoch=$v)"
+    fi
 }
 
 # --- rung 9: the S8 rows ------------------------------------------------------
@@ -7069,6 +7328,7 @@ s6-vm-fence) leg_s6_vm_fence ;;
 s7-device-fence) leg_s7_device_fence ;;
 s7-kill-matrix) leg_s7_kill_matrix ;;
 sym-crash) leg_sym_crash ;;
+sym-storm) leg_sym_storm ;;
 s8-serial-ab) leg_s8_serial_ab ;;
 s8-crucible) leg_s8_crucible ;;
 s9-fanout) leg_s9_fanout ;;
@@ -7092,5 +7352,5 @@ pv-rand4k-w1) leg_pv_rand4k_w1 ;;
 cowriters-admission) leg_cowriters_admission ;;
 vm-hostscope-validate) leg_vm_hostscope_validate ;;
 vm-multi-identity) leg_vm_multi_identity ;;
-*) die "unknown leg '$LEG' (pv-volume-scaling|smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|sym-crash|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s11-range|s11-subblock|s11-mpiio|s11-blockcyclic|s11-tiny|s11-killrange|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|pv-rewrite-funnel|pv-cross-owner|pv-rand4k-w1|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
+*) die "unknown leg '$LEG' (pv-volume-scaling|smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|sym-crash|sym-storm|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s11-range|s11-subblock|s11-mpiio|s11-blockcyclic|s11-tiny|s11-killrange|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|pv-rewrite-funnel|pv-cross-owner|pv-rand4k-w1|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
 esac

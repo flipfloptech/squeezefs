@@ -1282,15 +1282,30 @@ impl JobWireHost {
         seam: Arc<dyn ShardDeviceSeam>,
     ) -> Result<Arc<Self>> {
         // The session secret: 32 random bytes, durable on ino 1 behind
-        // the reserved-namespace screen.
-        let mut secret = vec![0u8; 32];
-        rand::Rng::fill(&mut rand::thread_rng(), &mut secret[..]);
-        let record =
-            serde_json::json!({ "schema": 1, "secret": cluster_wire::hex_encode(&secret) });
-        fabric
-            .meta_handle()
-            .setxattr(1, JOB_ENROLL_XATTR, record.to_string().as_bytes())
-            .await?;
+        // the reserved-namespace screen. The record is the SET's root of
+        // trust (ruling D2: possession of volume access IS membership) —
+        // it is minted ONCE and REUSED by every later coordinator: a
+        // member outlives a coordinator's incarnation (symmetric PR 12b's
+        // joined writers, an S9 co-writer, an S6 member reader), and every
+        // session it dials the successor with proves the secret it read
+        // at its own arm. Rotating it per mount made every reclaim after a
+        // manager failover `mac invalid` for the member's life (the
+        // sym-crash fleet leg: the joiners parked at `T_self` against a
+        // successor whose grace window would have admitted them).
+        let secret = match read_enroll_secret(fabric.meta_handle()).await {
+            Ok(existing) if existing.len() == 32 => existing,
+            _ => {
+                let mut fresh = vec![0u8; 32];
+                rand::Rng::fill(&mut rand::thread_rng(), &mut fresh[..]);
+                let record =
+                    serde_json::json!({ "schema": 1, "secret": cluster_wire::hex_encode(&fresh) });
+                fabric
+                    .meta_handle()
+                    .setxattr(1, JOB_ENROLL_XATTR, record.to_string().as_bytes())
+                    .await?;
+                fresh
+            }
+        };
 
         // The channel class. S3: a TLS configuration that is not a
         // complete CA pair is REFUSED here (`cluster_wire::tls_acceptor`),

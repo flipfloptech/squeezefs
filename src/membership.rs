@@ -4269,11 +4269,12 @@ fn spawn_member_renewal(
                 Ok(RenewalTick::Fenced) => return,
                 Ok(RenewalTick::RejoinRefused) => refused = true,
                 Ok(
-                    RenewalTick::Renewed
-                    | RenewalTick::Rejoined
-                    | RenewalTick::FencedAndRejoined
-                    | RenewalTick::Parked,
-                ) => refused = false,
+                    RenewalTick::Renewed | RenewalTick::Rejoined | RenewalTick::FencedAndRejoined,
+                ) => {
+                    refused = false;
+                    ack_learned_label_on_a_joined_appender(&client, rendezvous.as_ref());
+                }
+                Ok(RenewalTick::Parked) => refused = false,
                 Err(_) => {
                     // The per-attempt warning the field lacked (finding 2:
                     // >45 s of silence). No fence here — a cancelled
@@ -4290,6 +4291,40 @@ fn spawn_member_renewal(
             }
         }
     })
+}
+
+/// **A JOINED appender acknowledges the freed-offset label a grant carried
+/// at once** (symmetric PR 12b — the `sym-crash` fleet leg: an S5 reader
+/// beside three joiners): the owner's §6.8 item-3 bound is the MIN over
+/// EVERY member, a member that has acknowledged nothing holds it at 0, and
+/// a joined writer runs no S5 pass (it appends to every volume — the
+/// reader ladder is `revalidating_volumes`'s, empty on it), so the
+/// manager's every deferred free sat in the grace ring for the joiners'
+/// lives: `free_grace_releases 0`, the store ENOSPC after four rounds. The
+/// joiner's qualification is STRUCTURAL: its every foreign binding is
+/// token-governed — the freeing publish recalled the token and the ack
+/// (the serve drain + the R-6 purge) preceded the free whose label this
+/// is — and its own frees are its own; the label rides the next renewal.
+/// Only a joined appender (the rendezvous names its home volume): the
+/// manager is an owner, a reader and a co-writer run the S5 ladder.
+fn ack_learned_label_on_a_joined_appender(
+    client: &crate::membership_wire::MemberClient,
+    rendezvous: Option<&(std::sync::Weak<KvMetaBackend>, u64)>,
+) {
+    let Some((home, _)) = rendezvous else {
+        return;
+    };
+    let Some(home) = home.upgrade() else {
+        return;
+    };
+    if !home.is_joined_appender() {
+        return;
+    }
+    let session = client.session();
+    let (label, _) = session.learned_label();
+    if label != 0 {
+        session.ack_free_epoch(label);
+    }
 }
 
 /// The `membership_mode` stats field: `off` (no plane armed — the shipped

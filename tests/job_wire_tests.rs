@@ -1359,3 +1359,38 @@ async fn finished_connection_handles_are_pruned() {
     );
     host.shutdown().await;
 }
+
+/// **The enroll secret is the SET's, not one coordinator incarnation's**
+/// (symmetric PR 12b, the `sym-crash` fleet leg): a member that outlives
+/// the coordinator — a joined writer, an S9 co-writer, an S6 member reader
+/// — dials every session to the successor with the secret it read at its
+/// own arm; a coordinator that re-minted `job:enroll` at every start made
+/// each such session `mac invalid` for the member's life (the joiners
+/// parked at `T_self` against a successor whose grace window would have
+/// admitted their reclaim). The record is minted ONCE and reused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_coordinators_restart_keeps_the_sets_enroll_secret() {
+    let (meta, _mf) = meta_fixture().await;
+    let fab = fabric(&meta, 0).await;
+    let host = JobWireHost::start(
+        Arc::clone(&fab),
+        wire_cfg(30_000, 10_000),
+        FakeShardDevice::new(0, 0),
+    )
+    .await
+    .expect("host start");
+    let first = read_enroll_secret(&meta).await.expect("secret minted");
+    assert_eq!(first.len(), 32);
+    host.shutdown().await;
+
+    let host = JobWireHost::start(fab, wire_cfg(30_000, 10_000), FakeShardDevice::new(0, 0))
+        .await
+        .expect("host restart");
+    let second = read_enroll_secret(&meta).await.expect("secret present");
+    assert_eq!(
+        second, first,
+        "the successor coordinator reuses the set's enroll secret — a member's sessions \
+         dialed with the secret it read at its arm stay valid across the failover"
+    );
+    host.shutdown().await;
+}

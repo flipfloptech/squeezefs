@@ -1560,6 +1560,12 @@ impl KvMetaBackend {
             match out {
                 Ok(_) => {
                     wire.extent_returns.fetch_add(1, Ordering::Relaxed);
+                    // The extents left this mount's custody: the manager
+                    // (or the appender it grants them to next) mints there,
+                    // and this mount's projection must read them back.
+                    for e in &returnable {
+                        self.cache.unretire_extent(*e);
+                    }
                 }
                 Err(e) => {
                     region.grant().restore_returnable(returnable);

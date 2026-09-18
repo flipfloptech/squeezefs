@@ -3549,21 +3549,53 @@ impl KvMetaBackend {
         wants: crate::meta_ship::token_plane::TokenWants,
     ) -> std::result::Result<Option<Option<crate::meta_ship::token_plane::TokenServe>>, KvError>
     {
-        let Some(tokens) = self.token_reader_for(object).await? else {
-            return Ok(None);
+        let joined = self
+            .appenders
+            .as_ref()
+            .is_some_and(|s| s.is_joined_appender());
+        // A JOINED appender whose foreign read cannot reach its holder —
+        // the holder unbound, unreachable, its plane never fresh (PR 12b,
+        // the `sym-storm` fleet leg: a joiner died, the manager recovered
+        // its slots to `Unleased`, and a live joiner kept dialing the DEAD
+        // holder its lease projection named, every read of the recovered
+        // directory `EAGAIN`) — re-projects tree 0 once (keyed on the
+        // ledger seq: the recovery's releases land there at the manager's
+        // next checkpoint) and, when the projection moved, resolves and
+        // reads again through the holder it names now (the manager for an
+        // unleased slot).
+        let tokens = match self.token_reader_for(object).await {
+            Ok(Some(t)) => t,
+            Ok(None) => return Ok(None),
+            Err(e) if joined && self.refresh_control_projection().await? => {
+                log::info!(
+                    "meta volume {}: object {object}'s holder was unreachable ({e}); the lease \
+                     projection moved — resolved again",
+                    self.path.display()
+                );
+                match self.token_reader_for(object).await? {
+                    Some(t) => t,
+                    None => return Ok(None),
+                }
+            }
+            Err(e) => return Err(e),
         };
         match tokens.serve(object, wants).await {
             Ok(serve) => Ok(Some(serve)),
             Err(e) => {
                 let Some(redirect) = crate::meta_ship::token_plane::not_holder_redirect(&e) else {
+                    if joined && self.refresh_control_projection().await? {
+                        if let Some(t) = self.token_reader_for(object).await? {
+                            return t
+                                .serve(object, wants)
+                                .await
+                                .map(Some)
+                                .map_err(KvError::from);
+                        }
+                        return Ok(None);
+                    }
                     return Err(e.into());
                 };
-                if self.tokens_reader.get().is_some()
-                    || !self
-                        .appenders
-                        .as_ref()
-                        .is_some_and(|s| s.is_joined_appender())
-                {
+                if self.tokens_reader.get().is_some() || !joined {
                     return Err(e.into());
                 }
                 log::info!(
@@ -8059,6 +8091,11 @@ impl KvMetaBackend {
             // Nothing carvable fits beside the caller's fragmented
             // remainder: the remainder, verbatim (a return coalesces it).
             return Ok(remainder);
+        }
+        // The extents leave this mount's custody: whatever this mount once
+        // retired there, the grantee's node is what stands next.
+        for e in &claimed {
+            self.cache.unretire_extent(*e);
         }
         let runs = super::slot_state::ExtentGrantRecord::from_extents(claimed.iter().copied()).runs;
         let mut recs: Vec<(u8, Record)> = claimed
@@ -16412,7 +16449,10 @@ impl KvMetaBackend {
                         true,
                     ),
                     SlotState::Leased {
-                        appender_id, root, ..
+                        appender_id,
+                        root,
+                        g,
+                        ..
                     } => {
                         // A LEASED slot's live root is the lessee's page
                         // entry (§5.2.2); the record's grant-time root is
@@ -16441,6 +16481,7 @@ impl KvMetaBackend {
                                 &directory,
                                 native_routing_slot,
                                 appender_id,
+                                g,
                                 slot,
                                 root,
                             ),
@@ -17535,24 +17576,42 @@ impl KvMetaBackend {
                     if slot == super::record::NATIVE_FOREST_SLOT {
                         continue; // the ledger's, mirrored
                     }
+                    // The entry's currency is its GENERATION against tree
+                    // 0's lease of the slot (KD-SYM-3), never a node-seq
+                    // comparison — a page's seqs are its writer's handle's
+                    // (PR 12b: a joiner's and the manager's are two
+                    // spaces): an entry at or above the lease's `g` names
+                    // the live root (the forest open already stands there
+                    // — equal — unless it was written between the two
+                    // reads); one below it is a stale attestation of a
+                    // lease since released (`slot_lease_stale_entries`);
+                    // a slot tree 0 has no record for is this page's alone.
+                    let lease_g = match forest
+                        .control()
+                        .lookup(&super::slot_state::slot_state_key(slot))
+                        .await?
+                        .map(|v| super::slot_state::SlotState::decode(&v))
+                        .transpose()?
+                    {
+                        Some(super::slot_state::SlotState::Leased { g, .. })
+                        | Some(super::slot_state::SlotState::Unleased { g, .. }) => g,
+                        None => 0,
+                    };
+                    let current = e.g >= lease_g;
                     // Both arms raise the node-seq handle to the page's
                     // root seq inside the ONE install (review round 2,
                     // Issue 24 — the recovery driver shares them).
                     let page_root_current = match forest.tree(slot) {
                         Some(t) => {
-                            if e.root.seq > t.root().seq {
+                            if current && e.root != t.root() {
                                 cache.drop_slot_nodes(slot)?;
                                 t.install_recovered_root(e.root, floor).await?;
                                 true
                             } else {
-                                // Equal = the tree already stands at the
-                                // page's root; older = a stale entry (a
-                                // `g 0` attestation of a slot since
-                                // released — `slot_lease_stale_entries`).
-                                e.root.seq == t.root().seq
+                                current
                             }
                         }
-                        None => {
+                        None if current => {
                             let tree = KvTree::open_unpublished_slot_tree(
                                 Arc::clone(cache),
                                 slot,
@@ -17564,6 +17623,7 @@ impl KvMetaBackend {
                             forest.adopt_guest_unpublished(slot, Arc::new(tree));
                             true
                         }
+                        None => false,
                     };
                     // An OWN `Recovering` page (own residue — a recoverer
                     // died mid-way through OUR dead predecessor's region,
@@ -17635,9 +17695,14 @@ impl KvMetaBackend {
                     {
                         continue;
                     }
+                    // The dead lessee's page root, whenever the RAM tree
+                    // stands elsewhere (never a node-seq comparison — the
+                    // lessee's seqs are its own handle's, PR 12b; the
+                    // forest open already chose this root by generation,
+                    // so the arm is the between-two-reads belt).
                     match forest.tree(slot) {
                         Some(t) => {
-                            if se.root.seq > t.root().seq {
+                            if se.root != t.root() {
                                 cache.drop_slot_nodes(slot)?;
                                 t.install_recovered_root(se.root, ledger.journal_tail_seq)
                                     .await?;
@@ -17898,12 +17963,20 @@ impl KvMetaBackend {
     }
 
     /// The live root of LEASED slot `slot`: its lessee's page entry when
-    /// the page names it (newest root seq wins), else the grant-time root
-    /// tree 0 recorded (`recorded`).
+    /// the page names it AT THE LEASE'S GENERATION (`g` — KD-SYM-3: the
+    /// page is written by the lessee's checkpoints strictly after the
+    /// grant), else the grant-time root tree 0 recorded (`recorded`). By
+    /// generation, never by node seq: a joined appender's node seqs are
+    /// its own handle's, the manager's its own (PR 12b — the `sym-storm`
+    /// fleet leg read the manager's grant-time root as "newer" than the
+    /// dead joiner's page root on four of 64 slots and lost every record
+    /// the joiner had flushed there); an entry below `g` is a previous
+    /// lease's stale attestation (`slot_lease_stale_entries`).
     fn leased_root_from_directory(
         directory: &[super::appender::AppenderEntry],
         native_routing_slot: u16,
         appender_id: u32,
+        g: u32,
         slot: super::record::ForestSlot,
         recorded: RootPtr,
     ) -> RootPtr {
@@ -17920,13 +17993,11 @@ impl KvMetaBackend {
                         super::appender::forest_slot_of_page_slot(s.slot, native_routing_slot)
                             == slot
                             && s.root.addr != 0
+                            && s.g >= g
                     })
                     .map(|s| s.root)
             });
-        match from_page {
-            Some(r) if r.seq >= recorded.seq => r,
-            _ => recorded,
-        }
+        from_page.unwrap_or(recorded)
     }
 
     /// The trees whose roots the FIXED LEDGER names: every tree on a flat
@@ -18269,14 +18340,24 @@ impl KvMetaBackend {
                 let root = match super::slot_state::SlotState::decode(v)? {
                     super::slot_state::SlotState::Unleased { root, .. } => root,
                     super::slot_state::SlotState::Leased {
-                        appender_id, root, ..
+                        appender_id,
+                        root,
+                        g,
+                        ..
                     } => {
                         if directory.is_none() {
                             directory =
                                 Some(super::appender::read_directory(&self.path, &self.sb).await?);
                         }
                         let directory = directory.as_deref().unwrap_or(&[]);
-                        Self::leased_root_from_directory(directory, native, appender_id, slot, root)
+                        Self::leased_root_from_directory(
+                            directory,
+                            native,
+                            appender_id,
+                            g,
+                            slot,
+                            root,
+                        )
                     }
                 };
                 if root.addr == 0 || slot == super::record::NATIVE_FOREST_SLOT {

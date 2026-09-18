@@ -5656,8 +5656,29 @@ pub async fn foreign_read_plane(
     // A freshly dialed plane serves nothing until its recall channel's
     // first round lands (`serve_gate`): bounded wait, the serve's own
     // refusal is the honest answer past it.
-    plane.await_channel_fresh().await;
-    Ok(Some(plane))
+    if plane.await_channel_fresh().await {
+        return Ok(Some(plane));
+    }
+    // The channel never freshened: the holder at `endpoint` is dead or
+    // MOVED (the `sym-crash` fleet leg — a manager failover keeps appender
+    // 0's identity and publishes a NEW listener; the plane dialed at the
+    // old one refused every root read of every joiner `EIO` for the
+    // member's life). Re-resolve once: moved ⇒ the stale plane is stopped
+    // dead (its tokens dropped, PR 5's law) and the successor's dialed;
+    // the same address ⇒ the stale plane's own refusal stands.
+    let Some(moved) = Box::pin(crate::sym_join::rebind_holder_endpoint_if_moved(
+        &routed.volumes[v],
+        holder,
+        &endpoint,
+    ))
+    .await
+    else {
+        return Ok(Some(plane));
+    };
+    plane.stop_dead();
+    let (_client, fresh) = arm.holder(&moved, volume).await?;
+    fresh.await_channel_fresh().await;
+    Ok(Some(fresh))
 }
 
 /// **A JOINED appender's custody client at `endpoint`** (symmetric PR

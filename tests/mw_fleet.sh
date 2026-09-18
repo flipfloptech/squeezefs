@@ -213,14 +213,22 @@
 #   create [N|N=<n>] [--cowriters K] [--owners=K] [--vm=V]
 #          [--require-host-scoped-subsys]
 #          [--membership[=auto|addr:port]] [--lease-ttl-ms=N] [--multi-writer]
-#          [--symmetric]
+#          [--symmetric [--writers=K]]
 #                 build substrate + format + records + mount the fleet
 #                 (refuses if state exists — run teardown first); --vm=V
 #                 boots V sqz-kernel guests after the fleet is up;
 #                 --symmetric formats bit 17 (the forest + the appender
 #                 region) and arms the writer's SQUEEZEFS_SYMMETRIC_META
 #                 (implies --membership — the death ledger's writer), the
-#                 `run_mw_matrix.sh sym-crash` leg's fleet (PR 10)
+#                 `run_mw_matrix.sh sym-crash` leg's fleet (PR 10);
+#                 --writers=K (PR 12b) mounts K more RW daemons of the
+#                 armed set — JOINED WRITERS (indices 60..) through the
+#                 join ladder, no posture knob, N unbounded by design —
+#                 the `sym-crash` / `sym-storm` legs' N-daemon fleet.
+#                 Size the data volumes for the kill legs' 16 GiB load
+#                 (SQZ_MWFLEET_OSS_GB=16 — the default 2 × 4 GiB fills
+#                 in ≈ 7 s on the dev box, inside the randomized kill
+#                 phase; zram stores zeros for free)
 #   status        member table + capability verdict + identity map + VMs
 #   owners        the recorded per-volume ownership assignment (ids,
 #                 volumes, subtree roots, MW ports) — PR 8's legs read it
@@ -398,6 +406,24 @@ root = json.load(sys.stdin)
 print(flat(root.get("metrics", root), {}).get(sys.argv[1], ""))' "$2"
 }
 
+# `stat_field` for the per-volume families: a per-volume ARRAY answers its
+# first element (this rig's sets are one metadata volume; `run_mw_matrix.sh`'s
+# `stat_sum` folds wider ones), a scalar answers itself, `null` the empty
+# string.
+stat_first() { # mountpoint key -> value
+    cat "$1/.stats" | python3 -c '
+import json, sys
+def flat(d, out, pfx=""):
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+root = json.load(sys.stdin)
+v = flat(root.get("metrics", root), {}).get(sys.argv[1], "")
+if isinstance(v, list): v = v[0] if v else ""
+print("" if v is None else v)' "$2"
+}
+
 # Count of nvme-subsystem entries carrying <nqn> (the 5b probe's instrument).
 subsys_count_for_nqn() {
     local nqn="$1" s n=0
@@ -431,6 +457,16 @@ COWRITER_BASE=50
 # the co-writers, so a multi-owner fleet reads at a glance and member 0
 # stays the set authority every leg's oracle already snapshots.
 PARTIAL_BASE=20
+# Symmetric PR 12b: the JOINED WRITERS of a `--symmetric --writers=K`
+# fleet — every non-manager RW mount of the armed set, N unbounded by
+# design — take the slice above the co-writers (60..).
+JOINER_BASE=60
+
+# The joined-writer member indices of a symmetric fleet (empty on every
+# other shape).
+joiner_idxs() {
+    awk -F'\t' '$2=="joiner" {print $1}' "$MEMBERS" 2>/dev/null | sort -n
+}
 
 # The partial-authority member indices of a multi-owner fleet (empty on
 # every other shape).
@@ -861,6 +897,34 @@ mount_member() { # idx [--netns[=<delay_ms>]]
             --daemon --allow-other --log-file "$log" \
             >"$STATE/m0.mount.out" 2>&1 ||
             die "writer mount failed: $(cat "$STATE/m0.mount.out")"
+    elif [ "$idx" -ge "$JOINER_BASE" ]; then
+        # Symmetric PR 12b: a JOINED WRITER — a second (third, …) RW mount
+        # of the ARMED set. No posture knob (SQUEEZEFS_MULTI_WRITER /
+        # SQUEEZEFS_MW_ROLE / SQUEEZEFS_MW_AUTHORITY are RETIRED spellings
+        # beside the plane): the mount walks the join ladder off durable
+        # state — a live manager (its flock on this host, its fresh claim),
+        # its published listener (the claim set), the set's secret — and
+        # JOINS as a full writer: its own page, ring, slot leases and
+        # checkpoint task; tree 0 a projection; foreign slots read through
+        # their holders' tokens. CO-LOCATED (one head, one association):
+        # rung 4 ADOPTS the manager's holds (KD-SYM-22), registering
+        # nothing. The mount point derives its `(node, mount slot)`
+        # identity — the same point rejoins its own region.
+        role="joiner"
+        [ "${SYMMETRIC:-0}" = "1" ] ||
+            die "joined writers need a --symmetric fleet (create ... --symmetric --writers=K)"
+        env_args+=("SQUEEZEFS_SYMMETRIC_META=1")
+        # N full writers on ONE box each register 32 queues × 32 × 1 MiB
+        # of kernel-managed kmbuf rings (the shipped transport geometry —
+        # never downgraded); the fifth daemon of the first create met the
+        # kmbuf registration's ENOMEM on a page-cache-churned box with 84
+        # GB available (the kernel's contiguous-chunk allocation, not the
+        # budget). Compact first — a harness act for the single-box venue.
+        echo 1 >/proc/sys/vm/compact_memory 2>/dev/null || true
+        env "${env_args[@]}" "$SQZ" mount "sqmeta://$META_PATHS" "$mnt" \
+            --daemon --allow-other --log-file "$log" \
+            >"$STATE/m${idx}.mount.out" 2>&1 ||
+            die "joined writer $idx mount failed: $(cat "$STATE/m${idx}.mount.out")"
     elif [ "$idx" -ge "$COWRITER_BASE" ]; then
         # Rung 9 (the S8 arm): a CO-WRITER member — the DLM S9 posture, the
         # REAL S8 shipping client (every metadata verb ships to the
@@ -957,6 +1021,32 @@ mount_member() { # idx [--netns[=<delay_ms>]]
         [ "$posture" = "co-writer" ] ||
             die "co-writer $idx mount_posture='$posture' (want co-writer) — log: $log"
         log "member $idx co-writer posture engaged (CO-WRITER ADMITTED, mount_posture=co-writer)"
+    fi
+    if [ "$role" = "joiner" ]; then
+        # PR 12b engagement: a WRITER that holds no manager lease, its own
+        # appender id, its rotor leased over the wire, rung 4 adopted (one
+        # host, one registrant), the ladder's report published.
+        grep -q "mounted as a JOINED symmetric appender" "$log" ||
+            die "joined writer $idx log carries no 'mounted as a JOINED symmetric appender' line — the joined door did not engage (log: $log)"
+        local posture jid jpost lease held
+        posture="$(stat_field "$mnt" mount_posture)"
+        [ "$posture" = "writer" ] ||
+            die "joined writer $idx mount_posture='$posture' (want writer) — log: $log"
+        jid="$(stat_first "$mnt" joined_appender_id)"
+        [ "${jid:-0}" -ge 1 ] 2>/dev/null ||
+            die "joined writer $idx joined_appender_id='$jid' (want ≥ 1) — log: $log"
+        jpost="$(stat_first "$mnt" joined_registrant_posture)"
+        [ "$jpost" = "adopted" ] ||
+            die "joined writer $idx joined_registrant_posture='$jpost' (want adopted: one host, one registrant — KD-SYM-22) — log: $log"
+        lease="$(stat_first "$mnt" manager_lease)"
+        case "$lease" in
+        peer:*) : ;;
+        *) die "joined writer $idx manager_lease='$lease' (want peer:…) — log: $log" ;;
+        esac
+        held="$(stat_first "$mnt" slot_leases_held)"
+        [ "${held:-0}" -ge 1 ] 2>/dev/null ||
+            die "joined writer $idx slot_leases_held='$held' (want ≥ 1) — log: $log"
+        log "member $idx joined-writer posture engaged (appender $jid, manager_lease=$lease, $held slot(s), registrant adopted)"
     fi
     if [ "$role" = "partial-authority" ] || [ "$role" = "set-authority" ]; then
         # PR 8 / ops.md §Bringing a multi-owner fleet up, item 4 — asserted
@@ -1343,7 +1433,7 @@ verify_owner_fleet() {
 }
 
 create_fleet() {
-    local n="$N_DEFAULT" cowriters=0 owners=0 require_hs=0 vms=0 mw=0 symmetric=0 a
+    local n="$N_DEFAULT" cowriters=0 owners=0 require_hs=0 vms=0 mw=0 symmetric=0 writers=0 a
     local membership="${SQZ_MWFLEET_MEMBERSHIP:-}" lease_ttl_ms="${SQZ_MWFLEET_LEASE_TTL_MS:-}"
     for a in "$@"; do
         case "$a" in
@@ -1356,6 +1446,11 @@ create_fleet() {
         # successor's own-residue recovery, the frame screen, the C14/C15
         # census and the ledger's driver (`run_mw_matrix.sh sym-crash`).
         --symmetric) symmetric=1 ;;
+        # Symmetric PR 12b: K JOINED WRITERS beside the manager — every one
+        # a full RW mount of the armed set through the join ladder (N
+        # unbounded by design; the rig's slice starts at JOINER_BASE).
+        --writers) die "--writers takes a value (--writers=K)" ;;
+        --writers=*) writers="${a#--writers=}" ;;
         --cowriters)
             die "--cowriters takes a value (--cowriters K)"
             ;;
@@ -1380,6 +1475,9 @@ create_fleet() {
     [ -z "$lease_ttl_ms" ] || [ -n "$membership" ] || [ "$mw" = "1" ] || [ "$symmetric" = "1" ] ||
         die "--lease-ttl-ms is the OWNER's membership lease knob — it needs --membership"
     [[ "$cowriters" =~ ^[0-9]+$ ]] || die "--cowriters=K needs a non-negative integer (got '$cowriters')"
+    [[ "$writers" =~ ^[0-9]+$ ]] || die "--writers=K needs a non-negative integer (got '$writers')"
+    [ "$writers" -eq 0 ] || [ "$symmetric" = "1" ] ||
+        die "--writers=$writers: joined writers are the SYMMETRIC plane's posture (create ... --symmetric --writers=K) — under the per-volume-owner recipe a second RW mount is --owners; under the S9 recipe a data-only peer is --cowriters"
     # PR 8 — the MULTI-OWNER shape's own preconditions, all before anything
     # costly exists.
     [[ "$owners" =~ ^[0-9]+$ ]] || die "--owners=K needs a non-negative integer (got '$owners')"
@@ -1662,6 +1760,8 @@ create_fleet() {
         # PR 10: the symmetric forest (bit 17) + the armed plane on the
         # writer; `run_mw_matrix.sh sym-crash` requires it.
         echo "SYMMETRIC='$symmetric'"
+        # PR 12b: the joined writers (indices JOINER_BASE..).
+        echo "WRITERS='$writers'"
         # PR 8: the multi-owner shape. `OWNERS_ASSIGNED` flips to 1 only
         # when `volume set-owners` has actually written the assignment —
         # the per-volume mount branches read it, so a create that died
@@ -1741,6 +1841,13 @@ create_fleet() {
         mount_reader_verified "$idx"
     done
 
+    # Symmetric PR 12b: the joined writers — after the manager (whose
+    # rung 7 published the listener they resolve) and the readers (whose
+    # rung-6 tripwire mount_reader_verified nudges the manager for).
+    for ((idx = 0; idx < writers; idx++)); do
+        mount_member $((JOINER_BASE + idx))
+    done
+
     # Rung 9: the co-writer bring-up — the ops.md "Bringing one up" flow,
     # mechanized. Phase 1 harvests each mountpoint's durable enrollment id
     # from its rung-3 refusal; phase 2 re-arms the AUTHORITY with the
@@ -1772,7 +1879,7 @@ create_fleet() {
     for ((idx = 0; idx < vms; idx++)); do
         vm_boot "$idx"
     done
-    log "fleet up: 1 writer + $((n - 1)) reader(s) + $cowriters co-writer(s) + $([ "$owners" -gt 0 ] && echo "$((owners - 1))" || echo 0) partial-authorit(y/ies) + $vms guest(s), SQUEEZEFS_FLEET_SHARE=$n per daemon"
+    log "fleet up: 1 writer + $((n - 1)) reader(s) + $cowriters co-writer(s) + $writers joined writer(s) + $([ "$owners" -gt 0 ] && echo "$((owners - 1))" || echo 0) partial-authorit(y/ies) + $vms guest(s), SQUEEZEFS_FLEET_SHARE=$n per daemon"
     status_fleet
 }
 
@@ -1853,6 +1960,11 @@ teardown_fleet() {
         log "swept unledgered guest pid $qpid"
     done
     if [ -f "$MEMBERS" ]; then
+        # Highest index first: every peer (readers, co-writers, joined
+        # writers) leaves while the manager / authority it dials still
+        # serves — a joined writer's clean leave is a wire `LeaveAppender`
+        # (PR 12b), and a leave over a dead manager keeps its page Live
+        # for the next open to recover instead of ending clean.
         local idx role mnt lg hn hi pid
         while IFS=$'\t' read -r idx role mnt lg hn hi pid; do
             : "$role" "$lg" "$hn" "$hi"
@@ -1866,7 +1978,7 @@ teardown_fleet() {
             [ -n "$pid" ] && [ "$pid" != "-" ] && kill -0 "$pid" 2>/dev/null &&
                 kill -9 "$pid" 2>/dev/null
             log "member $idx down"
-        done <"$MEMBERS"
+        done < <(sort -rn "$MEMBERS")
     fi
     # Sweep mounts the ledger does not know (partial-create residue): any
     # live mount under MNT_ROOT is ours by construction.

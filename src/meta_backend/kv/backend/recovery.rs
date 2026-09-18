@@ -1603,17 +1603,43 @@ impl KvMetaBackend {
                 .slots
                 .iter()
                 .find(|se| appender::forest_slot_of_page_slot(se.slot, set.native_slot) == *slot);
-            // The tree's root: the page's when newer (the lessee's own
-            // checkpoints), else the grant-time record's.
+            // The tree's root: the lessee's PAGE word at the lease's
+            // generation — KD-SYM-3, a leased slot's root rides its
+            // lessee's page, written by its checkpoints strictly AFTER the
+            // grant; tree 0's record is the grant-time root. Never a
+            // node-seq comparison (PR 12b — the `sym-storm` fleet leg: a
+            // joiner's node seqs are ITS handle's, the manager's its own;
+            // "the newer by seq" picked the manager's grant-time root over
+            // the dead joiner's page root on four of 64 slots and every
+            // record the joiner had FLUSHED there was lost — 84 acked
+            // files absent at the manager). A page entry below the
+            // lease's `g` is a previous lease's stale attestation (PR 4's
+            // `slot_lease_stale_entries` class) and yields to the record.
             let recorded = lease.words;
             let mut root = RootPtr {
                 addr: recorded.root.0,
                 seq: recorded.root.1,
             };
-            if let Some(se) = page_entry {
-                if se.root.addr != 0 && se.root.seq >= root.seq {
-                    root = se.root;
-                }
+            match page_entry {
+                Some(se) if se.root.addr != 0 && se.g >= lease.g => root = se.root,
+                Some(se) => log::warn!(
+                    "{}: recovery of appender {id}: slot {slot}'s page entry (g {}, root {:#x}) \
+                     is not the lease's (g {}) — the grant-time root {:#x} (seq {}) stands",
+                    self.path.display(),
+                    se.g,
+                    se.root.addr,
+                    lease.g,
+                    root.addr,
+                    root.seq
+                ),
+                None => log::warn!(
+                    "{}: recovery of appender {id}: slot {slot} has NO page entry — the \
+                     grant-time root {:#x} (seq {}) stands (g {})",
+                    self.path.display(),
+                    root.addr,
+                    root.seq,
+                    lease.g
+                ),
             }
             if root.addr != 0 {
                 // The ONE install the own-residue open runs too (Issue
@@ -1622,9 +1648,14 @@ impl KvMetaBackend {
                 // raises it nowhere else, and a recoverer minting below
                 // the dead lessee's stamps would adopt a residue frame in
                 // a returned extent as its own tail (PR 11's class).
+                // Installed whenever the RAM tree stands elsewhere: the
+                // recoverer never writes a leased slot's tree, so its RAM
+                // root is at most the page's — equal or stale, never ahead
+                // (a re-run past a rollback is back at its pre-install
+                // root; equal roots are left untouched).
                 let tree_rollback = match forest.tree(*slot) {
                     Some(tr) => {
-                        if root.seq > tr.root().seq {
+                        if root != tr.root() {
                             // The recoverer's RAM tree is STALE (Issue 2):
                             // it holds the slot at the root it last saw
                             // while the lessee's checkpoints moved it. Every

@@ -1200,6 +1200,103 @@ fn owner_failover_opens_a_grace_window_admitting_only_reclaim() {
     assert!(!owner2.grace_active(), "the grace window is bounded");
 }
 
+/// PR 12b review round 2, Issue 26 — the `sym-crash` acceptance tape's
+/// reader SELF-FENCED at the third manager failover: the successor's
+/// window awaits the DURABLE roster (the claim set's writers), so the
+/// moment the last joiner re-asserted the window closed EARLY and the
+/// `-o ro` reader — a RAM-only member, in no claim set, polling the
+/// rendezvous once per beat — arrived to "no grace window is open":
+/// `UnknownLease`, purge, re-join fresh, `membership_self_fences` moving
+/// on a healthy failover.
+///
+/// The law pinned here splits the window in two: **fresh acquires are
+/// refused until every expected member re-asserted** (the early close —
+/// unchanged), and **a prior lease RE-ASSERTS until the window's
+/// DEADLINE** whether or not the durable roster's members already closed
+/// it to strangers — the deadline (`grace = T_owner ≥ T_self`) is the
+/// only bound a RAM-only member's own clock can meet. A successor with
+/// NO expected writers (a manager whose only other members are readers)
+/// opens the same deadline-bounded re-assertion with nothing refused.
+#[test]
+fn a_ram_only_members_reclaim_is_admitted_until_the_deadline_after_the_writers_closed_the_window() {
+    let _serial = serial();
+    let (clock, ticks) = manual_clock();
+    let clocks = shipped_clocks();
+    let owner = owner_with(clocks.clone(), clock.clone(), 21);
+    owner.open_grace(vec!["w-1".to_string()]);
+    assert!(owner.grace_active());
+    assert!(owner.reassertion_open());
+
+    // The durable roster re-asserts: the window closes EARLY to fresh
+    // acquires (the shipped law — a stranger is admitted, the operator
+    // gauge reads 0)…
+    let mut w1 = join_req("w-1", MemberRole::Writer, Some("10.0.0.1:7100"));
+    w1.prior_epoch = Some(3);
+    granted(owner.join(w1));
+    assert!(!owner.grace_active(), "every expected member re-asserted");
+    assert_eq!(
+        owner.grace_remaining_ms(),
+        0,
+        "the fresh-refusal half is closed"
+    );
+    granted(owner.join(join_req("stranger", MemberRole::Writer, None)));
+    // …and STAYS open to re-assertion until its deadline.
+    assert!(
+        owner.reassertion_open(),
+        "a prior lease re-asserts until the window's deadline"
+    );
+    let reclaims0 = METRICS.membership_grace_reclaims.load(Ordering::Relaxed);
+    let refusals0 = METRICS.membership_renew_refusals.load(Ordering::Relaxed);
+    let mut ro = join_req("ro-1", MemberRole::Reader, None);
+    ro.prior_epoch = Some(1); // the predecessor's grant — this owner never held it
+    match owner.join(ro) {
+        JoinOutcome::Granted(_) => {}
+        JoinOutcome::UnknownLease { reason } => panic!(
+            "a RAM-only member's reclaim inside the successor's grace deadline must be \
+             admitted, not fenced: {reason}"
+        ),
+        JoinOutcome::Refused { reason, .. } => panic!("refused: {reason}"),
+    }
+    assert_eq!(
+        METRICS.membership_grace_reclaims.load(Ordering::Relaxed),
+        reclaims0 + 1,
+        "the reader's re-assertion is counted as the reclaim it is"
+    );
+    assert_eq!(
+        METRICS.membership_renew_refusals.load(Ordering::Relaxed),
+        refusals0,
+        "no UnknownLease was issued"
+    );
+
+    // The deadline is the bound: past it a prior lease is not custody.
+    ticks.store(
+        clock.now_ms() + clocks.grace.as_millis() as u64 + 1,
+        Ordering::SeqCst,
+    );
+    assert!(!owner.reassertion_open());
+    let mut late = join_req("ro-2", MemberRole::Reader, None);
+    late.prior_epoch = Some(1);
+    match owner.join(late) {
+        JoinOutcome::UnknownLease { .. } => {}
+        other => panic!("past the deadline a prior lease is not custody: {other:?}"),
+    }
+
+    // A successor whose durable roster names NO writer still opens the
+    // deadline-bounded re-assertion: nothing is refused, the reader's
+    // prior lease is admitted.
+    let owner2 = owner_with(clocks.clone(), clock.clone(), 22);
+    owner2.open_grace(Vec::new());
+    assert!(
+        !owner2.grace_active(),
+        "no expected member: nothing to refuse"
+    );
+    assert!(owner2.reassertion_open());
+    granted(owner2.join(join_req("stranger", MemberRole::Writer, None)));
+    let mut ro = join_req("ro-1", MemberRole::Reader, None);
+    ro.prior_epoch = Some(9);
+    granted(owner2.join(ro));
+}
+
 /// The `mw_fleet --owners` bring-up refusal (2026-08-23, the fourth
 /// real-fleet catch): the grace window's fresh-acquire refusal was
 /// **identity-blind** — `reclaim` was `prior_epoch.is_some()` and the

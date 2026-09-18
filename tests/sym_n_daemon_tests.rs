@@ -45,6 +45,7 @@ fn reset_process_state() {
     squeezefs::data_custody::test_clear_poison();
     squeezefs::data_grant::test_clear_custody_quarantine();
     squeezefs::membership::test_clear_death_sinks();
+    squeezefs::membership::uninstall_window_decl_source();
     squeezefs::membership::uninstall();
 }
 
@@ -2787,6 +2788,373 @@ async fn a_live_joiner_follows_a_manager_failover_to_the_successors_listener() {
     shutdown(&successor).await;
     drop(svol);
     drop(successor);
+    fsck_clean(&uris).await;
+}
+
+/// **A re-hold's deferred leak release CONVERGES on the live peers'
+/// declared windows — across two failovers** (PR 12b review round 2,
+/// Issue 25): round 1 deferred every SET-but-unreferenced-and-ungranted
+/// bit while any peer page was `Live` and released it only at a
+/// peer-less re-hold — on a fleet that keeps writing the set grew ≈ G/2
+/// blocks per writer per manager failover for ever (53 → 340 of 4,096
+/// per volume across two failovers in the acceptance tape). The
+/// predecessor's ledger — a window's only record — died with it, so the
+/// bitmap alone cannot tell a live writer's remainder from a dead one's;
+/// the live writer's OWN word can: its membership renewal carries its
+/// unconsumed ranges every beat (`RenewFrame::block_grant_windows`, the
+/// source installed by the joined allocation arm), the holder ADOPTS a
+/// declared range into its ledger under the writer's name (revocable at
+/// its death, returnable at its leave) and, once every `Live` peer page's
+/// writer has declared (or its page is no longer `Live` — dead,
+/// recovered), releases what is still pending as provably nobody's. The
+/// verdict runs at the ledger poll's cadence and at the re-hold.
+///
+/// Two failovers over the REAL membership wire (an owner + plane per
+/// manager, the joiner a writer member re-pointed by the successor
+/// observation): at each successor's re-hold the joiner's remainder and
+/// the dead manager's own remainder are DEFERRED; the joiner's next
+/// renewal at the successor declares; pending → 0 within a beat, the
+/// joiner's remainder ADOPTED (its blocks stay SET, its later mints stay
+/// disjoint from everything minted before), the dead manager's
+/// RELEASED (CLEAR); `deferred ≡ released + adopted + pending` exact at
+/// every step. Red before: `pending` stayed at the deferred count and
+/// nothing was released while the joiner lived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_re_holds_deferred_leaks_converge_on_the_live_peers_declared_windows() {
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::block_grant::WindowDecl;
+    use squeezefs::data_alloc_bitmap::{
+        DATA_ALLOC_BITMAP_LEAKS_ADOPTED as ADOPTED, DATA_ALLOC_BITMAP_LEAKS_DEFERRED as DEFERRED,
+        DATA_ALLOC_BITMAP_LEAKS_RELEASED as RELEASED,
+    };
+    use squeezefs::membership::{self, LeaseClock, LeaseClocks, MembershipOwner, OwnerRecord};
+    use squeezefs::membership_wire::{MembershipPlane, MembershipPlaneConfig};
+    use squeezefs::meta_backend::kv::alloc_lease;
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    membership::note_successor_observed(None);
+    let clocks = LeaseClocks::with_params(
+        std::time::Duration::from_millis(1_500),
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(100),
+    )
+    .expect("short clocks");
+    let t_owner_ms = clocks.t_owner.as_millis() as u64;
+    let beat_ms = clocks.renew_interval.as_millis() as u64;
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared"), (SLOT_B, "other")]).await;
+    let shared = dirs[0];
+    let data_id = "vol-converge-data";
+    let data_tag = squeezefs::meta_backend::kv::block_refs::volume_tag(data_id);
+    let data_blocks = 4096u64;
+    // The closure over THIS pin's holdings: the counters are process-wide
+    // and cumulative (an earlier contract's holding, reset with its
+    // pending set, breaks the absolute identity), the law is per holding
+    // lifetime — so deltas from the pin's base, with `pending` absolute (0
+    // at the base: a fresh process state, the first hold has no leaks).
+    let base0 = (
+        DEFERRED.load(Relaxed),
+        RELEASED.load(Relaxed),
+        ADOPTED.load(Relaxed),
+    );
+    let closure = move || {
+        (
+            DEFERRED.load(Relaxed) - base0.0,
+            RELEASED.load(Relaxed) - base0.1,
+            ADOPTED.load(Relaxed) - base0.2,
+            alloc_lease::leaks_pending_total(),
+        )
+    };
+    let assert_closure = |(d, r, a, p): (u64, u64, u64, u64)| {
+        assert_eq!(
+            d,
+            r + a + p,
+            "deferred ≡ released + adopted + pending (deferred {d}, released {r}, adopted {a}, \
+             pending {p})"
+        );
+    };
+
+    // Manager 1, the holder; the joiner mints from its grants.
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    enroll_manager(&mvol, &venue.endpoint()).await;
+    let a = Arc::new(BlockAllocator::new(data_id).await.unwrap());
+    a.set_capacity_bytes(data_blocks * a.chunk_size());
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&manager, &[Arc::clone(&a)])
+            .await
+            .unwrap(),
+        1
+    );
+    let base = closure();
+    assert_closure(base);
+    let joiner = join(&uris, &venue, &mvol, 72).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jwire = Arc::clone(jvol.joined_wire().expect("joined"));
+    let writer = squeezefs::cowriter::node_member_id_of(
+        jwire.identity.node_token,
+        jwire.identity.mount_slot,
+    );
+    let hv = squeezefs::sym_join::joined_holder_venue(&joiner, data_tag, venue.endpoint());
+    let b = Arc::new(BlockAllocator::new(data_id).await.unwrap());
+    b.set_capacity_bytes(data_blocks * b.chunk_size());
+    assert!(b.install_block_grant_arm(
+        data_tag,
+        alloc_lease::wire_block_grant_sink(
+            Arc::clone(&hv),
+            VENUE_SECRET.to_vec(),
+            jwire.identity.into(),
+            0,
+            data_tag,
+        ),
+    ));
+    // The member's declaration source — what the joined allocation arm
+    // installs on a mount.
+    let decl_b = Arc::clone(&b);
+    membership::install_window_decl_source(Arc::new(move || {
+        let ranges = alloc_lease::held_block_ranges(&decl_b);
+        if ranges.is_empty() {
+            Vec::new()
+        } else {
+            vec![WindowDecl {
+                vol_tag: data_tag,
+                ranges,
+            }]
+        }
+    }));
+    // The joiner's mints are IN FLIGHT (minted, their publish not yet
+    // durable — the write path's registry guard held across the DMA):
+    // neither in its window nor referenced, and its to declare.
+    let mut minted = std::collections::BTreeSet::new();
+    let mut inflight_guards = Vec::new();
+    for _ in 0..8 {
+        let off = b.allocate_block().await.unwrap();
+        inflight_guards.push(b.inflight_register(off));
+        minted.insert(off / b.chunk_size());
+    }
+    // The manager minted too and never published — the dead
+    // incarnation's remainder once it dies: nobody's.
+    let mut manager_minted = std::collections::BTreeSet::new();
+    for _ in 0..8 {
+        manager_minted.insert(a.allocate_block().await.unwrap() / a.chunk_size());
+    }
+    assert_eq!(minted.len() + manager_minted.len(), 16);
+    let files = create_files(&joiner, shared, "cv", 4).await;
+
+    // The membership plane at manager 1; the joiner a WRITER member whose
+    // renewal carries its window.
+    let owner_id = |term: u64| format!("converge-owner-{term}");
+    let stand_owner = |term: u64| {
+        let owner = MembershipOwner::arm(
+            &owner_id(term),
+            term,
+            term - 1,
+            clocks.clone(),
+            LeaseClock::monotonic(),
+        )
+        .expect("the owner arms");
+        let plane = MembershipPlane::start(
+            MembershipPlaneConfig::loopback(),
+            VENUE_SECRET.to_vec(),
+            Arc::clone(&owner),
+        )
+        .expect("the plane binds");
+        (owner, plane)
+    };
+    let (owner1, plane1) = stand_owner(3);
+    membership::install_owner(Arc::clone(&owner1));
+    let rec = OwnerRecord {
+        v: 1,
+        id: owner_id(3),
+        term: 3,
+        endpoint: plane1.endpoint().to_string(),
+        ttl_ms: t_owner_ms,
+        owner_claim_id: String::new(),
+        ts: 0,
+        pid: std::process::id(),
+        boot: "boot-converge".to_string(),
+    };
+    let arm = membership::join_as_writer_member(&rec, VENUE_SECRET.to_vec(), &writer, 0, None)
+        .await
+        .expect("the join is admitted")
+        .expect("a rendezvous record exists");
+    assert!(owner1.member_is_live(&writer));
+
+    let mut prior_holding = alloc_lease::holding(data_tag).expect("manager 1 holds");
+    let mut plane = plane1;
+    let mut successor_term = 4u64;
+    let mut current_manager = manager;
+    let mut current_vol = mvol;
+    let mut current_venue = venue;
+    for failover in 1..=2u32 {
+        // The manager DIES with its listener and its membership plane; the
+        // joiner's remainder and the dead manager's own remainder are RAM
+        // at a ledger that died.
+        let joiner_remainder: std::collections::BTreeSet<u64> = b
+            .block_grant_unconsumed()
+            .iter()
+            .flat_map(|g| g.start..g.end())
+            .collect();
+        assert!(
+            !joiner_remainder.is_empty(),
+            "failover {failover}: the joiner holds a window remainder to declare"
+        );
+        current_venue.tear_down();
+        shutdown(&current_manager).await;
+        alloc_lease::disarm_symmetric_roles();
+        drop(current_vol);
+        drop(current_manager);
+        drop(prior_holding);
+        plane.shutdown();
+        membership::uninstall();
+
+        let successor = open_under(&uris, &Knobs::armed()).await;
+        let svol = Arc::clone(&successor.volumes[0]);
+        let venue2 = HoldersVenue::stand_up(&successor, &[]).await;
+        squeezefs::multi_writer::publish_symmetric_endpoint(&successor, &venue2.endpoint()).await;
+        svol.checkpoint_now().await.unwrap();
+        let (owner2, plane2) = stand_owner(successor_term);
+        owner2.open_grace(vec![writer.clone()]);
+        membership::install_owner(Arc::clone(&owner2));
+        membership::note_successor_observed(Some(plane2.endpoint().to_string()));
+        let a2 = Arc::new(BlockAllocator::new(data_id).await.unwrap());
+        a2.set_capacity_bytes(data_blocks * a2.chunk_size());
+        let before = closure();
+        assert_eq!(
+            alloc_lease::arm_symmetric_allocation(&successor, &[Arc::clone(&a2)])
+                .await
+                .unwrap(),
+            1
+        );
+        let sholding = alloc_lease::holding(data_tag).expect("the successor holds");
+        let after_arm = closure();
+        assert_closure(after_arm);
+        assert!(
+            after_arm.0 > before.0,
+            "failover {failover}: the re-hold deferred the dead ledger's remainders"
+        );
+        assert!(
+            after_arm.3 >= joiner_remainder.len() as u64,
+            "failover {failover}: the joiner's remainder ({}) is among the {} pending",
+            joiner_remainder.len(),
+            after_arm.3
+        );
+        assert_eq!(
+            after_arm.1, before.1,
+            "failover {failover}: nothing released under a live peer's feet at the arm"
+        );
+
+        // The joiner's reclaim lands at the successor's grace window and
+        // its next renewal DECLARES; the verdict (the poll's cadence here,
+        // run by hand) converges within a beat of it.
+        let landed = std::time::Instant::now() + std::time::Duration::from_millis(t_owner_ms);
+        while owner2.epoch_of(&writer).is_none() {
+            assert!(
+                std::time::Instant::now() < landed,
+                "failover {failover}: the joiner's reclaim lands at the successor"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let converged =
+            std::time::Instant::now() + std::time::Duration::from_millis(3 * beat_ms + t_owner_ms);
+        loop {
+            alloc_lease::converge_deferred_leaks().await;
+            if alloc_lease::leaks_pending_total() == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < converged,
+                "failover {failover}: the deferred set never converged ({:?})",
+                closure()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let done = closure();
+        assert_closure(done);
+        assert_eq!(done.3, 0, "failover {failover}: pending → 0");
+        assert!(
+            done.2 - after_arm.2 >= joiner_remainder.len() as u64,
+            "failover {failover}: the joiner's declared remainder was ADOPTED ({} ≥ {})",
+            done.2 - after_arm.2,
+            joiner_remainder.len()
+        );
+        assert!(
+            done.1 > after_arm.1,
+            "failover {failover}: the dead manager's own remainder was RELEASED"
+        );
+        for blk in &joiner_remainder {
+            assert!(
+                sholding.bitmap.is_set(*blk),
+                "failover {failover}: the joiner's window block {blk} stays SET"
+            );
+        }
+        let adopted_ranges = sholding.ledger.grants_of(&writer);
+        for blk in &joiner_remainder {
+            assert!(
+                adopted_ranges.iter().any(|g| g.contains(*blk)),
+                "failover {failover}: block {blk} is the joiner's grant in the successor's ledger"
+            );
+        }
+        for blk in &minted {
+            assert!(
+                sholding.bitmap.is_set(*blk),
+                "failover {failover}: the joiner's in-flight block {blk} stays SET"
+            );
+        }
+        for blk in &manager_minted {
+            assert!(
+                !sholding.bitmap.is_set(*blk),
+                "failover {failover}: the dead manager's unpublished mint {blk} is CLEAR — \
+                 nobody's"
+            );
+        }
+        // The joiner keeps minting — its window first, then the successor's
+        // grants — with no block minted twice against anything it holds.
+        let mut after: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for _ in 0..(joiner_remainder.len() + 40) {
+            let off = b.allocate_block().await.unwrap();
+            inflight_guards.push(b.inflight_register(off));
+            after.insert(off / b.chunk_size());
+        }
+        assert!(
+            minted.is_disjoint(&after),
+            "failover {failover}: a block minted twice across the failover"
+        );
+        assert!(
+            joiner_remainder.is_subset(&after),
+            "failover {failover}: the joiner minted its declared window through"
+        );
+        minted.extend(after.iter().copied());
+        manager_minted.clear();
+        for _ in 0..8 {
+            manager_minted.insert(a2.allocate_block().await.unwrap() / a2.chunk_size());
+        }
+        assert_all_resolve(&joiner, shared, &files).await;
+
+        prior_holding = sholding;
+        plane = plane2;
+        successor_term += 1;
+        current_manager = successor;
+        current_vol = svol;
+        current_venue = venue2;
+    }
+
+    arm.disarm().await;
+    drop(inflight_guards);
+    membership::note_successor_observed(None);
+    membership::uninstall_window_decl_source();
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    drop(prior_holding);
+    plane.shutdown();
+    current_venue.tear_down();
+    shutdown(&current_manager).await;
+    drop(current_vol);
+    drop(current_manager);
+    membership::uninstall();
     fsck_clean(&uris).await;
 }
 

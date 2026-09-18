@@ -443,7 +443,10 @@ fn check_identity_peer_screen(frame: &ManagerRequestFrame, peer_bytes: &[u8]) {
         _ => None,
     };
     let Some(identity) = identity else {
-        assert!(verdict.is_none(), "a verb carrying no identity passes any peer");
+        assert!(
+            verdict.is_none(),
+            "a verb carrying no identity passes any peer"
+        );
         return;
     };
     let own = squeezefs::cowriter::node_member_id_of(identity.node_token, identity.mount_slot);

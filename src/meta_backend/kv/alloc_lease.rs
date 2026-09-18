@@ -1085,6 +1085,14 @@ pub struct SlotCoverage {
     pub unleased: u64,
     /// Slots another appender leases — its shard's.
     pub foreign: u64,
+    /// Of `foreign`, the slots whose lessee the installed S6 owner lists
+    /// LIVE (PR 12b review round 1, Issue 1): their trees CHANGE under a
+    /// census here — a projection whose staleness nothing bounds — so the
+    /// dentry pass takes no verdict over the volume while any stands. A
+    /// foreign lessee not known live (dead-and-unrecorded, expired, or no
+    /// owner installed — the in-process fixtures') is PR 10's class: its
+    /// tree is frozen at its page root and its window is scoped out.
+    pub foreign_live: u64,
     /// `leased + unleased` — what this mount's pass covers.
     pub covered: u64,
 }
@@ -2226,6 +2234,30 @@ impl KvMetaBackend {
         } else {
             cov.foreign += 1;
         }
+        // The foreign lessees' liveness, read once per census: the
+        // directory's page identities → member ids → the installed S6
+        // owner's word (`member_is_live`). No owner ⇒ nobody is known live.
+        let owner = crate::membership::installed_owner();
+        let mut live_lessee: std::collections::HashMap<u32, bool> =
+            std::collections::HashMap::new();
+        if owner.is_some() && gate.is_armed() {
+            if let Ok(entries) =
+                super::appender::read_directory(self.device_path(), self.superblock()).await
+            {
+                for e in entries {
+                    let Some(page) = e.page.as_ref() else {
+                        continue;
+                    };
+                    let member = crate::cowriter::node_member_id_of(
+                        page.identity.node_token,
+                        page.identity.mount_slot,
+                    );
+                    let live = page.state == super::appender::AppenderState::Live
+                        && owner.as_ref().is_some_and(|o| o.member_is_live(&member));
+                    live_lessee.insert(e.appender_id, live);
+                }
+            }
+        }
         let (mut cursor, end) = super::slot_state::slot_state_key_range();
         loop {
             let page = control.range(&cursor, &end, 512).await?;
@@ -2242,8 +2274,11 @@ impl KvMetaBackend {
                     super::slot_state::SlotState::Leased { .. } if gate.is_leased(slot) => {
                         cov.leased += 1
                     }
-                    super::slot_state::SlotState::Leased { .. } if gate.is_armed() => {
-                        cov.foreign += 1
+                    super::slot_state::SlotState::Leased { appender_id, .. } if gate.is_armed() => {
+                        cov.foreign += 1;
+                        if live_lessee.get(&appender_id).copied().unwrap_or(false) {
+                            cov.foreign_live += 1;
+                        }
                     }
                     super::slot_state::SlotState::Leased { .. } => cov.leased += 1,
                     super::slot_state::SlotState::Unleased { .. } => {

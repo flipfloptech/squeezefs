@@ -2897,6 +2897,37 @@ async fn the_managers_census_takes_no_verdict_over_a_live_joiners_stale_projecte
     let joiner = join(&uris, &venue, &mvol, 3).await;
     let jvol = Arc::clone(&joiner.volumes[0]);
     let jid = jvol.appender_stats().unwrap().appender_id;
+    // The manager is the S6 owner of the joiner's shard (the mount path's
+    // rung 3): the joiner is a LIVE writer member — the census's liveness
+    // word for a foreign lessee (a lessee not known live is PR 10's
+    // frozen-tree class and IS judged).
+    {
+        use squeezefs::membership::{
+            self, JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole, MembershipOwner,
+        };
+        let owner = MembershipOwner::arm(
+            "census-owner",
+            3,
+            2,
+            LeaseClocks::derive(std::time::Duration::from_micros(250)).expect("derived clocks"),
+            LeaseClock::monotonic(),
+        )
+        .expect("arm the owner");
+        membership::install_owner(Arc::clone(&owner));
+        let ident = jvol.joined_wire().unwrap().identity;
+        let JoinOutcome::Granted(_) = owner.join(JoinRequest {
+            id: squeezefs::cowriter::node_member_id_of(ident.node_token, ident.mount_slot),
+            role: MemberRole::Writer,
+            endpoint: None,
+            pid: std::process::id(),
+            boot: "boot-census".to_string(),
+            prior_epoch: None,
+            pr_key: 0,
+            mount: None,
+        }) else {
+            panic!("the joiner joins the manager's shard as a writer member");
+        };
+    }
 
     // The joiner's directory, filled past the affinity cap: the children
     // spill into the joiner's ROTOR slots (their slot ≠ A).
@@ -2981,6 +3012,7 @@ async fn the_managers_census_takes_no_verdict_over_a_live_joiners_stale_projecte
     shutdown(&joiner).await;
     drop(jvol);
     drop(joiner);
+    squeezefs::membership::uninstall();
     mvol.checkpoint_now().await.unwrap();
     let report = inode_plane_over(&manager).await;
     assert_eq!(report.findings.len(), 0, "{:?}", report.findings);

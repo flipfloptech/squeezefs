@@ -3786,14 +3786,18 @@ async fn build_referenced_inos(
         // child slots re-read fresh, 442 false C10 findings). PR 8's
         // lessee-shard law scoped the INODE side only; the NAME side is
         // scoped here: the dentry set is complete on this mount only when
-        // no slot of the volume is leased elsewhere. Reading a live
+        // no slot of the volume is leased to a LIVE peer (the installed S6
+        // owner's word — `SlotCoverage::foreign_live`); a lessee NOT known
+        // live (dead-and-unrecorded, expired, or no plane) is PR 10's
+        // class — its tree frozen at its page root, its window scoped out
+        // (`foreign_window_inos`), the fleet judged. Reading a live
         // lessee's dentries through its holder (a census verb on the S8
         // wire) is the instrument that restores the verdict with joiners
         // live — PR 13's; until it lands the plane records NO verdict,
         // counted (`fsck_inode_plane_foreign_dentry_scoped`), never a
         // finding over a tree whose staleness it cannot bound.
         match kv.inode_plane_slot_coverage().await {
-            Ok(cov) if cov.foreign > 0 => {
+            Ok(cov) if cov.foreign_live > 0 => {
                 foreign_dentry_scoped += 1;
                 log::warn!(
                     "fsck C9/C10: meta volume {vol_idx} has {} slot(s) leased to another LIVE \
@@ -3802,7 +3806,7 @@ async fn build_referenced_inos(
                      census and the inode-plane classes record NO verdict this run \
                      (fsck_inode_plane_foreign_dentry_scoped; the lessee's clean leave or its \
                      recovery makes the set this mount's again)",
-                    cov.foreign
+                    cov.foreign_live
                 );
                 return (None, indexed, foreign_dentry_scoped);
             }

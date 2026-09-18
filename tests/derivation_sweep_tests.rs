@@ -3041,3 +3041,24 @@ fn sym_death_record_retire_age_ties_the_sweep_and_the_departed_key_memo() {
         "one tick past the retirement age the memo answers nothing"
     );
 }
+
+/// PR 12b review round 2, Issue 27: the fleet fsck collect loop's progress
+/// deadline is `max(shard lease TTL, 4 × shard 0's wall, FLOOR)`, and the
+/// FLOOR is the job wire's own dial/handshake deadline — a worker's
+/// proposal is one wire round trip, so "late" cannot be judged below the
+/// bound the wire grants a single dial (a shard 0 that finished in
+/// microseconds on an empty set must not read a worker still inside its
+/// first round trip as wedged). The floor carried no reason before; a
+/// drift between the two constants is red here.
+#[test]
+fn fleet_collect_progress_floor_is_the_job_wires_dial_deadline() {
+    assert_eq!(
+        squeezefs::fsck::fleet_collect_progress_floor(),
+        squeezefs::job_wire::ENROLL_DIAL_TIMEOUT,
+        "the collect loop's floor is the wire's dial deadline, never a free-floating second"
+    );
+    assert!(
+        squeezefs::fsck::fleet_collect_progress_floor() <= squeezefs::job_wire::LEASE_TTL,
+        "the floor never outranks the shipped shard lease TTL — it binds only where a harness shortens the TTL"
+    );
+}

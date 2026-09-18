@@ -3077,7 +3077,25 @@ async fn call_on(
             )));
         }
     }
-    let frame = decode_reply(&resp.body)?;
+    // A REFUSED status carries either an encoded reply (the holder's word
+    // — `Refused` / `Rejected` / `NotHolder` …) or the dispatch's own
+    // TEXT reason (the membership screen's "not a member" while a
+    // joiner re-enrols at a successor — PR 12b round 3, the `sym-crash`
+    // leg: decoded as a reply it read `invalid value: integer 105` and
+    // surfaced a user op's EIO). The text is the retryable class.
+    let frame = match decode_reply(&resp.body) {
+        Ok(f) => f,
+        Err(_) if resp.status == STATUS_REFUSED && !resp.body.is_empty() => {
+            return Err(SqueezefsError::refused(
+                libc::EAGAIN,
+                format!(
+                    "token holder refused the frame: {}",
+                    String::from_utf8_lossy(&resp.body)
+                ),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
     if frame.schema != TOKEN_SCHEMA {
         return Err(SqueezefsError::InvalidOperation(format!(
             "token holder answered in vocabulary schema {} (ours is {TOKEN_SCHEMA})",

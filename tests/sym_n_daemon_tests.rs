@@ -651,11 +651,22 @@ async fn concurrent_storms_on_four_writers_never_cross_a_record_into_another_app
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
 async fn concurrent_storms_on_eight_writers_at_the_fleets_depth() {
-    // Two rounds with an idle cadence between them — the fleet's N = 4
-    // row, its returns at the cadence, then its N = 8 row. Wire refusals
-    // of the manager's full ring (`joined_wire_failures`, the retry class)
-    // are legal under eight reactive refills at once; not judged here.
     concurrent_storms(8, 4, 6_000, 2, false).await;
+}
+
+/// The same shape at N = 2 and N = 1 — the bisection instruments for a
+/// finding the eight-writer form reports (which writer count first shows
+/// it); `--ignored` like their parent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn concurrent_storms_on_two_writers_at_the_fleets_depth() {
+    concurrent_storms(2, 4, 6_000, 2, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn concurrent_storms_on_one_writer_at_the_fleets_depth() {
+    concurrent_storms(1, 4, 6_000, 2, false).await;
 }
 
 async fn concurrent_storms(
@@ -689,10 +700,38 @@ async fn concurrent_storms(
     // are verified as they land).
     let mut dirs: Vec<u64> = Vec::new();
     let mut files: Vec<Vec<(String, u64)>> = vec![Vec::new(); daemons.len()];
+    // Every name a round REMOVED, per (dir, name): "deleted stays deleted"
+    // is judged on them after every daemon left — at the census AND at a
+    // fresh writer's lookup (a durable dentry that resolves is a
+    // resurrection, not a census artifact).
+    let mut removed: Vec<(u64, String)> = Vec::new();
     for round in 0..rounds {
         if round > 0 {
-            // The idle cadence between rows: the joiners' returnable extents
-            // go back to the manager, the grants refill at 50 %.
+            // The fleet's row boundary: every writer REMOVES its previous
+            // round's tree (the unlink storm — tombstones, leaf merges,
+            // retired extents returned to the manager at the cadence and
+            // re-granted) — then the idle cadence between rows.
+            let mut rms = Vec::new();
+            for (i, d) in daemons.iter().enumerate() {
+                let d = Arc::clone(d);
+                let dir = dirs[i];
+                let names: Vec<String> = files[i].iter().map(|(n, _)| n.clone()).collect();
+                removed.extend(names.iter().map(|n| (dir, n.clone())));
+                rms.push(tokio::spawn(async move {
+                    for name in names {
+                        d.unlink(dir, &name)
+                            .await
+                            .unwrap_or_else(|e| panic!("writer {i} unlink {name}: {e}"));
+                    }
+                    // The round's directory stays (empty): a joiner's
+                    // removal of its own directory under `/` answers
+                    // `Dentry not found` in this fixture — noted for the
+                    // cross-owner unlink's owner, not this pin's law.
+                }));
+            }
+            for r in rms {
+                r.await.expect("an unlink storm task");
+            }
             tokio::time::sleep(std::time::Duration::from_millis(3_000)).await;
         }
         dirs.clear();
@@ -856,7 +895,101 @@ async fn concurrent_storms(
     drop(mvol);
     drop(manager);
     drop(daemons);
+    // Deleted stays deleted: a fresh writer resolves NONE of the removed
+    // names (each was unlinked by its own creator, the unlink acked).
+    if !removed.is_empty() {
+        let fresh = open_under(&uris, &Knobs::armed()).await;
+        let mut resurrected = Vec::new();
+        for (dir, name) in &removed {
+            if let Ok(ino) = fresh.lookup(*dir, name).await {
+                resurrected.push((*dir, name.clone(), ino.ino, ino.nlink));
+            }
+        }
+        shutdown(&fresh).await;
+        assert!(
+            resurrected.is_empty(),
+            "{} of {} unlinked names RESOLVE at a fresh writer (first: {:?}) — deleted did not \
+             stay deleted",
+            resurrected.len(),
+            removed.len(),
+            &resurrected[..resurrected.len().min(4)]
+        );
+    }
     fsck_clean(&uris).await;
+}
+
+/// **Node incarnation seqs are one space per VOLUME, not per appender**
+/// (PR 13 — the fleet's `sym-scale` N = 8 row, defect 5; OPEN, routed to
+/// PR 12b): every appender seeds its node-seq handle from the SAME ledger
+/// watermark at its open, so two joiners' first mints carry the SAME
+/// `node_seq`, and every seq guard the CoW law rests on — the §4.2 child
+/// pointer check, the root pointer check, the §4.5 frame-incarnation
+/// check that ends a recycled extent's log at a previous node's frames —
+/// is void ACROSS appenders. The device showed it: one node extent with
+/// appender 3's header + base frame and three frames appender 4 appended
+/// into it, all under one `node_seq`, both appenders folding each other's
+/// records (finding 41's refusal, the tail pinned, D1.b). The law this
+/// pin states: two appenders of one volume never mint an equal
+/// `node_seq`. RED on this tree (`--ignored`, the PR 11 §5b precedent);
+/// the remedy is a per-incarnation seq space (a base derived from the
+/// volume uuid + appender id + term, the projection refresh's raise
+/// confined to the writer's own trees).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn two_joined_appenders_never_mint_an_equal_node_seq() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let j1 = join(&uris, &venue, &mvol, 1).await;
+    let j2 = join(&uris, &venue, &mvol, 2).await;
+    // One rotor mint each (a directory under `/` lands in the creator's
+    // rotor — a fresh slot tree, one node minted from the handle).
+    let d1 = j1
+        .create(1, "j1", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("j1's directory")
+        .ino;
+    let d2 = j2
+        .create(1, "j2", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("j2's directory")
+        .ino;
+    let seqs = |r: &Arc<RoutedMetaBackend>, who: &str| -> Vec<u64> {
+        let v = &r.volumes[0];
+        let mut out = Vec::new();
+        for s in v
+            .slot_leases()
+            .map(|p| p.gate.leased_slots())
+            .unwrap_or_default()
+        {
+            if let Some(t) = v.slot_tree(s) {
+                out.push(t.root().seq);
+            }
+        }
+        assert!(!out.is_empty(), "{who} minted no slot tree");
+        out
+    };
+    let s1 = seqs(&j1, "joiner 1");
+    let s2 = seqs(&j2, "joiner 2");
+    let shared: Vec<u64> = s1.iter().copied().filter(|s| s2.contains(s)).collect();
+    assert!(
+        shared.is_empty(),
+        "two joined appenders minted the same node_seq(s) {shared:?} (joiner 1 roots {s1:?}, \
+         joiner 2 roots {s2:?}) — one per-volume seq space, the cross-appender CoW hazard"
+    );
+    let _ = (d1, d2);
+    shutdown(&j2).await;
+    shutdown(&j1).await;
+    venue.tear_down();
+    shutdown(&manager).await;
 }
 
 /// **Own residue** (PR 2's law on a wire region, deliverable 4): the joiner

@@ -1423,10 +1423,25 @@ pub struct RegionGrant {
 }
 
 impl RegionGrant {
-    /// Adopt the runs a grant answered.
+    /// Adopt the runs a grant answered. An extent this grant already
+    /// HOLDS — claimed (a live image), parked on the tail, or in the
+    /// return batch — is never re-entered into the unclaimed set (PR 13,
+    /// defect 5's grant half): the manager's §5.3.5 verbatim answer and
+    /// its coalesced carve both describe the caller's remainder as it
+    /// stood at the caller's last page WRITE, and a claim that landed
+    /// since is inside those runs; re-unclaiming it handed a live node's
+    /// extent to the next mint (two appenders' frames under one node_seq
+    /// at one extent) or trimmed it into a `ReturnExtents` while its node
+    /// stood. Only a genuinely new extent counts as granted.
     pub fn add_runs(&mut self, runs: &[GrantRun]) {
         for r in runs {
             for e in r.start..r.start + u64::from(r.len) {
+                if self.claimed.contains(&e)
+                    || self.pending.iter().any(|(p, _)| *p == e)
+                    || self.returnable.contains(&e)
+                {
+                    continue;
+                }
                 if self.unclaimed.insert(e) {
                     self.granted += 1;
                 }

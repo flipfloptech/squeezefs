@@ -226,6 +226,50 @@ fn grant_size_derivation_floor_cap_and_the_knob_tie() {
     assert!(manager_should_release_role(45_001, 45_000));
 }
 
+/// **A run added to the grant never re-unclaims an extent the grant
+/// HOLDS** (PR 13, defect 5's grant half): the manager's §5.3.5 answer is
+/// the caller's page word VERBATIM whenever it covers the ask, and the
+/// page word is the remainder at the last page WRITE — the wire refill
+/// writes the page before it asks, but a claim that lands between that
+/// write and the manager's read, and the manager's own COALESCED carve
+/// (`coalesce_runs` over the remainder ∪ the fresh extents), both hand
+/// back runs that OVERLAP extents the appender has since claimed (live
+/// images), parked or moved to its return batch. `wire_extent_refill`'s
+/// `fresh` filter keeps a run unless EVERY extent of it is held, and the
+/// first `add_runs` inserted every extent of a kept run into `unclaimed`
+/// — a live image claimable again by the next mint (the device showed
+/// two appenders' frames under one node_seq at one extent), or trimmed
+/// into the return batch and RETURNED while its node stands. Held
+/// extents are skipped; only genuinely new ones count as granted.
+#[test]
+fn a_grant_run_overlapping_held_extents_adds_only_the_extents_the_grant_does_not_hold() {
+    let mut g = RegionGrant::default();
+    g.add_runs(&[GrantRun { start: 100, len: 4 }]);
+    assert_eq!(g.claim(), Some(100));
+    assert_eq!(g.claim(), Some(101));
+    g.free_pending(101, 500); // parked on the tail
+    g.add_runs(&[GrantRun { start: 102, len: 1 }]); // already unclaimed
+    g.advance_durable(500);
+    assert_eq!(g.returnable(), 1, "101 is in the return batch");
+    // The manager's coalesced answer: the whole original run again.
+    g.add_runs(&[GrantRun { start: 100, len: 6 }]);
+    assert_eq!(
+        g.unclaimed_runs(),
+        vec![GrantRun { start: 102, len: 4 }],
+        "100 (claimed — a live image) and 101 (returnable) never re-enter the unclaimed set"
+    );
+    assert_eq!(g.claimed(), 1);
+    assert_eq!(g.returnable(), 1);
+    assert_eq!(
+        g.granted, 6,
+        "four originals + the two genuinely new extents 104, 105"
+    );
+    assert_eq!(g.granted, g.held() + g.returned + g.unclaimed());
+    // A claim after the overlap answers the lowest UNCLAIMED extent —
+    // never the live image at 100.
+    assert_eq!(g.claim(), Some(102));
+}
+
 #[test]
 fn the_ram_grant_claims_lowest_first_parks_frees_on_its_tail_and_returns_past_it() {
     let mut g = RegionGrant::default();

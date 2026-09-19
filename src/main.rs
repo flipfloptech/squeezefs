@@ -1600,12 +1600,13 @@ enum JobActions {
         /// Metadata URI (sqmeta://...) of the volume set
         meta_uri: String,
     },
-    /// Rotate the set's job-wire enrollment secret (`job:enroll`) —
-    /// OFFLINE, on a quiesced set: the record is removed under the D0
-    /// guard and the next coordinator mints a fresh one; every member
-    /// re-enrolls at its next arm. The secret is minted once per set and
-    /// reused by every coordinator (1.3.0) — this verb is the only
-    /// rotation lever.
+    /// Rotate the set's job-wire enrollment secret
+    ///
+    /// Offline verb: unmount first. The `job:enroll` record is removed
+    /// under the exclusive writer guard; the next coordinator mints a
+    /// fresh secret and every member re-enrolls at its next arm. The
+    /// secret is minted once per set and reused by every coordinator,
+    /// so this verb is the only rotation lever.
     RotateEnroll {
         /// Metadata URI (sqmeta://...) of the volume set
         meta_uri: String,

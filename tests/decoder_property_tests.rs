@@ -2723,3 +2723,70 @@ proptest! {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// PR 12b round 3, Issue 30 — the S6 renewal's DECLARED WINDOW word at the
+// allocation holder's volume screen (the `cluster_wire_frame` arm 3d's
+// per-commit mirror): PR 3's bounded-execution law on the new wire word.
+// ---------------------------------------------------------------------------
+
+use squeezefs::block_grant::{screen_window_decl, BlockGrant, WindowDecl};
+
+proptest! {
+    /// Total over arbitrary integers (a start near `u64::MAX` never wraps
+    /// into the volume), and the verdict is exactly the law: every range
+    /// non-empty, inside `[0, blocks)` with `start + len ≤ blocks` in u64,
+    /// ascending and disjoint — so an accepted declaration covers at most
+    /// the volume and the adoption's walk is bounded by durable state.
+    #[test]
+    fn window_decl_screen_is_total_and_accepts_exactly_the_volume(
+        blocks in any::<u64>(),
+        ranges in prop::collection::vec((any::<u64>(), any::<u32>()), 0..12),
+    ) {
+        let decl = WindowDecl {
+            vol_tag: 0xd3c1,
+            ranges: ranges.iter().map(|(start, len)| BlockGrant { start: *start, len: *len }).collect(),
+        };
+        let verdict = screen_window_decl(&decl, blocks);
+        let mut prev_end = 0u64;
+        let mut expect_ok = true;
+        for r in &decl.ranges {
+            let Some(end) = r.start.checked_add(u64::from(r.len)) else {
+                expect_ok = false;
+                break;
+            };
+            if r.len == 0 || r.start >= blocks || end > blocks || r.start < prev_end {
+                expect_ok = false;
+                break;
+            }
+            prev_end = end;
+        }
+        prop_assert_eq!(verdict.is_ok(), expect_ok, "{:?} against {}: {:?}", decl, blocks, verdict);
+        if verdict.is_ok() {
+            let covered: u64 = decl.ranges.iter().map(|r| u64::from(r.len)).sum();
+            prop_assert!(covered <= blocks);
+        }
+    }
+
+    /// A WELL-FORMED declaration — what `held_block_ranges` builds:
+    /// ascending, disjoint, inside the volume — always passes.
+    #[test]
+    fn a_well_formed_window_decl_passes_the_screen(
+        blocks in 1u64..=1 << 40,
+        gaps in prop::collection::vec((1u32..=1 << 20, 0u32..=1 << 20), 0..12),
+    ) {
+        let mut ranges = Vec::new();
+        let mut cursor = 0u64;
+        for (len, gap) in gaps {
+            let start = cursor.saturating_add(u64::from(gap));
+            let Some(end) = start.checked_add(u64::from(len)) else { break };
+            if end > blocks {
+                break;
+            }
+            ranges.push(BlockGrant { start, len });
+            cursor = end;
+        }
+        let decl = WindowDecl { vol_tag: 1, ranges };
+        prop_assert_eq!(screen_window_decl(&decl, blocks), Ok(()));
+    }
+}

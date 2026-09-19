@@ -322,6 +322,63 @@ fn check_xv_step_bodies(data: &[u8]) {
 
 /// PR 7b: the striping verbs (`MetaVerb` 0x90–0x92) and their replies
 /// round-trip the S8 body, and the marker-name codec is total over the
+/// PR 12b round 3, Issue 30 — the S6 renewal's DECLARED WINDOW word
+/// (`block_grant::WindowDecl`, a peer's `(start, len: u32)` ranges) at the
+/// holder's screen: total over arbitrary integers, never a panic (a start
+/// near `u64::MAX` must not wrap into the volume), and its verdict is
+/// EXACTLY the law — a declaration passes iff every range is non-empty,
+/// inside `[0, blocks)` with `start + len ≤ blocks` in u64, ascending and
+/// disjoint — so an accepted declaration's ranges cover at most the
+/// volume and the adoption's work is bounded by durable state.
+fn check_window_decl_screen(data: &[u8]) {
+    use squeezefs::block_grant::{screen_window_decl, BlockGrant, WindowDecl};
+    let mut u = Unstructured::new(data);
+    let Ok(blocks) = u64::arbitrary(&mut u) else {
+        return;
+    };
+    let Ok(n) = u8::arbitrary(&mut u) else {
+        return;
+    };
+    let mut ranges = Vec::with_capacity(usize::from(n % 16));
+    for _ in 0..(n % 16) {
+        let (Ok(start), Ok(len)) = (u64::arbitrary(&mut u), u32::arbitrary(&mut u)) else {
+            break;
+        };
+        ranges.push(BlockGrant { start, len });
+    }
+    let decl = WindowDecl {
+        vol_tag: 0xd3c1,
+        ranges,
+    };
+    let verdict = screen_window_decl(&decl, blocks);
+    // The law, restated independently.
+    let mut prev_end = 0u64;
+    let mut expect_ok = true;
+    for r in &decl.ranges {
+        let Some(end) = r.start.checked_add(u64::from(r.len)) else {
+            expect_ok = false;
+            break;
+        };
+        if r.len == 0 || r.start >= blocks || end > blocks || r.start < prev_end {
+            expect_ok = false;
+            break;
+        }
+        prev_end = end;
+    }
+    assert_eq!(
+        verdict.is_ok(),
+        expect_ok,
+        "{decl:?} against {blocks}: {verdict:?}"
+    );
+    if verdict.is_ok() {
+        let covered: u64 = decl.ranges.iter().map(|r| u64::from(r.len)).sum();
+        assert!(
+            covered <= blocks,
+            "an accepted declaration never covers more than the volume"
+        );
+    }
+}
+
 /// bytes (a NUL-led name that is not a marker decodes to `None`, never a
 /// panic; every stripe index the codec emits decodes back).
 fn check_dir_stripe_bodies(data: &[u8]) {
@@ -447,6 +504,10 @@ fuzz_target!(|data: &[u8]| {
 
     // --- arm 3c (PR 7b): the striping verbs + the marker-name codec ------
     check_dir_stripe_bodies(data);
+
+    // --- arm 3d (PR 12b, Issue 30): the S6 renewal's declared-window word at
+    // the holder's volume screen — total, and exactly the law.
+    check_window_decl_screen(data);
 
     // --- arm 4: the proof helpers -------------------------------------------
     if let Ok(s) = std::str::from_utf8(data) {

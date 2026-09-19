@@ -1647,9 +1647,13 @@ async fn an_armed_holders_supply_terms_read_the_window_and_the_clear_population(
     // The last mints left the window under its refill point, so a
     // PROACTIVE ask may be in flight: it finds the freed holes and carves
     // one of them into the window — the supply is conserved (`remaining +
-    // clear`), read once the ask has landed both halves.
-    wait_until("the supply settles at the clear population", || {
-        a.free_supply_blocks() == 100
+    // clear`), read once the ask has landed both halves. The witness is
+    // the EVENT — no ask in flight, the supply settled — never the
+    // instantaneous remainder (PR 12b review round 3, Issue 32: the ask
+    // races the 100 frees and may carve the run cleared SO FAR, as short
+    // as one block, which the next mint empties; the law is conservation).
+    wait_until("the proactive top-up has landed", || {
+        !a.block_grant_topup_inflight() && a.free_supply_blocks() == 100
     })
     .await;
     assert_eq!(
@@ -1658,15 +1662,21 @@ async fn an_armed_holders_supply_terms_read_the_window_and_the_clear_population(
         "the clear population is the supply"
     );
     assert_eq!(a.lane_reachable_blocks(), 100);
-    // One mint carves a grant into the holes: supply = the window's
-    // remainder + the clear population, exactly one block fewer.
+    // One mint carves a grant into the holes (or consumes the one the
+    // proactive ask carved): supply = the window's remainder + the clear
+    // population, exactly one block fewer — and the window's ask reached
+    // the holder (the mechanism the terms read).
     let _ = a.allocate_block().await.unwrap();
+    wait_until("the mint's own top-up has landed", || {
+        !a.block_grant_topup_inflight()
+    })
+    .await;
     let clear = DATA_BLOCKS - holding.bitmap.population();
     assert_eq!(a.free_supply_blocks(), a.block_grant_remaining() + clear);
     assert_eq!(a.free_supply_blocks(), 99);
     assert!(
-        a.block_grant_remaining() > 0,
-        "a half-consumed grant is supply"
+        a.block_grant_topups() >= 1,
+        "the window asked the holder for the freed holes"
     );
     // No reader plane is armed here, so the valve's rungs are trivially
     // flat — pinned so a future arm cannot make an armed holder's full

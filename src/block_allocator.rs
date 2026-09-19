@@ -1034,6 +1034,15 @@ impl BlockAllocator {
             .unwrap_or_default()
     }
 
+    /// `true` while a PROACTIVE top-up ask is in flight (the detached
+    /// `kick_block_grant_topup` task) — the event a contract waits out
+    /// before reading the window at rest.
+    pub fn block_grant_topup_inflight(&self) -> bool {
+        self.block_grant
+            .get()
+            .is_some_and(|a| a.topup_inflight.load(Ordering::Acquire))
+    }
+
     /// Top-ups asked (`block_grant_topups`).
     pub fn block_grant_topups(&self) -> u64 {
         self.block_grant

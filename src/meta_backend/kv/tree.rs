@@ -2191,7 +2191,47 @@ impl KvTree {
                 for ext in &claimed_extents {
                     ctx.release_unpublished(*ext);
                 }
-                return Err(e);
+                // The finding-41 bounds refusal names the TREE and the
+                // NODE it fired in (PR 13 — the fleet's N = 8 row read a
+                // foreign slot's record in a leaf and the keys alone
+                // could not say which tree routed it there): this
+                // tree's slot, the source node's address / stamp /
+                // level, the root, and the slots of the records outside
+                // the bounds.
+                return Err(match e {
+                    KvError::Corrupt(msg) if msg.contains("outside its key bounds") => {
+                        // Each offender with its slot and its PROVENANCE:
+                        // `ram` = this mount's frozen delta applied into
+                        // the node, `disk` = folded from the image.
+                        let outside: Vec<String> = folded
+                            .iter()
+                            .filter(|r| r.key[..] < *node.min_key() || r.key[..] > *node.max_key())
+                            .take(4)
+                            .map(|r| {
+                                let from_ram = extra.iter().any(|x| x.key == r.key);
+                                format!(
+                                    "{:02x?} (slot {:?}, seq {}, {})",
+                                    r.key,
+                                    super::record::forest_key_slot(&r.key).ok(),
+                                    r.seq,
+                                    if from_ram { "ram" } else { "disk" }
+                                )
+                            })
+                            .collect();
+                        KvError::Corrupt(format!(
+                            "{msg}; SMO context: tree slot {:?} (id {}), source node {:#x} \
+                             stamped {:?} level {} root {:#x}, records outside the bounds: \
+                             {outside:?}",
+                            self.forest_slot,
+                            self.tree_id,
+                            node.addr(),
+                            node.forest_slot(),
+                            node.level(),
+                            self.root().addr
+                        ))
+                    }
+                    other => other,
+                });
             }
         };
         if log::log_enabled!(log::Level::Debug) {

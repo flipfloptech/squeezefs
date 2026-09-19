@@ -366,7 +366,25 @@
 #                       directory the manager holds — gate 4 (c): a victim
 #                       dies mid-plan and the intent rolls FORWARD: every
 #                       name at exactly one of source / destination, every
-#                       returned mv at the destination).
+#                       returned mv at the destination). K = every joiner
+#                       is admitted (gate 4 (e) proper — the manager reads
+#                       the oracle). `--striped` flips every storm
+#                       directory to SQZ_MWMATRIX_SYM_STRIPE_K (64) stripes
+#                       before its creators start (gate 4 (d') — a holder
+#                       dies with inserts in flight on its stripes; C17
+#                       judged 0 after). On a `--token-readers` fleet the
+#                       RECALLED-READER arm runs each round: the reader
+#                       takes a token on a victim's acked object before
+#                       the kill, the successor lessee (the manager)
+#                       setattrs it after the recovery, the reader is
+#                       recalled (`dlm_token_recalls_received`) and reads
+#                       the new word exactly. The `sym-crash` leg (the
+#                       manager's kill) on a ≥ 8-member fleet is gate 4
+#                       (d''): every joiner parks at T_self and reclaims
+#                       (`appender_park_expiries == 0`,
+#                       `membership_self_fences == 0` per joiner), and the
+#                       removed round directory is GONE through every
+#                       mount ("deleted stays deleted").
 #   sym-tarx            (symmetric PR 13 — design §8 gate 2; needs
 #                       `mw_fleet.sh create --symmetric --writers>=1` and
 #                       SQZ_MWMATRIX_TAR_SRC=<linux>/fs) `tar -x` on a JOINED
@@ -763,6 +781,10 @@ SYM_INGEST_MB="${SQZ_MWMATRIX_SYM_INGEST_MB:-1024}"
 SYM_TOUCH_ROUNDS="${SQZ_MWMATRIX_SYM_TOUCH_ROUNDS:-3}"
 SYM_VICTIMS=1
 SYM_XO=0
+SYM_STRIPED=0
+# `--striped`'s K: the design's operating point (`MINT_SPREAD` = 64 — a
+# flip to fewer stripes than the fleet's creators is a different row).
+SYM_STRIPE_K="${SQZ_MWMATRIX_SYM_STRIPE_K:-64}"
 for a in "$@"; do
     case "$a" in
     --sym-files=*) SYM_FILES="${a#--sym-files=}" ;;
@@ -772,6 +794,7 @@ for a in "$@"; do
     --touch-rounds=*) SYM_TOUCH_ROUNDS="${a#--touch-rounds=}" ;;
     --victims=*) SYM_VICTIMS="${a#--victims=}" ;;
     --cross-owner) SYM_XO=1 ;;
+    --striped) SYM_STRIPED=1 ;;
     --require-host-scoped-subsys) REQUIRE_HS=1 ;;
     --window=*) S6_WINDOW_S="${a#--window=}" ;;
     --netem=*) S6_NETEM_MS="${a#--netem=}" ;;
@@ -2994,8 +3017,10 @@ leg_sym_storm() {
     mapfile -t joiners < <(joiner_idxs)
     [ "${#joiners[@]}" -ge 2 ] ||
         die "sym-storm needs a symmetric fleet with ≥ 2 joined writers — create it with: sudo tests/mw_fleet.sh create N=2 --symmetric --writers=3 --lease-ttl-ms=15000"
-    [[ "$SYM_VICTIMS" =~ ^[1-9][0-9]*$ ]] && [ "$SYM_VICTIMS" -lt "${#joiners[@]}" ] ||
-        die "sym-storm --victims=$SYM_VICTIMS needs 1 ≤ K < joiners (${#joiners[@]}) — at least one joiner must survive to read the oracle"
+    # K = every joiner is gate 4 (e) — "N appenders at once": the MANAGER
+    # is then the surviving reader of the oracle (PR 13).
+    [[ "$SYM_VICTIMS" =~ ^[1-9][0-9]*$ ]] && [ "$SYM_VICTIMS" -le "${#joiners[@]}" ] ||
+        die "sym-storm --victims=$SYM_VICTIMS needs 1 ≤ K ≤ joiners (${#joiners[@]})"
     m_mnt="$(mnt_of 0)"
     rowdir="$STATE/rows/symstorm-$(date +%s)"
     mkdir -p "$rowdir"
@@ -3003,7 +3028,17 @@ leg_sym_storm() {
     # The regions a dead joiner holds = one per metadata volume it leases
     # slots on (every joiner's rotor spans every volume of the set).
     nvol="$(echo "$META_PATHS" | tr ',' '\n' | grep -c .)"
-    log "sym-storm: ${#joiners[@]} joined writer(s) + the manager write under the acked-writes oracle$([ "${SYM_XO:-0}" = "1" ] && echo ' + a cross-owner MOVER per joiner (its acked files renamed into a directory the MANAGER holds — a victim dies mid-plan, the intent rolls forward)'); $SYM_VICTIMS joiner(s) killed -9 AT ONCE per round, recovered by the manager's ledger (lease TTL ${ttl_ms} ms, $nvol region(s) each); x$S7_ROUNDS rounds"
+    # The recalled-reader arm (gate 4's last clause, PR 13): a `-o ro`
+    # TOKEN reader holds a token on a victim's object across the kill; the
+    # successor lessee (the manager, after the recovery) mutates that
+    # object and the reader is RECALLED before it can serve the stale
+    # word — `dlm_token_recalls_received` moves and the next resolve is
+    # exact. Only on a `--token-readers` fleet.
+    local token_reader=""
+    if [ "${TOKEN_READERS:-0}" = "1" ]; then
+        token_reader="$(member_idxs | awk '$1!=0' | head -1)"
+    fi
+    log "sym-storm: ${#joiners[@]} joined writer(s) + the manager write under the acked-writes oracle$([ "${SYM_XO:-0}" = "1" ] && echo ' + a cross-owner MOVER per joiner (its acked files renamed into a directory the MANAGER holds — a victim dies mid-plan, the intent rolls forward)')$([ "${SYM_STRIPED:-0}" = "1" ] && echo " + every storm directory STRIPED (K=$SYM_STRIPE_K) before its creators start — a victim dies with inserts in flight on its stripes (gate 4 d', C17 judged after)")$([ -n "$token_reader" ] && echo " + the recalled-reader arm on m$token_reader"); $SYM_VICTIMS joiner(s) killed -9 AT ONCE per round, recovered by the manager's ledger (lease TTL ${ttl_ms} ms, $nvol region(s) each); x$S7_ROUNDS rounds"
     printf '%-6s %-9s %-14s %-10s %-10s %-8s %s\n' ROUND PHASE_MS VICTIMS RECOVER_S ACKED LOST VERDICT | tee "$rowdir/matrix.tsv"
     for ((round = 1; round <= S7_ROUNDS; round++)); do
         victims=()
@@ -3025,6 +3060,18 @@ leg_sym_storm() {
         for idx in 0 "${joiners[@]}"; do
             dir="$(mnt_of "$idx")/storm-w$idx-r$round"
             ledger="$rowdir/acked-w$idx-r$round.ledger"
+            if [ "${SYM_STRIPED:-0}" = "1" ]; then
+                # Gate 4 (d'): the writer's directory is flipped to K
+                # stripes by its HOLDER (the explicit flip is holder-local
+                # until PR 12 — the creator mints the directory, so it is
+                # the holder) before the creators start; the kill lands
+                # with inserts and migrations in flight on the stripes.
+                mkdir -p "$dir" || die "round $round: mkdir $dir"
+                setfattr -n user.squeezefs.stripes -v "$SYM_STRIPE_K" "$dir" ||
+                    die "round $round: the explicit stripe flip of $dir (K=$SYM_STRIPE_K) refused on m$idx"
+                [ "$(getfattr -n user.squeezefs.stripes --only-values "$dir" 2>/dev/null)" = "$SYM_STRIPE_K" ] ||
+                    die "round $round: $dir does not read back K=$SYM_STRIPE_K stripes"
+            fi
             ack_writer "$dir" "$ledger" "w$idx:r$round" &
             pids+=($!)
             if [ "${SYM_XO:-0}" = "1" ] && [ "$idx" != "0" ]; then
@@ -3034,6 +3081,22 @@ leg_sym_storm() {
         done
         phase_ms=$((2000 + RANDOM % 6000))
         sleep "$(python3 -c "print($phase_ms/1000)")"
+        # The recalled-reader arm's TOKEN: the reader resolves one acked
+        # object of the first victim (a getattr = one inode token from the
+        # victim's plane) before the kill.
+        local rr_obj="" rr_recalls0=0 rr_grants0=0
+        if [ -n "$token_reader" ]; then
+            rr_obj="$(head -1 "$rowdir/acked-w${victims[0]}-r$round.ledger" 2>/dev/null || true)"
+            rr_obj="${rr_obj#"$(mnt_of "${victims[0]}")"}"
+            if [ -n "$rr_obj" ]; then
+                rr_grants0="$(stat_sum "$token_reader" dlm_token_grants)"
+                timeout 60 stat "$(mnt_of "$token_reader")$rr_obj" >/dev/null 2>&1 ||
+                    die "round $round: the token reader m$token_reader could not resolve victim m${victims[0]}'s acked object $rr_obj before the kill"
+                [ "$(stat_sum "$token_reader" dlm_token_grants)" -gt "$rr_grants0" ] 2>/dev/null ||
+                    die "round $round: the token reader's resolve of $rr_obj took no token (dlm_token_grants flat at $rr_grants0)"
+                rr_recalls0="$(stat_sum "$token_reader" dlm_token_recalls_received)"
+            fi
+        fi
         # Every daemon's .stats MID-STORM, bounded (round 3: a round whose
         # first ops parked 17 s at every daemon acked 25 files and died at
         # its oracle with no gauge of the stall on record — the stall's
@@ -3081,11 +3144,13 @@ leg_sym_storm() {
         # a name is at its source OR its cross-owner destination, never
         # both, never neither — and every RETURNED mv is at the destination.
         local acked=0 lost=0 n l
+        local -a oracle_readers=(0)
+        [ "${#survivors[@]}" -gt 0 ] && oracle_readers+=("${survivors[0]}")
         for idx in 0 "${joiners[@]}"; do
             ledger="$rowdir/acked-w$idx-r$round.ledger"
             n="$(wc -l <"$ledger" | tr -d ' ')"
             acked=$((acked + n))
-            for reader_idx in 0 "${survivors[0]}"; do
+            for reader_idx in "${oracle_readers[@]}"; do
                 if [ "${SYM_XO:-0}" = "1" ] && [ "$idx" != "0" ]; then
                     l="$(ack_verify_xo "$ledger" "w$idx:r$round" "$(mnt_of "$idx")" "$(mnt_of "$reader_idx")" "$rowdir/lost-r$round.txt" "/storm-xo-r$round" "w$idx" "$rowdir/moved-w$idx-r$round.ledger")"
                 else
@@ -3096,7 +3161,25 @@ leg_sym_storm() {
         done
         [ "$lost" = "0" ] ||
             die "round $round: ACKED-WRITES ORACLE RED — $lost miss(es) over $acked fsynced file(s) across the manager and joiner ${survivors[0]} (see $rowdir/lost-r$round.txt)"
-        log "round $round: acked-writes oracle GREEN ($acked fsynced file(s) from ${#joiners[@]} joiners + the manager, all present at the manager and at joiner ${survivors[0]})"
+        log "round $round: acked-writes oracle GREEN ($acked fsynced file(s) from ${#joiners[@]} joiners + the manager, all present at the manager and at ${survivors[0]:+joiner }${survivors[0]:-the manager})"
+        # The recalled-reader arm's VERDICT: the recovered slot's lessee
+        # is the manager now; its first mutation of the object the reader
+        # holds a token on RECALLS the reader (the conveyor pass's hook,
+        # PR 5) before the commit, and the reader's next resolve is the
+        # new word — never the cached one. A setattr keeps the name (the
+        # ledgers below still verify it).
+        if [ -n "$rr_obj" ]; then
+            chmod 0600 "$m_mnt$rr_obj" ||
+                die "round $round: the manager could not setattr the recovered object $rr_obj"
+            local rr_mode rr_recalls
+            rr_mode="$(timeout 60 stat -c %a "$(mnt_of "$token_reader")$rr_obj" 2>/dev/null || echo TIMEOUT)"
+            [ "$rr_mode" = "600" ] ||
+                die "round $round: the token reader m$token_reader reads mode $rr_mode for $rr_obj after the successor's setattr (want 600 — a stale token served)"
+            rr_recalls="$(stat_sum "$token_reader" dlm_token_recalls_received)"
+            [ "$rr_recalls" -gt "$rr_recalls0" ] 2>/dev/null ||
+                die "round $round: the token reader's dlm_token_recalls_received is flat at $rr_recalls0 across the successor's mutation of $rr_obj (the recovered slot's lessee recalled nobody)"
+            log "round $round: recalled-reader arm GREEN (reader m$token_reader recalled $((rr_recalls - rr_recalls0))×, reads the successor's setattr exactly)"
+        fi
         # The victims remount: a FRESH region each (a Recovered ring is
         # never rejoined), every name readable there too.
         for k in "${victims[@]}"; do
@@ -3155,6 +3238,14 @@ $out"
             [ "$(stat_sum "$idx" meta_kv_block_refs_drift)" = "0" ] || die "round $round: meta_kv_block_refs_drift != 0 on m$idx"
             [ "$(stat_sum "$idx" meta_kv_replay_dropped_torn)" = "0" ] || die "round $round: meta_kv_replay_dropped_torn != 0 on m$idx"
         done
+        # Gate 4 (d'): the stripe census (C17, report-only) is clean after
+        # a holder died with inserts in flight on its stripes — read off
+        # the manager's fsck, which walks the striped population.
+        if [ "${SYM_STRIPED:-0}" = "1" ]; then
+            local c17
+            c17="$(stat_sum 0 fsck_stripe_findings)"
+            [ "$c17" = "0" ] || die "round $round: fsck_stripe_findings=$c17 after the striped storm (C17 must stay 0)"
+        fi
         local recorded acted
         recorded="$(stat_sum 0 dead_members_recorded)"
         acted="$(stat_sum 0 dead_members_acted)"
@@ -3321,16 +3412,44 @@ PYEOF
 # set + the cross-owner and token tripwires); `dlm_rpcs` is asserted
 # ABSOLUTE: an own-slot op never pays a lock round trip (gate 1's law on
 # every rung).
+SYM_ZERO_KEYS="meta_kv_forest_key_violations appender_fence_breach foreign_frame_overwrite_detected \
+    manager_verb_refusals meta_kv_replay_key_violations meta_kv_replay_lease_violations \
+    meta_kv_replay_extent_violations fsck_slot_custody_conflicts slot_lease_conflicts \
+    appender_park_expiries meta_kv_leaf_lease_refusals dlm_token_recall_timeouts_live \
+    appender_flush_ceiling_overruns dead_member_write_deferrals data_alloc_bitmap_drift \
+    joined_control_refusals xv_cross_owner_intents_stuck manager_dependency_stalls \
+    dlm_token_custody_rejected invariant_tripwires data_dma_fence_refusals \
+    extent_grant_conflicts"
+
+# The must-stay-0 set on one daemon as a REPORT: prints every violated
+# gauge as `key=value` (nothing on a clean daemon). The rows that publish a
+# table read it so a violated law lands IN the row's VERDICT column with
+# its number beside the row's rates, instead of a die before the row
+# prints (sym-scale N = 8's first read of `appender_flush_ceiling_overruns`
+# had no row to stand beside).
+sym_zero_violations() { # idx
+    local idx="$1" k v
+    for k in $SYM_ZERO_KEYS; do
+        v="$(stat_sum "$idx" "$k")"
+        [ "$v" = "0" ] || printf '%s=%s ' "$k" "$v"
+    done
+}
+
+# The same set judged as a per-row DELTA between the row's two snapshots
+# (`snap … <label>0` / `<label>1`): a cumulative gauge another row (or a
+# previous run on the same fleet) moved is that row's finding, not this
+# one's. Prints `key=+delta` per violation.
+sym_zero_violations_delta() { # rowdir idx label
+    local rowdir="$1" idx="$2" label="$3" k v
+    for k in $SYM_ZERO_KEYS; do
+        v="$(sym_delta "$rowdir" "$idx" "$label" "$k")"
+        [ "$v" = "0" ] || printf '%s=+%s ' "$k" "$v"
+    done
+}
+
 sym_zero_set() { # label idx
     local label="$1" idx="$2" k v
-    for k in meta_kv_forest_key_violations appender_fence_breach foreign_frame_overwrite_detected \
-        manager_verb_refusals meta_kv_replay_key_violations meta_kv_replay_lease_violations \
-        meta_kv_replay_extent_violations fsck_slot_custody_conflicts slot_lease_conflicts \
-        appender_park_expiries meta_kv_leaf_lease_refusals dlm_token_recall_timeouts_live \
-        appender_flush_ceiling_overruns dead_member_write_deferrals data_alloc_bitmap_drift \
-        joined_control_refusals xv_cross_owner_intents_stuck manager_dependency_stalls \
-        dlm_token_custody_rejected invariant_tripwires data_dma_fence_refusals \
-        extent_grant_conflicts; do
+    for k in $SYM_ZERO_KEYS; do
         v="$(stat_sum "$idx" "$k")"
         [ "$v" = "0" ] || die "$label: $k=$v on m$idx (must stay 0)"
     done
@@ -3562,7 +3681,11 @@ leg_sym_scale() {
     mkdir -p "$rowdir"
     log "sym-scale: N ∈ {${ns[*]}} RW mounts each creating $SYM_FILES files ($SYM_THREADS threads) in its OWN directory, then ingesting $SYM_INGEST_MB MiB (4 MiB blocks, conv=fsync); exactly N appenders live per row"
     printf '%-4s %-10s %-8s %-10s %-8s %-9s %-8s %-8s %-8s %-6s %s\n' N CREATE_S RATIO INGEST_MBS RATIO MGR_LOAD MGR_CPU HANDOV SHIPS RPCS VERDICT | tee "$rowdir/symscale-table.tsv"
-    local n rate1="" ingest1="" verdict_all=MET
+    local n rate1="" ingest1="" verdict_all=MET zero_miss_all=""
+    # A per-run tag on every directory: a died run's residue never
+    # collides with the next run's creates ("File exists").
+    local SYM_RUN
+    SYM_RUN="$(date +%s)"
     for n in "${ns[@]}"; do
         local -a writers=(0)
         local i
@@ -3577,8 +3700,8 @@ leg_sym_scale() {
         local -a pids=()
         t0="$(date +%s.%N)"
         for idx in "${writers[@]}"; do
-            mkdir -p "$(mnt_of "$idx")/scale-n$n-w$idx"
-            "$SYM_STORM" "$(mnt_of "$idx")/scale-n$n-w$idx" "$SYM_THREADS" "$SYM_FILES" create \
+            mkdir -p "$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx"
+            "$SYM_STORM" "$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx" "$SYM_THREADS" "$SYM_FILES" create \
                 >"$rowdir/create-n$n-w$idx.txt" 2>&1 &
             pids+=($!)
         done
@@ -3592,7 +3715,7 @@ leg_sym_scale() {
         pids=()
         t0="$(date +%s.%N)"
         for idx in "${writers[@]}"; do
-            dd if=/dev/zero of="$(mnt_of "$idx")/scale-n$n-w$idx/ingest.bin" bs=4M \
+            dd if=/dev/zero of="$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx/ingest.bin" bs=4M \
                 count=$((SYM_INGEST_MB / 4)) conv=fsync status=none 2>"$rowdir/ingest-n$n-w$idx.err" &
             pids+=($!)
         done
@@ -3607,7 +3730,7 @@ leg_sym_scale() {
         # THE ENGAGEMENT LAW (§8 gate 3): every mount in its own slot
         # trees — no handover, no ship, no lock RPC; the manager's load
         # is what its verbs cost, reported per N.
-        local handovers=0 ships=0 rpcs=0 v
+        local handovers=0 ships=0 rpcs=0 v zero_miss=""
         for idx in "${writers[@]}"; do
             v="$(sym_delta "$rowdir" "$idx" "n$n" slot_handovers)"
             handovers=$((handovers + v))
@@ -3615,7 +3738,8 @@ leg_sym_scale() {
             ships=$((ships + v))
             v="$(stat_field "$idx" dlm_rpcs)"
             rpcs=$((rpcs + v))
-            sym_zero_set "sym-scale N=$n" "$idx"
+            v="$(sym_zero_violations_delta "$rowdir" "$idx" "n$n")"
+            [ -z "$v" ] || zero_miss="$zero_miss m$idx:{$v}"
         done
         [ "$handovers" = "0" ] || die "sym-scale N=$n: slot_handovers=$handovers (must be 0 — each mount writes its own trees)"
         [ "$ships" = "0" ] || die "sym-scale N=$n: slot_ships=$ships (must be ≈ 0)"
@@ -3632,13 +3756,20 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t0):.0f}')")"
         cr="$(python3 -c "print(f'{$create_rate/$rate1:.2f}')")"
         ir="$(python3 -c "print(f'{$ingest_rate/$ingest1:.2f}')")"
         verdict="$(python3 -c "print('MET' if $create_rate >= 0.7*$n*$rate1 and $ingest_rate >= 0.7*$n*$ingest1 else 'MISS')")"
+        # A violated must-stay-0 law is the row's verdict too — printed
+        # with its number, and the leg exits nonzero after the table.
+        if [ -n "$zero_miss" ]; then
+            verdict="MISS(must-stay-0:$zero_miss)"
+            zero_miss_all="$zero_miss_all N=$n:$zero_miss"
+        fi
         [ "$verdict" = "MET" ] || verdict_all=MISS
         printf '%-4s %-10s %-8s %-10s %-8s %-9s %-8s %-8s %-8s %-6s %s\n' "$n" "$create_rate" "${cr}x" "$ingest_rate" "${ir}x" "$mgr_load" "${mgr_cpu}%" "$handovers" "$ships" "$rpcs" "$verdict" | tee -a "$rowdir/symscale-table.tsv"
         for idx in "${writers[@]}"; do
-            rm -rf "$(mnt_of "$idx")/scale-n$n-w$idx" 2>/dev/null || true
+            rm -rf "$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx" 2>/dev/null || true
         done
     done
     echo "gate 3 (≥ 0.7 × N × the N=1 rate on BOTH rows; the manager's load flat in N): $verdict_all" | tee "$rowdir/symscale-verdict.txt"
+    [ -z "$zero_miss_all" ] || die "sym-scale: a must-stay-0 gauge moved:$zero_miss_all (rows above; the leg is RED)"
     # Every joiner back up for the legs that follow.
     sym_ensure_joiners $((${#joiners[@]} + 1)) "${joiners[@]}"
     sym_oracle sym-scale "$rowdir"
@@ -4127,6 +4258,28 @@ s7_kill_body() { # [sym]
         log "round $round: acked-writes oracle GREEN ($acked fsynced file(s) all present with content)"
         rm -rf "$ack_dir" 2>/dev/null || true
         if [ "$sym" = "sym" ]; then
+            # "Deleted stays deleted" (PR 13 — the oracle's other half, the
+            # 12b C10 finding's class): the round's directory the successor
+            # just removed is GONE through every joined writer and the
+            # reader — never a name a stale projection or token still
+            # serves. Bounded stats; a parked lookup is a red, not a hang.
+            local sidx src stale=0
+            for sidx in $(joiner_idxs) $reader_idx; do
+                if timeout 60 stat "$(mnt_of "$sidx")/acked-r$round" >/dev/null 2>&1; then
+                    src=0
+                else
+                    src=$?
+                fi
+                if [ "$src" = "124" ]; then
+                    die "round $round: stat of the removed acked-r$round through m$sidx HUNG past 60 s (a parked lookup)"
+                elif [ "$src" = "0" ]; then
+                    stale=$((stale + 1))
+                    echo "STALE: m$sidx still resolves acked-r$round" >>"$rowdir/stale-r$round.txt"
+                fi
+            done
+            [ "$stale" = "0" ] || die "round $round: the removed acked-r$round still resolves through $stale mount(s) (see $rowdir/stale-r$round.txt)"
+        fi
+        if [ "$sym" = "sym" ]; then
             # The symmetric fleet's device fence is the D0 guard's PR on the
             # METADATA namespaces (`flock+pr` — the death path's preempt
             # target); `data_plane_fence_mode` there is the job wire's
@@ -4255,6 +4408,14 @@ sym_crash_round_asserts() { # round rowdir
                 die "round $round: joined writer m$j is still PARKED $(($(date +%s) - t0)) s after the successor armed (appender_parked=$parked; its reclaim never landed — membership_reclaim_refusals=$(stat_sum "$j" membership_reclaim_refusals))"
             sleep 1
         done
+        # Gate 4 (d'') on a home shard of ≥ 8 members: the joiner PARKED at
+        # T_self and RECLAIMED in the successor's grace — never expired
+        # into the poison, never had a region recovered for it (the
+        # manager's `appender_recoveries == 0` above is that half).
+        v="$(stat_sum "$j" appender_park_expiries)"
+        [ "$v" = "0" ] || die "round $round: joined writer m$j appender_park_expiries=$v (the park expired into the poison instead of reclaiming)"
+        [ "$(stat_sum "$j" membership_self_fences)" = "0" ] ||
+            die "round $round: joined writer m$j membership_self_fences != 0 across the manager's death"
         f="$jm/after-failover-r$round-m$j"
         mkdir -p "$f" || die "round $round: joined writer m$j could not create after the manager failover"
         echo "r$round" >"$f/mark" || die "round $round: joined writer m$j could not write after the manager failover"

@@ -3489,6 +3489,13 @@ impl KvMetaBackend {
             return self.writer_read_plane_for(object).await;
         };
         let Some(holder) = self.reader_holder_of(object).await? else {
+            // A plane serves nothing until its recall channel's first
+            // round lands (`serve_gate`): the FIRST resolve after the arm
+            // parks on it — bounded by the freshness window — instead of
+            // failing closed on the dial's own latency (PR 13: the first
+            // `--token-readers` fleet read EIO on its first stat; the
+            // writer's divert already waited, PR 12b round 1 Issue 8).
+            default.await_channel_fresh().await;
             return Ok(Some(Arc::clone(default)));
         };
         let bound = self
@@ -3537,14 +3544,17 @@ impl KvMetaBackend {
         };
         // One plane per LISTENER: the manager's own endpoint is the
         // manager's plane (a holder the manager's daemon also serves), and
-        // an endpoint already dialed for another holder is reused.
+        // an endpoint already dialed for another holder is reused. Either
+        // way the resolve parks on the channel's first round (above).
         if *endpoint == *default.endpoint() {
+            default.await_channel_fresh().await;
             return Ok(Some(Arc::clone(default)));
         }
         if let Some(plane) = self
             .reader_holder_planes
             .read_sync(&endpoint, |_, p| Arc::clone(p))
         {
+            plane.await_channel_fresh().await;
             return Ok(Some(plane));
         }
         let cfg = default.config_for_endpoint(&endpoint);
@@ -3567,14 +3577,21 @@ impl KvMetaBackend {
                      §5.1.6)",
                     self.path.display()
                 );
+                // The dial's first round is this resolve's own latency —
+                // never the caller's refusal.
+                plane.await_channel_fresh().await;
                 Ok(Some(plane))
             }
             // A racing resolve dialed first: its plane stands, ours dies.
             Err(_) => {
                 plane.stop_dead();
-                Ok(self
+                let winner = self
                     .reader_holder_planes
-                    .read_sync(&endpoint, |_, p| Arc::clone(p)))
+                    .read_sync(&endpoint, |_, p| Arc::clone(p));
+                if let Some(w) = &winner {
+                    w.await_channel_fresh().await;
+                }
+                Ok(winner)
             }
         }
     }

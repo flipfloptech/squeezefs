@@ -1084,6 +1084,102 @@ async fn a_token_reader_dials_each_objects_slot_holder_and_refuses_an_unbound_on
     shutdown(&writer).await;
 }
 
+/// **PR 13 (found by the first `--token-readers` fleet — a PR 12 defect)**:
+/// a `-o ro` reader's FIRST resolve of an object in a slot another appender
+/// leases dials that holder's plane lazily and must SERVE — never fail
+/// closed on "the recall channel to the holder is not fresh". The channel
+/// task's first round is the dial's own latency, so the divert parks on it
+/// (the writer's `foreign_read_plane` already did, PR 12b round 1 Issue 8;
+/// the reader's `token_reader_for` returned the plane the instant it was
+/// spawned). The fleet read `stat: Input/output error` on a joiner's fresh
+/// directory at the reader's first touch; the contract above waited for
+/// freshness by hand before its `getattr` — the defect's own shape. The
+/// same law holds for the manager's plane right after the arm: the first
+/// resolve after `arm_token_reader` serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_readers_first_resolve_of_a_freshly_dialed_holder_serves_without_a_hand_wait() {
+    use squeezefs::cluster_wire as cw;
+    use squeezefs::meta_ship::token_plane::{TokenClientConfig, TokenSetService};
+    const SECRET: &[u8] = b"pr13-fresh-dial-secret";
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempfile::tempdir().unwrap();
+    let uris = vec![format_stamped_member(dir.path(), "sym0").await];
+    let (shared, mine) = {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        let shared = seed_dir_in_slot(&routed, 0, SLOT_B, "shared").await;
+        let mine = routed
+            .create(ROOT, "mine", libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("an own file")
+            .ino;
+        routed.volumes[0]
+            .release_slot_handover(0, SLOT_B)
+            .await
+            .expect("release to unleased");
+        shutdown(&routed).await;
+        (shared, mine)
+    };
+    let writer = open_under(&uris, &Knobs::armed().partition(TWO_HOLDERS)).await;
+    writer.volumes[0]
+        .checkpoint_now()
+        .await
+        .expect("publish tree 0");
+    let listener = |name: &'static str| {
+        cw::RpcListener::start_async(
+            cw::RpcListenerConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("literal addr"),
+                service_threads: 2,
+                ..cw::RpcListenerConfig::default()
+            },
+            SECRET.to_vec(),
+            TokenSetService::new(&writer.volumes),
+        )
+        .unwrap_or_else(|e| panic!("listener {name}: {e}"))
+    };
+    let a = listener("A");
+    let b = listener("B");
+    let reader = squeezefs::meta_backend::open_routed_meta_set_read_only(&uris)
+        .await
+        .expect("read-only open");
+    let rv = Arc::clone(&reader.volumes[0]);
+    rv.arm_reader_revalidation(None)
+        .expect("the reader's revalidation arms");
+    let default = rv
+        .arm_token_reader(TokenClientConfig {
+            endpoint: a.endpoint().to_string(),
+            secret: SECRET.to_vec(),
+            client_id: "pr13-reader".to_string(),
+            volume: 0,
+        })
+        .expect("the manager's plane arms");
+    // The manager's plane: the FIRST resolve after the arm, no wait.
+    reader
+        .getattr(mine)
+        .await
+        .expect("the first resolve after the arm serves under a token from A");
+    assert_eq!(default.stats().grants, 1);
+    // The holder's plane: bound, then the FIRST resolve, no wait.
+    rv.bind_reader_holder_endpoint(1, &b.endpoint().to_string());
+    reader
+        .getattr(shared)
+        .await
+        .expect("the first resolve of a freshly dialed holder serves under a token from B");
+    let planes = rv.reader_holder_planes();
+    assert_eq!(planes.len(), 1, "one per-holder plane dialed");
+    assert_eq!(planes[0].stats().grants, 1, "one grant from B");
+    assert_eq!(
+        planes[0].stats().serve_refusals,
+        0,
+        "the dial's first round was awaited, never refused"
+    );
+    assert_eq!(default.stats().serve_refusals, 0);
+    shutdown(&reader).await;
+    a.shutdown();
+    b.shutdown();
+    shutdown(&writer).await;
+}
+
 // ===========================================================================
 // 6. plane_gate keys on the held ALLOCATION LEASE
 // ===========================================================================

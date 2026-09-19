@@ -14722,6 +14722,12 @@ impl SqueezefsFilesystem {
                         "data_alloc_bitmap_leaks_pending".into(),
                         serde_json::json!(meta_kv::alloc_lease::leaks_pending_total()),
                     );
+                    // Round 6 (Issue 30): a peer's declared window refused
+                    // by the volume screen — must-stay-0.
+                    metrics.insert(
+                        "data_alloc_bitmap_decls_rejected".into(),
+                        load(&crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_DECLS_REJECTED),
+                    );
                     // Review round 2 — appended at the END of the block:
                     // the death ledger's retry / retirement / quarantine
                     // faces (Issues 5, 9, 18) and fsck C6's bitmap-oracle

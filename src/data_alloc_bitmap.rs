@@ -1003,6 +1003,14 @@ pub static DATA_ALLOC_BITMAP_LEAKS_DEFERRED: AtomicU64 = AtomicU64::new(0);
 /// ledger under its name (Issue 25).
 pub static DATA_ALLOC_BITMAP_LEAKS_ADOPTED: AtomicU64 = AtomicU64::new(0);
 
+/// `data_alloc_bitmap_decls_rejected` — a peer's declared window REFUSED
+/// by `block_grant::screen_window_decl` (a range past the volume, empty,
+/// or out of order — PR 12b round 3, Issue 30): nothing adopted from that
+/// renewal, the writer NOT counted as declared (it re-declares at its next
+/// beat). Must-stay-0 on a healthy fleet; growth names a buggy or hostile
+/// member inside D2's trust boundary.
+pub static DATA_ALLOC_BITMAP_DECLS_REJECTED: AtomicU64 = AtomicU64::new(0);
+
 /// Count a drift verdict's loss half on the process gauge; returns it.
 pub fn note_drift(report: &DriftReport) -> u64 {
     let loss = report.loss.len() as u64;

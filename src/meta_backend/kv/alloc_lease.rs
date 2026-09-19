@@ -625,34 +625,35 @@ impl AllocHolding {
     /// Counted `data_alloc_bitmap_leaks_adopted`. The writer joins the
     /// declared set whatever it declared (an empty declaration is the word
     /// "I hold no window here").
+    ///
+    /// The caller SCREENED the ranges against the volume
+    /// ([`crate::block_grant::screen_window_decl`] — Issue 30), and the
+    /// walk here is over the PENDING set intersected with each range
+    /// (`BTreeSet::range`), so its work is proportional to this holding's
+    /// deferred population, never to the peer's integers.
     pub fn adopt_declared(&self, writer: &str, ranges: &[BlockGrant]) -> u64 {
         let mut adopted = 0u64;
         {
             let mut d = self.deferred.lock();
             for r in ranges {
-                // Adopt the pending sub-runs of the declared range.
-                let mut run_start: Option<u64> = None;
-                let flush = |d: &mut DeferredLeaks, start: u64, end: u64, adopted: &mut u64| {
-                    for b in start..end {
-                        d.pending.remove(&b);
-                    }
-                    let len = u32::try_from(end - start).unwrap_or(u32::MAX);
-                    self.ledger.adopt(writer, BlockGrant { start, len });
-                    *adopted += u64::from(len);
-                };
-                for b in r.start..r.end() {
-                    let pending = d.pending.contains(&b) && self.bitmap.is_set(b);
-                    match (pending, run_start) {
-                        (true, None) => run_start = Some(b),
-                        (false, Some(s)) => {
-                            flush(&mut d, s, b, &mut adopted);
-                            run_start = None;
-                        }
-                        _ => {}
+                // The pending-and-SET blocks inside the range, as runs.
+                let hits: Vec<u64> = d
+                    .pending
+                    .range(r.start..r.end())
+                    .copied()
+                    .filter(|b| self.bitmap.is_set(*b))
+                    .collect();
+                let mut runs: Vec<BlockGrant> = Vec::new();
+                for b in hits {
+                    d.pending.remove(&b);
+                    match runs.last_mut() {
+                        Some(last) if last.end() == b && last.len < u32::MAX => last.len += 1,
+                        _ => runs.push(BlockGrant { start: b, len: 1 }),
                     }
                 }
-                if let Some(s) = run_start {
-                    flush(&mut d, s, r.end(), &mut adopted);
+                for run in runs {
+                    adopted += u64::from(run.len);
+                    self.ledger.adopt(writer, run);
                 }
             }
             d.declared.insert(writer.to_string());
@@ -878,11 +879,37 @@ pub fn note_finish_free(vol_tag: u64, block: u64) -> bool {
 /// window on, the word "none". The verdict (the directory's `Live` pages
 /// against the declared set) is the ledger poll's
 /// ([`converge_deferred_leaks`]) — never a device read on the heartbeat.
-pub fn note_peer_windows(member: &str, decls: &[crate::block_grant::WindowDecl]) {
+/// Returns `false` when the declaration was REFUSED whole (Issue 30 —
+/// `data_alloc_bitmap_decls_rejected`; the lease renewal itself stands).
+pub fn note_peer_windows(member: &str, decls: &[crate::block_grant::WindowDecl]) -> bool {
     if !holds_any() {
-        return;
+        return true;
     }
-    for h in holdings() {
+    let held = holdings();
+    // Issue 30 — PR 3's bounded-execution law on the wire word: every
+    // declaration for a volume this process holds is judged against that
+    // volume's DURABLE block count BEFORE any walk; one bad range refuses
+    // the renewal's whole declaration (one word), nothing is adopted and
+    // the writer is not counted as declared — it re-declares at its next
+    // beat. A declaration for a volume not held here is nobody's to judge.
+    for d in decls {
+        let Some(h) = held.iter().find(|h| h.vol_tag == d.vol_tag) else {
+            continue;
+        };
+        if let Err(why) = crate::block_grant::screen_window_decl(d, h.bitmap.blocks()) {
+            crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_DECLS_REJECTED
+                .fetch_add(1, Ordering::Relaxed);
+            log::warn!(
+                "allocation holder: REJECTED writer '{member}''s declared window on data volume \
+                 {:#018x}: {why} — nothing adopted from this renewal \
+                 (data_alloc_bitmap_decls_rejected; a member's wire integer is judged against \
+                 the volume before anything proportional to it is walked)",
+                d.vol_tag
+            );
+            return false;
+        }
+    }
+    for h in held {
         let ranges: Vec<BlockGrant> = decls
             .iter()
             .filter(|d| d.vol_tag == h.vol_tag)
@@ -890,6 +917,7 @@ pub fn note_peer_windows(member: &str, decls: &[crate::block_grant::WindowDecl])
             .collect();
         h.adopt_declared(member, &ranges);
     }
+    true
 }
 
 /// **The deferred leak release's verdict, at the ledger poll's cadence**

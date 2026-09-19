@@ -74,6 +74,79 @@ pub struct WindowDecl {
     pub ranges: Vec<BlockGrant>,
 }
 
+/// Why a declared window was REFUSED by [`screen_window_decl`] — PR 3's
+/// bounded-execution law on the wire word (PR 12b review round 3, Issue
+/// 30): every integer a peer's renewal carries is judged against the
+/// volume's DURABLE block count before anything proportional to it is
+/// walked. The declaration is one word: one bad range refuses it whole
+/// and nothing is adopted from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowDeclRefusal {
+    /// A zero-length range — a shape the writer never builds.
+    EmptyRange { start: u64 },
+    /// A range starting at or past the volume's end, or running past it
+    /// (`start + len` judged in `u64`, so a start near `u64::MAX` cannot
+    /// wrap into the volume).
+    PastVolume { start: u64, len: u32, blocks: u64 },
+    /// Ranges out of ascending order or overlapping — the writer's word
+    /// is coalesced and disjoint by construction (`held_block_ranges`),
+    /// so the sum of the lengths is bounded by the volume and the range
+    /// count by the block count.
+    Unordered { start: u64, prev_end: u64 },
+}
+
+impl std::fmt::Display for WindowDeclRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyRange { start } => write!(f, "an empty range at block {start}"),
+            Self::PastVolume { start, len, blocks } => write!(
+                f,
+                "range [{start}, {start}+{len}) runs past the volume's {blocks} block(s)"
+            ),
+            Self::Unordered { start, prev_end } => write!(
+                f,
+                "range at block {start} is not strictly after the previous range's end {prev_end} \
+                 (declared ranges are ascending and disjoint)"
+            ),
+        }
+    }
+}
+
+/// **Screen a declared window against the volume's block count** — pure,
+/// total, fuzzed (`cluster_wire_frame`'s S6 arm + the proptest mirror):
+/// every range non-empty, inside `[0, blocks)` with `start + len ≤
+/// blocks` judged without wrap, ascending and disjoint. A declaration
+/// that passes is bounded by durable state — its ranges cannot cover more
+/// than the volume — so the adoption's work is proportional to the
+/// holder's pending population, never to the peer's integers.
+pub fn screen_window_decl(decl: &WindowDecl, blocks: u64) -> Result<(), WindowDeclRefusal> {
+    let mut prev_end: Option<u64> = None;
+    for r in &decl.ranges {
+        if r.len == 0 {
+            return Err(WindowDeclRefusal::EmptyRange { start: r.start });
+        }
+        let end = r
+            .start
+            .checked_add(u64::from(r.len))
+            .filter(|end| r.start < blocks && *end <= blocks)
+            .ok_or(WindowDeclRefusal::PastVolume {
+                start: r.start,
+                len: r.len,
+                blocks,
+            })?;
+        if let Some(p) = prev_end {
+            if r.start < p {
+                return Err(WindowDeclRefusal::Unordered {
+                    start: r.start,
+                    prev_end: p,
+                });
+            }
+        }
+        prev_end = Some(end);
+    }
+    Ok(())
+}
+
 impl BlockGrant {
     /// One past the last granted block — the zombie floor.
     pub fn end(&self) -> u64 {

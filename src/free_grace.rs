@@ -3026,7 +3026,8 @@ impl ReaderAckLadder {
         self.acked_lag_ms.load(Ordering::Relaxed)
     }
 
-    /// Test seam: drop every in-flight candidate and zero the words.
+    /// Drop every in-flight candidate and zero the words — an OWNER-ERA
+    /// change ([`note_member_owner_term`]) and the test seam.
     fn reset(&self) {
         self.queue.lock().clear();
         self.acked.store(0, Ordering::Relaxed);
@@ -3228,6 +3229,32 @@ pub fn reader_refresh_floor_ms(pass_ms: u64, checkpoint_ceiling_ms: u64, skew_ms
 /// `membership::INSTALLED` shape).
 static LADDER: once_cell::sync::Lazy<ReaderAckLadder> =
     once_cell::sync::Lazy::new(ReaderAckLadder::default);
+
+/// The owner TERM the ladder's memo belongs to (`0` = none yet). A label
+/// is the owner's own monotonic instant, so the label space is PER OWNER
+/// ERA — a successor's restarts near 0 (PR 12b round 5, found by the
+/// `sym-crash` leg's reader assertions).
+static LADDER_OWNER_TERM: AtomicU64 = AtomicU64::new(0);
+
+/// Every member grant adopted by this process names its owner's `term`
+/// here ([`crate::membership::MemberSession::adopt`]). A grant from a NEW
+/// term resets the ladder: its monotone memo (the highest label acked
+/// under the predecessor) would otherwise refuse every label the
+/// successor mints until the successor's clock had run past the
+/// predecessor's uptime — the reader acknowledging nothing, the
+/// successor's `min_acked_free_epoch` at 0, every deferred free held to
+/// the pressure valve's `StorageFull` on a healthy fleet. A same-term
+/// grant (a reclaim after a wire blip) keeps the memo: one label space.
+pub fn note_member_owner_term(term: u64) {
+    let prior = LADDER_OWNER_TERM.swap(term, Ordering::AcqRel);
+    if prior != 0 && prior != term {
+        log::info!(
+            "free grace: the member's owner term moved {prior} → {term}: the acknowledgement \
+             ladder starts over — a successor's labels are readings of ITS clock"
+        );
+        LADDER.reset();
+    }
+}
 
 /// **The reader's hook**: called by the S5 revalidation task after every
 /// pass ([`crate::ro_coherence::spawn_reader_revalidation`]).
@@ -4043,6 +4070,7 @@ pub fn reset_for_test() {
     BOUND_ADVANCES.lock().clear();
     RUNWAY_MS.store(u64::MAX, Ordering::Relaxed);
     LADDER.reset();
+    LADDER_OWNER_TERM.store(0, Ordering::Relaxed);
     test_set_ack_pipeline(None);
     reset_recall_gate_for_test();
 }

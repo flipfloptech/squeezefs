@@ -2597,6 +2597,9 @@ impl MemberSession {
             pack_group_available: AtomicBool::new(grant.pack_group_available),
         };
         GRANT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        // The §6.8 item-3 label space is the OWNER's clock: a grant from a
+        // new term starts the reader's acknowledgement ladder over.
+        crate::free_grace::note_member_owner_term(grant.term);
         log::info!(
             "membership member '{id}' ({}) holds lease epoch {} in term {}: owner deadline \
              {} ms, MY deadline {} ms (T_owner − 2·skew_max − D_purge, anchored on my send \

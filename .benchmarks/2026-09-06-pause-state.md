@@ -740,6 +740,60 @@ mount (the A-arm rig reset the cluster; remount is part of every arm).
    `SPDK_NVMF_MAX_NUM_REGISTRANTS = 16` caps any SPDK-shared set at 16
    writers today (moot once PR 16 lands). Loop artifacts: writer/reviewer
    snapshots under `/tmp/grok-justin/grok-design-review-07bad785*.md`.
+1aa. **SYMMETRIC PR RUN — PAUSED AFTER PR 12b (owner: reboot + system
+   update), 2026-09-18 22:40.** Run log `.benchmarks/2026-09-12-sym-pr-run.md`
+   is the record of truth; state file `/tmp/grok-justin/grok-exec-plan-dadee1dd.json`
+   (backed up with every review/summary/brief and the gate logs to
+   `~/sym-run-state/` in case `/tmp` is cleaned). **On dev, 15 of 18 rows:**
+   PR 16, 1, 2, 3, 4, 11, level 4 (5, 6, 7, 8), level 5 (7b + the flip
+   lock-law fix, 9, 10), PR 12 (in part) and **PR 12b — the many-writer
+   posture, N unbounded** (`4f475a25`, 69 commits, 32 issues, 30
+   manager-only assumptions across PR 2–12 fixed at three venues; the
+   fleet `sym-storm` ×3 + `sym-crash` ×3 GREEN from zero with the fsync +
+   deleted-stays-deleted oracle; N = 3 real daemons on nvmet 118/0).
+   **Last green batch gate: `46ab01e7`** (397 suites / 5,417 tests) —
+   PR 12 (`9aa8d646`) and 12b are compile-checked + suite-proven but NOT
+   yet batch-gated. **Eleven defects shipping in 1.2.x found and fixed en
+   route**, every one with a red pin on the layout it shipped on, all
+   bound for RELEASE_NOTES 1.3.0 (already drafted there): the 63-registrant
+   Reservation Report truncation; the root-swap replay hole (P0); the
+   `rename` lock hole; the clean-unmount image leak; the offline-fsck probe
+   writing a checkpoint; the kvmap live block entering the free stream;
+   S9's clean leave leaving its data-namespace registrant; the KV loader's
+   mixed sync/async lock style; the S9 renewal 25 ms retry storm at a
+   moved authority; the reader's free-grace ack ladder kept across an
+   owner era (the valve refused `StorageFull` on a healthy fleet); the
+   membership grace window fencing a `-o ro` reader at every failover.
+   **RESUME (in this order, laptop idle for the gate):**
+   (1) after the reboot check `nproc` = 32, `/sys/devices/system/cpu/offline`
+   empty, `df -h /home`, `podman` + the `squeezefs-target-rocky8` volume
+   present, `sudo -n true`, `ssh squeeze-test` reachable; (2) the batch
+   gate on dev `4f475a25` (covers PR 12 + 12b): `rm -f /tmp/five/gate/taskcheck.exit;
+   (nohup setsid bash /tmp/five/gate/gate.sh 4f475a25 > /tmp/five/gate/gate-driver.out 2>&1 &)`
+   — if `/tmp/five` did not survive, restore it from `~/sym-run-state/five-gate/`
+   (the script checks out the commit in `~/Source/squeezefs-gate`); ~85 min;
+   (3) on green: launch **PR 13** (`perf/sym-acceptance`) from
+   `/tmp/grok-justin/grok-exec-prompt-dadee1dd-pr-13.md` (fill
+   `__DEV_TIP__`; an isolated worktree off dev; the brief encodes the venue
+   law — every `sym-*` leg to green LOCALLY on the tcp devsub first, then
+   ONE A-B-B-A bracket per box row set on squeeze-test for gates 1/2/3/3b/
+   3c/5/7; gates 4/6/8/8b local only; the closing record is the flip
+   decision's input); (4) PR 15 (cloud row) needs the owner's EXPRESSED
+   approval when PR 13 is green — ASK; (5) PR 14 (default flip; confirms
+   what `=0` IS on a stamped volume after the flip — PR 5's stated law);
+   (6) the 1.3.0 release gate from zero (task check, fstests `-g auto`
+   with `SQUEEZEFS_FSTESTS_EXCLUDE=generic/650`, pjdfstests, LTP,
+   require-mount, zc-capability, the fuzz campaign now at 20+ targets),
+   version bumps across root + `crates/{fuse3,squeezefs-ipc,squeezefs-preload}`,
+   AGENTS.md "currently 1.3.0", tag, `task dist:all`, the rocky8 pair to
+   the box. Squeeze-test footprint so far: `/scratch/tmp/squeezefs`
+   (= PR 1's arm B, for the reset script), `/scratch/tmp/sym-pr1/`,
+   `/scratch/tmp/rigs/`; the box is unmounted. Owed to PR 13/14 per the
+   notes' §owed (each named there): the box rows, the joiner `client:`
+   heartbeat, the job fabric's ≈ 45 s coordinator re-enrollment after a
+   failover, the manager's zero-census open + PR 7's un-share (PR 14),
+   `reader_free_grace_tests` contract 28's parallel-order dependence (the
+   gate's `--test-threads=1` rail keeps it green; state or fix at 13).
 2. **Kernel A/B, B arm** — after `squeeze-test` boots the 6.19.14 series
    WITH 0031 (or whichever box carries the patched kernel): on the box,
    `cd /scratch/tmp/sqz-agent/k26 && sudo env ARM=B KERNEL_TAG=<uname -r

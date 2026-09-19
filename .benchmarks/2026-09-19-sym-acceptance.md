@@ -71,6 +71,8 @@ OWN directory (`tests/run_mdstorm.sh` `create`), then ingesting 512 MiB each
 | r2 (`c2c5e663`) | 7,227 c/s · 2,065 MiB/s | 19,162 (2.65×) · 4,769 (2.31×) | 27,548 (3.81×) · 7,433 (3.60×) | storm completed (8 × ~5,100 c/s = 40,700 = 5.6×) | must-stay-0 tripped at N=8: `appender_flush_ceiling_overruns=2` on the manager (§4.3) |
 | r4 (`c2c5e663`) | 6,661 · 1,015 | 18,626 (2.80×) · 2,199 (2.17×) | 27,314 (4.10×) · 4,855 (4.78×) | a joiner FAIL-STOPPED at its 20,250th create (§4.2, defect 5) | N=4 also read `appender_flush_ceiling_overruns=+2` |
 
+| **r5 (`2a94abbc` + the return belt = `d00db50b`'s tree; defect 5 a+b landed)** | 6,874 · 2,481 | 19,192 (2.79×) · 5,679 (2.29×) | 27,909 (4.06×) · 8,015 (3.23×) | **39,778 (5.79×) · 10,309 (4.16×)** — the row COMPLETES: no fail-stop, no contamination, must-stay-0 set flat | create rate MET at every N (5.79× ≥ 5.6×); ingest at N = 8 MISS on the RATE law (4.16× < 5.6×) — 10.3 GB/s into zram over nvmet-tcp on `127.0.0.1` is the single 32-CPU box's data path (8 daemons × 4 MiB `dd conv=fsync` + their FUSE queues on the same cores), the box row decides; **deleted-stays-deleted 0 / 3,000** sampled removed names after every joiner's clean unmount, judged at the manager AND at a remounted joiner |
+
 `slot_handovers == 0`, `slot_ships == 0`, Σ `dlm_rpcs == 0`,
 `manager_load_pct` 0–2 % on every row (the manager's verbs cost nothing
 measurable at N ≤ 8 — its CPU is its OWN storm's). The 0.7 × N law is MET
@@ -113,7 +115,7 @@ at N = 2 and 4 on both runs; N = 8 is the defect-5 row.
    66/s in the pin). Pin: `sym_n_daemon_tests::
    concurrent_storms_on_four_writers_never_cross_a_record_into_another_appenders_leaf`.
 
-### 4.2 Defect 5 — OPEN in part (PR 12b, P0, the flip-blocking class): two appenders' frames under ONE `node_seq`
+### 4.2 Defect 5 — FIXED (both halves, PR 12b, P0, the flip-blocking class): two appenders' frames under ONE `node_seq`
 
 **The evidence** (fleet r4, N = 8, joiner m62 = appender 3, meta volume 0 =
 `/dev/nvme1n1`, extent `0x5a80000`, read raw off the device after the row):
@@ -137,19 +139,36 @@ a double grant RECORD.
 
 **Two halves, one class.**
 
-(a) *The design half — one node-seq space per VOLUME.* Every appender seeds
-its node-seq handle from the same ledger word at its open
-(`backend.rs:2454`, `ledger.seq.max(ledger.node_seq_watermark)`), so under N
-daemons every seq guard the CoW law rests on — the §4.2 child-pointer and
-root-pointer checks, the §4.5 frame-incarnation check that ends a recycled
-extent's log at a previous node's frames, PR 11's residue-seq ceiling — is
-void ACROSS appenders: lockstep storms mint the same `node_seq` in every
-daemon (the pin below: two joiners' first mints carry ONE seq). RED pin,
-`#[ignore]`d (the PR 11 §5b precedent):
-`sym_n_daemon_tests::two_joined_appenders_never_mint_an_equal_node_seq`. The
-remedy is a per-INCARNATION seq space (a base derived from the volume uuid +
-appender id + term; the projection refresh's `install_recovered_root` raise
-confined to the writer's own trees) — PR 12b's, named for the flip decision.
+(a) *The design half — one node-seq space per VOLUME* (FIXED on this branch,
+red-first, `2a94abbc`). Every appender seeded its node-seq handle from the
+same ledger word at its open (`backend.rs`, `ledger.seq.max(ledger.
+node_seq_watermark)`), so under N daemons every seq guard the CoW law rests
+on — the §4.2 child-pointer and root-pointer checks, the §4.5
+frame-incarnation check that ends a recycled extent's log at a previous
+node's frames, PR 11's residue-seq ceiling — was void ACROSS appenders:
+lockstep storms mint the same `node_seq` in every daemon (the pin below: two
+joiners' first mints carried ONE seq on `8af38eda`). **The law now**
+(`kv::node_seq`, design §5.3.2 amended): the volume's uuid base `B` starts
+incarnation 0 — the manager's and every flat / unarmed mount's legacy space,
+seeded and raised exactly as before (`NodeSeqHandle::shared` IS the old
+`AtomicU64`; a forest manager's is bounded by `B + 2^K`); every `JoinAppender`
+(a rejoin included) is minted a fresh ordinal `o ≥ 1` from the durable
+tree-0 counter `node_seq_incarnations` (one control entry, barriered before
+the reply) and the joiner mints in the disjoint `[B + o·2^K, B + (o+1)·2^K)`,
+its handle never raised. `K = 38` derived from the 63 usable bits (2^38
+mints per incarnation = 200 SMOs/s for 43 years; 2^25 incarnations = 15 k
+mounts re-joining daily for six years; either exhausted refuses loud, never
+wraps — tie test `node_seq_incarnation_space_partitions_the_63_usable_bits`).
+Every order comparison classified: the pointer checks / frame walk / frame
+screen compare equality (unaffected), PR 10's root choice is by generation
+(unaffected), `install_recovered_root`'s "older → re-read" became a mismatch
+test, every raise goes through `raise_to` (a joined handle ignores it, the
+shared handle confines it to its own space — PR 10's raise to a dead
+joiner's root / residue stamps is the disjointness now). Pin:
+`sym_n_daemon_tests::two_joined_appenders_never_mint_an_equal_node_seq`
+(manager in span 0, joiner 1 in span 1, joiner 2 in span 2, a rejoin in span
+3 — never back in its dead space). The wire's `Joined` reply carries the base;
+the page layout is unchanged (a root installs by pointer + seq equality).
 
 (b) *The grant half — a refill run that partially overlaps HELD extents
 re-unclaimed them* (FIXED on this branch, red-first). The manager's §5.3.5
@@ -162,13 +181,96 @@ batch and RETURNED while its node stood. `add_runs` now skips claimed /
 pending / returnable extents. Pin: `sym_manager_tests::
 a_grant_run_overlapping_held_extents_adds_only_the_extents_the_grant_does_not_hold`.
 
-Whether (b) alone is the fleet's mechanism is decided by the re-run of the
-N = 8 row on the fixed binary (§3.1 gains a row when it runs); (a) stands as
-the structural hazard regardless — with distinct seq spaces a re-unclaimed
-extent's second custodian would have been REFUSED at the frame walk instead
-of folded.
+**The fleet's verdict** (§3.1 r5): with (a) + (b) landed the N = 8 row runs
+to completion — 2/2 red before, 1/1 green after, on the same fleet shape
+and the same instrument. The two halves' contributions are NOT separated
+(a (b)-only fleet row was not run — the counted-run law forbade spending
+another red-first row on it, and the in-process storm never reproduced the
+fleet's contamination on either tree): the on-disk evidence — two
+appenders' frames under one `node_seq` in one extent — is (a)'s class by
+construction, and (b)'s partially-held-run re-unclaiming is pinned by its
+unit contract. With distinct seq spaces a second custodian's frames are
+now `StaleIncarnation` at the frame walk (seen as harmless residue in the
+defect-6 dumps) instead of folded.
 
-### 4.3 `appender_flush_ceiling_overruns` (must-stay-0) — 2 overruns, venue-attributed pending the box
+### 4.3 Defect 6 — OPEN (PR 12b, P0: "deleted stays deleted" violated across a joiner's CLEAN LEAVE at N = 8)
+
+Found by the eight-writer in-process storm pin (`sym_n_daemon_tests::
+concurrent_storms_on_eight_writers_at_the_fleets_depth`, `--ignored`, ~25 s)
+once it gained the fleet's row boundary — every writer UNLINKS its previous
+round's 24,000 files before the next round — and a "deleted stays deleted"
+arm at three points. **While every daemon is live, no removed name resolves
+anywhere** (each daemon's RAM fold has its tombstones). **After a joiner's
+CLEAN LEAVE** (`leave_joined_regions`: 64 × `transfer_slot_locked` —
+flush-then-transfer — then `LeaveAppender`; no error logged, the ring
+covered), the manager resolves 21–280 of the 192,000 unlinked names at
+`nlink 0`, always the LAST unlinks of ONE leaving daemon's directory (the
+tail of creator `c3`'s range), one or a few leaves' worth; a fresh writer
+open of the volume resolves them too (the durable state lacks the
+tombstones — 89 `C10ZeroNlinkNamed` findings in the offline census). N = 1
+and N = 2 with the same unlink boundary are CLEAN (5 runs); N = 8 fails 6/6.
+Two pre-checkpoints of the leaving daemon before its leave change nothing.
+
+On-disk attribution (the pin dumps the leaf the released tree routes the
+name to): the leaf's header is the owner's node, its frames are the owner's
+(`appender 3, g 1`: the base bset + the APPEND carrying the name's `Put`),
+and **no `Delete` frame follows** — the tail ends at the `Put`'s frame; in
+two of five runs the extent also carries a stale-incarnation frame of
+another appender PAST the walk (a previous tenant's residue, screened as
+`StaleIncarnation` by the seq-space law — harmless, and the reason defect
+5(a) had to land first: before it those frames FOLDED). `foreign_frames_
+screened` / `appender_fence_breach` stay 0 across the leaves; the
+return-of-a-live-image belt (`extent_return_live_refusals`, landed for this
+attribution at every return site) never fires; `extent_grant_conflicts` 0.
+So the last tombstones the leaving joiner applied in RAM were **never
+appended** to the leaf image its own release named — the joined flush /
+leave sequence (`joined_checkpoint_cycle`'s dirty walk, `checkpoint_flush_
+node`'s freeze + append + `merge_after_flush`, the `flush_slot_clear_of_
+region` post-condition) loses a leaf's final delta under the N = 8
+grant-refusal storm (`ExtentGrant` / `ReturnExtents` refused
+`JournalReserveExhausted` 100–150× per joiner as the manager's ring window
+fills). Not yet attributed to the step; the pin is the reproducer, the
+fleet's `sym-scale` leg gained the same arm (every joiner's product umount,
+then the removed sample judged at the manager and at a remounted joiner —
+§3.1's next row says whether the fleet shows it). **Routed to PR 12b's
+leave / flush law; flip-blocking until fixed** (§9).
+
+### 4.4 Defect 7 — FIXED (PR 12b): a joined holder's lease projection is loaded once and never refreshed on its own — every joiner→joiner cross-owner create into a slot a LATER joiner minted was refused
+
+Found by `sym-shared-dir` on a fresh fleet: m61's very first create into
+m60's directory `EINVAL`, m60's log `cross-owner step … insert names child
+ino …, which has no inode record and lives in a slot no appender leases — a
+dentry nobody could have minted a target for is refused
+(xv_cross_owner_steps_rejected)`, the intent left open and re-refused by
+the roll-forward cadence every second. `sym-foreign-touch` read the same
+class as "only 92 shipped steps for 192 foreign creates". The served
+insert's Issue-8a screen (`screen_insert_child`) judges the child's slot
+by the SERVING mount's lease table — on a joiner a PROJECTION of tree 0,
+loaded at its open and advanced only by an event (a re-dial, a divert
+failure, a `NotHolder` redirect, the join arm) — so every slot a LATER
+joiner acquired read `Unleased` at every earlier joiner for as long as no
+event fired; the second clause (the child's record on its volume) reads
+through the same stale table (an "unleased" slot is read at the manager,
+which has no such record). Fix: `KvMetaBackend::resolve_slot_holder_fresh`
+— the table's answer; on a joined appender that reads `Unleased` the
+projection is refreshed ONCE (`refresh_control_projection`), and when the
+refreshed table STILL says `Unleased` — the ledger lags a grant by up to
+one checkpoint (a grant is a ring-0 control entry; tree 0's moved root
+reaches the ledger at the manager's next cycle, so a re-read of the ledger
+right after the grant names the OLD root; the pin's first run read
+`Unleased { g: 0 }` after the refresh) — ONE wire `ResolveSlot` asks the
+manager's table, the lease's own word (`slot_resolve_rpcs` at the
+manager); the screen reads it, the manager's table is never refreshed. Pin
+(red-first): `sym_n_daemon_tests::a_joined_holder_resolves_a_later_
+joiners_slot_at_a_served_step` (the raw table's `Unleased` as the premise,
+the fresh resolve's `Holder { 2 }`, joiner 2's create into joiner 1's
+seeded directory SERVED at joiner 1's own listener — the dentry lands in
+joiner 1's tree, the record at its creator, `steps_rejected` unmoved).
+PR 12b's sym-storm `--cross-owner` never saw it because its mover renames
+into a directory the MANAGER holds (whose table is authoritative); this is
+the first joiner→joiner cross-owner row.
+
+### 4.5 `appender_flush_ceiling_overruns` (must-stay-0) — 2 overruns, venue-attributed pending the box
 
 At the tail of the N = 8 (and once the N = 4) create storm the manager's
 volume 1 counted 2 overruns: the oldest dirty slot-tree leaf aged 1,110 /
@@ -181,7 +283,7 @@ the box row trips it too it is a PR 14 item (derive the margin from the
 measured pass wall); the sym-scale leg reports it per row in the VERDICT
 column (per-row deltas — a previous row's count never bleeds into the next).
 
-### 4.4 Harness findings
+### 4.6 Harness findings
 
 * A joiner whose volume fail-stopped WEDGES the product `umount`
   (`mw_fleet.sh unmount` hangs; `fusermount3 -uz` is the teardown) — an

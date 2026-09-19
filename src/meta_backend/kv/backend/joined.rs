@@ -853,6 +853,73 @@ impl KvMetaBackend {
             .is_some_and(|s| s.is_joined_appender())
     }
 
+    /// Resolve `slot`'s lessee off this mount's lease table, REFRESHING a
+    /// joined appender's tree-0 projection ONCE when the table says
+    /// `Unleased` (PR 13, found by the fleet's first joiner→joiner
+    /// cross-owner create): a joiner's projection is loaded at its open and
+    /// advanced only by an event (a re-dial, a divert failure, a redirect),
+    /// so a slot a LATER joiner acquired reads `Unleased` at every earlier
+    /// joiner until one fires — and the served insert's child screen
+    /// refused every such create (`xv_cross_owner_steps_rejected`, EINVAL
+    /// at the initiator). The manager's table is authoritative and never
+    /// refreshed here; a refresh that fails leaves the first answer.
+    pub async fn resolve_slot_holder_fresh(
+        &self,
+        slot: ForestSlot,
+    ) -> Option<crate::slot_lease_core::Resolved> {
+        let plane = self.slot_leases()?;
+        let first = plane.table.resolve(slot);
+        if matches!(first, crate::slot_lease_core::Resolved::Holder { .. })
+            || !self.is_joined_appender()
+        {
+            return Some(first);
+        }
+        let refreshed = match self.refresh_control_projection().await {
+            Ok(true) => plane.table.resolve(slot),
+            Ok(false) => first,
+            Err(e) => {
+                log::debug!(
+                    "meta volume {}: projection refresh for slot {slot}'s lessee failed ({e}) — \
+                     the table's first answer stands",
+                    self.path.display()
+                );
+                first
+            }
+        };
+        if matches!(refreshed, crate::slot_lease_core::Resolved::Holder { .. }) {
+            return Some(refreshed);
+        }
+        // The ledger lags a grant by up to one checkpoint (a grant is a
+        // ring-0 entry; tree 0's root reaches the ledger at the next
+        // cycle): the MANAGER's table is the lease's own word — ONE
+        // `ResolveSlot` (`slot_resolve_rpcs` at the manager) answers a
+        // slot the projection still reads `Unleased`.
+        let wire = Arc::clone(self.joined.get()?);
+        let routing = self.routing_slot_of_forest(slot).ok()?;
+        match wire
+            .with_client(Some(self), "ResolveSlot", |c| {
+                Box::pin(async move { c.resolve_slot(routing).await })
+            })
+            .await
+        {
+            Ok(ManagerReply::Holder { appender_id, g }) => {
+                Some(crate::slot_lease_core::Resolved::Holder {
+                    holder: appender_id,
+                    g,
+                })
+            }
+            Ok(_) => Some(refreshed),
+            Err(e) => {
+                log::debug!(
+                    "meta volume {}: ResolveSlot for slot {slot} failed ({e}) — the projection's \
+                     answer stands",
+                    self.path.display()
+                );
+                Some(refreshed)
+            }
+        }
+    }
+
     /// The Joined family's snapshot; `None` unless this mount joined.
     pub fn joined_stats(&self) -> Option<JoinedStats> {
         let w = self.joined.get()?;

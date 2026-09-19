@@ -1108,6 +1108,117 @@ async fn two_joined_appenders_never_mint_an_equal_node_seq() {
     shutdown(&manager).await;
 }
 
+/// **A joined holder resolves a LATER joiner's slot to its holder at a
+/// served step** (PR 13 — found by the fleet's first joiner→joiner
+/// cross-owner create: `sym-shared-dir`, m61 creating into m60's
+/// directory, EINVAL at every file). A joiner's lease table is its tree-0
+/// PROJECTION, loaded at its open and advanced only by an event (a
+/// re-dial, a divert failure, a redirect) — so joiner 1 read every slot
+/// joiner 2 acquired afterwards as `Unleased`, and `screen_insert_child`
+/// (the served insert's Issue-8a screen) refused the child "a dentry
+/// nobody could have minted a target for". The one resolve the screen
+/// reads now refreshes the projection once on `Unleased`
+/// (`resolve_slot_holder_fresh`). RED before: the raw table answers
+/// `Unleased` for joiner 2's rotor at joiner 1 (asserted as the premise),
+/// the fresh resolve answers `Holder { joiner 2 }`, and joiner 2's create
+/// into joiner 1's directory lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joined_holder_resolves_a_later_joiners_slot_at_a_served_step() {
+    use squeezefs::slot_lease_core::Resolved;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    // The directory is SEEDED (every daemon holds its record from the
+    // format); joiner 1 acquires its slot by first touch, so joiner 2's
+    // open projection names joiner 1 as its lessee.
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let j1 = join(&uris, &venue, &mvol, 1).await;
+    let _ = create_files(&j1, shared, "j1", 2).await;
+    // Joiner 2 joins AFTER joiner 1's projection was loaded and mints in
+    // its own rotor.
+    let j2 = join(&uris, &venue, &mvol, 2).await;
+    let probe = j2
+        .create(1, "j2-probe", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("joiner 2's directory")
+        .ino;
+    let (_, local) = j2.route_ino(probe);
+    let slot2 = squeezefs::meta_backend::kv::record::forest_slot_of_ino(local);
+    // The premise: joiner 1's RAW table has not seen joiner 2's lease.
+    let raw = j1.volumes[0]
+        .slot_leases()
+        .expect("armed")
+        .table
+        .resolve(slot2);
+    assert!(
+        matches!(raw, Resolved::Unleased { .. }),
+        "the premise — joiner 1's projection predates joiner 2's acquire: {raw:?}"
+    );
+    // The fresh resolve refreshes the projection once and names joiner 2.
+    let fresh = j1.volumes[0].resolve_slot_holder_fresh(slot2).await;
+    assert!(
+        matches!(fresh, Some(Resolved::Holder { holder, .. }) if holder == 2),
+        "joiner 1 resolves joiner 2's slot to its holder after the refresh: {fresh:?}"
+    );
+    // The served step itself: joiner 2 creates into joiner 1's directory
+    // (a cross-owner create whose InsertDentry is served at joiner 1's
+    // listener). The bindings rung 7 makes: joiner 1 serves on its own
+    // venue, joiner 2 dials it where tree 0 names appender 1; the step
+    // shipper is process-global, so it is the INITIATOR's (joiner 2's).
+    let j1venue = DaemonVenue::stand_up(&j1, false, "joiner-1").await;
+    j2.volumes[0]
+        .slot_leases()
+        .expect("armed")
+        .holders
+        .set_endpoint(1, &j1venue.endpoint);
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(&j2),
+            "node-j2",
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    let rejected0 = squeezefs::meta_backend::crossvol_tx::cross_owner_stats().steps_rejected;
+    let child = j2
+        .create(shared, "from-j2", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("a cross-owner create served at joiner 1")
+        .ino;
+    // The served InsertDentry landed in joiner 1's tree (the dentry is
+    // the holder's; the child's RECORD is joiner 2's and a read of it at
+    // joiner 1 is a token read — the custody arm this fixture does not
+    // stand up, so the record is asserted at its creator).
+    assert_eq!(
+        j1.lookup_dentry_exact_unguarded(shared, "from-j2")
+            .await
+            .expect("joiner 1 reads its dentry")
+            .map(|(ino, _)| ino),
+        Some(child),
+        "the served insert is in joiner 1's tree"
+    );
+    assert_eq!(
+        j2.getattr(child)
+            .await
+            .expect("the creator holds its child's record")
+            .ino,
+        child
+    );
+    assert_eq!(
+        squeezefs::meta_backend::crossvol_tx::cross_owner_stats().steps_rejected,
+        rejected0,
+        "the served insert's child screen refused nothing"
+    );
+    shutdown(&j2).await;
+    shutdown(&j1).await;
+    j1venue.tear_down();
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
 /// **Own residue** (PR 2's law on a wire region, deliverable 4): the joiner
 /// commits, checkpoints, commits MORE into its window, and dies (dropped
 /// without a shutdown). The same identity's rejoin presents its Live

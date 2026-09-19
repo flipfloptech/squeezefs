@@ -3769,7 +3769,9 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t0):.0f}')")"
             # storm created (the "deleted stays deleted" arm below judges
             # them after every writer's CLEAN LEAVE: the in-process pin
             # found a joiner's final tombstones lost across its leave).
-            ls "$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx" 2>/dev/null | tail -200 |
+            # `ls -U` = readdir order — the order `rm -rf` unlinks in, so
+            # the tail IS the storm's last unlinks (the class the pin found).
+            ls -U "$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx" 2>/dev/null | tail -200 |
                 sed "s|^|/scale-$SYM_RUN-n$n-w$idx/|" >>"$rowdir/removed-sample.txt" || true
             rm -rf "$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx" 2>/dev/null || true
         done

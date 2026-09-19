@@ -1834,16 +1834,20 @@ impl RoutedMetaBackend {
 
     /// The served insert's `child` screen (Issue 8a): a record on its
     /// volume, or a slot some appender leases per tree 0; else refused
-    /// (`EINVAL`, `xv_cross_owner_steps_rejected`).
+    /// (`EINVAL`, `xv_cross_owner_steps_rejected`). On a JOINED holder the
+    /// lease table is a projection — refreshed once when it says
+    /// `Unleased` (PR 13: a later joiner's slots were unknown to every
+    /// earlier joiner until some event advanced its projection, and the
+    /// fleet's first joiner→joiner create was refused here).
     async fn screen_insert_child(&self, child: Ino, tx_id: u64) -> Result<()> {
         let (v_idx, local) = self.route_ino(child);
         self.check_volume_enabled(v_idx)?;
         let vol = &self.volumes[v_idx];
-        if let Some(plane) = vol.slot_leases() {
+        if vol.slot_leases().is_some() {
             let slot = kv::record::forest_slot_of_ino(local);
             if matches!(
-                plane.table.resolve(slot),
-                crate::slot_lease_core::Resolved::Holder { .. }
+                vol.resolve_slot_holder_fresh(slot).await,
+                Some(crate::slot_lease_core::Resolved::Holder { .. })
             ) {
                 return Ok(());
             }

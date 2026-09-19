@@ -270,6 +270,80 @@ PR 12b's sym-storm `--cross-owner` never saw it because its mover renames
 into a directory the MANAGER holds (whose table is authoritative); this is
 the first joiner→joiner cross-owner row.
 
+### 4.4a Defect 8 — FIXED (PR 7b under N daemons): a foreign create into a STRIPED directory judged the stripe's record by the initiator's projection and refused `ENOENT`
+
+Found by `sym-shared-dir` on the fixed defect-7 binary: every foreign
+writer created 1–3 files into m60's directory, m60 flipped it to 64
+stripes ("1 supplied by creators [0, 6, 7], 63 minted by the holder" —
+appenders 6 and 7 DECLINED "no endpoint bound on this mount", a
+`SupplyStripeIno` path that does not run `bind_holder_endpoint_on_demand`;
+noted, benign: the holder mints the remainder), and every later foreign
+create answered `ENOENT` "directory … was removed (no record)" with
+`dir_stripe_dying_refusals` +1 at each initiator (m0, m61, m62 — the
+manager too, whose RAM tree of m60's slot is a stale image like any
+non-holder's). `refuse_dying_parent` (R26's closer, at every insert path)
+read the KEY parent — the stripe, minted in the holder's rotor AFTER the
+other daemons' projections loaded — through `read_inode_value_routed`,
+the cross-volume plan's OWN-record witness, i.e. this mount's projection
+of the slot: no record. PR 7b's fixture (declared regions, one process,
+one RAM tree) could not see it. Fix: `key_parent_nlink` reads the record
+through `getattr` — the writer's read divert (PR 12b: the holder's token
+plane, exact until recalled); an own-slot parent and every unarmed mount
+take the local read verbatim (`token_serve` answers `None`); the same
+read serves `dying_parent_errno`, whose local read had a second face — a
+REAL `EEXIST` on a foreign striped parent was reported as `ENOENT` when
+the projection lacked the stripe. Pin: `sym_n_daemon_tests::
+a_foreign_create_into_a_striped_directory_reads_the_stripes_record_at_its_
+holder` (joiner 2 the process's reading writer under PR 9's custody arm —
+its reads of joiner 1's slot are token reads at joiner 1's listener, the
+fleet's shape; joiner 1 flips its directory after joiner 2's projection
+loaded; 12 post-flip foreign creates land in their stripes,
+`dying_refusals` unmoved).
+
+### 4.4b Defect 9 — FIXED (PR 6 + PR 12b): the served ship never fed the holder's dominance window, and a JOINED holder's offer refused — no idle tree ever moved on a fleet
+
+Found by `sym-foreign-touch`'s IDLE phase (gate 3c) on the same binary:
+12 dominating bursts of 64 foreign creates over 133 s into m60's idle
+tree, `slot_offers` 0 at every daemon, no handover — while the LIVE phase
+passed (192 ships, 0 handovers; defect 7's class gone). Four defects
+under it (the fourth found by the pin: `slot_handovers` counted the
+in-process accept's release + grant alone — a WIRE holder's release on
+its recall ran uncounted, so the leg's handover signal could never move
+even with the offer landing; the manager now counts a `ReleaseSlot` that
+SPENDS a standing recall as the handover and the requester sets the
+never-thrash cooldown on ITS plane at the accept — `joined_accept_offers`):
+(1) PR 4's `note_slot_ship(slot, requester, ship_ns)` — "the
+holder decides who moves a slot … at the served ship" — had NO product
+caller: PR 4's contracts drove it directly and PR 6's served step
+(`xv_serve_step`, the production ship) never called it, so `ops_q` never
+accumulated on any fleet and neither offer arm could fire; (2) a JOINED
+holder's verdict reached `manager_offer_slot`, a manager verb's local
+executor, which `manager_gate` refuses on a joined appender
+(`joined_control_refusals`) — the offer never reached the manager's
+table; (3) found by the pin once (1) counted: the door's holder-op note
+(PR 12b round 1 Issue 11 — INSIDE the door, for every commit naming the
+slot) counted the SERVED step's own commit as the holder's activity, so
+`ops_h` grew 1 : 1 with `ops_q` and `ops_q ≥ 2 × ops_h` held for no
+requester ever — the law's premise is the holder's OWN work. Fix: the
+served step notes the ship after its apply with the served wall as
+`ship_ns` (the requester = the shipping mount's appender: its member id's
+identity where the plane learnt it — `SlotLeasePlane::appender_of_
+identity` — else, for an insert, the creator through the child's slot,
+the stripe census's own resolution; the wire `ResolveSlot` answer of
+defect 7's fresh resolve is LEARNT into the projection so that read
+answers without another verb), a joined holder's offer travels as the
+wire `OfferSlot` (`joined_offer_slot`), and `KvTx::served_step` — set by
+`xv_apply_step(.., served = true)` at the served side alone — skips the
+door's holder-op note; the accept, the recall on the holder's carriage
+and the flush-then-transfer are PR 12b's existing member side. Pin:
+`sym_n_daemon_tests::a_dominating_requester_earns_an_idle_joined_holders_
+tree_through_served_ships` (joiner 2 ships `N_floor × 4` creates into
+joiner 1's idle directory served at joiner 1's listener: the holder's
+`ships` count every one, ONE idle offer, the manager's table `Offered`
+to joiner 2 on its carriage, `joined_control_refusals` 0; the accept
+recalls, the holder's carriage sink hands over, joiner 2 holds the slot
+at `g + 1` with every acked name).
+
 ### 4.5 `appender_flush_ceiling_overruns` (must-stay-0) — 2 overruns, venue-attributed pending the box
 
 At the tail of the N = 8 (and once the N = 4) create storm the manager's

@@ -903,6 +903,21 @@ impl KvMetaBackend {
             .await
         {
             Ok(ManagerReply::Holder { appender_id, g }) => {
+                // The projection LEARNS the manager's word (the acquire's
+                // `SlotRefused` arm's law): every later table read of the
+                // slot — the stripe census's creator, the ship's requester,
+                // the door — answers the holder without another verb.
+                if appender_id != self.own_appender_id() {
+                    plane.table.load(
+                        slot,
+                        crate::slot_lease_core::SlotLease::leased(appender_id, g),
+                    );
+                    plane.gate.mark_foreign(slot);
+                    plane.holders.learn(
+                        slot,
+                        crate::slot_holder_cache::SlotHolder { appender_id, g },
+                    );
+                }
                 Some(crate::slot_lease_core::Resolved::Holder {
                     holder: appender_id,
                     g,
@@ -1372,6 +1387,27 @@ impl KvMetaBackend {
     /// installed into the own region; `SlotRefused { holder }` ⇒ the
     /// "ship to the holder" class (`KvError::SlotBusy`); `Deferred` ⇒ the
     /// retry class (EAGAIN, nothing written at the manager).
+    /// A JOINED holder's `OfferSlot` (§5.1.4): the dominance verdict is
+    /// the holder's (its own `DominanceWindow`), the offer's durable
+    /// state the MANAGER's table — so the verb travels (`joined_wire_
+    /// verbs`); the offeree learns it on its renewal grant (`offered_
+    /// slots`) and its accept RECALLS the slot from this holder on ITS
+    /// renewal (`slot_recall_notices` → `joined_act_on_release_notices`).
+    /// Before PR 13 a joined holder's dominance verdict reached
+    /// `manager_offer_slot` — a manager verb's executor — and refused
+    /// (`joined_control_refusals`), so no idle joiner's tree ever moved.
+    pub(super) async fn joined_offer_slot(&self, slot: ForestSlot, to: u32) -> Result<(), KvError> {
+        let wire = Arc::clone(self.joined.get().ok_or_else(|| {
+            KvError::Corrupt(format!("{}: joined wire unset", self.path.display()))
+        })?);
+        let own = wire.appender_id;
+        let routing = self.routing_slot_of_forest(slot)?;
+        wire.with_client(Some(self), "OfferSlot", |c| {
+            Box::pin(c.offer_slot(own, routing, to))
+        })
+        .await
+    }
+
     pub(super) async fn joined_acquire_slot(&self, slot: ForestSlot) -> Result<(), KvError> {
         let plane = self.joined_plane()?;
         let wire = Arc::clone(self.joined.get().ok_or_else(|| {
@@ -2487,7 +2523,17 @@ impl KvMetaBackend {
         for (r, _g) in offered {
             let slot = self.forest_slot_of_routing(*r);
             match self.joined_acquire_slot(slot).await {
-                Ok(()) => taken += 1,
+                Ok(()) => {
+                    taken += 1;
+                    // The requester-side cooldown (§5.1.4, the S10 never-
+                    // thrash valve) is the NEW holder's word: a ship into
+                    // the slot inside the window is served, never re-offered
+                    // — the in-process accept set it on the manager's
+                    // plane, the wire accept sets it on its own.
+                    if let Ok(plane) = self.joined_plane() {
+                        plane.note_handover(slot, crate::mono_core::monotonic_ns_u64());
+                    }
+                }
                 Err(e) => log::debug!(
                     "meta volume {}: the offer of slot {slot} was not taken — {e}",
                     self.path.display()

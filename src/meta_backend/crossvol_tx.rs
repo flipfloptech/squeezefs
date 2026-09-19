@@ -2230,7 +2230,7 @@ async fn apply_or_ship_step(
                 }
             }
             let out = routed.volumes[v_idx]
-                .xv_apply_step(local, rider, guards)
+                .xv_apply_step(local, rider, guards, false)
                 .await;
             if out.is_err() {
                 routed.mirror_volume_failure(v_idx);

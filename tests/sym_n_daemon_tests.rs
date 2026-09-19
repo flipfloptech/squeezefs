@@ -955,19 +955,14 @@ async fn concurrent_storms(
     for (i, dir) in dirs.iter().enumerate() {
         assert_all_resolve(&manager, *dir, &files[i]).await;
     }
-    {
-        let r = resurrected_at(&manager, &removed).await;
-        if let Some((dir, name, _, _)) = r.first() {
-            attribute_resurrection(&manager, &manager.volumes[0], dir, name).await;
-        }
-        assert!(
-            r.is_empty(),
-            "the manager resolves {} of {} unlinked names after the joiners' clean leaves \
-             (first: {:?}) — a leave's flush-then-transfer lost tombstones",
-            r.len(),
-            removed.len(),
-            &r[..r.len().min(4)]
-        );
+    // The manager's verdict is GATHERED, not asserted yet: whether the
+    // DURABLE tree (a fresh writer's) resolves the same names tells a
+    // stale RAM image at the manager (the adoption barrier's class) from
+    // lost tombstones (the leave's), so both are read before either fails.
+    let at_manager = resurrected_at(&manager, &removed).await;
+    if let Some((dir, name, _, _)) = at_manager.first() {
+        eprintln!("ATTRIBUTION at the MANAGER (its RAM tree after the leaves):");
+        attribute_resurrection(&manager, &manager.volumes[0], dir, name).await;
     }
     venue.tear_down();
     shutdown(&manager).await;
@@ -976,27 +971,38 @@ async fn concurrent_storms(
     drop(daemons);
     // Deleted stays deleted: a fresh writer resolves NONE of the removed
     // names (each was unlinked by its own creator, the unlink acked).
+    let mut at_fresh = Vec::new();
     if !removed.is_empty() {
         let fresh = open_under(&uris, &Knobs::armed()).await;
-        let mut resurrected = Vec::new();
         for (dir, name) in &removed {
             if let Ok(ino) = fresh.lookup(*dir, name).await {
-                resurrected.push((*dir, name.clone(), ino.ino, ino.nlink));
+                at_fresh.push((*dir, name.clone(), ino.ino, ino.nlink));
             }
         }
-        if let Some((dir, name, _, _)) = resurrected.first() {
+        if let Some((dir, name, _, _)) = at_fresh.first() {
+            eprintln!("ATTRIBUTION at a FRESH writer (the durable tree):");
+            attribute_resurrection(&fresh, &fresh.volumes[0], dir, name).await;
+        } else if let Some((dir, name, _, _)) = at_manager.first() {
+            eprintln!(
+                "ATTRIBUTION at a FRESH writer of the MANAGER's first resurrected name (absent \
+                 here — the manager's image was stale):"
+            );
             attribute_resurrection(&fresh, &fresh.volumes[0], dir, name).await;
         }
         shutdown(&fresh).await;
-        assert!(
-            resurrected.is_empty(),
-            "{} of {} unlinked names RESOLVE at a fresh writer (first: {:?}) — deleted did not \
-             stay deleted",
-            resurrected.len(),
-            removed.len(),
-            &resurrected[..resurrected.len().min(4)]
-        );
     }
+    assert!(
+        at_manager.is_empty() && at_fresh.is_empty(),
+        "deleted did not stay deleted: the manager resolves {} of {} unlinked names after the \
+         joiners' clean leaves (first: {:?}); a fresh writer resolves {} (first: {:?}) — a \
+         fresh-writer count of 0 is a STALE image at the manager (the transfer's adoption \
+         barrier), a nonzero one is lost tombstones (the leave's flush-then-transfer)",
+        at_manager.len(),
+        removed.len(),
+        &at_manager[..at_manager.len().min(4)],
+        at_fresh.len(),
+        &at_fresh[..at_fresh.len().min(4)]
+    );
     fsck_clean(&uris).await;
 }
 
@@ -1215,6 +1221,286 @@ async fn a_joined_holder_resolves_a_later_joiners_slot_at_a_served_step() {
     shutdown(&j2).await;
     shutdown(&j1).await;
     j1venue.tear_down();
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
+/// **A foreign create into a STRIPED directory judges the stripe's record
+/// by its HOLDER's word, never this mount's projection** (PR 13 — found by
+/// the fleet's `sym-shared-dir`: every foreign writer created 1–3 files
+/// into m60's directory, m60 flipped it to 64 stripes, and every later
+/// foreign create was refused `ENOENT` "directory … was removed (no
+/// record)" with `dir_stripe_dying_refusals` +1 at each initiator). The
+/// stripes are minted in the holder's rotor AFTER the other daemons'
+/// projections loaded, so `refuse_dying_parent`'s routed LOCAL read of the
+/// key parent (the stripe) found no record at the initiator. The record
+/// is read through `getattr` — the writer's read divert — now; in this
+/// fixture (no custody arm) the divert reads locally, so the pin's
+/// premise is the shape, and the fleet leg is the wire's row: joiner 2
+/// creates into joiner 1's directory, joiner 1 flips it explicitly, joiner
+/// 2's next creates route to stripes and land, `dying_refusals` unmoved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_foreign_create_into_a_striped_directory_reads_the_stripes_record_at_its_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let j1 = join(&uris, &venue, &mvol, 1).await;
+    let _ = create_files(&j1, shared, "j1", 2).await;
+    let j2 = join(&uris, &venue, &mvol, 2).await;
+    let j1venue = DaemonVenue::stand_up(&j1, false, "joiner-1").await;
+    j2.volumes[0]
+        .slot_leases()
+        .expect("armed")
+        .holders
+        .set_endpoint(1, &j1venue.endpoint);
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(&j2),
+            "node-j2",
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    // Joiner 2 is this process's READING writer (PR 9's custody arm —
+    // process-global): its reads of joiner 1's slot are token reads at
+    // joiner 1's listener, the fleet's shape — the map's markers and the
+    // stripe's record come from the holder, never joiner 2's projection.
+    let sink = Arc::new(ProbeSink {
+        calls: std::sync::atomic::AtomicU64::new(0),
+    });
+    let for_arm = Arc::clone(&sink);
+    let j2vol = Arc::clone(&j2.volumes[0]);
+    let _arm = squeezefs::data_grant::arm_slot_custody(
+        &j2,
+        &squeezefs::cowriter::node_member_id_of(
+            j2vol.joined_wire().unwrap().identity.node_token,
+            j2vol.joined_wire().unwrap().identity.mount_slot,
+        ),
+        VENUE_SECRET.to_vec(),
+        0,
+        Arc::new(move |_volume| {
+            Arc::clone(&for_arm) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
+        }),
+    );
+    // Before the flip: an ordinary foreign create, served at joiner 1.
+    j2.create(shared, "pre-flip", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("a cross-owner create before the flip");
+    // Joiner 1 stripes the directory it holds (the stripes minted in ITS
+    // rotor, after joiner 2's projection loaded); joiner 2 re-reads the
+    // map through its token of the directory's dentries.
+    j1.stripe_dir(shared, 4).await.expect("the holder's flip");
+    assert!(
+        j1.stripe_map(shared)
+            .await
+            .expect("map")
+            .is_some_and(|m| m.stripes.len() == 4),
+        "the holder reads its 4-stripe map"
+    );
+    let dying0 = squeezefs::meta_backend::dir_stripe::DIR_STRIPE_DYING_REFUSALS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    for k in 0..12 {
+        let name = format!("post-flip-{k}");
+        let child = j2
+            .create(shared, &name, libc::S_IFREG | 0o644, 1000, 1000)
+            .await
+            .unwrap_or_else(|e| panic!("a foreign create into the striped directory ({name}): {e}"))
+            .ino;
+        let route = j2
+            .stripe_route(shared, &name)
+            .await
+            .expect("route")
+            .expect("the directory is striped at joiner 2 too");
+        assert_eq!(
+            j1.lookup_dentry_exact_unguarded(shared, &name)
+                .await
+                .expect("the holder reads the name")
+                .map(|(ino, _)| ino),
+            Some(child),
+            "{name} landed in stripe {} of joiner 1's directory",
+            route.index
+        );
+    }
+    assert_eq!(
+        squeezefs::meta_backend::dir_stripe::DIR_STRIPE_DYING_REFUSALS
+            .load(std::sync::atomic::Ordering::Relaxed),
+        dying0,
+        "no stripe was judged dying by a stale projection"
+    );
+    squeezefs::data_grant::disarm_slot_custody().await;
+    drop(j2vol);
+    shutdown(&j2).await;
+    shutdown(&j1).await;
+    j1venue.tear_down();
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
+/// **A dominating requester earns an IDLE joined holder's tree through
+/// the served ships** (§5.1.4 on the wire — gate 3c's IDLE row; PR 13,
+/// found by the fleet's `sym-foreign-touch`: 12 dominating bursts of 64
+/// over 133 s, `slot_offers` 0 everywhere, no handover). Two defects
+/// under it, each red-first here: (1) PR 4's holder-side dominance
+/// evaluation `note_slot_ship` had NO product caller — PR 6's served
+/// step never noted the ship it served, so `ops_q` never accumulated on
+/// any fleet; (2) a JOINED holder's offer reached `manager_offer_slot`,
+/// a manager verb's executor, and refused (`joined_control_refusals`) —
+/// it travels as the wire `OfferSlot` now. Pinned: joiner 2 ships
+/// `N_floor × 4` creates into joiner 1's idle directory (served at
+/// joiner 1's listener); joiner 1's plane counts the ships and ONE idle
+/// offer, the manager's table holds the slot `Offered` to joiner 2 with
+/// the offer on joiner 2's carriage, `joined_control_refusals` stays 0;
+/// the accept recalls the slot from joiner 1 (the wire holder's law),
+/// joiner 1's carriage sink runs the flush-then-transfer, and joiner 2's
+/// retry holds the slot at `g + 1` with every acked name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dominating_requester_earns_an_idle_joined_holders_tree_through_served_ships() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "a")]).await;
+    let a = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let holder = join(&uris, &venue, &mvol, 1).await;
+    let hvol = Arc::clone(&holder.volumes[0]);
+    let own = create_files(&holder, a, "own", 4).await;
+    let g_lease = match tree0_state(&mvol, SLOT_A).await {
+        Some(SlotState::Leased { appender_id, g, .. }) if appender_id == 1 => g,
+        other => panic!("joiner 1 holds the directory's slot: {other:?}"),
+    };
+    let requester = join(&uris, &venue, &mvol, 2).await;
+    let rvol = Arc::clone(&requester.volumes[0]);
+    let rident = rvol.joined_wire().unwrap().identity;
+    let hvenue = DaemonVenue::stand_up(&holder, false, "joiner-1").await;
+    rvol.slot_leases()
+        .expect("armed")
+        .holders
+        .set_endpoint(1, &hvenue.endpoint);
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(&requester),
+            "node-j2",
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    let hplane = Arc::clone(hvol.slot_leases().expect("armed"));
+    let mplane = Arc::clone(mvol.slot_leases().expect("armed"));
+    let ships0 = hplane.ships.load(std::sync::atomic::Ordering::Relaxed);
+    let offers = |p: &squeezefs::meta_backend::kv::slot_lease::SlotLeasePlane| {
+        p.offers_idle.load(std::sync::atomic::Ordering::Relaxed)
+            + p.offers_dominated
+                .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let offers0 = offers(&hplane);
+    // The dominating burst: the holder is IDLE on the slot (its own 4 ops
+    // are the window's `ops_h`); `ops_q ≥ 2 × ops_h ∧ ops_q ≥ N_floor`.
+    let n_floor = hplane.n_floor();
+    let burst = usize::try_from(n_floor.max(2) * 4).unwrap().max(16);
+    let shipped = create_files(&requester, a, "touch", burst).await;
+    let ships1 = hplane.ships.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        ships1 - ships0 >= burst as u64,
+        "the holder noted every served ship ({ships0} → {ships1}, burst {burst})"
+    );
+    // The holder's own 4 creates sit inside the window, so the verdict is
+    // the DOMINATED arm here (`ops_q ≥ 2 × ops_h`); the fleet's idle
+    // holder ages out over `T_idle` and takes the idle arm — one law.
+    assert_eq!(
+        offers(&hplane),
+        offers0 + 1,
+        "ONE offer at the holder (N_floor {n_floor}; busy {}, wire failures {})",
+        hplane
+            .offers_busy
+            .load(std::sync::atomic::Ordering::Relaxed),
+        hvol.joined_stats().unwrap().wire_failures
+    );
+    assert_eq!(
+        hvol.joined_stats().unwrap().control_refusals,
+        0,
+        "the joined holder's offer travelled — no local manager verb was attempted"
+    );
+    let routing_a = squeezefs::meta_backend::kv::appender::page_slot_of_forest_slot(
+        SLOT_A,
+        mvol.appender_stats().unwrap().native_slot,
+    )
+    .unwrap();
+    let carriage = mplane.carriage_for(rident.node_token, rident.mount_slot);
+    assert!(
+        carriage.offered.iter().any(|(r, _)| *r == routing_a),
+        "the manager's table offers the slot to joiner 2 on its carriage: {:?}",
+        carriage.offered
+    );
+    // The accept: a wire holder's accepted offer is a RECALL on its
+    // renewal; the holder's carriage sink runs the handover; the
+    // requester's retry takes the slot at g + 1.
+    let (_, accepted) = requester.act_on_slot_carriage(&[], &carriage.offered).await;
+    let hident = hvol.joined_wire().unwrap().identity;
+    let hcarriage = mplane.carriage_for(hident.node_token, hident.mount_slot);
+    if accepted == 0 {
+        assert_eq!(
+            hcarriage.release_notices,
+            vec![routing_a],
+            "the accept recalled the slot from the wire holder"
+        );
+        // The MANAGER counts the handover: the wire holder's release
+        // spends the recall its accepted offer raised (before PR 13 only
+        // the in-process accept counted, so `slot_handovers` read 0 on
+        // every fleet handover).
+        let handovers0 = mplane.handovers.load(std::sync::atomic::Ordering::Relaxed);
+        let (released, _) = holder
+            .act_on_slot_carriage(&hcarriage.release_notices, &[])
+            .await;
+        assert_eq!(released, 1, "the holder's flush-then-transfer ran");
+        assert_eq!(
+            mplane.handovers.load(std::sync::atomic::Ordering::Relaxed),
+            handovers0 + 1,
+            "the manager counts the wire handover"
+        );
+        let (_, accepted_again) = requester.act_on_slot_carriage(&[], &carriage.offered).await;
+        assert_eq!(accepted_again, 1, "the requester's retry holds the slot");
+        let now = squeezefs::mono_core::monotonic_ns_u64();
+        assert!(
+            rvol.slot_leases().unwrap().in_cooldown(SLOT_A, now),
+            "the new holder's never-thrash cooldown stands on ITS plane"
+        );
+    }
+    match tree0_state(&mvol, SLOT_A).await {
+        Some(SlotState::Leased { appender_id, g, .. }) => {
+            assert_eq!(appender_id, 2, "joiner 2 holds the slot now");
+            assert_eq!(g, g_lease + 1, "at the next generation");
+        }
+        other => panic!("tree 0 after the handover: {other:?}"),
+    }
+    // Every acked name — the holder's own and the shipped ones — is in
+    // the tree the new holder received (the transfer is exact); the
+    // shipped children's records are joiner 2's own, the holder's own
+    // children live in joiner 1's rotor (a token read this fixture's
+    // custody-armless requester cannot make — the dentry is asserted).
+    for (name, ino) in &own {
+        assert_eq!(
+            requester
+                .lookup_dentry_exact_unguarded(a, name)
+                .await
+                .expect("the new holder reads the transferred tree")
+                .map(|(i, _)| i),
+            Some(*ino),
+            "{name} travelled with the slot"
+        );
+    }
+    assert_all_resolve(&requester, a, &shipped).await;
+    assert_eq!(hvol.joined_stats().unwrap().control_refusals, 0);
+    assert_eq!(rvol.joined_stats().unwrap().control_refusals, 0);
+    shutdown(&requester).await;
+    drop(rvol);
+    shutdown(&holder).await;
+    drop(hvol);
+    hvenue.tear_down();
     venue.tear_down();
     shutdown(&manager).await;
 }

@@ -854,17 +854,39 @@ impl RoutedMetaBackend {
         Ok((key_parent, self.stripe_map(child).await?))
     }
 
+    /// The KEY parent's `nlink` as its HOLDER states it — `None` for no
+    /// record. A stripe is minted in ANOTHER appender's slot (the
+    /// supplier's, or the holder's rotor), so at the initiator its record
+    /// is a FOREIGN read: `getattr` rides the writer's read divert (PR
+    /// 12b — the holder's token plane, exact until recalled), where the
+    /// routed local read (`read_inode_value_routed`, the cross-volume
+    /// plan's OWN-record witness) reads this mount's PROJECTION of the
+    /// slot — loaded at its open, so a stripe minted after it read as "no
+    /// record" and every foreign create into a striped directory was
+    /// refused `ENOENT` (PR 13, the fleet's `sym-shared-dir`: 1–3 creates
+    /// per foreign writer, then `dir_stripe_dying_refusals` +1 each). An
+    /// own-slot parent and every unarmed mount take the local read
+    /// verbatim (`token_serve` answers `None` for them).
+    async fn key_parent_nlink(&self, parent: Ino) -> Result<Option<u32>> {
+        let (v, local) = self.route_ino(parent);
+        match self.volumes[v].getattr(local).await {
+            Ok(rec) => Ok(Some(rec.nlink)),
+            Err(SqueezefsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// A parent whose record reads `nlink == 0` — or has NO record (a
     /// stripe already destroyed behind its rmdir's intent) — is DYING or
     /// GONE, and an insert into it is refused `ENOENT`: the R26 closer,
     /// read under the insert's held `I{parent}` guard at EVERY insert
     /// path (create, link, rename's destination, the served step —
     /// Issue 6). An insert that parked on the stripe's guard behind the
-    /// rmdir resumes to exactly one of the two shapes.
+    /// rmdir resumes to exactly one of the two shapes. The record is the
+    /// HOLDER's word ([`Self::key_parent_nlink`]).
     pub async fn refuse_dying_parent(&self, parent: Ino) -> Result<()> {
-        let (v, local) = self.route_ino(parent);
-        match self.volumes[v].read_inode_value_routed(local).await? {
-            Some(rec) if rec.nlink != 0 => Ok(()),
+        match self.key_parent_nlink(parent).await? {
+            Some(nlink) if nlink != 0 => Ok(()),
             Some(_) => {
                 DIR_STRIPE_DYING_REFUSALS.fetch_add(1, Ordering::Relaxed);
                 Err(SqueezefsError::Io(std::io::Error::new(
@@ -893,9 +915,8 @@ impl RoutedMetaBackend {
         if e.to_errno() != libc::EEXIST {
             return e;
         }
-        let (v, local) = self.route_ino(key_parent);
-        match self.volumes[v].read_inode_value_routed(local).await {
-            Ok(Some(rec)) if rec.nlink != 0 => e,
+        match self.key_parent_nlink(key_parent).await {
+            Ok(Some(nlink)) if nlink != 0 => e,
             Ok(_) => SqueezefsError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("directory {key_parent} is being removed (rmdir in flight)"),

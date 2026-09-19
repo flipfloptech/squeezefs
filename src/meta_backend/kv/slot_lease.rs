@@ -658,6 +658,20 @@ impl SlotLeasePlane {
             .insert(id, (node_token, mount_slot));
     }
 
+    /// The appender whose page identity is `(node_token, mount_slot)` —
+    /// the served ship's REQUESTER off its member id (the offer's `to`).
+    /// `None` for an identity this plane has not learnt (a joiner that
+    /// joined after this mount's open: the served insert names the
+    /// creator through the child's slot instead).
+    pub fn appender_of_identity(&self, node_token: u64, mount_slot: u32) -> Option<u32> {
+        self.identities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(_, ident)| **ident == (node_token, mount_slot))
+            .map(|(id, _)| *id)
+    }
+
     /// Record a recall of `slot` from wire appender `holder` (its next
     /// renewal grant carries it).
     pub fn note_recall(&self, holder: u32, slot: ForestSlot) {

@@ -1817,7 +1817,8 @@ impl RoutedMetaBackend {
                 }
             }
         }
-        let out = vol.xv_apply_step(&local, None, guards).await;
+        let served_at = std::time::Instant::now();
+        let out = vol.xv_apply_step(&local, None, guards, true).await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);
         }
@@ -1829,7 +1830,46 @@ impl RoutedMetaBackend {
             step.name(),
             out.status
         );
+        // PR 4's holder-side dominance evaluation AT THE SERVED SHIP
+        // (§5.1.4 — `note_slot_ship`): before PR 13 nothing in the served
+        // path called it, so `ops_q` never accumulated, `slot_offers` and
+        // the idle arm read 0 on every fleet, and a dominating requester
+        // never earned an idle holder's tree (gate 3c's IDLE row). The
+        // requester is the shipping mount's appender: its member id's
+        // identity where this plane learnt it, else — for an insert — the
+        // creator through the child's slot (the child is minted in the
+        // creator's rotor; the screen above refreshed the projection).
+        if vol.slot_leases().is_some() {
+            let slot = kv::record::forest_slot_of_ino(local.local_home());
+            if let Some(requester) = self.served_step_requester(vol, scope.client, step) {
+                let ship_ns = u64::try_from(served_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let _ = vol.note_slot_ship(slot, requester, ship_ns).await;
+            }
+        }
         Ok(out)
+    }
+
+    /// The appender id of a served step's initiator — see the note at its
+    /// one call site. `None` when neither the member identity nor the
+    /// child's slot names one (the ship is served, never counted).
+    fn served_step_requester(
+        &self,
+        vol: &kv::backend::KvMetaBackend,
+        client: &str,
+        step: &crossvol_tx::XvStep,
+    ) -> Option<u32> {
+        let plane = vol.slot_leases()?;
+        let own = vol.own_appender_id();
+        if let Some((node_token, mount_slot)) = crate::cowriter::parse_node_member_id(client) {
+            if let Some(id) = plane.appender_of_identity(node_token, mount_slot) {
+                return (id != own).then_some(id);
+            }
+        }
+        if let crossvol_tx::XvStep::InsertDentry { child, .. } = step {
+            let creator = self.holder_of(*child)?;
+            return (creator != own).then_some(creator);
+        }
+        None
     }
 
     /// The served insert's `child` screen (Issue 8a): a record on its

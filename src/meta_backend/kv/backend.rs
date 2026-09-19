@@ -6229,13 +6229,26 @@ impl KvMetaBackend {
                 .reset_slot_record_frontier(slot, self.ring.core().head());
             plane.gate.clear_foreign(slot);
         }
+        // A release that SPENDS a standing recall is the wire holder's
+        // half of a HANDOVER (a requester's accepted offer — PR 13: the
+        // in-process accept counted its release + grant under one mutex
+        // hold; a wire holder's ran uncounted, so `slot_handovers` read 0
+        // on every fleet handover and gate 3c's IDLE row could never see
+        // one). The requester's grant follows on its retry; its cooldown
+        // is its own (`joined_accept_offers`).
+        let recalled = plane.recalls_of(appender_id).contains(&slot);
         plane.clear_recall(appender_id, slot);
         plane.holders.forget(slot);
         match plane
             .table
             .release(slot, appender_id, g, words, last_written)
         {
-            crate::slot_lease_core::ReleaseOutcome::Released => {}
+            crate::slot_lease_core::ReleaseOutcome::Released => {
+                if recalled {
+                    plane.handovers.fetch_add(1, Ordering::Relaxed);
+                    plane.note_handover(slot, crate::mono_core::monotonic_ns_u64());
+                }
+            }
             crate::slot_lease_core::ReleaseOutcome::Already => {
                 set.verbs.replays.fetch_add(1, Ordering::Relaxed);
             }
@@ -7294,8 +7307,15 @@ impl KvMetaBackend {
                 }
                 // Under the manager's mutex: an offer already in flight (a
                 // second dominating ship before the accept) is `Busy` and
-                // not a second offer.
-                if let Ok(()) = self.manager_offer_slot(holder, slot, requester).await {
+                // not a second offer. A JOINED holder's offer travels to
+                // its manager (PR 13 — the local executor is a manager
+                // verb's and refused it, so no joiner's idle tree moved).
+                let offered = if set.is_joined_appender() {
+                    self.joined_offer_slot(slot, requester).await
+                } else {
+                    self.manager_offer_slot(holder, slot, requester).await
+                };
+                if let Ok(()) = offered {
                     if matches!(verdict, ShipVerdict::OfferIdle { .. }) {
                         plane.offers_idle.fetch_add(1, Ordering::Relaxed);
                     } else {
@@ -7354,8 +7374,10 @@ impl KvMetaBackend {
         // the belt refused the very commit the drain was waiting for.
         let now = crate::mono_core::monotonic_ns_u64();
         let t_idle = plane.t_idle_ns();
-        for slot in &slots {
-            plane.note_holder_op(*slot, now, t_idle);
+        if !tx.served_step {
+            for slot in &slots {
+                plane.note_holder_op(*slot, now, t_idle);
+            }
         }
         let mut entered: Vec<super::record::ForestSlot> = Vec::with_capacity(slots.len());
         for slot in slots {
@@ -16076,6 +16098,13 @@ pub struct KvTx {
     /// the conveyor pass recalls nothing for it. The heartbeat on ino 1
     /// would otherwise recall every reader's ROOT token every 10 s.
     token_quiet: bool,
+    /// PR 13 (§5.1.4): `true` = the tx applies a cross-owner step ANOTHER
+    /// appender shipped here (`xv_serve_step`) — the REQUESTER's work on
+    /// the slot, not the holder's — so the door's holder-op note skips
+    /// it: `ops_h` is the holder's OWN activity, and with every served
+    /// insert counted on both sides `ops_q ≥ 2 × ops_h` held for no
+    /// requester and no dominated tree ever moved.
+    served_step: bool,
 }
 
 impl KvTx {
@@ -16094,6 +16123,7 @@ impl KvTx {
             site: std::panic::Location::caller(),
             guards: Arc::from(Vec::new()),
             token_quiet: false,
+            served_step: false,
         }
     }
 
@@ -24914,15 +24944,21 @@ impl KvMetaBackend {
     /// object that moved under the plan (`ForeignSkipped`, counted loud by
     /// the caller). The rider is committed even when the witness declines
     /// the effect: an intent that named nothing to do is retired by the
-    /// same protocol as one that did.
+    /// same protocol as one that did. `served` = the step was SHIPPED
+    /// here by another appender (`xv_serve_step`): the tx is the
+    /// requester's work on the slot for the door's holder-op note
+    /// (`KvTx::served_step`); the initiator's own local steps pass
+    /// `false`.
     pub async fn xv_apply_step(
         &self,
         step: &XvLocalStep,
         rider: Option<&XvRider>,
         guards: Arc<[DlmGuard]>,
+        served: bool,
     ) -> Result<XvStepOutcome> {
         self.write_gate()?;
         let mut tx = KvTx::new();
+        tx.served_step = served;
         Self::stage_intent_rider(&mut tx, rider)?;
         let mut status = XvStepStatus::Applied;
         let mut inode = None;

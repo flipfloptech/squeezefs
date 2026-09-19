@@ -864,6 +864,10 @@ async fn concurrent_storms(
                 s.extent_grant_conflicts, 0,
                 "writer {i}: extent_grant_conflicts"
             );
+            assert_eq!(
+                s.extent_return_live_refusals, 0,
+                "writer {i}: extent_return_live_refusals (a live image was about to be returned)"
+            );
             if strict_wire {
                 assert_must_stay_zero(&d.volumes[0], &format!("writer {i}"));
             } else {
@@ -883,12 +887,87 @@ async fn concurrent_storms(
             }
         }
     } // rounds
-      // Every joiner leaves cleanly; the manager reads every acked name.
+      // Deleted stays deleted at EVERY daemon while all are live (each
+      // unlink was acked at its own creator).
+    let resurrected_at = |r: &Arc<RoutedMetaBackend>, removed: &Vec<(u64, String)>| {
+        let r = Arc::clone(r);
+        let removed = removed.clone();
+        async move {
+            let mut out = Vec::new();
+            for (dir, name) in &removed {
+                if let Ok(ino) = r.lookup(*dir, name).await {
+                    out.push((*dir, name.clone(), ino.ino, ino.nlink));
+                }
+            }
+            out
+        }
+    };
+    for (i, d) in daemons.iter().enumerate() {
+        let r = resurrected_at(d, &removed).await;
+        assert!(
+            r.is_empty(),
+            "writer {i} resolves {} of {} unlinked names while every daemon is live (first: {:?})",
+            r.len(),
+            removed.len(),
+            &r[..r.len().min(4)]
+        );
+    }
+    // Every joiner leaves cleanly; the manager reads every acked name —
+    // and still none of the removed ones (the leave's flush-then-transfer
+    // carried every tombstone). The screen's gauges before/after name the
+    // mechanism if a name comes back.
+    let screened0 = squeezefs::meta_backend::kv::META_KV_FOREIGN_FRAMES_SCREENED
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let breach0 = squeezefs::meta_backend::kv::META_KV_APPENDER_FENCE_BREACH
+        .load(std::sync::atomic::Ordering::Relaxed);
     for d in daemons.drain(1..) {
+        // ATTRIBUTION EXPERIMENT: two full cycles before the leave.
+        if std::env::var_os("SQZ_PIN_PRECHECKPOINT").is_some() {
+            d.volumes[0].checkpoint_now().await.unwrap();
+            d.volumes[0].checkpoint_now().await.unwrap();
+        }
+        let left_dirs: Vec<u64> = dirs.clone();
         shutdown(&d).await;
+        let r = resurrected_at(&manager, &removed).await;
+        let mut by_dir: std::collections::BTreeMap<u64, Vec<String>> = Default::default();
+        for (dir, name, _, _) in &r {
+            by_dir.entry(*dir).or_default().push(name.clone());
+        }
+        eprintln!(
+            "after a leave (this daemon's round dirs {left_dirs:?}): by dir {:?}",
+            by_dir
+                .iter()
+                .map(|(d, v)| (*d, v.len(), v.first().cloned(), v.last().cloned()))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "after a leave: the manager resolves {} removed name(s); foreign_frames_screened +{} \
+             fence_breach +{}",
+            r.len(),
+            squeezefs::meta_backend::kv::META_KV_FOREIGN_FRAMES_SCREENED
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - screened0,
+            squeezefs::meta_backend::kv::META_KV_APPENDER_FENCE_BREACH
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - breach0
+        );
     }
     for (i, dir) in dirs.iter().enumerate() {
         assert_all_resolve(&manager, *dir, &files[i]).await;
+    }
+    {
+        let r = resurrected_at(&manager, &removed).await;
+        if let Some((dir, name, _, _)) = r.first() {
+            attribute_resurrection(&manager, &manager.volumes[0], dir, name).await;
+        }
+        assert!(
+            r.is_empty(),
+            "the manager resolves {} of {} unlinked names after the joiners' clean leaves \
+             (first: {:?}) — a leave's flush-then-transfer lost tombstones",
+            r.len(),
+            removed.len(),
+            &r[..r.len().min(4)]
+        );
     }
     venue.tear_down();
     shutdown(&manager).await;
@@ -904,6 +983,9 @@ async fn concurrent_storms(
             if let Ok(ino) = fresh.lookup(*dir, name).await {
                 resurrected.push((*dir, name.clone(), ino.ino, ino.nlink));
             }
+        }
+        if let Some((dir, name, _, _)) = resurrected.first() {
+            attribute_resurrection(&fresh, &fresh.volumes[0], dir, name).await;
         }
         shutdown(&fresh).await;
         assert!(
@@ -5305,4 +5387,104 @@ async fn joiner_gone_names(routed: &RoutedMetaBackend, dir: u64, files: &[(Strin
         }
     }
     true
+}
+
+/// ATTRIBUTION of a resurrected name (a removed name a fresh reader still
+/// resolves): the leaf that holds its dentry — the RAM fold for the key
+/// and every frame of its extent on the DEVICE (kind + seq per record) —
+/// so the record says whether the tombstone is missing from the image,
+/// sits in a frame the walk does not reach, or was never written.
+async fn attribute_resurrection(
+    routed: &RoutedMetaBackend,
+    kv: &KvMetaBackend,
+    dir: &u64,
+    name: &str,
+) {
+    // The dentry's key is in the LOCAL KEY form the routed layer frames
+    // (`route_ino`) — a global ino would route to the native slot.
+    let (_, local_dir) = routed.route_ino(*dir);
+    use squeezefs::meta_backend::kv::record::{dentry_key, dentry_name_hash54};
+    let hash = dentry_name_hash54(name.as_bytes(), kv.superblock().hash_seed);
+    let legacy = dentry_key(local_dir, hash, 0);
+    if let Ok(Some((tree, fkey))) =
+        kv.record_locator(squeezefs::meta_backend::kv::record::TREE_DENTRIES, &legacy)
+    {
+        if let Ok(leaf) = tree.resolve_leaf(&fkey).await {
+            let addr = leaf.addr();
+            let snap = leaf.snapshot();
+            let ram = format!(
+                "newest_seq {:?}, fold {}",
+                snap.newest_seq_of(&fkey),
+                match snap.lookup(&fkey) {
+                    Ok(squeezefs::meta_backend::kv::node_cache::LiveLookup::Live(_)) => "Live",
+                    Ok(squeezefs::meta_backend::kv::node_cache::LiveLookup::Tombstone) =>
+                        "Tombstone",
+                    Ok(squeezefs::meta_backend::kv::node_cache::LiveLookup::Absent) => "Absent",
+                    Err(_) => "Err",
+                }
+            );
+            let layout = kv.node_cache().config().layout.clone();
+            let node_size = layout.node_size();
+            let buf = squeezefs::uring_fs::read_at(kv.device_path(), addr, node_size)
+                .await
+                .unwrap();
+            let loaded =
+                squeezefs::meta_backend::kv::node::verify_node_extent(buf, &layout, addr, 0)
+                    .unwrap();
+            let mut disk: Vec<String> = Vec::new();
+            for (fi, view) in loaded.bset_views_newest_first().unwrap().iter().enumerate() {
+                for i in view.find(&fkey) {
+                    let r = view.record(i);
+                    disk.push(format!("frame{fi}:{:?}@{}", r.kind, r.seq));
+                }
+            }
+            // Every frame in the extent RAW (past the walk's stop too):
+            // offset, node_seq_at_write, appender id, g.
+            let raw = squeezefs::uring_fs::read_at(kv.device_path(), addr, node_size)
+                .await
+                .unwrap();
+            let mut frames: Vec<String> = Vec::new();
+            let mut pos = 4096usize;
+            while pos + 40 <= raw.len() {
+                let h = &raw[pos..pos + 40];
+                let magic = u32::from_le_bytes(h[0..4].try_into().unwrap());
+                if magic == 0 {
+                    break;
+                }
+                let nsw = u64::from_le_bytes(h[8..16].try_into().unwrap());
+                let padded = u32::from_le_bytes(h[16..20].try_into().unwrap()) as usize;
+                let blen = u32::from_le_bytes(h[20..24].try_into().unwrap());
+                let app = u32::from_le_bytes(h[24..28].try_into().unwrap());
+                let g = u32::from_le_bytes(h[28..32].try_into().unwrap());
+                frames.push(format!(
+                    "@{pos}: seq {nsw}{} padded {padded} bset {blen} appender {app} g {g}",
+                    if nsw == leaf.node_seq() {
+                        "(SAME)"
+                    } else {
+                        "(OTHER)"
+                    }
+                ));
+                if padded == 0 || frames.len() > 64 {
+                    break;
+                }
+                pos += padded;
+            }
+            eprintln!("ATTRIBUTION raw frames of {addr:#x}: {frames:#?}");
+            eprintln!(
+                "ATTRIBUTION {name} in dir {dir}: leaf {addr:#x} (slot {:?}, node_seq {}, \
+                         level {}, tail {} of {}) RAM {ram}; DEVICE frames (newest \
+                         first) {disk:?}; residue past the walk: {}",
+                leaf.forest_slot(),
+                leaf.node_seq(),
+                leaf.level(),
+                loaded.tail_offset(),
+                node_size,
+                squeezefs::meta_backend::kv::node::residue_seq_ceiling(
+                    &squeezefs::uring_fs::read_at(kv.device_path(), addr, node_size)
+                        .await
+                        .unwrap()
+                )
+            );
+        }
+    }
 }

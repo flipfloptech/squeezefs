@@ -2878,6 +2878,31 @@ impl NodeCache {
         (addr - self.cfg.heap_base) / self.cfg.layout.node_size() as u64
     }
 
+    /// The extents among `extents` whose address holds a LIVE cached node
+    /// of this mount — mapped, not superseded, stamped with a forest slot
+    /// or dirty — each with the node's stamp and seq (PR 13, the
+    /// return-of-a-live-image belt): an extent about to be RETURNED or
+    /// re-granted while a tree of this mount still routes to its node is
+    /// the double-custody class the fleet's N = 8 storm read as two
+    /// appenders' frames in one extent; the callers keep such an extent
+    /// claimed and count it. One `try_get` per extent, no I/O.
+    pub fn live_images_among(
+        &self,
+        extents: &[u64],
+    ) -> Vec<(u64, Option<super::record::ForestSlot>, u64)> {
+        let mut out = Vec::new();
+        for e in extents {
+            if let Some(node) = self.try_get(self.extent_addr(*e)) {
+                if !node.state().is_superseded()
+                    && (node.forest_slot().is_some() || node.dirty_floor() != u64::MAX)
+                {
+                    out.push((*e, node.forest_slot(), node.node_seq()));
+                }
+            }
+        }
+        out
+    }
+
     /// **An extent leaves this mount's custody** (symmetric PR 12b): the
     /// `retired` veto — "a node this mount retired stays dead until this
     /// mount publishes a node there" — is a ONE-writer law. Under the

@@ -1607,6 +1607,20 @@ impl RegionGrant {
         self.returnable.extend(extents);
     }
 
+    /// Put extents taken by [`Self::take_returnable`] / [`Self::
+    /// take_unclaimed`] back as CLAIMED (PR 13's live-image belt): the
+    /// caller found a live node of this mount at each — whatever ledger
+    /// step called it free was wrong, and the image stays in this grant's
+    /// custody rather than leaving for another appender to overwrite.
+    pub fn reclaim_as_claimed(&mut self, extents: &[u64]) {
+        for e in extents {
+            self.returned = self.returned.saturating_sub(1);
+            self.returnable.retain(|r| r != e);
+            self.unclaimed.remove(e);
+            self.claimed.insert(*e);
+        }
+    }
+
     /// The unclaimed remainder as ascending runs — the WHOLE remainder;
     /// the page writer calls [`Self::trim_to_page_runs`] first so the
     /// page names every unclaimed extent (review round 1, Issue 9).
@@ -2415,6 +2429,10 @@ pub struct ManagerVerbLedger {
     /// returns REFUSED because an extent already sat in another appender's
     /// `extent_grant:` record — two custodians of one image.
     pub grant_conflicts: std::sync::atomic::AtomicU64,
+    /// PR 13 (`extent_return_live_refusals`, **must-stay-0**): extents a
+    /// return batch named while a LIVE node of this mount stood at them
+    /// — kept claimed, never returned (the double-custody class).
+    pub return_live_refusals: std::sync::atomic::AtomicU64,
     /// PR 13 (`extent_grant_stale_page_words`): `ExtentGrant` asks whose
     /// page word named an extent the caller's record no longer held (a
     /// return landed after its last page write) — the word is intersected
@@ -2677,6 +2695,7 @@ impl AppenderSet {
             manager_verb_rejected: self.verbs.rejected.load(Relaxed),
             extent_grant_conflicts: self.verbs.grant_conflicts.load(Relaxed),
             extent_grant_stale_page_words: self.verbs.stale_page_words.load(Relaxed),
+            extent_return_live_refusals: self.verbs.return_live_refusals.load(Relaxed),
             appenders_known: self.appenders_known.load(Relaxed),
             manager_verbs_per_s: self.verbs.verbs_per_s(),
             manager_load_pct: self.verbs.load_pct(now_ns),
@@ -2794,6 +2813,9 @@ pub struct AppenderStats {
     /// `ExtentGrant` asks whose page word outran the record
     /// (`extent_grant_stale_page_words` — PR 13).
     pub extent_grant_stale_page_words: u64,
+    /// Return-batch extents kept claimed because a live node of this mount
+    /// stood at them (`extent_return_live_refusals`, must-stay-0 — PR 13).
+    pub extent_return_live_refusals: u64,
     /// The directory's `Live` count as last read (`appenders_known`) —
     /// the grant cap's appender term.
     pub appenders_known: u64,

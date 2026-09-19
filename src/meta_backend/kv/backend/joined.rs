@@ -1862,7 +1862,8 @@ impl KvMetaBackend {
                 ),
             }
         }
-        let returnable = region.grant().take_returnable();
+        let mut returnable = region.grant().take_returnable();
+        self.keep_live_images_claimed(region, &mut returnable);
         if !returnable.is_empty() {
             let runs = super::super::slot_state::ExtentGrantRecord::from_extents(
                 returnable.iter().copied(),
@@ -1993,12 +1994,13 @@ impl KvMetaBackend {
         // remainders (`ReturnBlocks`), it declares none.
         crate::membership::uninstall_window_decl_source();
         // The unclaimed remainder returns with the region.
-        let returnable = {
+        let mut returnable = {
             let mut g = region.grant();
             let mut all = g.take_returnable();
             all.extend(g.take_unclaimed());
             all
         };
+        self.keep_live_images_claimed(region, &mut returnable);
         let runs =
             super::super::slot_state::ExtentGrantRecord::from_extents(returnable.iter().copied())
                 .runs;

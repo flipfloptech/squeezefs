@@ -3419,7 +3419,7 @@ SYM_ZERO_KEYS="meta_kv_forest_key_violations appender_fence_breach foreign_frame
     appender_flush_ceiling_overruns dead_member_write_deferrals data_alloc_bitmap_drift \
     joined_control_refusals xv_cross_owner_intents_stuck manager_dependency_stalls \
     dlm_token_custody_rejected invariant_tripwires data_dma_fence_refusals \
-    extent_grant_conflicts"
+    extent_grant_conflicts extent_return_live_refusals"
 
 # The must-stay-0 set on one daemon as a REPORT: prints every violated
 # gauge as `key=value` (nothing on a clean daemon). The rows that publish a
@@ -3765,11 +3765,49 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t0):.0f}')")"
         [ "$verdict" = "MET" ] || verdict_all=MISS
         printf '%-4s %-10s %-8s %-10s %-8s %-9s %-8s %-8s %-8s %-6s %s\n' "$n" "$create_rate" "${cr}x" "$ingest_rate" "${ir}x" "$mgr_load" "${mgr_cpu}%" "$handovers" "$ships" "$rpcs" "$verdict" | tee -a "$rowdir/symscale-table.tsv"
         for idx in "${writers[@]}"; do
+            # A sample of the names about to be removed — the LAST ones the
+            # storm created (the "deleted stays deleted" arm below judges
+            # them after every writer's CLEAN LEAVE: the in-process pin
+            # found a joiner's final tombstones lost across its leave).
+            ls "$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx" 2>/dev/null | tail -200 |
+                sed "s|^|/scale-$SYM_RUN-n$n-w$idx/|" >>"$rowdir/removed-sample.txt" || true
             rm -rf "$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx" 2>/dev/null || true
         done
     done
     echo "gate 3 (≥ 0.7 × N × the N=1 rate on BOTH rows; the manager's load flat in N): $verdict_all" | tee "$rowdir/symscale-verdict.txt"
     [ -z "$zero_miss_all" ] || die "sym-scale: a must-stay-0 gauge moved:$zero_miss_all (rows above; the leg is RED)"
+    # DELETED STAYS DELETED across every joiner's CLEAN LEAVE (PR 13): every
+    # joiner unmounts (the product umount = the leave's flush-then-transfer
+    # of every slot), then the removed sample is judged through the
+    # MANAGER — a name that resolves is a tombstone the leave lost; then
+    # through a REMOUNTED joiner (a fresh open of the durable state).
+    if [ -s "$rowdir/removed-sample.txt" ]; then
+        local j resurrected=0 total
+        for j in "${joiners[@]}"; do
+            "$MWFLEET" unmount "$j" || die "sym-scale: joiner m$j's clean unmount failed"
+        done
+        total="$(wc -l <"$rowdir/removed-sample.txt" | tr -d ' ')"
+        while IFS= read -r rel; do
+            [ -n "$rel" ] || continue
+            if timeout 30 stat "$(mnt_of 0)$rel" >/dev/null 2>&1; then
+                resurrected=$((resurrected + 1))
+                echo "RESURRECTED at the manager: $rel" >>"$rowdir/resurrected.txt"
+            fi
+        done <"$rowdir/removed-sample.txt"
+        echo "deleted-stays-deleted (manager, after every joiner's clean leave): $resurrected of $total sampled removed names resolve" | tee -a "$rowdir/symscale-verdict.txt"
+        "$MWFLEET" mount "${joiners[0]}" || die "sym-scale: joiner m${joiners[0]}'s remount failed"
+        local resurrected_j=0
+        while IFS= read -r rel; do
+            [ -n "$rel" ] || continue
+            if timeout 30 stat "$(mnt_of "${joiners[0]}")$rel" >/dev/null 2>&1; then
+                resurrected_j=$((resurrected_j + 1))
+                echo "RESURRECTED at remounted joiner m${joiners[0]}: $rel" >>"$rowdir/resurrected.txt"
+            fi
+        done <"$rowdir/removed-sample.txt"
+        echo "deleted-stays-deleted (remounted joiner m${joiners[0]}): $resurrected_j of $total" | tee -a "$rowdir/symscale-verdict.txt"
+        [ "$resurrected" = "0" ] && [ "$resurrected_j" = "0" ] ||
+            die "sym-scale: DELETED DID NOT STAY DELETED — $resurrected (manager) / $resurrected_j (remounted joiner) of $total sampled removed names resolve after the joiners' clean leaves (see $rowdir/resurrected.txt)"
+    fi
     # Every joiner back up for the legs that follow.
     sym_ensure_joiners $((${#joiners[@]} + 1)) "${joiners[@]}"
     sym_oracle sym-scale "$rowdir"

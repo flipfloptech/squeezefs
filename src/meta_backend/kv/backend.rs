@@ -4380,6 +4380,7 @@ impl KvMetaBackend {
             };
             back.sort_unstable();
             back.dedup();
+            self.keep_live_images_claimed(region, &mut back);
             if !back.is_empty() {
                 if let Err(e) = self.return_extents_inner(region.id, &back, true).await {
                     log::warn!(
@@ -7998,6 +7999,7 @@ impl KvMetaBackend {
         };
         back.sort_unstable();
         back.dedup();
+        self.keep_live_images_claimed(region, &mut back);
         if !back.is_empty() {
             self.return_extents_inner(region.id, &back, false).await?;
         }
@@ -8279,6 +8281,47 @@ impl KvMetaBackend {
             return Ok(Vec::new());
         };
         Self::read_extent_grant_records(forest.control()).await
+    }
+
+    /// **The live-image belt on every RETURN** (PR 13): an extent a return
+    /// batch names while a LIVE node of this mount still stands at it —
+    /// mapped, not superseded, of one of this mount's trees — is a ledger
+    /// error somewhere upstream (a park released too early, a run
+    /// re-unclaimed, a retirement of a node the route still reaches); it
+    /// is kept CLAIMED, never handed to the manager to free and re-grant
+    /// (the double-custody class the fleet's N = 8 storm read as two
+    /// appenders' frames in one extent), and counted on
+    /// `extent_return_live_refusals` (must-stay-0), each named.
+    fn keep_live_images_claimed(
+        &self,
+        region: &super::appender::AppenderRegion,
+        batch: &mut Vec<u64>,
+    ) {
+        if batch.is_empty() {
+            return;
+        }
+        let live = self.cache.live_images_among(batch);
+        if live.is_empty() {
+            return;
+        }
+        let kept: Vec<u64> = live.iter().map(|(e, _, _)| *e).collect();
+        region.grant().reclaim_as_claimed(&kept);
+        batch.retain(|e| !kept.contains(e));
+        if let Some(set) = self.appenders.as_ref() {
+            set.verbs
+                .return_live_refusals
+                .fetch_add(kept.len() as u64, Ordering::Relaxed);
+        }
+        log::error!(
+            "meta volume {}: appender {}'s return batch named {} extent(s) holding a LIVE node of \
+             this mount — kept claimed, not returned (extent_return_live_refusals): {:?}",
+            self.path.display(),
+            region.id,
+            kept.len(),
+            live.iter()
+                .map(|(e, slot, seq)| format!("extent {e} (slot {slot:?}, node_seq {seq})"))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// **The grant-disjointness tripwire** (PR 13): every extent of
@@ -9489,7 +9532,8 @@ impl KvMetaBackend {
         }
         for r in set.regions.iter().skip(1) {
             r.fold_smo_rate(cycle_ms);
-            let returnable = r.grant().take_returnable();
+            let mut returnable = r.grant().take_returnable();
+            self.keep_live_images_claimed(r, &mut returnable);
             if !returnable.is_empty() {
                 if let Err(e) = self.manager_return_extents(r.id, &returnable).await {
                     r.grant().restore_returnable(returnable);

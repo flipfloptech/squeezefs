@@ -76,7 +76,7 @@ use squeezefs::meta_backend::kv::{
 };
 use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::NamedTempFile;
@@ -253,7 +253,7 @@ struct Vol {
     _file: NamedTempFile,
     cache: Arc<NodeCache>,
     alloc: Arc<ExtentAllocator>,
-    seq: Arc<AtomicU64>,
+    seq: Arc<squeezefs::meta_backend::kv::node_seq::NodeSeqHandle>,
     ctx: SmoContext,
 }
 
@@ -272,7 +272,7 @@ impl Vol {
             writeback_delta_bytes: DEFAULT_WRITEBACK_DELTA_BYTES,
         });
         let alloc = Arc::new(ExtentAllocator::format(extents, reserve, 4096));
-        let seq = Arc::new(AtomicU64::new(0));
+        let seq = Arc::new(squeezefs::meta_backend::kv::node_seq::NodeSeqHandle::shared(0));
         let ctx = SmoContext::new(alloc.clone());
         Self {
             _file: file,
@@ -293,7 +293,7 @@ impl Vol {
     /// counts as durable, so tombstones below it elide at the next fold
     /// (§4.2) and parked retirements release.
     fn cover_everything(&self) {
-        let seq = self.seq.load(Ordering::Relaxed);
+        let seq = self.seq.load();
         self.cache.set_durable_tail(seq);
         self.alloc.advance_durable(seq);
     }
@@ -993,7 +993,7 @@ async fn merge_vs_commit_storm_loses_nothing() {
                 .run_maintenance(&mut smo_ctx)
                 .await
                 .expect("maintenance under storm");
-            let seq = smo_seq.load(Ordering::Relaxed);
+            let seq = smo_seq.load();
             smo_cache.set_durable_tail(seq);
             smo_alloc.advance_durable(seq);
             let sweep = smo_tree

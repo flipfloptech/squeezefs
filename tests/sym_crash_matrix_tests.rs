@@ -3510,7 +3510,6 @@ async fn the_recovered_root_install_raises_the_node_seq_handle_and_refuses_a_sta
     };
     use squeezefs::meta_backend::kv::record::{guest_forest_slot, KIND_INTERIOR};
     use squeezefs::meta_backend::kv::tree::{KvTree, RootPtr};
-    use std::sync::atomic::AtomicU64;
     let file = tempfile::NamedTempFile::new().unwrap();
     let node_size = MIN_NODE_SIZE;
     file.as_file().set_len(4 * node_size as u64).unwrap();
@@ -3548,7 +3547,9 @@ async fn the_recovered_root_install_raises_the_node_seq_handle_and_refuses_a_sta
         addr: cache.extent_addr(1),
         seq: 42,
     };
-    let handle = Arc::new(AtomicU64::new(0));
+    // The legacy SHARED handle (incarnation 0's raise law — PR 13: a
+    // joined incarnation's handle is never raised, its space is fresh).
+    let handle = Arc::new(squeezefs::meta_backend::kv::node_seq::NodeSeqHandle::shared(0));
     let tree = KvTree::open_slot_tree(Arc::clone(&cache), slot, stale, Arc::clone(&handle))
         .await
         .unwrap();
@@ -3571,12 +3572,12 @@ async fn the_recovered_root_install_raises_the_node_seq_handle_and_refuses_a_sta
     assert_eq!(tree.root(), newer);
     assert_eq!(tree.root_floor(), 9);
     assert!(
-        handle.load(Ordering::Acquire) >= 42,
+        handle.load() >= 42,
         "the node-seq handle is raised to the installed root's seq (read {})",
-        handle.load(Ordering::Acquire)
+        handle.load()
     );
     // The fresh-tree arm: the same word, the same floor.
-    let handle2 = Arc::new(AtomicU64::new(0));
+    let handle2 = Arc::new(squeezefs::meta_backend::kv::node_seq::NodeSeqHandle::shared(0));
     let fresh = KvTree::open_unpublished_slot_tree(
         Arc::clone(&cache),
         slot,
@@ -3588,7 +3589,7 @@ async fn the_recovered_root_install_raises_the_node_seq_handle_and_refuses_a_sta
     .unwrap();
     assert_eq!(fresh.root(), newer);
     assert_eq!(fresh.root_floor(), 11);
-    assert!(handle2.load(Ordering::Acquire) >= 42);
+    assert!(handle2.load() >= 42);
 }
 
 /// **Review round 2, Issue 24 — the driver's arm: an EMPTY-window death.**

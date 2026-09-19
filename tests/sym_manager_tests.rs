@@ -672,6 +672,7 @@ fn the_manager_call_frames_round_trip_and_the_wire_schema_is_five() {
             ring_segments: vec![(0x2000, 0x10000)],
             grant: vec![(50, 8)],
             already: false,
+            node_seq_base: 0x4000_0000_0000,
         },
     };
     let bytes = encode_reply(&rep).unwrap();

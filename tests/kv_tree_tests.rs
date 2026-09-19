@@ -45,7 +45,7 @@ use squeezefs::meta_backend::kv::{
     META_KV_NODE_CACHE_HITS, META_KV_NODE_CACHE_MISSES, META_KV_NODE_COMPACTIONS,
     META_KV_NODE_SPLITS,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 
@@ -58,7 +58,7 @@ struct Vol {
     _file: NamedTempFile,
     cache: Arc<NodeCache>,
     alloc: Arc<ExtentAllocator>,
-    seq: Arc<AtomicU64>,
+    seq: Arc<squeezefs::meta_backend::kv::node_seq::NodeSeqHandle>,
     ctx: SmoContext,
 }
 
@@ -88,7 +88,7 @@ impl Vol {
         // No compaction reserve pressure in these tests; a roomy
         // pending-free FIFO (advance_durable is driven explicitly).
         let alloc = Arc::new(ExtentAllocator::format(extents, 0, 4096));
-        let seq = Arc::new(AtomicU64::new(0));
+        let seq = Arc::new(squeezefs::meta_backend::kv::node_seq::NodeSeqHandle::shared(0));
         let ctx = SmoContext::new(alloc.clone());
         Self {
             _file: file,
@@ -337,7 +337,7 @@ async fn writeback_appends_then_compacts_then_splits() {
         vol.alloc.free_extents() < free_before,
         "before durability the old extent is NOT reclaimed"
     );
-    let released = vol.alloc.advance_durable(vol.seq.load(Ordering::Relaxed));
+    let released = vol.alloc.advance_durable(vol.seq.load());
     assert!(released >= 1, "durable advance releases the retired extent");
 
     // Data intact across the rewrite.
@@ -802,7 +802,7 @@ async fn single_flight_collapses_racing_cold_loads() {
             cold_cache.clone(),
             TREE_INODES,
             root,
-            Arc::new(AtomicU64::new(1 << 32)),
+            Arc::new(squeezefs::meta_backend::kv::node_seq::NodeSeqHandle::shared(1 << 32)),
         )
         .await
         .expect("open"),
@@ -865,9 +865,14 @@ async fn reopen_from_disk_after_flush_serves_everything() {
         budget_bytes: DEFAULT_CACHE_BUDGET_BYTES,
         writeback_delta_bytes: DEFAULT_WRITEBACK_DELTA_BYTES,
     });
-    let tree = KvTree::open(cache, TREE_INODES, root, Arc::new(AtomicU64::new(1 << 32)))
-        .await
-        .expect("open");
+    let tree = KvTree::open(
+        cache,
+        TREE_INODES,
+        root,
+        Arc::new(squeezefs::meta_backend::kv::node_seq::NodeSeqHandle::shared(1 << 32)),
+    )
+    .await
+    .expect("open");
 
     for i in 0..n {
         let got = tree.lookup(&ikey(i)).await.expect("lookup");
@@ -903,7 +908,7 @@ async fn reopen_from_disk_after_flush_serves_everything() {
                 addr: root.addr,
                 seq: root.seq + 1
             },
-            Arc::new(AtomicU64::new(1 << 32)),
+            Arc::new(squeezefs::meta_backend::kv::node_seq::NodeSeqHandle::shared(1 << 32)),
         )
         .await
         .is_err(),

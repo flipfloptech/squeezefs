@@ -6807,7 +6807,9 @@ async fn finish_forest_conversion(
             budget_bytes: DEFAULT_CACHE_BUDGET_BYTES,
             writeback_delta_bytes: DEFAULT_WRITEBACK_DELTA_BYTES,
         });
-        let seq = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+        // The legacy shared handle (the flat trees being freed are the
+        // manager's space; nothing is minted here).
+        let seq = std::sync::Arc::new(crate::meta_backend::kv::node_seq::NodeSeqHandle::shared(
             ledger.seq.max(ledger.node_seq_watermark),
         ));
         for root in &old_roots {

@@ -48,7 +48,7 @@ use squeezefs::meta_backend::kv::{
     alloc_ext::ExtentAllocator, META_KV_FOLD_HEAD_SERVES, META_KV_FOLD_MEMO_BYTES,
     META_KV_FOLD_MEMO_HITS, META_KV_FOLD_MEMO_MISSES, META_KV_FOLD_RECORD_DECODES,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 
@@ -62,7 +62,7 @@ const NODE_SIZE: usize = 64 * 1024;
 struct Vol {
     _file: NamedTempFile,
     cache: Arc<NodeCache>,
-    seq: Arc<AtomicU64>,
+    seq: Arc<squeezefs::meta_backend::kv::node_seq::NodeSeqHandle>,
     ctx: SmoContext,
 }
 
@@ -83,7 +83,7 @@ impl Vol {
             writeback_delta_bytes: usize::MAX,
         });
         let alloc = Arc::new(ExtentAllocator::format(extents, 0, 4096));
-        let seq = Arc::new(AtomicU64::new(0));
+        let seq = Arc::new(squeezefs::meta_backend::kv::node_seq::NodeSeqHandle::shared(0));
         let ctx = SmoContext::new(alloc.clone());
         Self {
             _file: file,
@@ -127,7 +127,7 @@ fn iv(seed: u64) -> InodeValue {
 async fn apply(
     tree: &KvTree,
     leaf: &Arc<CachedNode>,
-    seq: &Arc<AtomicU64>,
+    seq: &Arc<squeezefs::meta_backend::kv::node_seq::NodeSeqHandle>,
     key: &[u8],
     kind: RecordKind,
     value: Bytes,
@@ -137,7 +137,7 @@ async fn apply(
         .await
         .expect("apply_at");
     assert_eq!(out, ApplyOutcome::Applied, "single-leaf tree never stales");
-    seq.load(Ordering::Acquire)
+    seq.load()
 }
 
 /// Freeze the open delta and append it, so its records become

@@ -745,7 +745,7 @@ fn dt_of(mode: u32) -> u8 {
 /// cross-generation seq collision as improbable as a checksum collision
 /// while keeping the builder's determinism contract (fixed uuid ⇒ fixed
 /// image). Top bit cleared: 2^63 of monotonic headroom before wrap.
-fn node_seq_base(uuid: [u8; 16]) -> u64 {
+pub fn node_seq_base(uuid: [u8; 16]) -> u64 {
     u64::from_le_bytes(uuid[..8].try_into().expect("8-byte slice")) & (u64::MAX >> 1)
 }
 

@@ -99,7 +99,11 @@ async fn reader(path: &std::path::Path) -> (Arc<NodeCache>, Vec<Arc<KvTree>>, Ro
     cache
         .arm_revalidation(&epoch, None)
         .expect("a fresh cache arms");
-    let seq = Arc::new(AtomicU64::new(rec.seq.max(rec.node_seq_watermark)));
+    let seq = Arc::new(
+        squeezefs::meta_backend::kv::node_seq::NodeSeqHandle::shared(
+            rec.seq.max(rec.node_seq_watermark),
+        ),
+    );
     let mut trees = Vec::new();
     if sb.symmetric_forest_stamped() {
         // A forest's ledger names tree 0 and the NATIVE slot tree (header
@@ -496,7 +500,7 @@ async fn revalidation_absolves_prearm_dirt_and_counts_postarm_dirt() {
     let alloc =
         Arc::new(squeezefs::meta_backend::kv::alloc_ext::ExtentAllocator::format(8, 0, 4096));
     let mut ctx = SmoContext::new(alloc);
-    let seq = Arc::new(AtomicU64::new(1));
+    let seq = Arc::new(squeezefs::meta_backend::kv::node_seq::NodeSeqHandle::shared(1));
     // A tree over the same cache gives us a legitimate dirty node — the
     // bootstrap-replay shape (mount replay rides the same apply path).
     let tree = KvTree::create(cache.clone(), &mut ctx, TREE_INODES, seq)

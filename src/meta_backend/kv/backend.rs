@@ -2449,9 +2449,25 @@ impl KvMetaBackend {
         // Node-seq mint floor: the persisted watermark keeps mints
         // strictly above every seq ever stamped into a frame this
         // generation (Finding A — re-minted seqs made recycled-extent
-        // residue admissible). The root/replay fetch_max floors below
-        // stay as the crash-window belt-and-braces.
-        let seq = Arc::new(AtomicU64::new(ledger.seq.max(ledger.node_seq_watermark)));
+        // residue admissible). The root/replay raises below stay as the
+        // crash-window belt-and-braces. ONE space per appender incarnation
+        // (PR 13, `node_seq`): a flat volume's and the manager's handle is
+        // the legacy one (the manager's bounded by incarnation 0's span —
+        // a raise into a dead joiner's space is ignored, the disjointness
+        // being the guarantee); a JOINED appender's starts at the base the
+        // manager minted for THIS incarnation at `JoinAppender` and is
+        // never raised.
+        let legacy_seed = ledger.seq.max(ledger.node_seq_watermark);
+        let seq = Arc::new(match (&posture, joined.as_ref()) {
+            (OpenPosture::JoinedAppender, Some(j)) => {
+                super::node_seq::NodeSeqHandle::incarnation(j.node_seq_base)
+            }
+            _ if sb.symmetric_forest_stamped() => super::node_seq::NodeSeqHandle::shared_bounded(
+                legacy_seed,
+                super::builder::node_seq_base(sb.uuid),
+            ),
+            _ => super::node_seq::NodeSeqHandle::shared(legacy_seed),
+        });
 
         // §4.11's unknown-ro bits degrade a writer's open to a non-writer
         // for the replay too: a mount that may not write mints nothing.
@@ -2499,7 +2515,7 @@ impl KvMetaBackend {
                 .await?;
                 // Post-replay seq assignment stays above every node seq the
                 // roots carry.
-                seq.fetch_max(root.node_seq, Ordering::AcqRel);
+                seq.raise_to(root.node_seq);
                 opened.push(tree);
             }
             let mut opened = opened.into_iter();
@@ -2547,7 +2563,7 @@ impl KvMetaBackend {
                             seq.clone(),
                         )
                         .await?;
-                        seq.fetch_max(root.node_seq, Ordering::AcqRel);
+                        seq.raise_to(root.node_seq);
                         Some(Arc::new(tree))
                     }
                     None => {
@@ -2598,7 +2614,7 @@ impl KvMetaBackend {
                             seq.clone(),
                         )
                         .await?;
-                        seq.fetch_max(root.node_seq, Ordering::AcqRel);
+                        seq.raise_to(root.node_seq);
                         Some(Arc::new(tree))
                     }
                     None => {
@@ -2699,7 +2715,7 @@ impl KvMetaBackend {
                 // incarnation a replayed pointer names.
                 if rec.kind == RecordKind::Put {
                     if let Ok((_addr, child_seq)) = decode_interior_value(&rec.value) {
-                        seq.fetch_max(child_seq, Ordering::AcqRel);
+                        seq.raise_to(child_seq);
                     }
                 }
                 tree.apply_replayed_interior(
@@ -9066,12 +9082,16 @@ impl KvMetaBackend {
                     && set.region(page.appender_id).is_none()
                     && self.extent_grant_record(page.appender_id).await?.is_empty();
                 let id = page.appender_id;
+                // A rejoin is a NEW incarnation: a fresh node-seq space,
+                // minted and barriered before the reply.
+                let node_seq_base = self.mint_node_seq_incarnation().await?;
                 let mut out = JoinOutcome {
                     appender_id: id,
                     page_addr: e.dir_offsets[0],
                     ring_segments: page.segments.clone(),
                     grant: page.grant.clone(),
                     already: true,
+                    node_seq_base,
                 };
                 if owed {
                     drop(_g);
@@ -9266,6 +9286,18 @@ impl KvMetaBackend {
                 }
                 return Err(e);
             }
+            // The joiner's node-seq incarnation (PR 13): minted durable
+            // BEFORE its page goes Live — the `sync_device` below covers
+            // the record with the pages.
+            let node_seq_base = match self.mint_node_seq_incarnation().await {
+                Ok(b) => b,
+                Err(e) => {
+                    for c in claimed {
+                        self.alloc.release_unpublished(c);
+                    }
+                    return Err(e);
+                }
+            };
             // The page, Live under the joiner, into BOTH directory slots.
             let mut page = prior;
             page.appender_id = id;
@@ -9302,7 +9334,7 @@ impl KvMetaBackend {
                 segments.len(),
                 page.term
             );
-            (id, dir_offsets[0], segments)
+            (id, dir_offsets[0], segments, node_seq_base)
         };
         if TEST_JOIN_HOLD_AFTER_PAGE.load(Ordering::Relaxed) {
             return Err(KvError::Busy(format!(
@@ -9313,7 +9345,7 @@ impl KvMetaBackend {
         }
         // The initial grant — its own control entry, outside the join's
         // critical section (the verb mutex is not reentrant).
-        let (id, page_addr, ring_segments) = chosen;
+        let (id, page_addr, ring_segments, node_seq_base) = chosen;
         // The grant writes the joiner's page with it.
         let grant = self.manager_extent_grant(id, 0).await?;
         // The joiner's identity for the membership carriage (PR 4).
@@ -9326,7 +9358,78 @@ impl KvMetaBackend {
             ring_segments,
             grant,
             already: false,
+            node_seq_base,
         })
+    }
+
+    /// Mint the next node-seq INCARNATION for a joiner (`kv::node_seq`,
+    /// PR 13): the tree-0 counter `node_seq_incarnations` is read, its
+    /// successor written as ONE control entry and BARRIERED before the
+    /// base is answered — a manager dying after the reply never re-mints
+    /// the ordinal (the counter is durable first), a manager dying before
+    /// it burns one ordinal (the joiner's retry mints the next). The base
+    /// of incarnation `o` is `B + o · 2^K` over the volume's
+    /// `node_seq_base(uuid)`; the volume's capacity exhausted is a loud
+    /// refusal of the join, never a wrap into another incarnation's space.
+    /// Volume-local (each volume has its own base and counter); the
+    /// manager's own space is incarnation 0.
+    pub(super) async fn mint_node_seq_incarnation(&self) -> std::result::Result<u64, KvError> {
+        let control = self.forest_control_tree().ok_or_else(|| {
+            KvError::Corrupt(format!(
+                "{}: a node-seq incarnation mint on a volume without tree 0",
+                self.path.display()
+            ))
+        })?;
+        let minted = match control
+            .lookup(super::node_seq::NODE_SEQ_INCARNATIONS_KEY)
+            .await?
+        {
+            Some(v) => super::node_seq::decode_incarnations(&v)?,
+            None => 0,
+        };
+        let ordinal = minted + 1;
+        let volume_base = super::builder::node_seq_base(self.sb.uuid);
+        let base = super::node_seq::incarnation_base(volume_base, ordinal).ok_or_else(|| {
+            KvError::Busy(format!(
+                "{}: node-seq incarnation space exhausted — this volume minted {minted} joiner \
+                 incarnation(s) of 2^{} node seqs each over base {volume_base:#x}; no join can be \
+                 admitted (design-symmetric-metadata §5.3.3, PR 13: the volume's uuid base \
+                 leaves 2^{} incarnations — a reformat is the remedy)",
+                self.path.display(),
+                super::node_seq::INCARNATION_SPACE_BITS,
+                super::node_seq::INCARNATION_ORDINAL_BITS
+            ))
+        })?;
+        // The manager's own counter must still sit inside incarnation 0.
+        let own = self.seq_handle().load();
+        if own >= self.seq_handle().ceiling() {
+            return Err(KvError::Corrupt(format!(
+                "{}: the manager's node-seq counter {own:#x} has left incarnation 0's space \
+                 (ceiling {:#x}) — no joiner space is disjoint from it",
+                self.path.display(),
+                self.seq_handle().ceiling()
+            )));
+        }
+        let tag = super::journal::tag_for(super::record::TREE_CONTROL, 0);
+        self.write_control_entry(
+            vec![(
+                tag,
+                Record::put(
+                    super::node_seq::NODE_SEQ_INCARNATIONS_KEY.to_vec(),
+                    0,
+                    super::node_seq::encode_incarnations(ordinal),
+                ),
+            )],
+            EntryAdmission::Try,
+        )
+        .await?;
+        self.sync_device().await.map_err(KvError::Io)?;
+        log::info!(
+            "meta volume {}: node-seq incarnation {ordinal} minted (base {base:#x}, span 2^{})",
+            self.path.display(),
+            super::node_seq::INCARNATION_SPACE_BITS
+        );
+        Ok(base)
     }
 
     /// A WIRE joiner's page names its grant — the manager writes it (an
@@ -10844,7 +10947,7 @@ impl KvMetaBackend {
 
     /// The volume-shared record/node seq source, borrowed (see
     /// [`Self::seq_handle`]).
-    fn seq_ref(&self) -> &Arc<AtomicU64> {
+    fn seq_ref(&self) -> &Arc<super::node_seq::NodeSeqHandle> {
         match &self.trees {
             TreeSet::Flat { inodes, .. } => inodes.seq_ref(),
             TreeSet::Forest { forest, .. } => forest.control().seq_ref(),
@@ -10854,7 +10957,7 @@ impl KvMetaBackend {
     /// The volume-shared record/node seq source (every tree clones the
     /// same `Arc`; one clone here, never a tree-set walk — this sits on
     /// the per-record commit path of a forest volume).
-    fn seq_handle(&self) -> Arc<AtomicU64> {
+    fn seq_handle(&self) -> Arc<super::node_seq::NodeSeqHandle> {
         match &self.trees {
             TreeSet::Flat { inodes, .. } => inodes.seq_handle(),
             TreeSet::Forest { forest, .. } => forest.control().seq_handle(),
@@ -14564,6 +14667,9 @@ pub struct JoinOutcome {
     pub ring_segments: Vec<super::superblock::ExtentRef>,
     pub grant: Vec<super::appender::GrantRun>,
     pub already: bool,
+    /// The base of the joiner's node-seq space for THIS incarnation
+    /// (`kv::node_seq`, PR 13) — minted durable on every join.
+    pub node_seq_base: u64,
 }
 
 /// One fsck C13 candidate (design-symmetric-metadata §5.8.5): a heap
@@ -16790,7 +16896,7 @@ impl KvMetaBackend {
         sb: &SuperblockV3,
         ledger: &LedgerRecord,
         cache: &Arc<NodeCache>,
-        seq: &Arc<AtomicU64>,
+        seq: &Arc<super::node_seq::NodeSeqHandle>,
         alloc: &Arc<ExtentAllocator>,
         recovery: &super::journal::JournalRecovery,
         posture: OpenPosture,
@@ -16837,7 +16943,7 @@ impl KvMetaBackend {
             )
             .await?,
         );
-        seq.fetch_max(control_root.seq, Ordering::AcqRel);
+        seq.raise_to(control_root.seq);
         let native = Arc::new(
             KvTree::open_slot_tree(
                 Arc::clone(cache),
@@ -16847,7 +16953,7 @@ impl KvMetaBackend {
             )
             .await?,
         );
-        seq.fetch_max(native_root.seq, Ordering::AcqRel);
+        seq.raise_to(native_root.seq);
 
         // ---- Tree 0 first: its window records (level DESC, seq) — the
         // guest roots the rest of the replay is routed through.
@@ -16864,7 +16970,7 @@ impl KvMetaBackend {
         for (level, entry_start, rec) in control_interior {
             if rec.kind == RecordKind::Put {
                 if let Ok((_addr, child_seq)) = decode_interior_value(&rec.value) {
-                    seq.fetch_max(child_seq, Ordering::AcqRel);
+                    seq.raise_to(child_seq);
                 }
             }
             control
@@ -17026,7 +17132,7 @@ impl KvMetaBackend {
                     let tree =
                         KvTree::open_slot_tree(Arc::clone(cache), slot, root, Arc::clone(seq))
                             .await?;
-                    seq.fetch_max(root.seq, Ordering::AcqRel);
+                    seq.raise_to(root.seq);
                     (tree, root)
                 };
                 guests.push((slot, Arc::new(tree), published));
@@ -17176,7 +17282,7 @@ impl KvMetaBackend {
         for (level, entry_start, rec) in interior {
             if rec.kind == RecordKind::Put {
                 if let Ok((_addr, child_seq)) = decode_interior_value(&rec.value) {
-                    seq.fetch_max(child_seq, Ordering::AcqRel);
+                    seq.raise_to(child_seq);
                 }
             }
             // A slot tree's interior record names its slot on the journal
@@ -17353,7 +17459,7 @@ impl KvMetaBackend {
         ring0: &Arc<JournalRing>,
         forest: &super::forest::SlotTrees,
         cache: &Arc<NodeCache>,
-        seq: &Arc<AtomicU64>,
+        seq: &Arc<super::node_seq::NodeSeqHandle>,
         alloc: &Arc<ExtentAllocator>,
         recovery0: &super::journal::JournalRecovery,
         posture: OpenPosture,
@@ -18404,7 +18510,7 @@ impl KvMetaBackend {
             for (level, entry_start, r) in interior {
                 if r.kind == RecordKind::Put {
                     if let Ok((_addr, child_seq)) = decode_interior_value(&r.value) {
-                        seq.fetch_max(child_seq, Ordering::AcqRel);
+                        seq.raise_to(child_seq);
                     }
                 }
                 let (slot, separator) = super::forest::split_interior_journal_key(&r.key)?;

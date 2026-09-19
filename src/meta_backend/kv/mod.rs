@@ -65,6 +65,7 @@ pub mod journal_core;
 pub mod journal_lane;
 pub mod node;
 pub mod node_cache;
+pub mod node_seq;
 pub mod node_state_core;
 pub mod record;
 pub mod revalidate;

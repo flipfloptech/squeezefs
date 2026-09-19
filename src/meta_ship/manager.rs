@@ -465,6 +465,10 @@ pub enum ManagerReply {
         grant: Vec<WireRun>,
         /// The page was already `Live` under this identity (KD-SYM-7).
         already: bool,
+        /// The base of THIS incarnation's node-seq space (PR 13,
+        /// `kv::node_seq`): minted durable by the manager for every join,
+        /// a rejoin included — the joiner's handle starts here.
+        node_seq_base: u64,
     },
     Granted {
         runs: Vec<WireRun>,
@@ -850,12 +854,14 @@ impl ManagerService {
                              ring_segments,
                              grant,
                              already,
+                             node_seq_base,
                          }| ManagerReply::Joined {
                             appender_id,
                             page_addr,
                             ring_segments: ring_segments.iter().map(|s| (s.start, s.len)).collect(),
                             grant: runs_to_wire(&grant),
                             already,
+                            node_seq_base,
                         },
                     ),
                     ManagerCall::ExtentGrant { appender_id, want } => self

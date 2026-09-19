@@ -71,6 +71,10 @@ pub(in crate::meta_backend::kv) struct JoinedOpen {
     /// The manager answered an existing `Live` page (a rejoin) — its ring
     /// is own residue; a fresh join's window is empty.
     pub already: bool,
+    /// The base of THIS incarnation's node-seq space (`kv::node_seq`, PR
+    /// 13) — the manager minted it durable at the join; the open's handle
+    /// starts here and is never raised.
+    pub node_seq_base: u64,
     /// The wire the join travelled — the region open refills the grant
     /// through it BEFORE the own-residue replay mints (a rejoin whose
     /// predecessor died with its grant consumed).
@@ -603,7 +607,7 @@ impl KvMetaBackend {
         admission: &JoinedAppenderAdmission,
         sb: &super::super::superblock::SuperblockV3,
         writer_id: u128,
-    ) -> Result<(ManagerClient, AppenderIdentity, u32, bool), KvError> {
+    ) -> Result<(ManagerClient, AppenderIdentity, u32, bool, u64), KvError> {
         let entries = super::super::appender::read_directory(path, sb).await?;
         let predecessor = entries.iter().find_map(|e| {
             e.page.as_ref().filter(|p| {
@@ -644,7 +648,7 @@ impl KvMetaBackend {
                 admission.manager_endpoint
             ))
         })?;
-        let (appender_id, already) = match client
+        let (appender_id, already, node_seq_base) = match client
             .join(presented, 0)
             .await
             .map_err(|e| wire_err("JoinAppender", e))?
@@ -652,8 +656,9 @@ impl KvMetaBackend {
             ManagerReply::Joined {
                 appender_id,
                 already,
+                node_seq_base,
                 ..
-            } => (appender_id, already),
+            } => (appender_id, already, node_seq_base),
             ManagerReply::Refused { reason } => {
                 return Err(KvError::Busy(format!(
                     "{}: the manager refused JoinAppender: {reason}",
@@ -662,7 +667,7 @@ impl KvMetaBackend {
             }
             other => return Err(unexpected("JoinAppender", &other)),
         };
-        Ok((client, presented, appender_id, already))
+        Ok((client, presented, appender_id, already, node_seq_base))
     }
 
     /// **Open one volume as a JOINED non-manager appender** (the fifth door
@@ -751,7 +756,7 @@ impl KvMetaBackend {
                 return Err(e);
             }
         };
-        let (client, presented, appender_id, already) = joined;
+        let (client, presented, appender_id, already, node_seq_base) = joined;
         let wire = Arc::new(JoinedWire {
             client: crate::sqz_sync::SqzMutex::new(client),
             endpoint: std::sync::RwLock::new(admission.manager_endpoint.clone()),
@@ -785,6 +790,7 @@ impl KvMetaBackend {
                 appender_id,
                 identity: presented,
                 already,
+                node_seq_base,
                 wire: Arc::clone(&wire),
             }),
         )

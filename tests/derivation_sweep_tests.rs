@@ -3062,3 +3062,39 @@ fn fleet_collect_progress_floor_is_the_job_wires_dial_deadline() {
         "the floor never outranks the shipped shard lease TTL — it binds only where a harness shortens the TTL"
     );
 }
+
+/// **The node-seq incarnation space** (PR 13, `kv::node_seq`): `K = 38`
+/// bits of mints per incarnation and `63 − K = 25` bits of incarnations
+/// partition the 63 usable bits above the volume base's cleared top bit —
+/// a drift in either constant is red here, and the arithmetic the module
+/// doc states (2^38 ≈ 2.7 × 10^11 mints — 200 SMOs/s for 43 years; 2^25
+/// ≈ 33.5 M incarnations — 15 k mounts re-joining daily for six years)
+/// is asserted as the bounds it derives from, never as free constants.
+#[test]
+fn node_seq_incarnation_space_partitions_the_63_usable_bits() {
+    use squeezefs::meta_backend::kv::node_seq::{
+        incarnation_base, INCARNATION_ORDINAL_BITS, INCARNATION_ORDINAL_MAX, INCARNATION_SPACE,
+        INCARNATION_SPACE_BITS,
+    };
+    assert_eq!(INCARNATION_SPACE_BITS + INCARNATION_ORDINAL_BITS, 63);
+    assert_eq!(INCARNATION_SPACE, 1u64 << INCARNATION_SPACE_BITS);
+    // Mints per incarnation cover 43 years at the storm rows' 200 SMOs/s.
+    let smos_per_s = 200u64;
+    let years_43 = 43 * 365 * 86_400 * smos_per_s;
+    assert!(
+        INCARNATION_SPACE > years_43,
+        "{INCARNATION_SPACE} vs {years_43}"
+    );
+    // Incarnations cover 15 k mounts re-joining daily for six years.
+    let joins_6y = 15_000u64 * 365 * 6;
+    assert!(INCARNATION_ORDINAL_MAX > joins_6y);
+    // Every base below 2^63 admits every ordinal up to the max; the max + 1
+    // and any base with its top bit set refuse.
+    let top = u64::MAX >> 1;
+    assert!(incarnation_base(top, INCARNATION_ORDINAL_MAX).is_some());
+    assert!(incarnation_base(top, INCARNATION_ORDINAL_MAX + 1).is_none());
+    // The builder's base keeps the top bit clear (the 2^63 headroom law).
+    let b = squeezefs::meta_backend::kv::builder::node_seq_base([0xff; 16]);
+    assert_eq!(b >> 63, 0);
+    assert!(incarnation_base(b, INCARNATION_ORDINAL_MAX).is_some());
+}

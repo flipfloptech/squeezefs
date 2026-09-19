@@ -1927,16 +1927,20 @@ fn arb_manager_reply() -> impl Strategy<Value = ManagerReply> {
             prop::collection::vec((any::<u64>(), any::<u64>()), 0..9),
             arb_runs(),
             any::<bool>(),
+            any::<u64>(),
         )
-            .prop_map(|(appender_id, page_addr, ring_segments, grant, already)| {
-                ManagerReply::Joined {
-                    appender_id,
-                    page_addr,
-                    ring_segments,
-                    grant,
-                    already,
-                }
-            }),
+            .prop_map(
+                |(appender_id, page_addr, ring_segments, grant, already, node_seq_base)| {
+                    ManagerReply::Joined {
+                        appender_id,
+                        page_addr,
+                        ring_segments,
+                        grant,
+                        already,
+                        node_seq_base,
+                    }
+                },
+            ),
         arb_runs().prop_map(|runs| ManagerReply::Granted { runs }),
         (any::<u64>(), any::<u64>())
             .prop_map(|(cleared, already)| ManagerReply::Returned { cleared, already }),

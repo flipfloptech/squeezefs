@@ -48,7 +48,7 @@ use squeezefs::meta_backend::kv::tree::{
     TEST_SMO_BUILD_PAUSE_TREE,
 };
 use squeezefs::meta_backend::Metadata;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 
@@ -64,7 +64,7 @@ struct Vol {
     _file: NamedTempFile,
     cache: Arc<NodeCache>,
     ctx: SmoContext,
-    seq: Arc<AtomicU64>,
+    seq: Arc<squeezefs::meta_backend::kv::node_seq::NodeSeqHandle>,
 }
 
 impl Vol {
@@ -84,7 +84,7 @@ impl Vol {
             writeback_delta_bytes: 1024 * 1024,
         });
         let alloc = Arc::new(ExtentAllocator::format(512, 0, 4096));
-        let seq = Arc::new(AtomicU64::new(0));
+        let seq = Arc::new(squeezefs::meta_backend::kv::node_seq::NodeSeqHandle::shared(0));
         let ctx = SmoContext::new(alloc.clone());
         Self {
             _file: file,

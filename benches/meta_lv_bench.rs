@@ -14,7 +14,6 @@ use squeezefs::meta_backend::kv::record::{
 use squeezefs::meta_backend::kv::tree::{KvTree, SmoContext};
 use squeezefs::meta_backend::Metadata;
 use std::hint::black_box;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 use tokio::runtime::Runtime;
@@ -377,7 +376,7 @@ fn bench_kv_tree(c: &mut Criterion) {
                 cache.clone(),
                 &mut ctx,
                 TREE_INODES,
-                Arc::new(AtomicU64::new(0)),
+                Arc::new(squeezefs::meta_backend::kv::node_seq::NodeSeqHandle::shared(0)),
             )
             .await
             .expect("create");
@@ -664,7 +663,7 @@ fn bench_kv_fold(c: &mut Criterion) {
     });
     let alloc = Arc::new(ExtentAllocator::format(64, 0, 4096));
     let mut ctx = SmoContext::new(alloc);
-    let seq = Arc::new(AtomicU64::new(0));
+    let seq = Arc::new(squeezefs::meta_backend::kv::node_seq::NodeSeqHandle::shared(0));
     let key = inode_key(42);
 
     let parent = InodeValue {
@@ -1478,7 +1477,7 @@ fn bench_kvmap(c: &mut Criterion) {
             cache.clone(),
             &mut ctx,
             TREE_BLOCK_MAP,
-            Arc::new(AtomicU64::new(0)),
+            Arc::new(squeezefs::meta_backend::kv::node_seq::NodeSeqHandle::shared(0)),
         )
         .await
         .expect("create tree 7");
@@ -1535,7 +1534,7 @@ fn bench_kvmap(c: &mut Criterion) {
             cache.clone(),
             &mut ctx,
             TREE_INODES,
-            Arc::new(AtomicU64::new(0)),
+            Arc::new(squeezefs::meta_backend::kv::node_seq::NodeSeqHandle::shared(0)),
         )
         .await
         .expect("create foreign tree");
@@ -2152,7 +2151,7 @@ fn bench_kv_merge_sweep(c: &mut Criterion) {
                 writeback_delta_bytes: DEFAULT_WRITEBACK_DELTA_BYTES,
             });
             let alloc = Arc::new(ExtentAllocator::format(extents, 0, 65_536));
-            let seq = Arc::new(AtomicU64::new(0));
+            let seq = Arc::new(squeezefs::meta_backend::kv::node_seq::NodeSeqHandle::shared(0));
             let mut ctx = SmoContext::new(alloc.clone());
             // Records per leaf at the split's ¾ fill, then enough keys for
             // the leaf count; deletes make the chosen share of leaves
@@ -2172,7 +2171,7 @@ fn bench_kv_merge_sweep(c: &mut Criterion) {
                         while tree.maintenance_pending() {
                             tree.run_maintenance(&mut ctx).await.expect("maintenance");
                         }
-                        alloc.advance_durable(seq.load(std::sync::atomic::Ordering::Relaxed));
+                        alloc.advance_durable(seq.load());
                     }
                 }
                 tree.flush_dirty(&mut ctx).await.expect("flush");
@@ -2183,7 +2182,7 @@ fn bench_kv_merge_sweep(c: &mut Criterion) {
                     }
                 }
                 tree.flush_dirty(&mut ctx).await.expect("flush deletes");
-                let s = seq.load(std::sync::atomic::Ordering::Relaxed);
+                let s = seq.load();
                 cache.set_durable_tail(s);
                 alloc.advance_durable(s);
                 tree

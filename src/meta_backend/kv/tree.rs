@@ -52,6 +52,7 @@ use super::bset::{compact, BsetView};
 use super::journal::{entry_len_for, tag_for, JournalRing};
 use super::node::{key_successor, load_node, split_node, write_node, NodeWriteParams, SplitDest};
 use super::node_cache::{CachedNode, LiveLookup, NodeCache, OwnedRec};
+use super::node_seq::NodeSeqHandle;
 use super::record::{Record, RecordKind};
 use super::KvError;
 use arc_swap::ArcSwap;
@@ -570,7 +571,7 @@ pub struct KvTree {
     /// reservation (§4.4 pt 2: assigned **inside** the node-lock window so
     /// per-key seq order equals RAM apply order). Shared across a volume's
     /// trees, like the journal head it stands in for.
-    seq: Arc<AtomicU64>,
+    seq: Arc<NodeSeqHandle>,
     /// Addresses whose open delta crossed the writeback threshold —
     /// drained by [`Self::run_maintenance`] (duplicates are benign).
     maintenance: scc::Queue<u64>,
@@ -624,12 +625,12 @@ impl KvTree {
     /// so its root's `node_seq` joins the volume's one monotonic space
     /// (the kvmap PR-2 ratchet's mint; open-time mints get it from the
     /// ledger recovery).
-    pub(super) fn seq_handle(&self) -> Arc<AtomicU64> {
+    pub(super) fn seq_handle(&self) -> Arc<NodeSeqHandle> {
         Arc::clone(&self.seq)
     }
 
     /// [`Self::seq_handle`] borrowed — no refcount traffic.
-    pub(super) fn seq_ref(&self) -> &Arc<AtomicU64> {
+    pub(super) fn seq_ref(&self) -> &Arc<NodeSeqHandle> {
         &self.seq
     }
 
@@ -640,7 +641,7 @@ impl KvTree {
         cache: Arc<NodeCache>,
         ctx: &mut SmoContext,
         tree_id: u8,
-        seq: Arc<AtomicU64>,
+        seq: Arc<NodeSeqHandle>,
     ) -> Result<Self, KvError> {
         Self::create_inner(cache, ctx, tree_id, seq, None).await
     }
@@ -654,7 +655,7 @@ impl KvTree {
         cache: Arc<NodeCache>,
         ctx: &mut SmoContext,
         slot: super::record::ForestSlot,
-        seq: Arc<AtomicU64>,
+        seq: Arc<NodeSeqHandle>,
         mint_floor: u64,
         class: super::alloc_ext_core::AllocClass,
     ) -> Result<Self, KvError> {
@@ -672,7 +673,7 @@ impl KvTree {
         cache: Arc<NodeCache>,
         ctx: &mut SmoContext,
         tree_id: u8,
-        seq: Arc<AtomicU64>,
+        seq: Arc<NodeSeqHandle>,
         slot_tree: Option<(
             super::record::ForestSlot,
             u64,
@@ -705,7 +706,7 @@ impl KvTree {
             (_, None) => ctx.alloc.claim_internal()?,
         };
         let addr = cache.extent_addr(extent);
-        let node_seq = seq.fetch_add(1, Ordering::AcqRel) + 1;
+        let node_seq = seq.next()?;
         // A fresh root is written under its slot's stamp (§5.8.2).
         write_node(
             &cache.config().path,
@@ -763,7 +764,7 @@ impl KvTree {
         cache: Arc<NodeCache>,
         tree_id: u8,
         root: RootPtr,
-        seq: Arc<AtomicU64>,
+        seq: Arc<NodeSeqHandle>,
     ) -> Result<Self, KvError> {
         Self::open_inner(cache, tree_id, root, seq, None).await
     }
@@ -775,7 +776,7 @@ impl KvTree {
         cache: Arc<NodeCache>,
         slot: super::record::ForestSlot,
         root: RootPtr,
-        seq: Arc<AtomicU64>,
+        seq: Arc<NodeSeqHandle>,
     ) -> Result<Self, KvError> {
         Self::open_inner(cache, super::record::KIND_INTERIOR, root, seq, Some(slot)).await
     }
@@ -784,7 +785,7 @@ impl KvTree {
         cache: Arc<NodeCache>,
         tree_id: u8,
         root: RootPtr,
-        seq: Arc<AtomicU64>,
+        seq: Arc<NodeSeqHandle>,
         forest_slot: Option<super::record::ForestSlot>,
     ) -> Result<Self, KvError> {
         let node = cache.get(root.addr).await?;
@@ -876,16 +877,23 @@ impl KvTree {
     /// a torn or stale page word never installs an unverified root), it
     /// is pinned and stamped with the slot, and the volume's node-seq
     /// handle is raised to the root's seq — the same word every open
-    /// raises for every root it adopts (§4.5's watermark).
+    /// raises for every root it adopts (§4.5's watermark) — INSIDE the
+    /// handle's own incarnation space (PR 13, `kv::node_seq`: a joined
+    /// appender's handle never raises, the manager's ignores a root in a
+    /// joiner's space — the spaces are disjoint, so the collision the
+    /// raise guarded against cannot arise there).
     pub async fn install_recovered_root(&self, root: RootPtr, floor: u64) -> Result<(), KvError> {
         let mut node = self.cache.get(root.addr).await?;
-        if node.node_seq() < root.seq {
-            // A cached image OLDER than the pointer is this mount's stale
-            // copy of an extent ANOTHER daemon rewrote since — the extent
-            // left one slot's tree (retired, returned, re-granted) and now
-            // holds another's node (PR 12b round 4); the slot barrier
-            // (`drop_slot_nodes`) drops by the OLD owner's stamp and misses
-            // it. Re-read from the device before judging the pointer.
+        if node.node_seq() != root.seq {
+            // A cached image that is NOT the pointer's is this mount's
+            // stale copy of an extent ANOTHER daemon rewrote since — the
+            // extent left one slot's tree (retired, returned, re-granted)
+            // and now holds another's node (PR 12b round 4); the slot
+            // barrier (`drop_slot_nodes`) drops by the OLD owner's stamp
+            // and misses it. Re-read from the device before judging the
+            // pointer. Any MISMATCH, never "older" (PR 13): node seqs are
+            // one space per appender incarnation, so a stale image can
+            // carry a numerically larger seq than the pointer's.
             let cfg = self.cache.config();
             let node_size = cfg.layout.node_size() as u64;
             if root.addr >= cfg.heap_base && node_size > 0 {
@@ -916,7 +924,7 @@ impl KvTree {
         }
         self.root.store(Arc::new(root));
         self.set_root_floor(floor);
-        self.seq.fetch_max(root.seq, Ordering::AcqRel);
+        self.seq.raise_to(root.seq);
         Ok(())
     }
 
@@ -931,12 +939,12 @@ impl KvTree {
         cache: Arc<NodeCache>,
         slot: super::record::ForestSlot,
         root: RootPtr,
-        seq: Arc<AtomicU64>,
+        seq: Arc<NodeSeqHandle>,
         floor: u64,
     ) -> Result<Self, KvError> {
         let tree = Self::open_slot_tree(cache, slot, root, seq).await?;
         tree.set_root_floor(floor);
-        tree.seq.fetch_max(root.seq, Ordering::AcqRel);
+        tree.seq.raise_to(root.seq);
         Ok(tree)
     }
 
@@ -1309,7 +1317,7 @@ impl KvTree {
                 (seq, entry_start)
             }
             None => {
-                let seq = self.seq.fetch_add(1, Ordering::AcqRel) + 1;
+                let seq = self.seq.next()?;
                 (seq, seq)
             }
         };
@@ -1345,7 +1353,7 @@ impl KvTree {
         entry_start: u64,
     ) -> Result<(), KvError> {
         self.check_key(key)?;
-        self.seq.fetch_max(seq, Ordering::AcqRel);
+        self.seq.raise_to(seq);
         for _ in 0..RETRY_BUDGET {
             let leaf = self.resolve_leaf(key).await?;
             match self
@@ -1382,7 +1390,7 @@ impl KvTree {
         entry_start: u64,
     ) -> Result<(), KvError> {
         self.check_key(key)?;
-        self.seq.fetch_max(seq, Ordering::AcqRel);
+        self.seq.raise_to(seq);
         for _ in 0..RETRY_BUDGET {
             let leaf = self.resolve_leaf(key).await?;
             match self
@@ -1476,7 +1484,7 @@ impl KvTree {
         structural: bool,
     ) -> Result<bool, KvError> {
         self.check_interior_key(r.key)?;
-        self.seq.fetch_max(r.seq, Ordering::AcqRel);
+        self.seq.raise_to(r.seq);
         if self.root_level().await? < r.level {
             return Ok(false); // shorter mounted structure: unroutable
         }
@@ -2034,7 +2042,7 @@ impl KvTree {
             };
             if parts.len() == 1 {
                 let dst = claim(ctx, &self.cache)?;
-                let dst_seq = self.next_seq();
+                let dst_seq = self.next_seq()?;
                 super::node::compact_node(
                     &cfg.path,
                     layout,
@@ -2048,7 +2056,7 @@ impl KvTree {
                 written.push((dst, dst_seq));
             } else if parts.len() == 2 {
                 let (l, r) = (claim(ctx, &self.cache)?, claim(ctx, &self.cache)?);
-                let (ls, rs) = (self.next_seq(), self.next_seq());
+                let (ls, rs) = (self.next_seq()?, self.next_seq()?);
                 split_node(
                     &cfg.path,
                     layout,
@@ -2073,7 +2081,7 @@ impl KvTree {
                 let mut min_key: Vec<u8> = node.min_key().to_vec();
                 for (i, part) in parts.iter().enumerate() {
                     let dst = claim(ctx, &self.cache)?;
-                    let dst_seq = self.next_seq();
+                    let dst_seq = self.next_seq()?;
                     let max_key: Vec<u8> = if i + 1 == parts.len() {
                         node.max_key().to_vec()
                     } else {
@@ -2133,7 +2141,7 @@ impl KvTree {
             // successors — written before any lock is taken.
             let new_root: Option<Arc<CachedNode>> = if self.is_root(node) && written.len() > 1 {
                 let dst = claim(ctx, &self.cache)?;
-                let dst_seq = self.next_seq();
+                let dst_seq = self.next_seq()?;
                 let recs: Vec<Record> = successors
                     .iter()
                     .map(|s| {
@@ -2478,25 +2486,23 @@ impl KvTree {
                     // K5 counter stand-in otherwise), bytes written after
                     // release (the journal entry below; the parent's node
                     // image catches up on its own later writeback).
-                    let recs: Vec<OwnedRec> = successors
-                        .iter()
-                        .enumerate()
-                        .map(|(i, s)| {
-                            OwnedRec::new(
-                                Bytes::copy_from_slice(s.max_key()),
-                                match &smo_entry {
-                                    // The first `successors.len()` journal
-                                    // records ARE the pointer records, in
-                                    // successor order — RAM apply and replay
-                                    // must carry identical seqs.
-                                    Some((_, recs)) => recs[i].1.seq,
-                                    None => self.next_seq(),
-                                },
-                                RecordKind::Put,
-                                Bytes::from(encode_interior_value(s.addr(), s.node_seq())),
-                            )
-                        })
-                        .collect();
+                    let mut recs: Vec<OwnedRec> = Vec::with_capacity(successors.len());
+                    for (i, s) in successors.iter().enumerate() {
+                        let seq = match &smo_entry {
+                            // The first `successors.len()` journal
+                            // records ARE the pointer records, in
+                            // successor order — RAM apply and replay
+                            // must carry identical seqs.
+                            Some((_, recs)) => recs[i].1.seq,
+                            None => self.next_seq()?,
+                        };
+                        recs.push(OwnedRec::new(
+                            Bytes::copy_from_slice(s.max_key()),
+                            seq,
+                            RecordKind::Put,
+                            Bytes::from(encode_interior_value(s.addr(), s.node_seq())),
+                        ));
+                    }
                     // The flips are the entry's records 0..n, so the
                     // first flip's seq IS the entry start (`res.start`
                     // under the K6b hooks) — SMO floors already pin at
@@ -2553,7 +2559,7 @@ impl KvTree {
                 }
                 gate
             }
-            None => self.next_seq(),
+            None => self.next_seq()?,
         };
         // The flush-pass posture (`forced_retirement`) parks
         // unconditionally — at cap the retirement rides the allocator's
@@ -2609,8 +2615,8 @@ impl KvTree {
         self.root().addr == addr
     }
 
-    fn next_seq(&self) -> u64 {
-        self.seq.fetch_add(1, Ordering::AcqRel) + 1
+    fn next_seq(&self) -> Result<u64, KvError> {
+        self.seq.next()
     }
 
     /// Current value of the shared per-volume node-seq mint counter —
@@ -2618,7 +2624,7 @@ impl KvTree {
     /// so a mount can reseed at or above every seq ever stamped into a
     /// persisted frame (Finding A, 2026-07-13).
     pub(crate) fn node_seq_snapshot(&self) -> u64 {
-        self.seq.load(Ordering::Acquire)
+        self.seq.load()
     }
 
     /// Resolve `node`'s parent: descend to `node.level() + 1` routing by
@@ -3257,7 +3263,7 @@ impl KvTree {
 
         let extent = ctx.claim_internal()?;
         let dst = self.cache.extent_addr(extent);
-        let dst_seq = self.next_seq();
+        let dst_seq = self.next_seq()?;
         let build: Result<Arc<CachedNode>, KvError> = async {
             write_node(
                 &cfg.path,
@@ -3407,7 +3413,7 @@ impl KvTree {
             self.cache.publish(successor.clone());
             let (put_seq, del_seq) = match &smo_entry {
                 Some((_, recs)) => (recs[0].1.seq, recs[1].1.seq),
-                None => (self.next_seq(), self.next_seq()),
+                None => (self.next_seq()?, self.next_seq()?),
             };
             let flips = vec![
                 OwnedRec::new(
@@ -3457,7 +3463,7 @@ impl KvTree {
                 }
                 gate
             }
-            None => self.next_seq(),
+            None => self.next_seq()?,
         };
         for ext in [old_l, old_r] {
             if forced_retirement {
@@ -3618,7 +3624,7 @@ impl KvTree {
                 }
                 gate
             }
-            None => self.next_seq(),
+            None => self.next_seq()?,
         };
         ctx.free_pending(old_extent, free_gate_seq, forced_retirement)?;
         super::META_KV_ROOT_COLLAPSES.fetch_add(1, Ordering::Relaxed);

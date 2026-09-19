@@ -42,7 +42,7 @@ use squeezefs::meta_backend::kv::{
 };
 use squeezefs::meta_backend::{open_routed_meta_set, Metadata};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 
@@ -55,7 +55,7 @@ const NODE_SIZE: usize = 64 * 1024;
 struct Vol {
     _file: NamedTempFile,
     cache: Arc<NodeCache>,
-    seq: Arc<AtomicU64>,
+    seq: Arc<squeezefs::meta_backend::kv::node_seq::NodeSeqHandle>,
     ctx: SmoContext,
 }
 
@@ -75,7 +75,7 @@ impl Vol {
             writeback_delta_bytes: usize::MAX,
         });
         let alloc = Arc::new(ExtentAllocator::format(extents, 0, 4096));
-        let seq = Arc::new(AtomicU64::new(0));
+        let seq = Arc::new(squeezefs::meta_backend::kv::node_seq::NodeSeqHandle::shared(0));
         let ctx = SmoContext::new(alloc.clone());
         Self {
             _file: file,

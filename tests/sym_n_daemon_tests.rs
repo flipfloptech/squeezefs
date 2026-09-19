@@ -918,25 +918,25 @@ async fn concurrent_storms(
     fsck_clean(&uris).await;
 }
 
-/// **Node incarnation seqs are one space per VOLUME, not per appender**
-/// (PR 13 — the fleet's `sym-scale` N = 8 row, defect 5; OPEN, routed to
-/// PR 12b): every appender seeds its node-seq handle from the SAME ledger
-/// watermark at its open, so two joiners' first mints carry the SAME
-/// `node_seq`, and every seq guard the CoW law rests on — the §4.2 child
-/// pointer check, the root pointer check, the §4.5 frame-incarnation
+/// **Node incarnation seqs are ONE SPACE PER APPENDER INCARNATION**
+/// (`kv::node_seq`, PR 13 — the fleet's `sym-scale` N = 8 row, defect 5).
+/// Before it every appender seeded its node-seq handle from the SAME
+/// ledger watermark at its open, so two joiners' first mints carried the
+/// SAME `node_seq` and every seq guard the CoW law rests on — the §4.2
+/// child pointer check, the root pointer check, the §4.5 frame-incarnation
 /// check that ends a recycled extent's log at a previous node's frames —
-/// is void ACROSS appenders. The device showed it: one node extent with
+/// was void ACROSS appenders. The device showed it: one node extent with
 /// appender 3's header + base frame and three frames appender 4 appended
 /// into it, all under one `node_seq`, both appenders folding each other's
-/// records (finding 41's refusal, the tail pinned, D1.b). The law this
-/// pin states: two appenders of one volume never mint an equal
-/// `node_seq`. RED on this tree (`--ignored`, the PR 11 §5b precedent);
-/// the remedy is a per-incarnation seq space (a base derived from the
-/// volume uuid + appender id + term, the projection refresh's raise
-/// confined to the writer's own trees).
+/// records (finding 41's refusal, the tail pinned, D1.b). The law: the
+/// manager (incarnation 0) mints in `[B, B + 2^K)` over the volume's uuid
+/// base exactly as before; every JOIN — a rejoin included — is minted a
+/// fresh incarnation `o ≥ 1` from the durable tree-0 counter and mints in
+/// the disjoint `[B + o·2^K, B + (o+1)·2^K)`; no two appenders ever mint
+/// an equal seq. RED on `8af38eda` (both joiners' roots read one seq).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
 async fn two_joined_appenders_never_mint_an_equal_node_seq() {
+    use squeezefs::meta_backend::kv::node_seq::{incarnation_base, INCARNATION_SPACE};
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
@@ -951,17 +951,13 @@ async fn two_joined_appenders_never_mint_an_equal_node_seq() {
     let j1 = join(&uris, &venue, &mvol, 1).await;
     let j2 = join(&uris, &venue, &mvol, 2).await;
     // One rotor mint each (a directory under `/` lands in the creator's
-    // rotor — a fresh slot tree, one node minted from the handle).
-    let d1 = j1
-        .create(1, "j1", libc::S_IFDIR | 0o755, 1000, 1000)
-        .await
-        .expect("j1's directory")
-        .ino;
-    let d2 = j2
-        .create(1, "j2", libc::S_IFDIR | 0o755, 1000, 1000)
-        .await
-        .expect("j2's directory")
-        .ino;
+    // rotor — a fresh slot tree, one node minted from the handle) — and
+    // one for the manager.
+    for (r, name) in [(&j1, "j1"), (&j2, "j2"), (&manager, "m")] {
+        r.create(1, name, libc::S_IFDIR | 0o755, 1000, 1000)
+            .await
+            .expect("a directory");
+    }
     let seqs = |r: &Arc<RoutedMetaBackend>, who: &str| -> Vec<u64> {
         let v = &r.volumes[0];
         let mut out = Vec::new();
@@ -977,6 +973,7 @@ async fn two_joined_appenders_never_mint_an_equal_node_seq() {
         assert!(!out.is_empty(), "{who} minted no slot tree");
         out
     };
+    let s0 = seqs(&manager, "the manager");
     let s1 = seqs(&j1, "joiner 1");
     let s2 = seqs(&j2, "joiner 2");
     let shared: Vec<u64> = s1.iter().copied().filter(|s| s2.contains(s)).collect();
@@ -985,9 +982,46 @@ async fn two_joined_appenders_never_mint_an_equal_node_seq() {
         "two joined appenders minted the same node_seq(s) {shared:?} (joiner 1 roots {s1:?}, \
          joiner 2 roots {s2:?}) — one per-volume seq space, the cross-appender CoW hazard"
     );
-    let _ = (d1, d2);
-    shutdown(&j2).await;
+    // The spaces by construction: the manager's below incarnation 1's
+    // base (the legacy space), joiner 1's inside incarnation 1's span,
+    // joiner 2's inside incarnation 2's — every seq inside its own span.
+    let b = squeezefs::meta_backend::kv::builder::node_seq_base(mvol.superblock().uuid);
+    let (b1, b2) = (
+        incarnation_base(b, 1).unwrap(),
+        incarnation_base(b, 2).unwrap(),
+    );
+    assert!(
+        s0.iter().all(|s| *s < b1),
+        "the manager mints in incarnation 0: {s0:?} < {b1:#x}"
+    );
+    assert!(
+        s1.iter().all(|s| (b1..b1 + INCARNATION_SPACE).contains(s)),
+        "joiner 1 mints in incarnation 1: {s1:?} ∈ [{b1:#x}, +2^K)"
+    );
+    assert!(
+        s2.iter().all(|s| (b2..b2 + INCARNATION_SPACE).contains(s)),
+        "joiner 2 mints in incarnation 2: {s2:?} ∈ [{b2:#x}, +2^K)"
+    );
+    // A REJOIN is a new incarnation: joiner 1 leaves and joins again — its
+    // next mint sits in incarnation 3's span, never back in 1's.
     shutdown(&j1).await;
+    let j1b = join(&uris, &venue, &mvol, 1).await;
+    j1b.create(1, "j1-again", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("a directory after the rejoin");
+    let b3 = incarnation_base(b, 3).unwrap();
+    let s1b = seqs(&j1b, "joiner 1 rejoined");
+    assert!(
+        s1b.iter().any(|s| (b3..b3 + INCARNATION_SPACE).contains(s)),
+        "the rejoined joiner mints in incarnation 3's span: {s1b:?} vs [{b3:#x}, +2^K)"
+    );
+    assert!(
+        !s1b.iter()
+            .any(|s| (b1..b1 + INCARNATION_SPACE).contains(s) && !s1.contains(s)),
+        "the rejoin minted nothing new in its dead incarnation's space: {s1b:?}"
+    );
+    shutdown(&j2).await;
+    shutdown(&j1b).await;
     venue.tear_down();
     shutdown(&manager).await;
 }

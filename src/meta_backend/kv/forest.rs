@@ -99,7 +99,7 @@ pub enum MintPolicy {
 /// (§5.3.3).
 pub struct MintContext<'a> {
     pub cache: &'a Arc<NodeCache>,
-    pub seq: &'a Arc<AtomicU64>,
+    pub seq: &'a Arc<super::node_seq::NodeSeqHandle>,
     pub alloc: &'a Arc<super::alloc_ext::ExtentAllocator>,
     pub floor: u64,
     pub policy: MintPolicy,

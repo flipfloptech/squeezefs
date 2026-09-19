@@ -902,6 +902,7 @@ enum ArbReply {
         ring_segments: Vec<(u64, u64)>,
         grant: Vec<(u64, u32)>,
         already: bool,
+        node_seq_base: u64,
     },
     Granted {
         runs: Vec<(u64, u32)>,
@@ -1019,12 +1020,14 @@ impl From<ArbReply> for ManagerReply {
                 ring_segments,
                 grant,
                 already,
+                node_seq_base,
             } => ManagerReply::Joined {
                 appender_id,
                 page_addr,
                 ring_segments,
                 grant,
                 already,
+                node_seq_base,
             },
             ArbReply::Granted { runs } => ManagerReply::Granted { runs },
             ArbReply::Returned { cleared, already } => ManagerReply::Returned { cleared, already },

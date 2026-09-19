@@ -626,7 +626,7 @@ impl KvMetaBackend {
     /// Test seam: the volume's node-seq handle as it stands — the word
     /// every root install raises (review round 2, Issue 24's witness).
     pub fn test_node_seq_now(&self) -> u64 {
-        self.seq_handle().load(Ordering::Acquire)
+        self.seq_handle().load()
     }
 
     /// Test seam: the interior records ring 0's window carried for `slot`
@@ -2003,7 +2003,12 @@ impl KvMetaBackend {
             // the handle is floored above every stamp they carry BEFORE
             // the extents return to the heap (PR 11's residue law,
             // `node::residue_seq_ceiling`; Issue 24) — one extent read per
-            // orphan, the price the offline census pays.
+            // orphan, the price the offline census pays. Under the
+            // per-incarnation seq spaces (PR 13, `kv::node_seq`) a wire
+            // joiner's stamps sit in ITS space, where this handle never
+            // mints: `raise_to` ignores them and the disjointness is the
+            // guarantee; a same-space stamp (an in-process region's) still
+            // floors the handle exactly as before.
             let mut ceiling = 0u64;
             let node_size = self.cache.config().layout.node_size() as u64;
             for e in &orphans {
@@ -2017,7 +2022,7 @@ impl KvMetaBackend {
                 ceiling = ceiling.max(crate::meta_backend::kv::node::residue_seq_ceiling(&image));
             }
             if ceiling != 0 {
-                self.seq_handle().fetch_max(ceiling, Ordering::AcqRel);
+                self.seq_handle().raise_to(ceiling);
             }
             match self.return_extents_inner(id, &orphans, false).await {
                 Ok((returned, _)) => log::info!(
@@ -2143,7 +2148,7 @@ impl KvMetaBackend {
             }
             if r.kind == RecordKind::Put {
                 if let Ok((_addr, child_seq)) = decode_interior_value(&r.value) {
-                    self.seq_handle().fetch_max(child_seq, Ordering::AcqRel);
+                    self.seq_handle().raise_to(child_seq);
                 }
             }
             let tree = forest.slot_or_mint(slot, &mint).await?;

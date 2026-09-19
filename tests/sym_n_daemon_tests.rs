@@ -629,6 +629,175 @@ async fn a_joiners_dirty_projection_of_a_retired_manager_leaf_never_refuses_its_
     fsck_clean(&uris).await;
 }
 
+/// **PR 13 (the `sym-scale` N = 8 fleet row, found and pinned red-first)**:
+/// four writers — the manager and three joiners — each storming its OWN
+/// directory with concurrent creators while every one checkpoints on its
+/// cadence (extent refills, returns, compactions — the extents churning
+/// between appenders through the manager's heap) never lands another
+/// appender's record in one of its leaves: every acked name resolves at
+/// every daemon, no compaction is refused on finding 41's bounds check
+/// ("carries records outside its key bounds" — the fleet read a joiner's
+/// storm-directory dentries inside another joiner's leaf, then the D1.b
+/// fail-stop of that volume), fsck + C8 clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_storms_on_four_writers_never_cross_a_record_into_another_appenders_leaf() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let mut daemons: Vec<Arc<RoutedMetaBackend>> = vec![Arc::clone(&manager)];
+    for n in 1..=3 {
+        daemons.push(join(&uris, &venue, &mvol, n).await);
+    }
+    // Every daemon's own directory under `/` (a shipped step to the
+    // manager — the root's dentries are slot 0's; the child a rotor mint).
+    let mut dirs = Vec::new();
+    for (i, d) in daemons.iter().enumerate() {
+        dirs.push(
+            d.create(1, &format!("w{i}"), libc::S_IFDIR | 0o755, 1000, 1000)
+                .await
+                .expect("the writer's directory")
+                .ino,
+        );
+    }
+    // The storm: 3 creators × 700 files per daemon, ONE cadence task per
+    // daemon checkpointing every 20 ms beside them (the production shape:
+    // one checkpoint task per volume — the refill / return / compaction
+    // churn the fleet's cadence drives).
+    const CREATORS: usize = 3;
+    const PER_CREATOR: usize = 700;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let corrupt: Arc<tokio::sync::Mutex<Option<String>>> = Arc::new(tokio::sync::Mutex::new(None));
+    let mut cadences = Vec::new();
+    for (i, d) in daemons.iter().enumerate() {
+        let d = Arc::clone(d);
+        let stop = Arc::clone(&stop);
+        let corrupt = Arc::clone(&corrupt);
+        cadences.push(tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                if let Err(e) = d.volumes[0].checkpoint_now().await {
+                    let mut c = corrupt.lock().await;
+                    if c.is_none() {
+                        *c = Some(format!("writer {i} checkpoint: {e}"));
+                    }
+                    return;
+                }
+            }
+        }));
+    }
+    let mut tasks = Vec::new();
+    for (i, d) in daemons.iter().enumerate() {
+        for c in 0..CREATORS {
+            let d = Arc::clone(d);
+            let dir = dirs[i];
+            tasks.push(tokio::spawn(async move {
+                let mut out = Vec::with_capacity(PER_CREATOR);
+                for k in 0..PER_CREATOR {
+                    let name = format!("c{c}-f{k:05}");
+                    let ino = d
+                        .create(dir, &name, libc::S_IFREG | 0o644, 1000, 1000)
+                        .await
+                        .unwrap_or_else(|e| panic!("writer {i} create {name}: {e}"))
+                        .ino;
+                    out.push((name, ino));
+                }
+                (i, out)
+            }));
+        }
+    }
+    let mut files: Vec<Vec<(String, u64)>> = vec![Vec::new(); daemons.len()];
+    for t in tasks {
+        let (i, out) = t.await.expect("a creator task");
+        files[i].extend(out);
+    }
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    for c in cadences {
+        c.await.expect("a cadence task");
+    }
+    // ATTRIBUTION on a corrupt node: which daemon's trees reach the
+    // address, and whose region grant claims its extent — the two words
+    // that name the second custodian.
+    if let Some(msg) = corrupt.lock().await.clone() {
+        let addr: Option<u64> = msg
+            .split("node at 0x")
+            .nth(1)
+            .and_then(|s| s.split(|c: char| !c.is_ascii_hexdigit()).next())
+            .and_then(|h| u64::from_str_radix(h, 16).ok());
+        if let Some(addr) = addr {
+            for (i, d) in daemons.iter().enumerate() {
+                let v = &d.volumes[0];
+                let mut slots: Vec<ForestSlot> = v
+                    .slot_leases()
+                    .map(|p| p.gate.leased_slots())
+                    .unwrap_or_default();
+                slots.push(squeezefs::meta_backend::kv::record::NATIVE_FOREST_SLOT);
+                for s in slots {
+                    if let Some(t) = v.slot_tree(s) {
+                        if let Ok(set) = t.reachable_node_addrs().await {
+                            if set.contains(&addr) {
+                                eprintln!(
+                                    "ATTRIBUTION: writer {i}'s slot {s} tree reaches {addr:#x}"
+                                );
+                            }
+                        }
+                    }
+                }
+                if let Some(c) = v.forest_control_tree() {
+                    if let Ok(set) = c.reachable_node_addrs().await {
+                        if set.contains(&addr) {
+                            eprintln!("ATTRIBUTION: writer {i}'s tree 0 reaches {addr:#x}");
+                        }
+                    }
+                }
+                let s = v.appender_stats().unwrap();
+                for r in &s.regions {
+                    eprintln!(
+                        "ATTRIBUTION: writer {i} region {} leases {} ring_entries {}",
+                        r.id, r.leases, r.ring_entries
+                    );
+                }
+            }
+        }
+        panic!("{msg}");
+    }
+    for d in &daemons {
+        d.volumes[0]
+            .checkpoint_now()
+            .await
+            .expect("the final checkpoint");
+    }
+    for (i, d) in daemons.iter().enumerate() {
+        assert_all_resolve(d, dirs[i], &files[i]).await;
+        assert_must_stay_zero(&d.volumes[0], &format!("writer {i}"));
+        let s = d.volumes[0].appender_stats().unwrap();
+        assert_eq!(
+            s.extent_grant_conflicts, 0,
+            "writer {i}: extent_grant_conflicts"
+        );
+    }
+    // Every joiner leaves cleanly; the manager reads every acked name.
+    for d in daemons.drain(1..) {
+        shutdown(&d).await;
+    }
+    for (i, dir) in dirs.iter().enumerate() {
+        assert_all_resolve(&manager, *dir, &files[i]).await;
+    }
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    drop(daemons);
+    fsck_clean(&uris).await;
+}
+
 /// **Own residue** (PR 2's law on a wire region, deliverable 4): the joiner
 /// commits, checkpoints, commits MORE into its window, and dies (dropped
 /// without a shutdown). The same identity's rejoin presents its Live

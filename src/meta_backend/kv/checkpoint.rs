@@ -1317,7 +1317,12 @@ async fn checkpoint_task(
         // checkpoint owed (review round 4, Issue 26 — `shutdown()` itself
         // now signals with a permit; this is the belt for any signaller
         // that stores the flag without one).
-        if be.is_shutting_down() || be.all_trees().into_iter().any(|t| t.maintenance_pending()) {
+        if be.is_shutting_down()
+            || be
+                .maintainable_trees()
+                .into_iter()
+                .any(|t| t.maintenance_pending())
+        {
             wake.notify_one();
         }
     }
@@ -1338,7 +1343,9 @@ async fn maintenance_pass(
     deadline: Option<std::time::Instant>,
 ) -> Result<(), KvError> {
     let mut smo = be.smo.lock().await;
-    for tree in be.all_trees() {
+    // The trees this mount MAINTAINS (never a projection or a foreign
+    // lessee's — PR 13).
+    for tree in be.maintainable_trees() {
         loop {
             let r = tree.run_maintenance_until(&mut smo, deadline).await;
             match r {
@@ -1351,6 +1358,28 @@ async fn maintenance_pass(
                     // restored), the cadence cycle's flush pass owns the
                     // retry — never a per-tick WARN storm.
                     be.enter_heap_full(&format!("threshold maintenance: {e}"));
+                    break;
+                }
+                Err(KvError::GrantExhausted {
+                    appender, needed, ..
+                }) => {
+                    // The §5.3.3 reactive refill (PR 13 — the flush
+                    // passes' arm on the threshold pass): the entry was
+                    // handed back, so a refill that lands retries it;
+                    // one the manager cannot answer hands the tree's
+                    // queue to the cadence (the flush pass owns the
+                    // retry and the stall count) — never a WARN per
+                    // entry, never an ask per re-armed wake.
+                    if be.maintenance_grant_refill(appender, needed, &smo).await {
+                        continue;
+                    }
+                    let dropped = tree.drop_maintenance_queue();
+                    log::debug!(
+                        "threshold maintenance on {:?}: appender {appender}'s grant is exhausted \
+                         ({needed} needed) and no refill landed; {dropped} queued entr(y/ies) \
+                         left to the cadence's flush pass",
+                        be.device_path()
+                    );
                     break;
                 }
                 Err(e) => return Err(e),
@@ -1432,7 +1461,9 @@ async fn tick(
     //    currency PR 4 clause a) forces the same cycle — its flush pass
     //    discharges the pinning floor (the §4.7 cycle-break) and its
     //    centralized progress audit (clause b) bounds genuine wedges.
-    for tree in be.all_trees() {
+    //    Over the trees this mount MAINTAINS (PR 13): a joined appender's
+    //    projections of the manager's trees are never appended to here.
+    for tree in be.maintainable_trees() {
         loop {
             match tree.run_maintenance_until(&mut smo, drain_deadline).await {
                 Ok(_) => break,

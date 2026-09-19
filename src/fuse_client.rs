@@ -13945,6 +13945,14 @@ impl SqueezefsFilesystem {
                     "manager_verb_rejected".into(),
                     appender(&|s| s.manager_verb_rejected),
                 );
+                metrics.insert(
+                    "extent_grant_conflicts".into(),
+                    appender(&|s| s.extent_grant_conflicts),
+                );
+                metrics.insert(
+                    "extent_grant_stale_page_words".into(),
+                    appender(&|s| s.extent_grant_stale_page_words),
+                );
                 metrics.insert("appenders_known".into(), appender(&|s| s.appenders_known));
                 metrics.insert(
                     "extent_grant_promised".into(),

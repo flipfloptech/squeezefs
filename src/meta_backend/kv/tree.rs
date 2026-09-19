@@ -1082,6 +1082,20 @@ impl KvTree {
         !self.maintenance.is_empty()
     }
 
+    /// Drop every queued threshold entry, answering how many (PR 13): the
+    /// threshold pass's hand-off to the cadence when the region's grant is
+    /// exhausted and the manager could not refill it — the nodes stay
+    /// dirty and the cadence's flush pass (which owns the reactive refill
+    /// and `manager_dependency_stalls`) writes them; keeping the entries
+    /// queued would re-arm the pass's wake into an ask per entry.
+    pub(crate) fn drop_maintenance_queue(&self) -> usize {
+        let mut n = 0;
+        while self.maintenance.pop().is_some() {
+            n += 1;
+        }
+        n
+    }
+
     // -----------------------------------------------------------------
     // Latch-free traversal (§4.5 reads; §4.6 writer resolution).
     // -----------------------------------------------------------------
@@ -1645,7 +1659,16 @@ impl KvTree {
                 break;
             }
             first = false;
-            self.maintain_node(ctx, addr, &mut out).await?;
+            if let Err(e) = self.maintain_node(ctx, addr, &mut out).await {
+                // The grant class is RETRYABLE at the caller (a reactive
+                // refill, PR 13): the entry goes back so the retry finds
+                // it; every other error drops it as before (the node
+                // stays dirty for the cadence's flush pass).
+                if matches!(e, KvError::GrantExhausted { .. }) {
+                    self.maintenance.push(addr);
+                }
+                return Err(e);
+            }
         }
         Ok(out)
     }

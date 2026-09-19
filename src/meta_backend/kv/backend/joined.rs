@@ -1628,6 +1628,60 @@ impl KvMetaBackend {
         self.joined_extent_grant_at(want, None).await
     }
 
+    /// The §5.3.3 REACTIVE refill for the threshold maintenance pass
+    /// (PR 13): a `GrantExhausted { appender, needed }` from an SMO the
+    /// pass ran on one of this mount's OWN regions asks the manager for
+    /// that SMO's need — over the wire on a joined appender, in process
+    /// on the manager — exactly as the two flush passes do, and answers
+    /// whether extents landed (the caller retries the tree once). The
+    /// pass had no arm: every threshold wake on an appender whose grant
+    /// was drained by a storm failed loud at WARN and left its appends to
+    /// the cadence (66 WARNs per second per three joiners in the
+    /// four-writer storm pin). A foreign appender's id — a tree this
+    /// mount does not maintain reached the SMO — is `false` without an
+    /// ask.
+    pub(in crate::meta_backend::kv) async fn maintenance_grant_refill(
+        &self,
+        appender: u32,
+        needed: u64,
+        smo: &super::super::tree::SmoContext,
+    ) -> bool {
+        let own = self
+            .appenders
+            .as_ref()
+            .is_some_and(|s| s.owns_region(appender));
+        if !own || super::super::appender::test_manager_unreachable() {
+            return false;
+        }
+        let want = u32::try_from(needed)
+            .unwrap_or(u32::MAX)
+            .max(super::super::appender::SMO_IMAGES_MAX);
+        let landed = if self.is_joined_appender() {
+            self.joined_extent_grant_at(want, Some(smo))
+                .await
+                .map(|n| n > 0)
+        } else {
+            self.manager_extent_grant_class(
+                appender,
+                want,
+                super::super::alloc_ext_core::AllocClass::Internal,
+            )
+            .await
+            .map(|runs| !runs.is_empty())
+        };
+        match landed {
+            Ok(landed) => landed,
+            Err(e) => {
+                log::debug!(
+                    "meta volume {}: appender {appender}'s threshold-maintenance ExtentGrant \
+                     deferred ({e}); the cadence's flush pass retries",
+                    self.path.display()
+                );
+                false
+            }
+        }
+    }
+
     /// [`Self::joined_extent_grant`] from INSIDE the checkpoint cycle
     /// (`smo` = the held guard's contents — F3): the re-dial follows a
     /// manager failover through the projection refresh on the held guard.

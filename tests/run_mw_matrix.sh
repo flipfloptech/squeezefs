@@ -3329,7 +3329,8 @@ sym_zero_set() { # label idx
         appender_park_expiries meta_kv_leaf_lease_refusals dlm_token_recall_timeouts_live \
         appender_flush_ceiling_overruns dead_member_write_deferrals data_alloc_bitmap_drift \
         joined_control_refusals xv_cross_owner_intents_stuck manager_dependency_stalls \
-        dlm_token_custody_rejected invariant_tripwires data_dma_fence_refusals; do
+        dlm_token_custody_rejected invariant_tripwires data_dma_fence_refusals \
+        extent_grant_conflicts; do
         v="$(stat_sum "$idx" "$k")"
         [ "$v" = "0" ] || die "$label: $k=$v on m$idx (must stay 0)"
     done

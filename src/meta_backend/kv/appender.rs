@@ -2396,6 +2396,15 @@ pub struct ManagerVerbLedger {
     pub replays: std::sync::atomic::AtomicU64,
     pub refusals: std::sync::atomic::AtomicU64,
     pub rejected: std::sync::atomic::AtomicU64,
+    /// PR 13 (`extent_grant_conflicts`, **must-stay-0**): grants or
+    /// returns REFUSED because an extent already sat in another appender's
+    /// `extent_grant:` record — two custodians of one image.
+    pub grant_conflicts: std::sync::atomic::AtomicU64,
+    /// PR 13 (`extent_grant_stale_page_words`): `ExtentGrant` asks whose
+    /// page word named an extent the caller's record no longer held (a
+    /// return landed after its last page write) — the word is intersected
+    /// with the record, never answered verbatim.
+    pub stale_page_words: std::sync::atomic::AtomicU64,
     pub admit_ns: std::sync::atomic::AtomicU64,
     pub execute_ns: std::sync::atomic::AtomicU64,
     pub reply_ns: std::sync::atomic::AtomicU64,
@@ -2651,6 +2660,8 @@ impl AppenderSet {
             manager_verb_replays: self.verbs.replays.load(Relaxed),
             manager_verb_refusals: self.verbs.refusals.load(Relaxed),
             manager_verb_rejected: self.verbs.rejected.load(Relaxed),
+            extent_grant_conflicts: self.verbs.grant_conflicts.load(Relaxed),
+            extent_grant_stale_page_words: self.verbs.stale_page_words.load(Relaxed),
             appenders_known: self.appenders_known.load(Relaxed),
             manager_verbs_per_s: self.verbs.verbs_per_s(),
             manager_load_pct: self.verbs.load_pct(now_ns),
@@ -2762,6 +2773,12 @@ pub struct AppenderStats {
     /// Wire-invalid frames rejected before any allocation
     /// (`manager_verb_rejected` — the buggy/hostile-peer class).
     pub manager_verb_rejected: u64,
+    /// Grants / returns refused on the grant-disjointness tripwire
+    /// (`extent_grant_conflicts`, must-stay-0 — PR 13).
+    pub extent_grant_conflicts: u64,
+    /// `ExtentGrant` asks whose page word outran the record
+    /// (`extent_grant_stale_page_words` — PR 13).
+    pub extent_grant_stale_page_words: u64,
     /// The directory's `Live` count as last read (`appenders_known`) —
     /// the grant cap's appender term.
     pub appenders_known: u64,

@@ -5112,23 +5112,42 @@ impl KvMetaBackend {
 
     /// Whether this mount MAINTAINS `tree`'s structure — the merge sweep's,
     /// the heap-full recovery's, the D4 arm's and the census's ONE filter
-    /// (review round 4, Issue 25): a flat volume's trees and tree 0
-    /// always; a slot tree this mount leases (an in-process region's SMOs
-    /// scope to its ring and grant); an UNLEASED slot tree on the manager
-    /// (KD-SYM-2/3 — its root lives in tree 0, its SMOs journal in ring 0);
-    /// never a tree another appender leases — skipped (counted by
+    /// (review round 4, Issue 25): a flat volume's trees always; tree 0
+    /// on every mount but a JOINED appender (PR 13 — a joiner's tree 0 is
+    /// the manager's PROJECTION, folded dirty by its open's replay: the
+    /// first four-writer storm had every joiner's maintenance pass
+    /// compacting the manager's control tree, its successor images
+    /// claimed from the joiner's stale projected BITMAP and written into
+    /// extents the manager had granted to other appenders since — two
+    /// appenders appending into one node, finding 41's bounds refusal and
+    /// `checkpoint-covered bset … follows a torn bset` at the manager);
+    /// a slot tree this mount leases (an in-process region's SMOs scope
+    /// to its ring and grant); an UNLEASED slot tree on the manager
+    /// (KD-SYM-2/3 — its root lives in tree 0, its SMOs journal in ring
+    /// 0); never a tree another appender leases — skipped (counted by
     /// [`Self::maintainable_trees`] on `merge_sweep_foreign_skips`), a
     /// refusal at the gate being the belt.
     fn maintains_slot(&self, slot: Option<super::record::ForestSlot>) -> bool {
-        let (Some(slot), Some(plane)) = (slot, self.slot_leases()) else {
+        let Some(plane) = self.slot_leases() else {
             return true;
+        };
+        let Some(slot) = slot else {
+            // Tree 0 and every flat node: the manager's alone under an
+            // armed plane. `is_manager` is false on a joined appender and
+            // on any non-manager the plane arms.
+            return plane.gate.is_manager();
         };
         plane.gate.is_leased(slot) || (!plane.gate.is_foreign(slot) && plane.gate.is_manager())
     }
 
     /// [`Self::all_trees`] filtered by [`Self::maintains_slot`]; every
-    /// tree left out is counted on `merge_sweep_foreign_skips`.
-    fn maintainable_trees(&self) -> Vec<Arc<KvTree>> {
+    /// tree left out is counted on `merge_sweep_foreign_skips`. The
+    /// checkpoint task's threshold-maintenance loops walk THIS population
+    /// (PR 13): walking `all_trees` ran a joined appender's maintenance
+    /// over its projections — the manager's tree 0 and slot trees, other
+    /// appenders' trees — appending their folded overlays into node
+    /// extents this mount does not own.
+    pub(super) fn maintainable_trees(&self) -> Vec<Arc<KvTree>> {
         let mut out = Vec::new();
         for t in self.all_trees() {
             if self.maintains_slot(t.forest_slot()) {
@@ -8246,6 +8265,45 @@ impl KvMetaBackend {
         Self::read_extent_grant_records(forest.control()).await
     }
 
+    /// **The grant-disjointness tripwire** (PR 13): every extent of
+    /// `extents` about to be granted to `appender_id` (or returned by it)
+    /// must be in NO OTHER appender's `extent_grant:` record — two records
+    /// naming one extent are two appenders writing one image (the fleet's
+    /// `sym-scale` N = 8 row read a leaf carrying another appender's
+    /// records: finding 41's bounds check caught the write). The check is
+    /// one tree-0 range read per grant (grants are rare, O(appenders)
+    /// records), and a conflict REFUSES the act loud naming both appenders
+    /// and the extent (`extent_grant_conflicts`, must-stay-0) rather than
+    /// landing the second custodian.
+    async fn refuse_extents_held_elsewhere(
+        &self,
+        appender_id: u32,
+        extents: &[u64],
+        act: &str,
+    ) -> std::result::Result<(), KvError> {
+        if extents.is_empty() {
+            return Ok(());
+        }
+        let records = self.extent_grant_records().await?;
+        for (other, record) in records {
+            if other == appender_id {
+                continue;
+            }
+            if let Some(e) = extents.iter().find(|e| record.contains(**e)) {
+                if let Some(set) = self.appenders.as_ref() {
+                    set.verbs.grant_conflicts.fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(KvError::Corrupt(format!(
+                    "{}: {act} for appender {appender_id} names extent {e}, which appender \
+                     {other}'s extent_grant record already holds — two custodians of one image \
+                     (extent_grant_conflicts); the act is refused",
+                    self.path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     async fn read_extent_grant_records(
         control: &KvTree,
     ) -> std::result::Result<Vec<(u32, super::slot_state::ExtentGrantRecord)>, KvError> {
@@ -8388,14 +8446,42 @@ impl KvMetaBackend {
             super::alloc_ext_core::AllocClass::User => super::appender::clamp_grant_want(want, cap),
             super::alloc_ext_core::AllocClass::Internal => u64::from(want.max(1)),
         };
-        // §5.3.5: an unconsumed grant is answered verbatim.
-        let remainder = self.unclaimed_remainder_of(set, appender_id).await?;
+        // §5.3.5: an unconsumed grant is answered verbatim — INTERSECTED
+        // with the appender's durable record (PR 13): the page's unclaimed
+        // word is the appender's RAM at its last page write, the record is
+        // what the manager granted and has not seen returned; an extent
+        // the word names outside the record was RETURNED (freed, possibly
+        // re-carved for another appender) after that page write, and
+        // answering it verbatim would hand the caller an extent it no
+        // longer holds — a second custodian of whoever holds it now.
+        let record = self.extent_grant_record(appender_id).await?;
+        let remainder = {
+            let word = self.unclaimed_remainder_of(set, appender_id).await?;
+            let named: u64 = word.iter().map(|r| u64::from(r.len)).sum();
+            let kept = super::slot_state::ExtentGrantRecord::from_extents(
+                word.iter()
+                    .flat_map(|r| r.start..r.start + u64::from(r.len))
+                    .filter(|e| record.contains(*e)),
+            )
+            .runs;
+            let kept_extents: u64 = kept.iter().map(|r| u64::from(r.len)).sum();
+            if kept_extents < named {
+                set.verbs.stale_page_words.fetch_add(1, Ordering::Relaxed);
+                log::warn!(
+                    "meta volume {}: appender {appender_id}'s page names {} unclaimed extent(s) \
+                     its grant record no longer holds — a return landed after its last page \
+                     write; the stale word is not answered (extent_grant_stale_page_words)",
+                    self.path.display(),
+                    named - kept_extents
+                );
+            }
+            kept
+        };
         let remainder_extents: u64 = remainder.iter().map(|r| u64::from(r.len)).sum();
         if remainder_extents >= want && want > 0 {
             set.verbs.replays.fetch_add(1, Ordering::Relaxed);
             return Ok(remainder);
         }
-        let record = self.extent_grant_record(appender_id).await?;
         // Bounded by the FREE heap, never by the wire.
         let mut claimed: Vec<u64> =
             Vec::with_capacity(want.min(self.alloc.free_extents()) as usize);
@@ -8458,6 +8544,17 @@ impl KvMetaBackend {
             // Nothing carvable fits beside the caller's fragmented
             // remainder: the remainder, verbatim (a return coalesces it).
             return Ok(remainder);
+        }
+        // A carve the bitmap answered FREE that another appender's record
+        // still names is a double custodian — refused, the claims undone.
+        if let Err(e) = self
+            .refuse_extents_held_elsewhere(appender_id, &claimed, "ExtentGrant")
+            .await
+        {
+            for c in claimed {
+                self.alloc.release_unpublished(c);
+            }
+            return Err(e);
         }
         // The extents leave this mount's custody: whatever this mount once
         // retired there, the grantee's node is what stands next — and
@@ -9138,6 +9235,18 @@ impl KvMetaBackend {
                 )));
             }
             claimed.extend(ring_claimed);
+            // The carve (the directory extent + the ring) must sit in no
+            // appender's grant record — a ring zeroed over another
+            // appender's live image is the double-custodian class.
+            if let Err(e) = self
+                .refuse_extents_held_elsewhere(id, &claimed, "JoinAppender's carve")
+                .await
+            {
+                for c in claimed {
+                    self.alloc.release_unpublished(c);
+                }
+                return Err(e);
+            }
             // A predecessor incarnation's ring may have occupied these
             // extents: zeroed before any page names them (`zero_extents`).
             if let Err(e) = super::appender::zero_extents(&self.path, &segments).await {

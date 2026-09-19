@@ -833,6 +833,163 @@ fn the_reader_ack_rides_the_renewal_and_advances_the_writers_bound() {
     );
 }
 
+/// PR 12b round 5 (found by the `sym-crash` leg's new reader assertions,
+/// Issue 26): a label is the OWNER's own monotonic instant, so a
+/// SUCCESSOR owner's label space restarts near 0 — but the reader's ack
+/// ladder kept a process-global monotone memo of the highest label it
+/// acked under the PREDECESSOR and refused to adopt any label below it.
+/// A reader that followed a failover (or re-joined fresh — the memo
+/// survived the self-fence too) therefore acknowledged NOTHING under the
+/// successor until the successor's clock had run past the predecessor's
+/// uptime: the successor's `min_acked_free_epoch` sat at 0, every
+/// deferred free stayed in the grace ring, and the pressure valve refused
+/// `StorageFull` on a healthy fleet (the round-5 tape's "readers have not
+/// acknowledged past label 44556" one failover later). The law pinned:
+/// **a grant from a NEW owner term resets the ladder** — the new owner's
+/// labels are adopted from scratch and qualified by the same three gates;
+/// a same-term reclaim keeps it (one label space).
+#[test]
+fn a_new_owner_terms_labels_are_acknowledged_from_scratch() {
+    let _serial = serial();
+    let (clock, ticks) = manual_clock();
+    // The predecessor has been up a long time: its labels are large.
+    ticks.store(90_000, Ordering::SeqCst);
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let grant = join(&owner, "r-follow", MemberRole::Reader);
+    let anchor = clock.now_ms();
+    let session = Arc::new(MemberSession::adopt(
+        "r-follow",
+        MemberRole::Reader,
+        &grant,
+        anchor,
+        clock.clone(),
+    ));
+    membership::install_member(Arc::clone(&session));
+    let staleness = squeezefs::ro_coherence::reader_staleness_bound().as_millis() as u64;
+    let qualify = staleness + session.skew_max_ms();
+    let drain = staleness + session.d_purge_ms();
+    ticks.fetch_add(qualify + 1, Ordering::SeqCst);
+    assert_eq!(
+        free_grace::reader_pass_completed(clock.now_ms(), true),
+        None
+    );
+    ticks.fetch_add(drain + 1, Ordering::SeqCst);
+    let old_label = grant.granted_at_owner_ms;
+    assert_eq!(
+        free_grace::reader_pass_completed(clock.now_ms(), false),
+        Some(old_label),
+        "the predecessor's label is acknowledged"
+    );
+    assert!(old_label >= 90_000);
+    free_grace::disarm_owner_plane();
+
+    // The predecessor dies; a SUCCESSOR at the next term arms on ITS OWN
+    // clock — its labels restart far below the predecessor's.
+    let (succ_clock, succ_ticks) = manual_clock();
+    succ_ticks.store(1_000, Ordering::SeqCst);
+    let successor = MembershipOwner::arm(
+        "owner-succ",
+        owner.term() + 1,
+        owner.term(),
+        shipped_clocks(),
+        succ_clock.clone(),
+    )
+    .expect("a successor arms at the bumped term");
+    free_grace::arm_owner_plane(succ_clock.clone(), successor.clocks()).expect("derived bound");
+    // The reader's re-assertion (the round-5 grace law admits it) —
+    // adopted as the member's session, exactly as the renewal loop does.
+    let mut reclaim = JoinRequest {
+        id: "r-follow".to_string(),
+        role: MemberRole::Reader,
+        endpoint: None,
+        pid: std::process::id(),
+        boot: "boot-test".to_string(),
+        prior_epoch: Some(grant.epoch),
+        pr_key: 0,
+        mount: None,
+    };
+    successor.open_grace(Vec::new());
+    let new_grant = match successor.join(reclaim.clone()) {
+        JoinOutcome::Granted(g) => g,
+        other => panic!("the reader's re-assertion is admitted: {other:?}"),
+    };
+    let new_label = new_grant.granted_at_owner_ms;
+    assert!(
+        new_label < old_label,
+        "the successor's label space restarted below the predecessor's ({new_label} < {old_label})"
+    );
+    // The member clock keeps running (the reader's own).
+    let anchor2 = clock.now_ms();
+    let session2 = Arc::new(MemberSession::adopt(
+        "r-follow",
+        MemberRole::Reader,
+        &new_grant,
+        anchor2,
+        clock.clone(),
+    ));
+    membership::install_member(Arc::clone(&session2));
+    assert_eq!(session2.acked_free_epoch(), 0, "a fresh session's word");
+
+    // The same three gates, under the new owner's label.
+    ticks.fetch_add(qualify + 1, Ordering::SeqCst);
+    assert_eq!(
+        free_grace::reader_pass_completed(clock.now_ms(), true),
+        None
+    );
+    ticks.fetch_add(drain + 1, Ordering::SeqCst);
+    assert_eq!(
+        free_grace::reader_pass_completed(clock.now_ms(), false),
+        Some(new_label),
+        "the successor's label is acknowledged from scratch — the predecessor's memo is gone"
+    );
+    assert_eq!(session2.acked_free_epoch(), new_label);
+    assert!(matches!(
+        successor.renew("r-follow", new_grant.epoch, session2.acked_free_epoch()),
+        RenewOutcome::Renewed(_)
+    ));
+    successor.refresh_free_grace_bound();
+    assert_eq!(
+        free_grace::bound(),
+        new_label,
+        "the successor's bound advances with the reader's ack"
+    );
+
+    // A SAME-term re-assertion keeps the ladder: the memo stands and the
+    // label already acknowledged is not re-adopted.
+    reclaim.prior_epoch = Some(new_grant.epoch);
+    let same = match successor.join(reclaim) {
+        JoinOutcome::Granted(g) => g,
+        other => panic!("{other:?}"),
+    };
+    let session3 = Arc::new(MemberSession::adopt(
+        "r-follow",
+        MemberRole::Reader,
+        &same,
+        clock.now_ms(),
+        clock.clone(),
+    ));
+    membership::install_member(Arc::clone(&session3));
+    ticks.fetch_add(qualify + drain + 2, Ordering::SeqCst);
+    assert_eq!(
+        free_grace::reader_pass_completed(clock.now_ms(), true),
+        None
+    );
+    ticks.fetch_add(drain + 1, Ordering::SeqCst);
+    let out = free_grace::reader_pass_completed(clock.now_ms(), false);
+    assert!(
+        out.is_none() || out.is_some_and(|l| l > new_label),
+        "a same-term grant never re-acknowledges a label already acknowledged: {out:?}"
+    );
+    // Consume the renewal-wake permit the promotions stored (lever (b)
+    // carries an ack home at once; no renewal loop runs here) — a poll
+    // consumes it, `enable()` only reports it.
+    if membership::renewal_wake().notified_raw().enable() {
+        squeezefs_ipc::sqz_blocking::block_on(membership::renewal_wake().notified());
+    }
+    free_grace::disarm_owner_plane();
+}
+
 // ---------------------------------------------------------------------------
 // 10 — both derivations, drift-is-red
 // ---------------------------------------------------------------------------

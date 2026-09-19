@@ -136,6 +136,50 @@ installed). New gauge `dlm_custody_renew_retries`. Contract:
 `membership_liveness_tests::a_custody_renewal_at_a_dead_authority_paces_its_dials_and_fences_at_t_self`
 (the flat, shipped shape).
 
+**A membership member that the successor's durable roster cannot name — an
+S5 `-o ro` reader — re-asserts its lease at a successor until the grace
+DEADLINE instead of self-fencing.** (Symmetric PR 12b review round 2,
+Issue 26 — the `sym-crash` fleet's reader fenced at every manager
+failover; an UNARMED S6 surface every layout reaches under
+`SQUEEZEFS_MEMBERSHIP_BIND`.) The failover grace window closed BOTH of its
+halves the moment the last claim-set writer had re-asserted, so a RAM-only
+member (a reader is in no claim set, so it is never among the members the
+window awaits) polling the rendezvous one beat later met "no grace window
+is open": `UnknownLease`, a purge of every cached block, a fresh join —
+and `membership_self_fences` moving on a healthy failover. The window is
+now two halves on one deadline: the fresh-refusal half protects the
+durable roster and still closes early (`membership_grace_remaining_ms`
+reads it, unchanged); the re-assertion half admits a member presenting a
+prior lease epoch until the deadline (the lease TTL, ≥ every member's
+`T_self` — the only bound a RAM-only member's own clock can meet; the trust
+model is unchanged, since a prior epoch is presented only by a member that
+renewed within its own `T_self`). A successor whose predecessor left no
+writer in the claim set opens the same deadline-bounded re-assertion with
+nothing refused. **`membership_self_fences` is flat across a manager
+failover on every member kind**, readers included. Contract:
+`dlm_membership_tests::a_ram_only_members_reclaim_is_admitted_until_the_deadline_after_the_writers_closed_the_window`
+(layout-blind; the `sym-crash` leg asserts the reader per round).
+
+**A reader's freed-offset acknowledgement ladder restarts per owner era.**
+(Symmetric PR 12b round 5 — found by the `sym-crash` leg's new reader
+assertions; a pre-existing §6.8 item-3 defect on every layout under
+`SQUEEZEFS_MEMBERSHIP_BIND`, hidden until now by the reader's self-fence at
+each failover happening to land after the successor's clock had caught up.)
+A freed-offset label is the OWNER's own monotonic instant, so a
+successor's label space restarts near 0 — but the reader's ack ladder kept
+a process-global monotone memo of the highest label it acknowledged under
+the predecessor and adopted no label below it. Under a successor the reader
+therefore acknowledged NOTHING until the successor's clock had run past the
+predecessor's uptime: the successor's `membership_min_acked_free_epoch` sat
+at 0, every deferred free stayed in the grace ring, and the pressure valve
+refused `StorageFull` on a healthy fleet ("readers have not acknowledged
+past label 44556" one failover later). A grant from a NEW owner term now
+resets the ladder (`membership_min_acked_free_epoch` advances under a
+successor within one qualification cycle); a same-term reclaim keeps it —
+one label space. Contract:
+`reader_free_grace_tests::a_new_owner_terms_labels_are_acknowledged_from_scratch`
+(layout-blind).
+
 **A mixed sync/async `scc` bucket acquisition in the KV node loader could
 wedge a mount's two metadata lanes for ever.** (Symmetric PR 12b review
 round 1, Issue 13 — pre-existing on every layout, made ordinary by the

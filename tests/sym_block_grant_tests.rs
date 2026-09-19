@@ -1688,6 +1688,153 @@ async fn an_armed_holders_supply_terms_read_the_window_and_the_clear_population(
     reset_process_state();
 }
 
+/// PR 12b review round 3, Issue 30 — PR 3's bounded-execution law on the
+/// NEW wire word: a peer's declared block-grant window (`WindowDecl`, on
+/// its membership renewal) is judged against the volume's DURABLE block
+/// count BEFORE anything proportional to its integers is walked. Before:
+/// `adopt_declared` walked `start..start+len` with `len: u32` from the
+/// frame — a poisoned `len = u32::MAX` cost the owner ≈ 4 × 10⁹ probes
+/// under the holding's lock on the renewal serve path every other member's
+/// liveness rides (this pin did not return). Now: a range past the
+/// volume, empty, or out of order REFUSES the renewal's whole declaration
+/// (`data_alloc_bitmap_decls_rejected`), nothing is adopted, the writer is
+/// not counted as declared; a well-formed declaration adopts by walking
+/// the PENDING set intersected with each range — the holder's population,
+/// never the peer's word.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_poisoned_window_declaration_is_refused_before_any_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_armed(&uris).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let me = identity_of(&vol);
+    let (holding, _) = take_fresh_lease(&vol, me).await;
+    // A predecessor's grant to writer "w" as the successor's re-hold sees
+    // it: bits SET on the recovered pages, no grant in THIS ledger, the
+    // blocks DEFERRED as leak candidates beside a Live peer page.
+    let g = BlockGrant {
+        start: 200,
+        len: 64,
+    };
+    assert_eq!(holding.bitmap.set_run(g.start, u64::from(g.len)), 64);
+    assert_eq!(holding.defer_leaks(g.start..g.end()), 64);
+    assert_eq!(holding.leaks_pending(), 64);
+    let rejected0 =
+        squeezefs::data_alloc_bitmap::DATA_ALLOC_BITMAP_DECLS_REJECTED.load(Ordering::Relaxed);
+    let adopted0 =
+        squeezefs::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_ADOPTED.load(Ordering::Relaxed);
+    let decl = |ranges: Vec<BlockGrant>| {
+        vec![squeezefs::block_grant::WindowDecl {
+            vol_tag: DATA_TAG,
+            ranges,
+        }]
+    };
+    // (1) The poisoned length: refused, bounded (the pin's own wall is
+    // the witness — the old walk did not return).
+    let t0 = std::time::Instant::now();
+    assert!(
+        !alloc_lease::note_peer_windows(
+            "w",
+            &decl(vec![BlockGrant {
+                start: 0,
+                len: u32::MAX
+            }])
+        ),
+        "a range running past the volume refuses the declaration"
+    );
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(5),
+        "the refusal is decided against the volume, never by walking the peer's integer \
+         ({:?})",
+        t0.elapsed()
+    );
+    // (2) A range ending one past the volume; (3) a start at the volume's
+    // end; (4) a start near u64::MAX (no wrap into the volume); (5) an
+    // empty range; (6) overlapping / unordered ranges.
+    for (label, ranges) in [
+        (
+            "end past the volume",
+            vec![BlockGrant {
+                start: DATA_BLOCKS - 1,
+                len: 2,
+            }],
+        ),
+        (
+            "start at the volume's end",
+            vec![BlockGrant {
+                start: DATA_BLOCKS,
+                len: 1,
+            }],
+        ),
+        (
+            "start near u64::MAX",
+            vec![BlockGrant {
+                start: u64::MAX - 1,
+                len: 4,
+            }],
+        ),
+        ("an empty range", vec![BlockGrant { start: 3, len: 0 }]),
+        (
+            "unordered ranges",
+            vec![
+                BlockGrant { start: 10, len: 4 },
+                BlockGrant { start: 12, len: 4 },
+            ],
+        ),
+    ] {
+        assert!(
+            !alloc_lease::note_peer_windows("w", &decl(ranges)),
+            "{label}: refused"
+        );
+    }
+    assert_eq!(
+        squeezefs::data_alloc_bitmap::DATA_ALLOC_BITMAP_DECLS_REJECTED.load(Ordering::Relaxed),
+        rejected0 + 6,
+        "every refusal counted"
+    );
+    assert_eq!(
+        squeezefs::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_ADOPTED.load(Ordering::Relaxed),
+        adopted0,
+        "nothing adopted from a refused declaration"
+    );
+    assert_eq!(holding.leaks_pending(), 64, "the pending set is untouched");
+    assert!(
+        holding.ledger.grants_of("w").is_empty(),
+        "a refused word grants nothing"
+    );
+    // A refused declaration is no declaration: with "w" the one live peer
+    // the verdict still waits for its word.
+    assert_eq!(
+        holding.converge_deferred(&["w".to_string()]),
+        None,
+        "a refused declaration leaves the writer undeclared"
+    );
+    // (7) The well-formed word — the whole grant plus a range the successor
+    // never deferred (already its own; left alone): adopted exactly the
+    // pending blocks, the verdict then releases nothing (pending 0).
+    assert!(alloc_lease::note_peer_windows(
+        "w",
+        &decl(vec![
+            g,
+            BlockGrant {
+                start: g.end() + 100,
+                len: 8,
+            },
+        ]),
+    ));
+    assert_eq!(
+        squeezefs::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_ADOPTED.load(Ordering::Relaxed),
+        adopted0 + 64
+    );
+    assert_eq!(holding.leaks_pending(), 0);
+    assert_eq!(holding.ledger.grants_of("w"), vec![g]);
+    assert_eq!(holding.converge_deferred(&["w".to_string()]), Some(0));
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
 /// The rebase seam onto PR 7 (round 4): the shared-block index's HOME is
 /// resolved behind ONE function, and PR 8 re-points it to the data
 /// volume's allocation-lease holder's home volume — a held volume's index

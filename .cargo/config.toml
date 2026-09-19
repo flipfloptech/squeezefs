@@ -1,2 +1,13 @@
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-Wl,--no-rosegment"]
+
+# Test binaries poll whole FUSE handler futures inline on libtest's thread
+# (default 2 MiB). The unoptimized build's async state machines are ~10x the
+# release ones: the striped-write path measured 256 KiB release / >2 MiB debug
+# (mem_budget_tests::advisory_integration_phases, 2026-09-19), so a debug
+# frame overflowed where the product keeps 8x headroom. Reaches only what
+# cargo runs (and the daemons those tests spawn); a shipped daemon's threads
+# keep the 2 MiB default. Stacks are committed lazily, so the reservation
+# costs nothing.
+[env]
+RUST_MIN_STACK = "8388608"

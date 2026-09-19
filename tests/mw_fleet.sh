@@ -213,7 +213,7 @@
 #   create [N|N=<n>] [--cowriters K] [--owners=K] [--vm=V]
 #          [--require-host-scoped-subsys]
 #          [--membership[=auto|addr:port]] [--lease-ttl-ms=N] [--multi-writer]
-#          [--symmetric [--writers=K]]
+#          [--symmetric [--writers=K] [--token-readers]]
 #                 build substrate + format + records + mount the fleet
 #                 (refuses if state exists — run teardown first); --vm=V
 #                 boots V sqz-kernel guests after the fleet is up;
@@ -224,7 +224,12 @@
 #                 --writers=K (PR 12b) mounts K more RW daemons of the
 #                 armed set — JOINED WRITERS (indices 60..) through the
 #                 join ladder, no posture knob, N unbounded by design —
-#                 the `sym-crash` / `sym-storm` legs' N-daemon fleet.
+#                 the `sym-crash` / `sym-storm` legs' N-daemon fleet;
+#                 --token-readers (PR 13) mounts the `--read-only`
+#                 members as READ-TOKEN clients (PR 5's posture — the
+#                 `sym-readers` leg's fleet; joiners may then mount in a
+#                 netns: `mount 60 --netns=<delay_ms>`, the `sym-tarx`
+#                 venue).
 #                 Size the data volumes for the kill legs' 16 GiB load
 #                 (SQZ_MWFLEET_OSS_GB=16 — the default 2 × 4 GiB fills
 #                 in ≈ 7 s on the dev box, inside the randomized kill
@@ -921,10 +926,22 @@ mount_member() { # idx [--netns[=<delay_ms>]]
         # GB available (the kernel's contiguous-chunk allocation, not the
         # budget). Compact first — a harness act for the single-box venue.
         echo 1 >/proc/sys/vm/compact_memory 2>/dev/null || true
-        env "${env_args[@]}" "$SQZ" mount "sqmeta://$META_PATHS" "$mnt" \
+        # PR 13 (gate 2's venue): a joiner may mount inside its own netns
+        # so its wire to the manager — the join, the slot acquires, the
+        # extent grants, every shipped step — is shapeable (netem 250 µs
+        # RTT is the `sym-tarx` row); the NVMe fabric and the FUSE mount
+        # are namespace-blind. Its listener binds inside the netns and
+        # `PublishEndpoint` carries the veth address the manager dials.
+        local launch=(env "${env_args[@]}" "$SQZ")
+        if [ "$netns" = "1" ]; then
+            netns_setup "$idx"
+            launch=(nsenter "--net=/run/netns/$(ns_name "$idx")" env "${env_args[@]}" "$SQZ")
+        fi
+        "${launch[@]}" mount "sqmeta://$META_PATHS" "$mnt" \
             --daemon --allow-other --log-file "$log" \
             >"$STATE/m${idx}.mount.out" 2>&1 ||
             die "joined writer $idx mount failed: $(cat "$STATE/m${idx}.mount.out")"
+        [ -n "$netem_ms" ] && netem_set "$idx" "$netem_ms"
     elif [ "$idx" -ge "$COWRITER_BASE" ]; then
         # Rung 9 (the S8 arm): a CO-WRITER member — the DLM S9 posture, the
         # REAL S8 shipping client (every metadata verb ships to the
@@ -991,6 +1008,15 @@ mount_member() { # idx [--netns[=<delay_ms>]]
         [ -n "$netem_ms" ] && netem_set "$idx" "$netem_ms"
     else
         role="reader"
+        # PR 13 (PR 5's §5.7.2 posture): a `--token-readers` fleet's
+        # readers declare the plane — member-reader + token client, every
+        # kernel TTL derived to 0, the manager's published listener dialed
+        # off durable state (never a declared authority). The arm refuses
+        # loud on anything missing (bit 17, the lease, the secret, the
+        # listener), so a token reader that mounted IS one.
+        if [ "${TOKEN_READERS:-0}" = "1" ]; then
+            env_args+=("SQUEEZEFS_SYMMETRIC_META=1")
+        fi
         # Rung 7 (the S6-b venue): a reader may mount inside its own netns
         # so its membership wire is shapeable (netem/partition) — block
         # devices and the FUSE mount are namespace-blind.
@@ -1021,6 +1047,18 @@ mount_member() { # idx [--netns[=<delay_ms>]]
         [ "$posture" = "co-writer" ] ||
             die "co-writer $idx mount_posture='$posture' (want co-writer) — log: $log"
         log "member $idx co-writer posture engaged (CO-WRITER ADMITTED, mount_posture=co-writer)"
+    fi
+    if [ "$role" = "reader" ] && [ "${TOKEN_READERS:-0}" = "1" ]; then
+        # PR 13 engagement: the token arm's own line (it refuses the mount
+        # otherwise) and the R-SYM-4 posture word — a reader that fell back
+        # to the S5 poll would read the derived bound here.
+        grep -q "read under TOKENS from" "$log" ||
+            die "token reader $idx log carries no 'read under TOKENS from' line — the token arm did not engage (log: $log)"
+        local bound
+        bound="$(stat_field "$mnt" reader_staleness_bound_ms)"
+        [ "$bound" = "0" ] ||
+            die "token reader $idx reader_staleness_bound_ms='$bound' (want 0 under tokens — R-SYM-4) — log: $log"
+        log "member $idx token-reader posture engaged (reader_staleness_bound_ms=0)"
     fi
     if [ "$role" = "joiner" ]; then
         # PR 12b engagement: a WRITER that holds no manager lease, its own
@@ -1433,7 +1471,7 @@ verify_owner_fleet() {
 }
 
 create_fleet() {
-    local n="$N_DEFAULT" cowriters=0 owners=0 require_hs=0 vms=0 mw=0 symmetric=0 writers=0 a
+    local n="$N_DEFAULT" cowriters=0 owners=0 require_hs=0 vms=0 mw=0 symmetric=0 writers=0 token_readers=0 a
     local membership="${SQZ_MWFLEET_MEMBERSHIP:-}" lease_ttl_ms="${SQZ_MWFLEET_LEASE_TTL_MS:-}"
     for a in "$@"; do
         case "$a" in
@@ -1451,6 +1489,15 @@ create_fleet() {
         # unbounded by design; the rig's slice starts at JOINER_BASE).
         --writers) die "--writers takes a value (--writers=K)" ;;
         --writers=*) writers="${a#--writers=}" ;;
+        # Symmetric PR 13 (gate 5 / the recalled-reader crash leg): the
+        # fleet's `--read-only` members mount as READ-TOKEN clients
+        # (`SQUEEZEFS_SYMMETRIC_META=1` on the reader — PR 5's §5.7.2
+        # posture: member-reader + a token plane per slot holder, exact at
+        # the next resolve, `reader_staleness_bound_ms == 0`). Without it
+        # the readers are the S5 bounded-staleness pollers PR 10–12b's kill
+        # legs were adjudicated on; recorded in the CONF so a remount
+        # keeps the posture.
+        --token-readers) token_readers=1 ;;
         --cowriters)
             die "--cowriters takes a value (--cowriters K)"
             ;;
@@ -1478,6 +1525,8 @@ create_fleet() {
     [[ "$writers" =~ ^[0-9]+$ ]] || die "--writers=K needs a non-negative integer (got '$writers')"
     [ "$writers" -eq 0 ] || [ "$symmetric" = "1" ] ||
         die "--writers=$writers: joined writers are the SYMMETRIC plane's posture (create ... --symmetric --writers=K) — under the per-volume-owner recipe a second RW mount is --owners; under the S9 recipe a data-only peer is --cowriters"
+    [ "$token_readers" -eq 0 ] || [ "$symmetric" = "1" ] ||
+        die "--token-readers: a read-token client needs the symmetric forest (create ... --symmetric --token-readers) — on a bit-17-absent set the reader's arm refuses loud naming enable-symmetric"
     # PR 8 — the MULTI-OWNER shape's own preconditions, all before anything
     # costly exists.
     [[ "$owners" =~ ^[0-9]+$ ]] || die "--owners=K needs a non-negative integer (got '$owners')"
@@ -1762,6 +1811,8 @@ create_fleet() {
         echo "SYMMETRIC='$symmetric'"
         # PR 12b: the joined writers (indices JOINER_BASE..).
         echo "WRITERS='$writers'"
+        # PR 13: the readers' posture (1 = read-token clients).
+        echo "TOKEN_READERS='$token_readers'"
         # PR 8: the multi-owner shape. `OWNERS_ASSIGNED` flips to 1 only
         # when `volume set-owners` has actually written the assignment —
         # the per-volume mount branches read it, so a create that died

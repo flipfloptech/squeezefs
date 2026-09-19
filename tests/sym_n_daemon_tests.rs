@@ -460,6 +460,175 @@ async fn a_second_daemon_joins_over_the_wire_and_commits_into_its_own_ring() {
     fsck_clean(&uris).await;
 }
 
+/// **PR 13 (found by the `sym-scale` leg's N ladder — a PR 12b defect)**: a
+/// joiner that LEAVES cleanly and REJOINS under the same identity keeps
+/// committing — the manager never grants it an extent a live slot-tree
+/// image sits in. The fleet's second incarnation hit `granted extent
+/// barrier: node … is DIRTY inside an extent the manager just granted`
+/// (EINVAL on its 27th create): a leaf of a tree it inherited back at the
+/// rejoin was handed out again as a fresh grant, so the live image had
+/// reached the manager's free bitmap somewhere between the first
+/// incarnation's release of the slot and its `LeaveAppender`. Pinned as
+/// the whole lifecycle: join → many creates (leaves, refills) → clean
+/// leave → rejoin → many more creates, every acked name present, fsck +
+/// C8 clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clean_leave_and_rejoin_of_one_identity_never_regrants_a_live_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+
+    // Incarnation 1: enough creates that the slot trees span several
+    // leaves and the grant refills over the wire; then the clean leave.
+    let joiner = join(&uris, &venue, &mvol, 1).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let own_dir = joiner
+        .create(shared, "job", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("the joiner's own directory")
+        .ino;
+    let first = create_files(&joiner, own_dir, "a", 900).await;
+    jvol.checkpoint_now().await.unwrap();
+    let refills_1 = jvol.joined_stats().unwrap().wire_extent_grants;
+    assert_must_stay_zero(&jvol, "joiner (incarnation 1)");
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    assert!(
+        matches!(tree0_state(&mvol, SLOT_A).await, Some(SlotState::Unleased { root, .. }) if root.addr != 0),
+        "SLOT_A released with its root: {:?}",
+        tree0_state(&mvol, SLOT_A).await
+    );
+
+    // Incarnation 2: the same identity rejoins over its Free page, takes
+    // its trees back at the first touch and keeps creating — every mint
+    // and refill lands in extents no live image occupies.
+    let joiner = join(&uris, &venue, &mvol, 1).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    assert_eq!(
+        jvol.appender_stats().unwrap().self_recoveries,
+        0,
+        "a rejoin over a Free page recovers nothing"
+    );
+    assert_all_resolve(&joiner, own_dir, &first).await;
+    let second = create_files(&joiner, own_dir, "b", 900).await;
+    jvol.checkpoint_now().await.unwrap();
+    let refills_2 = jvol.joined_stats().unwrap().wire_extent_grants;
+    assert!(
+        refills_1 + refills_2 >= 1,
+        "the row exercised the wire refill ({refills_1} + {refills_2})"
+    );
+    assert_all_resolve(&joiner, own_dir, &first).await;
+    assert_all_resolve(&joiner, own_dir, &second).await;
+    assert_must_stay_zero(&jvol, "joiner (incarnation 2)");
+    assert_must_stay_zero(&mvol, "manager");
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    assert_all_resolve(&manager, own_dir, &first).await;
+    assert_all_resolve(&manager, own_dir, &second).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+/// **PR 13 (found by the `sym-scale` leg — a PR 12b defect, the granted
+/// extents' cache barrier)**: a joiner that OPENS over a non-empty ring-0
+/// window folds the manager's records into its PROJECTION of the
+/// manager's slot-tree leaves, which then read DIRTY at the records' ring
+/// positions (the writer-style replay — `discard_tree_nodes` states it for
+/// tree 0). When the manager later compacts such a leaf, retires its
+/// extent and GRANTS it to the joiner, the joiner's `drop_nodes_in_extents`
+/// met its own projection's dirty node under the granted extent and
+/// refused the grant as "this mount wrote to an image it did not own" —
+/// `EINVAL` on the user's create (the fleet: the second incarnation's 27th
+/// create under the manager's storm). A dirty node of a tree this mount
+/// does not lease is a projection fold, dropped like a clean one; only a
+/// dirty node of a LEASED tree is the defect the barrier refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiners_dirty_projection_of_a_retired_manager_leaf_never_refuses_its_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    // The manager's own tree: many leaves, flushed once, then a window of
+    // records over them that is NOT checkpointed when the joiner opens.
+    let own = manager
+        .create(1, "mgr", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("the manager's directory")
+        .ino;
+    let _first = create_files(&manager, own, "m", 1_200).await;
+    mvol.checkpoint_now().await.unwrap();
+    let _window = create_files(&manager, own, "w", 600).await;
+    // The joiner's open replays ring 0's window into its projection —
+    // dirty images of the manager's leaves at the records' positions.
+    let joiner = join(&uris, &venue, &mvol, 1).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jdir = joiner
+        .create(shared, "job", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("the joiner's directory")
+        .ino;
+    let seed = create_files(&joiner, jdir, "s", 40).await;
+    // The manager compacts every leaf of its own tree (each swap retires
+    // the old image) and checkpoints until the retired extents are back
+    // in the free heap — the lowest addresses of the heap, exactly what
+    // the joiner's next carve is handed.
+    let mslot = squeezefs::meta_backend::kv::record::forest_slot_of_ino(manager.route_ino(own).1);
+    let leaves: Vec<(u8, u64)> = mvol
+        .slot_tree(mslot)
+        .expect("the manager's slot tree")
+        .reachable_node_addrs()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|addr| (0u8, addr))
+        .collect();
+    assert!(
+        leaves.len() >= 3,
+        "a multi-leaf tree ({} nodes)",
+        leaves.len()
+    );
+    let compacted = mvol
+        .defrag_compact_nodes(&leaves)
+        .await
+        .expect("the manager compacts its tree");
+    assert!(compacted >= 1, "{compacted} node(s) compacted");
+    for _ in 0..3 {
+        mvol.checkpoint_now().await.unwrap();
+    }
+    // The joiner keeps creating: its grant refills carve from the heap the
+    // manager just returned those images to. Every create must land.
+    let more = create_files(&joiner, jdir, "j", 1_200).await;
+    assert_all_resolve(&joiner, jdir, &seed).await;
+    assert_all_resolve(&joiner, jdir, &more).await;
+    let jw = jvol.joined_stats().unwrap();
+    assert!(jw.wire_extent_grants >= 1, "the refill travelled the wire");
+    assert_eq!(jw.wire_failures, 0);
+    assert_must_stay_zero(&jvol, "joiner");
+    assert_must_stay_zero(&mvol, "manager");
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
 /// **Own residue** (PR 2's law on a wire region, deliverable 4): the joiner
 /// commits, checkpoints, commits MORE into its window, and dies (dropped
 /// without a shutdown). The same identity's rejoin presents its Live

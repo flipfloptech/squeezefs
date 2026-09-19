@@ -2336,6 +2336,58 @@ async fn the_sharded_sim_parks_and_reclaims_a_dead_shards_members_at_the_cores_a
     );
     assert_eq!(report.census_rows, 64, "`clients` unions the shards");
     assert!(membership::renewal_beat_ms() > 0);
+    // PR 13 (SIM-1's four added legs): the carriage rides every grant (M =
+    // 2 per member per beat), the broadcast recall reaches every holder
+    // and is acked by every one, the free-grace fan-in closes on every
+    // shard, and the death ledger is read by every shard (no cohort
+    // evicted here — `evict_fraction_permille: 0`).
+    assert_eq!(report.carriage_leases, 128 * 2, "M = 2 leases per renewal");
+    assert_eq!(report.recall_readers, 64);
+    assert_eq!(report.recall_acks, 64, "every holder acked the one recall");
+    assert!(report.recall_fanout_us > 0.0);
+    assert!(report.free_grace_fanin_us > 0.0);
+    assert_eq!(report.death_records, 0);
+    assert!(report.death_poll_ms > 0, "the derived ledger poll cadence");
+    reset_process_state();
+}
+
+/// **SIM-1 at the operating point** (design-symmetric-metadata §8 gate 8,
+/// tier (ii) — measured-simulated): 12,500 members over 64 shards, two
+/// beats each with the slot-lease carriage, the free-grace fan-in, the
+/// broadcast recall of one object held by every member, a 1 ‰ reader
+/// cohort's deaths through the ledger sink, shard 0's manager death with
+/// its members parking and reclaiming. `#[ignore]`d: the row is PR 13's
+/// closing record's (`cargo test --release --test sym_block_grant_tests
+/// sim1_at_the_operating_point -- --ignored --nocapture`); the envelope
+/// asserted is the S6-a law (0 journal entries), zero park expiries,
+/// every ack and every shard reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn sim1_at_the_operating_point_12500_members_over_64_shards() {
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let report = run_sharded(
+        SimConfig {
+            clients: 12_500,
+            readers_pct: 50,
+            beats: 2,
+            mode: SimMode::Direct,
+            evict_fraction_permille: 1,
+            failover: true,
+        },
+        64,
+    )
+    .await
+    .unwrap();
+    println!("{}", report.render());
+    assert_eq!(report.journal_entries_delta, 0, "the S6 gate");
+    assert_eq!(report.park_expiries, 0);
+    assert_eq!(report.parked, report.reclaimed);
+    assert_eq!(report.recall_readers, 12_500);
+    assert_eq!(report.recall_acks, 12_500);
+    assert_eq!(report.death_shards_reached, 64);
+    assert!(report.death_records >= 12);
+    assert_eq!(report.carriage_leases, 12_500 * 2 * 2);
     reset_process_state();
 }
 

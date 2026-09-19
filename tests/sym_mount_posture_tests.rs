@@ -1174,6 +1174,17 @@ async fn a_readers_first_resolve_of_a_freshly_dialed_holder_serves_without_a_han
         "the dial's first round was awaited, never refused"
     );
     assert_eq!(default.stats().serve_refusals, 0);
+    // The reader-side Token family FOLDS every plane of the volume (the
+    // manager's + the per-holder ones): `dlm_token_grants` on the reader
+    // ≡ its foreign first touches — gate 5's engagement law — read 1 of
+    // the 2 grants above when the face read the manager's plane alone.
+    let face = squeezefs::meta_ship::token_plane::reader_stats_json(&reader.volumes);
+    assert_eq!(
+        face["dlm_token_grants"][0].as_u64(),
+        Some(2),
+        "one grant from A + one from B: {face}"
+    );
+    assert_eq!(face["dlm_token_cached"][0].as_u64(), Some(2));
     shutdown(&reader).await;
     a.shutdown();
     b.shutdown();

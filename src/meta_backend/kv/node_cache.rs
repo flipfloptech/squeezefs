@@ -3319,10 +3319,20 @@ impl NodeCache {
     /// compaction moved it; a guest leaf the manager retired) — so a mint
     /// or an SMO image written there would meet a stale node under its own
     /// address in RAM and every traversal would restart on the seq
-    /// mismatch for ever (found by the first two-daemon pin). Nothing of
-    /// this mount is ever dirty under a granted extent (it held no image
-    /// of ours): a dirty node here is a defect, refused loud, nothing
-    /// dropped. Returns the nodes dropped.
+    /// mismatch for ever (found by the first two-daemon pin). Nothing this
+    /// mount WRITES is ever dirty under a granted extent (it held no image
+    /// of ours): a dirty node of a tree this mount is the writer of (a
+    /// slot it leases; on the manager an unleased tree it maintains — the
+    /// `verdict_structural` word) is a defect, refused loud, nothing
+    /// dropped. A dirty node of any OTHER tree is a PROJECTION fold, not a
+    /// write (PR 13, found by the `sym-scale` leg): a joiner that opens
+    /// over a non-empty ring-0 window replays the manager's records into
+    /// its images of the manager's leaves, which then read dirty at the
+    /// records' ring positions exactly as [`Self::discard_tree_nodes`]
+    /// states for tree 0 — and the manager compacting such a leaf,
+    /// retiring its extent and granting it is the ordinary lifecycle, not
+    /// a defect: the fold is dropped with the image. Returns the nodes
+    /// dropped.
     pub fn drop_nodes_in_extents(&self, heap_base: u64, extents: &[u64]) -> Result<usize, KvError> {
         if extents.is_empty() {
             return Ok(0);
@@ -3336,8 +3346,23 @@ impl NodeCache {
                 victims.push(Arc::clone(n));
             }
         });
+        let mut projection_folds = 0usize;
         for node in &victims {
-            if node.dirty_floor() != u64::MAX {
+            if node.dirty_floor() == u64::MAX {
+                continue;
+            }
+            let ours = match node.forest_slot() {
+                // Tree 0 and every flat node: the manager's own on the
+                // manager (an unarmed gate reads `Unarmed` — the shipped
+                // one-writer law), a projection on a joined appender.
+                None => !self.lease.is_armed() || self.lease.is_manager(),
+                Some(slot) => matches!(
+                    self.lease.verdict_structural(slot),
+                    crate::slot_lease_core::CommitVerdict::Allowed
+                        | crate::slot_lease_core::CommitVerdict::Unarmed
+                ),
+            };
+            if ours {
                 return Err(KvError::Corrupt(format!(
                     "granted extent barrier: node {:#x} is DIRTY (floor {}) inside an extent the \
                      manager just granted — this mount wrote to an image it did not own",
@@ -3345,6 +3370,14 @@ impl NodeCache {
                     node.dirty_floor()
                 )));
             }
+            projection_folds += 1;
+        }
+        if projection_folds > 0 {
+            log::info!(
+                "granted extent barrier: {projection_folds} dirty PROJECTION node(s) of trees this \
+                 mount does not write dropped with the granted extents (the open's replay fold of \
+                 another appender's ring; their durable home is that ring)"
+            );
         }
         Ok(self.remove_nodes(victims))
     }

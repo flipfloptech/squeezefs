@@ -1131,6 +1131,24 @@ impl TokenHolderPlane {
         }
     }
 
+    /// **The harness's reader half** (PR 13, SIM-1's recall fan-out row):
+    /// the standing poll's body — the next issued frame for `client`, parked
+    /// up to `wait` — without the wire, so `membership_sim` can drive
+    /// 12,500 token holders through ONE plane in one process (`(frame_id,
+    /// objects)`; `None` = nothing issued inside `wait`).
+    pub async fn poll_recall_frame(&self, client: &str, wait: Duration) -> Option<(u64, Vec<u64>)> {
+        match self.serve_poll(client, wait).await {
+            TokenReply::Recall { frame_id, objects } if frame_id != 0 => Some((frame_id, objects)),
+            _ => None,
+        }
+    }
+
+    /// The harness's ack half (see [`Self::poll_recall_frame`]): `client`
+    /// acks `frame_id` exactly as its wire `RecallAck` would.
+    pub fn ack_recall_frame(&self, client: &str, frame_id: u64) {
+        let _ = self.serve_ack(client, frame_id);
+    }
+
     fn serve_ack(&self, client: &str, frame_id: u64) -> TokenReply {
         let now = Instant::now();
         self.last_ack_ns.fetch_max(
@@ -3459,13 +3477,44 @@ pub fn holder_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
     })
 }
 
-/// The reader-side Token family for the stats inode, per volume.
+/// The reader-side Token family for the stats inode, per volume — the
+/// FOLD over every plane the volume reads through: the manager's and the
+/// per-holder ones `token_reader_for` dialed (PR 13: the manager's alone
+/// read `dlm_token_grants` short of the reader's foreign first touches on
+/// every joiner-held object — gate 5's engagement law). Counters sum; the
+/// two posture words (`channel_fresh` / `channel_alive`) read 1 only when
+/// EVERY channel says so — a stale per-holder channel is the reader's
+/// refusal on that holder's objects, and a face that hid it behind the
+/// manager's fresh one would say "fresh" of a reader serving EIO.
 pub fn reader_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
+    let planes_of = |v: &Arc<KvMetaBackend>| -> Vec<Arc<TokenReaderPlane>> {
+        let mut planes: Vec<Arc<TokenReaderPlane>> =
+            v.token_reader().cloned().into_iter().collect();
+        planes.extend(v.reader_holder_planes());
+        planes
+    };
     let per = |f: &dyn Fn(&TokenReaderStats) -> u64| {
         serde_json::Value::Array(
             volumes
                 .iter()
-                .map(|v| v.token_reader().map_or(0, |p| f(&p.stats())).into())
+                .map(|v| {
+                    planes_of(v)
+                        .iter()
+                        .map(|p| f(&p.stats()))
+                        .sum::<u64>()
+                        .into()
+                })
+                .collect(),
+        )
+    };
+    let every = |f: &dyn Fn(&TokenReaderStats) -> bool| {
+        serde_json::Value::Array(
+            volumes
+                .iter()
+                .map(|v| {
+                    let planes = planes_of(v);
+                    u64::from(!planes.is_empty() && planes.iter().all(|p| f(&p.stats()))).into()
+                })
                 .collect(),
         )
     };
@@ -3482,8 +3531,8 @@ pub fn reader_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
         "dlm_token_serve_refusals": per(&|s| s.serve_refusals),
         "dlm_token_channel_rounds": per(&|s| s.channel_rounds),
         "dlm_token_fetch_retries": per(&|s| s.fetch_retries),
-        "dlm_token_channel_fresh": per(&|s| u64::from(s.channel_fresh)),
-        "dlm_token_channel_alive": per(&|s| u64::from(s.channel_alive)),
+        "dlm_token_channel_fresh": every(&|s| s.channel_fresh),
+        "dlm_token_channel_alive": every(&|s| s.channel_alive),
         "dlm_token_grant_sessions": per(&|s| s.grant_sessions),
         "dlm_token_grant_sessions_dialed": per(&|s| s.grant_sessions_dialed),
         "dlm_token_grant_rtt_ns": serde_json::Value::Array(

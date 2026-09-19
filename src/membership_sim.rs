@@ -56,7 +56,7 @@ use crate::membership_wire::{MemberClient, MembershipPlane, MembershipPlaneConfi
 use crate::meta_backend::kv::META_KV_JOURNAL_ENTRIES;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Which plane the harness drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +142,33 @@ pub struct SimReport {
     pub reclaimed: usize,
     /// Parks that outlived `T_park_max` (must be 0 on a healthy failover).
     pub park_expiries: usize,
+    /// PR 13 (SIM-1): slot leases CARRIED on the renewal grants — the
+    /// installed carriage source's words (`M` per member per beat; 0 with
+    /// no source).
+    pub carriage_leases: usize,
+    /// PR 13 (SIM-1, the broadcast shape §5.7.4): token holders of ONE
+    /// object recalled by one commit (0 = leg skipped).
+    pub recall_readers: usize,
+    /// Wall of that recall — issue → every ack observed — µs.
+    pub recall_fanout_us: f64,
+    /// Acks the plane counted for it (must equal `recall_readers`).
+    pub recall_acks: usize,
+    /// PR 13 (SIM-1, §5.5.2): members declared DEAD by their home shard's
+    /// eviction, each reaching the death ledger's sink.
+    pub death_records: usize,
+    /// Worst eviction → sink latency, µs (the record's write; the
+    /// projection's poll cadence is `death_poll_ms`).
+    pub death_sink_us: f64,
+    /// The ledger poll cadence every manager reads the record at, ms — the
+    /// derived checkpoint landing ceiling; propagation bound = sink +
+    /// poll.
+    pub death_poll_ms: u64,
+    /// Shards whose projection read the record (must equal `shards`).
+    pub death_shards_reached: usize,
+    /// PR 13 (SIM-1, §5.7.3's fan-in): wall for every shard's
+    /// `min_acked_free_epoch` to close on a fresh label once every member
+    /// acked it on ONE renewal, µs.
+    pub free_grace_fanin_us: f64,
 }
 
 impl SimReport {
@@ -170,7 +197,27 @@ impl SimReport {
              revoke fan-out: {revoke:.2} µs for {evictions} member(s), {fences} \
              self-fence(s)\n\
              grace completion: {grace:.2} µs (failover re-assertion window)\n\
-             census: {rows} row(s) in {pages} page(s)",
+             census: {rows} row(s) in {pages} page(s)\n\
+             shards={shards} parked={parked} reclaimed={reclaimed} park_expiries={expiries}\n\
+             slot-lease carriage: {carriage} lease word(s) on the grants\n\
+             token recall fan-out: {rreaders} holder(s) of one object recalled in \
+             {rfan:.2} µs, {racks} ack(s)\n\
+             death ledger: {deaths} record(s), sink ≤ {dsink:.2} µs, poll cadence {dpoll} ms, \
+             read by {dshards} shard(s)\n\
+             free-grace fan-in: every shard closed on the label in {fgfan:.2} µs",
+            shards = self.shards,
+            parked = self.parked,
+            reclaimed = self.reclaimed,
+            expiries = self.park_expiries,
+            carriage = self.carriage_leases,
+            rreaders = self.recall_readers,
+            rfan = self.recall_fanout_us,
+            racks = self.recall_acks,
+            deaths = self.death_records,
+            dsink = self.death_sink_us,
+            dpoll = self.death_poll_ms,
+            dshards = self.death_shards_reached,
+            fgfan = self.free_grace_fanin_us,
             mode = self.mode,
             clients = self.clients,
             beats = self.beats,
@@ -448,7 +495,33 @@ pub async fn run(cfg: SimConfig) -> Result<SimReport> {
         parked: 0,
         reclaimed: 0,
         park_expiries: 0,
+        carriage_leases: 0,
+        recall_readers: 0,
+        recall_fanout_us: 0.0,
+        recall_acks: 0,
+        death_records: 0,
+        death_sink_us: 0.0,
+        death_poll_ms: 0,
+        death_shards_reached: 0,
+        free_grace_fanin_us: 0.0,
     })
+}
+
+/// The operating point's rotor size the carriage source answers with
+/// (§1.6: `M = clamp(W / (2 × writers), 1, MINT_SPREAD)` = 2 at 12,500).
+const SIM_CARRIAGE_M: usize = 2;
+
+/// The sim member `i`'s rotor slots — `M` consecutive routing slots off
+/// its index, disjoint across members below `W / M`.
+fn sim_slots(i: usize) -> Vec<(u16, u32)> {
+    (0..SIM_CARRIAGE_M)
+        .map(|k| (((i * SIM_CARRIAGE_M + k) % 65_536) as u16, 1u32))
+        .collect()
+}
+
+/// The member index a sim id (`sim-{i}`) names.
+fn sim_index(id: &str) -> Option<usize> {
+    id.strip_prefix("sim-").and_then(|s| s.parse().ok())
 }
 
 /// **The SHARDED harness** (PR 8, KD-SYM-15 / §5.5.3 — the SIM-1 shape PR
@@ -522,21 +595,167 @@ pub async fn run_sharded(cfg: SimConfig, shards: usize) -> Result<SimReport> {
             )),
         ));
     }
+    // --- the slot-lease carriage (PR 13 — §5.9): every renewal grant
+    //     carries the member's leased slots off the installed source, the
+    //     O(held slots) RAM answer an armed plane installs; the beats below
+    //     are measured WITH it (the carriage is part of the beat's cost).
+    crate::membership::install_slot_lease_carriage_source(Arc::new(|id: &str| {
+        crate::membership::SlotLeaseCarriage {
+            leases: sim_index(id).map(sim_slots).unwrap_or_default(),
+            release_notices: Vec::new(),
+            offered: Vec::new(),
+        }
+    }));
+    let mut carriage_leases = 0usize;
     for _ in 0..cfg.beats {
         for (id, _, shard, session) in &sessions {
             let t0 = Instant::now();
             let outcome = owners[*shard].renew(id, session.epoch(), session.acked_free_epoch());
             latencies.push(t0.elapsed().as_secs_f64() * 1e6);
             match outcome {
-                RenewOutcome::Renewed(grant) => session.renewed(&grant, clock.now_ms()),
+                RenewOutcome::Renewed(grant) => {
+                    carriage_leases += grant.slot_leases_ack.slots.len();
+                    session.renewed(&grant, clock.now_ms())
+                }
                 RenewOutcome::UnknownLease { reason } => {
+                    crate::membership::uninstall_slot_lease_carriage_source();
                     return Err(SqueezefsError::InvalidOperation(format!(
                         "membership harness: live member '{id}' refused: {reason}"
-                    )))
+                    )));
                 }
             }
         }
     }
+    crate::membership::uninstall_slot_lease_carriage_source();
+
+    // --- the free-grace V-fan-in (§5.7.3, §6.8 item 3): a fresh label
+    //     every member acks on ONE renewal; the wall until every shard's
+    //     MIN closes on it is the fan-in's on-change cadence in-process.
+    let label = clock.now_ms().max(1);
+    let free_grace_fanin_us = {
+        let t0 = Instant::now();
+        for (id, _, shard, session) in &sessions {
+            session.ack_free_epoch(label);
+            match owners[*shard].renew(id, session.epoch(), session.acked_free_epoch()) {
+                RenewOutcome::Renewed(grant) => session.renewed(&grant, clock.now_ms()),
+                RenewOutcome::UnknownLease { reason } => {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "membership harness: live member '{id}' refused at the fan-in: {reason}"
+                    )))
+                }
+            }
+        }
+        let behind: Vec<usize> = (0..shards)
+            .filter(|s| owners[*s].min_acked_free_epoch() < label)
+            .collect();
+        if !behind.is_empty() {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "membership harness: shard(s) {behind:?} did not close on label {label} after \
+                 every member acked it"
+            )));
+        }
+        t0.elapsed().as_secs_f64() * 1e6
+    };
+
+    // --- the token recall fan-out (§5.7.4, the broadcast shape): every
+    //     member holds a token on ONE object of one holder plane; one
+    //     commit recalls them all; the readers' half polls and acks through
+    //     the plane's own body (`poll_recall_frame` / `ack_recall_frame`)
+    //     — the plane's cost at N, the wire's RTT being the venue's.
+    let (recall_readers, recall_fanout_us, recall_acks) = {
+        use crate::meta_ship::token_plane::{LeaseVerdict, TokenHolderPlane};
+        let plane = Arc::new(TokenHolderPlane::new());
+        plane.install_lease_oracle(Arc::new(|_: &str| LeaseVerdict::Live));
+        let object = 0x5157_u64;
+        let now = Instant::now();
+        let ids: Vec<&str> = sessions.iter().map(|(id, _, _, _)| id.as_str()).collect();
+        for id in &ids {
+            let _ = plane.lane().try_grant(object, id, now);
+        }
+        let readers = plane.holders(object);
+        let objects = [object];
+        let t0 = Instant::now();
+        let recall = plane.recall_and_wait(&objects);
+        let ack_all = async {
+            // One sweep acks every issued frame (the pass issues one frame
+            // per client at once); the loop re-sweeps until the lane
+            // reports no holder under recall.
+            loop {
+                for id in &ids {
+                    if let Some((frame_id, _)) = plane.poll_recall_frame(id, Duration::ZERO).await {
+                        plane.ack_recall_frame(id, frame_id);
+                    }
+                }
+                if plane.lane().holders_under_recall(object) == 0 {
+                    break;
+                }
+                squeezefs_ipc::sqz_time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        let (union, ()) = futures::join!(recall, ack_all);
+        let wall = t0.elapsed().as_secs_f64() * 1e6;
+        plane.settle(&union);
+        let stats = plane.stats();
+        if stats.timeouts_live != 0 {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "membership harness: {} live recall timeout(s) on the broadcast object",
+                stats.timeouts_live
+            )));
+        }
+        (readers, wall, stats.recall_acks as usize)
+    };
+
+    // --- the death ledger (§5.5.2, §5.9): a cohort of READERS evicted by
+    //     their home shards reaches the installed sink (the record's
+    //     write); every shard then reads the ledger as its projection.
+    let death_ledger: Arc<parking_lot::Mutex<Vec<(crate::membership::DeadMember, Instant)>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (death_records, death_sink_us, death_shards_reached) = if cfg.evict_fraction_permille == 0 {
+        (0, 0.0, 0)
+    } else {
+        let sink_ledger = Arc::clone(&death_ledger);
+        crate::membership::install_death_sink(Arc::new(move |dead| {
+            sink_ledger.lock().push((dead, Instant::now()));
+        }));
+        let want =
+            ((cfg.clients as u64 * cfg.evict_fraction_permille as u64) / 1000).max(1) as usize;
+        // Victims off shard 0 (the failover leg's home shard below).
+        let victims: Vec<(String, usize)> = sessions
+            .iter()
+            .filter(|(_, role, shard, _)| *role == MemberRole::Reader && *shard != 0)
+            .take(want)
+            .map(|(id, _, shard, _)| (id.clone(), *shard))
+            .collect();
+        let mut worst = 0.0f64;
+        for (id, shard) in &victims {
+            let t0 = Instant::now();
+            owners[*shard].evict(id, "membership harness: death ledger leg");
+            let seen = death_ledger
+                .lock()
+                .iter()
+                .rev()
+                .find(|(d, _)| d.id == *id)
+                .map(|(_, at)| at.saturating_duration_since(t0).as_secs_f64() * 1e6);
+            match seen {
+                Some(us) => worst = worst.max(us),
+                None => {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "membership harness: eviction of '{id}' reached no death sink"
+                    )))
+                }
+            }
+        }
+        // Every shard's projection: one read of the ledger names every
+        // record (the manager's poll, in-process).
+        let records = death_ledger.lock().len();
+        let reached = (0..shards)
+            .filter(|_| death_ledger.lock().len() == records)
+            .count();
+        crate::membership::test_clear_death_sinks();
+        (records, worst, reached)
+    };
+    let death_poll_ms = crate::meta_backend::kv::checkpoint::checkpoint_landing_ceiling_derived();
+
     // --- the manager of shard 0 dies: its home-shard members park at
     //     T_self (the S6 grace contract makes every lease reclaimable, so
     //     nothing is poisoned), the successor arms and opens grace, every
@@ -635,5 +854,14 @@ pub async fn run_sharded(cfg: SimConfig, shards: usize) -> Result<SimReport> {
         parked,
         reclaimed,
         park_expiries,
+        carriage_leases,
+        recall_readers,
+        recall_fanout_us,
+        recall_acks,
+        death_records,
+        death_sink_us,
+        death_poll_ms,
+        death_shards_reached,
+        free_grace_fanin_us,
     })
 }

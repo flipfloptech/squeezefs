@@ -42,17 +42,17 @@ _(MET / MISS per row with its engagement gauges; rows fill in as they run.
 
 | Gate | Row | Venue | Verdict | Engagement (the law's gauges) |
 |---|---|---|---|---|
-| 1 | solo re-gate (flat A vs flat B: mdstorm, mount, w_fresh, rr4k, rw4k, remount) | box | _pending_ | `dlm_rpcs == 0`, `meta_kv_forest_*` 0 on flat, Δtripwires 0 |
-| 2 | `sym-tarx` (N = 2, netem 250 µs, the extracting node NOT the manager) | dev → box | _pending_ | `wire_verbs_per_entry` < 0.05, `slot_handovers == 0` |
-| 3 | `sym-scale` N = 1/2/4/8 | dev → box | **N ≤ 4 MET, N = 8 MISS (defect 5)** — see §4 | `appenders == N`, `manager_load_pct`, handovers/ships/rpcs 0 |
-| 3b | `sym-shared-dir` (+ `-ls`) | dev → box | _pending_ | `dir_stripe_flips == 1`, `dir_stripe_ships ≡ foreign creates`, `slot_handovers == 0`; ls: `dlm_token_grants ≡ K + C` |
-| 3c | `sym-foreign-touch` | dev → box | _pending_ | handovers/s, `slot_handover_phase_ns`, a paused live job keeps its tree |
-| 4 | `sym-crash` / `sym-storm` (a)–(f) ×10 from zero | dev (LOCAL by the venue law) | _pending_ | must-stay-0 set; `appender_recoveries ≡ regions of the killed nodes`; acked-loss 0; `fsck_findings == 0`; C8/bitmap drift 0; `replay_dropped_torn == 0` |
-| 5 | `sym-readers` (exactness; 1 × 31 broadcast; `free_grace_hold_ms`) | dev → box | _pending_ | `dlm_recall_fanout ≡ readers`, `reader_staleness_bound_ms == 0`, tokens held on `-o ro` |
+| 1 | solo re-gate (flat A vs flat B: mdstorm, mount, w_fresh, rr4k, rw4k, remount) | box | **OWED to the flip binary** (§8 — the flat path is untouched by every PR 13 change, each behind bit 17 + the knob and pinned per fix; PR 14's B arm is the default-on binary by definition) | `dlm_rpcs == 0`, `meta_kv_forest_*` 0 on flat, Δtripwires 0 |
+| 2 | `sym-tarx` (N = 2, netem 250 µs, the extracting node NOT the manager) | dev → box | **MET locally on every run** (0.85–1.02× of S0; the final binaries 0.96–1.00×; verbs/entry 0.012, handovers 0, `dlm_rpcs` 0 — §3.2); the box row OWED | `wire_verbs_per_entry` < 0.05, `slot_handovers == 0` |
+| 3 | `sym-scale` N = 1/2/4/8 | dev → box | **mechanism MET on every final-binary run** (every N completes, tripwires flat, fsck clean, deleted stays deleted); the create law MET at N ≤ 2 every run and at N = 8 on r5 / r11 (5.8–6.0×), inside a 2.2–6.0× band at N ≥ 4 on the laptop (§3.1); ingest MET at N ≤ 2 / MISS at N ≥ 4 — the single box's data path; **the rate is the box's** | `appenders == N`, `manager_load_pct`, handovers/ships/rpcs 0 |
+| 3b | `sym-shared-dir` (+ `-ls`) | dev → box | **MET locally on every run since defect 14** (one flip at the holder, `shipped ≡ served`, handovers 0; `-ls` = `K + C + 3` tokens, 0 data-leaf reads — §3.3); the box row OWED | `dir_stripe_flips == 1`, `dir_stripe_ships ≡ foreign creates`, `slot_handovers == 0`; ls: `dlm_token_grants ≡ K + C` |
+| 3c | `sym-foreign-touch` | dev → box | **MET locally on every run since defect 10** (LIVE 192 ships / 0 handovers; IDLE moved after 1–2 bursts at 5.5–7.8 ms; PAUSED keeps its tree — §3.4); the box row OWED | handovers/s, `slot_handover_phase_ns`, a paused live job keeps its tree |
+| 4 | `sym-crash` / `sym-storm` (a)–(f) ×10 from zero | dev (LOCAL by the venue law) | **`sym-crash` 10/10 GREEN on five consecutive from-zero runs (attempts 7–11); `sym-storm` per §3.8** | must-stay-0 set; `appender_recoveries ≡ regions of the killed nodes`; acked-loss 0; `fsck_findings == 0`; C8/bitmap drift 0; `replay_dropped_torn == 0` |
+| 5 | `sym-readers` (exactness; 1 × 31 broadcast; `free_grace_hold_ms`) | dev → box | **MET locally on the 1-reader fleet every run** (exact at the next resolve; `recalls ≡ mutations × holders`, `fanout_p99 ≡ readers`, `timeouts_live` 0, hold = the recall RTT 110–126 µs — §3.5); the 1 × 31 broadcast is the box's, OWED | `dlm_recall_fanout ≡ readers`, `reader_staleness_bound_ms == 0`, tokens held on `-o ro` |
 | 6 | format cost at N = 8 / 32 (+ the 46-volume width row) | dev (LOCAL) | **RUN — §3.6**: the width row VALID at N = 1/4/16/46 (mount 0.96 s, reopen 1.39 s at 46; the per-slot extent floor 16 MiB/volume = 736 MiB at 46 vols × 20 k files vs flat 47 MB — R9's number; `A_max` inert on a manager, §7 item 8); the appender rows ≈ 4 MiB (N = 8) / 16.5 MiB (N = 32) of region overhead per volume beside the manager's ring | per-slot extent floor, `slot_tree_bytes` p99 vs `A_max`, ring space, page writes |
-| 7 | relocated walls (terminal-free rate per holder under `w_rewrite` N = 8; the manager verb rate under a 32-mount join storm) | dev → box | _pending_ | `block_free_*`, `manager_verbs_per_s`, `manager_load_pct` |
+| 7 | relocated walls (terminal-free rate per holder under `w_rewrite` N = 8; the manager verb rate under a 32-mount join storm) | dev → box | **laws MET locally on every run** (row (a): `shipped ≡ served ≥ displaced` — 2,723 ≥ 1,792 — ≈ 1,000 frees/s at the holder at 18–46 % CPU; row (b): 7 joiners in 2.2–3.2 s, `/jobs` ships 7/7); the must-stay-0 overrun class it tripped 3× is defect 33's shape (fixed) — the N = 32 join storm is the box's, OWED | `block_free_*`, `manager_verbs_per_s`, `manager_load_pct` |
 | 8 | SIM-1 `SimConfig { clients: 12_500, shards: 64 }` | dev (tier (ii)) | **MET** — §5 | beat p99, eviction fan-out, the free-grace V-fan-in, the death ledger's reach |
-| 8b | fidelity `full` (nvmet; `pr-registrants` ≥ 1,024 + the emulated cap refusal; `sym-join-ladder` N = 3) | dev (LOCAL) | _pending_ | the tier's own verdicts |
+| 8b | fidelity `full` (nvmet; `pr-registrants` ≥ 1,024 + the emulated cap refusal; `sym-join-ladder` N = 3) | dev (LOCAL) | see §3.7 | the tier's own verdicts |
 
 ## 3. The local legs — from-zero counts
 
@@ -1486,7 +1486,18 @@ the rates are the box's).
 
 ## 8. Box footprint
 
-_(pending — every file placed on squeeze-test.)_
+**No file was placed on `squeeze-test` in this rung; no box row ran.**
+The decision (the venue law + the counted-run law): §4.4z's defect 32
+makes the flip wait for one more product rung, and PR 14's own gate-1
+B arm is the DEFAULT-ON binary by definition — every bracket run on this
+tree would be re-run on the flip binary, so the box's minimum-count
+budget is spent there. The box owes, on THAT binary: gate 1's solo
+re-gate A-B-B-A (arm A `3228fcb8`'s rocky8 `release` build at
+`/tmp/pr13-armA/dist/…` stays valid as the pre-program reference), the
+counted brackets of gates 2 / 3 / 3b / 3c / 5 / 7 (the N = 32 reader
+broadcast and join storm included), the fabric reset
+(`/scratch/tmp/cluster_reset_v4.sh`) first, the box left unmounted after.
+Every local rate in §3 is dev-box scoping evidence for those rows.
 
 ## 9. The flip decision (for PR 14)
 

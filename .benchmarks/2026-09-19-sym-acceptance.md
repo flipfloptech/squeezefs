@@ -674,6 +674,55 @@ ring; the manager's union count still reads the STALE 1 (asserted — the
 old executor's word), the maintained count 0, and a reference in a tree
 the manager writes counts on both.
 
+### 4.4o Defect 21 — FIXED (PR 5's reader plane): a single-flight token fetch LOSER could lose the winner's wake — a joiner's `lookup(1)` parked 455 s
+
+Found by `sym-walls` on the defect-20 binary (`/tmp/grok-justin/
+pr13-walls2`): row (a)'s rewrite wedged on joiner m64 — the FUSE watchdog
+named ONE `lookup(1)` overdue at 455 s and climbing while a fresh
+`lookup` of the same name on the same daemon served at once; the census
+was clean (no conveyor window, no pipeline permit, no ring park, every
+other op on m64 served). `TokenReaderPlane::fetch` is single-flight per
+object: the loser reads the in-flight entry, then `n.notified()`, then
+awaits. The winner that FINISHED between the loser's entry read and its
+`notified()` removed the entry and bumped the epoch BEFORE the loser
+registered — and `sqz_notify` registers at creation, so a
+`notify_waiters` before creation is lost: the loser parked for ever
+(the tick re-polls the epoch-gated future alone, which never fires
+again for a gone entry). The register-recheck-await idiom (the
+`long-running` law every other parked wait in the tree already follows):
+register FIRST, re-check the entry is still the winner's
+(`fetching.read_sync(&object, |_, v| Arc::ptr_eq(v, &n))`), await only
+then; gone ⇒ the winner finished ⇒ re-read the cache. Seam
+`TEST_FETCH_LOSER_HOLD` parks the loser exactly in the window. Pin:
+`sym_coherence_tests::a_single_flight_fetch_loser_registers_before_it_
+rechecks_the_winner` — RED at its 5 s bound on the base ordering, green
+with one grant (the loser re-read the cache).
+
+### 4.4p Defect 22 — FIXED (PR 12b's joiner under PR 8's allocation lease): the W1 ladders ran a non-holder's eligible overwrite into the allocator's ERROR-logging gate
+
+The same m64 log: a burst of `W1 in-place sub-block patch refused: this
+armed symmetric writer does not hold the ALLOCATION LEASE …`
+(`plane_gate` from `begin_patch_sole_owner`, reached from
+`try_inplace_rewrite` / `try_sole_owner_patch` during the row's in-place
+rewrite), one ERROR line + one `cowriter_accounting_refusals` — the
+must-stay-≈0 tripwire — per eligible overwrite on every joiner. The
+2026-08-19 mw-fleet storm fix made exactly this class a counted
+DECISION for the CO-WRITER posture (`patch_ineligible_posture`, checked
+before any allocator arm); PR 12b's joiner is a `writer` posture whose
+allocation plane is PER VOLUME (the lease, never the posture word), so
+the posture clause never fired for it. Fix: `BlockAllocator::
+holds_ownership_plane` (the gate's armed question — `alloc_lease::
+holding(vol_tag)` on a grant-armed allocator — answered without its
+refusal), `SoleOwnerVerdict::NonHolder` decided FIRST in
+`DataRouter::sole_owner_verdict` (before the custody clause and before
+any probe), and all three W1 sites take it: the sub-block patch's match,
+the whole-block `try_inplace_rewrite` (which now runs the durable clause
+too — it had relied on the RAM predicate alone on an armed set, PR 7's
+gap), and the dd probe's armed face (one relaxed load unarmed). The gate
+stays defense-in-depth (pinned: reached directly it refuses and counts).
+Pin: `sym_shared_refs_tests::the_w1_ladders_decline_a_non_holders_patch_
+as_a_counted_posture_decision`.
+
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
 `sym-shared-dir-ls` on the defect-16 binary read `meta_kv_node_cache_

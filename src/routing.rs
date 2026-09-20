@@ -1827,6 +1827,25 @@ pub type SharedFreeGate = std::sync::Arc<
         + Sync,
 >;
 
+/// Symmetric PR 13 (defect 27): the HOLDER's ladder for a terminal free of
+/// an offset its RAM refcount map never tracked — `(vol_tag, block_idx) →
+/// the S9 owner-side verdict` (`cowriter::execute_shipped_frees`: the
+/// durable ledger population decides, a population of 0 seeds one
+/// reference and runs the ladder). Wired by `DataRouter::arm_shared_refs`
+/// beside the shared-block gate on an ARMED forest set only.
+pub type UntrackedFreeGate = std::sync::Arc<
+    dyn Fn(
+            u64,
+            u64,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::meta_ship::publish::FreeVerdict>>
+                    + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
 /// The W1 durable clause's verdict ([`DataRouter::sole_owner_verdict`]):
 /// which clause let the in-place patch proceed or declined it — the W1
 /// decision ledger's label (`patch_ineligible_shared` vs
@@ -1992,6 +2011,11 @@ pub struct BackendRouter {
     /// ARMED forest set only (`OnceCell`: flat / unarmed mounts never
     /// gate — one absent-mark probe on the free path).
     shared_free_gate: once_cell::sync::OnceCell<SharedFreeGate>,
+    /// Symmetric PR 13 (defect 27): the holder's ladder for an UNTRACKED
+    /// terminal free (a former lessee's mint — a slot released, handed
+    /// over or recovered to this mount since its RAM census). Wired beside
+    /// the shared gate on an armed set; unarmed the shipped refusal stands.
+    untracked_free_gate: once_cell::sync::OnceCell<UntrackedFreeGate>,
     /// RES-6: the D0 writer-guard fence probe, held so devices published
     /// AFTER `set_meta_backend` (online `volume add-data`, the mount's
     /// per-record registration loop) inherit the same gate. `OnceCell`:
@@ -2560,6 +2584,7 @@ impl BackendRouter {
             block_size,
             read_tier_purge: once_cell::sync::OnceCell::new(),
             shared_free_gate: once_cell::sync::OnceCell::new(),
+            untracked_free_gate: once_cell::sync::OnceCell::new(),
             dma_fence: once_cell::sync::OnceCell::new(),
             volume_records: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
             placement_table: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
@@ -2755,6 +2780,12 @@ impl BackendRouter {
     /// gate (once; `DataRouter::arm_shared_refs` on an armed forest set).
     pub fn install_shared_free_gate(&self, gate: SharedFreeGate) -> bool {
         self.shared_free_gate.set(gate).is_ok()
+    }
+
+    /// Symmetric PR 13 (defect 27): install the holder's untracked
+    /// terminal-free ladder (once; `DataRouter::arm_shared_refs`).
+    pub fn install_untracked_free_gate(&self, gate: UntrackedFreeGate) -> bool {
+        self.untracked_free_gate.set(gate).is_ok()
     }
 
     /// Is the shared-block index's free gate armed on this router? A
@@ -5328,6 +5359,39 @@ impl BackendRouter {
                         allocator.clear_shared(offset);
                     }
                 }
+            }
+        }
+        // Symmetric PR 13 (defect 27): a terminal free at the allocation
+        // HOLDER of an offset its RAM refcount map never tracked — a block
+        // a FORMER lessee minted from its grant window, in a slot released,
+        // handed over or recovered to this mount since its mount-time
+        // census (the RAM map knows its own mints and that census alone).
+        // `begin_free`'s untracked arm is the double-release REFUSAL (an
+        // ERROR per block, `block_untracked_free_refusals`) — here it left
+        // the block SET in the bitmap for ever: every `rm` at the manager
+        // of a file a departed joiner wrote leaked its blocks. The S9
+        // owner ladder already decides exactly this shape for a SHIPPED
+        // free (finding 13: the durable ledger population; 0 ⇒ seed one
+        // reference and run the ladder, > 0 ⇒ non-terminal, already free
+        // ⇒ the refusal) — a local free runs the same ladder through the
+        // installed gate. The gate's own ladder re-enters this function
+        // under the authority-accounting scope, which skips this arm.
+        if !tracked
+            && allocator.block_grant_armed()
+            && allocator.holds_ownership_plane()
+            && !crate::cowriter::authority_accounting_scope_active()
+        {
+            if let Some(gate) = self.untracked_free_gate.get() {
+                let vol_tag =
+                    crate::meta_backend::kv::block_refs::volume_tag(allocator.volume_id());
+                let verdict = gate(vol_tag, offset / allocator.chunk_size()).await?;
+                crate::fuse_client::METRICS
+                    .block_untracked_free_adjudicated
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(matches!(
+                    verdict,
+                    crate::meta_ship::publish::FreeVerdict::Freed
+                ));
             }
         }
         let terminal = allocator.begin_free(offset);
@@ -7972,9 +8036,40 @@ impl DataRouter {
             })
         });
         self.backend_router.install_shared_free_gate(gate);
+        // PR 13 (defect 27): the holder's ladder for an untracked
+        // terminal free — the S9 owner half, run locally.
+        let untracked_hooks = std::sync::Arc::new(RoutedSharedRefHooks {
+            meta: std::sync::Arc::downgrade(mb),
+            backend_router: std::sync::Arc::downgrade(&self.backend_router),
+        });
+        let untracked: UntrackedFreeGate =
+            std::sync::Arc::new(move |vol_tag: u64, block_idx: u64| {
+                let hooks = untracked_hooks.clone();
+                Box::pin(async move {
+                    let (Some(mb), Some(br)) =
+                        (hooks.meta.upgrade(), hooks.backend_router.upgrade())
+                    else {
+                        // Teardown: nothing decides — the shipped refusal.
+                        return Ok(crate::meta_ship::publish::FreeVerdict::Refused);
+                    };
+                    let verdicts = crate::cowriter::execute_shipped_frees(
+                        &br,
+                        &mb,
+                        vol_tag,
+                        &[block_idx],
+                        &crate::cowriter::live_owner_view(),
+                    )
+                    .await?;
+                    Ok(verdicts
+                        .into_iter()
+                        .next()
+                        .unwrap_or(crate::meta_ship::publish::FreeVerdict::Refused))
+                })
+            });
+        self.backend_router.install_untracked_free_gate(untracked);
         log::info!(
             "shared-block index armed (symmetric PR 7): {seeded} SHARED mark(s) seeded, the \
-             terminal-free gate installed"
+             terminal-free gate installed; the holder's untracked-free ladder installed (PR 13)"
         );
         Ok(seeded)
     }

@@ -6150,6 +6150,13 @@ pub struct Metrics {
     /// evidence of a double-release lineage upstream (leak-safe: the block
     /// leaks until fsck C6, it is never handed to two owners).
     pub block_untracked_free_refusals: Align64<AtomicU64>,
+    /// Symmetric PR 13 (defect 27): terminal frees of an offset this
+    /// mount's RAM refcount map never tracked, ADJUDICATED through the
+    /// holder's S9 owner ladder instead of refused — a former lessee's
+    /// mint freed at the mount that holds its slot now (the durable ledger
+    /// population decided; `Freed` / non-terminal / the refusal counted on
+    /// its own gauges inside). 0 on every unarmed mount.
+    pub block_untracked_free_adjudicated: Align64<AtomicU64>,
     /// A corpse's reference RELEASE whose durable record was ALREADY
     /// absent at release time, skipped BEFORE the free funnel (fstests
     /// generic/749 on the 1.2.3 release chain, 2026-09-11): on a
@@ -8825,6 +8832,11 @@ pub struct Metrics {
     /// reference, open grant or in-flight registration names — the dead
     /// incarnation's remainder the next (re-)hold releases. 0 unarmed.
     pub fsck_alloc_bitmap_leak_candidates: Align64<AtomicU64>,
+    /// `fsck_alloc_bitmap_tracked_exempted` — C2's bitmap arm on a
+    /// grant-armed HOLDER (symmetric PR 13, defect 27): referenced offsets
+    /// untracked in RAM but SET in the held allocation bitmap — a former
+    /// lessee's mints — declined as lost. 0 on every unarmed mount.
+    pub fsck_alloc_bitmap_tracked_exempted: Align64<AtomicU64>,
     /// `fsck_inode_plane_window_scoped` — C9/C10 candidates a foreign
     /// appender's un-replayed ring window names, scoped out this pass
     /// (PR 10, review round 2). 0 on a flat volume and a solo forest.
@@ -11761,6 +11773,7 @@ impl SqueezefsFilesystem {
                 "staged_spill_escalations": METRICS.staged_spill_escalations.load(Ordering::Relaxed),
                 "block_double_frees": METRICS.block_double_frees.load(Ordering::Relaxed),
                 "block_untracked_free_refusals": METRICS.block_untracked_free_refusals.load(Ordering::Relaxed),
+                "block_untracked_free_adjudicated": METRICS.block_untracked_free_adjudicated.load(Ordering::Relaxed),
                 "block_release_skipped_no_record": METRICS.block_release_skipped_no_record.load(Ordering::Relaxed),
                 // RECLAIM-ATOMIC
                 "reclaim_destroy_refused_release_failed": METRICS.reclaim_destroy_refused_release_failed.load(Ordering::Relaxed),
@@ -14795,6 +14808,12 @@ impl SqueezefsFilesystem {
                         "fsck_alloc_bitmap_leak_candidates".into(),
                         serde_json::json!(METRICS
                             .fsck_alloc_bitmap_leak_candidates
+                            .load(Ordering::Relaxed)),
+                    );
+                    metrics.insert(
+                        "fsck_alloc_bitmap_tracked_exempted".into(),
+                        serde_json::json!(METRICS
+                            .fsck_alloc_bitmap_tracked_exempted
                             .load(Ordering::Relaxed)),
                     );
                     metrics.insert(

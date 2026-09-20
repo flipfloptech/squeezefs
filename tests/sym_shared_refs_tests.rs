@@ -1360,3 +1360,106 @@ async fn the_w1_ladders_decline_a_non_holders_patch_as_a_counted_posture_decisio
     );
     shutdown(&rig.routed).await;
 }
+
+/// **PR 13 — a terminal free at the allocation HOLDER of a block a FORMER
+/// lessee minted runs the S9 owner ladder instead of the untracked
+/// refusal** (defect 27 — found by `sym-scale`'s fsck oracle from zero on
+/// the defect-24 binary: 2,816 C2 "referenced offset is not
+/// allocator-tracked" at the manager for the departed joiners' ingest
+/// blocks — every block minted from a joiner's grant window is SET in the
+/// holder's bitmap and durably referenced, never in the manager's RAM
+/// refcount map, which knows its own mints and its mount-time census
+/// alone; and `begin_free` on such a block was the double-release
+/// REFUSAL — an ERROR per block, `block_untracked_free_refusals`, the bit
+/// SET for ever: every `rm` at the manager of a file a departed joiner
+/// wrote leaked its blocks). The holder's local free now adjudicates an
+/// untracked offset through `execute_shipped_frees`' ladder (the durable
+/// ledger population: 0 ⇒ seed one reference and free; `block_untracked_
+/// free_adjudicated`), exactly the shipped free's law; fsck's C2 reads a
+/// SET bit in the held bitmap as tracked (`fsck_alloc_bitmap_tracked_
+/// exempted`). RED before: the refusal, the bit SET, the tripwire moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_holders_free_of_a_former_lessees_block_runs_the_owner_ladder_instead_of_refusing() {
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::meta_backend::kv::alloc_lease;
+    let dir = tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let data = data_file();
+    let rig = mount(&uris, data.path(), &Knobs::armed()).await;
+    let tag = rig.tag();
+    // The rig's allocator becomes the volume's allocation HOLDER (PR 8's
+    // arm): grant-armed, the lease held here.
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&rig.routed, &[Arc::clone(&rig.alloc)])
+            .await
+            .expect("the allocation arm"),
+        1
+    );
+    let holding = alloc_lease::holding(tag).expect("held");
+    assert!(rig.alloc.block_grant_armed());
+    // Another writer's allocator on the same data volume, minting from the
+    // holder's grants (the in-process sink) — a JOINER's mint: SET in the
+    // holder's bitmap, untracked in the holder's RAM map.
+    let b = Arc::new(BlockAllocator::new(DATA_VOL).await.unwrap());
+    b.set_capacity_bytes(rig.alloc.capacity_bytes());
+    assert!(b.install_block_grant_arm(
+        tag,
+        alloc_lease::holder_block_grant_sink(rig.vol(), tag, "former-lessee".to_string()),
+    ));
+    let off = b.allocate_block().await.expect("the joiner's mint");
+    let idx = off / rig.alloc.chunk_size();
+    assert!(
+        holding.bitmap.is_set(idx),
+        "premise: SET in the holder's bitmap"
+    );
+    assert_eq!(
+        rig.alloc.refcount(off),
+        None,
+        "premise: untracked at the holder"
+    );
+    // The joiner departed; its file's slot is the holder's now; the
+    // holder unlinks the file — a LOCAL terminal free of the block.
+    let key = rig
+        .router
+        .backend_router
+        .persist_block_key("backend_0", off);
+    let m = &squeezefs::fuse_client::METRICS;
+    let refusals0 = m.block_untracked_free_refusals.load(Ordering::Relaxed);
+    let adjudicated0 = m.block_untracked_free_adjudicated.load(Ordering::Relaxed);
+    let terminal = rig
+        .router
+        .backend_router
+        .free_block_verdict(&key)
+        .await
+        .expect("the free");
+    assert!(
+        terminal,
+        "the owner ladder freed it (population 0 ⇒ seed one reference ⇒ terminal)"
+    );
+    assert_eq!(
+        m.block_untracked_free_adjudicated.load(Ordering::Relaxed),
+        adjudicated0 + 1
+    );
+    assert_eq!(
+        m.block_untracked_free_refusals.load(Ordering::Relaxed),
+        refusals0,
+        "never the double-release refusal"
+    );
+    // The bit CLEARS once the reclaim's `finish_free` lands (the queue is
+    // asynchronous on a file-backed data device).
+    let mut cleared = false;
+    for _ in 0..200 {
+        if !holding.bitmap.is_set(idx) {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        cleared,
+        "the block's bit is CLEAR in the holder's bitmap — no leak"
+    );
+    alloc_lease::disarm_symmetric_roles();
+    shutdown(&rig.routed).await;
+}

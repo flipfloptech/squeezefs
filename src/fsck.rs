@@ -885,6 +885,12 @@ pub struct FsckCounters {
     /// releases (`data_alloc_bitmap_leaks_released`). Informational; the
     /// LOSS direction is the C6 finding.
     pub alloc_bitmap_leak_candidates: u64,
+    /// Symmetric PR 13 (defect 27): C2-lost verdicts DECLINED because the
+    /// referenced offset, untracked in this mount's RAM refcount map, is
+    /// SET in the allocation bitmap this mount HOLDS — a former lessee's
+    /// mint (a slot released, handed over or recovered to this mount);
+    /// the bitmap is the allocation truth on a grant-armed allocator.
+    pub alloc_bitmap_tracked_exempted: u64,
     /// C11: verified orphan tree-7 map RECORDS (per record, not per owner
     /// — the census the design's must-stay-0 `fsck_map_orphan_records`
     /// gauge accumulates). 0 on healthy volumes.
@@ -2252,6 +2258,7 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         counters.pack_ledger_exempted += r.counters.pack_ledger_exempted;
         counters.foreign_lane_exempted += r.counters.foreign_lane_exempted;
         counters.alloc_bitmap_leak_candidates += r.counters.alloc_bitmap_leak_candidates;
+        counters.alloc_bitmap_tracked_exempted += r.counters.alloc_bitmap_tracked_exempted;
         counters.map_orphan_records += r.counters.map_orphan_records;
         counters.map_empty_heads += r.counters.map_empty_heads;
         counters.map_run_foreign_shadows += r.counters.map_run_foreign_shadows;
@@ -2331,6 +2338,7 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     dst.pack_ledger_exempted += fin.pack_ledger_exempted;
     dst.foreign_lane_exempted += fin.foreign_lane_exempted;
     dst.alloc_bitmap_leak_candidates += fin.alloc_bitmap_leak_candidates;
+    dst.alloc_bitmap_tracked_exempted += fin.alloc_bitmap_tracked_exempted;
     // C11 runs ONLY in the finalize (shards skip the map plane, so the
     // shard reports carry zeros — no double count).
     dst.map_orphan_records += fin.map_orphan_records;
@@ -3155,6 +3163,7 @@ fn fold_worker_counters(dst: &mut FsckCounters, src: &FsckCounters) {
     dst.pack_ledger_exempted += src.pack_ledger_exempted;
     dst.foreign_lane_exempted += src.foreign_lane_exempted;
     dst.alloc_bitmap_leak_candidates += src.alloc_bitmap_leak_candidates;
+    dst.alloc_bitmap_tracked_exempted += src.alloc_bitmap_tracked_exempted;
     dst.tenant_overlap_findings += src.tenant_overlap_findings;
     dst.shared_index_drift += src.shared_index_drift;
     dst.stripe_findings += src.stripe_findings;
@@ -5243,6 +5252,24 @@ fn evaluate_allocator_classes(
                 owned & (1u64 << crate::data_alloc_lane::offset_lane_of(off, chunk, w)) == 0
             }
         };
+        // Symmetric PR 13 (defect 27): on a grant-armed allocator whose
+        // allocation lease THIS process holds, the RAM refcount map knows
+        // this mount's own mints and its mount-time census alone — a block
+        // a FORMER lessee minted from its grant window (a slot released,
+        // handed over or recovered to this mount since) is durably
+        // referenced and SET in the holder's bitmap, never in RAM. The
+        // bitmap is the allocation truth there (PR 8 — the free list IS
+        // the bitmap): a referenced offset whose bit is SET is TRACKED, not
+        // lost. Counted apart from the lane exemption.
+        let bitmap_set: Option<Arc<crate::meta_backend::kv::alloc_lease::AllocHolding>> = v
+            .alloc
+            .block_grant_vol_tag()
+            .and_then(crate::meta_backend::kv::alloc_lease::holding);
+        let bitmap_tracked = |off: u64| {
+            bitmap_set
+                .as_ref()
+                .is_some_and(|h| h.bitmap.is_set(off / chunk))
+        };
 
         // Leaked / C3: allocator-side ground truth is mount-session RAM —
         // meaningless on a sharded walk (a shard sees only its residue's
@@ -5304,6 +5331,8 @@ fn evaluate_allocator_classes(
             } else if !sharded && !tracked.contains_key(&off) {
                 if foreign_lane(off) {
                     counters.foreign_lane_exempted += 1;
+                } else if bitmap_tracked(off) {
+                    counters.alloc_bitmap_tracked_exempted += 1;
                 } else {
                     suspects.push(lost(
                         "referenced offset is not allocator-tracked".to_string(),
@@ -7341,6 +7370,8 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.foreign_lane_exempted, Ordering::Relaxed);
     m.fsck_alloc_bitmap_leak_candidates
         .fetch_add(c.alloc_bitmap_leak_candidates, Ordering::Relaxed);
+    m.fsck_alloc_bitmap_tracked_exempted
+        .fetch_add(c.alloc_bitmap_tracked_exempted, Ordering::Relaxed);
     m.fsck_map_orphan_records
         .fetch_add(c.map_orphan_records, Ordering::Relaxed);
     m.fsck_map_empty_heads

@@ -927,8 +927,42 @@ async fn concurrent_storms(
             d.volumes[0].checkpoint_now().await.unwrap();
         }
         let left_dirs: Vec<u64> = dirs.clone();
+        // BEFORE the leave: where the leaving daemon's OWN tree routes each
+        // removed name and what its fold says (the joiner's RAM truth the
+        // release must carry) — compared below against the manager's
+        // post-leave leaf for every name that comes back.
+        // Only the TAIL of each directory's removed set (the loss has always
+        // been the last unlinks): a full walk of 192,000 names delayed the
+        // leave by seconds and the daemon's own cadence flushed the leaf
+        // first — the pin went green (the Heisenbug that says the records
+        // ARE in RAM and a ROUTINE cycle carries them where the LEAVE's do
+        // not).
+        let before: std::collections::HashMap<(u64, String), (u64, u64, String)> = {
+            let mut m = std::collections::HashMap::new();
+            let mut by_dir: std::collections::BTreeMap<u64, Vec<&String>> = Default::default();
+            for (dir, name) in &removed {
+                by_dir.entry(*dir).or_default().push(name);
+            }
+            for (dir, names) in by_dir {
+                for name in names.iter().rev().take(300) {
+                    if let Some(v) = locate_name(&d, &d.volumes[0], dir, name).await {
+                        m.insert((dir, (*name).clone()), v);
+                    }
+                }
+            }
+            m
+        };
         shutdown(&d).await;
         let r = resurrected_at(&manager, &removed).await;
+        for (dir, name, _, _) in r.iter().take(3) {
+            let after = locate_name(&manager, &manager.volumes[0], *dir, name).await;
+            eprintln!(
+                "LEAVE-DIFF {name} in dir {dir}: at the leaving daemon before its leave {:?}; \
+                 at the manager after {:?}  ((leaf addr, leaf node_seq, fold))",
+                before.get(&(*dir, name.clone())),
+                after
+            );
+        }
         let mut by_dir: std::collections::BTreeMap<u64, Vec<String>> = Default::default();
         for (dir, name, _, _) in &r {
             by_dir.entry(*dir).or_default().push(name.clone());
@@ -5898,6 +5932,32 @@ async fn joiner_gone_names(routed: &RoutedMetaBackend, dir: u64, files: &[(Strin
     true
 }
 
+/// Where `routed`'s tree routes the dentry `(dir, name)` and what its RAM
+/// fold says: `(leaf addr, leaf node_seq, "Live" | "Tombstone" | "Absent")`.
+async fn locate_name(
+    routed: &RoutedMetaBackend,
+    kv: &KvMetaBackend,
+    dir: u64,
+    name: &str,
+) -> Option<(u64, u64, String)> {
+    let (_, local_dir) = routed.route_ino(dir);
+    use squeezefs::meta_backend::kv::record::{dentry_key, dentry_name_hash54};
+    let hash = dentry_name_hash54(name.as_bytes(), kv.superblock().hash_seed);
+    let legacy = dentry_key(local_dir, hash, 0);
+    let (tree, fkey) = kv
+        .record_locator(squeezefs::meta_backend::kv::record::TREE_DENTRIES, &legacy)
+        .ok()??;
+    let leaf = tree.resolve_leaf(&fkey).await.ok()?;
+    let snap = leaf.snapshot();
+    let fold = match snap.lookup(&fkey) {
+        Ok(squeezefs::meta_backend::kv::node_cache::LiveLookup::Live(_)) => "Live",
+        Ok(squeezefs::meta_backend::kv::node_cache::LiveLookup::Tombstone) => "Tombstone",
+        Ok(squeezefs::meta_backend::kv::node_cache::LiveLookup::Absent) => "Absent",
+        Err(_) => "Err",
+    };
+    Some((leaf.addr(), leaf.node_seq(), fold.to_string()))
+}
+
 /// ATTRIBUTION of a resurrected name (a removed name a fresh reader still
 /// resolves): the leaf that holds its dentry — the RAM fold for the key
 /// and every frame of its extent on the DEVICE (kind + seq per record) —
@@ -5941,12 +6001,31 @@ async fn attribute_resurrection(
                 squeezefs::meta_backend::kv::node::verify_node_extent(buf, &layout, addr, 0)
                     .unwrap();
             let mut disk: Vec<String> = Vec::new();
+            let mut census: Vec<String> = Vec::new();
             for (fi, view) in loaded.bset_views_newest_first().unwrap().iter().enumerate() {
                 for i in view.find(&fkey) {
                     let r = view.record(i);
                     disk.push(format!("frame{fi}:{:?}@{}", r.kind, r.seq));
                 }
+                // Every frame's kind census: does ANY tombstone frame exist
+                // in this leaf, and how many records of each kind?
+                let (mut puts, mut dels, mut deltas, mut lo, mut hi) =
+                    (0u32, 0u32, 0u32, u64::MAX, 0u64);
+                for i in 0..view.len() {
+                    let r = view.record(i);
+                    match r.kind {
+                        squeezefs::meta_backend::kv::record::RecordKind::Put => puts += 1,
+                        squeezefs::meta_backend::kv::record::RecordKind::Delete => dels += 1,
+                        _ => deltas += 1,
+                    }
+                    lo = lo.min(r.seq);
+                    hi = hi.max(r.seq);
+                }
+                census.push(format!(
+                    "frame{fi}: puts {puts} dels {dels} deltas {deltas} seqs [{lo}, {hi}]"
+                ));
             }
+            eprintln!("ATTRIBUTION per-frame census of {addr:#x} (newest first): {census:#?}");
             // Every frame in the extent RAW (past the walk's stop too):
             // offset, node_seq_at_write, appender id, g.
             let raw = squeezefs::uring_fs::read_at(kv.device_path(), addr, node_size)
@@ -5979,11 +6058,29 @@ async fn attribute_resurrection(
                 pos += padded;
             }
             eprintln!("ATTRIBUTION raw frames of {addr:#x}: {frames:#?}");
+            // The release's own words for the slot: tree 0's state (the
+            // root the departing holder named) and the recorded tail of
+            // THIS leaf (what the holder said the log ended at).
+            let slot = leaf.forest_slot();
+            let (t0_state, recorded_tail) = match slot {
+                Some(s) => (
+                    tree0_state(kv, s).await,
+                    kv.slot_tails(s).await.ok().flatten().map(|(g, tails)| {
+                        (
+                            g,
+                            tails.iter().find(|(a, _)| *a == addr).map(|(_, t)| *t),
+                            tails.len(),
+                        )
+                    }),
+                ),
+                None => (None, None),
+            };
             eprintln!(
                 "ATTRIBUTION {name} in dir {dir}: leaf {addr:#x} (slot {:?}, node_seq {}, \
                          level {}, tail {} of {}) RAM {ram}; DEVICE frames (newest \
-                         first) {disk:?}; residue past the walk: {}",
-                leaf.forest_slot(),
+                         first) {disk:?}; residue past the walk: {}; tree 0 {:?}; recorded \
+                         (g, tail of this leaf, tails) {:?}; tree root {:?}",
+                slot,
                 leaf.node_seq(),
                 leaf.level(),
                 loaded.tail_offset(),
@@ -5992,7 +6089,10 @@ async fn attribute_resurrection(
                     &squeezefs::uring_fs::read_at(kv.device_path(), addr, node_size)
                         .await
                         .unwrap()
-                )
+                ),
+                t0_state,
+                recorded_tail,
+                tree.root()
             );
         }
     }

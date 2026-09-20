@@ -1717,7 +1717,24 @@ impl KvTree {
     /// lock — full logs compact/split through the SMO path. On failure
     /// the floor is restored, so the tail rule keeps respecting the
     /// records this pass could not make durable.
-    pub(crate) async fn checkpoint_flush_node(
+    ///
+    /// **The floor covers only what this pass freezes** (PR 13, the
+    /// eight-writer storm's "deleted stays deleted" loss — an acked-loss
+    /// class): `freeze_locked` answers a PRE-EXISTING frozen delta when
+    /// one is parked (an SMO that froze the node for its fold and then
+    /// failed before the swap — a merge or compaction refused an extent
+    /// under `GrantExhausted`, the joined appender's common case under a
+    /// grant storm), and the open overlay may hold records applied SINCE
+    /// (`mark_dirty` admits an apply while FREEZING; only SUPERSEDED
+    /// refuses). This pass appends the parked delta alone, so taking the
+    /// whole floor left those newer records with `dirty_floor == MAX`:
+    /// never walked by another flush, never clamping the tail, released
+    /// with the tree at the leave — RAM said `Tombstone`, the image said
+    /// `Live`. The floor of the records still in the overlay is restored
+    /// in the same lock window (exact: each record carries its
+    /// `entry_floor`). Public for the harness that pins that law
+    /// (`kv_freeze_wedge_tests`); the checkpoint cycle is its caller.
+    pub async fn checkpoint_flush_node(
         &self,
         ctx: &mut SmoContext,
         addr: u64,
@@ -1732,6 +1749,12 @@ impl KvTree {
             let mut guard = node.lock().write().await;
             let frozen = node.freeze_locked(&mut guard, &self.cache.config().layout)?;
             let floor = node.take_dirty_floor();
+            if frozen.is_some() {
+                if let Some(remaining) = guard.overlay_floor() {
+                    super::META_KV_FLUSH_FLOOR_KEPT.fetch_add(1, Ordering::Relaxed);
+                    node.restore_dirty_floor(remaining);
+                }
+            }
             (frozen, floor)
         };
         if frozen.is_none() {

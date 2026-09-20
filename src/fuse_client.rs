@@ -13324,6 +13324,10 @@ impl SqueezefsFilesystem {
                     load(&meta_kv::META_KV_NODE_FREEZE_SHADOW_DROPPED),
                 );
                 metrics.insert(
+                    "meta_kv_flush_floor_kept".into(),
+                    load(&meta_kv::META_KV_FLUSH_FLOOR_KEPT),
+                );
+                metrics.insert(
                     "meta_kv_node_append_bytes".into(),
                     load(&meta_kv::META_KV_NODE_APPEND_BYTES),
                 );

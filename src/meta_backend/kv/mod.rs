@@ -345,6 +345,16 @@ pub static META_KV_NODE_APPENDS: AtomicU64 = AtomicU64::new(0);
 /// fold regressed. Surfaced as `meta_kv_node_freeze_shadow_dropped`.
 pub static META_KV_NODE_FREEZE_SHADOW_DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Checkpoint flush steps that appended a PRE-EXISTING frozen delta (an
+/// SMO froze the node for its fold and failed before its swap) while the
+/// open delta held newer records — the floor of those records KEPT on
+/// the node (PR 13: taking it made them invisible to every later flush
+/// and the tail; a joined appender's clean leave released a tree whose
+/// RAM fold said `Tombstone` and whose image said `Live`). Engagement of
+/// the fix; 0 on a solo mount whose SMOs never fail mid-way. Surfaced as
+/// `meta_kv_flush_floor_kept`.
+pub static META_KV_FLUSH_FLOOR_KEPT: AtomicU64 = AtomicU64::new(0);
+
 /// Bytes of those appended frames (4 KiB-padded) — the second half of the
 /// §8 row 7 "node writeback counters" accounting. Surfaced as
 /// `meta_kv_node_append_bytes` in PR K7.

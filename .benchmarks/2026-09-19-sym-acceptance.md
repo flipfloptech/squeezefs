@@ -193,47 +193,66 @@ unit contract. With distinct seq spaces a second custodian's frames are
 now `StaleIncarnation` at the frame walk (seen as harmless residue in the
 defect-6 dumps) instead of folded.
 
-### 4.3 Defect 6 — OPEN (PR 12b, P0: "deleted stays deleted" violated across a joiner's CLEAN LEAVE at N = 8)
+### 4.3 Defect 6 — FIXED (KV core, PR K6/§4.6 — an acked-loss class every layout can reach; found at N = 8): a checkpoint flush that appended a PARKED frozen delta took the dirty floor of the records applied since
 
-Found by the eight-writer in-process storm pin (`sym_n_daemon_tests::
-concurrent_storms_on_eight_writers_at_the_fleets_depth`, `--ignored`, ~25 s)
-once it gained the fleet's row boundary — every writer UNLINKS its previous
-round's 24,000 files before the next round — and a "deleted stays deleted"
-arm at three points. **While every daemon is live, no removed name resolves
-anywhere** (each daemon's RAM fold has its tombstones). **After a joiner's
-CLEAN LEAVE** (`leave_joined_regions`: 64 × `transfer_slot_locked` —
-flush-then-transfer — then `LeaveAppender`; no error logged, the ring
-covered), the manager resolves 21–280 of the 192,000 unlinked names at
-`nlink 0`, always the LAST unlinks of ONE leaving daemon's directory (the
-tail of creator `c3`'s range), one or a few leaves' worth; a fresh writer
-open of the volume resolves them too (the durable state lacks the
-tombstones — 89 `C10ZeroNlinkNamed` findings in the offline census). N = 1
-and N = 2 with the same unlink boundary are CLEAN (5 runs); N = 8 fails 6/6.
-Two pre-checkpoints of the leaving daemon before its leave change nothing.
+**The symptom.** The eight-writer in-process storm pin
+(`sym_n_daemon_tests::concurrent_storms_on_eight_writers_at_the_fleets_
+depth`, `--ignored`, ~25 s) with the fleet's row boundary — every writer
+UNLINKS its previous round's 24,000 files before the next round — read,
+after a joiner's CLEAN LEAVE, 21–280 of the 192,000 unlinked names
+resolving at the manager at `nlink 0`, always the LAST unlinks of one
+leaving daemon's directory; N = 1 and N = 2 clean, N = 8 red 5/5 on the
+tree carrying defects 7–14 (the durable state lacked the tombstones: a
+fresh writer resolved the same names — the pin's DUAL verdict, added for
+exactly this attribution). The fleet's `sym-scale` row never showed it.
 
-On-disk attribution (the pin dumps the leaf the released tree routes the
-name to): the leaf's header is the owner's node, its frames are the owner's
-(`appender 3, g 1`: the base bset + the APPEND carrying the name's `Put`),
-and **no `Delete` frame follows** — the tail ends at the `Put`'s frame; in
-two of five runs the extent also carries a stale-incarnation frame of
-another appender PAST the walk (a previous tenant's residue, screened as
-`StaleIncarnation` by the seq-space law — harmless, and the reason defect
-5(a) had to land first: before it those frames FOLDED). `foreign_frames_
-screened` / `appender_fence_breach` stay 0 across the leaves; the
-return-of-a-live-image belt (`extent_return_live_refusals`, landed for this
-attribution at every return site) never fires; `extent_grant_conflicts` 0.
-So the last tombstones the leaving joiner applied in RAM were **never
-appended** to the leaf image its own release named — the joined flush /
-leave sequence (`joined_checkpoint_cycle`'s dirty walk, `checkpoint_flush_
-node`'s freeze + append + `merge_after_flush`, the `flush_slot_clear_of_
-region` post-condition) loses a leaf's final delta under the N = 8
-grant-refusal storm (`ExtentGrant` / `ReturnExtents` refused
-`JournalReserveExhausted` 100–150× per joiner as the manager's ring window
-fills). Not yet attributed to the step; the pin is the reproducer, the
-fleet's `sym-scale` leg gained the same arm (every joiner's product umount,
-then the removed sample judged at the manager and at a remounted joiner —
-§3.1's next row says whether the fleet shows it). **Routed to PR 12b's
-leave / flush law; flip-blocking until fixed** (§9).
+**The attribution** (three instruments, each added to the pin this round):
+(1) the per-frame CENSUS of the leaf the released tree routes the name to
+— its base a compaction output (e.g. 59 puts / 383 dels), ONE appended
+frame of 8 dels, and the remaining tombstones in NO frame; (2)
+`LEAVE-DIFF` — the leaving daemon's own tree, read BEFORE its leave,
+routes the name to the SAME leaf (same address, same `node_seq`) and its
+RAM fold says `Tombstone`; the manager's post-leave read of that leaf says
+`Live` — the tombstone sat in the leaf's OPEN overlay and the leave
+released the tree without appending it; (3) the Heisenbug that named the
+step: a 192,000-name walk before the leave delayed it by seconds, the
+daemon's own cadence flushed the leaf first, and the pin went green.
+
+**The mechanism** (`KvTree::checkpoint_flush_node`, the checkpoint's
+per-node step — flat code, every layout): `freeze_locked` answers a
+PRE-EXISTING frozen delta when one is parked — an SMO froze the node for
+its fold (`freeze_for_smo`, a REAL freeze-swap that leaves the dirty
+floor intact) and then FAILED before its swap: a merge or compaction
+refused an extent (`GrantExhausted` — the joined appender's common case
+under the N = 8 grant storm: 100–150 wire refills refused per joiner per
+run, `merge_after_flush`'s `claim_internal`). Commits keep applying into
+the OPEN delta (`mark_dirty` admits an apply while FREEZING; only
+SUPERSEDED refuses). The next flush step got the parked delta back,
+`take_dirty_floor()` cleared the WHOLE floor, and `append_frozen` wrote
+the parked delta alone — the newer records stayed in the overlay with
+`dirty_floor == MAX`: no later dirty walk saw them, nothing clamped the
+tail, `flush_slot_clear_of_region`'s `tail ≥ frontier` held, the release
+recorded the leaf's tail at the parked frame's end, and the tree moved
+without them (the joiner's RING — their only durable home — released
+with the region). Why flat volumes never showed it: an SMO fails mid-way
+there only on `NoSpace` / `JournalReserveExhausted` (rare); a joiner's
+`GrantExhausted` is routine. Why N = 1/2 never showed it: no grant
+pressure.
+
+**The fix**: in the same lock window, when the freeze returned a delta
+and the open overlay still holds records, the floor of THOSE records is
+restored (`NodeDirty::overlay_floor` — `min(entry_floor, seq)` over the
+open delta, the exact per-record stamp `apply_locked` set) so the node
+stays dirty for them and the next pass appends them; engagement
+`meta_kv_flush_floor_kept` (0 on a solo mount whose SMOs never fail
+mid-way). Pins: `kv_freeze_wedge_tests::a_flush_of_a_parked_frozen_delta_
+keeps_the_floor_of_the_records_applied_since` (the exact shape by hand on
+the flat harness: a parked freeze, newer deletes, the flush step —
+red-first: the node read CLEAN with the deletes only in RAM; green: dirty
+until the second pass, every record on the device) and the eight-writer
+storm pin (`--ignored`, the fleet's depth; §3 lists its from-zero count on
+the fix). The two instruments — `LEAVE-DIFF` and the per-frame census —
+stay in the pin's attribution.
 
 ### 4.4 Defect 7 — FIXED (PR 12b): a joined holder's lease projection is loaded once and never refreshed on its own — every joiner→joiner cross-owner create into a slot a LATER joiner minted was refused
 

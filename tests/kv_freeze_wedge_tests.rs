@@ -262,6 +262,116 @@ async fn a_freeze_refusal_is_a_protocol_error_not_encoding_corruption() {
     );
 }
 
+/// **A flush that appends a PARKED frozen delta keeps the floor of the
+/// records applied since** (PR 13 — the eight-writer storm's "deleted
+/// stays deleted" loss, an acked-loss class reproduced 5/5 at N = 8 and
+/// pinned by `LEAVE-DIFF`: the leaving daemon's RAM said `Tombstone`, the
+/// released leaf's image said `Live`). The shape: an SMO freezes a node
+/// for its fold (`freeze_for_smo` — a REAL freeze-swap) and fails before
+/// its swap (a merge or compaction refused an extent — `GrantExhausted`,
+/// the joined appender's common case under a grant storm), leaving the
+/// frozen delta PARKED with the node's dirty floor intact; commits keep
+/// applying into the OPEN delta (`mark_dirty` admits an apply while
+/// FREEZING). The next `checkpoint_flush_node` gets the parked delta
+/// back from `freeze_locked`, TOOK the whole dirty floor and appended the
+/// parked delta alone — the newer records stayed in the overlay with
+/// `dirty_floor == MAX`: no later flush walked them, nothing clamped the
+/// tail, and a leave released the tree without them. Pinned: after the
+/// first flush the node is STILL DIRTY (its floor = the newer records'),
+/// `meta_kv_flush_floor_kept` counted once, the second flush appends
+/// them, and every record — the parked delta's and the newer ones —
+/// reads back from the DEVICE image.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flush_of_a_parked_frozen_delta_keeps_the_floor_of_the_records_applied_since() {
+    let mut vol = Vol::new();
+    let tree = vol.tree().await;
+    for i in 0..24u64 {
+        tree.insert(&ikey(i), val(i)).await.expect("insert");
+    }
+    tree.flush_dirty(&mut vol.ctx).await.expect("a clean base");
+    // The parked delta: records 100..108 applied, then frozen by hand —
+    // the failed SMO's `freeze_for_smo` (a real freeze-swap; the dirty
+    // floor untouched, exactly as the SMO leaves it).
+    for i in 100..108u64 {
+        tree.insert(&ikey(i), val(i)).await.expect("insert");
+    }
+    let node = tree.resolve_leaf(&ikey(0)).await.expect("leaf");
+    {
+        let mut guard = node.lock().write().await;
+        let frozen = node
+            .freeze_locked(&mut guard, &vol.cache.config().layout)
+            .expect("the SMO's freeze");
+        assert!(frozen.is_some(), "the parked delta");
+    }
+    let floor_before = node.dirty_floor();
+    assert_ne!(
+        floor_before,
+        u64::MAX,
+        "the node is dirty with the parked delta"
+    );
+    // Newer records land in the OPEN delta while the frozen one is parked
+    // (the storm's last unlinks — here: deletes of half the base).
+    for i in 0..12u64 {
+        tree.delete(&ikey(i)).await.expect("delete");
+    }
+    let kept0 = squeezefs::meta_backend::kv::META_KV_FLUSH_FLOOR_KEPT.load(Ordering::Relaxed);
+    // The checkpoint's flush step: appends the PARKED delta …
+    tree.checkpoint_flush_node(&mut vol.ctx, node.addr())
+        .await
+        .expect("the flush step");
+    // … and the node stays DIRTY for the records it did not take.
+    assert_ne!(
+        node.dirty_floor(),
+        u64::MAX,
+        "the floor of the newer records is KEPT (red before: taken with the parked delta's)"
+    );
+    assert_eq!(
+        squeezefs::meta_backend::kv::META_KV_FLUSH_FLOOR_KEPT.load(Ordering::Relaxed),
+        kept0 + 1,
+        "the gauge counts the kept floor once"
+    );
+    // The next pass flushes them; then the node is clean.
+    tree.checkpoint_flush_node(&mut vol.ctx, node.addr())
+        .await
+        .expect("the second flush step");
+    assert_eq!(node.dirty_floor(), u64::MAX, "clean after the second pass");
+    // Every record — the parked delta's and the newer deletes — is in the
+    // DEVICE image: a fresh cache over the same file reads the tree back.
+    let layout = vol.cache.config().layout;
+    let path = vol.cache.config().path.clone();
+    let root = tree.root();
+    let fresh = NodeCache::new(NodeCacheConfig {
+        path,
+        layout,
+        heap_base: 0,
+        budget_bytes: 512 * NODE_SIZE as u64,
+        writeback_delta_bytes: 1024 * 1024,
+    });
+    let reopened = KvTree::open(fresh, TREE_INODES, root, vol.seq.clone())
+        .await
+        .expect("open the tree at its root from the device");
+    for i in 0..12u64 {
+        assert_eq!(
+            reopened.lookup(&ikey(i)).await.expect("lookup"),
+            None,
+            "deleted {i} stays deleted on the device"
+        );
+    }
+    for i in 12..24u64 {
+        assert_eq!(
+            reopened.lookup(&ikey(i)).await.expect("lookup").as_deref(),
+            Some(&val(i)[..])
+        );
+    }
+    for i in 100..108u64 {
+        assert_eq!(
+            reopened.lookup(&ikey(i)).await.expect("lookup").as_deref(),
+            Some(&val(i)[..]),
+            "the parked delta's record {i} is on the device"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // W-B: the forced-compaction window (a full backend — the only public
 // route to `compact_node_forced` is `defrag_compact_nodes`).

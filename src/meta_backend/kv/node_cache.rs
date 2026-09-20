@@ -1216,6 +1216,16 @@ impl NodeDirty {
         self.overlay_bytes
     }
 
+    /// The not-yet-durable floor of the records still in the OPEN delta —
+    /// `min(entry_floor, seq)` over them (the exact per-record stamp
+    /// `apply_locked` set) — `None` when the open delta is empty. The
+    /// checkpoint's flush step keeps this on the node when it appends a
+    /// pre-existing frozen delta the open records are not part of
+    /// ([`super::tree::KvTree::checkpoint_flush_node`]).
+    pub fn overlay_floor(&self) -> Option<u64> {
+        self.overlay.iter().map(|r| r.entry_floor.min(r.seq)).min()
+    }
+
     /// Records currently in the open delta.
     pub fn overlay_len(&self) -> usize {
         self.overlay.len()

@@ -967,6 +967,111 @@ classified it as a ship failure; on the fleet the same refusal was the
 fail-stop). Harness: the "deleted stays deleted" arm now reads ONLY
 `ENOENT` as deleted — an `EIO`/`EAGAIN` from a mount is a red naming it.
 
+### 4.4x Defect 30 — FIXED (PR 6/12b — defect 29's LOCAL arm): a namespace op dispatched LOCALLY whose slot another appender took between the plan and the door surfaced the door's `SlotBusy` as `EAGAIN` to the application
+
+`sym-storm` round 2 from zero on `5b0ec0be` (`pr13-batch10`; every other
+leg GREEN, `sym-crash` 10/10 GREEN — the fourth from-zero 10/10 — and
+round 1 GREEN: 10,608 acked, 14 regions recovered in 47 s, the reader
+arm exact): `mkdir /mnt/sqz-mwfleet/m63/storm-w63-r2` answered
+`Resource temporarily unavailable`; m63's log has exactly one line —
+`Refused { errno: 11, msg: "forest slot 409 is leased by appender 0 (g
+3) — a mutation of a foreign slot ships to its holder … retry (EAGAIN)"
+}`. The schedule: `/` was auto-striped in round 1; the name's stripe
+lives in slot 409, which m62 held at `g 2` and LRU-released two seconds
+earlier (`slot 409 released by appender 3` at 13:28:19 in a wave of ≈ 40
+releases per joiner — round 1's stripe and directory slots past the page
+budget after the recovery and rejoin); the manager first-touched it at
+`g 3`; m63's projection still read it UNLEASED, so `spans_foreign_slot`
+said "local" and the create took the plain path — its commit door's wire
+first touch (`joined_acquire_slot`) lost to the manager, LEARNT the
+holder into the projection (PR 12b's `SlotRefused` arm), and returned
+`KvError::SlotBusy` → `EAGAIN` straight to `mkdir(2)`. Defect 29 made a
+SHIPPED step's `SlotBusy` re-dispatch; the LOCAL step's twin was never
+retried anywhere. Fix: `RoutedMetaBackend::redispatch_once_on_slot_
+moved` at the four namespace verbs' trait entries (`create`/`mkdir`
+through `create_with_rdev_preset`'s non-preset arm, `unlink`/`rmdir`
+(`unlink_body`), `link` (`link_body`), `rename` (around `rename_body`
+inside the lease loop)): the door refuses BEFORE ring admission and any
+node lock (nothing applied; a fresh mint burned — §4.8's law), and its
+reply taught the projection the holder, so the op run again reads the
+slot foreign and takes the cross-owner arm — ONE re-run, counted on
+`xv_cross_owner_op_slot_moved_redispatches`; a second refusal is the
+retryable class the caller sees. Pin `sym_n_daemon_tests::a_locally_
+dispatched_create_whose_slot_the_manager_took_is_redispatched_through_
+the_cross_owner_arm` (the joiner's projection reads the seeded slot
+unleased, the manager first-touches it, the joiner's create — RED:
+`EAGAIN "forest slot 4 is leased by appender 0"`; GREEN: lands at the
+manager after one re-dispatch, the next `mkdir` into it ships on its
+first run).
+
+### 4.4y Defect 31 — FIXED (PR M6's pending-times drain under PR 4's slot leases): one parked refinement on an ino whose slot had MOVED refused the manager's every drain — every `fsync` of the manager's own files answered `EAGAIN`
+
+The same round's manager log: `kv pending-times drain failed on
+/dev/nvme2n1: forest slot 474 is leased by appender 3 (g 2)` — 519 WARNs
+in 8 s at the drain cadence — and **70 `FUSE Fsync failed for ino …`**
+with the same text: the manager's `dd conv=fsync` files were REFUSED
+their fsync (the acked-writes oracle counts only fsynced names, so it
+read no loss; the manager's writes were not durable-on-demand for the
+rest of the round). Mechanism: `drain_pending_times_now` stages every
+parked refinement of the volume into ONE `KvTx`; PR 4's door judges the
+transaction by its records' slots and refuses the WHOLE batch on one
+foreign slot (`SlotBusy`), so one refinement on an ino whose slot moved
+to another appender (the pending map is RAM — a slot handover, an LRU
+release or a dead appender's recovery moves the slot and leaves the
+refinement behind) wedged every later drain until a remount emptied the
+map. Fix, two laws: (a) **the flush-then-transfer drains the departing
+slot's refinements FIRST** (`transfer_slot_locked` step 0, before the
+gate goes `Releasing` — after it the door would park the drain's commit
+on this very handover): the ordinary path leaves nothing behind; (b)
+**the drain PARTITIONS by slot** — a refinement whose slot another
+appender leases is retired and counted (`meta_kv_times_echo_foreign_
+dropped`, 0 on every unarmed mount), never staged, and the own
+refinements beside it commit. Pin `sym_n_daemon_tests::a_released_slots_
+pending_times_are_drained_first_and_a_foreign_slots_are_dropped_not_
+wedged` (RED before on both laws: `pending_times_len() == 1` after the
+release; `Err(SlotBusy)` from the drain with the own refinement never
+durable).
+
+### 4.4z Defect 32 — FOUND, NOT FIXED HERE (PR 6/12's owed record-level metanode arm; a FLIP BLOCKER): a file's `setattr` / `setxattr` / DATA WRITE from a mount that does not lease the file's slot is refused or silently not durable
+
+Found by a scoping probe on the live fleet while attributing defects
+30/31 (not by a gate — no leg mutates a foreign-slot FILE; the legs'
+cross-owner ops are the namespace verbs, which PR 6 ships). Joiner m60
+`mkdir /probe-a && echo hello > /probe-a/f60 && sync -f` (the directory
+and the file in m60's slot); from joiner m61: `chmod 640 /probe-a/f60`
+→ **`ENOENT`**; `touch /probe-a/f60` → **`ENOENT`**; `setfattr -n user.x
+-v 1 /probe-a/f60` → **`EOPNOTSUPP`**; `dd … conv=fsync,notrunc` → the
+write acked, `dd: closing output file: No such file or directory` (the
+fsync's publish refused), m61's own view 8,201 bytes, **m60's and the
+device's 6 bytes**; `echo appended >> /probe-a/f60` → **rc 0 and the bytes
+gone** (no fsync, the close's error unread by the shell). The namespace
+half beside it is exact: `echo x > /mnt/…/m61/probe-a/f61` (a create INTO
+m60's directory) lands and reads at m60. The design states the arm
+twice — the door's own refusal text ("a mutation of a foreign slot ships
+to its holder — the metanode arm; PR 6/12") and §5.10's row **"`write` to
+a FOREIGN-owned file (holder live): 1 custody grant + 1 publish ship per
+layout publish"** — and AGENTS carried it as owed from PR 5 ("the
+metanode ship for a foreign slot's mutation (PR 6/12)") until PR 12b's
+owed list, which no longer names it: an owed item fell off the ledger,
+and PR 9 built the custody GRANT at the slot holder without the PUBLISH
+ship that makes the grant useful. What exists: the S8 `MetaShipRouter`
+verbs (`setattr`/`setxattr`/`removexattr`), the S9 publish plane
+(`PublishClient` → `PublishService` under the owner's custody scope) and
+PR 12's per-holder endpoint binding — all keyed today on the S8 `OwnerMap`
+by VOLUME, which PR 12's `arm_authority_planes` sets all-local under the
+plane (`dlm_rpcs == 0` by construction). The fix shape: `daemon_verb_
+router` and the publish shipper resolve a FOREIGN-slot ino's holder
+through PR 6's `step_home` (tree 0's lessee + the endpoint table) and
+ship the record-level verbs there; the served side applies under the
+holder's lease and door, recalling the object's tokens (the writer's own
+included) — the row §5.10 already prices at 3.6 verbs/MiB. Its venue is
+this suite's two-backend fixture (a joiner's `setattr`/`write` on the
+manager's file, and the reverse). **Not built in this rung**: a rung-sized
+item (two shippers re-keyed by slot holder, the served publish's custody
+composition with PR 9's grant, the un-share of PR 7 beside it), stated
+here as the FIRST flip blocker (§9) — the flip cannot ship `chmod` of a
+colleague's file answering `ENOENT` and `>>` losing bytes.
+
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
 `sym-shared-dir-ls` on the defect-16 binary read `meta_kv_node_cache_

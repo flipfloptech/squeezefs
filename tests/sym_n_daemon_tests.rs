@@ -1978,6 +1978,233 @@ async fn a_stale_holder_view_at_the_guards_re_resolves_and_lands_the_create() {
     shutdown(&manager).await;
 }
 
+/// **Defect 30 (PR 13; PR 6/12b's local arm of defect 29)** — found by the
+/// fleet's `sym-storm` round 2 from zero: a joiner's `mkdir` into the
+/// striped `/` read the name's stripe slot UNLEASED in its projection (the
+/// previous lessee had just LRU-released it), took the LOCAL create path,
+/// and its commit door's wire first touch lost to the manager, which had
+/// first-touched the slot a moment earlier; the door surfaced the
+/// manager's `SlotRefused { holder: 0 }` as `EAGAIN` to `mkdir(2)` — the
+/// round died. The schedule here is the same and legal: the joiner's
+/// projection reads the slot unleased (it was released before the join),
+/// the manager first-touches it, the joiner's create is dispatched locally.
+/// RED before: `EAGAIN "forest slot 4 is leased by appender 0"`. GREEN: the
+/// door's refusal LEARNT the holder, the op re-ran ONCE through the
+/// cross-owner arm (`xv_cross_owner_op_slot_moved_redispatches` + 1) and
+/// the child resolves at the manager.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_locally_dispatched_create_whose_slot_the_manager_took_is_redispatched_through_the_cross_owner_arm(
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "d")]).await;
+    let d = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let j2 = join(&uris, &venue, &mvol, 2).await;
+    assert!(
+        matches!(
+            j2.volumes[0].slot_leases().unwrap().table.resolve(SLOT_A),
+            squeezefs::slot_lease_core::Resolved::Unleased { .. }
+        ),
+        "the premise: the joiner's projection reads the directory's slot UNLEASED"
+    );
+    // The manager first-touches the slot AFTER the joiner's projection was
+    // loaded (a tree-0 control entry in ring 0 the joiner has not read).
+    let _ = create_files(&manager, d, "m", 1).await;
+    assert!(
+        matches!(
+            mvol.slot_leases().unwrap().table.resolve(SLOT_A),
+            squeezefs::slot_lease_core::Resolved::Holder { holder: 0, .. }
+        ),
+        "the manager leases the slot now"
+    );
+    assert!(
+        matches!(
+            j2.volumes[0].slot_leases().unwrap().table.resolve(SLOT_A),
+            squeezefs::slot_lease_core::Resolved::Unleased { .. }
+        ),
+        "the joiner's projection is STALE — still unleased"
+    );
+    let mvenue_ep = venue.endpoint();
+    j2.volumes[0]
+        .slot_leases()
+        .expect("armed")
+        .holders
+        .set_endpoint(0, &mvenue_ep);
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(&j2),
+            "node-j2",
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    let redispatches0 =
+        squeezefs::meta_backend::crossvol_tx::cross_owner_stats().op_slot_moved_redispatches;
+    let child = j2
+        .create(d, "after-the-touch", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("the create lands through the cross-owner arm, never EAGAIN")
+        .ino;
+    assert_eq!(
+        squeezefs::meta_backend::crossvol_tx::cross_owner_stats().op_slot_moved_redispatches,
+        redispatches0 + 1,
+        "exactly one re-dispatch after the door's SlotBusy"
+    );
+    assert!(
+        matches!(
+            j2.volumes[0].slot_leases().unwrap().table.resolve(SLOT_A),
+            squeezefs::slot_lease_core::Resolved::Holder { holder: 0, .. }
+        ),
+        "the door's wire refusal taught the joiner the holder"
+    );
+    assert_eq!(
+        manager
+            .lookup_dentry_exact_unguarded(d, "after-the-touch")
+            .await
+            .expect("the holder reads its tree")
+            .map(|(i, _)| i),
+        Some(child),
+        "the child was inserted at the manager (the slot's holder)"
+    );
+    // The mkdir shape of the fleet's failure — a directory into the same
+    // (now foreign) slot — lands on the first run: the projection knows.
+    j2.create(d, "sub", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("a mkdir into the foreign directory ships on its first run");
+    assert_eq!(
+        squeezefs::meta_backend::crossvol_tx::cross_owner_stats().op_slot_moved_redispatches,
+        redispatches0 + 1,
+        "no second re-dispatch: the learnt holder routes the next op"
+    );
+    shutdown(&j2).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
+/// **Defect 31 (PR 13; PR M6's pending-times drain under PR 4's slot
+/// leases)** — found beside defect 30 on the same fleet round: the
+/// manager's `kv pending-times drain failed … forest slot 474 is leased by
+/// appender 3` at every tick, and every `fsync` of the manager's OWN
+/// files answered `EAGAIN` — the drain commits every parked refinement
+/// of the volume as ONE transaction, and one ino whose slot had moved to
+/// another appender refused the whole batch at the door, for ever (the
+/// map is RAM: only a remount emptied it). Two laws: (a) a slot's parked
+/// refinements are DRAINED before its release (the flush-then-transfer's
+/// step 0 — while the door still admits them; RED before: the refinement
+/// outlived the lease, `pending_times_len() == 1` after the release); (b)
+/// a refinement whose slot another appender leases at the drain is
+/// DROPPED and counted (`meta_kv_times_echo_foreign_dropped`), and the
+/// own refinements beside it commit (RED before: `Err(SlotBusy)`, the own
+/// refinement never durable).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_released_slots_pending_times_are_drained_first_and_a_foreign_slots_are_dropped_not_wedged(
+) {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "d")]).await;
+    let d = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    // The manager first-touches the slot and parks a refinement on the
+    // DIRECTORY (an object in the slot by construction — a child may mint
+    // into the rotor; the SETATTR-echo absorber's park, a second past the
+    // record).
+    let _ = create_files(&manager, d, "m", 1).await;
+    let f = d;
+    let local_f = manager.route_ino(f).1;
+    assert_eq!(
+        squeezefs::meta_backend::kv::record::forest_slot_of_ino(local_f),
+        SLOT_A,
+        "the premise: the refined object lives in the released slot"
+    );
+    let base = manager.getattr(f).await.expect("the record").mtime;
+    let later = base + 1_000_000_000;
+    mvol.park_times_refinement(local_f, later, later);
+    assert_eq!(
+        mvol.pending_times_len(),
+        1,
+        "the premise: one parked refinement"
+    );
+    let dropped0 =
+        squeezefs::meta_backend::kv::META_KV_TIMES_ECHO_FOREIGN_DROPPED.load(Ordering::Relaxed);
+    // (a) The release drains the slot's refinement FIRST.
+    mvol.release_slot_handover(0, SLOT_A)
+        .await
+        .expect("the manager releases the slot to unleased");
+    assert_eq!(
+        mvol.pending_times_len(),
+        0,
+        "the slot's refinement was drained before the release, not left behind"
+    );
+    assert_eq!(
+        manager.getattr(f).await.expect("the record").mtime,
+        later,
+        "the refinement is DURABLE (the map is empty; the record carries it)"
+    );
+    assert_eq!(
+        squeezefs::meta_backend::kv::META_KV_TIMES_ECHO_FOREIGN_DROPPED.load(Ordering::Relaxed),
+        dropped0,
+        "nothing was dropped on the ordinary path"
+    );
+    // (b) A joiner first-touches the slot; the manager parks a STALE
+    // refinement on the file (a times-only echo through its image of the
+    // tree) beside a refinement on its OWN file.
+    let j1 = join(&uris, &venue, &mvol, 1).await;
+    let _ = create_files(&j1, d, "j", 1).await;
+    assert!(
+        matches!(
+            mvol.slot_leases().unwrap().table.resolve(SLOT_A),
+            squeezefs::slot_lease_core::Resolved::Holder { holder: 1, .. }
+        ),
+        "the joiner leases the slot now"
+    );
+    let own = manager
+        .create(1, "own", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("the manager's own file")
+        .ino;
+    let own_base = manager.getattr(own).await.expect("the record").mtime;
+    let own_later = own_base + 2_000_000_000;
+    mvol.park_times_refinement(manager.route_ino(own).1, own_later, own_later);
+    mvol.park_times_refinement(local_f, later + 1_000_000_000, later + 1_000_000_000);
+    assert_eq!(mvol.pending_times_len(), 2);
+    let drained = mvol
+        .drain_pending_times_now()
+        .await
+        .expect("the drain commits the own refinement and drops the foreign one — never SlotBusy");
+    assert_eq!(drained, 1, "exactly the own refinement was made durable");
+    assert_eq!(
+        mvol.pending_times_len(),
+        0,
+        "the map is empty after the drain"
+    );
+    assert_eq!(
+        squeezefs::meta_backend::kv::META_KV_TIMES_ECHO_FOREIGN_DROPPED.load(Ordering::Relaxed),
+        dropped0 + 1,
+        "the foreign slot's refinement was dropped, counted"
+    );
+    assert_eq!(
+        manager.getattr(own).await.expect("the record").mtime,
+        own_later,
+        "the own refinement is durable"
+    );
+    // The fsync path's drain is the same function: a second drain with an
+    // empty map is a no-op that touches no gate.
+    assert_eq!(
+        mvol.drain_pending_times_now().await.expect("empty drain"),
+        0
+    );
+    shutdown(&j1).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
 /// **Own residue** (PR 2's law on a wire region, deliverable 4): the joiner
 /// commits, checkpoints, commits MORE into its window, and dies (dropped
 /// without a shutdown). The same identity's rejoin presents its Live

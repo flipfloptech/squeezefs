@@ -277,6 +277,12 @@ static XV_CO_GUARD_STALE_RERESOLVES: AtomicU64 = AtomicU64::new(0);
 /// plan and the apply) and the initiator re-resolved and re-dispatched
 /// (PR 13, defect 29; `xv_cross_owner_step_slot_moved_retries`).
 static XV_CO_STEP_SLOT_MOVED_RETRIES: AtomicU64 = AtomicU64::new(0);
+/// Namespace ops dispatched LOCALLY whose commit door answered `SlotBusy`
+/// (the slot read unleased or ours at the plan and another appender
+/// held it at the door) and were re-dispatched ONCE through the
+/// cross-owner arm (PR 13, defect 30; `xv_cross_owner_op_slot_moved_
+/// redispatches`).
+static XV_CO_OP_SLOT_MOVED_REDISPATCHES: AtomicU64 = AtomicU64::new(0);
 /// Guard scopes this holder parked for a remote initiator.
 static XV_CO_GUARDS_PARKED: AtomicU64 = AtomicU64::new(0);
 /// Parked scopes released by the lease-expiry sweep, not their initiator
@@ -523,6 +529,9 @@ pub struct CrossOwnerStats {
     /// PR 13 (defect 29): shipped steps re-dispatched after a holder's
     /// `SlotBusy` (the slot moved between the plan and the apply).
     pub step_slot_moved_retries: u64,
+    /// PR 13 (defect 30): locally dispatched namespace ops re-dispatched
+    /// through the cross-owner arm after the door's `SlotBusy`.
+    pub op_slot_moved_redispatches: u64,
     /// Scopes parked for remote initiators (holder side).
     pub guards_parked: u64,
     /// **Must stay 0**: scopes the lease-expiry sweep released.
@@ -546,6 +555,7 @@ pub fn cross_owner_stats() -> CrossOwnerStats {
         guard_rpcs: XV_CO_GUARD_RPCS.load(Ordering::Relaxed),
         guard_stale_reresolves: XV_CO_GUARD_STALE_RERESOLVES.load(Ordering::Relaxed),
         step_slot_moved_retries: XV_CO_STEP_SLOT_MOVED_RETRIES.load(Ordering::Relaxed),
+        op_slot_moved_redispatches: XV_CO_OP_SLOT_MOVED_REDISPATCHES.load(Ordering::Relaxed),
         guards_parked: XV_CO_GUARDS_PARKED.load(Ordering::Relaxed),
         guard_expiries: XV_CO_GUARD_EXPIRIES.load(Ordering::Relaxed),
     }
@@ -593,6 +603,10 @@ pub fn cross_owner_stats_json() -> serde_json::Map<String, serde_json::Value> {
     out.insert(
         "xv_cross_owner_step_slot_moved_retries".into(),
         s.step_slot_moved_retries.into(),
+    );
+    out.insert(
+        "xv_cross_owner_op_slot_moved_redispatches".into(),
+        s.op_slot_moved_redispatches.into(),
     );
     out.insert(
         "xv_cross_owner_guards_parked".into(),
@@ -2385,11 +2399,20 @@ async fn apply_or_ship_step_retrying(
     }
 }
 
-/// The refusal a shipped step earns at a holder whose commit door no
-/// longer leases the slot (`KvError::SlotBusy` — the EAGAIN class naming
-/// the lessee): the slot moved between the plan and the apply.
-fn is_slot_moved_refusal(e: &SqueezefsError) -> bool {
+/// The refusal a step earns at a commit door that does not lease the
+/// slot (`KvError::SlotBusy` — the EAGAIN class naming the lessee): the
+/// slot moved between the plan and the apply. A shipped step's at its
+/// holder (defect 29); a LOCAL step's at this mount's own door (defect
+/// 30 — the plan read the slot unleased or ours, the door's first touch
+/// lost to another appender, whose identity the door learnt).
+pub(crate) fn is_slot_moved_refusal(e: &SqueezefsError) -> bool {
     e.to_errno() == libc::EAGAIN && e.to_string().contains("is leased by appender")
+}
+
+/// Count one locally dispatched op re-dispatched through the cross-owner
+/// arm after its door's `SlotBusy` (defect 30).
+pub(crate) fn note_op_slot_moved_redispatch() {
+    XV_CO_OP_SLOT_MOVED_REDISPATCHES.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The intent's key ino: `step0`'s slot's local 0 when step 0 is local

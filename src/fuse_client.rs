@@ -13653,6 +13653,10 @@ impl SqueezefsFilesystem {
                     "meta_kv_times_echo_drained".into(),
                     load(&meta_kv::META_KV_TIMES_ECHO_DRAINED),
                 );
+                metrics.insert(
+                    "meta_kv_times_echo_foreign_dropped".into(),
+                    load(&meta_kv::META_KV_TIMES_ECHO_FOREIGN_DROPPED),
+                );
                 // PR M2 (design-metadata-throughput §5.4 D4.a): journal
                 // entries per commit_tx construction site — the named-
                 // committer decomposition of `meta_kv_journal_entries`

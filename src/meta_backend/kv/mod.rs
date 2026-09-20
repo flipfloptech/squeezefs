@@ -556,6 +556,19 @@ pub static META_KV_TIMES_ECHO_DRAIN_COMMITS: AtomicU64 = AtomicU64::new(0);
 /// Surfaced as `meta_kv_times_echo_drained`.
 pub static META_KV_TIMES_ECHO_DRAINED: AtomicU64 = AtomicU64::new(0);
 
+/// Pending refinements DROPPED because their ino's forest slot is leased
+/// by another appender at the drain (symmetric PR 13, defect 31): the
+/// slot moved out from under a parked refinement — the ordinary path
+/// drains a slot's refinements BEFORE its release (`transfer_slot_
+/// locked`), so this is the belt (a stale echo through a recovered or
+/// projected image; a slot recovered from a dead appender). A foreign
+/// refinement cannot be committed here (the door refuses the whole
+/// batch, and before this counter existed one such ino wedged the
+/// volume's every drain — every fsync of the manager's own files
+/// answered `EAGAIN` until the map was emptied by a remount). Surfaced
+/// as `meta_kv_times_echo_foreign_dropped`; 0 on every unarmed mount.
+pub static META_KV_TIMES_ECHO_FOREIGN_DROPPED: AtomicU64 = AtomicU64::new(0);
+
 /// PR M9 (design-metadata-throughput §5.7 D7.a): point lookups served
 /// straight from the **fold-forward overlay head** — the materialized
 /// folded value riding the newest open-delta record of the key, kept

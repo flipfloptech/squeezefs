@@ -7280,6 +7280,19 @@ impl KvMetaBackend {
                 self.path.display()
             )));
         }
+        // 0. The slot's parked pending-times refinements are committed
+        // while the door still admits them (defect 31): after step 1 the
+        // gate parks a commit of the slot on THIS handover's completion,
+        // and after the transfer the records are another appender's — a
+        // refinement left behind could only be dropped at the next drain.
+        // Best-effort like every drain (µs-grade time polish).
+        if let Err(e) = self.drain_pending_times_of_slot(slot).await {
+            log::debug!(
+                "meta volume {}: pending-times drain of slot {slot} before its release failed \
+                 ({e}); the refinements it could not commit are dropped at the next drain",
+                self.path.display()
+            );
+        }
         // 1. Releasing FIRST: the gate stops new commits at the door
         // before the flush takes any node lock (the loom-pinned order),
         // then the door is drained — the release's half of the Dekker
@@ -14006,6 +14019,43 @@ impl KvMetaBackend {
     /// cadence (cap crossings wake it early), by the fsync/unmount
     /// durability paths, and by tests.
     pub async fn drain_pending_times_now(&self) -> Result<u64> {
+        self.drain_pending_times_scoped(None).await
+    }
+
+    /// [`Self::drain_pending_times_now`] for the refinements of ONE forest
+    /// slot — the flush-then-transfer's first step (symmetric PR 13,
+    /// defect 31): a slot's parked refinements are this holder's records
+    /// and the door still admits them; after the release they are another
+    /// appender's and the drain can only drop them. A no-op on a flat or
+    /// unarmed volume (no slot's records ever leave it).
+    pub(super) async fn drain_pending_times_of_slot(
+        &self,
+        slot: super::record::ForestSlot,
+    ) -> Result<u64> {
+        self.drain_pending_times_scoped(Some(slot)).await
+    }
+
+    /// Whether a pending refinement on local ino `ino` belongs to a slot
+    /// ANOTHER appender leases — a refinement this mount can no longer
+    /// commit (the door refuses the whole batch). Unarmed: never.
+    fn pending_times_foreign(&self, ino: Ino) -> bool {
+        let Some(plane) = self.slot_leases() else {
+            return false;
+        };
+        let Some(set) = self.appenders.as_ref() else {
+            return false;
+        };
+        let slot = super::record::forest_slot_of_ino(ino);
+        matches!(
+            plane.table.resolve(slot),
+            crate::slot_lease_core::Resolved::Holder { holder, .. } if !set.owns_region(holder)
+        )
+    }
+
+    async fn drain_pending_times_scoped(
+        &self,
+        only_slot: Option<super::record::ForestSlot>,
+    ) -> Result<u64> {
         let mut total = 0u64;
         loop {
             // Snapshot up to a batch of inos (scan stops at the cap) —
@@ -14017,10 +14067,34 @@ impl KvMetaBackend {
             // so the old gate-first order counted a false un-routed local
             // commit on EVERY co-writer fsync.
             let mut batch: Vec<Ino> = Vec::new();
+            let mut foreign: Vec<Ino> = Vec::new();
             self.pending_times.iter_sync(|k, _| {
+                if only_slot.is_some_and(|s| super::record::forest_slot_of_ino(*k) != s) {
+                    return true;
+                }
+                // Defect 31: a refinement whose slot another appender
+                // leases is retired here, never staged — one such ino in
+                // the batch refused the WHOLE drain at the door, for ever.
+                if self.pending_times_foreign(*k) {
+                    foreign.push(*k);
+                    return true;
+                }
                 batch.push(*k);
                 batch.len() < PENDING_TIMES_DRAIN_BATCH
             });
+            if !foreign.is_empty() {
+                for ino in &foreign {
+                    self.retire_pending_times(*ino);
+                }
+                super::META_KV_TIMES_ECHO_FOREIGN_DROPPED
+                    .fetch_add(foreign.len() as u64, Ordering::Relaxed);
+                log::debug!(
+                    "meta volume {}: dropped {} pending-times refinement(s) on inos whose slot \
+                     another appender leases (meta_kv_times_echo_foreign_dropped)",
+                    self.path.display(),
+                    foreign.len()
+                );
+            }
             if batch.is_empty() {
                 return Ok(total);
             }

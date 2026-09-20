@@ -997,6 +997,23 @@ impl RoutedMetaBackend {
         if !self.stripes_armed(v) {
             return Ok(None);
         }
+        // The directory-parent MEMO first (PR 13 fix round 1 — the fleet's
+        // storm round 8: the reverse scan below walks EVERY slot tree of
+        // the volume, a joiner's PROJECTIONS of slots other appenders
+        // lease included, and one whose root the lessee had recycled
+        // exhausted the traversal budget — `restarts [root-seq] = 256` on
+        // a leased slot's tree no refresh heals (KD-SYM-3) — so the
+        // explicit flip of the joiner's OWN fresh directory was refused
+        // `EINVAL`). A stripe has NO ordinary name — its only dentries
+        // are its directory's markers — so a memo hint naming this ino
+        // under an ordinary name settles the question without a scan;
+        // inos are never reused (§4.8), so a directory that once had a
+        // name is never a stripe. Every directory mint feeds the memo.
+        if let Some((_, name)) = self.dir_parents.get(&maybe_stripe) {
+            if !is_marker_name(&name) {
+                return Ok(None);
+            }
+        }
         // Dentry values carry GLOBAL child inos — the scan is by the
         // global ino.
         let Some(local_parent) = self.volumes[v].find_parent_of_child(maybe_stripe).await? else {

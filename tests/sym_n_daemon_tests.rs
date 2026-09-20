@@ -1559,6 +1559,66 @@ async fn a_foreign_create_into_a_striped_directory_reads_the_stripes_record_at_i
     shutdown(&manager).await;
 }
 
+/// **PR 13 fix round 1 — the explicit flip of a mount's OWN fresh directory
+/// walks no projection** (found by the fix-round storm's round 8 from zero
+/// on `16408a2f`: a rejoined joiner's `setfattr user.squeezefs.stripes` on
+/// the round directory it had just made was refused `EINVAL` — the flip's
+/// stripe check ran the reverse dentry scan over EVERY slot tree of the
+/// volume, its PROJECTIONS of slots other appenders lease included, and
+/// slot 10's tree, whose root its lessee had recycled, exhausted the
+/// traversal budget (`restarts [root-seq] = 256`, a leased slot's tree no
+/// refresh heals — KD-SYM-3); the leg died at 7/10 GREEN). A stripe has NO
+/// ordinary name, so the directory-parent memo — fed at every directory
+/// mint now — settles "is this a stripe?" for a directory this mount made
+/// without a scan (`stripe_parent_dir`). Pinned: a joiner's `mkdir` + its
+/// explicit flip move `meta_parent_scans` by 0 (RED before: +1, the scan
+/// over the projections) and the map lands. The cold-directory case (a
+/// memo miss — a directory another incarnation made) keeps the scan and
+/// stays record §7 item 1's owed divert-aware form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_explicit_flip_of_a_joiners_own_fresh_directory_walks_no_projection() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, _dirs) = seeded_volume(dir.path(), &[(SLOT_A, "a")]).await;
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    // The manager holds a few slots the joiner will only project.
+    let _ = create_files(&manager, 1, "m", 4).await;
+    mvol.checkpoint_now().await.unwrap();
+    let j = join(&uris, &venue, &mvol, 1).await;
+    let d = j
+        .create(1, "storm-w1-r1", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("the joiner's own directory")
+        .ino;
+    let scans0 = squeezefs::fuse_client::METRICS
+        .meta_parent_scans
+        .load(Relaxed);
+    j.stripe_dir(d, 4)
+        .await
+        .expect("the explicit flip of an own fresh directory lands");
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .meta_parent_scans
+            .load(Relaxed),
+        scans0,
+        "the flip's stripe check read the parent memo, never the reverse scan over the projections"
+    );
+    assert!(
+        j.stripe_map(d)
+            .await
+            .expect("map")
+            .is_some_and(|m| m.stripes.len() == 4),
+        "the map landed"
+    );
+    shutdown(&j).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
 /// **A joiner's `stat` of a striped directory folds the stripes' records
 /// as their HOLDER states them** (PR 13, defect 24 — found by `sym-scale`
 /// N = 8 from zero on the defect-23 binary: the manager auto-striped `/`

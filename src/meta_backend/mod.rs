@@ -1781,7 +1781,7 @@ impl RoutedMetaBackend {
     /// PR 13b's): on an ARMED volume an ino whose slot another appender
     /// leases refuses `setattr` / `setxattr` / `removexattr` / a data
     /// write / a layout publish LOUD with the typed
-    /// [`SqueezefsError::ForeignSlotFileMutation`] (`EOPNOTSUPP`, naming
+    /// [`crate::error::SqueezefsError::ForeignSlotFileMutation`] (`EOPNOTSUPP`, naming
     /// the rung, the slot and its holder), BEFORE any read or write of the
     /// record — never `ENOENT` for a file that exists (the local commit's
     /// miss in the projection, defect 32's `chmod`/`touch` face), never an
@@ -3878,7 +3878,12 @@ impl RoutedMetaBackend {
                 self.mirror_volume_failure(target_v_idx);
             }
             let made = out?;
-            if is_dir && striped.is_some() {
+            // Every directory mint feeds the parent memo (a hint): the
+            // stripe check reads it before any reverse scan (PR 13 fix
+            // round 1 — `stripe_parent_dir`), so a mount's own fresh
+            // directory never walks its projections to learn it is not a
+            // stripe.
+            if is_dir {
                 self.note_dir_parent(made.ino, logical_parent, name);
             }
             Ok(made)

@@ -3364,7 +3364,8 @@ $out"
                 # its status inside the condition — a bare `timeout … stat`
                 # under `set -e` exited the leg silently right here (the
                 # round-3 re-runs' `rc 1` with no line after the fsck).
-                if timeout 60 stat "$(mnt_of "$reader_idx")/storm-w$idx-r$round" >/dev/null 2>&1; then
+                local stat_err=""
+                if stat_err="$(timeout 60 stat "$(mnt_of "$reader_idx")/storm-w$idx-r$round" 2>&1 >/dev/null)"; then
                     src=0
                 else
                     src=$?
@@ -3374,6 +3375,12 @@ $out"
                 elif [ "$src" = "0" ]; then
                     stale=$((stale + 1))
                     echo "STALE: m$reader_idx still resolves storm-w$idx-r$round" >>"$rowdir/stale-r$round.txt"
+                elif ! echo "$stat_err" | grep -q "No such file"; then
+                    # Only ENOENT is "deleted": an EIO / EAGAIN here is a
+                    # daemon that cannot answer (the round-1 run: a joiner
+                    # whose volumes FAIL-STOPPED read every removed name as
+                    # "gone" and the leg counted it green — defect 29).
+                    die "round $round: stat of removed storm-w$idx-r$round through m$reader_idx failed with something other than ENOENT: $stat_err"
                 fi
             done
         done

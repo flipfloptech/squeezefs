@@ -931,6 +931,42 @@ counts it. Pin: `sym_n_daemon_tests::a_token_reader_follows_a_not_holder_
 redirect_to_the_lessee` — the joiner's slots granted AFTER the reader's
 last poll, its file resolves at the reader without a poll (RED: `EIO`).
 
+### 4.4w Defect 29 — FIXED (PR 6 under PR 12b): a shipped step's `SlotBusy` at a holder whose slot had just moved to the INITIATOR was classified as a local device error — the initiator FAIL-STOPPED both volumes
+
+`sym-storm` round 1 from zero on `649d80f7` (`pr13-batch9`; `sym-crash`
+10/10 GREEN before it): the "deleted stays deleted" arm read
+`storm-w64-r1` still resolving through SEVEN mounts — the rejoined m64's
+`rm -rf` of its recovered round directory had FAILED, and m64's own
+`stat` answered `EIO` ("Metadata volume 0 is disabled"), which the arm
+counted as "gone". m64's log: `cross-volume transaction … failed at step
+0 of 2 (forest slot 679 is leased by appender 5 (g 3) — a mutation of a
+foreign slot ships to its holder … EAGAIN) — volume(s) [0, 1] are
+fail-stopped` — appender 5 IS m64. The directory's slot 679 had been
+recovered to the manager at m64's death; m64's removals into it shipped
+to the manager, whose dominance rule (defects 9/10's window, fed by the
+served ships) handed the slot to the dominating requester — m64 itself —
+mid-plan (`slot 679 released by appender 0 (g 2)` one line before); the
+manager's commit door then answered the shipped step `SlotBusy { 679,
+holder 5 }`, and the initiator's classifier `is_ship_failure` RE-RESOLVED
+the step's home to decide the class — which now read `Local` — so the
+shipped refusal was taken for a local mid-plan device error, the S3.5
+lattice latch fired and both volumes fail-stopped (`crossvol_tx_midplan_
+escalations`); every later op at m64 read `Metadata volume 0 is
+disabled`. Fix: (i) `apply_or_ship_step_retrying` — a holder's
+`SlotBusy` at a SHIPPED step is defect 11's class at the step (the slot
+moved between the plan and the apply): re-resolve it at the manager and
+dispatch again, locally when it is ours now, to the new holder otherwise,
+bounded at 2 (`xv_cross_owner_step_slot_moved_retries`); (ii) a step's
+failure is classified by the mode it was DISPATCHED in (read before the
+dispatch), never by re-resolving its home after the fact — in `execute`
+and in the roll-forward; `is_ship_failure` is deleted. Seam `TEST_XV_
+SERVE_SLOT_BUSY_ONCE`; pin `sym_cross_owner_tests::a_shipped_step_
+refused_slot_busy_at_its_holder_is_redispatched` (RED: `EAGAIN` with the
+intent left open — the fixture's home does not move, so the base
+classified it as a ship failure; on the fleet the same refusal was the
+fail-stop). Harness: the "deleted stays deleted" arm now reads ONLY
+`ENOENT` as deleted — an `EIO`/`EAGAIN` from a mount is a red naming it.
+
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
 `sym-shared-dir-ls` on the defect-16 binary read `meta_kv_node_cache_
@@ -969,6 +1005,13 @@ past its 2-tick margin under 64 creator threads + 8 daemons on the throttling
 the box row trips it too it is a PR 14 item (derive the margin from the
 measured pass wall); the sym-scale leg reports it per row in the VERDICT
 column (per-row deltas — a previous row's count never bleeds into the next).
+On the final binary's from-zero batches the class moved to `sym-walls`
+row (a) — seven joiners rewriting 7 GB into zram over nvmet-tcp at once:
+attempt 5 +1 on m61, attempt 9 **+1 on m61 at 1,105 ms (5 ms past the
+ceiling)**, attempts 7 and 8 none; `sym-scale` N = 8 read 0 on every
+final-binary run. The two laws of the row (the free wall, the join storm)
+MET on every run; the row's verdict is RED by the must-stay-0 set, and
+the reading is the box's.
 
 ### 4.6 Harness findings
 

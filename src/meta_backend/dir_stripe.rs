@@ -889,9 +889,24 @@ impl RoutedMetaBackend {
     /// own-slot parent and every unarmed mount take the local read
     /// verbatim (`token_serve` answers `None` for them).
     async fn key_parent_nlink(&self, parent: Ino) -> Result<Option<u32>> {
-        let (v, local) = self.route_ino(parent);
+        Ok(self.stripe_record(parent).await?.map(|rec| rec.nlink))
+    }
+
+    /// A STRIPE's record as its HOLDER states it — `None` for no record.
+    /// The ONE read every per-stripe probe of a striped directory runs
+    /// (PR 13, defect 24 — the `stat D` fold and the rmdir's count probe
+    /// read every stripe through `read_inode_value_routed`, this mount's
+    /// PROJECTION of a slot another appender leases: the projection's
+    /// root recycled under the lessee's compaction and re-granted, and
+    /// every `stat /` of a striped root on a joiner spun the traversal
+    /// budget — `sym-scale` N = 8, `EIO` on the storm's create). `getattr`
+    /// rides the writer's read divert (the holder's token plane, exact
+    /// until recalled); an own-slot stripe and every unarmed mount take
+    /// the local read verbatim.
+    async fn stripe_record(&self, stripe: Ino) -> Result<Option<Inode>> {
+        let (v, local) = self.route_ino(stripe);
         match self.volumes[v].getattr(local).await {
-            Ok(rec) => Ok(Some(rec.nlink)),
+            Ok(rec) => Ok(Some(rec)),
             Err(SqueezefsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
@@ -2056,8 +2071,9 @@ impl RoutedMetaBackend {
         let mut extra_links: u64 = 0;
         let (mut mtime, mut ctime) = (inode.mtime, inode.ctime);
         for stripe in &map.stripes {
-            let (sv, slocal) = self.route_ino(*stripe);
-            let Some(rec) = self.volumes[sv].read_inode_value_routed(slocal).await? else {
+            // The stripe's record at its HOLDER (defect 24 — never this
+            // mount's projection of a foreign slot).
+            let Some(rec) = self.stripe_record(*stripe).await? else {
                 continue;
             };
             if rec.nlink >= 2 {
@@ -2386,8 +2402,9 @@ impl RoutedMetaBackend {
         }
         let mut stripe_counts = Vec::with_capacity(map.stripes.len());
         for stripe in &map.stripes {
-            let (sv, slocal) = self.route_ino(*stripe);
-            let n = match self.volumes[sv].read_inode_value_routed(slocal).await? {
+            // Exact under the exclusive guards travelling to the stripe's
+            // holder — read THERE (defect 24), never off a projection.
+            let n = match self.stripe_record(*stripe).await? {
                 Some(r) if r.nlink == 2 || r.nlink == 0 => r.nlink,
                 Some(r) => {
                     log::debug!(

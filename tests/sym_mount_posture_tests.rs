@@ -1360,6 +1360,55 @@ async fn a_token_reader_follows_a_manager_failover_to_the_successors_listener() 
         "the face carries the re-point: {face}"
     );
 
+    // **The reader's CONTROL-class xattr listing reads its own projection**
+    // (the same leg's next gate): the fleet worker re-discovers the
+    // successor's coordinator through `mount_registrations` — `listxattr(1)`
+    // + `getxattr` of the `client:` records — and on a token reader the
+    // divert served the token's CARRIED names alone, so the reader saw no
+    // registration at all ("no coordinator endpoint published yet" for
+    // ever; its census shard never re-enrolled). The successor's
+    // registration carries its job endpoint; the reader lists it.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    successor.volumes[0]
+        .setxattr_internal(
+            ROOT,
+            "client:pr13-successor-client",
+            format!(
+                "{{\"ts\":{ts},\"pid\":{},\"job_endpoint\":\"10.0.0.9:4242\"}}",
+                std::process::id()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("the successor's registration (the mount heartbeat's shape)");
+    successor.volumes[0]
+        .checkpoint_now()
+        .await
+        .expect("the successor's checkpoint");
+    let out = rv.revalidate_reader().await.expect("the reader polls");
+    assert!(out.advanced);
+    let names = rv.listxattr(ROOT).await.expect("the reader lists ino 1");
+    assert!(
+        names.iter().any(|n| n == "client:pr13-successor-client"),
+        "a token reader lists the CONTROL names off its projection: {names:?}"
+    );
+    let regs = rv.mount_registrations().await;
+    assert!(
+        regs.iter().any(|r| r.id == "pr13-successor-client"
+            && r.job_endpoint.as_deref() == Some("10.0.0.9:4242")),
+        "the registration is discoverable on the reader: {regs:?}"
+    );
+    assert_eq!(
+        squeezefs::cluster_wire::discover_endpoint(&reader)
+            .await
+            .as_deref(),
+        Some("10.0.0.9:4242"),
+        "the fleet worker's discovery finds the successor's coordinator"
+    );
+
     shutdown(&reader).await;
     b.shutdown();
     shutdown(&successor).await;

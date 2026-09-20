@@ -13283,7 +13283,15 @@ impl KvMetaBackend {
     /// contract).
     pub async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {
         // PR 5: a token reader lists the token's (user-visible) names —
-        // PR 12: from the object's slot holder.
+        // PR 12: from the object's slot holder. The CONTROL class
+        // (`client:` registrations, `writer_claim`, `job:` …) is no
+        // token's — `getxattr` reads it off this mount's own projection
+        // and so does the listing (PR 13, found by the fleet's
+        // `sym-crash` leg: the fleet worker's coordinator discovery is
+        // `mount_registrations` = `listxattr(1)` + the `client:` records,
+        // and a token reader listed the token's carried names ALONE — no
+        // registration was ever discoverable on a reader, its census
+        // shard never re-enrolled at a successor's coordinator).
         if let Some(serve) = self
             .token_serve(ino, crate::meta_ship::token_plane::TokenWants::default())
             .await?
@@ -13291,13 +13299,26 @@ impl KvMetaBackend {
             let Some(serve) = serve else {
                 return Ok(Vec::new());
             };
-            return Ok(serve
+            let mut out: Vec<String> = serve
                 .entry()
                 .xattrs
                 .iter()
                 .map(|(n, _)| String::from_utf8_lossy(n).into_owned())
-                .collect());
+                .collect();
+            out.extend(
+                self.listxattr_local(ino)
+                    .await?
+                    .into_iter()
+                    .filter(|n| !crate::meta_ship::token_plane::token_carried_xattr(n)),
+            );
+            return Ok(out);
         }
+        self.listxattr_local(ino).await
+    }
+
+    /// The xattr names of `ino` off THIS mount's own trees (the writer's
+    /// truth; a reader's projection).
+    async fn listxattr_local(&self, ino: Ino) -> Result<Vec<String>> {
         let mut out = Vec::new();
         let mut cursor: Vec<u8> = xattr_key(ino, 0, 0).to_vec();
         let end = xattr_key(ino, HASH56_MAX, u8::MAX);

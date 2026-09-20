@@ -505,6 +505,32 @@ poll adopts it; the next `getattr` SERVES from B, the plane `Arc::ptr_eq`
 the one armed, `grants` continuous, `holder_repoints` 1, holder 0's
 binding moved.
 
+### 4.4i Defect 16 — FIXED (PR 5's `-o ro` reader): a token reader's `listxattr` served the token's CARRIED names alone — no `client:` registration was ever discoverable on a reader, so its census shard never re-enrolled at a successor's coordinator
+
+The same `sym-crash` round, the gate after defect 15: with the reader's
+planes following the successor (both volumes re-pointed `:33703 →
+:34493`, the acked-writes oracle GREEN, `self_fences 0`), the round
+failed "no fleet worker enrolled at the successor's coordinator 80 s
+after its arm (`job_remote_workers=0`)" — the reader's worker logged
+`no coordinator endpoint published yet` for the rest of the round. The
+worker's discovery is `cluster_wire::discover_endpoint` →
+`mount_registrations` = `listxattr(1)` + one `getxattr` per `client:`
+record; on a token reader `KvMetaBackend::listxattr` DIVERTED to the
+token serve and returned the token's carried names (the user-visible
+class) ALONE, so ino 1 listed as `[]` and no registration existed on the
+reader — the worker enrolled once at mount (its first discovery ran
+before the token arm) and never again. `getxattr` of a control name
+already read the projection (`token_carried_xattr` is the one list);
+the listing now does too: the token's names + the CONTROL names off the
+reader's own trees. Pin: the failover contract's second half — the
+successor's `client:` record with its job endpoint, checkpointed, the
+reader's poll adopts it, `listxattr(1)` names it, `mount_registrations`
+carries it, `discover_endpoint` answers the successor's coordinator
+(RED: `[]`). The standing PR 12b finding stays: a dead incarnation's
+record is heartbeat-fresh for `CLIENT_STALE_TTL` (45 s) and sorts first
+by id, so re-enrollment lands within 45 s + the retry grain; the leg's
+80 s bound covers it.
+
 ### 4.4f Harness — `sym-foreign-touch` LIVE's storm died at launch
 
 On the defect-10 binary the LIVE phase read `slot_handovers` 1 "a live

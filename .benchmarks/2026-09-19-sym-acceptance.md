@@ -73,10 +73,15 @@ OWN directory (`tests/run_mdstorm.sh` `create`), then ingesting 512 MiB each
 
 | **r5 (`2a94abbc` + the return belt = `d00db50b`'s tree; defect 5 a+b landed)** | 6,874 · 2,481 | 19,192 (2.79×) · 5,679 (2.29×) | 27,909 (4.06×) · 8,015 (3.23×) | **39,778 (5.79×) · 10,309 (4.16×)** — the row COMPLETES: no fail-stop, no contamination, must-stay-0 set flat | create rate MET at every N (5.79× ≥ 5.6×); ingest at N = 8 MISS on the RATE law (4.16× < 5.6×) — 10.3 GB/s into zram over nvmet-tcp on `127.0.0.1` is the single 32-CPU box's data path (8 daemons × 4 MiB `dd conv=fsync` + their FUSE queues on the same cores), the box row decides; **deleted-stays-deleted 0 / 3,000** sampled removed names after every joiner's clean unmount, judged at the manager AND at a remounted joiner |
 
+| **r7 (`8d7fd3c0` — the FINAL binary, from zero, `pr13-batch7`; defects 20–26 landed)** | 7,023 · 2,991 | 19,018 (2.71×) · 6,212 (2.08×) | 30,071 (4.28×) · 6,300 (2.11×) | **20,517 (2.92×) · 5,023 (1.68×)** — the row COMPLETES (defect 24 gone: `/` auto-striped under the seven `mkdir`s and every joiner's `stat /` folded through the divert), must-stay-0 flat, `appender_flush_ceiling_overruns` 0, `manager_load_pct` 1 %, 453 stripe tokens served at the manager once | create rate MET at N ≤ 2, MISS at N = 4 (ingest) and N = 8 (both — every writer at 2,600–3,100 c/s uniformly, the manager included, against 7,600–8,400 at N = 4: the throttling box after four hours of fleets (86 °C idle), not a serialization — no product change touches the create path between r5 and r7; the box row decides); deleted-stays-deleted 0 / 3,000 at the manager AND at the remounted joiner |
+
 `slot_handovers == 0`, `slot_ships == 0`, Σ `dlm_rpcs == 0`,
 `manager_load_pct` 0–2 % on every row (the manager's verbs cost nothing
 measurable at N ≤ 8 — its CPU is its OWN storm's). The 0.7 × N law is MET
-at N = 2 and 4 on both runs; N = 8 is the defect-5 row.
+at N = 2 and 4 on r2/r4/r5; N = 8 is the defect-5 row on r4 and MET on
+r5; r7 (the final binary) MISSES it on the throttled box — a dev-box
+RATE reading, the mechanism rows (completion, the tripwires, the deleted
+law) GREEN.
 
 ## 4. Issues found (each with its PR and its red pin)
 
@@ -784,6 +789,29 @@ the reader's projection loaded). Standing, same class, not per-op:
 `is_stripe`'s reverse dentry scan (`find_parent_of_child`) walks every
 slot tree on the flip candidate's holder — over projections on a joiner
 (§7 Owed).
+
+### 4.4r' Defect 24's second face — FIXED: the fold read at the holder made the MANAGER's `stat /` fail for a dead supplier's whole death window
+
+`sym-storm` from zero on `8d7fd3c0` (`pr13-batch7`, the batch whose
+`sym-crash` ran 10/10 GREEN): the seven joiners killed; `/` had been
+auto-striped under their `mkdir`s with THREE stripes they supplied; and
+the harness's first `cat /mnt/…/m0/.stats` — the MANAGER's — read `EIO`:
+`read token unavailable: the recall channel to the holder is not fresh`.
+Defect 24 made every per-stripe record read a token read at the
+stripe's holder — three holders were dead for the 15 s before the
+recovery, and the fold failed the whole `stat /`; the kernel revalidates
+`/`'s attrs on every path walk, so EVERY op under `/` at the manager
+(`.stats` included) failed for the window. The fold is a DERIVED
+attribute of an object this mount HOLDS, and a dead lessee's stripe
+cannot move: a stripe whose holder cannot be reached contributes NOTHING
+for the window (its `nlink` term, its times — bounded by the recovery,
+which makes the slot the manager's), counted `dir_stripe_fold_
+unreachable`; the stripe's DENTRIES stay exact-or-nothing (R-SYM-4 is a
+law about a foreign object's user-visible metadata, not about a derived
+term of an own object). Pin: `sym_n_daemon_tests::a_striped_directorys_
+stat_at_the_holder_survives_a_suppliers_death` — RED with the fleet's
+exact text. Harness: the storm's death window is exactly where the
+harness reads every daemon's `.stats`.
 
 ### 4.4s Defect 25 — FIXED (PR 5's ledger poll vs PR 2/10/12b's checkpoint-class steps): a consumed checkpoint seq left a LEDGER GAP, and every token reader's poll stopped on it for a whole ring of checkpoints
 

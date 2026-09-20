@@ -422,6 +422,28 @@ known stripe or a directory whose map this mount has read
 (`RoutedMetaBackend::is_striping_domain` — two `scc` probes); an ordinary
 directory's ships are unchanged (gate 3c).
 
+### 4.4g Defect 14 — FIXED (PR 7b + PR 12's `-o ro` reader): a token reader listed a striped directory's RAW tree
+
+Found by `sym-shared-dir-ls` once every create law of gate 3b held
+(20,000 creates, 4,610/s, flip at the holder, 17,459 stripe ships,
+closure `shipped ≡ served`, 0 handovers): the token reader's `ls -l`
+statted 0 of 20,000 children — it listed 65 entries: the 64 nameless
+stripe directories and the NUL-named markers rendered as empty names.
+PR 7b's `stripes_armed` = `slot_lease_armed()`, and a `-o ro` reader has
+no slot-lease plane, so the map was never read there, the markers never
+filtered, the K-way merge never run — the row the design's gate 3b
+`-ls` leg exists to price ("K stripe tokens + C inode tokens, 0 leaf
+reads") could not run on a reader at all (PR 7b's owed "the wire reader's
+per-stripe token merge", PR 12's). Fix: `KvMetaBackend::striping_plane_
+armed()` = the plane OR a token reader; the map, the merge, the marker
+filter and the `stat` fold key on it (never a mutation gate — the reader
+writes nothing, `persist_striped_times` is holder-only). The reader's
+map, stripes and children come as tokens from their holders. Pin:
+`sym_coherence_tests::a_token_reader_lists_a_striped_directory_as_the_
+merge_of_its_stripes` (48 names over 4 stripes: the reader lists exactly
+the user names, resolves and stats every child, `stat D` folds, ≥ K + C
+grants).
+
 ### 4.4f Harness — `sym-foreign-touch` LIVE's storm died at launch
 
 On the defect-10 binary the LIVE phase read `slot_handovers` 1 "a live

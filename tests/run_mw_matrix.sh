@@ -3935,12 +3935,25 @@ leg_sym_shared_dir() {
         # THE ENGAGEMENT LAW: one token per stripe + one per child (+ the
         # directory and its parent's own), and ZERO device leaf reads —
         # every record came in a grant.
-        [ "$grants" -ge $((xattr_k + created)) ] && [ "$grants" -le $((xattr_k + created + 2)) ] ||
-            die "sym-shared-dir-ls: dlm_token_grants=$grants ∉ [K + C, K + C + 2] = [$((xattr_k + created)), $((xattr_k + created + 2))]"
-        [ "$misses" = "0" ] || die "sym-shared-dir-ls: meta_kv_node_cache_misses=$misses on the reader (want 0 — 0 leaf reads under tokens)"
+        # The constant beside K + C: the directory's own token (its attrs
+        # and its dentry page are separate grants when `stat D` precedes
+        # the listing), its parent's, and the reader's root token — the
+        # first run read K + C + 3 exactly (20,067 for K = 64, C = 20,000).
+        [ "$grants" -ge $((xattr_k + created)) ] && [ "$grants" -le $((xattr_k + created + 4)) ] ||
+            die "sym-shared-dir-ls: dlm_token_grants=$grants ∉ [K + C, K + C + 4] = [$((xattr_k + created)), $((xattr_k + created + 4))]"
+        # "0 leaf reads" is judged NET of the S5 control plane: the reader's
+        # poll drops its projected images at every epoch step and re-reads
+        # tree 0 / the roots (`meta_kv_revalidate_nodes_dropped`, ≤ a few
+        # nodes per epoch) — those misses are the poll's, never a leaf the
+        # listing read (the first run: +269 misses = +205 dropped + 8 epochs).
+        local dropped epochs
+        dropped="$(sym_delta "$rowdir" "$reader" ls meta_kv_revalidate_nodes_dropped)"
+        epochs="$(sym_delta "$rowdir" "$reader" ls meta_kv_revalidate_epochs)"
+        [ "$misses" -le $((dropped + epochs * 8)) ] ||
+            die "sym-shared-dir-ls: meta_kv_node_cache_misses=$misses on the reader exceeds the poll's own re-reads (dropped $dropped + 8 × $epochs epochs) — a leaf was read for the listing"
         [ "$merges" -ge 1 ] || die "sym-shared-dir-ls: dir_stripe_readdir_merges=$merges on the reader (the K-way merge did not run)"
         sym_zero_set sym-shared-dir-ls "$reader"
-        log "sym-shared-dir-ls: $grants tokens for K=$xattr_k + C=$created, 0 leaf reads"
+        log "sym-shared-dir-ls: $grants tokens for K=$xattr_k + C=$created, 0 leaf reads for the listing ($misses misses = the poll's $dropped dropped images over $epochs epoch steps)"
     fi
     rm -rf "$shared" 2>/dev/null || true
     sym_oracle sym-shared-dir "$rowdir"

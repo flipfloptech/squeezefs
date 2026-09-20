@@ -1860,6 +1860,12 @@ async fn a_dead_joiners_region_is_recovered_by_the_manager_and_a_third_daemon_ta
         tid, id,
         "a Recovered page is never re-adopted by another identity"
     );
+    // The recovery's tree-0 release is a ring-0 control entry; the LEDGER
+    // names the moved root only at the manager's next cycle, and the
+    // third's projection reads the ledger — cycle it first, or the
+    // projection races the cadence and names the dead lessee (a
+    // suite-order flake: 1 in 4 full runs).
+    mvol.checkpoint_now().await.unwrap();
     tvol.refresh_control_projection().await.unwrap();
     let more = create_files(&third, shared, "t", 4).await;
     match tree0_state(&mvol, SLOT_A).await {

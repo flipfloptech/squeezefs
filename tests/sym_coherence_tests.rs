@@ -1649,6 +1649,103 @@ async fn a_voluntary_release_drains_and_purges_before_the_holder_is_told() {
     shutdown(&writer).await;
 }
 
+/// **A token reader lists a STRIPED directory as the K-way merge of its
+/// stripes, never its raw dentries** (PR 13 — the fleet's
+/// `sym-shared-dir-ls` row: a `-o ro` reader has no slot-lease plane, so
+/// PR 7b's `stripes_armed` read false there and the reader listed the
+/// directory's RAW tree — 64 nameless stripe directories and the
+/// NUL-named markers, none of the 20,000 children — `ls -l` statted 0).
+/// The striping READ paths (the map, the merge, the marker filter, the
+/// `stat` fold) arm on a token reader of an armed set
+/// (`striping_plane_armed`); the map's markers, each stripe's dentries and
+/// each child's record come as tokens from their holder — the row's
+/// "K stripe tokens + C inode tokens". Pinned: the writer stripes a
+/// directory of 48 names over 4 stripes; the reader lists exactly the 48
+/// user names (no marker, no stripe), resolves every child by name and
+/// stats it, and `stat D` folds `nlink` over the stripes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_reader_lists_a_striped_directory_as_the_merge_of_its_stripes() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let d = Metadata::create(writer.as_ref(), 1, "shared", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let mut names: Vec<(String, u64)> = Vec::new();
+    for i in 0..48 {
+        let name = format!("entry-{i:04}");
+        let ino = Metadata::create(writer.as_ref(), d, &name, libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap()
+            .ino;
+        names.push((name, ino));
+    }
+    writer.stripe_dir(d, 4).await.expect("the holder's flip");
+    let map = writer
+        .stripe_map(d)
+        .await
+        .expect("map")
+        .expect("striped at the writer");
+    assert_eq!(map.stripes.len(), 4);
+    // Every name re-homed into its stripe before the reader looks (the
+    // explicit, awaited form of the holder's background migration, so the
+    // row reads the finished shape, not the migrating one).
+    // The flip kicked the background migration (single-flight; an explicit
+    // `migrate_dir` beside it answers 0) — wait for the flag to clear.
+    let started = std::time::Instant::now();
+    loop {
+        let _ = writer.migrate_dir(d).await.expect("the migration");
+        let m = writer.stripe_map(d).await.expect("read").expect("striped");
+        if !m.migrating {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the migration did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-stripes").await;
+    let listed = Metadata::readdir(reader.as_ref(), d, 0, 1024)
+        .await
+        .expect("the reader lists the striped directory");
+    let mut listed_names: Vec<String> = listed.iter().map(|e| e.name.clone()).collect();
+    listed_names.sort();
+    let mut want: Vec<String> = names.iter().map(|(n, _)| n.clone()).collect();
+    want.sort();
+    assert_eq!(
+        listed_names, want,
+        "the reader lists exactly the user names — no marker, no stripe"
+    );
+    for (name, ino) in &names {
+        let got = Metadata::lookup(reader.as_ref(), d, name)
+            .await
+            .unwrap_or_else(|e| panic!("the reader resolves {name} through its stripe: {e}"));
+        assert_eq!(got.ino, *ino, "{name}");
+        Metadata::getattr(reader.as_ref(), *ino)
+            .await
+            .unwrap_or_else(|e| panic!("the reader stats {name}: {e}"));
+    }
+    let attrs = Metadata::getattr(reader.as_ref(), d)
+        .await
+        .expect("stat D at the reader");
+    assert_eq!(
+        attrs.nlink, 2,
+        "a directory of files folds to nlink 2 over its stripes"
+    );
+    assert!(
+        plane.stats().grants >= 4 + 48,
+        "K stripe tokens + C inode tokens at least: {}",
+        plane.stats().grants
+    );
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
 /// **The records budget is BYTES on the R5 component** (review round 1,
 /// Issue 7): every entry is charged its encoded records (attrs, xattrs,
 /// the dentry set) — `dlm_token_cached_bytes` is live — the cache evicts

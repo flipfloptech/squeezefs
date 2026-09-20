@@ -4477,6 +4477,18 @@ impl KvMetaBackend {
         self.slot_leases().is_some()
     }
 
+    /// Whether this mount READS striped directories through their maps
+    /// (design §5.6.5): every armed writer (the plane), and a TOKEN READER
+    /// of an armed set — its map, stripes and children come as tokens
+    /// from their holders (PR 13, the fleet's `sym-shared-dir-ls` row: a
+    /// `-o ro` reader has no slot-lease plane, so `stripes_armed` read
+    /// false there and it listed a striped directory's RAW dentries — the
+    /// 64 nameless stripes and the NUL-named markers — and none of its
+    /// 20,000 children). Never a mutation gate: a reader writes nothing.
+    pub fn striping_plane_armed(&self) -> bool {
+        self.slot_lease_armed() || self.tokens_reader.get().is_some()
+    }
+
     /// The appender leasing `object`'s slot when it is NOT one of this
     /// mount's regions (the token server's `NotHolder { holder }` — review
     /// round 1, Issue 12): one lease-table read. `None` = this mount's

@@ -3106,7 +3106,8 @@ impl RoutedMetaBackend {
         // the fold over its stripes (each stripe's record is the exact
         // delta its own inserts wrote); the persist runs after the shared
         // guard dropped — it takes the exclusive one.
-        if inode.mode & libc::S_IFMT == libc::S_IFDIR && self.volumes[v_idx].slot_lease_armed() {
+        if inode.mode & libc::S_IFMT == libc::S_IFDIR && self.volumes[v_idx].striping_plane_armed()
+        {
             if let Some(map) = self.stripe_map(ino).await? {
                 if let Some((mtime, ctime)) = self.fold_striped_attrs(&mut inode, &map).await? {
                     self.persist_striped_times(ino, mtime, ctime).await;
@@ -3175,7 +3176,7 @@ impl RoutedMetaBackend {
         // no user name can start with NUL); an ordinary directory on an
         // armed volume drops a marker only if one exists, which the codec
         // makes impossible outside a striped directory.
-        if self.volumes[v_idx].slot_lease_armed() {
+        if self.volumes[v_idx].striping_plane_armed() {
             let dir = self.make_global_ino(local_dir, v_idx);
             if let Some(map) = self.stripe_map(dir).await? {
                 return self.readdir_striped_page(&map, offset, max).await;
@@ -3189,7 +3190,7 @@ impl RoutedMetaBackend {
             let page = self.volumes[v_idx]
                 .readdir_page(local_dir, offset, max)
                 .await?;
-            if self.volumes[v_idx].slot_lease_armed() {
+            if self.volumes[v_idx].striping_plane_armed() {
                 return Ok(page
                     .into_iter()
                     .filter(|(_, e)| !dir_stripe::is_marker_name(&e.name))

@@ -579,7 +579,7 @@ impl RoutedMetaBackend {
     fn stripes_armed(&self, volume_idx: usize) -> bool {
         self.volumes
             .get(volume_idx)
-            .is_some_and(|v| v.slot_lease_armed())
+            .is_some_and(|v| v.striping_plane_armed())
     }
 
     /// `stripes_armed` for GLOBAL `ino`'s volume — the FUSE

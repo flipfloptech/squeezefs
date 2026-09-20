@@ -3776,6 +3776,172 @@ async fn a_peers_lookup_through_a_dead_holder_is_refused_inside_the_bound_and_ex
     fsck_clean(&uris).await;
 }
 
+/// **The served shipped free's reference count reads the trees the
+/// manager WRITES, never a joiner's PROJECTION** (PR 13 — found by the
+/// fleet's `sym-walls` row (a): every joiner's terminal free under
+/// `w_rewrite` was ABANDONED after 3 attempts — the manager's count for
+/// the shipped free walked EVERY slot tree, its projection of a joiner's
+/// tree included, and that projection's root (the grant-time image) had
+/// been retired by the joiner, returned through `ReturnExtents` and
+/// re-granted: `tree 0 (slot Some(1042), root …, a PROJECTION here):
+/// traversal retry budget exhausted`; 5,426 replays at the manager, 0
+/// blocks served). The projection is also STALE by design — the lessee
+/// appends into its images and moves its root under its own page — so
+/// the union count answered a reference the joiner had RELEASED as still
+/// held: a free judged `NonTerminal` for ever, the block leaked. PR 7
+/// §5.4.3 law 2: an unshared block's references live in its owner's slot
+/// tree and the lessee's terminal free carries that tree's verdict; a
+/// block two slots share is the index's, never a count's. Pinned on the
+/// two-backend fixture: the joiner publishes a block reference on its own
+/// file, the manager's projection of the joiner's tree LOADS it (the
+/// union count reads 1), the joiner RELEASES it (a displacing publish in
+/// its ring) — the manager's union count still reads the stale 1 while
+/// `block_ref_count_maintained` (the served free's word) reads 0, and a
+/// reference in a tree the manager writes counts on both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_served_frees_refcount_skips_a_joiners_projection_tree() {
+    use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared"), (SLOT_B, "other")]).await;
+    let other = dirs[1];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let joiner = join(&uris, &venue, &mvol, 71).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let tag = volume_tag("vol-00000000000000a7");
+    let layout = |block_idx: u64| -> Vec<u8> {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            0u32,
+            format!("vol-00000000000000a7://{}", block_idx * 4 * 1024 * 1024),
+        );
+        bincode::serialize(&squeezefs::layout_wire::LayoutMetadata {
+            file_type: "striped".into(),
+            size: 4 * 1024 * 1024,
+            block_map: Some(map),
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    let taken = |blk: u64, owner: u64| {
+        BlockRefOp::taken(BlockRef {
+            vol_tag: tag,
+            block_idx: blk,
+            owner_ino: owner,
+            block_index: 0,
+        })
+    };
+    let released = |blk: u64, owner: u64| {
+        BlockRefOp::released(BlockRef {
+            vol_tag: tag,
+            block_idx: blk,
+            owner_ino: owner,
+            block_index: 0,
+        })
+    };
+    // The shape the fleet had: a tree the manager HOLDS a projection of —
+    // one of its own ROTOR slots' (the slot `bf` mints into), the
+    // manager's until it releases the slot and the joiner acquires it;
+    // the manager's `KvTree` for the slot stays, FOREIGN now, at the
+    // grant-time image. The manager's file `bf` carries block 17 in that
+    // tree; its own file `mf` in another slot carries block 18.
+    let bfile = manager
+        .create(other, "bf", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let slot_b = slot_of_global(&manager, bfile);
+    manager
+        .set_layout_and_size(bfile, &layout(17), 4 * 1024 * 1024, &[taken(17, bfile)])
+        .await
+        .expect("the manager publishes block 17 in SLOT_B's tree");
+    let mfile = manager
+        .create(1, "mf", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    manager
+        .set_layout_and_size(mfile, &layout(18), 4 * 1024 * 1024, &[taken(18, mfile)])
+        .await
+        .expect("the manager publishes its block");
+    assert_eq!(mvol.block_ref_count(tag, 17).await.unwrap(), 1);
+    assert_ne!(
+        slot_of_global(&manager, mfile),
+        slot_b,
+        "mf sits in another slot"
+    );
+    mvol.release_slot_handover(0, slot_b)
+        .await
+        .expect("the manager releases bf's slot to unleased");
+    // The joiner takes the slot (an offer accepted — the wire first
+    // touch): the transfer barrier adopts the manager's live root at the
+    // joiner; the manager's tree of the slot is a PROJECTION from here.
+    let routing_b = mvol
+        .routing_slot_of_forest(slot_b)
+        .expect("the slot's routing slot");
+    assert_eq!(
+        jvol.joined_accept_offers(&[(routing_b, 0)]).await,
+        1,
+        "the joiner acquires the slot over the wire"
+    );
+    assert!(jvol.slot_leases().unwrap().gate.is_leased(slot_b));
+    assert!(mvol.slot_leases().unwrap().gate.is_foreign(slot_b));
+    assert_eq!(
+        jvol.block_ref_count(tag, 17).await.unwrap(),
+        1,
+        "the joiner's adopted tree holds the reference"
+    );
+    // The joiner RELEASES it (a displacing publish of the file it now
+    // holds, in ITS ring).
+    joiner
+        .set_layout_and_size(
+            bfile,
+            &layout(19),
+            4 * 1024 * 1024,
+            &[released(17, bfile), taken(19, bfile)],
+        )
+        .await
+        .expect("the joiner's displacing publish");
+    jvol.checkpoint_now()
+        .await
+        .expect("the joiner's checkpoint");
+    assert_eq!(
+        jvol.block_ref_count(tag, 17).await.unwrap(),
+        0,
+        "the joiner's own tree released it"
+    );
+    // The manager's union count still reads the STALE 1 (its projection
+    // never learns a lessee's release — the class the served free judged
+    // `NonTerminal` for ever); the served free's word reads the trees the
+    // manager writes: 0.
+    assert_eq!(
+        mvol.block_ref_count(tag, 17).await.unwrap(),
+        1,
+        "the union over projections is not the truth (stated, not relied on)"
+    );
+    assert_eq!(
+        mvol.block_ref_count_maintained(tag, 17).await.unwrap(),
+        0,
+        "the served free counts what the manager WRITES"
+    );
+    assert_eq!(
+        mvol.block_ref_count_maintained(tag, 18).await.unwrap(),
+        1,
+        "a reference in a tree the manager writes counts"
+    );
+    assert_eq!(
+        jvol.block_ref_count_maintained(tag, 19).await.unwrap(),
+        1,
+        "the joiner counts its own leased tree"
+    );
+    shutdown(&joiner).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
 /// **A live joiner follows a manager FAILOVER to the successor's
 /// listener** (PR 10's "busy appender across a manager failover" row, the
 /// N-daemon shape it named as PR 12's): the manager leaves and a

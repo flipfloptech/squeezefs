@@ -11348,6 +11348,47 @@ impl KvMetaBackend {
         Ok(population)
     }
 
+    /// [`Self::block_ref_count`] over the slot trees this mount WRITES
+    /// (PR 13 — the served shipped free's count under the ARMED plane):
+    /// a slot tree another appender leases is skipped — a PROJECTION
+    /// here, stale by design (the lessee appends into its images and
+    /// moves its root under its own page), so its count answered a
+    /// released reference as held (a leak class) and, once the lessee's
+    /// retired root extent came back through `ReturnExtents` and was
+    /// re-granted, spun the traversal budget (`sym-walls` row (a): every
+    /// joiner's free abandoned after 3 attempts, 5,426 replays at the
+    /// manager). The lessee's terminal free carries ITS tree's verdict
+    /// (PR 7 §5.4.3 law 2: an unshared block's references live in its
+    /// owner's slot tree; a block two slots share is the index's, never a
+    /// count's). Unarmed, and on a flat volume, ≡ `block_ref_count`.
+    pub async fn block_ref_count_maintained(
+        &self,
+        vol_tag: u64,
+        block_idx: u64,
+    ) -> std::result::Result<usize, KvError> {
+        if !self.block_refs_engaged() {
+            return Ok(0);
+        }
+        let Some(plane) = self.slot_leases() else {
+            return self.block_ref_count(vol_tag, block_idx).await;
+        };
+        let TreeSet::Forest { forest, .. } = &self.trees else {
+            return self.block_ref_count(vol_tag, block_idx).await;
+        };
+        let (start, end) = super::block_refs::block_range(vol_tag, block_idx);
+        let gate = Arc::clone(&plane.gate);
+        let mut population = 0usize;
+        for (k, v) in forest
+            .refs_window_where(&start, &end, |slot| !gate.is_foreign(slot))
+            .await?
+        {
+            let _ = super::block_refs::decode_block_ref_key(&k)?;
+            let _ = super::block_refs::decode_block_ref_value(&v)?;
+            population += 1;
+        }
+        Ok(population)
+    }
+
     /// `true` ⇔ the block-map tree is engaged on this volume (incompat
     /// bit 16 present and the mount may write). `false` means every
     /// layout head stays inline/`indirect:`, exactly as before the bit

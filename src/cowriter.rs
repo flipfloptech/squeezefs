@@ -2491,13 +2491,19 @@ pub async fn durable_block_refcounts_with(
         match view(v_idx) {
             None => {
                 for (slot, idx) in block_idxs.iter().enumerate() {
-                    out[slot] += kv.block_ref_count(vol_tag, *idx).await.map_err(|e| {
-                        SqueezefsError::InvalidOperation(format!(
-                            "durable block-reference count failed on {} while serving a \
+                    // The trees this mount WRITES (PR 13): a slot tree a
+                    // joiner leases is a projection here — the joiner's
+                    // free carries its own tree's verdict.
+                    out[slot] +=
+                        kv.block_ref_count_maintained(vol_tag, *idx)
+                            .await
+                            .map_err(|e| {
+                                SqueezefsError::InvalidOperation(format!(
+                                    "durable block-reference count failed on {} while serving a \
                              shipped free: {e}",
-                            kv.device_path().display()
-                        ))
-                    })?;
+                                    kv.device_path().display()
+                                ))
+                            })?;
                 }
             }
             Some(peer) => {

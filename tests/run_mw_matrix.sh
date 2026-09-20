@@ -3253,6 +3253,16 @@ leg_sym_storm() {
             if [ ! -e "$m_mnt$rr_obj" ] && [ -n "${rr_dst:-}" ] && [ -e "$m_mnt$rr_dst" ]; then
                 rr_obj="$rr_dst"
             fi
+            # The reader HOLDS the object's token at the mutation: its
+            # pre-kill token died with the victim's plane (fail-closed,
+            # dropped), and whether the oracle's read above re-fetched
+            # one — or the R5 cache evicted it since — is the reader's
+            # business, not the arm's premise. One resolve here (a hit or
+            # a fresh grant from the recovered slot's lessee), THEN the
+            # recall count the mutation must move.
+            timeout 60 stat "$(mnt_of "$token_reader")$rr_obj" >/dev/null 2>&1 ||
+                die "round $round: the token reader m$token_reader could not resolve $rr_obj at the successor before the mutation"
+            rr_recalls0="$(stat_sum "$token_reader" dlm_token_recalls_received)"
             chmod 0600 "$m_mnt$rr_obj" ||
                 die "round $round: the manager could not setattr the recovered object $rr_obj"
             local rr_mode rr_recalls
@@ -4373,7 +4383,15 @@ s7_kill_body() { # [sym]
     for ((round = 1; round <= S7_ROUNDS; round++)); do
         # Sustained load, randomized kill phase (0.5 .. 8.5 s into it).
         rm -f "$w_mnt/s7kill.dat" 2>/dev/null || true
-        (exec dd if=/dev/zero of="$w_mnt/s7kill.dat" bs=1M count=16384 conv=fsync status=none) &
+        # A load that OUTLASTS the longest kill phase whatever the box's
+        # bandwidth: 4 GiB passes rewritten in place until the kill (one
+        # 16 GiB pass finished inside an 8.2 s phase at 2 GB/s on the
+        # zram devsub and read as "write load died" — PR 13's batch).
+        (
+            while :; do
+                dd if=/dev/zero of="$w_mnt/s7kill.dat" bs=1M count=4096 conv=fsync,notrunc status=none || exit 1
+            done
+        ) &
         dd_pid=$!
         # The ACKED-WRITES ORACLE (PR 10, review round 1, Issue 14): a
         # ledger of names the client created and FSYNCED before the kill —
@@ -4412,6 +4430,7 @@ s7_kill_body() { # [sym]
         kill -9 "$ack_pid" 2>/dev/null || true
         wait "$ack_pid" 2>/dev/null || true
         t_kill="$(date +%s)"
+        pkill -9 -P "$dd_pid" 2>/dev/null || true
         kill -9 "$dd_pid" 2>/dev/null || true
         wait "$dd_pid" 2>/dev/null || true
         # Sweep the dead FUSE mount, then the successor takes the D0 ladder

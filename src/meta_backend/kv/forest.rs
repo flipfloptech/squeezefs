@@ -586,6 +586,27 @@ impl SlotTrees {
         Ok(out)
     }
 
+    /// [`Self::refs_window`] over the slot trees `keep` admits — the
+    /// served shipped free's count on an ARMED writer (PR 13): a slot tree
+    /// another appender LEASES is a PROJECTION here (stale by design, its
+    /// root pointer recyclable — the manager's count over a joiner's tree
+    /// spun the restart budget), and the lessee's terminal free carries
+    /// its OWN tree's verdict; this mount counts what it WRITES.
+    pub async fn refs_window_where(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        keep: impl Fn(ForestSlot) -> bool,
+    ) -> Result<Vec<(Bytes, Bytes)>, KvError> {
+        let mut out: Vec<(Bytes, Bytes)> = Vec::new();
+        for (slot, tree) in self.slot_trees() {
+            if keep(slot) {
+                Self::refs_window_in(&tree, start, end, &mut out).await?;
+            }
+        }
+        Ok(out)
+    }
+
     /// [`Self::refs_window`] over ONE slot tree — the on-demand refcount
     /// probe (design §5.4.3 law 2, PR 7): a block nobody cloned has every
     /// reference in its owner's slot tree (the pack law), so its

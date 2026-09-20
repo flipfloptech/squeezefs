@@ -638,6 +638,42 @@ member `Unknown` while `member_is_live` stays `false`; a joined one
 `Live`; after its clean leave `Dead`; past the deadline an absent one
 `Dead`). The fleet round was the RED.
 
+### 4.4n Defect 20 — FIXED (S9's served free under PR 12b's plane): the manager's count for a joiner's shipped free walked EVERY slot tree — its PROJECTION of the joiner's tree included — a leak class, and a routing loop once the projection's root was recycled
+
+Found by the new `sym-walls` leg's first run (gate 7 row (a), attempt 4):
+7 joiners × 16 × 64 MiB rewritten in place — 1,792 displaced blocks —
+and `shipped = 0`, `served = 0`: every joiner's terminal free was
+ABANDONED after 3 attempts (`free_ship_failures` +405 on one joiner,
+`free_replays` +5,426 at the manager — the retries answered from the
+dedup window): `durable block-reference count failed on /dev/nvme2n1
+while serving a shipped free: … tree 0 (slot Some(1042), root …, a
+PROJECTION here): traversal retry budget exhausted`. The served free
+(`cowriter::durable_block_refcounts_with` → `KvMetaBackend::block_ref_
+count`, S9's owner-side validation "the ledger, not the peer's claim")
+counted the block's references over EVERY slot tree of the volume — on
+the manager that includes the trees JOINERS lease, which are PROJECTIONS
+there (the grant-time image; the lessee appends into its images and
+moves its root under its own page). Two faces: (a) STALE — a reference
+the joiner RELEASED still read as held in the manager's image, so the
+free was `NonTerminal` for ever and the block leaked (pinned); (b) the
+loop — the joiner's SMO retired the projection's root, `ReturnExtents`
+returned the extent, the manager re-granted it, and the manager's
+traversal of the projection spun the budget (defect 18's shape at the
+MANAGER, which installs no refresh for a lessee's tree). PR 7 §5.4.3 law
+2 is the law: an unshared block's references live in its OWNER's slot
+tree and the lessee's terminal free carries that tree's verdict; a block
+two slots share is the index's (`ReleaseShared`), never a count's. Fix:
+`KvMetaBackend::block_ref_count_maintained` — the count over the slot
+trees this mount WRITES (`!gate.is_foreign(slot)`; `SlotTrees::refs_
+window_where`), the served free's word; unarmed and on a flat volume ≡
+`block_ref_count`. Pin: `sym_n_daemon_tests::the_served_frees_refcount_
+skips_a_joiners_projection_tree` — the manager publishes a block on a
+file in one of its rotor slots, releases the slot, the joiner acquires it
+(the transfer barrier adopts the live root) and RELEASES the block in its
+ring; the manager's union count still reads the STALE 1 (asserted — the
+old executor's word), the maintained count 0, and a reference in a tree
+the manager writes counts on both.
+
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
 `sym-shared-dir-ls` on the defect-16 binary read `meta_kv_node_cache_

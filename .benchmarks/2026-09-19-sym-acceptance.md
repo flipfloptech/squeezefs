@@ -539,9 +539,39 @@ on-change cadence, parked ≡ reclaimed, expiries 0.
 
 ## 6. The D1 arithmetic at fleet N vs §5.10, and the 15 k arithmetic re-derived
 
-_(pending the box rows; the dev-box scoping constants: manager verb load
-0–2 % at N ≤ 8, `slot_handovers == 0` on every own-directory row, the
-recall fan-out of 12,500 holders in 24.7 ms in process.)_
+Every row is design §5.10's per-op law read off the fleet's gauges (the
+dev-box tcp substrate — tier (ii) measured-simulated; the box brackets of
+§8 are the counted rows, and every number here is a constant the box
+rows re-measure, never a verdict):
+
+| §5.10 row | Design | Measured (fleet, this record) | Holds? |
+|---|---|---|---|
+| `create`/`mkdir` under an OWN directory | 0 wire verbs | `sym-tarx`: **0.0122 wire verbs per entry** on 2,468 entries (30 manager verbs = the join + the extent-grant refills; `xv`/`ship`/`pub` 0), `slot_handovers` 0, `dlm_rpcs` 0 | yes — the ≈ 0 law (gate 2's bound 0.05) |
+| `create` in a SHARED (striped) directory | 1 ship + 1 barrier per foreign create; never a handover | `sym-shared-dir`: 20,000 creates by 8 writers, `xv_shipped ≡ xv_served` (17,537), `dir_stripe_ships` 17,204 (the 1/64 own-stripe lands are the difference), **`slot_handovers` 0** after defect 13 | yes |
+| `lookup`/`stat`/`readdir` of foreign objects | 1 token per object first touch, 0 while cached; `readdir + stat` of a striped directory = `K + C` tokens cold | `sym-shared-dir-ls`: **20,067 grants for K = 64 + C = 20,000** (K + C + 3: the directory, its parent, the root), `dir_stripe_readdir_merges` 43, 0 data-leaf reads (the reader's `node_cache_misses` = the S5 poll's re-reads + one tree-0 lessee read per stripe slot), `dlm_token_hits` 284,483 | yes |
+| foreign touch of an IDLE tree (`mkdir /jobs/X`'s shape) | 1 handover if idle, then 0 | `sym-foreign-touch` IDLE: handed over after 1–2 bursts of 64, `slot_handover_phase_ns` total **5.5–7.8 ms** (flush 1.9–4.1, page 0.15–0.18, tree 0 3.5) | yes; the cost inside §1.6's 5–20 ms |
+| foreign touch of a LIVE tree | ships, never a handover | `sym-foreign-touch` LIVE: 192 ships, 0 handovers with the holder's storm alive | yes |
+| Manager verbs per volume (per-op work = 0) | steady ≪ 100/s | `manager_load_pct` 0–2 % at N = 8; the eight-writer in-process storm's grant/return refills 100–150 per joiner per run under `JournalReserveExhausted` (the retry class) | yes; the manager's ring window is the N = 8 storm's only pressure point (§4.6) |
+| Recall fan-out (holder side) | R recalls per mutated object, batched per pass | `sym-readers` (1 reader): `recalls ≡ mutations × holders` 5/5, `fanout_p99` 1, `recall_rtt_mean` 125.5 µs; SIM-1: 12,500 holders recalled in 24.7 ms in process | yes (the N = 32 reader shape is §7's) |
+| Handover reclaim by a bursty owner | ≤ 1 handover per burst per direction | `N_floor` ≈ 18 after the first measured handover (5.5 ms ÷ ≈ 0.3 ms ships) — defect 10's seed made it 2 for a joiner's life before | yes after defect 10 |
+| Aggregate creates scale with N | ≥ 0.7 × N × the N = 1 rate | `sym-scale` r5 (2a94abbc): 6,874 / 19,192 (2.79×) / 27,909 (4.06×) / **39,778 (5.79×)** creates/s at N = 1/2/4/8 — the law MET at every N; ingest 2,481 / 5,679 / 8,015 / 10,309 MiB/s (N = 8 4.16× — one box's memory bus; the box decides) | yes for creates; ingest is the box's row |
+
+**The 15 k arithmetic re-derived** (§1.6's table, the constants this
+record moved): `N_floor`'s cold start is no longer 2 on a joiner (defect
+10) — the handover price at the operating point is the MEASURED 5.5–7.8 ms
+÷ the served ship's ≈ 0.3 ms ⇒ ≈ 18–26 ships, so a `/jobs/X` touch never
+moves a stripe (defect 13 makes it moot: a striped directory's ships feed
+no window) and an idle tree moves only to a requester past that floor;
+the per-holder ship cost stands at the §5.10 shape (1 ship + 1 barrier;
+`meta_ship_owner_phase_ns` on the fleet ≈ 0.3 ms served) so 12,500
+`mkdir /jobs/X` over 64 stripe holders is 195 × 0.3 ms ≈ **60 ms of each
+holder's time** per wave (§1.6 wrote ≈ 6 ms at a 30 µs verb — the served
+INSERT is a commit + its durability lane, not a verb: the 10× is the
+barrier, and it is per WAVE); a reader's `ls -l` of the result is `K + C
++ 3` grants (§5.7.5's `K + C`, exact to the constant); death propagation,
+the join storm and the ring budget are untouched by this record (their
+rows are gates 7/8b's — §7). Nothing in §1.6 breaks first at a different
+resource than it did.
 
 ## 7. Owed (what PR 14 / PR 15 inherit)
 

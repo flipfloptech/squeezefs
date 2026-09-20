@@ -1469,6 +1469,139 @@ async fn a_joiners_stat_of_a_striped_directory_folds_the_stripes_at_their_holder
     shutdown(&manager).await;
 }
 
+/// **A striped directory's `stat` survives a SUPPLIER's death** (PR 13,
+/// defect 24's second face — found by `sym-storm` from zero on the
+/// defect-24 binary: seven joiners killed, `/` auto-striped with three
+/// stripes they supplied, and the MANAGER's `stat /` — every path walk
+/// across it, `.stats` included — failed `EIO` for the 15 s until the
+/// recovery: the fold now read each stripe's record at its holder, and
+/// three holders were dead). A holder that cannot be reached contributes
+/// NOTHING to the fold for the window (`dir_stripe_fold_unreachable`) —
+/// a dead lessee's stripe cannot move, the missing term is bounded by
+/// the recovery — instead of failing the `stat`; the stripe's DENTRIES
+/// stay exact-or-nothing. Pinned: the manager's `stat D` serves after the
+/// supplier's listener died (RED: `EIO`), the fold lacking exactly that
+/// stripe's subdirectory link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_striped_directorys_stat_at_the_holder_survives_a_suppliers_death() {
+    use squeezefs::meta_backend::dir_stripe::DIR_STRIPE_FOLD_UNREACHABLE;
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, _dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    // The manager's OWN hot directory.
+    let hot = manager
+        .create(1, "hot", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("the manager's directory")
+        .ino;
+    // Checkpointed before the join: the served `SupplyStripeIno` at
+    // joiner 1 reads `hot`'s record through its divert on a real mount;
+    // this process's one custody arm is the MANAGER's (below), so joiner
+    // 1 reads its projection — which the manager's page must name.
+    mvol.checkpoint_now().await.expect("checkpoint");
+    let j1 = join(&uris, &venue, &mvol, 1).await;
+    let j1venue = DaemonVenue::stand_up(&j1, false, "joiner-1").await;
+    mvol.slot_leases()
+        .expect("armed")
+        .holders
+        .set_endpoint(1, &j1venue.endpoint);
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(&manager),
+            "node-manager",
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    // The MANAGER is this process's reading writer (PR 9's custody arm —
+    // process-global): its reads of joiner 1's slot are token reads at
+    // joiner 1's listener.
+    let sink = Arc::new(ProbeSink {
+        calls: std::sync::atomic::AtomicU64::new(0),
+    });
+    let for_arm = Arc::clone(&sink);
+    let _arm = squeezefs::data_grant::arm_slot_custody(
+        &manager,
+        &squeezefs::cowriter::node_member_id().expect("this node's member id"),
+        VENUE_SECRET.to_vec(),
+        0,
+        Arc::new(move |_volume| {
+            Arc::clone(&for_arm) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
+        }),
+    );
+    // The flip names joiner 1 as a SUPPLIER: one stripe minted in ITS slot.
+    manager
+        .stripe_dir_with_suppliers(hot, 4, &[1])
+        .await
+        .expect("the flip with a supplied stripe");
+    let map = manager
+        .stripe_map(hot)
+        .await
+        .expect("map")
+        .expect("striped");
+    let supplied: Vec<u64> = map
+        .stripes
+        .iter()
+        .copied()
+        .filter(|s| {
+            j1.volumes[0]
+                .slot_leases()
+                .expect("armed")
+                .gate
+                .is_leased(slot_of_global(&manager, *s))
+        })
+        .collect();
+    assert_eq!(supplied.len(), 1, "one stripe lives in joiner 1's slot");
+    // A subdirectory whose name routes into the SUPPLIED stripe: the
+    // fold's term that stripe carries.
+    let mut into_supplied = None;
+    for i in 0..256 {
+        let name = format!("sub{i}");
+        let route = manager
+            .stripe_route(hot, &name)
+            .await
+            .expect("route")
+            .expect("striped");
+        if route.stripe == supplied[0] {
+            manager
+                .create(hot, &name, libc::S_IFDIR | 0o755, 1000, 1000)
+                .await
+                .expect("a subdirectory into the supplied stripe");
+            into_supplied = Some(name);
+            break;
+        }
+    }
+    into_supplied.expect("a name routing into the supplied stripe");
+    let alive = manager
+        .getattr(hot)
+        .await
+        .expect("the fold with every holder alive");
+    // The supplier DIES un-recovered: its listener gone, its page Live.
+    j1venue.tear_down();
+    drop(j1);
+    let unreachable0 = DIR_STRIPE_FOLD_UNREACHABLE.load(Relaxed);
+    let dead = manager
+        .getattr(hot)
+        .await
+        .expect("the fold serves while the supplier is dead (RED: EIO)");
+    assert!(
+        DIR_STRIPE_FOLD_UNREACHABLE.load(Relaxed) > unreachable0,
+        "the unreachable stripe was skipped, counted"
+    );
+    assert_eq!(
+        dead.nlink,
+        alive.nlink - 1,
+        "the fold lacks exactly the dead supplier's stripe's subdirectory link"
+    );
+    squeezefs::data_grant::disarm_slot_custody().await;
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
 /// **A consumed checkpoint seq is a LEDGER seq — a token reader's poll
 /// walks across a joiner's leave** (PR 13, defect 25 — found by the
 /// fleet's `sym-storm` round 1: seven regions released at once consumed

@@ -239,6 +239,18 @@ pub static DIR_STRIPE_RMDIRS: AtomicU64 = AtomicU64::new(0);
 /// self-healing; Issue 4).
 pub static DIR_STRIPE_REHOMED_ON_TOUCH: AtomicU64 = AtomicU64::new(0);
 
+/// Stripes the attribute fold could not read at their HOLDER (PR 13,
+/// defect 24's second face): a `stat D` on a striped directory whose
+/// stripe's lessee is dead or unreachable — the fold serves without that
+/// stripe's contribution (its `nlink` term, its times) for the holder's
+/// death window instead of failing the whole `stat` (the storm leg: the
+/// manager's `stat /` — and every path walk across it, `.stats`
+/// included — failed `EIO` for the 15 s between seven joiners' deaths and
+/// their recovery). A dead lessee's stripe cannot move, so the missing
+/// term is bounded by the recovery; the stripe's DENTRIES stay
+/// exact-or-nothing.
+pub static DIR_STRIPE_FOLD_UNREACHABLE: AtomicU64 = AtomicU64::new(0);
+
 /// Test seam: hold the BACKGROUND migration a flip would kick, so a
 /// contract observes the `migrating` state (names in both homes, the
 /// fallback lookup, the LWW rule) and drives [`RoutedMetaBackend::
@@ -267,6 +279,7 @@ pub struct StripeStats {
     pub dying_refusals: u64,
     pub rmdirs: u64,
     pub rehomed_on_touch: u64,
+    pub fold_unreachable: u64,
 }
 
 pub fn stripe_stats() -> StripeStats {
@@ -281,6 +294,7 @@ pub fn stripe_stats() -> StripeStats {
         dying_refusals: DIR_STRIPE_DYING_REFUSALS.load(Ordering::Relaxed),
         rmdirs: DIR_STRIPE_RMDIRS.load(Ordering::Relaxed),
         rehomed_on_touch: DIR_STRIPE_REHOMED_ON_TOUCH.load(Ordering::Relaxed),
+        fold_unreachable: DIR_STRIPE_FOLD_UNREACHABLE.load(Ordering::Relaxed),
     }
 }
 
@@ -299,6 +313,7 @@ pub fn stats_json() -> serde_json::Map<String, serde_json::Value> {
         ("dir_stripe_dying_refusals", s.dying_refusals),
         ("dir_stripe_rmdirs", s.rmdirs),
         ("dir_stripe_rehomed_on_touch", s.rehomed_on_touch),
+        ("dir_stripe_fold_unreachable", s.fold_unreachable),
     ] {
         m.insert(k.to_string(), serde_json::json!(v));
     }
@@ -2072,9 +2087,24 @@ impl RoutedMetaBackend {
         let (mut mtime, mut ctime) = (inode.mtime, inode.ctime);
         for stripe in &map.stripes {
             // The stripe's record at its HOLDER (defect 24 — never this
-            // mount's projection of a foreign slot).
-            let Some(rec) = self.stripe_record(*stripe).await? else {
-                continue;
+            // mount's projection of a foreign slot). A holder that cannot
+            // be reached (dead — its slots the recovery's within the
+            // ledger poll — or unreachable) contributes NOTHING for the
+            // window rather than failing the `stat`: a dead lessee's
+            // stripe cannot move, and every path walk across `D` would
+            // otherwise fail with it.
+            let rec = match self.stripe_record(*stripe).await {
+                Ok(Some(rec)) => rec,
+                Ok(None) => continue,
+                Err(e) => {
+                    DIR_STRIPE_FOLD_UNREACHABLE.fetch_add(1, Ordering::Relaxed);
+                    log::debug!(
+                        "directory {}: stripe {stripe}'s record could not be read at its holder \
+                         ({e}) — the fold serves without it (dir_stripe_fold_unreachable)",
+                        map.dir
+                    );
+                    continue;
+                }
             };
             if rec.nlink >= 2 {
                 extra_links += u64::from(rec.nlink - 2);

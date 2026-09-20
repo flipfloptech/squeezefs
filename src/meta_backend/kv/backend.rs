@@ -7256,6 +7256,19 @@ impl KvMetaBackend {
     /// cursor, g }` + barrier → `ReleaseSlot` (tree 0 `Unleased`, one tx,
     /// barriered) → the page without the slot. Two durable homes at every
     /// instant; `slot_handover_phase_ns` records `flush / page / tree0`.
+    ///
+    /// **Lock order (PR 13 review round 1, Issue 20 — the edge step 0
+    /// added, `handover → 4a → (commit park → tick)`, and its two rules;
+    /// stated in `src/stripe_locks.rs` and design §5.1.4 too):**
+    /// `handover` is taken with NO 4a guard held and NEVER under the SMO
+    /// mutex (the accept path takes the SMO mutex only AFTER the transfer,
+    /// the cadence and the leave hold neither); step 0's drain takes 4a
+    /// guards under `handover` and may PARK at ring admission there — the
+    /// checkpoint tick that drains the park needs neither `handover` nor a
+    /// 4a guard, and the drain runs BEFORE `begin_release`, so a committer
+    /// parked at the door on `Releasing` can hold no guard the drain
+    /// needs. No path may hold a 4a guard and wait on `handover`; no path
+    /// may hold `handover` under the SMO mutex.
     async fn transfer_slot_locked(
         &self,
         region_id: u32,

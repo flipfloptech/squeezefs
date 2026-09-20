@@ -180,6 +180,27 @@ one label space. Contract:
 `reader_free_grace_tests::a_new_owner_terms_labels_are_acknowledged_from_scratch`
 (layout-blind).
 
+**A checkpoint flush that appended a PARKED frozen delta took the dirty
+floor of the records applied since (every layout).** (Symmetric PR 13,
+defect 6, `e5a9210b` — found at N = 8 through a joined appender's
+routinely refused SMO extents; reachable on a flat volume whenever an SMO
+fails mid-way.) An SMO that froze a node for its fold (`freeze_for_smo`)
+and FAILED before its swap — `ENOSPC` or a journal-reserve refusal on a
+flat volume, a refused extent grant on a joined appender — left its frozen
+delta parked; the next checkpoint flush step got that delta back, cleared
+the node's WHOLE dirty floor, and appended the parked delta alone, so every
+record committed into the open overlay meanwhile stayed RAM-only:
+invisible to every later flush and to the clean unmount's coverage test,
+and gone with the process (the storm read 21–280 of 192,000 acked unlinks
+resolving again after a clean leave, always the last ones). 1.3.0 restores
+the floor of the records still in the open delta in the same lock window
+(`NodeDirty::overlay_floor`; `meta_kv_flush_floor_kept` counts the
+engagement — 0 on a mount whose SMOs never fail mid-way). Pinned red-first
+on the flat harness by
+`kv_freeze_wedge_tests::a_flush_of_a_parked_frozen_delta_keeps_the_floor_of_the_records_applied_since`
+(the suite runs on both layouts in the sym matrix) and by the eight-writer
+storm pin. Record: `.benchmarks/2026-09-19-sym-acceptance.md` §4.3.
+
 **A mixed sync/async `scc` bucket acquisition in the KV node loader could
 wedge a mount's two metadata lanes for ever.** (Symmetric PR 12b review
 round 1, Issue 13 — pre-existing on every layout, made ordinary by the

@@ -129,6 +129,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// `INODE_META_LOCKS` (`merge_block_mappings` is forbidden from doing so by
 /// contract), so the extended order is acyclic.
 ///
+/// **The symmetric plane's per-volume `handover` mutex** (slot handovers —
+/// `KvMetaBackend::transfer_slot_locked`; symmetric PR 4, step 0 added by
+/// PR 13's defect 31; PR 13 review round 1, Issue 20) sits OUTSIDE this
+/// table and adds one edge, `handover → 4a → (commit park → tick)`, under
+/// two rules: `handover` is taken with NO 4a guard held and NEVER under the
+/// SMO mutex; step 0 (the departing slot's pending-times drain) takes 4a
+/// guards under `handover` and may park at ring admission there — the
+/// checkpoint tick that drains the park needs neither `handover` nor a 4a
+/// guard, and the drain runs before `begin_release`, so a committer parked
+/// at the door on `Releasing` holds no guard the drain needs. No path may
+/// hold a 4a guard and wait on `handover`; no path may hold `handover` under
+/// the SMO mutex.
+///
 /// Do not hold (1) write-guard across long backend I/O when a finer lock suffices
 /// (see [`crate::fuse_client::InodeWriteLockScope`] / P1-8). Do not acquire (1)
 /// while holding (3). The MetaLV backend is self-contained (no external

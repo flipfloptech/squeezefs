@@ -2051,10 +2051,23 @@ fn ensure_records_r5(plane: &Arc<TokenReaderPlane>) {
 
 /// The reader's side of the token plane for ONE volume.
 pub struct TokenReaderPlane {
+    /// The identity words (secret, client id, volume ordinal) and the
+    /// BIRTH endpoint; the endpoint in force is `endpoint` below.
     cfg: TokenClientConfig,
+    /// The holder's endpoint in force — `cfg.endpoint` at birth, replaced
+    /// by [`Self::repoint`] when the holder MOVED its listener (PR 13: a
+    /// manager failover keeps appender 0's identity and publishes a new
+    /// address; a `-o ro` reader's plane dialed the dead one for ever).
+    endpoint: arc_swap::ArcSwap<String>,
+    /// Bumped per re-point: a session dialed under an older generation is
+    /// dropped before its next call (the pool below, the channel task).
+    endpoint_gen: AtomicU64,
+    /// Wakes the channel task out of its reconnect backoff at a re-point.
+    repoint_wake: squeezefs_ipc::sqz_notify::Notify,
     /// The grant session pool (Issue 16a) — request/reply sessions,
-    /// dialed lazily, one call each at a time.
-    sessions: Vec<crate::sqz_sync::SqzMutex<Option<RpcClient>>>,
+    /// dialed lazily, one call each at a time; each carries the endpoint
+    /// generation it was dialed under.
+    sessions: Vec<crate::sqz_sync::SqzMutex<Option<(u64, RpcClient)>>>,
     session_rr: std::sync::atomic::AtomicUsize,
     /// Sessions the pool has DIALED (`dlm_token_grant_sessions`).
     grant_sessions: AtomicU64,
@@ -2065,9 +2078,14 @@ pub struct TokenReaderPlane {
     /// its object installs nothing and retries.
     revoke_gens: scc::HashMap<u64, u64>,
     channel_ok: AtomicBool,
+    /// The channel FAILED since its last completed round (a dial the
+    /// holder refused, a round that errored) — what tells a dead holder
+    /// from a channel on its first round, both `!channel_ok`.
+    channel_failed: AtomicBool,
     channel_last_round_ms: AtomicU64,
-    /// Woken at every completed channel round — `await_channel_fresh`'s
-    /// park (register-recheck; never a poll).
+    /// Woken at every completed channel round AND at every channel
+    /// failure — `await_channel_fresh`'s park (register-recheck; never a
+    /// poll).
     channel_round_wake: squeezefs_ipc::sqz_notify::Notify,
     channel_park_ms: AtomicU64,
     epoch: Instant,
@@ -2101,16 +2119,32 @@ pub struct TokenReaderPlane {
     serve_refusals: AtomicU64,
     channel_rounds: AtomicU64,
     fetch_retries: AtomicU64,
+    /// Re-points to a MOVED holder (`dlm_token_holder_repoints`).
+    holder_repoints: AtomicU64,
     grant_rtt: LatencyHistogram,
 }
 
 impl std::fmt::Debug for TokenReaderPlane {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenReaderPlane")
-            .field("endpoint", &self.cfg.endpoint)
+            .field("endpoint", &self.endpoint())
             .field("cached", &self.cache.len())
             .finish()
     }
+}
+
+/// What a resolve's bounded wait on a plane's recall channel found
+/// ([`TokenReaderPlane::await_channel_fresh_or_failed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelWait {
+    /// A round completed inside the window.
+    Fresh,
+    /// The channel FAILED (its dial refused, its round errored) — the
+    /// holder is dead or MOVED; the caller re-resolves it off durable
+    /// state before it spends the window.
+    Failed,
+    /// The window passed with neither.
+    Expired,
 }
 
 /// The typed word of a `NotHolder` answer: `object`'s slot is served by
@@ -2166,6 +2200,9 @@ impl TokenReaderPlane {
             crate::cpu::process_parallelism(),
         );
         let plane = Arc::new(Self {
+            endpoint: arc_swap::ArcSwap::from_pointee(cfg.endpoint.clone()),
+            endpoint_gen: AtomicU64::new(0),
+            repoint_wake: squeezefs_ipc::sqz_notify::Notify::new(),
             cfg,
             sessions: (0..sessions)
                 .map(|_| crate::sqz_sync::SqzMutex::new(None))
@@ -2176,6 +2213,7 @@ impl TokenReaderPlane {
             fetching: scc::HashMap::new(),
             revoke_gens: scc::HashMap::new(),
             channel_ok: AtomicBool::new(false),
+            channel_failed: AtomicBool::new(false),
             channel_last_round_ms: AtomicU64::new(0),
             channel_round_wake: squeezefs_ipc::sqz_notify::Notify::new(),
             // The S10 channel's birth park (the first poll's reply
@@ -2198,6 +2236,7 @@ impl TokenReaderPlane {
             serve_refusals: AtomicU64::new(0),
             channel_rounds: AtomicU64::new(0),
             fetch_retries: AtomicU64::new(0),
+            holder_repoints: AtomicU64::new(0),
             grant_rtt: LatencyHistogram::default(),
         });
         ensure_records_r5(&plane);
@@ -2265,9 +2304,58 @@ impl TokenReaderPlane {
         }
     }
 
-    /// The endpoint this plane dials.
-    pub fn endpoint(&self) -> &str {
-        &self.cfg.endpoint
+    /// The endpoint this plane dials NOW (the birth endpoint until a
+    /// [`Self::repoint`]).
+    pub fn endpoint(&self) -> Arc<String> {
+        self.endpoint.load_full()
+    }
+
+    /// **Re-point this plane at `endpoint` — the holder MOVED its
+    /// listener** (PR 13, the fleet's `sym-crash` leg: a manager failover
+    /// keeps appender 0's identity and publishes a NEW address into the
+    /// same claim-set entry; a `-o ro` reader's manager plane dialed the
+    /// dead one for the rest of its life — every read `EIO`, `.stats`
+    /// unreadable). The plane keeps its identity, its gauges, its data
+    /// sink and its R5 registration; what changes: the endpoint word, the
+    /// generation (every pooled session and the channel's session were
+    /// dialed under the old one and are dropped before their next call),
+    /// every cached token (a holder that moved may have re-granted the
+    /// object — PR 5's law for a dead holder, `stop_dead`'s drop) with its
+    /// purge, and the channel task is woken out of its backoff to dial the
+    /// new address at once. `false` = the same endpoint, nothing done.
+    pub async fn repoint(&self, endpoint: &str) -> bool {
+        let stale = self.endpoint();
+        if stale.as_str() == endpoint {
+            return false;
+        }
+        self.endpoint.store(Arc::new(endpoint.to_string()));
+        self.endpoint_gen.fetch_add(1, Ordering::AcqRel);
+        self.channel_ok.store(false, Ordering::Release);
+        self.channel_failed.store(false, Ordering::Release);
+        self.holder_repoints.fetch_add(1, Ordering::Relaxed);
+        log::info!(
+            "token plane (volume {}): the holder MOVED its listener {stale} → {endpoint} — \
+             re-pointed in place; every cached token dropped, the recall channel re-dials",
+            self.cfg.volume
+        );
+        self.drop_all_and_purge().await;
+        self.repoint_wake.notify_waiters();
+        true
+    }
+
+    /// Dial the endpoint in force; the session carries the generation it
+    /// was dialed under.
+    async fn dial(&self) -> Result<(u64, RpcClient)> {
+        let gen = self.endpoint_gen.load(Ordering::Acquire);
+        let endpoint = self.endpoint();
+        let client = RpcClient::connect(
+            endpoint.as_str(),
+            &self.cfg.secret,
+            &self.cfg.client_id,
+            None,
+        )
+        .await?;
+        Ok((gen, client))
     }
 
     /// Test seam: declare the reader's lease live (`Some(true)`), past
@@ -2324,6 +2412,21 @@ impl TokenReaderPlane {
     /// refusal into the round's latency). Returns whether the channel is
     /// fresh; a `false` is the caller's honest refusal.
     pub async fn await_channel_fresh(&self) -> bool {
+        self.await_channel(false).await == ChannelWait::Fresh
+    }
+
+    /// [`Self::await_channel_fresh`] that returns EARLY when the channel
+    /// FAILED (PR 13): a dial the holder refused or a round that errored
+    /// since the last completed round is the shape of a dead or MOVED
+    /// holder, and the resolve that called re-resolves the holder off
+    /// durable state instead of spending the whole window at the dead
+    /// address. A channel on its first round (never failed) waits the
+    /// window as before.
+    pub async fn await_channel_fresh_or_failed(&self) -> ChannelWait {
+        self.await_channel(true).await
+    }
+
+    async fn await_channel(&self, early_on_failure: bool) -> ChannelWait {
         let bound = std::time::Duration::from_millis(
             self.channel_park_ms.load(Ordering::Relaxed) * 2 + super::tokens::DELEG_FRESH_SLACK_MS,
         );
@@ -2333,18 +2436,31 @@ impl TokenReaderPlane {
         // the word, then parks bounded by what is left of the window.
         while !self.channel_fresh() {
             if self.stop.load(Ordering::Relaxed) {
-                return false;
+                return ChannelWait::Expired;
+            }
+            if early_on_failure && self.channel_failed.load(Ordering::Acquire) {
+                return ChannelWait::Failed;
             }
             let Some(left) = bound.checked_sub(started.elapsed()) else {
-                return false;
+                return ChannelWait::Expired;
             };
             let woken = self.channel_round_wake.notified();
             if self.channel_fresh() {
-                return true;
+                return ChannelWait::Fresh;
+            }
+            if early_on_failure && self.channel_failed.load(Ordering::Acquire) {
+                return ChannelWait::Failed;
             }
             let _ = squeezefs_ipc::sqz_time::timeout(left, woken).await;
         }
-        true
+        ChannelWait::Fresh
+    }
+
+    /// The channel failed: the word, and the waiters woken to read it.
+    fn note_channel_failure(&self) {
+        self.channel_ok.store(false, Ordering::Release);
+        self.channel_failed.store(true, Ordering::Release);
+        self.channel_round_wake.notify_waiters();
     }
 
     fn serve_gate(&self) -> Result<()> {
@@ -2380,19 +2496,17 @@ impl TokenReaderPlane {
             Some(g) => g,
             None => self.sessions[start].lock().await,
         };
-        let client = match guard.as_mut() {
+        // A session dialed before a re-point addresses the MOVED holder's
+        // dead listener: dropped, re-dialed at the endpoint in force.
+        let gen = self.endpoint_gen.load(Ordering::Acquire);
+        if guard.as_ref().is_some_and(|(g, _)| *g != gen) {
+            *guard = None;
+        }
+        let (_, client) = match guard.as_mut() {
             Some(c) => c,
             None => {
                 self.grant_sessions.fetch_add(1, Ordering::Relaxed);
-                guard.insert(
-                    RpcClient::connect(
-                        &self.cfg.endpoint,
-                        &self.cfg.secret,
-                        &self.cfg.client_id,
-                        None,
-                    )
-                    .await?,
-                )
+                guard.insert(self.dial().await?)
             }
         };
         match call_on(client, &self.cfg, call.clone()).await {
@@ -2415,15 +2529,7 @@ impl TokenReaderPlane {
                     return Err(e);
                 }
                 self.grant_sessions.fetch_add(1, Ordering::Relaxed);
-                let fresh = guard.insert(
-                    RpcClient::connect(
-                        &self.cfg.endpoint,
-                        &self.cfg.secret,
-                        &self.cfg.client_id,
-                        None,
-                    )
-                    .await?,
-                );
+                let (_, fresh) = guard.insert(self.dial().await?);
                 match call_on(fresh, &self.cfg, call).await {
                     Ok(r) => Ok(r),
                     Err(e) => {
@@ -2911,19 +3017,25 @@ impl TokenReaderPlane {
     /// parked call must never block a grant.
     pub async fn run_recall_channel(self: Arc<Self>) {
         self.channel_alive.store(true, Ordering::Release);
-        let mut session: Option<RpcClient> = None;
+        let mut session: Option<(u64, RpcClient)> = None;
         let mut backoff = RECONNECT_BACKOFF_FLOOR;
+        // The backoff park, cut short by a re-point (the task dials the
+        // MOVED holder's new address at once, not at the backoff's end).
+        let me = &*self;
+        let backoff_park = move |d: Duration| async move {
+            let woken = me.repoint_wake.notified();
+            let _ = squeezefs_ipc::sqz_time::timeout(d, woken).await;
+        };
         while !self.stop.load(Ordering::Relaxed) {
-            let client = match session.as_mut() {
+            // A session dialed before a re-point is the dead listener's.
+            let gen = self.endpoint_gen.load(Ordering::Acquire);
+            if session.as_ref().is_some_and(|(g, _)| *g != gen) {
+                session = None;
+                backoff = RECONNECT_BACKOFF_FLOOR;
+            }
+            let (_, client) = match session.as_mut() {
                 Some(c) => c,
-                None => match RpcClient::connect(
-                    &self.cfg.endpoint,
-                    &self.cfg.secret,
-                    &self.cfg.client_id,
-                    None,
-                )
-                .await
-                {
+                None => match self.dial().await {
                     Ok(c) => {
                         backoff = RECONNECT_BACKOFF_FLOOR;
                         session.insert(c)
@@ -2931,12 +3043,12 @@ impl TokenReaderPlane {
                     Err(e) => {
                         log::warn!(
                             "token recall channel to {} could not connect: {e} (retry in {:?})",
-                            self.cfg.endpoint,
+                            self.endpoint(),
                             backoff
                         );
-                        self.channel_ok.store(false, Ordering::Release);
+                        self.note_channel_failure();
                         self.drop_all_and_purge().await;
-                        squeezefs_ipc::sqz_time::sleep(backoff).await;
+                        backoff_park(backoff).await;
                         backoff = (backoff * 2).min(RECONNECT_BACKOFF_CEILING);
                         continue;
                     }
@@ -2950,10 +3062,17 @@ impl TokenReaderPlane {
             if self.stop.load(Ordering::Relaxed) {
                 break;
             }
+            // A round that returned from a listener re-pointed away from
+            // meanwhile says nothing about the endpoint in force.
+            if self.endpoint_gen.load(Ordering::Acquire) != gen {
+                session = None;
+                continue;
+            }
             match round {
                 Ok(TokenReply::Recall { frame_id, objects }) => {
                     self.channel_last_round_ms
                         .store(self.now_ms(), Ordering::Release);
+                    self.channel_failed.store(false, Ordering::Release);
                     self.channel_ok.store(true, Ordering::Release);
                     self.channel_rounds.fetch_add(1, Ordering::Relaxed);
                     self.channel_round_wake.notify_waiters();
@@ -2966,7 +3085,7 @@ impl TokenReaderPlane {
                                  reconnects; the holder's deadline retires the grants"
                             );
                             session = None;
-                            self.channel_ok.store(false, Ordering::Release);
+                            self.note_channel_failure();
                             self.drop_all_and_purge().await;
                         }
                     }
@@ -2974,19 +3093,19 @@ impl TokenReaderPlane {
                 Ok(other) => {
                     log::warn!("token recall channel answered {other:?}; reconnecting");
                     session = None;
-                    self.channel_ok.store(false, Ordering::Release);
+                    self.note_channel_failure();
                     self.drop_all_and_purge().await;
                 }
                 Err(e) => {
                     log::warn!(
                         "token recall channel to {} failed: {e} — every token is dropped \
                          (fail-closed) until a round completes",
-                        self.cfg.endpoint
+                        self.endpoint()
                     );
                     session = None;
-                    self.channel_ok.store(false, Ordering::Release);
+                    self.note_channel_failure();
                     self.drop_all_and_purge().await;
-                    squeezefs_ipc::sqz_time::sleep(backoff).await;
+                    backoff_park(backoff).await;
                     backoff = (backoff * 2).min(RECONNECT_BACKOFF_CEILING);
                 }
             }
@@ -3123,6 +3242,7 @@ impl TokenReaderPlane {
             channel_alive: self.channel_alive.load(Ordering::Acquire),
             grant_sessions: self.sessions.len() as u64,
             grant_sessions_dialed: self.grant_sessions.load(Ordering::Relaxed),
+            holder_repoints: self.holder_repoints.load(Ordering::Relaxed),
         }
     }
 
@@ -3169,6 +3289,9 @@ pub struct TokenReaderStats {
     pub grant_sessions: u64,
     /// Sessions of the pool dialed so far.
     pub grant_sessions_dialed: u64,
+    /// Re-points to a holder that MOVED its listener (PR 13) — 0 on a
+    /// fleet that never failed over.
+    pub holder_repoints: u64,
 }
 
 /// Issue one verb on `client`; a refusal status with a reply body is
@@ -3535,6 +3658,10 @@ pub fn reader_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
         "dlm_token_channel_alive": every(&|s| s.channel_alive),
         "dlm_token_grant_sessions": per(&|s| s.grant_sessions),
         "dlm_token_grant_sessions_dialed": per(&|s| s.grant_sessions_dialed),
+        // PR 13 — a reader plane RE-POINTED at a holder that moved its
+        // listener (a manager failover, a joiner's rejoin): 0 on a fleet
+        // that never failed over; one per (plane, move) otherwise.
+        "dlm_token_holder_repoints": per(&|s| s.holder_repoints),
         "dlm_token_grant_rtt_ns": serde_json::Value::Array(
             volumes
                 .iter()

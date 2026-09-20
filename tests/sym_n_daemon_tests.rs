@@ -1405,7 +1405,9 @@ async fn a_dominating_requester_earns_an_idle_joined_holders_tree_through_served
     let hvol = Arc::clone(&holder.volumes[0]);
     let own = create_files(&holder, a, "own", 4).await;
     let g_lease = match tree0_state(&mvol, SLOT_A).await {
-        Some(SlotState::Leased { appender_id, g, .. }) if appender_id == 1 => g,
+        Some(SlotState::Leased {
+            appender_id: 1, g, ..
+        }) => g,
         other => panic!("joiner 1 holds the directory's slot: {other:?}"),
     };
     let requester = join(&uris, &venue, &mvol, 2).await;
@@ -5992,7 +5994,7 @@ async fn attribute_resurrection(
                     Err(_) => "Err",
                 }
             );
-            let layout = kv.node_cache().config().layout.clone();
+            let layout = kv.node_cache().config().layout;
             let node_size = layout.node_size();
             let buf = squeezefs::uring_fs::read_at(kv.device_path(), addr, node_size)
                 .await

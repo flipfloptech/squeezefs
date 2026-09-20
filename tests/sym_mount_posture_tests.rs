@@ -934,7 +934,7 @@ async fn a_token_reader_dials_each_objects_slot_holder_and_refuses_an_unbound_on
             volume: 0,
         })
         .expect("the manager's plane arms");
-    assert_eq!(default.endpoint(), endpoint_a);
+    assert_eq!(*default.endpoint(), endpoint_a);
     let wait_fresh = |plane: Arc<squeezefs::meta_ship::token_plane::TokenReaderPlane>| async move {
         let started = std::time::Instant::now();
         while !plane.stats().channel_fresh {
@@ -1039,12 +1039,12 @@ async fn a_token_reader_dials_each_objects_slot_holder_and_refuses_an_unbound_on
         .expect("a token reader");
     assert!(!Arc::ptr_eq(&plane_b, &default), "a per-holder plane");
     assert_eq!(
-        plane_b.endpoint(),
+        *plane_b.endpoint(),
         endpoint_b,
         "dialed to the holder's endpoint"
     );
     assert_eq!(
-        default.endpoint(),
+        *default.endpoint(),
         endpoint_a,
         "the manager's plane unchanged"
     );
@@ -1189,6 +1189,180 @@ async fn a_readers_first_resolve_of_a_freshly_dialed_holder_serves_without_a_han
     a.shutdown();
     b.shutdown();
     shutdown(&writer).await;
+}
+
+/// **PR 13 (found by the fleet's `sym-crash` leg — a PR 12 defect): a
+/// `-o ro` token reader FOLLOWS a manager failover to the successor's
+/// listener.** The manager's plane is the reader's default (appender 0's,
+/// dialed at the arm on the endpoint the manager's claim-set entry named);
+/// after the manager is killed and a SUCCESSOR at the same identity
+/// re-walks the ladder, the successor publishes a NEW listener into that
+/// same entry (an ephemeral port — `SQUEEZEFS_MW_BIND=auto`), the
+/// reader's S5 poll adopts the checkpoint carrying it, and its membership
+/// re-points to the successor — but the plane kept dialing the dead
+/// address for ever (`token recall channel to <dead> could not connect …
+/// retry in 5s`), every read `EIO` "the recall channel to the holder is
+/// not fresh", `.stats` unreadable, `membership_readers` never 1 again.
+/// The writer's per-holder plane already follows a moved holder
+/// (`data_grant::foreign_read_plane` → `rebind_holder_endpoint_if_moved`);
+/// the READER's planes did not. Now a resolve whose plane's channel is
+/// dead or never freshens re-resolves the holder's endpoint off DURABLE
+/// state — appender 0's page identity → its claim-set entry, read off the
+/// reader's own projection, no wire — and a MOVED endpoint RE-POINTS the
+/// plane in place (its identity, its gauges, its data sink and its R5
+/// registration kept; every cached token dropped — a holder that moved
+/// may have re-granted; the channel re-dials the successor at once):
+/// the next resolve serves, `dlm_token_holder_repoints` = 1, the plane
+/// `Arc::ptr_eq` the one armed. An unmoved endpoint keeps the shipped
+/// fail-closed window verbatim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_reader_follows_a_manager_failover_to_the_successors_listener() {
+    use squeezefs::cluster_wire as cw;
+    use squeezefs::meta_ship::token_plane::{TokenClientConfig, TokenSetService};
+    const SECRET: &[u8] = b"pr13-reader-failover-secret";
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempfile::tempdir().unwrap();
+    let uris = vec![format_stamped_member(dir.path(), "sym0").await];
+    let listener = |vols: &[Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend>]| {
+        cw::RpcListener::start_async(
+            cw::RpcListenerConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("literal addr"),
+                service_threads: 2,
+                ..cw::RpcListenerConfig::default()
+            },
+            SECRET.to_vec(),
+            TokenSetService::new(vols),
+        )
+        .expect("token listener")
+    };
+    // The MANAGER: its token service on listener A, A published into its
+    // claim-set entry (the ladder's rung 7 on a real mount).
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mine = manager
+        .create(ROOT, "mine", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("an own file")
+        .ino;
+    let a = listener(&manager.volumes);
+    let endpoint_a = a.endpoint().to_string();
+    // The ladder's rungs 3 + 7 on a real mount: this node's claim-set
+    // entry carrying its listener (`enroll_manager`'s shape in the
+    // N-daemon suite), checkpointed so a reader's poll sees it.
+    let enroll = |vol: Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend>,
+                  endpoint: String| async move {
+        use squeezefs::membership::{MemberIdentity, MemberRole};
+        let identity = MemberIdentity {
+            id: squeezefs::cowriter::node_member_id().expect("this node's member id"),
+            role: MemberRole::Writer,
+            pid: std::process::id(),
+            boot: squeezefs::meta_backend::kv::backend::read_boot_id(),
+            endpoint: Some(endpoint),
+            pr_key: 0,
+        };
+        squeezefs::membership::upsert_writer_member(
+            &vol,
+            &identity,
+            squeezefs::dlm::durable_term(),
+        )
+        .await
+        .expect("the claim-set entry");
+        vol.checkpoint_now().await.expect("checkpoint");
+    };
+    enroll(Arc::clone(&manager.volumes[0]), endpoint_a.clone()).await;
+
+    // The READER: armed at the endpoint the entry names (the mount path's
+    // `arm_token_readers` resolves exactly this), served under a token.
+    let reader = squeezefs::meta_backend::open_routed_meta_set_read_only(&uris)
+        .await
+        .expect("read-only open");
+    let rv = Arc::clone(&reader.volumes[0]);
+    rv.arm_reader_revalidation(None)
+        .expect("the reader's revalidation arms");
+    assert_eq!(
+        squeezefs::sym_join::resolve_holder_endpoint(&rv, 0).await,
+        Some(endpoint_a.clone()),
+        "the manager's entry names A"
+    );
+    let default = rv
+        .arm_token_reader(TokenClientConfig {
+            endpoint: endpoint_a.clone(),
+            secret: SECRET.to_vec(),
+            client_id: "pr13-failover-reader".to_string(),
+            volume: 0,
+        })
+        .expect("the manager's plane arms");
+    reader
+        .getattr(mine)
+        .await
+        .expect("served under a token from the manager");
+    let grants_before = default.stats().grants;
+    assert_eq!(grants_before, 1);
+    assert_eq!(default.stats().holder_repoints, 0);
+
+    // THE FAILOVER: the manager dies (its listener with it); a successor
+    // at the same identity wins the ladder and publishes listener B.
+    a.shutdown();
+    shutdown(&manager).await;
+    drop(manager);
+    let successor = open_under(&uris, &Knobs::armed()).await;
+    let b = listener(&successor.volumes);
+    let endpoint_b = b.endpoint().to_string();
+    assert_ne!(endpoint_b, endpoint_a, "a new listener address");
+    enroll(Arc::clone(&successor.volumes[0]), endpoint_b.clone()).await;
+    // The reader's poll adopts it (the mount path's cadence).
+    let out = rv.revalidate_reader().await.expect("the reader polls");
+    assert!(out.advanced, "the poll adopted the successor's epoch");
+    assert_eq!(
+        squeezefs::sym_join::resolve_holder_endpoint(&rv, 0).await,
+        Some(endpoint_b.clone()),
+        "durable state names the successor's listener"
+    );
+
+    // The read after the failover SERVES — the plane followed the entry.
+    let attrs = reader
+        .getattr(mine)
+        .await
+        .expect("served under a token from the SUCCESSOR (the plane re-pointed)");
+    assert_eq!(attrs.mode & 0o777, 0o644);
+    assert_eq!(
+        *default.endpoint(),
+        endpoint_b,
+        "the manager's plane dials the successor"
+    );
+    assert!(
+        Arc::ptr_eq(rv.token_reader().expect("still armed"), &default),
+        "the plane is re-pointed IN PLACE — its identity and gauges continue"
+    );
+    let s = default.stats();
+    assert_eq!(s.holder_repoints, 1, "one re-point: {s:?}");
+    assert_eq!(
+        s.grants,
+        grants_before + 1,
+        "the gauge continued across the re-point (the post-failover grant): {s:?}"
+    );
+    assert!(
+        s.channel_fresh,
+        "the channel to the successor completed a round"
+    );
+    assert_eq!(
+        rv.reader_holder_endpoint(0).as_deref(),
+        Some(endpoint_b.as_str()),
+        "holder 0's binding moved with it"
+    );
+    // A second read pays no second re-point and serves from the cache.
+    reader.getattr(mine).await.expect("served");
+    assert_eq!(default.stats().holder_repoints, 1);
+    let face = squeezefs::meta_ship::token_plane::reader_stats_json(&reader.volumes);
+    assert_eq!(
+        face["dlm_token_holder_repoints"][0].as_u64(),
+        Some(1),
+        "the face carries the re-point: {face}"
+    );
+
+    shutdown(&reader).await;
+    b.shutdown();
+    shutdown(&successor).await;
 }
 
 // ===========================================================================

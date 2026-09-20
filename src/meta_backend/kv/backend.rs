@@ -3511,7 +3511,11 @@ impl KvMetaBackend {
             // failing closed on the dial's own latency (PR 13: the first
             // `--token-readers` fleet read EIO on its first stat; the
             // writer's divert already waited, PR 12b round 1 Issue 8).
-            default.await_channel_fresh().await;
+            // A channel that FAILED or never freshens: the manager may
+            // have MOVED (a failover's successor at the same identity
+            // publishes a new listener) — re-resolved off durable state,
+            // re-pointed in place.
+            self.reader_plane_follow_holder(default, 0).await;
             return Ok(Some(Arc::clone(default)));
         };
         let bound = self
@@ -3561,17 +3565,44 @@ impl KvMetaBackend {
         // One plane per LISTENER: the manager's own endpoint is the
         // manager's plane (a holder the manager's daemon also serves), and
         // an endpoint already dialed for another holder is reused. Either
-        // way the resolve parks on the channel's first round (above).
+        // way the resolve parks on the channel's first round (above); a
+        // channel that failed re-resolves the holder (a rejoined joiner
+        // publishes a new listener under the same appender id — the
+        // per-holder plane keyed by the dead address is stopped and the
+        // successor's dialed).
         if *endpoint == *default.endpoint() {
-            default.await_channel_fresh().await;
+            self.reader_plane_follow_holder(default, 0).await;
             return Ok(Some(Arc::clone(default)));
         }
+        let mut endpoint = endpoint;
         if let Some(plane) = self
             .reader_holder_planes
             .read_sync(&endpoint, |_, p| Arc::clone(p))
         {
-            plane.await_channel_fresh().await;
-            return Ok(Some(plane));
+            match plane.await_channel_fresh_or_failed().await {
+                crate::meta_ship::token_plane::ChannelWait::Fresh => return Ok(Some(plane)),
+                crate::meta_ship::token_plane::ChannelWait::Failed
+                | crate::meta_ship::token_plane::ChannelWait::Expired => {
+                    match self.reader_holder_moved(holder, &endpoint).await {
+                        Some(moved) => {
+                            plane.stop_dead();
+                            self.reader_holder_planes.remove_sync(&endpoint);
+                            endpoint = moved;
+                        }
+                        None => {
+                            // The same address: the shipped fail-closed
+                            // window, then the plane's own refusal.
+                            plane.await_channel_fresh().await;
+                            return Ok(Some(plane));
+                        }
+                    }
+                }
+            }
+            // The holder moved onto the manager's own listener.
+            if *endpoint == *default.endpoint() {
+                default.await_channel_fresh().await;
+                return Ok(Some(Arc::clone(default)));
+            }
         }
         let cfg = default.config_for_endpoint(&endpoint);
         let plane = crate::meta_ship::token_plane::TokenReaderPlane::new(cfg);
@@ -3610,6 +3641,63 @@ impl KvMetaBackend {
                 Ok(winner)
             }
         }
+    }
+
+    /// **A reader plane FOLLOWS its holder to a moved listener** (PR 13 —
+    /// found by the fleet's `sym-crash` leg: after the manager's kill -9
+    /// and remount the `-o ro` reader dialed the dead manager's ephemeral
+    /// port for the rest of its life, every read `EIO`, `.stats`
+    /// unreadable). Park on the channel's round as before; a channel that
+    /// FAILED (the dial refused) or never freshened re-resolves appender
+    /// `appender`'s endpoint off DURABLE state — its page identity → its
+    /// claim-set entry, read off this reader's own projection, which the
+    /// S5 poll refreshes from the successor's checkpoints (the entry is a
+    /// control xattr no token carries: a local read, no wire) — and a
+    /// MOVED endpoint re-points the plane in place (`TokenReaderPlane::
+    /// repoint`) and parks on the new channel's first round. The same
+    /// address keeps the shipped fail-closed posture verbatim (the plane's
+    /// own refusal once the window passes). The writer's per-holder planes
+    /// had this law since PR 12b (`data_grant::foreign_read_plane`); the
+    /// reader's did not.
+    async fn reader_plane_follow_holder(
+        &self,
+        plane: &Arc<crate::meta_ship::token_plane::TokenReaderPlane>,
+        appender: u32,
+    ) {
+        use crate::meta_ship::token_plane::ChannelWait;
+        match plane.await_channel_fresh_or_failed().await {
+            ChannelWait::Fresh => {}
+            ChannelWait::Failed | ChannelWait::Expired => {
+                let stale = plane.endpoint();
+                if let Some(moved) = self.reader_holder_moved(appender, &stale).await {
+                    if plane.repoint(&moved).await {
+                        plane.await_channel_fresh().await;
+                    }
+                } else {
+                    plane.await_channel_fresh().await;
+                }
+            }
+        }
+    }
+
+    /// Appender `holder`'s endpoint per durable state when it differs from
+    /// `stale` — the reader's binding for it is moved with it. One
+    /// appender-directory read + one local claim-set read per call; the
+    /// caller reaches it only on a channel that failed or never
+    /// freshened, so a healthy reader pays nothing.
+    async fn reader_holder_moved(&self, holder: u32, stale: &str) -> Option<Arc<str>> {
+        crate::meta_ship::token_plane::note_reader_holder_resolve();
+        let fresh = Box::pin(crate::sym_join::resolve_holder_endpoint(self, holder)).await?;
+        if fresh == stale {
+            return None;
+        }
+        log::info!(
+            "meta volume {}: appender {holder} MOVED its listener {stale} → {fresh} (a successor \
+             at the same identity) — this reader's plane follows it",
+            self.path.display()
+        );
+        self.bind_reader_holder_endpoint(holder, &fresh);
+        Some(Arc::from(fresh))
     }
 
     /// **The divert sites' ONE serve** (`find_dentry` / `getattr` /

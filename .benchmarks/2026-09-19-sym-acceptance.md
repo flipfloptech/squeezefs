@@ -463,6 +463,48 @@ merge_of_its_stripes` (48 names over 4 stripes: the reader lists exactly
 the user names, resolves and stats every child, `stat D` folds, ≥ K + C
 grants).
 
+### 4.4h Defect 15 — FIXED (PR 12's `-o ro` reader / PR 5's plane): a token reader's plane never followed a manager failover — every read `EIO` for the rest of the reader's life
+
+Found by `sym-crash` round 1 on the fixed-defect-6 binary: after the
+manager's `kill -9` + remount the token reader (m1) answered `EIO` to
+every op — `.stats` unreadable, `membership_readers` never 1 again
+(attempt 1 read "never reached 1 within 129 s"). Its log: `token recall
+channel to 192.168.86.52:40325 could not connect … retry in 5s` for ever,
+`read token unavailable: the recall channel to the holder is not fresh`
+— the DEAD manager's ephemeral listener, while the successor had armed
+on `:34261` and the reader's membership had already re-pointed to the
+successor (era 3). The manager's plane is the reader's DEFAULT
+(`tokens_reader`, a `OnceLock` with a fixed `cfg.endpoint`, dialed at the
+arm on the endpoint appender 0's claim-set entry named); PR 12b gave the
+WRITER's per-holder planes a follow arm (`data_grant::foreign_read_plane`
+→ `rebind_holder_endpoint_if_moved`: "a manager failover keeps appender
+0's identity and publishes a NEW listener") and the READER's planes —
+the default and the per-holder ones alike — got none. Fix (`KvMetaBackend::
+reader_plane_follow_holder`, `TokenReaderPlane::repoint`): a resolve whose
+plane's channel FAILED (its dial refused — `ChannelWait::Failed`, early,
+never the whole window at a dead address) or never freshened re-resolves
+the holder's endpoint off DURABLE state (`sym_join::resolve_holder_
+endpoint`: its page identity → its claim-set entry, a control xattr read
+off the reader's own S5 projection — no wire; the poll refreshes it from
+the successor's checkpoints), and a MOVED endpoint re-points the plane
+IN PLACE: identity, gauges, data sink and R5 registration kept; the
+endpoint word and its generation swapped (every pooled grant session and
+the channel's session were dialed under the old one and drop before
+their next call), every cached token dropped with its purge (a holder
+that moved may have re-granted — PR 5's dead-holder law), the channel
+task woken out of its backoff to dial the successor at once; the binding
+for the holder moves with it. A per-holder plane (a rejoined joiner at a
+new port) is stopped dead and the successor's dialed. The same address
+keeps the shipped fail-closed window verbatim. Gauge `dlm_token_holder_
+repoints` (0 on a fleet that never failed over). Pin (RED-first with the
+fleet's exact text against the shipped shape, GREEN in 4.2 s): `sym_mount_
+posture_tests::a_token_reader_follows_a_manager_failover_to_the_successors_
+listener` — the manager enrolled at A, the reader served from A; the
+manager dies, a successor at the same identity enrolls B, the reader's
+poll adopts it; the next `getattr` SERVES from B, the plane `Arc::ptr_eq`
+the one armed, `grants` continuous, `holder_repoints` 1, holder 0's
+binding moved.
+
 ### 4.4f Harness — `sym-foreign-touch` LIVE's storm died at launch
 
 On the defect-10 binary the LIVE phase read `slot_handovers` 1 "a live

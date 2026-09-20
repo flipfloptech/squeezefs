@@ -681,6 +681,12 @@
 # Usage:  sudo tests/run_mw_matrix.sh <leg> [--require-host-scoped-subsys]
 #         [--window=S] [--netem=MS] [--victim=IDX]   (the s6-* legs)
 #         [--rounds=N]                               (s7-kill-matrix, s11-killrange, sym-crash)
+#         [--venue=laptop|box]                       (the sym-* legs; default laptop — the
+#                                                     VENUE word: `appender_flush_ceiling_overruns`,
+#                                                     the ruling's timing-shaped gauge, is REPORTED
+#                                                     per round as venue-attributed on the laptop
+#                                                     and stays must-stay-0 on the box; every other
+#                                                     law is fatal on both)
 #         [--procs=P]                                (s11-mpiio)
 #         [--partial-authority]                      (s10-placement-tarx, PR 8)
 #         [--rewrite-mb=M --rewrite-files=F]         (pv-rewrite-funnel)
@@ -820,6 +826,15 @@ SYM_WALLS_MB="${SQZ_MWMATRIX_SYM_WALLS_MB:-64}"
 SYM_VICTIMS=1
 SYM_XO=0
 SYM_STRIPED=0
+# The VENUE word (PR 13 review round 1, Issue 2; the venue ruling
+# `51bf21e1`): on the LAPTOP a timing-shaped must-stay-0 gauge —
+# `appender_flush_ceiling_overruns`, the one the ruling names — is a
+# venue reading the box bracket decides, so it is REPORTED per round as
+# `venue-attributed` (ledger `$STATE/rows/venue-attributed.txt`) instead
+# of failing the leg; on the BOX it stays must-stay-0. Every other law
+# (acked loss, deleted-stays-deleted, fsck, refusals, violations,
+# conflicts) is fatal on both venues.
+SYM_VENUE="${SQZ_MWMATRIX_VENUE:-laptop}"
 # `--striped`'s K: the design's operating point (`MINT_SPREAD` = 64 — a
 # flip to fewer stripes than the fleet's creators is a different row).
 SYM_STRIPE_K="${SQZ_MWMATRIX_SYM_STRIPE_K:-64}"
@@ -835,6 +850,7 @@ for a in "$@"; do
     --victims=*) SYM_VICTIMS="${a#--victims=}" ;;
     --cross-owner) SYM_XO=1 ;;
     --striped) SYM_STRIPED=1 ;;
+    --venue=*) SYM_VENUE="${a#--venue=}" ;;
     --require-host-scoped-subsys) REQUIRE_HS=1 ;;
     --window=*) S6_WINDOW_S="${a#--window=}" ;;
     --netem=*) S6_NETEM_MS="${a#--netem=}" ;;
@@ -870,6 +886,7 @@ done
 S11_PROCS="${S11_PROCS:-4}"
 [[ "$S11_PROCS" =~ ^[0-9]+$ ]] && [ "$S11_PROCS" -ge 1 ] && [ "$S11_PROCS" -le 16 ] ||
     die "--procs takes 1..16 (got '$S11_PROCS')"
+case "$SYM_VENUE" in laptop | box) ;; *) die "--venue takes laptop|box (got '$SYM_VENUE')" ;; esac
 [[ "$S9A_MB_CAP" =~ ^[0-9]+$ ]] && [ "$S9A_MB_CAP" -ge 64 ] || die "--mb takes MiB >= 64 (got '$S9A_MB_CAP')"
 [[ "$S11_MB_CAP" =~ ^[0-9]+$ ]] && [ "$S11_MB_CAP" -ge 64 ] || die "--mb takes MiB >= 64 (got '$S11_MB_CAP')"
 [[ "$S6_WINDOW_S" =~ ^[0-9]+$ ]] || die "--window takes seconds (got '$S6_WINDOW_S')"
@@ -3357,31 +3374,29 @@ $out"
         # live joiner's lookup of a removed directory whose child's holder
         # had died and rejoined parked 24 min at station [entry]) is a red
         # with its daemon named, never a leg that hangs.
-        local reader_idx stale=0 src
+        local reader_idx stale=0 verdict
         for idx in 0 "${joiners[@]}"; do
             for reader_idx in 0 "${joiners[@]}"; do
-                # The EXPECTED verdict is a failing `stat` (ENOENT): read
-                # its status inside the condition — a bare `timeout … stat`
-                # under `set -e` exited the leg silently right here (the
-                # round-3 re-runs' `rc 1` with no line after the fsck).
-                local stat_err=""
-                if stat_err="$(timeout 60 stat "$(mnt_of "$reader_idx")/storm-w$idx-r$round" 2>&1 >/dev/null)"; then
-                    src=0
-                else
-                    src=$?
-                fi
-                if [ "$src" = "124" ]; then
-                    die "round $round: stat of removed storm-w$idx-r$round through m$reader_idx HUNG past 60 s — a parked lookup (m$reader_idx's log: fuse_op_watchdog_overdue)"
-                elif [ "$src" = "0" ]; then
+                # The EXPECTED verdict is a failing `stat` (ENOENT): the
+                # classifier reads its status inside its own condition — a
+                # bare `timeout … stat` under `set -e` exited the leg
+                # silently right here (the round-3 re-runs' `rc 1` with no
+                # line after the fsck). ONE classifier for every arm
+                # (`sym_stat_deleted`): only ENOENT is "deleted" — an EIO /
+                # EAGAIN here is a daemon that cannot answer (the round-1
+                # run: a joiner whose volumes FAIL-STOPPED read every
+                # removed name as "gone" and the leg counted it green —
+                # defect 29).
+                verdict="$(sym_stat_deleted "$(mnt_of "$reader_idx")/storm-w$idx-r$round" 60)"
+                case "$verdict" in
+                hung) die "round $round: stat of removed storm-w$idx-r$round through m$reader_idx HUNG past 60 s — a parked lookup (m$reader_idx's log: fuse_op_watchdog_overdue)" ;;
+                resurrected)
                     stale=$((stale + 1))
                     echo "STALE: m$reader_idx still resolves storm-w$idx-r$round" >>"$rowdir/stale-r$round.txt"
-                elif ! echo "$stat_err" | grep -q "No such file"; then
-                    # Only ENOENT is "deleted": an EIO / EAGAIN here is a
-                    # daemon that cannot answer (the round-1 run: a joiner
-                    # whose volumes FAIL-STOPPED read every removed name as
-                    # "gone" and the leg counted it green — defect 29).
-                    die "round $round: stat of removed storm-w$idx-r$round through m$reader_idx failed with something other than ENOENT: $stat_err"
-                fi
+                    ;;
+                deleted) ;;
+                error:*) die "round $round: stat of removed storm-w$idx-r$round through m$reader_idx failed with something other than ENOENT: ${verdict#error:}" ;;
+                esac
             done
         done
         [ "$stale" = "0" ] || die "round $round: $stale removed round directory(ies) still resolve through a mount (see $rowdir/stale-r$round.txt)"
@@ -3448,6 +3463,61 @@ ack_verify_xo() { # ledger tag orig_mnt read_mnt lostfile dst_rel prefix moved_l
     echo "$lost"
 }
 
+# The VENUE word's one exemption (PR 13 review round 1, Issue 2 — the
+# venue ruling `51bf21e1`): is `key` a timing-shaped gauge the laptop
+# reports as venue-attributed instead of failing on? Exactly ONE gauge,
+# and only under `--venue=laptop`.
+sym_zero_venue_attributed() { # key -> 0 (yes) | 1 (no)
+    [ "$SYM_VENUE" = "laptop" ] && [ "$1" = "appender_flush_ceiling_overruns" ]
+}
+
+# Record a venue-attributed reading (never a verdict): the ledger every
+# row's note copies, and a loud line on stderr.
+sym_zero_venue_note() { # label idx key value
+    local label="$1" idx="$2" k="$3" v="$4"
+    mkdir -p "$STATE/rows" 2>/dev/null || true
+    echo "$label m$idx $k=$v venue=$SYM_VENUE" >>"$STATE/rows/venue-attributed.txt"
+    echo "[mwmatrix] VENUE-ATTRIBUTED ($label): $k=$v on m$idx — a timing-shaped reading on the $SYM_VENUE; the box bracket decides (51bf21e1), never a MISS here" >&2
+}
+
+# Judge ONE must-stay-0 gauge: die, or — the venue word's exemption —
+# report it and continue.
+sym_zero_judge() { # label idx key value
+    local label="$1" idx="$2" k="$3" v="$4"
+    [ "$v" = "0" ] && return 0
+    if sym_zero_venue_attributed "$k"; then
+        sym_zero_venue_note "$label" "$idx" "$k" "$v"
+        return 0
+    fi
+    die "$label: $k=$v on m$idx (must stay 0)"
+}
+
+# **The ONE deleted-stays-deleted classifier** (PR 13 review round 1, Issue
+# 8): a removed name's `stat` through a mount is `deleted` ONLY on ENOENT.
+# A resolved name is `resurrected`; a stat past its bound is `hung` (a
+# parked lookup — a red with its daemon named, never a leg that hangs);
+# any other failure is `error:<text>` — an EIO / EAGAIN / a refused read
+# is a daemon that CANNOT ANSWER, never "gone" (defect 29 was found
+# because a fail-stopped daemon's EIO on every removed name read as
+# GREEN). Every arm of the oracle (storm, scale, crash) reads this word.
+sym_stat_deleted() { # path [timeout_s] -> deleted|resurrected|hung|error:<text>
+    local path="$1" bound="${2:-60}" err="" src
+    if err="$(timeout "$bound" stat "$path" 2>&1 >/dev/null)"; then
+        src=0
+    else
+        src=$?
+    fi
+    if [ "$src" = "124" ]; then
+        echo hung
+    elif [ "$src" = "0" ]; then
+        echo resurrected
+    elif echo "$err" | grep -q "No such file"; then
+        echo deleted
+    else
+        echo "error:$err"
+    fi
+}
+
 # The symmetric must-stay-0 set on one daemon of the N-daemon fleet (the
 # manager's `sym_crash_round_asserts` set plus the Joined family's).
 sym_storm_daemon_asserts() { # round idx
@@ -3460,7 +3530,7 @@ sym_storm_daemon_asserts() { # round idx
         appender_flush_ceiling_overruns dead_member_write_deferrals data_alloc_bitmap_drift \
         joined_control_refusals xv_cross_owner_intents_stuck invariant_tripwires; do
         v="$(stat_sum "$idx" "$k")"
-        [ "$v" = "0" ] || die "round $round: $k=$v on m$idx (must stay 0)"
+        sym_zero_judge "round $round" "$idx" "$k" "$v"
     done
     [ "$(stat_all_eq "$idx" symmetric_meta 1)" = "1" ] ||
         die "round $round: symmetric_meta != 1 on every volume of m$idx"
@@ -3532,7 +3602,12 @@ sym_zero_violations() { # idx
     local idx="$1" k v
     for k in $SYM_ZERO_KEYS; do
         v="$(stat_sum "$idx" "$k")"
-        [ "$v" = "0" ] || printf '%s=%s ' "$k" "$v"
+        [ "$v" = "0" ] && continue
+        if sym_zero_venue_attributed "$k"; then
+            sym_zero_venue_note report "$idx" "$k" "$v"
+            continue
+        fi
+        printf '%s=%s ' "$k" "$v"
     done
 }
 
@@ -3544,7 +3619,12 @@ sym_zero_violations_delta() { # rowdir idx label
     local rowdir="$1" idx="$2" label="$3" k v
     for k in $SYM_ZERO_KEYS; do
         v="$(sym_delta "$rowdir" "$idx" "$label" "$k")"
-        [ "$v" = "0" ] || printf '%s=+%s ' "$k" "$v"
+        [ "$v" = "0" ] && continue
+        if sym_zero_venue_attributed "$k"; then
+            sym_zero_venue_note "$label" "$idx" "$k" "+$v"
+            continue
+        fi
+        printf '%s=+%s ' "$k" "$v"
     done
 }
 
@@ -3552,7 +3632,7 @@ sym_zero_set() { # label idx
     local label="$1" idx="$2" k v
     for k in $SYM_ZERO_KEYS; do
         v="$(stat_sum "$idx" "$k")"
-        [ "$v" = "0" ] || die "$label: $k=$v on m$idx (must stay 0)"
+        sym_zero_judge "$label" "$idx" "$k" "$v"
     done
     # A READER arms no slot leases (`symmetric_meta` is the writer's
     # posture word); its posture word is `reader_staleness_bound_ms == 0`.
@@ -3896,22 +3976,39 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t0):.0f}')")"
             "$MWFLEET" unmount "$j" || die "sym-scale: joiner m$j's clean unmount failed"
         done
         total="$(wc -l <"$rowdir/removed-sample.txt" | tr -d ' ')"
+        # ONE classifier for every arm (`sym_stat_deleted`, Issue 8): a
+        # manager whose volume FAIL-STOPPED after the leaves answers EIO
+        # for every removed name — that is "cannot answer", never
+        # "deleted"; only ENOENT counts, anything else dies loud.
+        local verdict
         while IFS= read -r rel; do
             [ -n "$rel" ] || continue
-            if timeout 30 stat "$(mnt_of 0)$rel" >/dev/null 2>&1; then
+            verdict="$(sym_stat_deleted "$(mnt_of 0)$rel" 30)"
+            case "$verdict" in
+            deleted) ;;
+            resurrected)
                 resurrected=$((resurrected + 1))
                 echo "RESURRECTED at the manager: $rel" >>"$rowdir/resurrected.txt"
-            fi
+                ;;
+            hung) die "sym-scale: stat of removed $rel through the manager HUNG past 30 s (a parked lookup)" ;;
+            error:*) die "sym-scale: stat of removed $rel through the manager failed with something other than ENOENT: ${verdict#error:}" ;;
+            esac
         done <"$rowdir/removed-sample.txt"
         echo "deleted-stays-deleted (manager, after every joiner's clean leave): $resurrected of $total sampled removed names resolve" | tee -a "$rowdir/symscale-verdict.txt"
         "$MWFLEET" mount "${joiners[0]}" || die "sym-scale: joiner m${joiners[0]}'s remount failed"
         local resurrected_j=0
         while IFS= read -r rel; do
             [ -n "$rel" ] || continue
-            if timeout 30 stat "$(mnt_of "${joiners[0]}")$rel" >/dev/null 2>&1; then
+            verdict="$(sym_stat_deleted "$(mnt_of "${joiners[0]}")$rel" 30)"
+            case "$verdict" in
+            deleted) ;;
+            resurrected)
                 resurrected_j=$((resurrected_j + 1))
                 echo "RESURRECTED at remounted joiner m${joiners[0]}: $rel" >>"$rowdir/resurrected.txt"
-            fi
+                ;;
+            hung) die "sym-scale: stat of removed $rel through remounted joiner m${joiners[0]} HUNG past 30 s (a parked lookup)" ;;
+            error:*) die "sym-scale: stat of removed $rel through remounted joiner m${joiners[0]} failed with something other than ENOENT: ${verdict#error:}" ;;
+            esac
         done <"$rowdir/removed-sample.txt"
         echo "deleted-stays-deleted (remounted joiner m${joiners[0]}): $resurrected_j of $total" | tee -a "$rowdir/symscale-verdict.txt"
         [ "$resurrected" = "0" ] && [ "$resurrected_j" = "0" ] ||
@@ -4518,19 +4615,21 @@ s7_kill_body() { # [sym]
             # just removed is GONE through every joined writer and the
             # reader — never a name a stale projection or token still
             # serves. Bounded stats; a parked lookup is a red, not a hang.
-            local sidx src stale=0
+            # ONE classifier for every arm (`sym_stat_deleted`, Issue 8): a
+            # joiner or the reader answering EIO for the removed round
+            # directory is a daemon that cannot answer, never "gone".
+            local sidx verdict stale=0
             for sidx in $(joiner_idxs) $reader_idx; do
-                if timeout 60 stat "$(mnt_of "$sidx")/acked-r$round" >/dev/null 2>&1; then
-                    src=0
-                else
-                    src=$?
-                fi
-                if [ "$src" = "124" ]; then
-                    die "round $round: stat of the removed acked-r$round through m$sidx HUNG past 60 s (a parked lookup)"
-                elif [ "$src" = "0" ]; then
+                verdict="$(sym_stat_deleted "$(mnt_of "$sidx")/acked-r$round" 60)"
+                case "$verdict" in
+                deleted) ;;
+                hung) die "round $round: stat of the removed acked-r$round through m$sidx HUNG past 60 s (a parked lookup)" ;;
+                resurrected)
                     stale=$((stale + 1))
                     echo "STALE: m$sidx still resolves acked-r$round" >>"$rowdir/stale-r$round.txt"
-                fi
+                    ;;
+                error:*) die "round $round: stat of the removed acked-r$round through m$sidx failed with something other than ENOENT: ${verdict#error:}" ;;
+                esac
             done
             [ "$stale" = "0" ] || die "round $round: the removed acked-r$round still resolves through $stale mount(s) (see $rowdir/stale-r$round.txt)"
         fi
@@ -4632,7 +4731,7 @@ sym_crash_round_asserts() { # round rowdir
         appender_park_expiries meta_kv_leaf_lease_refusals dlm_token_recall_timeouts_live \
         appender_flush_ceiling_overruns dead_member_write_deferrals data_alloc_bitmap_drift; do
         v="$(stat_sum 0 "$k")"
-        [ "$v" = "0" ] || die "round $round: $k=$v on the successor (must stay 0)"
+        sym_zero_judge "round $round (successor)" 0 "$k" "$v"
     done
     # The ledger's terms: nothing foreign died (the joiners, if any, are
     # alive), so the driver recovered nothing and acted on nothing.
@@ -9178,6 +9277,12 @@ leg_cowriters_admission() {
     die "host-scoped subsystems present, but the co-writer leg bodies land with rungs 7-10 (S6 arm onward) — this rung ships only the gate"
 }
 
+case "$LEG" in
+sym-*)
+    # The venue word governs the sym legs' must-stay-0 judgement (Issue 2).
+    log "venue: $SYM_VENUE — appender_flush_ceiling_overruns is $([ "$SYM_VENUE" = laptop ] && echo 'REPORTED as venue-attributed (the box bracket decides, 51bf21e1)' || echo 'must-stay-0')"
+    ;;
+esac
 case "$LEG" in
 smoke) leg_smoke ;;
 multipath-negative) leg_multipath_negative ;;

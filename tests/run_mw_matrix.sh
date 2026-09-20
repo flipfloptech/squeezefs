@@ -403,7 +403,7 @@
 #                       GATE ≥ 0.7 × N × the N=1 rate; the manager's
 #                       measured load and CPU reported per N. Engagement:
 #                       appenders_known == N, slot_handovers == 0,
-#                       slot_ships == 0, dlm_rpcs == 0.
+#                       slot_ships ≤ 1 per writer (its mkdir under /), dlm_rpcs == 0.
 #   sym-shared-dir [--sym-files=N]  (PR 13 — gate 3b; needs --writers >= 2)
 #                       N creators into ONE directory: the holder's flip
 #                       to K stripes on the observed creator count
@@ -3742,7 +3742,13 @@ leg_sym_scale() {
             [ -z "$v" ] || zero_miss="$zero_miss m$idx:{$v}"
         done
         [ "$handovers" = "0" ] || die "sym-scale N=$n: slot_handovers=$handovers (must be 0 — each mount writes its own trees)"
-        [ "$ships" = "0" ] || die "sym-scale N=$n: slot_ships=$ships (must be ≈ 0)"
+        # `slot_ships` counts every served ship since PR 13 (defect 9 — the
+        # served step feeds the holder's dominance window; before it the
+        # gauge never moved). Each joiner's ONE `mkdir /<top>` under `/` is
+        # §5.10's "1 ship to volume 0's manager" — the law is ≤ 1 per
+        # writer, never the 20,000 creates that follow in the writer's own
+        # tree.
+        [ "$ships" -le "$n" ] || die "sym-scale N=$n: slot_ships=$ships (must be ≈ 0 — at most one per writer: its directory's mkdir under /)"
         [ "$rpcs" = "0" ] || die "sym-scale N=$n: Σ dlm_rpcs=$rpcs (must be 0)"
         local mgr_load
         mgr_load="$(stat_field 0 manager_load_pct | tr -d '[] ' | cut -d, -f1)"

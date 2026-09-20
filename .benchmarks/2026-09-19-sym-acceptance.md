@@ -49,7 +49,7 @@ _(MET / MISS per row with its engagement gauges; rows fill in as they run.
 | 3c | `sym-foreign-touch` | dev → box | _pending_ | handovers/s, `slot_handover_phase_ns`, a paused live job keeps its tree |
 | 4 | `sym-crash` / `sym-storm` (a)–(f) ×10 from zero | dev (LOCAL by the venue law) | _pending_ | must-stay-0 set; `appender_recoveries ≡ regions of the killed nodes`; acked-loss 0; `fsck_findings == 0`; C8/bitmap drift 0; `replay_dropped_torn == 0` |
 | 5 | `sym-readers` (exactness; 1 × 31 broadcast; `free_grace_hold_ms`) | dev → box | _pending_ | `dlm_recall_fanout ≡ readers`, `reader_staleness_bound_ms == 0`, tokens held on `-o ro` |
-| 6 | format cost at N = 8 / 32 (+ the 46-volume width row) | dev (LOCAL) | _pending_ | per-slot extent floor, `slot_tree_bytes` p99 vs `A_max`, ring space, page writes |
+| 6 | format cost at N = 8 / 32 (+ the 46-volume width row) | dev (LOCAL) | **RUN — §3.6**: the width row VALID at N = 1/4/16/46 (mount 0.96 s, reopen 1.39 s at 46; the per-slot extent floor 16 MiB/volume = 736 MiB at 46 vols × 20 k files vs flat 47 MB — R9's number; `A_max` inert on a manager, §7 item 8); the appender rows ≈ 4 MiB (N = 8) / 16.5 MiB (N = 32) of region overhead per volume beside the manager's ring | per-slot extent floor, `slot_tree_bytes` p99 vs `A_max`, ring space, page writes |
 | 7 | relocated walls (terminal-free rate per holder under `w_rewrite` N = 8; the manager verb rate under a 32-mount join storm) | dev → box | _pending_ | `block_free_*`, `manager_verbs_per_s`, `manager_load_pct` |
 | 8 | SIM-1 `SimConfig { clients: 12_500, shards: 64 }` | dev (tier (ii)) | **MET** — §5 | beat p99, eviction fan-out, the free-grace V-fan-in, the death ledger's reach |
 | 8b | fidelity `full` (nvmet; `pr-registrants` ≥ 1,024 + the emulated cap refusal; `sym-join-ladder` N = 3) | dev (LOCAL) | _pending_ | the tier's own verdicts |
@@ -138,6 +138,78 @@ of one file: `dlm_token_recalls` 5 ≡ mutations × holders, acks 5,
 publish's recall IS the qualification — the hold under tokens is the
 recall RTT against the S5 composite's 2,724 ms), ring `deferrals ≡
 releases + offsets` = 0. The 1 × 31 broadcast is the box's (§7).
+
+### 3.6 Gate 6 — format cost (`pv-volume-scaling --symmetric`, the 46-volume width row; the N = 8 / 32 appender rows) — dev box, LOCAL (`pr13-post11/gate6-pv-symmetric.log`, exit 0, "rows VALID")
+
+**The width row** (`tests/pv_volume_set.sh` with `SQZ_PVSET_SYMMETRIC=1`:
+`format --symmetric`, ONE armed daemon over N file-backed volumes,
+20,000 files × 8 threads into one directory, medians of 3; the flat
+baseline is `.benchmarks/2026-08-21-pv-volume-scaling.md`'s table on
+the same fixture):
+
+| N vols | mount s (flat) | reopen s (flat) | RSS at mount MB (flat) | create ops/s (flat) | stat warm/cold ops/s | node cache MB (flat) | B/file (flat) | slot trees | tree p99 / max KiB | `A_max` KiB | Σ ring KiB | ckpts over create | free extents | jrnl max/mean (flat) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 0.17 (—) | 0.56 (—) | 1,761 | 6,508 | 33,795 / 34,814 | 18.3 | 957 | 64 | 2,048 / 2,048 | 288 | 8,176 | 3 | 1,939 | 1.0 |
+| 4 | 0.23 | 0.58 | 1,792 | 5,656 | 34,486 / 33,884 | 67.5 | 3,539 | 256 | 1,792 / 1,792 | 284 | 32,704 | 16 | 7,781 | 2.3 |
+| 16 | 0.45 (0.34) | 0.81 (1.09) | 1,864 (1,758) | 5,200 (4,828) | 33,984 / 34,867 (26,058 / 26,415) | 265.3 (17.0) | 13,907 (891) | 1,024 | 1,536 / 1,536 | 280 | 130,816 | 64 | 31,146 | 8.3 (8.3) |
+| 46 | 0.96 (0.60) | 1.39 (1.26) | 2,034 (1,832) | 4,304 (4,934) | 35,411 / 34,498 (25,540 / 26,433) | **760.0 (47.0)** | **39,846 (2,464)** | 2,944 | 1,280 / 1,280 | 276 | 376,096 | 230 | 89,557 | 23.3 (23.3) |
+
+R5 level 0 / yellow 0 / red 0 / backstop 0 at every width; `volsMoved
+== N`; node-cache hit 100 % warm and cold; the tripwires flat; the solo
+re-gate held (`dlm_rpcs` 0). Readings: (1) **the per-slot extent floor
+(R9) is the row's number** — every volume mints its 64 rotor trees at
+this population (`slot trees = 64 × N`, lazy minting engaged: a tree
+mints on its first record), and a tree is ≥ one 256 KiB node, so the
+forest's floor is **16 MiB per volume** (64 × `node_size`) — at N = 46
+with 20,000 files that is 736 MiB of node images against the flat
+layout's 47 MB, **39.8 KB per file vs 2.5 KB**; it amortizes with the
+population (the fleet's N = 8 volumes carried 1,850 inos per tree at
+1.5 MiB p99) and `--meta-node-kib 64` quarters it — the design's stated
+lever; (2) mount / reopen at N = 46 cost +0.36 s / +0.13 s over flat
+(the 2,944 trees' roots read from tree 0 + the directory's page); RSS
++200 MB (the floor's node images); (3) create ops/s −13 % at N = 46 and
++8 % at N = 16 vs the flat baseline — inside the laptop's band (§3.1);
+the stat passes +32 % (the kernel-TTL-0 stat sweep serves off the same
+cache either way — a different day's thermal state, not a layout term);
+(4) `A_max` reads ≈ `node_size` (276–288 KiB) at every width while the
+trees sit at 1.3–2 MiB: **the soft cap is inert on a MANAGER** — PR 3
+keeps the manager's own images untracked in the slot-extent ledger that
+`A_max` reads (`affinity_a_max_bytes`), so a solo mount spills every
+mint past 256 KiB per tree to the rotor with the most headroom
+(`affinity_ceiling_spills` 34,241 vs `affinity_mints` 5,759 on the
+fleet's manager); the OUTCOME is the designed one (p99 = max —
+uniform trees), the gauge misleads and each spill pays an O(M) headroom
+pick — §7's item 8 (feed the manager's images or derive `A_max` off
+`slot_tree_bytes` Σ); (5) `jrnlMax/Mean` 23.3 at N = 46 ≡ the flat
+baseline's 23.3 — a single-parent workload lands on one volume on both
+layouts (the 2026-08-21 record's own reading); the balance instrument is
+unchanged by the layout.
+
+**The N = 8 / 32 appender rows** (per-appender format cost — measured
+constants off the fleet's N = 8 `sym-scale` row on `8c992af6`, the N =
+32 row arithmetic on them): a joined appender costs its **ring** (the
+floor `SYM_RING_FLOOR_BYTES` = 512 KiB — `appender_ring_bytes` 524,288,
+2 segments, 0 grows on every joiner), its **pages** (4 × 4 KiB slots —
+two in the directory, two ring-side), its **grant** (`extent_grant_
+claimed` 65–71 extents per volume per joiner = 16–18 MiB of slot-tree
+images — the trees' OWN bytes, returned at the leave; `unclaimed` 3–7 =
+the standing remainder, ≤ 2 MiB), and a directory pair; the manager's
+ring is the format's (16 MiB here — `clamp(volume/64, 8, 32 MiB)`),
+`appenders_capacity` 125 on a 1 GiB volume (heap/16 ÷ ring). So at **N
+= 8**: 7 × 512 KiB rings + 8 × 16 KiB pages + one 256 KiB directory
+extent ≈ **4 MiB of region overhead per metadata volume** beside the
+manager's 16 MiB ring, and 128 minted slot trees × 256 KiB = 32 MiB of
+tree floor (16 per appender at this load); at **N = 32**: 31 × 512 KiB
++ 32 × 16 KiB + 2 directory extents (31 pairs per 256 KiB extent) ≈
+**16.5 MiB** of region overhead per volume, the tree floor 32 × 16 × 256
+KiB = 128 MiB at the same per-appender shape (64 rotors each mint only
+when written), `appenders_capacity` 125 unchanged (the ring floor sizes
+it) — the 32-appender join itself is the in-process contract
+(`sym_manager_tests`: 32 joiners grow the directory chain past its
+first extent) and the fleet's join storm (`sym-walls` row (b): 7 joiners
+in 2.2–3.2 s, the wall to the last armed). Page writes: one per
+appender per checkpoint (`meta_kv_checkpoints` 226 at the manager /
+375 at a joiner over the N = 8 ladder — the joiner's own cadence).
 
 ### 3.8 `sym-crash` / `sym-storm` (gate 4) — dev box, LOCAL by the venue law; the from-zero counts
 
@@ -1387,6 +1459,20 @@ counted decline, a bounded window or a stated venue):
 6. **`kv_freeze_wedge_tests`' flat-shaped census probe** and the joiner
    dead-manager checkpoint contract's 1-in-N flake (§4.6) — harness items
    for the matrix's next widening.
+8. **`A_max` is inert on a MANAGER** (§3.6 reading 4): PR 3 keeps the
+   manager's own images untracked in the slot-extent ledger `A_max`
+   reads, so the soft cap sits at `node_size` and every mint past 256
+   KiB per tree spills to the rotor with the most headroom — the
+   designed outcome (uniform trees) by a different rule, a misleading
+   `affinity_a_max_bytes`, an O(M) headroom pick per spill. Feed the
+   manager's images into the ledger or derive `A_max` off `slot_tree_
+   bytes` Σ — one accessor.
+9. **The per-slot extent floor at small populations** (§3.6 reading 1,
+   risk R9's number): 16 MiB per volume (64 rotor trees × one 256 KiB
+   node) — 736 MiB for 20,000 files over 46 volumes against the flat's
+   47 MB. Amortizes with population; `--meta-node-kib 64` quarters it;
+   a rotor that mints only past a per-volume population threshold is the
+   design-level lever if the box's small-set rows price it in.
 7. **The reader's per-op cost on a striped root**: the fold of a striped
    `/` is `K` token serves per `stat /` from the plane cache (one grant
    each per holder per token lifetime); a `stat`-heavy reader of a

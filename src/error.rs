@@ -5,6 +5,42 @@ use thiserror::Error;
 #[error("Mock Metadata Error")]
 pub struct MockRedisError;
 
+/// The class of a symmetric-plane RETRYABLE refusal
+/// ([`SqueezefsError::Retryable`]) — the typed word the cross-owner
+/// classifiers `matches!` on (PR 13 review round 1, Issue 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalClass {
+    /// The commit door refused a slot ANOTHER appender leases
+    /// (`KvError::SlotBusy { slot, holder, g }`): the slot moved between the
+    /// plan and the apply — re-resolve and re-dispatch (defects 29/30/35).
+    SlotMoved { slot: u32, holder: u32 },
+    /// A served travelling guard refused a key whose slot the serving mount
+    /// does not lease: the initiator's holder view is stale — re-resolve
+    /// through tree 0 and ship again (defect 11).
+    StaleHolderView,
+}
+
+impl RefusalClass {
+    /// The wire word (`WireError::class`): 0 = none, then this table.
+    pub fn to_wire(self) -> u8 {
+        match self {
+            RefusalClass::SlotMoved { .. } => 1,
+            RefusalClass::StaleHolderView => 2,
+        }
+    }
+
+    /// The inverse of [`Self::to_wire`] — total: an unknown word is `None`
+    /// (an unclassed refusal, never a guessed class). The slot and holder do
+    /// not travel (the client re-resolves through tree 0 either way).
+    pub fn from_wire(word: u8) -> Option<Self> {
+        match word {
+            1 => Some(RefusalClass::SlotMoved { slot: 0, holder: 0 }),
+            2 => Some(RefusalClass::StaleHolderView),
+            _ => None,
+        }
+    }
+}
+
 /// Why a shipped publish did not land ([`SqueezefsError::PublishFailure`]).
 /// Exactly one class is outcome-UNKNOWN; every other class means the
 /// owner applied NOTHING (or said exactly what it did).
@@ -102,6 +138,33 @@ pub enum SqueezefsError {
         msg: String,
     },
 
+    /// **A RETRYABLE refusal of the symmetric plane, classed** (PR 13 review
+    /// round 1, Issue 7): the decision "the slot moved — re-dispatch / leave
+    /// the intent open" versus "a device error — fail-stop through the S3.5
+    /// lattice" is made on [`RefusalClass`], never on the message text
+    /// (`crossvol_tx::refusal_class`). Minted at the ONE `KvError::SlotBusy`
+    /// conversion (`kv/mod.rs`) and at the served travelling-guard's
+    /// stale-holder refusals; carried across the S8 wire as
+    /// [`crate::meta_ship::WireError::class`] (a typed word, the
+    /// `STATUS_DEFERRED` precedent) and rebuilt into this variant at the
+    /// client. Presents `EAGAIN` (the class every caller retries).
+    #[error("{msg}")]
+    Retryable { class: RefusalClass, msg: String },
+
+    /// **A record-level mutation of an object whose forest slot ANOTHER
+    /// appender leases, from a mount that does not** (PR 13's flip blocker,
+    /// `.benchmarks/2026-09-19-sym-acceptance.md` §4.4z — a foreign-slot
+    /// FILE's `setattr` / `setxattr` / `removexattr` / data write): the arm
+    /// that ships the record-level verb to the slot holder under its lease
+    /// is PR 13b's. Until it lands the armed plane REFUSES the verb LOUD
+    /// here — `EOPNOTSUPP`, naming the rung — never `ENOENT` for a file
+    /// that exists (the local commit's miss, before this class) and never
+    /// an acked write whose bytes vanish at its publish (the write handler
+    /// refuses before it accepts a byte). Unarmed mounts never construct
+    /// it. Gauge `foreign_file_mutation_refusals`.
+    #[error("{msg}")]
+    ForeignSlotFileMutation { msg: String },
+
     #[error("GPU Direct Storage error: {0}")]
     GdsError(String),
 
@@ -150,6 +213,28 @@ impl SqueezefsError {
         Self::refused(libc::EBUSY, msg)
     }
 
+    /// A classed retryable refusal (`EAGAIN`) — see [`Self::Retryable`].
+    pub fn retryable(class: RefusalClass, msg: impl Into<String>) -> Self {
+        SqueezefsError::Retryable {
+            class,
+            msg: msg.into(),
+        }
+    }
+
+    /// The interim loud refusal of a foreign-slot record-level mutation —
+    /// see [`Self::ForeignSlotFileMutation`].
+    pub fn foreign_slot_file_mutation(msg: impl Into<String>) -> Self {
+        SqueezefsError::ForeignSlotFileMutation { msg: msg.into() }
+    }
+
+    /// The refusal's class, if it is a classed retryable one.
+    pub fn refusal_class(&self) -> Option<RefusalClass> {
+        match self {
+            SqueezefsError::Retryable { class, .. } => Some(*class),
+            _ => None,
+        }
+    }
+
     /// The POSIX errno this error presents to userspace.
     ///
     /// **POSIX-6 (one-way door, pinned by `tests/posix_errno_tests.rs`):**
@@ -176,6 +261,14 @@ impl SqueezefsError {
             // The message is prose, not wire format (POSIX-6).
             SqueezefsError::InvalidOperation(_) => libc::EINVAL,
             SqueezefsError::Refused { errno, .. } => *errno,
+            // The symmetric plane's classed retry: every caller retries
+            // (the cross-owner arm re-dispatches, the roll-forward
+            // cadence completes the intent, the application retries).
+            SqueezefsError::Retryable { .. } => libc::EAGAIN,
+            // "Not built yet on this path" is `EOPNOTSUPP` — the honest
+            // interim word for a verb the plane cannot serve here; never
+            // `ENOENT` (the file exists) and never `EIO` (nothing broke).
+            SqueezefsError::ForeignSlotFileMutation { .. } => libc::EOPNOTSUPP,
             SqueezefsError::WriterGuardFenced => libc::EIO,
             SqueezefsError::IndirectMapFormat { .. } => libc::EIO,
             // A fail-stopped lease reaching a data path is the same class

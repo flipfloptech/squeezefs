@@ -67,6 +67,10 @@ fn pinned_errno(e: &SqueezefsError) -> libc::c_int {
         // PK4: a shipped publish the authority did not land — the class
         // is the lane's, the errno is the honest "could not do it".
         SqueezefsError::PublishFailure { .. } => libc::EIO,
+        // PR 13 (review round 1, Issue 7): the symmetric plane's CLASSED
+        // retryable refusal — every caller retries, the application too.
+        SqueezefsError::Retryable { .. } => libc::EAGAIN,
+        SqueezefsError::ForeignSlotFileMutation { .. } => libc::EOPNOTSUPP,
         SqueezefsError::GdsError(_) => libc::EIO,
         SqueezefsError::CacheOverflow => libc::ENOMEM,
         SqueezefsError::Timeout => libc::ETIMEDOUT,
@@ -136,7 +140,117 @@ fn one_of_each() -> Vec<SqueezefsError> {
             class: squeezefs::error::PublishFailureClass::FrameRefused(0x57),
             msg: "refused".into(),
         },
+        SqueezefsError::retryable(
+            squeezefs::error::RefusalClass::SlotMoved { slot: 4, holder: 7 },
+            "slot moved",
+        ),
+        SqueezefsError::retryable(
+            squeezefs::error::RefusalClass::StaleHolderView,
+            "stale holder view",
+        ),
+        SqueezefsError::foreign_slot_file_mutation("setattr of a foreign-slot file (PR 13b)"),
     ]
+}
+
+/// **PR 13 review round 1, Issue 7 — a symmetric-plane retryable refusal is
+/// classified by its TYPED class, never by its prose.** The cross-owner
+/// ladder decides "re-dispatch the step" versus "fail-stop the volume" on
+/// `SqueezefsError::refusal_class()`; before this the two classifiers were
+/// `to_string().contains("is leased by appender")` /
+/// `contains("holder view is stale")` — a message-text rename, a
+/// localized log line, or an unrelated refusal that happened to carry the
+/// words (the striping flip's "directory … is leased by appender …" is
+/// one) would have moved a live op onto the S3.5 lattice or off it. Pinned
+/// here: (1) the ONE `KvError::SlotBusy` conversion mints the class; (2)
+/// the class survives ANY message text, including one that names nothing;
+/// (3) the OLD text without the class classifies as NOTHING; (4) the wire
+/// word (`WireError::class`) carries the class across a ship and rebuilds
+/// it, and an unknown word rebuilds an unclassed refusal with its errno.
+#[test]
+fn a_retryable_refusal_is_classified_by_its_typed_class_never_its_text() {
+    use squeezefs::error::RefusalClass;
+    use squeezefs::meta_ship::WireError;
+    // (1) the conversion site.
+    let e: SqueezefsError = KvError::SlotBusy {
+        slot: 10,
+        holder: 7,
+        g: 3,
+    }
+    .into();
+    assert!(
+        matches!(
+            e.refusal_class(),
+            Some(RefusalClass::SlotMoved {
+                slot: 10,
+                holder: 7
+            })
+        ),
+        "the SlotBusy conversion mints SlotMoved: {e:?}"
+    );
+    assert_eq!(e.to_errno(), libc::EAGAIN);
+    // (2) the class rides ANY text.
+    for text in [
+        "",
+        "renamed entirely",
+        "slot 10 is leased by appender 7 (g 3)",
+    ] {
+        let e = SqueezefsError::retryable(RefusalClass::SlotMoved { slot: 1, holder: 2 }, text);
+        assert!(matches!(
+            e.refusal_class(),
+            Some(RefusalClass::SlotMoved { .. })
+        ));
+        let e = SqueezefsError::retryable(RefusalClass::StaleHolderView, text);
+        assert!(matches!(
+            e.refusal_class(),
+            Some(RefusalClass::StaleHolderView)
+        ));
+        assert_eq!(e.to_errno(), libc::EAGAIN);
+    }
+    // (3) the old prose alone classifies as nothing.
+    for old in [
+        "forest slot 10 is leased by appender 7 (g 3) — ships to its holder",
+        "cross-owner guards … the initiator's holder view is stale",
+    ] {
+        let e = SqueezefsError::refused(libc::EAGAIN, old);
+        assert_eq!(e.refusal_class(), None, "prose is never wire format: {old}");
+        assert_eq!(
+            SqueezefsError::InvalidOperation(old.into()).refusal_class(),
+            None
+        );
+    }
+    // (4) the wire word.
+    for class in [
+        RefusalClass::SlotMoved { slot: 5, holder: 6 },
+        RefusalClass::StaleHolderView,
+    ] {
+        let w = WireError::from_error(&SqueezefsError::retryable(class, "any words"));
+        assert_eq!(w.class, class.to_wire());
+        assert_ne!(w.class, 0);
+        let back = w.into_error();
+        assert_eq!(
+            back.refusal_class().map(RefusalClass::to_wire),
+            Some(class.to_wire()),
+            "the class rebuilds at the initiator from the word, not the text"
+        );
+        assert_eq!(back.to_errno(), libc::EAGAIN);
+    }
+    let plain = WireError::from_error(&SqueezefsError::refused(libc::ENOENT, "gone"));
+    assert_eq!(plain.class, 0);
+    assert_eq!(plain.clone().into_error().refusal_class(), None);
+    assert_eq!(plain.into_error().to_errno(), libc::ENOENT);
+    let unknown = WireError {
+        errno: libc::EAGAIN,
+        msg: "future class".into(),
+        class: 0xEE,
+    };
+    assert_eq!(RefusalClass::from_wire(0xEE), None);
+    let back = unknown.into_error();
+    assert_eq!(
+        back.refusal_class(),
+        None,
+        "an unknown word is never a guessed class"
+    );
+    assert_eq!(back.to_errno(), libc::EAGAIN);
 }
 
 #[test]

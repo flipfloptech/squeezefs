@@ -459,7 +459,7 @@ struct ArbLaneFree {
 #[derive(Arbitrary, Debug)]
 enum ArbOutcome {
     Done(ArbReply),
-    Failed { errno: i32, msg: String },
+    Failed { errno: i32, msg: String, class: u8 },
     Refused { status: u16, detail: String },
 }
 
@@ -627,8 +627,8 @@ fuzz_target!(|data: &[u8]| {
             .into_iter()
             .map(|o| match o {
                 ArbOutcome::Done(r) => PublishCallOutcome::Done(Ok(reply_from(r))),
-                ArbOutcome::Failed { errno, msg } => {
-                    PublishCallOutcome::Done(Err(WireError { errno, msg }))
+                ArbOutcome::Failed { errno, msg, class } => {
+                    PublishCallOutcome::Done(Err(WireError { errno, msg, class }))
                 }
                 ArbOutcome::Refused { status, detail } => {
                     PublishCallOutcome::Refused { status, detail }

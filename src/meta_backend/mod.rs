@@ -2219,8 +2219,8 @@ impl RoutedMetaBackend {
                 {
                     let slot = kv::record::forest_slot_of_ino(local);
                     if !plane.gate.is_leased(slot) {
-                        return Err(crate::error::SqueezefsError::refused(
-                            libc::EAGAIN,
+                        return Err(crate::error::SqueezefsError::retryable(
+                            crate::error::RefusalClass::StaleHolderView,
                             format!(
                                 "cross-owner guards for scope {scope:#x} name forest slot \
                                  {slot}, which this mount does not lease — the initiator's \
@@ -2320,8 +2320,8 @@ impl RoutedMetaBackend {
             }
             crate::slot_lease_core::Resolved::Unleased { .. } => "nobody".to_string(),
         };
-        Err(crate::error::SqueezefsError::refused(
-            libc::EAGAIN,
+        Err(crate::error::SqueezefsError::retryable(
+            crate::error::RefusalClass::StaleHolderView,
             format!(
                 "{what} names ino {ino} on forest slot {slot}, which this mount does not lease \
                  ({holder} does) — the initiator's holder view is stale; it re-resolves \

@@ -975,9 +975,14 @@ pub async fn acquire_guards_leased(
 }
 
 /// The refusal a travelling `XvGuards` earns at a holder whose lease of
-/// the slot has moved (`RoutedMetaBackend::serve_xv_guards`).
+/// the slot has moved (`RoutedMetaBackend::serve_xv_guards`) — the TYPED
+/// class, minted at the served side and carried as `WireError::class`
+/// (PR 13 review round 1, Issue 7): the prose is never read.
 fn is_stale_holder_refusal(e: &SqueezefsError) -> bool {
-    e.to_errno() == libc::EAGAIN && e.to_string().contains("holder view is stale")
+    matches!(
+        e.refusal_class(),
+        Some(crate::error::RefusalClass::StaleHolderView)
+    )
 }
 
 async fn acquire_guards_leased_once(
@@ -2418,7 +2423,14 @@ async fn apply_or_ship_step_retrying(
 /// 30 — the plan read the slot unleased or ours, the door's first touch
 /// lost to another appender, whose identity the door learnt).
 pub(crate) fn is_slot_moved_refusal(e: &SqueezefsError) -> bool {
-    e.to_errno() == libc::EAGAIN && e.to_string().contains("is leased by appender")
+    // The typed class, minted at the ONE `KvError::SlotBusy` conversion
+    // (`kv::mod`) and rebuilt from `WireError::class` at a shipped step's
+    // initiator (PR 13 review round 1, Issue 7) — a message-text rename
+    // can never turn a slot-moved refusal back into a device error.
+    matches!(
+        e.refusal_class(),
+        Some(crate::error::RefusalClass::SlotMoved { .. })
+    )
 }
 
 /// Count one locally dispatched op re-dispatched through the cross-owner

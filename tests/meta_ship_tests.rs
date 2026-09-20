@@ -444,6 +444,7 @@ fn frames_round_trip_and_untrusted_bytes_refuse_loud() {
                 outcome: Err(ship::WireError {
                     errno: libc::ENOENT,
                     msg: "no such thing".into(),
+                    class: 0,
                 }),
                 grant: None,
                 delegs: Vec::new(),

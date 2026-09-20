@@ -682,11 +682,19 @@ pub enum MetaReply {
 /// **The errno is the payload** (POSIX-6): `SqueezefsError::to_errno` is
 /// structural and total, so shipping the number and reconstructing a
 /// `Refused { errno }` preserves what userspace sees byte for byte. The
-/// message is prose for the operator and is never parsed.
+/// message is prose for the operator and is never parsed. **The refusal
+/// CLASS is a typed word beside it** (PR 13 review round 1, Issue 7 — the
+/// `STATUS_DEFERRED` precedent): a served step's `SlotMoved` /
+/// `StaleHolderView` refusal is rebuilt as the same
+/// [`SqueezefsError::Retryable`] class at the initiator, so no classifier
+/// on either side reads the prose; `0` = no class (an ordinary errno).
+/// Rides `CLUSTER_WIRE_SCHEMA` 5, the program's unreleased wire (KD-7
+/// same-commit fleets).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireError {
     pub errno: i32,
     pub msg: String,
+    pub class: u8,
 }
 
 impl WireError {
@@ -695,12 +703,19 @@ impl WireError {
         Self {
             errno: e.to_errno(),
             msg: e.to_string(),
+            class: e
+                .refusal_class()
+                .map_or(0, crate::error::RefusalClass::to_wire),
         }
     }
 
-    /// Rebuild a local error that presents the SAME errno.
+    /// Rebuild a local error that presents the SAME errno — and the same
+    /// typed class where the wire carried one.
     pub fn into_error(self) -> SqueezefsError {
-        SqueezefsError::refused(self.errno, self.msg)
+        match crate::error::RefusalClass::from_wire(self.class) {
+            Some(class) => SqueezefsError::retryable(class, self.msg),
+            None => SqueezefsError::refused(self.errno, self.msg),
+        }
     }
 }
 

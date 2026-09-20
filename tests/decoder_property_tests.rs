@@ -2184,8 +2184,9 @@ fn arb_publish_outcome() -> impl Strategy<Value = PublishCallOutcome> {
                     }))
                 }
             ),
-        (any::<i32>(), "\\PC{0,32}")
-            .prop_map(|(errno, msg)| PublishCallOutcome::Done(Err(WireError { errno, msg }))),
+        (any::<i32>(), "\\PC{0,32}", any::<u8>()).prop_map(|(errno, msg, class)| {
+            PublishCallOutcome::Done(Err(WireError { errno, msg, class }))
+        }),
         (any::<u16>(), "\\PC{0,32}")
             .prop_map(|(status, detail)| PublishCallOutcome::Refused { status, detail }),
     ]

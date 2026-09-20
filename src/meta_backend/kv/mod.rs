@@ -1164,7 +1164,12 @@ impl From<KvError> for crate::error::SqueezefsError {
             }
             // A foreign slot lease at the commit door: EAGAIN — the ship
             // to the holder is PR 6/12's; the caller retries.
-            e @ KvError::SlotBusy { .. } => E::refused(libc::EAGAIN, format!("kv metadata: {e}")),
+            // The classed retryable refusal (PR 13 review round 1, Issue 7):
+            // the slot-moved decision is made on the CLASS, never the text.
+            e @ KvError::SlotBusy { slot, holder, .. } => E::retryable(
+                crate::error::RefusalClass::SlotMoved { slot, holder },
+                format!("kv metadata: {e}"),
+            ),
             // A grant deferred behind ring 0's window: the schedule's
             // EAGAIN — the requester's next ask finds the window clear.
             e @ KvError::GrantDeferred { .. } => {

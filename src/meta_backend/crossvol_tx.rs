@@ -197,6 +197,13 @@ pub static TEST_XV_SERVE_REFUSE: AtomicBool = AtomicBool::new(false);
 /// the seam clears. The initiator re-resolves and re-dispatches.
 pub static TEST_XV_SERVE_SLOT_BUSY_ONCE: AtomicBool = AtomicBool::new(false);
 
+/// Test seam (the initiator's own door): the next N LOCALLY dispatched
+/// steps are refused `SlotBusy` at this mount's door BEFORE any effect —
+/// a slot that moved away between the plan and the door, and kept moving
+/// through the retry bound (PR 13 review round 1, Issue 13: the
+/// roll-forward's local arm). Decremented per refusal; `0` = off.
+pub static TEST_XV_LOCAL_STEP_SLOT_BUSY: AtomicU64 = AtomicU64::new(0);
+
 /// Test seam: the grace window in ms after which an open intent no holder
 /// serves counts as STUCK (`0` = the derived window,
 /// [`stuck_grace_ms`]) — and after which a parked guard scope whose
@@ -2053,7 +2060,7 @@ pub enum StepHome {
 
 /// The forest slot of a LOCAL key ino on `v_idx`, and whether that slot's
 /// holder is another appender (`None` = unarmed, or ours).
-fn foreign_holder_of(
+pub(crate) fn foreign_holder_of(
     routed: &RoutedMetaBackend,
     v_idx: usize,
     local_ino: Ino,
@@ -2324,6 +2331,20 @@ async fn apply_or_ship_step(
                         ),
                     );
                 }
+            }
+            if TEST_XV_LOCAL_STEP_SLOT_BUSY
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                // The door's own word for a slot that moved: refused
+                // before any effect, exactly as `ensure_leases_for_tx`
+                // answers a foreign slot.
+                return Err(crate::meta_backend::kv::KvError::SlotBusy {
+                    slot: crate::meta_backend::kv::record::forest_slot_of_ino(local.local_home()),
+                    holder: 0,
+                    g: 0,
+                }
+                .into());
             }
             let out = routed.volumes[v_idx]
                 .xv_apply_step(local, rider, guards, false)
@@ -3228,12 +3249,24 @@ async fn recover_one(routed: &RoutedMetaBackend, o: &OpenIntent) -> Result<bool>
         .await
         {
             Ok(out) => out,
-            Err(e) if armed && shipped => {
+            // A shipped step's unreachable holder, OR a LOCAL step whose
+            // slot moved away past the retry bound (`execute`'s own arm —
+            // PR 13 review round 1, Issue 13: before it the roll-forward
+            // propagated the door's `SlotBusy` as the mount refusal / the
+            // cadence's error a LOCAL device failure earns, for a slot
+            // the plane moved on purpose). Left open: the next pass
+            // re-resolves it, at whichever holder tree 0 names then.
+            Err(e) if armed && (shipped || is_slot_moved_refusal(&e)) => {
                 log::warn!(
-                    "cross-owner transaction {:016x} ({:?}): step {i} could not be shipped to \
-                     its holder ({e}) — left open for the next roll-forward",
+                    "cross-owner transaction {:016x} ({:?}): step {i} could not be {} ({e}) — \
+                     left open for the next roll-forward",
                     rec.tx_id,
-                    rec.op
+                    rec.op,
+                    if shipped {
+                        "shipped to its holder"
+                    } else {
+                        "applied at this mount's door (its slot moved)"
+                    }
                 );
                 return Ok(false);
             }

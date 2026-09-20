@@ -4380,6 +4380,360 @@ async fn a_dead_joiners_half_applied_cross_owner_unlink_is_rolled_forward_at_the
     fsck_clean(&uris).await;
 }
 
+/// **Defect 32 (PR 13, FOUND-NOT-FIXED — the flip's first blocker, record
+/// §4.4z): a record-level mutation of a FOREIGN-slot file from a mount
+/// that does not lease its slot.** PR 13b's contract, stated RED here: the
+/// joiner's `setattr` of the MANAGER's file lands at the holder (the S8
+/// verb router + the S9 publish shipper re-keyed by SLOT HOLDER through
+/// `step_home`, the served side under the holder's lease recalling the
+/// object's tokens — design §5.10's row prices it at "1 custody grant + 1
+/// publish ship per layout publish"). Until that arm lands the armed
+/// plane answers the interim typed refusal (the next contract), so this
+/// pin is `#[ignore]`d; PR 13b un-ignores it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "PR 13b: the record-level ship to the slot holder (defect 32, record §4.4z) — un-ignore with it"]
+async fn a_joiners_setattr_of_the_managers_file_lands_at_the_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let f = manager
+        .create(shared, "m", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap()
+        .ino;
+    mvol.checkpoint_now().await.unwrap();
+    let j = join(&uris, &venue, &mvol, 61).await;
+    j.setattr(
+        f,
+        Some(libc::S_IFREG | 0o600),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("PR 13b: a foreign-slot file's setattr ships to its slot holder");
+    assert_eq!(
+        manager.getattr(f).await.unwrap().mode,
+        libc::S_IFREG | 0o600
+    );
+    shutdown(&j).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
+/// **PR 13 review round 1, Issue 12 — the INTERIM refusal of defect 32's
+/// class.** Before it a joiner's `chmod`/`touch` of the manager's file
+/// answered `ENOENT` (the local commit's miss in the projection — for a
+/// file that EXISTS), `setfattr` `EOPNOTSUPP` by accident, and `>>` ACKED
+/// bytes whose fsync publish the door then refused — bytes that vanished.
+/// Now every record-level verb on an object whose slot ANOTHER appender
+/// leases refuses LOUD, typed (`SqueezefsError::ForeignSlotFileMutation`,
+/// `EOPNOTSUPP`, naming PR 13b, the slot and its holder), BEFORE any read
+/// or write of the record: `setattr` / `setxattr` / `removexattr` at the
+/// routed trait entries, the layout publish at both publish entries (the
+/// FUSE write handler runs the same predicate before it accepts a byte),
+/// counted on `foreign_file_mutation_refusals`; the file still resolves
+/// (never `ENOENT`); an OWN file's verbs and an unarmed mount's are
+/// untouched (the gauge stays). The manager is judged by the same law
+/// for a joiner's file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_foreign_slot_files_record_mutation_refuses_loud_naming_pr_13b_until_it_ships() {
+    use squeezefs::meta_backend::FOREIGN_FILE_MUTATION_REFUSALS;
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    // The manager's file, durable before the join so the joiner's
+    // projection resolves it.
+    let f = manager
+        .create(shared, "m", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap()
+        .ino;
+    mvol.checkpoint_now().await.unwrap();
+    let j = join(&uris, &venue, &mvol, 62).await;
+    assert_eq!(
+        j.getattr(f)
+            .await
+            .expect("the file exists at the joiner")
+            .mode,
+        libc::S_IFREG | 0o644
+    );
+    let refusals0 = FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed);
+    let typed = |e: squeezefs::error::SqueezefsError, what: &str| {
+        assert!(
+            matches!(
+                e,
+                squeezefs::error::SqueezefsError::ForeignSlotFileMutation { .. }
+            ),
+            "{what}: the typed class, never ENOENT/EIO: {e:?}"
+        );
+        assert_eq!(e.to_errno(), libc::EOPNOTSUPP, "{what}");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("PR 13b") && msg.contains("leases at g"),
+            "{what}: names the rung and the holder: {msg}"
+        );
+    };
+    typed(
+        j.setattr(
+            f,
+            Some(libc::S_IFREG | 0o600),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("setattr of a foreign-slot file refuses"),
+        "setattr",
+    );
+    typed(
+        j.setxattr(f, "user.x", b"1")
+            .await
+            .expect_err("setxattr of a foreign-slot file refuses"),
+        "setxattr",
+    );
+    typed(
+        j.removexattr(f, "user.x")
+            .await
+            .expect_err("removexattr of a foreign-slot file refuses"),
+        "removexattr",
+    );
+    typed(
+        j.set_layout_and_size(f, b"never decoded", 4096, &[])
+            .await
+            .expect_err("a layout publish of a foreign-slot file refuses before it decodes"),
+        "layout publish",
+    );
+    typed(
+        j.merge_layout_and_size(
+            f,
+            &squeezefs::layout_wire::LayoutDelta::default(),
+            bytes::Bytes::from_static(b"never decoded"),
+            4096,
+            Vec::new(),
+        )
+        .await
+        .expect_err("a delta publish of a foreign-slot file refuses before it decodes"),
+        "delta publish",
+    );
+    assert_eq!(
+        FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed),
+        refusals0 + 5,
+        "every refusal counted"
+    );
+    // Nothing moved; the file still resolves — never ENOENT.
+    assert_eq!(j.getattr(f).await.unwrap().mode, libc::S_IFREG | 0o644);
+    assert_eq!(
+        manager.getattr(f).await.unwrap().mode,
+        libc::S_IFREG | 0o644
+    );
+    // The holder's own verb lands; the joiner's OWN file too — no count.
+    manager
+        .setattr(
+            f,
+            Some(libc::S_IFREG | 0o640),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("the holder mutates its own record");
+    let own = j
+        .create(1, "own", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("the joiner's own file")
+        .ino;
+    j.setattr(
+        own,
+        Some(libc::S_IFREG | 0o600),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("an own-slot file's setattr lands");
+    j.setxattr(own, "user.x", b"1")
+        .await
+        .expect("an own-slot file's setxattr lands");
+    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 5);
+    // The same law at the manager for the JOINER's file.
+    typed(
+        manager
+            .setattr(
+                own,
+                Some(libc::S_IFREG | 0o644),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("the manager's setattr of a joiner-slot file refuses"),
+        "manager setattr",
+    );
+    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 6);
+    shutdown(&j).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
+/// **PR 13 review round 1, Issue 13 — the roll-forward's LOCAL slot-moved
+/// arm.** `execute` (defect 35) leaves an intent OPEN when a local step's
+/// door answers `SlotBusy` past the retry bound; `recover_one` had the
+/// shipped half of that arm only (`Err(e) if armed && shipped`), so the
+/// same refusal on a LOCAL step of an intent being rolled forward
+/// propagated as the cadence's error — and at the mount path's recovery
+/// as the mount refusal a local device failure earns — for a slot the
+/// plane moved on purpose. Here the joiner's severed unlink leaves its
+/// child's `SetNlink` (LOCAL — the joiner's rotor) open; the door refuses
+/// that step `SlotBusy` past the bound at the next roll-forward. RED
+/// before: `roll_forward_open_intents` → `Err(EAGAIN …)`. GREEN: `Ok(0)`,
+/// the intent stays open and is retired by the pass after the slot
+/// settles (`Ok(1)`, `nlink 0`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_roll_forwards_local_step_refused_slot_busy_past_the_bound_leaves_the_intent_open() {
+    use squeezefs::meta_backend::crossvol_tx::{
+        cross_owner_stats, install_xv_shipper, roll_forward_open_intents, uninstall_xv_shipper,
+        TEST_XV_LOCAL_STEP_SLOT_BUSY, TEST_XV_SEAM_AFTER_STEPS, TEST_XV_SEAM_INITIATOR,
+    };
+    use squeezefs::meta_ship::MetaShipRouter;
+    use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    TEST_XV_LOCAL_STEP_SLOT_BUSY.store(0, SeqCst);
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mvenue = DaemonVenue::stand_up(&manager, true, "manager-issue13").await;
+    manager
+        .create(shared, "m0", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap();
+    let joiner = {
+        Knobs::armed().apply();
+        let r = open_routed_meta_set_joined(
+            &uris,
+            &JoinedSetAdmission {
+                manager_endpoint: mvenue.endpoint.clone(),
+                secret: VENUE_SECRET.to_vec(),
+                peer_id: peer_of(&joiner_identity(&mvol, 53).await),
+                identity: joiner_identity(&mvol, 53).await,
+            },
+        )
+        .await;
+        Knobs::clear();
+        r.expect("the joined open")
+    };
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jid = jvol.appender_stats().unwrap().appender_id;
+    let identity = jvol.joined_wire().unwrap().identity;
+    install_xv_shipper(MetaShipRouter::new(
+        Arc::clone(&joiner),
+        "joiner-node",
+        VENUE_SECRET.to_vec(),
+    ));
+    // The joiner reads the manager's directory through the manager's
+    // TOKENS (PR 9's custody arm — the mount path's `arm_mount_slot_
+    // custody`), so the dentry it ships is exact at its next read.
+    let sink = Arc::new(ProbeSink {
+        calls: std::sync::atomic::AtomicU64::new(0),
+    });
+    let for_arm = Arc::clone(&sink);
+    let _arm = squeezefs::data_grant::arm_slot_custody(
+        &joiner,
+        &squeezefs::cowriter::node_member_id_of(identity.node_token, identity.mount_slot),
+        VENUE_SECRET.to_vec(),
+        0,
+        Arc::new(move |_volume| {
+            Arc::clone(&for_arm) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
+        }),
+    );
+    let victim = joiner
+        .create(shared, "victim", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("a create into the manager's directory ships its dentry");
+    // The severed unlink: the shipped `RemoveDentry` lands at the manager,
+    // the child's LOCAL `SetNlink` never runs — the intent is open in the
+    // joiner's ring, abandoned by its op.
+    let open0 = cross_owner_stats().intents_open;
+    TEST_XV_SEAM_INITIATOR.store(u64::from(jid) + 1, Relaxed);
+    TEST_XV_SEAM_AFTER_STEPS.store(2, Relaxed);
+    let e = joiner
+        .unlink(shared, "victim")
+        .await
+        .expect_err("the severed plan errors like a dead process");
+    TEST_XV_SEAM_AFTER_STEPS.store(0, Relaxed);
+    TEST_XV_SEAM_INITIATOR.store(0, Relaxed);
+    assert!(e.to_string().contains("seam"), "{e}");
+    assert_eq!(cross_owner_stats().intents_open, open0 + 1);
+    assert_eq!(joiner.getattr(victim.ino).await.unwrap().nlink, 1);
+    // The roll-forward meets the door's `SlotBusy` on the LOCAL step past
+    // the retry bound (2 retries + the final refusal = 3 words per pass;
+    // the set's own cadence may run a pass beside this one, so the seam
+    // holds words for every pass that reaches the door).
+    TEST_XV_LOCAL_STEP_SLOT_BUSY.store(300, SeqCst);
+    let rolled = roll_forward_open_intents(&joiner).await.expect(
+        "a local step's slot-moved refusal is the retryable class — never the cadence's error",
+    );
+    assert_eq!(rolled, 0, "the intent stays open");
+    assert!(
+        TEST_XV_LOCAL_STEP_SLOT_BUSY.load(SeqCst) <= 297,
+        "the door refused the step at every attempt of the bound"
+    );
+    assert_eq!(cross_owner_stats().intents_open, open0 + 1, "still open");
+    assert_eq!(
+        joiner.getattr(victim.ino).await.unwrap().nlink,
+        1,
+        "nothing applied under the refusals"
+    );
+    // The slot settled: the next pass (this one, or the cadence's beside
+    // it — a pass that finds the record gone under its guards applies
+    // nothing) completes the plan.
+    TEST_XV_LOCAL_STEP_SLOT_BUSY.store(0, SeqCst);
+    roll_forward_open_intents(&joiner)
+        .await
+        .expect("the next pass");
+    assert_eq!(cross_owner_stats().intents_open, open0, "retired");
+    assert_eq!(joiner.getattr(victim.ino).await.unwrap().nlink, 0);
+    // The joiner still writes — nothing fail-stopped.
+    joiner
+        .create(1, "alive", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("the joiner's volumes are not disabled");
+    uninstall_xv_shipper();
+    squeezefs::data_grant::disarm_slot_custody().await;
+    shutdown(&joiner).await;
+    mvenue.tear_down();
+    shutdown(&manager).await;
+}
+
 /// **N ≥ 3: a daemon that joined AFTER another's ladder is bound ON
 /// DEMAND at its first foreign act** (the third daemon's endpoint): the
 /// slot holder table knows the appenders that were Live when a mount's

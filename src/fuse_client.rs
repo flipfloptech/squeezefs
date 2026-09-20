@@ -14222,6 +14222,15 @@ impl SqueezefsFilesystem {
                         word(&|s| u64::from(s.meta_hold_standing)),
                     );
                 }
+                // PR 13 §4.4z (the flip blocker, review round 1 Issue 12):
+                // record-level mutations of a FOREIGN-slot object refused
+                // loud (EOPNOTSUPP naming PR 13b) — 0 on every unarmed
+                // mount by construction; on an armed one each is a verb
+                // PR 13b's ship will serve.
+                metrics.insert(
+                    "foreign_file_mutation_refusals".into(),
+                    load(&crate::meta_backend::FOREIGN_FILE_MUTATION_REFUSALS),
+                );
                 // The door's ledger (review round 2, Issue 6): parks are a
                 // legal wait for a bounded handover, refusals the "ship to
                 // the holder" class (0 on a solo mount — no foreign holder
@@ -27257,6 +27266,16 @@ impl Filesystem for SqueezefsFilesystem {
         // writes — falling through would hand the data path a bogus ino.
         if is_virtual_ino(ino) {
             return Err(Errno::from(libc::EACCES));
+        }
+        // PR 13 §4.4z (the flip blocker): a FOREIGN-slot file's write on an
+        // armed mount refuses BEFORE a byte is accepted — the typed
+        // `EOPNOTSUPP` naming PR 13b — so `>>` fails at write(2), never an
+        // ack whose bytes the fsync publish's door then refuses. One lease-
+        // table read on an armed mount, nothing unarmed.
+        if let Some(backend) = self.meta_backend.as_ref() {
+            backend
+                .refuse_foreign_slot_file_mutation(ino, "write")
+                .map_err(map_squeezefs_err)?;
         }
 
         // D14 write-side zc leg (rc-manifest §3f): on a zc-armed session

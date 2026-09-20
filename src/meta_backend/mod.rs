@@ -340,6 +340,13 @@ pub fn test_disable_cross_owner_precheck(on: bool) {
     TEST_DISABLE_CROSS_OWNER_PRECHECK.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Record-level mutations of a FOREIGN-slot object refused loud on the
+/// armed plane (PR 13's flip blocker, §4.4z —
+/// [`RoutedMetaBackend::refuse_foreign_slot_file_mutation`]); 0 on every
+/// unarmed mount by construction. Stats `foreign_file_mutation_refusals`.
+pub static FOREIGN_FILE_MUTATION_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// The **offline-bracket probes** every writable mount runs on the slot-0
 /// volume before it serves: `mw_upgrade:` (KD-MW-1 §6.2 mechanism i) and
 /// its sibling `owner_assign:` (per-volume claim admission §5.2.1 / sweep
@@ -1764,6 +1771,48 @@ impl RoutedMetaBackend {
             }
             other => other,
         }
+    }
+
+    /// **The interim refusal of a record-level mutation on a FOREIGN-slot
+    /// object** (PR 13's flip blocker, `.benchmarks/2026-09-19-sym-
+    /// acceptance.md` §4.4z; the arm — the S8 verb router + the S9 publish
+    /// shipper re-keyed by SLOT HOLDER through `step_home`, the served
+    /// side under the holder's lease recalling the object's tokens — is
+    /// PR 13b's): on an ARMED volume an ino whose slot another appender
+    /// leases refuses `setattr` / `setxattr` / `removexattr` / a data
+    /// write / a layout publish LOUD with the typed
+    /// [`SqueezefsError::ForeignSlotFileMutation`] (`EOPNOTSUPP`, naming
+    /// the rung, the slot and its holder), BEFORE any read or write of the
+    /// record — never `ENOENT` for a file that exists (the local commit's
+    /// miss in the projection, defect 32's `chmod`/`touch` face), never an
+    /// acked write whose fsync publish the door refuses (its `>>` face).
+    /// `Ok(())` on every unarmed volume, for every own or unleased slot,
+    /// and inside a served verb (this mount IS the holder there). Counted
+    /// on `foreign_file_mutation_refusals`.
+    pub fn refuse_foreign_slot_file_mutation(&self, ino: Ino, what: &str) -> Result<()> {
+        let (v_idx, local) = self.route_ino(ino);
+        let Some(vol) = self.volumes.get(v_idx) else {
+            return Ok(());
+        };
+        if !vol.slot_lease_armed() || crate::meta_ship::executing_for_ship_client() {
+            return Ok(());
+        }
+        let Some(holder) = crossvol_tx::foreign_holder_of(self, v_idx, local) else {
+            return Ok(());
+        };
+        let slot = kv::record::forest_slot_of_ino(local);
+        FOREIGN_FILE_MUTATION_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(crate::error::SqueezefsError::foreign_slot_file_mutation(
+            format!(
+                "{what} of ino {ino}: its record lives in forest slot {slot} of metadata volume \
+             {v_idx}, which appender {} leases at g {} — this mount (appender {}) does not; \
+             the record-level ship to the slot holder is PR 13b's (design-symmetric-metadata \
+             §5.10), refused loud until it lands (EOPNOTSUPP; foreign_file_mutation_refusals)",
+                holder.appender_id,
+                holder.g,
+                vol.own_appender_id()
+            ),
+        ))
     }
 
     /// The `unlink` body (the trait entry re-dispatches it once on the
@@ -4871,6 +4920,9 @@ impl Metadata for RoutedMetaBackend {
                 .setattr(ino, mode, uid, gid, size, atime, mtime, ctime)
                 .await;
         }
+        // PR 13 §4.4z: a foreign-slot record's mutation refuses loud here,
+        // before any read of the record (PR 13b ships it).
+        self.refuse_foreign_slot_file_mutation(ino, "setattr")?;
         // S10 coherence law (rung 12): attrs are exactly what a LOOKUP
         // delegation serves.
         let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
@@ -4911,6 +4963,7 @@ impl Metadata for RoutedMetaBackend {
         if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
             return r.setxattr(ino, name, value).await;
         }
+        self.refuse_foreign_slot_file_mutation(ino, "setxattr")?;
         // S10 coherence law (rung 12): an xattr change moves ctime — the
         // delegated getattr's truth.
         let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
@@ -4938,6 +4991,7 @@ impl Metadata for RoutedMetaBackend {
         if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
             return r.removexattr(ino, name).await;
         }
+        self.refuse_foreign_slot_file_mutation(ino, "removexattr")?;
         // S10 coherence law (rung 12): ctime moves (the setxattr twin).
         let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
         // §5.5.2a cutover gate — before the 4a I-guard (and before
@@ -5298,6 +5352,9 @@ impl RoutedMetaBackend {
         // §5.5.2a cutover gate — before the backend's own I-guard and
         // before route derivation.
         let _gate = self.slot_gate_enter(&[ino]).await;
+        // PR 13 §4.4z: the write handler refused the byte already; this is
+        // the belt for every other publisher of a foreign-slot layout.
+        self.refuse_foreign_slot_file_mutation(ino, "layout publish")?;
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
         let block_refs = self.forest_ref_ops(v_idx, block_refs);
@@ -5404,6 +5461,11 @@ impl RoutedMetaBackend {
                         item.ino
                     ),
                 )));
+                continue;
+            }
+            // PR 13 §4.4z: the member's own refusal, never the group's.
+            if let Err(e) = self.refuse_foreign_slot_file_mutation(item.ino, "layout publish") {
+                results[i] = Some(Err(e));
                 continue;
             }
             let (v_idx, local_ino) = self.route_ino(item.ino);
@@ -5823,6 +5885,7 @@ impl RoutedMetaBackend {
         // §5.5.2a cutover gate — before the backend's own I-guard and
         // before route derivation (the `set_layout_and_size` discipline).
         let _gate = self.slot_gate_enter(&[ino]).await;
+        self.refuse_foreign_slot_file_mutation(ino, "layout publish")?;
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
         let block_refs = self.forest_ref_ops(v_idx, &block_refs).into_owned();

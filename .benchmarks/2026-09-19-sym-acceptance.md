@@ -1147,4 +1147,37 @@ _(pending — every file placed on squeeze-test.)_
 
 ## 9. The flip decision (for PR 14)
 
-_(pending — the exact list of gates MET and NOT MET.)_
+**Decision: NOT YET — the flip waits for the box brackets.** The
+mechanism half of every gate is GREEN on the dev box from zero on the
+final binary (§3): the fleet legs complete, every must-stay-0 tripwire
+but the venue-attributed flush-ceiling overrun reads 0, the kill matrix
+(`sym-crash` 10/10 × three from-zero runs, `sym-storm` 10/10 on the
+final run) loses nothing acked, deletes stay deleted, fsck is clean after
+every round. The RATE half of gates 1 / 2 / 3 / 5 / 7 is the box's by the
+venue law, and no box row ran in this rung (§8): every local rate is
+scoping evidence, and gate 3's create law at N = 8 read 2.9–3.2 × on the
+throttled laptop against 5.8 × on the same laptop cold (§3.1) — a number
+the box must settle before the default can flip.
+
+Gates, exactly:
+
+| Gate | Mechanism (dev, from zero, final binary) | Rate (box) |
+|---|---|---|
+| 1 solo re-gate | not this rung's (PR 1's rig; the flat path untouched by design — every PR 13 change is behind bit 17 + the knob, pinned per fix) | OWED — arm B `ad91d694` rocky8 vs arm A `3228fcb8` |
+| 2 `tar -x` | MET (0.96–1.02 × of S0 at netem 250 µs, verbs/entry 0.012, handovers 0, `dlm_rpcs` 0) | OWED |
+| 3 scale | MET at N ≤ 2 every run; N = 4 / 8 complete with every tripwire flat; the 0.7 × N law read MET at N = 8 once cold (5.8 ×) and MISS three times warm (2.9–3.2 ×) | OWED (the deciding row) |
+| 3b shared dir (+ `ls`) | MET (20,000 creates, one flip, ships ≡ served, handovers 0; `K + C + 3` tokens, 0 data-leaf reads) | OWED |
+| 3c foreign touch | MET (LIVE never moved, IDLE moved in 1–2 bursts, 5–8 ms handovers) | OWED |
+| 4 kill matrix | **MET** — `sym-crash` 10/10 ×3 from zero, `sym-storm` 10/10 from zero (§3) | n/a (LOCAL by the venue law) |
+| 5 readers | MET (exactness, `recalls ≡ mutations × holders`, `fanout_p99 ≡ readers`, `reader_staleness_bound_ms` 0) on the 1-reader fleet | OWED (the 1 × 31 broadcast) |
+| 6 format cost | see §3.6 | n/a |
+| 7 walls | MET (row (a) `shipped ≡ served ≥ displaced`, ≈ 1,000 frees/s at the holder at 18–45 % CPU; row (b) 7 joiners in 2.2–2.5 s, `/jobs` ships 7/7) — must-stay-0 tripped +1 twice by the 5–30 ms flush-ceiling class (§4.5) | OWED (N = 32) |
+| 8 SIM-1 | **MET** (§5) | n/a (tier (ii)) |
+| 8b fidelity | see §3.7 | n/a |
+
+What PR 14 flips on: the box rows of gates 1 / 2 / 3 / 3b / 3c / 5 / 7 on
+THIS binary (§8's footprint procedure), plus §7's product items 1–2 (both
+counted declines today). Nothing found in this rung's twenty-nine
+defects is a class the design did not already state; every one is fixed
+red-first here, so the flip inherits no known defect — only the box's
+numbers.

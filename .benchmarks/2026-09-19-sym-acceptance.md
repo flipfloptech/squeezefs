@@ -754,6 +754,100 @@ onto_its_neighbours` and `sym_block_grant_tests::a_joined_appenders_
 never_published_mint_returns_to_its_grant_window` (RED on the base: the
 abandon's `Err` from the gate).
 
+### 4.4r Defect 24 — FIXED (PR 7b under PR 12b): a joiner's `stat` of a striped directory folded every stripe's record off its PROJECTION — 256 `root-seq` restarts, EIO on the storm's create
+
+`sym-scale` N = 8 from zero on `ef95bedc` (`pr13-batch5`): the create
+storm on joiner m62 failed `EINVAL` at its 4,931st file — `tree 0 (slot
+Some(103), root 0x1e00000@…, a PROJECTION here): traversal retry budget
+exhausted … restarts [root-seq] = 256` — 1 s after the manager
+auto-STRIPED `/` (the seven joiners' `mkdir`s were seven foreign creates
+from seven creators — the PR 7b trigger; 61 stripes minted in the
+manager's rotors, 3 supplied by m60/m61/m62). Defect 18's shape at a
+DIFFERENT tree: `fold_striped_attrs` (`stat D` — every kernel attr
+revalidation of `/`) and the rmdir's stripe count probe read every
+stripe's record through `read_inode_value_routed` — the joiner's
+projection of the manager's rotor slot trees, loaded at its join; the
+lessee's compaction had retired a projected root's extent, `ReturnExtents`
++ a re-grant handed it to m62 (its barrier dropped the stale image at
+09:05:03, the mint wrote there), and the pointer named another node's
+seq. Defect 18's refresh cannot heal it: KD-SYM-3 — a LEASED slot's root
+rides its lessee's PAGE, never tree 0, so `refresh_control_projection`
+re-adopts tree 0 and the native tree only. The rule is defect 8's:
+**a stripe is minted in ANOTHER appender's slot, so at every non-holder
+its record is a FOREIGN read** — `dir_stripe::stripe_record` (`getattr`
+through the writer's read divert, the holder's token plane; an own-slot
+stripe and every unarmed mount read locally) is the ONE read the fold
+and the rmdir probe run. Pin: `sym_n_daemon_tests::a_joiners_stat_of_a_
+striped_directory_folds_the_stripes_at_their_holder` — RED `nlink 2 vs
+3` (the base's fold saw no stripe record: the stripes were minted after
+the reader's projection loaded). Standing, same class, not per-op:
+`is_stripe`'s reverse dentry scan (`find_parent_of_child`) walks every
+slot tree on the flip candidate's holder — over projections on a joiner
+(§7 Owed).
+
+### 4.4s Defect 25 — FIXED (PR 5's ledger poll vs PR 2/10/12b's checkpoint-class steps): a consumed checkpoint seq left a LEDGER GAP, and every token reader's poll stopped on it for a whole ring of checkpoints
+
+`sym-storm` round 1 from zero on `ef95bedc`: the seven joiners killed
+at 09:13:09; their regions recovered 09:13:22–27 (`Unleased` in tree 0,
+`64 slot(s) released` × 7 × 2 volumes); the acked-writes oracle GREEN;
+then at 09:14:08 the token reader m1 could not `stat` a recovered file —
+`read token unavailable: the recall channel to the holder is not fresh`
+— its tree 0 STILL naming appender 1 as the lessee 41 s after the
+release; live 27 minutes later it resolved. The mechanism, verified on
+the code: `release_recovered_regions` (PR 10), `grow_stalled_regions`
+(PR 2), the in-process leave and the wire `LeaveAppender` (PR 12b) each
+CONSUME a checkpoint seq for their bitmap write ("ledger slots are seq %
+32, so the gap is harmless") — and PR 5's predicted-slot poll
+(`read_newest_ledger_from`) reads slot `(adopted + 1) % 32` and STOPS on
+an older record there ("the writer has not written that seq"): a gap of
+one parks the reader until the writer's seq wraps the ring (32
+checkpoints ≈ 32 s at the shipped cadence — UNBOUNDED on a quiet
+writer); the storm's seven releases at 09:13:23 parked m1 before the
+09:13:27 releases landed, and every read of the recovered slots dialed
+the dead lessee for the whole window. Two halves, one law: **a consumed
+seq is a ledger seq** — `KvMetaBackend::consume_checkpoint_seq_for_
+bitmap` writes the bitmap at `ckpt_seq`, then a record at `ckpt_seq`
+RESTATING the last cycle's word (the roots as they stand, the last
+record's tail, `next_ino`, the watermark) under the SMO mutex (no cycle
+mid-flight: content-equivalent to the record it follows, so a crash
+after it replays exactly what a crash after the last cycle would);
+`meta_kv_ledger_restatements` counts them (0 on a flat mount). And **the
+belt**: a crash between a bitmap write and its record leaves one gap for
+the volume's life, so after `ROOT_LEDGER_SLOTS` consecutive stopped polls
+the reader reads the whole ledger once and adopts the newest record
+anywhere (`meta_kv_revalidate_gap_scans`; a truly idle writer costs one
+128 KiB read per 32 idle polls). Pins: `sym_n_daemon_tests::a_readers_
+ledger_poll_walks_across_a_consumed_checkpoint_seq` (a joiner's wire
+leave then the manager's next cycle; RED `None` between seqs 11 and 13
+— the walk stopped) and `sym_coherence_tests::a_readers_poll_scans_the_
+whole_ledger_after_a_ring_of_stopped_polls` (a forged gap; RED 0 scans).
+The reader's own staleness bound (S5's `interval + ceiling`, PR 5's 0
+for metadata) holds again.
+
+### 4.4t Defect 26 — FIXED (PR 12b's mount path): a successor remounting inside a killed manager's exit window JOINED the dying listener and the mount refused
+
+`sym-crash` round 1 from zero on `ef95bedc`: `mount 0` after the
+manager's kill -9 — `dialing the manager at …:39623 for JoinAppender
+failed: Connection reset by peer`, the successor remount FAILED.
+`symmetric_join_target` calls a heartbeat-fresh claim whose pid is not
+yet provably dead a LIVE manager (the D0 ladder's own word); a `kill -9`
+returns before a daemon with gigabytes of dirty pages has exited, the
+harness remounted inside that window, and the dying process's listener
+accepted-then-reset the dial (RST, not ECONNREFUSED — the process was
+still there). The join's transport failure was `KvError::Busy` — the
+class of a manager that REFUSED — so the mount refused. Fix: the dial and
+the `JoinAppender` call itself (the open's first act — nothing of the
+join exists yet) answer `KvError::ManagerUnreachable` (errno
+`EHOSTUNREACH`, `meta_backend::join_dial_failed`), and the mount path
+re-reads the join target ONCE on it: a manager the probe no longer calls
+live (the pid gone — the dead-pid proof) makes this mount the D0
+ladder's; a manager still live-looking keeps the refusal (a cross-host
+crash waits the claim's TTL exactly as the D0 ladder always did).
+Harness: `mw_fleet.sh kill` waits for the victim's pid to vanish
+(bounded 60 s, the exit wall logged) — a supervisor's restart never
+starts inside the exit window. Pin: `sym_n_daemon_tests::a_join_at_an_
+unreachable_manager_is_the_transport_class_the_mount_path_retries`.
+
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
 `sym-shared-dir-ls` on the defect-16 binary read `meta_kv_node_cache_

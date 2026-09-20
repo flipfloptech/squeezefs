@@ -531,6 +531,40 @@ record is heartbeat-fresh for `CLIENT_STALE_TTL` (45 s) and sorts first
 by id, so re-enrollment lands within 45 s + the retry grain; the leg's
 80 s bound covers it.
 
+### 4.4j Defect 17 — FIXED (PR 7b's read paths on PR 12's `-o ro` reader): a token reader took the HOLDER's arms in the stripe-map read — its negative "unstriped" hint outlived the holder's flip, and the root listed EMPTY
+
+The same `sym-crash` round, its last gate: with defects 15/16 fixed the
+round reached "the reader m1 does not read joined writer m60's
+post-failover name 60 s after it landed" — `ls /` on the reader listed
+NOTHING, no error (`stat /r1`: ENOENT), while every joiner listed the
+same root through the successor's token plane correctly. The successor's
+log named it: `directory 1 STRIPED into 64 stripes (4 supplied by
+creators [1, 2, 3, 4], 60 minted by the holder)` — seven joiners'
+post-failover `mkdir /after-failover-*` had striped the ROOT under the
+reader's cached root token. `dir_stripe::served_here` answered `true`
+for a mount with NO slot-lease plane (the unarmed writer's law, where the
+striping paths are off anyway), so on a token reader `stripe_map` ran
+the holder's arms: the reader's first (pre-flip) read of `/` cached the
+negative "unstriped" hint under lease `(0, 0)`, and the hint is
+invalidated only by the holder's OWN flip — the successor's flip cleared
+nothing at the reader, every later `stripe_map(1)` answered `None` off
+the hint, and the listing fell to the token's raw dentry set with the
+markers filtered: EMPTY (every name had migrated into stripes). Fix: a
+plane-less mount serves everything it WRITES and nothing it only READS
+(`served_here` → `!is_read_only()` without a plane) — a reader is never
+a holder: no negative hint, no migration kick, the markers re-read off
+its cached token (one `find` per marker, no wire). Beside it: the recall
+channel's reconnect backoff resets at a completed ROUND, not at the dial
+— a successor that accepts the connection and refuses every frame (the
+failover's membership re-assertion window: `holds no live membership
+lease with this set's owner`) was re-dialed at the 50 ms floor 20× a
+second. Pin (RED-first, `left: []` — the fleet's shape in one process):
+`sym_coherence_tests::a_token_reader_holding_a_directorys_token_across_its_
+flip_lists_the_merge` — the reader lists the unstriped ROOT (12 names,
+its token cached), the holder flips root to 4 stripes and migrates, 7
+more names land, the flip's inserts recall the token; the reader's next
+listing is the exact 19-name merge and every name resolves.
+
 ### 4.4f Harness — `sym-foreign-touch` LIVE's storm died at launch
 
 On the defect-10 binary the LIVE phase read `slot_handovers` 1 "a live

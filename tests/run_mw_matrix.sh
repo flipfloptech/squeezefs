@@ -173,7 +173,7 @@
 #                       accepted regression; this row publishes its size.
 #   pv-volume-scaling [--ns=1,4,16,46] [--files=N] [--idle-secs=S]
 #                       [--repeats=R] [--threads=T] [--budget=SIZE]
-#                       [--node-cache-mb=MB] [--tag=NAME]
+#                       [--node-cache-mb=MB] [--tag=NAME] [--symmetric]
 #                       (design-per-volume-claim-admission PR 0 — THE
 #                       VIABILITY GATE; risks R9/R15) THE VOLUME-SCALING
 #                       SWEEP. UNPRIVILEGED and fleet-free: it drives its
@@ -756,6 +756,12 @@ PV_NODE_CACHE_MB="${SQZ_MWMATRIX_PV_NODE_CACHE_MB:-}"
 # shipped 1 s TTLs a re-stat sweep never reaches the daemon at all).
 PV_TTL_MS="${SQZ_MWMATRIX_PV_TTL_MS:-0}"
 PV_TAG="${SQZ_MWMATRIX_PV_TAG:-derived}"
+# Symmetric PR 13, gate 6 (format cost): `--symmetric` formats every set
+# `--symmetric` and mounts it ARMED (`SQUEEZEFS_SYMMETRIC_META=1`), and
+# the emitter adds the forest's per-volume columns (slot trees minted,
+# slot-tree bytes p99/max vs A_max, ring bytes, checkpoints over the
+# create phase) beside the flat rows' — the default stays FLAT.
+PV_SYMMETRIC="${SQZ_MWMATRIX_PV_SYMMETRIC:-0}"
 # PR 8 (per-volume claim admission acceptance): the multi-owner legs.
 # `--partial-authority` switches the s10 gate row's client venue from the
 # co-writer to a PARTIAL AUTHORITY extracting into its OWN subtree root.
@@ -817,6 +823,7 @@ for a in "$@"; do
     --node-cache-mb=*) PV_NODE_CACHE_MB="${a#--node-cache-mb=}" ;;
     --kernel-ttl-ms=*) PV_TTL_MS="${a#--kernel-ttl-ms=}" ;;
     --tag=*) PV_TAG="${a#--tag=}" ;;
+    --symmetric) PV_SYMMETRIC=1 ;;
     --partial-authority) PVO_PARTIAL=1 ;;
     --rewrite-mb=*) PVO_REWRITE_MB="${a#--rewrite-mb=}" ;;
     --rewrite-files=*) PVO_REWRITE_FILES="${a#--rewrite-files=}" ;;
@@ -965,7 +972,7 @@ pv_one_row() { # n rep rowdir storm fixture
     SQZ_PVSET_STATE_DIR="$st" bash "$fixture" teardown >/dev/null 2>&1 || true
     local t0 t1 mount_s remount_s
     t0="$(date +%s.%N)"
-    SQZ_PVSET_STATE_DIR="$st" bash "$fixture" create "${create_args[@]}" \
+    SQZ_PVSET_STATE_DIR="$st" SQZ_PVSET_SYMMETRIC="$PV_SYMMETRIC" bash "$fixture" create "${create_args[@]}" \
         >"$pfx.fixture.log" 2>&1 || {
         cat "$pfx.fixture.log" >&2
         die "fixture create N=$n failed"
@@ -1027,6 +1034,7 @@ pv_one_row() { # n rep rowdir storm fixture
         echo "node_cache_label ${PV_NODE_CACHE_MB:-derived}"
         echo "ttl_ms $PV_TTL_MS"
         echo "tag $PV_TAG"
+        echo "layout $([ "$PV_SYMMETRIC" = "1" ] && echo symmetric || echo flat)"
     } >"$pfx.meta"
 
     SQZ_PVSET_STATE_DIR="$st" bash "$fixture" teardown >>"$pfx.fixture.log" 2>&1 ||
@@ -1086,6 +1094,9 @@ for mpath in sorted(glob.glob(os.path.join(rowdir, "*.meta"))):
     def total(v):  # per-volume arrays sum; scalars pass through
         return sum(v) if isinstance(v, list) else v
 
+    def as_list(v):  # per-volume arrays as is; a scalar as a one-element list
+        return v if isinstance(v, list) else [v]
+
     def d(a, b, key):
         return total(s[b].get(key, 0)) - total(s[a].get(key, 0))
 
@@ -1141,6 +1152,7 @@ for mpath in sorted(glob.glob(os.path.join(rowdir, "*.meta"))):
         "rep": int(md["rep"]),
         "files": files,
         "substrate": md["substrate"],
+        "layout": md.get("layout", "flat"),
         "budget_lbl": md["budget_label"],
         "nc_lbl": knob,
         "mount_s": float(md["mount_s"]),
@@ -1180,6 +1192,20 @@ for mpath in sorted(glob.glob(os.path.join(rowdir, "*.meta"))):
         "j_carrying": carrying,
         "hr_cold": hr_cold,
         "hr_warm": hr_warm,
+        # Symmetric PR 13, gate 6 — the forest's format cost per volume
+        # (every one 0 on a FLAT set): slot trees minted over the create
+        # phase, the lease family's slot-tree bytes (p99 / max over the
+        # set) against the affinity cap in force, the appender ring's
+        # bytes per volume (the fixed ring on a solo set), and the
+        # checkpoints the create phase cost (each writes every appender
+        # page + the ledger).
+        "f_slot_trees": d(0, 4, "meta_kv_forest_slot_trees_minted"),
+        "f_tree_p99_kb": max(as_list(s[4].get("slot_tree_bytes_p99", 0)) or [0]) / 1024,
+        "f_tree_max_kb": max(as_list(s[4].get("slot_tree_bytes_max", 0)) or [0]) / 1024,
+        "f_a_max_kb": max(as_list(s[4].get("affinity_a_max_bytes", 0)) or [0]) / 1024,
+        "f_ring_kb": total(s[4].get("appender_ring_bytes", 0)) / 1024,
+        "f_ckpt_create": d(1, 2, "meta_kv_checkpoints"),
+        "f_free_ext": total(s[4].get("meta_kv_free_extents", 0)),
     })
 
 if not rows:
@@ -1222,6 +1248,13 @@ MED = [
     ("j_carrying", "volsCarrying", "{:.0f}"),
     ("hr_cold", "ncHitCold_%", "{:.2f}"),
     ("hr_warm", "ncHitWarm_%", "{:.2f}"),
+    ("f_slot_trees", "symSlotTrees", "{:.0f}"),
+    ("f_tree_p99_kb", "symTreeP99_KB", "{:.0f}"),
+    ("f_tree_max_kb", "symTreeMax_KB", "{:.0f}"),
+    ("f_a_max_kb", "symAmax_KB", "{:.0f}"),
+    ("f_ring_kb", "symRing_KB", "{:.0f}"),
+    ("f_ckpt_create", "symCkptCreate", "{:.0f}"),
+    ("f_free_ext", "freeExtents", "{:.0f}"),
 ]
 
 ns = sorted({r["n"] for r in rows})
@@ -1229,7 +1262,7 @@ reps = max(r["rep"] for r in rows)
 head = rows[0]
 print(f"== pv-volume-scaling (substrate={head['substrate']}, budget={head['budget_lbl']}, "
       f"node_cache_mb={head['nc_lbl']}, files={head['files']}, "
-      f"repeats={reps}, medians) ==")
+      f"repeats={reps}, layout={head['layout']}, medians) ==")
 print(f"   R5 budget resolved: {head['budget_gb']:.1f} GiB")
 cols = ["N"] + [c for _, c, _ in MED]
 table = []

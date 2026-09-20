@@ -3036,10 +3036,13 @@ impl TokenReaderPlane {
             let (_, client) = match session.as_mut() {
                 Some(c) => c,
                 None => match self.dial().await {
-                    Ok(c) => {
-                        backoff = RECONNECT_BACKOFF_FLOOR;
-                        session.insert(c)
-                    }
+                    // The backoff resets at a completed ROUND, never at
+                    // the dial: a holder that accepts the connection and
+                    // refuses every frame (a successor whose membership
+                    // census does not list this reader yet — the
+                    // failover's re-assertion window) would otherwise be
+                    // re-dialed at the floor 20× a second.
+                    Ok(c) => session.insert(c),
                     Err(e) => {
                         log::warn!(
                             "token recall channel to {} could not connect: {e} (retry in {:?})",
@@ -3070,6 +3073,7 @@ impl TokenReaderPlane {
             }
             match round {
                 Ok(TokenReply::Recall { frame_id, objects }) => {
+                    backoff = RECONNECT_BACKOFF_FLOOR;
                     self.channel_last_round_ms
                         .store(self.now_ms(), Ordering::Release);
                     self.channel_failed.store(false, Ordering::Release);

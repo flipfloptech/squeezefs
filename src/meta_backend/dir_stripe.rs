@@ -644,12 +644,23 @@ impl RoutedMetaBackend {
     }
 
     /// Is GLOBAL `ino`'s slot served by THIS process (its own region or a
-    /// declared one — the door's "leased here")?
+    /// declared one — the door's "leased here")? A mount with no lease
+    /// plane serves everything it WRITES (the unarmed writer — where the
+    /// striping paths are off anyway) and nothing it only READS: a `-o ro`
+    /// token reader holds no slot, so it is never a directory's holder
+    /// (PR 13 — the fleet's `sym-crash` leg: the reader took the HOLDER's
+    /// arms here, cached the negative "unstriped" hint at its first read
+    /// of `/`, and the hint — invalidated only by the holder's OWN flip —
+    /// outlived the successor's flip of `/`; the reader listed the root as
+    /// EMPTY for the rest of the round).
     fn served_here(&self, ino: Ino) -> bool {
         let (v, local) = self.route_ino(ino);
-        match self.volumes.get(v).and_then(|vol| vol.slot_leases()) {
+        let Some(vol) = self.volumes.get(v) else {
+            return false;
+        };
+        match vol.slot_leases() {
             Some(plane) => plane.gate.is_leased(forest_slot_of_ino(local)),
-            None => true,
+            None => !vol.is_read_only(),
         }
     }
 

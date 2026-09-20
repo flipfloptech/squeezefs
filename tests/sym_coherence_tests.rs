@@ -1746,6 +1746,100 @@ async fn a_token_reader_lists_a_striped_directory_as_the_merge_of_its_stripes() 
     shutdown(&writer).await;
 }
 
+/// **A token reader that CACHED a directory's token before the flip lists
+/// the merge after it — the ROOT directory included** (PR 13, the fleet's
+/// `sym-crash` leg after defects 15/16: seven joiners' post-failover
+/// `mkdir /after-failover-*` striped the ROOT at the successor while the
+/// reader held root's token; the reader then listed `/` as EMPTY for the
+/// rest of the round — every post-failover name unreadable, no error).
+/// The fleet's shape, in one process: the reader reads the directory
+/// (its token cached), the holder flips it to K stripes and migrates
+/// every name, and the reader's next `readdir` / `lookup` must serve the
+/// K-way merge exactly — the flip's marker inserts RECALLED the token,
+/// the re-fetch carries the markers, the map is read off them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_reader_holding_a_directorys_token_across_its_flip_lists_the_merge() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    // The ROOT is the directory (the fleet's object): names created
+    // BEFORE the reader looks, then more after the flip.
+    let mut names: Vec<(String, u64)> = Vec::new();
+    for i in 0..12 {
+        let name = format!("pre-{i:03}");
+        let ino = Metadata::create(writer.as_ref(), 1, &name, libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .unwrap()
+            .ino;
+        names.push((name, ino));
+    }
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-root-flip").await;
+    let before = Metadata::readdir(reader.as_ref(), 1, 0, 1024)
+        .await
+        .expect("the reader lists the unstriped root");
+    assert_eq!(before.len(), 12, "the pre-flip names, off root's token");
+    assert!(plane.holds(1), "root's token is cached at the reader");
+    let recalls0 = plane.stats().recalls_received;
+
+    // The holder FLIPS root under the reader's token and migrates every
+    // name; then names land after the flip (the fleet's post-failover
+    // mkdirs, routed to their stripes).
+    writer
+        .stripe_dir(1, 4)
+        .await
+        .expect("the holder's flip of root");
+    let started = std::time::Instant::now();
+    loop {
+        let _ = writer.migrate_dir(1).await.expect("the migration");
+        let m = writer.stripe_map(1).await.expect("read").expect("striped");
+        if !m.migrating {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the migration did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    for i in 0..7 {
+        let name = format!("after-flip-{i}");
+        let ino = Metadata::create(writer.as_ref(), 1, &name, libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .unwrap()
+            .ino;
+        names.push((name, ino));
+    }
+    wait_until("the flip's inserts recalled root's token", || {
+        plane.stats().recalls_received > recalls0
+    })
+    .await;
+
+    // The reader's next listing is the MERGE: every name, no marker, no
+    // stripe — and every name resolves by lookup.
+    let listed = Metadata::readdir(reader.as_ref(), 1, 0, 1024)
+        .await
+        .expect("the reader lists the striped root");
+    let mut listed_names: Vec<String> = listed.iter().map(|e| e.name.clone()).collect();
+    listed_names.sort();
+    let mut want: Vec<String> = names.iter().map(|(n, _)| n.clone()).collect();
+    want.sort();
+    assert_eq!(
+        listed_names, want,
+        "the reader lists the root's merge after a flip it held a token across"
+    );
+    for (name, ino) in &names {
+        let got = Metadata::lookup(reader.as_ref(), 1, name)
+            .await
+            .unwrap_or_else(|e| panic!("the reader resolves {name} through its stripe: {e}"));
+        assert_eq!(got.ino, *ino, "{name}");
+    }
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
 /// **The records budget is BYTES on the R5 component** (review round 1,
 /// Issue 7): every entry is charged its encoded records (attrs, xattrs,
 /// the dentry set) — `dlm_token_cached_bytes` is live — the cache evicts

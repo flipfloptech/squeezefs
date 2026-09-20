@@ -1624,10 +1624,18 @@ counted decline, a bounded window or a stated venue):
    creator with no endpoint bound instead of `bind_holder_endpoint_on_
    demand`; the holder mints the remainder, so a flip still lands — with
    the stripes in the holder's rotor instead of the creators'.
-3. **`appender_flush_ceiling_overruns`** (§4.5): the landing ceiling's
-   fixed 2-tick margin against the checkpoint pass wall on a throttling
-   box — one overrun on `sym-walls` row (a) in attempt 5, none in attempt
-   7; derive the margin from the measured pass wall if the box trips it.
+3. **`appender_flush_ceiling_overruns`** (§4.5, §4.4aa): the landing
+   ceiling's fixed 2-tick margin against the manager's pass wall under
+   its grant / ship / free SERVICE (the SMO mutex) — the recovery's hold
+   is now an extension (defect 33), the service's is not: +1 at 5–127 ms
+   past the ceiling on `sym-walls` row (a) in attempts 5 / 9 / 10 / 12 /
+   13 and on the storm's start in the attempt-15 rerun; derive the
+   margin from the measured pass wall (PR 14) — until then the
+   must-stay-0 gauge fails a fleet round at random on this box, which is
+   what stands between the storm's ×10 count and this record.
+3b. **`sym-storm` ×10 from zero on the final binary** (§3.8): 2 + 1
+   GREEN rounds stand; every law but the margin gauge held on every
+   round of attempts 8–15; owed with item 3.
 4. **The manager's zero-census open** (PR 14 by design — the RAM refcount
    map's mount-time by-block scan replaced by PR 8's bitmap as the
    terminal-free engine) and **PR 7's un-share of a surviving sole

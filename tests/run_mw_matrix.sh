@@ -3949,11 +3949,15 @@ leg_sym_shared_dir() {
         local dropped epochs
         dropped="$(sym_delta "$rowdir" "$reader" ls meta_kv_revalidate_nodes_dropped)"
         epochs="$(sym_delta "$rowdir" "$reader" ls meta_kv_revalidate_epochs)"
-        [ "$misses" -le $((dropped + epochs * 8)) ] ||
-            die "sym-shared-dir-ls: meta_kv_node_cache_misses=$misses on the reader exceeds the poll's own re-reads (dropped $dropped + 8 × $epochs epochs) — a leaf was read for the listing"
+        # … plus ONE tree-0 read per stripe SLOT: the reader resolves each
+        # stripe's lessee off its own tree 0 (`slot_state:{s}`, a control
+        # record no token carries) before it dials the holder — K reads,
+        # cached after (the second run: 130 misses = 66 dropped + 64 slots).
+        [ "$misses" -le $((dropped + epochs * 8 + xattr_k)) ] ||
+            die "sym-shared-dir-ls: meta_kv_node_cache_misses=$misses on the reader exceeds the poll's own re-reads + one tree-0 read per stripe slot (dropped $dropped + 8 × $epochs epochs + K $xattr_k) — a DATA leaf was read for the listing"
         [ "$merges" -ge 1 ] || die "sym-shared-dir-ls: dir_stripe_readdir_merges=$merges on the reader (the K-way merge did not run)"
         sym_zero_set sym-shared-dir-ls "$reader"
-        log "sym-shared-dir-ls: $grants tokens for K=$xattr_k + C=$created, 0 leaf reads for the listing ($misses misses = the poll's $dropped dropped images over $epochs epoch steps)"
+        log "sym-shared-dir-ls: $grants tokens for K=$xattr_k + C=$created, 0 data-leaf reads for the listing ($misses misses = the poll's $dropped dropped images over $epochs epoch steps + ≤ K tree-0 lessee reads)"
     fi
     rm -rf "$shared" 2>/dev/null || true
     sym_oracle sym-shared-dir "$rowdir"

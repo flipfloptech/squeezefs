@@ -1168,8 +1168,19 @@ impl KvTree {
             };
             if restarts > 0 && restarts % PROJECTION_REFRESH_EVERY == 0 {
                 if let Some(hook) = self.cache.projection_refresh().filter(|_| is_projection) {
-                    if hook.refresh().await {
-                        super::META_KV_PROJECTION_ROOT_REFRESHES.fetch_add(1, Ordering::Relaxed);
+                    // Single-flight (defect 36): the refresh walks tree 0
+                    // itself (`load_slot_leases` → `range` → this fn), and
+                    // a restart inside THAT walk must not nest a refresh —
+                    // the recursion overflowed three joiners' handler
+                    // lanes. A walk under a refresh in flight keeps
+                    // restarting on the root the refresh installs.
+                    if self.cache.begin_projection_refresh() {
+                        let refreshed = hook.refresh().await;
+                        self.cache.end_projection_refresh();
+                        if refreshed {
+                            super::META_KV_PROJECTION_ROOT_REFRESHES
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }

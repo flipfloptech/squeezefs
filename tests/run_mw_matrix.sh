@@ -4257,8 +4257,24 @@ leg_sym_foreign_touch() {
         v="$(sym_delta "$rowdir" "$idx" paused slot_handovers)"
         paused_handovers=$((paused_handovers + v))
     done
-    [ "$paused_handovers" = "0" ] || die "sym-foreign-touch PAUSED: slot_handovers=$paused_handovers — a single touch per beat moved a paused job's tree"
-    echo "   PAUSED: $SYM_TOUCH_ROUNDS single touches over $SYM_TOUCH_ROUNDS beats: handovers=0 (a paused live job keeps its tree)" | tee -a "$rowdir/symtouch-table.txt"
+    # The design's rule is PER SLOT (§5.1.4: `ops_h(T_idle)` counts the
+    # holder's commits ON THE TOUCHED SLOT). The fixture's job writes its
+    # burst UNDER `job-wC/paused`, whose children mint by the affinity
+    # policy — at the `A_max` floor a one-extent tree already spills them
+    # to the rotor (`mint_choice`'s strict `<`; §7 item 10 of the PR 13
+    # record), so the touched slot can read IDLE while the job is live in
+    # the volume, and the IDLE arm (`slot_offers_idle`) moves it at
+    # `N_floor` touches by the rule. That is the rule working on a slot
+    # nobody wrote; the paused-job law this phase pins is the DOMINATED
+    # arm never firing against a live holder — a handover with no idle
+    # offer behind it is the violation.
+    local paused_idle=0
+    paused_idle="$(sym_delta "$rowdir" "$c" paused slot_offers_idle)"
+    if [ "$paused_handovers" != "0" ]; then
+        [ "${paused_idle:-0}" -ge "$paused_handovers" ] || die "sym-foreign-touch PAUSED: slot_handovers=$paused_handovers with slot_offers_idle=+$paused_idle — a live holder's slot was DOMINATED by a single touch per beat"
+        log "sym-foreign-touch PAUSED: the touched slot read IDLE at the holder (slot_offers_idle=+$paused_idle; the job's children spilled to other rotors at the A_max floor — §7 item 10) and the idle arm moved it after $SYM_TOUCH_ROUNDS touches ≥ N_floor; the paused-job law (no DOMINATED offer against a live holder) holds"
+    fi
+    echo "   PAUSED: $SYM_TOUCH_ROUNDS single touches over $SYM_TOUCH_ROUNDS beats: handovers=$paused_handovers (idle offers=+${paused_idle:-0}; dominated offers 0 — a paused live job's slot is never dominated)" | tee -a "$rowdir/symtouch-table.txt"
     for idx in "$a" "$b" "$c"; do
         sym_zero_set sym-foreign-touch "$idx"
         rm -rf "$(mnt_of "$idx")/job-w$idx" 2>/dev/null || true

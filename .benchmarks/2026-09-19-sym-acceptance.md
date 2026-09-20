@@ -1370,6 +1370,35 @@ harness premise (§4.4ac) is narrowed once more: the holder's window is
 two half-`T_idle` buckets on an absolute clock (`HolderOps::total`), so
 the phase fits `T_idle / 2`.
 
+### 4.4ae Defect 36 — FIXED (PR 12b's projection refresh, made reachable by defect 34's fix): the refresh walked tree 0 itself and a restart INSIDE that walk fired the refresh again — three rejoined joiners ABORTED on a stack overflow
+
+`sym-storm` round 5 from zero on `24bbb195` (`pr13-batch14`; rounds 1–4
+GREEN — 12,315 / 10,649 / 20,148 / 17,254 acked, recoveries 16–46 s;
+`sym-crash` 10/10 GREEN — the eighth from-zero 10/10; `sym-walls` GREEN
+with 0 overruns): the deleted-stays-deleted `stat` through m64 answered
+`Transport endpoint is not connected` — m64, m65 and m66 (the round's
+rejoined victims) had ABORTED: `thread 'fuse3-tpc26m0' (…) has
+overflowed its stack — fatal runtime error: stack overflow, aborting`,
+each right after `AcquireSlot failed on the wire (the coordinator closed
+the session) — re-dialing the manager and retrying once`. The re-dial
+refreshes the projection (`refresh_control_projection`), and the refresh
+WALKS tree 0 itself — `load_slot_leases` → `KvTree::range` → `descend`;
+with defect 34's fix every restart class inside that walk counted toward
+the refresh cadence, so a walk that met 8 racing restarts (a manager
+SMO under the storm's 7 rejoins) fired the refresh AGAIN from inside the
+refresh, which walked again — unbounded recursion until the handler
+lane's stack was gone. (Before defect 34 the same recursion existed for
+ROOT restarts alone and never met one inside the fresh-rooted walk.)
+Fix: the projection refresh is SINGLE-FLIGHT per cache
+(`NodeCache::begin_projection_refresh` / `end_projection_refresh`, a CAS
+around the hook): a restart inside a refresh in flight — its own walk,
+or a concurrent walker's — skips the arm and keeps restarting on the
+root the refresh installs. Pin `sym_projection_refresh_tests::a_
+projection_refresh_never_nests_inside_its_own_walk` (a hook that walks
+the stale projection before re-installing the root, counting its
+nesting depth — RED: `max_depth == 2`, the nested refresh observed and
+cut where the product overflowed; GREEN: 1, the lookup served).
+
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
 `sym-shared-dir-ls` on the defect-16 binary read `meta_kv_node_cache_

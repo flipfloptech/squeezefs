@@ -2592,6 +2592,12 @@ pub struct NodeCache {
     /// the projection's root pointer is stale, and a restart loop against
     /// it never converges. `None` on the manager and every flat mount.
     projection_refresh: OnceLock<Arc<dyn ProjectionRefresh>>,
+    /// A projection refresh in flight on this cache (defect 36, PR 13): the
+    /// refresh's own walks of tree 0 (`load_slot_leases` → `range` →
+    /// `descend`) must never fire the refresh again — the recursion
+    /// overflowed three joiners' handler lanes once every restart class
+    /// counted toward the arm (defect 34).
+    projection_refreshing: std::sync::atomic::AtomicBool,
 }
 
 /// A joined appender's projection refresh (PR 13 — see
@@ -2655,6 +2661,7 @@ impl NodeCache {
             slot_frontiers: scc::HashMap::new(),
             frame_fence: OnceLock::new(),
             projection_refresh: OnceLock::new(),
+            projection_refreshing: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2668,6 +2675,28 @@ impl NodeCache {
     /// The installed projection refresh, if any.
     pub fn projection_refresh(&self) -> Option<&Arc<dyn ProjectionRefresh>> {
         self.projection_refresh.get()
+    }
+
+    /// Enter the projection refresh's single-flight (defect 36): `true` =
+    /// this caller runs it and must call [`Self::end_projection_refresh`];
+    /// `false` = a refresh is already in flight on this cache (the walk
+    /// inside it, or a concurrent one) — the caller keeps restarting on
+    /// the root the refresh installs, never nests a refresh.
+    pub fn begin_projection_refresh(&self) -> bool {
+        self.projection_refreshing
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Leave the single-flight.
+    pub fn end_projection_refresh(&self) {
+        self.projection_refreshing
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// Is `slot`'s tree (`None` = tree 0 / a flat tree) a PROJECTION on

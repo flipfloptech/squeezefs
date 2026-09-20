@@ -464,3 +464,84 @@ async fn a_projection_whose_child_was_recycled_follows_the_manager_through_the_r
     a_j.lookup(&probe).await.expect("served");
     assert_eq!(hook.calls.load(Ordering::Relaxed), calls, "idempotent");
 }
+
+/// A refresh that WALKS the projection itself before it re-installs the
+/// root — what the joiner's `refresh_control_projection` does
+/// (`load_slot_leases` → `range` → `descend` on tree 0). Records the
+/// deepest nesting it saw: a nested call (depth 2) is the recursion.
+struct WalkingHook {
+    cache: Arc<NodeCache>,
+    target: Arc<KvTree>,
+    probe: Vec<u8>,
+    depth: AtomicU64,
+    max_depth: AtomicU64,
+    calls: AtomicU64,
+}
+
+impl ProjectionRefresh for WalkingHook {
+    fn refresh<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let d = self.depth.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_depth.fetch_max(d, Ordering::AcqRel);
+            if d > 1 {
+                // The recursion, observed and cut here so the contract can
+                // report it instead of overflowing the stack.
+                self.depth.fetch_sub(1, Ordering::AcqRel);
+                return false;
+            }
+            // The refresh's own walk of the STALE tree (the lease-table
+            // load) — every restart inside it must not nest a refresh.
+            let _ = self.target.lookup(&self.probe).await;
+            self.cache.discard_tree_nodes(TREE_CONTROL);
+            let root = self.target.root();
+            self.target
+                .install_recovered_root(root, 0)
+                .await
+                .expect("the refresh re-reads the root from the device");
+            self.depth.fetch_sub(1, Ordering::AcqRel);
+            true
+        })
+    }
+}
+
+/// **Defect 36 (PR 13)**: the projection refresh is SINGLE-FLIGHT per
+/// cache. Found by the fleet's `sym-storm` round 5 from zero on the
+/// defect-34 binary: three rejoined joiners ABORTED — `thread
+/// 'fuse3-tpc26m0' has overflowed its stack` — right after their first
+/// wire re-dial; the refresh walks tree 0 itself (`load_slot_leases` →
+/// `range` → `descend`), and once every restart class counted toward the
+/// arm (defect 34) a restart INSIDE that walk fired the refresh again,
+/// which walked again, without bound. Here the hook walks the stale
+/// projection before re-installing the root; RED before: the walk's
+/// restarts nested a second refresh (`max_depth == 2`). GREEN: the nested
+/// arm is skipped (`begin_projection_refresh` refused), the outer refresh
+/// completes, the lookup serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_projection_refresh_never_nests_inside_its_own_walk() {
+    let vol = Vol::new();
+    let (cache_j, a_j, probe) = recycled_child(&vol).await;
+    let hook = Arc::new(WalkingHook {
+        cache: Arc::clone(&cache_j),
+        target: Arc::clone(&a_j),
+        probe: probe.clone(),
+        depth: AtomicU64::new(0),
+        max_depth: AtomicU64::new(0),
+        calls: AtomicU64::new(0),
+    });
+    assert!(cache_j.install_projection_refresh(hook.clone()));
+    let got = a_j
+        .lookup(&probe)
+        .await
+        .expect("the projection follows the manager through a walking refresh");
+    assert_eq!(got.map(|v| v.len()), Some(200));
+    assert!(hook.calls.load(Ordering::Relaxed) >= 1, "the refresh ran");
+    assert_eq!(
+        hook.max_depth.load(Ordering::Relaxed),
+        1,
+        "a refresh never nests inside its own walk (calls {})",
+        hook.calls.load(Ordering::Relaxed)
+    );
+}

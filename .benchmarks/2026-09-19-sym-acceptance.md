@@ -234,8 +234,23 @@ striped K = 64, the recalled-reader arm, deleted-stays-deleted): attempt
 8 rounds 1–3 GREEN then defect 28; attempt 9 round 1 RED (defect 29);
 attempt 10 round 1 GREEN (10,608 acked from 7 joiners + the manager, 14
 regions recovered in 47 s, the reader arm exact) then round 2 RED
-(defects 30 / 31). **Attempt 11 from zero on `8c992af6` is the count
-that stands** — its rows are written below when it lands.
+(defects 30 / 31); attempt 11 (`8c992af6`) rounds 1–3 GREEN then round
+4 (defect 33); attempt 12 (`7ac89d24`) rounds 1–3 GREEN then round 4
+(defect 34); attempt 13 (`87461d56`) rounds 1–3 GREEN then round 4
+(defect 35); attempt 14 (`24bbb195`) rounds 1–4 GREEN then round 5
+(defect 36); attempt 15 (`702ab502`, the final code) rounds 1–2 GREEN
+then round 3 RED on the recalled-reader arm's PREMISE check ("the token
+reader's resolve … took no token — `dlm_token_grants` flat") — the
+harness asserts the reader's pre-kill `stat` of the victim's acked object
+took a fresh inode token, and the reader served it without one (the
+object's tokens already held from the two stats' first, failed, source
+walk, or the plane's fold — a harness premise, not the arm's law: the
+recall-on-successor-setattr it then tests ran GREEN on every round it
+reached, attempts 8–15), re-run as a storm-only from-zero attempt on the
+same binary (`pr13-batch15-storm`) — its count is written below.
+**`sym-crash`: 10/10 GREEN on NINE consecutive from-zero runs (attempts
+7–15)**; the three exit-2 codes (attempts 12–14) are the harness-edit
+shifted-tail class after the 10/10 verdict line, never a round.
 
 ## 4. Issues found (each with its PR and its red pin)
 

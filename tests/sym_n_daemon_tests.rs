@@ -2005,10 +2005,25 @@ async fn a_dominating_requester_earns_an_idle_joined_holders_tree_through_served
         // the in-process accept counted, so `slot_handovers` read 0 on
         // every fleet handover).
         let handovers0 = mplane.handovers.load(std::sync::atomic::Ordering::Relaxed);
+        let ewma_h0 = hplane
+            .ewma_handover_ns
+            .load(std::sync::atomic::Ordering::Relaxed);
         let (released, _) = holder
             .act_on_slot_carriage(&hcarriage.release_notices, &[])
             .await;
         assert_eq!(released, 1, "the holder's flush-then-transfer ran");
+        // Defect 10's second half (PR 13 review round 1, Issue 10): the WIRE
+        // holder's measured handover wall — flush + page + tree 0 — feeds
+        // ITS `N_floor` (before it only the manager's in-process accept
+        // folded a wall, and a wire holder kept the cold-start seed for
+        // its life).
+        assert_ne!(
+            hplane
+                .ewma_handover_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+            ewma_h0,
+            "the wire holder's ewma_handover_ns moved with its flush-then-transfer"
+        );
         assert_eq!(
             mplane.handovers.load(std::sync::atomic::Ordering::Relaxed),
             handovers0 + 1,
@@ -2053,6 +2068,185 @@ async fn a_dominating_requester_earns_an_idle_joined_holders_tree_through_served
     shutdown(&holder).await;
     drop(hvol);
     hvenue.tear_down();
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
+/// **Defect 10 (PR 13; review round 1, Issue 10 — the pin the fix
+/// lacked): a JOINED holder's `N_floor` leaves its absolute floor at the
+/// FIRST served ship.** A joined appender arms before its first device
+/// write or S8 ship, so both EWMA tables read 0 at the arm's seed and
+/// `N_floor = max(2, ceil(0 / 0))` sat at 2 for the mount's life — the
+/// fleet's shared-directory row handed the directory to the first
+/// requester whose 2 ships beat the holder's second own op. `note_slot_
+/// ship` re-seeds while `ewma_handover_ns` is 0 (the tables are populated
+/// by then) and folds the ship's measured wall. Pinned: the joined
+/// holder's plane in the fleet's cold-arm state (both EWMAs 0 — in this
+/// one-process fixture the manager's writes had populated the tables the
+/// arm seeds from, so the state is set explicitly); ONE served ship later
+/// `ewma_handover_ns` is non-zero, `ewma_ship_ns` carries the measured
+/// ship, and `n_floor()` is `max(2, ceil(ewma_handover / ewma_ship))` over
+/// them. RED on the base: `ewma_handover_ns` 0 and `n_floor()` 2 for the
+/// mount's life.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joined_holders_n_floor_is_seeded_at_its_first_served_ship() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "a")]).await;
+    let a = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let holder = join(&uris, &venue, &mvol, 1).await;
+    let hvol = Arc::clone(&holder.volumes[0]);
+    let _ = create_files(&holder, a, "own", 2).await;
+    let hplane = Arc::clone(hvol.slot_leases().expect("armed"));
+    // The fleet's cold arm made explicit: a joined DAEMON arms with the
+    // process-global tables empty (no device write, no S8 ship yet), so
+    // both EWMAs read 0 at its arm. In this one-process fixture the
+    // manager's writes populated the tables before the join, so the arm
+    // seeded them — set the joiner's plane back to the cold state the
+    // fleet's joiner is in.
+    hplane.ewma_handover_ns.store(0, Relaxed);
+    hplane.ewma_ship_ns.store(0, Relaxed);
+    assert_eq!(hplane.n_floor(), 2, "the absolute floor before any ship");
+    let requester = join(&uris, &venue, &mvol, 2).await;
+    let rvol = Arc::clone(&requester.volumes[0]);
+    let hvenue = DaemonVenue::stand_up(&holder, false, "joiner-1").await;
+    rvol.slot_leases()
+        .expect("armed")
+        .holders
+        .set_endpoint(1, &hvenue.endpoint);
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(&requester),
+            "node-j2",
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    let ships0 = hplane.ships.load(Relaxed);
+    let _ = create_files(&requester, a, "one", 1).await;
+    assert_eq!(
+        hplane.ships.load(Relaxed),
+        ships0 + 1,
+        "one served ship noted"
+    );
+    let h = hplane.ewma_handover_ns.load(Relaxed);
+    let s = hplane.ewma_ship_ns.load(Relaxed);
+    assert_ne!(h, 0, "ewma_handover_ns is seeded at the first served ship");
+    assert_ne!(s, 0, "ewma_ship_ns carries the measured ship");
+    assert_eq!(
+        hplane.n_floor(),
+        squeezefs::slot_lease_core::n_floor(h, s),
+        "N_floor is the measured handover over the measured ship"
+    );
+    squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
+    shutdown(&requester).await;
+    drop(rvol);
+    shutdown(&holder).await;
+    drop(hvol);
+    hvenue.tear_down();
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
+/// **Defect 13 (PR 13; review round 1, Issue 10 — the pin the fix
+/// lacked): a ship into a STRIPED directory or one of its stripes feeds
+/// NO dominance window.** Gate 3b's row: a stripe the manager supplied
+/// moved to the first requester whose few ships beat the manager's own
+/// few into that 1/K shard — a legal verdict of the law over a slot the
+/// striping already spread K ways (§5.6.5's split: ONE dominating creator
+/// is a handover candidate, MANY are a striping one). `is_striping_domain`
+/// exempts the served ship. Pinned: joiner 1 stripes its directory (the
+/// stripes minted in its rotor), joiner 2 ships `N_floor × 16` creates
+/// into it by one requester; joiner 1's `offers_idle + offers_dominated`
+/// AND its `ships` stay where they were — RED on the base: the ships fed
+/// each stripe slot's window and an idle offer fired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ships_into_a_striped_directory_feed_no_dominance_window() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let j1 = join(&uris, &venue, &mvol, 1).await;
+    let _ = create_files(&j1, shared, "j1", 2).await;
+    let j2 = join(&uris, &venue, &mvol, 2).await;
+    let j1venue = DaemonVenue::stand_up(&j1, false, "joiner-1").await;
+    j2.volumes[0]
+        .slot_leases()
+        .expect("armed")
+        .holders
+        .set_endpoint(1, &j1venue.endpoint);
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(&j2),
+            "node-j2",
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    let sink = Arc::new(ProbeSink {
+        calls: std::sync::atomic::AtomicU64::new(0),
+    });
+    let for_arm = Arc::clone(&sink);
+    let j2vol = Arc::clone(&j2.volumes[0]);
+    let _arm = squeezefs::data_grant::arm_slot_custody(
+        &j2,
+        &squeezefs::cowriter::node_member_id_of(
+            j2vol.joined_wire().unwrap().identity.node_token,
+            j2vol.joined_wire().unwrap().identity.mount_slot,
+        ),
+        VENUE_SECRET.to_vec(),
+        0,
+        Arc::new(move |_volume| {
+            Arc::clone(&for_arm) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
+        }),
+    );
+    j1.stripe_dir(shared, 4).await.expect("the holder's flip");
+    let j1plane = Arc::clone(j1.volumes[0].slot_leases().expect("armed"));
+    let offers = |p: &squeezefs::meta_backend::kv::slot_lease::SlotLeasePlane| {
+        p.offers_idle.load(Relaxed) + p.offers_dominated.load(Relaxed)
+    };
+    let offers0 = offers(&j1plane);
+    let ships0 = j1plane.ships.load(Relaxed);
+    let burst = usize::try_from(j1plane.n_floor().max(2) * 16).unwrap();
+    for k in 0..burst {
+        let name = format!("striped-{k}");
+        j2.create(shared, &name, libc::S_IFREG | 0o644, 1000, 1000)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("a foreign create into the striped directory ({name}): {e}")
+            });
+        assert!(
+            j2.stripe_route(shared, &name)
+                .await
+                .expect("route")
+                .is_some(),
+            "{name} routed to a stripe"
+        );
+    }
+    assert_eq!(
+        offers(&j1plane),
+        offers0,
+        "ships into a striped directory never earn an offer (burst {burst})"
+    );
+    assert_eq!(
+        j1plane.ships.load(Relaxed),
+        ships0,
+        "ships into a striping domain feed no window"
+    );
+    squeezefs::data_grant::disarm_slot_custody().await;
+    squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
+    drop(j2vol);
+    shutdown(&j2).await;
+    shutdown(&j1).await;
+    j1venue.tear_down();
     venue.tear_down();
     shutdown(&manager).await;
 }

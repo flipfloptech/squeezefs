@@ -75,7 +75,7 @@ _(MET / MISS per row with its engagement gauges; rows fill in as they run.
 | 6 | format cost at N = 8 / 32 (+ the 46-volume width row) | dev (LOCAL) | **RUN — §3.6**: the width row VALID at N = 1/4/16/46 (mount 0.96 s, reopen 1.39 s at 46; the per-slot extent floor 16 MiB/volume = 736 MiB at 46 vols × 20 k files vs flat 47 MB — R9's number; `A_max` inert on a manager, §7 item 8); the appender rows ≈ 4 MiB (N = 8) / 16.5 MiB (N = 32) of region overhead per volume beside the manager's ring | per-slot extent floor, `slot_tree_bytes` p99 vs `A_max`, ring space, page writes |
 | 7 | relocated walls (terminal-free rate per holder under `w_rewrite` N = 8; the manager verb rate under a 32-mount join storm) | dev → box | **laws MET locally on every run** (row (a): `shipped ≡ served ≥ displaced` — 2,723 ≥ 1,792 — ≈ 1,000 frees/s at the holder at 18–46 % CPU; row (b): 7 joiners in 2.2–3.2 s, `/jobs` ships 7/7); the must-stay-0 overrun class it tripped 3× is defect 33's shape (fixed) — the N = 32 join storm is the box's, OWED | `block_free_*`, `manager_verbs_per_s`, `manager_load_pct` |
 | 8 | SIM-1 `SimConfig { clients: 12_500, shards: 64 }` | dev (tier (ii)) | **MET** — §5 | beat p99, eviction fan-out, the free-grace V-fan-in, the death ledger's reach |
-| 8b | fidelity `full` (nvmet; `pr-registrants` ≥ 1,024 + the emulated cap refusal; `sym-join-ladder` N = 3) | dev (LOCAL) | see §3.7 | the tier's own verdicts |
+| 8b | fidelity `full` (nvmet; `pr-registrants` ≥ 1,024 + the emulated cap refusal; `sym-join-ladder` N = 3) | dev (LOCAL) | **PASS 189 / FAIL 1 — every product leg PASS (1,024 registrants reported by the REGCTL-sized read, 65,600 B; the join ladder N = 3; guard ×10); the one FAIL is the residue snapshot's `-zram1 -zram2` = the concurrent fleet's teardown, §3.7** | the tier's own verdicts |
 
 ## 3. The local legs — from-zero counts
 
@@ -233,6 +233,31 @@ first extent) and the fleet's join storm (`sym-walls` row (b): 7 joiners
 in 2.2–3.2 s, the wall to the last armed). Page writes: one per
 appender per checkpoint (`meta_kv_checkpoints` 226 at the manager /
 375 at a joiner over the N = 8 ladder — the joiner's own cadence).
+
+### 3.7 Gate 8b — the fidelity tier `full` (`pr13-post15/fidelity-full.log`; binary `702ab502`'s tree)
+
+`sudo tests/run_nvmeof_fidelity.sh full` with `FIDELI_PR_REGISTRANTS=1024`
+on kernel nvmet (the tier's own zram/null_blk substrate, 19 m 53 s):
+**PASS = 189, FAIL = 1** — the one FAIL is the closing
+`teardown-zero-residue` snapshot, whose diff is `-/dev/zram1 -/dev/zram2`:
+two zram devices PRESENT at the tier's start (the fleet's data namespaces
+— the storm-only rerun's fleet was up when the "before" snapshot was
+taken) and torn down by the fleet during the tier — a removal the
+residue law reads as a diff, not a product residue (the tier's own
+subsystems / controllers read `(none)` both sides). Every product leg
+PASSED: `roundtrip-nvmet`; **`pr-registrants` — 1,024 registrants on one
+namespace established in 950 s (928 ms each), the product's REGCTL-sized
+read REPORTS all 1,024 (`nvme-cli regctl=1024`), the report transfer
+`64 + 64 × 1024 = 65,600 B` (`pr_report_bytes`), the registrant cap in
+force `unbounded` (nvmet has none — the emulated-cap refusal is
+unreachable by construction here, its contract is the in-process one),
+drained to `regctl=0`, unshared**; `sym-manager-failover`;
+`sym-join-ladder` (N = 3 processes on real namespaces, the token reader
+beside them); `loud-fail-matrix` (incl. the R-SYM-8 retirement
+refusals); `crash-window-nvmet`; `adopt`; `pr-matrix`; `g2-persistence-
+nvmet`; `soft-roce` (plumbing); `ab-smoke`; `guard-nvmet-x10`. Gate 8b
+MET on the product legs; the tier's residue snapshot must be re-taken on
+a quiet box for the clean `FAIL = 0` line (a 20-minute re-run).
 
 ### 3.8 `sym-crash` / `sym-storm` (gate 4) — dev box, LOCAL by the venue law; the from-zero counts
 

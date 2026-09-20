@@ -910,6 +910,27 @@ of_refusing` (RED: the refusal, the bit SET). The engine swap itself —
 the bitmap as the terminal-free engine everywhere, the zero-census open —
 stays PR 14's (§7).
 
+### 4.4v Defect 28 — FIXED (PR 5/12's reader under PR 12b): a token reader failed closed on `NotHolder` for the whole poll interval after every grant
+
+`sym-storm` round 4 from zero on `f38776a7` (rounds 1–3 GREEN — the
+recalled-reader arm now GREEN with defect 25 landed): the reader's
+pre-kill resolve of the rejoined m63's first acked file read `EIO` —
+`NotHolderRedirect { object, holder: 2 }` / `{ holder: 6 }` in m1's log.
+A rejoined joiner's slots are granted at `g + 1` by ring-0 control
+entries; the reader's tree 0 carries them only after the manager's
+checkpoint and the reader's next poll, and PR 5 made the reader FAIL
+CLOSED on the redirect until then ("R-SYM-4: exact or nothing") while PR
+12b round 3 made the WRITER's divert follow it once. The redirect's
+`holder` is the LEASE's word — fresher than any ledger record — so the
+reader follows it once too: `KvMetaBackend::reader_plane_for_holder`
+(the per-holder half of `token_reader_for`, factored) dials the named
+holder's plane through the reader's per-holder binding (holder 0 = the
+manager's own plane; a dead lessee answers `HolderDead`, never a
+redirect, so the dial is bounded), `dlm_token_reader_redirects_followed`
+counts it. Pin: `sym_n_daemon_tests::a_token_reader_follows_a_not_holder_
+redirect_to_the_lessee` — the joiner's slots granted AFTER the reader's
+last poll, its file resolves at the reader without a poll (RED: `EIO`).
+
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
 `sym-shared-dir-ls` on the defect-16 binary read `meta_kv_node_cache_

@@ -6655,3 +6655,92 @@ async fn a_join_at_an_unreachable_manager_is_the_transport_class_the_mount_path_
     assert_eq!(manager.volumes[0].appenders_public().unwrap().live(), 1);
     shutdown(&manager).await;
 }
+
+/// **A token READER follows a `NotHolder` redirect once** (PR 13, defect
+/// 28 — found by `sym-storm` round 4 from zero: a joiner rejoined, its
+/// slots granted at `g + 1`, its new storm directory's first acked file
+/// resolved at the reader `EIO` — `NotHolderRedirect { object, holder: 2
+/// }` — for the whole poll interval until the reader's tree 0 caught up;
+/// R-SYM-4's "clients aware, 2 s is too long" read back as an I/O error
+/// at every grant). The redirect's `holder` is the LEASE's word, fresher
+/// than any ledger record: the reader dials that holder's plane through
+/// its per-holder binding and serves — exact — instead of failing closed;
+/// the writer's divert had this since PR 12b round 3. Pinned: the joiner's
+/// slots are granted AFTER the reader's last poll; its file resolves at
+/// the reader without a poll (RED: `EIO`), `dlm_token_reader_redirects_
+/// followed` +1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_reader_follows_a_not_holder_redirect_to_the_lessee() {
+    use squeezefs::meta_ship::token_plane::{test_reader_redirects_followed, TokenClientConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    // The manager's TOKEN service (the reader's default plane; the join
+    // venue above serves the manager verbs alone).
+    let mtokens = DaemonVenue::stand_up(&manager, true, "manager").await;
+    mvol.checkpoint_now().await.expect("checkpoint");
+    // The reader: armed at the manager's token venue, polled ONCE — its
+    // tree 0 knows no joiner.
+    let reader = squeezefs::meta_backend::open_routed_meta_set_read_only(&uris)
+        .await
+        .expect("read-only open");
+    let rv = Arc::clone(&reader.volumes[0]);
+    rv.arm_reader_revalidation(None).expect("arms");
+    rv.revalidate_reader().await.expect("poll");
+    let default = rv
+        .arm_token_reader(TokenClientConfig {
+            endpoint: mtokens.endpoint.clone(),
+            secret: VENUE_SECRET.to_vec(),
+            client_id: "pr13-redirect-reader".to_string(),
+            volume: 0,
+        })
+        .expect("the manager's plane arms");
+    reader
+        .getattr(shared)
+        .await
+        .expect("served under a token from the manager");
+    assert_eq!(default.stats().grants, 1);
+    // The joiner joins NOW — its 64 slots granted after the reader's
+    // poll — and creates a file in its rotor (a cross-owner create into
+    // the manager's directory: the child mints in the creator's slot).
+    let j1 = join(&uris, &venue, &mvol, 1).await;
+    let j1venue = DaemonVenue::stand_up(&j1, false, "joiner-1").await;
+    rv.bind_reader_holder_endpoint(1, &j1venue.endpoint);
+    let files = create_files(&j1, shared, "fresh", 1).await;
+    let fresh = files[0].1;
+    assert!(
+        j1.volumes[0]
+            .slot_leases()
+            .expect("armed")
+            .gate
+            .is_leased(slot_of_global(&j1, fresh)),
+        "premise: the file lives in the joiner's slot"
+    );
+    let followed0 = test_reader_redirects_followed();
+    // No poll in between: the reader's tree 0 still says the slot is
+    // nobody's, its default plane asks the manager, the manager answers
+    // NotHolder { 1 } — followed to the joiner's plane.
+    let attrs = reader
+        .getattr(fresh)
+        .await
+        .expect("served under a token from the JOINER via the redirect (RED: EIO)");
+    assert_eq!(attrs.ino, fresh);
+    assert_eq!(
+        test_reader_redirects_followed(),
+        followed0 + 1,
+        "one redirect followed"
+    );
+    for v in &reader.volumes {
+        v.shutdown().await.unwrap();
+    }
+    shutdown(&j1).await;
+    j1venue.tear_down();
+    mtokens.tear_down();
+    venue.tear_down();
+    shutdown(&manager).await;
+}

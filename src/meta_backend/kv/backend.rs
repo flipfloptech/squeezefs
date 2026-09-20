@@ -3523,6 +3523,27 @@ impl KvMetaBackend {
             self.reader_plane_follow_holder(default, 0).await;
             return Ok(Some(Arc::clone(default)));
         };
+        self.reader_plane_for_holder(default, holder, object).await
+    }
+
+    /// **The reader's plane for appender `holder`'s slots** — the
+    /// per-holder half of [`Self::token_reader_for`], reached from the
+    /// object's lessee per this reader's tree 0 AND (PR 13, defect 28) from
+    /// a `NotHolder { holder }` redirect the plane it dialed answered: a
+    /// slot granted since the reader's last epoch step names its lessee in
+    /// the MANAGER's word before the reader's projection carries it, and
+    /// the fleet's storm read `EIO` for the whole poll interval after
+    /// every rejoin — the redirect's word is the lease's, fresher than any
+    /// ledger record (the writer's divert followed it since PR 12b round
+    /// 3; the reader stayed fail-closed). `object` names the read in the
+    /// unbound-holder refusal.
+    async fn reader_plane_for_holder(
+        &self,
+        default: &Arc<crate::meta_ship::token_plane::TokenReaderPlane>,
+        holder: u32,
+        object: Ino,
+    ) -> std::result::Result<Option<Arc<crate::meta_ship::token_plane::TokenReaderPlane>>, KvError>
+    {
         let bound = self
             .reader_holder_endpoints
             .read_sync(&holder, |_, e| Arc::clone(e));
@@ -3823,7 +3844,37 @@ impl KvMetaBackend {
                     }
                     return manager_word(e.into()).await;
                 };
-                if self.tokens_reader.get().is_some() || !joined {
+                // PR 13 (defect 28): a READER follows the redirect ONCE
+                // too — at the holder's plane the redirect names (the
+                // manager's own for holder 0), through its per-holder
+                // binding; a holder the S6 owner lists dead answers
+                // `HolderDead`, never a redirect, so the dial is bounded.
+                if let Some(default) = self.tokens_reader.get() {
+                    crate::meta_ship::token_plane::note_reader_redirect_followed();
+                    log::info!(
+                        "meta volume {}: NotHolder {{ {} }} for object {object} — this reader's \
+                         tree 0 lags the lease; retried at the holder the redirect named",
+                        self.path.display(),
+                        redirect.holder
+                    );
+                    let plane = if redirect.holder == 0 {
+                        Arc::clone(default)
+                    } else {
+                        match self
+                            .reader_plane_for_holder(default, redirect.holder, object)
+                            .await?
+                        {
+                            Some(p) => p,
+                            None => return Err(e.into()),
+                        }
+                    };
+                    return plane
+                        .serve(object, wants)
+                        .await
+                        .map(Some)
+                        .map_err(KvError::from);
+                }
+                if !joined {
                     return Err(e.into());
                 }
                 log::info!(

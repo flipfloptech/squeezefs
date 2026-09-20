@@ -3440,8 +3440,24 @@ static READER_UNBOUND_HOLDERS: AtomicU64 = AtomicU64::new(0);
 /// bounded to one per (holder, epoch step) by the negative cache.
 static READER_HOLDER_RESOLVES: AtomicU64 = AtomicU64::new(0);
 
+/// `NotHolder { holder }` redirects a READER followed once at the named
+/// holder's plane (PR 13, defect 28 — a slot granted since the reader's
+/// last epoch step; `dlm_token_reader_redirects_followed`). Before it the
+/// reader failed closed for the whole poll interval after every grant.
+static READER_REDIRECTS_FOLLOWED: AtomicU64 = AtomicU64::new(0);
+
 pub fn note_reader_unbound_holder() {
     READER_UNBOUND_HOLDERS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn note_reader_redirect_followed() {
+    READER_REDIRECTS_FOLLOWED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The followed-redirect count (the contracts' witness; the stats face is
+/// `dlm_token_reader_redirects_followed`).
+pub fn test_reader_redirects_followed() -> u64 {
+    READER_REDIRECTS_FOLLOWED.load(Ordering::Relaxed)
 }
 
 pub fn note_reader_holder_resolve() {
@@ -3731,6 +3747,7 @@ pub fn reader_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
                 .collect(),
         ),
         "dlm_token_reader_unbound_holders": READER_UNBOUND_HOLDERS.load(Ordering::Relaxed),
+        "dlm_token_reader_redirects_followed": READER_REDIRECTS_FOLLOWED.load(Ordering::Relaxed),
         "dlm_token_reader_holder_resolves": READER_HOLDER_RESOLVES.load(Ordering::Relaxed),
         // The mount's recall sink (one ledger — the sinks share it).
         "dlm_token_recall_purged_keys": RECALL_PURGE_KEYS.load(Ordering::Relaxed),

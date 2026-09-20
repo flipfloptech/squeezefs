@@ -1595,6 +1595,19 @@ counted decline, a bounded window or a stated venue):
    `affinity_a_max_bytes`, an O(M) headroom pick per spill. Feed the
    manager's images into the ledger or derive `A_max` off `slot_tree_
    bytes` Σ — one accessor.
+10. **The PAUSED-job premise on a slot whose children spilled** (§4.4ac
+   and the `sym-foreign-touch` PAUSED phase, attempts 12–14): the
+   design's rule counts `ops_h` PER SLOT, and at the `A_max` floor a
+   one-extent tree already spills its children to the rotor
+   (`mint_choice`'s strict `<` against `max(used/64, node_size)`), so a
+   job live under `job-wC/paused/…` leaves the touched `job-wC` slot
+   idle and the IDLE arm moves it at `N_floor` (2–3 on this box) touches
+   — the rule working on a slot nobody wrote. Two levers to price: `≤`
+   at the floor (a tree holds one extent's children before spilling —
+   what "never less than one extent" reads as) and the window's two
+   half-`T_idle` buckets (a guarantee of `T_idle / 2`, not `T_idle`).
+   The harness gates on the DOMINATED arm alone now and reports the
+   idle one.
 9. **The per-slot extent floor at small populations** (§3.6 reading 1,
    risk R9's number): 16 MiB per volume (64 rotor trees × one 256 KiB
    node) — 736 MiB for 20,000 files over 46 volumes against the flat's

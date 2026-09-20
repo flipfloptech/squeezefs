@@ -43,6 +43,13 @@ use std::time::Instant;
 
 /// The manager vocabulary's schema (independent of the transport's
 /// `CLUSTER_WIRE_SCHEMA`, which PR 3 bumped 4 → 5 for this block).
+/// Test seam (PR 13 review round 1, Issue 6): the NEXT served `JoinAppender`
+/// answers this `node_seq_base` word instead of the minted one (0 = off;
+/// consumed once) — the joiner's screen (`node_seq::screen_incarnation_
+/// base`) is the contract under test. In-process atomics, never an env knob.
+pub static TEST_JOIN_FORGE_NODE_SEQ_BASE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub const MANAGER_SCHEMA: u32 = 1;
 
 /// The manager verb block: `0x0500..=0x05FF`, disjoint from the S8
@@ -861,7 +868,14 @@ impl ManagerService {
                             ring_segments: ring_segments.iter().map(|s| (s.start, s.len)).collect(),
                             grant: runs_to_wire(&grant),
                             already,
-                            node_seq_base,
+                            // Test seam (Issue 6's pin): a forged word in the
+                            // reply — the joiner's screen is what refuses it.
+                            node_seq_base: match TEST_JOIN_FORGE_NODE_SEQ_BASE
+                                .swap(0, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                0 => node_seq_base,
+                                forged => forged,
+                            },
                         },
                     ),
                     ManagerCall::ExtentGrant { appender_id, want } => self

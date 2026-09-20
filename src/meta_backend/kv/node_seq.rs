@@ -76,6 +76,47 @@ pub fn incarnation_base(volume_base: u64, ordinal: u64) -> Option<u64> {
     Some(start)
 }
 
+/// **The joiner's screen of the `Joined.node_seq_base` wire word** (PR 13
+/// review round 1, Issue 6 — PR 3's bounded-execution law: every
+/// wire-carried integer is validated against DURABLE state before any
+/// effect; the `screen_release_words` / `screen_publish_root_words` shape).
+/// The word decides the identity space of every node this daemon will
+/// ever write, and the joiner holds the truth to judge it: the volume's
+/// own `node_seq_base(uuid)`. A legitimate base is `B + o · 2^K` for an
+/// ordinal `o ≥ 1` (incarnation 0 is the MANAGER's space — a word equal
+/// to `B` would put the joiner back into it, defect 5(a)'s P0 class) at
+/// or below the volume's capacity, and nothing else: a word off the
+/// stride straddles two spaces. Refused = `KvError::Rejected` naming the
+/// word and the base, nothing installed. Pure and total — the fuzz target
+/// `manager_call_frame`'s service-edge arm and the proptest mirror drive
+/// it.
+pub fn screen_incarnation_base(volume_base: u64, word: u64) -> Result<u64, KvError> {
+    let refuse = |why: &str| {
+        KvError::Rejected(format!(
+            "Joined.node_seq_base {word:#x} rejected: {why} (the volume's base is \
+             {volume_base:#x}, a joiner's base is B + o · 2^{INCARNATION_SPACE_BITS} for \
+             1 ≤ o ≤ {INCARNATION_ORDINAL_MAX} — a buggy or hostile manager frame; nothing \
+             installed)"
+        ))
+    };
+    let Some(offset) = word.checked_sub(volume_base) else {
+        return Err(refuse("below the volume's base"));
+    };
+    if offset == 0 {
+        return Err(refuse("incarnation 0 is the manager's own space"));
+    }
+    if offset % INCARNATION_SPACE != 0 {
+        return Err(refuse(
+            "not on the incarnation stride — it would straddle two spaces",
+        ));
+    }
+    let ordinal = offset / INCARNATION_SPACE;
+    match incarnation_base(volume_base, ordinal) {
+        Some(base) if base == word => Ok(word),
+        _ => Err(refuse("past the volume's incarnation capacity")),
+    }
+}
+
 /// The ONE tree-0 key of the incarnation counter: how many joiner
 /// incarnations this volume has minted (the manager's, volume-local —
 /// every volume of a set has its own base and its own counter).
@@ -110,9 +151,9 @@ pub fn decode_incarnations(value: &[u8]) -> Result<u64, KvError> {
             value.len()
         )));
     }
-    Ok(u64::from_le_bytes(
-        value[1..9].try_into().expect("8-byte slice"),
-    ))
+    let bytes = <[u8; 8]>::try_from(&value[1..9])
+        .map_err(|_| KvError::Corrupt("node_seq_incarnations record: short counter".into()))?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 /// The per-volume node-seq mint handle: the counter, its space's

@@ -1173,10 +1173,12 @@ impl KvTree {
                     // a restart inside THAT walk must not nest a refresh —
                     // the recursion overflowed three joiners' handler
                     // lanes. A walk under a refresh in flight keeps
-                    // restarting on the root the refresh installs.
-                    if self.cache.begin_projection_refresh() {
+                    // restarting on the root the refresh installs. The
+                    // flight is RAII: a traversal dropped inside the
+                    // refresh releases it (Issue 15).
+                    if let Some(flight) = self.cache.begin_projection_refresh() {
                         let refreshed = hook.refresh().await;
-                        self.cache.end_projection_refresh();
+                        drop(flight);
                         if refreshed {
                             super::META_KV_PROJECTION_ROOT_REFRESHES
                                 .fetch_add(1, Ordering::Relaxed);

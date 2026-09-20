@@ -30,6 +30,34 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
+/// `Joined` replies whose `node_seq_base` word failed the joiner's screen
+/// (PR 13 review round 1, Issue 6 — `node_seq::screen_incarnation_base`):
+/// the join REFUSED with nothing installed. Process-wide (a refused join
+/// has no backend to hang a gauge on); `joined_wire_words_rejected`,
+/// must-stay-0 on a healthy set.
+pub static JOINED_WIRE_WORDS_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+/// Test seam (PR 13 review round 1, Issue 14): park every projection
+/// refresh right after its SMO-mutex step — the mutex HELD by the guard
+/// the refresh runs under — until cleared. `TEST_PROJECTION_REFRESH_PARKED`
+/// counts the arrivals; the notify wakes both sides.
+pub static TEST_PROJECTION_REFRESH_PARK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Refreshes parked on [`TEST_PROJECTION_REFRESH_PARK`] so far.
+pub static TEST_PROJECTION_REFRESH_PARKED: AtomicU64 = AtomicU64::new(0);
+/// The park's notify: the refresh signals its arrival, the contract
+/// signals the release (after clearing the park word).
+pub static TEST_PROJECTION_REFRESH_NOTIFY: once_cell::sync::Lazy<
+    squeezefs_ipc::sqz_notify::Notify,
+> = once_cell::sync::Lazy::new(squeezefs_ipc::sqz_notify::Notify::new);
+
+/// A held SMO mutex of one volume ([`KvMetaBackend::test_try_hold_smo`]) —
+/// a contract's witness of the mutex's state, released at drop.
+#[must_use = "the SMO mutex is released when this hold drops"]
+pub struct SmoHold<'a> {
+    _guard: crate::sqz_sync::SqzMutexGuard<'a, super::super::tree::SmoContext>,
+}
+
 /// What a non-manager RW mount needs to open one volume as a JOINED
 /// appender — decided by the join ladder off DURABLE state
 /// (`sym_join::resolve_holder_endpoint(vol, 0)` for the manager's
@@ -494,12 +522,17 @@ pub(super) async fn wire_extent_refill(
 }
 
 /// The joined appender's projection refresh for the node cache's
-/// traversal (PR 13): `refresh_control_projection` behind the SMO mutex's
+/// traversal (PR 13): `refresh_control_projection` under the SMO mutex's
 /// `try_lock` — a holder of the mutex on a joiner that reaches tree 0 is
 /// a refresh already in flight (the checkpoint cycle's F3 re-dial or a
 /// divert's), whose new root the caller's next restart reads; the flush
 /// pass never traverses a projection. Never blocks a traversal behind
-/// the mutex.
+/// the mutex: the guard the `try_lock` WON is the one the refresh runs
+/// under (`SmoHeld::Yes` — PR 13 review round 1, Issue 14; the first
+/// build probed with `try_lock`, dropped the guard, and re-took the mutex
+/// with a blocking `lock().await` inside the refresh — a holder arriving
+/// between the two parked the traversal behind the checkpoint cycle for
+/// its whole pass, the exact wait the probe existed to refuse).
 struct JoinedProjectionRefresh {
     be: Weak<KvMetaBackend>,
 }
@@ -512,10 +545,10 @@ impl super::super::node_cache::ProjectionRefresh for JoinedProjectionRefresh {
             let Some(be) = self.be.upgrade() else {
                 return false;
             };
-            if be.smo.try_lock().is_err() {
+            let Ok(smo) = be.smo.try_lock() else {
                 return false;
-            }
-            match be.refresh_control_projection().await {
+            };
+            let refreshed = match be.refresh_control_projection_at(SmoHeld::Yes).await {
                 Ok(moved) => moved,
                 Err(e) => {
                     log::debug!(
@@ -525,7 +558,9 @@ impl super::super::node_cache::ProjectionRefresh for JoinedProjectionRefresh {
                     );
                     false
                 }
-            }
+            };
+            drop(smo);
+            refreshed
         })
     }
 }
@@ -710,6 +745,23 @@ impl KvMetaBackend {
                 }
                 other => return Err(unexpected("JoinAppender", &other)),
             };
+        // The word decides this daemon's node-seq space: screened against
+        // the volume's own base BEFORE anything is installed (Issue 6 —
+        // PR 3's bounded-execution law). A refused word is a rejected
+        // frame, never a joined appender.
+        let volume_base = super::super::builder::node_seq_base(sb.uuid);
+        let node_seq_base =
+            super::super::node_seq::screen_incarnation_base(volume_base, node_seq_base).map_err(
+                |e| {
+                    JOINED_WIRE_WORDS_REJECTED.fetch_add(1, Ordering::Relaxed);
+                    KvError::Rejected(format!(
+                        "{}: the manager at {} answered JoinAppender with a node-seq base this \
+                         joiner refuses — {e} (joined_wire_words_rejected)",
+                        path.display(),
+                        admission.manager_endpoint
+                    ))
+                },
+            )?;
         Ok((client, presented, appender_id, already, node_seq_base))
     }
 
@@ -2676,6 +2728,16 @@ impl KvMetaBackend {
         self.refresh_control_projection_at(SmoHeld::No)
     }
 
+    /// Test seam (PR 13 review round 1, Issue 14): try to take this
+    /// volume's SMO mutex from a contract — `None` while another holder
+    /// (a parked projection refresh, a checkpoint cycle) has it.
+    pub fn test_try_hold_smo(&self) -> Option<SmoHold<'_>> {
+        self.smo
+            .try_lock()
+            .ok()
+            .map(|guard| SmoHold { _guard: guard })
+    }
+
     /// [`Self::refresh_control_projection`] with the SMO-mutex posture
     /// explicit: `SmoHeld::Yes` from inside the checkpoint cycle (the
     /// wire re-dial's refresh — F3), which already holds the mutex for
@@ -2730,6 +2792,21 @@ impl KvMetaBackend {
                 SmoHeld::No => Some(self.smo.lock().await),
                 SmoHeld::Yes => None,
             };
+            // Test seam (Issue 14's pin): park HERE, the root moves ahead
+            // and the SMO mutex held by whichever guard this refresh runs
+            // under, so a contract can read the mutex from outside.
+            // Register-recheck-await on the seam's notify.
+            if TEST_PROJECTION_REFRESH_PARK.load(Ordering::Acquire) {
+                TEST_PROJECTION_REFRESH_PARKED.fetch_add(1, Ordering::AcqRel);
+                TEST_PROJECTION_REFRESH_NOTIFY.notify_waiters();
+                while TEST_PROJECTION_REFRESH_PARK.load(Ordering::Acquire) {
+                    let notified = TEST_PROJECTION_REFRESH_NOTIFY.notified();
+                    if !TEST_PROJECTION_REFRESH_PARK.load(Ordering::Acquire) {
+                        break;
+                    }
+                    notified.await;
+                }
+            }
             let native_slot = super::super::record::NATIVE_FOREST_SLOT;
             let mut dropped = 0usize;
             if let Some(ptr) = native_root.filter(|_| !plane.gate.is_leased(native_slot)) {

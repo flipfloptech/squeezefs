@@ -545,3 +545,92 @@ async fn a_projection_refresh_never_nests_inside_its_own_walk() {
         hook.calls.load(Ordering::Relaxed)
     );
 }
+
+/// A refresh that PARKS on its first call until the test drops the
+/// traversal holding it, then repoints on its second (the RAII pin's
+/// hook — PR 13 review round 1, Issue 15).
+struct ParkThenRepointHook {
+    cache: Arc<NodeCache>,
+    target: Arc<KvTree>,
+    calls: AtomicU64,
+    parked: Arc<tokio::sync::Notify>,
+    hold: Arc<tokio::sync::Notify>,
+}
+
+impl ProjectionRefresh for ParkThenRepointHook {
+    fn refresh<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let call = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
+            if call == 1 {
+                // Announce the park, then wait to be CANCELLED (the hold
+                // is never released — only the traversal's drop ends this
+                // future).
+                self.parked.notify_one();
+                self.hold.notified().await;
+                return false;
+            }
+            self.cache.discard_tree_nodes(TREE_CONTROL);
+            let root = self.target.root();
+            self.target
+                .install_recovered_root(root, 0)
+                .await
+                .expect("the refresh re-reads the root from the device");
+            true
+        })
+    }
+}
+
+/// **PR 13 review round 1, Issue 15 — the projection refresh's
+/// single-flight is RAII.** Defect 36's single-flight was a `begin` /
+/// `end` PAIR around `hook.refresh().await`; a traversal dropped inside
+/// the refresh (a cancelled handler, an aborted task, a caller's timeout)
+/// never reached `end`, and the cache refused every later refresh for the
+/// mount's life — the projection back on defect 18's exhausted budget with
+/// the remedy latched shut. Here the first refresh PARKS inside a
+/// traversal task the test aborts; RED before: the flight stayed marked
+/// and the second lookup exhausted its budget (`Corrupt`). GREEN: the
+/// drop released the flight, the second lookup's refresh runs and serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refresh_dropped_mid_flight_releases_the_single_flight() {
+    let vol = Vol::new();
+    let (cache_j, a_j, probe) = recycled_child(&vol).await;
+    let parked = Arc::new(tokio::sync::Notify::new());
+    let hook = Arc::new(ParkThenRepointHook {
+        cache: Arc::clone(&cache_j),
+        target: Arc::clone(&a_j),
+        calls: AtomicU64::new(0),
+        parked: Arc::clone(&parked),
+        hold: Arc::new(tokio::sync::Notify::new()),
+    });
+    assert!(cache_j.install_projection_refresh(hook.clone()));
+    // The first traversal reaches the refresh arm and parks inside it.
+    let tree = Arc::clone(&a_j);
+    let key = probe.clone();
+    let first = tokio::spawn(async move { tree.lookup(&key).await });
+    parked.notified().await;
+    assert!(
+        cache_j.projection_refresh_in_flight(),
+        "the parked refresh holds the single-flight"
+    );
+    // Cancel the traversal — the refresh future is dropped mid-flight.
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert!(
+        !cache_j.projection_refresh_in_flight(),
+        "the dropped flight released the single-flight (RAII) — a paired `end` never ran here"
+    );
+    // The next traversal's refresh RUNS (the hook's second call repoints)
+    // and the lookup serves.
+    let got = a_j
+        .lookup(&probe)
+        .await
+        .expect("a later traversal's refresh runs after a cancelled one");
+    assert_eq!(got.map(|v| v.len()), Some(200));
+    assert!(
+        hook.calls.load(Ordering::Relaxed) >= 2,
+        "the second refresh ran (calls {})",
+        hook.calls.load(Ordering::Relaxed)
+    );
+}

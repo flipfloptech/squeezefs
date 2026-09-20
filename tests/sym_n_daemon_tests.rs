@@ -1056,6 +1056,192 @@ async fn concurrent_storms(
 /// fresh incarnation `o ≥ 1` from the durable tree-0 counter and mints in
 /// the disjoint `[B + o·2^K, B + (o+1)·2^K)`; no two appenders ever mint
 /// an equal seq. RED on `8af38eda` (both joiners' roots read one seq).
+/// **Issue 6 (PR 13 review round 1) — the `Joined.node_seq_base` wire word
+/// is SCREENED at the joiner before anything is installed** (PR 3's
+/// bounded-execution law: the `screen_release_words` shape). A manager
+/// answering the volume's own base (incarnation 0 — its OWN space), an
+/// off-stride word, or a word past the volume's capacity would put the
+/// joiner back into (or straddling) another appender's node-seq space —
+/// defect 5(a)'s P0 class from one buggy or hostile frame. Forged through
+/// the served side's seam: the join REFUSES (`Rejected`, naming the word
+/// and the base), `joined_wire_words_rejected` + 1, no joined backend
+/// exists, and the next honest join lands with a screened base above the
+/// volume's. RED before: the forged word was installed verbatim and the
+/// join succeeded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forged_node_seq_base_in_the_join_reply_is_refused_before_anything_is_installed() {
+    use squeezefs::meta_backend::kv::backend::joined::JOINED_WIRE_WORDS_REJECTED;
+    use squeezefs::meta_backend::kv::builder::node_seq_base;
+    use squeezefs::meta_backend::kv::node_seq::{INCARNATION_ORDINAL_MAX, INCARNATION_SPACE};
+    use squeezefs::meta_ship::manager::TEST_JOIN_FORGE_NODE_SEQ_BASE;
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let b = node_seq_base(mvol.superblock().uuid);
+    let forged = [
+        ("incarnation 0 — the manager's own space", b),
+        ("off the stride", b + INCARNATION_SPACE + 1),
+        (
+            "past the capacity",
+            b + (INCARNATION_ORDINAL_MAX + 1) * INCARNATION_SPACE,
+        ),
+    ];
+    for (what, word) in forged {
+        let before = JOINED_WIRE_WORDS_REJECTED.load(Ordering::Relaxed);
+        TEST_JOIN_FORGE_NODE_SEQ_BASE.store(word, Ordering::SeqCst);
+        let err = try_join(&uris, &venue, &mvol, 7)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("a forged node_seq_base ({what}) joined"));
+        assert!(
+            err.contains("node-seq base this joiner refuses") && err.contains("rejected"),
+            "{what}: the refusal names the screen: {err}"
+        );
+        assert_eq!(
+            JOINED_WIRE_WORDS_REJECTED.load(Ordering::Relaxed),
+            before + 1,
+            "{what}: counted on joined_wire_words_rejected"
+        );
+        assert_eq!(
+            TEST_JOIN_FORGE_NODE_SEQ_BASE.load(Ordering::SeqCst),
+            0,
+            "the seam is consumed once"
+        );
+    }
+    // The next honest join lands, its base screened: strictly above the
+    // volume's base, on the stride.
+    let j = join(&uris, &venue, &mvol, 8).await;
+    // The handle starts at the screened base and mints upward inside its
+    // incarnation's span, so `(now − B) / 2^K` is the incarnation ordinal
+    // the manager minted — never 0, never past the capacity.
+    let now = j.volumes[0].test_node_seq_now();
+    let ordinal = (now - b) / INCARNATION_SPACE;
+    assert!(
+        now > b && (1..=INCARNATION_ORDINAL_MAX).contains(&ordinal),
+        "an honest base: the handle {now:#x} over {b:#x} sits in incarnation {ordinal}"
+    );
+    let _ = create_files(&j, 1, "ok", 2).await;
+    shutdown(&j).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
+/// **PR 13 review round 1, Issue 14 — the traversal's projection refresh
+/// runs under the SMO guard its `try_lock` WON, and never parks behind a
+/// held mutex.** The first build probed `smo.try_lock()`, DROPPED the
+/// guard, and called `refresh_control_projection()`, which re-took the
+/// mutex with a blocking `lock().await` — a holder arriving between the
+/// probe and the lock (the checkpoint cycle, the wire re-dial's refresh)
+/// parked the traversal behind it for the holder's whole pass, the exact
+/// wait the probe existed to refuse (and the shape F3 deadlocked on). Two
+/// arms: (a) the mutex HELD by the contract — the hook answers `false` at
+/// once, no wait; (b) the mutex free and a newer ledger record standing —
+/// the hook's refresh runs, and while it is parked inside its root moves
+/// the mutex reads HELD from outside (the guard the probe won is the one
+/// the refresh runs under; a re-take would self-deadlock here, a dropped
+/// guard would read FREE — both RED), then it completes on release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_traversal_refresh_runs_under_the_smo_guard_its_probe_won_and_never_parks_behind_a_holder(
+) {
+    use squeezefs::meta_backend::kv::backend::joined::{
+        TEST_PROJECTION_REFRESH_NOTIFY, TEST_PROJECTION_REFRESH_PARK,
+        TEST_PROJECTION_REFRESH_PARKED,
+    };
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    TEST_PROJECTION_REFRESH_PARK.store(false, Ordering::SeqCst);
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let j = join(&uris, &venue, &mvol, 1).await;
+    let jvol = Arc::clone(&j.volumes[0]);
+    let hook = Arc::clone(
+        jvol.node_cache()
+            .projection_refresh()
+            .expect("a joined appender installs the traversal refresh"),
+    );
+    // The joiner's own checkpoint cadence takes the mutex for a cycle now
+    // and then — take it when it is free (bounded).
+    async fn hold_eventually(
+        v: &KvMetaBackend,
+    ) -> squeezefs::meta_backend::kv::backend::joined::SmoHold<'_> {
+        for _ in 0..10_000 {
+            if let Some(h) = v.test_try_hold_smo() {
+                return h;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the joiner's SMO mutex never came free");
+    }
+    // (a) held: the hook refuses at once — never a park.
+    let held = hold_eventually(&jvol).await;
+    let answered = tokio::time::timeout(Duration::from_secs(10), hook.refresh())
+        .await
+        .expect("a refresh against a HELD mutex never waits for the holder");
+    assert!(
+        !answered,
+        "a held mutex answers `false` — nothing refreshed"
+    );
+    drop(held);
+    // (b) free, with a newer ledger record for the refresh to adopt.
+    let _ = create_files(&manager, 1, "m", 3).await;
+    mvol.checkpoint_now()
+        .await
+        .expect("the manager's checkpoint");
+    TEST_PROJECTION_REFRESH_PARK.store(true, Ordering::SeqCst);
+    let parked_before = TEST_PROJECTION_REFRESH_PARKED.load(Ordering::Acquire);
+    let refresh = {
+        let hook = Arc::clone(&hook);
+        tokio::spawn(async move { hook.refresh().await })
+    };
+    // Register-recheck-await for the refresh's arrival at the seam.
+    loop {
+        let notified = TEST_PROJECTION_REFRESH_NOTIFY.notified();
+        if TEST_PROJECTION_REFRESH_PARKED.load(Ordering::Acquire) > parked_before {
+            break;
+        }
+        tokio::time::timeout(Duration::from_secs(30), notified)
+            .await
+            .expect("the refresh reaches its root moves");
+    }
+    assert!(
+        jvol.test_try_hold_smo().is_none(),
+        "while the traversal refresh moves roots, the SMO mutex is HELD — by the guard its \
+         try_lock won"
+    );
+    TEST_PROJECTION_REFRESH_PARK.store(false, Ordering::SeqCst);
+    TEST_PROJECTION_REFRESH_NOTIFY.notify_waiters();
+    let moved = tokio::time::timeout(Duration::from_secs(30), refresh)
+        .await
+        .expect("the released refresh completes — no self-deadlock on a re-take")
+        .expect("the refresh task");
+    assert!(
+        moved,
+        "the projection advanced to the manager's newer ledger record"
+    );
+    drop(hold_eventually(&jvol).await); // the guard is released with the refresh
+    shutdown(&j).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_joined_appenders_never_mint_an_equal_node_seq() {
     use squeezefs::meta_backend::kv::node_seq::{incarnation_base, INCARNATION_SPACE};

@@ -2600,6 +2600,22 @@ pub struct NodeCache {
     projection_refreshing: std::sync::atomic::AtomicBool,
 }
 
+/// The projection refresh's single-flight, held for the refresh's
+/// lifetime ([`NodeCache::begin_projection_refresh`]); its drop releases
+/// the flight — on completion or on cancellation alike.
+#[must_use = "the single-flight is released when this guard drops"]
+pub struct ProjectionRefreshFlight<'a> {
+    cache: &'a NodeCache,
+}
+
+impl Drop for ProjectionRefreshFlight<'_> {
+    fn drop(&mut self) {
+        self.cache
+            .projection_refreshing
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// A joined appender's projection refresh (PR 13 — see
 /// [`NodeCache::install_projection_refresh`]): re-adopt the manager's
 /// tree 0 / native root from its newest ledger record. `true` = the
@@ -2677,12 +2693,16 @@ impl NodeCache {
         self.projection_refresh.get()
     }
 
-    /// Enter the projection refresh's single-flight (defect 36): `true` =
-    /// this caller runs it and must call [`Self::end_projection_refresh`];
-    /// `false` = a refresh is already in flight on this cache (the walk
-    /// inside it, or a concurrent one) — the caller keeps restarting on
-    /// the root the refresh installs, never nests a refresh.
-    pub fn begin_projection_refresh(&self) -> bool {
+    /// Enter the projection refresh's single-flight (defect 36): `Some` =
+    /// this caller runs it, for exactly the guard's lifetime; `None` = a
+    /// refresh is already in flight on this cache (the walk inside it, or
+    /// a concurrent one) — the caller keeps restarting on the root the
+    /// refresh installs, never nests a refresh. The flight is RAII (PR 13
+    /// review round 1, Issue 15): a refresh future dropped mid-flight — a
+    /// cancelled traversal, an aborted handler — releases the single-flight
+    /// with the guard, where a paired `end` call would have left the cache
+    /// refusing every later refresh for the mount's life.
+    pub fn begin_projection_refresh(&self) -> Option<ProjectionRefreshFlight<'_>> {
         self.projection_refreshing
             .compare_exchange(
                 false,
@@ -2691,12 +2711,17 @@ impl NodeCache {
                 std::sync::atomic::Ordering::Acquire,
             )
             .is_ok()
+            // Lazily: an eagerly built guard on the LOSING branch would drop
+            // at once and clear the winner's flight.
+            .then(|| ProjectionRefreshFlight { cache: self })
     }
 
-    /// Leave the single-flight.
-    pub fn end_projection_refresh(&self) {
+    /// Is a projection refresh in flight on this cache (the single-flight
+    /// word as it stands — a test's witness that a dropped flight cleared
+    /// it)?
+    pub fn projection_refresh_in_flight(&self) -> bool {
         self.projection_refreshing
-            .store(false, std::sync::atomic::Ordering::Release);
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Is `slot`'s tree (`None` = tree 0 / a flat tree) a PROJECTION on

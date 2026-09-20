@@ -1269,6 +1269,50 @@ proptest! {
         prop_assert_eq!(screen_publish_root_words(&legit, &bounds, &grant), Ok(()));
     }
 
+    /// Symmetric PR 13 (review round 1, Issue 6): the JOINER's screen of
+    /// the `Joined.node_seq_base` wire word is total and admits exactly
+    /// `B + o · 2^K` for `1 ≤ o ≤ INCARNATION_ORDINAL_MAX` — incarnation 0
+    /// (the manager's space) and every off-stride or over-capacity word
+    /// refused before anything is installed (the fuzz target
+    /// `manager_call_frame`'s arm 3e, on stable).
+    #[test]
+    fn a_joiners_node_seq_base_word_is_screened_before_anything_is_installed(
+        volume_base in 0u64..(1u64 << 63),
+        ordinal in 0u64..(1u64 << 26),
+        jitter in prop::option::of(1u64..(1u64 << 38)),
+    ) {
+        use squeezefs::meta_backend::kv::node_seq::{
+            incarnation_base, screen_incarnation_base, INCARNATION_ORDINAL_MAX,
+            INCARNATION_SPACE,
+        };
+        // A legitimate base is admitted verbatim.
+        if let Some(base) = incarnation_base(volume_base, ordinal) {
+            if ordinal >= 1 {
+                prop_assert_eq!(screen_incarnation_base(volume_base, base).ok(), Some(base));
+            } else {
+                prop_assert!(screen_incarnation_base(volume_base, base).is_err());
+            }
+            // Off the stride: refused.
+            if let Some(j) = jitter {
+                let off = base.saturating_add(j);
+                if (off - volume_base) % INCARNATION_SPACE != 0 {
+                    prop_assert!(screen_incarnation_base(volume_base, off).is_err());
+                }
+            }
+        }
+        // Past the capacity: refused.
+        if let Some(over) = (INCARNATION_ORDINAL_MAX + 1)
+            .checked_mul(INCARNATION_SPACE)
+            .and_then(|o| volume_base.checked_add(o))
+        {
+            prop_assert!(screen_incarnation_base(volume_base, over).is_err());
+        }
+        // Below the base: refused.
+        if volume_base > 0 {
+            prop_assert!(screen_incarnation_base(volume_base, volume_base - 1).is_err());
+        }
+    }
+
     /// Symmetric PR 6 (review round 1, Issue 3): the two lock verbs' wire
     /// screen is total and admits exactly volume 0 + a Live non-own id +
     /// the holder for an unlock (the fuzz target `manager_call_frame`'s

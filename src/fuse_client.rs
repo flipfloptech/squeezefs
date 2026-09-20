@@ -14181,6 +14181,13 @@ impl SqueezefsFilesystem {
                         word(&|s| s.wire_extent_returns),
                     );
                     metrics.insert("joined_wire_failures".into(), word(&|s| s.wire_failures));
+                    // Issue 6 (PR 13 review): `Joined.node_seq_base` words the
+                    // joiner's screen refused — process-wide (a refused join
+                    // has no backend); must-stay-0.
+                    metrics.insert(
+                        "joined_wire_words_rejected".into(),
+                        load(&crate::meta_backend::kv::backend::joined::JOINED_WIRE_WORDS_REJECTED),
+                    );
                     metrics.insert(
                         "joined_control_refusals".into(),
                         word(&|s| s.control_refusals),

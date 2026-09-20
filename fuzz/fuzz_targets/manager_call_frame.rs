@@ -482,6 +482,38 @@ fn check_dir_rename_screen(frame: &ManagerRequestFrame, facts: u8) {
 /// always passes; `PublishEndpoint` / `LeaveAppender` refuse every other
 /// peer; `JoinAppender` refuses another MEMBER id and admits an ad-hoc
 /// one; every other verb passes whatever the peer.
+/// Arm 3e: the joiner's screen of `Joined.node_seq_base` (Issue 6) — pure
+/// and total over any `(volume base, word)` pair; a word it admits is
+/// exactly one `incarnation_base(B, o)` with `o ≥ 1`, and every such base
+/// is admitted.
+fn check_incarnation_base_screen(volume_base: u64, word: u64) {
+    use squeezefs::meta_backend::kv::node_seq::{
+        incarnation_base, screen_incarnation_base, INCARNATION_ORDINAL_MAX, INCARNATION_SPACE,
+    };
+    match screen_incarnation_base(volume_base, word) {
+        Ok(admitted) => {
+            assert_eq!(admitted, word);
+            let offset = word - volume_base;
+            assert!(offset > 0 && offset % INCARNATION_SPACE == 0);
+            let ordinal = offset / INCARNATION_SPACE;
+            assert!(ordinal >= 1 && ordinal <= INCARNATION_ORDINAL_MAX);
+            assert_eq!(incarnation_base(volume_base, ordinal), Some(word));
+        }
+        Err(_) => {
+            // Never a legitimate base refused.
+            let legit = word
+                .checked_sub(volume_base)
+                .filter(|off| *off > 0 && *off % INCARNATION_SPACE == 0)
+                .map(|off| off / INCARNATION_SPACE)
+                .and_then(|o| incarnation_base(volume_base, o))
+                .is_some_and(|b| b == word);
+            assert!(!legit, "a legitimate incarnation base was refused");
+        }
+    }
+    // The manager's own space (o = 0) is always refused.
+    assert!(screen_incarnation_base(volume_base, volume_base).is_err());
+}
+
 fn check_identity_peer_screen(frame: &ManagerRequestFrame, peer_bytes: &[u8]) {
     use squeezefs::meta_ship::manager::screen_identity_peer;
     let peer = String::from_utf8_lossy(peer_bytes);
@@ -1134,6 +1166,13 @@ fuzz_target!(|data: &[u8]| {
         request_id: input.request_id,
         reply: input.reply.into(),
     };
+    // --- arm 3e: the JOINER's service edge over the reply's word (PR 13
+    // review round 1, Issue 6): `Joined.node_seq_base` is screened against
+    // the volume's own base before anything is installed — total, and
+    // admits exactly `B + o · 2^K` for `1 ≤ o ≤ INCARNATION_ORDINAL_MAX`.
+    if let ManagerReply::Joined { node_seq_base, .. } = &reply.reply {
+        check_incarnation_base_screen(input.total_extents, *node_seq_base);
+    }
     if let Ok(body) = encode_reply(&reply) {
         let back = decode_reply(&body).expect("an encoded reply frame decodes");
         assert_eq!(back, reply, "reply round-trip (constructive)");

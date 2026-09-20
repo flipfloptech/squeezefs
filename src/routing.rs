@@ -1849,6 +1849,15 @@ pub enum SoleOwnerVerdict {
     /// lever is a per-block SHARED / reference-count summary carried on
     /// the custody grant, or a probe verb at the holder (PR 12).
     ForeignCustody,
+    /// PR 13's clause (the co-writer posture clause's joiner face): this
+    /// mount holds no ALLOCATION LEASE for the block's data volume
+    /// ([`crate::block_allocator::BlockAllocator::holds_ownership_plane`]
+    /// — a JOINED appender under PR 12b), and the patch retires a lifetime
+    /// that plane accounts; the CoW path + the shipped free, counted
+    /// `patch_ineligible_posture`. Decided BEFORE any probe or the
+    /// incarnation retire, so the allocator's ERROR-logging gate is never
+    /// reached from a product ladder.
+    NonHolder,
 }
 
 /// The packer's scope key on an armed set (design §5.4.3 law 1): the
@@ -8189,6 +8198,12 @@ impl DataRouter {
     ) -> SoleOwnerVerdict {
         if !self.symmetric_armed() {
             return SoleOwnerVerdict::Sole;
+        }
+        // PR 13: the ownership-accounting plane first — a non-holder's
+        // patch would be refused at the allocator's gate with an ERROR per
+        // attempt; decide it here as the counted posture clause.
+        if !allocator.holds_ownership_plane() {
+            return SoleOwnerVerdict::NonHolder;
         }
         if crate::data_grant::slot_holder_home(ino).is_some() {
             return SoleOwnerVerdict::ForeignCustody;

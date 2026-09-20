@@ -8018,7 +8018,11 @@ pub struct Metrics {
     /// reaches `plane_gate`'s ERROR-per-attempt refusal (which moves
     /// `cowriter_accounting_refusals`, a must-stay-≈0 bug tripwire on
     /// rewriting co-writers) and never pollutes `patch_ineligible_shared`
-    /// with its fallback. 0 on every non-co-writer mount by construction.
+    /// with its fallback. Symmetric PR 13 gave it a PER-VOLUME face: a
+    /// JOINED appender holding no ALLOCATION LEASE for the block's data
+    /// volume declines here too (`SoleOwnerVerdict::NonHolder`). 0 on
+    /// every non-co-writer mount that holds its volumes' leases — every
+    /// unarmed writer and the manager — by construction.
     pub patch_ineligible_posture: Align64<AtomicU64>,
     /// Patch DMA failures (EIO surfaced to exactly this write; tiers
     /// purged + incarnation re-stabilized — nothing acked, nothing lost).
@@ -16175,6 +16179,17 @@ impl SqueezefsFilesystem {
         let Ok((be_id, dev_off)) = self.router.backend_router.split_block_key(&key) else {
             return Err(I::Shape);
         };
+        // The posture screen's per-volume face (symmetric PR 13): on an
+        // ARMED set a JOINED appender holds no allocation lease for the
+        // block's volume, so its dd write is never patch-eligible — the
+        // co-writer decline above, resolved per allocator (one relaxed
+        // load unarmed; the handler ladder counts `patch_ineligible_posture`).
+        if self.router.symmetric_armed() {
+            match self.router.backend_router.get_backend(be_id) {
+                Ok((allocator, _)) if allocator.holds_ownership_plane() => {}
+                _ => return Err(I::Shape),
+            }
+        }
         let be_id = compact_str::CompactString::from(be_id);
 
         // -- commit ------------------------------------------------------
@@ -18361,6 +18376,15 @@ impl SqueezefsFilesystem {
             crate::routing::SoleOwnerVerdict::ForeignCustody => {
                 METRICS
                     .patch_ineligible_foreign_custody
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(false);
+            }
+            // Symmetric PR 13: a JOINED appender holding no allocation
+            // lease for the block's volume — the co-writer posture clause's
+            // per-volume face, the same bucket.
+            crate::routing::SoleOwnerVerdict::NonHolder => {
+                METRICS
+                    .patch_ineligible_posture
                     .fetch_add(1, Ordering::Relaxed);
                 return Ok(false);
             }
@@ -22273,6 +22297,37 @@ impl SqueezefsFilesystem {
         let Ok((allocator, device)) = self.router.backend_router.get_backend(&be_id) else {
             return Ok(false);
         };
+        // The durable clause, whole-block face (symmetric PR 7 / 9 / 13 —
+        // `try_sole_owner_patch`'s order): on an ARMED set the ino's slot
+        // tree decides sole ownership, a foreign-custody file and a
+        // non-holder joiner decline as counted decisions BEFORE the
+        // incarnation word is retired; unarmed it answers `Sole` with no
+        // read.
+        match self
+            .router
+            .sole_owner_verdict(ino, &allocator, dev_offset)
+            .await
+        {
+            crate::routing::SoleOwnerVerdict::Sole => {}
+            crate::routing::SoleOwnerVerdict::Shared => {
+                METRICS
+                    .patch_ineligible_shared
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(false);
+            }
+            crate::routing::SoleOwnerVerdict::ForeignCustody => {
+                METRICS
+                    .patch_ineligible_foreign_custody
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(false);
+            }
+            crate::routing::SoleOwnerVerdict::NonHolder => {
+                METRICS
+                    .patch_ineligible_posture
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(false);
+            }
+        }
         // The §5.1 fence, whole-block face: retire the incarnation (racing
         // validated fills of this key fail their seqlock re-check instead
         // of publishing mid-rewrite bytes) → fence(SeqCst) → sole-owner

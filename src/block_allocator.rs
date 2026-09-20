@@ -1586,6 +1586,30 @@ impl BlockAllocator {
         Ok(())
     }
 
+    /// Does this mount hold the OWNERSHIP-accounting plane of this
+    /// allocator's volume — the question [`Self::plane_gate`]'s armed arm
+    /// asks, answered WITHOUT the gate's ERROR line (symmetric PR 13; the
+    /// 2026-08-19 co-writer precedent made a joiner's shape): on a
+    /// grant-armed allocator (PR 8's `install_block_grant_arm`) the plane
+    /// is the ALLOCATION LEASE, so a JOINED appender that holds none for
+    /// this data volume answers `false` and the W1 ladders DECLINE
+    /// upstream as the counted `patch_ineligible_posture` decision —
+    /// before `begin_patch_sole_owner` can reach the gate's refusal, one
+    /// ERROR + one `cowriter_accounting_refusals` per eligible overwrite
+    /// (the sym-walls rewrite row on N = 7 joiners). Every unarmed
+    /// allocator answers `true` (the posture-word arms are the shipped
+    /// ladders' own clauses).
+    #[inline]
+    pub fn holds_ownership_plane(&self) -> bool {
+        match self.block_grant_vol_tag() {
+            Some(vol_tag) => {
+                crate::meta_backend::kv::alloc_lease::holding(vol_tag).is_some()
+                    || crate::cowriter::authority_accounting_scope_active()
+            }
+            None => true,
+        }
+    }
+
     /// [`Self::plane_gate`] for the **ALLOCATION** arms only (DLM S9 blocker
     /// #3's admission — `docs/design-mw-data-alloc-partition.md`,
     /// `crate::alloc_lane_grant`).
@@ -3226,10 +3250,13 @@ impl BlockAllocator {
         // whole-block twin in `try_inplace_rewrite`, and the dd shape
         // probe — the 2026-08-19 mw-fleet storm fix: this gate's
         // ERROR-per-attempt refusal fired per eligible overwrite and
-        // moved the `cowriter_accounting_refusals` tripwire). So this arm
-        // stays DEFENSE-IN-DEPTH — structurally unreachable from the
-        // product ladders on both postures — and a counter that can only
-        // ever read 0 is exactly the dead weight the ledger's
+        // moved the `cowriter_accounting_refusals` tripwire), and a JOINED
+        // appender under the armed plane declines the same way through
+        // `holds_ownership_plane` (`SoleOwnerVerdict::NonHolder`, PR 13 —
+        // the sym-walls rewrite row re-found the class on N = 7 joiners).
+        // So this arm stays DEFENSE-IN-DEPTH — structurally unreachable
+        // from the product ladders on every posture — and a counter that
+        // can only ever read 0 is exactly the dead weight the ledger's
         // rot-detection value depends on not having.
         if self.plane_gate("W1 in-place sub-block patch").is_err() {
             return false;

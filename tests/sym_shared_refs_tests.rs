@@ -1263,3 +1263,100 @@ async fn the_index_lives_in_tree0_and_never_pollutes_a_slot_trees_probe() {
     assert_eq!(vol.shared_index_scan(tag).await.unwrap().len(), 1);
     shutdown(&routed).await;
 }
+
+/// **PR 13 — the W1 ladders decline a NON-HOLDER's patch as the counted
+/// posture DECISION** (the 2026-08-19 co-writer clause's joiner face): a
+/// JOINED appender's allocator is grant-armed for a data volume whose
+/// ALLOCATION LEASE this mount does not hold, so the ownership plane the
+/// patch's incarnation retire accounts is another daemon's —
+/// `BlockAllocator::holds_ownership_plane` answers `false`, and the
+/// durable clause answers `SoleOwnerVerdict::NonHolder` BEFORE any probe
+/// and before the incarnation word is retired. Before it, the ladders ran
+/// on into `begin_patch_sole_owner`, whose `plane_gate` refused with one
+/// ERROR line + one `cowriter_accounting_refusals` per eligible overwrite
+/// (the sym-walls rewrite row: a burst per joiner). The shipped
+/// allocator (no grant arm) and the holder keep the `Sole` verdict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_w1_ladders_decline_a_non_holders_patch_as_a_counted_posture_decision() {
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::meta_backend::kv::alloc_lease;
+    use squeezefs::meta_ship::manager::WireIdentity;
+    use squeezefs::routing::SoleOwnerVerdict;
+    let dir = tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let data = data_file();
+    let rig = mount(&uris, data.path(), &Knobs::armed()).await;
+    let f = rig.mk_file("f").await;
+    let offset = rig.publish_block(f, 0).await;
+    assert!(
+        rig.alloc.holds_ownership_plane(),
+        "an allocator without a grant arm takes the shipped arms: it holds its plane"
+    );
+    assert_eq!(
+        rig.router.sole_owner_verdict(f, &rig.alloc, offset).await,
+        SoleOwnerVerdict::Sole
+    );
+    // A JOINED appender's allocator for a data volume nobody in this
+    // process holds the allocation lease of: grant-armed through the
+    // wire sink (the venue is never dialed — the verdict is decided
+    // before any ask).
+    let joiner_vol = "vol-pr13-joiner-data";
+    let joiner_tag = volume_tag(joiner_vol);
+    assert!(
+        alloc_lease::holding(joiner_tag).is_none(),
+        "premise: no allocation lease for the joiner's volume here"
+    );
+    let non_holder = Arc::new(BlockAllocator::new(joiner_vol).await.unwrap());
+    non_holder.set_capacity_bytes(4096 * non_holder.chunk_size());
+    assert!(non_holder.install_block_grant_arm(
+        joiner_tag,
+        alloc_lease::wire_block_grant_sink(
+            alloc_lease::HolderVenue::fixed("127.0.0.1:1".to_string()),
+            vec![7u8; 32],
+            WireIdentity {
+                node_token: 0x5150_1313,
+                mount_slot: 3,
+                writer_id: 0x13,
+            },
+            0,
+            joiner_tag,
+        ),
+    ));
+    assert!(
+        !non_holder.holds_ownership_plane(),
+        "grant-armed, lease held elsewhere: the plane is another daemon's"
+    );
+    let probes = BLOCK_REF_PROBES.load(Ordering::Relaxed);
+    let refusals = squeezefs::fuse_client::METRICS
+        .cowriter_accounting_refusals
+        .load(Ordering::Relaxed);
+    assert_eq!(
+        rig.router.sole_owner_verdict(f, &non_holder, offset).await,
+        SoleOwnerVerdict::NonHolder,
+        "the ladder's counted decision, not the gate's refusal"
+    );
+    assert_eq!(
+        BLOCK_REF_PROBES.load(Ordering::Relaxed),
+        probes,
+        "decided before any durable probe"
+    );
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .cowriter_accounting_refusals
+            .load(Ordering::Relaxed),
+        refusals,
+        "the allocator's ERROR-logging gate was never reached"
+    );
+    // The gate itself stays the defense-in-depth arm: reached directly it
+    // still refuses (and counts) — which is exactly why the ladders decide
+    // upstream.
+    assert!(!non_holder.begin_patch_sole_owner(offset));
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .cowriter_accounting_refusals
+            .load(Ordering::Relaxed),
+        refusals + 1
+    );
+    shutdown(&rig.routed).await;
+}

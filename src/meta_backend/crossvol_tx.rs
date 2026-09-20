@@ -263,6 +263,10 @@ static DIR_RENAME_PARENT_SCANS: AtomicU64 = AtomicU64::new(0);
 /// op — the design's "foreign-home guards travel: dlm_rpcs += 1 each"
 /// face; the `dlm_rpcs` word itself is the S4 table's).
 static XV_CO_GUARD_RPCS: AtomicU64 = AtomicU64::new(0);
+/// Travelling-guard acquisitions retried after a holder answered "stale
+/// holder view" (PR 13): the initiator re-resolved every key's slot at
+/// the manager and shipped again.
+static XV_CO_GUARD_STALE_RERESOLVES: AtomicU64 = AtomicU64::new(0);
 /// Guard scopes this holder parked for a remote initiator.
 static XV_CO_GUARDS_PARKED: AtomicU64 = AtomicU64::new(0);
 /// Parked scopes released by the lease-expiry sweep, not their initiator
@@ -505,6 +509,7 @@ pub struct CrossOwnerStats {
     pub dir_rename_parent_scans: u64,
     /// `XvGuards` shipped (initiator side).
     pub guard_rpcs: u64,
+    pub guard_stale_reresolves: u64,
     /// Scopes parked for remote initiators (holder side).
     pub guards_parked: u64,
     /// **Must stay 0**: scopes the lease-expiry sweep released.
@@ -526,6 +531,7 @@ pub fn cross_owner_stats() -> CrossOwnerStats {
         dir_rename_lock_wait_ns_sum: DIR_RENAME_LOCK_WAIT.sum_ns(),
         dir_rename_parent_scans: DIR_RENAME_PARENT_SCANS.load(Ordering::Relaxed),
         guard_rpcs: XV_CO_GUARD_RPCS.load(Ordering::Relaxed),
+        guard_stale_reresolves: XV_CO_GUARD_STALE_RERESOLVES.load(Ordering::Relaxed),
         guards_parked: XV_CO_GUARDS_PARKED.load(Ordering::Relaxed),
         guard_expiries: XV_CO_GUARD_EXPIRIES.load(Ordering::Relaxed),
     }
@@ -566,6 +572,10 @@ pub fn cross_owner_stats_json() -> serde_json::Map<String, serde_json::Value> {
         serde_json::Value::Object(phases),
     );
     out.insert("xv_cross_owner_guard_rpcs".into(), s.guard_rpcs.into());
+    out.insert(
+        "xv_cross_owner_guard_stale_reresolves".into(),
+        s.guard_stale_reresolves.into(),
+    );
     out.insert(
         "xv_cross_owner_guards_parked".into(),
         s.guards_parked.into(),
@@ -898,6 +908,55 @@ pub async fn acquire_guards_leased(
     if !vol.slot_lease_armed() || crate::meta_ship::executing_for_ship_client() {
         return Ok(vol.dlm().lock_many(inos, dents).await);
     }
+    // A holder's refusal "this mount does not lease the slot — the
+    // initiator re-resolves through tree 0" (`serve_xv_guards`) IS the
+    // re-resolve's trigger (PR 13, the fleet's shared-directory row: a
+    // stripe's slot handed to a dominating requester between two of a
+    // creator's ops left the creator's projection naming the old holder,
+    // and the refusal surfaced as EAGAIN to the application). Every key's
+    // slot is re-resolved at the manager and the acquisition retried —
+    // bounded: a second stale answer is the retryable class the caller
+    // sees.
+    const STALE_HOLDER_RETRIES: usize = 2;
+    let mut attempt = 0;
+    loop {
+        match acquire_guards_leased_once(routed, v_idx, scope, inos, dents, discovery).await {
+            Err(e) if is_stale_holder_refusal(&e) && attempt < STALE_HOLDER_RETRIES => {
+                attempt += 1;
+                XV_CO_GUARD_STALE_RERESOLVES.fetch_add(1, Ordering::Relaxed);
+                for local in inos
+                    .iter()
+                    .map(|(l, _)| *l)
+                    .chain(dents.iter().map(|(p, _, _)| *p))
+                {
+                    let slot = crate::meta_backend::kv::record::forest_slot_of_ino(local);
+                    let _ = vol.reresolve_slot_holder(slot).await;
+                }
+                log::debug!(
+                    "cross-owner guards: a holder answered stale ({e}); the slots re-resolved at \
+                     the manager, attempt {attempt} of {STALE_HOLDER_RETRIES}"
+                );
+            }
+            other => return other,
+        }
+    }
+}
+
+/// The refusal a travelling `XvGuards` earns at a holder whose lease of
+/// the slot has moved (`RoutedMetaBackend::serve_xv_guards`).
+fn is_stale_holder_refusal(e: &SqueezefsError) -> bool {
+    e.to_errno() == libc::EAGAIN && e.to_string().contains("holder view is stale")
+}
+
+async fn acquire_guards_leased_once(
+    routed: &RoutedMetaBackend,
+    v_idx: usize,
+    scope: &mut Option<u64>,
+    inos: &[(Ino, dlm::LockMode)],
+    dents: &[(Ino, &str, dlm::LockMode)],
+    discovery: bool,
+) -> Result<Vec<dlm::DlmGuard>> {
+    let vol = &routed.volumes[v_idx];
     let scope = *scope.get_or_insert_with(mint_guard_scope);
     let force_remote = TEST_XV_GUARDS_FORCE_REMOTE.load(Ordering::Relaxed);
     let own_id = vol.own_appender_id();

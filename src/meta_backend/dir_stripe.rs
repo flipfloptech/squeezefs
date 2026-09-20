@@ -1467,6 +1467,20 @@ impl RoutedMetaBackend {
     /// STRIPE, an already-striped directory and a marker insert (the
     /// flip's own steps, shipped to the holder by their suppliers) feed
     /// nothing (Issue 1 / Issue 11).
+    /// Is GLOBAL `dir` in the STRIPING mechanism's domain — a known stripe,
+    /// or a directory whose map this mount has read? A ship into it is
+    /// aggregate by construction (many creators into one directory, the
+    /// flip's shape) and never feeds the handover's dominance window (PR
+    /// 13, gate 3b: a stripe the manager supplied moved to the first
+    /// requester whose few ships beat the manager's own few into that
+    /// 1/K shard — a legal verdict of the law over a slot the striping
+    /// already spread K ways; §5.6.5's split: one dominating creator is a
+    /// handover candidate, MANY are a striping one). One `scc` probe each.
+    pub(super) fn is_striping_domain(&self, dir: Ino) -> bool {
+        self.dir_stripes.known_stripes.contains_sync(&dir)
+            || self.dir_stripes.maps.contains_sync(&dir)
+    }
+
     pub fn note_served_insert(&self, dir: Ino, name: &str, creator: u32) {
         let (v, _) = self.route_ino(dir);
         let Some(plane) = self.volumes.get(v).and_then(|vol| vol.slot_leases()) else {

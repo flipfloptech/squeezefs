@@ -894,6 +894,43 @@ impl KvMetaBackend {
         // cycle): the MANAGER's table is the lease's own word — ONE
         // `ResolveSlot` (`slot_resolve_rpcs` at the manager) answers a
         // slot the projection still reads `Unleased`.
+        Some(
+            self.learn_slot_holder_from_manager(slot)
+                .await
+                .unwrap_or(refreshed),
+        )
+    }
+
+    /// Re-resolve `slot`'s lessee at the MANAGER whatever this joiner's
+    /// table says (PR 13, the fleet's shared-directory row): a slot the
+    /// projection reads as SOME holder's may have MOVED since (a handover
+    /// this joiner was neither party to), and a travelling `XvGuards` to
+    /// the stale holder is refused EAGAIN "the initiator re-resolves
+    /// through tree 0" — this is that re-resolve. On the manager the
+    /// table is authoritative: its own answer. `None` when no word could
+    /// be had (the caller keeps what it has).
+    pub async fn reresolve_slot_holder(
+        &self,
+        slot: ForestSlot,
+    ) -> Option<crate::slot_lease_core::Resolved> {
+        let plane = self.slot_leases()?;
+        if !self.is_joined_appender() {
+            return Some(plane.table.resolve(slot));
+        }
+        self.learn_slot_holder_from_manager(slot).await
+    }
+
+    /// ONE wire `ResolveSlot` for `slot`, its answer LEARNT into the
+    /// projection (the acquire's `SlotRefused` arm's law): every later
+    /// table read of the slot — the stripe census's creator, the ship's
+    /// requester, `step_home`, the door — answers without another verb.
+    /// An `Unleased` answer clears a stale foreign word (the slot is
+    /// first-touchable again). `None` = the verb failed.
+    async fn learn_slot_holder_from_manager(
+        &self,
+        slot: ForestSlot,
+    ) -> Option<crate::slot_lease_core::Resolved> {
+        let plane = self.slot_leases()?;
         let wire = Arc::clone(self.joined.get()?);
         let routing = self.routing_slot_of_forest(slot).ok()?;
         match wire
@@ -903,10 +940,6 @@ impl KvMetaBackend {
             .await
         {
             Ok(ManagerReply::Holder { appender_id, g }) => {
-                // The projection LEARNS the manager's word (the acquire's
-                // `SlotRefused` arm's law): every later table read of the
-                // slot — the stripe census's creator, the ship's requester,
-                // the door — answers the holder without another verb.
                 if appender_id != self.own_appender_id() {
                     plane.table.load(
                         slot,
@@ -923,14 +956,35 @@ impl KvMetaBackend {
                     g,
                 })
             }
-            Ok(_) => Some(refreshed),
+            Ok(ManagerReply::Unleased { g }) => {
+                if !plane.gate.is_leased(slot) {
+                    plane.table.load(
+                        slot,
+                        crate::slot_lease_core::SlotLease::unleased(
+                            g,
+                            0,
+                            crate::slot_lease_core::SlotWords::default(),
+                        ),
+                    );
+                    plane.gate.clear_foreign(slot);
+                    plane.holders.forget(slot);
+                }
+                Some(crate::slot_lease_core::Resolved::Unleased { g })
+            }
+            Ok(other) => {
+                log::debug!(
+                    "meta volume {}: ResolveSlot for slot {slot} answered {other:?}",
+                    self.path.display()
+                );
+                None
+            }
             Err(e) => {
                 log::debug!(
                     "meta volume {}: ResolveSlot for slot {slot} failed ({e}) — the projection's \
                      answer stands",
                     self.path.display()
                 );
-                Some(refreshed)
+                None
             }
         }
     }

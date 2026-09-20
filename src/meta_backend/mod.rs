@@ -1838,8 +1838,16 @@ impl RoutedMetaBackend {
         // requester is the shipping mount's appender: its member id's
         // identity where this plane learnt it, else — for an insert — the
         // creator through the child's slot (the child is minted in the
-        // creator's rotor; the screen above refreshed the projection).
-        if vol.slot_leases().is_some() {
+        // creator's rotor; the screen above refreshed the projection). A
+        // ship into a STRIPED directory or one of its stripes is the
+        // striping mechanism's (aggregate by construction) and feeds no
+        // window (`is_striping_domain`).
+        let striping = match step {
+            crossvol_tx::XvStep::InsertDentry { parent, .. }
+            | crossvol_tx::XvStep::RemoveDentry { parent, .. } => self.is_striping_domain(*parent),
+            _ => false,
+        };
+        if vol.slot_leases().is_some() && !striping {
             let slot = kv::record::forest_slot_of_ino(local.local_home());
             if let Some(requester) = self.served_step_requester(vol, scope.client, step) {
                 let ship_ns = u64::try_from(served_at.elapsed().as_nanos()).unwrap_or(u64::MAX);

@@ -1505,6 +1505,112 @@ async fn a_dominating_requester_earns_an_idle_joined_holders_tree_through_served
     shutdown(&manager).await;
 }
 
+/// **A creator whose projection names a slot's OLD holder re-resolves and
+/// retries, never surfaces EAGAIN** (PR 13 — the fleet's shared-directory
+/// row on the defect-9 binary: a stripe's slot moved to a dominating
+/// requester between two of m61's creates; the holder answered its
+/// travelling `XvGuards` "this mount does not lease the slot — the
+/// initiator re-resolves through tree 0", and nothing re-resolved: the
+/// refusal reached the application as EAGAIN, 52 of 2,500 creates). The
+/// re-resolve is `reresolve_slot_holder` (one wire `ResolveSlot`, its
+/// answer learnt into the projection) around the acquisition, counted on
+/// `xv_cross_owner_guard_stale_reresolves`. Pinned: joiner 2's projection
+/// names the MANAGER for a directory's slot; the manager hands the slot to
+/// joiner 1 (an in-process accept: release + grant); joiner 2's next create
+/// into it lands, served at joiner 1, ONE re-resolve counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_holder_view_at_the_guards_re_resolves_and_lands_the_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "d")]).await;
+    let d = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    // The manager first-touches the directory's slot.
+    let _ = create_files(&manager, d, "m", 2).await;
+    let j1 = join(&uris, &venue, &mvol, 1).await;
+    let j2 = join(&uris, &venue, &mvol, 2).await;
+    // Both joiners' projections name the manager as the slot's holder.
+    assert!(
+        matches!(
+            j2.volumes[0].slot_leases().unwrap().table.resolve(SLOT_A),
+            squeezefs::slot_lease_core::Resolved::Holder { holder: 0, .. }
+        ),
+        "the premise: joiner 2's projection names the manager"
+    );
+    let j1venue = DaemonVenue::stand_up(&j1, false, "joiner-1").await;
+    j2.volumes[0]
+        .slot_leases()
+        .expect("armed")
+        .holders
+        .set_endpoint(1, &j1venue.endpoint);
+    let mvenue_ep = venue.endpoint();
+    j2.volumes[0]
+        .slot_leases()
+        .expect("armed")
+        .holders
+        .set_endpoint(0, &mvenue_ep);
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(&j2),
+            "node-j2",
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    // The slot MOVES to joiner 1 (its wire first touch is refused while
+    // the manager holds it; an explicit offer + accept moves it — the
+    // manager's in-process release + grant under one mutex hold).
+    mvol.manager_offer_slot(0, SLOT_A, 1)
+        .await
+        .expect("the manager offers its slot to joiner 1");
+    let routing_a = squeezefs::meta_backend::kv::appender::page_slot_of_forest_slot(
+        SLOT_A,
+        mvol.appender_stats().unwrap().native_slot,
+    )
+    .unwrap();
+    let (_, accepted) = j1.act_on_slot_carriage(&[], &[(routing_a, 0)]).await;
+    assert_eq!(accepted, 1, "joiner 1 holds the slot now");
+    assert!(
+        matches!(
+            j2.volumes[0].slot_leases().unwrap().table.resolve(SLOT_A),
+            squeezefs::slot_lease_core::Resolved::Holder { holder: 0, .. }
+        ),
+        "joiner 2's projection is STALE — it still names the manager"
+    );
+    let stale0 = squeezefs::meta_backend::crossvol_tx::cross_owner_stats().guard_stale_reresolves;
+    let child = j2
+        .create(d, "after-the-move", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("the create lands after ONE re-resolve, never EAGAIN")
+        .ino;
+    assert_eq!(
+        squeezefs::meta_backend::crossvol_tx::cross_owner_stats().guard_stale_reresolves,
+        stale0 + 1,
+        "exactly one stale-holder re-resolve"
+    );
+    assert!(
+        matches!(
+            j2.volumes[0].slot_leases().unwrap().table.resolve(SLOT_A),
+            squeezefs::slot_lease_core::Resolved::Holder { holder: 1, .. }
+        ),
+        "joiner 2's projection learnt the new holder"
+    );
+    assert_eq!(
+        j1.lookup_dentry_exact_unguarded(d, "after-the-move")
+            .await
+            .expect("the new holder reads its tree")
+            .map(|(i, _)| i),
+        Some(child)
+    );
+    shutdown(&j2).await;
+    shutdown(&j1).await;
+    j1venue.tear_down();
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
 /// **Own residue** (PR 2's law on a wire region, deliverable 4): the joiner
 /// commits, checkpoints, commits MORE into its window, and dies (dropped
 /// without a shutdown). The same identity's rejoin presents its Live

@@ -3988,14 +3988,37 @@ leg_sym_foreign_touch() {
     # Phase 2 — LIVE holder: A keeps creating in its tree while B touches
     # it with bursts — ships, NEVER a handover.
     for idx in "$a" "$b" "$c"; do snap "$idx" live0 "$rowdir"; done
-    "$SYM_STORM" "$(mnt_of "$a")/job-w$a/live" "$SYM_THREADS" "$SYM_FILES" mkdir >"$rowdir/live-a.txt" 2>&1 &
+    # The live directory exists BEFORE the storm is launched into it: the
+    # first run of this leg launched the storm first, its first mkdir
+    # failed ENOENT and died, and the "live" holder was IDLE for the whole
+    # phase — the dominance law then moved the slot to B correctly and the
+    # leg read it as "a live holder recalled by a touch" (PR 13, harness).
+    # The holder stays LIVE for the whole phase: one storm of SYM_FILES
+    # finishes in seconds at the holder's own rate, so the storm runs in
+    # rounds (a fresh subdirectory each) until the touches are over.
+    local live_root
+    live_root="$(mnt_of "$a")/job-w$a/live"
+    mkdir -p "$live_root" || die "sym-foreign-touch: the live directory's mkdir failed"
+    (
+        i=0
+        while :; do
+            i=$((i + 1))
+            mkdir -p "$live_root/r$i" || exit 1
+            "$SYM_STORM" "$live_root/r$i" "$SYM_THREADS" "$SYM_FILES" mkdir >>"$rowdir/live-a.txt" 2>&1 || exit 1
+        done
+    ) &
     local live_pid=$!
-    mkdir -p "$(mnt_of "$a")/job-w$a/live" 2>/dev/null || true
     local r
     for ((r = 1; r <= SYM_TOUCH_ROUNDS; r++)); do
         sym_prefixed_create "$a_tree_on_b" "touch-live-r$r" "$burst" >/dev/null || die "sym-foreign-touch: a live touch failed"
         sleep "$(python3 -c "print($beat_ms/1000)")"
     done
+    # The LIVE verdict is vacuous unless the holder's storm was ALIVE
+    # through every touch: a storm that died is an idle holder.
+    kill -0 "$live_pid" 2>/dev/null ||
+        die "sym-foreign-touch LIVE: the holder's storm died before the touches ended (see $rowdir/live-a.txt) — the phase measured an IDLE holder"
+    # The loop AND its running storm (the subshell's child).
+    pkill -P "$live_pid" 2>/dev/null || true
     kill "$live_pid" 2>/dev/null || true
     wait "$live_pid" 2>/dev/null || true
     sleep 2

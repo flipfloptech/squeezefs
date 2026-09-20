@@ -5214,7 +5214,21 @@ impl KvMetaBackend {
         let Some(forest) = self.forest() else {
             return Ok(());
         };
-        let dropped = self.cache.drop_slot_nodes(slot)?;
+        // On a JOINED appender the slot's cached nodes are its PROJECTION —
+        // the open replayed ring 0's un-checkpointed window into them (the
+        // manager's records, dirty in RAM as every replayed record is) and
+        // nothing of this mount's own is under a slot it does not lease
+        // (the door refused every commit), so the dirt is discarded, not a
+        // defect (PR 13: the barrier's "a mount wrote to a slot it did not
+        // lease" refused every grant of a manager slot to a joiner that
+        // had joined while the manager's window stood — the accepted
+        // offer's `AcquireSlot` failed for the mount's life). The manager's
+        // barrier keeps the refusal: its projections are never dirty.
+        let dropped = if self.is_joined_appender() {
+            self.cache.discard_slot_nodes(slot)
+        } else {
+            self.cache.drop_slot_nodes(slot)?
+        };
         match forest.tree(slot) {
             Some(t) => {
                 let floor = t.root_floor();
@@ -7235,6 +7249,11 @@ impl KvMetaBackend {
         }
         self.write_region_page(region).await?;
         plane.phases.record(flush_ns, page_ns, tree0_ns, 0);
+        // The HOLDER's measured handover cost feeds ITS `N_floor` (PR 13):
+        // the manager's in-process accept folded the wall it paid; a wire
+        // holder pays flush + page + tree 0 here and, unfolded, kept the
+        // cold-start seed for its life.
+        plane.fold_handover_ns(flush_ns.saturating_add(page_ns).saturating_add(tree0_ns));
         log::info!(
             "meta volume {}: slot {slot} released by appender {region_id} (g {g}, root {:#x}, \
              cursor {}, {} extents) — flush {} µs, page {} µs, tree 0 {} µs",
@@ -7281,6 +7300,15 @@ impl KvMetaBackend {
         }
         if ship_ns != 0 {
             plane.fold_ship_ns(ship_ns);
+        }
+        // The cold-start seed, retried until it lands (PR 13): a JOINED
+        // appender arms before its first device write or S8 ship, so both
+        // tables read 0 at the arm and `N_floor` sat at its absolute floor
+        // of 2 for the mount's life — the fleet's shared-directory row
+        // handed the directory to the first requester whose 2 ships beat
+        // the holder's second own op. The tables are populated by now.
+        if plane.ewma_handover_ns.load(Ordering::Relaxed) == 0 {
+            plane.seed_n_floor_inputs();
         }
         let holder = set.region_of_slot(slot);
         plane.ships.fetch_add(1, Ordering::Relaxed);

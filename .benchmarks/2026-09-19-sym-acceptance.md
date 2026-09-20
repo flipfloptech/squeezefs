@@ -344,6 +344,96 @@ to joiner 2 on its carriage, `joined_control_refusals` 0; the accept
 recalls, the holder's carriage sink hands over, joiner 2 holds the slot
 at `g + 1` with every acked name).
 
+### 4.4c Defect 10 — FIXED (PR 4 under N daemons): a joined holder's `N_floor` sat at its absolute floor of 2 for the mount's life
+
+Found by `sym-shared-dir` on the defect-8/9 binary: every create landed
+(20,000 in 4.49 s) but `slot_handovers` read 1 — the directory moved to
+the first requester whose 2 ships beat the holder's second own op, in
+the storm's first milliseconds. `N_floor = max(2, ceil(ewma_handover /
+ewma_ship))` is seeded ONCE at the plane's arm from the always-on tables
+(`seed_n_floor_inputs`: the barrier EWMA and the S8 ship RTT); a JOINED
+appender arms before its first device write and before any S8 ship, so
+both read 0, the seed took nothing, and `n_floor(0, 0)` = 2 — the
+"single touch never moves anything" floor doing duty as the handover
+price. The leg's own log said so: `N_floor(A)=2`. And a WIRE holder's
+handover cost was never folded: `fold_handover_ns` ran at the manager's
+in-process accept alone, so the holder that PAYS the flush-then-transfer
+learnt nothing from it. Fix: `note_slot_ship` re-seeds while
+`ewma_handover_ns` is 0 (the tables are populated by the first served
+ship), and `transfer_slot_locked` folds `flush + page + tree 0` at the
+holder. The dominance law itself is unchanged (a dominator wins over a
+12,000-creator crowd by design — `dominance_over_a_common_window_decides_
+every_offer`); what changed is that its price is the DERIVED one from the
+first ship, and the measured one after the first handover (5.5 ms on the
+fleet against ≈ 0.3 ms ships ⇒ ≈ 18).
+
+### 4.4d Defect 11 — FIXED (PR 6 + PR 12b): a stale holder view at the travelling guards surfaced EAGAIN to the application
+
+Found by `sym-shared-dir` on the defect-10 binary: m61 created 52 of
+2,500 then `EAGAIN`; its log: `cross-owner guards for scope … name forest
+slot 3, which this mount does not lease — the initiator's holder view is
+stale; it re-resolves through tree 0`. The manager had handed its stripe's
+slot 3 to a dominating requester between two of m61's creates (a legal
+verdict — §4.4e below is what makes it moot for stripes); m61's
+projection still named the manager, the manager refused the `XvGuards`
+with the text above, and NOTHING re-resolved: `acquire_guards_leased`
+returned the refusal and the create failed. Fix: the refusal IS the
+re-resolve's trigger — every key's slot is re-resolved at the manager
+(`KvMetaBackend::reresolve_slot_holder`: one wire `ResolveSlot`, its
+`Holder` / `Unleased` answer LEARNT into the projection — table, gate,
+holder cache) and the acquisition retried, bounded at 2
+(`xv_cross_owner_guard_stale_reresolves`; a third stale answer is the
+retryable class the caller sees). Pin: `sym_n_daemon_tests::
+a_stale_holder_view_at_the_guards_re_resolves_and_lands_the_create`
+(joiner 2's projection names the manager for a directory's slot; the
+manager hands it to joiner 1; joiner 2's create lands after ONE
+re-resolve, its projection names joiner 1, the dentry is in joiner 1's
+tree).
+
+### 4.4d' Defect 12 — FIXED (PR 12b): a joiner's projection dirt refused every transfer-in of a manager slot
+
+Found by defect 11's pin (RED at its premise): joiner 1's accept of the
+manager's offer failed `corrupt KV encoding: slot 4's cache barrier: node
+… is dirty or locked on the recoverer — a mount wrote to a slot it did not
+lease`. The cross-daemon adoption barrier (`adopt_transferred_slot_tree`
+→ `NodeCache::drop_slot_nodes`) rests on "a foreign slot is never dirty
+here — the door refused every commit"; on a JOINED appender that is
+false: its open REPLAYS ring 0's un-checkpointed window into its
+projection (the manager's records, dirty in RAM as every replayed record
+is), so any joiner that joined while the manager's window stood held
+dirty projection nodes of the manager's slots, and every later grant of
+such a slot to it — an accepted offer, a first touch after the manager
+released it — refused, for the mount's life (PR 12b's fixtures
+checkpointed the manager before the joins). On a joined appender the
+barrier DISCARDS the slot's cached nodes (`discard_slot_nodes`, PR 10's
+failed-recovery inverse — the dirt is never this mount's own); the
+manager's barrier keeps the refusal (its projections are never dirty).
+
+### 4.4e Defect 13 — FIXED (PR 4 + PR 7b): ships into a STRIPED directory fed the handover's dominance window
+
+`sym-shared-dir` on the defect-10 binary: `slot_handovers` 1 — the
+manager's supplied stripe (slot 3) moved to the first requester whose
+few ships into that 1/K shard beat the manager's own few. A legal verdict
+of §5.1.4's law over a slot the striping already spread K ways, and the
+gate-3b law says "no handover (aggregate never triggers)": §5.6.5's own
+split — ONE dominating creator is a handover candidate, MANY are a
+striping one. `xv_serve_step` feeds no dominance window for a ship into a
+known stripe or a directory whose map this mount has read
+(`RoutedMetaBackend::is_striping_domain` — two `scc` probes); an ordinary
+directory's ships are unchanged (gate 3c).
+
+### 4.4f Harness — `sym-foreign-touch` LIVE's storm died at launch
+
+On the defect-10 binary the LIVE phase read `slot_handovers` 1 "a live
+holder was recalled by a touch": the holder's storm was launched BEFORE
+its target directory's `mkdir -p` and died on its first `mkdir` (ENOENT,
+`live-a.txt`), so the "live" holder was IDLE and the law moved the slot to
+B correctly (`N_floor` 15, the dominated arm, `rotor_mints` +1 at A over
+the phase). The leg creates the directory first, runs the storm in
+ROUNDS (a fresh subdirectory each — one storm of `SYM_FILES` ends in
+seconds at the holder's own rate) for the phase's whole length, and
+refuses the LIVE verdict if the storm is not alive at the last touch.
+
 ### 4.5 `appender_flush_ceiling_overruns` (must-stay-0) — 2 overruns, venue-attributed pending the box
 
 At the tail of the N = 8 (and once the N = 4) create storm the manager's
@@ -368,6 +458,21 @@ column (per-row deltas — a previous row's count never bleeds into the next).
   — 140–154 per joiner in the in-process two-round storm), retried at the
   joiner's cadence. Not a defect; stated because the in-process heavy pin
   reports it.
+* `kv_freeze_wedge_tests::a_dropped_forced_compaction_leaves_the_node_
+  freezable` is RED under `SQUEEZEFS_TEST_STAMP_SYMMETRIC=1` (green flat)
+  on this tree AND on the base: its census probe is flat-shaped —
+  `candidates.iter().find(|(t, _)| *t == TREE_INODES)`, while every forest
+  slot tree's id is 0 (PR 1: the kind bytes are the tree ids; PR 4 round 4
+  made the census resolve a leaf by id AND slot). The suite is not in the
+  matrix's stamped list and was never run stamped; not a product finding.
+  Making the probe layout-blind is a one-line harness item for the matrix's
+  next widening.
+* The `SupplyStripeIno` path declines a creator "no endpoint bound on this
+  mount" instead of binding it on demand (`bind_holder_endpoint_on_demand`
+  runs at the guards and the steps, not at the supply): the holder mints
+  the remainder, so the flip is unaffected — 63 of 64 stripes land in the
+  holder's rotor instead of the creators'. Owed to PR 14 (one call at the
+  supply).
 
 ## 5. SIM-1 (gate 8) — `SimConfig { clients: 12_500, shards: 64 }`, release, dev box (measured-simulated, tier (ii))
 

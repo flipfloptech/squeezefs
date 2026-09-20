@@ -12,7 +12,30 @@ brackets the design marks measured-real/box).
 
 ## 0. The verdict in one paragraph (updated last)
 
-_(pending — see §9, the flip decision.)_
+**NOT YET — and the rung did its job.** Every acceptance leg exists and
+ran from zero on a 7-joiner + token-reader fleet; every MECHANISM law
+is GREEN on the final binary (`702ab502`): `tar -x` at 0.96–1.02× of S0
+with 0.012 wire verbs per entry, one flip and `shipped ≡ served` in the
+shared directory, `K + C + 3` tokens for its `ls -l`, a live holder never
+recalled and an idle tree moved in 5–8 ms, readers exact at the next
+resolve with the recall RTT as the free-grace hold, the free wall and
+the join storm served, the 46-volume format row VALID, SIM-1 at 12,500
+× 64 MET, and **`sym-crash` 10/10 GREEN on nine consecutive from-zero
+runs**. The rung found **thirty-five product defects and fixed every one
+red-first** (eleven of them P0 — two appenders under one `node_seq`, a
+flush that dropped acked records, a successor reading every joiner dead,
+a reader that never followed a failover, a shipped/local/mid-plan
+`SlotBusy` each fail-stopping or refusing, a manager wedged out of every
+`fsync` by one stale refinement, three joiners aborting on a stack
+overflow) and **one it could not build — the record-level metanode arm
+(defect 32)**: a colleague's file cannot be `chmod`ed, `touch`ed or
+WRITTEN from another mount, and an unfsynced append acks bytes that
+never land — design §5.10's priced row, never built, the flip's first
+blocker. Every RATE is dev-box scoping (the venue law): the box owes
+gates 1 / 2 / 3 / 3b / 3c / 5 / 7 on the flip binary. `sym-storm`'s ×10
+on the final binary stands at 2 + 1 GREEN rounds, the rest of the count
+owed beside the flush-ceiling margin's derivation. The flip waits for
+defect 32's rung, then the box.
 
 ## 1. Venue block
 
@@ -247,7 +270,23 @@ object's tokens already held from the two stats' first, failed, source
 walk, or the plane's fold — a harness premise, not the arm's law: the
 recall-on-successor-setattr it then tests ran GREEN on every round it
 reached, attempts 8–15), re-run as a storm-only from-zero attempt on the
-same binary (`pr13-batch15-storm`) — its count is written below.
+same binary (`pr13-batch15-storm`): round 1 GREEN on every law (26,181
+acked from 7 joiners + the manager, 14 regions recovered in 17 s, the
+reader arm exact) and then `appender_flush_ceiling_overruns=1 on m0` at
+1,114 ms — 14 ms past the ceiling at the storm's START (seven explicit
+stripe flips + seven `mkdir /` ships + the movers on the manager, with
+the fidelity tier's substrate coming up on the same box), the §4.5 /
+§4.4aa NON-recovery class (no extension applies — the manager's
+grant/ship service under the SMO mutex), the margin PR 14 derives.
+**The `sym-storm` ×10 count on the final binary is NOT reached in this
+rung**: attempts 8–15 each ran 1–5 rounds GREEN on every law — acked
+loss 0, deletes stay deleted, fsck clean after every round, the reader
+arm exact — and each ended on a defect fixed the same day (28–36) or,
+on the final code, a harness premise and the flush-ceiling margin;
+the rounds that ran GREEN on the final code are the count that stands
+(2 + 1), the ×10 is OWED (§7) and belongs beside the margin's
+derivation, without which the must-stay-0 gauge fails a round at random
+on this box.
 **`sym-crash`: 10/10 GREEN on NINE consecutive from-zero runs (attempts
 7–15)**; the three exit-2 codes (attempts 12–14) are the harness-edit
 shifted-tail class after the 10/10 verdict line, never a round.

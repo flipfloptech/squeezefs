@@ -1090,6 +1090,14 @@ impl KvTree {
         Ok(self.cache.get(self.root().addr).await?.level())
     }
 
+    /// The address of the LEAF whose range holds `key` — the latch-free
+    /// descent's answer, for the harnesses that pin an SMO's effect on
+    /// the routing (a compaction moved the leaf; the projection's stale
+    /// root still names the old one).
+    pub async fn descend_leaf_addr_for_test(&self, key: &[u8]) -> Result<u64, KvError> {
+        Ok(self.descend(key, 0).await?.addr())
+    }
+
     /// Whether maintenance work is queued (writeback thresholds crossed).
     pub fn maintenance_pending(&self) -> bool {
         !self.maintenance.is_empty()
@@ -1141,13 +1149,25 @@ impl KvTree {
             // record — the free of the old extent needed the checkpoint
             // that named the new root), and the walk restarts on it. The
             // writer's own trees never take this arm (their root is live).
-            let root_restarts = dbg_reasons[0] + dbg_reasons[1];
-            if root_restarts > 0 && root_restarts % PROJECTION_REFRESH_EVERY == 0 {
-                if let Some(hook) = self
-                    .cache
-                    .projection_refresh()
-                    .filter(|_| self.cache.is_projection(self.forest_slot))
-                {
+            // On a PROJECTION every restart class counts (PR 13, defect
+            // 34 — defect 18's second face): the manager's child SMO
+            // flips the pointer IN THE ROOT'S OWN LOG (same node, same
+            // seq), so a projection whose cached root image predates the
+            // flip passes the root checks and spins on `child-seq` /
+            // `child-retired` / `routing-hole` against the recycled child
+            // — the fleet's `[0, 0, 0, 0, 256]`. The refresh drops the
+            // projection's images WHOLE and re-reads the root, which is
+            // the remedy for a stale image exactly as for a stale pointer.
+            // A writer's own tree keeps the root-restart tally alone (a
+            // child restart there is a racing SMO's window, converging).
+            let is_projection = self.cache.is_projection(self.forest_slot);
+            let restarts = if is_projection {
+                dbg_reasons.iter().sum::<u32>()
+            } else {
+                dbg_reasons[0] + dbg_reasons[1]
+            };
+            if restarts > 0 && restarts % PROJECTION_REFRESH_EVERY == 0 {
+                if let Some(hook) = self.cache.projection_refresh().filter(|_| is_projection) {
                     if hook.refresh().await {
                         super::META_KV_PROJECTION_ROOT_REFRESHES.fetch_add(1, Ordering::Relaxed);
                     }

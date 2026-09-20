@@ -1271,6 +1271,68 @@ grant carve and PR 4's transfer — the same class the box row will read;
 if it trips there, the margin derives from the measured pass wall (PR
 14's item stays).
 
+### 4.4ab Defect 34 — FIXED (PR 12b's projection refresh — defect 18's second face): a joiner's PROJECTION spun its budget on `child-seq` restarts against a recycled CHILD, and the refresh arm keyed on ROOT restarts alone never fired
+
+`sym-storm` round 4 from zero on `7ac89d24` (`pr13-batch12`; rounds 1–3
+GREEN — 15,460 / 12,427 / 8,917 acked, recoveries 16–91 s; every law of
+round 4 GREEN: 7 region sets recovered in 16 s, 11,062 acked present,
+the reader arm exact): the "deleted stays deleted" arm's `stat` of the
+removed `storm-w62-r4` through m60 answered **`EINVAL`**, and m60's log
+has the class's exact tally — `tree 8 (slot None, root 0x19580000@…, a
+PROJECTION here): traversal retry budget exhausted … restarts
+[root-retired, root-seq, routing-hole, child-retired, child-seq] = [0, 0,
+0, 0, 256]`. Defect 18's fix (`KvTree::descend`'s refresh arm) counted
+ROOT restarts (`root-retired` + `root-seq`) toward the refresh cadence,
+on the reasoning that a projection's staleness is a stale root POINTER.
+It is also a stale root IMAGE: the manager's compaction of a CHILD leaf
+of tree 0 (a dead round's directory records folded, the leaf rewritten
+into a fresh extent) flips the parent pointer IN THE ROOT'S OWN LOG — the
+same node, the same `node_seq` — so the joiner's cached root image
+passes both root checks and its old child pointer names an extent the
+manager freed at its checkpoint and re-granted (the storm's 7 rejoins
+claimed their grants there), where a node under ANOTHER seq now sits:
+every restart is `child-seq`, the root is re-read from the projection's
+own cache (`try_get` serves the stale image), and nothing refreshes it.
+Fix: on a PROJECTION every restart class counts toward `PROJECTION_
+REFRESH_EVERY` (the sum of the five tallies); a writer's own tree keeps
+the root-restart tally alone (a child restart there is a racing SMO's
+window, converging). The refresh (`refresh_control_projection`) drops
+the projection's images WHOLE and re-reads the root — the remedy for a
+stale image exactly as for a stale pointer. Pins in `tests/sym_
+projection_refresh_tests.rs` on the child shape (TWO `NodeCache`s over
+one file — the manager's writes the interior tree, compacts the leaf,
+checkpoints the flipped root; the joiner's holds the pre-flip root image
+and drops its leaf; tree B re-claims the leaf's extent under a fresh
+seq): `a_projection_whose_child_was_recycled_exhausts_its_budget_
+without_a_refresh` reproduces the fleet's `[0, 0, 0, 0, 256]` exactly,
+and `…_follows_the_manager_through_the_refresh` is RED on the root-only
+count (the hook never consulted, `Corrupt`) and GREEN on the sum;
+`KvTree::descend_leaf_addr_for_test` is the harness accessor.
+
+### 4.4ac Harness — the PAUSED phase's premise, and the one law re-learnt
+
+`sym-foreign-touch` PAUSED on attempt 12 read `slot_handovers=1` — "a
+single touch per beat moved a paused job's tree": the manager's slot 24
+(its `job-w0` tree, 1,518 inos) was OFFERED on the idle arm
+(`slot_offers_idle` +1) at the requester's third touch. The design's
+premise for "a paused LIVE job keeps its tree" is `ops_h(T_idle) ≫ 2 ×
+ops_q` — a pause SHORTER than `T_idle`; the fleet's `T_idle` is its
+membership lease TTL (15 s, `--lease-ttl-ms=15000`), and the phase ran
+its three touches at the 10 s membership beat (31 s), so at the third
+touch the job was IDLE by the design's own definition and `N_floor`
+decided alone — a derived ratio (`ewma_handover / ewma_ship`) that reads
+2–5 on this box (it moved 7 → 5 across the phase; a served ship that
+costs as much as a handover on a hot box makes moving the right call).
+Eleven earlier runs passed on a higher `N_floor`. Not a product term:
+the phase now paces its touches inside the holder's window (`paused_beat
+= min(beat, (T_idle − 3 s) / (rounds + 1))`, read off
+`membership_lease_ttl_ms`) and refuses a fixture that cannot fit. **The
+law re-learnt the hard way**: the fix was written while attempt 12's
+`sym-crash` ran the script and reverted within a minute — the running
+bash still read a shifted tail after its 10/10 GREEN verdict
+(`line 9184: syntax error near unexpected token ')'`, exit 2 on a GREEN
+leg); a batch's harness is frozen for its whole run, reverts included.
+
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
 `sym-shared-dir-ls` on the defect-16 binary read `meta_kv_node_cache_

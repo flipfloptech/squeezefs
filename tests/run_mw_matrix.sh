@@ -4212,8 +4212,24 @@ leg_sym_foreign_touch() {
     done
 
     # Phase 4 — a PAUSED live job: C's creator SIGSTOPped mid-tree, B a
-    # SINGLE touch per beat — the tree STAYS (a single touch never
-    # dominates: ops_q < N_floor).
+    # SINGLE touch per beat — the tree STAYS (design §5.1.4: a live job on
+    # a pause keeps its tree because `ops_h(T_idle)` — its own burst — dwarfs
+    # `2 × ops_q`). The premise is that the pause is SHORTER than `T_idle`
+    # (= the membership lease TTL, 15 s on this fleet): past it the job is
+    # IDLE by the design's own definition and the idle arm decides on
+    # `N_floor` alone — a derived ratio (`ewma_handover / ewma_ship`) that
+    # reads 2 when a served ship costs as much as a handover on a hot box.
+    # Attempt 12 from zero ran the three touches at the 10 s membership
+    # beat (31 s > 15 s), and the tree moved at the 21 s touch by the rule
+    # — a harness premise, not a product term. The touches are paced so
+    # the whole phase sits inside `T_idle` with margin.
+    local t_idle_ms paused_beat_ms
+    t_idle_ms="$(stat_field 0 membership_lease_ttl_ms)"
+    [ -n "$t_idle_ms" ] && [ "$t_idle_ms" -gt 0 ] 2>/dev/null || t_idle_ms=45000
+    paused_beat_ms=$(((t_idle_ms - 3000) / (SYM_TOUCH_ROUNDS + 1)))
+    [ "$paused_beat_ms" -lt "$beat_ms" ] || paused_beat_ms="$beat_ms"
+    [ "$paused_beat_ms" -ge 1000 ] || die "sym-foreign-touch PAUSED: T_idle ${t_idle_ms} ms leaves no room for $SYM_TOUCH_ROUNDS touches (beat would be ${paused_beat_ms} ms) — fewer --touch-rounds or a longer --lease-ttl-ms"
+    log "sym-foreign-touch PAUSED: T_idle=${t_idle_ms} ms, $SYM_TOUCH_ROUNDS touches at ${paused_beat_ms} ms (the phase inside the holder's window)"
     for idx in "$a" "$b" "$c"; do snap "$idx" paused0 "$rowdir"; done
     "$SYM_STORM" "$(mnt_of "$c")/job-w$c/paused" "$SYM_THREADS" "$SYM_FILES" mkdir >"$rowdir/paused-c.txt" 2>&1 &
     local paused_pid=$!
@@ -4223,7 +4239,7 @@ leg_sym_foreign_touch() {
     c_tree_on_b="$(mnt_of "$b")/job-w$c"
     for ((r = 1; r <= SYM_TOUCH_ROUNDS; r++)); do
         sym_prefixed_create "$c_tree_on_b" "touch-paused-r$r" 1 >/dev/null || die "sym-foreign-touch: a paused-job touch failed"
-        sleep "$(python3 -c "print($beat_ms/1000)")"
+        sleep "$(python3 -c "print($paused_beat_ms/1000)")"
     done
     kill -CONT "$paused_pid" 2>/dev/null || true
     kill "$paused_pid" 2>/dev/null || true

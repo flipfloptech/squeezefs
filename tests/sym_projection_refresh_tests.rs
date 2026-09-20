@@ -257,3 +257,210 @@ async fn a_writers_own_tree_never_consults_the_projection_refresh() {
         "never consulted on a live tree"
     );
 }
+
+/// A second cache over the SAME file — the joiner's, reading what the
+/// manager's cache wrote: the two-daemon shape at the tree level.
+fn second_cache(vol: &Vol) -> Arc<NodeCache> {
+    let layout = NodeLayout::new(NODE_SIZE).expect("layout");
+    NodeCache::new(NodeCacheConfig {
+        path: vol._file.path().to_path_buf(),
+        layout,
+        heap_base: 0,
+        budget_bytes: EXTENTS * NODE_SIZE as u64,
+        writeback_delta_bytes: 1024 * 1024,
+    })
+}
+
+/// The joiner's refresh for a root that did NOT move (the child shape):
+/// the projection's images go WHOLE and the root is re-read from the
+/// device — what `refresh_control_projection` does (`discard_tree_nodes`
+/// + `install_recovered_root`).
+struct DiscardHook {
+    cache: Arc<NodeCache>,
+    target: Arc<KvTree>,
+    calls: AtomicU64,
+}
+
+impl ProjectionRefresh for DiscardHook {
+    fn refresh<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.cache.discard_tree_nodes(TREE_CONTROL);
+            let root = self.target.root();
+            self.target
+                .install_recovered_root(root, 0)
+                .await
+                .expect("the refresh re-reads the root from the device");
+            true
+        })
+    }
+}
+
+/// Stand the CHILD shape (PR 13, defect 34 — defect 18's second face,
+/// found by the fleet's `sym-storm` round 4 from zero: joiner m60's
+/// `stat` of a removed directory answered `EINVAL` on `tree 8 … a
+/// PROJECTION here … restarts [root-retired, root-seq, routing-hole,
+/// child-retired, child-seq] = [0, 0, 0, 0, 256]`): the manager's tree A
+/// has an INTERIOR root; the joiner's cache holds A's root image and one
+/// leaf; the manager compacts that leaf (a new extent, the root's pointer
+/// flipped IN THE ROOT'S OWN LOG — same node, same seq), checkpoints (the
+/// flipped root image on the device), frees the old leaf's extent, and
+/// tree B claims it under a fresh seq. The joiner's cached ROOT image is
+/// stale WITHOUT any root restart: its pointer names the old leaf, whose
+/// extent now carries B's node — every restart is `child-seq`, and the
+/// refresh arm keyed on ROOT restarts alone never fired.
+/// Returns `(the joiner's cache, the joiner's tree A, a key in the
+/// compacted leaf)`.
+async fn recycled_child(vol: &Vol) -> (Arc<NodeCache>, Arc<KvTree>, Vec<u8>) {
+    // The manager: an interior root — enough records to split the 64 KiB
+    // leaf.
+    let mut ctx = SmoContext::new(vol.alloc.clone());
+    let a_m = vol.control_tree().await;
+    let value = vec![0x5au8; 200];
+    for i in 0..1_200u64 {
+        a_m.insert(&inode_key(1_000 + i), value.clone())
+            .await
+            .expect("insert");
+        if i % 100 == 99 {
+            a_m.flush_dirty(&mut ctx).await.expect("flush");
+        }
+    }
+    a_m.flush_dirty(&mut ctx).await.expect("flush");
+    assert!(
+        a_m.root_level().await.expect("level") >= 1,
+        "the premise: an interior root"
+    );
+    let root = a_m.root();
+    let probe = inode_key(1_000).to_vec();
+
+    // The joiner: a second cache on the same file, the projection posture;
+    // its lookup caches A's root image AND the leaf that holds `probe`.
+    let cache_j = second_cache(vol);
+    let gate = cache_j.lease_gate();
+    gate.arm();
+    gate.test_set_manager(false);
+    assert!(cache_j.is_projection(None));
+    let a_j = Arc::new(
+        KvTree::open(Arc::clone(&cache_j), TREE_CONTROL, root, vol.seq.clone())
+            .await
+            .expect("the joiner opens A at the manager's root"),
+    );
+    assert_eq!(
+        a_j.lookup(&probe).await.expect("served").map(|v| v.len()),
+        Some(200)
+    );
+    let leaf_before = a_j
+        .descend_leaf_addr_for_test(&probe)
+        .await
+        .expect("the leaf under probe");
+
+    // The manager compacts that leaf: overwrite its keys until the log
+    // fills and the maintenance pass rewrites it into a NEW extent (the
+    // root's pointer flip appended to the root's log — same node, same
+    // seq), then checkpoints the root image to the device.
+    let mut leaf_after = leaf_before;
+    for round in 0..200u64 {
+        for i in 0..64u64 {
+            a_m.insert(&inode_key(1_000 + i), vec![round as u8; 200])
+                .await
+                .expect("overwrite");
+        }
+        a_m.flush_dirty(&mut ctx).await.expect("flush");
+        leaf_after = a_m
+            .descend_leaf_addr_for_test(&probe)
+            .await
+            .expect("the leaf under probe");
+        if leaf_after != leaf_before {
+            break;
+        }
+    }
+    assert_ne!(
+        leaf_after, leaf_before,
+        "the premise: the manager's compaction moved the leaf"
+    );
+    assert_eq!(
+        a_m.root(),
+        root,
+        "the root pointer did NOT move (a child SMO)"
+    );
+
+    // The old leaf's extent is freed and re-claimed by tree B under a
+    // fresh seq (the manager's checkpoint freed it; a grant re-used it).
+    let e_leaf = vol.extent_of(leaf_before);
+    vol.alloc.release_unpublished(e_leaf);
+    let b = vol.control_tree().await;
+    b.insert(&inode_key(7), &b"seven"[..])
+        .await
+        .expect("B's record");
+    b.flush_dirty(&mut ctx).await.expect("flush B");
+    assert_eq!(
+        vol.extent_of(b.root().addr),
+        e_leaf,
+        "B's root took the old leaf's extent"
+    );
+    // The joiner's barrier dropped its stale LEAF image (a fresh grant over
+    // that extent) — its ROOT image stays cached, stale.
+    assert_eq!(
+        cache_j
+            .drop_nodes_in_extents(0, &[e_leaf])
+            .expect("the barrier"),
+        1,
+        "the joiner's leaf image dropped"
+    );
+    (cache_j, a_j, probe)
+}
+
+/// The base shape without a refresh: every restart is `child-seq`, the
+/// budget is exhausted, the error names the shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_projection_whose_child_was_recycled_exhausts_its_budget_without_a_refresh() {
+    let vol = Vol::new();
+    let (_cache_j, a_j, probe) = recycled_child(&vol).await;
+    let err = a_j
+        .lookup(&probe)
+        .await
+        .expect_err("the stale root's child pointer never converges without a refresh")
+        .to_string();
+    assert!(
+        err.contains("routing loop") && err.contains("a PROJECTION here"),
+        "the error names the shape: {err}"
+    );
+    assert!(
+        err.contains("= [0, 0, 0, 0, 256]"),
+        "every restart is child-seq (the fleet's exact tally): {err}"
+    );
+}
+
+/// The law (defect 34): on a PROJECTION every restart class counts toward
+/// the refresh cadence — a stale root IMAGE (its pointer unchanged, its
+/// log missing the manager's flip) is the same staleness as a stale root
+/// POINTER. With the joiner's refresh installed the lookup SERVES, the
+/// hook ran, the gauge moved. RED before: `Corrupt` with
+/// `[0, 0, 0, 0, 256]` and the hook never consulted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_projection_whose_child_was_recycled_follows_the_manager_through_the_refresh() {
+    let vol = Vol::new();
+    let (cache_j, a_j, probe) = recycled_child(&vol).await;
+    let hook = Arc::new(DiscardHook {
+        cache: Arc::clone(&cache_j),
+        target: Arc::clone(&a_j),
+        calls: AtomicU64::new(0),
+    });
+    assert!(cache_j.install_projection_refresh(hook.clone()));
+    let before = META_KV_PROJECTION_ROOT_REFRESHES.load(Ordering::Relaxed);
+    let got = a_j
+        .lookup(&probe)
+        .await
+        .expect("the projection follows the manager's compacted leaf through the refresh");
+    assert_eq!(got.map(|v| v.len()), Some(200));
+    assert!(hook.calls.load(Ordering::Relaxed) >= 1, "the refresh ran");
+    assert!(
+        META_KV_PROJECTION_ROOT_REFRESHES.load(Ordering::Relaxed) > before,
+        "the gauge moved"
+    );
+    let calls = hook.calls.load(Ordering::Relaxed);
+    a_j.lookup(&probe).await.expect("served");
+    assert_eq!(hook.calls.load(Ordering::Relaxed), calls, "idempotent");
+}

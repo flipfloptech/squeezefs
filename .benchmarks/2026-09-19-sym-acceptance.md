@@ -1773,3 +1773,14 @@ FIXED defects is a class the design did not already state, and every
 one is fixed red-first here; the one it did not fix is the class the
 design stated and the program never built — the flip inherits exactly
 that item and the box's numbers.
+
+## 10. Verification on the final tree (`702ab502`'s code; docs commits after it)
+
+`pr13-post15/`: `cargo fmt --check` 0 · `cargo clippy --all-targets
+--all-features -- -D warnings` 0 · `cargo clippy --all-targets -- -D
+warnings` 0 · `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 0 (two
+private-item links found RED on the way and made plain code) · the fuzz
+workspace type-check + fmt 0 · **`tests/run_sym_forest_suites.sh`: PASS,
+40 suites flat THEN 40 stamped (33 m 11 s)** · the fidelity tier `full`
+§3.7. The fleet is torn down (zero daemons, the `mwfleet` substrate
+released); nothing was placed on `squeeze-test`.

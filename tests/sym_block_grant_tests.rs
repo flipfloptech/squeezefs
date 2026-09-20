@@ -2984,3 +2984,92 @@ async fn a_crashed_incarnations_window_remainder_is_released_at_the_rehold() {
     shutdown(&routed).await;
     reset_process_state();
 }
+
+/// **PR 13 — a JOINED appender's never-published mint goes back into its
+/// grant WINDOW** (the co-writer lane recycle's grant face): a grant-armed
+/// allocator whose volume's allocation lease this process does NOT hold
+/// (a wire writer — the manager is another daemon) abandons a
+/// superseded overlay destination / failed-publish upload through
+/// `abandon_unpublished_offset`; before it the arm fell through to the
+/// allocator's `free_block`, whose `plane_gate` refused with one ERROR +
+/// one `cowriter_accounting_refusals` per abandoned mint (the sym-walls
+/// rewrite row) and left the block SET in the holder's bitmap for the
+/// deferred leak release. Now: `GrantWindow::give_back` — the block is
+/// unconsumed again (the next lowest-first mint takes it, the leave's
+/// remainder returns it), counted `block_grant_window_recycles`, the
+/// tripwire untouched. A second abandon of the same block is the
+/// double-handout lineage — refused, nothing moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joined_appenders_never_published_mint_returns_to_its_grant_window() {
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let vol_id = "vol-pr13-window-recycle";
+    let tag = squeezefs::meta_backend::kv::block_refs::volume_tag(vol_id);
+    assert!(alloc_lease::holding(tag).is_none(), "premise: a non-holder");
+    let b = data_allocator(vol_id).await;
+    assert!(b.install_block_grant_arm(
+        tag,
+        alloc_lease::wire_block_grant_sink(
+            alloc_lease::HolderVenue::fixed("127.0.0.1:1".to_string()),
+            SECRET.to_vec(),
+            wire(successor_identity()),
+            0,
+            tag,
+        ),
+    ));
+    assert!(b.install_block_grant(BlockGrant { start: 100, len: 4 }));
+    assert!(!b.holds_ownership_plane());
+    let chunk = b.chunk_size();
+    let first = b.allocate_block().await.unwrap();
+    assert_eq!(first / chunk, 100);
+    let second = b.allocate_block().await.unwrap();
+    assert_eq!(second / chunk, 101);
+    assert_eq!(b.block_grant_remaining(), 2);
+    let m = &squeezefs::fuse_client::METRICS;
+    let refusals = m.cowriter_accounting_refusals.load(Ordering::Relaxed);
+    let recycles = m.block_grant_window_recycles.load(Ordering::Relaxed);
+    let abandons = m.cowriter_unpublished_abandons.load(Ordering::Relaxed);
+    // The never-published FIRST mint is abandoned: back into the window,
+    // merged onto the unconsumed range's low side.
+    b.abandon_unpublished_offset(first).await.unwrap();
+    assert_eq!(
+        m.cowriter_accounting_refusals.load(Ordering::Relaxed),
+        refusals,
+        "the allocator's gate was never reached"
+    );
+    assert_eq!(
+        m.block_grant_window_recycles.load(Ordering::Relaxed),
+        recycles + 1
+    );
+    assert_eq!(b.block_grant_remaining(), 3);
+    assert_eq!(
+        b.refcount(first),
+        None,
+        "no RAM reference survives the abandon"
+    );
+    // The double-handout lineage: the same block again is refused, nothing
+    // moves, counted on the abandon ledger.
+    b.abandon_unpublished_offset(first).await.unwrap();
+    assert_eq!(b.block_grant_remaining(), 3);
+    assert_eq!(
+        m.block_grant_window_recycles.load(Ordering::Relaxed),
+        recycles + 1
+    );
+    assert_eq!(
+        m.cowriter_unpublished_abandons.load(Ordering::Relaxed),
+        abandons + 1
+    );
+    // The recycled block is the next lowest-first mint; the window then
+    // continues where it was.
+    assert_eq!(b.allocate_block().await.unwrap() / chunk, 100);
+    assert_eq!(b.allocate_block().await.unwrap() / chunk, 102);
+    assert_eq!(b.allocate_block().await.unwrap() / chunk, 103);
+    assert_eq!(b.block_grant_remaining(), 0);
+    // The unconsumed remainder a leave returns names a recycled block
+    // exactly as any granted one (give back 102: one range [102, 103)).
+    b.abandon_unpublished_offset(102 * chunk).await.unwrap();
+    assert_eq!(
+        b.block_grant_unconsumed(),
+        vec![BlockGrant { start: 102, len: 1 }]
+    );
+}

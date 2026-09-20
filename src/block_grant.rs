@@ -451,6 +451,49 @@ impl GrantWindow {
         Some(block)
     }
 
+    /// **Give a minted, never-published block back to the window** (PR 13:
+    /// a JOINED appender's superseded overlay destination / failed-publish
+    /// upload — the co-writer lane recycle's grant-window face). The
+    /// block is SET in the holder's bitmap by the carve that granted it
+    /// and named by no ledger, so it is exactly a grant block again: the
+    /// next lowest-first mint takes it, the leave returns it with the
+    /// remainder, a renewal declares it inside the window. Merged into an
+    /// adjacent range where one exists. `false` ⇔ the block is already
+    /// unconsumed in the window (the double-handout lineage — nothing
+    /// changes). `installed` / the top-up reference are untouched (the
+    /// block was installed once); `consumed` is un-counted.
+    pub fn give_back(&self, block: u64) -> bool {
+        let mut grants = self.grants.lock();
+        if grants.iter().any(|g| g.contains(block)) {
+            return false;
+        }
+        let merged = grants.iter_mut().any(|g| {
+            if g.end() == block && g.len < u32::MAX {
+                g.len += 1;
+                true
+            } else if block + 1 == g.start && g.len < u32::MAX {
+                g.start -= 1;
+                g.len += 1;
+                true
+            } else {
+                false
+            }
+        });
+        if !merged {
+            grants.push(BlockGrant {
+                start: block,
+                len: 1,
+            });
+            grants.sort_unstable();
+        }
+        let _ = self
+            .consumed
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                Some(c.saturating_sub(1))
+            });
+        true
+    }
+
     /// Blocks still unconsumed in the window.
     pub fn remaining(&self) -> u64 {
         self.grants.lock().iter().map(|g| u64::from(g.len)).sum()
@@ -570,6 +613,36 @@ mod tests {
             block_grant_derived(100_000, 10_000, 100, 4),
             BLOCK_GRANT_FLOOR
         );
+    }
+
+    #[test]
+    fn a_given_back_block_is_the_next_mint_and_merges_onto_its_neighbours() {
+        let w = GrantWindow::new();
+        assert!(w.install(BlockGrant { start: 10, len: 4 }));
+        assert_eq!(w.mint(), Some(10));
+        assert_eq!(w.mint(), Some(11));
+        assert_eq!(w.consumed(), 2);
+        // Give 10 back: a new range below the remainder (11 is still out).
+        assert!(w.give_back(10));
+        assert_eq!(w.consumed(), 1);
+        assert_eq!(
+            w.unconsumed(),
+            vec![
+                BlockGrant { start: 10, len: 1 },
+                BlockGrant { start: 12, len: 2 }
+            ]
+        );
+        // Give 11 back: merges onto 10's high side (adjacency), the low
+        // range now [10, 12) beside [12, 14).
+        assert!(w.give_back(11));
+        assert_eq!(w.unconsumed()[0], BlockGrant { start: 10, len: 2 });
+        assert_eq!(w.remaining(), 4);
+        // Already unconsumed: refused, nothing moves.
+        assert!(!w.give_back(12));
+        assert_eq!(w.remaining(), 4);
+        assert_eq!(w.mint(), Some(10));
+        // `installed` counts the one install; the reference is untouched.
+        assert_eq!(w.installed(), 4);
     }
 
     #[test]

@@ -723,6 +723,37 @@ stays defense-in-depth (pinned: reached directly it refuses and counts).
 Pin: `sym_shared_refs_tests::the_w1_ladders_decline_a_non_holders_patch_
 as_a_counted_posture_decision`.
 
+### 4.4q Defect 23 — FIXED (PR 12b's joiner under PR 8's grant window): a joiner's never-published mint was abandoned INTO the allocator's terminal-free gate — an ERROR per abandon and a leaked grant block
+
+Found by the first green `sym-walls` run on the defect-22 binary
+(`/tmp/grok-justin/pr13-walls3`, both rows MET): the fleet's ERROR census
+read ONE class left — `block free refused: this armed symmetric writer
+does not hold the ALLOCATION LEASE …` (`free_block`'s `plane_gate`), 2
+across two joiners, mid-rewrite. `BlockAllocator::abandon_unpublished_
+offset` — the ACK-early overlay's superseded destination / a
+failed-publish upload, a mint NO ledger ever named — has the co-writer's
+lane recycle and the quiet counted abandon, then falls to
+`self.free_block(offset)`; a JOINED appender is the `writer` posture,
+so it took the terminal-free ladder and the gate refused (Err, the
+caller's `let _ =`): one ERROR per abandoned mint and the block left SET
+in the holder's bitmap with no reference and no window naming it — the
+deferred leak release converges on it only after this mount's LEAVE
+(PR 12b round 5's law: a live peer's window is adopted, the rest released
+once every live peer declared). Fix: the recycle arm's GRANT-WINDOW face
+— on a grant-armed allocator whose plane this mount does not hold, the
+RAM reference goes, the incarnation word is retired, and the block is
+given back to the window (`GrantWindow::give_back`: merged onto an
+adjacent range, `consumed` un-counted, `installed` untouched — the next
+lowest-first mint takes it, the leave's remainder returns it, a renewal
+declares it inside the window); counted `block_grant_window_recycles`
+(0 on every holder and every unarmed mount); a fenced era keeps the
+quiet counted abandon; a second give-back of one block is the
+double-handout lineage (refused, `cowriter_unpublished_abandons`). Pins:
+`block_grant::tests::a_given_back_block_is_the_next_mint_and_merges_
+onto_its_neighbours` and `sym_block_grant_tests::a_joined_appenders_
+never_published_mint_returns_to_its_grant_window` (RED on the base: the
+abandon's `Err` from the gate).
+
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
 `sym-shared-dir-ls` on the defect-16 binary read `meta_kv_node_cache_

@@ -4484,6 +4484,55 @@ impl BlockAllocator {
     /// 2026-08-19 post-fence storm) and an offset outside this mount's
     /// lanes.
     pub async fn abandon_unpublished_offset(&self, offset: u64) -> Result<()> {
+        // Symmetric PR 13 (the recycle arm's GRANT-WINDOW face): a JOINED
+        // appender mints from the holder's grants and holds no ownership
+        // plane for this volume, so `free_block`'s gate would refuse with
+        // an ERROR per abandoned mint (the sym-walls rewrite row: the
+        // ACK-early overlay's superseded destinations) and the block —
+        // SET in the holder's bitmap, named by no ledger — would leak until
+        // the holder's deferred leak release converged past this mount's
+        // life. Nothing durable ever named it, so the act is this mount's
+        // private view of its own grant supply: back into the window
+        // (`GrantWindow::give_back` — the next mint takes it, the leave
+        // returns it, a renewal declares it). A fenced era keeps the quiet
+        // counted abandon (the leak-safe direction), never the gate.
+        if let Some(arm) = self.block_grant.get() {
+            if !self.holds_ownership_plane() {
+                let idx = offset / self.chunk_size;
+                let _ = self.refcounts.remove_sync(&offset);
+                self.mark_incarnation_unstable(offset);
+                if crate::data_custody::poisoned() {
+                    crate::fuse_client::METRICS
+                        .cowriter_unpublished_abandons
+                        .fetch_add(1, Ordering::Relaxed);
+                    log::debug!(
+                        "joined appender abandon: never-published offset {offset} on volume \
+                         '{}' left to the holder's leak release (fenced era)",
+                        self._volume_id
+                    );
+                } else if arm.window.give_back(idx) {
+                    crate::fuse_client::METRICS
+                        .block_grant_window_recycles
+                        .fetch_add(1, Ordering::Relaxed);
+                    log::debug!(
+                        "joined appender recycle: never-published offset {offset} on volume \
+                         '{}' back in this mount's grant window",
+                        self._volume_id
+                    );
+                } else {
+                    log::error!(
+                        "joined appender recycle REFUSED: never-published offset {offset} on \
+                         volume '{}' is already unconsumed in this mount's grant window — the \
+                         double-handout lineage (cowriter_unpublished_abandons)",
+                        self._volume_id
+                    );
+                    crate::fuse_client::METRICS
+                        .cowriter_unpublished_abandons
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(());
+            }
+        }
         if crate::fuse_client::co_writer_mount()
             && !crate::cowriter::authority_accounting_scope_active()
         {

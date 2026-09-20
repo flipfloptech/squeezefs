@@ -7045,6 +7045,13 @@ pub struct Metrics {
     /// `cowriter_unpublished_abandons`, which now grows only around custody
     /// loss or on an offset outside this mount's lanes.
     pub cowriter_unpublished_recycles: Align64<AtomicU64>,
+    /// Symmetric PR 13: a JOINED appender's never-published mint (a
+    /// superseded overlay destination, a failed-publish upload) given
+    /// back to its own grant WINDOW (`GrantWindow::give_back`) — the
+    /// recycle arm's face on a grant-armed non-holder allocator, where the
+    /// co-writer's lane list does not exist and the allocator's terminal
+    /// free is the holder's act. 0 on every holder and every unarmed mount.
+    pub block_grant_window_recycles: Align64<AtomicU64>,
     /// Displaced-block frees this co-writer SHIPPED for an offset in its
     /// OWN lane that it no longer tracked locally — a lifetime this mount
     /// already released once (the first displacement retired the entry),
@@ -14368,6 +14375,12 @@ impl SqueezefsFilesystem {
                             .iter()
                             .map(|a| a.block_grant_remaining())
                             .sum::<u64>()),
+                    );
+                    metrics.insert(
+                        "block_grant_window_recycles".into(),
+                        serde_json::json!(METRICS
+                            .block_grant_window_recycles
+                            .load(Ordering::Relaxed)),
                     );
                     metrics.insert(
                         "data_alloc_bitmap_set_bits".into(),

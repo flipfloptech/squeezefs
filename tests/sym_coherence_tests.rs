@@ -1840,6 +1840,81 @@ async fn a_token_reader_holding_a_directorys_token_across_its_flip_lists_the_mer
     shutdown(&writer).await;
 }
 
+/// **A single-flight fetch LOSER never loses its wake** (PR 13 — found by
+/// the fleet's `sym-walls` row: a joiner's `lookup(1)` parked 455 s past
+/// the entry station while a fresh lookup of the same name served at
+/// once — a LONE lost wake). `TokenReaderPlane::fetch` is single-flight
+/// per object: a second fetcher of an object in flight parks on the
+/// winner's `Notify` and re-reads the cache when woken. The loser read
+/// the in-flight entry, dropped it, THEN registered — and a winner that
+/// finished in between removed its entry and bumped the epoch before the
+/// registration: a `notified()` created after the bump is never woken
+/// (`sqz_notify` registers at creation; a bump before it is not a
+/// permit), and the tick heals only the epoch-gated future, never the
+/// caller's outer condition — the op parked for ever. The law: register
+/// FIRST, then re-check the entry is still the winner's; gone ⇒ no
+/// await. Pinned through the seam that parks the loser in exactly that
+/// window until the winner has finished: RED = the loser's serve never
+/// returns (bounded here at 5 s), GREEN = it serves off the cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_single_flight_fetch_loser_registers_before_it_rechecks_the_winner() {
+    use squeezefs::meta_ship::token_plane::{
+        test_fetch_loser_release, TEST_FETCH_LOSER_HOLD, TEST_FETCH_LOSER_PARKED,
+    };
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            test_fetch_loser_release();
+        }
+    }
+    let _g = SEAM.lock().await;
+    let _cleanup = Cleanup;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let f = Metadata::create(writer.as_ref(), 1, "f", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let (_v, local) = writer.route_ino(f);
+    let (_reader, plane) = open_token_reader(&path, &endpoint, "reader-single-flight").await;
+    let parked0 = TEST_FETCH_LOSER_PARKED.load(Ordering::Relaxed);
+    TEST_FETCH_LOSER_HOLD.store(true, Ordering::Release);
+    // Two fetchers of one cold object: the first wins the single flight
+    // and fetches; the second reads the in-flight entry and parks at the
+    // seam — BEFORE its registration.
+    let p1 = Arc::clone(&plane);
+    let winner = tokio::spawn(async move { p1.serve(local, TokenWants::default()).await });
+    let p2 = Arc::clone(&plane);
+    let loser = tokio::spawn(async move { p2.serve(local, TokenWants::default()).await });
+    wait_until("the loser parked at the seam", || {
+        TEST_FETCH_LOSER_PARKED.load(Ordering::Relaxed) > parked0
+    })
+    .await;
+    // The winner finishes: its entry removed, its waiters woken — the
+    // loser is not among them yet.
+    let served = winner.await.unwrap().expect("the winner serves");
+    assert!(served.is_some());
+    assert!(plane.holds(local));
+    // Release the loser: it registers now, re-checks, and must SERVE.
+    test_fetch_loser_release();
+    let out = tokio::time::timeout(Duration::from_secs(5), loser)
+        .await
+        .expect("the loser's serve returned (a lost wake parks it for ever)")
+        .unwrap()
+        .expect("the loser serves");
+    assert!(out.is_some(), "served off the winner's cache");
+    assert_eq!(
+        plane.stats().grants,
+        1,
+        "one grant — the loser re-read the cache"
+    );
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
 /// **The records budget is BYTES on the R5 component** (review round 1,
 /// Issue 7): every entry is charged its encoded records (attrs, xattrs,
 /// the dentry set) — `dlm_token_cached_bytes` is live — the cache evicts

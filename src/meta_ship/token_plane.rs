@@ -2552,8 +2552,38 @@ impl TokenReaderPlane {
                 scc::hash_map::Entry::Occupied(o) => {
                     let n = Arc::clone(o.get());
                     drop(o);
+                    // Test seam (PR 13): park the LOSER between the entry
+                    // read and its registration — the lost-wake window.
+                    if TEST_FETCH_LOSER_HOLD.load(Ordering::Acquire) {
+                        TEST_FETCH_LOSER_PARKED.fetch_add(1, Ordering::AcqRel);
+                        while TEST_FETCH_LOSER_HOLD.load(Ordering::Acquire) {
+                            let released = TEST_FETCH_LOSER_RELEASE.notified();
+                            if !TEST_FETCH_LOSER_HOLD.load(Ordering::Acquire) {
+                                break;
+                            }
+                            released.await;
+                        }
+                    }
+                    // Register-recheck-await (PR 13 — the fleet's `sym-
+                    // walls` row: a joiner's `lookup(1)` parked 455 s past
+                    // the entry station while a fresh lookup of the same
+                    // name served at once — a LONE lost wake): the winner
+                    // that finished between the entry read above and the
+                    // registration below removed its entry and bumped the
+                    // epoch BEFORE the loser registered, and a `notified()`
+                    // created after the bump is never woken — the loser
+                    // parked for ever, unhealable (the tick re-polls the
+                    // epoch-gated future alone). Register FIRST, then
+                    // re-check the entry is still the winner's; gone ⇒ the
+                    // winner finished ⇒ no await, re-read the cache.
                     let notified = n.notified();
-                    notified.await;
+                    let still_inflight = self
+                        .fetching
+                        .read_sync(&object, |_, v| Arc::ptr_eq(v, &n))
+                        .unwrap_or(false);
+                    if still_inflight {
+                        notified.await;
+                    }
                     if let Some(e) = self.cache.read_sync(&object, |_, e| Arc::clone(e)) {
                         if !wants.dentries || e.dir.is_some() {
                             return Ok(Some(e));
@@ -3374,6 +3404,23 @@ pub fn dentry_of(rec: &DirRecord) -> DentryValue {
 // ---------------------------------------------------------------------------
 // The mount path's arms
 // ---------------------------------------------------------------------------
+
+/// **Test seam** (PR 13): park a single-flight fetch LOSER between its
+/// read of the in-flight entry and its registration on the winner's
+/// wake — the lost-wake window `TokenReaderPlane::fetch` closes with the
+/// register-recheck-await idiom. `TEST_FETCH_LOSER_PARKED` counts the
+/// losers parked; `TEST_FETCH_LOSER_RELEASE` lets them go once the flag
+/// is cleared.
+pub static TEST_FETCH_LOSER_HOLD: AtomicBool = AtomicBool::new(false);
+pub static TEST_FETCH_LOSER_PARKED: AtomicU64 = AtomicU64::new(0);
+pub static TEST_FETCH_LOSER_RELEASE: squeezefs_ipc::sqz_notify::Notify =
+    squeezefs_ipc::sqz_notify::Notify::new();
+
+/// Release every loser the seam parked (the flag cleared first).
+pub fn test_fetch_loser_release() {
+    TEST_FETCH_LOSER_HOLD.store(false, Ordering::Release);
+    TEST_FETCH_LOSER_RELEASE.notify_waiters();
+}
 
 /// Block keys the scoped recall purge dropped (`dlm_token_recall_purged_keys`).
 static RECALL_PURGE_KEYS: AtomicU64 = AtomicU64::new(0);

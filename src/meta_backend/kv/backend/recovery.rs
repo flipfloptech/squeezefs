@@ -1559,6 +1559,11 @@ impl KvMetaBackend {
         // The structural door for everything from the root install on: no
         // manager SMO on the trees is in flight while their custody moves.
         let mut smo = self.smo.lock().await;
+        // Defect 33: the flush-ceiling audit judges the leaves that age
+        // under this hold against the extended bound (declared after the
+        // mutex guard so it drops FIRST — the hold's end is recorded while
+        // the mutex is still ours).
+        let _recovery_hold = self.recovery_hold();
         // Every RAM word step 4 changes goes back on any `Err` before step
         // 7b; declared under the mutex so its drop runs under it.
         let mut rollback = RecoveryRollback {

@@ -2291,6 +2291,16 @@ pub struct AppenderSet {
     /// region and did not reach its covering barrier within the flush
     /// ceiling (KD-SYM-10).
     pub flush_ceiling_overruns: std::sync::atomic::AtomicU64,
+    /// Covering barriers past the landing ceiling but inside `ceiling +
+    /// appender_recovery_bound_ms` while a dead appender's recovery held
+    /// this volume's SMO mutex (PR 13, defect 33): the recovery's
+    /// per-region steps 4–7 run under the mutex the flush pass needs, and
+    /// the design's own recovery bound (0.2–0.5 s per region, published)
+    /// exceeds the ceiling's 2-tick margin — so a manager leaf dirty when a
+    /// recovery begins lands late by a BOUNDED, published amount. Counted
+    /// apart so the must-stay-0 overrun keeps its meaning; a barrier past
+    /// the extended bound is still an overrun.
+    pub flush_ceiling_recovery_extensions: std::sync::atomic::AtomicU64,
     /// Checkpoint cycles a declared region's ring pressure made due (§4.6
     /// pt 2 per region — [`AppenderSet::ring_pressure`]): a parked
     /// committer is drained by the next cadence tick, never by the
@@ -2671,6 +2681,7 @@ impl AppenderSet {
             ring_segments: self.ring_segments(),
             ring_grows: self.ring_grows(),
             flush_ceiling_overruns: self.flush_ceiling_overruns.load(Relaxed),
+            flush_ceiling_recovery_extensions: self.flush_ceiling_recovery_extensions.load(Relaxed),
             flush_ceiling_ms: self.flush_ceiling_ms,
             pressure_cycles: self.pressure_cycles.load(Relaxed),
             manager_lease: self
@@ -2782,6 +2793,9 @@ pub struct AppenderStats {
     pub ring_segments: u64,
     pub ring_grows: u64,
     pub flush_ceiling_overruns: u64,
+    /// Late covering barriers explained by a recovery's SMO-mutex hold
+    /// (inside the extended bound) — defect 33.
+    pub flush_ceiling_recovery_extensions: u64,
     /// The flush ceiling in force, ms (`appender_flush_ceiling_ms`) —
     /// published so the bound the gauge audits cannot drift from the docs.
     pub flush_ceiling_ms: u64,

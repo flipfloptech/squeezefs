@@ -13866,6 +13866,10 @@ impl SqueezefsFilesystem {
                     "appender_flush_ceiling_overruns".into(),
                     appender(&|s| s.flush_ceiling_overruns),
                 );
+                metrics.insert(
+                    "appender_flush_ceiling_recovery_extensions".into(),
+                    appender(&|s| s.flush_ceiling_recovery_extensions),
+                );
                 // The bound the audit compares against — the checkpoint
                 // LANDING ceiling of the cadence in force (1,100 ms at the
                 // shipped 50 ms flush) — published so the docs cannot drift.

@@ -2205,6 +2205,118 @@ async fn a_released_slots_pending_times_are_drained_first_and_a_foreign_slots_ar
     shutdown(&manager).await;
 }
 
+/// **Defect 33 (PR 13; PR 2's KD-SYM-10 audit × PR 10's recovery)** — a
+/// dead appender's recovery holds the volume's SMO mutex through its
+/// per-region steps 4–7, and the flush pass that covers a MANAGER leaf
+/// dirty at that instant waits it out; the recovery's own published bound
+/// (`appender_recovery_bound_ms`, 0.2–1.2 s) exceeds the landing
+/// ceiling's 2-tick margin by design, so every recovery that met a dirty
+/// manager leaf tripped `appender_flush_ceiling_overruns` (must-stay-0) —
+/// the fleet's `sym-storm` round 4 from zero read the manager's leaf at
+/// 1,101 ms against 1,100 during a seven-region recovery. The audit now
+/// judges a leaf whose dirty window a recovery hold overlapped against
+/// `ceiling + appender_recovery_bound_ms` (both published) and counts it
+/// on `appender_flush_ceiling_recovery_extensions`; past THAT it is still
+/// an overrun. Here: a joiner dies with acked records, the manager's
+/// recovery parks under its hold (`TEST_RECOVERY_HOLD_BEFORE_TREE0`), the
+/// manager commits into its own tree (a leaf dirty under the hold), the
+/// leaf ages 200 ms past the 1,100 ms ceiling (the aging IS the measured
+/// quantity — the one sleep the contract takes), the hold releases and
+/// the next cycle covers it. RED before: `flush_ceiling_overruns == 1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_manager_leaf_that_aged_under_a_recoverys_hold_is_a_counted_extension_not_an_overrun() {
+    use squeezefs::meta_backend::kv::backend::recovery;
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    recovery::TEST_RECOVERY_HOLD_BEFORE_TREE0.store(false, Ordering::SeqCst);
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    // The manager's own directory, flushed clean before the recovery so
+    // the leaf's next dirtying is the one under the hold.
+    let mine = manager
+        .create(1, "mine", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("the manager's directory")
+        .ino;
+    let _ = create_files(&manager, mine, "before", 1).await;
+    // The joiner writes into the shared slot and dies.
+    let joiner = join(&uris, &venue, &mvol, 3).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let identity = jvol.joined_wire().unwrap().identity;
+    let _ = create_files(&joiner, shared, "x", 8).await;
+    drop(jvol);
+    drop(joiner);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    mvol.checkpoint_now()
+        .await
+        .expect("clean before the recovery");
+    let s0 = mvol.appender_stats().unwrap();
+    assert_eq!(s0.flush_ceiling_overruns, 0, "the premise");
+    assert_eq!(s0.flush_ceiling_recovery_extensions, 0, "the premise");
+    let ceiling_ms = s0.flush_ceiling_ms;
+    let bound_ms = mvol.appender_recovery_bound_ms();
+    assert!(
+        ceiling_ms <= 2_000,
+        "the contract runs at the shipped cadence (ceiling {ceiling_ms} ms)"
+    );
+    mvol.record_death_with_key(identity, 9, 0)
+        .await
+        .expect("the death record");
+    recovery::TEST_RECOVERY_HOLD_BEFORE_TREE0.store(true, Ordering::SeqCst);
+    let m2 = Arc::clone(&manager);
+    let poll = tokio::spawn(async move { recover_dead_appenders_set(&m2).await });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !recovery::TEST_RECOVERY_HELD.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the recovery never parked"
+        );
+        tokio::task::yield_now().await;
+    }
+    // A manager commit under the hold: admitted (its own slot), its leaf
+    // dirty from now — unflushable while the recovery holds the mutex.
+    manager
+        .create(mine, "under-the-hold", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("an own-slot create commits while a recovery holds the mutex");
+    let aged_ms = ceiling_ms + 200;
+    assert!(
+        aged_ms <= ceiling_ms + bound_ms,
+        "the aging sits inside the extended bound (ceiling {ceiling_ms} + bound {bound_ms} ms)"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(aged_ms)).await;
+    recovery::TEST_RECOVERY_HOLD_BEFORE_TREE0.store(false, Ordering::SeqCst);
+    recovery::TEST_RECOVERY_HOLD_RELEASE.notify_waiters();
+    let rep = poll.await.unwrap().unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    // The covering cycle: the manager's leaf lands past the ceiling and
+    // inside the extended bound.
+    mvol.checkpoint_now().await.expect("the covering cycle");
+    let s1 = mvol.appender_stats().unwrap();
+    assert_eq!(
+        s1.flush_ceiling_overruns, 0,
+        "a leaf that aged under a recovery's hold is not an overrun (ceiling {ceiling_ms} ms, \
+         recovery bound {bound_ms} ms, aged ≥ {aged_ms} ms)"
+    );
+    assert!(
+        s1.flush_ceiling_recovery_extensions >= 1,
+        "the extension is counted (got {})",
+        s1.flush_ceiling_recovery_extensions
+    );
+    manager
+        .lookup(mine, "under-the-hold")
+        .await
+        .expect("the commit under the hold is served");
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
 /// **Own residue** (PR 2's law on a wire region, deliverable 4): the joiner
 /// commits, checkpoints, commits MORE into its window, and dies (dropped
 /// without a shutdown). The same identity's rejoin presents its Live

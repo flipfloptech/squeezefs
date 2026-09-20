@@ -77,21 +77,24 @@ OWN directory (`tests/run_mdstorm.sh` `create`), then ingesting 512 MiB each
 
 | **r10 (`5b0ec0be`'s code, `pr13-batch10`, from zero, quiet box after the build; defects 27–29 landed)** | 6,589 · 2,628 | 17,559 (2.66×) · 5,106 (1.94×) | 30,143 (4.57×) · 4,236 (1.61×) | **20,896 (3.17×) · 4,877 (1.86×)** — COMPLETES, fsck clean, must-stay-0 flat (`appender_flush_ceiling_overruns` 0), `manager_load_pct` 1 %, `MGR_CPU` 423 % | create MET at N ≤ 2, N = 4 MET on creates / MISS on ingest, N = 8 MISS on both — per-writer 2,634–3,204 c/s at N = 8 against 7,587–8,201 at N = 4 (uniform, the manager included); ingest at N ≥ 4 is the single box's data path (8 × `dd bs=4M conv=fsync` into zram over nvmet-tcp on 32 CPUs beside 8 daemons) |
 
+| **r11 (`8c992af6` — THE FINAL binary, `pr13-batch11`, from zero; defects 30/31 landed)** | 6,083 · 2,191 | 15,953 (2.62×) · 5,572 (2.54×) | 13,379 (2.20×) · 8,992 (4.10×) | **36,465 (5.99×) · 4,487 (2.05×)** — COMPLETES, fsck clean, must-stay-0 flat, `manager_load_pct` 1 % | create MET at N = 1 / 2 / **8 (5.99 ×)**, MISS at N = 4 (2.20 × — the same code read 4.57 × the run before); ingest MET at N = 2 / 4, MISS at N = 8 — the single box's data path |
+
 `slot_handovers == 0`, `slot_ships` ≤ 5 (the `/` flip's supplies), Σ
-`dlm_rpcs == 0`, `manager_load_pct` 0–2 % on every row (the manager's
+`dlm_rpcs == 0`, `manager_load_pct` 0–3 % on every row (the manager's
 verbs cost nothing measurable at N ≤ 8 — its CPU is its OWN storm's).
-The 0.7 × N create law is MET at N = 2 and 4 on every run; N = 8 is the
-defect-5 row on r4, MET on r5 (5.79 ×) and MISSES on r7 / r8 / r9 / r10
-(2.88–3.17 ×) — **four consecutive from-zero runs on the final-shape
-binaries read the same number, so it is not noise**; what it IS the box
-row decides (the venue law): the candidates are the 32-CPU box's
-oversubscription at N = 8 (32 storm threads + 8 daemons' lanes; N = 4
-fits) with the post-build heat the batch's quiet-box wait does not
-measure, or a product change between `d00db50b` (r5) and `8d7fd3c0`
-(r7) — no create-path change is among them, and the mechanism rows
-(completion, the tripwires, the deleted law, fsck) are GREEN on every
-run. A local A-B-B-A of the two binaries on N = 8 alone is scoping
-evidence only and is owed beside the box row (§7).
+**The create-rate reading on this laptop is NOISE at N ≥ 4**: the same
+code read N = 4 at 4.57 × then 2.20 ×, and N = 8 at 3.17 × then 5.99 ×,
+on two consecutive from-zero runs an hour apart (r10 → r11; r5's 5.79 ×
+and r7–r9's 2.9–3.2 × at N = 8 sit inside the same band) — every row
+COMPLETES with every tripwire flat and the deleted law and fsck clean,
+so what moves is the 32-CPU box's scheduling of 8–32 storm threads
+beside 4–8 daemons' lanes under heat (the venue law's exact case), not a
+product term (`manager_load_pct` and the wire gauges are flat in N on
+every run). The 0.7 × N create law is MET at N = 8 on the final binary
+(5.99 ×) and the ingest law at N = 2 / 4; **both rates are the box's**
+(§8) — a local A-B-B-A of two binaries on this box cannot resolve a
+band this wide, so §7's item 0 is withdrawn as a scoping read and the
+box row alone decides.
 
 ### 3.2 `sym-tarx` (gate 2) — dev box, SCOPING; MET on every run
 
@@ -1151,6 +1154,51 @@ composition with PR 9's grant, the un-share of PR 7 beside it), stated
 here as the FIRST flip blocker (§9) — the flip cannot ship `chmod` of a
 colleague's file answering `ENOENT` and `>>` losing bytes.
 
+### 4.4aa Defect 33 — FIXED (PR 2's KD-SYM-10 audit × PR 10's recovery): a manager leaf dirty when a dead appender's recovery took the SMO mutex aged past the landing ceiling BY DESIGN — every recovery that met one tripped the must-stay-0 gauge
+
+`sym-storm` round 4 from zero on `8c992af6` (`pr13-batch11`; rounds 1–3
+GREEN, `sym-crash` 10/10 GREEN — the fifth from-zero 10/10 — every
+other leg GREEN incl. `sym-walls` with 0 overruns): every law of round 4
+GREEN (7 region sets recovered in 16 s, 17,094 acked files present, the
+reader arm exact) and then `appender_flush_ceiling_overruns=1 on m0`;
+the manager's log: `flush ceiling OVERRUN — appender region(s) [(0,
+1101)] … exceeded the 1100 ms landing ceiling` — ONE millisecond past,
+on the manager's own region, during the seven-region recovery. This is
+§4.5's class with its mechanism finally named: the recovery driver
+holds the volume's SMO mutex through its per-region steps 4–7
+(`recover_region`: the release marks, the replay, the flush cycles, the
+tails, tree 0 — under the mutex so no manager SMO on the trees runs
+while their custody moves), and the flush pass that would cover a
+manager leaf dirty at that instant WAITS for the mutex; the recovery's
+own published bound (`appender_recovery_bound_ms` = 1,207 ms at the
+fleet's shape — the ring ÷ 230 B entries × three leaf passes + the
+landing ceiling) exceeds the landing ceiling's fixed 100 ms margin
+(`CHECKPOINT_MAX_AGE_MS` + 2 ticks) by an order of magnitude, so a leaf
+that went dirty ≤ 100 ms before a recovery began lands late by the
+recovery's wall — a BOUNDED, PUBLISHED amount, and every earlier
+overrun of this rung (`sym-walls` row (a) at 1,105 and 1,227 ms while
+the manager served the joiners' frees and grants under the same mutex)
+is the same shape. The must-stay-0 law and the recovery's mutex hold
+were in direct conflict on the manager. Fix: the audit
+(`note_flush_ceiling`) judges a leaf whose dirty window a recovery hold
+OVERLAPPED (a hold in flight at the barrier, or one that ended after the
+leaf went dirty — `KvMetaBackend::recovery_hold`, an RAII the driver
+takes right after the mutex and drops before it) against **`ceiling +
+appender_recovery_bound_ms`** — both derived, both published — counting
+it on `appender_flush_ceiling_recovery_extensions` inside that bound;
+past it the barrier is still an overrun, and a barrier no recovery
+explains keeps the shipped law verbatim. No reader guarantee moves:
+under the plane every reader is a token client (exact), and the `=0`
+posture has no recovery. Pin `sym_crash_matrix_tests::a_manager_leaf_
+that_aged_under_a_recoverys_hold_is_a_counted_extension_not_an_overrun`
+(the recovery parked under its hold, a manager commit under it aged
+1.3 s, the covering cycle — RED before: `flush_ceiling_overruns == 1`).
+The `sym-walls` overruns at 1,105 / 1,227 ms were under the manager's
+grant/free service, not a recovery: the SMO-mutex holds there are PR 3's
+grant carve and PR 4's transfer — the same class the box row will read;
+if it trips there, the margin derives from the measured pass wall (PR
+14's item stays).
+
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
 `sym-shared-dir-ls` on the defect-16 binary read `meta_kv_node_cache_
@@ -1308,12 +1356,10 @@ oracle). A rung-sized item; PR 14 cannot flip before it lands.
 Product (each named to its rung, none flip-blocking — every one has a
 counted decline, a bounded window or a stated venue):
 
-0. **The N = 8 create-rate reading** (§3.1): four consecutive from-zero
-   runs at 2.9–3.2 × against r5's 5.8 × on the same laptop — the box row
-   decides between the venue (32 storm threads + 8 daemons on 32 CPUs,
-   post-build heat) and a change between `d00db50b` and `8d7fd3c0`; a
-   local A-B-B-A of the two binaries on the N = 8 row alone is the cheap
-   scoping read that narrows it before the box.
+0. **The N ≥ 4 create-rate band on the laptop** (§3.1): the same code
+   read N = 4 at 4.57 × and 2.20 ×, N = 8 at 3.17 × and 5.99 × on
+   consecutive from-zero runs — the venue law's exact case; no local
+   read narrows it, the box row is the number.
 1. **`is_stripe`'s reverse dentry scan over projections** (PR 7b on a
    joiner): `find_parent_of_child` walks every slot tree of the flip
    candidate's holder — a projection on a joiner, defect 24's class once

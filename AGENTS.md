@@ -739,7 +739,7 @@ verdict, and each launch is individually approved by the user before
 `tests/cloud_bench_cluster.sh launch` is invoked. A gate/fix train never
 implies cloud approval.
 
-### Benchmark VENUE: A/B and A-B-B-A rows run on squeeze-test, never the dev box (user directive 2026-09-07; scope narrowed 2026-09-14)
+### Benchmark VENUE: A/B and A-B-B-A rows run on squeeze-test, never the dev box (user directive 2026-09-07; scope narrowed 2026-09-14; restated 2026-09-20)
 
 **Every A/B, A-B-B-A bracket, per-lever leg and acceptance row runs on
 `squeeze-test`** (the 32-core Xeon field box). The dev laptop has **heat
@@ -751,6 +751,20 @@ of a shape) and every note carrying one must say so; the acceptance
 pair is re-run on the box before any verdict is written. This is the
 same fact the criterion baselines already record ("the thermally-capped
 dev box gives relative truth only") applied to every measurement class.
+
+**Restated by the owner 2026-09-20 (verbatim): "this machine has thermal
+issues and should not be a ABBA test that holds merit / record but more of
+a 'it works' and then we have squeeze-test for ABBA numbers testing."**
+The two roles are exclusive: the laptop answers *does the mechanism
+work* (legs green, engagement laws met, tripwires 0, crash/storm counts
+from zero); **no laptop number holds merit, enters a record as a verdict,
+or decides a gate** — a laptop row that reads a MISS on a timing-shaped
+or throughput-shaped law (a flush-ceiling overrun, an ingest multiple, a
+wall-clock ratio) is *venue-attributed pending the box*, never a MISS and
+never a MET, and the record says so in the row. Only a squeeze-test
+A-B-B-A bracket adjudicates a number. (PR 13's `sym-walls` row is the
+standing example: one `appender_flush_ceiling_overruns` on the laptop
+under a 3.1–3.7 GHz throttle is a venue reading; the box bracket decides.)
 
 **The box is for the acceptance rows ONLY, at the minimum count (user
 directive 2026-09-14: "run the minimal amount of ABBA rows on

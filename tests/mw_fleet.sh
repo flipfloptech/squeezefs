@@ -2001,6 +2001,20 @@ kill_member() {
     [ -n "$pid" ] && [ "$pid" != "-" ] || die "member $idx has no recorded pid"
     kill "-$sig" "$pid" 2>/dev/null || die "kill -$sig $pid failed"
     log "member $idx (pid $pid) sent signal $sig"
+    # The kill returns before the process is GONE (a daemon with gigabytes
+    # of dirty pages exits over hundreds of ms); a successor mounted inside
+    # that window reads the victim's heartbeat-fresh claim as a LIVE
+    # manager whose pid is not yet provably dead and dials a listener that
+    # resets — what a supervisor's restart never does (the successor starts
+    # after the exit). Wait for the pid to vanish, bounded.
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        [ "$waited" -ge 600 ] && die "member $idx (pid $pid) still alive 60 s after signal $sig"
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    [ "$waited" -gt 0 ] && log "member $idx (pid $pid) exited $((waited * 100)) ms after signal $sig"
+    return 0
 }
 
 teardown_fleet() {

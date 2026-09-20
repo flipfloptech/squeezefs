@@ -1312,6 +1312,10 @@ pub struct KvMetaBackend {
     /// Last ledger seq written by a checkpoint (starts at the mounted
     /// record's seq).
     pub(super) checkpoint_seq: AtomicU64,
+    /// A token reader's consecutive polls that stopped on an older
+    /// predicted ledger slot — the gap belt's counter (PR 13, defect 25;
+    /// `Self::read_root_epoch`). 0 on every write mount.
+    pub(super) reader_poll_stops: AtomicU64,
     /// The `journal_tail_seq` of the last ledger record written (starts
     /// at the mounted record's tail) — the §4.4 pt 4 hole discipline's
     /// progress observable ([`Self::checkpoint_past`]).
@@ -2987,6 +2991,7 @@ impl KvMetaBackend {
             // the gap the max opens is harmless; on a flat volume the two
             // agree except after a genuine failed-cycle raise.
             checkpoint_seq: AtomicU64::new(ledger.seq.max(alloc.resume_generation())),
+            reader_poll_stops: AtomicU64::new(0),
             last_ledger_tail: AtomicU64::new(ledger.journal_tail_seq),
             // PR VL5a (§5.5.1a): seed the live stamp from the mounted
             // record — every checkpoint re-writes it, so a slot-mapped
@@ -4530,11 +4535,10 @@ impl KvMetaBackend {
                 off += node_size;
             }
         }
-        let ckpt_seq = self.checkpoint_seq.fetch_add(1, Ordering::AcqRel) + 1;
-        self.alloc
-            .write_dirty_pages(&self.path, self.sb.alloc_bitmap.start, ckpt_seq)
-            .await?;
-        crate::uring_fs::fdatasync(self.path.clone()).await?;
+        // The bits + the ledger record the consumed seq names (PR 13,
+        // defect 25). The checkpoint task has exited: this is the
+        // shutdown's serialized tail, no cycle is mid-flight.
+        self.consume_checkpoint_seq_for_bitmap().await?;
         Ok(())
     }
 
@@ -8185,11 +8189,12 @@ impl KvMetaBackend {
                 off += node_size;
             }
         }
-        let ckpt_seq = self.checkpoint_seq.fetch_add(1, Ordering::AcqRel) + 1;
-        self.alloc
-            .write_dirty_pages(&self.path, self.sb.alloc_bitmap.start, ckpt_seq)
-            .await?;
-        crate::uring_fs::fdatasync(self.path.clone()).await?;
+        // The bits + the ledger record the consumed seq names (PR 13,
+        // defect 25), under the SMO mutex (handover → SMO order).
+        {
+            let _smo = self.smo.lock().await;
+            self.consume_checkpoint_seq_for_bitmap().await?;
+        }
         region.released.store(true, Ordering::Release);
         set.leaves.fetch_add(1, Ordering::Relaxed);
         log::info!(
@@ -9827,16 +9832,14 @@ impl KvMetaBackend {
                 }
             };
             // The extents' bits, durable before any page names them. A
-            // checkpoint-class durable step CONSUMES a checkpoint seq
-            // (ledger slots are `seq % 32`, so the gap is harmless): the
+            // checkpoint-class durable step CONSUMES a checkpoint seq: the
             // next cycle's bitmap write then carries a strictly higher
             // generation instead of tying this one and taking DUR-4's
-            // loud raise.
-            let ckpt_seq = self.checkpoint_seq.fetch_add(1, Ordering::AcqRel) + 1;
-            self.alloc
-                .write_dirty_pages(&self.path, self.sb.alloc_bitmap.start, ckpt_seq)
-                .await?;
-            self.sync_device().await.map_err(KvError::Io)?;
+            // loud raise — and the seq WRITES its ledger record (PR 13,
+            // defect 25: a ledger gap parked every token reader's poll
+            // for a whole ring of checkpoints). Under the cycle's SMO
+            // mutex.
+            self.consume_checkpoint_seq_for_bitmap().await?;
             // The page naming the grown table at the drained head — a
             // TABLE CHANGE, so it lands in the directory pair (both
             // slots) before any position is written under the new map.

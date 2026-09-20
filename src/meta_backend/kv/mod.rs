@@ -365,6 +365,22 @@ pub static META_KV_FLUSH_FLOOR_KEPT: AtomicU64 = AtomicU64::new(0);
 /// manager and every flat mount.
 pub static META_KV_PROJECTION_ROOT_REFRESHES: AtomicU64 = AtomicU64::new(0);
 
+/// Ledger records written by a checkpoint-class durable step that
+/// CONSUMED a checkpoint seq outside a cycle — PR 2's ring growth, the
+/// appender leave, PR 10's region release (`KvMetaBackend::
+/// consume_checkpoint_seq_for_bitmap`): each restates the last cycle's
+/// word at the consumed seq so the ledger stays DENSE and PR 5's
+/// predicted-slot poll never stops on a gap (PR 13, defect 25).
+/// Surfaced as `meta_kv_ledger_restatements`; 0 on every flat mount.
+pub static META_KV_LEDGER_RESTATEMENTS: AtomicU64 = AtomicU64::new(0);
+
+/// A token reader's poll that read the WHOLE ledger after a ring's worth
+/// of polls stopped on an older predicted slot — the gap belt
+/// (`KvMetaBackend::read_root_epoch`, PR 13 defect 25). ≈ 0 against a
+/// writer that restates every consumed seq; surfaced as
+/// `meta_kv_revalidate_gap_scans`.
+pub static META_KV_REVALIDATE_GAP_SCANS: AtomicU64 = AtomicU64::new(0);
+
 /// Bytes of those appended frames (4 KiB-padded) — the second half of the
 /// §8 row 7 "node writeback counters" accounting. Surfaced as
 /// `meta_kv_node_append_bytes` in PR K7.
@@ -1067,6 +1083,17 @@ pub enum KvError {
     #[error("{0}")]
     Busy(String),
 
+    /// Symmetric PR 12b's joined door could not REACH the manager the
+    /// heartbeat-fresh claim named (the dial failed, the connection reset)
+    /// — the TRANSPORT class of the join, typed apart from [`Self::Busy`]
+    /// (PR 13: a manager killed moments ago on this host is still exiting
+    /// — its pid not yet provably dead, its listener resetting the dial —
+    /// and the mount path re-reads the join target ONCE before it
+    /// refuses; the D0 ladder's dead-pid proof then decides). Its errno is
+    /// `EHOSTUNREACH` — the class the mount path keys on.
+    #[error("{0}")]
+    ManagerUnreachable(String),
+
     // PR 8 (design-symmetric-metadata §5.5.1 — the allocation lease's
     // ordering law): a successor asked for a DEAD holder's allocation
     // lease before the dead holder's home region was recovered (no
@@ -1110,6 +1137,13 @@ impl From<KvError> for crate::error::SqueezefsError {
             e @ KvError::ValueTooLarge { .. } => E::too_large(format!("kv metadata: {e}")),
             // The D0 single-writer refusal names a holder — EBUSY.
             e @ KvError::Busy(_) => E::busy(format!("kv metadata: {e}")),
+            // The join's transport class carries its OWN errno —
+            // EHOSTUNREACH, the manager cannot be reached — so the mount
+            // path classifies it structurally (`meta_backend::
+            // join_dial_failed`), never by text.
+            e @ KvError::ManagerUnreachable(_) => {
+                E::refused(libc::EHOSTUNREACH, format!("kv metadata: {e}"))
+            }
             // Out of grant with the manager unreachable: EAGAIN — the
             // caller retries inside the published stall bound.
             e @ KvError::GrantExhausted { .. } => {

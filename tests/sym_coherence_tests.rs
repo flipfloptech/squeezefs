@@ -4056,3 +4056,132 @@ async fn a_ro_mount_under_the_knob_arms_the_token_client_and_writes_nothing() {
     squeezefs::fuse_client::set_read_only_mount(false);
     shutdown(&writer).await;
 }
+
+/// **The poll's GAP BELT** (PR 13, defect 25's second half): every
+/// checkpoint-class step restates the ledger at the seq it consumes, but
+/// a crash between a bitmap write and its record leaves ONE gap for the
+/// volume's life — and PR 5's predicted-slot poll, stopped on the older
+/// record at `(adopted + 1) % 32`, would never adopt again on a writer
+/// whose next 31 records land in other slots. After a ring's worth of
+/// stopped polls the reader reads the whole ledger once
+/// (`meta_kv_revalidate_gap_scans`) and adopts the newest record anywhere.
+/// Pinned by forging the gap: the writer stands at `k`, the reader adopted
+/// it, a record at `k + 2` is written straight into its slot (`k + 1`
+/// never written — the crash's shape); 31 polls stop, the 32nd scans and
+/// adopts `k + 2`; a dense ledger (the writer's own next cycle) is walked
+/// without a scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_readers_poll_scans_the_whole_ledger_after_a_ring_of_stopped_polls() {
+    use squeezefs::meta_backend::kv::checkpoint::{
+        read_newest_ledger, write_ledger_slot, ROOT_LEDGER_SLOTS,
+    };
+    use squeezefs::meta_backend::kv::revalidate::revalidation_stats;
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "gap-belt").await;
+    let writer = open_armed_writer(&path).await;
+    let wv = Arc::clone(&writer.volumes[0]);
+    writer
+        .create(1, "before", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("a create");
+    wv.checkpoint_now().await.expect("checkpoint");
+    let uris = vec![path.display().to_string()];
+    let reader = open_routed_meta_set_read_only(&uris)
+        .await
+        .expect("read-only open");
+    let rv = Arc::clone(&reader.volumes[0]);
+    rv.arm_reader_revalidation(None).expect("arms");
+    // The reader's FIRST advance (a whole-ledger read until it has adopted
+    // one record — from there the predicted slot): the writer's next cycle.
+    writer
+        .create(1, "first-advance", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("a create");
+    wv.checkpoint_now().await.expect("checkpoint");
+    rv.revalidate_reader().await.expect("poll");
+    let base = rv.superblock().root_ledger.start;
+    let k = read_newest_ledger(&path, base)
+        .await
+        .expect("ledger")
+        .expect("a record")
+        .seq;
+    assert_eq!(
+        rv.reader_epoch(),
+        k,
+        "the reader adopted the writer's record"
+    );
+    // The crash's shape: a record at `k + 2` in its own slot, `k + 1`
+    // never written.
+    let mut forged = read_newest_ledger(&path, base)
+        .await
+        .expect("ledger")
+        .expect("a record");
+    forged.seq = k + 2;
+    forged.alloc_bitmap_generation = k + 2;
+    write_ledger_slot(&path, base, &forged)
+        .await
+        .expect("the forged record");
+    let scans0 = revalidation_stats().gap_scans;
+    for poll in 1..ROOT_LEDGER_SLOTS {
+        rv.revalidate_reader().await.expect("poll");
+        assert_eq!(
+            rv.reader_epoch(),
+            k,
+            "poll {poll}: the predicted slot holds an older record — stopped"
+        );
+    }
+    assert_eq!(
+        revalidation_stats().gap_scans,
+        scans0,
+        "no scan before the ring's worth"
+    );
+    rv.revalidate_reader().await.expect("the belt's poll");
+    assert_eq!(
+        revalidation_stats().gap_scans,
+        scans0 + 1,
+        "one whole-ledger read"
+    );
+    assert_eq!(
+        rv.reader_epoch(),
+        k + 2,
+        "the newest record adopted across the gap"
+    );
+    // A dense continuation (the writer's own cycles land at k + 3 ... ):
+    // the predicted walk resumes from the adopted record, no scan.
+    writer
+        .create(1, "after", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("a create");
+    // The writer's seq counter still stands at `k`; its next records fill
+    // `k + 1` (never read again — the reader is past it) and `k + 2` (the
+    // forged slot, overwritten with the same seq, newer content), then
+    // `k + 3`: two cycles put the newest at or past the adopted one.
+    wv.checkpoint_now().await.expect("checkpoint");
+    wv.checkpoint_now().await.expect("checkpoint");
+    wv.checkpoint_now().await.expect("checkpoint");
+    let newest = read_newest_ledger(&path, base)
+        .await
+        .expect("ledger")
+        .expect("a record")
+        .seq;
+    assert!(
+        newest > k + 2,
+        "the writer's cycles passed the forged seq ({newest})"
+    );
+    rv.revalidate_reader().await.expect("poll");
+    assert_eq!(
+        rv.reader_epoch(),
+        newest,
+        "the predicted walk resumed from the adopted record"
+    );
+    assert_eq!(
+        revalidation_stats().gap_scans,
+        scans0 + 1,
+        "no second scan on a dense ledger"
+    );
+    for v in &reader.volumes {
+        v.shutdown().await.unwrap();
+    }
+    shutdown(&writer).await;
+}

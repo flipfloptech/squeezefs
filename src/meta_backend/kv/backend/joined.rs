@@ -679,31 +679,37 @@ impl KvMetaBackend {
         )
         .await
         .map_err(|e| {
-            KvError::Busy(format!(
+            KvError::ManagerUnreachable(format!(
                 "{}: dialing the manager at {} for JoinAppender failed: {e}",
                 path.display(),
                 admission.manager_endpoint
             ))
         })?;
-        let (appender_id, already, node_seq_base) = match client
-            .join(presented, 0)
-            .await
-            .map_err(|e| wire_err("JoinAppender", e))?
-        {
-            ManagerReply::Joined {
-                appender_id,
-                already,
-                node_seq_base,
-                ..
-            } => (appender_id, already, node_seq_base),
-            ManagerReply::Refused { reason } => {
-                return Err(KvError::Busy(format!(
-                    "{}: the manager refused JoinAppender: {reason}",
-                    path.display()
-                )))
-            }
-            other => return Err(unexpected("JoinAppender", &other)),
-        };
+        // The open's FIRST act: a transport failure here (the manager
+        // died between the connect and its reply) is the same unreachable
+        // class as the dial's — nothing of this join exists yet.
+        let (appender_id, already, node_seq_base) =
+            match client.join(presented, 0).await.map_err(|e| {
+                KvError::ManagerUnreachable(format!(
+                    "{}: JoinAppender to the manager at {} failed over the wire: {e}",
+                    path.display(),
+                    admission.manager_endpoint
+                ))
+            })? {
+                ManagerReply::Joined {
+                    appender_id,
+                    already,
+                    node_seq_base,
+                    ..
+                } => (appender_id, already, node_seq_base),
+                ManagerReply::Refused { reason } => {
+                    return Err(KvError::Busy(format!(
+                        "{}: the manager refused JoinAppender: {reason}",
+                        path.display()
+                    )))
+                }
+                other => return Err(unexpected("JoinAppender", &other)),
+            };
         Ok((client, presented, appender_id, already, node_seq_base))
     }
 
@@ -2334,6 +2340,10 @@ impl KvMetaBackend {
         if !unclaimed.is_empty() {
             self.manager_return_runs(appender_id, unclaimed).await?;
         }
+        // SMO before `manager_verbs` (PR 4 round 5's order for a wire
+        // grant): the consumed seq below restates the ledger's roots, so
+        // no cycle may be mid-flight.
+        let _smo = self.smo.lock().await;
         let _g = self.manager_verbs.lock().await;
         let segments = std::mem::take(&mut page.segments);
         page.state = AppenderState::Free;
@@ -2356,11 +2366,9 @@ impl KvMetaBackend {
                 off += node_size;
             }
         }
-        let ckpt_seq = self.checkpoint_seq.fetch_add(1, Ordering::AcqRel) + 1;
-        self.alloc
-            .write_dirty_pages(&self.path, self.sb.alloc_bitmap.start, ckpt_seq)
-            .await?;
-        self.sync_device().await.map_err(KvError::Io)?;
+        // The bits + the ledger record the consumed seq names (PR 13,
+        // defect 25).
+        self.consume_checkpoint_seq_for_bitmap().await?;
         set.leaves.fetch_add(1, Ordering::Relaxed);
         let live = entries
             .iter()

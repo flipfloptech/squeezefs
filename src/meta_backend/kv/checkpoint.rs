@@ -1644,6 +1644,71 @@ pub static TEST_CHECKPOINT_HALT_BEFORE_LEDGER: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 impl KvMetaBackend {
+    /// **A checkpoint-class durable step CONSUMES a checkpoint seq — and
+    /// writes the ledger record that seq names** (symmetric PR 13, defect
+    /// 25). PR 2's ring growth, the appender leave (in-process and the
+    /// wire `LeaveAppender`) and PR 10's region release each write the
+    /// allocation bitmap at a fresh `checkpoint_seq` so the next cycle's
+    /// pages carry a strictly higher generation (DUR-4's raise stays a
+    /// signal) — and left the LEDGER with a gap: no record at that seq.
+    /// PR 5's predicted-slot poll reads slot `(adopted + 1) % 32` and
+    /// stops on an OLDER record there ("the writer has not written that
+    /// seq"), so after ONE gap every `-o ro` token reader stopped adopting
+    /// until the writer's seq wrapped the whole ring — 32 checkpoints, 41 s
+    /// on the fleet's `sym-storm` round (seven regions released at once;
+    /// the reader's tree 0 named the dead lessees for the whole window and
+    /// every read of a recovered slot failed at the dead address) and
+    /// unbounded on a quiet volume. The law now: **a consumed seq is a
+    /// ledger seq** — this writes the bitmap pages at `ckpt_seq`, then a
+    /// record at `ckpt_seq` RESTATING the last cycle's word (the roots as
+    /// they stand, the last record's tail — nothing became covered — the
+    /// live `next_ino` and watermark), then the barrier. Content-equivalent
+    /// to the record it follows: a crash after it replays exactly what a
+    /// crash after the last cycle would. **The caller holds the SMO mutex**
+    /// (no cycle mid-flight: the roots are the last record's) or is the
+    /// shutdown's serialized tail. Returns the seq consumed.
+    pub(crate) async fn consume_checkpoint_seq_for_bitmap(
+        &self,
+    ) -> std::result::Result<u64, KvError> {
+        let ckpt_seq = self.checkpoint_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        self.allocator()
+            .write_dirty_pages(
+                self.device_path(),
+                self.superblock().alloc_bitmap.start,
+                ckpt_seq,
+            )
+            .await?;
+        self.sync_device().await.map_err(KvError::Io)?;
+        let tree_roots: Vec<TreeRoot> = self
+            .ledger_root_trees()
+            .into_iter()
+            .map(|t| TreeRoot {
+                tree_id: t.tree_id(),
+                node_addr: t.root().addr,
+                node_seq: t.root().seq,
+            })
+            .collect();
+        let rec = LedgerRecord {
+            seq: ckpt_seq,
+            tree_roots,
+            journal_tail_seq: self.last_ledger_tail.load(Ordering::Acquire),
+            next_ino: self.next_ino(),
+            alloc_bitmap_generation: ckpt_seq,
+            node_seq_watermark: self.all_trees()[0].node_seq_snapshot(),
+            membership_stamp: self.membership_stamp_for_ledger(),
+            append_partition: None,
+        };
+        write_ledger_slot(
+            self.device_path(),
+            self.superblock().root_ledger.start,
+            &rec,
+        )
+        .await?;
+        self.sync_device().await.map_err(KvError::Io)?;
+        super::META_KV_LEDGER_RESTATEMENTS.fetch_add(1, Ordering::Relaxed);
+        Ok(ckpt_seq)
+    }
+
     /// One §4.6 pt 2 checkpoint cycle (module docs pin the order).
     /// Serialized by the SMO mutex the caller holds. `barrier_now` makes
     /// the freshly-written ledger record durable inside this cycle

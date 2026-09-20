@@ -1374,6 +1374,204 @@ async fn a_foreign_create_into_a_striped_directory_reads_the_stripes_record_at_i
     shutdown(&manager).await;
 }
 
+/// **A joiner's `stat` of a striped directory folds the stripes' records
+/// as their HOLDER states them** (PR 13, defect 24 — found by `sym-scale`
+/// N = 8 from zero on the defect-23 binary: the manager auto-striped `/`
+/// under the seven joiners' `mkdir`s, and a joiner's next `stat /` folded
+/// the 61 holder-minted stripes through `read_inode_value_routed` — its
+/// PROJECTION of the manager's rotor slots, whose roots the lessee's
+/// compaction had retired and the manager re-granted: `restarts
+/// [root-seq] = 256`, `EIO` on the storm's create; PR 12b's refresh
+/// re-adopts tree 0 and the native tree alone — a LEASED slot's root
+/// rides its lessee's page, KD-SYM-3, so no refresh could heal it). The
+/// fold and the rmdir's count probe read every stripe through `getattr`
+/// — the writer's read divert, the holder's token plane — never the
+/// projection. Pinned in the failure's observable shape: the stripes are
+/// minted AFTER the reading joiner's projection loaded, so on the base
+/// the fold saw NO stripe record and the joiner's `nlink` of the
+/// directory lagged the holder's by the subdirectory the holder created
+/// into a stripe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiners_stat_of_a_striped_directory_folds_the_stripes_at_their_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let j1 = join(&uris, &venue, &mvol, 1).await;
+    let _ = create_files(&j1, shared, "j1", 2).await;
+    let j2 = join(&uris, &venue, &mvol, 2).await;
+    let j1venue = DaemonVenue::stand_up(&j1, false, "joiner-1").await;
+    j2.volumes[0]
+        .slot_leases()
+        .expect("armed")
+        .holders
+        .set_endpoint(1, &j1venue.endpoint);
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(&j2),
+            "node-j2",
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    let sink = Arc::new(ProbeSink {
+        calls: std::sync::atomic::AtomicU64::new(0),
+    });
+    let for_arm = Arc::clone(&sink);
+    let j2vol = Arc::clone(&j2.volumes[0]);
+    let _arm = squeezefs::data_grant::arm_slot_custody(
+        &j2,
+        &squeezefs::cowriter::node_member_id_of(
+            j2vol.joined_wire().unwrap().identity.node_token,
+            j2vol.joined_wire().unwrap().identity.mount_slot,
+        ),
+        VENUE_SECRET.to_vec(),
+        0,
+        Arc::new(move |_volume| {
+            Arc::clone(&for_arm) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
+        }),
+    );
+    // The holder stripes its directory AFTER joiner 2's projection
+    // loaded (the stripes' records are invisible to that projection), then
+    // creates a subdirectory into one stripe — the stripe's nlink 2 → 3.
+    j1.stripe_dir(shared, 4).await.expect("the holder's flip");
+    j1.create(shared, "sub", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("a subdirectory into a stripe");
+    let holder_view = j1.getattr(shared).await.expect("the holder's fold");
+    // Joiner 2 learns the map (the routing arm — its token of the
+    // directory's dentries) and folds.
+    assert!(
+        j2.stripe_route(shared, "sub")
+            .await
+            .expect("route")
+            .is_some(),
+        "the directory is striped at joiner 2 too"
+    );
+    let joiner_view = j2.getattr(shared).await.expect("the joiner's fold");
+    assert_eq!(
+        joiner_view.nlink, holder_view.nlink,
+        "the joiner's fold reads every stripe's record at its holder (the subdirectory's link)"
+    );
+    assert_eq!(
+        joiner_view.mtime, holder_view.mtime,
+        "the max over the stripes"
+    );
+    squeezefs::data_grant::disarm_slot_custody().await;
+    drop(j2vol);
+    shutdown(&j2).await;
+    shutdown(&j1).await;
+    j1venue.tear_down();
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
+/// **A consumed checkpoint seq is a LEDGER seq — a token reader's poll
+/// walks across a joiner's leave** (PR 13, defect 25 — found by the
+/// fleet's `sym-storm` round 1: seven regions released at once consumed
+/// seven checkpoint seqs with no ledger record, PR 5's predicted-slot
+/// poll stopped on the older record at `(adopted + 1) % 32` — "the writer
+/// has not written that seq" — and the `-o ro` reader adopted NOTHING for
+/// 41 s, until the writer's seq wrapped the ring: its tree 0 named the
+/// dead lessees the whole time and every read of a recovered slot failed
+/// at the dead address). Here the served `LeaveAppender` consumes the seq
+/// (its bitmap write); the manager then writes on and checkpoints; the
+/// reader's next poll must adopt the NEWEST record — the ledger is dense
+/// (`meta_kv_ledger_restatements` +1), the predicted walk crosses the
+/// consumed seq, the belt never fires. RED before: the reader stayed on
+/// the record it adopted before the leave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_readers_ledger_poll_walks_across_a_consumed_checkpoint_seq() {
+    use squeezefs::meta_backend::kv::checkpoint::read_newest_ledger;
+    use squeezefs::meta_backend::kv::revalidate::{read_newest_ledger_from, revalidation_stats};
+    use squeezefs::meta_backend::kv::META_KV_LEDGER_RESTATEMENTS;
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let j1 = join(&uris, &venue, &mvol, 1).await;
+    let _ = create_files(&j1, shared, "j1", 2).await;
+    mvol.checkpoint_now().await.expect("checkpoint");
+    // The reader adopts the newest record `k`.
+    let reader = squeezefs::meta_backend::open_routed_meta_set_read_only(&uris)
+        .await
+        .expect("read-only open");
+    let rv = Arc::clone(&reader.volumes[0]);
+    rv.arm_reader_revalidation(None)
+        .expect("the reader's revalidation arms");
+    rv.revalidate_reader().await.expect("poll");
+    let path = rv.device_path().to_path_buf();
+    let base = rv.superblock().root_ledger.start;
+    let k = read_newest_ledger(&path, base)
+        .await
+        .expect("ledger")
+        .expect("a record")
+        .seq;
+    assert_eq!(
+        rv.reader_epoch(),
+        k,
+        "the reader stands on the newest record"
+    );
+    let restatements0 = META_KV_LEDGER_RESTATEMENTS.load(Relaxed);
+    let gap_scans0 = revalidation_stats().gap_scans;
+    // The joiner LEAVES: the served `LeaveAppender` returns its ring and
+    // writes the bitmap at a CONSUMED checkpoint seq — which now writes
+    // its ledger record too.
+    shutdown(&j1).await;
+    assert!(
+        META_KV_LEDGER_RESTATEMENTS.load(Relaxed) > restatements0,
+        "the consumed seq restated the ledger"
+    );
+    // The manager writes on: records PAST the consumed seq.
+    manager
+        .create(1, "after-the-leave", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("a create after the leave");
+    mvol.checkpoint_now().await.expect("checkpoint");
+    let newest = read_newest_ledger(&path, base)
+        .await
+        .expect("ledger")
+        .expect("a record")
+        .seq;
+    assert!(
+        newest >= k + 2,
+        "a consumed seq and a cycle past it ({k} → {newest})"
+    );
+    // DENSE: the predicted walk from `k` reaches the newest record.
+    assert_eq!(
+        read_newest_ledger_from(&path, base, k)
+            .await
+            .expect("walk")
+            .map(|r| r.seq),
+        Some(newest),
+        "no gap between {k} and {newest}"
+    );
+    rv.revalidate_reader().await.expect("poll");
+    assert_eq!(
+        rv.reader_epoch(),
+        newest,
+        "the reader adopted the newest record across the consumed seq"
+    );
+    assert_eq!(
+        revalidation_stats().gap_scans,
+        gap_scans0,
+        "the belt never fired: the writer kept the ledger dense"
+    );
+    for v in &reader.volumes {
+        v.shutdown().await.unwrap();
+    }
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
 /// **A dominating requester earns an IDLE joined holder's tree through
 /// the served ships** (§5.1.4 on the wire — gate 3c's IDLE row; PR 13,
 /// found by the fleet's `sym-foreign-touch`: 12 dominating bursts of 64
@@ -6264,4 +6462,63 @@ async fn attribute_resurrection(
             );
         }
     }
+}
+
+/// **A join whose manager cannot be REACHED is its own class** (PR 13,
+/// defect 26 — found by `sym-crash` round 1 from zero: the successor
+/// remounted while the killed manager was still exiting — its
+/// heartbeat-fresh claim named it LIVE, its pid not yet provably dead —
+/// dialed the dying listener for `JoinAppender`, got `Connection reset by
+/// peer` and the mount REFUSED as if the manager had refused it). The
+/// joined door's dial (and the join call itself, the open's first act)
+/// answer `KvError::ManagerUnreachable` — errno `EHOSTUNREACH`, which
+/// `meta_backend::join_dial_failed` keys on — so the mount path re-reads
+/// the join target once and walks the D0 ladder when the manager is no
+/// longer live-looking; a manager that REFUSES the join (`Busy`) is not
+/// that class. Pinned against a closed port: nothing joined, nothing
+/// written, the volume mounts as the manager afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_at_an_unreachable_manager_is_the_transport_class_the_mount_path_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, _dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    // A listener nobody serves: bind, learn the port, drop it.
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().to_string()
+    };
+    let identity = AppenderIdentity {
+        node_token: 0x5150_2626,
+        mount_slot: 26,
+        writer_id: 0,
+    };
+    Knobs::armed().apply();
+    let r = open_routed_meta_set_joined(
+        &uris,
+        &JoinedSetAdmission {
+            manager_endpoint: dead.clone(),
+            secret: VENUE_SECRET.to_vec(),
+            peer_id: peer_of(&identity),
+            identity,
+        },
+    )
+    .await;
+    Knobs::clear();
+    let e = r
+        .err()
+        .expect("the join refuses: nobody answers at the dead address");
+    assert!(
+        squeezefs::meta_backend::join_dial_failed(&e),
+        "the transport class (EHOSTUNREACH): {e}"
+    );
+    assert_eq!(e.to_errno(), libc::EHOSTUNREACH);
+    // Not the class: a refusal the manager ANSWERED (the D0 posture word).
+    let busy: squeezefs::error::SqueezefsError =
+        squeezefs::meta_backend::kv::KvError::Busy("the manager refused".into()).into();
+    assert!(!squeezefs::meta_backend::join_dial_failed(&busy));
+    // Nothing of the join exists: the volume opens as the manager.
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    assert_eq!(manager.volumes[0].appenders_public().unwrap().live(), 1);
+    shutdown(&manager).await;
 }

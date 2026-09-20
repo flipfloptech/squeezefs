@@ -6506,8 +6506,43 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else if let Some(pre) = pv_preflight.as_ref() {
                 squeezefs::meta_backend::open_routed_meta_set_partial(&meta_lvs, &pre.admission)
                     .await
-            } else if let Some(adm) = joined_admission.as_ref() {
-                squeezefs::meta_backend::open_routed_meta_set_joined(&meta_lvs, adm).await
+            } else if let Some(adm) = joined_admission.take() {
+                match squeezefs::meta_backend::open_routed_meta_set_joined(&meta_lvs, &adm).await {
+                    Ok(r) => {
+                        joined_admission = Some(adm);
+                        Ok(r)
+                    }
+                    Err(e) if squeezefs::meta_backend::join_dial_failed(&e) => {
+                        // PR 13 (the `sym-crash` leg's successor remount):
+                        // the manager whose heartbeat-fresh claim named it
+                        // LIVE did not answer the JOIN — a manager killed
+                        // moments ago on this host is still EXITING (its
+                        // pid not yet provably dead, its listener resetting
+                        // the dial). Re-read the target ONCE: a manager the
+                        // probe no longer calls live (the pid gone — the D0
+                        // dead-pid proof) makes this mount the D0 ladder's;
+                        // a manager still live-looking keeps the refusal
+                        // (a cross-host crash waits the claim's TTL, as the
+                        // D0 ladder always did).
+                        match squeezefs::meta_backend::symmetric_join_target(&meta_lvs).await {
+                            Ok(None) => {
+                                log::warn!(
+                                    "symmetric join ladder: the JOIN dial failed ({e}) and the \
+                                     manager it named is no longer live — walking the D0 ladder"
+                                );
+                                squeezefs::meta_backend::open_routed_meta_set(&meta_lvs).await
+                            }
+                            _ => {
+                                joined_admission = Some(adm);
+                                Err(e)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        joined_admission = Some(adm);
+                        Err(e)
+                    }
+                }
             } else {
                 match squeezefs::meta_backend::open_routed_meta_set(&meta_lvs).await {
                     Ok(r) => Ok(r),

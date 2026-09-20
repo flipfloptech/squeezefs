@@ -446,12 +446,31 @@ impl KvMetaBackend {
         // The reader adopted `seq` at its last poll: the writer's next
         // record can only sit at `(seq + 1) % 32`. Nothing newer = the
         // adopted epoch restated (a no-op for `revalidate_trees`).
-        Ok(
-            match read_newest_ledger_from(self.device_path(), base, seq).await? {
-                Some(rec) => RootEpoch::from_ledger(&rec),
-                None => RootEpoch::synthetic(seq, 0, &[]),
-            },
-        )
+        if let Some(rec) = read_newest_ledger_from(self.device_path(), base, seq).await? {
+            self.reader_poll_stops.store(0, Ordering::Relaxed);
+            return Ok(RootEpoch::from_ledger(&rec));
+        }
+        // **The gap belt** (PR 13, defect 25): the predicted slot's stop
+        // rule reads an OLDER record as "not written yet", which a seq the
+        // writer CONSUMED without a record makes false — every such step
+        // restates the ledger now (`consume_checkpoint_seq_for_bitmap`),
+        // but a crash between a bitmap write and its record leaves one gap
+        // for the volume's life, and a poll that stopped there would never
+        // adopt again. After a ring's worth of stopped polls the reader
+        // reads the whole ledger once: a newer record anywhere is adopted
+        // and the predicted walk resumes from it; a truly idle writer
+        // costs one 128 KiB read per 32 idle polls.
+        let stops = self.reader_poll_stops.fetch_add(1, Ordering::Relaxed) + 1;
+        if stops % ROOT_LEDGER_SLOTS == 0 {
+            super::META_KV_REVALIDATE_GAP_SCANS.fetch_add(1, Ordering::Relaxed);
+            if let Some(rec) = full_ledger_read(self.device_path(), base).await? {
+                if rec.seq > seq {
+                    self.reader_poll_stops.store(0, Ordering::Relaxed);
+                    return Ok(RootEpoch::from_ledger(&rec));
+                }
+            }
+        }
+        Ok(RootEpoch::synthetic(seq, 0, &[]))
     }
 
     /// One revalidation pass for a declared reader: poll, adopt roots, drop
@@ -583,6 +602,7 @@ pub struct RevalidationStats {
     pub ledger_full_reads: u64,
     pub load_retries: u64,
     pub partition_refusals: u64,
+    pub gap_scans: u64,
 }
 
 /// Read the reader-side counters (`meta_kv_revalidate_*`,
@@ -599,5 +619,6 @@ pub fn revalidation_stats() -> RevalidationStats {
         ledger_full_reads: super::META_KV_REVALIDATE_LEDGER_FULL_READS.load(Ordering::Relaxed),
         load_retries: super::META_KV_READER_LOAD_RETRIES.load(Ordering::Relaxed),
         partition_refusals: super::META_KV_NODE_PARTITION_REFUSALS.load(Ordering::Relaxed),
+        gap_scans: super::META_KV_REVALIDATE_GAP_SCANS.load(Ordering::Relaxed),
     }
 }

@@ -2775,11 +2775,14 @@ impl KvMetaBackend {
                     off += node_size;
                 }
             }
-            let ckpt_seq = self.checkpoint_seq.fetch_add(1, Ordering::AcqRel) + 1;
-            self.alloc
-                .write_dirty_pages(&self.path, self.sb.alloc_bitmap.start, ckpt_seq)
-                .await?;
-            self.sync_device().await.map_err(KvError::Io)?;
+            // The bits + the ledger record the consumed seq names (PR 13,
+            // defect 25 — a reader's poll stops on a ledger gap), under the
+            // SMO mutex (handover → SMO, the recovery's own order) so no
+            // cycle is mid-flight while the roots are restated.
+            {
+                let _smo = self.smo.lock().await;
+                self.consume_checkpoint_seq_for_bitmap().await?;
+            }
             released += 1;
             RECOVERED_REGIONS_RELEASED.fetch_add(1, Ordering::Relaxed);
             log::info!(

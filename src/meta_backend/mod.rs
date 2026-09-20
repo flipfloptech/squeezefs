@@ -815,6 +815,19 @@ pub struct JoinedSetAdmission {
 /// becomes it), or the plane is not requested (the shipped posture
 /// exactly). A live manager whose endpoint is unresolvable REFUSES loud:
 /// a second RW mount that can neither claim nor join must not half-join.
+/// Did a joined open fail because the manager the join target named
+/// could not be REACHED (`KvError::ManagerUnreachable` — the dial or the
+/// `JoinAppender` call itself, the transport class, errno `EHOSTUNREACH`)?
+/// The mount path re-reads [`symmetric_join_target`] once on it (PR 13):
+/// a manager killed moments ago on this host is still exiting — its
+/// heartbeat-fresh claim named it live, its pid was not yet provably dead,
+/// its listener reset the dial — and the D0 ladder's dead-pid proof
+/// decides once the target no longer calls it live. Every other refusal
+/// (the manager REFUSED the join, a page conflict, a device error) stands.
+pub fn join_dial_failed(e: &crate::error::SqueezefsError) -> bool {
+    e.to_errno() == libc::EHOSTUNREACH
+}
+
 pub async fn symmetric_join_target(paths: &[String]) -> Result<Option<JoinedSetAdmission>> {
     if !kv::slot_lease::symmetric_meta_requested() {
         return Ok(None);

@@ -14560,7 +14560,17 @@ impl SqueezefsFilesystem {
                         "meta_kv_revalidate_ledger_full_reads".into(),
                         r.ledger_full_reads.into(),
                     );
+                    // PR 13, defect 25: the poll's GAP belt — a whole-ledger
+                    // read after a ring's worth of polls that stopped on an
+                    // older predicted slot (a consumed seq the writer never
+                    // restated: a crash between a bitmap write and its
+                    // record). ≈ 0 against a healthy writer.
+                    metrics.insert("meta_kv_revalidate_gap_scans".into(), r.gap_scans.into());
                 }
+                metrics.insert(
+                    "meta_kv_ledger_restatements".into(),
+                    load(&meta_kv::META_KV_LEDGER_RESTATEMENTS),
+                );
                 // THE FENCING FAMILY (§5.8.1 / KD-SYM-18): the Reservation
                 // Report read SIZED BY REGCTL — per metadata AND data
                 // namespace this mount registered on: registrants the last

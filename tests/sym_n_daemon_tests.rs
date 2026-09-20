@@ -921,11 +921,10 @@ async fn concurrent_storms(
     let breach0 = squeezefs::meta_backend::kv::META_KV_APPENDER_FENCE_BREACH
         .load(std::sync::atomic::Ordering::Relaxed);
     for d in daemons.drain(1..) {
-        // ATTRIBUTION EXPERIMENT: two full cycles before the leave.
-        if std::env::var_os("SQZ_PIN_PRECHECKPOINT").is_some() {
-            d.volumes[0].checkpoint_now().await.unwrap();
-            d.volumes[0].checkpoint_now().await.unwrap();
-        }
+        // No pre-leave checkpoint here, by design: defect 6's attribution
+        // found that a ROUTINE cycle before the leave carried the records
+        // the leave's own did not, so a cycle at this point is exactly the
+        // arm that hides the loss this pin exists to catch.
         let left_dirs: Vec<u64> = dirs.clone();
         // BEFORE the leave: where the leaving daemon's OWN tree routes each
         // removed name and what its fold says (the joiner's RAM truth the

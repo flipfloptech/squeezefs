@@ -4925,21 +4925,32 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t0):.0f}')")"
     mgr_load="$(stat_field 0 manager_load_pct | tr -d '[] ' | cut -d, -f1)"
     verbs="$(sym_delta "$rowdir" 0 wa manager_verbs)"
     verbs_per_s="$(stat_field 0 manager_verbs_per_s | tr -d '[] ' | cut -d, -f1)"
-    svc_total="$(sym_delta "$rowdir" 0 wa manager_service_ns.total)"
-    svc_exec="$(sym_delta "$rowdir" 0 wa manager_service_ns.execute)"
-    local verdict_a=MET
-    # THE ENGAGEMENT LAW (§8 gate 7): every displaced block's terminal free
-    # SHIPPED and was SERVED at the holder — never freed locally on a
-    # non-holder, never lost (`free_ship_failures` is in the must-stay-0
-    # set's spirit: reported per row).
-    [ "$shipped" = "$displaced" ] || verdict_a="MISS(shipped=$shipped≠displaced=$displaced)"
-    [ "$served" = "$displaced" ] || verdict_a="$verdict_a MISS(served=$served≠displaced=$displaced)"
+    svc_total="$(sym_delta_arr_field "$rowdir" 0 wa manager_service_ns total)"
+    svc_exec="$(sym_delta_arr_field "$rowdir" 0 wa manager_service_ns execute)"
+    local verdict_a=MET minted failures
+    minted="$(sym_delta "$rowdir" 0 wa block_grant_blocks)"
+    failures=0
+    for j in "${joiners[@]}"; do
+        v="$(sym_delta "$rowdir" "$j" wa meta_ship_publish.free_ship_failures)"
+        failures=$((failures + v))
+    done
+    # THE ENGAGEMENT LAW (§8 gate 7): every free the joiners SHIPPED was
+    # SERVED at the holder (exact closure), every displaced OLD block is
+    # among them (`served ≥ displaced` — the rewrite's ACK-early overlay
+    # mints intermediate images per kernel-split segment and frees them
+    # as it settles, so the free population is displaced + superseded;
+    # `minted` beside it: a rewrite leaves the live set unchanged, so
+    # minted ≈ served at quiesce), and none FAILED (a failed ship is a
+    # durably-free offset unreturned until the next derivation).
+    [ "$shipped" = "$served" ] || verdict_a="MISS(shipped=$shipped≠served=$served)"
+    [ "$served" -ge "$displaced" ] || verdict_a="$verdict_a MISS(served=$served<displaced=$displaced)"
+    [ "$failures" = "0" ] || verdict_a="$verdict_a MISS(free_ship_failures=+$failures)"
     [ -z "$zero_miss" ] || verdict_a="$verdict_a MISS(must-stay-0:$zero_miss)"
     {
         echo "== sym-walls row (a): the relocated FREE wall (w_rewrite, N=$n joiners × $SYM_WALLS_FILES × $SYM_WALLS_MB MiB)$SYM_BUSY_ROW =="
-        printf '%-10s %-10s %-10s %-10s %-12s %-9s %-9s %-10s %-12s %-12s %s\n' N DISPLACED SHIPPED SERVED FREE_BLK_S REWRITE_S MGR_CPU MGR_VERBS SVC_TOTAL_NS SVC_EXEC_NS VERDICT
-        printf '%-10s %-10s %-10s %-10s %-12s %-9s %-9s %-10s %-12s %-12s %s\n' "$n" "$displaced" "$shipped" "$served" "$free_rate" "$wall" "${mgr_cpu}%" "$verbs" "$svc_total" "$svc_exec" "$verdict_a"
-        echo "manager_load_pct=$mgr_load manager_verbs_per_s=$verbs_per_s free_ship_failures=$(stat_sum 0 meta_ship_publish.free_ship_failures) free_refused_blocks=$(stat_sum 0 meta_ship_publish.free_refused_blocks)"
+        printf '%-6s %-10s %-8s %-8s %-8s %-11s %-10s %-8s %-10s %-13s %-12s %s\n' N DISPLACED MINTED SHIPPED SERVED FREE_BLK_S REWRITE_S MGR_CPU MGR_VERBS SVC_TOTAL_NS SVC_EXEC_NS VERDICT
+        printf '%-6s %-10s %-8s %-8s %-8s %-11s %-10s %-8s %-10s %-13s %-12s %s\n' "$n" "$displaced" "$minted" "$shipped" "$served" "$free_rate" "$wall" "${mgr_cpu}%" "$verbs" "$svc_total" "$svc_exec" "$verdict_a"
+        echo "manager_load_pct=$mgr_load manager_verbs_per_s=$verbs_per_s free_ship_failures=+$failures free_refused_blocks=$(stat_sum 0 meta_ship_publish.free_refused_blocks)"
     } | tee "$rowdir/symwalls-a.txt"
     for j in "${joiners[@]}"; do rm -rf "$(mnt_of "$j")/walls-$run-w$j" 2>/dev/null || true; done
 
@@ -4990,7 +5001,7 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t0):.0f}')")"
     local steps verbs_b svc_b_total
     steps=$(( $(stat_sum 0 xv_cross_owner_steps_served) - steps0 ))
     verbs_b="$(sym_delta "$rowdir" 0 wb manager_verbs)"
-    svc_b_total="$(sym_delta "$rowdir" 0 wb manager_service_ns.total)"
+    svc_b_total="$(sym_delta_arr_field "$rowdir" 0 wb manager_service_ns total)"
     mgr_cpu="$(python3 -c "
 import os
 hz = os.sysconf('SC_CLK_TCK')
@@ -5009,6 +5020,25 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t0):.0f}')")"
     [ "$verdict_a" = "MET" ] && [ "$verdict_b" = "MET" ] ||
         die "sym-walls: gate 7 rows RED — (a) $verdict_a; (b) $verdict_b (tables in $rowdir)"
     log "sym-walls PUBLISHED (rows (a) + (b) + snapshots in $rowdir)"
+}
+
+# The delta of one FIELD summed over a per-volume ARRAY OF OBJECTS
+# (`manager_service_ns` = `[{admit, execute, reply, total}, …]`) between
+# a row's two snapshots — `sym_delta`'s flattening reaches no list of
+# objects.
+sym_delta_arr_field() { # rowdir idx label key field
+    python3 - "$1" "$2" "$3" "$4" "$5" <<'PYEOF'
+import json, sys
+rowdir, idx, label, key, field = sys.argv[1:6]
+def load(ph):
+    root = json.load(open(f"{rowdir}/m{idx}_p{label}{ph}.json"))
+    m = root.get("metrics", root)
+    v = m.get(key, [])
+    if isinstance(v, dict):
+        v = [v]
+    return sum(int(o.get(field, 0) or 0) for o in v if isinstance(o, dict))
+print(load(1) - load(0))
+PYEOF
 }
 
 # One flattened key's value out of a saved snapshot (the row's own p0,

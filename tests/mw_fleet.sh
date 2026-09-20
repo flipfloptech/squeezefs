@@ -1156,16 +1156,26 @@ mount_member() { # idx [--netns[=<delay_ms>]]
     local pid
     pid="$(daemon_pid_for_mnt "$mnt")"
     [ -n "$pid" ] || die "cannot find member $idx's daemon pid"
-    # Update the members ledger (idx role mnt log hostnqn hostid pid).
-    if [ "$idx" -eq 0 ]; then
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$idx" "$role" "$mnt" "$log" "$W_HOSTNQN" "$W_HOSTID" "$pid"
-    else
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$idx" "$role" "$mnt" "$log" "-" "-" "$pid"
-    fi >>"$MEMBERS.new"
-    grep -v "^$idx	" "$MEMBERS" >>"$MEMBERS.new" 2>/dev/null || true
-    sort -n "$MEMBERS.new" >"$MEMBERS" && rm -f "$MEMBERS.new"
+    # Update the members ledger (idx role mnt log hostnqn hostid pid) —
+    # under a lock: the join-storm row mounts every joiner AT ONCE, and
+    # two rewrites of the table through one `.new` file left it with
+    # duplicate and missing rows (PR 13's `sym-walls` row (b)).
+    (
+        flock -w 60 9 || die "member $idx: the members ledger's lock was not taken in 60 s"
+        local row
+        if [ "$idx" -eq 0 ]; then
+            row="$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+                "$idx" "$role" "$mnt" "$log" "$W_HOSTNQN" "$W_HOSTID" "$pid")"
+        else
+            row="$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+                "$idx" "$role" "$mnt" "$log" "-" "-" "$pid")"
+        fi
+        {
+            echo "$row"
+            grep -v "^$idx	" "$MEMBERS" 2>/dev/null || true
+        } | sort -n >"$MEMBERS.new.$$"
+        mv -f "$MEMBERS.new.$$" "$MEMBERS"
+    ) 9>>"$MEMBERS.lock"
     log "member $idx ($role) up at $mnt (pid $pid)"
 }
 

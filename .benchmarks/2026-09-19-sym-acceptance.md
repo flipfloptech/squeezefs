@@ -75,13 +75,92 @@ OWN directory (`tests/run_mdstorm.sh` `create`), then ingesting 512 MiB each
 
 | **r7 (`8d7fd3c0` — the FINAL binary, from zero, `pr13-batch7`; defects 20–26 landed)** | 7,023 · 2,991 | 19,018 (2.71×) · 6,212 (2.08×) | 30,071 (4.28×) · 6,300 (2.11×) | **20,517 (2.92×) · 5,023 (1.68×)** — the row COMPLETES (defect 24 gone: `/` auto-striped under the seven `mkdir`s and every joiner's `stat /` folded through the divert), must-stay-0 flat, `appender_flush_ceiling_overruns` 0, `manager_load_pct` 1 %, 453 stripe tokens served at the manager once | create rate MET at N ≤ 2, MISS at N = 4 (ingest) and N = 8 (both — every writer at 2,600–3,100 c/s uniformly, the manager included, against 7,600–8,400 at N = 4: the throttling box after four hours of fleets (86 °C idle), not a serialization — no product change touches the create path between r5 and r7; the box row decides); deleted-stays-deleted 0 / 3,000 at the manager AND at the remounted joiner |
 
-`slot_handovers == 0`, `slot_ships == 0`, Σ `dlm_rpcs == 0`,
-`manager_load_pct` 0–2 % on every row (the manager's verbs cost nothing
-measurable at N ≤ 8 — its CPU is its OWN storm's). The 0.7 × N law is MET
-at N = 2 and 4 on r2/r4/r5; N = 8 is the defect-5 row on r4 and MET on
-r5; r7 (the final binary) MISSES it on the throttled box — a dev-box
-RATE reading, the mechanism rows (completion, the tripwires, the deleted
-law) GREEN.
+| **r10 (`5b0ec0be`'s code, `pr13-batch10`, from zero, quiet box after the build; defects 27–29 landed)** | 6,589 · 2,628 | 17,559 (2.66×) · 5,106 (1.94×) | 30,143 (4.57×) · 4,236 (1.61×) | **20,896 (3.17×) · 4,877 (1.86×)** — COMPLETES, fsck clean, must-stay-0 flat (`appender_flush_ceiling_overruns` 0), `manager_load_pct` 1 %, `MGR_CPU` 423 % | create MET at N ≤ 2, N = 4 MET on creates / MISS on ingest, N = 8 MISS on both — per-writer 2,634–3,204 c/s at N = 8 against 7,587–8,201 at N = 4 (uniform, the manager included); ingest at N ≥ 4 is the single box's data path (8 × `dd bs=4M conv=fsync` into zram over nvmet-tcp on 32 CPUs beside 8 daemons) |
+
+`slot_handovers == 0`, `slot_ships` ≤ 5 (the `/` flip's supplies), Σ
+`dlm_rpcs == 0`, `manager_load_pct` 0–2 % on every row (the manager's
+verbs cost nothing measurable at N ≤ 8 — its CPU is its OWN storm's).
+The 0.7 × N create law is MET at N = 2 and 4 on every run; N = 8 is the
+defect-5 row on r4, MET on r5 (5.79 ×) and MISSES on r7 / r8 / r9 / r10
+(2.88–3.17 ×) — **four consecutive from-zero runs on the final-shape
+binaries read the same number, so it is not noise**; what it IS the box
+row decides (the venue law): the candidates are the 32-CPU box's
+oversubscription at N = 8 (32 storm threads + 8 daemons' lanes; N = 4
+fits) with the post-build heat the batch's quiet-box wait does not
+measure, or a product change between `d00db50b` (r5) and `8d7fd3c0`
+(r7) — no create-path change is among them, and the mechanism rows
+(completion, the tripwires, the deleted law, fsck) are GREEN on every
+run. A local A-B-B-A of the two binaries on N = 8 alone is scoping
+evidence only and is owed beside the box row (§7).
+
+### 3.2 `sym-tarx` (gate 2) — dev box, SCOPING; MET on every run
+
+2,468 entries (`linux-7.2.3/fs`), A-B-B-A both orders per run, the
+joiner under netem 250 µs, the manager local. r4 1.02× / r5 0.85× / r7
+0.96× / r9 0.96× / **r10 0.96×** (2.42 s vs 2.53 s) of S0 (gate ≤ 1.10×);
+`verbs/entry` 0.0122 on the first sym leg (30 manager verbs = the join +
+grant refills) and 0.0000 on the second; `xv` / `ship` / `pub` 0;
+`slot_handovers` 0; oracle clean. The joined writer's `tar -x` into its
+own tree costs no wire verb per entry — §5.10's first row, exact.
+
+### 3.3 `sym-shared-dir` (+ `-ls`) (gate 3b) — dev box, SCOPING; MET on every run since defect 14
+
+8 creators × 2,500 files into ONE directory held by m60: r10 — wall 6.08
+s, 3,290 creates/s aggregate, **one flip at the holder (K = 64)**,
+`xv_shipped ≡ xv_served` = 17,502, `dir_stripe_ships` 17,394 (the 1/64
+own-stripe lands are the difference), `slot_handovers` 0. `-ls` on the
+token reader: cold `readdir + stat` of 20,000 children in 20.9 s,
+**`dlm_token_grants` 20,067 = K + C + 3** (the directory, its parent, the
+root), `readdir_merges` 43, `node_cache_misses` 12 (the poll's dropped
+images over 8 epoch steps), `token_hits` 5.4 M — 0 data-leaf reads for
+the listing. Oracle clean.
+
+### 3.4 `sym-foreign-touch` (gate 3c) — dev box, SCOPING; MET on every run since defect 10
+
+Holder m60, requester m61, the manager holder C; beat 10 s, `N_floor(A)`
+5, bursts of 64, 3 rounds per phase. **LIVE**: 192 ships, 0 handovers (a
+live holder is never recalled by a touch). **IDLE**: handed over after 2
+bursts (r10: 21.9 s, 0.046 handovers/s; `slot_handover_phase_ns` total
+5.6 ms — flush 2.8, page 0.09, tree 0 2.7). **PAUSED**: 3 single touches
+over 3 beats, 0 handovers (a paused live job keeps its tree). Oracle
+clean.
+
+### 3.5 `sym-readers` (gate 5) — dev box, SCOPING; MET on the 1-reader fleet every run
+
+Writer m60, one token reader: create / rename / setattr **exact at the
+reader's next resolve** (0 misses); the broadcast shape over 5 publishes
+of one file: `dlm_token_recalls` 5 ≡ mutations × holders, acks 5,
+`fanout_p99` 1 ≡ readers, `timeouts_live` 0, `recall_rtt_mean` 110–126
+µs; recall-driven free-grace: `recall_gated_frees` 5 (the freeing
+publish's recall IS the qualification — the hold under tokens is the
+recall RTT against the S5 composite's 2,724 ms), ring `deferrals ≡
+releases + offsets` = 0. The 1 × 31 broadcast is the box's (§7).
+
+### 3.8 `sym-crash` / `sym-storm` (gate 4) — dev box, LOCAL by the venue law; the from-zero counts
+
+Every batch runs both ×10 from zero on the binary its row names
+(counted-restart law: a red aborts the count, the fix restarts it).
+`sym-crash` (7 joiners + a token reader, the manager killed −9 every
+round under a sustained write load, the successor remounted): **10/10
+GREEN on attempts 7, 8, 9 and 10** — per round the acked-writes oracle
+(866–3,820 fsynced files per round, all present with content), the
+reader following the failover as a member without fencing
+(`self_fences` 0), a member worker re-enrolled at the successor, the
+symmetric successor (`self_recoveries` 2, manager `held`, tripwires 0),
+every joined writer's window covering its post-failover write and its
+free served at the successor, the freed-offset fan-in advancing with 7
+members, the dead incarnation's deferred bitmap leaks converging
+(`deferred ≡ released + adopted`, pending 0), the member-side census
+shard on the reader (0 findings), the reader reading every joiner's
+post-failover name, `fsck` clean. `sym-storm --victims=7 --cross-owner
+--striped` ×10 (every joiner killed at once per round, its acked files
+renamed concurrently into the manager's directory, every storm directory
+striped K = 64, the recalled-reader arm, deleted-stays-deleted): attempt
+8 rounds 1–3 GREEN then defect 28; attempt 9 round 1 RED (defect 29);
+attempt 10 round 1 GREEN (10,608 acked from 7 joiners + the manager, 14
+regions recovered in 47 s, the reader arm exact) then round 2 RED
+(defects 30 / 31). **Attempt 11 from zero on `8c992af6` is the count
+that stands** — its rows are written below when it lands.
 
 ## 4. Issues found (each with its PR and its red pin)
 
@@ -1113,10 +1192,12 @@ column (per-row deltas — a previous row's count never bleeds into the next).
 On the final binary's from-zero batches the class moved to `sym-walls`
 row (a) — seven joiners rewriting 7 GB into zram over nvmet-tcp at once:
 attempt 5 +1 on m61, attempt 9 **+1 on m61 at 1,105 ms (5 ms past the
-ceiling)**, attempts 7 and 8 none; `sym-scale` N = 8 read 0 on every
-final-binary run. The two laws of the row (the free wall, the join storm)
-MET on every run; the row's verdict is RED by the must-stay-0 set, and
-the reading is the box's.
+ceiling)**, attempt 10 **+1 on m0 (the manager, the allocation holder
+serving 2,723 frees) at 1,227 ms**, attempts 7 and 8 none; `sym-scale`
+N = 8 read 0 on every final-binary run. The two laws of the row (the free
+wall, the join storm) MET on every run; the row's verdict is RED by the
+must-stay-0 set, and the reading is the box's — with the PR 14 item
+(derive the margin from the measured pass wall) written up in §7.
 
 ### 4.6 Harness findings
 
@@ -1205,9 +1286,34 @@ resource than it did.
 
 ## 7. Owed (what PR 14 / PR 15 inherit)
 
+**Flip-blocking (one item — §4.4z, defect 32):** the record-level
+metanode arm — a foreign-slot FILE's `setattr` / `setxattr` / layout
+publish from a mount that does not lease its slot ships to the holder
+(design §5.10's "1 custody grant + 1 publish ship per layout publish";
+the door's own "ships to its holder" text). Today: `chmod`/`touch` of a
+colleague's file `ENOENT`, `setfattr` `EOPNOTSUPP`, a write's fsync
+refused and `>>` acking bytes that never land. Fix shape: `daemon_verb_
+router` + the publish shipper keyed by SLOT HOLDER through PR 6's
+`step_home` (tree 0's lessee + the endpoint table) for the record-level
+verbs only (the namespace verbs keep PR 6's intent arm — the S8 router's
+`create` would bypass the creator's-rotor mint); the served side under
+the holder's lease and door, composing the publish's custody scope with
+PR 9's grant at that holder and recalling the object's tokens (the
+writer's own included); PR 7's un-share beside it. Venue: the two-backend
+fixture (`sym_n_daemon_tests` — a joiner's `setattr`/`write` on the
+manager's file and the reverse) + a fleet leg (`sym-foreign-file`: N
+writers `chmod`/`touch`/append a colleague's files under the acked-writes
+oracle). A rung-sized item; PR 14 cannot flip before it lands.
+
 Product (each named to its rung, none flip-blocking — every one has a
 counted decline, a bounded window or a stated venue):
 
+0. **The N = 8 create-rate reading** (§3.1): four consecutive from-zero
+   runs at 2.9–3.2 × against r5's 5.8 × on the same laptop — the box row
+   decides between the venue (32 storm threads + 8 daemons on 32 CPUs,
+   post-build heat) and a change between `d00db50b` and `8d7fd3c0`; a
+   local A-B-B-A of the two binaries on the N = 8 row alone is the cheap
+   scoping read that narrows it before the box.
 1. **`is_stripe`'s reverse dentry scan over projections** (PR 7b on a
    joiner): `find_parent_of_child` walks every slot tree of the flip
    candidate's holder — a projection on a joiner, defect 24's class once
@@ -1252,17 +1358,25 @@ _(pending — every file placed on squeeze-test.)_
 
 ## 9. The flip decision (for PR 14)
 
-**Decision: NOT YET — the flip waits for the box brackets.** The
-mechanism half of every gate is GREEN on the dev box from zero on the
-final binary (§3): the fleet legs complete, every must-stay-0 tripwire
-but the venue-attributed flush-ceiling overrun reads 0, the kill matrix
-(`sym-crash` 10/10 × three from-zero runs, `sym-storm` 10/10 on the
-final run) loses nothing acked, deletes stay deleted, fsck is clean after
-every round. The RATE half of gates 1 / 2 / 3 / 5 / 7 is the box's by the
-venue law, and no box row ran in this rung (§8): every local rate is
-scoping evidence, and gate 3's create law at N = 8 read 2.9–3.2 × on the
-throttled laptop against 5.8 × on the same laptop cold (§3.1) — a number
-the box must settle before the default can flip.
+**Decision: NOT YET — two blockers, one of them a product gap.** (1)
+**Defect 32 (§4.4z, §7's flip-blocking item)**: a file created on one
+mount cannot be `chmod`ed, `touch`ed, `setfattr`ed or WRITTEN from a
+mount that does not lease its slot — `ENOENT` / `EOPNOTSUPP` / a refused
+publish, and an append without an fsync acks bytes that never land. The
+design states the arm (§5.10's "1 custody grant + 1 publish ship");
+PR 9 built the grant, nobody built the ship, and the owed item left the
+ledger at PR 12b. A default that flips on this loses data on an ordinary
+POSIX op; it is the rung the flip waits for first. (2) The box brackets:
+the mechanism half of every gate is GREEN on the dev box from zero on
+the final binaries (§3) — the fleet legs complete, every must-stay-0
+tripwire but the venue-attributed flush-ceiling overrun reads 0, the
+kill matrix (`sym-crash` 10/10 × four from-zero runs; `sym-storm`'s
+count per §3.8) loses nothing acked, deletes stay deleted, fsck is clean
+after every round. The RATE half of gates 1 / 2 / 3 / 5 / 7 is the box's
+by the venue law, and no box row ran in this rung (§8): every local rate
+is scoping evidence, and gate 3's create law at N = 8 read 2.9–3.2 × on
+four consecutive from-zero runs against 5.8 × once on the same laptop
+(§3.1) — a number the box must settle before the default can flip.
 
 Gates, exactly:
 
@@ -1280,9 +1394,11 @@ Gates, exactly:
 | 8 SIM-1 | **MET** (§5) | n/a (tier (ii)) |
 | 8b fidelity | see §3.7 | n/a |
 
-What PR 14 flips on: the box rows of gates 1 / 2 / 3 / 3b / 3c / 5 / 7 on
-THIS binary (§8's footprint procedure), plus §7's product items 1–2 (both
-counted declines today). Nothing found in this rung's twenty-nine
-defects is a class the design did not already state; every one is fixed
-red-first here, so the flip inherits no known defect — only the box's
-numbers.
+What PR 14 flips on: **defect 32's arm landed and pinned** (the rung
+before the flip), then the box rows of gates 1 / 2 / 3 / 3b / 3c / 5 / 7
+on THAT binary (§8's footprint procedure), plus §7's product items 1–2
+(both counted declines today). Nothing found in this rung's thirty-one
+FIXED defects is a class the design did not already state, and every
+one is fixed red-first here; the one it did not fix is the class the
+design stated and the program never built — the flip inherits exactly
+that item and the box's numbers.

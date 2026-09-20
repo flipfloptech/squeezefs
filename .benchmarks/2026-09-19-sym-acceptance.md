@@ -876,6 +876,40 @@ Harness: `mw_fleet.sh kill` waits for the victim's pid to vanish
 starts inside the exit window. Pin: `sym_n_daemon_tests::a_join_at_an_
 unreachable_manager_is_the_transport_class_the_mount_path_retries`.
 
+### 4.4u Defect 27 — FIXED (PR 8/12b, under PR 14's owed terminal-free-engine swap): a former lessee's blocks were "lost" to fsck at the manager, and a local free of one REFUSED — leaked
+
+`sym-scale`'s fsck oracle from zero on `f38776a7` (`pr13-batch8`,
+attempt 8 — attempt 7's oracle had recorded NO block-plane verdict: `0
+block(s), 0 refcount(s) checked`): after every joiner's clean leave the
+manager's online fsck raised **2,816 C2 "lost block … referenced offset
+is not allocator-tracked"** on `nvme3n1`, every one an ingest block of a
+departed joiner (128 per 512 MiB file). The manager's RAM refcount map
+knows its OWN mints and its mount-time by-block census alone (PR 7 kept
+the scan as the free list's derivation; PR 12b's joined open performs
+none); a block a joiner minted from its grant window is SET in the
+holder's bitmap (PR 8 — the bitmap IS the free list there) and durably
+referenced, and once the joiner's slot is released, handed over or
+recovered to the manager, its tree is the manager's to read and its
+blocks are untracked THERE. Two faces: fsck's C2 read RAM alone — a
+FALSE finding class on every N-daemon set with departed writers; and the
+LEAK — `begin_free` on such a block is the double-release REFUSAL (an
+ERROR per block, `block_untracked_free_refusals` — the must-stay-≈0
+tripwire — and the bit SET for ever), so every `rm` at the manager of a
+file a departed joiner wrote leaked its blocks (unexercised by the legs:
+their deleted files are inline). Fix: (i) `BackendRouter::untracked_free_
+gate` — a terminal free at the allocation HOLDER of an untracked offset
+runs `cowriter::execute_shipped_frees`' ladder LOCALLY (finding 13's law
+for a shipped free of an untracked offset: the durable ledger population
+decides; 0 ⇒ seed one reference and run the ladder; > 0 ⇒ non-terminal;
+already free ⇒ the refusal), installed by `arm_shared_refs` beside the
+shared-block gate, counted `block_untracked_free_adjudicated`; (ii) fsck's
+C2 on a grant-armed HOLDER reads a SET bit in the held bitmap as TRACKED
+(`fsck_alloc_bitmap_tracked_exempted`). Pin: `sym_shared_refs_tests::
+a_holders_free_of_a_former_lessees_block_runs_the_owner_ladder_instead_
+of_refusing` (RED: the refusal, the bit SET). The engine swap itself —
+the bitmap as the terminal-free engine everywhere, the zero-census open —
+stays PR 14's (§7).
+
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
 `sym-shared-dir-ls` on the defect-16 binary read `meta_kv_node_cache_
@@ -1002,7 +1036,46 @@ resource than it did.
 
 ## 7. Owed (what PR 14 / PR 15 inherit)
 
-_(pending — filled at the close.)_
+Product (each named to its rung, none flip-blocking — every one has a
+counted decline, a bounded window or a stated venue):
+
+1. **`is_stripe`'s reverse dentry scan over projections** (PR 7b on a
+   joiner): `find_parent_of_child` walks every slot tree of the flip
+   candidate's holder — a projection on a joiner, defect 24's class once
+   per flip candidate, never per op. The fix shape is a divert-aware
+   reverse scan or the `known_stripes` set fed at every map read on every
+   mount; the candidate's own `stripe_map` read already learns it.
+2. **`SupplyStripeIno`'s on-demand binding** (§4.6): the supply declines a
+   creator with no endpoint bound instead of `bind_holder_endpoint_on_
+   demand`; the holder mints the remainder, so a flip still lands — with
+   the stripes in the holder's rotor instead of the creators'.
+3. **`appender_flush_ceiling_overruns`** (§4.5): the landing ceiling's
+   fixed 2-tick margin against the checkpoint pass wall on a throttling
+   box — one overrun on `sym-walls` row (a) in attempt 5, none in attempt
+   7; derive the margin from the measured pass wall if the box trips it.
+4. **The manager's zero-census open** (PR 14 by design — the RAM refcount
+   map's mount-time by-block scan replaced by PR 8's bitmap as the
+   terminal-free engine) and **PR 7's un-share of a surviving sole
+   owner**: unchanged from PR 12b's owed list.
+5. **A second SHARD** (a home ≠ volume 0 — the owner-role fusion, the
+   `shared_ref:` migration, the cross-shard rejoin retirement, the
+   departure sink's cross-shard face; PR 12b's owed list) — the fleet
+   rig stands one shard; the N = 32-member reader broadcast (gate 5's
+   1 × 31 row) and the 32-mount join storm (gate 7's wall (b) at N = 32)
+   are BOX rows (§8).
+6. **`kv_freeze_wedge_tests`' flat-shaped census probe** and the joiner
+   dead-manager checkpoint contract's 1-in-N flake (§4.6) — harness items
+   for the matrix's next widening.
+7. **The reader's per-op cost on a striped root**: the fold of a striped
+   `/` is `K` token serves per `stat /` from the plane cache (one grant
+   each per holder per token lifetime); a `stat`-heavy reader of a
+   64-stripe root pays 64 cache hits per attr revalidation — measured
+   nothing on the legs, stated for the box's `ls -l` row.
+
+Records the box owes (§8): gate 1's solo re-gate A-B-B-A on the final
+binary; gates 2 / 3 / 3b / 3c / 5 / 7's counted brackets — every local
+number in §3 is a dev-box RATE reading (the mechanism rows are GREEN;
+the rates are the box's).
 
 ## 8. Box footprint
 

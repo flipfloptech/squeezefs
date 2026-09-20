@@ -2382,16 +2382,28 @@ async fn apply_or_ship_step_retrying(
         )
         .await
         {
-            Err(e) if shipped && is_slot_moved_refusal(&e) && attempt < SLOT_MOVED_RETRIES => {
+            // A shipped step's holder (defect 29) OR this mount's own door
+            // (defect 35, PR 13): a LOCAL step whose slot another appender
+            // took between the plan and the door is the same slot-moved
+            // class — the door learnt the holder, the re-resolve confirms
+            // it, and the step SHIPS on the next attempt. Before it a
+            // local mid-plan `SlotBusy` was a "device error" and the
+            // lattice fail-stopped both volumes.
+            Err(e) if is_slot_moved_refusal(&e) && attempt < SLOT_MOVED_RETRIES => {
                 attempt += 1;
                 XV_CO_STEP_SLOT_MOVED_RETRIES.fetch_add(1, Ordering::Relaxed);
                 let slot = crate::meta_backend::kv::record::forest_slot_of_ino(local.local_home());
                 let _ = routed.volumes[v_idx].reresolve_slot_holder(slot).await;
                 log::debug!(
-                    "cross-owner transaction {tx_id:016x}: step {step_idx} ({}) was refused at \
-                     its holder because the slot moved ({e}); re-resolved, attempt {attempt} of \
+                    "cross-owner transaction {tx_id:016x}: step {step_idx} ({}) was refused \
+                     {} because the slot moved ({e}); re-resolved, attempt {attempt} of \
                      {SLOT_MOVED_RETRIES}",
-                    step.name()
+                    step.name(),
+                    if shipped {
+                        "at its holder"
+                    } else {
+                        "at this mount's door"
+                    }
                 );
             }
             other => return other,
@@ -2618,13 +2630,24 @@ pub async fn execute(
                 // to THIS initiator during the ship reads `Local` now, and
                 // the shipped refusal was taken for a local device error —
                 // the fail-stop (defect 29).
-                if armed && !local_step {
+                // A slot-moved refusal (defect 35) is the retryable class
+                // whatever the dispatch mode: the door refused BEFORE any
+                // effect, the plan's applied steps stand, and the intent's
+                // roll-forward ships the step to the holder the door named
+                // — never the lattice (a device error is what the lattice
+                // guards; a slot that moved is the plane doing its job).
+                if armed && (!local_step || is_slot_moved_refusal(&e)) {
                     log::warn!(
                         "cross-owner transaction {tx_id:016x} ({:?}): step {i} of {} could not \
-                         be shipped to its holder ({e}) — the intent stays open and the \
-                         roll-forward cadence completes it (design-symmetric-metadata §5.6)",
+                         be {} ({e}) — the intent stays open and the roll-forward cadence \
+                         completes it (design-symmetric-metadata §5.6)",
                         plan.op,
-                        localised.len()
+                        localised.len(),
+                        if local_step {
+                            "applied at this mount's door (the slot moved)"
+                        } else {
+                            "shipped to its holder"
+                        }
                     );
                     note_intent_abandoned(tx_id);
                     return Err(e);

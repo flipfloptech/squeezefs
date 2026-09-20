@@ -934,7 +934,7 @@ impl RoutedMetaBackend {
     /// path (create, link, rename's destination, the served step —
     /// Issue 6). An insert that parked on the stripe's guard behind the
     /// rmdir resumes to exactly one of the two shapes. The record is the
-    /// HOLDER's word ([`Self::key_parent_nlink`]).
+    /// HOLDER's word (`key_parent_nlink`).
     pub async fn refuse_dying_parent(&self, parent: Ino) -> Result<()> {
         match self.key_parent_nlink(parent).await? {
             Some(nlink) if nlink != 0 => Ok(()),

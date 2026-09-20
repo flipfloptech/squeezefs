@@ -1333,6 +1333,43 @@ bash still read a shifted tail after its 10/10 GREEN verdict
 (`line 9184: syntax error near unexpected token ')'`, exit 2 on a GREEN
 leg); a batch's harness is frozen for its whole run, reverts included.
 
+### 4.4ad Defect 35 — FIXED (PR 6 under PR 12b — defects 29/30's MID-PLAN arm): a LOCAL step's `SlotBusy` inside a cross-owner plan was a "device error" — the S3.5 lattice FAIL-STOPPED the initiator's volumes
+
+`sym-storm` round 4 from zero on `87461d56` (`pr13-batch13`; rounds 1–3
+GREEN — 30,857 / 11,507 / 17,682 acked, recoveries 16–46 s; `sym-crash`
+10/10 GREEN — the seventh from-zero 10/10): the round's explicit stripe
+flip on a joiner refused, its every op `Metadata volume 1 is disabled`,
+and the joiner's log: `cross-volume transaction … failed at step 1 of 3
+(forest slot 10 is leased by appender 7 (g 3) — a mutation of a foreign
+slot ships to its holder … EAGAIN) — … volume(s) [0, 1] are fail-stopped
+until then (crossvol_tx_midplan_escalations)`. The `--cross-owner`
+mover's rename into the manager's directory planned three steps; step
+1's destination slot read UNLEASED in the joiner's projection (the
+manager had released it — `slot 10 released by appender 0 (g 1)` a
+moment before — and appender 7 first-touched it at `g 3`), so the step
+was dispatched LOCALLY and the door's wire first touch lost; defect 29's
+classifier ("by the mode the step was DISPATCHED in") read a local
+failure as a device error, and the S3.5 lattice latched both volumes.
+Defect 30 covered the op-level arm (a create/unlink/link/rename whose
+FIRST commit hit the door) and defect 29 the SHIPPED step's; the local
+step INSIDE a plan was the third face. Fix: `apply_or_ship_step_
+retrying` re-dispatches a LOCAL step's slot-moved refusal exactly as a
+shipped one's (re-resolve → the step ships to the holder the door
+named; bounded), and `execute`'s classifier treats a slot-moved refusal
+as the RETRYABLE class whatever the dispatch mode (the door refused
+before any effect; the applied steps stand; the intent's roll-forward
+completes the plan) — the lattice guards device errors, never the plane
+moving a slot. Pin `sym_n_daemon_tests::a_local_steps_slot_busy_mid_
+plan_redispatches_and_never_fail_stops_the_initiator` (the joiner's
+rename from the manager's directory into one whose slot the manager
+first-touched after the projection loaded — RED: `EAGAIN` and
+`Metadata volume 0 is disabled` at the joiner; GREEN: the name lands at
+the manager after one step re-dispatch, `crossvol_tx_midplan_
+escalations` flat, the joiner still writes). The PAUSED phase's
+harness premise (§4.4ac) is narrowed once more: the holder's window is
+two half-`T_idle` buckets on an absolute clock (`HolderOps::total`), so
+the phase fits `T_idle / 2`.
+
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
 `sym-shared-dir-ls` on the defect-16 binary read `meta_kv_node_cache_

@@ -2084,6 +2084,116 @@ async fn a_locally_dispatched_create_whose_slot_the_manager_took_is_redispatched
     shutdown(&manager).await;
 }
 
+/// **Defect 35 (PR 13; PR 6 under PR 12b — defect 29/30's MID-PLAN arm)**
+/// — found by the fleet's `sym-storm` round 4 from zero on `7ac89d24`: a
+/// joiner's cross-owner plan (a rename into the manager's directory) had
+/// its step 1 dispatched LOCALLY — the destination's slot read UNLEASED in
+/// its projection — and the door's wire first touch lost to another
+/// appender (`forest slot 10 is leased by appender 7 (g 3)`); defect 29's
+/// classifier read the LOCAL dispatch as a device error and the S3.5
+/// lattice FAIL-STOPPED both volumes (`crossvol_tx_midplan_escalations`;
+/// every later op `Metadata volume 1 is disabled`, the round's explicit
+/// stripe flip refused). The door refuses before any effect, so a local
+/// step's `SlotBusy` is the slot-moved class exactly like a shipped
+/// step's: re-resolved and re-dispatched (it ships now), and past the
+/// bound the retryable class (the intent stays open) — never the lattice.
+/// Here: the joiner's projection reads the destination slot unleased, the
+/// manager first-touches it, the joiner renames across. RED before: the
+/// rename `EAGAIN` and BOTH volumes disabled at the joiner. GREEN: the
+/// rename lands at the manager after one step re-dispatch; nothing is
+/// disabled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_steps_slot_busy_mid_plan_redispatches_and_never_fail_stops_the_initiator() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "src"), (SLOT_B, "dst")]).await;
+    let (src, dst) = (dirs[0], dirs[1]);
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    // The manager holds the SOURCE (first touch) before the joiner reads
+    // tree 0; the destination stays unleased in the joiner's projection.
+    let files = create_files(&manager, src, "f", 1).await;
+    let f = files[0].1;
+    mvol.checkpoint_now()
+        .await
+        .expect("tree 0 names the source lease");
+    let j2 = join(&uris, &venue, &mvol, 2).await;
+    assert!(
+        matches!(
+            j2.volumes[0].slot_leases().unwrap().table.resolve(SLOT_A),
+            squeezefs::slot_lease_core::Resolved::Holder { holder: 0, .. }
+        ),
+        "the premise: the joiner knows the manager holds the source"
+    );
+    assert!(
+        matches!(
+            j2.volumes[0].slot_leases().unwrap().table.resolve(SLOT_B),
+            squeezefs::slot_lease_core::Resolved::Unleased { .. }
+        ),
+        "the premise: the destination reads unleased at the joiner"
+    );
+    // The manager first-touches the destination AFTER the joiner's
+    // projection was loaded.
+    let _ = create_files(&manager, dst, "m", 1).await;
+    let mvenue_ep = venue.endpoint();
+    j2.volumes[0]
+        .slot_leases()
+        .expect("armed")
+        .holders
+        .set_endpoint(0, &mvenue_ep);
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(&j2),
+            "node-j2",
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    let retries0 =
+        squeezefs::meta_backend::crossvol_tx::cross_owner_stats().step_slot_moved_retries;
+    let escalations0 = squeezefs::meta_backend::crossvol_tx::XV_MIDPLAN_ESCALATIONS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    j2.rename(src, &files[0].0, dst, "g", 0)
+        .await
+        .expect("the rename lands: its local step re-dispatches to the holder, never EAGAIN");
+    assert_eq!(
+        squeezefs::meta_backend::crossvol_tx::XV_MIDPLAN_ESCALATIONS
+            .load(std::sync::atomic::Ordering::Relaxed),
+        escalations0,
+        "no mid-plan escalation — the lattice never fires on a moved slot"
+    );
+    assert!(
+        squeezefs::meta_backend::crossvol_tx::cross_owner_stats().step_slot_moved_retries
+            > retries0,
+        "the local step was re-dispatched after the door's SlotBusy"
+    );
+    assert_eq!(
+        manager
+            .lookup_dentry_exact_unguarded(dst, "g")
+            .await
+            .expect("the holder reads its tree")
+            .map(|(i, _)| i),
+        Some(f),
+        "the name landed in the destination at its holder"
+    );
+    assert!(
+        manager
+            .lookup_dentry_exact_unguarded(src, &files[0].0)
+            .await
+            .expect("the holder reads its tree")
+            .is_none(),
+        "the source name is gone"
+    );
+    // Nothing fail-stopped: the joiner still writes.
+    j2.create(1, "alive", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("the joiner's volumes are not disabled");
+    shutdown(&j2).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
 /// **Defect 31 (PR 13; PR M6's pending-times drain under PR 4's slot
 /// leases)** — found beside defect 30 on the same fleet round: the
 /// manager's `kv pending-times drain failed … forest slot 474 is leased by

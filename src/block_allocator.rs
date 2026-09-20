@@ -1587,7 +1587,7 @@ impl BlockAllocator {
     }
 
     /// Does this mount hold the OWNERSHIP-accounting plane of this
-    /// allocator's volume — the question [`Self::plane_gate`]'s armed arm
+    /// allocator's volume — the question `plane_gate`'s armed arm
     /// asks, answered WITHOUT the gate's ERROR line (symmetric PR 13; the
     /// 2026-08-19 co-writer precedent made a joiner's shape): on a
     /// grant-armed allocator (PR 8's `install_block_grant_arm`) the plane

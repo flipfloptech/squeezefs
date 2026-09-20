@@ -4222,11 +4222,17 @@ leg_sym_foreign_touch() {
     # Attempt 12 from zero ran the three touches at the 10 s membership
     # beat (31 s > 15 s), and the tree moved at the 21 s touch by the rule
     # — a harness premise, not a product term. The touches are paced so
-    # the whole phase sits inside `T_idle` with margin.
+    # the whole phase sits inside the holder's window with margin — and
+    # the window the holder COUNTS over is two half-`T_idle` buckets on
+    # an absolute clock (`HolderOps::total` = the current + the previous
+    # bucket; `DominanceWindow::epoch`), so what it guarantees is
+    # `T_idle / 2`, not `T_idle`: attempt 13's 3 s beats fit 15 s and
+    # still moved the tree once the storm's bucket aged out under the
+    # third touch. The phase fits the HALF window.
     local t_idle_ms paused_beat_ms
     t_idle_ms="$(stat_field 0 membership_lease_ttl_ms)"
     [ -n "$t_idle_ms" ] && [ "$t_idle_ms" -gt 0 ] 2>/dev/null || t_idle_ms=45000
-    paused_beat_ms=$(((t_idle_ms - 3000) / (SYM_TOUCH_ROUNDS + 1)))
+    paused_beat_ms=$(((t_idle_ms / 2 - 2500) / (SYM_TOUCH_ROUNDS + 1)))
     [ "$paused_beat_ms" -lt "$beat_ms" ] || paused_beat_ms="$beat_ms"
     [ "$paused_beat_ms" -ge 1000 ] || die "sym-foreign-touch PAUSED: T_idle ${t_idle_ms} ms leaves no room for $SYM_TOUCH_ROUNDS touches (beat would be ${paused_beat_ms} ms) — fewer --touch-rounds or a longer --lease-ttl-ms"
     log "sym-foreign-touch PAUSED: T_idle=${t_idle_ms} ms, $SYM_TOUCH_ROUNDS touches at ${paused_beat_ms} ms (the phase inside the holder's window)"

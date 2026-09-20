@@ -44,8 +44,8 @@ use squeezefs::meta_backend::kv::node_cache::{
 };
 use squeezefs::meta_backend::kv::record::{inode_key, TREE_INODES};
 use squeezefs::meta_backend::kv::tree::{
-    test_smo_build_pause_release, KvTree, SmoContext, TEST_SMO_BUILD_PAUSED,
-    TEST_SMO_BUILD_PAUSE_TREE,
+    test_smo_build_pause_arm_slot, test_smo_build_pause_release, KvTree, SmoContext,
+    TEST_SMO_BUILD_PAUSED, TEST_SMO_BUILD_PAUSE_TREE,
 };
 use squeezefs::meta_backend::Metadata;
 use std::sync::atomic::Ordering;
@@ -455,15 +455,31 @@ async fn a_dropped_forced_compaction_leaves_the_node_freezable() {
         .await
         .expect("checkpoint the overwrites");
     let census = kv.dead_bset_census();
+    // Layout-blind (PR 13 review round 1, Issue 17): the tree the inode
+    // records live in through the ONE locator — the INODES tree on a flat
+    // volume, the slot tree that holds this ino on a forest (every slot
+    // tree carries header id 0, so the candidate is matched by id AND by
+    // the node's slot stamp) — and the seam armed by id or by SLOT.
+    let (inodes_tree, _) = kv
+        .record_locator(TREE_INODES, &inode_key(inos[0]))
+        .expect("locator")
+        .expect("the inode records' tree exists");
     let &(tree_id, addr) = census
         .candidates
         .iter()
-        .find(|(t, _)| *t == TREE_INODES)
+        .find(|&&(t, a)| {
+            t == inodes_tree.tree_id()
+                && kv.node_cache().try_get(a).map(|n| n.forest_slot())
+                    == Some(inodes_tree.forest_slot())
+        })
         .expect("an inode leaf with dead records (the setattr overwrites)");
 
     // Park the forced compaction in its build window, then DROP it (the
     // job-cancel / unwind shape).
-    TEST_SMO_BUILD_PAUSE_TREE.store(u64::from(tree_id), Ordering::SeqCst);
+    match inodes_tree.forest_slot() {
+        Some(slot) => test_smo_build_pause_arm_slot(slot),
+        None => TEST_SMO_BUILD_PAUSE_TREE.store(u64::from(tree_id), Ordering::SeqCst),
+    }
     let kv2 = Arc::clone(&kv);
     let handle = tokio::spawn(async move { kv2.defrag_compact_nodes(&[(tree_id, addr)]).await });
     let mut parked = false;

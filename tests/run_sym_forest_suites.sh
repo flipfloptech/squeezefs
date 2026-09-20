@@ -37,6 +37,12 @@
 # keeping its bit; a forest writer's `open` joins its appender regions,
 # and that join's barriered cycle IS the first post-mount durable
 # checkpoint, so the parked window is read off the counters there).
+# `kv_freeze_wedge_tests` (the W-B freeze-wedge contracts) joined the list
+# in PR 13's review round 1 (Issue 17): its forced-compaction probe picked
+# the census candidate by `tree_id == TREE_INODES`, a flat-only fact (every
+# slot tree carries header id 0), so it read red stamped with nobody
+# running it there. It resolves its tree through the ONE locator now and
+# arms the SMO seam by id or by SLOT like the crash-completeness pins.
 # `sym_slot_transfer_tests` (PR 4 — slot leases) rides the list the same
 # way as PR 2/3's suites: its armed fixtures stamp under the seam
 # themselves (`SQUEEZEFS_SYMMETRIC_META=1` on a bit-17 volume), and its
@@ -177,6 +183,7 @@ DEFAULT_SUITES=(
   meta_slot_migration_tests
   pv_coordinator_tests
   kv_smo_crash_completeness_tests
+  kv_freeze_wedge_tests
   sym_appender_tests
   sym_manager_tests
   sym_fence_tests

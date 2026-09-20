@@ -191,6 +191,12 @@ pub static TEST_XV_SERVE_MISDELIVER_ONCE: AtomicBool = AtomicBool::new(false);
 /// side (the intent stays open for the roll-forward cadence).
 pub static TEST_XV_SERVE_REFUSE: AtomicBool = AtomicBool::new(false);
 
+/// Test seam (the served side): the NEXT shipped step is refused
+/// `SlotBusy` at the holder's door BEFORE it commits — the slot moved
+/// between the initiator's plan and the apply (PR 13, defect 29) — then
+/// the seam clears. The initiator re-resolves and re-dispatches.
+pub static TEST_XV_SERVE_SLOT_BUSY_ONCE: AtomicBool = AtomicBool::new(false);
+
 /// Test seam: the grace window in ms after which an open intent no holder
 /// serves counts as STUCK (`0` = the derived window,
 /// [`stuck_grace_ms`]) — and after which a parked guard scope whose
@@ -267,6 +273,10 @@ static XV_CO_GUARD_RPCS: AtomicU64 = AtomicU64::new(0);
 /// holder view" (PR 13): the initiator re-resolved every key's slot at
 /// the manager and shipped again.
 static XV_CO_GUARD_STALE_RERESOLVES: AtomicU64 = AtomicU64::new(0);
+/// Shipped steps a holder refused `SlotBusy` (the slot moved between the
+/// plan and the apply) and the initiator re-resolved and re-dispatched
+/// (PR 13, defect 29; `xv_cross_owner_step_slot_moved_retries`).
+static XV_CO_STEP_SLOT_MOVED_RETRIES: AtomicU64 = AtomicU64::new(0);
 /// Guard scopes this holder parked for a remote initiator.
 static XV_CO_GUARDS_PARKED: AtomicU64 = AtomicU64::new(0);
 /// Parked scopes released by the lease-expiry sweep, not their initiator
@@ -510,6 +520,9 @@ pub struct CrossOwnerStats {
     /// `XvGuards` shipped (initiator side).
     pub guard_rpcs: u64,
     pub guard_stale_reresolves: u64,
+    /// PR 13 (defect 29): shipped steps re-dispatched after a holder's
+    /// `SlotBusy` (the slot moved between the plan and the apply).
+    pub step_slot_moved_retries: u64,
     /// Scopes parked for remote initiators (holder side).
     pub guards_parked: u64,
     /// **Must stay 0**: scopes the lease-expiry sweep released.
@@ -532,6 +545,7 @@ pub fn cross_owner_stats() -> CrossOwnerStats {
         dir_rename_parent_scans: DIR_RENAME_PARENT_SCANS.load(Ordering::Relaxed),
         guard_rpcs: XV_CO_GUARD_RPCS.load(Ordering::Relaxed),
         guard_stale_reresolves: XV_CO_GUARD_STALE_RERESOLVES.load(Ordering::Relaxed),
+        step_slot_moved_retries: XV_CO_STEP_SLOT_MOVED_RETRIES.load(Ordering::Relaxed),
         guards_parked: XV_CO_GUARDS_PARKED.load(Ordering::Relaxed),
         guard_expiries: XV_CO_GUARD_EXPIRIES.load(Ordering::Relaxed),
     }
@@ -575,6 +589,10 @@ pub fn cross_owner_stats_json() -> serde_json::Map<String, serde_json::Value> {
     out.insert(
         "xv_cross_owner_guard_stale_reresolves".into(),
         s.guard_stale_reresolves.into(),
+    );
+    out.insert(
+        "xv_cross_owner_step_slot_moved_retries".into(),
+        s.step_slot_moved_retries.into(),
     );
     out.insert(
         "xv_cross_owner_guards_parked".into(),
@@ -2308,17 +2326,70 @@ async fn apply_or_ship_step(
     }
 }
 
-/// Is `e` a SHIPPED step's failure (the holder unreachable, its session
-/// dead, its refusal) rather than a local device error? The armed plane
-/// leaves the intent open on the first class and fail-stops on the
-/// second — the S3.5 lattice latch protects the witnesses' premise
-/// against a local mid-plan device error, which a holder that is down
-/// does not violate.
-fn is_ship_failure(routed: &RoutedMetaBackend, v_idx: usize, local: &XvLocalStep) -> bool {
-    !matches!(
-        step_home(routed, v_idx, local.local_home()),
-        StepHome::Local
-    )
+/// [`apply_or_ship_step`] with the SLOT-MOVED retry (PR 13, defect 29 —
+/// found by the fleet's `sym-storm` round 1 from zero: a joiner's `rm -rf`
+/// of its recovered round directory shipped its removals to the manager,
+/// whose dominance rule handed the slot to the INITIATOR mid-plan; the
+/// manager's commit door then answered the shipped step `SlotBusy { slot,
+/// holder: the initiator }`, and the initiator — classifying the failure
+/// by re-resolving the step's home, which now read `Local` — took it for
+/// a local device error and FAIL-STOPPED both volumes). A holder's
+/// `SlotBusy` at a shipped step is defect 11's class at the STEP: the slot
+/// moved between the plan and the apply — re-resolve it at the manager
+/// and dispatch again, locally when it is ours now, to the new holder
+/// otherwise; bounded — a second stale answer is the retryable class
+/// the caller sees (the intent stays open, the cadence completes it).
+async fn apply_or_ship_step_retrying(
+    routed: &RoutedMetaBackend,
+    tx_id: u64,
+    step_idx: usize,
+    v_idx: usize,
+    step: &XvStep,
+    local: &XvLocalStep,
+    rider: Option<&XvRider>,
+    guards: Arc<[dlm::DlmGuard]>,
+) -> Result<XvStepOutcome> {
+    const SLOT_MOVED_RETRIES: usize = 2;
+    let mut attempt = 0;
+    loop {
+        let shipped = !matches!(
+            step_home(routed, v_idx, local.local_home()),
+            StepHome::Local
+        );
+        match apply_or_ship_step(
+            routed,
+            tx_id,
+            step_idx,
+            v_idx,
+            step,
+            local,
+            rider,
+            guards.clone(),
+        )
+        .await
+        {
+            Err(e) if shipped && is_slot_moved_refusal(&e) && attempt < SLOT_MOVED_RETRIES => {
+                attempt += 1;
+                XV_CO_STEP_SLOT_MOVED_RETRIES.fetch_add(1, Ordering::Relaxed);
+                let slot = crate::meta_backend::kv::record::forest_slot_of_ino(local.local_home());
+                let _ = routed.volumes[v_idx].reresolve_slot_holder(slot).await;
+                log::debug!(
+                    "cross-owner transaction {tx_id:016x}: step {step_idx} ({}) was refused at \
+                     its holder because the slot moved ({e}); re-resolved, attempt {attempt} of \
+                     {SLOT_MOVED_RETRIES}",
+                    step.name()
+                );
+            }
+            other => return other,
+        }
+    }
+}
+
+/// The refusal a shipped step earns at a holder whose commit door no
+/// longer leases the slot (`KvError::SlotBusy` — the EAGAIN class naming
+/// the lessee): the slot moved between the plan and the apply.
+fn is_slot_moved_refusal(e: &SqueezefsError) -> bool {
+    e.to_errno() == libc::EAGAIN && e.to_string().contains("is leased by appender")
 }
 
 /// The intent's key ino: `step0`'s slot's local 0 when step 0 is local
@@ -2465,7 +2536,7 @@ pub async fn execute(
                 step_home(routed, *v_idx, local.local_home()),
                 StepHome::Local
             );
-        match apply_or_ship_step(
+        match apply_or_ship_step_retrying(
             routed,
             tx_id,
             i,
@@ -2518,7 +2589,13 @@ pub async fn execute(
                     note_intent_never_durable(tx_id);
                     return Err(e);
                 }
-                if armed && is_ship_failure(routed, *v_idx, local) {
+                // Classified by the mode the step was DISPATCHED in
+                // (`local_step` read before the dispatch), never by
+                // re-resolving its home after the fact: a slot that moved
+                // to THIS initiator during the ship reads `Local` now, and
+                // the shipped refusal was taken for a local device error —
+                // the fail-stop (defect 29).
+                if armed && !local_step {
                     log::warn!(
                         "cross-owner transaction {tx_id:016x} ({:?}): step {i} of {} could not \
                          be shipped to its holder ({e}) — the intent stays open and the \
@@ -3072,7 +3149,15 @@ async fn recover_one(routed: &RoutedMetaBackend, o: &OpenIntent) -> Result<bool>
     note_intent_adopted(rec.tx_id);
 
     for (i, (v_idx, local)) in localised.iter().enumerate() {
-        let out = match apply_or_ship_step(
+        // The dispatch mode read BEFORE the dispatch (defect 29's law): a
+        // slot that moved to this mount during the ship reads `Local`
+        // after it, and the shipped refusal must never be taken for a
+        // local device error.
+        let shipped = !matches!(
+            step_home(routed, *v_idx, local.local_home()),
+            StepHome::Local
+        );
+        let out = match apply_or_ship_step_retrying(
             routed,
             rec.tx_id,
             i,
@@ -3085,7 +3170,7 @@ async fn recover_one(routed: &RoutedMetaBackend, o: &OpenIntent) -> Result<bool>
         .await
         {
             Ok(out) => out,
-            Err(e) if armed && is_ship_failure(routed, *v_idx, local) => {
+            Err(e) if armed && shipped => {
                 log::warn!(
                     "cross-owner transaction {:016x} ({:?}): step {i} could not be shipped to \
                      its holder ({e}) — left open for the next roll-forward",

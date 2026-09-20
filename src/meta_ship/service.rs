@@ -1464,6 +1464,18 @@ impl MetaShipService {
                         "TEST_XV_SERVE_REFUSE: the holder is down before its commit".to_string(),
                     ));
                 }
+                if crate::meta_backend::crossvol_tx::TEST_XV_SERVE_SLOT_BUSY_ONCE
+                    .swap(false, Ordering::SeqCst)
+                {
+                    // The door's own word for a slot that moved (the
+                    // `KvError::SlotBusy` text the initiator classifies).
+                    return Err(crate::meta_backend::kv::KvError::SlotBusy {
+                        slot: crate::meta_backend::kv::record::forest_slot_of_ino(step.home_ino()),
+                        holder: 0,
+                        g: 0,
+                    }
+                    .into());
+                }
                 if crate::meta_backend::crossvol_tx::TEST_XV_SERVE_SKIP_ONCE
                     .swap(false, Ordering::SeqCst)
                 {

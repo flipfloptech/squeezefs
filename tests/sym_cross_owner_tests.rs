@@ -34,7 +34,8 @@ use squeezefs::cluster_wire as cw;
 use squeezefs::data_grant::AsyncVerbRouter;
 use squeezefs::meta_backend::crossvol_tx::{
     self, cross_owner_stats, install_xv_shipper, uninstall_xv_shipper, TEST_XV_SEAM_AFTER_STEPS,
-    TEST_XV_SERVE_MISDELIVER_ONCE, TEST_XV_SERVE_REFUSE, TEST_XV_STUCK_AFTER_MS,
+    TEST_XV_SERVE_MISDELIVER_ONCE, TEST_XV_SERVE_REFUSE, TEST_XV_SERVE_SLOT_BUSY_ONCE,
+    TEST_XV_STUCK_AFTER_MS,
 };
 use squeezefs::meta_backend::kv::appender::TEST_APPENDER_SLOTS_ENV;
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
@@ -774,6 +775,74 @@ async fn a_holder_dying_after_commit_before_reply_is_recognized_exactly_once_by_
     );
     assert_eq!(open_intents(&routed).await, 0);
     assert_closed("holder restart");
+    holders.tear_down();
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
+/// **A shipped step refused `SlotBusy` at its holder is RE-DISPATCHED,
+/// never a mid-plan failure** (PR 13, defect 29 — found by the fleet's
+/// `sym-storm` round 1 from zero: a joiner's `rm -rf` of its recovered
+/// round directory shipped its removals to the manager, whose dominance
+/// rule handed the slot to the INITIATOR mid-plan; the manager's commit
+/// door answered the shipped step `SlotBusy { holder: the initiator }`,
+/// and the initiator — classifying the failure by re-resolving the step's
+/// home, which now read `Local` — took it for a local device error and
+/// FAIL-STOPPED both its volumes: `crossvol_tx_midplan_escalations`, every
+/// later op `Metadata volume 0 is disabled`). A holder's `SlotBusy` at a
+/// shipped step is the slot-moved class: re-resolved at the manager and
+/// dispatched again — the op completes (`xv_cross_owner_step_slot_moved_
+/// retries` +1), nothing escalates, no intent stays open. RED before: the
+/// op failed EAGAIN with its intent left open (this fixture's home does not
+/// move, so the base classified it as a ship failure — on the fleet the
+/// same refusal was the fail-stop).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shipped_step_refused_slot_busy_at_its_holder_is_redispatched() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    let before = cross_owner_stats();
+    let escalations0 = crossvol_tx::XV_MIDPLAN_ESCALATIONS.load(Ordering::Relaxed);
+    TEST_XV_SERVE_SLOT_BUSY_ONCE.store(true, Ordering::SeqCst);
+    let ino = routed
+        .create(shared, "moved-under-me", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("the op completes: the refused step was re-dispatched (RED: EAGAIN)")
+        .ino;
+    assert!(
+        !TEST_XV_SERVE_SLOT_BUSY_ONCE.load(Ordering::SeqCst),
+        "the seam fired once"
+    );
+    assert!(
+        !routed.disabled_volumes.contains_key(&0) && !routed.disabled_volumes.contains_key(&1),
+        "nothing fail-stopped"
+    );
+    assert_eq!(
+        crossvol_tx::XV_MIDPLAN_ESCALATIONS.load(Ordering::Relaxed),
+        escalations0,
+        "no mid-plan escalation"
+    );
+    let after = cross_owner_stats();
+    assert_eq!(
+        after.step_slot_moved_retries - before.step_slot_moved_retries,
+        1,
+        "one slot-moved re-dispatch"
+    );
+    assert_eq!(
+        after.steps_shipped - before.steps_shipped,
+        2,
+        "the step travelled twice: the refused ship and the re-dispatch"
+    );
+    assert_eq!(open_intents(&routed).await, 0, "no intent left open");
+    assert_eq!(
+        lookup_opt(&routed, shared, "moved-under-me").await,
+        Some(ino),
+        "the name landed at the holder"
+    );
+    assert_closed("slot moved under a shipped step");
     holders.tear_down();
     shutdown(&routed).await;
     fsck_clean(&uris).await;

@@ -3106,9 +3106,19 @@ impl RoutedMetaBackend {
         // the fold over its stripes (each stripe's record is the exact
         // delta its own inserts wrote); the persist runs after the shared
         // guard dropped — it takes the exclusive one.
-        if inode.mode & libc::S_IFMT == libc::S_IFDIR && self.volumes[v_idx].striping_plane_armed()
-        {
-            if let Some(map) = self.stripe_map(ino).await? {
+        if inode.mode & libc::S_IFMT == libc::S_IFDIR {
+            // A writer reads the map (its own tree, or a token read it
+            // pays anyway); a TOKEN READER folds only over a map it
+            // already knows — its `readdir` / `lookup` learn it — so a
+            // `stat`-only reader pays one grant per directory, not two.
+            let map = if self.volumes[v_idx].slot_lease_armed() {
+                self.stripe_map(ino).await?
+            } else if self.volumes[v_idx].striping_plane_armed() {
+                self.stripe_map_cached(ino)
+            } else {
+                None
+            };
+            if let Some(map) = map {
                 if let Some((mtime, ctime)) = self.fold_striped_attrs(&mut inode, &map).await? {
                     self.persist_striped_times(ino, mtime, ctime).await;
                 }

@@ -690,6 +690,16 @@ impl RoutedMetaBackend {
         Ok(Some(map))
     }
 
+    /// The map of `dir` as this mount already KNOWS it — the cache alone,
+    /// no read (PR 13: a TOKEN READER's `stat D` folds over the stripes
+    /// only once its own `readdir` / `lookup` — which fetch `D`'s dentry
+    /// token anyway — learnt the map; a marker probe at every `getattr` of
+    /// a directory cost a `stat`-only reader a second grant per directory,
+    /// `sym_mount_posture_tests`' "one grant from B").
+    pub fn stripe_map_cached(&self, dir: Ino) -> Option<Arc<StripeMap>> {
+        self.dir_stripes.maps.read_sync(&dir, |_, m| Arc::clone(m))
+    }
+
     /// The map as `dir`'s markers name it — `None` = not striped (no
     /// commit marker, a commit marker naming anything but stripe 0, or
     /// fewer than two entries: a torn or planted map is never guessed

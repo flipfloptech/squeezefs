@@ -13328,6 +13328,10 @@ impl SqueezefsFilesystem {
                     load(&meta_kv::META_KV_FLUSH_FLOOR_KEPT),
                 );
                 metrics.insert(
+                    "meta_kv_projection_root_refreshes".into(),
+                    load(&meta_kv::META_KV_PROJECTION_ROOT_REFRESHES),
+                );
+                metrics.insert(
                     "meta_kv_node_append_bytes".into(),
                     load(&meta_kv::META_KV_NODE_APPEND_BYTES),
                 );

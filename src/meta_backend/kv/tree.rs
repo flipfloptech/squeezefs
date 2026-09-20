@@ -69,6 +69,11 @@ pub const KEY_SPACE_MAX: [u8; 32] = [0xFF; 32];
 /// Bounded traversal / writer-retry budget: SMOs are rare and serialized,
 /// so more than a handful of retries means a routing bug, failed loud.
 const RETRY_BUDGET: usize = 256;
+/// Root-pointer restarts of a PROJECTION tree between two projection
+/// refreshes (PR 13): a handful — enough for a racing SMO's swap window
+/// to close on its own (the shipped restart law), small against the
+/// budget so a recycled root is re-adopted long before it is exhausted.
+const PROJECTION_REFRESH_EVERY: u32 = 8;
 
 /// Test seam (docs/design-smo-replay-currency.md §6 PR 1; the
 /// `TEST_CONVEYOR_POISON_APPLY_INO` precedent): arm with a tree id
@@ -1123,6 +1128,31 @@ impl KvTree {
         // the next one self-describing instead of a heisenbug hunt.
         let mut dbg_reasons: [u32; 5] = [0; 5];
         'restart: for attempt in 0..RETRY_BUDGET {
+            // A ROOT-pointer restart on a tree this mount does not WRITE
+            // (PR 13): the root a projection stands on can name an image
+            // that is GONE — the manager compacted the tree and freed the
+            // old root's extent, which was then re-granted (this
+            // appender's own barrier dropped the stale image and its mint
+            // wrote there; or a peer's write landed on the device) — and a
+            // restart against that pointer never converges: the root is
+            // re-read from `self.root()`, which only a projection refresh
+            // moves. So after the first few root restarts the installed
+            // refresh re-adopts the manager's newest root (its ledger
+            // record — the free of the old extent needed the checkpoint
+            // that named the new root), and the walk restarts on it. The
+            // writer's own trees never take this arm (their root is live).
+            let root_restarts = dbg_reasons[0] + dbg_reasons[1];
+            if root_restarts > 0 && root_restarts % PROJECTION_REFRESH_EVERY == 0 {
+                if let Some(hook) = self
+                    .cache
+                    .projection_refresh()
+                    .filter(|_| self.cache.is_projection(self.forest_slot))
+                {
+                    if hook.refresh().await {
+                        super::META_KV_PROJECTION_ROOT_REFRESHES.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
             if attempt > 0 {
                 // Cooperative restart: every reason to be here is a racing
                 // SMO's swap window (retired extent / stale seq / routing
@@ -1189,11 +1219,21 @@ impl KvTree {
                 cur = child;
             }
         }
+        let root = self.root();
         Err(KvError::Corrupt(format!(
-            "traversal retry budget exhausted descending to level {target_level} \
-             (routing loop — SMO protocol bug) restarts \
+            "tree {} (slot {:?}, root {:#x}@{}{}): traversal retry budget exhausted descending \
+             to level {target_level} (routing loop — SMO protocol bug) restarts \
              [root-retired, root-seq, routing-hole, child-retired, child-seq] \
-             = {dbg_reasons:?}"
+             = {dbg_reasons:?}",
+            self.tree_id,
+            self.forest_slot,
+            root.addr,
+            root.seq,
+            if self.cache.is_projection(self.forest_slot) {
+                ", a PROJECTION here"
+            } else {
+                ""
+            }
         )))
     }
 

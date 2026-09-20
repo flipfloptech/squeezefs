@@ -355,6 +355,16 @@ pub static META_KV_NODE_FREEZE_SHADOW_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// `meta_kv_flush_floor_kept`.
 pub static META_KV_FLUSH_FLOOR_KEPT: AtomicU64 = AtomicU64::new(0);
 
+/// Traversals of a PROJECTION tree (tree 0 / the manager's native tree on
+/// a JOINED appender) whose root pointer named a recycled image — the
+/// manager compacted the tree and its old root's extent was re-granted —
+/// that re-adopted the manager's newest root through the installed
+/// projection refresh instead of exhausting the restart budget (PR 13,
+/// the `sym-scale` N = 8 row: `restarts [root-seq] = 256`, EIO on the
+/// user op). Surfaced as `meta_kv_projection_root_refreshes`; 0 on the
+/// manager and every flat mount.
+pub static META_KV_PROJECTION_ROOT_REFRESHES: AtomicU64 = AtomicU64::new(0);
+
 /// Bytes of those appended frames (4 KiB-padded) — the second half of the
 /// §8 row 7 "node writeback counters" accounting. Surfaced as
 /// `meta_kv_node_append_bytes` in PR K7.

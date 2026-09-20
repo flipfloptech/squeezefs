@@ -4619,8 +4619,16 @@ impl KvMetaBackend {
         let Some(member) = plane.holders.member_id(holder) else {
             return true;
         };
+        // Three-valued (PR 13): a member the owner does not list YET — a
+        // successor inside its re-assertion window — is UNKNOWN and dialed
+        // (one bounded dial), never refused as dead: the round-4 oracle
+        // read every joiner's file through a fresh successor as
+        // `EAGAIN` "lists DEAD" for the window's length.
         match crate::membership::installed_owner() {
-            Some(owner) => owner.member_is_live(&member),
+            Some(owner) => !matches!(
+                owner.member_liveness(&member),
+                crate::membership::MemberLiveness::Dead
+            ),
             None => true,
         }
     }
@@ -13305,12 +13313,20 @@ impl KvMetaBackend {
                 .iter()
                 .map(|(n, _)| String::from_utf8_lossy(n).into_owned())
                 .collect();
-            out.extend(
-                self.listxattr_local(ino)
-                    .await?
-                    .into_iter()
-                    .filter(|n| !crate::meta_ship::token_plane::token_carried_xattr(n)),
-            );
+            // The control class lives on the CONTROL inode alone (ino 1 —
+            // and its slot-0 guest keyspace after a migration): only its
+            // listing pays the local read. Every other object's listing is
+            // its token's, so a reader's `ls -l` (`getxattr` of the ACL
+            // names → `listxattr` on some builds) reads no projection leaf
+            // per file — gate 3b's `-ls` law (K + C tokens, 0 leaf reads).
+            if ino == 1 || ino == crate::meta_backend::guest_local_ino(0, 1) {
+                out.extend(
+                    self.listxattr_local(ino)
+                        .await?
+                        .into_iter()
+                        .filter(|n| !crate::meta_ship::token_plane::token_carried_xattr(n)),
+                );
+            }
             return Ok(out);
         }
         self.listxattr_local(ino).await

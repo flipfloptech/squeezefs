@@ -1200,6 +1200,54 @@ fn owner_failover_opens_a_grace_window_admitting_only_reclaim() {
     assert!(!owner2.grace_active(), "the grace window is bounded");
 }
 
+/// **A successor's liveness word is THREE-valued** (PR 13 — found by the
+/// fleet's `sym-crash` leg, round 4): right after the manager's remount
+/// the acked-writes oracle read every joined writer's file through the
+/// SUCCESSOR and lost 1,318 of 1,318 — its census was EMPTY inside the
+/// re-assertion window, `member_is_live` read every live joiner as DEAD,
+/// and the writer's read divert refused each object `EAGAIN` "leased to
+/// an appender the membership owner lists DEAD" until the joiners'
+/// renewals landed. `member_liveness` says `Unknown` of a member the
+/// successor has not heard from while its window is open (the reader
+/// dials it — one bounded dial), `Dead` of one listed past its deadline,
+/// departed here, or absent with the window closed, `Live` inside its
+/// deadline; `member_is_live` keeps the `RecordDeath` screen's word ("not
+/// listed" proves nothing).
+#[test]
+fn a_successors_liveness_word_is_unknown_inside_its_reassertion_window() {
+    use squeezefs::membership::MemberLiveness;
+    let _serial = serial();
+    let (clock, ticks) = manual_clock();
+    let clocks = shipped_clocks();
+    let owner = owner_with(clocks.clone(), clock.clone(), 21);
+    owner.open_grace(vec!["m-1".to_string()]);
+    assert!(owner.reassertion_open());
+    // Not heard from yet, window open: UNKNOWN — never dead.
+    assert_eq!(owner.member_liveness("j-60"), MemberLiveness::Unknown);
+    assert!(
+        !owner.member_is_live("j-60"),
+        "the RecordDeath screen's word stays: not listed proves nothing"
+    );
+    // Listed inside its deadline: LIVE.
+    let mut r = join_req("j-60", MemberRole::Writer, None);
+    r.prior_epoch = Some(3);
+    let g = granted(owner.join(r));
+    assert_eq!(owner.member_liveness("j-60"), MemberLiveness::Live);
+    assert!(owner.member_is_live("j-60"));
+    // A clean leave: DEAD (the departed memo), whatever the window says.
+    assert!(owner.leave("j-60"));
+    assert_eq!(owner.member_liveness("j-60"), MemberLiveness::Dead);
+    // The window closes at its deadline: an absent member is DEAD then.
+    assert_eq!(owner.member_liveness("never-seen"), MemberLiveness::Unknown);
+    ticks.store(
+        clock.now_ms() + clocks.grace.as_millis() as u64 + 1,
+        Ordering::SeqCst,
+    );
+    assert!(!owner.reassertion_open());
+    assert_eq!(owner.member_liveness("never-seen"), MemberLiveness::Dead);
+    let _ = g;
+}
+
 /// PR 12b review round 2, Issue 26 — the `sym-crash` acceptance tape's
 /// reader SELF-FENCED at the third manager failover: the successor's
 /// window awaits the DURABLE roster (the claim set's writers), so the

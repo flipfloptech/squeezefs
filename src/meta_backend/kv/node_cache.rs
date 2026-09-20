@@ -2582,6 +2582,26 @@ pub struct NodeCache {
     /// mount with no lease plane (the manager's `(0, 0)` stamp, rule 3
     /// alone at loads).
     frame_fence: OnceLock<Arc<dyn FrameFenceSource>>,
+    /// **The PROJECTION refresh a JOINED appender installs** (PR 13): the
+    /// act a traversal of a tree this mount does not WRITE (tree 0, the
+    /// manager's native slot tree) runs when its root pointer names an
+    /// image that is gone — the manager compacted the tree, freed the old
+    /// root's extent, and the extent was RE-GRANTED (to this appender,
+    /// whose granted-extent barrier dropped the stale image and whose next
+    /// mint wrote there; or to a peer whose write landed on the device):
+    /// the projection's root pointer is stale, and a restart loop against
+    /// it never converges. `None` on the manager and every flat mount.
+    projection_refresh: OnceLock<Arc<dyn ProjectionRefresh>>,
+}
+
+/// A joined appender's projection refresh (PR 13 — see
+/// [`NodeCache::install_projection_refresh`]): re-adopt the manager's
+/// tree 0 / native root from its newest ledger record. `true` = the
+/// projection advanced (the traversal's next restart reads a new root).
+pub trait ProjectionRefresh: Send + Sync {
+    fn refresh<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
 }
 
 /// The lease plane's answers for the §5.8.2 frame screen and the frame
@@ -2634,7 +2654,38 @@ impl NodeCache {
             slot_tails: ArcSwap::from_pointee(std::collections::BTreeMap::new()),
             slot_frontiers: scc::HashMap::new(),
             frame_fence: OnceLock::new(),
+            projection_refresh: OnceLock::new(),
         })
+    }
+
+    /// Install the projection refresh (a JOINED appender's arm, once;
+    /// PR 13). Consulted by [`super::tree::KvTree`]'s traversal alone, on
+    /// a root-pointer restart of a tree this mount does not write.
+    pub fn install_projection_refresh(&self, hook: Arc<dyn ProjectionRefresh>) -> bool {
+        self.projection_refresh.set(hook).is_ok()
+    }
+
+    /// The installed projection refresh, if any.
+    pub fn projection_refresh(&self) -> Option<&Arc<dyn ProjectionRefresh>> {
+        self.projection_refresh.get()
+    }
+
+    /// Is `slot`'s tree (`None` = tree 0 / a flat tree) a PROJECTION on
+    /// this mount — a tree another appender writes, held here at the root
+    /// this mount last adopted? `false` on every unarmed mount and on the
+    /// manager for tree 0 and every unleased tree (its own to maintain).
+    pub fn is_projection(&self, slot: Option<super::record::ForestSlot>) -> bool {
+        if !self.lease.is_armed() {
+            return false;
+        }
+        match slot {
+            None => !self.lease.is_manager(),
+            Some(s) => !matches!(
+                self.lease.verdict_structural(s),
+                crate::slot_lease_core::CommitVerdict::Allowed
+                    | crate::slot_lease_core::CommitVerdict::Unarmed
+            ),
+        }
     }
 
     /// Install the §5.8.2 frame-fence source (the symmetric plane's arm;

@@ -1620,6 +1620,19 @@ struct DepartedKey {
     departed_ms: u64,
 }
 
+/// What an owner knows of a member's liveness ([`MembershipOwner::member_liveness`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberLiveness {
+    /// Listed, inside its lease deadline.
+    Live,
+    /// Listed past its deadline, departed here, or absent with the
+    /// re-assertion window closed.
+    Dead,
+    /// Not listed while the successor's re-assertion window is open — it
+    /// may re-assert any beat now.
+    Unknown,
+}
+
 impl std::fmt::Debug for MembershipOwner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MembershipOwner")
@@ -2185,6 +2198,48 @@ impl MembershipOwner {
         self.members
             .read_sync(id, |_, st| now < st.deadline_ms)
             .unwrap_or(false)
+    }
+
+    /// **The three-valued liveness of `id`** (PR 13 — found by the fleet's
+    /// `sym-crash` leg, round 4: the acked-writes oracle read every joined
+    /// writer's file through the SUCCESSOR right after its remount and lost
+    /// 1,318 of 1,318 — the successor's census was EMPTY inside its
+    /// re-assertion window, `member_is_live` read every live joiner as
+    /// dead, and the writer's read divert refused each object `EAGAIN`
+    /// "leased to an appender the membership owner lists DEAD"). A member
+    /// this owner LISTS is `Live` inside its deadline and `Dead` past it;
+    /// one it does not list is `Dead` when it DEPARTED here (the departed
+    /// memo — an eviction or a clean leave inside the retention) or when
+    /// the re-assertion window is CLOSED (the durable roster's members
+    /// re-asserted or were recorded dead at the deadline), and `Unknown`
+    /// while the window is open — a successor has not heard from it YET.
+    /// `member_is_live` stays the `RecordDeath` screen's word (a peer's
+    /// death word never overrules a member held LIVE; "not listed" proves
+    /// nothing there); the liveness DECISIONS (a redirect to a lessee, a
+    /// dial) read this one and treat `Unknown` as live.
+    pub fn member_liveness(&self, id: &str) -> MemberLiveness {
+        let now = self.clock.now_ms();
+        if let Some(live) = self.members.read_sync(id, |_, st| now < st.deadline_ms) {
+            return if live {
+                MemberLiveness::Live
+            } else {
+                MemberLiveness::Dead
+            };
+        }
+        let retention = self.departed_key_retention_ms();
+        let departed = self
+            .departed_keys
+            .lock()
+            .iter()
+            .any(|d| d.id == id && now.saturating_sub(d.departed_ms) <= retention);
+        if departed {
+            return MemberLiveness::Dead;
+        }
+        if self.reassertion_open() {
+            MemberLiveness::Unknown
+        } else {
+            MemberLiveness::Dead
+        }
     }
 
     /// **§6.8 item 3's reallocation bound**: the minimum freed-offset epoch

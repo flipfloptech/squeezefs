@@ -28,7 +28,7 @@ use super::{KvMetaBackend, OpenPosture, ReadOnlyCause};
 use crate::meta_ship::manager::{ManagerClient, ManagerReply, WireSlotGrant};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 /// What a non-manager RW mount needs to open one volume as a JOINED
 /// appender — decided by the join ladder off DURABLE state
@@ -491,6 +491,43 @@ pub(super) async fn wire_extent_refill(
         wire.extent_grants.fetch_add(1, Ordering::Relaxed);
     }
     Ok(got)
+}
+
+/// The joined appender's projection refresh for the node cache's
+/// traversal (PR 13): `refresh_control_projection` behind the SMO mutex's
+/// `try_lock` — a holder of the mutex on a joiner that reaches tree 0 is
+/// a refresh already in flight (the checkpoint cycle's F3 re-dial or a
+/// divert's), whose new root the caller's next restart reads; the flush
+/// pass never traverses a projection. Never blocks a traversal behind
+/// the mutex.
+struct JoinedProjectionRefresh {
+    be: Weak<KvMetaBackend>,
+}
+
+impl super::super::node_cache::ProjectionRefresh for JoinedProjectionRefresh {
+    fn refresh<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(be) = self.be.upgrade() else {
+                return false;
+            };
+            if be.smo.try_lock().is_err() {
+                return false;
+            }
+            match be.refresh_control_projection().await {
+                Ok(moved) => moved,
+                Err(e) => {
+                    log::debug!(
+                        "meta volume {}: projection refresh from a traversal restart failed \
+                         ({e}) — the restart budget stands",
+                        be.path.display()
+                    );
+                    false
+                }
+            }
+        })
+    }
 }
 
 impl KvMetaBackend {
@@ -1252,7 +1289,13 @@ impl KvMetaBackend {
         // its slots and recalls them before its conflicting commits).
         if let Ok(weak) = self.conveyor_identity() {
             self.cache
-                .install_frame_fence(Arc::new(super::SlotFrameFence { be: weak }));
+                .install_frame_fence(Arc::new(super::SlotFrameFence { be: weak.clone() }));
+            // PR 13: a traversal of a PROJECTION tree whose root pointer
+            // names a recycled image re-adopts the manager's newest root
+            // (`KvTree::descend`'s root-restart arm) instead of exhausting
+            // its restart budget.
+            self.cache
+                .install_projection_refresh(Arc::new(JoinedProjectionRefresh { be: weak }));
         }
         self.arm_token_holder();
         plane.gate.arm();

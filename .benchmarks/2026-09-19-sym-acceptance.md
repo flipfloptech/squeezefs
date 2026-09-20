@@ -565,6 +565,93 @@ its token cached), the holder flips root to 4 stripes and migrates, 7
 more names land, the flip's inserts recall the token; the reader's next
 listing is the exact 19-name merge and every name resolves.
 
+### 4.4k Defect 18 — FIXED (PR 12b's projection on PR 13's granted-extent barrier): a joined appender's PROJECTION tree spun its whole restart budget on a RECYCLED root — `restarts [root-seq] = 256`, EIO on the user op
+
+Found by `sym-scale` N = 8 on the defect-17 binary (attempt 3 — attempts
+1/2 passed N = 8: a race): joiner m63 (appender 4, joined 11 s earlier)
+read `traversal retry budget exhausted descending to level 0 (routing
+loop — SMO protocol bug) restarts [root-retired, root-seq, routing-hole,
+child-retired, child-seq] = [0, 256, 0, 0, 0]` twice on user ops one
+second after `joined appender 4 dropped 1 stale projection node(s)
+inside a fresh extent grant` ×3, and its create storm died. The shape: a
+joiner holds tree 0 (and the manager's native slot tree) as a PROJECTION
+— a `KvTree` whose root pointer is the one it adopted at open or at its
+last `refresh_control_projection` (keyed on the ledger seq, run at the
+cadence and at F3's re-dials). The manager compacts the tree (a root
+swap), frees the old root's extent at the covering checkpoint, and the
+free extent is RE-GRANTED — here to m63 itself, whose granted-extent
+barrier (defect 3's `drop_nodes_in_extents`) dropped the stale image and
+whose next mint wrote a fresh node there (a peer's write landing on the
+device is the same shape). The image under the projection's root address
+now carries ANOTHER node's seq, and `KvTree::descend` — which re-reads the
+root from the tree's own pointer at every restart — exhausts its budget
+on `root-seq`: nothing between restarts moves a projection's root. Before
+the barrier the stale image was served (a bounded-staleness read, the S5
+law); the barrier turned it into a loop. Fix: `NodeCache::install_
+projection_refresh` (a JOINED appender installs `refresh_control_
+projection` behind the SMO mutex's `try_lock` — a holder of the mutex
+on a joiner that reaches tree 0 is a refresh already in flight, whose
+root the next restart reads; the flush pass never traverses a
+projection), and `descend` runs it every `PROJECTION_REFRESH_EVERY` = 8
+root-pointer restarts of a tree this mount does not WRITE
+(`NodeCache::is_projection`: tree 0 on a non-manager, a slot tree whose
+structural verdict is not this mount's) — the walk restarts on the root
+it installs (the ledger record that named the new root is the
+checkpoint whose coverage freed the old extent). A writer's own trees
+never take the arm (their root is live; a loop there IS the SMO protocol
+bug the budget names); the exhaustion error now names the tree, its
+slot, the root pointer and "a PROJECTION here". Gauge `meta_kv_
+projection_root_refreshes` (0 on the manager and every flat mount). Pins
+(new suite `tests/sym_projection_refresh_tests.rs`, tree-level and
+deterministic where the fleet's race is not): the recycled-root shape
+stood by hand (a projection-posture cache, tree A's root image dropped by
+the barrier, its extent released and re-claimed by tree B under a fresh
+seq) exhausts the budget with no refresh installed and names the shape;
+follows B's root through the installed refresh (one refresh, the gauge
++1, the next lookup restarts nothing) — RED-first against the base
+traversal (`if false &&` on the arm: the budget exhausted); a writer's
+own tree never consults the hook.
+
+### 4.4l Defect 19 — FIXED (PR 12b's F2 liveness word): a fresh SUCCESSOR read every live joiner as DEAD inside its re-assertion window — the acked-writes oracle lost 1,318 of 1,318
+
+`sym-crash` round 4 (rounds 1–3 GREEN): right after the manager's
+`kill -9` + remount the oracle read every joined writer's acked file
+through the SUCCESSOR and every read was refused `EAGAIN` — `object …'s
+slot is leased to appender 4, which the membership owner lists DEAD —
+its slots are the recovery's within the ledger poll` — for every joiner,
+1,318 of 1,318 "lost". The successor's S6 census is EMPTY until the
+joiners' renewals re-assert (a beat, up to 4.3 s here), and
+`foreign_slot_holder_live` read `MembershipOwner::member_is_live` — the
+`RecordDeath` screen's word, where "not listed" is `false` on purpose
+(a peer's death word never overrules a member held LIVE; an unknown
+member proves nothing). Rounds 1–3 read after the beat landed. Fix:
+`MembershipOwner::member_liveness` — THREE-valued: `Live` inside its
+deadline, `Dead` past it / departed here (the departed memo, inside its
+retention) / absent with the re-assertion window CLOSED (the durable
+roster re-asserted or was recorded dead at the deadline), `Unknown` while
+the window is open (the successor has not heard from it YET) — and the
+F2 predicate refuses only `Dead`: an `Unknown` lessee is dialed once
+(bounded; the manager's word if the dial fails), never refused. Pin:
+`dlm_membership_tests::a_successors_liveness_word_is_unknown_inside_its_
+reassertion_window` (a successor with its window open: an unheard-of
+member `Unknown` while `member_is_live` stays `false`; a joined one
+`Live`; after its clean leave `Dead`; past the deadline an absent one
+`Dead`). The fleet round was the RED.
+
+### 4.4m Defect 16's regression, caught by the same batch and narrowed
+
+`sym-shared-dir-ls` on the defect-16 binary read `meta_kv_node_cache_
+misses = 1,219` on the reader against the law's `dropped + 8 × epochs +
+K = 324` — "a DATA leaf was read for the listing". `ls -l` probes the
+ACL names per file (`getxattr` / `listxattr` of `system.posix_acl_*`),
+and defect 16's fix read the CONTROL names off the reader's projection
+at EVERY `listxattr` — one projection leaf per listed file. The control
+class lives on ino 1 alone (and its slot-0 guest keyspace after a
+migration): the merge is now confined to those inos; every other
+object's listing is its token's, no leaf read. The failover pin's second
+half (ino 1) stands; the `-ls` law is judged again in the from-zero
+batch.
+
 ### 4.4f Harness — `sym-foreign-touch` LIVE's storm died at launch
 
 On the defect-10 binary the LIVE phase read `slot_handovers` 1 "a live

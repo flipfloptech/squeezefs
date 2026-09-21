@@ -347,6 +347,16 @@ pub fn test_disable_cross_owner_precheck(on: bool) {
 pub static FOREIGN_FILE_MUTATION_REFUSALS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// The kernel's SETATTR times ECHO on a FOREIGN-slot file (a read's
+/// `write_inode` — `FATTR_MTIME|FATTR_CTIME` carrying the times the kernel
+/// got from us; PR M6's absorber class) answered from the holder's exact
+/// record with nothing refused and nothing refined here — the fix-round
+/// storm's oracle read 14 k foreign files per round at the manager and
+/// every echo counted as a refused mutation. Stats
+/// `foreign_file_times_echo_absorbed`.
+pub static FOREIGN_FILE_TIMES_ECHO_ABSORBED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// The **offline-bracket probes** every writable mount runs on the slot-0
 /// volume before it serves: `mw_upgrade:` (KD-MW-1 §6.2 mechanism i) and
 /// its sibling `owner_assign:` (per-volume claim admission §5.2.1 / sweep
@@ -1790,19 +1800,33 @@ impl RoutedMetaBackend {
     /// and inside a served verb (this mount IS the holder there). Counted
     /// on `foreign_file_mutation_refusals`.
     pub fn refuse_foreign_slot_file_mutation(&self, ino: Ino, what: &str) -> Result<()> {
-        let (v_idx, local) = self.route_ino(ino);
-        let Some(vol) = self.volumes.get(v_idx) else {
-            return Ok(());
-        };
-        if !vol.slot_lease_armed() || crate::meta_ship::executing_for_ship_client() {
-            return Ok(());
+        match self.foreign_slot_file_mutation_refusal(ino, what) {
+            None => Ok(()),
+            Some(e) => {
+                FOREIGN_FILE_MUTATION_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(e)
+            }
         }
-        let Some(holder) = crossvol_tx::foreign_holder_of(self, v_idx, local) else {
-            return Ok(());
-        };
+    }
+
+    /// [`Self::refuse_foreign_slot_file_mutation`]'s verdict WITHOUT the
+    /// count — `Some(the refusal)` for a foreign-slot object on an armed
+    /// volume outside a served verb, `None` otherwise. The `setattr` entry
+    /// reads it first so the kernel's times ECHO can be absorbed instead
+    /// of counted.
+    fn foreign_slot_file_mutation_refusal(
+        &self,
+        ino: Ino,
+        what: &str,
+    ) -> Option<crate::error::SqueezefsError> {
+        let (v_idx, local) = self.route_ino(ino);
+        let vol = self.volumes.get(v_idx)?;
+        if !vol.slot_lease_armed() || crate::meta_ship::executing_for_ship_client() {
+            return None;
+        }
+        let holder = crossvol_tx::foreign_holder_of(self, v_idx, local)?;
         let slot = kv::record::forest_slot_of_ino(local);
-        FOREIGN_FILE_MUTATION_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Err(crate::error::SqueezefsError::foreign_slot_file_mutation(
+        Some(crate::error::SqueezefsError::foreign_slot_file_mutation(
             format!(
                 "{what} of ino {ino}: its record lives in forest slot {slot} of metadata volume \
              {v_idx}, which appender {} leases at g {} — this mount (appender {}) does not; \
@@ -1813,6 +1837,41 @@ impl RoutedMetaBackend {
                 vol.own_appender_id()
             ),
         ))
+    }
+
+    /// The `setattr` entry's foreign-slot gate: the kernel's times ECHO
+    /// (PR M6's absorber class — mtime none-or-unchanged, a ctime, nothing
+    /// else) on a foreign-slot file is ABSORBED against the holder's exact
+    /// record (one divert read) with nothing refused and nothing refined
+    /// here (the record's µs polish is its holder's); every other
+    /// foreign-slot setattr is the loud typed refusal (`Err`).
+    /// `Ok(None)` = not a foreign-slot object — proceed.
+    #[allow(clippy::too_many_arguments)] // the trait's parameter surface
+    async fn foreign_slot_setattr_gate(
+        &self,
+        ino: Ino,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+        ctime: Option<u64>,
+    ) -> Result<Option<Inode>> {
+        let Some(refusal) = self.foreign_slot_file_mutation_refusal(ino, "setattr") else {
+            return Ok(None);
+        };
+        let times_only =
+            mode.is_none() && uid.is_none() && gid.is_none() && size.is_none() && atime.is_none();
+        if times_only && ctime.is_some() {
+            let cur = self.getattr(ino).await?;
+            if mtime.is_none_or(|m| m == cur.mtime) {
+                FOREIGN_FILE_TIMES_ECHO_ABSORBED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(Some(cur));
+            }
+        }
+        FOREIGN_FILE_MUTATION_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(refusal)
     }
 
     /// The `unlink` body (the trait entry re-dispatches it once on the
@@ -4926,8 +4985,14 @@ impl Metadata for RoutedMetaBackend {
                 .await;
         }
         // PR 13 §4.4z: a foreign-slot record's mutation refuses loud here,
-        // before any read of the record (PR 13b ships it).
-        self.refuse_foreign_slot_file_mutation(ino, "setattr")?;
+        // before any read of the record (PR 13b ships it) — the kernel's
+        // times echo excepted, answered from the holder's exact record.
+        if let Some(cur) = self
+            .foreign_slot_setattr_gate(ino, mode, uid, gid, size, atime, mtime, ctime)
+            .await?
+        {
+            return Ok(cur);
+        }
         // S10 coherence law (rung 12): attrs are exactly what a LOOKUP
         // delegation serves.
         let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;

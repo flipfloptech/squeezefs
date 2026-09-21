@@ -3255,8 +3255,12 @@ leg_sym_storm() {
                 lost=$((lost + l))
             done
         done
+        # `${survivors[0]}` is UNBOUND under `set -u` when every joiner is a
+        # victim (`--victims=K` = all): the die itself died on it and the
+        # acked-writes red read as a harness syntax error (fix round 1,
+        # batch 2 round 4).
         [ "$lost" = "0" ] ||
-            die "round $round: ACKED-WRITES ORACLE RED — $lost miss(es) over $acked fsynced file(s) across the manager and joiner ${survivors[0]} (see $rowdir/lost-r$round.txt)"
+            die "round $round: ACKED-WRITES ORACLE RED — $lost miss(es) over $acked fsynced file(s) across the manager and ${survivors[0]:+joiner }${survivors[0]:-the manager} (see $rowdir/lost-r$round.txt)"
         log "round $round: acked-writes oracle GREEN ($acked fsynced file(s) from ${#joiners[@]} joiners + the manager, all present at the manager and at ${survivors[0]:+joiner }${survivors[0]:-the manager})"
         # The recalled-reader arm's VERDICT: the recovered slot's lessee
         # is the manager now; its first mutation of the object the reader

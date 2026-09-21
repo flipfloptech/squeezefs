@@ -4791,6 +4791,49 @@ async fn a_foreign_slot_files_record_mutation_refuses_loud_naming_pr_13b_until_i
         refusals0 + 5,
         "every refusal counted"
     );
+    // The kernel's times ECHO (a read's `write_inode`: the mtime it got
+    // from us + a ctime, nothing else) is ABSORBED against the holder's
+    // record — answered, never refused, never counted as a mutation (the
+    // fix-round storm read 14 k foreign files per round at the manager).
+    let echoes0 = squeezefs::meta_backend::FOREIGN_FILE_TIMES_ECHO_ABSORBED.load(Relaxed);
+    let cur = j.getattr(f).await.unwrap();
+    let echoed = j
+        .setattr(
+            f,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(cur.mtime),
+            Some(cur.ctime),
+        )
+        .await
+        .expect("the kernel's times echo on a foreign-slot file is absorbed");
+    assert_eq!((echoed.mtime, echoed.ctime), (cur.mtime, cur.ctime));
+    assert_eq!(
+        squeezefs::meta_backend::FOREIGN_FILE_TIMES_ECHO_ABSORBED.load(Relaxed),
+        echoes0 + 1
+    );
+    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 5);
+    // A `touch` (an mtime the record does not carry) is a real mutation —
+    // refused loud like the rest.
+    typed(
+        j.setattr(
+            f,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(cur.mtime + 1_000_000_000),
+            Some(cur.ctime),
+        )
+        .await
+        .expect_err("touch of a foreign-slot file refuses"),
+        "touch",
+    );
+    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 6);
     // Nothing moved; the file still resolves — never ENOENT.
     assert_eq!(j.getattr(f).await.unwrap().mode, libc::S_IFREG | 0o644);
     assert_eq!(
@@ -4831,7 +4874,7 @@ async fn a_foreign_slot_files_record_mutation_refuses_loud_naming_pr_13b_until_i
     j.setxattr(own, "user.x", b"1")
         .await
         .expect("an own-slot file's setxattr lands");
-    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 5);
+    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 6);
     // The same law at the manager for the JOINER's file.
     typed(
         manager
@@ -4849,7 +4892,7 @@ async fn a_foreign_slot_files_record_mutation_refuses_loud_naming_pr_13b_until_i
             .expect_err("the manager's setattr of a joiner-slot file refuses"),
         "manager setattr",
     );
-    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 6);
+    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 7);
     shutdown(&j).await;
     venue.tear_down();
     shutdown(&manager).await;

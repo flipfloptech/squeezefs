@@ -14231,6 +14231,12 @@ impl SqueezefsFilesystem {
                     "foreign_file_mutation_refusals".into(),
                     load(&crate::meta_backend::FOREIGN_FILE_MUTATION_REFUSALS),
                 );
+                // The kernel's times echo on a foreign-slot file, absorbed
+                // against the holder's exact record (never a refusal).
+                metrics.insert(
+                    "foreign_file_times_echo_absorbed".into(),
+                    load(&crate::meta_backend::FOREIGN_FILE_TIMES_ECHO_ABSORBED),
+                );
                 // The door's ledger (review round 2, Issue 6): parks are a
                 // legal wait for a bounded handover, refusals the "ship to
                 // the holder" class (0 on a solo mount — no foreign holder

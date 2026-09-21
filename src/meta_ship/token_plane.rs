@@ -3598,6 +3598,15 @@ static RECALL_PURGE_SCOPED: AtomicU64 = AtomicU64::new(0);
 /// (`dlm_token_recall_census_purges`) — an object whose block keys the
 /// reader could not enumerate (no entry held, an indirect map).
 static RECALL_PURGE_CENSUS: AtomicU64 = AtomicU64::new(0);
+/// Recalled objects whose layout entry the purge KEPT because it was
+/// DIRTY — this writer's acked, not-yet-saved bytes
+/// (`dlm_token_recall_dirty_kept`; PR 13b — 0 on a `-o ro` reader).
+static RECALL_PURGE_DIRTY_KEPT: AtomicU64 = AtomicU64::new(0);
+/// Recalled objects whose layout-entry discard the purge SKIPPED because
+/// the ino's (3.5) stripe was held — a write or persist of it in flight
+/// (`dlm_token_recall_discard_skipped`; the epoch step expires the entry
+/// instead).
+static RECALL_PURGE_DISCARD_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Resolves a reader REFUSED because the object's slot holder had no
 /// bound endpoint (`dlm_token_reader_unbound_holders` — PR 12's per-slot
@@ -3650,6 +3659,7 @@ pub struct RecallPurgeCounts {
     pub keys: u64,
     pub scoped: u64,
     pub census: u64,
+    pub dirty_kept: u64,
 }
 
 pub fn recall_purge_counts() -> RecallPurgeCounts {
@@ -3657,6 +3667,7 @@ pub fn recall_purge_counts() -> RecallPurgeCounts {
         keys: RECALL_PURGE_KEYS.load(Ordering::Relaxed),
         scoped: RECALL_PURGE_SCOPED.load(Ordering::Relaxed),
         census: RECALL_PURGE_CENSUS.load(Ordering::Relaxed),
+        dirty_kept: RECALL_PURGE_DIRTY_KEPT.load(Ordering::Relaxed),
     }
 }
 
@@ -3725,6 +3736,27 @@ impl MountRecallSink {
 
     /// Purge one object's keys; `false` = not enumerable (the caller
     /// falls back to the census).
+    ///
+    /// **A DIRTY layout entry is KEPT** (PR 13b — the `sym-foreign-file`
+    /// leg's acked-write loss): under PR 12b's divert a WRITER is a token
+    /// client of the holders it writes to, and its `layout_dirty` entry is
+    /// the pending write itself — an inline write's `data_key` is the ONLY
+    /// copy of the acked bytes until the fsync's save. The holder's commit
+    /// that recalled the token (the kernel's times echo shipped as a
+    /// `Setattr`, a colleague's `chmod`) is OLDER than that write, so the
+    /// entry is newer than anything the recall could re-fetch; dropping it
+    /// made the fsync find nothing to save and return 0 with the bytes
+    /// gone. A clean entry is dropped as before. The decision runs under
+    /// the ino's (3.5) guard — the write path publishes the dirty entry
+    /// under the same guard, so a write landing during the recall is
+    /// either seen dirty here or published after the discard — taken in
+    /// the NON-PARKING form: a held stripe is a write or a persist of this
+    /// ino in flight (the persist's shipped publish is what caused this
+    /// very recall, and the holder waits for our ack), so the discard is
+    /// SKIPPED there. That is safe because the discard is a courtesy: the
+    /// recall's epoch step (`drain_in_flight_serves`) already makes every
+    /// clean entry stamped before it pre-step (`layout_entry_pre_step`),
+    /// so the next read re-fetches whatever stale clean entry stayed.
     fn purge_scoped(&self, object: &RecalledObject) -> bool {
         let Some(entry) = object.entry.as_deref() else {
             return false;
@@ -3747,7 +3779,17 @@ impl MountRecallSink {
             },
             None => Vec::new(),
         };
-        self.router.discard_layout_cache(global);
+        match crate::routing::meta_lock_try_acquire(global) {
+            Some(_meta_guard) => match self.router.metadata_cache.get(&global) {
+                Some(m) if m.layout_dirty => {
+                    RECALL_PURGE_DIRTY_KEPT.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => self.router.discard_layout_cache(global),
+            },
+            None => {
+                RECALL_PURGE_DISCARD_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         for k in &keys {
             self.router.cache.purge_block_key(k);
         }
@@ -3922,6 +3964,8 @@ pub fn reader_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
         "dlm_token_recall_purged_keys": RECALL_PURGE_KEYS.load(Ordering::Relaxed),
         "dlm_token_recall_scoped_purges": RECALL_PURGE_SCOPED.load(Ordering::Relaxed),
         "dlm_token_recall_census_purges": RECALL_PURGE_CENSUS.load(Ordering::Relaxed),
+        "dlm_token_recall_dirty_kept": RECALL_PURGE_DIRTY_KEPT.load(Ordering::Relaxed),
+        "dlm_token_recall_discard_skipped": RECALL_PURGE_DISCARD_SKIPPED.load(Ordering::Relaxed),
     })
 }
 

@@ -3639,6 +3639,28 @@ pub fn set_stripe_hold_timing(on: bool) {
     STRIPE_HOLD_TIMED.store(on, Ordering::Relaxed);
 }
 
+/// The NON-PARKING form of [`census_meta_lock_acquire`]: the same
+/// `try_lock` fast path and census stamp, `None` when the stripe is held
+/// (the caller decides what a held stripe means — the token recall sink's
+/// discard, which may never park behind the write path that is about to
+/// publish or persist the very entry it would drop).
+pub fn census_meta_lock_try_acquire(
+    lock: &'static crate::sqz_sync::SqzMutex<()>,
+    census: &'static crate::stripe_locks::StripeCensus,
+    stripe: usize,
+    ino: u64,
+) -> Option<MetaLockGuard> {
+    let g = lock.try_lock().ok()?;
+    census.stamp(stripe, crate::stripe_locks::key_word(ino, 0));
+    lock_phase_record(LockPhase::StripeLockWait, Duration::ZERO);
+    Some(MetaLockGuard {
+        _g: g,
+        acquired: STRIPE_HOLD_TIMED
+            .load(Ordering::Relaxed)
+            .then(std::time::Instant::now),
+    })
+}
+
 /// Census-wrapped acquisition of an `INODE_META_LOCKS`-class mutex (used
 /// by `routing::meta_lock_acquire` — the lock lives in `routing`, the
 /// census here). Fast path: one `try_lock`; the wait sample is exactly

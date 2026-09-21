@@ -2129,6 +2129,136 @@ async fn a_recall_purges_the_recalled_objects_block_keys_and_leaves_the_rest() {
     shutdown(&writer).await;
 }
 
+/// **A recall never drops a WRITER's dirty layout** (PR 13b — the
+/// `sym-foreign-file` leg's acked-write loss, `p5.txt`/`p6.txt` on the
+/// fleet): under PR 12b's divert a WRITER is a token client of every
+/// holder it writes to, and the mount's recall sink dropped the recalled
+/// object's layout entry from the router's cache unconditionally
+/// (`discard_layout_cache` — PR 5's reader law, where an entry is never
+/// dirty). An inline write is "RAM only until fsync/release": its
+/// `layout_dirty` entry's `data_key` IS the acked bytes. The kernel's
+/// times echo after the write shipped a `Setattr` to the holder, whose
+/// commit recalled the object's tokens — the writer's own included — and
+/// the purge dropped the dirty entry; the `fsync` found nothing dirty,
+/// returned 0, and the appended bytes existed nowhere (every other mount
+/// read the pre-append size; m62 alone read its own page cache). The
+/// law: a DIRTY entry is newer than anything the holder committed (it is
+/// the pending write) and stays; a clean entry is dropped as before; the
+/// decision is taken under the ino's (3.5) guard, the write path's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recall_never_drops_the_writers_dirty_layout_entry() {
+    use squeezefs::layout_wire::{encode_layout, LayoutMetadata};
+    use squeezefs::meta_ship::token_plane::{recall_purge_counts, MountRecallSink};
+    use squeezefs::routing::CachedMetadata;
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let inline = |bytes: &[u8]| LayoutMetadata {
+        file_type: "inline".to_string(),
+        size: bytes.len() as u64,
+        block_map_id: None,
+        block_prefix: None,
+        file_id: None,
+        data_key: Some(bytes.to_vec()),
+        block_map: None,
+    };
+    let x = Metadata::create(writer.as_ref(), 1, "x", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let y = Metadata::create(writer.as_ref(), 1, "y", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    for (ino, body) in [(x, &b"abc"[..]), (y, &b"yyy"[..])] {
+        writer
+            .set_layout_and_size(ino, &encode_layout(&inline(body)).unwrap(), 3, &[])
+            .await
+            .unwrap();
+    }
+
+    let (reader, plane) = open_token_reader(&path, &endpoint, "writer-dirty").await;
+    let (router, _dev) = data_router("vol-dirty").await;
+    router.set_meta_backend(Arc::clone(&reader));
+    assert!(plane.install_data_sink(MountRecallSink::new(router.clone(), 0)));
+    let _ = Metadata::getattr(reader.as_ref(), x).await.unwrap();
+    let _ = Metadata::getattr(reader.as_ref(), y).await.unwrap();
+    let (_v, x_local) = writer.route_ino(x);
+    let (_v, y_local) = writer.route_ino(y);
+    assert!(plane.holds(x_local) && plane.holds(y_local));
+
+    // The token client is a WRITER too: an acked inline append on X lives
+    // ONLY in its dirty layout entry until the fsync's save; Y's entry is
+    // a clean cached view.
+    let dirty = CachedMetadata {
+        size: 7,
+        data_key: Some(bytes::Bytes::from_static(b"abcDEFG")),
+        layout_dirty: true,
+        ..CachedMetadata::default()
+    };
+    router.publish_layout_cache_entry(x, dirty);
+    let clean = CachedMetadata {
+        size: 3,
+        data_key: Some(bytes::Bytes::from_static(b"yyy")),
+        layout_dirty: false,
+        ..CachedMetadata::default()
+    };
+    router.publish_layout_cache_entry(y, clean);
+    let before = recall_purge_counts();
+
+    // The holder commits on BOTH objects (the kernel's times echo shipped
+    // as a Setattr is the fleet's shape) — the conflicting commit recalls
+    // both tokens; the reader acks after the purge.
+    for ino in [x, y] {
+        Metadata::setattr(
+            writer.as_ref(),
+            ino,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(1_700_000_000_000_000_000),
+            Some(1_700_000_000_000_000_000),
+        )
+        .await
+        .unwrap();
+    }
+    wait_until("both recalls were acked", || {
+        plane.stats().recalls_acked >= 2
+    })
+    .await;
+    assert!(!plane.holds(x_local) && !plane.holds(y_local));
+    let after = recall_purge_counts();
+    assert_eq!(
+        after.scoped - before.scoped,
+        2,
+        "both objects purged by their layout"
+    );
+
+    let kept = router
+        .metadata_cache
+        .get(&x)
+        .expect("X's DIRTY layout entry survives the recall — it is the acked write");
+    assert!(kept.layout_dirty);
+    assert_eq!(kept.size, 7);
+    assert_eq!(kept.data_key.as_deref(), Some(&b"abcDEFG"[..]));
+    assert!(
+        router.metadata_cache.get(&y).is_none(),
+        "Y's CLEAN entry is dropped — the holder's commit made it stale"
+    );
+    assert_eq!(
+        after.dirty_kept - before.dirty_kept,
+        1,
+        "the kept dirty entry is counted (dlm_token_recall_dirty_kept)"
+    );
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
 /// **The holder answers `NotHolder` for a slot it does not lease**
 /// (review round 1, Issue 12): a wire joiner acquires a slot; a reader's
 /// grant on an object of that slot is answered `NotHolder { holder }` —

@@ -529,6 +529,22 @@ pub async fn meta_lock_acquire(ino: u64) -> crate::fuse_client::MetaLockGuard {
     .await
 }
 
+/// The non-parking form of [`meta_lock_acquire`]: `None` when the stripe
+/// is held. The token recall sink's discard (`MountRecallSink`) runs
+/// here — it must never park behind a write path or a persist of this
+/// ino, whose shipped publish is what the recall it is answering was
+/// caused by (the holder waits for the ack; parking would hold it to the
+/// recall deadline).
+pub fn meta_lock_try_acquire(ino: u64) -> Option<crate::fuse_client::MetaLockGuard> {
+    let stripe = INODE_META_LOCKS.shard_index(ino);
+    crate::fuse_client::census_meta_lock_try_acquire(
+        INODE_META_LOCKS.get_by_index(stripe),
+        &INODE_META_CENSUS_TABLE,
+        stripe,
+        ino,
+    )
+}
+
 /// **The 3.5 multi-holder convention** (design-small-file-packing §5.6,
 /// PK4; documented beside the lock-order table in `src/stripe_locks.rs`):
 /// the `INODE_META_LOCKS` guards of a SET of inos, taken as ONE canonical

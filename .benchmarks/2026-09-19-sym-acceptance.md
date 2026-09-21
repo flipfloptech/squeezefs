@@ -2103,7 +2103,7 @@ resource than it did.
 
 ## 7. Owed (what PR 14 / PR 15 inherit)
 
-> **Status (PR 13b, `feat/sym-metanode-ship`, 2026-09-21): the three flip-blocking items below are CLOSED on that branch — (i) §4.4z in `cd85f701`, (ii) §4.4af in `cc642b6a` (attributed: a page-published slot root pushed off the page — not the rename/intent machinery), (iii) §4.4ag in `53ffb626` + `31519ceb`; the fleet legs `sym-foreign-file` (new), `sym-crash` and `sym-storm` (×10 from zero) run on that binary. PR 7's un-share of a surviving sole owner stays PR 14's (the reason is stated in `docs/operations.md`'s PR 13b section). The text below is the ledger as recorded.**
+> **Status (PR 13b, `feat/sym-metanode-ship`, 2026-09-21): the three flip-blocking items below are CLOSED on that branch — (i) §4.4z in `cd85f701`, (ii) §4.4af in `cc642b6a` (attributed: a page-published slot root pushed off the page — not the rename/intent machinery), (iii) §4.4ag in `53ffb626` + `31519ceb`; the fleet legs on that branch's final binary (`b806b9a5`, laptop — "it works" evidence): `sym-foreign-file` GREEN ×3 from zero, `sym-crash --rounds=3` GREEN 3/3 from zero, `sym-storm --rounds=3 --victims=7 --cross-owner --striped` GREEN 3/3 from zero; **the storm ×10 is NOT MET** — three attempts read 8/10 (the rig's 1 GiB metadata namespace exhausted by the rejoin slot-tree economy — owed to PR 14, stated), 2/10 (a harness precondition, fixed) and 9/10 (a joiner's tree-0 projection routing loop, defect 34's class — owed), LOST 0 in every one of the 19 seven-victim rounds, so §4.4af's class did not recur. Three further defects the legs found were fixed red-first on the branch (the writer's dirty layout under a token recall — an acked-write loss; the holder's caches + writeback-cache kernel after a served mutation; a step whose slot moved TO the initiator mid-plan applying unguarded). PR 7's un-share of a surviving sole owner stays PR 14's (the reason is stated in `docs/operations.md`'s PR 13b section). The text below is the ledger as recorded.**
 
 **Flip-blocking (three items — §4.4z defect 32, §4.4af finding 1, §4.4ag
 finding 2; §9 lists them as the flip's preconditions):**
@@ -2346,7 +2346,7 @@ Every local rate in §3 is dev-box scoping evidence for those rows.
 
 ## 9. The flip decision (for PR 14)
 
-> **Status (PR 13b, 2026-09-21): the three PRODUCT blockers below are closed on `feat/sym-metanode-ship` (`cd85f701` defect 32, `cc642b6a` §4.4af, `53ffb626`+`31519ceb` §4.4ag); the box brackets remain the orchestrator's. The decision text below is as recorded at PR 13.**
+> **Status (PR 13b, 2026-09-21): the three PRODUCT blockers below are closed on `feat/sym-metanode-ship` (`cd85f701` defect 32, `cc642b6a` §4.4af, `53ffb626`+`31519ceb` §4.4ag); the box brackets remain the orchestrator's; the storm ×10 count is NOT MET on that branch (see §7's status line — two owed items, no acked loss in 19 seven-victim rounds). The decision text below is as recorded at PR 13.**
 
 **Decision: NOT YET — four blockers, three of them product (§7's
 flip-blocking items (i)–(iii) + the box).** (0) **Fix-round

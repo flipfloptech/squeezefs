@@ -2517,5 +2517,8 @@ every rail below was RUN (`/tmp/grok-justin/fix2-*.log`):
   mounts read the six bytes; `foreign_file_mutation_refusals` = 2 at
   joiner 2). The previous run of the same leg on the `EOPNOTSUPP` binary
   (`fix2-fidelity-quick.log`, PASS = 122 / FAIL = 1) is §4.4ai's finding.
-* `tests/run_sym_forest_suites.sh` both legs — see the line appended
-  below when the run completes.
+* **`tests/run_sym_forest_suites.sh` — PASS, 41 suites flat THEN 41
+  stamped (33 m 45 s, `fix2-matrix.log`; no suite HUNG, no
+  stamped/flat ratio at or above the 2.0 note)** — the first complete
+  both-legs pass since the rung's own 40/40 matrix (fix round 1's
+  stamped leg had hung at defect 21's pin, §4.4ah, fixed in `48fdf7d5`).

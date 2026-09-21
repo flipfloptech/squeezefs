@@ -5,7 +5,7 @@
 the flip fix), PR 12, PR 12b). **Design:** `docs/design-symmetric-metadata.md`
 §8 (the gate table — the contract), §1.6 (the measured constants), §5.10 (the
 D1 arithmetic), §7.3/§7.4 (the flip decision's inputs), PR-plan row 13.
-**Status: COMPLETE (fix loop round 1 pending)** — every row states its venue
+**Status: COMPLETE (review rounds 1–3 addressed; landed by the orchestrator)** — every row states its venue
 class (the 2026-09-14 venue law and the owner's 2026-09-20 restatement
 `51bf21e1`, quoted in §1: the dev box answers *does the mechanism work*;
 `squeeze-test` is the acceptance venue for every number).
@@ -1496,7 +1496,8 @@ an own-region slot exempt per `b8c4c92a`; a read-only open untouched; a
 `dd`, `truncate` and every `O_WRONLY` open fail LOUD at the open and no
 write is ever acked; the `write` / `setattr` / `setxattr` / publish gates
 stay as the BELT for an fd opened before the slot moved and for the il
-shim's ring-write path (which the FUSE handlers never see). The honest
+shim's ring WRITES (its fd was opened through the FUSE `open` gate; only
+the writes bypass the `write` handler). The honest
 statement of the class: **the open refuses; a write that reaches the
 `write` handler is refused at `write(2)` only on a `--no-writeback`,
 `O_DIRECT` or `O_SYNC` path, else at `fsync`/`close` through the kernel's

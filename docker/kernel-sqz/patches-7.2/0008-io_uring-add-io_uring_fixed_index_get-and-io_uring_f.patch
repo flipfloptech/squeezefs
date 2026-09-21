@@ -1,7 +1,7 @@
-From c0b4791fb92ab2aae4d7bce76e965c621526f4d2 Mon Sep 17 00:00:00 2001
+From b72cced5c19755ea3b71dfc40f7becda9ad0be95 Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:27 -0800
-Subject: [PATCH 08/25] io_uring: add io_uring_fixed_index_get() and
+Subject: [PATCH 08/26] io_uring: add io_uring_fixed_index_get() and
  io_uring_fixed_index_put()
 
 Add two new helpers, io_uring_fixed_index_get() and

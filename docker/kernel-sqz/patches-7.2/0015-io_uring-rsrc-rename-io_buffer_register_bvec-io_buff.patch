@@ -1,7 +1,7 @@
-From 785a0696ed51f00aacdeff2ff2b16c9bc4c76813 Mon Sep 17 00:00:00 2001
+From 6987f5f2fcd32cefc08c2400ab69100ccb167e8a Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:39 -0800
-Subject: [PATCH 15/25] io_uring/rsrc: rename
+Subject: [PATCH 15/26] io_uring/rsrc: rename
  io_buffer_register_bvec()/io_buffer_unregister_bvec()
 
 Currently, io_buffer_register_bvec() takes in a request. In preparation
@@ -22,6 +22,8 @@ Reviewed-by: Caleb Sander Mateos <csander@purestorage.com>
 [sqz 7.1.6 rebase] Rename extended to the 7.1-only ublk_drv call sites (batch dispatch / auto-buffer-reg paths) the 6.19 patch did not know about.
 
 [sqz 7.2.3 rebase] Context-only drift (ublk's ublk_rq_has_data() became blk_rq_has_data() upstream); the rename hunks are unchanged.
+
+[sqz 7.2.6 rebase] Context-only drift in drivers/block/ublk_drv.c (7.2.6's ublk auto-buf-reg fixes: ublk_config_io_buf() became ublk_apply_io_buf() in one hunk's context, line offsets elsewhere); the rename hunks are unchanged.
 ---
  Documentation/block/ublk.rst | 14 +++++++-------
  drivers/block/ublk_drv.c     | 22 +++++++++++-----------
@@ -59,10 +61,10 @@ index 0413dcd9e..28300fee2 100644
  ublk server implementing zero copy or user copy has to be CAP_SYS_ADMIN and
  be trusted, because it is ublk server's responsibility to make sure IO buffer
 diff --git a/drivers/block/ublk_drv.c b/drivers/block/ublk_drv.c
-index 2a22f9dc1..654613a9e 100644
+index b71283588..04cf4c0b2 100644
 --- a/drivers/block/ublk_drv.c
 +++ b/drivers/block/ublk_drv.c
-@@ -1698,8 +1698,8 @@ ublk_auto_buf_register(const struct ublk_queue *ubq, struct request *req,
+@@ -1710,8 +1710,8 @@ ublk_auto_buf_register(const struct ublk_queue *ubq, struct request *req,
  {
  	int ret;
  
@@ -73,7 +75,7 @@ index 2a22f9dc1..654613a9e 100644
  	if (ret) {
  		if (io->buf.auto_reg.flags & UBLK_AUTO_BUF_REG_FALLBACK) {
  			ublk_auto_buf_reg_fallback(ubq, req->tag);
-@@ -1905,7 +1905,7 @@ static noinline void ublk_batch_dispatch_fail(struct ublk_queue *ubq,
+@@ -1917,7 +1917,7 @@ static noinline void ublk_batch_dispatch_fail(struct ublk_queue *ubq,
  		ublk_io_unlock(io);
  
  		if (index != -1)
@@ -82,7 +84,7 @@ index 2a22f9dc1..654613a9e 100644
  					data->issue_flags);
  	}
  
-@@ -3193,8 +3193,8 @@ static int ublk_register_io_buf(struct io_uring_cmd *cmd,
+@@ -3208,8 +3208,8 @@ static int ublk_register_io_buf(struct io_uring_cmd *cmd,
  	if (!req)
  		return -EINVAL;
  
@@ -93,7 +95,7 @@ index 2a22f9dc1..654613a9e 100644
  	if (ret) {
  		ublk_put_req_ref(io, req);
  		return ret;
-@@ -3225,8 +3225,8 @@ ublk_daemon_register_io_buf(struct io_uring_cmd *cmd,
+@@ -3240,8 +3240,8 @@ ublk_daemon_register_io_buf(struct io_uring_cmd *cmd,
  	if (!ublk_dev_support_zero_copy(ub) || !blk_rq_has_data(req))
  		return -EINVAL;
  
@@ -104,7 +106,7 @@ index 2a22f9dc1..654613a9e 100644
  	if (ret)
  		return ret;
  
-@@ -3241,7 +3241,7 @@ static int ublk_unregister_io_buf(struct io_uring_cmd *cmd,
+@@ -3256,7 +3256,7 @@ static int ublk_unregister_io_buf(struct io_uring_cmd *cmd,
  	if (!(ub->dev_info.flags & UBLK_F_SUPPORT_ZERO_COPY))
  		return -EINVAL;
  
@@ -113,7 +115,7 @@ index 2a22f9dc1..654613a9e 100644
  }
  
  static int ublk_check_fetch_buf(const struct ublk_device *ub, __u64 buf_addr)
-@@ -3382,7 +3382,7 @@ static int ublk_ch_uring_cmd_local(struct io_uring_cmd *cmd,
+@@ -3400,7 +3400,7 @@ static int ublk_ch_uring_cmd_local(struct io_uring_cmd *cmd,
  		goto out;
  
  	/*
@@ -122,16 +124,16 @@ index 2a22f9dc1..654613a9e 100644
  	 * so no need to validate the q_id, tag, or task
  	 */
  	if (_IOC_NR(cmd_op) == UBLK_IO_UNREGISTER_IO_BUF)
-@@ -3449,7 +3449,7 @@ static int ublk_ch_uring_cmd_local(struct io_uring_cmd *cmd,
+@@ -3472,7 +3472,7 @@ static int ublk_ch_uring_cmd_local(struct io_uring_cmd *cmd,
  		req = ublk_fill_io_cmd(io, cmd);
- 		ret = ublk_config_io_buf(ub, io, cmd, addr, &buf_idx);
+ 		ublk_apply_io_buf(ub, io, cmd, addr, &auto_buf, &buf_idx);
  		if (buf_idx != UBLK_INVALID_BUF_IDX)
 -			io_buffer_unregister_bvec(cmd, buf_idx, issue_flags);
 +			io_buffer_unregister(cmd, buf_idx, issue_flags);
  		compl = ublk_need_complete_req(ub, io);
  
  		if (req_op(req) == REQ_OP_ZONE_APPEND)
-@@ -3797,7 +3797,7 @@ static int ublk_batch_commit_io(struct ublk_queue *ubq,
+@@ -3817,7 +3817,7 @@ static int ublk_batch_commit_io(struct ublk_queue *ubq,
  	}
  
  	if (buf_idx != UBLK_INVALID_BUF_IDX)

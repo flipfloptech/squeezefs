@@ -1,7 +1,7 @@
-From 3222b3e68920514dd0db961a78f1ac61af10c3e4 Mon Sep 17 00:00:00 2001
+From 615090332f4d0a7a8592dce580c30a19ce7a703e Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:20 -0800
-Subject: [PATCH 01/25] io_uring/kbuf: refactor io_buf_pbuf_register() logic
+Subject: [PATCH 01/26] io_uring/kbuf: refactor io_buf_pbuf_register() logic
  into generic helpers
 
 Refactor the logic in io_register_pbuf_ring() into generic helpers:

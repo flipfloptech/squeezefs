@@ -1,7 +1,7 @@
-From 9f53e2d0ca7ee01555ffc09b6c7a5589f1861a47 Mon Sep 17 00:00:00 2001
+From 3e71eaf9f06c7fcd2426fe27f00b0e4ceb67fbdc Mon Sep 17 00:00:00 2001
 From: sqz kernel recipe <sqz-kernel@squeezefs>
 Date: Sat, 1 Aug 2026 22:26:42 -0400
-Subject: [PATCH 22/25] sqz transplant seam: check io_buffer_add_list() in
+Subject: [PATCH 22/26] sqz transplant seam: check io_buffer_add_list() in
  io_register_kmbuf_ring()
 
 6.19.14 stable made io_buffer_add_list() return int (xa_store error) and

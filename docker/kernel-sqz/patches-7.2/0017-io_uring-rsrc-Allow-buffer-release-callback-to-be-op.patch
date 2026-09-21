@@ -1,7 +1,7 @@
-From c88cacb0aadcb7f08c0272d9139dafb423475314 Mon Sep 17 00:00:00 2001
+From 3486f4b150e4f5c2dadf84149883e7016e98347b Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:41 -0800
-Subject: [PATCH 17/25] io_uring/rsrc: Allow buffer release callback to be
+Subject: [PATCH 17/26] io_uring/rsrc: Allow buffer release callback to be
  optional
 
 This is a preparatory patch for supporting kernel-populated buffers in

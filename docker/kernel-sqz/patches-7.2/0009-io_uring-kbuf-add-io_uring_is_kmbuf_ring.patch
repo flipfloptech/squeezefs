@@ -1,7 +1,7 @@
-From 13cb4314d29094bc0de93661ecfd733dd0a7205b Mon Sep 17 00:00:00 2001
+From 4e8f519821b79a15585a5a5c91520df3bb021694 Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:28 -0800
-Subject: [PATCH 09/25] io_uring/kbuf: add io_uring_is_kmbuf_ring()
+Subject: [PATCH 09/26] io_uring/kbuf: add io_uring_is_kmbuf_ring()
 
 io_uring_is_kmbuf_ring() returns true if there is a kernel-managed
 buffer ring at the specified buffer group.

@@ -1,7 +1,7 @@
-From e0a329aefe4e9abf01eeaa135c5a228d7f6a43e0 Mon Sep 17 00:00:00 2001
+From 0536ab9f608685156d96af003648eb5d22a9ae43 Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:23 -0800
-Subject: [PATCH 04/25] io_uring/kbuf: add mmap support for kernel-managed
+Subject: [PATCH 04/26] io_uring/kbuf: add mmap support for kernel-managed
  buffer rings
 
 Add support for mmapping kernel-managed buffer rings (kmbuf) to

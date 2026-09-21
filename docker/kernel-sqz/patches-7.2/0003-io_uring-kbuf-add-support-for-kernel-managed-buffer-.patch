@@ -1,7 +1,7 @@
-From 797571706741aabb80953a972a38015eb6676904 Mon Sep 17 00:00:00 2001
+From 69e5e10c8b57d5e94054347723c7968ba1e09d79 Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:22 -0800
-Subject: [PATCH 03/25] io_uring/kbuf: add support for kernel-managed buffer
+Subject: [PATCH 03/26] io_uring/kbuf: add support for kernel-managed buffer
  rings
 
 Add support for kernel-managed buffer rings (kmbuf rings), which allow

@@ -1,7 +1,7 @@
-From fd3873d85e763d488e2afe7fbe551d72a8ccf23a Mon Sep 17 00:00:00 2001
+From 21821101c3a98c7c9114fd60cadf6e13865ce338 Mon Sep 17 00:00:00 2001
 From: sqz kernel recipe <sqz-kernel@squeezefs>
 Date: Sat, 15 Aug 2026 18:30:00 -0400
-Subject: [PATCH 25/25] sqz: nvme: host-scoped fabric subsystems (opt-in)
+Subject: [PATCH 25/26] sqz: nvme: host-scoped fabric subsystems (opt-in)
 
 The multi-writer program's rung-6 STOP finding
 (design-full-multi-writer.md s5.2 / rung 5b; design note
@@ -72,7 +72,7 @@ qemu guest owns boot/behaviour validation
  3 files changed, 78 insertions(+), 2 deletions(-)
 
 diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
-index 453c1f0b2..65b52d83a 100644
+index 0b80db7a0..7041009f3 100644
 --- a/drivers/nvme/host/core.c
 +++ b/drivers/nvme/host/core.c
 @@ -106,6 +106,23 @@ module_param(disable_pi_offsets, bool, 0444);
@@ -99,7 +99,7 @@ index 453c1f0b2..65b52d83a 100644
  /*
   * nvme_wq - hosts nvme related works that are not reset or delete
   * nvme_reset_wq - hosts nvme reset works
-@@ -3197,7 +3214,25 @@ static void nvme_put_subsystem(struct nvme_subsystem *subsys)
+@@ -3217,7 +3234,25 @@ static void nvme_put_subsystem(struct nvme_subsystem *subsys)
  	kref_put(&subsys->ref, nvme_destroy_subsystem);
  }
  
@@ -126,7 +126,7 @@ index 453c1f0b2..65b52d83a 100644
  {
  	struct nvme_subsystem *subsys;
  
-@@ -3217,6 +3252,9 @@ static struct nvme_subsystem *__nvme_find_get_subsystem(const char *subsysnqn)
+@@ -3237,6 +3272,9 @@ static struct nvme_subsystem *__nvme_find_get_subsystem(const char *subsysnqn)
  	list_for_each_entry(subsys, &nvme_subsystems, entry) {
  		if (strcmp(subsys->subnqn, subsysnqn))
  			continue;
@@ -136,7 +136,7 @@ index 453c1f0b2..65b52d83a 100644
  		if (!kref_get_unless_zero(&subsys->ref))
  			continue;
  		return subsys;
-@@ -3286,6 +3324,8 @@ static int nvme_init_subsystem(struct nvme_ctrl *ctrl, struct nvme_id_ctrl *id)
+@@ -3306,6 +3344,8 @@ static int nvme_init_subsystem(struct nvme_ctrl *ctrl, struct nvme_id_ctrl *id)
  	INIT_LIST_HEAD(&subsys->ctrls);
  	INIT_LIST_HEAD(&subsys->nsheads);
  	nvme_init_subnqn(subsys, ctrl, id);
@@ -145,7 +145,7 @@ index 453c1f0b2..65b52d83a 100644
  	memcpy(subsys->serial, id->sn, sizeof(subsys->serial));
  	memcpy(subsys->model, id->mn, sizeof(subsys->model));
  	subsys->vendor_id = le16_to_cpu(id->vid);
-@@ -3314,7 +3354,7 @@ static int nvme_init_subsystem(struct nvme_ctrl *ctrl, struct nvme_id_ctrl *id)
+@@ -3334,7 +3374,7 @@ static int nvme_init_subsystem(struct nvme_ctrl *ctrl, struct nvme_id_ctrl *id)
  	device_initialize(&subsys->dev);
  
  	mutex_lock(&nvme_subsystems_lock);
@@ -154,7 +154,7 @@ index 453c1f0b2..65b52d83a 100644
  	if (found) {
  		put_device(&subsys->dev);
  		subsys = found;
-@@ -4038,6 +4078,16 @@ static int nvme_global_check_duplicate_ids(struct nvme_subsystem *this,
+@@ -4058,6 +4098,16 @@ static int nvme_global_check_duplicate_ids(struct nvme_subsystem *this,
  	list_for_each_entry(s, &nvme_subsystems, entry) {
  		if (s == this)
  			continue;
@@ -172,10 +172,10 @@ index 453c1f0b2..65b52d83a 100644
  		ret = nvme_subsys_check_duplicate_ids(s, ids);
  		mutex_unlock(&s->lock);
 diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
-index 824651cc8..46eb75014 100644
+index 957ded0c6..9c73638b7 100644
 --- a/drivers/nvme/host/nvme.h
 +++ b/drivers/nvme/host/nvme.h
-@@ -498,6 +498,15 @@ struct nvme_subsystem {
+@@ -505,6 +505,15 @@ struct nvme_subsystem {
  	struct list_head	ctrls;
  	struct list_head	nsheads;
  	char			subnqn[NVMF_NQN_SIZE];

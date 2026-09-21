@@ -1,7 +1,7 @@
-From ec6d0f855e428c8fcc3127ed9ca47c63ffb10c80 Mon Sep 17 00:00:00 2001
+From 240ed0ac473a261351afcb50c26b050f82fbe97a Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:30 -0800
-Subject: [PATCH 11/25] io_uring/kbuf: return buffer id in buffer selection
+Subject: [PATCH 11/26] io_uring/kbuf: return buffer id in buffer selection
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

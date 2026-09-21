@@ -1,7 +1,7 @@
-From 2b1ae48290661b672372fe65014de8b9322778fd Mon Sep 17 00:00:00 2001
+From 33742b978375512036b2d4ea8e9306ca9cc0466a Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:24 -0800
-Subject: [PATCH 05/25] io_uring/kbuf: support kernel-managed buffer rings in
+Subject: [PATCH 05/26] io_uring/kbuf: support kernel-managed buffer rings in
  buffer selection
 
 Allow kernel-managed buffers to be selected. This requires modifying the

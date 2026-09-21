@@ -273,7 +273,16 @@ the 31-patch chain `patch -p1 --fuzz=0` **31/31** from a fresh pristine
 is `cat patches-7.1/00*.patch` (31 files) — the v3 concat on disk is the
 30-patch A arm.
 
-## The 7.2 track (`patches-7.2/`) — 26 patches on linux-7.2.3
+## The 7.2 track (`patches-7.2/`) — 26 patches on linux-7.2.6
+
+**2026-09-21: the base is linux-7.2.6** (kernel.org stable; sha256
+`039aef84f2b0994aeda3f4fcfc3d02ec9d7a9bbb9020ea264c43f446c860f606`
+from `v7.x/sha256sums.asc`; `build-kernel.sh`'s `7.2` row) — the
+CachyOS manager moved to `linux-cachyos-bore-7.2.6` and the 7.2.3 concat
+stopped applying. The same 26 patches, three-way rebased; the per-hunk
+ledger is *The 7.2.3 → 7.2.6 rebase* at the end of this section. The
+previous base was **linux-7.2.3** (2026-09-03 → 2026-09-21); the import
+record below is that base's history and is unchanged.
 
 **2026-09-06: the track is 26 patches** — **0026** (`sqz: fuse-uring
 per-queue background accounting (COMMIT-lock split)`) is the first patch
@@ -281,7 +290,7 @@ AUTHORED on 7.2 (not rebased); see its row and paragraph below. The
 rebase record that follows describes the 25-patch import of 2026-09-03
 and is unchanged.
 
-**Base: linux-7.2.3** (kernel.org stable, the newest 7.2.y on
+**Base at import: linux-7.2.3** (kernel.org stable, the newest 7.2.y on
 2026-09-03 — `releases.json` `latest_stable`; sha256
 `8ba259e8e7b13ec6ef0941c8a39ad90b24bd4a4d6c0010ba6bafb794550ecd03`
 from `v7.x/sha256sums.asc`). The 30-patch 7.1 series rebased
@@ -326,19 +335,19 @@ stay in the series, as do the 7 FUSE consumer/sqz patches and 0030.
 | 0016 | — | enum header types | **DROPPED — landed** as `b2bbd7dcd243` "fuse-uring: use enum types for header copying" (7.2's form returns an OFFSET from `ring_header_type_offset()` where v4 returned a pointer from `get_user_ring_header()` — the shape 0019 rebases onto) |
 | 0017 | — | copy-state setup | **DROPPED — landed** as `c0f9203732fc` "fuse-uring: refactor setting up copy state for payload copying" (the rebase auto-dropped it as an empty commit — the strongest "already there" evidence) |
 | 0018 | 0013 | kaddr copy support (`dev.c`) | applied clean |
-| 0019 | 0014 | FUSE kmbuf ring | **rebased** (9 hunks): composed with 7.2's `fuse_conn → fuse_chan` split (`b03404ea3a05` ring->chan, `bf9932623d20` fch->lock, `0ea79b7d077f` fch->ring; every added `fc` site renamed) and with the landed offset form of the header helpers — `get_kernel_ring_header()` derives its `iov_iter_advance()` from `ring_header_type_offset()`, the user arms of `copy_header_{to,from}_ring()` compute `ent->headers + offset`; 7.2 idioms `fuse_pqueue_alloc()` (`48649c0603bd`), `kzalloc_obj(*ent)`, `READ_ONCE(ring->queues[qid])`, the `FUSE_URING_IOV_{HEADERS,PAYLOAD}` accessors (`8bbb2ad1f687`) in `create_ring_ent`; `#include "fuse_dev_i.h"` (`c0f817320d6a` dropped `fuse_i.h` from dev_uring) |
-| 0020 | 0015 | bvec rename | applied — context-only drift (ublk's `ublk_rq_has_data()` became `blk_rq_has_data()`), rename hunks unchanged |
+| 0019 | 0014 | FUSE kmbuf ring | **rebased** (9 hunks): composed with 7.2's `fuse_conn → fuse_chan` split (`b03404ea3a05` ring->chan, `bf9932623d20` fch->lock, `0ea79b7d077f` fch->ring; every added `fc` site renamed) and with the landed offset form of the header helpers — `get_kernel_ring_header()` derives its `iov_iter_advance()` from `ring_header_type_offset()`, the user arms of `copy_header_{to,from}_ring()` compute `ent->headers + offset`; 7.2 idioms `fuse_pqueue_alloc()` (`48649c0603bd`), `kzalloc_obj(*ent)`, `READ_ONCE(ring->queues[qid])`, the `FUSE_URING_IOV_{HEADERS,PAYLOAD}` accessors (`8bbb2ad1f687`) in `create_ring_ent`; `#include "fuse_dev_i.h"` (`c0f817320d6a` dropped `fuse_i.h` from dev_uring). **7.2.6 (2026-09-21): rebased again** — the create-queue arm over 7.2.4's decoupled ring creation, the stack-bounced `in_header` (the rebase ledger below) |
+| 0020 | 0015 | bvec rename | applied — context-only drift (ublk's `ublk_rq_has_data()` became `blk_rq_has_data()`), rename hunks unchanged. **7.2.6**: context-only again (`ublk_apply_io_buf()`) |
 | 0021 | 0016 | register split | **rebased**: `imu->acct_pages` no longer exists (`df0a52537c0f` derives accounting at unmap via `io_buffer_unaccount_pages()`); the assignment is dropped from `io_kernel_buffer_init()` |
 | 0022 | 0017 | optional release | **rebased**: `io_buffer_unmap()` unaccounts from a derived local; the `if (imu->release)` guard composes with that form |
 | 0023 | 0018 | `io_buffer_register_bvec` | applied clean |
-| 0024 | 0019 | FUSE zc | **rebased**: `fch->ring` in `fuse_uring_register()`; and 7.2's `7d87a5a284bb` "fuse-uring: clear ent->fuse_req in commit_fetch error path" routes the `set_commit` `WARN_ON_ONCE` arm through `fuse_uring_req_end()` (background accounting) — the compile proof caught it ("too few arguments"): that site gains `issue_flags`, and because it reaches `req_end` with an ent still in userspace handoff (`ent->cmd == NULL` — no cmd owns the ent), the zc unregister is guarded on `ent->cmd` (the slot is released at ring-fd teardown like every other abandoned registration) |
+| 0024 | 0019 | FUSE zc | **rebased**: `fch->ring` in `fuse_uring_register()`; and 7.2's `7d87a5a284bb` "fuse-uring: clear ent->fuse_req in commit_fetch error path" routes the `set_commit` `WARN_ON_ONCE` arm through `fuse_uring_req_end()` (background accounting) — the compile proof caught it ("too few arguments"): that site gains `issue_flags`, and because it reaches `req_end` with an ent still in userspace handoff (`ent->cmd == NULL` — no cmd owns the ent), the zc unregister is guarded on `ent->cmd` (the slot is released at ring-fd teardown like every other abandoned registration). **7.2.6**: context-only (the composed create-queue arm, `in_header`) |
 | 0025 | 0020 | abort-race folio refs | applied clean |
 | 0026 | 0021 | docs | applied clean |
 | 0027 | 0022 | seam (`io_buffer_add_list` check) | applied clean — **still required** on 7.2 (int-returning `io_buffer_add_list()` unchanged) |
 | 0028 | 0023 | `FUSE_TIME_LIMITS` | applied clean — hunks verified in 7.2's `process_init_reply` `time_gran` block and `fuse_new_init` flag mask |
-| 0029 | 0024 | zc payload retention | **rebased**: `fuse_uring_release_payload()` takes `struct fuse_chan *fch` (`fch->ring` / `fch->connected`), loads the queue with `READ_ONCE(ring->queues[qid])`, dispatch passes `fch`; the RETAIN arm composes with the `ent->cmd` guard (`zero_copied && !retain && ent->cmd`) and the 7.2 `req_end` site passes `false` |
+| 0029 | 0024 | zc payload retention | **rebased**: `fuse_uring_release_payload()` takes `struct fuse_chan *fch` (`fch->ring` / `fch->connected`), loads the queue with `READ_ONCE(ring->queues[qid])`, dispatch passes `fch`; the RETAIN arm composes with the `ent->cmd` guard (`zero_copied && !retain && ent->cmd`) and the 7.2 `req_end` site passes `false`. **7.2.6: rebased again** — the `BUILD_BUG_ON` ahead of 7.2.6's reordered `fuse_uring_cmd()` gates, `out_header` (the ledger below) |
 | 0030 | 0025 | nvme host-scoped fabric subsystems | applied clean (identical patch-id — the region is code-identical 7.1.6 → 7.2.3) |
-| — | **0026** | **sqz: fuse-uring per-queue background accounting (COMMIT-lock split)** | **AUTHORED on 7.2.3, 2026-09-06**; **backported the same day as 0031 on BOTH the 6.19.14 field track and the 7.1 track** (each compile-proven three ways — their rows above; the adaptation ledger is `docs/design-kernel-bg-per-queue.md` §6). `fs/fuse/{dev_uring.c,dev.c,dev_uring_i.h,fuse_dev_i.h}` + the fuse-io-uring rst; zero uapi/Kconfig change; zero hunk overlap with 0001–0025 (it edits `fuse_uring_req_end()`'s bg arm and `fuse_uring_queue_bq_req()`, which 0019/0024 only pass through). Applies `--fuzz=0` on the 0001–0025 tree; the 26-patch chain re-verified fuzz=0 on a fresh base and byte-identical to the git series tip |
+| — | **0026** | **sqz: fuse-uring per-queue background accounting (COMMIT-lock split)** | **AUTHORED on 7.2.3, 2026-09-06**; **backported the same day as 0031 on BOTH the 6.19.14 field track and the 7.1 track** (each compile-proven three ways — their rows above; the adaptation ledger is `docs/design-kernel-bg-per-queue.md` §6). `fs/fuse/{dev_uring.c,dev.c,dev_uring_i.h,fuse_dev_i.h}` + the fuse-io-uring rst; zero uapi/Kconfig change; zero hunk overlap with 0001–0025 (it edits `fuse_uring_req_end()`'s bg arm and `fuse_uring_queue_bq_req()`, which 0019/0024 only pass through). Applies `--fuzz=0` on the 0001–0025 tree; the 26-patch chain re-verified fuzz=0 on a fresh base and byte-identical to the git series tip. **7.2.6: rebased** — `fuse_block_alloc()` over the acquire load, no `smp_rmb()` (the ledger below) |
 
 **Patch 0026 (sqz-authored, 2026-09-06 — the R-4 ledger's kernel item).**
 The e2e perf audit's reap-thread ledger
@@ -409,7 +418,132 @@ file reports 92 false FAILED hunks (later hunks depending on earlier
 patches in the same file — the same control the 6.19 and 7.1
 artifacts show). **v1 is the 25-patch (0001–0025) artifact — the A arm
 of the 0026 A/B**; a `-v2` concat carrying 0026 is minted when the box
-that boots it is chosen (same `cat` recipe, 26 files).
+that boots it is chosen (same `cat` recipe, 26 files). (What the nix
+config actually booted from 2026-09-06 was the 26-file `cat` under the
+`-7.2.3-v1` name — sha256
+`d7961949702dcf3509c2cb9a71a3e07421a4491a62b5f47eaaf2e2c8508ade6e`,
+189,758 bytes; superseded by the 7.2.6 concat below.)
+
+### The 7.2.3 → 7.2.6 rebase (2026-09-21)
+
+**Why.** The owner's NixOS config builds
+`pkgs.cachyosKernels.linux-cachyos-bore` with ONE concatenated patch
+(the 26 per-commit diffs stacked in order, applied by nix's
+`applyPatches` as one `patch -p1` after `bridge-stp-helper`,
+`request-key-helper` and CachyOS's `sched/0001-bore-cachy.patch` on the
+`cachyos-7.2.6-1.tar.gz` source). When CachyOS moved from 7.2.3 to
+7.2.6 the `linux-src-patched` derivation failed with **three FAILED
+hunks, all `fs/fuse/dev_uring.c`**: 0014 hunk 17 (`FAILED at 1448`),
+0019 hunk 23 (`at 1551`), 0024 hunk 22 (`at 1703`) — one block,
+`fuse_uring_register()`'s create-queue arm, which the three patches
+extend in turn (`use_bufring` → `zero_copy` → `retention`). Every other
+hunk applied (offsets ±1–6, `dev.c` with fuzz 1–2).
+
+**What moved (kernel.org `ChangeLog-7.2.{4,5,6}`; the 7.2.3 → 7.2.6
+diff of every series-touched file).** `fs/fuse/dev_uring.c` 65 changed
+lines, `dev.c` 19, `dev_uring_i.h` 4 (`fuse_uring_conn_init()`),
+`dev.h` 2, `inode.c` 12 and `fuse_i.h` 1 (unrelated: duplicate `fd=`,
+NULL submount root, `fuse_dentry_set_epoch`), `drivers/block/ublk_drv.c`
+122 (0015 context only), `drivers/nvme/host/{core.c,nvme.h}` 30/6
+(outside every 0025 hunk). Byte-identical 7.2.3 → 7.2.6: every
+`io_uring/` file the series touches (`kbuf.c`, `kbuf.h`, `rsrc.c`,
+`register.c`, `memmap.c`, `memmap.h`, `uring_cmd.c`),
+`include/linux/io_uring/cmd.h`, `include/linux/io_uring_types.h`, BOTH
+uapi headers (`fuse.h`, `io_uring.h` — so the ABI audit above holds
+verbatim: 38/39, `0x88000000`, the FUSE bits, opcode 3, bit 62),
+`fs/fuse/fuse_dev_i.h`, `drivers/nvme/host/sysfs.c`, both rst files.
+The four stable commits under the three hunks:
+
+| Stable (7.2.y) | Upstream | Subject | Effect on the series |
+|---|---|---|---|
+| 7.2.4 `303b6eeedf29` | `6330b1f61ed1` | fuse: decouple fuse_ring creation from ent registration (Koong; Stable-dep-of the next) | the ring is created at FUSE_INIT-reply time (`fuse_uring_conn_init()` ← `fuse_chan_set_initialized()` when the reply set `FUSE_OVER_IO_URING`; `fuse_chan_param.io_uring_enabled`, `fuse_chan_io_uring_enable()` deleted); `fuse_uring_create()` lost its "another thread created the ring" race arm; `fuse_uring_register()` no longer creates the ring (`-EINVAL` when absent) and lost its `err` local — the create-queue arm reads `return -ENOMEM;` where the series' pre-image had `return err;`. **The line all three hunks tripped on.** |
+| 7.2.4 `a47a416ff68d` | `fd10f40af314` | fuse: copy request headers via a stack buffer for io-uring (Xiang Mei) | `req->in.h` / `req->out.h` bounce through on-stack `in_header` / `out_header` in `fuse_uring_copy_to_ring()` / `fuse_uring_commit()` — the `fuse_request` slab has no usercopy whitelist and `CONFIG_HARDENED_USERCOPY` (on in the CachyOS config) panicked. Context for 0014/0019/0024. |
+| 7.2.6 `f940f3d3fd0b` | `4ef7c8cc9894` | fuse: use release/acquire for fch->initialized (Koong; Stable-dep-of the next) | `smp_wmb()`/`fch->initialized = 1` → `smp_store_release()`; the readers (`fuse_block_alloc()`, `fuse_dev_do_write()`, `fuse_uring_cmd()`) → `smp_load_acquire()`, the `smp_rmb()` deleted. Context for 0026's `fuse_block_alloc()`. |
+| 7.2.6 `8f9a725d8971` | `1f59015e9581` | fuse: Fix the condition to enable over-io-uring (Bernd Schubert) | `fuse_uring_cmd()` gates on `smp_load_acquire(&fch->initialized)` FIRST (`-EAGAIN` before INIT), then abort/connected, then the module-param arm, then a NEW `!fch->io_uring` refusal: a connection whose INIT reply did not set `FUSE_OVER_IO_URING` gets `-EOPNOTSUPP` for every `IORING_OP_URING_CMD`. **Server-visible behavior change** — the daemon is unaffected: the fuse3 fork advertises `FUSE_OVER_IO_URING` unconditionally in its INIT reply (`crates/fuse3/src/raw/session.rs`, "Required: always advertise") and REGISTERs only after the INIT reply. Context for 0024's `BUILD_BUG_ON`. |
+
+**How (the track's recipe).** Scratch git repo under `/tmp/sqz-7.2.6/`:
+linux-7.2.3 as an orphan base + the 26 patches `git am --3way` (the
+apply control — clean), linux-7.2.6 as a second orphan base, `git rebase
+--onto base-7.2.6 base-7.2.3` (true three-way merges against the real
+ancestor), `git format-patch` export. Git conflicted THREE times — its
+merge units differ from `patch`'s hunk units, the root causes are the
+same two commits:
+
+| Patch | Conflict (7.2.6 side vs series side) | Resolution — intent preserved |
+|---|---|---|
+| **0014** fuse kmbuf ring | `fuse_uring_register()` create-queue arm — HEAD: `queue = fuse_uring_create_queue(ring, qid); if (!queue) return -ENOMEM;` vs the series: `queue = fuse_uring_create_queue(cmd, ring, qid, use_bufring, issue_flags); if (IS_ERR(queue)) return PTR_ERR(queue); } else { if (queue->use_bufring != use_bufring) return -EINVAL;` | the series' arm verbatim — its `fuse_uring_create_queue()` returns `ERR_PTR`, so upstream's `-ENOMEM` line has no counterpart and the `err` local is not reintroduced. Auto-merged in the same patch: `fuse_uring_buf_ring_setup()` inserts below the new `fuse_uring_conn_init()`; `fuse_uring_copy_to_ring()`'s kmbuf header arm copies from the stack-bounced `in_header`. `[sqz 7.2.6 rebase]` note in the body. |
+| **0024** zc payload retention | `fuse_uring_cmd()` — the `BUILD_BUG_ON(sizeof(struct fuse_uring_cmd_req) != 24)` was inserted after `fch = fud->chan;` with the old "Once a connection has io-uring enabled" block as trailing context; 7.2.6 replaced that spot with the `smp_load_acquire(&fch->initialized)` gate and moved the enable arm below `connected` | `BUILD_BUG_ON` stays right after `fch = fud->chan;`, upstream's four reordered gates kept verbatim below it; `fuse_uring_commit(…, retain)` composes with the stack-bounced `out_header` (auto-merged); `fuse_uring_release_payload()` unchanged (`fch->ring` is created at INIT now, its `-ENOTCONN` on a NULL ring still right). Note in the body. |
+| **0026** per-queue bg accounting | `fuse_block_alloc()` — HEAD: `if (!smp_load_acquire(&fch->initialized)) return true; return (for_background && fch->blocked) \|\| (fch->io_uring && …);` vs the series' 7.2.3 form: `if (!fch->initialized) return true; smp_rmb(); if (fch->io_uring && fch->connected && !fuse_uring_ready(fch)) return true; return for_background && fch->blocked && !fuse_uring_ready(fch);` | upstream's acquire load + the series' split logic, no `smp_rmb()` (the acquire subsumes it). The seven `dev_uring.c` hunks and the `dev_uring_i.h`/`fuse_dev_i.h`/rst hunks auto-merged. Note in the body. |
+
+0019 (fuse zc) **auto-merged** once 0014's arm was resolved — its
+`zero_copy` extension of the same arm applies on the composed form,
+otherwise context-only (`[sqz 7.2.6 rebase]` note recorded). 0015
+(bvec rename) is **context-only** drift in `ublk_drv.c` (7.2.6's
+auto-buf-reg fixes; one context line `ublk_config_io_buf()` →
+`ublk_apply_io_buf()`, offsets elsewhere; note recorded). **Every other
+patch has an identical `git patch-id` to its 7.2.3 form.** **Nothing
+dropped** — no series hunk landed upstream between 7.2.3 and 7.2.6 (the
+five drops of the 2026-09-03 import stand). Whole-series diff on 7.2.6
+vs on 7.2.3: only the context lines above differ; tip-to-tip
+`git diff series-7.2.3 series-7.2.6 -- fs/fuse/dev_uring.c` IS the
+upstream 7.2.3 → 7.2.6 delta of that file (plus the `BUILD_BUG_ON` line
+holding its place). The export renumbers the `[PATCH NN/26]` prefix
+uniformly (the 2026-09-03 files read `NN/25` + `26/26`); filenames and
+subjects unchanged.
+
+**Proofs (2026-09-21; the dev box is the scoping venue — nothing here is
+a number):**
+
+* Chain: fresh pristine 7.2.6 extraction (tarball sha256 verified
+  against `v7.x/sha256sums.asc`), `patch -p1 --fuzz=0` per patch —
+  **26/26, fuzz 0, offset 0**, tree byte-identical to the git tip.
+* Concat **`sqz-kmbuf-zc-7.2.6-v1.patch`** = `cat patches-7.2/00*.patch`
+  (sha256 `75a8e290747cd6e9cd6c84fca2bb125840cf51d17310cd0c45a9eb8140edef9c`,
+  192,243 bytes, 26 `From` records; the nix config's
+  `patches/sqz-kmbuf-zc-7.2.6-v1.patch`). Applied in the nix
+  derivation's EXACT shape — `cachyos-7.2.6-1.tar.gz` (whose sqz-touched
+  files are byte-identical to vanilla 7.2.6) + `bridge-stp-helper` +
+  `request-key-helper` + `0001-bore-cachy.patch` (0 rejects; BORE touches
+  none of the series' files), then the concat single-shot with default
+  fuzz: **0 FAILED, 0 fuzz, 0 offset, 0 rejects**, tree identical to the
+  per-patch apply on the same base. On VANILLA 7.2.6 + BORE the concat
+  applies the same way (BORE itself rejects 6 `kernel/sched/fair.c` hunks
+  on vanilla — it is authored against the CachyOS tree); the naive
+  single-shot `--dry-run` of the whole concat on a pristine tree shows
+  the known false-FAILED class (later hunks depending on earlier patches
+  in the same file), as on every prior artifact.
+* **The nix `linux-src-patched` derivation built** with the new concat
+  (`nix eval … kernel.src.drvPath` →
+  `/nix/store/varfq7jb4qsfr25jk1cl9khf1jjwqxpr-linux-src-patched.drv`,
+  `nix build` → `/nix/store/lqvqzxh8nrb1jw5136mp64admjk3vpq0-linux-src-patched`):
+  the sqz section of its log has zero non-trivial lines and the output's
+  23 sqz-touched files are byte-identical to the git tip. The full
+  kernel build (multi-hour, LTO full) is the owner's `nixos-rebuild`.
+* Compile proof: running CachyOS `7.2.3-cachyos-lto` config
+  (`/proc/config.gz`: `CONFIG_CC_IS_CLANG`, `LTO_CLANG_FULL`,
+  `HARDENED_USERCOPY`, `FUSE_IO_URING=y`, `IO_URING_ZCRX`, `MZEN4`) →
+  `olddefconfig` → `make LLVM=1 -j32 fs/fuse/ io_uring/
+  drivers/nvme/host/` with the running kernel's toolchain (unwrapped
+  clang 21.1.8 + LLD 21.1.8 from `llvmPackages_21`; `CC` must be the
+  UNWRAPPED clang because the nix cc-wrapper injects `-nostdlibinc`,
+  which the kernel's `-Werror=unused-command-line-argument` refuses;
+  `HOSTCC=gcc`), four trees: vanilla-pristine, vanilla+26,
+  CachyOS+3-prepatches (ctl), CachyOS+3-prepatches+concat — **0 warnings
+  / 0 errors on all four** (objects are LLVM bitcode under LTO full);
+  `W=1` on the same dirs: **identical one-line sets** on all four
+  (upstream's pre-existing `fs/fuse/ioctl.c:133`
+  `-Wtautological-constant-out-of-range-compare`). Logs:
+  `/tmp/sqz-7.2.6/build-*.log`.
+* Not boot-tested (the owner builds and boots kernels). The lockdep
+  build and the field A/B are the 0026 rows' and unchanged by a
+  context-only rebase.
+
+`kernel.org` `latest_stable` was **7.2.7** the same day; the track
+follows the CachyOS manager's base. Read off the cumulative
+`patch-7.2.{6,7}.xz`: 7.2.7 changes no `fs/fuse/` or `io_uring/` file
+the series touches, but does touch `drivers/nvme/host/{core.c,nvme.h,
+sysfs.c}` (0025) and `drivers/block/ublk_drv.c` (0015's context) —
+re-run the chain check at the next bump.
 
 ## Config
 

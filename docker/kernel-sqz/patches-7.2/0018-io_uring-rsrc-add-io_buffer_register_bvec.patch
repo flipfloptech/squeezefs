@@ -1,7 +1,7 @@
-From c8da877ba76e480f00dc2bc6bb212167614abed6 Mon Sep 17 00:00:00 2001
+From 2622fc083d328badb9a499f9c80a8ba65a3caab4 Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:42 -0800
-Subject: [PATCH 18/25] io_uring/rsrc: add io_buffer_register_bvec()
+Subject: [PATCH 18/26] io_uring/rsrc: add io_buffer_register_bvec()
 
 Add io_buffer_register_bvec() for registering a bvec array.
 

@@ -1,7 +1,7 @@
-From a4662182c16a439f6b59634b3ae4aaca118d4915 Mon Sep 17 00:00:00 2001
+From d1f5a1e354efd0b2f296d5a768be6f0ab9b206d0 Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:26 -0800
-Subject: [PATCH 07/25] io_uring/kbuf: add recycling for kernel managed buffer
+Subject: [PATCH 07/26] io_uring/kbuf: add recycling for kernel managed buffer
  rings
 
 Add an interface for buffers to be recycled back into a kernel-managed

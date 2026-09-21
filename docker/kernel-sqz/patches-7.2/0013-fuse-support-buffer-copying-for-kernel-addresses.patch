@@ -1,7 +1,7 @@
-From accfafec3abaa1bfa066317e303393599ccd6ce5 Mon Sep 17 00:00:00 2001
+From 8fe43f3be2215eecdcd8d9b9383ccddeb2a2c39e Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:37 -0800
-Subject: [PATCH 13/25] fuse: support buffer copying for kernel addresses
+Subject: [PATCH 13/26] fuse: support buffer copying for kernel addresses
 
 This is a preparatory patch needed to support kernel-managed ring
 buffers in fuse-over-io-uring. For kernel-managed ring buffers, we get
@@ -19,10 +19,10 @@ Reviewed-by: Bernd Schubert <bernd@bsbernd.com>
  2 files changed, 23 insertions(+), 7 deletions(-)
 
 diff --git a/fs/fuse/dev.c b/fs/fuse/dev.c
-index 95df51880..a8f2a19af 100644
+index a82cf763f..2221b5b73 100644
 --- a/fs/fuse/dev.c
 +++ b/fs/fuse/dev.c
-@@ -986,6 +986,9 @@ void fuse_copy_init(struct fuse_copy_state *cs, bool write,
+@@ -981,6 +981,9 @@ void fuse_copy_init(struct fuse_copy_state *cs, bool write,
  /* Unmap and put previous page of userspace buffer */
  void fuse_copy_finish(struct fuse_copy_state *cs)
  {
@@ -32,7 +32,7 @@ index 95df51880..a8f2a19af 100644
  	if (cs->currbuf) {
  		struct pipe_buffer *buf = cs->currbuf;
  
-@@ -1011,6 +1014,9 @@ static int fuse_copy_fill(struct fuse_copy_state *cs)
+@@ -1006,6 +1009,9 @@ static int fuse_copy_fill(struct fuse_copy_state *cs)
  	struct page *page;
  	int err;
  
@@ -42,7 +42,7 @@ index 95df51880..a8f2a19af 100644
  	err = unlock_request(cs->req);
  	if (err)
  		return err;
-@@ -1069,15 +1075,20 @@ static int fuse_copy_do(struct fuse_copy_state *cs, void **val, unsigned *size)
+@@ -1064,15 +1070,20 @@ static int fuse_copy_do(struct fuse_copy_state *cs, void **val, unsigned *size)
  {
  	unsigned ncpy = min(*size, cs->len);
  	if (val) {
@@ -67,7 +67,7 @@ index 95df51880..a8f2a19af 100644
  		*val += ncpy;
  	}
  	*size -= ncpy;
-@@ -1259,7 +1270,7 @@ int fuse_copy_folio(struct fuse_copy_state *cs, struct folio **foliop,
+@@ -1254,7 +1265,7 @@ int fuse_copy_folio(struct fuse_copy_state *cs, struct folio **foliop,
  	}
  
  	while (count) {
@@ -76,7 +76,7 @@ index 95df51880..a8f2a19af 100644
  			/*
  			 * Can't control lifetime of pipe buffers, so always
  			 * copy user pages.
-@@ -1271,7 +1282,7 @@ int fuse_copy_folio(struct fuse_copy_state *cs, struct folio **foliop,
+@@ -1266,7 +1277,7 @@ int fuse_copy_folio(struct fuse_copy_state *cs, struct folio **foliop,
  			} else {
  				return fuse_ref_folio(cs, folio, offset, count);
  			}

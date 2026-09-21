@@ -72,11 +72,11 @@ maintained; do not resurrect it.
 | `Dockerfile` | pinned EL8 build image (gcc-toolset-14, from-source pahole v1.30 for BTF) |
 | `build.sh` | host wrapper: image build + capped (`--cpus 16`, `nice`) kernel build; artifacts → `dist/kernel-sqz/` |
 | `build-kernel.sh` | in-container: sha256-pinned tarball → the track's series → config assembly → checklist assertion (fail loud) → `make binrpm-pkg`. **`TRACK=6.19.14` (default, the FIELD build) / `7.1` / `7.2`** selects `patches-$TRACK/` + the pinned `KVER`/sha256 from its table — see *Build* below |
-| `SERIES.md` | the series manifest: message-ids, base ruling, conflict resolutions, 0025/0029, the 7.2 track's per-patch table |
+| `SERIES.md` | the series manifest: message-ids, base ruling, conflict resolutions, 0025/0029, the 7.2 track's per-patch table + the 7.2.3 → 7.2.6 rebase ledger |
 | `V2-CANDIDATES.md` | the v2 scoping manifest (ranked candidates; rank 1 = TIME_LIMITS, now patch 0028) |
 | `patches/` | `git format-patch` export (0001–0024 Koong + 0025 abort-race + 0026 docs + 0027 seam + 0028 TIME_LIMITS + 0029 retention + 0030 nvme host-scoped subsystems — rung 5b + **0031 per-queue bg accounting — the 6.19.14 backport of 7.2's 0026, 2026-09-06**) |
 | `patches-7.1/` | the **linux-7.1.6 rebase** of the same 30 patches (the D13 latest-mainline track — 0030 was AUTHORED here first; see *The 7.1 track* below) **+ 0031** (the 7.1 backport of the per-queue bg accounting, 2026-09-06) |
-| `patches-7.2/` | the **linux-7.2.3 rebase** — **26 patches**: the same series minus the five FUSE prep-refactors upstream 7.2 landed (renumbered contiguously; mapping in *The 7.2 track* below and SERIES.md) **plus 0026**, the per-queue background accounting (COMMIT-lock split) — the first patch AUTHORED on this track (2026-09-06; compile-proven, boot + A/B owed) |
+| `patches-7.2/` | the **linux-7.2.6 rebase** (base bumped from 7.2.3 on 2026-09-21 — the CachyOS manager moved to 7.2.6 and three `fs/fuse/dev_uring.c` hunks stopped applying; see *The 7.2 track* below) — **26 patches**: the same series minus the five FUSE prep-refactors upstream 7.2 landed (renumbered contiguously; mapping in *The 7.2 track* below and SERIES.md) **plus 0026**, the per-queue background accounting (COMMIT-lock split) — the first patch AUTHORED on this track (2026-09-06; boot-tested on the dev box the same day) |
 | `config-base-7.1.2-1.el8.elrepo.x86_64` | the field client's running config (the base; copied read-only 2026-08-01) |
 | `config-fragment` | the ENABLE CHECKLIST — every entry asserted in the final `.config` |
 | `probes/` | capability probes (see below) |
@@ -111,12 +111,12 @@ All gcc-8.5-clean, no libnl/liburing — they compile on the field box.
 ```bash
 docker/kernel-sqz/build.sh            # podman or docker
 # → dist/kernel-sqz/kernel-*.rpm + config-6.19.14-sqz + SHA256SUMS
-TRACK=7.2 docker/kernel-sqz/build.sh  # the 7.2.3 track (26 patches) → config-7.2.3-sqz
+TRACK=7.2 docker/kernel-sqz/build.sh  # the 7.2.6 track (26 patches) → config-7.2.6-sqz
 ```
 
 `TRACK` (default `6.19.14` — **the FIELD build, unchanged**) selects the
 row in `build-kernel.sh`'s table: `6.19.14` → `patches/`, `7.1` →
-`patches-7.1/` on linux-7.1.6, `7.2` → `patches-7.2/` on linux-7.2.3
+`patches-7.1/` on linux-7.1.6, `7.2` → `patches-7.2/` on linux-7.2.6
 (each row pins its tarball sha256; an unknown value refuses loud). The
 config assembly is the same for every track (client base config →
 `olddefconfig` → `config-fragment` checklist), so the checklist
@@ -225,10 +225,18 @@ the 6.19 artifact — verified as the control).
 
 ## The 7.2 track (`patches-7.2/`) — D13 latest-mainline rebase, 2026-09-03
 
-**Base: linux-7.2.3** (kernel.org stable; the newest 7.2.y on
-2026-09-03 per `releases.json`; sha256
+**Base: linux-7.2.6 since 2026-09-21** (kernel.org stable; sha256
+`039aef84f2b0994aeda3f4fcfc3d02ec9d7a9bbb9020ea264c43f446c860f606`
+from `v7.x/sha256sums.asc`) — the CachyOS kernel manager moved its
+7.2 line to `linux-cachyos-bore-7.2.6` and the 7.2.3 concat stopped
+applying (three FAILED hunks, all `fs/fuse/dev_uring.c`); the bump is
+recorded in *The 7.2.6 bump* below and in SERIES.md's rebase ledger.
+The paragraphs that follow describe the 2026-09-03 import, whose base
+was **linux-7.2.3** (the newest 7.2.y on 2026-09-03 per
+`releases.json`; sha256
 `8ba259e8e7b13ec6ef0941c8a39ad90b24bd4a4d6c0010ba6bafb794550ecd03`
-from `v7.x/sha256sums.asc`). The 7.1 track's 30 patches semantically
+from `v7.x/sha256sums.asc`) — every statement about "7.2.3" there is
+the history of that import. The 7.1 track's 30 patches semantically
 rebased by the 7.1 recipe (scratch git repo, 7.1.6 orphan base as the
 apply control, `git rebase --onto` 7.2.3 for true three-way merges,
 `git format-patch` export, `patch -p1 --fuzz=0` re-verified on a fresh
@@ -265,12 +273,17 @@ adaptation was found by the compile proof rather than the merge:
 unregisters through `ent->cmd` — that arm reaches it with
 `ent->cmd == NULL`, so the unregister is now guarded on `ent->cmd`
 (the slot is released at ring-fd teardown). Concatenated manager-ready
-form: **`~/sqz-kmbuf-zc-7.2.3-v1.patch`** = `cat patches-7.2/00*.patch`
-(sha256 `d977fafffe67dfe5429226331267a2c74220ca73c3d9280390056824ca77697a`)
-— sequential `patch -p1 --fuzz=0` clean 25/25 on a fresh pristine
-7.2.3 extraction; single-shot real apply 0 rejects, tree identical to
-the per-patch apply; the naive single-shot `--dry-run` shows the same
-false-FAILED class as the 6.19/7.1 artifacts. Compile-proof:
+form (HISTORY — the 7.2.3-base artifacts; the current one is
+`sqz-kmbuf-zc-7.2.6-v1.patch`, *The 7.2.6 bump* below):
+**`~/sqz-kmbuf-zc-7.2.3-v1.patch`** = `cat patches-7.2/00*.patch`
+(sha256 `d977fafffe67dfe5429226331267a2c74220ca73c3d9280390056824ca77697a`
+at 25 patches; the 26-patch form the nix config booted from 2026-09-06
+is `d7961949702dcf3509c2cb9a71a3e07421a4491a62b5f47eaaf2e2c8508ade6e`,
+189,758 bytes) — sequential `patch -p1 --fuzz=0` clean 25/25 on a fresh
+pristine 7.2.3 extraction; single-shot real apply 0 rejects, tree
+identical to the per-patch apply; the naive single-shot `--dry-run`
+shows the same false-FAILED class as the 6.19/7.1 artifacts.
+Compile-proof:
 `make io_uring/ fs/fuse/ drivers/nvme/host/ drivers/block/ublk_drv.o`
 with the running CachyOS `7.1.8-cachyos-lto` config (`olddefconfig`,
 gcc) on pristine vs patched 7.2.3 — **0 warnings both**, `W=1` on the
@@ -326,6 +339,115 @@ Unlisted patches applied identically (same patch-id). 7.2 numbers.
 7.2 lives in the same CachyOS kernel-manager posture as 7.1 (the notes
 above apply verbatim); the manager's next base bump to a 7.2.y is
 where this concat gets its first boot.
+
+### The 7.2.6 bump (2026-09-21) — base linux-7.2.3 → linux-7.2.6
+
+The CachyOS manager moved to `linux-cachyos-bore-7.2.6` and the nix
+source-patching phase (`cachyos-7.2.6-1.tar.gz` + bridge-stp +
+request-key + `0001-bore-cachy.patch`, then the sqz concat) reported
+**three FAILED hunks, all `fs/fuse/dev_uring.c`**: 0014 hunk 17 at
+~1448, 0019 hunk 23 at ~1551, 0024 hunk 22 at ~1703 — the same block
+three times, `fuse_uring_register()`'s create-queue arm, which each of
+the three patches extends (`use_bufring` → `zero_copy` → `retention`).
+The ground moved under it in **7.2.4** and **7.2.6** (kernel.org
+`ChangeLog-7.2.{4,6}`; the 7.2.3 → 7.2.6 delta of every series-touched
+file: `fs/fuse/dev_uring.c` 65 changed lines, `dev.c` 19,
+`dev_uring_i.h` 4, `inode.c` 12 (unrelated), `fuse_i.h` 1 (unrelated),
+`drivers/block/ublk_drv.c` 122 (context only for 0015),
+`drivers/nvme/host/{core.c,nvme.h}` 30/6 (outside every 0025 hunk);
+`io_uring/{kbuf,rsrc,register,memmap,uring_cmd}.c`, `kbuf.h`,
+`memmap.h`, `include/linux/io_uring/cmd.h`, `io_uring_types.h`, BOTH
+uapi headers, `nvme/host/sysfs.c` and the two rst files are
+**byte-identical**):
+
+* **7.2.4** `303b6eeedf29` = upstream `6330b1f61ed1` **"fuse: decouple
+  fuse_ring creation from ent registration"** (Koong; Stable-dep-of the
+  next) — the ring is created at FUSE_INIT-reply time
+  (`fuse_uring_conn_init()` from `fuse_chan_set_initialized()` when the
+  INIT reply set `FUSE_OVER_IO_URING`), `fuse_uring_create()` lost its
+  "another thread created the ring" race arm, and
+  `fuse_uring_register()` no longer creates the ring (`-EINVAL` when
+  absent) — its `err` local went with that, so the create-queue arm
+  reads `return -ENOMEM;` where the series' pre-image had `return err;`.
+  **This is the line all three hunks tripped on.**
+* **7.2.4** `a47a416ff68d` = upstream `fd10f40af314` **"fuse: copy
+  request headers via a stack buffer for io-uring"** (Xiang Mei) —
+  `req->in.h` / `req->out.h` bounce through on-stack `in_header` /
+  `out_header` (the `fuse_request` slab has no usercopy whitelist;
+  `CONFIG_HARDENED_USERCOPY` panicked). Context for 0014/0019/0024.
+* **7.2.6** `8f9a725d8971` = upstream `1f59015e9581` **"fuse: Fix the
+  condition to enable over-io-uring"** (Bernd Schubert) —
+  `fuse_uring_cmd()` gates on `smp_load_acquire(&fch->initialized)`
+  FIRST and REFUSES (`-EOPNOTSUPP`) a connection whose INIT reply did
+  not set `FUSE_OVER_IO_URING`. **Behavior change for servers**: the
+  daemon already advertises the flag unconditionally (`session.rs`,
+  "Required: always advertise FUSE_OVER_IO_URING") and REGISTERs only
+  after the INIT reply, so it is unaffected. Context for 0024's
+  `BUILD_BUG_ON`.
+* **7.2.6** `f940f3d3fd0b` = upstream `4ef7c8cc9894` **"fuse: use
+  release/acquire for fch->initialized"** (Koong; Stable-dep-of the
+  previous) — `smp_wmb`/`smp_rmb` → `smp_store_release`/
+  `smp_load_acquire`. Context for 0026's `fuse_block_alloc()`.
+
+Rebased by the track's own recipe (scratch git repo: 7.2.3 orphan base +
+the 26 patches `git am`'d as the control, 7.2.6 orphan base, `git rebase
+--onto` for true three-way merges, `git format-patch` export). Git's
+merge conflicted in three places (its resolution units differ from
+`patch`'s hunk units — same root causes):
+
+| Patch | 7.2.6 conflict | Resolution |
+|---|---|---|
+| 0014 FUSE kmbuf ring | `fuse_uring_register()` create-queue arm: upstream `return -ENOMEM;` vs the series' `if (IS_ERR(queue)) return PTR_ERR(queue); } else { if (queue->use_bufring != use_bufring) return -EINVAL;` | the series' arm verbatim (`fuse_uring_create_queue()` returns `ERR_PTR` in the series, so upstream's `-ENOMEM` line has no counterpart); `fuse_uring_buf_ring_setup()` now inserts below the new `fuse_uring_conn_init()`; the kmbuf header arm copies from the stack-bounced `in_header` |
+| 0024 zc payload retention | `fuse_uring_cmd()`: the `BUILD_BUG_ON(sizeof(struct fuse_uring_cmd_req) != 24)` was anchored on the old "Once a connection has io-uring enabled" block, which 7.2.6 moved below the new acquire gate | `BUILD_BUG_ON` kept right after `fch = fud->chan;`, ahead of upstream's reordered gates, which are kept verbatim; `fuse_uring_commit()`'s RETAIN arm composes with the stack-bounced `out_header` |
+| 0026 per-queue bg accounting | `fuse_block_alloc()`: the series' split gate carried 7.2.3's `smp_rmb()` after the `initialized` test; 7.2.6 made the test `smp_load_acquire()` and deleted the barrier | upstream's acquire load + the series' split logic (ring-not-ready first, then the classical `fch->blocked` arm guarded by `!fuse_uring_ready()`), no `smp_rmb()` — the acquire subsumes it |
+
+0019 (zc) auto-merged once 0014's arm was resolved (its `zero_copy`
+hunk lands on the composed arm; context-only vs 7.2.3), 0015 is
+context-only drift in `ublk_drv.c` (7.2.6's auto-buf-reg fixes), every
+other patch has an **identical patch-id** to its 7.2.3 form. **Nothing
+was dropped** — no series hunk landed upstream in 7.2.4–7.2.6. The
+whole-series diff on 7.2.6 vs on 7.2.3 differs ONLY in those context
+lines; the tip-to-tip `dev_uring.c` diff IS the upstream delta. Each
+adapted patch carries its `[sqz 7.2.6 rebase]` note beneath the 7.2.3
+one; the export renumbers the `[PATCH NN/26]` prefix uniformly (the
+2026-09-03 files read `NN/25` + a `26/26`).
+
+**Proofs (2026-09-21, dev box — scoping venue):** chain
+`patch -p1 --fuzz=0` **26/26, fuzz 0, offset 0** on a fresh pristine
+7.2.6 extraction, byte-identical to the git tip; the concat
+**`sqz-kmbuf-zc-7.2.6-v1.patch`** = `cat patches-7.2/00*.patch` (sha256
+`75a8e290747cd6e9cd6c84fca2bb125840cf51d17310cd0c45a9eb8140edef9c`,
+192,243 bytes, 26 `From` records) applied in the nix derivation's EXACT
+shape — `cachyos-7.2.6-1.tar.gz` (its sqz-touched files are
+byte-identical to vanilla 7.2.6) + bridge-stp + request-key + BORE,
+then the concat single-shot with default fuzz — **0 FAILED, 0 fuzz, 0
+offset lines, 0 rejects**, tree identical to the per-patch apply; the
+same on vanilla 7.2.6 + BORE (BORE itself rejects 6 `kernel/sched/fair.c`
+hunks on VANILLA — it is authored against the CachyOS tree — and touches
+none of the sqz files); the naive single-shot `--dry-run` shows the
+known false-FAILED class. **Compile proof**: running CachyOS
+`7.2.3-cachyos-lto` config (`/proc/config.gz`, `CONFIG_LTO_CLANG_FULL=y`,
+`HARDENED_USERCOPY=y`, `FUSE_IO_URING=y`) → `olddefconfig` → `make
+LLVM=1` (unwrapped clang 21.1.8 + LLD 21.1.8 — the running kernel's
+toolchain; the nix cc-wrapper's injected `-nostdlibinc` trips the
+kernel's `-Werror=unused-command-line-argument`, so `CC` is the
+unwrapped binary and `HOSTCC=gcc`) `fs/fuse/ io_uring/
+drivers/nvme/host/` on vanilla-pristine vs +26 AND on
+CachyOS+3-prepatches vs +concat: **0 warnings / 0 errors on all four**,
+`W=1` on the same dirs: **identical one-line sets** (upstream's
+pre-existing `fs/fuse/ioctl.c:133` tautological compare, on every
+tree). **The nix `linux-src-patched` derivation BUILT**
+(`/nix/store/varfq7jb4qsfr25jk1cl9khf1jjwqxpr-linux-src-patched.drv` →
+`/nix/store/lqvqzxh8nrb1jw5136mp64admjk3vpq0-linux-src-patched`; the sqz
+section of its log has zero non-trivial lines and its 23 touched files
+are byte-identical to the git tip) — the full kernel build is the
+owner's. Not boot-tested here. kernel.org's `latest_stable` was
+**7.2.7** on the day; the track follows the CachyOS manager's base
+(7.2.6). Read off the cumulative `patch-7.2.{6,7}.xz`: 7.2.7 changes
+NO `fs/fuse/` or `io_uring/` file the series touches, but it does
+touch `drivers/nvme/host/{core.c,nvme.h,sysfs.c}` (0025's files) and
+`drivers/block/ublk_drv.c` (0015's context) — re-run the chain check
+at the next bump before assuming fuzz 0 there.
 
 ### 0026 — per-queue background accounting (the COMMIT-lock split), 2026-09-06
 

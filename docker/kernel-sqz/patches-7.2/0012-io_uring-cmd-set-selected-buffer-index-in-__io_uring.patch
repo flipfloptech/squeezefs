@@ -1,7 +1,7 @@
-From e5b00d9efb48ec39526de0bf5aebb8125fb2d1ab Mon Sep 17 00:00:00 2001
+From f34df20f521f954ed53a3b626dcedbc691b1a663 Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:31 -0800
-Subject: [PATCH 12/25] io_uring/cmd: set selected buffer index in
+Subject: [PATCH 12/26] io_uring/cmd: set selected buffer index in
  __io_uring_cmd_done()
 
 When uring_cmd operations select a buffer, the completion queue entry

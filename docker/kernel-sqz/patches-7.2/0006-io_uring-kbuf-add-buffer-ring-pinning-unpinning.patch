@@ -1,7 +1,7 @@
-From 16df27c601ecba5ef0e7787e6b6bf19f01f36ddc Mon Sep 17 00:00:00 2001
+From 470452fa600fd86c34083bdaaadc0e1e91d00bfc Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:25 -0800
-Subject: [PATCH 06/25] io_uring/kbuf: add buffer ring pinning/unpinning
+Subject: [PATCH 06/26] io_uring/kbuf: add buffer ring pinning/unpinning
 
 Add kernel APIs to pin and unpin buffer rings, preventing userspace from
 unregistering a buffer ring while it is pinned by the kernel.

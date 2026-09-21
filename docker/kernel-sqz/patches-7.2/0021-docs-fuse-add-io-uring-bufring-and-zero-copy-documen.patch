@@ -1,7 +1,7 @@
-From 5aad7ef773c84cc2adcb30da4a16250a524bb038 Mon Sep 17 00:00:00 2001
+From f30f5ab147c9823e37c94916acd778554a56ef15 Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:44 -0800
-Subject: [PATCH 21/25] docs: fuse: add io-uring bufring and zero-copy
+Subject: [PATCH 21/26] docs: fuse: add io-uring bufring and zero-copy
  documentation
 
 Add documentation for fuse over io-uring usage of kernel-managed

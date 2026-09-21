@@ -1,4 +1,4 @@
-From 3388ee16f5f2ae536894027bc78dfd07d32dae71 Mon Sep 17 00:00:00 2001
+From 4be136b400492153210ac40c6bf75f09ea34d063 Mon Sep 17 00:00:00 2001
 From: sqz kernel recipe <sqz-kernel@squeezefs>
 Date: Sun, 6 Sep 2026 09:00:00 -0400
 Subject: [PATCH 26/26] sqz: fuse-uring per-queue background accounting
@@ -148,6 +148,8 @@ and control.c writes fc->max_background directly, so the backport hooks
 those sites); 6.19.14's fuse_request_end() performs the finish inline
 under fc->bg_lock (the ledger's second caller) - the backport's per-queue
 credit clears FR_BACKGROUND so that block is skipped.
+
+[sqz 7.2.6 rebase] fuse_block_alloc() composed with 7.2.6's "fuse: use release/acquire for fch->initialized" (stable f940f3d3fd0b = upstream 4ef7c8cc9894): the initialized test is smp_load_acquire() and the smp_rmb() this patch's 7.2.3 form carried is gone with it; the split gate logic (ring-not-ready first, then the classical fch->blocked arm guarded by !fuse_uring_ready()) is unchanged. Everything else applied identically.
 ---
  .../filesystems/fuse/fuse-io-uring.rst        |  26 ++
  fs/fuse/dev.c                                 |  61 ++++-
@@ -191,10 +193,10 @@ index f9483f28c..37aaf2733 100644
 +credited by ``fuse_request_end()`` as before; ``FR_BG_URING`` marks the
 +requests a queue charged.
 diff --git a/fs/fuse/dev.c b/fs/fuse/dev.c
-index e6d905f74..d09ccf200 100644
+index 99870fb20..7c099fe85 100644
 --- a/fs/fuse/dev.c
 +++ b/fs/fuse/dev.c
-@@ -83,6 +83,12 @@ void fuse_chan_set_initialized(struct fuse_chan *fch, struct fuse_chan_param *pa
+@@ -85,14 +85,22 @@ void fuse_chan_set_initialized(struct fuse_chan *fch, struct fuse_chan_param *pa
  	wake_up_all(&fch->blocked_waitq);
  }
  
@@ -206,10 +208,9 @@ index e6d905f74..d09ccf200 100644
 + */
  static bool fuse_block_alloc(struct fuse_chan *fch, bool for_background)
  {
- 	if (!fch->initialized)
-@@ -91,8 +97,10 @@ static bool fuse_block_alloc(struct fuse_chan *fch, bool for_background)
- 	/* Pairs with smp_wmb() in fuse_chan_set_initialized() */
- 	smp_rmb();
+ 	/* Pairs with smp_store_release() in fuse_chan_set_initialized() */
+ 	if (!smp_load_acquire(&fch->initialized))
+ 		return true;
  
 -	return (for_background && fch->blocked) ||
 -	       (fch->io_uring && fch->connected && !fuse_uring_ready(fch));
@@ -298,7 +299,7 @@ index e6d905f74..d09ccf200 100644
  }
  
  unsigned int fuse_chan_num_waiting(struct fuse_chan *fch)
-@@ -598,7 +629,12 @@ static void flush_bg_queue(struct fuse_chan *fch)
+@@ -593,7 +624,12 @@ static void flush_bg_queue(struct fuse_chan *fch)
  	}
  }
  
@@ -312,7 +313,7 @@ index e6d905f74..d09ccf200 100644
  {
  	lockdep_assert_held(&fch->bg_lock);
  
-@@ -2190,7 +2226,8 @@ void fuse_chan_abort(struct fuse_chan *fch, bool abort_with_err)
+@@ -2186,7 +2222,8 @@ void fuse_chan_abort(struct fuse_chan *fch, bool abort_with_err)
  		}
  		spin_lock(&fch->bg_lock);
  		fch->blocked = 0;
@@ -323,7 +324,7 @@ index e6d905f74..d09ccf200 100644
  		spin_unlock(&fch->bg_lock);
  
 diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
-index 2eff241c7..fe14cf8df 100644
+index 0baef7222..7f365615d 100644
 --- a/fs/fuse/dev_uring.c
 +++ b/fs/fuse/dev_uring.c
 @@ -63,34 +63,105 @@ static struct fuse_ring_ent *uring_cmd_to_ring_ent(struct io_uring_cmd *cmd)
@@ -512,7 +513,7 @@ index 2eff241c7..fe14cf8df 100644
  		spin_unlock(&queue->lock);
  		fuse_uring_abort_end_queue_requests(queue);
  	}
-@@ -364,6 +448,7 @@ fuse_uring_create_queue(struct io_uring_cmd *cmd, struct fuse_ring *ring,
+@@ -363,6 +447,7 @@ fuse_uring_create_queue(struct io_uring_cmd *cmd, struct fuse_ring *ring,
  	queue->qid = qid;
  	queue->ring = ring;
  	spin_lock_init(&queue->lock);
@@ -520,7 +521,7 @@ index 2eff241c7..fe14cf8df 100644
  
  	INIT_LIST_HEAD(&queue->ent_avail_queue);
  	INIT_LIST_HEAD(&queue->ent_commit_queue);
-@@ -436,6 +521,9 @@ static void fuse_uring_entry_teardown(struct fuse_ring_ent *ent)
+@@ -435,6 +520,9 @@ static void fuse_uring_entry_teardown(struct fuse_ring_ent *ent)
  	if (req) {
  		/* remove entry from queue->fpq->processing */
  		list_del_init(&req->list);
@@ -530,7 +531,7 @@ index 2eff241c7..fe14cf8df 100644
  	}
  
  	/*
-@@ -1934,17 +2022,23 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
+@@ -1939,17 +2027,23 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
  	}
  
  	set_bit(FR_URING, &req->flags);
@@ -559,7 +560,7 @@ index 2eff241c7..fe14cf8df 100644
  
  	/*
  	 * Due to bg_queue flush limits there might be other bg requests
-@@ -1966,6 +2060,100 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
+@@ -1971,6 +2065,100 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
  	return true;
  }
  
@@ -661,7 +662,7 @@ index 2eff241c7..fe14cf8df 100644
  {
  	struct fuse_ring_queue *queue = req->ring_queue;
 diff --git a/fs/fuse/dev_uring_i.h b/fs/fuse/dev_uring_i.h
-index 15a03851d..5d2c583eb 100644
+index a3da4edc5..db668a894 100644
 --- a/fs/fuse/dev_uring_i.h
 +++ b/fs/fuse/dev_uring_i.h
 @@ -131,7 +131,19 @@ struct fuse_ring_queue {
@@ -684,7 +685,7 @@ index 15a03851d..5d2c583eb 100644
  
  	bool stopped;
  
-@@ -193,6 +205,10 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req);
+@@ -194,6 +206,10 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req);
  bool fuse_uring_queue_bq_req(struct fuse_req *req);
  bool fuse_uring_remove_pending_req(struct fuse_req *req);
  bool fuse_uring_request_expired(struct fuse_chan *fch);
@@ -695,7 +696,7 @@ index 15a03851d..5d2c583eb 100644
  
  static inline void fuse_uring_abort(struct fuse_chan *fch)
  {
-@@ -248,6 +264,24 @@ static inline bool fuse_uring_request_expired(struct fuse_chan *fch)
+@@ -253,6 +269,24 @@ static inline bool fuse_uring_request_expired(struct fuse_chan *fch)
  	return false;
  }
  

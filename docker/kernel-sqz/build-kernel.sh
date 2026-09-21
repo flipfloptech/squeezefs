@@ -10,8 +10,9 @@
 #   + client base config + /src/config-fragment (checklist asserted).
 #
 # TRACK selects the row: 6.19.14 (default — the FIELD build, the EL8
-# fleet RPMs), 7.1 (linux-7.1.6, patches-7.1/), 7.2 (linux-7.2.3,
-# patches-7.2/). An unknown TRACK refuses loud before any fetch.
+# fleet RPMs), 7.1 (linux-7.1.6, patches-7.1/), 7.2 (linux-7.2.6,
+# patches-7.2/ — rebased from 7.2.3 on 2026-09-21, SERIES.md). An unknown
+# TRACK refuses loud before any fetch.
 set -euo pipefail
 
 TRACK=${TRACK:-6.19.14}
@@ -25,8 +26,8 @@ case "$TRACK" in
 		SHA256=995dd7188d924662b94b48fd6fb783587267590e5b8bb33dade2c771e7d855c1
 		PATCHES=/src/patches-7.1 ;;
 	7.2)
-		KVER=7.2.3
-		SHA256=8ba259e8e7b13ec6ef0941c8a39ad90b24bd4a4d6c0010ba6bafb794550ecd03
+		KVER=7.2.6
+		SHA256=039aef84f2b0994aeda3f4fcfc3d02ec9d7a9bbb9020ea264c43f446c860f606
 		PATCHES=/src/patches-7.2 ;;
 	*)
 		echo "unknown TRACK='${TRACK}' (want 6.19.14 | 7.1 | 7.2)"; exit 1 ;;

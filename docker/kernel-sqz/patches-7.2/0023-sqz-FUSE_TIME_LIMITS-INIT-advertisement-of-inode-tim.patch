@@ -1,7 +1,7 @@
-From 35cdae534b05e87008faf707fb741f9c2d2b191a Mon Sep 17 00:00:00 2001
+From 9332867a084084b47fe46d81a86bd2f08e50419f Mon Sep 17 00:00:00 2001
 From: sqz kernel recipe <sqz-kernel@squeezefs>
 Date: Sun, 2 Aug 2026 07:09:58 -0400
-Subject: [PATCH 23/25] sqz: FUSE_TIME_LIMITS INIT advertisement of
+Subject: [PATCH 23/26] sqz: FUSE_TIME_LIMITS INIT advertisement of
  inode-timestamp range
 
 The only timestamp field FUSE_INIT carries is time_gran, so a FUSE
@@ -36,10 +36,10 @@ the echoed bit + nonzero time_max.
  2 files changed, 17 insertions(+), 2 deletions(-)
 
 diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
-index d975073c6..54b5e24a9 100644
+index e89e2b0a5..42e6c8517 100644
 --- a/fs/fuse/inode.c
 +++ b/fs/fuse/inode.c
-@@ -1330,6 +1330,10 @@ static void process_init_reply(struct fuse_args *args, int error)
+@@ -1334,6 +1334,10 @@ static void process_init_reply(struct fuse_args *args, int error)
  				fc->handle_killpriv = 1;
  			if (arg->time_gran && arg->time_gran <= 1000000000)
  				fm->sb->s_time_gran = arg->time_gran;
@@ -50,7 +50,7 @@ index d975073c6..54b5e24a9 100644
  			if ((flags & FUSE_POSIX_ACL)) {
  				fc->default_permissions = 1;
  				fc->posix_acl = 1;
-@@ -1462,7 +1466,7 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
+@@ -1467,7 +1471,7 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
  		FUSE_SECURITY_CTX | FUSE_CREATE_SUPP_GROUP |
  		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
  		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |

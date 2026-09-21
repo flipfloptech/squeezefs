@@ -1,7 +1,7 @@
-From ae781175a98f995e0175d6d66c1688e185e8c104 Mon Sep 17 00:00:00 2001
+From caea45203902e7a6cc41380c5708a23a366bceb6 Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:21 -0800
-Subject: [PATCH 02/25] io_uring/kbuf: rename io_unregister_pbuf_ring() to
+Subject: [PATCH 02/26] io_uring/kbuf: rename io_unregister_pbuf_ring() to
  io_unregister_buf_ring()
 
 Use the more generic name io_unregister_buf_ring() as this function will

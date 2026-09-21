@@ -1,7 +1,7 @@
-From f95017ee89a26637eca11ff02806d682bd34cdbd Mon Sep 17 00:00:00 2001
+From feb173405ff9ff514ea202261ec2ee9a6505a802 Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:29 -0800
-Subject: [PATCH 10/25] io_uring/kbuf: export io_ring_buffer_select()
+Subject: [PATCH 10/26] io_uring/kbuf: export io_ring_buffer_select()
 
 Export io_ring_buffer_select() so that it may be used by callers who
 pass in a pinned bufring without needing to grab the io_uring mutex.

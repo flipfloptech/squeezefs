@@ -1,7 +1,7 @@
-From a5a09a1c1095dce339835008fc0fa3e1d58c98fb Mon Sep 17 00:00:00 2001
+From 87b916bcb41b0b3c1dfb88acd5ea0bd5243dca03 Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:40 -0800
-Subject: [PATCH 16/25] io_uring/rsrc: split io_buffer_register_request() logic
+Subject: [PATCH 16/26] io_uring/rsrc: split io_buffer_register_request() logic
 
 Split the main initialization logic in io_buffer_register_request() into
 a helper function.

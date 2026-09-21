@@ -1,7 +1,7 @@
-From 0b1678588be828e0a3b97512d7f7e28d1814e2a2 Mon Sep 17 00:00:00 2001
+From ef67e528b59a8c7821393cb61a40ee08ab7d7826 Mon Sep 17 00:00:00 2001
 From: sqz kernel recipe <sqz-kernel@squeezefs>
 Date: Sun, 9 Aug 2026 07:40:00 -0400
-Subject: [PATCH 20/25] fuse/io_uring: hold page references for zero-copy
+Subject: [PATCH 20/26] fuse/io_uring: hold page references for zero-copy
  registrations
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -73,10 +73,10 @@ seam-commit rationale). Mechanism donor: patch 0022.
  3 files changed, 52 insertions(+), 5 deletions(-)
 
 diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
-index 64a2be2d2..7a19e3b1e 100644
+index 721234d90..e0c5e0634 100644
 --- a/fs/fuse/dev_uring.c
 +++ b/fs/fuse/dev_uring.c
-@@ -830,11 +830,35 @@ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
+@@ -829,11 +829,35 @@ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
  	return err;
  }
  
@@ -112,7 +112,7 @@ index 64a2be2d2..7a19e3b1e 100644
  	size_t total_bytes = 0;
  	struct bio_vec *bvs;
  	int err, ddir, i;
-@@ -844,27 +868,46 @@ static int fuse_uring_set_up_zero_copy(struct fuse_ring_ent *ent,
+@@ -843,27 +867,46 @@ static int fuse_uring_set_up_zero_copy(struct fuse_ring_ent *ent,
  
  	ap = container_of(req->args, typeof(*ap), args);
  

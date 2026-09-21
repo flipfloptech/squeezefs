@@ -1,7 +1,7 @@
-From a25d1ea4fc42d3c8577a591c4970fd038d21c826 Mon Sep 17 00:00:00 2001
+From bd0974652b683a0ba324139056ae34b77bcdf508 Mon Sep 17 00:00:00 2001
 From: Joanne Koong <joannelkoong@gmail.com>
 Date: Fri, 16 Jan 2026 15:30:43 -0800
-Subject: [PATCH 19/25] fuse: add zero-copy over io-uring
+Subject: [PATCH 19/26] fuse: add zero-copy over io-uring
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -36,6 +36,8 @@ Signed-off-by: Joanne Koong <joannelkoong@gmail.com>
 [sqz 7.1.6 rebase] issue_flags threading composed with 7.1's restructured fuse_uring_prepare_send() error arm and the 7.1-only cancel-arm fuse_uring_req_end() call site; io_uring_sqe_cmd -> io_uring_sqe128_cmd (7.1's macro takes the type; fuse_uring_cmd_req lives in the 80B SQE128 command area).
 
 [sqz 7.2.3 rebase] fuse_conn -> fuse_chan in fuse_uring_register() (fch->ring); the rest is context drift from 7.2's dev_uring rework (READ_ONCE queue loads, trace_fuse_request_sent()). 7.2 also routes commit_fetch()'s set_commit WARN arm through fuse_uring_req_end() (background accounting): that site gains issue_flags, and because it reaches req_end with an ent still parked in userspace handoff (ent->cmd == NULL — no cmd owns the ent), the zc unregister is guarded on ent->cmd; the registration is released at ring-fd teardown like every other abandoned slot.
+
+[sqz 7.2.6 rebase] Context-only drift from 7.2.4's decoupled ring creation (the fuse_uring_register() create_queue arm this patch extends with zero_copy is the 7.2.6-composed form of 0014's; upstream's -ENOMEM line is gone with the err local) and from the stack-bounced in_header in fuse_uring_copy_to_ring(); the zero_copy / use_zero_copy hunks are unchanged.
 ---
  fs/fuse/dev.c             |   7 +-
  fs/fuse/dev_uring.c       | 171 ++++++++++++++++++++++++++++++--------
@@ -45,10 +47,10 @@ Signed-off-by: Joanne Koong <joannelkoong@gmail.com>
  5 files changed, 158 insertions(+), 38 deletions(-)
 
 diff --git a/fs/fuse/dev.c b/fs/fuse/dev.c
-index a8f2a19af..e6d905f74 100644
+index 2221b5b73..99870fb20 100644
 --- a/fs/fuse/dev.c
 +++ b/fs/fuse/dev.c
-@@ -1361,10 +1361,13 @@ int fuse_copy_args(struct fuse_copy_state *cs, unsigned numargs,
+@@ -1356,10 +1356,13 @@ int fuse_copy_args(struct fuse_copy_state *cs, unsigned numargs,
  
  	for (i = 0; !err && i < numargs; i++)  {
  		struct fuse_arg *arg = &args[i];
@@ -65,7 +67,7 @@ index a8f2a19af..e6d905f74 100644
  	return err;
  }
 diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
-index c4dc7c949..64a2be2d2 100644
+index 584840877..721234d90 100644
 --- a/fs/fuse/dev_uring.c
 +++ b/fs/fuse/dev_uring.c
 @@ -91,8 +91,14 @@ static void fuse_uring_flush_bg(struct fuse_ring_queue *queue)
@@ -96,7 +98,7 @@ index c4dc7c949..64a2be2d2 100644
  	if (error)
  		req->out.h.error = error;
  
-@@ -288,6 +299,7 @@ static struct fuse_ring *fuse_uring_create(struct fuse_chan *fch)
+@@ -287,6 +298,7 @@ void fuse_uring_conn_init(struct fuse_chan *fch)
  
  static int fuse_uring_buf_ring_setup(struct io_uring_cmd *cmd,
  				     struct fuse_ring_queue *queue,
@@ -104,7 +106,7 @@ index c4dc7c949..64a2be2d2 100644
  				     unsigned int issue_flags)
  {
  	int err;
-@@ -297,21 +309,38 @@ static int fuse_uring_buf_ring_setup(struct io_uring_cmd *cmd,
+@@ -296,21 +308,38 @@ static int fuse_uring_buf_ring_setup(struct io_uring_cmd *cmd,
  	if (err)
  		return err;
  
@@ -149,7 +151,7 @@ index c4dc7c949..64a2be2d2 100644
  {
  	struct fuse_chan *fch = ring->chan;
  	struct fuse_ring_queue *queue;
-@@ -343,12 +372,13 @@ fuse_uring_create_queue(struct io_uring_cmd *cmd, struct fuse_ring *ring,
+@@ -342,12 +371,13 @@ fuse_uring_create_queue(struct io_uring_cmd *cmd, struct fuse_ring *ring,
  	queue->fpq.processing = pq;
  
  	if (use_bufring) {
@@ -169,7 +171,7 @@ index c4dc7c949..64a2be2d2 100644
  	}
  
  	spin_lock(&fch->lock);
-@@ -368,6 +398,11 @@ fuse_uring_create_queue(struct io_uring_cmd *cmd, struct fuse_ring *ring,
+@@ -367,6 +397,11 @@ fuse_uring_create_queue(struct io_uring_cmd *cmd, struct fuse_ring *ring,
  	spin_unlock(&fch->lock);
  
  	return queue;
@@ -181,7 +183,7 @@ index c4dc7c949..64a2be2d2 100644
  }
  
  static void fuse_uring_stop_fuse_req_end(struct fuse_req *req)
-@@ -762,6 +797,7 @@ static int setup_fuse_copy_state(struct fuse_copy_state *cs,
+@@ -761,6 +796,7 @@ static int setup_fuse_copy_state(struct fuse_copy_state *cs,
  		cs->is_kaddr = true;
  		cs->len = ent->payload_kvec.iov_len;
  		cs->kaddr = ent->payload_kvec.iov_base;
@@ -189,7 +191,7 @@ index c4dc7c949..64a2be2d2 100644
  	}
  
  	cs->is_uring = true;
-@@ -794,11 +830,53 @@ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
+@@ -793,11 +829,53 @@ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
  	return err;
  }
  
@@ -244,7 +246,7 @@ index c4dc7c949..64a2be2d2 100644
  {
  	struct fuse_copy_state cs;
  	struct fuse_args *args = req->args;
-@@ -831,6 +909,11 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
+@@ -830,6 +908,11 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
  		num_args--;
  	}
  
@@ -256,7 +258,7 @@ index c4dc7c949..64a2be2d2 100644
  	/* copy the payload */
  	err = fuse_copy_args(&cs, num_args, args->in_pages,
  			     (struct fuse_arg *)in_args, 0);
-@@ -841,12 +924,17 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
+@@ -840,12 +923,17 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
  	}
  
  	ent_in_out.payload_sz = cs.ring.copied_sz;
@@ -284,8 +286,8 @@ index c4dc7c949..64a2be2d2 100644
  	if (unlikely(err)) {
  		pr_info_ratelimited("Copy to ring failed: %d\n", err);
  		return err;
-@@ -875,11 +963,20 @@ static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
- 				   sizeof(req->in.h));
+@@ -876,11 +964,20 @@ static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
+ 				   sizeof(in_header));
  }
  
 -static bool fuse_uring_req_has_payload(struct fuse_req *req)
@@ -307,7 +309,7 @@ index c4dc7c949..64a2be2d2 100644
  }
  
  static int fuse_uring_select_buffer(struct fuse_ring_ent *ent,
-@@ -937,7 +1034,7 @@ static int fuse_uring_next_req_update_buffer(struct fuse_ring_ent *ent,
+@@ -938,7 +1035,7 @@ static int fuse_uring_next_req_update_buffer(struct fuse_ring_ent *ent,
  	ent->headers_iter.data_source = false;
  
  	buffer_selected = ent->payload_kvec.iov_base != NULL;
@@ -316,7 +318,7 @@ index c4dc7c949..64a2be2d2 100644
  
  	if (has_payload && !buffer_selected)
  		return fuse_uring_select_buffer(ent, issue_flags);
-@@ -957,18 +1054,19 @@ static int fuse_uring_prep_buffer(struct fuse_ring_ent *ent,
+@@ -958,18 +1055,19 @@ static int fuse_uring_prep_buffer(struct fuse_ring_ent *ent,
  	ent->headers_iter.data_source = false;
  
  	/* no payload to copy, can skip selecting a buffer */
@@ -339,7 +341,7 @@ index c4dc7c949..64a2be2d2 100644
  	if (!err) {
  		set_bit(FR_SENT, &req->flags);
  		trace_fuse_request_sent(req);
-@@ -982,7 +1080,7 @@ static int fuse_uring_prepare_send(struct fuse_ring_ent *ent,
+@@ -983,7 +1081,7 @@ static int fuse_uring_prepare_send(struct fuse_ring_ent *ent,
  		ent->state = FRRS_INVALID;
  		spin_unlock(&ent->queue->lock);
  
@@ -348,7 +350,7 @@ index c4dc7c949..64a2be2d2 100644
  	}
  
  	return err;
-@@ -1087,7 +1185,7 @@ static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
+@@ -1090,7 +1188,7 @@ static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
  
  	err = fuse_uring_copy_from_ring(ring, req, ent);
  out:
@@ -357,7 +359,7 @@ index c4dc7c949..64a2be2d2 100644
  }
  
  /*
-@@ -1110,7 +1208,7 @@ static bool fuse_uring_get_next_fuse_req(struct fuse_ring_ent *ent,
+@@ -1113,7 +1211,7 @@ static bool fuse_uring_get_next_fuse_req(struct fuse_ring_ent *ent,
  	spin_unlock(&queue->lock);
  
  	if (req) {
@@ -366,7 +368,7 @@ index c4dc7c949..64a2be2d2 100644
  		if (err)
  			goto retry;
  	}
-@@ -1162,6 +1260,7 @@ static int fuse_uring_headers_prep(struct fuse_ring_ent *ent, unsigned int dir,
+@@ -1165,6 +1263,7 @@ static int fuse_uring_headers_prep(struct fuse_ring_ent *ent, unsigned int dir,
  				   unsigned int issue_flags)
  {
  	size_t header_size = sizeof(struct fuse_uring_req_header);
@@ -374,7 +376,7 @@ index c4dc7c949..64a2be2d2 100644
  	struct io_uring_cmd *cmd = ent->cmd;
  	struct io_rsrc_node *node;
  	unsigned int offset;
-@@ -1171,9 +1270,11 @@ static int fuse_uring_headers_prep(struct fuse_ring_ent *ent, unsigned int dir,
+@@ -1174,9 +1273,11 @@ static int fuse_uring_headers_prep(struct fuse_ring_ent *ent, unsigned int dir,
  
  	offset = ent->fixed_buf_id * header_size;
  
@@ -389,7 +391,7 @@ index c4dc7c949..64a2be2d2 100644
  	if (IS_ERR(node))
  		return PTR_ERR(node);
  
-@@ -1240,7 +1341,7 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
+@@ -1243,7 +1344,7 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
  		pr_info_ratelimited("qid=%d commit_id %llu state %d",
  				    queue->qid, commit_id, ent->state);
  		spin_unlock(&queue->lock);
@@ -398,7 +400,7 @@ index c4dc7c949..64a2be2d2 100644
  		return err;
  	}
  
-@@ -1252,7 +1353,7 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
+@@ -1255,7 +1356,7 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
  
  	err = fuse_uring_headers_prep(ent, ITER_SOURCE, issue_flags);
  	if (err)
@@ -407,7 +409,7 @@ index c4dc7c949..64a2be2d2 100644
  	else
  		fuse_uring_commit(ent, req, issue_flags);
  
-@@ -1428,6 +1529,7 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,
+@@ -1431,6 +1532,7 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,
  								       struct fuse_uring_cmd_req);
  	unsigned int init_flags = READ_ONCE(cmd_req->init.flags);
  	bool use_bufring = init_flags & FUSE_URING_BUF_RING;
@@ -415,7 +417,7 @@ index c4dc7c949..64a2be2d2 100644
  	struct fuse_ring *ring = smp_load_acquire(&fch->ring);
  	struct fuse_ring_queue *queue;
  	struct fuse_ring_ent *ent;
-@@ -1449,11 +1551,12 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,
+@@ -1447,11 +1549,12 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,
  	queue = READ_ONCE(ring->queues[qid]);
  	if (!queue) {
  		queue = fuse_uring_create_queue(cmd, ring, qid, use_bufring,
@@ -430,7 +432,7 @@ index c4dc7c949..64a2be2d2 100644
  			return -EINVAL;
  	}
  
-@@ -1558,7 +1661,7 @@ static void fuse_uring_send_in_task(struct io_tw_req tw_req, io_tw_token_t tw)
+@@ -1563,7 +1666,7 @@ static void fuse_uring_send_in_task(struct io_tw_req tw_req, io_tw_token_t tw)
  		if (fuse_uring_headers_prep(ent, ITER_DEST, issue_flags))
  			return;
  
@@ -439,7 +441,7 @@ index c4dc7c949..64a2be2d2 100644
  			send = fuse_uring_get_next_fuse_req(ent, queue, issue_flags);
  		fuse_uring_headers_cleanup(ent, issue_flags);
  		if (!send)
-@@ -1573,7 +1676,7 @@ static void fuse_uring_send_in_task(struct io_tw_req tw_req, io_tw_token_t tw)
+@@ -1578,7 +1681,7 @@ static void fuse_uring_send_in_task(struct io_tw_req tw_req, io_tw_token_t tw)
  
  		io_uring_cmd_done(cmd, err, issue_flags);
  
@@ -449,7 +451,7 @@ index c4dc7c949..64a2be2d2 100644
  		if (atomic_dec_and_test(&queue->ring->queue_refs))
  			wake_up_all(&queue->ring->stop_waitq);
 diff --git a/fs/fuse/dev_uring_i.h b/fs/fuse/dev_uring_i.h
-index b9017b5c5..cade5d317 100644
+index 82579816d..292ddc862 100644
 --- a/fs/fuse/dev_uring_i.h
 +++ b/fs/fuse/dev_uring_i.h
 @@ -58,6 +58,9 @@ struct fuse_ring_ent {

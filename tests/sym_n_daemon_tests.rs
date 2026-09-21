@@ -3281,6 +3281,34 @@ async fn a_rejoined_identitys_fresh_region_is_never_recovered_under_its_predeces
 const OVERFLOW_SEED_BASE: ForestSlot = 12;
 const OVERFLOW_SEED_COUNT: u32 = 128;
 
+/// **The cadence PARKED for the page-budget pins** (the crash matrix's
+/// fixture, `SQUEEZEFS_META_FLUSH_INTERVAL_MS=60000` read by every
+/// checkpoint task spawned while it stands): a pin that reads a slot's
+/// root and asserts it again later — "the appends left the root where the
+/// page named it", "the victim's root did not move on its own", tree 0
+/// naming the root a compaction recorded — presumes NO cycle ran in
+/// between; with the live cadence a tick's flush pass (a split of the
+/// loaded leaf, the maintenance arms) could move it early under a slower
+/// box, and the premise read the moved root (the batch `task check` on
+/// `13a009dd`: the root-split pin red at its premise, 12/12 green alone).
+/// Every cycle of these pins is one the pin runs (`checkpoint_now`, or
+/// the one it parks and releases). The successor's open inherits the
+/// posture; its assertions are direct reads. Dropped at the pin's end.
+struct ParkedCadence;
+
+impl ParkedCadence {
+    fn arm() -> Self {
+        std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+        Self
+    }
+}
+
+impl Drop for ParkedCadence {
+    fn drop(&mut self) {
+        std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    }
+}
+
 /// `OVERFLOW_SEED_COUNT` directories seeded one per slot from
 /// `OVERFLOW_SEED_BASE`, every slot `Unleased` afterwards.
 async fn overflow_seeded_volume(dir: &std::path::Path) -> (Vec<String>, Vec<u64>, Vec<ForestSlot>) {
@@ -8900,6 +8928,8 @@ async fn a_page_published_root_pushed_off_the_page_by_a_lower_first_touch_rides_
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
+    // Every cycle below is this pin's (see `ParkedCadence`).
+    let _cadence = ParkedCadence::arm();
     let (uris, dirs, slots) = overflow_seeded_volume(dir.path()).await;
     let knobs = Knobs::armed().mint_slots("1");
     let manager = open_under(&uris, &knobs).await;
@@ -9137,6 +9167,8 @@ async fn releasing_an_overflow_slot_of_a_page_full_region_publishes_the_slot_it_
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
+    // Every cycle below is this pin's (see `ParkedCadence`).
+    let _cadence = ParkedCadence::arm();
     let (uris, dirs, slots) = overflow_seeded_volume(dir.path()).await;
     let knobs = Knobs::armed().mint_slots("1");
     let manager = open_under(&uris, &knobs).await;
@@ -9327,6 +9359,8 @@ async fn a_first_touch_between_the_cycles_publication_and_its_page_write_evicts_
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
+    // Every cycle below is this pin's (see `ParkedCadence`).
+    let _cadence = ParkedCadence::arm();
     let (uris, dirs, slots) = overflow_seeded_volume(dir.path()).await;
     let knobs = Knobs::armed().mint_slots("1");
     let manager = open_under(&uris, &knobs).await;
@@ -9504,6 +9538,8 @@ async fn a_root_split_in_the_parked_cycles_flush_pass_never_drops_the_slots_page
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
+    // Every cycle below is this pin's (see `ParkedCadence`).
+    let _cadence = ParkedCadence::arm();
     let (uris, dirs, slots) = overflow_seeded_volume(dir.path()).await;
     let knobs = Knobs::armed().mint_slots("1");
     let manager = open_under(&uris, &knobs).await;
@@ -9567,20 +9603,25 @@ async fn a_root_split_in_the_parked_cycles_flush_pass_never_drops_the_slots_page
     );
 
     // More records into the victim's one leaf than a node holds — under a
-    // file whose inode lives there, so the flush pass of the next cycle
-    // SPLITS the root (`R1 → R2`). The appends move no pointer until then.
+    // file whose inode lives there — so its root SPLITS (`R1 → R2`) with
+    // page 0 still naming `R1`. WHICH pass splits it is the schedule's:
+    // the cadence is parked (`ParkedCadence`), but the appends cross §4.6
+    // pt 1's threshold trigger, and the SMO task's wake-driven maintenance
+    // pass may run the split at once — or lose the race to the cycle this
+    // pin parks, whose flush pass then splits it. The law holds in both
+    // (the batch `task check` on `13a009dd` read the first premise, "the
+    // appends left the root where the page named it", RED on the early
+    // split — the premise's window, never the law's), so the premise is
+    // taken where it is invariant: at the parked cycle's page write the
+    // root has moved and page 0 still says `R1`.
+    let splits0 = META_KV_NODE_SPLITS.load(Relaxed);
     let wide = vec![0x5au8; 15 * 1024];
     for k in 0..12 {
         mvol.setxattr_internal(a_file_local, &format!("user.wide{k}"), &wide)
             .await
             .expect("an xattr into the victim's leaf");
     }
-    assert_eq!(
-        mvol.slot_tree(victim).unwrap().root(),
-        r1,
-        "premise: the appends left the root where the page named it"
-    );
-    let splits0 = META_KV_NODE_SPLITS.load(Relaxed);
+    let before_park = mvol.slot_tree(victim).unwrap().root();
 
     // The cycle parked between its publication and its page write.
     let parked0 = test_checkpoint_parked_count();
@@ -9593,15 +9634,31 @@ async fn a_root_split_in_the_parked_cycles_flush_pass_never_drops_the_slots_page
         test_checkpoint_parked_count() > parked0
     })
     .await;
-    // (a) The flush pass moved the victim's root: page 0 still says R1.
+    // (a) The victim's root moved — by the threshold maintenance the
+    // appends woke (`before_park != r1`) or by the parked cycle's flush
+    // pass (`before_park == r1`) — and page 0, last written before the
+    // appends, still names `R1`: the stale PAGE-homed shape at the page
+    // write this pin controls.
     let r2 = mvol.slot_tree(victim).unwrap().root();
     assert_ne!(
         r2, r1,
-        "premise: the parked cycle's flush pass split the victim's root"
+        "premise: the victim's root split before the page write (before the park: \
+         {before_park:?})"
     );
     assert!(
         META_KV_NODE_SPLITS.load(Relaxed) > splits0,
-        "premise: a node split ran in the cycle"
+        "premise: a node split ran"
+    );
+    let page_at_park = page_of(&uris[0], &mvol, 0).await.expect("page 0");
+    let word_at_park = page_at_park
+        .slots
+        .iter()
+        .find(|e| forest_slot_of_page_slot(e.slot, native) == victim)
+        .map(|e| e.root);
+    assert_eq!(
+        word_at_park,
+        Some(r1),
+        "premise: page 0 still names the victim at R1 while its live root is R2"
     );
     // (b) A lower rank-2 competitor: a slot with no tree, first-touched +
     // minted under the parked cycle.

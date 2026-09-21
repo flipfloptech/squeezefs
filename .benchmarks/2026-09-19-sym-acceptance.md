@@ -2491,3 +2491,31 @@ it below):
   the interim refusal's classification only and did not re-run the
   fleet — the storm count is blocked on finding 1 either way. The fleet
   is torn down; nothing was placed on `squeeze-test`.
+
+**Fix round 2's tree (`a8ce78eb` — the code; `34014306` docs after it)** —
+every rail below was RUN (`/tmp/grok-justin/fix2-*.log`):
+
+* `cargo fmt --check` 0 · `cargo clippy --all-targets --all-features -- -D
+  warnings` 0 · `cargo clippy --all-targets -- -D warnings` 0 ·
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 0.
+* **The three rails:** `derivation_sweep_tests` 63 ok ·
+  `docs_parity_tests` 5 ok · `env_knob_convention_tests` 22 ok
+  (`fix2-doc-rails.log`).
+* **The touched pins, both legs** (`sym_n_daemon_tests foreign_slot` —
+  the round-1 contract with its OPEN face + §4.4ai's chmod-shape pin,
+  flat 4/4 and stamped 4/4; `posix_errno_tests` 14/14). **§4.4ai's pin
+  RED first** on the `EOPNOTSUPP` tree with its exact message
+  (`fix2-pin-red.log`: "errno 95 is in coreutils' is_ENOTSUP set —
+  chmod(1)/chown(1) exit 0 and print nothing on it"), GREEN on the fix
+  (`fix2-pin-green.log`).
+* **The fidelity tier `quick` from zero on the final binary
+  (`fix2-fidelity-quick2.log`): PASS = 124 / FAIL = 0** (2 m 28 s;
+  `sym-join-ladder` 81/81 — the N = 3 leg's §4.4z/§4.4ai contract lines:
+  joiner 2's `>>` into joiner 3's file fails AT THE OPEN with `EREMOTE`
+  rc 1; its `chmod` refuses `EREMOTE` AND `chmod(1)` exits nonzero; the
+  mode reads 644 at joiner 2, joiner 3 and the manager after it; both
+  mounts read the six bytes; `foreign_file_mutation_refusals` = 2 at
+  joiner 2). The previous run of the same leg on the `EOPNOTSUPP` binary
+  (`fix2-fidelity-quick.log`, PASS = 122 / FAIL = 1) is §4.4ai's finding.
+* `tests/run_sym_forest_suites.sh` both legs — see the line appended
+  below when the run completes.

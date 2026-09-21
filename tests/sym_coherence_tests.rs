@@ -4524,6 +4524,32 @@ async fn a_read_refused_not_a_member_parks_on_the_members_reclaim_and_never_answ
     .expect("the parked read returns inside the harness bound")
     .expect("the bound starts at the first refusal: the reclaim one beat later completes the read");
     assert_eq!(got.ino, f3);
+
+    // The `sym-crash` round-3 shape: a joiner's FIRST read of a holder after
+    // the failover dials a fresh per-holder plane, whose arm PROBES the
+    // holder before any fetch (`data_grant::foreign_read_plane`) — the
+    // probe is a token verb like any other and parks on the reclaim the
+    // same way; a plain call there surfaced the class to `stat(2)`.
+    *verdict.lock().unwrap() = LeaseVerdict::Expired;
+    let fresh = squeezefs::meta_ship::token_plane::TokenReaderPlane::new(
+        squeezefs::meta_ship::token_plane::TokenClientConfig {
+            endpoint: endpoint.clone(),
+            secret: SECRET.to_vec(),
+            client_id: "reader-reasserting".to_string(),
+            volume: 0,
+        },
+    );
+    let v = Arc::clone(&verdict);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        *v.lock().unwrap_or_else(|p| p.into_inner()) = LeaseVerdict::Live;
+        squeezefs::membership::note_grant_adopted();
+    });
+    tokio::time::timeout(Duration::from_secs(20), fresh.probe())
+        .await
+        .expect("the parked probe returns inside the harness bound")
+        .expect("a fresh plane's arm probe parks on the member's reclaim like a fetch — never the class");
+    assert!(fresh.stats().membership_waits >= 1, "the probe parked");
     std::env::remove_var("SQUEEZEFS_MEMBERSHIP_PURGE_MS");
     std::env::remove_var("SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS");
     plane.stop().await;

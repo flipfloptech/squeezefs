@@ -2290,9 +2290,14 @@ impl TokenReaderPlane {
     /// must answer it, so a writer whose plane is unarmed (the token verbs
     /// are not on its listener), a listener that is down, or a wrong
     /// endpoint is found at the ARM and refuses the mount, never at the
-    /// first resolve as an EIO.
+    /// first resolve as an EIO. A token verb like any other: the holder's
+    /// membership screen refusing this MEMBER parks on its reclaim
+    /// (`call_parking`, §4.4ag) — a joiner's first read of a holder after
+    /// a failover dials a fresh per-holder plane whose probe runs first,
+    /// and a plain call here surfaced the class to `stat(2)` (`sym-crash`
+    /// round 3); a ghost with no member session keeps the fail-closed word.
     pub async fn probe(&self) -> Result<()> {
-        match self.call(TokenCall::Recall { wait_ms: 0 }).await? {
+        match self.call_parking(TokenCall::Recall { wait_ms: 0 }).await? {
             TokenReply::Recall { .. } => Ok(()),
             other => Err(fail_closed(&format!(
                 "the holder answered the arm's probe with {other:?}"

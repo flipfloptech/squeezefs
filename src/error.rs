@@ -157,11 +157,12 @@ pub enum SqueezefsError {
     /// FILE's `setattr` / `setxattr` / `removexattr` / data write): the arm
     /// that ships the record-level verb to the slot holder under its lease
     /// is PR 13b's. Until it lands the armed plane REFUSES the verb LOUD
-    /// here — `EOPNOTSUPP`, naming the rung — never `ENOENT` for a file
+    /// here — `EREMOTE`, naming the rung (never `EOPNOTSUPP`: coreutils'
+    /// `chmod`/`chown` swallow it, §4.4ai) — never `ENOENT` for a file
     /// that exists (the local commit's miss, before this class) and never
-    /// an acked write whose bytes vanish at its publish (the write handler
-    /// refuses before it accepts a byte). Unarmed mounts never construct
-    /// it. Gauge `foreign_file_mutation_refusals`.
+    /// an acked write whose bytes vanish at its publish (the open-for-write
+    /// gate refuses before a byte is accepted). Unarmed mounts never
+    /// construct it. Gauge `foreign_file_mutation_refusals`.
     #[error("{msg}")]
     ForeignSlotFileMutation { msg: String },
 
@@ -265,10 +266,15 @@ impl SqueezefsError {
             // (the cross-owner arm re-dispatches, the roll-forward
             // cadence completes the intent, the application retries).
             SqueezefsError::Retryable { .. } => libc::EAGAIN,
-            // "Not built yet on this path" is `EOPNOTSUPP` — the honest
-            // interim word for a verb the plane cannot serve here; never
-            // `ENOENT` (the file exists) and never `EIO` (nothing broke).
-            SqueezefsError::ForeignSlotFileMutation { .. } => libc::EOPNOTSUPP,
+            // "The record lives at another appender" is `EREMOTE` ("Object
+            // is remote" — the S8 service's own not-the-owner word); never
+            // `ENOENT` (the file exists), never `EIO` (nothing broke), never
+            // `EAGAIN` (nothing is transient until PR 13b ships it), and
+            // never `EOPNOTSUPP`: coreutils ≥ 9.6 `chmod`/`chown` read
+            // `ENOTSUP` from the mode/owner syscalls as "not applied" — rc 0,
+            // nothing printed (PR 13 §4.4ai: the real-mount `chmod` of a
+            // foreign-slot file exited 0 while the daemon refused it).
+            SqueezefsError::ForeignSlotFileMutation { .. } => libc::EREMOTE,
             SqueezefsError::WriterGuardFenced => libc::EIO,
             SqueezefsError::IndirectMapFormat { .. } => libc::EIO,
             // A fail-stopped lease reaching a data path is the same class

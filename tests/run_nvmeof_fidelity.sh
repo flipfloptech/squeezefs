@@ -1553,6 +1553,36 @@ sym_n_daemon_leg() { # meta data out
     # joiner): the manager creates under joiner 2's directory.
     echo "from manager" > "$mnt/w2-dir/by-manager" 2>> "$out" && ok "SYMJOIN/N: the manager created into joiner 2's directory (a cross-owner op — one intent, the step served by the joiner)" || bad "SYMJOIN/N: the manager's create into joiner 2's directory failed"
     [ "$(cat "$j2/w2-dir/by-manager" 2>> "$out")" = "from manager" ] && ok "SYMJOIN/N: joiner 2 reads the manager's create in its own directory" || bad "SYMJOIN/N: joiner 2 does not see the manager's create"
+    # PR 13 §4.4z's INTERIM refusal on a REAL mount (review round 2, Issue
+    # 22): a FOREIGN-slot FILE's mutation from a mount that does not lease
+    # its slot refuses at the OPEN for write — where the shell checks —
+    # with `EREMOTE` ("Object is remote") naming PR 13b (the default
+    # mount's writeback cache would otherwise ack `write(2)` and report the
+    # refusal only at close/fsync, so a `>>` printed rc 0 with its bytes
+    # gone); `chmod` refuses the same way AND ITS EXIT STATUS SAYS SO —
+    # §4.4ai: this contract's first run read `fchmodat = -1 EOPNOTSUPP`
+    # with `chmod` exiting 0 and printing nothing, because coreutils ≥ 9.6
+    # treats ENOTSUP from the mode syscall as "not applied"; the errno
+    # class moved to one no tool swallows. The mode stays 644 at every
+    # daemon; a read-only open serves; the holder's bytes stand.
+    local xo_err xo_rc
+    xo_err="$( (echo appended >> "$j2/w3-dir/f7") 2>&1 )"; xo_rc=$?
+    if [ "$xo_rc" != "0" ] && echo "$xo_err" | grep -qi "object is remote"; then
+        ok "SYMJOIN/N: joiner 2's \`>>\` into joiner 3's file failed AT THE OPEN with EREMOTE (rc=$xo_rc — the shell saw it; PR 13b owns the ship)"
+    else
+        bad "SYMJOIN/N: joiner 2's \`>>\` into joiner 3's file: rc=$xo_rc '$xo_err' (want a failed open, EREMOTE)"
+    fi
+    xo_err="$(chmod 600 "$j2/w3-dir/f7" 2>&1)"; xo_rc=$?
+    if [ "$xo_rc" != "0" ] && echo "$xo_err" | grep -qi "object is remote"; then
+        ok "SYMJOIN/N: joiner 2's chmod of joiner 3's file refused EREMOTE and chmod(1) EXITED NONZERO (never ENOENT for a file that exists; never an errno coreutils swallows)"
+    else
+        bad "SYMJOIN/N: joiner 2's chmod of joiner 3's file: rc=$xo_rc '$xo_err' (want EREMOTE, rc != 0)"
+    fi
+    [ "$(stat -c %a "$j2/w3-dir/f7" 2>> "$out")" = "644" ] && [ "$(stat -c %a "$j3/w3-dir/f7" 2>> "$out")" = "644" ] && [ "$(stat -c %a "$mnt/w3-dir/f7" 2>> "$out")" = "644" ] && ok "SYMJOIN/N: the refused chmod moved nothing (mode 644 at joiner 2, joiner 3 and the manager)" || bad "SYMJOIN/N: f7's mode after the refused chmod — j2 $(stat -c %a "$j2/w3-dir/f7" 2>&1) j3 $(stat -c %a "$j3/w3-dir/f7" 2>&1) mgr $(stat -c %a "$mnt/w3-dir/f7" 2>&1) (want 644 everywhere)"
+    [ "$(cat "$j2/w3-dir/f7" 2>> "$out")" = "j3 7" ] && ok "SYMJOIN/N: the refused file still reads exact at joiner 2 (its bytes stand at the holder)" || bad "SYMJOIN/N: joiner 3's f7 read '$(cat "$j2/w3-dir/f7" 2>&1)' after the refusals"
+    [ "$(cat "$j3/w3-dir/f7" 2>> "$out")" = "j3 7" ] && ok "SYMJOIN/N: the holder's bytes are untouched" || bad "SYMJOIN/N: the holder's f7 read '$(cat "$j3/w3-dir/f7" 2>&1)'"
+    v=$(jstat "$j2" foreign_file_mutation_refusals)
+    [ "${v:-0}" -ge 2 ] 2>/dev/null && ok "SYMJOIN/N: joiner 2 counted the refusals (foreign_file_mutation_refusals=$v)" || bad "SYMJOIN/N: joiner 2 foreign_file_mutation_refusals=$v (want ≥ 2)"
     # A joiner's TERMINAL FREE ships to the allocation-lease holder (PR 8's
     # law on a real second daemon): joiner 2 truncates its 4 MiB file, the
     # displaced block's free travels as `FreeBlocks` to the manager, whose

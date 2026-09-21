@@ -70,7 +70,9 @@ fn pinned_errno(e: &SqueezefsError) -> libc::c_int {
         // PR 13 (review round 1, Issue 7): the symmetric plane's CLASSED
         // retryable refusal — every caller retries, the application too.
         SqueezefsError::Retryable { .. } => libc::EAGAIN,
-        SqueezefsError::ForeignSlotFileMutation { .. } => libc::EOPNOTSUPP,
+        // PR 13 §4.4ai: the interim foreign-slot refusal is `EREMOTE` —
+        // `EOPNOTSUPP` is the class coreutils' chmod/chown swallow (rc 0).
+        SqueezefsError::ForeignSlotFileMutation { .. } => libc::EREMOTE,
         SqueezefsError::GdsError(_) => libc::EIO,
         SqueezefsError::CacheOverflow => libc::ENOMEM,
         SqueezefsError::Timeout => libc::ETIMEDOUT,

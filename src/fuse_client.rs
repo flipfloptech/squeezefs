@@ -14224,7 +14224,7 @@ impl SqueezefsFilesystem {
                 }
                 // PR 13 §4.4z (the flip blocker, review round 1 Issue 12):
                 // record-level mutations of a FOREIGN-slot object refused
-                // loud (EOPNOTSUPP naming PR 13b) — 0 on every unarmed
+                // loud (EREMOTE naming PR 13b) — 0 on every unarmed
                 // mount by construction; on an armed one each is a verb
                 // PR 13b's ship will serve.
                 metrics.insert(
@@ -27036,10 +27036,22 @@ impl Filesystem for SqueezefsFilesystem {
         // of at the first `write`. The virtual `.stats`/`.config` inodes
         // below are exempt: they are synthesized read payloads and are
         // opened O_RDONLY by every consumer.
-        const WRITE_INTENT: u32 =
-            (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND | libc::O_CREAT) as u32;
+        const WRITE_INTENT: u32 = crate::meta_backend::OPEN_WRITE_INTENT;
         if !is_virtual_ino(inode) && flags & WRITE_INTENT != 0 {
             self.ro_gate("open(write intent)")?;
+            // PR 13 §4.4z (review round 2, Issue 22): on the ARMED plane a
+            // write-intent open of a FOREIGN-slot file refuses HERE, where
+            // the shell checks — the default mount's writeback cache acks
+            // `write(2)` into the page cache and the WRITE handler's gate
+            // reaches the application only at fsync/close through the
+            // kernel's errseq, so `>>` printed rc 0 with its bytes gone.
+            // Typed `EREMOTE` naming PR 13b; one lease-table read on an
+            // armed mount, nothing unarmed; a read-only open never here.
+            if let Some(backend) = self.meta_backend.as_ref() {
+                backend
+                    .refuse_foreign_slot_open(inode, flags)
+                    .map_err(map_squeezefs_err)?;
+            }
         }
 
         if is_virtual_ino(inode) {
@@ -27274,10 +27286,17 @@ impl Filesystem for SqueezefsFilesystem {
             return Err(Errno::from(libc::EACCES));
         }
         // PR 13 §4.4z (the flip blocker): a FOREIGN-slot file's write on an
-        // armed mount refuses BEFORE a byte is accepted — the typed
-        // `EOPNOTSUPP` naming PR 13b — so `>>` fails at write(2), never an
-        // ack whose bytes the fsync publish's door then refuses. One lease-
-        // table read on an armed mount, nothing unarmed.
+        // armed mount refuses here with the typed `EREMOTE` naming PR
+        // 13b — the BELT behind the open gate (an fd opened before the slot
+        // moved, the shim's ring writes). What this gate delivers depends
+        // on the mount: under `--no-writeback`, `O_DIRECT` or `O_SYNC` the
+        // application's `write(2)` fails here; on the DEFAULT
+        // writeback-cached mount the kernel has already acked the write
+        // into its page cache and this refusal reaches the application at
+        // `fsync`/`close` through the kernel's errseq (POSIX-16's class) —
+        // which is why the OPEN gate above it exists (review round 2,
+        // Issue 22). One lease-table read on an armed mount, nothing
+        // unarmed.
         if let Some(backend) = self.meta_backend.as_ref() {
             backend
                 .refuse_foreign_slot_file_mutation(ino, "write")

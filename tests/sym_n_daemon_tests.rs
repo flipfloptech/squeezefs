@@ -4640,12 +4640,17 @@ async fn a_dead_joiners_half_applied_cross_owner_unlink_is_rolled_forward_at_the
 /// verb router + the S9 publish shipper re-keyed by SLOT HOLDER through
 /// `step_home`, the served side under the holder's lease recalling the
 /// object's tokens — design §5.10's row prices it at "1 custody grant + 1
-/// publish ship per layout publish"). Until that arm lands the armed
-/// plane answers the interim typed refusal (the next contract), so this
-/// pin is `#[ignore]`d; PR 13b un-ignores it.
+/// publish ship per layout publish"). All THREE faces of the §4.4z row
+/// (review round 2, Issue 27): the record-level verbs (`setattr`,
+/// `setxattr`), the DATA write (the layout publish — a joiner's
+/// `write` + `fsync` at the routed layer) and the read-back at the
+/// holder. Until that arm lands the armed plane answers the interim typed
+/// refusal (the next contract), so this pin is `#[ignore]`d; PR 13b
+/// un-ignores it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "PR 13b: the record-level ship to the slot holder (defect 32, record §4.4z) — un-ignore with it"]
 async fn a_joiners_setattr_of_the_managers_file_lands_at_the_holder() {
+    use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
@@ -4677,6 +4682,54 @@ async fn a_joiners_setattr_of_the_managers_file_lands_at_the_holder() {
         manager.getattr(f).await.unwrap().mode,
         libc::S_IFREG | 0o600
     );
+    // The xattr face.
+    j.setxattr(f, "user.pr13b", b"shipped")
+        .await
+        .expect("PR 13b: a foreign-slot file's setxattr ships to its slot holder");
+    assert_eq!(
+        manager.getxattr(f, "user.pr13b").await.unwrap().as_deref(),
+        Some(&b"shipped"[..]),
+        "the holder reads the shipped xattr"
+    );
+    // The DATA face: the joiner's write + fsync is a layout publish at the
+    // routed layer (one striped block, 4 MiB) — it lands at the holder and
+    // the holder's record reads the new size and layout.
+    let tag = volume_tag("vol-00000000000000a7");
+    let mut map = std::collections::HashMap::new();
+    map.insert(0u32, "vol-00000000000000a7://0".to_string());
+    let layout = bincode::serialize(&squeezefs::layout_wire::LayoutMetadata {
+        file_type: "striped".into(),
+        size: 4 * 1024 * 1024,
+        block_map: Some(map),
+        ..Default::default()
+    })
+    .unwrap();
+    j.set_layout_and_size(
+        f,
+        &layout,
+        4 * 1024 * 1024,
+        &[BlockRefOp::taken(BlockRef {
+            vol_tag: tag,
+            block_idx: 0,
+            owner_ino: f,
+            block_index: 0,
+        })],
+    )
+    .await
+    .expect("PR 13b: a foreign-slot file's layout publish ships to its slot holder");
+    assert_eq!(
+        manager.getattr(f).await.unwrap().size,
+        4 * 1024 * 1024,
+        "the holder reads the published size"
+    );
+    assert!(
+        manager
+            .getxattr(f, "layout")
+            .await
+            .unwrap()
+            .is_some_and(|l| l == layout),
+        "the holder reads the published layout"
+    );
     shutdown(&j).await;
     venue.tear_down();
     shutdown(&manager).await;
@@ -4689,7 +4742,9 @@ async fn a_joiners_setattr_of_the_managers_file_lands_at_the_holder() {
 /// bytes whose fsync publish the door then refused — bytes that vanished.
 /// Now every record-level verb on an object whose slot ANOTHER appender
 /// leases refuses LOUD, typed (`SqueezefsError::ForeignSlotFileMutation`,
-/// `EOPNOTSUPP`, naming PR 13b, the slot and its holder), BEFORE any read
+/// `EREMOTE` since fix round 2 — the `EOPNOTSUPP` this pin first asserted
+/// is what coreutils' `chmod`/`chown` swallow, §4.4ai, the next contract —
+/// naming PR 13b, the slot and its holder), BEFORE any read
 /// or write of the record: `setattr` / `setxattr` / `removexattr` at the
 /// routed trait entries, the layout publish at both publish entries (the
 /// FUSE write handler runs the same predicate before it accepts a byte),
@@ -4734,7 +4789,7 @@ async fn a_foreign_slot_files_record_mutation_refuses_loud_naming_pr_13b_until_i
             ),
             "{what}: the typed class, never ENOENT/EIO: {e:?}"
         );
-        assert_eq!(e.to_errno(), libc::EOPNOTSUPP, "{what}");
+        assert_eq!(e.to_errno(), libc::EREMOTE, "{what}");
         let msg = e.to_string();
         assert!(
             msg.contains("PR 13b") && msg.contains("leases at g"),
@@ -4774,6 +4829,28 @@ async fn a_foreign_slot_files_record_mutation_refuses_loud_naming_pr_13b_until_i
             .expect_err("a layout publish of a foreign-slot file refuses before it decodes"),
         "layout publish",
     );
+    // The OPEN face (review round 2, Issue 22): every write-intent open of
+    // the foreign-slot file refuses at the open — where the shell checks —
+    // a read-only open passes (uncounted).
+    for flags in [
+        libc::O_WRONLY,
+        libc::O_RDWR,
+        libc::O_WRONLY | libc::O_APPEND,
+        libc::O_RDWR | libc::O_TRUNC,
+        libc::O_WRONLY | libc::O_CREAT,
+    ] {
+        typed(
+            j.refuse_foreign_slot_open(f, flags as u32)
+                .expect_err("a write-intent open of a foreign-slot file refuses"),
+            &format!("open {flags:#o}"),
+        );
+    }
+    let opens0 = FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed);
+    j.refuse_foreign_slot_open(f, libc::O_RDONLY as u32)
+        .expect("a read-only open of a foreign-slot file passes");
+    j.refuse_foreign_slot_open(f, (libc::O_RDONLY | libc::O_NOATIME) as u32)
+        .expect("a read-only open with read flags passes");
+    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), opens0);
     typed(
         j.merge_layout_and_size(
             f,
@@ -4788,8 +4865,8 @@ async fn a_foreign_slot_files_record_mutation_refuses_loud_naming_pr_13b_until_i
     );
     assert_eq!(
         FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed),
-        refusals0 + 5,
-        "every refusal counted"
+        refusals0 + 5 + 5,
+        "every refusal counted (the five verbs + the five write-intent opens)"
     );
     // The kernel's times ECHO (a read's `write_inode`: the mtime it got
     // from us + a ctime, nothing else) is ABSORBED against the holder's
@@ -4815,7 +4892,7 @@ async fn a_foreign_slot_files_record_mutation_refuses_loud_naming_pr_13b_until_i
         squeezefs::meta_backend::FOREIGN_FILE_TIMES_ECHO_ABSORBED.load(Relaxed),
         echoes0 + 1
     );
-    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 5);
+    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 10);
     // A `touch` (an mtime the record does not carry) is a real mutation —
     // refused loud like the rest.
     typed(
@@ -4833,7 +4910,7 @@ async fn a_foreign_slot_files_record_mutation_refuses_loud_naming_pr_13b_until_i
         .expect_err("touch of a foreign-slot file refuses"),
         "touch",
     );
-    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 6);
+    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 11);
     // Nothing moved; the file still resolves — never ENOENT.
     assert_eq!(j.getattr(f).await.unwrap().mode, libc::S_IFREG | 0o644);
     assert_eq!(
@@ -4874,7 +4951,9 @@ async fn a_foreign_slot_files_record_mutation_refuses_loud_naming_pr_13b_until_i
     j.setxattr(own, "user.x", b"1")
         .await
         .expect("an own-slot file's setxattr lands");
-    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 6);
+    j.refuse_foreign_slot_open(own, (libc::O_RDWR | libc::O_APPEND) as u32)
+        .expect("an own-slot file's write-intent open passes");
+    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 11);
     // The same law at the manager for the JOINER's file.
     typed(
         manager
@@ -4892,7 +4971,153 @@ async fn a_foreign_slot_files_record_mutation_refuses_loud_naming_pr_13b_until_i
             .expect_err("the manager's setattr of a joiner-slot file refuses"),
         "manager setattr",
     );
-    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 7);
+    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 12);
+    shutdown(&j).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
+/// **PR 13 fix round 2, §4.4ai — the interim refusal's ERRNO is one no
+/// tool is entitled to swallow.** Found by the real-mount contract
+/// (fidelity `sym-join-ladder`, the N = 3 leg): a joiner's `chmod` of
+/// joiner 3's file exited **0 and printed nothing** while the daemon
+/// refused the `SETATTR` and the mode stayed 644 at all three daemons —
+/// `strace` read `fchmodat(...) = -1 EOPNOTSUPP`. coreutils ≥ 9.6
+/// (`src/chmod.c`: "treat not supported as not applied"; `chown-core.c`
+/// the same for `lchownat`) classifies `ENOTSUP`/`EOPNOTSUPP` from the
+/// mode/owner syscalls as NOT AN ERROR — the accommodation for
+/// `AT_SYMLINK_NOFOLLOW` on Linux — so the errno class round 1 chose for
+/// "not built yet on this path" was the ONE class the tools that reach
+/// this face are allowed to hide. The in-process pin before this one
+/// asserted the typed class and `EOPNOTSUPP` itself — its premise was
+/// too narrow: it never asked what the SYSCALL's caller does with the
+/// word. This pin's premise is the FUSE layer's shape (a `chmod` under
+/// the writeback cache is `FATTR_MODE | FATTR_CTIME` — mode + a ctime,
+/// `trust_local_cmtime`; a `chown` is uid/gid + ctime; a `>>` is the
+/// `O_WRONLY | O_APPEND | O_CREAT` open) and its law is the caller's:
+/// the errno is NEVER in gnulib's `is_ENOTSUP` set, never `ENOENT` (the
+/// file exists), never `EAGAIN` (nothing is transient about it until PR
+/// 13b), and the record is untouched at both daemons. `EREMOTE` ("Object
+/// is remote" — the record lives at another appender, the S8 service's
+/// own not-the-owner word) is what the daemon is saying.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chmods_setattr_shape_on_a_foreign_slot_file_refuses_with_an_errno_no_tool_swallows() {
+    use squeezefs::meta_backend::FOREIGN_FILE_MUTATION_REFUSALS;
+    use std::sync::atomic::Ordering::Relaxed;
+    // gnulib `is_ENOTSUP(err)`: `err == ENOTSUP || err == EOPNOTSUPP` —
+    // what coreutils' chmod/chown read as "not applied", rc 0, silent.
+    const SWALLOWED_BY_CHMOD: [i32; 2] = [libc::ENOTSUP, libc::EOPNOTSUPP];
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let f = manager
+        .create(shared, "m", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap()
+        .ino;
+    mvol.checkpoint_now().await.unwrap();
+    let j = join(&uris, &venue, &mvol, 62).await;
+    let cur = j.getattr(f).await.expect("the file exists at the joiner");
+    assert_eq!(cur.mode, libc::S_IFREG | 0o644);
+    let refusals0 = FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed);
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let loud = |e: squeezefs::error::SqueezefsError, what: &str| {
+        assert!(
+            matches!(
+                e,
+                squeezefs::error::SqueezefsError::ForeignSlotFileMutation { .. }
+            ),
+            "{what}: the typed class: {e:?}"
+        );
+        let errno = e.to_errno();
+        assert!(
+            !SWALLOWED_BY_CHMOD.contains(&errno),
+            "{what}: errno {errno} is in coreutils' is_ENOTSUP set — chmod(1)/chown(1) \
+             exit 0 and print nothing on it (the real-mount contract's rc=0 '')"
+        );
+        assert_ne!(errno, libc::ENOENT, "{what}: the file exists");
+        assert_ne!(
+            errno,
+            libc::EAGAIN,
+            "{what}: nothing is transient until PR 13b"
+        );
+        assert_eq!(
+            errno,
+            libc::EREMOTE,
+            "{what}: the record lives at another appender"
+        );
+        assert!(e.to_string().contains("PR 13b"), "{what}: names the rung");
+    };
+    // chmod's SETATTR: FATTR_MODE | FATTR_CTIME (the writeback cache's
+    // `trust_local_cmtime` sends the ctime beside the mode).
+    loud(
+        j.setattr(
+            f,
+            Some(libc::S_IFREG | 0o600),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(now_ns),
+        )
+        .await
+        .expect_err("chmod's mode + ctime on a foreign-slot file refuses"),
+        "chmod (mode + ctime)",
+    );
+    // chown's SETATTR: uid/gid + ctime.
+    loud(
+        j.setattr(f, None, Some(0), Some(0), None, None, None, Some(now_ns))
+            .await
+            .expect_err("chown's uid/gid + ctime on a foreign-slot file refuses"),
+        "chown (uid + gid + ctime)",
+    );
+    // The shell's `>>`: O_WRONLY | O_APPEND | O_CREAT at the open.
+    loud(
+        j.refuse_foreign_slot_open(f, (libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT) as u32)
+            .expect_err("the `>>` open of a foreign-slot file refuses"),
+        ">> (open O_WRONLY|O_APPEND|O_CREAT)",
+    );
+    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 3);
+    // The record is untouched at BOTH daemons — the refusal is the whole
+    // effect (the real mount read 644 at joiner 2, joiner 3 and the
+    // manager after the rc-0 chmod).
+    let after_j = j.getattr(f).await.unwrap();
+    let after_m = manager.getattr(f).await.unwrap();
+    assert_eq!(after_j.mode, libc::S_IFREG | 0o644);
+    assert_eq!(after_m.mode, libc::S_IFREG | 0o644);
+    assert_eq!((after_j.uid, after_j.gid), (1000, 1000));
+    assert_eq!((after_m.uid, after_m.gid), (1000, 1000));
+    assert_eq!(after_m.ctime, cur.ctime, "the holder's ctime never moved");
+    // The pure times ECHO stays absorbed (mode/uid/gid/size absent, the
+    // mtime the record carries) — the narrow absorb is what keeps the
+    // chmod shape a refusal.
+    let echoes0 = squeezefs::meta_backend::FOREIGN_FILE_TIMES_ECHO_ABSORBED.load(Relaxed);
+    j.setattr(
+        f,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(cur.mtime),
+        Some(now_ns),
+    )
+    .await
+    .expect("the kernel's ctime-only echo is absorbed");
+    assert_eq!(
+        squeezefs::meta_backend::FOREIGN_FILE_TIMES_ECHO_ABSORBED.load(Relaxed),
+        echoes0 + 1
+    );
+    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 3);
     shutdown(&j).await;
     venue.tear_down();
     shutdown(&manager).await;

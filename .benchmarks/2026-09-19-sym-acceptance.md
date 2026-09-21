@@ -14,10 +14,11 @@ class (the 2026-09-14 venue law and the owner's 2026-09-20 restatement
 
 **NOT YET — and the rung did its job.** Every acceptance leg exists and
 ran from zero on a 7-joiner + token-reader fleet; every MECHANISM law
-is GREEN on the final binary (`702ab502`): `tar -x` at 0.96–1.02× of S0
-with 0.012 wire verbs per entry, one flip and `shipped ≡ served` in the
+is GREEN on the final binary (`702ab502`): `tar -x` with 0.012 wire
+verbs per entry (its RATIO is the box's — §1), one flip and `shipped ≡ served` in the
 shared directory, `K + C + 3` tokens for its `ls -l`, a live holder never
-recalled and an idle tree moved in 5–8 ms, readers exact at the next
+recalled and an idle tree moved in 1–2 bursts (its 5–8 ms wall the
+box's — §1), readers exact at the next
 resolve with the recall RTT as the free-grace hold, the free wall and
 the join storm served, the 46-volume format row VALID, SIM-1 at 12,500
 × 64 MET, and **`sym-crash` 10/10 GREEN on nine consecutive from-zero
@@ -31,9 +32,11 @@ a reader that never followed a failover, a shipped/local/mid-plan
 `fsync` by one stale refinement, three joiners aborting on a stack
 overflow) and **one it could not build — the record-level metanode arm
 (defect 32)**: a colleague's file cannot be `chmod`ed, `touch`ed or
-WRITTEN from another mount, and an unfsynced append acks bytes that
-never land — design §5.10's priced row, never built, the flip's first
-blocker. **Every RATE, wall-clock ratio and timing-shaped reading in
+WRITTEN from another mount, and as found an unfsynced append acked bytes
+that never landed — design §5.10's priced row, never built, the flip's
+first blocker (the interim posture since the fix rounds: the ARMED plane
+refuses the OPEN for write and every record mutation of such a file
+`EREMOTE` naming PR 13b, §4.4z / §4.4ai). **Every RATE, wall-clock ratio and timing-shaped reading in
 this record is venue-attributed pending the box** (`51bf21e1`: "no laptop
 number holds merit, enters a record as a verdict, or decides a gate") —
 never a MET, never a MISS; the box owes gates 1 / 2 / 3 / 3b / 3c / 5 / 7
@@ -83,8 +86,11 @@ kill), `squeezefs appenders`, SIM-1 = `membership_sim::run_sharded` (release).
 
 ## 2. Gate table
 
-_(MET / MISS per row with its engagement gauges; rows fill in as they run.
-"dev" = scoping venue; "box" = squeeze-test.)_
+_(Per row: the MECHANISM verdict with its engagement gauges, and the
+RATE's status — under the venue ruling (`51bf21e1`, §1) a laptop rate is
+never a MET or a MISS, so every rate row reads OWED to the box or
+SCOPING; the only MET words are SIM-1's (tier (ii), the design's own
+class). "dev" = scoping venue; "box" = squeeze-test.)_
 
 | Gate | Row | Venue | Verdict | Engagement (the law's gauges) |
 |---|---|---|---|---|
@@ -316,7 +322,8 @@ Every batch runs both ×10 from zero on the binary its row names
 (counted-restart law: a red aborts the count, the fix restarts it).
 `sym-crash` (7 joiners + a token reader, the manager killed −9 every
 round under a sustained write load, the successor remounted): **10/10
-GREEN on attempts 7, 8, 9 and 10** — per round the acked-writes oracle
+GREEN on nine consecutive from-zero attempts (7–15, listed with their
+binaries in §3.8b)** — per round the acked-writes oracle
 (866–3,820 fsynced files per round, all present with content), the
 reader following the failover as a member without fencing
 (`self_fences` 0), a member worker re-enrolled at the successor, the
@@ -1108,7 +1115,8 @@ as_a_counted_posture_decision`.
 ### 4.4q Defect 23 — FIXED (PR 12b's joiner under PR 8's grant window): a joiner's never-published mint was abandoned INTO the allocator's terminal-free gate — an ERROR per abandon and a leaked grant block
 
 Found by the first green `sym-walls` run on the defect-22 binary
-(`/tmp/grok-justin/pr13-walls3`, both rows MET): the fleet's ERROR census
+(`/tmp/grok-justin/pr13-walls3`, both rows' mechanism laws GREEN — the
+rates venue-attributed, §1): the fleet's ERROR census
 read ONE class left — `block free refused: this armed symmetric writer
 does not hold the ALLOCATION LEASE …` (`free_block`'s `plane_gate`), 2
 across two joiners, mid-rewrite. `BlockAllocator::abandon_unpublished_
@@ -1454,16 +1462,65 @@ file_lands_at_the_holder` (the two-backend fixture: a joiner's `setattr`
 of the manager's file lands and the manager reads it) — and the armed
 plane REFUSES the class LOUD until then: `RoutedMetaBackend::refuse_
 foreign_slot_file_mutation` answers the typed `SqueezefsError::
-ForeignSlotFileMutation` (`EOPNOTSUPP`, naming PR 13b, the slot and its
-holder) at the routed `setattr` / `setxattr` / `removexattr` entries
+ForeignSlotFileMutation` (`EREMOTE` since fix round 2 — §4.4ai; round 1's
+`EOPNOTSUPP` is the class coreutils' `chmod`/`chown` swallow — naming PR
+13b, the slot and its holder) at the routed `setattr` / `setxattr` / `removexattr` entries
 BEFORE any read of the record, at both layout publish entries and per
 member of the publish group, and in the FUSE `write` handler before a
 byte is accepted — so `chmod`/`touch` never answer `ENOENT` for a file
-that exists, `setfattr`'s `EOPNOTSUPP` is now the deliberate word, and
-`>>` fails at `write(2)` instead of acking bytes whose publish the door
-refuses; gauge `foreign_file_mutation_refusals` (0 unarmed by
-construction); pinned red-first by `a_foreign_slot_files_record_
-mutation_refuses_loud_naming_pr_13b_until_it_ships`.
+that exists and `setfattr` answers the deliberate word;
+the kernel's SETATTR times ECHO (ctime-only, mtime unchanged — what
+every writeback lands) is ABSORBED against the holder's record instead
+of refused (`foreign_slot_setattr_gate`, `4523f25e`; gauge
+`foreign_file_times_echo_absorbed` — the storm's oracle had read 14 k
+refusals per round of exactly this echo); gauge
+`foreign_file_mutation_refusals` (0 unarmed by construction); pinned
+red-first by `a_foreign_slot_files_record_mutation_refuses_loud_naming_
+pr_13b_until_it_ships`. **Fix round 2 (Issue 22 — the `write` gate's
+claim was FALSE on the default mount):** the default mount negotiates
+`FUSE_WRITEBACK_CACHE` (`--no-writeback` is the opt-out; interception
+mounts force write-through), so an application's `write(2)` lands in the
+kernel's page cache and RETURNS 0 — the daemon sees the `FUSE_WRITE`
+only at writeback (`fuse_flush` at `close`, `fsync`, dirty pressure) and
+the `write` gate's refusal reaches the application through the kernel's
+errseq at `fsync(2)`/`close(2)` (POSIX-16's class); a shell `>>` whose
+close status nobody reads still printed rc 0 with the bytes gone, the
+exact pre-fix symptom above. **The interim gate therefore also sits
+where a shell CAN see it:** the FUSE `open` handler refuses an `open(2)`
+of a FOREIGN-slot file that carries WRITE INTENT (`O_WRONLY` / `O_RDWR`
+/ `O_TRUNC` / `O_APPEND` / `O_CREAT` — `meta_backend::OPEN_WRITE_INTENT`,
+the S5 reader gate's own mask) with the same typed refusal naming
+PR 13b (`RoutedMetaBackend::refuse_foreign_slot_open`, behind the plane;
+an own-region slot exempt per `b8c4c92a`; a read-only open untouched; a
+`-o ro` reader unchanged — the kernel refuses its writes first), so `>>`,
+`dd`, `truncate` and every `O_WRONLY` open fail LOUD at the open and no
+write is ever acked; the `write` / `setattr` / `setxattr` / publish gates
+stay as the BELT for an fd opened before the slot moved and for the il
+shim's ring-write path (which the FUSE handlers never see). The honest
+statement of the class: **the open refuses; a write that reaches the
+`write` handler is refused at `write(2)` only on a `--no-writeback`,
+`O_DIRECT` or `O_SYNC` path, else at `fsync`/`close` through the kernel's
+errseq — and a shell redirection that ignores `close`'s status reports
+success**. Pinned on the two-backend fixture (the same contract's OPEN
+face: five write-intent flag sets refused and counted, `O_RDONLY` passes
+uncounted, an own-slot `O_RDWR|O_APPEND` passes) and LIVE on the fidelity
+tier's `sym-join-ladder` leg (three real daemons on kernel nvmet: joiner
+2's `echo >> f7` into joiner 3's file fails at the open with "Object
+is remote", `chmod` refuses AND exits nonzero (§4.4ai — its first run
+exited 0 on `EOPNOTSUPP`), the mode stays 644 at all three daemons,
+both mounts still read the six bytes, `foreign_file_mutation_refusals`
+≥ 2 at the refusing joiner) — the
+`sym_convert_fuse_tests` precedent is a ONE-mount suite and cannot stand
+a second daemon, which is why the live pin rides the fidelity leg. **Two
+shapes the interim refusal answers `EREMOTE` for a slot legitimately
+about to be THIS mount's — both transient, both PR 13b's:** a slot
+mid-handover TO this mount (`Offered` / `Releasing` resolve to the
+DEPARTING holder for the handover's milliseconds, where `EAGAIN` would be
+the honest word), and a JOINER whose lease PROJECTION lags a release (the
+slot reads leased-to-the-old-lessee until the projection refreshes; the
+door's first touch would have acquired it). Both vanish with PR 13b's
+ship, whose served side applies under the holder's lease and needs no
+local verdict.
 
 ### 4.4aa Defect 33 — FIXED (PR 2's KD-SYM-10 audit × PR 10's recovery): a manager leaf dirty when a dead appender's recovery took the SMO mutex aged past the landing ceiling BY DESIGN — every recovery that met one tripped the must-stay-0 gauge
 
@@ -1673,13 +1730,36 @@ the insert (the initiator dead mid-plan with the insert's holder ALSO
 dead — the two-process dead-initiator shape §7 routes to PR 13b, met
 here for real), or the mover's `mv` acked on a rename whose insert step
 never reached durability at the holder before the kill (PR 6's ack law
-would then be the defect). **Not fixed in this round**: the fix loop's
-turn ended at the finding; it is a P0 class (acked loss on the death
-path) and joins defect 32 as a flip blocker — PR 13b's first item, with
-the attribution recipe: re-run the shape with `SQUEEZEFS_XV_TRACE` on the
-initiator and the stripe holders, correlate the lost names' intent ids
-against the manager's roll-forward log, and read the recovered stripe
-tree's frames for the inserts. The harness die that should have named it
+would then be the defect). **The two populations (fix round 2, Issue
+25):** the oracle's 25 = the 15 names + the 10 RETURNED ones counted a
+second time by the moved ledger's own pass ("a RETURNED mv is not at its
+destination"); the 15 lost names are TWO classes the oracle must judge apart —
+**10 whose `mv` had RETURNED** (in `moved-w60-r4.ledger`: an acked rename
+whose insert PR 6's law says was durable at its holder before the ack;
+absent at both homes after every ring's recovery, this is the P0 signal
+whatever the oracle's timing) and **5 whose `mv` had NOT returned** (the
+kill caught the rename mid-plan; a name at NEITHER home while its intent
+is still OPEN is the S3.5 lattice's DESIGNED transient — PR 10's driver
+runs `roll_forward_open_intents` AFTER the per-region recoveries that
+move `appender_recoveries`, and the round's oracle ran the instant
+`appender_recoveries ≥ want`, so those five may be the roll-forward's
+window read too early, never a loss). **The timing premise the recipe
+gains**: the oracle settles on `xv_cross_owner_intents_open == 0` at the
+manager (bounded by the landing ceiling × a few + the stuck grace; past
+it the harness dies naming `xv_cross_owner_intents_stuck`) before it
+judges, snapshots `xv_cross_owner_intents_{open,stuck}` and
+`recovery_intents_rolled_forward` per round, and a lost name whose `mv`
+did not return with an intent still open is reported "in flight", not
+LOSS — the harness carries this since fix round 2 (`tests/run_mw_matrix.
+sh`, the storm's recovery wait). **Not fixed in this round**: the fix
+loop's turn ended at the finding; it is a P0 class (acked loss on the
+death path) and joins defect 32 as a flip blocker — PR 13b's first item,
+with the attribution recipe: re-run the shape with `SQUEEZEFS_XV_TRACE`
+on the initiator and the stripe holders, settle on the intent gauges as
+above, correlate the lost names' intent ids against the manager's
+roll-forward log (`recovery_intents_rolled_forward`), and read the
+recovered stripe tree's frames for the inserts — the 10 RETURNED names
+first. The harness die that should have named it
 was itself red (`survivors[0]` unbound under `set -u` when every joiner
 is a victim) — fixed in `4523f25e`; the lost list and the ledgers are
 the evidence.
@@ -1801,6 +1881,72 @@ Recipe for the class: a pin that names its actors by SPAWN ORDER and
 awaits one of them unbounded before releasing a seam is this deadlock
 waiting for load — every such await in a seam-driven pin is bounded, and
 the actors are named by what the SEAM observed.
+
+### 4.4ai Fix-round-2 finding — FIXED (PR 13's own interim refusal, §4.4z): the real-mount contract read `chmod` exiting 0 on a REFUSED `SETATTR` — the errno class round 1 chose (`EOPNOTSUPP`) is the one class coreutils' `chmod`/`chown` are entitled to swallow
+
+**Found by the fidelity `sym-join-ladder` leg's new §4.4z contract on
+its first run** (fix round 2, the N = 3 real-daemon leg, `PASS=122
+FAIL=1`): `SYMJOIN/N: joiner 2's chmod of joiner 3's file: rc=0 ''
+(want EOPNOTSUPP)` — while the `>>` half beside it PASSED (the open
+refused, bash printed the error, rc 1). **Attribution** (an untracked
+instrumented re-run of the leg alone, `/tmp/grok-justin/fix2-attrib-
+run1.log`): joiner 2's daemon logged `FUSE SetAttr { mode: Some(33152),
+ctime: Some(..) }` for the file and REFUSED it with the typed class
+(`foreign_file_mutation_refusals` 1 → 2, the ERROR line naming slot 137
+/ appender 2); `strace` on the `chmod` read **`fchmodat(AT_FDCWD, ".../
+w3-dir/f7", 0600) = -1 EOPNOTSUPP`**; the mode read **644 at joiner 2,
+joiner 3 and the manager** before and after. So the daemon was right on
+every count — the errno reached the syscall and nothing moved — and
+**`chmod(1)` exited 0 and printed nothing**: coreutils ≥ 9.6
+(`src/chmod.c`, `process_file`: `if (! is_ENOTSUP (errno)) { error(…);
+ch.status = CH_FAILED; } /* else treat not supported as not applied
+*/`; `src/chown-core.c` the same for `lchownat` — "Ignore any error due
+to lack of support") classifies `ENOTSUP` / `EOPNOTSUPP` from the mode
+and owner syscalls as NOT AN ERROR, its accommodation for
+`AT_SYMLINK_NOFOLLOW` on Linux. Not (a) a different handler path (the
+one FUSE `setattr` ran, its `SetAttr` shape is the chmod's — mode + the
+writeback cache's `trust_local_cmtime` ctime), not (b) the own-region
+exemption (`b8c4c92a`'s predicate answered "foreign", the refusal
+fired), not (c) a lost errno (the syscall returned it): **the WORD was
+wrong**. "Not supported" is exactly what a permission-preserving tool is
+entitled to ignore (`cp -p`, `rsync -p`, `tar -p` would have "preserved"
+a colleague's file's mode silently too), and the in-process pin of round
+1 asserted the typed class and the errno's VALUE — never what the
+syscall's caller does with it: its premise was too narrow.
+
+**Fix** (`src/error.rs`, the one `to_errno` row; every site that named
+the word): `SqueezefsError::ForeignSlotFileMutation` → **`EREMOTE`**
+("Object is remote" — the record lives at another appender, which is
+what the daemon is saying; the S8 owner service's own not-the-owner word
+for an intent naming a volume this node holds no authority over). Never
+`ENOENT` (the file exists), never `EIO` (nothing broke), never `EAGAIN`
+(nothing is transient until PR 13b), never `EPERM` (collides with
+`default_permissions`' class — an operator could not tell "not the
+owner" from "not the lessee" without the log), never `EXDEV` (S8's
+rename/link word, whose text misleads a `chmod`; `mv` falls back to
+copy-and-unlink on it). No tool masks or retries `EREMOTE`; neither the
+FUSE kernel module nor the VFS special-cases it (grep of `fs/fuse`,
+`namei.c`, `open.c`, `attr.c`, `xattr.c` on the 7.2.3 tree: no hit). The
+typed class, the gauge, the message naming PR 13b / the slot / the
+holder, the open-for-write gate, the times-echo absorb and the
+own-region exemption are unchanged; a flat/unarmed mount never
+constructs the class.
+
+**Pinned red-first** — `sym_n_daemon_tests::a_chmods_setattr_shape_on_a_
+foreign_slot_file_refuses_with_an_errno_no_tool_swallows` (the
+two-backend fixture): the premise is the FUSE layer's SHAPES (a `chmod`
+is `mode + ctime`, a `chown` is `uid/gid + ctime`, a `>>` is the
+`O_WRONLY | O_APPEND | O_CREAT` open) and the law is the CALLER's — the
+errno is outside gnulib's `is_ENOTSUP` set (`ENOTSUP`, `EOPNOTSUPP`),
+never `ENOENT`, never `EAGAIN`, `EREMOTE` exactly, the message names PR
+13b, the record untouched at BOTH daemons (mode, uid/gid, the holder's
+ctime), the ctime-only echo still absorbed; RED on the `EOPNOTSUPP` tree
+with the exact message ("errno 95 is in coreutils' is_ENOTSUP set —
+chmod(1)/chown(1) exit 0 and print nothing on it"), GREEN on the fix.
+The round-1 pin asserts `EREMOTE` now; `posix_errno_tests`' table
+carries the row. The fidelity contract greps `Object is remote`,
+requires `chmod`'s exit status nonzero, and reads the mode at all three
+daemons after the refusal (644).
 
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
@@ -1949,13 +2095,27 @@ resource than it did.
 
 ## 7. Owed (what PR 14 / PR 15 inherit)
 
-**Flip-blocking (one item — §4.4z, defect 32):** the record-level
+**Flip-blocking (three items — §4.4z defect 32, §4.4af finding 1, §4.4ag
+finding 2; §9 lists them as the flip's preconditions):**
+
+**(i) §4.4z, defect 32:** the record-level
 metanode arm — a foreign-slot FILE's `setattr` / `setxattr` / layout
 publish from a mount that does not lease its slot ships to the holder
 (design §5.10's "1 custody grant + 1 publish ship per layout publish";
-the door's own "ships to its holder" text). Today: `chmod`/`touch` of a
-colleague's file `ENOENT`, `setfattr` `EOPNOTSUPP`, a write's fsync
-refused and `>>` acking bytes that never land. Fix shape: `daemon_verb_
+the door's own "ships to its holder" text). Today (the interim posture
+since fix rounds 1–2): the ARMED plane REFUSES the class LOUD with the
+typed `EREMOTE` naming PR 13b (§4.4ai — never `EOPNOTSUPP`, the class
+coreutils' `chmod`/`chown` swallow as "not applied") — the `open(2)` for
+write of a colleague's file fails at the open (so `>>` / `dd` /
+`truncate` never ack a byte), `chmod`/`touch`/`setfattr` refuse at the
+syscall AND their exit status says so, and the
+`write` / publish gates stay as the belt for an fd opened before the slot
+moved or the il shim's ring path (there a write is refused at `write(2)`
+only on a `--no-writeback` / `O_DIRECT` / `O_SYNC` path, else at
+`fsync`/`close` through the kernel's errseq); the kernel's ctime-only
+times echo is absorbed; two transient shapes (a slot mid-handover to
+this mount, a joiner's lagging lease projection) answer `EREMOTE`
+where `EAGAIN` would be honest. Fix shape: `daemon_verb_
 router` + the publish shipper keyed by SLOT HOLDER through PR 6's
 `step_home` (tree 0's lessee + the endpoint table) for the record-level
 verbs only (the namespace verbs keep PR 6's intent arm — the S8 router's
@@ -1967,6 +2127,18 @@ fixture (`sym_n_daemon_tests` — a joiner's `setattr`/`write` on the
 manager's file and the reverse) + a fleet leg (`sym-foreign-file`: N
 writers `chmod`/`touch`/append a colleague's files under the acked-writes
 oracle). A rung-sized item; PR 14 cannot flip before it lands.
+
+**(ii) §4.4af, fix-round finding 1 (item 13 below):** the acked-writes
+LOSS across a seven-victim kill with the cross-owner mover into striped
+destinations — 25 of 17,376, one writer's moved files, unattributed; a
+default cannot flip on an unattributed acked loss. PR 13b's first item;
+the storm ×10 count restarts from zero on its fix.
+
+**(iii) §4.4ag, fix-round finding 2 (item 14 below):** a joiner's user
+read answering `EIO` for one beat inside a manager failover — a gate-4
+PRECONDITION (its "refusals 0" law reads a user op failing on the death
+path as a violation, whatever the window's width) that PR 13b clears
+beside defect 15's follow.
 
 Product (each named to its rung, none flip-blocking — every one has a
 counted decline, a bounded window or a stated venue):
@@ -2026,10 +2198,13 @@ counted decline, a bounded window or a stated venue):
    (no fleet up) read PASS = 190 / FAIL = 0 (`fix1-post3`); the rung's
    own FAIL 1 was the concurrent fleet's zram teardown between the tier's
    snapshots.
-12. **Defect 32's arm — PR 13b** (§4.4z; the flip-blocking item above):
+12. **Defect 32's arm — PR 13b** (§4.4z; flip-blocking item (i) above):
    the interim loud refusal and the `#[ignore]`d RED contract landed in
-   fix round 1 (Issue 12); PR 13b builds the ship and un-ignores the
-   contract.
+   fix round 1 (Issue 12); fix round 2 (Issue 22) moved the interim gate
+   to the `open(2)` for write — where a writeback-cached shell can see it
+   — and gave the contract its three faces (`setattr` + `setxattr`, the
+   layout publish, the data write + `fsync` reading back at the manager;
+   Issue 27); PR 13b builds the ship and un-ignores the contract.
 13. **Fix-round finding 1 — the acked-writes LOSS across a seven-victim
    kill with the cross-owner mover and striped destinations** (§4.4af; a
    FLIP BLOCKER beside defect 32): 25 of 17,376, one writer's moved files
@@ -2161,24 +2336,40 @@ Every local rate in §3 is dev-box scoping evidence for those rows.
 
 ## 9. The flip decision (for PR 14)
 
-**Decision: NOT YET — three blockers, two of them product.** (0) **Fix-round
+**Decision: NOT YET — four blockers, three of them product (§7's
+flip-blocking items (i)–(iii) + the box).** (0) **Fix-round
 finding 1 (§4.4af)**: an acked-writes LOSS on the death path under the
 seven-victim + cross-owner + striped shape — 25 of 17,376 fsynced files,
 one writer's moved files, at neither source nor destination after the
-recovery — found by the fix round's storm and NOT attributed; the ×10
+recovery (10 of them renames whose `mv` had RETURNED — the P0 signal; 5
+whose `mv` had not, which Issue 25's oracle now judges against the intent
+gauges) — found by the fix round's storm and NOT attributed; the ×10
 storm count restarts from zero on its fix. A default cannot flip on an
 unattributed acked loss. (1)
-**Defect 32 (§4.4z, §7's flip-blocking item)**: a file created on one
+**Defect 32 (§4.4z, §7's flip-blocking item (i))**: a file created on one
 mount cannot be `chmod`ed, `touch`ed, `setfattr`ed or WRITTEN from a
-mount that does not lease its slot — `ENOENT` / `EOPNOTSUPP` / a refused
-publish, and an append without an fsync acks bytes that never land. The
-design states the arm (§5.10's "1 custody grant + 1 publish ship");
-PR 9 built the grant, nobody built the ship, and the owed item left the
-ledger at PR 12b. A default that flips on this loses data on an ordinary
-POSIX op; it is the rung the flip waits for first (fix round 1 made the
-class refuse LOUD and typed — `EOPNOTSUPP` naming PR 13b, never `ENOENT`
-for a file that exists, never an acked `>>` — and wrote PR 13b's contract
-`#[ignore]`d RED; §4.4z). (2) The box brackets: the mechanism half of
+mount that does not lease its slot — as found `ENOENT` / `EOPNOTSUPP` / a
+refused publish, and an append without an fsync acked bytes that never
+landed. The design states the arm (§5.10's "1 custody grant + 1 publish
+ship"); PR 9 built the grant, nobody built the ship, and the owed item
+left the ledger at PR 12b. A default that flips on this loses data on an
+ordinary POSIX op; it is the rung the flip waits for first. The interim
+posture (fix rounds 1–2): the class refuses LOUD and typed —
+`EREMOTE` naming PR 13b (§4.4ai: round 1's `EOPNOTSUPP` let coreutils'
+`chmod` exit 0 on a refused syscall) at the `open(2)` for write (so `>>`
+fails at the open and never acks a byte), at `setattr`/`setxattr`/the publish, and
+as a belt in the `write` handler (there the refusal reaches an
+application at `write(2)` only on a `--no-writeback` / `O_DIRECT` /
+`O_SYNC` path, else at `fsync`/`close` through the kernel's errseq —
+POSIX-16's class); never `ENOENT` for a file that exists; PR 13b's
+contract stands `#[ignore]`d RED with its three faces (§4.4z). (1b)
+**Fix-round finding 2 (§4.4ag)**: a joiner's user read answering `EIO`
+for one beat inside a manager failover — a gate-4 PRECONDITION: gate 4's
+law is "refusals 0" on the death path, and a user op failing `EIO` there
+violates it whatever the window's width (a one-beat window is NOT
+admissible as a default — the S6 reclaim is designed so a live member
+never observes its own re-assertion as an error); PR 13b clears it beside
+defect 15's follow. (2) The box brackets: the mechanism half of
 every gate is GREEN on the dev box from zero on the final binaries (§3)
 — the fleet legs complete, every must-stay-0 tripwire but the
 venue-attributed flush-ceiling overrun reads 0, the kill matrix
@@ -2200,7 +2391,7 @@ Gates, exactly:
 | 3 scale | mechanism GREEN at every N every run (complete, `appenders == N`, tripwires flat, fsck clean, deleted stays deleted) | OWED (the deciding row) — the 0.7 × N law read 2.9–6.0 × at N = 8 across five laptop runs, SCOPING, venue-attributed |
 | 3b shared dir (+ `ls`) | mechanism GREEN (20,000 creates, one flip, ships ≡ served, handovers 0; `K + C + 3` tokens, 0 data-leaf reads) | OWED — the laptop's creates/s and `ls -l` wall SCOPING, venue-attributed |
 | 3c foreign touch | mechanism GREEN (LIVE never moved, IDLE moved in 1–2 bursts, PAUSED kept its tree) | OWED — the laptop's 5–8 ms handover wall SCOPING, venue-attributed |
-| 4 kill matrix | **`sym-crash` 10/10 on nine consecutive from-zero runs (attempts 7–15) + 1/1 then 0/1 on the widened arm (finding 2, §4.4ag); `sym-storm` ×10 NOT REACHED — 7 + 3 GREEN rounds from zero under `--venue=laptop`, stopped by finding 1 (§4.4af, an acked-writes LOSS — open)** | n/a (LOCAL by the venue law; the flush-ceiling gauge venue-attributed) |
+| 4 kill matrix | **`sym-crash` 10/10 on nine consecutive from-zero runs (attempts 7–15) + 1/1 then 0/1 on the widened arm (finding 2, §4.4ag — a gate-4 precondition PR 13b clears: a user read failing `EIO` on the death path is a "refusals 0" violation); `sym-storm` ×10 NOT REACHED — 7 + 3 GREEN rounds from zero under `--venue=laptop`, stopped by finding 1 (§4.4af, an acked-writes LOSS — open); both counts restart from zero on PR 13b's binary** | n/a (LOCAL by the venue law; the flush-ceiling gauge venue-attributed) |
 | 5 readers | mechanism GREEN (exactness, `recalls ≡ mutations × holders`, `fanout_p99 ≡ readers`, `reader_staleness_bound_ms` 0) on the 1-reader fleet | OWED (the 1 × 31 broadcast) — the laptop's recall RTT SCOPING, venue-attributed |
 | 6 format cost | see §3.6 | n/a |
 | 7 walls | mechanism GREEN (row (a) `shipped ≡ served ≥ displaced`; row (b) `/jobs` ships 7/7) — the flush-ceiling gauge's +1 readings are the ruling's named venue reading (§4.5) | OWED (N = 32) — the laptop's ≈ 1,000 frees/s and 2.2–3.2 s join wall SCOPING, venue-attributed |

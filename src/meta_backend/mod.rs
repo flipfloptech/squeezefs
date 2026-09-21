@@ -357,6 +357,13 @@ pub static FOREIGN_FILE_MUTATION_REFUSALS: std::sync::atomic::AtomicU64 =
 pub static FOREIGN_FILE_TIMES_ECHO_ABSORBED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// The `open(2)` flags that carry WRITE INTENT — the S5 reader gate's mask,
+/// shared with the foreign-slot open gate ([`RoutedMetaBackend::
+/// refuse_foreign_slot_open`]): `O_WRONLY | O_RDWR | O_TRUNC | O_APPEND |
+/// O_CREAT`. A read-only open carries none of them.
+pub const OPEN_WRITE_INTENT: u32 =
+    (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND | libc::O_CREAT) as u32;
+
 /// The **offline-bracket probes** every writable mount runs on the slot-0
 /// volume before it serves: `mw_upgrade:` (KD-MW-1 §6.2 mechanism i) and
 /// its sibling `owner_assign:` (per-volume claim admission §5.2.1 / sweep
@@ -1791,8 +1798,9 @@ impl RoutedMetaBackend {
     /// PR 13b's): on an ARMED volume an ino whose slot another appender
     /// leases refuses `setattr` / `setxattr` / `removexattr` / a data
     /// write / a layout publish LOUD with the typed
-    /// [`crate::error::SqueezefsError::ForeignSlotFileMutation`] (`EOPNOTSUPP`, naming
-    /// the rung, the slot and its holder), BEFORE any read or write of the
+    /// [`crate::error::SqueezefsError::ForeignSlotFileMutation`] (`EREMOTE`, naming
+    /// the rung, the slot and its holder — never `EOPNOTSUPP`, which coreutils'
+    /// `chmod`/`chown` swallow as "not applied", §4.4ai), BEFORE any read or write of the
     /// record — never `ENOENT` for a file that exists (the local commit's
     /// miss in the projection, defect 32's `chmod`/`touch` face), never an
     /// acked write whose fsync publish the door refuses (its `>>` face).
@@ -1807,6 +1815,27 @@ impl RoutedMetaBackend {
                 Err(e)
             }
         }
+    }
+
+    /// **The interim refusal at the OPEN** (PR 13 review round 2, Issue 22):
+    /// an `open(2)` carrying write intent ([`OPEN_WRITE_INTENT`]) of a
+    /// FOREIGN-slot object on an armed volume refuses the same typed
+    /// `ForeignSlotFileMutation` — at the syscall the SHELL checks. The
+    /// default mount negotiates the FUSE writeback cache, so `write(2)`
+    /// is acked by the kernel into its page cache and the WRITE handler's
+    /// gate reaches the application only at `fsync`/`close` through the
+    /// kernel's errseq (POSIX-16's class) — a `>>` whose close status
+    /// nobody reads still printed rc 0 and lost its bytes. Refusing the
+    /// open closes that face: no byte is ever accepted for a file this
+    /// mount cannot publish. The write / setattr / xattr / publish gates
+    /// stay as the belt (an fd opened before the slot moved; the shim's
+    /// ring writes). A read-only open passes; every unarmed / own /
+    /// unleased / own-region shape passes as before.
+    pub fn refuse_foreign_slot_open(&self, ino: Ino, flags: u32) -> Result<()> {
+        if flags & OPEN_WRITE_INTENT == 0 {
+            return Ok(());
+        }
+        self.refuse_foreign_slot_file_mutation(ino, "open for write")
     }
 
     /// [`Self::refuse_foreign_slot_file_mutation`]'s verdict WITHOUT the
@@ -1838,7 +1867,7 @@ impl RoutedMetaBackend {
                 "{what} of ino {ino}: its record lives in forest slot {slot} of metadata volume \
              {v_idx}, which appender {} leases at g {} — this mount (appender {}) does not; \
              the record-level ship to the slot holder is PR 13b's (design-symmetric-metadata \
-             §5.10), refused loud until it lands (EOPNOTSUPP; foreign_file_mutation_refusals)",
+             §5.10), refused loud until it lands (EREMOTE; foreign_file_mutation_refusals)",
                 holder.appender_id,
                 holder.g,
                 vol.own_appender_id()

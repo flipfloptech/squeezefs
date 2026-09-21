@@ -5966,6 +5966,16 @@ impl KvMetaBackend {
             });
         }
         slots.sort_by_key(|e| e.slot);
+        // The cut here is the 108 LOWEST page slots, not `page_plan`'s rank
+        // (review round 1, Issue 11) — and it is safe by construction: every
+        // word above is the lease TABLE's, i.e. tree 0's own `Leased` record
+        // (the grant-time root, cursor and extent count — a wire joiner's
+        // moved roots never reach this page, its own checkpoint writes
+        // them), so no entry is a root's only durable home and a truncated
+        // entry loses nothing. Bounded: a joiner before its first checkpoint
+        // holds ≤ `M` rotor slots + a beat of first touches; once
+        // `ckpt_seq ≥ 1` its own page writer owns the page and ranks by the
+        // plan (the arm above returns before this line).
         slots.truncate(super::appender::SLOT_PAGE_BUDGET);
         page.slots = slots;
         for off in e.dir_offsets {

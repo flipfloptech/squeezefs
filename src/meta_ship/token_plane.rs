@@ -2145,6 +2145,10 @@ pub struct TokenReaderPlane {
     /// plane parked on the member's reclaim for (PR 13b, §4.4ag —
     /// `dlm_token_membership_waits`).
     membership_waits: AtomicU64,
+    /// Test seam: the NEXT `call` sleeps this long before dialing (0 =
+    /// none) — the dead-listener re-dial a manager failover puts ahead of
+    /// the successor's first refusal.
+    test_call_delay_ms: AtomicU64,
     /// The recall channel's last round was refused by the holder's
     /// membership screen — the serve gate parks on this word instead of
     /// failing closed (cleared by the next completed round).
@@ -2266,11 +2270,19 @@ impl TokenReaderPlane {
             fetch_retries: AtomicU64::new(0),
             holder_repoints: AtomicU64::new(0),
             membership_waits: AtomicU64::new(0),
+            test_call_delay_ms: AtomicU64::new(0),
             channel_membership_pending: AtomicBool::new(false),
             grant_rtt: LatencyHistogram::default(),
         });
         ensure_records_r5(&plane);
         plane
+    }
+
+    /// Test seam: delay the plane's NEXT call by `ms` before it dials
+    /// (one shot) — stands in for the dead-listener re-dial a failover
+    /// puts ahead of the successor's first membership refusal.
+    pub fn test_delay_next_call_ms(&self, ms: u64) {
+        self.test_call_delay_ms.store(ms, Ordering::Relaxed);
     }
 
     /// **The arm's probe** (review round 1, Issue 17): one empty recall
@@ -2527,7 +2539,12 @@ impl TokenReaderPlane {
     /// loops and callers own the retry, and a park there would hold the
     /// channel's first round behind a member that never joins.
     async fn call_parking(&self, call: TokenCall) -> Result<TokenReply> {
-        let deadline = Instant::now() + crate::membership::reassertion_wait_bound();
+        // The bound starts at the FIRST membership refusal, not at entry:
+        // the call ahead of it may have spent seconds re-dialing a dead
+        // holder's listener (a manager failover — `sym-crash` round 2 read
+        // the class at the user after a 9 s dead dial had consumed the
+        // whole bound before the successor's first refusal).
+        let mut deadline: Option<Instant> = None;
         loop {
             let gen0 = crate::membership::grant_generation();
             match self.call(call.clone()).await {
@@ -2539,6 +2556,8 @@ impl TokenReaderPlane {
                 {
                     self.membership_waits.fetch_add(1, Ordering::Relaxed);
                     let now = Instant::now();
+                    let deadline =
+                        *deadline.get_or_insert(now + crate::membership::reassertion_wait_bound());
                     if now < deadline
                         && crate::membership::await_grant_adopted(gen0, deadline - now).await
                     {
@@ -2552,6 +2571,10 @@ impl TokenReaderPlane {
     }
 
     async fn call(&self, call: TokenCall) -> Result<TokenReply> {
+        let delay = self.test_call_delay_ms.swap(0, Ordering::Relaxed);
+        if delay > 0 {
+            squeezefs_ipc::sqz_time::sleep(Duration::from_millis(delay)).await;
+        }
         let n = self.sessions.len();
         let start = self.session_rr.fetch_add(1, Ordering::Relaxed) % n;
         let mut guard = None;

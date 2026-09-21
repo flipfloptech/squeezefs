@@ -4496,6 +4496,34 @@ async fn a_read_refused_not_a_member_parks_on_the_members_reclaim_and_never_answ
         .await
         .expect("a live lease serves again");
     assert_eq!(got.ino, f2);
+
+    // The `sym-crash` round-2 shape (PR 13b): the call AHEAD of the first
+    // membership refusal spends longer than the bound re-dialing a dead
+    // holder (the seam stands in for the dead dial); the park's bound
+    // starts at the FIRST refusal, so the reclaim one beat later still
+    // completes the read — measured from entry, the bound was spent before
+    // the successor ever answered and the class reached `stat(2)`.
+    let f3 = Metadata::create(writer.as_ref(), 1, "f3", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    *verdict.lock().unwrap() = LeaseVerdict::Expired;
+    let dead_dial = bound + Duration::from_millis(400);
+    plane.test_delay_next_call_ms(dead_dial.as_millis() as u64);
+    let v = Arc::clone(&verdict);
+    tokio::spawn(async move {
+        tokio::time::sleep(dead_dial + Duration::from_millis(250)).await;
+        *v.lock().unwrap_or_else(|p| p.into_inner()) = LeaseVerdict::Live;
+        squeezefs::membership::note_grant_adopted();
+    });
+    let got = tokio::time::timeout(
+        Duration::from_secs(20),
+        Metadata::getattr(reader.as_ref(), f3),
+    )
+    .await
+    .expect("the parked read returns inside the harness bound")
+    .expect("the bound starts at the first refusal: the reclaim one beat later completes the read");
+    assert_eq!(got.ino, f3);
     std::env::remove_var("SQUEEZEFS_MEMBERSHIP_PURGE_MS");
     std::env::remove_var("SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS");
     plane.stop().await;

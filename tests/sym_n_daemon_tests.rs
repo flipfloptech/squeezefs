@@ -4972,6 +4972,46 @@ async fn a_joiners_setattr_of_the_managers_file_lands_at_the_holder() {
         "the holder reads the inline record"
     );
     assert_eq!(j.getattr(f).await.unwrap().size, 7);
+    let s3 = record_ship_stats();
+    assert_eq!(s3.foreign_publish_ships - s0.foreign_publish_ships, 2);
+    assert_eq!(s3.foreign_publish_served - s0.foreign_publish_served, 2);
+    assert_eq!(s3.foreign_publish_refusals, s0.foreign_publish_refusals);
+
+    // A shipped publish the holder REFUSES (review round 1, Issue 4): an
+    // ino that routes to the holder's slot but has no record there. The
+    // ship travels and fails terminally — counted on
+    // `foreign_publish_refusals`, never on `foreign_publish_ships`, which
+    // counts publishes that LANDED (at the terminal reply, once per
+    // logical publish) so `ships ≡ served` holds at rest. RED on the
+    // first build, which counted the ship at the dispatch: a refusal
+    // read as a ship with no served twin.
+    let ghost = {
+        let (v, local) = j.route_ino(f);
+        let width = j.routing_width();
+        let routing = squeezefs::meta_backend::kv::record::forest_slot_of_ino(local) - 1;
+        // A raw local ino on the same routing slot, far past the cursor:
+        // never minted at the holder (`route_ino` re-derives the slot's
+        // guest keyspace from the routing slot).
+        assert_eq!(v, 0);
+        squeezefs::meta_backend::make_global_ino_width(4_000_000_000, u64::from(routing), width)
+    };
+    let refused =
+        squeezefs::meta_ship::publish::set_layout_and_size(&j, ghost, &inline, 7, &[]).await;
+    assert!(
+        refused.is_err(),
+        "a publish of an ino the holder has no record for is refused: {refused:?}"
+    );
+    let s4 = record_ship_stats();
+    assert_eq!(
+        s4.foreign_publish_refusals - s3.foreign_publish_refusals,
+        1,
+        "the refused publish is counted on foreign_publish_refusals"
+    );
+    assert_eq!(
+        s4.foreign_publish_ships, s3.foreign_publish_ships,
+        "a refused publish is NOT a ship — foreign_publish_ships ≡ foreign_publish_served"
+    );
+    assert_eq!(s4.foreign_publish_served, s3.foreign_publish_served);
 
     // The kernel's ctime-only times ECHO stays absorbed against the
     // holder's record — never shipped (the storm's oracle read 14 k per

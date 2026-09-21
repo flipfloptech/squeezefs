@@ -60,6 +60,13 @@ static RECORD_UNREACHABLE: AtomicU64 = AtomicU64::new(0);
 static FOREIGN_PUBLISH_SHIPS: AtomicU64 = AtomicU64::new(0);
 /// Layout publishes this holder SERVED for a peer under the armed plane.
 static FOREIGN_PUBLISH_SERVED: AtomicU64 = AtomicU64::new(0);
+/// Layout publishes this mount shipped to a slot holder whose terminal
+/// outcome was a FAILURE — refused at the holder, or the wire failed past
+/// the witnessed resend (review round 1, Issue 4; a slot-moved redirect is
+/// not terminal). `ships` counts the ones that LANDED, so at rest
+/// `foreign_publish_ships ≡ foreign_publish_served`; a refusal is the
+/// writer's retry class and lands nowhere.
+static FOREIGN_PUBLISH_REFUSALS: AtomicU64 = AtomicU64::new(0);
 /// Served mutations for which this HOLDER's FUSE layer invalidated its
 /// own view of the object — the router's RAM entry, the kernel's attrs
 /// (and pages for a publish) — over the classical sideband
@@ -116,6 +123,7 @@ pub struct RecordShipStats {
     pub record_unreachable: u64,
     pub foreign_publish_ships: u64,
     pub foreign_publish_served: u64,
+    pub foreign_publish_refusals: u64,
     pub served_mutation_invals: u64,
     pub served_mutation_prunes: u64,
     pub served_mutation_dirty_kept: u64,
@@ -132,6 +140,7 @@ pub fn stats() -> RecordShipStats {
         record_unreachable: RECORD_UNREACHABLE.load(Ordering::Relaxed),
         foreign_publish_ships: FOREIGN_PUBLISH_SHIPS.load(Ordering::Relaxed),
         foreign_publish_served: FOREIGN_PUBLISH_SERVED.load(Ordering::Relaxed),
+        foreign_publish_refusals: FOREIGN_PUBLISH_REFUSALS.load(Ordering::Relaxed),
         served_mutation_invals: SERVED_MUTATION_INVALS.load(Ordering::Relaxed),
         served_mutation_prunes: SERVED_MUTATION_PRUNES.load(Ordering::Relaxed),
         served_mutation_dirty_kept: SERVED_MUTATION_DIRTY_KEPT.load(Ordering::Relaxed),
@@ -208,6 +217,10 @@ pub fn stats_into(out: &mut serde_json::Map<String, serde_json::Value>) {
         s.foreign_publish_served.into(),
     );
     out.insert(
+        "foreign_publish_refusals".into(),
+        s.foreign_publish_refusals.into(),
+    );
+    out.insert(
         "served_mutation_invals".into(),
         s.served_mutation_invals.into(),
     );
@@ -234,9 +247,15 @@ pub fn phase_json() -> serde_json::Value {
     serde_json::Value::Object(phases)
 }
 
-/// Count one layout publish shipped to a slot holder.
+/// Count one layout publish that LANDED at a slot holder.
 pub(crate) fn note_publish_shipped() {
     FOREIGN_PUBLISH_SHIPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count one layout publish shipped to a slot holder that FAILED
+/// terminally (refused at the holder, or the wire failed).
+pub(crate) fn note_publish_refused() {
+    FOREIGN_PUBLISH_REFUSALS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Count one layout publish served for a peer under the armed plane.

@@ -2636,13 +2636,28 @@ impl PublishTarget {
 
     /// Count one LAYOUT-CLASS publish (a witnessed call — the class the
     /// holder's `serve_layout_publish` counts as `foreign_publish_served`)
-    /// shipped to a slot holder, so `foreign_publish_ships ≡
-    /// foreign_publish_served` fleet-wide: the generic-class sibling a
-    /// write also ships (`ParkWriteTimes`) is served through the generic
-    /// dispatch and belongs to neither side.
-    fn note_layout_ship(&self) {
+    /// that LANDED at a slot holder — counted at the terminal reply, once
+    /// per LOGICAL publish (review round 1, Issue 4: a slot-moved redirect
+    /// re-dispatches the same publish and a refused one lands nowhere;
+    /// counting at the dispatch made a legal redirect read as a closure
+    /// violation), so `foreign_publish_ships ≡ foreign_publish_served`
+    /// fleet-wide at rest: the generic-class sibling a write also ships
+    /// (`ParkWriteTimes`) is served through the generic dispatch and
+    /// belongs to neither side.
+    fn note_layout_ship_landed(&self) {
         if self.holder.is_some() {
             crate::meta_backend::record_ship::note_publish_shipped();
+        }
+    }
+
+    /// Count one layout-class publish shipped to a slot holder whose
+    /// terminal outcome is a FAILURE — the holder refused it, or the wire
+    /// failed past the witnessed resend (`foreign_publish_refusals`; a
+    /// slot-moved refusal that redirects is not terminal and counts here
+    /// only if the re-resolve itself fails).
+    fn note_layout_ship_refused(&self) {
+        if self.holder.is_some() {
+            crate::meta_backend::record_ship::note_publish_refused();
         }
     }
 
@@ -2928,7 +2943,6 @@ pub async fn set_layout_and_size(
             return Ok(OwnerVerdict::default());
         };
         intent_barrier_inos(&[ino]).await?;
-        t.note_layout_ship();
         let shipped = ship_witnessed(
             &t,
             PublishCall::SetLayoutAndSize {
@@ -2943,20 +2957,31 @@ pub async fn set_layout_and_size(
         .await;
         match shipped {
             Ok(PublishReply::PutDone { recomputed, freed }) => {
-                return Ok(OwnerVerdict { recomputed, freed })
+                t.note_layout_ship_landed();
+                return Ok(OwnerVerdict { recomputed, freed });
             }
             Ok(other) => {
+                t.note_layout_ship_landed();
                 return Err(protocol_error(
                     "set_layout_and_size",
                     &format!("{other:?}"),
                     "a Put acknowledgement",
-                ))
+                ));
             }
             Err(e) if !redirected && slot_moved_at_holder(&t, &e) => {
                 redirected = true;
-                target = publish_target_after_slot_moved(be, ino, WHAT).await?;
+                target = match publish_target_after_slot_moved(be, ino, WHAT).await {
+                    Ok(next) => next,
+                    Err(e) => {
+                        t.note_layout_ship_refused();
+                        return Err(e);
+                    }
+                };
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                t.note_layout_ship_refused();
+                return Err(e);
+            }
         }
     }
 }
@@ -3119,7 +3144,6 @@ pub async fn merge_layout_and_size(
             ));
         };
         intent_barrier_inos(&[ino]).await?;
-        t.note_layout_ship();
         let call = PublishCall::MergeLayoutAndSize {
             ino,
             delta: delta.encode(),
@@ -3140,25 +3164,36 @@ pub async fn merge_layout_and_size(
                 recomputed,
                 freed,
             }) => {
+                t.note_layout_ship_landed();
                 return Ok((
                     used,
                     version,
                     OwnerVerdict { recomputed, freed },
                     Vec::new(),
-                ))
+                ));
             }
             Ok(other) => {
+                t.note_layout_ship_landed();
                 return Err(protocol_error(
                     "merge_layout_and_size",
                     &format!("{other:?}"),
                     "a delta-used flag",
-                ))
+                ));
             }
             Err(e) if !redirected && slot_moved_at_holder(&t, &e) => {
                 redirected = true;
-                target = publish_target_after_slot_moved(be, ino, WHAT).await?;
+                target = match publish_target_after_slot_moved(be, ino, WHAT).await {
+                    Ok(next) => next,
+                    Err(e) => {
+                        t.note_layout_ship_refused();
+                        return Err(e);
+                    }
+                };
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                t.note_layout_ship_refused();
+                return Err(e);
+            }
         }
     }
 }
@@ -3288,20 +3323,25 @@ async fn ship_commit_block_refs(
     refs: &[BlockRefOp],
 ) -> Result<()> {
     intent_barrier_inos(&[ino]).await?;
-    target.note_layout_ship();
-    expect_unit(
-        ship_witnessed(
-            target,
-            PublishCall::CommitBlockRefs {
-                ino,
-                refs: wire_refs(refs),
-                lease_epoch: target.epoch(),
-                request_id: crate::cowriter::next_ship_request_id(),
-            },
-        )
-        .await?,
-        "commit_block_refs",
+    let reply = match ship_witnessed(
+        target,
+        PublishCall::CommitBlockRefs {
+            ino,
+            refs: wire_refs(refs),
+            lease_epoch: target.epoch(),
+            request_id: crate::cowriter::next_ship_request_id(),
+        },
     )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(e) => {
+            target.note_layout_ship_refused();
+            return Err(e);
+        }
+    };
+    target.note_layout_ship_landed();
+    expect_unit(reply, "commit_block_refs")
 }
 
 /// Routed [`RoutedMetaBackend::migrate_block_map_train`] — the kvmap
@@ -3446,7 +3486,6 @@ pub async fn migrate_block_map(
         }
         Some(target) => {
             intent_barrier_inos(&[ino]).await?;
-            target.note_layout_ship();
             // PR 5b (design §11's belt): the shipped head's own kvmap id
             // carries the generation this ship was computed against — the
             // verb's base_gen is its explicit face (0 on a first
@@ -3467,7 +3506,15 @@ pub async fn migrate_block_map(
                 lease_epoch: target.epoch(),
                 request_id: crate::cowriter::next_ship_request_id(),
             };
-            match ship_witnessed(&target, call).await? {
+            let reply = match ship_witnessed(&target, call).await {
+                Ok(reply) => reply,
+                Err(e) => {
+                    target.note_layout_ship_refused();
+                    return Err(e);
+                }
+            };
+            target.note_layout_ship_landed();
+            match reply {
                 PublishReply::MapMigrated {
                     records,
                     record_bytes,

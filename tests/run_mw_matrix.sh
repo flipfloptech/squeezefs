@@ -468,7 +468,7 @@
 #                       read back at the HOLDER and at a THIRD mount.
 #                       Engagement: Σ record_ships ≡ Σ record_served across
 #                       the daemons, record_refusals 0 everywhere, Σ
-#                       foreign_publish_ships ≡ Σ foreign_publish_served,
+#                       foreign_publish_ships ≡ Σ foreign_publish_served, foreign_publish_refusals == 0,
 #                       dlm_custody_via_slot_holder > 0 at every mutator;
 #                       fsck + the must-stay-0 set after. LOCAL = "it
 #                       works" (the box prices the row).
@@ -4603,7 +4603,7 @@ $(head -20 "$rowdir/lost.txt")"
 
     # Phase 4 — the engagement laws (the ledger closes at the two ends).
     for idx in "${writers[@]}"; do snap "$idx" ff1 "$rowdir"; done
-    local ships=0 served=0 refusals=0 unreachable=0 pships=0 pserved=0 v custody
+    local ships=0 served=0 refusals=0 unreachable=0 pships=0 pserved=0 prefused=0 v custody
     for idx in "${writers[@]}"; do
         v="$(sym_delta "$rowdir" "$idx" ff meta_ship.record_ships)"; ships=$((ships + v))
         [ "$v" -ge $((SYM_FF_FILES / 4 * 3 * 3)) ] || die "sym-foreign-file: m$idx record_ships +$v for $((SYM_FF_FILES / 4 * 3 * 3)) foreign record verbs (chmod + touch + setfattr per surviving file — three of every four)"
@@ -4613,14 +4613,19 @@ $(head -20 "$rowdir/lost.txt")"
         v="$(sym_delta "$rowdir" "$idx" ff meta_ship.foreign_publish_ships)"; pships=$((pships + v))
         [ "$v" -ge 1 ] || die "sym-foreign-file: m$idx foreign_publish_ships +$v — its appends into a colleague's files published through no slot holder"
         v="$(sym_delta "$rowdir" "$idx" ff meta_ship.foreign_publish_served)"; pserved=$((pserved + v))
+        v="$(sym_delta "$rowdir" "$idx" ff meta_ship.foreign_publish_refusals)"; prefused=$((prefused + v))
         custody="$(sym_delta "$rowdir" "$idx" ff dlm_custody.dlm_custody_via_slot_holder)"
         [ "$custody" -ge 1 ] || die "sym-foreign-file: m$idx dlm_custody_via_slot_holder +$custody — its write custody of a colleague's file came from no slot holder"
     done
     [ "$refusals" = "0" ] || die "sym-foreign-file: record_refusals=$refusals across the fleet (must stay 0)"
     [ "$unreachable" = "0" ] || die "sym-foreign-file: record_unreachable=$unreachable across the fleet — a holder had no endpoint bound"
     [ "$ships" = "$served" ] || die "sym-foreign-file: Σ record_ships $ships != Σ record_served $served (a shipped verb landed nowhere, or a served one was nobody's)"
+    # Review round 1, Issue 4: `foreign_publish_ships` counts the publishes
+    # that LANDED (at the terminal reply, once per logical publish), so it
+    # closes against served EXACTLY; a terminal failure is its own gauge.
     [ "$pships" = "$pserved" ] || die "sym-foreign-file: Σ foreign_publish_ships $pships != Σ foreign_publish_served $pserved"
-    echo "== PR 13b sym-foreign-file: ${#writers[@]} writers × $SYM_FF_FILES files: record_ships=$ships ≡ record_served=$served, record_refusals=0, foreign_publish_ships=$pships ≡ served=$pserved$SYM_BUSY_ROW ==" | tee "$rowdir/symff-table.txt"
+    [ "$prefused" = "0" ] || die "sym-foreign-file: foreign_publish_refusals=$prefused across the fleet — a shipped publish failed terminally at its holder"
+    echo "== PR 13b sym-foreign-file: ${#writers[@]} writers × $SYM_FF_FILES files: record_ships=$ships ≡ record_served=$served, record_refusals=0, foreign_publish_ships=$pships ≡ served=$pserved, foreign_publish_refusals=0$SYM_BUSY_ROW ==" | tee "$rowdir/symff-table.txt"
     for idx in "${writers[@]}"; do
         rm -rf "$(mnt_of "$idx")/ff-w$idx" 2>/dev/null || true
     done

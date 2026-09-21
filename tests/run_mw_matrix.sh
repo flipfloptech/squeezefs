@@ -3190,6 +3190,8 @@ leg_sym_storm() {
             rr_obj="${rr_obj#"$(mnt_of "${victims[0]}")"}"
             if [ -n "$rr_obj" ]; then
                 rr_grants0="$(stat_sum "$token_reader" dlm_token_grants)"
+                local rr_hits0
+                rr_hits0="$(stat_sum "$token_reader" dlm_token_hits)"
                 # Under `--cross-owner` the victim's MOVER renames every
                 # acked file into the manager's directory concurrently:
                 # the object is at its source or at its destination
@@ -3204,8 +3206,16 @@ leg_sym_storm() {
                         die "round $round: the token reader m$token_reader could not resolve victim m${victims[0]}'s acked object $rr_obj${rr_dst:+ (nor its moved form $rr_dst)} before the kill"
                     fi
                 fi
-                [ "$(stat_sum "$token_reader" dlm_token_grants)" -gt "$rr_grants0" ] 2>/dev/null ||
-                    die "round $round: the token reader's resolve of $rr_obj took no token (dlm_token_grants flat at $rr_grants0)"
+                # The arm's premise is that the reader HOLDS a token on the
+                # object it resolved: a fetch (`dlm_token_grants`) or a serve
+                # from a token it already held (`dlm_token_hits` — the
+                # storm's earlier rounds left the reader holding `/` and
+                # the round's directories) both satisfy it; only a resolve
+                # that touched NO token is the arm's failure.
+                if ! { [ "$(stat_sum "$token_reader" dlm_token_grants)" -gt "$rr_grants0" ] ||
+                    [ "$(stat_sum "$token_reader" dlm_token_hits)" -gt "$rr_hits0" ]; } 2>/dev/null; then
+                    die "round $round: the token reader's resolve of $rr_obj touched no token (dlm_token_grants flat at $rr_grants0, dlm_token_hits flat at $rr_hits0)"
+                fi
                 rr_recalls0="$(stat_sum "$token_reader" dlm_token_recalls_received)"
             fi
         fi

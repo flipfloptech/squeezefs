@@ -102,6 +102,10 @@
 # themselves and its flat pins (a bit-17-absent set arms nothing, the
 # knobs keep their shipped meaning, `set-owners` runs its shipped gates)
 # run on both legs.
+# `served_mutation_kernel_tests` (PR 13b — the HOLDER's kernel after a
+# served mutation: the invalidation + FUSE_NOTIFY_PRUNE frames, and the
+# FLAT/unarmed law that a mount's OWN mutations never reach the sink —
+# layout-blind, so both legs must read identically).
 # `sym_n_daemon_tests` (PR 12b — the N-daemon posture: two and three REAL
 # `KvMetaBackend`s open on one volume at once, the manager through `open`
 # and the joiners through the joined door over a real wire, all
@@ -200,6 +204,7 @@ DEFAULT_SUITES=(
   sym_crash_matrix_tests
   sym_mount_posture_tests
   sym_n_daemon_tests
+  served_mutation_kernel_tests
 )
 read -r -a SUITES <<<"${SQZ_SYM_SUITES:-${DEFAULT_SUITES[*]}}"
 RATIO_NOTE="${SQZ_SYM_RATIO_NOTE:-2.0}"

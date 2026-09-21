@@ -5028,6 +5028,275 @@ async fn a_joiners_setattr_of_the_managers_file_lands_at_the_holder() {
     // lost block by construction); the fleet leg is the data plane's row.
 }
 
+/// A `SqueezefsFilesystem` — the FUSE layer — in front of an already-open
+/// routed set: the handler-driven write / fsync / read path over a
+/// file-backed data volume (no staging: the inline shape needs none).
+struct FsFront {
+    fs: squeezefs::fuse_client::SqueezefsFilesystem,
+    req: fuse3::raw::Request,
+    _dev: tempfile::NamedTempFile,
+}
+
+async fn fs_in_front_of(routed: &Arc<RoutedMetaBackend>, vol_id: &str) -> FsFront {
+    let dev_file = tempfile::NamedTempFile::new().unwrap();
+    dev_file.as_file().set_len(64 * 1024 * 1024).unwrap();
+    let dev = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
+        dev_file.path().to_str().unwrap(),
+    ));
+    let alloc = Arc::new(
+        squeezefs::block_allocator::BlockAllocator::new(vol_id)
+            .await
+            .unwrap(),
+    );
+    let cache = squeezefs::cache::TieredCache::new(
+        Vec::new(),
+        Some("16MB"),
+        Some("16MB"),
+        Some("8MB"),
+        Some("16MB"),
+        alloc.clone(),
+        dev.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let dlm = squeezefs::dlm::DlmClient::new().unwrap();
+    let router = squeezefs::routing::DataRouter::new(dlm.clone(), cache, alloc, dev);
+    router.set_meta_backend(Arc::clone(routed));
+    let mut fs = squeezefs::fuse_client::SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+    fs.meta_backend = Some(Arc::clone(routed));
+    let req = fuse3::raw::Request {
+        unique: 1,
+        uid: 1000,
+        gid: 1000,
+        pid: 1,
+        ..Default::default()
+    };
+    FsFront {
+        fs,
+        req,
+        _dev: dev_file,
+    }
+}
+
+/// **The HOLDER's served-mutation sink never drops the holder's DIRTY
+/// layout entry** (review round 1, Issue 1 — the holder-side mirror of
+/// `85e42408`). The holder appends to its OWN file through the FUSE write
+/// handler (inline, unfsynced: the `layout_dirty` entry's `data_key` is
+/// the ONLY copy of the acked bytes — "RAM only until fsync/release")
+/// while a colleague `chmod`s the file through the ship (a record verb —
+/// no custody grant stands between them). The served verb lands at the
+/// holder's KV and runs the FUSE sink; before the fix the sink ran
+/// `discard_layout_cache` UNCONDITIONALLY, the holder's `fsync` found
+/// nothing dirty and returned 0 with the bytes in no KV. The law is the
+/// recall sink's — ONE function, `DataRouter::discard_clean_layout_entry`:
+/// decided under the ino's (3.5) guard in its non-parking form, a DIRTY
+/// entry is KEPT (counted, `served_mutation_dirty_kept`), a CLEAN entry is
+/// dropped, a held stripe skips the discard. The holder's fsync then lands
+/// the bytes and every mount reads them; the served mode stands beside
+/// them. A second file whose entry is CLEAN (fsynced) loses its entry at
+/// the served verb, as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_served_chmod_never_drops_the_holders_dirty_layout_entry() {
+    use fuse3::raw::prelude::Filesystem;
+    use std::ffi::OsStr;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mvenue = DaemonVenue::stand_up(&manager, true, "manager-custody-13b-dirty").await;
+    mvol.checkpoint_now().await.unwrap();
+    let j = {
+        Knobs::armed().apply();
+        let r = open_routed_meta_set_joined(
+            &uris,
+            &JoinedSetAdmission {
+                manager_endpoint: mvenue.endpoint.clone(),
+                secret: VENUE_SECRET.to_vec(),
+                peer_id: peer_of(&joiner_identity(&mvol, 62).await),
+                identity: joiner_identity(&mvol, 62).await,
+            },
+        )
+        .await;
+        Knobs::clear();
+        r.expect("the joined open")
+    };
+    let jvol = Arc::clone(&j.volumes[0]);
+    let jidentity = jvol.joined_wire().unwrap().identity;
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(&j),
+            &peer_of(&jidentity),
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    let _arm = arm_publish_writer(&j, &jidentity).await;
+
+    // The FUSE layer in front of the HOLDER, with the REAL served-mutation
+    // sink installed (the mount arm's act on an armed set).
+    let h = fs_in_front_of(&manager, "vol-13b-dirty").await;
+    h.fs.install_served_mutation_sink();
+    let s0 = record_ship_stats();
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+
+    // The holder's own files in its slot, made through the FUSE layer.
+    let dirty_ino =
+        h.fs.create(h.req, shared, OsStr::new("dirty"), libc::S_IFREG | 0o644, 0)
+            .await
+            .expect("the holder creates its file")
+            .attr
+            .ino;
+    let clean_ino =
+        h.fs.create(h.req, shared, OsStr::new("clean"), libc::S_IFREG | 0o644, 0)
+            .await
+            .expect("the holder creates its second file")
+            .attr
+            .ino;
+    // An inline append the holder has NOT fsynced: its dirty layout entry
+    // is the acked bytes' only home. The second file is fsynced — clean.
+    for ino in [dirty_ino, clean_ino] {
+        let w =
+            h.fs.write(
+                h.req,
+                ino,
+                0,
+                0,
+                bytes::Bytes::from_static(b"abcDEFG"),
+                0,
+                0,
+            )
+            .await
+            .expect("the holder's inline write");
+        assert_eq!(w.written, 7);
+    }
+    h.fs.fsync(h.req, clean_ino, 0, false)
+        .await
+        .expect("the clean file's fsync");
+    let entry =
+        h.fs.router
+            .metadata_cache
+            .get(&dirty_ino)
+            .expect("the unfsynced write left a layout entry");
+    assert!(entry.layout_dirty, "the entry is DIRTY — the acked write");
+    assert!(
+        h.fs.router
+            .metadata_cache
+            .get(&clean_ino)
+            .is_some_and(|m| !m.layout_dirty),
+        "the fsynced file's entry is CLEAN"
+    );
+    assert_eq!(
+        manager.getattr(dirty_ino).await.unwrap().size,
+        0,
+        "the KV has not seen the append yet"
+    );
+    assert_eq!(manager.getattr(clean_ino).await.unwrap().size, 7);
+
+    // The colleague chmods BOTH files through the ship: served at the
+    // holder under its lease, the FUSE sink runs for each.
+    for ino in [dirty_ino, clean_ino] {
+        j.setattr(
+            ino,
+            Some(libc::S_IFREG | 0o600),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(now_ns),
+        )
+        .await
+        .expect("PR 13b: the colleague's chmod ships to the holder");
+        assert_eq!(
+            manager.getattr(ino).await.unwrap().mode,
+            libc::S_IFREG | 0o600,
+            "the holder's record carries the served mode"
+        );
+    }
+    let s1 = record_ship_stats();
+    assert_eq!(s1.record_served - s0.record_served, 2, "two served verbs");
+
+    // The DIRTY entry survives the served mutation; the CLEAN one is gone.
+    let kept = h.fs.router.metadata_cache.get(&dirty_ino).expect(
+        "Issue 1: the served chmod's sink must KEEP the holder's DIRTY layout entry — it is \
+         the acked write, and its data_key is the bytes' only copy",
+    );
+    assert!(kept.layout_dirty);
+    assert_eq!(kept.size, 7);
+    assert_eq!(kept.data_key.as_deref(), Some(&b"abcDEFG"[..]));
+    assert!(
+        h.fs.router.metadata_cache.get(&clean_ino).is_none(),
+        "the CLEAN entry is dropped at the served verb (the holder's next read refetches)"
+    );
+    assert_eq!(
+        s1.served_mutation_dirty_kept - s0.served_mutation_dirty_kept,
+        1,
+        "the kept dirty entry is counted (meta_ship.served_mutation_dirty_kept)"
+    );
+    assert_eq!(
+        s1.served_mutation_discard_skipped, s0.served_mutation_discard_skipped,
+        "no stripe was held: nothing skipped"
+    );
+    assert_eq!(
+        squeezefs::invariant_tripwire_count("served_publish_over_dirty_entry"),
+        0,
+        "a record verb beside a dirty entry is legal — never the tripwire"
+    );
+
+    // The holder's fsync lands the bytes; every mount reads them, the
+    // served mode beside them.
+    h.fs.fsync(h.req, dirty_ino, 0, false)
+        .await
+        .expect("the holder's fsync lands the acked bytes");
+    let at_holder = manager.getattr(dirty_ino).await.unwrap();
+    assert_eq!(
+        at_holder.size, 7,
+        "the holder's KV carries the appended size"
+    );
+    assert_eq!(
+        at_holder.mode,
+        libc::S_IFREG | 0o600,
+        "the served mode stands"
+    );
+    let layout = manager
+        .getxattr(dirty_ino, "layout")
+        .await
+        .unwrap()
+        .expect("the persisted inline record");
+    let decoded = squeezefs::layout_wire::decode_layout_any(&layout).unwrap();
+    assert_eq!(decoded.data_key.as_deref(), Some(&b"abcDEFG"[..]));
+    let at_joiner = j.getattr(dirty_ino).await.unwrap();
+    assert_eq!(at_joiner.size, 7, "the colleague reads the landed size");
+    assert_eq!(at_joiner.mode, libc::S_IFREG | 0o600);
+    let got =
+        h.fs.read(h.req, dirty_ino, 0, 0, 7, 0)
+            .await
+            .expect("the holder's own read")
+            .data
+            .to_vec();
+    assert_eq!(got, b"abcDEFG", "the holder reads its own bytes back");
+    assert_must_stay_zero(&jvol, "joiner");
+    assert_must_stay_zero(&mvol, "manager");
+
+    squeezefs::meta_backend::record_ship::install_served_mutation_sink(Arc::new(|_, _| {
+        Box::pin(async {})
+    }));
+    disarm_publish_writer().await;
+    squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
+    shutdown(&j).await;
+    drop(jvol);
+    drop(j);
+    drop(h);
+    mvenue.tear_down();
+    shutdown(&manager).await;
+}
+
 /// **PR 13b — the REVERSE direction, and the holder's dominance window
 /// fed by the served verb.** The MANAGER mutates a file the JOINER's slot
 /// holds: the record-level verbs ship to the joiner's listener (tree 0's

@@ -3774,17 +3774,21 @@ impl MountRecallSink {
     /// `Setattr`, a colleague's `chmod`) is OLDER than that write, so the
     /// entry is newer than anything the recall could re-fetch; dropping it
     /// made the fsync find nothing to save and return 0 with the bytes
-    /// gone. A clean entry is dropped as before. The decision runs under
-    /// the ino's (3.5) guard — the write path publishes the dirty entry
-    /// under the same guard, so a write landing during the recall is
-    /// either seen dirty here or published after the discard — taken in
-    /// the NON-PARKING form: a held stripe is a write or a persist of this
-    /// ino in flight (the persist's shipped publish is what caused this
-    /// very recall, and the holder waits for our ack), so the discard is
-    /// SKIPPED there. That is safe because the discard is a courtesy: the
-    /// recall's epoch step (`drain_in_flight_serves`) already makes every
-    /// clean entry stamped before it pre-step (`layout_entry_pre_step`),
-    /// so the next read re-fetches whatever stale clean entry stayed.
+    /// gone. The law is [`DataRouter::discard_clean_layout_entry`]'s (ONE
+    /// function — the holder's served-mutation sink is its other caller):
+    /// a clean entry is dropped as before, the decision under the ino's
+    /// (3.5) guard in its non-parking form, a held stripe SKIPPING the
+    /// discard. The skip is safe here because the discard is a courtesy:
+    /// the recall's epoch step (`drain_in_flight_serves`) already makes
+    /// every clean entry stamped before it pre-step
+    /// (`layout_entry_pre_step`), so the next read re-fetches whatever
+    /// stale clean entry stayed — **while `SQUEEZEFS_FREE_GRACE_DRAIN_
+    /// EPOCH_STAMP` is on** (the default; PR 5 refuses `=0` on a `-o ro`
+    /// token reader, and under PR 12b's divert a WRITER running `=0`
+    /// leaves a skipped clean entry to its 1 s `cached_at` TTL — review
+    /// round 1, Issue 10).
+    ///
+    /// [`DataRouter::discard_clean_layout_entry`]: crate::routing::DataRouter::discard_clean_layout_entry
     fn purge_scoped(&self, object: &RecalledObject) -> bool {
         let Some(entry) = object.entry.as_deref() else {
             return false;
@@ -3807,14 +3811,12 @@ impl MountRecallSink {
             },
             None => Vec::new(),
         };
-        match crate::routing::meta_lock_try_acquire(global) {
-            Some(_meta_guard) => match self.router.metadata_cache.get(&global) {
-                Some(m) if m.layout_dirty => {
-                    RECALL_PURGE_DIRTY_KEPT.fetch_add(1, Ordering::Relaxed);
-                }
-                _ => self.router.discard_layout_cache(global),
-            },
-            None => {
+        match self.router.discard_clean_layout_entry(global) {
+            crate::routing::LayoutEntryDiscard::Discarded => {}
+            crate::routing::LayoutEntryDiscard::DirtyKept => {
+                RECALL_PURGE_DIRTY_KEPT.fetch_add(1, Ordering::Relaxed);
+            }
+            crate::routing::LayoutEntryDiscard::HeldSkipped => {
                 RECALL_PURGE_DISCARD_SKIPPED.fetch_add(1, Ordering::Relaxed);
             }
         }

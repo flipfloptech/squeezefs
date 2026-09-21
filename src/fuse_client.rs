@@ -17381,8 +17381,14 @@ impl SqueezefsFilesystem {
     /// the pre-mutation words for the mount's life (the `sym-foreign-file`
     /// leg's first run: the holder read its colleague's append as the old 8
     /// bytes while every other mount read the new 14). The sink drops the
-    /// router's entry (the own-mint reclaim funnel — a stale entry's blob
-    /// knowledge is reclaimed, never orphaned) and runs the kernel hook
+    /// router's CLEAN entry through the dirty law's one discard
+    /// (`DataRouter::discard_clean_layout_entry` — the token recall sink's
+    /// function; review round 1, Issue 1: a DIRTY entry is the holder's own
+    /// acked, unsaved write — an inline `data_key`'s only copy, a staged
+    /// write's pending merge + C8 delta — and it is KEPT, `fetch_metadata`'s
+    /// local-authority law; the first build dropped it unconditionally and
+    /// a colleague's grant-less `chmod` made the holder's `fsync` land
+    /// nothing) and runs the kernel hook
     /// ([`make_served_mutation_kernel_hook`]).
     pub fn install_served_mutation_sink(&self) {
         use crate::meta_backend::record_ship::ServedMutation;
@@ -17403,7 +17409,10 @@ impl SqueezefsFilesystem {
                     // entry goes whole; the next getattr refetches onto an
                     // empty slot.
                     fs.attr_cache.invalidate(&ino);
-                    fs.router.discard_layout_cache(ino);
+                    let verdict = fs.router.discard_clean_layout_entry(ino);
+                    crate::meta_backend::record_ship::note_served_mutation_layout_entry(
+                        ino, kind, verdict,
+                    );
                     kernel(ino, kind);
                 })
             },

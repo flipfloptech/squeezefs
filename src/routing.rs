@@ -771,6 +771,18 @@ pub fn max_block_keys_per_call() -> u32 {
     max_block_keys_for_budget(crate::mem_budget::MEM_BUDGET.budget_bytes())
 }
 
+/// The verdict of [`DataRouter::discard_clean_layout_entry`] — the two
+/// sinks count each arm on their own gauge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutEntryDiscard {
+    /// A clean (or absent) entry went through the discard funnel.
+    Discarded,
+    /// The entry is DIRTY — this mount's acked, unsaved write — and stays.
+    DirtyKept,
+    /// The ino's (3.5) stripe was held; nothing was decided.
+    HeldSkipped,
+}
+
 #[derive(Clone, Debug)]
 pub struct CachedMetadata {
     /// Layout class (`inline`/`staged`/`striped`) — [`CompactString`]
@@ -8819,6 +8831,39 @@ impl DataRouter {
             self.reclaim_own_mint_blob(ino, &m, "cache discard");
         }
         self.metadata_cache.remove(&ino);
+    }
+
+    /// **The dirty law's ONE discard** (symmetric PR 13b — the token
+    /// recall sink's `85e42408` and the holder's served-mutation sink,
+    /// review round 1 Issue 1, are its two callers): drop `ino`'s layout
+    /// entry because a PEER's commit made it stale — a recall of this
+    /// mount's token, a mutation served here for a colleague — UNLESS the
+    /// entry is DIRTY. A dirty entry is this mount's acked, not-yet-saved
+    /// write (an inline write's `data_key` is the ONLY copy of the acked
+    /// bytes; a staged write's pending block-map merge and its C8 delta
+    /// ride it too) — `fetch_metadata`'s law makes it the LOCAL AUTHORITY,
+    /// cleaned only under `INODE_META_LOCKS` by the paths that persist it,
+    /// and it is newer than anything the peer committed. The decision runs
+    /// under the ino's (3.5) guard in its NON-PARKING form: the write path
+    /// publishes the dirty entry under the same guard, so a write landing
+    /// now is either seen dirty here or published after the discard; a
+    /// HELD stripe is a write or a persist of this ino in flight — on the
+    /// recall path the persist's shipped publish is what caused the recall
+    /// and the holder waits for our ack, so parking would hold its pass to
+    /// the recall deadline — and the discard is SKIPPED, the caller's TTL
+    /// (the recall's epoch step; the holder's 1 s `cached_at`) expiring
+    /// the clean entry instead.
+    pub fn discard_clean_layout_entry(&self, ino: u64) -> LayoutEntryDiscard {
+        match meta_lock_try_acquire(ino) {
+            Some(_meta_guard) => match self.metadata_cache.get(&ino) {
+                Some(m) if m.layout_dirty => LayoutEntryDiscard::DirtyKept,
+                _ => {
+                    self.discard_layout_cache(ino);
+                    LayoutEntryDiscard::Discarded
+                }
+            },
+            None => LayoutEntryDiscard::HeldSkipped,
+        }
     }
 
     /// Finding 35c: the ONE own-mint reclaim seam — the f33 funnel's act,

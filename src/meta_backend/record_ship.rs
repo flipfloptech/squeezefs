@@ -70,6 +70,17 @@ static SERVED_MUTATION_INVALS: AtomicU64 = AtomicU64::new(0);
 /// (uapi ≥ 7.45) told to evict the unreferenced inode so its next lookup
 /// adopts the served size / times (`served_mutation_prunes`).
 static SERVED_MUTATION_PRUNES: AtomicU64 = AtomicU64::new(0);
+/// Served mutations whose object's layout entry the HOLDER's sink KEPT
+/// because it was DIRTY — the holder's own acked, unsaved write (review
+/// round 1, Issue 1; `served_mutation_dirty_kept`). A record verb beside
+/// it is legal; a served PUBLISH beside it is the tripwire
+/// `served_publish_over_dirty_entry`.
+static SERVED_MUTATION_DIRTY_KEPT: AtomicU64 = AtomicU64::new(0);
+/// Served mutations whose layout-entry discard the holder's sink SKIPPED
+/// because the ino's (3.5) stripe was held — a write or a persist of it in
+/// flight (`served_mutation_discard_skipped`; the entry's 1 s `cached_at`
+/// TTL expires it instead — no epoch step runs at the holder).
+static SERVED_MUTATION_DISCARD_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Phases of one shipped record-level verb (`record_ship_phase_ns`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +118,8 @@ pub struct RecordShipStats {
     pub foreign_publish_served: u64,
     pub served_mutation_invals: u64,
     pub served_mutation_prunes: u64,
+    pub served_mutation_dirty_kept: u64,
+    pub served_mutation_discard_skipped: u64,
 }
 
 /// Read the family.
@@ -121,6 +134,8 @@ pub fn stats() -> RecordShipStats {
         foreign_publish_served: FOREIGN_PUBLISH_SERVED.load(Ordering::Relaxed),
         served_mutation_invals: SERVED_MUTATION_INVALS.load(Ordering::Relaxed),
         served_mutation_prunes: SERVED_MUTATION_PRUNES.load(Ordering::Relaxed),
+        served_mutation_dirty_kept: SERVED_MUTATION_DIRTY_KEPT.load(Ordering::Relaxed),
+        served_mutation_discard_skipped: SERVED_MUTATION_DISCARD_SKIPPED.load(Ordering::Relaxed),
     }
 }
 
@@ -130,6 +145,46 @@ pub fn note_served_mutation_inval(pruned: bool) {
     SERVED_MUTATION_INVALS.fetch_add(1, Ordering::Relaxed);
     if pruned {
         SERVED_MUTATION_PRUNES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// **The holder's layout entry after a served mutation** — the sink's
+/// verdict from [`DataRouter::discard_clean_layout_entry`] counted (review
+/// round 1, Issue 1): a kept DIRTY entry beside a record verb is legal
+/// (the verb never changes the layout; the attr-cache drop + the kernel
+/// invalidation are the whole act) and counted; beside a served LAYOUT
+/// PUBLISH it is the custody law broken — a colleague published a layout
+/// of a file this holder has an acked, unsaved write of, which S9's
+/// exclusive custody forbids — reported on the `invariant_tripwires`
+/// label `served_publish_over_dirty_entry`, the dirty entry KEPT (the
+/// local authority; dropping it would lose this mount's acked bytes to a
+/// peer's, which no law admits). A skipped discard is counted.
+///
+/// [`DataRouter::discard_clean_layout_entry`]: crate::routing::DataRouter::discard_clean_layout_entry
+pub fn note_served_mutation_layout_entry(
+    ino: Ino,
+    kind: ServedMutation,
+    verdict: crate::routing::LayoutEntryDiscard,
+) {
+    use crate::routing::LayoutEntryDiscard;
+    match verdict {
+        LayoutEntryDiscard::Discarded => {}
+        LayoutEntryDiscard::DirtyKept => {
+            SERVED_MUTATION_DIRTY_KEPT.fetch_add(1, Ordering::Relaxed);
+            if kind == ServedMutation::Data {
+                crate::note_invariant_tripwire(
+                    "served_publish_over_dirty_entry",
+                    &format!(
+                        "a layout publish served for a peer landed on ino {ino} while this \
+                         holder's own layout entry for it is DIRTY (an acked, unsaved write) — \
+                         two writers under one custody; the dirty entry is kept"
+                    ),
+                );
+            }
+        }
+        LayoutEntryDiscard::HeldSkipped => {
+            SERVED_MUTATION_DISCARD_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -159,6 +214,14 @@ pub fn stats_into(out: &mut serde_json::Map<String, serde_json::Value>) {
     out.insert(
         "served_mutation_prunes".into(),
         s.served_mutation_prunes.into(),
+    );
+    out.insert(
+        "served_mutation_dirty_kept".into(),
+        s.served_mutation_dirty_kept.into(),
+    );
+    out.insert(
+        "served_mutation_discard_skipped".into(),
+        s.served_mutation_discard_skipped.into(),
     );
 }
 

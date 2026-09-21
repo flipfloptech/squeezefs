@@ -459,6 +459,19 @@
 #                       after its join (the ship to /jobs's holder):
 #                       xv_cross_owner_steps_served at the manager ≡ N.
 #                       N = the fleet's writer count; N = 32 is the box's.
+#   sym-foreign-file [--ff-files=F]  (PR 13b — the record-level metanode
+#                       ship; needs --symmetric --writers >= 2) every
+#                       writer chmod / touch / setfattr / APPEND (+ fsync)
+#                       / truncate / unlink a COLLEAGUE's files (the next
+#                       joiner's, the last joiner's the manager's) under
+#                       the acked-writes + deleted-stays-deleted oracle,
+#                       read back at the HOLDER and at a THIRD mount.
+#                       Engagement: Σ record_ships ≡ Σ record_served across
+#                       the daemons, record_refusals 0 everywhere, Σ
+#                       foreign_publish_ships ≡ Σ foreign_publish_served,
+#                       dlm_custody_via_slot_holder > 0 at every mutator;
+#                       fsck + the must-stay-0 set after. LOCAL = "it
+#                       works" (the box prices the row).
 #   s9-fanout [--mb=M]  (rung 10 — needs --multi-writer --cowriters=K;
 #                       design row S9-a) THE FAN-OUT ROW: K co-writers +
 #                       the authority writing DATA concurrently — the
@@ -823,6 +836,8 @@ SYM_TOUCH_ROUNDS="${SQZ_MWMATRIX_SYM_TOUCH_ROUNDS:-3}"
 # 4 MiB blocks), rewritten in place once.
 SYM_WALLS_FILES="${SQZ_MWMATRIX_SYM_WALLS_FILES:-16}"
 SYM_WALLS_MB="${SQZ_MWMATRIX_SYM_WALLS_MB:-64}"
+# sym-foreign-file (PR 13b): files per writer a colleague mutates.
+SYM_FF_FILES="${SQZ_MWMATRIX_SYM_FF_FILES:-64}"
 SYM_VICTIMS=1
 SYM_XO=0
 SYM_STRIPED=0
@@ -847,6 +862,7 @@ for a in "$@"; do
     --touch-rounds=*) SYM_TOUCH_ROUNDS="${a#--touch-rounds=}" ;;
     --walls-files=*) SYM_WALLS_FILES="${a#--walls-files=}" ;;
     --walls-mb=*) SYM_WALLS_MB="${a#--walls-mb=}" ;;
+    --ff-files=*) SYM_FF_FILES="${a#--ff-files=}" ;;
     --victims=*) SYM_VICTIMS="${a#--victims=}" ;;
     --cross-owner) SYM_XO=1 ;;
     --striped) SYM_STRIPED=1 ;;
@@ -3477,7 +3493,7 @@ xo_mover() { # src dst prefix ledger
 # designed transient the roll-forward completes).
 ack_verify_xo() { # ledger tag orig_mnt read_mnt lostfile dst_rel prefix moved_ledger [intents_open]
     local ledger="$1" tag="$2" orig="$3" read_mnt="$4" lostfile="$5" dst_rel="$6" prefix="$7" moved="$8" intents_open="${9:-0}"
-    local f g h want got lost=0 at_src at_dst returned
+    local f g h want got lost=0 at_src at_dst returned why_g why_h
     while IFS= read -r f; do
         [ -n "$f" ] || continue
         g="$read_mnt${f#"$orig"}"
@@ -3495,11 +3511,17 @@ ack_verify_xo() { # ledger tag orig_mnt read_mnt lostfile dst_rel prefix moved_l
                 echo "IN-FLIGHT (xo: src=0 dst=0, mv NOT returned, xv_cross_owner_intents_open=$intents_open — the roll-forward's window, not a loss): $g | $h" >>"$lostfile"
                 continue
             fi
+            # The ERRNO behind each absence (PR 13b, §4.4af's attribution
+            # recipe): a name whose `stat` fails EIO is a READ the daemon
+            # could not serve (a stale projection, a dead holder), not a
+            # record that is gone — the two are different defects.
+            why_g="$(stat -c %F "$g" 2>&1 >/dev/null | sed 's/^stat: //')"
+            why_h="$(stat -c %F "$h" 2>&1 >/dev/null | sed 's/^stat: //')"
             lost=$((lost + 1))
             if [ "$returned" = "1" ]; then
-                echo "LOST (xo RETURNED mv — acked rename, P0: src=$at_src dst=$at_dst): $g | $h" >>"$lostfile"
+                echo "LOST (xo RETURNED mv — acked rename, P0: src=$at_src dst=$at_dst; src stat: ${why_g:-ok}; dst stat: ${why_h:-ok}): $g | $h" >>"$lostfile"
             else
-                echo "LOST (xo UNRETURNED mv, xv_cross_owner_intents_open=$intents_open: src=$at_src dst=$at_dst): $g | $h" >>"$lostfile"
+                echo "LOST (xo UNRETURNED mv, xv_cross_owner_intents_open=$intents_open: src=$at_src dst=$at_dst; src stat: ${why_g:-ok}; dst stat: ${why_h:-ok}): $g | $h" >>"$lostfile"
             fi
             continue
         fi
@@ -3515,7 +3537,8 @@ ack_verify_xo() { # ledger tag orig_mnt read_mnt lostfile dst_rel prefix moved_l
         h="$read_mnt$dst_rel/$(basename "$f")"
         if [ ! -f "$h" ]; then
             lost=$((lost + 1))
-            echo "LOST (xo: a RETURNED mv is not at its destination): $h" >>"$lostfile"
+            why_h="$(stat -c %F "$h" 2>&1 >/dev/null | sed 's/^stat: //')"
+            echo "LOST (xo: a RETURNED mv is not at its destination; dst stat: ${why_h:-ok}): $h" >>"$lostfile"
         fi
     done <"$moved"
     echo "$lost"
@@ -4436,6 +4459,160 @@ leg_sym_foreign_touch() {
     done
     sym_oracle sym-foreign-touch "$rowdir"
     log "sym-foreign-touch PUBLISHED (table + snapshots in $rowdir)"
+}
+
+# --- PR 13b: sym-foreign-file ------------------------------------------------
+# The record-level metanode ship on a real fleet (design §5.10's "write to a
+# FOREIGN-owned file" row; PR 13 defect 32, the flip's first blocker): every
+# writer mutates a COLLEAGUE's files — the next joiner's, the last joiner's
+# the manager's — through the ordinary syscalls (chmod / touch / setfattr /
+# an APPEND + fsync / a truncate / an unlink), each verb SHIPPED to the
+# file's slot holder and applied there; the result is read back at the
+# HOLDER (the authority for the record) and at a THIRD mount (the ledger
+# every reader resolves); the deleted files stay deleted at every mount.
+# The engagement laws close the ledger at the two ends of every ship.
+# LOCAL = "it works" (the venue ruling): no rate this leg prints is a
+# verdict.
+leg_sym_foreign_file() {
+    require_symmetric
+    local joiners
+    mapfile -t joiners < <(joiner_idxs)
+    [ "${#joiners[@]}" -ge 2 ] ||
+        die "sym-foreign-file needs ≥ 2 joined writers — create the fleet with: sudo tests/mw_fleet.sh create N=2 --symmetric --writers=2"
+    [[ "$SYM_FF_FILES" =~ ^[1-9][0-9]*$ ]] || die "--ff-files takes a positive integer (got '$SYM_FF_FILES')"
+    local rowdir writers idx
+    rowdir="$STATE/rows/symff-$(date +%s)"
+    mkdir -p "$rowdir"
+    writers=(0 "${joiners[@]}")
+    log "sym-foreign-file: ${#writers[@]} writers (the manager + ${#joiners[@]} joiners), $SYM_FF_FILES files each, every writer mutating its right neighbour's files through the record-level ship"
+    for idx in "${writers[@]}"; do snap "$idx" ff0 "$rowdir"; done
+
+    # Phase 1 — every writer's OWN files, fsync-acked (the acked-writes
+    # oracle's ledger: name + content).
+    local i f mnt
+    for idx in "${writers[@]}"; do
+        mnt="$(mnt_of "$idx")"
+        mkdir -p "$mnt/ff-w$idx" || die "sym-foreign-file: mkdir ff-w$idx on m$idx failed"
+        : >"$rowdir/acked-w$idx.ledger"
+        for ((i = 0; i < SYM_FF_FILES; i++)); do
+            f="$mnt/ff-w$idx/f$(printf '%04d' "$i")"
+            printf 'w%s:%04d' "$idx" "$i" | dd of="$f" conv=fsync status=none 2>>"$rowdir/dd-w$idx.err" ||
+                die "sym-foreign-file: m$idx's own write of f$i failed (see $rowdir/dd-w$idx.err)"
+            echo "f$(printf '%04d' "$i")" >>"$rowdir/acked-w$idx.ledger"
+        done
+    done
+    sleep 1
+
+    # Phase 2 — the FOREIGN mutations: writer q mutates holder h's files
+    # (h = q's right neighbour in the writer ring) through q's mount. Every
+    # verb must succeed at the syscall: the interim posture answered
+    # ENOENT / EOPNOTSUPP / a refused publish here (record §4.4z).
+    local n q h qmnt hdir rc err ops_q
+    n=${#writers[@]}
+    : >"$rowdir/mutations.tsv"
+    for ((k = 0; k < n; k++)); do
+        q="${writers[$k]}"
+        h="${writers[$(((k + 1) % n))]}"
+        qmnt="$(mnt_of "$q")"
+        hdir="$qmnt/ff-w$h"
+        ops_q=0
+        for ((i = 0; i < SYM_FF_FILES; i++)); do
+            f="$hdir/f$(printf '%04d' "$i")"
+            err="$(chmod 640 "$f" 2>&1)" || die "sym-foreign-file: m$q chmod of m$h's f$i: $err"
+            err="$(touch -d '@1700000000' "$f" 2>&1)" || die "sym-foreign-file: m$q touch of m$h's f$i: $err"
+            err="$(setfattr -n user.ff -v "by-w$q" "$f" 2>&1)" || die "sym-foreign-file: m$q setfattr on m$h's f$i: $err"
+            ops_q=$((ops_q + 3))
+            case $((i % 4)) in
+            0 | 1)
+                # An APPEND + fsync (the DATA face: the publish ships to
+                # the holder under q's custody lease there).
+                err="$(python3 - "$f" "$q" 2>&1 <<'PYEOF'
+import os, sys
+p, q = sys.argv[1], sys.argv[2]
+fd = os.open(p, os.O_WRONLY | os.O_APPEND)
+os.write(fd, f"|by-w{q}".encode())
+os.fsync(fd)
+os.close(fd)
+PYEOF
+)" || die "sym-foreign-file: m$q append+fsync into m$h's f$i: $err"
+                ;;
+            2)
+                err="$(truncate -s 4 "$f" 2>&1)" || die "sym-foreign-file: m$q truncate of m$h's f$i: $err"
+                ;;
+            3)
+                err="$(rm "$f" 2>&1)" || die "sym-foreign-file: m$q unlink of m$h's f$i: $err"
+                ;;
+            esac
+        done
+        printf 'q=%s h=%s files=%s record_verbs=%s\n' "$q" "$h" "$SYM_FF_FILES" "$ops_q" >>"$rowdir/mutations.tsv"
+        log "sym-foreign-file: m$q mutated m$h's $SYM_FF_FILES files ($ops_q record verbs, $((SYM_FF_FILES / 2)) appends, $((SYM_FF_FILES / 4)) truncates, $((SYM_FF_FILES / 4)) unlinks)"
+    done
+    # Let the appends' writeback publishes and the holders' checkpoints
+    # land before the read-back (the fsync acked each; the close-time
+    # writeback of the page cache is the kernel's).
+    sleep 2
+
+    # Phase 3 — the read-back at the HOLDER and at a THIRD mount: mode,
+    # mtime, xattr, content, size; the unlinked files ENOENT everywhere
+    # (deleted stays deleted — `sym_stat_deleted`, only ENOENT is deleted).
+    local third tmnt hmnt want got lost=0 verdict
+    : >"$rowdir/lost.txt"
+    for ((k = 0; k < n; k++)); do
+        q="${writers[$k]}"
+        h="${writers[$(((k + 1) % n))]}"
+        third="${writers[$(((k + 2) % n))]}"
+        hmnt="$(mnt_of "$h")"
+        tmnt="$(mnt_of "$third")"
+        for ((i = 0; i < SYM_FF_FILES; i++)); do
+            f="f$(printf '%04d' "$i")"
+            case $((i % 4)) in
+            0 | 1) want="$(printf 'w%s:%04d|by-w%s' "$h" "$i" "$q")" ;;
+            2) want="$(printf 'w%s:%04d' "$h" "$i" | head -c 4)" ;;
+            3) want="" ;;
+            esac
+            for m in "$hmnt" "$tmnt"; do
+                if [ $((i % 4)) = 3 ]; then
+                    verdict="$(sym_stat_deleted "$m/ff-w$h/$f" 20)"
+                    [ "$verdict" = "deleted" ] || { lost=$((lost + 1)); echo "NOT DELETED at $m ($verdict): ff-w$h/$f (unlinked by m$q)" >>"$rowdir/lost.txt"; }
+                    continue
+                fi
+                got="$(cat "$m/ff-w$h/$f" 2>&1)" || { lost=$((lost + 1)); echo "UNREADABLE at $m: ff-w$h/$f: $got" >>"$rowdir/lost.txt"; continue; }
+                [ "$got" = "$want" ] || { lost=$((lost + 1)); echo "CONTENT at $m: ff-w$h/$f '$got' != '$want' (mutated by m$q)" >>"$rowdir/lost.txt"; }
+                [ "$(stat -c %a "$m/ff-w$h/$f" 2>&1)" = "640" ] || { lost=$((lost + 1)); echo "MODE at $m: ff-w$h/$f $(stat -c %a "$m/ff-w$h/$f" 2>&1) != 640 (chmod by m$q)" >>"$rowdir/lost.txt"; }
+                [ "$(stat -c %Y "$m/ff-w$h/$f" 2>&1)" = "1700000000" ] || { lost=$((lost + 1)); echo "MTIME at $m: ff-w$h/$f $(stat -c %Y "$m/ff-w$h/$f" 2>&1) != 1700000000 (touch by m$q)" >>"$rowdir/lost.txt"; }
+                [ "$(getfattr -n user.ff --only-values "$m/ff-w$h/$f" 2>&1)" = "by-w$q" ] || { lost=$((lost + 1)); echo "XATTR at $m: ff-w$h/$f user.ff='$(getfattr -n user.ff --only-values "$m/ff-w$h/$f" 2>&1)' != by-w$q" >>"$rowdir/lost.txt"; }
+            done
+        done
+    done
+    [ "$lost" = "0" ] || die "sym-foreign-file: $lost read-back violation(s) — see $rowdir/lost.txt:
+$(head -20 "$rowdir/lost.txt")"
+    log "sym-foreign-file: every shipped mutation reads back exact at the holder and at a third mount; every unlinked file ENOENT at both"
+
+    # Phase 4 — the engagement laws (the ledger closes at the two ends).
+    for idx in "${writers[@]}"; do snap "$idx" ff1 "$rowdir"; done
+    local ships=0 served=0 refusals=0 unreachable=0 pships=0 pserved=0 v custody
+    for idx in "${writers[@]}"; do
+        v="$(sym_delta "$rowdir" "$idx" ff meta_ship.record_ships)"; ships=$((ships + v))
+        [ "$v" -ge $((SYM_FF_FILES * 3)) ] || die "sym-foreign-file: m$idx record_ships +$v for $((SYM_FF_FILES * 3)) foreign record verbs (chmod + touch + setfattr per file)"
+        v="$(sym_delta "$rowdir" "$idx" ff meta_ship.record_served)"; served=$((served + v))
+        v="$(sym_delta "$rowdir" "$idx" ff meta_ship.record_refusals)"; refusals=$((refusals + v))
+        v="$(sym_delta "$rowdir" "$idx" ff meta_ship.record_unreachable)"; unreachable=$((unreachable + v))
+        v="$(sym_delta "$rowdir" "$idx" ff meta_ship.foreign_publish_ships)"; pships=$((pships + v))
+        [ "$v" -ge 1 ] || die "sym-foreign-file: m$idx foreign_publish_ships +$v — its appends into a colleague's files published through no slot holder"
+        v="$(sym_delta "$rowdir" "$idx" ff meta_ship.foreign_publish_served)"; pserved=$((pserved + v))
+        custody="$(sym_delta "$rowdir" "$idx" ff dlm_custody.dlm_custody_via_slot_holder)"
+        [ "$custody" -ge 1 ] || die "sym-foreign-file: m$idx dlm_custody_via_slot_holder +$custody — its write custody of a colleague's file came from no slot holder"
+    done
+    [ "$refusals" = "0" ] || die "sym-foreign-file: record_refusals=$refusals across the fleet (must stay 0)"
+    [ "$unreachable" = "0" ] || die "sym-foreign-file: record_unreachable=$unreachable across the fleet — a holder had no endpoint bound"
+    [ "$ships" = "$served" ] || die "sym-foreign-file: Σ record_ships $ships != Σ record_served $served (a shipped verb landed nowhere, or a served one was nobody's)"
+    [ "$pships" = "$pserved" ] || die "sym-foreign-file: Σ foreign_publish_ships $pships != Σ foreign_publish_served $pserved"
+    echo "== PR 13b sym-foreign-file: ${#writers[@]} writers × $SYM_FF_FILES files: record_ships=$ships ≡ record_served=$served, record_refusals=0, foreign_publish_ships=$pships ≡ served=$pserved$SYM_BUSY_ROW ==" | tee "$rowdir/symff-table.txt"
+    for idx in "${writers[@]}"; do
+        rm -rf "$(mnt_of "$idx")/ff-w$idx" 2>/dev/null || true
+    done
+    sym_oracle sym-foreign-file "$rowdir"
+    log "sym-foreign-file PUBLISHED (table + snapshots in $rowdir)"
 }
 
 # --- gate 5: sym-readers ----------------------------------------------------
@@ -9355,6 +9532,7 @@ sym-tarx) leg_sym_tarx ;;
 sym-scale) leg_sym_scale ;;
 sym-shared-dir) leg_sym_shared_dir ;;
 sym-foreign-touch) leg_sym_foreign_touch ;;
+sym-foreign-file) leg_sym_foreign_file ;;
 sym-readers) leg_sym_readers ;;
 sym-walls) leg_sym_walls ;;
 s8-serial-ab) leg_s8_serial_ab ;;

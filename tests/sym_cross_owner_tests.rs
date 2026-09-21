@@ -38,7 +38,7 @@ use squeezefs::meta_backend::crossvol_tx::{
     TEST_XV_STUCK_AFTER_MS,
 };
 use squeezefs::meta_backend::kv::appender::TEST_APPENDER_SLOTS_ENV;
-use squeezefs::meta_backend::kv::backend::KvMetaBackend;
+use squeezefs::meta_backend::kv::backend::{AcquireSlotReply, KvMetaBackend};
 use squeezefs::meta_backend::kv::builder::{format_v3_stamped, FormatV3Options, ROOT_INO};
 use squeezefs::meta_backend::kv::record::ForestSlot;
 use squeezefs::meta_backend::kv::slot_lease::SYMMETRIC_META_ENV;
@@ -843,6 +843,113 @@ async fn a_shipped_step_refused_slot_busy_at_its_holder_is_redispatched() {
         "the name landed at the holder"
     );
     assert_closed("slot moved under a shipped step");
+    holders.tear_down();
+    shutdown(&routed).await;
+    fsck_clean(&uris).await;
+}
+
+/// **A step whose slot moved TO the initiator mid-plan applies under a
+/// guard of its own, never unguarded** (PR 13b — `sym-storm` ×10 round 4:
+/// `invariant_tripwires=1` on the manager, `xv_local_step_unguarded`,
+/// "local step 1 (set_nlink) is not covered by the op's guard scope").
+/// Defect 29's own scenario: the manager's `rm -rf` of its striped
+/// cross-owner directory shipped steps to a joiner, the dominance rule
+/// (or PR 10's recovery) handed the slot to the INITIATOR mid-plan, the
+/// holder's door refused `SlotBusy { holder: the initiator }`, and the
+/// re-dispatch applied the step LOCALLY — under guards that had TRAVELLED
+/// to the old holder, so nothing in this table covered the key. The
+/// tripwire's "cannot happen" was false: a handover is a legal schedule.
+/// Now the local re-dispatch takes the step's own guards in the
+/// NON-PARKING canonical form (`DlmLockManager::try_lock_many` — a late
+/// parking acquire while holding the op's other guards could cycle with a
+/// peer's canonical set), holds them across the apply
+/// (`xv_cross_owner_step_late_guards`), and a contended stripe is the
+/// slot-moved retryable class (the bounded re-dispatch, then the intent
+/// stays open for the cadence) — never an unguarded apply. RED before:
+/// the tripwire fired once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_whose_slot_moved_to_the_initiator_mid_plan_applies_under_its_own_guard() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[SLOT_B]).await;
+    let shared = dirs[0];
+    let routed = open_under(&uris, true, Some(TWO_HOLDERS)).await;
+    let holders = Holders::stand_up(&routed, &[1]).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let before = cross_owner_stats();
+    let tripwires0 = squeezefs::invariant_tripwire_count("xv_local_step_unguarded");
+    let escalations0 = crossvol_tx::XV_MIDPLAN_ESCALATIONS.load(Ordering::Relaxed);
+    // The shipped InsertDentry is HELD at the holder before it applies —
+    // the window in which SLOT_B moves from the holder to the initiator —
+    // and then answered `SlotBusy` at the holder's door (the one-process
+    // model shares the door between holder and initiator, so the seam
+    // speaks the word the fleet's real second daemon spoke).
+    crossvol_tx::TEST_XV_SERVE_HOLD_MS.store(1500, Ordering::SeqCst);
+    TEST_XV_SERVE_SLOT_BUSY_ONCE.store(true, Ordering::SeqCst);
+    // The holder's guards TRAVEL (the fleet's shape: two daemons, two
+    // tables) — in one process they would otherwise be taken in the shared
+    // table and cover the re-dispatched step by accident.
+    crossvol_tx::TEST_XV_GUARDS_FORCE_REMOTE.store(true, Ordering::SeqCst);
+    let op = {
+        let routed = Arc::clone(&routed);
+        tokio::spawn(async move {
+            routed
+                .create(shared, "moved-to-me", libc::S_IFREG | 0o644, 0, 0)
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    vol.release_slot_handover(1, SLOT_B)
+        .await
+        .expect("the holder releases the slot under the held step");
+    let AcquireSlotReply::Granted(_) = vol.manager_acquire_slot(0, SLOT_B).await.unwrap() else {
+        panic!("the initiator (appender 0) takes the released slot");
+    };
+    // The fleet's two-table reality: the guards parked at the OLD holder
+    // live in another daemon's table and cover nothing here. In one
+    // process they landed in this very table (and would cover the step by
+    // accident — the own-parked-scope arm reads them), so they are dropped.
+    assert_eq!(
+        crossvol_tx::test_release_all_parked_guards(),
+        1,
+        "the op's one travelling scope was parked at the holder"
+    );
+    let ino = op
+        .await
+        .unwrap()
+        .expect("the op completes: the held step, refused SlotBusy at the old holder, re-dispatched locally")
+        .ino;
+    crossvol_tx::TEST_XV_SERVE_HOLD_MS.store(0, Ordering::SeqCst);
+    crossvol_tx::TEST_XV_GUARDS_FORCE_REMOTE.store(false, Ordering::SeqCst);
+    assert_eq!(
+        squeezefs::invariant_tripwire_count("xv_local_step_unguarded"),
+        tripwires0,
+        "the local re-dispatch applied UNDER a guard — no tripwire"
+    );
+    assert_eq!(
+        crossvol_tx::XV_MIDPLAN_ESCALATIONS.load(Ordering::Relaxed),
+        escalations0,
+        "no mid-plan escalation"
+    );
+    let after = cross_owner_stats();
+    assert_eq!(
+        after.step_slot_moved_retries - before.step_slot_moved_retries,
+        1,
+        "one slot-moved re-dispatch"
+    );
+    assert_eq!(
+        after.step_late_guards - before.step_late_guards,
+        1,
+        "the re-dispatched local step took its own guards (xv_cross_owner_step_late_guards)"
+    );
+    assert_eq!(open_intents(&routed).await, 0, "no intent left open");
+    assert_eq!(
+        lookup_opt(&routed, shared, "moved-to-me").await,
+        Some(ino),
+        "the name landed under the slot's new lessee"
+    );
+    assert_closed("slot moved to the initiator mid-plan");
     holders.tear_down();
     shutdown(&routed).await;
     fsck_clean(&uris).await;
@@ -2428,14 +2535,17 @@ async fn a_step_outside_its_scopes_parked_keys_takes_its_own_guards_and_parks() 
     fsck_clean(&uris).await;
 }
 
-/// The LOCAL applier's belt (review round 1, Issue 8c; pinned in round
-/// 2, Issue 25b): a local step whose keys the op's guard scope does not
-/// cover trips `invariant_tripwires` (`xv_local_step_unguarded`) — loud,
-/// never silent. Built from the public faces: a scope acquired over ino
-/// A's key, a plan whose step names ino B under those guards; the
-/// covered shape trips nothing.
+/// The LOCAL applier's coverage law (review round 1, Issue 8c; pinned in
+/// round 2, Issue 25b; PR 13b): a local step whose keys the op's guard
+/// scope does not cover — a slot that moved TO this initiator mid-plan,
+/// its guards having travelled — takes its OWN guards for the apply
+/// (`xv_cross_owner_step_late_guards`), never applies unguarded and never
+/// trips `invariant_tripwires` (the retired belt `xv_local_step_unguarded`
+/// called a legal handover schedule impossible). Built from the public
+/// faces: a scope acquired over ino A's key, a plan whose step names ino B
+/// under those guards; the covered shape takes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_local_step_outside_its_scopes_keys_trips_the_invariant_tripwire() {
+async fn a_local_step_outside_its_scopes_keys_takes_its_own_guards_never_unguarded() {
     use squeezefs::meta_backend::dlm::LockMode;
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
@@ -2463,7 +2573,7 @@ async fn a_local_step_outside_its_scopes_keys_trips_the_invariant_tripwire() {
             ctime: KvMetaBackend::now_ns_pub(),
         }],
     };
-    for (guarded, expect) in [(a, 1u64), (b, 0)] {
+    for (guarded, late) in [(a, 1u64), (b, 0)] {
         let (_, local) = routed.route_ino(guarded);
         let mut scope = None;
         let guards: Arc<[squeezefs::meta_backend::dlm::DlmGuard]> = Arc::from(
@@ -2480,14 +2590,26 @@ async fn a_local_step_outside_its_scopes_keys_trips_the_invariant_tripwire() {
         );
         assert!(scope.is_some(), "an armed acquisition mints the scope");
         let before = tripwires();
+        let stats0 = cross_owner_stats();
         crossvol_tx::execute(&routed, &plan, guards).await.unwrap();
         assert_eq!(
             tripwires() - before,
-            expect,
-            "guarding {guarded}: an uncovered local step trips the belt, a covered one does not"
+            0,
+            "guarding {guarded}: a local step never applies unguarded and never trips"
+        );
+        let stats1 = cross_owner_stats();
+        assert_eq!(
+            stats1.step_late_guards - stats0.step_late_guards,
+            late,
+            "guarding {guarded}: an uncovered local step takes its own guards, a covered one takes nothing"
+        );
+        assert_eq!(
+            stats1.step_late_guard_refusals - stats0.step_late_guard_refusals,
+            0,
+            "the step's own stripe is free here"
         );
     }
-    assert_closed("local tripwire");
+    assert_closed("local late guards");
     shutdown(&routed).await;
     fsck_clean(&uris).await;
 }

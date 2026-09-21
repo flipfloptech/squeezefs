@@ -284,6 +284,15 @@ static XV_CO_GUARD_STALE_RERESOLVES: AtomicU64 = AtomicU64::new(0);
 /// plan and the apply) and the initiator re-resolved and re-dispatched
 /// (PR 13, defect 29; `xv_cross_owner_step_slot_moved_retries`).
 static XV_CO_STEP_SLOT_MOVED_RETRIES: AtomicU64 = AtomicU64::new(0);
+/// Local steps whose slot moved TO this initiator mid-plan (the guards
+/// travelled to the old holder) and that took their OWN guards for the
+/// apply in the non-parking canonical form (PR 13b;
+/// `xv_cross_owner_step_late_guards`).
+static XV_CO_STEP_LATE_GUARDS: AtomicU64 = AtomicU64::new(0);
+/// Such steps whose late guards were CONTENDED — answered the slot-moved
+/// retryable class instead of an unguarded apply (PR 13b;
+/// `xv_cross_owner_step_late_guard_refusals`).
+static XV_CO_STEP_LATE_GUARD_REFUSALS: AtomicU64 = AtomicU64::new(0);
 /// Namespace ops dispatched LOCALLY whose commit door answered `SlotBusy`
 /// (the slot read unleased or ours at the plan and another appender
 /// held it at the door) and were re-dispatched ONCE through the
@@ -536,6 +545,12 @@ pub struct CrossOwnerStats {
     /// PR 13 (defect 29): shipped steps re-dispatched after a holder's
     /// `SlotBusy` (the slot moved between the plan and the apply).
     pub step_slot_moved_retries: u64,
+    /// PR 13b: local steps re-dispatched after their slot moved TO this
+    /// initiator that took their own guards for the apply.
+    pub step_late_guards: u64,
+    /// PR 13b: such steps whose late guards were contended (the retryable
+    /// class, the intent left for the cadence).
+    pub step_late_guard_refusals: u64,
     /// PR 13 (defect 30): locally dispatched namespace ops re-dispatched
     /// through the cross-owner arm after the door's `SlotBusy`.
     pub op_slot_moved_redispatches: u64,
@@ -562,6 +577,8 @@ pub fn cross_owner_stats() -> CrossOwnerStats {
         guard_rpcs: XV_CO_GUARD_RPCS.load(Ordering::Relaxed),
         guard_stale_reresolves: XV_CO_GUARD_STALE_RERESOLVES.load(Ordering::Relaxed),
         step_slot_moved_retries: XV_CO_STEP_SLOT_MOVED_RETRIES.load(Ordering::Relaxed),
+        step_late_guards: XV_CO_STEP_LATE_GUARDS.load(Ordering::Relaxed),
+        step_late_guard_refusals: XV_CO_STEP_LATE_GUARD_REFUSALS.load(Ordering::Relaxed),
         op_slot_moved_redispatches: XV_CO_OP_SLOT_MOVED_REDISPATCHES.load(Ordering::Relaxed),
         guards_parked: XV_CO_GUARDS_PARKED.load(Ordering::Relaxed),
         guard_expiries: XV_CO_GUARD_EXPIRIES.load(Ordering::Relaxed),
@@ -610,6 +627,14 @@ pub fn cross_owner_stats_json() -> serde_json::Map<String, serde_json::Value> {
     out.insert(
         "xv_cross_owner_step_slot_moved_retries".into(),
         s.step_slot_moved_retries.into(),
+    );
+    out.insert(
+        "xv_cross_owner_step_late_guards".into(),
+        s.step_late_guards.into(),
+    );
+    out.insert(
+        "xv_cross_owner_step_late_guard_refusals".into(),
+        s.step_late_guard_refusals.into(),
     );
     out.insert(
         "xv_cross_owner_op_slot_moved_redispatches".into(),
@@ -882,6 +907,30 @@ pub(crate) fn serve_guards_for(scope: GuardScope<'_>, needed: &StripeSet) -> Ser
         return ServeGuards::Covered;
     }
     ServeGuards::Take
+}
+
+/// Does a scope THIS mount minted have guards parked in THIS table covering
+/// `needed` — the one-process holder model, where the initiator's
+/// travelling guards land in its own table under its own client id?
+fn own_parked_scope_covers(scope: u64, needed: &StripeSet) -> bool {
+    let Some(router) = XV_SHIPPER.load_full() else {
+        return false;
+    };
+    PARKED_GUARDS
+        .lock()
+        .get(&(router.peer_id().to_string(), scope))
+        .is_some_and(|p| needed.is_subset(&p.stripes))
+}
+
+/// Test seam: drop every parked scope — the fleet's two-table reality in
+/// one process (a scope parked at the OLD holder covers nothing in the
+/// initiator's table once the slot moved to it). Returns the count.
+#[doc(hidden)]
+pub fn test_release_all_parked_guards() -> usize {
+    let mut parked = PARKED_GUARDS.lock();
+    let n = parked.len();
+    parked.clear();
+    n
 }
 
 /// Park `guards` for `(client, scope)` — extending a scope already parked.
@@ -2309,27 +2358,63 @@ async fn apply_or_ship_step(
 ) -> Result<XvStepOutcome> {
     match step_home_bound(routed, v_idx, local.local_home()).await {
         StepHome::Local => {
-            // The op's guard set must cover the step's keys (Issue 8c):
-            // a slot that moved to this initiator between its acquisition
-            // and this step would leave the key unguarded — loud, never
-            // silent. A FRESH MINT is exempt (PR 12): its ino was
-            // allocated by this op and nothing names it until the op's
-            // own dentry step lands, so the 4a law takes no `I{ino}` on
-            // it — the local create path holds none either — and there
-            // is no guard the scope could cover. Judging it fired the
-            // tripwire on every cross-owner create and whiteout rename.
+            // The op's guard set must cover the step's keys (Issue 8c). A
+            // FRESH MINT is exempt (PR 12): its ino was allocated by this
+            // op and nothing names it until the op's own dentry step
+            // lands, so the 4a law takes no `I{ino}` on it — the local
+            // create path holds none either — and there is no guard the
+            // scope could cover. A key the scope does NOT cover is a slot
+            // that moved TO this initiator between the acquisition and
+            // this step — its guards travelled to the old holder (PR 13b:
+            // defect 29's re-dispatch, one step further — the dominance
+            // rule or PR 10's recovery handed the slot to the initiator
+            // under a shipped step; the `sym-storm` manager applied its
+            // `set_nlink` unguarded and tripped `xv_local_step_unguarded`).
+            // A legal schedule, so the step takes its OWN guards for the
+            // apply — in the NON-PARKING canonical form: a parking acquire
+            // while the op holds its other guards could cycle with a
+            // peer's canonical set. A contended stripe is the slot-moved
+            // retryable class (the bounded re-dispatch; past it the intent
+            // stays open for the cadence), never an unguarded apply.
             let scope = scope_of(&guards);
+            let mut late_guards: Vec<dlm::DlmGuard> = Vec::new();
             if scope != 0 && !local.is_fresh_mint() {
-                let needed = step_stripes(routed.volumes[v_idx].dlm(), v_idx, local);
-                if local_scope_covers(scope, &needed) == Some(false) {
-                    crate::note_invariant_tripwire(
-                        "xv_local_step_unguarded",
-                        &format!(
-                            "cross-owner transaction {tx_id:016x}: local step {step_idx} ({}) \
-                             is not covered by the op's guard scope {scope:#x}",
-                            step.name()
-                        ),
-                    );
+                let dlm = routed.volumes[v_idx].dlm();
+                let needed = step_stripes(dlm, v_idx, local);
+                // Covered by the op's local set, or by its OWN scope parked
+                // in this table (the one-process holder model) — nothing to
+                // take; only a key guarded NOWHERE here takes late guards.
+                if local_scope_covers(scope, &needed) == Some(false)
+                    && !own_parked_scope_covers(scope, &needed)
+                {
+                    let (inos, dents) = step_guard_keys(local);
+                    let d: Vec<(Ino, &str, dlm::LockMode)> = dents
+                        .iter()
+                        .map(|(p, n)| (*p, n.as_str(), dlm::LockMode::Exclusive))
+                        .collect();
+                    match dlm.try_lock_many(&inos, &d) {
+                        Some(g) => {
+                            XV_CO_STEP_LATE_GUARDS.fetch_add(1, Ordering::Relaxed);
+                            late_guards = g;
+                        }
+                        None => {
+                            XV_CO_STEP_LATE_GUARD_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                            let slot = crate::meta_backend::kv::record::forest_slot_of_ino(
+                                local.local_home(),
+                            );
+                            return Err(SqueezefsError::retryable(
+                                crate::error::RefusalClass::SlotMoved { slot, holder: 0 },
+                                format!(
+                                    "cross-owner transaction {tx_id:016x}: local step \
+                                     {step_idx} ({}) of slot {slot} — moved to this mount \
+                                     mid-plan, its guards travelled to the old holder — found \
+                                     its own guards contended; retry \
+                                     (xv_cross_owner_step_late_guard_refusals)",
+                                    step.name()
+                                ),
+                            ));
+                        }
+                    }
                 }
             }
             if TEST_XV_LOCAL_STEP_SLOT_BUSY
@@ -2349,6 +2434,8 @@ async fn apply_or_ship_step(
             let out = routed.volumes[v_idx]
                 .xv_apply_step(local, rider, guards, false)
                 .await;
+            // The step's own guards (if any) live to its terminal outcome.
+            drop(late_guards);
             if out.is_err() {
                 routed.mirror_volume_failure(v_idx);
             }

@@ -279,6 +279,71 @@ impl DlmLockManager {
         guards
     }
 
+    /// The NON-PARKING form of [`Self::lock_many`]: the same canonical,
+    /// deduped plan, every stripe taken with the `try_*` fast path;
+    /// `None` — nothing held — when any stripe is contended. The one legal
+    /// way to add guards to an op that already HOLDS some (symmetric
+    /// PR 13b: a cross-owner step whose slot moved TO the initiator
+    /// mid-plan, its guards having travelled to the old holder): a
+    /// parking acquire there could cycle with a peer's canonical set (the
+    /// peer holds a lower stripe and waits for one of ours), so a
+    /// contended stripe is refused to the caller's retry law instead.
+    pub fn try_lock_many(
+        &self,
+        inodes: &[(u64, LockMode)],
+        dentries: &[(u64, &str, LockMode)],
+    ) -> Option<Vec<DlmGuard>> {
+        let mut guards = Vec::with_capacity(inodes.len() + dentries.len());
+        let mut plan: Vec<(usize, u64, LockMode)> = inodes
+            .iter()
+            .map(|&(ino, mode)| (self.inode_stripe(ino), key_word(ino, 0), mode))
+            .collect();
+        guards.extend(Self::try_acquire_deduped(&self.inode, &mut plan, true)?);
+        let mut plan: Vec<(usize, u64, LockMode)> = dentries
+            .iter()
+            .map(|&(parent, name, mode)| {
+                (
+                    self.dentry_stripe(parent, name),
+                    key_word(Self::dentry_key(parent, name), 0),
+                    mode,
+                )
+            })
+            .collect();
+        guards.extend(Self::try_acquire_deduped(&self.dentry, &mut plan, false)?);
+        Some(guards)
+    }
+
+    /// [`Self::acquire_deduped`]'s non-parking twin — `None` at the first
+    /// contended stripe (the guards taken so far drop with the `Vec`).
+    fn try_acquire_deduped(
+        class: &LockClass,
+        plan: &mut Vec<(usize, u64, LockMode)>,
+        inode_class: bool,
+    ) -> Option<Vec<DlmGuard>> {
+        plan.sort_unstable_by_key(|&(idx, _, mode)| (idx, mode == LockMode::Shared));
+        plan.dedup_by_key(|&mut (idx, _, _)| idx);
+        let mut guards = Vec::with_capacity(plan.len());
+        for &(idx, key, mode) in plan.iter() {
+            let cell = class.locks.get_by_index(idx).clone();
+            let inner = match mode {
+                LockMode::Shared => DlmGuardInner::Shared {
+                    _g: cell.try_read_owned().ok()?,
+                },
+                LockMode::Exclusive => DlmGuardInner::Exclusive {
+                    _g: cell.try_write_owned().ok()?,
+                },
+            };
+            class.census.stamp(idx, key);
+            let hold_timed = inode_class && mode == LockMode::Exclusive;
+            guards.push(DlmGuard {
+                _inner: inner,
+                acquired: hold_timed.then(std::time::Instant::now),
+                trace_id: 0,
+            });
+        }
+        Some(guards)
+    }
+
     /// The plan carries each object's census key beside its stripe; the
     /// dedup keeps the FIRST object of a shared stripe as the stripe's
     /// census identity (an in-group stripe collision is one acquire —

@@ -69,6 +69,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///    guard across a free, and it now waits on a journal write there.
 /// 4. MetaLV metadata-transaction locks, acquired in this sub-order:
 ///    - a. DLM `I{ino}` / `D{parent:name}` (per-object; MetaLV `DlmLockManager`)
+///      — an op's guards are ONE canonical `lock_many` per volume (deduped,
+///      ascending stripe), taken holding no other 4a guard. **The ONE
+///      sanctioned out-of-order ADDITION is `DlmLockManager::try_lock_many`**
+///      (symmetric PR 13b — a cross-owner step whose slot moved TO the
+///      initiator mid-plan applies locally under guards that travelled to
+///      the old holder): try-only, all-or-nothing, the canonical plan with
+///      the `try_*` fast path; a miss is the caller's retry class (the
+///      slot-moved re-dispatch), NEVER a parking acquire while holding — a
+///      parking take beside the op's held guards could cycle with a peer's
+///      canonical set, the self-deadlock class the flip fix adjudicated.
 ///    - b. **format v2**: dentry bucket lock (`dentry_bucket_locks`) — in-RAM
 ///      dentry-chain integrity. **Format v3** (design-cow-kv-metadata §4.9 4b):
 ///      per-node write locks — the commit path takes **leaf locks only**, in

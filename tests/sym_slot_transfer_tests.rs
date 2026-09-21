@@ -1387,7 +1387,11 @@ async fn a_region_past_its_page_budget_publishes_the_overflow_roots_into_tree0()
         "the tail passed the burst"
     );
     // Every overflow slot's record names a live root; the page names it
-    // not (the budget).
+    // not (the budget). Since PR 13b the page PREFERS the slots tree 0
+    // does not name (§4.4af — a page-published root must never be pushed
+    // off every durable home), so the 77 past the budget are the 64 rotor
+    // slots tree 0 named at the arm plus the 12 of the burst the first
+    // cycle wrote into tree 0 — never a page-homed root.
     let entries = read_directory(std::path::Path::new(&uris[0]), vol.superblock())
         .await
         .unwrap();
@@ -1413,7 +1417,33 @@ async fn a_region_past_its_page_budget_publishes_the_overflow_roots_into_tree0()
             "slot {s}: the overflow root rides tree 0"
         );
     }
-    assert!(overflow >= 77, "{overflow} overflow slots");
+    assert!(
+        overflow >= touched.len() - SLOT_PAGE_BUDGET,
+        "{overflow} of the burst past the page (≥ {})",
+        touched.len() - SLOT_PAGE_BUDGET
+    );
+    // Every leased slot OFF the page that HAS a tree — the burst's and the
+    // rotor's alike — has tree 0 naming its LIVE root: the selection law
+    // (a rotor slot nothing was minted in has no root to name).
+    for (s, st) in &states {
+        if named.contains(s) || *s == NATIVE_FOREST_SLOT {
+            continue;
+        }
+        let Some(live) = vol.slot_tree(*s).map(|t| t.root()) else {
+            continue;
+        };
+        if let SlotState::Leased {
+            appender_id: 0,
+            root,
+            ..
+        } = st
+        {
+            assert_eq!(
+                *root, live,
+                "slot {s} is off the page: tree 0 must name its live root"
+            );
+        }
+    }
     // Crash remount: every record is served off the recovered roots.
     drop(vol);
     drop(routed);

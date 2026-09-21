@@ -4151,6 +4151,19 @@ impl WriteCustodyClient {
                     self.endpoint
                 ),
             )),
+            // The holder's membership screen inside a failover (PR 13b,
+            // §4.4ag): this member's reclaim at the successor has not
+            // landed — the retryable class the acquire's ladder retries
+            // inside its budget, never EIO.
+            tp::TokenReply::NotMember => Err(SqueezefsError::retryable(
+                crate::error::RefusalClass::MembershipPending,
+                format!(
+                    "PR 13b: the slot holder at {} holds no live membership lease for '{}' yet — \
+                     a custody grant is served to members only; the reclaim lands within a \
+                     renewal beat",
+                    self.endpoint, self.id
+                ),
+            )),
             other => Err(SqueezefsError::refused(
                 libc::EIO,
                 format!(

@@ -2145,6 +2145,10 @@ pub struct TokenReaderPlane {
     /// plane parked on the member's reclaim for (PR 13b, §4.4ag —
     /// `dlm_token_membership_waits`).
     membership_waits: AtomicU64,
+    /// The recall channel's last round was refused by the holder's
+    /// membership screen — the serve gate parks on this word instead of
+    /// failing closed (cleared by the next completed round).
+    channel_membership_pending: AtomicBool,
     grant_rtt: LatencyHistogram,
 }
 
@@ -2262,6 +2266,7 @@ impl TokenReaderPlane {
             fetch_retries: AtomicU64::new(0),
             holder_repoints: AtomicU64::new(0),
             membership_waits: AtomicU64::new(0),
+            channel_membership_pending: AtomicBool::new(false),
             grant_rtt: LatencyHistogram::default(),
         });
         ensure_records_r5(&plane);
@@ -2507,21 +2512,31 @@ impl TokenReaderPlane {
     /// session, and every other grant of the volume rides the others.
     /// Pool depth = the D-1b session-depth derivation (one per 8 cores,
     /// 2..=8 — the owner's RPC-lane slope), dialed lazily.
-    /// One verb at the holder, PARKING on this member's reclaim when the
-    /// holder's membership screen refuses it (PR 13b, record §4.4ag —
+    /// A USER-facing verb at the holder (a fetch, a custody grant),
+    /// PARKING on this member's reclaim when the holder's membership
+    /// screen refuses it (PR 13b, record §4.4ag — the typed
+    /// [`RefusalClass::MembershipPending`] `call_on` mints from
     /// `TokenReply::NotMember`): inside a manager failover the successor's
     /// owner does not list this member until its renewal loop re-asserts
-    /// there, a beat after its reads resume; the read waits for the next
+    /// there, a beat after its reads resume; the verb waits for the next
     /// adopted grant (`membership::await_grant_adopted`, bounded by
     /// `reassertion_wait_bound`) and asks again. Past the bound the
-    /// RETRYABLE class surfaces ([`RefusalClass::MembershipPending`]),
-    /// never `EIO`. Counted on `dlm_token_membership_waits`.
-    async fn call(&self, call: TokenCall) -> Result<TokenReply> {
+    /// retryable class surfaces, never `EIO`. Counted on
+    /// `dlm_token_membership_waits`. The recall channel's standing poll,
+    /// the arm's probe, acks and releases take [`Self::call`] — their
+    /// loops and callers own the retry, and a park there would hold the
+    /// channel's first round behind a member that never joins.
+    async fn call_parking(&self, call: TokenCall) -> Result<TokenReply> {
         let deadline = Instant::now() + crate::membership::reassertion_wait_bound();
         loop {
             let gen0 = crate::membership::grant_generation();
-            match self.call_once(call.clone()).await? {
-                TokenReply::NotMember => {
+            match self.call(call.clone()).await {
+                Err(e)
+                    if matches!(
+                        e.refusal_class(),
+                        Some(crate::error::RefusalClass::MembershipPending)
+                    ) && crate::membership::installed_member_session().is_some() =>
+                {
                     self.membership_waits.fetch_add(1, Ordering::Relaxed);
                     let now = Instant::now();
                     if now < deadline
@@ -2529,24 +2544,14 @@ impl TokenReaderPlane {
                     {
                         continue;
                     }
-                    return Err(SqueezefsError::retryable(
-                        crate::error::RefusalClass::MembershipPending,
-                        format!(
-                            "token holder at {} refused '{}': no live membership lease with its \
-                             owner, and no grant was re-asserted within {:?} — retry \
-                             (dlm_token_membership_waits)",
-                            self.endpoint(),
-                            self.cfg.client_id,
-                            crate::membership::reassertion_wait_bound()
-                        ),
-                    ));
+                    return Err(e);
                 }
-                other => return Ok(other),
+                other => return other,
             }
         }
     }
 
-    async fn call_once(&self, call: TokenCall) -> Result<TokenReply> {
+    async fn call(&self, call: TokenCall) -> Result<TokenReply> {
         let n = self.sessions.len();
         let start = self.session_rr.fetch_add(1, Ordering::Relaxed) % n;
         let mut guard = None;
@@ -2687,7 +2692,7 @@ impl TokenReaderPlane {
         let mut entries: Vec<DirRecord> = Vec::new();
         loop {
             let reply = self
-                .call(TokenCall::Grant {
+                .call_parking(TokenCall::Grant {
                     object,
                     mode: TokenMode::Read,
                     wants: TokenWants {
@@ -2829,7 +2834,7 @@ impl TokenReaderPlane {
                 ));
             };
             let reply = self
-                .call(TokenCall::Grant {
+                .call_parking(TokenCall::Grant {
                     object,
                     mode: TokenMode::Read,
                     wants: TokenWants {
@@ -3047,10 +3052,63 @@ impl TokenReaderPlane {
         self.sheds.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// [`Self::serve_gate`] PARKING while the recall channel's last round
+    /// was refused by the holder's membership screen (PR 13b, §4.4ag): a
+    /// stale channel inside a manager failover is this member's reclaim
+    /// not yet landed at the successor, not a dead holder — the serve
+    /// waits for the channel's next round or an adopted grant, bounded by
+    /// `reassertion_wait_bound`, and re-reads the gate; past the bound the
+    /// typed retryable class surfaces ([`RefusalClass::MembershipPending`]),
+    /// never the fail-closed `EIO`. Every other stale channel keeps the
+    /// shipped fail-closed word.
+    async fn serve_gate_parking(&self) -> Result<()> {
+        let deadline = Instant::now() + crate::membership::reassertion_wait_bound();
+        loop {
+            let gen0 = crate::membership::grant_generation();
+            let round = self.channel_round_wake.notified();
+            match self.serve_gate() {
+                Ok(()) => return Ok(()),
+                // Only a MEMBER can be re-asserted: a process with no
+                // membership session (a misconfigured reader — the ghost)
+                // keeps the shipped fail-closed word at once.
+                Err(_)
+                    if self.channel_membership_pending.load(Ordering::Acquire)
+                        && crate::membership::installed_member_session().is_some() =>
+                {
+                    self.membership_waits.fetch_add(1, Ordering::Relaxed);
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(SqueezefsError::retryable(
+                            crate::error::RefusalClass::MembershipPending,
+                            format!(
+                                "token holder at {} refused '{}': no live membership lease with \
+                                 its owner, and no grant was re-asserted within {:?} — retry \
+                                 (dlm_token_membership_waits)",
+                                self.endpoint(),
+                                self.cfg.client_id,
+                                crate::membership::reassertion_wait_bound()
+                            ),
+                        ));
+                    }
+                    // Whichever lands first: the channel's next round (the
+                    // holder lists us again) or an adopted grant (the loop
+                    // re-polls on it).
+                    let remaining = deadline - now;
+                    let _ = squeezefs_ipc::sqz_future::race2(
+                        squeezefs_ipc::sqz_time::timeout(remaining, round),
+                        crate::membership::await_grant_adopted(gen0, remaining),
+                    )
+                    .await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Begin a serve of `object`: the cached entry under the serve gate,
     /// fetched on a miss (or when dentries are wanted and not yet held).
     pub async fn serve(&self, object: u64, wants: TokenWants) -> Result<Option<TokenServe>> {
-        self.serve_gate()?;
+        self.serve_gate_parking().await?;
         loop {
             if let Some(entry) = self.cache.read_sync(&object, |_, e| Arc::clone(e)) {
                 if entry.state.load(Ordering::Acquire) == ENTRY_LIVE
@@ -3168,6 +3226,8 @@ impl TokenReaderPlane {
             match round {
                 Ok(TokenReply::Recall { frame_id, objects }) => {
                     backoff = RECONNECT_BACKOFF_FLOOR;
+                    self.channel_membership_pending
+                        .store(false, Ordering::Release);
                     self.channel_last_round_ms
                         .store(self.now_ms(), Ordering::Release);
                     self.channel_failed.store(false, Ordering::Release);
@@ -3193,6 +3253,32 @@ impl TokenReaderPlane {
                     session = None;
                     self.note_channel_failure();
                     self.drop_all_and_purge().await;
+                }
+                // The holder's membership screen (PR 13b, §4.4ag): this
+                // member's reclaim at a successor has not landed. The
+                // tokens still drop (the holder swept them with the lease
+                // it does not know), the gate reads the class so a serve
+                // PARKS instead of failing closed, and the channel re-polls
+                // as soon as a grant is adopted — never at the doubling
+                // backoff a dead holder earns.
+                Err(e)
+                    if matches!(
+                        e.refusal_class(),
+                        Some(crate::error::RefusalClass::MembershipPending)
+                    ) =>
+                {
+                    log::info!(
+                        "token recall channel to {} refused as a non-member ({e}) — every token \
+                         is dropped; the channel re-polls when this member's grant is adopted",
+                        self.endpoint()
+                    );
+                    let gen0 = crate::membership::grant_generation();
+                    self.channel_membership_pending
+                        .store(true, Ordering::Release);
+                    self.note_channel_failure();
+                    self.drop_all_and_purge().await;
+                    let _ = crate::membership::await_grant_adopted(gen0, backoff).await;
+                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_CEILING);
                 }
                 Err(e) => {
                     log::warn!(
@@ -3452,6 +3538,20 @@ async fn call_on(
             "token reply echoes request {} for request {request_id}",
             frame.request_id
         )));
+    }
+    // The membership screen's word (PR 13b, §4.4ag) is the TYPED retryable
+    // class: a read parks on this member's reclaim (`call_parking`), every
+    // other verb surfaces it as EAGAIN at once.
+    if matches!(frame.reply, TokenReply::NotMember) {
+        return Err(SqueezefsError::retryable(
+            crate::error::RefusalClass::MembershipPending,
+            format!(
+                "token holder refused the frame: client '{}' holds no live membership lease with \
+                 this set's owner — a read token is granted to members only (a member \
+                 mid-reclaim at a successor retries)",
+                cfg.client_id
+            ),
+        ));
     }
     Ok(frame.reply)
 }

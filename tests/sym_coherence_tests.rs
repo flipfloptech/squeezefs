@@ -3461,23 +3461,29 @@ async fn the_holder_grants_members_only_and_refuses_a_ghost_before_it_registers(
         !squeezefs::meta_ship::token_plane::is_token_client("ghost"),
         "a refused ghost is not a token client"
     );
-    // The refusal's OWN text reaches the client (PR 12b round 3, F8): the
-    // membership screen answers STATUS_REFUSED with a reason string, not
-    // an encoded reply — decoded as one it read `invalid value: integer
-    // 99` and a joiner re-enrolling at a failover successor surfaced a
-    // user op's EIO off the garbage; it is the retryable class.
+    // The refusal's OWN word reaches the client (PR 12b round 3, F8 —
+    // decoded as an ordinary reply the screen's text read `invalid value:
+    // integer 99` and a joiner re-enrolling at a failover successor
+    // surfaced a user op's EIO off the garbage): since PR 13b (§4.4ag)
+    // the screen answers the TYPED `TokenReply::NotMember`, minted at the
+    // client as the retryable class `RefusalClass::MembershipPending`
+    // (EAGAIN) with the screen's reason; a fetch parks on the member's
+    // reclaim before it surfaces, the arm's probe surfaces it at once.
     let e = ghost_plane
         .probe()
         .await
         .expect_err("a ghost's probe is refused");
     assert!(
         e.to_string().contains("holds no live membership lease"),
-        "the refusal's own text, never a decode of it: {e}"
+        "the refusal's own reason, never a decode of it: {e}"
     );
     assert!(!e.to_string().contains("undecodable"), "{e}");
     assert!(
-        matches!(&e, squeezefs::error::SqueezefsError::Refused { errno, .. } if *errno == libc::EAGAIN),
-        "the retryable class: {e:?}"
+        matches!(
+            e.refusal_class(),
+            Some(squeezefs::error::RefusalClass::MembershipPending)
+        ) && e.to_errno() == libc::EAGAIN,
+        "the typed retryable class: {e:?}"
     );
     assert_eq!(ghost_plane.stats().grants, 0);
     ghost_plane.stop().await;
@@ -4228,16 +4234,54 @@ async fn a_readers_poll_scans_the_whole_ledger_after_a_ring_of_stopped_polls() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_read_refused_not_a_member_parks_on_the_members_reclaim_and_never_answers_eio() {
     use squeezefs::error::RefusalClass;
+    use squeezefs::membership::{
+        self, JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole, MemberSession,
+        MembershipOwner,
+    };
     let _g = SEAM.lock().await;
+    membership::uninstall();
+    // A short beat: T_owner 1 s, D_purge 100 ms ⇒ renew ≈ 300 ms, the
+    // reader's park bound (two beats) ≈ 600 ms — set BEFORE the clocks
+    // derive.
+    std::env::set_var("SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS", "1000");
+    std::env::set_var("SQUEEZEFS_MEMBERSHIP_PURGE_MS", "100");
+    // This process IS a member (a reader that joined an owner's shard):
+    // only a member can be re-asserted at a successor — a process with no
+    // membership session keeps the shipped fail-closed word.
+    let ticks = Arc::new(AtomicU64::new(50_000));
+    let clock = LeaseClock::manual(Arc::clone(&ticks));
+    let member_owner = MembershipOwner::arm(
+        "reasserting-owner",
+        3,
+        2,
+        LeaseClocks::derive(Duration::from_micros(250)).expect("the shipped derivation"),
+        clock.clone(),
+    )
+    .expect("arm the owner");
+    let JoinOutcome::Granted(grant) = member_owner.join(JoinRequest {
+        id: "reader-reasserting".to_string(),
+        role: MemberRole::Reader,
+        endpoint: None,
+        pid: std::process::id(),
+        boot: "boot-reasserting".to_string(),
+        prior_epoch: None,
+        pr_key: 0,
+        mount: None,
+    }) else {
+        panic!("join");
+    };
+    membership::install_member(Arc::new(MemberSession::adopt(
+        "reader-reasserting",
+        MemberRole::Reader,
+        &grant,
+        clock.now_ms(),
+        clock.clone(),
+    )));
     let dir = tempfile::tempdir().unwrap();
     let path = format_stamped(dir.path(), "meta0").await;
     let writer = open_armed_writer(&path).await;
     let (host, endpoint) = holder_listener(&writer.volumes[0]);
     let holder = writer.volumes[0].token_holder().unwrap().clone();
-    // A short beat: T_owner 1 s, D_purge 100 ms ⇒ renew ≈ 300 ms, the
-    // reader's park bound (two beats) ≈ 600 ms.
-    std::env::set_var("SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS", "1000");
-    std::env::set_var("SQUEEZEFS_MEMBERSHIP_PURGE_MS", "100");
     let bound = squeezefs::membership::reassertion_wait_bound();
     assert!(
         bound >= Duration::from_millis(200) && bound <= Duration::from_secs(2),
@@ -4307,9 +4351,12 @@ async fn a_read_refused_not_a_member_parks_on_the_members_reclaim_and_never_answ
         "the typed class, never the prose: {e:?}"
     );
     assert_eq!(e.to_errno(), libc::EAGAIN, "never EIO inside the window");
+    // At least the derived bound (the park is real), and bounded: the
+    // divert's holder-follow arm (PR 13 defect 15) may re-resolve and
+    // re-dial the plane once on a stale channel before the class surfaces.
     assert!(
-        wall >= bound.mul_f32(0.8) && wall < bound + Duration::from_secs(2),
-        "the park is the derived bound ({bound:?}), not a timer of its own: {wall:?}"
+        wall >= bound.mul_f32(0.8) && wall < Duration::from_secs(15),
+        "the park is the derived bound ({bound:?}) and bounded, not a timer of its own: {wall:?}"
     );
     assert!(plane.stats().membership_waits > waits1);
     // Re-asserted: the same read serves.
@@ -4324,4 +4371,5 @@ async fn a_read_refused_not_a_member_parks_on_the_members_reclaim_and_never_answ
     plane.stop().await;
     host.shutdown();
     shutdown(&writer).await;
+    membership::uninstall();
 }

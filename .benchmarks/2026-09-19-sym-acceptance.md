@@ -1711,29 +1711,96 @@ turn ended); PR 13b's item beside the token plane's failover follow
 refusal is the retryable class until the member's lease is re-asserted
 or expires — never `EIO` inside the window.
 
-### 4.4ah Fix-round finding 3 — FOUND, NOT FIXED (PR 5's token reader / defect 21's pin): `a_single_flight_fetch_loser_registers_before_it_rechecks_the_winner` hangs intermittently in the suite's order
+### 4.4ah Fix-round finding 3 — FIXED (the PIN's own seam schedule, not the product; defect 21's pin): `a_single_flight_fetch_loser_registers_before_it_rechecks_the_winner` deadlocked itself whenever the second-spawned fetcher won the single flight
 
 Twice in the fix round's matrix runs the `sym_coherence_tests` suite
 stopped on this test until the runner's 600 s watchdog killed it — the
 first matrix's FLAT leg (with a standalone instance of the same test
 running in another process beside it) and the second matrix's STAMPED
-leg (nothing else on the box); the same suite run alone passes on both
-legs (41/41 in 75 s each), the runner's own single-suite flat leg passes,
-and the pin alone passes in 2 s on both legs. A predecessor bisect was
-inconclusive (pairs re-run with a bound read PASS wherever the bound let
-the predecessor finish). The pin drives the single-flight token fetch
-through the `TEST_FETCH_LOSER_HOLD` seam — the register-recheck-await
-idiom over `sqz_notify::Notify` (registers at creation, ticked) — so a
-hang HERE is either the seam's own schedule (the release's
-`notify_waiters` and the loser's park) or the product's lost wake in a
-window the pin does not cover, which is the class the pin exists for.
-Recipe: `SQUEEZEFS_TEST_STAMP_SYMMETRIC=1 cargo test --all-features
---test sym_coherence_tests -- --test-threads=1` in the suite's order,
-under the runner's watchdog; the process's stacks at the hang
-(`eu-stack` / `gdb -p`) name the parked future. Open — PR 13b / the
-matrix's next run; under the "load-dependent hangs are first-class
-product bugs" doctrine it is filed as a product finding until the stacks
-say otherwise.
+leg (nothing else on the box); the same suite run alone passed on both
+legs and the pin alone passed in 2 s, so it was filed as a product
+finding until the stacks said otherwise. **The hang hunt (2026-09-20,
+the tree at `4094cb40`) reproduced it, read the stacks, and attributed
+it to the PIN — class (d), the seam's own schedule; the product's
+`TokenReaderPlane::fetch` was correct throughout.**
+
+**Reproduction.** The suite in the runner's order (one process,
+`--test-threads=1`, `CARGO_INCREMENTAL=0`, the two legs run beside each
+other as the first hang's shape) passed 4/4 on the `4094cb40` binary
+(stamped ×2, flat ×2, 41/41 in 75 s each) — the in-suite rate is low.
+**The pin ALONE, the test binary run directly, HUNG 10 of 29 runs on the
+`4094cb40` binary** (loops of 3/4/3/4 with 2/2/1/1 hangs on the idle box;
+then 15 runs interleaved with the fixed binary under a concurrent clippy
+build: 4 hangs — `/tmp/grok-justin/hang-hunt/pin-red*.stacks`); the
+record's "the pin alone passes in 2 s" was one lucky sample of a ≈ 35 %
+race. At every hang the stacks were captured before the kill
+(`sudo gdb -p`; `ptrace_scope` 1 refuses an unprivileged `eu-stack`):
+
+- **The parked frame.** Every worker thread of the pin's 4-worker runtime
+  is parked idle (`parking_lot_core::…::futex_wait` under
+  `tokio::runtime::…::park`) — no task is runnable; the test thread
+  (`Thread "a_single_flight"`) is parked in `tokio::runtime::park::
+  CachedParkThread::block_on` ← `Runtime::block_on` ←
+  `a_single_flight_fetch_loser_registers_before_it_rechecks_the_winner ()
+  at tests/sym_coherence_tests.rs:1915` — the `#[tokio::test]` block_on
+  of the test's future, i.e. the test's OWN await, not a product task.
+- **The statics name the future** (gdb on the symbols, identical at all
+  four captured hangs): `TEST_FETCH_LOSER_HOLD = 1` — `test_fetch_loser_
+  release()` has NOT run, so the test sits BEFORE it, at the one
+  unbounded await between the seam's park and the release:
+  `winner.await`; `TEST_FETCH_LOSER_PARKED = 1` — exactly one fetcher is
+  parked at the seam; `TEST_FETCH_LOSER_RELEASE.state = { permit: false,
+  epoch: 0, waiters.len: 1 }` — the seam's `Notify` holds ONE registered
+  waiter and its `notify_waiters` never fired. So the seam-parked future
+  (`released.await` in `fetch`, the Occupied arm) is the task the test
+  calls `winner` — the FIRST-spawned one — and the task it calls `loser`
+  won the single flight, fetched, removed its entry, notified nobody (the
+  seam holds the other before its registration) and finished. The test
+  then awaited `winner` unbounded while the release `winner` needed sat
+  behind that await: a deadlock of the pin with itself.
+
+**The mechanism.** `#[tokio::test(flavor = "multi_thread")]` runs the
+test's future under `block_on` on the test THREAD (the stack above); both
+`tokio::spawn`s therefore land on the runtime's inject queue and are
+picked by two different workers — which of the two reaches
+`fetching.entry_sync` first is a race of two worker wake-ups, won by the
+second-spawned task ≈ 35 % of the time alone here and more often under
+load (the matrix, a sibling process — the two matrix hangs' shapes). The
+pin assumed spawn order = station order. Not class (a): `sqz_notify`
+registers at creation and `notify_waiters` bumps the epoch every poll
+re-checks (read again for this finding); not (b): the fix round touched
+neither `token_plane.rs`, the pin, `sqz_notify.rs` nor `data_grant.rs`
+(`git diff --stat dcc0e1af^..4094cb40` on those paths is empty — the
+correlation with the fix round was the round's extra matrix runs and
+their load); not (c): no projection-refresh flight is on this path. The
+predecessor bisect the round tried could not have converged: the defect
+predates every fix-round commit (it landed with the pin, `86559cf3`).
+
+**The fix** (pin only — `tests/sym_coherence_tests.rs`, the test and its
+doc comment state the mechanism): the roles are the STATION's. After the
+seam reports a parked loser, the winner is **whichever task FINISHES**
+(`tokio::select!` over the two `JoinHandle`s, bounded at the file's 20 s
+— a genuine product park now fails LOUD instead of hanging the matrix),
+the release follows, and the other handle — the seam's loser — must
+serve within the 5 s bound as before. The pinned law is unchanged:
+register-recheck-await serves the loser off the winner's cache with ONE
+grant.
+
+**Proof (RED → GREEN, same box, interleaved).** RED: the `4094cb40`
+binary's pin alone 15 runs → 4 hangs (statics as above), cumulative 10 of
+29. GREEN: the fixed binary's pin alone **15 / 15** in the same
+interleaved loops (0 hangs), and the suite in the runner's order **5 + 5
+GREEN — stamped 5/5, flat 5/5 (41/41 each, 75–77 s wall), the two legs
+run beside each other** (+ one more pass per leg on the committed tree
+after the doc comment's final wording). `cargo fmt --check` 0; `cargo clippy --all-targets
+--all-features -- -D warnings` 0; `cargo clippy --all-targets -- -D
+warnings` 0. Artifacts: `/tmp/grok-justin/hang-hunt/` (`run_leg.sh` the
+watched suite attempt with stack capture, `pin_loop.sh` the bounded pin
+loop, `pin-red*.stacks` the four captured hangs, `{stamped,flat}-N.log`).
+Recipe for the class: a pin that names its actors by SPAWN ORDER and
+awaits one of them unbounded before releasing a seam is this deadlock
+waiting for load — every such await in a seam-driven pin is bounded, and
+the actors are named by what the SEAM observed.
 
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
@@ -1975,9 +2042,13 @@ counted decline, a bounded window or a stated venue):
    defect 15's follow — the refusal is the retryable class inside the
    window.
 15. **Fix-round finding 3 — defect 21's pin hangs intermittently in the
-   suite's order** (§4.4ah): the stamped matrix leg stopped on it once,
-   the flat leg once under a concurrent instance; alone it passes on both
-   legs. Attribute with the parked stacks; PR 13b / the matrix's next run.
+   suite's order** (§4.4ah): **FIXED by the hang hunt (2026-09-20)** —
+   the pin's own seam schedule (it named the winner by SPAWN ORDER and
+   awaited that handle unbounded before releasing the seam; the
+   second-spawned fetcher wins the station ≈ 35 % of the time alone and
+   more under load), attributed from the parked stacks + the seam's
+   statics, no product change. The pin names the winner by what the seam
+   observed and bounds the await; suite 10/10 in the runner's order.
 
 **Routed to PR 13 and NOT run here** (the brief's §3 list off PR 12b's,
 PR 7's, PR 4/8/9's and the gate's ledgers — each with its next venue,
@@ -2208,7 +2279,9 @@ it below):
   suite run alone on either leg passes — flat 41/41 in 75 s (twice, once
   through the runner), stamped 41/41 in 75 s — and the pin alone passes
   in 2 s on both legs, so the hang is INTERMITTENT and in the SUITE
-  ORDER: recorded as fix-round finding 3 (§4.4ah), open. The matrix
+  ORDER: recorded as fix-round finding 3 (§4.4ah) — **since attributed
+  and FIXED as the pin's own seam-schedule deadlock (§4.4ah; the pin
+  alone hung 10 of 29 runs on this binary)**. The matrix
   verdict for this tree is therefore: flat PASS 41/41; stamped 22 suites
   PASS then a HUNG suite the runner stopped on (the 19 suites after it
   in the stamped order did not run in that pass; every one of them ran

@@ -1856,6 +1856,21 @@ async fn a_token_reader_holding_a_directorys_token_across_its_flip_lists_the_mer
 /// await. Pinned through the seam that parks the loser in exactly that
 /// window until the winner has finished: RED = the loser's serve never
 /// returns (bounded here at 5 s), GREEN = it serves off the cache.
+///
+/// **The roles are the STATION's, never the spawn order's** (the PR 13
+/// record's §4.4ah — this pin hung the matrix twice and, run alone on a
+/// 32-core box, deadlocked itself in 10 of 29 runs). Both fetchers
+/// are spawned from the test's `block_on` thread onto the runtime's
+/// inject queue and picked by two different workers; which one reaches
+/// `fetching.entry_sync` first is a race of two worker wake-ups that the
+/// second-spawned task wins under load. The first build awaited the
+/// FIRST-spawned handle unbounded before it released the seam — when
+/// that task was the one the seam parked, the release it needed sat
+/// behind the await, and the process parked for ever with the seam's
+/// `Notify` holding one registered waiter and `TEST_FETCH_LOSER_HOLD`
+/// still set (the stacks' statics at the hang). The winner is whichever
+/// task FINISHES while the seam holds the other — awaited bounded — and
+/// the product's `fetch` was correct throughout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_single_flight_fetch_loser_registers_before_it_rechecks_the_winner() {
     use squeezefs::meta_ship::token_plane::{
@@ -1881,20 +1896,29 @@ async fn a_single_flight_fetch_loser_registers_before_it_rechecks_the_winner() {
     let (_reader, plane) = open_token_reader(&path, &endpoint, "reader-single-flight").await;
     let parked0 = TEST_FETCH_LOSER_PARKED.load(Ordering::Relaxed);
     TEST_FETCH_LOSER_HOLD.store(true, Ordering::Release);
-    // Two fetchers of one cold object: the first wins the single flight
-    // and fetches; the second reads the in-flight entry and parks at the
-    // seam — BEFORE its registration.
+    // Two fetchers of one cold object: whichever reaches the station
+    // first wins the single flight and fetches; the other reads the
+    // in-flight entry and parks at the seam — BEFORE its registration.
     let p1 = Arc::clone(&plane);
-    let winner = tokio::spawn(async move { p1.serve(local, TokenWants::default()).await });
+    let mut first = tokio::spawn(async move { p1.serve(local, TokenWants::default()).await });
     let p2 = Arc::clone(&plane);
-    let loser = tokio::spawn(async move { p2.serve(local, TokenWants::default()).await });
+    let mut second = tokio::spawn(async move { p2.serve(local, TokenWants::default()).await });
     wait_until("the loser parked at the seam", || {
         TEST_FETCH_LOSER_PARKED.load(Ordering::Relaxed) > parked0
     })
     .await;
     // The winner finishes: its entry removed, its waiters woken — the
-    // loser is not among them yet.
-    let served = winner.await.unwrap().expect("the winner serves");
+    // loser is not among them yet. The winner is the task that FINISHES
+    // (the seam holds the other), never the first-spawned one.
+    let (served, loser) = tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::select! {
+            r = &mut first => (r, second),
+            r = &mut second => (r, first),
+        }
+    })
+    .await
+    .expect("the winner's fetch returned while the seam held the loser");
+    let served = served.unwrap().expect("the winner serves");
     assert!(served.is_some());
     assert!(plane.holds(local));
     // Release the loser: it registers now, re-checks, and must SERVE.

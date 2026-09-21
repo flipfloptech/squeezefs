@@ -1407,6 +1407,16 @@ async fn field_rewrite_free_list_regime_runs_off_the_write_path() {
         for t in tasks {
             t.await.expect("rewrite task");
         }
+        // A displaced block's enqueue rides the write's detached DMA
+        // continuation, so the write acks BEFORE the enqueue lands: wait
+        // for this round's 8 enqueues first (a lost free fails loud here),
+        // else an empty queue between two continuations reads as drained.
+        let expected_queued = q0 + (round + 1) * 8;
+        eventually(
+            || queued() >= expected_queued,
+            "the round's displaced frees reach the reclaim queue",
+        )
+        .await;
         // The WORKER must complete the round's displaced reclaims (no
         // explicit drain here — batches>0 is part of the contract).
         eventually(

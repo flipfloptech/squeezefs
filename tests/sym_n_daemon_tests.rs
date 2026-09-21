@@ -8421,3 +8421,229 @@ async fn a_token_reader_follows_a_not_holder_redirect_to_the_lessee() {
     venue.tear_down();
     shutdown(&manager).await;
 }
+
+/// Move `slot`'s root by a forced compaction on `jvol` (the storm's shape
+/// is a lazy mint or a split — any move leaves the root unpublished until
+/// a durable home names it); the joiner's grant refills at its cadence.
+async fn compact_root_of(
+    jvol: &KvMetaBackend,
+    slot: ForestSlot,
+) -> squeezefs::meta_backend::kv::tree::RootPtr {
+    let before = jvol.slot_tree(slot).expect("the joiner's tree").root();
+    let mut attempts = 0;
+    loop {
+        match jvol.defrag_compact_nodes(&[(0, before.addr)]).await {
+            Ok(n) => {
+                assert_eq!(n, 1, "slot {slot}'s root compacts");
+                break;
+            }
+            Err(squeezefs::meta_backend::kv::KvError::GrantExhausted { .. }) if attempts < 8 => {
+                attempts += 1;
+                jvol.checkpoint_now().await.unwrap();
+            }
+            Err(e) => panic!("slot {slot}: {e}"),
+        }
+    }
+    let moved = jvol.slot_tree(slot).expect("the joiner's tree").root();
+    assert_ne!(moved, before, "slot {slot}'s root moved");
+    moved
+}
+
+/// **§4.4af — a PAGE-published root that falls off the page keeps no
+/// durable home, and the lessee's death loses the slot whole** (PR 13b;
+/// the `sym-storm` round-4 acked-writes loss: 15 fsynced files of writer
+/// m60 at a 128-name stride — every inode the rotor round-robin minted
+/// into ONE slot, 3549 — absent at the manager after it recovered m60's
+/// 14 regions; `recovery of appender 6: slot 3549 has NO page entry — the
+/// grant-time root 0x0 (seq 0) stands`; `slot_roots_shipped` 18 of the 19
+/// overflow slots on that volume).
+///
+/// The law as built before this pin: a LEASED slot's root rides its
+/// lessee's page (KD-SYM-3); a region past `SLOT_PAGE_BUDGET` ships the
+/// roots the page cannot hold to tree 0 (`PublishRoots`, F9); a root the
+/// page NAMED is `published` and its floor lifts. The hole: the page cut
+/// is DYNAMIC — the page named the 108 lowest slots, so a later first
+/// touch of a LOWER slot pushed a page-published slot INTO the overflow.
+/// Its `published` mark (the page's) still equalled its live root, so
+/// `roots_to_publish` excluded it, `PublishRoots` never shipped it, the
+/// page no longer named it and the ring tail had long passed its records:
+/// the root was named NOWHERE durable. The lessee's death recovered the
+/// slot at tree 0's grant-time root — every record flushed under the
+/// current root, and every one the tail passed, was gone.
+///
+/// Fixed: a publication remembers its HOME (page / tree 0); the page
+/// prefers the slots tree 0 does not name over the ones it does (a slot
+/// is left off the page only when tree 0 names its current root, or when
+/// more than the budget need the page); a slot the page can no longer
+/// name loses a page-homed publication (`demote_page_publications`, its
+/// floor re-armed) and the joiner ships the overflow's stale roots BEFORE
+/// it writes the page that drops them — a root is never off every
+/// durable home. Pinned at the durable level (tree 0 names the current
+/// root of every slot that left the page) and at the acked-writes level
+/// (the lessee's death loses nothing; a manager remount opens every
+/// file).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_published_root_pushed_off_the_page_by_a_lower_first_touch_rides_tree_zero_before_the_lessee_dies(
+) {
+    use squeezefs::meta_backend::kv::appender::{
+        forest_slot_of_page_slot, SlotEntryState, SLOT_PAGE_BUDGET,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs, slots) = overflow_seeded_volume(dir.path()).await;
+    let knobs = Knobs::armed().mint_slots("1");
+    let manager = open_under(&uris, &knobs).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let native = mvol.appender_stats().unwrap().native_slot;
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    enroll_manager(&mvol, &venue.endpoint()).await;
+
+    let joiner = join_knobs(&knobs, &uris, &venue, &mvol, 93).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jid = jvol.appender_stats().unwrap().appender_id;
+    let identity = jvol.joined_wire().unwrap().identity;
+    let plane = jvol.slot_leases().expect("armed");
+    let page_slots =
+        |page: &squeezefs::meta_backend::kv::appender::AppenderPage| -> Vec<ForestSlot> {
+            page.slots
+                .iter()
+                .filter(|e| e.state == SlotEntryState::Live)
+                .map(|e| forest_slot_of_page_slot(e.slot, native))
+                .collect()
+        };
+
+    // The UPPER 108 seeded slots first-touched (one file each) and every
+    // one's root MOVED: with the one-slot rotor (no tree — nothing to
+    // name) the joiner holds 109 and the page names all 108 moved roots —
+    // 108 PAGE publications, tree 0 keeping the grant-time roots.
+    let low = 20usize;
+    let mut files: Vec<(u64, Vec<(String, u64)>)> = Vec::with_capacity(dirs.len());
+    let mut grant_roots = std::collections::BTreeMap::new();
+    for (i, d) in dirs.iter().enumerate().skip(low) {
+        files.push((*d, create_files(&joiner, *d, &format!("s{i:03}-"), 1).await));
+        match tree0_state(&mvol, slots[i]).await {
+            Some(SlotState::Leased {
+                appender_id, root, ..
+            }) => {
+                assert_eq!(appender_id, jid);
+                grant_roots.insert(slots[i], root);
+            }
+            other => panic!("slot {}: {other:?}", slots[i]),
+        }
+    }
+    assert_eq!(plane.gate.leased_count(), SLOT_PAGE_BUDGET + 1);
+    jvol.checkpoint_now().await.unwrap();
+    let mut moved_roots = std::collections::BTreeMap::new();
+    for slot in slots.iter().skip(low) {
+        moved_roots.insert(*slot, compact_root_of(&jvol, *slot).await);
+    }
+    jvol.checkpoint_now().await.unwrap();
+    let page = page_of(&uris[0], &jvol, jid)
+        .await
+        .expect("the joiner's page");
+    let named = page_slots(&page);
+    assert_eq!(named.len(), SLOT_PAGE_BUDGET, "the page names its budget");
+    for slot in slots.iter().skip(low) {
+        let entry = page
+            .slots
+            .iter()
+            .find(|e| forest_slot_of_page_slot(e.slot, native) == *slot)
+            .unwrap_or_else(|| panic!("the page names slot {slot}"));
+        assert_eq!(
+            entry.root, moved_roots[slot],
+            "the page's word is the moved root"
+        );
+        match tree0_state(&mvol, *slot).await {
+            Some(SlotState::Leased { root, .. }) => assert_eq!(
+                root, grant_roots[slot],
+                "tree 0 keeps slot {slot}'s grant-time root: the page is its home"
+            ),
+            other => panic!("slot {slot}: {other:?}"),
+        }
+    }
+    // The victim: the highest seeded slot — the first the cut reaches.
+    let victim = *slots.last().unwrap();
+    let victim_dir = *dirs.last().unwrap();
+
+    // More acked records under the victim's moved root, the ring COVERED
+    // past them: their only durable home is the page's word.
+    let after = create_files(&joiner, victim_dir, "after-", 40).await;
+    jvol.checkpoint_now().await.unwrap();
+    jvol.checkpoint_now().await.unwrap();
+    let (head, upto) = jvol.region_ring_window(jid).expect("the joined region");
+    assert_eq!(head, upto, "covered (head {head}, reusable_upto {upto})");
+
+    // Twenty LOWER slots first-touched, each root MOVED too (unpublished
+    // — the page must name them ahead of anything tree 0 names): 128
+    // roots need the page, the cut moves down past the 20 highest. The
+    // LAW (RED on the base): once the page cannot name a slot, tree 0
+    // names its CURRENT root — a slot is never off every durable home.
+    let mut lower: Vec<(u64, Vec<(String, u64)>)> = Vec::new();
+    for (i, d) in dirs.iter().enumerate().take(low) {
+        lower.push((*d, create_files(&joiner, *d, &format!("l{i:03}-"), 1).await));
+        moved_roots.insert(slots[i], compact_root_of(&jvol, slots[i]).await);
+    }
+    jvol.checkpoint_now().await.unwrap();
+    let named = page_slots(
+        &page_of(&uris[0], &jvol, jid)
+            .await
+            .expect("the joiner's page"),
+    );
+    assert!(
+        !named.contains(&victim),
+        "premise: the victim left the page (the cut moved down)"
+    );
+    let demoted = squeezefs::meta_backend::kv::META_KV_FOREST_PAGE_PUBLICATIONS_DEMOTED
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        demoted >= low as u64,
+        "every page-homed publication the cut passed was demoted ({demoted} ≥ {low})"
+    );
+    for slot in &slots {
+        if named.contains(slot) {
+            continue;
+        }
+        match tree0_state(&mvol, *slot).await {
+            Some(SlotState::Leased { root, .. }) => assert_eq!(
+                root, moved_roots[slot],
+                "slot {slot} left the page: tree 0 must name its current root (RED: the \
+                 grant-time root — the page's publication mark survived the page)"
+            ),
+            other => panic!("slot {slot}: {other:?}"),
+        }
+    }
+    assert!(!jvol.is_failed());
+    assert_must_stay_zero(&jvol, "joiner");
+    assert_must_stay_zero(&mvol, "manager");
+
+    // The lessee DIES; the manager recovers its region: every acked file
+    // resolves (RED: the recovery installs the grant-time root of every
+    // slot that left the page — the storm's stride-128 population).
+    drop(jvol);
+    drop(joiner);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    assert!(!mvol.record_death_with_key(identity, 33, 0).await.unwrap());
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    assert_all_resolve(&manager, victim_dir, &after).await;
+    for (d, fs) in files.iter().chain(lower.iter()) {
+        assert_all_resolve(&manager, *d, fs).await;
+    }
+    assert_must_stay_zero(&mvol, "manager after the recovery");
+
+    // A manager remount opens every one of them.
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    let again = open_under(&uris, &knobs).await;
+    assert_all_resolve(&again, victim_dir, &after).await;
+    for (d, fs) in files.iter().chain(lower.iter()) {
+        assert_all_resolve(&again, *d, fs).await;
+    }
+    shutdown(&again).await;
+    drop(again);
+    fsck_clean(&uris).await;
+}

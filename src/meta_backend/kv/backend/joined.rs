@@ -1798,6 +1798,15 @@ impl KvMetaBackend {
         self.sync_device().await.map_err(KvError::Io)?;
         self.note_flush_ceiling(&had_dirty, crate::mono_core::monotonic_ns_u64());
 
+        // ---- The page-budget overflow law's WIRE form (round 4, F9): the
+        // roots the page below cannot name ride tree 0 through the
+        // manager; their floors lift at its durable reply. BEFORE the
+        // tail and the page (PR 13b, §4.4af): a slot the moving cut just
+        // pushed off the page keeps a durable home at every instant — tree
+        // 0 names its root before the page stops naming it, and a root
+        // the manager could not take clamps this cycle's tail.
+        self.joined_publish_overflow_roots(set, region, smo).await;
+
         // ---- The region's tail: every clamp a position in ITS ring.
         let dying_leaf_floors = self.node_cache().take_dying_leaf_floors();
         // The volume-wide dying floors (interior nodes and root swaps of
@@ -1855,10 +1864,6 @@ impl KvMetaBackend {
                  grant (tail {tail}); the manager's refill owns the retry"
             );
         }
-        // ---- The page-budget overflow law's WIRE form (round 4, F9): the
-        // roots the page just could not name ride tree 0 through the
-        // manager; their floors lift at its durable reply.
-        self.joined_publish_overflow_roots(set, region, smo).await;
         // Ring growth is the manager's bitmap act — declined here; the
         // ring drains at `admissible ÷ cadence` per tick (PR 2's law).
         {
@@ -1996,10 +2001,16 @@ impl KvMetaBackend {
         else {
             return;
         };
-        let overflow = Self::region_page_overflow(set, region);
+        let overflow = self.region_page_overflow(set, &plane, region);
         if overflow.is_empty() {
             return;
         }
+        // The cut moved past a page-published slot (PR 13b, §4.4af): its
+        // page-homed publication no longer holds — demoted here, BEFORE
+        // the page that drops it is written, so the frame below names
+        // its current root and its floor clamps this cycle's tail until
+        // the manager's reply.
+        forest.demote_page_publications(&overflow, region.ring().core().reusable_upto());
         let stale: std::collections::BTreeMap<ForestSlot, RootPtr> =
             forest.roots_to_publish().into_iter().collect();
         let mut roots: Vec<(ForestSlot, crate::meta_ship::manager::WireSlotRoot)> = Vec::new();

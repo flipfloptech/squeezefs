@@ -230,6 +230,15 @@ pub static META_KV_FOREST_SLOT_TREES_MINTED: AtomicU64 = AtomicU64::new(0);
 /// mounts. Surfaced as `meta_kv_forest_root_publishes`.
 pub static META_KV_FOREST_ROOT_PUBLISHES: AtomicU64 = AtomicU64::new(0);
 
+/// Page-homed root publications DEMOTED because the page-budget cut
+/// moved past their slot (PR 13b, §4.4af): a leased slot's root the
+/// appender page named is published only while the page names it — a
+/// lower slot's first touch that pushes it off the page re-arms its floor
+/// and ships it to tree 0 BEFORE the page that drops it is written.
+/// Grows only on a region past `SLOT_PAGE_BUDGET`; 0 on every unarmed
+/// mount. Surfaced as `meta_kv_forest_page_publications_demoted`.
+pub static META_KV_FOREST_PAGE_PUBLICATIONS_DEMOTED: AtomicU64 = AtomicU64::new(0);
+
 /// **Must-stay-0 tripwire**: a record that reached a forest volume's
 /// commit or replay path carrying a key the §5.2.1 codec refuses (a kind
 /// byte that is another tree's id, a wrong length, a by-block prefix

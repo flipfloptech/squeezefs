@@ -13800,6 +13800,13 @@ impl SqueezefsFilesystem {
                     "meta_kv_forest_root_publishes".into(),
                     load(&meta_kv::META_KV_FOREST_ROOT_PUBLISHES),
                 );
+                // Page-homed publications demoted because the page-budget
+                // cut moved past their slot (PR 13b, §4.4af) — each shipped
+                // to tree 0 before the page that drops it is written.
+                metrics.insert(
+                    "meta_kv_forest_page_publications_demoted".into(),
+                    load(&meta_kv::META_KV_FOREST_PAGE_PUBLICATIONS_DEMOTED),
+                );
                 metrics.insert(
                     "meta_kv_forest_key_violations".into(),
                     load(&meta_kv::META_KV_FOREST_KEY_VIOLATIONS),

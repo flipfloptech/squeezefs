@@ -52,9 +52,11 @@ pub struct SlotTrees {
     /// Serializes guest mints: two committers racing the first record of
     /// one slot must agree on ONE root (the loser adopts the winner's).
     mint: crate::sqz_sync::SqzMutex<()>,
-    /// Roots as last PUBLISHED into tree 0 — the checkpoint publishes
-    /// only the slots whose live root moved.
-    published: scc::HashMap<ForestSlot, RootPtr>,
+    /// Roots as last PUBLISHED, with the HOME that named each (tree 0, or
+    /// a leased slot's appender page) — the checkpoint publishes only the
+    /// slots whose live root moved, and a page-homed publication holds
+    /// only while the page names the slot ([`Self::demote_page_publications`]).
+    published: scc::HashMap<ForestSlot, Publication>,
     /// Guest slot trees minted this mount (`meta_kv_forest_slot_trees_minted`).
     minted: AtomicU64,
     /// `slot_state` records the checkpoint published (`meta_kv_forest_root_publishes`).
@@ -62,6 +64,25 @@ pub struct SlotTrees {
     /// Per-slot extent counts (`slot_tree_extents`, PR 4) — the affinity
     /// cap's input, moved by every SMO context scoped to a slot.
     extents: Arc<super::slot_lease::SlotExtentLedger>,
+}
+
+/// The durable home a guest root's publication lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationHome {
+    /// Tree 0's `slot_state` record names the root — a home for the
+    /// volume's life.
+    Tree0,
+    /// A LEASED slot's appender page names the root (KD-SYM-3). The page
+    /// is rewritten every checkpoint and names at most `SLOT_PAGE_BUDGET`
+    /// slots: this home holds only while the slot is on the page.
+    Page,
+}
+
+/// A published guest root and where it is named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Publication {
+    root: RootPtr,
+    home: PublicationHome,
 }
 
 /// A routed record: the slot tree holding it and its forest key.
@@ -129,7 +150,13 @@ impl SlotTrees {
         let published = scc::HashMap::new();
         for (slot, tree, published_root) in guests {
             let _ = map.insert_sync(slot, tree);
-            let _ = published.insert_sync(slot, published_root);
+            let _ = published.insert_sync(
+                slot,
+                Publication {
+                    root: published_root,
+                    home: PublicationHome::Tree0,
+                },
+            );
         }
         Self {
             control,
@@ -378,7 +405,13 @@ impl SlotTrees {
     pub fn adopt_guest(&self, slot: ForestSlot, tree: Arc<KvTree>) {
         let root = tree.root();
         let _ = self.guests.insert_sync(slot, tree);
-        let _ = self.published.upsert_sync(slot, root);
+        let _ = self.published.upsert_sync(
+            slot,
+            Publication {
+                root,
+                home: PublicationHome::Tree0,
+            },
+        );
     }
 
     /// The WRITER's adoption of a guest tree tree 0 does not name (opened
@@ -409,17 +442,70 @@ impl SlotTrees {
     pub fn unpublished_root_floors(&self) -> std::collections::BTreeMap<ForestSlot, u64> {
         let mut out = std::collections::BTreeMap::new();
         self.guests.iter_sync(|slot, tree| {
-            let live = tree.root();
-            let stale = self
-                .published
-                .read_sync(slot, |_, p| *p != live)
-                .unwrap_or(true);
-            if stale {
+            if self.root_is_stale(*slot, tree.root()) {
                 out.insert(*slot, tree.root_floor());
             }
             true
         });
         out
+    }
+
+    /// Whether `live` (a guest's current root) is NOT what its publication
+    /// names — unpublished, or published at another root.
+    fn root_is_stale(&self, slot: ForestSlot, live: RootPtr) -> bool {
+        self.published
+            .read_sync(&slot, |_, p| p.root != live)
+            .unwrap_or(true)
+    }
+
+    /// Whether TREE 0 names `slot`'s current root — the publication whose
+    /// home outlives the page (the page selection's second class: a slot
+    /// tree 0 names is the one the page may leave off). A slot with no
+    /// tree yet has no root to name: `true` (nothing of it is off any
+    /// home).
+    pub fn published_in_tree0(&self, slot: ForestSlot) -> bool {
+        let Some(live) = self.tree(slot).map(|t| t.root()) else {
+            return true;
+        };
+        self.published
+            .read_sync(&slot, |_, p| {
+                p.home == PublicationHome::Tree0 && p.root == live
+            })
+            .unwrap_or(false)
+    }
+
+    /// **The page-budget cut moved** (PR 13b, §4.4af): every slot in
+    /// `off_page` — leased by a region whose page can no longer name it —
+    /// loses a PAGE-homed publication, so it reads unpublished again: its
+    /// root ships to tree 0 before the page that drops it is written
+    /// (`roots_to_publish` names it), and its floor clamps the tail
+    /// meanwhile — from `floor` (the region ring's reusable frontier: the
+    /// records below it are covered by images the page named until now,
+    /// and a tail can never regress below what the ring reused) or the
+    /// root's own floor, whichever is higher. A tree-0 publication is
+    /// untouched. Returns how many publications were demoted (counted on
+    /// `meta_kv_forest_page_publications_demoted`).
+    pub fn demote_page_publications(&self, off_page: &[ForestSlot], floor: u64) -> usize {
+        let mut demoted = 0;
+        for slot in off_page {
+            let page_homed = self
+                .published
+                .read_sync(slot, |_, p| p.home == PublicationHome::Page)
+                .unwrap_or(false);
+            if !page_homed {
+                continue;
+            }
+            let _ = self.published.remove_sync(slot);
+            if let Some(tree) = self.tree(*slot) {
+                tree.set_root_floor(tree.root_floor().max(floor));
+            }
+            demoted += 1;
+        }
+        if demoted > 0 {
+            super::META_KV_FOREST_PAGE_PUBLICATIONS_DEMOTED
+                .fetch_add(demoted as u64, Ordering::Relaxed);
+        }
+        demoted
     }
 
     /// Split a slot-tree key into `(kind, legacy key)`, or `None` for a
@@ -683,11 +769,7 @@ impl SlotTrees {
         let mut out = Vec::new();
         self.guests.iter_sync(|slot, tree| {
             let live = tree.root();
-            let stale = self
-                .published
-                .read_sync(slot, |_, p| *p != live)
-                .unwrap_or(true);
-            if stale {
+            if self.root_is_stale(*slot, live) {
                 out.push((*slot, live));
             }
             true
@@ -698,7 +780,11 @@ impl SlotTrees {
 
     /// Note that `slot`'s root `root` has been published into tree 0.
     pub fn note_published(&self, slot: ForestSlot, root: RootPtr) {
-        let _ = self.published.upsert_sync(slot, root);
+        self.note_published_at(slot, root, PublicationHome::Tree0);
+    }
+
+    fn note_published_at(&self, slot: ForestSlot, root: RootPtr, home: PublicationHome) {
+        let _ = self.published.upsert_sync(slot, Publication { root, home });
         self.publishes.fetch_add(1, Ordering::Relaxed);
         super::META_KV_FOREST_ROOT_PUBLISHES.fetch_add(1, Ordering::Relaxed);
     }
@@ -706,14 +792,15 @@ impl SlotTrees {
     /// [`Self::note_published`] for a root a LEASED slot's appender page
     /// named (the armed plane's durable home for it): counted only when
     /// the root MOVED since its last publication — a page names every
-    /// leased root at every checkpoint.
+    /// leased root at every checkpoint. A root tree 0 already names keeps
+    /// its tree-0 home (the page is the weaker home).
     pub fn note_page_published(&self, slot: ForestSlot, root: RootPtr) {
         let moved = self
             .published
-            .read_sync(&slot, |_, p| *p != root)
+            .read_sync(&slot, |_, p| p.root != root)
             .unwrap_or(true);
         if moved {
-            self.note_published(slot, root);
+            self.note_published_at(slot, root, PublicationHome::Page);
         }
     }
 }

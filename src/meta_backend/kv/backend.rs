@@ -7074,7 +7074,8 @@ impl KvMetaBackend {
 
     /// The page entries of in-process region `region` under the armed
     /// plane: every slot it leases with its `g`, extent count, root and
-    /// cursor (`releasing` = the one entry mid-handover, in `Releasing`).
+    /// cursor (`releasing` = the one entry mid-handover, in `Releasing`),
+    /// up to the budget — [`Self::page_partition`]'s first half.
     fn lease_page_entries(
         &self,
         set: &super::appender::AppenderSet,
@@ -7082,7 +7083,49 @@ impl KvMetaBackend {
         region: &super::appender::AppenderRegion,
         releasing: &[super::record::ForestSlot],
     ) -> Vec<super::appender::SlotEntry> {
-        let mut entries: Vec<super::appender::SlotEntry> = Vec::new();
+        self.page_partition(set, plane, region, releasing).0
+    }
+
+    /// The slots of `region` its page CANNOT name (the page-budget
+    /// overflow law: their roots ride tree 0 — `publish_forest_roots`, or
+    /// a wire lessee's `PublishRoots`) — [`Self::page_partition`]'s second
+    /// half.
+    fn region_page_overflow(
+        &self,
+        set: &super::appender::AppenderSet,
+        plane: &super::slot_lease::SlotLeasePlane,
+        region: &super::appender::AppenderRegion,
+    ) -> Vec<super::record::ForestSlot> {
+        self.page_partition(set, plane, region, &[]).1
+    }
+
+    /// **The page's budget cut** (PR 13b, §4.4af — the `sym-storm` acked-
+    /// writes loss): the entries the page NAMES and the leased slots it
+    /// leaves to tree 0, ONE order for both. The page is a leased root's
+    /// durable home (KD-SYM-3) but names at most `SLOT_PAGE_BUDGET` slots,
+    /// so a slot is NEVER left off the page while tree 0 does not name its
+    /// current root: the entry mid-handover first (the two-homes law of
+    /// the release), then every slot whose root tree 0 does not name
+    /// (page-published or never published), then the slots tree 0 names
+    /// — each class in page-slot order, the budget cutting the tail. The
+    /// page-slot order alone cut the page at the 108 LOWEST slots, so a
+    /// later first touch of a LOWER slot pushed a page-published slot off
+    /// the page with its `published` mark intact: nothing shipped it,
+    /// nothing named it, and the lessee's death lost the slot whole (15
+    /// fsynced files at a 128-name stride — one rotor slot's population).
+    fn page_partition(
+        &self,
+        set: &super::appender::AppenderSet,
+        plane: &super::slot_lease::SlotLeasePlane,
+        region: &super::appender::AppenderRegion,
+        releasing: &[super::record::ForestSlot],
+    ) -> (
+        Vec<super::appender::SlotEntry>,
+        Vec<super::record::ForestSlot>,
+    ) {
+        let forest = self.forest();
+        let mut ranked: Vec<(u8, super::appender::SlotEntry, super::record::ForestSlot)> =
+            Vec::new();
         for slot in region.leases().iter().copied() {
             let Ok(page_slot) = super::appender::page_slot_of_forest_slot(slot, set.native_slot)
             else {
@@ -7090,53 +7133,48 @@ impl KvMetaBackend {
             };
             let words = self.slot_words_now(plane, slot);
             let g = plane.table.get(slot).map_or(0, |l| l.g);
-            entries.push(super::appender::SlotEntry {
-                slot: page_slot,
-                state: if releasing.contains(&slot) {
-                    super::appender::SlotEntryState::Releasing
-                } else {
-                    super::appender::SlotEntryState::Live
+            let is_releasing = releasing.contains(&slot);
+            let class = if is_releasing {
+                0
+            } else if forest.as_ref().is_some_and(|f| f.published_in_tree0(slot)) {
+                2
+            } else {
+                1
+            };
+            ranked.push((
+                class,
+                super::appender::SlotEntry {
+                    slot: page_slot,
+                    state: if is_releasing {
+                        super::appender::SlotEntryState::Releasing
+                    } else {
+                        super::appender::SlotEntryState::Live
+                    },
+                    g,
+                    slot_tree_extents: words.extents,
+                    root: RootPtr {
+                        addr: words.root.0,
+                        seq: words.root.1,
+                    },
+                    cursor: words.cursor,
                 },
-                g,
-                slot_tree_extents: words.extents,
-                root: RootPtr {
-                    addr: words.root.0,
-                    seq: words.root.1,
-                },
-                cursor: words.cursor,
-            });
+                slot,
+            ));
         }
-        entries.sort_by_key(|e| e.slot);
-        entries.truncate(super::appender::SLOT_PAGE_BUDGET);
-        entries
-    }
-
-    /// The slots of `region` its page CANNOT name — the leases past
-    /// `SLOT_PAGE_BUDGET` in the page's own order (`lease_page_entries`
-    /// sorts by page slot and truncates); their roots ride tree 0 (the
-    /// page-budget overflow law, `publish_forest_roots`).
-    fn region_page_overflow(
-        set: &super::appender::AppenderSet,
-        region: &super::appender::AppenderRegion,
-    ) -> Vec<super::record::ForestSlot> {
-        let leases = region.leases();
-        if leases.len() <= super::appender::SLOT_PAGE_BUDGET {
-            return Vec::new();
-        }
-        let mut by_page: Vec<(u16, super::record::ForestSlot)> = leases
+        ranked.sort_by_key(|(class, e, _)| (*class, e.slot));
+        let overflow = ranked
             .iter()
-            .filter_map(|s| {
-                super::appender::page_slot_of_forest_slot(*s, set.native_slot)
-                    .ok()
-                    .map(|p| (p, *s))
-            })
-            .collect();
-        by_page.sort_unstable();
-        by_page
-            .into_iter()
             .skip(super::appender::SLOT_PAGE_BUDGET)
-            .map(|(_, s)| s)
-            .collect()
+            .map(|(_, _, s)| *s)
+            .collect();
+        let mut entries: Vec<super::appender::SlotEntry> = ranked
+            .into_iter()
+            .take(super::appender::SLOT_PAGE_BUDGET)
+            .map(|(_, e, _)| e)
+            .collect();
+        // The page's own order (the decoder's canonical form).
+        entries.sort_by_key(|e| e.slot);
+        (entries, overflow)
     }
 
     /// **Flush-then-transfer** (KD-SYM-4, §5.1.4) of `slot` held by
@@ -19165,16 +19203,23 @@ impl KvMetaBackend {
         // process regions only (a wire appender's page is its own
         // mount's; its holdings are bounded at its join — PR 12).
         let plane = self.slot_leases();
-        let overflow: std::collections::BTreeSet<super::record::ForestSlot> =
-            match (plane, self.appenders.as_ref()) {
-                (Some(_), Some(set)) => set
-                    .regions
-                    .iter()
-                    .filter(|r| !r.released.load(Ordering::Acquire))
-                    .flat_map(|r| Self::region_page_overflow(set, r))
-                    .collect(),
-                _ => Default::default(),
-            };
+        let mut overflow: std::collections::BTreeSet<super::record::ForestSlot> =
+            Default::default();
+        if let (Some(p), Some(set)) = (plane, self.appenders.as_ref()) {
+            for r in set
+                .regions
+                .iter()
+                .filter(|r| !r.released.load(Ordering::Acquire))
+            {
+                let off_page = self.region_page_overflow(set, p, r);
+                // The cut moved past a page-published slot (PR 13b,
+                // §4.4af): its page-homed publication no longer holds —
+                // demoted, so the write below names its CURRENT root
+                // before the page that drops it is written.
+                forest.demote_page_publications(&off_page, r.ring().core().reusable_upto());
+                overflow.extend(off_page);
+            }
+        }
         // A slot the RAM table holds in ANY leased state — this mount's
         // lease (the gate's bits), a foreign lessee's, or a slot mid-
         // RECOVERY (`Releasing { dead }`, PR 10) — is never published as

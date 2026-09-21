@@ -1914,7 +1914,15 @@ leg_sym_join_ladder() {
     fi
 
     umount "$mnt" >> "$out" 2>&1
-    sleep 1
+    # The FUSE unmount returns before the daemon's leave; the registrant
+    # release is the leave's LAST act (the WERO hold drops with the arm's
+    # disarm). Wait for the PROCESS to exit, bounded, before judging the
+    # namespaces — the joiners' law above; a fixed 1 s read the successor's
+    # own key one instant before its release.
+    for i in $(seq 1 240); do
+        pgrep -f "squeezefs.*mount sqmeta://$meta $mnt " > /dev/null 2>&1 || break
+        sleep 0.5
+    done
     reg_m=$(nvme resv-report "$meta" --eds -o json 2>/dev/null | jq -r .regctl)
     reg_d=$(nvme resv-report "$data" --eds -o json 2>/dev/null | jq -r .regctl)
     log "SYMJOIN: registrants after the clean leave — meta [$(regkeys "$meta")] data [$(regkeys "$data")]"

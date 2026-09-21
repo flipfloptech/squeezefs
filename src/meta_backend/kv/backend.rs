@@ -7072,77 +7072,87 @@ impl KvMetaBackend {
         }
     }
 
-    /// The page entries of in-process region `region` under the armed
-    /// plane: every slot it leases with its `g`, extent count, root and
-    /// cursor (`releasing` = the one entry mid-handover, in `Releasing`),
-    /// up to the budget — [`Self::page_partition`]'s first half.
-    fn lease_page_entries(
-        &self,
-        set: &super::appender::AppenderSet,
-        plane: &super::slot_lease::SlotLeasePlane,
-        region: &super::appender::AppenderRegion,
-        releasing: &[super::record::ForestSlot],
-    ) -> Vec<super::appender::SlotEntry> {
-        self.page_partition(set, plane, region, releasing).0
-    }
-
     /// The slots of `region` its page CANNOT name (the page-budget
     /// overflow law: their roots ride tree 0 — `publish_forest_roots`, or
-    /// a wire lessee's `PublishRoots`) — [`Self::page_partition`]'s second
-    /// half.
+    /// a wire lessee's `PublishRoots`) — [`Self::page_plan`]'s off-page
+    /// half, the cycle's bulk publication's input.
     fn region_page_overflow(
         &self,
         set: &super::appender::AppenderSet,
         plane: &super::slot_lease::SlotLeasePlane,
         region: &super::appender::AppenderRegion,
     ) -> Vec<super::record::ForestSlot> {
-        self.page_partition(set, plane, region, &[]).1
+        self.page_plan(set, plane, region, &[]).off_page
     }
 
     /// **The page's budget cut** (PR 13b, §4.4af — the `sym-storm` acked-
-    /// writes loss): the entries the page NAMES and the leased slots it
-    /// leaves to tree 0, ONE order for both. The page is a leased root's
-    /// durable home (KD-SYM-3) but names at most `SLOT_PAGE_BUDGET` slots,
-    /// so a slot is NEVER left off the page while tree 0 does not name its
-    /// current root: the entry mid-handover first (the two-homes law of
-    /// the release), then every slot whose root tree 0 does not name
-    /// (page-published or never published), then the slots tree 0 names
-    /// — each class in page-slot order, the budget cutting the tail. The
-    /// page-slot order alone cut the page at the 108 LOWEST slots, so a
-    /// later first touch of a LOWER slot pushed a page-published slot off
-    /// the page with its `published` mark intact: nothing shipped it,
-    /// nothing named it, and the lessee's death lost the slot whole (15
-    /// fsynced files at a 128-name stride — one rotor slot's population).
-    fn page_partition(
+    /// writes loss; review round 1, Issue 2 — the ONE order every page
+    /// writer takes): the entries the page NAMES and the leased slots it
+    /// leaves to tree 0. The page is a leased root's durable home
+    /// (KD-SYM-3) but names at most `SLOT_PAGE_BUDGET` slots, so the rank
+    /// is by what a slot LOSES if the page drops it: the entry mid-handover
+    /// first (the two-homes law of the release — the caller's `releasing`,
+    /// or the table's `Releasing` state during the flush cycles, so the
+    /// cadence's own page write names it too), then every slot whose
+    /// CURRENT root only a page names (`page_homed` — dropping it loses the
+    /// root's only durable home; [`Self::prepare_page_entries`] publishes
+    /// such a slot into tree 0 BEFORE any page drops it), then every
+    /// UNPUBLISHED slot (its floor keeps its records in the window; naming
+    /// it lifts the floor), then the slots tree 0 names at their current
+    /// root and the native slot (the fixed ledger's root — safe off the
+    /// page) — each class in page-slot order, the budget cutting the tail.
+    /// The page-slot order alone cut the page at the 108
+    /// LOWEST slots, so a later first touch of a LOWER slot pushed a
+    /// page-published slot off the page with its `published` mark intact:
+    /// nothing shipped it, nothing named it, and the lessee's death lost
+    /// the slot whole (15 fsynced files at a 128-name stride — one rotor
+    /// slot's population); the first fix's rank put the unpublished ahead
+    /// of the page-homed, so a first touch landing between the cycle's
+    /// publication and its page write — or a handover's `Releasing` entry
+    /// — could still evict a page-homed slot un-demoted.
+    fn page_plan(
         &self,
         set: &super::appender::AppenderSet,
         plane: &super::slot_lease::SlotLeasePlane,
         region: &super::appender::AppenderRegion,
         releasing: &[super::record::ForestSlot],
-    ) -> (
-        Vec<super::appender::SlotEntry>,
-        Vec<super::record::ForestSlot>,
-    ) {
+    ) -> PagePlan {
         let forest = self.forest();
-        let mut ranked: Vec<(u8, super::appender::SlotEntry, super::record::ForestSlot)> =
-            Vec::new();
+        let mut ranked: Vec<(
+            (u8, u8),
+            super::appender::SlotEntry,
+            super::record::ForestSlot,
+            bool,
+        )> = Vec::new();
         for slot in region.leases().iter().copied() {
             let Ok(page_slot) = super::appender::page_slot_of_forest_slot(slot, set.native_slot)
             else {
                 continue;
             };
             let words = self.slot_words_now(plane, slot);
-            let g = plane.table.get(slot).map_or(0, |l| l.g);
+            let lease = plane.table.get(slot);
+            let g = lease.as_ref().map_or(0, |l| l.g);
             let is_releasing = releasing.contains(&slot);
-            let class = if is_releasing {
-                0
-            } else if forest.as_ref().is_some_and(|f| f.published_in_tree0(slot)) {
-                2
-            } else {
+            let mid_handover = is_releasing
+                || lease.as_ref().is_some_and(|l| {
+                    l.holder == region.id
+                        && l.state == crate::slot_lease_core::LeaseState::Releasing
+                });
+            let page_homed = forest.as_ref().is_some_and(|f| f.page_homed(slot));
+            // The native slot's root rides the FIXED LEDGER every cycle
+            // (the open skips its page entry — "the ledger's, mirrored"),
+            // so its entry is the one the page may always drop.
+            let home_rank = if slot == super::record::NATIVE_FOREST_SLOT {
+                3
+            } else if page_homed {
                 1
+            } else if forest.as_ref().is_some_and(|f| f.published_in_tree0(slot)) {
+                3
+            } else {
+                2
             };
             ranked.push((
-                class,
+                (u8::from(!mid_handover), home_rank),
                 super::appender::SlotEntry {
                     slot: page_slot,
                     state: if is_releasing {
@@ -7159,22 +7169,161 @@ impl KvMetaBackend {
                     cursor: words.cursor,
                 },
                 slot,
+                page_homed,
             ));
         }
-        ranked.sort_by_key(|(class, e, _)| (*class, e.slot));
-        let overflow = ranked
+        ranked.sort_by_key(|(class, e, _, _)| (*class, e.slot));
+        let cut = ranked.split_off(ranked.len().min(super::appender::SLOT_PAGE_BUDGET));
+        let off_page_homed = cut
             .iter()
-            .skip(super::appender::SLOT_PAGE_BUDGET)
-            .map(|(_, _, s)| *s)
+            .filter(|(_, _, _, homed)| *homed)
+            .map(|(_, _, s, _)| *s)
             .collect();
-        let mut entries: Vec<super::appender::SlotEntry> = ranked
-            .into_iter()
-            .take(super::appender::SLOT_PAGE_BUDGET)
-            .map(|(_, e, _)| e)
-            .collect();
+        let off_page = cut.into_iter().map(|(_, _, s, _)| s).collect();
+        let mut entries: Vec<super::appender::SlotEntry> =
+            ranked.into_iter().map(|(_, e, _, _)| e).collect();
         // The page's own order (the decoder's canonical form).
         entries.sort_by_key(|e| e.slot);
-        (entries, overflow)
+        PagePlan {
+            entries,
+            off_page,
+            off_page_homed,
+        }
+    }
+
+    /// **The ONE page writer's invariant** (review round 1, Issue 2 —
+    /// §4.4af made structural): the entries region `region`'s page names
+    /// NOW, computed so that a slot whose current root only a page names
+    /// is never dropped from the page before tree 0 names it. Every page
+    /// write of a leased region takes its entries here — the checkpoint
+    /// cycle's ([`Self::write_appender_pages`]), the handover's step 3 and
+    /// step 5, the leave's — so the order "tree 0 names a root, THEN the
+    /// page stops naming it" is a property of the writer, not of the two
+    /// cycle sites that published the bulk. The cycle's publication
+    /// (`publish_forest_roots` / `joined_publish_overflow_roots`) leaves at
+    /// most the budget page-homed; what reaches this arm is the residue a
+    /// legal schedule adds between it and the page write — a first touch
+    /// during the flush pass, a handover's `Releasing` entry promoted to
+    /// the page's head, the leave's all-`Releasing` page — and it is
+    /// published here before the page is written: the manager as one
+    /// durable control entry rewriting each slot's `Leased` record with
+    /// its current root, a joined appender as `PublishRoots` awaited at
+    /// the manager. A publication that cannot land (the reserve, the
+    /// wire) fails the page write, never the invariant — the previous
+    /// page image, which named the slot, stands. `cycle` = the checkpoint
+    /// cycle's context when the caller IS the cycle (the checkpoint-class
+    /// admission; the wire under the held SMO guard), `None` from the
+    /// handover and the leave.
+    async fn prepare_page_entries(
+        &self,
+        set: &super::appender::AppenderSet,
+        plane: &super::slot_lease::SlotLeasePlane,
+        region: &super::appender::AppenderRegion,
+        releasing: &[super::record::ForestSlot],
+        cycle: Option<&super::tree::SmoContext>,
+    ) -> std::result::Result<Vec<super::appender::SlotEntry>, KvError> {
+        let plan = self.page_plan(set, plane, region, releasing);
+        if !plan.off_page_homed.is_empty() {
+            self.publish_roots_before_drop(plane, region, &plan.off_page_homed, cycle)
+                .await?;
+        }
+        Ok(plan.entries)
+    }
+
+    /// The tree-0 publication of `slots` — page-homed roots the page is
+    /// about to drop ([`Self::prepare_page_entries`]): demoted (the floor
+    /// re-armed, counted on `meta_kv_forest_page_publications_demoted`),
+    /// then named in tree 0 durably, then noted published there. The
+    /// manager writes the `Leased` records itself; a joined appender ships
+    /// `PublishRoots`.
+    async fn publish_roots_before_drop(
+        &self,
+        plane: &super::slot_lease::SlotLeasePlane,
+        region: &super::appender::AppenderRegion,
+        slots: &[super::record::ForestSlot],
+        cycle: Option<&super::tree::SmoContext>,
+    ) -> std::result::Result<(), KvError> {
+        let Some(forest) = self.forest() else {
+            return Ok(());
+        };
+        forest.demote_page_publications(slots, region.ring().core().reusable_upto());
+        if self.is_joined_appender() {
+            return self.wire_publish_roots(plane, region, slots, cycle).await;
+        }
+        let mut recs: Vec<(u8, Record)> = Vec::with_capacity(slots.len());
+        let mut written: Vec<(super::record::ForestSlot, RootPtr)> =
+            Vec::with_capacity(slots.len());
+        let tag = super::journal::tag_for(super::record::TREE_CONTROL, 0);
+        for slot in slots {
+            let Some(l) = plane
+                .table
+                .get(*slot)
+                .filter(|l| l.state != crate::slot_lease_core::LeaseState::Unleased)
+            else {
+                continue;
+            };
+            let Some(root) = forest.tree(*slot).map(|t| t.root()) else {
+                continue;
+            };
+            let page_addr = self.page_addr_of(l.holder).await?;
+            let words = self.slot_words_now(plane, *slot);
+            let value = super::slot_state::SlotState::Leased {
+                appender_id: l.holder,
+                g: l.g,
+                page_addr,
+                root,
+                cursor: words.cursor,
+                slot_tree_extents: words.extents,
+                seq_floor: l.words.seq_floor,
+            }
+            .encode();
+            recs.push((
+                tag,
+                Record::put(super::slot_state::slot_state_key(*slot), 0, value),
+            ));
+            written.push((*slot, root));
+        }
+        if recs.is_empty() {
+            return Ok(());
+        }
+        let admit = if cycle.is_some() {
+            EntryAdmission::TryCheckpoint
+        } else {
+            EntryAdmission::Try
+        };
+        self.write_control_entry(recs, admit).await?;
+        for (slot, root) in written {
+            forest.note_published(slot, root);
+        }
+        log::debug!(
+            "meta volume {}: appender {}'s page dropped {} page-homed slot(s) — their roots \
+             published into tree 0 first",
+            self.path.display(),
+            region.id,
+            slots.len()
+        );
+        Ok(())
+    }
+
+    /// Note the roots one page write NAMED as page-published (a `Live`
+    /// or `Releasing` entry with a root is that root's durable home under
+    /// the armed plane — its floor stops clamping the region's tail; the
+    /// native slot's root is the ledger's). Called after every page write
+    /// of a leased region.
+    fn note_page_entries_published(
+        &self,
+        set: &super::appender::AppenderSet,
+        entries: &[super::appender::SlotEntry],
+    ) {
+        let Some(forest) = self.forest() else {
+            return;
+        };
+        for e in entries.iter().filter(|e| e.root.addr != 0) {
+            let slot = super::appender::forest_slot_of_page_slot(e.slot, set.native_slot);
+            if slot != super::record::NATIVE_FOREST_SLOT {
+                forest.note_page_published(slot, e.root);
+            }
+        }
     }
 
     /// **Flush-then-transfer** (KD-SYM-4, §5.1.4) of `slot` held by
@@ -7218,12 +7367,12 @@ impl KvMetaBackend {
     ) -> std::result::Result<(), KvError> {
         use super::checkpoint::COVER_CYCLES_MAX;
         for cycle in 1..=COVER_CYCLES_MAX {
+            // The cycle's own page write names the slot (its table state
+            // is `Releasing` — the page plan's first class) and notes the
+            // root page-published; review round 1, Issue 2 retired the
+            // note this loop made itself, which recorded a publication
+            // the page had not made when the slot sat in the overflow.
             self.checkpoint_now().await?;
-            if let Some(forest) = self.forest() {
-                if let Some(tree) = forest.tree(slot) {
-                    forest.note_page_published(slot, tree.root());
-                }
-            }
             let tail = region.ring().core().reusable_upto();
             let frontier = self.cache.slot_record_frontier(slot);
             let root_unpublished = self.unpublished_root_floors().contains_key(&slot);
@@ -7415,15 +7564,30 @@ impl KvMetaBackend {
             },
             None => Vec::new(),
         };
-        // 3. The page: the slot in `Releasing` with its final words.
+        // 3. The page: the slot in `Releasing` with its final words — the
+        // ONE page writer's invariant applies (Issue 2: a `Releasing`
+        // entry promoted to the page's head on a region holding the
+        // budget in page-homed roots pushes one off; its root is published
+        // into tree 0 BEFORE this page drops it).
         let t_page = std::time::Instant::now();
+        let entries = match self
+            .prepare_page_entries(set, &plane, region, &[slot], None)
+            .await
         {
-            let entries = self.lease_page_entries(set, &plane, region, &[slot]);
+            Ok(e) => e,
+            Err(e) => return Err(abort(e)),
+        };
+        {
             let mut page = region.page.lock().unwrap_or_else(|e| e.into_inner());
-            page.slots = entries;
+            page.slots = entries.clone();
         }
-        self.write_region_page(region).await?;
-        self.sync_device().await.map_err(KvError::Io)?;
+        if let Err(e) = self.write_region_page(region).await {
+            return Err(abort(e));
+        }
+        if let Err(e) = self.sync_device().await {
+            return Err(abort(KvError::Io(e)));
+        }
+        self.note_page_entries_published(set, &entries);
         let page_ns = t_page.elapsed().as_nanos() as u64;
         if TEST_HANDOVER_HOLD_AFTER_PAGE.load(Ordering::Relaxed) {
             return Err(KvError::Busy(format!(
@@ -7476,12 +7640,15 @@ impl KvMetaBackend {
                 self.remove_guest_cursor(r);
             }
         }
+        let entries = self
+            .prepare_page_entries(set, &plane, region, &[], None)
+            .await?;
         {
-            let entries = self.lease_page_entries(set, &plane, region, &[]);
             let mut page = region.page.lock().unwrap_or_else(|e| e.into_inner());
-            page.slots = entries;
+            page.slots = entries.clone();
         }
         self.write_region_page(region).await?;
+        self.note_page_entries_published(set, &entries);
         plane.phases.record(flush_ns, page_ns, tree0_ns, 0);
         // The HOLDER's measured handover cost feeds ITS `N_floor` (PR 13):
         // the manager's in-process accept folded the wall it paid; a wire
@@ -8066,13 +8233,21 @@ impl KvMetaBackend {
         if held.is_empty() {
             return Ok(());
         }
+        // The ONE page writer's invariant (Issue 2): every held slot is
+        // `Releasing` here, and past the budget the page names the
+        // page-homed ones first (the leave's final cycles left at most the
+        // budget of them); a slot the page still cannot name is published
+        // into tree 0 before this write drops it.
+        let entries = self
+            .prepare_page_entries(set, plane, region, &held, None)
+            .await?;
         {
-            let entries = self.lease_page_entries(set, plane, region, &held);
             let mut page = region.page.lock().unwrap_or_else(|e| e.into_inner());
-            page.slots = entries;
+            page.slots = entries.clone();
         }
         self.write_region_page(region).await?;
         self.sync_device().await.map_err(KvError::Io)?;
+        self.note_page_entries_published(set, &entries);
         let last_written = self.lease_seq();
         let tag = super::journal::tag_for(super::record::TREE_CONTROL, 0);
         // Phase 1: every slot's records staged (its `Unleased` put, its
@@ -8435,6 +8610,11 @@ impl KvMetaBackend {
                 .ring
                 .try_admit(len, AdmissionClass::User)
                 .ok_or(KvError::JournalReserveExhausted { needed: len })?,
+            EntryAdmission::TryCheckpoint => {
+                self.ring
+                    .try_admit(len, AdmissionClass::Checkpoint)
+                    .ok_or(KvError::JournalReserveExhausted { needed: len })?
+            }
             // A pre-admission (the door's, taken PARKING before the verb
             // mutex — Issue 24) for at least this entry: split to the
             // exact length, the remainder released. A shorter one is a
@@ -10084,6 +10264,7 @@ impl KvMetaBackend {
         ckpt_seq: u64,
         head: u64,
         region_tails: &[(u32, u64)],
+        cycle: &super::tree::SmoContext,
     ) -> std::result::Result<(), KvError> {
         let Some(set) = self.appenders.as_ref() else {
             return Ok(());
@@ -10113,8 +10294,13 @@ impl KvMetaBackend {
             if let Some(plane) = self.slot_leases() {
                 // The armed plane (PR 4, KD-SYM-3): every page names
                 // exactly the slots its region leases, with their live
-                // `g`, extent count, root and cursor.
-                entries = self.lease_page_entries(set, plane, r, &[]);
+                // `g`, extent count, root and cursor — through the ONE
+                // page writer's invariant (Issue 2: a first touch that
+                // landed since this cycle's publication cannot evict a
+                // page-homed root un-named).
+                entries = self
+                    .prepare_page_entries(set, plane, r, &[], Some(cycle))
+                    .await?;
             } else if r.id == 0 {
                 for (slot, tree) in &trees {
                     if set.region_of_slot(*slot) != 0 {
@@ -10219,16 +10405,10 @@ impl KvMetaBackend {
             // that started after this write (the DUR-3 push above), so
             // the page is durable before any record under the root can
             // leave the window. An entry the budget truncated off the
-            // page publishes nothing and keeps its floor.
+            // page publishes nothing and keeps its floor (or was published
+            // into tree 0 by `prepare_page_entries` first).
             if self.slot_leases().is_some() {
-                for e in entries.iter().filter(|e| {
-                    e.state == super::appender::SlotEntryState::Live && e.root.addr != 0
-                }) {
-                    let slot = super::appender::forest_slot_of_page_slot(e.slot, set.native_slot);
-                    if slot != super::record::NATIVE_FOREST_SLOT {
-                        forest.note_page_published(slot, e.root);
-                    }
-                }
+                self.note_page_entries_published(set, &entries);
             }
         }
         Ok(())
@@ -15063,10 +15243,14 @@ pub enum ControlAdmit {
 
 /// A control entry's admission as [`KvMetaBackend::write_control_entry`]
 /// receives it: taken now (`try_admit`, the wire verbs' and the
-/// cadence's class) or handed in, already admitted for AT LEAST the
-/// entry's length (the door's pre-admission).
+/// cadence's class), taken now in the CHECKPOINT class (an entry the
+/// checkpoint cycle itself writes — the page writer's publish-before-drop
+/// inside a cycle draws the reserve a user commit cannot, exactly like
+/// `publish_forest_roots`), or handed in, already admitted for AT LEAST
+/// the entry's length (the door's pre-admission).
 pub(super) enum EntryAdmission {
     Try,
+    TryCheckpoint,
     Held(super::journal_core::Admission),
 }
 
@@ -15103,6 +15287,16 @@ impl Drop for HeldAdmission<'_> {
             self.core.release(adm);
         }
     }
+}
+
+/// One region's page plan (`page_plan`): the entries its page names now
+/// and the leased slots it leaves to tree 0 — of those, the ones whose
+/// current root only a page names (`off_page_homed`), which
+/// `prepare_page_entries` publishes into tree 0 BEFORE the page is written.
+struct PagePlan {
+    entries: Vec<super::appender::SlotEntry>,
+    off_page: Vec<super::record::ForestSlot>,
+    off_page_homed: Vec<super::record::ForestSlot>,
 }
 
 /// One slot the clean leave releases (`release_leases_at_leave`): its

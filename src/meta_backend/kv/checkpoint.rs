@@ -1643,6 +1643,33 @@ pub static TEST_CHECKPOINT_HALT_AFTER_LEDGER: std::sync::atomic::AtomicBool =
 pub static TEST_CHECKPOINT_HALT_BEFORE_LEDGER: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// TEST seam ONLY (`false` in production, one relaxed load): PARK the
+/// manager's checkpoint cycle after its ledger record and BEFORE its
+/// appender page writes — the window between the cycle's tree-0
+/// publication (`publish_forest_roots`, the cycle's first step) and the
+/// page that names the region's roots (PR 13b review round 1, Issue 2: a
+/// first touch landing here — the manager's own takes no SMO mutex — must
+/// not evict a page-homed root from the page un-named; `tests/
+/// sym_n_daemon_tests.rs`). Released by [`test_release_checkpoint_park`].
+pub static TEST_CHECKPOINT_PARK_BEFORE_PAGES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Cycles that PARKED on [`TEST_CHECKPOINT_PARK_BEFORE_PAGES`] so far.
+static TEST_CHECKPOINT_PARKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEST_CHECKPOINT_PARK_NOTIFY: once_cell::sync::Lazy<squeezefs_ipc::sqz_notify::Notify> =
+    once_cell::sync::Lazy::new(squeezefs_ipc::sqz_notify::Notify::new);
+
+/// Cycles parked on [`TEST_CHECKPOINT_PARK_BEFORE_PAGES`] so far.
+pub fn test_checkpoint_parked_count() -> u64 {
+    TEST_CHECKPOINT_PARKED.load(Ordering::Acquire)
+}
+
+/// Release every cycle parked on [`TEST_CHECKPOINT_PARK_BEFORE_PAGES`]
+/// (the flag cleared first).
+pub fn test_release_checkpoint_park() {
+    TEST_CHECKPOINT_PARK_BEFORE_PAGES.store(false, Ordering::Relaxed);
+    TEST_CHECKPOINT_PARK_NOTIFY.notify_waiters();
+}
+
 impl KvMetaBackend {
     /// **A checkpoint-class durable step CONSUMES a checkpoint seq — and
     /// writes the ledger record that seq names** (symmetric PR 13, defect
@@ -2152,6 +2179,19 @@ impl KvMetaBackend {
             .unwrap()
             .push((tail, self.barrier_push_epoch()));
         super::META_KV_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+        // Test seam: PARK here (the ledger record is on the device, the
+        // pages are not yet written) until released — the window a
+        // first touch of the manager's own lands in (Issue 2's pin).
+        if TEST_CHECKPOINT_PARK_BEFORE_PAGES.load(Ordering::Relaxed) {
+            TEST_CHECKPOINT_PARKED.fetch_add(1, Ordering::AcqRel);
+            while TEST_CHECKPOINT_PARK_BEFORE_PAGES.load(Ordering::Relaxed) {
+                let notified = TEST_CHECKPOINT_PARK_NOTIFY.notified();
+                if !TEST_CHECKPOINT_PARK_BEFORE_PAGES.load(Ordering::Relaxed) {
+                    break;
+                }
+                notified.await;
+            }
+        }
         // ---- The appender pages (§5.3.2): region 0's mirrors the record
         // just written; a declared region's names ITS tail — one page
         // write per region per checkpoint. A no-op on a flat volume. The
@@ -2159,7 +2199,7 @@ impl KvMetaBackend {
         // region's own: its page keeps its previous (lower) tail, so
         // nothing under them is reclaimed.
         if let Err(e) = self
-            .write_appender_pages(tail, ckpt_seq, h, &region_tails)
+            .write_appender_pages(tail, ckpt_seq, h, &region_tails, smo)
             .await
         {
             self.node_cache()

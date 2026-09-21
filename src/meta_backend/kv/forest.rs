@@ -474,6 +474,23 @@ impl SlotTrees {
             .unwrap_or(false)
     }
 
+    /// Whether an appender PAGE is the ONLY durable home of `slot`'s
+    /// current root — a page-homed publication at the live root (the
+    /// page selection's first class after the mid-handover entry: a slot
+    /// the page may never leave off until tree 0 names the root; review
+    /// round 1, Issue 2). `false` for an unpublished root (its floor keeps
+    /// its records in the window), a tree-0-named one, or no tree.
+    pub fn page_homed(&self, slot: ForestSlot) -> bool {
+        let Some(live) = self.tree(slot).map(|t| t.root()) else {
+            return false;
+        };
+        self.published
+            .read_sync(&slot, |_, p| {
+                p.home == PublicationHome::Page && p.root == live
+            })
+            .unwrap_or(false)
+    }
+
     /// **The page-budget cut moved** (PR 13b, §4.4af): every slot in
     /// `off_page` — leased by a region whose page can no longer name it —
     /// loses a PAGE-homed publication, so it reads unpublished again: its

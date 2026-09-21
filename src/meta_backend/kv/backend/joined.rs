@@ -1841,7 +1841,7 @@ impl KvMetaBackend {
         // ---- ITS page: the Issue-31 words, this cycle's seq.
         let region_tails = vec![(own, tail)];
         if let Err(e) = self
-            .write_appender_pages(0, ckpt_seq, h, &region_tails)
+            .write_appender_pages(0, ckpt_seq, h, &region_tails, smo)
             .await
         {
             self.node_cache().restore_dying_floors(dying_floors);
@@ -1996,9 +1996,7 @@ impl KvMetaBackend {
         region: &AppenderRegion,
         smo: &super::super::tree::SmoContext,
     ) {
-        let (Some(plane), Some(forest), Some(wire)) =
-            (self.slot_leases(), self.forest(), self.joined.get())
-        else {
+        let (Some(plane), Some(forest)) = (self.slot_leases(), self.forest()) else {
             return;
         };
         let overflow = self.region_page_overflow(set, &plane, region);
@@ -2011,24 +2009,57 @@ impl KvMetaBackend {
         // its current root and its floor clamps this cycle's tail until
         // the manager's reply.
         forest.demote_page_publications(&overflow, region.ring().core().reusable_upto());
+        if let Err(e) = self
+            .wire_publish_roots(&plane, region, &overflow, Some(smo))
+            .await
+        {
+            log::warn!(
+                "meta volume {}: joined appender {}'s PublishRoots for its overflow deferred \
+                 ({e}) — the floors stand until the next cycle's",
+                self.path.display(),
+                region.id
+            );
+        }
+    }
+
+    /// **`PublishRoots` over the wire** for every slot of `slots` whose
+    /// current root its publication does not name — the joined appender's
+    /// tree-0 publication (the manager writes them into tree 0's `Leased`
+    /// records under ONE durable entry; the floors lift AT ITS REPLY, never
+    /// before — a refused or failed frame leaves them standing; the
+    /// manager's rejection is counted on its side). The two callers:
+    /// the cycle's overflow publication (`smo` = the held guard, F3) and
+    /// the ONE page writer's publish-before-drop (`prepare_page_entries`
+    /// — review round 1, Issue 2; from the handover and the leave with no
+    /// guard held). Nothing to ship is `Ok`.
+    pub(super) async fn wire_publish_roots(
+        &self,
+        plane: &super::super::slot_lease::SlotLeasePlane,
+        region: &AppenderRegion,
+        slots: &[ForestSlot],
+        smo: Option<&super::super::tree::SmoContext>,
+    ) -> Result<(), KvError> {
+        let (Some(forest), Some(wire)) = (self.forest(), self.joined.get()) else {
+            return Ok(());
+        };
         let stale: std::collections::BTreeMap<ForestSlot, RootPtr> =
             forest.roots_to_publish().into_iter().collect();
         let mut roots: Vec<(ForestSlot, crate::meta_ship::manager::WireSlotRoot)> = Vec::new();
-        for slot in overflow {
-            let Some(root) = stale.get(&slot) else {
+        for slot in slots {
+            let Some(root) = stale.get(slot) else {
                 continue;
             };
-            let Some(lease) = plane.table.get(slot).filter(|l| {
-                l.holder == region.id && l.state == crate::slot_lease_core::LeaseState::Leased
+            let Some(lease) = plane.table.get(*slot).filter(|l| {
+                l.holder == region.id && l.state != crate::slot_lease_core::LeaseState::Unleased
             }) else {
                 continue;
             };
-            let Ok(routing) = self.routing_slot_of_forest(slot) else {
+            let Ok(routing) = self.routing_slot_of_forest(*slot) else {
                 continue;
             };
-            let words = self.slot_words_now(&plane, slot);
+            let words = self.slot_words_now(plane, *slot);
             roots.push((
-                slot,
+                *slot,
                 crate::meta_ship::manager::WireSlotRoot {
                     slot: routing,
                     g: lease.g,
@@ -2039,7 +2070,7 @@ impl KvMetaBackend {
             ));
         }
         if roots.is_empty() {
-            return;
+            return Ok(());
         }
         // Chunked well under the CONTROL frame cap (a word is ~30 B; the
         // overflow is bounded by the held set).
@@ -2047,47 +2078,46 @@ impl KvMetaBackend {
         for chunk in roots.chunks(256) {
             let frame: Vec<crate::meta_ship::manager::WireSlotRoot> =
                 chunk.iter().map(|(_, w)| *w).collect();
-            let out = wire
-                .with_client_under_smo(self, smo, "PublishRoots", |c| {
-                    let frame = frame.clone();
-                    Box::pin(async move { c.publish_roots(own, frame).await })
-                })
-                .await;
-            match out {
-                Ok((published, already)) => {
-                    // Durable at the manager: the floors lift. A root that
-                    // moved again meanwhile stays stale (its NEW root's
-                    // publication is the next cycle's).
-                    for (slot, w) in chunk {
-                        forest.note_published(
-                            *slot,
-                            RootPtr {
-                                addr: w.root.0,
-                                seq: w.root.1,
-                            },
-                        );
-                    }
-                    plane
-                        .roots_shipped
-                        .fetch_add(chunk.len() as u64, Ordering::Relaxed);
-                    log::debug!(
-                        "meta volume {}: joined appender {own} published {} overflow root(s) \
-                         through the manager ({published} written, {already} already)",
-                        self.path.display(),
-                        chunk.len()
-                    );
+            let out = match smo {
+                Some(smo) => {
+                    wire.with_client_under_smo(self, smo, "PublishRoots", |c| {
+                        let frame = frame.clone();
+                        Box::pin(async move { c.publish_roots(own, frame).await })
+                    })
+                    .await
                 }
-                Err(e) => {
-                    log::warn!(
-                        "meta volume {}: joined appender {own}'s PublishRoots for {} overflow \
-                         root(s) deferred ({e}) — their floors stand until the next cycle's",
-                        self.path.display(),
-                        chunk.len()
-                    );
-                    return;
+                None => {
+                    wire.with_client(Some(self), "PublishRoots", |c| {
+                        let frame = frame.clone();
+                        Box::pin(async move { c.publish_roots(own, frame).await })
+                    })
+                    .await
                 }
+            };
+            let (published, already) = out?;
+            // Durable at the manager: the floors lift. A root that moved
+            // again meanwhile stays stale (its NEW root's publication is
+            // the next cycle's).
+            for (slot, w) in chunk {
+                forest.note_published(
+                    *slot,
+                    RootPtr {
+                        addr: w.root.0,
+                        seq: w.root.1,
+                    },
+                );
             }
+            plane
+                .roots_shipped
+                .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            log::debug!(
+                "meta volume {}: joined appender {own} published {} root(s) through the manager \
+                 ({published} written, {already} already)",
+                self.path.display(),
+                chunk.len()
+            );
         }
+        Ok(())
     }
 
     /// The joined appender's grant cadence (§5.3.3): fold the SMO rate,

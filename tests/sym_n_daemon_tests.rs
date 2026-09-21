@@ -176,6 +176,19 @@ async fn tree0_state(vol: &KvMetaBackend, slot: ForestSlot) -> Option<SlotState>
         .map(|v| SlotState::decode(&v).unwrap())
 }
 
+/// Poll `cond` to true, loud past a bound (a seam's park is what it
+/// waits for — never a product wait).
+async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+    let started = std::time::Instant::now();
+    while !cond() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "timed out waiting for: {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 async fn page_of(
     uri: &str,
     vol: &KvMetaBackend,
@@ -8796,17 +8809,21 @@ async fn compact_root_of(
 /// slot at tree 0's grant-time root — every record flushed under the
 /// current root, and every one the tail passed, was gone.
 ///
-/// Fixed: a publication remembers its HOME (page / tree 0); the page
-/// prefers the slots tree 0 does not name over the ones it does (a slot
-/// is left off the page only when tree 0 names its current root, or when
-/// more than the budget need the page); a slot the page can no longer
-/// name loses a page-homed publication (`demote_page_publications`, its
-/// floor re-armed) and the joiner ships the overflow's stale roots BEFORE
-/// it writes the page that drops them — a root is never off every
-/// durable home. Pinned at the durable level (tree 0 names the current
-/// root of every slot that left the page) and at the acked-writes level
-/// (the lessee's death loses nothing; a manager remount opens every
-/// file).
+/// The law as of review round 1, Issue 2 (the ONE page writer's
+/// invariant): a publication remembers its HOME (page / tree 0) and the
+/// page ranks by what a slot loses if dropped — a PAGE-homed root
+/// outranks every unpublished one, which outranks every tree-0-named one
+/// — so twenty LOWER first touches with moved roots (unpublished, low
+/// page slots) evict NO page-homed root: the page keeps naming all 108
+/// (107 upper + the rotor holding every inode), the lower slots stay off
+/// it and their stale roots ship to tree 0 (`PublishRoots`), and nothing
+/// is demoted (a page-homed publication is demoted only when a page
+/// writer must drop it — `prepare_page_entries` publishes it first; the
+/// handover and first-touch-race shapes are the two pins after this one).
+/// Pinned at the durable level (every slot off the page has its current
+/// root in tree 0; every page-homed slot is still named) and at the
+/// acked-writes level (the lessee's death loses nothing; a manager
+/// remount opens every file).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_page_published_root_pushed_off_the_page_by_a_lower_first_touch_rides_tree_zero_before_the_lessee_dies(
 ) {
@@ -8838,11 +8855,11 @@ async fn a_page_published_root_pushed_off_the_page_by_a_lower_first_touch_rides_
                 .collect()
         };
 
-    // The UPPER 108 seeded slots first-touched (one file each) and every
-    // one's root MOVED: with the one-slot rotor (no tree — nothing to
-    // name) the joiner holds 109 and the page names all 108 moved roots —
-    // 108 PAGE publications, tree 0 keeping the grant-time roots.
-    let low = 20usize;
+    // 107 UPPER seeded slots first-touched (one file each — the inodes
+    // land in the joiner's rotor slot) and every one's root MOVED: the
+    // joiner holds 108 with the rotor, the page names all 108 moved roots
+    // — 108 PAGE publications, tree 0 keeping the grant-time roots.
+    let low = dirs.len() - (SLOT_PAGE_BUDGET - 1);
     let mut files: Vec<(u64, Vec<(String, u64)>)> = Vec::with_capacity(dirs.len());
     let mut grant_roots = std::collections::BTreeMap::new();
     for (i, d) in dirs.iter().enumerate().skip(low) {
@@ -8857,7 +8874,7 @@ async fn a_page_published_root_pushed_off_the_page_by_a_lower_first_touch_rides_
             other => panic!("slot {}: {other:?}", slots[i]),
         }
     }
-    assert_eq!(plane.gate.leased_count(), SLOT_PAGE_BUDGET + 1);
+    assert_eq!(plane.gate.leased_count(), SLOT_PAGE_BUDGET);
     jvol.checkpoint_now().await.unwrap();
     let mut moved_roots = std::collections::BTreeMap::new();
     for slot in slots.iter().skip(low) {
@@ -8887,43 +8904,54 @@ async fn a_page_published_root_pushed_off_the_page_by_a_lower_first_touch_rides_
             other => panic!("slot {slot}: {other:?}"),
         }
     }
-    // The victim: the highest seeded slot — the first the cut reaches.
+    let homed = page_homed_entries(&mvol, &page, native).await;
+    assert_eq!(
+        homed.len(),
+        SLOT_PAGE_BUDGET,
+        "premise: every named slot is PAGE-homed — {homed:?}"
+    );
+    // More acked records under the highest seeded slot's moved root, the
+    // ring COVERED past them: their only durable home is the page's word.
     let victim = *slots.last().unwrap();
     let victim_dir = *dirs.last().unwrap();
-
-    // More acked records under the victim's moved root, the ring COVERED
-    // past them: their only durable home is the page's word.
     let after = create_files(&joiner, victim_dir, "after-", 40).await;
     jvol.checkpoint_now().await.unwrap();
     jvol.checkpoint_now().await.unwrap();
     let (head, upto) = jvol.region_ring_window(jid).expect("the joined region");
     assert_eq!(head, upto, "covered (head {head}, reusable_upto {upto})");
+    let demoted0 = squeezefs::meta_backend::kv::META_KV_FOREST_PAGE_PUBLICATIONS_DEMOTED
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     // Twenty LOWER slots first-touched, each root MOVED too (unpublished
-    // — the page must name them ahead of anything tree 0 names): 128
-    // roots need the page, the cut moves down past the 20 highest. The
-    // LAW (RED on the base): once the page cannot name a slot, tree 0
-    // names its CURRENT root — a slot is never off every durable home.
+    // — low page slots, the first build's cut moved down past the 20
+    // highest page-homed slots). The LAW: a page-homed root outranks an
+    // unpublished one — the page still names every page-homed slot, the
+    // lower slots stay off it with their current roots shipped to tree 0
+    // — a slot is never off every durable home.
     let mut lower: Vec<(u64, Vec<(String, u64)>)> = Vec::new();
     for (i, d) in dirs.iter().enumerate().take(low) {
         lower.push((*d, create_files(&joiner, *d, &format!("l{i:03}-"), 1).await));
         moved_roots.insert(slots[i], compact_root_of(&jvol, slots[i]).await);
     }
     jvol.checkpoint_now().await.unwrap();
+    jvol.checkpoint_now().await.unwrap();
     let named = page_slots(
         &page_of(&uris[0], &jvol, jid)
             .await
             .expect("the joiner's page"),
     );
-    assert!(
-        !named.contains(&victim),
-        "premise: the victim left the page (the cut moved down)"
-    );
+    for (slot, _) in &homed {
+        assert!(
+            named.contains(slot),
+            "page-homed slot {slot} is still named — an unpublished first touch never evicts it"
+        );
+    }
+    assert!(named.contains(&victim), "the highest page-homed slot stays");
     let demoted = squeezefs::meta_backend::kv::META_KV_FOREST_PAGE_PUBLICATIONS_DEMOTED
         .load(std::sync::atomic::Ordering::Relaxed);
-    assert!(
-        demoted >= low as u64,
-        "every page-homed publication the cut passed was demoted ({demoted} ≥ {low})"
+    assert_eq!(
+        demoted, demoted0,
+        "nothing left the page, nothing was demoted"
     );
     for slot in &slots {
         if named.contains(slot) {
@@ -8932,8 +8960,8 @@ async fn a_page_published_root_pushed_off_the_page_by_a_lower_first_touch_rides_
         match tree0_state(&mvol, *slot).await {
             Some(SlotState::Leased { root, .. }) => assert_eq!(
                 root, moved_roots[slot],
-                "slot {slot} left the page: tree 0 must name its current root (RED: the \
-                 grant-time root — the page's publication mark survived the page)"
+                "slot {slot} is off the page: tree 0 names its current root (RED on the base: \
+                 the grant-time root — the page's publication mark survived the page)"
             ),
             other => panic!("slot {slot}: {other:?}"),
         }
@@ -8943,8 +8971,9 @@ async fn a_page_published_root_pushed_off_the_page_by_a_lower_first_touch_rides_
     assert_must_stay_zero(&mvol, "manager");
 
     // The lessee DIES; the manager recovers its region: every acked file
-    // resolves (RED: the recovery installs the grant-time root of every
-    // slot that left the page — the storm's stride-128 population).
+    // resolves (RED on the base: the recovery installs the grant-time root
+    // of every slot that left the page — the storm's stride-128
+    // population).
     drop(jvol);
     drop(joiner);
     park_gate::test_reset();
@@ -8968,6 +8997,404 @@ async fn a_page_published_root_pushed_off_the_page_by_a_lower_first_touch_rides_
     for (d, fs) in files.iter().chain(lower.iter()) {
         assert_all_resolve(&again, *d, fs).await;
     }
+    shutdown(&again).await;
+    drop(again);
+    fsck_clean(&uris).await;
+}
+
+/// The slots `page` names whose CURRENT root tree 0 does NOT name — the
+/// page is their only durable home (page-homed) — with the page's root
+/// word, in page-slot order. The native slot rides the fixed ledger and is
+/// never counted.
+async fn page_homed_entries(
+    mvol: &KvMetaBackend,
+    page: &squeezefs::meta_backend::kv::appender::AppenderPage,
+    native: u16,
+) -> Vec<(ForestSlot, squeezefs::meta_backend::kv::tree::RootPtr)> {
+    use squeezefs::meta_backend::kv::appender::{forest_slot_of_page_slot, SlotEntryState};
+    let mut out = Vec::new();
+    for e in &page.slots {
+        if e.root.addr == 0
+            || !(e.state == SlotEntryState::Live || e.state == SlotEntryState::Releasing)
+        {
+            continue;
+        }
+        let slot = forest_slot_of_page_slot(e.slot, native);
+        if slot == squeezefs::meta_backend::kv::record::NATIVE_FOREST_SLOT {
+            continue;
+        }
+        let tree0_root = match tree0_state(mvol, slot).await {
+            Some(SlotState::Leased { root, .. }) | Some(SlotState::Unleased { root, .. }) => {
+                Some(root)
+            }
+            _ => None,
+        };
+        if tree0_root != Some(e.root) {
+            out.push((slot, e.root));
+        }
+    }
+    out
+}
+
+/// **§4.4af, the HANDOVER shape (review round 1, Issue 2 — the ONE page
+/// writer's invariant): releasing an OVERFLOW slot of a region holding
+/// its whole page budget in page-homed roots publishes the slot the
+/// `Releasing` entry pushes off the page BEFORE the page drops it.** The
+/// joiner holds 108 page-homed slots — 107 first-touched slots whose
+/// roots moved plus its rotor slot, which holds every created file's
+/// INODE (a child of a parent the creator did not lease yet mints into
+/// the rotor — the storm's own shape: one rotor slot's population at a
+/// 128-name stride); the page names every one, tree 0 keeps the
+/// grant-time roots — plus ONE lower slot whose root never moved: tree 0
+/// names it, the page leaves it off. The cadence releases that lower
+/// slot: the handover's step 3 puts it on the page in `Releasing` (the
+/// two-homes law), the 109th entry — the first build's step 3 re-ranked
+/// against the live lease set and cut the highest page slot (the rotor)
+/// with its publication mark intact: named on no page, on tree 0 at the
+/// grant-time root, its records below the ring tail. The holder dies
+/// right after that page write (`TEST_HANDOVER_HOLD_AFTER_PAGE`); the
+/// manager's recovery installed the grant-time root and lost every file's
+/// inode. The law: every page write of a leased region takes its entries
+/// from `prepare_page_entries`, which ships the page-homed slot's root to
+/// tree 0 (`PublishRoots`, awaited) before the page stops naming it —
+/// pinned at the durable level (tree 0 names the pushed slot's current
+/// root once the page no longer does) and at the acked-writes level (the
+/// death loses nothing; a manager remount opens every file).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn releasing_an_overflow_slot_of_a_page_full_region_publishes_the_slot_it_pushes_off_first() {
+    use squeezefs::meta_backend::kv::appender::{
+        forest_slot_of_page_slot, SlotEntryState, SLOT_PAGE_BUDGET,
+    };
+    use squeezefs::meta_backend::kv::backend::TEST_HANDOVER_HOLD_AFTER_PAGE;
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs, slots) = overflow_seeded_volume(dir.path()).await;
+    let knobs = Knobs::armed().mint_slots("1");
+    let manager = open_under(&uris, &knobs).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let native = mvol.appender_stats().unwrap().native_slot;
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    enroll_manager(&mvol, &venue.endpoint()).await;
+
+    let joiner = join_knobs(&knobs, &uris, &venue, &mvol, 94).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jid = jvol.appender_stats().unwrap().appender_id;
+    let identity = jvol.joined_wire().unwrap().identity;
+    let page_slots =
+        |page: &squeezefs::meta_backend::kv::appender::AppenderPage| -> Vec<ForestSlot> {
+            page.slots
+                .iter()
+                .filter(|e| e.state == SlotEntryState::Live || e.state == SlotEntryState::Releasing)
+                .map(|e| forest_slot_of_page_slot(e.slot, native))
+                .collect()
+        };
+
+    // 108 page-homed slots: 107 upper seeded slots first-touched (one
+    // file each — the inodes land in the joiner's ROTOR slot), every
+    // upper root MOVED; the page names all 107 and the rotor.
+    let low = dirs.len() - (SLOT_PAGE_BUDGET - 1);
+    let mut files: Vec<(u64, Vec<(String, u64)>)> = Vec::with_capacity(dirs.len());
+    for (i, d) in dirs.iter().enumerate().skip(low) {
+        files.push((*d, create_files(&joiner, *d, &format!("s{i:03}-"), 1).await));
+    }
+    jvol.checkpoint_now().await.unwrap();
+    for slot in slots.iter().skip(low) {
+        compact_root_of(&jvol, *slot).await;
+    }
+    jvol.checkpoint_now().await.unwrap();
+    // ONE lower slot first-touched, its root NOT moved: tree 0 names its
+    // current root, so it is the one the page leaves off (the overflow).
+    let overflow_slot = slots[0];
+    let overflow_dir = dirs[0];
+    let overflow_files = create_files(&joiner, overflow_dir, "o-", 1).await;
+    jvol.checkpoint_now().await.unwrap();
+    let page = page_of(&uris[0], &jvol, jid)
+        .await
+        .expect("the joiner's page");
+    let named = page_slots(&page);
+    assert_eq!(named.len(), SLOT_PAGE_BUDGET, "the page names its budget");
+    assert!(
+        !named.contains(&overflow_slot),
+        "premise: the unmoved lower slot is the page's overflow"
+    );
+    for slot in slots.iter().skip(low) {
+        assert!(
+            named.contains(slot),
+            "the page names page-homed slot {slot}"
+        );
+    }
+    let homed = page_homed_entries(&mvol, &page, native).await;
+    assert_eq!(
+        homed.len(),
+        SLOT_PAGE_BUDGET,
+        "premise: every named slot is PAGE-homed (tree 0 names another root) — {homed:?}"
+    );
+    let overflow_root = jvol.slot_tree(overflow_slot).unwrap().root();
+    match tree0_state(&mvol, overflow_slot).await {
+        Some(SlotState::Leased { root, .. }) => {
+            assert_eq!(root, overflow_root, "tree 0 names the overflow slot's root")
+        }
+        other => panic!("slot {overflow_slot}: {other:?}"),
+    }
+    // The victim: the highest PAGE SLOT among the page-homed — the one a
+    // 109th entry at the page's head pushes off (the rotor, holding every
+    // file's inode). The ring is COVERED past its records: the page's word
+    // is their only home.
+    let (victim, victim_root) = *homed
+        .iter()
+        .max_by_key(|(s, _)| {
+            squeezefs::meta_backend::kv::appender::page_slot_of_forest_slot(*s, native).unwrap()
+        })
+        .unwrap();
+    jvol.checkpoint_now().await.unwrap();
+    let (head, upto) = jvol.region_ring_window(jid).expect("the joined region");
+    assert_eq!(head, upto, "covered (head {head}, reusable_upto {upto})");
+    assert_eq!(jvol.slot_tree(victim).unwrap().root(), victim_root);
+
+    // The handover of the overflow slot, the holder dying right after its
+    // step-3 page write.
+    let demoted0 =
+        squeezefs::meta_backend::kv::META_KV_FOREST_PAGE_PUBLICATIONS_DEMOTED.load(Relaxed);
+    TEST_HANDOVER_HOLD_AFTER_PAGE.store(true, Relaxed);
+    let out = jvol.release_slot_handover(jid, overflow_slot).await;
+    TEST_HANDOVER_HOLD_AFTER_PAGE.store(false, Relaxed);
+    assert!(
+        out.is_err(),
+        "the seam ends the handover after the page write"
+    );
+    assert!(
+        squeezefs::meta_backend::kv::META_KV_FOREST_PAGE_PUBLICATIONS_DEMOTED.load(Relaxed)
+            > demoted0,
+        "the pushed slot's page-homed publication was demoted before the page dropped it \
+         (meta_kv_forest_page_publications_demoted)"
+    );
+    let page = page_of(&uris[0], &jvol, jid)
+        .await
+        .expect("the joiner's page after step 3");
+    let named = page_slots(&page);
+    assert!(
+        named.contains(&overflow_slot),
+        "step 3 put the releasing slot on the page"
+    );
+    assert!(
+        !named.contains(&victim),
+        "premise: the 109th entry pushed the highest page slot ({victim}) off"
+    );
+    // The LAW (RED on the first build): a slot the page no longer names
+    // has its CURRENT root in tree 0.
+    match tree0_state(&mvol, victim).await {
+        Some(SlotState::Leased { root, .. }) => assert_eq!(
+            root, victim_root,
+            "slot {victim} left the page at the handover's step 3: tree 0 must name its \
+             current root first (RED: the grant-time root stands — the Releasing entry \
+             evicted a page-homed slot un-published)"
+        ),
+        other => panic!("slot {victim}: {other:?}"),
+    }
+    assert!(!jvol.is_failed());
+
+    // The lessee DIES after step 3; the manager recovers its region:
+    // every acked file resolves (RED: the victim's grant-time root — every
+    // inode gone).
+    drop(jvol);
+    drop(joiner);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    assert!(!mvol.record_death_with_key(identity, 34, 0).await.unwrap());
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    assert_all_resolve(&manager, overflow_dir, &overflow_files).await;
+    for (d, fs) in &files {
+        assert_all_resolve(&manager, *d, fs).await;
+    }
+    assert_must_stay_zero(&mvol, "manager after the recovery");
+
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    let again = open_under(&uris, &knobs).await;
+    assert_all_resolve(&again, overflow_dir, &overflow_files).await;
+    for (d, fs) in &files {
+        assert_all_resolve(&again, *d, fs).await;
+    }
+    shutdown(&again).await;
+    drop(again);
+    fsck_clean(&uris).await;
+}
+
+/// **§4.4af, the FIRST-TOUCH-DURING-THE-CYCLE shape (review round 1,
+/// Issue 2 — the ONE page writer's invariant on the MANAGER's own
+/// region).** The manager holds its page budget in page-homed roots (107
+/// first-touched slots whose roots moved + its rotor slot with every
+/// file's inode; page 0 names every one, tree 0 keeps the grant-time
+/// roots). Its checkpoint cycle is PARKED between its tree-0 publication
+/// (`publish_forest_roots`, which found nothing off the page) and its page
+/// write (`TEST_CHECKPOINT_PARK_BEFORE_PAGES`), and inside that window the
+/// manager first-touches a LOWER slot with no tree yet and mints it — the
+/// manager's own first touch takes no SMO mutex, so it lands under the
+/// parked cycle exactly as the storm's load does. The first build's page
+/// write re-ranked against the live lease set: the fresh unpublished slot
+/// (a low page slot) ranked ahead of the page-homed class and evicted the
+/// highest page slot (the rotor) with its publication mark intact — a
+/// root on no page, tree 0 at root 0, its records below the tail. The
+/// manager DIES after that page write; its successor (re-open, own
+/// residue) adopts page 0's roots and tree 0's for the rest — and lost
+/// every file's inode. The law: a page-homed root outranks every
+/// unpublished one, and a page-homed slot the page still cannot name is
+/// published into tree 0 by the page writer before the page drops it —
+/// pinned at the durable level and at the acked-writes level.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_touch_between_the_cycles_publication_and_its_page_write_evicts_no_page_homed_root()
+{
+    use squeezefs::meta_backend::kv::appender::{
+        forest_slot_of_page_slot, page_slot_of_forest_slot, SlotEntryState, SLOT_PAGE_BUDGET,
+    };
+    use squeezefs::meta_backend::kv::checkpoint::{
+        test_checkpoint_parked_count, test_release_checkpoint_park,
+        TEST_CHECKPOINT_PARK_BEFORE_PAGES,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs, slots) = overflow_seeded_volume(dir.path()).await;
+    let knobs = Knobs::armed().mint_slots("1");
+    let manager = open_under(&uris, &knobs).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let native = mvol.appender_stats().unwrap().native_slot;
+    let page_slots =
+        |page: &squeezefs::meta_backend::kv::appender::AppenderPage| -> Vec<ForestSlot> {
+            page.slots
+                .iter()
+                .filter(|e| e.state == SlotEntryState::Live)
+                .map(|e| forest_slot_of_page_slot(e.slot, native))
+                .collect()
+        };
+
+    // The manager's page budget in page-homed roots: 107 UPPER seeded
+    // slots first-touched (one file each — the inodes in the rotor) with
+    // their roots moved, plus the rotor (its native slot's root is the
+    // ledger's — the entry the full page drops).
+    let first = dirs.len() - (SLOT_PAGE_BUDGET - 1);
+    let mut files: Vec<(u64, Vec<(String, u64)>)> = Vec::with_capacity(dirs.len());
+    for (i, d) in dirs.iter().enumerate().skip(first) {
+        files.push((
+            *d,
+            create_files(&manager, *d, &format!("s{i:03}-"), 1).await,
+        ));
+    }
+    mvol.checkpoint_now().await.unwrap();
+    for slot in slots.iter().skip(first) {
+        compact_root_of(&mvol, *slot).await;
+    }
+    mvol.checkpoint_now().await.unwrap();
+    mvol.checkpoint_now().await.unwrap();
+    let page = page_of(&uris[0], &mvol, 0).await.expect("page 0");
+    let named = page_slots(&page);
+    assert_eq!(named.len(), SLOT_PAGE_BUDGET, "page 0 names its budget");
+    for slot in slots.iter().skip(first) {
+        assert!(named.contains(slot), "page 0 names page-homed slot {slot}");
+    }
+    let homed = page_homed_entries(&mvol, &page, native).await;
+    assert_eq!(
+        homed.len(),
+        SLOT_PAGE_BUDGET,
+        "premise: every named slot is PAGE-homed — {homed:?}"
+    );
+    let (victim, victim_root) = *homed
+        .iter()
+        .max_by_key(|(s, _)| page_slot_of_forest_slot(*s, native).unwrap())
+        .unwrap();
+    let ring0 = mvol.journal_ring().core();
+    assert_eq!(
+        ring0.head(),
+        ring0.reusable_upto(),
+        "ring 0 covered (head {}, reusable_upto {})",
+        ring0.head(),
+        ring0.reusable_upto()
+    );
+
+    // The cycle parked between its publication and its page write; the
+    // manager's first touch + MINT of a slot with no tree lands inside.
+    let parked0 = test_checkpoint_parked_count();
+    TEST_CHECKPOINT_PARK_BEFORE_PAGES.store(true, Relaxed);
+    let cycle = {
+        let mvol = Arc::clone(&mvol);
+        tokio::spawn(async move { mvol.checkpoint_now().await })
+    };
+    wait_until("the cycle parked before its page write", || {
+        test_checkpoint_parked_count() > parked0
+    })
+    .await;
+    // A slot LOWER than every page-homed one (a low page slot — the
+    // first build's rank sorted it ahead of them), with no tree yet.
+    let plane = mvol.slot_leases().expect("armed");
+    let fresh_slot: ForestSlot = (2..OVERFLOW_SEED_BASE)
+        .find(|s| {
+            mvol.slot_tree(*s).is_none()
+                && !plane.gate.is_leased(*s)
+                && page_slot_of_forest_slot(*s, native).is_ok()
+        })
+        .expect("a low slot with no tree");
+    let minted = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        seed_dir_in_slot(&manager, 0, fresh_slot, "parked-mint"),
+    )
+    .await
+    .expect("the manager's own first touch + mint lands under the parked cycle");
+    let fresh_root = mvol.slot_tree(fresh_slot).expect("the minted tree").root();
+    assert_ne!(fresh_root.addr, 0, "the mint gave the slot a root");
+    test_release_checkpoint_park();
+    cycle.await.unwrap().unwrap();
+
+    // The LAW (RED on the first build): the fresh unpublished slot never
+    // evicts a page-homed root — every page-homed slot is still named,
+    // and whatever page 0 does not name has its current root in tree 0
+    // or stands unpublished behind its floor.
+    let page = page_of(&uris[0], &mvol, 0).await.expect("page 0");
+    let named = page_slots(&page);
+    for (slot, root) in &homed {
+        if named.contains(slot) {
+            continue;
+        }
+        match tree0_state(&mvol, *slot).await {
+            Some(SlotState::Leased { root: t0, .. }) => assert_eq!(
+                t0, *root,
+                "slot {slot} left page 0 at the cycle's page write: tree 0 must name its \
+                 current root first (RED: the fresh mint evicted the page-homed slot {victim} \
+                 with its publication mark intact)"
+            ),
+            other => panic!("slot {slot}: {other:?}"),
+        }
+    }
+    assert_eq!(
+        mvol.slot_tree(victim).unwrap().root(),
+        victim_root,
+        "the victim's root did not move on its own"
+    );
+    assert!(!mvol.is_failed());
+
+    // The manager DIES after that page write; its successor opens the
+    // volume (own residue: page 0's roots, tree 0's for the rest, the
+    // window replayed) and every acked file resolves.
+    drop(mvol);
+    drop(manager);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    let again = open_under_retry(&uris, &knobs)
+        .await
+        .expect("the successor's open");
+    for (d, fs) in &files {
+        assert_all_resolve(&again, *d, fs).await;
+    }
+    again
+        .getattr(minted)
+        .await
+        .expect("the parked mint's directory resolves too");
+    assert_must_stay_zero(&again.volumes[0], "successor");
     shutdown(&again).await;
     drop(again);
     fsck_clean(&uris).await;

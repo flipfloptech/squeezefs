@@ -2634,6 +2634,18 @@ impl PublishTarget {
         Self { peer, holder: None }
     }
 
+    /// Count one LAYOUT-CLASS publish (a witnessed call — the class the
+    /// holder's `serve_layout_publish` counts as `foreign_publish_served`)
+    /// shipped to a slot holder, so `foreign_publish_ships ≡
+    /// foreign_publish_served` fleet-wide: the generic-class sibling a
+    /// write also ships (`ParkWriteTimes`) is served through the generic
+    /// dispatch and belongs to neither side.
+    fn note_layout_ship(&self) {
+        if self.holder.is_some() {
+            crate::meta_backend::record_ship::note_publish_shipped();
+        }
+    }
+
     /// The custody lease epoch every mutating call to this target
     /// presents — the holder's grant to THIS mount where the target is a
     /// slot holder, the set authority's otherwise.
@@ -2666,7 +2678,6 @@ async fn publish_target(
         RecordHome::Local => Ok(None),
         RecordHome::Foreign { holder, endpoint } => {
             let client = crate::data_grant::slot_holder_client(&endpoint).await?;
-            record_ship::note_publish_shipped();
             Ok(Some(PublishTarget {
                 peer: Arc::new(super::PeerOwner::new(
                     format!("appender-{holder}"),
@@ -2917,6 +2928,7 @@ pub async fn set_layout_and_size(
             return Ok(OwnerVerdict::default());
         };
         intent_barrier_inos(&[ino]).await?;
+        t.note_layout_ship();
         let shipped = ship_witnessed(
             &t,
             PublishCall::SetLayoutAndSize {
@@ -3107,6 +3119,7 @@ pub async fn merge_layout_and_size(
             ));
         };
         intent_barrier_inos(&[ino]).await?;
+        t.note_layout_ship();
         let call = PublishCall::MergeLayoutAndSize {
             ino,
             delta: delta.encode(),
@@ -3275,6 +3288,7 @@ async fn ship_commit_block_refs(
     refs: &[BlockRefOp],
 ) -> Result<()> {
     intent_barrier_inos(&[ino]).await?;
+    target.note_layout_ship();
     expect_unit(
         ship_witnessed(
             target,
@@ -3432,6 +3446,7 @@ pub async fn migrate_block_map(
         }
         Some(target) => {
             intent_barrier_inos(&[ino]).await?;
+            target.note_layout_ship();
             // PR 5b (design §11's belt): the shipped head's own kvmap id
             // carries the generation this ship was computed against — the
             // verb's base_gen is its explicit face (0 on a first

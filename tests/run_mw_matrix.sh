@@ -4518,10 +4518,8 @@ leg_sym_foreign_file() {
         ops_q=0
         for ((i = 0; i < SYM_FF_FILES; i++)); do
             f="$hdir/f$(printf '%04d' "$i")"
-            err="$(chmod 640 "$f" 2>&1)" || die "sym-foreign-file: m$q chmod of m$h's f$i: $err"
-            err="$(touch -d '@1700000000' "$f" 2>&1)" || die "sym-foreign-file: m$q touch of m$h's f$i: $err"
-            err="$(setfattr -n user.ff -v "by-w$q" "$f" 2>&1)" || die "sym-foreign-file: m$q setfattr on m$h's f$i: $err"
-            ops_q=$((ops_q + 3))
+            # The DATA face first (an append / a truncate moves mtime), the
+            # record verbs after it — the touched mtime is the final word.
             case $((i % 4)) in
             0 | 1)
                 # An APPEND + fsync (the DATA face: the publish ships to
@@ -4541,8 +4539,13 @@ PYEOF
                 ;;
             3)
                 err="$(rm "$f" 2>&1)" || die "sym-foreign-file: m$q unlink of m$h's f$i: $err"
+                continue
                 ;;
             esac
+            err="$(chmod 640 "$f" 2>&1)" || die "sym-foreign-file: m$q chmod of m$h's f$i: $err"
+            err="$(touch -d '@1700000000' "$f" 2>&1)" || die "sym-foreign-file: m$q touch of m$h's f$i: $err"
+            err="$(setfattr -n user.ff -v "by-w$q" "$f" 2>&1)" || die "sym-foreign-file: m$q setfattr on m$h's f$i: $err"
+            ops_q=$((ops_q + 3))
         done
         printf 'q=%s h=%s files=%s record_verbs=%s\n' "$q" "$h" "$SYM_FF_FILES" "$ops_q" >>"$rowdir/mutations.tsv"
         log "sym-foreign-file: m$q mutated m$h's $SYM_FF_FILES files ($ops_q record verbs, $((SYM_FF_FILES / 2)) appends, $((SYM_FF_FILES / 4)) truncates, $((SYM_FF_FILES / 4)) unlinks)"
@@ -4580,7 +4583,7 @@ PYEOF
                 [ "$got" = "$want" ] || { lost=$((lost + 1)); echo "CONTENT at $m: ff-w$h/$f '$got' != '$want' (mutated by m$q)" >>"$rowdir/lost.txt"; }
                 [ "$(stat -c %a "$m/ff-w$h/$f" 2>&1)" = "640" ] || { lost=$((lost + 1)); echo "MODE at $m: ff-w$h/$f $(stat -c %a "$m/ff-w$h/$f" 2>&1) != 640 (chmod by m$q)" >>"$rowdir/lost.txt"; }
                 [ "$(stat -c %Y "$m/ff-w$h/$f" 2>&1)" = "1700000000" ] || { lost=$((lost + 1)); echo "MTIME at $m: ff-w$h/$f $(stat -c %Y "$m/ff-w$h/$f" 2>&1) != 1700000000 (touch by m$q)" >>"$rowdir/lost.txt"; }
-                [ "$(getfattr -n user.ff --only-values "$m/ff-w$h/$f" 2>&1)" = "by-w$q" ] || { lost=$((lost + 1)); echo "XATTR at $m: ff-w$h/$f user.ff='$(getfattr -n user.ff --only-values "$m/ff-w$h/$f" 2>&1)' != by-w$q" >>"$rowdir/lost.txt"; }
+                [ "$(getfattr --absolute-names -n user.ff --only-values "$m/ff-w$h/$f" 2>&1)" = "by-w$q" ] || { lost=$((lost + 1)); echo "XATTR at $m: ff-w$h/$f user.ff='$(getfattr --absolute-names -n user.ff --only-values "$m/ff-w$h/$f" 2>&1)' != by-w$q" >>"$rowdir/lost.txt"; }
             done
         done
     done
@@ -4593,7 +4596,7 @@ $(head -20 "$rowdir/lost.txt")"
     local ships=0 served=0 refusals=0 unreachable=0 pships=0 pserved=0 v custody
     for idx in "${writers[@]}"; do
         v="$(sym_delta "$rowdir" "$idx" ff meta_ship.record_ships)"; ships=$((ships + v))
-        [ "$v" -ge $((SYM_FF_FILES * 3)) ] || die "sym-foreign-file: m$idx record_ships +$v for $((SYM_FF_FILES * 3)) foreign record verbs (chmod + touch + setfattr per file)"
+        [ "$v" -ge $((SYM_FF_FILES / 4 * 3 * 3)) ] || die "sym-foreign-file: m$idx record_ships +$v for $((SYM_FF_FILES / 4 * 3 * 3)) foreign record verbs (chmod + touch + setfattr per surviving file — three of every four)"
         v="$(sym_delta "$rowdir" "$idx" ff meta_ship.record_served)"; served=$((served + v))
         v="$(sym_delta "$rowdir" "$idx" ff meta_ship.record_refusals)"; refusals=$((refusals + v))
         v="$(sym_delta "$rowdir" "$idx" ff meta_ship.record_unreachable)"; unreachable=$((unreachable + v))

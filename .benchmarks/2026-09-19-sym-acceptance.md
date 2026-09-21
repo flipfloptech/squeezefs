@@ -1419,6 +1419,8 @@ durable).
 
 ### 4.4z Defect 32 — FOUND, NOT FIXED HERE (PR 6/12's owed record-level metanode arm; a FLIP BLOCKER): a file's `setattr` / `setxattr` / DATA WRITE from a mount that does not lease the file's slot is refused or silently not durable
 
+> **Status (PR 13b, `feat/sym-metanode-ship`, 2026-09-21): FIXED — the record-level metanode ship landed in `cd85f701` (`src/meta_backend/record_ship.rs`; the S9 publish plane's `PublishTarget`; the interim `EREMOTE` refusal, its write belt and `foreign_file_mutation_refusals` deleted; the `#[ignore]`d pin `a_joiners_setattr_of_the_managers_file_lands_at_the_holder` un-ignored — RED on the base, GREEN on the fix — beside the reverse and the three-daemon pins; the fidelity `sym-join-ladder` contract flipped to the landing law in `53ffb626`). The text below is the finding as recorded.**
+
 Found by a scoping probe on the live fleet while attributing defects
 30/31 (not by a gate — no leg mutates a foreign-slot FILE; the legs'
 cross-owner ops are the namespace verbs, which PR 6 ships). Joiner m60
@@ -1697,6 +1699,8 @@ cut where the product overflowed; GREEN: 1, the lookup served).
 
 ### 4.4af Fix-round finding 1 — FOUND, NOT FIXED (the death path under `--victims=7 --cross-owner --striped`; a FLIP BLOCKER beside defect 32): 25 of 17,376 acked files lost across a seven-victim kill — every one a moved file of ONE writer, at neither its source nor its destination
 
+> **Status (PR 13b, 2026-09-21): ATTRIBUTED and FIXED in `cc642b6a`.** The stride was ONE rotor slot's population (with two metadata volumes a joiner's files alternate volumes, and the volume where the parent stripe does not live mints by the rotor round-robin — `rotor_mints = [940, 65]` on m60; 64 rotor slots ⇒ stride 128); the slot, 3549, was recovered with "NO page entry — the grant-time root 0x0 stands" and an empty window, and `slot_roots_shipped` read 18 of that volume's 19 overflow slots. The 5 misses whose `mv` had not run prove a CREATE-record loss, not the rename's. Cause: a PAGE-published root pushed off the page by a lower slot's first touch kept its `published` mark, so nothing shipped it and nothing named it (PR 4/12b's page-budget overflow law; the cut is dynamic). Fix: a publication remembers its home, the page prefers the slots tree 0 does not name, an off-page page-homed publication is demoted and shipped to tree 0 BEFORE the page that drops it is written (`meta_kv_forest_page_publications_demoted`). Pin on the two-backend fixture, RED on the base at the durable level and at the acked-writes level: `sym_n_daemon_tests::a_page_published_root_pushed_off_the_page_by_a_lower_first_touch_rides_tree_zero_before_the_lessee_dies`. The storm ×10 count restarts from zero on PR 13b's binary. The text below is the finding as recorded.**
+
 `sym-storm` batch 2 (`7c62428b`), round 4 from zero (`/tmp/grok-justin/
 fix1-fleet2/sym-storm-rows/symstorm-1789948411/lost-r4.txt`, the
 daemon logs beside it): the seven joiners killed at once at phase 6.2 s;
@@ -1766,6 +1770,8 @@ is a victim) — fixed in `4523f25e`; the lost list and the ledgers are
 the evidence.
 
 ### 4.4ag Fix-round finding 2 — FOUND, NOT FIXED (PR 12b / PR 5, the failover window): a joiner's read one second into a manager failover answers `EIO` — the successor's token plane refuses a member whose reclaim has not landed
+
+> **Status (PR 13b, 2026-09-21): FIXED in `53ffb626` + `31519ceb`.** The holder's membership screen answers the TYPED `TokenReply::NotMember`, minted at the client as `RefusalClass::MembershipPending` (EAGAIN); a token fetch and the serve gate over a channel the screen refused park on this member's grant adoption (bounded by `reassertion_wait_bound()` = 2 × the renewal beat) and retry — never `EIO` — while this process holds a member session (a ghost keeps the fail-closed word); a `CustodyGrant` answered `NotMember` surfaces the typed class for the acquire ladder's retry. Gauge `dlm_token_membership_waits`. Pin: `sym_coherence_tests::a_read_refused_not_a_member_parks_on_the_members_reclaim_and_never_answers_eio`. The text below is the finding as recorded.**
 
 `sym-crash --rounds=1` on `7c62428b` (batch 2), the WIDENED
 deleted-stays-deleted arm (Issue 8 — `sym_stat_deleted`: only `ENOENT` is
@@ -2097,6 +2103,8 @@ resource than it did.
 
 ## 7. Owed (what PR 14 / PR 15 inherit)
 
+> **Status (PR 13b, `feat/sym-metanode-ship`, 2026-09-21): the three flip-blocking items below are CLOSED on that branch — (i) §4.4z in `cd85f701`, (ii) §4.4af in `cc642b6a` (attributed: a page-published slot root pushed off the page — not the rename/intent machinery), (iii) §4.4ag in `53ffb626` + `31519ceb`; the fleet legs `sym-foreign-file` (new), `sym-crash` and `sym-storm` (×10 from zero) run on that binary. PR 7's un-share of a surviving sole owner stays PR 14's (the reason is stated in `docs/operations.md`'s PR 13b section). The text below is the ledger as recorded.**
+
 **Flip-blocking (three items — §4.4z defect 32, §4.4af finding 1, §4.4ag
 finding 2; §9 lists them as the flip's preconditions):**
 
@@ -2337,6 +2345,8 @@ broadcast and join storm included), the fabric reset
 Every local rate in §3 is dev-box scoping evidence for those rows.
 
 ## 9. The flip decision (for PR 14)
+
+> **Status (PR 13b, 2026-09-21): the three PRODUCT blockers below are closed on `feat/sym-metanode-ship` (`cd85f701` defect 32, `cc642b6a` §4.4af, `53ffb626`+`31519ceb` §4.4ag); the box brackets remain the orchestrator's. The decision text below is as recorded at PR 13.**
 
 **Decision: NOT YET — four blockers, three of them product (§7's
 flip-blocking items (i)–(iii) + the box).** (0) **Fix-round

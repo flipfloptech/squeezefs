@@ -474,20 +474,30 @@ impl SlotTrees {
             .unwrap_or(false)
     }
 
-    /// Whether an appender PAGE is the ONLY durable home of `slot`'s
-    /// current root — a page-homed publication at the live root (the
-    /// page selection's first class after the mid-handover entry: a slot
-    /// the page may never leave off until tree 0 names the root; review
-    /// round 1, Issue 2). `false` for an unpublished root (its floor keeps
-    /// its records in the window), a tree-0-named one, or no tree.
+    /// Whether an appender PAGE is the ONLY durable home of `slot`'s tree
+    /// — a page-homed publication at ANY root (the page selection's first
+    /// class after the mid-handover entry: a slot the page may never leave
+    /// off until tree 0 names its root; review round 1, Issue 2). At the
+    /// LIVE root the page's word is the root's only home. At an OLDER root
+    /// (the root moved since the page named it — a split in this cycle's
+    /// flush pass, a threshold pass before a handover's step 3) the page's
+    /// word is still the only home of every record flushed UNDER that
+    /// older root, which the page's publication covered cycles ago: the
+    /// live root's floor keeps only the records since the move in the
+    /// window. Dropping such a slot from the page loses the older root's
+    /// records at the next death — review round 2, Issue 12: the first
+    /// predicate required `root == live` and ranked a stale page-homed
+    /// slot with the never-published. `publish_roots_before_drop` publishes
+    /// the LIVE root, which supersedes the older one by CoW construction.
+    /// `false` for a tree tree 0 names or that was never published (its
+    /// floor keeps every record since tree 0's root in the window), or no
+    /// tree.
     pub fn page_homed(&self, slot: ForestSlot) -> bool {
-        let Some(live) = self.tree(slot).map(|t| t.root()) else {
+        if self.tree(slot).is_none() {
             return false;
-        };
+        }
         self.published
-            .read_sync(&slot, |_, p| {
-                p.home == PublicationHome::Page && p.root == live
-            })
+            .read_sync(&slot, |_, p| p.home == PublicationHome::Page)
             .unwrap_or(false)
     }
 

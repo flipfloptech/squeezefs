@@ -7103,14 +7103,19 @@ impl KvMetaBackend {
     /// is by what a slot LOSES if the page drops it: the entry mid-handover
     /// first (the two-homes law of the release — the caller's `releasing`,
     /// or the table's `Releasing` state during the flush cycles, so the
-    /// cadence's own page write names it too), then every slot whose
-    /// CURRENT root only a page names (`page_homed` — dropping it loses the
-    /// root's only durable home; [`Self::prepare_page_entries`] publishes
-    /// such a slot into tree 0 BEFORE any page drops it), then every
-    /// UNPUBLISHED slot (its floor keeps its records in the window; naming
-    /// it lifts the floor), then the slots tree 0 names at their current
-    /// root and the native slot (the fixed ledger's root — safe off the
-    /// page) — each class in page-slot order, the budget cutting the tail.
+    /// cadence's own page write names it too), then every slot whose tree
+    /// only a PAGE names (`page_homed` — a page-homed publication at ANY
+    /// root: at the live root the page is the root's only home, at an
+    /// older root it is the only home of the records flushed under that
+    /// root, which the live root's floor no longer covers — review round
+    /// 2, Issue 12; dropping either loses acked records, so
+    /// [`Self::prepare_page_entries`] publishes such a slot's LIVE root into
+    /// tree 0 BEFORE any page drops it), then every UNPUBLISHED slot whose
+    /// last home is tree 0 (its floor keeps every record since tree 0's
+    /// root in the window; naming it lifts the floor), then the slots tree
+    /// 0 names at their current root and the native slot (the fixed
+    /// ledger's root — safe off the page) — each class in page-slot order,
+    /// the budget cutting the tail.
     /// The page-slot order alone cut the page at the 108
     /// LOWEST slots, so a later first touch of a LOWER slot pushed a
     /// page-published slot off the page with its `published` mark intact:
@@ -10308,9 +10313,27 @@ impl KvMetaBackend {
                 // page writer's invariant (Issue 2: a first touch that
                 // landed since this cycle's publication cannot evict a
                 // page-homed root un-named).
-                entries = self
+                entries = match self
                     .prepare_page_entries(set, plane, r, &[], Some(cycle))
-                    .await?;
+                    .await
+                {
+                    Ok(e) => e,
+                    // The cycle's OWN deferral class (the reserve — the
+                    // same arm `publish_forest_roots` logs at the cycle's
+                    // head): the page write fails, the tick retries, the
+                    // previous image that named the slot stands.
+                    Err(KvError::JournalReserveExhausted { needed }) => {
+                        log::debug!(
+                            "checkpoint: SMO reserve exhausted ({needed} B) publishing the \
+                             page-homed roots appender {}'s page would drop (publish-before-drop \
+                             deferred) — the page write is retried next cycle, the previous \
+                             page image stands",
+                            r.id
+                        );
+                        return Err(KvError::JournalReserveExhausted { needed });
+                    }
+                    Err(e) => return Err(e),
+                };
             } else if r.id == 0 {
                 for (slot, tree) in &trees {
                     if set.region_of_slot(*slot) != 0 {

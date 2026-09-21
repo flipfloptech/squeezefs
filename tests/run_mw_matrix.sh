@@ -3235,10 +3235,44 @@ leg_sym_storm() {
         done
         t_rec="$(date +%s)"
         log "round $round: ${#victims[@]} region set(s) RECOVERED by the manager $((t_rec - t_kill)) s after the kill (appender_recoveries $recov0 → $v; dead_members_acted=$(stat_sum 0 dead_members_acted))"
+        # The intent register SETTLES before the oracle judges (PR 13
+        # review round 2, Issue 25): PR 10's driver runs
+        # `roll_forward_open_intents` AFTER the per-region recoveries that
+        # move `appender_recoveries`, and PR 6's law completes a cross-owner
+        # rename the kill caught mid-plan FORWARD — a name at NEITHER home
+        # while its intent is still OPEN is the S3.5 lattice's designed
+        # transient, never a loss. Bounded by the landing ceiling × a few +
+        # the stuck grace (`CLIENT_STALE_TTL_SECS` = 45 s); past it the die
+        # names `xv_cross_owner_intents_stuck`. The three gauges are
+        # snapshotted per round beside the `.stats` files.
+        local ceil_ms xv_open xv_stuck xv_rolled xv_deadline xv_t0
+        ceil_ms="$(stat_sum 0 appender_flush_ceiling_ms)"
+        ceil_ms=$((ceil_ms / (nvol > 0 ? nvol : 1)))
+        [ "$ceil_ms" -gt 0 ] 2>/dev/null || ceil_ms=1100
+        xv_deadline=$((ceil_ms * 8 / 1000 + 45 + 30))
+        xv_t0="$(date +%s)"
+        while :; do
+            xv_open="$(stat_sum 0 xv_cross_owner_intents_open)"
+            [ "$xv_open" = "0" ] && break
+            now="$(date +%s)"
+            [ $((now - xv_t0)) -lt "$xv_deadline" ] ||
+                die "round $round: $xv_open cross-owner intent(s) still OPEN at the manager ${xv_deadline}s after the recovery (xv_cross_owner_intents_stuck=$(stat_sum 0 xv_cross_owner_intents_stuck), recovery_intents_rolled_forward=$(stat_sum 0 recovery_intents_rolled_forward)) — the roll-forward never settled"
+            sleep 1
+        done
+        xv_stuck="$(stat_sum 0 xv_cross_owner_intents_stuck)"
+        xv_rolled="$(stat_sum 0 recovery_intents_rolled_forward)"
+        printf 'round=%s xv_cross_owner_intents_open=%s xv_cross_owner_intents_stuck=%s recovery_intents_rolled_forward=%s settle_s=%s\n' \
+            "$round" "$xv_open" "$xv_stuck" "$xv_rolled" "$(($(date +%s) - xv_t0))" >>"$rowdir/intents-r$round.txt"
+        log "round $round: intent register SETTLED (xv_cross_owner_intents_open $xv_open, stuck $xv_stuck, recovery_intents_rolled_forward $xv_rolled — $(($(date +%s) - xv_t0)) s after the recovery)"
         # The oracle at the MANAGER and at one survivor, over EVERY writer's
         # ledger (the victims' names through the recovery); with the mover
         # a name is at its source OR its cross-owner destination, never
         # both, never neither — and every RETURNED mv is at the destination.
+        # A name at neither home whose `mv` did NOT return is judged
+        # against the intent register (`ack_verify_xo`'s last argument):
+        # open ⇒ "in flight", not LOSS (the register read 0 above, so here
+        # every such name IS a loss — the two populations stay split in the
+        # lost file's labels for the attribution recipe, §4.4af).
         local acked=0 lost=0 n l
         local -a oracle_readers=(0)
         [ "${#survivors[@]}" -gt 0 ] && oracle_readers+=("${survivors[0]}")
@@ -3248,7 +3282,7 @@ leg_sym_storm() {
             acked=$((acked + n))
             for reader_idx in "${oracle_readers[@]}"; do
                 if [ "${SYM_XO:-0}" = "1" ] && [ "$idx" != "0" ]; then
-                    l="$(ack_verify_xo "$ledger" "w$idx:r$round" "$(mnt_of "$idx")" "$(mnt_of "$reader_idx")" "$rowdir/lost-r$round.txt" "/storm-xo-r$round" "w$idx" "$rowdir/moved-w$idx-r$round.ledger")"
+                    l="$(ack_verify_xo "$ledger" "w$idx:r$round" "$(mnt_of "$idx")" "$(mnt_of "$reader_idx")" "$rowdir/lost-r$round.txt" "/storm-xo-r$round" "w$idx" "$rowdir/moved-w$idx-r$round.ledger" "$xv_open")"
                 else
                     l="$(ack_verify "$ledger" "w$idx:r$round" "$(mnt_of "$idx")" "$(mnt_of "$reader_idx")" "$rowdir/lost-r$round.txt")"
                 fi
@@ -3308,7 +3342,7 @@ leg_sym_storm() {
         for idx in 0 "${joiners[@]}"; do
             ledger="$rowdir/acked-w$idx-r$round.ledger"
             if [ "${SYM_XO:-0}" = "1" ] && [ "$idx" != "0" ]; then
-                l="$(ack_verify_xo "$ledger" "w$idx:r$round" "$(mnt_of "$idx")" "$(mnt_of "${victims[0]}")" "$rowdir/lost-r$round.txt" "/storm-xo-r$round" "w$idx" "$rowdir/moved-w$idx-r$round.ledger")"
+                l="$(ack_verify_xo "$ledger" "w$idx:r$round" "$(mnt_of "$idx")" "$(mnt_of "${victims[0]}")" "$rowdir/lost-r$round.txt" "/storm-xo-r$round" "w$idx" "$rowdir/moved-w$idx-r$round.ledger" "$(stat_sum 0 xv_cross_owner_intents_open)")"
             else
                 l="$(ack_verify "$ledger" "w$idx:r$round" "$(mnt_of "$idx")" "$(mnt_of "${victims[0]}")" "$rowdir/lost-r$round.txt")"
             fi
@@ -3433,9 +3467,17 @@ xo_mover() { # src dst prefix ledger
 # cross-owner DESTINATION (`<dst_rel>/<prefix>-<name>`) — exactly one of the
 # two, with its content — and every mv the mover's ledger says RETURNED is
 # at the destination (a plan the kill caught rolls FORWARD, never back).
-ack_verify_xo() { # ledger tag orig_mnt read_mnt lostfile dst_rel prefix moved_ledger
-    local ledger="$1" tag="$2" orig="$3" read_mnt="$4" lostfile="$5" dst_rel="$6" prefix="$7" moved="$8"
-    local f g h want got lost=0 at_src at_dst
+# A name at NEITHER home is split into the two populations the attribution
+# recipe judges apart (PR 13 review round 2, Issue 25; record §4.4af): its
+# `mv` RETURNED (its destination in `moved_ledger` — an acked rename PR 6's
+# law says was durable at its holder before the ack: LOST whatever the
+# timing) or did NOT return (the kill caught the rename mid-plan: LOST once
+# the intent register reads 0 — the caller settles on it first — and
+# "IN-FLIGHT", NOT a loss, while `intents_open` > 0, the S3.5 lattice's
+# designed transient the roll-forward completes).
+ack_verify_xo() { # ledger tag orig_mnt read_mnt lostfile dst_rel prefix moved_ledger [intents_open]
+    local ledger="$1" tag="$2" orig="$3" read_mnt="$4" lostfile="$5" dst_rel="$6" prefix="$7" moved="$8" intents_open="${9:-0}"
+    local f g h want got lost=0 at_src at_dst returned
     while IFS= read -r f; do
         [ -n "$f" ] || continue
         g="$read_mnt${f#"$orig"}"
@@ -3445,8 +3487,20 @@ ack_verify_xo() { # ledger tag orig_mnt read_mnt lostfile dst_rel prefix moved_l
         [ -f "$g" ] && at_src=1
         [ -f "$h" ] && at_dst=1
         if [ $((at_src + at_dst)) != 1 ]; then
+            # The mover's ledger holds DESTINATION paths (`xo_mover`); the
+            # acked ledger holds the source — match on the fixed-width name.
+            returned=0
+            grep -qE -- "/${prefix}-$(basename "$f")\$" "$moved" 2>/dev/null && returned=1
+            if [ "$at_src" = "0" ] && [ "$at_dst" = "0" ] && [ "$returned" = "0" ] && [ "${intents_open:-0}" != "0" ]; then
+                echo "IN-FLIGHT (xo: src=0 dst=0, mv NOT returned, xv_cross_owner_intents_open=$intents_open — the roll-forward's window, not a loss): $g | $h" >>"$lostfile"
+                continue
+            fi
             lost=$((lost + 1))
-            echo "LOST (xo: src=$at_src dst=$at_dst): $g | $h" >>"$lostfile"
+            if [ "$returned" = "1" ]; then
+                echo "LOST (xo RETURNED mv — acked rename, P0: src=$at_src dst=$at_dst): $g | $h" >>"$lostfile"
+            else
+                echo "LOST (xo UNRETURNED mv, xv_cross_owner_intents_open=$intents_open: src=$at_src dst=$at_dst): $g | $h" >>"$lostfile"
+            fi
             continue
         fi
         want="$tag:$((10#${f##*/f}))"

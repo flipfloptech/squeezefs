@@ -5354,6 +5354,8 @@ impl PublishService {
         let name = call.name();
         let is_extent = call.is_extent();
         let served_ino = call.named_inos().first().copied().unwrap_or(0);
+        let served_at = std::time::Instant::now();
+        let requester = client.clone();
         let (slot, owns) = self.publish_dedup.slot((lease_epoch, request_id));
         if !owns {
             if is_extent {
@@ -5430,7 +5432,7 @@ impl PublishService {
             EXTENT_SERVED.fetch_add(1, Ordering::Relaxed);
         }
         if !is_extent && owns {
-            self.note_foreign_publish_served(served_ino, outcome.is_ok())
+            self.note_foreign_publish_served(served_ino, outcome.is_ok(), &requester, served_at)
                 .await;
         }
         PublishCallOutcome::Done(outcome)
@@ -5439,17 +5441,34 @@ impl PublishService {
     /// PR 13b's holder-side row: a layout-class publish served under the
     /// ARMED symmetric plane (every such serve is a peer's publish of an
     /// object in a slot this mount leases — no co-writer posture exists
-    /// beside the plane) — counted, and the holder's OWN caches of the
-    /// object invalidated (`record_ship::note_served_mutation`: the
-    /// router's RAM entry and the kernel's attrs + pages — the served
-    /// publish landed below both). Nothing on an unarmed set.
-    async fn note_foreign_publish_served(&self, ino: u64, ok: bool) {
+    /// beside the plane) — counted, the holder's OWN caches of the object
+    /// invalidated (`record_ship::note_served_mutation`: the router's RAM
+    /// entry and the kernel's attrs + pages — the served publish landed
+    /// below both), and the slot's dominance window fed with the
+    /// requester's op (`record_ship::note_served_slot_ship` — review round
+    /// 1, Issue 8: §5.1.4's law on the DATA face, so a writer that
+    /// dominates a slot through its writes alone earns the offer).
+    /// Nothing on an unarmed set.
+    async fn note_foreign_publish_served(
+        &self,
+        ino: u64,
+        ok: bool,
+        client: &str,
+        served_at: std::time::Instant,
+    ) {
         if ok && self.inner.volumes.iter().any(|v| v.slot_lease_armed()) {
             crate::meta_backend::record_ship::note_publish_served();
             if ino != 0 {
                 crate::meta_backend::record_ship::note_served_mutation(
                     ino,
                     crate::meta_backend::record_ship::ServedMutation::Data,
+                )
+                .await;
+                crate::meta_backend::record_ship::note_served_slot_ship(
+                    &self.inner,
+                    ino,
+                    client,
+                    served_at,
                 )
                 .await;
             }
@@ -5574,6 +5593,8 @@ impl PublishService {
             group_inos.push(m.call.named_inos().first().copied().unwrap_or(0));
             work.push(m.call);
         }
+        let served_at = std::time::Instant::now();
+        let requester = client.to_string();
         let client = client.to_string();
         let (joined, _) = super::owner_dispatch("meta_ship_publish_group", inline, async move {
             me.run_layout_group(&client, work, single_volume).await
@@ -5590,7 +5611,8 @@ impl PublishService {
                 {
                     lease.complete(outcome.clone());
                     SERVED.fetch_add(1, Ordering::Relaxed);
-                    self.note_foreign_publish_served(ino, outcome.is_ok()).await;
+                    self.note_foreign_publish_served(ino, outcome.is_ok(), &requester, served_at)
+                        .await;
                     out.push((idx, PublishCallOutcome::Done(outcome)));
                 }
                 (out, committed, split)

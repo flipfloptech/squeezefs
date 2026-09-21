@@ -403,13 +403,13 @@ pub async fn note_served(
     if !crate::meta_ship::executing_for_ship_client() {
         return;
     }
-    let (v_idx, local) = routed.route_ino(ino);
+    let (v_idx, _local) = routed.route_ino(ino);
     let Some(vol) = routed.volumes.get(v_idx) else {
         return;
     };
-    let Some(plane) = vol.slot_leases() else {
+    if vol.slot_leases().is_none() {
         return;
-    };
+    }
     match failure {
         None => RECORD_SERVED.fetch_add(1, Ordering::Relaxed),
         Some(e) if crossvol_tx::is_slot_moved_refusal(e) => return,
@@ -422,7 +422,34 @@ pub async fn note_served(
     let Some(client) = crate::meta_ship::current_ship_client() else {
         return;
     };
-    let Some((node_token, mount_slot)) = crate::cowriter::parse_node_member_id(&client) else {
+    note_served_slot_ship(routed, ino, &client, served_at).await;
+}
+
+/// **The slot's dominance window fed by ONE served act** (§5.1.4 — a
+/// served ship is the requester's op on the slot, PR 13's defect 9/13
+/// law): the requester is the shipping mount's appender where this plane
+/// knows its identity (`client` = its KD-MW-2 member id), the ship's wall
+/// the served act's measured `served_at`. The two callers: a served
+/// record verb ([`note_served`]) and a served LAYOUT PUBLISH
+/// (`PublishService::note_foreign_publish_served` — review round 1, Issue
+/// 8: a writer that dominates a slot through DATA writes alone, design
+/// §5.10's own "`write` to a FOREIGN-owned file" row, never triggered the
+/// offer before). Nothing on an unarmed volume, nothing for this mount's
+/// own appender.
+pub async fn note_served_slot_ship(
+    routed: &RoutedMetaBackend,
+    ino: Ino,
+    client: &str,
+    served_at: Instant,
+) {
+    let (v_idx, local) = routed.route_ino(ino);
+    let Some(vol) = routed.volumes.get(v_idx) else {
+        return;
+    };
+    let Some(plane) = vol.slot_leases() else {
+        return;
+    };
+    let Some((node_token, mount_slot)) = crate::cowriter::parse_node_member_id(client) else {
         return;
     };
     let Some(requester) = plane.appender_of_identity(node_token, mount_slot) else {

@@ -5452,12 +5452,39 @@ async fn a_managers_setattr_of_a_joiners_file_lands_at_the_joiner() {
     assert_eq!(s1.record_refusals, s0.record_refusals);
     // The dominance window: the served verbs counted as the MANAGER's ops
     // on the slot at the holder (the requester off the shipper's member id).
+    let ships_after_verbs = jvol.slot_lease_stats().map_or(0, |s| s.ships);
     assert!(
-        jvol.slot_lease_stats().map_or(0, |s| s.ships) >= 2,
+        ships_after_verbs >= 2,
         "the holder's window counts the manager's two ships (slot_ships)"
+    );
+    // The DATA face feeds the window too (review round 1, Issue 8): the
+    // manager's layout publish of the joiner's file ships to the joiner
+    // under the per-holder custody lease and is the manager's op on the
+    // slot at the holder — RED on the first build, where only the record
+    // verbs' served note reached `note_slot_ship`.
+    let _arm = arm_publish_writer(&manager, &midentity).await;
+    let inline = bincode::serialize(&squeezefs::layout_wire::LayoutMetadata {
+        file_type: "inline".into(),
+        size: 5,
+        data_key: Some(b"hello".to_vec()),
+        ..Default::default()
+    })
+    .unwrap();
+    squeezefs::meta_ship::publish::set_layout_and_size(&manager, f, &inline, 5, &[])
+        .await
+        .expect("PR 13b: the manager's layout publish of a joiner-slot file ships to the joiner");
+    assert_eq!(j.getattr(f).await.unwrap().size, 5, "the holder's record");
+    let s2 = record_ship_stats();
+    assert_eq!(s2.foreign_publish_ships - s1.foreign_publish_ships, 1);
+    assert_eq!(s2.foreign_publish_served - s1.foreign_publish_served, 1);
+    assert_eq!(
+        jvol.slot_lease_stats().map_or(0, |s| s.ships),
+        ships_after_verbs + 1,
+        "the served publish is the requester's op on the slot (slot_ships +1)"
     );
     assert_must_stay_zero(&jvol, "joiner");
     assert_must_stay_zero(&mvol, "manager");
+    disarm_publish_writer().await;
     squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
     shutdown(&j).await;
     drop(jvol);

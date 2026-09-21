@@ -127,7 +127,7 @@ pub use owners::{
     ownership_armed, owns_volume, rearm_ownership, OwnerMap, PeerOwner,
 };
 pub use router::{MetaShipRouter, VerbRoute, TEST_SHIP_DRAIN_HOLD_MS};
-pub(crate) use service::executing_for_ship_client;
+pub(crate) use service::{current_ship_client, executing_for_ship_client};
 pub use service::{
     owner_authority_token, MetaShipService, ServiceStats, TEST_DELEG_COHERENCE_LAW,
     TEST_INTENT_APPLY_ERRNO, TEST_INTENT_READ_GATE, TEST_INTENT_SUPPLY_CHUNK,
@@ -529,7 +529,7 @@ pub fn stats() -> ShipStatsSnapshot {
 pub fn stats_json() -> serde_json::Value {
     let s = stats();
     let t = token_cache_stats();
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "armed": s.armed,
         "arms": s.arms,
         "local_verbs": s.local_verbs,
@@ -577,7 +577,16 @@ pub fn stats_json() -> serde_json::Value {
         "dlm_token_cache_range_spans": t.range_spans,
         "dlm_token_cache_cap_entries": t.cap_entries,
         "dlm_token_cache_owner_term": t.owner_term,
-    })
+    });
+    // PR 13b — the record-level metanode ship's ledger (0 on every mount
+    // without a foreign slot holder): `record_ships` / `record_served` /
+    // `record_refusals` (must stay 0) / `record_ship_redirects` /
+    // `record_unreachable`, and the publish plane's slot-holder rows
+    // `foreign_publish_ships` / `foreign_publish_served`.
+    if let serde_json::Value::Object(map) = &mut out {
+        crate::meta_backend::record_ship::stats_into(map);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

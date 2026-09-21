@@ -14222,20 +14222,18 @@ impl SqueezefsFilesystem {
                         word(&|s| u64::from(s.meta_hold_standing)),
                     );
                 }
-                // PR 13 §4.4z (the flip blocker, review round 1 Issue 12):
-                // record-level mutations of a FOREIGN-slot object refused
-                // loud (EREMOTE naming PR 13b) — 0 on every unarmed
-                // mount by construction; on an armed one each is a verb
-                // PR 13b's ship will serve.
-                metrics.insert(
-                    "foreign_file_mutation_refusals".into(),
-                    load(&crate::meta_backend::FOREIGN_FILE_MUTATION_REFUSALS),
-                );
                 // The kernel's times echo on a foreign-slot file, absorbed
-                // against the holder's exact record (never a refusal).
+                // against the holder's exact record (never a wire trip for
+                // a no-op — PR 13b ships every other foreign-slot record
+                // verb; its ledger rides the `meta_ship` object).
                 metrics.insert(
                     "foreign_file_times_echo_absorbed".into(),
                     load(&crate::meta_backend::FOREIGN_FILE_TIMES_ECHO_ABSORBED),
+                );
+                // PR 13b: the shipped record verb's decomposition.
+                metrics.insert(
+                    "record_ship_phase_ns".into(),
+                    crate::meta_backend::record_ship::phase_json(),
                 );
                 // The door's ledger (review round 2, Issue 6): parks are a
                 // legal wait for a bounded handover, refusals the "ship to
@@ -27039,17 +27037,18 @@ impl Filesystem for SqueezefsFilesystem {
         const WRITE_INTENT: u32 = crate::meta_backend::OPEN_WRITE_INTENT;
         if !is_virtual_ino(inode) && flags & WRITE_INTENT != 0 {
             self.ro_gate("open(write intent)")?;
-            // PR 13 §4.4z (review round 2, Issue 22): on the ARMED plane a
-            // write-intent open of a FOREIGN-slot file refuses HERE, where
-            // the shell checks — the default mount's writeback cache acks
-            // `write(2)` into the page cache and the WRITE handler's gate
-            // reaches the application only at fsync/close through the
-            // kernel's errseq, so `>>` printed rc 0 with its bytes gone.
-            // Typed `EREMOTE` naming PR 13b; one lease-table read on an
-            // armed mount, nothing unarmed; a read-only open never here.
+            // PR 13b: on the ARMED plane a write-intent open of a FOREIGN-
+            // slot file passes when the slot's holder is reachable (the
+            // write path ships its publish there) and refuses the retryable
+            // `EAGAIN` class HERE — where the shell checks — when it is not:
+            // the default mount's writeback cache acks `write(2)` into the
+            // page cache, so a publish that cannot travel would reach the
+            // application only at fsync/close through the kernel's errseq.
+            // One lease-table read on an armed mount, nothing unarmed.
             if let Some(backend) = self.meta_backend.as_ref() {
                 backend
                     .refuse_foreign_slot_open(inode, flags)
+                    .await
                     .map_err(map_squeezefs_err)?;
             }
         }
@@ -27285,24 +27284,6 @@ impl Filesystem for SqueezefsFilesystem {
         if is_virtual_ino(ino) {
             return Err(Errno::from(libc::EACCES));
         }
-        // PR 13 §4.4z (the flip blocker): a FOREIGN-slot file's write on an
-        // armed mount refuses here with the typed `EREMOTE` naming PR
-        // 13b — the BELT behind the open gate (an fd opened before the slot
-        // moved, the shim's ring writes). What this gate delivers depends
-        // on the mount: under `--no-writeback`, `O_DIRECT` or `O_SYNC` the
-        // application's `write(2)` fails here; on the DEFAULT
-        // writeback-cached mount the kernel has already acked the write
-        // into its page cache and this refusal reaches the application at
-        // `fsync`/`close` through the kernel's errseq (POSIX-16's class) —
-        // which is why the OPEN gate above it exists (review round 2,
-        // Issue 22). One lease-table read on an armed mount, nothing
-        // unarmed.
-        if let Some(backend) = self.meta_backend.as_ref() {
-            backend
-                .refuse_foreign_slot_file_mutation(ino, "write")
-                .map_err(map_squeezefs_err)?;
-        }
-
         // D14 write-side zc leg (rc-manifest §3f): on a zc-armed session
         // the WRITE's payload was delivered HELD in the transport's
         // sparse slot (dispatch-before-extraction — `data` here is the

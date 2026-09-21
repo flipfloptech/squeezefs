@@ -2461,6 +2461,7 @@ pub(crate) fn serve_window_already_held() -> bool {
 /// the ladder-suite self-deadlock).
 pub(crate) fn publishes_locally(be: &Arc<RoutedMetaBackend>, ino: Ino) -> bool {
     owner_of_unchecked(be, ino).is_none()
+        && !crate::meta_backend::record_ship::slot_is_foreign(be, ino)
 }
 
 /// Acquire `ino`'s serve stripe for a routing-side compose window
@@ -2615,6 +2616,92 @@ fn note_local() {
     LOCAL.fetch_add(1, Ordering::Relaxed);
 }
 
+/// **A shipped publish's destination and the custody lease it presents**
+/// (symmetric PR 13b — design §5.10's "1 custody grant + 1 publish ship
+/// per layout publish"): the S8 VOLUME owner with the set authority's
+/// custody client (the per-volume-owner recipe, `holder: None`), or the
+/// appender leasing the object's SLOT with the per-HOLDER custody client
+/// PR 9's arm dialed there (`holder: Some`) — the grant the served side's
+/// era gate (`validate_publish_era`) and custody-scoped compose judge the
+/// publish by.
+struct PublishTarget {
+    peer: Arc<super::PeerOwner>,
+    holder: Option<Arc<crate::data_grant::WriteCustodyClient>>,
+}
+
+impl PublishTarget {
+    fn owner(peer: Arc<super::PeerOwner>) -> Self {
+        Self { peer, holder: None }
+    }
+
+    /// The custody lease epoch every mutating call to this target
+    /// presents — the holder's grant to THIS mount where the target is a
+    /// slot holder, the set authority's otherwise.
+    fn epoch(&self) -> u64 {
+        match &self.holder {
+            Some(client) => client.lease_epoch(),
+            None => current_lease_epoch(),
+        }
+    }
+}
+
+/// **Where a publish of `ino` lands** — `None` = here. The S8 volume
+/// owner first (the shipped path, byte-identical); then, under the ARMED
+/// symmetric plane, the appender leasing the ino's slot
+/// (`record_ship::record_home` — tree 0's lessee, the endpoint bound on
+/// demand), whose custody lease this mount JOINs on first use
+/// (`data_grant::slot_holder_client`). An unreachable holder is the
+/// retryable class the caller sees; an unarmed volume pays one `Option`
+/// test past `owner_of`'s relaxed load.
+async fn publish_target(
+    be: &Arc<RoutedMetaBackend>,
+    ino: Ino,
+    what: &str,
+) -> Result<Option<PublishTarget>> {
+    use crate::meta_backend::record_ship::{self, RecordHome};
+    if let Some(peer) = owner_of(be, ino)? {
+        return Ok(Some(PublishTarget::owner(peer)));
+    }
+    match record_ship::record_home(be, ino, what).await? {
+        RecordHome::Local => Ok(None),
+        RecordHome::Foreign { holder, endpoint } => {
+            let client = crate::data_grant::slot_holder_client(&endpoint).await?;
+            record_ship::note_publish_shipped();
+            Ok(Some(PublishTarget {
+                peer: Arc::new(super::PeerOwner::new(
+                    format!("appender-{holder}"),
+                    &*endpoint,
+                )),
+                holder: Some(client),
+            }))
+        }
+    }
+}
+
+/// The slot-moved arm of a shipped publish (PR 13b — defects 28/29's
+/// class on this wire): the holder's commit door refused the publish
+/// because the slot was handed over between the resolve and the apply;
+/// re-resolve the lessee ONCE (a joiner asks the manager) and answer the
+/// new target — `None` when the slot is this mount's now.
+async fn publish_target_after_slot_moved(
+    be: &Arc<RoutedMetaBackend>,
+    ino: Ino,
+    what: &str,
+) -> Result<Option<PublishTarget>> {
+    let (v_idx, local) = be.route_ino(ino);
+    if let Some(vol) = be.volumes.get(v_idx) {
+        let slot = crate::meta_backend::kv::record::forest_slot_of_ino(local);
+        let _ = vol.reresolve_slot_holder(slot).await;
+    }
+    publish_target(be, ino, what).await
+}
+
+/// Whether a shipped publish's failure is a SLOT-HOLDER target's
+/// slot-moved refusal — the one re-resolve the target layer runs.
+fn slot_moved_at_holder(target: &PublishTarget, e: &SqueezefsError) -> bool {
+    target.holder.is_some() && crate::meta_backend::crossvol_tx::is_slot_moved_refusal(e)
+}
+
 /// Ship `call` to `peer`, or refuse loud when the ownership plane is armed
 /// without its publish half.
 ///
@@ -2651,6 +2738,9 @@ fn wire_refs(refs: &[BlockRefOp]) -> Vec<WireBlockRefOp> {
 /// None).
 pub fn merge_is_chained(be: &Arc<RoutedMetaBackend>, ino: Ino) -> bool {
     owner_of_unchecked(be, ino).is_some()
+        // PR 13b: a foreign-SLOT ino's merge ships to its slot holder,
+        // which chains it onto the durable head exactly as an owner does.
+        || crate::meta_backend::record_ship::slot_is_foreign(be, ino)
         || crate::data_grant::custody_owner()
             .map(|o| o.ino_granted(ino))
             .unwrap_or(false)
@@ -2701,13 +2791,13 @@ const PUBLISH_SHIP_ATTEMPTS: u32 = 3;
 /// is a new act the window cannot correlate. A fence-class refusal
 /// (`PUBLISH_STALE_LEASE` → `WriterGuardFenced`) never retries — the era
 /// is dead and every resend would refuse identically.
-async fn ship_witnessed(peer: &Arc<super::PeerOwner>, call: PublishCall) -> Result<PublishReply> {
+async fn ship_witnessed(target: &PublishTarget, call: PublishCall) -> Result<PublishReply> {
     let epoch = call
         .presented_epoch()
         .expect("only witnessed (epoch-bearing) calls ride this ladder");
     let mut attempt = 0u32;
     loop {
-        match ship(peer, call.clone()).await {
+        match ship(&target.peer, call.clone()).await {
             Ok(reply) => return Ok(reply),
             Err(e @ SqueezefsError::WriterGuardFenced) => return Err(e),
             // PK4: a typed DEFINITE refusal (the owner refused the frame or
@@ -2724,9 +2814,13 @@ async fn ship_witnessed(peer: &Arc<super::PeerOwner>, call: PublishCall) -> Resu
                     ..
                 },
             ) => return Err(e),
+            // PR 13b: a slot holder's SLOT-MOVED refusal is the target
+            // layer's re-resolve, never a same-frame resend at the door
+            // that refused it.
+            Err(e) if slot_moved_at_holder(target, &e) => return Err(e),
             Err(e) => {
                 attempt += 1;
-                if current_lease_epoch() != epoch || attempt >= PUBLISH_SHIP_ATTEMPTS {
+                if target.epoch() != epoch || attempt >= PUBLISH_SHIP_ATTEMPTS {
                     return Err(e);
                 }
                 squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(10)).await;
@@ -2812,37 +2906,45 @@ pub async fn set_layout_and_size(
     size: u64,
     refs: &[BlockRefOp],
 ) -> Result<OwnerVerdict> {
-    match owner_of(be, ino)? {
-        None => {
+    const WHAT: &str = "layout publish";
+    let mut target = publish_target(be, ino, WHAT).await?;
+    let mut redirected = false;
+    loop {
+        let Some(t) = target else {
             note_local();
             let _serve_window = local_publish_guard(ino).await;
             be.set_layout_and_size(ino, layout, size, refs).await?;
-            Ok(OwnerVerdict::default())
-        }
-        Some(peer) => {
-            intent_barrier_inos(&[ino]).await?;
-            match ship_witnessed(
-                &peer,
-                PublishCall::SetLayoutAndSize {
-                    ino,
-                    layout: layout.to_vec(),
-                    size,
-                    refs: wire_refs(refs),
-                    lease_epoch: current_lease_epoch(),
-                    request_id: crate::cowriter::next_ship_request_id(),
-                },
-            )
-            .await?
-            {
-                PublishReply::PutDone { recomputed, freed } => {
-                    Ok(OwnerVerdict { recomputed, freed })
-                }
-                other => Err(protocol_error(
+            return Ok(OwnerVerdict::default());
+        };
+        intent_barrier_inos(&[ino]).await?;
+        let shipped = ship_witnessed(
+            &t,
+            PublishCall::SetLayoutAndSize {
+                ino,
+                layout: layout.to_vec(),
+                size,
+                refs: wire_refs(refs),
+                lease_epoch: t.epoch(),
+                request_id: crate::cowriter::next_ship_request_id(),
+            },
+        )
+        .await;
+        match shipped {
+            Ok(PublishReply::PutDone { recomputed, freed }) => {
+                return Ok(OwnerVerdict { recomputed, freed })
+            }
+            Ok(other) => {
+                return Err(protocol_error(
                     "set_layout_and_size",
                     &format!("{other:?}"),
                     "a Put acknowledgement",
-                )),
+                ))
             }
+            Err(e) if !redirected && slot_moved_at_holder(&t, &e) => {
+                redirected = true;
+                target = publish_target_after_slot_moved(be, ino, WHAT).await?;
+            }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -2955,8 +3057,11 @@ pub async fn merge_layout_and_size(
     size: u64,
     refs: Vec<BlockRefOp>,
 ) -> Result<(bool, u64, OwnerVerdict, Vec<BlockRef>)> {
-    match owner_of(be, ino)? {
-        None => {
+    const WHAT: &str = "layout publish";
+    let mut target = publish_target(be, ino, WHAT).await?;
+    let mut redirected = false;
+    loop {
+        let Some(t) = target else {
             note_local();
             // Rung 17: the AUTHORITY's own publishes on an ino with live
             // foreign custody must ALSO chain onto the head — its RAM
@@ -2989,52 +3094,58 @@ pub async fn merge_layout_and_size(
                     recomputed: released.is_some(),
                     freed: Vec::new(),
                 };
-                Ok((used, version, verdict, released.unwrap_or_default()))
-            } else {
-                let used = be
-                    .merge_layout_and_size(ino, delta, full_layout, size, refs)
-                    .await?;
-                Ok((
-                    used,
-                    if used { delta.version } else { 0 },
-                    OwnerVerdict::default(),
-                    Vec::new(),
-                ))
+                return Ok((used, version, verdict, released.unwrap_or_default()));
             }
-        }
-        Some(peer) => {
-            intent_barrier_inos(&[ino]).await?;
-            let call = PublishCall::MergeLayoutAndSize {
-                ino,
-                delta: delta.encode(),
-                full_layout: full_layout.to_vec(),
-                size,
-                refs: wire_refs(&refs),
-                lease_epoch: current_lease_epoch(),
-                request_id: crate::cowriter::next_ship_request_id(),
-            };
-            match ship_witnessed(&peer, call).await? {
-                // The OWNER freed its recompute's releases (finding 36):
-                // nothing travels back for the caller to FREE — what
-                // travels is which offsets it freed (schema 15), the
-                // caller's local-hygiene input.
-                PublishReply::DeltaUsed {
-                    used,
-                    version,
-                    recomputed,
-                    freed,
-                } => Ok((
+            let used = be
+                .merge_layout_and_size(ino, delta, full_layout, size, refs)
+                .await?;
+            return Ok((
+                used,
+                if used { delta.version } else { 0 },
+                OwnerVerdict::default(),
+                Vec::new(),
+            ));
+        };
+        intent_barrier_inos(&[ino]).await?;
+        let call = PublishCall::MergeLayoutAndSize {
+            ino,
+            delta: delta.encode(),
+            full_layout: full_layout.to_vec(),
+            size,
+            refs: wire_refs(&refs),
+            lease_epoch: t.epoch(),
+            request_id: crate::cowriter::next_ship_request_id(),
+        };
+        match ship_witnessed(&t, call).await {
+            // The OWNER freed its recompute's releases (finding 36):
+            // nothing travels back for the caller to FREE — what
+            // travels is which offsets it freed (schema 15), the
+            // caller's local-hygiene input.
+            Ok(PublishReply::DeltaUsed {
+                used,
+                version,
+                recomputed,
+                freed,
+            }) => {
+                return Ok((
                     used,
                     version,
                     OwnerVerdict { recomputed, freed },
                     Vec::new(),
-                )),
-                other => Err(protocol_error(
+                ))
+            }
+            Ok(other) => {
+                return Err(protocol_error(
                     "merge_layout_and_size",
                     &format!("{other:?}"),
                     "a delta-used flag",
-                )),
+                ))
             }
+            Err(e) if !redirected && slot_moved_at_holder(&t, &e) => {
+                redirected = true;
+                target = publish_target_after_slot_moved(be, ino, WHAT).await?;
+            }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -3072,7 +3183,7 @@ pub async fn write_extent(
                 lease_epoch: current_lease_epoch(),
                 request_id,
             };
-            match ship_witnessed(&peer, call).await? {
+            match ship_witnessed(&PublishTarget::owner(peer), call).await? {
                 PublishReply::ExtentAck { covering_version } => {
                     EXTENT_SHIPPED.fetch_add(1, Ordering::Relaxed);
                     Ok(covering_version)
@@ -3102,7 +3213,7 @@ pub async fn flush_extents(be: &Arc<RoutedMetaBackend>, ino: Ino) -> Result<u64>
                 lease_epoch: current_lease_epoch(),
                 request_id: crate::cowriter::next_ship_request_id(),
             };
-            match ship_witnessed(&peer, call).await? {
+            match ship_witnessed(&PublishTarget::owner(peer), call).await? {
                 PublishReply::FlushDone { covering_version } => {
                     EXTENT_FLUSH_FORCES.fetch_add(1, Ordering::Relaxed);
                     Ok(covering_version)
@@ -3123,12 +3234,12 @@ pub async fn commit_block_refs(
     ino: Ino,
     refs: &[BlockRefOp],
 ) -> Result<()> {
-    match owner_of(be, ino)? {
+    match publish_target(be, ino, "block-reference commit").await? {
         None => {
             note_local();
             be.commit_block_refs(ino, refs).await
         }
-        Some(peer) => ship_commit_block_refs(&peer, ino, refs).await,
+        Some(target) => ship_commit_block_refs(&target, ino, refs).await,
     }
 }
 
@@ -3143,7 +3254,7 @@ pub async fn release_block_refs_witnessed(
     refs: &[BlockRefOp],
 ) -> Result<crate::meta_backend::kv::block_refs::ReleaseWitness> {
     use crate::meta_backend::kv::block_refs::ReleaseWitness;
-    match owner_of(be, ino)? {
+    match publish_target(be, ino, "block-reference release").await? {
         None => {
             note_local();
             Ok(match be.commit_block_refs_witnessed(ino, refs).await? {
@@ -3151,26 +3262,26 @@ pub async fn release_block_refs_witnessed(
                 Some(held) => ReleaseWitness::Ledger(held),
             })
         }
-        Some(peer) => {
-            ship_commit_block_refs(&peer, ino, refs).await?;
+        Some(target) => {
+            ship_commit_block_refs(&target, ino, refs).await?;
             Ok(ReleaseWitness::Shipped)
         }
     }
 }
 
 async fn ship_commit_block_refs(
-    peer: &Arc<super::PeerOwner>,
+    target: &PublishTarget,
     ino: Ino,
     refs: &[BlockRefOp],
 ) -> Result<()> {
     intent_barrier_inos(&[ino]).await?;
     expect_unit(
         ship_witnessed(
-            peer,
+            target,
             PublishCall::CommitBlockRefs {
                 ino,
                 refs: wire_refs(refs),
-                lease_epoch: current_lease_epoch(),
+                lease_epoch: target.epoch(),
                 request_id: crate::cowriter::next_ship_request_id(),
             },
         )
@@ -3219,7 +3330,7 @@ pub async fn migrate_block_map(
     crate::meta_backend::kv::backend::MapMigrateOutcome,
     Vec<WireFreedBlock>,
 )> {
-    match owner_of(be, ino)? {
+    match publish_target(be, ino, "block-map crossing").await? {
         None => {
             note_local();
             use crate::meta_backend::Metadata as _;
@@ -3319,7 +3430,7 @@ pub async fn migrate_block_map(
                 ))),
             }
         }
-        Some(peer) => {
+        Some(target) => {
             intent_barrier_inos(&[ino]).await?;
             // PR 5b (design §11's belt): the shipped head's own kvmap id
             // carries the generation this ship was computed against — the
@@ -3338,10 +3449,10 @@ pub async fn migrate_block_map(
                 entries,
                 refs: wire_refs(&refs),
                 base_gen,
-                lease_epoch: current_lease_epoch(),
+                lease_epoch: target.epoch(),
                 request_id: crate::cowriter::next_ship_request_id(),
             };
-            match ship_witnessed(&peer, call).await? {
+            match ship_witnessed(&target, call).await? {
                 PublishReply::MapMigrated {
                     records,
                     record_bytes,
@@ -3389,21 +3500,21 @@ pub async fn park_write_times(
     mtime: u64,
     ctime: u64,
 ) -> Result<()> {
-    match owner_of(be, ino)? {
+    match publish_target(be, ino, "write-times park").await? {
         None => {
             note_local();
             be.park_write_times(ino, mtime, ctime).await
         }
-        Some(peer) => {
+        Some(target) => {
             intent_barrier_inos(&[ino]).await?;
             expect_unit(
                 ship(
-                    &peer,
+                    &target.peer,
                     PublishCall::ParkWriteTimes {
                         ino,
                         mtime,
                         ctime,
-                        lease_epoch: current_lease_epoch(),
+                        lease_epoch: target.epoch(),
                     },
                 )
                 .await?,
@@ -4569,6 +4680,13 @@ pub struct PublishService {
     /// is the aged block list plus the grant sequence it was served under
     /// (schema 16), so a replay re-answers the same sequence.
     harvest_dedup: DedupWindow<std::result::Result<(Vec<(u64, u64)>, u64), WireError>>,
+    /// PR 13b: the S9 custody authority the era gate and the custody-
+    /// scoped compose judge a served publish by — this service's own when
+    /// set, else the process-installed owner (`data_grant::custody_owner`).
+    /// The N-daemon contracts stand N holders up in one process, each
+    /// with its own authority (the `TokenService::with_custody_owner`
+    /// precedent).
+    custody_owner: Option<Arc<crate::data_grant::WriteCustodyOwner>>,
     self_ref: std::sync::OnceLock<std::sync::Weak<PublishService>>,
 }
 
@@ -4593,6 +4711,25 @@ impl PublishService {
     /// [`Self::new`] with an explicit authority set — the shape a node that
     /// owns a SUBSET of the set has.
     pub fn with_authority(inner: Arc<RoutedMetaBackend>, volumes: &[usize]) -> Arc<Self> {
+        Self::build(inner, volumes, None)
+    }
+
+    /// [`Self::new`] judging every served publish's custody by `owner`
+    /// instead of the process-installed authority (PR 13b — the
+    /// in-process N-daemon venue).
+    pub fn with_custody_owner(
+        inner: Arc<RoutedMetaBackend>,
+        owner: Arc<crate::data_grant::WriteCustodyOwner>,
+    ) -> Arc<Self> {
+        let all: Vec<usize> = (0..inner.volumes.len()).collect();
+        Self::build(inner, &all, Some(owner))
+    }
+
+    fn build(
+        inner: Arc<RoutedMetaBackend>,
+        volumes: &[usize],
+        custody_owner: Option<Arc<crate::data_grant::WriteCustodyOwner>>,
+    ) -> Arc<Self> {
         let mut authority = vec![false; inner.volumes.len()];
         for &v in volumes {
             if let Some(slot) = authority.get_mut(v) {
@@ -4605,6 +4742,7 @@ impl PublishService {
             free_dedup: DedupWindow::new(crate::meta_ship::service::dedup_cap()),
             harvest_dedup: DedupWindow::new(crate::meta_ship::service::dedup_cap()),
             publish_dedup: DedupWindow::new(crate::meta_ship::service::dedup_cap()),
+            custody_owner,
             self_ref: std::sync::OnceLock::new(),
         });
         let _ = me.self_ref.set(Arc::downgrade(&me));
@@ -4613,6 +4751,13 @@ impl PublishService {
 
     fn owned(&self) -> Option<Arc<Self>> {
         self.self_ref.get().and_then(|w| w.upgrade())
+    }
+
+    /// The custody authority this service judges by (see the field).
+    fn custody_owner(&self) -> Option<Arc<crate::data_grant::WriteCustodyOwner>> {
+        self.custody_owner
+            .clone()
+            .or_else(crate::data_grant::custody_owner)
     }
 
     fn has_authority(&self, ino: u64) -> bool {
@@ -4961,7 +5106,11 @@ impl PublishService {
         // precedent verbatim). The raise/free/harvest verbs keep their own,
         // older gates in `serve_call` (landed counter surface).
         if let Some(epoch) = call.era_gated_epoch() {
-            if let Err(reason) = crate::data_grant::validate_publish_era(client, epoch) {
+            let verdict = match self.custody_owner {
+                Some(ref owner) => owner.check_publish_era(client, epoch),
+                None => crate::data_grant::validate_publish_era(client, epoch),
+            };
+            if let Err(reason) = verdict {
                 // Rung 17: the extent class's era refusals land on their
                 // OWN row (`extent_stale_refusals`); the layout class
                 // keeps the finding-#6 row.
@@ -5210,7 +5359,20 @@ impl PublishService {
         if is_extent && owns && outcome.is_ok() {
             EXTENT_SERVED.fetch_add(1, Ordering::Relaxed);
         }
+        if !is_extent && owns {
+            self.note_foreign_publish_served(outcome.is_ok());
+        }
         PublishCallOutcome::Done(outcome)
+    }
+
+    /// PR 13b's holder-side row: a layout-class publish served under the
+    /// ARMED symmetric plane (every such serve is a peer's publish of an
+    /// object in a slot this mount leases — no co-writer posture exists
+    /// beside the plane). Nothing on an unarmed set.
+    fn note_foreign_publish_served(&self, ok: bool) {
+        if ok && self.inner.volumes.iter().any(|v| v.slot_lease_armed()) {
+            crate::meta_backend::record_ship::note_publish_served();
+        }
     }
 
     /// Serve a round's `SetLayoutAndSize` calls as ONE conveyor group
@@ -5343,6 +5505,7 @@ impl PublishService {
                 for ((idx, lease), outcome) in idxs.into_iter().zip(leases).zip(outcomes) {
                     lease.complete(outcome.clone());
                     SERVED.fetch_add(1, Ordering::Relaxed);
+                    self.note_foreign_publish_served(outcome.is_ok());
                     out.push((idx, PublishCallOutcome::Done(outcome)));
                 }
                 (out, committed, split)
@@ -6270,7 +6433,7 @@ impl PublishService {
             ram_only_releases: Vec::new(),
             blob_custody: ScopedBlobCustody::default(),
         };
-        let Some(owner) = crate::data_grant::custody_owner() else {
+        let Some(owner) = self.custody_owner() else {
             return Ok(verbatim(shipped));
         };
         // Finding 35 (second half): the sticky range-episode predicate.

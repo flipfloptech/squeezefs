@@ -4194,8 +4194,10 @@ impl squeezefs::meta_ship::token_plane::RecallDataSink for ProbeSink {
 
 /// ONE daemon's listener: what the join ladder's rung 7 stands up on
 /// every writer — the S9 custody owner, the S8 meta service (shipped
-/// steps served on ITS backend), the token service over ITS holder
-/// planes; the manager verbs on the MANAGER's alone.
+/// steps AND record-level verbs served on ITS backend — PR 13b), the S9
+/// publish service judging by ITS custody owner (a shipped layout
+/// publish, PR 13b), the token service over ITS holder planes; the
+/// manager verbs on the MANAGER's alone.
 struct DaemonVenue {
     host: Arc<squeezefs::cluster_wire::RpcListener>,
     endpoint: String,
@@ -4207,6 +4209,7 @@ impl DaemonVenue {
         use squeezefs::data_grant::{AsyncVerbRouter, WriteCustodyOwner};
         use squeezefs::membership::{LeaseClock, LeaseClocks};
         use squeezefs::meta_ship::manager::ManagerSetService;
+        use squeezefs::meta_ship::publish::PublishService;
         use squeezefs::meta_ship::token_plane::TokenSetService;
         use squeezefs::meta_ship::MetaShipService;
         let clocks = LeaseClocks::with_params(
@@ -4227,6 +4230,10 @@ impl DaemonVenue {
         let mut router = AsyncVerbRouter::new()
             .with_custody(Arc::clone(&owner))
             .with_meta(MetaShipService::new(Arc::clone(routed)))
+            .with_publish(PublishService::with_custody_owner(
+                Arc::clone(routed),
+                Arc::clone(&owner),
+            ))
             .with_tokens(TokenSetService::with_custody_owner(
                 &routed.volumes,
                 Arc::clone(&owner),
@@ -4633,67 +4640,54 @@ async fn a_dead_joiners_half_applied_cross_owner_unlink_is_rolled_forward_at_the
     fsck_clean(&uris).await;
 }
 
-/// **Defect 32 (PR 13, FOUND-NOT-FIXED — the flip's first blocker, record
-/// §4.4z): a record-level mutation of a FOREIGN-slot file from a mount
-/// that does not lease its slot.** PR 13b's contract, stated RED here: the
-/// joiner's `setattr` of the MANAGER's file lands at the holder (the S8
-/// verb router + the S9 publish shipper re-keyed by SLOT HOLDER through
-/// `step_home`, the served side under the holder's lease recalling the
-/// object's tokens — design §5.10's row prices it at "1 custody grant + 1
-/// publish ship per layout publish"). All THREE faces of the §4.4z row
-/// (review round 2, Issue 27): the record-level verbs (`setattr`,
-/// `setxattr`), the DATA write (the layout publish — a joiner's
-/// `write` + `fsync` at the routed layer) and the read-back at the
-/// holder. Until that arm lands the armed plane answers the interim typed
-/// refusal (the next contract), so this pin is `#[ignore]`d; PR 13b
-/// un-ignores it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "PR 13b: the record-level ship to the slot holder (defect 32, record §4.4z) — un-ignore with it"]
-async fn a_joiners_setattr_of_the_managers_file_lands_at_the_holder() {
+/// The record-ship ledger (`meta_ship.record_*` / `foreign_publish_*`).
+fn record_ship_stats() -> squeezefs::meta_backend::record_ship::RecordShipStats {
+    squeezefs::meta_backend::record_ship::stats()
+}
+
+/// The two halves of PR 13b's in-process WRITER: PR 9's custody arm over
+/// `writer`'s set (the per-holder custody lease a shipped publish rides)
+/// and the S9 publish client (process-global, as on the mount path —
+/// `arm_authority_planes` installs it on every writer). The arm's identity
+/// is `writer`'s KD-MW-2 member id, the join's word at every holder.
+async fn arm_publish_writer(
+    writer: &Arc<RoutedMetaBackend>,
+    identity: &AppenderIdentity,
+) -> Arc<squeezefs::data_grant::SlotCustodyArm> {
+    let member = squeezefs::cowriter::node_member_id_of(identity.node_token, identity.mount_slot);
+    let sink = Arc::new(ProbeSink {
+        calls: std::sync::atomic::AtomicU64::new(0),
+    });
+    let arm = squeezefs::data_grant::arm_slot_custody(
+        writer,
+        &member,
+        VENUE_SECRET.to_vec(),
+        0,
+        Arc::new(move |_volume| {
+            Arc::clone(&sink) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
+        }),
+    );
+    squeezefs::meta_ship::publish::install_client(
+        squeezefs::meta_ship::publish::PublishClient::new(&member, VENUE_SECRET.to_vec()),
+    );
+    arm
+}
+
+async fn disarm_publish_writer() {
+    squeezefs::data_grant::disarm_slot_custody().await;
+    squeezefs::meta_ship::publish::uninstall_client();
+}
+
+/// The DATA face's layout: one striped 4 MiB block on the data volume the
+/// fixtures name, and its durable reference (the C8 ledger rides the same
+/// tx as the layout it justifies).
+fn striped_layout_for(
+    ino: u64,
+) -> (
+    Vec<u8>,
+    Vec<squeezefs::meta_backend::kv::block_refs::BlockRefOp>,
+) {
     use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
-    let dir = tempfile::tempdir().unwrap();
-    let _g = SEAM.lock().await;
-    reset_process_state();
-    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
-    let shared = dirs[0];
-    let manager = open_under(&uris, &Knobs::armed()).await;
-    let mvol = Arc::clone(&manager.volumes[0]);
-    let venue = HoldersVenue::stand_up(&manager, &[]).await;
-    let f = manager
-        .create(shared, "m", libc::S_IFREG | 0o644, 1000, 1000)
-        .await
-        .unwrap()
-        .ino;
-    mvol.checkpoint_now().await.unwrap();
-    let j = join(&uris, &venue, &mvol, 61).await;
-    j.setattr(
-        f,
-        Some(libc::S_IFREG | 0o600),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .expect("PR 13b: a foreign-slot file's setattr ships to its slot holder");
-    assert_eq!(
-        manager.getattr(f).await.unwrap().mode,
-        libc::S_IFREG | 0o600
-    );
-    // The xattr face.
-    j.setxattr(f, "user.pr13b", b"shipped")
-        .await
-        .expect("PR 13b: a foreign-slot file's setxattr ships to its slot holder");
-    assert_eq!(
-        manager.getxattr(f, "user.pr13b").await.unwrap().as_deref(),
-        Some(&b"shipped"[..]),
-        "the holder reads the shipped xattr"
-    );
-    // The DATA face: the joiner's write + fsync is a layout publish at the
-    // routed layer (one striped block, 4 MiB) — it lands at the holder and
-    // the holder's record reads the new size and layout.
     let tag = volume_tag("vol-00000000000000a7");
     let mut map = std::collections::HashMap::new();
     map.insert(0u32, "vol-00000000000000a7://0".to_string());
@@ -4704,19 +4698,188 @@ async fn a_joiners_setattr_of_the_managers_file_lands_at_the_holder() {
         ..Default::default()
     })
     .unwrap();
-    j.set_layout_and_size(
+    let refs = vec![BlockRefOp::taken(BlockRef {
+        vol_tag: tag,
+        block_idx: 0,
+        owner_ino: ino,
+        block_index: 0,
+    })];
+    (layout, refs)
+}
+
+/// **PR 13b — the record-level metanode ship (defect 32, PR 13's first
+/// flip blocker, record §4.4z; design §5.10's "`write` to a FOREIGN-owned
+/// file" row).** A JOINED appender mutates a file the MANAGER's slot holds
+/// — `setattr` (a `chmod`'s mode + ctime, a `chown`'s uid/gid + ctime, a
+/// `touch`'s mtime, a truncate's size), `setxattr` / `removexattr`, and the
+/// DATA face (the layout publish through the daemon's publish funnel,
+/// `meta_ship::publish::set_layout_and_size` — a `write` + `fsync` at the
+/// routed layer) — and every verb LANDS at the holder: shipped as the S8
+/// `MetaCall` it already is (`record_ship::ship_record_verb`) / the S9
+/// publish plane re-keyed by SLOT HOLDER with the per-holder custody lease
+/// PR 9's arm dialed (`publish_target`), applied under the holder's lease
+/// and door, its tokens recalled by the holder's commit. RED on the base
+/// (`5bd47813`): every verb answered PR 13's interim `EREMOTE`
+/// (`ForeignSlotFileMutation`). The write-intent OPEN passes (the write
+/// path ships); the ledger closes (`record_ships ≡ record_served`,
+/// `record_refusals == 0`, `foreign_publish_ships ≡
+/// foreign_publish_served`); the kernel's ctime-only times echo stays
+/// absorbed against the holder's record (never a wire trip for a no-op);
+/// an OWN file's verbs stay local (the ledger unmoved).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiners_setattr_of_the_managers_file_lands_at_the_holder() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mvenue = DaemonVenue::stand_up(&manager, true, "manager-custody-13b").await;
+    let f = manager
+        .create(shared, "m", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap()
+        .ino;
+    mvol.checkpoint_now().await.unwrap();
+    let j = {
+        Knobs::armed().apply();
+        let r = open_routed_meta_set_joined(
+            &uris,
+            &JoinedSetAdmission {
+                manager_endpoint: mvenue.endpoint.clone(),
+                secret: VENUE_SECRET.to_vec(),
+                peer_id: peer_of(&joiner_identity(&mvol, 61).await),
+                identity: joiner_identity(&mvol, 61).await,
+            },
+        )
+        .await;
+        Knobs::clear();
+        r.expect("the joined open")
+    };
+    let jvol = Arc::clone(&j.volumes[0]);
+    let jidentity = jvol.joined_wire().unwrap().identity;
+    // The joiner's step shipper — the ladder's rung 7 (keyed by its member
+    // id so the served verb's requester is known to the holder).
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(&j),
+            &peer_of(&jidentity),
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    let _arm = arm_publish_writer(&j, &jidentity).await;
+    let s0 = record_ship_stats();
+    let echoes0 = squeezefs::meta_backend::FOREIGN_FILE_TIMES_ECHO_ABSORBED.load(Relaxed);
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+
+    // chmod: mode + ctime (the writeback cache's `trust_local_cmtime`).
+    let got = j
+        .setattr(
+            f,
+            Some(libc::S_IFREG | 0o600),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(now_ns),
+        )
+        .await
+        .expect("PR 13b: a foreign-slot file's chmod ships to its slot holder");
+    assert_eq!(got.ino, f, "the reply names the global ino");
+    assert_eq!(got.mode, libc::S_IFREG | 0o600);
+    assert_eq!(
+        manager.getattr(f).await.unwrap().mode,
+        libc::S_IFREG | 0o600,
+        "the holder's record carries the mode"
+    );
+    // chown: uid/gid + ctime.
+    j.setattr(f, None, Some(0), Some(0), None, None, None, Some(now_ns))
+        .await
+        .expect("PR 13b: a foreign-slot file's chown ships");
+    let at_holder = manager.getattr(f).await.unwrap();
+    assert_eq!((at_holder.uid, at_holder.gid), (0, 0));
+    // touch: an mtime the record does not carry.
+    j.setattr(
         f,
-        &layout,
-        4 * 1024 * 1024,
-        &[BlockRefOp::taken(BlockRef {
-            vol_tag: tag,
-            block_idx: 0,
-            owner_ino: f,
-            block_index: 0,
-        })],
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(at_holder.mtime + 1_000_000_000),
+        Some(now_ns),
     )
     .await
-    .expect("PR 13b: a foreign-slot file's layout publish ships to its slot holder");
+    .expect("PR 13b: a foreign-slot file's touch ships");
+    assert_eq!(
+        manager.getattr(f).await.unwrap().mtime,
+        at_holder.mtime + 1_000_000_000
+    );
+    // truncate: a size.
+    j.setattr(f, None, None, None, Some(4096), None, None, Some(now_ns))
+        .await
+        .expect("PR 13b: a foreign-slot file's truncate ships");
+    assert_eq!(manager.getattr(f).await.unwrap().size, 4096);
+    // The xattr faces.
+    j.setxattr(f, "user.pr13b", b"shipped")
+        .await
+        .expect("PR 13b: a foreign-slot file's setxattr ships to its slot holder");
+    assert_eq!(
+        manager.getxattr(f, "user.pr13b").await.unwrap().as_deref(),
+        Some(&b"shipped"[..]),
+        "the holder reads the shipped xattr"
+    );
+    j.removexattr(f, "user.pr13b")
+        .await
+        .expect("PR 13b: a foreign-slot file's removexattr ships");
+    assert_eq!(manager.getxattr(f, "user.pr13b").await.unwrap(), None);
+    let s1 = record_ship_stats();
+    assert_eq!(
+        s1.record_ships - s0.record_ships,
+        6,
+        "six record-level verbs shipped"
+    );
+    assert_eq!(
+        s1.record_served - s0.record_served,
+        6,
+        "the holder applied every one (record_ships ≡ record_served)"
+    );
+    assert_eq!(s1.record_refusals, s0.record_refusals, "must stay 0");
+    assert_eq!(s1.record_unreachable, s0.record_unreachable);
+    assert_eq!(s1.record_ship_redirects, s0.record_ship_redirects);
+
+    // The write-intent OPEN passes: the holder is reachable, the write
+    // path ships its publish there (PR 13's interim gate refused here).
+    for flags in [
+        libc::O_WRONLY,
+        libc::O_RDWR,
+        libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT,
+        libc::O_RDWR | libc::O_TRUNC,
+    ] {
+        j.refuse_foreign_slot_open(f, flags as u32)
+            .await
+            .unwrap_or_else(|e| panic!("a write-intent open ({flags:#o}) passes: {e}"));
+    }
+    // The DATA face: the joiner's write + fsync is a layout publish
+    // through the daemon's publish funnel — shipped to the slot holder
+    // under the per-holder custody lease PR 9's arm dialed, applied under
+    // the holder's lease; the holder's record reads the new size and
+    // layout.
+    let (layout, refs) = striped_layout_for(f);
+    let verdict =
+        squeezefs::meta_ship::publish::set_layout_and_size(&j, f, &layout, 4 * 1024 * 1024, &refs)
+            .await
+            .expect("PR 13b: a foreign-slot file's layout publish ships to its slot holder");
+    assert!(
+        !verdict.recomputed,
+        "whole-file custody: the shipped layout applies verbatim"
+    );
     assert_eq!(
         manager.getattr(f).await.unwrap().size,
         4 * 1024 * 1024,
@@ -4730,149 +4893,20 @@ async fn a_joiners_setattr_of_the_managers_file_lands_at_the_holder() {
             .is_some_and(|l| l == layout),
         "the holder reads the published layout"
     );
-    shutdown(&j).await;
-    venue.tear_down();
-    shutdown(&manager).await;
-}
+    let s2 = record_ship_stats();
+    assert_eq!(s2.foreign_publish_ships - s0.foreign_publish_ships, 1);
+    assert_eq!(
+        s2.foreign_publish_served - s0.foreign_publish_served,
+        1,
+        "foreign_publish_ships ≡ foreign_publish_served"
+    );
+    // The joiner's own view is exact at its next resolve (the holder's
+    // commit recalled its token; the divert re-fetches).
+    assert_eq!(j.getattr(f).await.unwrap().size, 4 * 1024 * 1024);
 
-/// **PR 13 review round 1, Issue 12 — the INTERIM refusal of defect 32's
-/// class.** Before it a joiner's `chmod`/`touch` of the manager's file
-/// answered `ENOENT` (the local commit's miss in the projection — for a
-/// file that EXISTS), `setfattr` `EOPNOTSUPP` by accident, and `>>` ACKED
-/// bytes whose fsync publish the door then refused — bytes that vanished.
-/// Now every record-level verb on an object whose slot ANOTHER appender
-/// leases refuses LOUD, typed (`SqueezefsError::ForeignSlotFileMutation`,
-/// `EREMOTE` since fix round 2 — the `EOPNOTSUPP` this pin first asserted
-/// is what coreutils' `chmod`/`chown` swallow, §4.4ai, the next contract —
-/// naming PR 13b, the slot and its holder), BEFORE any read
-/// or write of the record: `setattr` / `setxattr` / `removexattr` at the
-/// routed trait entries, the layout publish at both publish entries (the
-/// FUSE write handler runs the same predicate before it accepts a byte),
-/// counted on `foreign_file_mutation_refusals`; the file still resolves
-/// (never `ENOENT`); an OWN file's verbs and an unarmed mount's are
-/// untouched (the gauge stays). The manager is judged by the same law
-/// for a joiner's file.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_foreign_slot_files_record_mutation_refuses_loud_naming_pr_13b_until_it_ships() {
-    use squeezefs::meta_backend::FOREIGN_FILE_MUTATION_REFUSALS;
-    use std::sync::atomic::Ordering::Relaxed;
-    let dir = tempfile::tempdir().unwrap();
-    let _g = SEAM.lock().await;
-    reset_process_state();
-    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
-    let shared = dirs[0];
-    let manager = open_under(&uris, &Knobs::armed()).await;
-    let mvol = Arc::clone(&manager.volumes[0]);
-    let venue = HoldersVenue::stand_up(&manager, &[]).await;
-    // The manager's file, durable before the join so the joiner's
-    // projection resolves it.
-    let f = manager
-        .create(shared, "m", libc::S_IFREG | 0o644, 1000, 1000)
-        .await
-        .unwrap()
-        .ino;
-    mvol.checkpoint_now().await.unwrap();
-    let j = join(&uris, &venue, &mvol, 62).await;
-    assert_eq!(
-        j.getattr(f)
-            .await
-            .expect("the file exists at the joiner")
-            .mode,
-        libc::S_IFREG | 0o644
-    );
-    let refusals0 = FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed);
-    let typed = |e: squeezefs::error::SqueezefsError, what: &str| {
-        assert!(
-            matches!(
-                e,
-                squeezefs::error::SqueezefsError::ForeignSlotFileMutation { .. }
-            ),
-            "{what}: the typed class, never ENOENT/EIO: {e:?}"
-        );
-        assert_eq!(e.to_errno(), libc::EREMOTE, "{what}");
-        let msg = e.to_string();
-        assert!(
-            msg.contains("PR 13b") && msg.contains("leases at g"),
-            "{what}: names the rung and the holder: {msg}"
-        );
-    };
-    typed(
-        j.setattr(
-            f,
-            Some(libc::S_IFREG | 0o600),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect_err("setattr of a foreign-slot file refuses"),
-        "setattr",
-    );
-    typed(
-        j.setxattr(f, "user.x", b"1")
-            .await
-            .expect_err("setxattr of a foreign-slot file refuses"),
-        "setxattr",
-    );
-    typed(
-        j.removexattr(f, "user.x")
-            .await
-            .expect_err("removexattr of a foreign-slot file refuses"),
-        "removexattr",
-    );
-    typed(
-        j.set_layout_and_size(f, b"never decoded", 4096, &[])
-            .await
-            .expect_err("a layout publish of a foreign-slot file refuses before it decodes"),
-        "layout publish",
-    );
-    // The OPEN face (review round 2, Issue 22): every write-intent open of
-    // the foreign-slot file refuses at the open — where the shell checks —
-    // a read-only open passes (uncounted).
-    for flags in [
-        libc::O_WRONLY,
-        libc::O_RDWR,
-        libc::O_WRONLY | libc::O_APPEND,
-        libc::O_RDWR | libc::O_TRUNC,
-        libc::O_WRONLY | libc::O_CREAT,
-    ] {
-        typed(
-            j.refuse_foreign_slot_open(f, flags as u32)
-                .expect_err("a write-intent open of a foreign-slot file refuses"),
-            &format!("open {flags:#o}"),
-        );
-    }
-    let opens0 = FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed);
-    j.refuse_foreign_slot_open(f, libc::O_RDONLY as u32)
-        .expect("a read-only open of a foreign-slot file passes");
-    j.refuse_foreign_slot_open(f, (libc::O_RDONLY | libc::O_NOATIME) as u32)
-        .expect("a read-only open with read flags passes");
-    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), opens0);
-    typed(
-        j.merge_layout_and_size(
-            f,
-            &squeezefs::layout_wire::LayoutDelta::default(),
-            bytes::Bytes::from_static(b"never decoded"),
-            4096,
-            Vec::new(),
-        )
-        .await
-        .expect_err("a delta publish of a foreign-slot file refuses before it decodes"),
-        "delta publish",
-    );
-    assert_eq!(
-        FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed),
-        refusals0 + 5 + 5,
-        "every refusal counted (the five verbs + the five write-intent opens)"
-    );
-    // The kernel's times ECHO (a read's `write_inode`: the mtime it got
-    // from us + a ctime, nothing else) is ABSORBED against the holder's
-    // record — answered, never refused, never counted as a mutation (the
-    // fix-round storm read 14 k foreign files per round at the manager).
-    let echoes0 = squeezefs::meta_backend::FOREIGN_FILE_TIMES_ECHO_ABSORBED.load(Relaxed);
+    // The kernel's ctime-only times ECHO stays absorbed against the
+    // holder's record — never shipped (the storm's oracle read 14 k per
+    // round).
     let cur = j.getattr(f).await.unwrap();
     let echoed = j
         .setattr(
@@ -4883,54 +4917,22 @@ async fn a_foreign_slot_files_record_mutation_refuses_loud_naming_pr_13b_until_i
             None,
             None,
             Some(cur.mtime),
-            Some(cur.ctime),
+            Some(now_ns),
         )
         .await
-        .expect("the kernel's times echo on a foreign-slot file is absorbed");
-    assert_eq!((echoed.mtime, echoed.ctime), (cur.mtime, cur.ctime));
+        .expect("the echo is absorbed");
+    assert_eq!(echoed.mtime, cur.mtime);
     assert_eq!(
         squeezefs::meta_backend::FOREIGN_FILE_TIMES_ECHO_ABSORBED.load(Relaxed),
         echoes0 + 1
     );
-    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 10);
-    // A `touch` (an mtime the record does not carry) is a real mutation —
-    // refused loud like the rest.
-    typed(
-        j.setattr(
-            f,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(cur.mtime + 1_000_000_000),
-            Some(cur.ctime),
-        )
-        .await
-        .expect_err("touch of a foreign-slot file refuses"),
-        "touch",
-    );
-    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 11);
-    // Nothing moved; the file still resolves — never ENOENT.
-    assert_eq!(j.getattr(f).await.unwrap().mode, libc::S_IFREG | 0o644);
     assert_eq!(
-        manager.getattr(f).await.unwrap().mode,
-        libc::S_IFREG | 0o644
+        record_ship_stats().record_ships,
+        s2.record_ships,
+        "no ship for a no-op"
     );
-    // The holder's own verb lands; the joiner's OWN file too — no count.
-    manager
-        .setattr(
-            f,
-            Some(libc::S_IFREG | 0o640),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect("the holder mutates its own record");
+
+    // An OWN file's verbs stay local — the ledger does not move.
     let own = j
         .create(1, "own", libc::S_IFREG | 0o644, 1000, 1000)
         .await
@@ -4947,66 +4949,40 @@ async fn a_foreign_slot_files_record_mutation_refuses_loud_naming_pr_13b_until_i
         None,
     )
     .await
-    .expect("an own-slot file's setattr lands");
+    .expect("an own-slot file's setattr lands locally");
     j.setxattr(own, "user.x", b"1")
         .await
-        .expect("an own-slot file's setxattr lands");
+        .expect("an own-slot file's setxattr lands locally");
     j.refuse_foreign_slot_open(own, (libc::O_RDWR | libc::O_APPEND) as u32)
+        .await
         .expect("an own-slot file's write-intent open passes");
-    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 11);
-    // The same law at the manager for the JOINER's file.
-    typed(
-        manager
-            .setattr(
-                own,
-                Some(libc::S_IFREG | 0o644),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .expect_err("the manager's setattr of a joiner-slot file refuses"),
-        "manager setattr",
-    );
-    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 12);
+    assert_eq!(record_ship_stats().record_ships, s2.record_ships);
+    assert_must_stay_zero(&jvol, "joiner");
+    assert_must_stay_zero(&mvol, "manager");
+
+    disarm_publish_writer().await;
+    squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
     shutdown(&j).await;
-    venue.tear_down();
+    drop(jvol);
+    drop(j);
+    mvenue.tear_down();
     shutdown(&manager).await;
+    // No offline fsck here: the DATA face's layout names a data volume this
+    // metadata-only fixture has no backend for (fsck's C2 reads it as a
+    // lost block by construction); the fleet leg is the data plane's row.
 }
 
-/// **PR 13 fix round 2, §4.4ai — the interim refusal's ERRNO is one no
-/// tool is entitled to swallow.** Found by the real-mount contract
-/// (fidelity `sym-join-ladder`, the N = 3 leg): a joiner's `chmod` of
-/// joiner 3's file exited **0 and printed nothing** while the daemon
-/// refused the `SETATTR` and the mode stayed 644 at all three daemons —
-/// `strace` read `fchmodat(...) = -1 EOPNOTSUPP`. coreutils ≥ 9.6
-/// (`src/chmod.c`: "treat not supported as not applied"; `chown-core.c`
-/// the same for `lchownat`) classifies `ENOTSUP`/`EOPNOTSUPP` from the
-/// mode/owner syscalls as NOT AN ERROR — the accommodation for
-/// `AT_SYMLINK_NOFOLLOW` on Linux — so the errno class round 1 chose for
-/// "not built yet on this path" was the ONE class the tools that reach
-/// this face are allowed to hide. The in-process pin before this one
-/// asserted the typed class and `EOPNOTSUPP` itself — its premise was
-/// too narrow: it never asked what the SYSCALL's caller does with the
-/// word. This pin's premise is the FUSE layer's shape (a `chmod` under
-/// the writeback cache is `FATTR_MODE | FATTR_CTIME` — mode + a ctime,
-/// `trust_local_cmtime`; a `chown` is uid/gid + ctime; a `>>` is the
-/// `O_WRONLY | O_APPEND | O_CREAT` open) and its law is the caller's:
-/// the errno is NEVER in gnulib's `is_ENOTSUP` set, never `ENOENT` (the
-/// file exists), never `EAGAIN` (nothing is transient about it until PR
-/// 13b), and the record is untouched at both daemons. `EREMOTE` ("Object
-/// is remote" — the record lives at another appender, the S8 service's
-/// own not-the-owner word) is what the daemon is saying.
+/// **PR 13b — the REVERSE direction, and the holder's dominance window
+/// fed by the served verb.** The MANAGER mutates a file the JOINER's slot
+/// holds: the record-level verbs ship to the joiner's listener (tree 0's
+/// lessee, the endpoint bound as the ladder binds it), the joiner applies
+/// them under ITS lease and ring, and the JOINER — the holder, the
+/// authority for the record — reads every one. The served verb is the
+/// requester's op for the slot's dominance window (§5.1.4 — the defect
+/// 9/13 law on this wire): `note_slot_ship` at the holder names the
+/// manager's appender id.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_chmods_setattr_shape_on_a_foreign_slot_file_refuses_with_an_errno_no_tool_swallows() {
-    use squeezefs::meta_backend::FOREIGN_FILE_MUTATION_REFUSALS;
-    use std::sync::atomic::Ordering::Relaxed;
-    // gnulib `is_ENOTSUP(err)`: `err == ENOTSUP || err == EOPNOTSUPP` —
-    // what coreutils' chmod/chown read as "not applied", rc 0, silent.
-    const SWALLOWED_BY_CHMOD: [i32; 2] = [libc::ENOTSUP, libc::EOPNOTSUPP];
+async fn a_managers_setattr_of_a_joiners_file_lands_at_the_joiner() {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
@@ -5014,52 +4990,211 @@ async fn a_chmods_setattr_shape_on_a_foreign_slot_file_refuses_with_an_errno_no_
     let shared = dirs[0];
     let manager = open_under(&uris, &Knobs::armed()).await;
     let mvol = Arc::clone(&manager.volumes[0]);
-    let venue = HoldersVenue::stand_up(&manager, &[]).await;
-    let f = manager
-        .create(shared, "m", libc::S_IFREG | 0o644, 1000, 1000)
+    let mvenue = DaemonVenue::stand_up(&manager, true, "manager-custody-13b-rev").await;
+    let j = {
+        Knobs::armed().apply();
+        let r = open_routed_meta_set_joined(
+            &uris,
+            &JoinedSetAdmission {
+                manager_endpoint: mvenue.endpoint.clone(),
+                secret: VENUE_SECRET.to_vec(),
+                peer_id: peer_of(&joiner_identity(&mvol, 62).await),
+                identity: joiner_identity(&mvol, 62).await,
+            },
+        )
+        .await;
+        Knobs::clear();
+        r.expect("the joined open")
+    };
+    let jvol = Arc::clone(&j.volumes[0]);
+    let jid = jvol.appender_stats().unwrap().appender_id;
+    let jvenue = DaemonVenue::stand_up(&j, false, "joiner-custody-13b-rev").await;
+    // The joiner's first touch takes the seeded slot; its file lives there.
+    let f = j
+        .create(shared, "jf", libc::S_IFREG | 0o644, 1000, 1000)
         .await
         .unwrap()
         .ino;
-    mvol.checkpoint_now().await.unwrap();
-    let j = join(&uris, &venue, &mvol, 62).await;
-    let cur = j.getattr(f).await.expect("the file exists at the joiner");
-    assert_eq!(cur.mode, libc::S_IFREG | 0o644);
-    let refusals0 = FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed);
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    assert!(
+        matches!(
+            tree0_state(&mvol, SLOT_A).await,
+            Some(SlotState::Leased { appender_id, .. }) if appender_id == jid
+        ),
+        "the joiner leases the slot"
+    );
+    // The bindings the ladders make: the manager dials the joiner where it
+    // serves (rung 7's census binding); the manager's step shipper carries
+    // its member id so the served verb's requester is known.
+    mvol.slot_leases()
         .unwrap()
-        .as_nanos() as u64;
-    let loud = |e: squeezefs::error::SqueezefsError, what: &str| {
+        .holders
+        .set_endpoint(jid, &jvenue.endpoint);
+    let midentity = read_directory(mvol.device_path(), mvol.superblock())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.appender_id == 0)
+        .and_then(|e| e.page)
+        .expect("the manager's page")
+        .identity;
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(&manager),
+            &peer_of(&midentity),
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    let s0 = record_ship_stats();
+    manager
+        .setattr(
+            f,
+            Some(libc::S_IFREG | 0o640),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("PR 13b: the manager's setattr of a joiner-slot file ships to the joiner");
+    manager
+        .setxattr(f, "user.from-manager", b"1")
+        .await
+        .expect("PR 13b: the manager's setxattr ships");
+    let at_holder = j.getattr(f).await.expect("the holder reads its record");
+    assert_eq!(at_holder.mode, libc::S_IFREG | 0o640);
+    assert_eq!(
+        j.getxattr(f, "user.from-manager").await.unwrap().as_deref(),
+        Some(&b"1"[..])
+    );
+    let s1 = record_ship_stats();
+    assert_eq!(s1.record_ships - s0.record_ships, 2);
+    assert_eq!(s1.record_served - s0.record_served, 2);
+    assert_eq!(s1.record_refusals, s0.record_refusals);
+    // The dominance window: the served verbs counted as the MANAGER's ops
+    // on the slot at the holder (the requester off the shipper's member id).
+    assert!(
+        jvol.slot_lease_stats().map_or(0, |s| s.ships) >= 2,
+        "the holder's window counts the manager's two ships (slot_ships)"
+    );
+    assert_must_stay_zero(&jvol, "joiner");
+    assert_must_stay_zero(&mvol, "manager");
+    squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
+    shutdown(&j).await;
+    drop(jvol);
+    drop(j);
+    jvenue.tear_down();
+    // The released slot's record is exact at the manager after the leave.
+    assert_eq!(
+        manager.getattr(f).await.unwrap().mode,
+        libc::S_IFREG | 0o640
+    );
+    mvenue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+/// **PR 13b — joiner → joiner (three daemons), and the ONE refusal the ship
+/// keeps: an UNREACHABLE holder.** Joiner 1 holds a file in its slot;
+/// joiner 2 knows no endpoint for joiner 1 (its ladder published none in
+/// this fixture — the shape of a joiner whose rung 7 has not run, or a
+/// dead member's until PR 10 re-leases its slots). Every record-level verb
+/// and the write-intent open answer the RETRYABLE class
+/// (`Retryable { HolderUnreachable }`, `EAGAIN` — never PR 13's `EREMOTE`,
+/// never `ENOENT`, and not in coreutils' `is_ENOTSUP` set), counted on
+/// `record_unreachable`; nothing moves at either daemon. Once joiner 1's
+/// endpoint is bound (the ladder's act) the SAME verbs land at joiner 1
+/// and joiner 1 reads them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_foreign_slot_verb_whose_holder_is_unreachable_refuses_retryable_then_lands_once_bound() {
+    use squeezefs::error::{RefusalClass, SqueezefsError};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mvenue = DaemonVenue::stand_up(&manager, true, "manager-custody-13b-3").await;
+    let j1 = {
+        Knobs::armed().apply();
+        let r = open_routed_meta_set_joined(
+            &uris,
+            &JoinedSetAdmission {
+                manager_endpoint: mvenue.endpoint.clone(),
+                secret: VENUE_SECRET.to_vec(),
+                peer_id: peer_of(&joiner_identity(&mvol, 63).await),
+                identity: joiner_identity(&mvol, 63).await,
+            },
+        )
+        .await;
+        Knobs::clear();
+        r.expect("the joined open")
+    };
+    let j1vol = Arc::clone(&j1.volumes[0]);
+    let j1id = j1vol.appender_stats().unwrap().appender_id;
+    let f = j1
+        .create(shared, "j1f", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap()
+        .ino;
+    j1vol.checkpoint_now().await.unwrap();
+    let j2 = {
+        Knobs::armed().apply();
+        let r = open_routed_meta_set_joined(
+            &uris,
+            &JoinedSetAdmission {
+                manager_endpoint: mvenue.endpoint.clone(),
+                secret: VENUE_SECRET.to_vec(),
+                peer_id: peer_of(&joiner_identity(&mvol, 64).await),
+                identity: joiner_identity(&mvol, 64).await,
+            },
+        )
+        .await;
+        Knobs::clear();
+        r.expect("the joined open")
+    };
+    let j2vol = Arc::clone(&j2.volumes[0]);
+    let j2identity = j2vol.joined_wire().unwrap().identity;
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(&j2),
+            &peer_of(&j2identity),
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    assert!(
+        j2vol
+            .slot_leases()
+            .unwrap()
+            .holders
+            .endpoint(j1id)
+            .is_none(),
+        "joiner 1 published no endpoint in this fixture"
+    );
+    let s0 = record_ship_stats();
+    let retryable = |e: SqueezefsError, what: &str| {
         assert!(
             matches!(
-                e,
-                squeezefs::error::SqueezefsError::ForeignSlotFileMutation { .. }
+                e.refusal_class(),
+                Some(RefusalClass::HolderUnreachable { holder }) if holder == j1id
             ),
-            "{what}: the typed class: {e:?}"
+            "{what}: the typed retryable class naming the holder: {e:?}"
         );
         let errno = e.to_errno();
-        assert!(
-            !SWALLOWED_BY_CHMOD.contains(&errno),
-            "{what}: errno {errno} is in coreutils' is_ENOTSUP set — chmod(1)/chown(1) \
-             exit 0 and print nothing on it (the real-mount contract's rc=0 '')"
-        );
+        assert_eq!(errno, libc::EAGAIN, "{what}: the retryable class");
+        assert_ne!(errno, libc::EREMOTE, "{what}: the interim word is retired");
         assert_ne!(errno, libc::ENOENT, "{what}: the file exists");
-        assert_ne!(
-            errno,
-            libc::EAGAIN,
-            "{what}: nothing is transient until PR 13b"
+        assert!(
+            ![libc::ENOTSUP, libc::EOPNOTSUPP].contains(&errno),
+            "{what}: coreutils' chmod/chown swallow is_ENOTSUP as 'not applied'"
         );
-        assert_eq!(
-            errno,
-            libc::EREMOTE,
-            "{what}: the record lives at another appender"
-        );
-        assert!(e.to_string().contains("PR 13b"), "{what}: names the rung");
     };
-    // chmod's SETATTR: FATTR_MODE | FATTR_CTIME (the writeback cache's
-    // `trust_local_cmtime` sends the ctime beside the mode).
-    loud(
-        j.setattr(
+    retryable(
+        j2.setattr(
             f,
             Some(libc::S_IFREG | 0o600),
             None,
@@ -5067,60 +5202,92 @@ async fn a_chmods_setattr_shape_on_a_foreign_slot_file_refuses_with_an_errno_no_
             None,
             None,
             None,
-            Some(now_ns),
+            None,
         )
         .await
-        .expect_err("chmod's mode + ctime on a foreign-slot file refuses"),
-        "chmod (mode + ctime)",
+        .expect_err("setattr toward an unreachable holder refuses retryable"),
+        "setattr",
     );
-    // chown's SETATTR: uid/gid + ctime.
-    loud(
-        j.setattr(f, None, Some(0), Some(0), None, None, None, Some(now_ns))
+    retryable(
+        j2.setxattr(f, "user.x", b"1")
             .await
-            .expect_err("chown's uid/gid + ctime on a foreign-slot file refuses"),
-        "chown (uid + gid + ctime)",
+            .expect_err("setxattr toward an unreachable holder refuses retryable"),
+        "setxattr",
     );
-    // The shell's `>>`: O_WRONLY | O_APPEND | O_CREAT at the open.
-    loud(
-        j.refuse_foreign_slot_open(f, (libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT) as u32)
-            .expect_err("the `>>` open of a foreign-slot file refuses"),
-        ">> (open O_WRONLY|O_APPEND|O_CREAT)",
+    retryable(
+        j2.removexattr(f, "user.x")
+            .await
+            .expect_err("removexattr toward an unreachable holder refuses retryable"),
+        "removexattr",
     );
-    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 3);
-    // The record is untouched at BOTH daemons — the refusal is the whole
-    // effect (the real mount read 644 at joiner 2, joiner 3 and the
-    // manager after the rc-0 chmod).
-    let after_j = j.getattr(f).await.unwrap();
-    let after_m = manager.getattr(f).await.unwrap();
-    assert_eq!(after_j.mode, libc::S_IFREG | 0o644);
-    assert_eq!(after_m.mode, libc::S_IFREG | 0o644);
-    assert_eq!((after_j.uid, after_j.gid), (1000, 1000));
-    assert_eq!((after_m.uid, after_m.gid), (1000, 1000));
-    assert_eq!(after_m.ctime, cur.ctime, "the holder's ctime never moved");
-    // The pure times ECHO stays absorbed (mode/uid/gid/size absent, the
-    // mtime the record carries) — the narrow absorb is what keeps the
-    // chmod shape a refusal.
-    let echoes0 = squeezefs::meta_backend::FOREIGN_FILE_TIMES_ECHO_ABSORBED.load(Relaxed);
-    j.setattr(
+    retryable(
+        j2.refuse_foreign_slot_open(f, libc::O_WRONLY as u32)
+            .await
+            .expect_err("a write-intent open toward an unreachable holder refuses retryable"),
+        "open for write",
+    );
+    j2.refuse_foreign_slot_open(f, libc::O_RDONLY as u32)
+        .await
+        .expect("a read-only open passes");
+    let s1 = record_ship_stats();
+    assert_eq!(s1.record_unreachable - s0.record_unreachable, 4);
+    assert_eq!(s1.record_ships, s0.record_ships, "nothing shipped");
+    assert_eq!(
+        j1.getattr(f).await.unwrap().mode,
+        libc::S_IFREG | 0o644,
+        "nothing moved at the holder"
+    );
+    // Joiner 1 stands up its listener and the binding lands (the ladder's
+    // act); the same verbs now travel and land.
+    let j1venue = DaemonVenue::stand_up(&j1, false, "joiner-1-custody-13b").await;
+    j2vol
+        .slot_leases()
+        .unwrap()
+        .holders
+        .set_endpoint(j1id, &j1venue.endpoint);
+    j2.setattr(
         f,
+        Some(libc::S_IFREG | 0o600),
         None,
         None,
         None,
         None,
         None,
-        Some(cur.mtime),
-        Some(now_ns),
+        None,
     )
     .await
-    .expect("the kernel's ctime-only echo is absorbed");
+    .expect("PR 13b: joiner 2's setattr of joiner 1's file lands at joiner 1");
+    j2.setxattr(f, "user.x", b"1")
+        .await
+        .expect("PR 13b: joiner 2's setxattr lands at joiner 1");
+    j2.refuse_foreign_slot_open(f, libc::O_WRONLY as u32)
+        .await
+        .expect("the write-intent open passes once the holder is reachable");
+    assert_eq!(j1.getattr(f).await.unwrap().mode, libc::S_IFREG | 0o600);
     assert_eq!(
-        squeezefs::meta_backend::FOREIGN_FILE_TIMES_ECHO_ABSORBED.load(Relaxed),
-        echoes0 + 1
+        j1.getxattr(f, "user.x").await.unwrap().as_deref(),
+        Some(&b"1"[..])
     );
-    assert_eq!(FOREIGN_FILE_MUTATION_REFUSALS.load(Relaxed), refusals0 + 3);
-    shutdown(&j).await;
-    venue.tear_down();
+    let s2 = record_ship_stats();
+    assert_eq!(s2.record_ships - s1.record_ships, 2);
+    assert_eq!(s2.record_served - s1.record_served, 2);
+    assert_eq!(s2.record_refusals, s0.record_refusals);
+    assert_must_stay_zero(&j1vol, "joiner 1");
+    assert_must_stay_zero(&j2vol, "joiner 2");
+    assert_must_stay_zero(&mvol, "manager");
+    squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
+    shutdown(&j2).await;
+    drop(j2vol);
+    drop(j2);
+    shutdown(&j1).await;
+    drop(j1vol);
+    drop(j1);
+    j1venue.tear_down();
+    mvenue.tear_down();
     shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
 }
 
 /// **PR 13 review round 1, Issue 13 — the roll-forward's LOCAL slot-moved

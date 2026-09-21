@@ -18,6 +18,12 @@ pub enum RefusalClass {
     /// does not lease: the initiator's holder view is stale — re-resolve
     /// through tree 0 and ship again (defect 11).
     StaleHolderView,
+    /// A record-level verb on an object whose slot appender `holder`
+    /// leases, from a mount that knows no endpoint for it (PR 13b — the
+    /// join ladder has not published one, or the holder is dead until
+    /// PR 10's recovery re-leases its slots): the ship cannot travel yet —
+    /// retry (`meta_backend::record_ship`).
+    HolderUnreachable { holder: u32 },
 }
 
 impl RefusalClass {
@@ -26,6 +32,7 @@ impl RefusalClass {
         match self {
             RefusalClass::SlotMoved { .. } => 1,
             RefusalClass::StaleHolderView => 2,
+            RefusalClass::HolderUnreachable { .. } => 3,
         }
     }
 
@@ -36,6 +43,7 @@ impl RefusalClass {
         match word {
             1 => Some(RefusalClass::SlotMoved { slot: 0, holder: 0 }),
             2 => Some(RefusalClass::StaleHolderView),
+            3 => Some(RefusalClass::HolderUnreachable { holder: 0 }),
             _ => None,
         }
     }
@@ -151,21 +159,6 @@ pub enum SqueezefsError {
     #[error("{msg}")]
     Retryable { class: RefusalClass, msg: String },
 
-    /// **A record-level mutation of an object whose forest slot ANOTHER
-    /// appender leases, from a mount that does not** (PR 13's flip blocker,
-    /// `.benchmarks/2026-09-19-sym-acceptance.md` §4.4z — a foreign-slot
-    /// FILE's `setattr` / `setxattr` / `removexattr` / data write): the arm
-    /// that ships the record-level verb to the slot holder under its lease
-    /// is PR 13b's. Until it lands the armed plane REFUSES the verb LOUD
-    /// here — `EREMOTE`, naming the rung (never `EOPNOTSUPP`: coreutils'
-    /// `chmod`/`chown` swallow it, §4.4ai) — never `ENOENT` for a file
-    /// that exists (the local commit's miss, before this class) and never
-    /// an acked write whose bytes vanish at its publish (the open-for-write
-    /// gate refuses before a byte is accepted). Unarmed mounts never
-    /// construct it. Gauge `foreign_file_mutation_refusals`.
-    #[error("{msg}")]
-    ForeignSlotFileMutation { msg: String },
-
     #[error("GPU Direct Storage error: {0}")]
     GdsError(String),
 
@@ -222,12 +215,6 @@ impl SqueezefsError {
         }
     }
 
-    /// The interim loud refusal of a foreign-slot record-level mutation —
-    /// see [`Self::ForeignSlotFileMutation`].
-    pub fn foreign_slot_file_mutation(msg: impl Into<String>) -> Self {
-        SqueezefsError::ForeignSlotFileMutation { msg: msg.into() }
-    }
-
     /// The refusal's class, if it is a classed retryable one.
     pub fn refusal_class(&self) -> Option<RefusalClass> {
         match self {
@@ -266,15 +253,6 @@ impl SqueezefsError {
             // (the cross-owner arm re-dispatches, the roll-forward
             // cadence completes the intent, the application retries).
             SqueezefsError::Retryable { .. } => libc::EAGAIN,
-            // "The record lives at another appender" is `EREMOTE` ("Object
-            // is remote" — the S8 service's own not-the-owner word); never
-            // `ENOENT` (the file exists), never `EIO` (nothing broke), never
-            // `EAGAIN` (nothing is transient until PR 13b ships it), and
-            // never `EOPNOTSUPP`: coreutils ≥ 9.6 `chmod`/`chown` read
-            // `ENOTSUP` from the mode/owner syscalls as "not applied" — rc 0,
-            // nothing printed (PR 13 §4.4ai: the real-mount `chmod` of a
-            // foreign-slot file exited 0 while the daemon refused it).
-            SqueezefsError::ForeignSlotFileMutation { .. } => libc::EREMOTE,
             SqueezefsError::WriterGuardFenced => libc::EIO,
             SqueezefsError::IndirectMapFormat { .. } => libc::EIO,
             // A fail-stopped lease reaching a data path is the same class

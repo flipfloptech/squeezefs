@@ -17408,6 +17408,22 @@ impl SqueezefsFilesystem {
                 })
             },
         ));
+        // The same face from a THIRD mount: a token this mount held on a
+        // FOREIGN object, recalled by its holder's commit — the attr cache
+        // and the kernel (a publish or a record verb alike: the recall
+        // does not say which, so the whole inode) invalidated; the
+        // router's layout entry is the recall sink's own (the dirty law).
+        let fs = self.clone();
+        let kernel = make_served_mutation_kernel_hook(
+            std::sync::Arc::clone(&self.kernel_notify),
+            std::sync::Arc::new(kernel_prune_capable),
+        );
+        crate::meta_backend::record_ship::install_recalled_object_sink(std::sync::Arc::new(
+            move |ino: u64| {
+                fs.attr_cache.invalidate(&ino);
+                kernel(ino, ServedMutation::Data);
+            },
+        ));
     }
 
     /// Drop a locally cached lease (e.g. after `FencingTokenExpired` or lock loss).

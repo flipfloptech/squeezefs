@@ -3818,6 +3818,11 @@ impl MountRecallSink {
                 RECALL_PURGE_DISCARD_SKIPPED.fetch_add(1, Ordering::Relaxed);
             }
         }
+        // The FUSE layer's view of the object (attr cache, kernel attrs +
+        // pages, the writeback-cache kernel's inode) — PR 13b: a THIRD
+        // mount that had read a foreign file kept the old bytes and mode
+        // after its holder's served publish / chmod recalled its token.
+        crate::meta_backend::record_ship::note_recalled_object(global);
         for k in &keys {
             self.router.cache.purge_block_key(k);
         }

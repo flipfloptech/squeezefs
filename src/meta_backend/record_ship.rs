@@ -400,3 +400,30 @@ pub async fn note_served_mutation(ino: Ino, kind: ServedMutation) {
         sink(ino, kind).await;
     }
 }
+
+/// The FUSE layer's hook for a RECALLED object (a token this mount held
+/// on a foreign object, recalled by its holder's commit): the daemon's
+/// attr cache and the kernel's view of the object (attrs + pages, and the
+/// writeback-cache kernel's inode) read the pre-commit words until told
+/// otherwise — the same face as a served mutation, seen from a third
+/// mount (the fidelity leg's manager read a joiner's append as the old 5
+/// bytes and the shipped `chmod` as the old mode for the inode's life).
+/// The router's layout entry is NOT this hook's: the recall sink drops it
+/// under the dirty law itself. Installed once per mount; absent in-process.
+pub type RecalledObjectSink = Arc<dyn Fn(Ino) + Send + Sync>;
+
+static RECALLED_OBJECT_SINK: Lazy<arc_swap::ArcSwapOption<RecalledObjectSink>> =
+    Lazy::new(arc_swap::ArcSwapOption::empty);
+
+/// Install the FUSE layer's recalled-object sink.
+pub fn install_recalled_object_sink(sink: RecalledObjectSink) {
+    RECALLED_OBJECT_SINK.store(Some(Arc::new(sink)));
+}
+
+/// Run the installed sink for a recalled object `ino` (GLOBAL); a no-op
+/// with none installed.
+pub fn note_recalled_object(ino: Ino) {
+    if let Some(sink) = RECALLED_OBJECT_SINK.load_full() {
+        sink(ino);
+    }
+}

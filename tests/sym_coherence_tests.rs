@@ -2207,6 +2207,15 @@ async fn a_recall_never_drops_the_writers_dirty_layout_entry() {
     };
     router.publish_layout_cache_entry(y, clean);
     let before = recall_purge_counts();
+    // The FUSE layer's recalled-object hook (the third-mount face: the
+    // fidelity leg's manager read a joiner's append as the old bytes and
+    // the shipped chmod as the old mode for the inode's life) fires per
+    // recalled object with its GLOBAL ino — dirty or clean alike.
+    let recalled: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let r = Arc::clone(&recalled);
+    squeezefs::meta_backend::record_ship::install_recalled_object_sink(Arc::new(move |ino| {
+        r.lock().unwrap_or_else(|p| p.into_inner()).push(ino);
+    }));
 
     // The holder commits on BOTH objects (the kernel's times echo shipped
     // as a Setattr is the fleet's shape) — the conflicting commit recalls
@@ -2254,6 +2263,15 @@ async fn a_recall_never_drops_the_writers_dirty_layout_entry() {
         1,
         "the kept dirty entry is counted (dlm_token_recall_dirty_kept)"
     );
+    let mut got = recalled.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    got.sort_unstable();
+    let mut want = vec![x, y];
+    want.sort_unstable();
+    assert_eq!(
+        got, want,
+        "the recalled-object hook fired once per recalled object with its global ino"
+    );
+    squeezefs::meta_backend::record_ship::install_recalled_object_sink(Arc::new(|_| {}));
     plane.stop().await;
     host.shutdown();
     shutdown(&writer).await;

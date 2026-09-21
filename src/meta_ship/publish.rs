@@ -5291,6 +5291,7 @@ impl PublishService {
         };
         let name = call.name();
         let is_extent = call.is_extent();
+        let served_ino = call.named_inos().first().copied().unwrap_or(0);
         let (slot, owns) = self.publish_dedup.slot((lease_epoch, request_id));
         if !owns {
             if is_extent {
@@ -5354,13 +5355,21 @@ impl PublishService {
             .await
             .clone();
         SERVED.fetch_add(1, Ordering::Relaxed);
+        log::debug!(
+            "S9 publish served {name} for ino {served_ino} (owns {owns}): {}",
+            match &outcome {
+                Ok(r) => format!("{r:?}"),
+                Err(e) => format!("Err({e:?})"),
+            }
+        );
         // `shipped ≡ served` is the engagement law: served counts the
         // WINNER's execution only (a replay is its own row).
         if is_extent && owns && outcome.is_ok() {
             EXTENT_SERVED.fetch_add(1, Ordering::Relaxed);
         }
         if !is_extent && owns {
-            self.note_foreign_publish_served(outcome.is_ok());
+            self.note_foreign_publish_served(served_ino, outcome.is_ok())
+                .await;
         }
         PublishCallOutcome::Done(outcome)
     }
@@ -5368,10 +5377,20 @@ impl PublishService {
     /// PR 13b's holder-side row: a layout-class publish served under the
     /// ARMED symmetric plane (every such serve is a peer's publish of an
     /// object in a slot this mount leases — no co-writer posture exists
-    /// beside the plane). Nothing on an unarmed set.
-    fn note_foreign_publish_served(&self, ok: bool) {
+    /// beside the plane) — counted, and the holder's OWN caches of the
+    /// object invalidated (`record_ship::note_served_mutation`: the
+    /// router's RAM entry and the kernel's attrs + pages — the served
+    /// publish landed below both). Nothing on an unarmed set.
+    async fn note_foreign_publish_served(&self, ino: u64, ok: bool) {
         if ok && self.inner.volumes.iter().any(|v| v.slot_lease_armed()) {
             crate::meta_backend::record_ship::note_publish_served();
+            if ino != 0 {
+                crate::meta_backend::record_ship::note_served_mutation(
+                    ino,
+                    crate::meta_backend::record_ship::ServedMutation::Data,
+                )
+                .await;
+            }
         }
     }
 
@@ -5486,9 +5505,11 @@ impl PublishService {
         let mut idxs = Vec::with_capacity(members.len());
         let mut leases = Vec::with_capacity(members.len());
         let mut work = Vec::with_capacity(members.len());
+        let mut group_inos = Vec::with_capacity(members.len());
         for m in members {
             idxs.push(m.idx);
             leases.push(m.lease);
+            group_inos.push(m.call.named_inos().first().copied().unwrap_or(0));
             work.push(m.call);
         }
         let client = client.to_string();
@@ -5502,10 +5523,12 @@ impl PublishService {
                 committed,
                 split,
             }) => {
-                for ((idx, lease), outcome) in idxs.into_iter().zip(leases).zip(outcomes) {
+                for (((idx, lease), outcome), ino) in
+                    idxs.into_iter().zip(leases).zip(outcomes).zip(group_inos)
+                {
                     lease.complete(outcome.clone());
                     SERVED.fetch_add(1, Ordering::Relaxed);
-                    self.note_foreign_publish_served(outcome.is_ok());
+                    self.note_foreign_publish_served(ino, outcome.is_ok()).await;
                     out.push((idx, PublishCallOutcome::Done(outcome)));
                 }
                 (out, committed, split)

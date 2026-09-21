@@ -4728,6 +4728,7 @@ fn striped_layout_for(
 /// an OWN file's verbs stay local (the ledger unmoved).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_joiners_setattr_of_the_managers_file_lands_at_the_holder() {
+    use squeezefs::meta_backend::record_ship::ServedMutation;
     use std::sync::atomic::Ordering::Relaxed;
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
@@ -4770,6 +4771,24 @@ async fn a_joiners_setattr_of_the_managers_file_lands_at_the_holder() {
         ),
     );
     let _arm = arm_publish_writer(&j, &jidentity).await;
+    // The HOLDER's served-mutation sink (the FUSE layer's hook — the
+    // `sym-foreign-file` leg's first run read the holder's colleague's
+    // append as the old bytes for the mount's life: the served verb lands
+    // at the KV below the daemon's own caches): every served record verb
+    // and every served publish names the object and its scope here.
+    let served_sink: Arc<std::sync::Mutex<Vec<(u64, ServedMutation)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let seen = Arc::clone(&served_sink);
+        squeezefs::meta_backend::record_ship::install_served_mutation_sink(Arc::new(
+            move |ino, kind| {
+                let seen = Arc::clone(&seen);
+                Box::pin(async move {
+                    seen.lock().unwrap().push((ino, kind));
+                })
+            },
+        ));
+    }
     let s0 = record_ship_stats();
     let echoes0 = squeezefs::meta_backend::FOREIGN_FILE_TIMES_ECHO_ABSORBED.load(Relaxed);
     let now_ns = std::time::SystemTime::now()
@@ -4853,6 +4872,11 @@ async fn a_joiners_setattr_of_the_managers_file_lands_at_the_holder() {
     assert_eq!(s1.record_refusals, s0.record_refusals, "must stay 0");
     assert_eq!(s1.record_unreachable, s0.record_unreachable);
     assert_eq!(s1.record_ship_redirects, s0.record_ship_redirects);
+    assert_eq!(
+        served_sink.lock().unwrap().as_slice(),
+        &[(f, ServedMutation::Attrs); 6][..],
+        "the holder's sink saw six attrs-class served mutations of the object"
+    );
 
     // The write-intent OPEN passes: the holder is reachable, the write
     // path ships its publish there (PR 13's interim gate refused here).
@@ -4900,9 +4924,41 @@ async fn a_joiners_setattr_of_the_managers_file_lands_at_the_holder() {
         1,
         "foreign_publish_ships ≡ foreign_publish_served"
     );
+    assert_eq!(
+        served_sink.lock().unwrap().last().copied(),
+        Some((f, ServedMutation::Data)),
+        "the holder's sink saw the served publish as a DATA-class mutation of the object"
+    );
     // The joiner's own view is exact at its next resolve (the holder's
     // commit recalled its token; the divert re-fetches).
     assert_eq!(j.getattr(f).await.unwrap().size, 4 * 1024 * 1024);
+    // The INLINE face (the fleet's small-file shape — an append of a
+    // ≤ 4 KiB file is a layout publish whose record IS the payload): the
+    // holder's size and its inline record follow the shipped words.
+    let inline = bincode::serialize(&squeezefs::layout_wire::LayoutMetadata {
+        file_type: "inline".into(),
+        size: 7,
+        data_key: Some(b"abcDEFG".to_vec()),
+        ..Default::default()
+    })
+    .unwrap();
+    squeezefs::meta_ship::publish::set_layout_and_size(&j, f, &inline, 7, &[])
+        .await
+        .expect("PR 13b: an inline layout publish ships to its slot holder");
+    assert_eq!(
+        manager.getattr(f).await.unwrap().size,
+        7,
+        "the holder reads the inline publish's size"
+    );
+    assert!(
+        manager
+            .getxattr(f, "layout")
+            .await
+            .unwrap()
+            .is_some_and(|l| l == inline),
+        "the holder reads the inline record"
+    );
+    assert_eq!(j.getattr(f).await.unwrap().size, 7);
 
     // The kernel's ctime-only times ECHO stays absorbed against the
     // holder's record — never shipped (the storm's oracle read 14 k per

@@ -503,6 +503,15 @@ pub enum fuse_notify_code {
 
     /// notify kernel that a directory entry has been deleted
     FUSE_NOTIFY_DELETE = 6,
+
+    /// ask the kernel to drop the unreferenced dentry aliases of the named
+    /// inodes (uapi 7.45, `fuse_try_prune_one_inode` → `d_prune_aliases`)
+    /// — under `generic_delete_inode` an inode nobody holds open is then
+    /// evicted and its next lookup re-instantiates it from the daemon's
+    /// attrs, the ONE way a kernel running FUSE_WRITEBACK_CACHE (which owns
+    /// a cached regular inode's size/mtime/ctime for its life) adopts a
+    /// size another mount changed
+    FUSE_NOTIFY_PRUNE = 9,
 }
 
 impl TryFrom<u32> for fuse_notify_code {
@@ -521,6 +530,8 @@ impl TryFrom<u32> for fuse_notify_code {
             5 => Ok(fuse_notify_code::FUSE_NOTIFY_RETRIEVE),
 
             6 => Ok(fuse_notify_code::FUSE_NOTIFY_DELETE),
+
+            9 => Ok(fuse_notify_code::FUSE_NOTIFY_PRUNE),
 
             invalid_code => Err(InvalidNotifyCodeError(invalid_code)),
         }
@@ -1077,6 +1088,18 @@ pub struct fuse_notify_delete_out {
     pub child: u64,
     pub namelen: u32,
     pub(crate) _padding: u32,
+}
+
+pub const FUSE_NOTIFY_PRUNE_OUT_SIZE: usize = mem::size_of::<fuse_notify_prune_out>();
+
+/// `struct fuse_notify_prune_out` (uapi 7.45): `count` nodeids follow it
+/// in the same frame.
+#[derive(Debug, Serialize)]
+#[allow(non_camel_case_types)]
+pub struct fuse_notify_prune_out {
+    pub count: u32,
+    pub(crate) _padding: u32,
+    pub(crate) _spare: u64,
 }
 
 pub const FUSE_NOTIFY_STORE_OUT_SIZE: usize = mem::size_of::<fuse_notify_store_out>();

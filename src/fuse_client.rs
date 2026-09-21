@@ -17373,6 +17373,43 @@ impl SqueezefsFilesystem {
         });
     }
 
+    /// **Install the record-level metanode ship's holder-side sink** (PR
+    /// 13b; the armed symmetric plane's mount arm): a colleague's
+    /// `setattr` / `setxattr` / layout publish of a file in a slot THIS
+    /// mount leases lands at the KV below the daemon's own caches, so the
+    /// router's RAM metadata entry and the kernel's attr / page cache read
+    /// the pre-mutation words for the mount's life (the `sym-foreign-file`
+    /// leg's first run: the holder read its colleague's append as the old 8
+    /// bytes while every other mount read the new 14). The sink drops the
+    /// router's entry (the own-mint reclaim funnel — a stale entry's blob
+    /// knowledge is reclaimed, never orphaned) and runs the kernel hook
+    /// ([`make_served_mutation_kernel_hook`]).
+    pub fn install_served_mutation_sink(&self) {
+        use crate::meta_backend::record_ship::ServedMutation;
+        let fs = self.clone();
+        let kernel = make_served_mutation_kernel_hook(
+            std::sync::Arc::clone(&self.kernel_notify),
+            std::sync::Arc::new(kernel_prune_capable),
+        );
+        crate::meta_backend::record_ship::install_served_mutation_sink(std::sync::Arc::new(
+            move |ino: u64, kind: ServedMutation| {
+                let fs = fs.clone();
+                let kernel = std::sync::Arc::clone(&kernel);
+                Box::pin(async move {
+                    // The attr cache's merge law keeps the CACHED size and
+                    // the newer times over a refetch (an acked local write
+                    // legally leads the durable record) — a served truncate
+                    // or a backwards `touch` can never win a merge, so the
+                    // entry goes whole; the next getattr refetches onto an
+                    // empty slot.
+                    fs.attr_cache.invalidate(&ino);
+                    fs.router.discard_layout_cache(ino);
+                    kernel(ino, kind);
+                })
+            },
+        ));
+    }
+
     /// Drop a locally cached lease (e.g. after `FencingTokenExpired` or lock loss).
     pub fn invalidate_local_lease(&self, ino: u64) {
         if let Some((_, lease)) = self.active_leases.remove(&ino) {
@@ -30989,6 +31026,81 @@ pub fn resolve_interception_posture(
         interception,
         write_back,
     })
+}
+
+/// **The HOLDER's kernel after a served mutation** (symmetric PR 13b —
+/// `tests/served_mutation_kernel_tests.rs`): the invalidation frame first
+/// — attrs-only (`off < 0`) for a record verb, attrs + every page
+/// (`(0, 0)`, to EOF) for a layout publish — then, where
+/// `prune_capable()`, `FUSE_NOTIFY_PRUNE` of the ino. The prune is what
+/// makes a `FUSE_WRITEBACK_CACHE` kernel adopt a PEER mount's size /
+/// mtime / ctime: `fuse_get_cache_mask` makes those the kernel's for a
+/// cached regular inode's life (every attr reply's size is replaced by
+/// `i_size_read`), and `fuse_reverse_inval_inode` never moves `i_size` —
+/// the `sym-foreign-file` leg's holder read a colleague's inline append as
+/// the old 3 bytes until `drop_caches`. `d_prune_aliases` drops the
+/// UNREFERENCED dentries, `generic_delete_inode` evicts the inode, and its
+/// next lookup re-instantiates it from the daemon's attrs. An inode a
+/// process holds OPEN at the holder is the stated residual: the prune
+/// cannot evict it, the invalidation drops its pages, and the kernel keeps
+/// its size / times until the last close (every FUSE writeback-cache
+/// filesystem's foreign-writer law). The invalidation travels FIRST so the
+/// residual's pages are dropped whether or not the prune lands.
+///
+/// Both frames ride the fork's detached forms — the
+/// [`crate::ipc_service::make_inval_hook`] venue law: no task, no runtime,
+/// one `unbounded_send` each from the serving thread.
+pub fn make_served_mutation_kernel_hook(
+    cell: std::sync::Arc<arc_swap::ArcSwap<Option<fuse3::notify::Notify>>>,
+    prune_capable: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+) -> std::sync::Arc<dyn Fn(u64, crate::meta_backend::record_ship::ServedMutation) + Send + Sync> {
+    use crate::meta_backend::record_ship::ServedMutation;
+    std::sync::Arc::new(move |ino, kind| {
+        if let Some(notify) = cell.load().as_ref() {
+            let (off, len) = match kind {
+                ServedMutation::Attrs => (-1, 0),
+                ServedMutation::Data => (0, 0),
+            };
+            notify.invalid_inode_detached(ino, off, len);
+            let prune = prune_capable();
+            if prune {
+                notify.prune_detached(&[ino]);
+            }
+            crate::meta_backend::record_ship::note_served_mutation_inval(prune);
+        }
+    })
+}
+
+/// Whether the served-mutation hook prunes: the kernel speaks uapi ≥ 7.45
+/// (`FUSE_NOTIFY_PRUNE`) AND this mount negotiated the writeback cache
+/// (without it the invalidation alone re-syncs size and times at the next
+/// GETATTR). A writeback mount on an older kernel is announced ONCE — the
+/// loud degrade: a colleague's mutation of a file this kernel has cached
+/// reads at the kernel's size / times until the inode is evicted.
+pub fn kernel_prune_capable() -> bool {
+    static DEGRADE_ANNOUNCED: std::sync::Once = std::sync::Once::new();
+    let writeback = fuse3::raw::negotiated_reply_flags()
+        .is_some_and(|f| f & fuse3::raw::abi::FUSE_WRITEBACK_CACHE != 0);
+    if !writeback {
+        return false;
+    }
+    let prune = fuse3::raw::kernel_init_info()
+        .is_some_and(|k| k.major > 7 || (k.major == 7 && k.minor >= 45));
+    if !prune {
+        DEGRADE_ANNOUNCED.call_once(|| {
+            warn!(
+                "symmetric PR 13b: this kernel speaks FUSE {} — below uapi 7.45, so \
+                 FUSE_NOTIFY_PRUNE is unavailable and a colleague's served mutation of a \
+                 file this writeback-cache kernel has cached reads at the kernel's size / \
+                 times until the inode is evicted (re-lookup after `echo 2 > \
+                 /proc/sys/vm/drop_caches`, or mount `--no-writeback`)",
+                fuse3::raw::kernel_init_info()
+                    .map(|k| format!("{}.{}", k.major, k.minor))
+                    .unwrap_or_else(|| "?".to_string())
+            );
+        });
+    }
+    prune
 }
 
 /// Start FUSE mount daemon using fuse3.

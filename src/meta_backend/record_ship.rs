@@ -60,6 +60,16 @@ static RECORD_UNREACHABLE: AtomicU64 = AtomicU64::new(0);
 static FOREIGN_PUBLISH_SHIPS: AtomicU64 = AtomicU64::new(0);
 /// Layout publishes this holder SERVED for a peer under the armed plane.
 static FOREIGN_PUBLISH_SERVED: AtomicU64 = AtomicU64::new(0);
+/// Served mutations for which this HOLDER's FUSE layer invalidated its
+/// own view of the object — the router's RAM entry, the kernel's attrs
+/// (and pages for a publish) — over the classical sideband
+/// (`served_mutation_invals`; ≡ the served verbs + publishes on a
+/// mounted holder, 0 in-process).
+static SERVED_MUTATION_INVALS: AtomicU64 = AtomicU64::new(0);
+/// Of those, the `FUSE_NOTIFY_PRUNE` pushes — a writeback-cache kernel
+/// (uapi ≥ 7.45) told to evict the unreferenced inode so its next lookup
+/// adopts the served size / times (`served_mutation_prunes`).
+static SERVED_MUTATION_PRUNES: AtomicU64 = AtomicU64::new(0);
 
 /// Phases of one shipped record-level verb (`record_ship_phase_ns`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +105,8 @@ pub struct RecordShipStats {
     pub record_unreachable: u64,
     pub foreign_publish_ships: u64,
     pub foreign_publish_served: u64,
+    pub served_mutation_invals: u64,
+    pub served_mutation_prunes: u64,
 }
 
 /// Read the family.
@@ -107,6 +119,17 @@ pub fn stats() -> RecordShipStats {
         record_unreachable: RECORD_UNREACHABLE.load(Ordering::Relaxed),
         foreign_publish_ships: FOREIGN_PUBLISH_SHIPS.load(Ordering::Relaxed),
         foreign_publish_served: FOREIGN_PUBLISH_SERVED.load(Ordering::Relaxed),
+        served_mutation_invals: SERVED_MUTATION_INVALS.load(Ordering::Relaxed),
+        served_mutation_prunes: SERVED_MUTATION_PRUNES.load(Ordering::Relaxed),
+    }
+}
+
+/// Count one kernel invalidation pushed for a served mutation, and
+/// whether a prune rode with it.
+pub fn note_served_mutation_inval(pruned: bool) {
+    SERVED_MUTATION_INVALS.fetch_add(1, Ordering::Relaxed);
+    if pruned {
+        SERVED_MUTATION_PRUNES.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -128,6 +151,14 @@ pub fn stats_into(out: &mut serde_json::Map<String, serde_json::Value>) {
     out.insert(
         "foreign_publish_served".into(),
         s.foreign_publish_served.into(),
+    );
+    out.insert(
+        "served_mutation_invals".into(),
+        s.served_mutation_invals.into(),
+    );
+    out.insert(
+        "served_mutation_prunes".into(),
+        s.served_mutation_prunes.into(),
     );
 }
 
@@ -305,6 +336,7 @@ pub async fn note_served(
             return;
         }
     };
+    note_served_mutation(ino, ServedMutation::Attrs).await;
     let Some(client) = crate::meta_ship::current_ship_client() else {
         return;
     };
@@ -320,4 +352,51 @@ pub async fn note_served(
     let slot = super::kv::record::forest_slot_of_ino(local);
     let ship_ns = u64::try_from(served_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let _ = vol.note_slot_ship(slot, requester, ship_ns).await;
+}
+
+// ---------------------------------------------------------------------------
+// The holder's OWN caches after a served mutation.
+// ---------------------------------------------------------------------------
+
+/// What a served record-level verb changed at the holder — the FUSE
+/// layer's invalidation scope (an attrs-only kernel invalidation for a
+/// record verb; pages too for a layout publish that changed the bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServedMutation {
+    /// `setattr` / `setxattr` / `removexattr`: the inode record and its
+    /// xattrs.
+    Attrs,
+    /// A layout publish: the file's size and bytes.
+    Data,
+}
+
+/// The FUSE layer's hook: a served mutation of `ino` applied at THIS
+/// mount's KV below the daemon's own caches — the router's RAM metadata
+/// entry and the kernel's attr / page cache read the pre-mutation words
+/// until told otherwise (the `sym-foreign-file` leg's first run: the
+/// holder read its colleague's append as the old 8 bytes for the mount's
+/// life while every other mount read the new 14). Installed once per
+/// mount by `SqueezefsFilesystem`; absent on the in-process fixtures,
+/// whose reads go to the KV directly.
+pub type ServedMutationSink = Arc<
+    dyn Fn(Ino, ServedMutation) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+static SERVED_MUTATION_SINK: Lazy<arc_swap::ArcSwapOption<ServedMutationSink>> =
+    Lazy::new(arc_swap::ArcSwapOption::empty);
+
+/// Install the FUSE layer's served-mutation sink (one per process — the
+/// mount's).
+pub fn install_served_mutation_sink(sink: ServedMutationSink) {
+    SERVED_MUTATION_SINK.store(Some(Arc::new(sink)));
+}
+
+/// Run the installed sink for a served mutation of `ino`; a no-op with
+/// none installed.
+pub async fn note_served_mutation(ino: Ino, kind: ServedMutation) {
+    if let Some(sink) = SERVED_MUTATION_SINK.load_full() {
+        sink(ino, kind).await;
+    }
 }

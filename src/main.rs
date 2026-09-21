@@ -7158,6 +7158,13 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if multi_writer_arm.is_some() {
                 fs_engine.install_extent_assembler();
             }
+            // Symmetric PR 13b: a colleague's served record verb / layout
+            // publish of a file in a slot THIS mount leases invalidates
+            // this daemon's own caches of the object (the router's RAM
+            // entry, the kernel's attrs and pages). Inert unarmed.
+            if joined_mount || symmetric_set {
+                fs_engine.install_served_mutation_sink();
+            }
 
             // Symmetric metadata PR 10 (design-symmetric-metadata §5.9,
             // §5.8.5 C14/C15): BEFORE the set serves — and before the

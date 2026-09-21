@@ -10,11 +10,11 @@ use futures_util::future::Either;
 use crate::helper::get_bincode_config;
 use crate::raw::abi::{
     fuse_notify_code, fuse_notify_delete_out, fuse_notify_inval_entry_out,
-    fuse_notify_inval_inode_out, fuse_notify_poll_wakeup_out, fuse_notify_retrieve_out,
-    fuse_notify_store_out, fuse_out_header, FUSE_NOTIFY_DELETE_OUT_SIZE,
+    fuse_notify_inval_inode_out, fuse_notify_poll_wakeup_out, fuse_notify_prune_out,
+    fuse_notify_retrieve_out, fuse_notify_store_out, fuse_out_header, FUSE_NOTIFY_DELETE_OUT_SIZE,
     FUSE_NOTIFY_INVAL_ENTRY_OUT_SIZE, FUSE_NOTIFY_INVAL_INODE_OUT_SIZE,
-    FUSE_NOTIFY_POLL_WAKEUP_OUT_SIZE, FUSE_NOTIFY_RETRIEVE_OUT_SIZE, FUSE_NOTIFY_STORE_OUT_SIZE,
-    FUSE_OUT_HEADER_SIZE,
+    FUSE_NOTIFY_POLL_WAKEUP_OUT_SIZE, FUSE_NOTIFY_PRUNE_OUT_SIZE, FUSE_NOTIFY_RETRIEVE_OUT_SIZE,
+    FUSE_NOTIFY_STORE_OUT_SIZE, FUSE_OUT_HEADER_SIZE,
 };
 use crate::raw::session::ReplyTx;
 
@@ -48,6 +48,39 @@ pub fn inval_inode_frame(inode: u64, offset: i64, len: i64) -> Vec<u8> {
     get_bincode_config()
         .serialize_into(&mut data, &invalid_inode_out)
         .expect("vec size is not enough");
+    data
+}
+
+/// Serialized `FUSE_NOTIFY_PRUNE` frame (uapi 7.45): the out header —
+/// `len` covering the nodeid array too, since `fuse_dev_do_write` refuses
+/// `oh.len != nbytes` — `fuse_notify_prune_out { count }`, then the
+/// nodeids verbatim (`fuse_notify_prune` reads exactly `count × 8` bytes
+/// past the struct). ONE encoder for both enqueue forms
+/// ([`Notify::prune`] / [`Notify::prune_detached`]), the
+/// [`inval_inode_frame`] no-drift law.
+#[doc(hidden)]
+pub fn prune_frame(inodes: &[u64]) -> Vec<u8> {
+    let len = FUSE_OUT_HEADER_SIZE + FUSE_NOTIFY_PRUNE_OUT_SIZE + inodes.len() * 8;
+    let out_header = fuse_out_header {
+        len: len as u32,
+        error: fuse_notify_code::FUSE_NOTIFY_PRUNE as i32,
+        unique: 0,
+    };
+    let prune_out = fuse_notify_prune_out {
+        count: inodes.len() as u32,
+        _padding: 0,
+        _spare: 0,
+    };
+    let mut data = Vec::with_capacity(len);
+    get_bincode_config()
+        .serialize_into(&mut data, &out_header)
+        .expect("vec size is not enough");
+    get_bincode_config()
+        .serialize_into(&mut data, &prune_out)
+        .expect("vec size is not enough");
+    for ino in inodes {
+        data.extend_from_slice(&ino.to_le_bytes());
+    }
     data
 }
 
@@ -96,6 +129,8 @@ impl Notify {
                 // path (generic/451) — see `inval_inode_frame`.
                 Either::Left(inval_inode_frame(*inode, *offset, *len))
             }
+
+            NotifyKind::Prune { inodes } => Either::Left(prune_frame(inodes)),
 
             NotifyKind::InvalidEntry { parent, name } => {
                 let out_header = fuse_out_header {
@@ -258,6 +293,24 @@ impl Notify {
             .send_detached(Either::Left(inval_inode_frame(inode, offset, len)));
     }
 
+    /// Ask the kernel to prune the unreferenced dentry aliases of
+    /// `inodes` (`FUSE_NOTIFY_PRUNE`, uapi 7.45 — a kernel below it
+    /// answers the device write `EINVAL`, which the reply task logs;
+    /// callers gate on the negotiated minor). An inode nobody holds open
+    /// is evicted and re-instantiated from the daemon's attrs at its next
+    /// lookup — how a FUSE_WRITEBACK_CACHE kernel, which owns a cached
+    /// regular inode's size/mtime/ctime, adopts a peer mount's change.
+    pub async fn prune(mut self, inodes: Vec<u64>) {
+        let _ = self.notify(NotifyKind::Prune { inodes }).await;
+    }
+
+    /// Synchronous fire-and-forget form of [`Notify::prune`] — the
+    /// [`Notify::invalid_inode_detached`] venue law (no task, no runtime;
+    /// one `unbounded_send` of the ONE shared encoding).
+    pub fn prune_detached(&self, inodes: &[u64]) {
+        self.sender.send_detached(Either::Left(prune_frame(inodes)));
+    }
+
     /// try to notify the invalidation about a directory entry.
     pub async fn invalid_entry(mut self, parent: u64, name: OsString) {
         let _ = self.notify(NotifyKind::InvalidEntry { parent, name }).await;
@@ -307,6 +360,9 @@ enum NotifyKind {
     // TODO need check is right or not
     /// notify the cache invalidation about an inode.
     InvalidInode { inode: u64, offset: i64, len: i64 },
+
+    /// prune the unreferenced dentry aliases of these inodes (uapi 7.45).
+    Prune { inodes: Vec<u64> },
 
     /// notify the invalidation about a directory entry.
     InvalidEntry { parent: u64, name: OsString },
@@ -414,5 +470,52 @@ mod tests {
         let asynchronous = rx2.try_next_frame().expect("async frame");
 
         assert_eq!(detached, asynchronous, "ONE shared encoding, two forms");
+    }
+
+    /// `FUSE_NOTIFY_PRUNE` (uapi 7.45): ONE frame — the out header whose
+    /// `len` covers the header, `fuse_notify_prune_out` AND the nodeid
+    /// array (`fuse_dev_do_write` refuses `oh.len != nbytes`), code 9,
+    /// `unique` 0, `count` = the nodeids, then the nodeids verbatim — the
+    /// kernel's `fuse_notify_prune` reads exactly `count × 8` bytes past
+    /// the struct. The detached and async forms enqueue the identical
+    /// frame.
+    #[test]
+    fn prune_frame_is_one_header_struct_and_nodeid_array() {
+        let frame = prune_frame(&[7, 0x1_0000_0000]);
+        assert_eq!(
+            frame.len(),
+            FUSE_OUT_HEADER_SIZE + FUSE_NOTIFY_PRUNE_OUT_SIZE + 16,
+            "header + prune_out + two nodeids"
+        );
+        // out header: len (u32), error (i32 = the notify code), unique (u64)
+        assert_eq!(
+            u32::from_le_bytes(frame[0..4].try_into().unwrap()) as usize,
+            frame.len(),
+            "oh.len covers the nodeid array"
+        );
+        assert_eq!(
+            i32::from_le_bytes(frame[4..8].try_into().unwrap()),
+            fuse_notify_code::FUSE_NOTIFY_PRUNE as i32
+        );
+        assert_eq!(u64::from_le_bytes(frame[8..16].try_into().unwrap()), 0);
+        // fuse_notify_prune_out: count (u32), padding (u32), spare (u64)
+        assert_eq!(u32::from_le_bytes(frame[16..20].try_into().unwrap()), 2);
+        assert_eq!(&frame[20..32], &[0u8; 12]);
+        assert_eq!(u64::from_le_bytes(frame[32..40].try_into().unwrap()), 7);
+        assert_eq!(
+            u64::from_le_bytes(frame[40..48].try_into().unwrap()),
+            0x1_0000_0000
+        );
+
+        let (notify, mut rx) = notify_test_channel();
+        notify.prune_detached(&[7, 0x1_0000_0000]);
+        assert_eq!(rx.try_next_frame().expect("detached prune frame"), frame);
+
+        let (notify2, mut rx2) = notify_test_channel();
+        notify2
+            .prune(vec![7, 0x1_0000_0000])
+            .now_or_never()
+            .expect("the async enqueue never suspends");
+        assert_eq!(rx2.try_next_frame().expect("async prune frame"), frame);
     }
 }

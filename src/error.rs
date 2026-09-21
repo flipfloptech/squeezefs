@@ -24,6 +24,11 @@ pub enum RefusalClass {
     /// PR 10's recovery re-leases its slots): the ship cannot travel yet —
     /// retry (`meta_backend::record_ship`).
     HolderUnreachable { holder: u32 },
+    /// A token holder's membership screen refused this member (its lease
+    /// is not live at the holder's owner — a manager failover's
+    /// re-assertion window, PR 13b §4.4ag) and no grant was re-asserted
+    /// within the park bound: retry (`token_plane::TokenReaderPlane::call`).
+    MembershipPending,
 }
 
 impl RefusalClass {
@@ -33,6 +38,7 @@ impl RefusalClass {
             RefusalClass::SlotMoved { .. } => 1,
             RefusalClass::StaleHolderView => 2,
             RefusalClass::HolderUnreachable { .. } => 3,
+            RefusalClass::MembershipPending => 4,
         }
     }
 
@@ -44,6 +50,7 @@ impl RefusalClass {
             1 => Some(RefusalClass::SlotMoved { slot: 0, holder: 0 }),
             2 => Some(RefusalClass::StaleHolderView),
             3 => Some(RefusalClass::HolderUnreachable { holder: 0 }),
+            4 => Some(RefusalClass::MembershipPending),
             _ => None,
         }
     }

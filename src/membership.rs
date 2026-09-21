@@ -2651,7 +2651,7 @@ impl MemberSession {
             checkpoint_ceiling_ms: AtomicU64::new(grant.checkpoint_ceiling_ms),
             pack_group_available: AtomicBool::new(grant.pack_group_available),
         };
-        GRANT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        note_grant_adopted();
         // The §6.8 item-3 label space is the OWNER's clock: a grant from a
         // new term starts the reader's acknowledgement ladder over.
         crate::free_grace::note_member_owner_term(grant.term);
@@ -2689,7 +2689,7 @@ impl MemberSession {
             .store(grant.checkpoint_ceiling_ms, Ordering::Relaxed);
         self.pack_group_available
             .store(grant.pack_group_available, Ordering::Relaxed);
-        GRANT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        note_grant_adopted();
         // L2b (design-free-grace-sustain §5.2b, OQ 3): the grant's
         // `renew_ms` IS the pass-cadence ask — a prodded (shortened) value
         // tightens the revalidation pass cadence too, clamped at the
@@ -2727,7 +2727,7 @@ impl MemberSession {
         // The pack-group posture is a decision about NOW, like the ask.
         self.pack_group_available
             .store(grant.pack_group_available, Ordering::Relaxed);
-        GRANT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        note_grant_adopted();
         crate::free_grace::note_prodded_renewal(
             grant.renew_ms,
             grant.checkpoint_ceiling_ms,
@@ -2969,6 +2969,61 @@ pub fn request_renewal_now() {
 /// The carriage tick takes the request instant it is serving.
 fn take_renewal_request_instant() -> Option<std::time::Instant> {
     RENEWAL_REQUESTED_AT.lock().take()
+}
+
+/// PR 13b (record §4.4ag): woken at every grant a member session of this
+/// process ADOPTS (the join, every renewal, a reclaim at a successor) —
+/// what a caller a holder refused "not a member" parks on until its
+/// lease is re-asserted there ([`await_grant_adopted`]).
+static GRANT_ADOPTED: squeezefs_ipc::sqz_notify::Notify = squeezefs_ipc::sqz_notify::Notify::new();
+
+/// The process's grant generation (every grant any member session
+/// adopted) — [`await_grant_adopted`]'s `after` word.
+pub fn grant_generation() -> u64 {
+    GRANT_GENERATION.load(Ordering::Acquire)
+}
+
+/// Note one adopted grant: the generation advances, every parked
+/// [`await_grant_adopted`] wakes. Called by every `MemberSession` adopt /
+/// renewal; the contracts drive it directly for the reclaim they stand in
+/// for.
+pub fn note_grant_adopted() {
+    GRANT_GENERATION.fetch_add(1, Ordering::AcqRel);
+    GRANT_ADOPTED.notify_waiters();
+}
+
+/// **Park until a grant is adopted past generation `after`, or `bound`
+/// elapses** (`true` = a grant landed). Register-then-recheck: a grant
+/// adopted between the caller's generation read and the park wakes it at
+/// once (the token fetch's own lost-wake law, PR 13 defect 21).
+pub async fn await_grant_adopted(after: u64, bound: Duration) -> bool {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        let notified = GRANT_ADOPTED.notified();
+        if grant_generation() > after {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return grant_generation() > after;
+        }
+        if squeezefs_ipc::sqz_time::timeout(deadline - now, notified)
+            .await
+            .is_err()
+        {
+            return grant_generation() > after;
+        }
+    }
+}
+
+/// The bound a holder-refused "not a member" caller parks for its
+/// re-assertion (PR 13b, §4.4ag): two renewal beats — the member's
+/// reclaim loop paces at the beat (one beat to the next attempt), and the
+/// successor's re-assertion half admits it inside the next (its window
+/// is `T_owner ≥` the beat). Past it the retryable class surfaces, never
+/// `EIO`.
+pub fn reassertion_wait_bound() -> Duration {
+    Duration::from_millis(renewal_beat_ms().saturating_mul(2))
 }
 
 /// What this process is on the membership plane.

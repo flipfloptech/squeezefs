@@ -150,7 +150,10 @@ fn one_of_each() -> Vec<SqueezefsError> {
             squeezefs::error::RefusalClass::StaleHolderView,
             "stale holder view",
         ),
-        SqueezefsError::foreign_slot_file_mutation("setattr of a foreign-slot file (PR 13b)"),
+        SqueezefsError::retryable(
+            squeezefs::error::RefusalClass::HolderUnreachable { holder: 3 },
+            "the slot holder has no endpoint bound (PR 13b)",
+        ),
     ]
 }
 
@@ -224,6 +227,7 @@ fn a_retryable_refusal_is_classified_by_its_typed_class_never_its_text() {
     for class in [
         RefusalClass::SlotMoved { slot: 5, holder: 6 },
         RefusalClass::StaleHolderView,
+        RefusalClass::HolderUnreachable { holder: 9 },
     ] {
         let w = WireError::from_error(&SqueezefsError::retryable(class, "any words"));
         assert_eq!(w.class, class.to_wire());

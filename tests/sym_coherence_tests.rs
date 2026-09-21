@@ -4209,3 +4209,119 @@ async fn a_readers_poll_scans_the_whole_ledger_after_a_ring_of_stopped_polls() {
     }
     shutdown(&writer).await;
 }
+
+/// **PR 13b, record §4.4ag — a read the holder's membership screen refuses
+/// PARKS on this member's reclaim; it never answers `EIO`.** The `sym-crash`
+/// leg's widened deleted-stays-deleted arm read a joiner's `stat` one
+/// second into a manager failover as `Input/output error`: the successor's
+/// token plane refused the frame — "holds no live membership lease with
+/// this set's owner" (PR 5 round 3 Issue 27's law, correct) — and the
+/// read did not wait for the joiner's re-assertion, one beat away. Now the
+/// screen's word is TYPED on the wire (`TokenReply::NotMember`), the reader
+/// plane parks on the next adopted grant (`membership::await_grant_adopted`
+/// — the reclaim landing at the successor; the contract drives
+/// `note_grant_adopted` for it, the join's own act) bounded by two renewal
+/// beats, and retries; past the bound the RETRYABLE class
+/// (`RefusalClass::MembershipPending`, `EAGAIN`) surfaces — never `EIO`,
+/// never a served stale answer. The holder counts the refusals
+/// (`nonmember_refusals`), the reader its parks (`membership_waits`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_refused_not_a_member_parks_on_the_members_reclaim_and_never_answers_eio() {
+    use squeezefs::error::RefusalClass;
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    let (host, endpoint) = holder_listener(&writer.volumes[0]);
+    let holder = writer.volumes[0].token_holder().unwrap().clone();
+    // A short beat: T_owner 1 s, D_purge 100 ms ⇒ renew ≈ 300 ms, the
+    // reader's park bound (two beats) ≈ 600 ms.
+    std::env::set_var("SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS", "1000");
+    std::env::set_var("SQUEEZEFS_MEMBERSHIP_PURGE_MS", "100");
+    let bound = squeezefs::membership::reassertion_wait_bound();
+    assert!(
+        bound >= Duration::from_millis(200) && bound <= Duration::from_secs(2),
+        "the derived park bound at a 1 s TTL: {bound:?}"
+    );
+    let verdict = Arc::new(std::sync::Mutex::new(LeaseVerdict::Live));
+    let v = Arc::clone(&verdict);
+    holder.install_lease_oracle(Arc::new(move |_client: &str| {
+        *v.lock().unwrap_or_else(|p| p.into_inner())
+    }));
+    let f1 = Metadata::create(writer.as_ref(), 1, "f1", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let f2 = Metadata::create(writer.as_ref(), 1, "f2", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let (reader, plane) = open_token_reader(&path, &endpoint, "reader-reasserting").await;
+    let refusals0 = holder.stats().nonmember_refusals;
+
+    // The failover window: the successor's owner does not list this member
+    // yet. The read of an uncached object PARKS; the reclaim lands 250 ms
+    // later (the oracle flips LIVE, a grant is adopted) and the read
+    // completes exact — no EIO, no stale answer.
+    *verdict.lock().unwrap() = LeaseVerdict::Expired;
+    let v = Arc::clone(&verdict);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        *v.lock().unwrap_or_else(|p| p.into_inner()) = LeaseVerdict::Live;
+        squeezefs::membership::note_grant_adopted();
+    });
+    let t0 = std::time::Instant::now();
+    let got = tokio::time::timeout(
+        Duration::from_secs(20),
+        Metadata::getattr(reader.as_ref(), f1),
+    )
+    .await
+    .expect("the parked read returns inside the harness bound")
+    .expect("the read completes once the member's lease is re-asserted — never EIO");
+    let wall = t0.elapsed();
+    assert_eq!(got.ino, f1);
+    assert!(
+        wall >= Duration::from_millis(200),
+        "the read waited for the reclaim, not a stale serve: {wall:?}"
+    );
+    assert!(
+        holder.stats().nonmember_refusals > refusals0,
+        "the holder's screen refused the first ask"
+    );
+    assert!(plane.stats().membership_waits >= 1, "the reader parked");
+
+    // No reclaim inside the bound: the RETRYABLE class, never EIO.
+    *verdict.lock().unwrap() = LeaseVerdict::Expired;
+    let waits1 = plane.stats().membership_waits;
+    let t1 = std::time::Instant::now();
+    let e = tokio::time::timeout(
+        Duration::from_secs(20),
+        Metadata::getattr(reader.as_ref(), f2),
+    )
+    .await
+    .expect("the bounded park returns")
+    .expect_err("no grant re-asserted inside the bound: the retryable class");
+    let wall = t1.elapsed();
+    assert!(
+        matches!(e.refusal_class(), Some(RefusalClass::MembershipPending)),
+        "the typed class, never the prose: {e:?}"
+    );
+    assert_eq!(e.to_errno(), libc::EAGAIN, "never EIO inside the window");
+    assert!(
+        wall >= bound.mul_f32(0.8) && wall < bound + Duration::from_secs(2),
+        "the park is the derived bound ({bound:?}), not a timer of its own: {wall:?}"
+    );
+    assert!(plane.stats().membership_waits > waits1);
+    // Re-asserted: the same read serves.
+    *verdict.lock().unwrap() = LeaseVerdict::Live;
+    squeezefs::membership::note_grant_adopted();
+    let got = Metadata::getattr(reader.as_ref(), f2)
+        .await
+        .expect("a live lease serves again");
+    assert_eq!(got.ino, f2);
+    std::env::remove_var("SQUEEZEFS_MEMBERSHIP_PURGE_MS");
+    std::env::remove_var("SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS");
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}

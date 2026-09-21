@@ -336,6 +336,14 @@ pub enum TokenReply {
     HolderDead {
         holder: u32,
     },
+    /// PR 13b (record §4.4ag): the caller holds no LIVE membership lease
+    /// with this holder's owner — a read token is granted to members only
+    /// (PR 5 review round 3, Issue 27) — the TYPED word of the dispatch's
+    /// membership screen: inside a manager failover a joiner's lease is
+    /// re-asserted at the successor a beat after its reads resume, and the
+    /// client PARKS on its own reclaim and retries
+    /// (`membership::await_grant_adopted`) instead of surfacing `EIO`.
+    NotMember,
 }
 
 /// One request frame: the schema, the client's correlation id, the volume
@@ -1703,16 +1711,26 @@ impl TokenService {
         // nothing.
         if plane.lease_verdict(&frame.client) == LeaseVerdict::Expired {
             plane.nonmember_refusals.fetch_add(1, Ordering::Relaxed);
-            return Self::refuse(
-                req_id,
-                STATUS_REFUSED,
-                format!(
-                    "client '{}' holds no live membership lease with this set's owner — a read \
-                     token is granted to members only (join through the membership plane \
-                     first)",
-                    frame.client
-                ),
+            log::warn!(
+                "token service refused a frame: client '{}' holds no live membership lease with \
+                 this set's owner — a read token is granted to members only (join through the \
+                 membership plane first; a member mid-reclaim at a successor retries)",
+                frame.client
             );
+            // TYPED (PR 13b, §4.4ag): the client keys its park-and-retry on
+            // the word, never the prose.
+            return match encode_reply(&TokenReplyFrame {
+                schema: TOKEN_SCHEMA,
+                request_id: frame.request_id,
+                reply: TokenReply::NotMember,
+            }) {
+                Ok(body) => RpcResponse {
+                    id: req_id,
+                    status: STATUS_REFUSED,
+                    body,
+                },
+                Err(e) => Self::refuse(req_id, STATUS_MALFORMED, format!("reply encode: {e}")),
+            };
         }
         // Every verb names its client: a member that reached this service
         // is a TOKEN client — the class the recall-gated free bypasses the
@@ -1780,7 +1798,9 @@ impl TokenService {
             }
         };
         let status = match reply {
-            TokenReply::Refused { .. } | TokenReply::CustodyRefused { .. } => STATUS_REFUSED,
+            TokenReply::Refused { .. }
+            | TokenReply::CustodyRefused { .. }
+            | TokenReply::NotMember => STATUS_REFUSED,
             TokenReply::Rejected { .. } => STATUS_REJECTED,
             _ => STATUS_OK,
         };
@@ -2121,6 +2141,10 @@ pub struct TokenReaderPlane {
     fetch_retries: AtomicU64,
     /// Re-points to a MOVED holder (`dlm_token_holder_repoints`).
     holder_repoints: AtomicU64,
+    /// Verbs the holder's membership screen refused `NotMember` and this
+    /// plane parked on the member's reclaim for (PR 13b, §4.4ag —
+    /// `dlm_token_membership_waits`).
+    membership_waits: AtomicU64,
     grant_rtt: LatencyHistogram,
 }
 
@@ -2237,6 +2261,7 @@ impl TokenReaderPlane {
             channel_rounds: AtomicU64::new(0),
             fetch_retries: AtomicU64::new(0),
             holder_repoints: AtomicU64::new(0),
+            membership_waits: AtomicU64::new(0),
             grant_rtt: LatencyHistogram::default(),
         });
         ensure_records_r5(&plane);
@@ -2482,7 +2507,46 @@ impl TokenReaderPlane {
     /// session, and every other grant of the volume rides the others.
     /// Pool depth = the D-1b session-depth derivation (one per 8 cores,
     /// 2..=8 — the owner's RPC-lane slope), dialed lazily.
+    /// One verb at the holder, PARKING on this member's reclaim when the
+    /// holder's membership screen refuses it (PR 13b, record §4.4ag —
+    /// `TokenReply::NotMember`): inside a manager failover the successor's
+    /// owner does not list this member until its renewal loop re-asserts
+    /// there, a beat after its reads resume; the read waits for the next
+    /// adopted grant (`membership::await_grant_adopted`, bounded by
+    /// `reassertion_wait_bound`) and asks again. Past the bound the
+    /// RETRYABLE class surfaces ([`RefusalClass::MembershipPending`]),
+    /// never `EIO`. Counted on `dlm_token_membership_waits`.
     async fn call(&self, call: TokenCall) -> Result<TokenReply> {
+        let deadline = Instant::now() + crate::membership::reassertion_wait_bound();
+        loop {
+            let gen0 = crate::membership::grant_generation();
+            match self.call_once(call.clone()).await? {
+                TokenReply::NotMember => {
+                    self.membership_waits.fetch_add(1, Ordering::Relaxed);
+                    let now = Instant::now();
+                    if now < deadline
+                        && crate::membership::await_grant_adopted(gen0, deadline - now).await
+                    {
+                        continue;
+                    }
+                    return Err(SqueezefsError::retryable(
+                        crate::error::RefusalClass::MembershipPending,
+                        format!(
+                            "token holder at {} refused '{}': no live membership lease with its \
+                             owner, and no grant was re-asserted within {:?} — retry \
+                             (dlm_token_membership_waits)",
+                            self.endpoint(),
+                            self.cfg.client_id,
+                            crate::membership::reassertion_wait_bound()
+                        ),
+                    ));
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+
+    async fn call_once(&self, call: TokenCall) -> Result<TokenReply> {
         let n = self.sessions.len();
         let start = self.session_rr.fetch_add(1, Ordering::Relaxed) % n;
         let mut guard = None;
@@ -3277,6 +3341,7 @@ impl TokenReaderPlane {
             grant_sessions: self.sessions.len() as u64,
             grant_sessions_dialed: self.grant_sessions.load(Ordering::Relaxed),
             holder_repoints: self.holder_repoints.load(Ordering::Relaxed),
+            membership_waits: self.membership_waits.load(Ordering::Relaxed),
         }
     }
 
@@ -3326,6 +3391,9 @@ pub struct TokenReaderStats {
     /// Re-points to a holder that MOVED its listener (PR 13) — 0 on a
     /// fleet that never failed over.
     pub holder_repoints: u64,
+    /// Parks on this member's reclaim after a holder's `NotMember`
+    /// refusal (PR 13b, §4.4ag) — 0 on a fleet that never failed over.
+    pub membership_waits: u64,
 }
 
 /// Issue one verb on `client`; a refusal status with a reply body is
@@ -3729,6 +3797,7 @@ pub fn reader_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
         // listener (a manager failover, a joiner's rejoin): 0 on a fleet
         // that never failed over; one per (plane, move) otherwise.
         "dlm_token_holder_repoints": per(&|s| s.holder_repoints),
+        "dlm_token_membership_waits": per(&|s| s.membership_waits),
         "dlm_token_grant_rtt_ns": serde_json::Value::Array(
             volumes
                 .iter()

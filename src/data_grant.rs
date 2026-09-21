@@ -5620,6 +5620,13 @@ impl SlotCustodyArm {
         });
         plane.install_data_sink((self.sink_for)(usize::from(volume)));
         plane.probe().await.map_err(|e| {
+            // PR 13b (§4.4ag): the holder's membership screen refusing this
+            // member past the reclaim park is the RETRYABLE class the
+            // plane already typed — a manager failover's window, never a
+            // holder that serves no tokens.
+            if e.refusal_class().is_some() {
+                return e;
+            }
             acquire_refusal(
                 libc::EIO,
                 format!(

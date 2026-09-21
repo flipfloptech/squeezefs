@@ -1888,9 +1888,10 @@ the actors are named by what the SEAM observed.
 its first run** (fix round 2, the N = 3 real-daemon leg, `PASS=122
 FAIL=1`): `SYMJOIN/N: joiner 2's chmod of joiner 3's file: rc=0 ''
 (want EOPNOTSUPP)` — while the `>>` half beside it PASSED (the open
-refused, bash printed the error, rc 1). **Attribution** (an untracked
-instrumented re-run of the leg alone, `/tmp/grok-justin/fix2-attrib-
-run1.log`): joiner 2's daemon logged `FUSE SetAttr { mode: Some(33152),
+refused, bash printed the error, rc 1). **Attribution** (an instrumented
+copy of the leg run alone, kept outside the tree — `/tmp/grok-justin/
+attrib-fideli.sh`, its run `/tmp/grok-justin/fix2-attrib-run1.log`):
+joiner 2's daemon logged `FUSE SetAttr { mode: Some(33152),
 ctime: Some(..) }` for the file and REFUSED it with the typed class
 (`foreign_file_mutation_refusals` 1 → 2, the ERROR line naming slot 137
 / appender 2); `strace` on the `chmod` read **`fchmodat(AT_FDCWD, ".../

@@ -3098,3 +3098,23 @@ fn node_seq_incarnation_space_partitions_the_63_usable_bits() {
     assert_eq!(b >> 63, 0);
     assert!(incarnation_base(b, INCARNATION_ORDINAL_MAX).is_some());
 }
+
+/// **The membership re-assertion park's bound** (symmetric PR 13b,
+/// §4.4ag — `membership::reassertion_wait_bound`): a token fetch refused
+/// "not a member" by a successor parks for exactly TWO renewal beats —
+/// the member's reclaim loop paces at the beat (one beat to its next
+/// attempt) and the successor's re-assertion half admits it inside the
+/// next (its window is `T_owner ≥` the beat) — then surfaces the
+/// retryable class, never `EIO`. The bound is the beat's derivation, never
+/// a free constant: a drift between the two is red here (review round 1,
+/// Issue 5).
+#[test]
+fn membership_reassertion_wait_bound_is_two_renewal_beats() {
+    let beat_ms = squeezefs::membership::renewal_beat_ms();
+    assert!(beat_ms > 0);
+    assert_eq!(
+        squeezefs::membership::reassertion_wait_bound(),
+        std::time::Duration::from_millis(beat_ms * 2),
+        "the re-assertion park is exactly 2 × renewal_beat_ms ({beat_ms} ms)"
+    );
+}

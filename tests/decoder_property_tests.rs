@@ -2582,6 +2582,11 @@ fn arb_token_reply() -> impl Strategy<Value = TokenReply> {
         Just(TokenReply::Acked),
         any::<u64>().prop_map(|count| TokenReply::Released { count }),
         "\\PC{0,64}".prop_map(|reason| TokenReply::Refused { reason }),
+        // PR 12b round 3 (F2) and PR 13b (§4.4ag): the two appended
+        // words — a lessee the S6 owner lists dead, and the dispatch's
+        // typed membership screen (PR 13b review round 1, Issue 6).
+        any::<u32>().prop_map(|holder| TokenReply::HolderDead { holder }),
+        Just(TokenReply::NotMember),
     ]
 }
 

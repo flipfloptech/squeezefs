@@ -187,6 +187,12 @@ enum ArbReply {
     Rejected {
         reason: String,
     },
+    // PR 12b round 3 (F2) and PR 13b (§4.4ag) — the two appended words
+    // (PR 13b review round 1, Issue 6).
+    HolderDead {
+        holder: u32,
+    },
+    NotMember,
 }
 
 /// The bounded `TokenRecords` of a granted reply (both grant shapes).
@@ -288,6 +294,8 @@ impl ArbReply {
             ArbReply::Refused { reason } => TokenReply::Refused {
                 reason: reason.chars().take(256).collect(),
             },
+            ArbReply::HolderDead { holder } => TokenReply::HolderDead { holder },
+            ArbReply::NotMember => TokenReply::NotMember,
         }
     }
 }

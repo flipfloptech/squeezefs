@@ -1825,6 +1825,13 @@ impl RoutedMetaBackend {
             return None;
         }
         let holder = crossvol_tx::foreign_holder_of(self, v_idx, local)?;
+        // The DOOR's law is the truth: a slot leased by a region THIS
+        // mount owns (the declared partition — PR 2–4's two-holder model
+        // in one process, whose ring the commit routes the tx into) is
+        // writable here, whatever the cross-owner arm calls it.
+        if vol.is_own_region(holder.appender_id) {
+            return None;
+        }
         let slot = kv::record::forest_slot_of_ino(local);
         Some(crate::error::SqueezefsError::foreign_slot_file_mutation(
             format!(

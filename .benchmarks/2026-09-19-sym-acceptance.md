@@ -37,9 +37,16 @@ blocker. **Every RATE, wall-clock ratio and timing-shaped reading in
 this record is venue-attributed pending the box** (`51bf21e1`: "no laptop
 number holds merit, enters a record as a verdict, or decides a gate") —
 never a MET, never a MISS; the box owes gates 1 / 2 / 3 / 3b / 3c / 5 / 7
-on the flip binary. `sym-storm`'s ×10 count on the final binary is §3.8's
-(the fix-round re-run under the harness's venue word). The flip waits for
-defect 32's rung, then the box.
+on the flip binary. **`sym-storm`'s ×10 count is NOT reached** (§3.8b):
+the fix round's two from-zero runs under the harness's venue word ran 7 +
+3 rounds GREEN and each stopped on a PRODUCT finding — the flip's
+projection walk (fixed red-first) and then an **acked-writes LOSS across a
+seven-victim kill with the cross-owner mover into striped destinations
+(§4.4af — 25 of 17,376, one writer's moved files, unattributed, a P0
+class: the flip's SECOND blocker)**; the widened deleted-stays-deleted arm
+then found a joiner's read inside the failover window answering `EIO`
+(§4.4ag). The flip waits for defect 32's rung and finding 1's
+attribution, then the box.
 
 ## 1. Venue block
 
@@ -86,12 +93,12 @@ _(MET / MISS per row with its engagement gauges; rows fill in as they run.
 | 3 | `sym-scale` N = 1/2/4/8 | dev → box | **Mechanism GREEN on every final-binary run** (every N completes, `appenders == N`, tripwires flat, fsck clean, deleted stays deleted through the widened arm — §3.1). **Rate (box): OWED** — the 0.7 × N create law and the ingest law read on the laptop (creates 2.2–6.0× at N ≥ 4 across runs, ingest 1.6–4.8×) are SCOPING, venue-attributed pending the box | `appenders == N`, `manager_load_pct`, handovers/ships/rpcs 0 |
 | 3b | `sym-shared-dir` (+ `-ls`) | dev → box | **Mechanism GREEN on every run since defect 14** (one flip at the holder, `shipped ≡ served`, handovers 0; `-ls` = `K + C + 3` tokens, 0 data-leaf reads — §3.3). **Rate (box): OWED** — the laptop's 3,290 creates/s and 20.9 s `ls -l` are SCOPING, venue-attributed | `dir_stripe_flips == 1`, `dir_stripe_ships ≡ foreign creates`, `slot_handovers == 0`; ls: `dlm_token_grants ≡ K + C` |
 | 3c | `sym-foreign-touch` | dev → box | **Mechanism GREEN on every run since defect 10** (LIVE 192 ships / 0 handovers; IDLE moved after 1–2 bursts; PAUSED keeps its tree — §3.4). **Rate (box): OWED** — the laptop's 5.5–7.8 ms handover wall is SCOPING, venue-attributed | handovers/s, `slot_handover_phase_ns`, a paused live job keeps its tree |
-| 4 | `sym-crash` / `sym-storm` (a)–(f) ×10 from zero | dev (LOCAL by the venue law) | **`sym-crash` 10/10 GREEN on nine consecutive from-zero runs (attempts 7–15 — §3.8's attempt → binary list) + 1/1 on the fix-round binary; `sym-storm` per §3.8 (the fix-round ×10 under `--venue=laptop`)** | must-stay-0 set (the flush-ceiling gauge venue-attributed on the laptop, Issue 2); `appender_recoveries ≡ regions of the killed nodes`; acked-loss 0; `fsck_findings == 0`; C8/bitmap drift 0; `replay_dropped_torn == 0` |
+| 4 | `sym-crash` / `sym-storm` (a)–(f) ×10 from zero | dev (LOCAL by the venue law) | **`sym-crash` 10/10 GREEN on nine consecutive from-zero runs (attempts 7–15 — §3.8's attempt → binary list; their deleted arm read EIO as "deleted", §4.4ag); on the fix-round binaries 1/1 GREEN then 0/1 on the WIDENED arm (finding 2). `sym-storm` ×10 NOT REACHED: 7 + 3 GREEN rounds from zero under `--venue=laptop`, stopped by finding 1 (§4.4af — an acked-writes LOSS, open)** | must-stay-0 set (the flush-ceiling gauge venue-attributed on the laptop, Issue 2); `appender_recoveries ≡ regions of the killed nodes`; acked-loss 0 (VIOLATED once — §4.4af); `fsck_findings == 0`; C8/bitmap drift 0; `replay_dropped_torn == 0` |
 | 5 | `sym-readers` (exactness; 1 × 31 broadcast; `free_grace_hold_ms`) | dev → box | **Mechanism GREEN on the 1-reader fleet every run** (exact at the next resolve; `recalls ≡ mutations × holders`, `fanout_p99 ≡ readers`, `timeouts_live` 0 — §3.5). **Rate (box): OWED** — the laptop's recall RTT 110–126 µs (= the free-grace hold under tokens) is SCOPING, venue-attributed; the 1 × 31 broadcast is the box's | `dlm_recall_fanout ≡ readers`, `reader_staleness_bound_ms == 0`, tokens held on `-o ro` |
 | 6 | format cost at N = 8 / 32 (+ the 46-volume width row) | dev (LOCAL) | **RUN — §3.6**: the width row VALID at N = 1/4/16/46 (mount 0.96 s, reopen 1.39 s at 46; the per-slot extent floor 16 MiB/volume = 736 MiB at 46 vols × 20 k files vs flat 47 MB — R9's number; `A_max` inert on a manager, §7 item 8); the appender rows ≈ 4 MiB (N = 8) / 16.5 MiB (N = 32) of region overhead per volume beside the manager's ring | per-slot extent floor, `slot_tree_bytes` p99 vs `A_max`, ring space, page writes |
 | 7 | relocated walls (terminal-free rate per holder under `w_rewrite` N = 8; the manager verb rate under a 32-mount join storm) | dev → box | **Mechanism GREEN on every run** (row (a): `shipped ≡ served ≥ displaced` — 2,723 ≥ 1,792; row (b): `/jobs` ships 7/7). **Rate (box): OWED** — the laptop's ≈ 1,000 frees/s at 18–46 % CPU and 2.2–3.2 s join wall are SCOPING, venue-attributed; the flush-ceiling overrun it read 3× is the ruling's named venue reading (§4.5); the N = 32 join storm is the box's | `block_free_*`, `manager_verbs_per_s`, `manager_load_pct` |
 | 8 | SIM-1 `SimConfig { clients: 12_500, shards: 64 }` | dev (tier (ii)) | **MET** — §5 | beat p99, eviction fan-out, the free-grace V-fan-in, the death ledger's reach |
-| 8b | fidelity `full` (nvmet; `pr-registrants` ≥ 1,024 + the emulated cap refusal; `sym-join-ladder` N = 3) | dev (LOCAL) | **Product legs PASS (189 — 1,024 registrants reported by the REGCTL-sized read, 65,600 B; the join ladder N = 3; guard ×10); the tier's `FAIL = 0` line OWED** (§7 item 11 — the one FAIL is the residue snapshot's `-zram1 -zram2` = the concurrent fleet's teardown, §3.7; a from-zero re-run on a quiet box, ≈ 20 min) | the tier's own verdicts |
+| 8b | fidelity `full` (nvmet; `pr-registrants` ≥ 1,024 + the emulated cap refusal; `sym-join-ladder` N = 3) | dev (LOCAL) | **PASS = 190 / FAIL = 0 from zero on a quiet box (fix round 1, `fix1-post3`) — 1,024 registrants reported by the REGCTL-sized read (65,600 B), the join ladder N = 3, guard ×10, the residue snapshot clean; the rung's own run read PASS 189 / FAIL 1 with the one FAIL the concurrent fleet's zram teardown (§3.7)** | the tier's own verdicts |
 
 ## 3. The local legs — from-zero counts
 
@@ -140,12 +147,20 @@ classifier (`sym_stat_deleted`: only `ENOENT` is deleted, anything else
 dies with its errno) — and the leg re-ran once from zero on the fix-round
 binary (mechanism only): §3.1a.
 
-### 3.1a `sym-scale` on the fix-round binary (Issue 8's re-run; mechanism only)
+### 3.1a `sym-scale` on the fix-round binaries (Issue 8's re-run; mechanism only)
 
-_(filled from `/tmp/grok-justin/fix1-fleet/sym-scale.log` when the run
-completes — every N complete, tripwires flat, fsck clean, the widened
-deleted-stays-deleted arm GREEN at the manager and the remounted joiner;
-its rates are SCOPING like every row above.)_
+**Run 1 — `16408a2f` (`/tmp/grok-justin/fix1-fleet/sym-scale.log`, from
+zero, exit 0, PUBLISHED):** every N completes (N = 1/2/4/8: 6,588 /
+17,355 / 28,579 / 24,038 creates/s, ingest 2,668 / 5,538 / 3,517 / 5,492
+MiB/s — SCOPING, venue-attributed pending the box), `appenders == N`,
+handovers 0, `slot_ships` ≤ 4, Σ `dlm_rpcs` 0, `manager_load_pct` 1–2 %,
+the must-stay-0 set flat (the venue word reported nothing), fsck clean;
+**the WIDENED deleted-stays-deleted arm (`sym_stat_deleted`, only ENOENT
+is deleted): 0 of 3,000 sampled removed names resolve at the manager
+after every joiner's clean leave, 0 of 3,000 at the remounted joiner —
+every `stat` answered `ENOENT`, none an EIO / EAGAIN the old arm would
+have read as "deleted"**. Run 2 on the flip-fix binary (`7c62428b`) is
+§3.8b's batch — its row is appended there when it lands.
 
 ### 3.2 `sym-tarx` (gate 2) — dev box, SCOPING; mechanism GREEN on every run, the ratio venue-attributed pending the box
 
@@ -286,8 +301,14 @@ drained to `regctl=0`, unshared**; `sym-manager-failover`;
 beside them); `loud-fail-matrix` (incl. the R-SYM-8 retirement
 refusals); `crash-window-nvmet`; `adopt`; `pr-matrix`; `g2-persistence-
 nvmet`; `soft-roce` (plumbing); `ab-smoke`; `guard-nvmet-x10`. Gate 8b
-MET on the product legs; the tier's residue snapshot must be re-taken on
-a quiet box for the clean `FAIL = 0` line (a 20-minute re-run).
+MET on the product legs; the tier's residue snapshot had to be re-taken
+on a quiet box for the clean `FAIL = 0` line. **Fix round 1 re-ran it
+from zero on a QUIET box (no fleet up; `fix1-post3/fidelity-full.log`,
+binary `4523f25e`'s tree, `FIDELI_PR_REGISTRANTS=1024`, 19 m 58 s): PASS
+= 190, FAIL = 0** — every leg above again (1,024 registrants reported,
+65,600 B; the join ladder N = 3 with the device reporting rtype 3 on the
+data namespace; guard ×10) and the residue snapshot clean. Gate 8b's
+`FAIL = 0` line stands (§7 item 11 closed).
 
 ### 3.8 `sym-crash` / `sym-storm` (gate 4) — dev box, LOCAL by the venue law; the from-zero counts
 
@@ -346,13 +367,81 @@ law fatal on both) and the storm re-ran ×10 from zero on the fix-round
 binary under `--venue=laptop` — §3.8b carries the count and the
 per-round venue-attributed readings.
 
-### 3.8b Fix round 1's from-zero runs on the fix-round binary (`/tmp/grok-justin/fix1-fleet/`)
+### 3.8b Fix round 1's from-zero runs on the fix-round binaries
 
-_(filled when the batch completes: `sym-crash --rounds=1` (the widened
-deleted-stays-deleted arm, mechanism only) and `sym-storm --rounds=10
---victims=7 --cross-owner --striped --venue=laptop` — the ×10 count,
-every law's verdict per round, and every `appender_flush_ceiling_overruns`
-reading listed as venue-attributed.)_
+**Batch 1 — `16408a2f` (Issues 2/7/8/12/13's product + harness landed;
+`/tmp/grok-justin/fix1-fleet/`):** `sym-crash --rounds=1` GREEN (1,643
+fsynced files all present, the reader followed as a member with
+`self_fences` 0, a member worker enrolled at the successor, the
+member-side census shard scoped 130 projected trees with 0 findings, the
+successor's must-stay-0 set flat, the WIDENED deleted-stays-deleted arm
+GREEN through every joiner and the reader, fsck `findings:0`). `sym-storm
+--rounds=10 --victims=7 --cross-owner --striped --venue=laptop` from
+zero: **rounds 1–7 GREEN on every law** (acked 14,357 / 10,631 / 17,414 /
+15,232 / 19,463 / 15,351 / 18,733 fsynced files from 7 joiners + the
+manager, all present; 14 regions recovered per round in 13–46 s; the
+recalled-reader arm exact; deleted stays deleted through every daemon by
+the ONE classifier; fsck clean after every round); **the venue word did
+its job** — round 5 read `appender_flush_ceiling_overruns=1 on m0` and
+the leg REPORTED it as venue-attributed (ledger `venue-attributed.txt`:
+`round 5 m0 appender_flush_ceiling_overruns=1 venue=laptop`; the gauge is
+cumulative, so round 7 reported the same word) and continued where the
+attempt-15 rerun had died; **round 8 RED — a NEW product defect, fixed
+red-first the same hour** (`7c62428b`; not one of the 35): the rejoined
+joiner m64's explicit stripe flip of the round directory it had just made
+was refused `EINVAL` — the flip's stripe check (`stripe_parent_dir` →
+`find_parent_of_child`) ran the reverse dentry scan over EVERY slot tree
+of the volume, its PROJECTIONS of slots other appenders lease included,
+and slot 10's tree, whose root its lessee had recycled, exhausted the
+traversal budget (`tree 0 (slot Some(10), … a PROJECTION here) …
+restarts [root-seq] = 256` — a leased slot's tree no refresh heals,
+KD-SYM-3; §7 item 1's class reached from the FLIP). A stripe has no
+ordinary name and inos are never reused, so the directory-parent memo —
+fed at every directory mint now — answers the check for a directory this
+mount made without a scan; pinned red-first
+(`an_explicit_flip_of_a_joiners_own_fresh_directory_walks_no_projection`:
+`meta_parent_scans` +0 across a joiner's mkdir + flip, RED +1 before).
+By the counted-restart law the storm count restarts from zero on the fix
+binary — batch 2 below.
+
+**Batch 2 — `7c62428b` (the flip fix landed; `/tmp/grok-justin/
+fix1-fleet2/`), from zero:** `sym-storm --rounds=10 --victims=7
+--cross-owner --striped --venue=laptop`: **rounds 1–3 GREEN on every law**
+(acked 16,086 / 17,418 / 18,388 fsynced files from 7 joiners + the
+manager, all present; 14 regions recovered per round in 46 s; the
+recalled-reader arm exact; deleted stays deleted by the ONE classifier;
+fsck clean; no venue-attributed reading); **round 4 RED — an ACKED-WRITES
+LOSS, a NEW finding (§4.4af), FOUND and NOT FIXED in this fix round**: 25
+of 17,376 fsynced files, every one of writer m60's and every one a file
+its mover had renamed into the manager's striped cross-owner directory
+`/storm-xo-r4` (`w60-f000086`, `w60-f000216`, `w60-f000344`, … — a
+128-name stride, 15 names; 10 of them the mover's ledger says RETURNED),
+each "at NEITHER its source nor its destination" at the manager after
+the seven-victim recovery. The die that should have named it expanded an
+UNBOUND `${survivors[0]}` (every joiner a victim) and the leg exited on
+`survivors[0]: unbound variable` — the harness die is fixed (`4523f25e`),
+the loss is the finding. **The storm count on the fix-round binaries is
+therefore 7 + 3 GREEN rounds from zero, the ×10 NOT reached**, stopped
+twice by product findings (the flip's projection walk, fixed; the
+acked-loss class, open) and never by the venue-attributed gauge. Then
+`sym-crash --rounds=1` on a fresh fleet: **RED on the WIDENED
+deleted-stays-deleted arm — a second new finding (§4.4ag)**: joiner m60's
+`stat` of the removed `acked-r1` answered `EIO`, not `ENOENT` — the read
+went to the SUCCESSOR's token plane one second after its listener came
+up and was refused "holds no live membership lease with this set's
+owner" (the joiner's reclaim had been refused `Connection refused` a
+second earlier and had not yet re-asserted); the old arm read that EIO
+as "deleted". Every other law of the round held (the acked-writes oracle
+2,281 / 2,281, the reader followed as a member, the member worker
+enrolled). Then `sym-scale` once (exit 0, PUBLISHED): every N completes
+(7,019 / 18,515 / 24,350 / 19,375 creates/s — SCOPING), handovers 0,
+`slot_ships` ≤ 5, Σ `dlm_rpcs` 0, the widened deleted-stays-deleted arm 0
+/ 3,000 at the manager AND the remounted joiner, fsck clean. The manager's
+log of batch 2 also carried 23,434 `ForeignSlotFileMutation` refusals —
+the kernel's SETATTR times ECHO on the oracle's 14 k foreign reads per
+round, refused as a mutation by the Issue-12 gate; the gate absorbs the
+echo class now (`4523f25e`, `foreign_file_times_echo_absorbed`; the pin
+gained the echo and `touch` arms).
 **`sym-crash`: 10/10 GREEN on NINE consecutive from-zero runs (attempts
 7–15) — the ONE count this record carries** (§0, §2, §9 say the same
 number); the attempt → binary pairs, each `target/release/squeezefs` of
@@ -1548,6 +1637,104 @@ the stale projection before re-installing the root, counting its
 nesting depth — RED: `max_depth == 2`, the nested refresh observed and
 cut where the product overflowed; GREEN: 1, the lookup served).
 
+### 4.4af Fix-round finding 1 — FOUND, NOT FIXED (the death path under `--victims=7 --cross-owner --striped`; a FLIP BLOCKER beside defect 32): 25 of 17,376 acked files lost across a seven-victim kill — every one a moved file of ONE writer, at neither its source nor its destination
+
+`sym-storm` batch 2 (`7c62428b`), round 4 from zero (`/tmp/grok-justin/
+fix1-fleet2/sym-storm-rows/symstorm-1789948411/lost-r4.txt`, the
+daemon logs beside it): the seven joiners killed at once at phase 6.2 s;
+14 regions recovered by the manager 19 s later; the acked-writes oracle
+at the manager read 25 misses over 17,376 fsynced files — **all writer
+m60's** (`storm-w60-r4/f000086`, `f000216`, `f000344`, `f000472`,
+`f000600`, `f000728`, `f000856`, `f000984`, `f001112`, `f001240`,
+`f001368`, `f001496`, `f001624`, `f001752`, `f001880` — a stride of
+exactly 128 names, 15 of m60's 1,904 acked), each `src=0 dst=0`: not at
+`/storm-w60-r4/` and not at `/storm-xo-r4/w60-…` (the manager's
+cross-owner directory, striped K = 64 by the movers' inserts); 10 of the
+15 are also in the mover's RETURNED ledger (`moved-w60-r4.ledger` — the
+`mv` returned 0 before the kill). Rounds 1–3 of the same shape were GREEN
+(16,086 / 17,418 / 18,388 acked, 0 lost), as were batch 1's rounds 1–7 on
+`16408a2f`. **What the shape says**: an acked `dd conv=fsync` (m60's own
+slot) followed by an acked cross-owner `mv` into a striped foreign
+directory (PR 6's intent: `RemoveDentry` at m60's own directory,
+`InsertDentry` shipped to the stripe's holder — another joiner, killed in
+the same instant — or local when the stripe is m60's) and then EVERY
+participant dead at once: the source name gone, the destination name
+absent after the manager recovered every ring (§5.9 per region, then
+`roll_forward_open_intents`), the child's record unreachable by name. The
+128-stride over sequentially named files is a schedule artefact of the
+mover's passes (one `mv` per file per pass, `sleep 0.05` between passes)
+— the names each pass's FIRST or LAST rename touched — not a hash class
+(the stripe of `w60-f…` is `hash54 % 64` over the seeded dentry hash).
+Candidates, unattributed here: the recovery's replay of the stripe
+holder's ring dropping the shipped inserts (a `Lease` / frame-screen
+class the must-stay-0 set did not count — every violation gauge read 0),
+the intent's roll-forward at the manager applying `RemoveDentry` without
+the insert (the initiator dead mid-plan with the insert's holder ALSO
+dead — the two-process dead-initiator shape §7 routes to PR 13b, met
+here for real), or the mover's `mv` acked on a rename whose insert step
+never reached durability at the holder before the kill (PR 6's ack law
+would then be the defect). **Not fixed in this round**: the fix loop's
+turn ended at the finding; it is a P0 class (acked loss on the death
+path) and joins defect 32 as a flip blocker — PR 13b's first item, with
+the attribution recipe: re-run the shape with `SQUEEZEFS_XV_TRACE` on the
+initiator and the stripe holders, correlate the lost names' intent ids
+against the manager's roll-forward log, and read the recovered stripe
+tree's frames for the inserts. The harness die that should have named it
+was itself red (`survivors[0]` unbound under `set -u` when every joiner
+is a victim) — fixed in `4523f25e`; the lost list and the ledgers are
+the evidence.
+
+### 4.4ag Fix-round finding 2 — FOUND, NOT FIXED (PR 12b / PR 5, the failover window): a joiner's read one second into a manager failover answers `EIO` — the successor's token plane refuses a member whose reclaim has not landed
+
+`sym-crash --rounds=1` on `7c62428b` (batch 2), the WIDENED
+deleted-stays-deleted arm (Issue 8 — `sym_stat_deleted`: only `ENOENT` is
+deleted): joiner m60's `stat /acked-r1` (the round directory the
+successor had just removed) answered **`Input/output error`**. m60's log:
+00:06:39 the membership reclaim against the dead manager's listener
+refused `Connection refused`, the custody client fenced its own custody
+at `T_self` and re-dialed the successor; 00:06:40 the successor's token
+plane refused m60's read frame — "client `node_…m6674fc98` holds no live
+membership lease with this set's owner — a read token is granted to
+members only" (PR 5 round 3 Issue 27's law: the token dispatch checks
+the caller's lease FIRST) — and `data_grant` surfaced it as
+`Refused { errno: 5 }` to the FUSE op. The joiner's lease was one beat
+from re-asserting at the successor (PR 12b round 5's re-assertion half
+admits it); the read did not wait for it. Before the widened arm this
+EIO read as "deleted" and the round was GREEN (every one of the nine
+10/10 runs' deleted arms could have hidden the same window). Every other
+law of the round held. **The class**: a user read at a joiner inside the
+failover window fails `EIO` for the beat until the joiner's reclaim
+lands, instead of parking on the reclaim (bounded by the renewal beat /
+`T_owner`) and retrying the token fetch. Not fixed here (the fix loop's
+turn ended); PR 13b's item beside the token plane's failover follow
+(defect 15): the per-holder token client's "no live membership lease"
+refusal is the retryable class until the member's lease is re-asserted
+or expires — never `EIO` inside the window.
+
+### 4.4ah Fix-round finding 3 — FOUND, NOT FIXED (PR 5's token reader / defect 21's pin): `a_single_flight_fetch_loser_registers_before_it_rechecks_the_winner` hangs intermittently in the suite's order
+
+Twice in the fix round's matrix runs the `sym_coherence_tests` suite
+stopped on this test until the runner's 600 s watchdog killed it — the
+first matrix's FLAT leg (with a standalone instance of the same test
+running in another process beside it) and the second matrix's STAMPED
+leg (nothing else on the box); the same suite run alone passes on both
+legs (41/41 in 75 s each), the runner's own single-suite flat leg passes,
+and the pin alone passes in 2 s on both legs. A predecessor bisect was
+inconclusive (pairs re-run with a bound read PASS wherever the bound let
+the predecessor finish). The pin drives the single-flight token fetch
+through the `TEST_FETCH_LOSER_HOLD` seam — the register-recheck-await
+idiom over `sqz_notify::Notify` (registers at creation, ticked) — so a
+hang HERE is either the seam's own schedule (the release's
+`notify_waiters` and the loser's park) or the product's lost wake in a
+window the pin does not cover, which is the class the pin exists for.
+Recipe: `SQUEEZEFS_TEST_STAMP_SYMMETRIC=1 cargo test --all-features
+--test sym_coherence_tests -- --test-threads=1` in the suite's order,
+under the runner's watchdog; the process's stacks at the hang
+(`eu-stack` / `gdb -p`) name the parked future. Open — PR 13b / the
+matrix's next run; under the "load-dependent hangs are first-class
+product bugs" doctrine it is filed as a product finding until the stacks
+say otherwise.
+
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
 `sym-shared-dir-ls` on the defect-16 binary read `meta_kv_node_cache_
@@ -1724,8 +1911,14 @@ counted decline, a bounded window or a stated venue):
    number.
 1. **`is_stripe`'s reverse dentry scan over projections** (PR 7b on a
    joiner): `find_parent_of_child` walks every slot tree of the flip
-   candidate's holder — a projection on a joiner, defect 24's class once
-   per flip candidate, never per op. The fix shape is a divert-aware
+   candidate's volume — a projection on a joiner, defect 24's class once
+   per flip candidate, never per op. **Reached by fix round 1's storm
+   (§3.8b, batch 1 round 8 — the explicit flip of a rejoined joiner's own
+   fresh directory refused `EINVAL` on a recycled projected root) and
+   closed for every directory THIS mount made** (`7c62428b`: the
+   directory-parent memo, fed at every directory mint, answers the check
+   first; pinned). What stays owed is the COLD case — a memo miss, a
+   directory another incarnation made — whose fix shape is a divert-aware
    reverse scan or the `known_stripes` set fed at every map read on every
    mount; the candidate's own `stripe_map` read already learns it.
 2. **`SupplyStripeIno`'s on-demand binding** (§4.6): the supply declines a
@@ -1761,16 +1954,30 @@ counted decline, a bounded window or a stated venue):
    — a harness item for the matrix's next widening. (`kv_freeze_wedge_
    tests`' flat-shaped census probe was closed in fix round 1, Issue 17:
    the probe is layout-blind and the suite rides the matrix.)
-11. **Gate 8b's `FAIL = 0` line** (§3.7, Issue 19): `sudo tests/run_
-   nvmeof_fidelity.sh full` from zero on a QUIET box (no fleet up) — the
-   one FAIL of the rung's run is the residue snapshot's `-zram1 -zram2`,
-   the concurrent fleet's teardown between the tier's before/after
-   snapshots; the product legs' PASS (189) stands, the clean line is
-   owed (≈ 20 min).
+11. **Gate 8b's `FAIL = 0` line** (§3.7, Issue 19) — CLOSED in fix round
+   1: `sudo tests/run_nvmeof_fidelity.sh full` from zero on a quiet box
+   (no fleet up) read PASS = 190 / FAIL = 0 (`fix1-post3`); the rung's
+   own FAIL 1 was the concurrent fleet's zram teardown between the tier's
+   snapshots.
 12. **Defect 32's arm — PR 13b** (§4.4z; the flip-blocking item above):
    the interim loud refusal and the `#[ignore]`d RED contract landed in
    fix round 1 (Issue 12); PR 13b builds the ship and un-ignores the
    contract.
+13. **Fix-round finding 1 — the acked-writes LOSS across a seven-victim
+   kill with the cross-owner mover and striped destinations** (§4.4af; a
+   FLIP BLOCKER beside defect 32): 25 of 17,376, one writer's moved files
+   at a 128-name stride, at neither source nor destination after the
+   recovery — unattributed, the recipe in §4.4af; PR 13b's first item.
+   The storm ×10 count restarts from zero on its fix.
+14. **Fix-round finding 2 — a joiner's read inside the failover window
+   answers `EIO`** (§4.4ag): the successor's token plane refuses a member
+   whose reclaim has not landed and the read does not wait; PR 13b, beside
+   defect 15's follow — the refusal is the retryable class inside the
+   window.
+15. **Fix-round finding 3 — defect 21's pin hangs intermittently in the
+   suite's order** (§4.4ah): the stamped matrix leg stopped on it once,
+   the flat leg once under a concurrent instance; alone it passes on both
+   legs. Attribute with the parked stacks; PR 13b / the matrix's next run.
 
 **Routed to PR 13 and NOT run here** (the brief's §3 list off PR 12b's,
 PR 7's, PR 4/8/9's and the gate's ledgers — each with its next venue,
@@ -1883,7 +2090,13 @@ Every local rate in §3 is dev-box scoping evidence for those rows.
 
 ## 9. The flip decision (for PR 14)
 
-**Decision: NOT YET — two blockers, one of them a product gap.** (1)
+**Decision: NOT YET — three blockers, two of them product.** (0) **Fix-round
+finding 1 (§4.4af)**: an acked-writes LOSS on the death path under the
+seven-victim + cross-owner + striped shape — 25 of 17,376 fsynced files,
+one writer's moved files, at neither source nor destination after the
+recovery — found by the fix round's storm and NOT attributed; the ×10
+storm count restarts from zero on its fix. A default cannot flip on an
+unattributed acked loss. (1)
 **Defect 32 (§4.4z, §7's flip-blocking item)**: a file created on one
 mount cannot be `chmod`ed, `touch`ed, `setfattr`ed or WRITTEN from a
 mount that does not lease its slot — `ENOENT` / `EOPNOTSUPP` / a refused
@@ -1916,15 +2129,16 @@ Gates, exactly:
 | 3 scale | mechanism GREEN at every N every run (complete, `appenders == N`, tripwires flat, fsck clean, deleted stays deleted) | OWED (the deciding row) — the 0.7 × N law read 2.9–6.0 × at N = 8 across five laptop runs, SCOPING, venue-attributed |
 | 3b shared dir (+ `ls`) | mechanism GREEN (20,000 creates, one flip, ships ≡ served, handovers 0; `K + C + 3` tokens, 0 data-leaf reads) | OWED — the laptop's creates/s and `ls -l` wall SCOPING, venue-attributed |
 | 3c foreign touch | mechanism GREEN (LIVE never moved, IDLE moved in 1–2 bursts, PAUSED kept its tree) | OWED — the laptop's 5–8 ms handover wall SCOPING, venue-attributed |
-| 4 kill matrix | **`sym-crash` 10/10 on nine consecutive from-zero runs (attempts 7–15) + 1/1 on the fix-round binary; `sym-storm` per §3.8 / §3.8b (the fix-round ×10 under `--venue=laptop`)** | n/a (LOCAL by the venue law; the flush-ceiling gauge venue-attributed) |
+| 4 kill matrix | **`sym-crash` 10/10 on nine consecutive from-zero runs (attempts 7–15) + 1/1 then 0/1 on the widened arm (finding 2, §4.4ag); `sym-storm` ×10 NOT REACHED — 7 + 3 GREEN rounds from zero under `--venue=laptop`, stopped by finding 1 (§4.4af, an acked-writes LOSS — open)** | n/a (LOCAL by the venue law; the flush-ceiling gauge venue-attributed) |
 | 5 readers | mechanism GREEN (exactness, `recalls ≡ mutations × holders`, `fanout_p99 ≡ readers`, `reader_staleness_bound_ms` 0) on the 1-reader fleet | OWED (the 1 × 31 broadcast) — the laptop's recall RTT SCOPING, venue-attributed |
 | 6 format cost | see §3.6 | n/a |
 | 7 walls | mechanism GREEN (row (a) `shipped ≡ served ≥ displaced`; row (b) `/jobs` ships 7/7) — the flush-ceiling gauge's +1 readings are the ruling's named venue reading (§4.5) | OWED (N = 32) — the laptop's ≈ 1,000 frees/s and 2.2–3.2 s join wall SCOPING, venue-attributed |
 | 8 SIM-1 | **MET** (§5) | n/a (tier (ii)) |
-| 8b fidelity | product legs PASS (189); the `FAIL = 0` line OWED (§7 item 11) | n/a |
+| 8b fidelity | PASS = 190 / FAIL = 0 from zero on a quiet box (fix round 1; §3.7) | n/a |
 
-What PR 14 flips on: **defect 32's arm landed and pinned** (the rung
-before the flip), then the box rows of gates 1 / 2 / 3 / 3b / 3c / 5 / 7
+What PR 14 flips on: **finding 1 attributed and fixed with the storm ×10
+GREEN from zero on its binary (§4.4af), defect 32's arm landed and
+pinned** (the rung before the flip), then the box rows of gates 1 / 2 / 3 / 3b / 3c / 5 / 7
 on THAT binary (§8's footprint procedure), plus §7's product items 1–2
 (both counted declines today). Nothing found in this rung's thirty-five
 FIXED defects is a class the design did not already state, and every
@@ -1932,13 +2146,83 @@ one is fixed red-first here (defects 10 and 13's pins landed in fix round
 1); the one it did not fix is the class the design stated and the program
 never built — the flip inherits exactly that item and the box's numbers.
 
-## 10. Verification on the final tree (`702ab502`'s code; docs commits after it)
+## 10. Verification on the final tree
 
+**The rung's tree (`702ab502`'s code; docs commits after it)** —
 `pr13-post15/`: `cargo fmt --check` 0 · `cargo clippy --all-targets
 --all-features -- -D warnings` 0 · `cargo clippy --all-targets -- -D
 warnings` 0 · `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 0 (two
 private-item links found RED on the way and made plain code) · the fuzz
 workspace type-check + fmt 0 · **`tests/run_sym_forest_suites.sh`: PASS,
 40 suites flat THEN 40 stamped (33 m 11 s)** · the fidelity tier `full`
-§3.7. The fleet is torn down (zero daemons, the `mwfleet` substrate
-released); nothing was placed on `squeeze-test`.
+§3.7 (PASS 189 / FAIL 1, the FAIL attributed).
+
+**Fix round 1's tree (`b8c4c92a`; the final code)** — every rail below
+was RUN, none assumed (`/tmp/grok-justin/fix1-post3/SUMMARY` and its logs;
+the gate lines ran on `4523f25e` and the matrix on `b8c4c92a`, whose one
+difference is the six-line own-region exemption in
+`foreign_slot_file_mutation_refusal` — the gate lines are re-stated for
+it below):
+
+* `cargo fmt --check` 0 · `cargo clippy --all-targets --all-features -- -D
+  warnings` 0 · `cargo clippy --all-targets -- -D warnings` 0 ·
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 0 (one intra-doc link
+  found RED on the way — `ForeignSlotFileMutation` unqualified in
+  `mod.rs` — and qualified) · the fuzz workspace `cargo check --bins` +
+  `fmt --check` 0 (`RUSTFLAGS=-D warnings`).
+* **The three rails Issue 4 asked to be RUN:** `cargo test --all-features
+  --test env_knob_convention_tests --test docs_parity_tests --test
+  derivation_sweep_tests -- --test-threads=1` — **22 ok / 5 ok / 63 ok**,
+  run twice (`fix1-rails.log` after the knob deletion, `fix1-post3/
+  rails.log` on the final tree).
+* **The touched suites, both legs** (`posix_errno_tests`,
+  `meta_ship_tests`, `decoder_property_tests`,
+  `sym_projection_refresh_tests`, `sym_n_daemon_tests`,
+  `kv_freeze_wedge_tests`, `sym_cross_owner_tests`,
+  `sym_slot_transfer_tests` — `--test-threads=1`): flat 8/8 ok (254 s),
+  stamped 8/8 ok (149 s).
+* **Every new pin RED-first** (each verified by neutering its fix and
+  watching the pin fail, then restoring): Issue 6's forged reply (the
+  screen bypassed), Issue 10's two (the re-seed / the striping exemption
+  neutered), Issue 12's (the gate disabled — the door's EAGAIN surfaced),
+  Issue 13's (the shipped-only arm), Issue 15's (the paired-end shape),
+  the flip pin (the memo check removed — `meta_parent_scans` +1); Issue
+  14's pin fails by construction on a re-take (a self-deadlock the
+  bounded wait catches) and on a dropped guard (the mutex reads FREE
+  while the refresh is parked).
+* **The fidelity tier `full` from zero on a QUIET box** (Issue 19):
+  **PASS = 190 / FAIL = 0** (19 m 58 s; §3.7).
+* **`tests/run_sym_forest_suites.sh` — 41 suites flat THEN 41 stamped**:
+  the first run on `4523f25e` read the FLAT leg RED at `sym_custody_tests`
+  (5 of 27 — the Issue-12 gate judging the in-process two-holder model's
+  declared region as foreign; fixed in `b8c4c92a`, the own-region
+  exemption; 27/27 flat and stamped by hand), then the matrix re-ran on
+  `b8c4c92a` alone on the box (`fix1-post3/matrix2.log`, 31 m): **the
+  FLAT leg PASS — 41 suites** (every suite of the rung's 40 plus
+  `kv_freeze_wedge_tests`); **the STAMPED leg HUNG at
+  `sym_coherence_tests`** — the per-suite watchdog killed it at 600 s
+  with the last test line `a_single_flight_fetch_loser_registers_before_
+  it_rechecks_the_winner ...` (defect 21's pin, added in this rung; green
+  in the rung's own 40/40 matrix), the same line the first matrix run's
+  FLAT leg had stalled on while a standalone instance ran beside it. The
+  suite run alone on either leg passes — flat 41/41 in 75 s (twice, once
+  through the runner), stamped 41/41 in 75 s — and the pin alone passes
+  in 2 s on both legs, so the hang is INTERMITTENT and in the SUITE
+  ORDER: recorded as fix-round finding 3 (§4.4ah), open. The matrix
+  verdict for this tree is therefore: flat PASS 41/41; stamped 22 suites
+  PASS then a HUNG suite the runner stopped on (the 19 suites after it
+  in the stamped order did not run in that pass; every one of them ran
+  green stamped in the rung's own matrix, and the eight touched suites
+  ran green stamped in this round's own leg). A third full pass was not
+  run — the turn ended.
+* **The fleet, from zero, as root** (`/tmp/grok-justin/fix1-fleet/`,
+  `fix1-fleet2/`): batch 1 on `16408a2f` — `sym-scale` exit 0 (the widened
+  deleted arm 0 / 3,000 ×2), `sym-crash --rounds=1` GREEN, `sym-storm
+  --venue=laptop` 7/10 then round 8 (the flip walk — fixed); batch 2 on
+  `7c62428b` — `sym-storm --venue=laptop` 3/10 then round 4 (finding 1,
+  §4.4af — OPEN), `sym-crash --rounds=1` RED through the widened arm
+  (finding 2, §4.4ag — OPEN), `sym-scale` exit 0 (0 / 3,000 ×2). The
+  later fixes (`4523f25e`'s echo absorb, `b8c4c92a`'s exemption) change
+  the interim refusal's classification only and did not re-run the
+  fleet — the storm count is blocked on finding 1 either way. The fleet
+  is torn down; nothing was placed on `squeeze-test`.

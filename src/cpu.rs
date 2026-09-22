@@ -106,6 +106,35 @@ pub fn raw_parallelism() -> usize {
     raw_process_parallelism()
 }
 
+/// The soft `RLIMIT_NOFILE` **as found** — snapshotted the first time
+/// anything asks, which the daemon's startup raise
+/// (`cluster_wire::raise_nofile_soft_limit`) does BEFORE it moves the
+/// limit. Every derivation that predates the raise reads this word
+/// (`uring_fs::fd_cache_cap`: the flat path's fd economy is byte-identical
+/// to the pre-raise binary on every posture — PR 13c review round 1,
+/// Issue 8: the raise had grown the open-file cache 32× on the systemd
+/// default); the raise serves the cluster-wire listener caps ALONE, which
+/// read the limit in force.
+pub fn nofile_soft_as_found() -> usize {
+    static FOUND: OnceLock<usize> = OnceLock::new();
+    *FOUND.get_or_init(nofile_soft_limit_now)
+}
+
+/// The soft `RLIMIT_NOFILE` in force NOW (1024 when the query fails — the
+/// login default, the conservative read).
+pub fn nofile_soft_limit_now() -> usize {
+    let mut rl = libc::rlimit {
+        rlim_cur: 1024,
+        rlim_max: 1024,
+    };
+    // SAFETY: plain getrlimit into a stack struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
+        usize::try_from(rl.rlim_cur).unwrap_or(usize::MAX)
+    } else {
+        1024
+    }
+}
+
 fn raw_process_parallelism() -> usize {
     static CACHED: OnceLock<usize> = OnceLock::new();
     *CACHED.get_or_init(compute_process_parallelism)

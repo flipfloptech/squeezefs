@@ -52,22 +52,27 @@ const ADMIT_CAP: usize = 256;
 /// the pool can never EMFILE the process by itself (the pool's aggregate
 /// cache stays under a quarter of RLIMIT_NOFILE), capped at 1024, floored
 /// at 16. Production metadata I/O touches only a handful of distinct paths;
-/// churny workloads simply re-open.
+/// churny workloads simply re-open. The limit is the soft `RLIMIT_NOFILE`
+/// **as found at startup** ([`crate::cpu::nofile_soft_as_found`]) — the
+/// daemon's startup raise to the hard limit serves the cluster-wire
+/// listener caps alone, so this cache is the same size on every posture
+/// as before the raise existed (PR 13c review round 1, Issue 8).
 fn fd_cache_cap() -> usize {
-    static CAP: Lazy<usize> = Lazy::new(|| {
-        let mut rl = libc::rlimit {
-            rlim_cur: 1024,
-            rlim_max: 1024,
-        };
-        // SAFETY: plain getrlimit into a stack struct.
-        let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
-            rl.rlim_cur as usize
-        } else {
-            1024
-        };
-        (soft / 4 / worker_count().max(1)).clamp(16, 1024)
-    });
+    static CAP: Lazy<usize> =
+        Lazy::new(|| fd_cache_cap_from(crate::cpu::nofile_soft_as_found(), worker_count()));
     *CAP
+}
+
+/// The pure form of [`fd_cache_cap`]: `soft / 4 / workers`, clamped
+/// `16..=1024` — the derivation the tie test reads.
+pub fn fd_cache_cap_from(nofile_soft: usize, workers: usize) -> usize {
+    (nofile_soft / 4 / workers.max(1)).clamp(16, 1024)
+}
+
+/// The cap in force for this process (the `Lazy` word) and the worker
+/// count it derived from — the tie test's live face.
+pub fn fd_cache_cap_in_force() -> (usize, usize) {
+    (fd_cache_cap(), worker_count())
 }
 
 /// A write's terminal outcome plus the two worker-side instants the

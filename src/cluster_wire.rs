@@ -1664,8 +1664,12 @@ pub fn nofile_soft_limit() -> usize {
 /// possible CPU, the fleet's sessions — and the 1024 login default is a
 /// shell posture, not a resource; the hard limit is the operator's bound).
 /// Returns the soft limit in force afterwards. A refused raise keeps the
-/// limit as found and is announced once.
+/// limit as found and is announced once. **The limit AS FOUND is recorded
+/// first** (`crate::cpu::nofile_soft_as_found`): the raise moves the
+/// listener caps' ceiling and nothing else — `uring_fs::fd_cache_cap`
+/// keeps deriving from the pre-raise limit on every posture.
 pub fn raise_nofile_soft_limit() -> usize {
+    let _ = crate::cpu::nofile_soft_as_found();
     let mut rl = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,

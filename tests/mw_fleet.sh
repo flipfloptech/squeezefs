@@ -743,12 +743,26 @@ netns_setup() { # idx — create the member's netns + veth + routes
     # veth; strict rp_filter on the host side would drop the 10.207/24
     # source arriving toward a non-veth local address.
     sysctl -qw "net.ipv4.conf.$hv.rp_filter=2" || true
+    # A host under SOURCE-BASED policy routing (the field box: `from
+    # <fabric ip> lookup 301`, whose table holds the fabric routes only)
+    # answers a dial to that address through the source's table, where the
+    # veth subnet does not exist — the SYN-ACK leaves by the fabric gateway
+    # and the netns member's JoinAppender dial times out (squeeze-test,
+    # 2026-09-22). One rule per such source sends this veth subnet through
+    # main; netns_teardown removes them.
+    local src
+    for src in $(ip -4 rule show 2>/dev/null | awk '$2=="from" && $3!="all" && $4=="lookup" {print $3}' | sort -u); do
+        ip rule add pref 40 from "$src" to "$net.0/24" lookup main 2>/dev/null || true
+    done
     log "netns $ns up (veth $hv <-> $nv, $net.0/24)"
 }
 
 netns_teardown() { # idx — best-effort delete (veth pair dies with the ns)
-    local idx="$1" ns hv
-    ns="$(ns_name "$idx")" hv="$(veth_host "$idx")"
+    local idx="$1" ns hv net src
+    ns="$(ns_name "$idx")" hv="$(veth_host "$idx")" net="$(ns_subnet "$idx")"
+    for src in $(ip -4 rule show 2>/dev/null | awk -v t="$net.0/24" '$2=="from" && $4=="to" && $5==t {print $3}' | sort -u); do
+        ip rule del pref 40 from "$src" to "$net.0/24" lookup main 2>/dev/null || true
+    done
     ip netns del "$ns" 2>/dev/null || true
     ip link del "$hv" 2>/dev/null || true
 }
@@ -2077,12 +2091,16 @@ teardown_fleet() {
         kill -9 "$mpid" 2>/dev/null || true
         log "swept stray daemon pid $mpid"
     done
-    # Rung 7: sweep every fleet netns (the veth pair dies with it).
+    # Rung 7: sweep every fleet netns (the veth pair dies with it) and the
+    # policy-routing rules netns_setup added for its subnet.
     local nsn
     for nsn in $(ip netns list 2>/dev/null | awk '{print $1}' | grep "^sqzmw-$INSTANCE-m" || true); do
-        ip netns del "$nsn" 2>/dev/null || true
+        netns_teardown "${nsn##*-m}"
         log "swept netns $nsn"
     done
+    while read -r src net; do
+        [ -n "$src" ] && ip rule del pref 40 from "$src" to "$net" lookup main 2>/dev/null || true
+    done < <(ip -4 rule show 2>/dev/null | awk '$1=="40:" && $2=="from" && $4=="to" && $5 ~ /^10\.207\./ {print $3, $5}')
     sleep 1
     # Disconnect every controller still serving an instance NQN (writer
     # daemon-owned data connects + operator meta connects + probe leftovers).

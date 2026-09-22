@@ -46,7 +46,7 @@
 #            TAR_SRC=/scratch/tmp/sym-box/linux/fs \
 #            [GATES="tarx scale shared-dir foreign-touch walls readers walls32"] \
 #            [REPEATS=2] [OUT=/scratch/tmp/sym-box/brackets-<ts>] \
-#            [SQZ_MWFLEET_OSS_GB=16] \
+#            [SQZ_MWFLEET_OSS_GB=16] [SQZ_DEVSUB_OSS_ALGO=lzo-rle] \
 #        bash 2026-09-21-sym-box-brackets.sh
 #   SMOKE=1 = the laptop PLUMBING run ("it works" only — the venue law):
 #   relaxes the sqz-kernel and quiet-box gates, labels every line SMOKE, and
@@ -77,7 +77,11 @@ LEG_EXTRA="${LEG_EXTRA:-}"
 FLEET_A_WRITERS="${FLEET_A_WRITERS:-7}"
 FLEET_B_READERS="${FLEET_B_READERS:-31}"
 FLEET_C_WRITERS="${FLEET_C_WRITERS:-31}"
-export SQZ_BIN="$BIN" SQZ_MWFLEET_OSS_GB="${SQZ_MWFLEET_OSS_GB:-16}"
+# The zram algorithm: squeeze-test's sqz kernel offers lzo-rle / lzo only
+# (the D-5 fleet ran `lzo-rle` there); the laptop has zstd. The devsub's
+# default is zstd, so the box run names its algorithm — refused loud by
+# the devsub otherwise ("zram algorithm 'zstd' unavailable").
+export SQZ_BIN="$BIN" SQZ_MWFLEET_OSS_GB="${SQZ_MWFLEET_OSS_GB:-16}" SQZ_DEVSUB_OSS_ALGO="${SQZ_DEVSUB_OSS_ALGO:-zstd}"
 mkdir -p "$OUT"
 TAG="sym-box"; [ "$SMOKE" = "1" ] && TAG="sym-box SMOKE"
 log() { echo "[$TAG] $*" | tee -a "$OUT/box.log"; }
@@ -93,7 +97,7 @@ esac
 # `env -u`: the daemon's knob gate announces every unregistered SQZ_* name
 # on stderr — SQZ_BIN / SQZ_MWFLEET_* are the RIG's words (the fleet scrubs
 # them before it launches a daemon), so the identity read runs without them.
-env -u SQZ_BIN -u SQZ_MWFLEET_OSS_GB "$BIN" --version | grep -q "profile" || die "$BIN does not name its profile — not a squeezefs binary?"
+env -u SQZ_BIN -u SQZ_MWFLEET_OSS_GB -u SQZ_DEVSUB_OSS_ALGO "$BIN" --version | grep -q "profile" || die "$BIN does not name its profile — not a squeezefs binary?"
 [ -f "$STATE/members.tsv" ] && die "a fleet already exists at $STATE — tear it down first (sudo $FLEET teardown)"
 if pgrep -x cargo >/dev/null 2>&1 || pgrep -x rustc >/dev/null 2>&1 || pgrep -x fio >/dev/null 2>&1; then
     [ "$SMOKE" = "1" ] || die "the box is not quiet (cargo / rustc / fio running)"
@@ -112,8 +116,8 @@ esac
 
 {
     echo "== sym-box brackets $TS host $(hostname) kernel $(uname -r) gates [$GATES] repeats $REPEATS out $OUT"
-    echo "   B: $(env -u SQZ_BIN -u SQZ_MWFLEET_OSS_GB "$BIN" --version 2>/dev/null | head -1) sha256 $(sha256sum "$BIN" | cut -c1-16)"
-    echo "   fleet: $FLEET (tcp devsub, OSS ${SQZ_MWFLEET_OSS_GB} GiB zram per data volume); matrix: $MATRIX --venue=box"
+    echo "   B: $(env -u SQZ_BIN -u SQZ_MWFLEET_OSS_GB -u SQZ_DEVSUB_OSS_ALGO "$BIN" --version 2>/dev/null | head -1) sha256 $(sha256sum "$BIN" | cut -c1-16)"
+    echo "   fleet: $FLEET (tcp devsub, OSS ${SQZ_MWFLEET_OSS_GB} GiB zram ${SQZ_DEVSUB_OSS_ALGO} per data volume); matrix: $MATRIX --venue=box"
     echo "   loadavg $(cut -d' ' -f1-3 /proc/loadavg); cpus $(nproc); mem $(awk '/MemTotal/ {printf "%.0f GiB", $2/1048576}' /proc/meminfo)"
     echo "   patch 0031 (per-queue bg budget) is part of the sqz series on this kernel: $(uname -v)"
 } | tee -a "$OUT/box.log"

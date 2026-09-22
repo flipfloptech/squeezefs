@@ -3952,7 +3952,15 @@ leg_sym_scale() {
     rowdir="$STATE/rows/symscale-$(date +%s)"
     mkdir -p "$rowdir"
     log "sym-scale: N ∈ {${ns[*]}} RW mounts each creating $SYM_FILES files ($SYM_THREADS threads) in its OWN directory, then ingesting $SYM_INGEST_MB MiB (4 MiB blocks, conv=fsync); exactly N appenders live per row"
-    printf '%-4s %-10s %-8s %-10s %-8s %-9s %-8s %-8s %-8s %-6s %s\n' N CREATE_S RATIO INGEST_MBS RATIO MGR_LOAD MGR_CPU HANDOV SHIPS RPCS VERDICT | tee "$rowdir/symscale-table.tsv"
+    # C/CPU-S (PR 13c, gate 3's venue term): the create phase's creates per
+    # DAEMON-CPU-second, Σ over the row's writers — the co-located venue's
+    # reading of the ≥ 0.7 × N law (design §8 gate 3: on one box the
+    # writers share the cores, so the wall-clock multiple is bounded by the
+    # box, not the mechanism). MGR_CPU is the manager's process CPU over
+    # the WHOLE row (create + ingest) — the first build divided the
+    # create + ingest CPU by the INGEST wall alone (1,322 % on the box was
+    # 9.8 CPU-s ÷ 0.74 s).
+    printf '%-4s %-10s %-8s %-9s %-10s %-8s %-9s %-8s %-8s %-8s %-6s %s\n' N CREATE_S RATIO C/CPU-S INGEST_MBS RATIO MGR_LOAD MGR_CPU HANDOV SHIPS RPCS VERDICT | tee "$rowdir/symscale-table.tsv"
     local n rate1="" ingest1="" verdict_all=MET zero_miss_all=""
     # A per-run tag on every directory: a died run's residue never
     # collides with the next run's creates ("File exists").
@@ -3966,11 +3974,12 @@ leg_sym_scale() {
         sleep 2
         local idx
         for idx in "${writers[@]}"; do snap "$idx" "n${n}0" "$rowdir"; done
-        local cpu0 t0 t1
+        local cpu0 t0 t1 t_row0
         cpu0="$(sym_cpu_ticks 0)"
         # The create row: every writer's storm at once, one directory each.
         local -a pids=()
         t0="$(date +%s.%N)"
+        t_row0="$t0"
         for idx in "${writers[@]}"; do
             mkdir -p "$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx"
             "$SYM_STORM" "$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx" "$SYM_THREADS" "$SYM_FILES" create \
@@ -3983,6 +3992,19 @@ leg_sym_scale() {
         [ "$rc" = "0" ] || die "sym-scale N=$n: a create storm FAILED (see $rowdir/create-n$n-w*.txt)"
         local create_rate
         create_rate="$(python3 -c "print(f'{$n*$SYM_FILES/($t1-$t0):.0f}')")"
+        # The create phase's own daemon-CPU face (the snapshot between the
+        # two phases — the ingest's CPU never pollutes it).
+        for idx in "${writers[@]}"; do snap "$idx" "n${n}c" "$rowdir"; done
+        local create_cpu_ns=0 v_cpu creates_per_cpu_s
+        for idx in "${writers[@]}"; do
+            v_cpu="$(python3 -c "
+import json
+a=json.load(open('$rowdir/m${idx}_pn${n}0.json'))['metrics']['daemon_cpu_ns']
+b=json.load(open('$rowdir/m${idx}_pn${n}c.json'))['metrics']['daemon_cpu_ns']
+print(int(b)-int(a))" 2>/dev/null || echo 0)"
+            create_cpu_ns=$((create_cpu_ns + v_cpu))
+        done
+        creates_per_cpu_s="$(python3 -c "print(f'{$n*$SYM_FILES*1e9/max(1,$create_cpu_ns):.0f}')")"
         # The ingest row: 4 MiB blocks, conv=fsync, one file per writer.
         pids=()
         t0="$(date +%s.%N)"
@@ -4027,7 +4049,7 @@ leg_sym_scale() {
         mgr_cpu="$(python3 -c "
 import os
 hz = os.sysconf('SC_CLK_TCK')
-print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t0):.0f}')")"
+print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t_row0):.0f}')")"
         [ -n "$rate1" ] || rate1="$create_rate"
         [ -n "$ingest1" ] || ingest1="$ingest_rate"
         local cr ir verdict
@@ -4041,7 +4063,7 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t0):.0f}')")"
             zero_miss_all="$zero_miss_all N=$n:$zero_miss"
         fi
         [ "$verdict" = "MET" ] || verdict_all=MISS
-        printf '%-4s %-10s %-8s %-10s %-8s %-9s %-8s %-8s %-8s %-6s %s\n' "$n" "$create_rate" "${cr}x" "$ingest_rate" "${ir}x" "$mgr_load" "${mgr_cpu}%" "$handovers" "$ships" "$rpcs" "$verdict" | tee -a "$rowdir/symscale-table.tsv"
+        printf '%-4s %-10s %-8s %-9s %-10s %-8s %-9s %-8s %-8s %-8s %-6s %s\n' "$n" "$create_rate" "${cr}x" "$creates_per_cpu_s" "$ingest_rate" "${ir}x" "$mgr_load" "${mgr_cpu}%" "$handovers" "$ships" "$rpcs" "$verdict" | tee -a "$rowdir/symscale-table.tsv"
         for idx in "${writers[@]}"; do
             # A sample of the names about to be removed — the LAST ones the
             # storm created (the "deleted stays deleted" arm below judges

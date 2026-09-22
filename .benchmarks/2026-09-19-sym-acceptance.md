@@ -929,6 +929,18 @@ Consequence for the rows: the gate-3 and gate-7 row sets stopped at r1
 (the legs die on it; `--venue=box` is the brief's word), and every later
 leg on the SAME fleet died at its door until the driver recreated the
 fleet per leg (harness finding H-B2).
+**→ fixed in PR 13c** (`fix/sym-box-campaign`, the F-B1 commit): ONE law —
+the audit judges a leaf on the time it aged with NO structural hold on
+the SMO mutex; the Σ of hold time per class (`NodeEnv::holds`, stamped on
+the leaf at its dirty transition) is excluded exactly — a RECOVERY's up to
+the published bound (defect 33's law kept), a SERVICE hold's (the
+manager's wire slot grant / release, a transfer's adoption, a projection
+refresh, a region release, the joiner's own wire refill inside its pass)
+its measured overlap, each on its class's gauge
+(`appender_flush_ceiling_{recovery,service}_extensions`); the flush pass's
+own wall past the ceiling is still the overrun. Pin: `sym_appender_tests::
+a_leaf_that_aged_under_a_service_hold_of_the_smo_mutex_is_an_extension_not_an_overrun`.
+The box re-run of gates 3 / 7 is owed on PR 13c's binary.
 
 **F-B2 — a LIVE holder was recalled by a touch (gate 3c's law).** The
 holder m60 ran the harness's LIVE job (a storm under `job-wA/`) while the
@@ -944,6 +956,17 @@ to the rotor at the `A_max` floor, so the touched directory's slot reads
 nearly idle beside a 64-touch burst. A design-rule finding (the two
 levers §7 item 10 prices), not a harness one — the LIVE job is a real
 storm under the slot's directory.
+**→ fixed in PR 13c** (the F-B2 commit; design §5.1.4 amended as built):
+`ops_h(S)` counts the holder's namespace ops on the SUBTREE rooted in S's
+directories — the commit door notes every dentry-bearing commit on the
+parent's ANCESTOR slots too (`RoutedMetaBackend::install_liveness_ancestry`
+over the `dir_parents` memo, consulted behind the armed plane's `Option`),
+so a job live anywhere below a directory keeps that directory's slot; the
+IDLE arm, the trickle-holder reclaim and the crowd law are unchanged. Pin
+(the box's exact shape, `N_floor` forced to 2): `sym_slot_transfer_tests::
+a_holder_live_below_a_directory_is_never_recalled_by_a_burst_into_it` —
+RED on the base at ship 2 (`OfferDominated`), GREEN with the fix. The box
+re-run of gate 3c is owed.
 
 **F-B3 — the cluster-wire connection cap derives to 64 under
 `SQUEEZEFS_FLEET_SHARE=32` and a 32-member fleet cannot come up.**
@@ -962,6 +985,27 @@ join storm are not measurable on PR 13b's binary**; the 31-joiner fleet C
 (`walls32`) was not attempted for the same reason. Also read on the way:
 a token reader's `.stats` read answered EINVAL while its wire dial was
 refused — a `.stats` read must never fail on a transient wire error.
+**→ fixed in PR 13c** (the F-B3 commit): the cap derives from the RAW
+affinity mask × 16 (the fleet-width exemption class —
+`crate::cpu::raw_parallelism`, its consumer census pinned), floored at the
+shipped 64 and ceilinged by the fd budget (`RLIMIT_NOFILE / 8`: two fds per
+connection, a quarter share; the daemon raises its soft limit to the hard
+one at startup); `SQUEEZEFS_CLUSTER_WIRE_MAX_CONNS` is the lever, railed
+by the fd budget; `member_session_demand_from(cpus, volumes)` is the
+tie-tested per-member demand (32 members × 12 = 384 ≤ 512 at share 32 on
+32 CPUs); a dial refused at accept retries with a doubling backoff inside
+the dial bound and then surfaces the TYPED `RefusalClass::ListenerRefused`
+(EAGAIN), never the first-EOF `InvalidOperation`. The `.stats` defect: the
+kernel's `default_permissions` walk GETATTRs the mount ROOT before
+`/.stats`, and the root's token fetch surfaced the wire error; a token
+reader whose plane answers a transient class now serves the ROOT's attrs
+from its projection (`dlm_token_root_projection_serves` — R-SYM-4's one
+named exception; every child resolve stays fail-closed). Pins:
+`derivation_sweep_tests` (the cap rows + the fleet-demand row),
+`cluster_wire_tests` (the retry lands / fails typed inside the bound),
+`sym_coherence_tests::a_readers_root_attr_survives_the_holders_connection_cap_so_stats_never_fail`.
+The 32-member fleet forming on the laptop's tcp devsub is PR 13c's real-mount
+face; gates 5 and 7@N=32 on the box are owed on PR 13c's binary.
 
 **Harness findings (fixed in the tree, both on the box's first pass):**
 H-B1 — the netns joiner's `JoinAppender` dial to the manager's advertised
@@ -992,6 +1036,54 @@ device READS** (the escalation's seed of partially covered 4 MiB blocks —
 `block_grants` 8 / 11 / 27 / 44 = `block_grant_topups` (the joiners' pull);
 gate 3b's creates and gate 2's `tar -x` are metadata rows (no data bytes
 of note).
+
+#### 3.9.3 Gate 3's N = 8 term, ATTRIBUTED from the row's own `.stats` (PR 13c — no box row run): the co-located venue's per-core slowdown, not a product wall
+
+The `sym-scale` r1 snapshots (`m*_pn{N}{0,1}.json` — per writer, before
+the create storm and after the ingest) read per N:
+
+| N | create c/s | Σ daemon CPU (s, create + ingest) | daemon cores busy | creates per daemon-CPU-s | `meta_op_phase_ns.create.total` µs (m0 / joiner) | `lock_phase_ns.leaf_lock_hold` µs | `meta_txpass_phase_ns` `pass_total` / `window_total` µs (m0) | journal `uring_fs_write_phase_ns.device` µs (m0) |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 5,062 | 9.8 | 1.2 | 4,085 | 105 | 21.8 | 27.7 / 35.8 | 8.4 |
+| 2 | 9,607 | 20.9 | 2.5 | 3,829 | 109 / 97 | 21.7 / 12.4 | 27.1 / 34.8 | 8.1 |
+| 4 | 16,352 | 50.9 | 5.2 | 3,144 | 129 / 114 | 24.3 / 14.5 | 30.7 / 39.5 | 9.4 |
+| 8 | 21,606 | 123.7 | 8.4 | 2,586 | 160 / 143 | 32.0 / 21.5 | 40.7 / 51.3 | 11.4 |
+
+* **The daemons are not CPU-bound**: 8.4 of the box's 32 cores at N = 8,
+  1.0–1.2 cores per daemon (`daemon_cpu_ns` ≡ the per-class Σ). The
+  table's `MGR_CPU` column (1,322 %) was a HARNESS bug — the create +
+  ingest CPU divided by the INGEST wall alone (9.8 CPU-s ÷ 0.74 s); fixed
+  in PR 13c (the whole row's wall).
+* **No product wall**: the conveyor's ρ ≈ 0.3 (`pass_total` 40.7 µs ×
+  ≈ 7.5 k passes/s per daemon), `slot_door_parks` 0, `dlm_guard_wait` 11–15
+  events per 60 k, `leaf_lock_wait` 0.3 µs; the `stripe_lock_wait`s
+  (523–1,188 events at 1.8–4.8 ms) are the INGEST's per-ino 4 MiB merges,
+  not the creates'.
+* **Every RAM-only phase grew +40–58 % per op UNIFORMLY** — `leaf_lock_hold`
+  21.8 → 32.0 µs, `pass_leaf_locks` 24.2 → 35.0, the create's meta op
+  105 → 160 (m0) / 97 → 143 (a joiner), the journal write's device leg
+  8.4 → 11.4 (nvmet-tcp on the same box) — the per-core slowdown of a
+  co-located venue (8 daemons + 32 mdstorm threads on 2 × 16 cores, 2 NUMA
+  nodes, all-core vs single-core turbo, a shared LLC), never one phase's
+  queue.
+* **≈ 600 of the ≈ 700 µs per-create latency growth is OUTSIDE the
+  daemon's meta op** (790 → 1,480 µs per client thread at 4 threads;
+  the meta op grew 55 µs): the FUSE transport + the kernel + the client
+  threads' scheduling on shared cores. The fleet legs do not arm
+  `SQUEEZEFS_OP_PROFILE=1`, so `fuse_op_phase_ns` is absent from these
+  snapshots and the outside term is not decomposed further.
+
+**Decision**: the venue term. The design's gate-3 law presumes N
+independent NODES; on ONE box the writers share the cores with their
+clients and the wall-clock multiple is bounded by the box. Design §8's
+gate-3 row is amended ("per node; on a co-located venue the law is judged
+on creates per daemon-CPU-second, or the row needs one node per writer"),
+and `sym-scale` gains the `C/CPU-S` column — the create phase's creates per
+daemon-CPU-second, read off a snapshot between the create and the ingest
+(never the ingest's CPU) — beside the corrected `MGR_CPU`. The re-run on
+PR 13c's binary reads both; per daemon-CPU-second the box's own numbers
+above fall 4,085 → 2,586 (0.63×) INCLUDING the ingest's CPU — the create
+phase's own reading is the re-run's.
 
 ## 4. Issues found (each with its PR and its red pin)
 

@@ -524,18 +524,21 @@ awsq() { # awsq <canned-dry-run-output> <args...> — query aws call
 }
 
 # remote <ip> [VAR=val ...]  — remote root script arrives on stdin (heredoc).
-# Env values must not contain spaces (use comma-separated lists).
+# The env words ride ONE command string the remote login shell re-parses,
+# so each is `%q`-quoted: a value with a space stays one assignment by
+# construction (comma-separated lists remain the house style for lists).
 remote() {
   local ip="$1"; shift
-  local envs=("$@")
+  local envq=""
+  [ "$#" -eq 0 ] || envq="$(printf '%q ' "$@")"
   local script
   script="$(cat)"
   if $DRY_RUN; then
-    printf "+ ssh %s@%s sudo env %s bash -s <<'EOS'\n" "$REMOTE_USER" "$ip" "${envs[*]:-}"
+    printf "+ ssh %s@%s sudo env %sbash -s <<'EOS'\n" "$REMOTE_USER" "$ip" "$envq"
     printf '%s\nEOS\n' "$script"
   else
     ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_FILE" "$REMOTE_USER@$ip" \
-      "sudo env ${envs[*]:-} bash -s" <<<"$script"
+      "sudo env ${envq}bash -s" <<<"$script"
   fi
 }
 

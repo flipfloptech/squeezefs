@@ -281,7 +281,11 @@ ssh_cmd() { # -> the ssh argv prefix for interactive-less root exec
 }
 
 # rx <idx> [VAR=val ...] — the root script arrives on stdin (heredoc).
-# Prints the script's stdout. Env values must not contain spaces.
+# Prints the script's stdout. Over ssh the env words ride ONE command
+# string the remote login shell re-parses, so each word is `%q`-quoted —
+# a value with a space (or any shell metacharacter) stays one assignment
+# by construction, never a command (review round 2, Issue 17); the local
+# path passes the words as an argv array.
 rx() {
     local idx="$1"
     shift
@@ -291,7 +295,7 @@ rx() {
         if [ "$host" = local ]; then
             printf "+ [m%s local] sudo env %s bash -s <<'EOS'\n%s\nEOS\n" "$idx" "$*" "$script" >&2
         else
-            printf "+ [m%s] ssh %s sudo env %s bash -s <<'EOS'\n%s\nEOS\n" "$idx" "$(ssh_target "$host")" "$*" "$script" >&2
+            printf "+ [m%s] ssh %s sudo env %sbash -s <<'EOS'\n%s\nEOS\n" "$idx" "$(ssh_target "$host")" "$([ "$#" -eq 0 ] || printf '%q ' "$@")" "$script" >&2
         fi
         printf '%s\n' "${RX_CANNED:-}"
         return 0
@@ -304,8 +308,10 @@ rx() {
         fi
     else
         local -a sshv
+        local envq=""
         mapfile -t sshv < <(ssh_cmd)
-        "${sshv[@]}" "$(ssh_target "$host")" "sudo env $* bash -s" <<<"$script"
+        [ "$#" -eq 0 ] || envq="$(printf '%q ' "$@")"
+        "${sshv[@]}" "$(ssh_target "$host")" "sudo env ${envq}bash -s" <<<"$script"
     fi
 }
 

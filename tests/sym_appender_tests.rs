@@ -1823,6 +1823,113 @@ async fn the_flush_ceiling_is_the_checkpoint_age_and_a_parked_device_moves_the_o
     }
 }
 
+/// Symmetric PR 13c, F-B1 (`.benchmarks/2026-09-19-sym-acceptance.md`
+/// §3.9.2): on the box `appender_flush_ceiling_overruns` tripped four
+/// times in 12 minutes, 1–32 ms past the 1,100 ms landing ceiling, with
+/// no recovery in flight — the manager's grant / release / ship SERVICE
+/// holds the volume's SMO mutex 5–127 ms (PR 13 §4.5), the cadence tick
+/// that covers a dirty leaf waits it out, and the ceiling's fixed 2-tick
+/// margin is what it spent. ONE law now (defect 33's recovery extension
+/// generalized): a leaf is judged on the time it aged with NO structural
+/// hold on the mutex — the Σ of SERVICE holds (a wire appender's slot
+/// grant / release, a slot transfer's adoption, a projection refresh, a
+/// region's release, the joiner's own wire refill inside its pass)
+/// overlapping its dirty window is excluded exactly (a monotone Σ on the
+/// node environment, stamped on the leaf at its clean → dirty transition
+/// beside `dirty_since_ns`), a RECOVERY hold's overlap up to the published
+/// `appender_recovery_bound_ms`; what remains past the ceiling is the
+/// overrun. Each excused leaf counts on its class's gauge
+/// (`appender_flush_ceiling_service_extensions` here). RED before: the
+/// leaf that aged under a held mutex read `flush_ceiling_overruns == 1`.
+/// Take the SMO mutex as the SERVICE would, waiting out a cadence pass
+/// that holds it (the seam is try-only; the tick runs every 50 ms).
+async fn hold_smo_as_service(
+    va: &Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend>,
+) -> (
+    squeezefs::meta_backend::kv::backend::SmoHold<'_>,
+    squeezefs::meta_backend::kv::backend::StructuralHold<'_>,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(h) = va.test_hold_smo_as_service() {
+            return h;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the SMO mutex never freed between passes"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_leaf_that_aged_under_a_service_hold_of_the_smo_mutex_is_an_extension_not_an_overrun() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let path = std::path::PathBuf::from(&uris[0]);
+    let ra = open_with_partition(&uris, None).await;
+    let va = Arc::clone(&ra.volumes[0]);
+    ra.create(ROOT_INO, "warm", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    va.checkpoint_now().await.unwrap();
+    let s0 = stats(&va);
+    assert_eq!(s0.flush_ceiling_overruns, 0, "the premise");
+    assert_eq!(s0.flush_ceiling_service_extensions, 0, "the premise");
+    let ceiling = s0.flush_ceiling_ms;
+    // The leaf goes dirty, then a SERVICE holds the mutex past the ceiling
+    // (the box's shape: the tick parked behind the manager's grant service).
+    ra.create(
+        ROOT_INO,
+        "under-a-service-hold",
+        libc::S_IFREG | 0o644,
+        0,
+        0,
+    )
+    .await
+    .unwrap();
+    let hold = hold_smo_as_service(&va).await;
+    tokio::time::sleep(std::time::Duration::from_millis(ceiling + 200)).await;
+    drop(hold);
+    va.checkpoint_now().await.unwrap();
+    let s1 = stats(&va);
+    assert_eq!(
+        s1.flush_ceiling_overruns, 0,
+        "a leaf that aged under a service hold is not an overrun (ceiling {ceiling} ms)"
+    );
+    assert!(
+        s1.flush_ceiling_service_extensions >= 1,
+        "the extension is counted on its class (got {})",
+        s1.flush_ceiling_service_extensions
+    );
+    // The exclusion is EXACT: a hold that ended BEFORE the leaf went dirty
+    // excuses nothing — a parked device past the ceiling is still the
+    // overrun the counter must see.
+    let hold = hold_smo_as_service(&va).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(hold);
+    ra.create(ROOT_INO, "late", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    let park = std::time::Duration::from_millis(ceiling + 400);
+    squeezefs::uring_fs::arm_device_latency(&path, std::time::Duration::ZERO, park);
+    va.checkpoint_now().await.unwrap();
+    squeezefs::uring_fs::disarm_device_latency(&path);
+    let s2 = stats(&va);
+    assert_eq!(
+        s2.flush_ceiling_overruns, 1,
+        "a hold that ended before the leaf went dirty excuses nothing"
+    );
+    assert_eq!(
+        s2.flush_ceiling_service_extensions, s1.flush_ceiling_service_extensions,
+        "no extension counted for a hold outside the dirty window"
+    );
+    for v in &ra.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Review round 1 — the three landed-behaviour bugs, pinned red first.
 // ---------------------------------------------------------------------------

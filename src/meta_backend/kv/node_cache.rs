@@ -1465,6 +1465,11 @@ pub struct CachedNode {
     /// Stamped on forest-slot nodes only (0 for ever on a flat volume);
     /// stale once the floor is taken — read only beside a live floor.
     dirty_since_ns: AtomicU64,
+    /// The structural-hold Σ (`NodeEnv::holds`, `[recovery, service]`) at
+    /// the same transition (PR 13c, F-B1): the flush-ceiling audit's
+    /// `Σ(now) − this` is the hold time that overlapped this leaf's dirty
+    /// window. Stamped where `dirty_since_ns` is — forest-slot nodes only.
+    dirty_since_held_ns: [AtomicU64; 2],
     /// PR M9 (§5.7): the owning cache's budget gauge — handed to every
     /// snapshot's [`FoldMemo`] and the open delta's charge accounting so
     /// a node's charged size is `extent + overlay + memo` bytes.
@@ -1548,6 +1553,7 @@ impl CachedNode {
             pinned: AtomicBool::new(pinned),
             dirty_floor: AtomicU64::new(u64::MAX),
             dirty_since_ns: AtomicU64::new(0),
+            dirty_since_held_ns: [AtomicU64::new(0), AtomicU64::new(0)],
             charge,
             forest_slot: AtomicU32::new(u32::MAX),
         }))
@@ -1831,8 +1837,11 @@ impl CachedNode {
             // (nothing before PR 14 changes a flat mount; review round 2,
             // Issue 24).
             if prev == u64::MAX && self.forest_slot.load(Ordering::Relaxed) != u32::MAX {
-                self.dirty_since_ns
-                    .store(crate::mono_core::monotonic_ns_u64(), Ordering::Release);
+                let now = crate::mono_core::monotonic_ns_u64();
+                self.dirty_since_ns.store(now, Ordering::Release);
+                let held = self.env.holds.snapshot(now);
+                self.dirty_since_held_ns[0].store(held[0], Ordering::Release);
+                self.dirty_since_held_ns[1].store(held[1], Ordering::Release);
             }
         }
         for mut rec in records {
@@ -2023,6 +2032,15 @@ impl CachedNode {
     /// floor after a failed flush keeps its original age).
     pub fn dirty_since_ns(&self) -> u64 {
         self.dirty_since_ns.load(Ordering::Acquire)
+    }
+
+    /// The structural-hold Σ (`[recovery, service]`) stamped at the same
+    /// transition (PR 13c, F-B1) — read beside [`Self::dirty_since_ns`].
+    pub fn dirty_since_held_ns(&self) -> [u64; 2] {
+        [
+            self.dirty_since_held_ns[0].load(Ordering::Acquire),
+            self.dirty_since_held_ns[1].load(Ordering::Acquire),
+        ]
     }
 
     /// Checkpoint flush pass: take the floor (leaving `u64::MAX`) —
@@ -3101,6 +3119,11 @@ impl NodeCache {
     /// builds SMO successors and fresh roots itself).
     pub(crate) fn node_env(&self) -> Arc<NodeEnv> {
         self.env.clone()
+    }
+
+    /// The structural-hold ledger (PR 13c, F-B1) — borrowed, no refcount.
+    pub(crate) fn holds(&self) -> &super::epoch_core::StructuralHolds {
+        &self.env.holds
     }
 
     /// The slot-lease gate (PR 4) — what [`CachedNode::from_loaded`] takes

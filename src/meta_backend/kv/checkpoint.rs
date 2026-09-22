@@ -1789,7 +1789,7 @@ impl KvMetaBackend {
         // its OLDEST leaf's dirty-since instant — the flush-ceiling
         // audit's subjects (KD-SYM-10 bounds the AGE of a dirty leaf, from
         // the record that dirtied it; forest volumes only).
-        let mut had_dirty: Vec<(u32, u64)> = Vec::new();
+        let mut had_dirty: Vec<super::backend::DirtyLeafAge> = Vec::new();
         let region_aware = self.appenders().is_some();
         self.node_cache().for_each_node(|n| {
             if n.dirty_floor() != u64::MAX && !n.state().is_superseded() {
@@ -1799,9 +1799,14 @@ impl KvMetaBackend {
                     let since = n.dirty_since_ns();
                     if since != 0 {
                         let r = self.region_of_node(n);
-                        match had_dirty.iter_mut().find(|(id, _)| *id == r) {
-                            Some((_, oldest)) => *oldest = (*oldest).min(since),
-                            None => had_dirty.push((r, since)),
+                        let held = n.dirty_since_held_ns();
+                        match had_dirty.iter_mut().find(|d| d.region == r) {
+                            Some(d) => d.fold_oldest(since, held),
+                            None => had_dirty.push(super::backend::DirtyLeafAge {
+                                region: r,
+                                since_ns: since,
+                                held_at_since_ns: held,
+                            }),
                         }
                     }
                 }

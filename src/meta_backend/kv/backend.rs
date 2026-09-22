@@ -134,6 +134,7 @@
 use super::alloc_ext::{compaction_reserve_extents, ExtentAllocator};
 use super::checkpoint::{read_newest_ledger, LedgerRecord};
 use super::conveyor_core::ConveyorCore;
+use super::epoch_core::HoldClass;
 use super::journal::{
     checkpoint_reserve_bytes, entry_len_for, record_frame_len, untag, JournalRing, SeqSpan,
 };
@@ -190,7 +191,7 @@ pub use recovery::{
 /// (`open_joined_appender`), its wire acquires, its own checkpoint cycle
 /// and its leave (design §7.3 / §5.1 / §5.3).
 pub mod joined;
-pub use joined::{JoinedAppenderAdmission, JoinedStats};
+pub use joined::{JoinedAppenderAdmission, JoinedStats, SmoHold};
 
 /// `SQUEEZEFS_META_NODE_CACHE_MB` (§5.1; absolute MiB, explicit wins
 /// verbatim — default derived, see [`resolve_node_cache_budget`]).
@@ -1316,11 +1317,6 @@ pub struct KvMetaBackend {
     /// predicted ledger slot — the gap belt's counter (PR 13, defect 25;
     /// `Self::read_root_epoch`). 0 on every write mount.
     pub(super) reader_poll_stops: AtomicU64,
-    /// Dead-appender recoveries holding this volume's SMO mutex right now
-    /// (defect 33 — the flush-ceiling audit's extension witness).
-    recovery_holds: std::sync::atomic::AtomicU32,
-    /// CLOCK_MONOTONIC ns at which the last such hold ended (0 = never).
-    recovery_hold_last_end_ns: AtomicU64,
     /// The `journal_tail_seq` of the last ledger record written (starts
     /// at the mounted record's tail) — the §4.4 pt 4 hole discipline's
     /// progress observable ([`Self::checkpoint_past`]).
@@ -2997,8 +2993,6 @@ impl KvMetaBackend {
             // agree except after a genuine failed-cycle raise.
             checkpoint_seq: AtomicU64::new(ledger.seq.max(alloc.resume_generation())),
             reader_poll_stops: AtomicU64::new(0),
-            recovery_holds: std::sync::atomic::AtomicU32::new(0),
-            recovery_hold_last_end_ns: AtomicU64::new(0),
             last_ledger_tail: AtomicU64::new(ledger.journal_tail_seq),
             // PR VL5a (§5.5.1a): seed the live stamp from the mounted
             // record — every checkpoint re-writes it, so a slot-mapped
@@ -5716,9 +5710,12 @@ impl KvMetaBackend {
         // mutex; the cadence's tick waits out one grant.
         let _smo_guard = if appender_id != 0 {
             let mut smo = self.smo.lock().await;
+            // A SERVICE hold (PR 13c, F-B1): the flush-ceiling audit
+            // excludes its overlap from the leaves that age under it.
+            let hold = self.service_hold();
             self.clear_ring0_window_of_unleased(&mut smo, explicit)
                 .await?;
-            Some(smo)
+            Some((smo, hold))
         } else {
             None
         };
@@ -6617,6 +6614,7 @@ impl KvMetaBackend {
         // (review round 5, Issue 28 — the checkpoint task's order), so no
         // structural pass of this mount spans the transfer.
         let _smo = self.smo.lock().await;
+        let _hold = self.service_hold();
         // Any count: the release site records the set inline or spilled
         // (the wire frame's own class cap bounds what arrives).
         self.manager_release_slot(appender_id, fslot, words, g, tails.to_vec())
@@ -8505,6 +8503,7 @@ impl KvMetaBackend {
         // defect 25), under the SMO mutex (handover → SMO order).
         {
             let _smo = self.smo.lock().await;
+            let _hold = self.service_hold();
             self.consume_checkpoint_seq_for_bitmap().await?;
         }
         region.released.store(true, Ordering::Release);
@@ -10459,47 +10458,77 @@ impl KvMetaBackend {
     /// the pass; the pass wall alone, the round-1 build, read 0 for every
     /// violation up to ≈ 2× the bound). Past the ceiling each such region
     /// is one overrun (must-stay-0), logged.
-    pub(super) fn note_flush_ceiling(&self, had_dirty: &[(u32, u64)], now_ns: u64) {
+    ///
+    /// **ONE law for the structural holds** (PR 13c, F-B1 — defect 33's
+    /// recovery extension generalized): the SMO mutex is the one
+    /// serialized structural actor, and a leaf cannot be flushed while
+    /// another actor holds it — a dead appender's recovery (steps 4–7),
+    /// or the fleet SERVICE (a wire appender's slot grant / release, a
+    /// transfer's adoption, a projection refresh, a region's release, the
+    /// joiner's own wire refill inside its pass: 5–127 ms on the box, the
+    /// 2-tick margin spent). The audited age is the time the leaf aged
+    /// with NO such hold: each leaf stamps `NodeEnv::holds`' Σ at its
+    /// dirty transition, so `Σ(now) − Σ(stamp)` is EXACTLY the hold time
+    /// that overlapped its window (serialized holds never double count).
+    /// A recovery's excusable overlap is capped at the PUBLISHED
+    /// `appender_recovery_bound_ms` (its promise); a service hold's is the
+    /// measured overlap (the service is priced on `manager_service_ns`).
+    /// An excused leaf counts on its class's gauge; the flush pass's own
+    /// wall past the ceiling is still the overrun.
+    pub(super) fn note_flush_ceiling(&self, had_dirty: &[DirtyLeafAge], now_ns: u64) {
         let Some(set) = self.appenders.as_ref() else {
             return;
         };
         let ceiling_ns = set.flush_ceiling_ms * 1_000_000;
-        // Defect 33 (PR 13): a dead appender's recovery holds this
-        // volume's SMO mutex through its per-region steps 4–7 — the pass
-        // that covers a leaf dirty at that instant waits it out, and the
-        // recovery's published bound exceeds the ceiling's 2-tick margin
-        // by design. A leaf whose dirty window a hold overlapped (a hold
-        // in flight now, or one that ended after the leaf went dirty) is
-        // judged against `ceiling + appender_recovery_bound_ms` — both
-        // published — and counted on its own gauge inside that bound.
-        let hold_active = self.recovery_holds.load(Ordering::Acquire) > 0;
-        let last_hold_end = self.recovery_hold_last_end_ns.load(Ordering::Acquire);
-        let extended_ns = ceiling_ns + self.appender_recovery_bound_ms() * 1_000_000;
+        let recovery_cap_ns = self.appender_recovery_bound_ms() * 1_000_000;
+        let held_now = self.cache.holds().snapshot(now_ns);
         let mut over: Vec<(u32, u64)> = Vec::new();
-        let mut extended: Vec<(u32, u64)> = Vec::new();
-        for (r, since) in had_dirty {
-            let age_ns = now_ns.saturating_sub(*since);
+        let mut by_recovery: Vec<(u32, u64)> = Vec::new();
+        let mut by_service: Vec<(u32, u64)> = Vec::new();
+        for leaf in had_dirty {
+            let age_ns = now_ns.saturating_sub(leaf.since_ns);
             if age_ns <= ceiling_ns {
                 continue;
             }
-            let recovery_overlapped = hold_active || last_hold_end > *since;
-            if recovery_overlapped && age_ns <= extended_ns {
-                extended.push((*r, age_ns / 1_000_000));
+            let recovery_ns = held_now[0]
+                .saturating_sub(leaf.held_at_since_ns[0])
+                .min(recovery_cap_ns);
+            let service_ns = held_now[1].saturating_sub(leaf.held_at_since_ns[1]);
+            let judged_ns = age_ns
+                .saturating_sub(recovery_ns)
+                .saturating_sub(service_ns);
+            let row = (leaf.region, age_ns / 1_000_000);
+            if judged_ns > ceiling_ns {
+                over.push(row);
+            } else if recovery_ns > 0 {
+                by_recovery.push(row);
             } else {
-                over.push((*r, age_ns / 1_000_000));
+                by_service.push(row);
             }
         }
-        if !extended.is_empty() {
+        if !by_recovery.is_empty() {
             set.flush_ceiling_recovery_extensions
-                .fetch_add(extended.len() as u64, Ordering::Relaxed);
+                .fetch_add(by_recovery.len() as u64, Ordering::Relaxed);
             log::info!(
                 "meta volume {}: flush ceiling extended by a recovery's hold — appender \
-                 region(s) {extended:?} (id, oldest dirty leaf's age in ms at the covering \
-                 barrier) past the {} ms landing ceiling, inside ceiling + the {} ms recovery \
-                 bound (appender_flush_ceiling_recovery_extensions)",
+                 region(s) {by_recovery:?} (id, oldest dirty leaf's age in ms at the covering \
+                 barrier) past the {} ms landing ceiling, the hold's overlap (≤ the {} ms \
+                 recovery bound) excluded (appender_flush_ceiling_recovery_extensions)",
                 self.path.display(),
                 set.flush_ceiling_ms,
                 self.appender_recovery_bound_ms()
+            );
+        }
+        if !by_service.is_empty() {
+            set.flush_ceiling_service_extensions
+                .fetch_add(by_service.len() as u64, Ordering::Relaxed);
+            log::info!(
+                "meta volume {}: flush ceiling extended by a service hold of the SMO mutex — \
+                 appender region(s) {by_service:?} (id, oldest dirty leaf's age in ms at the \
+                 covering barrier) past the {} ms landing ceiling, the hold's measured overlap \
+                 excluded (appender_flush_ceiling_service_extensions)",
+                self.path.display(),
+                set.flush_ceiling_ms
             );
         }
         if over.is_empty() {
@@ -10510,7 +10539,8 @@ impl KvMetaBackend {
         log::warn!(
             "meta volume {}: flush ceiling OVERRUN — appender region(s) {over:?} (id, oldest \
              dirty leaf's age in ms at the covering barrier) exceeded the {} ms landing \
-             ceiling (appender_flush_ceiling_overruns, must stay 0)",
+             ceiling with every structural hold excluded (appender_flush_ceiling_overruns, \
+             must stay 0)",
             self.path.display(),
             set.flush_ceiling_ms
         );
@@ -10518,11 +10548,33 @@ impl KvMetaBackend {
 
     /// Mark this volume's SMO mutex as held by a dead appender's recovery
     /// (defect 33) for the returned guard's lifetime — the flush-ceiling
-    /// audit judges the leaves that aged under it against the extended
-    /// bound.
-    pub(super) fn recovery_hold(&self) -> RecoveryHold<'_> {
-        self.recovery_holds.fetch_add(1, Ordering::AcqRel);
-        RecoveryHold { be: self }
+    /// audit excludes the hold's overlap (≤ the published recovery bound)
+    /// from the leaves that aged under it.
+    pub(super) fn recovery_hold(&self) -> StructuralHold<'_> {
+        self.structural_hold(HoldClass::Recovery)
+    }
+
+    /// Mark this volume's SMO mutex as held by the fleet SERVICE (PR 13c,
+    /// F-B1) for the guard's lifetime — taken AFTER the mutex (a wait
+    /// behind the flush pass is the pass's time, not a hold). The audit
+    /// excludes the hold's measured overlap from the leaves that aged
+    /// under it.
+    pub(super) fn service_hold(&self) -> StructuralHold<'_> {
+        self.structural_hold(HoldClass::Service)
+    }
+
+    fn structural_hold(&self, class: HoldClass) -> StructuralHold<'_> {
+        self.cache
+            .holds()
+            .begin(class, crate::mono_core::monotonic_ns_u64());
+        StructuralHold { be: self, class }
+    }
+
+    /// Test seam (PR 13c's F-B1 pin): hold the SMO mutex as the SERVICE
+    /// would, when it is free — `None` if a pass holds it.
+    pub fn test_hold_smo_as_service(&self) -> Option<(SmoHold<'_>, StructuralHold<'_>)> {
+        let smo = self.test_try_hold_smo()?;
+        Some((smo, self.service_hold()))
     }
 
     /// The fixed journal extent's RING part: the whole extent on a flat
@@ -18415,6 +18467,7 @@ impl KvMetaBackend {
             self_recoveries: AtomicU64::new(0),
             flush_ceiling_overruns: AtomicU64::new(0),
             flush_ceiling_recovery_extensions: AtomicU64::new(0),
+            flush_ceiling_service_extensions: AtomicU64::new(0),
             pressure_cycles: AtomicU64::new(0),
             joined: AtomicBool::new(false),
             join_refusal,
@@ -26319,15 +26372,37 @@ impl Metadata for KvMetaBackend {
 /// The RAII witness of a dead appender's recovery holding a volume's SMO
 /// mutex (defect 33): dropped, it records the hold's end for the
 /// flush-ceiling audit's overlap test.
-pub(super) struct RecoveryHold<'a> {
+pub struct StructuralHold<'a> {
     be: &'a KvMetaBackend,
+    class: HoldClass,
 }
 
-impl Drop for RecoveryHold<'_> {
+impl Drop for StructuralHold<'_> {
     fn drop(&mut self) {
         self.be
-            .recovery_hold_last_end_ns
-            .fetch_max(crate::mono_core::monotonic_ns_u64(), Ordering::AcqRel);
-        self.be.recovery_holds.fetch_sub(1, Ordering::AcqRel);
+            .cache
+            .holds()
+            .end(self.class, crate::mono_core::monotonic_ns_u64());
+    }
+}
+
+/// One region's oldest dirty LEAF as the flush pass began — the
+/// flush-ceiling audit's subject (KD-SYM-10): its dirty-since instant and
+/// the structural-hold Σ stamped beside it (`[recovery, service]`).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct DirtyLeafAge {
+    pub region: u32,
+    pub since_ns: u64,
+    pub held_at_since_ns: [u64; 2],
+}
+
+impl DirtyLeafAge {
+    /// Fold another dirty leaf of the same region in: the OLDEST wins
+    /// (its stamps travel with it).
+    pub fn fold_oldest(&mut self, since_ns: u64, held_at_since_ns: [u64; 2]) {
+        if since_ns < self.since_ns {
+            self.since_ns = since_ns;
+            self.held_at_since_ns = held_at_since_ns;
+        }
     }
 }

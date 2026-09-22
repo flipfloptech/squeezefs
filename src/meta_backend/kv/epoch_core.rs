@@ -279,6 +279,14 @@ impl Default for AppendGate {
 pub struct NodeEnv {
     pub epoch: RevalidationEpoch,
     pub gate: AppendGate,
+    /// The structural-hold ledger the flush-ceiling audit reads
+    /// (symmetric PR 13c, F-B1): the monotone Σ of the time the volume's
+    /// SMO mutex was held by an actor OTHER than the flush pass, per
+    /// class. A leaf stamps the Σ at its clean → dirty transition; the
+    /// audit's `Σ(now) − Σ(stamp)` is EXACTLY the hold time overlapping
+    /// the leaf's dirty window (holds are serialized by the mutex, so the
+    /// Σ never double counts).
+    pub holds: StructuralHolds,
 }
 
 impl NodeEnv {
@@ -286,6 +294,97 @@ impl NodeEnv {
         Self {
             epoch: RevalidationEpoch::new(durable_tail),
             gate: AppendGate::new(),
+            holds: StructuralHolds::new(),
         }
+    }
+}
+
+/// The class of a structural hold of the SMO mutex — the two actors
+/// whose hold time the flush-ceiling audit excludes from a leaf's age.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldClass {
+    /// A dead appender's recovery (PR 10 §5.9 steps 4–7; its excusable
+    /// overlap is capped at the published `appender_recovery_bound_ms` —
+    /// defect 33's law).
+    Recovery = 0,
+    /// The manager's or a joiner's SERVICE of the fleet under the mutex:
+    /// a wire appender's slot grant / release, a transfer's adoption, a
+    /// projection refresh, a region's release, the joiner's own wire
+    /// refill inside its flush pass (its excusable overlap is the
+    /// measured hold — the service is priced on `manager_service_ns`).
+    Service = 1,
+}
+
+/// Per class: the Σ of completed hold time, the active hold's start
+/// (0 = none) and its nesting depth (a class's guards may nest — the
+/// recovery poll around one region's steps; the outermost brackets the
+/// hold). Both classes hold the ONE mutex, so the Σs are exact.
+#[derive(Debug)]
+pub struct StructuralHolds {
+    held_ns: [atomic::AtomicU64; 2],
+    active_since_ns: [atomic::AtomicU64; 2],
+    depth: [atomic::AtomicU32; 2],
+}
+
+impl Default for StructuralHolds {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StructuralHolds {
+    pub fn new() -> Self {
+        Self {
+            held_ns: [atomic::AtomicU64::new(0), atomic::AtomicU64::new(0)],
+            active_since_ns: [atomic::AtomicU64::new(0), atomic::AtomicU64::new(0)],
+            depth: [atomic::AtomicU32::new(0), atomic::AtomicU32::new(0)],
+        }
+    }
+
+    /// A hold of `class` began at `now_ns` (CLOCK_MONOTONIC); a nested
+    /// guard of an already-active hold only deepens it.
+    pub fn begin(&self, class: HoldClass, now_ns: u64) {
+        let i = class as usize;
+        if self.depth[i].fetch_add(1, atomic::Ordering::AcqRel) == 0 {
+            self.active_since_ns[i].store(now_ns.max(1), atomic::Ordering::Release);
+        }
+    }
+
+    /// A guard of `class` dropped at `now_ns`: the outermost one's
+    /// duration joins the Σ.
+    pub fn end(&self, class: HoldClass, now_ns: u64) {
+        let i = class as usize;
+        if self.depth[i].fetch_sub(1, atomic::Ordering::AcqRel) == 1 {
+            let since = self.active_since_ns[i].swap(0, atomic::Ordering::AcqRel);
+            if since != 0 {
+                self.held_ns[i].fetch_add(now_ns.saturating_sub(since), atomic::Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// The Σ of `class` hold time up to `now_ns`, the active hold's
+    /// elapsed part included — the stamp a leaf takes at its dirty
+    /// transition and the value the audit compares it against.
+    pub fn held_ns(&self, class: HoldClass, now_ns: u64) -> u64 {
+        let done = self.held_ns[class as usize].load(atomic::Ordering::Acquire);
+        let since = self.active_since_ns[class as usize].load(atomic::Ordering::Acquire);
+        if since != 0 {
+            done.saturating_add(now_ns.saturating_sub(since))
+        } else {
+            done
+        }
+    }
+
+    /// Both classes' Σ at `now_ns` (`[recovery, service]`).
+    pub fn snapshot(&self, now_ns: u64) -> [u64; 2] {
+        [
+            self.held_ns(HoldClass::Recovery, now_ns),
+            self.held_ns(HoldClass::Service, now_ns),
+        ]
+    }
+
+    /// Whether a hold of `class` is active.
+    pub fn active(&self, class: HoldClass) -> bool {
+        self.active_since_ns[class as usize].load(atomic::Ordering::Acquire) != 0
     }
 }

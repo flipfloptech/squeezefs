@@ -548,6 +548,7 @@ impl super::super::node_cache::ProjectionRefresh for JoinedProjectionRefresh {
             let Ok(smo) = be.smo.try_lock() else {
                 return false;
             };
+            let _hold = be.service_hold();
             let refreshed = match be.refresh_control_projection_at(SmoHeld::Yes).await {
                 Ok(moved) => moved,
                 Err(e) => {
@@ -1502,6 +1503,7 @@ impl KvMetaBackend {
         // the transfer; the slot was nobody's here until this instant).
         {
             let _smo = self.smo.lock().await;
+            let _hold = self.service_hold();
             self.adopt_transferred_slot_tree(
                 slot,
                 RootPtr {
@@ -1710,7 +1712,7 @@ impl KvMetaBackend {
         // manager's projection (tree 0, its slot trees — folded at the
         // open's replay, refreshed by the poll) is never ours to write.
         let mut dirty: Vec<Arc<super::CachedNode>> = Vec::new();
-        let mut oldest_since: u64 = 0;
+        let mut oldest: Option<super::DirtyLeafAge> = None;
         self.node_cache().for_each_node(|n| {
             if n.dirty_floor() != u64::MAX
                 && !n.state().is_superseded()
@@ -1719,21 +1721,23 @@ impl KvMetaBackend {
                 if n.level() == 0 {
                     let since = n.dirty_since_ns();
                     if since != 0 {
-                        oldest_since = if oldest_since == 0 {
-                            since
-                        } else {
-                            oldest_since.min(since)
-                        };
+                        let held = n.dirty_since_held_ns();
+                        match oldest.as_mut() {
+                            Some(d) => d.fold_oldest(since, held),
+                            None => {
+                                oldest = Some(super::DirtyLeafAge {
+                                    region: own,
+                                    since_ns: since,
+                                    held_at_since_ns: held,
+                                })
+                            }
+                        }
                     }
                 }
                 dirty.push(Arc::clone(n));
             }
         });
-        let had_dirty: Vec<(u32, u64)> = if oldest_since != 0 {
-            vec![(own, oldest_since)]
-        } else {
-            Vec::new()
-        };
+        let had_dirty: Vec<super::DirtyLeafAge> = oldest.into_iter().collect();
         let mut deferred_for_grant = 0u64;
         let mut deferred_for_space = 0u64;
         for node in dirty {
@@ -1747,7 +1751,14 @@ impl KvMetaBackend {
                 let want = u32::try_from(*needed)
                     .unwrap_or(u32::MAX)
                     .max(super::super::appender::SMO_IMAGES_MAX);
-                match self.joined_extent_grant_at(want, Some(&*smo)).await {
+                // The manager's SERVICE the pass waits on, under its own
+                // mutex hold (PR 13c, F-B1): its round trip is excluded
+                // from the leaves' audited age like any service hold.
+                let refill = {
+                    let _hold = self.service_hold();
+                    self.joined_extent_grant_at(want, Some(&*smo)).await
+                };
+                match refill {
                     Ok(n) if n > 0 => {
                         out = tree.checkpoint_flush_node(smo, addr).await;
                     }
@@ -2437,6 +2448,7 @@ impl KvMetaBackend {
         // grant): the consumed seq below restates the ledger's roots, so
         // no cycle may be mid-flight.
         let _smo = self.smo.lock().await;
+        let _hold = self.service_hold();
         let _g = self.manager_verbs.lock().await;
         let segments = std::mem::take(&mut page.segments);
         page.state = AppenderState::Free;
@@ -2830,7 +2842,10 @@ impl KvMetaBackend {
             // what the manager checkpointed since, the ring what it did
             // not — the reader's bounded-staleness law for a projection).
             let _smo = match smo_held {
-                SmoHeld::No => Some(self.smo.lock().await),
+                SmoHeld::No => {
+                    let smo = self.smo.lock().await;
+                    Some((smo, self.service_hold()))
+                }
                 SmoHeld::Yes => None,
             };
             // Test seam (Issue 14's pin): park HERE, the root moves ahead

@@ -2786,6 +2786,7 @@ impl KvMetaBackend {
             // cycle is mid-flight while the roots are restated.
             {
                 let _smo = self.smo.lock().await;
+                let _hold = self.recovery_hold();
                 self.consume_checkpoint_seq_for_bitmap().await?;
             }
             released += 1;

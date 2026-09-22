@@ -2301,6 +2301,15 @@ pub struct AppenderSet {
     /// apart so the must-stay-0 overrun keeps its meaning; a barrier past
     /// the extended bound is still an overrun.
     pub flush_ceiling_recovery_extensions: std::sync::atomic::AtomicU64,
+    /// Late covering barriers explained by a SERVICE hold of the SMO mutex
+    /// (PR 13c, F-B1 — the box's 1–32 ms overruns with no recovery in
+    /// flight): the manager's slot grant / release to a wire appender, a
+    /// transfer's adoption, a projection refresh, a region's release, the
+    /// joiner's own wire refill inside its flush pass. The excluded time
+    /// is the MEASURED overlap of such holds with the leaf's dirty window
+    /// (`NodeEnv::holds`), never a constant — the service is priced on
+    /// `manager_service_ns`; what remains past the ceiling is the overrun.
+    pub flush_ceiling_service_extensions: std::sync::atomic::AtomicU64,
     /// Checkpoint cycles a declared region's ring pressure made due (§4.6
     /// pt 2 per region — [`AppenderSet::ring_pressure`]): a parked
     /// committer is drained by the next cadence tick, never by the
@@ -2682,6 +2691,7 @@ impl AppenderSet {
             ring_grows: self.ring_grows(),
             flush_ceiling_overruns: self.flush_ceiling_overruns.load(Relaxed),
             flush_ceiling_recovery_extensions: self.flush_ceiling_recovery_extensions.load(Relaxed),
+            flush_ceiling_service_extensions: self.flush_ceiling_service_extensions.load(Relaxed),
             flush_ceiling_ms: self.flush_ceiling_ms,
             pressure_cycles: self.pressure_cycles.load(Relaxed),
             manager_lease: self
@@ -2796,6 +2806,9 @@ pub struct AppenderStats {
     /// Late covering barriers explained by a recovery's SMO-mutex hold
     /// (inside the extended bound) — defect 33.
     pub flush_ceiling_recovery_extensions: u64,
+    /// Late covering barriers explained by a service hold of the SMO
+    /// mutex (the measured overlap excluded) — PR 13c, F-B1.
+    pub flush_ceiling_service_extensions: u64,
     /// The flush ceiling in force, ms (`appender_flush_ceiling_ms`) —
     /// published so the bound the gauge audits cannot drift from the docs.
     pub flush_ceiling_ms: u64,

@@ -299,6 +299,17 @@ static XV_CO_STEP_LATE_GUARD_REFUSALS: AtomicU64 = AtomicU64::new(0);
 /// cross-owner arm (PR 13, defect 30; `xv_cross_owner_op_slot_moved_
 /// redispatches`).
 static XV_CO_OP_SLOT_MOVED_REDISPATCHES: AtomicU64 = AtomicU64::new(0);
+/// The cross-owner plan builders' "no inode record — removing the
+/// dangling name and accounting nothing" arm (an unlink / rmdir / rename-
+/// over whose child witness read NONE): the count step is dropped and the
+/// name alone goes. **Must stay 0 on an armed mount** — a child whose slot
+/// another appender leases has its witness read AT THE HOLDER (PR 13e,
+/// F-R3), so a `None` here is a record genuinely gone; before it the
+/// local read of a foreign lessee's slot answered this daemon's
+/// PROJECTION (never the leased root — KD-SYM-3), and every `rm -rf` of
+/// a directory another appender had created into orphaned one inode per
+/// name (`xv_cross_owner_dangling_names`).
+static XV_CO_DANGLING_NAMES: AtomicU64 = AtomicU64::new(0);
 /// Guard scopes this holder parked for a remote initiator.
 static XV_CO_GUARDS_PARKED: AtomicU64 = AtomicU64::new(0);
 /// Parked scopes released by the lease-expiry sweep, not their initiator
@@ -558,6 +569,9 @@ pub struct CrossOwnerStats {
     pub guards_parked: u64,
     /// **Must stay 0**: scopes the lease-expiry sweep released.
     pub guard_expiries: u64,
+    /// PR 13e (F-R3), **must stay 0 on an armed mount**: plan builders
+    /// that found no child record and dropped the count step.
+    pub dangling_names: u64,
 }
 
 /// Read the family.
@@ -582,7 +596,14 @@ pub fn cross_owner_stats() -> CrossOwnerStats {
         op_slot_moved_redispatches: XV_CO_OP_SLOT_MOVED_REDISPATCHES.load(Ordering::Relaxed),
         guards_parked: XV_CO_GUARDS_PARKED.load(Ordering::Relaxed),
         guard_expiries: XV_CO_GUARD_EXPIRIES.load(Ordering::Relaxed),
+        dangling_names: XV_CO_DANGLING_NAMES.load(Ordering::Relaxed),
     }
+}
+
+/// A plan builder found no record for the child it removes a name of and
+/// dropped the count step (the `xv_cross_owner_dangling_names` arm).
+pub(crate) fn note_dangling_name() {
+    XV_CO_DANGLING_NAMES.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The family as the stats inode serves it (its keys are §11's names).
@@ -647,6 +668,10 @@ pub fn cross_owner_stats_json() -> serde_json::Map<String, serde_json::Value> {
     out.insert(
         "xv_cross_owner_guard_expiries".into(),
         s.guard_expiries.into(),
+    );
+    out.insert(
+        "xv_cross_owner_dangling_names".into(),
+        s.dangling_names.into(),
     );
     out.insert(
         "dir_rename_lock_acquires".into(),

@@ -5530,11 +5530,15 @@ impl RoutedMetaBackend {
                     },
                     ctime: Some(kv::backend::KvMetaBackend::now_ns_pub()),
                 }),
-                None => log::warn!(
-                    "cross-volume unlink of {name:?} in parent {parent}: child ino \
-                     {global_child_ino} has no inode record — removing the dangling name \
-                     and accounting nothing (run `squeezefs fsck`)"
-                ),
+                None => {
+                    crossvol_tx::note_dangling_name();
+                    log::warn!(
+                        "cross-volume unlink of {name:?} in parent {parent}: child ino \
+                         {global_child_ino} has no inode record — removing the dangling name \
+                         and accounting nothing (run `squeezefs fsck`; \
+                         xv_cross_owner_dangling_names)"
+                    );
+                }
             }
             let plan = crossvol_tx::XvPlan {
                 op: if is_dir {

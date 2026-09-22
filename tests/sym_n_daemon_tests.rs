@@ -10060,3 +10060,374 @@ async fn a_cold_ls_of_a_striped_directory_at_a_token_reader_pays_one_token_per_s
     venue.tear_down();
     shutdown(&manager).await;
 }
+
+// ---------------------------------------------------------------------------
+// PR 13e — the box re-run's findings (record §3.9.4.3): F-R3, the cross-owner
+// plan's child witness read off this daemon's PROJECTION of a foreign
+// lessee's slot.
+// ---------------------------------------------------------------------------
+
+/// Stand the initiator's halves up for `writer`: the process-global step
+/// shipper (the ladder's rung 7, keyed by its member id) and PR 9's custody
+/// arm over ITS set — the mount path's `arm_mount_slot_custody`, which is
+/// what dials the writer's read divert to a foreign slot's HOLDER. Both
+/// are process-global, so a contract that moves the initiator role between
+/// two in-process daemons re-stands them per phase.
+async fn stand_up_initiator(
+    writer: &Arc<RoutedMetaBackend>,
+    identity: &AppenderIdentity,
+) -> Arc<squeezefs::data_grant::SlotCustodyArm> {
+    squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
+    squeezefs::data_grant::disarm_slot_custody().await;
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(writer),
+            &peer_of(identity),
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    let sink = Arc::new(ProbeSink {
+        calls: std::sync::atomic::AtomicU64::new(0),
+    });
+    squeezefs::data_grant::arm_slot_custody(
+        writer,
+        &peer_of(identity),
+        VENUE_SECRET.to_vec(),
+        0,
+        Arc::new(move |_volume| {
+            Arc::clone(&sink) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
+        }),
+    )
+}
+
+/// The child's record at ITS HOLDER after a cross-owner removal: `nlink 0`
+/// (the count step landed) or already destroyed — never `nlink ≥ 1` with
+/// no name (the orphan).
+async fn assert_counted_out(holder: &RoutedMetaBackend, ino: u64, what: &str) {
+    if let Ok(a) = holder.getattr(ino).await {
+        assert_eq!(
+            a.nlink, 0,
+            "{what}: the child's count step never landed at its holder — nlink {} with no \
+             name is the orphan F-R3 leaked (430 / 512 per `rm -rf` on the box)",
+            a.nlink
+        );
+    }
+}
+
+/// **F-R3 (record §3.9.4.3 / §4.4aj; a FLIP PRECONDITION): a cross-owner
+/// unlink of a child ANOTHER appender minted reads the child's witness AT
+/// ITS HOLDER, never this daemon's projection.** The joiner creates into
+/// the MANAGER's directory (PR 6: the dentry ships, the child is minted in
+/// the joiner's rotor) and the manager `rm`s them; then the reverse (the
+/// manager creates into the joiner's directory, the joiner `rm`s); then a
+/// joiner-minted directory `rmdir`ed by the manager. RED on `7f4b007e`: the
+/// plan builder read the witness with `read_inode_value_routed` — a LOCAL
+/// KV read of this daemon's PROJECTION of the lessee's slot, which by
+/// KD-SYM-3 never sees the leased root (it rides the lessee's page) — found
+/// `None`, DROPPED the `SetNlink` step, shipped the `RemoveDentry` alone,
+/// and logged "child ino … has no inode record — removing the dangling
+/// name and accounting nothing" once per victim (m60: 430 / 512 lines in
+/// one `rm -rf`, `rm -rf` reporting success); every child stayed `nlink 1`
+/// with zero names at its creator, invisible to fsck while the lessee
+/// lived (the inode plane scopes live foreign lessees' slots out). GREEN:
+/// the witness is read through the writer's read divert (the holder's
+/// token plane — one grant, already held from the `lookup` that precedes
+/// an `rm`, recalled by the very step the plan ships), every child reads
+/// `nlink 0` at its holder, `xv_cross_owner_dangling_names` stays 0, and
+/// the offline fsck after every writer LEAVES reads no C9.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cross_owner_unlink_of_a_foreign_minted_child_reads_its_witness_at_the_holder() {
+    use squeezefs::meta_backend::crossvol_tx::cross_owner_stats;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared"), (SLOT_B, "jdir")]).await;
+    let (shared, jdir) = (dirs[0], dirs[1]);
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mvenue = DaemonVenue::stand_up(&manager, true, "manager-custody-f-r3").await;
+    let midentity = page_of(&uris[0], &mvol, 0).await.expect("page 0").identity;
+    // The MANAGER holds `shared` (its first touch).
+    manager
+        .create(shared, "m0", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap();
+    let joiner = {
+        Knobs::armed().apply();
+        let r = open_routed_meta_set_joined(
+            &uris,
+            &JoinedSetAdmission {
+                manager_endpoint: mvenue.endpoint.clone(),
+                secret: VENUE_SECRET.to_vec(),
+                peer_id: peer_of(&joiner_identity(&mvol, 71).await),
+                identity: joiner_identity(&mvol, 71).await,
+            },
+        )
+        .await;
+        Knobs::clear();
+        r.expect("the joined open")
+    };
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jid = jvol.appender_stats().unwrap().appender_id;
+    let jidentity = jvol.joined_wire().unwrap().identity;
+    let jvenue = DaemonVenue::stand_up(&joiner, false, "joiner-custody-f-r3").await;
+    // The bindings the ladders make (the manager dials the joiner where it
+    // serves; the joiner learnt the manager's at its join).
+    mvol.slot_leases()
+        .unwrap()
+        .holders
+        .set_endpoint(jid, &jvenue.endpoint);
+    // The JOINER holds `jdir` (its first touch, over the wire).
+    joiner
+        .create(jdir, "j0", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap();
+    assert!(matches!(
+        tree0_state(&mvol, SLOT_B).await,
+        Some(SlotState::Leased { appender_id, .. }) if appender_id == jid
+    ));
+
+    // A. The joiner creates into the MANAGER's directory: six children in
+    // the joiner's rotor, their names at the manager.
+    let _jarm = stand_up_initiator(&joiner, &jidentity).await;
+    let from_joiner = create_files(&joiner, shared, "jf", 6).await;
+    for (name, ino) in &from_joiner {
+        let slot = slot_of_global(&manager, *ino);
+        assert!(
+            matches!(
+                tree0_state(&mvol, slot).await,
+                Some(SlotState::Leased { appender_id, .. }) if appender_id == jid
+            ),
+            "{name} was minted in the joiner's rotor (slot {slot})"
+        );
+    }
+    let sub = joiner
+        .create(shared, "jsub", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("a joiner's mkdir into the manager's directory")
+        .ino;
+    let shared_nlink_with_sub = manager.getattr(shared).await.unwrap().nlink;
+
+    // The MANAGER unlinks them (the box's `rm -rf` shape): its shipper, its
+    // read divert. Every witness is the JOINER's word.
+    let _marm = stand_up_initiator(&manager, &midentity).await;
+    let s0 = cross_owner_stats();
+    for (name, _) in &from_joiner {
+        manager
+            .unlink(shared, name)
+            .await
+            .unwrap_or_else(|e| panic!("the manager's unlink of {name}: {e}"));
+    }
+    // rmdir of the joiner-minted directory (the `is_dir` arm: post 0).
+    manager
+        .unlink(shared, "jsub")
+        .await
+        .expect("the manager's rmdir of a joiner-minted directory");
+    let s1 = cross_owner_stats();
+    assert_eq!(
+        s1.dangling_names, s0.dangling_names,
+        "the manager's plan builder found every child's record at its holder (RED: the \
+         'no inode record — accounting nothing' arm fired once per victim off the projection)"
+    );
+    for (name, ino) in &from_joiner {
+        assert!(
+            manager.lookup(shared, name).await.is_err(),
+            "{name}: the name is gone at the manager"
+        );
+        assert_counted_out(&joiner, *ino, name).await;
+    }
+    assert!(manager.lookup(shared, "jsub").await.is_err());
+    assert_counted_out(&joiner, sub, "jsub").await;
+    assert_eq!(
+        manager.getattr(shared).await.unwrap().nlink,
+        shared_nlink_with_sub - 1,
+        "the rmdir's parent bump landed"
+    );
+
+    // B. The reverse: the manager creates into the JOINER's directory
+    // (children in the manager's rotor), the joiner unlinks them — the
+    // witness is the MANAGER's word (holder 0 of a joiner's foreign slot).
+    let from_manager = create_files(&manager, jdir, "mf", 4).await;
+    for (name, ino) in &from_manager {
+        let slot = slot_of_global(&manager, *ino);
+        assert!(
+            matches!(
+                tree0_state(&mvol, slot).await,
+                Some(SlotState::Leased { appender_id: 0, .. })
+            ),
+            "{name} was minted in the manager's rotor (slot {slot})"
+        );
+    }
+    let _jarm = stand_up_initiator(&joiner, &jidentity).await;
+    let s2 = cross_owner_stats();
+    for (name, _) in &from_manager {
+        joiner
+            .unlink(jdir, name)
+            .await
+            .unwrap_or_else(|e| panic!("the joiner's unlink of {name}: {e}"));
+    }
+    let s3 = cross_owner_stats();
+    assert_eq!(s3.dangling_names, s2.dangling_names);
+    for (name, ino) in &from_manager {
+        assert!(joiner.lookup(jdir, name).await.is_err());
+        assert_counted_out(&manager, *ino, name).await;
+    }
+    assert_must_stay_zero(&jvol, "joiner");
+    assert_must_stay_zero(&mvol, "manager");
+    assert_eq!(cross_owner_stats().intents_open, 0, "every plan retired");
+
+    // The leave, then the census the lessee's life hid: an offline fsck
+    // over every tree (every slot unleased now) must read no C9.
+    squeezefs::data_grant::disarm_slot_custody().await;
+    squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    jvenue.tear_down();
+    mvenue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+/// **F-R3's other witness classes** (the brief's audit of every local
+/// witness read in the cross-owner plan): a `link` of a foreign-minted
+/// file (its `pre` read answered `NotFound` off the projection — the link
+/// failed `ENOENT` for a file that exists), a `rename` OVER a foreign-
+/// minted name (the destination's `SetNlink` dropped — the orphan again),
+/// and a DIRECTORY MOVE out of a foreign-held parent (the old parent's
+/// nlink shift read a stale or absent parent record — the shift step was
+/// skipped or the underflow guard fired, and the parent's `nlink` drifted
+/// at its holder for ever). Every witness is the holder's word now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cross_owner_link_rename_over_and_directory_move_read_their_witnesses_at_the_holder() {
+    use squeezefs::meta_backend::crossvol_tx::cross_owner_stats;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared"), (SLOT_B, "jdir")]).await;
+    let (shared, jdir) = (dirs[0], dirs[1]);
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mvenue = DaemonVenue::stand_up(&manager, true, "manager-custody-f-r3b").await;
+    let midentity = page_of(&uris[0], &mvol, 0).await.expect("page 0").identity;
+    manager
+        .create(shared, "m0", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap();
+    let joiner = {
+        Knobs::armed().apply();
+        let r = open_routed_meta_set_joined(
+            &uris,
+            &JoinedSetAdmission {
+                manager_endpoint: mvenue.endpoint.clone(),
+                secret: VENUE_SECRET.to_vec(),
+                peer_id: peer_of(&joiner_identity(&mvol, 72).await),
+                identity: joiner_identity(&mvol, 72).await,
+            },
+        )
+        .await;
+        Knobs::clear();
+        r.expect("the joined open")
+    };
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jid = jvol.appender_stats().unwrap().appender_id;
+    let jidentity = jvol.joined_wire().unwrap().identity;
+    let jvenue = DaemonVenue::stand_up(&joiner, false, "joiner-custody-f-r3b").await;
+    mvol.slot_leases()
+        .unwrap()
+        .holders
+        .set_endpoint(jid, &jvenue.endpoint);
+    joiner
+        .create(jdir, "j0", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap();
+
+    // The joiner's two files in the manager's directory.
+    let _jarm = stand_up_initiator(&joiner, &jidentity).await;
+    let jf = joiner
+        .create(shared, "jf", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap()
+        .ino;
+    let jg = joiner
+        .create(shared, "jg", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap()
+        .ino;
+
+    let _marm = stand_up_initiator(&manager, &midentity).await;
+    let s0 = cross_owner_stats();
+    // (a) link: the manager links the joiner-minted file under a second
+    // name in its own directory.
+    let linked = manager.link(jf, shared, "jf-link").await.expect(
+        "a link of a foreign-minted file is an ordinary op (RED: ENOENT off the projection)",
+    );
+    assert_eq!(linked.nlink, 2);
+    assert_eq!(
+        joiner.getattr(jf).await.unwrap().nlink,
+        2,
+        "the count step landed at the holder"
+    );
+    // (b) rename OVER the joiner-minted name: the manager's own file takes
+    // `jg`'s name; `jg` is counted out at its holder.
+    manager
+        .create(shared, "mf", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap();
+    manager
+        .rename(shared, "mf", shared, "jg", 0)
+        .await
+        .expect("a rename over a foreign-minted name");
+    assert_counted_out(&joiner, jg, "jg (rename-over)").await;
+    // (c) a directory MOVE out of the joiner-held parent: the manager
+    // mkdirs `sub` INTO `jdir` (the bump ships: jdir nlink 3 at the
+    // joiner), then moves it into `shared` — the old parent's nlink shift
+    // is read at the joiner.
+    let jdir_nlink0 = joiner.getattr(jdir).await.unwrap().nlink;
+    manager
+        .create(jdir, "sub", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("a mkdir into a foreign-held directory");
+    assert_eq!(joiner.getattr(jdir).await.unwrap().nlink, jdir_nlink0 + 1);
+    let shared_nlink0 = manager.getattr(shared).await.unwrap().nlink;
+    manager
+        .rename(jdir, "sub", shared, "sub", 0)
+        .await
+        .expect("a directory move out of a foreign-held parent");
+    assert_eq!(
+        joiner.getattr(jdir).await.unwrap().nlink,
+        jdir_nlink0,
+        "the old parent's nlink shift landed at its holder (RED: the shift read a stale or \
+         absent parent record off the projection and was skipped)"
+    );
+    assert_eq!(
+        manager.getattr(shared).await.unwrap().nlink,
+        shared_nlink0 + 1
+    );
+    let s1 = cross_owner_stats();
+    assert_eq!(s1.dangling_names, s0.dangling_names);
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .dir_nlink_underflows
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no underflow guard fired on a stale parent witness"
+    );
+    assert_must_stay_zero(&jvol, "joiner");
+    assert_must_stay_zero(&mvol, "manager");
+    assert_eq!(cross_owner_stats().intents_open, 0);
+
+    squeezefs::data_grant::disarm_slot_custody().await;
+    squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    jvenue.tear_down();
+    mvenue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}

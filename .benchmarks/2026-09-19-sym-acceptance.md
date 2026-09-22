@@ -139,6 +139,8 @@ class). "dev" = scoping venue; "box" = squeeze-test.)_
 > **the per-NODE law ("bounded by no node") is UNMEASURED on any venue and
 > a multi-node venue (PR 15's cloud row) is its instrument.**
 
+> **Status (the box RE-RUN on PR 13c's binary `77f4da1d`, `perf/sym-box-rerun`, 2026-09-22 11:02 → 13:52 UTC — §3.9.4; the counted-run law: every row set from zero, gates 2 / 3b not re-run):** **gate 1** — `rr4k` PAR (0.999; the −1.8 % residual GONE), `mkdir` within noise (0.976 / 0.984 — the MISS closed), `create` / `stat` / `manydirs` / `rmdir` / `w_fresh` / mount / remount within noise, `rw4k` 0.970 (the 3 % floor, reproducible), **`rename` 0.960 / 0.967 and `unlink` 0.956 / 0.967 DELTA in both orders — MISS, narrowed to two phases and ATTRIBUTED** (the priced PR-4 rename guard + the `handle_setattr` future's move, named by DWARF perf — §3.9.4.1); **gate 3** — B N = 8 **4.27× creates / 5.37× ingest** (MISS on the wall law vs ≥ 5.6×, exactly §3.9.2's read; `C/CPU-S` 0.61× at N = 8), the A arm (the shipped authority + co-writers, measured for the first time) **bounded at 0.07× at every N** (F-R2: the owner's 8k-entry readdir per shipped create); **gate 3c** — **the LIVE law MET as a VERDICT ×2 (F-B2 FIXED)**, IDLE 6.7–7.5 ms, PAUSED never dominated; **gate 5** — **MET ×2 (F-B3 FIXED: the 1 × 31 fleet forms at `max 512 connections`)**, 0 misses, 155 ≡ 155, recall RTT 300 µs, hold 0; **gate 7 at N = 32** — **row (a) MET (1,002–1,299 frees/s, `shipped ≡ served ≡ displaced`, 1.000× device/user), row (b) MET (32 mounts in 3.66–3.68 s, 250–269 verbs, 12.3–14.6 s service)**; **F-B1 NOT FIXED on the box — `appender_flush_ceiling_overruns` tripped SIX times across the three fleets (16–106 ms past the ceiling) with the exclusion excusing NOTHING (0 ns on every writer) — the row sets of gates 3 / 3c / 7 each stopped at r1 on it.** Two NEW product findings on the armed plane (F-R3: every cross-owner unlink of a foreign-minted child orphans the inode — 430 / 512 in one leg, invisible to fsck while the lessee lives; F-R4: a mid-handover create answered `ENOENT`) and one on the shipped path (F-R2). §9's re-read: NOT YET — the exact list is there.**
+
 | Gate | Row | Venue | Verdict | Engagement (the law's gauges) |
 |---|---|---|---|---|
 | 1 | solo re-gate (flat A vs flat B: mdstorm, mount, w_fresh, rr4k, rw4k, remount) | box | **RAN 2026-09-22 (§3.9.1): MISS on mdstorm mkdir/rename/unlink (−3.4…−5.8 %, both brackets), rand-4k within noise with a reproducible residual (rr4k −1.8 %, rw4k −2.5…−3.8 %), w_fresh/mount within noise, `dlm_rpcs` 0 everywhere.** Before it: OWED to the flip binary (§8 — the flat path takes ONE behaviour change from PR 13: defect 6's shipped-bug fix (§4.3), pinned red-first flat, plus per-op atomic loads that are behaviour-identical (`KvTree::descend`'s `LeaseGate::is_armed`, `NodeSeqHandle::next`'s ceiling compare); every other change is behind bit 17 + the knob; PR 14's B arm is the default-on binary by definition) | `dlm_rpcs == 0`, `meta_kv_forest_*` 0 on flat, Δtripwires 0 |
@@ -1197,7 +1199,7 @@ PR 13c's binary reads both; per daemon-CPU-second the box's own numbers
 above fall 4,085 → 2,586 (0.63×) INCLUDING the ingest's CPU — the create
 phase's own reading is the re-run's.
 
-#### 3.9.4 The re-run on PR 13c's binary (`77f4da1d`) — the box-rerun rung, `perf/sym-box-rerun`, 2026-09-22 11:02 → (in progress) UTC
+#### 3.9.4 The re-run on PR 13c's binary (`77f4da1d`) — the box-rerun rung, `perf/sym-box-rerun`, 2026-09-22 11:02 → 13:52 UTC: **gate 1 MISS narrowed to `rename` / `unlink` and attributed (`rr4k` PAR, `mkdir` closed); gate 3 B 4.27× / 5.37× at N = 8 with the A arm (the shipped MW posture) measured at 0.07×; gate 3c LIVE law MET ×2 (F-B2 fixed); gate 5 MET ×2 (F-B3 fixed); gate 7@N=32 both rows MET; F-B1 NOT fixed on the box — six trips, 0 ns excused; two new armed-plane findings (F-R3, F-R4) and one shipped-path finding (F-R2)**
 
 **The counted-run law**: every row set below ran FROM ZERO on PR 13c's
 binary; nothing from §3.9.1 / §3.9.2 is creditable. Gates 2 and 3b (MET
@@ -1573,6 +1575,34 @@ each reader's `.stats` readable (the F-B3 `.stats` EINVAL closed), 95 /
 states it reads MET on the box.** The design's "token grant p99 and
 recall-ack p99 at N = 32 members" are the bucket edges above (the
 histograms are log-bucketed by design; the exact means beside them).
+
+##### 3.9.4.5 Gate 7 — `sym-walls` at the design's N = 32 (fleet C: the manager + 31 joined writers; `--walls-files=4`), two launches (13:34 → 13:41 and 13:45 → 13:52 UTC): **row (a) the relocated FREE wall MET on its law both times (1,299 / 1,002 frees/s at the holder, `shipped 1,984 ≡ served 1,984 ≡ displaced`, device bytes 1.000× user); row (b) the JOIN STORM MET — 32 mounts in 3.66 / 3.68 s (the design's 10 s), 250 / 269 manager verbs, `manager_service_ns` 14.6 / 12.3 s; the second launch's row (a) tripped F-B1 on m65 (1,206 ms, nothing excused) — the row set stopped at r1**
+
+| launch | row (a): 31 joiners × 4 × 64 MiB pre-written then REWRITTEN in place at once | row (b): 31 joiners leave, then all rejoin at once + `mkdir /jobs/<j>` each | oracle |
+|---|---|---|---|
+| 1 (13:34, `nw3/walls32-r1`) | displaced **1,984 ≡ shipped 1,984 ≡ served 1,984**, minted 0 (the grant windows covered the rewrite), **1,299 frees/s**, rewrite wall **1.53 s** (7.75 GiB → 5.1 GB/s into the zram), `MGR_CPU` 14 %, 3 manager verbs (42 ms), `manager_load_pct` 0, `free_ship_failures` 0, `free_refused_blocks` 0, the holder's bitmap `clear_bits` 1,984, 0 reclaim commands at the joiners, **device write bytes 7.75 GiB ≡ 7.75 GiB user (1.000×)**, `write_through_bytes` 0 — **MET** | join wall **3.66 s** to the 32nd Live page, **250 manager verbs, `manager_service_ns` Σ 14.63 s** (execute 14.63 s — 58 ms per verb under 31 concurrent joins: `extent_grants` 62, `slot_grants` 3,968 = 31 × 128 rotor slots), `MGR_CPU` 169 %, `manager_load_pct` [4, 3], `manager_failover_bound_ms` 45,033, `appenders_known` 32, `membership_members` 31; the `/jobs` ships: **28 served at the manager, `dir_stripe_flips` +1 — `/jobs` STRIPED mid-storm** (`directory 5 STRIPED into 64 stripes (4 supplied by creators [1, 7, 17, 31], 60 minted by the holder)`; `/` had striped during row (a)'s 31 `mkdir /walls-*`), so the harness law `steps_served ≥ n` AT THE MANAGER read RED — **H-R3**, the law made fleet-wide | clean (fsck 0, C8 0, the must-stay-0 set flat on all 32 writers — **no F-B1 trip on this launch**) |
+| 2 (13:45, `nw4/walls32-r1`, the fixed law, from zero) | 1,984 ≡ 1,984 ≡ 1,984, minted 332, **1,002 frees/s**, rewrite **1.98 s**, `MGR_CPU` 13 %, 29 verbs (15.4 ms), device bytes **1.000×**, failures 0, refused 0 — **MET on its law; F-B1: m65 `appender_flush_ceiling_overruns` +1 during the rewrite** (`region (6, 1206)` — 106 ms past the ceiling "with every structural hold's capped overlap excluded", 13:47:55; `excused_ns` 0 on all 32 writers) | join wall **3.68 s**, **269 verbs, Σ 12.32 s** service (execute 12.32 s), `MGR_CPU` 210 %, load [3, 2]; **`JOBS_SHIPPED` 31 ≡ `served_fleet` 31 (28 at the manager + 3 at the stripe holders), `JOBS_LOCAL` 0, flips during the storm 1 — MET** | clean (fsck 0, C8 0) |
+
+The design's row (b) names "WERO registers" in the storm: on this
+co-located fleet the 31 joiners ADOPT the manager's holds (KD-SYM-22,
+`join_wero_as_appender` CO-LOCATED), so `pr_registrants_per_namespace`
+stays 1 on each of the four namespaces — no device registration rides
+the storm on a one-box fleet; the wire's own cost is the 250–269 manager
+verbs above. **Gate 7 as the design states it reads MET on both rows at
+N = 32 on the box**, with the tripwire's verdict beside it: F-B1 tripped
+on one of the two launches' rewrite rows (a joiner at 1,206 ms). The
+first launch's row (b) number stands although its verdict word read RED
+on the pre-fix law (the law was the harness's, the mechanism the
+design's own striping arm engaging on 31 creators into one directory —
+the 3b shape, unplanned in the join storm).
+
+##### 3.9.4.6 The three fixes, judged on the box (F-B1 / F-B2 / F-B3)
+
+| finding | PR 13c's fix | **the box's verdict on PR 13c's binary** |
+|---|---|---|
+| **F-B3** — the cluster-wire cap derived to 64 under `FLEET_SHARE=32`; the 32-member fleet never formed; a token reader's `.stats` EINVAL | the cap from the RAW root × 16 ceilinged by the fd budget, the startup `RLIMIT_NOFILE` raise (listener caps alone), a refused dial retries then `ListenerRefused`, the reader's root attr off its projection under a transient wire class | **FIXED — a VERDICT**: fleet B (1 manager + 1 writer + 31 token readers) formed twice in ≈ 3 min each (`max 512 connections`, `RLIMIT_NOFILE soft raised 1024 → 262144`), fleet C (manager + 31 joined writers) twice; every reader's `.stats` readable; gate 5 MET ×2, gate 7's N = 32 storm MET ×2 (§3.9.4.4 / §3.9.4.5). 0 accept refusals in any log. |
+| **F-B2** — a LIVE holder recalled once by a 64-touch burst (`OfferDominated`, `N_floor` 2) | `ops_h` counts the holder's work on the slot's SUBTREE across volumes | **FIXED — a VERDICT**: 384 touches into a LIVE holder's tree over two fresh fleets at `N_floor` 2, **0 handovers** (§3.9.4.3); the IDLE arm still moves an idle tree in 4–5 bursts (6.7–7.5 ms) and the PAUSED law holds. |
+| **F-B1** — `appender_flush_ceiling_overruns` tripped 4× in 12 min on PR 13b (1–32 ms past the 1,100 ms ceiling, no recovery in flight) | the audit EXCLUDES the SMO mutex's structural holds (an overlap-bounded exclusion, capped and published); **the MARGIN's derivation stays §7 item 3, PR 14's** | **NOT FIXED on the box — the tripwire still trips, and the exclusion excused NOTHING**: on PR 13c's binary the gauge moved **six times in 45 minutes of fleet time** — the 8-writer scale fleet 4× (m0 [1, 1], m61, m63 — §3.9.4.2), the 8-writer touch fleet 1× (m60 at **1,116 ms** — §3.9.4.3), the 32-writer walls fleet 1× (m65 at **1,206 ms** — above) — every one logged `exceeded the 1100 ms landing ceiling with every structural hold's capped overlap excluded`, with `appender_flush_ceiling_excused_ns` 0, `…_service_extensions` 0, `…_recovery_extensions` 0 on every writer of every fleet, `…_service_cap_ms` 1,100 published. **What the exclusion did NOT explain is EVERYTHING the box reads** — the class is not another actor's hold of the SMO mutex; it is the pass's own wall / the tick's lateness on a loaded co-located box (a create storm's or a rewrite burst's covering barrier landing 16–106 ms late, a join's checkpoint) — i.e. exactly the residue §7 item 3's margin derivation (from the measured pass wall, never a fixed 2-tick constant) must price. Until it does, every N-writer row set on the box stops at its first trip, as the counted-run law requires, and the design's gates 3 / 3c / 7 cannot read MET whatever their rates say. **The gauge's verdict on the flip: NOT YET.** |
 
 ## 4. Issues found (each with its PR and its red pin)
 
@@ -3447,11 +3477,48 @@ so nothing falls off a ledger the way defect 32 did between PR 5 and PR
    each per holder per token lifetime); a `stat`-heavy reader of a
    64-stripe root pays 64 cache hits per attr revalidation — measured
    nothing on the legs, stated for the box's `ls -l` row.
+11. **PR 13c review nit (routed to the board): the dial-site census as a
+   TOKEN census** — `derivation_sweep_tests` counts the `S8-LISTENER
+   CONTROL SESSION` markers against `MEMBER_CONTROL_SESSIONS`; the
+   census should count the dial SITES themselves (the `RpcClient::connect`
+   / `ManagerClient::connect` call sites reaching the S8 listener) so a
+   new standing session cannot land un-marked. PR 14.
+12. **PR 13c review nit (routed to the board): tie `handshake_timeout ≡
+   DIAL_TIMEOUT`** in `derivation_sweep_tests` — the refused-dial retry's
+   clip and the listener's pre-authentication reaper are stated as one
+   bound; the tie test is what keeps them one. PR 14.
+13. **The box re-run's findings (§3.9.4, PR 13c's binary — each REPORTED,
+   none fixed there):** **F-B1 stands** — six trips in 45 min across three
+   fleets, 16–106 ms past the 1,100 ms ceiling, `excused_ns` 0 everywhere:
+   item 3's margin derivation is the whole answer (PR 14, a flip
+   precondition — every N-writer row set on the box stops at its first
+   trip). **F-R2** (the SHIPPED S8/S10 path): `issue_update_grant` runs an
+   8,193-entry `readdir_local` on the parent of EVERY shipped create
+   before its over-budget decline — 1.66 ms of `sqz-meta` CPU per create,
+   the authority bound at ≈ 1,200 verbs/s / ≈ 350–390 creates/s
+   fleet-wide (a cached per-directory census word is the fix; the shipped
+   co-writer posture the flip retires). **F-R3** (the armed plane, PR 6 ×
+   PR 12b): the cross-owner unlink's child witness `read_inode_value_
+   routed` reads this daemon's PROJECTION of a foreign lessee's slot,
+   finds `None`, drops the `SetNlink` step and removes the name —
+   **one orphaned inode per cross-owner unlink of a foreign-minted child**
+   (430 / 512 in one leg), invisible to fsck while the lessee lives (the
+   inode plane scopes out live foreign lessees' slots); the witness must
+   read at the child's holder (the writer's divert / a `LookupExact`).
+   A flip precondition (an ordinary `rm -rf` leaks). **F-R4** (PR 6 × the
+   handover): a create into a directory whose slot moves TO the creator
+   mid-burst answered `ENOENT` once (the old holder's live-witness
+   refusal after its release, surfaced instead of re-dispatched —
+   defects 29 / 30's family). **Gate 1's rename / unlink DELTA** (−3.3…
+   −4.4 %): the PR-4 rename lock-set fix's priced cost STAYS; the
+   `handle_setattr` future's construction + lane move (the kernel's
+   SETATTR echo per rename / unlink) is the named per-op term — shrink
+   the setattr future's state on the unarmed path (PR 14).
 
-Records the box owes (§8): gate 1's solo re-gate A-B-B-A on the flip
-binary; gates 2 / 3 / 3b / 3c / 5 / 7's counted brackets — every local
-number in §3 is a dev-box RATE reading, venue-attributed pending the box
-(the mechanism rows are GREEN; the rates are the box's).
+Records the box owes (§8): after the re-run, NONE of gates 1 / 3 / 3c /
+5 / 7's rows is owed on PR 13c's binary — §3.9.4 carries them; the
+remaining box rows are PR 14's (the flip binary's A-B-B-A of every gate,
+gates 2 / 3b included) after items 3 / 13 land.
 
 ## 8. Box footprint
 
@@ -3511,6 +3578,42 @@ pulled artifacts), `/tmp/grok-justin/box-rows/smoke1` (the driver's
 plumbing smoke), the arm-B build log; `/tmp/pr13-armA` (PR 13's arm-A
 worktree, reused, left as found).
 
+**The PR 13c box campaign (`fix/sym-box-campaign`, 2026-09-22 05:00–05:12
+UTC — the ONE approved `perf record` leg per arm, not listed before this
+rung):** `squeeze-test:/scratch/tmp/sym-box/{box-perf-leg.sh,perf-agg.py,
+perf-callers.py,perf-raw.py}` (the leg + its three aggregators),
+`/scratch/tmp/sym-box/perf-{A,B}/` (`perf.data`, `leg.log`, `tpc-agg*.txt`,
+`tpc-raw.txt`, `comms.txt`), `/scratch/tmp/sym-box/perf-{A,B}.run.log`.
+
+**The box RE-RUN rung (`perf/sym-box-rerun`, 2026-09-22 11:02 → 13:52
+UTC) placed, all under `/scratch/tmp/` (root-owned; the artifacts are the
+evidence and stay):**
+
+| path | what |
+|---|---|
+| `squeeze-test:/scratch/tmp/sym-box/{squeezefs-B-77f4da1d,libsqueezefs_il-B-77f4da1d.so,SHA256SUMS.rerun}` | arm B = PR 13c's gated tip (`77f4da1d`, `release`, sha256 `42438ccd…0088a1`; the shim `581126de…`), `sha256sum -c` OK + `--version` verified on the box; the previous `squeezefs-B` (`7b2ef9e9`'s code) kept beside it |
+| `squeeze-test:/scratch/tmp/squeezefs` | **REPLACED** by arm B `77f4da1d` (the reset script's client binary) |
+| `squeeze-test:/scratch/tmp/sym-box/repo/{tests,.benchmarks/rigs}/` | refreshed from this worktree (`mw-scale` leg, the walls row (b) fleet-wide law, the mw-scale intents closure; 445 / 88 files; the copies diff-identical after each refresh) |
+| `squeeze-test:/scratch/tmp/rigs/{2026-09-13-sym-pr1-solo-regate.sh,-reduce.py,2026-09-21-sym-box-brackets.sh,2026-09-22-sym-box-perf-phases.sh}` | PR 1's pair (the RT + diskstats revision), the driver (fleet M / `mwscale`, daemon logs kept per leg), the NEW phase-targeted perf leg |
+| `squeeze-test:/scratch/tmp/sym-box-rerun-stage/` | the user-writable staging dir the `rsync`s landed in before the root `install`s (the arms, `repo/`, the rigs) |
+| `squeeze-test:/scratch/tmp/sym-box/rows-gate1-rerun-20260922-110641/` (+ `.log`, `REDUCED.md`) | **gate 1 bracket 1** (A B B A, RT = 60): per row `.stats0/1`, `.diskstats0/1`, `.job`, `.fio.json/.txt`, `_bw.*.log`, `.procstat*`, `.thermal*`, `.dmesg`; per arm `reset-*.log`, `features-*.txt`, the timed mount / remount / umount legs, `*-mdstorm.*`, `prep-*.fio.json` |
+| `squeeze-test:/scratch/tmp/sym-box/rows-gate1-rerun-20260922-110641-rev/` (+ `.log`, `REDUCED.md`) | **gate 1 bracket 2** (B A A B, mdstorm only — the DELTA rows) |
+| `squeeze-test:/scratch/tmp/sym-box/perf-phases-{A,B}/` + `perf-phases.log` | the fp-chain perf legs: `{mkdir,create,rename,unlink}.{data,row,comms.txt,tpc-agg.txt,perf-record.log}`, `stats_{pre,post}.json`, `leg.log` |
+| `squeeze-test:/scratch/tmp/sym-box/perf-dwarf-{A,B}/` + `perf-dwarf.log` + `perf-callers2.py` | the DWARF-unwound legs (rename / unlink, 299 Hz; 177–219 MB `perf.data` each) + the caller aggregator |
+| `squeeze-test:/scratch/tmp/sym-box/rerun-nw-20260922-121141-mwscale-r1/` (+ `.log`) | the FIRST `mw-scale` launch (H-R1: died at N = 2 on the intents term) — kept as the finding's evidence |
+| `squeeze-test:/scratch/tmp/sym-box/rerun-nw-20260922-122434-mwscale-r1/` (+ `.log`) | **gate 3's A arm** (fleet M, `mwscale-r1/mwscale-1790079886/`: the table, per-writer `create-n*-w*.txt`, `m*_pn*{0,c,1}.json`, `fsck-mw-scale.out`) |
+| `squeeze-test:/scratch/tmp/sym-box/rerun-nw-20260922-125749-scale-B/` (+ `.log`) | **gate 3's B arm** (fleet A, `scale-r1/symscale-1790081892/`) — RED on F-B1 at N = 8; daemon logs NOT kept (H-R2 found here) |
+| `squeeze-test:/scratch/tmp/sym-box/rerun-nw-20260922-130638-touch-readers-walls32/` (+ `.log`) | **gates 3c ×2, 5 ×2, 7@N=32 launch 1** — per leg `<gate>-r<i>/` (rows + `daemon-logs/m*.log`), `fleet-{A,B,C}-<n>.{create,teardown}.log`, `SUMMARY.txt` |
+| `squeeze-test:/scratch/tmp/sym-box/rerun-nw-20260922-134449-walls32/` (+ `.log`) | **gate 7@N=32 launch 2** (the fleet-wide law; RED on F-B1 at row (a)) |
+| `squeeze-test:/scratch/tmp/sym-box/{GATE1_RERUN_OUT,GATE1_RERUN_REV_OUT,RERUN_NW{1,2,3,4}_OUT}` | pointer files |
+| `/dev/shm/sqz_mdstorm{,_perf}/`, `/run/squeezefs-mwfleet`, `/run/squeezefs-devsub-tcp-mwfleet`, the fleets' netns / veth / `pref 40` rules, `/mnt/sqz-mwfleet/` | **all removed** — every fleet torn down to zero residue (asserted by `mw_fleet.sh teardown` ×8), verified at 13:53 UTC: 0 daemons, no netns, no rule, no veth, `/scratch/tmp/test` unmounted, no `/dev/shm/sqz*`; the devsub's `nvmet_tcp` / `nvmet` / `zram` / `null_blk` modules unloaded (only `fuse` + the fabric's host `nvme_tcp` stack loaded, as found); the fabric's 15 namespaces connected as found; 246 G free; `/scratch/tmp/sym-box` 3.3 G |
+| the 5 storage nodes | **nothing placed** (their `squeezefs 1.1.0` copies serve the reset's `nvmeof` verbs); the reset rebuilt their null_blk backings + shares per gate-1 arm (4 resets), leaving the fabric converged |
+
+Laptop-side: `/tmp/grok-justin/box-rerun/{arms,gate1,gate1-rev,perf-phases,nw}`
+(the pulled artifacts incl. `SHA256SUMS.local`), the arm-B build log
+`/tmp/grok-justin/box-rerun-armB-build.log`; the build worktree
+`/tmp/box-armB-77f4da1d` REMOVED after placement.
+
 ## 9. The flip decision (for PR 14)
 
 > **Status (PR 13b, 2026-09-21): the three PRODUCT blockers below are closed on `feat/sym-metanode-ship` (`cd85f701` defect 32, `cc642b6a` §4.4af, `53ffb626`+`31519ceb` §4.4ag); the box brackets remain the orchestrator's; the storm ×10 count is NOT MET on that branch (see §7's status line — two owed items, no acked loss in 19 seven-victim rounds). The decision text below is as recorded at PR 13.**
@@ -3523,6 +3626,14 @@ worktree, reused, left as found).
 > * **the must-stay-0 tripwire `appender_flush_ceiling_overruns`** trips on the acceptance venue (F-B1: four times in 12 minutes, 1–32 ms past the 1,100 ms ceiling, no recovery in flight) — PR 14's margin derivation is no longer a laptop reading.
 >
 > **Reading MET on the box:** gate 2 (1.04–1.07× of S0), gate 3b (one flip, `shipped ≡ served`, `K + C + 3` tokens, 3,400–3,581 creates/s into one directory), gate 7 at N = 8 (983 frees/s, `shipped ≡ served ≥ displaced`; the 8-mount join storm 3.92 s) — each with the tripwire caveat above where it applies. **What PR 14 flips on, restated:** the gate-1 regression attributed and closed (or adjudicated as the shipped-bug fixes' price with the owner's word), F-B3's cap re-derived (then the N = 32 rows run), F-B1's margin derived, F-B2's rule adjudicated, and the storm ×10 count from zero on that binary — then the flip. The decision text below is as recorded at PR 13.
+>
+> **Status (the box RE-RUN on PR 13c's binary `77f4da1d` — `perf/sym-box-rerun`, 2026-09-22 11:02 → 13:52 UTC; §3.9.4 — the re-read the brief asked for, with the fixed binary's numbers in hand). The decision stays NOT YET.** With these numbers, the design gates the flip requires read as follows. **Reading MET on the box (this binary):** **gate 3c** (a LIVE holder never recalled — 384 touches, 0 handovers over two fresh fleets; F-B2 FIXED), **gate 5** (the 1 × 31 broadcast: exact at the next resolve, 155 ≡ 155, recall RTT 300 µs, hold 0 — twice; F-B3 FIXED), **gate 7 at N = 32** (row (a) 1,002–1,299 frees/s with `shipped ≡ served ≡ displaced` and 1.000× device/user; row (b) 32 mounts in 3.66–3.68 s, 250–269 verbs, 12.3–14.6 s of service — twice), and — from the previous pass, not re-run — **gate 2** (1.04–1.07× of S0) and **gate 3b** (one flip, `shipped ≡ served`, `K + C + 3` tokens). **The exact list that does NOT read MET:**
+> * **gate 1** — MISS on mdstorm `rename` (0.960 / 0.967) and `unlink` (0.956 / 0.967), both orders of two brackets; `mkdir` CLOSED (0.976 / 0.984), `rr4k` PAR (0.999), everything else within noise, `rw4k` −3.0 % at the floor. ATTRIBUTED (§3.9.4.1): the PR-4 rename lock-set fix's priced +1 guard (kept) and the `handle_setattr` future's construction + lane move on the kernel's per-op SETATTR echo (named by the DWARF legs); the fix shape is a smaller unarmed setattr future — PR 14's, then the bracket re-reads;
+> * **gate 3** — MISS on the WALL law at N = 8 (4.27× creates / 5.37× ingest vs ≥ 5.6×; `C/CPU-S` 0.61×) — the co-located venue's term re-read to 0.01× of §3.9.2's; N = 2 / 4 MET; the per-NODE law UNMEASURED (PR 15). The A arm is measured for the first time: the shipped authority + co-writers are bounded at 0.07× at every N — the armed plane creates 55× faster at N = 8 on the same binary (F-R2 names why the shipped path is that slow);
+> * **the must-stay-0 tripwire `appender_flush_ceiling_overruns`** — NOT closed: six trips across three fleets in 45 minutes, 16–106 ms past the 1,100 ms ceiling, **with PR 13c's exclusion excusing 0 ns on every writer** — the margin derivation (§7 item 3) is the whole remaining item, and it is a FLIP PRECONDITION: every N-writer row set on the box stops at its first trip, so gates 3 / 3c / 7 cannot read MET as ROW SETS however their rates read;
+> * **two NEW product findings on the armed plane** (§3.9.4.3, §7 item 13): **F-R3** — every cross-owner unlink of a child another appender minted orphans the child's inode (the witness read off the projection; 430 / 512 leaked in one leg; invisible to fsck while the lessee lives) — a FLIP PRECONDITION (an ordinary `rm -rf` leaks on the default the flip would ship); **F-R4** — a create into a directory whose slot moves to the creator answered `ENOENT` once (defects 29 / 30's family).
+>
+> **What PR 14 flips on, restated once more:** F-R3 fixed and pinned (the witness at the child's holder), F-B1's margin DERIVED from the measured pass wall with the box's 16–106 ms readings as its input and the six trips re-read as 0, F-R4 in the retryable class, gate 1's setattr future shrunk (or the −3.3…−4.4 % on rename / unlink adjudicated as the shipped-bug fixes' price with the owner's word), the storm ×10 from zero on that binary — then the flip binary's box brackets of EVERY gate (2 and 3b included). Nothing in this rung's product findings is a class the design did not state: F-R3 is PR 6's deviation (3) left standing on the N-daemon fleet; F-B1 is §7 item 3 exactly; F-R2 is the shipped path the flip retires.
 >
 > **Status (PR 13c, the box campaign — `fix/sym-box-campaign`, 2026-09-22): what LANDED against the list above, and what still stands.** *Landed, red-first:* **F-B3** — the listener cap derives from the RAW root × the shipped factor, ceilinged by the fd budget (`RLIMIT_NOFILE / 8`), a refused dial retries from the accept tick to the dial bound then surfaces the typed `ListenerRefused`, a token reader's ROOT attr survives a transient wire class (the `.stats` EINVAL), and the first 32-member fleet FORMED on the laptop (§3.9.2's "→ fixed"; H-C1 / H-C2 the harness shapes it uncovered); **F-B2** — the dominance rule's `ops_h` counts the holder's work on the slot's SUBTREE across volumes (design §5.1.4 as built, the hint's two error directions and the root-ward consequence stated); **F-B1** — the flush-ceiling audit EXCLUDES the SMO mutex's structural holds: an overlap-bounded exclusion (over-excuse ≤ one cadence tick per hold), each class CAPPED at a published bound (a recovery's at `appender_recovery_bound_ms`, a service hold's at one landing ceiling — `appender_flush_ceiling_service_cap_ms`), the excused Σ published (`appender_flush_ceiling_excused_{ns,max_ms}`), the pass's own wall (its device time, its wait on a peer) never excused; **the gate-1 flat path** — three unarmed-path costs deleted (`stripes_armed_any`, the memo fed on an armed set only, `token_serve`'s two-probe return), the rename lock-set fix's +1 guard priced and kept, and the startup `RLIMIT_NOFILE` raise confined to the listener caps (`uring_fs::fd_cache_cap` derives from the limit AS FOUND — review round 1, Issue 8: the first build had grown the flat path's fd cache 32×). *Still standing (the flip's list, restated for PR 14):* (a) **the box re-runs** of gates 1 / 3 / 3c / 5 / 7@N=32 on PR 13c's binary — no box row ran in PR 13c (the counted-run law); (b) **the flush-ceiling MARGIN's derivation from the measured pass wall (§7 item 3) — NOT done**: F-B1 landed an exclusion of another actor's holds, which is not a derivation of the margin, and the box's 1–32 ms overruns are what that derivation must price; (c) **gate 3's per-NODE law ("bounded by no node") is UNMEASURED on any venue**: the box's N = 8 MISS is attributed to the co-located venue (§3.9.3), the per-daemon-CPU-second face (0.63× at N = 8 with the ingest CPU folded in; the create phase alone is `sym-scale`'s new `C/CPU-S` column, unrun on the box) is that venue's PROXY, and **a multi-node venue — PR 15's cloud row — is the law's instrument**; (d) the storm ×10 count from zero on PR 13c's binary.
 

@@ -1197,6 +1197,183 @@ PR 13c's binary reads both; per daemon-CPU-second the box's own numbers
 above fall 4,085 → 2,586 (0.63×) INCLUDING the ingest's CPU — the create
 phase's own reading is the re-run's.
 
+#### 3.9.4 The re-run on PR 13c's binary (`77f4da1d`) — the box-rerun rung, `perf/sym-box-rerun`, 2026-09-22 11:02 → (in progress) UTC
+
+**The counted-run law**: every row set below ran FROM ZERO on PR 13c's
+binary; nothing from §3.9.1 / §3.9.2 is creditable. Gates 2 and 3b (MET
+on `7b2ef9e9`) were NOT re-run (minimum count — they rerun once more on
+PR 14's flip binary).
+
+**Venue (re-verified 11:02 UTC before the first leg):** `squeeze-test`
+(`memp-s3ds-aqs-37`), 32-core Xeon, 251 GiB, Rocky 8.10, **kernel
+`6.19.14-sqz`** (the sqz series incl. patch 0031 — the per-queue bg
+budget, since 2026-09-06), up 9 h 54 at the first leg, load 0.00, no
+Lustre / lnet modules, docker inactive, no daemon, only `fusectl`
+mounted, no `/run/squeezefs*`, no netns / veth / `pref 40` rules, 249 G
+free on `/scratch`; the reset-v5 converged fabric (5 storage nodes ×
+(1 meta + 2 data) memory-backed null_blk namespaces over nvme-tcp, two
+paths each, the client's 15 controllers connected as PR 1 left them;
+the storage nodes on `4.18.0-553.123.1.el8_lustre.ddn17` holding
+`squeezefs 1.1.0 (19888503…)` for the reset script's `nvmeof`
+share/unshare/list verbs — NOT refreshed, as the previous rung did not:
+target-side configfs verbs only, the client binary does format + mount).
+Gate 1 ran on the fabric via the reset script; the N-writer gates on the
+box's own tcp devsub (option (a) of §3.9 — nvmet-tcp on `127.0.0.1`,
+`resv_enable=1`, `lzo-rle` zram, `SQZ_MWFLEET_OSS_GB=16`, `--venue=box`
+on every leg). **Arms:** **A** = `3228fcb8` (reused, sha256
+`993100757bde…d69b1` verified on the box); **B** = `77f4da1d` — built on
+the laptop from a DETACHED worktree at the gated code sha (`task
+build:rocky8`, the `release` profile, 3 m 25 s, artifact checks passed):
+`squeezefs 1.2.4 (77f4da1dc0fa / 77f4da1dc0fa95ce170ba53fc0708d077f0576ad)
+built 2026-09-22T10:55:12Z profile release`, sha256
+`42438ccde4cb12f02bc418866f46523c0f57dfefbd9d5dd56e54f0b01d0088a1`, placed
+as `/scratch/tmp/sym-box/squeezefs-B-77f4da1d` and as
+`/scratch/tmp/squeezefs` (the reset script's client binary; the previous
+`squeezefs-B` kept for provenance). Both arms `release` (the two-profile
+law). **Instrument:** PR 1's rig at its 2026-09-22 revision — **RT = 60 s
+honoured** through the per-row job copy (§3.9.1b's fix: 2.0 TiB per
+`wfresh` row against §3.9.1's 1.0 TiB at 30 s), the data namespaces'
+`/proc/diskstats` snapshotted per row — so the fio rows are 60 s windows
+and NOT window-comparable to §3.9.1's or PR 1's 30 s rows (the A arm is
+in the same bracket; within-bracket comparability is what the verdict
+rule needs); the reducer verbatim; `fio-3.36`, the box's standing job
+files (libaio, `direct=1`, 24 jobs, `ramp_time=10`).
+
+##### 3.9.4.1 Gate 1 — the solo re-gate, flat A vs flat B (11:06 → 11:39 UTC bracket 1, A B B A; 11:42 → 11:51 the reversed bracket, B A A B, mdstorm only): **`rr4k` PAR (0.999 — the −1.8 % residual is GONE), `mkdir` within noise (0.976 / 0.984 — the previous MISS closed), `create` / `stat` / `manydirs` / `rmdir` / `w_fresh` / mount / remount within noise; `rw4k` 0.970 (within noise by the 3 % floor, a reproducible −3.0 % at the floor); `rename` 0.960 / 0.967 and `unlink` 0.956 / 0.967 DELTA in BOTH orders — the rename lock-set fix's priced cost plus a per-op future-move term, ATTRIBUTED below**
+
+**Verdict table (the two brackets, the PR 1 rule: within noise iff |B/A − 1| ≤ max(band, 3 %)):**
+
+| row | bracket 1 (A B B A) B/A · band | bracket 2 (B A A B) B/A · band | positions (bracket 1 ; bracket 2) | **verdict** |
+|---|---|---|---|---|
+| `wfresh-kern` MiB/s (60 s) | **0.990 · 0.9 %** | — | A 34,420 / 34,265 — B 33,865 / 34,163 | **within noise** (−1.0 %) |
+| `rr4k-kern` IOPS (60 s) | **0.999 · 0.8 %** | — | A 589,579 / 594,567 — B 589,787 / 592,996 | **PAR — the §3.9.1 residual (−1.7…−1.8 % in both brackets) is GONE on PR 13c's binary** |
+| `rw4k-kern` IOPS (60 s) | **0.970 · 0.8 %** | — | A 539,387 / 540,132 — B 521,706 / 525,789 | **within noise (the 3 % floor) — REPRODUCIBLE −3.0 %**: every B position 521.7–525.8k, every A 539.4–540.1k; §3.9.1 read 0.962 / 0.975, so the W1 patch arm's residual STANDS at the floor (attributed below) |
+| `mount` / `remount` / `umount` s | 1.132 / 1.106 / 0.706 | — | 0.41–0.59 s / 0.53–0.67 s / 7.6–13.5 s | within noise (0.4–0.7 s events, 18–43 % bands; A1's 13.5 s clean unmount after `rw4k` is the post-reboot outlier — the other three 7.6–8.7 s) |
+| `mdstorm mkdir` ops/s | **0.976 · 4.1 %** | **0.984 · 4.6 %** | A 6,801 / 6,598 ; 6,831 / 6,527 — B 6,672 / 6,401 ; 6,539 / 6,599 | **within noise (−2.4 % / −1.6 %) — §3.9.1's MISS (0.942 / 0.965) CLOSED** |
+| `mdstorm create` | 0.992 · 2.1 % | 0.983 · 1.5 % | A 5,881 / 5,756 ; 5,870 / 5,780 — B 5,824 / 5,718 ; 5,721 / 5,736 | within noise (−0.8 % / −1.7 %) |
+| `mdstorm stat` | 0.987 · 1.1 % | 1.006 · 1.1 % | 187–194k both arms | within noise |
+| `mdstorm rename` | **0.960 · 3.0 % DELTA** | **0.967 · 0.1 % DELTA** | A 4,567 / 4,432 ; 4,469 / 4,472 — B 4,339 / 4,304 ; 4,327 / 4,323 | **DELTA (B −4.0 % / −3.3 %; every B below every A) — the PR-4 rename lock-set fix's priced cost (+1 DLM guard + one lookup per rename ≈ +2.6 µs) + the `handle_setattr` future term below; §3.9.1 read 0.966 / 0.948** |
+| `mdstorm unlink` | **0.956 · 1.2 % DELTA** | **0.967 · 1.6 % DELTA** | A 5,284 / 5,220 ; 5,272 / 5,188 — B 5,038 / 5,000 ; 5,075 / 5,042 | **DELTA (B −4.4 % / −3.3 %; every B below every A) — the `handle_setattr` / `handle_unlink` future-move term below; §3.9.1 read 0.965 / 0.960** |
+| `mdstorm manydirs` | 0.999 · 2.6 % | 0.997 · 3.0 % | 10.7–11.3k both arms | within noise |
+| `mdstorm rmdir` | 0.971 · 3.9 % | 0.985 · 4.7 % | 5.7–6.0k both arms | within noise |
+
+**Gate 1 as the design states it ("within noise of `dev` tip on mdstorm,
+rand-4k, `w_fresh`, and mount time; `dlm_rpcs == 0`") reads on PR 13c's
+binary: `dlm_rpcs` 0 ✓ (all 12 mount legs + 8 mdstorm legs), mount time
+✓, `w_fresh` ✓, rand-4k ✓ by the rule (`rr4k` PAR; `rw4k` −3.0 % at the
+floor — reproducible, not convicted), mdstorm: `mkdir` / `create` /
+`stat` / `manydirs` / `rmdir` ✓, **`rename` ✗ / `unlink` ✗ (−3.3…−4.4 %
+in both orders of two brackets on 0.1–3.0 % bands).** PR 13c's three
+unarmed-cost deletions CLOSED the `mkdir` miss and the `rr4k` residual
+and left `create` at par; the two phases that carry the kernel's SETATTR
+echo per op stay DELTA. **Verdict: MISS on `rename` / `unlink`, narrowed
+from §3.9.1's three phases to two, attributed to two named terms (one
+priced and kept, one new) — reported; nothing in the tree changed for it.**
+
+**Engagement / tripwires — every leg of both arms:** `dlm_mode` `solo`,
+`dlm_rpcs` 0, `mount_posture` `writer`, Δ`invariant_tripwires` (+ the
+eight sibling tripwires) 0 on every row, Δ`fsck_findings` 0,
+Δ`meta_kv_block_refs_drift` 0, the five `meta_kv_forest_*` gauges **0**
+on every B mount (bit 17 absent — the shipped path), `features_incompat`
+bit 17 = 0 on every meta volume of both arms, dmesg the five boot-time
+lines only. Thermal: the hottest hwmon sensor 47–51 °C at every row
+start AND end (no heat soak). The metadata economy identical arm to arm:
+`Δjournal_entries` 60.0–60.3k (`wfresh`, 60 s), 66 (`rr4k`), 7.07–7.12k
+(`rw4k`), 547.6–547.8k (mdstorm); checkpoints 345–350 / 92–95 / 354–355 /
+70–73; node appends 9.1–9.8k / 55–58 / 428–491 / 24.4–24.8k; node splits
+97 on every mdstorm leg.
+
+**Write-amplification columns (the AGENTS instrument — `/proc/diskstats`
+on the TEN data namespaces per row, ramp-inclusive: fio counts the 60 s
+window, the device the 70 s incl. ramp, so ≈ 1.11–1.15× reads as 1.0×
+device/user; beside it the daemon's own ledger and the reclaim family):**
+
+| row / position | user GiB (60 s) | **device write bytes ÷ user** (`/proc/diskstats`) | `wareq-sz` | device read ÷ user | ledger `rewrite_device_write_bytes` ÷ user | `patch_write_bytes` ÷ user | reclaim `commands` / `discards` / trim bytes ÷ user | `write_through_blocks` |
+|---|---|---|---|---|---|---|---|---|
+| `wfresh` A1 / A4 | 2,031 / 2,011 | **1.116 / 1.116** | 1,037 KiB | ≈ 0 (1.0 / 0.9 GiB) | 1.021 / 1.021 | 0 | 61,398 / 62,200 / 0.120 ; 54,892 / 55,455 / 0.108 | 7,753 / 7,333 |
+| `wfresh` B2 / B3 | 1,991 / 2,005 | **1.116 / 1.114** | 1,038 / 1,036 KiB | ≈ 0 | 1.020 / 1.019 | 0 | 39,168 / 39,575 / 0.078 ; 58,370 / 59,160 / 0.115 | 7,701 / 6,526 |
+| `rw4k` A1 / A4 | 123.5 / 123.6 | **1.141 / 1.139** | 5 KiB | 0.003 / 0.004 | 0.155 / 0.147 | **0.979 / 0.985** | 0 / 0 / 0 | 4,896 / 4,652 |
+| `rw4k` B2 / B3 | 119.4 / 120.4 | **1.146 / 1.134** | 5 KiB | 0.008 / 0.003 | 0.152 / 0.143 | **0.982 / 0.985** | 0 / 0 / 0 | 4,649 / 4,398 |
+| `rr4k` A1 / A4 | 134.9 / 136.1 | 0 (no writes) | — | **1.172 / 1.172** (`rareq-sz` 4 KiB) | 0 | 0 | 34,033 / 27,433 (the prep's discards draining) | 0 |
+| `rr4k` B2 / B3 | 135.0 / 135.7 | 0 | — | **1.170 / 1.169** | 0 | 0 | 22,604 / 24,950 | 0 |
+
+Device write bytes ≡ user bytes on both arms and both write rows (the
+ramp explains the 1.11–1.15×; `wareq-sz` = the write size — 1 MiB on
+`wfresh`, the 4 KiB in-place W1 patch on `rw4k`, so no request-size
+collapse), device read ≡ user on `rr4k`. **§3.9.1's flat-path delta —
+B's reclaimer at 2.4–3.7× A's discard commands — did NOT reproduce:**
+39–58k (B) vs 55–61k (A) commands per `wfresh` row, 0.08–0.12× user in
+trim bytes on both arms.
+
+**Attribution of the DELTA rows (the `.stats` pairs + the phase-targeted
+`perf record` legs — `2026-09-22-sym-box-perf-phases.sh`, one `perf.data`
+per mdstorm PHASE per arm at 999 Hz with frame-pointer chains, then one
+DWARF-unwound leg per arm for `rename` / `unlink` at 299 Hz; scale 100,
+`/dev/shm`, the same daemon across its phases):**
+
+| leg | daemon µs/op (540k ops) | `fuse3-tpc` µs/op | `sqz-jrnl` / `fuse3-ur` / `sqz-meta` | conveyor `pass_total` / `window_total` µs | **`dlm_guard_hold` count** | journal entries / checkpoints / appends / splits |
+|---|---|---|---|---|---|---|
+| A1 / A4 / A2 / A3 | 225.5 / 226.6 / 226.2 / 230.4 | **123.5 / 125.3 / 124.0 / 127.1** | 36.2–37.2 / 33.1–33.8 / 17.6–18.2 | 38.1–39.2 / 56.9–58.6 | **889.3–889.8k** | 547.6–547.7k / 70–72 / 24.4–24.5k / 97 |
+| B2 / B3 / B1 / B4 | 231.0 / 231.1 / 231.0 / 233.8 | **128.5 / 129.2 / 128.4 / 129.7** | 36.8–37.4 / 33.4–34.1 / 17.6–18.5 | 38.3–39.1 / 56.5–58.3 | **989.5–989.9k** | 547.7–547.8k / 73 / 24.6–24.8k / 97 |
+
+* The conveyor pass, the journal lane and the meta lanes are IDENTICAL
+  arm to arm; the whole daemon shift is the handler lanes: `fuse3-tpc`
+  +3.2–5.0 µs per op. **B takes exactly +100,000 4a DLM guards per storm**
+  (one per rename — the PR-4 round-2 rename lock-set fix, `I{moved}` +
+  `I{dest}` beside the two parents and the two `D{}` keys, a shipped-bug
+  fix pinned by `tests/rename_lock_set_tests.rs`; PR 13c priced it at
+  ≈ +2.6 µs per `rename.backend` and KEPT it).
+* **Per phase (the fp legs; `fuse3-tpc*` samples ÷ 999 Hz ÷ ops):** rename
+  A 203.6 → B 208.3 µs/op (+4.7, +2.3 %), unlink 217.7 → 227.4 (+9.6,
+  +4.4 %), create 196.6 → 200.3 (+3.7, +1.9 %), mkdir 203.1 → 214.8 on
+  20k ops. **The ONE dominant term in both DELTA phases is
+  `__memmove_avx512_unaligned_erms`: +295 samples on rename (720 → 1,015,
+  ≈ +3.0 µs/op) and +531 on unlink (1,081 → 1,612, ≈ +5.3 µs/op)** —
+  then `RecordIndex::group_bounds` (+98, rename), the `arc_swap` debt
+  loads (+122 rename / +71 unlink — `RouteTable` loads at the routed
+  entry points), `DlmLockManager::lock_stripe` (+50, create); the
+  `sqz_channel::RecvFut` / `FuseReply` unbounded-receiver pair (+300 /
+  +250) is a RENAME of A's `futures_util::stream::next` +
+  `sqz_time::Timeout` samples (−280 / −256), not a cost; `memcmp` +177 on
+  rename, −69 on unlink.
+* **The DWARF legs NAME the memmove term (glibc resolves it as
+  `__memcpy_avx512_unaligned_erms` there): it is the `handle_setattr`
+  FUTURE's construction and move into the lane — `Box::pin` (`…E0E3new` /
+  `…E0E3pin`) + the `LaneExec::run` handoff (`…E09squeezefs <-
+  LaneExec::run`)** — A 178 → B 255 of the lane samples on rename (95 +
+  83 → 144 + 111), A 198 → B 280 on unlink (109 + 89 → 151 + 129), plus
+  the `handle_unlink` future itself 77 → 105 on unlink and `handle_lookup`
+  9 → 11 / `handle_rename` 7 → 8; the leaf's share of the lane's samples
+  3.35 % → 5.12 % (rename), 4.82 % → 6.63 % (unlink). The kernel sends a
+  ctime/mtime SETATTR echo after every rename and unlink (the D4
+  "absorbed, not committed" echo — `meta_kv_times_echo_absorbed` 299.2–
+  299.4k per storm on BOTH arms), so the SETATTR handler runs once per
+  op in exactly these two phases and not in `mkdir` / `create`: **the
+  per-op cost is the SIZE of the SETATTR handler's future state — the
+  memmove of a larger `async fn` frame at `Box::pin` and at the lane
+  handoff — grown across PRs 5–13b at the routed `setattr` entry (PR 13b's
+  `record_ship` resolver, PR 9's custody words, PR 7b's stripe checks, the
+  served-mutation sink) even where every arm is an `Option` probe on the
+  unarmed path.** This is the term §3.9.1 called "nameable only with a
+  dwarf-unwound leg"; it is named. The fix shape (a PR 14 item, never this
+  rung's): shrink the `setattr` future's state on the unarmed path (box the
+  armed-plane words behind one `Option<Box<…>>`, or split the unarmed fast
+  path into its own smaller future) — the same economy the kernel READ
+  handler took in R-5.
+* `rw4k`'s reproducible −3.0 %: daemon µs/op 36.5 / 36.6 (A) → 38.1 /
+  37.6 (B) — `fuse3-ur` 29.6 / 29.7 → 30.6 / 30.4 (+0.8 µs/op, §3.9.1
+  read +1.2), `fuse3-tpc` 6.1 / 6.2 → 6.8 / 6.5 (+0.4); `write_transport_
+  phase_ns.transport_total` 530–534 → 550–557 µs; clat p50 251–253 → 257
+  µs (+2 %); the W1 arm's own `patch_write_bytes` / `write_through_blocks`
+  identical. The write handler's per-op term on the unarmed path (PR 9's
+  `custody_use_enter` + `cached_lease_token`, the served-mutation / recall
+  sinks, `refuse_foreign_slot_open` at the write-intent open) — priced
+  here at ≈ +1.2 µs of daemon CPU per 4 KiB write; the same fix shape.
+* `rr4k`: daemon µs/op 28.1 → 28.6 (+0.5: `fuse3-tpc` 11.5 → 11.8,
+  `fuse3-ur` 16.5 → 16.7), IOPS PAR — the box has the CPU headroom (74 %
+  busy) and the zc bridge's hops are unchanged (`msg_hop` 24.4 → 25.0,
+  `wake_hop` 26.8 → 28.1, `device_cq` 96 both).
+
 ## 4. Issues found (each with its PR and its red pin)
 
 ### 4.1 Fixed on this branch

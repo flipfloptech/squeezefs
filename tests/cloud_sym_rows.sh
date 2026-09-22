@@ -878,7 +878,22 @@ print(f'{100*(int(b)-int(a))/1e9/max(1e-9, $t1-$t_row0):.0f}')" 2>/dev/null || e
         fi
         [ "$verdict" = "MET" ] || verdict_all=MISS
         sym_gate3_row_line "$n" "$create_rate" "$cr" "$creates_per_cpu_s" "$ingest_rate" "$ir" "$mgr_load" "$mgr_cpu" "$handovers" "$ships" "$rpcs" "$verdict" | tee -a "$table" | tee -a "$ROWS_FILE"
-        emit "   N=$n walls: create ${create_wall}s ingest ${ingest_wall}s (RT $RT s); appenders_known=$live; ingest amplification: $amp"
+        # The write-amplification instrument's third column (AGENTS.md): the
+        # block_free_* reclaim ledger over the ingest window, Σ over the
+        # row's writers — a freed-block path that WRITES instead of
+        # deallocating (Write Zeroes on a target without DSM) shows here
+        # beside the device ÷ user ratio (the local pass read 1.87× on the
+        # N = 1 row that followed sym-tarx's rm -rf of ≈ 6,000 blocks).
+        local bf="" k v_bf
+        for k in block_free_discards block_free_discard_bytes block_free_file_punches block_free_punch_bytes block_free_reclaim_skipped block_free_reclaim_commands; do
+            v_bf=0
+            for idx in "${writers[@]}"; do
+                v="$(sym_delta "$ROWDIR" "$idx" "n$n" "$k" 2>/dev/null || echo 0)"
+                v_bf=$((v_bf + v))
+            done
+            bf="$bf ${k#block_free_}=$v_bf"
+        done
+        emit "   N=$n walls: create ${create_wall}s ingest ${ingest_wall}s (RT $RT s); appenders_known=$live; ingest amplification: $amp; block_free (row window, Σ writers):$bf"
         [ "$(python3 -c "print(1 if min($create_wall,$ingest_wall) >= $RT else 0)")" = "1" ] ||
             warn "sym-scale N=$n: a measured phase ran shorter than RT=$RT s (create $create_wall s, ingest $ingest_wall s) — size --files/--ingest-mb up for the counted row (the sustained-state rule)"
         for idx in "${writers[@]}"; do

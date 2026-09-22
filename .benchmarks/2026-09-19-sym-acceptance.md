@@ -3611,8 +3611,11 @@ wall` at its covering barrier and the audit — correctly — counted it.
 population the audit judges) the age law runs from the LAST COLLECTION
 (`checkpoint_collected_ns`, set by every cycle path — a leaf dirtied after
 a collection is the next cycle's) against
-`checkpoint::checkpoint_trigger_ms(ceiling, term)` = `max_age − term`,
-where the anticipated `term` is the MAXIMUM over the last
+`checkpoint::checkpoint_trigger_ms(max_age, term)` = `max_age − term`
+(the input is the MAX AGE the tick fires at — `CHECKPOINT_MAX_AGE_MS`,
+the elastic ceiling under a live reader ask — never the landing ceiling
+`max_age + 2 × tick`, which would eat the margin; review round 1, Issue
+7's rename + tie), where the anticipated `term` is the MAXIMUM over the last
 `TERM_HORIZON_CYCLES` = `COVER_CYCLES_MAX` (64) cycles
 (`checkpoint::CycleTermWindow` — a bound anticipated by a bound: the first
 build's EWMA mean left 3 of 6 cycles overrunning, and a decayed high-water
@@ -3622,9 +3625,9 @@ runs to, so a burst is remembered exactly as long as a cover loop would
 wait on it — a count of CYCLES, never a duration: about a minute at the
 full trigger, seconds at a trigger of 0 or inside a handover's
 `checkpoint_now` loop) of ONE cycle's landing TERM
-(`checkpoint_cycle_term_ns(wall, late, tick)` = `wall + (late − tick)⁺`):
-its pre-barrier wall plus the age decision's lateness past the trigger
-BEYOND one tick — the tick
+(`checkpoint_cycle_term_ns(wall, late, tick, cap)` = `wall + (min(late,
+cap) − tick)⁺`): its pre-barrier wall plus the age decision's lateness
+past the trigger BEYOND one tick — the tick
 quantization IS the ceiling's first priced tick; the excess is the tick's
 own pre-decision device work the second tick bounds at one period — with
 the tick's WAIT for the SMO mutex left out (`tick` measures it; a wait
@@ -3680,6 +3683,32 @@ prices whatever act produced the measured wall, so the join trips'
 coverage is by construction. **The box re-run on this binary is what
 says the derivation priced the box's term** — the laptop readings above
 are the mechanism's.
+
+**Review round 1, Issue 1 — a BUG in the first build's age law, FIXED
+(`b8adb790`, pin `2b3758d4`):** `checkpoint_due_by_age` STORED the
+decision's lateness on every `due` tick — the ticks that ran NO cycle
+included — while `checkpoint_collected_ns` never advanced on an idle
+volume, so the first cycle after an idle span adopted `wall + idle` as
+its term, the 64-cycle MAXIMUM held it, the trigger saturated to 0 and
+every later cycle's own ledger record made the chain self-sustaining at
+one cycle per tick (the reviewer reproduced 4 s idle → 29 paced creates →
+31 cycles in 1.5 s, term 2,489 ms, trigger 0 — the box's
+between-rows→row shape on every writer). Now the verdict RECORDS nothing:
+the tick hands the lateness to the cycle it RUNS
+(`note_checkpoint_decision`, consumed by `note_checkpoint_cycle_term`)
+and an idle `due` tick with nothing to cover ADVANCES the collection
+instant (`note_checkpoint_collected` — an empty collection is a
+collection: a leaf dirtied after it is the next cycle's); the belt caps
+`late` at ONE landing ceiling (`AppenderSet::flush_ceiling_ms`, the
+`late_cap_ns` of `checkpoint_cycle_term_ns`) — a decision later than the
+whole ceiling is a stall the audit counts on the cycle it happens, never
+a term the next 64 cycles anticipate. Pin
+`sym_appender_tests::an_idle_span_is_never_a_cycles_term_so_the_first_
+burst_after_it_runs_at_the_cadence` (4 s idle, then a paced burst: RED on
+`0c7a0678` with the term 2,425 ms and the cycles at one per tick, GREEN
+with the term 9 ms / trigger 991 and the cycles bounded), and the F-B1
+pin gained its UPPER cycle bound (`max_cadence_cycles` — the first pin's
+`cycles ≥ 4` alone would have passed the storm).
 
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 

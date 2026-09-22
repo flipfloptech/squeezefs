@@ -2623,7 +2623,9 @@ fn sym_appender_ring_derives_from_the_reserve_and_the_solo_ring() {
         appender_ring_bytes_derived, appenders_capacity, ring_budget_bytes, sym_ring_ceiling_bytes,
         SYM_RING_FLOOR_BYTES,
     };
-    use squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS;
+    use squeezefs::meta_backend::kv::checkpoint::{
+        checkpoint_tick_period_ms, CHECKPOINT_MAX_AGE_MS,
+    };
     use squeezefs::meta_backend::kv::journal::{checkpoint_reserve_bytes, MAX_ENTRY_LEN};
     use squeezefs::meta_backend::kv::superblock::{
         journal_ring_len, JOURNAL_RING_MAX, JOURNAL_RING_MIN,
@@ -2703,13 +2705,13 @@ fn sym_appender_ring_derives_from_the_reserve_and_the_solo_ring() {
         );
     }
     // PR 13e (F-B1 — record §7 item 3, the margin derived from the
-    // MEASURED cycle term): the cadence TRIGGER in force is the ceiling
+    // MEASURED cycle term): the cadence TRIGGER in force is the MAX AGE
     // minus the cycle's anticipated landing term, saturating — a term at
-    // or past the ceiling makes a cycle due every tick; the published
+    // or past the max age makes a cycle due every tick; the published
     // ceiling itself never widens (a cycle slower than the measured one
     // still trips the audit).
     use squeezefs::meta_backend::kv::checkpoint::checkpoint_trigger_ms;
-    for (ceiling, term, want) in [
+    for (max_age, term, want) in [
         (
             CHECKPOINT_MAX_AGE_MS as u64,
             0,
@@ -2729,15 +2731,38 @@ fn sym_appender_ring_derives_from_the_reserve_and_the_solo_ring() {
         (500, 120, 380),
     ] {
         assert_eq!(
-            checkpoint_trigger_ms(ceiling, term),
+            checkpoint_trigger_ms(max_age, term),
             want,
-            "trigger(ceiling {ceiling}, term {term})"
+            "trigger(max age {max_age}, term {term})"
         );
         assert_eq!(
-            checkpoint_trigger_ms(ceiling, term),
-            ceiling.saturating_sub(term),
-            "the trigger is the ceiling less the anticipated term, saturating"
+            checkpoint_trigger_ms(max_age, term),
+            max_age.saturating_sub(term),
+            "the trigger is the max age less the anticipated term, saturating"
         );
+    }
+    // The trigger's INPUT is the MAX AGE — the age the tick fires AT
+    // (`CHECKPOINT_MAX_AGE_MS`, the cadence's and the stats face's word),
+    // never the LANDING ceiling `max_age + 2 × tick` (review round 1, Issue
+    // 7): fed the max age, a cycle whose term is the anticipated one lands
+    // exactly at the ceiling less nothing — `trigger + 2 × tick + term ==
+    // ceiling`; fed the landing ceiling it would land `2 × tick` past the
+    // promise on every cycle, the margin silently eaten.
+    for flush in [0u64, 50, 5_000] {
+        let tick = checkpoint_tick_period_ms(flush);
+        for term in [0u64, 9, 150, 600] {
+            assert_eq!(
+                checkpoint_trigger_ms(CHECKPOINT_MAX_AGE_MS as u64, term) + 2 * tick,
+                appender_flush_ceiling_ms(flush) - term,
+                "flush {flush} ms, term {term} ms: the trigger at the max age lands the \
+                 anticipated term inside the landing ceiling"
+            );
+            assert_eq!(
+                checkpoint_trigger_ms(appender_flush_ceiling_ms(flush), term) + 2 * tick,
+                appender_flush_ceiling_ms(flush) - term + 2 * tick,
+                "fed the landing ceiling the trigger would eat the 2-tick margin"
+            );
+        }
     }
     // One cycle's landing TERM = its pre-barrier wall + the age decision's
     // lateness past the trigger BEYOND one tick (the wake quantization is

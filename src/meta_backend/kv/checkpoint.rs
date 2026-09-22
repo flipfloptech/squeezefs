@@ -1039,33 +1039,39 @@ pub fn checkpoint_landing_ceiling_ms(flush_interval_ms: u64) -> u64 {
     CHECKPOINT_MAX_AGE_MS as u64 + 2 * checkpoint_tick_period_ms(flush_interval_ms)
 }
 
-/// **The cadence TRIGGER in force for a ceiling, ms** (PR 13e, F-B1 —
+/// **The cadence TRIGGER in force for a MAX AGE, ms** (PR 13e, F-B1 —
 /// record §7 item 3, the margin derived from the MEASURED cycle term):
-/// `ceiling − anticipated_term` (saturating). The landing ceiling is a
-/// PROMISE about when a commit's checkpoint LANDS — the free-grace
-/// qualify term and the reader's staleness bound read it as the writer's
-/// landing bound — and its "trigger + 2 ticks" prices the tick wait and
-/// one period of the tick's own work alone; the cycle's TERM — its
-/// pre-barrier wall (the flush pass, the bitmap pages, barrier #1 — at N
-/// regions their page writes, at a full cache the appends) plus the
-/// tick's own pre-decision work beyond that one period (the deferred-flush
-/// barrier and a maintenance item's device time run BEFORE the tick
-/// decides) — sat OUTSIDE it, so a leaf dirtied right after a cycle's
-/// collection aged `trigger + late + wall` at the next covering barrier and the
-/// audit read the excess as an overrun (16–106 ms past 1,100 on the box,
-/// `excused_ns` 0: no other actor's hold, the cadence's own term). The
-/// decision anticipates the term it has measured
-/// ([`CycleTermWindow`] — the maximum of [`checkpoint_cycle_term_ns`] over
-/// the last [`TERM_HORIZON_CYCLES`] cycles, the same interval the audit
-/// measures)
-/// so the LANDING stays inside the published ceiling on a stationary
-/// term; a cycle SLOWER than the measured one still trips the audit —
-/// the tripwire keeps its teeth, the published number never widens. A
-/// term at or past the ceiling makes a cycle due every tick, the honest
-/// response to a device that cannot land the promise. Tie-tested
-/// (`derivation_sweep_tests`).
-pub fn checkpoint_trigger_ms(ceiling_ms: u64, anticipated_term_ms: u64) -> u64 {
-    ceiling_ms.saturating_sub(anticipated_term_ms)
+/// `max_age − anticipated_term` (saturating). The input is the age the
+/// tick fires AT — [`CHECKPOINT_MAX_AGE_MS`] on the routine cadence, the
+/// free-grace composite's elastic ceiling while a reader ask is live —
+/// and NEVER the landing ceiling: the landing ceiling is `max_age + 2 ×
+/// tick` ([`checkpoint_landing_ceiling_ms`]), a PROMISE about when a
+/// commit's checkpoint LANDS — the free-grace qualify term and the
+/// reader's staleness bound read it as the writer's landing bound — whose
+/// two ticks price the tick wait and one period of the tick's own work; a
+/// caller feeding it the landing ceiling would land the cycle `2 × tick`
+/// past the promise on every cycle, the margin silently eaten (review
+/// round 1, Issue 7 — the parameter is named for its input, and the tie
+/// `trigger(max_age, term) + 2 × tick == landing ceiling − term` pins
+/// it). The cycle's TERM — its pre-barrier wall (the flush pass, the
+/// bitmap pages, barrier #1 — at N regions their page writes, at a full
+/// cache the appends) plus the tick's own pre-decision work beyond that
+/// one period (the deferred-flush barrier and a maintenance item's device
+/// time run BEFORE the tick decides) — sat OUTSIDE the two ticks, so a
+/// leaf dirtied right after a cycle's collection aged `trigger + late +
+/// wall` at the next covering barrier and the audit read the excess as an
+/// overrun (16–106 ms past 1,100 on the box, `excused_ns` 0: no other
+/// actor's hold, the cadence's own term). The decision anticipates the
+/// term it has measured ([`CycleTermWindow`] — the maximum of
+/// [`checkpoint_cycle_term_ns`] over the last [`TERM_HORIZON_CYCLES`]
+/// cycles, the same interval the audit measures) so the LANDING stays
+/// inside the published ceiling on a stationary term; a cycle SLOWER than
+/// the measured one still trips the audit — the tripwire keeps its teeth,
+/// the published number never widens. A term at or past the max age makes
+/// a cycle due every tick, the honest response to a device that cannot
+/// land the promise. Tie-tested (`derivation_sweep_tests`).
+pub fn checkpoint_trigger_ms(max_age_ms: u64, anticipated_term_ms: u64) -> u64 {
+    max_age_ms.saturating_sub(anticipated_term_ms)
 }
 
 /// **One cycle's landing TERM**, ns — the interval between the trigger
@@ -1650,23 +1656,25 @@ async fn tick(
     // flush-ceiling audit judges): the elapsed time runs from the last
     // cycle's COLLECTION (a leaf dirtied after it is this cycle's — the
     // interval the landing ceiling bounds; a cycle's post-barrier work no
-    // longer eats the margin), against the TRIGGER in force — the ceiling
-    // minus the cycle's measured TERM (`checkpoint_trigger_ms`), so the
-    // covering barrier lands inside the promise the ceiling's consumers
-    // read; the tick in force is what one period of the decision's
-    // lateness is priced against. A FLAT volume keeps the shipped law
-    // verbatim: the ceiling elapsed since the last cycle's end.
-    let ceiling_ms = elastic_ceiling.map_or(CHECKPOINT_MAX_AGE_MS as u64, |c| c);
+    // longer eats the margin), against the TRIGGER in force — the MAX AGE
+    // minus the cycle's measured TERM (`checkpoint_trigger_ms`; the max
+    // age is what the tick fires AT, the landing ceiling is `max_age + 2
+    // × tick` — review round 1, Issue 7), so the covering barrier lands
+    // inside the promise the ceiling's consumers read; the tick in force
+    // is what one period of the decision's lateness is priced against. A
+    // FLAT volume keeps the shipped law verbatim: the max age elapsed
+    // since the last cycle's end.
+    let max_age_ms = elastic_ceiling.map_or(CHECKPOINT_MAX_AGE_MS as u64, |c| c);
     // `Some(late)` = due by age on a forest volume, with the decision's
     // lateness for the cycle it runs; the flat arm carries no lateness.
     let age_late_ns = if be.appenders().is_some() {
         be.checkpoint_due_by_age(
-            ceiling_ms,
+            max_age_ms,
             mutex_wait_ns,
             crate::mono_core::monotonic_ns_u64(),
         )
     } else {
-        (last_checkpoint.elapsed().as_millis() >= u128::from(ceiling_ms)).then_some(0)
+        (last_checkpoint.elapsed().as_millis() >= u128::from(max_age_ms)).then_some(0)
     };
     let due_by_age = age_late_ns.is_some();
     let due = final_cycle

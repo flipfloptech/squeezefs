@@ -11496,19 +11496,23 @@ impl KvMetaBackend {
         self.checkpoint_term_ns.load(Ordering::Relaxed) / 1_000_000
     }
 
-    /// **The cadence TRIGGER in force for a landing ceiling `ceiling_ms`**
-    /// (`meta_kv_checkpoint_trigger_ms` at the shipped ceiling): on a
-    /// volume with an appender set — every bit-17 forest, the population
-    /// the flush-ceiling audit judges — `checkpoint::checkpoint_trigger_ms
-    /// (ceiling, term)`, the ceiling minus the measured cycle terms'
-    /// maximum over the horizon, so the covering barrier lands inside the
-    /// promise; a flat volume's trigger is the ceiling verbatim (the
-    /// shipped cadence, byte-identical — PR 1's law).
-    pub fn checkpoint_trigger_ms(&self, ceiling_ms: u64) -> u64 {
+    /// **The cadence TRIGGER in force for a MAX AGE `max_age_ms`** — the
+    /// age the tick fires AT (`CHECKPOINT_MAX_AGE_MS` routinely, the
+    /// elastic ceiling under a live reader ask), never the LANDING ceiling
+    /// `max_age + 2 × tick` (review round 1, Issue 7; the stats face
+    /// `meta_kv_checkpoint_trigger_ms` reads it at the shipped max age):
+    /// on a volume with an appender set — every bit-17 forest, the
+    /// population the flush-ceiling audit judges —
+    /// `checkpoint::checkpoint_trigger_ms(max_age, term)`, the max age
+    /// minus the measured cycle terms' maximum over the horizon, so the
+    /// covering barrier lands inside the promise; a bit-17-ABSENT volume's
+    /// trigger is the max age verbatim (the shipped cadence's decision —
+    /// PR 1's law).
+    pub fn checkpoint_trigger_ms(&self, max_age_ms: u64) -> u64 {
         if self.appenders.is_none() {
-            return ceiling_ms;
+            return max_age_ms;
         }
-        super::checkpoint::checkpoint_trigger_ms(ceiling_ms, self.checkpoint_term_ms())
+        super::checkpoint::checkpoint_trigger_ms(max_age_ms, self.checkpoint_term_ms())
     }
 
     /// The cadence's age law (PR 13e, F-B1): a cycle is due when the time

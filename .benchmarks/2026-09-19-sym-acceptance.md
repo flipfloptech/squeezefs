@@ -3594,6 +3594,17 @@ counted decline, a bounded window or a stated venue):
    is that venue's proxy — **the per-NODE law ("bounded by no node") is
    UNMEASURED on any venue: a multi-node venue, PR 15's cloud row (one
    node per writer), is its instrument** — owed there, never a box row.
+   **PR 15 (2026-09-22): the instrument is BUILT — `tests/cloud_bench_cluster.sh
+   PRESET=mw SYMMETRIC=1 N_CLIENT=<n>` (`assemble-sym` / `bench-sym`, one
+   symmetric writer per client node, the manager on client0 and a JOINED
+   writer per other node through the ladder over the real wire) +
+   `tests/cloud_sym_rows.sh` (gates 2 / 3 / 3b with the matrix's own laws
+   via `tests/sym_rows_lib.sh`); the local functional pass ran on the
+   laptop's fleet as "it works" evidence; NO cloud minute spent — the
+   launch awaits the owner's expressed approval for that run (S1 =
+   `N_CLIENT=3`, 6 × i4i.2xlarge ≈ $4.1/hr; S2 = `N_CLIENT=8`, 11 nodes
+   ≈ $7.5/hr; the cost table is in the PR 15 summary), and only after the
+   squeeze-test re-run on the same binary reads clean.**
 1. **`is_stripe`'s reverse dentry scan over projections** (PR 7b on a
    joiner): `find_parent_of_child` walks every slot tree of the flip
    candidate's volume — a projection on a joiner, defect 24's class once

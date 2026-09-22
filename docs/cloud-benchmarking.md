@@ -52,6 +52,7 @@ venue exists only for the final sustained verdict.
 | `i4i` (default) | `i4i.4xlarge` | ×6 (96 vCPU) | 1 × 3,750 GB Nitro NVMe | ~$12–17/hr on-demand, ~$3–4/hr spot | IOPS |
 | `i3en` | `i3en.12xlarge` | ×6 (288 vCPU) | 4 × 7,500 GB NVMe | ~$30–45/hr on-demand, ~$10–14/hr spot | throughput |
 | `mw` | `i4i.2xlarge` | ×4 (32 vCPU) | 1 × 1,875 GB Nitro NVMe | ~$2.7–2.8/hr on-demand, ~$0.5–0.8/hr spot | multi-writer MPI-IO (`s11-mpiio`) |
+| `mw` + `SYMMETRIC=1 N_CLIENT=n` | `i4i.2xlarge` | ×(3+n) — S1 n=3: ×6 (48 vCPU), S2 n=8: ×11 (88 vCPU) | 1 × 1,875 GB Nitro NVMe | ~$0.686/hr per node on-demand: S1 ~$4.1/hr, S2 ~$7.5/hr | symmetric gates 2 / 3 / 3b on N real nodes (PR 15) |
 | `custom` | `INSTANCE_TYPE` verbatim | — | — | — | (still burst-class-refused) |
 
 Roles are preset-dependent (an explicit `N_MDS`/`N_OSS`/`N_CLIENT`/`N_SPARE`
@@ -82,9 +83,10 @@ MAX_CLUSTER_HOURS=3 PRESET=mw tests/cloud_bench_cluster.sh full  # multi-writer 
 ```
 
 `full` = launch → deploy → assemble → bench → teardown (with `PRESET=mw`:
-launch → deploy → assemble-mw → bench-mw → teardown). Step-by-step
-subcommands (`launch`, `deploy`, `assemble`, `assemble-mw`, `bench`,
-`bench-mw`, `status`, `teardown`) exist for iterating; every one of them
+launch → deploy → assemble-mw → bench-mw → teardown; with `PRESET=mw
+SYMMETRIC=1`: … → assemble-sym → bench-sym → teardown). Step-by-step
+subcommands (`launch`, `deploy`, `assemble`, `assemble-mw`, `assemble-sym`,
+`bench`, `bench-mw`, `bench-sym`, `status`, `teardown`) exist for iterating; every one of them
 takes `--dry-run`, which prints the exact aws/ssh commands with canned query
 results and needs no credentials. `--cluster-id ID` targets a specific
 cluster (default: the one recorded in `.cloud-bench/current`); `--preset P`
@@ -162,6 +164,109 @@ runs must run **both orders** and cite both brackets.
 shared-vs-disjoint** ior row (`tests/run_mw_matrix.sh s11-mpiio` in
 external-mounts mode, `MW_IOR_PROCS` ranks per mount, default 4) over the
 assembled fleet, into the same results layout.
+
+## The symmetric fleet shape (`PRESET=mw SYMMETRIC=1` — PR 15, the program's only multi-node venue)
+
+Every symmetric row so far ran **co-located** (one box, N daemons sharing
+its cores — the laptop and squeeze-test), so design §8 gate 3's law
+("aggregate create/s and ingest scale with N, **bounded by no node**") was
+judged on creates per daemon-CPU-second
+([design §8 row 3](design-symmetric-metadata.md#8-performance-gates--evidence-tiers),
+acceptance record §3.9.3). The cloud row puts **one symmetric writer per
+node** on a real nvme-tcp fabric and reads the law as written. `SYMMETRIC=1`
+(or `--symmetric`) under `PRESET=mw` makes `N_CLIENT` the **writer node
+count** (default 2; `N_MDS=1 N_OSS=2` as today; `INSTANCE_TYPE` override
+honoured; the burst-class refusal untouched). Pass `PRESET=mw SYMMETRIC=1
+N_CLIENT=<n>` on **every** subcommand:
+
+```bash
+MAX_CLUSTER_HOURS=4 PRESET=mw SYMMETRIC=1 N_CLIENT=3 tests/cloud_bench_cluster.sh launch
+PRESET=mw SYMMETRIC=1 N_CLIENT=3 ARTIFACT_DIR=dist/ubuntu2604 tests/cloud_bench_cluster.sh deploy
+PRESET=mw SYMMETRIC=1 N_CLIENT=3 tests/cloud_bench_cluster.sh assemble-sym
+PRESET=mw SYMMETRIC=1 N_CLIENT=3 SYM_TAR_SRC=<linux>/fs tests/cloud_bench_cluster.sh bench-sym
+tests/cloud_bench_cluster.sh teardown
+```
+
+| shape | `N_CLIENT` | nodes | rows | est. on-demand |
+|---|---|---|---|---|
+| **S1** | 3 | 6 × i4i.2xlarge | gate 2 + gate 3b (+ `-ls`) + gate 3 at N ≤ 2 | ~$4.1/hr |
+| S1' | 2 | 5 × i4i.2xlarge | gates 2 + 3 (N ≤ 2) only — `SYM_ROWS=tarx,scale` (gate 3b needs ≥ 2 **joined** writers beside the manager: the flip triggers on foreign creates from more than one creator) | ~$3.4/hr |
+| **S2** | 8 | 11 × i4i.2xlarge | gate 3's full N = 1/2/4/8 ladder + gates 2 / 3b | ~$7.5/hr |
+
+**`assemble-sym`** runs `assemble-mw`'s fabric steps (the FUSE-over-io_uring
+floor on **every** client node, the prologue on every client node, the
+storage shares + the nvmet PR assert) and diverges at two points: the
+manager's node formats with **`format --symmetric`** (the other client nodes
+connect only — the meta URI is the set's on every node); and the mount is
+**one symmetric writer per client node** through the join ladder
+(`SQUEEZEFS_SYMMETRIC_META=1`, no posture knob — `SQUEEZEFS_MULTI_WRITER` /
+`MW_ROLE` / `MW_AUTHORITY` / `MW_MEMBERS` are retired spellings under the
+plane): the **manager** on `client0` (the D0 winner; membership shard at
+`auto`, listener at `<private ip>:SYM_PORT` — an explicit bind, advertised
+verbatim into its claim-set entry, which every joiner's
+`resolve_holder_endpoint` reads), a **joined writer** on `client1..N-1`
+(the fifth door over the wire — its own ring, page, slot leases and
+checkpoint task), and, with `SYM_TOKEN_READER=1` (default), a `--read-only`
+**token reader** at `/scratch/mnt-ro` on `client0` (the `-ls` half of gate
+3b). Every node is its **own registrant** — the REMOTE posture: the node's
+nvme-cli host identity (`/etc/nvme/hostnqn` + `hostid`), generated where
+missing and **asserted distinct across the client nodes** (a baked AMI
+clones the file onto every node; two nodes with one identity alias as one
+registrant at the target). No `SQUEEZEFS_FLEET_SHARE` — one daemon per node
+owns its machine, which is the point of the venue.
+
+The posture gates are read from every node's `.stats` (a silently-degraded
+mount is contractually impossible): the manager — `mount_posture writer`,
+`manager_lease held` + `symmetric_meta 1` + `writer_guard_mode flock+pr` on
+every volume, `data_plane_fence_mode 1`, `membership_mode owner`,
+`symmetric_join.endpoint` on the node's private ip, the ladder's
+`SYMMETRIC WRITER JOINED` log line; each joiner — the joined door's log
+line, `mount_posture writer`, `joined_appender_id ≥ 1`,
+**`joined_registrant_posture registrant`** (`adopted` would mean the joiner
+believed itself co-located with the manager — a product finding on this
+venue; `detection` a non-PR namespace), `manager_lease peer:…`,
+`slot_leases_held ≥ 1`, `membership_mode member`, its own endpoint
+published; fleet-wide at the manager — `appenders_live == N`,
+`appenders_known == N`, `membership_writers == N − 1` (every joiner a
+writer member of the manager's shard); the token reader —
+`reader_staleness_bound_ms == 0`; then the build_commit ritual on every
+node.
+
+**`bench-sym`** drives the three row sets from the operator's box over ssh
+with `tests/cloud_sym_rows.sh` — one row driver whose laws are
+`tests/sym_rows_lib.sh`, the **same file `tests/run_mw_matrix.sh` sources
+for its `sym-tarx` / `sym-scale` / `sym-shared-dir` legs**, so the cloud row
+and the box row read one law (the matrix's `.stats` keys and verdict text;
+change a threshold there and both venues move together). The row set:
+
+| row | shape on the fleet | law (the lib's) |
+|---|---|---|
+| gate 2 `sym-tarx` | `tar -x` of the shipped corpus (`SYM_TAR_SRC=<linux>/fs` — the box used `linux-7.2.3/fs`, 2,468 entries; ship the same tarball to keep rows comparable) by **client1's joined writer** into a directory it created, vs **S0 = the manager's own extract on client0** (the same binary, a single-node mount on the same node class over the same fabric, in the same session); A-B-B-A `sym-1 local-1 local-2 sym-2`; as many extractions per arm as fit `SYM_RT` (each into a fresh subdir); the measured node-to-node RTT stated in the row (replaces the box's netem 250 µs) | ≤ 1.10× S0; `wire_verbs_per_entry` < 0.05; `slot_handovers == 0`; `dlm_rpcs == 0` |
+| gate 3 `sym-scale` | N ∈ {1,2,4,8} ∩ [1, N_CLIENT] writer **nodes** (the manager + N−1 joiners) each create `SYM_FILES` files (`SYM_THREADS` threads) in its own directory, then ingest `SYM_INGEST_MB` (4 MiB blocks, `conv=fsync`); the idle writers **leave** (`sym-hook`) so exactly N appenders are live; `C/CPU-S` beside the wall multiple; the ingest row's amplification columns from `/proc/diskstats` on the storage nodes' data namespaces (`device ÷ user bytes`, `wareq-sz`) | ≥ 0.7 × N × the N=1 rate on both rows; `appenders_live == N`; handovers 0; `slot_ships ≤ N`; `dlm_rpcs` 0; the must-stay-0 deltas 0; deleted stays deleted through the manager after every writer's clean leave and through a remounted writer |
+| gate 3b `sym-shared-dir` (+ `-ls`) | every writer node creates `SYM_FILES / N` files into **one** directory the first joiner made; then the token reader's cold `ls -l` of it | `dir_stripe_flips == 1` at the holder; `dir_striped_dirs ≥ 1`; `dir_stripe_ships > 0`; `xv shipped ≡ served`; `slot_handovers == 0`; `-ls`: `dlm_token_grants ∈ [K + C, K + C + 4]`, 0 data-leaf reads (net of the poll's re-reads + one tree-0 read per stripe slot), `dir_stripe_readdir_merges ≥ 1` |
+
+After every row set: `squeezefs fsck <manager mount> --json` (findings 0),
+`meta_kv_block_refs_drift == 0`, `data_alloc_bitmap_drift == 0` and the
+must-stay-0 set on every writer. Every measured phase runs ≥ `SYM_RT`
+seconds (default 60 — the sustained-state rule; a shorter phase is warned
+as under-sized); the local scoping pass runs `--rt=10`. The design's
+"vs today" **A arm** (the shipped authority + co-writers at the same N on
+the same binary) is **not built** in PR 15 — this rig has no per-node
+co-writer recipe (the v5-mw recipe is co-located on client0) — and
+`SYM_ARM_A=1` refuses loud; the B-only law rows are the minimum.
+
+Results land in `.benchmarks/cloud/<ts>/` (the manifest) and
+`.benchmarks/cloud/<ts>/sym-rows/` (`rows.txt` = the labelled rows +
+verdicts; per-node `.stats` snapshots `m<idx>_p<label>{0,1}.json`; the
+fsck transcripts; every node's daemon logs under `logs/<node>/`). **Every
+row carries the cloud label**: instrument, `substrate=aws-<market>/<instance>/<az>/pg-<placement>`,
+venue + cluster id, the measured RTT, and **per node** its kernel and
+the mounted daemon's `build_commit`. A cloud row is a third substrate class
+— never spliced into devsub or squeeze-test medians. Every launch needs the
+owner's expressed approval for **that** run; the free local pass
+(`tests/cloud_sym_rows.sh … manager=local:… writer=local:…` over a
+`tests/mw_fleet.sh create N=2 --symmetric --writers=3` fleet, with
+`--mount-hook="tests/cloud_sym_rows.sh fleet-hook"`) comes first.
 
 ## Substrate-labeling rules (what makes a cloud row admissible)
 

@@ -3593,55 +3593,66 @@ of its decision (the deferred-flush barrier + a maintenance item's SMO
 barrier past the drain deadline), 26–272 ms against a 50 ms tick. A leaf
 dirtied right after a cycle's collection aged `tail + trigger + late +
 wall` at its covering barrier and the audit — correctly — counted it.
-**Fix (`57f5d214`, a derivation, never a widened constant — §7 item 3):**
-on a volume with an appender set (every bit-17 forest — the population the
-audit judges) the age law runs from the LAST COLLECTION
+**Fix (`57f5d214` + `eaf2fd58`, a derivation, never a widened constant —
+§7 item 3):** on a volume with an appender set (every bit-17 forest — the
+population the audit judges) the age law runs from the LAST COLLECTION
 (`checkpoint_collected_ns`, set by every cycle path — a leaf dirtied after
 a collection is the next cycle's) against
-`checkpoint::checkpoint_trigger_ms(ceiling, term_hwm)` = `max_age −
-HWM(term)`, where ONE cycle's landing TERM (`checkpoint_cycle_term_ns
-(wall, late, tick)` = `wall + (late − tick)⁺`) is its pre-barrier wall
-plus the decision's lateness past the trigger BEYOND one tick — the tick
-quantization IS the ceiling's first priced tick; the excess is the
-pre-decision device work the second tick bounds at one period — less the
-lateness spent parked behind a STRUCTURAL hold (PR 13c's excused class,
-accounted there; anticipating it would fire every tick for the mark's
-memory after every long service); the HWM is a decayed HIGH-WATER MARK
-`max(sample, prev − prev/8)` (`anticipated_cycle_term_ns` — a bound must
-be anticipated by a bound: the first build's EWMA mean left 3 of 6 cycles
-overrunning). The published ceiling never widens (a cycle slower than its
-anticipated term still trips the audit — the tripwire keeps its teeth); a
-term at or past the ceiling makes a cycle due every tick, the honest
-response to a device that cannot land the promise. A FLAT volume keeps the
-shipped law VERBATIM (`tick` keeps `last_checkpoint`; the dispatch is
-`appenders().is_some()`). Published per volume:
+`checkpoint::checkpoint_trigger_ms(ceiling, term)` = `max_age − term`,
+where the anticipated `term` is the MAXIMUM over the last
+`TERM_HORIZON_CYCLES` = `COVER_CYCLES_MAX` (64) cycles
+(`checkpoint::CycleTermWindow` — a bound anticipated by a bound: the first
+build's EWMA mean left 3 of 6 cycles overrunning, and a decayed high-water
+mark leaked one eighth per quiet cycle and landed a burst one step above
+it a tick short; the horizon is the ONE cycle-count bound every cover loop
+runs to, so a burst is remembered exactly as long as a cover loop would
+wait on it) of ONE cycle's landing TERM (`checkpoint_cycle_term_ns(wall,
+late, tick)` = `wall + (late − tick)⁺`): its pre-barrier wall plus the age
+decision's lateness past the trigger BEYOND one tick — the tick
+quantization IS the ceiling's first priced tick; the excess is the tick's
+own pre-decision device work the second tick bounds at one period — with
+the tick's WAIT for the SMO mutex left out (`tick` measures it; a wait
+behind another holder is that holder's hold — a structural hold the audit
+excuses, an online fsck's census or a wire service it judges, never a term
+for the cadence to anticipate: the fleet proof's manager read a 7 s wait
+behind its own census as a term and a trigger of 0 for the mark's memory
+before this rule). The published ceiling never widens (a cycle slower than
+its anticipated term still trips the audit — the tripwire keeps its
+teeth); a term at or past the ceiling makes a cycle due every tick, the
+honest response to a device that cannot land the promise. A FLAT volume
+keeps the shipped law VERBATIM (`tick` keeps `last_checkpoint`; the
+dispatch is `appenders().is_some()`). Published per volume:
 `meta_kv_checkpoint_term_ms`, `meta_kv_checkpoint_trigger_ms`; the
 per-cycle instrument the box-rerun's item 13 named is the debug tape
 `checkpoint: cycle … pre-barrier wall N ms = publish + flush (dirty, SMOs)
-+ pages + barrier` and `cycle due by age … decided N ms past the
-trigger`. **Pin (`96d5e98d` + `808667fc`, RED on the base; `57f5d214`
-GREEN):** `sym_appender_tests::the_cadence_anticipates_the_measured_cycle_
-wall_so_a_slow_barrier_lands_inside_the_ceiling` — the box's shape: the
-ARMED plane with the box's affinity order (`Knobs::armed().affinity_mb
-("16")`; the 64 MiB fixture's derived ceiling is the one-extent floor,
-which a one-leaf tree sits AT and spills to the 64-rotor — 60–68 dirty
-leaves + 1–2 SMOs per cycle and 64 per-tree maintenance items ahead of
-every decision), the shipped 256 KiB node / 8 MiB ring, ONE directory
-leaf, one creator, a 60 ms barrier armed after a clean checkpoint, two
-warm cycles, five intervals: **RED on the base cadence (1 overrun at
-1,470 ms in 5 cycles — 370 ms past the ceiling), GREEN with the fix (0
-overruns in 7 cadence cycles; the trigger 780 / 808 / 665 / 707 / 744 /
-776 / 743 ms anticipating terms of 220 / 192 / 335 / 293 / 256 / 224 /
-257 ms)**. The first shape (64 KiB nodes, the unarmed 64-rotor, four
-creators, a 150 ms barrier) was retired in the rung: its walls were
-355–1,204 ms — past the ceiling ITSELF, a geometry × latency verdict no
-cadence can land, and not the box's bounded 16–106 ms. PR 13c's four
-ceiling contracts stay green (the service-hold pin dirties its step-3 leaf
-UNDER the hold: its step-2 parked device teaches the cadence a term past
-the ceiling, and a leaf dirtied before the hold is then flushed inside
-one tick); the three fns are tie-tested in `derivation_sweep_tests`.
-**The box re-run on this binary is what says the derivation priced the
-box's term** — the laptop readings above are the mechanism's.
++ pages + barrier` and `cycle due by age … decided N ms past the trigger …
+the tick's wait for the SMO mutex N ms left out`. **Pin (`96d5e98d` +
+`808667fc` + `eaf2fd58`):** `sym_appender_tests::the_cadence_anticipates_
+the_measured_cycle_wall_so_a_slow_barrier_lands_inside_the_ceiling` — the
+box's shape: the ARMED plane with the box's affinity order
+(`Knobs::armed().affinity_mb("16")`; the 64 MiB fixture's derived ceiling
+is the one-extent floor, which a one-leaf tree sits AT and spills to the
+64-rotor — 60–68 dirty leaves + 1–2 SMOs per cycle and 64 per-tree
+maintenance items ahead of every decision), the shipped 256 KiB node /
+8 MiB ring, ONE directory leaf, one creator PACED at a tick (a STATIONARY
+storm — an unpaced creator's compaction count grows with the leaf, a
+bursts-larger-than-any-before shape the tripwire is designed to catch), a
+60 ms barrier armed after a clean checkpoint (the term reads 60–120 ms —
+the box's 16–106 ms class; a 25 ms barrier's 26 ms term sits inside the
+margin on the base too and pins nothing, 0/5), two warm cycles, five
+intervals: **RED on the TRUE base (`96d5e98d`'s src) 5/5 — every cycle
+1,121–1,174 ms, 21–74 ms past the ceiling; GREEN with the fix 12/12 (terms
+63–73 ms, the trigger 927–937 ms), the four ceiling contracts 10/10**. The
+first shape (64 KiB nodes, the unarmed 64-rotor, four creators, a 150 ms
+barrier) was retired in the rung: its walls were 355–1,204 ms — past the
+ceiling ITSELF, a geometry × latency verdict no cadence can land, and not
+the box's bounded 16–106 ms. PR 13c's four ceiling contracts stay green
+(the service-hold pin dirties its step-3 leaf UNDER the hold: its step-2
+parked device teaches the cadence a term past the ceiling, and a leaf
+dirtied before the hold is then flushed inside one tick); the fns and the
+window are tie-tested in `derivation_sweep_tests`. **The box re-run on
+this binary is what says the derivation priced the box's term** — the
+laptop readings above are the mechanism's.
 
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
@@ -3896,10 +3907,10 @@ counted decline, a bounded window or a stated venue):
    stays THIS item, PR 14's**, and the box re-run on PR 13c's binary
    says what remains for it to price. **PR 13e (F-B1, §4.4am — the
    derivation LANDED):** a forest volume's cadence fires
-   `checkpoint_trigger_ms(ceiling, term_hwm)` = `max_age − HWM(term)` from
-   the LAST COLLECTION, the term = the cycle's measured pre-barrier wall +
-   the decision's lateness beyond one tick (a structural hold's overlap
-   excluded), the HWM a decayed high-water mark; the published ceiling
+   `checkpoint_trigger_ms(ceiling, term)` = `max_age − term` from the LAST
+   COLLECTION, the term = the horizon MAXIMUM (64 cycles) of the cycle's
+   measured pre-barrier wall + the decision's lateness beyond one tick
+   (the tick's wait for the SMO mutex left out); the published ceiling
    never widens, the flat cadence is byte-identical; RED-first on the
    box's shape, published `meta_kv_checkpoint_{term,trigger}_ms`. **What
    stays for the box re-run (PR 14):** the counted rows on this binary —
@@ -4234,7 +4245,7 @@ Laptop-side: `/tmp/grok-justin/box-rerun/{arms,gate1,gate1-rev,perf-phases,nw}`
 >
 > **Status (PR 13c, the box campaign — `fix/sym-box-campaign`, 2026-09-22): what LANDED against the list above, and what still stands.** *Landed, red-first:* **F-B3** — the listener cap derives from the RAW root × the shipped factor, ceilinged by the fd budget (`RLIMIT_NOFILE / 8`), a refused dial retries from the accept tick to the dial bound then surfaces the typed `ListenerRefused`, a token reader's ROOT attr survives a transient wire class (the `.stats` EINVAL), and the first 32-member fleet FORMED on the laptop (§3.9.2's "→ fixed"; H-C1 / H-C2 the harness shapes it uncovered); **F-B2** — the dominance rule's `ops_h` counts the holder's work on the slot's SUBTREE across volumes (design §5.1.4 as built, the hint's two error directions and the root-ward consequence stated); **F-B1** — the flush-ceiling audit EXCLUDES the SMO mutex's structural holds: an overlap-bounded exclusion (over-excuse ≤ one cadence tick per hold), each class CAPPED at a published bound (a recovery's at `appender_recovery_bound_ms`, a service hold's at one landing ceiling — `appender_flush_ceiling_service_cap_ms`), the excused Σ published (`appender_flush_ceiling_excused_{ns,max_ms}`), the pass's own wall (its device time, its wait on a peer) never excused; **the gate-1 flat path** — three unarmed-path costs deleted (`stripes_armed_any`, the memo fed on an armed set only, `token_serve`'s two-probe return), the rename lock-set fix's +1 guard priced and kept, and the startup `RLIMIT_NOFILE` raise confined to the listener caps (`uring_fs::fd_cache_cap` derives from the limit AS FOUND — review round 1, Issue 8: the first build had grown the flat path's fd cache 32×). *Still standing (the flip's list, restated for PR 14):* (a) **the box re-runs** of gates 1 / 3 / 3c / 5 / 7@N=32 on PR 13c's binary — no box row ran in PR 13c (the counted-run law); (b) **the flush-ceiling MARGIN's derivation from the measured pass wall (§7 item 3) — NOT done**: F-B1 landed an exclusion of another actor's holds, which is not a derivation of the margin, and the box's 1–32 ms overruns are what that derivation must price; (c) **gate 3's per-NODE law ("bounded by no node") is UNMEASURED on any venue**: the box's N = 8 MISS is attributed to the co-located venue (§3.9.3), the per-daemon-CPU-second face (0.63× at N = 8 with the ingest CPU folded in; the create phase alone is `sym-scale`'s new `C/CPU-S` column, unrun on the box) is that venue's PROXY, and **a multi-node venue — PR 15's cloud row — is the law's instrument**; (d) the storm ×10 count from zero on PR 13c's binary.
 >
-> **Status (PR 13e, the box re-run's armed-plane findings — `fix/sym-box-rerun-findings`, 2026-09-22): NOT YET, the list restated.** *Landed, red-first:* **F-R3 (P0)** — a cross-owner plan's inode witness is read AT THE HOLDER of the ino's slot (`read_inode_witness` — the writer's read divert; the local record verbatim on every unarmed / flat mount), the dangling-name arm is the must-stay-0 `xv_cross_owner_dangling_names`, a projection's `None` on a live foreign lessee's slot refuses the retryable class (§4.4ak); **F-R4** — a served step for a slot the holder no longer leases is the typed slot-moved class, never the op's `ENOENT`, and a wire grant adopts the tree before naming its lessee (§4.4al); **F-B1** — the flush-ceiling MARGIN's derivation LANDED: a forest volume's cadence fires `max_age − HWM(cycle term)` from the last collection, the term = the measured pre-barrier wall + the decision's lateness beyond one tick (a structural hold's overlap excluded), the published ceiling never widened, the flat cadence byte-identical, published `meta_kv_checkpoint_{term,trigger}_ms` (§4.4am; item (b) above is DONE as a mechanism — the box re-run judges whether it priced the box's 16–106 ms). *Still standing:* (a) **the box re-runs** of gates 1 / 3 / 3c / 5 / 7@N=32 on THIS binary — F-B1's derivation and F-R3 / F-R4 are judged there (every N-writer row set stopped at its first trip on PR 13c's); (c) gate 3's per-NODE law (PR 15's venue); (d) the storm ×10 from zero on this binary; **F-R2** (the SHIPPED authority's per-create `readdir` — the co-writer posture the flip retires) and **gate 1's `handle_setattr` economy** (PR 13f, in parallel) are not this rung's; the PAUSED law of gate 3c stays owed to the next box session (§4.4aj of the box-rerun record).
+> **Status (PR 13e, the box re-run's armed-plane findings — `fix/sym-box-rerun-findings`, 2026-09-22): NOT YET, the list restated.** *Landed, red-first:* **F-R3 (P0)** — a cross-owner plan's inode witness is read AT THE HOLDER of the ino's slot (`read_inode_witness` — the writer's read divert; the local record verbatim on every unarmed / flat mount), the dangling-name arm is the must-stay-0 `xv_cross_owner_dangling_names`, a projection's `None` on a live foreign lessee's slot refuses the retryable class (§4.4ak); **F-R4** — a served step for a slot the holder no longer leases is the typed slot-moved class, never the op's `ENOENT`, and a wire grant adopts the tree before naming its lessee (§4.4al); **F-B1** — the flush-ceiling MARGIN's derivation LANDED: a forest volume's cadence fires `max_age − term` from the last collection, the term = the horizon maximum (64 cycles) of the measured pre-barrier wall + the decision's lateness beyond one tick (the tick's wait for the SMO mutex left out), the published ceiling never widened, the flat cadence byte-identical, published `meta_kv_checkpoint_{term,trigger}_ms` (§4.4am; item (b) above is DONE as a mechanism — the box re-run judges whether it priced the box's 16–106 ms). *Still standing:* (a) **the box re-runs** of gates 1 / 3 / 3c / 5 / 7@N=32 on THIS binary — F-B1's derivation and F-R3 / F-R4 are judged there (every N-writer row set stopped at its first trip on PR 13c's); (c) gate 3's per-NODE law (PR 15's venue); (d) the storm ×10 from zero on this binary; **F-R2** (the SHIPPED authority's per-create `readdir` — the co-writer posture the flip retires) and **gate 1's `handle_setattr` economy** (PR 13f, in parallel) are not this rung's; the PAUSED law of gate 3c stays owed to the next box session (§4.4aj of the box-rerun record).
 
 > **Status (PR 13d, `fix/sym-stripe-ls-token-economy`, 2026-09-22): the `2K + C + 3` reading PR 15's local pass took on gate 3b's `-ls` half is ATTRIBUTED to fleet state (a ROOT striped by the preceding `sym-scale` leg on the same fleet — one records-only grant per root stripe at the reader's first `stat /` after its lookup learnt the map, §7 item 7's class), identical on `7b2ef9e9` and `77f4da1d`, pinned in-process both ways (§4.4ak); no product change; **adjudicated option (c): design §8 row 3b's `-ls` law is `K_D + K_root + C + [0, 4]`**, the leg's code change PR 15's (`tests/sym_rows_lib.sh`, the one law library).**
 

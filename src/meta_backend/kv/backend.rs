@@ -1082,6 +1082,17 @@ impl std::ops::Deref for TreeRef<'_> {
 }
 
 /// One mounted v3 metadata volume.
+/// A forest slot's census word off tree 0 — see
+/// `KvMetaBackend::forest_slot_word`.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ForestSlotWord {
+    /// Tree 0 leases the slot to nobody.
+    pub unleased: bool,
+    /// The slot's ino cursor as tree 0 records it (the release's for an
+    /// unleased slot, the grant's for a leased one).
+    pub cursor: u64,
+}
+
 pub struct KvMetaBackend {
     path: PathBuf,
     sb: SuperblockV3,
@@ -1133,6 +1144,20 @@ pub struct KvMetaBackend {
     /// has no era floor and its records are never C9 candidates —
     /// fail-closed, the fsck posture (no verdict rather than a guess).
     era_ino_floor_guest: std::sync::OnceLock<std::collections::HashMap<u16, u64>>,
+    /// Tree 0's slot words as read at OPEN on a forest volume — per forest
+    /// slot, whether NOBODY leases it and its ino cursor — the census's
+    /// source for a slot this mount holds no cursor for (PR 13e review
+    /// round 1, Issue 2): a JOINED appender's rotor slots never reach the
+    /// manager's `guest_cursors` (it never `install_lease`s them), so the
+    /// stamp the guest floors were seeded from never names them, and
+    /// every joiner-minted ino read current-era (exempt) at the manager
+    /// AND at an offline probe — and sat above the ino bitmaps' raw
+    /// ceiling. The LIVE word is the armed plane's lease table where one
+    /// exists (`forest_slot_word`); this snapshot serves a probe, a
+    /// reader and an unarmed forest, whose tree 0 does not move under them
+    /// the way a manager's does under its own grants and releases.
+    forest_slot_words:
+        std::sync::OnceLock<std::collections::HashMap<super::record::ForestSlot, ForestSlotWord>>,
     /// Pre-RC spec §6.2 item 5 (incompat bit 12): **per-writer ino lane
     /// cursors**, keyed `(writer id, space)` where the space is the
     /// volume's native watermark or a hosted guest slot
@@ -3092,6 +3117,7 @@ impl KvMetaBackend {
             next_ino: AtomicU64::new(next_ino),
             era_ino_floor_native: next_ino,
             era_ino_floor_guest: std::sync::OnceLock::new(),
+            forest_slot_words: std::sync::OnceLock::new(),
             lane_cursors: scc::HashMap::new(),
             lanes_live: AtomicBool::new(false),
             destroyed_inodes: AtomicU64::new(0),
@@ -3228,7 +3254,61 @@ impl KvMetaBackend {
             true
         });
         let _ = be.era_ino_floor_guest.set(guest_floors);
+        be.snapshot_forest_slot_words().await?;
         Ok(be)
+    }
+
+    /// Read tree 0's slot words once at open (`forest_slot_words`) — a
+    /// no-op on a flat volume.
+    async fn snapshot_forest_slot_words(&self) -> std::result::Result<(), KvError> {
+        let Some(control) = self.forest_control_tree() else {
+            return Ok(());
+        };
+        let mut words = std::collections::HashMap::new();
+        let (mut cursor, end) = super::slot_state::slot_state_key_range();
+        loop {
+            let page = control.range(&cursor, &end, 512).await?;
+            let Some((last, _)) = page.last() else {
+                break;
+            };
+            cursor = key_successor(last);
+            for (k, v) in &page {
+                let slot = super::slot_state::decode_slot_state_key(k)?;
+                let word = match super::slot_state::SlotState::decode(v)? {
+                    super::slot_state::SlotState::Unleased { cursor, .. } => ForestSlotWord {
+                        unleased: true,
+                        cursor,
+                    },
+                    super::slot_state::SlotState::Leased { cursor, .. } => ForestSlotWord {
+                        unleased: false,
+                        cursor,
+                    },
+                };
+                words.insert(slot, word);
+            }
+        }
+        let _ = self.forest_slot_words.set(words);
+        Ok(())
+    }
+
+    /// A forest slot's census word — tree 0's lessee state and ino cursor
+    /// (review round 1, Issue 2): the armed plane's LIVE lease table
+    /// where one exists (a manager's tree 0 moves under its own grants and
+    /// releases; the table mirrors every one), else the words read at open
+    /// (a probe's, a reader's, an unarmed forest's — static under them).
+    /// `None` = tree 0 names no such slot.
+    fn forest_slot_word(&self, slot: super::record::ForestSlot) -> Option<ForestSlotWord> {
+        if let Some(plane) = self.slot_leases() {
+            if let Some(lease) = plane.table.get(slot) {
+                return Some(ForestSlotWord {
+                    unleased: lease.state == crate::slot_lease_core::LeaseState::Unleased,
+                    cursor: lease.words.cursor,
+                });
+            }
+        }
+        self.forest_slot_words
+            .get()
+            .and_then(|m| m.get(&slot).copied())
     }
 
     /// The mounted superblock.
@@ -11056,6 +11136,21 @@ impl KvMetaBackend {
             hi = hi.max(cursor.snapshot());
             true
         });
+        // A forest slot this mount holds no cursor for (a joined
+        // appender's, released or leased) is bounded by tree 0's word —
+        // without it every joiner-minted ino sat above the ceiling and
+        // the census's bitmaps could not even index it (Issue 2's second
+        // face beside the era floor's).
+        if let Some(plane) = self.slot_leases() {
+            for (_slot, lease) in plane.table.snapshot() {
+                hi = hi.max(lease.words.cursor);
+            }
+        }
+        if let Some(words) = self.forest_slot_words.get() {
+            for w in words.values() {
+                hi = hi.max(w.cursor);
+            }
+        }
         hi
     }
 
@@ -11072,16 +11167,33 @@ impl KvMetaBackend {
     /// legitimately commits the inode record before the dentry, and every
     /// ino this mount can mint is at or above the floor.
     ///
-    /// **Fail-closed** for a guest keyspace this mount had no cursor for at
-    /// open (a virgin slot, or one whose cursor arrived mid-mount with a
-    /// migrated slot): `false` — no verdict rather than a guess.
+    /// **On a forest volume tree 0 is a witness beside the floor** (PR 13e
+    /// review round 1, Issue 2): a slot NOBODY leases has no minter, so
+    /// every record in it is prior-era whatever this mount's floor says —
+    /// a joined appender's rotor slots never reach the manager's cursors,
+    /// so its mints read current-era at every censusing mount and the
+    /// class the census was added for (F-R3's orphans) passed it; and a
+    /// PROBE has nothing in flight (an offline census refuses a live
+    /// set), so every guest record it reads without a floor is prior-era
+    /// too. A slot a LIVE foreign appender leases stays fail-closed here
+    /// (the inode plane scopes it out of the dentry verdict anyway).
+    ///
+    /// **Fail-closed** otherwise for a guest keyspace this mount had no
+    /// cursor for at open (a virgin slot, or one whose cursor arrived
+    /// mid-mount with a migrated slot): `false` — no verdict rather than a
+    /// guess.
     pub fn minted_in_prior_era(&self, local_ino: Ino) -> bool {
         match crate::meta_backend::split_guest_local(local_ino) {
-            Some((slot, raw)) => self
-                .era_ino_floor_guest
-                .get()
-                .and_then(|m| m.get(&slot).copied())
-                .is_some_and(|floor| raw < floor),
+            Some((slot, raw)) => {
+                let word = self.forest_slot_word(super::record::forest_slot_of_ino(local_ino));
+                if word.is_some_and(|w| w.unleased) {
+                    return true;
+                }
+                if let Some(floor) = self.era_ino_floor_guest.get().and_then(|m| m.get(&slot)) {
+                    return raw < *floor;
+                }
+                self.probe && word.is_some()
+            }
             None => local_ino < self.era_ino_floor_native,
         }
     }

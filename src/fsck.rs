@@ -4101,12 +4101,20 @@ async fn evaluate_c9_unreferenced(
             counters.current_era_exempted += 1;
             continue;
         }
-        let Ok(Some(val)) = kv.read_inode_value_routed(local).await else {
-            continue; // vanished between the walk and here: no verdict
+        let val = match kv.read_inode_value_routed(local).await {
+            Ok(Some(val)) => val,
+            other => {
+                // Vanished between the walk and here: no verdict.
+                log::debug!(
+                    "fsck C9: candidate ino {ino} (local {local}) read {other:?} — no verdict"
+                );
+                continue;
+            }
         };
         // `nlink == 0` is the unlinked-but-open / POSIX-15 shape and is
         // deliberately out of scope (module header).
         if val.nlink == 0 {
+            log::debug!("fsck C9: candidate ino {ino} (local {local}) is nlink 0 — out of scope");
             continue;
         }
         let blocks = layout_mappings_of(ctx, ino).await.len();

@@ -4687,9 +4687,12 @@ leg_sym_foreign_touch() {
 # manager's online fsck covers the inode plane WHOLE and reads C9 = C10 = 0:
 # the orphan an F-R3 unlink leaves lives in the CREATOR's slot tree — a
 # projection at the censusing mount while the creator lives, scoped out of
-# every live-fleet row (`fsck_inode_plane_foreign_dentry_scoped`), which is
-# why the live oracle above is NOT a C9 verdict and this arm is. The
-# joiners are mounted back afterwards (the leg leaves the fleet as it
+# every live-fleet row (`fsck_inode_plane_foreign_dentry_scoped`); (3) after
+# EVERY member leaves, the OFFLINE probe judges the set with nothing in
+# flight and must exempt NOTHING as current-era beside findings 0 — the
+# clause with teeth for the joiner-minted class (review round 1, Issue 2:
+# the era floor never named a joined appender's slots until it consulted
+# tree 0). The fleet is mounted back afterwards (the leg leaves it as it
 # found it).
 sym_post_leave_census() { # label rowdir since_epoch idx...
     local label="$1" rowdir="$2" since="$3"
@@ -4759,6 +4762,55 @@ if c9 or c10:
 sys.exit(0 if ok else 1)
 PYEOF
     log "$label: post-leave census clean — the inode plane judged WHOLE at the manager, C9 = C10 = 0 (every joiner left; the F-R3 orphan class would read C9 here)"
+    # The OFFLINE census (review round 1, Issue 2): every member leaves —
+    # readers, then the manager — and the offline probe judges the set with
+    # NOTHING in flight, so an inode it exempts as current-era is an inode
+    # it did not judge: `current_era_exempted` must read 0 beside findings 0
+    # (before PR 13e's era floor consulted tree 0, every JOINER-minted ino
+    # read exempt at every censusing mount — the online census above and
+    # this probe alike — and the fleet arm's C9 clause was vacuous for the
+    # box's 430; the `no inode record` grep and the dangling-name gauge
+    # were its teeth).
+    local i
+    for i in $(member_idxs); do
+        [ "$i" = "0" ] && continue
+        if mountpoint -q "$(mnt_of "$i")"; then
+            "$MWFLEET" unmount "$i" || die "$label: member $i's unmount before the offline census failed"
+            wait_for_unmounted "$(mnt_of "$i")"
+        fi
+    done
+    "$MWFLEET" unmount 0 || die "$label: the manager's unmount before the offline census failed"
+    wait_for_unmounted "$(mnt_of 0)"
+    rc=0
+    out="$(timeout 900 "$SQZ" fsck "sqmeta://$META_PATHS" --offline --json 2>"$rowdir/fsck-$label-offline.err")" || rc=$?
+    echo "$out" >"$rowdir/fsck-$label-offline.json"
+    [ "$rc" != "124" ] || die "$label: the OFFLINE fsck HUNG past 900 s — $rowdir/fsck-$label-offline.err"
+    [ "$rc" = "0" ] || die "$label: the OFFLINE fsck FAILED (rc=$rc) — $rowdir/fsck-$label-offline.err"
+    python3 - "$rowdir/fsck-$label-offline.json" "$label" "$volumes" <<'PYEOF' || die "$label: the OFFLINE census is RED (F-R3 / Issue 2) — $rowdir/fsck-$label-offline.json"
+import json, sys
+path, label, volumes = sys.argv[1], sys.argv[2], int(sys.argv[3])
+r = json.load(open(path))
+c = r["counters"]
+covered = c["inode_plane_volumes_covered"]
+exempt = c["current_era_exempted"]
+by_class = {}
+for f in r["findings"]:
+    by_class[f["class"]] = by_class.get(f["class"], 0) + 1
+print(f"{label} offline census: inode plane covered {covered} of {volumes} volume(s), current_era_exempted {exempt}, findings by class {by_class or '{}'}")
+ok = covered == volumes and exempt == 0 and len(r["findings"]) == 0
+if exempt:
+    print(f"{label}: the offline probe exempted {exempt} inode(s) as current-era — a probe has nothing in flight, so these are inodes the census did NOT judge (a joined appender's mints before the era floor consulted tree 0)", file=sys.stderr)
+for f in r["findings"]:
+    print(f"  [{f['class']}] {f['object']} — {f['evidence']}", file=sys.stderr)
+sys.exit(0 if ok else 1)
+PYEOF
+    log "$label: OFFLINE census clean — every writer left, the probe judged every inode (current_era_exempted 0), C9 = C10 = 0"
+    "$MWFLEET" mount 0 || die "$label: the manager's re-mount failed"
+    for i in $(member_idxs); do
+        [ "$i" = "0" ] && continue
+        case " ${joiners[*]} " in *" $i "*) continue ;; esac
+        "$MWFLEET" mount "$i" || die "$label: member $i's re-mount failed"
+    done
     for j in "${joiners[@]}"; do
         "$MWFLEET" mount "$j" || die "$label: joiner $j's re-mount failed"
     done

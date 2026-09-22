@@ -92,30 +92,37 @@ never a MET or a MISS, so every rate row reads OWED to the box or
 SCOPING; the only MET words are SIM-1's (tier (ii), the design's own
 class). "dev" = scoping venue; "box" = squeeze-test.)_
 
-> **Status (the box-rows rung, `perf/sym-box-rows`, 2026-09-22): every
-> "Rate (box): OWED" cell below STAYS OWED — no box row ran, because the
-> venue is gone: `squeeze-test` was reclaimed by a third party on
-> 2026-09-19 21:20 UTC (booted into the DDN Lustre client kernel with
-> `/s3ds` mounted and the `s3ds` container up; the sqz kernel is installed
-> but no longer the default). The arms are BUILT and staged (A `3228fcb8`,
-> B `7b2ef9e9`'s code — §3.9), the procedure is written, nothing was placed
-> on the box. §3.9 has the evidence, the two venue options for the N-writer
-> gates (the storage nodes' nvmet has no `resv_enable`), and the exact
-> command sequence for the day the venue is back. The flip's product
-> blockers are closed on PR 13b (§7 / §9 status lines); the box brackets
-> are the flip's one remaining precondition (§9).**
+> **Status (the box-rows rung, `perf/sym-box-rows`, 2026-09-22): the box
+> brackets RAN on PR 13b's binary (`7b2ef9e9`'s code) after the owner
+> restored the venue at 01:07 UTC (it had been reclaimed by a third party
+> on 2026-09-19 — §3.9's history). The "Rate (box)" cells below are
+> superseded by §3.9.1 (gate 1) and §3.9.2 (gates 2 / 3 / 3b / 3c / 5 / 7),
+> summarized: gate 1 **MISS on mdstorm mkdir / rename / unlink** (−3.4…
+> −5.8 % vs the pre-program tip, both brackets, both orders; rand-4k within
+> noise with a reproducible −1.8 % / −2.5…−3.8 %; `w_fresh` and mount time
+> within noise); gate 2 **MET** (1.04–1.07× of S0); gate 3 **MISS at N = 8**
+> (4.27× creates / 5.33× ingest vs ≥ 5.6×; N = 2 / 4 MET) + the
+> flush-ceiling tripwire tripped; gate 3b **MET** (3,400–3,581 creates/s
+> into one directory, one flip, `K + C + 3` tokens); gate 3c **MISS
+> (mechanism)** — a LIVE holder recalled by a touch; gate 5 **BLOCKED** and
+> gate 7's N = 32 storm **BLOCKED** — the manager's cluster-wire connection
+> cap derives to 64 under `FLEET_SHARE=32` and the 32-member fleet never
+> comes up; gate 7 at N = 8 MET on both rows with the tripwire tripped.
+> Three product findings (F-B1 flush-ceiling margin, F-B2 the dominance
+> rule's per-slot `ops_h`, F-B3 the listener cap) and the gate-1 regression
+> go to PR 14 (§9's re-read).**
 
 | Gate | Row | Venue | Verdict | Engagement (the law's gauges) |
 |---|---|---|---|---|
-| 1 | solo re-gate (flat A vs flat B: mdstorm, mount, w_fresh, rr4k, rw4k, remount) | box | **OWED to the flip binary** (§8 — the flat path takes ONE behaviour change from PR 13: defect 6's shipped-bug fix (§4.3), pinned red-first flat, plus per-op atomic loads that are behaviour-identical (`KvTree::descend`'s `LeaseGate::is_armed`, `NodeSeqHandle::next`'s ceiling compare); every other change is behind bit 17 + the knob; PR 14's B arm is the default-on binary by definition) | `dlm_rpcs == 0`, `meta_kv_forest_*` 0 on flat, Δtripwires 0 |
-| 2 | `sym-tarx` (N = 2, netem 250 µs, the extracting node NOT the manager) | dev → box | **Mechanism GREEN on every run** (verbs/entry 0.012, handovers 0, `dlm_rpcs` 0, oracle clean — §3.2). **Rate (box): OWED** — laptop read 0.85–1.02× of S0 (the final binaries 0.96–1.00×), SCOPING, venue-attributed pending the box | `wire_verbs_per_entry` < 0.05, `slot_handovers == 0` |
-| 3 | `sym-scale` N = 1/2/4/8 | dev → box | **Mechanism GREEN on every final-binary run** (every N completes, `appenders == N`, tripwires flat, fsck clean, deleted stays deleted through the widened arm — §3.1). **Rate (box): OWED** — the 0.7 × N create law and the ingest law read on the laptop (creates 2.2–6.0× at N ≥ 4 across runs, ingest 1.6–4.8×) are SCOPING, venue-attributed pending the box | `appenders == N`, `manager_load_pct`, handovers/ships/rpcs 0 |
-| 3b | `sym-shared-dir` (+ `-ls`) | dev → box | **Mechanism GREEN on every run since defect 14** (one flip at the holder, `shipped ≡ served`, handovers 0; `-ls` = `K + C + 3` tokens, 0 data-leaf reads — §3.3). **Rate (box): OWED** — the laptop's 3,290 creates/s and 20.9 s `ls -l` are SCOPING, venue-attributed | `dir_stripe_flips == 1`, `dir_stripe_ships ≡ foreign creates`, `slot_handovers == 0`; ls: `dlm_token_grants ≡ K + C` |
-| 3c | `sym-foreign-touch` | dev → box | **Mechanism GREEN on every run since defect 10** (LIVE 192 ships / 0 handovers; IDLE moved after 1–2 bursts; PAUSED keeps its tree — §3.4). **Rate (box): OWED** — the laptop's 5.5–7.8 ms handover wall is SCOPING, venue-attributed | handovers/s, `slot_handover_phase_ns`, a paused live job keeps its tree |
+| 1 | solo re-gate (flat A vs flat B: mdstorm, mount, w_fresh, rr4k, rw4k, remount) | box | **RAN 2026-09-22 (§3.9.1): MISS on mdstorm mkdir/rename/unlink (−3.4…−5.8 %, both brackets), rand-4k within noise with a reproducible residual (rr4k −1.8 %, rw4k −2.5…−3.8 %), w_fresh/mount within noise, `dlm_rpcs` 0 everywhere.** Before it: OWED to the flip binary (§8 — the flat path takes ONE behaviour change from PR 13: defect 6's shipped-bug fix (§4.3), pinned red-first flat, plus per-op atomic loads that are behaviour-identical (`KvTree::descend`'s `LeaseGate::is_armed`, `NodeSeqHandle::next`'s ceiling compare); every other change is behind bit 17 + the knob; PR 14's B arm is the default-on binary by definition) | `dlm_rpcs == 0`, `meta_kv_forest_*` 0 on flat, Δtripwires 0 |
+| 2 | `sym-tarx` (N = 2, netem 250 µs, the extracting node NOT the manager) | dev → box | **Mechanism GREEN on every run** (verbs/entry 0.012, handovers 0, `dlm_rpcs` 0, oracle clean — §3.2). **Rate (box): MET — 1.04–1.07× of S0 (§3.9.2, two positions, both orders each)**; the laptop had read 0.85–1.02× (SCOPING) | `wire_verbs_per_entry` < 0.05 (0.0122 / 0.0000 on the box), `slot_handovers == 0` |
+| 3 | `sym-scale` N = 1/2/4/8 | dev → box | **Mechanism GREEN on every final-binary run** (every N completes, `appenders == N`, tripwires flat, fsck clean, deleted stays deleted through the widened arm — §3.1). **Rate (box): MISS at N = 8 — 4.27× creates / 5.33× ingest vs ≥ 5.6× (N = 2: 1.90× / 2.04×, N = 4: 3.23× / 2.95× MET); `appender_flush_ceiling_overruns` tripped (F-B1) — §3.9.2**; the laptop's 2.2–6.0× band was SCOPING | `appenders == N` ✓, `manager_load_pct` 0–3 %, handovers 0 / ships ≤ 5 / rpcs 0 ✓ |
+| 3b | `sym-shared-dir` (+ `-ls`) | dev → box | **Mechanism GREEN on every run since defect 14** (one flip at the holder, `shipped ≡ served`, handovers 0; `-ls` = `K + C + 3` tokens, 0 data-leaf reads — §3.3). **Rate (box): 3,400–3,581 creates/s (8 × 5,000 into one directory), `ls -l` of 40,000 in 65.3 s — MET on every law, two positions (§3.9.2)**; the design's A arm (authority + co-writers) has no leg | `dir_stripe_flips == 1` ✓, `dir_stripe_ships ≡ foreign creates` ✓ (34,901 / 34,982 shipped ≡ served), `slot_handovers == 0` ✓; ls: `dlm_token_grants` = 40,067 = K + C + 3 ✓ |
+| 3c | `sym-foreign-touch` | dev → box | **Mechanism GREEN on every run since defect 10** (LIVE 192 ships / 0 handovers; IDLE moved after 1–2 bursts; PAUSED keeps its tree — §3.4). **Box: MISS (mechanism) — the LIVE phase's touches RECALLED the live holder once (`slot_handovers` 1, `slot_offers_dominated` 1 of 64 evaluations, handover 13.4 ms; `N_floor` seeded 2 on the box) — F-B2, §3.9.2; the row set stopped, IDLE / PAUSED not run** | handovers/s, `slot_handover_phase_ns` (13.4 ms: flush 9.4 / tree 0 3.8 / page 0.14), a paused live job keeps its tree (not reached) |
 | 4 | `sym-crash` / `sym-storm` (a)–(f) ×10 from zero | dev (LOCAL by the venue law) | **`sym-crash` 10/10 GREEN on nine consecutive from-zero runs (attempts 7–15 — §3.8's attempt → binary list; their deleted arm read EIO as "deleted", §4.4ag); on the fix-round binaries 1/1 GREEN then 0/1 on the WIDENED arm (finding 2). `sym-storm` ×10 NOT REACHED: 7 + 3 GREEN rounds from zero under `--venue=laptop`, stopped by finding 1 (§4.4af — an acked-writes LOSS, open)** | must-stay-0 set (the flush-ceiling gauge venue-attributed on the laptop, Issue 2); `appender_recoveries ≡ regions of the killed nodes`; acked-loss 0 (VIOLATED once — §4.4af); `fsck_findings == 0`; C8/bitmap drift 0; `replay_dropped_torn == 0` |
-| 5 | `sym-readers` (exactness; 1 × 31 broadcast; `free_grace_hold_ms`) | dev → box | **Mechanism GREEN on the 1-reader fleet every run** (exact at the next resolve; `recalls ≡ mutations × holders`, `fanout_p99 ≡ readers`, `timeouts_live` 0 — §3.5). **Rate (box): OWED** — the laptop's recall RTT 110–126 µs (= the free-grace hold under tokens) is SCOPING, venue-attributed; the 1 × 31 broadcast is the box's | `dlm_recall_fanout ≡ readers`, `reader_staleness_bound_ms == 0`, tokens held on `-o ro` |
+| 5 | `sym-readers` (exactness; 1 × 31 broadcast; `free_grace_hold_ms`) | dev → box | **Mechanism GREEN on the 1-reader fleet every run** (exact at the next resolve; `recalls ≡ mutations × holders`, `fanout_p99 ≡ readers`, `timeouts_live` 0 — §3.5). **Box: BLOCKED — the 1 × 31 fleet never came up: the manager's cluster-wire listener cap derives to 64 under `SQUEEZEFS_FLEET_SHARE=32` and refused the 14th member's dials (F-B3, §3.9.2)**; the laptop's recall RTT 110–126 µs stays SCOPING | `dlm_recall_fanout ≡ readers`, `reader_staleness_bound_ms == 0`, tokens held on `-o ro` (not measured at N = 32) |
 | 6 | format cost at N = 8 / 32 (+ the 46-volume width row) | dev (LOCAL) | **RUN — §3.6**: the width row VALID at N = 1/4/16/46 (mount 0.96 s, reopen 1.39 s at 46; the per-slot extent floor 16 MiB/volume = 736 MiB at 46 vols × 20 k files vs flat 47 MB — R9's number; `A_max` inert on a manager, §7 item 8); the appender rows ≈ 4 MiB (N = 8) / 16.5 MiB (N = 32) of region overhead per volume beside the manager's ring | per-slot extent floor, `slot_tree_bytes` p99 vs `A_max`, ring space, page writes |
-| 7 | relocated walls (terminal-free rate per holder under `w_rewrite` N = 8; the manager verb rate under a 32-mount join storm) | dev → box | **Mechanism GREEN on every run** (row (a): `shipped ≡ served ≥ displaced` — 2,723 ≥ 1,792; row (b): `/jobs` ships 7/7). **Rate (box): OWED** — the laptop's ≈ 1,000 frees/s at 18–46 % CPU and 2.2–3.2 s join wall are SCOPING, venue-attributed; the flush-ceiling overrun it read 3× is the ruling's named venue reading (§4.5); the N = 32 join storm is the box's | `block_free_*`, `manager_verbs_per_s`, `manager_load_pct` |
+| 7 | relocated walls (terminal-free rate per holder under `w_rewrite` N = 8; the manager verb rate under a 32-mount join storm) | dev → box | **Mechanism GREEN on every run** (row (a): `shipped ≡ served ≥ displaced` — 2,723 ≥ 1,792; row (b): `/jobs` ships 7/7). **Box (§3.9.2): row (a) 983 frees/s at the holder, `shipped 1,824 ≡ served 1,824 ≥ 1,792 displaced`, device bytes 1.0× user, `manager_load_pct` 1 — MET on its law with the flush-ceiling tripwire tripped (F-B1); row (b) at N = 7: 3.92 s join wall, 55 verbs, 278 ms service, `/jobs` ships 7/7 — MET; the N = 32 storm BLOCKED (F-B3)** | `block_free_*`, `manager_verbs_per_s` (4), `manager_load_pct` (1), `manager_service_ns` (571 ms / 278 ms) |
 | 8 | SIM-1 `SimConfig { clients: 12_500, shards: 64 }` | dev (tier (ii)) | **MET** — §5 | beat p99, eviction fan-out, the free-grace V-fan-in, the death ledger's reach |
 | 8b | fidelity `full` (nvmet; `pr-registrants` ≥ 1,024 + the emulated cap refusal; `sym-join-ladder` N = 3) | dev (LOCAL) | **PASS = 190 / FAIL = 0 from zero on a quiet box (fix round 1, `fix1-post3`) — 1,024 registrants reported by the REGCTL-sized read (65,600 B), the join ladder N = 3, guard ×10, the residue snapshot clean; the rung's own run read PASS 189 / FAIL 1 with the one FAIL the concurrent fleet's zram teardown (§3.7)** | the tier's own verdicts |
 
@@ -871,6 +878,120 @@ The finding is a PRODUCT regression on the flat path: the design's gate
    four arms, 27 min for the four-row reversed bracket — ≈ 3 min per arm
    is the load-1 decay wait after the previous arm's fio echo (PR 1 §1's
    note), not measurement.
+
+#### 3.9.2 Gates 2 / 3 / 3b / 3c / 5 / 7 — the N-writer brackets on the box (02:11 → 02:34 UTC): **gate 2 MET (1.04–1.07× of S0), gate 3b MET on its laws (3,400–3,581 creates/s into ONE directory; `ls -l` 40,000 = K + C + 3 tokens), gate 3 MISS at N = 8 (4.27× creates / 5.33× ingest vs ≥ 5.6×), gate 7 row (a)/(b) MET on their laws at N = 8 — and THREE product findings that stop three row sets: `appender_flush_ceiling_overruns` trips on the box (1–32 ms past the ceiling), a LIVE holder recalled by a touch (3c), and the manager's cluster-wire connection cap (64 under `FLEET_SHARE=32`) that keeps a 32-member fleet from coming up (gates 5 and 7 at N = 32 cannot run on PR 13b)**
+
+**Venue.** The same box and kernel as §3.9.1, the fleet legs on the
+box's OWN tcp devsub (option (a) of §3.9's procedure — the design's gate-3
+venue and the D-5 precedent; the real fabric's storage-node nvmet has no
+`resv_enable` and `require_symmetric` refuses a non-PR guard mode):
+`tests/mw_fleet.sh create N=2 --symmetric --writers=7 --token-readers`
+(a manager, 7 joined writers = N up to 8, one token reader) — nvmet-tcp on
+`127.0.0.1` (`resv_enable=1`), 2 memory-backed null_blk metadata
+namespaces, 2 × 16 GiB zram data namespaces (**`lzo-rle`** — the box's
+sqz kernel offers `lzo-rle`/`lzo` only; the devsub's default `zstd` refused
+loud, the driver names the algorithm now), `SQUEEZEFS_FLEET_SHARE=9` per
+daemon; the legs ran with **`--venue=box`** (every must-stay-0 gauge a
+VERDICT). Driver: `.benchmarks/rigs/2026-09-21-sym-box-brackets.sh` (the
+repo's `tests/` snapshot at `/scratch/tmp/sym-box/repo/`), arm B only
+(`squeezefs-B` = `7b2ef9e9`'s code). Two passes: **pass 1**
+(`brackets-20260922-021250`, one fleet for gates 2 / 3 / 3b / 3c / 7, then
+the 32-member fleet for gate 5) and **pass 2** (`brackets-20260922-022526`,
+gates 2 and 3b with a FRESH fleet per leg, after the harness findings
+below). Wall: 23 min of box time for both passes. The box was left with
+zero fleet residue (no `/run/squeezefs-mwfleet`, no daemon, no netns, no
+policy rule), the fabric unmounted.
+
+| Gate | Row / instrument | Position(s) | Number | Engagement (the law's gauges) | **Verdict (box)** |
+|---|---|---|---|---|---|
+| **2** | `sym-tarx` — `tar -x` of `linux-7.2.3/fs` (2,468 entries) by a JOINED writer in a netns at netem 125 µs/end (250 µs RTT) into a directory it created, vs the manager-local S0; each leg A-B-B-A (sym-1 local-1 local-2 sym-2) | r1: sym 2.14 / 1.90 s, local 1.94 / 1.83 s → **1.07×**; r2: sym 2.19 / 1.85 s, local 1.94 / 1.95 s → **1.04×** | **1.04–1.07× of S0** (≤ 1.10×); ≈ 1,125–1,350 entries/s; the FIRST sym leg pays the join over the shaped wire + its 30 manager verbs, the second is at par with local (1.85–1.90 vs 1.83–1.95 s) | `wire_verbs_per_entry` **0.0122 / 0.0000** (< 0.05; 30 verbs = the join + grant refills, then none), `xv`/`ship`/`pub` 0, `slot_handovers` 0, `dlm_rpcs` 0, oracle clean (fsck 0, C8 0, must-stay-0 flat) on both positions | **MET** |
+| **3** | `sym-scale` — N = 1/2/4/8 RW mounts each creating 40,000 files (4 threads) in its OWN directory (`tests/mdstorm.c create`), then ingesting 1 GiB (`dd bs=4M conv=fsync`) | r1 only (the row set stopped — below): N=1 **5,058 c/s · 1,382 MiB/s**; N=2 **9,599 (1.90×) · 2,816 (2.04×)**; N=4 **16,340 (3.23×) · 4,074 (2.95×)**; N=8 **21,595 (4.27×) · 7,366 (5.33×)** | law ≥ 0.7 × N: N=2 ✓✓ (≥ 1.4), N=4 ✓✓ (≥ 2.8), **N=8 ✗✗ (needs ≥ 5.6×)**; per writer at N = 8: 2,700 c/s vs 5,058 alone (the manager's own storm included) | `appenders == N` per row, `slot_handovers` **0**, `slot_ships` 0 / 1 / 3 / 5 (≤ N — each joiner's `mkdir` under `/`), Σ `dlm_rpcs` **0**, `manager_load_pct` 3 / 1 / 1 / 0 %, the manager's process CPU 1,322–1,625 % (its OWN storm); **`appender_flush_ceiling_overruns` +1 on m60 (joiner) at N = 2 — 1,132 ms vs the 1,100 ms landing ceiling — and +1 on m0 during the leg (1,101 ms)**; the leg RED'd on it BEFORE its deleted-stays-deleted arm and fsck oracle (not run for this row) | **MISS at N = 8 (rate) + the must-stay-0 VERDICT (product finding F-B1)** — the row set stopped at r1 |
+| **3b** | `sym-shared-dir` — 8 creators × 5,000 files into ONE directory held by m60 (the flip to K = 64 stripes on the holder's observed creator count); `-ls`: a COLD token reader's `readdir + stat` of the 40,000 children | r1: **11.17 s, 3,581 creates/s**; `ls -l` **65.32 s**. r2 (fresh fleet): **11.76 s, 3,400 creates/s**; `ls -l` **65.26 s** | 3,400–3,581 creates/s aggregate into one directory (= 425–450 per creator — a cross-owner create costs ≈ 2.2–2.4 ms: one S3.5 intent + one shipped step + the retirement, each a durable barrier; 6× below the own-directory storm's 21,595 at N = 8); `ls -l` 1.63 ms per child (one token grant round trip each) | **`dir_stripe_flips` = 1** at the holder (K = 64, `striped_dirs` 1), `xv_shipped ≡ xv_served` = 34,982 (r1) / both positions, `dir_stripe_ships` 34,901 (the 1/64 own-stripe lands are the difference), `slot_handovers` **0**; `-ls`: **`dlm_token_grants` 40,067 = K + C + 3** (64 + 40,000 + the directory, its parent, the root), `readdir_merges` 83, `node_cache_misses` 32 / 29 (the poll's dropped images over 26 epoch steps + ≤ K tree-0 reads — **0 data-leaf reads**), `token_hits` 21.7 M; oracle clean both positions | **MET on every law** (the design's "vs today's authority + co-writers" A arm has no leg — §3.9's stated gap; the rate stands as the box's number for the flip's ledger) |
+| **3c** | `sym-foreign-touch` — holder m60 (A), requester m61, the manager (C); beat 10 s, bursts of 64 touches, 3 rounds per phase; LIVE / IDLE / PAUSED | r1 LIVE phase only | the LIVE phase's 192 touches SHIPPED (m60 `slot_ships` 0 → 192) but **`slot_handovers` = 1**: the manager's ledger `slot_offers` 1 / `slot_offers_busy` 63 / `slot_recall_notices` 1 / `slot_handovers` 1, m60 `slot_offers_dominated` 1, `slot_handover_phase_ns` total **13.4 ms** (flush 9.4, tree 0 3.8, page 0.14), `slot_leases_held` 64 → 63; **`slot_offer_n_floor` on the box = 2** at the phase start (the laptop's read 5) → 23 after the handover fed the EWMA | the law "a LIVE holder is never recalled by a touch" (§8 gate 3c; `a_live_holder_is_never_recalled`) — 63 of 64 offer evaluations judged the holder BUSY, one judged it DOMINATED on a slot the live storm wrote too little in the window (§7 item 10's premise: `ops_h` counts PER SLOT and the storm's children spill to the rotor at the `A_max` floor, so the touched slot reads idle beside a burst of 64) | **MISS (mechanism) — product finding F-B2**; the row set stopped (IDLE / PAUSED not run) |
+| **5** | `sym-readers` — 1 writer × 31 `-o ro` token readers (`create N=32 --symmetric --writers=1 --token-readers`) | the fleet **never came up**: the create died at member 13 | at the 14th mount (13 token readers up, ≈ 5 wire sessions each to the manager) the manager logged **`cluster wire: refusing 10.181.177.194:36258 — 64 concurrent connections is the cap`** (02:22:28 and :31); the new reader logged `InvalidOperation("cluster wire: expected a Challenge first, got None")` twice and its `.stats` read answered **EINVAL** to the rig's readiness check (`membership_readers` 13 at the manager) | the cap: `cluster_wire::max_connections_from(process_parallelism())` = `(cpus × 16).clamp(64, 1024)` with `cpus` = the FLEET-SHARE-DIVIDED root (KD-MW-14): 32 / 32 = 1 → **64** on a 32-member fleet on 32 cores — the listener's cap SHRINKS as the fleet it serves grows; no knob overrides it | **BLOCKED — product finding F-B3**; the 1 × 31 broadcast, the token-grant / recall-ack p99 at N = 32 and `free_grace_hold_ms` under 31 readers are NOT measured on PR 13b |
+| **7 (a)** | `sym-walls` row (a) — the relocated FREE wall: 7 joiners each pre-write then REWRITE 16 × 64 MiB in place at once; every displaced block ships to the allocation holder (the manager) | r1 only | **983 frees/s** served at the holder; rewrite wall **1.85 s** for 7 GiB (3.8 GB/s aggregate into zram); `manager_verbs` 329, `manager_service_ns` total **571 ms** (exec 570), `manager_load_pct` **1**, `manager_verbs_per_s` 4, the manager's process CPU 20 % | **`free_shipped_blocks` 1,824 ≡ `free_served_blocks` 1,824 ≥ 1,792 displaced** (+32 = the write-through residue), `free_ship_failures` 0, `free_refused_blocks` 0; the holder's bitmap `set_bits` 1,570 (the mints) / `clear_bits` 1,824 (the frees); device write bytes **7.00 GiB ≡ 6.95 GiB user (1.0×)**; `block_grant_topups` 326 across the joiners; **m60 `appender_flush_ceiling_overruns` +1** during the rewrite (1,132 ms) | **MET on its law; the must-stay-0 VERDICT tripped (F-B1)** — the row set stopped at r1 |
+| **7 (b)** | `sym-walls` row (b) — the JOIN STORM: every joiner leaves, all rejoin at once, each `mkdir /jobs/<j>` shipping to `/jobs`'s holder | r1, **N = 7** (the design's N = 32 is F-B3's) | **3.92 s** to the last armed joiner; `manager_verbs` 55, `manager_service_ns` total **278 ms**, the manager's CPU 41 % over the storm; `manager_failover_bound_ms` 45,013 | `/jobs` ships **7 / 7**, `appenders_known` 8 after the storm | **MET at N = 7**; the N = 32 storm cannot run (F-B3) |
+
+**F-B1 — `appender_flush_ceiling_overruns` trips on the acceptance
+venue** (PR 2's KD-SYM-10 landing-ceiling audit; the §4.5 / §4.4aa
+class PR 13 called "venue-attributed pending the box"): the box read it
+**four times in 12 minutes** on the 7-joiner fleet — m60 at 02:14:10
+(N = 2 of `sym-scale`: region 1's oldest dirty leaf 1,132 ms at the
+covering barrier vs the 1,100 ms ceiling), m0 at 02:15:15 (region 0,
+1,101 ms), m60 at 02:19:51 (the `sym-walls` rewrite, 1,132 ms) — with no
+recovery in flight (the extension of defect 33 does not apply), a 47–48 °C
+box at load 2–5. The venue law made the gauge a VERDICT on the box, and
+the verdict is: **the fixed 2-tick margin over `CHECKPOINT_MAX_AGE_MS`
+is too small for a joined appender under a create storm or a rewrite
+burst — by 1–32 ms.** This is PR 14's owed derivation ("derive the margin
+from the measured pass wall", §7 item 3), now with the box's number.
+Consequence for the rows: the gate-3 and gate-7 row sets stopped at r1
+(the legs die on it; `--venue=box` is the brief's word), and every later
+leg on the SAME fleet died at its door until the driver recreated the
+fleet per leg (harness finding H-B2).
+
+**F-B2 — a LIVE holder was recalled by a touch (gate 3c's law).** The
+holder m60 ran the harness's LIVE job (a storm under `job-wA/`) while the
+requester m61 touched 64 foreign names per burst; PR 4's dominance rule
+(`ops_q ≥ 2 × ops_h ∧ ops_q ≥ N_floor` over one `T_idle` window) judged
+the holder BUSY on 63 evaluations and DOMINATED on one — the handover
+followed (13.4 ms). On the laptop the same leg read 192 ships / 0
+handovers with `N_floor` = 5; the box seeded `N_floor` = 2 (the cold-start
+`max(2, ceil(ewma_handover / ewma_ship))` — a faster handover EWMA against
+the ship EWMA). The premise PR 13 §7 item 10 named for the PAUSED phase
+holds for LIVE too: `ops_h` is counted PER SLOT, the storm's children spill
+to the rotor at the `A_max` floor, so the touched directory's slot reads
+nearly idle beside a 64-touch burst. A design-rule finding (the two
+levers §7 item 10 prices), not a harness one — the LIVE job is a real
+storm under the slot's directory.
+
+**F-B3 — the cluster-wire connection cap derives to 64 under
+`SQUEEZEFS_FLEET_SHARE=32` and a 32-member fleet cannot come up.**
+`RpcListenerConfig::max_connections` = `max_connections_from(cpus)` =
+`(cpus × 16).clamp(64, 1024)` with `cpus = process_parallelism()` = the
+raw parallelism ÷ the fleet share (KD-MW-14): on 32 cores with 32
+co-located members the manager's listener admits 64 connections, and 13
+token readers (each ≈ 5 sessions: per volume a token channel + the grant
+session pool, plus membership) fill it — the 14th mount's dials are
+refused at accept, its `.stats` read answers EINVAL to the rig, the create
+dies. The derivation is inverted for a LISTENER: its load is the fleet's
+width, which is exactly what the fleet-share divisor shrinks it by (the
+laptop's 9-member fleets sat at the 64 floor by luck: 32 / 9 × 16 = 48 →
+64). No knob overrides it. **Gate 5's 1 × 31 broadcast and gate 7's N = 32
+join storm are not measurable on PR 13b's binary**; the 31-joiner fleet C
+(`walls32`) was not attempted for the same reason. Also read on the way:
+a token reader's `.stats` read answered EINVAL while its wire dial was
+refused — a `.stats` read must never fail on a transient wire error.
+
+**Harness findings (fixed in the tree, both on the box's first pass):**
+H-B1 — the netns joiner's `JoinAppender` dial to the manager's advertised
+`10.181.177.194:35247` timed out (`sym-tarx` r1 of pass 1): the box has
+SOURCE-BASED policy routing (`from 10.181.177.194 lookup 301`, a table
+holding the fabric routes only), so the manager's SYN-ACK to the veth
+subnet left by the fabric gateway; `mw_fleet.sh netns_setup` now adds
+`from <src> to <veth subnet> lookup main` per such source and removes it at
+teardown (`4b1e1b55`). H-B2 — the legs judge the must-stay-0 set on
+ABSOLUTE gauges at their door, so F-B1's +1 on the fleet killed
+`sym-shared-dir` r1 (and would have killed every later leg) at entry; the
+driver's `FRESH_FLEET_PER_LEG=1` recreates the fleet before every leg
+(≈ 35 s on the box — `06c9ea58`); pass 2 ran gates 2 and 3b that way. H-B3
+— the devsub's default zram algorithm `zstd` is absent on the box's sqz
+kernel (`lzo-rle` / `lzo`); the driver names `SQZ_DEVSUB_OSS_ALGO`.
+
+**Write-amplification faces of the N-writer rows** (the daemons' ledgers
+÷ user bytes; the fleet's zram namespaces carry no `/proc/diskstats`
+column in the legs): gate 7 (a) `rewrite_device_write_bytes` Σ 7.00 GiB
+over 6.95 GiB user (**1.0×**), no reclaim commands at the joiners (the
+frees ship to the holder), `write_through_bytes` 0.14 GiB; gate 3's ingest
+(`dd bs=4M conv=fsync` of 1 GiB per writer): `overlay_store_bytes`
+0.81–0.92× user (the B4 ack-early DMA) + `durable_upload_bytes_escalation`
+0.15–0.28× (the fsync escalation) ≈ **1.1–1.2× device writes**, and
+`flush_seed_read_bytes` = `read_fill_dma_bytes` **0.15–0.28× user of
+device READS** (the escalation's seed of partially covered 4 MiB blocks —
+`write_path_seed_read_bytes` stayed 0), 0 reclaim commands, 0 discards,
+`block_grants` 8 / 11 / 27 / 44 = `block_grant_topups` (the joiners' pull);
+gate 3b's creates and gate 2's `tar -x` are metadata rows (no data bytes
+of note).
 
 ## 4. Issues found (each with its PR and its red pin)
 
@@ -2771,11 +2892,44 @@ their shims sit on the LAPTOP at `/tmp/grok-justin/box-rows/arms/`
 (`squeezefs-A` `9931007…`, `squeezefs-B` `ea41d9e…`, `SHA256SUMS.local`);
 the box copy `/scratch/tmp/sym-box/` does not exist yet.
 
+**After the owner restored the venue (01:07 UTC) the rung placed, all
+under `/scratch/tmp/` (root-owned unless noted; the artifacts are the
+evidence and stay):**
+
+| path | what |
+|---|---|
+| `squeeze-test:/scratch/tmp/sym-box/{squeezefs-A,squeezefs-B,libsqueezefs_il-A.so,libsqueezefs_il-B.so,SHA256SUMS.local}` | the two arms + shims + checksums (`sha256sum -c` OK on the box; `--version` verified) |
+| `squeeze-test:/scratch/tmp/squeezefs` | **REPLACED** by arm B (`088e8c4a` = `7b2ef9e9`'s code, 857,023,904 B) — the reset script's client binary (`SQZ=`); PR 1 had left `a9827378` there |
+| `squeeze-test:/scratch/tmp/sym-box/repo/{tests,.benchmarks/rigs}/` | the worktree's `tests/` tree (88 rigs beside it) — the fleet rig + matrix the driver runs; `tests/mw_fleet.sh` carries the H-B1 policy-routing fix (replaced by `mv` mid-pass, the running processes on the old inode) |
+| `squeeze-test:/scratch/tmp/sym-box/linux/linux-7.2.3/fs` | the `tar -x` corpus (2,468 entries, 51 MB) — gate 2's instrument; the box has no internet |
+| `squeeze-test:/scratch/tmp/rigs/{2026-09-13-sym-pr1-solo-regate.sh,2026-09-13-sym-pr1-solo-regate-reduce.py,2026-09-21-sym-box-brackets.sh}` | PR 1's pair re-placed (diff-identical to the tree's) + the N-writer driver (its final revision) |
+| `squeeze-test:/scratch/tmp/sym-box/reset-verify.log` | the one hand-run fabric reset (rc 0, 15 namespaces, format complete) |
+| `squeeze-test:/scratch/tmp/sym-box/rows-gate1-20260922-011258/` (+ `.log`, `REDUCED.md`) | **gate 1 bracket 1** (A B B A): per row `.stats0/1`, `.fio.json/.txt`, `_bw.*.log`, `.procstat*`, `.thermal*`, `.dmesg`; per arm `reset-*.log`, `features-*.txt`, `*.mount.*`/`*.remount.*`/`*.umount.*` (timed legs + daemon logs + `.stats`), `*-mdstorm.*`, `prep-*.fio.json` |
+| `squeeze-test:/scratch/tmp/sym-box/rows-gate1-20260922-011258-rev/` (+ `.log`, `REDUCED.md`) | **gate 1 bracket 2** (B A A B, the DELTA rows + `rr4k`) |
+| `squeeze-test:/scratch/tmp/sym-box/brackets-20260922-021250/` (+ `.log`; `.log.zstd-refused` = the first launch's devsub refusal) | **N-writer pass 1**: `SUMMARY.txt`, `box.log`, `fleet-A.{create,teardown}.log`, `fleet-B.create.log` (the 32-member create that died at member 13), `fleet-B-partial-logs/{m0,m12,m13}.log + m0.stats.json`, per leg `<gate>-r1.log` + `<gate>-r1/` (the leg's `$STATE/rows`: tables, verdicts, `m*_p*.json` snapshots) + `.thermal*`/`.loadavg`/`.dmesg` |
+| `squeeze-test:/scratch/tmp/sym-box/brackets-20260922-022526/` (+ `.log`) | **N-writer pass 2** (gates 2 and 3b, two positions each, a fresh fleet per leg): `SUMMARY.txt`, `box.log`, `fleet-A-{1..4}.{create,teardown}.log`, `tarx-r{1,2}`, `shared-dir-r{1,2}` |
+| `squeeze-test:/scratch/tmp/sym-box/{GATE1_OUT,GATE1_REV_OUT,BRACKETS_OUT,BRACKETS2_OUT}` | four one-line pointer files |
+| `squeeze-test:/scratch/tmp/logs/` | the reset script's `mkdir -p` (empty) |
+| `squeeze-test:/dev/shm/sqz_mdstorm/`, `/run/squeezefs-mwfleet`, `/run/squeezefs-devsub-tcp-mwfleet`, the fleet's netns / veth / `pref 40` policy rules, `/mnt/sqz-mwfleet/` mounts | **all removed** — the mdstorm substrate per leg, every fleet torn down to zero residue (asserted by `mw_fleet.sh teardown`), verified at the end: no daemon, no netns, no rule, `/scratch/tmp/test` unmounted |
+| the 5 storage nodes | **nothing placed**; the reset rebuilt their null_blk backings and nvmet shares per gate-1 arm (8 resets), leaving the fabric in the converged shape it found; the client's fabric controllers stay connected (the standing shape PR 1 left too) |
+
+Laptop-side: `/tmp/grok-justin/box-rows/{arms,gate1,gate1-rev,nw}` (the
+pulled artifacts), `/tmp/grok-justin/box-rows/smoke1` (the driver's
+plumbing smoke), the arm-B build log; `/tmp/pr13-armA` (PR 13's arm-A
+worktree, reused, left as found).
+
 ## 9. The flip decision (for PR 14)
 
 > **Status (PR 13b, 2026-09-21): the three PRODUCT blockers below are closed on `feat/sym-metanode-ship` (`cd85f701` defect 32, `cc642b6a` §4.4af, `53ffb626`+`31519ceb` §4.4ag); the box brackets remain the orchestrator's; the storm ×10 count is NOT MET on that branch (see §7's status line — two owed items, no acked loss in 19 seven-victim rounds). The decision text below is as recorded at PR 13.**
 >
-> **Status (the box-rows rung, 2026-09-22 — the re-read the brief asked for): with PR 13b landed (`dev` @ `7b2ef9e9`, the batch gate GREEN), blockers (0) §4.4af, (1) defect 32 and (1b) §4.4ag read CLOSED; blocker (2) — the box brackets — reads OPEN and UNCHANGED: no box row ran (§3.9, the venue reclaimed). The exact list of design gates whose RATE half does not read MET is therefore still gates 1 / 2 / 3 / 3b / 3c / 5 / 7 (gate 4 is LOCAL by the venue law and its `sym-storm` ×10 count is not reached — §7's status line; gates 6 / 8 / 8b are not the box's). The arms are staged and the procedure is §3.9's; the decision is one venue away, not one rung.**
+> **Status (the box-rows rung, 2026-09-22 — the re-read the brief asked for, with the box's numbers in hand):** with PR 13b landed (`dev` @ `7b2ef9e9`, the batch gate GREEN), blockers (0) §4.4af, (1) defect 32 and (1b) §4.4ag read CLOSED; blocker (2) — the box brackets — RAN (§3.9.1 / §3.9.2) and the decision stays **NOT YET**, for the box's own reasons. **The exact list of design gates that do NOT read MET on the box:**
+> * **gate 1** — MISS: PR 13b's FLAT path is 3.4–5.8 % slower than the pre-program tip on mdstorm `mkdir` / `rename` / `unlink` (both brackets, both orders), with a reproducible rand-4k residual (rr4k −1.8 %, rw4k −2.5…−3.8 %) at the floor; a flat-path regression the flip would ship to every solo mount (+100k DLM guards per storm — the PR-4 rename lock-set fix's shape — and +3–5 µs/op on the handler lanes; the `mkdir`/`unlink` sites need a `perf` A/B);
+> * **gate 3** — MISS at N = 8 (4.27× creates / 5.33× ingest vs ≥ 5.6×) on a one-box fleet whose manager runs its own storm (the design's "measured-simulated" caveat, now with the box's number); N = 2 / 4 MET;
+> * **gate 3c** — MISS (mechanism): a LIVE holder recalled once by a 64-touch burst (F-B2: the dominance rule's per-slot `ops_h` against a storm whose children spill to the rotor — §7 item 10's premise, now on LIVE);
+> * **gate 5** and **gate 7 at N = 32** — BLOCKED (F-B3): the manager's cluster-wire connection cap derives to 64 under `FLEET_SHARE=32`; a 32-member fleet never comes up on PR 13b's binary — the design's own N = 32 rows are unmeasurable until the listener's cap derives from the width it serves;
+> * **the must-stay-0 tripwire `appender_flush_ceiling_overruns`** trips on the acceptance venue (F-B1: four times in 12 minutes, 1–32 ms past the 1,100 ms ceiling, no recovery in flight) — PR 14's margin derivation is no longer a laptop reading.
+>
+> **Reading MET on the box:** gate 2 (1.04–1.07× of S0), gate 3b (one flip, `shipped ≡ served`, `K + C + 3` tokens, 3,400–3,581 creates/s into one directory), gate 7 at N = 8 (983 frees/s, `shipped ≡ served ≥ displaced`; the 8-mount join storm 3.92 s) — each with the tripwire caveat above where it applies. **What PR 14 flips on, restated:** the gate-1 regression attributed and closed (or adjudicated as the shipped-bug fixes' price with the owner's word), F-B3's cap re-derived (then the N = 32 rows run), F-B1's margin derived, F-B2's rule adjudicated, and the storm ×10 count from zero on that binary — then the flip. The decision text below is as recorded at PR 13.
 
 **Decision: NOT YET — four blockers, three of them product (§7's
 flip-blocking items (i)–(iii) + the box).** (0) **Fix-round

@@ -3760,6 +3760,13 @@ impl KvMetaBackend {
         wants: crate::meta_ship::token_plane::TokenWants,
     ) -> std::result::Result<Option<Option<crate::meta_ship::token_plane::TokenServe>>, KvError>
     {
+        // The flat volume's answer in two `Option` probes (PR 13c, gate 1):
+        // no token reader, no appender region — nothing below can divert,
+        // and the two nested async resolves it would run are the handler
+        // lanes' cost on every read verb of the flat mdstorm.
+        if self.tokens_reader.get().is_none() && self.appenders.is_none() {
+            return Ok(None);
+        }
         let joined = self
             .appenders
             .as_ref()

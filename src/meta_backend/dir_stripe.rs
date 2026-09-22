@@ -597,6 +597,14 @@ impl RoutedMetaBackend {
             .is_some_and(|v| v.striping_plane_armed())
     }
 
+    /// Whether ANY volume of the set reads stripe maps — one `Option`
+    /// probe per volume, no routing: the unarmed set's answer to every
+    /// stripe question before a route table load (PR 13c).
+    #[inline]
+    fn stripes_armed_any(&self) -> bool {
+        self.volumes.iter().any(|v| v.striping_plane_armed())
+    }
+
     /// `stripes_armed` for GLOBAL `ino`'s volume — the FUSE
     /// boundary's gate on the `user.squeezefs.stripes` command (an
     /// unarmed mount treats the name as the reserved one it is).
@@ -686,6 +694,13 @@ impl RoutedMetaBackend {
     /// the next access). The holder keeps a negative cache too, invalidated
     /// by its own flip — the one act that stripes a directory it holds.
     pub async fn stripe_map(&self, dir: Ino) -> Result<Option<Arc<StripeMap>>> {
+        // The flat / unarmed set's fast path (PR 13c, gate 1): the
+        // per-volume probes come BEFORE the route table's arc-swap load —
+        // the box's `perf` read the added `RouteTable` loads on the
+        // handler lanes of the flat mdstorm.
+        if !self.stripes_armed_any() {
+            return Ok(None);
+        }
         let (v, local) = self.route_ino(dir);
         if !self.stripes_armed(v) {
             return Ok(None);
@@ -874,6 +889,9 @@ impl RoutedMetaBackend {
         parent: Ino,
         name: &str,
     ) -> Result<(Ino, Option<Arc<StripeMap>>)> {
+        if !self.stripes_armed_any() {
+            return Ok((parent, None));
+        }
         let (v, _) = self.route_ino(parent);
         if !self.stripes_armed(v) {
             return Ok((parent, None));

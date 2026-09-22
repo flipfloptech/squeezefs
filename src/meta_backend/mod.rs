@@ -2473,7 +2473,9 @@ impl RoutedMetaBackend {
                 }
             }
         } else if let Some((victim, _)) = dest {
-            self.dir_parents.invalidate(&victim);
+            if self.dir_parents_armed() {
+                self.dir_parents.invalidate(&victim);
+            }
         }
     }
 
@@ -2535,10 +2537,32 @@ impl RoutedMetaBackend {
     }
 
     /// Note a directory's one name in the parent memo (a mint, a
-    /// directory rename, a confirmed ancestor hop). A hint only.
+    /// directory rename, a confirmed ancestor hop). A hint only — and an
+    /// ARMED set's: every reader of the memo (the set-wide rename lock's
+    /// ancestor walk, the stripe check, the subtree liveness resolver) runs
+    /// behind the symmetric plane, so a flat / unarmed mount feeds nothing
+    /// (PR 13c, gate 1: the moka insert + the name's `Arc<str>` allocation
+    /// per `mkdir` on the flat mdstorm — the box's `perf` read moka's
+    /// pending-task runs and jemalloc growth on the handler lanes).
     pub(crate) fn note_dir_parent(&self, dir: Ino, parent: Ino, name: &str) {
+        if !self.dir_parents_armed() {
+            return;
+        }
         self.dir_parents
             .insert(dir, (parent, std::sync::Arc::from(name)));
+    }
+
+    /// Whether the directory-parent memo has a reader on this set: any
+    /// volume with the symmetric plane armed or reading under tokens.
+    #[inline]
+    fn dir_parents_armed(&self) -> bool {
+        self.volumes.iter().any(|v| v.striping_plane_armed())
+    }
+
+    /// Test seam (PR 13c's flat-path pin): the memo's live entry count.
+    pub fn test_dir_parents_len(&self) -> u64 {
+        self.dir_parents.run_pending_tasks();
+        self.dir_parents.entry_count()
     }
 
     /// The EXACT `(parent, name)` read WITHOUT a 4a guard: the local arm

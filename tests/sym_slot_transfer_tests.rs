@@ -1923,6 +1923,48 @@ async fn a_holder_live_below_a_directory_is_never_recalled_by_a_burst_into_it() 
     shutdown(&routed).await;
 }
 
+/// PR 13c (the gate-1 flat-path regression, `.benchmarks/2026-09-19-sym-
+/// acceptance.md` §3.9.1c): the directory-parent memo is an ARMED set's
+/// hint — its every reader (the set-wide rename lock's ancestor walk, the
+/// stripe check, the subtree liveness resolver) runs behind the plane —
+/// so an UNARMED mount feeds it nothing (no moka insert, no `Arc<str>` per
+/// `mkdir`), while an armed one feeds every directory mint. RED before: the
+/// unarmed mount held one entry per mkdir.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unarmed_mount_feeds_the_directory_parent_memo_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_under(&uris, &Knobs::unarmed()).await;
+    assert!(!routed.volumes[0].slot_lease_armed());
+    for i in 0..200u32 {
+        routed
+            .create(ROOT_INO, &format!("d{i}"), libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        routed.test_dir_parents_len(),
+        0,
+        "an unarmed mount's mkdirs feed the memo nothing"
+    );
+    shutdown(&routed).await;
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    assert!(routed.volumes[0].slot_lease_armed());
+    for i in 0..200u32 {
+        routed
+            .create(ROOT_INO, &format!("e{i}"), libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .unwrap();
+    }
+    assert!(
+        routed.test_dir_parents_len() >= 200,
+        "an armed mount feeds every directory mint (got {})",
+        routed.test_dir_parents_len()
+    );
+    shutdown(&routed).await;
+}
+
 /// Two nodes alternating on one directory converge on ONE holder: the
 /// requester-side cooldown (the S10 valve over `T_idle`) serves the
 /// alternating touches after the first handover instead of re-offering.

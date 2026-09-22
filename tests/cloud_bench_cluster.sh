@@ -223,7 +223,10 @@ MW_MOUNT_EXTRA="--allow-other"             # NO --interception on MW mounts
 # (/etc/nvme/hostnqn + hostid) is the registrant — assemble-sym asserts the
 # identities DISTINCT across the client nodes and regenerates a duplicate (a
 # baked AMI clones the file onto every node). No SQUEEZEFS_FLEET_SHARE (one
-# daemon per node owns its machine — the point of the venue).
+# daemon per node owns its machine — the point of the venue). The set is
+# formatted CACHE-LESS (no --disk-cache-paths — tests/mw_fleet.sh's shape
+# for the box and local fleets): every beyond-inline file is a whole
+# striped block at its publish, so gate 2 prices the DMA the box priced.
 SYMMETRIC="${SYMMETRIC:-0}"
 SYM_PORT="${SYM_PORT:-45999}"              # every writer's listener: <node private ip>:SYM_PORT
                                            # — an EXPLICIT bind (advertised verbatim); a
@@ -1184,9 +1187,19 @@ DATA_URI="sqdata://$data_devs"
 if [ "${MW_SKIP_FORMAT:-0}" != 1 ]; then
   # FORMAT_EXTRA_STR: extra `format` flags, comma-separated (the symmetric
   # shape's `--symmetric`); empty = the shipped format verbatim.
+  # FORMAT_CACHE=0: a CACHE-LESS set (no --disk-cache-paths — every
+  # beyond-inline file a whole striped block, visible to every node at its
+  # publish; the shape tests/mw_fleet.sh formats the box and local fleets
+  # with, so the symmetric rows price the same DMA the box priced). The
+  # default keeps every other preset's staged format verbatim.
   read -ra FEXTRA <<<"$(printf '%s' "${FORMAT_EXTRA_STR:-}" | tr ',' ' ')"
-  echo "format: $META_URI $DATA_URI ${FEXTRA[*]:-}"
-  "$SQZ" format "$META_URI" "$DATA_URI" --disk-cache-paths "$CACHE" "${FEXTRA[@]}"
+  if [ "${FORMAT_CACHE:-1}" = 0 ]; then
+    echo "format (CACHE-LESS): $META_URI $DATA_URI ${FEXTRA[*]:-}"
+    "$SQZ" format "$META_URI" "$DATA_URI" "${FEXTRA[@]}"
+  else
+    echo "format: $META_URI $DATA_URI --disk-cache-paths $CACHE ${FEXTRA[*]:-}"
+    "$SQZ" format "$META_URI" "$DATA_URI" --disk-cache-paths "$CACHE" "${FEXTRA[@]}"
+  fi
 else
   # a JOINING node: the set is formatted by the manager's node — connect
   # only, and record the SAME meta URI (the devices resolve in csv order,
@@ -1991,12 +2004,12 @@ EOS
   share_storage_nodes
   assert_storage_pr
 
-  log "assemble-sym 5/8: ${clients[0]} — single-path connect, PR verify, format --symmetric (the manager's node formats; nobody mounts yet)"
+  log "assemble-sym 5/8: ${clients[0]} — single-path connect, PR verify, format --symmetric CACHE-LESS (no --disk-cache-paths: the box/local fleets' shape; the manager's node formats, nobody mounts yet)"
   remote "$(node_pub "${clients[0]}")" \
     SQZ="$REMOTE_DIR/squeezefs" MNT="$MOUNTPOINT" CACHE="$CACHE_DIR" \
     META_SPECS="$SHARED_META_SPECS" DATA_SPECS="$SHARED_DATA_SPECS" \
     MOUNT_EXTRA_STR="$(printf '%s' "$MW_MOUNT_EXTRA" | tr ' ' ',')" \
-    FORMAT_EXTRA_STR="--symmetric" MW_PR_VERIFY=1 MW_SKIP_MOUNT=1 \
+    FORMAT_EXTRA_STR="--symmetric" FORMAT_CACHE=0 MW_PR_VERIFY=1 MW_SKIP_MOUNT=1 \
     <<<"$CLIENT_FABRIC_SCRIPT"
 
   log "assemble-sym 6/8: ${clients[*]:1} — single-path connect + PR verify (no format: a joining node)"
@@ -2148,7 +2161,7 @@ EOS
   local -a drv=("$driver"
     "--rows=$SYM_ROWS" "--rt=$SYM_RT" "--files=$SYM_FILES" "--threads=$SYM_THREADS" "--ingest-mb=$SYM_INGEST_MB"
     "--scale-ns=$ns" "--sqz=$REMOTE_DIR/squeezefs" "--rowdir=$BENCH_DIR/sym-rows" "--venue=cloud"
-    "--substrate=$substrate" "--cluster=$CID" "--ssh-key=$SSH_KEY_FILE" "--ssh-user=$REMOTE_USER"
+    "--substrate=$substrate" "--cluster=$CID" "--format=--symmetric cache-less (no --disk-cache-paths)" "--ssh-key=$SSH_KEY_FILE" "--ssh-user=$REMOTE_USER"
     "--mount-hook=$SCRIPT_PATH sym-hook --preset $PRESET --symmetric --cluster-id $CID"
     "--manager-priv=$(node_priv "${clients[0]}")" "--remote-dir=$REMOTE_DIR/sym-rows")
   [ -n "$corpus_arg" ] && drv+=("$corpus_arg")
@@ -2162,7 +2175,7 @@ EOS
     echo "cluster=$CID preset=$PRESET symmetric=1 instance_type=$INSTANCE_TYPE az=$AWS_AZ region=$AWS_REGION market=$MARKET placement=$PLACEMENT_STRATEGY"
     echo "rows=$SYM_ROWS (gate 2 sym-tarx | gate 3 sym-scale N in {$ns} | gate 3b sym-shared-dir + -ls) — tests/cloud_sym_rows.sh over ssh, laws = tests/sym_rows_lib.sh (the matrix's)"
     echo "fleet: manager ${clients[0]}:$MOUNTPOINT + $((${#clients[@]} - 1)) joined writer node(s) ${clients[*]:1}$([ "$SYM_TOKEN_READER" = "1" ] && echo " + token reader ${clients[0]}:$SYM_READER_MNT"); ONE symmetric writer per node; storage=$SYM_STORAGE_DEVS"
-    echo "rt=$SYM_RT files=$SYM_FILES threads=$SYM_THREADS ingest_mb=$SYM_INGEST_MB corpus=${SYM_TARBALL:-$SYM_TAR_SRC}"
+    echo "format=--symmetric CACHE-LESS (no --disk-cache-paths; the box/local fleets' shape) rt=$SYM_RT files=$SYM_FILES threads=$SYM_THREADS ingest_mb=$SYM_INGEST_MB corpus=${SYM_TARBALL:-$SYM_TAR_SRC}"
     echo "instrument=tar -xf (the shipped corpus), tests/mdstorm.c, dd bs=4M conv=fsync, python3 O_CREAT|O_EXCL creators, ls -l (the matrix's sym legs' instruments)"
     echo "substrate=$substrate — cloud substrate, a THIRD class: never spliced into devsub loop/tcp or squeeze-test medians (docs/rc-manifest.md tiers)"
     echo "repo_commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)"

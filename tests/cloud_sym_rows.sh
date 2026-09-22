@@ -51,7 +51,9 @@
 #   --rowdir=DIR                results (snapshots, tables, verdicts, fsck)
 #   --venue=cloud|laptop        the VENUE word (default cloud; laptop = the
 #                               ruling's one venue-attributed gauge)
-#   --substrate=LABEL --cluster=ID --instrument=TEXT   the row label words
+#   --substrate=LABEL --cluster=ID --instrument=TEXT --format=TEXT
+#                               the row label words (--format = the set's
+#                               format posture: cache-less vs staged)
 #   --ssh-key=FILE --ssh-user=U --ssh-opt=OPT (repeatable)
 #   --mount-hook=CMD            `CMD mount|unmount <host> <mnt>` — how a
 #                               writer node's mount is LEFT and REJOINED
@@ -146,6 +148,7 @@ SYM_VENUE="${SQZ_CLOUDSYM_VENUE:-cloud}"
 SUBSTRATE="${SQZ_CLOUDSYM_SUBSTRATE:-}"
 CLUSTER="${SQZ_CLOUDSYM_CLUSTER:-}"
 INSTRUMENT="${SQZ_CLOUDSYM_INSTRUMENT:-}"
+FORMAT_LABEL="${SQZ_CLOUDSYM_FORMAT:-}"
 SSH_KEY="${SQZ_CLOUDSYM_SSH_KEY:-}"
 SSH_USER="${SQZ_CLOUDSYM_SSH_USER:-}"
 SSH_EXTRA=()
@@ -173,6 +176,7 @@ for a in "$@"; do
     --substrate=*) SUBSTRATE="${a#--substrate=}" ;;
     --cluster=*) CLUSTER="${a#--cluster=}" ;;
     --instrument=*) INSTRUMENT="${a#--instrument=}" ;;
+    --format=*) FORMAT_LABEL="${a#--format=}" ;;
     --ssh-key=*) SSH_KEY="${a#--ssh-key=}" ;;
     --ssh-user=*) SSH_USER="${a#--ssh-user=}" ;;
     --ssh-opt=*) SSH_EXTRA+=("${a#--ssh-opt=}") ;;
@@ -439,6 +443,7 @@ row_stamp() { # row cmd — the caller bumps BENCH_ORDER (a stamp inside a
     echo "# order=$BENCH_ORDER"
     echo "# instrument=${INSTRUMENT:-the matrix's sym legs' instruments (tar -xf the shipped corpus; tests/mdstorm.c T=$THREADS; dd bs=4M conv=fsync; python3 O_CREAT|O_EXCL creators; ls -l)}"
     echo "# substrate=${SUBSTRATE:-unlabelled (pass --substrate)}"
+    echo "# format=${FORMAT_LABEL:-unstated (pass --format: cache-less vs staged — the shape gate 2 prices)}"
     echo "# venue=$SYM_VENUE${CLUSTER:+ cluster=$CLUSTER} — one symmetric writer per node; the cloud row is a THIRD substrate class, never spliced into devsub or squeeze-test medians"
     echo "# rt=$RT s (the sustained window per measured phase)"
     echo "# rtt=$RTT_TEXT (writer m${WRITERS[0]} → the manager)"
@@ -1158,7 +1163,7 @@ preflight
 tools_preflight
 $DRY_RUN || : >"$ROWS_FILE"
 {
-    echo "cluster=${CLUSTER:-} venue=$SYM_VENUE substrate=${SUBSTRATE:-}"
+    echo "cluster=${CLUSTER:-} venue=$SYM_VENUE substrate=${SUBSTRATE:-} format=${FORMAT_LABEL:-}"
     echo "rows=$ROWS rt=$RT files=$FILES threads=$THREADS ingest_mb=$INGEST_MB scale_ns=$SCALE_NS"
     echo "manager m0=${HOST[0]}:${MNT[0]}"
     for idx in "${WRITERS[@]}"; do echo "writer m$idx=${HOST[$idx]}:${MNT[$idx]}"; done

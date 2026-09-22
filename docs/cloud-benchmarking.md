@@ -196,8 +196,13 @@ tests/cloud_bench_cluster.sh teardown
 **`assemble-sym`** runs `assemble-mw`'s fabric steps (the FUSE-over-io_uring
 floor on **every** client node, the prologue on every client node, the
 storage shares + the nvmet PR assert) and diverges at two points: the
-manager's node formats with **`format --symmetric`** (the other client nodes
-connect only — the meta URI is the set's on every node); and the mount is
+manager's node formats with **`format --symmetric`, CACHE-LESS** (no
+`--disk-cache-paths` — the shape `tests/mw_fleet.sh` formats the box and
+local fleets with, so every beyond-inline file is a whole striped block at
+its publish, visible to every node, and gate 2 prices the same whole-block
+DMA the box priced; the mw preset's staged format is the co-located
+`s11-mpiio` fleet's, not this one's; the other client nodes connect only —
+the meta URI is the set's on every node); and the mount is
 **one symmetric writer per client node** through the join ladder
 (`SQUEEZEFS_SYMMETRIC_META=1`, no posture knob — `SQUEEZEFS_MULTI_WRITER` /
 `MW_ROLE` / `MW_AUTHORITY` / `MW_MEMBERS` are retired spellings under the
@@ -244,7 +249,7 @@ change a threshold there and both venues move together). The row set:
 
 | row | shape on the fleet | law (the lib's) |
 |---|---|---|
-| gate 2 `sym-tarx` | `tar -x` of the shipped corpus (`SYM_TAR_SRC=<linux>/fs` — the box used `linux-7.2.3/fs`, 2,468 entries; ship the same tarball to keep rows comparable) by **client1's joined writer** into a directory it created, vs **S0 = the manager's own extract on client0** (the same binary, a single-node mount on the same node class over the same fabric, in the same session); A-B-B-A `sym-1 local-1 local-2 sym-2`; ONE extraction per arm — the box's exact shape (gate 2 is a wall ratio, not a rate; on a cache-less set every beyond-inline file is a whole 4 MiB block, so one `fs/` extraction is ≈ 7 GiB of data blocks — `--tarx-reps=0` fills `--rt` with fresh-subdir extractions where the volume holds them); the measured node-to-node RTT stated in the row (replaces the box's netem 250 µs) | ≤ 1.10× S0; `wire_verbs_per_entry` < 0.05; `slot_handovers == 0`; `dlm_rpcs == 0` |
+| gate 2 `sym-tarx` | `tar -x` of the shipped corpus (`SYM_TAR_SRC=<linux>/fs` — the box used `linux-7.2.3/fs`, 2,468 entries; ship the same tarball to keep rows comparable) by **client1's joined writer** into a directory it created, vs **S0 = the manager's own extract on client0** (the same binary, a single-node mount on the same node class over the same fabric, in the same session); A-B-B-A `sym-1 local-1 local-2 sym-2`; ONE extraction per arm — the box's exact shape (gate 2 is a wall ratio, not a rate; the set is cache-less, so every beyond-inline file is a whole 4 MiB block and one `fs/` extraction is ≈ 7 GiB of data blocks — `--tarx-reps=0` fills `--rt` with fresh-subdir extractions where the 1,875 GB data namespaces hold them); the row label states the format posture; the measured node-to-node RTT stated in the row (replaces the box's netem 250 µs) | ≤ 1.10× S0; `wire_verbs_per_entry` < 0.05; `slot_handovers == 0`; `dlm_rpcs == 0` |
 | gate 3 `sym-scale` | N ∈ {1,2,4,8} ∩ [1, N_CLIENT] writer **nodes** (the manager + N−1 joiners) each create `SYM_FILES` files (`SYM_THREADS` threads) in its own directory, then ingest `SYM_INGEST_MB` (4 MiB blocks, `conv=fsync`); the idle writers **leave** (`sym-hook`) so exactly N appenders are live; `C/CPU-S` beside the wall multiple; the ingest row's amplification columns from `/proc/diskstats` on the storage nodes' data namespaces (`device ÷ user bytes`, `wareq-sz`) | ≥ 0.7 × N × the N=1 rate on both rows; `appenders_known == N`; handovers 0; `slot_ships ≤ N`; `dlm_rpcs` 0; the must-stay-0 deltas 0; deleted stays deleted through the manager after every writer's clean leave and through a remounted writer |
 | gate 3b `sym-shared-dir` (+ `-ls`) | every writer node creates `SYM_FILES / N` files into **one** directory the first joiner made; then the token reader's cold `ls -l` of it | `dir_stripe_flips == 1` at the holder; `dir_striped_dirs ≥ 1`; `dir_stripe_ships > 0`; `xv shipped ≡ served`; `slot_handovers == 0`; `-ls`: `dlm_token_grants ∈ [K + C, K + C + 4]`, 0 data-leaf reads (net of the poll's re-reads + one tree-0 read per stripe slot), `dir_stripe_readdir_merges ≥ 1` |
 

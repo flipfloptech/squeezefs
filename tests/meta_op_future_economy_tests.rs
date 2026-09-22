@@ -27,9 +27,11 @@
 //!
 //! Every number here is the TEST profile's (unoptimized): a coroutine's
 //! saved-locals layout can differ under the `release` / `dist` MIR
-//! optimization level, so the pin is a same-profile tripwire — the
-//! release-profile sizes are the `-Zprint-type-sizes` dump's, recorded in
-//! the PR 13f note (`.benchmarks/2026-09-19-sym-acceptance.md` §3.9.4.1).
+//! optimization level, so the pin is a same-profile tripwire. The
+//! `-Zprint-type-sizes` dumps recorded in the PR 13f note
+//! (`.benchmarks/2026-09-19-sym-acceptance.md` §3.9.4.1) were taken with
+//! `cargo rustc --lib --profile test` too; no release-profile size was
+//! measured.
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;

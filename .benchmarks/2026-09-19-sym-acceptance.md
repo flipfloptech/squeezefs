@@ -954,7 +954,7 @@ publish site within ≈ 300–400 B of pre-program (`merge_layout_and_size`
 forest ref ops), `write` 26,592 → 20,320 B (the striped-write arm's own
 growth stays — the `rw4k` row's follow-on, same fix shape). No behaviour
 change; pinned at 2× the fixed sizes (test-profile readings — a same-profile
-tripwire; the release sizes are the type-size dumps'). **Where the armed
+tripwire; the type-size dumps are test-profile too (`cargo rustc --lib --profile test`); no release-profile size was measured). **Where the armed
 arms now allocate**, exactly: the door's two acquires (once per slot per
 mount, a durable control write already), the PR 13b ship (a wire round
 trip), `note_served`'s tail (inside a served verb), `fold_striped_dir_attrs`
@@ -1425,7 +1425,7 @@ DWARF-unwound leg per arm for `rename` / `unlink` at 299 Hz; scale 100,
 * **→ FIXED in PR 13f (`perf/setattr-future-economy`, 2026-09-22; pins
   `tests/meta_op_future_economy_tests.rs` + `tests/sym_read_divert_economy_tests.rs`).**
   `size_of_val` at the FUSE entry (test profile, rustc 1.98.1 —
-  same-profile tripwire; the release sizes are the type-size dumps'):
+  same-profile tripwire; the type-size dumps are test-profile too (`cargo rustc --lib --profile test`); no release-profile size was measured):
   `SqueezefsFilesystem::setattr` **18,960 B (`3228fcb8`) → 26,016 B
   (`77f4da1d`) → 896 B**; `unlink` **7,616 → 11,088 → 280 B**; `rename`
   392 B on all three (it never grew); the routed `setattr` / `getattr`

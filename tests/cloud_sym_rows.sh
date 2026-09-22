@@ -522,12 +522,14 @@ preflight() {
 tools_preflight() {
     local idx tools
     for idx in 0 "${WRITERS[@]}" ${READER:+1}; do
-        tools="python3 stat timeout ls rm mkdir"
-        if [ "$idx" != "1" ]; then tools="$tools tar cc dd getfattr"; fi
-        if [ "$idx" = "${WRITERS[0]}" ] && [ -n "$MANAGER_PRIV" ]; then tools="$tools ping"; fi
+        # comma-separated: an rx env value rides `sudo env K=V … bash -s` as
+        # ONE ssh command string, so it must carry no spaces
+        tools="python3,stat,timeout,ls,rm,mkdir"
+        if [ "$idx" != "1" ]; then tools="$tools,tar,cc,dd,getfattr"; fi
+        if [ "$idx" = "${WRITERS[0]}" ] && [ -n "$MANAGER_PRIV" ]; then tools="$tools,ping"; fi
         RX_CANNED="" rx "$idx" TOOLS="$tools" <<'EOS' || die "m$idx (${HOST[$idx]}): a tool the rows need is missing (see above) — install it on the node before any row runs"
 missing=""
-for t in $TOOLS; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
+for t in ${TOOLS//,/ }; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
 [ -z "$missing" ] || { echo "missing on $(hostname):$missing" >&2; exit 1; }
 EOS
     done
@@ -697,17 +699,19 @@ print(f'dev_bytes={dev} user_bytes={user} dev/user={dev/max(1,user):.3f} wareq_s
 }
 
 # --- acked writes present (the lib's laws; the census runs ON the nodes) --------------
+# (the lib's python text travels as the SCRIPT BODY — an rx env value rides
+# `sudo env K=V … bash -s` as one ssh command string and cannot carry spaces)
 # tree_census <idx> <path-under-mount> -> "entries bytes" as m<idx> sees it
 tree_census() {
-    RX_CANNED="0 0" rx "$1" P="${MNT[$1]}$2" PY="$SYM_TREE_CENSUS_PY" <<'EOS'
-python3 -c "$PY" "$P"
-EOS
+    RX_CANNED="0 0" rx "$1" P="${MNT[$1]}$2" <<<"python3 - \"\$P\" <<'PYEOF'
+$SYM_TREE_CENSUS_PY
+PYEOF"
 }
 # zero_file <idx> <path-under-mount> -> "bytes zero_ok"
 zero_file() {
-    RX_CANNED="0 1" rx "$1" P="${MNT[$1]}$2" PY="$SYM_ZERO_FILE_PY" <<'EOS'
-python3 -c "$PY" "$P"
-EOS
+    RX_CANNED="0 1" rx "$1" P="${MNT[$1]}$2" <<<"python3 - \"\$P\" <<'PYEOF'
+$SYM_ZERO_FILE_PY
+PYEOF"
 }
 # The mount a WRITER's acked writes are read back through: another writer
 # when one is mounted (the manager for a joiner, the first mounted joiner

@@ -2553,6 +2553,12 @@ async fn apply_or_ship_step(
 /// and dispatch again, locally when it is ours now, to the new holder
 /// otherwise; bounded — a second stale answer is the retryable class
 /// the caller sees (the intent stays open, the cadence completes it).
+/// Answers the outcome WITH the dispatch mode of the attempt that
+/// produced it (`shipped`): a witness refusal is classified by how the
+/// step travelled, never by re-resolving its home after the fact (PR
+/// 13e, F-R4 — a slot that moved to the initiator during the ship read
+/// `Local` after it, and a holder's refusal was taken for a local skip:
+/// the plan completed and the create ACKED with its name nowhere).
 async fn apply_or_ship_step_retrying(
     routed: &RoutedMetaBackend,
     tx_id: u64,
@@ -2562,7 +2568,7 @@ async fn apply_or_ship_step_retrying(
     local: &XvLocalStep,
     rider: Option<&XvRider>,
     guards: Arc<[dlm::DlmGuard]>,
-) -> Result<XvStepOutcome> {
+) -> Result<(XvStepOutcome, bool)> {
     const SLOT_MOVED_RETRIES: usize = 2;
     let mut attempt = 0;
     loop {
@@ -2606,7 +2612,7 @@ async fn apply_or_ship_step_retrying(
                     }
                 );
             }
-            other => return other,
+            other => return other.map(|o| (o, shipped)),
         }
     }
 }
@@ -2790,7 +2796,7 @@ pub async fn execute(
         )
         .await
         {
-            Ok(o) => {
+            Ok((o, shipped)) => {
                 if i == 0 && step0_local {
                     // Counted only once the intent record is DURABLE (it
                     // rode this commit): `started` therefore means "an
@@ -2802,18 +2808,18 @@ pub async fn execute(
                 } else if local_step {
                     phase_record(XvPhase::LocalSteps, t_step);
                 }
-                // A LIVE witness refusal at a shipped step: the object
+                // A LIVE witness refusal at a SHIPPED step: the object
                 // moved at the holder between the plan and the apply. The
                 // plan completes (every later step still runs — a skipped
                 // insert never undoes a committed removal), the op answers
                 // the step's errno, and a create's minted child — the one
                 // half nothing names — is destroyed before the retirement.
-                let refused_here = o.status == XvStepStatus::ForeignSkipped
-                    && armed
-                    && !matches!(
-                        step_home(routed, *v_idx, local.local_home()),
-                        StepHome::Local
-                    );
+                // Judged by the mode the refusing attempt was DISPATCHED
+                // in (PR 13e, F-R4): re-resolving the home here read a
+                // slot that had moved to THIS initiator as `Local`, the
+                // holder's refusal passed as a skipped local step, and
+                // the create acked with no name anywhere.
+                let refused_here = o.status == XvStepStatus::ForeignSkipped && armed && shipped;
                 outcomes.push(o);
                 if refused_here {
                     // The plan STOPS here (review round 1, Issue 15): the
@@ -3425,7 +3431,7 @@ async fn recover_one(routed: &RoutedMetaBackend, o: &OpenIntent) -> Result<bool>
         )
         .await
         {
-            Ok(out) => out,
+            Ok((out, _)) => out,
             // A shipped step's unreachable holder, OR a LOCAL step whose
             // slot moved away past the retry bound (`execute`'s own arm —
             // PR 13 review round 1, Issue 13: before it the roll-forward

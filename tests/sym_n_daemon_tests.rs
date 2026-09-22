@@ -10647,9 +10647,18 @@ async fn a_create_into_a_directory_whose_slot_moves_to_the_creator_mid_plan_neve
         ),
         "J2 holds the slot"
     );
-    j2.lookup(j1dir, "moving")
-        .await
-        .expect("`moving` exists at its new holder");
+    // The directory's record moved with its slot (J2's own tree now); its
+    // name stays in J1's directory (J1's slot — read there: the process's
+    // one custody arm is J1's at this point, so J2 would read `j1dir`'s
+    // projection).
+    assert_eq!(
+        j2.getattr(moving)
+            .await
+            .expect("`moving` at its new holder")
+            .nlink,
+        2
+    );
+    assert_eq!(j1.lookup(j1dir, "moving").await.unwrap().ino, moving);
     assert_must_stay_zero(&mvol, "manager");
     assert_must_stay_zero(&j1vol, "j1");
     assert_must_stay_zero(&j2vol, "j2");

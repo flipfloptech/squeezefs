@@ -1492,19 +1492,18 @@ impl KvMetaBackend {
         let own = wire.appender_id;
         let slot = self.forest_slot_of_routing(g.slot);
         let words: crate::slot_lease_core::SlotWords = g.words.into();
-        plane.table.load(
-            slot,
-            crate::slot_lease_core::SlotLease::leased_with(own, g.g, words),
-        );
-        if rotor {
-            plane.table.mark_rotor(slot, own);
-        }
-        plane.gate.clear_foreign(slot);
-        super::test_wire_grant_park_point().await;
         // The grant's tree arrives from the MANAGER's (or a previous
         // lessee's) appends: the cross-daemon barrier re-reads it at the
         // granted root under this mount's SMO mutex (no pass of ours spans
         // the transfer; the slot was nobody's here until this instant).
+        // BEFORE any word names this mount the holder (PR 13e, F-R4): the
+        // table word below is what `writer_read_plane_for` and a served
+        // `foreign_slot_holder` answer "ours — read locally" off, and the
+        // first build wrote it first, so a read landing between the word
+        // and the adoption — the old holder's dying-parent verdict,
+        // diverted here through the manager's redirect — was served the
+        // un-adopted PROJECTION's absence (`Gone`): the box's `ENOENT` for
+        // a directory that existed.
         {
             let _smo = self.smo.lock().await;
             let _hold = self.service_hold();
@@ -1517,6 +1516,15 @@ impl KvMetaBackend {
             )
             .await?;
         }
+        super::test_wire_grant_park_point().await;
+        plane.table.load(
+            slot,
+            crate::slot_lease_core::SlotLease::leased_with(own, g.g, words),
+        );
+        if rotor {
+            plane.table.mark_rotor(slot, own);
+        }
+        plane.gate.clear_foreign(slot);
         self.install_lease(set, plane, own, slot, words, true)
             .await?;
         // The custody transfer's SECOND half on the wire (PR 12b round 3,

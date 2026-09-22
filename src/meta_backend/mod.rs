@@ -2178,25 +2178,40 @@ impl RoutedMetaBackend {
         let (v_idx, local) = crossvol_tx::localise_step(self, step);
         self.check_volume_enabled(v_idx)?;
         let vol = &self.volumes[v_idx];
-        if let Some(plane) = vol.slot_leases() {
-            let slot = kv::record::forest_slot_of_ino(local.local_home());
-            if !plane.gate.is_leased(slot) {
-                let holder = match plane.table.resolve(slot) {
-                    crate::slot_lease_core::Resolved::Holder { holder, g } => {
-                        format!("appender {holder} at g {g}")
-                    }
-                    crate::slot_lease_core::Resolved::Unleased { .. } => "nobody".to_string(),
-                };
-                return Err(crate::error::SqueezefsError::refused(
-                    libc::EAGAIN,
-                    format!(
-                        "cross-owner step {} of {tx_id:016x} homes on forest slot {slot}, which \
-                         this mount does not lease ({holder} does) — the initiator's holder \
-                         view is stale; it re-resolves through tree 0",
-                        step.name()
-                    ),
-                ));
-            }
+        let slot = kv::record::forest_slot_of_ino(local.local_home());
+        // The slot moved between the initiator's plan and this apply (a
+        // release landed, the initiator's holder view is stale): the TYPED
+        // slot-moved class (PR 13e, F-R4 — the class defects 29 / 30 / 35
+        // made retryable), which the initiator re-resolves through tree 0
+        // and re-dispatches on, never an errno the op surfaces.
+        let slot_moved = |what: &str| {
+            let holder = vol
+                .slot_leases()
+                .map_or(crate::slot_lease_core::Resolved::Unleased { g: 0 }, |p| {
+                    p.table.resolve(slot)
+                });
+            let (holder_id, holder_word) = match holder {
+                crate::slot_lease_core::Resolved::Holder { holder, g } => {
+                    (holder, format!("appender {holder} at g {g}"))
+                }
+                crate::slot_lease_core::Resolved::Unleased { .. } => (0, "nobody".to_string()),
+            };
+            crate::error::SqueezefsError::retryable(
+                crate::error::RefusalClass::SlotMoved {
+                    slot,
+                    holder: holder_id,
+                },
+                format!(
+                    "cross-owner step {} of {tx_id:016x} homes on forest slot {slot}, which \
+                     this mount does not lease ({holder_word} does) — {what}; the initiator \
+                     re-resolves through tree 0 and re-dispatches",
+                    step.name()
+                ),
+            )
+        };
+        let leased_here = || vol.slot_leases().is_none_or(|p| p.gate.is_leased(slot));
+        if !leased_here() {
+            return Err(slot_moved("the initiator's holder view is stale"));
         }
         crossvol_tx::test_xv_serve_park_point().await;
         // The wire's `child` (Issue 8a — PR 3's bounded-execution law): an
@@ -2244,7 +2259,22 @@ impl RoutedMetaBackend {
             ..
         } = step
         {
-            if self.refuse_dying_parent(*parent).await.is_err() {
+            // The parent's verdict is this mount's OWN word only while it
+            // LEASES the slot — before AND after the read (PR 13e, F-R4):
+            // a release that lands under the read leaves the record another
+            // appender's, and the divert the read then takes can answer a
+            // not-yet-adopted projection's absence (the box's ENOENT). Not
+            // leased ⇒ the slot-moved class; a wire / transient class off
+            // the read ⇒ the ship failed (retryable, the intent stays open),
+            // never a witness.
+            if let Err(e) = self.refuse_dying_parent(*parent).await {
+                if !leased_here() {
+                    return Err(slot_moved("the slot was released under the served step"));
+                }
+                if !matches!(&e, crate::error::SqueezefsError::Io(io) if io.kind() == std::io::ErrorKind::NotFound)
+                {
+                    return Err(e);
+                }
                 let out = crossvol_tx::XvStepOutcome {
                     status: crossvol_tx::XvStepStatus::ForeignSkipped,
                     inode: None,
@@ -2314,7 +2344,6 @@ impl RoutedMetaBackend {
             _ => false,
         };
         if vol.slot_leases().is_some() && !striping {
-            let slot = kv::record::forest_slot_of_ino(local.local_home());
             if let Some(requester) = self.served_step_requester(vol, scope.client, step) {
                 let ship_ns = u64::try_from(served_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 let _ = vol.note_slot_ship(slot, requester, ship_ns).await;

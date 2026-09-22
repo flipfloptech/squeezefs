@@ -2268,6 +2268,26 @@ impl RoutedMetaBackend {
             self.mirror_volume_failure(v_idx);
         }
         let out = out?;
+        // A served insert of a DIRECTORY re-feeds the parent memo at the
+        // holder (PR 13c review round 1, Issue 2): a peer's rename moved
+        // the directory under this parent, and the memo — a hint fed by
+        // this mount's own mints and renames — would keep its OLD parent
+        // for the mount's life, crediting the old chain's slots with the
+        // subtree's liveness. The holder of the new parent learns the move
+        // here; a THIRD mount's stale entry is the class design §5.1.4
+        // states, bounded by the memo's capacity eviction.
+        if let crossvol_tx::XvStep::InsertDentry {
+            parent,
+            child,
+            name,
+            ft_bits,
+            ..
+        } = step
+        {
+            if *ft_bits == libc::S_IFDIR && out.status == crossvol_tx::XvStepStatus::Applied {
+                self.note_dir_parent(*child, *parent, name);
+            }
+        }
         out.count();
         crossvol_tx::note_step_served();
         log::debug!(

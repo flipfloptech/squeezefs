@@ -3584,6 +3584,76 @@ the two F-R3 pins assert `current_era_exempted == 0` after their leaves
 (`common::sym::fsck_clean_no_exempt`), and the fleet arm above asserts
 it on the offline census after the MANAGER leaves too.
 
+**Review round 2, Issue 10 — C9 exempts the inos an OPEN cross-owner
+plan names, FIXED (`73a9fe31`, pin `27434b48`):** the era witness above
+widened a pre-existing class — C9 had no open-intent exemption (C10's
+`open_intent_inos` was read by C10 alone). A cross-owner create commits
+the child's record (step 0, the creator's rotor) under one door token
+and SHIPS the `InsertDentry` afterwards; a ship the holder refuses
+leaves the intent OPEN for the roll-forward cadence, and once the
+child's slot reads UNLEASED (a forced rotor shrink, a dominance
+handover, the creator's LEAVE) tree 0 makes the record a prior-era
+candidate with no name — so the census REPORTED it as C9 while the plan
+that names it stood, report-only by default, and `--repair` would have
+run `delete_file` + destroy on the record the roll-forward re-names (a
+fresh mint holds no `I{ino}` guard the repair's exclusive lease could
+wait on; the roll-forward's insert then dangles — C10). C9 now reads the
+same set in its evaluate (lazily, after the era floor — a healthy volume
+reaches the line for no candidate), its confirm, and the repair planner
+(a C9 action on an ino a plan names is REFUSED), counted on
+`unreferenced_intent_exempted` / `fsck_unreferenced_intent_exempted` —
+0 on a healthy set, growth = plans open at census time, read beside
+`xv_cross_owner_intents_{open,stuck}`. Pin `sym_n_daemon_tests::a_cross_
+owner_creates_child_is_never_a_c9_finding_while_its_intent_stands`: the
+joiner ships two creates into the manager's directory under
+`TEST_XV_SERVE_REFUSE` (both intents open, both records at nlink 1 with
+no name), `pending-b`'s intent is deleted at its lessee with the name
+never landed (the kill-before-the-inverse window — the shape C9 exists
+for), the joiner LEAVES; the manager's census reports `pending-b` ALONE
+(`pending-a` exempted, counted 1); the manager's cadence then rolls
+`pending-a` FORWARD (an abandoned intent with no live owner) — its name
+lands, the census exempts nothing and `pending-b` stays the finding; the
+offline probe after the manager leaves agrees. RED on `d06c07c2`: both
+children reported at the first census.
+
+**Review round 2, Issue 11 — the rebuilt census arm RAN on a fleet
+(`646ec726`; laptop, "it works" — no number holds merit):** 3-writer
+symmetric fleet on the round-2 binary `eaa0bff6` (`create N=2
+--symmetric --writers=3 --lease-ttl-ms=15000`, tcp devsub,
+`SQZ_MWFLEET_OSS_GB=24`), `run_mw_matrix.sh sym-foreign-touch
+--venue=laptop`. The arm's own lines, second run from zero:
+```
+[mwmatrix] sym-foreign-touch: zero 'no inode record' lines across the writers' logs (since 1790119013.008426566)
+[mwfleet] member 60 unmounted
+[mwfleet] member 61 unmounted
+[mwfleet] member 62 unmounted
+sym-foreign-touch post-leave census: inode plane covered 2 of 2 volume(s), findings by class {}
+[mwmatrix] sym-foreign-touch: post-leave census clean — the inode plane judged WHOLE at the manager, C9 = C10 = 0 (every joiner left; the F-R3 orphan class would read C9 here)
+[mwfleet] member 1 unmounted
+[mwfleet] member 0 unmounted
+sym-foreign-touch offline census: inode plane covered 2 of 2 volume(s), current_era_exempted 0, findings by class {}
+[mwmatrix] sym-foreign-touch: OFFLINE census clean — every writer left, the probe judged every inode (current_era_exempted 0), C9 = C10 = 0
+[mwmatrix] sym-foreign-touch: the remounted manager's grace window closed (waited 15s); re-admitting the members
+[mwfleet] member 60 joined-writer posture engaged (appender 1, manager_lease=peer:0x1c4e7f3e0e89c39d, 64 slot(s), registrant adopted)
+[mwfleet] member 61 joined-writer posture engaged (appender 2, …)
+[mwfleet] member 62 joined-writer posture engaged (appender 3, …)
+```
+(the offline census JSON: `inode_plane_volumes_covered 2`,
+`current_era_exempted 0`, `unreferenced_intent_exempted 0`,
+`inodes_scanned 1` — the `rm -rf`'d tree's one live inode; the 157 k
+records the recovery scan still counts are `nlink 0` corpses the census
+excludes by design — `findings []`; rows kept at
+`/tmp/grok-justin/pr13e-logs/symtouch-rows-r2`). The FIRST run found
+the arm's own ordering defect: the remounted manager is a SUCCESSOR S6
+owner inside its failover grace window (T_owner, reclaim only — §6.7), a
+remounted reader is a FRESH acquire the window refuses, and a reader
+takes the refusal as final (the shipped S5 posture) — the fleet's
+`membership_mode=member` gate read `off` on the reader's remount; the
+arm now waits `membership_grace_remaining_ms` out on the manager before
+re-admitting anyone (the s10-delegation leg's posture). LIVE 192 ships /
+0 handovers, IDLE handed over after 3 bursts, PAUSED 0/0/0, the oracle
+clean, fleet + devsub torn down to zero residue.
+
 ### 4.4am PR 13e — F-R4, FIXED (PR 6 × PR 4's handover): a create into a directory whose slot moved TO the creator mid-plan answered `ENOENT` — the old holder's live-witness refusal after its release surfaced as the op's errno
 
 **Found by the box re-run's `sym-foreign-touch` IDLE phase** (§3.9.4.3 of

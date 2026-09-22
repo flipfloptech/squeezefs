@@ -7711,6 +7711,24 @@ impl KvMetaBackend {
         let _ = self.liveness_ancestors.set(resolve);
     }
 
+    /// The subtree law's cross-volume arm (PR 13c, F-B2): a descendant's
+    /// commit on ANOTHER volume is the holder's work on `slot` of THIS
+    /// volume — one own op on it now, iff this mount leases the slot (a
+    /// foreign slot's ops are its holder's to count). Inert unarmed.
+    pub fn note_subtree_holder_op(&self, slot: super::record::ForestSlot) {
+        let Some(plane) = self.slot_leases() else {
+            return;
+        };
+        if !plane.gate.is_leased(slot) {
+            return;
+        }
+        plane.note_holder_op(
+            slot,
+            crate::mono_core::monotonic_ns_u64(),
+            plane.t_idle_ns(),
+        );
+    }
+
     /// The holder's dominance evaluation at one served SHIP of `slot` by
     /// `requester` (§5.1.4): count it, and when ONE requester dominates
     /// over the common window — `ops_q ≥ 2 × ops_h ∧ ops_q ≥ N_floor`

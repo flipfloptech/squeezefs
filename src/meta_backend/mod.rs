@@ -1534,8 +1534,15 @@ impl RoutedMetaBackend {
     /// slots of its ancestors THERE, walked up the `dir_parents` memo
     /// (a hint fed at every directory mint and rename this mount
     /// performs; a memo miss ends the walk — an unknown ancestor credits
-    /// no slot, erring toward the shipped per-slot count). Ancestors on
-    /// another volume are that volume's slots and are skipped. Held
+    /// no slot, erring toward the shipped per-slot count). An ancestor on
+    /// ANOTHER volume is credited on that volume's plane directly
+    /// (`KvMetaBackend::note_subtree_holder_op`): the subtree is a
+    /// property of the TREE, and a multi-volume set mints a directory's
+    /// children round-robin over its volumes, so a job's storm directory
+    /// routinely lives on the other volume from the directory a requester
+    /// touches — the fleet's `sym-foreign-touch` PAUSED phase read the
+    /// touched slot idle at the manager with the job one second old
+    /// until this arm (PR 13c, the first build skipped them). Held
     /// weakly: a set that left leaves an inert resolver.
     pub fn install_liveness_ancestry(self: &std::sync::Arc<Self>) {
         for (vi, vol) in self.volumes.iter().enumerate() {
@@ -1551,10 +1558,12 @@ impl RoutedMetaBackend {
 
     /// The ancestor slots of the directory `local_parent` (a LOCAL ino on
     /// volume `vi`) on that same volume — see
-    /// [`Self::install_liveness_ancestry`]. Bounded by the memo chain's
-    /// depth; the root (ino 1) ends it.
+    /// [`Self::install_liveness_ancestry`]; an ancestor on another volume
+    /// is credited there as the walk passes it. Bounded by the memo
+    /// chain's depth; the root (ino 1) ends it.
     fn liveness_ancestor_slots(&self, vi: usize, local_parent: u64) -> Vec<kv::record::ForestSlot> {
         let mut out: Vec<kv::record::ForestSlot> = Vec::new();
+        let mut foreign: Vec<(usize, kv::record::ForestSlot)> = Vec::new();
         let mut cur = self.make_global_ino(local_parent, vi);
         // A memo-fed chain is acyclic by construction (a rename into its
         // own subtree is refused); the bound is a belt against a torn
@@ -1570,11 +1579,16 @@ impl RoutedMetaBackend {
                 break;
             }
             let (v, local) = self.route_ino(parent);
+            let slot = kv::record::forest_slot_of_ino(local);
             if v == vi {
-                let slot = kv::record::forest_slot_of_ino(local);
                 if !out.contains(&slot) {
                     out.push(slot);
                 }
+            } else if !foreign.contains(&(v, slot)) {
+                if let Some(vol) = self.volumes.get(v) {
+                    vol.note_subtree_holder_op(slot);
+                }
+                foreign.push((v, slot));
             }
             cur = parent;
         }

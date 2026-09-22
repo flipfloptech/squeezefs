@@ -1923,6 +1923,103 @@ async fn a_holder_live_below_a_directory_is_never_recalled_by_a_burst_into_it() 
     shutdown(&routed).await;
 }
 
+/// F-B2's law on a MULTI-VOLUME set — the fleet's shape (`MDS_COUNT=2`):
+/// a directory's children mint ROUND-ROBIN over the healthy volumes
+/// (`pick_mint_volume`), so a job's storm directory routinely lives on
+/// the OTHER metadata volume from the directory the requester touches,
+/// and its dentries commit through THAT volume's door. The subtree law is
+/// a property of the TREE, not of one volume's slot table: the holder's
+/// op below `job-wA` on volume 1 is work on `job-wA`'s slot on volume 0,
+/// and the credit lands on volume 0's plane. RED before: the first build's
+/// resolver skipped an ancestor on another volume ("that volume's slots"),
+/// so the fleet's `sym-foreign-touch` PAUSED phase read the touched slot
+/// IDLE at the manager with the job's storm one second old — the one-
+/// volume pin above could not see it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_holder_live_below_a_directory_on_another_volume_keeps_the_directorys_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let plan = plan_meta_slot_set(2).expect("derived plan");
+    let mut uris = Vec::new();
+    for (i, name) in ["meta0", "meta1"].iter().enumerate() {
+        let p = dir.path().join(name);
+        std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
+        let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[i].clone()).await;
+        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        r.expect("format stamped member");
+        uris.push(p.display().to_string());
+    }
+    let routed = open_under(&uris, &Knobs::armed().t_idle_ms("2000")).await;
+    assert_eq!(routed.volumes.len(), 2);
+    assert!(routed.volumes.iter().all(|v| v.slot_lease_armed()));
+    // The touched directory and a child directory on the OTHER volume
+    // (round-robin: one of the first two child directories lands there).
+    let job = routed
+        .create(ROOT_INO, "job-wA", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let (job_v, job_local) = routed.route_ino(job);
+    let job_slot = forest_slot_of_ino(job_local);
+    let vol = Arc::clone(&routed.volumes[job_v]);
+    let plane = vol.slot_leases().expect("armed");
+    assert!(
+        plane.gate.is_leased(job_slot),
+        "the holder leases the job's slot"
+    );
+    let mut live = None;
+    for i in 0..4u32 {
+        let d = routed
+            .create(job, &format!("paused{i}"), libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .unwrap()
+            .ino;
+        if routed.route_ino(d).0 != job_v {
+            live = Some(d);
+            break;
+        }
+    }
+    let live = live.expect("a child directory minted on the other volume (round-robin)");
+    let live_v = routed.route_ino(live).0;
+    assert_ne!(
+        live_v, job_v,
+        "the storm's directory is on the OTHER volume"
+    );
+    // N_floor forced to the box's 2 on the touched directory's volume.
+    plane.ewma_handover_ns.store(1_000, Ordering::Relaxed);
+    plane.ewma_ship_ns.store(1_000, Ordering::Relaxed);
+    assert_eq!(plane.n_floor(), 2);
+    tokio::time::sleep(std::time::Duration::from_millis(
+        plane.t_idle_ms + plane.t_idle_ms / 2,
+    ))
+    .await;
+    // The fleet's PAUSED shape: the storm under the child directory (its
+    // dentries commit through the OTHER volume's door), then single
+    // touches into the job's directory — the slot stays.
+    for i in 0..200u32 {
+        routed
+            .create(live, &format!("d{i}"), libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .unwrap();
+    }
+    for ship in 1..=64u32 {
+        assert_eq!(
+            vol.note_slot_ship(job_slot, 7, 1_000).await,
+            ShipVerdict::Serve,
+            "ship {ship}: a holder live below the directory ON ANOTHER VOLUME is never recalled \
+             by a burst into it (job slot {job_slot} on volume {job_v}, storm on volume {live_v})"
+        );
+    }
+    let s = lease_stats(&vol);
+    assert_eq!(
+        (s.offers, s.offers_idle, s.offers_dominated, s.handovers),
+        (0, 0, 0, 0),
+        "no offer, no handover: {s:?}"
+    );
+    shutdown(&routed).await;
+}
+
 /// PR 13c (the gate-1 flat-path regression, `.benchmarks/2026-09-19-sym-
 /// acceptance.md` §3.9.1c): the directory-parent memo is an ARMED set's
 /// hint — its every reader (the set-wide rename lock's ancestor walk, the

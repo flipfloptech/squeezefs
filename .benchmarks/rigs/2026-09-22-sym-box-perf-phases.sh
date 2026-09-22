@@ -15,8 +15,14 @@
 #        sudo bash ... B /scratch/tmp/sym-box/squeezefs-B-77f4da1d
 #
 # Artifacts: $OUT/<phase>.data (perf, 999 Hz, -g), $OUT/<phase>.row (the
-# storm's ops/s line), $OUT/<phase>.{comms,tpc-flat}.txt (perf report by
-# comm; the fuse3-tpc* flat symbol table), $OUT/stats_{pre,post}.json.
+# storm's ops/s line), $OUT/<phase>.comms.txt (perf report by comm),
+# $OUT/<phase>.tpc-agg.txt (the fuse3-tpc* flat LEAF table, crate hashes
+# folded — the sibling aggregator 2026-09-22-sym-box-perf-agg.py; the
+# first build's `perf report --comm fuse3-tpc` matched no `fuse3-tpcN`
+# comm and wrote an EMPTY table on every leg), and on a DWARF leg
+# $OUT/<phase>.callers-<leaf>.txt for each CALLER_LEAVES entry (default
+# memcpy_avx512 memmove memcmp — the callers of glibc's frame-pointer-less
+# copies, depth CALLER_DEPTH = 4), $OUT/stats_{pre,post}.json.
 set -euo pipefail
 ARM="${1:?arm label (A|B)}"
 BIN="${2:?binary path}"
@@ -29,6 +35,11 @@ THREADS="${SQZ_MDSTORM_THREADS:-8}"
 SCALE="${SQZ_MDSTORM_SCALE:-100}"
 PHASES="${PHASES:-mkdir create rename unlink}"
 HZ="${HZ:-999}"
+AGG="$(dirname "$0")/2026-09-22-sym-box-perf-agg.py"
+[ -f "$AGG" ] || AGG="$REPO/.benchmarks/rigs/2026-09-22-sym-box-perf-agg.py"
+[ -f "$AGG" ] || { echo "no aggregator beside this rig or under $REPO/.benchmarks/rigs"; exit 1; }
+CALLER_LEAVES="${CALLER_LEAVES:-memcpy_avx512 memmove memcmp}"
+CALLER_DEPTH="${CALLER_DEPTH:-4}"
 # CALLGRAPH=fp (default, `-g`) or dwarf (`--call-graph dwarf,<bytes>` — names
 # the callers glibc's frame-pointer-less memmove/memcmp hide; the `release`
 # profile keeps DWARF in-binary; ~16 KiB of stack per sample).
@@ -87,7 +98,15 @@ for _ in $(seq 1 100); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
 for ph in $PHASES; do
   [ -s "$OUT/$ph.data" ] || continue
   perf report -i "$OUT/$ph.data" --no-children --sort comm --stdio 2>/dev/null | grep -v "^#" | grep -v "^$" | head -20 >"$OUT/$ph.comms.txt" || true
-  perf report -i "$OUT/$ph.data" --no-children --comm fuse3-tpc --sort dso,symbol --stdio -g none 2>/dev/null | grep -v "^#" | grep -v "^$" | head -150 >"$OUT/$ph.tpc-flat.txt" || true
+  python3 "$AGG" flat "$OUT/$ph.data" fuse3-tpc 400 >"$OUT/$ph.tpc-agg.txt" 2>"$OUT/$ph.tpc-agg.err" ||
+    echo "aggregator FAILED on $ph (see $OUT/$ph.tpc-agg.err)" | tee -a "$OUT/leg.log"
+  [ -s "$OUT/$ph.tpc-agg.txt" ] || echo "WARN: $ph.tpc-agg.txt is EMPTY — no fuse3-tpc* samples decoded" | tee -a "$OUT/leg.log"
+  if [ "$CALLGRAPH" = dwarf ]; then
+    for leaf in $CALLER_LEAVES; do
+      python3 "$AGG" callers "$OUT/$ph.data" fuse3-tpc "$leaf" "$CALLER_DEPTH" >"$OUT/$ph.callers-$leaf.txt" 2>>"$OUT/$ph.tpc-agg.err" ||
+        echo "caller aggregation FAILED on $ph/$leaf" | tee -a "$OUT/leg.log"
+    done
+  fi
 done
 rm -rf "$DIR"
 echo "DONE $ARM $(date -u +%FT%TZ)" | tee -a "$OUT/leg.log"

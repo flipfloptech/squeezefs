@@ -1353,7 +1353,14 @@ DWARF-unwound leg per arm for `rename` / `unlink` at 299 Hz; scale 100,
   83 → 144 + 111), A 198 → B 280 on unlink (109 + 89 → 151 + 129), plus
   the `handle_unlink` future itself 77 → 105 on unlink and `handle_lookup`
   9 → 11 / `handle_rename` 7 → 8; the leaf's share of the lane's samples
-  3.35 % → 5.12 % (rename), 4.82 % → 6.63 % (unlink). The kernel sends a
+  3.35 % → 5.12 % (rename), 4.82 % → 6.63 % (unlink). **Provenance:**
+  four invocations of the on-box `perf-callers2.py <perf.data> fuse3-tpc
+  memcpy_avx512 4` over `perf-dwarf-{A,B}/{rename,unlink}.data` (the
+  caller chain of the four frames above the leaf, samples whose comm
+  starts with `fuse3-tpc`), read from the session's stdout — their
+  outputs were NOT saved beside the data (review Issue 5; §8 states the
+  owed `callers-*.txt` files and the rig now writes them on every DWARF
+  leg through `2026-09-22-sym-box-perf-agg.py callers`). The kernel sends a
   ctime/mtime SETATTR echo after every rename and unlink (the D4
   "absorbed, not committed" echo — `meta_kv_times_echo_absorbed` 299.2–
   299.4k per storm on BOTH arms), so the SETATTR handler runs once per
@@ -3723,12 +3730,12 @@ evidence and stay):**
 | `squeeze-test:/scratch/tmp/sym-box/{squeezefs-B-77f4da1d,libsqueezefs_il-B-77f4da1d.so,SHA256SUMS.rerun}` | arm B = PR 13c's gated tip (`77f4da1d`, `release`, sha256 `42438ccd…0088a1`; the shim `581126de…`), `sha256sum -c` OK + `--version` verified on the box; the previous `squeezefs-B` (`7b2ef9e9`'s code) kept beside it |
 | `squeeze-test:/scratch/tmp/squeezefs` | **REPLACED** by arm B `77f4da1d` (the reset script's client binary) |
 | `squeeze-test:/scratch/tmp/sym-box/repo/{tests,.benchmarks/rigs}/` | refreshed from this worktree (`mw-scale` leg, the walls row (b) fleet-wide law, the mw-scale intents closure; 445 / 88 files; the copies diff-identical after each refresh) |
-| `squeeze-test:/scratch/tmp/rigs/{2026-09-13-sym-pr1-solo-regate.sh,-reduce.py,2026-09-21-sym-box-brackets.sh,2026-09-22-sym-box-perf-phases.sh}` | PR 1's pair (the RT + diskstats revision), the driver (fleet M / `mwscale`, daemon logs kept per leg), the NEW phase-targeted perf leg |
+| `squeeze-test:/scratch/tmp/rigs/{2026-09-13-sym-pr1-solo-regate.sh,-reduce.py,2026-09-21-sym-box-brackets.sh,2026-09-22-sym-box-perf-phases.sh}` | PR 1's pair (the RT + diskstats revision), the driver (fleet M / `mwscale`, daemon logs kept per leg), the NEW phase-targeted perf leg (its fix-round revision — the aggregator `2026-09-22-sym-box-perf-agg.py` beside it, the flat table and the DWARF caller tables persisted per phase — is on the branch and NOT yet on the box: the box was unreachable at fix-round time; place both files with the next session's arms) |
 | `squeeze-test:/scratch/tmp/sym-box-rerun-stage/` | the user-writable staging dir the `rsync`s landed in before the root `install`s (the arms, `repo/`, the rigs) |
 | `squeeze-test:/scratch/tmp/sym-box/rows-gate1-rerun-20260922-110641/` (+ `.log`, `REDUCED.md`) | **gate 1 bracket 1** (A B B A, RT = 60): per row `.stats0/1`, `.diskstats0/1`, `.job`, `.fio.json/.txt`, `_bw.*.log`, `.procstat*`, `.thermal*`, `.dmesg`; per arm `reset-*.log`, `features-*.txt`, the timed mount / remount / umount legs, `*-mdstorm.*`, `prep-*.fio.json` |
 | `squeeze-test:/scratch/tmp/sym-box/rows-gate1-rerun-20260922-110641-rev/` (+ `.log`, `REDUCED.md`) | **gate 1 bracket 2** (B A A B, mdstorm only — the DELTA rows) |
-| `squeeze-test:/scratch/tmp/sym-box/perf-phases-{A,B}/` + `perf-phases.log` | the fp-chain perf legs: `{mkdir,create,rename,unlink}.{data,row,comms.txt,tpc-agg.txt,perf-record.log}`, `stats_{pre,post}.json`, `leg.log` |
-| `squeeze-test:/scratch/tmp/sym-box/perf-dwarf-{A,B}/` + `perf-dwarf.log` + `perf-callers2.py` | the DWARF-unwound legs (rename / unlink, 299 Hz; 177–219 MB `perf.data` each) + the caller aggregator |
+| `squeeze-test:/scratch/tmp/sym-box/perf-phases-{A,B}/` + `perf-phases.log` | the fp-chain perf legs: `{mkdir,create,rename,unlink}.{data,row,comms.txt,perf-record.log}`, `stats_{pre,post}.json`, `leg.log`; **`<phase>.tpc-flat.txt` is EMPTY on every leg** (the rig's first build filtered `perf report --comm fuse3-tpc`, an EXACT match that no `fuse3-tpcN` comm meets — review Issue 5; the rig now runs the sibling aggregator instead); **`<phase>.tpc-agg.txt`** = the fp leaf tables §3.9.4.1's per-phase numbers come from, produced BY HAND with the previous rung's `/scratch/tmp/sym-box/perf-agg.py <data> fuse3-tpc 400` (its prefix-match logic is what `2026-09-22-sym-box-perf-agg.py flat` now carries) |
+| `squeeze-test:/scratch/tmp/sym-box/perf-dwarf-{A,B}/` + `perf-dwarf.log` + `perf-callers2.py` | the DWARF-unwound legs (rename / unlink, 299 Hz; 177–219 MB `perf.data` each) + the caller aggregator (on the box only — its logic is `2026-09-22-sym-box-perf-agg.py callers` on the branch). **The caller tables §3.9.4.1 quotes came from FOUR invocations whose stdout was NOT saved beside the data** — `python3 perf-callers2.py perf-dwarf-{A,B}/{rename,unlink}.data fuse3-tpc memcpy_avx512 4` — so a reader cannot re-check them without re-running `perf script`; **OWED (the box unreachable at fix-round time): re-run the four through the rig's aggregator and save `perf-dwarf-{A,B}/{rename,unlink}.callers-memcpy_avx512.txt` (+ `-memmove`, `-memcmp`) beside the data — the rig does this itself on every DWARF leg from now on** |
 | `squeeze-test:/scratch/tmp/sym-box/rerun-nw-20260922-121141-mwscale-r1/` (+ `.log`) | the FIRST `mw-scale` launch (H-R1: died at N = 2 on the intents term) — kept as the finding's evidence |
 | `squeeze-test:/scratch/tmp/sym-box/rerun-nw-20260922-122434-mwscale-r1/` (+ `.log`) | **gate 3's A arm** (fleet M, `mwscale-r1/mwscale-1790079886/`: the table, per-writer `create-n*-w*.txt`, `m*_pn*{0,c,1}.json`, `fsck-mw-scale.out`) |
 | `squeeze-test:/scratch/tmp/sym-box/rerun-nw-20260922-125749-scale-B/` (+ `.log`) | **gate 3's B arm** (fleet A, `scale-r1/symscale-1790081892/`) — RED on F-B1 at N = 8; daemon logs NOT kept (H-R2 found here) |

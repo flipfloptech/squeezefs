@@ -10118,7 +10118,7 @@ async fn assert_counted_out(holder: &RoutedMetaBackend, ino: u64, what: &str) {
     }
 }
 
-/// **F-R3 (record §3.9.4.3 / §4.4aj; a FLIP PRECONDITION): a cross-owner
+/// **F-R3 (record §3.9.4.3 / §4.4al; a FLIP PRECONDITION): a cross-owner
 /// unlink of a child ANOTHER appender minted reads the child's witness AT
 /// ITS HOLDER, never this daemon's projection.** The joiner creates into
 /// the MANAGER's directory (PR 6: the dentry ships, the child is minted in

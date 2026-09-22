@@ -750,7 +750,7 @@ fn bench_layout_publish(c: &mut Criterion) {
         b.iter(|| {
             let img = black_box(&packed_delta_img);
             let mut sum = 0u64;
-            for rec in img.chunks_exact(4 + PACKED_ENTRY_BYTES) {
+            for rec in img.as_chunks::<{ 4 + PACKED_ENTRY_BYTES }>().0.iter() {
                 let blk = u32::from_le_bytes(rec[0..4].try_into().expect("fixed"));
                 let m = packed_decode(&rec[4..]);
                 sum = sum.wrapping_add(blk as u64).wrapping_add(m.offset);
@@ -999,7 +999,11 @@ fn bench_block_map_encoding(c: &mut Criterion) {
     group.bench_function("packed_decode_mix_1024", |b| {
         b.iter(|| {
             let mut acc = 0u64;
-            for rec in black_box(&packed_mix).chunks_exact(PACKED_ENTRY_BYTES) {
+            for rec in black_box(&packed_mix)
+                .as_chunks::<PACKED_ENTRY_BYTES>()
+                .0
+                .iter()
+            {
                 acc = acc.wrapping_add(packed_decode(rec).offset);
             }
             black_box(acc)

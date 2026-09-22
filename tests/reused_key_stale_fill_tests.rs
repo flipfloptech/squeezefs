@@ -476,12 +476,12 @@ fn stamp_block(b: u64, generation: u64) -> Vec<u8> {
 /// Validate `data`, which was read from file offset `file_off`: every aligned
 /// 8-byte word must be zero (hole) or carry the stamp of the block it lies in.
 fn check_stamps(data: &[u8], file_off: u64, tag: &str) {
-    for (i, w) in data.chunks_exact(8).enumerate() {
+    for (i, w) in data.as_chunks::<8>().0.iter().enumerate() {
         let off = file_off + (i as u64) * 8;
         if !off.is_multiple_of(8) {
             continue;
         }
-        let word = u64::from_le_bytes(w.try_into().unwrap());
+        let word = u64::from_le_bytes(*w);
         if word == 0 {
             continue;
         }

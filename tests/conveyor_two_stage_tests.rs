@@ -991,7 +991,8 @@ fn d2_crash_child_entry() {
             let routed = routed.clone();
             let ledger = ledger.clone();
             tasks.push(tokio::spawn(async move {
-                for i in 0.. {
+                // The child is killed -9 mid-storm; the bound is the lint's.
+                for i in 0..=u64::MAX {
                     let name = format!("k{c}_{i}");
                     routed
                         .create(1, &name, libc::S_IFREG | 0o644, 0, 0)

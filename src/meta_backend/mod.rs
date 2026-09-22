@@ -578,6 +578,9 @@ pub async fn open_routed_meta_set(paths: &[String]) -> Result<std::sync::Arc<Rou
         // PR 7b: the striped directories' background flips and
         // migrations hold the set through this handle.
         routed.install_stripe_self();
+        // PR 13c (F-B2): the commit door's subtree liveness reads the
+        // directory-parent memo through this resolver.
+        routed.install_liveness_ancestry();
     }
     // PR 8 (design-symmetric-metadata §5.5 / KD-SYM-15): under the armed
     // plane volume 0's manager is the maintenance coordinator and this
@@ -747,6 +750,7 @@ pub async fn open_routed_meta_set_joined(
         kv::checkpoint::checkpoint_landing_ceiling_derived(),
     );
     routed.install_stripe_self();
+    routed.install_liveness_ancestry();
     kv::alloc_lease::arm_symmetric_roles(&routed);
     install_joined_slot_carriage_sink(&routed);
     Ok(routed)
@@ -1217,6 +1221,12 @@ pub struct RoutedMetaBackend {
     dir_stripes: dir_stripe::StripeState,
 }
 
+/// The liveness ancestry walk's belt (PR 13c, F-B2): the deepest chain a
+/// path can address — `PATH_MAX / 2` components (each component is at
+/// least one byte plus its separator) — never a tuning constant; a
+/// memo-fed chain ends at the root long before it.
+const LIVENESS_CHAIN_MAX: usize = (libc::PATH_MAX as usize) / 2;
+
 /// The directory-parent memo's capacity: the dentry-cache derivation
 /// (`mem_budget::dir_entry_capacity` — one entry per hot directory, the
 /// same function the FUSE dentry cache sizes by; never a fixed constant).
@@ -1516,6 +1526,59 @@ impl RoutedMetaBackend {
             dir_parents: dir_parent_memo(),
             dir_stripes: dir_stripe::StripeState::new(),
         })
+    }
+
+    /// PR 13c (F-B2, design §5.1.4 as amended): hand every volume the
+    /// directory-ancestry resolver its commit door notes holder ops
+    /// through — a directory's LOCAL ino on that volume → the forest
+    /// slots of its ancestors THERE, walked up the `dir_parents` memo
+    /// (a hint fed at every directory mint and rename this mount
+    /// performs; a memo miss ends the walk — an unknown ancestor credits
+    /// no slot, erring toward the shipped per-slot count). Ancestors on
+    /// another volume are that volume's slots and are skipped. Held
+    /// weakly: a set that left leaves an inert resolver.
+    pub fn install_liveness_ancestry(self: &std::sync::Arc<Self>) {
+        for (vi, vol) in self.volumes.iter().enumerate() {
+            let me = std::sync::Arc::downgrade(self);
+            vol.install_liveness_ancestors(std::sync::Arc::new(move |local_parent: u64| {
+                let Some(routed) = me.upgrade() else {
+                    return Vec::new();
+                };
+                routed.liveness_ancestor_slots(vi, local_parent)
+            }));
+        }
+    }
+
+    /// The ancestor slots of the directory `local_parent` (a LOCAL ino on
+    /// volume `vi`) on that same volume — see
+    /// [`Self::install_liveness_ancestry`]. Bounded by the memo chain's
+    /// depth; the root (ino 1) ends it.
+    fn liveness_ancestor_slots(&self, vi: usize, local_parent: u64) -> Vec<kv::record::ForestSlot> {
+        let mut out: Vec<kv::record::ForestSlot> = Vec::new();
+        let mut cur = self.make_global_ino(local_parent, vi);
+        // A memo-fed chain is acyclic by construction (a rename into its
+        // own subtree is refused); the bound is a belt against a torn
+        // memo, sized by the deepest tree a create can address.
+        for _ in 0..LIVENESS_CHAIN_MAX {
+            if cur <= 1 {
+                break;
+            }
+            let Some((parent, _)) = self.dir_parents.get(&cur) else {
+                break;
+            };
+            if parent == cur {
+                break;
+            }
+            let (v, local) = self.route_ino(parent);
+            if v == vi {
+                let slot = kv::record::forest_slot_of_ino(local);
+                if !out.contains(&slot) {
+                    out.push(slot);
+                }
+            }
+            cur = parent;
+        }
+        out
     }
 
     /// PR 3 (kvmap): install the block-key → record encoder (once, at

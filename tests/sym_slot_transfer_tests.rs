@@ -1785,6 +1785,144 @@ async fn dominance_over_a_common_window_decides_every_offer() {
     shutdown(&routed).await;
 }
 
+/// Symmetric PR 13c, F-B2 (`.benchmarks/2026-09-19-sym-acceptance.md`
+/// §3.9.2 — gate 3c's box row): a LIVE holder was recalled by a 64-touch
+/// burst. The holder's job ran under `job-wA/live/r*` — a storm whose
+/// directories spilled to the ROTOR at the `A_max` floor — while the
+/// requester created 64 names INTO `job-wA` per burst; the dominance rule
+/// counted `ops_h` PER SLOT, so `job-wA`'s slot read one own op (the
+/// `mkdir live`) beside 64 foreign creates, and with `N_floor` seeded 2
+/// the second ship offered the slot DOMINATED. **The rule as built now
+/// (design §5.1.4 amended): `ops_h(S)` counts the holder's namespace ops
+/// on the SUBTREE rooted in `S`'s directories** — every commit that names
+/// a parent directory notes the slots of the parent's ANCESTORS too (the
+/// directory-parent memo's chain, resolved once per commit on an armed
+/// mount), so a job live anywhere below a directory keeps that
+/// directory's slot; the IDLE arm still fires when the job stops (the
+/// subtree count falls to 0 with it), and a bursty requester still
+/// reclaims from a trickle holder. The box's exact shape, `N_floor` forced
+/// to 2: RED before at the second ship (`OfferDominated`, `handovers 1`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_holder_live_below_a_directory_is_never_recalled_by_a_burst_into_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    // T_idle = 2 s: the idle half of the contract waits it out.
+    let routed = open_under(
+        &uris,
+        &Knobs::armed().partition(PARTITION).t_idle_ms("2000"),
+    )
+    .await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let plane = vol.slot_leases().expect("armed");
+    assert_eq!(plane.t_idle_ms, 2000);
+    // The job's top directory, its own tree grown past one extent so the
+    // next child spills to the rotor (the `A_max` floor at a young volume
+    // is one node).
+    let job = routed
+        .create(ROOT_INO, "job-wA", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    let job_slot = slot_of_global(&routed, job);
+    assert!(
+        plane.gate.is_leased(job_slot),
+        "the holder leases the job's slot"
+    );
+    let mut live = None;
+    for i in 0..4_000u32 {
+        routed
+            .create(job, &format!("f{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+        if i % 500 == 499 {
+            let probe = routed
+                .create(job, &format!("live{i}"), libc::S_IFDIR | 0o755, 0, 0)
+                .await
+                .unwrap()
+                .ino;
+            if slot_of_global(&routed, probe) != job_slot {
+                live = Some(probe);
+                break;
+            }
+        }
+    }
+    let live = live.expect("a child directory spilled to the rotor (the box's shape)");
+    let live_slot = slot_of_global(&routed, live);
+    assert_ne!(
+        live_slot, job_slot,
+        "the storm's directory is in ANOTHER slot"
+    );
+    // N_floor forced to the box's 2: a handover priced at one ship.
+    plane.ewma_handover_ns.store(1_000, Ordering::Relaxed);
+    plane.ewma_ship_ns.store(1_000, Ordering::Relaxed);
+    assert_eq!(plane.n_floor(), 2);
+    // The setup's own ops on the job's slot age OUT of the window (the
+    // box's phase 1 preceded the LIVE phase by more than a window); one
+    // own op on the directory inside it — the box's `mkdir live` — is
+    // what made the second foreign ship DOMINATE (`2 ≥ 2 × 1`) rather
+    // than find the slot idle. Then the LIVE storm under the spilled
+    // directory (its dentries and records in `live`'s slot, never the
+    // job's) interleaved with the requester's bursts into the job's
+    // directory — the served ships PR 6 counts at the holder.
+    tokio::time::sleep(std::time::Duration::from_millis(
+        plane.t_idle_ms + plane.t_idle_ms / 2,
+    ))
+    .await;
+    routed
+        .create(job, "one-own-op", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    let mut ships = 0u64;
+    for round in 0..3u32 {
+        for i in 0..200u32 {
+            routed
+                .create(live, &format!("r{round}-d{i}"), libc::S_IFDIR | 0o755, 0, 0)
+                .await
+                .unwrap();
+        }
+        for _ in 0..64 {
+            ships += 1;
+            assert_eq!(
+                vol.note_slot_ship(job_slot, 7, 1_000).await,
+                ShipVerdict::Serve,
+                "ship {ships}: a holder live below the directory is never recalled by a burst \
+                 into it (job slot {job_slot}, storm slot {live_slot}, N_floor {})",
+                plane.n_floor()
+            );
+        }
+    }
+    let s = lease_stats(&vol);
+    assert_eq!(
+        (s.offers, s.offers_dominated, s.handovers),
+        (0, 0, 0),
+        "no offer, no handover: {s:?}"
+    );
+    assert_eq!(s.ships, ships);
+    // The storm stops: the subtree count ages out of the window and the
+    // IDLE arm decides on `N_floor` alone — the requester's next burst
+    // moves the slot (the rule's other half, unchanged).
+    let t_idle = std::time::Duration::from_millis(plane.t_idle_ms + plane.t_idle_ms / 2);
+    assert!(
+        t_idle <= std::time::Duration::from_secs(30),
+        "the fixture's T_idle is the contract's wall ({t_idle:?})"
+    );
+    tokio::time::sleep(t_idle).await;
+    let mut offered = false;
+    for _ in 0..64 {
+        if vol.note_slot_ship(job_slot, 7, 1_000).await != ShipVerdict::Serve {
+            offered = true;
+            break;
+        }
+    }
+    assert!(
+        offered,
+        "an idle tree moves at N_floor ships once the job stopped"
+    );
+    assert_eq!(lease_stats(&vol).offers_idle, 1);
+    shutdown(&routed).await;
+}
+
 /// Two nodes alternating on one directory converge on ONE holder: the
 /// requester-side cooldown (the S10 valve over `T_idle`) serves the
 /// alternating touches after the first handover instead of re-offering.

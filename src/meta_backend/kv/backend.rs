@@ -180,6 +180,12 @@ use std::sync::{Arc, Weak};
 /// step, the intent's slot homing, the set-wide directory-rename lock).
 mod crossvol_arms;
 pub use crossvol_arms::{screen_dir_rename_words, DirRenameLease, DirRenameOutcome};
+
+/// A directory's LOCAL ino → the forest slots of its ancestors on this
+/// volume (PR 13c, F-B2; installed by the routed layer, which owns the
+/// directory-parent memo). An empty answer = no ancestor known here.
+pub type LivenessAncestors =
+    Arc<dyn Fn(u64) -> Vec<super::record::ForestSlot> + Send + Sync + 'static>;
 /// Symmetric PR 10: dead-appender recovery — the death ledger's driver
 /// (design §5.9), the C14/C15 census, `appender clear`.
 pub mod recovery;
@@ -1223,6 +1229,14 @@ pub struct KvMetaBackend {
     /// every unarmed forest mount — one `OnceLock` probe per read verb.
     tokens_holder: std::sync::OnceLock<Arc<crate::meta_ship::token_plane::TokenHolderPlane>>,
     tokens_reader: std::sync::OnceLock<Arc<crate::meta_ship::token_plane::TokenReaderPlane>>,
+    /// PR 13c (F-B2, design §5.1.4 as amended): the routed layer's
+    /// directory-ancestry resolver — a directory's LOCAL ino → the forest
+    /// slots of its ancestors on THIS volume (the `dir_parents` memo's
+    /// chain). The commit door notes the holder's namespace op on those
+    /// slots too, so `ops_h(S)` counts the holder's work on the SUBTREE
+    /// rooted in `S`'s directories. Consulted on an ARMED mount only; a
+    /// backend nobody installed on notes the tx's own slots alone.
+    liveness_ancestors: std::sync::OnceLock<LivenessAncestors>,
     /// PR 12 — the reader's PER-HOLDER token planes (§5.1.6 / §5.7.2): an
     /// object in a slot ANOTHER appender leases is served by a plane
     /// dialing THAT holder's listener — keyed by ENDPOINT, so two appenders
@@ -3035,6 +3049,7 @@ impl KvMetaBackend {
             conveyor_self: std::sync::OnceLock::new(),
             tokens_holder: std::sync::OnceLock::new(),
             tokens_reader: std::sync::OnceLock::new(),
+            liveness_ancestors: std::sync::OnceLock::new(),
             reader_holder_planes: scc::HashMap::new(),
             reader_holder_endpoints: scc::HashMap::new(),
             reader_holder_unresolved: scc::HashSet::new(),
@@ -7682,6 +7697,13 @@ impl KvMetaBackend {
         Ok(())
     }
 
+    /// Install the directory-ancestry resolver the commit door notes
+    /// holder ops through (PR 13c, F-B2 — see the field). Once per
+    /// backend; a second install is ignored.
+    pub fn install_liveness_ancestors(&self, resolve: LivenessAncestors) {
+        let _ = self.liveness_ancestors.set(resolve);
+    }
+
     /// The holder's dominance evaluation at one served SHIP of `slot` by
     /// `requester` (§5.1.4): count it, and when ONE requester dominates
     /// over the common window — `ops_q ≥ 2 × ops_h ∧ ops_q ≥ N_floor`
@@ -7819,6 +7841,34 @@ impl KvMetaBackend {
         if !tx.served_step {
             for slot in &slots {
                 plane.note_holder_op(*slot, now, t_idle);
+            }
+            // PR 13c (F-B2): a namespace op is the holder's work on the
+            // whole chain above its parent — `ops_h(S)` counts the
+            // subtree rooted in S's directories, so a job live BELOW a
+            // directory keeps that directory's slot against a burst INTO
+            // it (the box's gate-3c row: a storm under `job-wA/live/r*`
+            // read as idle on `job-wA`'s slot). One resolver call per
+            // dentry-bearing commit, the tx's own slots skipped, slots
+            // this mount does not lease skipped (a foreign slot's ops are
+            // its holder's to count).
+            if let Some(resolve) = self.liveness_ancestors.get() {
+                let mut noted: Vec<super::record::ForestSlot> = Vec::new();
+                for (kind, key, _, _) in &tx.staged {
+                    if *kind != super::record::TREE_DENTRIES || key.len() < 8 {
+                        continue;
+                    }
+                    let parent = u64::from_be_bytes(key[..8].try_into().unwrap_or([0; 8]));
+                    for slot in resolve(parent) {
+                        if slots.contains(&slot)
+                            || noted.contains(&slot)
+                            || !plane.gate.is_leased(slot)
+                        {
+                            continue;
+                        }
+                        plane.note_holder_op(slot, now, t_idle);
+                        noted.push(slot);
+                    }
+                }
             }
         }
         let mut entered: Vec<super::record::ForestSlot> = Vec::with_capacity(slots.len());

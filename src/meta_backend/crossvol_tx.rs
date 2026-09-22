@@ -197,6 +197,47 @@ pub static TEST_XV_SERVE_REFUSE: AtomicBool = AtomicBool::new(false);
 /// the seam clears. The initiator re-resolves and re-dispatches.
 pub static TEST_XV_SERVE_SLOT_BUSY_ONCE: AtomicBool = AtomicBool::new(false);
 
+/// Test seam (the served side — PR 13e, F-R4's pin): PARK every served
+/// step at its holder right after the lease check and before the parent
+/// verdict / apply — the window a slot RELEASE lands into. Released by
+/// [`test_xv_serve_park_release`]; one relaxed load per served step.
+pub static TEST_XV_SERVE_PARK_AFTER_LEASE_CHECK: AtomicBool = AtomicBool::new(false);
+
+/// Served steps that PARKED on [`TEST_XV_SERVE_PARK_AFTER_LEASE_CHECK`]
+/// so far (the test-side barrier that the schedule formed).
+static TEST_XV_SERVE_PARKED: AtomicU64 = AtomicU64::new(0);
+
+/// Served steps parked on [`TEST_XV_SERVE_PARK_AFTER_LEASE_CHECK`] so far.
+pub fn test_xv_serve_parked() -> u64 {
+    TEST_XV_SERVE_PARKED.load(Ordering::Acquire)
+}
+
+static TEST_XV_SERVE_PARK_NOTIFY: once_cell::sync::Lazy<squeezefs_ipc::sqz_notify::Notify> =
+    once_cell::sync::Lazy::new(squeezefs_ipc::sqz_notify::Notify::new);
+
+/// Release every served step parked on
+/// [`TEST_XV_SERVE_PARK_AFTER_LEASE_CHECK`] (the flag is stored `false`
+/// first; the notify wakes the loop).
+pub fn test_xv_serve_park_release() {
+    TEST_XV_SERVE_PARK_AFTER_LEASE_CHECK.store(false, Ordering::Relaxed);
+    TEST_XV_SERVE_PARK_NOTIFY.notify_waiters();
+}
+
+/// The served step's park point (one relaxed load when the seam is off).
+pub(crate) async fn test_xv_serve_park_point() {
+    if !TEST_XV_SERVE_PARK_AFTER_LEASE_CHECK.load(Ordering::Relaxed) {
+        return;
+    }
+    TEST_XV_SERVE_PARKED.fetch_add(1, Ordering::AcqRel);
+    while TEST_XV_SERVE_PARK_AFTER_LEASE_CHECK.load(Ordering::Relaxed) {
+        let notified = TEST_XV_SERVE_PARK_NOTIFY.notified();
+        if !TEST_XV_SERVE_PARK_AFTER_LEASE_CHECK.load(Ordering::Relaxed) {
+            break;
+        }
+        notified.await;
+    }
+}
+
 /// Test seam (the initiator's own door): the next N LOCALLY dispatched
 /// steps are refused `SlotBusy` at this mount's door BEFORE any effect —
 /// a slot that moved away between the plan and the door, and kept moving

@@ -2198,6 +2198,7 @@ impl RoutedMetaBackend {
                 ));
             }
         }
+        crossvol_tx::test_xv_serve_park_point().await;
         // The wire's `child` (Issue 8a — PR 3's bounded-execution law): an
         // insert may name only an ino that already has a record on its
         // volume or lives in a slot tree 0 says SOME appender leases (the

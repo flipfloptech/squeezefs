@@ -1500,6 +1500,7 @@ impl KvMetaBackend {
             plane.table.mark_rotor(slot, own);
         }
         plane.gate.clear_foreign(slot);
+        super::test_wire_grant_park_point().await;
         // The grant's tree arrives from the MANAGER's (or a previous
         // lessee's) appends: the cross-daemon barrier re-reads it at the
         // granted root under this mount's SMO mutex (no pass of ours spans

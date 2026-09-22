@@ -10431,3 +10431,244 @@ async fn a_cross_owner_link_rename_over_and_directory_move_read_their_witnesses_
     drop(manager);
     fsck_clean(&uris).await;
 }
+
+// ---------------------------------------------------------------------------
+// PR 13e — F-R4 (record §3.9.4.3): a create into a directory whose slot
+// MOVES to the creator mid-plan answered `ENOENT` once on the box.
+// ---------------------------------------------------------------------------
+
+/// **F-R4: a create into a directory whose slot moves TO the creator
+/// mid-plan never answers `ENOENT` for a parent that exists.** Three
+/// daemons (the box's shape): the manager, J1 (the OLD holder — its
+/// directory `moving` lives in a slot it leases, minted after J2's
+/// projection was taken, so J2's tree of that slot holds no record of it —
+/// the box's `job-w60`, local 2 of slot 131), J2 (the requester). J2's
+/// create into `moving` ships its `InsertDentry` to J1, where the seam
+/// parks it after the lease check; J1 RELEASES the slot; J2's wire first
+/// touch of it parks MID-INSTALL (the table word written, the tree not yet
+/// adopted); the served step resumes. RED on `7f4b007e`: J1's dying-parent
+/// verdict read `moving` through its divert — the manager redirected to
+/// J2, whose table already named it the holder — and J2 served `Gone`
+/// from its un-adopted projection; J1 answered the witness refusal, J2's
+/// create surfaced `ENOENT` to the application. GREEN: the served step's
+/// parent verdict is judged only while the holder LEASES the slot (before
+/// and after the read), else the typed slot-moved class the initiator
+/// re-dispatches on; a wire grant adopts the tree BEFORE naming this mount
+/// the holder — the create lands at its new holder or answers a retryable
+/// class, never `ENOENT`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_into_a_directory_whose_slot_moves_to_the_creator_mid_plan_never_answers_enoent() {
+    use squeezefs::meta_backend::crossvol_tx::{
+        cross_owner_stats, test_xv_serve_park_release, test_xv_serve_parked,
+        TEST_XV_SERVE_PARK_AFTER_LEASE_CHECK,
+    };
+    use squeezefs::meta_backend::kv::backend::{
+        test_wire_grant_park_release, test_wire_grant_parked, TEST_WIRE_GRANT_PARK_MID_INSTALL,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "j1dir")]).await;
+    let j1dir = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mvenue = DaemonVenue::stand_up(&manager, true, "manager-custody-f-r4").await;
+    let mut joined = Vec::new();
+    for n in [81u32, 82] {
+        Knobs::armed().apply();
+        let r = open_routed_meta_set_joined(
+            &uris,
+            &JoinedSetAdmission {
+                manager_endpoint: mvenue.endpoint.clone(),
+                secret: VENUE_SECRET.to_vec(),
+                peer_id: peer_of(&joiner_identity(&mvol, n).await),
+                identity: joiner_identity(&mvol, n).await,
+            },
+        )
+        .await;
+        Knobs::clear();
+        let j = r.expect("the joined open");
+        // J1 first-touches the seeded slot and mints `moving` BEFORE J2
+        // opens: J2's projection of that slot is tree 0's grant-time root,
+        // which holds no record of `moving`.
+        if n == 81 {
+            j.create(j1dir, "moving", libc::S_IFDIR | 0o755, 1000, 1000)
+                .await
+                .expect("J1's mkdir in its own directory");
+        }
+        joined.push(j);
+    }
+    let (j1, j2) = (Arc::clone(&joined[0]), Arc::clone(&joined[1]));
+    let (j1vol, j2vol) = (Arc::clone(&j1.volumes[0]), Arc::clone(&j2.volumes[0]));
+    let (j1id, j2id) = (
+        j1vol.appender_stats().unwrap().appender_id,
+        j2vol.appender_stats().unwrap().appender_id,
+    );
+    let (j1identity, j2identity) = (
+        j1vol.joined_wire().unwrap().identity,
+        j2vol.joined_wire().unwrap().identity,
+    );
+    let j1venue = DaemonVenue::stand_up(&j1, false, "j1-custody-f-r4").await;
+    let j2venue = DaemonVenue::stand_up(&j2, false, "j2-custody-f-r4").await;
+    for vol in [&mvol, &j1vol, &j2vol] {
+        let holders = &vol.slot_leases().unwrap().holders;
+        holders.set_endpoint(j1id, &j1venue.endpoint);
+        holders.set_endpoint(j2id, &j2venue.endpoint);
+    }
+    let moving = j1.lookup(j1dir, "moving").await.unwrap().ino;
+    let slot = slot_of_global(&j1, moving);
+    assert!(
+        matches!(
+            tree0_state(&mvol, slot).await,
+            Some(SlotState::Leased { appender_id, .. }) if appender_id == j1id
+        ),
+        "J1 leases `moving`'s slot {slot}"
+    );
+    let (_, local_moving) = j2.route_ino(moving);
+    assert!(
+        j2vol
+            .read_inode_value_routed(local_moving)
+            .await
+            .unwrap()
+            .is_none(),
+        "the premise: J2's projection of slot {slot} holds no record of `moving`"
+    );
+
+    // J2 is the requester: its shipper, its read divert. Its plan reads the
+    // parent at J1 and ships the InsertDentry there, where the seam parks
+    // the served step after the lease check.
+    let _j2arm = stand_up_initiator(&j2, &j2identity).await;
+    TEST_XV_SERVE_PARK_AFTER_LEASE_CHECK.store(true, Relaxed);
+    let parked0 = test_xv_serve_parked();
+    let t1 = {
+        let j2 = Arc::clone(&j2);
+        tokio::spawn(async move {
+            j2.create(moving, "moving-46", libc::S_IFREG | 0o644, 1000, 1000)
+                .await
+        })
+    };
+    wait_until("the served step parked at J1", || {
+        test_xv_serve_parked() > parked0
+    })
+    .await;
+
+    // The slot moves: J1 releases it (tree 0 Unleased at the manager); J2
+    // learns it and first-touches it over the wire — the install parks
+    // MID-INSTALL. J1's divert now dials the new holder (the process-global
+    // arm re-stood as J1's: the box's daemons each had one).
+    j1vol
+        .release_slot_handover(j1id, slot)
+        .await
+        .expect("J1's release of the slot");
+    mvol.checkpoint_now().await.unwrap();
+    j2vol.refresh_control_projection().await.unwrap();
+    let _j1arm = {
+        let sink = Arc::new(ProbeSink {
+            calls: std::sync::atomic::AtomicU64::new(0),
+        });
+        squeezefs::data_grant::arm_slot_custody(
+            &j1,
+            &peer_of(&j1identity),
+            VENUE_SECRET.to_vec(),
+            0,
+            Arc::new(move |_volume| {
+                Arc::clone(&sink) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
+            }),
+        )
+    };
+    TEST_WIRE_GRANT_PARK_MID_INSTALL.store(true, Relaxed);
+    let installs0 = test_wire_grant_parked();
+    let routing = u16::try_from(u64::from(slot) - 1).unwrap();
+    let t2 = {
+        let j2vol = Arc::clone(&j2vol);
+        tokio::spawn(async move { j2vol.joined_accept_offers(&[(routing, 0)]).await })
+    };
+    wait_until("J2's wire grant install parked mid-install", || {
+        test_wire_grant_parked() > installs0
+    })
+    .await;
+    assert!(
+        matches!(
+            tree0_state(&mvol, slot).await,
+            Some(SlotState::Leased { appender_id, .. }) if appender_id == j2id
+        ),
+        "the manager granted the slot to J2"
+    );
+
+    // The served step resumes at J1 with the slot GONE from its lease set.
+    let retries0 = cross_owner_stats().step_slot_moved_retries;
+    test_xv_serve_park_release();
+    // The served step answers (the RED shape: the witness refusal, the
+    // create's errno) or is re-dispatched (the GREEN shape: the slot-moved
+    // class, the initiator waiting on the install); the install lands
+    // after either.
+    let started = std::time::Instant::now();
+    while !t1.is_finished() && cross_owner_stats().step_slot_moved_retries == retries0 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the served step neither answered nor was re-dispatched"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    test_wire_grant_park_release();
+    t2.await.expect("the accept task");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), t1)
+        .await
+        .expect("the create completes once the install lands")
+        .expect("the create task");
+    match outcome {
+        Ok(created) => match j2.lookup(moving, "moving-46").await {
+            Ok(l) => assert_eq!(l.ino, created.ino, "the create landed at its new holder"),
+            Err(e) => panic!(
+                "F-R4: the create ACKED and its name exists nowhere ({e}) — the served step's \
+                 witness refusal off a not-yet-adopted projection was read as a COMPLETED plan \
+                 once the slot had moved to the initiator (the child minted, no dentry: the \
+                 box's ENOENT wearing an ack)"
+            ),
+        },
+        Err(e) => {
+            assert_ne!(
+                e.to_errno(),
+                libc::ENOENT,
+                "F-R4: a parent that EXISTS at its new holder must never read `ENOENT` — \
+                 the OLD holder's dying-parent verdict off a not-yet-adopted projection ({e})"
+            );
+            assert!(
+                e.refusal_class().is_some() || e.to_errno() == libc::EAGAIN,
+                "only a retryable class may surface ({e})"
+            );
+        }
+    }
+    assert!(
+        matches!(
+            tree0_state(&mvol, slot).await,
+            Some(SlotState::Leased { appender_id, .. }) if appender_id == j2id
+        ),
+        "J2 holds the slot"
+    );
+    j2.lookup(j1dir, "moving")
+        .await
+        .expect("`moving` exists at its new holder");
+    assert_must_stay_zero(&mvol, "manager");
+    assert_must_stay_zero(&j1vol, "j1");
+    assert_must_stay_zero(&j2vol, "j2");
+    assert_eq!(cross_owner_stats().intents_open, 0, "every plan retired");
+
+    squeezefs::data_grant::disarm_slot_custody().await;
+    squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
+    drop(joined);
+    shutdown(&j2).await;
+    drop(j2vol);
+    drop(j2);
+    j2venue.tear_down();
+    shutdown(&j1).await;
+    drop(j1vol);
+    drop(j1);
+    j1venue.tear_down();
+    mvenue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}

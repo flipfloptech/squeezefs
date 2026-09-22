@@ -457,6 +457,47 @@ pub fn test_handover_park_release() {
     TEST_HANDOVER_PARK_NOTIFY.notify_waiters();
 }
 
+/// Test seam (PR 13e, F-R4's pin): PARK a joined appender's wire grant
+/// install MID-INSTALL — between the slot tree's adoption and the RAM
+/// words that name this mount the holder — the window a served step's
+/// parent read at the OLD holder lands into. Released by
+/// [`test_wire_grant_park_release`]; one relaxed load per install.
+pub static TEST_WIRE_GRANT_PARK_MID_INSTALL: AtomicBool = AtomicBool::new(false);
+
+/// Wire grant installs that PARKED on [`TEST_WIRE_GRANT_PARK_MID_INSTALL`]
+/// so far (the test-side barrier that the schedule formed).
+static TEST_WIRE_GRANT_PARKED: AtomicU64 = AtomicU64::new(0);
+
+/// Wire grant installs parked on [`TEST_WIRE_GRANT_PARK_MID_INSTALL`] so far.
+pub fn test_wire_grant_parked() -> u64 {
+    TEST_WIRE_GRANT_PARKED.load(Ordering::Acquire)
+}
+
+static TEST_WIRE_GRANT_PARK_NOTIFY: once_cell::sync::Lazy<squeezefs_ipc::sqz_notify::Notify> =
+    once_cell::sync::Lazy::new(squeezefs_ipc::sqz_notify::Notify::new);
+
+/// Release every install parked on [`TEST_WIRE_GRANT_PARK_MID_INSTALL`]
+/// (the flag is stored `false` first; the notify wakes the loop).
+pub fn test_wire_grant_park_release() {
+    TEST_WIRE_GRANT_PARK_MID_INSTALL.store(false, Ordering::Relaxed);
+    TEST_WIRE_GRANT_PARK_NOTIFY.notify_waiters();
+}
+
+/// The wire grant install's park point (one relaxed load when off).
+pub(super) async fn test_wire_grant_park_point() {
+    if !TEST_WIRE_GRANT_PARK_MID_INSTALL.load(Ordering::Relaxed) {
+        return;
+    }
+    TEST_WIRE_GRANT_PARKED.fetch_add(1, Ordering::AcqRel);
+    while TEST_WIRE_GRANT_PARK_MID_INSTALL.load(Ordering::Relaxed) {
+        let notified = TEST_WIRE_GRANT_PARK_NOTIFY.notified();
+        if !TEST_WIRE_GRANT_PARK_MID_INSTALL.load(Ordering::Relaxed) {
+            break;
+        }
+        notified.await;
+    }
+}
+
 /// Test seam (§5.3.4 row 6, PR 4): the holder DIES after the manager's
 /// tree-0 `Unleased` landed and before it dropped the slot from its page
 /// — page `Releasing` ∧ tree 0 `Unleased`: tree 0 wins, the entry is

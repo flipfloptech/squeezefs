@@ -4083,6 +4083,7 @@ async fn evaluate_c9_unreferenced(
             candidates.len()
         );
     }
+    let mut intents: Option<std::collections::HashSet<u64>> = None;
     for ino in candidates {
         let (vol_idx, local) = ctx.meta.route_ino(ino);
         let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
@@ -4116,6 +4117,23 @@ async fn evaluate_c9_unreferenced(
         // because a create legitimately holds its record before its name.
         if !kv.minted_in_prior_era(local) {
             counters.current_era_exempted += 1;
+            continue;
+        }
+        // The inode plane's in-flight exemption (PR 13e review round 2,
+        // Issue 10 — C10's `open_intent_inos`, read by C9 too): a
+        // cross-owner create commits the child's record before its
+        // `InsertDentry` ships, and a ship the holder refuses leaves the
+        // intent OPEN for the roll-forward; the child's slot reads UNLEASED
+        // once its lessee releases or leaves, so tree 0 makes the record a
+        // prior-era candidate with no name — the roll-forward's object,
+        // never C9's, while the intent stands (a `--repair` here would
+        // destroy the record the roll-forward re-names). Read lazily: a
+        // healthy volume reaches this line for no candidate.
+        if intents.is_none() {
+            intents = Some(open_intent_inos(ctx).await);
+        }
+        if intents.as_ref().is_some_and(|set| set.contains(&ino)) {
+            counters.unreferenced_intent_exempted += 1;
             continue;
         }
         let val = match kv.read_inode_value_routed(local).await {
@@ -5812,11 +5830,12 @@ async fn recheck_suspects(
     // exactly the window where a count and a name legitimately disagree,
     // and the plan's durable intent is what says one is in flight. One
     // bounded range per volume, empty on a healthy set.
-    let intent_inos = if c10_judged.is_empty() && !pending.iter().any(is_c10_dangling) {
-        std::collections::HashSet::new()
-    } else {
-        open_intent_inos(ctx).await
-    };
+    let intent_inos =
+        if c10_judged.is_empty() && !c9_pending && !pending.iter().any(is_c10_dangling) {
+            std::collections::HashSet::new()
+        } else {
+            open_intent_inos(ctx).await
+        };
 
     // Phase C: per-suspect final verification.
     static EMPTY: once_cell::sync::Lazy<HashMap<u64, u32>> =
@@ -6417,6 +6436,15 @@ async fn recheck_suspects(
                 size,
                 blocks,
             } => {
+                // An ino an OPEN cross-volume plan names is in flight by
+                // definition (Issue 10 — C10's guard, C9's too): the plan
+                // that names it is still to land, and its intent is what
+                // says so.
+                if intent_inos.contains(ino) {
+                    counters.unreferenced_intent_exempted += 1;
+                    counters.suspects_cleared += 1;
+                    continue;
+                }
                 // Verify under the ino's exclusive 4a lease (online):
                 // the record is still live, still prior-era, and the
                 // FRESH dentry pass still found no name for it. The raw
@@ -8303,10 +8331,12 @@ pub async fn repair(
     // C10's in-flight exemption at repair time too: a plan in flight is
     // never repaired around.
     let repair_intents = if inode_plane_inos.is_empty()
-        && !actionable
-            .iter()
-            .any(|(_, id)| matches!(id, FindingId::C10DanglingDentry { .. }))
-    {
+        && !actionable.iter().any(|(_, id)| {
+            matches!(
+                id,
+                FindingId::C10DanglingDentry { .. } | FindingId::C9Unreferenced { .. }
+            )
+        }) {
         std::collections::HashSet::new()
     } else {
         open_intent_inos(ctx).await
@@ -8767,6 +8797,18 @@ pub async fn repair(
             // a bit-8 volume C8 drift) — which is why C9 runs first: after
             // its destroy those findings verify as healed and refuse.
             FindingId::C9Unreferenced { ino } => {
+                // Issue 10: a plan in flight is never repaired around —
+                // the roll-forward names this record.
+                if repair_intents.contains(ino) {
+                    refuse(
+                        &mut out,
+                        f,
+                        "an open cross-volume plan names this inode: its name is the \
+                         plan's roll-forward to land, never C9's to destroy"
+                            .to_string(),
+                    );
+                    continue;
+                }
                 let (vol_idx, local) = ctx.meta.route_ino(*ino);
                 let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
                     refuse(&mut out, f, "volume index no longer exists".to_string());

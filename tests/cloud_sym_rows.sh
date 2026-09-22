@@ -31,8 +31,20 @@
 #                               (default 60 — the AGENTS.md rule; the local
 #                               scoping pass runs 10; 0 = one pass)
 #   --files=N --threads=T       per-writer creates and threads (scale;
-#                               shared sizes per_writer = files / creators)
-#   --ingest-mb=M               per-writer ingest MiB (4 MiB blocks, fsync)
+#                               shared sizes per_writer = files / creators);
+#                               under --size-to-rt=auto these are FLOORS
+#   --ingest-mb=M               per-writer ingest MiB (4 MiB blocks, fsync;
+#                               a floor under --size-to-rt=auto)
+#   --size-to-rt=auto|off       auto (the cloud venue's default): an N = 1
+#                               PILOT on the manager (a short create storm,
+#                               a 256 MiB ingest, a small shared-dir wave)
+#                               sizes --files / --ingest-mb / the shared
+#                               row's per-creator count so every RATE phase
+#                               fills --rt (the sustained-state rule); off
+#                               (the laptop's default) = the sizes as given
+#   --ingest-cap-mb=M           the per-writer ingest ceiling the pilot may
+#                               size up to (default 65536 — the cloud
+#                               namespaces hold it; local zram does not)
 #   --scale-ns=1,2,4,8          gate 3's N ladder (capped at the writers
 #                               given + 1)
 #   --tar-src=DIR | --tarball=F the `tar -x` corpus (the linux fs/ tree —
@@ -142,6 +154,8 @@ FILES="${SQZ_CLOUDSYM_FILES:-40000}"
 THREADS="${SQZ_CLOUDSYM_THREADS:-4}"
 INGEST_MB="${SQZ_CLOUDSYM_INGEST_MB:-1024}"
 SCALE_NS="${SQZ_CLOUDSYM_SCALE_NS:-1,2,4,8}"
+SIZE_TO_RT="${SQZ_CLOUDSYM_SIZE_TO_RT:-}"
+INGEST_CAP_MB="${SQZ_CLOUDSYM_INGEST_CAP_MB:-65536}"
 TAR_SRC="${SQZ_CLOUDSYM_TAR_SRC:-}"
 TARBALL="${SQZ_CLOUDSYM_TARBALL:-}"
 TARX_REPS="${SQZ_CLOUDSYM_TARX_REPS:-1}"
@@ -170,6 +184,8 @@ for a in "$@"; do
     --threads=*) THREADS="${a#--threads=}" ;;
     --ingest-mb=*) INGEST_MB="${a#--ingest-mb=}" ;;
     --scale-ns=*) SCALE_NS="${a#--scale-ns=}" ;;
+    --size-to-rt=*) SIZE_TO_RT="${a#--size-to-rt=}" ;;
+    --ingest-cap-mb=*) INGEST_CAP_MB="${a#--ingest-cap-mb=}" ;;
     --tar-src=*) TAR_SRC="${a#--tar-src=}" ;;
     --tarball=*) TARBALL="${a#--tarball=}" ;;
     --tarx-reps=*) TARX_REPS="${a#--tarx-reps=}" ;;
@@ -198,6 +214,9 @@ for a in "$@"; do
     esac
 done
 case "$SYM_VENUE" in cloud | laptop) ;; *) die "--venue takes cloud|laptop (got '$SYM_VENUE')" ;; esac
+[ -n "$SIZE_TO_RT" ] || SIZE_TO_RT="$([ "$SYM_VENUE" = cloud ] && echo auto || echo off)"
+case "$SIZE_TO_RT" in auto | off) ;; *) die "--size-to-rt takes auto|off (got '$SIZE_TO_RT')" ;; esac
+[[ "$INGEST_CAP_MB" =~ ^[0-9]+$ ]] && [ "$INGEST_CAP_MB" -ge 4 ] || die "--ingest-cap-mb takes MiB >= 4 (got '$INGEST_CAP_MB')"
 [[ "$RT" =~ ^[0-9]+$ ]] || die "--rt takes seconds (got '$RT')"
 [[ "$FILES" =~ ^[0-9]+$ ]] && [ "$FILES" -ge 100 ] || die "--files takes an integer ≥ 100 (got '$FILES')"
 [[ "$THREADS" =~ ^[0-9]+$ ]] && [ "$THREADS" -ge 1 ] || die "--threads takes an integer ≥ 1 (got '$THREADS')"
@@ -514,7 +533,10 @@ EOS
     log "tools preflight: every row tool resolves on every node"
 }
 MDSTORM_BIN="$REMOTE_DIR/mdstorm"
+MDSTORM_INSTALLED=0
 install_mdstorm() {
+    [ "$MDSTORM_INSTALLED" = 1 ] && return 0
+    MDSTORM_INSTALLED=1
     [ -r "$MDSTORM_SRC" ] || die "mdstorm source missing: $MDSTORM_SRC"
     local idx
     for idx in 0 "${WRITERS[@]}"; do
@@ -779,6 +801,102 @@ row_tarx() {
     log "sym-tarx PUBLISHED (rows + verdict + snapshots in $ROWDIR)"
 }
 
+# --- the sustained-state rule (AGENTS.md): a RATE phase shorter than --rt ---------
+# On the CLOUD venue a burst row is "a FAILED row, not a result" — the
+# phase is judged INVALID (the row's verdict word; the driver exits
+# nonzero after its row sets, evidence kept), never warned past. On the
+# laptop it is scoping and a WARN. Prints the verdict suffix ("" when the
+# phase filled RT).
+RT_INVALID=0
+sym_rt_verdict() { # label wall_s phase -> "" | "INVALID(sub-RT …)"
+    local label="$1" wall="$2" phase="$3"
+    [ "$(python3 -c "print(1 if $wall >= $RT else 0)")" = "1" ] && return 0
+    if [ "$SYM_VENUE" = cloud ]; then
+        RT_INVALID=1
+        echo "INVALID(sub-RT:$phase ${wall}s<${RT}s)"
+        echo "[sym-rows] $label: the $phase phase ran ${wall} s < RT=$RT s — a burst is a FAILED row on the cloud venue (the sustained-state rule); the row is INVALID (size --files/--ingest-mb up or let --size-to-rt=auto size them)" >&2
+    else
+        warn "$label: the $phase phase ran ${wall} s < RT=$RT s — size --files/--ingest-mb up for the counted row (the sustained-state rule; scoping on the laptop)"
+    fi
+}
+
+# The N = 1 PILOT (--size-to-rt=auto): a short create storm + a 256 MiB
+# ingest on the manager, then a small shared-dir wave by every creator into
+# a throwaway directory, each timed on the node — the measured rates size
+# the counted phases to fill --rt with 25 % headroom. The pilot's files are
+# removed before any snapshot a row judges; its directory flips once (a
+# warm-up the rows' per-row deltas never see).
+PILOT_DONE=0
+SHARED_PER_WRITER=""
+size_to_rt() {
+    [ "$SIZE_TO_RT" = auto ] || return 0
+    [ "$PILOT_DONE" = 1 ] && return 0
+    PILOT_DONE=1
+    install_mdstorm
+    local pf out c_rate i_rate
+    pf=$((FILES < 5000 ? FILES : 5000))
+    log "pilot (--size-to-rt=auto): N = 1 on the manager — $pf creates ($THREADS threads) + 256 MiB ingest, then a shared-dir wave by every creator; sizing the rows to fill RT=$RT s"
+    out="$(RX_CANNED="5000.0 1000.0" rx 0 MNT="${MNT[0]}" STORM="$MDSTORM_BIN" T="$THREADS" F="$pf" <<'EOS'
+set -euo pipefail
+d="$MNT/pilot-$$"
+mkdir -p "$d"
+t0="$(date +%s.%N)"; "$STORM" "$d" "$T" "$F" create >/dev/null 2>&1; t1="$(date +%s.%N)"
+dd if=/dev/zero of="$d/ingest.bin" bs=4M count=64 conv=fsync status=none
+t2="$(date +%s.%N)"
+rm -rf "$d"
+python3 -c "print(f'{$F/($t1-$t0):.1f} {256/($t2-$t1):.1f}')"
+EOS
+)" || die "pilot: the N = 1 create/ingest pilot FAILED on the manager"
+    read -r c_rate i_rate <<<"$out"
+    # creates: rate × RT × 1.25, rounded up to 1,000; ingest: MiB/s × RT × 1.25,
+    # rounded up to 4 MiB, capped (the local zram cannot hold a cloud-sized row)
+    local want_files want_mb
+    want_files="$(python3 -c "import math; print(max($FILES, int(math.ceil($c_rate*$RT*1.25/1000))*1000))")"
+    want_mb="$(python3 -c "import math; print(max($INGEST_MB, int(math.ceil($i_rate*$RT*1.25/4))*4))")"
+    if [ "$want_mb" -gt "$INGEST_CAP_MB" ]; then
+        warn "pilot: the ingest sized to RT wants $want_mb MiB per writer, capped at --ingest-cap-mb=$INGEST_CAP_MB (the ingest phase may read sub-RT — INVALID on the cloud venue)"
+        want_mb="$INGEST_CAP_MB"
+    fi
+    FILES="$want_files"
+    INGEST_MB="$want_mb"
+    # the shared row: every creator into ONE directory — a different
+    # mechanism (ships to the holder), so its own pilot wave: 500 per
+    # creator into a throwaway directory of the first joiner
+    local holder="${WRITERS[0]}" prel idx s_rate
+    prel="/pilot-shared-$(date +%s)"
+    rx "$holder" P="${MNT[$holder]}$prel" <<'EOS' || die "pilot: the shared-dir pilot's mkdir failed on m$holder"
+mkdir "$P"
+EOS
+    local -a pids=()
+    local t0 t1 p rc=0
+    t0="$(date +%s.%N)"
+    for idx in 0 "${WRITERS[@]}"; do
+        rx_bg "$idx" "$ROWDIR/.pilot-shared-w$idx" D="${MNT[$idx]}$prel" PFX="p$idx" N=500 <<'EOS'
+python3 - "$D" "$PFX" "$N" <<'PYEOF'
+import os, sys
+d, pfx, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+for i in range(n):
+    fd = os.open(f"{d}/{pfx}-{i:07d}", os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o644); os.close(fd)
+PYEOF
+EOS
+        pids+=($!)
+    done
+    for p in "${pids[@]}"; do wait "$p" || rc=1; done
+    t1="$(date +%s.%N)"
+    [ "$rc" = "0" ] || die "pilot: a shared-dir pilot creator FAILED (see $ROWDIR/.pilot-shared-w*.err)"
+    rx "$holder" P="${MNT[$holder]}$prel" <<'EOS' || true
+rm -rf "$P"
+EOS
+    if $DRY_RUN; then
+        SHARED_PER_WRITER=$((FILES / (1 + ${#WRITERS[@]})))
+    else
+        s_rate="$(python3 -c "print(f'{500/($t1-$t0):.1f}')")" # per creator, into one directory
+        SHARED_PER_WRITER="$(python3 -c "import math; print(max($FILES // (1 + ${#WRITERS[@]}), int(math.ceil($s_rate*$RT*1.25/100))*100))")"
+    fi
+    log "pilot: create $c_rate/s, ingest $i_rate MiB/s, shared $([ "$DRY_RUN" = true ] && echo '(dry-run)' || echo "$s_rate")/creator/s → --files=$FILES --ingest-mb=$INGEST_MB shared per-creator=$SHARED_PER_WRITER (RT $RT s, 25 % headroom)"
+    emit "# pilot(size-to-rt): create=${c_rate}/s ingest=${i_rate}MiB/s shared_per_creator=${s_rate:-dry}/s -> files=$FILES ingest_mb=$INGEST_MB shared_per_writer=$SHARED_PER_WRITER"
+}
+
 # ===================================================================================
 # gate 3 — sym-scale
 # ===================================================================================
@@ -792,6 +910,7 @@ row_scale() {
     done
     [ "${#ns_ok[@]}" -ge 1 ] || die "sym-scale: no N in '$SCALE_NS' fits the ${#WRITERS[@]} writer(s) given"
     install_mdstorm
+    size_to_rt
     BENCH_ORDER=$((BENCH_ORDER + 1))
     log "gate 3 (sym-scale): N ∈ {${ns_ok[*]}} writer NODES each creating $FILES files ($THREADS threads) in its OWN directory, then ingesting $INGEST_MB MiB (4 MiB blocks, conv=fsync); exactly N appenders live per row${MOUNT_HOOK:+ (the idle writers LEAVE — mount hook)}"
     [ -n "$MOUNT_HOOK" ] || warn "sym-scale: no --mount-hook — the idle writers stay MOUNTED (appenders_known reads the whole fleet; the deleted-stays-deleted-across-the-leave arm is skipped)"
@@ -907,6 +1026,12 @@ print(f'{100*(int(b)-int(a))/1e9/max(1e-9, $t1-$t_row0):.0f}')" 2>/dev/null || e
             verdict="MISS(must-stay-0:$zero_miss)"
             zero_miss_all="$zero_miss_all N=$n:$zero_miss"
         fi
+        # The sustained-state rule: both RATE phases must fill RT (the
+        # cloud venue's INVALID word lands in the verdict column).
+        local rt_c rt_i
+        rt_c="$(sym_rt_verdict "sym-scale N=$n" "$create_wall" create)"
+        rt_i="$(sym_rt_verdict "sym-scale N=$n" "$ingest_wall" ingest)"
+        [ -z "$rt_c$rt_i" ] || verdict="$verdict $rt_c $rt_i"
         [ "$verdict" = "MET" ] || verdict_all=MISS
         sym_gate3_row_line "$n" "$create_rate" "$cr" "$creates_per_cpu_s" "$ingest_rate" "$ir" "$mgr_load" "$mgr_cpu" "$handovers" "$ships" "$rpcs" "$verdict" | tee -a "$table" | tee -a "$ROWS_FILE"
         # The write-amplification instrument's third column (AGENTS.md): the
@@ -925,8 +1050,6 @@ print(f'{100*(int(b)-int(a))/1e9/max(1e-9, $t1-$t_row0):.0f}')" 2>/dev/null || e
             bf="$bf ${k#block_free_}=$v_bf"
         done
         emit "   N=$n walls: create ${create_wall}s ingest ${ingest_wall}s (RT $RT s); appenders_known=$live; ingest amplification: $amp; block_free (row window, Σ writers):$bf"
-        [ "$(python3 -c "print(1 if min($create_wall,$ingest_wall) >= $RT else 0)")" = "1" ] ||
-            warn "sym-scale N=$n: a measured phase ran shorter than RT=$RT s (create $create_wall s, ingest $ingest_wall s) — size --files/--ingest-mb up for the counted row (the sustained-state rule)"
         for idx in "${writers[@]}"; do
             # The LAST names the storm created (`ls -U` = readdir order = the
             # order `rm -rf` unlinks in) — the deleted-stays-deleted sample.
@@ -1007,7 +1130,8 @@ row_shared() {
     BENCH_ORDER=$((BENCH_ORDER + 1))
     shared_rel="/shared-$(date +%s)"
     local -a writers=(0 "${WRITERS[@]}")
-    per_writer=$((FILES / ${#writers[@]}))
+    size_to_rt
+    per_writer="${SHARED_PER_WRITER:-$((FILES / ${#writers[@]}))}"
     rx "$holder" P="${MNT[$holder]}$shared_rel" <<'EOS' || die "sym-shared-dir: the holder's mkdir failed"
 set -euo pipefail
 mkdir "$P"
@@ -1087,14 +1211,14 @@ EOS
 )" || die "sym-shared-dir: getfattr -n user.squeezefs.stripes on the holder m$holder FAILED (the tool missing, or the directory carries no stripe map) — see above"
     [[ "$xattr_k" =~ ^[0-9]+$ ]] && [ "$xattr_k" -ge 1 ] ||
         die "sym-shared-dir: the holder's user.squeezefs.stripes read '$xattr_k' (want an integer ≥ 1 — K)"
+    local rt_s
+    rt_s="$(sym_rt_verdict sym-shared-dir "$wall" create)"
     {
         row_stamp "sym-shared-dir" "python3 O_CREAT|O_EXCL creators: ${#writers[@]} nodes × $per_writer into ONE directory held by m$holder"
-        echo "== gate 3b: ${#writers[@]} creator nodes × $per_writer into ONE directory (holder m$holder): wall $wall s, $(python3 -c "print(f'{$created/($t1-$t0):.0f}')") creates/s aggregate (RT $RT s) =="
+        echo "== gate 3b: ${#writers[@]} creator nodes × $per_writer into ONE directory (holder m$holder): wall $wall s, $(python3 -c "print(f'{$created/($t1-$t0):.0f}')") creates/s aggregate (RT $RT s)${rt_s:+ $rt_s} =="
         echo "   flips=$flips at [$flip_at] striped_dirs(holder)=$striped K=$xattr_k xv_shipped=$shipped xv_served=$served dir_stripe_ships=$stripe_ships handovers=$handovers"
     } | tee -a "$ROWS_FILE"
     sym_law_gate3b_engagement "$holder" "$flips" "$flip_at" "$striped" "$stripe_ships" "$shipped" "$served" "$handovers"
-    [ "$(python3 -c "print(1 if $wall >= $RT else 0)")" = "1" ] ||
-        warn "sym-shared-dir: the create phase ran $wall s < RT=$RT s — size --files up for the counted row (the sustained-state rule)"
     log "sym-shared-dir: flip at the holder, $stripe_ships stripe ships, closure shipped ≡ served ($shipped), 0 handovers"
 
     # --- sym-shared-dir-ls: a COLD token reader's `readdir + stat` ------------
@@ -1188,6 +1312,8 @@ for r in ${ROWS//,/ }; do
 done
 if $DRY_RUN; then
     log "dry-run complete: every command printed, nothing executed"
+elif [ "$RT_INVALID" = 1 ]; then
+    die "a RATE phase ran shorter than RT=$RT s on the cloud venue — the row(s) marked INVALID(sub-RT) in $ROWS_FILE are burst rows, not results (every other law's evidence is kept in $ROWDIR)"
 else
     log "ALL ROW SETS PUBLISHED — $ROWS_FILE (labels, tables, verdicts); snapshots + fsck transcripts in $ROWDIR"
 fi

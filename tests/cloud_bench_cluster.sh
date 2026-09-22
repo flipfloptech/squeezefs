@@ -243,10 +243,19 @@ SYM_TAR_SRC="${SYM_TAR_SRC:-}"             # the gate-2 corpus DIRECTORY (<linux
 SYM_TARBALL="${SYM_TARBALL:-}"             # …or a pre-made tarball (wins over SYM_TAR_SRC)
 SYM_RT="${SYM_RT:-60}"                     # the sustained window per measured phase
                                            # (the AGENTS.md rule; the local scoping pass
-                                           # runs 10)
-SYM_FILES="${SYM_FILES:-40000}"            # per-writer creates (the matrix's default)
+                                           # runs 10). On the cloud venue a RATE phase
+                                           # shorter than this is INVALID (the driver's
+                                           # --size-to-rt=auto pilot sizes the phases to
+                                           # fill it; a burst row is a failed row)
+SYM_FILES="${SYM_FILES:-40000}"            # per-writer creates — a FLOOR: the driver's
+                                           # N = 1 pilot sizes the create phase to SYM_RT
 SYM_THREADS="${SYM_THREADS:-4}"            # storm threads per writer node
-SYM_INGEST_MB="${SYM_INGEST_MB:-1024}"     # per-writer ingest MiB (4 MiB blocks, fsync)
+SYM_INGEST_MB="${SYM_INGEST_MB:-1024}"     # per-writer ingest MiB (4 MiB blocks, fsync) —
+                                           # a FLOOR, sized to SYM_RT by the pilot up to
+                                           # SYM_INGEST_CAP_MB
+SYM_INGEST_CAP_MB="${SYM_INGEST_CAP_MB:-65536}"  # the pilot's per-writer ingest ceiling
+                                           # (8 writers x 64 GiB fits the 2 x 1,875 GB
+                                           # data namespaces)
 SYM_SCALE_NS="${SYM_SCALE_NS:-}"           # gate 3's N ladder; EMPTY = 1,2,4,8 capped at N_CLIENT
 SYM_ROWS="${SYM_ROWS:-tarx,shared,scale}"  # the row sets bench-sym runs, in
                                            # this order (the -ls half's token
@@ -1660,6 +1669,8 @@ sym_preflight() {
   [[ "$SYM_THREADS" =~ ^[0-9]+$ ]] && [ "$SYM_THREADS" -ge 1 ] || die "SYM_THREADS must be an integer >= 1 (got: $SYM_THREADS)"
   [[ "$SYM_INGEST_MB" =~ ^[0-9]+$ ]] && [ "$SYM_INGEST_MB" -ge 4 ] && [ $((SYM_INGEST_MB % 4)) -eq 0 ] \
     || die "SYM_INGEST_MB must be a multiple of 4 MiB >= 4 (got: $SYM_INGEST_MB)"
+  [[ "$SYM_INGEST_CAP_MB" =~ ^[0-9]+$ ]] && [ "$SYM_INGEST_CAP_MB" -ge "$SYM_INGEST_MB" ] \
+    || die "SYM_INGEST_CAP_MB must be an integer >= SYM_INGEST_MB (got: $SYM_INGEST_CAP_MB)"
   [ -z "$SYM_SCALE_NS" ] || [[ "$SYM_SCALE_NS" =~ ^[0-9]+(,[0-9]+)*$ ]] || die "SYM_SCALE_NS must be a comma-separated N list (got: $SYM_SCALE_NS)"
 }
 
@@ -2162,6 +2173,7 @@ EOS
   local -a drv=("$driver"
     "--rows=$SYM_ROWS" "--rt=$SYM_RT" "--files=$SYM_FILES" "--threads=$SYM_THREADS" "--ingest-mb=$SYM_INGEST_MB"
     "--scale-ns=$ns" "--sqz=$REMOTE_DIR/squeezefs" "--rowdir=$BENCH_DIR/sym-rows" "--venue=cloud"
+    "--size-to-rt=auto" "--ingest-cap-mb=$SYM_INGEST_CAP_MB"
     "--substrate=$substrate" "--cluster=$CID" "--format=--symmetric cache-less (no --disk-cache-paths)" "--ssh-key=$SSH_KEY_FILE" "--ssh-user=$REMOTE_USER"
     "--mount-hook=$SCRIPT_PATH sym-hook --preset $PRESET --symmetric --cluster-id $CID"
     "--manager-priv=$(node_priv "${clients[0]}")" "--remote-dir=$REMOTE_DIR/sym-rows")

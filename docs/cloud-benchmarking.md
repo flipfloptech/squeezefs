@@ -256,9 +256,15 @@ change a threshold there and both venues move together). The row set:
 
 After every row set: `squeezefs fsck <manager mount> --json` (findings 0),
 `meta_kv_block_refs_drift == 0`, `data_alloc_bitmap_drift == 0` and the
-must-stay-0 set on every writer. Every measured phase runs ≥ `SYM_RT`
-seconds (default 60 — the sustained-state rule; a shorter phase is warned
-as under-sized); the local scoping pass runs `--rt=10`. The design's
+must-stay-0 set on every writer. **Every RATE phase runs ≥ `SYM_RT` seconds**
+(default 60 — the sustained-state rule): on the cloud venue the driver's
+`--size-to-rt=auto` pilot (an N = 1 create storm + a 256 MiB ingest on the
+manager, then a small shared-dir wave) sizes `--files`, `--ingest-mb` (up
+to `SYM_INGEST_CAP_MB`) and the shared row's per-creator count so each
+phase fills RT with 25 % headroom, and a phase that still reads shorter is
+**INVALID** (the row's verdict word; the driver exits nonzero after its row
+sets, every other law's evidence kept) — a burst row is a failed row, never
+a warning. The local scoping pass runs `--rt=10 --size-to-rt=off` (a warn). The design's
 "vs today" **A arm** (the shipped authority + co-writers at the same N on
 the same binary) is **not built** in PR 15 — this rig has no per-node
 co-writer recipe (the v5-mw recipe is co-located on client0) — and

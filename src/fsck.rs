@@ -772,6 +772,18 @@ pub struct FsckCounters {
     /// concurrent creates, and its growth is the proof the shield is
     /// doing work rather than sitting vacuous.
     pub current_era_exempted: u64,
+    /// C9: unnamed prior-era candidates an OPEN cross-volume plan NAMES
+    /// (PR 13e review round 2, Issue 10 — the inode plane's in-flight
+    /// exemption for C9, C10's `open_intent_inos` read by the evaluate AND
+    /// the confirm): a cross-owner create commits the child's record before
+    /// its `InsertDentry` ships, and a ship the holder refuses leaves the
+    /// intent OPEN for the roll-forward cadence; once the child's slot
+    /// reads UNLEASED (its lessee released or left) tree 0 makes the record
+    /// a prior-era candidate with no name — the roll-forward's object, never
+    /// C9's, until the intent retires. 0 on a healthy set; growth = plans
+    /// left open at census time (read beside `xv_cross_owner_intents_open`
+    /// / `_stuck`).
+    pub unreferenced_intent_exempted: u64,
     /// C10: inos named MORE THAN ONCE that the name counting tracked — the
     /// counting extension's engagement gauge (0 on a tree with no hardlinks
     /// and no damage, which is why the class costs nothing there).
@@ -2223,6 +2235,7 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         // its own residue, so both of these sum (disjoint by residue).
         counters.dentry_refs_indexed += r.counters.dentry_refs_indexed;
         counters.current_era_exempted += r.counters.current_era_exempted;
+        counters.unreferenced_intent_exempted += r.counters.unreferenced_intent_exempted;
         // C10: every shard judges its own ino residue, so these sum too.
         counters.nlink_names_counted += r.counters.nlink_names_counted;
         counters.nlink_mismatch_high += r.counters.nlink_mismatch_high;
@@ -2363,6 +2376,7 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     // double-count every owner's findings.
     dst.dentry_refs_indexed += fin.dentry_refs_indexed;
     dst.current_era_exempted += fin.current_era_exempted;
+    dst.unreferenced_intent_exempted += fin.unreferenced_intent_exempted;
     dst.nlink_names_counted += fin.nlink_names_counted;
     dst.nlink_mismatch_high += fin.nlink_mismatch_high;
     dst.nlink_mismatch_low += fin.nlink_mismatch_low;
@@ -2665,6 +2679,7 @@ pub async fn run_fleet(
                         let mut c = FsckCounters {
                             dentry_refs_indexed: r.counters.dentry_refs_indexed,
                             current_era_exempted: r.counters.current_era_exempted,
+                            unreferenced_intent_exempted: r.counters.unreferenced_intent_exempted,
                             nlink_names_counted: r.counters.nlink_names_counted,
                             nlink_mismatch_high: r.counters.nlink_mismatch_high,
                             nlink_mismatch_low: r.counters.nlink_mismatch_low,
@@ -3092,6 +3107,7 @@ fn admit_inode_plane_proposals(
         c.nlink_names_counted = 0;
         c.nlink_transient_cleared = 0;
         c.current_era_exempted = 0;
+        c.unreferenced_intent_exempted = 0;
         c.inode_plane_volumes_covered = 0;
         c.findings = r.findings.len() as u64;
         r.inode_plane_covered.clear();
@@ -3140,6 +3156,7 @@ fn fold_worker_counters(dst: &mut FsckCounters, src: &FsckCounters) {
     dst.nodes_walked = dst.nodes_walked.max(src.nodes_walked);
     dst.dentry_refs_indexed += src.dentry_refs_indexed;
     dst.current_era_exempted += src.current_era_exempted;
+    dst.unreferenced_intent_exempted += src.unreferenced_intent_exempted;
     dst.nlink_names_counted += src.nlink_names_counted;
     dst.nlink_mismatch_high += src.nlink_mismatch_high;
     dst.nlink_mismatch_low += src.nlink_mismatch_low;
@@ -7319,6 +7336,8 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.dentry_refs_indexed, Ordering::Relaxed);
     m.fsck_current_era_exempted
         .fetch_add(c.current_era_exempted, Ordering::Relaxed);
+    m.fsck_unreferenced_intent_exempted
+        .fetch_add(c.unreferenced_intent_exempted, Ordering::Relaxed);
     m.fsck_nlink_names_counted
         .fetch_add(c.nlink_names_counted, Ordering::Relaxed);
     m.fsck_nlink_mismatch_high

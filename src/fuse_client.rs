@@ -6535,6 +6535,11 @@ pub struct Metrics {
     /// the inode plane); growth under concurrent creates is the proof it
     /// is doing work.
     pub fsck_current_era_exempted: Align64<AtomicU64>,
+    /// C9: unnamed prior-era candidates an OPEN cross-volume plan names —
+    /// the inode plane's in-flight exemption for C9 (PR 13e review round
+    /// 2, Issue 10; C10's `open_intent_inos` read by C9 too). 0 on a
+    /// healthy set; growth = plans open at census time.
+    pub fsck_unreferenced_intent_exempted: Align64<AtomicU64>,
     /// C10: inos named MORE THAN ONCE that the name counting tracked — the
     /// counting extension's engagement gauge (0 on a tree with no hardlinks
     /// and no damage, which is why the class costs nothing there).
@@ -11947,6 +11952,7 @@ impl SqueezefsFilesystem {
                 "fsck_foreign_lane_exempted": METRICS.fsck_foreign_lane_exempted.load(Ordering::Relaxed),
                 "fsck_dentry_refs_indexed": METRICS.fsck_dentry_refs_indexed.load(Ordering::Relaxed),
                 "fsck_current_era_exempted": METRICS.fsck_current_era_exempted.load(Ordering::Relaxed),
+                "fsck_unreferenced_intent_exempted": METRICS.fsck_unreferenced_intent_exempted.load(Ordering::Relaxed),
                 // C10 (inode-plane reference consistency). The last three
                 // findings gauges are the DATA-LOSS direction; `high` is
                 // the leak direction, and `transient_cleared` is the

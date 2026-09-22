@@ -10580,6 +10580,256 @@ async fn a_joiner_minted_orphan_is_a_c9_finding_at_the_offline_census_after_ever
     );
 }
 
+/// **PR 13e review round 2, Issue 10 — C9 exempts the inos an OPEN
+/// cross-owner plan names.** A cross-owner create commits the child's
+/// record (step 0, the creator's rotor) under one door token and SHIPS
+/// the `InsertDentry` afterwards; a ship the holder refuses leaves the
+/// intent OPEN for the roll-forward cadence and the record standing at
+/// `nlink 1` with no name. With tree 0 as C9's era witness (Issue 2) the
+/// child's slot reads UNLEASED the moment its lessee releases it (a forced
+/// shrink, a dominance handover, the creator's LEAVE), every record in it
+/// is a prior-era candidate, and the fresh dentry pass finds no name — so
+/// the first build REPORTED the child as C9 while the plan that names it
+/// stood, and `--repair` would have destroyed the record the roll-forward
+/// re-names (the roll-forward's insert then dangles: C10). C10 has had
+/// the open-intent exemption since its birth (`open_intent_inos`); C9 now
+/// reads the same set in its evaluate AND its confirm, counted on
+/// `unreferenced_intent_exempted`. Shape: the joiner ships two creates
+/// into the MANAGER's directory under `TEST_XV_SERVE_REFUSE` (the holder
+/// down before its commit — both intents open, both records at nlink 1
+/// with no name); `pending-b`'s intent record is then deleted AT ITS
+/// LESSEE with the name never landed — the kill-before-the-inverse window
+/// PR 6 leaves to the census, the shape C9 exists for; the joiner LEAVES
+/// (its rotor slot `Unleased` at tree 0), and the manager's inode-plane
+/// census must report `pending-b` ALONE: `pending-a` is exempted by its
+/// open intent (counted), never reported. Then the manager's cadence rolls
+/// `pending-a` FORWARD (an abandoned intent with no live owner here): its
+/// name lands under `shared`, the census reads it named and exempts
+/// nothing, `pending-b` stays the finding. The offline probe after the
+/// manager leaves agrees. RED on the branch: BOTH children reported at
+/// the first census (`--repair` would have destroyed `pending-a`'s record,
+/// the one the roll-forward re-names).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cross_owner_creates_child_is_never_a_c9_finding_while_its_intent_stands() {
+    use squeezefs::meta_backend::crossvol_tx::{
+        cross_owner_stats, intent_key_at, roll_forward_open_intents, IntentRecord, XvStep,
+        TEST_XV_SERVE_REFUSE,
+    };
+    use squeezefs::meta_backend::kv::record::TREE_XATTRS;
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mvenue = DaemonVenue::stand_up(&manager, true, "manager-c9-intent").await;
+    let midentity = page_of(&uris[0], &mvol, 0).await.expect("page 0").identity;
+    // The MANAGER holds `shared` (its first touch).
+    manager
+        .create(shared, "m0", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap();
+    let joiner = {
+        Knobs::armed().apply();
+        let r = open_routed_meta_set_joined(
+            &uris,
+            &JoinedSetAdmission {
+                manager_endpoint: mvenue.endpoint.clone(),
+                secret: VENUE_SECRET.to_vec(),
+                peer_id: peer_of(&joiner_identity(&mvol, 74).await),
+                identity: joiner_identity(&mvol, 74).await,
+            },
+        )
+        .await;
+        Knobs::clear();
+        r.expect("the joined open")
+    };
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jid = jvol.appender_stats().unwrap().appender_id;
+    let jidentity = jvol.joined_wire().unwrap().identity;
+    let jvenue = DaemonVenue::stand_up(&joiner, false, "joiner-c9-intent").await;
+    mvol.slot_leases()
+        .unwrap()
+        .holders
+        .set_endpoint(jid, &jvenue.endpoint);
+    let _jarm = stand_up_initiator(&joiner, &jidentity).await;
+    // A control: a joiner-minted child whose name LANDED at the manager.
+    let landed = joiner
+        .create(shared, "landed", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("a joiner's create into the manager's directory")
+        .ino;
+    let s0 = cross_owner_stats();
+    // Two creates whose ship the holder refuses BEFORE its commit: the
+    // child records stand in the joiner's rotor, the intents stay OPEN.
+    TEST_XV_SERVE_REFUSE.store(true, Ordering::SeqCst);
+    for name in ["pending-a", "pending-b"] {
+        let e = joiner
+            .create(shared, name, libc::S_IFREG | 0o644, 1000, 1000)
+            .await
+            .expect_err("the holder refused before committing");
+        assert!(
+            !joiner.disabled_volumes.contains_key(&0),
+            "a refused ship never fail-stops the initiator: {e}"
+        );
+    }
+    TEST_XV_SERVE_REFUSE.store(false, Ordering::SeqCst);
+    assert_eq!(
+        cross_owner_stats().intents_open - s0.intents_open,
+        2,
+        "both intents stay open for the roll-forward"
+    );
+    // The children's inos and tx ids, off the intent records themselves.
+    let mut pending: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+    for (_home, tx_id, image) in jvol.xv_scan_intents_homed().await.unwrap() {
+        let rec = IntentRecord::decode(&image).expect("an intent record");
+        for step in &rec.steps {
+            if let XvStep::InsertDentry { name, child, .. } = step {
+                pending.insert(name.clone(), (*child, tx_id));
+            }
+        }
+    }
+    assert_eq!(
+        pending.keys().cloned().collect::<Vec<_>>(),
+        vec!["pending-a".to_string(), "pending-b".to_string()],
+        "the two open intents name the two children"
+    );
+    let (pending_a, _tx_a) = pending["pending-a"];
+    let (pending_b, tx_b) = pending["pending-b"];
+    for (name, (ino, _)) in &pending {
+        let (_v, local) = joiner.route_ino(*ino);
+        assert_eq!(
+            jvol.read_inode_value_routed(local)
+                .await
+                .unwrap()
+                .map(|v| v.nlink),
+            Some(1),
+            "{name}: the child's record stands at nlink 1 with no name"
+        );
+        assert!(
+            manager.lookup(shared, name).await.is_err(),
+            "{name}: the name never landed at the holder"
+        );
+    }
+
+    // `pending-b`'s intent retired at its LESSEE with the name NEVER
+    // landing (the kill-before-the-inverse window): the record is C9's
+    // object from here — the roll-forward can no longer name it.
+    let home_b = jvol
+        .xv_scan_intents_homed()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(_, tx, _)| *tx == tx_b)
+        .map(|(home, _, _)| home)
+        .expect("pending-b's intent at its home");
+    jvol.delete_kind(TREE_XATTRS, &intent_key_at(home_b, tx_b))
+        .await
+        .expect("retire the intent without its inverse");
+    jvol.checkpoint_now().await.unwrap();
+
+    // The creator LEAVES with `pending-a`'s intent open: its rotor slot
+    // goes Unleased at tree 0 — every record in it a prior-era candidate.
+    squeezefs::data_grant::disarm_slot_custody().await;
+    squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    jvenue.tear_down();
+    let slot_a = slot_of_global(&manager, pending_a);
+    assert!(
+        matches!(
+            tree0_state(&mvol, slot_a).await,
+            Some(SlotState::Unleased { .. })
+        ),
+        "the children's slot {slot_a} is unleased after the creator's leave"
+    );
+    let c9_naming = |report: &squeezefs::fsck::FsckReport, ino: u64| {
+        report
+            .findings
+            .iter()
+            .any(|f| f.class == "C9" && f.object.contains(&ino.to_string()))
+    };
+
+    // (1) The census: `pending-a`'s intent STANDS — never a finding;
+    // `pending-b`'s is gone with its name never landed — the finding.
+    let report = inode_plane_over(&manager).await;
+    assert!(
+        !c9_naming(&report, pending_a),
+        "a child an OPEN cross-owner plan names is never a C9 finding (RED: reported, and \
+         --repair would destroy the record the roll-forward re-names): {:?}",
+        report.findings
+    );
+    assert!(
+        c9_naming(&report, pending_b),
+        "with its intent gone and its name never landed, pending-b IS the orphan C9 exists \
+         for: {:?}",
+        report.findings
+    );
+    assert!(!c9_naming(&report, landed), "the landed child is named");
+    assert_eq!(
+        report.counters.unreferenced_intent_exempted, 1,
+        "pending-a was exempted by its open intent, counted"
+    );
+    assert_eq!(report.counters.current_era_exempted, 0);
+
+    // (2) The manager's cadence rolls `pending-a` FORWARD (an abandoned
+    // intent with no live owner in this process): the name lands.
+    let _marm = stand_up_initiator(&manager, &midentity).await;
+    let rolled = roll_forward_open_intents(&manager)
+        .await
+        .expect("the roll-forward over the manager's own directory");
+    assert_eq!(rolled, 1, "exactly pending-a's intent rolled forward");
+    assert_eq!(
+        manager
+            .lookup(shared, "pending-a")
+            .await
+            .expect("named now")
+            .ino,
+        pending_a,
+        "the roll-forward landed the name the census waited for"
+    );
+    // No durable intent stands (the register still remembers the RAW-
+    // deleted `pending-b` plant as abandoned — the plant bypassed the
+    // retirement protocol; a real retirement removes it, so the register
+    // read `s0 + 1` here is the plant's, not the product's).
+    assert!(
+        mvol.xv_scan_intents_homed().await.unwrap().is_empty(),
+        "no intent record stands after the roll-forward"
+    );
+    assert_eq!(
+        cross_owner_stats().intents_open - s0.intents_open,
+        1,
+        "pending-a's intent retired through the register; pending-b's raw plant stays"
+    );
+    let report = inode_plane_over(&manager).await;
+    assert!(!c9_naming(&report, pending_a), "named: no finding");
+    assert!(
+        c9_naming(&report, pending_b),
+        "the retired-unnamed one stays the finding"
+    );
+    assert_eq!(
+        report.counters.unreferenced_intent_exempted, 0,
+        "nothing left to exempt"
+    );
+
+    // The offline probe after the manager leaves agrees: exactly pending-b.
+    squeezefs::data_grant::disarm_slot_custody().await;
+    squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
+    mvenue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    let report = fsck_offline(&uris).await;
+    let c9: Vec<_> = report.findings.iter().filter(|f| f.class == "C9").collect();
+    assert_eq!(c9.len(), 1, "exactly pending-b: {:?}", report.findings);
+    assert!(c9[0].object.contains(&pending_b.to_string()));
+    assert_eq!(report.counters.current_era_exempted, 0);
+    assert_eq!(report.counters.unreferenced_intent_exempted, 0);
+}
+
 // ---------------------------------------------------------------------------
 // PR 13e — F-R4 (record §3.9.4.3): a create into a directory whose slot
 // MOVES to the creator mid-plan answered `ENOENT` once on the box.

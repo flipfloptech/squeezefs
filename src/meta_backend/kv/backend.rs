@@ -13724,7 +13724,9 @@ impl KvMetaBackend {
             {
                 crate::meta_ship::token_plane::note_reader_root_projection_serve();
                 log::warn!(
-                    "meta volume {}: the mount root's attrs served from the local projection —                      the token plane answered a transient wire class ({e}); every child resolve                      stays under the token law (dlm_token_root_projection_serves)",
+                    "meta volume {}: the mount root's attrs served from the local projection — \
+                     the token plane answered a transient wire class ({e}); every child resolve \
+                     stays under the token law (dlm_token_root_projection_serves)",
                     self.path.display()
                 );
             }

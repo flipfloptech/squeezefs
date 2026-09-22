@@ -4190,7 +4190,7 @@ leg_mw_scale() {
     rowdir="$STATE/rows/mwscale-$(date +%s)"
     mkdir -p "$rowdir"
     log "mw-scale (gate 3's A arm — the SHIPPED authority + co-writers): N ∈ {${ns[*]}} RW mounts (the authority + N − 1 co-writers) each creating $SYM_FILES files ($SYM_THREADS threads) in its OWN directory, then ingesting $SYM_INGEST_MB MiB (4 MiB blocks, conv=fsync)"
-    printf '%-4s %-10s %-8s %-9s %-10s %-8s %-8s %-9s %-9s %-8s %s\n' N CREATE_S RATIO C/CPU-S INGEST_MBS RATIO MGR_CPU SHIPPED SERVED PUB_SHIP VERDICT | tee "$rowdir/mwscale-table.tsv"
+    printf '%-4s %-10s %-8s %-9s %-10s %-8s %-8s %-9s %-8s %-9s %-8s %s\n' N CREATE_S RATIO C/CPU-S INGEST_MBS RATIO MGR_CPU SHIPPED INTENTS SERVED PUB_SHIP VERDICT | tee "$rowdir/mwscale-table.tsv"
     local n rate1="" ingest1="" verdict_all=MET
     local MW_RUN
     MW_RUN="$(date +%s)"
@@ -4249,11 +4249,19 @@ print(int(b)-int(a))" 2>/dev/null || echo 0)"
         cpu1="$(sym_cpu_ticks 0)"
         sleep 3 # the co-writers' shipped verbs and publishes land at the authority
         for idx in "${writers[@]}"; do snap "$idx" "n${n}1" "$rowdir"; done
-        # THE ENGAGEMENT LAW: the ship ledgers close at both ends.
-        local shipped=0 pub_shipped=0 served pub_served refusals lcr=0 v
+        # THE ENGAGEMENT LAW: the ship ledgers close at both ends. A
+        # co-writer's creates ride the S10 create-INTENT lane, whose
+        # client counts them on `meta_ship_intent_verbs` (never
+        # `shipped_verbs`) while the owner's `served_verbs` counts every
+        # verb it executed for a peer, intents included — so the client
+        # side of the closure is shipped + intent verbs (the box re-run's
+        # first N = 2 row read 131,156 + 8,192 ≡ 139,347 served).
+        local shipped=0 intents=0 pub_shipped=0 served pub_served refusals lcr=0 v
         for idx in "${writers[@]:1}"; do
             v="$(sym_delta "$rowdir" "$idx" "n$n" meta_ship.shipped_verbs)"
             shipped=$((shipped + v))
+            v="$(sym_delta "$rowdir" "$idx" "n$n" meta_ship_intent.meta_ship_intent_verbs)"
+            intents=$((intents + v))
             v="$(sym_delta "$rowdir" "$idx" "n$n" meta_ship_publish.shipped)"
             pub_shipped=$((pub_shipped + v))
             v="$(sym_delta "$rowdir" "$idx" "n$n" cowriter.local_commit_refusals)"
@@ -4262,11 +4270,11 @@ print(int(b)-int(a))" 2>/dev/null || echo 0)"
         served="$(sym_delta "$rowdir" 0 "n$n" meta_ship.served_verbs)"
         pub_served="$(sym_delta "$rowdir" 0 "n$n" meta_ship_publish.served)"
         refusals="$(stat_field 0 meta_ship_publish.refusals)"
-        local skew=$((4 * (n - 1)))
+        local skew=$((4 * (n - 1))) client_side=$((shipped + intents))
         if [ "$n" -gt 1 ]; then
             [ "$shipped" -gt 0 ] || die "mw-scale N=$n: shipped_verbs delta 0 — the row did not engage the S8 plane"
-            [ $((shipped - served)) -le "$skew" ] && [ $((served - shipped)) -le "$skew" ] ||
-                die "mw-scale N=$n: ships that don't account — co-writers shipped=$shipped vs authority served=$served (skew allowed ±$skew)"
+            [ $((client_side - served)) -le "$skew" ] && [ $((served - client_side)) -le "$skew" ] ||
+                die "mw-scale N=$n: ships that don't account — co-writers shipped=$shipped + intent verbs=$intents = $client_side vs authority served=$served (skew allowed ±$skew)"
             [ $((pub_shipped - pub_served)) -le "$skew" ] && [ $((pub_served - pub_shipped)) -le "$skew" ] ||
                 die "mw-scale N=$n: publish ships that don't account — shipped=$pub_shipped vs served=$pub_served"
         fi
@@ -4283,7 +4291,7 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t_row0):.0f}')")"
         ir="$(python3 -c "print(f'{$ingest_rate/$ingest1:.2f}')")"
         verdict="$(python3 -c "print('MET' if $create_rate >= 0.7*$n*$rate1 and $ingest_rate >= 0.7*$n*$ingest1 else 'MISS')")"
         [ "$verdict" = "MET" ] || verdict_all=MISS
-        printf '%-4s %-10s %-8s %-9s %-10s %-8s %-8s %-9s %-9s %-8s %s\n' "$n" "$create_rate" "${cr}x" "$creates_per_cpu_s" "$ingest_rate" "${ir}x" "${mgr_cpu}%" "$shipped" "$served" "$pub_shipped" "$verdict" | tee -a "$rowdir/mwscale-table.tsv"
+        printf '%-4s %-10s %-8s %-9s %-10s %-8s %-8s %-9s %-8s %-9s %-8s %s\n' "$n" "$create_rate" "${cr}x" "$creates_per_cpu_s" "$ingest_rate" "${ir}x" "${mgr_cpu}%" "$shipped" "$intents" "$served" "$pub_shipped" "$verdict" | tee -a "$rowdir/mwscale-table.tsv"
         for idx in "${writers[@]}"; do
             rm -rf "$(mnt_of "$idx")/mwscale-$MW_RUN-n$n-w$idx" 2>/dev/null || true
         done

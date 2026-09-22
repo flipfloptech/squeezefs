@@ -1476,6 +1476,104 @@ store_bytes` 0.92× + `durable_upload_bytes_escalation` 0.16× +
 bytes` 0.17× user of device READS (`write_path_seed_read_bytes` 0),
 `block_grant_topups` 46, 0 reclaim commands.
 
+##### 3.9.4.3 Gate 3c — `sym-foreign-touch`, two positions on fresh fleets (13:07 → 13:25 UTC): **the LIVE law MET as a VERDICT both positions (192 ships / 0 handovers — F-B2's fix holds on the box); IDLE moved after 4 / 5 bursts in 7.5 / 6.7 ms; PAUSED never dominated; position 2 RED at its oracle on F-B1 (1,116 ms); and TWO product findings on the cross-owner path (F-R3, F-R4)**
+
+| position | LIVE (3 bursts × 64 into the live holder's tree) | IDLE (bursts of 64 at the 10 s beat until the handover) | `slot_handover_phase_ns` (the departing holder) | PAUSED (3 single touches over 3 × 5 s inside the half-window) | own create rate (A) | oracle |
+|---|---|---|---|---|---|---|
+| r1 (13:07) | **192 ships, 0 handovers** ✓ | handed over after **4 bursts** (50.3 s; 238 ships, 2 offers), 0.020 handovers/s | **7.48 ms** = flush 3.99 / tree 0 3.36 / page 0.13 / grant 0 | **kept its tree** (handovers 0; idle offers +1, dominated 0) ✓ | 5,047 c/s | clean (fsck 0, C8 0, must-stay-0 flat) |
+| r2 (13:16) | **192 ships, 0 handovers** ✓ | handed over after **5 bursts** (63.7 s; 320 ships, 1 offer), 0.016 handovers/s | **6.67 ms** = flush 2.04 / tree 0 4.49 / page 0.13 | moved by the IDLE arm (handovers 1 with idle offers +1, dominated 0 — the law "no DOMINATED offer against a live holder" holds; §7 item 10's premise class: a SIGSTOPped job writes nothing in the window) ✓ | 5,342 c/s | **RED — F-B1: m60 `appender_flush_ceiling_overruns` 1** |
+
+`N_floor(A)` seeded 2 on the box both positions (the value under which
+§3.9.2 read the LIVE handover), beat 10 s. **F-B2 — the box's verdict on
+the fix: MET** — 384 touches into a LIVE holder's tree across two fleets,
+0 handovers (63/64 → 64/64 evaluations BUSY); the subtree law credited
+the storm under `job-w60/live/r*` to `job-w60`'s slot as designed.
+
+**F-B1 (position 2's oracle)** — m60's kept daemon log at 13:19:26,
+inside the LIVE storm: `flush ceiling OVERRUN — appender region(s)
+[(1, 1116)] (id, oldest dirty leaf's age in ms at the covering barrier)
+exceeded the 1100 ms landing ceiling with every structural hold's capped
+overlap excluded` — 16 ms past the ceiling with NOTHING excluded (the
+same class §3.9.4.2 read four times on the scale fleet); the leg's
+`sym_zero_set` at the oracle judges the ABSOLUTE gauge and RED'd the
+position (the LIVE / IDLE / PAUSED laws had already printed their
+verdicts). The row set's two positions stand.
+
+**F-R3 — PRODUCT FINDING (the ARMED plane — PR 6's cross-owner unlink ×
+PR 12b's N daemons; both positions, named by the kept daemon logs the
+driver keeps since H-R2):** *every* cross-owner UNLINK of a child ANOTHER
+appender minted judges the child "no inode record". m60's end-of-leg
+`rm -rf /mnt/…/m60/job-w60` logged **430 (r1) / 512 (r2)** lines of
+`cross-volume unlink of "touch-live-r…" / "touch-idle-r…" in parent 132:
+child ino 53086xx has no inode record — removing the dangling name and
+accounting nothing (run squeezefs fsck)` — exactly the 192 + 238 / 192 +
+320 touches m61 CREATED into m60's directory (m61's children live in
+m61's rotor slot — PR 6 mints in the creator's rotor); m0 logged 3 (the
+paused-phase touches into its `job-w0`); m61 logged 0. The plan builder
+`RoutedMetaBackend` (`src/meta_backend/mod.rs:5499`) reads the child's
+`(pre, post)` nlink witness with `read_inode_value_routed(local_child)`
+— `KvMetaBackend::read_inode_value`, a LOCAL KV read — and on a slot
+another appender LEASES that is this daemon's PROJECTION of the lessee's
+tree, which by KD-SYM-3 never sees the leased root (it rides the
+lessee's page) — so the witness reads `None`, the `SetNlink` step is
+DROPPED, the `RemoveDentry` step ships and lands, and the child stays
+`nlink 1` with zero names at its creator: **one orphaned inode per
+cross-owner unlink of a foreign-minted child — 430 / 512 leaked inode
+records (+ their slot-tree bytes) in this leg alone**, and `rm -rf`
+reports success. PR 6's stated deviation (3) — "the plan's foreign READS
+are exact in one process and the S5 projection on the wire until PR 5's
+tokens" — was never closed for the unlink witness on the N-daemon fleet
+(PR 12b's writer read divert covers `token_reader_for`'s five verbs, not
+`read_inode_value_routed`). **fsck cannot see it while the lessee lives**:
+the inode plane scopes out live foreign lessees' slots (PR 12b round 1,
+`fsck_inode_plane_foreign_dentry_scoped`), so both positions' oracles
+read `findings: 0` over hundreds of orphans; the manager's `stat` of a
+removed name through m60 would read `ENOENT` (the name IS gone) — the
+loss is the creator's inode + its blocks, invisible until the lessee
+leaves and the next census walks its tree. Fix shape (PR 14 — a rung
+item, reported not fixed): the witness read through the writer's read
+divert (`writer_read_plane_for` — the holder's token plane, one grant)
+or a `LookupExact`-class verb at the child's holder; the unlink path's
+"dangling name" arm should refuse to drop the count step for a child
+whose slot another LIVE appender leases. Pin shape: the two-backend
+fixture — a joiner creates into the manager's directory, the manager
+unlinks, the child's record at the joiner must read `nlink 0` (or be
+destroyed), fsck's C9 over the joiner's tree after its leave 0.
+
+**F-R4 — PRODUCT FINDING (r1; PR 6 × PR 4's handover — defects 29 / 30's
+family):** create #46 of the IDLE burst that TRIGGERED the handover
+answered **`ENOENT` to the application** — `create touch-idle-r4-46:
+[Errno 2] No such file or directory: /mnt/…/m61/job-w60/touch-idle-r4-
+0000046` at 13:08:27, the instant m60 logged `slot 131 released by
+appender 1 (g 1, root 0x3400000, cursor 44, 3 extents) — flush 3987 µs,
+page 134 µs, tree 0 3356 µs` and m61 logged five `the manager answered
+NotHolder { 0 } for object 144036023238658 — this joiner's lease
+projection lagged the manager's checkpoint; retried at the holder the
+manager named`. The requester's create into the moving directory was
+answered by the OLD holder's live-witness refusal after its release
+(`ENOENT` — the parent no longer in m60's leased set) and surfaced as
+the op's errno instead of re-dispatching (the `SlotBusy` / stale-holder
+classes defects 29 / 30 / 35 made retryable; an `ENOENT` witness for a
+directory that EXISTS at its new holder is the same class wearing the
+wrong word). Once in 558 touches across the two positions (the 46
+creates before it in that burst succeeded — and are F-R3's orphans).
+
+##### 3.9.4.4 Gate 5 — `sym-readers`, the 1 × 31 broadcast on the 32-member fleet, two positions on fresh fleets (13:26 → 13:33 UTC): **MET on every law, both positions — F-B3's fix is a VERDICT on the box: the fleet that could not form on PR 13b FORMS (the manager's listener at `max 512 connections`, `RLIMIT_NOFILE soft raised 1024 → 262144`), exactness 0 misses over 31 readers, `dlm_token_recalls` 155 ≡ 5 × 31, recall RTT 300 µs, `free_grace_hold_ms` 0 under tokens**
+
+| position | fleet | exactness (create / rename / setattr at the NEXT resolve, 31 readers) | broadcast (5 publishes × 31 holders) | recall RTT (the writer's `dlm_token_recall_rtt_ns`, exact-sum) | token grant RTT (Σ 31 readers, the leg) | free-grace | oracle |
+|---|---|---|---|---|---|---|---|
+| r1 (13:28) | 1 manager + 1 joined writer (m60) + 31 `-o ro` token readers, `FLEET_SHARE=32`; the manager's listener `max 512 connections` | **0 misses** | **`dlm_token_recalls` 155 ≡ 155**, acks 155, readers received 155 / acked 155, `fanout_p99` 32 (= the 31-reader bucket edge, `fanout_p50` 32), **`timeouts_live` 0** | mean **299.6 µs** = send 157 / drain 90 / ack 53; p50 ≤ 512 µs, p99 ≤ 512 µs (n = 5 batches) | 31 grants, mean 99 µs, p50 ≤ 128 µs, **p99 ≤ 512 µs** (the log-bucket edges) | `free_grace_recall_gated_frees` 5 (the row) / 8 (the leg) — every displaced block published DIRECTLY; `free_grace_hold_ms` **0**, deferrals ≡ releases + offsets = 0; the S5 composite was 2,724 ms | clean (fsck 0, C8 0, must-stay-0 flat on both writers) |
+| r2 (13:31) | fresh fleet, same shape | **0 misses** | **155 ≡ 155**, acks 155, `fanout_p99` 32, `timeouts_live` 0 | mean **300.3 µs** | 31 grants | `recall_gated_frees` 5, hold 0 | clean |
+
+`reader_staleness_bound_ms` **0** on all 31 readers both positions
+(R-SYM-4), `dlm_token_reader_holder_planes` 1 per volume per reader,
+each reader's `.stats` readable (the F-B3 `.stats` EINVAL closed), 95 /
+94 s per position incl. the exactness + broadcast + free-grace legs, the
+32-member fleet formed in ≈ 3 min each time. **Gate 5 as the design
+states it reads MET on the box.** The design's "token grant p99 and
+recall-ack p99 at N = 32 members" are the bucket edges above (the
+histograms are log-bucketed by design; the exact means beside them).
+
 ## 4. Issues found (each with its PR and its red pin)
 
 ### 4.1 Fixed on this branch

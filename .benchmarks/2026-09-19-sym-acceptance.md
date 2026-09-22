@@ -3602,10 +3602,14 @@ lost. **Fix (`9c1794ef`):** `xv_serve_step` checks the lease FIRST and
 again inside the `InsertDentry` arm's refusal — a served step for a slot
 this holder does not lease is the typed `RefusalClass::SlotMoved { slot,
 holder }` (EAGAIN on the wire) naming tree 0's lessee, never the op's
-errno; `apply_or_ship_step_retrying` reports whether the step SHIPPED, and
-`execute` classifies a witness refusal as the op's errno only when it was
-judged HERE or at a holder that still leases the slot (the slot-moved
-class re-resolves through tree 0 and re-dispatches — defect 29's arm).
+errno; `apply_or_ship_step` answers the arm it TOOK beside the outcome
+(`Dispatch::{Local, Shipped}` — review round 1, Issue 3: the first build
+read a `step_home` word AHEAD of the dispatch, a two-read window in which
+a release landing between them dispatched SHIPPED under a `Local` word),
+the retrying wrapper passes it through, and `execute` (and `recover_one`)
+classify a witness refusal as the op's errno only when it was judged HERE
+or at a holder that still leases the slot (the slot-moved class
+re-resolves through tree 0 and re-dispatches — defect 29's arm).
 Beside it, `install_wire_grant` adopts the transferred tree
 (`adopt_transferred_slot_tree`) BEFORE it names the new lessee in the
 RAM table (the first order let a served step on the new holder read the

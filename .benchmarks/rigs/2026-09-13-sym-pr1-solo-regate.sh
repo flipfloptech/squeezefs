@@ -17,6 +17,16 @@
 # Δinvariant_tripwires, Δfsck_findings, the meta_kv journal / checkpoint /
 # node-append deltas, and the PR-1 forest gauges (0 on every flat mount).
 #
+# RT: the measured fio window per row (default 60 s + the job files' 10 s
+# ramp). Until 2026-09-22 the CLI `--runtime=$RT` was OVERRIDDEN by the job
+# files' own `runtime=30` (a job-section value wins over a CLI option given
+# after the job file), so the 2026-09-13 (PR 1) and 2026-09-22 (PR 13b)
+# brackets measured 30 s windows — comparable to each other and to the
+# campaign rows; `row()` now writes a per-row job copy carrying RT and
+# snapshots the data namespaces' /proc/diskstats beside the .stats pair
+# (acceptance record §3.9.1b). Rows run with this revision are NOT
+# window-comparable to those two brackets unless RT=30.
+#
 #   sudo env BIN_A=/scratch/tmp/sym-pr1/squeezefs-A \
 #            BIN_B=/scratch/tmp/sym-pr1/squeezefs-B \
 #            [SEQ="A B B A"] [RT=60] [ROWS="mdstorm mount wfresh-kern rr4k-kern rw4k-kern remount"] \
@@ -24,7 +34,7 @@
 #   sudo env BIN_B=... SEQ="S" OUT=<same dir> bash 2026-09-13-sym-pr1-solo-regate.sh   # the stamped leg
 #
 # Artifacts: $OUT/<arm><pos>-<row>.{stats0,stats1,procstat0,procstat1,
-# thermal0,thermal1,fio.json,fio.txt,dmesg,_bw.*.log}, $OUT/<arm><pos>.mount.*
+# diskstats0,diskstats1,job,thermal0,thermal1,fio.json,fio.txt,dmesg,_bw.*.log}, $OUT/<arm><pos>.mount.*
 # / .remount.* / .umount.time (the timed mount legs + their daemon logs +
 # the .stats census read at first mount), $OUT/<arm><pos>-mdstorm.{txt,row,
 # pre.json,post.json}, $OUT/reset-<arm><pos>.log, $OUT/format-<arm><pos>.log
@@ -88,16 +98,28 @@ PY
 
 row() {  # $1 = tag, $2 = jobfile, $3.. = extra fio args
   local tag="$1" jobfile="$2"; shift 2
-  echo "-- row $tag: $(basename "$jobfile") $* loadavg=$(cut -d' ' -f1-3 /proc/loadavg) $(date -u +%FT%TZ)"
+  # RT is honoured through a per-row COPY of the job file: fio lets a
+  # job-section `runtime=` override a CLI `--runtime` given after the job
+  # file, so the box's standing files (`runtime=30`) made every fio row of
+  # the 2026-09-13 and 2026-09-22 brackets a 30 s window whatever RT said
+  # (acceptance record §3.9.1b). The copy carries the RT this run names.
+  sed -E "s/^runtime=.*/runtime=$RT/" "$jobfile" > "$OUT/$tag.job"
+  grep -q "^runtime=$RT\$" "$OUT/$tag.job" || echo "runtime=$RT" >> "$OUT/$tag.job"
+  echo "-- row $tag: $(basename "$jobfile") (runtime=$RT via $tag.job) $* loadavg=$(cut -d' ' -f1-3 /proc/loadavg) $(date -u +%FT%TZ)"
   thermal "$OUT/$tag.thermal0"
   sync; sleep 1
   cat "$MNT/.stats" > "$OUT/$tag.stats0"
   head -1 /proc/stat > "$OUT/$tag.procstat0"
-  fio "$jobfile" "$@" --output-format=json --output="$OUT/$tag.fio.json" \
+  # The data namespaces' /proc/diskstats lines — the AGENTS write-
+  # amplification instrument's device-byte face (sectors written ÷ user
+  # bytes); the daemon's own ledger rides the .stats pair beside it.
+  grep -E " nvme[0-9]+n[0-9]+ " /proc/diskstats > "$OUT/$tag.diskstats0"
+  fio "$OUT/$tag.job" "$@" --output-format=json --output="$OUT/$tag.fio.json" \
     --write_bw_log="$OUT/$tag" --log_avg_msec=1000 > "$OUT/$tag.fio.txt" 2>&1 \
     || { echo "fio failed: $(tail -3 "$OUT/$tag.fio.txt")"; return 1; }
   cat "$MNT/.stats" > "$OUT/$tag.stats1"
   head -1 /proc/stat > "$OUT/$tag.procstat1"
+  grep -E " nvme[0-9]+n[0-9]+ " /proc/diskstats > "$OUT/$tag.diskstats1"
   thermal "$OUT/$tag.thermal1"
   python3 - "$OUT/$tag.fio.json" "$OUT/$tag.procstat0" "$OUT/$tag.procstat1" <<'PY'
 import json, sys

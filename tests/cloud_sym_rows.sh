@@ -831,13 +831,15 @@ row_tarx() {
             printf '%-10s %-10s %-5s %-8s %s\n' "$a" "$b" "$c" "$d" "$rest"
         done
     } | tee -a "$([ "$DRY_RUN" = true ] && echo /dev/null || echo "$ROWS_FILE")"
-    $DRY_RUN && { echo "(dry-run: would print the gate-2 verdict)"; return 0; }
+    # (dry-run: the walls below are the canned "2.00" — the verdict runs on
+    # them to show its shape; the oracle prints its commands)
     local s1 s2 l1 l2
     s1="$(echo "${rows[0]}" | awk '{print $2}')"
     l1="$(echo "${rows[1]}" | awk '{print $2}')"
     l2="$(echo "${rows[2]}" | awk '{print $2}')"
     s2="$(echo "${rows[3]}" | awk '{print $2}')"
-    sym_law_gate2_verdict "$s1" "$s2" "$l1" "$l2" | tee "$ROWDIR/symtarx-verdict.txt" | tee -a "$ROWS_FILE"
+    sym_law_gate2_verdict "$s1" "$s2" "$l1" "$l2" | tee "$([ "$DRY_RUN" = true ] && echo /dev/null || echo "$ROWDIR/symtarx-verdict.txt")" | tee -a "$([ "$DRY_RUN" = true ] && echo /dev/null || echo "$ROWS_FILE")"
+    $DRY_RUN && echo "(dry-run: the verdict above ran on CANNED walls)"
     sym_oracle sym-tarx
     log "sym-tarx PUBLISHED (rows + verdict + snapshots in $ROWDIR)"
 }
@@ -956,6 +958,7 @@ row_scale() {
     log "gate 3 (sym-scale): N ∈ {${ns_ok[*]}} writer NODES each creating $FILES files ($THREADS threads) in its OWN directory, then ingesting $INGEST_MB MiB (4 MiB blocks, conv=fsync); exactly N appenders live per row${MOUNT_HOOK:+ (the idle writers LEAVE — mount hook)}"
     [ -n "$MOUNT_HOOK" ] || warn "sym-scale: no --mount-hook — the idle writers stay MOUNTED (appenders_known reads the whole fleet; the deleted-stays-deleted-across-the-leave arm is skipped)"
     local SYM_RUN rate1="" ingest1="" verdict_all=MET zero_miss_all="" removed="$ROWDIR/removed-sample.txt"
+    $DRY_RUN && removed="$(mktemp -t sym-rows-dryrun-removed.XXXXXX)"
     SYM_RUN="$(date +%s)"
     local table="$ROWDIR/symscale-table.tsv"
     $DRY_RUN && table=/dev/null
@@ -1034,12 +1037,11 @@ EOS
         sleep 2
         for idx in "${writers[@]}"; do snap "$idx" "n${n}1"; done
         if $DRY_RUN; then
-            echo "(dry-run: N=$n — would judge handovers 0, ships ≤ $n, rpcs 0, the must-stay-0 deltas, ≥ 0.7 × N × the N=1 rate; then rm -rf the row's directories)"
-            continue
+            echo "(dry-run: N=$n — would judge handovers 0, ships ≤ $n, rpcs 0, the must-stay-0 deltas, ≥ 0.7 × N × the N=1 rate and the RT rule from the snapshots above; the acked read-backs and the removed-sample ls follow)"
         fi
         # THE ENGAGEMENT LAW (§8 gate 3) — the lib's.
         local handovers=0 ships=0 rpcs=0 v zero_miss=""
-        for idx in "${writers[@]}"; do
+        $DRY_RUN || for idx in "${writers[@]}"; do
             v="$(sym_delta "$ROWDIR" "$idx" "n$n" slot_handovers)"
             handovers=$((handovers + v))
             v="$(sym_delta "$ROWDIR" "$idx" "n$n" slot_ships)"
@@ -1049,14 +1051,16 @@ EOS
             v="$(sym_zero_violations_delta "$ROWDIR" "$idx" "n$n")"
             [ -z "$v" ] || zero_miss="$zero_miss m$idx:{$v}"
         done
-        sym_law_gate3_engagement "$n" "$handovers" "$ships" "$rpcs"
-        local mgr_load mgr_cpu
-        mgr_load="$(sym_json_first "$ROWDIR/m0_pn${n}1.json" manager_load_pct)"
-        mgr_cpu="$(python3 -c "
+        $DRY_RUN || sym_law_gate3_engagement "$n" "$handovers" "$ships" "$rpcs"
+        local mgr_load="0" mgr_cpu="0"
+        if ! $DRY_RUN; then
+            mgr_load="$(sym_json_first "$ROWDIR/m0_pn${n}1.json" manager_load_pct)"
+            mgr_cpu="$(python3 -c "
 import json
 a=json.load(open('$ROWDIR/m0_pn${n}0.json'))['metrics']['daemon_cpu_ns']
 b=json.load(open('$ROWDIR/m0_pn${n}1.json'))['metrics']['daemon_cpu_ns']
 print(f'{100*(int(b)-int(a))/1e9/max(1e-9, $t1-$t_row0):.0f}')" 2>/dev/null || echo 0)"
+        fi
         [ -n "$rate1" ] || rate1="$create_rate"
         [ -n "$ingest1" ] || ingest1="$ingest_rate"
         local cr ir verdict
@@ -1074,7 +1078,7 @@ print(f'{100*(int(b)-int(a))/1e9/max(1e-9, $t1-$t_row0):.0f}')" 2>/dev/null || e
         rt_i="$(sym_rt_verdict "sym-scale N=$n" "$ingest_wall" ingest)"
         [ -z "$rt_c$rt_i" ] || verdict="$verdict $rt_c $rt_i"
         [ "$verdict" = "MET" ] || verdict_all=MISS
-        sym_gate3_row_line "$n" "$create_rate" "$cr" "$creates_per_cpu_s" "$ingest_rate" "$ir" "$mgr_load" "$mgr_cpu" "$handovers" "$ships" "$rpcs" "$verdict" | tee -a "$table" | tee -a "$ROWS_FILE"
+        sym_gate3_row_line "$n" "$create_rate" "$cr" "$creates_per_cpu_s" "$ingest_rate" "$ir" "$mgr_load" "$mgr_cpu" "$handovers" "$ships" "$rpcs" "$verdict" | tee -a "$table" | tee -a "$([ "$DRY_RUN" = true ] && echo /dev/null || echo "$ROWS_FILE")"
         # The write-amplification instrument's third column (AGENTS.md): the
         # block_free_* reclaim ledger over the ingest window, Σ over the
         # row's writers — a freed-block path that WRITES instead of
@@ -1082,7 +1086,7 @@ print(f'{100*(int(b)-int(a))/1e9/max(1e-9, $t1-$t_row0):.0f}')" 2>/dev/null || e
         # beside the device ÷ user ratio (the local pass read 1.87× on the
         # N = 1 row that followed sym-tarx's rm -rf of ≈ 6,000 blocks).
         local bf="" k v_bf
-        for k in block_free_discards block_free_discard_bytes block_free_file_punches block_free_punch_bytes block_free_reclaim_skipped block_free_reclaim_commands; do
+        $DRY_RUN || for k in block_free_discards block_free_discard_bytes block_free_file_punches block_free_punch_bytes block_free_reclaim_skipped block_free_reclaim_commands; do
             v_bf=0
             for idx in "${writers[@]}"; do
                 v="$(sym_delta "$ROWDIR" "$idx" "n$n" "$k" 2>/dev/null || echo 0)"
@@ -1111,15 +1115,18 @@ print(f'{100*(int(b)-int(a))/1e9/max(1e-9, $t1-$t_row0):.0f}')" 2>/dev/null || e
         for idx in "${writers[@]}"; do
             # The LAST names the storm created (`ls -U` = readdir order = the
             # order `rm -rf` unlinks in) — the deleted-stays-deleted sample.
-            rx "$idx" MNT="${MNT[$idx]}" DIR="scale-$SYM_RUN-n$n-w$idx" <<'EOS' >>"$([ "$DRY_RUN" = true ] && echo /dev/null || echo "$removed")" || true
+            RX_CANNED="/scale-$SYM_RUN-n$n-w$idx/f000199" rx "$idx" MNT="${MNT[$idx]}" DIR="scale-$SYM_RUN-n$n-w$idx" <<'EOS' >>"$removed" || true
 ls -U "$MNT/$DIR" 2>/dev/null | tail -200 | sed "s|^|/$DIR/|"
 rm -rf "$MNT/$DIR" 2>/dev/null || true
 EOS
         done
     done
-    $DRY_RUN && return 0
-    sym_law_gate3_verdict_line "$verdict_all" | tee "$ROWDIR/symscale-verdict.txt" | tee -a "$ROWS_FILE"
-    [ -z "$zero_miss_all" ] || die "sym-scale: a must-stay-0 gauge moved:$zero_miss_all (rows above; the row set is RED)"
+    if $DRY_RUN; then
+        echo "(dry-run: the gate-3 verdict line would print here; the deleted-stays-deleted arm — every writer's clean leave, the removed sample through the manager, one writer's rejoin, the sample through it — follows with its commands)"
+    else
+        sym_law_gate3_verdict_line "$verdict_all" | tee "$ROWDIR/symscale-verdict.txt" | tee -a "$ROWS_FILE"
+        [ -z "$zero_miss_all" ] || die "sym-scale: a must-stay-0 gauge moved:$zero_miss_all (rows above; the row set is RED)"
+    fi
     # DELETED STAYS DELETED across every writer's CLEAN LEAVE: every joined
     # writer unmounts (the leave's flush-then-transfer of every slot), the
     # removed sample is judged through the MANAGER, then through a
@@ -1128,6 +1135,13 @@ EOS
     # "deleted"; an EIO/EAGAIN is a daemon that cannot answer.
     stat_removed_via() { # idx rel -> the classifier's word
         local out rc=0
+        if $DRY_RUN; then
+            rx "$1" P="${MNT[$1]}$2" <<'EOS' >/dev/null
+timeout 30 stat "$P" >/dev/null
+EOS
+            echo deleted
+            return 0
+        fi
         # the remote `timeout`'s exit (124 = hung) rides the ssh exit code
         # verbatim; stderr (the ENOENT text) comes home as $out
         out="$(rx "$1" P="${MNT[$1]}$2" <<'EOS' 2>&1 >/dev/null
@@ -1172,6 +1186,7 @@ EOS
         [ "$resurrected" = "0" ] && [ "$resurrected_j" = "0" ] ||
             die "sym-scale: DELETED DID NOT STAY DELETED — $resurrected (manager) / $resurrected_j (remounted writer) of $total sampled removed names resolve (see $ROWDIR/resurrected.txt)"
     fi
+    $DRY_RUN && rm -f "$removed"
     # Every writer back up for the rows that follow.
     ensure_writers "$((1 + ${#WRITERS[@]}))" "${WRITERS[@]}"
     sym_oracle sym-scale
@@ -1226,19 +1241,16 @@ EOS
     [ "$rc" = "0" ] || die "sym-shared-dir: a creator FAILED (see $ROWDIR/shared-w*.count.err)"
     sleep 3
     for idx in "${writers[@]}"; do snap "$idx" "sd1"; done
-    if $DRY_RUN; then
-        echo "(dry-run: would judge flips == 1 at the holder, striped, stripe ships > 0, shipped ≡ served, handovers 0; then the -ls half; then rm -rf)"
-        return 0
-    fi
+    $DRY_RUN && echo "(dry-run: would judge flips == 1 at the holder, striped, stripe ships > 0, shipped ≡ served, handovers 0 from the snapshots above; the census, the acked read-back, the -ls half and the oracle follow with their commands)"
     local created=0 c wall
     for idx in "${writers[@]}"; do
-        c="$(tr -d '[:space:]' <"$ROWDIR/shared-w$idx.count")"
+        if $DRY_RUN; then c="$per_writer"; else c="$(tr -d '[:space:]' <"$ROWDIR/shared-w$idx.count")"; fi
         [ "$c" = "$per_writer" ] || die "sym-shared-dir: m$idx created $c of $per_writer (see $ROWDIR/shared-w$idx.count.err)"
         created=$((created + c))
     done
     wall="$(python3 -c "print(f'{$t1-$t0:.2f}')")"
     local listed
-    listed="$(rx "$holder" P="${MNT[$holder]}$shared_rel" <<'EOS'
+    listed="$(RX_CANNED="$created" rx "$holder" P="${MNT[$holder]}$shared_rel" <<'EOS'
 ls -f "$P" | grep -c '^w' || true
 EOS
 )"
@@ -1248,8 +1260,9 @@ EOS
     # directory ≡ the manager's (a creator reading a foreign holder's
     # directory through its tokens) — the -ls half below is the reader's.
     acked_tree_check "sym-shared-dir" "$holder" "$shared_rel" 0
-    local flips=0 flip_at="" striped shipped=0 served=0 stripe_ships=0 handovers=0 v
-    for idx in "${writers[@]}"; do
+    local flips=0 flip_at="" striped=0 shipped=0 served=0 stripe_ships=0 handovers=0 v
+    $DRY_RUN && { flips=1; flip_at="m$holder(1) "; striped=1; stripe_ships=1; }
+    $DRY_RUN || for idx in "${writers[@]}"; do
         v="$(sym_delta "$ROWDIR" "$idx" sd dir_stripe_flips)"
         [ "$v" = "0" ] || flip_at="${flip_at}m$idx($v) "
         flips=$((flips + v))
@@ -1263,11 +1276,11 @@ EOS
         handovers=$((handovers + v))
         sym_zero_set_file sym-shared-dir "$idx" "$ROWDIR/m${idx}_psd1.json"
     done
-    striped="$(sym_json_sum "$ROWDIR/m${holder}_psd1.json" dir_striped_dirs)"
+    $DRY_RUN || striped="$(sym_json_sum "$ROWDIR/m${holder}_psd1.json" dir_striped_dirs)"
     # K = the directory's stripe count as the HOLDER reports it; a missing
     # tool or a non-integer answer is a harness failure, never K = 0.
     local xattr_k
-    xattr_k="$(rx "$holder" P="${MNT[$holder]}$shared_rel" <<'EOS'
+    xattr_k="$(RX_CANNED=64 rx "$holder" P="${MNT[$holder]}$shared_rel" <<'EOS'
 getfattr -n user.squeezefs.stripes --only-values "$P"
 EOS
 )" || die "sym-shared-dir: getfattr -n user.squeezefs.stripes on the holder m$holder FAILED (the tool missing, or the directory carries no stripe map) — see above"
@@ -1279,8 +1292,8 @@ EOS
         row_stamp "sym-shared-dir" "python3 O_CREAT|O_EXCL creators: ${#writers[@]} nodes × $per_writer into ONE directory held by m$holder"
         echo "== gate 3b: ${#writers[@]} creator nodes × $per_writer into ONE directory (holder m$holder): wall $wall s, $(python3 -c "print(f'{$created/($t1-$t0):.0f}')") creates/s aggregate (RT $RT s)${rt_s:+ $rt_s} =="
         echo "   flips=$flips at [$flip_at] striped_dirs(holder)=$striped K=$xattr_k xv_shipped=$shipped xv_served=$served dir_stripe_ships=$stripe_ships handovers=$handovers"
-    } | tee -a "$ROWS_FILE"
-    sym_law_gate3b_engagement "$holder" "$flips" "$flip_at" "$striped" "$stripe_ships" "$shipped" "$served" "$handovers"
+    } | tee -a "$([ "$DRY_RUN" = true ] && echo /dev/null || echo "$ROWS_FILE")"
+    $DRY_RUN || sym_law_gate3b_engagement "$holder" "$flips" "$flip_at" "$striped" "$stripe_ships" "$shipped" "$served" "$handovers"
     log "sym-shared-dir: flip at the holder, $stripe_ships stripe ships, closure shipped ≡ served ($shipped), 0 handovers"
 
     # --- sym-shared-dir-ls: a COLD token reader's `readdir + stat` ------------
@@ -1294,13 +1307,16 @@ EOS
         snap 1 "ls0"
         local statted
         t0="$(date +%s.%N)"
-        statted="$(rx 1 P="${MNT[1]}$shared_rel" <<'EOS'
+        statted="$(RX_CANNED="$created" rx 1 P="${MNT[1]}$shared_rel" <<'EOS'
 ls -l "$P" | grep -c '^-' || true
 EOS
 )"
         t1="$(date +%s.%N)"
         snap 1 "ls1"
         [ "$statted" = "$created" ] || die "sym-shared-dir-ls: the reader statted $statted of $created children"
+        if $DRY_RUN; then
+            echo "(dry-run: would judge the -ls law — dlm_token_grants ∈ [K + C, K + C + 4], 0 data-leaf reads net of the poll, merges ≥ 1 — and the plane-replacement witnesses from the two reader snapshots above)"
+        else
         # The instrument's precondition: the reader's per-holder planes
         # stood for the whole listing. A plane REPLACED mid-window (its
         # holder's endpoint died — a writer rejoined at another port) takes
@@ -1329,6 +1345,7 @@ EOS
         sym_law_gate3b_ls "$grants" "$xattr_k" "$created" "$misses" "$dropped" "$epochs" "$merges"
         sym_zero_reader_file sym-shared-dir-ls 1 "$ROWDIR/m1_pls1.json"
         log "sym-shared-dir-ls: $grants tokens for K=$xattr_k + C=$created, 0 data-leaf reads for the listing ($misses misses = the poll's $dropped dropped images over $epochs epoch steps + ≤ K tree-0 lessee reads)"
+        fi
     fi
     rx "$holder" P="${MNT[$holder]}$shared_rel" <<'EOS' || true
 rm -rf "$P" 2>/dev/null || true

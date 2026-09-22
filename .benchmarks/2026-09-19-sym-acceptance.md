@@ -3504,7 +3504,7 @@ while the requester lives the inode plane scopes its slots out (PR 12b
 round 1's law), and after it LEAVES C9's era floor EXEMPTED every ino it
 minted as current-era (review round 1, Issue 2 — below: the first
 build's post-leave census was VACUOUS for exactly this class). **Fix
-(`d56c839a`):**
+(`a5e80886`):**
 `KvMetaBackend::read_inode_witness` is the ONE witness read of every
 plan-builder site — through the writer's read divert (`token_serve` →
 the holder's token plane, one grant, already held from the `lookup` that
@@ -3520,14 +3520,14 @@ the slot moved under the read — REFUSES the retryable class
 (`xv_cross_owner_witness_refusals`, the belt: a projection's absence is no
 witness); the "no inode record — removing the dangling name" arm counts
 `xv_cross_owner_dangling_names`, a **must-stay-0 tripwire on an armed
-mount**. A found accounting defect beside it (`de99fd9d`): a joined
+mount**. A found accounting defect beside it (`f53d77bd`): a joined
 holder's `OfferSlot` answered `Busy` was a `joined_wire_failure` — the
 manager's legal refusal (`STATUS_REFUSED`) is `Ok(false)`, while the wire
 screen's `STATUS_REJECTED` (an offeree no page names — the two share the
 `Refused` reply and differ in the frame's status word alone, which
 `ManagerClient::call` had discarded; `call_with_status` carries it) stays
 an error — the matrix's screen pin caught the first build serving past
-it. **Pins (`e24d0016`, RED on the
+it. **Pins (`ec005930`, RED on the
 base with the exact log line, GREEN on the fix):**
 `sym_n_daemon_tests::a_cross_owner_unlink_of_a_foreign_minted_child_reads_
 its_witness_at_the_holder` (the MANAGER + ONE joiner, both directions —
@@ -3551,8 +3551,8 @@ asserting `findings == 0` AND `current_era_exempted == 0` (below); the
 run's numbers are in PR 13e's report.
 
 **Review round 1, Issue 2 — the post-leave census was VACUOUS for the
-joiner-minted class (the box's 430), FIXED (`d85ef1c8`, pins
-`725e56e6`):** fsck C9's zero-FP shield is the writer era's ino floor
+joiner-minted class (the box's 430), FIXED (`807f9435`, pins
+`799834a9`):** fsck C9's zero-FP shield is the writer era's ino floor
 (`KvMetaBackend::minted_in_prior_era` — a record at or above its
 keyspace's open-time cursor is current-era: a live create commits the
 inode before the dentry). The guest floors were seeded from the
@@ -3598,7 +3598,7 @@ longer leased — `NotFound` — and answered the PR 7b WITNESS refusal
 (`ForeignSkipped`, "the parent is dying"), which the initiator's
 `foreign_skipped_errno` turned into the op's `ENOENT`; defects 29 / 30 /
 35's family, at the one site that judged a witness under a lease it had
-lost. **Fix (`756d5706`):** `xv_serve_step` checks the lease FIRST and
+lost. **Fix (`9c1794ef`):** `xv_serve_step` checks the lease FIRST and
 again inside the `InsertDentry` arm's refusal — a served step for a slot
 this holder does not lease is the typed `RefusalClass::SlotMoved { slot,
 holder }` (EAGAIN on the wire) naming tree 0's lessee, never the op's
@@ -3612,11 +3612,11 @@ RAM table (the first order let a served step on the new holder read the
 pre-transfer projection for one window). Seams:
 `TEST_XV_SERVE_PARK_AFTER_LEASE_CHECK` (the holder parked after its lease
 check), `TEST_WIRE_GRANT_PARK_MID_INSTALL` (the grant parked between the
-adoption and the words). **Pin (`8d82892c`, RED on the base with the
+adoption and the words). **Pin (`4441005b`, RED on the base with the
 exact `ENOENT`; GREEN ×3 on the fix):** `sym_n_daemon_tests::a_create_into_
 a_directory_whose_slot_moves_to_the_creator_mid_plan_never_answers_enoent`
 — the create lands, `nlink` 2 at the holder, the name resolves at the
-old holder's mount. **Suite isolation (`4658e829`):** the pin's ONE
+old holder's mount. **Suite isolation (`59449ea6`):** the pin's ONE
 deliberately parked ship (≈ 700 ms) lands in the process-global
 `meta_ship_phase_ns.rtt` mean the slot-lease plane's `N_floor` cold-start
 seed reads, and the next armed plane in the same process seeded
@@ -3650,7 +3650,7 @@ of its decision (the deferred-flush barrier + a maintenance item's SMO
 barrier past the drain deadline), 26–272 ms against a 50 ms tick. A leaf
 dirtied right after a cycle's collection aged `tail + trigger + late +
 wall` at its covering barrier and the audit — correctly — counted it.
-**Fix (`f14158a0` + `f8711fa6`, a derivation, never a widened constant —
+**Fix (`470f680a` + `be7ae847`, a derivation, never a widened constant —
 §7 item 3):** on a volume with an appender set (every bit-17 forest — the
 population the audit judges) the age law runs from the LAST COLLECTION
 (`checkpoint_collected_ns`, set by every cycle path — a leaf dirtied after
@@ -3694,8 +3694,8 @@ mutex, a 64-word max per cycle) — "decision-identical", the honest word
 per-cycle instrument the box-rerun's item 13 named is the debug tape
 `checkpoint: cycle … pre-barrier wall N ms = publish + flush (dirty, SMOs)
 + pages + barrier` and `cycle due by age … decided N ms past the trigger …
-the tick's wait for the SMO mutex N ms left out`. **Pin (`eda5b5bd` +
-`7d3bbec1` + `f8711fa6`):** `sym_appender_tests::the_cadence_anticipates_
+the tick's wait for the SMO mutex N ms left out`. **Pin (`56194301` +
+`7bf7d284` + `be7ae847`):** `sym_appender_tests::the_cadence_anticipates_
 the_measured_cycle_wall_so_a_slow_barrier_lands_inside_the_ceiling` — the
 box's shape: the ARMED plane with the box's affinity order
 (`Knobs::armed().affinity_mb("16")`; the 64 MiB fixture's derived ceiling
@@ -3708,7 +3708,7 @@ bursts-larger-than-any-before shape the tripwire is designed to catch), a
 60 ms barrier armed after a clean checkpoint (the term reads 60–120 ms —
 the box's 16–106 ms class; a 25 ms barrier's 26 ms term sits inside the
 margin on the base too and pins nothing, 0/5), two warm cycles, five
-intervals: **RED on the TRUE base (`eda5b5bd`'s src) 5/5 — every cycle
+intervals: **RED on the TRUE base (`56194301`'s src) 5/5 — every cycle
 1,121–1,174 ms, 21–74 ms past the ceiling; GREEN with the fix 12/12 (terms
 63–73 ms, the trigger 927–937 ms), the four ceiling contracts 10/10**. The
 first shape (64 KiB nodes, the unarmed 64-rotor, four creators, a 150 ms
@@ -3729,7 +3729,7 @@ says the derivation priced the box's term** — the laptop readings above
 are the mechanism's.
 
 **Review round 1, Issue 1 — a BUG in the first build's age law, FIXED
-(`b8adb790`, pin `2b3758d4`):** `checkpoint_due_by_age` STORED the
+(`0c4b6be8`, pin `2a5709f9`):** `checkpoint_due_by_age` STORED the
 decision's lateness on every `due` tick — the ticks that ran NO cycle
 included — while `checkpoint_collected_ns` never advanced on an idle
 volume, so the first cycle after an idle span adopted `wall + idle` as
@@ -3749,7 +3749,7 @@ whole ceiling is a stall the audit counts on the cycle it happens, never
 a term the next 64 cycles anticipate. Pin
 `sym_appender_tests::an_idle_span_is_never_a_cycles_term_so_the_first_
 burst_after_it_runs_at_the_cadence` (4 s idle, then a paced burst: RED on
-`0c7a0678` with the term 2,425 ms and the cycles at one per tick, GREEN
+`dcc015e4` with the term 2,425 ms and the cycles at one per tick, GREEN
 with the term 9 ms / trigger 991 and the cycles bounded), and the F-B1
 pin gained its UPPER cycle bound (`max_cadence_cycles` — the first pin's
 `cycles ≥ 4` alone would have passed the storm).

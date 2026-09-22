@@ -168,6 +168,23 @@ async fn flat_path_microbench() {
         }
     })
     .await;
+    // PR 13f: the kernel's ctime SETATTR echo — once per rename / unlink on
+    // a real mount; the routed `setattr` box is what this phase prices
+    // (the FUSE handler's own future is the mount row's).
+    let r = Arc::clone(&routed);
+    let d = Arc::clone(&dirs);
+    let setattr_us = phase("setattr(echo)", n, t, move |i| {
+        let r = Arc::clone(&r);
+        let d = Arc::clone(&d);
+        async move {
+            let th = i / per;
+            let ts = 1_700_000_000_000_000_000u64 + i as u64;
+            r.setattr(d[th], None, None, None, None, None, Some(ts), Some(ts))
+                .await
+                .unwrap();
+        }
+    })
+    .await;
     let r = Arc::clone(&routed);
     let d = Arc::clone(&dirs);
     let rename_us = phase("rename", n, t, move |i| {
@@ -194,7 +211,8 @@ async fn flat_path_microbench() {
     .await;
     println!(
         "MICROBENCH SUMMARY µs/op: create {create_us:.2} mkdir {mkdir_us:.2} lookup+ {lookup_us:.2} \
-         lookup- {neg_us:.2} getattr {getattr_us:.2} rename {rename_us:.2} unlink {unlink_us:.2}"
+         lookup- {neg_us:.2} getattr {getattr_us:.2} setattr {setattr_us:.2} rename {rename_us:.2} \
+         unlink {unlink_us:.2}"
     );
     for v in &routed.volumes {
         v.shutdown().await.unwrap();

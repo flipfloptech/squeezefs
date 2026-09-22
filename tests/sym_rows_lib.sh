@@ -70,7 +70,9 @@ def flat(d, out, pfx=""):
         else: out[pfx + k] = v
     return out
 root = json.load(open(sys.argv[1]))
-print(flat(root.get("metrics", root), {}).get(sys.argv[2], ""))' "$1" "$2"
+d = flat(root.get("metrics", root), {})
+d.update({k: v for k, v in root.items() if not isinstance(v, dict)})  # top-level words (build_commit, …)
+print(d.get(sys.argv[2], ""))' "$1" "$2"
 }
 
 # A per-volume gauge (a JSON array) of a captured `.stats` FILE, folded:
@@ -111,9 +113,46 @@ print(1 if vals and all(str(x) == want for x in vals) else 0)' "$1" "$2" "$3"
 }
 
 # The first element of a per-volume gauge of a captured `.stats` FILE (a
-# scalar is itself).
+# scalar is itself; a string element without its repr quotes).
 sym_json_first() { # file key
-    sym_json_field "$1" "$2" | tr -d '[] ' | cut -d, -f1
+    python3 -c '
+import json, sys
+def flat(d, out, pfx=""):
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+root = json.load(open(sys.argv[1]))
+d = flat(root.get("metrics", root), {})
+d.update({k: v for k, v in root.items() if not isinstance(v, dict)})
+v = d.get(sys.argv[2], "")
+if isinstance(v, list):
+    v = v[0] if v else ""
+print(v)' "$1" "$2"
+}
+
+# Did any per-volume element of a CUMULATIVE gauge DECREASE between two
+# captured `.stats` files? Prints 1/0. The reader's Token family is summed
+# over its per-holder planes, and a plane REPLACED mid-window (its holder's
+# endpoint died — a rejoined writer at a fresh port) takes its history
+# with it: the row's delta then reads short, never a law's MISS but an
+# INSTRUMENT the row must refuse to judge (PR 15's local pass: volume 2's
+# `dlm_token_grants` 13,861 → 16,000 with `recalls_received` 7,861 → 0).
+sym_json_any_decrease() { # file0 file1 key
+    python3 -c '
+import json, sys
+def flat(d, out, pfx=""):
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+def load(f):
+    r = json.load(open(f)); return flat(r.get("metrics", r), {})
+a, b = load(sys.argv[1]).get(sys.argv[3], 0), load(sys.argv[2]).get(sys.argv[3], 0)
+la = a if isinstance(a, list) else [a]
+lb = b if isinstance(b, list) else [b]
+dec = any(isinstance(x, (int, float)) and isinstance(y, (int, float)) and y < x for x, y in zip(la, lb))
+print(1 if dec else 0)' "$1" "$2" "$3"
 }
 
 # --- the VENUE word ------------------------------------------------------------

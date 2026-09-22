@@ -226,9 +226,12 @@ line, `mount_posture writer`, `joined_appender_id ≥ 1`,
 believed itself co-located with the manager — a product finding on this
 venue; `detection` a non-PR namespace), `manager_lease peer:…`,
 `slot_leases_held ≥ 1`, `membership_mode member`, its own endpoint
-published; fleet-wide at the manager — `appenders_live == N`,
-`appenders_known == N`, `membership_writers == N − 1` (every joiner a
-writer member of the manager's shard); the token reader —
+published; fleet-wide at the manager — `appenders_known == N` (the
+appender directory's Live-page count; a daemon's `appenders_live` counts
+only the regions it joined itself, 1 everywhere) and `membership_writers
+== N − 1` (every joiner a writer member of the manager's shard;
+`membership_members` also counts the token reader, so it is not the gate);
+the token reader —
 `reader_staleness_bound_ms == 0`; then the build_commit ritual on every
 node.
 
@@ -241,8 +244,8 @@ change a threshold there and both venues move together). The row set:
 
 | row | shape on the fleet | law (the lib's) |
 |---|---|---|
-| gate 2 `sym-tarx` | `tar -x` of the shipped corpus (`SYM_TAR_SRC=<linux>/fs` — the box used `linux-7.2.3/fs`, 2,468 entries; ship the same tarball to keep rows comparable) by **client1's joined writer** into a directory it created, vs **S0 = the manager's own extract on client0** (the same binary, a single-node mount on the same node class over the same fabric, in the same session); A-B-B-A `sym-1 local-1 local-2 sym-2`; as many extractions per arm as fit `SYM_RT` (each into a fresh subdir); the measured node-to-node RTT stated in the row (replaces the box's netem 250 µs) | ≤ 1.10× S0; `wire_verbs_per_entry` < 0.05; `slot_handovers == 0`; `dlm_rpcs == 0` |
-| gate 3 `sym-scale` | N ∈ {1,2,4,8} ∩ [1, N_CLIENT] writer **nodes** (the manager + N−1 joiners) each create `SYM_FILES` files (`SYM_THREADS` threads) in its own directory, then ingest `SYM_INGEST_MB` (4 MiB blocks, `conv=fsync`); the idle writers **leave** (`sym-hook`) so exactly N appenders are live; `C/CPU-S` beside the wall multiple; the ingest row's amplification columns from `/proc/diskstats` on the storage nodes' data namespaces (`device ÷ user bytes`, `wareq-sz`) | ≥ 0.7 × N × the N=1 rate on both rows; `appenders_live == N`; handovers 0; `slot_ships ≤ N`; `dlm_rpcs` 0; the must-stay-0 deltas 0; deleted stays deleted through the manager after every writer's clean leave and through a remounted writer |
+| gate 2 `sym-tarx` | `tar -x` of the shipped corpus (`SYM_TAR_SRC=<linux>/fs` — the box used `linux-7.2.3/fs`, 2,468 entries; ship the same tarball to keep rows comparable) by **client1's joined writer** into a directory it created, vs **S0 = the manager's own extract on client0** (the same binary, a single-node mount on the same node class over the same fabric, in the same session); A-B-B-A `sym-1 local-1 local-2 sym-2`; ONE extraction per arm — the box's exact shape (gate 2 is a wall ratio, not a rate; on a cache-less set every beyond-inline file is a whole 4 MiB block, so one `fs/` extraction is ≈ 7 GiB of data blocks — `--tarx-reps=0` fills `--rt` with fresh-subdir extractions where the volume holds them); the measured node-to-node RTT stated in the row (replaces the box's netem 250 µs) | ≤ 1.10× S0; `wire_verbs_per_entry` < 0.05; `slot_handovers == 0`; `dlm_rpcs == 0` |
+| gate 3 `sym-scale` | N ∈ {1,2,4,8} ∩ [1, N_CLIENT] writer **nodes** (the manager + N−1 joiners) each create `SYM_FILES` files (`SYM_THREADS` threads) in its own directory, then ingest `SYM_INGEST_MB` (4 MiB blocks, `conv=fsync`); the idle writers **leave** (`sym-hook`) so exactly N appenders are live; `C/CPU-S` beside the wall multiple; the ingest row's amplification columns from `/proc/diskstats` on the storage nodes' data namespaces (`device ÷ user bytes`, `wareq-sz`) | ≥ 0.7 × N × the N=1 rate on both rows; `appenders_known == N`; handovers 0; `slot_ships ≤ N`; `dlm_rpcs` 0; the must-stay-0 deltas 0; deleted stays deleted through the manager after every writer's clean leave and through a remounted writer |
 | gate 3b `sym-shared-dir` (+ `-ls`) | every writer node creates `SYM_FILES / N` files into **one** directory the first joiner made; then the token reader's cold `ls -l` of it | `dir_stripe_flips == 1` at the holder; `dir_striped_dirs ≥ 1`; `dir_stripe_ships > 0`; `xv shipped ≡ served`; `slot_handovers == 0`; `-ls`: `dlm_token_grants ∈ [K + C, K + C + 4]`, 0 data-leaf reads (net of the poll's re-reads + one tree-0 read per stripe slot), `dir_stripe_readdir_merges ≥ 1` |
 
 After every row set: `squeezefs fsck <manager mount> --json` (findings 0),

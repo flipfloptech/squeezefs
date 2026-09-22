@@ -244,7 +244,10 @@ SYM_FILES="${SYM_FILES:-40000}"            # per-writer creates (the matrix's de
 SYM_THREADS="${SYM_THREADS:-4}"            # storm threads per writer node
 SYM_INGEST_MB="${SYM_INGEST_MB:-1024}"     # per-writer ingest MiB (4 MiB blocks, fsync)
 SYM_SCALE_NS="${SYM_SCALE_NS:-}"           # gate 3's N ladder; EMPTY = 1,2,4,8 capped at N_CLIENT
-SYM_ROWS="${SYM_ROWS:-tarx,scale,shared}"  # the row sets bench-sym runs
+SYM_ROWS="${SYM_ROWS:-tarx,shared,scale}"  # the row sets bench-sym runs, in
+                                           # this order (the -ls half's token
+                                           # reader lists BEFORE sym-scale's
+                                           # leave/rejoin storm)
 SYM_ARM_A="${SYM_ARM_A:-0}"                # 1 = ALSO run the design's "vs today" A arm
                                            # (authority + co-writers at the same N, the same
                                            # binary, default format) as an A-B-B-A over the
@@ -310,7 +313,7 @@ subcommands:
              optional `--read-only` TOKEN reader on client0; posture gates
              read from every node's .stats (mount_posture writer,
              symmetric_join non-null, manager_lease held / joined_appender_id,
-             appenders_live == N, the membership census)
+             appenders_known == N, the membership census)
   bench-sym  (PRESET=mw SYMMETRIC=1) the three symmetric row sets — gate 2
              sym-tarx (a JOINED node's tar -x vs the manager-local S0), gate
              3 sym-scale (N = 1/2/4/8 writer NODES — the per-node law), gate
@@ -1428,7 +1431,7 @@ poll_stat() { # mountpoint key want tries what
 
 unmount_and_reap() { # mountpoint (idempotent — v5-mw verbatim)
   local mnt="$1" pid t
-  pid="$(pgrep -f "squeezefs.*mount.*$mnt" | head -1 || true)"
+  pid="$(pgrep -f "squeezefs mount .* $mnt( |$)" | head -1 || true)"
   if awk -v m="$mnt" '$2==m {f=1} END {exit !f}' /proc/mounts; then
     env -u SUDO_UID -u SUDO_GID -u SUDO_USER "$SQZ" umount "$mnt" >/dev/null 2>&1 || true
   fi
@@ -1597,7 +1600,19 @@ def flat(d, out, pfx=""):
 root = json.load(sys.stdin)
 print(flat(root.get("metrics", root), {}).get(sys.argv[1], ""))' "$2"
 }
-stat_first() { stat_field "$1" "$2" | tr -d '[] ' | cut -d, -f1; }
+stat_first() { # mountpoint key -> the first per-volume element (a scalar is itself)
+  cat "$1/.stats" | python3 -c '
+import json, sys
+def flat(d, out, pfx=""):
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+root = json.load(sys.stdin)
+v = flat(root.get("metrics", root), {}).get(sys.argv[1], "")
+if isinstance(v, list): v = v[0] if v else ""
+print(v)' "$2"
+}
 stat_all_eq() { # mountpoint key want -> 1|0
   cat "$1/.stats" | python3 -c '
 import json, sys
@@ -1640,7 +1655,7 @@ poll_all_eq() { # mountpoint key want tries what
 }
 unmount_and_reap() { # mountpoint (idempotent — v5-mw verbatim)
   local mnt="$1" pid t
-  pid="$(pgrep -f "squeezefs.*mount.*$mnt" | head -1 || true)"
+  pid="$(pgrep -f "squeezefs mount .* $mnt( |$)" | head -1 || true)"
   if awk -v m="$mnt" '$2==m {f=1} END {exit !f}' /proc/mounts; then
     env -u SUDO_UID -u SUDO_GID -u SUDO_USER "$SQZ" umount "$mnt" >/dev/null 2>&1 || true
   fi
@@ -1922,15 +1937,16 @@ EOS
     sym_mount_node "${clients[0]}" reader
   fi
   # The fleet-wide gates at the manager: N Live pages (the manager + every
-  # joiner), the directory's count, the membership census — every joiner is
-  # a WRITER member of the manager's shard (the manager owns the shard; the
-  # census counts its members).
+  # joiner — `appenders_known`, the directory's Live-page count; a daemon's
+  # `appenders_live` counts only the regions IT joined), the membership
+  # census — every joiner is a WRITER member of the manager's shard
+  # (`membership_writers == N − 1`; `membership_members` also counts the
+  # token reader, so it is not the gate).
   remote "$(node_pub "${clients[0]}")" MNT="$MOUNTPOINT" N="$n" <<<"$SYM_STAT_HELPERS
 die() { echo \"FATAL: \$*\" >&2; exit 1; }
-poll_all_eq \"\$MNT\" appenders_live \"\$N\" 240 \"manager: appenders_live (want \$N = the manager + \$((N - 1)) joined writers)\"
-poll_all_eq \"\$MNT\" appenders_known \"\$N\" 240 \"manager: appenders_known (the directory's Live count)\"
+poll_all_eq \"\$MNT\" appenders_known \"\$N\" 240 \"manager: appenders_known — the directory's Live-page count (want \$N = the manager + \$((N - 1)) joined writers; appenders_live counts only the regions THIS daemon joined)\"
 poll_stat \"\$MNT\" membership_writers \"\$((N - 1))\" 240 \"manager: membership_writers (every joiner a WRITER member of the manager's shard)\"
-echo \"  fleet gates: appenders_live=\$(stat_first \"\$MNT\" appenders_live) appenders_known=\$(stat_first \"\$MNT\" appenders_known) membership_members=\$(stat_field \"\$MNT\" membership_members) membership_writers=\$(stat_field \"\$MNT\" membership_writers) membership_readers=\$(stat_field \"\$MNT\" membership_readers)\""
+echo \"  fleet gates: appenders_known=\$(stat_first \"\$MNT\" appenders_known) membership_members=\$(stat_field \"\$MNT\" membership_members) membership_writers=\$(stat_field \"\$MNT\" membership_writers) membership_readers=\$(stat_field \"\$MNT\" membership_readers)\""
 
   log "assemble-sym 8/8: build_commit verification ritual on every node"
   for c in "${clients[@]}"; do

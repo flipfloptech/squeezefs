@@ -24,7 +24,9 @@
 #
 # Flags (every one has a SQZ_CLOUDSYM_* default — harness variables, never
 # a daemon's):
-#   --rows=tarx,scale,shared    row sets to run (default all three)
+#   --rows=tarx,shared,scale    row sets to run (default all three, in
+#                               that order — shared's -ls half ahead of
+#                               scale's leave/rejoin storm)
 #   --rt=S                      the sustained window per measured phase
 #                               (default 60 — the AGENTS.md rule; the local
 #                               scoping pass runs 10; 0 = one pass)
@@ -36,8 +38,13 @@
 #   --tar-src=DIR | --tarball=F the `tar -x` corpus (the linux fs/ tree —
 #                               the box used linux-7.2.3/fs, 2,468 entries;
 #                               ship the SAME tarball to keep rows comparable)
-#   --tarx-reps=R               extractions per arm (default: as many as fit
-#                               --rt; 0 → 1 — the box's shape)
+#   --tarx-reps=R               extractions per arm (default 1 — the box's
+#                               exact shape: gate 2 is a WALL RATIO, not a
+#                               rate, and on a cache-less set every
+#                               beyond-inline file is a whole 4 MiB block, so
+#                               one fs/ extraction is ≈ 7 GiB of data blocks;
+#                               0 = as many as fit --rt, each into a fresh
+#                               subdir — sized for a volume that holds them)
 #   --sqz=PATH                  the squeezefs binary ON THE NODES (default
 #                               `squeezefs` in root's PATH)
 #   --mdstorm-src=FILE          tests/mdstorm.c (compiled on every writer node)
@@ -71,7 +78,7 @@
 #   gate 3  sym-scale     N ∈ ns: N writers (the manager + N−1 joiners) each
 #                         create --files in its own directory then ingest
 #                         --ingest-mb; ≥ 0.7 × N × the N=1 rate on both
-#                         rows; appenders_live == N; handovers 0; ships ≤ N;
+#                         rows; appenders_known == N; handovers 0; ships ≤ N;
 #                         rpcs 0; must-stay-0 deltas 0; deleted stays deleted
 #                         across every joiner's clean leave; C/CPU-S beside
 #                         the multiple.
@@ -120,7 +127,10 @@ die() {
 }
 
 # --- flags ------------------------------------------------------------------------
-ROWS="${SQZ_CLOUDSYM_ROWS:-tarx,scale,shared}"
+# Default order: the -ls half (a token reader's cold listing) runs BEFORE
+# sym-scale's leave/rejoin storm, so the reader's per-holder planes stand
+# for the listing (a writer that rejoined at another port replaces them).
+ROWS="${SQZ_CLOUDSYM_ROWS:-tarx,shared,scale}"
 RT="${SQZ_CLOUDSYM_RT:-60}"
 FILES="${SQZ_CLOUDSYM_FILES:-40000}"
 THREADS="${SQZ_CLOUDSYM_THREADS:-4}"
@@ -128,7 +138,7 @@ INGEST_MB="${SQZ_CLOUDSYM_INGEST_MB:-1024}"
 SCALE_NS="${SQZ_CLOUDSYM_SCALE_NS:-1,2,4,8}"
 TAR_SRC="${SQZ_CLOUDSYM_TAR_SRC:-}"
 TARBALL="${SQZ_CLOUDSYM_TARBALL:-}"
-TARX_REPS="${SQZ_CLOUDSYM_TARX_REPS:-}"
+TARX_REPS="${SQZ_CLOUDSYM_TARX_REPS:-1}"
 SQZ_NODE="${SQZ_CLOUDSYM_SQZ:-squeezefs}"
 MDSTORM_SRC="${SQZ_CLOUDSYM_MDSTORM_SRC:-$REPO/tests/mdstorm.c}"
 ROWDIR="${SQZ_CLOUDSYM_ROWDIR:-}"
@@ -363,7 +373,13 @@ EOS
     sym_json_all_eq "$f" "$2" "$3"
 }
 stat_first() { # idx key
-    stat_field "$1" "$2" | tr -d '[] ' | cut -d, -f1
+    local f="$ROWDIR/.live-m$1.json"
+    $DRY_RUN && { echo 0; return 0; }
+    rx "$1" MNT="${MNT[$1]}" <<'EOS' >"$f"
+set -euo pipefail
+cat "$MNT/.stats"
+EOS
+    sym_json_first "$f" "$2"
 }
 
 # The must-stay-0 set of one LIVE writer (an oracle face).
@@ -458,10 +474,13 @@ preflight() {
         v="$(stat_field 1 reader_staleness_bound_ms)"
         $DRY_RUN || [ "$v" = "0" ] || die "reader m1 (${HOST[1]}:${MNT[1]}): reader_staleness_bound_ms='$v' (want 0 — a TOKEN reader, R-SYM-4)"
     fi
+    # The fleet-wide appender count is the DIRECTORY's Live-page count
+    # (`appenders_known`); `appenders_live` counts the regions THIS mount
+    # joined (1 on every daemon).
     local n=$((1 + ${#WRITERS[@]}))
-    v="$(stat_first 0 appenders_live)"
-    $DRY_RUN || [ "$v" = "$n" ] || die "manager m0: appenders_live=$v (want $n — the manager + ${#WRITERS[@]} joined writers)"
-    log "preflight: manager m0 + ${#WRITERS[@]} joined writer(s)${READER:+ + 1 token reader} — appenders_live=$v"
+    v="$(stat_first 0 appenders_known)"
+    $DRY_RUN || [ "$v" = "$n" ] || die "manager m0: appenders_known=$v (want $n — the manager + ${#WRITERS[@]} joined writers' Live pages)"
+    log "preflight: manager m0 + ${#WRITERS[@]} joined writer(s)${READER:+ + 1 token reader} — appenders_known=$v"
 }
 
 # --- tools on the nodes ---------------------------------------------------------------
@@ -553,7 +572,7 @@ EOS
 # Exactly the writers `want...` live (gate 3's "exactly N appenders live"):
 # every other joined writer LEAVES cleanly, a wanted one not up JOINS; the
 # manager's directory must then count N Live pages. Without a hook every
-# writer stays mounted (the row says so) and appenders_live reads the fleet.
+# writer stays mounted (the row says so) and appenders_known reads the fleet.
 ensure_writers() { # n want_idx...
     local n="$1" j want t
     shift
@@ -634,10 +653,10 @@ print(f'dev_bytes={dev} user_bytes={user} dev/user={dev/max(1,user):.3f} wareq_s
 # ends (the extracting node + the manager) around a settle. Prints
 # `label wall_per_rep reps ops_s`.
 sym_venue_extract() { # idx label
-    local idx="$1" label="$2" reps="${TARX_REPS:-}" out
-    local rt_arg="$RT"
-    [ -n "$reps" ] && rt_arg=0
-    [ -n "$reps" ] || reps=1
+    local idx="$1" label="$2" reps="$TARX_REPS" out
+    local rt_arg=0
+    # reps 0 = fill --rt (each extraction into a fresh subdir); ≥ 1 = that many
+    [ "$reps" = "0" ] && { rt_arg="$RT"; reps=1; }
     sleep 2
     [ "$idx" != "0" ] && snap "$idx" "${label}0"
     snap 0 "${label}0"
@@ -660,13 +679,18 @@ t1="$(date +%s.%N)"
 python3 -c "
 w=$t1-$t0; n=$n
 print(f'{w/n:.3f} {n} {n*$ENTRIES/w:.0f}')"
-# the venue's blocks back before the next arm (untimed)
-rm -rf "$dest"
 EOS
 )" || die "sym-tarx $label: tar -x FAILED on m$idx (a shipped verb errored — see the daemon logs)"
     sleep 2
     [ "$idx" != "0" ] && snap "$idx" "${label}1"
     snap 0 "${label}1"
+    # The venue's blocks back before the next arm (untimed) — AFTER the
+    # snapshots: on a joined writer every terminal free SHIPS to the
+    # allocation holder as a publish-plane frame, which would land on the
+    # arm's `meta_ship_publish.shipped` delta (the matrix's order).
+    rx "$idx" MNT="${MNT[$idx]}" LABEL="$label" <<'EOS' || true
+rm -rf "$MNT/s8a-$LABEL"
+EOS
     echo "$label $out"
 }
 
@@ -674,7 +698,7 @@ row_tarx() {
     local jw="${WRITERS[0]}" label
     BENCH_ORDER=$((BENCH_ORDER + 1))
     prepare_corpus
-    log "gate 2 (sym-tarx): corpus $CORPUS_ENTRIES entries; venue = joined writer m$jw (${HOST[$jw]}) extracting into a directory IT created over the REAL fabric (rtt $RTT_TEXT), vs the manager-local S0 (m0, ${HOST[0]}); A-B-B-A; ≥ $RT s per arm"
+    log "gate 2 (sym-tarx): corpus $CORPUS_ENTRIES entries; venue = joined writer m$jw (${HOST[$jw]}) extracting into a directory IT created over the REAL fabric (rtt $RTT_TEXT), vs the manager-local S0 (m0, ${HOST[0]}); A-B-B-A; $([ "$TARX_REPS" = 0 ] && echo "≥ $RT s per arm" || echo "$TARX_REPS extraction(s) per arm — the box's shape")"
     local -a rows=()
     sym_arm() { # label -> row line
         local label="$1" out wire xv ship pub verbs_per h_j h_m rpcs
@@ -705,12 +729,12 @@ row_tarx() {
     rows+=("$(sym_arm sym-2)")
     {
         row_stamp "sym-tarx" "tar -xf $CORPUS_REMOTE (entries=$CORPUS_ENTRIES) ×reps; A-B-B-A sym-1 local-1 local-2 sym-2"
-        echo "== gate 2: tar -x on a JOINED WRITER node (m$jw) over the real fabric vs manager-local S0 (m0) — entries=$CORPUS_ENTRIES per rep, ≥ $RT s per arm =="
+        echo "== gate 2: tar -x on a JOINED WRITER node (m$jw) over the real fabric vs manager-local S0 (m0) — entries=$CORPUS_ENTRIES per rep; $([ "$TARX_REPS" = 0 ] && echo "≥ $RT s per arm" || echo "$TARX_REPS extraction(s) per arm") =="
         printf '%-10s %-10s %-5s %-8s %s\n' ARM WALL/REP_S REPS OPS_S ENGAGEMENT
-        local r
+        local r a b c d rest
         for r in "${rows[@]}"; do
-            # shellcheck disable=SC2086 # deliberate word split of the row line
-            printf '%-10s %-10s %-5s %-8s %s\n' $r
+            read -r a b c d rest <<<"$r"
+            printf '%-10s %-10s %-5s %-8s %s\n' "$a" "$b" "$c" "$d" "$rest"
         done
     } | tee -a "$([ "$DRY_RUN" = true ] && echo /dev/null || echo "$ROWS_FILE")"
     $DRY_RUN && { echo "(dry-run: would print the gate-2 verdict)"; return 0; }
@@ -739,7 +763,7 @@ row_scale() {
     install_mdstorm
     BENCH_ORDER=$((BENCH_ORDER + 1))
     log "gate 3 (sym-scale): N ∈ {${ns_ok[*]}} writer NODES each creating $FILES files ($THREADS threads) in its OWN directory, then ingesting $INGEST_MB MiB (4 MiB blocks, conv=fsync); exactly N appenders live per row${MOUNT_HOOK:+ (the idle writers LEAVE — mount hook)}"
-    [ -n "$MOUNT_HOOK" ] || warn "sym-scale: no --mount-hook — the idle writers stay MOUNTED (appenders_live reads the whole fleet; the deleted-stays-deleted-across-the-leave arm is skipped)"
+    [ -n "$MOUNT_HOOK" ] || warn "sym-scale: no --mount-hook — the idle writers stay MOUNTED (appenders_known reads the whole fleet; the deleted-stays-deleted-across-the-leave arm is skipped)"
     local SYM_RUN rate1="" ingest1="" verdict_all=MET zero_miss_all="" removed="$ROWDIR/removed-sample.txt"
     SYM_RUN="$(date +%s)"
     local table="$ROWDIR/symscale-table.tsv"
@@ -757,9 +781,9 @@ row_scale() {
         sleep 2
         for idx in "${writers[@]}"; do snap "$idx" "n${n}0"; done
         local live
-        live="$(stat_first 0 appenders_live)"
+        live="$(stat_first 0 appenders_known)"
         if [ -n "$MOUNT_HOOK" ]; then
-            $DRY_RUN || [ "$live" = "$n" ] || die "sym-scale N=$n: appenders_live=$live at the manager (want exactly $n)"
+            $DRY_RUN || [ "$live" = "$n" ] || die "sym-scale N=$n: appenders_known=$live at the manager (want exactly $n Live pages)"
         fi
         # The create row: every writer node's storm at once, one directory each.
         local -a pids=()
@@ -854,7 +878,7 @@ print(f'{100*(int(b)-int(a))/1e9/max(1e-9, $t1-$t_row0):.0f}')" 2>/dev/null || e
         fi
         [ "$verdict" = "MET" ] || verdict_all=MISS
         sym_gate3_row_line "$n" "$create_rate" "$cr" "$creates_per_cpu_s" "$ingest_rate" "$ir" "$mgr_load" "$mgr_cpu" "$handovers" "$ships" "$rpcs" "$verdict" | tee -a "$table" | tee -a "$ROWS_FILE"
-        emit "   N=$n walls: create ${create_wall}s ingest ${ingest_wall}s (RT $RT s); appenders_live=$live; ingest amplification: $amp"
+        emit "   N=$n walls: create ${create_wall}s ingest ${ingest_wall}s (RT $RT s); appenders_known=$live; ingest amplification: $amp"
         [ "$(python3 -c "print(1 if min($create_wall,$ingest_wall) >= $RT else 0)")" = "1" ] ||
             warn "sym-scale N=$n: a measured phase ran shorter than RT=$RT s (create $create_wall s, ingest $ingest_wall s) — size --files/--ingest-mb up for the counted row (the sustained-state rule)"
         for idx in "${writers[@]}"; do
@@ -1041,6 +1065,16 @@ EOS
         t1="$(date +%s.%N)"
         snap 1 "ls1"
         [ "$statted" = "$created" ] || die "sym-shared-dir-ls: the reader statted $statted of $created children"
+        # The instrument's precondition: the reader's per-holder planes
+        # stood for the whole listing. A plane REPLACED mid-window (its
+        # holder's endpoint died — a writer rejoined at another port) takes
+        # its cumulative history with it and the delta reads short — an
+        # INVALID instrument, never a law's verdict (found by the local
+        # pass behind sym-scale's leave/rejoin on `auto`-port joiners).
+        for k in dlm_token_grants dlm_token_recalls_received dlm_token_cached; do
+            [ "$(sym_json_any_decrease "$ROWDIR/m1_pls0.json" "$ROWDIR/m1_pls1.json" "$k")" = "0" ] ||
+                die "sym-shared-dir-ls: INSTRUMENT INVALID — the reader's $k went BACKWARDS on a volume across the listing (a per-holder token plane was replaced mid-row: a holder's endpoint changed — planes $(sym_json_field "$ROWDIR/m1_pls0.json" dlm_token_reader_holder_planes) → $(sym_json_field "$ROWDIR/m1_pls1.json" dlm_token_reader_holder_planes)); the row cannot be judged from these deltas — re-run the -ls half on a reader whose planes are fresh (run 'shared' ahead of 'scale', or remount the reader)"
+        done
         local grants merges misses hits dropped epochs
         grants="$(sym_delta "$ROWDIR" 1 ls dlm_token_grants)"
         merges="$(sym_delta "$ROWDIR" 1 ls dir_stripe_readdir_merges)"

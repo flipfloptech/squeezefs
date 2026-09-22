@@ -499,7 +499,14 @@ owner_idxs() {
 is_mounted() { awk -v m="$1" '$2==m {f=1} END {exit !f}' /proc/mounts; }
 
 daemon_pid_for_mnt() { # mountpoint -> pid or empty
-    pgrep -f "squeezefs.*mount.*$1" | head -1 || true
+    # ANCHORED to the daemon's argv shape — `<bin>/squeezefs mount <uri>
+    # <mnt> …` with the mountpoint as a whole WORD: the former
+    # `squeezefs.*mount.*$1` matched any process whose argv carried the
+    # words (PR 15's row driver names `--sqz=…/squeezefs`, `--mount-hook=…`
+    # and `writer=local:<mnt>`), and `…/m6` matched `…/m60`; a `mount 61`
+    # recorded the DRIVER's pid as member 61's daemon and the next
+    # `unmount` killed it -9.
+    pgrep -f "squeezefs mount .* $1( |$)" | head -1 || true
 }
 
 require_state() {
@@ -2095,7 +2102,7 @@ teardown_fleet() {
         log "swept unledgered mount $m (pid ${mpid:-?})"
     done < <(awk -v r="$MNT_ROOT/" 'index($2, r) == 1 {print $2}' /proc/mounts)
     # Sweep daemons whose mounts already detached (lazy umounts, dead devs).
-    for mpid in $(pgrep -f "squeezefs.*mount.*$MNT_ROOT/" || true); do
+    for mpid in $(pgrep -f "squeezefs mount .* $MNT_ROOT/" || true); do
         kill -9 "$mpid" 2>/dev/null || true
         log "swept stray daemon pid $mpid"
     done

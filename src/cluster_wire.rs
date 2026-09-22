@@ -1567,11 +1567,33 @@ impl Default for RpcListenerConfig {
 /// 32 cores, the 14th member refused at accept. `crate::cpu::raw_parallelism`
 /// is the fleet-width exemption class (its consumer census is pinned).
 pub fn default_max_connections() -> usize {
-    max_connections_resolved(
-        crate::env_knobs::opt_int_knob::<usize>(MAX_CONNS_ENV),
-        crate::cpu::raw_parallelism(),
-        nofile_soft_limit(),
-    )
+    let explicit = crate::env_knobs::opt_int_knob::<usize>(MAX_CONNS_ENV);
+    let nofile = nofile_soft_limit();
+    let cap = max_connections_resolved(explicit, crate::cpu::raw_parallelism(), nofile);
+    // An explicit lever the fd budget railed is announced (review round 1,
+    // Issue 10): the listener's start line names the cap in force, not that
+    // the operator's number was reduced — and the rail depends on whether
+    // the startup raise landed (a container with a low hard limit rails
+    // every explicit value).
+    if let Some(v) = explicit {
+        if cap < v {
+            let found = crate::cpu::nofile_soft_as_found();
+            log::warn!(
+                "cluster wire: {MAX_CONNS_ENV}={v} railed to {cap} by the fd budget — \
+                 RLIMIT_NOFILE soft {nofile} in force ({} × {} fds per connection; the soft \
+                 limit as found was {found}{}) — raise the process's hard fd limit for a \
+                 wider cap",
+                CONNECTION_FDS,
+                LISTENER_FD_SHARE,
+                if nofile > found {
+                    ", raised to the hard limit at startup"
+                } else {
+                    ", the startup raise did not move it"
+                }
+            );
+        }
+    }
+    cap
 }
 
 /// The explicit lever: `SQUEEZEFS_CLUSTER_WIRE_MAX_CONNS` (int, 64..=65536)

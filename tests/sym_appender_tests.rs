@@ -29,6 +29,8 @@
 //!   sector 0 otherwise); format under the seam writes appender 0's page
 //!   pair + the directory's first extent.
 
+mod common;
+
 use squeezefs::meta_backend::kv::appender::{
     appender0_page_offsets, appender0_ring_extent, appender_ring_bytes_derived, appenders_capacity,
     classify_page, dir_pair_offsets, dir_pairs_per_extent, forest_slot_of_page_slot, newest_valid,
@@ -1957,10 +1959,15 @@ async fn a_leaf_that_aged_under_a_service_hold_of_the_smo_mutex_is_an_extension_
     // The exclusion is CAPPED (review round 1, Issue 1c): a service hold
     // longer than one landing ceiling excuses the cap and the EXCESS is
     // the overrun — the stall class the ceiling's consumers must see.
+    // The leaf goes dirty UNDER the hold (PR 13e, F-B1): the parked
+    // device above taught the cadence a term past the ceiling, so a leaf
+    // dirtied before the hold is flushed inside one tick — the honest
+    // response to a device that cannot land the promise, and not the
+    // shape this arm judges.
+    let hold = hold_smo_as_service(&va).await;
     ra.create(ROOT_INO, "under-a-long-hold", libc::S_IFREG | 0o644, 0, 0)
         .await
         .unwrap();
-    let hold = hold_smo_as_service(&va).await;
     tokio::time::sleep(std::time::Duration::from_millis(cap + ceiling + 300)).await;
     drop(hold);
     va.checkpoint_now().await.unwrap();
@@ -1988,72 +1995,120 @@ async fn a_leaf_that_aged_under_a_service_hold_of_the_smo_mutex_is_an_extension_
 
 /// **PR 13e, F-B1 (record §3.9.4.6 / §7 item 3 — the box re-run's six
 /// trips with NOTHING excused): the cadence anticipates the cycle's
-/// MEASURED pre-barrier wall, so a stationary slow barrier lands every
-/// leaf inside the landing ceiling.** KD-SYM-10's ceiling is `trigger +
-/// 2 ticks`: the tick wait and the maintenance drain — the cycle's own
-/// pre-barrier wall (the flush pass, the bitmap pages, barrier #1; on the
-/// box 16–106 ms of page writes and barriers under N regions' joins and an
-/// ingest) sat OUTSIDE it, so a leaf dirtied right after a cycle's
-/// collection aged `trigger + ticks + wall` at its covering barrier, and
-/// the audit — correctly — read the wall as an overrun the exclusion of
-/// another actor's hold could not touch (`excused_ns` 0). Here the device's
-/// barrier is parked 1.5× the margin (150 ms at the shipped flush) BEFORE
-/// the open, one cycle warms the measurement, and a steady create stream
-/// keeps a leaf dirty at every instant for five cadence intervals. RED on
-/// `7f4b007e`: every cycle's covering barrier lands `2 × wall` past the
-/// trigger + ticks — an overrun per cycle. GREEN: the decision is taken
-/// against the LAST COLLECTION instant (never the cycle's end — the grant
-/// cadence, a growth, the merge sweep run after the barrier and ate the
-/// margin too) and fires `wall_ewma` early
-/// (`checkpoint::checkpoint_trigger_ms`), so the landing stays inside the
-/// published ceiling: 0 overruns, the wall and the trigger in force
-/// published per volume.
+/// MEASURED pre-barrier wall, so a slow barrier lands every leaf inside
+/// the landing ceiling.** KD-SYM-10's ceiling is `trigger + 2 ticks`: the
+/// tick wait and the maintenance drain — the cycle's own pre-barrier wall
+/// (the flush pass, the bitmap pages, barrier #1; on the box 16–106 ms of
+/// page writes and barriers under N regions' joins and an ingest) sat
+/// OUTSIDE it, and the decision ran from the previous cycle's END (the
+/// grant cadence, a growth, the merge sweep after the barrier ate the
+/// margin too), so a leaf dirtied right after a collection aged
+/// `trigger + ticks + wall` at its covering barrier and the audit —
+/// correctly — read the wall as an overrun the exclusion of another
+/// actor's hold could not touch (`excused_ns` 0). The box's shape here: the
+/// shipped node size, ONE leaf (a directory's children by affinity — no
+/// rotor round-robin, no SMO in the window: an SMO barriers its images, and
+/// the fixture's 64 KiB / 64-rotor geometry ran 1–6 per cycle, walls past
+/// the ceiling itself — a geometry × latency verdict, not a cadence's), a
+/// device barrier parked at 60 % of the margin (60 ms at the shipped
+/// flush; a cycle's barrier coalesces with the lane's in-flight window
+/// barrier, so the wall is 60–120 ms — the box's order), a single creator
+/// keeping the leaf dirty at every instant, two cycles under the stream
+/// warming the measurement, then five cadence intervals. RED on
+/// `7f4b007e`: the covering barrier lands two walls past the trigger +
+/// ticks. GREEN: the decision is taken against the LAST COLLECTION
+/// instant and fires the anticipated wall early
+/// (`checkpoint::checkpoint_trigger_ms` off the decayed high-water mark of
+/// the measured TERM — the pre-barrier wall plus the decision's lateness
+/// beyond one tick, the deferred-flush and maintenance barriers the tick
+/// runs before it decides; a bound anticipated by a bound, never a mean),
+/// and the landing stays inside the published ceiling: 0 overruns, the
+/// term and the trigger in force published per volume.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_cadence_anticipates_the_measured_cycle_wall_so_a_slow_barrier_lands_inside_the_ceiling(
 ) {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
-    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let _ = env_logger::builder().is_test(true).try_init();
+    // The shipped node geometry with a ring wide enough that no reserve
+    // drain forces a cycle mid-window.
+    let p = dir.path().join("meta0");
+    std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+    let plan = plan_meta_slot_set(1).expect("derived plan");
+    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
+    let r = format_v3_stamped(
+        &p,
+        VOL_LEN,
+        &FormatV3Options {
+            node_size: 256 * 1024,
+            journal_len_override: Some(8 * 1024 * 1024),
+            ..set_opts()
+        },
+        plan.stamps[0].clone(),
+    )
+    .await;
+    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    r.expect("format");
+    let uris = vec![p.display().to_string()];
     let path = std::path::PathBuf::from(&uris[0]);
-    let margin_ms = 2 * checkpoint_tick_period_ms(50);
-    let barrier = std::time::Duration::from_millis(margin_ms * 3 / 2);
-    squeezefs::uring_fs::arm_device_latency(&path, std::time::Duration::ZERO, barrier);
-    let ra = open_with_partition(&uris, None).await;
+    // The ARMED plane (the box's posture): a child mints into its parent's
+    // slot by affinity, so ONE directory's stream is ONE leaf per cycle —
+    // unarmed, the shared rotor round-robins it over 64 slot trees and
+    // every cycle flushes 64 leaves with an SMO or two, and the tick's
+    // per-tree maintenance item runs 64 times ahead of its decision. The
+    // affinity ceiling is the box's order (a populated volume's
+    // `used_leaf_bytes / 64` is MiBs; this 64 MiB fixture's derives to
+    // the one-extent floor, which a one-leaf tree sits AT and spills).
+    let ra = common::sym::open_under(&uris, &common::sym::Knobs::armed().affinity_mb("16")).await;
     let va = Arc::clone(&ra.volumes[0]);
     assert_eq!(stats(&va).flush_ceiling_ms, appender_flush_ceiling_ms(50));
-    // One warm cycle: the wall is a measurement before the stream begins.
-    ra.create(ROOT_INO, "warm", libc::S_IFREG | 0o644, 0, 0)
+    // One directory whose children land in ITS slot tree by affinity (one
+    // leaf holds the whole stream); its mint and first records are
+    // checkpointed before the device slows.
+    let d = ra
+        .create(ROOT_INO, "d", libc::S_IFDIR | 0o755, 0, 0)
         .await
-        .unwrap();
+        .unwrap()
+        .ino;
+    for i in 0..4u32 {
+        ra.create(d, &format!("w{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+    }
     va.checkpoint_now().await.unwrap();
-    assert_eq!(stats(&va).flush_ceiling_overruns, 0, "the premise");
-    let checkpoints0 = META_KV_CHECKPOINTS.load(std::sync::atomic::Ordering::Relaxed);
-    // The stream: four creators, each ack waiting the parked barrier, so a
-    // slot-tree leaf is dirty at every instant of the window.
+    let margin_ms = 2 * checkpoint_tick_period_ms(50);
+    let barrier = std::time::Duration::from_millis(margin_ms * 3 / 5);
+    squeezefs::uring_fs::arm_device_latency(&path, std::time::Duration::ZERO, barrier);
+    // The stream: ONE creator, each ack waiting the parked barrier, so the
+    // leaf is dirty at every instant of the window.
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut creators = Vec::new();
-    for t in 0..4u32 {
+    let creator = {
         let ra = Arc::clone(&ra);
         let stop = Arc::clone(&stop);
-        creators.push(tokio::spawn(async move {
+        tokio::spawn(async move {
             let mut i = 0u32;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                ra.create(ROOT_INO, &format!("s{t}-{i}"), libc::S_IFREG | 0o644, 0, 0)
+                ra.create(d, &format!("s{i}"), libc::S_IFREG | 0o644, 0, 0)
                     .await
                     .unwrap();
                 i += 1;
             }
             i
-        }));
-    }
+        })
+    };
+    // Two cycles under the stream warm the measurement (the coalesced
+    // wall is what the high-water mark learns; the decision's lateness
+    // joins it from the first cadence cycle).
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    va.checkpoint_now().await.unwrap();
+    va.checkpoint_now().await.unwrap();
+    let overruns0 = stats(&va).flush_ceiling_overruns;
+    let checkpoints0 = META_KV_CHECKPOINTS.load(std::sync::atomic::Ordering::Relaxed);
     let window = std::time::Duration::from_millis(5 * CHECKPOINT_MAX_AGE_MS as u64 + 500);
     tokio::time::sleep(window).await;
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let mut created = 0u32;
-    for c in creators {
-        created += c.await.unwrap();
-    }
-    assert!(created >= 20, "the stream ran ({created} creates)");
+    let created = creator.await.unwrap();
+    assert!(created >= 40, "the stream ran ({created} creates)");
     squeezefs::uring_fs::disarm_device_latency(&path);
     let s = stats(&va);
     let cycles = META_KV_CHECKPOINTS.load(std::sync::atomic::Ordering::Relaxed) - checkpoints0;
@@ -2062,14 +2117,14 @@ async fn the_cadence_anticipates_the_measured_cycle_wall_so_a_slow_barrier_lands
         "the cadence ran through the window ({cycles} checkpoints)"
     );
     assert_eq!(
-        s.flush_ceiling_overruns,
+        s.flush_ceiling_overruns - overruns0,
         0,
-        "a stationary {} ms barrier must land inside the {} ms ceiling — the cadence \
-         anticipates the wall it measured (RED: {} overrun(s) in {cycles} cycles, the wall \
-         outside the 2-tick margin, nothing excused: the box's F-B1)",
+        "a {} ms barrier must land inside the {} ms ceiling — the cadence anticipates the \
+         wall it measured (RED: {} overrun(s) in {cycles} cycles, the wall outside the 2-tick \
+         margin, nothing excused: the box's F-B1)",
         barrier.as_millis(),
         s.flush_ceiling_ms,
-        s.flush_ceiling_overruns
+        s.flush_ceiling_overruns - overruns0
     );
     for v in &ra.volumes {
         v.shutdown().await.unwrap();

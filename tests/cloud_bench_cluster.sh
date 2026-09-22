@@ -721,15 +721,37 @@ global_exit_trap() {
   fi
 }
 
+# Every refusal that is DECIDABLE on the operator box runs here, BEFORE the
+# typed YES and the first billed minute (review round 1, Issue 10 — a
+# refusal deploy/assemble/bench would have raised is ≈ 15–20 billed
+# node-minutes under `full`): the artifacts, the instrument, and the
+# symmetric shape's own preconditions. The later steps keep their checks
+# (idempotent — a step-by-step operator may change the env between them).
+launch_preflight() {
+  if ! $DRY_RUN; then
+    [ -f "$SSH_KEY_FILE" ] || die "SSH key file not found: $SSH_KEY_FILE"
+    [ -x "$ARTIFACT_DIR/squeezefs" ] \
+      || die "squeezefs artifact missing/not executable: $ARTIFACT_DIR/squeezefs (build elsewhere: task build:${ARTIFACT_DIR##*/}) — refused BEFORE launch"
+    if [ "$PRESET" != "mw" ] && [ ! -x "$ELBENCHO_BIN" ]; then
+      die "elbencho artifact missing: $ELBENCHO_BIN (must be a DYNAMIC build) — refused BEFORE launch"
+    fi
+  fi
+  if [ "$PRESET" = "mw" ]; then
+    if [ "$SYMMETRIC" = "1" ]; then
+      sym_preflight
+    else
+      mw_shape_check
+    fi
+  fi
+}
+
 cmd_launch() {
   require_local_tools
 
   # --- Max-spend guard: refuse to launch without it -----------------------
   [[ "$MAX_CLUSTER_HOURS" =~ ^[0-9]+$ ]] && [ "$MAX_CLUSTER_HOURS" -ge 1 ] \
     || die "max-spend guard not set: export MAX_CLUSTER_HOURS=<positive integer hours>. The script will not launch billing instances without a deadline (preset $PRESET costs $EST_CLUSTER_HOURLY)."
-  if ! $DRY_RUN; then
-    [ -f "$SSH_KEY_FILE" ] || die "SSH key file not found: $SSH_KEY_FILE"
-  fi
+  launch_preflight
 
   CID="sqzbench-$(date +%Y%m%d-%H%M%S)"
   STATE_DIR="$STATE_ROOT/$CID"
@@ -1595,6 +1617,38 @@ sym_shape_check() {
   [ "$SYM_ARM_A" = "0" ] || die "SYM_ARM_A=1: the design's 'vs today' A arm (authority + co-writers on N nodes) is NOT BUILT in PR 15 — this rig has no per-node co-writer recipe (the co-located v5-mw recipe is client0-only); the B-only law rows are the minimum. Run with SYM_ARM_A=0."
 }
 
+# The row set's preconditions, decidable on the operator box: the row
+# words, the gate-3b shape (>= 2 JOINED writers), the corpus, the driver,
+# the numbers. Run at launch (before money) and again at bench-sym.
+sym_preflight() {
+  sym_shape_check
+  local r
+  for r in ${SYM_ROWS//,/ }; do
+    case "$r" in tarx | scale | shared) ;; *) die "SYM_ROWS names an unknown row set '$r' (tarx|shared|scale)" ;; esac
+  done
+  if [[ ",$SYM_ROWS," == *,shared,* ]] && [ "$N_CLIENT" -lt 3 ]; then
+    die "gate 3b (sym-shared-dir) needs >= 2 JOINED writers — the flip triggers on foreign creates from MORE THAN ONE creator and the holder is a joined writer — so N_CLIENT >= 3 (have $N_CLIENT); use N_CLIENT=3 or SYM_ROWS=tarx,scale"
+  fi
+  if [[ ",$SYM_ROWS," == *,tarx,* ]]; then
+    if [ -n "$SYM_TARBALL" ]; then
+      $DRY_RUN || [ -s "$SYM_TARBALL" ] || die "SYM_TARBALL=$SYM_TARBALL is missing/empty"
+    elif [ -n "$SYM_TAR_SRC" ]; then
+      $DRY_RUN || [ -d "$SYM_TAR_SRC" ] || die "SYM_TAR_SRC=$SYM_TAR_SRC is not a directory"
+    else
+      die "the gate-2 row needs the corpus — SYM_TAR_SRC=<linux>/fs (the box used linux-7.2.3/fs, 2,468 entries) or SYM_TARBALL=<file>; or drop tarx from SYM_ROWS"
+    fi
+  fi
+  [ -x "$(dirname "$SCRIPT_PATH")/cloud_sym_rows.sh" ] || die "row driver missing: $(dirname "$SCRIPT_PATH")/cloud_sym_rows.sh"
+  [ -r "$(dirname "$SCRIPT_PATH")/sym_rows_lib.sh" ] || die "law lib missing: $(dirname "$SCRIPT_PATH")/sym_rows_lib.sh"
+  [ -r "$(dirname "$SCRIPT_PATH")/mdstorm.c" ] || die "tests/mdstorm.c missing (the create storm the driver compiles on every writer node)"
+  [[ "$SYM_RT" =~ ^[0-9]+$ ]] || die "SYM_RT must be seconds (got: $SYM_RT)"
+  [[ "$SYM_FILES" =~ ^[0-9]+$ ]] && [ "$SYM_FILES" -ge 100 ] || die "SYM_FILES must be an integer >= 100 (got: $SYM_FILES)"
+  [[ "$SYM_THREADS" =~ ^[0-9]+$ ]] && [ "$SYM_THREADS" -ge 1 ] || die "SYM_THREADS must be an integer >= 1 (got: $SYM_THREADS)"
+  [[ "$SYM_INGEST_MB" =~ ^[0-9]+$ ]] && [ "$SYM_INGEST_MB" -ge 4 ] && [ $((SYM_INGEST_MB % 4)) -eq 0 ] \
+    || die "SYM_INGEST_MB must be a multiple of 4 MiB >= 4 (got: $SYM_INGEST_MB)"
+  [ -z "$SYM_SCALE_NS" ] || [[ "$SYM_SCALE_NS" =~ ^[0-9]+(,[0-9]+)*$ ]] || die "SYM_SCALE_NS must be a comma-separated N list (got: $SYM_SCALE_NS)"
+}
+
 # The one flattened-stats reader the remote gates use (the JSON nests under
 # "metrics") — v5-mw / mw_fleet's stat_field, plus a per-volume FIRST and
 # an ALL-EQUAL face for the symmetric families (JSON arrays per volume).
@@ -2048,23 +2102,18 @@ cmd_sym_hook() {
 cmd_bench_sym() {
   require_local_tools
   load_state --placeholder-ok
-  sym_shape_check
+  sym_preflight
   local -a clients
   mapfile -t clients < <(sym_client_names)
   [ "${#clients[@]}" -ge 2 ] || die "bench-sym needs >= 2 client nodes (assemble-sym first)"
+  [ "${#clients[@]}" -eq "$N_CLIENT" ] || die "bench-sym: the cluster has ${#clients[@]} client nodes but N_CLIENT=$N_CLIENT — pass the shape the cluster was launched with"
   local driver
   driver="$(dirname "$SCRIPT_PATH")/cloud_sym_rows.sh"
-  [ -x "$driver" ] || die "row driver missing: $driver"
   local corpus_arg=""
   if [ -n "$SYM_TARBALL" ]; then
     corpus_arg="--tarball=$SYM_TARBALL"
   elif [ -n "$SYM_TAR_SRC" ]; then
     corpus_arg="--tar-src=$SYM_TAR_SRC"
-  elif [[ ",$SYM_ROWS," == *,tarx,* ]]; then
-    die "bench-sym: the gate-2 row needs the corpus — SYM_TAR_SRC=<linux>/fs (the box used linux-7.2.3/fs, 2,468 entries) or SYM_TARBALL=<file>; or drop tarx from SYM_ROWS"
-  fi
-  if [[ ",$SYM_ROWS," == *,shared,* ]] && [ "${#clients[@]}" -lt 3 ]; then
-    die "bench-sym: gate 3b (sym-shared-dir) needs >= 2 JOINED writers — the flip triggers on foreign creates from MORE THAN ONE creator and the holder is a joined writer — so N_CLIENT >= 3 (have ${#clients[@]}); relaunch with N_CLIENT=3 or run SYM_ROWS=tarx,scale on this cluster"
   fi
   local ns="$SYM_SCALE_NS"
   if [ -z "$ns" ]; then

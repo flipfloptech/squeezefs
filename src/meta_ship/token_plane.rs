@@ -2217,12 +2217,34 @@ pub fn not_holder_redirect(e: &SqueezefsError) -> Option<NotHolderRedirect> {
     }
 }
 
-/// Why a token could not be served (never a stale answer).
+/// Why a token could not be served (never a stale answer). Typed
+/// `Refused { EIO }`, not `Io`: the plane's LAW words (past `T_self`, a
+/// stale channel, a holder's decoded refusal) must never read as the
+/// wire's transport class — `is_transport_failure` classes every `Io`
+/// as the wire's, and the root-attr projection arm (PR 13c, F-B3) serves
+/// the mount root through that class alone.
 fn fail_closed(what: &str) -> SqueezefsError {
-    SqueezefsError::Io(std::io::Error::other(format!(
-        "read token unavailable: {what} (R-SYM-4: a foreign object is served under a token or \
-         not at all)"
-    )))
+    SqueezefsError::refused(
+        libc::EIO,
+        format!(
+            "read token unavailable: {what} (R-SYM-4: a foreign object is served under a token \
+             or not at all)"
+        ),
+    )
+}
+
+/// The recall channel to the holder has no fresh session — mid-dial,
+/// refused at the holder's cap, failed and re-dialing. A WIRE state, so
+/// it wears the tree's transport word (`Io(NotConnected)` → EIO, the
+/// shipped errno; `is_transport_failure` classes it as the wire's): the
+/// mount root's projection arm reads it as transient, and every child
+/// stays fail-closed exactly as before.
+fn channel_not_fresh() -> SqueezefsError {
+    SqueezefsError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotConnected,
+        "read token unavailable: the recall channel to the holder is not fresh (R-SYM-4: a \
+         foreign object is served under a token or not at all)",
+    ))
 }
 
 impl TokenReaderPlane {
@@ -2518,7 +2540,7 @@ impl TokenReaderPlane {
         }
         if !self.channel_fresh() {
             self.serve_refusals.fetch_add(1, Ordering::Relaxed);
-            return Err(fail_closed("the recall channel to the holder is not fresh"));
+            return Err(channel_not_fresh());
         }
         Ok(())
     }

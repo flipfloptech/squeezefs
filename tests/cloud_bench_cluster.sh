@@ -13,7 +13,8 @@
 #     ($SSH_KEY_FILE) readable by you.
 #   * Spot vCPU quota for the preset ("All Standard (A, C, D, H, I, M, R, T,
 #     Z) Spot Instance Requests"): i4i preset needs 96 vCPUs, i3en preset
-#     needs 288 vCPUs, mw preset needs 32 vCPUs.
+#     needs 288 vCPUs, mw preset needs 32 vCPUs (SYMMETRIC=1: 8 x (3 + N_CLIENT)
+#     — S1 N_CLIENT=3 48, S2 N_CLIENT=8 88).
 #   * Pre-built artifacts in $ARTIFACT_DIR (this script DEPLOYS, it does not
 #     build): `squeezefs` (linux-gnu, glibc ≤ the AMI's — use the
 #     `task build:ubuntu2404` dist output; the mw preset rides the Ubuntu

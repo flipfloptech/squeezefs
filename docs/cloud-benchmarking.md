@@ -28,8 +28,9 @@ venue exists only for the final sustained verdict.
   `MaxAuthTries` would otherwise never offer the bench key (2026-09-12: a
   launch stalled at 6/7 nodes on "Too many authentication failures").
 - **vCPU quota** in the market you launch in — the `i4i` preset needs 96
-  vCPUs, `i3en` 288, `mw` 32 (for `MARKET=spot` that is the "All Standard
-  (A, C, D, H, I, M, R, T, Z) Spot Instance Requests" quota).
+  vCPUs, `i3en` 288, `mw` 32, `mw` + `SYMMETRIC=1` 8 × (3 + N_CLIENT): S1
+  (`N_CLIENT=3`) 48, S2 (`N_CLIENT=8`) 88 (for `MARKET=spot` that is the
+  "All Standard (A, C, D, H, I, M, R, T, Z) Spot Instance Requests" quota).
 - **Pre-built artifacts** in `ARTIFACT_DIR` (the script *deploys*, it never
   builds): `squeezefs` (glibc must fit the AMI — `task build:ubuntu2404` →
   `dist/ubuntu2404/` for the Ubuntu 24.04 presets; the `mw` preset rides

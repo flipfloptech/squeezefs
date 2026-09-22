@@ -1888,7 +1888,8 @@ impl RoutedMetaBackend {
     /// the record's µs polish is its holder's); every other foreign-slot
     /// setattr SHIPS to the slot holder, which applies it under its lease
     /// and door and answers the record. `Ok(None)` = this mount's to
-    /// apply.
+    /// apply. The caller has already read `record_ship::slot_is_foreign`
+    /// true (the trait entry boxes this arm behind that predicate).
     #[allow(clippy::too_many_arguments)] // the trait's parameter surface
     async fn ship_foreign_slot_setattr(
         &self,
@@ -1901,9 +1902,6 @@ impl RoutedMetaBackend {
         mtime: Option<u64>,
         ctime: Option<u64>,
     ) -> Result<Option<Inode>> {
-        if !record_ship::slot_is_foreign(self, ino) {
-            return Ok(None);
-        }
         let times_only =
             mode.is_none() && uid.is_none() && gid.is_none() && size.is_none() && atime.is_none();
         if times_only && ctime.is_some() {
@@ -3594,26 +3592,41 @@ impl RoutedMetaBackend {
         // PR 7b (design §5.6.5): a STRIPED directory's `nlink`/times are
         // the fold over its stripes (each stripe's record is the exact
         // delta its own inserts wrote); the persist runs after the shared
-        // guard dropped — it takes the exclusive one.
-        if inode.mode & libc::S_IFMT == libc::S_IFDIR {
-            // A writer reads the map (its own tree, or a token read it
-            // pays anyway); a TOKEN READER folds only over a map it
-            // already knows — its `readdir` / `lookup` learn it — so a
-            // `stat`-only reader pays one grant per directory, not two.
-            let map = if self.volumes[v_idx].slot_lease_armed() {
-                self.stripe_map(ino).await?
-            } else if self.volumes[v_idx].striping_plane_armed() {
-                self.stripe_map_cached(ino)
-            } else {
-                None
-            };
-            if let Some(map) = map {
-                if let Some((mtime, ctime)) = self.fold_striped_attrs(&mut inode, &map).await? {
-                    self.persist_striped_times(ino, mtime, ctime).await;
-                }
-            }
+        // guard dropped — it takes the exclusive one. Boxed (PR 13f): the
+        // fold's state is 5 KiB of the striping plane's — an unarmed
+        // volume's every `getattr` box carried it.
+        if inode.mode & libc::S_IFMT == libc::S_IFDIR
+            && (self.volumes[v_idx].slot_lease_armed()
+                || self.volumes[v_idx].striping_plane_armed())
+        {
+            Box::pin(self.fold_striped_dir_attrs(ino, v_idx, &mut inode)).await?;
         }
         Ok(inode)
+    }
+
+    /// [`Self::getattr_local`]'s striped-directory arm: the map, the fold,
+    /// the persist (armed volumes only — the caller's gate).
+    async fn fold_striped_dir_attrs(
+        &self,
+        ino: Ino,
+        v_idx: usize,
+        inode: &mut Inode,
+    ) -> Result<()> {
+        // A writer reads the map (its own tree, or a token read it
+        // pays anyway); a TOKEN READER folds only over a map it
+        // already knows — its `readdir` / `lookup` learn it — so a
+        // `stat`-only reader pays one grant per directory, not two.
+        let map = if self.volumes[v_idx].slot_lease_armed() {
+            self.stripe_map(ino).await?
+        } else {
+            self.stripe_map_cached(ino)
+        };
+        if let Some(map) = map {
+            if let Some((mtime, ctime)) = self.fold_striped_attrs(inode, &map).await? {
+                self.persist_striped_times(ino, mtime, ctime).await;
+            }
+        }
+        Ok(())
     }
 
     /// The **commit watermark** of `ino`'s volume (rung 12): the journal
@@ -5112,12 +5125,17 @@ impl Metadata for RoutedMetaBackend {
         }
         // PR 13b: a foreign-slot record's mutation SHIPS to its slot holder
         // (the kernel's times echo excepted — answered from the holder's
-        // exact record, never a wire trip for a no-op).
-        if let Some(served) = self
-            .ship_foreign_slot_setattr(ino, mode, uid, gid, size, atime, mtime, ctime)
+        // exact record, never a wire trip for a no-op). The sync predicate
+        // decides here; the ship's state rides a box (PR 13f — a wire round
+        // trip owns its allocation, the unarmed echo's future does not).
+        if record_ship::slot_is_foreign(self, ino) {
+            if let Some(served) = Box::pin(
+                self.ship_foreign_slot_setattr(ino, mode, uid, gid, size, atime, mtime, ctime),
+            )
             .await?
-        {
-            return Ok(served);
+            {
+                return Ok(served);
+            }
         }
         // S10 coherence law (rung 12): attrs are exactly what a LOOKUP
         // delegation serves.

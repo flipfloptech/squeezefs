@@ -20518,6 +20518,21 @@ impl SqueezefsFilesystem {
             .map(|(ino, _)| ino)
     }
 
+    /// The unlink handler's overlay-drain arm (§7 row 6): resolve the
+    /// name, drain every device overlay of the child. Its own `async fn`
+    /// so the handler boxes it inside the `any_open_fast` branch (PR 13f).
+    async fn drain_unlink_target_overlays(
+        &self,
+        parent: u64,
+        name: &str,
+    ) -> Result<(), SqueezefsError> {
+        if let Some(child) = self.lookup_ino_for_overlay_drain(parent, name).await {
+            self.drain_device_overlays_for_ino(child, u64::MAX, false)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Await overlapping in-flight stores on `[first_page, pages)`.
     /// ACK-early returns before CQE; coverage is published only at
     /// complete_store (law 3). A long wait is the tripwire.
@@ -22213,6 +22228,98 @@ impl SqueezefsFilesystem {
             })
             .await;
         }
+    }
+
+    /// The SETATTR handler's truncate arm (`size` in the request), run
+    /// under the handler's per-inode write guard and BEFORE the inode
+    /// record's own setattr commit: lease, grow-vs-shrink classification
+    /// against the freshest size, the straddling block's tail zeroed, the
+    /// beyond-EOF overlays dropped, the layout pruned. Its own `async fn`
+    /// so the handler can `Box::pin` it inside the size branch (PR 13f):
+    /// the kernel runs SETATTR as a ctime echo after every rename /
+    /// unlink, and this arm's state is the data plane's whole publish
+    /// path — inline it made every echo move 24 KiB twice.
+    /// `durable_size` is the inode record's size the handler already read.
+    async fn setattr_truncate(&self, ino: u64, new_size: u64, durable_size: u64) -> FuseResult<()> {
+        // Truncate is a MUTATION: hold the shared op lease exactly
+        // like the write path (get_or_acquire_lease — cached-lease
+        // reuse), never a bare token snapshot. The snapshot raced
+        // any transient background acquirer (drain/clone-class)
+        // re-acquiring after release dropped the cached lease: the
+        // token bumped between the snapshot and the layout save's
+        // fence, and the truncate — since the O_TRUNC fix, run on
+        // every open(O_TRUNC) — surfaced the transient as EIO to
+        // open(2) (the aborted first generic/074 ×20, run 2).
+        // With the shared cache, either both sides reuse one lease
+        // (no bump) or the acquisition serializes behind the
+        // transient holder — no stale-token window exists.
+        let fencing_token = self
+            .acquire_write_lease(ino)
+            .await
+            .map_err(map_squeezefs_err)?;
+        // Classify grow-vs-shrink against the FRESHEST size, never the
+        // durable inode size alone: staged/inline writes defer their
+        // layout+size persist, so `current_inode.size` lags and a real
+        // shrink would be misclassified as a grow (skipping the
+        // straddle-zero below — the generic/075 stale-tail trap).
+        let old_size = self
+            .freshest_size(ino)
+            .await
+            .map_err(map_squeezefs_err)?
+            .max(durable_size);
+
+        // Striped shrink to a non-block-aligned size: the block that
+        // straddles new_size survives the map removal below with stale
+        // bytes in [new_size, block_end). A later re-extend would read
+        // those instead of zeros (a hole must read zeros). RMW-zero that
+        // tail now, while the file is still at its old size so the write
+        // never grows it — the block is then stored clean. This consumes
+        // (and thereby clips) any parked/staged overlay of the straddling
+        // block as its RMW base.
+        if new_size < old_size {
+            let bs = self.router.block_size.load(Ordering::Relaxed);
+            if bs > 0 && new_size % bs != 0 {
+                let file_path = crate::keys::inode_path(ino);
+                if let Ok(meta) = self.router.fetch_metadata(&file_path).await {
+                    if meta.file_type == "striped" {
+                        let block_end = (new_size / bs + 1) * bs;
+                        let zero_to = std::cmp::min(old_size, block_end);
+                        if zero_to > new_size {
+                            let zeros =
+                                bytes::Bytes::from(vec![0u8; (zero_to - new_size) as usize]);
+                            self.write_file_staged(ino, new_size, zeros, old_size, fencing_token)
+                                .await
+                                .map_err(map_squeezefs_err)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Blocks entirely at/after new_size are GONE: their parked RAM
+        // buffers and staged `active_block:` overlays must die with
+        // them, or the stale overlay outlives the map prune — serving
+        // pre-truncate bytes to single-block reads, seeding the next
+        // partial write's RMW, and re-merging the whole stale block on
+        // the next flush (the generic/075.2 resurrection). Purge BEFORE
+        // the map prune so a racing writeback upload NotFound-skips;
+        // one that already merged is pruned by truncate_layout below.
+        self.drop_active_block_overlays_beyond(ino, new_size).await;
+
+        if let Err(e) = self
+            .router
+            .truncate_layout(ino, new_size, fencing_token)
+            .await
+        {
+            // Same hygiene as the write path: a fenced lease is
+            // stale — drop the local cache so the retry (kernel or
+            // app) re-acquires fresh.
+            if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
+                self.invalidate_local_lease(ino);
+            }
+            return Err(map_squeezefs_err(e));
+        }
+        Ok(())
     }
 
     /// The freshest known logical size of `ino`: the maximum of the durable
@@ -28143,6 +28250,11 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         let prof = OpProf::begin(FuseOpKind::Setattr, ino);
+        // PR 13f: this future is `Box::pin`ned onto a lane and moved at
+        // the handoff once per op, and the kernel runs it as a ctime ECHO
+        // after every rename / unlink. Every truncate-only arm below is
+        // boxed inside its branch so the echo's state stays small
+        // (`tests/meta_op_future_economy_tests.rs` pins the budget).
         let setattr_future = async {
             let backend = self
                 .meta_backend
@@ -28168,7 +28280,7 @@ impl Filesystem for SqueezefsFilesystem {
                 // or below the cut DRAIN so the truncate operates on
                 // published state.
                 if crate::device_overlay::any_open_fast() {
-                    self.drain_device_overlays_for_ino(ino, size, false)
+                    Box::pin(self.drain_device_overlays_for_ino(ino, size, false))
                         .await
                         .map_err(map_squeezefs_err)?;
                 }
@@ -28221,93 +28333,10 @@ impl Filesystem for SqueezefsFilesystem {
             };
 
             if let Some(new_size) = size_to_set {
-                // Truncate is a MUTATION: hold the shared op lease exactly
-                // like the write path (get_or_acquire_lease — cached-lease
-                // reuse), never a bare token snapshot. The snapshot raced
-                // any transient background acquirer (drain/clone-class)
-                // re-acquiring after release dropped the cached lease: the
-                // token bumped between the snapshot and the layout save's
-                // fence, and the truncate — since the O_TRUNC fix, run on
-                // every open(O_TRUNC) — surfaced the transient as EIO to
-                // open(2) (the aborted first generic/074 ×20, run 2).
-                // With the shared cache, either both sides reuse one lease
-                // (no bump) or the acquisition serializes behind the
-                // transient holder — no stale-token window exists.
-                let fencing_token = self
-                    .acquire_write_lease(ino)
-                    .await
-                    .map_err(map_squeezefs_err)?;
-                // Classify grow-vs-shrink against the FRESHEST size, never the
-                // durable inode size alone: staged/inline writes defer their
-                // layout+size persist, so `current_inode.size` lags and a real
-                // shrink would be misclassified as a grow (skipping the
-                // straddle-zero below — the generic/075 stale-tail trap).
-                let old_size = self
-                    .freshest_size(ino)
-                    .await
-                    .map_err(map_squeezefs_err)?
-                    .max(current_inode.size);
-
-                // Striped shrink to a non-block-aligned size: the block that
-                // straddles new_size survives the map removal below with stale
-                // bytes in [new_size, block_end). A later re-extend would read
-                // those instead of zeros (a hole must read zeros). RMW-zero that
-                // tail now, while the file is still at its old size so the write
-                // never grows it — the block is then stored clean. This consumes
-                // (and thereby clips) any parked/staged overlay of the straddling
-                // block as its RMW base.
-                if new_size < old_size {
-                    let bs = self.router.block_size.load(Ordering::Relaxed);
-                    if bs > 0 && new_size % bs != 0 {
-                        let file_path = crate::keys::inode_path(ino);
-                        if let Ok(meta) = self.router.fetch_metadata(&file_path).await {
-                            if meta.file_type == "striped" {
-                                let block_end = (new_size / bs + 1) * bs;
-                                let zero_to = std::cmp::min(old_size, block_end);
-                                if zero_to > new_size {
-                                    let zeros = bytes::Bytes::from(vec![
-                                        0u8;
-                                        (zero_to - new_size)
-                                            as usize
-                                    ]);
-                                    self.write_file_staged(
-                                        ino,
-                                        new_size,
-                                        zeros,
-                                        old_size,
-                                        fencing_token,
-                                    )
-                                    .await
-                                    .map_err(map_squeezefs_err)?;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Blocks entirely at/after new_size are GONE: their parked RAM
-                // buffers and staged `active_block:` overlays must die with
-                // them, or the stale overlay outlives the map prune — serving
-                // pre-truncate bytes to single-block reads, seeding the next
-                // partial write's RMW, and re-merging the whole stale block on
-                // the next flush (the generic/075.2 resurrection). Purge BEFORE
-                // the map prune so a racing writeback upload NotFound-skips;
-                // one that already merged is pruned by truncate_layout below.
-                self.drop_active_block_overlays_beyond(ino, new_size).await;
-
-                if let Err(e) = self
-                    .router
-                    .truncate_layout(ino, new_size, fencing_token)
-                    .await
-                {
-                    // Same hygiene as the write path: a fenced lease is
-                    // stale — drop the local cache so the retry (kernel or
-                    // app) re-acquires fresh.
-                    if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
-                        self.invalidate_local_lease(ino);
-                    }
-                    return Err(map_squeezefs_err(e));
-                }
+                // Boxed: the truncate arm carries the data plane's whole
+                // publish state (the tail-zeroing staged write, the layout
+                // prune) — 24 KiB the ctime echo must not move.
+                Box::pin(self.setattr_truncate(ino, new_size, current_inode.size)).await?;
             }
 
             let backend_res = backend
@@ -28587,13 +28616,13 @@ impl Filesystem for SqueezefsFilesystem {
             // BEFORE the unlink — an unlinked-but-open file must keep
             // reading its ACKed bytes, so overlays PUBLISH (never
             // supersede) and the delete's own machinery then frees the
-            // published blocks through the ordinary ladder.
+            // published blocks through the ordinary ladder. Boxed (PR
+            // 13f): the drain's state is the overlay settle's whole
+            // publish path, 11 KiB every overlay-less unlink moved.
             if crate::device_overlay::any_open_fast() {
-                if let Some(child) = self.lookup_ino_for_overlay_drain(parent, &name_str).await {
-                    self.drain_device_overlays_for_ino(child, u64::MAX, false)
-                        .await
-                        .map_err(map_squeezefs_err)?;
-                }
+                Box::pin(self.drain_unlink_target_overlays(parent, &name_str))
+                    .await
+                    .map_err(map_squeezefs_err)?;
             }
             let backend = self
                 .meta_backend

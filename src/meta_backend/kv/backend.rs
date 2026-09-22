@@ -3767,6 +3767,19 @@ impl KvMetaBackend {
         if self.tokens_reader.get().is_none() && self.appenders.is_none() {
             return Ok(None);
         }
+        // PR 13f: the divert's state (its three serve arms) rides a box so
+        // the five read verbs' futures — and the routed `getattr` box the
+        // kernel's ctime echo constructs — carry a pointer to it, not it.
+        Box::pin(self.token_serve_armed(object, wants)).await
+    }
+
+    /// [`Self::token_serve`]'s body past the flat volume's probes.
+    async fn token_serve_armed(
+        &self,
+        object: Ino,
+        wants: crate::meta_ship::token_plane::TokenWants,
+    ) -> std::result::Result<Option<Option<crate::meta_ship::token_plane::TokenServe>>, KvError>
+    {
         let joined = self
             .appenders
             .as_ref()
@@ -7936,10 +7949,15 @@ impl KvMetaBackend {
                         // (region 0, one tree-0 put); a JOINED appender
                         // asks its manager over the wire (PR 12b), whose
                         // reply is what its projection learns from.
+                        // Boxed (PR 13f): a first touch is one durable
+                        // control write per slot per mount, and its arms'
+                        // state (4.5 KiB) sat inline in EVERY commit's
+                        // future — the door runs inside every routed
+                        // mutation's box on every posture.
                         let acquired = if set.is_joined_appender() {
-                            self.joined_acquire_slot(slot).await
+                            Box::pin(self.joined_acquire_slot(slot)).await
                         } else {
-                            self.manager_acquire_slots(0, 0, &[slot], ControlAdmit::Park)
+                            Box::pin(self.manager_acquire_slots(0, 0, &[slot], ControlAdmit::Park))
                                 .await
                                 .map(|_| ())
                         };

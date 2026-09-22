@@ -418,11 +418,17 @@ pub async fn note_served(
             return;
         }
     };
-    note_served_mutation(ino, ServedMutation::Attrs).await;
-    let Some(client) = crate::meta_ship::current_ship_client() else {
-        return;
-    };
-    note_served_slot_ship(routed, ino, &client, served_at).await;
+    // Boxed (PR 13f): the served tail's state (the sink, the dominance
+    // note's resolve) sat inline in every routed record verb's future on
+    // every posture; a served verb owns its allocation.
+    Box::pin(async {
+        note_served_mutation(ino, ServedMutation::Attrs).await;
+        let Some(client) = crate::meta_ship::current_ship_client() else {
+            return;
+        };
+        note_served_slot_ship(routed, ino, &client, served_at).await;
+    })
+    .await;
 }
 
 /// **The slot's dominance window fed by ONE served act** (§5.1.4 — a

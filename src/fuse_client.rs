@@ -13781,7 +13781,7 @@ impl SqueezefsFilesystem {
                 // PR 13e (F-B1): the cadence's age law per volume — the
                 // measured landing TERM of a checkpoint cycle (the
                 // pre-barrier wall + the age decision's lateness beyond
-                // one tick, a decayed high-water mark — the interval the
+                // one tick, the maximum over the horizon — the interval the
                 // flush-ceiling audit measures past the priced ticks) and
                 // the TRIGGER in force at the shipped ceiling: `ceiling −
                 // term` on a forest volume (the landing stays inside the

@@ -2011,17 +2011,21 @@ async fn a_leaf_that_aged_under_a_service_hold_of_the_smo_mutex_is_an_extension_
 /// the fixture's 64 KiB / 64-rotor geometry ran 1–6 per cycle, walls past
 /// the ceiling itself — a geometry × latency verdict, not a cadence's), a
 /// device barrier parked at 60 % of the margin (60 ms at the shipped
-/// flush; a cycle's barrier coalesces with the lane's in-flight window
-/// barrier, so the wall is 60–120 ms — the box's order), a single creator
-/// keeping the leaf dirty at every instant, two cycles under the stream
-/// warming the measurement, then five cadence intervals. RED on
+/// flush; a flush pass's compaction barriers its images too, so the term
+/// is 60–120 ms — the box's order, past the margin), a single creator
+/// paced at one tick (the leaf dirty within a tick of every collection; a
+/// STATIONARY storm — an unpaced one grows its flush passes' SMO count as
+/// the leaf fills, a burst larger than every one before it, which the
+/// tripwire is designed to catch), two cycles under the stream warming
+/// the measurement, then five cadence intervals. RED on
 /// `7f4b007e`: the covering barrier lands two walls past the trigger +
 /// ticks. GREEN: the decision is taken against the LAST COLLECTION
 /// instant and fires the anticipated wall early
-/// (`checkpoint::checkpoint_trigger_ms` off the decayed high-water mark of
+/// (`checkpoint::checkpoint_trigger_ms` off the horizon maximum of
 /// the measured TERM — the pre-barrier wall plus the decision's lateness
 /// beyond one tick, the deferred-flush and maintenance barriers the tick
-/// runs before it decides; a bound anticipated by a bound, never a mean),
+/// runs before it decides, its wait for the SMO mutex left out; a bound
+/// anticipated by a bound, never a mean),
 /// and the landing stays inside the published ceiling: 0 overruns, the
 /// term and the trigger in force published per volume.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2076,11 +2080,22 @@ async fn the_cadence_anticipates_the_measured_cycle_wall_so_a_slow_barrier_lands
             .unwrap();
     }
     va.checkpoint_now().await.unwrap();
+    // The barrier is 60 % of the 100 ms margin: a paced storm's term then
+    // reads 60–120 ms (one barrier, or a compaction's second one) — the
+    // box's 16–106 ms class, PAST the margin on the base cadence (RED 5/5
+    // at 1,121–1,174 ms) and inside the anticipation on the fix. A 25 ms
+    // barrier's 26 ms term sits INSIDE the margin on the base too and
+    // pins nothing.
     let margin_ms = 2 * checkpoint_tick_period_ms(50);
     let barrier = std::time::Duration::from_millis(margin_ms * 3 / 5);
     squeezefs::uring_fs::arm_device_latency(&path, std::time::Duration::ZERO, barrier);
-    // The stream: ONE creator, each ack waiting the parked barrier, so the
-    // leaf is dirty at every instant of the window.
+    // The stream: ONE creator PACED at a tick — the leaf is dirty within
+    // one tick of every collection (the worst leaf the ceiling bounds),
+    // and the storm is STATIONARY: an unpaced creator fills the leaf's log
+    // faster every second and its flush passes run 1 → 2 → 3 SMOs, a burst
+    // larger than every one before it, which the tripwire is DESIGNED to
+    // catch (the derivation anticipates the measured term, never a growth
+    // it has not seen).
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let creator = {
         let ra = Arc::clone(&ra);
@@ -2092,13 +2107,17 @@ async fn the_cadence_anticipates_the_measured_cycle_wall_so_a_slow_barrier_lands
                     .await
                     .unwrap();
                 i += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(checkpoint_tick_period_ms(
+                    50,
+                )))
+                .await;
             }
             i
         })
     };
     // Two cycles under the stream warm the measurement (the coalesced
-    // wall is what the high-water mark learns; the decision's lateness
-    // joins it from the first cadence cycle).
+    // wall is what the window learns; the decision's lateness joins it
+    // from the first cadence cycle).
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     va.checkpoint_now().await.unwrap();
     va.checkpoint_now().await.unwrap();

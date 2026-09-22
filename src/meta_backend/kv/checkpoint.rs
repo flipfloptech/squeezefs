@@ -1048,15 +1048,16 @@ pub fn checkpoint_landing_ceiling_ms(flush_interval_ms: u64) -> u64 {
 /// one period of the tick's own work alone; the cycle's TERM — its
 /// pre-barrier wall (the flush pass, the bitmap pages, barrier #1 — at N
 /// regions their page writes, at a full cache the appends) plus the
-/// decision's lateness beyond that one period (the deferred-flush barrier
-/// and a maintenance item's device time run BEFORE the tick decides) —
-/// sat OUTSIDE it, so a leaf dirtied right after a cycle's collection
-/// aged `trigger + late + wall` at the next covering barrier and the
+/// tick's own pre-decision work beyond that one period (the deferred-flush
+/// barrier and a maintenance item's device time run BEFORE the tick
+/// decides) — sat OUTSIDE it, so a leaf dirtied right after a cycle's
+/// collection aged `trigger + late + wall` at the next covering barrier and the
 /// audit read the excess as an overrun (16–106 ms past 1,100 on the box,
 /// `excused_ns` 0: no other actor's hold, the cadence's own term). The
 /// decision anticipates the term it has measured
-/// ([`anticipated_cycle_term_ns`] — a decayed high-water mark of
-/// [`checkpoint_cycle_term_ns`], the same interval the audit measures)
+/// ([`CycleTermWindow`] — the maximum of [`checkpoint_cycle_term_ns`] over
+/// the last [`TERM_HORIZON_CYCLES`] cycles, the same interval the audit
+/// measures)
 /// so the LANDING stays inside the published ceiling on a stationary
 /// term; a cycle SLOWER than the measured one still trips the audit —
 /// the tripwire keeps its teeth, the published number never widens. A
@@ -1070,36 +1071,80 @@ pub fn checkpoint_trigger_ms(ceiling_ms: u64, anticipated_term_ms: u64) -> u64 {
 /// **One cycle's landing TERM**, ns — the interval between the trigger
 /// firing and the covering barrier that the ceiling's `2 × tick` does not
 /// price (PR 13e, F-B1): the cycle's pre-barrier wall (start → barrier #1)
-/// plus the decision's lateness past the trigger BEYOND one tick —
-/// `wall + (late − tick)⁺`. One tick of lateness is the cadence's
-/// quantization and is the ceiling's first tick; the excess is the tick's
-/// own device work ahead of its decision (the deferred-flush barrier, a
+/// plus the age decision's lateness past the trigger BEYOND one tick —
+/// `wall + (late − tick)⁺`. One tick of lateness is the cadence's wake
+/// quantization, the ceiling's first tick; the excess is the tick's own
+/// device work ahead of its decision (the deferred-flush barrier, a
 /// maintenance item's SMO barrier past the drain deadline — the shape the
 /// pin's parked device makes 130 ms of), which the ceiling's second tick
-/// bounds at one period and no further. The lateness a tick spent parked
-/// behind a STRUCTURAL hold of the SMO mutex is not in `late`: it is the
-/// audit's excused class (`StructuralHolds`), accounted there and never
-/// anticipated as the cadence's own cost. Tie-tested
-/// (`derivation_sweep_tests`).
+/// prices at one period and no further. It is the LATENESS that is
+/// sampled, never the tick's whole pre-decision work: work that ran
+/// before the trigger fired cost the leaf nothing, and anticipating it
+/// would spend the ceiling's second tick on every cycle and leave a burst
+/// one decayed step above the mark nothing to land in. The tick's WAIT for
+/// the SMO mutex is not in `late` (the caller subtracts it): a wait behind
+/// another holder is that holder's hold — a structural hold the audit
+/// excuses (`StructuralHolds`), a census or a service it judges — and
+/// never a term for the cadence to anticipate (the fleet's manager read a
+/// 7 s wait behind its own online fsck as a term, and a trigger of 0 for
+/// the mark's memory). Tie-tested (`derivation_sweep_tests`).
 pub fn checkpoint_cycle_term_ns(prebarrier_wall_ns: u64, late_ns: u64, tick_ns: u64) -> u64 {
     prebarrier_wall_ns.saturating_add(late_ns.saturating_sub(tick_ns))
 }
 
-/// **The anticipated cycle term after one more cycle's sample**, ns — a
-/// decayed HIGH-WATER MARK: `max(sample, prev − prev/8)` (PR 13e, F-B1).
-/// A ceiling is a BOUND, so the term it anticipates must be one: a
-/// trigger set off the MEAN term lands past the promise on every cycle
-/// whose term is above the mean — which under a create storm is every
-/// cycle whose flush pass runs an SMO, because each SMO barriers its
-/// successor images (§4.10) and the pass wall is `(SMOs + 1) × barrier`,
-/// bursty by construction (the first build's mean estimator left 3 of 6
-/// cycles overrunning at a 150 ms barrier). The mark decays one eighth
-/// per cycle — the `sample_alloc_rate` shape's α halved, so a burst is
-/// remembered for ≈ 16 cycles and a quieter device earns its cadence
-/// back — and a burst larger than every recent one still trips the
-/// audit. Tie-tested (`derivation_sweep_tests`).
-pub fn anticipated_cycle_term_ns(prev_hwm_ns: u64, sample_ns: u64) -> u64 {
-    sample_ns.max(prev_hwm_ns.saturating_sub(prev_hwm_ns.div_ceil(8)))
+/// **The cycle terms a forest volume's cadence anticipates over** — the
+/// last [`TERM_HORIZON_CYCLES`] samples; the anticipated term is their
+/// MAXIMUM (PR 13e, F-B1). A ceiling is a BOUND, so the term it
+/// anticipates must be one: a trigger set off the MEAN term lands past
+/// the promise on every cycle whose term is above the mean — which under
+/// a create storm is every cycle whose flush pass runs an SMO, because
+/// each SMO barriers its successor images (§4.10) and the pass wall is
+/// `(SMOs + 1) × barrier`, bursty by construction (the first build's mean
+/// estimator left 3 of 6 cycles overrunning at a 150 ms barrier; a
+/// DECAYED mark leaked one eighth per quiet cycle and let a burst one
+/// step above it land a tick short). The window is the bound over its
+/// horizon and forgets a burst exactly when it leaves it — a quieter
+/// device earns its cadence back after the horizon; a burst larger than
+/// every one in it still trips the audit (the tripwire keeps its teeth).
+/// A fixed ring of `u64`s, RAM only, no allocation past the open.
+#[derive(Debug)]
+pub struct CycleTermWindow {
+    samples: [u64; TERM_HORIZON_CYCLES],
+    next: usize,
+}
+
+/// The horizon of [`CycleTermWindow`], in cycles: [`COVER_CYCLES_MAX`] —
+/// the ONE cycle-count bound every "cycle until the tail covers X" loop
+/// runs to, so a burst is remembered for as long as any cover loop would
+/// wait on it (64 at the shipped constants; ≈ 1 minute at the shipped
+/// cadence). Tie-tested (`derivation_sweep_tests`).
+pub const TERM_HORIZON_CYCLES: usize = COVER_CYCLES_MAX as usize;
+
+impl Default for CycleTermWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CycleTermWindow {
+    pub const fn new() -> Self {
+        Self {
+            samples: [0; TERM_HORIZON_CYCLES],
+            next: 0,
+        }
+    }
+
+    /// One more cycle's term, ns.
+    pub fn push(&mut self, sample_ns: u64) {
+        self.samples[self.next] = sample_ns;
+        self.next = (self.next + 1) % TERM_HORIZON_CYCLES;
+    }
+
+    /// The anticipated term: the maximum over the horizon (0 before the
+    /// first sample).
+    pub fn anticipated_ns(&self) -> u64 {
+        self.samples.iter().copied().max().unwrap_or(0)
+    }
 }
 
 /// [`checkpoint_landing_ceiling_ms`] at the flush cadence in force — the
@@ -1521,7 +1566,12 @@ async fn tick(
             }
         }
     }
+    // The tick's WAIT for the mutex is another holder's hold — measured so
+    // the age decision below leaves it out of the lateness it anticipates
+    // (PR 13e, F-B1).
+    let lock_requested = std::time::Instant::now();
     let mut smo = be.smo.lock().await;
+    let mutex_wait_ns = lock_requested.elapsed().as_nanos() as u64;
 
     // 1. Threshold maintenance (appends + SMOs, serialized here — §4.6),
     //    within the drain budget (finding 49: the checkpoint decision
@@ -1599,7 +1649,12 @@ async fn tick(
     // verbatim: the ceiling elapsed since the last cycle's end.
     let ceiling_ms = elastic_ceiling.map_or(CHECKPOINT_MAX_AGE_MS as u64, |c| c);
     let due_by_age = if be.appenders().is_some() {
-        be.checkpoint_due_by_age(ceiling_ms, tick_ms, crate::mono_core::monotonic_ns_u64())
+        be.checkpoint_due_by_age(
+            ceiling_ms,
+            tick_ms,
+            mutex_wait_ns,
+            crate::mono_core::monotonic_ns_u64(),
+        )
     } else {
         last_checkpoint.elapsed().as_millis() >= u128::from(ceiling_ms)
     };

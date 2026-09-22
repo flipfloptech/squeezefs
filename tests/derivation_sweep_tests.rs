@@ -2740,9 +2740,11 @@ fn sym_appender_ring_derives_from_the_reserve_and_the_solo_ring() {
         );
     }
     // One cycle's landing TERM = its pre-barrier wall + the age decision's
-    // lateness BEYOND one tick (the tick itself is the ceiling's first
-    // priced tick; the excess is the tick's own device work ahead of the
-    // decision, which the ceiling's second tick bounds at one period).
+    // lateness past the trigger BEYOND one tick (the wake quantization is
+    // the ceiling's first priced tick; the excess — the tick's own device
+    // work ahead of its decision — is what the second tick bounds at one
+    // period; the tick's wait for the SMO mutex behind another holder is
+    // left out of the lateness by the caller).
     use squeezefs::meta_backend::kv::checkpoint::checkpoint_cycle_term_ns;
     let ms = 1_000_000u64;
     assert_eq!(checkpoint_cycle_term_ns(60 * ms, 0, 50 * ms), 60 * ms);
@@ -2758,23 +2760,35 @@ fn sym_appender_ring_derives_from_the_reserve_and_the_solo_ring() {
         u64::MAX,
         "saturating"
     );
-    // The anticipated term is a decayed HIGH-WATER MARK of the samples —
-    // a bound anticipated by a bound (a mean lands past the promise on
-    // every above-mean cycle): a larger sample takes the mark, a smaller
-    // one lets it decay one eighth per cycle.
-    use squeezefs::meta_backend::kv::checkpoint::anticipated_cycle_term_ns;
-    assert_eq!(anticipated_cycle_term_ns(0, 150), 150);
-    assert_eq!(anticipated_cycle_term_ns(150, 300), 300);
-    assert_eq!(anticipated_cycle_term_ns(800, 100), 700);
-    assert_eq!(anticipated_cycle_term_ns(800, 750), 750);
-    assert_eq!(anticipated_cycle_term_ns(7, 0), 6);
-    let mut hwm = 1_000u64;
-    for _ in 0..16 {
-        hwm = anticipated_cycle_term_ns(hwm, 0);
+    // The anticipated term is the MAXIMUM of the samples over the horizon
+    // — a bound anticipated by a bound (a mean lands past the promise on
+    // every above-mean cycle; a decayed mark leaks inside its memory and
+    // lands a burst one step above it a tick short): a burst holds the
+    // mark for exactly the horizon and is forgotten when it leaves it. The
+    // horizon is the ONE cover-loop bound (`COVER_CYCLES_MAX`).
+    use squeezefs::meta_backend::kv::checkpoint::{
+        CycleTermWindow, COVER_CYCLES_MAX, TERM_HORIZON_CYCLES,
+    };
+    assert_eq!(TERM_HORIZON_CYCLES, COVER_CYCLES_MAX as usize);
+    let mut w = CycleTermWindow::new();
+    assert_eq!(w.anticipated_ns(), 0, "nothing before the first sample");
+    w.push(150);
+    assert_eq!(w.anticipated_ns(), 150);
+    w.push(300);
+    assert_eq!(w.anticipated_ns(), 300);
+    for _ in 0..TERM_HORIZON_CYCLES - 1 {
+        w.push(100);
+        assert_eq!(
+            w.anticipated_ns(),
+            300,
+            "the burst holds the mark for the whole horizon"
+        );
     }
-    assert!(
-        hwm < 1_000 / 7,
-        "a burst is forgotten in ≈ 16 quiet cycles ({hwm})"
+    w.push(100);
+    assert_eq!(
+        w.anticipated_ns(),
+        100,
+        "the burst is forgotten exactly when it leaves the horizon"
     );
 }
 

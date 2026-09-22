@@ -16,8 +16,9 @@
 # the laws"). Change a threshold here and both venues move together.
 #
 # The sourcing harness must define: die, log, warn, SYM_VENUE
-# (laptop | box | cloud) and SYM_VENUE_LEDGER (where venue-attributed
-# readings are appended).
+# (laptop | box | cloud), SYM_VENUE_LEDGER (where venue-attributed
+# readings are appended) and SYM_LOG_TAG (its stderr prefix — the matrix's
+# `[mwmatrix]`, the cloud driver's `[sym-rows]`; default `[sym-rows]`).
 
 # The symmetric must-stay-0 set on one daemon (the sym-storm set + the
 # cross-owner and token tripwires); `dlm_rpcs` is asserted ABSOLUTE by the
@@ -173,7 +174,7 @@ sym_zero_venue_note() { # label idx key value
     local label="$1" idx="$2" k="$3" v="$4"
     mkdir -p "$(dirname "$SYM_VENUE_LEDGER")" 2>/dev/null || true
     echo "$label m$idx $k=$v venue=$SYM_VENUE" >>"$SYM_VENUE_LEDGER"
-    echo "[sym-rows] VENUE-ATTRIBUTED ($label): $k=$v on m$idx — a timing-shaped reading on the $SYM_VENUE; the box bracket decides (51bf21e1), never a MISS here" >&2
+    echo "${SYM_LOG_TAG:-[sym-rows]} VENUE-ATTRIBUTED ($label): $k=$v on m$idx — a timing-shaped reading on the $SYM_VENUE; the box bracket decides (51bf21e1), never a MISS here" >&2
 }
 
 # Judge ONE must-stay-0 gauge: die, or — the venue word's exemption —

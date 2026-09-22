@@ -322,6 +322,8 @@ EOS
 ROWDIR="${ROWDIR:-$REPO/target/sym-rows/$(date +%Y-%m-%d-%H%M%S)}"
 # shellcheck disable=SC2034  # read by the lib's sym_zero_venue_note
 SYM_VENUE_LEDGER="$ROWDIR/venue-attributed.txt"
+# shellcheck disable=SC2034  # the lib's stderr prefix
+SYM_LOG_TAG="[sym-rows]"
 # shellcheck source=tests/sym_rows_lib.sh
 . "$REPO/tests/sym_rows_lib.sh"
 $DRY_RUN || mkdir -p "$ROWDIR"

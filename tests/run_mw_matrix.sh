@@ -3572,6 +3572,8 @@ ack_verify_xo() { # ledger tag orig_mnt read_mnt lostfile dst_rel prefix moved_l
 # the venue-attributed ledger's path.
 # shellcheck disable=SC2034  # read by the lib's sym_zero_venue_note
 SYM_VENUE_LEDGER="$STATE/rows/venue-attributed.txt"
+# shellcheck disable=SC2034  # the lib's stderr prefix — this harness's tag
+SYM_LOG_TAG="[mwmatrix]"
 # shellcheck source=tests/sym_rows_lib.sh
 . "$REPO/tests/sym_rows_lib.sh"
 

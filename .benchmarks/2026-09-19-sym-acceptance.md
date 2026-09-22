@@ -3517,9 +3517,14 @@ the slot moved under the read — REFUSES the retryable class
 (`xv_cross_owner_witness_refusals`, the belt: a projection's absence is no
 witness); the "no inode record — removing the dangling name" arm counts
 `xv_cross_owner_dangling_names`, a **must-stay-0 tripwire on an armed
-mount**. A found accounting defect beside it (`6eca9c68`): a joined
-holder's `OfferSlot` answered `Busy`/`Refused` was a `joined_wire_failure`
-— the manager's legal word is `Ok(false)`. **Pins (`e24d0016`, RED on the
+mount**. A found accounting defect beside it (`de99fd9d`): a joined
+holder's `OfferSlot` answered `Busy` was a `joined_wire_failure` — the
+manager's legal refusal (`STATUS_REFUSED`) is `Ok(false)`, while the wire
+screen's `STATUS_REJECTED` (an offeree no page names — the two share the
+`Refused` reply and differ in the frame's status word alone, which
+`ManagerClient::call` had discarded; `call_with_status` carries it) stays
+an error — the matrix's screen pin caught the first build serving past
+it. **Pins (`e24d0016`, RED on the
 base with the exact log line, GREEN on the fix):**
 `sym_n_daemon_tests::a_cross_owner_unlink_of_a_foreign_minted_child_reads_
 its_witness_at_the_holder` (three daemons: the child minted by joiner 2
@@ -3549,7 +3554,7 @@ longer leased — `NotFound` — and answered the PR 7b WITNESS refusal
 (`ForeignSkipped`, "the parent is dying"), which the initiator's
 `foreign_skipped_errno` turned into the op's `ENOENT`; defects 29 / 30 /
 35's family, at the one site that judged a witness under a lease it had
-lost. **Fix (`f7c93853`):** `xv_serve_step` checks the lease FIRST and
+lost. **Fix (`756d5706`):** `xv_serve_step` checks the lease FIRST and
 again inside the `InsertDentry` arm's refusal — a served step for a slot
 this holder does not lease is the typed `RefusalClass::SlotMoved { slot,
 holder }` (EAGAIN on the wire) naming tree 0's lessee, never the op's
@@ -3563,11 +3568,19 @@ RAM table (the first order let a served step on the new holder read the
 pre-transfer projection for one window). Seams:
 `TEST_XV_SERVE_PARK_AFTER_LEASE_CHECK` (the holder parked after its lease
 check), `TEST_WIRE_GRANT_PARK_MID_INSTALL` (the grant parked between the
-adoption and the words). **Pin (`6c65f37b`, RED on the base with the
+adoption and the words). **Pin (`8d82892c`, RED on the base with the
 exact `ENOENT`; GREEN ×3 on the fix):** `sym_n_daemon_tests::a_create_into_
 a_directory_whose_slot_moves_to_the_creator_mid_plan_never_answers_enoent`
 — the create lands, `nlink` 2 at the holder, the name resolves at the
-old holder's mount.
+old holder's mount. **Suite isolation (`4658e829`):** the pin's ONE
+deliberately parked ship (≈ 700 ms) lands in the process-global
+`meta_ship_phase_ns.rtt` mean the slot-lease plane's `N_floor` cold-start
+seed reads, and the next armed plane in the same process seeded
+`ewma_handover` at 2.09 s — `N_floor` climbed 4 → 26 across the dominance
+contract's 16-ship burst (green alone, red in suite order; the product
+right on both counts); the suite's `reset_process_state()` gained
+`meta_ship::test_reset_ship_phases()`, and the dominance verdict and the
+seed gained their debug tapes.
 
 ### 4.4am PR 13e — F-B1, FIXED as a DERIVATION (PR 2's KD-SYM-10 cadence): `appender_flush_ceiling_overruns` tripped on the box with PR 13c's exclusion excusing NOTHING — the excess was the cadence's OWN term, which the ceiling's `trigger + 2 ticks` never priced
 
@@ -3593,7 +3606,7 @@ of its decision (the deferred-flush barrier + a maintenance item's SMO
 barrier past the drain deadline), 26–272 ms against a 50 ms tick. A leaf
 dirtied right after a cycle's collection aged `tail + trigger + late +
 wall` at its covering barrier and the audit — correctly — counted it.
-**Fix (`0447e939` + `4667e34d`, a derivation, never a widened constant —
+**Fix (`f14158a0` + `f8711fa6`, a derivation, never a widened constant —
 §7 item 3):** on a volume with an appender set (every bit-17 forest — the
 population the audit judges) the age law runs from the LAST COLLECTION
 (`checkpoint_collected_ns`, set by every cycle path — a leaf dirtied after
@@ -3626,8 +3639,8 @@ dispatch is `appenders().is_some()`). Published per volume:
 per-cycle instrument the box-rerun's item 13 named is the debug tape
 `checkpoint: cycle … pre-barrier wall N ms = publish + flush (dirty, SMOs)
 + pages + barrier` and `cycle due by age … decided N ms past the trigger …
-the tick's wait for the SMO mutex N ms left out`. **Pin (`c713af85` +
-`ba0ccbd6` + `4667e34d`):** `sym_appender_tests::the_cadence_anticipates_
+the tick's wait for the SMO mutex N ms left out`. **Pin (`eda5b5bd` +
+`7d3bbec1` + `f8711fa6`):** `sym_appender_tests::the_cadence_anticipates_
 the_measured_cycle_wall_so_a_slow_barrier_lands_inside_the_ceiling` — the
 box's shape: the ARMED plane with the box's affinity order
 (`Knobs::armed().affinity_mb("16")`; the 64 MiB fixture's derived ceiling
@@ -3640,7 +3653,7 @@ bursts-larger-than-any-before shape the tripwire is designed to catch), a
 60 ms barrier armed after a clean checkpoint (the term reads 60–120 ms —
 the box's 16–106 ms class; a 25 ms barrier's 26 ms term sits inside the
 margin on the base too and pins nothing, 0/5), two warm cycles, five
-intervals: **RED on the TRUE base (`c713af85`'s src) 5/5 — every cycle
+intervals: **RED on the TRUE base (`eda5b5bd`'s src) 5/5 — every cycle
 1,121–1,174 ms, 21–74 ms past the ceiling; GREEN with the fix 12/12 (terms
 63–73 ms, the trigger 927–937 ms), the four ceiling contracts 10/10**. The
 first shape (64 KiB nodes, the unarmed 64-rotor, four creators, a 150 ms

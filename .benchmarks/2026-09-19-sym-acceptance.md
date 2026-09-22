@@ -1422,6 +1422,54 @@ DWARF-unwound leg per arm for `rename` / `unlink` at 299 Hz; scale 100,
   armed-plane words behind one `Option<Box<…>>`, or split the unarmed fast
   path into its own smaller future) — the same economy the kernel READ
   handler took in R-5.
+* **→ FIXED in PR 13f (`perf/setattr-future-economy`, 2026-09-22; pins
+  `tests/meta_op_future_economy_tests.rs` + `tests/sym_read_divert_economy_tests.rs`).**
+  `size_of_val` at the FUSE entry (test profile, rustc 1.98.1 —
+  same-profile tripwire; the release sizes are the type-size dumps'):
+  `SqueezefsFilesystem::setattr` **18,960 B (`3228fcb8`) → 26,016 B
+  (`77f4da1d`) → 896 B**; `unlink` **7,616 → 11,088 → 280 B**; `rename`
+  392 B on all three (it never grew); the routed `setattr` / `getattr`
+  `async_trait` boxes the echo mints per op 1,536 / 1,088 → 5,552 / 5,552
+  → 1,720 / 1,192 B (rustc `-Zprint-type-sizes`, both trees). The
+  attribution above is corrected by the type-size dumps: the growth is
+  NOT at the routed `setattr` entry (a 16-byte box at the FUSE call site)
+  — it is the TRUNCATE arm's two layout publishes (`write_file_staged`
+  17,784 → 24,816, `truncate_layout` 7,224 → 10,672) and the unlink
+  handler's overlay drain (`drain_device_overlays_for_ino` 7,392 →
+  10,864), every publish site of which grew ≈ 3.5–4.6 KiB from ONE root:
+  `KvMetaBackend::commit_tx` 176 → 4,816 B — PR 4's door
+  `ensure_leases_for_tx`, whose two FIRST-TOUCH acquire arms
+  (`manager_acquire_slots` 4.5 KiB, `joined_acquire_slot` 2.3 KiB) sat
+  inline in every commit's future (PR 13b's `publish_target` pair and PR
+  7's forest ref ops are ≈ 300–400 B of residue: `merge_layout_and_size`
+  +272, `commit_block_refs` +416). The echo never takes either arm and
+  moved their state twice per op. The fix boxes each arm INSIDE its
+  branch (`setattr_truncate`, `drain_unlink_target_overlays`, the door's
+  two acquires, the PR 13b ship behind the sync `slot_is_foreign`,
+  `note_served`'s tail, `getattr_local`'s striped fold,
+  `token_serve_armed` behind the sync `writer_reads_locally`): `commit_tx`
+  408 B, `open` 26,224 → 2,064 B (its O_TRUNC fold runs the setattr arm),
+  every publish site within ≈ 300–400 B of pre-program; no behaviour
+  change. **Where the armed arms allocate now**: the door's acquires (once
+  per slot per mount — a durable control write), the PR 13b ship (a wire
+  round trip), `note_served`'s tail (inside a served verb), the
+  striped-directory fold (once per armed directory `getattr`, beside its
+  own `stripe_map` KV read), and the divert's box ONLY for a read a plane
+  will serve — an armed solo writer's own-object read verb and every read
+  verb of a `SQUEEZEFS_SYMMETRIC_META=0` forest take the sync exit and
+  allocate nothing for it (review round 1, Issue 1: the first build boxed
+  before deciding, one allocation per read verb on the flip's default
+  path — 8,800 → 7,600 allocations over 400 × `getattr` + `lookup` on the
+  armed writer and the `=0` forest alike; the remaining 9 per round over
+  flat are PR 1's forest key framing, owed). Still carrying the term:
+  `write` 26,592 → 20,320 B (the striped-write arm's own growth — the
+  `rw4k` −3.0 % row's follow-on, same fix shape), `fallocate` /
+  `copy_file_range` (19.1–19.2 KiB), `fsync` / `read` / `flush` (8.6–11.7
+  KiB). The gate-1 bracket on the flip binary re-reads the two rows; the
+  laptop scoping rows (direction only: `fuse3-tpc` C 80.3 / 83.9 vs B
+  85.8 / 86.4 µs/op at scale 25, the counts identical B vs C —
+  `times_echo_absorbed` 74.8k, `journal_entries` 136.9k, `dlm_guard_hold`
+  246.7k per leg) are in the PR 13f note.
 * `rw4k`'s reproducible −3.0 %: daemon µs/op 36.5 / 36.6 (A) → 38.1 /
   37.6 (B) — `fuse3-ur` 29.6 / 29.7 → 30.6 / 30.4 (+0.8 µs/op, §3.9.1
   read +1.2), `fuse3-tpc` 6.1 / 6.2 → 6.8 / 6.5 (+0.4); `write_transport_
@@ -3880,8 +3928,12 @@ number in §3 is a dev-box RATE reading, venue-attributed pending the box
    29 / 30's family); the pin shape that settles it is in §3.9.4.3. **Gate 1's rename / unlink DELTA** (−3.3…
    −4.4 %): the PR-4 rename lock-set fix's priced cost STAYS; the
    `handle_setattr` future's construction + lane move (the kernel's
-   SETATTR echo per rename / unlink) is the named per-op term — shrink
-   the setattr future's state on the unarmed path (PR 14).
+   SETATTR echo per rename / unlink) is the named per-op term — **FIXED
+   in PR 13f** (setattr 26,016 → 896 B, unlink 11,088 → 280 B, the root
+   `commit_tx`'s inline door arms 4,816 → 408 B; §3.9.4.1); the bracket
+   re-reads on the flip binary. The same term in `write` / `fallocate` /
+   `copy_file_range` / `fsync` / `read` / `flush` is PR 14's (the `rw4k`
+   row's shape).
 
 Records the box owes (§8): after the re-run, NONE of gates 1 / 3 / 3c /
 5 / 7's rows is owed on PR 13c's binary — §3.9.4 carries them; the
@@ -3996,7 +4048,7 @@ Laptop-side: `/tmp/grok-justin/box-rerun/{arms,gate1,gate1-rev,perf-phases,nw}`
 > **Reading MET on the box:** gate 2 (1.04–1.07× of S0), gate 3b (one flip, `shipped ≡ served`, `K + C + 3` tokens, 3,400–3,581 creates/s into one directory), gate 7 at N = 8 (983 frees/s, `shipped ≡ served ≥ displaced`; the 8-mount join storm 3.92 s) — each with the tripwire caveat above where it applies. **What PR 14 flips on, restated:** the gate-1 regression attributed and closed (or adjudicated as the shipped-bug fixes' price with the owner's word), F-B3's cap re-derived (then the N = 32 rows run), F-B1's margin derived, F-B2's rule adjudicated, and the storm ×10 count from zero on that binary — then the flip. The decision text below is as recorded at PR 13.
 >
 > **Status (the box RE-RUN on PR 13c's binary `77f4da1d` — `perf/sym-box-rerun`, 2026-09-22 11:02 → 13:52 UTC; §3.9.4 — the re-read the brief asked for, with the fixed binary's numbers in hand). The decision stays NOT YET.** With these numbers, the design gates the flip requires read as follows. **Reading MET on the box (this binary):** **gate 3c's LIVE and IDLE laws** (a LIVE holder never recalled — 384 touches, 0 handovers over two fresh fleets, F-B2 FIXED; an idle tree moved in 4–5 bursts) — **its third law, the PAUSED job, NOT RUN: the phase's job never ran on any venue (§4.4aj, a harness defect fixed on this branch and proven locally), so gate 3c as a WHOLE reads LIVE ✓ / IDLE ✓ / PAUSED owed to the next box session**, **gate 5** (the 1 × 31 broadcast: exact at the next resolve, 155 ≡ 155, recall RTT 300 µs, hold 0 — twice; F-B3 FIXED), **gate 7 at N = 32** (row (a) 1,002–1,299 frees/s with `shipped ≡ served ≡ displaced` and the ledger's 1.000× submitted/user; row (b) 32 mounts in 3.66–3.68 s, 250–269 verbs, 12.3–14.6 s of service — twice), and — from the previous pass, not re-run — **gate 2** (1.04–1.07× of S0) and **gate 3b** (one flip, `shipped ≡ served`, `K + C + 3` tokens). **The exact list that does NOT read MET:**
-> * **gate 1** — MISS on mdstorm `rename` (0.960 / 0.967) and `unlink` (0.956 / 0.967), both orders of two brackets; `mkdir` CLOSED (0.976 / 0.984), `rr4k` PAR (0.999), everything else within noise, `rw4k` −3.0 % at the floor. ATTRIBUTED (§3.9.4.1): the PR-4 rename lock-set fix's priced +1 guard (kept) and the `handle_setattr` future's construction + lane move on the kernel's per-op SETATTR echo (named by the DWARF legs); the fix shape is a smaller unarmed setattr future — PR 14's, then the bracket re-reads;
+> * **gate 1** — MISS on mdstorm `rename` (0.960 / 0.967) and `unlink` (0.956 / 0.967), both orders of two brackets; `mkdir` CLOSED (0.976 / 0.984), `rr4k` PAR (0.999), everything else within noise, `rw4k` −3.0 % at the floor. ATTRIBUTED (§3.9.4.1): the PR-4 rename lock-set fix's priced +1 guard (kept) and the `handle_setattr` future's construction + lane move on the kernel's per-op SETATTR echo (named by the DWARF legs); **FIXED in PR 13f** (the unarmed setattr future 26,016 → 896 B, unlink 11,088 → 280 B — §3.9.4.1), the bracket re-reads on the flip binary;
 > * **gate 3** — MISS on the WALL law at N = 8 (4.27× creates / 5.37× ingest vs ≥ 5.6×; `C/CPU-S` 0.61×) — the co-located venue's term re-read to 0.01× of §3.9.2's; N = 2 / 4 MET; the per-NODE law UNMEASURED (PR 15). The A arm is measured for the first time: the shipped authority + co-writers are bounded at 0.07× at every N — the armed plane creates 55× faster at N = 8 on the same binary (F-R2 names why the shipped path is that slow);
 > * **the must-stay-0 tripwire `appender_flush_ceiling_overruns`** — NOT closed: six increments on five writers across three fleets in 45 minutes (the two with a WARN line 16 / 106 ms past the 1,100 ms ceiling; the scale fleet's four have no age reading; one of the six — m60 — established as not under a storm, the "between the rows" three under each writer's `rm -rf` of its 20k-file tree + the joins), **with PR 13c's exclusion excusing 0 ns on every writer** — the margin derivation (§7 item 3) is the whole remaining item, its first piece the missing per-cycle pass-wall instrument, and it is a FLIP PRECONDITION: every N-writer row set on the box stops at its first trip, so gates 3 / 3c / 7 cannot read MET as ROW SETS however their rates read;
 > * **two NEW product findings on the armed plane** (§3.9.4.3, §7 item 13): **F-R3** — every cross-owner unlink of a child another appender minted orphans the child's inode (the witness read off the projection; 430 / 512 leaked in one leg; invisible to fsck while the lessee lives) — a FLIP PRECONDITION (an ordinary `rm -rf` leaks on the default the flip would ship); **F-R4** — a create into a directory whose slot moves to the creator answered `ENOENT` once (defects 29 / 30's family; a correlation-based hypothesis until pinned — §3.9.4.3);

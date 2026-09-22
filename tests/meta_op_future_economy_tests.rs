@@ -79,7 +79,7 @@ async fn make() -> H {
         ImageBuilder::new(BuilderConfig {
             node_size: DEFAULT_NODE_SIZE,
             journal_len_override: None,
-            hash_seed: 0xC0FF_EE00_1313_0f0f,
+            hash_seed: 0xC0FF_EE00_1313_0F0F,
             uuid: *b"meta-op-futecon1",
         })
         .unwrap()

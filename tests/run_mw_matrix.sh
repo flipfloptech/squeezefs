@@ -4732,7 +4732,7 @@ leg_sym_readers() {
     done
     local rtt_us
     rtt_us="$(sym_phase_mean_us "$writer" dlm_token_recall_rtt_ns)"
-    echo "== PR 13 gate 5: broadcast shape — 1 writer × ${#readers[@]} reader(s) of one file, $k publishes: dlm_token_recalls=$recalls (law: mutations × holders = $((k * ${#readers[@]}))) acks=$acks readers_received=$recv readers_acked=$racks fanout_p99=$fanout_p99 (≡ readers) timeouts_live=$timeouts recall_rtt_mean=${rtt_us}us ==" | tee "$rowdir/symreaders-table.txt"
+    echo "== PR 13 gate 5: broadcast shape — 1 writer × ${#readers[@]} reader(s) of one file, $k publishes: dlm_token_recalls=$recalls (law: mutations × holders = $((k * ${#readers[@]}))) acks=$acks readers_received=$recv readers_acked=$racks fanout_p99=$fanout_p99 (≡ the readers' bucket edge) timeouts_live=$timeouts recall_rtt_mean=${rtt_us}us ==" | tee "$rowdir/symreaders-table.txt"
     [ "$recv" = "$recalls" ] && [ "$racks" = "$recalls" ] ||
         die "sym-readers: the readers received $recv / acked $racks recalls against the holder's $recalls (the reader face must fold every per-holder plane)"
     # THE ENGAGEMENT LAW: recalls ≡ mutations × holders (every reader
@@ -4741,7 +4741,19 @@ leg_sym_readers() {
     [ "$recalls" = "$((k * ${#readers[@]}))" ] ||
         die "sym-readers: dlm_token_recalls=$recalls ≠ mutations × holders = $((k * ${#readers[@]}))"
     [ "$recalls" = "$acks" ] || die "sym-readers: recalls $recalls ≠ acks $acks (closure: recalls ≡ acks + expired_with_lease; nothing expired here)"
-    [ "$fanout_p99" = "${#readers[@]}" ] || die "sym-readers: dlm_token_recall_fanout_p99=$fanout_p99 ≠ readers ${#readers[@]}"
+    # The fan-out p99 is a LOG-BUCKET histogram's upper bound
+    # (`QueueDepthHistogram::percentile`: 0, 1, 2, <=4, <=8, … — the
+    # reader count's bucket edge), so 31 readers read 32 (PR 13c: the
+    # first 32-member fleet to FORM — F-B3's cap had refused every earlier
+    # one — read `p99=32 ≠ readers 31` on a law only a power-of-two reader
+    # count could meet). The exact per-batch count is `dlm_token_recalls`
+    # ÷ batches, asserted above as mutations × holders.
+    local fanout_edge
+    fanout_edge="$(python3 -c "
+r=${#readers[@]}
+print(r if r <= 2 else 1 << ((r - 1).bit_length()))")"
+    [ "$fanout_p99" = "$fanout_edge" ] ||
+        die "sym-readers: dlm_token_recall_fanout_p99=$fanout_p99 ≠ the bucket edge $fanout_edge of ${#readers[@]} readers"
     [ "$timeouts" = "0" ] || die "sym-readers: dlm_token_recall_timeouts_live=$timeouts"
 
     # --- the recall-driven free-grace hold: a striped file's block

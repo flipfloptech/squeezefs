@@ -984,9 +984,13 @@ mount_member() { # idx [--netns[=<delay_ms>]]
             >"$STATE/m${idx}.mount.out" 2>&1 ||
             die "co-writer $idx mount failed: $(cat "$STATE/m${idx}.mount.out")"
         [ -n "$netem_ms" ] && netem_set "$idx" "$netem_ms"
-    elif [ "$idx" -ge "$PARTIAL_BASE" ]; then
+    elif [ "$idx" -ge "$PARTIAL_BASE" ] && [ "${OWNERS_ASSIGNED:-0}" = "1" ]; then
         # PR 8: a PARTIAL AUTHORITY — the only posture that is a CLIENT and
-        # an OWNER at once. Client halves toward the SET authority (custody
+        # an OWNER at once — on an --owners fleet ALONE: every other shape's
+        # indices 20..49 are READERS (PR 13c: the 32-member token-reader
+        # fleet died at member 20 here, a harness shape the box never
+        # reached behind F-B3's 64-connection cap). Client halves toward
+        # the SET authority (custody
         # lease, the lane that lease carries, the publish client, the
         # shipped verbs); an owner half over the volumes this node was
         # ASSIGNED, served on its OWN bind. CO-LOCATED, like the
@@ -994,8 +998,6 @@ mount_member() { # idx [--netns[=<delay_ms>]]
         # the box's default host association under the set authority's
         # standing hold (D20 — one holder, N registrants).
         role="partial-authority"
-        [ "${OWNERS_ASSIGNED:-0}" = "1" ] ||
-            die "partial-authority members need an ASSIGNED set (create ... --owners=K writes it offline via \`squeezefs volume set-owners\`)"
         [ -n "${MW_ENDPOINT:-}" ] ||
             die "no MW_ENDPOINT recorded — the set authority's 'MULTI-WRITER ARMED' line was not parsed (log: $STATE/m0.log)"
         local p_port
@@ -1540,6 +1542,12 @@ create_fleet() {
         esac
     done
     [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] || die "N must be a positive integer (got '$n')"
+    # The reader slice is 1..N-1 below the co-writer slice; a wider N would
+    # dispatch its tail as co-writers (PR 13c: the 32-member token-reader
+    # fleet's readers 20..31 sit inside the partial-authority slice, which
+    # exists on an --owners fleet ALONE — `mount_member` reads the shape).
+    [ "$n" -le "$COWRITER_BASE" ] ||
+        die "N=$n exceeds the reader slice (indices 1..$((COWRITER_BASE - 1)); the co-writer slice starts at $COWRITER_BASE)"
     [[ "$vms" =~ ^[0-9]+$ ]] || die "--vm=V needs a non-negative integer (got '$vms')"
     [ -z "$lease_ttl_ms" ] || [[ "$lease_ttl_ms" =~ ^[0-9]+$ ]] ||
         die "--lease-ttl-ms takes milliseconds (got '$lease_ttl_ms')"

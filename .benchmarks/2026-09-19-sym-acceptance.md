@@ -1625,10 +1625,10 @@ creates before it in that burst succeeded — and are F-R3's orphans).
 
 ##### 3.9.4.4 Gate 5 — `sym-readers`, the 1 × 31 broadcast on the 32-member fleet, two positions on fresh fleets (13:26 → 13:33 UTC): **MET on every law, both positions — F-B3's fix is a VERDICT on the box: the fleet that could not form on PR 13b FORMS (the manager's listener at `max 512 connections`, `RLIMIT_NOFILE soft raised 1024 → 262144`), exactness 0 misses over 31 readers, `dlm_token_recalls` 155 ≡ 5 × 31, recall RTT 300 µs, `free_grace_hold_ms` 0 under tokens**
 
-| position | fleet | exactness (create / rename / setattr at the NEXT resolve, 31 readers) | broadcast (5 publishes × 31 holders) | recall RTT (the writer's `dlm_token_recall_rtt_ns`, exact-sum) | token grant RTT (Σ 31 readers, the leg) | free-grace | oracle |
+| position | fleet | exactness (create / rename / setattr at the NEXT resolve, 31 readers) | broadcast (5 publishes × 31 holders) | recall RTT (the writer's `dlm_token_recall_rtt_ns`, exact-sum) | token grant RTT (Σ 31 readers — the EXACTNESS window `pex0 → pbc0` / SINCE MOUNT at `pfg1`, the fleet-formation probes included) | free-grace | oracle |
 |---|---|---|---|---|---|---|---|
-| r1 (13:28) | 1 manager + 1 joined writer (m60) + 31 `-o ro` token readers, `FLEET_SHARE=32`; the manager's listener `max 512 connections` | **0 misses** | **`dlm_token_recalls` 155 ≡ 155**, acks 155, readers received 155 / acked 155, `fanout_p99` 32 (= the 31-reader bucket edge, `fanout_p50` 32), **`timeouts_live` 0** | mean **299.6 µs** = send 157 / drain 90 / ack 53; p50 ≤ 512 µs, p99 ≤ 512 µs (n = 5 batches) | 31 grants, mean 99 µs, p50 ≤ 128 µs, **p99 ≤ 512 µs** (the log-bucket edges) | `free_grace_recall_gated_frees` 5 (the row) / 8 (the leg) — every displaced block published DIRECTLY; `free_grace_hold_ms` **0**, deferrals ≡ releases + offsets = 0; the S5 composite was 2,724 ms | clean (fsck 0, C8 0, must-stay-0 flat on both writers) |
-| r2 (13:31) | fresh fleet, same shape | **0 misses** | **155 ≡ 155**, acks 155, `fanout_p99` 32, `timeouts_live` 0 | mean **300.3 µs** | 31 grants | `recall_gated_frees` 5, hold 0 | clean |
+| r1 (13:28) | 1 manager + 1 joined writer (m60) + 31 `-o ro` token readers, `FLEET_SHARE=32`; the manager's listener `max 512 connections` | **0 misses** | **`dlm_token_recalls` 155 ≡ 155**, acks 155, readers received 155 / acked 155, `fanout_p99` 32 (= the 31-reader bucket edge, `fanout_p50` 32), **`timeouts_live` 0** | mean **299.6 µs** = send 157 / drain 90 / ack 53; p50 ≤ 512 µs, p99 ≤ 512 µs (n = 5 batches) | exactness window: 31 grants, mean 99.2 µs, p50 ≤ 128 µs, **p99 ≤ 512 µs**; since mount: **155 grants** (5 per reader — the arm probe, the root and the leg's fetches), mean **229 µs**, p50 ≤ 128 µs, **p99 ≤ 1,024 µs** (5 grants in the ≤ 1,024 µs bucket — the fleet-formation probes while 31 readers dialed at once); the log-bucket edges | `free_grace_recall_gated_frees` 5 (the row) / 8 (the leg) — every displaced block published DIRECTLY; `free_grace_hold_ms` **0**, deferrals ≡ releases + offsets = 0; the S5 composite was 2,724 ms | clean (fsck 0, C8 0, must-stay-0 flat on both writers) |
+| r2 (13:31) | fresh fleet, same shape | **0 misses** | **155 ≡ 155**, acks 155, `fanout_p99` 32, `timeouts_live` 0 | mean **300.3 µs** | exactness window: 31 grants, mean 98.8 µs, p99 ≤ 512 µs; since mount: 155 grants, mean 235 µs, p99 ≤ 1,024 µs | `recall_gated_frees` 5, hold 0 | clean |
 
 `reader_staleness_bound_ms` **0** on all 31 readers both positions
 (R-SYM-4), `dlm_token_reader_holder_planes` 1 per volume per reader,
@@ -1637,7 +1637,14 @@ each reader's `.stats` readable (the F-B3 `.stats` EINVAL closed), 95 /
 32-member fleet formed in ≈ 3 min each time. **Gate 5 as the design
 states it reads MET on the box.** The design's "token grant p99 and
 recall-ack p99 at N = 32 members" are the bucket edges above (the
-histograms are log-bucketed by design; the exact means beside them).
+histograms are log-bucketed by design; the exact means beside them);
+**the verdict reads the SINCE-MOUNT population for the grant p99 (155
+grants, ≤ 1,024 µs — "at N = 32 members" includes the fleet's formation,
+which is where the five slowest grants fell) and the exactness window
+(31 grants, ≤ 512 µs) as the row's steady-state face**; the recall-ack
+p99 is the writer's `ack` phase ≤ 128 µs (n = 5 batches). Both
+populations are stated because the first write of this section labelled
+the exactness window "the leg" (review Issue 7).
 
 ##### 3.9.4.5 Gate 7 — `sym-walls` at the design's N = 32 (fleet C: the manager + 31 joined writers; `--walls-files=4`), two launches (13:34 → 13:41 and 13:45 → 13:52 UTC): **row (a) the relocated FREE wall MET on its law both times (1,299 / 1,002 frees/s at the holder, `shipped 1,984 ≡ served 1,984 ≡ displaced`, the daemons' ledger `rewrite_device_write_bytes ÷ rewrite_user_bytes` 1.000× — the `/proc/diskstats` face and `wareq-sz` OWED on the N-writer legs); row (b) the JOIN STORM MET — 32 mounts in 3.66 / 3.68 s (the design's 10 s), 250 / 269 manager verbs, `manager_service_ns` 14.6 / 12.3 s; the second launch's row (a) tripped F-B1 on m65 (1,206 ms, nothing excused) — the row set stopped at r1**
 

@@ -927,9 +927,9 @@ routed mutation futures across PRs 6 / 7b / 13b — nameable only with a
 dwarf-unwound leg, not run). The venue law: no laptop number above is a
 verdict.
 
-**→ The memmove term: named by the box re-run's DWARF legs (§3.9.4.1 on
-`perf/sym-box-rerun`) and FIXED in PR 13f (`perf/setattr-future-economy`,
-2026-09-22).** It is the `handle_setattr` future's `Box::pin` + lane-handoff
+**→ The memmove term: named by the box re-run's DWARF legs (§3.9.4.1) and
+FIXED in PR 13f (`perf/setattr-future-economy`, 2026-09-22).** It is the
+`handle_setattr` future's `Box::pin` + lane-handoff
 move on the kernel's per-op ctime SETATTR echo. `size_of_val` at the FUSE
 entry (`tests/meta_op_future_economy_tests.rs`, test profile, rustc
 1.98.1): `SqueezefsFilesystem::setattr` **18,960 B (`3228fcb8`) → 26,016 B
@@ -949,10 +949,27 @@ drain as `drain_unlink_target_overlays`, the door's two acquires, the PR 13b
 ship behind the sync `slot_is_foreign`, `note_served`'s tail,
 `getattr_local`'s striped fold, `token_serve_armed`): `commit_tx` 408 B,
 `open` 26,224 → 2,064 B (its O_TRUNC fold runs the setattr arm), every
-publish site within ≈ 300 B of pre-program, `write` 26,592 → 20,320 B (the
-striped-write arm's own growth stays — the `rw4k` row's follow-on, same fix
-shape). No behaviour change; pinned at 2× the fixed sizes. The box's gate-1
-bracket on the next flip binary re-reads the row.
+publish site within ≈ 300–400 B of pre-program (`merge_layout_and_size`
++272, `commit_block_refs` +416 — PR 13b's `publish_target` pair and PR 7's
+forest ref ops), `write` 26,592 → 20,320 B (the striped-write arm's own
+growth stays — the `rw4k` row's follow-on, same fix shape). No behaviour
+change; pinned at 2× the fixed sizes (test-profile readings — a same-profile
+tripwire; the release sizes are the type-size dumps'). **Where the armed
+arms now allocate**, exactly: the door's two acquires (once per slot per
+mount, a durable control write already), the PR 13b ship (a wire round
+trip), `note_served`'s tail (inside a served verb), `fold_striped_dir_attrs`
+(once per DIRECTORY `getattr` on an armed volume — beside the fold's own
+`stripe_map` KV read), and `token_serve_armed` ONLY for a read a plane will
+serve: an armed solo writer's own-object read verb and every read verb of a
+`SQUEEZEFS_SYMMETRIC_META=0` forest take the sync `writer_reads_locally`
+exit off the gate's bits and allocate nothing for the divert (review round
+1, Issue 1 — the first build boxed before deciding, one allocation per read
+verb on the flip's default path; pinned by
+`tests/sym_read_divert_economy_tests.rs`: 8,800 → 7,600 allocations over
+400 × (`getattr` + `lookup`) on the armed writer AND the `=0` forest alike,
+the remaining excess over flat — 9 per round — being PR 1's forest key
+framing, stated as owed). The box's gate-1 bracket on the next flip binary
+re-reads the row.
 
 ##### 3.9.1b Harness findings (PR 1's rig, both brackets)
 

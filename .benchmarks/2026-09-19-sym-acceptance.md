@@ -3614,7 +3614,24 @@ for), the joiner LEAVES; the manager's census reports `pending-b` ALONE
 `pending-a` FORWARD (an abandoned intent with no live owner) — its name
 lands, the census exempts nothing and `pending-b` stays the finding; the
 offline probe after the manager leaves agrees. RED on `d06c07c2`: both
-children reported at the first census.
+children reported at the first census. **Found by the pin, fixed
+(`e7ae10d7`):** the per-process intent REGISTER (whose population is
+`xv_cross_owner_intents_open`, an abandoned entry past the grace window
+the must-stay-0 `_stuck`) was emptied only by THIS process's retirement
+— on a fleet another appender's roll-forward retires an abandoned intent
+as readily (the manager's poll adopting a joiner's, or the reverse;
+`intent_in_flight` is per process), and the abandoning daemon's register
+kept the entry for the mount's life: open, then STUCK, on a healthy set
+(the in-process fixtures share one register, so only the pin's
+`pending-b` plant — a record gone without this process's protocol, the
+other daemon's exact shape — met it, and left the two F-R3 pins reading
+`intents_open == 1` in suite order). `roll_forward_open_intents` now
+reconciles the register against its SUCCESSFUL durable scan
+(`forget_abandoned_absent`: an abandoned entry the scan does not list is
+forgotten, counted retired where it was counted minted — `minted ≡
+retired + open` holds; an `InFlight` entry is never touched; a failed
+scan reconciles nothing); the pin asserts the register at `s0` after the
+roll-forward.
 
 **Review round 2, Issue 11 — the rebuilt census arm RAN on a fleet
 (`646ec726`; laptop, "it works" — no number holds merit):** 3-writer

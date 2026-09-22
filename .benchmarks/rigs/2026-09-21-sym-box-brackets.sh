@@ -186,8 +186,14 @@ run_leg() { # gate position
     thermal "$OUT/$tag.thermal1"
     cut -d' ' -f1-3 /proc/loadavg >"$OUT/$tag.loadavg"
     dmesg -T 2>/dev/null | grep -iE "fuse|WARN|lockdep|BUG|nvme.*(error|reset|timeout)" | tail -5 >"$OUT/$tag.dmesg" || true
-    mkdir -p "$OUT/$tag"
+    mkdir -p "$OUT/$tag" "$OUT/$tag/daemon-logs"
     cp -r "$STATE/rows/." "$OUT/$tag/" 2>/dev/null || true
+    # Every member's daemon log, kept BEFORE the fleet is torn down: a
+    # must-stay-0 gauge that moves on the box is a product finding whose
+    # evidence is the daemon's own WARN line (the flush-ceiling audit's
+    # age / excused / cap words) — the re-run's first RED leg lost them
+    # with the teardown and had the `.stats` snapshots alone.
+    cp "$STATE"/m*.log "$OUT/$tag/daemon-logs/" 2>/dev/null || true
     echo "   leg $tag rc=$rc wall=$((t1 - t0))s hottest=$(hottest "$OUT/$tag.thermal1")°C" | tee -a "$OUT/box.log"
     {
         echo "### $tag (rc=$rc, $((t1 - t0)) s)"

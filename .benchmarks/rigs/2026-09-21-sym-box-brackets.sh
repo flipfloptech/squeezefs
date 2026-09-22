@@ -57,7 +57,7 @@
 # (every leg's verdict + table lines, by gate and position).
 set -eu
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-: "${BIN:?BIN (the arm-B binary, PR 13b's tip or the flip binary) is required}"
+: "${BIN:?BIN (the arm-B binary — the PR 13b tip or the flip binary) is required}"
 FLEET="$REPO/tests/mw_fleet.sh"
 MATRIX="$REPO/tests/run_mw_matrix.sh"
 [ -x "$FLEET" ] && [ -x "$MATRIX" ] || { echo "tests/mw_fleet.sh / tests/run_mw_matrix.sh not found under $REPO (place the repo's tests/ beside this rig)" >&2; exit 2; }
@@ -84,7 +84,10 @@ case "$(uname -r)" in
 *) [ "$SMOKE" = "1" ] || die "the running kernel is $(uname -r), not the sqz series — FUSE-over-io_uring cannot arm here (the 2026-09-22 finding: squeeze-test booted into the DDN Lustre kernel; restoring the grub default to vmlinuz-6.19.14-sqz and rebooting is the OWNER's act); SMOKE=1 for a laptop plumbing run" ;;
 esac
 [ -x "$BIN" ] || die "BIN $BIN is not executable"
-"$BIN" --version | grep -q "profile" || die "$BIN does not name its profile — not a squeezefs binary?"
+# `env -u`: the daemon's knob gate announces every unregistered SQZ_* name
+# on stderr — SQZ_BIN / SQZ_MWFLEET_* are the RIG's words (the fleet scrubs
+# them before it launches a daemon), so the identity read runs without them.
+env -u SQZ_BIN -u SQZ_MWFLEET_OSS_GB "$BIN" --version | grep -q "profile" || die "$BIN does not name its profile — not a squeezefs binary?"
 [ -f "$STATE/members.tsv" ] && die "a fleet already exists at $STATE — tear it down first (sudo $FLEET teardown)"
 if pgrep -x cargo >/dev/null 2>&1 || pgrep -x rustc >/dev/null 2>&1 || pgrep -x fio >/dev/null 2>&1; then
     [ "$SMOKE" = "1" ] || die "the box is not quiet (cargo / rustc / fio running)"
@@ -103,7 +106,7 @@ esac
 
 {
     echo "== sym-box brackets $TS host $(hostname) kernel $(uname -r) gates [$GATES] repeats $REPEATS out $OUT"
-    echo "   B: $("$BIN" --version 2>/dev/null | head -1) sha256 $(sha256sum "$BIN" | cut -c1-16)"
+    echo "   B: $(env -u SQZ_BIN -u SQZ_MWFLEET_OSS_GB "$BIN" --version 2>/dev/null | head -1) sha256 $(sha256sum "$BIN" | cut -c1-16)"
     echo "   fleet: $FLEET (tcp devsub, OSS ${SQZ_MWFLEET_OSS_GB} GiB zram per data volume); matrix: $MATRIX --venue=box"
     echo "   loadavg $(cut -d' ' -f1-3 /proc/loadavg); cpus $(nproc); mem $(awk '/MemTotal/ {printf "%.0f GiB", $2/1048576}' /proc/meminfo)"
     echo "   patch 0031 (per-queue bg budget) is part of the sqz series on this kernel: $(uname -v)"
@@ -183,6 +186,7 @@ run_leg() { # gate position
 }
 
 : >"$OUT/SUMMARY.txt"
+[ "$SMOKE" != "1" ] || echo "SMOKE RUN on $(hostname) ($(uname -r)) — laptop PLUMBING evidence only; no number below stands (the venue law)" >>"$OUT/SUMMARY.txt"
 FAILED=""
 fleet_a_gates=""
 fleet_b_gates=""

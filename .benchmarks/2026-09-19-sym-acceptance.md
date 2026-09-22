@@ -1475,7 +1475,7 @@ every customer runs today.
 `appender_flush_ceiling_overruns` **moved FOUR increments on THREE
 writers of the 8-writer fleet inside the 8-minute leg — m0 (the manager)
 [1, 1] (one per metadata volume, BETWEEN the rows: `[0, 0]` at `pn41` →
-`[1, 1]` at `pn80`, the window of the joins of m63..m66 for N = 8), m61
+`[1, 1]` at `pn80`, the window of the joins of m63..m66 for N = 8 — m61 / m62 were already mounted for N = 4), m61
 [0, 1] (between the rows too: `[0, 0]` at `pn4c` → `[0, 1]` at `pn80`),
 m63 [0, 1] during N = 8's INGEST (`[0, 0]` at `pn8c` → `[0, 1]` at
 `pn81`; `dd bs=4M conv=fsync`, 6.9 GB/s aggregate into the zram) — and

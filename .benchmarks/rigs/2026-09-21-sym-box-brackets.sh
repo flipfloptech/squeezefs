@@ -26,13 +26,18 @@
 #     `walls32` gate runs sym-walls there with a SMALL row (a)
 #     (`--walls-files=4`: 31 × 4 × 64 MiB fits the zram) so the join storm
 #     of 32 mounts is the row; fleet A's `walls` is row (a) at N = 8;
+#   * fleet M (gate 3's A ARM — the SHIPPED authority + co-writers on the
+#     SAME binary, the design's "vs today's authority+co-writers"):
+#     `create N=1 --cowriters=7` — an S9 authority + 7 co-writers, default
+#     format, no symmetric knob; the `mwscale` gate runs `mw-scale` there
+#     (the box re-run rung's leg — PR 13's box-rows rung had stated it as
+#     the harness gap);
 #   each fleet torn down to ZERO residue after its gates (the rig's own
 #   assertion — a residue fails the pass).
 #
 # The A arm of gate 3b the design names ("vs today's authority+co-writers")
-# has no leg in the tree (sym-shared-dir asserts the flip; sym-scale is
-# self-relative to its N = 1 row) — stated in the acceptance record §3.9;
-# this driver runs what exists.
+# has no leg in the tree (sym-shared-dir asserts the flip) — stated in the
+# acceptance record §3.9; gate 3's A arm is fleet M's `mwscale`.
 #
 # Preflight REFUSES (loud, before any fleet exists): a non-sqz kernel (the
 # 2026-09-22 finding: the box booted into the DDN Lustre kernel — FUSE-over-
@@ -44,7 +49,7 @@
 # /scratch/tmp/sym-box/repo/ and run from there):
 #   sudo env BIN=/scratch/tmp/sym-box/squeezefs-B \
 #            TAR_SRC=/scratch/tmp/sym-box/linux/fs \
-#            [GATES="tarx scale shared-dir foreign-touch walls readers walls32"] \
+#            [GATES="tarx scale mwscale shared-dir foreign-touch walls readers walls32"] \
 #            [REPEATS=2] [FRESH_FLEET_PER_LEG=1] [OUT=/scratch/tmp/sym-box/brackets-<ts>] \
 #            [SQZ_MWFLEET_OSS_GB=16] [SQZ_DEVSUB_OSS_ALGO=lzo-rle] \
 #        bash 2026-09-21-sym-box-brackets.sh
@@ -68,7 +73,7 @@ MATRIX="$REPO/tests/run_mw_matrix.sh"
 [ -x "$FLEET" ] && [ -x "$MATRIX" ] || { echo "tests/mw_fleet.sh / tests/run_mw_matrix.sh not found under $REPO (place the repo's tests/ beside this rig)" >&2; exit 2; }
 TS=$(date -u +%Y%m%d-%H%M%S)
 OUT="${OUT:-/scratch/tmp/sym-box/brackets-$TS}"
-GATES="${GATES:-tarx scale shared-dir foreign-touch walls readers walls32}"
+GATES="${GATES:-tarx scale mwscale shared-dir foreign-touch walls readers walls32}"
 REPEATS="${REPEATS:-2}"
 TAR_SRC="${TAR_SRC:-${SQZ_MWMATRIX_TAR_SRC:-}}"
 STATE="${SQZ_MWFLEET_STATE_DIR:-/run/squeezefs-mwfleet}"
@@ -77,6 +82,7 @@ LEG_EXTRA="${LEG_EXTRA:-}"
 FLEET_A_WRITERS="${FLEET_A_WRITERS:-7}"
 FLEET_B_READERS="${FLEET_B_READERS:-31}"
 FLEET_C_WRITERS="${FLEET_C_WRITERS:-31}"
+FLEET_M_COWRITERS="${FLEET_M_COWRITERS:-7}"
 # The zram algorithm: squeeze-test's sqz kernel offers lzo-rle / lzo only
 # (the D-5 fleet ran `lzo-rle` there); the laptop has zstd. The devsub's
 # default is zstd, so the box run names its algorithm — refused loud by
@@ -107,7 +113,7 @@ load1="$(awk '{print int($1)}' /proc/loadavg)"
 [ "$SMOKE" != "1" ] || [ -z "$LEG_EXTRA$([ "$FLEET_A_WRITERS" = 7 ] && [ "$FLEET_B_READERS" = 31 ] && [ "$FLEET_C_WRITERS" = 31 ] || echo x)" ] ||
     log "SMOKE: LEG_EXTRA='$LEG_EXTRA' writers=$FLEET_A_WRITERS readers=$FLEET_B_READERS storm-writers=$FLEET_C_WRITERS — plumbing only, no number stands"
 [ "$SMOKE" = "1" ] || [ -z "$LEG_EXTRA" ] || die "LEG_EXTRA is a SMOKE lever (the acceptance shapes are the legs' defaults)"
-[ "$SMOKE" = "1" ] || { [ "$FLEET_A_WRITERS" = 7 ] && [ "$FLEET_B_READERS" = 31 ] && [ "$FLEET_C_WRITERS" = 31 ]; } || die "FLEET_{A,C}_WRITERS / FLEET_B_READERS are SMOKE levers (the acceptance shapes are 7 / 31 / 31)"
+[ "$SMOKE" = "1" ] || { [ "$FLEET_A_WRITERS" = 7 ] && [ "$FLEET_B_READERS" = 31 ] && [ "$FLEET_C_WRITERS" = 31 ] && [ "$FLEET_M_COWRITERS" = 7 ]; } || die "FLEET_{A,C}_WRITERS / FLEET_B_READERS / FLEET_M_COWRITERS are SMOKE levers (the acceptance shapes are 7 / 31 / 31 / 7)"
 for t in nvme python3 cc tar dd; do command -v "$t" >/dev/null 2>&1 || die "missing tool: $t"; done
 case " $GATES " in
 *" tarx "*) { [ -n "$TAR_SRC" ] && [ -d "$TAR_SRC" ]; } || die "gate 2 (tarx) needs TAR_SRC=<linux>/fs (the real linux fs/ corpus — the box has no internet: ship the tree)" ;;
@@ -133,6 +139,7 @@ fleet_up() { # A|B|C
     A) args="N=2 --symmetric --writers=$FLEET_A_WRITERS --token-readers" ;;
     B) args="N=$((FLEET_B_READERS + 1)) --symmetric --writers=1 --token-readers" ;;
     C) args="N=1 --symmetric --writers=$FLEET_C_WRITERS" ;;
+    M) args="N=1 --cowriters=$FLEET_M_COWRITERS" ;;
     *) die "fleet shape $shape" ;;
     esac
     log "fleet $shape: create $args $(date -u +%FT%TZ)"
@@ -156,12 +163,13 @@ leg_args() { # gate
     case "$1" in
     tarx) echo "sym-tarx" ;;
     scale) echo "sym-scale --scale-ns=1,2,4,8" ;;
+    mwscale) echo "mw-scale --scale-ns=1,2,4,8" ;;
     shared-dir) echo "sym-shared-dir" ;;
     foreign-touch) echo "sym-foreign-touch" ;;
     walls) echo "sym-walls" ;;
     walls32) echo "sym-walls --walls-files=4" ;;
     readers) echo "sym-readers" ;;
-    *) die "unknown gate '$1' (tarx scale shared-dir foreign-touch walls readers walls32)" ;;
+    *) die "unknown gate '$1' (tarx scale mwscale shared-dir foreign-touch walls readers walls32)" ;;
     esac
 }
 run_leg() { # gate position
@@ -205,10 +213,12 @@ FAILED=""
 fleet_a_gates=""
 fleet_b_gates=""
 fleet_c_gates=""
+fleet_m_gates=""
 for g in $GATES; do
     case "$g" in
     readers) fleet_b_gates="$fleet_b_gates $g" ;;
     walls32) fleet_c_gates="$fleet_c_gates $g" ;;
+    mwscale) fleet_m_gates="$fleet_m_gates $g" ;;
     *) fleet_a_gates="$fleet_a_gates $g" ;;
     esac
 done
@@ -241,6 +251,8 @@ run_shape() { # shape gates...
 [ -z "$fleet_b_gates" ] || run_shape B $fleet_b_gates
 # shellcheck disable=SC2086
 [ -z "$fleet_c_gates" ] || run_shape C $fleet_c_gates
+# shellcheck disable=SC2086
+[ -z "$fleet_m_gates" ] || run_shape M $fleet_m_gates
 log "== done $(date -u +%FT%TZ) $OUT failed=[${FAILED# }]"
 cat "$OUT/SUMMARY.txt"
 [ -z "$FAILED" ] || { echo "RED legs:$FAILED (each stopped its gate's pass; attribute before any row is written)" >&2; exit 3; }

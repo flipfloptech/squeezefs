@@ -404,6 +404,16 @@
 #                       measured load and CPU reported per N. Engagement:
 #                       appenders_known == N, slot_handovers == 0,
 #                       slot_ships ≤ 1 per writer (its mkdir under /), dlm_rpcs == 0.
+#   mw-scale [--scale-ns=1,2,4,8] [--sym-files=N] [--sym-threads=T]
+#             [--ingest-mb=M]  (the box re-run — gate 3's A ARM; needs
+#                       `create N=1 --cowriters >= max N − 1`): the SAME
+#                       storm on the SHIPPED authority + co-writers posture
+#                       (S9), N = the authority + N − 1 co-writers each in
+#                       its own directory; self-relative like sym-scale
+#                       with the same C/CPU-S column. Engagement: Σ the
+#                       co-writers' shipped verbs ≡ the authority's served
+#                       (both ledgers), publish refusals 0,
+#                       local_commit_refusals flat, mount_posture co-writer.
 #   sym-shared-dir [--sym-files=N]  (PR 13 — gate 3b; needs --writers >= 2)
 #                       N creators into ONE directory: the holder's flip
 #                       to K stripes on the observed creator count
@@ -4131,6 +4141,167 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t_row0):.0f}')")"
     sym_ensure_joiners $((${#joiners[@]} + 1)) "${joiners[@]}"
     sym_oracle sym-scale "$rowdir"
     log "sym-scale PUBLISHED (table + verdict + snapshots in $rowdir)"
+}
+
+# --- gate 3's A ARM: mw-scale (the SHIPPED authority + co-writers) ----------
+# Design §8 gate 3 compares the symmetric plane against "today's authority +
+# co-writers" on the same binary; PR 13's box-rows rung stated this leg as
+# the harness gap (record §3.9, Finding 3). The SAME storm as sym-scale — N
+# RW mounts each creating SYM_FILES files in its OWN directory, then
+# ingesting SYM_INGEST_MB — on an S9 fleet (`mw_fleet.sh create N=1
+# --cowriters=K`): the authority + N − 1 co-writers, every metadata verb
+# of a co-writer SHIPPED to the authority, its data DMA under a granted
+# custody lease. Self-relative to its N = 1 row like sym-scale, the same
+# C/CPU-S column (creates per daemon-CPU-second over the row's N daemons,
+# the create phase alone), MGR_CPU = the authority's process CPU over the
+# whole row. The ENGAGEMENT law is the S8/S9 ledgers' closure — Σ the
+# co-writers' `meta_ship.shipped_verbs` ≡ the authority's `served_verbs`
+# (± the instrument's own reads, 4 per co-writer — the s8a law) and the
+# same for the publish ledger, `meta_ship_publish.refusals` 0,
+# `cowriter.local_commit_refusals` flat, every co-writer's `mount_posture
+# == co-writer`. The symmetric words (handovers / ships / `dlm_rpcs`) have
+# no meaning on this posture (a co-writer's lock acquire IS a round trip),
+# so the table prints the ship ledger where sym-scale prints them.
+mw_ensure_cowriters() { # want_idx...
+    local c want
+    for c in $(cowriter_idxs); do
+        want=0
+        for w in "$@"; do [ "$w" = "$c" ] && want=1; done
+        if [ "$want" = "1" ]; then
+            mountpoint -q "$(mnt_of "$c")" || "$MWFLEET" mount "$c" || die "co-writer $c (re)mount failed"
+        else
+            if mountpoint -q "$(mnt_of "$c")"; then
+                "$MWFLEET" unmount "$c" || die "co-writer $c unmount failed"
+                wait_for_unmounted "$(mnt_of "$c")"
+            fi
+        fi
+    done
+}
+leg_mw_scale() {
+    local cowriters ns maxn
+    IFS=',' read -r -a ns <<<"$SYM_SCALE_NS"
+    maxn=0
+    for n in "${ns[@]}"; do [ "$n" -gt "$maxn" ] && maxn="$n"; done
+    require_cowriters $((maxn - 1))
+    sym_build_storm
+    mapfile -t cowriters < <(cowriter_idxs)
+    sym_quiet_or_die mw-scale
+    local rowdir
+    rowdir="$STATE/rows/mwscale-$(date +%s)"
+    mkdir -p "$rowdir"
+    log "mw-scale (gate 3's A arm — the SHIPPED authority + co-writers): N ∈ {${ns[*]}} RW mounts (the authority + N − 1 co-writers) each creating $SYM_FILES files ($SYM_THREADS threads) in its OWN directory, then ingesting $SYM_INGEST_MB MiB (4 MiB blocks, conv=fsync)"
+    printf '%-4s %-10s %-8s %-9s %-10s %-8s %-8s %-9s %-9s %-8s %s\n' N CREATE_S RATIO C/CPU-S INGEST_MBS RATIO MGR_CPU SHIPPED SERVED PUB_SHIP VERDICT | tee "$rowdir/mwscale-table.tsv"
+    local n rate1="" ingest1="" verdict_all=MET
+    local MW_RUN
+    MW_RUN="$(date +%s)"
+    for n in "${ns[@]}"; do
+        local -a writers=(0)
+        local i
+        for ((i = 0; i < n - 1; i++)); do writers+=("${cowriters[$i]}"); done
+        mw_ensure_cowriters "${writers[@]:1}"
+        sleep 2
+        local idx
+        for idx in "${writers[@]}"; do
+            [ "$idx" = "0" ] || [ "$(stat_field "$idx" mount_posture)" = "co-writer" ] ||
+                die "mw-scale N=$n: m$idx mount_posture != co-writer (a silently degraded mount would fake the row)"
+            snap "$idx" "n${n}0" "$rowdir"
+        done
+        local cpu0 t0 t1 t_row0
+        cpu0="$(sym_cpu_ticks 0)"
+        local -a pids=()
+        t0="$(date +%s.%N)"
+        t_row0="$t0"
+        for idx in "${writers[@]}"; do
+            mkdir -p "$(mnt_of "$idx")/mwscale-$MW_RUN-n$n-w$idx"
+            "$SYM_STORM" "$(mnt_of "$idx")/mwscale-$MW_RUN-n$n-w$idx" "$SYM_THREADS" "$SYM_FILES" create \
+                >"$rowdir/create-n$n-w$idx.txt" 2>&1 &
+            pids+=($!)
+        done
+        local p rc=0
+        for p in "${pids[@]}"; do wait "$p" || rc=1; done
+        t1="$(date +%s.%N)"
+        [ "$rc" = "0" ] || die "mw-scale N=$n: a create storm FAILED (see $rowdir/create-n$n-w*.txt)"
+        local create_rate
+        create_rate="$(python3 -c "print(f'{$n*$SYM_FILES/($t1-$t0):.0f}')")"
+        for idx in "${writers[@]}"; do snap "$idx" "n${n}c" "$rowdir"; done
+        local create_cpu_ns=0 v_cpu creates_per_cpu_s
+        for idx in "${writers[@]}"; do
+            v_cpu="$(python3 -c "
+import json
+a=json.load(open('$rowdir/m${idx}_pn${n}0.json'))['metrics']['daemon_cpu_ns']
+b=json.load(open('$rowdir/m${idx}_pn${n}c.json'))['metrics']['daemon_cpu_ns']
+print(int(b)-int(a))" 2>/dev/null || echo 0)"
+            create_cpu_ns=$((create_cpu_ns + v_cpu))
+        done
+        creates_per_cpu_s="$(python3 -c "print(f'{$n*$SYM_FILES*1e9/max(1,$create_cpu_ns):.0f}')")"
+        pids=()
+        t0="$(date +%s.%N)"
+        for idx in "${writers[@]}"; do
+            dd if=/dev/zero of="$(mnt_of "$idx")/mwscale-$MW_RUN-n$n-w$idx/ingest.bin" bs=4M \
+                count=$((SYM_INGEST_MB / 4)) conv=fsync status=none 2>"$rowdir/ingest-n$n-w$idx.err" &
+            pids+=($!)
+        done
+        for p in "${pids[@]}"; do wait "$p" || rc=1; done
+        t1="$(date +%s.%N)"
+        [ "$rc" = "0" ] || die "mw-scale N=$n: an ingest dd FAILED (see $rowdir/ingest-n$n-w*.err)"
+        local ingest_rate cpu1 mgr_cpu
+        ingest_rate="$(python3 -c "print(f'{$n*$SYM_INGEST_MB/($t1-$t0):.0f}')")"
+        cpu1="$(sym_cpu_ticks 0)"
+        sleep 3 # the co-writers' shipped verbs and publishes land at the authority
+        for idx in "${writers[@]}"; do snap "$idx" "n${n}1" "$rowdir"; done
+        # THE ENGAGEMENT LAW: the ship ledgers close at both ends.
+        local shipped=0 pub_shipped=0 served pub_served refusals lcr=0 v
+        for idx in "${writers[@]:1}"; do
+            v="$(sym_delta "$rowdir" "$idx" "n$n" meta_ship.shipped_verbs)"
+            shipped=$((shipped + v))
+            v="$(sym_delta "$rowdir" "$idx" "n$n" meta_ship_publish.shipped)"
+            pub_shipped=$((pub_shipped + v))
+            v="$(sym_delta "$rowdir" "$idx" "n$n" cowriter.local_commit_refusals)"
+            lcr=$((lcr + v))
+        done
+        served="$(sym_delta "$rowdir" 0 "n$n" meta_ship.served_verbs)"
+        pub_served="$(sym_delta "$rowdir" 0 "n$n" meta_ship_publish.served)"
+        refusals="$(stat_field 0 meta_ship_publish.refusals)"
+        local skew=$((4 * (n - 1)))
+        if [ "$n" -gt 1 ]; then
+            [ "$shipped" -gt 0 ] || die "mw-scale N=$n: shipped_verbs delta 0 — the row did not engage the S8 plane"
+            [ $((shipped - served)) -le "$skew" ] && [ $((served - shipped)) -le "$skew" ] ||
+                die "mw-scale N=$n: ships that don't account — co-writers shipped=$shipped vs authority served=$served (skew allowed ±$skew)"
+            [ $((pub_shipped - pub_served)) -le "$skew" ] && [ $((pub_served - pub_shipped)) -le "$skew" ] ||
+                die "mw-scale N=$n: publish ships that don't account — shipped=$pub_shipped vs served=$pub_served"
+        fi
+        [ "$refusals" = "0" ] || die "mw-scale N=$n: meta_ship_publish.refusals=$refusals (must stay 0)"
+        [ "$lcr" = "0" ] || die "mw-scale N=$n: cowriter.local_commit_refusals moved by $lcr — an un-routed local commit"
+        mgr_cpu="$(python3 -c "
+import os
+hz = os.sysconf('SC_CLK_TCK')
+print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t_row0):.0f}')")"
+        [ -n "$rate1" ] || rate1="$create_rate"
+        [ -n "$ingest1" ] || ingest1="$ingest_rate"
+        local cr ir verdict
+        cr="$(python3 -c "print(f'{$create_rate/$rate1:.2f}')")"
+        ir="$(python3 -c "print(f'{$ingest_rate/$ingest1:.2f}')")"
+        verdict="$(python3 -c "print('MET' if $create_rate >= 0.7*$n*$rate1 and $ingest_rate >= 0.7*$n*$ingest1 else 'MISS')")"
+        [ "$verdict" = "MET" ] || verdict_all=MISS
+        printf '%-4s %-10s %-8s %-9s %-10s %-8s %-8s %-9s %-9s %-8s %s\n' "$n" "$create_rate" "${cr}x" "$creates_per_cpu_s" "$ingest_rate" "${ir}x" "${mgr_cpu}%" "$shipped" "$served" "$pub_shipped" "$verdict" | tee -a "$rowdir/mwscale-table.tsv"
+        for idx in "${writers[@]}"; do
+            rm -rf "$(mnt_of "$idx")/mwscale-$MW_RUN-n$n-w$idx" 2>/dev/null || true
+        done
+    done
+    echo "gate 3 A arm (the shipped authority + co-writers; ≥ 0.7 × N × the N=1 rate on BOTH rows): $verdict_all" | tee "$rowdir/mwscale-verdict.txt"
+    # Every co-writer back up for the legs that follow.
+    mw_ensure_cowriters "${cowriters[@]}"
+    local out rc=0
+    out="$(timeout 900 "$SQZ" fsck "$(mnt_of 0)" 2>&1)" || rc=$?
+    echo "$out" >"$rowdir/fsck-mw-scale.out"
+    [ "$rc" != "124" ] || die "mw-scale: online fsck HUNG past 900 s — transcript $rowdir/fsck-mw-scale.out"
+    [ "$rc" = "0" ] || die "mw-scale: online fsck FAILED or found:
+$out"
+    echo "$out" | grep -q "findings: 0" || die "mw-scale: fsck findings != 0:
+$out"
+    [ "$(stat_sum 0 meta_kv_block_refs_drift)" = "0" ] || die "mw-scale: meta_kv_block_refs_drift != 0 on the authority (C8 oracle RED)"
+    log "mw-scale: oracle clean (fsck findings 0, C8 drift 0)"
+    log "mw-scale PUBLISHED (table + verdict + snapshots in $rowdir)"
 }
 
 # --- gate 3b: sym-shared-dir (+ the -ls leg) --------------------------------
@@ -9582,6 +9753,7 @@ sym-crash) leg_sym_crash ;;
 sym-storm) leg_sym_storm ;;
 sym-tarx) leg_sym_tarx ;;
 sym-scale) leg_sym_scale ;;
+mw-scale) leg_mw_scale ;;
 sym-shared-dir) leg_sym_shared_dir ;;
 sym-foreign-touch) leg_sym_foreign_touch ;;
 sym-foreign-file) leg_sym_foreign_file ;;

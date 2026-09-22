@@ -3763,14 +3763,36 @@ impl KvMetaBackend {
         // The flat volume's answer in two `Option` probes (PR 13c, gate 1):
         // no token reader, no appender region — nothing below can divert,
         // and the two nested async resolves it would run are the handler
-        // lanes' cost on every read verb of the flat mdstorm.
-        if self.tokens_reader.get().is_none() && self.appenders.is_none() {
+        // lanes' cost on every read verb of the flat mdstorm. A WRITER's
+        // own-object / unarmed-forest read takes the same sync exit off the
+        // gate's bits (PR 13f review round 1, Issue 1): the box below is
+        // reached only by a read that WILL be served by a plane.
+        if self.tokens_reader.get().is_none() && self.writer_reads_locally(object) {
             return Ok(None);
         }
         // PR 13f: the divert's state (its three serve arms) rides a box so
         // the five read verbs' futures — and the routed `getattr` box the
         // kernel's ctime echo constructs — carry a pointer to it, not it.
         Box::pin(self.token_serve_armed(object, wants)).await
+    }
+
+    /// **The WRITER's sync "read locally" verdict** —
+    /// [`Self::writer_read_plane_for`]'s prefix decided on the gate's bits
+    /// alone, no table lock, no allocation: an unarmed mount (a flat
+    /// volume, a `SQUEEZEFS_SYMMETRIC_META=0` forest — no lease plane), a
+    /// slot this mount leases, or an unleased slot on the manager (which
+    /// maintains every unleased tree itself, KD-SYM-2/3). `false` = the
+    /// table's resolve decides (a foreign slot on the manager, any
+    /// unleased slot on a joiner) — the plane / wire serve.
+    fn writer_reads_locally(&self, object: Ino) -> bool {
+        let Some(plane) = self.slot_leases() else {
+            return true;
+        };
+        let Some(set) = self.appenders.as_ref() else {
+            return true;
+        };
+        let slot = super::record::forest_slot_of_ino(object);
+        plane.gate.is_leased(slot) || (!set.is_joined_appender() && !plane.gate.is_foreign(slot))
     }
 
     /// [`Self::token_serve`]'s body past the flat volume's probes.
@@ -3966,21 +3988,14 @@ impl KvMetaBackend {
         object: Ino,
     ) -> std::result::Result<Option<Arc<crate::meta_ship::token_plane::TokenReaderPlane>>, KvError>
     {
-        let Some(plane) = self.slot_leases() else {
+        if self.writer_reads_locally(object) {
             return Ok(None);
-        };
-        let Some(set) = self.appenders.as_ref() else {
+        }
+        let (Some(plane), Some(set)) = (self.slot_leases(), self.appenders.as_ref()) else {
             return Ok(None);
         };
         let slot = super::record::forest_slot_of_ino(object);
-        if plane.gate.is_leased(slot) {
-            return Ok(None);
-        }
         let joined = set.is_joined_appender();
-        if !joined && !plane.gate.is_foreign(slot) {
-            // The manager maintains every unleased tree itself.
-            return Ok(None);
-        }
         let holder = match plane.table.resolve(slot) {
             crate::slot_lease_core::Resolved::Holder { holder, .. } if !set.owns_region(holder) => {
                 holder

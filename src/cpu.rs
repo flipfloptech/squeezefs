@@ -95,7 +95,17 @@ pub fn possible_cpus() -> usize {
 
 /// The RAW process affinity mask width — the undivided machine fact both
 /// roots derive from ([`process_parallelism`] divides it; the
-/// [`possible_cpus`] fallback must NOT).
+/// [`possible_cpus`] fallback must NOT). **The FLEET-WIDTH exemption
+/// class** (symmetric PR 13c, F-B3): a cluster-wire LISTENER's load is the
+/// whole fleet's width × each member's session demand, which N co-located
+/// daemons each serve WHOLE — the share divisor would shrink the cap
+/// exactly as the fleet it serves grows (64 on a 32-member fleet on 32
+/// cores, the 14th member refused at accept). Its consumer census is
+/// pinned beside `possible_cpus`'s in `tests/derivation_sweep_tests.rs`.
+pub fn raw_parallelism() -> usize {
+    raw_process_parallelism()
+}
+
 fn raw_process_parallelism() -> usize {
     static CACHED: OnceLock<usize> = OnceLock::new();
     *CACHED.get_or_init(compute_process_parallelism)

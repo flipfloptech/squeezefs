@@ -13535,25 +13535,51 @@ impl KvMetaBackend {
         // PR 5: a token reader serves the object's attrs from its token
         // (the holder's folded view at the grant), exact until recalled —
         // PR 12: granted by the object's slot holder.
-        if let Some(serve) = self
+        match self
             .token_serve(ino, crate::meta_ship::token_plane::TokenWants::default())
-            .await?
+            .await
         {
-            let serve = serve.ok_or_else(|| Self::not_found(format!("Inode {ino} not found")))?;
-            let v = serve.entry().attrs;
-            return Ok(Inode {
-                ino,
-                mode: v.mode,
-                uid: v.uid,
-                gid: v.gid,
-                size: v.size,
-                nlink: v.nlink,
-                atime: v.atime,
-                mtime: v.mtime,
-                ctime: v.ctime,
-                flags: v.flags,
-                rdev: v.rdev,
-            });
+            Ok(Some(serve)) => {
+                let serve =
+                    serve.ok_or_else(|| Self::not_found(format!("Inode {ino} not found")))?;
+                let v = serve.entry().attrs;
+                return Ok(Inode {
+                    ino,
+                    mode: v.mode,
+                    uid: v.uid,
+                    gid: v.gid,
+                    size: v.size,
+                    nlink: v.nlink,
+                    atime: v.atime,
+                    mtime: v.mtime,
+                    ctime: v.ctime,
+                    flags: v.flags,
+                    rdev: v.rdev,
+                });
+            }
+            Ok(None) => {}
+            // PR 13c (F-B3): the mount ROOT on a `-o ro` token reader whose
+            // plane answered a TRANSIENT wire class is served from the
+            // local projection instead — R-SYM-4's one named exception
+            // (`note_reader_root_projection_serve`). The kernel's
+            // `default_permissions` walk GETATTRs the root before every
+            // `/.stats` read, so the operator's instrument went down with
+            // the wire it was needed to read (the box's 14th member: its
+            // `.stats` answered EINVAL while the manager's cap refused
+            // its dial). The root's attributes carry no user data and
+            // no routing; every child resolve stays under the token.
+            Err(e)
+                if ino == super::builder::ROOT_INO
+                    && self.tokens_reader.get().is_some()
+                    && Self::is_transient_wire_error(&e) =>
+            {
+                crate::meta_ship::token_plane::note_reader_root_projection_serve();
+                log::warn!(
+                    "meta volume {}: the mount root's attrs served from the local projection —                      the token plane answered a transient wire class ({e}); every child resolve                      stays under the token law (dlm_token_root_projection_serves)",
+                    self.path.display()
+                );
+            }
+            Err(e) => return Err(e.into()),
         }
         let mut v = self
             .read_inode_value(ino)
@@ -13573,6 +13599,31 @@ impl KvMetaBackend {
             flags: v.flags,
             rdev: v.rdev,
         })
+    }
+
+    /// A token-plane failure of the TRANSIENT wire class (PR 13c, F-B3):
+    /// the transport itself (a dial refused, a reset, the listener at its
+    /// cap — [`crate::cluster_wire::is_transport_failure`]), the typed
+    /// retryable classes the wire mints for a holder that cannot serve
+    /// YET, or the joined door's manager-unreachable class. Never a
+    /// refusal the holder decoded (a witness, a screen).
+    fn is_transient_wire_error(e: &KvError) -> bool {
+        use crate::error::RefusalClass;
+        match e {
+            KvError::Io(se) => {
+                crate::cluster_wire::is_transport_failure(se)
+                    || matches!(
+                        se.refusal_class(),
+                        Some(
+                            RefusalClass::ListenerRefused
+                                | RefusalClass::MembershipPending
+                                | RefusalClass::HolderUnreachable { .. }
+                        )
+                    )
+            }
+            KvError::ManagerUnreachable(_) => true,
+            _ => false,
+        }
     }
 
     /// List `dir` per the module-docs offset contract; at most `max`

@@ -825,6 +825,110 @@ async fn a_foreign_create_is_visible_at_the_readers_next_resolve() {
     shutdown(&writer).await;
 }
 
+/// Symmetric PR 13c, F-B3's second defect (`.benchmarks/2026-09-19-sym-
+/// acceptance.md` §3.9.2): the box's 14th token reader answered EINVAL to
+/// the rig's `.stats` read while the manager's connection cap refused its
+/// dial — the kernel's `default_permissions` walk GETATTRs the mount ROOT
+/// before it reaches `/.stats`, and the root's token fetch surfaced the
+/// wire's `InvalidOperation`. The law now: a `.stats` read never fails on
+/// a transient wire error — the ROOT's attributes on a token reader whose
+/// plane answered a transient class (the holder's listener at its cap:
+/// the dial's bounded retry then the typed `ListenerRefused`) are served
+/// from the local projection, counted on `dlm_token_root_projection_serves`
+/// — R-SYM-4's ONE named exception, the root alone: a child's resolve
+/// under the same refusal stays fail-closed (the retryable class, never
+/// the projection), and once the cap admits the reader the root is served
+/// under its token again. RED before: `getattr(1)` `Err`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_readers_root_attr_survives_the_holders_connection_cap_so_stats_never_fail() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let writer = open_armed_writer(&path).await;
+    Metadata::create(writer.as_ref(), 1, "pre", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    // The holder's listener admits ONE connection, and a foreign session
+    // holds it: every dial of the reader's plane is refused at accept.
+    let mut cfg = listener_cfg();
+    cfg.max_connections = 1;
+    let host = cw::RpcListener::start_async(
+        cfg,
+        SECRET.to_vec(),
+        TokenService::new(Arc::clone(&writer.volumes[0])),
+    )
+    .expect("token listener");
+    let endpoint = host.endpoint().to_string();
+    let occupant = cw::RpcClient::connect(&endpoint, SECRET, "occupant", None)
+        .await
+        .expect("the one slot");
+    let reader = open_routed_meta_set_read_only(&[path.display().to_string()])
+        .await
+        .expect("read-only open");
+    let plane = reader.volumes[0]
+        .arm_token_reader(TokenClientConfig {
+            endpoint: endpoint.clone(),
+            secret: SECRET.to_vec(),
+            client_id: "reader-capped".to_string(),
+            volume: 0,
+        })
+        .expect("token client arms on a read-only open");
+    let serves0 = squeezefs::meta_ship::token_plane::test_reader_root_projection_serves();
+    // The root: served from the projection after the dial's bounded retry
+    // — never an error, so `/.stats` stays readable.
+    let root = Metadata::getattr(reader.as_ref(), 1)
+        .await
+        .expect("the root's attr never fails on a transient wire class");
+    assert!(root.mode & libc::S_IFMT == libc::S_IFDIR);
+    assert_eq!(
+        squeezefs::meta_ship::token_plane::test_reader_root_projection_serves(),
+        serves0 + 1,
+        "the projection serve is counted"
+    );
+    assert!(
+        host.stats().connections_refused >= 1,
+        "the cap refused the reader's dial"
+    );
+    // A CHILD under the same refusal: fail-closed with the retryable class
+    // (R-SYM-4 — never the projection).
+    let child = Metadata::lookup(reader.as_ref(), 1, "pre").await;
+    let err = child.expect_err("a child's resolve stays fail-closed");
+    assert_eq!(
+        err.to_errno(),
+        libc::EAGAIN,
+        "the typed retryable class, never EINVAL: {err}"
+    );
+    assert_eq!(
+        squeezefs::meta_ship::token_plane::test_reader_root_projection_serves(),
+        serves0 + 1,
+        "only the root takes the exception"
+    );
+    // The cap admits the reader: the root is served under its token.
+    drop(occupant);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let _ = Metadata::getattr(reader.as_ref(), 1).await;
+        if plane.stats().grants >= 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the root is served under a token once the cap admits the reader"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        Metadata::lookup(reader.as_ref(), 1, "pre")
+            .await
+            .expect("the child resolves under its token now")
+            .nlink,
+        1
+    );
+    plane.stop().await;
+    host.shutdown();
+    shutdown(&writer).await;
+}
+
 /// §5.7.1 — the recall rides the commit: a commit that mutates a token's
 /// object cannot be observed (its `create` cannot return) before the
 /// reader has acked; the reader's cached records are gone before the ack

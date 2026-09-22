@@ -3655,6 +3655,27 @@ pub fn note_reader_unbound_holder() {
     READER_UNBOUND_HOLDERS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// The mount ROOT's attributes a token reader served from its LOCAL
+/// projection because its token plane answered a TRANSIENT wire class
+/// (the holder's listener at its connection cap, a dial refused, the
+/// membership re-assertion pending) — `dlm_token_root_projection_serves`
+/// (PR 13c, F-B3). R-SYM-4's ONE named exception, and only the root: the
+/// kernel's `default_permissions` walk GETATTRs the mount root before it
+/// reaches `/.stats`, so a failed root attr took the operator's instrument
+/// down with the wire it was needed to read; the root's attributes carry
+/// no user data and every child resolve stays under the token law.
+static READER_ROOT_PROJECTION_SERVES: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_reader_root_projection_serve() {
+    READER_ROOT_PROJECTION_SERVES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The root-projection count (the contracts' witness; the stats face is
+/// `dlm_token_root_projection_serves`).
+pub fn test_reader_root_projection_serves() -> u64 {
+    READER_ROOT_PROJECTION_SERVES.load(Ordering::Relaxed)
+}
+
 pub fn note_reader_redirect_followed() {
     READER_REDIRECTS_FOLLOWED.fetch_add(1, Ordering::Relaxed);
 }
@@ -3993,6 +4014,7 @@ pub fn reader_stats_json(volumes: &[Arc<KvMetaBackend>]) -> serde_json::Value {
                 .collect(),
         ),
         "dlm_token_reader_unbound_holders": READER_UNBOUND_HOLDERS.load(Ordering::Relaxed),
+        "dlm_token_root_projection_serves": READER_ROOT_PROJECTION_SERVES.load(Ordering::Relaxed),
         "dlm_token_reader_redirects_followed": READER_REDIRECTS_FOLLOWED.load(Ordering::Relaxed),
         "dlm_token_reader_holder_resolves": READER_HOLDER_RESOLVES.load(Ordering::Relaxed),
         // The mount's recall sink (one ledger — the sinks share it).

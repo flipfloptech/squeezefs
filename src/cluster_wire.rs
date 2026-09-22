@@ -1555,19 +1555,151 @@ impl Default for RpcListenerConfig {
     }
 }
 
-/// Default concurrent-connection cap: derived from the core count (caps
-/// derive from system resources), floored so a small box still admits a
-/// real peer population and ceilinged so a large one still has a bound.
+/// Default concurrent-connection cap: derived from the core count and the
+/// fd budget (caps derive from system resources), floored so a small box
+/// still admits a real peer population.
+///
+/// **The root is the RAW affinity mask, never the fleet-share-divided one**
+/// (symmetric PR 13c, F-B3 — `.benchmarks/2026-09-19-sym-acceptance.md`
+/// §3.9.2): a listener's load is the FLEET's width × each member's session
+/// demand, which N co-located daemons each serve WHOLE; the divisor shrank
+/// the cap exactly as the fleet it served grew — 64 on a 32-member fleet on
+/// 32 cores, the 14th member refused at accept. `crate::cpu::raw_parallelism`
+/// is the fleet-width exemption class (its consumer census is pinned).
 pub fn default_max_connections() -> usize {
-    // Sized from the fleet-share-DIVIDED root (KD-MW-14 rung 3c).
-    max_connections_from(crate::cpu::process_parallelism())
+    max_connections_resolved(
+        crate::env_knobs::opt_int_knob::<usize>(MAX_CONNS_ENV),
+        crate::cpu::raw_parallelism(),
+        nofile_soft_limit(),
+    )
 }
 
-/// Pure form (tie-tested in the derivation sweep): `(cpus × 16).clamp(64,
-/// 1024)` — floored so a small box still admits a real peer population,
-/// ceilinged so a large one still has a bound.
-pub fn max_connections_from(cpus: usize) -> usize {
-    cpus.saturating_mul(16).clamp(64, 1024)
+/// The explicit lever: `SQUEEZEFS_CLUSTER_WIRE_MAX_CONNS` (int, 64..=65536)
+/// wins verbatim, railed by the fd budget only (a value the process cannot
+/// hold is a lie, not a cap).
+pub const MAX_CONNS_ENV: &str = "SQUEEZEFS_CLUSTER_WIRE_MAX_CONNS";
+
+/// fds ONE accepted connection holds: the socket + its shutdown-nudge
+/// clone (`conn_socks`).
+pub const CONNECTION_FDS: usize = 2;
+
+/// The listeners' share of `RLIMIT_NOFILE`: a quarter — the
+/// `uring_fs::fd_cache_cap` law; the FUSE rings, device fds, staging
+/// segments and the job wire own the rest.
+pub const LISTENER_FD_SHARE: usize = 4;
+
+/// The connection cap's floor: the shipped posture (never regress below
+/// it — a process too small for 64 × 2 fds fails at its FUSE rings first).
+const MAX_CONNS_FLOOR: usize = 64;
+
+/// Parked connection threads per core: the thread-per-connection posture —
+/// a parked thread costs no CPU, so the factor bounds the worst-case wake
+/// storm (16 runnable per core), not steady-state load.
+const CONNS_PER_CORE: usize = 16;
+
+/// Pure form (tie-tested in the derivation sweep): `(raw_cpus × 16)`
+/// clamped to `[64, nofile / (CONNECTION_FDS × LISTENER_FD_SHARE)]` — the
+/// fd budget is the ceiling (each connection holds two fds and the
+/// listeners may spend a quarter of the soft limit), never below the floor.
+pub fn max_connections_from(raw_cpus: usize, nofile_soft: usize) -> usize {
+    let fd_ceiling = (nofile_soft / (CONNECTION_FDS * LISTENER_FD_SHARE)).max(MAX_CONNS_FLOOR);
+    raw_cpus
+        .saturating_mul(CONNS_PER_CORE)
+        .clamp(MAX_CONNS_FLOOR, fd_ceiling)
+}
+
+/// [`max_connections_from`] with the explicit lever ahead of it: explicit
+/// wins verbatim inside its admissible range, railed by the fd ceiling.
+pub fn max_connections_resolved(
+    explicit: Option<usize>,
+    raw_cpus: usize,
+    nofile_soft: usize,
+) -> usize {
+    match explicit {
+        Some(v) => {
+            let fd_ceiling =
+                (nofile_soft / (CONNECTION_FDS * LISTENER_FD_SHARE)).max(MAX_CONNS_FLOOR);
+            v.min(fd_ceiling)
+        }
+        None => max_connections_from(raw_cpus, nofile_soft),
+    }
+}
+
+/// One member's steady-state session demand against the S8 listener
+/// (tie-tested; the derivation the cap is judged against for a fleet of
+/// `N` members): per volume the token grant pool
+/// ([`crate::meta_ship::publish::publish_ship_depth_from`] sessions — the
+/// reader plane's pool) + one standing recall channel; plus the publish
+/// frame pool (the same depth) and the control sessions a writer holds one
+/// each of — the manager wire, the meta-ship lane, its pipelined mux, the
+/// per-holder custody client. `cpus` is the MEMBER's divided root (its
+/// pools derive from its own share); a reader holds the per-volume terms
+/// only, so the writer's demand is the bound.
+pub fn member_session_demand_from(cpus: usize, volumes: usize) -> usize {
+    let depth = crate::meta_ship::publish::publish_ship_depth_from(None, cpus);
+    volumes.max(1) * (depth + 1) + depth + MEMBER_CONTROL_SESSIONS
+}
+
+/// The per-member control sessions against one listener: the manager
+/// wire, the meta-ship lane, its mux, the custody client — one each.
+const MEMBER_CONTROL_SESSIONS: usize = 4;
+
+/// The process's `RLIMIT_NOFILE` soft limit (the fd budget the cap's
+/// ceiling derives from); the classic 1024 when the read fails.
+pub fn nofile_soft_limit() -> usize {
+    let mut rl = libc::rlimit {
+        rlim_cur: 1024,
+        rlim_max: 1024,
+    };
+    // SAFETY: plain getrlimit into a stack struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
+        usize::try_from(rl.rlim_cur).unwrap_or(usize::MAX)
+    } else {
+        1024
+    }
+}
+
+/// Raise the soft `RLIMIT_NOFILE` to the hard limit, once per process (the
+/// daemon's fd population derives from system geometry — one FUSE ring per
+/// possible CPU, the fleet's sessions — and the 1024 login default is a
+/// shell posture, not a resource; the hard limit is the operator's bound).
+/// Returns the soft limit in force afterwards. A refused raise keeps the
+/// limit as found and is announced once.
+pub fn raise_nofile_soft_limit() -> usize {
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit into and from a stack struct with
+    // process-scoped constant arguments.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
+            return nofile_soft_limit();
+        }
+        if rl.rlim_cur < rl.rlim_max {
+            let want = libc::rlimit {
+                rlim_cur: rl.rlim_max,
+                rlim_max: rl.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &want) != 0 {
+                log::warn!(
+                    "RLIMIT_NOFILE soft {} → hard {} refused ({}) — the cluster-wire \
+                     connection cap derives from the soft limit as found",
+                    rl.rlim_cur,
+                    rl.rlim_max,
+                    std::io::Error::last_os_error()
+                );
+                return usize::try_from(rl.rlim_cur).unwrap_or(usize::MAX);
+            }
+            log::info!(
+                "RLIMIT_NOFILE soft raised {} → {} (the fd budget the listener caps derive from)",
+                rl.rlim_cur,
+                rl.rlim_max
+            );
+            return usize::try_from(rl.rlim_max).unwrap_or(usize::MAX);
+        }
+    }
+    usize::try_from(rl.rlim_cur).unwrap_or(usize::MAX)
 }
 
 /// Listener counters. `mac_failures` and `service_refusals` are
@@ -2165,8 +2297,12 @@ impl RpcListener {
             let Some(permit) = self.counters.conns.try_admit() else {
                 self.counters.refused.fetch_add(1, Ordering::SeqCst);
                 log::warn!(
-                    "cluster wire: refusing {peer} — {} concurrent connections is the cap",
-                    self.cfg.max_connections
+                    "cluster wire: refusing {peer} — {} concurrent connections is the cap \
+                     (derived: raw CPUs × {CONNS_PER_CORE}, ceilinged by RLIMIT_NOFILE / \
+                     {}; {MAX_CONNS_ENV} is the lever, the fd limit its rail); the peer's \
+                     dial retries bounded",
+                    self.cfg.max_connections,
+                    CONNECTION_FDS * LISTENER_FD_SHARE
                 );
                 drop(tcp);
                 continue;
@@ -2883,6 +3019,26 @@ impl std::fmt::Debug for RpcClient {
 /// Bound on the dial-side connect + handshake and on one call's reply.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// One dial attempt's outcome class (`RpcClient::connect_once`): the
+/// listener closed before its challenge — the cap's shape, retried by
+/// `connect_sync` — or any other failure, returned verbatim.
+enum ConnectRefusal {
+    BeforeChallenge,
+    Other(SqueezefsError),
+}
+
+impl From<SqueezefsError> for ConnectRefusal {
+    fn from(e: SqueezefsError) -> Self {
+        ConnectRefusal::Other(e)
+    }
+}
+
+impl From<std::io::Error> for ConnectRefusal {
+    fn from(e: std::io::Error) -> Self {
+        ConnectRefusal::Other(SqueezefsError::from(e))
+    }
+}
+
 /// The reply bound every [`RpcClient::call`] waits under — the socket read
 /// timeout installed at dial time, so it is the wall from the client's
 /// send to the first reply byte. A verb the SERVER parks for this long
@@ -2915,12 +3071,52 @@ impl RpcClient {
         .await
     }
 
+    /// The dial with the accept-refusal retry around it (PR 13c, F-B3): a
+    /// listener at its connection cap accepts and CLOSES without a
+    /// challenge, so the first read answers EOF. That is the retryable
+    /// class — a slot frees when a peer's session ends — so the dial is
+    /// repeated with a doubling backoff (`DIAL_TIMEOUT / 500` → `/ 20`:
+    /// fractions of the one bound, never free constants) until the dial
+    /// bound is spent; past it the TYPED class surfaces (EAGAIN), never the
+    /// PR-13b `InvalidOperation` at the first EOF (the 14th member of the
+    /// box's 32-member fleet died on that word).
     fn connect_sync(
         endpoint: &str,
         secret: &[u8],
         peer_id: &str,
         security: Option<&ClusterSecurityConfig>,
     ) -> Result<Self> {
+        let started = std::time::Instant::now();
+        let mut backoff = DIAL_TIMEOUT / 500;
+        loop {
+            match Self::connect_once(endpoint, secret, peer_id, security) {
+                Err(ConnectRefusal::BeforeChallenge) => {
+                    let spent = started.elapsed();
+                    if spent + backoff >= DIAL_TIMEOUT {
+                        return Err(SqueezefsError::retryable(
+                            crate::error::RefusalClass::ListenerRefused,
+                            format!(
+                                "cluster wire: {endpoint} closed the connection before its \
+                                 challenge for {spent:?} (its connection cap, or a shutdown) — \
+                                 the peer's {MAX_CONNS_ENV} / fd limit is the lever; retry"
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(DIAL_TIMEOUT / 20);
+                }
+                Err(ConnectRefusal::Other(e)) => return Err(e),
+                Ok(client) => return Ok(client),
+            }
+        }
+    }
+
+    fn connect_once(
+        endpoint: &str,
+        secret: &[u8],
+        peer_id: &str,
+        security: Option<&ClusterSecurityConfig>,
+    ) -> std::result::Result<Self, ConnectRefusal> {
         let tcp = dial_tcp(endpoint, DIAL_TIMEOUT)?;
         // Every dial-side exchange is bounded by DIAL_TIMEOUT at the
         // socket (the tokio::time::timeout wrappers this replaces bounded
@@ -2966,14 +3162,19 @@ impl RpcClient {
                     return Err(SqueezefsError::InvalidOperation(format!(
                         "cluster wire: coordinator speaks schema {schema}, this build speaks \
                          {CLUSTER_WIRE_SCHEMA}"
-                    )));
+                    ))
+                    .into());
                 }
                 server_nonce
             }
+            // EOF before any frame: the listener accepted and closed —
+            // its connection cap (or a shutdown). The retryable class.
+            None => return Err(ConnectRefusal::BeforeChallenge),
             other => {
                 return Err(SqueezefsError::InvalidOperation(format!(
                     "cluster wire: expected a Challenge first, got {other:?}"
-                )))
+                ))
+                .into())
             }
         };
         let peer_nonce = uuid::Uuid::new_v4().to_string();
@@ -2997,12 +3198,14 @@ impl RpcClient {
             Some(RpcFrame::Refused { reason }) => {
                 return Err(SqueezefsError::InvalidOperation(format!(
                     "cluster wire: enrollment refused by the coordinator: {reason}"
-                )))
+                ))
+                .into())
             }
             other => {
                 return Err(SqueezefsError::InvalidOperation(format!(
                     "cluster wire: unexpected admission reply: {other:?}"
-                )))
+                ))
+                .into())
             }
         }
         let key = session_key(

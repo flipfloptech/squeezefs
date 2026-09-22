@@ -1714,6 +1714,40 @@ fn fleet_share_exemption_list_is_pinned_to_the_kernel_mandated_set() {
          join the §5.6 exemption list EXPLICITLY (kernel-mandated) or read \
          the divided sizing root (crate::cpu::process_parallelism) instead"
     );
+    // The SECOND exemption class (PR 13c, F-B3): the FLEET-WIDTH root —
+    // a listener's load is the whole fleet's width, so N co-located
+    // daemons each serve it whole and the RAW mask is the root. Its
+    // consumer census is pinned the same way.
+    let mut raw_consumers = BTreeSet::new();
+    for f in &files {
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        if text.contains("raw_parallelism(") {
+            raw_consumers.insert(
+                f.strip_prefix(root)
+                    .expect("census file outside the manifest root")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    let raw_expected: BTreeSet<String> = [
+        // The root's definition (and possible_cpus' RAW fallback).
+        "src/cpu.rs",
+        // The cluster-wire listener cap: a LISTENER serves the fleet's
+        // width whatever this box's share (F-B3).
+        "src/cluster_wire.rs",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    assert_eq!(
+        raw_consumers, raw_expected,
+        "the raw_parallelism consumer census drifted — a new consumer must \
+         join the fleet-width exemption class EXPLICITLY (a listener's load \
+         is the fleet's, never this daemon's share) or read the divided root"
+    );
 }
 
 /// ENG-10: the knob is registered (int, lo = 1 — zero and negatives
@@ -1804,12 +1838,13 @@ fn fleet_share_quarters_the_residue_site_derivations() {
     );
 
     // cluster_wire owner-side RPC lanes (ceil(cpus/8), clamp [1, 8]).
-    use squeezefs::cluster_wire::{max_connections_from, service_threads_from};
+    use squeezefs::cluster_wire::service_threads_from;
     assert_eq!(service_threads_from(None, 32), 4);
     assert_eq!(service_threads_from(None, field), 1, "= 4/4");
-    // cluster_wire connection cap (cpus × 16, clamp [64, 1024]).
-    assert_eq!(max_connections_from(32), 512);
-    assert_eq!(max_connections_from(field), 128, "= 512/4");
+    // The cluster_wire connection cap is NOT a residue site any more (PR
+    // 13c, F-B3): a listener's load is the FLEET's width, which the share
+    // divisor shrinks it by — it reads the RAW root (the fleet-width
+    // exemption class); its rows are `listener_cap_derives_from_the_raw_root…`.
 
     // meta_ship per-frame batch cap (cpus × 2, clamp [64, 4096]): the
     // quarter is visible on the 256-core box; the field shape sits on the
@@ -1888,11 +1923,6 @@ fn residue_site_floors_hold_at_every_share() {
             "RPC-lane floor holds at share={share}"
         );
         assert_eq!(
-            squeezefs::cluster_wire::max_connections_from(c),
-            64,
-            "connection-cap floor holds at share={share}"
-        );
-        assert_eq!(
             squeezefs::meta_ship::router::batch_max_from(None, c),
             64,
             "M7 batch floor holds at share={share}"
@@ -1946,6 +1976,98 @@ fn residue_site_explicit_levers_stay_verbatim() {
         4,
         "never oversubscribes the (divided) root"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Symmetric PR 13c — F-B3: the cluster-wire LISTENER cap derives from the
+// width it serves (`.benchmarks/2026-09-19-sym-acceptance.md` §3.9.2). The
+// PR-13b form `(cpus × 16).clamp(64, 1024)` read the FLEET-SHARE-DIVIDED
+// root: on 32 cores under `SQUEEZEFS_FLEET_SHARE=32` it derived 64 — the
+// listener's cap SHRANK exactly as the fleet it served grew, and the 14th
+// member of a 32-member fleet was refused at accept. A listener's load is
+// the fleet's width × each member's session demand, independent of how
+// many daemons share this box's CPUs: the RAW mask is its root (the
+// fleet-width exemption class, §5.6), the fd budget its ceiling.
+// ---------------------------------------------------------------------------
+
+/// The cap's pure form: `(raw_cpus × 16)` — 16 parked connection threads
+/// per core, the thread-per-connection posture — floored at the shipped 64
+/// and ceilinged by the fd budget: each connection holds TWO fds (the
+/// socket + its shutdown-nudge clone) and the listeners may hold a quarter
+/// of `RLIMIT_NOFILE` (the `uring_fs::fd_cache_cap` law — the FUSE rings,
+/// device fds, staging segments and the job wire own the rest), so
+/// `ceiling = nofile / 8`, never below the floor.
+#[test]
+fn listener_cap_derives_from_the_raw_root_and_the_fd_budget() {
+    use squeezefs::cluster_wire::{max_connections_from, CONNECTION_FDS, LISTENER_FD_SHARE};
+    assert_eq!(CONNECTION_FDS, 2, "the socket + its shutdown-nudge clone");
+    assert_eq!(
+        LISTENER_FD_SHARE, 4,
+        "a quarter of RLIMIT_NOFILE — fd_cache_cap's law"
+    );
+    // The box: 32 raw CPUs, a raised soft limit.
+    assert_eq!(max_connections_from(32, 524_288), 512);
+    // The fd budget ceilings a big box on a small limit: 1024 / 2 / 4 = 128.
+    assert_eq!(max_connections_from(256, 1_024), 128);
+    assert_eq!(
+        max_connections_from(256, 65_536),
+        4096,
+        "256 × 16 under the budget"
+    );
+    // The floor is the shipped posture even under a tiny fd limit (a
+    // process that small fails at its FUSE rings first).
+    assert_eq!(max_connections_from(1, 1_024), 64);
+    assert_eq!(max_connections_from(1, 64), 64);
+}
+
+/// THE F-B3 LAW: the cap is fleet-share EXEMPT. On the box's shape (32 raw
+/// CPUs, 32 co-located members, each under `FLEET_SHARE=32`) the listener
+/// admits the whole fleet's steady-state session demand — computed from the
+/// SAME pool derivations the members dial with — where the PR-13b form
+/// admitted 64 of the 160+ sessions.
+#[test]
+fn a_32_member_fleets_session_demand_fits_the_listener_cap_at_share_32() {
+    use squeezefs::cluster_wire::{max_connections_from, member_session_demand_from};
+    use squeezefs::cpu::effective_parallelism_from;
+    let raw = 32usize;
+    let members = 32usize;
+    let volumes = 2usize; // the fleet rig's MDS_COUNT
+    let member_cpus = effective_parallelism_from(raw, members);
+    assert_eq!(member_cpus, 1, "each co-located member sizes for one CPU");
+    let per_member = member_session_demand_from(member_cpus, volumes);
+    // A member's demand against the S8 listener: per volume the token
+    // grant pool (publish_ship_depth = 2 at one CPU) + its recall channel,
+    // plus the publish pool, the manager wire, the meta-ship lane + its
+    // mux, and the per-holder custody client.
+    assert_eq!(per_member, 2 * (2 + 1) + 2 + 4);
+    let cap = max_connections_from(raw, 524_288);
+    assert!(
+        members * per_member <= cap,
+        "32 members × {per_member} sessions = {} must fit the cap {cap}",
+        members * per_member
+    );
+    // The PR-13b defect, stated as arithmetic: the divided root's cap.
+    let divided = (member_cpus * 16).clamp(64, 1024);
+    assert!(
+        members * per_member > divided,
+        "the fleet-share-divided cap {divided} refused the fleet ({})",
+        members * per_member
+    );
+}
+
+/// The explicit lever wins verbatim inside its range and is RAILED by the
+/// fd budget (the `service_threads_from(Some(16), 4) == 4` precedent: an
+/// explicit value the process cannot hold is a lie, never a cap).
+#[test]
+fn listener_cap_explicit_lever_is_railed_by_the_fd_budget() {
+    use squeezefs::cluster_wire::max_connections_resolved;
+    assert_eq!(max_connections_resolved(Some(200), 32, 524_288), 200);
+    assert_eq!(
+        max_connections_resolved(Some(4096), 32, 1_024),
+        128,
+        "the fd budget rails an explicit value"
+    );
+    assert_eq!(max_connections_resolved(None, 32, 524_288), 512);
 }
 
 /// D-1c (e2e perf audit §5.3 row 1 — one conveyor group per shipped

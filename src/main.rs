@@ -3668,6 +3668,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so the one-line notice is audible.
     squeezefs::harden_root_subprocess_path();
 
+    // PR 13c (F-B3): the daemon's fd population derives from system
+    // geometry (one FUSE ring per possible CPU, the fleet's wire sessions);
+    // the 1024 login default is a shell posture. The hard limit is the
+    // operator's bound, and the listener caps derive their ceiling from
+    // the soft limit in force — raised BEFORE any listener reads it.
+    squeezefs::cluster_wire::raise_nofile_soft_limit();
+
     // rip-tokio-total: no runtime in the surviving process. The CLI
     // future runs on THIS thread's park loop; every venue is first-party
     // (fuse3 lanes own the handlers and their pinning, sqz-meta owns the

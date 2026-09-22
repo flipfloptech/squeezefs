@@ -904,8 +904,17 @@ async fn a_peer_without_the_storage_secret_is_refused() {
     host.shutdown();
 }
 
+/// Symmetric PR 13c, F-B3 (`.benchmarks/2026-09-19-sym-acceptance.md`
+/// §3.9.2): a dial the listener REFUSED AT ACCEPT (the cap — one accept,
+/// one close, no challenge) is RETRIED bounded by the dial-side client,
+/// never surfaced as the PR-13b `InvalidOperation("expected a Challenge
+/// first, got None")` at the first EOF: the 14th member of the box's
+/// 32-member fleet died on that word while thirteen live peers held the
+/// slots. A slot that frees inside the bound admits the dial; a cap that
+/// never frees fails it with the TYPED retryable class (EAGAIN) inside the
+/// dial bound — and the listener's refusal is counted either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_connections_are_capped_and_handles_pruned() {
+async fn a_dial_refused_at_the_cap_retries_bounded_and_lands_when_a_slot_frees() {
     let mut cfg = listener_cfg();
     cfg.max_connections = 2;
     let host = cw::RpcListener::start(cfg, SECRET.to_vec(), Arc::new(cw::PingService))
@@ -919,20 +928,77 @@ async fn concurrent_connections_are_capped_and_handles_pruned() {
                 .expect("inside the cap"),
         );
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if cw::RpcClient::connect(&endpoint, SECRET, "over-cap", None)
-            .await
-            .is_err()
-        {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the cap must refuse the third connection"
-        );
-    }
-    assert!(host.stats().connections_refused >= 1);
+    // Free one slot after the third dial has been refused at least once.
+    let freer = {
+        let host = Arc::clone(&host);
+        let first = held.pop().expect("a held session");
+        tokio::spawn(async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while host.stats().connections_refused == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the cap never refused the third dial"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            drop(first);
+        })
+    };
+    let t0 = std::time::Instant::now();
+    let third = cw::RpcClient::connect(&endpoint, SECRET, "over-cap", None)
+        .await
+        .expect("the retried dial lands once a slot frees");
+    assert!(third.authn().authenticated());
+    assert!(
+        t0.elapsed() < cw::call_reply_bound(),
+        "landed inside the dial bound, not at it"
+    );
+    freer.await.expect("the freer task");
+    assert!(
+        host.stats().connections_refused >= 1,
+        "the refusal is counted"
+    );
+    drop(third);
+    drop(held);
+    host.shutdown();
+}
+
+/// The second face: a cap that never frees fails the dial with the typed
+/// class — `RefusalClass::ListenerRefused` → EAGAIN — inside the dial bound
+/// (the bound is `call_reply_bound()`; the PR-13b word was EINVAL at once).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cap_that_never_frees_fails_the_dial_typed_inside_the_bound() {
+    let mut cfg = listener_cfg();
+    cfg.max_connections = 1;
+    let host = cw::RpcListener::start(cfg, SECRET.to_vec(), Arc::new(cw::PingService))
+        .expect("listener starts");
+    let endpoint = host.endpoint().to_string();
+    let held = cw::RpcClient::connect(&endpoint, SECRET, "peer-0", None)
+        .await
+        .expect("inside the cap");
+    let t0 = std::time::Instant::now();
+    let err = cw::RpcClient::connect(&endpoint, SECRET, "over-cap", None)
+        .await
+        .expect_err("the cap never frees");
+    let took = t0.elapsed();
+    assert_eq!(
+        err.refusal_class(),
+        Some(squeezefs::error::RefusalClass::ListenerRefused),
+        "the typed retryable class, not InvalidOperation: {err}"
+    );
+    assert_eq!(err.to_errno(), libc::EAGAIN);
+    assert!(
+        took <= cw::call_reply_bound() + Duration::from_secs(2),
+        "bounded by the dial bound: {took:?}"
+    );
+    assert!(
+        took >= cw::call_reply_bound() / 2,
+        "the retry ran for the bound, not one attempt: {took:?}"
+    );
+    assert!(
+        host.stats().connections_refused >= 2,
+        "every refused attempt is counted"
+    );
     drop(held);
     host.shutdown();
 }

@@ -29,6 +29,12 @@ pub enum RefusalClass {
     /// re-assertion window, PR 13b §4.4ag) and no grant was re-asserted
     /// within the park bound: retry (`token_plane::TokenReaderPlane::call`).
     MembershipPending,
+    /// The peer's cluster-wire listener closed the connection before its
+    /// challenge — at its connection cap or shutting down — and the
+    /// dial-side bounded retry ran out (PR 13c, F-B3): retry
+    /// (`cluster_wire::RpcClient::connect`). Never travels on the wire (the
+    /// peer said nothing); the word exists so `refusal_class()` names it.
+    ListenerRefused,
 }
 
 impl RefusalClass {
@@ -39,6 +45,7 @@ impl RefusalClass {
             RefusalClass::StaleHolderView => 2,
             RefusalClass::HolderUnreachable { .. } => 3,
             RefusalClass::MembershipPending => 4,
+            RefusalClass::ListenerRefused => 5,
         }
     }
 
@@ -51,6 +58,7 @@ impl RefusalClass {
             2 => Some(RefusalClass::StaleHolderView),
             3 => Some(RefusalClass::HolderUnreachable { holder: 0 }),
             4 => Some(RefusalClass::MembershipPending),
+            5 => Some(RefusalClass::ListenerRefused),
             _ => None,
         }
     }

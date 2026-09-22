@@ -1853,10 +1853,14 @@ async fn a_token_reader_lists_a_striped_directory_as_the_merge_of_its_stripes() 
         attrs.nlink, 2,
         "a directory of files folds to nlink 2 over its stripes"
     );
-    assert!(
-        plane.stats().grants >= 4 + 48,
-        "K stripe tokens + C inode tokens at least: {}",
-        plane.stats().grants
+    // EXACT (PR 13d): K stripe tokens + C inode tokens + the directory's
+    // own (its dentry-bearing token, fetched by the map read; the fold's
+    // stripe records are hits on the merge's tokens) — the `-ls` leg's
+    // `K + C` law with its one constant, on the solo shape.
+    assert_eq!(
+        plane.stats().grants,
+        4 + 48 + 1,
+        "K stripe tokens + C inode tokens + D's own — no second token per stripe"
     );
     plane.stop().await;
     host.shutdown();

@@ -9742,3 +9742,260 @@ async fn a_root_split_in_the_parked_cycles_flush_pass_never_drops_the_slots_page
     drop(again);
     fsck_clean(&uris).await;
 }
+
+/// **A COLD `ls -l` of a STRIPED directory at a token reader pays ONE
+/// token per stripe — and a striped ROOT adds its own `K_root` at the
+/// reader's first `stat /`** (PR 13d — found by PR 15's local functional
+/// pass of the matrix's own `sym-shared-dir-ls` leg on the gated
+/// `77f4da1d`: `dlm_token_grants` read `2K + C + 3` (20,131 for K = 64,
+/// C = 20,000) where every PR 13-era run read `K + C + 3`; design §8 gate
+/// 3b's law is `[K + C, K + C + 4]`). Attributed to FLEET STATE, not a
+/// commit: that fleet had run `sym-scale` first, whose N = 8 row's seven
+/// `mkdir /scale-…` auto-striped `/` at the manager (`dir_striped_dirs 1`
+/// at m0 before the leg; 0 in every `K + C + 3` run), and the kernel
+/// revalidates the mount root's attrs on every path walk (every TTL is 0
+/// under tokens), so the reader's `stat /` folds over the root's stripes
+/// (`getattr_local` → `stripe_map_cached`, learnt by the `lookup(/, D)` →
+/// `fold_striped_attrs` → `stripe_record`) and pays ONE records-only grant
+/// per root stripe — the class the acceptance record's §7 item 7 prices
+/// ("one grant each per holder per token lifetime"). PR 13b's `7b2ef9e9`
+/// reads both arithmetics identically. The fleet's shape in one process:
+/// the directory held by the manager (this process's one cross-owner
+/// shipper and custody arm — both process-global), its stripes SUPPLIED
+/// by two joiners over the S8 wire (the remainder the manager's own), its
+/// children the manager's — the ones routing into a supplied stripe
+/// shipped to that holder — two metadata volumes (a directory's children
+/// mint round-robin over the set), and a `-o ro` reader whose planes dial
+/// each holder's listener. The reader's `ls -l` as the kernel walks it:
+/// `lookup(/, D)`, `stat /`, `stat D`, the paged `readdir` (the K-way
+/// merge), `lookup + stat` of every child, `stat D` again (the fold).
+/// Phase 1 (the leg's law): the root unstriped — EXACTLY `K + C + 3`: the
+/// root's dentry token, `D`'s record token, `D`'s dentry-bearing re-grant.
+/// Phase 2: the root striped over `K_root` stripes, a second cold reader —
+/// EXACTLY `K + C + 3 + K_root` (the root stripe the lookup fetched with
+/// dentries is one of the `K_root`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cold_ls_of_a_striped_directory_at_a_token_reader_pays_one_token_per_stripe() {
+    use squeezefs::meta_ship::token_plane::{reader_stats_json, TokenClientConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config(dir.path(), 2).await;
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let mtokens = DaemonVenue::stand_up(&manager, true, "manager").await;
+    // The manager's OWN directory, checkpointed before the joins (a
+    // served `SupplyStripeIno` reads the directory's record off the
+    // joiner's projection — the joiners are no custody arm here).
+    let d = manager
+        .create(1, "hot", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("the manager's directory")
+        .ino;
+    let mut files = create_files(&manager, d, "pre-", 8).await;
+    for v in &manager.volumes {
+        v.checkpoint_now().await.expect("checkpoint");
+    }
+    let j1 = join(&uris, &venue, &mvol, 1).await;
+    let j2 = join(&uris, &venue, &mvol, 2).await;
+    let j1venue = DaemonVenue::stand_up(&j1, false, "joiner-1").await;
+    let j2venue = DaemonVenue::stand_up(&j2, false, "joiner-2").await;
+    for v in &manager.volumes {
+        let holders = &v.slot_leases().expect("armed").holders;
+        holders.set_endpoint(1, &j1venue.endpoint);
+        holders.set_endpoint(2, &j2venue.endpoint);
+    }
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(&manager),
+            "node-manager",
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    let sink = Arc::new(ProbeSink {
+        calls: std::sync::atomic::AtomicU64::new(0),
+    });
+    let for_arm = Arc::clone(&sink);
+    let _arm = squeezefs::data_grant::arm_slot_custody(
+        &manager,
+        &squeezefs::cowriter::node_member_id().expect("this node's member id"),
+        VENUE_SECRET.to_vec(),
+        0,
+        Arc::new(move |_volume| {
+            Arc::clone(&for_arm) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
+        }),
+    );
+    // The flip at the holder: stripes 0 and 1 supplied by joiners 1 and 2
+    // (their slots, their listeners), the remainder the manager's own —
+    // three stripe holders.
+    const K: u16 = 4;
+    // The closures below run twice: they capture REFERENCES (copied into
+    // each `async move` block), never the handles.
+    let (mgr, uris_ref, mtokens_ref, j1venue_ref, j2venue_ref) =
+        (&manager, &uris, &mtokens, &j1venue, &j2venue);
+    let flip_and_migrate = |dir: u64| async move {
+        mgr.stripe_dir_with_suppliers(dir, K, &[1, 2])
+            .await
+            .unwrap_or_else(|e| panic!("the flip of {dir} with two supplied stripes: {e}"));
+        // Every name re-homed before a reader looks (the finished shape).
+        let started = std::time::Instant::now();
+        loop {
+            let _ = mgr.migrate_dir(dir).await.expect("the migration");
+            let m = mgr.stripe_map(dir).await.expect("read").expect("striped");
+            if !m.migrating {
+                return m;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "the migration of {dir} did not finish"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    };
+    let map = flip_and_migrate(d).await;
+    assert_eq!(map.stripes.len(), usize::from(K));
+    for (j, stripe) in [(&j1, map.stripes[0]), (&j2, map.stripes[1])] {
+        assert!(
+            j.volumes[0]
+                .slot_leases()
+                .expect("armed")
+                .gate
+                .is_leased(slot_of_global(&manager, stripe)),
+            "premise: stripe {stripe} lives in a joiner's slot"
+        );
+    }
+    // Post-flip children: the ones routing into a supplied stripe ship to
+    // its holder (PR 6's step through the manager's shipper).
+    files.extend(create_files(&manager, d, "post-", 24).await);
+    let c = files.len() as u64;
+    let (dv, _) = manager.route_ino(d);
+    let off_volume = files
+        .iter()
+        .filter(|(_, ino)| manager.route_ino(*ino).0 != dv)
+        .count();
+    assert!(
+        off_volume > 0,
+        "premise: some children live on the volume D does not ({off_volume} of {c})"
+    );
+    let k = u64::from(K);
+    let files_ref = &files;
+
+    // A COLD reader: nothing of the directory cached, every holder's
+    // listener bound, its tree 0 polled after the manager's checkpoint
+    // (the lessees published). Returns the grants its `ls -l D` paid.
+    let cold_ls = |client_id: &'static str| async move {
+        for v in &mgr.volumes {
+            v.checkpoint_now().await.expect("checkpoint");
+        }
+        let reader = squeezefs::meta_backend::open_routed_meta_set_read_only(uris_ref)
+            .await
+            .expect("read-only open");
+        for (vi, rv) in reader.volumes.iter().enumerate() {
+            rv.arm_reader_revalidation(None).expect("arms");
+            rv.revalidate_reader().await.expect("poll");
+            let _default = rv
+                .arm_token_reader(TokenClientConfig {
+                    endpoint: mtokens_ref.endpoint.clone(),
+                    secret: VENUE_SECRET.to_vec(),
+                    client_id: client_id.to_string(),
+                    volume: u16::try_from(vi).expect("ordinal"),
+                })
+                .expect("the manager's plane arms");
+            rv.bind_reader_holder_endpoint(1, &j1venue_ref.endpoint);
+            rv.bind_reader_holder_endpoint(2, &j2venue_ref.endpoint);
+        }
+        let grants = |reader: &RoutedMetaBackend| -> u64 {
+            reader_stats_json(&reader.volumes)["dlm_token_grants"]
+                .as_array()
+                .expect("the reader's Token family")
+                .iter()
+                .map(|v| v.as_u64().expect("a count"))
+                .sum()
+        };
+        let g0 = grants(&reader);
+        // `ls -l D` as the kernel walks it.
+        let looked = reader.lookup(1, "hot").await.expect("lookup D").ino;
+        assert_eq!(looked, d);
+        // The kernel revalidates the mount ROOT's attrs on every path
+        // walk (every TTL is 0 under tokens).
+        reader.getattr(1).await.expect("stat / (the kernel's walk)");
+        reader.getattr(d).await.expect("stat D (cold)");
+        let mut listed: Vec<String> = Vec::new();
+        let mut offset = 0u64;
+        loop {
+            let page = reader
+                .readdir_stream(d, offset, 7)
+                .await
+                .expect("the reader's readdir page");
+            let Some((last, _)) = page.last() else {
+                break;
+            };
+            offset = *last;
+            listed.extend(page.iter().map(|(_, e)| e.name.clone()));
+            if page.len() < 7 {
+                break;
+            }
+        }
+        let mut want: Vec<String> = files_ref.iter().map(|(n, _)| n.clone()).collect();
+        want.sort();
+        listed.sort();
+        assert_eq!(listed, want, "the merge lists every child once");
+        for (name, ino) in files_ref {
+            let got = reader
+                .lookup(d, name)
+                .await
+                .unwrap_or_else(|e| panic!("the reader resolves {name}: {e}"));
+            assert_eq!(got.ino, *ino, "{name}");
+            reader.getattr(*ino).await.expect("stat child");
+        }
+        let attrs = reader.getattr(d).await.expect("stat D (the fold)");
+        assert_eq!(attrs.nlink, 2, "a directory of files folds to nlink 2");
+        let paid = grants(&reader) - g0;
+        let face = reader_stats_json(&reader.volumes);
+        for v in &reader.volumes {
+            v.shutdown().await.unwrap();
+        }
+        (paid, face)
+    };
+
+    // Phase 1 — the leg's law, the root unstriped.
+    let (paid, face) = cold_ls("pr13d-ls-reader").await;
+    assert!(
+        paid >= k + c && paid <= k + c + 4,
+        "dlm_token_grants = {paid} ∉ [K + C, K + C + 4] = [{}, {}] for K = {k}, C = {c} (one \
+         token per stripe, one per child, + the root, D's record, D's re-grant with dentries): \
+         {face}",
+        k + c,
+        k + c + 4
+    );
+    assert_eq!(
+        paid,
+        k + c + 3,
+        "the constant beside K + C is 3 on both fleet venues: {face}"
+    );
+
+    // Phase 2 — the ROOT striped (the fleet after `sym-scale`): a second
+    // cold reader's first `stat /` folds over the root's stripes and pays
+    // one records-only grant per root stripe.
+    let root_map = flip_and_migrate(1).await;
+    let k_root = root_map.stripes.len() as u64;
+    assert_eq!(k_root, k);
+    let (paid_striped_root, face) = cold_ls("pr13d-ls-reader-striped-root").await;
+    assert_eq!(
+        paid_striped_root,
+        k + c + 3 + k_root,
+        "a striped root adds exactly K_root = {k_root} records-only grants at the reader's \
+         first stat / (the record's §7 item 7 class — the fleet's 2K + C + 3): {face}"
+    );
+
+    squeezefs::data_grant::disarm_slot_custody().await;
+    squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
+    shutdown(&j2).await;
+    shutdown(&j1).await;
+    j2venue.tear_down();
+    j1venue.tear_down();
+    mtokens.tear_down();
+    venue.tear_down();
+    shutdown(&manager).await;
+}

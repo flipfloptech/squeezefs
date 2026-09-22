@@ -927,6 +927,33 @@ routed mutation futures across PRs 6 / 7b / 13b — nameable only with a
 dwarf-unwound leg, not run). The venue law: no laptop number above is a
 verdict.
 
+**→ The memmove term: named by the box re-run's DWARF legs (§3.9.4.1 on
+`perf/sym-box-rerun`) and FIXED in PR 13f (`perf/setattr-future-economy`,
+2026-09-22).** It is the `handle_setattr` future's `Box::pin` + lane-handoff
+move on the kernel's per-op ctime SETATTR echo. `size_of_val` at the FUSE
+entry (`tests/meta_op_future_economy_tests.rs`, test profile, rustc
+1.98.1): `SqueezefsFilesystem::setattr` **18,960 B (`3228fcb8`) → 26,016 B
+(`77f4da1d`) → 896 B (PR 13f)**; `unlink` **7,616 → 11,088 → 280 B**;
+`rename` 392 B on all three (never grew). The routed `setattr` / `getattr`
+`async_trait` boxes the echo mints per op: 1,536 / 1,088 → 5,552 / 5,552 →
+1,720 / 1,192 B (rustc `-Zprint-type-sizes`). The root, named by the type-
+size dumps of both trees: NOT the routed setattr entry (a 16-byte box at
+the FUSE call site) but `KvMetaBackend::commit_tx` 176 → 4,816 B — PR 4's
+door `ensure_leases_for_tx` with its two first-touch acquire arms inline in
+EVERY commit's future, so every layout-publish site grew ≈ 3.5–4.6 KiB and
+the truncate arm (two publishes — the tail-zeroing staged write + the layout
+prune) +7 KiB, the unlink handler's overlay drain (one) +3.5 KiB; the echo
+never takes either arm and moved their state twice per op. The fix boxes
+each such arm INSIDE its branch (the truncate arm as `setattr_truncate`, the
+drain as `drain_unlink_target_overlays`, the door's two acquires, the PR 13b
+ship behind the sync `slot_is_foreign`, `note_served`'s tail,
+`getattr_local`'s striped fold, `token_serve_armed`): `commit_tx` 408 B,
+`open` 26,224 → 2,064 B (its O_TRUNC fold runs the setattr arm), every
+publish site within ≈ 300 B of pre-program, `write` 26,592 → 20,320 B (the
+striped-write arm's own growth stays — the `rw4k` row's follow-on, same fix
+shape). No behaviour change; pinned at 2× the fixed sizes. The box's gate-1
+bracket on the next flip binary re-reads the row.
+
 ##### 3.9.1b Harness findings (PR 1's rig, both brackets)
 
 1. **The fio window is 30 s, not the rig's `RT=60`.** The box's job files

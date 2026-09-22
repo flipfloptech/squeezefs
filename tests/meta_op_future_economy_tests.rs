@@ -7,20 +7,23 @@
 //! as the dominant term of the mdstorm `rename` / `unlink` DELTA: the
 //! kernel sends a ctime SETATTR echo after every rename and unlink, and
 //! the SETATTR handler's future had grown 18,960 → 26,016 B across PRs
-//! 5–13b (the unlink handler's 7,616 → 11,088 B) — not at the routed
+//! 4–13b (the unlink handler's 7,616 → 11,088 B) — not at the routed
 //! `setattr` entry, which is `async_trait`-boxed, but through the
 //! TRUNCATE arm's `write_file_staged` / `truncate_layout` sub-futures
-//! (and the unlink handler's overlay-drain arm), whose state is the data
-//! plane's whole layout-publish path: the S9 publish plane grew ≈ 3.5 KiB
-//! per publish site (`publish_target`, the record-ship resolver, the
-//! served-mutation sink, `commit_block_refs`, `migrate_block_map`), and
-//! the truncate arm carries two of them. The echo never takes either
-//! arm, yet moved their state twice per op.
+//! (and the unlink handler's overlay-drain arm), the CARRIERS: each
+//! carries the data plane's layout publish, and every publish site grew
+//! ≈ 3.5–4.6 KiB from ONE root — `KvMetaBackend::commit_tx` 176 →
+//! 4,816 B, PR 4's door `ensure_leases_for_tx`, whose two first-touch
+//! acquire arms (`manager_acquire_slots`, `joined_acquire_slot`) sat
+//! inline in every commit's future (rustc `-Zprint-type-sizes` on both
+//! trees; PR 13b's `publish_target` pair is ≈ 300–400 B of residue). The
+//! truncate arm carries two publishes (+7 KiB), the drain one. The echo
+//! never takes either arm, yet moved their state twice per op.
 //!
-//! The fix boxes those arms INSIDE their branches, so the unarmed
-//! metadata-only future carries a pointer to them, not them. This suite is
-//! the size INSTRUMENT (`--nocapture` prints every future's `size_of_val`)
-//! and the BUDGET pin.
+//! The fix boxes those arms INSIDE their branches (and the door's two
+//! acquires inside theirs), so the unarmed metadata-only future carries a
+//! pointer to them, not them. This suite is the size INSTRUMENT
+//! (`--nocapture` prints every future's `size_of_val`) and the BUDGET pin.
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
@@ -251,15 +254,14 @@ async fn handler_future_sizes_are_printed() {
 // The budget pin.
 // ---------------------------------------------------------------------------
 
-/// **The SETATTR handler's unarmed future budget.** Measured 26,016 B on
-/// `77f4da1d` (18,960 B on the pre-program `3228fcb8`); with the truncate
-/// arm and the overlay drain boxed inside their branches it is **896 B**
-/// — the metadata-only setattr's own state: the `async_trait` `getattr` /
-/// `setattr` boxes (16 B each), the per-inode write guard's future, the
-/// inode record and the attr publish's locals. The budget is 2× the fixed
-/// size: one more handler-class await (a guard, a boxed verb, a small
-/// router probe) fits; a data-plane arm (the smallest, `fetch_metadata`,
-/// is 2.6 KiB) does not.
+/// **The SETATTR handler's unarmed future budget.** Measured 26,016 B on `77f4da1d` (18,960 B on the
+/// pre-program `3228fcb8`); with the truncate arm and the overlay drain
+/// boxed inside their branches it is **896 B** — the metadata-only
+/// setattr's own state: the `async_trait` `getattr` / `setattr` boxes
+/// (16 B each), the per-inode write guard's future, the inode record and
+/// the attr publish's locals. The budget is 2× the fixed size: one more
+/// handler-class await (a guard, a boxed verb, a small router probe) fits;
+/// a data-plane arm (the smallest, `fetch_metadata`, is 2.6 KiB) does not.
 const SETATTR_FUTURE_BUDGET: usize = 1_792;
 /// **The UNLINK handler's unarmed future budget.** Measured 11,088 B on
 /// `77f4da1d` (7,616 B on `3228fcb8`); with the overlay-drain arm boxed it

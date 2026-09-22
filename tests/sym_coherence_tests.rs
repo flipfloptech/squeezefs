@@ -836,9 +836,10 @@ async fn a_foreign_create_is_visible_at_the_readers_next_resolve() {
 /// the dial's bounded retry then the typed `ListenerRefused`) are served
 /// from the local projection, counted on `dlm_token_root_projection_serves`
 /// — R-SYM-4's ONE named exception, the root alone: a child's resolve
-/// under the same refusal stays fail-closed (the retryable class, never
-/// the projection), and once the cap admits the reader the root is served
-/// under its token again. RED before: `getattr(1)` `Err`.
+/// under the same refusal stays fail-closed (PR 5's never-fresh-channel
+/// word or the dial's typed class — never the projection, never EINVAL),
+/// and once the cap admits the reader the root is served under its token
+/// again. RED before: `getattr(1)` `Err`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_readers_root_attr_survives_the_holders_connection_cap_so_stats_never_fail() {
     let _g = SEAM.lock().await;
@@ -848,10 +849,16 @@ async fn a_readers_root_attr_survives_the_holders_connection_cap_so_stats_never_
     Metadata::create(writer.as_ref(), 1, "pre", libc::S_IFREG | 0o644, 0, 0)
         .await
         .unwrap();
-    // The holder's listener admits ONE connection, and a foreign session
-    // holds it: every dial of the reader's plane is refused at accept.
+    // The holder's listener admits exactly ONE reader's session demand (its
+    // recall channel + its grant pool — `member_session_demand_from`'s
+    // per-volume terms), and that many foreign sessions hold the slots:
+    // every dial of the reader's plane is refused at accept.
+    let demand = 1 + squeezefs::meta_ship::publish::publish_ship_depth_from(
+        None,
+        squeezefs::cpu::process_parallelism(),
+    );
     let mut cfg = listener_cfg();
-    cfg.max_connections = 1;
+    cfg.max_connections = demand;
     let host = cw::RpcListener::start_async(
         cfg,
         SECRET.to_vec(),
@@ -859,9 +866,14 @@ async fn a_readers_root_attr_survives_the_holders_connection_cap_so_stats_never_
     )
     .expect("token listener");
     let endpoint = host.endpoint().to_string();
-    let occupant = cw::RpcClient::connect(&endpoint, SECRET, "occupant", None)
-        .await
-        .expect("the one slot");
+    let mut occupants = Vec::new();
+    for i in 0..demand {
+        occupants.push(
+            cw::RpcClient::connect(&endpoint, SECRET, &format!("occupant-{i}"), None)
+                .await
+                .expect("inside the cap"),
+        );
+    }
     let reader = open_routed_meta_set_read_only(&[path.display().to_string()])
         .await
         .expect("read-only open");
@@ -889,14 +901,15 @@ async fn a_readers_root_attr_survives_the_holders_connection_cap_so_stats_never_
         host.stats().connections_refused >= 1,
         "the cap refused the reader's dial"
     );
-    // A CHILD under the same refusal: fail-closed with the retryable class
-    // (R-SYM-4 — never the projection).
+    // A CHILD under the same refusal: fail-closed (R-SYM-4 — never the
+    // projection): the plane's never-fresh channel is PR 5's own
+    // `serve_refusals` word (EIO), the dial's typed class EAGAIN — never
+    // the PR-13b EINVAL.
     let child = Metadata::lookup(reader.as_ref(), 1, "pre").await;
     let err = child.expect_err("a child's resolve stays fail-closed");
-    assert_eq!(
-        err.to_errno(),
-        libc::EAGAIN,
-        "the typed retryable class, never EINVAL: {err}"
+    assert!(
+        matches!(err.to_errno(), libc::EAGAIN | libc::EIO),
+        "fail-closed under a token or the retryable class, never EINVAL: {err}"
     );
     assert_eq!(
         squeezefs::meta_ship::token_plane::test_reader_root_projection_serves(),
@@ -904,7 +917,7 @@ async fn a_readers_root_attr_survives_the_holders_connection_cap_so_stats_never_
         "only the root takes the exception"
     );
     // The cap admits the reader: the root is served under its token.
-    drop(occupant);
+    drop(occupants);
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let _ = Metadata::getattr(reader.as_ref(), 1).await;

@@ -1374,6 +1374,108 @@ DWARF-unwound leg per arm for `rename` / `unlink` at 299 Hz; scale 100,
   busy) and the zc bridge's hops are unchanged (`msg_hop` 24.4 → 25.0,
   `wake_hop` 26.8 → 28.1, `device_cq` 96 both).
 
+##### 3.9.4.2 Gate 3 — `sym-scale` (B, the armed plane) vs `mw-scale` (A, the SHIPPED authority + co-writers on the same binary) (12:24 → 13:06 UTC): **B N = 8 4.27× creates / 5.37× ingest on the wall (MISS vs ≥ 5.6×, exactly §3.9.2's read), 0.61× per daemon-CPU-second; A bounded at 351–391 creates/s at EVERY N (0.07×) by the authority's verb service — and the F-B1 tripwire TRIPPED THREE TIMES on the B fleet with PR 13c's exclusion excusing NOTHING; the B row set stopped at r1**
+
+**The A arm exists on the box for the first time** — the box-rows rung's
+Finding 3 was the harness gap; this rung wrote `run_mw_matrix.sh
+mw-scale` (the SAME storm on `mw_fleet.sh create N=1 --cowriters=7`: the
+S9 authority + N − 1 co-writers each in its own directory, the same
+`C/CPU-S` column, the engagement law the S8/S9 ledgers' closure — Σ
+`shipped_verbs` + the S10 create-intent lane's `meta_ship_intent_verbs`
+≡ the authority's `served_verbs` (H-R1: the first launch died on
+131,156 shipped vs 139,347 served, the +8,192 the intents lane the owner
+counts and the client's `shipped_verbs` does not), publish ships ≡
+served, refusals 0, `local_commit_refusals` flat, `mount_posture`
+co-writer) and fleet M / the `mwscale` gate in the driver. Order: **A1**
+(fleet M) → **B2** (fleet A, fresh); the B row set stopped on the
+tripwire at r1, and a second A position was NOT run (at a 60×
+separation it decides nothing — the minimum-count law).
+
+| N | **B (armed): create/s · ×N=1** | B `C/CPU-S` (create phase) | B ingest MiB/s · × | B `MGR_LOAD` / `MGR_CPU` / handovers / ships / rpcs | **A (shipped MW): create/s · ×** | A `C/CPU-S` | A ingest MiB/s · × | A `MGR_CPU` / shipped + intents ≡ served / publish ships |
+|---|---|---|---|---|---|---|---|---|
+| 1 | **5,029 · 1.00×** | 4,281 | 1,284 · 1.00× | 3 % / 114 % / 0 / 0 / 0 | **5,288 · 1.00×** | 4,287 | 1,112 · 1.00× | 116 % / — / 0 |
+| 2 | **9,446 · 1.88×** | 3,944 (0.92×) | 2,719 · 2.12× | 2 % / 120 % / 0 / 1 / 0 | **351 · 0.07×** | 332 | 2,347 · 2.11× | 101 % / 131,396 + 8,192 ≡ 139,587 / 1,657 |
+| 4 | **16,348 · 3.25×** | 3,314 (0.77×) | 4,251 · 3.31× | 1 % / 123 % / 0 / 3 / 0 | **343 · 0.06×** | 234 | 3,910 · 3.52× | 138 % / 391,144 + 24,576 ≡ 415,720 / 4,350 |
+| 8 | **21,486 · 4.27×** | **2,627 (0.61×)** | **6,898 · 5.37×** | 0 % / 111 % / 0 / 6 / 0 | **391 · 0.07×** | 206 | **6,715 · 6.04×** | 176 % / 902,335 + 57,856 ≡ 960,191 / 8,987 |
+
+**Verdicts.** *B, the wall law (≥ 0.7 × N × the N = 1 rate on BOTH
+rows):* N = 2 ✓✓, N = 4 ✓✓, **N = 8 ✗ on creates (4.27× vs ≥ 5.6×), ✓
+on ingest (5.37× — the previous read 5.33×)** — the number §3.9.2 read
+on PR 13b, reproduced to 0.01× on PR 13c: the co-located venue's term
+(§3.9.3) is unchanged by the fixes, as it should be. *B, the amended
+row's per-daemon-CPU-second face (design §8 gate 3, PR 13c):* 4,281 →
+3,944 → 3,314 → 2,627 creates per daemon-CPU-s = **0.92× / 0.77× /
+0.61×** — the create phase ALONE reads what §3.9.3 read with the ingest
+folded in (0.63×), so the per-core slowdown is the create phase's own:
+every RAM-only phase grows again uniformly (`leaf_lock_hold` 20.5 →
+24.3 µs on the manager, 12.5 → 15–18 on a joiner; `pass_total` 26 → 30 /
+20 → 22–29), `slot_door_parks` 0, per-writer create walls 13.5–14.9 s at
+N = 8 (2,687–2,973 c/s each vs 5,029 alone), the manager's `MGR_CPU`
+111–123 % (its own storm). **The per-NODE law stays UNMEASURED on any
+venue (PR 15's cloud row).** *A, the shipped posture:* **bounded by the
+authority at every N — 351 / 343 / 391 creates/s aggregate (0.07×)**:
+the authority's own storm finishes at 4,020–5,240 c/s while every
+co-writer's 40,000 creates take 228 s (N = 2: 175 c/s), 466 s (N = 4)
+and 810–818 s (N = 8: **49 c/s each**); ingest scales (6.04× at N = 8 —
+the data DMA is the co-writer's own under its custody lease). This is
+the design's "vs today's authority + co-writers" comparison, MEASURED:
+**at N = 8 the armed plane creates 55× faster than the shipped posture
+on the same binary and the same box.**
+
+**F-R2 — PRODUCT FINDING on the SHIPPED S8/S10 path (the A arm; reported,
+not fixed here):** the authority burns **1.66 ms of `sqz-meta` CPU per
+served create** — `meta_ship_owner_dispatch_ns.run` mean 1,657 µs
+against `meta_ship_owner_phase_ns.execute` 18 µs at N = 2 (1,917 / 122 µs
+at N = 4, 2,717 / 337 µs at N = 8), `daemon_cpu_ns_by_class.sqz-meta`
+217 of the authority's 230 CPU-s over the N = 2 create phase (1,443
+CPU-s at N = 8), the co-writer's `meta_ship_phase_ns.rtt` 1.7 ms per
+verb with `queue_wait` 235 µs. The site: `MetaShipService::
+issue_update_grant` (`src/meta_ship/service.rs:1216`) — for EVERY shipped
+`CreateWithRdev` the owner reads the parent's census with
+`readdir_local(dir, 0, census_max + 1)` BEFORE the over-budget decline,
+and `intent_census_max()` = `CONTROL_MAX_FRAME_BYTES / 2 / 64` = 8,192,
+so once a co-writer's directory passes 8,192 entries every further
+create pays an 8,193-entry readdir at the owner and is then DECLINED
+(`meta_ship_intent_update_declines` 31,784 / 95,335 / 221,931 = every
+create past the first 8,192 + 24 per co-writer; `update_grants` 25–26;
+`meta_ship_intent_verbs` 8,192 per co-writer — the one supply chunk that
+was granted). The remedy shape (PR 14 / the S10 owner): decide the
+over-budget class from a cached per-directory census word (the
+delegation table already keys the directory) instead of a bounded
+readdir per create, or check `supply_remaining` / the holder's own
+census before the read. Not a symmetric-plane finding — the armed plane
+never runs this path (its creates are local mints in the creator's own
+slot tree) — but the shipped co-writer posture the flip retires is what
+every customer runs today.
+
+**F-B1 on the box, on PR 13c's binary — the VERDICT:**
+`appender_flush_ceiling_overruns` **tripped THREE times on the 8-writer
+fleet inside the 8-minute leg — m0 (the manager) [1, 1] (one per
+metadata volume, between the rows: the joins of m61..m66 for N = 8 /
+the leaves between rows), m61 [0, 1] (between the rows), m63 [0, 1]
+during N = 8's INGEST (`dd bs=4M conv=fsync`, 6.9 GB/s aggregate into
+the zram) — and PR 13c's exclusion excused NOTHING**:
+`appender_flush_ceiling_excused_ns` 0, `…_excused_max_ms` 0,
+`…_service_extensions` 0, `…_recovery_extensions` 0 on every one of the
+eight writers, `…_service_cap_ms` 1,100 and `appender_recovery_bound_ms`
+1,207 published, `appender_recoveries` 0. So the overruns the box reads
+are NOT another actor's structural hold of the SMO mutex (the class the
+exclusion closes) — they are the pass's own wall or the tick's lateness
+under the co-located load, i.e. **exactly what §7 item 3's MARGIN
+derivation must price, and F-B1's fix leaves the box's reading where it
+was: the tripwire is a VERDICT on the box, and it trips.** The audit's
+WARN lines (age / excused / cap) were lost with the fleet's teardown
+(H-R2 — the driver now keeps every member's daemon log per leg); the
+`.stats` snapshots above are the evidence. Per the counted-run law the B
+row set stopped at r1 (no second position); the numbers above stand as
+the row's. Deleted-stays-deleted and the fsck oracle were NOT reached
+(the leg dies on the tripwire before them, as §3.9.2's did). Ingest
+amplification at N = 8 (the daemons' ledgers ÷ 8 GiB user): `overlay_
+store_bytes` 0.92× + `durable_upload_bytes_escalation` 0.16× +
+`write_through_bytes` 0.02× ≈ **1.10× device writes**, `flush_seed_read_
+bytes` 0.17× user of device READS (`write_path_seed_read_bytes` 0),
+`block_grant_topups` 46, 0 reclaim commands.
+
 ## 4. Issues found (each with its PR and its red pin)
 
 ### 4.1 Fixed on this branch

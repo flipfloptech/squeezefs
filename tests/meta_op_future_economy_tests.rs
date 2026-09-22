@@ -24,6 +24,12 @@
 //! acquires inside theirs), so the unarmed metadata-only future carries a
 //! pointer to them, not them. This suite is the size INSTRUMENT
 //! (`--nocapture` prints every future's `size_of_val`) and the BUDGET pin.
+//!
+//! Every number here is the TEST profile's (unoptimized): a coroutine's
+//! saved-locals layout can differ under the `release` / `dist` MIR
+//! optimization level, so the pin is a same-profile tripwire — the
+//! release-profile sizes are the `-Zprint-type-sizes` dump's, recorded in
+//! the PR 13f note (`.benchmarks/2026-09-19-sym-acceptance.md` §3.9.4.1).
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
@@ -254,7 +260,8 @@ async fn handler_future_sizes_are_printed() {
 // The budget pin.
 // ---------------------------------------------------------------------------
 
-/// **The SETATTR handler's unarmed future budget.** Measured 26,016 B on `77f4da1d` (18,960 B on the
+/// **The SETATTR handler's unarmed future budget** (test-profile bytes —
+/// see the module doc). Measured 26,016 B on `77f4da1d` (18,960 B on the
 /// pre-program `3228fcb8`); with the truncate arm and the overlay drain
 /// boxed inside their branches it is **896 B** — the metadata-only
 /// setattr's own state: the `async_trait` `getattr` / `setattr` boxes

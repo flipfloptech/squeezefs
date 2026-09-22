@@ -1218,8 +1218,10 @@ PR 14's flip binary).
 `6.19.14-sqz`** (the sqz series incl. patch 0031 — the per-queue bg
 budget, since 2026-09-06), up 9 h 54 at the first leg, load 0.00, no
 Lustre / lnet modules, docker inactive, no daemon, only `fusectl`
-mounted, no `/run/squeezefs*`, no netns / veth / `pref 40` rules, 249 G
-free on `/scratch`; the reset-v5 converged fabric (5 storage nodes ×
+mounted, no `/run/squeezefs-mwfleet*` / `-devsub-*` (`/run/squeezefs/`
+itself holds the box-rows rung's four stale IL sockets, `sqz-il0-*.sock`
+of 01:43–02:04 UTC — not a daemon, not this rung's), no netns / veth /
+`pref 40` rules, 249 G free on `/scratch`; the reset-v5 converged fabric (5 storage nodes ×
 (1 meta + 2 data) memory-backed null_blk namespaces over nvme-tcp, two
 paths each, the client's 15 controllers connected as PR 1 left them;
 the storage nodes on `4.18.0-553.123.1.el8_lustre.ddn17` holding
@@ -3754,7 +3756,7 @@ evidence and stay):**
 | `squeeze-test:/scratch/tmp/sym-box/rerun-nw-20260922-130638-touch-readers-walls32/` (+ `.log`) | **gates 3c ×2, 5 ×2, 7@N=32 launch 1** — per leg `<gate>-r<i>/` (rows + `daemon-logs/m*.log`), `fleet-{A,B,C}-<n>.{create,teardown}.log`, `SUMMARY.txt` |
 | `squeeze-test:/scratch/tmp/sym-box/rerun-nw-20260922-134449-walls32/` (+ `.log`) | **gate 7@N=32 launch 2** (the fleet-wide law; RED on F-B1 at row (a)) |
 | `squeeze-test:/scratch/tmp/sym-box/{GATE1_RERUN_OUT,GATE1_RERUN_REV_OUT,RERUN_NW{1,2,3,4}_OUT}` | pointer files |
-| `/dev/shm/sqz_mdstorm{,_perf}/`, `/run/squeezefs-mwfleet`, `/run/squeezefs-devsub-tcp-mwfleet`, the fleets' netns / veth / `pref 40` rules, `/mnt/sqz-mwfleet/` | **all removed** — every fleet torn down to zero residue (asserted by `mw_fleet.sh teardown` ×8), verified at 13:53 UTC: 0 daemons, no netns, no rule, no veth, `/scratch/tmp/test` unmounted, no `/dev/shm/sqz*`; the devsub's `nvmet_tcp` / `nvmet` / `zram` / `null_blk` modules unloaded (only `fuse` + the fabric's host `nvme_tcp` stack loaded, as found); the fabric's 15 namespaces connected as found; 246 G free; `/scratch/tmp/sym-box` 3.3 G |
+| `/dev/shm/sqz_mdstorm{,_perf}/`, `/run/squeezefs-mwfleet`, `/run/squeezefs-devsub-tcp-mwfleet`, the fleets' netns / veth / `pref 40` rules, `/mnt/sqz-mwfleet/` | **all removed** — every fleet torn down to zero residue (asserted by `mw_fleet.sh teardown` ×8), verified at 13:53 UTC: 0 daemons, no `/run/squeezefs-mwfleet*` / `-devsub-*` (`/run/squeezefs/` keeps the box-rows rung's four IL sockets, as found), no netns, no rule, no veth, `/scratch/tmp/test` unmounted, no `/dev/shm/sqz*`; the devsub's `nvmet_tcp` / `nvmet` / `zram` / `null_blk` modules unloaded (only `fuse` + the fabric's host `nvme_tcp` stack loaded, as found); the fabric's 15 namespaces connected as found; 246 G free; `/scratch/tmp/sym-box` 3.3 G |
 | the 5 storage nodes | **nothing placed** (their `squeezefs 1.1.0` copies serve the reset's `nvmeof` verbs); the reset rebuilt their null_blk backings + shares per gate-1 arm (4 resets), leaving the fabric converged |
 
 Laptop-side: `/tmp/grok-justin/box-rerun/{arms,gate1,gate1-rev,perf-phases,nw}`

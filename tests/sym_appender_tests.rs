@@ -1999,7 +1999,7 @@ async fn a_leaf_that_aged_under_a_service_hold_of_the_smo_mutex_is_an_extension_
 /// box's affinity order (a populated volume's `used_leaf_bytes / 64` is
 /// MiBs; this 64 MiB fixture's derives to the one-extent floor, which a
 /// one-leaf tree sits AT and spills to the 64-rotor — 60–68 dirty leaves
-/// + 1–2 SMOs per cycle and 64 per-tree maintenance items ahead of every
+/// plus 1–2 SMOs per cycle and 64 per-tree maintenance items ahead of every
 /// decision), and ONE directory whose children mint into its slot by
 /// affinity (one leaf per cycle) with four files already in it. Returns
 /// the set, its volume, the device path and the directory.

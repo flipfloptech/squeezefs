@@ -63,8 +63,9 @@ fn fd_cache_cap() -> usize {
     *CAP
 }
 
-/// The pure form of [`fd_cache_cap`]: `soft / 4 / workers`, clamped
-/// `16..=1024` — the derivation the tie test reads.
+/// The pure form of the per-worker open-file cache cap (`fd_cache_cap`):
+/// `soft / 4 / workers`, clamped `16..=1024` — the derivation the tie test
+/// reads.
 pub fn fd_cache_cap_from(nofile_soft: usize, workers: usize) -> usize {
     (nofile_soft / 4 / workers.max(1)).clamp(16, 1024)
 }

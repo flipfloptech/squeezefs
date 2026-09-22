@@ -1001,8 +1001,18 @@ so a job live anywhere below a directory keeps that directory's slot; the
 IDLE arm, the trickle-holder reclaim and the crowd law are unchanged. Pin
 (the box's exact shape, `N_floor` forced to 2): `sym_slot_transfer_tests::
 a_holder_live_below_a_directory_is_never_recalled_by_a_burst_into_it` —
-RED on the base at ship 2 (`OfferDominated`), GREEN with the fix. The box
-re-run of gate 3c is owed.
+RED on the base at ship 2 (`OfferDominated`), GREEN with the fix. **The
+fleet leg found the first build ONE VOLUME wide**: `sym-foreign-touch`
+GREEN from zero on the laptop (LIVE 192 ships / 0 handovers), but its
+PAUSED phase read the touched slot IDLE at the manager with the job's
+storm one second old — the fleet has `MDS_COUNT=2`, `pick_mint_volume`
+mints a directory's children round-robin, and the resolver SKIPPED an
+ancestor on another volume. Second pin `…_on_another_volume_keeps_the_
+directorys_slot` (a two-volume set, the storm directory on the other
+volume): RED at ship 2 with the box's verdict, GREEN once an ancestor on
+another volume is credited on THAT volume's plane
+(`KvMetaBackend::note_subtree_holder_op`). The box re-run of gate 3c is
+owed.
 
 **F-B3 — the cluster-wire connection cap derives to 64 under
 `SQUEEZEFS_FLEET_SHARE=32` and a 32-member fleet cannot come up.**
@@ -1036,7 +1046,12 @@ kernel's `default_permissions` walk GETATTRs the mount ROOT before
 `/.stats`, and the root's token fetch surfaced the wire error; a token
 reader whose plane answers a transient class now serves the ROOT's attrs
 from its projection (`dlm_token_root_projection_serves` — R-SYM-4's one
-named exception; every child resolve stays fail-closed). Pins:
+named exception; every child resolve stays fail-closed). The class is
+STRUCTURAL (the 42-suite matrix's flat leg caught the first build serving
+a reader past `T_self`: the plane's law words were `Io(other)`, which
+`is_transport_failure` classes as the wire's) — the plane's LAW refusals
+are typed `Refused { EIO }`, a recall channel with no fresh session wears
+`Io(NotConnected)` (EIO, the shipped errno; the wire's word). Pins:
 `derivation_sweep_tests` (the cap rows + the fleet-demand row),
 `cluster_wire_tests` (the retry lands / fails typed inside the bound),
 `sym_coherence_tests::a_readers_root_attr_survives_the_holders_connection_cap_so_stats_never_fail`.

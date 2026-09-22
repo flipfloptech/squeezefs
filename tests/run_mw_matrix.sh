@@ -4659,10 +4659,116 @@ leg_sym_foreign_touch() {
     echo "   PAUSED: $SYM_TOUCH_ROUNDS single touches over $SYM_TOUCH_ROUNDS beats: handovers=$paused_handovers holder idle offers=+$paused_idle dominated offers=+$paused_dominated — a paused live job's slot is never offered or moved" | tee -a "$rowdir/symtouch-table.txt"
     for idx in "$a" "$b" "$c"; do
         sym_zero_set sym-foreign-touch "$idx"
-        rm -rf "$(mnt_of "$idx")/job-w$idx" 2>/dev/null || true
+    done
+    # The end-of-leg `rm -rf` is F-R3's shape (PR 13e; record §3.9.4.3):
+    # every writer removes ITS job tree through ITS mount, and every child
+    # another appender minted into it (the touches) is a cross-owner
+    # unlink whose count step must read the child's record AT THE HOLDER —
+    # the box read this daemon's PROJECTION, found no record, dropped the
+    # count step and shipped the name's removal alone: 430 of 512 children
+    # orphaned per tree, each logged "no inode record — removing the
+    # dangling name". The census arm judges it at BOTH ends.
+    local rm_t0
+    rm_t0="$(date +%s.%N)"
+    for idx in "$a" "$b" "$c"; do
+        rm -rf "$(mnt_of "$idx")/job-w$idx" ||
+            die "sym-foreign-touch: rm -rf job-w$idx through m$idx failed (F-R3's shape — a name a cross-owner unlink could not remove)"
     done
     sym_oracle sym-foreign-touch "$rowdir"
+    sym_post_leave_census sym-foreign-touch "$rowdir" "$rm_t0" "$a" "$b" "$c"
     log "sym-foreign-touch PUBLISHED (table + snapshots in $rowdir)"
+}
+
+# F-R3's fleet proof (PR 13e): (1) the writers' logs carry ZERO "no inode
+# record" lines from the leg's removals — the cross-owner plan builders'
+# dangling-name arm, a must-stay-0 on an armed mount
+# (`xv_cross_owner_dangling_names`); (2) after EVERY joiner LEAVES (its
+# slots released to the manager — Unleased, the manager's to judge), the
+# manager's online fsck covers the inode plane WHOLE and reads C9 = C10 = 0:
+# the orphan an F-R3 unlink leaves lives in the CREATOR's slot tree — a
+# projection at the censusing mount while the creator lives, scoped out of
+# every live-fleet row (`fsck_inode_plane_foreign_dentry_scoped`), which is
+# why the live oracle above is NOT a C9 verdict and this arm is. The
+# joiners are mounted back afterwards (the leg leaves the fleet as it
+# found it).
+sym_post_leave_census() { # label rowdir since_epoch idx...
+    local label="$1" rowdir="$2" since="$3"
+    shift 3
+    local idx n_dangling=0 lines
+    for idx in "$@"; do
+        lines="$(grep -c "no inode record" "$STATE/m$idx.log" 2>/dev/null || true)"
+        lines="${lines:-0}"
+        [ "$lines" = "0" ] || {
+            grep "no inode record" "$STATE/m$idx.log" >"$rowdir/dangling-m$idx.txt"
+            n_dangling=$((n_dangling + lines))
+        }
+        [ "$(stat_sum "$idx" xv_cross_owner_dangling_names)" = "0" ] ||
+            die "$label: xv_cross_owner_dangling_names != 0 on m$idx — a cross-owner unlink dropped its count step (F-R3)"
+        [ "$(stat_sum "$idx" xv_cross_owner_witness_refusals)" = "0" ] ||
+            warn "$label: xv_cross_owner_witness_refusals=$(stat_sum "$idx" xv_cross_owner_witness_refusals) on m$idx (the belt fired — the retry landed the read at the holder)"
+    done
+    [ "$n_dangling" = "0" ] ||
+        die "$label: $n_dangling 'no inode record' line(s) in the writers' logs (F-R3's orphan class — see $rowdir/dangling-m*.txt)"
+    log "$label: zero 'no inode record' lines across the writers' logs (since $since)"
+    # Every joiner LEAVES; the manager's census then judges every slot.
+    local joiners j
+    mapfile -t joiners < <(joiner_idxs)
+    for j in "${joiners[@]}"; do
+        if mountpoint -q "$(mnt_of "$j")"; then
+            "$MWFLEET" unmount "$j" || die "$label: joiner $j's leave failed"
+            wait_for_unmounted "$(mnt_of "$j")"
+        fi
+    done
+    local t
+    for t in $(seq 1 60); do
+        : "$t"
+        [ "$(stat_all_eq 0 appenders_known 1)" = "1" ] && break
+        sleep 1
+    done
+    [ "$(stat_all_eq 0 appenders_known 1)" = "1" ] ||
+        die "$label: the manager's appender directory still counts $(stat_field 0 appenders_known) Live page(s) after every joiner left"
+    [ "$(stat_all_eq 0 slot_lease_conflicts 0)" = "1" ] || die "$label: slot_lease_conflicts != 0 at the manager after the leaves"
+    # The manager's per-volume `symmetric_meta` array is the set's width —
+    # the census must cover EVERY volume (a scoped pass is no verdict).
+    local volumes
+    volumes="$(stat_field 0 symmetric_meta | python3 -c 'import ast,sys; v=ast.literal_eval(sys.stdin.read().strip() or "1"); print(len(v) if isinstance(v, list) else 1)')"
+    local out rc=0
+    out="$(timeout 900 "$SQZ" fsck "$(mnt_of 0)" --json 2>"$rowdir/fsck-$label-post-leave.err")" || rc=$?
+    echo "$out" >"$rowdir/fsck-$label-post-leave.json"
+    [ "$rc" != "124" ] || die "$label: the post-leave online fsck HUNG past 900 s — $rowdir/fsck-$label-post-leave.err"
+    [ "$rc" = "0" ] || die "$label: the post-leave online fsck FAILED (rc=$rc) — $rowdir/fsck-$label-post-leave.err"
+    python3 - "$rowdir/fsck-$label-post-leave.json" "$label" "$volumes" <<'PYEOF' || die "$label: the post-leave inode-plane census is RED (F-R3) — $rowdir/fsck-$label-post-leave.json"
+import json, sys
+path, label, volumes = sys.argv[1], sys.argv[2], int(sys.argv[3])
+r = json.load(open(path))
+c = r["counters"]
+covered = c["inode_plane_volumes_covered"]
+by_class = {}
+for f in r["findings"]:
+    by_class[f["class"]] = by_class.get(f["class"], 0) + 1
+c9 = by_class.get("C9", 0)
+c10 = by_class.get("C10", 0)
+print(f"{label} post-leave census: inode plane covered {covered} of {volumes} volume(s), findings by class {by_class or '{}'}")
+ok = covered == volumes and c9 == 0 and c10 == 0 and len(r["findings"]) == 0
+if covered != volumes:
+    print(f"{label}: the inode plane covered {covered} of {volumes} volumes after every joiner left — a scoped pass records no C9/C10 verdict", file=sys.stderr)
+if c9 or c10:
+    for f in r["findings"]:
+        if f["class"] in ("C9", "C10"):
+            print(f"  [{f['class']}] {f['object']} — {f['evidence']}", file=sys.stderr)
+sys.exit(0 if ok else 1)
+PYEOF
+    log "$label: post-leave census clean — the inode plane judged WHOLE at the manager, C9 = C10 = 0 (every joiner left; the F-R3 orphan class would read C9 here)"
+    for j in "${joiners[@]}"; do
+        "$MWFLEET" mount "$j" || die "$label: joiner $j's re-mount failed"
+    done
+    for t in $(seq 1 60); do
+        : "$t"
+        [ "$(stat_all_eq 0 appenders_known $((${#joiners[@]} + 1)))" = "1" ] && break
+        sleep 1
+    done
+    [ "$(stat_all_eq 0 appenders_known $((${#joiners[@]} + 1)))" = "1" ] ||
+        die "$label: the joiners' re-join never landed (appenders_known=$(stat_field 0 appenders_known))"
 }
 
 # --- PR 13b: sym-foreign-file ------------------------------------------------

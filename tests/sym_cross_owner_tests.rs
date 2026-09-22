@@ -1561,6 +1561,13 @@ async fn the_lock_verbs_reject_a_foreign_unlock_a_dead_id_and_any_volume_but_zer
 /// `SQUEEZEFS_SYMMETRIC_META=0` (a bit-17 volume) and a bit-17-ABSENT
 /// volume take the S3.5 paths verbatim: intents key on ino 0, no step
 /// ships, no lock is taken, every Cross-owner gauge stays where it was.
+/// PR 13e (F-R3): the plan's inode WITNESS on such a mount is the local
+/// record read itself — `read_inode_witness` answers what
+/// `read_inode_value_routed` answers, byte for byte, at every step (the
+/// live record, the last unlink's `nlink 0` record the reclaim path
+/// destroys later, an absent record's `Ok(None)` — never the armed
+/// belt's refusal): no dangling name, no witness refusal, both F-R3
+/// gauges 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_unarmed_and_flat_paths_ship_nothing_and_lock_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -1587,11 +1594,40 @@ async fn the_unarmed_and_flat_paths_ship_nothing_and_lock_nothing() {
         routed.rename(ROOT_INO, "a", b, "a2", 0).await.unwrap();
         routed.link(f.ino, b, "h").await.unwrap();
         routed.unlink(b, "h").await.unwrap();
+        // F-R3's witness law on the shipped path: the witness IS the
+        // local record (nlink 1 after the link + unlink pair; nlink 0 after
+        // the last unlink — the record's destroy rides the reclaim path),
+        // and an absent record reads `Ok(None)` — both reads agree at every
+        // step, nothing refuses.
+        let (vi, local_f) = routed.route_ino(f.ino);
+        let vol = &routed.volumes[vi];
+        let witness = vol.read_inode_witness(local_f).await.unwrap();
+        let local = vol.read_inode_value_routed(local_f).await.unwrap();
+        assert_eq!(
+            witness, local,
+            "{name}: the witness is the local record on an unarmed mount"
+        );
+        assert_eq!(witness.map(|v| v.nlink), Some(1), "{name}: one name left");
+        routed.unlink(b, "g").await.unwrap();
+        let witness = vol.read_inode_witness(local_f).await.unwrap();
+        assert_eq!(
+            witness,
+            vol.read_inode_value_routed(local_f).await.unwrap(),
+            "{name}: the last unlink's witness is the local record"
+        );
+        assert_eq!(witness.map(|v| v.nlink), Some(0), "{name}: no name left");
+        assert_eq!(
+            vol.read_inode_witness(local_f + 1_000_000).await.unwrap(),
+            None,
+            "{name}: an absent record's witness is Ok(None), never a refusal"
+        );
         let after = cross_owner_stats();
         assert_eq!(
             after, before,
             "{name}: the Cross-owner family never moves unarmed"
         );
+        assert_eq!(after.dangling_names, 0, "{name}: no dangling name");
+        assert_eq!(after.witness_refusals, 0, "{name}: no witness refusal");
         assert_eq!(open_intents(&routed).await, 0);
         assert!(!routed.volumes[0].slot_lease_armed());
         shutdown(&routed).await;
@@ -1620,6 +1656,8 @@ fn the_cross_owner_family_is_exported_under_its_published_names() {
         "dir_rename_lock_acquires",
         "dir_rename_lock_wait_ns",
         "dir_rename_parent_scans",
+        "xv_cross_owner_dangling_names",
+        "xv_cross_owner_witness_refusals",
     ] {
         assert!(json.get(key).is_some(), "missing {key}: {json:?}");
     }

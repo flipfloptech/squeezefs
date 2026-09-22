@@ -139,7 +139,7 @@ class). "dev" = scoping venue; "box" = squeeze-test.)_
 > **the per-NODE law ("bounded by no node") is UNMEASURED on any venue and
 > a multi-node venue (PR 15's cloud row) is its instrument.**
 
-> **Status (the box RE-RUN on PR 13c's binary `77f4da1d`, `perf/sym-box-rerun`, 2026-09-22 11:02 → 13:52 UTC — §3.9.4; the counted-run law: every row set from zero, gates 2 / 3b not re-run):** **gate 1** — `rr4k` PAR (0.999; the −1.8 % residual GONE), `mkdir` within noise (0.976 / 0.984 — the MISS closed), `create` / `stat` / `manydirs` / `rmdir` / `w_fresh` / mount / remount within noise, `rw4k` 0.970 (the 3 % floor, reproducible), **`rename` 0.960 / 0.967 and `unlink` 0.956 / 0.967 DELTA in both orders — MISS, narrowed to two phases and ATTRIBUTED** (the priced PR-4 rename guard + the `handle_setattr` future's move, named by DWARF perf — §3.9.4.1); **gate 3** — B N = 8 **4.27× creates / 5.37× ingest** (MISS on the wall law vs ≥ 5.6×, exactly §3.9.2's read; `C/CPU-S` 0.61× at N = 8), the A arm (the shipped authority + co-writers, measured for the first time) **bounded at 0.07× at every N** (F-R2: the owner's 8k-entry readdir per shipped create); **gate 3c** — **the LIVE law MET as a VERDICT ×2 (F-B2 FIXED)**, IDLE 6.7–7.5 ms, PAUSED never dominated; **gate 5** — **MET ×2 (F-B3 FIXED: the 1 × 31 fleet forms at `max 512 connections`)**, 0 misses, 155 ≡ 155, recall RTT 300 µs, hold 0; **gate 7 at N = 32** — **row (a) MET (1,002–1,299 frees/s, `shipped ≡ served ≡ displaced`, 1.000× device/user), row (b) MET (32 mounts in 3.66–3.68 s, 250–269 verbs, 12.3–14.6 s service)**; **F-B1 NOT FIXED on the box — `appender_flush_ceiling_overruns` tripped SIX times across the three fleets (16–106 ms past the ceiling) with the exclusion excusing NOTHING (0 ns on every writer) — the row sets of gates 3 / 3c / 7 each stopped at r1 on it.** Two NEW product findings on the armed plane (F-R3: every cross-owner unlink of a foreign-minted child orphans the inode — 430 / 512 in one leg, invisible to fsck while the lessee lives; F-R4: a mid-handover create answered `ENOENT`) and one on the shipped path (F-R2). §9's re-read: NOT YET — the exact list is there.**
+> **Status (the box RE-RUN on PR 13c's binary `77f4da1d`, `perf/sym-box-rerun`, 2026-09-22 11:02 → 13:52 UTC — §3.9.4; the counted-run law: every row set from zero, gates 2 / 3b not re-run):** **gate 1** — `rr4k` PAR (0.999; the −1.8 % residual GONE), `mkdir` within noise (0.976 / 0.984 — the MISS closed), `create` / `stat` / `manydirs` / `rmdir` / `w_fresh` / mount / remount within noise, `rw4k` 0.970 (the 3 % floor, reproducible), **`rename` 0.960 / 0.967 and `unlink` 0.956 / 0.967 DELTA in both orders — MISS, narrowed to two phases and ATTRIBUTED** (the priced PR-4 rename guard + the `handle_setattr` future's move, named by DWARF perf — §3.9.4.1); **gate 3** — B N = 8 **4.27× creates / 5.37× ingest** (MISS on the wall law vs ≥ 5.6×, exactly §3.9.2's read; `C/CPU-S` 0.61× at N = 8), the A arm (the shipped authority + co-writers, measured for the first time) **bounded at 0.07× at every N** (F-R2: the owner's 8k-entry readdir per shipped create); **gate 3c** — **the LIVE law MET as a VERDICT ×2 (F-B2 FIXED)**, IDLE MET ×2 (6.7–7.5 ms), **PAUSED NOT RUN — its job never ran (a harness defect since PR 13, §4.4aj; fixed, proven locally, the box row owed)**; **gate 5** — **MET ×2 (F-B3 FIXED: the 1 × 31 fleet forms at `max 512 connections`)**, 0 misses, 155 ≡ 155, recall RTT 300 µs, hold 0; **gate 7 at N = 32** — **row (a) MET (1,002–1,299 frees/s, `shipped ≡ served ≡ displaced`, 1.000× device/user), row (b) MET (32 mounts in 3.66–3.68 s, 250–269 verbs, 12.3–14.6 s service)**; **F-B1 NOT FIXED on the box — `appender_flush_ceiling_overruns` tripped SIX times across the three fleets (16–106 ms past the ceiling) with the exclusion excusing NOTHING (0 ns on every writer) — the row sets of gates 3 / 3c / 7 each stopped at r1 on it.** Two NEW product findings on the armed plane (F-R3: every cross-owner unlink of a foreign-minted child orphans the inode — 430 / 512 in one leg, invisible to fsck while the lessee lives; F-R4: a mid-handover create answered `ENOENT`) and one on the shipped path (F-R2). §9's re-read: NOT YET — the exact list is there.**
 
 | Gate | Row | Venue | Verdict | Engagement (the law's gauges) |
 |---|---|---|---|---|
@@ -147,7 +147,7 @@ class). "dev" = scoping venue; "box" = squeeze-test.)_
 | 2 | `sym-tarx` (N = 2, netem 250 µs, the extracting node NOT the manager) | dev → box | **Mechanism GREEN on every run** (verbs/entry 0.012, handovers 0, `dlm_rpcs` 0, oracle clean — §3.2). **Rate (box): MET — 1.04–1.07× of S0 (§3.9.2, two positions, both orders each)**; the laptop had read 0.85–1.02× (SCOPING) | `wire_verbs_per_entry` < 0.05 (0.0122 / 0.0000 on the box), `slot_handovers == 0` |
 | 3 | `sym-scale` N = 1/2/4/8 | dev → box | **Mechanism GREEN on every final-binary run** (every N completes, `appenders == N`, tripwires flat, fsck clean, deleted stays deleted through the widened arm — §3.1). **Rate (box): MISS at N = 8 — 4.27× creates / 5.33× ingest vs ≥ 5.6× (N = 2: 1.90× / 2.04×, N = 4: 3.23× / 2.95× MET); `appender_flush_ceiling_overruns` tripped (F-B1) — §3.9.2**; the laptop's 2.2–6.0× band was SCOPING | `appenders == N` ✓, `manager_load_pct` 0–3 %, handovers 0 / ships ≤ 5 / rpcs 0 ✓ |
 | 3b | `sym-shared-dir` (+ `-ls`) | dev → box | **Mechanism GREEN on every run since defect 14** (one flip at the holder, `shipped ≡ served`, handovers 0; `-ls` = `K + C + 3` tokens, 0 data-leaf reads — §3.3). **Rate (box): 3,400–3,581 creates/s (8 × 5,000 into one directory), `ls -l` of 40,000 in 65.3 s — MET on every law, two positions (§3.9.2)**; the design's A arm (authority + co-writers) has no leg | `dir_stripe_flips == 1` ✓, `dir_stripe_ships ≡ foreign creates` ✓ (34,901 / 34,982 shipped ≡ served), `slot_handovers == 0` ✓; ls: `dlm_token_grants` = 40,067 = K + C + 3 ✓ |
-| 3c | `sym-foreign-touch` | dev → box | **Mechanism GREEN on every run since defect 10** (LIVE 192 ships / 0 handovers; IDLE moved after 1–2 bursts; PAUSED keeps its tree — §3.4). **Box: MISS (mechanism) — the LIVE phase's touches RECALLED the live holder once (`slot_handovers` 1, `slot_offers_dominated` 1 of 64 evaluations, handover 13.4 ms; `N_floor` seeded 2 on the box) — F-B2, §3.9.2; the row set stopped, IDLE / PAUSED not run** | handovers/s, `slot_handover_phase_ns` (13.4 ms: flush 9.4 / tree 0 3.8 / page 0.14), a paused live job keeps its tree (not reached) |
+| 3c | `sym-foreign-touch` | dev → box | **Mechanism GREEN on every run since defect 10** (LIVE 192 ships / 0 handovers; IDLE moved after 1–2 bursts; PAUSED keeps its tree — §3.4 — **VOID: the PAUSED job never ran, §4.4aj**). **Box: MISS (mechanism) — the LIVE phase's touches RECALLED the live holder once (`slot_handovers` 1, `slot_offers_dominated` 1 of 64 evaluations, handover 13.4 ms; `N_floor` seeded 2 on the box) — F-B2, §3.9.2; the row set stopped, IDLE / PAUSED not run** | handovers/s, `slot_handover_phase_ns` (13.4 ms: flush 9.4 / tree 0 3.8 / page 0.14), a paused live job keeps its tree (not reached) |
 | 4 | `sym-crash` / `sym-storm` (a)–(f) ×10 from zero | dev (LOCAL by the venue law) | **`sym-crash` 10/10 GREEN on nine consecutive from-zero runs (attempts 7–15 — §3.8's attempt → binary list; their deleted arm read EIO as "deleted", §4.4ag); on the fix-round binaries 1/1 GREEN then 0/1 on the WIDENED arm (finding 2). `sym-storm` ×10 NOT REACHED: 7 + 3 GREEN rounds from zero under `--venue=laptop`, stopped by finding 1 (§4.4af — an acked-writes LOSS, open)** | must-stay-0 set (the flush-ceiling gauge venue-attributed on the laptop, Issue 2); `appender_recoveries ≡ regions of the killed nodes`; acked-loss 0 (VIOLATED once — §4.4af); `fsck_findings == 0`; C8/bitmap drift 0; `replay_dropped_torn == 0` |
 | 5 | `sym-readers` (exactness; 1 × 31 broadcast; `free_grace_hold_ms`) | dev → box | **Mechanism GREEN on the 1-reader fleet every run** (exact at the next resolve; `recalls ≡ mutations × holders`, `fanout_p99 ≡ readers`, `timeouts_live` 0 — §3.5). **Box: BLOCKED — the 1 × 31 fleet never came up: the manager's cluster-wire listener cap derives to 64 under `SQUEEZEFS_FLEET_SHARE=32` and refused the 14th member's dials (F-B3, §3.9.2)**; the laptop's recall RTT 110–126 µs stays SCOPING | `dlm_recall_fanout ≡ readers`, `reader_staleness_bound_ms == 0`, tokens held on `-o ro` (not measured at N = 32) |
 | 6 | format cost at N = 8 / 32 (+ the 46-volume width row) | dev (LOCAL) | **RUN — §3.6**: the width row VALID at N = 1/4/16/46 (mount 0.96 s, reopen 1.39 s at 46; the per-slot extent floor 16 MiB/volume = 736 MiB at 46 vols × 20 k files vs flat 47 MB — R9's number; `A_max` inert on a manager, §7 item 8); the appender rows ≈ 4 MiB (N = 8) / 16.5 MiB (N = 32) of region overhead per volume beside the manager's ring | per-slot extent floor, `slot_tree_bytes` p99 vs `A_max`, ring space, page writes |
@@ -248,8 +248,15 @@ Holder m60, requester m61, the manager holder C; beat 10 s, `N_floor(A)`
 live holder is never recalled by a touch). **IDLE**: handed over after 2
 bursts (r10: 21.9 s, 0.046 handovers/s; `slot_handover_phase_ns` total
 5.6 ms — flush 2.8, page 0.09, tree 0 2.7). **PAUSED**: 3 single touches
-over 3 beats, 0 handovers (a paused live job keeps its tree). Oracle
-clean.
+over 3 beats, 0 handovers — **VOID (harness defect §4.4aj, found by the
+box re-run's review 2026-09-22): the phase's "paused live job" never
+ran on any of these attempts** — its storm was launched into a
+directory that did not exist and died at its first `mkdir`, so every
+PAUSED green here (and §4.4ac's attempt-12 handover) read the IDLE arm
+on a slot nobody wrote, never the paused-job law. The law is exercised
+for the first time by the fixed harness on 2026-09-22 (§3.9.4.3: 0
+handovers, 0 idle offers, 0 dominated offers with a live STOPPED job)
+and its box row is owed. Oracle clean.
 
 ### 3.5 `sym-readers` (gate 5) — dev box, SCOPING; mechanism GREEN on the 1-reader fleet every run, the recall RTT venue-attributed pending the box
 
@@ -1199,7 +1206,7 @@ PR 13c's binary reads both; per daemon-CPU-second the box's own numbers
 above fall 4,085 → 2,586 (0.63×) INCLUDING the ingest's CPU — the create
 phase's own reading is the re-run's.
 
-#### 3.9.4 The re-run on PR 13c's binary (`77f4da1d`) — the box-rerun rung, `perf/sym-box-rerun`, 2026-09-22 11:02 → 13:52 UTC: **gate 1 MISS narrowed to `rename` / `unlink` and attributed (`rr4k` PAR, `mkdir` closed); gate 3 B 4.27× / 5.37× at N = 8 with the A arm (the shipped MW posture) measured at 0.07×; gate 3c LIVE law MET ×2 (F-B2 fixed); gate 5 MET ×2 (F-B3 fixed); gate 7@N=32 both rows MET; F-B1 NOT fixed on the box — six trips, 0 ns excused; two new armed-plane findings (F-R3, F-R4) and one shipped-path finding (F-R2)**
+#### 3.9.4 The re-run on PR 13c's binary (`77f4da1d`) — the box-rerun rung, `perf/sym-box-rerun`, 2026-09-22 11:02 → 13:52 UTC: **gate 1 MISS narrowed to `rename` / `unlink` and attributed (`rr4k` PAR, `mkdir` closed); gate 3 B 4.27× / 5.37× at N = 8 with the A arm (the shipped MW posture) measured at 0.07×; gate 3c LIVE law MET ×2 (F-B2 fixed), IDLE MET ×2, PAUSED NOT RUN (a harness defect since PR 13, §4.4aj — owed); gate 5 MET ×2 (F-B3 fixed); gate 7@N=32 both rows MET; F-B1 NOT fixed on the box — six trips, 0 ns excused; two new armed-plane findings (F-R3, F-R4) and one shipped-path finding (F-R2)**
 
 **The counted-run law**: every row set below ran FROM ZERO on PR 13c's
 binary; nothing from §3.9.1 / §3.9.2 is creditable. Gates 2 and 3b (MET
@@ -1478,18 +1485,45 @@ store_bytes` 0.92× + `durable_upload_bytes_escalation` 0.16× +
 bytes` 0.17× user of device READS (`write_path_seed_read_bytes` 0),
 `block_grant_topups` 46, 0 reclaim commands.
 
-##### 3.9.4.3 Gate 3c — `sym-foreign-touch`, two positions on fresh fleets (13:07 → 13:25 UTC): **the LIVE law MET as a VERDICT both positions (192 ships / 0 handovers — F-B2's fix holds on the box); IDLE moved after 4 / 5 bursts in 7.5 / 6.7 ms; PAUSED never dominated; position 2 RED at its oracle on F-B1 (1,116 ms); and TWO product findings on the cross-owner path (F-R3, F-R4)**
+##### 3.9.4.3 Gate 3c — `sym-foreign-touch`, two positions on fresh fleets (13:07 → 13:25 UTC): **the LIVE law MET as a VERDICT both positions (192 ships / 0 handovers — F-B2's fix holds on the box); IDLE moved after 4 / 5 bursts in 7.5 / 6.7 ms; the PAUSED law NOT RUN — its "live job" never ran (a harness defect since PR 13's `8b7cc418`, §4.4aj), so both positions' PAUSED cells are INVALID and the law is owed to the next box session; position 2 RED at its oracle on F-B1 (1,116 ms); and TWO product findings on the cross-owner path (F-R3, F-R4)**
 
 | position | LIVE (3 bursts × 64 into the live holder's tree) | IDLE (bursts of 64 at the 10 s beat until the handover) | `slot_handover_phase_ns` (the departing holder) | PAUSED (3 single touches over 3 × 5 s inside the half-window) | own create rate (A) | oracle |
 |---|---|---|---|---|---|---|
-| r1 (13:07) | **192 ships, 0 handovers** ✓ | handed over after **4 bursts** (50.3 s; 238 ships, 2 offers), 0.020 handovers/s | **7.48 ms** = flush 3.99 / tree 0 3.36 / page 0.13 / grant 0 | **kept its tree** (handovers 0; idle offers +1, dominated 0) ✓ | 5,047 c/s | clean (fsck 0, C8 0, must-stay-0 flat) |
-| r2 (13:16) | **192 ships, 0 handovers** ✓ | handed over after **5 bursts** (63.7 s; 320 ships, 1 offer), 0.016 handovers/s | **6.67 ms** = flush 2.04 / tree 0 4.49 / page 0.13 | moved by the IDLE arm (handovers 1 with idle offers +1, dominated 0 — the law "no DOMINATED offer against a live holder" holds; §7 item 10's premise class: a SIGSTOPped job writes nothing in the window) ✓ | 5,342 c/s | **RED — F-B1: m60 `appender_flush_ceiling_overruns` 1** |
+| r1 (13:07) | **192 ships, 0 handovers** ✓ | handed over after **4 bursts** (50.3 s; 238 ships, 2 offers), 0.020 handovers/s | **7.48 ms** = flush 3.99 / tree 0 3.36 / page 0.13 / grant 0 | **NOT RUN / INVALID** — the phase's storm died at its first `mkdir` (`paused-c.txt`: `mdstorm: mkdir failed on …/job-w0/paused/d1`), the holder's journal moved 15,873 → 15,882 over the phase (the three touches' served steps, no job); the recorded outcome (handovers 0 with `slot_offers_idle` +1) is the IDLE arm's offer not yet completed, not the paused-job law | 5,047 c/s | clean (fsck 0, C8 0, must-stay-0 flat) |
+| r2 (13:16) | **192 ships, 0 handovers** ✓ | handed over after **5 bursts** (63.7 s; 320 ships, 1 offer), 0.016 handovers/s | **6.67 ms** = flush 2.04 / tree 0 4.49 / page 0.13 | **NOT RUN / INVALID** — the same (`…/paused/d3`; journal 15,940 → 15,947); the recorded "moved by the IDLE arm" was the IDLE arm moving a slot NOBODY wrote — there was no job whose children could spill, so the §7-item-10 attribution written here before this review is STRUCK | 5,342 c/s | **RED — F-B1: m60 `appender_flush_ceiling_overruns` 1** |
 
 `N_floor(A)` seeded 2 on the box both positions (the value under which
 §3.9.2 read the LIVE handover), beat 10 s. **F-B2 — the box's verdict on
 the fix: MET** — 384 touches into a LIVE holder's tree across two fleets,
 0 handovers (63/64 → 64/64 evaluations BUSY); the subtree law credited
 the storm under `job-w60/live/r*` to `job-w60`'s slot as designed.
+
+**The PAUSED law (design §8 row 3c's third law — "a PAUSED live job's
+tree stays", engagement `a_paused_live_job_keeps_its_tree`) has never
+been exercised by this leg, on any venue** (§4.4aj): `run_mw_matrix.sh`
+launched the paused job's storm into `job-w<C>/paused` without creating
+it, mdstorm's `mkdir` phase never creates its own root, the first
+`mkdir` failed `ENOENT`, every worker stopped, and the storm was
+backgrounded and waited with `|| true` — so the touched slot read IDLE
+(`slot_offers_idle` +1 in EVERY position, both on the box and in PR 13's
+§3.4 laptop rows) and with `ops_h = 0` a DOMINATED offer is LEGAL by the
+rule (`ops_q ≥ 2 × 0 ∧ ops_q ≥ N_floor`); the idle arm merely fired
+first. "Dominated offers 0" therefore tested nothing. The harness is
+fixed on this branch (the root is created, the job must be a STOPPED
+live process at the pause and COMPLETE its 40,000 mkdirs after the
+resume, the holder's journal must move by them — a storm that dies is
+an idle holder and the phase dies loud), and **the fixed phase RUNS on
+the laptop** ("it works" — 2026-09-22 11:03 local, `7.2.6-cachyos-lto`,
+`create N=2 --symmetric --writers=3 --lease-ttl-ms=15000`, the binary
+`fe960985` = `77f4da1d`'s source): `mkdir ops=40000 wall_s=9.639
+ops_s=4150`, the holder's journal **+60,129** entries over the phase,
+and — with a live job for the first time — **handovers 0, `slot_offers_
+idle` 0, `slot_offers_dominated` 0** (LIVE 192 ships / 0 handovers and
+IDLE after 3 bursts / 5.5 ms beside it, oracle clean, torn down to zero
+residue). The PAUSED law's BOX row is owed to the next box session (PR
+13e's binary, where 3c re-runs anyway for F-R3 / F-R4) — not run now
+(the minimum-count law). Gate 3c on this binary therefore reads: **LIVE
+law MET ×2, IDLE MET ×2 (moved in 4–5 bursts), PAUSED NOT RUN.**
 
 **F-B1 (position 2's oracle)** — m60's kept daemon log at 13:19:26,
 inside the LIVE storm: `flush ceiling OVERRUN — appender region(s)
@@ -1498,8 +1532,8 @@ exceeded the 1100 ms landing ceiling with every structural hold's capped
 overlap excluded` — 16 ms past the ceiling with NOTHING excluded (the
 same class §3.9.4.2 read four times on the scale fleet); the leg's
 `sym_zero_set` at the oracle judges the ABSOLUTE gauge and RED'd the
-position (the LIVE / IDLE / PAUSED laws had already printed their
-verdicts). The row set's two positions stand.
+position (the LIVE / IDLE laws had already printed their verdicts; the
+PAUSED cell is INVALID — above). The row set's two positions stand.
 
 **F-R3 — PRODUCT FINDING (the ARMED plane — PR 6's cross-owner unlink ×
 PR 12b's N daemons; both positions, named by the kept daemon logs the
@@ -1601,7 +1635,7 @@ the 3b shape, unplanned in the join storm).
 | finding | PR 13c's fix | **the box's verdict on PR 13c's binary** |
 |---|---|---|
 | **F-B3** — the cluster-wire cap derived to 64 under `FLEET_SHARE=32`; the 32-member fleet never formed; a token reader's `.stats` EINVAL | the cap from the RAW root × 16 ceilinged by the fd budget, the startup `RLIMIT_NOFILE` raise (listener caps alone), a refused dial retries then `ListenerRefused`, the reader's root attr off its projection under a transient wire class | **FIXED — a VERDICT**: fleet B (1 manager + 1 writer + 31 token readers) formed twice in ≈ 3 min each (`max 512 connections`, `RLIMIT_NOFILE soft raised 1024 → 262144`), fleet C (manager + 31 joined writers) twice; every reader's `.stats` readable; gate 5 MET ×2, gate 7's N = 32 storm MET ×2 (§3.9.4.4 / §3.9.4.5). 0 accept refusals in any log. |
-| **F-B2** — a LIVE holder recalled once by a 64-touch burst (`OfferDominated`, `N_floor` 2) | `ops_h` counts the holder's work on the slot's SUBTREE across volumes | **FIXED — a VERDICT**: 384 touches into a LIVE holder's tree over two fresh fleets at `N_floor` 2, **0 handovers** (§3.9.4.3); the IDLE arm still moves an idle tree in 4–5 bursts (6.7–7.5 ms) and the PAUSED law holds. |
+| **F-B2** — a LIVE holder recalled once by a 64-touch burst (`OfferDominated`, `N_floor` 2) | `ops_h` counts the holder's work on the slot's SUBTREE across volumes | **FIXED — a VERDICT**: 384 touches into a LIVE holder's tree over two fresh fleets at `N_floor` 2, **0 handovers** (§3.9.4.3); the IDLE arm still moves an idle tree in 4–5 bursts (6.7–7.5 ms). The PAUSED law was NOT exercised on the box (§4.4aj — its job never ran); it runs on the laptop with the fixed harness and is owed to the next box session. |
 | **F-B1** — `appender_flush_ceiling_overruns` tripped 4× in 12 min on PR 13b (1–32 ms past the 1,100 ms ceiling, no recovery in flight) | the audit EXCLUDES the SMO mutex's structural holds (an overlap-bounded exclusion, capped and published); **the MARGIN's derivation stays §7 item 3, PR 14's** | **NOT FIXED on the box — the tripwire still trips, and the exclusion excused NOTHING**: on PR 13c's binary the gauge moved **six times in 45 minutes of fleet time** — the 8-writer scale fleet 4× (m0 [1, 1], m61, m63 — §3.9.4.2), the 8-writer touch fleet 1× (m60 at **1,116 ms** — §3.9.4.3), the 32-writer walls fleet 1× (m65 at **1,206 ms** — above) — every one logged `exceeded the 1100 ms landing ceiling with every structural hold's capped overlap excluded`, with `appender_flush_ceiling_excused_ns` 0, `…_service_extensions` 0, `…_recovery_extensions` 0 on every writer of every fleet, `…_service_cap_ms` 1,100 published. **What the exclusion did NOT explain is EVERYTHING the box reads** — the class is not another actor's hold of the SMO mutex; it is the pass's own wall / the tick's lateness on a loaded co-located box (a create storm's or a rewrite burst's covering barrier landing 16–106 ms late, a join's checkpoint) — i.e. exactly the residue §7 item 3's margin derivation (from the measured pass wall, never a fixed 2-tick constant) must price. Until it does, every N-writer row set on the box stops at its first trip, as the counted-run law requires, and the design's gates 3 / 3c / 7 cannot read MET whatever their rates say. **The gauge's verdict on the flip: NOT YET.** |
 
 ## 4. Issues found (each with its PR and its red pin)
@@ -2752,6 +2786,14 @@ count (the hook never consulted, `Corrupt`) and GREEN on the sum;
 
 ### 4.4ac Harness — the PAUSED phase's premise, and the one law re-learnt
 
+> **Superseded in part by §4.4aj (2026-09-22):** the "paused job" of this
+> phase never ran — its storm died at its first `mkdir` on every attempt
+> (the root was never created) — so the touched slot's IDLE reading below
+> came from an EMPTY job, not from `T_idle` expiring over a live one; the
+> pacing fix this entry describes stands (it fits the phase inside the
+> holder's window), but the premise attribution ("the job was IDLE by the
+> design's own definition") is void: nothing was ever live.
+
 `sym-foreign-touch` PAUSED on attempt 12 read `slot_handovers=1` — "a
 single touch per beat moved a paused job's tree": the manager's slot 24
 (its `job-w0` tree, 1,518 inos) was OFFERED on the idle arm
@@ -3097,6 +3139,52 @@ The round-1 pin asserts `EREMOTE` now; `posix_errno_tests`' table
 carries the row. The fidelity contract greps `Object is remote`,
 requires `chmod`'s exit status nonzero, and reads the mode at all three
 daemons after the refusal (644).
+
+### 4.4aj Harness — FOUND by the box re-run's review, FIXED on `perf/sym-box-rerun` (2026-09-22): the `sym-foreign-touch` PAUSED phase's "live job" never ran — every PAUSED outcome since PR 13's `8b7cc418` (the laptop's §3.4 greens, §4.4ac's attempt-12 handover, the box re-run's two positions) is VOID
+
+`tests/run_mw_matrix.sh` launched the paused job's storm as
+`"$SYM_STORM" "$(mnt_of "$c")/job-w$c/paused" … mkdir >… 2>&1 &` without
+creating `job-w$c/paused`. `tests/mdstorm.c`'s `mkdir` phase never
+creates its own root (`worker`: `mkdir("%s/d%ld")` on `g_dir`), so the
+first `mkdir(job-w0/paused/dN)` failed `ENOENT`, `fail()` set
+`g_failed`, every worker stopped, and the storm exited — backgrounded
+and later `kill`ed / `wait`ed with `|| true`, nothing noticed. The LIVE
+phase had both halves (`mkdir -p "$live_root/r$i" || exit 1` and the
+`kill -0 $live_pid || die` liveness check — §4.4f's fix); the PAUSED
+phase had neither. Evidence (the box re-run, both positions):
+`paused-c.txt` holds exactly one line — `mdstorm: mkdir failed on
+/mnt/sqz-mwfleet/m0/job-w0/paused/d1` (r1) / `…/d3` (r2) — and the
+holder's `meta_kv_journal_entries` moved 15,873 → 15,882 (r1) / 15,940
+→ 15,947 (r2) across the whole phase: the three touches' served steps,
+no storm. **Consequence:** with no live work on the touched slot the
+holder's `ops_h` is 0 and the slot reads IDLE (`slot_offers_idle` +1 in
+every position, laptop and box); a DOMINATED offer is then LEGAL by the
+rule (`ops_q ≥ 2 × 0 ∧ ops_q ≥ N_floor`) and the idle arm simply fires
+first — "dominated offers 0" tested nothing, and design §8 row 3c's
+third law (`a_paused_live_job_keeps_its_tree`) was never exercised by
+this leg on any venue. **Fix (harness, no product change):** the root
+is created first (`mkdir -p … || die`); the job must be a live STOPPED
+process at the pause (`/proc/<pid>/status` `State: T` — a `kill -0` on
+the exited job's zombie would still succeed) with no failure line
+written; after the touches it is RESUMED and must COMPLETE its
+`SYM_FILES` mkdirs (its `mkdir ops=… ` row is the proof) and the
+holder's journal must move by at least that many entries; a storm that
+dies at any point dies the leg loud, exactly as the LIVE phase's does.
+**Proof the fixed phase runs (laptop, "it works", 2026-09-22 11:03 —
+`7.2.6-cachyos-lto`, the tcp devsub recreated after the reboot, `create
+N=2 --symmetric --writers=3 --lease-ttl-ms=15000`, `sym-foreign-touch
+--venue=laptop`, the binary `fe960985` = `77f4da1d`'s source):** `mkdir
+ops=40000 wall_s=9.639 ops_s=4150` after the resume, the holder's
+journal **+60,129** entries over the phase, and — for the first time —
+**handovers 0, `slot_offers_idle` 0, `slot_offers_dominated` 0, `slot_
+offers` 0** on the manager (m60 / m61 all 0); LIVE 192 ships / 0
+handovers and IDLE after 3 bursts (35.7 s, 5.54 ms) beside it, oracle
+clean, the fleet and the devsub torn down to zero residue. Artifacts:
+`/tmp/grok-justin/box-rerun/fix1-local/` (the leg log, `paused-c.txt`,
+the `m*_ppaused{0,1}.json` snapshots, the three daemons' logs). **Owed:**
+the PAUSED law's BOX row — the next box session (PR 13e's binary; not
+run in this round by the minimum-count law). §3.4, §3.9.4.3, §7 item
+10, design §8 row 3c and §9 are re-worded on this branch.
 
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
@@ -3465,7 +3553,13 @@ so nothing falls off a ledger the way defect 32 did between PR 5 and PR
    what "never less than one extent" reads as) and the window's two
    half-`T_idle` buckets (a guarantee of `T_idle / 2`, not `T_idle`).
    The harness gates on the DOMINATED arm alone now and reports the
-   idle one.
+   idle one. **Void as an OBSERVATION (§4.4aj, 2026-09-22): the PAUSED
+   phase's job never ran on attempts 12–14 or on the box — the slot read
+   idle because it WAS idle, not because the job's children spilled; the
+   spill premise itself stands as design text (PR 13c's subtree law
+   closes it), but no leg has yet observed a live paused job, and the
+   fixed harness's first local run read 0 handovers / 0 idle offers / 0
+   dominated offers. The box row is owed.**
 9. **The per-slot extent floor at small populations** (§3.6 reading 1,
    risk R9's number): 16 MiB per volume (64 rotor trees × one 256 KiB
    node) — 736 MiB for 20,000 files over 46 volumes against the flat's
@@ -3627,7 +3721,7 @@ Laptop-side: `/tmp/grok-justin/box-rerun/{arms,gate1,gate1-rev,perf-phases,nw}`
 >
 > **Reading MET on the box:** gate 2 (1.04–1.07× of S0), gate 3b (one flip, `shipped ≡ served`, `K + C + 3` tokens, 3,400–3,581 creates/s into one directory), gate 7 at N = 8 (983 frees/s, `shipped ≡ served ≥ displaced`; the 8-mount join storm 3.92 s) — each with the tripwire caveat above where it applies. **What PR 14 flips on, restated:** the gate-1 regression attributed and closed (or adjudicated as the shipped-bug fixes' price with the owner's word), F-B3's cap re-derived (then the N = 32 rows run), F-B1's margin derived, F-B2's rule adjudicated, and the storm ×10 count from zero on that binary — then the flip. The decision text below is as recorded at PR 13.
 >
-> **Status (the box RE-RUN on PR 13c's binary `77f4da1d` — `perf/sym-box-rerun`, 2026-09-22 11:02 → 13:52 UTC; §3.9.4 — the re-read the brief asked for, with the fixed binary's numbers in hand). The decision stays NOT YET.** With these numbers, the design gates the flip requires read as follows. **Reading MET on the box (this binary):** **gate 3c** (a LIVE holder never recalled — 384 touches, 0 handovers over two fresh fleets; F-B2 FIXED), **gate 5** (the 1 × 31 broadcast: exact at the next resolve, 155 ≡ 155, recall RTT 300 µs, hold 0 — twice; F-B3 FIXED), **gate 7 at N = 32** (row (a) 1,002–1,299 frees/s with `shipped ≡ served ≡ displaced` and 1.000× device/user; row (b) 32 mounts in 3.66–3.68 s, 250–269 verbs, 12.3–14.6 s of service — twice), and — from the previous pass, not re-run — **gate 2** (1.04–1.07× of S0) and **gate 3b** (one flip, `shipped ≡ served`, `K + C + 3` tokens). **The exact list that does NOT read MET:**
+> **Status (the box RE-RUN on PR 13c's binary `77f4da1d` — `perf/sym-box-rerun`, 2026-09-22 11:02 → 13:52 UTC; §3.9.4 — the re-read the brief asked for, with the fixed binary's numbers in hand). The decision stays NOT YET.** With these numbers, the design gates the flip requires read as follows. **Reading MET on the box (this binary):** **gate 3c's LIVE and IDLE laws** (a LIVE holder never recalled — 384 touches, 0 handovers over two fresh fleets, F-B2 FIXED; an idle tree moved in 4–5 bursts) — **its third law, the PAUSED job, NOT RUN: the phase's job never ran on any venue (§4.4aj, a harness defect fixed on this branch and proven locally), so gate 3c as a WHOLE reads LIVE ✓ / IDLE ✓ / PAUSED owed to the next box session**, **gate 5** (the 1 × 31 broadcast: exact at the next resolve, 155 ≡ 155, recall RTT 300 µs, hold 0 — twice; F-B3 FIXED), **gate 7 at N = 32** (row (a) 1,002–1,299 frees/s with `shipped ≡ served ≡ displaced` and 1.000× device/user; row (b) 32 mounts in 3.66–3.68 s, 250–269 verbs, 12.3–14.6 s of service — twice), and — from the previous pass, not re-run — **gate 2** (1.04–1.07× of S0) and **gate 3b** (one flip, `shipped ≡ served`, `K + C + 3` tokens). **The exact list that does NOT read MET:**
 > * **gate 1** — MISS on mdstorm `rename` (0.960 / 0.967) and `unlink` (0.956 / 0.967), both orders of two brackets; `mkdir` CLOSED (0.976 / 0.984), `rr4k` PAR (0.999), everything else within noise, `rw4k` −3.0 % at the floor. ATTRIBUTED (§3.9.4.1): the PR-4 rename lock-set fix's priced +1 guard (kept) and the `handle_setattr` future's construction + lane move on the kernel's per-op SETATTR echo (named by the DWARF legs); the fix shape is a smaller unarmed setattr future — PR 14's, then the bracket re-reads;
 > * **gate 3** — MISS on the WALL law at N = 8 (4.27× creates / 5.37× ingest vs ≥ 5.6×; `C/CPU-S` 0.61×) — the co-located venue's term re-read to 0.01× of §3.9.2's; N = 2 / 4 MET; the per-NODE law UNMEASURED (PR 15). The A arm is measured for the first time: the shipped authority + co-writers are bounded at 0.07× at every N — the armed plane creates 55× faster at N = 8 on the same binary (F-R2 names why the shipped path is that slow);
 > * **the must-stay-0 tripwire `appender_flush_ceiling_overruns`** — NOT closed: six trips across three fleets in 45 minutes, 16–106 ms past the 1,100 ms ceiling, **with PR 13c's exclusion excusing 0 ns on every writer** — the margin derivation (§7 item 3) is the whole remaining item, and it is a FLIP PRECONDITION: every N-writer row set on the box stops at its first trip, so gates 3 / 3c / 7 cannot read MET as ROW SETS however their rates read;
@@ -3691,7 +3785,7 @@ Gates, exactly:
 | 2 `tar -x` | mechanism GREEN (verbs/entry 0.012, handovers 0, `dlm_rpcs` 0, oracle clean) | OWED — laptop read 0.96–1.02 × of S0 at netem 250 µs, SCOPING, venue-attributed |
 | 3 scale | mechanism GREEN at every N every run (complete, `appenders == N`, tripwires flat, fsck clean, deleted stays deleted) | OWED (the deciding row) — the 0.7 × N law read 2.9–6.0 × at N = 8 across five laptop runs, SCOPING, venue-attributed |
 | 3b shared dir (+ `ls`) | mechanism GREEN (20,000 creates, one flip, ships ≡ served, handovers 0; `K + C + 3` tokens, 0 data-leaf reads) | OWED — the laptop's creates/s and `ls -l` wall SCOPING, venue-attributed |
-| 3c foreign touch | mechanism GREEN (LIVE never moved, IDLE moved in 1–2 bursts, PAUSED kept its tree) | OWED — the laptop's 5–8 ms handover wall SCOPING, venue-attributed |
+| 3c foreign touch | mechanism GREEN (LIVE never moved, IDLE moved in 1–2 bursts; the PAUSED green VOID — its job never ran, §4.4aj) | OWED — the laptop's 5–8 ms handover wall SCOPING, venue-attributed |
 | 4 kill matrix | **`sym-crash` 10/10 on nine consecutive from-zero runs (attempts 7–15) + 1/1 then 0/1 on the widened arm (finding 2, §4.4ag — a gate-4 precondition PR 13b clears: a user read failing `EIO` on the death path is a "refusals 0" violation); `sym-storm` ×10 NOT REACHED — 7 + 3 GREEN rounds from zero under `--venue=laptop`, stopped by finding 1 (§4.4af, an acked-writes LOSS — open); both counts restart from zero on PR 13b's binary** | n/a (LOCAL by the venue law; the flush-ceiling gauge venue-attributed) |
 | 5 readers | mechanism GREEN (exactness, `recalls ≡ mutations × holders`, `fanout_p99 ≡ readers`, `reader_staleness_bound_ms` 0) on the 1-reader fleet | OWED (the 1 × 31 broadcast) — the laptop's recall RTT SCOPING, venue-attributed |
 | 6 format cost | see §3.6 | n/a |

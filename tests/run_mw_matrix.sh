@@ -4626,21 +4626,60 @@ leg_sym_foreign_touch() {
     [ "$paused_beat_ms" -ge 1000 ] || die "sym-foreign-touch PAUSED: T_idle ${t_idle_ms} ms leaves no room for $SYM_TOUCH_ROUNDS touches (beat would be ${paused_beat_ms} ms) — fewer --touch-rounds or a longer --lease-ttl-ms"
     log "sym-foreign-touch PAUSED: T_idle=${t_idle_ms} ms, $SYM_TOUCH_ROUNDS touches at ${paused_beat_ms} ms (the phase inside the holder's window)"
     for idx in "$a" "$b" "$c"; do snap "$idx" paused0 "$rowdir"; done
-    "$SYM_STORM" "$(mnt_of "$c")/job-w$c/paused" "$SYM_THREADS" "$SYM_FILES" mkdir >"$rowdir/paused-c.txt" 2>&1 &
-    local paused_pid=$!
+    # The storm's root is created FIRST (mdstorm's `mkdir` phase never
+    # creates its own root — the LIVE phase's law at `live_root`): from PR
+    # 13's `8b7cc418` to the box re-run this phase launched the storm
+    # into a directory that did not exist, its first `mkdir` failed
+    # ENOENT, every worker stopped, and the "paused live job" was no job
+    # at all — the touched slot read IDLE (`slot_offers_idle` +1 in every
+    # position) and the phase's outcome was the IDLE arm's, never the
+    # paused-job law's. Backgrounded and waited with `|| true`, nothing
+    # noticed (the box re-run's review, Issue 1). The phase now judges its
+    # job the way the LIVE phase judges its storm: alive and STOPPED at
+    # the pause, COMPLETED after the resume, the holder's journal moved by
+    # the storm's entries — a storm that died is an idle holder, and the
+    # phase dies loud.
+    local paused_root paused_pid paused_state
+    paused_root="$(mnt_of "$c")/job-w$c/paused"
+    mkdir -p "$paused_root" || die "sym-foreign-touch PAUSED: the paused job's directory mkdir failed"
+    "$SYM_STORM" "$paused_root" "$SYM_THREADS" "$SYM_FILES" mkdir >"$rowdir/paused-c.txt" 2>&1 &
+    paused_pid=$!
     sleep 1
-    kill -STOP "$paused_pid" 2>/dev/null || true
+    kill -STOP "$paused_pid" 2>/dev/null || die "sym-foreign-touch PAUSED: the paused job died before the pause (see $rowdir/paused-c.txt)"
+    # A job that failed at its first syscall exits before the STOP lands
+    # and reads as a zombie (`kill -0` still succeeds); the process STATE
+    # is the witness — `T` (stopped) is a live job holding its work.
+    for t in $(seq 1 20); do
+        : "$t"
+        paused_state="$(awk '/^State:/ {print $2}' "/proc/$paused_pid/status" 2>/dev/null)"
+        [ "$paused_state" = "T" ] && break
+        sleep 0.1
+    done
+    [ "$paused_state" = "T" ] ||
+        die "sym-foreign-touch PAUSED: the paused job is not a STOPPED live process (state '${paused_state:-gone}'; see $rowdir/paused-c.txt) — the phase would measure an IDLE holder"
+    grep -q "failed" "$rowdir/paused-c.txt" 2>/dev/null &&
+        die "sym-foreign-touch PAUSED: the paused job FAILED before the pause: $(head -1 "$rowdir/paused-c.txt")"
     local c_tree_on_b
     c_tree_on_b="$(mnt_of "$b")/job-w$c"
     for ((r = 1; r <= SYM_TOUCH_ROUNDS; r++)); do
         sym_prefixed_create "$c_tree_on_b" "touch-paused-r$r" 1 >/dev/null || die "sym-foreign-touch: a paused-job touch failed"
         sleep "$(python3 -c "print($paused_beat_ms/1000)")"
     done
-    kill -CONT "$paused_pid" 2>/dev/null || true
-    kill "$paused_pid" 2>/dev/null || true
-    wait "$paused_pid" 2>/dev/null || true
+    # Resume and let the job COMPLETE its phase (SYM_FILES mkdirs — seconds
+    # at the holder's own rate): its row line is the proof it was a live
+    # job through the pause, and the holder's journal must carry its
+    # entries (one commit per mkdir, the D4 economy).
+    kill -CONT "$paused_pid" 2>/dev/null || die "sym-foreign-touch PAUSED: the paused job vanished before the resume (see $rowdir/paused-c.txt)"
+    wait "$paused_pid" || die "sym-foreign-touch PAUSED: the paused job FAILED after the resume (see $rowdir/paused-c.txt)"
+    grep -q "^mkdir ops=$SYM_FILES " "$rowdir/paused-c.txt" ||
+        die "sym-foreign-touch PAUSED: the paused job's row is missing — it did not complete its $SYM_FILES mkdirs (see $rowdir/paused-c.txt)"
     sleep 2
     for idx in "$a" "$b" "$c"; do snap "$idx" paused1 "$rowdir"; done
+    local paused_journal
+    paused_journal="$(sym_delta "$rowdir" "$c" paused meta_kv_journal_entries)"
+    [ "$paused_journal" -ge "$SYM_FILES" ] ||
+        die "sym-foreign-touch PAUSED: the holder's journal moved by $paused_journal entries over the phase, fewer than the job's $SYM_FILES mkdirs — the job's work did not land at the holder"
+    log "sym-foreign-touch PAUSED: the paused job was a live STOPPED process through the touches and completed after the resume ($(tr '\n' ' ' <"$rowdir/paused-c.txt"); the holder's journal +$paused_journal entries)"
     local paused_handovers=0
     for idx in "$a" "$b" "$c"; do
         v="$(sym_delta "$rowdir" "$idx" paused slot_handovers)"

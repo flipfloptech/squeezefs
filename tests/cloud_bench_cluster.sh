@@ -1702,6 +1702,11 @@ die() { echo "FATAL: $*" >&2; exit 1; }
 META_URI="$(cat /etc/squeezefs-bench-meta-uri)"
 read -ra EXTRA <<<"$(printf '%s' "$MOUNT_EXTRA_STR" | tr ',' ' ')"
 LOG=/tmp/sqz-sym-manager.log
+# --log-file opens O_APPEND: rotate the previous incarnation's log aside so
+# the log-line gates below read THIS mount's lines only (a rejoin through
+# sym-hook, a re-assemble — review round 1, Issue 7); bench-sym pulls
+# `sqz-sym-*.log*`.
+[ -f "$LOG" ] && mv "$LOG" "$LOG.$(date +%s)"
 mkdir -p "$MNT"
 env -u SUDO_UID -u SUDO_GID -u SUDO_USER \
   "SQUEEZEFS_IPC_ALLOW_DEV=1" \
@@ -1747,6 +1752,11 @@ die() { echo "FATAL: $*" >&2; exit 1; }
 META_URI="$(cat /etc/squeezefs-bench-meta-uri)"
 read -ra EXTRA <<<"$(printf '%s' "$MOUNT_EXTRA_STR" | tr ',' ' ')"
 LOG=/tmp/sqz-sym-joiner.log
+# --log-file opens O_APPEND: rotate the previous incarnation's log aside so
+# the log-line gates below read THIS mount's lines only (a rejoin through
+# sym-hook, a re-assemble — review round 1, Issue 7); bench-sym pulls
+# `sqz-sym-*.log*`.
+[ -f "$LOG" ] && mv "$LOG" "$LOG.$(date +%s)"
 mkdir -p "$MNT"
 env -u SUDO_UID -u SUDO_GID -u SUDO_USER \
   "SQUEEZEFS_IPC_ALLOW_DEV=1" \
@@ -1788,6 +1798,11 @@ die() { echo "FATAL: $*" >&2; exit 1; }
 META_URI="$(cat /etc/squeezefs-bench-meta-uri)"
 read -ra EXTRA <<<"$(printf '%s' "$MOUNT_EXTRA_STR" | tr ',' ' ')"
 LOG=/tmp/sqz-sym-reader.log
+# --log-file opens O_APPEND: rotate the previous incarnation's log aside so
+# the log-line gates below read THIS mount's lines only (a rejoin through
+# sym-hook, a re-assemble — review round 1, Issue 7); bench-sym pulls
+# `sqz-sym-*.log*`.
+[ -f "$LOG" ] && mv "$LOG" "$LOG.$(date +%s)"
 mkdir -p "$MNT"
 env -u SUDO_UID -u SUDO_GID -u SUDO_USER \
   "SQUEEZEFS_IPC_ALLOW_DEV=1" \
@@ -2137,7 +2152,7 @@ EOS
     remote "$(node_pub "$c")" <<'EOS' || true
 set -euo pipefail
 mkdir -p /tmp/sym-rows/logs
-for f in /tmp/sqz-sym-*.log /tmp/sqz-sym-*.mount.out; do
+for f in /tmp/sqz-sym-*.log /tmp/sqz-sym-*.log.* /tmp/sqz-sym-*.mount.out; do
   [ -f "$f" ] && install -m 0644 "$f" /tmp/sym-rows/logs/ || true
 done
 chmod -R a+rX /tmp/sym-rows/logs

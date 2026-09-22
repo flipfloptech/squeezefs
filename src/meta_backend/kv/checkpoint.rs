@@ -1087,9 +1087,18 @@ pub fn checkpoint_trigger_ms(ceiling_ms: u64, anticipated_term_ms: u64) -> u64 {
 /// excuses (`StructuralHolds`), a census or a service it judges — and
 /// never a term for the cadence to anticipate (the fleet's manager read a
 /// 7 s wait behind its own online fsck as a term, and a trigger of 0 for
-/// the mark's memory). Tie-tested (`derivation_sweep_tests`).
-pub fn checkpoint_cycle_term_ns(prebarrier_wall_ns: u64, late_ns: u64, tick_ns: u64) -> u64 {
-    prebarrier_wall_ns.saturating_add(late_ns.saturating_sub(tick_ns))
+/// the mark's memory). `late` is CAPPED at `late_cap_ns` — one landing
+/// ceiling (`AppenderSet::flush_ceiling_ms`), the belt of review round 1,
+/// Issue 1: a decision later than the whole ceiling is a stall the audit
+/// counts on the cycle it happens, never a term the next 64 cycles
+/// anticipate. Tie-tested (`derivation_sweep_tests`).
+pub fn checkpoint_cycle_term_ns(
+    prebarrier_wall_ns: u64,
+    late_ns: u64,
+    tick_ns: u64,
+    late_cap_ns: u64,
+) -> u64 {
+    prebarrier_wall_ns.saturating_add(late_ns.min(late_cap_ns).saturating_sub(tick_ns))
 }
 
 /// **The cycle terms a forest volume's cadence anticipates over** — the
@@ -1648,16 +1657,18 @@ async fn tick(
     // lateness is priced against. A FLAT volume keeps the shipped law
     // verbatim: the ceiling elapsed since the last cycle's end.
     let ceiling_ms = elastic_ceiling.map_or(CHECKPOINT_MAX_AGE_MS as u64, |c| c);
-    let due_by_age = if be.appenders().is_some() {
+    // `Some(late)` = due by age on a forest volume, with the decision's
+    // lateness for the cycle it runs; the flat arm carries no lateness.
+    let age_late_ns = if be.appenders().is_some() {
         be.checkpoint_due_by_age(
             ceiling_ms,
-            tick_ms,
             mutex_wait_ns,
             crate::mono_core::monotonic_ns_u64(),
         )
     } else {
-        last_checkpoint.elapsed().as_millis() >= u128::from(ceiling_ms)
+        (last_checkpoint.elapsed().as_millis() >= u128::from(ceiling_ms)).then_some(0)
     };
+    let due_by_age = age_late_ns.is_some();
     let due = final_cycle
         || ring_pressure
         // The cap is resolved ONCE at open (`KvMetaBackend::dirty_node_cap`
@@ -1679,12 +1690,28 @@ async fn tick(
                 a.pressure_cycles.fetch_add(1, Ordering::Relaxed);
             }
         }
+        // The age decision's lateness rides the cycle it RUNS, and only
+        // that one (PR 13e review round 1, Issue 1): a due tick that runs
+        // no cycle records nothing.
+        if be.appenders().is_some() {
+            if let Some(late_ns) = age_late_ns {
+                be.note_checkpoint_decision(late_ns, tick_ms);
+            }
+        }
         be.checkpoint_cycle(&mut smo, ring_pressure || final_cycle)
             .await?;
         *last_checkpoint = std::time::Instant::now();
         if elastic_ceiling.is_some() {
             crate::free_grace::note_elastic_checkpoint_cycle();
         }
+    } else if due_by_age && be.appenders().is_some() {
+        // An idle due tick with nothing to cover — nothing dirty, the ring
+        // covered, no region uncovered — is an EMPTY COLLECTION: every leaf
+        // dirtied from here is bounded from here, so the age law's
+        // reference advances and an idle volume never accrues lateness
+        // (Issue 1: the first build let the idle span become the first
+        // busy cycle's term, a trigger of 0 for the horizon).
+        be.note_checkpoint_collected(crate::mono_core::monotonic_ns_u64());
     }
     if final_cycle {
         // Shutdown guarantee (`KvMetaBackend::shutdown`: "tail == head ⇒

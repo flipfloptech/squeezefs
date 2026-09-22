@@ -11346,15 +11346,25 @@ impl KvMetaBackend {
 
     /// Fold a cycle's measured pre-barrier wall (cycle start → barrier
     /// #1) — plus the lateness beyond one tick of the age decision that
-    /// fired it, if one did — into the window the cadence trigger
-    /// anticipates over (PR 13e, F-B1). The window's mutex is the
-    /// checkpoint task's own (one cycle at a time per volume); the
-    /// published maximum is what the cadence reads.
+    /// fired it, if one did, capped at the landing ceiling in force (the
+    /// belt: a lateness past one ceiling is a stall the audit counts on
+    /// the cycle it happens, never a term to anticipate) — into the window
+    /// the cadence trigger anticipates over (PR 13e, F-B1). The window's
+    /// mutex is the checkpoint task's own (one cycle at a time per
+    /// volume); the published maximum is what the cadence reads.
     pub(super) fn note_checkpoint_cycle_term(&self, prebarrier_wall_ns: u64) {
         let late_ns = self.checkpoint_decision_late_ns.swap(0, Ordering::AcqRel);
         let tick_ns = self.checkpoint_decision_tick_ns.swap(0, Ordering::AcqRel);
-        let sample_ns =
-            super::checkpoint::checkpoint_cycle_term_ns(prebarrier_wall_ns, late_ns, tick_ns);
+        let ceiling_ns = self
+            .appenders
+            .as_ref()
+            .map_or(u64::MAX, |a| a.flush_ceiling_ms.saturating_mul(1_000_000));
+        let sample_ns = super::checkpoint::checkpoint_cycle_term_ns(
+            prebarrier_wall_ns,
+            late_ns,
+            tick_ns,
+            ceiling_ns,
+        );
         let anticipated = {
             let mut w = self
                 .checkpoint_terms
@@ -11391,45 +11401,56 @@ impl KvMetaBackend {
 
     /// The cadence's age law (PR 13e, F-B1): a cycle is due when the time
     /// since the LAST COLLECTION reaches the trigger in force for
-    /// `ceiling_ms`. A due verdict records the decision's lateness past
+    /// `max_age_ms`; `Some(late_ns)` is the due decision's lateness past
     /// the trigger LESS the tick's wait for the SMO mutex (`mutex_wait_ns`
     /// — a wait behind another holder is that holder's hold: a structural
     /// hold the audit excuses, an online fsck's census or a wire service it
     /// judges, never a term for the cadence to anticipate; the fleet's
     /// manager read a 7 s wait behind its own census as a term and a
-    /// trigger of 0 for the mark's memory) and the tick in force, for the
-    /// cycle it fires to fold into the term.
+    /// trigger of 0 for the mark's memory). The verdict RECORDS nothing:
+    /// the caller hands the lateness to the cycle it runs
+    /// (`note_checkpoint_decision`) or, with nothing to cover, advances the
+    /// collection (`note_checkpoint_collected`) — review round 1, Issue 1:
+    /// the first build stored the lateness on every due tick, so an idle
+    /// volume's whole idle span became the next cycle's term.
     pub(super) fn checkpoint_due_by_age(
         &self,
-        ceiling_ms: u64,
-        tick_ms: u64,
+        max_age_ms: u64,
         mutex_wait_ns: u64,
         now_ns: u64,
-    ) -> bool {
+    ) -> Option<u64> {
         let since_ns = now_ns.saturating_sub(self.checkpoint_collected_ns.load(Ordering::Acquire));
-        let trigger_ms = self.checkpoint_trigger_ms(ceiling_ms);
-        let due = since_ns / 1_000_000 >= trigger_ms;
-        if due {
-            let late_ns = since_ns
-                .saturating_sub(trigger_ms.saturating_mul(1_000_000))
-                .saturating_sub(mutex_wait_ns);
-            self.checkpoint_decision_late_ns
-                .store(late_ns, Ordering::Release);
-            self.checkpoint_decision_tick_ns
-                .store(tick_ms.saturating_mul(1_000_000), Ordering::Release);
-            log::debug!(
-                "checkpoint: cycle due by age on {:?} — {} ms since the last collection ≥ the \
-                 {trigger_ms} ms trigger (ceiling {ceiling_ms}, anticipated term {} ms, \
-                 decided {} ms past the trigger against a {tick_ms} ms tick, the tick's wait \
-                 for the SMO mutex {} ms left out)",
-                self.path,
-                since_ns / 1_000_000,
-                self.checkpoint_term_ms(),
-                late_ns / 1_000_000,
-                mutex_wait_ns / 1_000_000
-            );
+        let trigger_ms = self.checkpoint_trigger_ms(max_age_ms);
+        if since_ns / 1_000_000 < trigger_ms {
+            return None;
         }
-        due
+        let late_ns = since_ns
+            .saturating_sub(trigger_ms.saturating_mul(1_000_000))
+            .saturating_sub(mutex_wait_ns);
+        log::debug!(
+            "checkpoint: cycle due by age on {:?} — {} ms since the last collection ≥ the \
+             {trigger_ms} ms trigger (max age {max_age_ms}, anticipated term {} ms, decided {} ms \
+             past the trigger, the tick's wait for the SMO mutex {} ms left out)",
+            self.path,
+            since_ns / 1_000_000,
+            self.checkpoint_term_ms(),
+            late_ns / 1_000_000,
+            mutex_wait_ns / 1_000_000
+        );
+        Some(late_ns)
+    }
+
+    /// The age decision that is about to RUN a cycle hands it its
+    /// lateness and the tick in force (PR 13e, F-B1 — review round 1,
+    /// Issue 1: recorded here alone, never by a due tick that runs no
+    /// cycle). The cycle consumes both in `note_checkpoint_cycle_term`;
+    /// the SMO mutex the caller holds across the store and the cycle is
+    /// what keeps another path's cycle from consuming them first.
+    pub(super) fn note_checkpoint_decision(&self, late_ns: u64, tick_ms: u64) {
+        self.checkpoint_decision_late_ns
+            .store(late_ns, Ordering::Release);
+        self.checkpoint_decision_tick_ns
+            .store(tick_ms.saturating_mul(1_000_000), Ordering::Release);
     }
 
     /// The sweep's per-cycle budget in force (ms) — `merge_sweep_budget_ms`

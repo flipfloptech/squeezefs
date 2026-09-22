@@ -2747,16 +2747,30 @@ fn sym_appender_ring_derives_from_the_reserve_and_the_solo_ring() {
     // left out of the lateness by the caller).
     use squeezefs::meta_backend::kv::checkpoint::checkpoint_cycle_term_ns;
     let ms = 1_000_000u64;
-    assert_eq!(checkpoint_cycle_term_ns(60 * ms, 0, 50 * ms), 60 * ms);
-    assert_eq!(checkpoint_cycle_term_ns(60 * ms, 30 * ms, 50 * ms), 60 * ms);
-    assert_eq!(checkpoint_cycle_term_ns(60 * ms, 50 * ms, 50 * ms), 60 * ms);
+    let cap = appender_flush_ceiling_ms(50) * ms;
+    assert_eq!(checkpoint_cycle_term_ns(60 * ms, 0, 50 * ms, cap), 60 * ms);
     assert_eq!(
-        checkpoint_cycle_term_ns(60 * ms, 132 * ms, 50 * ms),
+        checkpoint_cycle_term_ns(60 * ms, 30 * ms, 50 * ms, cap),
+        60 * ms
+    );
+    assert_eq!(
+        checkpoint_cycle_term_ns(60 * ms, 50 * ms, 50 * ms, cap),
+        60 * ms
+    );
+    assert_eq!(
+        checkpoint_cycle_term_ns(60 * ms, 132 * ms, 50 * ms, cap),
         142 * ms
     );
-    assert_eq!(checkpoint_cycle_term_ns(0, 132 * ms, 50 * ms), 82 * ms);
+    assert_eq!(checkpoint_cycle_term_ns(0, 132 * ms, 50 * ms, cap), 82 * ms);
+    // The belt (review round 1, Issue 1): a lateness past one landing
+    // ceiling is a stall the audit counts, never a term to anticipate —
+    // the fold sees the cap, whatever the decision measured.
     assert_eq!(
-        checkpoint_cycle_term_ns(u64::MAX, 132 * ms, 50 * ms),
+        checkpoint_cycle_term_ns(60 * ms, 4_000 * ms, 50 * ms, cap),
+        60 * ms + cap - 50 * ms
+    );
+    assert_eq!(
+        checkpoint_cycle_term_ns(u64::MAX, 132 * ms, 50 * ms, cap),
         u64::MAX,
         "saturating"
     );

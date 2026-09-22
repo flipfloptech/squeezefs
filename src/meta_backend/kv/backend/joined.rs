@@ -1757,6 +1757,9 @@ impl KvMetaBackend {
             }
         });
         let had_dirty: Vec<super::DirtyLeafAge> = oldest.into_iter().collect();
+        // The age law's reference (PR 13e, F-B1) — the joiner's cadence
+        // measures its interval from this collection.
+        self.note_checkpoint_collected(crate::mono_core::monotonic_ns_u64());
         let mut deferred_for_grant = 0u64;
         let mut deferred_for_space = 0u64;
         for node in dirty {
@@ -1827,6 +1830,7 @@ impl KvMetaBackend {
         // ---- Barrier #1: our node appends become durable.
         self.sync_device().await.map_err(KvError::Io)?;
         self.note_flush_ceiling(&had_dirty, crate::mono_core::monotonic_ns_u64());
+        self.note_checkpoint_cycle_term(cycle_started.elapsed().as_nanos() as u64);
 
         // ---- The page-budget overflow law's WIRE form (round 4, F9): the
         // roots the page below cannot name ride tree 0 through the

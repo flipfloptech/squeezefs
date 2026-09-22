@@ -2702,6 +2702,80 @@ fn sym_appender_ring_derives_from_the_reserve_and_the_solo_ring() {
             "the service cap is one landing ceiling of the cadence in force"
         );
     }
+    // PR 13e (F-B1 — record §7 item 3, the margin derived from the
+    // MEASURED cycle term): the cadence TRIGGER in force is the ceiling
+    // minus the cycle's anticipated landing term, saturating — a term at
+    // or past the ceiling makes a cycle due every tick; the published
+    // ceiling itself never widens (a cycle slower than the measured one
+    // still trips the audit).
+    use squeezefs::meta_backend::kv::checkpoint::checkpoint_trigger_ms;
+    for (ceiling, term, want) in [
+        (
+            CHECKPOINT_MAX_AGE_MS as u64,
+            0,
+            CHECKPOINT_MAX_AGE_MS as u64,
+        ),
+        (
+            CHECKPOINT_MAX_AGE_MS as u64,
+            150,
+            CHECKPOINT_MAX_AGE_MS as u64 - 150,
+        ),
+        (
+            CHECKPOINT_MAX_AGE_MS as u64,
+            CHECKPOINT_MAX_AGE_MS as u64,
+            0,
+        ),
+        (CHECKPOINT_MAX_AGE_MS as u64, 5_000, 0),
+        (500, 120, 380),
+    ] {
+        assert_eq!(
+            checkpoint_trigger_ms(ceiling, term),
+            want,
+            "trigger(ceiling {ceiling}, term {term})"
+        );
+        assert_eq!(
+            checkpoint_trigger_ms(ceiling, term),
+            ceiling.saturating_sub(term),
+            "the trigger is the ceiling less the anticipated term, saturating"
+        );
+    }
+    // One cycle's landing TERM = its pre-barrier wall + the age decision's
+    // lateness BEYOND one tick (the tick itself is the ceiling's first
+    // priced tick; the excess is the tick's own device work ahead of the
+    // decision, which the ceiling's second tick bounds at one period).
+    use squeezefs::meta_backend::kv::checkpoint::checkpoint_cycle_term_ns;
+    let ms = 1_000_000u64;
+    assert_eq!(checkpoint_cycle_term_ns(60 * ms, 0, 50 * ms), 60 * ms);
+    assert_eq!(checkpoint_cycle_term_ns(60 * ms, 30 * ms, 50 * ms), 60 * ms);
+    assert_eq!(checkpoint_cycle_term_ns(60 * ms, 50 * ms, 50 * ms), 60 * ms);
+    assert_eq!(
+        checkpoint_cycle_term_ns(60 * ms, 132 * ms, 50 * ms),
+        142 * ms
+    );
+    assert_eq!(checkpoint_cycle_term_ns(0, 132 * ms, 50 * ms), 82 * ms);
+    assert_eq!(
+        checkpoint_cycle_term_ns(u64::MAX, 132 * ms, 50 * ms),
+        u64::MAX,
+        "saturating"
+    );
+    // The anticipated term is a decayed HIGH-WATER MARK of the samples —
+    // a bound anticipated by a bound (a mean lands past the promise on
+    // every above-mean cycle): a larger sample takes the mark, a smaller
+    // one lets it decay one eighth per cycle.
+    use squeezefs::meta_backend::kv::checkpoint::anticipated_cycle_term_ns;
+    assert_eq!(anticipated_cycle_term_ns(0, 150), 150);
+    assert_eq!(anticipated_cycle_term_ns(150, 300), 300);
+    assert_eq!(anticipated_cycle_term_ns(800, 100), 700);
+    assert_eq!(anticipated_cycle_term_ns(800, 750), 750);
+    assert_eq!(anticipated_cycle_term_ns(7, 0), 6);
+    let mut hwm = 1_000u64;
+    for _ in 0..16 {
+        hwm = anticipated_cycle_term_ns(hwm, 0);
+    }
+    assert!(
+        hwm < 1_000 / 7,
+        "a burst is forgotten in ≈ 16 quiet cycles ({hwm})"
+    );
 }
 
 /// The symmetric MANAGER's derivations (design-symmetric-metadata §5.3.3

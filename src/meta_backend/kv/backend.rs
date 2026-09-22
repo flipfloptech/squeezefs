@@ -1531,6 +1531,41 @@ pub struct KvMetaBackend {
     /// `checkpoint::merge_sweep_budget_ms` of the flush interval in force
     /// at open (one tick period, finding 49's drain law).
     pub(super) merge_sweep_budget_ms: u64,
+    /// The monotonic instant (ns) the LAST checkpoint cycle COLLECTED its
+    /// dirty set — the cadence's age-law reference (PR 13e, F-B1): a leaf
+    /// dirtied after a collection is barriered by the next cycle, so the
+    /// interval the ceiling bounds runs collection → the next covering
+    /// barrier; the first build measured from the cycle's END, and the
+    /// grant cadence / a ring growth / the merge sweep that run after the
+    /// barrier ate the margin unseen. Set at the open (the first cycle's
+    /// reference) and by every cycle, whichever path ran it; read by the
+    /// cadence on a forest volume only — a flat volume's cadence keeps
+    /// the shipped cycle-end reference.
+    pub(super) checkpoint_collected_ns: AtomicU64,
+    /// The structural-hold Σs (`[recovery, service]`) at the last
+    /// collection — the age decision subtracts the hold time that
+    /// overlapped its wait from the lateness it folds into the term: a
+    /// tick parked behind a recovery or a fleet service is the audit's
+    /// EXCUSED class with its own accounting, never the cadence's own
+    /// cost to anticipate (anticipating it would fire every tick for the
+    /// mark's memory after every long service).
+    pub(super) checkpoint_collected_holds_ns: [AtomicU64; 2],
+    /// The decayed HIGH-WATER MARK of a cycle's landing TERM, ns
+    /// (`checkpoint::anticipated_cycle_term_ns` over
+    /// `checkpoint::checkpoint_cycle_term_ns`): the pre-barrier wall —
+    /// cycle start → barrier #1's completion — plus the age decision's
+    /// lateness beyond one tick; exactly the interval the flush-ceiling
+    /// audit measures past the ceiling's priced ticks, and the term the
+    /// cadence trigger anticipates (`checkpoint::checkpoint_trigger_ms`).
+    /// Fed by every cycle (the manager's and a joined appender's); 0
+    /// before the first. Published as `meta_kv_checkpoint_term_ms`.
+    pub(super) checkpoint_term_hwm_ns: AtomicU64,
+    /// The LAST age decision that found a cycle due
+    /// (`checkpoint_due_by_age`): its lateness past the trigger and the
+    /// tick in force, ns — consumed by the cycle it fired
+    /// (`note_checkpoint_cycle_term`); 0 for a cycle another path ran.
+    pub(super) checkpoint_decision_late_ns: AtomicU64,
+    pub(super) checkpoint_decision_tick_ns: AtomicU64,
     /// The volume's merge LAP across its trees (`run_merge_sweep`): which
     /// trees completed their lap since the last publish, and the exact
     /// candidate count they reported. Guarded by the SMO mutex's callers;
@@ -3148,6 +3183,11 @@ impl KvMetaBackend {
             merge_sweep_budget_ms: super::checkpoint::merge_sweep_budget_ms(
                 crate::meta_backend::resolve_flush_interval_ms(),
             ),
+            checkpoint_collected_ns: AtomicU64::new(crate::mono_core::monotonic_ns_u64()),
+            checkpoint_collected_holds_ns: [AtomicU64::new(0), AtomicU64::new(0)],
+            checkpoint_term_hwm_ns: AtomicU64::new(0),
+            checkpoint_decision_late_ns: AtomicU64::new(0),
+            checkpoint_decision_tick_ns: AtomicU64::new(0),
             merge_lap: std::sync::Mutex::new(VolumeLap::default()),
             merge_laps: AtomicU64::new(0),
             merge_candidates_tail: AtomicU64::new(0),
@@ -10648,11 +10688,20 @@ impl KvMetaBackend {
         let mut over: Vec<(u32, u64)> = Vec::new();
         let mut by_recovery: Vec<(u32, u64)> = Vec::new();
         let mut by_service: Vec<(u32, u64)> = Vec::new();
+        let collected_ns = self.checkpoint_collected_ns.load(Ordering::Acquire);
         for leaf in had_dirty {
             let age_ns = now_ns.saturating_sub(leaf.since_ns);
             if age_ns <= ceiling_ns {
                 continue;
             }
+            log::debug!(
+                "flush ceiling: region {}'s oldest dirty leaf aged {} ms — dirtied {} ms before \
+                 this cycle's collection, the collection {} ms before its covering barrier",
+                leaf.region,
+                age_ns / 1_000_000,
+                collected_ns.saturating_sub(leaf.since_ns) / 1_000_000,
+                now_ns.saturating_sub(collected_ns) / 1_000_000
+            );
             let recovery_ns = held_now[0]
                 .saturating_sub(leaf.held_at_since_ns[0])
                 .min(recovery_cap_ns);
@@ -11280,6 +11329,99 @@ impl KvMetaBackend {
     /// `meta_kv_merge_sweep_projections`: nodes the sweep projected (count).
     pub fn merge_sweep_projections(&self) -> u64 {
         self.merge_sweep_projections.load(Ordering::Relaxed)
+    }
+
+    /// A cycle COLLECTED its dirty set at monotonic `now_ns` (the age
+    /// law's reference — PR 13e, F-B1). Every cycle path records it: the
+    /// cadence's, `checkpoint_now`, the hole checkpoints, the bring-up
+    /// cover, a grant path's clearing cycles — a collection is a
+    /// collection whoever ran it.
+    pub(super) fn note_checkpoint_collected(&self, now_ns: u64) {
+        let held = self.cache.holds().snapshot(now_ns);
+        for (slot, v) in self.checkpoint_collected_holds_ns.iter().zip(held) {
+            slot.store(v, Ordering::Release);
+        }
+        self.checkpoint_collected_ns
+            .store(now_ns, Ordering::Release);
+    }
+
+    /// Fold a cycle's measured pre-barrier wall (cycle start → barrier
+    /// #1) — plus the lateness beyond one tick of the age decision that
+    /// fired it, if one did — into the high-water mark the cadence trigger
+    /// anticipates (PR 13e, F-B1).
+    pub(super) fn note_checkpoint_cycle_term(&self, prebarrier_wall_ns: u64) {
+        let late_ns = self.checkpoint_decision_late_ns.swap(0, Ordering::AcqRel);
+        let tick_ns = self.checkpoint_decision_tick_ns.swap(0, Ordering::AcqRel);
+        let sample_ns =
+            super::checkpoint::checkpoint_cycle_term_ns(prebarrier_wall_ns, late_ns, tick_ns);
+        let prev = self.checkpoint_term_hwm_ns.load(Ordering::Relaxed);
+        self.checkpoint_term_hwm_ns.store(
+            super::checkpoint::anticipated_cycle_term_ns(prev, sample_ns),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The anticipated landing term of this volume's checkpoint cycles —
+    /// the measured term's decayed high-water mark, ms
+    /// (`meta_kv_checkpoint_term_ms`; 0 before the first cycle).
+    pub fn checkpoint_term_ms(&self) -> u64 {
+        self.checkpoint_term_hwm_ns.load(Ordering::Relaxed) / 1_000_000
+    }
+
+    /// **The cadence TRIGGER in force for a landing ceiling `ceiling_ms`**
+    /// (`meta_kv_checkpoint_trigger_ms` at the shipped ceiling): on a
+    /// volume with an appender set — every bit-17 forest, the population
+    /// the flush-ceiling audit judges — `checkpoint::checkpoint_trigger_ms
+    /// (ceiling, term_hwm)`, the ceiling minus the measured cycle term's
+    /// decayed high-water mark, so the covering barrier lands inside the
+    /// promise; a flat volume's trigger is the ceiling verbatim (the
+    /// shipped cadence, byte-identical — PR 1's law).
+    pub fn checkpoint_trigger_ms(&self, ceiling_ms: u64) -> u64 {
+        if self.appenders.is_none() {
+            return ceiling_ms;
+        }
+        super::checkpoint::checkpoint_trigger_ms(ceiling_ms, self.checkpoint_term_ms())
+    }
+
+    /// The cadence's age law (PR 13e, F-B1): a cycle is due when the time
+    /// since the LAST COLLECTION reaches the trigger in force for
+    /// `ceiling_ms`. A due verdict records the decision's lateness past
+    /// the trigger — less the structural hold time that overlapped the
+    /// wait, the audit's excused class — and the tick in force, for the
+    /// cycle it fires to fold into the term.
+    pub(super) fn checkpoint_due_by_age(&self, ceiling_ms: u64, tick_ms: u64, now_ns: u64) -> bool {
+        let since_ns = now_ns.saturating_sub(self.checkpoint_collected_ns.load(Ordering::Acquire));
+        let trigger_ms = self.checkpoint_trigger_ms(ceiling_ms);
+        let due = since_ns / 1_000_000 >= trigger_ms;
+        if due {
+            let held_since_ns: u64 = self
+                .cache
+                .holds()
+                .snapshot(now_ns)
+                .iter()
+                .zip(&self.checkpoint_collected_holds_ns)
+                .map(|(now, at)| now.saturating_sub(at.load(Ordering::Acquire)))
+                .sum();
+            let late_ns = since_ns
+                .saturating_sub(trigger_ms.saturating_mul(1_000_000))
+                .saturating_sub(held_since_ns);
+            self.checkpoint_decision_late_ns
+                .store(late_ns, Ordering::Release);
+            self.checkpoint_decision_tick_ns
+                .store(tick_ms.saturating_mul(1_000_000), Ordering::Release);
+            log::debug!(
+                "checkpoint: cycle due by age on {:?} — {} ms since the last collection ≥ the \
+                 {trigger_ms} ms trigger (ceiling {ceiling_ms}, anticipated term {} ms, \
+                 decided {} ms past the trigger against a {tick_ms} ms tick, {} ms of it \
+                 behind a structural hold)",
+                self.path,
+                since_ns / 1_000_000,
+                self.checkpoint_term_ms(),
+                late_ns / 1_000_000,
+                held_since_ns / 1_000_000
+            );
+        }
+        due
     }
 
     /// The sweep's per-cycle budget in force (ms) — `merge_sweep_budget_ms`

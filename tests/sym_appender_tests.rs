@@ -2126,6 +2126,27 @@ async fn the_cadence_anticipates_the_measured_cycle_wall_so_a_slow_barrier_lands
         s.flush_ceiling_ms,
         s.flush_ceiling_overruns - overruns0
     );
+    // The derivation's published faces: the anticipated term carries the
+    // parked barrier (every cycle's barrier #1 waits it), and the trigger
+    // in force is the ceiling less that term (`checkpoint_trigger_ms`).
+    let term = va.checkpoint_term_ms();
+    assert!(
+        term >= barrier.as_millis() as u64,
+        "the anticipated cycle term carries the parked barrier ({term} ms)"
+    );
+    assert_eq!(
+        va.checkpoint_trigger_ms(CHECKPOINT_MAX_AGE_MS as u64),
+        squeezefs::meta_backend::kv::checkpoint::checkpoint_trigger_ms(
+            CHECKPOINT_MAX_AGE_MS as u64,
+            term
+        ),
+        "the trigger in force is the derivation's"
+    );
+    assert!(
+        va.checkpoint_trigger_ms(CHECKPOINT_MAX_AGE_MS as u64)
+            <= CHECKPOINT_MAX_AGE_MS as u64 - barrier.as_millis() as u64,
+        "the cadence fires the wall early"
+    );
     for v in &ra.volumes {
         v.shutdown().await.unwrap();
     }

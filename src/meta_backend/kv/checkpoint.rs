@@ -1026,14 +1026,80 @@ pub fn merge_sweep_budget_ms(flush_interval_ms: u64) -> u64 {
 /// the decision in the same tick (finding 49: ≤ one period). A commit
 /// acked at `t` therefore has its checkpoint decided by
 /// `t + CHECKPOINT_MAX_AGE_MS + 2 × period`; the record lands after the
-/// cycle's own writes, a device-time term the reader cannot derive and
-/// that the published S5 staleness bound leaves unstated too (the
-/// writer-advertised ceiling of adjudication item 4 is where a measured
-/// cycle term belongs). On the shipped 50 ms flush this is 1,100 ms; on a
-/// slow-flush venue the tick IS the landing term (5 s ⇒ 11,000 ms), which
-/// the retired `staleness + skew` window (P + 1 s) never covered.
+/// cycle's own writes — a device-time term the reader cannot derive, and
+/// which the writer therefore PRICES INTO ITS TRIGGER on a forest volume
+/// (PR 13e, F-B1: the cadence fires `checkpoint_trigger_ms` — the ceiling
+/// minus the cycle's measured TERM, `checkpoint_cycle_term_ns` — from the
+/// last cycle's collection, so the landing stays inside this number on a
+/// stationary term; a flat volume keeps the constant trigger verbatim). On the
+/// shipped 50 ms flush this is 1,100 ms; on a slow-flush venue the tick
+/// IS the landing term (5 s ⇒ 11,000 ms), which the retired `staleness +
+/// skew` window (P + 1 s) never covered.
 pub fn checkpoint_landing_ceiling_ms(flush_interval_ms: u64) -> u64 {
     CHECKPOINT_MAX_AGE_MS as u64 + 2 * checkpoint_tick_period_ms(flush_interval_ms)
+}
+
+/// **The cadence TRIGGER in force for a ceiling, ms** (PR 13e, F-B1 —
+/// record §7 item 3, the margin derived from the MEASURED cycle term):
+/// `ceiling − anticipated_term` (saturating). The landing ceiling is a
+/// PROMISE about when a commit's checkpoint LANDS — the free-grace
+/// qualify term and the reader's staleness bound read it as the writer's
+/// landing bound — and its "trigger + 2 ticks" prices the tick wait and
+/// one period of the tick's own work alone; the cycle's TERM — its
+/// pre-barrier wall (the flush pass, the bitmap pages, barrier #1 — at N
+/// regions their page writes, at a full cache the appends) plus the
+/// decision's lateness beyond that one period (the deferred-flush barrier
+/// and a maintenance item's device time run BEFORE the tick decides) —
+/// sat OUTSIDE it, so a leaf dirtied right after a cycle's collection
+/// aged `trigger + late + wall` at the next covering barrier and the
+/// audit read the excess as an overrun (16–106 ms past 1,100 on the box,
+/// `excused_ns` 0: no other actor's hold, the cadence's own term). The
+/// decision anticipates the term it has measured
+/// ([`anticipated_cycle_term_ns`] — a decayed high-water mark of
+/// [`checkpoint_cycle_term_ns`], the same interval the audit measures)
+/// so the LANDING stays inside the published ceiling on a stationary
+/// term; a cycle SLOWER than the measured one still trips the audit —
+/// the tripwire keeps its teeth, the published number never widens. A
+/// term at or past the ceiling makes a cycle due every tick, the honest
+/// response to a device that cannot land the promise. Tie-tested
+/// (`derivation_sweep_tests`).
+pub fn checkpoint_trigger_ms(ceiling_ms: u64, anticipated_term_ms: u64) -> u64 {
+    ceiling_ms.saturating_sub(anticipated_term_ms)
+}
+
+/// **One cycle's landing TERM**, ns — the interval between the trigger
+/// firing and the covering barrier that the ceiling's `2 × tick` does not
+/// price (PR 13e, F-B1): the cycle's pre-barrier wall (start → barrier #1)
+/// plus the decision's lateness past the trigger BEYOND one tick —
+/// `wall + (late − tick)⁺`. One tick of lateness is the cadence's
+/// quantization and is the ceiling's first tick; the excess is the tick's
+/// own device work ahead of its decision (the deferred-flush barrier, a
+/// maintenance item's SMO barrier past the drain deadline — the shape the
+/// pin's parked device makes 130 ms of), which the ceiling's second tick
+/// bounds at one period and no further. The lateness a tick spent parked
+/// behind a STRUCTURAL hold of the SMO mutex is not in `late`: it is the
+/// audit's excused class (`StructuralHolds`), accounted there and never
+/// anticipated as the cadence's own cost. Tie-tested
+/// (`derivation_sweep_tests`).
+pub fn checkpoint_cycle_term_ns(prebarrier_wall_ns: u64, late_ns: u64, tick_ns: u64) -> u64 {
+    prebarrier_wall_ns.saturating_add(late_ns.saturating_sub(tick_ns))
+}
+
+/// **The anticipated cycle term after one more cycle's sample**, ns — a
+/// decayed HIGH-WATER MARK: `max(sample, prev − prev/8)` (PR 13e, F-B1).
+/// A ceiling is a BOUND, so the term it anticipates must be one: a
+/// trigger set off the MEAN term lands past the promise on every cycle
+/// whose term is above the mean — which under a create storm is every
+/// cycle whose flush pass runs an SMO, because each SMO barriers its
+/// successor images (§4.10) and the pass wall is `(SMOs + 1) × barrier`,
+/// bursty by construction (the first build's mean estimator left 3 of 6
+/// cycles overrunning at a 150 ms barrier). The mark decays one eighth
+/// per cycle — the `sample_alloc_rate` shape's α halved, so a burst is
+/// remembered for ≈ 16 cycles and a quieter device earns its cadence
+/// back — and a burst larger than every recent one still trips the
+/// audit. Tie-tested (`derivation_sweep_tests`).
+pub fn anticipated_cycle_term_ns(prev_hwm_ns: u64, sample_ns: u64) -> u64 {
+    sample_ns.max(prev_hwm_ns.saturating_sub(prev_hwm_ns.div_ceil(8)))
 }
 
 /// [`checkpoint_landing_ceiling_ms`] at the flush cadence in force — the
@@ -1269,6 +1335,7 @@ async fn checkpoint_task(
                 shutting_down,
                 drain_deadline,
                 elastic_ceiling,
+                period_now.as_millis() as u64,
             )
             .await
             {
@@ -1394,13 +1461,16 @@ async fn maintenance_pass(
 /// in-flight commits first and forces a full cycle with an immediate
 /// post-ledger barrier, leaving `tail == head` — an empty replay window
 /// for the next mount. `elastic_ceiling` is the freed-offset composite's
-/// checkpoint ceiling in force (`None` = the shipped `CHECKPOINT_MAX_AGE_MS`).
+/// checkpoint ceiling in force (`None` = the shipped `CHECKPOINT_MAX_AGE_MS`);
+/// `tick_ms` the cadence period in force (the elastic composite may
+/// tighten it below the routine tick).
 async fn tick(
     be: &Arc<KvMetaBackend>,
     last_checkpoint: &mut std::time::Instant,
     final_cycle: bool,
     drain_deadline: Option<std::time::Instant>,
     elastic_ceiling: Option<u64>,
+    tick_ms: u64,
 ) -> Result<(), KvError> {
     if final_cycle {
         // New mutations are already refused (`write_gate`); wait out the
@@ -1517,7 +1587,22 @@ async fn tick(
     // ELAPSED time, so a ceiling that tightens mid-interval fires at once
     // — what lets an advertised ceiling be a promise about commits that
     // preceded the grant, not only about the ones that follow it.
-    let ceiling_ms = elastic_ceiling.map_or(CHECKPOINT_MAX_AGE_MS, u128::from);
+    // The age law on a FOREST volume (PR 13e, F-B1 — the population the
+    // flush-ceiling audit judges): the elapsed time runs from the last
+    // cycle's COLLECTION (a leaf dirtied after it is this cycle's — the
+    // interval the landing ceiling bounds; a cycle's post-barrier work no
+    // longer eats the margin), against the TRIGGER in force — the ceiling
+    // minus the cycle's measured TERM (`checkpoint_trigger_ms`), so the
+    // covering barrier lands inside the promise the ceiling's consumers
+    // read; the tick in force is what one period of the decision's
+    // lateness is priced against. A FLAT volume keeps the shipped law
+    // verbatim: the ceiling elapsed since the last cycle's end.
+    let ceiling_ms = elastic_ceiling.map_or(CHECKPOINT_MAX_AGE_MS as u64, |c| c);
+    let due_by_age = if be.appenders().is_some() {
+        be.checkpoint_due_by_age(ceiling_ms, tick_ms, crate::mono_core::monotonic_ns_u64())
+    } else {
+        last_checkpoint.elapsed().as_millis() >= u128::from(ceiling_ms)
+    };
     let due = final_cycle
         || ring_pressure
         // The cap is resolved ONCE at open (`KvMetaBackend::dirty_node_cap`
@@ -1526,7 +1611,7 @@ async fn tick(
         // sysinfo probes in `resolve_budget_now`) was an allocation stream
         // that broke the op-economy allocation-free contract (2026-08-02).
         || dirty_nodes > be.dirty_node_cap()
-        || last_checkpoint.elapsed().as_millis() >= ceiling_ms;
+        || due_by_age;
     // A declared region's uncovered ring counts as "something to cover"
     // exactly as ring 0's `distance > 0` does (its tail lands a cycle
     // after its flush, like the ledger's).
@@ -1813,6 +1898,12 @@ impl KvMetaBackend {
                 dirty.push(Arc::clone(n));
             }
         });
+        // The age law's reference (PR 13e, F-B1): every leaf dirtied from
+        // here on is the NEXT cycle's, so the cadence measures its interval
+        // from this instant — never from the cycle's end.
+        self.note_checkpoint_collected(crate::mono_core::monotonic_ns_u64());
+        let t_collected = std::time::Instant::now();
+        let dirty_count = dirty.len();
         // Nodes this pass could not flush because the allocator answered
         // `NoSpace` — the wedged-tail audit's class discriminator below.
         let mut deferred_for_space = 0u64;
@@ -1826,6 +1917,7 @@ impl KvMetaBackend {
                 + super::META_KV_NODE_MERGES.load(Ordering::Relaxed)
                 + super::META_KV_ROOT_COLLAPSES.load(Ordering::Relaxed)
         };
+        let smos_at_start = smo_counters();
         for node in dirty {
             let addr = node.addr();
             let tree = self.tree_of_node(&node)?;
@@ -1976,6 +2068,7 @@ impl KvMetaBackend {
             self.leave_heap_full("a flush pass deferred nothing and the growth floor is clear");
         }
 
+        let t_flushed = std::time::Instant::now();
         // ---- Dirty bitmap pages, stamped with this checkpoint's seq
         // (§4.7: the generation the ledger record names).
         let ckpt_seq = self.checkpoint_seq.load(Ordering::Acquire) + 1;
@@ -1995,12 +2088,29 @@ impl KvMetaBackend {
         // by barrier #1 — BEFORE that record lands. A no-op on a mount
         // holding no lease.
         self.write_data_alloc_pages(ckpt_seq).await?;
+        let t_pages = std::time::Instant::now();
 
         // ---- Barrier #1: node appends + bitmap pages + every completed
         // journal write + any previously-written ledger record become
         // durable (the §4.6 pt 3 pending-reclaim drains inside).
         self.sync_device().await.map_err(KvError::Io)?;
         self.note_flush_ceiling(&had_dirty, crate::mono_core::monotonic_ns_u64());
+        // The pre-barrier wall the audit just measured against, folded with
+        // the decision's lateness into the term the cadence trigger
+        // anticipates (PR 13e, F-B1).
+        self.note_checkpoint_cycle_term(cycle_started.elapsed().as_nanos() as u64);
+        log::debug!(
+            "checkpoint: cycle on {:?} pre-barrier wall {} ms = publish {} + flush {} ({} dirty \
+             nodes, {} SMOs) + pages {} + barrier {}",
+            self.device_path(),
+            cycle_started.elapsed().as_millis(),
+            (t_collected - cycle_started).as_millis(),
+            (t_flushed - t_collected).as_millis(),
+            dirty_count,
+            smo_counters().saturating_sub(smos_at_start),
+            (t_pages - t_flushed).as_millis(),
+            t_pages.elapsed().as_millis()
+        );
 
         // ---- The tail rule (module docs; §4.6 pt 2), plus the FIND-VS-A
         // dying-floor clamp: floors of nodes whose mappings LEFT the cache

@@ -13778,6 +13778,24 @@ impl SqueezefsFilesystem {
                     "meta_kv_heap_promised".into(),
                     per_volume(&|be| be.heap_promised()),
                 );
+                // PR 13e (F-B1): the cadence's age law per volume — the
+                // measured landing TERM of a checkpoint cycle (the
+                // pre-barrier wall + the age decision's lateness beyond
+                // one tick, a decayed high-water mark — the interval the
+                // flush-ceiling audit measures past the priced ticks) and
+                // the TRIGGER in force at the shipped ceiling: `ceiling −
+                // term` on a forest volume (the landing stays inside the
+                // published ceiling), the ceiling verbatim on a flat one.
+                metrics.insert(
+                    "meta_kv_checkpoint_term_ms".into(),
+                    per_volume(&|be| be.checkpoint_term_ms()),
+                );
+                metrics.insert(
+                    "meta_kv_checkpoint_trigger_ms".into(),
+                    per_volume(&|be| {
+                        be.checkpoint_trigger_ms(meta_kv::checkpoint::CHECKPOINT_MAX_AGE_MS as u64)
+                    }),
+                );
                 // LEAF-MERGE (design-cow-kv-metadata §4.6a (h)): the
                 // underfull-sibling SMO. `node_merges` = merges executed
                 // (the engagement gauge — moves on any delete-heavy

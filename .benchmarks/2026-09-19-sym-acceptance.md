@@ -1072,6 +1072,22 @@ driver's `FRESH_FLEET_PER_LEG=1` recreates the fleet before every leg
 (≈ 35 s on the box — `06c9ea58`); pass 2 ran gates 2 and 3b that way. H-B3
 — the devsub's default zram algorithm `zstd` is absent on the box's sqz
 kernel (`lzo-rle` / `lzo`); the driver names `SQZ_DEVSUB_OSS_ALGO`.
+**PR 13c's two, found by the FIRST 32-member fleet to form (the laptop,
+F-B3 fixed — shapes the box never reached behind the 64-cap):** H-C1 —
+`mw_fleet.sh mount_member` dispatched every index ≥ 20 as a PARTIAL
+AUTHORITY whatever the fleet's shape, so `create N=32 --symmetric
+--writers=1 --token-readers` died at member 20 ("partial-authority members
+need an ASSIGNED set"); the dispatch reads `OWNERS_ASSIGNED` and `create`
+bounds N by the co-writer slice, loud (`f1bc93d1`). H-C2 — `sym-readers`
+judged `dlm_token_recall_fanout_p99 == readers`, but the p99 is
+`QueueDepthHistogram::percentile`'s log-bucket UPPER BOUND (31 readers →
+the `<=32` bucket → 32), a law only a power-of-two reader count could meet
+— the box's N = 32 fleet has 31 readers too; the leg compares to the
+count's bucket edge, the exact per-batch count already being `recalls ≡
+mutations × holders` (`f483e5f5`). With both, gate 5's leg ran GREEN from
+zero on the laptop's 32-member fleet (0 misses over 31 readers, 155
+recalls ≡ 5 × 31, `timeouts_live` 0, recall RTT 485 µs — scoping; the
+box row is owed).
 
 **Write-amplification faces of the N-writer rows** (the daemons' ledgers
 ÷ user bytes; the fleet's zram namespaces carry no `/proc/diskstats`

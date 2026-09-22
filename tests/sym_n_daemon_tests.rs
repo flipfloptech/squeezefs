@@ -10292,7 +10292,12 @@ async fn a_cross_owner_unlink_of_a_foreign_minted_child_reads_its_witness_at_the
     shutdown(&manager).await;
     drop(mvol);
     drop(manager);
-    fsck_clean(&uris).await;
+    // The census after every writer LEFT: no finding, and NOTHING exempted
+    // as current-era — a probe has nothing in flight, so an exemption is an
+    // inode the census did not judge (review round 1, Issue 2: every
+    // joiner-minted ino read exempt here before the era floor consulted
+    // tree 0 — the box's 430 would have passed this census).
+    fsck_clean_no_exempt(&uris).await;
 }
 
 /// **F-R3's other witness classes** (the brief's audit of every local
@@ -10433,7 +10438,144 @@ async fn a_cross_owner_link_rename_over_and_directory_move_read_their_witnesses_
     shutdown(&manager).await;
     drop(mvol);
     drop(manager);
-    fsck_clean(&uris).await;
+    fsck_clean_no_exempt(&uris).await;
+}
+
+/// **PR 13e review round 1, Issue 2 — the C9 census's era floor on a
+/// forest: a JOINED appender's mints were exempt at every censusing
+/// mount.** fsck C9's candidate filter is `minted_in_prior_era`, whose
+/// per-slot floor was a snapshot of the censusing mount's `guest_cursors`
+/// at OPEN — seeded from the ledger STAMP's slot cursors and the replay
+/// window. A joined appender's rotor slots never reach the MANAGER's
+/// cursors (it never `install_lease`s them), so the manager's stamp never
+/// carries them; the slot's cursor lives in tree 0 alone (`Leased {
+/// cursor }`, `Unleased { cursor }` after the leave). Every joiner-minted
+/// ino therefore had NO floor entry → `current_era_exempted` → never a C9
+/// candidate — at the online manager AND at an offline probe after every
+/// writer left (the reviewer read the F-R3 pin's own census at its RED
+/// commit: the 4 manager-minted orphans reported, the 7 joiner-minted
+/// ones exempted). The box's 430 orphans were the OTHER writers' mints:
+/// the post-leave census as first built read C9 = 0 on the broken binary
+/// too. The law: an UNLEASED slot's records are ALL prior-era candidates
+/// (nobody leases it ⇒ no create is in flight there — tree 0 / the lease
+/// table is the witness), and a PROBE's are all candidates (nothing is in
+/// flight in a probe; an offline census refuses a live set). This
+/// contract plants a joiner-minted orphan (the joiner's own file, its
+/// naming dentry deleted through the dentry tree — fsck C1's own repair
+/// shape, `fsck_c9_tests`' plant) and, after both writers leave, the
+/// offline probe must REPORT it as C9 with nothing exempted. RED on the
+/// branch: 0 findings, `current_era_exempted` 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiner_minted_orphan_is_a_c9_finding_at_the_offline_census_after_every_writer_left() {
+    use squeezefs::meta_backend::kv::record::{
+        dentry_key, dentry_name_hash54, DentryValue, TREE_DENTRIES,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_B, "jdir")]).await;
+    let jdir = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mvenue = DaemonVenue::stand_up(&manager, true, "manager-c9-era").await;
+    let joiner = {
+        Knobs::armed().apply();
+        let r = open_routed_meta_set_joined(
+            &uris,
+            &JoinedSetAdmission {
+                manager_endpoint: mvenue.endpoint.clone(),
+                secret: VENUE_SECRET.to_vec(),
+                peer_id: peer_of(&joiner_identity(&mvol, 73).await),
+                identity: joiner_identity(&mvol, 73).await,
+            },
+        )
+        .await;
+        Knobs::clear();
+        r.expect("the joined open")
+    };
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    // The joiner's own directory (its first touch) and two files minted in
+    // ITS rotor — records no manager stamp ever names.
+    let kept = joiner
+        .create(jdir, "kept", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap()
+        .ino;
+    let orphan = joiner
+        .create(jdir, "orphan", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .unwrap()
+        .ino;
+    jvol.checkpoint_now().await.unwrap();
+    // The plant: the orphan's naming dentry deleted through the dentry
+    // tree at the JOINER (the slot's lessee), its record left at nlink 1.
+    // The key is the lookup's own: `(parent local ino, seeded hash54 of
+    // the name, coll)`, the window compared by full name.
+    let (_v, local_orphan) = joiner.route_ino(orphan);
+    let (_v, local_jdir) = joiner.route_ino(jdir);
+    let hash = dentry_name_hash54(b"orphan", jvol.superblock().hash_seed);
+    let start = dentry_key(local_jdir, hash, 0);
+    let end = dentry_key(local_jdir, hash, u8::MAX);
+    let window = jvol
+        .range_kind(TREE_DENTRIES, &start, &end, 64)
+        .await
+        .expect("the name's hash window");
+    let mut planted = false;
+    for (k, v) in &window {
+        let d = DentryValue::decode(v).expect("a dentry record");
+        if d.name == b"orphan" {
+            jvol.delete_kind(TREE_DENTRIES, k)
+                .await
+                .expect("drop the naming dentry");
+            planted = true;
+            break;
+        }
+    }
+    assert!(planted, "the orphan's dentry was found and dropped");
+    jvol.checkpoint_now().await.unwrap();
+    assert_eq!(
+        jvol.read_inode_value_routed(local_orphan)
+            .await
+            .unwrap()
+            .map(|v| v.nlink),
+        Some(1),
+        "the orphan: a record at nlink 1 with no name"
+    );
+
+    // Both writers LEAVE (the joiner's slots go Unleased at tree 0 with
+    // their cursors); the offline probe judges every slot.
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    mvenue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    let report = fsck_offline(&uris).await;
+    let c9: Vec<_> = report.findings.iter().filter(|f| f.class == "C9").collect();
+    assert_eq!(
+        report.counters.current_era_exempted, 0,
+        "a probe exempts nothing — every joiner-minted ino is judged (RED: the joiner's slot \
+         had no era floor at the probe and its records read current-era)"
+    );
+    assert_eq!(
+        c9.len(),
+        1,
+        "exactly the planted orphan is a C9 finding: {:?}",
+        report.findings
+    );
+    assert!(
+        c9[0].object.contains(&orphan.to_string()),
+        "the finding names the joiner-minted orphan {orphan}: {}",
+        c9[0].object
+    );
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| f.object.contains(&kept.to_string())),
+        "the named sibling {kept} is no finding"
+    );
 }
 
 // ---------------------------------------------------------------------------

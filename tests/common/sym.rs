@@ -522,16 +522,44 @@ pub async fn apply_region_image(
 
 /// The offline fsck of `uris` must report nothing.
 pub async fn fsck_clean(uris: &[String]) {
-    let mut opts = squeezefs::fsck::FsckOptions::offline();
-    opts.settle = std::time::Duration::from_millis(10);
-    let report = squeezefs::fsck::run_offline(uris, &opts)
-        .await
-        .expect("offline fsck runs");
+    let report = fsck_offline(uris).await;
     assert!(
         !report.has_findings(),
         "fsck must be clean: {:?}",
         report.findings
     );
+}
+
+/// [`fsck_clean`] with the C9 census's TEETH asserted (PR 13e review round
+/// 1, Issue 2): a probe has nothing in flight, so an inode C9 exempts as
+/// "current era" is an inode the census did not judge — on a forest
+/// volume every record a JOINED appender minted read that way at every
+/// censusing mount (its slot's cursor lives in tree 0, never in the
+/// manager's stamp the era floor was seeded from), so a clean report over
+/// a set a joiner wrote to proved nothing about its mints. Both words:
+/// no finding AND no exemption.
+pub async fn fsck_clean_no_exempt(uris: &[String]) {
+    let report = fsck_offline(uris).await;
+    assert!(
+        !report.has_findings(),
+        "fsck must be clean: {:?}",
+        report.findings
+    );
+    assert_eq!(
+        report.counters.current_era_exempted, 0,
+        "a probe has nothing in flight — every inode is judged, none is exempted as \
+         current-era (a joined appender's mints read exempt at every censusing mount before \
+         the era floor consulted tree 0)"
+    );
+}
+
+/// The offline fsck report of `uris` (a fast settle).
+pub async fn fsck_offline(uris: &[String]) -> squeezefs::fsck::FsckReport {
+    let mut opts = squeezefs::fsck::FsckOptions::offline();
+    opts.settle = std::time::Duration::from_millis(10);
+    squeezefs::fsck::run_offline(uris, &opts)
+        .await
+        .expect("offline fsck runs")
 }
 
 /// An ino inside forest slot `slot`'s guest keyspace (local key ino).

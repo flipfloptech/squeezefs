@@ -573,6 +573,35 @@ fn open_and_stuck_now() -> (u64, u64) {
     (open.len() as u64, stuck as u64)
 }
 
+/// Reconcile the register against a SUCCESSFUL durable scan (PR 13e review
+/// round 2 — found by Issue 10's pin): an ABANDONED entry whose record the
+/// scan no longer lists is no longer this process's to complete — another
+/// appender's roll-forward retired it (the manager's poll adopting a
+/// joiner's abandoned intent, or the reverse; the in-process fixtures
+/// share one register, so only a real fleet met the ghost), or its slot
+/// moved to an appender whose scan owns it now — and would otherwise ride
+/// this register as open, then STUCK, for the mount's life. A live op's
+/// own (`InFlight`) entry is never touched: its record may not be durable
+/// yet. Counted as retired where it was counted as minted, so `minted ≡
+/// retired + open` keeps holding per process. Returns how many were
+/// forgotten.
+fn forget_abandoned_absent(durable: &std::collections::HashSet<u64>) -> usize {
+    let mut open = OPEN_INTENTS.lock();
+    let ghosts: Vec<u64> = open
+        .iter()
+        .filter(|(tx, e)| e.state == IntentState::Abandoned && !durable.contains(*tx))
+        .map(|(tx, _)| *tx)
+        .collect();
+    for tx in &ghosts {
+        if let Some(e) = open.remove(tx) {
+            if e.counted {
+                XV_CO_INTENTS_RETIRED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    ghosts.len()
+}
+
 /// Does the register hold anything the cadence owns (an abandoned intent)?
 fn any_abandoned() -> bool {
     OPEN_INTENTS
@@ -3303,6 +3332,19 @@ pub async fn recover_open_intents(routed: &RoutedMetaBackend) -> Result<usize> {
 /// `xv_cross_owner_intents_stuck`.
 pub async fn roll_forward_open_intents(routed: &RoutedMetaBackend) -> Result<usize> {
     let open = scan_open(routed).await?;
+    // The register is a PROJECTION of the durable records this mount's
+    // scan owns: an abandoned entry the scan no longer lists was retired
+    // elsewhere (or moved with its slot) and is forgotten here, never a
+    // ghost on `xv_cross_owner_intents_{open,stuck}`.
+    let durable: std::collections::HashSet<u64> = open.iter().map(|o| o.rec.tx_id).collect();
+    let forgotten = forget_abandoned_absent(&durable);
+    if forgotten > 0 {
+        log::debug!(
+            "cross-volume transaction roll-forward: {forgotten} abandoned intent(s) no volume \
+             of this mount's scan holds any more — retired by another appender or moved with \
+             their slot; forgotten here"
+        );
+    }
     let hold = TEST_XV_CADENCE_HOLD_AFTER_SCAN_MS.load(Ordering::Relaxed);
     if hold > 0 {
         squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(hold)).await;

@@ -10608,7 +10608,11 @@ async fn a_joiner_minted_orphan_is_a_c9_finding_at_the_offline_census_after_ever
 /// nothing, `pending-b` stays the finding. The offline probe after the
 /// manager leaves agrees. RED on the branch: BOTH children reported at
 /// the first census (`--repair` would have destroyed `pending-a`'s record,
-/// the one the roll-forward re-names).
+/// the one the roll-forward re-names). Found beside it: the roll-forward's
+/// scan now RECONCILES the intent register — `pending-b`'s abandoned entry,
+/// its record gone without this process's retirement (what another
+/// daemon's roll-forward leaves behind on a fleet), is forgotten instead
+/// of riding `intents_open` / `intents_stuck` for the mount's life.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cross_owner_creates_child_is_never_a_c9_finding_while_its_intent_stands() {
     use squeezefs::meta_backend::crossvol_tx::{
@@ -10791,18 +10795,21 @@ async fn a_cross_owner_creates_child_is_never_a_c9_finding_while_its_intent_stan
         pending_a,
         "the roll-forward landed the name the census waited for"
     );
-    // No durable intent stands (the register still remembers the RAW-
-    // deleted `pending-b` plant as abandoned — the plant bypassed the
-    // retirement protocol; a real retirement removes it, so the register
-    // read `s0 + 1` here is the plant's, not the product's).
+    // No durable intent stands, and the REGISTER agrees: `pending-a`'s
+    // entry retired through the protocol, and `pending-b`'s — abandoned in
+    // this process, its record gone without the protocol (as another
+    // daemon's roll-forward leaves it on a real fleet) — was reconciled
+    // away by the scan (found by this pin: before it the entry rode
+    // `xv_cross_owner_intents_open`, then `_stuck`, for the mount's life).
     assert!(
         mvol.xv_scan_intents_homed().await.unwrap().is_empty(),
         "no intent record stands after the roll-forward"
     );
     assert_eq!(
-        cross_owner_stats().intents_open - s0.intents_open,
-        1,
-        "pending-a's intent retired through the register; pending-b's raw plant stays"
+        cross_owner_stats().intents_open,
+        s0.intents_open,
+        "the register holds no ghost: an abandoned intent the durable scan no longer lists is \
+         forgotten"
     );
     let report = inode_plane_over(&manager).await;
     assert!(!c9_naming(&report, pending_a), "named: no finding");

@@ -382,9 +382,4 @@ impl StructuralHolds {
             self.held_ns(HoldClass::Service, now_ns),
         ]
     }
-
-    /// Whether a hold of `class` is active.
-    pub fn active(&self, class: HoldClass) -> bool {
-        self.active_since_ns[class as usize].load(atomic::Ordering::Acquire) != 0
-    }
 }

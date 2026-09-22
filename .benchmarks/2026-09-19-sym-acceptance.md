@@ -51,6 +51,20 @@ then found a joiner's read inside the failover window answering `EIO`
 (§4.4ag). The flip waits for defect 32's rung and finding 1's
 attribution, then the box.
 
+> **Re-read at PR 13c (the box campaign, `fix/sym-box-campaign`):** PR 13b
+> landed the paragraph's two blockers and the box brackets ran (§3.9 —
+> gates 2 / 3b / 7@N=8 MET as VERDICTS; gate 1 a flat-path MISS, gate 3's
+> N = 8 term, gate 3c a live holder recalled, gates 5 and 7@N=32 BLOCKED
+> on the connection cap, `appender_flush_ceiling_overruns` tripping). PR
+> 13c fixed F-B1 / F-B2 / F-B3 and three unarmed-path costs red-first,
+> attributed gate 3's N = 8 term to the co-located venue, and formed the
+> first 32-member fleet; **what still stands between the tree and the
+> flip is §9's PR-13c blockquote**: the box re-runs of gates 1 / 3 / 3c /
+> 5 / 7@N=32 on PR 13c's binary, the flush-ceiling MARGIN's derivation
+> (F-B1 landed an exclusion, not the margin), and the per-NODE gate-3
+> law, UNMEASURED on any venue — a multi-node venue (PR 15's cloud row)
+> is its instrument.
+
 ## 1. Venue block
 
 | Venue | What ran here | Host / kernel / fabric / substrate |
@@ -111,6 +125,19 @@ class). "dev" = scoping venue; "box" = squeeze-test.)_
 > Three product findings (F-B1 flush-ceiling margin, F-B2 the dominance
 > rule's per-slot `ops_h`, F-B3 the listener cap) and the gate-1 regression
 > go to PR 14 (§9's re-read).**
+
+> **Status (PR 13c, the box campaign — `fix/sym-box-campaign`):** F-B1 /
+> F-B2 / F-B3 and three unarmed-path costs fixed red-first; the box cells
+> above stay the VERDICTS and the re-runs (gates 1 / 3 / 3c / 5 / 7@N=32)
+> are owed on PR 13c's binary. **Gate 3's N = 8 row is attributed to the
+> co-located venue** (§3.9.3): the per-daemon-CPU-second face read off
+> the box's own `.stats` is 4,085 (N = 1) → 2,586 (N = 8) creates per
+> daemon-CPU-s — **0.63× at N = 8, which MISSES the 0.7 law too when
+> the ingest phase's CPU is folded in** (the create phase alone is what
+> `sym-scale`'s new `C/CPU-S` column reads; the box has not run it) — so
+> the C/CPU-S face is the law's VENUE-BOUNDED PROXY, not its replacement:
+> **the per-NODE law ("bounded by no node") is UNMEASURED on any venue and
+> a multi-node venue (PR 15's cloud row) is its instrument.**
 
 | Gate | Row | Venue | Verdict | Engagement (the law's gauges) |
 |---|---|---|---|---|
@@ -965,18 +992,34 @@ Consequence for the rows: the gate-3 and gate-7 row sets stopped at r1
 (the legs die on it; `--venue=box` is the brief's word), and every later
 leg on the SAME fleet died at its door until the driver recreated the
 fleet per leg (harness finding H-B2).
-**→ fixed in PR 13c** (`fix/sym-box-campaign`, the F-B1 commit): ONE law —
-the audit judges a leaf on the time it aged with NO structural hold on
-the SMO mutex; the Σ of hold time per class (`NodeEnv::holds`, stamped on
-the leaf at its dirty transition) is excluded exactly — a RECOVERY's up to
-the published bound (defect 33's law kept), a SERVICE hold's (the
-manager's wire slot grant / release, a transfer's adoption, a projection
-refresh, a region release, the joiner's own wire refill inside its pass)
-its measured overlap, each on its class's gauge
-(`appender_flush_ceiling_{recovery,service}_extensions`); the flush pass's
-own wall past the ceiling is still the overrun. Pin: `sym_appender_tests::
-a_leaf_that_aged_under_a_service_hold_of_the_smo_mutex_is_an_extension_not_an_overrun`.
-The box re-run of gates 3 / 7 is owed on PR 13c's binary.
+**→ fixed in PR 13c** (`fix/sym-box-campaign`, the F-B1 commit + review
+round 1's Issue 1): the audit judges a leaf on the time it aged with NO
+structural hold of the SMO mutex by ANOTHER actor — the Σ of hold time
+per class (`NodeEnv::holds`, stamped on the leaf at its dirty transition)
+that OVERLAPPED the leaf's dirty window is excluded: **an overlap-bounded
+exclusion, not the delay the pass suffered** (passes and holds serialize
+on the mutex, so a hold spanning the pass's due tick delays it by its
+remainder — the over-excuse is ≤ one cadence tick per hold), each class
+CAPPED at a published bound — a RECOVERY's at `appender_recovery_bound_ms`
+(defect 33's law kept), a SERVICE hold's (the manager's wire slot grant /
+release, a transfer's adoption, a projection refresh, a region release) at
+ONE landing ceiling (`appender_flush_ceiling_service_cap_ms`: the
+contract the audit excuses against — a longer hold is the stall class the
+ceiling's consumers, the free-grace qualify term and the `=0` reader,
+must SEE, so the excess counts) — each excused leaf on its class's gauge
+(`appender_flush_ceiling_{recovery,service}_extensions`), the excused Σ
+and the largest single exclusion published
+(`appender_flush_ceiling_excused_{ns,max_ms}`). **The pass's OWN wall is
+never excused**: its device time, and its wait on a peer — the joiner's
+in-pass reactive wire refill, which round 1 had registered as a service
+hold (Issue 1b), is the pass waiting, not another actor holding. **This is
+an exclusion, not the MARGIN's derivation** — §7 item 3 ("derive the
+margin from the measured pass wall") stays PR 14's. Pin: `sym_appender_
+tests::a_leaf_that_aged_under_a_service_hold_of_the_smo_mutex_is_an_
+extension_not_an_overrun` (a hold inside the window excuses up to the cap;
+a hold outside it excuses nothing and the parked device's overrun counts;
+a hold PAST the cap leaves its excess as the overrun, `excused_max_ms ==
+cap`). The box re-run of gates 3 / 7 is owed on PR 13c's binary.
 
 **F-B2 — a LIVE holder was recalled by a touch (gate 3c's law).** The
 holder m60 ran the harness's LIVE job (a storm under `job-wA/`) while the
@@ -1038,9 +1081,11 @@ shipped 64 and ceilinged by the fd budget (`RLIMIT_NOFILE / 8`: two fds per
 connection, a quarter share; the daemon raises its soft limit to the hard
 one at startup); `SQUEEZEFS_CLUSTER_WIRE_MAX_CONNS` is the lever, railed
 by the fd budget; `member_session_demand_from(cpus, volumes)` is the
-tie-tested per-member demand (32 members × 12 = 384 ≤ 512 at share 32 on
-32 CPUs); a dial refused at accept retries with a doubling backoff inside
-the dial bound and then surfaces the TYPED `RefusalClass::ListenerRefused`
+tie-tested per-member demand (32 members × 14 = 448 ≤ 512 at share 32 on
+32 CPUs — its control term COUNTED IN CODE since review round 1's Issue 3:
+six standing sessions, each dial site marked and the count pinned); a dial
+refused at accept retries with a doubling backoff from the accept tick,
+clipped to the dial bound and then surfaces the TYPED `RefusalClass::ListenerRefused`
 (EAGAIN), never the first-EOF `InvalidOperation`. The `.stats` defect: the
 kernel's `default_permissions` walk GETATTRs the mount ROOT before
 `/.stats`, and the root's token fetch surfaced the wire error; a token
@@ -2847,7 +2892,12 @@ counted decline, a bounded window or a stated venue):
    read N = 4 at 4.57 × and 2.20 ×, N = 8 at 3.17 × and 5.99 × on
    consecutive from-zero runs — a SCOPING read, venue-attributed pending
    the box (`51bf21e1`); no local read narrows it, the box row is the
-   number.
+   number. **PR 13c:** the box read 4.27× at N = 8 and §3.9.3 attributes
+   it to the CO-LOCATED venue (8.4 of 32 cores, every RAM-only phase
+   +40–58 % per op uniformly, no queue); the per-daemon-CPU-second face
+   is that venue's proxy — **the per-NODE law ("bounded by no node") is
+   UNMEASURED on any venue: a multi-node venue, PR 15's cloud row (one
+   node per writer), is its instrument** — owed there, never a box row.
 1. **`is_stripe`'s reverse dentry scan over projections** (PR 7b on a
    joiner): `find_parent_of_child` walks every slot tree of the flip
    candidate's volume — a projection on a joiner, defect 24's class once
@@ -2874,7 +2924,14 @@ counted decline, a bounded window or a stated venue):
    the gauge are venue-attributed (`51bf21e1`) and, since fix round 1,
    the harness's venue word reports them per round instead of failing
    the leg (Issue 2) — the margin derivation is a PR 14 item, never a
-   gate-4 dependency.
+   gate-4 dependency. **PR 13c (F-B1):** the audit now EXCLUDES a service
+   hold's overlap with the leaf's dirty window, capped at one landing
+   ceiling and published (`appender_flush_ceiling_service_cap_ms`,
+   `…_excused_{ns,max_ms}`) — an exclusion of ANOTHER actor's hold, which
+   closes the box's "no recovery in flight" class as far as such holds
+   explain it; **the margin's derivation from the measured pass wall
+   stays THIS item, PR 14's**, and the box re-run on PR 13c's binary
+   says what remains for it to price.
 3b. **`sym-storm` ×10 from zero on the final binary** (§3.8): re-run in
    fix round 1 under `--venue=laptop` — §3.8b carries the count and the
    per-round venue-attributed readings; whatever count stands there is
@@ -3089,6 +3146,8 @@ worktree, reused, left as found).
 > * **the must-stay-0 tripwire `appender_flush_ceiling_overruns`** trips on the acceptance venue (F-B1: four times in 12 minutes, 1–32 ms past the 1,100 ms ceiling, no recovery in flight) — PR 14's margin derivation is no longer a laptop reading.
 >
 > **Reading MET on the box:** gate 2 (1.04–1.07× of S0), gate 3b (one flip, `shipped ≡ served`, `K + C + 3` tokens, 3,400–3,581 creates/s into one directory), gate 7 at N = 8 (983 frees/s, `shipped ≡ served ≥ displaced`; the 8-mount join storm 3.92 s) — each with the tripwire caveat above where it applies. **What PR 14 flips on, restated:** the gate-1 regression attributed and closed (or adjudicated as the shipped-bug fixes' price with the owner's word), F-B3's cap re-derived (then the N = 32 rows run), F-B1's margin derived, F-B2's rule adjudicated, and the storm ×10 count from zero on that binary — then the flip. The decision text below is as recorded at PR 13.
+>
+> **Status (PR 13c, the box campaign — `fix/sym-box-campaign`, 2026-09-22): what LANDED against the list above, and what still stands.** *Landed, red-first:* **F-B3** — the listener cap derives from the RAW root × the shipped factor, ceilinged by the fd budget (`RLIMIT_NOFILE / 8`), a refused dial retries from the accept tick to the dial bound then surfaces the typed `ListenerRefused`, a token reader's ROOT attr survives a transient wire class (the `.stats` EINVAL), and the first 32-member fleet FORMED on the laptop (§3.9.2's "→ fixed"; H-C1 / H-C2 the harness shapes it uncovered); **F-B2** — the dominance rule's `ops_h` counts the holder's work on the slot's SUBTREE across volumes (design §5.1.4 as built, the hint's two error directions and the root-ward consequence stated); **F-B1** — the flush-ceiling audit EXCLUDES the SMO mutex's structural holds: an overlap-bounded exclusion (over-excuse ≤ one cadence tick per hold), each class CAPPED at a published bound (a recovery's at `appender_recovery_bound_ms`, a service hold's at one landing ceiling — `appender_flush_ceiling_service_cap_ms`), the excused Σ published (`appender_flush_ceiling_excused_{ns,max_ms}`), the pass's own wall (its device time, its wait on a peer) never excused; **the gate-1 flat path** — three unarmed-path costs deleted (`stripes_armed_any`, the memo fed on an armed set only, `token_serve`'s two-probe return), the rename lock-set fix's +1 guard priced and kept, and the startup `RLIMIT_NOFILE` raise confined to the listener caps (`uring_fs::fd_cache_cap` derives from the limit AS FOUND — review round 1, Issue 8: the first build had grown the flat path's fd cache 32×). *Still standing (the flip's list, restated for PR 14):* (a) **the box re-runs** of gates 1 / 3 / 3c / 5 / 7@N=32 on PR 13c's binary — no box row ran in PR 13c (the counted-run law); (b) **the flush-ceiling MARGIN's derivation from the measured pass wall (§7 item 3) — NOT done**: F-B1 landed an exclusion of another actor's holds, which is not a derivation of the margin, and the box's 1–32 ms overruns are what that derivation must price; (c) **gate 3's per-NODE law ("bounded by no node") is UNMEASURED on any venue**: the box's N = 8 MISS is attributed to the co-located venue (§3.9.3), the per-daemon-CPU-second face (0.63× at N = 8 with the ingest CPU folded in; the create phase alone is `sym-scale`'s new `C/CPU-S` column, unrun on the box) is that venue's PROXY, and **a multi-node venue — PR 15's cloud row — is the law's instrument**; (d) the storm ×10 count from zero on PR 13c's binary.
 
 **Decision: NOT YET — four blockers, three of them product (§7's
 flip-blocking items (i)–(iii) + the box).** (0) **Fix-round

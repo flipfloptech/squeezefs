@@ -3619,9 +3619,12 @@ build's EWMA mean left 3 of 6 cycles overrunning, and a decayed high-water
 mark leaked one eighth per quiet cycle and landed a burst one step above
 it a tick short; the horizon is the ONE cycle-count bound every cover loop
 runs to, so a burst is remembered exactly as long as a cover loop would
-wait on it) of ONE cycle's landing TERM (`checkpoint_cycle_term_ns(wall,
-late, tick)` = `wall + (late − tick)⁺`): its pre-barrier wall plus the age
-decision's lateness past the trigger BEYOND one tick — the tick
+wait on it — a count of CYCLES, never a duration: about a minute at the
+full trigger, seconds at a trigger of 0 or inside a handover's
+`checkpoint_now` loop) of ONE cycle's landing TERM
+(`checkpoint_cycle_term_ns(wall, late, tick)` = `wall + (late − tick)⁺`):
+its pre-barrier wall plus the age decision's lateness past the trigger
+BEYOND one tick — the tick
 quantization IS the ceiling's first priced tick; the excess is the tick's
 own pre-decision device work the second tick bounds at one period — with
 the tick's WAIT for the SMO mutex left out (`tick` measures it; a wait
@@ -3663,9 +3666,15 @@ the box's bounded 16–106 ms. PR 13c's four ceiling contracts stay green
 (the service-hold pin dirties its step-3 leaf UNDER the hold: its step-2
 parked device teaches the cadence a term past the ceiling, and a leaf
 dirtied before the hold is then flushed inside one tick); the fns and the
-window are tie-tested in `derivation_sweep_tests`. **The box re-run on
-this binary is what says the derivation priced the box's term** — the
-laptop readings above are the mechanism's.
+window are tie-tested in `derivation_sweep_tests`. **What the pin does
+NOT reproduce (review round 1, Issue 8):** the box's trips rode the JOINS
+between the rows and the N = 8 ingest — shapes no in-process fixture
+runs; the pin reproduces the CLASS (a pre-barrier wall + a decision
+lateness past the 2-tick margin) with a PARKED DEVICE, and the derivation
+prices whatever act produced the measured wall, so the join trips'
+coverage is by construction. **The box re-run on this binary is what
+says the derivation priced the box's term** — the laptop readings above
+are the mechanism's.
 
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 

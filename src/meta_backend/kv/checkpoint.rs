@@ -1128,11 +1128,14 @@ pub struct CycleTermWindow {
     next: usize,
 }
 
-/// The horizon of [`CycleTermWindow`], in cycles: [`COVER_CYCLES_MAX`] —
+/// The horizon of [`CycleTermWindow`], in CYCLES: [`COVER_CYCLES_MAX`] —
 /// the ONE cycle-count bound every "cycle until the tail covers X" loop
 /// runs to, so a burst is remembered for as long as any cover loop would
-/// wait on it (64 at the shipped constants; ≈ 1 minute at the shipped
-/// cadence). Tie-tested (`derivation_sweep_tests`).
+/// wait on it (64 at the shipped constants). A count of cycles, never a
+/// duration: at the full trigger 64 cycles is about a minute, at a
+/// trigger of 0 (a term at the max age) or inside a handover's
+/// `checkpoint_now` loop the horizon passes in seconds (review round 1,
+/// Issue 8). Tie-tested (`derivation_sweep_tests`).
 pub const TERM_HORIZON_CYCLES: usize = COVER_CYCLES_MAX as usize;
 
 impl Default for CycleTermWindow {

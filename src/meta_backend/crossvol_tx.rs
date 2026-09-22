@@ -2433,6 +2433,23 @@ async fn ship_step(
 /// holder (symmetric PR 6 — the seam the module docs name, made real:
 /// the remote leg replaces this call and only this call). `rider` rides
 /// a LOCAL step only (an intent is the initiator's ring's record).
+/// The arm [`apply_or_ship_step`] TOOK for one attempt — answered beside
+/// the outcome so a caller classifies the outcome by the dispatch that
+/// produced it (PR 13e review round 1, Issue 3: a second `step_home` read
+/// ahead of the dispatch could disagree with the arm the dispatch
+/// resolved — a release landing between the two reads dispatched SHIPPED
+/// under a `Local` word, and a holder's witness refusal read as a local
+/// skip: the "acked with its name nowhere" face, narrowed to a two-read
+/// window).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dispatch {
+    /// Applied at this mount's door.
+    Local,
+    /// Shipped to the slot's holder (or found it unreachable — a foreign
+    /// home either way).
+    Shipped,
+}
+
 async fn apply_or_ship_step(
     routed: &RoutedMetaBackend,
     tx_id: u64,
@@ -2442,102 +2459,120 @@ async fn apply_or_ship_step(
     local: &XvLocalStep,
     rider: Option<&XvRider>,
     guards: Arc<[dlm::DlmGuard]>,
-) -> Result<XvStepOutcome> {
+) -> (Dispatch, Result<XvStepOutcome>) {
     match step_home_bound(routed, v_idx, local.local_home()).await {
-        StepHome::Local => {
-            // The op's guard set must cover the step's keys (Issue 8c). A
-            // FRESH MINT is exempt (PR 12): its ino was allocated by this
-            // op and nothing names it until the op's own dentry step
-            // lands, so the 4a law takes no `I{ino}` on it — the local
-            // create path holds none either — and there is no guard the
-            // scope could cover. A key the scope does NOT cover is a slot
-            // that moved TO this initiator between the acquisition and
-            // this step — its guards travelled to the old holder (PR 13b:
-            // defect 29's re-dispatch, one step further — the dominance
-            // rule or PR 10's recovery handed the slot to the initiator
-            // under a shipped step; the `sym-storm` manager applied its
-            // `set_nlink` unguarded and tripped `xv_local_step_unguarded`).
-            // A legal schedule, so the step takes its OWN guards for the
-            // apply — in the NON-PARKING canonical form: a parking acquire
-            // while the op holds its other guards could cycle with a
-            // peer's canonical set. A contended stripe is the slot-moved
-            // retryable class (the bounded re-dispatch; past it the intent
-            // stays open for the cadence), never an unguarded apply.
-            let scope = scope_of(&guards);
-            let mut late_guards: Vec<dlm::DlmGuard> = Vec::new();
-            if scope != 0 && !local.is_fresh_mint() {
-                let dlm = routed.volumes[v_idx].dlm();
-                let needed = step_stripes(dlm, v_idx, local);
-                // Covered by the op's local set, or by its OWN scope parked
-                // in this table (the one-process holder model) — nothing to
-                // take; only a key guarded NOWHERE here takes late guards.
-                if local_scope_covers(scope, &needed) == Some(false)
-                    && !own_parked_scope_covers(scope, &needed)
-                {
-                    let (inos, dents) = step_guard_keys(local);
-                    let d: Vec<(Ino, &str, dlm::LockMode)> = dents
-                        .iter()
-                        .map(|(p, n)| (*p, n.as_str(), dlm::LockMode::Exclusive))
-                        .collect();
-                    match dlm.try_lock_many(&inos, &d) {
-                        Some(g) => {
-                            XV_CO_STEP_LATE_GUARDS.fetch_add(1, Ordering::Relaxed);
-                            late_guards = g;
-                        }
-                        None => {
-                            XV_CO_STEP_LATE_GUARD_REFUSALS.fetch_add(1, Ordering::Relaxed);
-                            let slot = crate::meta_backend::kv::record::forest_slot_of_ino(
-                                local.local_home(),
-                            );
-                            return Err(SqueezefsError::retryable(
-                                crate::error::RefusalClass::SlotMoved { slot, holder: 0 },
-                                format!(
-                                    "cross-owner transaction {tx_id:016x}: local step \
-                                     {step_idx} ({}) of slot {slot} — moved to this mount \
-                                     mid-plan, its guards travelled to the old holder — found \
-                                     its own guards contended; retry \
-                                     (xv_cross_owner_step_late_guard_refusals)",
-                                    step.name()
-                                ),
-                            ));
-                        }
-                    }
-                }
-            }
-            if TEST_XV_LOCAL_STEP_SLOT_BUSY
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-            {
-                // The door's own word for a slot that moved: refused
-                // before any effect, exactly as `ensure_leases_for_tx`
-                // answers a foreign slot.
-                return Err(crate::meta_backend::kv::KvError::SlotBusy {
-                    slot: crate::meta_backend::kv::record::forest_slot_of_ino(local.local_home()),
-                    holder: 0,
-                    g: 0,
-                }
-                .into());
-            }
-            let out = routed.volumes[v_idx]
-                .xv_apply_step(local, rider, guards, false)
-                .await;
-            // The step's own guards (if any) live to its terminal outcome.
-            drop(late_guards);
-            if out.is_err() {
-                routed.mirror_volume_failure(v_idx);
-            }
-            let out = out?;
-            out.count();
-            Ok(out)
-        }
+        StepHome::Local => (
+            Dispatch::Local,
+            apply_step_locally(routed, tx_id, step_idx, v_idx, step, local, rider, guards).await,
+        ),
         // The HOLDER counts the outcome on the S3.5 step ledger (the
         // effect committed there); the initiator counts the ship. The
         // step travels under the op's guard scope.
-        StepHome::Foreign { holder, endpoint } => {
-            ship_step(&endpoint, holder, tx_id, step_idx, step, scope_of(&guards)).await
-        }
-        StepHome::Unreachable { holder } => Err(unreachable_error(holder, step.name())),
+        StepHome::Foreign { holder, endpoint } => (
+            Dispatch::Shipped,
+            ship_step(&endpoint, holder, tx_id, step_idx, step, scope_of(&guards)).await,
+        ),
+        StepHome::Unreachable { holder } => (
+            Dispatch::Shipped,
+            Err(unreachable_error(holder, step.name())),
+        ),
     }
+}
+
+/// The LOCAL arm of [`apply_or_ship_step`].
+async fn apply_step_locally(
+    routed: &RoutedMetaBackend,
+    tx_id: u64,
+    step_idx: usize,
+    v_idx: usize,
+    step: &XvStep,
+    local: &XvLocalStep,
+    rider: Option<&XvRider>,
+    guards: Arc<[dlm::DlmGuard]>,
+) -> Result<XvStepOutcome> {
+    // The op's guard set must cover the step's keys (Issue 8c). A
+    // FRESH MINT is exempt (PR 12): its ino was allocated by this
+    // op and nothing names it until the op's own dentry step
+    // lands, so the 4a law takes no `I{ino}` on it — the local
+    // create path holds none either — and there is no guard the
+    // scope could cover. A key the scope does NOT cover is a slot
+    // that moved TO this initiator between the acquisition and
+    // this step — its guards travelled to the old holder (PR 13b:
+    // defect 29's re-dispatch, one step further — the dominance
+    // rule or PR 10's recovery handed the slot to the initiator
+    // under a shipped step; the `sym-storm` manager applied its
+    // `set_nlink` unguarded and tripped `xv_local_step_unguarded`).
+    // A legal schedule, so the step takes its OWN guards for the
+    // apply — in the NON-PARKING canonical form: a parking acquire
+    // while the op holds its other guards could cycle with a
+    // peer's canonical set. A contended stripe is the slot-moved
+    // retryable class (the bounded re-dispatch; past it the intent
+    // stays open for the cadence), never an unguarded apply.
+    let scope = scope_of(&guards);
+    let mut late_guards: Vec<dlm::DlmGuard> = Vec::new();
+    if scope != 0 && !local.is_fresh_mint() {
+        let dlm = routed.volumes[v_idx].dlm();
+        let needed = step_stripes(dlm, v_idx, local);
+        // Covered by the op's local set, or by its OWN scope parked
+        // in this table (the one-process holder model) — nothing to
+        // take; only a key guarded NOWHERE here takes late guards.
+        if local_scope_covers(scope, &needed) == Some(false)
+            && !own_parked_scope_covers(scope, &needed)
+        {
+            let (inos, dents) = step_guard_keys(local);
+            let d: Vec<(Ino, &str, dlm::LockMode)> = dents
+                .iter()
+                .map(|(p, n)| (*p, n.as_str(), dlm::LockMode::Exclusive))
+                .collect();
+            match dlm.try_lock_many(&inos, &d) {
+                Some(g) => {
+                    XV_CO_STEP_LATE_GUARDS.fetch_add(1, Ordering::Relaxed);
+                    late_guards = g;
+                }
+                None => {
+                    XV_CO_STEP_LATE_GUARD_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                    let slot =
+                        crate::meta_backend::kv::record::forest_slot_of_ino(local.local_home());
+                    return Err(SqueezefsError::retryable(
+                        crate::error::RefusalClass::SlotMoved { slot, holder: 0 },
+                        format!(
+                            "cross-owner transaction {tx_id:016x}: local step \
+                             {step_idx} ({}) of slot {slot} — moved to this mount \
+                             mid-plan, its guards travelled to the old holder — found \
+                             its own guards contended; retry \
+                             (xv_cross_owner_step_late_guard_refusals)",
+                            step.name()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    if TEST_XV_LOCAL_STEP_SLOT_BUSY
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
+    {
+        // The door's own word for a slot that moved: refused
+        // before any effect, exactly as `ensure_leases_for_tx`
+        // answers a foreign slot.
+        return Err(crate::meta_backend::kv::KvError::SlotBusy {
+            slot: crate::meta_backend::kv::record::forest_slot_of_ino(local.local_home()),
+            holder: 0,
+            g: 0,
+        }
+        .into());
+    }
+    let out = routed.volumes[v_idx]
+        .xv_apply_step(local, rider, guards, false)
+        .await;
+    // The step's own guards (if any) live to its terminal outcome.
+    drop(late_guards);
+    if out.is_err() {
+        routed.mirror_volume_failure(v_idx);
+    }
+    let out = out?;
+    out.count();
+    Ok(out)
 }
 
 /// [`apply_or_ship_step`] with the SLOT-MOVED retry (PR 13, defect 29 —
@@ -2553,8 +2588,9 @@ async fn apply_or_ship_step(
 /// and dispatch again, locally when it is ours now, to the new holder
 /// otherwise; bounded — a second stale answer is the retryable class
 /// the caller sees (the intent stays open, the cadence completes it).
-/// Answers the outcome WITH the dispatch mode of the attempt that
-/// produced it (`shipped`): a witness refusal is classified by how the
+/// Answers the outcome WITH the arm the producing attempt TOOK
+/// (`Dispatch` — the one `apply_or_ship_step` resolved and dispatched on,
+/// never a second table read): a witness refusal is classified by how the
 /// step travelled, never by re-resolving its home after the fact (PR
 /// 13e, F-R4 — a slot that moved to the initiator during the ship read
 /// `Local` after it, and a holder's refusal was taken for a local skip:
@@ -2568,15 +2604,11 @@ async fn apply_or_ship_step_retrying(
     local: &XvLocalStep,
     rider: Option<&XvRider>,
     guards: Arc<[dlm::DlmGuard]>,
-) -> Result<(XvStepOutcome, bool)> {
+) -> (Dispatch, Result<XvStepOutcome>) {
     const SLOT_MOVED_RETRIES: usize = 2;
     let mut attempt = 0;
     loop {
-        let shipped = !matches!(
-            step_home(routed, v_idx, local.local_home()),
-            StepHome::Local
-        );
-        match apply_or_ship_step(
+        let (dispatch, r) = apply_or_ship_step(
             routed,
             tx_id,
             step_idx,
@@ -2586,8 +2618,8 @@ async fn apply_or_ship_step_retrying(
             rider,
             guards.clone(),
         )
-        .await
-        {
+        .await;
+        match r {
             // A shipped step's holder (defect 29) OR this mount's own door
             // (defect 35, PR 13): a LOCAL step whose slot another appender
             // took between the plan and the door is the same slot-moved
@@ -2605,14 +2637,13 @@ async fn apply_or_ship_step_retrying(
                      {} because the slot moved ({e}); re-resolved, attempt {attempt} of \
                      {SLOT_MOVED_RETRIES}",
                     step.name(),
-                    if shipped {
-                        "at its holder"
-                    } else {
-                        "at this mount's door"
+                    match dispatch {
+                        Dispatch::Shipped => "at its holder",
+                        Dispatch::Local => "at this mount's door",
                     }
                 );
             }
-            other => return other.map(|o| (o, shipped)),
+            other => return (dispatch, other),
         }
     }
 }
@@ -2779,12 +2810,7 @@ pub async fn execute(
         }
         let rider = (i == 0 && step0_local).then_some(&put);
         let t_step = std::time::Instant::now();
-        let local_step = !(i == 0 && step0_local)
-            && matches!(
-                step_home(routed, *v_idx, local.local_home()),
-                StepHome::Local
-            );
-        match apply_or_ship_step_retrying(
+        let (dispatch, r) = apply_or_ship_step_retrying(
             routed,
             tx_id,
             i,
@@ -2794,9 +2820,13 @@ pub async fn execute(
             rider,
             guards.clone(),
         )
-        .await
-        {
-            Ok((o, shipped)) => {
+        .await;
+        // The arm the producing attempt TOOK (review round 1, Issue 3) —
+        // never a second table read ahead of the dispatch.
+        let shipped = dispatch == Dispatch::Shipped;
+        let local_step = !(i == 0 && step0_local) && !shipped;
+        match r {
+            Ok(o) => {
                 if i == 0 && step0_local {
                     // Counted only once the intent record is DURABLE (it
                     // rode this commit): `started` therefore means "an
@@ -2837,9 +2867,9 @@ pub async fn execute(
                     note_intent_never_durable(tx_id);
                     return Err(e);
                 }
-                // Classified by the mode the step was DISPATCHED in
-                // (`local_step` read before the dispatch), never by
-                // re-resolving its home after the fact: a slot that moved
+                // Classified by the arm the step was DISPATCHED on
+                // (`Dispatch`, the attempt's own), never by re-resolving
+                // its home after the fact: a slot that moved
                 // to THIS initiator during the ship reads `Local` now, and
                 // the shipped refusal was taken for a local device error —
                 // the fail-stop (defect 29).
@@ -3093,8 +3123,9 @@ async fn compensate_live_refusal(
             continue;
         };
         let (iv, il) = localise(routed, &inverse);
-        let out =
-            apply_or_ship_step(routed, tx_id, i, iv, &inverse, &il, rider, guards.clone()).await?;
+        let (_dispatch, out) =
+            apply_or_ship_step(routed, tx_id, i, iv, &inverse, &il, rider, guards.clone()).await;
+        let out = out?;
         retired |= rides_here;
         if out.status == XvStepStatus::ForeignSkipped {
             log::error!(
@@ -3411,15 +3442,11 @@ async fn recover_one(routed: &RoutedMetaBackend, o: &OpenIntent) -> Result<bool>
     note_intent_adopted(rec.tx_id);
 
     for (i, (v_idx, local)) in localised.iter().enumerate() {
-        // The dispatch mode read BEFORE the dispatch (defect 29's law): a
-        // slot that moved to this mount during the ship reads `Local`
-        // after it, and the shipped refusal must never be taken for a
-        // local device error.
-        let shipped = !matches!(
-            step_home(routed, *v_idx, local.local_home()),
-            StepHome::Local
-        );
-        let out = match apply_or_ship_step_retrying(
+        // Classified by the arm the attempt TOOK (defect 29's law, made the
+        // dispatch's own word — review round 1, Issue 3): a slot that moved
+        // to this mount during the ship reads `Local` after it, and the
+        // shipped refusal must never be taken for a local device error.
+        let (dispatch, r) = apply_or_ship_step_retrying(
             routed,
             rec.tx_id,
             i,
@@ -3429,9 +3456,10 @@ async fn recover_one(routed: &RoutedMetaBackend, o: &OpenIntent) -> Result<bool>
             None,
             Arc::clone(&guards),
         )
-        .await
-        {
-            Ok((out, _)) => out,
+        .await;
+        let shipped = dispatch == Dispatch::Shipped;
+        let out = match r {
+            Ok(out) => out,
             // A shipped step's unreachable holder, OR a LOCAL step whose
             // slot moved away past the retry bound (`execute`'s own arm —
             // PR 13 review round 1, Issue 13: before it the roll-forward

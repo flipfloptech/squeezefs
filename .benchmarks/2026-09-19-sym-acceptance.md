@@ -855,6 +855,42 @@ The finding is a PRODUCT regression on the flat path: the design's gate
 1 says "within noise", and −3.4…−5.8 % in both orders of two brackets on
 1.5–5.2 % bands is not noise. Reported; nothing changed in the tree for it.
 
+**→ PR 13c (`fix/sym-box-campaign`, the gate-1 commit) — attributed, three
+unarmed-path costs deleted, the rename fix's cost priced.** (i) The laptop's
+in-process routed+KV microbench (`tests/meta_flat_path_microbench.rs`, 4
+threads × 40 k ops, A-B-B-A against `3228fcb8`, SCOPING): create / mkdir /
+unlink at par (±0.5 of 23–26 µs/op), rename +0.4–1.6 µs (the PR-4 lock-set
+fix's second lookup + `I{moved}` guard), lookup / getattr +30–80 ns. (ii) The
+laptop mount A-B-B-A (`run_mdstorm.sh`, scale 25, `SQUEEZEFS_OP_PROFILE=1`,
+SCOPING): `dlm_guard_hold` +24.8 k per leg = +1 guard per rename (the box's
++100 k at scale 100); `fuse3-tpc` 23.5 → 24.65 µs per FUSE op (A → B, 459 k
+ops per leg); `unlink.backend` 117–123 → 125 µs, `rename.backend` 51–53 →
+54–56, `lookup.backend` 5.8–6.0 → 6.2–6.4. (iii) **The ONE approved `perf
+record` leg per arm on the box** (the flat mdstorm at scale 50 on `/dev/shm`,
+45 s of the daemon at 499 Hz; `fuse3-tpc*` samples 24,801 (A) → 25,384 (B),
++2.4 %): `__memmove_avx512_unaligned_erms` +280 samples (782 → 1,062, +36 %
+— HALF the delta; glibc stops the frame-pointer chain, the callers are
+unnamed), the `RouteTable` arc-swap loads +78 (`arc_swap::debt::LocalNode::
+with<HybridProtection<Arc<RouteTable>>>` — the added `route_ino` calls at
+the routed entry points), moka +71 / jemalloc +72 (the memo feed's insert +
+`Arc<str>` per mkdir and the attr cache's policy churn), `DlmLockManager::
+lock_stripe` +32 (the rename guard), `token_serve::{closure}` +30 (the read
+verbs' divert layers); `event_listener` −187 (retired for `sqz_notify` —
+a win). Fixed: `stripe_map` / `stripe_unlink_prelude` answer an unarmed set
+in one `Option` probe per volume BEFORE any route-table load; the
+directory-parent memo is fed on an ARMED set only (no moka insert, no
+`Arc<str>` per `mkdir` on a flat mount — pinned:
+`an_unarmed_mount_feeds_the_directory_parent_memo_nothing`); `token_serve`
+returns a flat volume in two probes. The laptop's C-A-A-C re-read on the
+fixed tree (SCOPING): `fuse3-tpc` 24.35 µs/op (C) vs 23.5 (A) vs 24.65 (B),
+`unlink.backend` back at par (115–123), `rename.backend` 55–56 (the lock-set
+fix's cost, ≈ +2.6 µs — it STAYS: a shipped-bug fix), `lookup.backend`
+6.1–6.2. **What remains for the box bracket on PR 13c's binary**: the rename
+fix's priced cost and the memmove term (a per-op state-size growth of the
+routed mutation futures across PRs 6 / 7b / 13b — nameable only with a
+dwarf-unwound leg, not run). The venue law: no laptop number above is a
+verdict.
+
 ##### 3.9.1b Harness findings (PR 1's rig, both brackets)
 
 1. **The fio window is 30 s, not the rig's `RT=60`.** The box's job files

@@ -1440,12 +1440,17 @@ on the same binary and the same box.**
 
 **F-R2 — PRODUCT FINDING on the SHIPPED S8/S10 path (the A arm; reported,
 not fixed here):** the authority burns **1.66 ms of `sqz-meta` CPU per
-served create** — `meta_ship_owner_dispatch_ns.run` mean 1,657 µs
-against `meta_ship_owner_phase_ns.execute` 18 µs at N = 2 (1,917 / 122 µs
-at N = 4, 2,717 / 337 µs at N = 8), `daemon_cpu_ns_by_class.sqz-meta`
-217 of the authority's 230 CPU-s over the N = 2 create phase (1,443
-CPU-s at N = 8), the co-writer's `meta_ship_phase_ns.rtt` 1.7 ms per
-verb with `queue_wait` 235 µs. The site: `MetaShipService::
+served create** — the PER-ROW deltas (`pn{n}0 → pn{n}c`, `sum_ns ÷
+count`): `meta_ship_owner_dispatch_ns.run` **1,658 µs** against
+`meta_ship_owner_phase_ns.execute` **18 µs** at N = 2 (n = 130,926 /
+131,317); **1,817 / 237 µs at N = 4** (n = 389,299 / 390,997); **2,429 /
+869 µs at N = 8** (n = 897,427 / 902,086) — the served `execute` term
+itself GROWS 18 → 237 → 869 µs with N (the owner's dispatch contention
+under 3 / 7 concurrent lanes) while `run − execute` (the readdir below)
+stays 1.5–1.6 ms; `daemon_cpu_ns_by_class.sqz-meta` **217 of the
+authority's 231 CPU-s** over the N = 2 create phase (621 of 645 at N =
+4, **1,392 of 1,443** at N = 8), the co-writer's `meta_ship_phase_ns.rtt`
+1.7 ms per verb with `queue_wait` 235 µs at N = 2. The site: `MetaShipService::
 issue_update_grant` (`src/meta_ship/service.rs:1216`) — for EVERY shipped
 `CreateWithRdev` the owner reads the parent's census with
 `readdir_local(dir, 0, census_max + 1)` BEFORE the over-budget decline,

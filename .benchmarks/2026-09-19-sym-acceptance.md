@@ -3479,6 +3479,170 @@ body is PR 15's to move (untouched here). No product change: a records-
 only stripe grant riding something cheaper than a token would be a new
 economy, not a fix.
 
+### 4.4ak PR 13e — F-R3, FIXED (PR 6 × PR 12b, the armed plane; P0): a cross-owner unlink / rmdir / link / rename-over / directory move of a FOREIGN-minted child read its `(pre, post)` witness off this daemon's PROJECTION — `None`, the count step dropped, the name removed alone, the inode orphaned
+
+**Found by the box re-run's `sym-foreign-touch` leg** (the box-rerun
+record's §3.9.4.3 on `77f4da1d`: the end-of-leg `rm -rf` of the job trees
+logged 430 of 512 children "no inode record — removing the dangling
+name", one orphaned inode per cross-owner unlink of a child ANOTHER
+appender minted). **Mechanism:** PR 6's plan builders (`unlink_at`,
+`link_body`, `rename_body`'s overwritten destination and parent shift,
+the compensation's inverse insert, `dir_stripe`'s shadowed migrate loser)
+read the child's inode record with `read_inode_value_routed` — a LOCAL
+read of this daemon's tree of the child's slot, which under KD-SYM-3 is a
+stale PROJECTION whenever another appender leases that slot (a leased
+slot's root rides its lessee's PAGE; the projection knows nothing minted
+after the last checkpoint it refreshed from). A create the touching
+requester minted in ITS rotor and shipped the dentry for lands in the
+requester's slot tree; the holder of the parent later removes the name
+through its own mount, reads the child's record from its projection of
+the requester's slot — `None` — and PR 6's `None ⇒ no count step` arm
+(written for "the record is genuinely gone") ships `RemoveDentry` alone:
+the name is gone, the record stands at `nlink 1` in the requester's tree
+for ever, invisible to fsck C9 while the requester lives (the inode plane
+scopes out live foreign lessees' slots — PR 12b round 1's law) and
+FOUND at the requester's leave. **Fix (`7ac93d4e`):**
+`KvMetaBackend::read_inode_witness` is the ONE witness read of every
+plan-builder site — through the writer's read divert (`token_serve` →
+the holder's token plane, one grant, already held from the `lookup` that
+precedes an `rm`, recalled by the very step the plan then ships) for a
+slot another appender leases; the local record verbatim for a slot this
+mount leases or maintains and on every unarmed / flat mount (PR 1's law —
+pinned: `sym_cross_owner_tests::the_unarmed_and_flat_paths_ship_nothing_
+and_lock_nothing` reads the witness ≡ `read_inode_value_routed` byte for
+byte at every step, the last unlink's `nlink 0` record and an absent
+record's `Ok(None)` included, both F-R3 gauges 0). A local `None` on a
+slot a LIVE foreign appender leases — no divert reached the holder, or
+the slot moved under the read — REFUSES the retryable class
+(`xv_cross_owner_witness_refusals`, the belt: a projection's absence is no
+witness); the "no inode record — removing the dangling name" arm counts
+`xv_cross_owner_dangling_names`, a **must-stay-0 tripwire on an armed
+mount**. A found accounting defect beside it (`23232a9b`): a joined
+holder's `OfferSlot` answered `Busy`/`Refused` was a `joined_wire_failure`
+— the manager's legal word is `Ok(false)`. **Pins (`440f860a`, RED on the
+base with the exact log line, GREEN on the fix):**
+`sym_n_daemon_tests::a_cross_owner_unlink_of_a_foreign_minted_child_reads_
+its_witness_at_the_holder` (three daemons: the child minted by joiner 2
+into joiner 1's directory, unlinked through joiner 1 — `nlink` 0 at the
+holder and every mount, no dangling-name line, the record gone at the
+requester's leave) and `…_link_rename_over_and_directory_move_read_their_
+witnesses_at_the_holder`. **Fleet proof (laptop, "it works"):**
+`tests/run_mw_matrix.sh sym-foreign-touch` gained `sym_post_leave_census`
+— zero "no inode record" lines across the writers' logs after the leg's
+`rm -rf`, the dangling-name gauge 0 on every writer, then EVERY joiner
+LEAVES and the manager's online fsck `--json` covers the inode plane on
+every volume and reads C9 = C10 = 0 (the live oracle was never a C9
+verdict, by the harness's own note); the run's numbers are in PR 13e's
+report.
+
+### 4.4al PR 13e — F-R4, FIXED (PR 6 × PR 4's handover): a create into a directory whose slot moved TO the creator mid-plan answered `ENOENT` — the old holder's live-witness refusal after its release surfaced as the op's errno
+
+**Found by the box re-run's `sym-foreign-touch` IDLE phase** (§3.9.4.3 of
+the box-rerun record: one `ENOENT` on a 64-touch burst into a directory
+whose slot the burst was moving to the toucher). **Mechanism (the
+hypothesis confirmed by the pin):** the initiator resolved the parent's
+slot to the OLD holder and shipped `InsertDentry`; the holder had released
+the slot (its lease gate `Releasing` → the door drained → tree 0
+`Unleased` → the requester's grant) between the resolve and the serve, so
+`xv_serve_step`'s `refuse_dying_parent` read the parent from a tree it no
+longer leased — `NotFound` — and answered the PR 7b WITNESS refusal
+(`ForeignSkipped`, "the parent is dying"), which the initiator's
+`foreign_skipped_errno` turned into the op's `ENOENT`; defects 29 / 30 /
+35's family, at the one site that judged a witness under a lease it had
+lost. **Fix (`f8da35ad`):** `xv_serve_step` checks the lease FIRST and
+again inside the `InsertDentry` arm's refusal — a served step for a slot
+this holder does not lease is the typed `RefusalClass::SlotMoved { slot,
+holder }` (EAGAIN on the wire) naming tree 0's lessee, never the op's
+errno; `apply_or_ship_step_retrying` reports whether the step SHIPPED, and
+`execute` classifies a witness refusal as the op's errno only when it was
+judged HERE or at a holder that still leases the slot (the slot-moved
+class re-resolves through tree 0 and re-dispatches — defect 29's arm).
+Beside it, `install_wire_grant` adopts the transferred tree
+(`adopt_transferred_slot_tree`) BEFORE it names the new lessee in the
+RAM table (the first order let a served step on the new holder read the
+pre-transfer projection for one window). Seams:
+`TEST_XV_SERVE_PARK_AFTER_LEASE_CHECK` (the holder parked after its lease
+check), `TEST_WIRE_GRANT_PARK_MID_INSTALL` (the grant parked between the
+adoption and the words). **Pin (`330913c8`, RED on the base with the
+exact `ENOENT`; GREEN ×3 on the fix):** `sym_n_daemon_tests::a_create_into_
+a_directory_whose_slot_moves_to_the_creator_mid_plan_never_answers_enoent`
+— the create lands, `nlink` 2 at the holder, the name resolves at the
+old holder's mount.
+
+### 4.4am PR 13e — F-B1, FIXED as a DERIVATION (PR 2's KD-SYM-10 cadence): `appender_flush_ceiling_overruns` tripped on the box with PR 13c's exclusion excusing NOTHING — the excess was the cadence's OWN term, which the ceiling's `trigger + 2 ticks` never priced
+
+**Found on the box** (§3.9.2 four times in 12 min at 1–32 ms past the
+1,100 ms landing ceiling; the box-rerun record's §3.9.4 six increments on
+five writers in 45 min, the two with a WARN line 16 / 106 ms past it,
+`excused_ns` 0 on every writer, one trip on a QUIET joiner, three
+"between the rows" in each writer's `rm -rf` + the joins). **Attribution
+(the kept `.stats` `scale-r1/symscale-1790081892/m*_pn*.json` + the
+code):** the device writes are µs-class (p99 ≤ 1 ms),
+`free_grace_checkpoint_cycle_ms` 0–7, no recovery, no service hold — no
+other actor. KD-SYM-10's ceiling prices the tick wait and ONE period of
+the tick's work; two terms sat outside it: (1) the cycle's own PRE-BARRIER
+WALL — `publish_forest_roots`, the flush pass (an SMO barriers its
+successor images, so a pass wall is `(SMOs + 1) × barrier`), the bitmap
+pages, barrier #1 (at N regions their page writes) — and (2) the age
+decision `last_checkpoint.elapsed() ≥ 1000` ran from the previous cycle's
+END, so its post-barrier tail (the grant cadence's `ReturnExtents` /
+refills per region — control entries, page writes and barriers;
+`grow_stalled_regions`; the merge sweep's one-tick budget) ate the margin
+too; the pin's debug tape added a third — the tick's own device work AHEAD
+of its decision (the deferred-flush barrier + a maintenance item's SMO
+barrier past the drain deadline), 26–272 ms against a 50 ms tick. A leaf
+dirtied right after a cycle's collection aged `tail + trigger + late +
+wall` at its covering barrier and the audit — correctly — counted it.
+**Fix (`57f5d214`, a derivation, never a widened constant — §7 item 3):**
+on a volume with an appender set (every bit-17 forest — the population the
+audit judges) the age law runs from the LAST COLLECTION
+(`checkpoint_collected_ns`, set by every cycle path — a leaf dirtied after
+a collection is the next cycle's) against
+`checkpoint::checkpoint_trigger_ms(ceiling, term_hwm)` = `max_age −
+HWM(term)`, where ONE cycle's landing TERM (`checkpoint_cycle_term_ns
+(wall, late, tick)` = `wall + (late − tick)⁺`) is its pre-barrier wall
+plus the decision's lateness past the trigger BEYOND one tick — the tick
+quantization IS the ceiling's first priced tick; the excess is the
+pre-decision device work the second tick bounds at one period — less the
+lateness spent parked behind a STRUCTURAL hold (PR 13c's excused class,
+accounted there; anticipating it would fire every tick for the mark's
+memory after every long service); the HWM is a decayed HIGH-WATER MARK
+`max(sample, prev − prev/8)` (`anticipated_cycle_term_ns` — a bound must
+be anticipated by a bound: the first build's EWMA mean left 3 of 6 cycles
+overrunning). The published ceiling never widens (a cycle slower than its
+anticipated term still trips the audit — the tripwire keeps its teeth); a
+term at or past the ceiling makes a cycle due every tick, the honest
+response to a device that cannot land the promise. A FLAT volume keeps the
+shipped law VERBATIM (`tick` keeps `last_checkpoint`; the dispatch is
+`appenders().is_some()`). Published per volume:
+`meta_kv_checkpoint_term_ms`, `meta_kv_checkpoint_trigger_ms`; the
+per-cycle instrument the box-rerun's item 13 named is the debug tape
+`checkpoint: cycle … pre-barrier wall N ms = publish + flush (dirty, SMOs)
++ pages + barrier` and `cycle due by age … decided N ms past the
+trigger`. **Pin (`96d5e98d` + `808667fc`, RED on the base; `57f5d214`
+GREEN):** `sym_appender_tests::the_cadence_anticipates_the_measured_cycle_
+wall_so_a_slow_barrier_lands_inside_the_ceiling` — the box's shape: the
+ARMED plane with the box's affinity order (`Knobs::armed().affinity_mb
+("16")`; the 64 MiB fixture's derived ceiling is the one-extent floor,
+which a one-leaf tree sits AT and spills to the 64-rotor — 60–68 dirty
+leaves + 1–2 SMOs per cycle and 64 per-tree maintenance items ahead of
+every decision), the shipped 256 KiB node / 8 MiB ring, ONE directory
+leaf, one creator, a 60 ms barrier armed after a clean checkpoint, two
+warm cycles, five intervals: **RED on the base cadence (1 overrun at
+1,470 ms in 5 cycles — 370 ms past the ceiling), GREEN with the fix (0
+overruns in 7 cadence cycles; the trigger 780 / 808 / 665 / 707 / 744 /
+776 / 743 ms anticipating terms of 220 / 192 / 335 / 293 / 256 / 224 /
+257 ms)**. The first shape (64 KiB nodes, the unarmed 64-rotor, four
+creators, a 150 ms barrier) was retired in the rung: its walls were
+355–1,204 ms — past the ceiling ITSELF, a geometry × latency verdict no
+cadence can land, and not the box's bounded 16–106 ms. PR 13c's four
+ceiling contracts stay green (the service-hold pin dirties its step-3 leaf
+UNDER the hold: its step-2 parked device teaches the cadence a term past
+the ceiling, and a leaf dirtied before the hold is then flushed inside
+one tick); the three fns are tie-tested in `derivation_sweep_tests`.
+**The box re-run on this binary is what says the derivation priced the
+box's term** — the laptop readings above are the mechanism's.
+
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
 `sym-shared-dir-ls` on the defect-16 binary read `meta_kv_node_cache_
@@ -3730,7 +3894,17 @@ counted decline, a bounded window or a stated venue):
    closes the box's "no recovery in flight" class as far as such holds
    explain it; **the margin's derivation from the measured pass wall
    stays THIS item, PR 14's**, and the box re-run on PR 13c's binary
-   says what remains for it to price.
+   says what remains for it to price. **PR 13e (F-B1, §4.4am — the
+   derivation LANDED):** a forest volume's cadence fires
+   `checkpoint_trigger_ms(ceiling, term_hwm)` = `max_age − HWM(term)` from
+   the LAST COLLECTION, the term = the cycle's measured pre-barrier wall +
+   the decision's lateness beyond one tick (a structural hold's overlap
+   excluded), the HWM a decayed high-water mark; the published ceiling
+   never widens, the flat cadence is byte-identical; RED-first on the
+   box's shape, published `meta_kv_checkpoint_{term,trigger}_ms`. **What
+   stays for the box re-run (PR 14):** the counted rows on this binary —
+   the derivation is judged on whether the box's 16–106 ms terms land
+   inside the ceiling there (the laptop reads the mechanism only).
 3b. **`sym-storm` ×10 from zero on the final binary** (§3.8): re-run in
    fix round 1 under `--venue=laptop` — §3.8b carries the count and the
    per-round venue-attributed readings; whatever count stands there is
@@ -4059,6 +4233,8 @@ Laptop-side: `/tmp/grok-justin/box-rerun/{arms,gate1,gate1-rev,perf-phases,nw}`
 > **What PR 14 flips on, restated once more:** F-R3 fixed and pinned (the witness at the child's holder), F-B1's margin DERIVED from a pass wall that is MEASURED first (the per-cycle instrument), with the box's two logged ages (16 / 106 ms past) and the four unlogged increments as its input and the six re-read as 0, F-R4 in the retryable class, gate 1's setattr future shrunk (or the −3.3…−4.4 % on rename / unlink adjudicated as the shipped-bug fixes' price with the owner's word), the storm ×10 from zero on that binary — then the flip binary's box brackets of EVERY gate (2 and 3b included). Nothing in this rung's product findings is a class the design did not state: F-R3 is PR 6's deviation (3) left standing on the N-daemon fleet; F-B1 is §7 item 3 exactly; F-R2 is the shipped path the flip retires.
 >
 > **Status (PR 13c, the box campaign — `fix/sym-box-campaign`, 2026-09-22): what LANDED against the list above, and what still stands.** *Landed, red-first:* **F-B3** — the listener cap derives from the RAW root × the shipped factor, ceilinged by the fd budget (`RLIMIT_NOFILE / 8`), a refused dial retries from the accept tick to the dial bound then surfaces the typed `ListenerRefused`, a token reader's ROOT attr survives a transient wire class (the `.stats` EINVAL), and the first 32-member fleet FORMED on the laptop (§3.9.2's "→ fixed"; H-C1 / H-C2 the harness shapes it uncovered); **F-B2** — the dominance rule's `ops_h` counts the holder's work on the slot's SUBTREE across volumes (design §5.1.4 as built, the hint's two error directions and the root-ward consequence stated); **F-B1** — the flush-ceiling audit EXCLUDES the SMO mutex's structural holds: an overlap-bounded exclusion (over-excuse ≤ one cadence tick per hold), each class CAPPED at a published bound (a recovery's at `appender_recovery_bound_ms`, a service hold's at one landing ceiling — `appender_flush_ceiling_service_cap_ms`), the excused Σ published (`appender_flush_ceiling_excused_{ns,max_ms}`), the pass's own wall (its device time, its wait on a peer) never excused; **the gate-1 flat path** — three unarmed-path costs deleted (`stripes_armed_any`, the memo fed on an armed set only, `token_serve`'s two-probe return), the rename lock-set fix's +1 guard priced and kept, and the startup `RLIMIT_NOFILE` raise confined to the listener caps (`uring_fs::fd_cache_cap` derives from the limit AS FOUND — review round 1, Issue 8: the first build had grown the flat path's fd cache 32×). *Still standing (the flip's list, restated for PR 14):* (a) **the box re-runs** of gates 1 / 3 / 3c / 5 / 7@N=32 on PR 13c's binary — no box row ran in PR 13c (the counted-run law); (b) **the flush-ceiling MARGIN's derivation from the measured pass wall (§7 item 3) — NOT done**: F-B1 landed an exclusion of another actor's holds, which is not a derivation of the margin, and the box's 1–32 ms overruns are what that derivation must price; (c) **gate 3's per-NODE law ("bounded by no node") is UNMEASURED on any venue**: the box's N = 8 MISS is attributed to the co-located venue (§3.9.3), the per-daemon-CPU-second face (0.63× at N = 8 with the ingest CPU folded in; the create phase alone is `sym-scale`'s new `C/CPU-S` column, unrun on the box) is that venue's PROXY, and **a multi-node venue — PR 15's cloud row — is the law's instrument**; (d) the storm ×10 count from zero on PR 13c's binary.
+>
+> **Status (PR 13e, the box re-run's armed-plane findings — `fix/sym-box-rerun-findings`, 2026-09-22): NOT YET, the list restated.** *Landed, red-first:* **F-R3 (P0)** — a cross-owner plan's inode witness is read AT THE HOLDER of the ino's slot (`read_inode_witness` — the writer's read divert; the local record verbatim on every unarmed / flat mount), the dangling-name arm is the must-stay-0 `xv_cross_owner_dangling_names`, a projection's `None` on a live foreign lessee's slot refuses the retryable class (§4.4ak); **F-R4** — a served step for a slot the holder no longer leases is the typed slot-moved class, never the op's `ENOENT`, and a wire grant adopts the tree before naming its lessee (§4.4al); **F-B1** — the flush-ceiling MARGIN's derivation LANDED: a forest volume's cadence fires `max_age − HWM(cycle term)` from the last collection, the term = the measured pre-barrier wall + the decision's lateness beyond one tick (a structural hold's overlap excluded), the published ceiling never widened, the flat cadence byte-identical, published `meta_kv_checkpoint_{term,trigger}_ms` (§4.4am; item (b) above is DONE as a mechanism — the box re-run judges whether it priced the box's 16–106 ms). *Still standing:* (a) **the box re-runs** of gates 1 / 3 / 3c / 5 / 7@N=32 on THIS binary — F-B1's derivation and F-R3 / F-R4 are judged there (every N-writer row set stopped at its first trip on PR 13c's); (c) gate 3's per-NODE law (PR 15's venue); (d) the storm ×10 from zero on this binary; **F-R2** (the SHIPPED authority's per-create `readdir` — the co-writer posture the flip retires) and **gate 1's `handle_setattr` economy** (PR 13f, in parallel) are not this rung's; the PAUSED law of gate 3c stays owed to the next box session (§4.4aj of the box-rerun record).
 
 > **Status (PR 13d, `fix/sym-stripe-ls-token-economy`, 2026-09-22): the `2K + C + 3` reading PR 15's local pass took on gate 3b's `-ls` half is ATTRIBUTED to fleet state (a ROOT striped by the preceding `sym-scale` leg on the same fleet — one records-only grant per root stripe at the reader's first `stat /` after its lookup learnt the map, §7 item 7's class), identical on `7b2ef9e9` and `77f4da1d`, pinned in-process both ways (§4.4ak); no product change; **adjudicated option (c): design §8 row 3b's `-ls` law is `K_D + K_root + C + [0, 4]`**, the leg's code change PR 15's (`tests/sym_rows_lib.sh`, the one law library).**
 

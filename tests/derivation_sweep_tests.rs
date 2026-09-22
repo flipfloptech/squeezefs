@@ -2025,6 +2025,41 @@ fn listener_cap_derives_from_the_raw_root_and_the_fd_budget() {
 /// admits the whole fleet's steady-state session demand — computed from the
 /// SAME pool derivations the members dial with — where the PR-13b form
 /// admitted 64 of the 160+ sessions.
+/// The dial sites that hold a STANDING session against the manager's S8
+/// listener, counted off their marker (`S8-LISTENER CONTROL SESSION
+/// (member_session_demand_from's census)`) — the code-side term the
+/// per-member demand constant is tied to. A new long-lived dial site
+/// carries the marker or the demand law reads an undercount.
+fn s8_listener_control_session_sites() -> usize {
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rust_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    assert!(
+        files.len() > 100,
+        "census root wrong: {} files",
+        files.len()
+    );
+    let marker = "// S8-LISTENER CONTROL SESSION (member_session_demand_from's census)";
+    files
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .map(|text| text.matches(marker).count())
+        .sum()
+}
+
 #[test]
 fn a_32_member_fleets_session_demand_fits_the_listener_cap_at_share_32() {
     use squeezefs::cluster_wire::{max_connections_from, member_session_demand_from};
@@ -2037,9 +2072,18 @@ fn a_32_member_fleets_session_demand_fits_the_listener_cap_at_share_32() {
     let per_member = member_session_demand_from(member_cpus, volumes);
     // A member's demand against the S8 listener: per volume the token
     // grant pool (publish_ship_depth = 2 at one CPU) + its recall channel,
-    // plus the publish pool, the manager wire, the meta-ship lane + its
-    // mux, and the per-holder custody client.
-    assert_eq!(per_member, 2 * (2 + 1) + 2 + 4);
+    // plus the publish pool and the control sessions a joined writer
+    // holds — COUNTED IN CODE below, never a number asserted against
+    // itself (review round 1, Issue 3).
+    assert_eq!(
+        per_member,
+        2 * (2 + 1) + 2 + squeezefs::cluster_wire::MEMBER_CONTROL_SESSIONS
+    );
+    assert_eq!(
+        squeezefs::cluster_wire::MEMBER_CONTROL_SESSIONS,
+        s8_listener_control_session_sites(),
+        "MEMBER_CONTROL_SESSIONS ≡ the marked long-lived dial sites in src/"
+    );
     let cap = max_connections_from(raw, 524_288);
     assert!(
         members * per_member <= cap,

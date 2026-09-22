@@ -3471,6 +3471,8 @@ impl WriteCustodyClient {
         pr_key: u64,
         scope: CustodyScope,
     ) -> Result<Arc<Self>> {
+        // The custody client's standing session (one JOIN per holder).
+        // S8-LISTENER CONTROL SESSION (member_session_demand_from's census)
         let mut session = RpcClient::connect(endpoint, secret, id, None).await?;
         let anchor = clock.now_ms();
         let frame = JoinFrame {

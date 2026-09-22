@@ -1630,33 +1630,34 @@ pub fn max_connections_resolved(
 /// `N` members): per volume the token grant pool
 /// ([`crate::meta_ship::publish::publish_ship_depth_from`] sessions — the
 /// reader plane's pool) + one standing recall channel; plus the publish
-/// frame pool (the same depth) and the control sessions a writer holds one
-/// each of — the manager wire, the meta-ship lane, its pipelined mux, the
-/// per-holder custody client. `cpus` is the MEMBER's divided root (its
-/// pools derive from its own share); a reader holds the per-volume terms
-/// only, so the writer's demand is the bound.
+/// frame pool (the same depth) and the [`MEMBER_CONTROL_SESSIONS`] a
+/// JOINED WRITER holds one each of. `cpus` is the MEMBER's divided root
+/// (its pools derive from its own share); a reader holds the per-volume
+/// terms only, so the writer's demand is the bound.
 pub fn member_session_demand_from(cpus: usize, volumes: usize) -> usize {
     let depth = crate::meta_ship::publish::publish_ship_depth_from(None, cpus);
     volumes.max(1) * (depth + 1) + depth + MEMBER_CONTROL_SESSIONS
 }
 
-/// The per-member control sessions against one listener: the manager
-/// wire, the meta-ship lane, its mux, the custody client — one each.
-const MEMBER_CONTROL_SESSIONS: usize = 4;
+/// The standing control sessions a joined writer holds against the
+/// manager's S8 listener — COUNTED IN CODE (review round 1, Issue 3): every
+/// long-lived dial site carries the marker `S8-LISTENER CONTROL SESSION
+/// (member_session_demand_from's census)` and `derivation_sweep_tests`
+/// pins their number to this constant. The six: the manager wire (the join
+/// door's `ManagerClient`, which BECOMES the `JoinedWire`'s — one session,
+/// `kv/backend/joined.rs`), the S8 meta-ship lane's stop-and-wait session
+/// and its pipelined mux (`meta_ship/router.rs`), the per-holder custody
+/// client (`data_grant.rs`), the S10 intents lane (`meta_ship/intents.rs`),
+/// the wire block-grant sink (`kv/alloc_lease.rs`). Not counted: the
+/// membership renewal (its own listener), the S10 delegation channel (a
+/// REMOTE owner's — the symmetric arm's ownership map is all-local), and
+/// every one-shot dial (a reclaim, a probe, `ResolveEndpoint`).
+pub const MEMBER_CONTROL_SESSIONS: usize = 6;
 
 /// The process's `RLIMIT_NOFILE` soft limit (the fd budget the cap's
 /// ceiling derives from); the classic 1024 when the read fails.
 pub fn nofile_soft_limit() -> usize {
-    let mut rl = libc::rlimit {
-        rlim_cur: 1024,
-        rlim_max: 1024,
-    };
-    // SAFETY: plain getrlimit into a stack struct.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
-        usize::try_from(rl.rlim_cur).unwrap_or(usize::MAX)
-    } else {
-        1024
-    }
+    crate::cpu::nofile_soft_limit_now()
 }
 
 /// Raise the soft `RLIMIT_NOFILE` to the hard limit, once per process (the

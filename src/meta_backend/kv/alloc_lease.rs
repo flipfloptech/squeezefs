@@ -2832,6 +2832,8 @@ pub fn wire_block_grant_sink(
                     // speaks under (the manager's identity verbs bind to it).
                     let peer =
                         crate::cowriter::node_member_id_of(writer.node_token, writer.mount_slot);
+                    // The wire block-grant sink's client, kept in its slot.
+                    // S8-LISTENER CONTROL SESSION (member_session_demand_from's census)
                     match crate::meta_ship::manager::ManagerClient::connect(
                         &endpoint, &secret, &peer, volume,
                     )

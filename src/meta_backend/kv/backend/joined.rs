@@ -707,6 +707,9 @@ impl KvMetaBackend {
                 ..admission.identity
             },
         };
+        // The join door's client BECOMES the `JoinedWire`'s (one standing
+        // session for the manager verbs, re-dialed on transport failure).
+        // S8-LISTENER CONTROL SESSION (member_session_demand_from's census)
         let mut client = ManagerClient::connect(
             &admission.manager_endpoint,
             &admission.secret,

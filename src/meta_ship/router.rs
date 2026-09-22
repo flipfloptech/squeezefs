@@ -651,6 +651,8 @@ impl MetaShipRouter {
             let session = match live {
                 Some(s) => s,
                 None => {
+                    // The lane's pipelined session, kept beside it.
+                    // S8-LISTENER CONTROL SESSION (member_session_demand_from's census)
                     match crate::cluster_wire::MuxSession::connect(
                         &lane.peer.endpoint,
                         &self.secret,
@@ -792,6 +794,8 @@ impl LaneDrain {
         let mut last: Option<SqueezefsError> = None;
         for attempt in 0..2 {
             if session.is_none() {
+                // The lane's stop-and-wait session, kept across drains.
+                // S8-LISTENER CONTROL SESSION (member_session_demand_from's census)
                 match crate::cluster_wire::RpcClient::connect(
                     &self.lane.peer.endpoint,
                     &self.secret,

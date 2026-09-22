@@ -920,6 +920,8 @@ pub(crate) async fn flush_owner(endpoint: &str) -> Result<(), i32> {
         let mut attempt = 0u32;
         while attempt < INTENT_SHIP_ATTEMPTS {
             if session.is_none() {
+                // The S10 intents lane's session (`lane.session`), kept.
+                // S8-LISTENER CONTROL SESSION (member_session_demand_from's census)
                 match crate::cluster_wire::RpcClient::connect(
                     endpoint,
                     &ctx.secret,

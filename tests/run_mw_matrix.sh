@@ -3564,60 +3564,16 @@ ack_verify_xo() { # ledger tag orig_mnt read_mnt lostfile dst_rel prefix moved_l
     echo "$lost"
 }
 
-# The VENUE word's one exemption (PR 13 review round 1, Issue 2 — the
-# venue ruling `51bf21e1`): is `key` a timing-shaped gauge the laptop
-# reports as venue-attributed instead of failing on? Exactly ONE gauge,
-# and only under `--venue=laptop`.
-sym_zero_venue_attributed() { # key -> 0 (yes) | 1 (no)
-    [ "$SYM_VENUE" = "laptop" ] && [ "$1" = "appender_flush_ceiling_overruns" ]
-}
-
-# Record a venue-attributed reading (never a verdict): the ledger every
-# row's note copies, and a loud line on stderr.
-sym_zero_venue_note() { # label idx key value
-    local label="$1" idx="$2" k="$3" v="$4"
-    mkdir -p "$STATE/rows" 2>/dev/null || true
-    echo "$label m$idx $k=$v venue=$SYM_VENUE" >>"$STATE/rows/venue-attributed.txt"
-    echo "[mwmatrix] VENUE-ATTRIBUTED ($label): $k=$v on m$idx — a timing-shaped reading on the $SYM_VENUE; the box bracket decides (51bf21e1), never a MISS here" >&2
-}
-
-# Judge ONE must-stay-0 gauge: die, or — the venue word's exemption —
-# report it and continue.
-sym_zero_judge() { # label idx key value
-    local label="$1" idx="$2" k="$3" v="$4"
-    [ "$v" = "0" ] && return 0
-    if sym_zero_venue_attributed "$k"; then
-        sym_zero_venue_note "$label" "$idx" "$k" "$v"
-        return 0
-    fi
-    die "$label: $k=$v on m$idx (must stay 0)"
-}
-
-# **The ONE deleted-stays-deleted classifier** (PR 13 review round 1, Issue
-# 8): a removed name's `stat` through a mount is `deleted` ONLY on ENOENT.
-# A resolved name is `resurrected`; a stat past its bound is `hung` (a
-# parked lookup — a red with its daemon named, never a leg that hangs);
-# any other failure is `error:<text>` — an EIO / EAGAIN / a refused read
-# is a daemon that CANNOT ANSWER, never "gone" (defect 29 was found
-# because a fail-stopped daemon's EIO on every removed name read as
-# GREEN). Every arm of the oracle (storm, scale, crash) reads this word.
-sym_stat_deleted() { # path [timeout_s] -> deleted|resurrected|hung|error:<text>
-    local path="$1" bound="${2:-60}" err="" src
-    if err="$(timeout "$bound" stat "$path" 2>&1 >/dev/null)"; then
-        src=0
-    else
-        src=$?
-    fi
-    if [ "$src" = "124" ]; then
-        echo hung
-    elif [ "$src" = "0" ]; then
-        echo resurrected
-    elif echo "$err" | grep -q "No such file"; then
-        echo deleted
-    else
-        echo "error:$err"
-    fi
-}
+# The symmetric rows' LAWS — the venue word, the must-stay-0 set, the
+# snapshot readers, the deleted-stays-deleted classifier and the gate
+# 2 / 3 / 3b verdicts — live in tests/sym_rows_lib.sh, sourced here AND by
+# the multi-node cloud driver (tests/cloud_sym_rows.sh, PR 15): ONE law per
+# row on every venue. The lib needs die/log/warn (above), SYM_VENUE and
+# the venue-attributed ledger's path.
+# shellcheck disable=SC2034  # read by the lib's sym_zero_venue_note
+SYM_VENUE_LEDGER="$STATE/rows/venue-attributed.txt"
+# shellcheck source=tests/sym_rows_lib.sh
+. "$REPO/tests/sym_rows_lib.sh"
 
 # The symmetric must-stay-0 set on one daemon of the N-daemon fleet (the
 # manager's `sym_crash_round_asserts` set plus the Joined family's).
@@ -3655,43 +3611,11 @@ sym_build_storm() {
     cc -O2 -pthread -o "$SYM_STORM" "$REPO/tests/mdstorm.c" || die "cc tests/mdstorm.c failed"
 }
 
-# Σ-folded delta of one stats key between the `p<label>0` and `p<label>1`
-# snapshots (the symmetric families publish PER VOLUME as JSON arrays —
-# `s8a_delta` reads scalars only).
-sym_delta() { # rowdir idx label key
-    python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
-import json, sys
-rowdir, idx, label, key = sys.argv[1:5]
-def flat(d, out=None, pfx=""):
-    out = {} if out is None else out
-    for k, v in d.items():
-        if isinstance(v, dict): flat(v, out, pfx + k + ".")
-        else: out[pfx + k] = v
-    return out
-def fold(v):
-    if isinstance(v, list):
-        return sum(x for x in v if isinstance(x, (int, float)))
-    return v if isinstance(v, (int, float)) else 0
-def load(ph):
-    root = json.load(open(f"{rowdir}/m{idx}_p{label}{ph}.json"))
-    return flat(root.get("metrics", root))
-a, b = load(0), load(1)
-print(int(fold(b.get(key, 0)) - fold(a.get(key, 0))))
-PYEOF
-}
+# (`sym_delta` — the Σ-folded per-volume snapshot delta — is the lib's;
+# `s8a_delta` reads scalars only.)
 
-# The symmetric must-stay-0 set on one daemon, labelled (the sym-storm
-# set + the cross-owner and token tripwires); `dlm_rpcs` is asserted
-# ABSOLUTE: an own-slot op never pays a lock round trip (gate 1's law on
-# every rung).
-SYM_ZERO_KEYS="meta_kv_forest_key_violations appender_fence_breach foreign_frame_overwrite_detected \
-    manager_verb_refusals meta_kv_replay_key_violations meta_kv_replay_lease_violations \
-    meta_kv_replay_extent_violations fsck_slot_custody_conflicts slot_lease_conflicts \
-    appender_park_expiries meta_kv_leaf_lease_refusals dlm_token_recall_timeouts_live \
-    appender_flush_ceiling_overruns dead_member_write_deferrals data_alloc_bitmap_drift \
-    joined_control_refusals xv_cross_owner_intents_stuck manager_dependency_stalls \
-    dlm_token_custody_rejected invariant_tripwires data_dma_fence_refusals \
-    extent_grant_conflicts extent_return_live_refusals"
+# (`SYM_ZERO_KEYS` — the must-stay-0 set, `dlm_rpcs` asserted ABSOLUTE by
+# the rows — is the lib's.)
 
 # The must-stay-0 set on one daemon as a REPORT: prints every violated
 # gauge as `key=value` (nothing on a clean daemon). The rows that publish a
@@ -3712,22 +3636,8 @@ sym_zero_violations() { # idx
     done
 }
 
-# The same set judged as a per-row DELTA between the row's two snapshots
-# (`snap … <label>0` / `<label>1`): a cumulative gauge another row (or a
-# previous run on the same fleet) moved is that row's finding, not this
-# one's. Prints `key=+delta` per violation.
-sym_zero_violations_delta() { # rowdir idx label
-    local rowdir="$1" idx="$2" label="$3" k v
-    for k in $SYM_ZERO_KEYS; do
-        v="$(sym_delta "$rowdir" "$idx" "$label" "$k")"
-        [ "$v" = "0" ] && continue
-        if sym_zero_venue_attributed "$k"; then
-            sym_zero_venue_note "$label" "$idx" "$k" "+$v"
-            continue
-        fi
-        printf '%s=+%s ' "$k" "$v"
-    done
-}
+# (`sym_zero_violations_delta` — the set judged as a per-row DELTA — is
+# the lib's.)
 
 sym_zero_set() { # label idx
     local label="$1" idx="$2" k v
@@ -3897,16 +3807,9 @@ leg_sym_tarx() {
         h_j="$(sym_delta "$rowdir" "$jw" "$label" slot_handovers)"
         h_m="$(sym_delta "$rowdir" 0 "$label" slot_handovers)"
         rpcs="$(stat_field "$jw" dlm_rpcs)"
-        verbs_per="$(python3 -c "print(f'{($wire+$xv+$ship+$pub)/$entries:.4f}')")"
-        # THE ENGAGEMENT LAW (§8 gate 2): wire verbs per entry ≈ 0 — the
-        # destination directory's mkdir under `/` is the ONE shipped step
-        # (the root's dentries are slot 0's), the extent-grant refills a
-        # handful of manager verbs per thousand leaves; 0.05 is the bound.
-        python3 -c "import sys; sys.exit(0 if ($wire+$xv+$ship+$pub)/$entries < 0.05 else 1)" ||
-            die "sym-tarx $label: $verbs_per wire verbs per entry (wire=$wire xv=$xv ship=$ship pub=$pub over $entries) — the joiner did not extract into its OWN slot tree; the row is INVALID, not slow"
-        [ "$h_j" = "0" ] && [ "$h_m" = "0" ] ||
-            die "sym-tarx $label: slot_handovers moved (joiner $h_j, manager $h_m) — a handover inside a local extraction"
-        [ "$rpcs" = "0" ] || die "sym-tarx $label: dlm_rpcs=$rpcs on the joiner (must be 0)"
+        # THE ENGAGEMENT LAW (§8 gate 2) — the lib's, one definition for
+        # every venue: verbs/entry < 0.05, no handover, dlm_rpcs 0.
+        verbs_per="$(sym_law_gate2_engagement "$label" "$entries" "$wire" "$xv" "$ship" "$pub" "$h_j" "$h_m" "$rpcs")"
         echo "$out wire=$wire xv=$xv ship=$ship pub=$pub verbs/entry=$verbs_per handovers=0"
     }
     local_arm() { # label -> row line (the S0 shape)
@@ -3934,14 +3837,7 @@ leg_sym_tarx() {
     l1="$(echo "${rows[1]}" | awk '{print $2}')"
     l2="$(echo "${rows[2]}" | awk '{print $2}')"
     s2="$(echo "${rows[3]}" | awk '{print $2}')"
-    python3 - "$s1" "$s2" "$l1" "$l2" <<'PYGATE' | tee "$rowdir/symtarx-verdict.txt"
-import sys
-s = (float(sys.argv[1]) + float(sys.argv[2])) / 2
-l = (float(sys.argv[3]) + float(sys.argv[4])) / 2
-r = s / l
-print(f"gate 2: joined writer {s:.2f}s vs manager-local {l:.2f}s -> {r:.2f}x of S0 (gate <= 1.10x): {'MET' if r <= 1.10 else 'MISS'}")
-print(f"both orders: sym-1 {float(sys.argv[1]):.2f} local-1 {float(sys.argv[3]):.2f} | local-2 {float(sys.argv[4]):.2f} sym-2 {float(sys.argv[2]):.2f}")
-PYGATE
+    sym_law_gate2_verdict "$s1" "$s2" "$l1" "$l2" | tee "$rowdir/symtarx-verdict.txt"
     sym_oracle sym-tarx "$rowdir"
     log "sym-tarx PUBLISHED (table + verdict + snapshots in $rowdir)"
 }
@@ -3970,7 +3866,7 @@ leg_sym_scale() {
     # the WHOLE row (create + ingest) — the first build divided the
     # create + ingest CPU by the INGEST wall alone (1,322 % on the box was
     # 9.8 CPU-s ÷ 0.74 s).
-    printf '%-4s %-10s %-8s %-9s %-10s %-8s %-9s %-8s %-8s %-8s %-6s %s\n' N CREATE_S RATIO C/CPU-S INGEST_MBS RATIO MGR_LOAD MGR_CPU HANDOV SHIPS RPCS VERDICT | tee "$rowdir/symscale-table.tsv"
+    sym_gate3_header | tee "$rowdir/symscale-table.tsv"
     local n rate1="" ingest1="" verdict_all=MET zero_miss_all=""
     # A per-run tag on every directory: a died run's residue never
     # collides with the next run's creates ("File exists").
@@ -4045,15 +3941,9 @@ print(int(b)-int(a))" 2>/dev/null || echo 0)"
             v="$(sym_zero_violations_delta "$rowdir" "$idx" "n$n")"
             [ -z "$v" ] || zero_miss="$zero_miss m$idx:{$v}"
         done
-        [ "$handovers" = "0" ] || die "sym-scale N=$n: slot_handovers=$handovers (must be 0 — each mount writes its own trees)"
-        # `slot_ships` counts every served ship since PR 13 (defect 9 — the
-        # served step feeds the holder's dominance window; before it the
-        # gauge never moved). Each joiner's ONE `mkdir /<top>` under `/` is
-        # §5.10's "1 ship to volume 0's manager" — the law is ≤ 1 per
-        # writer, never the 20,000 creates that follow in the writer's own
-        # tree.
-        [ "$ships" -le "$n" ] || die "sym-scale N=$n: slot_ships=$ships (must be ≈ 0 — at most one per writer: its directory's mkdir under /)"
-        [ "$rpcs" = "0" ] || die "sym-scale N=$n: Σ dlm_rpcs=$rpcs (must be 0)"
+        # THE ENGAGEMENT LAW (§8 gate 3) — the lib's: handovers 0, ships
+        # ≤ 1 per writer (its directory's mkdir under /), Σ dlm_rpcs 0.
+        sym_law_gate3_engagement "$n" "$handovers" "$ships" "$rpcs"
         local mgr_load
         mgr_load="$(stat_field 0 manager_load_pct | tr -d '[] ' | cut -d, -f1)"
         mgr_cpu="$(python3 -c "
@@ -4065,7 +3955,7 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t_row0):.0f}')")"
         local cr ir verdict
         cr="$(python3 -c "print(f'{$create_rate/$rate1:.2f}')")"
         ir="$(python3 -c "print(f'{$ingest_rate/$ingest1:.2f}')")"
-        verdict="$(python3 -c "print('MET' if $create_rate >= 0.7*$n*$rate1 and $ingest_rate >= 0.7*$n*$ingest1 else 'MISS')")"
+        verdict="$(sym_law_gate3_row "$n" "$create_rate" "$rate1" "$ingest_rate" "$ingest1")"
         # A violated must-stay-0 law is the row's verdict too — printed
         # with its number, and the leg exits nonzero after the table.
         if [ -n "$zero_miss" ]; then
@@ -4073,7 +3963,7 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t_row0):.0f}')")"
             zero_miss_all="$zero_miss_all N=$n:$zero_miss"
         fi
         [ "$verdict" = "MET" ] || verdict_all=MISS
-        printf '%-4s %-10s %-8s %-9s %-10s %-8s %-9s %-8s %-8s %-8s %-6s %s\n' "$n" "$create_rate" "${cr}x" "$creates_per_cpu_s" "$ingest_rate" "${ir}x" "$mgr_load" "${mgr_cpu}%" "$handovers" "$ships" "$rpcs" "$verdict" | tee -a "$rowdir/symscale-table.tsv"
+        sym_gate3_row_line "$n" "$create_rate" "$cr" "$creates_per_cpu_s" "$ingest_rate" "$ir" "$mgr_load" "$mgr_cpu" "$handovers" "$ships" "$rpcs" "$verdict" | tee -a "$rowdir/symscale-table.tsv"
         for idx in "${writers[@]}"; do
             # A sample of the names about to be removed — the LAST ones the
             # storm created (the "deleted stays deleted" arm below judges
@@ -4086,7 +3976,7 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t_row0):.0f}')")"
             rm -rf "$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx" 2>/dev/null || true
         done
     done
-    echo "gate 3 (≥ 0.7 × N × the N=1 rate on BOTH rows; the manager's load flat in N): $verdict_all" | tee "$rowdir/symscale-verdict.txt"
+    sym_law_gate3_verdict_line "$verdict_all" | tee "$rowdir/symscale-verdict.txt"
     [ -z "$zero_miss_all" ] || die "sym-scale: a must-stay-0 gauge moved:$zero_miss_all (rows above; the leg is RED)"
     # DELETED STAYS DELETED across every joiner's CLEAN LEAVE (PR 13): every
     # joiner unmounts (the product umount = the leave's flush-then-transfer
@@ -4422,13 +4312,9 @@ leg_sym_shared_dir() {
     xattr_k="$(getfattr -n user.squeezefs.stripes --only-values "$shared" 2>/dev/null || echo 0)"
     echo "== PR 13 gate 3b: ${#writers[@]} creators × $per_writer into ONE directory (holder m$holder): wall $(python3 -c "print(f'{$t1-$t0:.2f}')") s, $(python3 -c "print(f'{$created/($t1-$t0):.0f}')") creates/s aggregate ==" | tee "$rowdir/symshared-table.txt"
     echo "   flips=$flips at [$flip_at] striped_dirs(holder)=$striped K=$xattr_k xv_shipped=$shipped xv_served=$served dir_stripe_ships=$stripe_ships handovers=$handovers" | tee -a "$rowdir/symshared-table.txt"
-    [ "$flips" = "1" ] || die "sym-shared-dir: dir_stripe_flips=$flips (want exactly 1: the holder's flip on the observed creator count) — [$flip_at]"
-    [ -n "$flip_at" ] && [ "${flip_at% *}" = "m$holder(1)" ] ||
-        die "sym-shared-dir: the flip landed at [$flip_at], not at the holder m$holder"
-    [ "$striped" -ge 1 ] || die "sym-shared-dir: dir_striped_dirs=$striped at the holder"
-    [ "$stripe_ships" -gt 0 ] || die "sym-shared-dir: dir_stripe_ships=0 — no post-flip create was routed to a stripe holder"
-    [ "$shipped" = "$served" ] || die "sym-shared-dir: shipped steps $shipped ≠ served steps $served (the closure) — a step was lost or double-served"
-    [ "$handovers" = "0" ] || die "sym-shared-dir: slot_handovers=$handovers (aggregate shipping never triggers a handover)"
+    # THE ENGAGEMENT LAW (§8 gate 3b) — the lib's: one flip at the holder,
+    # striped, stripe ships > 0, shipped ≡ served, handovers 0.
+    sym_law_gate3b_engagement "$holder" "$flips" "$flip_at" "$striped" "$stripe_ships" "$shipped" "$served" "$handovers"
     log "sym-shared-dir: flip at the holder, $stripe_ships stripe ships, closure shipped ≡ served ($shipped), 0 handovers"
 
     # --- sym-shared-dir-ls: a COLD token reader's `readdir + stat` ----------
@@ -4466,23 +4352,13 @@ leg_sym_shared_dir() {
         # and its dentry page are separate grants when `stat D` precedes
         # the listing), its parent's, and the reader's root token — the
         # first run read K + C + 3 exactly (20,067 for K = 64, C = 20,000).
-        [ "$grants" -ge $((xattr_k + created)) ] && [ "$grants" -le $((xattr_k + created + 4)) ] ||
-            die "sym-shared-dir-ls: dlm_token_grants=$grants ∉ [K + C, K + C + 4] = [$((xattr_k + created)), $((xattr_k + created + 4))]"
-        # "0 leaf reads" is judged NET of the S5 control plane: the reader's
-        # poll drops its projected images at every epoch step and re-reads
-        # tree 0 / the roots (`meta_kv_revalidate_nodes_dropped`, ≤ a few
-        # nodes per epoch) — those misses are the poll's, never a leaf the
-        # listing read (the first run: +269 misses = +205 dropped + 8 epochs).
+        # "0 leaf reads" is judged NET of the S5 control plane (the poll's
+        # dropped images per epoch step + one tree-0 read per stripe slot)
+        # — the lib's law, one definition for every venue.
         local dropped epochs
         dropped="$(sym_delta "$rowdir" "$reader" ls meta_kv_revalidate_nodes_dropped)"
         epochs="$(sym_delta "$rowdir" "$reader" ls meta_kv_revalidate_epochs)"
-        # … plus ONE tree-0 read per stripe SLOT: the reader resolves each
-        # stripe's lessee off its own tree 0 (`slot_state:{s}`, a control
-        # record no token carries) before it dials the holder — K reads,
-        # cached after (the second run: 130 misses = 66 dropped + 64 slots).
-        [ "$misses" -le $((dropped + epochs * 8 + xattr_k)) ] ||
-            die "sym-shared-dir-ls: meta_kv_node_cache_misses=$misses on the reader exceeds the poll's own re-reads + one tree-0 read per stripe slot (dropped $dropped + 8 × $epochs epochs + K $xattr_k) — a DATA leaf was read for the listing"
-        [ "$merges" -ge 1 ] || die "sym-shared-dir-ls: dir_stripe_readdir_merges=$merges on the reader (the K-way merge did not run)"
+        sym_law_gate3b_ls "$grants" "$xattr_k" "$created" "$misses" "$dropped" "$epochs" "$merges"
         sym_zero_set sym-shared-dir-ls "$reader"
         log "sym-shared-dir-ls: $grants tokens for K=$xattr_k + C=$created, 0 data-leaf reads for the listing ($misses misses = the poll's $dropped dropped images over $epochs epoch steps + ≤ K tree-0 lessee reads)"
     fi

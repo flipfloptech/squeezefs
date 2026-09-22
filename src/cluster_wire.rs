@@ -1592,9 +1592,11 @@ pub const LISTENER_FD_SHARE: usize = 4;
 /// it — a process too small for 64 × 2 fds fails at its FUSE rings first).
 const MAX_CONNS_FLOOR: usize = 64;
 
-/// Parked connection threads per core: the thread-per-connection posture —
-/// a parked thread costs no CPU, so the factor bounds the worst-case wake
-/// storm (16 runnable per core), not steady-state load.
+/// Parked connection threads per core — THE SHIPPED FACTOR KEPT (the
+/// never-regress-below-shipped posture, not a measured derivation): PR 13b
+/// derived `cpus × 16` and nothing has measured the thread-per-connection
+/// wake storm at another factor; the root it multiplies is what PR 13c
+/// changed (raw, never fleet-share-divided).
 const CONNS_PER_CORE: usize = 16;
 
 /// Pure form (tie-tested in the derivation sweep): `(raw_cpus × 16)`
@@ -3080,11 +3082,17 @@ impl RpcClient {
     /// listener at its connection cap accepts and CLOSES without a
     /// challenge, so the first read answers EOF. That is the retryable
     /// class — a slot frees when a peer's session ends — so the dial is
-    /// repeated with a doubling backoff (`DIAL_TIMEOUT / 500` → `/ 20`:
-    /// fractions of the one bound, never free constants) until the dial
-    /// bound is spent; past it the TYPED class surfaces (EAGAIN), never the
-    /// PR-13b `InvalidOperation` at the first EOF (the 14th member of the
-    /// box's 32-member fleet died on that word).
+    /// repeated with a doubling backoff from the listener's own liveness
+    /// grain (`ACCEPT_POLL_TICK`: the finest interval at which the accept
+    /// thread re-reads its state, so a shorter first wait cannot observe a
+    /// freed slot sooner) until the dial bound is spent — and `DIAL_TIMEOUT`
+    /// is also the listener's HANDSHAKE deadline, the lifetime of the
+    /// shortest slot-holding session (a pre-authentication straggler is
+    /// reaped at it), so a dialer that retried for one bound has outlived
+    /// every such straggler; each wait is clipped to the budget left. Past
+    /// it the TYPED class surfaces (EAGAIN), never the PR-13b
+    /// `InvalidOperation` at the first EOF (the 14th member of the box's
+    /// 32-member fleet died on that word).
     fn connect_sync(
         endpoint: &str,
         secret: &[u8],
@@ -3092,12 +3100,13 @@ impl RpcClient {
         security: Option<&ClusterSecurityConfig>,
     ) -> Result<Self> {
         let started = std::time::Instant::now();
-        let mut backoff = DIAL_TIMEOUT / 500;
+        let mut backoff = ACCEPT_POLL_TICK;
         loop {
             match Self::connect_once(endpoint, secret, peer_id, security) {
                 Err(ConnectRefusal::BeforeChallenge) => {
                     let spent = started.elapsed();
-                    if spent + backoff >= DIAL_TIMEOUT {
+                    let Some(left) = DIAL_TIMEOUT.checked_sub(spent).filter(|l| !l.is_zero())
+                    else {
                         return Err(SqueezefsError::retryable(
                             crate::error::RefusalClass::ListenerRefused,
                             format!(
@@ -3106,9 +3115,9 @@ impl RpcClient {
                                  the peer's {MAX_CONNS_ENV} / fd limit is the lever; retry"
                             ),
                         ));
-                    }
-                    std::thread::sleep(backoff);
-                    backoff = (backoff * 2).min(DIAL_TIMEOUT / 20);
+                    };
+                    std::thread::sleep(backoff.min(left));
+                    backoff *= 2;
                 }
                 Err(ConnectRefusal::Other(e)) => return Err(e),
                 Ok(client) => return Ok(client),

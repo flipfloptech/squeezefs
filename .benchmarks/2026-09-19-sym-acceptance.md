@@ -3635,9 +3635,14 @@ behind its own census as a term and a trigger of 0 for the mark's memory
 before this rule). The published ceiling never widens (a cycle slower than
 its anticipated term still trips the audit — the tripwire keeps its
 teeth); a term at or past the ceiling makes a cycle due every tick, the
-honest response to a device that cannot land the promise. A FLAT volume
-keeps the shipped law VERBATIM (`tick` keeps `last_checkpoint`; the
-dispatch is `appenders().is_some()`). Published per volume:
+honest response to a device that cannot land the promise. The dispatch
+is `appenders().is_some()` — every bit-17 forest, ARMED OR NOT (so
+`SQUEEZEFS_SYMMETRIC_META=0` on a bit-17 volume takes the new cadence:
+the population the audit judges); a bit-17-ABSENT volume keeps the
+shipped DECISION verbatim (`tick` keeps `last_checkpoint.elapsed() ≥
+max_age`) and pays the term bookkeeping beside it (two atomic stores, one
+mutex, a 64-word max per cycle) — "decision-identical", the honest word
+(review round 1, Issue 9). Published per volume:
 `meta_kv_checkpoint_term_ms`, `meta_kv_checkpoint_trigger_ms`; the
 per-cycle instrument the box-rerun's item 13 named is the debug tape
 `checkpoint: cycle … pre-barrier wall N ms = publish + flush (dirty, SMOs)

@@ -32,8 +32,10 @@ pub enum RefusalClass {
     /// The peer's cluster-wire listener closed the connection before its
     /// challenge — at its connection cap or shutting down — and the
     /// dial-side bounded retry ran out (PR 13c, F-B3): retry
-    /// (`cluster_wire::RpcClient::connect`). Never travels on the wire (the
-    /// peer said nothing); the word exists so `refusal_class()` names it.
+    /// (`cluster_wire::RpcClient::connect`). Minted by the DIALER (the
+    /// refusing listener says nothing); it rides the wire like every class
+    /// when a served verb's own dial was the refusal (a manager forwarding
+    /// a step, a holder re-dialing) — wire word 5.
     ListenerRefused,
 }
 

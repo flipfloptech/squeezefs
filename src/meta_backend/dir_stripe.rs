@@ -1900,8 +1900,12 @@ impl RoutedMetaBackend {
                     );
                     return Ok(false);
                 }
-                let Some(loser) = self.volumes[cv].read_inode_value_routed(clocal).await? else {
+                // The loser's witness is its HOLDER's word (PR 13e, F-R3: a
+                // foreign-minted loser read off the projection would answer
+                // no record and lose its count step).
+                let Some(loser) = self.volumes[cv].read_inode_witness(clocal).await? else {
                     // No record: the dangling name alone goes.
+                    crossvol_tx::note_dangling_name();
                     steps.push(XvStep::RemoveDentry {
                         parent: dir,
                         name: entry.name.clone(),

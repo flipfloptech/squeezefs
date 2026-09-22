@@ -310,6 +310,13 @@ static XV_CO_OP_SLOT_MOVED_REDISPATCHES: AtomicU64 = AtomicU64::new(0);
 /// a directory another appender had created into orphaned one inode per
 /// name (`xv_cross_owner_dangling_names`).
 static XV_CO_DANGLING_NAMES: AtomicU64 = AtomicU64::new(0);
+/// Witness reads REFUSED (`EAGAIN`-class) because the local read found no
+/// record in a slot a LIVE foreign appender leases while no read divert
+/// could reach its holder — a `None` off a projection is not a witness
+/// (PR 13e, F-R3's belt; `xv_cross_owner_witness_refusals`). 0 on the
+/// mount path by construction (the divert is armed on every writer);
+/// the retryable class where a race moved the slot under the read.
+static XV_CO_WITNESS_REFUSALS: AtomicU64 = AtomicU64::new(0);
 /// Guard scopes this holder parked for a remote initiator.
 static XV_CO_GUARDS_PARKED: AtomicU64 = AtomicU64::new(0);
 /// Parked scopes released by the lease-expiry sweep, not their initiator
@@ -572,6 +579,9 @@ pub struct CrossOwnerStats {
     /// PR 13e (F-R3), **must stay 0 on an armed mount**: plan builders
     /// that found no child record and dropped the count step.
     pub dangling_names: u64,
+    /// PR 13e (F-R3): witness reads refused because a local `None` came
+    /// off the projection of a live foreign lessee's slot.
+    pub witness_refusals: u64,
 }
 
 /// Read the family.
@@ -597,6 +607,7 @@ pub fn cross_owner_stats() -> CrossOwnerStats {
         guards_parked: XV_CO_GUARDS_PARKED.load(Ordering::Relaxed),
         guard_expiries: XV_CO_GUARD_EXPIRIES.load(Ordering::Relaxed),
         dangling_names: XV_CO_DANGLING_NAMES.load(Ordering::Relaxed),
+        witness_refusals: XV_CO_WITNESS_REFUSALS.load(Ordering::Relaxed),
     }
 }
 
@@ -604,6 +615,12 @@ pub fn cross_owner_stats() -> CrossOwnerStats {
 /// dropped the count step (the `xv_cross_owner_dangling_names` arm).
 pub(crate) fn note_dangling_name() {
     XV_CO_DANGLING_NAMES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A witness read refused a projection's `None` for a live foreign
+/// lessee's slot (`xv_cross_owner_witness_refusals`).
+pub(crate) fn note_witness_refusal() {
+    XV_CO_WITNESS_REFUSALS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The family as the stats inode serves it (its keys are §11's names).
@@ -672,6 +689,10 @@ pub fn cross_owner_stats_json() -> serde_json::Map<String, serde_json::Value> {
     out.insert(
         "xv_cross_owner_dangling_names".into(),
         s.dangling_names.into(),
+    );
+    out.insert(
+        "xv_cross_owner_witness_refusals".into(),
+        s.witness_refusals.into(),
     );
     out.insert(
         "dir_rename_lock_acquires".into(),
@@ -2981,9 +3002,12 @@ async fn compensate_live_refusal(
                 expect_child,
                 parent_update,
             } => {
+                // The restored name's type is the child's HOLDER's word
+                // (PR 13e, F-R3): a foreign-minted child read off the
+                // projection would answer no record and no inverse.
                 let (cv, cl) = routed.route_ino(*expect_child);
                 routed.volumes[cv]
-                    .read_inode_value_routed(cl)
+                    .read_inode_witness(cl)
                     .await?
                     .map(|child| XvStep::InsertDentry {
                         parent: *parent,

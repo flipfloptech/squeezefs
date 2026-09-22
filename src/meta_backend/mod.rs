@@ -2097,8 +2097,10 @@ impl RoutedMetaBackend {
             // carries the intent record, so the next mount rolls the
             // second name forward instead of leaking the inode and every
             // block it names forever.
+            // The linked inode's witness is its HOLDER's word (PR 13e, F-R3:
+            // the projection read `NotFound` for a foreign-minted file).
             let pre = self.volumes[child_v_idx]
-                .read_inode_value_routed(local_child)
+                .read_inode_witness(local_child)
                 .await?
                 .ok_or_else(|| {
                     crate::error::SqueezefsError::Io(std::io::Error::new(
@@ -4698,8 +4700,11 @@ impl RoutedMetaBackend {
                         (new_parent, local_new_parent, 1i64),
                     ] {
                         let (v_idx, _) = self.route_ino(target);
-                        let Some(pv) = self.volumes[v_idx].read_inode_value_routed(local).await?
-                        else {
+                        // Each parent's witness is its HOLDER's word (PR
+                        // 13e, F-R3: a foreign-held parent read stale or
+                        // absent off the projection — the shift was skipped
+                        // or the guard below fired, and its nlink drifted).
+                        let Some(pv) = self.volumes[v_idx].read_inode_witness(local).await? else {
                             // The v2/routed arms tolerated an unreadable
                             // parent here (best-effort); no step.
                             continue;
@@ -4735,31 +4740,44 @@ impl RoutedMetaBackend {
                 // then remove its dentry.
                 if let Some((dest_ino, _dest_ft)) = new_dentry_opt {
                     let (dest_v_idx, local_dest) = self.route_ino(dest_ino);
-                    if let Some(dv) = self.volumes[dest_v_idx]
-                        .read_inode_value_routed(local_dest)
+                    // The overwritten inode's witness is its HOLDER's word
+                    // (PR 13e, F-R3 — the unlink's orphan, at a rename).
+                    match self.volumes[dest_v_idx]
+                        .read_inode_witness(local_dest)
                         .await?
                     {
-                        let dest_is_dir = (dv.mode & libc::S_IFMT) == libc::S_IFDIR;
-                        if dest_is_dir
-                            && self.volumes[dest_v_idx].dir_has_entries(local_dest).await?
-                        {
-                            return Err(crate::error::SqueezefsError::Io(
-                                std::io::Error::from_raw_os_error(libc::ENOTEMPTY),
-                            ));
+                        None => {
+                            crossvol_tx::note_dangling_name();
+                            log::warn!(
+                                "cross-volume rename over {new_name:?} in parent {new_parent}: \
+                                 the replaced ino {dest_ino} has no inode record — removing \
+                                 the dangling name and accounting nothing (run `squeezefs \
+                                 fsck`; xv_cross_owner_dangling_names)"
+                            );
                         }
-                        // Replaced directory ⇒ nlink 0 (the rmdir rule —
-                        // generic/035); otherwise one link fewer.
-                        let post = if dest_is_dir {
-                            0
-                        } else {
-                            dv.nlink.saturating_sub(1)
-                        };
-                        steps.push(crossvol_tx::XvStep::SetNlink {
-                            ino: dest_ino,
-                            pre: dv.nlink,
-                            post,
-                            ctime: Some(now),
-                        });
+                        Some(dv) => {
+                            let dest_is_dir = (dv.mode & libc::S_IFMT) == libc::S_IFDIR;
+                            if dest_is_dir
+                                && self.volumes[dest_v_idx].dir_has_entries(local_dest).await?
+                            {
+                                return Err(crate::error::SqueezefsError::Io(
+                                    std::io::Error::from_raw_os_error(libc::ENOTEMPTY),
+                                ));
+                            }
+                            // Replaced directory ⇒ nlink 0 (the rmdir rule
+                            // — generic/035); otherwise one link fewer.
+                            let post = if dest_is_dir {
+                                0
+                            } else {
+                                dv.nlink.saturating_sub(1)
+                            };
+                            steps.push(crossvol_tx::XvStep::SetNlink {
+                                ino: dest_ino,
+                                pre: dv.nlink,
+                                post,
+                                ctime: Some(now),
+                            });
+                        }
                     }
                     steps.push(crossvol_tx::XvStep::RemoveDentry {
                         parent: new_parent,
@@ -5514,8 +5532,12 @@ impl RoutedMetaBackend {
                 expect_child: global_child_ino,
                 parent_update: crossvol_tx::parent_update_code(update),
             }];
+            // The witness is the child's HOLDER's word (PR 13e, F-R3): a
+            // child another appender minted lives in its rotor slot, and a
+            // local read there is this daemon's projection — the arm below
+            // fired once per victim of every `rm -rf` on the box.
             match self.volumes[child_v_idx]
-                .read_inode_value_routed(local_child)
+                .read_inode_witness(local_child)
                 .await?
             {
                 // Validation + the count step's (pre, post) witness, read

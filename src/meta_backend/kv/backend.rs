@@ -23037,8 +23037,19 @@ impl KvMetaBackend {
     }
 
     /// Whether a directory has any live entries (the routed rename's
-    /// ENOTEMPTY probe).
+    /// ENOTEMPTY probe) — at the directory's HOLDER for a slot another
+    /// appender leases (PR 13e, F-R3: the projection's dentry set is
+    /// neither complete nor current), the local tree otherwise.
     pub async fn dir_has_entries(&self, local_ino: Ino) -> Result<bool> {
+        if let Some(serve) = self
+            .token_serve(
+                local_ino,
+                crate::meta_ship::token_plane::TokenWants::with_dentries(),
+            )
+            .await?
+        {
+            return Ok(serve.is_some_and(|s| !s.entry().page_after(0, 1).is_empty()));
+        }
         let start = dentry_key(local_ino, 0, 0);
         let end = dentry_key(local_ino, HASH54_MAX, u8::MAX);
         Ok(!self
@@ -25789,11 +25800,69 @@ impl KvMetaBackend {
         self.strict
     }
 
-    /// The routed layer's read of one local inode record — what a
-    /// cross-volume plan's count steps take their `(pre, post)` witness
-    /// from, under the op's held I-guard.
+    /// The routed layer's LOCAL read of one inode record — this mount's
+    /// tree of the ino's slot, verbatim: fsck's census walks and the
+    /// holder-side stripe reads. On a slot another appender leases that
+    /// tree is this daemon's PROJECTION (never the leased root — KD-SYM-3),
+    /// so a cross-owner plan's witness never reads here: it reads
+    /// [`Self::read_inode_witness`].
     pub async fn read_inode_value_routed(&self, local_ino: Ino) -> Result<Option<InodeValue>> {
         Ok(self.read_inode_value(local_ino).await?)
+    }
+
+    /// **The `(pre, post)` WITNESS of a cross-owner plan's inode step**
+    /// (PR 13e, F-R3 — record §3.9.4.3): the record a count step, a link's
+    /// `pre`, a rename's overwritten destination, a directory move's parent
+    /// shift or a compensation's inverse is recorded against, read AT THE
+    /// HOLDER of the ino's slot. A slot another appender leases is read
+    /// through the writer's read divert (`token_serve` — the holder's token
+    /// plane, one grant, already held from the `lookup` that precedes an
+    /// `rm`, recalled by the very step the plan then ships); a slot this
+    /// mount leases or maintains, and every unarmed mount, read the local
+    /// record verbatim (the flat path byte-identical). `Ok(None)` is a
+    /// record GENUINELY absent — gone at its holder, or absent locally on a
+    /// slot that is ours. Before it the plan builders read
+    /// `read_inode_value_routed` — the PROJECTION of a foreign lessee's
+    /// slot — found `None`, dropped the `SetNlink` step and removed the
+    /// name: one orphaned inode per cross-owner unlink of a foreign-minted
+    /// child (430 / 512 in one `rm -rf` on the box). A local `None` on a
+    /// slot a LIVE foreign appender leases — no divert could reach the
+    /// holder (no custody arm on this backend's set), or the slot moved
+    /// under the read — is REFUSED `EAGAIN`-class and counted
+    /// (`xv_cross_owner_witness_refusals`): a projection's `None` is not a
+    /// witness, and the retryable class is the honest word for both.
+    pub async fn read_inode_witness(&self, local_ino: Ino) -> Result<Option<InodeValue>> {
+        match self
+            .token_serve(
+                local_ino,
+                crate::meta_ship::token_plane::TokenWants::default(),
+            )
+            .await
+        {
+            Ok(Some(serve)) => return Ok(serve.map(|s| s.entry().attrs)),
+            Ok(None) => {}
+            Err(e) => return Err(e.into()),
+        }
+        let v = self.read_inode_value(local_ino).await?;
+        if v.is_none() {
+            if let Some(holder) = self.foreign_slot_holder(local_ino) {
+                if self.foreign_slot_holder_live(holder) {
+                    crossvol_tx::note_witness_refusal();
+                    return Err(crate::error::SqueezefsError::refused(
+                        libc::EAGAIN,
+                        format!(
+                            "{}: no record for ino {local_ino} in this mount's PROJECTION of \
+                             forest slot {}, which appender {holder} leases — a projection's \
+                             absence is no witness for a cross-owner step; the read at the \
+                             holder is retried (xv_cross_owner_witness_refusals)",
+                            self.path.display(),
+                            super::record::forest_slot_of_ino(local_ino)
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(v)
     }
 
     /// The backend's metadata clock (§ the `now_ns` note above), for plan

@@ -1972,6 +1972,7 @@ EOS
   local nqn hid
   for c in "${clients[@]}"; do
     ip="$(node_pub "$c")"
+    nqn="" hid=""   # per iteration (the dry-run branch names each node's own)
     if $DRY_RUN; then
       remote "$ip" NODE="$c" REGEN=0 <<'EOS'
 set -euo pipefail

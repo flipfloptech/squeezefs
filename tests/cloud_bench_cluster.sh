@@ -1217,6 +1217,7 @@ else
   echo "connected (no format — a joining node): $META_URI $DATA_URI"
 fi
 echo "$META_URI" >/etc/squeezefs-bench-meta-uri
+echo "$DATA_URI" >/etc/squeezefs-bench-data-uri   # the registrant-count gate reads every namespace
 if [ "${MW_SKIP_MOUNT:-0}" != 1 ]; then
   read -ra EXTRA <<<"$(printf '%s' "$MOUNT_EXTRA_STR" | tr ',' ' ')"
   "$SQZ" mount "$META_URI" "$MNT" --daemon "${EXTRA[@]}"
@@ -2061,20 +2062,45 @@ poll_all_eq \"\$MNT\" appenders_known \"\$N\" 240 \"manager: appenders_known —
 poll_stat \"\$MNT\" membership_writers \"\$((N - 1))\" 240 \"manager: membership_writers (every joiner a WRITER member of the manager's shard)\"
 echo \"  fleet gates: appenders_known=\$(stat_first \"\$MNT\" appenders_known) membership_members=\$(stat_field \"\$MNT\" membership_members) membership_writers=\$(stat_field \"\$MNT\" membership_writers) membership_readers=\$(stat_field \"\$MNT\" membership_readers)\""
 
-  # The DEVICE's word on the identities (KD-MW-3 / §5.2 rule 2):
-  # `pr_registrant_shared` is set from the Reservation Report when the
-  # target attributes ANOTHER registration to this association's Host
-  # Identifier — two nodes aliasing as one registrant. Gated 0 on the
-  # manager and every joined writer; the configured strings above are the
-  # premise, this is the proof.
-  log "assemble-sym 7b/8: the device's registrant identities — pr_registrant_shared == 0 on every writer"
-  for c in "${clients[@]}"; do
-    remote "$(node_pub "$c")" MNT="$MOUNTPOINT" NODE="$c" <<<"$SYM_STAT_HELPERS
+  # The DEVICE's word on the identities: the Reservation Report's
+  # REGISTRANT COUNT. Every node's daemon registers on every namespace of
+  # the set (the manager HOLDS + registers, each REMOTE joiner REGISTERS
+  # under the set's key with ITS host identity; the reader registers
+  # nothing) — so `nvme resv-report -e` on any client node must list
+  # exactly N distinct Host IDs per namespace. Two nodes aliasing as one
+  # host (a cloned identity) read N − 1; a joiner that adopted instead of
+  # registering reads N − 1 too. (Round 1's `pr_registrant_shared` was
+  # vacuous here — the MANAGER's own gauge, evaluated at its open before
+  # any joiner, sensitive only to a different rkey under its own hostid;
+  # review round 2, Issue 14.) The manager's `pr_registrants_per_namespace`
+  # — the daemon's own REGCTL read, refreshed on the guard's 10 s heartbeat
+  # for the METADATA namespaces — is printed beside it as the record.
+  log "assemble-sym 7b/8: the device's registrant count — nvme resv-report -e on every namespace of the set reads $n distinct Host IDs (the manager + $((n - 1)) joined writers)"
+  remote "$(node_pub "${clients[0]}")" N="$n" MNT="$MOUNTPOINT" <<<"$SYM_STAT_HELPERS
 die() { echo \"FATAL: \$*\" >&2; exit 1; }
-v=\"\$(stat_field \"\$MNT\" pr_registrant_shared)\"
-[ \"\$v\" = \"0\" ] || die \"\$NODE: pr_registrant_shared=\$v — the device attributes ANOTHER registration to this node's Host Identifier (two client nodes share one nvme host identity: fencing between them is process-local, not device-enforced); regenerate /etc/nvme/hostid on one of them and re-run assemble-sym\"
-echo \"  \$NODE: pr_registrant_shared=0 (the device sees this node as its own registrant)\""
+set -euo pipefail
+command -v nvme >/dev/null 2>&1 || die \"nvme-cli missing on the manager's node\"
+devs=\"\$(sed 's|^sqmeta://||' /etc/squeezefs-bench-meta-uri),\$(sed 's|^sqdata://||' /etc/squeezefs-bench-data-uri)\"
+IFS=, read -ra DEVS <<<\"\$devs\"
+[ \"\${#DEVS[@]}\" -ge 2 ] || die \"no namespaces recorded on this node (the connect step did not run)\"
+for d in \"\${DEVS[@]}\"; do
+  # a joiner's registration is synchronous at its join, but the report is
+  # the device's — one short retry window absorbs a fabric round trip
+  got=-1
+  for try in \$(seq 1 20); do
+    : \"\$try\"
+    got=\"\$(nvme resv-report -e -o json \"\$d\" 2>/dev/null | python3 -c '
+import json, sys
+r = json.load(sys.stdin)
+regs = r.get(\"regctlext\") or r.get(\"regctl_ext\") or r.get(\"regctls\") or []
+print(len({str(e.get(\"hostid\", \"\")).lower() for e in regs if str(e.get(\"hostid\", \"\"))}))' 2>/dev/null || echo -1)\"
+    [ \"\$got\" = \"\$N\" ] && break
+    sleep 1
   done
+  [ \"\$got\" = \"\$N\" ] || die \"\$d: nvme resv-report -e lists \$got distinct Host ID(s) (want \$N = the manager + \$((N - 1)) joined writers, each its OWN registrant) — a cloned host identity (two nodes as one registrant) or a joiner that adopted instead of registering; the fence between such nodes is process-local, not device-enforced\"
+  echo \"  \$d: \$got distinct registrant Host IDs (the device's report)\"
+done
+echo \"  manager pr_registrants_per_namespace (the daemon's REGCTL read, 10 s heartbeat on the metadata namespaces): \$(stat_field \"\$MNT\" pr_registrants_per_namespace)\""
 
   log "assemble-sym 8/8: build_commit verification ritual on every node"
   for c in "${clients[@]}"; do

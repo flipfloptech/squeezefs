@@ -219,9 +219,14 @@ nvme-cli host identity (`/etc/nvme/hostnqn` + `hostid`), generated where
 missing and **asserted distinct across the client nodes — both words**
 (nvmet keys a PR registrant by the Host ID; a baked AMI clones both files
 onto every node; a duplicate of either regenerates both), and after the
-mounts the DEVICE's own answer is gated: **`pr_registrant_shared == 0`** on
-the manager and every joiner (the Reservation Report attributes no other
-registration to the node's Host Identifier). No `SQUEEZEFS_FLEET_SHARE` —
+mounts the DEVICE's own answer is gated: **`nvme resv-report -e` on every
+namespace of the set lists exactly N distinct Host IDs** (the manager holds
+and registers, each REMOTE joiner registers under its own host identity,
+the reader registers nothing — two nodes aliasing as one host, or a joiner
+that adopted instead of registering, read N − 1); the manager's
+`pr_registrants_per_namespace` (its own REGCTL read, refreshed on the 10 s
+guard heartbeat for the metadata namespaces) is printed beside it as the
+record. No `SQUEEZEFS_FLEET_SHARE` —
 one daemon per node owns its machine, which is the point of the venue. The
 mw preset's node packages gain `attr` (`getfattr` reads the striped
 directory's `user.squeezefs.stripes`); the deploy resolves every tool the

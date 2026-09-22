@@ -308,7 +308,10 @@ sym_law_gate2_engagement() { # label entries wire xv ship pub handovers_joiner h
 }
 
 # The gate-2 verdict over the A-B-B-A (sym-1 local-1 local-2 sym-2 walls,
-# seconds): the joined writer's mean wall ≤ 1.10 × the S0 mean.
+# seconds): the joined writer's mean wall ≤ 1.10 × the S0 mean. S0 is the
+# MANAGER's own extract on its mount with the fleet's other members mounted
+# and idle (the matrix's `local_arm`; the cloud driver's too) — the same
+# shape on every venue, never a solo mount.
 sym_law_gate2_verdict() { # s1 s2 l1 l2
     python3 - "$1" "$2" "$3" "$4" <<'PYGATE'
 import sys

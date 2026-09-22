@@ -74,9 +74,13 @@
 #
 # The rows are the matrix's, verbatim in shape:
 #   gate 2  sym-tarx      A-B-B-A: sym-1 (writer 1 extracts into a directory
-#                         it created) local-1 local-2 (the manager's S0)
-#                         sym-2; law ≤ 1.10× S0, verbs/entry < 0.05,
-#                         handovers 0, rpcs 0.
+#                         it created) local-1 local-2 (S0 = the MANAGER's
+#                         own extract on its node — the matrix's shape:
+#                         the joiners and the reader stay MOUNTED and idle,
+#                         so the manager serves their renewals and token
+#                         planes during S0; never a solo mount) sym-2; law
+#                         ≤ 1.10× S0, verbs/entry < 0.05, handovers 0,
+#                         rpcs 0.
 #   gate 3  sym-scale     N ∈ ns: N writers (the manager + N−1 joiners) each
 #                         create --files in its own directory then ingest
 #                         --ingest-mb; ≥ 0.7 × N × the N=1 rate on both
@@ -723,7 +727,7 @@ row_tarx() {
     local jw="${WRITERS[0]}" label
     BENCH_ORDER=$((BENCH_ORDER + 1))
     prepare_corpus
-    log "gate 2 (sym-tarx): corpus $CORPUS_ENTRIES entries; venue = joined writer m$jw (${HOST[$jw]}) extracting into a directory IT created over the REAL fabric (rtt $RTT_TEXT), vs the manager-local S0 (m0, ${HOST[0]}); A-B-B-A; $([ "$TARX_REPS" = 0 ] && echo "≥ $RT s per arm" || echo "$TARX_REPS extraction(s) per arm — the box's shape")"
+    log "gate 2 (sym-tarx): corpus $CORPUS_ENTRIES entries; venue = joined writer m$jw (${HOST[$jw]}) extracting into a directory IT created over the REAL fabric (rtt $RTT_TEXT), vs S0 = the manager's own extract on m0 (${HOST[0]}) with the ${#WRITERS[@]} joiner(s)${READER:+ + the reader} mounted and idle; A-B-B-A; $([ "$TARX_REPS" = 0 ] && echo "≥ $RT s per arm" || echo "$TARX_REPS extraction(s) per arm — the box's shape")"
     local -a rows=()
     sym_arm() { # label -> row line
         local label="$1" out wire xv ship pub verbs_per h_j h_m rpcs
@@ -743,10 +747,12 @@ row_tarx() {
         verbs_per="$(sym_law_gate2_engagement "$label" "$entries_total" "$wire" "$xv" "$ship" "$pub" "$h_j" "$h_m" "$rpcs")"
         echo "$out wire=$wire xv=$xv ship=$ship pub=$pub verbs/entry=$verbs_per handovers=0"
     }
-    local_arm() { # label -> row line (the S0 shape)
+    local_arm() { # label -> row line (the S0 shape: the manager's own
+        # extract with the joiners and the reader mounted and idle — the
+        # matrix's `local_arm`, never a solo mount)
         local label="$1" out
         out="$(sym_venue_extract 0 "$label")"
-        echo "$out local-S0"
+        echo "$out manager-local-S0(joiners-idle-mounted)"
     }
     rows+=("$(sym_arm sym-1)")
     rows+=("$(local_arm local-1)")
@@ -754,7 +760,7 @@ row_tarx() {
     rows+=("$(sym_arm sym-2)")
     {
         row_stamp "sym-tarx" "tar -xf $CORPUS_REMOTE (entries=$CORPUS_ENTRIES) ×reps; A-B-B-A sym-1 local-1 local-2 sym-2"
-        echo "== gate 2: tar -x on a JOINED WRITER node (m$jw) over the real fabric vs manager-local S0 (m0) — entries=$CORPUS_ENTRIES per rep; $([ "$TARX_REPS" = 0 ] && echo "≥ $RT s per arm" || echo "$TARX_REPS extraction(s) per arm") =="
+        echo "== gate 2: tar -x on a JOINED WRITER node (m$jw) over the real fabric vs S0 = the manager's own extract (m0; joiners idle and mounted — the matrix's shape) — entries=$CORPUS_ENTRIES per rep; $([ "$TARX_REPS" = 0 ] && echo "≥ $RT s per arm" || echo "$TARX_REPS extraction(s) per arm") =="
         printf '%-10s %-10s %-5s %-8s %s\n' ARM WALL/REP_S REPS OPS_S ENGAGEMENT
         local r a b c d rest
         for r in "${rows[@]}"; do

@@ -814,8 +814,11 @@ cmd_launch() {
   # WAITS on cloud-init and verifies, with an apt fallback only if
   # user-data failed. The mw client set installs on every node — a few
   # idle MiB on storage nodes buys the one-template simplicity.
+  # `attr` (getfattr/setfattr): the symmetric rows read the striped
+  # directory's `user.squeezefs.stripes` — the cloud image ships libattr1
+  # but not the tools (PR 15 review round 1, Issue 1).
   local extra_pkgs=""
-  [ "$PRESET" = "mw" ] && extra_pkgs=" openmpi-bin libopenmpi-dev python3 curl gcc make"
+  [ "$PRESET" = "mw" ] && extra_pkgs=" openmpi-bin libopenmpi-dev python3 curl gcc make attr"
   local user_data
   user_data="$(printf '#!/bin/bash\nexport DEBIAN_FRONTEND=noninteractive\napt-get -qq update\napt-get -qq install -y fuse3 nvme-cli%s\n' "$extra_pkgs" | base64 -w0)"
   LT_ID="$(awsq "lt-dryrun" ec2 create-launch-template \
@@ -963,7 +966,7 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 cloud-init status --wait --long >/dev/null 2>&1 || true
 need="fuse3 nvme-cli"
-[ "$NEED_MW" = "1" ] && need="$need openmpi-bin libopenmpi-dev python3 curl gcc make"
+[ "$NEED_MW" = "1" ] && need="$need openmpi-bin libopenmpi-dev python3 curl gcc make attr"
 missing=""
 for p in $need; do dpkg -s "$p" >/dev/null 2>&1 || missing="$missing $p"; done
 if [ -n "$missing" ]; then
@@ -972,6 +975,13 @@ if [ -n "$missing" ]; then
   # shellcheck disable=SC2086
   apt-get -qq install -y $missing >/dev/null
 fi
+# The TOOLS the rows invoke, by name (a package verified is not a binary
+# resolved): die LOUD here, on the deploy, never mid-row on a billing fleet.
+tools="fusermount3 nvme python3 tar"
+[ "$NEED_MW" = "1" ] && tools="$tools mpirun mpicc curl gcc make getfattr setfattr ping"
+for t in $tools; do
+  command -v "$t" >/dev/null 2>&1 || { echo "deploy: tool '$t' missing on this node after the package install (the rows need it)" >&2; exit 1; }
+done
 EOS
     push "$sqz" "$ip" "$REMOTE_DIR/squeezefs"
     # sha256 verification: same-commit artifact on every node (KD-7 spirit)

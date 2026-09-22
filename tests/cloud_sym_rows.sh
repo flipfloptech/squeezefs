@@ -486,6 +486,24 @@ preflight() {
 }
 
 # --- tools on the nodes ---------------------------------------------------------------
+# Every tool a row invokes must resolve on the node BEFORE any row runs:
+# a missing binary dies LOUD here, never mid-row on a billing fleet (the
+# review's Issue 1: `getfattr` is not on the cloud image, and a failed
+# `getfattr … || echo 0` read K = 0 — a false RED of the -ls law).
+tools_preflight() {
+    local idx tools
+    for idx in 0 "${WRITERS[@]}" ${READER:+1}; do
+        tools="python3 stat timeout ls rm mkdir"
+        if [ "$idx" != "1" ]; then tools="$tools tar cc dd getfattr"; fi
+        if [ "$idx" = "${WRITERS[0]}" ] && [ -n "$MANAGER_PRIV" ]; then tools="$tools ping"; fi
+        RX_CANNED="" rx "$idx" TOOLS="$tools" <<'EOS' || die "m$idx (${HOST[$idx]}): a tool the rows need is missing (see above) — install it on the node before any row runs"
+missing=""
+for t in $TOOLS; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
+[ -z "$missing" ] || { echo "missing on $(hostname):$missing" >&2; exit 1; }
+EOS
+    done
+    log "tools preflight: every row tool resolves on every node"
+}
 MDSTORM_BIN="$REMOTE_DIR/mdstorm"
 install_mdstorm() {
     [ -r "$MDSTORM_SRC" ] || die "mdstorm source missing: $MDSTORM_SRC"
@@ -1049,11 +1067,15 @@ EOS
         sym_zero_set_file sym-shared-dir "$idx" "$ROWDIR/m${idx}_psd1.json"
     done
     striped="$(sym_json_sum "$ROWDIR/m${holder}_psd1.json" dir_striped_dirs)"
+    # K = the directory's stripe count as the HOLDER reports it; a missing
+    # tool or a non-integer answer is a harness failure, never K = 0.
     local xattr_k
     xattr_k="$(rx "$holder" P="${MNT[$holder]}$shared_rel" <<'EOS'
-getfattr -n user.squeezefs.stripes --only-values "$P" 2>/dev/null || echo 0
+getfattr -n user.squeezefs.stripes --only-values "$P"
 EOS
-)"
+)" || die "sym-shared-dir: getfattr -n user.squeezefs.stripes on the holder m$holder FAILED (the tool missing, or the directory carries no stripe map) — see above"
+    [[ "$xattr_k" =~ ^[0-9]+$ ]] && [ "$xattr_k" -ge 1 ] ||
+        die "sym-shared-dir: the holder's user.squeezefs.stripes read '$xattr_k' (want an integer ≥ 1 — K)"
     {
         row_stamp "sym-shared-dir" "python3 O_CREAT|O_EXCL creators: ${#writers[@]} nodes × $per_writer into ONE directory held by m$holder"
         echo "== gate 3b: ${#writers[@]} creator nodes × $per_writer into ONE directory (holder m$holder): wall $wall s, $(python3 -c "print(f'{$created/($t1-$t0):.0f}')") creates/s aggregate (RT $RT s) =="
@@ -1133,6 +1155,7 @@ parse_storage
 node_facts
 measure_rtt
 preflight
+tools_preflight
 $DRY_RUN || : >"$ROWS_FILE"
 {
     echo "cluster=${CLUSTER:-} venue=$SYM_VENUE substrate=${SUBSTRATE:-}"

@@ -475,7 +475,14 @@ three exit-2 codes (attempts 12–14) are the harness-edit shifted-tail
 class after the 10/10 verdict line, never a round (the harness law, §4.6). Fix round 1 added a
 1/1 mechanism round on the fix-round binary (§3.8b).
 
-### 3.9 The box brackets — NOT RUN: the venue was found reclaimed (the box-rows rung, `perf/sym-box-rows`, 2026-09-22)
+### 3.9 The box brackets (the box-rows rung, `perf/sym-box-rows`, 2026-09-22) — the venue was reclaimed 2026-09-19 and restored by the owner 2026-09-22 01:07 UTC; the brackets ran after that
+
+> **History (kept as the record of what happened, read 00:20 UTC):** the
+> section below down to "The procedure" is the venue finding as written
+> before the owner restored the box. **At 01:07 UTC the owner rebooted
+> `squeeze-test` into `6.19.14-sqz`** (grub default restored, no Lustre
+> mount, docker inactive, no daemon; verified at 01:09 — up 1 min, load 0)
+> and the brackets ran as §3.9.1 onward records.
 
 **What this rung was to run** (the brief off §8 / §9): gate 1's solo
 re-gate A-B-B-A with PR 1's rig verbatim (arm A `3228fcb8` flat vs arm B
@@ -601,6 +608,147 @@ on PR 13b's binary from zero (its summary: `sym-foreign-file` ×3,
 are closed there. The rate half of gates 1 / 2 / 3 / 3b / 3c / 5 / 7 is
 exactly as owed as it was at PR 13's close — now with the arms in hand
 and the venue's state on record.
+
+#### 3.9.1 Gate 1 — the solo re-gate on the restored box (2026-09-22 01:12 → 02:0x UTC): **DELTA — B (PR 13b's flat path) reads 3.5–5 % below A (the pre-program tip) on every CPU-bound row, both orders**
+
+**Venue (the same as PR 1's row, re-verified 01:09 UTC):** `squeeze-test`
+(`memp-s3ds-aqs-37`), 32-core Xeon, 251 GiB, Rocky 8.10, **kernel
+`6.19.14-sqz`** (the sqz series incl. patch 0031 — the per-queue bg budget),
+up 1 min and idle at the first leg (load 0.02); the reset-v5 converged
+fabric (`/scratch/tmp/cluster_reset_v4.sh`, run once by hand to verify —
+rc 0, 15 namespaces connected, format complete — then per arm by the
+rig): 5 storage nodes × (1 meta + 2 data) memory-backed null_blk
+namespaces over nvme-tcp, two paths each, cache-less format; the storage
+nodes on `4.18.0-553.123.1.el8_lustre.ddn17` (nvmet targets — fine for
+this row, no PR needed on the flat path). Sector 0 `features_incompat =
+0xffd7`, bit 17 = 0 on every meta volume of every arm (the rig reads it).
+Transport geometry identical on every leg of both arms: `queues=32
+depth=32 payload_sz=1048576 max_write=1048576 max_pages=256
+buffers=kmbuf-bufring+zero-copy+retention kmbuf_ops=37/38 (6.19-sqz)
+sqpoll=off`. **Instrument:** PR 1's rig VERBATIM
+(`/scratch/tmp/rigs/2026-09-13-sym-pr1-solo-regate.sh`, diff-identical to
+the tree's) + its reducer; `fio-3.36`, the box's standing job files
+(libaio, `direct=1`, 24 jobs, `ramp_time=10`): `write_BW` 1 MiB × qd 16,
+`rand{read,write}_iops` 4 KiB × qd 8. **The fio window is 30 s measured
++ 10 s ramp per row, NOT 60 s — a rig finding (§3.9.1b): the job files
+carry `runtime=30` and a job-section value overrides the CLI's
+`--runtime=60`, so PR 1's rows (which state "RT=60") ran the same 30 s
+window — the two brackets are comparable to each other and to the
+campaign rows, and neither meets the ≥ 60 s sustained-state rule; the
+bw-log flatness column stands in.** Arms: **A** = `3228fcb8`, **B** =
+`7b2ef9e9`'s code (§3.9's table — both `release`, same `rustc 1.98.0
+(88d9e12a 2026-08-18)`; A's binary 627.5 MB, B's 857.0 MB with
+debuginfo). Order: **bracket 1 A B B A** (01:12:58 → 01:38:57 UTC, all six
+rows, `rows-gate1-20260922-011258`); **bracket 2 B A A B** (the reversed
+re-run of the DELTA rows + `rr4k`, 01:40:30 → §3.9.1a). Verdict rule =
+PR 1's: `within noise` iff |B/A − 1| ≤ max(band, 3 %), else `DELTA` and
+one reversed bracket before any verdict.
+
+**Bracket 1 (A B B A) — every row:**
+
+| row | primary | A1 | B2 | B3 | A4 | median A | median B | **B/A** | band | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `wfresh-kern` (write_BW, the fresh set) | MiB/s | 36,298 | 33,942 | 33,811 | 34,993 | 35,645 | 33,877 | **0.950** | 3.7 % | **DELTA** (B −5.0 %) |
+| `rr4k-kern` (randread 4 KiB) | IOPS | 603,015 | 593,213 | 593,357 | 605,847 | 604,431 | 593,285 | **0.982** | 0.5 % | within noise (the 3 % floor; B's two positions agree to 0.02 %, A's to 0.5 % — REPRODUCIBLE −1.8 %, PR 1 §4.3's carried residual, re-read in bracket 2) |
+| `rw4k-kern` (randwrite 4 KiB, the W1 patch arm) | IOPS | 542,637 | 520,361 | 517,480 | 536,596 | 539,616 | 518,920 | **0.962** | 1.1 % | **DELTA** (B −3.8 %) |
+| `mount` (fresh format → ready) | s | 0.372 | 0.420 | 0.458 | 0.498 | 0.435 | 0.439 | 1.009 | 29.0 % | within noise |
+| `remount` (populated set → ready) | s | 0.616 | 0.687 | 0.562 | 0.572 | 0.594 | 0.625 | 1.051 | 20.0 % | within noise |
+| `umount` (clean, after `rw4k`) | s | 7.589 | 7.844 | 9.972 | 8.612 | 8.101 | 8.908 | 1.100 | 23.9 % | within noise |
+| `mdstorm mkdir` 20k | ops/s | 6,725 | 6,466 | 6,625 | 6,834 | 6,780 | 6,546 | **0.965** | 2.4 % | **DELTA** (B −3.5 %) |
+| `mdstorm create` 100k | ops/s | 5,730 | 5,770 | 5,695 | 5,877 | 5,804 | 5,732 | 0.988 | 2.5 % | within noise |
+| `mdstorm stat` 100k | ops/s | 189,280 | 190,079 | 191,908 | 187,012 | 188,146 | 190,994 | 1.015 | 1.2 % | within noise |
+| `mdstorm rename` 100k | ops/s | 4,365 | 4,312 | 4,265 | 4,512 | 4,438 | 4,288 | **0.966** | 3.3 % | **DELTA** (B −3.4 %) |
+| `mdstorm unlink` 100k | ops/s | 5,163 | 5,051 | 4,986 | 5,242 | 5,202 | 5,018 | **0.965** | 1.5 % | **DELTA** (B −3.5 %) |
+| `mdstorm manydirs` 100k | ops/s | 10,912 | 10,871 | 11,026 | 11,206 | 11,059 | 10,948 | 0.990 | 2.7 % | within noise |
+| `mdstorm rmdir` 20k | ops/s | 5,451 | 5,768 | 5,813 | 5,963 | 5,707 | 5,790 | 1.015 | 9.0 % | within noise |
+
+**Engagement / tripwires — every leg of both arms:** `dlm_mode` `solo`,
+**`dlm_rpcs` 0** on all 12 mount legs (the rig's exit-3 law: `gate_failed=0`),
+`mount_posture` `writer`, Δ`invariant_tripwires` (+ the eight sibling
+tripwires) 0 on every row, Δ`fsck_findings` 0, Δ`meta_kv_block_refs_drift`
+0, `meta_kv_forest_{slot_trees_minted,root_publishes,key_violations,
+reader_window_skips,reader_unpublished_children}` **0** on every B mount
+(the bit-17-absent volume takes the shipped path), `write_enospc_refusals`
+/ `rewrite_shadow_fence_drops` / `write_pipeline_fence_drops` /
+`fuse_op_watchdog_overdue` / `stale_binding_escalations` / the reclaim
+`sync_drains` / `fence_halts` / `cap_parks` **0** on every write row.
+dmesg: the same five boot-time lines after every row, nothing logged
+during any row. Thermal: the hottest hwmon sensor 47–51 °C at every row
+start AND end (no heat soak — the venue law's point). The metadata
+economy per row is identical arm to arm: `Δjournal_entries` 54.9–55.3k
+(`wfresh`), 48–50 (`rr4k`), 4,029–4,072 (`rw4k`), 547.6–547.7k (mdstorm);
+checkpoints 200 / 65–67 / 200–205 / 70–73; `layout_publish_batches` 49,128
+and `layout_delta_commits` 35,204–35,207 on every `wfresh` position.
+
+**Write-amplification columns (the daemon's device-byte ledger ÷ fio's
+user bytes; RAMP-INCLUSIVE — the `.stats` pair brackets fio's 40 s
+while `io_bytes` counts the 30 s window, so ≈ 1.04–1.15× reads as 1.0×
+device/user):** PR 1's rig snapshots no `/proc/diskstats` and runs no
+`iostat`, so the `/proc/diskstats` face and `wareq-sz` are NOT in this
+bracket (harness gap, §3.9.1b).
+
+| row / position | user GiB | device write bytes ÷ user (daemon ledger) | `write_through_blocks` | reclaim `commands` / `discards` | discard bytes ÷ user | `block_free_elided_debt_bytes` |
+|---|---|---|---|---|---|---|
+| `wfresh` A1 / A4 | 1,065 / 1,026 | `rewrite_device_write_bytes` **1.054 / 1.043** | 4,845 / 3,021 | 13,644 / 11,796 ; 13,783 / 11,944 | 0.051 / 0.045 | 42.6 / 43.9 GiB |
+| `wfresh` B2 / B3 | 1,001 / 991 | **1.035 / 1.041** | 4,213 / 3,513 | **32,131 / 50,356** ; 32,546 / 51,009 | **0.127 / 0.201** | 68.3 / 81.1 GiB |
+| `rw4k` A1 / A4 | 62.1 / 61.4 | `patch_write_bytes` **1.144 / 1.141** (4 KiB in-place DMA per op; `patch_writes` ≈ ios) | 2,224 / 2,275 (the prep's residue) | 0 / 0 | 0 | ≈ 0 |
+| `rw4k` B2 / B3 | 59.6 / 59.2 | **1.146 / 1.146** | 2,238 / 2,222 | 0 / 0 | 0 | ≈ 0 |
+
+Device write bytes ≡ user bytes on both arms and both rows (no
+amplification; the W1 arm and the CoW-rewrite arm behave identically).
+**One behaviour difference on the flat path**: B's reclaimer issued
+**2.4–3.7× the discard commands** of A on `wfresh` (32–50k vs 12–14k per
+row, `block_free_trim_bytes` 0.13–0.20× user vs 0.05×) for the SAME
+`block_free_reclaim_elided` count (243–264k on all four) and a higher
+elided-debt drain (`block_free_debt_pressure_drains` 59 on B2, 0 on A) —
+the discard-elision debt draining as device commands more often; ≈ 1k
+commands/s against 25k+ 1 MiB writes/s, so not the throughput term, but
+a flat-path delta to attribute (§3.9.1c).
+
+**Attribution of the DELTA (the captured `.stats` pairs; no extra row
+run):** the cost is a **uniform ≈ +1–1.5 µs of daemon CPU per FUSE op
+on the data-plane handlers**, read three ways —
+
+* `rw4k` (the W1 in-place patch: NO metadata commit per op, 4,0xx journal
+  entries per row both arms): daemon µs/op **40.3 / 41.0 (A) → 42.2 /
+  42.7 (B)** (+4 %); by class `fuse3-ur` (the FUSE-over-io_uring queue
+  workers) 33.4 / 33.9 → 34.9 / 35.0 (**+1.2 µs/op**), `fuse3-tpc` 6.2 /
+  6.3 → 6.5 / 6.9 (+0.4); `write_transport_phase_ns.transport_total`
+  197–199 → 208 µs, `queue_wait` 66–67 → 70 µs; clat p50 249–251 → 261 µs
+  (+4 %); `write_pipeline_phase_ns` (the 2.2k write-through blocks) par.
+* `rr4k`: daemon µs/op **31.6 / 31.7 → 32.8 / 32.75** (+3.5 %);
+  `fuse3-tpc` 12.9 → 13.6 (+0.7), `fuse3-ur` 18.7 → 19.1 (+0.4);
+  `read_serve_phase_ns.total` 154 → 157 µs = `block_fetch` 148 → 151 =
+  `zc_bridge_phase_ns.total` 147.4–147.9 → 150.3–150.9 (`msg_hop` 24.3–24.6
+  → 25.0–25.1, `wake_hop` 26.0 → 27.7–28.0, `device_cq` 96 → 97 — the
+  hops grow on a 74–75 %-busy box when the handler lanes carry more CPU
+  per op); `read_transport_phase_ns.dispatch_lag` 26.0 → 27.6–28.4.
+* `wfresh` (CPU-bound at the venue's nvme-tcp ceiling, box 71–72 % busy
+  both arms): daemon µs per 1 MiB write 524 / 533 → 536 / 545 (+1–2 %);
+  `publish_phase_ns.meta_commit` 434–435 → 456–489 µs, `publish total`
+  663 → 683–769; `write_transport_phase_ns.dispatch_lag` 714–791 →
+  819–854 µs, `queue_wait` 592–646 → 608–703; GiB moved in the window
+  1,026–1,065 → 991–1,001.
+* mdstorm: the three write-heavy phases −3.4…−3.5 % with identical
+  journal entries / checkpoints / node appends (the same records, the
+  same number of times — a per-op CPU cost, not an economy change);
+  `stat` +1.5 %, `create` −1.2 %, `manydirs` −1.0 %, `rmdir` +1.5 %.
+
+The shape is a fixed per-op overhead added to every FUSE op on the
+UNARMED path (both data handlers AND the metadata write phases), not one
+phase's term — the class PR 13's §2 named as "per-op atomic loads that
+are behaviour-identical" plus whatever PRs 5–13b added at the unarmed
+entry points (`token_reader_for`'s divert check on every metadata resolve,
+`record_ship`'s home resolution at every setattr / layout publish, PR 9's
+per-write `custody_use_enter` + `cached_lease_token`, the served-mutation
+and recall sinks, `refuse_foreign_slot_open` at every write-intent open,
+the new sharded phase families' recording). **Naming the site needs a
+`perf record` A/B on the box — a follow-up row the orchestrator approves,
+not this bracket's; the phase ledger above is the honest attribution this
+rung has.** This is a PRODUCT finding (a flat-path regression accumulated
+over PRs 2–13b — the design's gate 1 says "within noise", and 3.5–5 % on
+a 0.5–3.7 % band, both orders, is not noise), reported to the
+orchestrator; nothing in the tree was changed for it.
 
 ## 4. Issues found (each with its PR and its red pin)
 

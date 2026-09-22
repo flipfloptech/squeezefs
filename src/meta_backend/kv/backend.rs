@@ -7889,6 +7889,13 @@ impl KvMetaBackend {
             t_idle,
             plane.n_floor(),
         );
+        log::debug!(
+            "slot lease: served ship on slot {slot} from appender {requester} at holder {holder}: \
+             ops_h {ops_h}, N_floor {}, T_idle {} ms, cooldown {} → {verdict:?}",
+            plane.n_floor(),
+            t_idle / 1_000_000,
+            plane.in_cooldown(slot, now)
+        );
         match verdict {
             ShipVerdict::Serve => {}
             ShipVerdict::OfferIdle { .. } | ShipVerdict::OfferDominated { .. } => {

@@ -47,6 +47,10 @@ fn reset_process_state() {
     squeezefs::membership::test_clear_death_sinks();
     squeezefs::membership::uninstall_window_decl_source();
     squeezefs::membership::uninstall();
+    // The S8 phase table seeds every later plane's `N_floor` (its `Rtt`
+    // mean): a contract that parks a served step (F-R4's pin) must not
+    // hand the next one a seconds-long handover seed.
+    squeezefs::meta_ship::test_reset_ship_phases();
 }
 
 /// Enroll this process's manager identity in the volume's claim set with

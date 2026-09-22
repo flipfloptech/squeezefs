@@ -638,6 +638,20 @@ pub fn ship_phase_totals(phase: ShipPhase) -> (u64, u64) {
     (h.sum_ns(), h.count())
 }
 
+/// Test seam: zero the client-side phase table (every process-global
+/// always-on histogram a later test's derivation seeds from). The
+/// slot-lease plane's `N_floor` cold start reads the `Rtt` MEAN, so a
+/// contract that deliberately PARKS a served step (the F-R4 pin: one
+/// ship of ≈ 700 ms while the slot moved) would hand every plane armed
+/// after it in the same process a 2 s handover seed — a floor the next
+/// contract's burst chases and never catches. Reset between contracts
+/// (`reset_process_state`); never called by product code.
+pub fn test_reset_ship_phases() {
+    for h in SHIP_PROF.iter() {
+        h.reset();
+    }
+}
+
 /// `meta_ship_phase_ns` — the client-side decomposition.
 pub fn phase_json() -> serde_json::Value {
     let mut phases = serde_json::Map::new();

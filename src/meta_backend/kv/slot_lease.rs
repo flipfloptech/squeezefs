@@ -549,6 +549,14 @@ impl SlotLeasePlane {
             );
         }
         let handover_ns = crate::slot_lease_core::handover_cold_start_ns(write_ns, ship_ns);
+        log::debug!(
+            "slot lease: N_floor cold-start seed — journal write mean {} µs, ship rtt mean {} µs \
+             → ewma_ship {} µs, ewma_handover {} µs",
+            write_ns / 1_000,
+            rtt_ns / 1_000,
+            ship_ns / 1_000,
+            handover_ns / 1_000
+        );
         if handover_ns != 0 {
             let _ = self.ewma_handover_ns.compare_exchange(
                 0,

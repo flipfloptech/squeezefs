@@ -9745,35 +9745,54 @@ async fn a_root_split_in_the_parked_cycles_flush_pass_never_drops_the_slots_page
 
 /// **A COLD `ls -l` of a STRIPED directory at a token reader pays ONE
 /// token per stripe — and a striped ROOT adds its own `K_root` at the
-/// reader's first `stat /`** (PR 13d — found by PR 15's local functional
-/// pass of the matrix's own `sym-shared-dir-ls` leg on the gated
-/// `77f4da1d`: `dlm_token_grants` read `2K + C + 3` (20,131 for K = 64,
-/// C = 20,000) where every PR 13-era run read `K + C + 3`; design §8 gate
-/// 3b's law is `[K + C, K + C + 4]`). Attributed to FLEET STATE, not a
-/// commit: that fleet had run `sym-scale` first, whose N = 8 row's seven
-/// `mkdir /scale-…` auto-striped `/` at the manager (`dir_striped_dirs 1`
+/// reader's first `stat /` AFTER the map is learnt** (PR 13d — found by
+/// PR 15's local functional pass of the matrix's own `sym-shared-dir-ls`
+/// leg on the gated `77f4da1d`: `dlm_token_grants` read `2K + C + 3`
+/// (20,131 for K = 64, C = 20,000) where every PR 13-era run read
+/// `K + C + 3`; design §8 gate 3b's law is `K_D + K_root + C + [0, 4]`
+/// since the adjudication). Attributed to FLEET STATE, not a commit: that
+/// fleet's writers had `mkdir`ed their per-leg directories into `/` on
+/// ONE fleet, which auto-striped `/` at the manager (`dir_striped_dirs 1`
 /// at m0 before the leg; 0 in every `K + C + 3` run), and the kernel
 /// revalidates the mount root's attrs on every path walk (every TTL is 0
 /// under tokens), so the reader's `stat /` folds over the root's stripes
-/// (`getattr_local` → `stripe_map_cached`, learnt by the `lookup(/, D)` →
-/// `fold_striped_attrs` → `stripe_record`) and pays ONE records-only grant
-/// per root stripe — the class the acceptance record's §7 item 7 prices
-/// ("one grant each per holder per token lifetime"). PR 13b's `7b2ef9e9`
-/// reads both arithmetics identically. The fleet's shape in one process:
-/// the directory held by the manager (this process's one cross-owner
-/// shipper and custody arm — both process-global), its stripes SUPPLIED
-/// by two joiners over the S8 wire (the remainder the manager's own), its
-/// children the manager's — the ones routing into a supplied stripe
-/// shipped to that holder — two metadata volumes (a directory's children
-/// mint round-robin over the set), and a `-o ro` reader whose planes dial
-/// each holder's listener. The reader's `ls -l` as the kernel walks it:
-/// `lookup(/, D)`, `stat /`, `stat D`, the paged `readdir` (the K-way
-/// merge), `lookup + stat` of every child, `stat D` again (the fold).
-/// Phase 1 (the leg's law): the root unstriped — EXACTLY `K + C + 3`: the
-/// root's dentry token, `D`'s record token, `D`'s dentry-bearing re-grant.
-/// Phase 2: the root striped over `K_root` stripes, a second cold reader —
-/// EXACTLY `K + C + 3 + K_root` (the root stripe the lookup fetched with
-/// dentries is one of the `K_root`).
+/// (`getattr_local` → `stripe_map_cached`, learnt by `lookup(/, D)`'s
+/// `stripe_route` → `fold_striped_attrs` → `stripe_record`) and pays ONE
+/// records-only grant per root stripe — the class the acceptance record's
+/// §7 item 7 prices ("one grant each per holder per token lifetime").
+/// PR 13b's `7b2ef9e9` reads every arithmetic below identically. The
+/// fleet's shape in one process: the directory held by the manager (this
+/// process's one cross-owner shipper and custody arm — both
+/// process-global), its stripes SUPPLIED by two joiners over the S8 wire
+/// (the remainder the manager's own), its children the manager's — the
+/// ones routing into a supplied stripe shipped to that holder — two
+/// metadata volumes (a directory's children mint round-robin over the
+/// set), and a `-o ro` reader whose planes dial each holder's listener.
+///
+/// **The constant beside `K_D + K_root + C` is the WALK ORDER's.** The
+/// routed verbs the FUSE handlers call: `lookup(/, D)`, `stat /`, `stat
+/// D`, the paged `readdir` (the K-way merge), `lookup + stat` per child,
+/// `stat D` again (the fold). Lookup-first (phases 1–2): `+3` = the root's
+/// dentry-bearing token (the lookup's `stripe_route(/)` marker read), `D`'s
+/// record token (the lookup's inner `getattr`), `D`'s dentry-bearing
+/// re-grant (the readdir's map read — a records-only token lacks the
+/// dentries). The KERNEL's order (phase 3) GETATTRs `/` BEFORE `LOOKUP(/,
+/// D)` (the `default_permissions` walk): that pre-lookup `stat /` pays one
+/// records-only root grant and folds NOTHING (the map is not learnt yet),
+/// so a truly cold reader in kernel order reads `+4` — the law's ceiling —
+/// and the fleet reads `+3` only because the harness's pre-leg `.stats`
+/// snapshot (a `GETATTR(1)`) absorbs the root's records grant before the
+/// leg's first reading (PR 15's `m1_pls0`: `dlm_token_grants [2, 0]`).
+///
+/// Phase 1 (the leg's law, lookup-first): the root unstriped — EXACTLY
+/// `K_D + C + 3`. Phase 2: the root striped over `K_root ≠ K_D` stripes
+/// (the discriminating shape — with `K_root = K_D` the reading equals `2K
+/// + C + 3`, which a "second token per `D` stripe" theory passes too), a
+/// second cold reader, lookup-first — EXACTLY `K_D + C + 3 + K_root`, and
+/// the per-volume `dlm_token_cached` split puts the `K_root` extra objects
+/// on the ROOT's volume alone (the fleet's own split, PR 15's and PR 13d
+/// run 2's, made a law). Phase 3: the KERNEL's order on the striped root, a
+/// third cold reader — EXACTLY `K_D + C + 4 + K_root`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cold_ls_of_a_striped_directory_at_a_token_reader_pays_one_token_per_stripe() {
     use squeezefs::meta_ship::token_plane::{reader_stats_json, TokenClientConfig};
@@ -9826,16 +9845,18 @@ async fn a_cold_ls_of_a_striped_directory_at_a_token_reader_pays_one_token_per_s
             Arc::clone(&for_arm) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
         }),
     );
-    // The flip at the holder: stripes 0 and 1 supplied by joiners 1 and 2
-    // (their slots, their listeners), the remainder the manager's own —
-    // three stripe holders.
-    const K: u16 = 4;
-    // The closures below run twice: they capture REFERENCES (copied into
-    // each `async move` block), never the handles.
+    // The flip at the holder over `k` stripes: stripes 0 and 1 supplied by
+    // joiners 1 and 2 (their slots, their listeners), the remainder the
+    // manager's own — three stripe holders. `K_D` for the directory,
+    // `K_ROOT ≠ K_D` for the root (Issue 2: the discriminating shape).
+    const K_D: u16 = 4;
+    const K_ROOT: u16 = 6;
+    // The closures below run more than once: they capture REFERENCES
+    // (copied into each `async move` block), never the handles.
     let (mgr, uris_ref, mtokens_ref, j1venue_ref, j2venue_ref) =
         (&manager, &uris, &mtokens, &j1venue, &j2venue);
-    let flip_and_migrate = |dir: u64| async move {
-        mgr.stripe_dir_with_suppliers(dir, K, &[1, 2])
+    let flip_and_migrate = |dir: u64, k: u16| async move {
+        mgr.stripe_dir_with_suppliers(dir, k, &[1, 2])
             .await
             .unwrap_or_else(|e| panic!("the flip of {dir} with two supplied stripes: {e}"));
         // Every name re-homed before a reader looks (the finished shape).
@@ -9853,8 +9874,8 @@ async fn a_cold_ls_of_a_striped_directory_at_a_token_reader_pays_one_token_per_s
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     };
-    let map = flip_and_migrate(d).await;
-    assert_eq!(map.stripes.len(), usize::from(K));
+    let map = flip_and_migrate(d, K_D).await;
+    assert_eq!(map.stripes.len(), usize::from(K_D));
     for (j, stripe) in [(&j1, map.stripes[0]), (&j2, map.stripes[1])] {
         assert!(
             j.volumes[0]
@@ -9870,6 +9891,7 @@ async fn a_cold_ls_of_a_striped_directory_at_a_token_reader_pays_one_token_per_s
     files.extend(create_files(&manager, d, "post-", 24).await);
     let c = files.len() as u64;
     let (dv, _) = manager.route_ino(d);
+    let (root_v, _) = manager.route_ino(1);
     let off_volume = files
         .iter()
         .filter(|(_, ino)| manager.route_ino(*ino).0 != dv)
@@ -9878,13 +9900,16 @@ async fn a_cold_ls_of_a_striped_directory_at_a_token_reader_pays_one_token_per_s
         off_volume > 0,
         "premise: some children live on the volume D does not ({off_volume} of {c})"
     );
-    let k = u64::from(K);
+    let k = u64::from(K_D);
     let files_ref = &files;
 
     // A COLD reader: nothing of the directory cached, every holder's
     // listener bound, its tree 0 polled after the manager's checkpoint
-    // (the lessees published). Returns the grants its `ls -l D` paid.
-    let cold_ls = |client_id: &'static str| async move {
+    // (the lessees published). `kernel_order` puts the mount root's
+    // GETATTR BEFORE the lookup (the `default_permissions` walk). Returns
+    // the grants its `ls -l D` paid, the per-volume `dlm_token_cached` at
+    // the end (a fresh reader starts at 0) and the face.
+    let cold_ls = |client_id: &'static str, kernel_order: bool| async move {
         for v in &mgr.volumes {
             v.checkpoint_now().await.expect("checkpoint");
         }
@@ -9905,16 +9930,22 @@ async fn a_cold_ls_of_a_striped_directory_at_a_token_reader_pays_one_token_per_s
             rv.bind_reader_holder_endpoint(1, &j1venue_ref.endpoint);
             rv.bind_reader_holder_endpoint(2, &j2venue_ref.endpoint);
         }
-        let grants = |reader: &RoutedMetaBackend| -> u64 {
-            reader_stats_json(&reader.volumes)["dlm_token_grants"]
+        let per_volume = |reader: &RoutedMetaBackend, key: &str| -> Vec<u64> {
+            reader_stats_json(&reader.volumes)[key]
                 .as_array()
                 .expect("the reader's Token family")
                 .iter()
                 .map(|v| v.as_u64().expect("a count"))
-                .sum()
+                .collect()
         };
-        let g0 = grants(&reader);
-        // `ls -l D` as the kernel walks it.
+        let g0: u64 = per_volume(&reader, "dlm_token_grants").iter().sum();
+        // `ls -l D` — the routed verbs the FUSE handlers call.
+        if kernel_order {
+            reader
+                .getattr(1)
+                .await
+                .expect("stat / (the permission walk)");
+        }
         let looked = reader.lookup(1, "hot").await.expect("lookup D").ino;
         assert_eq!(looked, d);
         // The kernel revalidates the mount ROOT's attrs on every path
@@ -9951,42 +9982,72 @@ async fn a_cold_ls_of_a_striped_directory_at_a_token_reader_pays_one_token_per_s
         }
         let attrs = reader.getattr(d).await.expect("stat D (the fold)");
         assert_eq!(attrs.nlink, 2, "a directory of files folds to nlink 2");
-        let paid = grants(&reader) - g0;
+        let paid = per_volume(&reader, "dlm_token_grants").iter().sum::<u64>() - g0;
+        let cached = per_volume(&reader, "dlm_token_cached");
         let face = reader_stats_json(&reader.volumes);
         for v in &reader.volumes {
             v.shutdown().await.unwrap();
         }
-        (paid, face)
+        (paid, cached, face)
     };
 
-    // Phase 1 — the leg's law, the root unstriped.
-    let (paid, face) = cold_ls("pr13d-ls-reader").await;
+    // Phase 1 — the leg's law, the root unstriped, lookup-first.
+    let (paid, cached1, face) = cold_ls("pr13d-ls-reader", false).await;
     assert!(
         paid >= k + c && paid <= k + c + 4,
         "dlm_token_grants = {paid} ∉ [K + C, K + C + 4] = [{}, {}] for K = {k}, C = {c} (one \
-         token per stripe, one per child, + the root, D's record, D's re-grant with dentries): \
-         {face}",
+         token per stripe, one per child, + the root's dentry token, D's record, D's re-grant \
+         with dentries): {face}",
         k + c,
         k + c + 4
     );
     assert_eq!(
         paid,
         k + c + 3,
-        "the constant beside K + C is 3 on both fleet venues: {face}"
+        "lookup-first, the root unstriped: the constant beside K + C is 3: {face}"
     );
 
-    // Phase 2 — the ROOT striped (the fleet after `sym-scale`): a second
-    // cold reader's first `stat /` folds over the root's stripes and pays
-    // one records-only grant per root stripe.
-    let root_map = flip_and_migrate(1).await;
+    // Phase 2 — the ROOT striped over K_ROOT ≠ K_D (the fleet after its
+    // writers' per-leg `mkdir`s into `/`): a second cold reader's first
+    // `stat /` AFTER its lookup learnt the root's map folds over the
+    // root's stripes and pays one records-only grant per root stripe.
+    let root_map = flip_and_migrate(1, K_ROOT).await;
     let k_root = root_map.stripes.len() as u64;
-    assert_eq!(k_root, k);
-    let (paid_striped_root, face) = cold_ls("pr13d-ls-reader-striped-root").await;
+    assert_eq!(k_root, u64::from(K_ROOT));
+    assert_ne!(k_root, k, "the discriminating shape: K_root ≠ K_D");
+    let (paid_striped_root, cached2, face) = cold_ls("pr13d-ls-reader-striped-root", false).await;
     assert_eq!(
         paid_striped_root,
         k + c + 3 + k_root,
         "a striped root adds exactly K_root = {k_root} records-only grants at the reader's \
-         first stat / (the record's §7 item 7 class — the fleet's 2K + C + 3): {face}"
+         first stat / after the map is learnt (the record's §7 item 7 class — the fleet's \
+         2K + C + 3 at K_root = K_D): {face}"
+    );
+    // The extra objects live on the ROOT's volume alone — the fleet's
+    // per-volume `dlm_token_cached` split (PR 15's `+20,064` beside the
+    // root's 20,000 children; PR 13d run 2's the same).
+    assert_eq!(cached1.len(), 2);
+    for v in 0..2 {
+        let grew = cached2[v] - cached1[v];
+        let want = if v == root_v { k_root } else { 0 };
+        assert_eq!(
+            grew, want,
+            "volume {v}: the cached-object delta between the phases is the root's stripes on \
+             the root's volume ({root_v}) and nothing elsewhere: {cached1:?} → {cached2:?}"
+        );
+    }
+
+    // Phase 3 — the KERNEL's order on the striped root: the pre-lookup
+    // `stat /` pays the root's records-only grant and folds nothing (the
+    // map is not learnt yet); the lookup's marker read re-grants the root
+    // with dentries — the law's `+4` ceiling.
+    let (paid_kernel_order, _, face) = cold_ls("pr13d-ls-reader-kernel-order", true).await;
+    assert_eq!(
+        paid_kernel_order,
+        k + c + 4 + k_root,
+        "a cold reader in the kernel's order (GETATTR / before LOOKUP) reads the law's +4 \
+         ceiling: the fleet's +3 is this minus the root's records grant the harness's \
+         pre-leg .stats snapshot absorbs: {face}"
     );
 
     squeezefs::data_grant::disarm_slot_custody().await;

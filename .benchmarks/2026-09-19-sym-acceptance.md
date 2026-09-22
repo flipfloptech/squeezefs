@@ -3249,6 +3249,144 @@ the PAUSED law's BOX row — the next box session (PR 13e's binary; not
 run in this round by the minimum-count law). §3.4, §3.9.4.3, §7 item
 10, design §8 row 3c and §9 are re-worded on this branch.
 
+### 4.4ak PR 13d finding — ATTRIBUTED, NO PRODUCT CHANGE, the LAW MOVED (the `-ls` law's fleet-state term): `sym-shared-dir-ls` read `2K + C + 3` tokens on the gated `77f4da1d` — the ROOT was striped, and a token reader's first `stat /` AFTER its lookup learnt the root's map pays one records-only grant per root stripe
+
+**Found by PR 15's local functional pass** (2026-09-22, three runs on one
+fleet — the driver twice and the matrix's own `sym-shared-dir` leg once:
+`[mwmatrix] ERROR: sym-shared-dir-ls: dlm_token_grants=20131 ∉ [K + C,
+K + C + 4]`, `/tmp/grok-justin/pr15-local/matrix-shared.log`, snapshots
+`rows-shared/m1_pls{0,1}.json`), the binary product-identical to
+`77f4da1d`; every PR 13-era run of the leg — laptop batches 4–15 and the
+box's two positions (§3.3, §3.9.2) — read exactly `K + C + 3`
+(20,067 / 40,067). PR 13d's brief was the 16 product commits of
+`7b2ef9e9..77f4da1d`.
+
+**Attribution — fleet STATE, not a commit.** The reader's snapshots say
+the extra 64 are 64 DISTINCT `(object, plane)` entries, never re-fetches
+(`dlm_token_cached` +10,064 / +10,065 per volume for +20,131 grants: two
+re-grants — `D` records-only then with dentries — and 20,129 distinct
+objects = 20,000 children + 64 stripes + `D` + **64 more**). The
+manager's snapshot BEFORE the leg names them: `m0_psd0.json` reads
+**`dir_striped_dirs 1`, `dir_stripe_flips 1`, `dir_stripe_supply_rpcs
+63`** — the manager had already flipped ONE directory it holds, `/`:
+PR 15's driver ran `sym-tarx` + `sym-scale` + `sym-shared-dir` on ONE
+fleet whose writers each `mkdir` their per-leg directories into `/` —
+cross-owner creates served at the manager from > 1 creator, `flip_due`
+(`≥ 2 creators ∧ total > N_floor`) — and that fleet's `/` reads striped
+from its FIRST kept snapshot on (`rows-full/m0_plocal-10.json`, the tarx
+legs, before `sym-scale`; every later `m0_*` too). PR 13's OWN binary
+stripes `/` the same way: `pr13-batch10/sym-scale-rows/*/m0_pn81.json`
+reads `dir_striped_dirs 0 → 1` across `sym-scale`'s N = 8 row (eight
+writers' `mkdir /scale-…-w<idx>` at once), and on the box bracket
+`021250`'s `scale-r1/symscale-1790043202/m0_pn81.json` reads 1 after its
+N = 8 row. **Every kept `-ls` row correlates the manager's root state
+with the reading, 100 %:** the eleven PR 13 laptop batches
+(`pr13-batch{4,5,7,8,9,10,11,12,13,14,15}/sym-shared-dir-rows/*/
+m0_psd0.json` `dir_striped_dirs 0` — each `sym-shared-dir` on a FRESH
+fleet, `create-rows.log` between the scale and the rows legs) ↔ 20,067 =
+`+3`; **the box's two `-ls` rows** (bracket `022526`, `shared-dir-r1` /
+`shared-dir-r2`: `box.log` shows a fleet `create` and `teardown` around
+EACH leg — pass 2's `FRESH_FLEET_PER_LEG=1`, H-B2 — and BOTH rows' kept
+`m0_psd0.json` AND `m0_psd1.json` read `dir_striped_dirs 0`) ↔ 40,067 =
+`+3`; PR 13d's own fleet run 1 (below, root unstriped) ↔ `+3`; PR 15's
+run (`dir_striped_dirs 1`) ↔ 20,131 = `+3 + 64` and PR 13d's run 2 (the
+root flipped explicitly) ↔ 40,131 = `+3 + 64`. **No box `-ls` reading on
+a striped root exists**: the ONE box shared-dir leg that shared a fleet
+with `sym-scale` (bracket `021250`, root striped by its N = 8 row) died
+AT ENTRY on `appender_flush_ceiling_overruns=1 on m0` (H-B2's class,
+`shared-dir-r1.log`, wall 27 s) before its `-ls` half ran. The box
+evidence therefore AGREES with the attribution at every kept row.
+
+**Mechanism (pre-existing since PR 13's `stripe_map_cached`, priced by §7
+item 7).** A `-o ro` token reader's `ls -l D`: the kernel walks the path
+with every TTL 0 under tokens, so it `lookup(/, D)`s — the routed lookup's
+`stripe_route(/, D)` reads `/`'s map through the root's token and
+caches it (`stripe_map` → `read_map_from_markers`; `stripe_locate`
+fetches the ONE root stripe naming `D`, with dentries) — and it
+revalidates the mount ROOT's attrs: `getattr_local(1)` →
+`stripe_map_cached(1)` (the CACHE alone — known once the lookup learnt
+it) → `fold_striped_attrs` → `stripe_record(D_i)` → `getattr(D_i)` →
+`token_serve(default)` — ONE records-only grant per root stripe not
+already cached (`K_root − 1`), then hits for the mount's life. **The fold
+lands on the first `stat /` AFTER a lookup under `/` learnt the map**: the
+kernel's `default_permissions` walk GETATTRs `/` BEFORE `LOOKUP(/, D)`,
+and that pre-lookup `stat /` pays one records-only root grant and folds
+NOTHING (`stripe_map_cached` reads `None`). So the constant beside
+`K_D + K_root + C` is the walk order's: a truly cold reader in kernel
+order reads `+4` (the root's records grant, then its dentry-bearing
+re-grant at the lookup's marker read, `D`'s record, `D`'s re-grant) —
+the law's ceiling — and the fleet reads `+3` only because the harness's
+pre-leg `snap … ls0` (a `.stats` read → `GETATTR(1)`) absorbs the root's
+records grant BEFORE the leg's first reading (PR 15's `m1_pls0.json`:
+`dlm_token_grants [2, 0]`). Total `K_D + K_root + C + 3` on the fleet;
+with `K_root = K_D = 64`, `2K + C + 3` — the fleet's 20,131 to the
+token. The listing of `D` itself still pays exactly `K_D + C + 3`.
+
+**Pinned (every arithmetic, in-process, the leg's shape):**
+`sym_n_daemon_tests::a_cold_ls_of_a_striped_directory_at_a_token_reader_
+pays_one_token_per_stripe` — two metadata volumes, the manager holding
+`D`, two stripes SUPPLIED by joiners over the S8 wire, children on both
+volumes, a cold reader dialing every holder's plane, the routed verbs the
+FUSE handlers call (`lookup(/, D)`, `stat /`, `stat D`, the paged merge,
+`lookup + stat` per child, `stat D`): phase 1 (root unstriped,
+lookup-first) EXACTLY `K_D + C + 3`; phase 2 (root striped over
+**`K_root = 6 ≠ K_D = 4`** — the discriminating shape, since at `K_root =
+K_D` the reading equals `2K + C + 3`, which a "second token per `D`
+stripe" theory passes too; a second cold reader, lookup-first) EXACTLY
+`K_D + C + 3 + K_root`, AND the reader's per-volume `dlm_token_cached`
+delta between the phases is `K_root` on the ROOT's volume and 0 elsewhere
+(the fleet's split made a law); phase 3 (the KERNEL's order — `GETATTR /`
+before the lookup — on the striped root, a third cold reader) EXACTLY
+`K_D + C + 4 + K_root`, the law's ceiling (review round 1, Issues 2–3).
+**The lookup-first arithmetics read the same on `7b2ef9e9` and on
+`77f4da1d`'s code** (39 / 43 for K = 4, C = 32, K_root = 4 — the base
+tree at `/tmp/grok-justin/pr13d-base-7b2ef9e9`, removed after; every
+API the pin uses exists at `7b2ef9e9`, so a checkout re-runs it), so no
+commit in the range moves the reader's token economy and `git bisect`
+has nothing to find; the range's reader-side diffs (`stripes_armed_any` /
+`token_serve`'s early returns, F-B3's root-attr arm on the `Err` path,
+the typed `fail_closed`, the armed-only `dir_parents` feed) are inert on
+an armed reader by inspection. The solo contract in `sym_coherence_tests`
+(`a_token_reader_lists_a_striped_directory_as_the_merge_of_its_stripes`)
+pinned only `≥ K + C`; it pins `K + C + 1` exactly now.
+
+**Reproduced on the fleet, same binary, both ways (laptop — "it works"
+evidence; `/tmp/grok-justin/pr13d-fleet/`):** a fresh `mw_fleet.sh create
+N=2 --symmetric --writers=3 --token-readers`, `run_mw_matrix.sh
+sym-shared-dir --venue=laptop` from zero — the root unstriped (`m0`
+`dir_striped_dirs 0`): **`dlm_token_grants` 40,067 = K + C + 3** for
+K = 64, C = 40,000, `readdir_merges` 83, 16 misses = the poll's, oracle
+clean, the leg GREEN (`rows/symshared-1790083203`); then the ROOT flipped
+at the manager by the explicit `setfattr -n user.squeezefs.stripes -v 64`
+on its mount root (`dir_striped_dirs 1`, `dir_stripe_supply_rpcs 63` —
+PR 15's `m0_psd0` shape exactly) and the same leg on the same fleet:
+**40,131 = 2K + C + 3**, the leg's own `ERROR … ∉ [40064, 40068]`
+(`rows/symshared-1790083306`); the reader's per-volume `dlm_token_cached`
+deltas put the 64 extra objects on the ROOT's volume beside its 20,000
+children (`+20,064`), the shared directory's own on the other
+(`+20,065` = 20,000 + 64 + D) — PR 15's split to the entry. Fleet and
+substrate torn down to zero residue.
+
+**Adjudicated (orchestrator, 2026-09-22) — option (c), the LAW moved:**
+design §8 row 3b's `-ls` law is **`K_D + K_root + C + [0, 4]`** — `K_D`
+the listed directory's stripe count, `K_root` the mount root's (0 while
+`/` is unstriped; read off the manager's root as `getfattr -n
+user.squeezefs.stripes` / the `dir_striped_dirs` census). The root-stripe
+fold's records-only grant (paid at the reader's first `stat /` AFTER a
+lookup learnt the map; a cold reader in the kernel's order reads the
+`+4` ceiling, the fleet's `+3` is the harness's pre-leg snapshot
+absorbing the root's records grant) is a design-conformant cost, paid
+once per token lifetime, and the law must hold on ANY fleet state — the leg's
+former text `[K + C, K + C + 4]` presumed a fresh fleet (an unstriped
+root), which is the harness's premise, not the design's. The in-process
+pin above carries both arithmetics already (`K + C + 3` at `K_root = 0`,
+`+ K_root` otherwise). **The LEG's code change lands in PR 15** —
+`tests/sym_rows_lib.sh`, the shared law library PR 15 extracts from the
+matrix, so the law lives in ONE place; `tests/run_mw_matrix.sh`'s `-ls`
+body is PR 15's to move (untouched here). No product change: a records-
+only stripe grant riding something cheaper than a token would be a new
+economy, not a fix.
+
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
 `sym-shared-dir-ls` on the defect-16 binary read `meta_kv_node_cache_
@@ -3633,7 +3771,16 @@ so nothing falls off a ledger the way defect 32 did between PR 5 and PR
    `/` is `K` token serves per `stat /` from the plane cache (one grant
    each per holder per token lifetime); a `stat`-heavy reader of a
    64-stripe root pays 64 cache hits per attr revalidation — measured
-   nothing on the legs, stated for the box's `ls -l` row.
+   nothing on the legs, stated for the box's `ls -l` row. **Measured by
+   PR 15's fleet (§4.4ak, PR 13d): the `K_root` first-touch grants land
+   INSIDE the `-ls` leg's `dlm_token_grants` when the same fleet ran
+   `sym-scale` first (`2K + C + 3`), and the leg's law does not carry
+   the term — the adjudication stands in §4.4ak.**
+
+Records the box owes (§8): gate 1's solo re-gate A-B-B-A on the flip
+binary; gates 2 / 3 / 3b / 3c / 5 / 7's counted brackets — every local
+number in §3 is a dev-box RATE reading, venue-attributed pending the box
+(the mechanism rows are GREEN; the rates are the box's).
 11. **PR 13c review nit (routed to the board): the dial-site census as a
    TOKEN census** — `derivation_sweep_tests` counts the `S8-LISTENER
    CONTROL SESSION` markers against `MEMBER_CONTROL_SESSIONS`; the
@@ -3805,6 +3952,8 @@ Laptop-side: `/tmp/grok-justin/box-rerun/{arms,gate1,gate1-rev,perf-phases,nw}`
 > **What PR 14 flips on, restated once more:** F-R3 fixed and pinned (the witness at the child's holder), F-B1's margin DERIVED from a pass wall that is MEASURED first (the per-cycle instrument), with the box's two logged ages (16 / 106 ms past) and the four unlogged increments as its input and the six re-read as 0, F-R4 in the retryable class, gate 1's setattr future shrunk (or the −3.3…−4.4 % on rename / unlink adjudicated as the shipped-bug fixes' price with the owner's word), the storm ×10 from zero on that binary — then the flip binary's box brackets of EVERY gate (2 and 3b included). Nothing in this rung's product findings is a class the design did not state: F-R3 is PR 6's deviation (3) left standing on the N-daemon fleet; F-B1 is §7 item 3 exactly; F-R2 is the shipped path the flip retires.
 >
 > **Status (PR 13c, the box campaign — `fix/sym-box-campaign`, 2026-09-22): what LANDED against the list above, and what still stands.** *Landed, red-first:* **F-B3** — the listener cap derives from the RAW root × the shipped factor, ceilinged by the fd budget (`RLIMIT_NOFILE / 8`), a refused dial retries from the accept tick to the dial bound then surfaces the typed `ListenerRefused`, a token reader's ROOT attr survives a transient wire class (the `.stats` EINVAL), and the first 32-member fleet FORMED on the laptop (§3.9.2's "→ fixed"; H-C1 / H-C2 the harness shapes it uncovered); **F-B2** — the dominance rule's `ops_h` counts the holder's work on the slot's SUBTREE across volumes (design §5.1.4 as built, the hint's two error directions and the root-ward consequence stated); **F-B1** — the flush-ceiling audit EXCLUDES the SMO mutex's structural holds: an overlap-bounded exclusion (over-excuse ≤ one cadence tick per hold), each class CAPPED at a published bound (a recovery's at `appender_recovery_bound_ms`, a service hold's at one landing ceiling — `appender_flush_ceiling_service_cap_ms`), the excused Σ published (`appender_flush_ceiling_excused_{ns,max_ms}`), the pass's own wall (its device time, its wait on a peer) never excused; **the gate-1 flat path** — three unarmed-path costs deleted (`stripes_armed_any`, the memo fed on an armed set only, `token_serve`'s two-probe return), the rename lock-set fix's +1 guard priced and kept, and the startup `RLIMIT_NOFILE` raise confined to the listener caps (`uring_fs::fd_cache_cap` derives from the limit AS FOUND — review round 1, Issue 8: the first build had grown the flat path's fd cache 32×). *Still standing (the flip's list, restated for PR 14):* (a) **the box re-runs** of gates 1 / 3 / 3c / 5 / 7@N=32 on PR 13c's binary — no box row ran in PR 13c (the counted-run law); (b) **the flush-ceiling MARGIN's derivation from the measured pass wall (§7 item 3) — NOT done**: F-B1 landed an exclusion of another actor's holds, which is not a derivation of the margin, and the box's 1–32 ms overruns are what that derivation must price; (c) **gate 3's per-NODE law ("bounded by no node") is UNMEASURED on any venue**: the box's N = 8 MISS is attributed to the co-located venue (§3.9.3), the per-daemon-CPU-second face (0.63× at N = 8 with the ingest CPU folded in; the create phase alone is `sym-scale`'s new `C/CPU-S` column, unrun on the box) is that venue's PROXY, and **a multi-node venue — PR 15's cloud row — is the law's instrument**; (d) the storm ×10 count from zero on PR 13c's binary.
+
+> **Status (PR 13d, `fix/sym-stripe-ls-token-economy`, 2026-09-22): the `2K + C + 3` reading PR 15's local pass took on gate 3b's `-ls` half is ATTRIBUTED to fleet state (a ROOT striped by the preceding `sym-scale` leg on the same fleet — one records-only grant per root stripe at the reader's first `stat /` after its lookup learnt the map, §7 item 7's class), identical on `7b2ef9e9` and `77f4da1d`, pinned in-process both ways (§4.4ak); no product change; **adjudicated option (c): design §8 row 3b's `-ls` law is `K_D + K_root + C + [0, 4]`**, the leg's code change PR 15's (`tests/sym_rows_lib.sh`, the one law library).**
 
 **Decision: NOT YET — four blockers, three of them product (§7's
 flip-blocking items (i)–(iii) + the box).** (0) **Fix-round

@@ -10811,6 +10811,15 @@ async fn a_cross_owner_creates_child_is_never_a_c9_finding_while_its_intent_stan
         "the register holds no ghost: an abandoned intent the durable scan no longer lists is \
          forgotten"
     );
+    // The forget credits `retired` for every intent it forgets (PR 13e review
+    // round 3, Issue 13): the closure `minted ≡ retired + open` must hold after
+    // the reconcile, or a later forget that skips the credit reads as a leak.
+    let after = cross_owner_stats();
+    assert_eq!(
+        after.intents_minted,
+        after.intents_retired + after.intents_open,
+        "minted ≡ retired + open after the roll-forward's reconcile"
+    );
     let report = inode_plane_over(&manager).await;
     assert!(!c9_naming(&report, pending_a), "named: no finding");
     assert!(

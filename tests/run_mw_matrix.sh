@@ -4816,10 +4816,14 @@ PYEOF
     # first run of this arm found the ordering (PR 13e review round 2).
     local grace
     for ((t = 0; t < 90; t++)); do
+        # An empty read is "not yet" (the stats inode not served yet), never
+        # "closed" (PR 13e review round 3, Issue 14).
         grace="$(stat_field 0 membership_grace_remaining_ms)"
-        [ -z "$grace" ] || [ "$grace" = "0" ] && break
+        [ -n "$grace" ] && [ "$grace" = "0" ] && break
         sleep 1
     done
+    [ "$t" -lt 90 ] ||
+        die "$label: the remounted manager's grace window did not close within 90 s (membership_grace_remaining_ms=${grace:-unread})"
     log "$label: the remounted manager's grace window closed (waited ${t}s); re-admitting the members"
     for i in $(member_idxs); do
         [ "$i" = "0" ] && continue

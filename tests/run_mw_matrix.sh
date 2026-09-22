@@ -4162,6 +4162,29 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t_row0):.0f}')")"
 # == co-writer`. The symmetric words (handovers / ships / `dlm_rpcs`) have
 # no meaning on this posture (a co-writer's lock acquire IS a round trip),
 # so the table prints the ship ledger where sym-scale prints them.
+# The S9 posture's must-stay-0 set, read as a per-row DELTA on every writer
+# of the row (the B arm's `sym_zero_violations_delta` for the shipped
+# posture — the box re-run's review, Issue 8: a row whose engagement law
+# omits its posture's tripwires is softer than its counterpart). The
+# symmetric keys are absent on this posture (a missing key folds to 0 in
+# `sym_delta`), so the set is the S9 co-writer / authority family's.
+MW_ZERO_KEYS="invariant_tripwires data_dma_fence_refusals data_dma_epoch_refusals \
+    meta_ship_publish.free_ship_failures meta_ship_publish.free_refused_blocks \
+    meta_ship_publish.refusals meta_ship_publish.owner_panics meta_ship.owner_panics \
+    meta_ship.stale_term_refusals meta_ship.not_owner_refusals meta_ship.cross_owner_refusals \
+    alloc_lane_enospc_refusals alloc_lane_raise_refusals cowriter.accounting_refusals \
+    cowriter.local_commit_refusals cowriter.admission_refusals dlm_custody.dlm_custody_grace_conflicts \
+    dlm_custody.dlm_custody_self_fences membership_self_fences free_grace_forced_releases \
+    free_grace_laggard_fences write_enospc_refusals fuse_op_watchdog_overdue transport_cq_overflows \
+    job_worker_panics detached_task_panics writeback_errors_latched"
+mw_zero_violations_delta() { # rowdir idx label
+    local rowdir="$1" idx="$2" label="$3" k v
+    for k in $MW_ZERO_KEYS; do
+        v="$(sym_delta "$rowdir" "$idx" "$label" "$k")"
+        [ "$v" = "0" ] && continue
+        printf '%s=+%s ' "$k" "$v"
+    done
+}
 mw_ensure_cowriters() { # want_idx...
     local c want
     for c in $(cowriter_idxs); do
@@ -4280,6 +4303,12 @@ print(int(b)-int(a))" 2>/dev/null || echo 0)"
         fi
         [ "$refusals" = "0" ] || die "mw-scale N=$n: meta_ship_publish.refusals=$refusals (must stay 0)"
         [ "$lcr" = "0" ] || die "mw-scale N=$n: cowriter.local_commit_refusals moved by $lcr — an un-routed local commit"
+        # The posture's must-stay-0 set, per row, on every writer of the row.
+        local zero_bad=""
+        for idx in "${writers[@]}"; do
+            v="$(mw_zero_violations_delta "$rowdir" "$idx" "n$n")"
+            [ -z "$v" ] || zero_bad="$zero_bad m$idx:{$v}"
+        done
         mgr_cpu="$(python3 -c "
 import os
 hz = os.sysconf('SC_CLK_TCK')
@@ -4290,8 +4319,10 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t_row0):.0f}')")"
         cr="$(python3 -c "print(f'{$create_rate/$rate1:.2f}')")"
         ir="$(python3 -c "print(f'{$ingest_rate/$ingest1:.2f}')")"
         verdict="$(python3 -c "print('MET' if $create_rate >= 0.7*$n*$rate1 and $ingest_rate >= 0.7*$n*$ingest1 else 'MISS')")"
+        [ -z "$zero_bad" ] || verdict="$verdict MISS(must-stay-0:$zero_bad)"
         [ "$verdict" = "MET" ] || verdict_all=MISS
         printf '%-4s %-10s %-8s %-9s %-10s %-8s %-8s %-9s %-8s %-9s %-8s %s\n' "$n" "$create_rate" "${cr}x" "$creates_per_cpu_s" "$ingest_rate" "${ir}x" "${mgr_cpu}%" "$shipped" "$intents" "$served" "$pub_shipped" "$verdict" | tee -a "$rowdir/mwscale-table.tsv"
+        [ -z "$zero_bad" ] || die "mw-scale N=$n: a must-stay-0 gauge of the S9 posture moved:$zero_bad (rows above; the leg is RED)"
         for idx in "${writers[@]}"; do
             rm -rf "$(mnt_of "$idx")/mwscale-$MW_RUN-n$n-w$idx" 2>/dev/null || true
         done

@@ -3499,9 +3499,12 @@ through its own mount, reads the child's record from its projection of
 the requester's slot — `None` — and PR 6's `None ⇒ no count step` arm
 (written for "the record is genuinely gone") ships `RemoveDentry` alone:
 the name is gone, the record stands at `nlink 1` in the requester's tree
-for ever, invisible to fsck C9 while the requester lives (the inode plane
-scopes out live foreign lessees' slots — PR 12b round 1's law) and
-FOUND at the requester's leave. **Fix (`d56c839a`):**
+for ever — and, AS FOUND, invisible to fsck C9 at EVERY censusing mount:
+while the requester lives the inode plane scopes its slots out (PR 12b
+round 1's law), and after it LEAVES C9's era floor EXEMPTED every ino it
+minted as current-era (review round 1, Issue 2 — below: the first
+build's post-leave census was VACUOUS for exactly this class). **Fix
+(`d56c839a`):**
 `KvMetaBackend::read_inode_witness` is the ONE witness read of every
 plan-builder site — through the writer's read divert (`token_serve` →
 the holder's token plane, one grant, already held from the `lookup` that
@@ -3542,8 +3545,44 @@ directory move across holders). **Fleet proof (laptop, "it works"):**
 `rm -rf`, the dangling-name gauge 0 on every writer, then EVERY joiner
 LEAVES and the manager's online fsck `--json` covers the inode plane on
 every volume and reads C9 = C10 = 0 (the live oracle was never a C9
-verdict, by the harness's own note); the run's numbers are in PR 13e's
-report.
+verdict, by the harness's own note); since review round 1 the census
+also unmounts the MANAGER and runs the OFFLINE fsck over the set,
+asserting `findings == 0` AND `current_era_exempted == 0` (below); the
+run's numbers are in PR 13e's report.
+
+**Review round 1, Issue 2 — the post-leave census was VACUOUS for the
+joiner-minted class (the box's 430), FIXED (`d85ef1c8`, pins
+`725e56e6`):** fsck C9's zero-FP shield is the writer era's ino floor
+(`KvMetaBackend::minted_in_prior_era` — a record at or above its
+keyspace's open-time cursor is current-era: a live create commits the
+inode before the dentry). The guest floors were seeded from the
+manager's STAMP and its replay, and a JOINED appender's rotor slots have
+their cursors in tree 0 alone — never in the manager's stamp, never in a
+probe's — so every joiner-minted ino read as current-era and was
+EXEMPTED at the online manager AND at an offline probe (the reviewer ran
+the offline `fsck_clean` at the F-R3 pin's RED commit: the 4
+manager-minted orphans reported, `current_era_exempted = 7` for all 7
+joiner-minted ones — the census as first built could not see the class
+it was added for, and its "C9 = C10 = 0" was no verdict). The fix reads
+tree 0 as a witness beside the floor: an UNLEASED slot has no minter, so
+every record in it is a prior-era candidate whatever this mount's floor
+says (the armed plane's live lease table where one exists, else the
+`slot_state` words read once at open — `forest_slot_word`); a PROBE has
+nothing in flight (an offline census refuses a live set), so every guest
+record it reads without a floor is a candidate too; a slot a LIVE foreign
+appender leases stays fail-closed (the dentry verdict scopes it out
+anyway); and the ino bitmaps' ceiling (`max_local_ino_watermark`) folds
+every slot word's cursor, since a joiner-minted ino sat ABOVE the
+manager's ceiling and was never indexed (the fix's first cut found 0
+findings AND 0 exemptions for that reason). Pin
+`sym_n_daemon_tests::a_joiner_minted_orphan_is_a_c9_finding_at_the_
+offline_census_after_every_writer_left` (a joiner-minted child's dentry
+deleted underneath it, both writers leave, the offline probe reports
+exactly that ino as C9 with `current_era_exempted` 0 and its named
+sibling not a finding — RED on the base with 0 findings / 7 exempted),
+the two F-R3 pins assert `current_era_exempted == 0` after their leaves
+(`common::sym::fsck_clean_no_exempt`), and the fleet arm above asserts
+it on the offline census after the MANAGER leaves too.
 
 ### 4.4am PR 13e — F-R4, FIXED (PR 6 × PR 4's handover): a create into a directory whose slot moved TO the creator mid-plan answered `ENOENT` — the old holder's live-witness refusal after its release surfaced as the op's errno
 

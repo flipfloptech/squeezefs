@@ -10132,8 +10132,10 @@ async fn assert_counted_out(holder: &RoutedMetaBackend, ino: u64, what: &str) {
 /// and logged "child ino … has no inode record — removing the dangling
 /// name and accounting nothing" once per victim (m60: 430 / 512 lines in
 /// one `rm -rf`, `rm -rf` reporting success); every child stayed `nlink 1`
-/// with zero names at its creator, invisible to fsck while the lessee
-/// lived (the inode plane scopes live foreign lessees' slots out). GREEN:
+/// with zero names at its creator, invisible to fsck at every censusing
+/// mount (the inode plane scopes a live lessee's slots out; after the
+/// leave C9's era floor exempted a joiner's mints — review round 1, Issue
+/// 2, fixed: an unleased slot's records are prior-era candidates). GREEN:
 /// the witness is read through the writer's read divert (the holder's
 /// token plane — one grant, already held from the `lookup` that precedes
 /// an `rm`, recalled by the very step the plan ships), every child reads

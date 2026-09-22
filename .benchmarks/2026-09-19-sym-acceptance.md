@@ -609,7 +609,37 @@ are closed there. The rate half of gates 1 / 2 / 3 / 3b / 3c / 5 / 7 is
 exactly as owed as it was at PR 13's close — now with the arms in hand
 and the venue's state on record.
 
-#### 3.9.1 Gate 1 — the solo re-gate on the restored box (2026-09-22 01:12 → 02:0x UTC): **DELTA — B (PR 13b's flat path) reads 3.5–5 % below A (the pre-program tip) on every CPU-bound row, both orders**
+#### 3.9.1 Gate 1 — the solo re-gate on the restored box (2026-09-22 01:12 → 02:07 UTC): **MISS on the mdstorm write phases (mkdir / rename / unlink −3.4…−5.8 %, DELTA in BOTH brackets, both orders); the data-plane rows within noise with a reproducible residual (rr4k −1.8 %, rw4k −2.5…−3.8 % — at the 3 % floor); `w_fresh`'s bracket-1 DELTA did not reproduce**
+
+**Gate 1 verdict (the two brackets cited, the PR 1 rule):**
+
+| row | bracket 1 (A B B A) B/A · band | bracket 2 (B A A B) B/A · band | positions (bracket 1 ; bracket 2) | **verdict** |
+|---|---|---|---|---|
+| `wfresh-kern` MiB/s | 0.950 · 3.7 % DELTA | **1.000 · 1.2 %** | A 36,298 / 34,993 ; 34,184 / 34,271 — B 33,942 / 33,811 ; 34,453 / 34,025 | **within noise** — the bracket-1 delta is A1's 36,298 (the first row after the reboot, 1,065 GiB moved vs 991–1,026 on the other seven positions); six of eight positions sit at 33.8–34.5 GB/s on either binary |
+| `rr4k-kern` IOPS | 0.982 · 0.5 % | 0.983 · 0.7 % | A 603,015 / 605,847 ; 606,347 / 602,252 — B 593,213 / 593,357 ; 594,632 / 593,694 | **within noise (3 % floor) — REPRODUCIBLE −1.7…−1.8 %**: every B position 593.2–594.6k, every A 602.3–606.3k, both orders, both brackets (PR 1's §4.3 carried residual, read again at the same sign) |
+| `rw4k-kern` IOPS | **0.962 · 1.1 % DELTA** | 0.975 · 1.4 % | A 542,637 / 536,596 ; 530,267 / 537,977 — B 520,361 / 517,480 ; 520,740 / 520,404 | **at the floor — REPRODUCIBLE −2.5…−3.8 %**: every B position 517.5–520.7k (a 0.6 % spread), every A 530.3–542.6k; DELTA in bracket 1, inside the 3 % floor in bracket 2 — not convicted by the rule, not cleared: PR 1's −1.5 % residual has GROWN |
+| `mount` / `remount` / `umount` s | 1.009 / 1.051 / 1.100 | 1.150 / — / — | 0.37–0.57 s / 0.56–0.69 s / 7.6–10.0 s | within noise (0.4–0.7 s events, 17–29 % bands; the 8–10 s clean unmount after `rw4k` is PR 1's §9.3 term, both arms) |
+| `mdstorm mkdir` ops/s | **0.965 · 2.4 % DELTA** | **0.942 · 5.2 % DELTA** | A 6,725 / 6,834 ; 6,775 / 6,853 — B 6,466 / 6,625 ; 6,254 / 6,588 | **DELTA — MISS** (B −3.5 % / −5.8 %; every B position below every A position) |
+| `mdstorm create` | 0.988 · 2.5 % | 0.976 · 4.1 % | A 5,730 / 5,877 ; 5,925 / 5,796 — B 5,770 / 5,695 ; 5,604 / 5,838 | within noise (−1.2 % / −2.4 %) |
+| `mdstorm stat` | 1.015 · 1.2 % | 0.998 · 0.6 % | 187–192k both arms | within noise |
+| `mdstorm rename` | **0.966 · 3.3 % DELTA** | **0.948 · 3.8 % DELTA** | A 4,365 / 4,512 ; 4,550 / 4,521 — B 4,312 / 4,265 ; 4,218 / 4,382 | **DELTA — MISS** (B −3.4 % / −5.2 %; every B below every A) |
+| `mdstorm unlink` | **0.965 · 1.5 % DELTA** | **0.960 · 2.5 % DELTA** | A 5,163 / 5,242 ; 5,306 / 5,235 — B 5,051 / 4,986 ; 4,995 / 5,123 | **DELTA — MISS** (B −3.5 % / −4.0 %; every B below every A) |
+| `mdstorm manydirs` | 0.990 · 2.7 % | 0.981 · 1.1 % | A 10,912 / 11,206 ; 11,035 / 10,910 — B 10,871 / 11,026 ; 10,766 / 10,765 | within noise (−1.0 % / −1.9 %) |
+| `mdstorm rmdir` | 1.015 · 9.0 % | 0.978 · 4.6 % | 5,451–5,963 both arms | within noise |
+
+**Gate 1 as the design states it ("within noise of `dev` tip on mdstorm,
+rand-4k, `w_fresh`, and mount time; `dlm_rpcs == 0`") reads: `dlm_rpcs`
+0 ✓ (every leg), mount time ✓, `w_fresh` ✓, rand-4k ✓ by the rule with a
+reproducible 1.8–3.8 % residual at the floor, **mdstorm ✗ — the three
+write-heavy phases are 3.4–5.8 % slower on PR 13b's flat path in both
+orders of both brackets.** A PRODUCT finding (a flat-path regression
+accumulated over PRs 2–13b), attributed below to the extent the captured
+`.stats` allow; reported to the orchestrator; nothing in the tree was
+changed for it. The verdict is not softened: the same rows read
+0.985–1.033 at PR 1 (`.benchmarks/2026-09-13-sym-pr1-solo-regate.md`),
+so the regression landed between `a9827378` (PR 1) and `7b2ef9e9`.
+
+##### 3.9.1-details — the two brackets
 
 **Venue (the same as PR 1's row, re-verified 01:09 UTC):** `squeeze-test`
 (`memp-s3ds-aqs-37`), 32-core Xeon, 251 GiB, Rocky 8.10, **kernel
@@ -745,10 +775,102 @@ and recall sinks, `refuse_foreign_slot_open` at every write-intent open,
 the new sharded phase families' recording). **Naming the site needs a
 `perf record` A/B on the box — a follow-up row the orchestrator approves,
 not this bracket's; the phase ledger above is the honest attribution this
-rung has.** This is a PRODUCT finding (a flat-path regression accumulated
-over PRs 2–13b — the design's gate 1 says "within noise", and 3.5–5 % on
-a 0.5–3.7 % band, both orders, is not noise), reported to the
-orchestrator; nothing in the tree was changed for it.
+rung has.**
+
+**Bracket 2 (B A A B — the reversed re-run of the DELTA rows + `rr4k`;
+01:40:30 → 02:07:19 UTC, `rows-gate1-20260922-011258-rev`, `gate_failed=0`):**
+
+| row | primary | B1 | A2 | A3 | B4 | median A | median B | **B/A** | band | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `wfresh-kern` | MiB/s | 34,453 | 34,184 | 34,271 | 34,025 | 34,227 | 34,239 | **1.000** | 1.2 % | within noise |
+| `rr4k-kern` | IOPS | 594,632 | 606,347 | 602,252 | 593,694 | 604,300 | 594,163 | **0.983** | 0.7 % | within noise (3 % floor; −1.7 % reproducible) |
+| `rw4k-kern` | IOPS | 520,740 | 530,267 | 537,977 | 520,404 | 534,122 | 520,572 | **0.975** | 1.4 % | within noise (3 % floor; −2.5 % reproducible) |
+| `mount` (fresh) | s | 0.569 | 0.529 | 0.445 | 0.551 | 0.487 | 0.560 | 1.150 | 17.2 % | within noise |
+| `mdstorm mkdir` | ops/s | 6,254 | 6,775 | 6,853 | 6,588 | 6,814 | 6,421 | **0.942** | 5.2 % | **DELTA** |
+| `mdstorm create` | ops/s | 5,604 | 5,925 | 5,796 | 5,838 | 5,860 | 5,721 | 0.976 | 4.1 % | within noise |
+| `mdstorm stat` | ops/s | 188,292 | 189,113 | 187,918 | 188,068 | 188,516 | 188,180 | 0.998 | 0.6 % | within noise |
+| `mdstorm rename` | ops/s | 4,218 | 4,550 | 4,521 | 4,382 | 4,536 | 4,300 | **0.948** | 3.8 % | **DELTA** |
+| `mdstorm unlink` | ops/s | 4,995 | 5,306 | 5,235 | 5,123 | 5,270 | 5,059 | **0.960** | 2.5 % | **DELTA** |
+| `mdstorm manydirs` | ops/s | 10,766 | 11,035 | 10,910 | 10,765 | 10,972 | 10,766 | 0.981 | 1.1 % | within noise |
+| `mdstorm rmdir` | ops/s | 5,670 | 5,939 | 5,929 | 5,934 | 5,934 | 5,802 | 0.978 | 4.6 % | within noise |
+
+Engagement identical to bracket 1: `dlm_rpcs` 0 on all 8 mount legs,
+tripwires / `fsck_findings` / `block_refs_drift` 0, the forest gauges 0
+on every B mount, `features_incompat = 0xffd7` everywhere, dmesg the
+boot-time lines only, hottest sensor 48–51 °C at every row start and
+end; the per-row metadata economy identical arm to arm (`wfresh`
+Δjournal 54,975–55,041 / 200 checkpoints; `rw4k` 4,066–4,100 / 205;
+mdstorm 547.65–547.82k / 70–75). Daemon µs/op on the fio rows read the
+same shift as bracket 1: `rr4k` A 31.7 / 31.7 → B 32.5 / 32.4, `rw4k` A
+41.5 / 41.2 → B 42.6 / 42.3, `wfresh` A 520 / 529 → B 535 / 535. Write
+amplification: `rewrite_device_write_bytes` ÷ user 1.05–1.06× (A) /
+1.05–1.06× (B) on `wfresh`, `patch_write_bytes` ÷ user 1.14× on every
+`rw4k` position (ramp-inclusive ≡ 1.0×); B's `wfresh` discard commands
+again 1.9–3.9× A's (A2 12,836 / A3 13,077 — B1 24,586 / B4 50,672).
+
+**The mdstorm MISS, attributed from the eight legs' pre/post `.stats`
+(both brackets):**
+
+| leg | daemon µs/op (540k ops) | `fuse3-tpc` µs/op (the handler lanes) | `sqz-jrnl` / `sqz-meta` | conveyor `pass_total` / `window_total` µs | **`lock_phase_ns.dlm_guard_hold` count** | `dlm_guard_wait` count | journal entries / checkpoints / node appends |
+|---|---|---|---|---|---|---|---|
+| A1 / A4 / A2 / A3 | 229.6 / 224.0 / 225.3 / 228.5 | 125.5 / 124.8 / 124.5 / 125.3 | 36–38 / 17–19 | 38–39 / 56–61 | **889–890k** | 4k | 547.6–547.7k / 70–72 / 24.2–24.8k |
+| B2 / B3 / B1 / B4 | 232.4 / 232.1 / 234.1 / 230.1 | **130.1 / 128.0 / 129.6 / 127.9** | 37–38 / 18 | 39 / 58–62 | **989–990k** | 3–4k | 547.7–547.8k / 72–75 / 24.5–24.9k |
+
+* The conveyor pass, the journal lane and the meta lanes are IDENTICAL
+  arm to arm (`pass_total` 38–39 µs, `window_total` 56–62 µs, `sqz-jrnl`
+  36–38 µs/op, the same 547.7k entries and 96 splits) — the regression is
+  not in the commit path.
+* **The handler lanes (`fuse3-tpc`) carry +3–5 µs per op on B** (124.5–125.5
+  → 127.9–130.1), i.e. the whole daemon µs/op shift (+1.5–2.5 %), and it
+  lands on the storm's wall as −3.4…−5.8 % on the three phases whose
+  handler work is largest.
+* **B takes ≈ 100,000 MORE 4a DLM guards per storm** — `dlm_guard_hold`
+  889–890k (A) vs 989–990k (B) over the same 540,000 ops, i.e. exactly
+  one more guard per op of one 100k-op phase: the shape of PR 4 round 2's
+  rename lock-set fix (`RoutedMetaBackend::rename` now locks `I{moved}`
+  (+ `I{dest}`) beside the two parents and the two `D{}` keys, in the
+  unlink path's two-phase discover → `lock_many` → revalidate law — a
+  SHIPPED-BUG fix, the co-queued `Delta`/`Put` hole, pinned by
+  `tests/rename_lock_set_tests.rs`), which also adds the second lookup
+  per rename — the `rename` phase's −3.4…−5.2 %. `mkdir`'s and `unlink`'s
+  terms are not named by a gauge here: candidates are the per-directory-
+  mint memo feed (`dir_parents`, PR 6 / PR 13 defect 37), the unarmed
+  `record_ship` / `token_reader_for` / stripe-map checks at the routed
+  entry points (PRs 5, 7b, 12b, 13b), and the same per-op atomics the
+  data rows pay.
+* `fold_memo_misses` (14–28k) and `node_compactions` (1,533–1,664) scatter
+  the same on both arms; `meta_reclaim_inflight_waits` 25–70 both.
+
+**Naming the mkdir / unlink sites needs `perf record` on the box (one
+mdstorm leg per arm under `perf record -g`) — a follow-up row for the
+orchestrator to approve; this rung's attribution is the ledger above.**
+The finding is a PRODUCT regression on the flat path: the design's gate
+1 says "within noise", and −3.4…−5.8 % in both orders of two brackets on
+1.5–5.2 % bands is not noise. Reported; nothing changed in the tree for it.
+
+##### 3.9.1b Harness findings (PR 1's rig, both brackets)
+
+1. **The fio window is 30 s, not the rig's `RT=60`.** The box's job files
+   carry `runtime=30` (+ `ramp_time=10`, `time_based`), and fio lets a
+   job-section value override a CLI `--runtime` given after the job file
+   (the fio JSON records `global options: runtime=60` beside `job options:
+   runtime=30`, `job_runtime` 30,040 ms): every fio row of PR 1's bracket
+   AND this one measured 30 s after a 10 s ramp — comparable to each other
+   and to the 2026-09-08 campaign rows, and PR 1's record's "RT=60 (60 s +
+   10 s ramp)" was wrong. Neither meets the ≥ 60 s sustained-state rule;
+   the bw-log flatness column (−20…+12 %, last third vs first) stands in.
+   Fix (the tree's rig, after these brackets — the on-box copy stays the
+   one that ran): `row()` writes a per-row job file with `runtime=$RT`.
+2. **No `/proc/diskstats` snapshot, no `iostat`**: the write rows'
+   amplification column is the daemon's own device-byte ledger
+   (`rewrite_device_write_bytes`, `patch_write_bytes`, the `block_free_*`
+   reclaim counters); the `/proc/diskstats` face and `wareq-sz` the
+   AGENTS instrument names are not in either bracket. Fix alongside 1:
+   snapshot the data namespaces' `/proc/diskstats` lines per row.
+3. **The mdstorm quiet gate dominates the wall**: 26 min for six rows ×
+   four arms, 27 min for the four-row reversed bracket — ≈ 3 min per arm
+   is the load-1 decay wait after the previous arm's fio echo (PR 1 §1's
+   note), not measurement.
 
 ## 4. Issues found (each with its PR and its red pin)
 

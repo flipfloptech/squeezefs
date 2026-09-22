@@ -11569,6 +11569,14 @@ impl KvMetaBackend {
             .store(tick_ms.saturating_mul(1_000_000), Ordering::Release);
     }
 
+    /// Drop a stored decision a FAILED cycle never folded (review round
+    /// 2, Issue 12): the lateness was that cycle's, and the next cycle's
+    /// term is its own.
+    pub(super) fn clear_checkpoint_decision(&self) {
+        self.checkpoint_decision_late_ns.store(0, Ordering::Release);
+        self.checkpoint_decision_tick_ns.store(0, Ordering::Release);
+    }
+
     /// The sweep's per-cycle budget in force (ms) — `merge_sweep_budget_ms`
     /// of the flush interval this volume opened with.
     pub fn merge_sweep_budget_ms(&self) -> u64 {

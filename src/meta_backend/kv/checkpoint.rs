@@ -1928,9 +1928,29 @@ impl KvMetaBackend {
         // PR 12b: a JOINED appender's cycle is over ITS ring, ITS slot
         // trees and ITS page alone — the ledger, the bitmap, tree 0 and
         // page 0 below are the manager's (`joined_checkpoint_cycle`).
-        if self.is_joined_appender() {
-            return self.joined_checkpoint_cycle(smo, barrier_now).await;
+        let r = if self.is_joined_appender() {
+            self.joined_checkpoint_cycle(smo, barrier_now).await
+        } else {
+            self.checkpoint_cycle_managed(smo, barrier_now).await
+        };
+        // A cycle that fails BEFORE it folds the age decision's lateness
+        // (`note_checkpoint_cycle_term` runs at barrier #1; an `Err` out
+        // of the root publication or the flush pass precedes it) must not
+        // leave the decision words for the NEXT cycle to fold as its own
+        // term (review round 2, Issue 12).
+        if r.is_err() {
+            self.clear_checkpoint_decision();
         }
+        r
+    }
+
+    /// The MANAGER's cycle — the volume's ledger, bitmap, tree 0 and page
+    /// 0 are its own (a joined appender's is `joined_checkpoint_cycle`).
+    async fn checkpoint_cycle_managed(
+        &self,
+        smo: &mut SmoContext,
+        barrier_now: bool,
+    ) -> Result<(), KvError> {
         let cycle_started = std::time::Instant::now();
         let h = self.journal_ring().core().head();
         // The wedged-tail progress audit's inputs (see the barrier_now

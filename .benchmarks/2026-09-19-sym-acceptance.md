@@ -4011,12 +4011,15 @@ counted decline, a bounded window or a stated venue):
    stays THIS item, PR 14's**, and the box re-run on PR 13c's binary
    says what remains for it to price. **PR 13e (F-B1, §4.4an — the
    derivation LANDED):** a forest volume's cadence fires
-   `checkpoint_trigger_ms(ceiling, term)` = `max_age − term` from the LAST
-   COLLECTION, the term = the horizon MAXIMUM (64 cycles) of the cycle's
-   measured pre-barrier wall + the decision's lateness beyond one tick
-   (the tick's wait for the SMO mutex left out); the published ceiling
-   never widens, the flat cadence is byte-identical; RED-first on the
-   box's shape, published `meta_kv_checkpoint_{term,trigger}_ms`. **What
+   `checkpoint_trigger_ms(max_age, term)` = `max_age − term` from the LAST
+   COLLECTION (the input is the MAX AGE the tick fires at, never the
+   landing ceiling `max_age + 2 × tick`), the term = the horizon MAXIMUM
+   (64 CYCLES) of the cycle's measured pre-barrier wall + the decision's
+   lateness beyond one tick (the tick's wait for the SMO mutex left out;
+   the lateness rides the cycle it RUNS, capped at one ceiling — review
+   round 1, Issue 1); the published ceiling never widens, the
+   bit-17-absent cadence is decision-identical; RED-first on the box's
+   shape, published `meta_kv_checkpoint_{term,trigger}_ms`. **What
    stays for the box re-run (PR 14):** the counted rows on this binary —
    the derivation is judged on whether the box's 16–106 ms terms land
    inside the ceiling there (the laptop reads the mechanism only).

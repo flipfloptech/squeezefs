@@ -45,7 +45,7 @@
 #   sudo env BIN=/scratch/tmp/sym-box/squeezefs-B \
 #            TAR_SRC=/scratch/tmp/sym-box/linux/fs \
 #            [GATES="tarx scale shared-dir foreign-touch walls readers walls32"] \
-#            [REPEATS=2] [OUT=/scratch/tmp/sym-box/brackets-<ts>] \
+#            [REPEATS=2] [FRESH_FLEET_PER_LEG=1] [OUT=/scratch/tmp/sym-box/brackets-<ts>] \
 #            [SQZ_MWFLEET_OSS_GB=16] [SQZ_DEVSUB_OSS_ALGO=lzo-rle] \
 #        bash 2026-09-21-sym-box-brackets.sh
 #   SMOKE=1 = the laptop PLUMBING run ("it works" only — the venue law):
@@ -57,7 +57,7 @@
 # Artifacts: $OUT/<gate>-r<i>/ = the leg's $STATE/rows/* (its tables,
 # verdicts, per-daemon .stats snapshots, venue-attributed ledger),
 # $OUT/<gate>-r<i>.log (the leg's stdout+stderr), $OUT/<gate>-r<i>.{thermal,
-# loadavg,dmesg}, $OUT/fleet-<A|B>.{create,teardown}.log, $OUT/box.log (the
+# loadavg,dmesg}, $OUT/fleet-<A|B|C>-<n>.{create,teardown}.log, $OUT/box.log (the
 # venue block: host, kernel, binary identity, fio-free), $OUT/SUMMARY.txt
 # (every leg's verdict + table lines, by gate and position).
 set -eu
@@ -125,8 +125,10 @@ esac
 thermal() { for h in /sys/class/hwmon/hwmon*/temp*_input; do [ -r "$h" ] && echo "hwmon $(basename "$(dirname "$h")")/$(basename "$h")=$(cat "$h")"; done > "$1" 2>/dev/null; }
 hottest() { sort -t= -k2 -n "$1" 2>/dev/null | tail -1 | sed 's/.*=//' | awk '{printf "%.0f", $1/1000}'; }
 
-fleet_up() { # A|B
+FLEET_SEQ=0
+fleet_up() { # A|B|C
     local shape="$1" args
+    FLEET_SEQ=$((FLEET_SEQ + 1))
     case "$shape" in
     A) args="N=2 --symmetric --writers=$FLEET_A_WRITERS --token-readers" ;;
     B) args="N=$((FLEET_B_READERS + 1)) --symmetric --writers=1 --token-readers" ;;
@@ -135,15 +137,15 @@ fleet_up() { # A|B
     esac
     log "fleet $shape: create $args $(date -u +%FT%TZ)"
     # shellcheck disable=SC2086 # deliberate word split of the create args
-    bash "$FLEET" create $args >"$OUT/fleet-$shape.create.log" 2>&1 ||
-        die "fleet $shape create FAILED — tail: $(tail -5 "$OUT/fleet-$shape.create.log")"
+    bash "$FLEET" create $args >"$OUT/fleet-$shape-$FLEET_SEQ.create.log" 2>&1 ||
+        die "fleet $shape create FAILED — tail: $(tail -5 "$OUT/fleet-$shape-$FLEET_SEQ.create.log")"
     log "fleet $shape up: $(grep -c . "$STATE/members.tsv") members"
 }
-fleet_down() { # A|B
+fleet_down() { # A|B|C
     local shape="$1"
     log "fleet $shape: teardown $(date -u +%FT%TZ)"
-    bash "$FLEET" teardown >"$OUT/fleet-$shape.teardown.log" 2>&1 ||
-        die "fleet $shape teardown FAILED (residue) — tail: $(tail -5 "$OUT/fleet-$shape.teardown.log")"
+    bash "$FLEET" teardown >"$OUT/fleet-$shape-$FLEET_SEQ.teardown.log" 2>&1 ||
+        die "fleet $shape teardown FAILED (residue) — tail: $(tail -5 "$OUT/fleet-$shape-$FLEET_SEQ.teardown.log")"
     [ -f "$STATE/members.tsv" ] && die "residue after teardown of fleet $shape"
     log "fleet $shape torn down to zero residue"
 }
@@ -210,33 +212,35 @@ for g in $GATES; do
     *) fleet_a_gates="$fleet_a_gates $g" ;;
     esac
 done
-if [ -n "$fleet_a_gates" ]; then
-    fleet_up A
-    for g in $fleet_a_gates; do
+# One fleet per SHAPE by default; FRESH_FLEET_PER_LEG=1 recreates the
+# fleet before EVERY leg (≈ 35 s on the box). The legs judge the must-
+# stay-0 set on ABSOLUTE gauges at their entry, so a gauge one leg moved
+# (the box's first pass: `appender_flush_ceiling_overruns` +1 during
+# sym-scale) kills every later leg on the same fleet at its door — a fresh
+# fleet per leg keeps each position's verdict its OWN.
+FRESH_FLEET_PER_LEG="${FRESH_FLEET_PER_LEG:-0}"
+run_shape() { # shape gates...
+    local shape="$1" g i up=0
+    shift
+    for g in "$@"; do
         for ((i = 1; i <= REPEATS; i++)); do
+            if [ "$up" = "1" ] && [ "$FRESH_FLEET_PER_LEG" = "1" ]; then
+                fleet_down "$shape"
+                up=0
+            fi
+            [ "$up" = "1" ] || { fleet_up "$shape"; up=1; }
             run_leg "$g" "$i" || { FAILED="$FAILED $g-r$i"; break; }
         done
     done
-    fleet_down A
-fi
-if [ -n "$fleet_b_gates" ]; then
-    fleet_up B
-    for g in $fleet_b_gates; do
-        for ((i = 1; i <= REPEATS; i++)); do
-            run_leg "$g" "$i" || { FAILED="$FAILED $g-r$i"; break; }
-        done
-    done
-    fleet_down B
-fi
-if [ -n "$fleet_c_gates" ]; then
-    fleet_up C
-    for g in $fleet_c_gates; do
-        for ((i = 1; i <= REPEATS; i++)); do
-            run_leg "$g" "$i" || { FAILED="$FAILED $g-r$i"; break; }
-        done
-    done
-    fleet_down C
-fi
+    [ "$up" = "1" ] && fleet_down "$shape"
+    return 0
+}
+# shellcheck disable=SC2086 # deliberate word split of the gate lists
+[ -z "$fleet_a_gates" ] || run_shape A $fleet_a_gates
+# shellcheck disable=SC2086
+[ -z "$fleet_b_gates" ] || run_shape B $fleet_b_gates
+# shellcheck disable=SC2086
+[ -z "$fleet_c_gates" ] || run_shape C $fleet_c_gates
 log "== done $(date -u +%FT%TZ) $OUT failed=[${FAILED# }]"
 cat "$OUT/SUMMARY.txt"
 [ -z "$FAILED" ] || { echo "RED legs:$FAILED (each stopped its gate's pass; attribute before any row is written)" >&2; exit 3; }

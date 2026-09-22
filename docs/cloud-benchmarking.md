@@ -216,10 +216,17 @@ checkpoint task), and, with `SYM_TOKEN_READER=1` (default), a `--read-only`
 **token reader** at `/scratch/mnt-ro` on `client0` (the `-ls` half of gate
 3b). Every node is its **own registrant** — the REMOTE posture: the node's
 nvme-cli host identity (`/etc/nvme/hostnqn` + `hostid`), generated where
-missing and **asserted distinct across the client nodes** (a baked AMI
-clones the file onto every node; two nodes with one identity alias as one
-registrant at the target). No `SQUEEZEFS_FLEET_SHARE` — one daemon per node
-owns its machine, which is the point of the venue.
+missing and **asserted distinct across the client nodes — both words**
+(nvmet keys a PR registrant by the Host ID; a baked AMI clones both files
+onto every node; a duplicate of either regenerates both), and after the
+mounts the DEVICE's own answer is gated: **`pr_registrant_shared == 0`** on
+the manager and every joiner (the Reservation Report attributes no other
+registration to the node's Host Identifier). No `SQUEEZEFS_FLEET_SHARE` —
+one daemon per node owns its machine, which is the point of the venue. The
+mw preset's node packages gain `attr` (`getfattr` reads the striped
+directory's `user.squeezefs.stripes`); the deploy resolves every tool the
+rows invoke by name and the driver preflights them on every node before
+any row runs — a missing tool dies loud, never a false RED on a paid row.
 
 The posture gates are read from every node's `.stats` (a silently-degraded
 mount is contractually impossible): the manager — `mount_posture writer`,

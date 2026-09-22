@@ -254,9 +254,15 @@ change a threshold there and both venues move together). The row set:
 | gate 3 `sym-scale` | N ∈ {1,2,4,8} ∩ [1, N_CLIENT] writer **nodes** (the manager + N−1 joiners) each create `SYM_FILES` files (`SYM_THREADS` threads) in its own directory, then ingest `SYM_INGEST_MB` (4 MiB blocks, `conv=fsync`); the idle writers **leave** (`sym-hook`) so exactly N appenders are live; `C/CPU-S` beside the wall multiple; the ingest row's amplification columns from `/proc/diskstats` on the storage nodes' data namespaces (`device ÷ user bytes`, `wareq-sz`) | ≥ 0.7 × N × the N=1 rate on both rows; `appenders_known == N`; handovers 0; `slot_ships ≤ N`; `dlm_rpcs` 0; the must-stay-0 deltas 0; deleted stays deleted through the manager after every writer's clean leave and through a remounted writer |
 | gate 3b `sym-shared-dir` (+ `-ls`) | every writer node creates `SYM_FILES / N` files into **one** directory the first joiner made; then the token reader's cold `ls -l` of it | `dir_stripe_flips == 1` at the holder; `dir_striped_dirs ≥ 1`; `dir_stripe_ships > 0`; `xv shipped ≡ served`; `slot_handovers == 0`; `-ls`: `dlm_token_grants ∈ [K + C, K + C + 4]`, 0 data-leaf reads (net of the poll's re-reads + one tree-0 read per stripe slot), `dir_stripe_readdir_merges ≥ 1` |
 
-After every row set: `squeezefs fsck <manager mount> --json` (findings 0),
-`meta_kv_block_refs_drift == 0`, `data_alloc_bitmap_drift == 0` and the
-must-stay-0 set on every writer. **Every RATE phase runs ≥ `SYM_RT` seconds**
+Every row also carries the **acked-writes-present** law (the lib's, so the
+matrix's legs read it too): the tree a writer acked — entries and bytes —
+read back **identical through another mount** (the manager for a joiner's
+`tar -x`, the first joiner for the manager's; another writer of the row, or
+the token reader, for `sym-scale`'s trees; the manager for the shared
+directory) and every fsynced `ingest.bin` read back whole through another
+mount, all zero. After every row set: `squeezefs fsck <manager mount>
+--json` (findings 0), `meta_kv_block_refs_drift == 0`,
+`data_alloc_bitmap_drift == 0` and the must-stay-0 set on every writer. **Every RATE phase runs ≥ `SYM_RT` seconds**
 (default 60 — the sustained-state rule): on the cloud venue the driver's
 `--size-to-rt=auto` pilot (an N = 1 create storm + a 256 MiB ingest on the
 manager, then a small shared-dir wave) sizes `--files`, `--ingest-mb` (up

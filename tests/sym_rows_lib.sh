@@ -393,6 +393,64 @@ sym_law_gate3b_ls() { # grants K C misses dropped epochs merges
     [ "$merges" -ge 1 ] || die "sym-shared-dir-ls: dir_stripe_readdir_merges=$merges on the reader (the K-way merge did not run)"
 }
 
+# --- acked writes present (the oracle's presence half) --------------------------------
+
+# The census of a directory TREE as one mount sees it: `entries bytes` —
+# every entry below the root (files, directories, symlinks; the root
+# itself excluded) and Σ regular-file bytes. Run on the node that holds
+# the mount (python3 -c "$SYM_TREE_CENSUS_PY" <dir>); the harness runs it
+# on the WRITING mount right after the writes were acked and again through
+# ANOTHER mount, and `sym_law_acked_tree` judges the two equal — an acked
+# entry a peer cannot see is a lost write, never a slow one.
+# shellcheck disable=SC2034  # read by the harnesses that source this lib
+SYM_TREE_CENSUS_PY='
+import os, sys
+root = sys.argv[1]
+n = 0; b = 0
+for d, dirs, files in os.walk(root):
+    n += len(dirs) + len(files)
+    for f in files:
+        p = os.path.join(d, f)
+        st = os.lstat(p)
+        if not os.path.islink(p):
+            b += st.st_size
+print(n, b)'
+
+# One file read back whole: `bytes zero_ok` — its size and whether every
+# byte is zero (the ingest rows write /dev/zero; a size-consistent file
+# of the wrong bytes is the staged-payload-lost class, `zero_ok` = 0).
+# shellcheck disable=SC2034
+SYM_ZERO_FILE_PY='
+import sys
+p = sys.argv[1]
+n = 0; ok = 1
+with open(p, "rb") as f:
+    while True:
+        c = f.read(4 << 20)
+        if not c: break
+        n += len(c)
+        if ok and c.count(0) != len(c): ok = 0
+print(n, ok)'
+
+# THE ACKED-WRITES LAW (a tree): what the writer acked ≡ what another mount
+# reads — entries and bytes both. Dies on a difference.
+sym_law_acked_tree() { # label want_entries got_entries want_bytes got_bytes via
+    local label="$1" we="$2" ge="$3" wb="$4" gb="$5" via="$6"
+    [ "$we" = "$ge" ] && [ "$wb" = "$gb" ] ||
+        die "$label: ACKED WRITES NOT PRESENT through $via — the writer saw $we entries / $wb bytes, the read-back sees $ge entries / $gb bytes (a lost acked write, never a slow one)"
+}
+
+# THE ACKED-WRITES LAW (an ingest file): the fsynced file's bytes read back
+# whole through another mount, every byte the zero the writer wrote. Dies
+# on a difference.
+sym_law_acked_ingest() { # label want_bytes got_bytes zero_ok via
+    local label="$1" wb="$2" gb="$3" z="$4" via="$5"
+    [ "$wb" = "$gb" ] ||
+        die "$label: ACKED INGEST NOT PRESENT through $via — $wb bytes fsynced, $gb bytes read back"
+    [ "$z" = "1" ] ||
+        die "$label: ACKED INGEST CORRUPT through $via — $gb bytes read back but not the zeros the writer wrote (the staged-payload-lost class)"
+}
+
 # --- the oracle's JSON face --------------------------------------------------------
 
 # `squeezefs fsck <mnt> --json` output → the finding count (findings +

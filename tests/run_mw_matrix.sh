@@ -3770,6 +3770,29 @@ print(ok)
 PYEOF
 }
 
+# ACKED WRITES PRESENT (the lib's laws, PR 15 review round 1, Issue 11):
+# a tree the writer acked ≡ the tree ANOTHER mount reads (entries + bytes);
+# an fsynced ingest file read back whole through another mount, all zero.
+sym_tree_census() { # path -> "entries bytes"
+    python3 -c "$SYM_TREE_CENSUS_PY" "$1"
+}
+sym_acked_tree_check() { # label writer_mnt via_idx rel
+    local label="$1" w_mnt="$2" via="$3" rel="$4" we wb ge gb
+    read -r we wb <<<"$(sym_tree_census "$w_mnt$rel")"
+    read -r ge gb <<<"$(sym_tree_census "$(mnt_of "$via")$rel")"
+    sym_law_acked_tree "$label" "$we" "$ge" "$wb" "$gb" "m$via"
+    log "$label: acked writes present — $we entries / $wb bytes read back identical through m$via"
+}
+# The s8a_venue hook for the sym-tarx leg: the extracting mount's tree read
+# back through the OTHER side (the manager for the joiner's arm, the first
+# joiner for the manager's).
+sym_tarx_census_hook() { # label mnt rel
+    local label="$1" mnt="$2" rel="$3" via
+    if [ "$mnt" = "$(mnt_of 0)" ]; then via="$SYM_TARX_JW"; else via=0; fi
+    sym_acked_tree_check "sym-tarx $label" "$mnt" "$via" "$rel"
+}
+SYM_TARX_JW=""
+
 # --- gate 2: sym-tarx ------------------------------------------------------
 leg_sym_tarx() {
     require_symmetric
@@ -3798,6 +3821,8 @@ leg_sym_tarx() {
     "$MWFLEET" mount "$jw" --netns || die "sym-tarx: netns joiner mount failed"
     "$MWFLEET" netem "$jw" 125us || die "sym-tarx: netem failed"
     jw_mnt="$(mnt_of "$jw")"
+    SYM_TARX_JW="$jw"
+    S8A_VENUE_CENSUS_HOOK=sym_tarx_census_hook
 
     sym_arm() { # label -> row line
         local label="$1" out wire xv ship pub verbs_per h_j h_m rpcs
@@ -3824,6 +3849,7 @@ leg_sym_tarx() {
     rows+=("$(local_arm local-1)")
     rows+=("$(local_arm local-2)")
     rows+=("$(sym_arm sym-2)")
+    S8A_VENUE_CENSUS_HOOK=""
     "$MWFLEET" netem "$jw" off || true
 
     echo ""
@@ -3966,6 +3992,18 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t_row0):.0f}')")"
         fi
         [ "$verdict" = "MET" ] || verdict_all=MISS
         sym_gate3_row_line "$n" "$create_rate" "$cr" "$creates_per_cpu_s" "$ingest_rate" "$ir" "$mgr_load" "$mgr_cpu" "$handovers" "$ships" "$rpcs" "$verdict" | tee -a "$rowdir/symscale-table.tsv"
+        # ACKED WRITES PRESENT: every writer's tree + its fsynced ingest file
+        # read back through ANOTHER writer of the row (N ≥ 2) or the token
+        # reader; at N = 1 with no reader the manager's own view stands.
+        for idx in "${writers[@]}"; do
+            local via="" j zb zok
+            for j in "${writers[@]}"; do [ "$j" != "$idx" ] && { via="$j"; break; }; done
+            [ -n "$via" ] || via="$(awk -F'\t' '$2=="reader" {print $1}' "$MEMBERS" 2>/dev/null | sort -n | head -1)"
+            [ -n "$via" ] || { log "sym-scale N=$n m$idx: no other mount to read the acked writes back through (N = 1, no reader)"; continue; }
+            sym_acked_tree_check "sym-scale N=$n m$idx" "$(mnt_of "$idx")" "$via" "/scale-$SYM_RUN-n$n-w$idx"
+            read -r zb zok <<<"$(python3 -c "$SYM_ZERO_FILE_PY" "$(mnt_of "$via")/scale-$SYM_RUN-n$n-w$idx/ingest.bin")"
+            sym_law_acked_ingest "sym-scale N=$n m$idx" "$((SYM_INGEST_MB * 1024 * 1024))" "$zb" "$zok" "m$via"
+        done
         for idx in "${writers[@]}"; do
             # A sample of the names about to be removed — the LAST ones the
             # storm created (the "deleted stays deleted" arm below judges
@@ -4289,6 +4327,9 @@ leg_sym_shared_dir() {
     listed="$(ls -f "$shared" | grep -c '^w')"
     [ "$listed" = "$created" ] ||
         die "sym-shared-dir: the directory lists $listed names but $created creates were acked (the striped readdir merge or a lost dentry)"
+    # ACKED WRITES PRESENT: the holder's census of the directory ≡ the
+    # manager's (a creator reading a foreign holder's directory).
+    sym_acked_tree_check sym-shared-dir "$h_mnt" 0 "${shared#"$h_mnt"}"
     # THE ENGAGEMENT LAW (§8 gate 3b): exactly ONE flip, at the holder;
     # the directory striped; every foreign create either a served
     # cross-owner step (pre-flip) or a stripe ship (post-flip) — the
@@ -5721,6 +5762,13 @@ s8a_venue() { # rowdir label mnt cw_idx entries tarball [subtree-root]
     sleep 2
     [ -n "$cw" ] && snap "$cw" "${label}1" "$rowdir"
     snap 0 "${label}1" "$rowdir"
+    # A caller-installed census hook runs on the extracted tree AFTER the
+    # snapshots and BEFORE the venue's blocks go back (the sym legs' acked-
+    # writes-present law reads the tree through ANOTHER mount; the S8 rows
+    # install none — byte-identical there).
+    if [ -n "${S8A_VENUE_CENSUS_HOOK:-}" ]; then
+        "$S8A_VENUE_CENSUS_HOOK" "$label" "$mnt" "${subtree}/s8a-$label" >&2
+    fi
     # Return the venue's blocks before the next one (untimed; a cache-less
     # fleet stores every beyond-inline file as a whole striped block, so a
     # 4-venue sweep would otherwise exhaust the lane share — on a

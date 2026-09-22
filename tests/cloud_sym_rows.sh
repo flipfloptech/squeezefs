@@ -695,6 +695,39 @@ dev=$dsec*512; ops=$dops; user=$user
 print(f'dev_bytes={dev} user_bytes={user} dev/user={dev/max(1,user):.3f} wareq_sz={dev/max(1,ops):.0f}B write_ops={ops}')"
 }
 
+# --- acked writes present (the lib's laws; the census runs ON the nodes) --------------
+# tree_census <idx> <path-under-mount> -> "entries bytes" as m<idx> sees it
+tree_census() {
+    RX_CANNED="0 0" rx "$1" P="${MNT[$1]}$2" PY="$SYM_TREE_CENSUS_PY" <<'EOS'
+python3 -c "$PY" "$P"
+EOS
+}
+# zero_file <idx> <path-under-mount> -> "bytes zero_ok"
+zero_file() {
+    RX_CANNED="0 1" rx "$1" P="${MNT[$1]}$2" PY="$SYM_ZERO_FILE_PY" <<'EOS'
+python3 -c "$PY" "$P"
+EOS
+}
+# The mount a WRITER's acked writes are read back through: another writer
+# when one is mounted (the manager for a joiner, the first mounted joiner
+# for the manager), else the token reader, else none (N = 1 with no reader).
+other_mount_for() { # idx [mounted-writers...] -> idx | ""
+    local idx="$1" j
+    shift
+    for j in "$@"; do [ "$j" != "$idx" ] && { echo "$j"; return 0; }; done
+    [ -n "$READER" ] && { echo 1; return 0; }
+    echo ""
+}
+# acked_tree_check <label> <writer idx> <rel path> <via idx>
+acked_tree_check() {
+    local label="$1" w="$2" rel="$3" via="$4" we ge wb gb
+    read -r we wb <<<"$(tree_census "$w" "$rel")"
+    read -r ge gb <<<"$(tree_census "$via" "$rel")"
+    $DRY_RUN && { echo "(dry-run: would judge acked tree $rel: m$w $we/$wb ≡ m$via $ge/$gb)" >&2; return 0; }
+    sym_law_acked_tree "$label" "$we" "$ge" "$wb" "$gb" "m$via (${HOST[$via]}:${MNT[$via]})"
+    emit "   acked-writes present ($label): $we entries / $wb bytes acked at m$w read back identical through m$via"
+}
+
 # ===================================================================================
 # gate 2 — sym-tarx
 # ===================================================================================
@@ -735,6 +768,14 @@ EOS
     sleep 2
     [ "$idx" != "0" ] && snap "$idx" "${label}1"
     snap 0 "${label}1"
+    # ACKED WRITES PRESENT (the lib's law): the extracted tree as the
+    # extracting node sees it ≡ as ANOTHER mount reads it (the manager for
+    # the joiner's arm, the first joiner for the manager's) — after the
+    # snapshots (the read-back's tokens are the other mount's, never the
+    # arm's judged deltas), before the venue's blocks go back.
+    local via
+    via="$(other_mount_for "$idx" 0 "${WRITERS[0]}")"
+    [ -n "$via" ] && acked_tree_check "sym-tarx $label" "$idx" "/s8a-$label" "$via" >&2
     # The venue's blocks back before the next arm (untimed) — AFTER the
     # snapshots: on a joined writer every terminal free SHIPS to the
     # allocation holder as a publish-plane frame, which would land on the
@@ -1050,6 +1091,23 @@ print(f'{100*(int(b)-int(a))/1e9/max(1e-9, $t1-$t_row0):.0f}')" 2>/dev/null || e
             bf="$bf ${k#block_free_}=$v_bf"
         done
         emit "   N=$n walls: create ${create_wall}s ingest ${ingest_wall}s (RT $RT s); appenders_known=$live; ingest amplification: $amp; block_free (row window, Σ writers):$bf"
+        # ACKED WRITES PRESENT (the lib's laws): every writer's create tree
+        # and its fsynced ingest file read back through ANOTHER mount (a
+        # writer of the row when N ≥ 2, else the token reader; at N = 1 with
+        # no reader there is no other mount — stated).
+        for idx in "${writers[@]}"; do
+            local via
+            via="$(other_mount_for "$idx" "${writers[@]}")"
+            if [ -z "$via" ]; then
+                emit "   acked-writes present (N=$n m$idx): no other mount to read back through (N = 1, no reader) — the manager's own view is the census (deleted-stays-deleted below reads it)"
+                continue
+            fi
+            acked_tree_check "sym-scale N=$n m$idx" "$idx" "/scale-$SYM_RUN-n$n-w$idx" "$via"
+            local zb zok
+            read -r zb zok <<<"$(zero_file "$via" "/scale-$SYM_RUN-n$n-w$idx/ingest.bin")"
+            $DRY_RUN || sym_law_acked_ingest "sym-scale N=$n m$idx" "$((INGEST_MB * 1024 * 1024))" "$zb" "$zok" "m$via (${HOST[$via]}:${MNT[$via]})"
+            $DRY_RUN || emit "   acked-writes present (N=$n m$idx): ingest.bin $zb bytes read back through m$via, all zero"
+        done
         for idx in "${writers[@]}"; do
             # The LAST names the storm created (`ls -U` = readdir order = the
             # order `rm -rf` unlinks in) — the deleted-stays-deleted sample.
@@ -1186,6 +1244,10 @@ EOS
 )"
     [ "$listed" = "$created" ] ||
         die "sym-shared-dir: the directory lists $listed names but $created creates were acked (the striped readdir merge or a lost dentry)"
+    # ACKED WRITES PRESENT (the lib's law): the holder's census of the
+    # directory ≡ the manager's (a creator reading a foreign holder's
+    # directory through its tokens) — the -ls half below is the reader's.
+    acked_tree_check "sym-shared-dir" "$holder" "$shared_rel" 0
     local flips=0 flip_at="" striped shipped=0 served=0 stripe_ships=0 handovers=0 v
     for idx in "${writers[@]}"; do
         v="$(sym_delta "$ROWDIR" "$idx" sd dir_stripe_flips)"

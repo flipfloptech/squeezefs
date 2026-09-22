@@ -3527,11 +3527,16 @@ an error — the matrix's screen pin caught the first build serving past
 it. **Pins (`e24d0016`, RED on the
 base with the exact log line, GREEN on the fix):**
 `sym_n_daemon_tests::a_cross_owner_unlink_of_a_foreign_minted_child_reads_
-its_witness_at_the_holder` (three daemons: the child minted by joiner 2
-into joiner 1's directory, unlinked through joiner 1 — `nlink` 0 at the
-holder and every mount, no dangling-name line, the record gone at the
-requester's leave) and `…_link_rename_over_and_directory_move_read_their_
-witnesses_at_the_holder`. **Fleet proof (laptop, "it works"):**
+its_witness_at_the_holder` (the MANAGER + ONE joiner, both directions —
+A: the joiner creates into the manager's directory and the manager `rm`s
+the joiner-minted children; B: the manager creates into the joiner's
+directory and the joiner `rm`s — plus a joiner-minted directory `rmdir`ed
+by the manager; every child reads `nlink` 0 at its holder and every
+mount, no dangling-name line, the offline census after every writer left
+reads no C9 and exempts nothing) and `…_link_rename_over_and_directory_
+move_read_their_witnesses_at_the_holder` (the same two daemons: `link`
+into the foreign directory, a rename OVER a foreign-minted destination, a
+directory move across holders). **Fleet proof (laptop, "it works"):**
 `tests/run_mw_matrix.sh sym-foreign-touch` gained `sym_post_leave_census`
 — zero "no inode record" lines across the writers' logs after the leg's
 `rm -rf`, the dangling-name gauge 0 on every writer, then EVERY joiner

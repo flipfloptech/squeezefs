@@ -1483,6 +1483,14 @@ impl ManagerClient {
 
     /// Issue one verb; a `Refused` reply is an error naming its reason.
     pub async fn call(&mut self, call: ManagerCall) -> Result<ManagerReply> {
+        self.call_with_status(call).await.map(|(_, reply)| reply)
+    }
+
+    /// [`Self::call`] with the frame's STATUS word beside the reply — the
+    /// word that tells the manager's legal refusal (`STATUS_REFUSED`, the
+    /// table's verdict) from the wire screen's `STATUS_REJECTED` (a word
+    /// the manager could not admit), which share the `Refused` reply.
+    pub async fn call_with_status(&mut self, call: ManagerCall) -> Result<(u16, ManagerReply)> {
         let request_id = self.next_request;
         self.next_request += 1;
         let body = encode_request(&ManagerRequestFrame {
@@ -1514,7 +1522,7 @@ impl ManagerClient {
                 frame.request_id
             )));
         }
-        Ok(frame.reply)
+        Ok((resp.status, frame.reply))
     }
 
     /// `JoinAppender` for `identity`.
@@ -1600,18 +1608,32 @@ impl ManagerClient {
     }
 
     /// `OfferSlot`: the holder `appender_id` offers `slot` to `to`.
-    pub async fn offer_slot(&mut self, appender_id: u32, slot: u16, to: u32) -> Result<()> {
+    /// `OfferSlot` — `Ok(true)` offered; `Ok(false)` the manager's legal
+    /// refusal (`STATUS_REFUSED`: a transition already in flight on the
+    /// slot — a second dominating ship before the accept, a recall —
+    /// `slot_offers_busy` at the manager), which is the table's verdict,
+    /// never a failure of the wire (PR 13e: a joined holder's second
+    /// offer counted on `joined_wire_failures`, a must-stay-0 gauge). The
+    /// wire screen's `STATUS_REJECTED` (an offeree no page names, the
+    /// holder itself — `manager_verb_rejected`) stays an error: a word
+    /// this caller sent that the manager could not admit is the caller's
+    /// bug, never a verdict to serve past.
+    pub async fn offer_slot(&mut self, appender_id: u32, slot: u16, to: u32) -> Result<bool> {
         match self
-            .call(ManagerCall::OfferSlot {
+            .call_with_status(ManagerCall::OfferSlot {
                 appender_id,
                 slot,
                 to,
             })
             .await?
         {
-            ManagerReply::Offered => Ok(()),
-            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
-            other => Err(SqueezefsError::InvalidOperation(format!(
+            (_, ManagerReply::Offered) => Ok(true),
+            (STATUS_REFUSED, ManagerReply::Refused { reason }) => {
+                log::debug!("OfferSlot {slot} by appender {appender_id} to {to}: {reason}");
+                Ok(false)
+            }
+            (_, ManagerReply::Refused { reason }) => Err(SqueezefsError::InvalidOperation(reason)),
+            (_, other) => Err(SqueezefsError::InvalidOperation(format!(
                 "OfferSlot answered {other:?}"
             ))),
         }

@@ -7830,9 +7830,11 @@ impl KvMetaBackend {
                 let offered = if set.is_joined_appender() {
                     self.joined_offer_slot(slot, requester).await
                 } else {
-                    self.manager_offer_slot(holder, slot, requester).await
+                    self.manager_offer_slot(holder, slot, requester)
+                        .await
+                        .map(|()| true)
                 };
-                if let Ok(()) = offered {
+                if let Ok(true) = offered {
                     if matches!(verdict, ShipVerdict::OfferIdle { .. }) {
                         plane.offers_idle.fetch_add(1, Ordering::Relaxed);
                     } else {

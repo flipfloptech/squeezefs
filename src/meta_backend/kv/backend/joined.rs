@@ -1556,7 +1556,14 @@ impl KvMetaBackend {
     /// Before PR 13 a joined holder's dominance verdict reached
     /// `manager_offer_slot` — a manager verb's executor — and refused
     /// (`joined_control_refusals`), so no idle joiner's tree ever moved.
-    pub(super) async fn joined_offer_slot(&self, slot: ForestSlot, to: u32) -> Result<(), KvError> {
+    /// `Ok(false)` = the manager's legal `Busy` (an offer already standing
+    /// on the slot — a second dominating ship before the accept; PR 13e:
+    /// before it the answer was counted on `joined_wire_failures`).
+    pub(super) async fn joined_offer_slot(
+        &self,
+        slot: ForestSlot,
+        to: u32,
+    ) -> Result<bool, KvError> {
         let wire = Arc::clone(self.joined.get().ok_or_else(|| {
             KvError::Corrupt(format!("{}: joined wire unset", self.path.display()))
         })?);

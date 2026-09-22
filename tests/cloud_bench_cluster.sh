@@ -1864,12 +1864,16 @@ EOS
       <<<"$CLIENT_PROLOGUE_SCRIPT"
   done
 
-  log "assemble-sym 3/8: host identities — every client node its OWN registrant (nvme-cli hostnqn/hostid, DISTINCT across the fleet)"
+  log "assemble-sym 3/8: host identities — every client node its OWN registrant (nvme-cli hostnqn AND hostid, each DISTINCT across the fleet)"
   # A baked AMI clones /etc/nvme/hostnqn + hostid onto every node; two
   # nodes with one identity ALIAS at the target (one registrant, the
-  # fence blind to which host wrote). Generate where missing, then assert
-  # distinct; a duplicate is regenerated on the later node and re-read.
-  local -A seen_nqn=()
+  # fence blind to which host wrote). nvmet keys a PR registrant by the
+  # controller's HOST ID (`nvmet_pr_registrant.hostid`) — so the hostid is
+  # the key that matters and the NQN the name beside it: BOTH are asserted
+  # distinct, a duplicate of EITHER regenerates both on the later node
+  # (review round 1, Issue 2). The device's own answer is gated after the
+  # mounts: `pr_registrant_shared == 0` on every writer.
+  local -A seen_nqn=() seen_hid=()
   local nqn hid
   for c in "${clients[@]}"; do
     ip="$(node_pub "$c")"
@@ -1897,16 +1901,21 @@ EOS
 )"
         nqn="$(awk '/^IDENTITY /{print $2}' <<<"$out")"; hid="$(awk '/^IDENTITY /{print $3}' <<<"$out")"
         [ -n "$nqn" ] && [ -n "$hid" ] || die "$c: could not read its nvme host identity"
-        if [ -n "${seen_nqn[$nqn]:-}" ]; then
-          [ "$try" = 1 ] || die "$c: hostnqn $nqn STILL duplicates ${seen_nqn[$nqn]}'s after regeneration"
-          warn "$c: hostnqn duplicates ${seen_nqn[$nqn]}'s ($nqn — a baked AMI's clone); regenerating"
+        local dup=""
+        [ -n "${seen_nqn[$nqn]:-}" ] && dup="hostnqn $nqn duplicates ${seen_nqn[$nqn]}'s"
+        [ -n "${seen_hid[$hid]:-}" ] && dup="${dup:+$dup; }hostid $hid duplicates ${seen_hid[$hid]}'s (the PR registrant KEY)"
+        if [ -n "$dup" ]; then
+          [ "$try" = 1 ] || die "$c: $dup — STILL after regeneration"
+          warn "$c: $dup (a baked AMI's clone); regenerating both"
           continue
         fi
         break
       done
     fi
+    [ -n "${hid:-}" ] || hid="dryrun-hid-$c"
     seen_nqn[$nqn]="$c"
-    echo "  $c: hostnqn $nqn"
+    seen_hid[$hid]="$c"
+    echo "  $c: hostnqn $nqn hostid $hid"
   done
 
   log "assemble-sym 4/8: storage nodes — instance-store share + nvmet PR assert (resv_enable=1; v6.13+ floor)"
@@ -1957,6 +1966,21 @@ die() { echo \"FATAL: \$*\" >&2; exit 1; }
 poll_all_eq \"\$MNT\" appenders_known \"\$N\" 240 \"manager: appenders_known — the directory's Live-page count (want \$N = the manager + \$((N - 1)) joined writers; appenders_live counts only the regions THIS daemon joined)\"
 poll_stat \"\$MNT\" membership_writers \"\$((N - 1))\" 240 \"manager: membership_writers (every joiner a WRITER member of the manager's shard)\"
 echo \"  fleet gates: appenders_known=\$(stat_first \"\$MNT\" appenders_known) membership_members=\$(stat_field \"\$MNT\" membership_members) membership_writers=\$(stat_field \"\$MNT\" membership_writers) membership_readers=\$(stat_field \"\$MNT\" membership_readers)\""
+
+  # The DEVICE's word on the identities (KD-MW-3 / §5.2 rule 2):
+  # `pr_registrant_shared` is set from the Reservation Report when the
+  # target attributes ANOTHER registration to this association's Host
+  # Identifier — two nodes aliasing as one registrant. Gated 0 on the
+  # manager and every joined writer; the configured strings above are the
+  # premise, this is the proof.
+  log "assemble-sym 7b/8: the device's registrant identities — pr_registrant_shared == 0 on every writer"
+  for c in "${clients[@]}"; do
+    remote "$(node_pub "$c")" MNT="$MOUNTPOINT" NODE="$c" <<<"$SYM_STAT_HELPERS
+die() { echo \"FATAL: \$*\" >&2; exit 1; }
+v=\"\$(stat_field \"\$MNT\" pr_registrant_shared)\"
+[ \"\$v\" = \"0\" ] || die \"\$NODE: pr_registrant_shared=\$v — the device attributes ANOTHER registration to this node's Host Identifier (two client nodes share one nvme host identity: fencing between them is process-local, not device-enforced); regenerate /etc/nvme/hostid on one of them and re-run assemble-sym\"
+echo \"  \$NODE: pr_registrant_shared=0 (the device sees this node as its own registrant)\""
+  done
 
   log "assemble-sym 8/8: build_commit verification ritual on every node"
   for c in "${clients[@]}"; do

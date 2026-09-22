@@ -103,8 +103,9 @@
 #   gate 3b sym-shared-dir every writer creates into ONE directory the first
 #                         joiner made: one flip at the holder, stripe ships
 #                         > 0, shipped ≡ served, handovers 0; -ls: the
-#                         reader's cold `ls -l` = K + C (+ ≤ 4) tokens, 0
-#                         data-leaf reads.
+#                         reader's cold `ls -l` = K_D + K_root + C (+ ≤ 4)
+#                         tokens (K_root = the mount root's stripes, 0
+#                         unstriped — PR 13d), 0 data-leaf reads.
 # After every row set: `fsck --json` on the manager (findings 0) +
 # `meta_kv_block_refs_drift` / `data_alloc_bitmap_drift` 0 + the must-stay-0
 # set on every writer.
@@ -718,6 +719,18 @@ other_mount_for() { # idx [mounted-writers...] -> idx | ""
     [ -n "$READER" ] && { echo 1; return 0; }
     echo ""
 }
+# stripe_k_of <idx> <rel path> -> K as m<idx> reports it (the lib's reader
+# shipped to the node; 0 = unstriped; dies loud on a missing tool)
+stripe_k_of() {
+    local k
+    # the lib's reader IS the remote script (an env value cannot carry it
+    # over `sudo env … bash -s`); the path arrives as $P
+    k="$(RX_CANNED=64 rx "$1" P="${MNT[$1]}$2" <<<"set -- \"\$P\"
+$SYM_STRIPE_K_SH")" || true
+    [ -n "$k" ] && [ "$k" != "SYM_K_TOOL_FAIL" ] && [[ "$k" =~ ^[0-9]+$ ]] ||
+        die "m$1 (${HOST[$1]}): cannot read user.squeezefs.stripes on ${MNT[$1]}$2 (getfattr missing on the node, or not a live directory) — the -ls law needs K, never a silent 0"
+    echo "$k"
+}
 # acked_tree_check <label> <writer idx> <rel path> <via idx>
 acked_tree_check() {
     local label="$1" w="$2" rel="$3" via="$4" we ge wb gb
@@ -1277,21 +1290,23 @@ EOS
         sym_zero_set_file sym-shared-dir "$idx" "$ROWDIR/m${idx}_psd1.json"
     done
     $DRY_RUN || striped="$(sym_json_sum "$ROWDIR/m${holder}_psd1.json" dir_striped_dirs)"
-    # K = the directory's stripe count as the HOLDER reports it; a missing
-    # tool or a non-integer answer is a harness failure, never K = 0.
-    local xattr_k
-    xattr_k="$(RX_CANNED=64 rx "$holder" P="${MNT[$holder]}$shared_rel" <<'EOS'
-getfattr -n user.squeezefs.stripes --only-values "$P"
-EOS
-)" || die "sym-shared-dir: getfattr -n user.squeezefs.stripes on the holder m$holder FAILED (the tool missing, or the directory carries no stripe map) — see above"
-    [[ "$xattr_k" =~ ^[0-9]+$ ]] && [ "$xattr_k" -ge 1 ] ||
-        die "sym-shared-dir: the holder's user.squeezefs.stripes read '$xattr_k' (want an integer ≥ 1 — K)"
+    # K_D = the directory's stripe count as the HOLDER reports it (≥ 1 after
+    # the flip); K_root = the mount ROOT's as the MANAGER reports it (0 while
+    # `/` is unstriped — a token reader's first `stat /` folds the root's
+    # stripes, one records-only grant each: design §8 row 3b's K_root term,
+    # PR 13d). Both through the lib's ONE die-loud reader shipped to the
+    # node: a missing tool or an unreadable answer is a harness failure,
+    # never a silent 0.
+    local xattr_k k_root
+    xattr_k="$(stripe_k_of "$holder" "$shared_rel")"
+    [ "$xattr_k" -ge 1 ] || die "sym-shared-dir: the holder's user.squeezefs.stripes read K_D=$xattr_k (want ≥ 1 after the flip)"
+    k_root="$(stripe_k_of 0 "")"
     local rt_s
     rt_s="$(sym_rt_verdict sym-shared-dir "$wall" create)"
     {
         row_stamp "sym-shared-dir" "python3 O_CREAT|O_EXCL creators: ${#writers[@]} nodes × $per_writer into ONE directory held by m$holder"
         echo "== gate 3b: ${#writers[@]} creator nodes × $per_writer into ONE directory (holder m$holder): wall $wall s, $(python3 -c "print(f'{$created/($t1-$t0):.0f}')") creates/s aggregate (RT $RT s)${rt_s:+ $rt_s} =="
-        echo "   flips=$flips at [$flip_at] striped_dirs(holder)=$striped K=$xattr_k xv_shipped=$shipped xv_served=$served dir_stripe_ships=$stripe_ships handovers=$handovers"
+        echo "   flips=$flips at [$flip_at] striped_dirs(holder)=$striped K_D=$xattr_k K_root=$k_root xv_shipped=$shipped xv_served=$served dir_stripe_ships=$stripe_ships handovers=$handovers"
     } | tee -a "$([ "$DRY_RUN" = true ] && echo /dev/null || echo "$ROWS_FILE")"
     $DRY_RUN || sym_law_gate3b_engagement "$holder" "$flips" "$flip_at" "$striped" "$stripe_ships" "$shipped" "$served" "$handovers"
     log "sym-shared-dir: flip at the holder, $stripe_ships stripe ships, closure shipped ≡ served ($shipped), 0 handovers"
@@ -1315,7 +1330,7 @@ EOS
         snap 1 "ls1"
         [ "$statted" = "$created" ] || die "sym-shared-dir-ls: the reader statted $statted of $created children"
         if $DRY_RUN; then
-            echo "(dry-run: would judge the -ls law — dlm_token_grants ∈ [K + C, K + C + 4], 0 data-leaf reads net of the poll, merges ≥ 1 — and the plane-replacement witnesses from the two reader snapshots above)"
+            echo "(dry-run: would judge the -ls law — dlm_token_grants ∈ [K_D + K_root + C, K_D + K_root + C + 4], 0 data-leaf reads net of the poll, merges ≥ 1 — and the plane-replacement witnesses from the two reader snapshots above)"
         else
         # The instrument's precondition: the reader's per-holder planes
         # stood for the whole listing. A plane REPLACED mid-window (its
@@ -1341,10 +1356,10 @@ EOS
         hits="$(sym_delta "$ROWDIR" 1 ls dlm_token_hits)"
         dropped="$(sym_delta "$ROWDIR" 1 ls meta_kv_revalidate_nodes_dropped)"
         epochs="$(sym_delta "$ROWDIR" 1 ls meta_kv_revalidate_epochs)"
-        emit "== sym-shared-dir-ls: cold readdir + stat of $created children over K=$xattr_k stripes on token reader m1 (${HOST[1]}): $(python3 -c "print(f'{$t1-$t0:.2f}')") s; dlm_token_grants=$grants (law: K + C = $((xattr_k + created)), + the directory itself and its parent) readdir_merges=$merges node_cache_misses=$misses token_hits=$hits =="
-        sym_law_gate3b_ls "$grants" "$xattr_k" "$created" "$misses" "$dropped" "$epochs" "$merges"
+        emit "== sym-shared-dir-ls: cold readdir + stat of $created children over K_D=$xattr_k stripes (root K_root=$k_root) on token reader m1 (${HOST[1]}): $(python3 -c "print(f'{$t1-$t0:.2f}')") s; dlm_token_grants=$grants (law: K_D + K_root + C = $((xattr_k + k_root + created)), + the directory itself, its parent and the reader's root) readdir_merges=$merges node_cache_misses=$misses token_hits=$hits =="
+        sym_law_gate3b_ls "$grants" "$xattr_k" "$k_root" "$created" "$misses" "$dropped" "$epochs" "$merges"
         sym_zero_reader_file sym-shared-dir-ls 1 "$ROWDIR/m1_pls1.json"
-        log "sym-shared-dir-ls: $grants tokens for K=$xattr_k + C=$created, 0 data-leaf reads for the listing ($misses misses = the poll's $dropped dropped images over $epochs epoch steps + ≤ K tree-0 lessee reads)"
+        log "sym-shared-dir-ls: $grants tokens for K_D=$xattr_k + K_root=$k_root + C=$created, 0 data-leaf reads for the listing ($misses misses = the poll's $dropped dropped images over $epochs epoch steps + ≤ K tree-0 lessee reads)"
         fi
     fi
     rx "$holder" P="${MNT[$holder]}$shared_rel" <<'EOS' || true

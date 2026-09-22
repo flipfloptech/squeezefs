@@ -4351,10 +4351,14 @@ leg_sym_shared_dir() {
         sym_zero_set sym-shared-dir "$idx"
     done
     striped="$(stat_sum "$holder" dir_striped_dirs)"
-    local xattr_k
-    xattr_k="$(getfattr -n user.squeezefs.stripes --only-values "$shared" 2>/dev/null || echo 0)"
+    # K_D (the shared directory's stripes) and K_root (the mount ROOT's —
+    # 0 while `/` is unstriped; a fleet whose joiners' `mkdir /…` striped
+    # `/` reads K there) through the lib's ONE die-loud reader.
+    local xattr_k k_root
+    xattr_k="$(sym_stripe_k "$shared")"
+    k_root="$(sym_stripe_k "$(mnt_of 0)")"
     echo "== PR 13 gate 3b: ${#writers[@]} creators × $per_writer into ONE directory (holder m$holder): wall $(python3 -c "print(f'{$t1-$t0:.2f}')") s, $(python3 -c "print(f'{$created/($t1-$t0):.0f}')") creates/s aggregate ==" | tee "$rowdir/symshared-table.txt"
-    echo "   flips=$flips at [$flip_at] striped_dirs(holder)=$striped K=$xattr_k xv_shipped=$shipped xv_served=$served dir_stripe_ships=$stripe_ships handovers=$handovers" | tee -a "$rowdir/symshared-table.txt"
+    echo "   flips=$flips at [$flip_at] striped_dirs(holder)=$striped K_D=$xattr_k K_root=$k_root xv_shipped=$shipped xv_served=$served dir_stripe_ships=$stripe_ships handovers=$handovers" | tee -a "$rowdir/symshared-table.txt"
     # THE ENGAGEMENT LAW (§8 gate 3b) — the lib's: one flip at the holder,
     # striped, stripe ships > 0, shipped ≡ served, handovers 0.
     sym_law_gate3b_engagement "$holder" "$flips" "$flip_at" "$striped" "$stripe_ships" "$shipped" "$served" "$handovers"
@@ -4387,23 +4391,25 @@ leg_sym_shared_dir() {
         merges="$(sym_delta "$rowdir" "$reader" ls dir_stripe_readdir_merges)"
         misses="$(sym_delta "$rowdir" "$reader" ls meta_kv_node_cache_misses)"
         hits="$(sym_delta "$rowdir" "$reader" ls dlm_token_hits)"
-        echo "== sym-shared-dir-ls: cold readdir + stat of $created children over K=$xattr_k stripes on token reader m$reader: $(python3 -c "print(f'{$t1-$t0:.2f}')") s; dlm_token_grants=$grants (law: K + C = $((xattr_k + created)), + the directory itself and its parent) readdir_merges=$merges node_cache_misses=$misses token_hits=$hits ==" | tee -a "$rowdir/symshared-table.txt"
-        # THE ENGAGEMENT LAW: one token per stripe + one per child (+ the
-        # directory and its parent's own), and ZERO device leaf reads —
-        # every record came in a grant.
-        # The constant beside K + C: the directory's own token (its attrs
-        # and its dentry page are separate grants when `stat D` precedes
-        # the listing), its parent's, and the reader's root token — the
-        # first run read K + C + 3 exactly (20,067 for K = 64, C = 20,000).
-        # "0 leaf reads" is judged NET of the S5 control plane (the poll's
-        # dropped images per epoch step + one tree-0 read per stripe slot)
-        # — the lib's law, one definition for every venue.
+        echo "== sym-shared-dir-ls: cold readdir + stat of $created children over K_D=$xattr_k stripes (root K_root=$k_root) on token reader m$reader: $(python3 -c "print(f'{$t1-$t0:.2f}')") s; dlm_token_grants=$grants (law: K_D + K_root + C = $((xattr_k + k_root + created)), + the directory itself, its parent and the reader's root) readdir_merges=$merges node_cache_misses=$misses token_hits=$hits ==" | tee -a "$rowdir/symshared-table.txt"
+        # THE ENGAGEMENT LAW (design §8 row 3b, PR 13d's adjudication):
+        # dlm_token_grants ∈ K_D + K_root + C + [0, 4] — one token per
+        # stripe of D, one per child, one records-only grant per stripe of
+        # the mount ROOT (a token reader's first `stat /` folds the root's
+        # stripes once per token lifetime; 0 on an unstriped root), plus
+        # the constant (D's own token — its attrs and its dentry page are
+        # separate grants when `stat D` precedes the listing — its
+        # parent's, the reader's root: the fresh-fleet runs read + 3
+        # exactly, 20,067 for K_D = 64, K_root = 0, C = 20,000). "0 leaf
+        # reads" is judged NET of the S5 control plane (the poll's dropped
+        # images per epoch step + one tree-0 read per stripe slot) — the
+        # lib's law, one definition for every venue.
         local dropped epochs
         dropped="$(sym_delta "$rowdir" "$reader" ls meta_kv_revalidate_nodes_dropped)"
         epochs="$(sym_delta "$rowdir" "$reader" ls meta_kv_revalidate_epochs)"
-        sym_law_gate3b_ls "$grants" "$xattr_k" "$created" "$misses" "$dropped" "$epochs" "$merges"
+        sym_law_gate3b_ls "$grants" "$xattr_k" "$k_root" "$created" "$misses" "$dropped" "$epochs" "$merges"
         sym_zero_set sym-shared-dir-ls "$reader"
-        log "sym-shared-dir-ls: $grants tokens for K=$xattr_k + C=$created, 0 data-leaf reads for the listing ($misses misses = the poll's $dropped dropped images over $epochs epoch steps + ≤ K tree-0 lessee reads)"
+        log "sym-shared-dir-ls: $grants tokens for K_D=$xattr_k + K_root=$k_root + C=$created, 0 data-leaf reads for the listing ($misses misses = the poll's $dropped dropped images over $epochs epoch steps + ≤ K tree-0 lessee reads)"
     fi
     rm -rf "$shared" 2>/dev/null || true
     sym_oracle sym-shared-dir "$rowdir"

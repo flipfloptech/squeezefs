@@ -374,22 +374,54 @@ sym_law_gate3b_engagement() { # holder_idx flips flip_at striped stripe_ships sh
     [ "$handovers" = "0" ] || die "sym-shared-dir: slot_handovers=$handovers (aggregate shipping never triggers a handover)"
 }
 
-# THE `-ls` ENGAGEMENT LAW: one token per stripe + one per child (+ the
-# directory and its parent's own and the reader's root token — the
-# constant beside K + C; the first run read K + C + 3 exactly), and ZERO
-# device leaf reads — every record came in a grant. "0 leaf reads" is
-# judged NET of the S5 control plane: the reader's poll drops its
-# projected images at every epoch step and re-reads tree 0 / the roots
+# A directory's stripe count K as its mount reports it (`user.squeezefs.
+# stripes`): the ONE die-loud read for both K terms of the -ls law. Run
+# ON the node that holds the mount (the cloud driver ships the text
+# through `rx`; the matrix calls it locally): prints an integer — an
+# ABSENT attribute or `1` = unstriped ⇒ 0; a missing `getfattr` or any
+# other failure/answer is a harness failure (`SYM_K_TOOL_FAIL` on stdout,
+# exit 1), never a silent 0 (PR 15 review round 1, Issue 1). Every
+# harness that consumes the answer dies on the marker.
+# shellcheck disable=SC2034  # read by the harnesses that source this lib
+SYM_STRIPE_K_SH='
+command -v getfattr >/dev/null 2>&1 || { echo SYM_K_TOOL_FAIL; exit 1; }
+v="$(getfattr -n user.squeezefs.stripes --only-values "$1" 2>/dev/null)"; rc=$?
+if [ "$rc" != 0 ]; then
+  # absent = unstriped; any other failure (not a directory, a dead mount) is loud
+  if [ -d "$1" ] && getfattr -d -m - "$1" >/dev/null 2>&1; then echo 0; else echo SYM_K_TOOL_FAIL; exit 1; fi
+elif [ "$v" = 1 ]; then echo 0
+elif printf "%s" "$v" | grep -Eq "^[0-9]+$"; then echo "$v"
+else echo SYM_K_TOOL_FAIL; exit 1; fi'
+sym_stripe_k() { # path (local) -> K (0 = unstriped) | dies
+    local k
+    k="$(bash -c "$SYM_STRIPE_K_SH" _ "$1")" || true
+    [ -n "$k" ] && [ "$k" != "SYM_K_TOOL_FAIL" ] && [[ "$k" =~ ^[0-9]+$ ]] ||
+        die "cannot read user.squeezefs.stripes on $1 (getfattr missing, or the path is not a live directory) — the -ls law needs K, never a silent 0"
+    echo "$k"
+}
+
+# THE `-ls` ENGAGEMENT LAW (design §8 row 3b, adjudicated 2026-09-22 —
+# PR 13d): `dlm_token_grants ∈ [K_D + K_root + C, K_D + K_root + C + 4]` —
+# one token per stripe of D, one per child, plus ONE records-only grant
+# per stripe of the mount ROOT (`K_root`; 0 while `/` is unstriped: a
+# `-o ro` token reader's first `stat /` folds the root's stripes once per
+# token lifetime — the acceptance record §4.4aj / §7 item 7; a fleet whose
+# joiners' `mkdir /…` into `/` auto-striped it reads `K_root = K`), plus
+# the constant (the directory's own token, its parent's, the reader's
+# root — the fresh-fleet runs read exactly + 3), and ZERO device leaf
+# reads — every record came in a grant. "0 leaf reads" is judged NET of
+# the S5 control plane: the reader's poll drops its projected images at
+# every epoch step and re-reads tree 0 / the roots
 # (`meta_kv_revalidate_nodes_dropped`, ≤ a few nodes per epoch), plus ONE
-# tree-0 read per stripe SLOT (the reader resolves each stripe's lessee
-# off its own tree 0 before it dials the holder — K reads, cached after).
-# Dies on a violation.
-sym_law_gate3b_ls() { # grants K C misses dropped epochs merges
-    local grants="$1" k="$2" c="$3" misses="$4" dropped="$5" epochs="$6" merges="$7"
-    [ "$grants" -ge $((k + c)) ] && [ "$grants" -le $((k + c + 4)) ] ||
-        die "sym-shared-dir-ls: dlm_token_grants=$grants ∉ [K + C, K + C + 4] = [$((k + c)), $((k + c + 4))]"
-    [ "$misses" -le $((dropped + epochs * 8 + k)) ] ||
-        die "sym-shared-dir-ls: meta_kv_node_cache_misses=$misses on the reader exceeds the poll's own re-reads + one tree-0 read per stripe slot (dropped $dropped + 8 × $epochs epochs + K $k) — a DATA leaf was read for the listing"
+# tree-0 read per stripe SLOT of D AND of the root (the reader resolves
+# each stripe's lessee off its own tree 0 before it dials the holder —
+# K_D + K_root reads, cached after). Dies on a violation.
+sym_law_gate3b_ls() { # grants K_D K_root C misses dropped epochs merges
+    local grants="$1" kd="$2" kr="$3" c="$4" misses="$5" dropped="$6" epochs="$7" merges="$8"
+    [ "$grants" -ge $((kd + kr + c)) ] && [ "$grants" -le $((kd + kr + c + 4)) ] ||
+        die "sym-shared-dir-ls: dlm_token_grants=$grants ∉ [K_D + K_root + C, K_D + K_root + C + 4] = [$((kd + kr + c)), $((kd + kr + c + 4))] (K_D=$kd K_root=$kr C=$c)"
+    [ "$misses" -le $((dropped + epochs * 8 + kd + kr)) ] ||
+        die "sym-shared-dir-ls: meta_kv_node_cache_misses=$misses on the reader exceeds the poll's own re-reads + one tree-0 read per stripe slot (dropped $dropped + 8 × $epochs epochs + K_D $kd + K_root $kr) — a DATA leaf was read for the listing"
     [ "$merges" -ge 1 ] || die "sym-shared-dir-ls: dir_stripe_readdir_merges=$merges on the reader (the K-way merge did not run)"
 }
 

@@ -5599,17 +5599,35 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t0):.0f}')")"
     local join_wall
     join_wall="$(python3 -c "print(f'{$t1-$t0:.2f}')")"
     # Each joiner's `mkdir /jobs/<j>` right after its join — the ship to
-    # /jobs's holder (the manager), §5.10's one root-level ship per mount.
+    # /jobs's HOLDER, §5.10's one root-level ship per mount. The holder is
+    # the manager until `/jobs` STRIPES: N creators into one directory is
+    # the 3b shape, and at N = 31 the holder's flip trigger fires DURING
+    # the storm (the box re-run read `dir_stripe_flips` +1 with 28 of 31
+    # steps served at the manager — the other three landed at the stripe
+    # holders, which are joiners). So the law is FLEET-WIDE: every mkdir
+    # landed (asserted below), the steps the joiners SHIPPED were SERVED
+    # somewhere (Σ served over every member ≡ Σ shipped), and the ones
+    # that shipped nowhere were own-stripe local lands (≤ n, reported).
     local steps0
     steps0="$(stat_sum 0 xv_cross_owner_steps_served)"
+    for j in "${joiners[@]}"; do snap "$j" "wb0" "$rowdir"; done
     for j in "${joiners[@]}"; do
         mkdir "$(mnt_of "$j")/jobs/w$j-$run" || die "sym-walls: joiner m$j's mkdir /jobs/… failed after the storm"
     done
     sleep 2
     cpu1="$(sym_cpu_ticks 0)"
     snap 0 "wb1" "$rowdir"
-    local steps verbs_b svc_b_total
+    for j in "${joiners[@]}"; do snap "$j" "wb1" "$rowdir"; done
+    local steps verbs_b svc_b_total shipped_b=0 served_fleet flips_b
     steps=$(( $(stat_sum 0 xv_cross_owner_steps_served) - steps0 ))
+    served_fleet="$steps"
+    for j in "${joiners[@]}"; do
+        v="$(sym_delta "$rowdir" "$j" wb xv_cross_owner_steps_shipped)"
+        shipped_b=$((shipped_b + v))
+        v="$(sym_delta "$rowdir" "$j" wb xv_cross_owner_steps_served)"
+        served_fleet=$((served_fleet + v))
+    done
+    flips_b="$(sym_delta "$rowdir" 0 wb dir_stripe_flips)"
     verbs_b="$(sym_delta "$rowdir" 0 wb manager_verbs)"
     svc_b_total="$(sym_delta_arr_field "$rowdir" 0 wb manager_service_ns total)"
     mgr_cpu="$(python3 -c "
@@ -5617,14 +5635,15 @@ import os
 hz = os.sysconf('SC_CLK_TCK')
 print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t0):.0f}')")"
     local verdict_b=MET
-    [ "$steps" -ge "$n" ] || verdict_b="MISS(steps_served=$steps<$n)"
+    [ "$served_fleet" = "$shipped_b" ] || verdict_b="MISS(shipped=$shipped_b≠served_fleet=$served_fleet)"
+    [ "$shipped_b" -le "$n" ] || verdict_b="$verdict_b MISS(shipped=$shipped_b>$n)"
     v="$(sym_zero_violations_delta "$rowdir" 0 wb)"
     [ -z "$v" ] || verdict_b="$verdict_b MISS(must-stay-0:m0:{$v})"
     {
         echo "== sym-walls row (b): the JOIN STORM (N=$n joiners leave, then all rejoin at once)$SYM_BUSY_ROW =="
-        printf '%-6s %-12s %-10s %-12s %-9s %-14s %s\n' N JOIN_WALL_S MGR_VERBS SVC_TOTAL_NS MGR_CPU JOBS_SHIPS VERDICT
-        printf '%-6s %-12s %-10s %-12s %-9s %-14s %s\n' "$n" "$join_wall" "$verbs_b" "$svc_b_total" "${mgr_cpu}%" "$steps" "$verdict_b"
-        echo "manager_failover_bound_ms=$(stat_field 0 manager_failover_bound_ms | tr -d '[] ' | cut -d, -f1) appenders_known=$(stat_field 0 appenders_known | tr -d '[] ' | cut -d, -f1)"
+        printf '%-6s %-12s %-10s %-12s %-9s %-14s %-12s %-12s %s\n' N JOIN_WALL_S MGR_VERBS SVC_TOTAL_NS MGR_CPU JOBS_SHIPPED JOBS_AT_MGR JOBS_LOCAL VERDICT
+        printf '%-6s %-12s %-10s %-12s %-9s %-14s %-12s %-12s %s\n' "$n" "$join_wall" "$verbs_b" "$svc_b_total" "${mgr_cpu}%" "$shipped_b" "$steps" "$((n - shipped_b))" "$verdict_b"
+        echo "manager_failover_bound_ms=$(stat_field 0 manager_failover_bound_ms | tr -d '[] ' | cut -d, -f1) appenders_known=$(stat_field 0 appenders_known | tr -d '[] ' | cut -d, -f1) served_fleet=$served_fleet dir_stripe_flips_during_storm=$flips_b (a flip of /jobs re-homes the later mkdirs' ships to the stripe holders)"
     } | tee "$rowdir/symwalls-b.txt"
     sym_oracle sym-walls "$rowdir"
     [ "$verdict_a" = "MET" ] && [ "$verdict_b" = "MET" ] ||

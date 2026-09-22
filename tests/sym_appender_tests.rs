@@ -55,6 +55,7 @@ use squeezefs::meta_backend::kv::superblock::{
     FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST, SUPERBLOCK_V3_LEN,
 };
 use squeezefs::meta_backend::kv::tree::RootPtr;
+use squeezefs::meta_backend::kv::META_KV_CHECKPOINTS;
 use std::collections::HashMap;
 use tempfile::NamedTempFile;
 
@@ -1979,6 +1980,96 @@ async fn a_leaf_that_aged_under_a_service_hold_of_the_smo_mutex_is_an_extension_
         s3.flush_ceiling_excused_ns - s2.flush_ceiling_excused_ns,
         cap * 1_000_000,
         "the long hold excused the cap and nothing more"
+    );
+    for v in &ra.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// **PR 13e, F-B1 (record §3.9.4.6 / §7 item 3 — the box re-run's six
+/// trips with NOTHING excused): the cadence anticipates the cycle's
+/// MEASURED pre-barrier wall, so a stationary slow barrier lands every
+/// leaf inside the landing ceiling.** KD-SYM-10's ceiling is `trigger +
+/// 2 ticks`: the tick wait and the maintenance drain — the cycle's own
+/// pre-barrier wall (the flush pass, the bitmap pages, barrier #1; on the
+/// box 16–106 ms of page writes and barriers under N regions' joins and an
+/// ingest) sat OUTSIDE it, so a leaf dirtied right after a cycle's
+/// collection aged `trigger + ticks + wall` at its covering barrier, and
+/// the audit — correctly — read the wall as an overrun the exclusion of
+/// another actor's hold could not touch (`excused_ns` 0). Here the device's
+/// barrier is parked 1.5× the margin (150 ms at the shipped flush) BEFORE
+/// the open, one cycle warms the measurement, and a steady create stream
+/// keeps a leaf dirty at every instant for five cadence intervals. RED on
+/// `7f4b007e`: every cycle's covering barrier lands `2 × wall` past the
+/// trigger + ticks — an overrun per cycle. GREEN: the decision is taken
+/// against the LAST COLLECTION instant (never the cycle's end — the grant
+/// cadence, a growth, the merge sweep run after the barrier and ate the
+/// margin too) and fires `wall_ewma` early
+/// (`checkpoint::checkpoint_trigger_ms`), so the landing stays inside the
+/// published ceiling: 0 overruns, the wall and the trigger in force
+/// published per volume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_cadence_anticipates_the_measured_cycle_wall_so_a_slow_barrier_lands_inside_the_ceiling(
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let path = std::path::PathBuf::from(&uris[0]);
+    let margin_ms = 2 * checkpoint_tick_period_ms(50);
+    let barrier = std::time::Duration::from_millis(margin_ms * 3 / 2);
+    squeezefs::uring_fs::arm_device_latency(&path, std::time::Duration::ZERO, barrier);
+    let ra = open_with_partition(&uris, None).await;
+    let va = Arc::clone(&ra.volumes[0]);
+    assert_eq!(stats(&va).flush_ceiling_ms, appender_flush_ceiling_ms(50));
+    // One warm cycle: the wall is a measurement before the stream begins.
+    ra.create(ROOT_INO, "warm", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    va.checkpoint_now().await.unwrap();
+    assert_eq!(stats(&va).flush_ceiling_overruns, 0, "the premise");
+    let checkpoints0 = META_KV_CHECKPOINTS.load(std::sync::atomic::Ordering::Relaxed);
+    // The stream: four creators, each ack waiting the parked barrier, so a
+    // slot-tree leaf is dirty at every instant of the window.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut creators = Vec::new();
+    for t in 0..4u32 {
+        let ra = Arc::clone(&ra);
+        let stop = Arc::clone(&stop);
+        creators.push(tokio::spawn(async move {
+            let mut i = 0u32;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                ra.create(ROOT_INO, &format!("s{t}-{i}"), libc::S_IFREG | 0o644, 0, 0)
+                    .await
+                    .unwrap();
+                i += 1;
+            }
+            i
+        }));
+    }
+    let window = std::time::Duration::from_millis(5 * CHECKPOINT_MAX_AGE_MS as u64 + 500);
+    tokio::time::sleep(window).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut created = 0u32;
+    for c in creators {
+        created += c.await.unwrap();
+    }
+    assert!(created >= 20, "the stream ran ({created} creates)");
+    squeezefs::uring_fs::disarm_device_latency(&path);
+    let s = stats(&va);
+    let cycles = META_KV_CHECKPOINTS.load(std::sync::atomic::Ordering::Relaxed) - checkpoints0;
+    assert!(
+        cycles >= 4,
+        "the cadence ran through the window ({cycles} checkpoints)"
+    );
+    assert_eq!(
+        s.flush_ceiling_overruns,
+        0,
+        "a stationary {} ms barrier must land inside the {} ms ceiling — the cadence \
+         anticipates the wall it measured (RED: {} overrun(s) in {cycles} cycles, the wall \
+         outside the 2-tick margin, nothing excused: the box's F-B1)",
+        barrier.as_millis(),
+        s.flush_ceiling_ms,
+        s.flush_ceiling_overruns
     );
     for v in &ra.volumes {
         v.shutdown().await.unwrap();

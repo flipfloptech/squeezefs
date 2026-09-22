@@ -551,8 +551,26 @@ below is what this rung would have run; none ran):
      (`.benchmarks/2026-09-08-d5-fleet-squeeze-test.md`); one box, one
      memory bus, so the ingest column is the box's data path — a 32-core
      Xeon without heat soak, which is what the laptop lacked. The driver
-     `.benchmarks/rigs/2026-09-21-sym-box-brackets.sh` runs this shape
-     (below).
+     `.benchmarks/rigs/2026-09-21-sym-box-brackets.sh` runs this shape:
+     fleet A (`N=2 --symmetric --writers=7 --token-readers`) for gates 2 /
+     3 / 3b / 3c / 7 and fleet B (`N=32 --symmetric --writers=1
+     --token-readers`, the 1 × 31 broadcast) for gate 5, `REPEATS` = 2
+     positions per leg (the same-arm band; the gate-2 leg is itself an
+     A-B-B-A), each leg's `$STATE/rows` + log + thermal + dmesg collected
+     under `$OUT/<gate>-r<i>/`, each fleet torn down to zero residue, a
+     `SUMMARY.txt` of every verdict and table; its preflight REFUSES a
+     non-sqz kernel loud (this rung's finding made a rail) and a busy box.
+     **Plumbing smoke on the laptop (`SMOKE=1`, 1 joiner, `sym-scale
+     --scale-ns=1,2 --sym-files=2000 --ingest-mb=64`): rc 0 — fleet up,
+     the leg PUBLISHED with `--venue=box`, rows collected, teardown to zero
+     residue, 1 m 45 s wall; no number from it stands** (the rig labels a
+     SMOKE summary so). On the box: `rsync tests/ .benchmarks/rigs/` to
+     `/scratch/tmp/sym-box/repo/{tests,.benchmarks/rigs}/`, then `sudo env
+     BIN=/scratch/tmp/sym-box/squeezefs-B TAR_SRC=/scratch/tmp/sym-box/linux/fs
+     OUT=/scratch/tmp/sym-box/brackets-<ts> bash
+     /scratch/tmp/sym-box/repo/.benchmarks/rigs/2026-09-21-sym-box-brackets.sh`
+     (the linux `fs/` corpus must be shipped too — gate 2's instrument; the
+     box has no internet).
    * **(b) the REAL fabric** (the reset script's 5 × {m0, d0, d1} over
      nvme-tcp): the storage nodes' `4.18.0-553.123.1` nvmet has **no
      `resv_enable`** (probed on `aqr37-d0`'s namespace: the knob is

@@ -1993,6 +1993,166 @@ async fn a_leaf_that_aged_under_a_service_hold_of_the_smo_mutex_is_an_extension_
     }
 }
 
+/// The F-B1 fixture (the box's shape): a bit-17 forest at the shipped
+/// node geometry (256 KiB nodes, an 8 MiB ring — wide enough that no
+/// reserve drain forces a cycle mid-window), the ARMED plane with the
+/// box's affinity order (a populated volume's `used_leaf_bytes / 64` is
+/// MiBs; this 64 MiB fixture's derives to the one-extent floor, which a
+/// one-leaf tree sits AT and spills to the 64-rotor — 60–68 dirty leaves
+/// + 1–2 SMOs per cycle and 64 per-tree maintenance items ahead of every
+/// decision), and ONE directory whose children mint into its slot by
+/// affinity (one leaf per cycle) with four files already in it. Returns
+/// the set, its volume, the device path and the directory.
+async fn armed_one_leaf_fixture(
+    dir: &std::path::Path,
+) -> (
+    Arc<RoutedMetaBackend>,
+    Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend>,
+    std::path::PathBuf,
+    u64,
+) {
+    let p = dir.join("meta0");
+    std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+    let plan = plan_meta_slot_set(1).expect("derived plan");
+    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
+    let r = format_v3_stamped(
+        &p,
+        VOL_LEN,
+        &FormatV3Options {
+            node_size: 256 * 1024,
+            journal_len_override: Some(8 * 1024 * 1024),
+            ..set_opts()
+        },
+        plan.stamps[0].clone(),
+    )
+    .await;
+    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    r.expect("format");
+    let uris = vec![p.display().to_string()];
+    let path = std::path::PathBuf::from(&uris[0]);
+    let ra = common::sym::open_under(&uris, &common::sym::Knobs::armed().affinity_mb("16")).await;
+    let va = Arc::clone(&ra.volumes[0]);
+    assert_eq!(stats(&va).flush_ceiling_ms, appender_flush_ceiling_ms(50));
+    let d = ra
+        .create(ROOT_INO, "d", libc::S_IFDIR | 0o755, 0, 0)
+        .await
+        .unwrap()
+        .ino;
+    for i in 0..4u32 {
+        ra.create(d, &format!("w{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap();
+    }
+    (ra, va, path, d)
+}
+
+/// The cadence's UPPER cycle bound over a window: one cycle per trigger
+/// interval at the LOWEST trigger a bounded term admits, plus the two
+/// warm cycles a window's edges can straddle. A trigger collapsed to 0
+/// (a term the derivation read past the ceiling) runs a cycle per tick
+/// and lands an order of magnitude above it.
+fn max_cadence_cycles(window_ms: u64, term_ms: u64) -> u64 {
+    let trigger = squeezefs::meta_backend::kv::checkpoint::checkpoint_trigger_ms(
+        CHECKPOINT_MAX_AGE_MS as u64,
+        term_ms,
+    )
+    .max(checkpoint_tick_period_ms(50));
+    window_ms.div_ceil(trigger) + 2
+}
+
+/// **PR 13e review round 1, Issue 1 (F-B1's age law — the bug): an IDLE
+/// forest volume's whole idle span became the next cycle's "term".** The
+/// first build recorded the age decision's lateness on EVERY `due` tick —
+/// the ticks that ran no cycle included (nothing dirty, the ring
+/// covered) — while `checkpoint_collected_ns` never advanced, so the
+/// first cycle after an idle span folded `wall + idle` into the term, the
+/// 64-cycle maximum held it, the trigger saturated to 0, and every cycle's
+/// own ledger record left `distance > 0` for the next tick: a
+/// self-sustaining checkpoint-per-tick storm for the whole horizon after
+/// EVERY idle → active transition (the reviewer reproduced it: 4 s idle →
+/// 29 paced creates → 31 cycles in 1.5 s, term 2,489 ms, trigger 0 — the
+/// box's "between the rows" → row shape on every writer). The law:
+/// lateness is recorded ONLY by a decision that RUNS a cycle; an idle
+/// `due` tick with nothing to cover ADVANCES the collection instant (an
+/// empty collection is a collection — every leaf dirtied from here is
+/// bounded from here); and a lateness past one landing ceiling is a stall
+/// the audit counts on the cycle it happens, never a term to anticipate
+/// (the belt). This contract: the fixture, a clean checkpoint, the
+/// cadence given 1.5 s to cover itself, 4 s IDLE, then a paced storm for
+/// 1.5 s — the cycles over the storm are bounded by the trigger and the
+/// published term stays inside a tick. RED on the first build (31 cycles,
+/// term 2,489 ms); GREEN on the fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_span_is_never_a_cycles_term_so_the_first_burst_after_it_runs_at_the_cadence() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let _ = env_logger::builder().is_test(true).try_init();
+    let (ra, va, _path, d) = armed_one_leaf_fixture(dir.path()).await;
+    va.checkpoint_now().await.unwrap();
+    // The cadence covers its own ledger record (one cycle), then the
+    // volume is IDLE for four seconds — every tick past the trigger is
+    // `due` with nothing to cover.
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    let idle_ms = 4_000u64;
+    tokio::time::sleep(std::time::Duration::from_millis(idle_ms)).await;
+    let checkpoints0 = META_KV_CHECKPOINTS.load(std::sync::atomic::Ordering::Relaxed);
+    let term_before = va.checkpoint_term_ms();
+    // The storm: one creator paced at a tick for 1.5 s.
+    let window_ms = 1_500u64;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let creator = {
+        let ra = Arc::clone(&ra);
+        let stop = Arc::clone(&stop);
+        tokio::spawn(async move {
+            let mut i = 0u32;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                ra.create(d, &format!("b{i}"), libc::S_IFREG | 0o644, 0, 0)
+                    .await
+                    .unwrap();
+                i += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(checkpoint_tick_period_ms(
+                    50,
+                )))
+                .await;
+            }
+            i
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(window_ms)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let created = creator.await.unwrap();
+    assert!(created >= 20, "the storm ran ({created} creates)");
+    let cycles = META_KV_CHECKPOINTS.load(std::sync::atomic::Ordering::Relaxed) - checkpoints0;
+    let term = va.checkpoint_term_ms();
+    let tick = checkpoint_tick_period_ms(50);
+    assert!(
+        term <= 2 * tick,
+        "the published term is the storm's own (barrier-free device: a few ms), never the \
+         {idle_ms} ms idle span before it (term {term} ms, before the storm {term_before} ms)"
+    );
+    let bound = max_cadence_cycles(window_ms, term);
+    assert!(
+        cycles <= bound,
+        "the first burst after an idle span runs at the cadence: {cycles} cycles over a \
+         {window_ms} ms storm against a bound of {bound} (term {term} ms, trigger {} ms) — a \
+         trigger collapsed to 0 runs a cycle per tick (RED: 31 cycles in 1.5 s at a 2,489 ms \
+         term)",
+        va.checkpoint_trigger_ms(CHECKPOINT_MAX_AGE_MS as u64)
+    );
+    assert!(
+        cycles >= 1,
+        "the storm's leaf was checkpointed at least once ({cycles})"
+    );
+    assert_eq!(
+        stats(&va).flush_ceiling_overruns,
+        0,
+        "no overrun (the storm's leaf lands inside the ceiling)"
+    );
+    for v in &ra.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
 /// **PR 13e, F-B1 (record §3.9.4.6 / §7 item 3 — the box re-run's six
 /// trips with NOTHING excused): the cadence anticipates the cycle's
 /// MEASURED pre-barrier wall, so a slow barrier lands every leaf inside
@@ -2034,51 +2194,7 @@ async fn the_cadence_anticipates_the_measured_cycle_wall_so_a_slow_barrier_lands
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     let _ = env_logger::builder().is_test(true).try_init();
-    // The shipped node geometry with a ring wide enough that no reserve
-    // drain forces a cycle mid-window.
-    let p = dir.path().join("meta0");
-    std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
-    let plan = plan_meta_slot_set(1).expect("derived plan");
-    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-    let r = format_v3_stamped(
-        &p,
-        VOL_LEN,
-        &FormatV3Options {
-            node_size: 256 * 1024,
-            journal_len_override: Some(8 * 1024 * 1024),
-            ..set_opts()
-        },
-        plan.stamps[0].clone(),
-    )
-    .await;
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
-    r.expect("format");
-    let uris = vec![p.display().to_string()];
-    let path = std::path::PathBuf::from(&uris[0]);
-    // The ARMED plane (the box's posture): a child mints into its parent's
-    // slot by affinity, so ONE directory's stream is ONE leaf per cycle —
-    // unarmed, the shared rotor round-robins it over 64 slot trees and
-    // every cycle flushes 64 leaves with an SMO or two, and the tick's
-    // per-tree maintenance item runs 64 times ahead of its decision. The
-    // affinity ceiling is the box's order (a populated volume's
-    // `used_leaf_bytes / 64` is MiBs; this 64 MiB fixture's derives to
-    // the one-extent floor, which a one-leaf tree sits AT and spills).
-    let ra = common::sym::open_under(&uris, &common::sym::Knobs::armed().affinity_mb("16")).await;
-    let va = Arc::clone(&ra.volumes[0]);
-    assert_eq!(stats(&va).flush_ceiling_ms, appender_flush_ceiling_ms(50));
-    // One directory whose children land in ITS slot tree by affinity (one
-    // leaf holds the whole stream); its mint and first records are
-    // checkpointed before the device slows.
-    let d = ra
-        .create(ROOT_INO, "d", libc::S_IFDIR | 0o755, 0, 0)
-        .await
-        .unwrap()
-        .ino;
-    for i in 0..4u32 {
-        ra.create(d, &format!("w{i}"), libc::S_IFREG | 0o644, 0, 0)
-            .await
-            .unwrap();
-    }
+    let (ra, va, path, d) = armed_one_leaf_fixture(dir.path()).await;
     va.checkpoint_now().await.unwrap();
     // The barrier is 60 % of the 100 ms margin: a paced storm's term then
     // reads 60–120 ms (one barrier, or a compaction's second one) — the
@@ -2134,6 +2250,17 @@ async fn the_cadence_anticipates_the_measured_cycle_wall_so_a_slow_barrier_lands
     assert!(
         cycles >= 4,
         "the cadence ran through the window ({cycles} checkpoints)"
+    );
+    // The UPPER bound (review round 1, Issue 1): a trigger collapsed to 0
+    // — a term the derivation read past the ceiling — passes the lower
+    // bound and the overrun count both while running a cycle per tick.
+    let bound = max_cadence_cycles(window.as_millis() as u64, va.checkpoint_term_ms());
+    assert!(
+        cycles <= bound,
+        "the cadence ran at its trigger, never a cycle per tick ({cycles} cycles over {} ms, \
+         bound {bound}, term {} ms)",
+        window.as_millis(),
+        va.checkpoint_term_ms()
     );
     assert_eq!(
         s.flush_ceiling_overruns - overruns0,

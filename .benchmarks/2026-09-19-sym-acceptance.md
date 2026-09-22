@@ -92,6 +92,19 @@ never a MET or a MISS, so every rate row reads OWED to the box or
 SCOPING; the only MET words are SIM-1's (tier (ii), the design's own
 class). "dev" = scoping venue; "box" = squeeze-test.)_
 
+> **Status (the box-rows rung, `perf/sym-box-rows`, 2026-09-22): every
+> "Rate (box): OWED" cell below STAYS OWED — no box row ran, because the
+> venue is gone: `squeeze-test` was reclaimed by a third party on
+> 2026-09-19 21:20 UTC (booted into the DDN Lustre client kernel with
+> `/s3ds` mounted and the `s3ds` container up; the sqz kernel is installed
+> but no longer the default). The arms are BUILT and staged (A `3228fcb8`,
+> B `7b2ef9e9`'s code — §3.9), the procedure is written, nothing was placed
+> on the box. §3.9 has the evidence, the two venue options for the N-writer
+> gates (the storage nodes' nvmet has no `resv_enable`), and the exact
+> command sequence for the day the venue is back. The flip's product
+> blockers are closed on PR 13b (§7 / §9 status lines); the box brackets
+> are the flip's one remaining precondition (§9).**
+
 | Gate | Row | Venue | Verdict | Engagement (the law's gauges) |
 |---|---|---|---|---|
 | 1 | solo re-gate (flat A vs flat B: mdstorm, mount, w_fresh, rr4k, rw4k, remount) | box | **OWED to the flip binary** (§8 — the flat path takes ONE behaviour change from PR 13: defect 6's shipped-bug fix (§4.3), pinned red-first flat, plus per-op atomic loads that are behaviour-identical (`KvTree::descend`'s `LeaseGate::is_armed`, `NodeSeqHandle::next`'s ceiling compare); every other change is behind bit 17 + the knob; PR 14's B arm is the default-on binary by definition) | `dlm_rpcs == 0`, `meta_kv_forest_*` 0 on flat, Δtripwires 0 |
@@ -461,6 +474,115 @@ on top the record names the code's SHA beside it): attempt 7 `8d7fd3c0`
 three exit-2 codes (attempts 12–14) are the harness-edit shifted-tail
 class after the 10/10 verdict line, never a round (the harness law, §4.6). Fix round 1 added a
 1/1 mechanism round on the fix-round binary (§3.8b).
+
+### 3.9 The box brackets — NOT RUN: the venue was found reclaimed (the box-rows rung, `perf/sym-box-rows`, 2026-09-22)
+
+**What this rung was to run** (the brief off §8 / §9): gate 1's solo
+re-gate A-B-B-A with PR 1's rig verbatim (arm A `3228fcb8` flat vs arm B
+= PR 13b's tip flat), then ONE A-B-B-A per row set for gates 2 / 3 / 3b /
+3c / 5 / 7 on the armed plane (`format --symmetric` +
+`SQUEEZEFS_SYMMETRIC_META=1` — identical to the post-flip default, so
+valid inputs to PR 14), on `squeeze-test`, the box left unmounted after.
+
+**What was found instead (box state read 2026-09-22 00:20 UTC, nothing
+changed on it):**
+
+| read | value |
+|---|---|
+| running kernel | **`4.18.0-553.123.1.el8_lustre.ddn17.x86_64`** — the DDN Lustre client kernel, not `6.19.14-sqz` (which is still installed, grub index 0, no longer the default: `grubby --default-kernel` = the ddn17 kernel) |
+| the act (journal boot −1 + `/root/.bash_history`; root from **`10.179.193.136`**, not the program's usual `10.187.129.115`) | 2026-09-19 21:00 UTC: a boot into `6.19.14-sqz` (21 min); 21:04–21:19 `rpm -Uvh lustre-2.14.0_ddn255-1.el8 kmod-lustre-2.14.0_ddn255-1.el8`; **21:21:54 `grubby --set-default=/boot/vmlinuz-4.18.0-553.123.1.el8_lustre.ddn17.x86_64`; 21:22 `reboot`**; 21:50–22:16 `lustre_rmmod; systemctl start lnet; modprobe lustre; mount /s3ds; systemctl start docker; s3ds status; s3ds_cluster status --all` |
+| current role | Lustre `10.181.177.101@tcp,…:/memexa01` mounted at **`/s3ds`** (`rw,flock,user_xattr,lazystatfs,encrypt`); `lnet` active; docker active, the **`s3ds` container "Up 2 days"**; `s3ds status` → "Mount points configured correctly ✓ / Docker functioning correctly ✓ / S3ds containers not running"; load 0.00 |
+| the fabric, client side | no nvme host module loaded, no `/dev/nvme*` — the reset script's `nvmeof connect` has not run on this boot |
+| the fabric, target side (the reset script's five nodes, read over its root ssh from the box) | **INTACT and idle**: `aqr37 / aqr38 / aqr39 / aqs38 / oss2` (all `4.18.0-553.123.1.el8_lustre.ddn17`), nvmet subsystems `nqn.2026-07.io.squeezefs:<node>-{m0,d0,d1}` shared, `/scratch/tmp/squeezefs` (`1.1.0`, Sep 1) present on every node |
+| `/scratch/tmp/` on the box | intact: `cluster_reset_v4.sh`, `fio_jobs/`, `rigs/` (PR 1's rig + reducer + mdstorm), `squeezefs` (PR 1's arm-B copy `a9827378`), `sym-pr1/` (PR 1's rows), `logs/`; 251 G free |
+
+**Why no row ran.** FUSE-over-io_uring needs the sqz kernel (the request
+hot path has no classical fallback — the mount fails on a 4.18 kernel by
+design), so no squeezefs row can run on the box as it stands; and
+rebooting it back into `6.19.14-sqz` would take down another party's
+deliberately configured Lustre / S3DS service on a shared field machine
+— the brief's stop-and-report class ("do not improvise a substrate"),
+and a reboot is the owner's call, not a measurement rung's. The box's
+root ssh, `sudo -n`, the storage nodes and the reset script all still
+work, so the venue is one owner decision away (restore the grub default
+to `/boot/vmlinuz-6.19.14-sqz` and reboot, or another sqz-kernel box),
+not rebuilt.
+
+**The arms — BUILT, checksummed, staged on the laptop, NOT shipped**
+(`/tmp/grok-justin/box-rows/arms/`, `SHA256SUMS.local`):
+
+| arm | code | binary identity (`--version`, read in-container by the artifact check) | sha256 | provenance |
+|---|---|---|---|---|
+| **A** | `3228fcb8` (the pre-program dev tip PR 1's bracket used — comparability with `.benchmarks/2026-09-13-sym-pr1-solo-regate.md`) | `squeezefs 1.2.4 (3228fcb8…) built 2026-09-19T13:23:09Z profile release` | `993100757bde274d729f4d0fb7956b885af358b4acc3db079dcef90cac4d69b1` | REUSED from PR 13's own arm-A build (`/tmp/pr13-armA/dist/rocky8/`, a linked worktree at `3228fcb8`; §8 of this record named it valid) — no rebuild |
+| **B** | `7b2ef9e9`'s code (the worktree HEAD `088e8c4a` is one docs commit on top — the binary embeds `088e8c4a`) | `squeezefs 1.2.4 (088e8c4a…) built 2026-09-22T00:20:14Z profile release` | `ea41d9e57bfe51b26559511a2055775324354ae57cb1508ae4457686662ef692` | `task build:rocky8` from the rung's worktree (3 m 25 s on the cached target volume; artifact checks passed: glibc ≤ 2.28, the shim embeds the same commit) |
+
+Both arms are the `release` profile (the two-profile law — both legs the
+same profile). Shims `libsqueezefs_il-{A,B}.so` beside them (no shim row
+is planned; they ride along as the KD-7 pairing unit).
+
+**The procedure, ready for the day the venue is back** (every command
+below is what this rung would have run; none ran):
+
+1. *Venue*: `ssh squeeze-test`; `uname -r` must read `6.19.14-sqz`
+   (`grubby --set-default=/boot/vmlinuz-6.19.14-sqz` + a reboot is the
+   owner's act); `pgrep -x squeezefs` empty; `/scratch/tmp/squeezefs`
+   replaced by arm B (the reset script's `SQZ` — PR 1 placed `a9827378`
+   there); `scp` both arms + `SHA256SUMS.local` to `/scratch/tmp/sym-box/`,
+   `sha256sum -c`, `--version` on the box.
+2. *Gate 1* — PR 1's rig VERBATIM, one A-B-B-A: `sudo env
+   BIN_A=/scratch/tmp/sym-box/squeezefs-A BIN_B=/scratch/tmp/sym-box/squeezefs-B
+   RT=60 OUT=/scratch/tmp/sym-box/rows-<ts> bash
+   /scratch/tmp/rigs/2026-09-13-sym-pr1-solo-regate.sh` (default `SEQ="A B B A"`,
+   rows `mdstorm mount wfresh-kern rr4k-kern rw4k-kern remount`); reduce with
+   `python3 /scratch/tmp/rigs/2026-09-13-sym-pr1-solo-regate-reduce.py <OUT>`
+   (the verdict rule: within noise iff |B/A − 1| ≤ max(band, 3 %); a DELTA
+   row gets ONE reversed re-run). The B arm here is the FLAT shipped path
+   on PR 13b's binary — every shipped-bug fix of PRs 1–13b in, so a real
+   A/B, and the one number PR 1 carried forward (`rw4k` −1.5 %, §4.3 of
+   PR 1's record) is re-read by this bracket.
+3. *Gates 2 / 3 / 3b / 3c / 5 / 7* — the fleet legs with `--venue=box`
+   (the must-stay-0 gauges are VERDICTS there). Two venue options, the
+   owner's call:
+   * **(a) the box's own tcp devsub** (`tests/mw_fleet.sh create N=2
+     --symmetric --writers=7 --token-readers` on the box — nvmet-tcp on
+     `127.0.0.1` with `resv_enable=1`, null_blk metadata, zram data): the
+     design's gate-3 venue as written ("on the tcp devsub; squeeze-test
+     brackets") and the D-5 fleet precedent on this box
+     (`.benchmarks/2026-09-08-d5-fleet-squeeze-test.md`); one box, one
+     memory bus, so the ingest column is the box's data path — a 32-core
+     Xeon without heat soak, which is what the laptop lacked. The driver
+     `.benchmarks/rigs/2026-09-21-sym-box-brackets.sh` runs this shape
+     (below).
+   * **(b) the REAL fabric** (the reset script's 5 × {m0, d0, d1} over
+     nvme-tcp): the storage nodes' `4.18.0-553.123.1` nvmet has **no
+     `resv_enable`** (probed on `aqr37-d0`'s namespace: the knob is
+     absent), so the armed plane's rung 4 needs the loud lab opt-in
+     `SQUEEZEFS_SYM_ALLOW_NON_PR=1` (KD-SYM-13 — detection-grade fencing,
+     announced at every mount) — the rates are the fabric's but the row
+     is not the PR-substrate row gate 4 names. It also needs a harness the
+     tree does not have: the fleet's mount recipe over the fabric's
+     `/dev/nvme*` heads under the box's default host identity (the
+     `tests/cluster_reset_v5_mw.sh` co-located shape, adapted to `format
+     --symmetric` + the join ladder) — NOT written in this rung.
+   * The **A arm for gates 3 / 3b** the brief names (the SHIPPED
+     authority + co-writers at the same N on the same binary): no leg
+     runs it — `sym-scale` is self-relative to its N = 1 row and
+     `sym-shared-dir` asserts the flip; an `mw-scale` / `mw-shared-dir`
+     pair over `create N=1 --multi-writer --cowriters=K` is a harness
+     item stated here, not written (the design's gate 3 is stated
+     against N = 1 and needs no A arm; gate 3b's "vs today's
+     authority+co-writers" does).
+4. *After*: `pkill -x squeezefs; umount -l /scratch/tmp/test`, `pgrep`
+   empty, the fleet torn down to zero residue, every placed file listed
+   in §8.
+
+**What the venue's loss does NOT change.** Every mechanism law is GREEN
+on PR 13b's binary from zero (its summary: `sym-foreign-file` ×3,
+`sym-crash` 3/3, `sym-storm` 3/3 at seven victims, fidelity `quick`
+130/0, the 42-suite matrix both legs); the three product blockers of §9
+are closed there. The rate half of gates 1 / 2 / 3 / 3b / 3c / 5 / 7 is
+exactly as owed as it was at PR 13's close — now with the arms in hand
+and the venue's state on record.
 
 ## 4. Issues found (each with its PR and its red pin)
 
@@ -2344,9 +2466,28 @@ broadcast and join storm included), the fabric reset
 (`/scratch/tmp/cluster_reset_v4.sh`) first, the box left unmounted after.
 Every local rate in §3 is dev-box scoping evidence for those rows.
 
+**The box-rows rung (`perf/sym-box-rows`, 2026-09-22): again nothing was
+placed on `squeeze-test` or the storage nodes, and nothing on them was
+changed** — the box was found in another party's role (§3.9: the DDN
+Lustre kernel as the grub default since 2026-09-19 21:21 UTC, `/s3ds`
+mounted, the `s3ds` container up). Read only: `uname -r`, `grubby
+--info=ALL` / `--default-kernel`, `journalctl -b -1/-2`, `last`,
+`/root/.bash_history`, `mount`, `systemctl is-active docker lnet`,
+`docker ps`, `s3ds status`, `rpm -q lustre kmod-lustre`, `ls /scratch/tmp`,
+and over the reset script's root ssh on each storage node `uname -r`,
+`uptime`, `ls /sys/kernel/config/nvmet/subsystems`, `ls -la
+/scratch/tmp/squeezefs`, plus one `ls` of `aqr37-d0`'s namespace attrs
+(no `resv_enable`). PR 1's footprint (`/scratch/tmp/{squeezefs,rigs,
+sym-pr1,logs,fio_jobs,cluster_reset_v4.sh}`) is intact. The two arms and
+their shims sit on the LAPTOP at `/tmp/grok-justin/box-rows/arms/`
+(`squeezefs-A` `9931007…`, `squeezefs-B` `ea41d9e…`, `SHA256SUMS.local`);
+the box copy `/scratch/tmp/sym-box/` does not exist yet.
+
 ## 9. The flip decision (for PR 14)
 
 > **Status (PR 13b, 2026-09-21): the three PRODUCT blockers below are closed on `feat/sym-metanode-ship` (`cd85f701` defect 32, `cc642b6a` §4.4af, `53ffb626`+`31519ceb` §4.4ag); the box brackets remain the orchestrator's; the storm ×10 count is NOT MET on that branch (see §7's status line — two owed items, no acked loss in 19 seven-victim rounds). The decision text below is as recorded at PR 13.**
+>
+> **Status (the box-rows rung, 2026-09-22 — the re-read the brief asked for): with PR 13b landed (`dev` @ `7b2ef9e9`, the batch gate GREEN), blockers (0) §4.4af, (1) defect 32 and (1b) §4.4ag read CLOSED; blocker (2) — the box brackets — reads OPEN and UNCHANGED: no box row ran (§3.9, the venue reclaimed). The exact list of design gates whose RATE half does not read MET is therefore still gates 1 / 2 / 3 / 3b / 3c / 5 / 7 (gate 4 is LOCAL by the venue law and its `sym-storm` ×10 count is not reached — §7's status line; gates 6 / 8 / 8b are not the box's). The arms are staged and the procedure is §3.9's; the decision is one venue away, not one rung.**
 
 **Decision: NOT YET — four blockers, three of them product (§7's
 flip-blocking items (i)–(iii) + the box).** (0) **Fix-round

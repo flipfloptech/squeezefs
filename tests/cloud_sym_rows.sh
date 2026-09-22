@@ -80,6 +80,12 @@
 #   --manager-priv=IP           the manager's fabric address (the writer
 #                               node pings it — the row's measured RTT)
 #   --dry-run                   print every ssh/local command, run nothing
+#                               (the canned walls read as --rt, so a plain
+#                               dry-run exits 0)
+#   --test-force-sub-rt         the Issue-15 pin: every RATE phase's wall is
+#                               judged as 0 s — on --venue=cloud the driver
+#                               MUST exit nonzero (a dry-run transcript is
+#                               the evidence); harness-only
 #
 # Exit: 0 = every row's engagement law GREEN and the oracle clean; nonzero
 # on any violated law (the row is INVALID, never a number).
@@ -176,6 +182,7 @@ STORAGE="${SQZ_CLOUDSYM_STORAGE:-}"
 MANAGER_PRIV="${SQZ_CLOUDSYM_MANAGER_PRIV:-}"
 REMOTE_DIR="${SQZ_CLOUDSYM_REMOTE_DIR:-/tmp/sym-rows}"
 DRY_RUN=false
+FORCE_SUB_RT=false
 ENTRIES=()
 for a in "$@"; do
     case "$a" in
@@ -206,6 +213,7 @@ for a in "$@"; do
     --manager-priv=*) MANAGER_PRIV="${a#--manager-priv=}" ;;
     --remote-dir=*) REMOTE_DIR="${a#--remote-dir=}" ;;
     --dry-run) DRY_RUN=true ;;
+    --test-force-sub-rt) FORCE_SUB_RT=true ;;
     -h | --help)
         awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
         exit 0
@@ -866,13 +874,20 @@ row_tarx() {
 # phase is judged INVALID (the row's verdict word; the driver exits
 # nonzero after its row sets, evidence kept), never warned past. On the
 # laptop it is scoping and a WARN. Prints the verdict suffix ("" when the
-# phase filled RT).
+# phase filled RT). Every caller runs this in a command substitution — a
+# SUBSHELL — so the flag is set by the CALLER off the non-empty word
+# (`rt_flag`), never in here (review round 2, Issue 15: the first build
+# set it here and the end-of-run refusal was unreachable).
 RT_INVALID=0
+rt_flag() { # verdict-word... -> RT_INVALID=1 when any word is non-empty
+    local w
+    for w in "$@"; do [ -z "$w" ] || RT_INVALID=1; done
+}
 sym_rt_verdict() { # label wall_s phase -> "" | "INVALID(sub-RT …)"
     local label="$1" wall="$2" phase="$3"
+    $FORCE_SUB_RT && wall=0   # the pin: judge every phase as a burst
     [ "$(python3 -c "print(1 if $wall >= $RT else 0)")" = "1" ] && return 0
     if [ "$SYM_VENUE" = cloud ]; then
-        RT_INVALID=1
         echo "INVALID(sub-RT:$phase ${wall}s<${RT}s)"
         echo "[sym-rows] $label: the $phase phase ran ${wall} s < RT=$RT s — a burst is a FAILED row on the cloud venue (the sustained-state rule); the row is INVALID (size --files/--ingest-mb up or let --size-to-rt=auto size them)" >&2
     else
@@ -1015,6 +1030,7 @@ EOS
         [ "$rc" = "0" ] || die "sym-scale N=$n: a create storm FAILED (see $ROWDIR/create-n$n-w*.txt{,.err})"
         local create_rate create_wall
         create_wall="$(python3 -c "print(f'{$t1-$t0:.1f}')")"
+        $DRY_RUN && create_wall="$RT"   # canned: the dry-run "fills RT"
         create_rate="$(python3 -c "print(f'{$n*$FILES/($t1-$t0):.0f}')")"
         # the create phase's own daemon-CPU face (a snapshot between the phases)
         for idx in "${writers[@]}"; do snap "$idx" "n${n}c"; done
@@ -1048,6 +1064,7 @@ EOS
         diskstats_sample "n${n}i1"
         local ingest_rate ingest_wall amp
         ingest_wall="$(python3 -c "print(f'{$t1-$t0:.1f}')")"
+        $DRY_RUN && ingest_wall="$RT"
         ingest_rate="$(python3 -c "print(f'{$n*$INGEST_MB/($t1-$t0):.0f}')")"
         amp="n/a"
     $DRY_RUN || amp="$(amplification "n${n}i0" "n${n}i1" $((n * INGEST_MB * 1024 * 1024)))"
@@ -1093,6 +1110,7 @@ print(f'{100*(int(b)-int(a))/1e9/max(1e-9, $t1-$t_row0):.0f}')" 2>/dev/null || e
         local rt_c rt_i
         rt_c="$(sym_rt_verdict "sym-scale N=$n" "$create_wall" create)"
         rt_i="$(sym_rt_verdict "sym-scale N=$n" "$ingest_wall" ingest)"
+        rt_flag "$rt_c" "$rt_i"
         [ -z "$rt_c$rt_i" ] || verdict="$verdict $rt_c $rt_i"
         [ "$verdict" = "MET" ] || verdict_all=MISS
         sym_gate3_row_line "$n" "$create_rate" "$cr" "$creates_per_cpu_s" "$ingest_rate" "$ir" "$mgr_load" "$mgr_cpu" "$handovers" "$ships" "$rpcs" "$verdict" | tee -a "$table" | tee -a "$([ "$DRY_RUN" = true ] && echo /dev/null || echo "$ROWS_FILE")"
@@ -1266,6 +1284,7 @@ EOS
         created=$((created + c))
     done
     wall="$(python3 -c "print(f'{$t1-$t0:.2f}')")"
+    $DRY_RUN && wall="$RT"
     local listed
     listed="$(RX_CANNED="$created" rx "$holder" P="${MNT[$holder]}$shared_rel" <<'EOS'
 ls -f "$P" | grep -c '^w' || true
@@ -1307,6 +1326,7 @@ EOS
     k_root="$(stripe_k_of 0 "")"
     local rt_s
     rt_s="$(sym_rt_verdict sym-shared-dir "$wall" create)"
+    rt_flag "$rt_s"
     {
         row_stamp "sym-shared-dir" "python3 O_CREAT|O_EXCL creators: ${#writers[@]} nodes × $per_writer into ONE directory held by m$holder"
         echo "== gate 3b: ${#writers[@]} creator nodes × $per_writer into ONE directory (holder m$holder): wall $wall s, $(python3 -c "print(f'{$created/($t1-$t0):.0f}')") creates/s aggregate (RT $RT s)${rt_s:+ $rt_s} =="
@@ -1408,10 +1428,12 @@ for r in ${ROWS//,/ }; do
     *) die "unknown row set '$r' (tarx|scale|shared)" ;;
     esac
 done
-if $DRY_RUN; then
+if [ "$RT_INVALID" = 1 ]; then
+    # Reached from the PARENT shell (the callers flag it); the dry-run under
+    # --test-force-sub-rt is the pin that it fires (review round 2, Issue 15).
+    die "a RATE phase ran shorter than RT=$RT s on the cloud venue — the row(s) marked INVALID(sub-RT) in $ROWS_FILE are burst rows, not results (every other law's evidence is kept in $ROWDIR)$($FORCE_SUB_RT && echo ' — --test-force-sub-rt: this nonzero exit IS the Issue-15 pin')"
+elif $DRY_RUN; then
     log "dry-run complete: every command printed, nothing executed"
-elif [ "$RT_INVALID" = 1 ]; then
-    die "a RATE phase ran shorter than RT=$RT s on the cloud venue — the row(s) marked INVALID(sub-RT) in $ROWS_FILE are burst rows, not results (every other law's evidence is kept in $ROWDIR)"
 else
     log "ALL ROW SETS PUBLISHED — $ROWS_FILE (labels, tables, verdicts); snapshots + fsck transcripts in $ROWDIR"
 fi

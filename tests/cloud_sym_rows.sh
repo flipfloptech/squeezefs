@@ -195,7 +195,7 @@ case "$SYM_VENUE" in cloud | laptop) ;; *) die "--venue takes cloud|laptop (got 
 [[ "$THREADS" =~ ^[0-9]+$ ]] && [ "$THREADS" -ge 1 ] || die "--threads takes an integer ≥ 1 (got '$THREADS')"
 [[ "$INGEST_MB" =~ ^[0-9]+$ ]] && [ "$INGEST_MB" -ge 4 ] && [ $((INGEST_MB % 4)) -eq 0 ] ||
     die "--ingest-mb takes a multiple of 4 MiB ≥ 4 (got '$INGEST_MB')"
-[ -z "$TARX_REPS" ] || [[ "$TARX_REPS" =~ ^[0-9]+$ ]] || die "--tarx-reps takes an integer (got '$TARX_REPS')"
+[[ "$TARX_REPS" =~ ^[0-9]+$ ]] || die "--tarx-reps takes an integer ≥ 0 (got '$TARX_REPS'; an empty value would loop the node's extraction unbounded)"
 [ "${#ENTRIES[@]}" -ge 1 ] || die "no mounts given — see --help (manager=<host>:<mnt> writer=<host>:<mnt> …)"
 
 # --- the node table ---------------------------------------------------------------
@@ -574,7 +574,7 @@ EOS
 # manager's directory must then count N Live pages. Without a hook every
 # writer stays mounted (the row says so) and appenders_known reads the fleet.
 ensure_writers() { # n want_idx...
-    local n="$1" j want t
+    local n="$1" j w want t
     shift
     if [ -z "$MOUNT_HOOK" ]; then
         return 0

@@ -1616,14 +1616,27 @@ appender 1 (g 1, root 0x3400000, cursor 44, 3 extents) — flush 3987 µs,
 page 134 µs, tree 0 3356 µs` and m61 logged five `the manager answered
 NotHolder { 0 } for object 144036023238658 — this joiner's lease
 projection lagged the manager's checkpoint; retried at the holder the
-manager named`. The requester's create into the moving directory was
-answered by the OLD holder's live-witness refusal after its release
-(`ENOENT` — the parent no longer in m60's leased set) and surfaced as
-the op's errno instead of re-dispatching (the `SlotBusy` / stale-holder
-classes defects 29 / 30 / 35 made retryable; an `ENOENT` witness for a
-directory that EXISTS at its new holder is the same class wearing the
-wrong word). Once in 558 touches across the two positions (the 46
-creates before it in that burst succeeded — and are F-R3's orphans).
+manager named`. **The mechanism below is a WORKING HYPOTHESIS from that
+timing correlation — no log line names the refusing site** (the
+requester's daemon logs the redirects, not the errno's origin): the
+requester's create into the moving directory was answered by the OLD
+holder's live-witness refusal after its release (`ENOENT` — the parent
+no longer in m60's leased set) and surfaced as the op's errno instead of
+re-dispatching (the `SlotBusy` / stale-holder classes defects 29 / 30 /
+35 made retryable; an `ENOENT` witness for a directory that EXISTS at
+its new holder would be the same class wearing the wrong word). The
+alternatives the evidence does not exclude: the new holder's (m61's)
+first local lookup of the parent right after `adopt_transferred_slot_
+tree`, or the initiator's own re-dispatch landing on a stale parent
+read. **The pin that settles it** (the fix's, PR 13e / 14): the
+two-backend fixture with a foreign create held at the served step
+(`TEST_XV_SEAM_AFTER_STEPS` / a hold before the holder's witness read)
+while the slot is released TO the creator, then the served step
+resumed — the create must LAND (or re-dispatch and land), never answer
+`ENOENT` for a directory that exists at its new holder; the seam names
+the site the errno came from. Once in 558 touches across the two
+positions (the 46 creates before it in that burst succeeded — and are
+F-R3's orphans).
 
 ##### 3.9.4.4 Gate 5 — `sym-readers`, the 1 × 31 broadcast on the 32-member fleet, two positions on fresh fleets (13:26 → 13:33 UTC): **MET on every law, both positions — F-B3's fix is a VERDICT on the box: the fleet that could not form on PR 13b FORMS (the manager's listener at `max 512 connections`, `RLIMIT_NOFILE soft raised 1024 → 262144`), exactness 0 misses over 31 readers, `dlm_token_recalls` 155 ≡ 5 × 31, recall RTT 300 µs, `free_grace_hold_ms` 0 under tokens**
 
@@ -3657,9 +3670,10 @@ so nothing falls off a ledger the way defect 32 did between PR 5 and PR
    read at the child's holder (the writer's divert / a `LookupExact`).
    A flip precondition (an ordinary `rm -rf` leaks). **F-R4** (PR 6 × the
    handover): a create into a directory whose slot moves TO the creator
-   mid-burst answered `ENOENT` once (the old holder's live-witness
-   refusal after its release, surfaced instead of re-dispatched —
-   defects 29 / 30's family). **Gate 1's rename / unlink DELTA** (−3.3…
+   mid-burst answered `ENOENT` once — the working HYPOTHESIS (a timing
+   correlation, no log names the site) is the old holder's live-witness
+   refusal after its release surfaced instead of re-dispatched (defects
+   29 / 30's family); the pin shape that settles it is in §3.9.4.3. **Gate 1's rename / unlink DELTA** (−3.3…
    −4.4 %): the PR-4 rename lock-set fix's priced cost STAYS; the
    `handle_setattr` future's construction + lane move (the kernel's
    SETATTR echo per rename / unlink) is the named per-op term — shrink

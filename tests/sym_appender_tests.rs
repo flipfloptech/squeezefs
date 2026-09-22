@@ -969,7 +969,8 @@ fn the_recovering_exemption_admits_the_managers_structure_alone_and_only_for_the
 // ---------------------------------------------------------------------------
 
 use squeezefs::meta_backend::kv::appender::{
-    appender_flush_ceiling_ms, write_page, AppenderStats, TEST_APPENDER_SLOTS_ENV,
+    appender_flush_ceiling_ms, appender_flush_ceiling_service_cap_ms, write_page, AppenderStats,
+    TEST_APPENDER_SLOTS_ENV,
 };
 use squeezefs::meta_backend::kv::backend::{
     test_conveyor_hold_release, TEST_CONVEYOR_HOLD_PRE_ROLLBACK, TEST_CONVEYOR_HOLD_STAGE,
@@ -1833,14 +1834,18 @@ async fn the_flush_ceiling_is_the_checkpoint_age_and_a_parked_device_moves_the_o
 /// generalized): a leaf is judged on the time it aged with NO structural
 /// hold on the mutex — the Σ of SERVICE holds (a wire appender's slot
 /// grant / release, a slot transfer's adoption, a projection refresh, a
-/// region's release, the joiner's own wire refill inside its pass)
-/// overlapping its dirty window is excluded exactly (a monotone Σ on the
+/// region's release — another actor's hold, never the pass's own wait on
+/// a peer) OVERLAPPING its dirty window is excluded (a monotone Σ on the
 /// node environment, stamped on the leaf at its clean → dirty transition
-/// beside `dirty_since_ns`), a RECOVERY hold's overlap up to the published
+/// beside `dirty_since_ns`; an overlap-bounded exclusion whose over-excuse
+/// is ≤ one cadence tick per hold), CAPPED at one landing ceiling
+/// (`appender_flush_ceiling_service_cap_ms`, published — review round 1,
+/// Issue 1c), a RECOVERY hold's overlap up to the published
 /// `appender_recovery_bound_ms`; what remains past the ceiling is the
 /// overrun. Each excused leaf counts on its class's gauge
-/// (`appender_flush_ceiling_service_extensions` here). RED before: the
-/// leaf that aged under a held mutex read `flush_ceiling_overruns == 1`.
+/// (`appender_flush_ceiling_service_extensions` here), the excused Σ and
+/// the largest exclusion are published. RED before: the leaf that aged
+/// under a held mutex read `flush_ceiling_overruns == 1`.
 /// Take the SMO mutex as the SERVICE would, waiting out a cadence pass
 /// that holds it (the seam is try-only; the tick runs every 50 ms).
 async fn hold_smo_as_service(
@@ -1903,9 +1908,28 @@ async fn a_leaf_that_aged_under_a_service_hold_of_the_smo_mutex_is_an_extension_
         "the extension is counted on its class (got {})",
         s1.flush_ceiling_service_extensions
     );
-    // The exclusion is EXACT: a hold that ended BEFORE the leaf went dirty
-    // excuses nothing — a parked device past the ceiling is still the
-    // overrun the counter must see.
+    // The exclusion is PUBLISHED and CAPPED at one landing ceiling: this
+    // hold ran 200 ms past the cap, so the Σ excused reads the cap (the
+    // 200 ms + the pass are what was judged, under the ceiling).
+    let cap = s1.flush_ceiling_service_cap_ms;
+    assert_eq!(
+        cap,
+        appender_flush_ceiling_service_cap_ms(50),
+        "the service cap in force is the derivation's (one landing ceiling)"
+    );
+    assert_eq!(cap, ceiling, "one landing ceiling");
+    assert_eq!(
+        s1.flush_ceiling_excused_ns,
+        cap * 1_000_000,
+        "the excused Σ is the capped overlap"
+    );
+    assert_eq!(
+        s1.flush_ceiling_excused_max_ms, cap,
+        "the largest exclusion is the cap"
+    );
+    // The exclusion is OVERLAP-bounded: a hold that ended BEFORE the leaf
+    // went dirty excuses nothing — a parked device past the ceiling is
+    // still the overrun the counter must see.
     let hold = hold_smo_as_service(&va).await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     drop(hold);
@@ -1924,6 +1948,37 @@ async fn a_leaf_that_aged_under_a_service_hold_of_the_smo_mutex_is_an_extension_
     assert_eq!(
         s2.flush_ceiling_service_extensions, s1.flush_ceiling_service_extensions,
         "no extension counted for a hold outside the dirty window"
+    );
+    assert_eq!(
+        s2.flush_ceiling_excused_ns, s1.flush_ceiling_excused_ns,
+        "nothing excused for a leaf no hold overlapped"
+    );
+    // The exclusion is CAPPED (review round 1, Issue 1c): a service hold
+    // longer than one landing ceiling excuses the cap and the EXCESS is
+    // the overrun — the stall class the ceiling's consumers must see.
+    ra.create(ROOT_INO, "under-a-long-hold", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .unwrap();
+    let hold = hold_smo_as_service(&va).await;
+    tokio::time::sleep(std::time::Duration::from_millis(cap + ceiling + 300)).await;
+    drop(hold);
+    va.checkpoint_now().await.unwrap();
+    let s3 = stats(&va);
+    assert_eq!(
+        s3.flush_ceiling_overruns,
+        2,
+        "a hold past the cap leaves its excess as the overrun (hold {} ms, cap {cap} ms, \
+         ceiling {ceiling} ms)",
+        cap + ceiling + 300
+    );
+    assert_eq!(
+        s3.flush_ceiling_excused_max_ms, cap,
+        "the largest exclusion is exactly the cap"
+    );
+    assert_eq!(
+        s3.flush_ceiling_excused_ns - s2.flush_ceiling_excused_ns,
+        cap * 1_000_000,
+        "the long hold excused the cap and nothing more"
     );
     for v in &ra.volumes {
         v.shutdown().await.unwrap();

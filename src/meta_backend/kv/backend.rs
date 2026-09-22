@@ -10537,25 +10537,37 @@ impl KvMetaBackend {
     /// **ONE law for the structural holds** (PR 13c, F-B1 — defect 33's
     /// recovery extension generalized): the SMO mutex is the one
     /// serialized structural actor, and a leaf cannot be flushed while
-    /// another actor holds it — a dead appender's recovery (steps 4–7),
+    /// ANOTHER actor holds it — a dead appender's recovery (steps 4–7),
     /// or the fleet SERVICE (a wire appender's slot grant / release, a
-    /// transfer's adoption, a projection refresh, a region's release, the
-    /// joiner's own wire refill inside its pass: 5–127 ms on the box, the
-    /// 2-tick margin spent). The audited age is the time the leaf aged
-    /// with NO such hold: each leaf stamps `NodeEnv::holds`' Σ at its
-    /// dirty transition, so `Σ(now) − Σ(stamp)` is EXACTLY the hold time
-    /// that overlapped its window (serialized holds never double count).
-    /// A recovery's excusable overlap is capped at the PUBLISHED
-    /// `appender_recovery_bound_ms` (its promise); a service hold's is the
-    /// measured overlap (the service is priced on `manager_service_ns`).
-    /// An excused leaf counts on its class's gauge; the flush pass's own
-    /// wall past the ceiling is still the overrun.
+    /// transfer's adoption, a projection refresh, a region's release:
+    /// 5–127 ms on the box, the 2-tick margin spent). The audited age is
+    /// the time the leaf aged with NO such hold: each leaf stamps
+    /// `NodeEnv::holds`' Σ at its dirty transition, so `Σ(now) − Σ(stamp)`
+    /// is the hold time that OVERLAPPED its dirty window (serialized holds
+    /// never double count). **An overlap-bounded exclusion, not the delay
+    /// the pass suffered**: passes and holds serialize on the mutex, so a
+    /// hold spanning the pass's due tick delays the pass by its REMAINDER
+    /// and the part before the tick is excused without having delayed
+    /// anything — an over-excuse of at most one cadence tick per hold
+    /// (review round 1, Issue 1a). Each class's exclusion is CAPPED at a
+    /// published bound: a recovery's at `appender_recovery_bound_ms` (its
+    /// promise), a service hold's at one landing ceiling
+    /// (`appender_flush_ceiling_service_cap_ms` — the contract the audit
+    /// excuses against; a longer hold is the stall class the ceiling's
+    /// consumers must see, so the excess counts). The excused Σ and the
+    /// largest single exclusion are published (`…_excused_ns`,
+    /// `…_excused_max_ms`) beside the class counts. This pass's own wall —
+    /// its device time, its wait on a peer (the joiner's in-pass wire
+    /// refill) — is never a hold and never excused: past the ceiling it is
+    /// the overrun. The MARGIN's derivation from the measured pass wall
+    /// (record §7 item 3) is untouched by this rung — PR 14's.
     pub(super) fn note_flush_ceiling(&self, had_dirty: &[DirtyLeafAge], now_ns: u64) {
         let Some(set) = self.appenders.as_ref() else {
             return;
         };
         let ceiling_ns = set.flush_ceiling_ms * 1_000_000;
         let recovery_cap_ns = self.appender_recovery_bound_ms() * 1_000_000;
+        let service_cap_ns = set.flush_ceiling_service_cap_ms * 1_000_000;
         let held_now = self.cache.holds().snapshot(now_ns);
         let mut over: Vec<(u32, u64)> = Vec::new();
         let mut by_recovery: Vec<(u32, u64)> = Vec::new();
@@ -10568,10 +10580,17 @@ impl KvMetaBackend {
             let recovery_ns = held_now[0]
                 .saturating_sub(leaf.held_at_since_ns[0])
                 .min(recovery_cap_ns);
-            let service_ns = held_now[1].saturating_sub(leaf.held_at_since_ns[1]);
-            let judged_ns = age_ns
-                .saturating_sub(recovery_ns)
-                .saturating_sub(service_ns);
+            let service_ns = held_now[1]
+                .saturating_sub(leaf.held_at_since_ns[1])
+                .min(service_cap_ns);
+            let excused_ns = recovery_ns + service_ns;
+            if excused_ns > 0 {
+                set.flush_ceiling_excused_ns
+                    .fetch_add(excused_ns, Ordering::Relaxed);
+                set.flush_ceiling_excused_max_ms
+                    .fetch_max(excused_ns / 1_000_000, Ordering::Relaxed);
+            }
+            let judged_ns = age_ns.saturating_sub(excused_ns);
             let row = (leaf.region, age_ns / 1_000_000);
             if judged_ns > ceiling_ns {
                 over.push(row);
@@ -10601,9 +10620,10 @@ impl KvMetaBackend {
                 "meta volume {}: flush ceiling extended by a service hold of the SMO mutex — \
                  appender region(s) {by_service:?} (id, oldest dirty leaf's age in ms at the \
                  covering barrier) past the {} ms landing ceiling, the hold's measured overlap \
-                 excluded (appender_flush_ceiling_service_extensions)",
+                 (≤ the {} ms service cap) excluded (appender_flush_ceiling_service_extensions)",
                 self.path.display(),
-                set.flush_ceiling_ms
+                set.flush_ceiling_ms,
+                set.flush_ceiling_service_cap_ms
             );
         }
         if over.is_empty() {
@@ -10614,8 +10634,8 @@ impl KvMetaBackend {
         log::warn!(
             "meta volume {}: flush ceiling OVERRUN — appender region(s) {over:?} (id, oldest \
              dirty leaf's age in ms at the covering barrier) exceeded the {} ms landing \
-             ceiling with every structural hold excluded (appender_flush_ceiling_overruns, \
-             must stay 0)",
+             ceiling with every structural hold's capped overlap excluded \
+             (appender_flush_ceiling_overruns, must stay 0)",
             self.path.display(),
             set.flush_ceiling_ms
         );
@@ -10631,9 +10651,11 @@ impl KvMetaBackend {
 
     /// Mark this volume's SMO mutex as held by the fleet SERVICE (PR 13c,
     /// F-B1) for the guard's lifetime — taken AFTER the mutex (a wait
-    /// behind the flush pass is the pass's time, not a hold). The audit
-    /// excludes the hold's measured overlap from the leaves that aged
-    /// under it.
+    /// behind the flush pass is the pass's time, not a hold), and only by
+    /// ANOTHER actor than the flush pass (a pass waiting on a peer under
+    /// its own hold is its own wall). The audit excludes the hold's
+    /// measured overlap, capped at one landing ceiling, from the leaves
+    /// that aged under it.
     pub(super) fn service_hold(&self) -> StructuralHold<'_> {
         self.structural_hold(HoldClass::Service)
     }
@@ -18543,10 +18565,15 @@ impl KvMetaBackend {
             flush_ceiling_overruns: AtomicU64::new(0),
             flush_ceiling_recovery_extensions: AtomicU64::new(0),
             flush_ceiling_service_extensions: AtomicU64::new(0),
+            flush_ceiling_excused_ns: AtomicU64::new(0),
+            flush_ceiling_excused_max_ms: AtomicU64::new(0),
             pressure_cycles: AtomicU64::new(0),
             joined: AtomicBool::new(false),
             join_refusal,
             flush_ceiling_ms: super::appender::appender_flush_ceiling_ms(
+                crate::meta_backend::resolve_flush_interval_ms(),
+            ),
+            flush_ceiling_service_cap_ms: super::appender::appender_flush_ceiling_service_cap_ms(
                 crate::meta_backend::resolve_flush_interval_ms(),
             ),
             // The ladder's and the replay's measured terms land at the

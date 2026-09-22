@@ -1751,13 +1751,13 @@ impl KvMetaBackend {
                 let want = u32::try_from(*needed)
                     .unwrap_or(u32::MAX)
                     .max(super::super::appender::SMO_IMAGES_MAX);
-                // The manager's SERVICE the pass waits on, under its own
-                // mutex hold (PR 13c, F-B1): its round trip is excluded
-                // from the leaves' audited age like any service hold.
-                let refill = {
-                    let _hold = self.service_hold();
-                    self.joined_extent_grant_at(want, Some(&*smo)).await
-                };
+                // The round trip is the PASS's own wall (PR 13c review
+                // round 1, Issue 1b): the pass holds the mutex and waits on
+                // a peer, so a slow manager lands these leaves late for
+                // every consumer of the ceiling — the flush-ceiling audit
+                // counts it, never excuses it (a `Service` hold is another
+                // actor's hold of the mutex, not this pass waiting).
+                let refill = self.joined_extent_grant_at(want, Some(&*smo)).await;
                 match refill {
                     Ok(n) if n > 0 => {
                         out = tree.checkpoint_flush_node(smo, addr).await;

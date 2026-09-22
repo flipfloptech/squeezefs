@@ -13903,6 +13903,23 @@ impl SqueezefsFilesystem {
                     "appender_flush_ceiling_service_extensions".into(),
                     appender(&|s| s.flush_ceiling_service_extensions),
                 );
+                // The exclusion's operator face (PR 13c review round 1,
+                // Issue 1c): the Σ excused (exact-sum, both classes after
+                // their caps — its delta per `checkpoints` is the excuse
+                // per cycle), the largest single exclusion, and the
+                // service class's published cap (one landing ceiling).
+                metrics.insert(
+                    "appender_flush_ceiling_excused_ns".into(),
+                    appender(&|s| s.flush_ceiling_excused_ns),
+                );
+                metrics.insert(
+                    "appender_flush_ceiling_excused_max_ms".into(),
+                    appender(&|s| s.flush_ceiling_excused_max_ms),
+                );
+                metrics.insert(
+                    "appender_flush_ceiling_service_cap_ms".into(),
+                    appender(&|s| s.flush_ceiling_service_cap_ms),
+                );
                 // The bound the audit compares against — the checkpoint
                 // LANDING ceiling of the cadence in force (1,100 ms at the
                 // shipped 50 ms flush) — published so the docs cannot drift.

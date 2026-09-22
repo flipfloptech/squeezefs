@@ -2046,6 +2046,23 @@ pub fn appender_flush_ceiling_ms(flush_interval_ms: u64) -> u64 {
     super::checkpoint::checkpoint_landing_ceiling_ms(flush_interval_ms)
 }
 
+/// The CAP on the flush-ceiling audit's SERVICE exclusion, ms (PR 13c,
+/// F-B1 — review round 1, Issue 1c): a leaf that aged under a service
+/// hold of the SMO mutex (a wire appender's slot grant / release, a
+/// transfer's adoption, a projection refresh, a region's release) is
+/// excused the hold's overlap with its dirty window, but never more than
+/// ONE landing ceiling — the very contract the audit excuses against.
+/// The ceiling is a cross-plane promise (the free-grace qualify term and
+/// the `=0` reader's staleness input read `checkpoint_landing_ceiling_ms`
+/// as the writer's landing bound); a hold longer than the ceiling itself
+/// is the stall class those consumers must SEE, so the excess counts as
+/// the overrun. The recovery class keeps its own published cap
+/// (`appender_recovery_bound_ms`). Published live as
+/// `appender_flush_ceiling_service_cap_ms`.
+pub fn appender_flush_ceiling_service_cap_ms(flush_interval_ms: u64) -> u64 {
+    appender_flush_ceiling_ms(flush_interval_ms)
+}
+
 /// `SQUEEZEFS_TEST_SYM_APPENDER_SLOTS` — the PR-2 declared static
 /// partition (a harness seam standing in for PR 4's lease gate).
 pub const TEST_APPENDER_SLOTS_ENV: &str = "SQUEEZEFS_TEST_SYM_APPENDER_SLOTS";
@@ -2304,12 +2321,22 @@ pub struct AppenderSet {
     /// Late covering barriers explained by a SERVICE hold of the SMO mutex
     /// (PR 13c, F-B1 — the box's 1–32 ms overruns with no recovery in
     /// flight): the manager's slot grant / release to a wire appender, a
-    /// transfer's adoption, a projection refresh, a region's release, the
-    /// joiner's own wire refill inside its flush pass. The excluded time
-    /// is the MEASURED overlap of such holds with the leaf's dirty window
-    /// (`NodeEnv::holds`), never a constant — the service is priced on
-    /// `manager_service_ns`; what remains past the ceiling is the overrun.
+    /// transfer's adoption, a projection refresh, a region's release —
+    /// another actor's hold, never this pass waiting on a peer (the
+    /// joiner's in-pass wire refill is the pass's own wall). The excluded
+    /// time is the MEASURED overlap of such holds with the leaf's dirty
+    /// window (`NodeEnv::holds`), capped at ONE landing ceiling
+    /// ([`appender_flush_ceiling_service_cap_ms`], published); what
+    /// remains past the ceiling is the overrun.
     pub flush_ceiling_service_extensions: std::sync::atomic::AtomicU64,
+    /// The Σ of hold time the audit EXCLUDED, ns (recovery and service,
+    /// each after its cap), over every leaf it judged — the operator's
+    /// face of the exclusion beside the two counts (its delta per
+    /// `checkpoints` is the excuse per cycle). Exact-sum.
+    pub flush_ceiling_excused_ns: std::sync::atomic::AtomicU64,
+    /// The largest single exclusion the audit applied to one leaf, ms —
+    /// bounded by `max(recovery bound, service cap)` by construction.
+    pub flush_ceiling_excused_max_ms: std::sync::atomic::AtomicU64,
     /// Checkpoint cycles a declared region's ring pressure made due (§4.6
     /// pt 2 per region — [`AppenderSet::ring_pressure`]): a parked
     /// committer is drained by the next cadence tick, never by the
@@ -2326,6 +2353,9 @@ pub struct AppenderSet {
     /// [`appender_flush_ceiling_ms`] of the flush interval in force at
     /// open (the backend-knob convention: resolved once, never per cycle).
     pub flush_ceiling_ms: u64,
+    /// [`appender_flush_ceiling_service_cap_ms`] of the same interval —
+    /// the published cap on the audit's service exclusion.
+    pub flush_ceiling_service_cap_ms: u64,
     /// [`manager_failover_bound_ms`] as derived at this open (the ladder
     /// and replay terms land at the join).
     pub failover_bound_ms: std::sync::atomic::AtomicU64,
@@ -2692,7 +2722,10 @@ impl AppenderSet {
             flush_ceiling_overruns: self.flush_ceiling_overruns.load(Relaxed),
             flush_ceiling_recovery_extensions: self.flush_ceiling_recovery_extensions.load(Relaxed),
             flush_ceiling_service_extensions: self.flush_ceiling_service_extensions.load(Relaxed),
+            flush_ceiling_excused_ns: self.flush_ceiling_excused_ns.load(Relaxed),
+            flush_ceiling_excused_max_ms: self.flush_ceiling_excused_max_ms.load(Relaxed),
             flush_ceiling_ms: self.flush_ceiling_ms,
+            flush_ceiling_service_cap_ms: self.flush_ceiling_service_cap_ms,
             pressure_cycles: self.pressure_cycles.load(Relaxed),
             manager_lease: self
                 .manager_lease
@@ -2807,11 +2840,18 @@ pub struct AppenderStats {
     /// (inside the extended bound) — defect 33.
     pub flush_ceiling_recovery_extensions: u64,
     /// Late covering barriers explained by a service hold of the SMO
-    /// mutex (the measured overlap excluded) — PR 13c, F-B1.
+    /// mutex (the measured overlap excluded, capped) — PR 13c, F-B1.
     pub flush_ceiling_service_extensions: u64,
+    /// Σ excluded hold time, ns (both classes, after their caps).
+    pub flush_ceiling_excused_ns: u64,
+    /// The largest single exclusion applied to one leaf, ms.
+    pub flush_ceiling_excused_max_ms: u64,
     /// The flush ceiling in force, ms (`appender_flush_ceiling_ms`) —
     /// published so the bound the gauge audits cannot drift from the docs.
     pub flush_ceiling_ms: u64,
+    /// The service exclusion's cap, ms
+    /// (`appender_flush_ceiling_service_cap_ms`).
+    pub flush_ceiling_service_cap_ms: u64,
     /// Cycles a declared region's ring pressure made due.
     pub pressure_cycles: u64,
     /// The Manager family (§11, PR 3).

@@ -2575,8 +2575,9 @@ fn free_grace_elastic_checkpoint_ceiling_derives_from_the_poll_and_the_cycle() {
 #[test]
 fn sym_appender_ring_derives_from_the_reserve_and_the_solo_ring() {
     use squeezefs::meta_backend::kv::appender::{
-        appender_flush_ceiling_ms, appender_ring_bytes_derived, appenders_capacity,
-        ring_budget_bytes, sym_ring_ceiling_bytes, SYM_RING_FLOOR_BYTES,
+        appender_flush_ceiling_ms, appender_flush_ceiling_service_cap_ms,
+        appender_ring_bytes_derived, appenders_capacity, ring_budget_bytes, sym_ring_ceiling_bytes,
+        SYM_RING_FLOOR_BYTES,
     };
     use squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS;
     use squeezefs::meta_backend::kv::journal::{checkpoint_reserve_bytes, MAX_ENTRY_LEN};
@@ -2646,6 +2647,17 @@ fn sym_appender_ring_derives_from_the_reserve_and_the_solo_ring() {
         1_100,
         "the shipped 50 ms flush"
     );
+    // PR 13c (F-B1, review round 1 Issue 1c): the audit's SERVICE exclusion
+    // is capped at ONE landing ceiling — the contract it excuses against;
+    // a hold longer than the ceiling is the stall class its consumers
+    // (the free-grace qualify term, the `=0` reader) must see.
+    for interval in [0u64, 50, 5_000] {
+        assert_eq!(
+            appender_flush_ceiling_service_cap_ms(interval),
+            appender_flush_ceiling_ms(interval),
+            "the service cap is one landing ceiling of the cadence in force"
+        );
+    }
 }
 
 /// The symmetric MANAGER's derivations (design-symmetric-metadata §5.3.3

@@ -1088,10 +1088,17 @@ EOS
         # its cumulative history with it and the delta reads short — an
         # INVALID instrument, never a law's verdict (found by the local
         # pass behind sym-scale's leave/rejoin on `auto`-port joiners).
-        for k in dlm_token_grants dlm_token_recalls_received dlm_token_cached; do
+        # Witnesses: the two COUNTERS going backwards, and the per-volume
+        # plane COUNT changing (`dlm_token_cached` is a level — an eviction
+        # inside the window is legitimate and never aborts a paid run).
+        local planes_msg
+        planes_msg="planes $(sym_json_field "$ROWDIR/m1_pls0.json" dlm_token_reader_holder_planes) → $(sym_json_field "$ROWDIR/m1_pls1.json" dlm_token_reader_holder_planes)"
+        for k in dlm_token_grants dlm_token_recalls_received; do
             [ "$(sym_json_any_decrease "$ROWDIR/m1_pls0.json" "$ROWDIR/m1_pls1.json" "$k")" = "0" ] ||
-                die "sym-shared-dir-ls: INSTRUMENT INVALID — the reader's $k went BACKWARDS on a volume across the listing (a per-holder token plane was replaced mid-row: a holder's endpoint changed — planes $(sym_json_field "$ROWDIR/m1_pls0.json" dlm_token_reader_holder_planes) → $(sym_json_field "$ROWDIR/m1_pls1.json" dlm_token_reader_holder_planes)); the row cannot be judged from these deltas — re-run the -ls half on a reader whose planes are fresh (run 'shared' ahead of 'scale', or remount the reader)"
+                die "sym-shared-dir-ls: INSTRUMENT INVALID — the reader's $k went BACKWARDS on a volume across the listing (a per-holder token plane was replaced mid-row: a holder's endpoint changed — $planes_msg); the row cannot be judged from these deltas — re-run the -ls half on a reader whose planes are fresh (run 'shared' ahead of 'scale', or remount the reader)"
         done
+        [ "$(sym_json_any_change "$ROWDIR/m1_pls0.json" "$ROWDIR/m1_pls1.json" dlm_token_reader_holder_planes)" = "0" ] ||
+            warn "sym-shared-dir-ls: the reader's per-holder plane count CHANGED across the listing ($planes_msg) — a first-touch plane dial inside the window (expected on a cold reader: the counters above stayed monotone, so the deltas stand)"
         local grants merges misses hits dropped epochs
         grants="$(sym_delta "$ROWDIR" 1 ls dlm_token_grants)"
         merges="$(sym_delta "$ROWDIR" 1 ls dir_stripe_readdir_merges)"

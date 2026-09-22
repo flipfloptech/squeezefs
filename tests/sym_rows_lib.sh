@@ -139,6 +139,9 @@ print(v)' "$1" "$2"
 # with it: the row's delta then reads short, never a law's MISS but an
 # INSTRUMENT the row must refuse to judge (PR 15's local pass: volume 2's
 # `dlm_token_grants` 13,861 → 16,000 with `recalls_received` 7,861 → 0).
+# Feed it COUNTERS only — `dlm_token_cached` is a LEVEL (the cache's
+# `len()`; a byte-budget eviction or a recall inside the window is a
+# legitimate decrease).
 sym_json_any_decrease() { # file0 file1 key
     python3 -c '
 import json, sys
@@ -154,6 +157,24 @@ la = a if isinstance(a, list) else [a]
 lb = b if isinstance(b, list) else [b]
 dec = any(isinstance(x, (int, float)) and isinstance(y, (int, float)) and y < x for x, y in zip(la, lb))
 print(1 if dec else 0)' "$1" "$2" "$3"
+}
+
+# Did any per-volume element of a LEVEL gauge CHANGE between two captured
+# `.stats` files? Prints 1/0 — the reader's `dlm_token_reader_holder_planes`
+# per volume is the plane-replacement witness beside the counters above
+# (a re-point that keeps the plane count is what the counters catch).
+sym_json_any_change() { # file0 file1 key
+    python3 -c '
+import json, sys
+def flat(d, out, pfx=""):
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+def load(f):
+    r = json.load(open(f)); return flat(r.get("metrics", r), {})
+a, b = load(sys.argv[1]).get(sys.argv[3], None), load(sys.argv[2]).get(sys.argv[3], None)
+print(0 if a == b else 1)' "$1" "$2" "$3"
 }
 
 # --- the VENUE word ------------------------------------------------------------

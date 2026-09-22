@@ -10,7 +10,9 @@
 //! --nocapture`.
 
 use squeezefs::meta_backend::kv::builder::{format_v3_stamped, FormatV3Options};
+use squeezefs::meta_backend::kv::META_KV_TIMES_ECHO_ABSORBED;
 use squeezefs::meta_backend::{open_routed_meta_set, plan_meta_slot_set, Metadata};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -169,8 +171,19 @@ async fn flat_path_microbench() {
     })
     .await;
     // PR 13f: the kernel's ctime SETATTR echo — once per rename / unlink on
-    // a real mount; the routed `setattr` box is what this phase prices
-    // (the FUSE handler's own future is the mount row's).
+    // a real mount — in ITS shape: no mtime, a monotone ctime, so every op
+    // takes `setattr_locked`'s ABSORB arm (a parked refinement, zero
+    // journal entries) and the phase prices the routed `setattr` box the
+    // echo mints per op, not a `utimes` commit (the FUSE handler's own
+    // future is the mount row's). The absorb count is asserted below.
+    let echo0 = META_KV_TIMES_ECHO_ABSORBED.load(Ordering::Relaxed);
+    // Ahead of the records' ctime (now), as the kernel's echo is: each op
+    // parks a refinement, the realistic absorb.
+    let base = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+        + 1_000_000_000;
     let r = Arc::clone(&routed);
     let d = Arc::clone(&dirs);
     let setattr_us = phase("setattr(echo)", n, t, move |i| {
@@ -178,13 +191,26 @@ async fn flat_path_microbench() {
         let d = Arc::clone(&d);
         async move {
             let th = i / per;
-            let ts = 1_700_000_000_000_000_000u64 + i as u64;
-            r.setattr(d[th], None, None, None, None, None, Some(ts), Some(ts))
-                .await
-                .unwrap();
+            r.setattr(
+                d[th],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(base + i as u64),
+            )
+            .await
+            .unwrap();
         }
     })
     .await;
+    assert_eq!(
+        META_KV_TIMES_ECHO_ABSORBED.load(Ordering::Relaxed) - echo0,
+        n as u64,
+        "the setattr(echo) phase must run the echo's shape — every op absorbed"
+    );
     let r = Arc::clone(&routed);
     let d = Arc::clone(&dirs);
     let rename_us = phase("rename", n, t, move |i| {

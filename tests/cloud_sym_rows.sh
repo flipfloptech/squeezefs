@@ -1,0 +1,1101 @@
+#!/usr/bin/env bash
+#
+# cloud_sym_rows.sh — the symmetric program's MULTI-NODE row driver
+# (design-symmetric-metadata §8 gates 2 / 3 / 3b; PR 15 `perf/sym-cloud-row`).
+#
+# The three acceptance row sets the box ran CO-LOCATED (run_mw_matrix.sh
+# `sym-tarx` / `sym-scale` / `sym-shared-dir`(+`-ls`)), driven over ssh from
+# the operator's box against ONE symmetric writer PER NODE — the venue gate
+# 3's law ("aggregate create/s and ingest scale with N, bounded by no node")
+# is written for. Every law is tests/sym_rows_lib.sh's — the SAME
+# definitions run_mw_matrix.sh sources — so the cloud row and the box row
+# read one law; this file owns only the venue (where a command runs, how a
+# `.stats` inode is captured, how a node's mount is left and rejoined).
+#
+# Usage:
+#   tests/cloud_sym_rows.sh [flags] manager=<host>:<mnt> writer=<host>:<mnt>...
+#                           [reader=<host>:<mnt>]
+#
+#   <host> is `local` (run here — the laptop's fleet, the "it works" venue)
+#   or an ssh target `[user@]ip`; every command runs as ROOT on the node
+#   (sudo). The manager entry comes first; every writer is a JOINED writer
+#   (its `.stats` reads `joined_appender_id ≥ 1`); the optional reader is a
+#   `-o ro` TOKEN reader (the `-ls` half — SKIPPED loud without one).
+#
+# Flags (every one has a SQZ_CLOUDSYM_* default — harness variables, never
+# a daemon's):
+#   --rows=tarx,scale,shared    row sets to run (default all three)
+#   --rt=S                      the sustained window per measured phase
+#                               (default 60 — the AGENTS.md rule; the local
+#                               scoping pass runs 10; 0 = one pass)
+#   --files=N --threads=T       per-writer creates and threads (scale;
+#                               shared sizes per_writer = files / creators)
+#   --ingest-mb=M               per-writer ingest MiB (4 MiB blocks, fsync)
+#   --scale-ns=1,2,4,8          gate 3's N ladder (capped at the writers
+#                               given + 1)
+#   --tar-src=DIR | --tarball=F the `tar -x` corpus (the linux fs/ tree —
+#                               the box used linux-7.2.3/fs, 2,468 entries;
+#                               ship the SAME tarball to keep rows comparable)
+#   --tarx-reps=R               extractions per arm (default: as many as fit
+#                               --rt; 0 → 1 — the box's shape)
+#   --sqz=PATH                  the squeezefs binary ON THE NODES (default
+#                               `squeezefs` in root's PATH)
+#   --mdstorm-src=FILE          tests/mdstorm.c (compiled on every writer node)
+#   --rowdir=DIR                results (snapshots, tables, verdicts, fsck)
+#   --venue=cloud|laptop        the VENUE word (default cloud; laptop = the
+#                               ruling's one venue-attributed gauge)
+#   --substrate=LABEL --cluster=ID --instrument=TEXT   the row label words
+#   --ssh-key=FILE --ssh-user=U --ssh-opt=OPT (repeatable)
+#   --mount-hook=CMD            `CMD mount|unmount <host> <mnt>` — how a
+#                               writer node's mount is LEFT and REJOINED
+#                               (gate 3's "exactly N appenders live" and its
+#                               deleted-stays-deleted-across-the-leave arm);
+#                               without it the idle writers stay mounted
+#                               and the row says so
+#   --storage=host:dev,...      DATA namespaces on the storage nodes — the
+#                               ingest row's amplification columns
+#                               (/proc/diskstats deltas: device ÷ user bytes,
+#                               wareq-sz) — n/a without it
+#   --manager-priv=IP           the manager's fabric address (the writer
+#                               node pings it — the row's measured RTT)
+#   --dry-run                   print every ssh/local command, run nothing
+#
+# Exit: 0 = every row's engagement law GREEN and the oracle clean; nonzero
+# on any violated law (the row is INVALID, never a number).
+#
+# The rows are the matrix's, verbatim in shape:
+#   gate 2  sym-tarx      A-B-B-A: sym-1 (writer 1 extracts into a directory
+#                         it created) local-1 local-2 (the manager's S0)
+#                         sym-2; law ≤ 1.10× S0, verbs/entry < 0.05,
+#                         handovers 0, rpcs 0.
+#   gate 3  sym-scale     N ∈ ns: N writers (the manager + N−1 joiners) each
+#                         create --files in its own directory then ingest
+#                         --ingest-mb; ≥ 0.7 × N × the N=1 rate on both
+#                         rows; appenders_live == N; handovers 0; ships ≤ N;
+#                         rpcs 0; must-stay-0 deltas 0; deleted stays deleted
+#                         across every joiner's clean leave; C/CPU-S beside
+#                         the multiple.
+#   gate 3b sym-shared-dir every writer creates into ONE directory the first
+#                         joiner made: one flip at the holder, stripe ships
+#                         > 0, shipped ≡ served, handovers 0; -ls: the
+#                         reader's cold `ls -l` = K + C (+ ≤ 4) tokens, 0
+#                         data-leaf reads.
+# After every row set: `fsck --json` on the manager (findings 0) +
+# `meta_kv_block_refs_drift` / `data_alloc_bitmap_drift` 0 + the must-stay-0
+# set on every writer.
+#
+set -euo pipefail
+set -E
+trap 'rc=$?; [ "$rc" = "0" ] || echo "[sym-rows] ERROR: exit $rc at line $LINENO: $BASH_COMMAND" >&2' ERR
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+# The LOCAL venue's mount hook: `tests/cloud_sym_rows.sh fleet-hook
+# mount|unmount local <mnt>` maps the fleet rig's mountpoint
+# (`<MNT_ROOT>/m<idx>`) to `tests/mw_fleet.sh mount|unmount <idx>` — the
+# rig's own leave/rejoin verbs, so the local functional pass exercises the
+# same "exactly N appenders live" arm the cloud rig's `sym-hook` does.
+if [ "${1:-}" = "fleet-hook" ]; then
+    verb="${2:?fleet-hook needs mount|unmount}"
+    host="${3:?fleet-hook needs <host>}"
+    mnt="${4:?fleet-hook needs <mnt>}"
+    [ "$host" = local ] || { echo "[sym-rows] fleet-hook: host must be local (got '$host')" >&2; exit 1; }
+    idx="${mnt##*/m}"
+    [[ "$idx" =~ ^[0-9]+$ ]] || { echo "[sym-rows] fleet-hook: '$mnt' is not a fleet mountpoint (<root>/m<idx>)" >&2; exit 1; }
+    case "$verb" in
+    mount) exec sudo -n "$REPO/tests/mw_fleet.sh" mount "$idx" ;;
+    unmount) exec sudo -n "$REPO/tests/mw_fleet.sh" unmount "$idx" ;;
+    *) echo "[sym-rows] fleet-hook: verb must be mount|unmount (got '$verb')" >&2; exit 1 ;;
+    esac
+fi
+
+log() { echo "[sym-rows] $*"; }
+warn() { echo "[sym-rows] WARN: $*" >&2; }
+die() {
+    echo "[sym-rows] ERROR: $*" >&2
+    # A died row leaves its background storms on the nodes — reap the ssh
+    # children (the remote storms end with their ssh session).
+    pkill -P $$ 2>/dev/null || true
+    exit 1
+}
+
+# --- flags ------------------------------------------------------------------------
+ROWS="${SQZ_CLOUDSYM_ROWS:-tarx,scale,shared}"
+RT="${SQZ_CLOUDSYM_RT:-60}"
+FILES="${SQZ_CLOUDSYM_FILES:-40000}"
+THREADS="${SQZ_CLOUDSYM_THREADS:-4}"
+INGEST_MB="${SQZ_CLOUDSYM_INGEST_MB:-1024}"
+SCALE_NS="${SQZ_CLOUDSYM_SCALE_NS:-1,2,4,8}"
+TAR_SRC="${SQZ_CLOUDSYM_TAR_SRC:-}"
+TARBALL="${SQZ_CLOUDSYM_TARBALL:-}"
+TARX_REPS="${SQZ_CLOUDSYM_TARX_REPS:-}"
+SQZ_NODE="${SQZ_CLOUDSYM_SQZ:-squeezefs}"
+MDSTORM_SRC="${SQZ_CLOUDSYM_MDSTORM_SRC:-$REPO/tests/mdstorm.c}"
+ROWDIR="${SQZ_CLOUDSYM_ROWDIR:-}"
+SYM_VENUE="${SQZ_CLOUDSYM_VENUE:-cloud}"
+SUBSTRATE="${SQZ_CLOUDSYM_SUBSTRATE:-}"
+CLUSTER="${SQZ_CLOUDSYM_CLUSTER:-}"
+INSTRUMENT="${SQZ_CLOUDSYM_INSTRUMENT:-}"
+SSH_KEY="${SQZ_CLOUDSYM_SSH_KEY:-}"
+SSH_USER="${SQZ_CLOUDSYM_SSH_USER:-}"
+SSH_EXTRA=()
+MOUNT_HOOK="${SQZ_CLOUDSYM_MOUNT_HOOK:-}"
+STORAGE="${SQZ_CLOUDSYM_STORAGE:-}"
+MANAGER_PRIV="${SQZ_CLOUDSYM_MANAGER_PRIV:-}"
+REMOTE_DIR="${SQZ_CLOUDSYM_REMOTE_DIR:-/tmp/sym-rows}"
+DRY_RUN=false
+ENTRIES=()
+for a in "$@"; do
+    case "$a" in
+    --rows=*) ROWS="${a#--rows=}" ;;
+    --rt=*) RT="${a#--rt=}" ;;
+    --files=*) FILES="${a#--files=}" ;;
+    --threads=*) THREADS="${a#--threads=}" ;;
+    --ingest-mb=*) INGEST_MB="${a#--ingest-mb=}" ;;
+    --scale-ns=*) SCALE_NS="${a#--scale-ns=}" ;;
+    --tar-src=*) TAR_SRC="${a#--tar-src=}" ;;
+    --tarball=*) TARBALL="${a#--tarball=}" ;;
+    --tarx-reps=*) TARX_REPS="${a#--tarx-reps=}" ;;
+    --sqz=*) SQZ_NODE="${a#--sqz=}" ;;
+    --mdstorm-src=*) MDSTORM_SRC="${a#--mdstorm-src=}" ;;
+    --rowdir=*) ROWDIR="${a#--rowdir=}" ;;
+    --venue=*) SYM_VENUE="${a#--venue=}" ;;
+    --substrate=*) SUBSTRATE="${a#--substrate=}" ;;
+    --cluster=*) CLUSTER="${a#--cluster=}" ;;
+    --instrument=*) INSTRUMENT="${a#--instrument=}" ;;
+    --ssh-key=*) SSH_KEY="${a#--ssh-key=}" ;;
+    --ssh-user=*) SSH_USER="${a#--ssh-user=}" ;;
+    --ssh-opt=*) SSH_EXTRA+=("${a#--ssh-opt=}") ;;
+    --mount-hook=*) MOUNT_HOOK="${a#--mount-hook=}" ;;
+    --storage=*) STORAGE="${a#--storage=}" ;;
+    --manager-priv=*) MANAGER_PRIV="${a#--manager-priv=}" ;;
+    --remote-dir=*) REMOTE_DIR="${a#--remote-dir=}" ;;
+    --dry-run) DRY_RUN=true ;;
+    -h | --help)
+        awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+        exit 0
+        ;;
+    manager=* | writer=* | reader=*) ENTRIES+=("$a") ;;
+    *) die "unknown argument '$a' (see --help)" ;;
+    esac
+done
+case "$SYM_VENUE" in cloud | laptop) ;; *) die "--venue takes cloud|laptop (got '$SYM_VENUE')" ;; esac
+[[ "$RT" =~ ^[0-9]+$ ]] || die "--rt takes seconds (got '$RT')"
+[[ "$FILES" =~ ^[0-9]+$ ]] && [ "$FILES" -ge 100 ] || die "--files takes an integer ≥ 100 (got '$FILES')"
+[[ "$THREADS" =~ ^[0-9]+$ ]] && [ "$THREADS" -ge 1 ] || die "--threads takes an integer ≥ 1 (got '$THREADS')"
+[[ "$INGEST_MB" =~ ^[0-9]+$ ]] && [ "$INGEST_MB" -ge 4 ] && [ $((INGEST_MB % 4)) -eq 0 ] ||
+    die "--ingest-mb takes a multiple of 4 MiB ≥ 4 (got '$INGEST_MB')"
+[ -z "$TARX_REPS" ] || [[ "$TARX_REPS" =~ ^[0-9]+$ ]] || die "--tarx-reps takes an integer (got '$TARX_REPS')"
+[ "${#ENTRIES[@]}" -ge 1 ] || die "no mounts given — see --help (manager=<host>:<mnt> writer=<host>:<mnt> …)"
+
+# --- the node table ---------------------------------------------------------------
+# idx 0 = the manager, 60.. = the joined writers (the fleet rig's JOINER_BASE
+# slice, so a snapshot file reads like the matrix's), 1 = the token reader.
+declare -A HOST=() MNT=() ROLE=()
+WRITERS=()
+READER=""
+next_w=60
+for e in "${ENTRIES[@]}"; do
+    role="${e%%=*}"
+    spec="${e#*=}"
+    host="${spec%%:*}"
+    mnt="${spec#*:}"
+    [ -n "$host" ] && [ -n "$mnt" ] && [ "$mnt" != "$spec" ] || die "malformed entry '$e' (want role=<host>:<mnt>)"
+    [[ "$mnt" = /* ]] || die "entry '$e': the mountpoint must be absolute"
+    case "$role" in
+    manager)
+        [ -z "${HOST[0]:-}" ] || die "two manager entries"
+        HOST[0]="$host" MNT[0]="$mnt" ROLE[0]=manager
+        ;;
+    writer)
+        HOST[$next_w]="$host" MNT[$next_w]="$mnt" ROLE[$next_w]=writer
+        WRITERS+=("$next_w")
+        next_w=$((next_w + 1))
+        ;;
+    reader)
+        [ -z "$READER" ] || die "two reader entries"
+        HOST[1]="$host" MNT[1]="$mnt" ROLE[1]=reader
+        READER=1
+        ;;
+    esac
+done
+[ -n "${HOST[0]:-}" ] || die "no manager= entry"
+[ "${#WRITERS[@]}" -ge 1 ] || die "no writer= entry — the rows need ≥ 1 joined writer (gate 3b needs ≥ 2)"
+
+# --- execution: local or ssh, always root, dry-run prints --------------------------
+SSH_BASE=(-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ServerAliveInterval=15)
+ssh_target() { # host -> [user@]host
+    local h="$1"
+    if [ -n "$SSH_USER" ] && [[ "$h" != *@* ]]; then echo "$SSH_USER@$h"; else echo "$h"; fi
+}
+ssh_cmd() { # -> the ssh argv prefix for interactive-less root exec
+    printf '%s\n' ssh "${SSH_BASE[@]}" "${SSH_EXTRA[@]}"
+    [ -n "$SSH_KEY" ] && printf '%s\n' -i "$SSH_KEY"
+    return 0
+}
+
+# rx <idx> [VAR=val ...] — the root script arrives on stdin (heredoc).
+# Prints the script's stdout. Env values must not contain spaces.
+rx() {
+    local idx="$1"
+    shift
+    local host="${HOST[$idx]}" script
+    script="$(cat)"
+    if $DRY_RUN; then
+        if [ "$host" = local ]; then
+            printf "+ [m%s local] sudo env %s bash -s <<'EOS'\n%s\nEOS\n" "$idx" "$*" "$script" >&2
+        else
+            printf "+ [m%s] ssh %s sudo env %s bash -s <<'EOS'\n%s\nEOS\n" "$idx" "$(ssh_target "$host")" "$*" "$script" >&2
+        fi
+        printf '%s\n' "${RX_CANNED:-}"
+        return 0
+    fi
+    if [ "$host" = local ]; then
+        if [ "$(id -u)" = 0 ]; then
+            env "$@" bash -s <<<"$script"
+        else
+            sudo -n env "$@" bash -s <<<"$script"
+        fi
+    else
+        local -a sshv
+        mapfile -t sshv < <(ssh_cmd)
+        "${sshv[@]}" "$(ssh_target "$host")" "sudo env $* bash -s" <<<"$script"
+    fi
+}
+
+# rx_bg <idx> <outfile> [VAR=val ...] — like rx, detached; the caller waits
+# on the pid ($!) — the row's parallel storms.
+rx_bg() {
+    local idx="$1" out="$2" script
+    shift 2
+    # A backgrounded command's default stdin is /dev/null — the heredoc is
+    # read HERE and handed to the child explicitly.
+    script="$(cat)"
+    if $DRY_RUN; then
+        # the printed command rides the inherited stderr (never a re-opened
+        # /dev/stderr — that truncates a redirected transcript)
+        rx "$idx" "$@" <<<"$script" >/dev/null &
+    else
+        rx "$idx" "$@" <<<"$script" >"$out" 2>"$out.err" &
+    fi
+}
+
+# push_file <idx> <local-file> <remote-path>
+push_file() {
+    local idx="$1" src="$2" dst="$3" host
+    host="${HOST[$idx]}"
+    if $DRY_RUN; then
+        if [ "$host" = local ]; then
+            echo "+ [m$idx local] install -D -m 0644 $src $dst" >&2
+        else
+            echo "+ [m$idx] scp $src $(ssh_target "$host"):/tmp/$(basename "$dst") && sudo install -D -m 0644 /tmp/$(basename "$dst") $dst" >&2
+        fi
+        return 0
+    fi
+    if [ "$host" = local ]; then
+        rx "$idx" SRC="$src" DST="$dst" <<'EOS'
+set -euo pipefail
+install -D -m 0644 "$SRC" "$DST"
+EOS
+    else
+        local -a scpv=(scp "${SSH_BASE[@]}" "${SSH_EXTRA[@]}")
+        [ -n "$SSH_KEY" ] && scpv+=(-i "$SSH_KEY")
+        "${scpv[@]}" "$src" "$(ssh_target "$host"):/tmp/$(basename "$dst")"
+        rx "$idx" SRC="/tmp/$(basename "$dst")" DST="$dst" <<'EOS'
+set -euo pipefail
+install -D -m 0644 "$SRC" "$DST"
+EOS
+    fi
+}
+
+# --- the shared laws --------------------------------------------------------------
+ROWDIR="${ROWDIR:-$REPO/target/sym-rows/$(date +%Y-%m-%d-%H%M%S)}"
+# shellcheck disable=SC2034  # read by the lib's sym_zero_venue_note
+SYM_VENUE_LEDGER="$ROWDIR/venue-attributed.txt"
+# shellcheck source=tests/sym_rows_lib.sh
+. "$REPO/tests/sym_rows_lib.sh"
+$DRY_RUN || mkdir -p "$ROWDIR"
+
+# --- stats: capture, never cp (the aging trap) ------------------------------------
+# snap <idx> <label> — `<rowdir>/m<idx>_p<label>.json` (the lib's file shape)
+snap() {
+    local idx="$1" label="$2" out
+    out="$ROWDIR/m${idx}_p${label}.json"
+    if $DRY_RUN; then
+        RX_CANNED='{"metrics":{}}' rx "$idx" MNT="${MNT[$idx]}" <<'EOS' >/dev/null
+cat "$MNT/.stats"
+EOS
+        return 0
+    fi
+    rx "$idx" MNT="${MNT[$idx]}" <<'EOS' >"$out" || die "cannot snapshot m$idx's stats inode (${HOST[$idx]}:${MNT[$idx]})"
+set -euo pipefail
+cat "$MNT/.stats"
+EOS
+    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$out" 2>/dev/null ||
+        die "m$idx's .stats is not JSON (${HOST[$idx]}:${MNT[$idx]}) — a daemon that cannot answer"
+}
+# live reads (one snapshot to a scratch file, then the lib's readers)
+stat_field() { # idx key
+    local f="$ROWDIR/.live-m$1.json"
+    $DRY_RUN && { echo 0; return 0; }
+    rx "$1" MNT="${MNT[$1]}" <<'EOS' >"$f"
+set -euo pipefail
+cat "$MNT/.stats"
+EOS
+    sym_json_field "$f" "$2"
+}
+stat_sum() { # idx key
+    local f="$ROWDIR/.live-m$1.json"
+    $DRY_RUN && { echo 0; return 0; }
+    rx "$1" MNT="${MNT[$1]}" <<'EOS' >"$f"
+set -euo pipefail
+cat "$MNT/.stats"
+EOS
+    sym_json_sum "$f" "$2"
+}
+stat_all_eq() { # idx key want
+    local f="$ROWDIR/.live-m$1.json"
+    $DRY_RUN && { echo 1; return 0; }
+    rx "$1" MNT="${MNT[$1]}" <<'EOS' >"$f"
+set -euo pipefail
+cat "$MNT/.stats"
+EOS
+    sym_json_all_eq "$f" "$2" "$3"
+}
+stat_first() { # idx key
+    stat_field "$1" "$2" | tr -d '[] ' | cut -d, -f1
+}
+
+# The must-stay-0 set of one LIVE writer (an oracle face).
+sym_zero_set_live() { # label idx
+    local f="$ROWDIR/.live-m$2.json"
+    $DRY_RUN && return 0
+    rx "$2" MNT="${MNT[$2]}" <<'EOS' >"$f"
+set -euo pipefail
+cat "$MNT/.stats"
+EOS
+    sym_zero_set_file "$1" "$2" "$f"
+}
+
+# --- the label -------------------------------------------------------------------
+BENCH_ORDER=0
+declare -A NODE_KERNEL=() NODE_BUILD=()
+node_facts() { # every distinct host: kernel + the mounted daemon's build_commit
+    local idx
+    for idx in 0 "${WRITERS[@]}" ${READER:+1}; do
+        if $DRY_RUN; then
+            NODE_KERNEL[$idx]="(kernel)"
+            NODE_BUILD[$idx]="(build_commit)"
+            continue
+        fi
+        NODE_KERNEL[$idx]="$(rx "$idx" <<'EOS'
+uname -r
+EOS
+)"
+        NODE_BUILD[$idx]="$(stat_field "$idx" build_commit)"
+    done
+}
+RTT_TEXT="n/a"
+measure_rtt() { # the first writer node → the manager's fabric address
+    local w="${WRITERS[0]}"
+    if [ "${HOST[$w]}" = local ] && [ "${HOST[0]}" = local ]; then
+        RTT_TEXT="co-located (one host, no wire RTT)"
+        return 0
+    fi
+    [ -n "$MANAGER_PRIV" ] || { RTT_TEXT="not measured (no --manager-priv)"; return 0; }
+    if $DRY_RUN; then
+        RX_CANNED="rtt min/avg/max/mdev = 0.100/0.120/0.150/0.010 ms" rx "$w" TARGET="$MANAGER_PRIV" <<'EOS' >/dev/null
+ping -c 10 -i 0.2 -q "$TARGET" | tail -1
+EOS
+        RTT_TEXT="(dry-run)"
+        return 0
+    fi
+    RTT_TEXT="$(rx "$w" TARGET="$MANAGER_PRIV" <<'EOS' || echo "ping failed"
+ping -c 10 -i 0.2 -q "$TARGET" 2>/dev/null | tail -1 | sed 's/^rtt //'
+EOS
+)"
+}
+row_stamp() { # row cmd — the caller bumps BENCH_ORDER (a stamp inside a
+    # pipeline runs in a subshell)
+    echo "# row=$1"
+    echo "# order=$BENCH_ORDER"
+    echo "# instrument=${INSTRUMENT:-the matrix's sym legs' instruments (tar -xf the shipped corpus; tests/mdstorm.c T=$THREADS; dd bs=4M conv=fsync; python3 O_CREAT|O_EXCL creators; ls -l)}"
+    echo "# substrate=${SUBSTRATE:-unlabelled (pass --substrate)}"
+    echo "# venue=$SYM_VENUE${CLUSTER:+ cluster=$CLUSTER} — one symmetric writer per node; the cloud row is a THIRD substrate class, never spliced into devsub or squeeze-test medians"
+    echo "# rt=$RT s (the sustained window per measured phase)"
+    echo "# rtt=$RTT_TEXT (writer m${WRITERS[0]} → the manager)"
+    local idx
+    for idx in 0 "${WRITERS[@]}" ${READER:+1}; do
+        echo "# node m$idx=${ROLE[$idx]} host=${HOST[$idx]} mnt=${MNT[$idx]} kernel=${NODE_KERNEL[$idx]:-?} build=${NODE_BUILD[$idx]:-?}"
+    done
+    echo "# ts=$(date -u +%FT%TZ)"
+    echo "# cmd=$2"
+}
+ROWS_FILE="$ROWDIR/rows.txt"
+emit() { # append a labelled line to the rows file + stdout
+    if $DRY_RUN; then echo "$*"; else echo "$*" | tee -a "$ROWS_FILE"; fi
+}
+
+# --- the posture preflight (every node's .stats says what it is) --------------------
+preflight() {
+    log "preflight: the fleet's posture from every node's .stats"
+    local idx v
+    v="$(stat_field 0 mount_posture)"
+    $DRY_RUN || [ "$v" = "writer" ] || die "manager m0 (${HOST[0]}:${MNT[0]}): mount_posture='$v' (want writer)"
+    $DRY_RUN || [ "$(stat_all_eq 0 manager_lease held)" = "1" ] ||
+        die "manager m0: manager_lease != held on every volume (the D0 winner IS the manager, KD-SYM-3)"
+    $DRY_RUN || [ "$(stat_all_eq 0 symmetric_meta 1)" = "1" ] ||
+        die "manager m0: symmetric_meta != 1 on every volume — the plane is not armed"
+    for idx in "${WRITERS[@]}"; do
+        v="$(stat_field "$idx" mount_posture)"
+        $DRY_RUN || [ "$v" = "writer" ] || die "writer m$idx (${HOST[$idx]}:${MNT[$idx]}): mount_posture='$v' (want writer)"
+        v="$(stat_first "$idx" joined_appender_id)"
+        $DRY_RUN || [ "${v:-0}" -ge 1 ] 2>/dev/null || die "writer m$idx: joined_appender_id='$v' (want ≥ 1 — a JOINED writer)"
+        v="$(stat_first "$idx" manager_lease)"
+        $DRY_RUN || [[ "$v" = peer:* ]] || die "writer m$idx: manager_lease='$v' (want peer:…)"
+    done
+    if [ -n "$READER" ]; then
+        v="$(stat_field 1 reader_staleness_bound_ms)"
+        $DRY_RUN || [ "$v" = "0" ] || die "reader m1 (${HOST[1]}:${MNT[1]}): reader_staleness_bound_ms='$v' (want 0 — a TOKEN reader, R-SYM-4)"
+    fi
+    local n=$((1 + ${#WRITERS[@]}))
+    v="$(stat_first 0 appenders_live)"
+    $DRY_RUN || [ "$v" = "$n" ] || die "manager m0: appenders_live=$v (want $n — the manager + ${#WRITERS[@]} joined writers)"
+    log "preflight: manager m0 + ${#WRITERS[@]} joined writer(s)${READER:+ + 1 token reader} — appenders_live=$v"
+}
+
+# --- tools on the nodes ---------------------------------------------------------------
+MDSTORM_BIN="$REMOTE_DIR/mdstorm"
+install_mdstorm() {
+    [ -r "$MDSTORM_SRC" ] || die "mdstorm source missing: $MDSTORM_SRC"
+    local idx
+    for idx in 0 "${WRITERS[@]}"; do
+        push_file "$idx" "$MDSTORM_SRC" "$REMOTE_DIR/mdstorm.c"
+        rx "$idx" SRC="$REMOTE_DIR/mdstorm.c" BIN="$MDSTORM_BIN" <<'EOS' || die "m$idx: cc mdstorm.c failed (gcc missing on the node?)"
+set -euo pipefail
+cc -O2 -pthread -o "$BIN" "$SRC"
+EOS
+    done
+}
+CORPUS_REMOTE="$REMOTE_DIR/corpus.tar"
+CORPUS_ENTRIES=0
+CORPUS_LOCAL=""
+prepare_corpus() {
+    if [ -n "$TARBALL" ]; then
+        CORPUS_LOCAL="$TARBALL"
+    elif [ -n "$TAR_SRC" ]; then
+        [ -d "$TAR_SRC" ] || die "--tar-src '$TAR_SRC' is not a directory"
+        CORPUS_LOCAL="$ROWDIR/corpus.tar"
+        if $DRY_RUN; then
+            echo "+ tar -cf $CORPUS_LOCAL -C $(dirname "$TAR_SRC") $(basename "$TAR_SRC")" >&2
+        else
+            tar -cf "$CORPUS_LOCAL" -C "$(dirname "$TAR_SRC")" "$(basename "$TAR_SRC")"
+        fi
+    else
+        die "sym-tarx needs the corpus: --tar-src=<linux>/fs (design §5.10: the linux fs/ corpus) or --tarball=<file>"
+    fi
+    if $DRY_RUN; then
+        CORPUS_ENTRIES=2468
+    else
+        [ -s "$CORPUS_LOCAL" ] || die "corpus tarball missing/empty: $CORPUS_LOCAL"
+        CORPUS_ENTRIES="$(tar -tf "$CORPUS_LOCAL" | wc -l)"
+    fi
+    local idx
+    for idx in 0 "${WRITERS[0]}"; do
+        push_file "$idx" "$CORPUS_LOCAL" "$CORPUS_REMOTE"
+    done
+    log "corpus: $CORPUS_LOCAL ($CORPUS_ENTRIES entries) shipped to m0 and m${WRITERS[0]}"
+}
+
+# --- the oracle (fsck --json at the manager + drift + the must-stay-0 set) ------------
+sym_oracle() { # label
+    local label="$1" rc=0 findings idx out
+    out="$ROWDIR/fsck-$label.json"
+    if $DRY_RUN; then
+        RX_CANNED='{"findings":[],"findings_elided":0}' rx 0 SQZ="$SQZ_NODE" MNT="${MNT[0]}" <<'EOS' >/dev/null
+timeout 900 "$SQZ" fsck "$MNT" --json
+EOS
+        echo "(dry-run: would judge findings == 0, meta_kv_block_refs_drift == 0 and the must-stay-0 set on every writer)" >&2
+        return 0
+    fi
+    rx 0 SQZ="$SQZ_NODE" MNT="${MNT[0]}" <<'EOS' >"$out" 2>"$out.err" || rc=$?
+timeout 900 "$SQZ" fsck "$MNT" --json
+EOS
+    [ "$rc" != "124" ] || die "$label: online fsck HUNG past 900 s — transcript $out"
+    findings="$(sym_fsck_json_findings "$out")"
+    [ "$rc" = "0" ] && [ "$findings" = "0" ] ||
+        die "$label: online fsck rc=$rc findings=$findings — $out / $out.err"
+    for idx in 0 "${WRITERS[@]}"; do
+        [ "$(stat_sum "$idx" meta_kv_block_refs_drift)" = "0" ] ||
+            die "$label: meta_kv_block_refs_drift != 0 on m$idx (C8 oracle RED)"
+        sym_zero_set_live "$label" "$idx"
+    done
+    log "$label: oracle clean (fsck findings 0, C8 drift 0, the must-stay-0 set flat on every writer)"
+}
+
+# --- the mount hook (a writer node's LEAVE and REJOIN) -----------------------------
+hook() { # mount|unmount idx
+    local verb="$1" idx="$2"
+    [ -n "$MOUNT_HOOK" ] || return 1
+    if $DRY_RUN; then
+        echo "+ $MOUNT_HOOK $verb ${HOST[$idx]} ${MNT[$idx]}" >&2
+        return 0
+    fi
+    # shellcheck disable=SC2086 # the hook is a command WORD LIST by contract
+    $MOUNT_HOOK "$verb" "${HOST[$idx]}" "${MNT[$idx]}" || die "mount hook '$MOUNT_HOOK $verb' failed for m$idx (${HOST[$idx]}:${MNT[$idx]})"
+}
+is_mounted() { # idx -> 0 yes
+    $DRY_RUN && return 0
+    rx "$1" MNT="${MNT[$1]}" <<'EOS'
+mountpoint -q "$MNT"
+EOS
+}
+# Exactly the writers `want...` live (gate 3's "exactly N appenders live"):
+# every other joined writer LEAVES cleanly, a wanted one not up JOINS; the
+# manager's directory must then count N Live pages. Without a hook every
+# writer stays mounted (the row says so) and appenders_live reads the fleet.
+ensure_writers() { # n want_idx...
+    local n="$1" j want t
+    shift
+    if [ -z "$MOUNT_HOOK" ]; then
+        return 0
+    fi
+    for j in "${WRITERS[@]}"; do
+        want=0
+        for w in "$@"; do [ "$w" = "$j" ] && want=1; done
+        if [ "$want" = "1" ]; then
+            is_mounted "$j" || hook mount "$j"
+        else
+            if is_mounted "$j"; then hook unmount "$j"; fi
+        fi
+    done
+    $DRY_RUN && return 0
+    for t in $(seq 1 90); do
+        : "$t"
+        [ "$(stat_all_eq 0 appenders_known "$n")" = "1" ] && return 0
+        sleep 1
+    done
+    die "the manager's appender directory never read $n Live page(s) (appenders_known=$(stat_field 0 appenders_known)) — a writer's leave or join did not land"
+}
+
+# --- diskstats on the storage nodes (the ingest row's amplification columns) -------------
+declare -A STG_HOST=() STG_DEV=()
+STG_IDXS=()
+parse_storage() {
+    [ -n "$STORAGE" ] || return 0
+    local i=200 spec
+    IFS=, read -r -a specs <<<"$STORAGE"
+    for spec in "${specs[@]}"; do
+        STG_HOST[$i]="${spec%%:*}"
+        STG_DEV[$i]="${spec#*:}"
+        HOST[$i]="${STG_HOST[$i]}"
+        MNT[$i]="-"
+        ROLE[$i]=storage
+        STG_IDXS+=("$i")
+        i=$((i + 1))
+    done
+}
+# diskstats_sample <tag> — per storage device: sectors written, write ops
+diskstats_sample() {
+    local tag="$1" i
+    $DRY_RUN && { for i in "${STG_IDXS[@]}"; do RX_CANNED="0 0" rx "$i" DEV="${STG_DEV[$i]}" <<'EOS' >/dev/null
+b="$(basename "$(readlink -f "$DEV")")"
+awk -v d="$b" '$3==d {print $10, $8}' /proc/diskstats
+EOS
+    done; return 0; }
+    for i in "${STG_IDXS[@]}"; do
+        RX_CANNED="0 0" rx "$i" DEV="${STG_DEV[$i]}" <<'EOS' >"$ROWDIR/.diskstats-$tag-$i" 2>/dev/null || echo "0 0" >"$ROWDIR/.diskstats-$tag-$i"
+b="$(basename "$(readlink -f "$DEV")")"
+awk -v d="$b" '$3==d {print $10, $8}' /proc/diskstats
+EOS
+    done
+}
+# amplification <tag0> <tag1> <user_bytes> -> "dev/user=X wareq_sz=Y B"
+amplification() {
+    local t0="$1" t1="$2" user="$3" i sec0 ops0 sec1 ops1 dsec=0 dops=0
+    [ "${#STG_IDXS[@]}" -gt 0 ] || { echo "amp=n/a(no --storage)"; return 0; }
+    for i in "${STG_IDXS[@]}"; do
+        read -r sec0 ops0 <"$ROWDIR/.diskstats-$t0-$i"
+        read -r sec1 ops1 <"$ROWDIR/.diskstats-$t1-$i"
+        dsec=$((dsec + sec1 - sec0))
+        dops=$((dops + ops1 - ops0))
+    done
+    python3 -c "
+dev=$dsec*512; ops=$dops; user=$user
+print(f'dev_bytes={dev} user_bytes={user} dev/user={dev/max(1,user):.3f} wareq_sz={dev/max(1,ops):.0f}B write_ops={ops}')"
+}
+
+# ===================================================================================
+# gate 2 — sym-tarx
+# ===================================================================================
+# One venue arm: extract the corpus into a directory the node creates, as
+# many reps as fit --rt (≥ 1; each into a fresh subdir so every extraction
+# is "into a directory it created"), timed ON THE NODE; snapshots at both
+# ends (the extracting node + the manager) around a settle. Prints
+# `label wall_per_rep reps ops_s`.
+sym_venue_extract() { # idx label
+    local idx="$1" label="$2" reps="${TARX_REPS:-}" out
+    local rt_arg="$RT"
+    [ -n "$reps" ] && rt_arg=0
+    [ -n "$reps" ] || reps=1
+    sleep 2
+    [ "$idx" != "0" ] && snap "$idx" "${label}0"
+    snap 0 "${label}0"
+    out="$(RX_CANNED="2.00 1 $CORPUS_ENTRIES" rx "$idx" MNT="${MNT[$idx]}" TAR="$CORPUS_REMOTE" LABEL="$label" REPS="$reps" RT="$rt_arg" ENTRIES="$CORPUS_ENTRIES" <<'EOS'
+set -euo pipefail
+dest="$MNT/s8a-$LABEL"
+mkdir -p "$dest"
+t0="$(date +%s.%N)"
+n=0
+while :; do
+  d="$dest/r$n"
+  mkdir "$d"
+  tar -xf "$TAR" -C "$d"
+  n=$((n + 1))
+  now="$(date +%s.%N)"
+  el="$(python3 -c "print($now-$t0)")"
+  if [ "$RT" = "0" ]; then [ "$n" -ge "$REPS" ] && break; else python3 -c "import sys; sys.exit(0 if $el >= $RT else 1)" && break; fi
+done
+t1="$(date +%s.%N)"
+python3 -c "
+w=$t1-$t0; n=$n
+print(f'{w/n:.3f} {n} {n*$ENTRIES/w:.0f}')"
+# the venue's blocks back before the next arm (untimed)
+rm -rf "$dest"
+EOS
+)" || die "sym-tarx $label: tar -x FAILED on m$idx (a shipped verb errored — see the daemon logs)"
+    sleep 2
+    [ "$idx" != "0" ] && snap "$idx" "${label}1"
+    snap 0 "${label}1"
+    echo "$label $out"
+}
+
+row_tarx() {
+    local jw="${WRITERS[0]}" label
+    BENCH_ORDER=$((BENCH_ORDER + 1))
+    prepare_corpus
+    log "gate 2 (sym-tarx): corpus $CORPUS_ENTRIES entries; venue = joined writer m$jw (${HOST[$jw]}) extracting into a directory IT created over the REAL fabric (rtt $RTT_TEXT), vs the manager-local S0 (m0, ${HOST[0]}); A-B-B-A; ≥ $RT s per arm"
+    local -a rows=()
+    sym_arm() { # label -> row line
+        local label="$1" out wire xv ship pub verbs_per h_j h_m rpcs
+        out="$(sym_venue_extract "$jw" "$label")"
+        if $DRY_RUN; then echo "$out (dry-run: would judge verbs/entry < 0.05, handovers 0, rpcs 0)"; return 0; fi
+        wire="$(sym_delta "$ROWDIR" "$jw" "$label" joined_wire_verbs)"
+        xv="$(sym_delta "$ROWDIR" "$jw" "$label" xv_cross_owner_steps_shipped)"
+        ship="$(sym_delta "$ROWDIR" "$jw" "$label" meta_ship.shipped_verbs)"
+        pub="$(sym_delta "$ROWDIR" "$jw" "$label" meta_ship_publish.shipped)"
+        h_j="$(sym_delta "$ROWDIR" "$jw" "$label" slot_handovers)"
+        h_m="$(sym_delta "$ROWDIR" 0 "$label" slot_handovers)"
+        rpcs="$(stat_field "$jw" dlm_rpcs)"
+        # the per-rep verb counts (the law is per entry over every rep's entries)
+        local reps entries_total
+        reps="$(echo "$out" | awk '{print $3}')"
+        entries_total=$((CORPUS_ENTRIES * reps))
+        verbs_per="$(sym_law_gate2_engagement "$label" "$entries_total" "$wire" "$xv" "$ship" "$pub" "$h_j" "$h_m" "$rpcs")"
+        echo "$out wire=$wire xv=$xv ship=$ship pub=$pub verbs/entry=$verbs_per handovers=0"
+    }
+    local_arm() { # label -> row line (the S0 shape)
+        local label="$1" out
+        out="$(sym_venue_extract 0 "$label")"
+        echo "$out local-S0"
+    }
+    rows+=("$(sym_arm sym-1)")
+    rows+=("$(local_arm local-1)")
+    rows+=("$(local_arm local-2)")
+    rows+=("$(sym_arm sym-2)")
+    {
+        row_stamp "sym-tarx" "tar -xf $CORPUS_REMOTE (entries=$CORPUS_ENTRIES) ×reps; A-B-B-A sym-1 local-1 local-2 sym-2"
+        echo "== gate 2: tar -x on a JOINED WRITER node (m$jw) over the real fabric vs manager-local S0 (m0) — entries=$CORPUS_ENTRIES per rep, ≥ $RT s per arm =="
+        printf '%-10s %-10s %-5s %-8s %s\n' ARM WALL/REP_S REPS OPS_S ENGAGEMENT
+        local r
+        for r in "${rows[@]}"; do
+            # shellcheck disable=SC2086 # deliberate word split of the row line
+            printf '%-10s %-10s %-5s %-8s %s\n' $r
+        done
+    } | tee -a "$([ "$DRY_RUN" = true ] && echo /dev/null || echo "$ROWS_FILE")"
+    $DRY_RUN && { echo "(dry-run: would print the gate-2 verdict)"; return 0; }
+    local s1 s2 l1 l2
+    s1="$(echo "${rows[0]}" | awk '{print $2}')"
+    l1="$(echo "${rows[1]}" | awk '{print $2}')"
+    l2="$(echo "${rows[2]}" | awk '{print $2}')"
+    s2="$(echo "${rows[3]}" | awk '{print $2}')"
+    sym_law_gate2_verdict "$s1" "$s2" "$l1" "$l2" | tee "$ROWDIR/symtarx-verdict.txt" | tee -a "$ROWS_FILE"
+    sym_oracle sym-tarx
+    log "sym-tarx PUBLISHED (rows + verdict + snapshots in $ROWDIR)"
+}
+
+# ===================================================================================
+# gate 3 — sym-scale
+# ===================================================================================
+row_scale() {
+    local -a ns
+    IFS=',' read -r -a ns <<<"$SCALE_NS"
+    local maxn=$((1 + ${#WRITERS[@]})) n
+    local -a ns_ok=()
+    for n in "${ns[@]}"; do
+        if [ "$n" -le "$maxn" ]; then ns_ok+=("$n"); else warn "sym-scale: N=$n exceeds the writers present ($maxn) — skipped"; fi
+    done
+    [ "${#ns_ok[@]}" -ge 1 ] || die "sym-scale: no N in '$SCALE_NS' fits the ${#WRITERS[@]} writer(s) given"
+    install_mdstorm
+    BENCH_ORDER=$((BENCH_ORDER + 1))
+    log "gate 3 (sym-scale): N ∈ {${ns_ok[*]}} writer NODES each creating $FILES files ($THREADS threads) in its OWN directory, then ingesting $INGEST_MB MiB (4 MiB blocks, conv=fsync); exactly N appenders live per row${MOUNT_HOOK:+ (the idle writers LEAVE — mount hook)}"
+    [ -n "$MOUNT_HOOK" ] || warn "sym-scale: no --mount-hook — the idle writers stay MOUNTED (appenders_live reads the whole fleet; the deleted-stays-deleted-across-the-leave arm is skipped)"
+    local SYM_RUN rate1="" ingest1="" verdict_all=MET zero_miss_all="" removed="$ROWDIR/removed-sample.txt"
+    SYM_RUN="$(date +%s)"
+    local table="$ROWDIR/symscale-table.tsv"
+    $DRY_RUN && table=/dev/null
+    : >"$table"
+    {
+        row_stamp "sym-scale" "mdstorm T=$THREADS F=$FILES create per writer node; dd bs=4M count=$((INGEST_MB / 4)) conv=fsync per writer node; N ∈ {${ns_ok[*]}}"
+        sym_gate3_header
+    } | tee -a "$table" | tee -a "$([ "$DRY_RUN" = true ] && echo /dev/null || echo "$ROWS_FILE")"
+    for n in "${ns_ok[@]}"; do
+        local -a writers=(0)
+        local i idx
+        for ((i = 0; i < n - 1; i++)); do writers+=("${WRITERS[$i]}"); done
+        ensure_writers "$n" "${writers[@]:1}"
+        sleep 2
+        for idx in "${writers[@]}"; do snap "$idx" "n${n}0"; done
+        local live
+        live="$(stat_first 0 appenders_live)"
+        if [ -n "$MOUNT_HOOK" ]; then
+            $DRY_RUN || [ "$live" = "$n" ] || die "sym-scale N=$n: appenders_live=$live at the manager (want exactly $n)"
+        fi
+        # The create row: every writer node's storm at once, one directory each.
+        local -a pids=()
+        local t0 t1 t_row0
+        t0="$(date +%s.%N)"
+        t_row0="$t0"
+        for idx in "${writers[@]}"; do
+            rx_bg "$idx" "$ROWDIR/create-n$n-w$idx.txt" MNT="${MNT[$idx]}" DIR="scale-$SYM_RUN-n$n-w$idx" STORM="$MDSTORM_BIN" T="$THREADS" F="$FILES" <<'EOS'
+set -euo pipefail
+mkdir -p "$MNT/$DIR"
+"$STORM" "$MNT/$DIR" "$T" "$F" create
+EOS
+            pids+=($!)
+        done
+        local p rc=0
+        for p in "${pids[@]}"; do wait "$p" || rc=1; done
+        t1="$(date +%s.%N)"
+        [ "$rc" = "0" ] || die "sym-scale N=$n: a create storm FAILED (see $ROWDIR/create-n$n-w*.txt{,.err})"
+        local create_rate create_wall
+        create_wall="$(python3 -c "print(f'{$t1-$t0:.1f}')")"
+        create_rate="$(python3 -c "print(f'{$n*$FILES/($t1-$t0):.0f}')")"
+        # the create phase's own daemon-CPU face (a snapshot between the phases)
+        for idx in "${writers[@]}"; do snap "$idx" "n${n}c"; done
+        local create_cpu_ns=0 v_cpu creates_per_cpu_s
+        if ! $DRY_RUN; then
+            for idx in "${writers[@]}"; do
+                v_cpu="$(python3 -c "
+import json
+a=json.load(open('$ROWDIR/m${idx}_pn${n}0.json'))['metrics']['daemon_cpu_ns']
+b=json.load(open('$ROWDIR/m${idx}_pn${n}c.json'))['metrics']['daemon_cpu_ns']
+print(int(b)-int(a))" 2>/dev/null || echo 0)"
+                create_cpu_ns=$((create_cpu_ns + v_cpu))
+            done
+        fi
+        creates_per_cpu_s="$(python3 -c "print(f'{$n*$FILES*1e9/max(1,$create_cpu_ns):.0f}')")"
+        # The ingest row: 4 MiB blocks, conv=fsync, one file per writer node;
+        # diskstats on the DATA namespaces around it (the amplification columns).
+        diskstats_sample "n${n}i0"
+        pids=()
+        t0="$(date +%s.%N)"
+        for idx in "${writers[@]}"; do
+            rx_bg "$idx" "$ROWDIR/ingest-n$n-w$idx.txt" MNT="${MNT[$idx]}" DIR="scale-$SYM_RUN-n$n-w$idx" COUNT="$((INGEST_MB / 4))" <<'EOS'
+set -euo pipefail
+dd if=/dev/zero of="$MNT/$DIR/ingest.bin" bs=4M count="$COUNT" conv=fsync status=none
+EOS
+            pids+=($!)
+        done
+        for p in "${pids[@]}"; do wait "$p" || rc=1; done
+        t1="$(date +%s.%N)"
+        [ "$rc" = "0" ] || die "sym-scale N=$n: an ingest dd FAILED (see $ROWDIR/ingest-n$n-w*.txt.err)"
+        diskstats_sample "n${n}i1"
+        local ingest_rate ingest_wall amp
+        ingest_wall="$(python3 -c "print(f'{$t1-$t0:.1f}')")"
+        ingest_rate="$(python3 -c "print(f'{$n*$INGEST_MB/($t1-$t0):.0f}')")"
+        amp="n/a"
+    $DRY_RUN || amp="$(amplification "n${n}i0" "n${n}i1" $((n * INGEST_MB * 1024 * 1024)))"
+        sleep 2
+        for idx in "${writers[@]}"; do snap "$idx" "n${n}1"; done
+        if $DRY_RUN; then
+            echo "(dry-run: N=$n — would judge handovers 0, ships ≤ $n, rpcs 0, the must-stay-0 deltas, ≥ 0.7 × N × the N=1 rate; then rm -rf the row's directories)"
+            continue
+        fi
+        # THE ENGAGEMENT LAW (§8 gate 3) — the lib's.
+        local handovers=0 ships=0 rpcs=0 v zero_miss=""
+        for idx in "${writers[@]}"; do
+            v="$(sym_delta "$ROWDIR" "$idx" "n$n" slot_handovers)"
+            handovers=$((handovers + v))
+            v="$(sym_delta "$ROWDIR" "$idx" "n$n" slot_ships)"
+            ships=$((ships + v))
+            v="$(stat_field "$idx" dlm_rpcs)"
+            rpcs=$((rpcs + v))
+            v="$(sym_zero_violations_delta "$ROWDIR" "$idx" "n$n")"
+            [ -z "$v" ] || zero_miss="$zero_miss m$idx:{$v}"
+        done
+        sym_law_gate3_engagement "$n" "$handovers" "$ships" "$rpcs"
+        local mgr_load mgr_cpu
+        mgr_load="$(sym_json_first "$ROWDIR/m0_pn${n}1.json" manager_load_pct)"
+        mgr_cpu="$(python3 -c "
+import json
+a=json.load(open('$ROWDIR/m0_pn${n}0.json'))['metrics']['daemon_cpu_ns']
+b=json.load(open('$ROWDIR/m0_pn${n}1.json'))['metrics']['daemon_cpu_ns']
+print(f'{100*(int(b)-int(a))/1e9/max(1e-9, $t1-$t_row0):.0f}')" 2>/dev/null || echo 0)"
+        [ -n "$rate1" ] || rate1="$create_rate"
+        [ -n "$ingest1" ] || ingest1="$ingest_rate"
+        local cr ir verdict
+        cr="$(python3 -c "print(f'{$create_rate/$rate1:.2f}')")"
+        ir="$(python3 -c "print(f'{$ingest_rate/$ingest1:.2f}')")"
+        verdict="$(sym_law_gate3_row "$n" "$create_rate" "$rate1" "$ingest_rate" "$ingest1")"
+        if [ -n "$zero_miss" ]; then
+            verdict="MISS(must-stay-0:$zero_miss)"
+            zero_miss_all="$zero_miss_all N=$n:$zero_miss"
+        fi
+        [ "$verdict" = "MET" ] || verdict_all=MISS
+        sym_gate3_row_line "$n" "$create_rate" "$cr" "$creates_per_cpu_s" "$ingest_rate" "$ir" "$mgr_load" "$mgr_cpu" "$handovers" "$ships" "$rpcs" "$verdict" | tee -a "$table" | tee -a "$ROWS_FILE"
+        emit "   N=$n walls: create ${create_wall}s ingest ${ingest_wall}s (RT $RT s); appenders_live=$live; ingest amplification: $amp"
+        [ "$(python3 -c "print(1 if min($create_wall,$ingest_wall) >= $RT else 0)")" = "1" ] ||
+            warn "sym-scale N=$n: a measured phase ran shorter than RT=$RT s (create $create_wall s, ingest $ingest_wall s) — size --files/--ingest-mb up for the counted row (the sustained-state rule)"
+        for idx in "${writers[@]}"; do
+            # The LAST names the storm created (`ls -U` = readdir order = the
+            # order `rm -rf` unlinks in) — the deleted-stays-deleted sample.
+            rx "$idx" MNT="${MNT[$idx]}" DIR="scale-$SYM_RUN-n$n-w$idx" <<'EOS' >>"$([ "$DRY_RUN" = true ] && echo /dev/null || echo "$removed")" || true
+ls -U "$MNT/$DIR" 2>/dev/null | tail -200 | sed "s|^|/$DIR/|"
+rm -rf "$MNT/$DIR" 2>/dev/null || true
+EOS
+        done
+    done
+    $DRY_RUN && return 0
+    sym_law_gate3_verdict_line "$verdict_all" | tee "$ROWDIR/symscale-verdict.txt" | tee -a "$ROWS_FILE"
+    [ -z "$zero_miss_all" ] || die "sym-scale: a must-stay-0 gauge moved:$zero_miss_all (rows above; the row set is RED)"
+    # DELETED STAYS DELETED across every writer's CLEAN LEAVE: every joined
+    # writer unmounts (the leave's flush-then-transfer of every slot), the
+    # removed sample is judged through the MANAGER, then through a
+    # REMOUNTED writer (a fresh open of the durable state). ONE classifier
+    # for every arm (the lib's `sym_stat_deleted_classify`): only ENOENT is
+    # "deleted"; an EIO/EAGAIN is a daemon that cannot answer.
+    stat_removed_via() { # idx rel -> the classifier's word
+        local out rc=0
+        # the remote `timeout`'s exit (124 = hung) rides the ssh exit code
+        # verbatim; stderr (the ENOENT text) comes home as $out
+        out="$(rx "$1" P="${MNT[$1]}$2" <<'EOS' 2>&1 >/dev/null
+timeout 30 stat "$P" >/dev/null
+EOS
+)" || rc=$?
+        sym_stat_deleted_classify "$rc" "$out"
+    }
+    judge_removed() { # idx what -> resurrected count (dies on hung/error)
+        local idx="$1" what="$2" resurrected=0 verdict rel
+        while IFS= read -r rel; do
+            [ -n "$rel" ] || continue
+            verdict="$(stat_removed_via "$idx" "$rel")"
+            case "$verdict" in
+            deleted) ;;
+            resurrected)
+                resurrected=$((resurrected + 1))
+                echo "RESURRECTED at $what: $rel" >>"$ROWDIR/resurrected.txt"
+                ;;
+            hung) die "sym-scale: stat of removed $rel through $what HUNG past 30 s (a parked lookup)" ;;
+            error:*) die "sym-scale: stat of removed $rel through $what failed with something other than ENOENT: ${verdict#error:}" ;;
+            esac
+        done <"$removed"
+        echo "$resurrected"
+    }
+    if [ -s "$removed" ]; then
+        local total resurrected resurrected_j=0 j
+        total="$(wc -l <"$removed" | tr -d ' ')"
+        if [ -n "$MOUNT_HOOK" ]; then
+            for j in "${WRITERS[@]}"; do
+                if is_mounted "$j"; then hook unmount "$j"; fi
+            done
+            resurrected="$(judge_removed 0 "the manager after every writer's clean leave")"
+            emit "deleted-stays-deleted (manager, after every writer's clean leave): $resurrected of $total sampled removed names resolve"
+            hook mount "${WRITERS[0]}"
+            resurrected_j="$(judge_removed "${WRITERS[0]}" "remounted writer m${WRITERS[0]}")"
+            emit "deleted-stays-deleted (remounted writer m${WRITERS[0]}): $resurrected_j of $total"
+        else
+            resurrected="$(judge_removed 0 "the manager (writers still mounted — no hook)")"
+            emit "deleted-stays-deleted (manager; the writers stayed mounted — no --mount-hook): $resurrected of $total sampled removed names resolve"
+        fi
+        [ "$resurrected" = "0" ] && [ "$resurrected_j" = "0" ] ||
+            die "sym-scale: DELETED DID NOT STAY DELETED — $resurrected (manager) / $resurrected_j (remounted writer) of $total sampled removed names resolve (see $ROWDIR/resurrected.txt)"
+    fi
+    # Every writer back up for the rows that follow.
+    ensure_writers "$((1 + ${#WRITERS[@]}))" "${WRITERS[@]}"
+    sym_oracle sym-scale
+    log "sym-scale PUBLISHED (table + verdict + snapshots in $ROWDIR)"
+}
+
+# ===================================================================================
+# gate 3b — sym-shared-dir (+ -ls)
+# ===================================================================================
+row_shared() {
+    [ "${#WRITERS[@]}" -ge 2 ] ||
+        die "sym-shared-dir needs ≥ 2 joined writers (the flip triggers on foreign creates from MORE THAN ONE creator)"
+    local holder="${WRITERS[0]}" shared_rel per_writer idx
+    BENCH_ORDER=$((BENCH_ORDER + 1))
+    shared_rel="/shared-$(date +%s)"
+    local -a writers=(0 "${WRITERS[@]}")
+    per_writer=$((FILES / ${#writers[@]}))
+    rx "$holder" P="${MNT[$holder]}$shared_rel" <<'EOS' || die "sym-shared-dir: the holder's mkdir failed"
+set -euo pipefail
+mkdir "$P"
+EOS
+    local k_stripes
+    k_stripes="$(stat_first 0 slot_rotor)"
+    log "gate 3b (sym-shared-dir): ${#writers[@]} creator NODES × $per_writer files into ONE directory held by m$holder (${HOST[$holder]}); the flip to K stripes (K derives from MINT_SPREAD = $k_stripes) on the holder's observed creator count"
+    for idx in "${writers[@]}"; do snap "$idx" "sd0"; done
+    local -a pids=()
+    local t0 t1
+    t0="$(date +%s.%N)"
+    for idx in "${writers[@]}"; do
+        rx_bg "$idx" "$ROWDIR/shared-w$idx.count" D="${MNT[$idx]}$shared_rel" PFX="w$idx" N="$per_writer" <<'EOS'
+python3 - "$D" "$PFX" "$N" <<'PYEOF'
+import os, sys
+d, pfx, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+ok = 0
+for i in range(n):
+    try:
+        fd = os.open(f"{d}/{pfx}-{i:07d}", os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o644)
+        os.close(fd)
+        ok += 1
+    except OSError as e:
+        sys.stderr.write(f"create {pfx}-{i}: {e}\n")
+        break
+print(ok)
+PYEOF
+EOS
+        pids+=($!)
+    done
+    local p rc=0
+    for p in "${pids[@]}"; do wait "$p" || rc=1; done
+    t1="$(date +%s.%N)"
+    [ "$rc" = "0" ] || die "sym-shared-dir: a creator FAILED (see $ROWDIR/shared-w*.count.err)"
+    sleep 3
+    for idx in "${writers[@]}"; do snap "$idx" "sd1"; done
+    if $DRY_RUN; then
+        echo "(dry-run: would judge flips == 1 at the holder, striped, stripe ships > 0, shipped ≡ served, handovers 0; then the -ls half; then rm -rf)"
+        return 0
+    fi
+    local created=0 c wall
+    for idx in "${writers[@]}"; do
+        c="$(tr -d '[:space:]' <"$ROWDIR/shared-w$idx.count")"
+        [ "$c" = "$per_writer" ] || die "sym-shared-dir: m$idx created $c of $per_writer (see $ROWDIR/shared-w$idx.count.err)"
+        created=$((created + c))
+    done
+    wall="$(python3 -c "print(f'{$t1-$t0:.2f}')")"
+    local listed
+    listed="$(rx "$holder" P="${MNT[$holder]}$shared_rel" <<'EOS'
+ls -f "$P" | grep -c '^w' || true
+EOS
+)"
+    [ "$listed" = "$created" ] ||
+        die "sym-shared-dir: the directory lists $listed names but $created creates were acked (the striped readdir merge or a lost dentry)"
+    local flips=0 flip_at="" striped shipped=0 served=0 stripe_ships=0 handovers=0 v
+    for idx in "${writers[@]}"; do
+        v="$(sym_delta "$ROWDIR" "$idx" sd dir_stripe_flips)"
+        [ "$v" = "0" ] || flip_at="${flip_at}m$idx($v) "
+        flips=$((flips + v))
+        v="$(sym_delta "$ROWDIR" "$idx" sd xv_cross_owner_steps_shipped)"
+        shipped=$((shipped + v))
+        v="$(sym_delta "$ROWDIR" "$idx" sd xv_cross_owner_steps_served)"
+        served=$((served + v))
+        v="$(sym_delta "$ROWDIR" "$idx" sd dir_stripe_ships)"
+        stripe_ships=$((stripe_ships + v))
+        v="$(sym_delta "$ROWDIR" "$idx" sd slot_handovers)"
+        handovers=$((handovers + v))
+        sym_zero_set_file sym-shared-dir "$idx" "$ROWDIR/m${idx}_psd1.json"
+    done
+    striped="$(sym_json_sum "$ROWDIR/m${holder}_psd1.json" dir_striped_dirs)"
+    local xattr_k
+    xattr_k="$(rx "$holder" P="${MNT[$holder]}$shared_rel" <<'EOS'
+getfattr -n user.squeezefs.stripes --only-values "$P" 2>/dev/null || echo 0
+EOS
+)"
+    {
+        row_stamp "sym-shared-dir" "python3 O_CREAT|O_EXCL creators: ${#writers[@]} nodes × $per_writer into ONE directory held by m$holder"
+        echo "== gate 3b: ${#writers[@]} creator nodes × $per_writer into ONE directory (holder m$holder): wall $wall s, $(python3 -c "print(f'{$created/($t1-$t0):.0f}')") creates/s aggregate (RT $RT s) =="
+        echo "   flips=$flips at [$flip_at] striped_dirs(holder)=$striped K=$xattr_k xv_shipped=$shipped xv_served=$served dir_stripe_ships=$stripe_ships handovers=$handovers"
+    } | tee -a "$ROWS_FILE"
+    sym_law_gate3b_engagement "$holder" "$flips" "$flip_at" "$striped" "$stripe_ships" "$shipped" "$served" "$handovers"
+    [ "$(python3 -c "print(1 if $wall >= $RT else 0)")" = "1" ] ||
+        warn "sym-shared-dir: the create phase ran $wall s < RT=$RT s — size --files up for the counted row (the sustained-state rule)"
+    log "sym-shared-dir: flip at the holder, $stripe_ships stripe ships, closure shipped ≡ served ($shipped), 0 handovers"
+
+    # --- sym-shared-dir-ls: a COLD token reader's `readdir + stat` ------------
+    if [ -z "$READER" ]; then
+        warn "sym-shared-dir-ls SKIPPED: no reader= entry (the cold readdir + stat row is K stripe tokens + C inode tokens, 0 leaf reads — mount a -o ro TOKEN reader and pass reader=<host>:<mnt>)"
+    else
+        rx 1 <<'EOS' || true
+sync
+echo 3 >/proc/sys/vm/drop_caches 2>/dev/null || true
+EOS
+        snap 1 "ls0"
+        local statted
+        t0="$(date +%s.%N)"
+        statted="$(rx 1 P="${MNT[1]}$shared_rel" <<'EOS'
+ls -l "$P" | grep -c '^-' || true
+EOS
+)"
+        t1="$(date +%s.%N)"
+        snap 1 "ls1"
+        [ "$statted" = "$created" ] || die "sym-shared-dir-ls: the reader statted $statted of $created children"
+        local grants merges misses hits dropped epochs
+        grants="$(sym_delta "$ROWDIR" 1 ls dlm_token_grants)"
+        merges="$(sym_delta "$ROWDIR" 1 ls dir_stripe_readdir_merges)"
+        misses="$(sym_delta "$ROWDIR" 1 ls meta_kv_node_cache_misses)"
+        hits="$(sym_delta "$ROWDIR" 1 ls dlm_token_hits)"
+        dropped="$(sym_delta "$ROWDIR" 1 ls meta_kv_revalidate_nodes_dropped)"
+        epochs="$(sym_delta "$ROWDIR" 1 ls meta_kv_revalidate_epochs)"
+        emit "== sym-shared-dir-ls: cold readdir + stat of $created children over K=$xattr_k stripes on token reader m1 (${HOST[1]}): $(python3 -c "print(f'{$t1-$t0:.2f}')") s; dlm_token_grants=$grants (law: K + C = $((xattr_k + created)), + the directory itself and its parent) readdir_merges=$merges node_cache_misses=$misses token_hits=$hits =="
+        sym_law_gate3b_ls "$grants" "$xattr_k" "$created" "$misses" "$dropped" "$epochs" "$merges"
+        sym_zero_reader_file sym-shared-dir-ls 1 "$ROWDIR/m1_pls1.json"
+        log "sym-shared-dir-ls: $grants tokens for K=$xattr_k + C=$created, 0 data-leaf reads for the listing ($misses misses = the poll's $dropped dropped images over $epochs epoch steps + ≤ K tree-0 lessee reads)"
+    fi
+    rx "$holder" P="${MNT[$holder]}$shared_rel" <<'EOS' || true
+rm -rf "$P" 2>/dev/null || true
+EOS
+    sym_oracle sym-shared-dir
+    log "sym-shared-dir PUBLISHED (rows + snapshots in $ROWDIR)"
+}
+
+# ===================================================================================
+# main
+# ===================================================================================
+log "venue=$SYM_VENUE rows=$ROWS rt=${RT}s rowdir=$ROWDIR"
+# Shape preconditions BEFORE any row runs (a billing cluster must not learn
+# them two row sets in): gate 3b's flip triggers on foreign creates from
+# MORE THAN ONE creator — the holder is a joined writer, so it needs a
+# second joined writer beside the manager (≥ 3 writer nodes).
+if [[ ",$ROWS," == *,shared,* ]] && [ "${#WRITERS[@]}" -lt 2 ]; then
+    die "sym-shared-dir needs ≥ 2 joined writers (${#WRITERS[@]} given): the flip triggers on foreign creates from MORE THAN ONE creator and the holder is a joined writer — run ≥ 3 writer nodes (N_CLIENT ≥ 3), or drop 'shared' from --rows"
+fi
+parse_storage
+node_facts
+measure_rtt
+preflight
+$DRY_RUN || : >"$ROWS_FILE"
+{
+    echo "cluster=${CLUSTER:-} venue=$SYM_VENUE substrate=${SUBSTRATE:-}"
+    echo "rows=$ROWS rt=$RT files=$FILES threads=$THREADS ingest_mb=$INGEST_MB scale_ns=$SCALE_NS"
+    echo "manager m0=${HOST[0]}:${MNT[0]}"
+    for idx in "${WRITERS[@]}"; do echo "writer m$idx=${HOST[$idx]}:${MNT[$idx]}"; done
+    [ -n "$READER" ] && echo "reader m1=${HOST[1]}:${MNT[1]}"
+    echo "storage=${STORAGE:-none} rtt=$RTT_TEXT mount_hook=${MOUNT_HOOK:-none}"
+    echo "repo_commit=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "ts=$(date -u +%FT%TZ)"
+} >"$([ "$DRY_RUN" = true ] && echo /dev/null || echo "$ROWDIR/manifest.txt")"
+for r in ${ROWS//,/ }; do
+    case "$r" in
+    tarx) row_tarx ;;
+    scale) row_scale ;;
+    shared) row_shared ;;
+    *) die "unknown row set '$r' (tarx|scale|shared)" ;;
+    esac
+done
+if $DRY_RUN; then
+    log "dry-run complete: every command printed, nothing executed"
+else
+    log "ALL ROW SETS PUBLISHED — $ROWS_FILE (labels, tables, verdicts); snapshots + fsck transcripts in $ROWDIR"
+fi

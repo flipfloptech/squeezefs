@@ -32,6 +32,8 @@
 #   i3en    i3en.12xlarge   x6 (288 vCPU)      4 x 7,500 GB NVMe          ~$10-14/hr (the throughput venue)
 #   mw      i4i.2xlarge     x4 (32 vCPU)       1 x 1,875 GB Nitro NVMe    ~$0.5-0.8/hr (the MW MPI-IO venue;
 #                                                                          campaign ~2-3 h => ~$1.5-3 total)
+#   mw+SYMMETRIC=1 N_CLIENT=n: x(3+n) i4i.2xlarge, ~$0.686/hr on-demand per node —
+#           S1 (n=3)  x6  ~$4.1/hr on-demand   S2 (n=8)  x11  ~$7.5/hr on-demand   (n=2: x5 ~$3.4/hr, gates 2 + 3 only)
 #
 # NO burst-class (t2/t3/t3a/t4g) instances, ever: CPU-credit throttling makes
 # a median a function of the credit balance (not the code under test), their
@@ -63,6 +65,26 @@
 #   PRESET=mw tests/cloud_bench_cluster.sh assemble-mw
 #   PRESET=mw tests/cloud_bench_cluster.sh bench-mw     # rows -> .benchmarks/cloud/<ts>/
 #   tests/cloud_bench_cluster.sh teardown
+#
+# The SYMMETRIC fleet shape (design-symmetric-metadata §8 gates 2 / 3 / 3b
+# on REAL nodes — PR 15, the program's only multi-node venue): PRESET=mw
+# SYMMETRIC=1 (or --symmetric) makes N_CLIENT the WRITER NODE COUNT — one
+# symmetric writer per client node (the MANAGER on client0 = the D0 winner,
+# a JOINED writer on every other client node through the join ladder), the
+# storage nodes as today. Pass PRESET=mw SYMMETRIC=1 N_CLIENT=<n> on EVERY
+# subcommand:
+#
+#   MAX_CLUSTER_HOURS=3 PRESET=mw SYMMETRIC=1 N_CLIENT=2 tests/cloud_bench_cluster.sh launch
+#   PRESET=mw SYMMETRIC=1 N_CLIENT=2 tests/cloud_bench_cluster.sh deploy
+#   PRESET=mw SYMMETRIC=1 N_CLIENT=2 tests/cloud_bench_cluster.sh assemble-sym
+#   PRESET=mw SYMMETRIC=1 N_CLIENT=2 tests/cloud_bench_cluster.sh bench-sym  # rows -> .benchmarks/cloud/<ts>/sym-rows/
+#   tests/cloud_bench_cluster.sh teardown
+#
+#   shape S1 = N_CLIENT=3 (6 x i4i.2xlarge: gates 2 + 3b + gate 3 at N <= 3;
+#              gate 3b needs >= 2 JOINED writers beside the manager, so
+#              N_CLIENT=2 — 5 nodes — runs gates 2 + 3 only: SYM_ROWS=tarx,scale)
+#   shape S2 = N_CLIENT=8 (11 x i4i.2xlarge: gate 3's full N = 1/2/4/8 ladder)
+#   SYM_TAR_SRC=<linux>/fs is the gate-2 corpus (the box used linux-7.2.3/fs).
 #
 # Every subcommand takes --dry-run (prints the aws/ssh commands, executes
 # nothing, needs no credentials). `launch`/`full` refuse to run without the
@@ -191,6 +213,46 @@ MW_MOUNT_EXTRA="--allow-other"             # NO --interception on MW mounts
                                            # the kernel FUSE path); per-mount
                                            # --log-file is appended per daemon
 
+# --- Symmetric fleet shape (PRESET=mw SYMMETRIC=1: assemble-sym / bench-sym) -
+# ONE symmetric writer PER CLIENT NODE (design-symmetric-metadata §7.3 — the
+# join ladder; PR 12b's N-daemon posture made multi-node): client0 mounts
+# first and wins the D0 ladder (the MANAGER); client1..N-1 join it over the
+# wire as full writers (their own ring, page, slot leases, checkpoint task).
+# Every node is its OWN registrant (the REMOTE posture, `joined_registrant_
+# posture = registrant`): the node's nvme-cli host identity
+# (/etc/nvme/hostnqn + hostid) is the registrant — assemble-sym asserts the
+# identities DISTINCT across the client nodes and regenerates a duplicate (a
+# baked AMI clones the file onto every node). No SQUEEZEFS_FLEET_SHARE (one
+# daemon per node owns its machine — the point of the venue).
+SYMMETRIC="${SYMMETRIC:-0}"
+SYM_PORT="${SYM_PORT:-45999}"              # every writer's listener: <node private ip>:SYM_PORT
+                                           # — an EXPLICIT bind (advertised verbatim); a
+                                           # STABLE port for the same reason MW_PORT is
+SYM_MEMBERSHIP_BIND="${SYM_MEMBERSHIP_BIND:-auto}"  # the manager's S6 shard (the joiners are
+                                                    # its members — rung 3 of their ladder)
+SYM_TOKEN_READER="${SYM_TOKEN_READER:-1}"  # 1 = also mount a `--read-only` TOKEN reader at
+                                           # $MOUNTPOINT-ro on client0 (the -ls half of gate
+                                           # 3b: K + C tokens, 0 leaf reads); 0 = skip it
+SYM_TAR_SRC="${SYM_TAR_SRC:-}"             # the gate-2 corpus DIRECTORY (<linux>/fs) — the
+                                           # box used linux-7.2.3/fs (2,468 entries); one
+                                           # tarball is shipped to the two extracting nodes
+SYM_TARBALL="${SYM_TARBALL:-}"             # …or a pre-made tarball (wins over SYM_TAR_SRC)
+SYM_RT="${SYM_RT:-60}"                     # the sustained window per measured phase
+                                           # (the AGENTS.md rule; the local scoping pass
+                                           # runs 10)
+SYM_FILES="${SYM_FILES:-40000}"            # per-writer creates (the matrix's default)
+SYM_THREADS="${SYM_THREADS:-4}"            # storm threads per writer node
+SYM_INGEST_MB="${SYM_INGEST_MB:-1024}"     # per-writer ingest MiB (4 MiB blocks, fsync)
+SYM_SCALE_NS="${SYM_SCALE_NS:-}"           # gate 3's N ladder; EMPTY = 1,2,4,8 capped at N_CLIENT
+SYM_ROWS="${SYM_ROWS:-tarx,scale,shared}"  # the row sets bench-sym runs
+SYM_ARM_A="${SYM_ARM_A:-0}"                # 1 = ALSO run the design's "vs today" A arm
+                                           # (authority + co-writers at the same N, the same
+                                           # binary, default format) as an A-B-B-A over the
+                                           # row set — DOUBLES the row wall; the B-only law
+                                           # rows are the minimum (NOT BUILT in PR 15: the
+                                           # A arm needs a per-node co-writer recipe this
+                                           # rig does not have — refused loud)
+
 # --- Benchmark battery knobs ------------------------------------------------
 BENCH_THREADS=16          # thread count for 1m + seq rows
 BENCH_QD_THREADS=32       # thread count for the t32qd32 rand-4k rows
@@ -240,13 +302,32 @@ subcommands:
              (tests/run_mw_matrix.sh external-mounts mode) over the MW fleet;
              rows -> .benchmarks/cloud/<timestamp>/ (cloud rows are a THIRD
              substrate class — never spliced into devsub medians)
+  assemble-sym (PRESET=mw SYMMETRIC=1) the same fabric steps as assemble-mw,
+             DIVERGING at the format into `format --symmetric` and at the
+             mount into ONE symmetric writer PER CLIENT NODE: the MANAGER on
+             client0, a JOINED writer on client1..N_CLIENT-1 (the join
+             ladder over the real wire — each node its OWN registrant), an
+             optional `--read-only` TOKEN reader on client0; posture gates
+             read from every node's .stats (mount_posture writer,
+             symmetric_join non-null, manager_lease held / joined_appender_id,
+             appenders_live == N, the membership census)
+  bench-sym  (PRESET=mw SYMMETRIC=1) the three symmetric row sets — gate 2
+             sym-tarx (a JOINED node's tar -x vs the manager-local S0), gate
+             3 sym-scale (N = 1/2/4/8 writer NODES — the per-node law), gate
+             3b sym-shared-dir (+ -ls) — driven from THIS box over ssh by
+             tests/cloud_sym_rows.sh with the matrix's own laws
+             (tests/sym_rows_lib.sh); rows -> .benchmarks/cloud/<ts>/sym-rows/
+  sym-hook   (internal) `sym-hook mount|unmount <client-pub-ip> <mnt>` —
+             the driver's leave/rejoin of one writer node (gate 3's
+             "exactly N appenders live")
   status     instance table, elapsed cluster-hours vs the max-spend guard,
              estimated spend
   teardown   terminate instances, delete SG/launch template/placement group,
              cancel the deadline guard, tag-scoped final sweep (fails loudly
              on any still-billing resource). Idempotent.
   full       launch -> deploy -> assemble -> bench -> teardown
-             (PRESET=mw: launch -> deploy -> assemble-mw -> bench-mw -> teardown)
+             (PRESET=mw: launch -> deploy -> assemble-mw -> bench-mw -> teardown;
+              PRESET=mw SYMMETRIC=1: … -> assemble-sym -> bench-sym -> teardown)
 
 flags:
   --dry-run          print every aws/ssh command instead of executing (no
@@ -256,6 +337,7 @@ flags:
   --cluster-id ID    operate on a specific cluster (default: the one recorded
                      in .cloud-bench/current)
   --preset P         i4i | i3en | mw | custom (overrides $PRESET)
+  --symmetric        the symmetric fleet shape (PRESET=mw only; = SYMMETRIC=1)
 
 The max-spend guard: launch/full refuse unless MAX_CLUSTER_HOURS is a
 positive integer. See the header quickstart for the cost table.
@@ -272,6 +354,9 @@ EOF
 SUBCMD="${1:-}"
 [ -n "$SUBCMD" ] || { usage; exit 1; }
 shift || true
+# sym-hook's three positionals (the driver's contract: `<flags> mount|unmount
+# <host> <mnt>` — the driver appends them after the rig's own flags)
+HOOK_POS=()
 
 DRY_RUN=false
 ASSUME_YES=false
@@ -283,12 +368,24 @@ while [ $# -gt 0 ]; do
     --yes)        ASSUME_YES=true ;;
     --cluster-id) CID_ARG="${2:?--cluster-id needs a value}"; shift ;;
     --preset)     PRESET="${2:?--preset needs a value}"; shift ;;
+    --symmetric)  SYMMETRIC=1 ;;
     --secs)       GUARD_SECS="${2:?--secs needs a value}"; shift ;;  # __deadline-guard only
     -h|--help)    usage; exit 0 ;;
-    *)            die "unknown flag: $1 (see --help)" ;;
+    *)
+      if [ "$SUBCMD" = "sym-hook" ] && [ "${#HOOK_POS[@]}" -lt 3 ]; then
+        HOOK_POS+=("$1")
+      else
+        die "unknown flag: $1 (see --help)"
+      fi
+      ;;
   esac
   shift
 done
+HOOK_VERB="" HOOK_HOST="" HOOK_MNT=""
+if [ "$SUBCMD" = "sym-hook" ]; then
+  [ "${#HOOK_POS[@]}" -eq 3 ] || die "sym-hook needs three positionals: mount|unmount <host> <mnt> (got: ${HOOK_POS[*]:-none})"
+  HOOK_VERB="${HOOK_POS[0]}"; HOOK_HOST="${HOOK_POS[1]}"; HOOK_MNT="${HOOK_POS[2]}"
+fi
 
 # ---------------------------------------------------------------------------
 # Preset resolution
@@ -337,10 +434,23 @@ esac
 
 # Preset-dependent defaults (an explicit env value always wins — see the
 # config block notes on roles, AMI kernel floors, and artifact glibc).
+[ "$SYMMETRIC" = "0" ] || [ "$SYMMETRIC" = "1" ] || die "SYMMETRIC must be 0 or 1 (got: $SYMMETRIC)"
+if [ "$SYMMETRIC" = "1" ] && [ "$PRESET" != "mw" ]; then
+  die "SYMMETRIC=1 is the mw preset's shape (PRESET=mw SYMMETRIC=1 N_CLIENT=<writer nodes>)"
+fi
 if [ "$PRESET" = "mw" ]; then
   N_MDS="${N_MDS:-1}"
   N_OSS="${N_OSS:-2}"
-  N_CLIENT="${N_CLIENT:-1}"
+  if [ "$SYMMETRIC" = "1" ]; then
+    # N_CLIENT = the WRITER NODE COUNT (one symmetric writer per node);
+    # the smallest multi-node shape is the default.
+    N_CLIENT="${N_CLIENT:-2}"
+    [[ "$N_CLIENT" =~ ^[0-9]+$ ]] && [ "$N_CLIENT" -ge 2 ] ||
+      die "SYMMETRIC=1 needs N_CLIENT >= 2 writer nodes (a one-node symmetric set is the solo mount every local venue already measures; got: $N_CLIENT)"
+    EST_CLUSTER_HOURLY="~\$$(python3 -c "print(f'{0.686*(3+$N_CLIENT):.2f}')")/hr on-demand ($((3 + N_CLIENT)) x i4i.2xlarge at ~\$0.686/hr; planning number)"
+  else
+    N_CLIENT="${N_CLIENT:-1}"
+  fi
   N_SPARE="${N_SPARE:-0}"
   AMI_SSM_PARAM="${AMI_SSM_PARAM:-/aws/service/canonical/ubuntu/server/26.04/stable/current/amd64/hvm/ebs-gp3/ami-id}"
   ARTIFACT_DIR="${ARTIFACT_DIR:-dist/ubuntu2604}"
@@ -456,6 +566,7 @@ CID=""
 STATE_DIR=""
 LT_ID="" SG_ID="" PG_NAME="" VPC_ID="" SUBNET_ID=""
 LAUNCH_EPOCH="" DEADLINE_EPOCH="" DEADLINE_PID=""
+SYM_STORAGE_DEVS=""   # assemble-sym records `<oss pub ip>:<dev>,…` (bench-sym's amplification columns)
 NODE_NAMES=() NODE_IDS=() NODE_PUB=() NODE_PRIV=()
 
 state_file() { echo "$STATE_DIR/cluster.env"; }
@@ -476,6 +587,7 @@ save_state() {
     echo "LAUNCH_EPOCH=$LAUNCH_EPOCH"
     echo "DEADLINE_EPOCH=$DEADLINE_EPOCH"
     echo "DEADLINE_PID=$DEADLINE_PID"
+    echo "SYM_STORAGE_DEVS=$SYM_STORAGE_DEVS"
     local i
     for i in "${!NODE_NAMES[@]}"; do
       echo "NODE ${NODE_NAMES[$i]} ${NODE_IDS[$i]} ${NODE_PUB[$i]} ${NODE_PRIV[$i]}"
@@ -507,7 +619,7 @@ load_state() { # load_state [--placeholder-ok] [--tags-ok]
           read -r n id pub priv <<<"$rest"
           NODE_NAMES+=("$n"); NODE_IDS+=("$id"); NODE_PUB+=("$pub"); NODE_PRIV+=("$priv")
           ;;
-        CID=*|AWS_REGION=*|AWS_AZ=*|PRESET=*|INSTANCE_TYPE=*|LT_ID=*|SG_ID=*|PG_NAME=*|VPC_ID=*|SUBNET_ID=*|LAUNCH_EPOCH=*|DEADLINE_EPOCH=*|DEADLINE_PID=*)
+        CID=*|AWS_REGION=*|AWS_AZ=*|PRESET=*|INSTANCE_TYPE=*|LT_ID=*|SG_ID=*|PG_NAME=*|VPC_ID=*|SUBNET_ID=*|LAUNCH_EPOCH=*|DEADLINE_EPOCH=*|DEADLINE_PID=*|SYM_STORAGE_DEVS=*)
           # shellcheck disable=SC2163  # deliberate: keys are the enumerated allowlist above
           export "$key"
           ;;
@@ -536,6 +648,10 @@ load_state() { # load_state [--placeholder-ok] [--tags-ok]
       NODE_IDS+=("i-dryrun$i")
       NODE_PUB+=("203.0.113.$((10 + i))")
       NODE_PRIV+=("10.0.1.$((10 + i))")
+    done
+    SYM_STORAGE_DEVS=""
+    for i in "${!ROLE_NAMES[@]}"; do
+      [ "$(role_of "${ROLE_NAMES[$i]}")" = "oss" ] && SYM_STORAGE_DEVS="${SYM_STORAGE_DEVS:+$SYM_STORAGE_DEVS,}${NODE_PUB[$i]}:/dev/nvme1n1"
     done
     warn "dry-run without cluster state: using placeholder cluster $CID"
     return 0
@@ -567,6 +683,7 @@ role_of() { # role_of <name> -> mds|oss|client|spare
 }
 
 mw_shape_check() { # the MW fleet knobs, validated before anything costly
+  [ "$SYMMETRIC" = "1" ] && return 0   # the symmetric shape has no co-writers (sym_shape_check)
   [[ "$MW_COWRITERS" =~ ^[0-9]+$ ]] && [ "$MW_COWRITERS" -ge 2 ] \
     || die "MW_COWRITERS must be an integer >= 2 (the s11-mpiio leg's floor; got: $MW_COWRITERS)"
   [[ "$MW_IOR_PROCS" =~ ^[0-9]+$ ]] && [ "$MW_IOR_PROCS" -ge 1 ] && [ "$MW_IOR_PROCS" -le 16 ] \
@@ -887,15 +1004,16 @@ EOS
 # ---------------------------------------------------------------------------
 
 # Client prologue: unmount every ${MNT}* mount (reverse-sorted so co-writer
-# mounts unmount before the authority they dial — this also reaps a prior MW
-# fleet under a plain re-assemble), kill stray daemons, then LOUDLY verify
+# mounts — and the symmetric shape's `-ro` token reader — unmount before the
+# authority they dial — this also reaps a prior MW fleet under a plain
+# re-assemble), kill stray daemons, then LOUDLY verify
 # the disconnect (survivors auto-reconnect to rebuilt shares and poison the
 # connect step — same failure mode as tests/cluster_reset.sh).
 CLIENT_PROLOGUE_SCRIPT="$(cat <<'EOS'
 set -euo pipefail
 while read -r m; do
   umount "$m" || umount -l "$m" || true
-done < <(awk -v m="$MNT" '$2 == m || index($2, m "-cw") == 1 {print $2}' /proc/mounts | sort -r)
+done < <(awk -v m="$MNT" '$2 == m || index($2, m "-") == 1 {print $2}' /proc/mounts | sort -r)
 sleep 2
 pkill -f 'squeezefs moun[t]' 2>/dev/null || true
 sleep 1
@@ -940,7 +1058,7 @@ for d in "${devs[@]}"; do
   "$SQZ" nvmeof unshare "$nqn" 2>/dev/null || true
   wipefs -a "$d" >/dev/null 2>&1 || true
   "$SQZ" nvmeof share "$d" --target-stack nvmet --ip "$PRIV_IP" --subnqn "$nqn"
-  echo "SHARED $nqn"
+  echo "SHARED $nqn $d"
   i=$((i + 1))
 done
 EOS
@@ -1028,8 +1146,18 @@ if [ "${MW_PR_VERIFY:-0}" = 1 ]; then
 fi
 META_URI="sqmeta://$meta_devs"
 DATA_URI="sqdata://$data_devs"
-echo "format: $META_URI $DATA_URI"
-"$SQZ" format "$META_URI" "$DATA_URI" --disk-cache-paths "$CACHE"
+if [ "${MW_SKIP_FORMAT:-0}" != 1 ]; then
+  # FORMAT_EXTRA_STR: extra `format` flags, comma-separated (the symmetric
+  # shape's `--symmetric`); empty = the shipped format verbatim.
+  read -ra FEXTRA <<<"$(printf '%s' "${FORMAT_EXTRA_STR:-}" | tr ',' ' ')"
+  echo "format: $META_URI $DATA_URI ${FEXTRA[*]:-}"
+  "$SQZ" format "$META_URI" "$DATA_URI" --disk-cache-paths "$CACHE" "${FEXTRA[@]}"
+else
+  # a JOINING node: the set is formatted by the manager's node — connect
+  # only, and record the SAME meta URI (the devices resolve in csv order,
+  # so the URI is the set's on every node)
+  echo "connected (no format — a joining node): $META_URI $DATA_URI"
+fi
 echo "$META_URI" >/etc/squeezefs-bench-meta-uri
 if [ "${MW_SKIP_MOUNT:-0}" != 1 ]; then
   read -ra EXTRA <<<"$(printf '%s' "$MOUNT_EXTRA_STR" | tr ',' ' ')"
@@ -1050,6 +1178,7 @@ SHARED_DATA_SPECS=""
 share_storage_nodes() {
   SHARED_META_SPECS=""
   SHARED_DATA_SPECS=""
+  SYM_STORAGE_DEVS=""
   local idx name role ip priv shares nqn
   for idx in "${!NODE_NAMES[@]}"; do
     name="${NODE_NAMES[$idx]}"
@@ -1061,10 +1190,19 @@ share_storage_nodes() {
       remote "$ip" NAME="$name" KIND="$role" NQN_BASE="$NQN_PREFIX" PRIV_IP="$priv" SQZ="$REMOTE_DIR/squeezefs" \
         <<<"$STORAGE_SHARE_SCRIPT"
       shares="$NQN_PREFIX:$name-d0"     # canned: 1 device/node in dry-run
+      [ "$role" = "oss" ] && SYM_STORAGE_DEVS="${SYM_STORAGE_DEVS:+$SYM_STORAGE_DEVS,}$ip:/dev/nvme1n1"
     else
-      shares="$(remote "$ip" NAME="$name" KIND="$role" NQN_BASE="$NQN_PREFIX" PRIV_IP="$priv" SQZ="$REMOTE_DIR/squeezefs" \
-        <<<"$STORAGE_SHARE_SCRIPT" | awk '/^SHARED /{print $2}')"
+      local share_lines
+      share_lines="$(remote "$ip" NAME="$name" KIND="$role" NQN_BASE="$NQN_PREFIX" PRIV_IP="$priv" SQZ="$REMOTE_DIR/squeezefs" \
+        <<<"$STORAGE_SHARE_SCRIPT" | awk '/^SHARED /')"
+      shares="$(awk '{print $2}' <<<"$share_lines")"
       [ -n "$shares" ] || die "$name shared nothing"
+      if [ "$role" = "oss" ]; then
+        local dev
+        for dev in $(awk '{print $3}' <<<"$share_lines"); do
+          SYM_STORAGE_DEVS="${SYM_STORAGE_DEVS:+$SYM_STORAGE_DEVS,}$ip:$dev"
+        done
+      fi
     fi
     for nqn in $shares; do
       if [ "$role" = "mds" ]; then
@@ -1413,6 +1551,555 @@ EOS
   echo
   echo "MW fleet assembled: authority $MOUNTPOINT + $MW_COWRITERS co-writers ($MOUNTPOINT-cw1..cw$MW_COWRITERS) on client0."
   echo "Next: PRESET=mw tests/cloud_bench_cluster.sh bench-mw"
+}
+
+# ---------------------------------------------------------------------------
+# assemble-sym — the SYMMETRIC fleet shape (PRESET=mw SYMMETRIC=1): the same
+# fabric steps as assemble-mw, DIVERGING at the format into
+# `format --symmetric` and at the mount into ONE symmetric writer PER CLIENT
+# NODE — the MANAGER on client0 (the D0 winner), a JOINED writer on
+# client1..N-1 through the join ladder (design-symmetric-metadata §7.3; PR
+# 12b's N-daemon posture on N real hosts), an optional `--read-only` TOKEN
+# reader on client0. Every node is its own registrant (the REMOTE posture):
+# its nvme-cli host identity, asserted DISTINCT across the client nodes.
+# Idempotent: re-running reaps every mount and rebuilds from scratch
+# (fresh format — data is destroyed).
+# ---------------------------------------------------------------------------
+SYM_READER_MNT="$MOUNTPOINT-ro"
+
+sym_client_names() { # every client node name, client0 first
+  local idx
+  for idx in "${!NODE_NAMES[@]}"; do
+    [ "$(role_of "${NODE_NAMES[$idx]}")" = "client" ] && echo "${NODE_NAMES[$idx]}"
+  done
+}
+
+sym_shape_check() {
+  [ "$SYMMETRIC" = "1" ] || die "this subcommand is the symmetric shape's — pass SYMMETRIC=1 (or --symmetric) with PRESET=mw N_CLIENT=<writer nodes>"
+  [[ "$SYM_PORT" =~ ^[0-9]+$ ]] && [ "$SYM_PORT" -ge 1024 ] && [ "$SYM_PORT" -le 65535 ] \
+    || die "SYM_PORT must be a port in 1024..65535 (got: $SYM_PORT)"
+  [ "$SYM_TOKEN_READER" = "0" ] || [ "$SYM_TOKEN_READER" = "1" ] || die "SYM_TOKEN_READER must be 0 or 1"
+  [ "$SYM_ARM_A" = "0" ] || die "SYM_ARM_A=1: the design's 'vs today' A arm (authority + co-writers on N nodes) is NOT BUILT in PR 15 — this rig has no per-node co-writer recipe (the co-located v5-mw recipe is client0-only); the B-only law rows are the minimum. Run with SYM_ARM_A=0."
+}
+
+# The one flattened-stats reader the remote gates use (the JSON nests under
+# "metrics") — v5-mw / mw_fleet's stat_field, plus a per-volume FIRST and
+# an ALL-EQUAL face for the symmetric families (JSON arrays per volume).
+SYM_STAT_HELPERS="$(cat <<'EOS'
+stat_field() { # mountpoint key -> value
+  cat "$1/.stats" | python3 -c '
+import json, sys
+def flat(d, out, pfx=""):
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+root = json.load(sys.stdin)
+print(flat(root.get("metrics", root), {}).get(sys.argv[1], ""))' "$2"
+}
+stat_first() { stat_field "$1" "$2" | tr -d '[] ' | cut -d, -f1; }
+stat_all_eq() { # mountpoint key want -> 1|0
+  cat "$1/.stats" | python3 -c '
+import json, sys
+def flat(d, out, pfx=""):
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+root = json.load(sys.stdin)
+v = flat(root.get("metrics", root), {}).get(sys.argv[1], None)
+vals = v if isinstance(v, list) else [v]
+print(1 if vals and all(str(x) == sys.argv[2] for x in vals) else 0)' "$2" "$3"
+}
+wait_for() { # description tries cmd...
+  local what="$1" tries="$2" i
+  shift 2
+  for ((i = 0; i < tries; i++)); do
+    "$@" >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  die "timed out waiting for $what"
+}
+poll_stat() { # mountpoint key want tries what
+  local mnt="$1" key="$2" want="$3" tries="$4" what="$5" v i
+  v=""
+  for ((i = 0; i < tries; i++)); do
+    v="$(stat_field "$mnt" "$key" 2>/dev/null || true)"
+    [ "$v" = "$want" ] && return 0
+    sleep 0.5
+  done
+  die "$what: $key='$v' (want $want)"
+}
+poll_all_eq() { # mountpoint key want tries what
+  local mnt="$1" key="$2" want="$3" tries="$4" what="$5" i
+  for ((i = 0; i < tries; i++)); do
+    [ "$(stat_all_eq "$mnt" "$key" "$want" 2>/dev/null || echo 0)" = "1" ] && return 0
+    sleep 0.5
+  done
+  die "$what: $key != $want on every volume (last: $(stat_field "$mnt" "$key" 2>/dev/null))"
+}
+unmount_and_reap() { # mountpoint (idempotent — v5-mw verbatim)
+  local mnt="$1" pid t
+  pid="$(pgrep -f "squeezefs.*mount.*$mnt" | head -1 || true)"
+  if awk -v m="$mnt" '$2==m {f=1} END {exit !f}' /proc/mounts; then
+    env -u SUDO_UID -u SUDO_GID -u SUDO_USER "$SQZ" umount "$mnt" >/dev/null 2>&1 || true
+  fi
+  if awk -v m="$mnt" '$2==m {f=1} END {exit !f}' /proc/mounts; then
+    umount -l "$mnt" 2>/dev/null || true
+  fi
+  wait_for "unmount of $mnt" 240 bash -c "! awk -v m='$mnt' '\$2==m {f=1} END {exit !f}' /proc/mounts"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    for ((t = 0; t < 40; t++)); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.5
+    done
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+}
+EOS
+)"
+
+# The MANAGER mount on client0: the D0 winner of an armed set IS the
+# manager (KD-SYM-3). The knob-armed shape — SQUEEZEFS_SYMMETRIC_META=1,
+# NO posture knob (SQUEEZEFS_MULTI_WRITER / MW_ROLE / MW_AUTHORITY /
+# MW_MEMBERS are RETIRED spellings under the plane), the membership shard
+# at `auto` (rung 3), the listener at the node's private ip + SYM_PORT
+# (rung 7 — advertised verbatim into its claim-set entry: what every
+# joiner's `resolve_holder_endpoint` reads). Engagement: the ladder's own
+# log line, `mount_posture writer`, `manager_lease held` + `symmetric_meta
+# 1` on every volume, `membership_mode owner`, `symmetric_join` published,
+# `writer_guard_mode flock+pr` (the metadata PR the death path's preempt
+# fences), `data_plane_fence_mode 1` (rung 4's WERO).
+SYM_MOUNT_MANAGER_SCRIPT="$(cat <<'EOS'
+set -euo pipefail
+die() { echo "FATAL: $*" >&2; exit 1; }
+[ -s /etc/squeezefs-bench-meta-uri ] || die "no recorded meta URI — the connect/format step did not run"
+META_URI="$(cat /etc/squeezefs-bench-meta-uri)"
+read -ra EXTRA <<<"$(printf '%s' "$MOUNT_EXTRA_STR" | tr ',' ' ')"
+LOG=/tmp/sqz-sym-manager.log
+mkdir -p "$MNT"
+env -u SUDO_UID -u SUDO_GID -u SUDO_USER \
+  "SQUEEZEFS_IPC_ALLOW_DEV=1" \
+  "SQUEEZEFS_SYMMETRIC_META=1" \
+  "SQUEEZEFS_MEMBERSHIP_BIND=$MEMBERSHIP_BIND" \
+  "SQUEEZEFS_MW_BIND=$PRIV_IP:$PORT" \
+  "$SQZ" mount "$META_URI" "$MNT" --daemon "${EXTRA[@]}" --log-file "$LOG" \
+  >/tmp/sqz-sym-manager.mount.out 2>&1 ||
+  die "manager mount failed: $(cat /tmp/sqz-sym-manager.mount.out)"
+wait_for "manager mountpoint" 240 mountpoint -q "$MNT"
+wait_for "manager stats inode" 240 test -s "$MNT/.stats"
+grep -q "SYMMETRIC WRITER JOINED" "$LOG" ||
+  die "manager log carries no 'SYMMETRIC WRITER JOINED' line — the join ladder did not run (log: $LOG)"
+poll_stat "$MNT" mount_posture writer 60 "manager posture (log: $LOG)"
+poll_all_eq "$MNT" manager_lease held 120 "manager: manager_lease (the D0 winner IS the manager, KD-SYM-3; log: $LOG)"
+poll_all_eq "$MNT" symmetric_meta 1 60 "manager: the symmetric plane did not arm (log: $LOG)"
+poll_all_eq "$MNT" writer_guard_mode flock+pr 60 "manager: writer_guard_mode (the metadata PR is not held — a non-PR substrate?; log: $LOG)"
+poll_stat "$MNT" data_plane_fence_mode 1 240 "manager: rung 4's data WERO did not engage (log: $LOG)"
+poll_stat "$MNT" membership_mode owner 240 "manager: the S6 shard did not arm (log: $LOG)"
+ep="$(stat_field "$MNT" symmetric_join.endpoint)"
+[ -n "$ep" ] || die "manager: symmetric_join.endpoint is empty — rung 7 published no listener (log: $LOG)"
+case "$ep" in "$PRIV_IP:"*) : ;; *) die "manager: symmetric_join.endpoint='$ep' does not carry the node's private ip $PRIV_IP — the joiners would dial the wrong address" ;; esac
+echo "MANAGER_ENDPOINT $ep"
+echo "  manager up at $MNT (posture writer, lease held, WERO held, membership owner, serving on $ep)"
+EOS
+)"
+
+# A JOINED writer on client1..N-1: the fifth door over the wire (PR 12b) —
+# no posture knob, the join target resolved off DURABLE state (the
+# manager's heartbeat-fresh claim + its published listener + the set's
+# secret). The REMOTE posture: this node holds no local flock and its boot
+# id is not the claim's, so rung 4 REGISTERS under the manager's standing
+# hold with this node's own identity (`joined_registrant_posture =
+# registrant` — `adopted` here would mean the joiner believed itself
+# co-located, a product finding on this venue). Engagement: the joined
+# door's log line, `mount_posture writer`, `joined_appender_id ≥ 1`,
+# `manager_lease peer:…`, `slot_leases_held ≥ 1`, `membership_mode
+# member`, `symmetric_join` published with this node's endpoint.
+SYM_MOUNT_JOINER_SCRIPT="$(cat <<'EOS'
+set -euo pipefail
+die() { echo "FATAL: $*" >&2; exit 1; }
+[ -s /etc/squeezefs-bench-meta-uri ] || die "no recorded meta URI — the connect step did not run on this node"
+META_URI="$(cat /etc/squeezefs-bench-meta-uri)"
+read -ra EXTRA <<<"$(printf '%s' "$MOUNT_EXTRA_STR" | tr ',' ' ')"
+LOG=/tmp/sqz-sym-joiner.log
+mkdir -p "$MNT"
+env -u SUDO_UID -u SUDO_GID -u SUDO_USER \
+  "SQUEEZEFS_IPC_ALLOW_DEV=1" \
+  "SQUEEZEFS_SYMMETRIC_META=1" \
+  "SQUEEZEFS_MW_BIND=$PRIV_IP:$PORT" \
+  "$SQZ" mount "$META_URI" "$MNT" --daemon "${EXTRA[@]}" --log-file "$LOG" \
+  >/tmp/sqz-sym-joiner.mount.out 2>&1 ||
+  die "joined writer mount failed on $NODE: $(cat /tmp/sqz-sym-joiner.mount.out)"
+wait_for "joiner mountpoint" 240 mountpoint -q "$MNT"
+wait_for "joiner stats inode" 240 test -s "$MNT/.stats"
+grep -q "mounted as a JOINED symmetric appender" "$LOG" ||
+  die "$NODE: log carries no 'mounted as a JOINED symmetric appender' line — the joined door did not engage (log: $LOG)"
+grep -q "SYMMETRIC WRITER JOINED as a NON-MANAGER appender" "$LOG" ||
+  die "$NODE: log carries no 'SYMMETRIC WRITER JOINED as a NON-MANAGER appender' line — rungs 4/7 did not arm (log: $LOG)"
+poll_stat "$MNT" mount_posture writer 60 "$NODE posture (log: $LOG)"
+jid="$(stat_first "$MNT" joined_appender_id)"
+[ "${jid:-0}" -ge 1 ] 2>/dev/null || die "$NODE: joined_appender_id='$jid' (want ≥ 1) — log: $LOG"
+jpost="$(stat_first "$MNT" joined_registrant_posture)"
+[ "$jpost" = "registrant" ] ||
+  die "$NODE: joined_registrant_posture='$jpost' (want registrant — the REMOTE posture: this node is its own registrant under the manager's hold; 'adopted' means the joiner believed itself co-located with the manager, 'detection' a non-PR namespace) — log: $LOG"
+lease="$(stat_first "$MNT" manager_lease)"
+case "$lease" in peer:*) : ;; *) die "$NODE: manager_lease='$lease' (want peer:…) — log: $LOG" ;; esac
+held="$(stat_first "$MNT" slot_leases_held)"
+[ "${held:-0}" -ge 1 ] 2>/dev/null || die "$NODE: slot_leases_held='$held' (want ≥ 1) — log: $LOG"
+poll_stat "$MNT" membership_mode member 240 "$NODE: the S6 join did not engage (log: $LOG)"
+ep="$(stat_field "$MNT" symmetric_join.endpoint)"
+case "$ep" in "$PRIV_IP:"*) : ;; *) die "$NODE: symmetric_join.endpoint='$ep' does not carry this node's private ip $PRIV_IP" ;; esac
+echo "  joined writer up at $MNT on $NODE (appender $jid, manager_lease=$lease, $held slot(s), registrant=$jpost, serving on $ep)"
+EOS
+)"
+
+# A `--read-only` TOKEN reader (PR 5's §5.7.2 posture): member-reader +
+# token client, every kernel TTL derived to 0, the holders dialed off
+# durable state. Engagement: the token arm's own line and
+# `reader_staleness_bound_ms == 0` (R-SYM-4).
+SYM_MOUNT_READER_SCRIPT="$(cat <<'EOS'
+set -euo pipefail
+die() { echo "FATAL: $*" >&2; exit 1; }
+META_URI="$(cat /etc/squeezefs-bench-meta-uri)"
+read -ra EXTRA <<<"$(printf '%s' "$MOUNT_EXTRA_STR" | tr ',' ' ')"
+LOG=/tmp/sqz-sym-reader.log
+mkdir -p "$MNT"
+env -u SUDO_UID -u SUDO_GID -u SUDO_USER \
+  "SQUEEZEFS_IPC_ALLOW_DEV=1" \
+  "SQUEEZEFS_SYMMETRIC_META=1" \
+  "$SQZ" mount "$META_URI" "$MNT" --read-only --daemon "${EXTRA[@]}" --log-file "$LOG" \
+  >/tmp/sqz-sym-reader.mount.out 2>&1 ||
+  die "token reader mount failed: $(cat /tmp/sqz-sym-reader.mount.out)"
+wait_for "reader mountpoint" 240 mountpoint -q "$MNT"
+wait_for "reader stats inode" 240 test -s "$MNT/.stats"
+grep -q "read under TOKENS from" "$LOG" ||
+  die "token reader log carries no 'read under TOKENS from' line — the token arm did not engage (log: $LOG)"
+poll_stat "$MNT" reader_staleness_bound_ms 0 60 "token reader: R-SYM-4's posture word (log: $LOG)"
+echo "  token reader up at $MNT (reader_staleness_bound_ms=0)"
+EOS
+)"
+
+# sym_mount_node <name> manager|joiner|reader — one node's mount, gated.
+sym_mount_node() {
+  local name="$1" kind="$2" ip priv
+  ip="$(node_pub "$name")"; priv="$(node_priv "$name")"
+  local script mnt
+  case "$kind" in
+    manager) script="$SYM_MOUNT_MANAGER_SCRIPT"; mnt="$MOUNTPOINT" ;;
+    joiner)  script="$SYM_MOUNT_JOINER_SCRIPT";  mnt="$MOUNTPOINT" ;;
+    reader)  script="$SYM_MOUNT_READER_SCRIPT";  mnt="$SYM_READER_MNT" ;;
+    *) die "sym_mount_node: kind must be manager|joiner|reader" ;;
+  esac
+  remote "$ip" \
+    SQZ="$REMOTE_DIR/squeezefs" MNT="$mnt" NODE="$name" PRIV_IP="$priv" PORT="$SYM_PORT" \
+    MEMBERSHIP_BIND="$SYM_MEMBERSHIP_BIND" \
+    MOUNT_EXTRA_STR="$(printf '%s' "$MW_MOUNT_EXTRA" | tr ' ' ',')" \
+    <<<"$SYM_STAT_HELPERS
+$script"
+}
+
+# sym_unmount_node <name> <mnt> — the product umount (the clean LEAVE:
+# every slot handed back, the page Free), the lazy fallback, the reap.
+sym_unmount_node() {
+  remote "$(node_pub "$1")" SQZ="$REMOTE_DIR/squeezefs" MNT="$2" <<<"$SYM_STAT_HELPERS
+die() { echo \"FATAL: \$*\" >&2; exit 1; }
+unmount_and_reap \"\$MNT\"
+echo \"  unmounted \$MNT on $1\""
+}
+
+cmd_assemble_sym() {
+  require_local_tools
+  load_state --placeholder-ok
+  sym_shape_check
+  local -a clients
+  mapfile -t clients < <(sym_client_names)
+  [ "${#clients[@]}" -ge 2 ] || die "assemble-sym needs >= 2 client nodes (N_CLIENT=$N_CLIENT; the cluster has ${#clients[@]})"
+  local n="${#clients[@]}"
+  local reader_word=""
+  [ "$SYM_TOKEN_READER" = "1" ] && reader_word=" + a token reader on ${clients[0]}"
+  confirm "assemble-sym REFORMATS the cluster volumes (any prior benchmark data on $CID is destroyed) with format --symmetric and mounts ONE symmetric writer per client node ($n nodes: the manager on ${clients[0]}, joined writers on ${clients[*]:1})$reader_word."
+
+  local c ip
+  log "assemble-sym 1/8: client kernel floor — FUSE-over-io_uring (v6.14+) on EVERY client node"
+  for c in "${clients[@]}"; do
+    remote "$(node_pub "$c")" NODE="$c" <<'EOS'
+set -euo pipefail
+modprobe fuse 2>/dev/null || true
+[ -e /sys/module/fuse/parameters/enable_uring ] || {
+  echo "FATAL[$NODE]: kernel $(uname -r) lacks FUSE-over-io_uring (no /sys/module/fuse/parameters/enable_uring; mainline v6.14+ needed) — every SqueezeFS mount requires the transport. Remedy: the mw preset's default Ubuntu 26.04 AMI (AMI_SSM_PARAM) or any v6.14+ kernel." >&2
+  exit 1
+}
+echo "$NODE kernel $(uname -r): fuse.enable_uring present"
+EOS
+  done
+
+  log "assemble-sym 2/8: client prologue on EVERY client node — unmount + disconnect survivors (idempotency)"
+  for c in "${clients[@]}"; do
+    remote "$(node_pub "$c")" SQZ="$REMOTE_DIR/squeezefs" MNT="$MOUNTPOINT" NQN_PREFIX="$NQN_PREFIX" \
+      <<<"$CLIENT_PROLOGUE_SCRIPT"
+  done
+
+  log "assemble-sym 3/8: host identities — every client node its OWN registrant (nvme-cli hostnqn/hostid, DISTINCT across the fleet)"
+  # A baked AMI clones /etc/nvme/hostnqn + hostid onto every node; two
+  # nodes with one identity ALIAS at the target (one registrant, the
+  # fence blind to which host wrote). Generate where missing, then assert
+  # distinct; a duplicate is regenerated on the later node and re-read.
+  local -A seen_nqn=()
+  local nqn hid
+  for c in "${clients[@]}"; do
+    ip="$(node_pub "$c")"
+    if $DRY_RUN; then
+      remote "$ip" NODE="$c" REGEN=0 <<'EOS'
+set -euo pipefail
+mkdir -p /etc/nvme
+[ "$REGEN" = 1 ] && rm -f /etc/nvme/hostnqn /etc/nvme/hostid
+[ -s /etc/nvme/hostnqn ] || nvme gen-hostnqn >/etc/nvme/hostnqn
+[ -s /etc/nvme/hostid ] || { cat /proc/sys/kernel/random/uuid >/etc/nvme/hostid; }
+echo "IDENTITY $(tr -d '[:space:]' </etc/nvme/hostnqn) $(tr -d '[:space:]' </etc/nvme/hostid)"
+EOS
+      nqn="nqn.2014-08.org.nvmexpress:uuid:dryrun-$c"
+    else
+      local out try
+      for try in 1 2; do
+        out="$(remote "$ip" NODE="$c" REGEN="$([ "$try" = 2 ] && echo 1 || echo 0)" <<'EOS'
+set -euo pipefail
+mkdir -p /etc/nvme
+[ "$REGEN" = 1 ] && rm -f /etc/nvme/hostnqn /etc/nvme/hostid
+[ -s /etc/nvme/hostnqn ] || nvme gen-hostnqn >/etc/nvme/hostnqn
+[ -s /etc/nvme/hostid ] || { cat /proc/sys/kernel/random/uuid >/etc/nvme/hostid; }
+echo "IDENTITY $(tr -d '[:space:]' </etc/nvme/hostnqn) $(tr -d '[:space:]' </etc/nvme/hostid)"
+EOS
+)"
+        nqn="$(awk '/^IDENTITY /{print $2}' <<<"$out")"; hid="$(awk '/^IDENTITY /{print $3}' <<<"$out")"
+        [ -n "$nqn" ] && [ -n "$hid" ] || die "$c: could not read its nvme host identity"
+        if [ -n "${seen_nqn[$nqn]:-}" ]; then
+          [ "$try" = 1 ] || die "$c: hostnqn $nqn STILL duplicates ${seen_nqn[$nqn]}'s after regeneration"
+          warn "$c: hostnqn duplicates ${seen_nqn[$nqn]}'s ($nqn — a baked AMI's clone); regenerating"
+          continue
+        fi
+        break
+      done
+    fi
+    seen_nqn[$nqn]="$c"
+    echo "  $c: hostnqn $nqn"
+  done
+
+  log "assemble-sym 4/8: storage nodes — instance-store share + nvmet PR assert (resv_enable=1; v6.13+ floor)"
+  share_storage_nodes
+  assert_storage_pr
+
+  log "assemble-sym 5/8: ${clients[0]} — single-path connect, PR verify, format --symmetric (the manager's node formats; nobody mounts yet)"
+  remote "$(node_pub "${clients[0]}")" \
+    SQZ="$REMOTE_DIR/squeezefs" MNT="$MOUNTPOINT" CACHE="$CACHE_DIR" \
+    META_SPECS="$SHARED_META_SPECS" DATA_SPECS="$SHARED_DATA_SPECS" \
+    MOUNT_EXTRA_STR="$(printf '%s' "$MW_MOUNT_EXTRA" | tr ' ' ',')" \
+    FORMAT_EXTRA_STR="--symmetric" MW_PR_VERIFY=1 MW_SKIP_MOUNT=1 \
+    <<<"$CLIENT_FABRIC_SCRIPT"
+
+  log "assemble-sym 6/8: ${clients[*]:1} — single-path connect + PR verify (no format: a joining node)"
+  for c in "${clients[@]:1}"; do
+    echo "-- $c"
+    remote "$(node_pub "$c")" \
+      SQZ="$REMOTE_DIR/squeezefs" MNT="$MOUNTPOINT" CACHE="$CACHE_DIR" \
+      META_SPECS="$SHARED_META_SPECS" DATA_SPECS="$SHARED_DATA_SPECS" \
+      MOUNT_EXTRA_STR="$(printf '%s' "$MW_MOUNT_EXTRA" | tr ' ' ',')" \
+      MW_PR_VERIFY=1 MW_SKIP_MOUNT=1 MW_SKIP_FORMAT=1 \
+      <<<"$CLIENT_FABRIC_SCRIPT"
+  done
+
+  log "assemble-sym 7/8: mount the symmetric fleet — the MANAGER on ${clients[0]}, then a JOINED writer per node (${clients[*]:1})${reader_word:+, then$reader_word}"
+  local manager_out
+  manager_out="$(sym_mount_node "${clients[0]}" manager)"
+  echo "$manager_out"
+  local mgr_ep
+  mgr_ep="$(awk '/^MANAGER_ENDPOINT /{print $2}' <<<"$manager_out")"
+  $DRY_RUN && mgr_ep="$(node_priv "${clients[0]}"):$SYM_PORT"
+  [ -n "$mgr_ep" ] || die "the manager's endpoint was not reported"
+  for c in "${clients[@]:1}"; do
+    sym_mount_node "$c" joiner
+  done
+  if [ "$SYM_TOKEN_READER" = "1" ]; then
+    sym_mount_node "${clients[0]}" reader
+  fi
+  # The fleet-wide gates at the manager: N Live pages (the manager + every
+  # joiner), the directory's count, the membership census — every joiner is
+  # a WRITER member of the manager's shard (the manager owns the shard; the
+  # census counts its members).
+  remote "$(node_pub "${clients[0]}")" MNT="$MOUNTPOINT" N="$n" <<<"$SYM_STAT_HELPERS
+die() { echo \"FATAL: \$*\" >&2; exit 1; }
+poll_all_eq \"\$MNT\" appenders_live \"\$N\" 240 \"manager: appenders_live (want \$N = the manager + \$((N - 1)) joined writers)\"
+poll_all_eq \"\$MNT\" appenders_known \"\$N\" 240 \"manager: appenders_known (the directory's Live count)\"
+poll_stat \"\$MNT\" membership_writers \"\$((N - 1))\" 240 \"manager: membership_writers (every joiner a WRITER member of the manager's shard)\"
+echo \"  fleet gates: appenders_live=\$(stat_first \"\$MNT\" appenders_live) appenders_known=\$(stat_first \"\$MNT\" appenders_known) membership_members=\$(stat_field \"\$MNT\" membership_members) membership_writers=\$(stat_field \"\$MNT\" membership_writers) membership_readers=\$(stat_field \"\$MNT\" membership_readers)\""
+
+  log "assemble-sym 8/8: build_commit verification ritual on every node"
+  for c in "${clients[@]}"; do
+    local mnts="$MOUNTPOINT"
+    [ "$c" = "${clients[0]}" ] && [ "$SYM_TOKEN_READER" = "1" ] && mnts="$MOUNTPOINT,$SYM_READER_MNT"
+    verify_build_commit "$(node_pub "$c")" "$mnts"
+  done
+  if ! $DRY_RUN; then
+    save_state   # SYM_STORAGE_DEVS for bench-sym
+  fi
+  echo
+  echo "Symmetric fleet assembled: manager ${clients[0]}:$MOUNTPOINT (serving on $mgr_ep) + $((n - 1)) joined writer(s) on ${clients[*]:1}$([ "$SYM_TOKEN_READER" = "1" ] && echo " + token reader ${clients[0]}:$SYM_READER_MNT")."
+  echo "Next: PRESET=mw SYMMETRIC=1 N_CLIENT=$N_CLIENT tests/cloud_bench_cluster.sh bench-sym"
+}
+
+# ---------------------------------------------------------------------------
+# sym-hook — the row driver's leave/rejoin of ONE writer node (gate 3's
+# "exactly N appenders live" + its deleted-stays-deleted-across-the-leave
+# arm): `sym-hook mount|unmount <client-pub-ip> <mnt>`. A joined writer's
+# clean unmount IS the leave (every slot handed back, its page Free); its
+# mount rejoins through the ladder (its own region as own residue).
+# ---------------------------------------------------------------------------
+cmd_sym_hook() {
+  require_local_tools
+  load_state --placeholder-ok
+  sym_shape_check
+  local name="" idx
+  for idx in "${!NODE_NAMES[@]}"; do
+    [ "${NODE_PUB[$idx]}" = "$HOOK_HOST" ] && name="${NODE_NAMES[$idx]}"
+  done
+  [ -n "$name" ] || die "sym-hook: no node of $CID has public ip $HOOK_HOST"
+  [ "$(role_of "$name")" = "client" ] || die "sym-hook: $name is not a client node"
+  [ "$name" != "client0" ] || die "sym-hook: client0 is the MANAGER — the driver never leaves/rejoins it"
+  [ "$HOOK_MNT" = "$MOUNTPOINT" ] || die "sym-hook: '$HOOK_MNT' is not the writer mount ($MOUNTPOINT)"
+  case "$HOOK_VERB" in
+    mount)   sym_mount_node "$name" joiner ;;
+    unmount) sym_unmount_node "$name" "$HOOK_MNT" ;;
+    *) die "sym-hook: verb must be mount|unmount (got '$HOOK_VERB')" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# bench-sym — the three symmetric row sets over the assembled fleet, driven
+# from THIS box by tests/cloud_sym_rows.sh (one row driver, the matrix's
+# laws via tests/sym_rows_lib.sh). Rows land under
+# .benchmarks/cloud/<ts>/sym-rows/ with the manifest, per-row labels, the
+# per-node .stats snapshots and the fsck transcripts. A cloud row is a
+# THIRD substrate class — never spliced into devsub or squeeze-test medians.
+# ---------------------------------------------------------------------------
+cmd_bench_sym() {
+  require_local_tools
+  load_state --placeholder-ok
+  sym_shape_check
+  local -a clients
+  mapfile -t clients < <(sym_client_names)
+  [ "${#clients[@]}" -ge 2 ] || die "bench-sym needs >= 2 client nodes (assemble-sym first)"
+  local driver
+  driver="$(dirname "$SCRIPT_PATH")/cloud_sym_rows.sh"
+  [ -x "$driver" ] || die "row driver missing: $driver"
+  local corpus_arg=""
+  if [ -n "$SYM_TARBALL" ]; then
+    corpus_arg="--tarball=$SYM_TARBALL"
+  elif [ -n "$SYM_TAR_SRC" ]; then
+    corpus_arg="--tar-src=$SYM_TAR_SRC"
+  elif [[ ",$SYM_ROWS," == *,tarx,* ]]; then
+    die "bench-sym: the gate-2 row needs the corpus — SYM_TAR_SRC=<linux>/fs (the box used linux-7.2.3/fs, 2,468 entries) or SYM_TARBALL=<file>; or drop tarx from SYM_ROWS"
+  fi
+  if [[ ",$SYM_ROWS," == *,shared,* ]] && [ "${#clients[@]}" -lt 3 ]; then
+    die "bench-sym: gate 3b (sym-shared-dir) needs >= 2 JOINED writers — the flip triggers on foreign creates from MORE THAN ONE creator and the holder is a joined writer — so N_CLIENT >= 3 (have ${#clients[@]}); relaunch with N_CLIENT=3 or run SYM_ROWS=tarx,scale on this cluster"
+  fi
+  local ns="$SYM_SCALE_NS"
+  if [ -z "$ns" ]; then
+    local n
+    for n in 1 2 4 8; do [ "$n" -le "${#clients[@]}" ] && ns="${ns:+$ns,}$n"; done
+  fi
+  local ts
+  ts="$(date +%Y-%m-%d-%H%M%S)"
+  BENCH_DIR="$RESULTS_ROOT/$ts"
+  if $DRY_RUN; then
+    echo "(dry-run: results would land in $BENCH_DIR/sym-rows — nothing is written)"
+  else
+    mkdir -p "$BENCH_DIR/sym-rows"
+  fi
+
+  log "bench-sym: fleet-liveness preflight (every client node's mount)"
+  local c
+  for c in "${clients[@]}"; do
+    remote "$(node_pub "$c")" MNT="$MOUNTPOINT" NODE="$c" <<'EOS'
+set -euo pipefail
+mountpoint -q "$MNT" || { echo "symmetric fleet not assembled: $MNT is not mounted on $NODE (run assemble-sym)" >&2; exit 1; }
+test -s "$MNT/.stats" || { echo "$NODE: $MNT/.stats unreadable" >&2; exit 1; }
+echo "$NODE: $MNT live"
+EOS
+  done
+
+  # The driver's node table: manager=client0, writer=client1.., reader=client0's -ro.
+  local -a entries=("manager=$(node_pub "${clients[0]}"):$MOUNTPOINT")
+  for c in "${clients[@]:1}"; do entries+=("writer=$(node_pub "$c"):$MOUNTPOINT"); done
+  [ "$SYM_TOKEN_READER" = "1" ] && entries+=("reader=$(node_pub "${clients[0]}"):$SYM_READER_MNT")
+  local substrate="aws-$MARKET/$INSTANCE_TYPE/$AWS_AZ/pg-$PLACEMENT_STRATEGY (instance-store NVMe over nvmet-tcp, single NIC; one symmetric writer per node)"
+  local -a drv=("$driver"
+    "--rows=$SYM_ROWS" "--rt=$SYM_RT" "--files=$SYM_FILES" "--threads=$SYM_THREADS" "--ingest-mb=$SYM_INGEST_MB"
+    "--scale-ns=$ns" "--sqz=$REMOTE_DIR/squeezefs" "--rowdir=$BENCH_DIR/sym-rows" "--venue=cloud"
+    "--substrate=$substrate" "--cluster=$CID" "--ssh-key=$SSH_KEY_FILE" "--ssh-user=$REMOTE_USER"
+    "--mount-hook=$SCRIPT_PATH sym-hook --preset $PRESET --symmetric --cluster-id $CID"
+    "--manager-priv=$(node_priv "${clients[0]}")" "--remote-dir=$REMOTE_DIR/sym-rows")
+  [ -n "$corpus_arg" ] && drv+=("$corpus_arg")
+  [ -n "$SYM_STORAGE_DEVS" ] && drv+=("--storage=$SYM_STORAGE_DEVS")
+  # (the driver's own ssh options are this rig's SSH_OPTS verbatim —
+  # BatchMode, ConnectTimeout, accept-new, IdentitiesOnly)
+  $DRY_RUN && drv+=("--dry-run")
+  drv+=("${entries[@]}")
+
+  sym_manifest() {
+    echo "cluster=$CID preset=$PRESET symmetric=1 instance_type=$INSTANCE_TYPE az=$AWS_AZ region=$AWS_REGION market=$MARKET placement=$PLACEMENT_STRATEGY"
+    echo "rows=$SYM_ROWS (gate 2 sym-tarx | gate 3 sym-scale N in {$ns} | gate 3b sym-shared-dir + -ls) — tests/cloud_sym_rows.sh over ssh, laws = tests/sym_rows_lib.sh (the matrix's)"
+    echo "fleet: manager ${clients[0]}:$MOUNTPOINT + $((${#clients[@]} - 1)) joined writer node(s) ${clients[*]:1}$([ "$SYM_TOKEN_READER" = "1" ] && echo " + token reader ${clients[0]}:$SYM_READER_MNT"); ONE symmetric writer per node; storage=$SYM_STORAGE_DEVS"
+    echo "rt=$SYM_RT files=$SYM_FILES threads=$SYM_THREADS ingest_mb=$SYM_INGEST_MB corpus=${SYM_TARBALL:-$SYM_TAR_SRC}"
+    echo "instrument=tar -xf (the shipped corpus), tests/mdstorm.c, dd bs=4M conv=fsync, python3 O_CREAT|O_EXCL creators, ls -l (the matrix's sym legs' instruments)"
+    echo "substrate=$substrate — cloud substrate, a THIRD class: never spliced into devsub loop/tcp or squeeze-test medians (docs/rc-manifest.md tiers)"
+    echo "repo_commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "discipline: an instance leaving running mid-row => COUNT ABORTED, restart from zero (never splice); every rate row RT >= $SYM_RT s"
+    echo "ts=$ts"
+  }
+  if $DRY_RUN; then
+    echo "-- manifest.txt would contain:"; sym_manifest | sed 's/^/   /'
+  else
+    sym_manifest >"$BENCH_DIR/manifest.txt"
+  fi
+
+  log "bench-sym: the row driver -> $BENCH_DIR/sym-rows"
+  spot_monitor_start
+  assert_fleet_running
+  local row_rc=0
+  if $DRY_RUN; then
+    printf '+'; printf ' %q' "${drv[@]}"; printf '\n'
+    "${drv[@]}" || row_rc=$?
+  else
+    # EVIDENCE BEFORE VERDICT: the driver writes its rows/snapshots/fsck
+    # transcripts into the results dir as it goes; the per-node daemon
+    # logs are pulled below UNCONDITIONALLY, then the verdict.
+    "${drv[@]}" 2>&1 | tee "$BENCH_DIR/sym-rows/driver.log" || row_rc=$?
+  fi
+  spot_monitor_stop
+
+  log "bench-sym: pull the per-node daemon logs"
+  for c in "${clients[@]}"; do
+    if $DRY_RUN; then
+      printf '+ scp %s@%s:/tmp/sqz-sym-*.log %s/sym-rows/logs/%s/\n' "$REMOTE_USER" "$(node_pub "$c")" "$BENCH_DIR" "$c"
+      continue
+    fi
+    mkdir -p "$BENCH_DIR/sym-rows/logs/$c"
+    # --log-file is 0600 root (VAL-7h): stage world-readable copies.
+    remote "$(node_pub "$c")" <<'EOS' || true
+set -euo pipefail
+mkdir -p /tmp/sym-rows/logs
+for f in /tmp/sqz-sym-*.log /tmp/sqz-sym-*.mount.out; do
+  [ -f "$f" ] && install -m 0644 "$f" /tmp/sym-rows/logs/ || true
+done
+chmod -R a+rX /tmp/sym-rows/logs
+EOS
+    scp -r "${SSH_OPTS[@]}" -i "$SSH_KEY_FILE" "$REMOTE_USER@$(node_pub "$c"):/tmp/sym-rows/logs/." "$BENCH_DIR/sym-rows/logs/$c/" \
+      || warn "could not pull $c's daemon logs"
+  done
+  [ "$row_rc" -eq 0 ] \
+    || die "the symmetric row driver FAILED (rc=$row_rc) — rows/snapshots/logs pulled to $BENCH_DIR/sym-rows before this verdict (evidence before verdict)"
+  assert_fleet_running   # the rows count only if the fleet survived them
+  echo
+  echo "Symmetric rows complete. Results: $BENCH_DIR (manifest; sym-rows/rows.txt = the labelled rows + verdicts; per-node .stats snapshots, fsck transcripts and daemon logs under sym-rows/; fleet verified running end-to-end — count valid)"
 }
 
 # ---------------------------------------------------------------------------
@@ -1909,7 +2596,10 @@ cmd_full() {
   cmd_launch
   ASSUME_YES=true       # the cost confirmation already happened at launch
   cmd_deploy
-  if [ "$PRESET" = "mw" ]; then
+  if [ "$PRESET" = "mw" ] && [ "$SYMMETRIC" = "1" ]; then
+    cmd_assemble_sym
+    cmd_bench_sym
+  elif [ "$PRESET" = "mw" ]; then
     cmd_assemble_mw
     cmd_bench_mw
   else
@@ -1928,8 +2618,11 @@ case "$SUBCMD" in
   deploy)            cmd_deploy ;;
   assemble)          cmd_assemble ;;
   assemble-mw)       cmd_assemble_mw ;;
+  assemble-sym)      cmd_assemble_sym ;;
   bench)             cmd_bench ;;
   bench-mw)          cmd_bench_mw ;;
+  bench-sym)         cmd_bench_sym ;;
+  sym-hook)          cmd_sym_hook ;;
   status)            cmd_status ;;
   teardown)          cmd_teardown ;;
   full)              cmd_full ;;

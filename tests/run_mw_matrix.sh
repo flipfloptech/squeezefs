@@ -4806,6 +4806,21 @@ sys.exit(0 if ok else 1)
 PYEOF
     log "$label: OFFLINE census clean — every writer left, the probe judged every inode (current_era_exempted 0), C9 = C10 = 0"
     "$MWFLEET" mount 0 || die "$label: the manager's re-mount failed"
+    # The remounted manager is a SUCCESSOR S6 owner inside its failover
+    # grace window (T_owner, reclaim only — spec §6.7): a remounted reader
+    # or joiner is a FRESH membership acquire, which the window refuses by
+    # design, and a reader takes the refusal as final (the shipped S5
+    # posture: it stays invisible to `squeezefs clients`), so the fleet's
+    # `membership_mode=member` gate would read `off`. Wait the window out,
+    # as an operator's retry would (the s10-delegation leg's posture); the
+    # first run of this arm found the ordering (PR 13e review round 2).
+    local grace
+    for ((t = 0; t < 90; t++)); do
+        grace="$(stat_field 0 membership_grace_remaining_ms)"
+        [ -z "$grace" ] || [ "$grace" = "0" ] && break
+        sleep 1
+    done
+    log "$label: the remounted manager's grace window closed (waited ${t}s); re-admitting the members"
     for i in $(member_idxs); do
         [ "$i" = "0" ] && continue
         case " ${joiners[*]} " in *" $i "*) continue ;; esac

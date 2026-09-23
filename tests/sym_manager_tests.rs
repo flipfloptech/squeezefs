@@ -2695,7 +2695,7 @@ async fn a_returns_run_cap_refusal_is_the_capacity_class_on_its_own_gauge() {
     let carved = ExtentGrantRecord::from_extents(record.extents().filter(|e| !before.contains(*e)));
     let run = *carved.runs.iter().max_by_key(|r| r.len).unwrap();
     assert!(
-        u64::from(run.len) >= 2 * cap as u64 + 1,
+        u64::from(run.len) > 2 * cap as u64,
         "the premise: one carved run of ≥ {} extents ({:?})",
         2 * cap + 1,
         carved.runs

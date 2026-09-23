@@ -11681,6 +11681,188 @@ async fn a_grow_ring_re_asked_after_a_lost_reply_carves_once_and_the_death_path_
 }
 
 // ---------------------------------------------------------------------------
+// PR 13g review round 2, Issue 20 — the death path's settle never fails
+// silently, and a released segment is never freed twice.
+// ---------------------------------------------------------------------------
+
+/// **A refused death-path settle ABORTS the recovery step, the re-run
+/// completes it, and the segment the dead page names is released exactly
+/// ONCE** (PR 13g review round 2, Issue 20). The round-1 death path ran
+/// `settle_pending_ring_segment` `Try`-admitted under the SMO mutex and
+/// treated a refusal as a WARN: the page still went `Recovered`, the
+/// release freed its ring — the named segment included — while the
+/// pending word STOOD, and the identity's rejoin settled against no page
+/// ("not named") and FREED the segment's extents a second time, extents
+/// the manager may have carved into another appender's ring by then
+/// (lowest-free-first) — two custodians, a live ring freed under its
+/// writer. The pin: a joiner GROWS its ring for real (a stall bumped, its
+/// cadence asks `GrowRing`, its page names the segment, the witness
+/// stands), dies, the death path's settle is refused once (the seam):
+/// the recovery is DEFERRED with the page `Recovering`, nothing released;
+/// the re-run settles (the word cleared, the segment released with the
+/// ring, `appender_pending_segments_returned` unmoved), the region
+/// released, a second joiner carves a ring from the freed extents, the
+/// identity rejoins — the second joiner's ring stays allocated and the
+/// witness is clear. RED before the fix: the first run recovers with the
+/// word standing, and the rejoin frees the second joiner's ring extents.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_death_path_settle_aborts_the_step_and_a_released_segment_is_freed_once() {
+    use squeezefs::meta_backend::kv::backend::recovery::TEST_RECOVERY_SETTLE_FAIL_ONCE;
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    TEST_RECOVERY_SETTLE_FAIL_ONCE.store(false, Ordering::SeqCst);
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let joiner = join(&uris, &venue, &mvol, 3).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let id = jvol.appender_stats().unwrap().appender_id;
+    let identity = jvol.joined_wire().unwrap().identity;
+    let files = create_files(&joiner, shared, "x", 8).await;
+    jvol.checkpoint_now().await.unwrap();
+    // A REAL growth: a stall bumped, the cadence's drain-then-grow asks the
+    // manager, the page names the segment, the witness stands.
+    let segments0 = page_of(&uris[0], &mvol, id).await.unwrap().segments.len();
+    jvol.appenders_public()
+        .unwrap()
+        .region(id)
+        .unwrap()
+        .stalls
+        .fetch_add(1, Ordering::Relaxed);
+    jvol.checkpoint_now().await.unwrap();
+    let page = page_of(&uris[0], &mvol, id).await.unwrap();
+    assert_eq!(
+        page.segments.len(),
+        segments0 + 1,
+        "the ring grew by one segment"
+    );
+    let segment = *page.segments.last().unwrap();
+    let hint = mvol
+        .appender_hint_for(identity.node_token, identity.mount_slot)
+        .await
+        .unwrap();
+    assert_eq!(
+        hint.pending.map(|p| (p.start, p.len)),
+        Some((segment.start, segment.len)),
+        "the premise: the pending witness names the segment the page names"
+    );
+    let node_size = NODE_SIZE as u64;
+    let heap_start = mvol.superblock().heap.start;
+    let segment_extents: Vec<u64> = (0..segment.len / node_size)
+        .map(|i| (segment.start - heap_start) / node_size + i)
+        .collect();
+    // The death, the settle refused once.
+    drop(jvol);
+    drop(joiner);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    assert!(!mvol.record_death_with_key(identity, 9, 0).await.unwrap());
+    let returned0 = mvol.appender_stats().unwrap().pending_segments_returned;
+    TEST_RECOVERY_SETTLE_FAIL_ONCE.store(true, Ordering::SeqCst);
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert!(
+        !TEST_RECOVERY_SETTLE_FAIL_ONCE.load(Ordering::SeqCst),
+        "the settle was reached"
+    );
+    assert_eq!(
+        rep.recovered(),
+        0,
+        "a refused settle ABORTS the recovery step ({rep:?})"
+    );
+    assert_eq!(
+        page_of(&uris[0], &mvol, id).await.unwrap().state,
+        AppenderState::Recovering,
+        "the page stays Recovering for the re-run"
+    );
+    for e in &segment_extents {
+        assert!(
+            mvol.allocator().is_allocated(*e),
+            "nothing released under a standing witness ({e})"
+        );
+    }
+    // The re-run: settled (the named segment's word CLEARED, nothing
+    // returned by the settle), recovered.
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    let hint = mvol
+        .appender_hint_for(identity.node_token, identity.mount_slot)
+        .await
+        .unwrap();
+    assert_eq!(
+        hint.pending, None,
+        "the witness is cleared by the re-run ({hint:?})"
+    );
+    assert_eq!(
+        mvol.appender_stats().unwrap().pending_segments_returned,
+        returned0,
+        "a segment the page names is released with the ring, never 'returned'"
+    );
+    // The release: the next projection frees the ring (the segment with
+    // it) — exactly once.
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(rep.regions_released, 1, "{rep:?}");
+    for e in &segment_extents {
+        assert!(
+            !mvol.allocator().is_allocated(*e),
+            "released with the ring ({e})"
+        );
+    }
+    // A SECOND joiner carves its ring lowest-free-first — from the
+    // released extents.
+    let second = join(&uris, &venue, &mvol, 4).await;
+    let svol = Arc::clone(&second.volumes[0]);
+    let sid = svol.appender_stats().unwrap().appender_id;
+    let second_ring: std::collections::BTreeSet<u64> = page_of(&uris[0], &mvol, sid)
+        .await
+        .unwrap()
+        .segments
+        .iter()
+        .flat_map(|s| {
+            let first = (s.start.max(heap_start) - heap_start) / node_size;
+            first..(s.end() - heap_start) / node_size
+        })
+        .collect();
+    let reused: Vec<u64> = segment_extents
+        .iter()
+        .copied()
+        .filter(|e| second_ring.contains(e))
+        .collect();
+    assert!(
+        !reused.is_empty(),
+        "the premise: the second joiner's ring reuses released segment extents"
+    );
+    // The identity's rejoin: a fresh region over the Free page — the
+    // witness clear, nothing freed under the second joiner.
+    let again = join(&uris, &venue, &mvol, 3).await;
+    let avol = Arc::clone(&again.volumes[0]);
+    for e in &second_ring {
+        assert!(
+            mvol.allocator().is_allocated(*e),
+            "the second joiner's ring extent {e} was freed under it by the rejoin's settle"
+        );
+    }
+    assert_eq!(
+        mvol.appender_stats().unwrap().pending_segments_returned,
+        returned0,
+        "the rejoin returned nothing — no witness stood"
+    );
+    assert_all_resolve(&manager, shared, &files).await;
+    assert_supply_gauges_zero(&avol, "the rejoined joiner");
+    shutdown(&again).await;
+    shutdown(&second).await;
+    assert_must_stay_zero(&mvol, "manager");
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+// ---------------------------------------------------------------------------
 // PR 13g review round 1, Issue 2 — the unnamed POOL survives a crash-rejoin.
 // ---------------------------------------------------------------------------
 

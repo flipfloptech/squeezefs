@@ -137,6 +137,12 @@ pub static TEST_RECOVERY_HOLD_BEFORE_REREAD: AtomicBool = AtomicBool::new(false)
 pub static TEST_RECOVERY_HELD: AtomicBool = AtomicBool::new(false);
 pub static TEST_RECOVERY_HOLD_RELEASE: squeezefs_ipc::sqz_notify::Notify =
     squeezefs_ipc::sqz_notify::Notify::new();
+/// Test seam (PR 13g review round 2, Issue 20): the death path's settle
+/// of the dead identity's pending `GrowRing` segment FAILS once with the
+/// retryable class — the shape of ring 0 refusing the settle's admission
+/// under the recovery's own hold of the SMO mutex. Consumed by the
+/// failure.
+pub static TEST_RECOVERY_SETTLE_FAIL_ONCE: AtomicBool = AtomicBool::new(false);
 
 fn test_fail_at_step(step: u32, id: u32) -> std::result::Result<(), KvError> {
     if TEST_RECOVERY_FAIL_AT_STEP
@@ -2049,10 +2055,20 @@ impl KvMetaBackend {
         // point on the death path; PR 13g review round 1, Issue 1).
         {
             let _g = self.manager_verbs.lock().await;
-            if let Err(e) = self
-                .settle_pending_ring_segment(identity, Some(&page), "the death ledger's recovery")
-                .await
+            let settled = if TEST_RECOVERY_SETTLE_FAIL_ONCE
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
             {
+                Err(KvError::JournalReserveExhausted { needed: 0 })
+            } else {
+                self.settle_pending_ring_segment(
+                    identity,
+                    Some(&page),
+                    "the death ledger's recovery",
+                )
+                .await
+            };
+            if let Err(e) = settled {
                 log::warn!(
                     "meta volume {}: appender {id}'s pending GrowRing segment could not be \
                      settled ({e}) — the next verb for its identity retries",

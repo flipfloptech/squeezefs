@@ -11697,8 +11697,10 @@ async fn a_grow_ring_re_asked_after_a_lost_reply_carves_once_and_the_death_path_
 /// (lowest-free-first) — two custodians, a live ring freed under its
 /// writer. The pin: a joiner GROWS its ring for real (a stall bumped, its
 /// cadence asks `GrowRing`, its page names the segment, the witness
-/// stands), dies, the death path's settle is refused once (the seam):
-/// the recovery is DEFERRED with the page `Recovering`, nothing released;
+/// stands), dies, the death path's settle is REFUSED once (the seam — a
+/// refusal no cover cycle discharges; a full ring's `JournalReserve
+/// Exhausted` is the drain-and-retry class and recovers by design): the
+/// recovery is DEFERRED with the page `Recovering`, nothing released;
 /// the re-run settles (the word cleared, the segment released with the
 /// ring, `appender_pending_segments_returned` unmoved), the region
 /// released, a second joiner carves a ring from the freed extents, the
@@ -11707,12 +11709,12 @@ async fn a_grow_ring_re_asked_after_a_lost_reply_carves_once_and_the_death_path_
 /// word standing, and the rejoin frees the second joiner's ring extents.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_death_path_settle_aborts_the_step_and_a_released_segment_is_freed_once() {
-    use squeezefs::meta_backend::kv::backend::recovery::TEST_RECOVERY_SETTLE_FAIL_ONCE;
+    use squeezefs::meta_backend::kv::backend::recovery::TEST_RECOVERY_SETTLE_REFUSE_N;
     use std::sync::atomic::Ordering;
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
-    TEST_RECOVERY_SETTLE_FAIL_ONCE.store(false, Ordering::SeqCst);
+    TEST_RECOVERY_SETTLE_REFUSE_N.store(0, Ordering::SeqCst);
     let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
     let shared = dirs[0];
     let manager = open_under(&uris, &Knobs::armed()).await;
@@ -11755,18 +11757,20 @@ async fn a_refused_death_path_settle_aborts_the_step_and_a_released_segment_is_f
     let segment_extents: Vec<u64> = (0..segment.len / node_size)
         .map(|i| (segment.start - heap_start) / node_size + i)
         .collect();
-    // The death, the settle refused once.
+    // The death, the settle REFUSED once (the seam's class is one no cover
+    // cycle discharges).
     drop(jvol);
     drop(joiner);
     park_gate::test_reset();
     squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
     assert!(!mvol.record_death_with_key(identity, 9, 0).await.unwrap());
     let returned0 = mvol.appender_stats().unwrap().pending_segments_returned;
-    TEST_RECOVERY_SETTLE_FAIL_ONCE.store(true, Ordering::SeqCst);
+    TEST_RECOVERY_SETTLE_REFUSE_N.store(1, Ordering::SeqCst);
     let rep = recover_dead_appenders_set(&manager).await.unwrap();
-    assert!(
-        !TEST_RECOVERY_SETTLE_FAIL_ONCE.load(Ordering::SeqCst),
-        "the settle was reached"
+    assert_eq!(
+        TEST_RECOVERY_SETTLE_REFUSE_N.load(Ordering::SeqCst),
+        0,
+        "the seam refused the one settle"
     );
     assert_eq!(
         rep.recovered(),
@@ -11811,12 +11815,12 @@ async fn a_refused_death_path_settle_aborts_the_step_and_a_released_segment_is_f
             "released with the ring ({e})"
         );
     }
-    // A SECOND joiner carves its ring lowest-free-first — from the
-    // released extents.
+    // A SECOND joiner carves its ring and its join grant lowest-free-first
+    // — from the released extents.
     let second = join(&uris, &venue, &mvol, 4).await;
     let svol = Arc::clone(&second.volumes[0]);
     let sid = svol.appender_stats().unwrap().appender_id;
-    let second_ring: std::collections::BTreeSet<u64> = page_of(&uris[0], &mvol, sid)
+    let mut second_held: std::collections::BTreeSet<u64> = page_of(&uris[0], &mvol, sid)
         .await
         .unwrap()
         .segments
@@ -11826,23 +11830,24 @@ async fn a_refused_death_path_settle_aborts_the_step_and_a_released_segment_is_f
             first..(s.end() - heap_start) / node_size
         })
         .collect();
+    second_held.extend(record_extents(&mvol, sid).await);
     let reused: Vec<u64> = segment_extents
         .iter()
         .copied()
-        .filter(|e| second_ring.contains(e))
+        .filter(|e| second_held.contains(e))
         .collect();
     assert!(
         !reused.is_empty(),
-        "the premise: the second joiner's ring reuses released segment extents"
+        "the premise: the second joiner's ring or grant reuses released segment extents"
     );
     // The identity's rejoin: a fresh region over the Free page — the
     // witness clear, nothing freed under the second joiner.
     let again = join(&uris, &venue, &mvol, 3).await;
     let avol = Arc::clone(&again.volumes[0]);
-    for e in &second_ring {
+    for e in &second_held {
         assert!(
             mvol.allocator().is_allocated(*e),
-            "the second joiner's ring extent {e} was freed under it by the rejoin's settle"
+            "the second joiner's extent {e} was freed under it by the rejoin's settle"
         );
     }
     assert_eq!(

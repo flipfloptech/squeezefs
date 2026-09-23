@@ -138,11 +138,13 @@ pub static TEST_RECOVERY_HELD: AtomicBool = AtomicBool::new(false);
 pub static TEST_RECOVERY_HOLD_RELEASE: squeezefs_ipc::sqz_notify::Notify =
     squeezefs_ipc::sqz_notify::Notify::new();
 /// Test seam (PR 13g review round 2, Issue 20): the death path's settle
-/// of the dead identity's pending `GrowRing` segment FAILS once with the
-/// retryable class — the shape of ring 0 refusing the settle's admission
-/// under the recovery's own hold of the SMO mutex. Consumed by the
-/// failure.
-pub static TEST_RECOVERY_SETTLE_FAIL_ONCE: AtomicBool = AtomicBool::new(false);
+/// of the dead identity's pending `GrowRing` segment is REFUSED with the
+/// admission class this many times — the shape of ring 0 refusing the
+/// settle's admission under the recovery's own hold of the SMO mutex; a
+/// count past the drain-and-retry bound is the PERSISTENT shape (the
+/// step aborts, the page stays `Recovering`). Decremented per refusal.
+pub static TEST_RECOVERY_SETTLE_REFUSE_N: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
 
 fn test_fail_at_step(step: u32, id: u32) -> std::result::Result<(), KvError> {
     if TEST_RECOVERY_FAIL_AT_STEP
@@ -2052,30 +2054,19 @@ impl KvMetaBackend {
         // ring (`release_recovered_regions`); one the manager carved that
         // the page never named — the incarnation died between the reply
         // and its page write — is returned HERE (the witness's settle
-        // point on the death path; PR 13g review round 1, Issue 1).
-        {
-            let _g = self.manager_verbs.lock().await;
-            let settled = if TEST_RECOVERY_SETTLE_FAIL_ONCE
-                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                Err(KvError::JournalReserveExhausted { needed: 0 })
-            } else {
-                self.settle_pending_ring_segment(
-                    identity,
-                    Some(&page),
-                    "the death ledger's recovery",
-                )
-                .await
-            };
-            if let Err(e) = settled {
-                log::warn!(
-                    "meta volume {}: appender {id}'s pending GrowRing segment could not be \
-                     settled ({e}) — the next verb for its identity retries",
-                    self.path.display()
-                );
-            }
-        }
+        // point on the death path; PR 13g review round 1, Issue 1). The
+        // settle's entry is admitted DRAIN-AND-RETRY (review round 2,
+        // Issue 20 — the recovery's own law for every control entry it
+        // writes under the SMO mutex: a `Try` on a ring 0 full of user
+        // windows refuses, and the checkpoint task cannot drain it while
+        // we hold the mutex); the cover cycle runs with `manager_verbs`
+        // RELEASED (the grant cadence inside a cycle takes it — the SMO →
+        // verbs order). A settle still refused ABORTS the step: the page
+        // stays `Recovering`, the re-run resumes here — never a WARN over
+        // a page about to go `Recovered` with the word standing, whose
+        // ring the release would free and the rejoin free AGAIN.
+        self.settle_dead_pending_segment(identity, &page, id, &mut smo)
+            .await?;
         drop(smo);
         test_fail_at_step(8, id)?;
 
@@ -2340,6 +2331,83 @@ impl KvMetaBackend {
         leaves.sort_unstable();
         leaves.dedup();
         Ok(TreeAddrs { interior, leaves })
+    }
+
+    /// The death path's settle of the dead identity's pending `GrowRing`
+    /// segment, DRAIN-AND-RETRY (review round 2, Issue 20): the settle's
+    /// `Try` admission is retried across barriered cover cycles of THIS
+    /// task (the recovery holds the SMO mutex — the checkpoint task cannot
+    /// drain ring 0 for it), each attempt under `manager_verbs` and each
+    /// cycle with it released (the cadence inside a cycle takes it); the
+    /// bound is `COVER_CYCLES_MAX`, its class the tail's (`Busy` when it
+    /// moved — the next projection re-runs the recovery from its
+    /// `Recovering` page — `Corrupt` when it did not).
+    async fn settle_dead_pending_segment(
+        &self,
+        identity: AppenderIdentity,
+        page: &AppenderPage,
+        id: u32,
+        smo: &mut SmoContext,
+    ) -> std::result::Result<(), KvError> {
+        let tail_start = self.ring.core().reusable_upto();
+        for cycle in 0..=checkpoint::COVER_CYCLES_MAX {
+            let settled = {
+                let _g = self.manager_verbs.lock().await;
+                if TEST_RECOVERY_SETTLE_REFUSE_N
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+                {
+                    // The seam: a settle REFUSED for a reason no cover
+                    // cycle discharges (the shape the step must abort on).
+                    Err(KvError::Busy(format!(
+                        "{}: TEST_RECOVERY_SETTLE_REFUSE_N refused the settle",
+                        self.path.display()
+                    )))
+                } else {
+                    self.settle_pending_ring_segment(
+                        identity,
+                        Some(page),
+                        "the death ledger's recovery",
+                    )
+                    .await
+                }
+            };
+            match settled {
+                Ok(_) => return Ok(()),
+                // A full ring: one barriered cycle advances `reusable_upto`,
+                // then the settle again — `admit_control_drain_and_retry`'s
+                // law; the last cycle falls through to the classification.
+                Err(KvError::JournalReserveExhausted { .. }) => {
+                    if cycle < checkpoint::COVER_CYCLES_MAX {
+                        self.checkpoint_cycle(smo, true).await?;
+                    }
+                }
+                Err(e) => {
+                    return Err(KvError::Busy(format!(
+                        "{}: appender {id}'s pending GrowRing segment could not be settled ({e}) \
+                         — the recovery step is deferred, the page stays Recovering for the \
+                         re-run",
+                        self.path.display()
+                    )));
+                }
+            }
+        }
+        let tail = self.ring.core().reusable_upto();
+        if tail != tail_start {
+            return Err(KvError::Busy(format!(
+                "{}: appender {id}'s pending-segment settle found no ring-0 admission in {} \
+                 barriered cycles (tail {tail_start} → {tail}) — the ring is busy; the next \
+                 ledger poll re-runs the recovery",
+                self.path.display(),
+                checkpoint::COVER_CYCLES_MAX
+            )));
+        }
+        Err(KvError::Corrupt(format!(
+            "{}: appender {id}'s pending-segment settle found no ring-0 admission in {} \
+             barriered cycles with the tail pinned at {tail_start} — a wedge no flush discharges",
+            self.path.display(),
+            checkpoint::COVER_CYCLES_MAX
+        )))
     }
 
     /// A PARKING-free admission for a control entry while the caller holds
@@ -2888,6 +2956,34 @@ impl KvMetaBackend {
                 continue;
             }
             let _handover = self.handover.lock().await;
+            // A pending `GrowRing` word this page's ring SATISFIES (the
+            // page names the segment) is CLEARED before the ring is
+            // released (review round 2, Issue 20's belt): the segment goes
+            // back with its ring here, and a word left standing would have
+            // the identity's next settle FREE it a second time. A word the
+            // page does not name is another settle point's (the segment
+            // is not in this ring). A clear that cannot land skips this
+            // region for the next projection — never a release over a
+            // standing word.
+            {
+                let _g = self.manager_verbs.lock().await;
+                match self
+                    .clear_pending_segment_named_by(page.identity, &page.segments)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(err) => {
+                        log::warn!(
+                            "meta volume {}: recovered appender {}'s pending GrowRing word could \
+                             not be cleared ahead of its release ({err}) — the release waits for \
+                             the next projection",
+                            self.path.display(),
+                            e.appender_id
+                        );
+                        continue;
+                    }
+                }
+            }
             let segments = std::mem::take(&mut page.segments);
             page.state = AppenderState::Free;
             page.grant.clear();

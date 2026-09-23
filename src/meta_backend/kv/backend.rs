@@ -10276,8 +10276,23 @@ impl KvMetaBackend {
             // incarnation (dead or left before its page named it, and its
             // death path never ran) is returned before this one's ring is
             // carved — the rejoin is one of the witness's settle points
-            // (review round 1, Issue 1).
-            self.settle_pending_ring_segment(identity, None, "the identity's rejoin")
+            // (review round 1, Issue 1) — judged against the identity's
+            // LAST page in ANY state (review round 2, Issue 20): a
+            // `Recovered` / `Free` page that names the segment has it
+            // released with its ring (the death path's release, the leave)
+            // or about to be — the word is CLEARED there, never freed a
+            // second time under whoever holds the extents now; only a
+            // segment no page of the identity names is returned.
+            let last_page = entries
+                .iter()
+                .filter_map(|e| e.page.as_ref())
+                .filter(|p| {
+                    p.identity.node_token == identity.node_token
+                        && p.identity.mount_slot == identity.mount_slot
+                })
+                .max_by_key(|p| (p.term, p.generation))
+                .cloned();
+            self.settle_pending_ring_segment(identity, last_page.as_ref(), "the identity's rejoin")
                 .await?;
             let ring_bytes = if ring_want_bytes == 0 {
                 let hint = self
@@ -10598,6 +10613,43 @@ impl KvMetaBackend {
             identity.mount_slot
         );
         Ok(Some(extent))
+    }
+
+    /// **Clear an identity's pending `GrowRing` word when `segments` name
+    /// its segment** (review round 2, Issue 20 — the release's belt): the
+    /// settle's NAMED arm alone — the segment is released with the ring
+    /// the caller is about to free, so the word must not survive to be
+    /// freed again by the identity's next settle. A word naming a segment
+    /// outside `segments`, or no word, is left for its own settle point.
+    /// Under the caller's hold of `manager_verbs`; `Try`-admitted (the
+    /// release runs outside the SMO mutex — a refusal is the caller's
+    /// skip, never a release over a standing word).
+    pub(super) async fn clear_pending_segment_named_by(
+        &self,
+        identity: super::appender::AppenderIdentity,
+        segments: &[super::superblock::ExtentRef],
+    ) -> std::result::Result<(), KvError> {
+        let hint = self
+            .appender_hint_for(identity.node_token, identity.mount_slot)
+            .await?;
+        let Some(p) = hint.pending else {
+            return Ok(());
+        };
+        if !segments
+            .iter()
+            .any(|s| s.start == p.start && s.len == p.len)
+        {
+            return Ok(());
+        }
+        let cleared = super::slot_state::AppenderHint {
+            pending: None,
+            ..hint
+        };
+        self.write_control_entry(
+            vec![Self::appender_hint_put(identity, cleared)],
+            EntryAdmission::Try,
+        )
+        .await
     }
 
     /// **`GrowRing { appender_id, want_bytes }`** (PR 13g, F-R5 — PR 2's

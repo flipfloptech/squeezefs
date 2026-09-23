@@ -968,6 +968,60 @@ async fn stale_writer_revalidates_and_retries_after_a_merge() {
     }
 }
 
+/// **A merge's successor is an IMAGE the SMO context counts** (PR 13g
+/// review round 1, Issue 10a; F-B1's image class). `SmoContext::
+/// images_written` — the flush pass's per-image unit's count and the
+/// joiner's SMO-rate input — was incremented by `smo_replace` alone;
+/// `smo_merge` wrote its successor (`write_node`, one fresh extent) and
+/// counted nothing, so a flush pass whose sibling check MERGED classified
+/// that node as an APPEND with an SMO's wall: the per-node unit absorbed a
+/// 5–14 ms merge as one node's append, and the projection over hundreds
+/// of dirty nodes read seconds. The pin: two leaves under a level-1 root,
+/// 95 % deleted, the sweep merges them — the context's image count moves
+/// by exactly the successor. RED before the fix: 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merges_successor_image_is_counted_on_the_smo_context() {
+    let mut vol = Vol::new(64 * 1024, 512, 0);
+    let tree = vol.tree(TREE_INODES).await;
+    let mut n = 0u64;
+    while tree.root_level().await.expect("level") < 1 {
+        tree.insert(&ikey(n), val(n, 64)).await.expect("seed");
+        n += 1;
+        if n.is_multiple_of(64) {
+            drain(&tree, &mut vol.ctx).await;
+        }
+        assert!(n < 100_000, "split never triggered");
+    }
+    tree.flush_dirty(&mut vol.ctx).await.expect("flush");
+    for i in 0..n {
+        if i % 20 != 0 {
+            tree.delete(&ikey(i)).await.expect("delete");
+        }
+    }
+    // The deletes' flush appends tombstones — no image; then the sweep.
+    tree.flush_dirty(&mut vol.ctx).await.expect("flush");
+    vol.cover_everything();
+    let images0 = vol.ctx.images_written();
+    let merges0 = META_KV_NODE_MERGES.load(Ordering::Relaxed);
+    let sweep = tree
+        .merge_underfull(&mut vol.ctx, false, None)
+        .await
+        .expect("merge sweep");
+    let merges = META_KV_NODE_MERGES.load(Ordering::Relaxed) - merges0;
+    assert!(
+        sweep.outcome.merges >= 1 && merges == sweep.outcome.merges,
+        "two underfull leaves must merge ({merges})"
+    );
+    // Every merge writes exactly ONE successor image; a root collapse
+    // writes none.
+    assert_eq!(
+        vol.ctx.images_written() - images0,
+        merges,
+        "a merge's successor is an image the context counts (merges {merges}, collapses {})",
+        sweep.outcome.root_collapses
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn merge_vs_commit_storm_loses_nothing() {
     const WRITERS: u64 = 8;

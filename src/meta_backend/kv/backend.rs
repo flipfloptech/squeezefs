@@ -19685,6 +19685,7 @@ impl KvMetaBackend {
             flush_ceiling_excused_max_ms: AtomicU64::new(0),
             pressure_cycles: AtomicU64::new(0),
             pending_segments_returned: AtomicU64::new(0),
+            pool_restored_extents: AtomicU64::new(0),
             cadence_pressure_seen: AtomicU64::new(0),
             joined: AtomicBool::new(false),
             join_refusal,

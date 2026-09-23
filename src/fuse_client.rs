@@ -13984,6 +13984,10 @@ impl SqueezefsFilesystem {
                     "appender_pending_segments_returned".into(),
                     appender(&|s| s.pending_segments_returned),
                 );
+                metrics.insert(
+                    "appender_pool_restored_extents".into(),
+                    appender(&|s| s.pool_restored_extents),
+                );
                 // THE MANAGER FAMILY (design-symmetric-metadata §11 — PR 3,
                 // dark): per volume; `vacant` / 0 on every bit-17-absent
                 // mount. `manager_lease` is the posture word — `held` (this

@@ -2529,6 +2529,11 @@ pub struct AppenderSet {
     /// PR 13g review round 1, Issue 1 — the detected form of the class
     /// that was a leak no census saw). ≈ 0 on a healthy fleet.
     pub pending_segments_returned: std::sync::atomic::AtomicU64,
+    /// Pool extents the own-residue open's census moved back from CLAIMED
+    /// to UNCLAIMED (`appender_pool_restored_extents`; PR 13g review round
+    /// 1, Issue 2 — the unnamed pool a crash-rejoin's `recover` lands
+    /// claimed). 0 on every clean lifecycle.
+    pub pool_restored_extents: std::sync::atomic::AtomicU64,
     /// `pressure_cycles` as the grant cadence last read it — a cadence
     /// that finds it moved ran on a PRESSURE-DRIVEN cycle (the ring is
     /// the bottleneck, not the heap) and returns nothing (PR 13g, F-R5).
@@ -2919,6 +2924,7 @@ impl AppenderSet {
             flush_ceiling_service_cap_ms: self.flush_ceiling_service_cap_ms,
             pressure_cycles: self.pressure_cycles.load(Relaxed),
             pending_segments_returned: self.pending_segments_returned.load(Relaxed),
+            pool_restored_extents: self.pool_restored_extents.load(Relaxed),
             manager_lease: self
                 .manager_lease
                 .lock()
@@ -2968,6 +2974,7 @@ impl AppenderSet {
                         leases: r.leases().len() as u64,
                         self_recovered: r.self_recovered,
                         grant_unclaimed: grant.unclaimed(),
+                        grant_unclaimed_runs: grant.unclaimed_runs().len() as u64,
                         grant_claimed: grant.claimed(),
                         grant_pending: grant.pending(),
                         grant_returnable: grant.returnable(),
@@ -2998,6 +3005,8 @@ pub struct AppenderRegionStats {
     /// The region's grant: unclaimed remainder, claimed images, frees
     /// parked on its tail.
     pub grant_unclaimed: u64,
+    /// The unclaimed remainder's runs (the page names ≤ `GRANT_RUNS_MAX`).
+    pub grant_unclaimed_runs: u64,
     pub grant_claimed: u64,
     pub grant_pending: u64,
     /// Releases the tail covered, awaiting the cadence's return.
@@ -3048,6 +3057,8 @@ pub struct AppenderStats {
     pub pressure_cycles: u64,
     /// `GrowRing` segments returned unnamed (PR 13g review round 1, Issue 1).
     pub pending_segments_returned: u64,
+    /// Pool extents the own-residue census restored (Issue 2).
+    pub pool_restored_extents: u64,
     /// The Manager family (§11, PR 3).
     pub manager_lease: ManagerLease,
     pub meta_pr_wero: bool,

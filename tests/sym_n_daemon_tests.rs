@@ -11657,6 +11657,151 @@ async fn a_grow_ring_re_asked_after_a_lost_reply_carves_once_and_the_death_path_
 }
 
 // ---------------------------------------------------------------------------
+// PR 13g review round 1, Issue 2 — the unnamed POOL survives a crash-rejoin.
+// ---------------------------------------------------------------------------
+
+/// **A joiner killed with a pool wider than its page names rejoins with
+/// the pool WHOLE — `claimed ≡ reachable`, no C13 orphan, no fsck** (PR
+/// 13g review round 1, Issue 2). The page names the pool's largest
+/// `GRANT_RUNS_MAX` = 4 runs; the rest stays unclaimed in RAM. A DEAD
+/// joiner's recovery returns them; an own-residue REJOIN
+/// (`RegionGrant::recover` — every record extent the page does not name
+/// lands CLAIMED) routed nothing to them and freed nothing: C13
+/// candidates only at an fsck run at the joiner, its repair gated — the
+/// crash-class leak PR 3 review round 1 Issue 9 had closed by making the
+/// page name EVERY unclaimed extent, reopened by the pool. Now the own-
+/// residue open runs the death path's orphan census for its OWN region
+/// (`restore_own_pools`: a claimed extent no tree of this mount reaches
+/// and no in-window claim named is the pool — back to UNCLAIMED,
+/// `appender_pool_restored_extents`). The shape: the joiner's pool grown
+/// in SIX asks with the manager claiming between them (non-adjacent
+/// runs — more than the four the page names), the joiner killed (dropped
+/// without its leave), the same identity rejoined over its `Live` page.
+/// RED before the fix: the unnamed runs read claimed at the rejoin, the
+/// joiner's C13 census names them, the pool is short by their extents.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiner_killed_with_a_pool_wider_than_its_page_names_rejoins_with_the_pool_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    // A 512 MiB member: the manager's interleaving claims and six pool
+    // grants never near the fixture heap's reserve.
+    let uris = format_stamped_set_with_config_len(dir.path(), 1, 512 * 1024 * 1024).await;
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let mdir = manager
+        .create(1, "mgr", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .unwrap()
+        .ino;
+    let joiner = join(&uris, &venue, &mvol, 3).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let id = jvol.appender_stats().unwrap().appender_id;
+    let shared = joiner
+        .create(1, "own", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .unwrap()
+        .ino;
+    let files = create_files(&joiner, shared, "x", 8).await;
+    // (claimed, unclaimed) of the joiner's region; (returned, granted) of
+    // its set — the joiner's one own region.
+    let region_faces = |vol: &KvMetaBackend| {
+        let s = vol.appender_stats().unwrap();
+        let own = s
+            .regions
+            .iter()
+            .find(|r| r.id == id)
+            .expect("the region")
+            .clone();
+        (
+            own.grant_claimed,
+            own.grant_unclaimed,
+            s.grant_returned,
+            s.grant_granted,
+        )
+    };
+    // Six asks, the manager claiming between them: the pool grows by a
+    // non-adjacent run each time.
+    for round in 0..6u32 {
+        let (_, unclaimed, _, _) = region_faces(&jvol);
+        let got = jvol
+            .joined_extent_grant(u32::try_from(unclaimed + 16).unwrap())
+            .await
+            .expect("a grant");
+        assert!(got > 0, "round {round} grew the pool ({got})");
+        create_files(&manager, mdir, &format!("m{round}-"), 400).await;
+        mvol.checkpoint_now().await.unwrap();
+    }
+    let runs = jvol
+        .appender_stats()
+        .unwrap()
+        .regions
+        .iter()
+        .find(|r| r.id == id)
+        .map(|r| r.grant_unclaimed_runs)
+        .unwrap();
+    assert!(
+        runs > squeezefs::meta_backend::kv::appender::GRANT_RUNS_MAX as u64,
+        "the premise: the pool holds more runs than the page names ({runs})"
+    );
+    jvol.checkpoint_now().await.unwrap();
+    let (claimed0, unclaimed0, _, granted0) = region_faces(&jvol);
+    assert!(unclaimed0 >= 16 * 5, "the pool: {unclaimed0}");
+    // The kill: dropped without its leave — its page stays Live.
+    drop(jvol);
+    drop(joiner);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    // The rejoin over own residue.
+    let again = join(&uris, &venue, &mvol, 3).await;
+    let avol = Arc::clone(&again.volumes[0]);
+    assert_eq!(
+        avol.appender_stats().unwrap().appender_id,
+        id,
+        "the same region"
+    );
+    let (claimed1, unclaimed1, returned1, granted1) = region_faces(&avol);
+    let s = avol.appender_stats().unwrap();
+    assert_eq!(granted1, granted0, "the record is the grant");
+    assert_eq!(
+        granted1,
+        claimed1 + returned1 + unclaimed1,
+        "the closure holds at the rejoin"
+    );
+    assert_eq!(
+        unclaimed1, unclaimed0,
+        "the pool is WHOLE at the rejoin (claimed {claimed0} → {claimed1}; restored {})",
+        s.pool_restored_extents
+    );
+    assert_eq!(claimed1, claimed0, "no pool extent reads claimed");
+    assert!(
+        s.pool_restored_extents >= unclaimed0 - unclaimed1.min(unclaimed0)
+            && s.pool_restored_extents > 0,
+        "the census restored the unnamed runs ({})",
+        s.pool_restored_extents
+    );
+    let orphans = avol.c13_orphan_image_extents().await.unwrap();
+    assert!(
+        orphans.is_empty(),
+        "no C13 orphan at the rejoined joiner: {orphans:?}"
+    );
+    assert_all_resolve(&again, shared, &files).await;
+    assert_supply_gauges_zero(&avol, "the rejoined joiner");
+    shutdown(&again).await;
+    assert_must_stay_zero(&mvol, "manager");
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+// ---------------------------------------------------------------------------
 // PR 13g review round 1, Issue 3 — a carve or a return wider than ONE
 // control entry.
 // ---------------------------------------------------------------------------

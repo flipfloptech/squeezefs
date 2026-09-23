@@ -1214,6 +1214,14 @@ pub const PENDING_FREE_FORCE_CYCLES: u64 = 8;
 /// `tests/sym_slot_transfer_tests.rs`.
 pub const COVER_CYCLES_MAX: u32 = 8 * PENDING_FREE_FORCE_CYCLES as u32;
 
+/// The cycles a cover-to-FIXPOINT loop runs before it gives up — the
+/// shutdown's "tail == head" convergence and (PR 13g) a joined appender's
+/// ring growth under its closed gate: a cycle's flush pass journals its
+/// SMOs past the head its tail was computed from and the next cycle
+/// covers them, so with nothing else arriving the term converges within
+/// the SMO cascade height; the bound is defensive.
+pub const FIXPOINT_COVER_CYCLES_MAX: u64 = 16;
+
 /// Spawn the per-volume checkpoint/writeback task (called by
 /// `KvMetaBackend::open`). The task holds a `Weak` backend reference —
 /// dropping the backend without `shutdown` reaps it on its next tick (the
@@ -1754,7 +1762,7 @@ async fn tick(
         let bound = match crate::meta_backend::kv::backend::TEST_SHUTDOWN_FIXPOINT_CYCLES
             .load(Ordering::Relaxed)
         {
-            0 => 16,
+            0 => FIXPOINT_COVER_CYCLES_MAX,
             n => n - 1,
         };
         // Coverage alone is not convergence: the cycle's own barrier

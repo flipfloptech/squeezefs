@@ -1726,8 +1726,22 @@ impl KvMetaBackend {
     /// barrier that advances its `reusable_upto`. Nothing of the manager's
     /// is touched: no tree-0 publication (a leased slot's root rides its
     /// page, KD-SYM-3), no meta bitmap page, no ledger record, no page 0.
-    /// The grant cadence at the end returns and refills over the wire.
+    /// The grant cadence at the end recycles, returns the surplus and
+    /// refills over the wire; a ring the storm outgrew is then GROWN
+    /// (drain-then-grow, PR 13g — `joined_grow_ring_if_due`).
     pub(in crate::meta_backend::kv) async fn joined_checkpoint_cycle(
+        &self,
+        smo: &mut SmoContext,
+        barrier_now: bool,
+    ) -> Result<(), KvError> {
+        self.joined_checkpoint_cycle_body(smo, barrier_now).await?;
+        self.joined_grow_ring_if_due(smo).await;
+        Ok(())
+    }
+
+    /// One cycle's body — everything but the growth step (the growth's
+    /// own cover cycle runs this under the growth gate).
+    async fn joined_checkpoint_cycle_body(
         &self,
         smo: &mut SmoContext,
         barrier_now: bool,
@@ -1935,18 +1949,8 @@ impl KvMetaBackend {
                  grant (tail {tail}); the manager's refill owns the retry"
             );
         }
-        // Ring growth is the manager's bitmap act — declined here; the
-        // ring drains at `admissible ÷ cadence` per tick (PR 2's law).
-        {
-            let stalls = region.stalls.load(Ordering::Relaxed);
-            if stalls != region.stalls_at_last_grow.load(Ordering::Relaxed) {
-                region.stalls_at_last_grow.store(stalls, Ordering::Relaxed);
-                if let Some(w) = self.joined.get() {
-                    w.grow_declined.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-        // ---- The grant cadence over the wire.
+        // ---- The grant cadence over the wire (the commit rate folded
+        // beside the SMO rate: the ring derivation's measured input).
         let now = crate::mono_core::monotonic_ns_u64();
         let last = set.cadence_last_ns.swap(now, Ordering::AcqRel);
         let cycle_ms = if last == 0 {
@@ -1954,7 +1958,289 @@ impl KvMetaBackend {
         } else {
             now.saturating_sub(last) / 1_000_000
         };
+        region.fold_commit_rate(cycle_ms);
         self.joined_grant_cadence(cycle_ms, smo).await
+    }
+
+    /// **The joined appender's ring growth — drain-then-grow** (PR 13g,
+    /// F-R5; design §5.3.2's owed arm — PR 2 grew a ring only when it
+    /// happened to be drained, PR 12b DECLINED growth on a joiner, and
+    /// the fleet's joiners sat at the 512 KiB floor checkpointing 8×/s
+    /// under a create storm). The decision: the derived ring size
+    /// (`appender_ring_bytes_derived` over the MEASURED commit rate —
+    /// two max-ages of the stream) above the ring, or PR 2's stall law
+    /// (a park on the full ring since the last decision) — one more
+    /// segment of `derived − current` (the stall law's step is the
+    /// ring's own size, PR 2's doubling), to the volume's per-appender
+    /// ceiling. The drain: the region's growth gate closes (every pass
+    /// parks at admission — PR 2's Dekker pair), the window empties (no
+    /// pass inside, no stage-B window in flight — awaited on the region's
+    /// `drained` notify, bounded by one landing ceiling), a COVER cycle
+    /// flushes and barriers what landed so `head == reusable_upto`; then
+    /// `GrowRing` over the wire (the manager's carve, zero, control entry,
+    /// barrier), the page naming the grown table into BOTH directory
+    /// slots + barrier (a table change — the directory-first law), the
+    /// ring SWAPPED (`grown_with` at the drained head), the gate opened.
+    /// A ring the cover could not drain (a deferred SMO pins the tail)
+    /// or a manager that cannot carve leaves the ring as it is for the
+    /// next cycle; `joined_ring_grow_declined` counts the table at
+    /// `RING_SEGMENTS_MAX` alone. Nothing here is the cycle's error: the
+    /// cycle landed before growth was decided.
+    async fn joined_grow_ring_if_due(&self, smo: &mut SmoContext) {
+        let (Some(set), Ok(region)) = (self.appenders.as_ref(), self.joined_region()) else {
+            return;
+        };
+        let region = Arc::clone(region);
+        let Some(wire) = self.joined.get().cloned() else {
+            return;
+        };
+        if self.is_shutting_down() || self.is_failed() {
+            return;
+        }
+        let ring = region.ring();
+        let current = ring.ring_bytes();
+        let stalls = region.stalls.load(Ordering::Relaxed);
+        let stalled = stalls != region.stalls_at_last_grow.load(Ordering::Relaxed);
+        let ceiling = super::super::appender::sym_ring_ceiling_bytes(self.sb.heap.end());
+        let derived = super::super::appender::appender_ring_bytes_derived(
+            region.commit_ewma_bytes_per_s.load(Ordering::Relaxed),
+            self.sb.heap.end(),
+        );
+        if derived <= current && !stalled {
+            return;
+        }
+        // One step is at least a DOUBLING (PR 2's law — a segment of the
+        // ring's own size): the table holds `RING_SEGMENTS_MAX` segments,
+        // so a ring that followed a converging EWMA by its increments
+        // alone would spend them on the first second of a storm and stall
+        // at a quarter of the derived size.
+        let target = derived
+            .max(current.saturating_mul(2))
+            .min(ceiling)
+            .max(current);
+        let node_size = u64::from(self.sb.node_size);
+        let step = target.saturating_sub(current) / node_size * node_size;
+        if step == 0 {
+            region.stalls_at_last_grow.store(stalls, Ordering::Relaxed);
+            return;
+        }
+        if ring.segments().len() >= super::super::appender::RING_SEGMENTS_MAX {
+            region.stalls_at_last_grow.store(stalls, Ordering::Relaxed);
+            wire.grow_declined.fetch_add(1, Ordering::Relaxed);
+            log::debug!(
+                "meta volume {}: joined appender {}'s ring wants {target} bytes (derived {derived}, \
+                 stalled {stalled}) but its table is at {} segments — declined \
+                 (joined_ring_grow_declined)",
+                self.path.display(),
+                region.id,
+                super::super::appender::RING_SEGMENTS_MAX
+            );
+            return;
+        }
+        // The gate: passes park at admission from here.
+        region.growing.store(true, Ordering::SeqCst);
+        let bound = std::time::Duration::from_millis(set.flush_ceiling_ms.max(1));
+        let deadline = std::time::Instant::now() + bound;
+        let window_empty = || {
+            region.passes_inside.load(Ordering::SeqCst) == 0
+                && region.windows_inflight.load(Ordering::SeqCst) == 0
+        };
+        // A pass inside the window may be PARKED at ring admission (the
+        // storm filled the ring behind the cycle that just ran) — it waits
+        // for the tail, which only a cycle of this task advances: the wait
+        // covers between its parks (one cycle per round, the tick's own
+        // period between rounds) instead of holding the gate shut for the
+        // whole bound with the ring full.
+        let round =
+            std::time::Duration::from_millis(super::super::checkpoint::checkpoint_tick_period_ms(
+                crate::meta_backend::resolve_flush_interval_ms(),
+            ));
+        loop {
+            if window_empty() {
+                break;
+            }
+            if let Err(e) = self.joined_checkpoint_cycle_body(smo, true).await {
+                region.end_growth();
+                log::warn!(
+                    "meta volume {}: joined appender {}'s growth drain cycle failed ({e}) — growth \
+                     retried next cycle",
+                    self.path.display(),
+                    region.id
+                );
+                return;
+            }
+            let notified = region.drained.notified();
+            if window_empty() {
+                break;
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                region.end_growth();
+                log::debug!(
+                    "meta volume {}: joined appender {}'s window did not empty inside the {} ms \
+                     landing ceiling — growth retried next cycle",
+                    self.path.display(),
+                    region.id,
+                    bound.as_millis()
+                );
+                return;
+            }
+            let _ = squeezefs_ipc::sqz_time::timeout(left.min(round), notified).await;
+        }
+        // The cover: everything that landed before the gate closed,
+        // flushed and barriered — to the FIXPOINT (the shutdown's law):
+        // a cycle's own flush pass journals its SMOs past the head its
+        // tail was computed from ("reclamation lags one cycle"), so the
+        // cycle after it covers them; with the gate closed nothing else
+        // arrives and the term converges within the SMO cascade height.
+        let drained = |ring: &super::super::journal::JournalRing| {
+            let core = ring.core();
+            core.head() == core.reusable_upto() && ring.min_inflight_start() == u64::MAX
+        };
+        let cover_bound = super::super::checkpoint::FIXPOINT_COVER_CYCLES_MAX;
+        for _ in 0..cover_bound {
+            if drained(&region.ring()) {
+                break;
+            }
+            if let Err(e) = self.joined_checkpoint_cycle_body(smo, true).await {
+                region.end_growth();
+                log::warn!(
+                    "meta volume {}: joined appender {}'s growth cover cycle failed ({e}) — growth \
+                     retried next cycle",
+                    self.path.display(),
+                    region.id
+                );
+                return;
+            }
+        }
+        let ring = region.ring();
+        let core = ring.core();
+        let head = core.head();
+        if !drained(&ring) {
+            region.end_growth();
+            log::debug!(
+                "meta volume {}: joined appender {}'s ring is not drained after {cover_bound} \
+                 cover cycles (head {head}, reusable_upto {}, a reservation open: {}) — growth \
+                 retried next cycle",
+                self.path.display(),
+                region.id,
+                core.reusable_upto(),
+                ring.min_inflight_start() != u64::MAX
+            );
+            return;
+        }
+        let own = wire.appender_id;
+        let segment = wire
+            .with_client_under_smo(self, smo, "GrowRing", |c| Box::pin(c.grow_ring(own, step)))
+            .await;
+        let extent = match segment {
+            Ok(Some((start, len))) => super::super::superblock::ExtentRef { start, len },
+            Ok(None) => {
+                region.stalls_at_last_grow.store(stalls, Ordering::Relaxed);
+                region.end_growth();
+                wire.grow_declined.fetch_add(1, Ordering::Relaxed);
+                log::info!(
+                    "meta volume {}: the manager declined joined appender {own}'s GrowRing \
+                     ({step} bytes wanted at {current}) — the ring stays \
+                     (joined_ring_grow_declined)",
+                    self.path.display()
+                );
+                return;
+            }
+            Err(e) => {
+                region.end_growth();
+                log::warn!(
+                    "meta volume {}: joined appender {own}'s GrowRing deferred ({e}) — retried \
+                     next cycle",
+                    self.path.display()
+                );
+                return;
+            }
+        };
+        // The page names the grown table — a TABLE CHANGE, so it lands in
+        // both directory slots before any position is written under the
+        // new map (the directory-first law).
+        {
+            let mut page = region.page.lock().unwrap_or_else(|e| e.into_inner());
+            page.segments.push(extent);
+            page.head_hint = head;
+            page.ledger_tail_seq = head;
+        }
+        region.dir_named.store(0, Ordering::Release);
+        let written = async {
+            Self::write_region_page_at(&self.path, &region).await?;
+            self.sync_device().await.map_err(KvError::Io)
+        }
+        .await;
+        if let Err(e) = written {
+            // The manager's carve stands durable, this page does not name
+            // it: the bounded leak class (one segment) — loud.
+            {
+                let mut page = region.page.lock().unwrap_or_else(|e| e.into_inner());
+                page.segments.pop();
+            }
+            region.end_growth();
+            log::error!(
+                "meta volume {}: joined appender {own}'s page could not name its grown ring \
+                 ({e}) — the segment at {:#x} ({} bytes) the manager carved is claimed by no page \
+                 until a bitmap-vs-reachability census returns it",
+                self.path.display(),
+                extent.start,
+                extent.len
+            );
+            return;
+        }
+        let grown = match ring.grown_with(super::super::journal::RingSegment::from_extent(&extent))
+        {
+            Ok(g) => g,
+            Err(e) => {
+                // Refused only on a drained-ring race the checks above
+                // excluded under the gate. The page must not name a table
+                // the ring does not write under (the never-in-place law):
+                // the segment comes off the page again, both slots.
+                {
+                    let mut page = region.page.lock().unwrap_or_else(|e| e.into_inner());
+                    page.segments.pop();
+                }
+                region.dir_named.store(0, Ordering::Release);
+                let undone = async {
+                    Self::write_region_page_at(&self.path, &region).await?;
+                    self.sync_device().await.map_err(KvError::Io)
+                }
+                .await;
+                region.end_growth();
+                log::error!(
+                    "meta volume {}: joined appender {own}'s ring swap refused ({e}) after its \
+                     page named the grown table — the page rewritten without it ({}); the \
+                     segment at {:#x} ({} bytes) is the bounded leak class",
+                    self.path.display(),
+                    match undone {
+                        Ok(()) => "ok".to_string(),
+                        Err(e) => format!("failed: {e}"),
+                    },
+                    extent.start,
+                    extent.len
+                );
+                return;
+            }
+        };
+        region.last_tail.store(head, Ordering::Release);
+        region.durable_tail.fetch_max(head, Ordering::AcqRel);
+        region.ring.store(Arc::new(grown));
+        region.ring_grows.fetch_add(1, Ordering::Relaxed);
+        region.stalls_at_last_grow.store(stalls, Ordering::Relaxed);
+        wire.ring_grows.fetch_add(1, Ordering::Relaxed);
+        region.end_growth();
+        log::info!(
+            "meta volume {}: joined appender {own}'s ring grew by one segment of {} bytes at \
+             {:#x} ({current} → {} bytes, {} segments; derived {derived}, stalled {stalled}; \
+             appender_ring_grows, joined_wire_ring_grows)",
+            self.path.display(),
+            extent.len,
+            extent.start,
+            region.ring().ring_bytes(),
+            region.ring().segments().len()
+        );
     }
 
     /// `ExtentGrant { own, want }` over the wire: the manager carves and
@@ -2329,13 +2615,35 @@ impl KvMetaBackend {
             }
         }
         // Due at 50 % consumption AND below the derived size (the
-        // manager's own cadence law); the ask names the derived size.
-        let due = {
+        // manager's own cadence law) — or when the images the pending
+        // commits already PROMISED (§4.7's admission against this grant)
+        // leave less than the derived pool as headroom: the next flush
+        // pass's demand is known before it runs, and a pool that covers
+        // the promises plus the derived size never meets it exhausted.
+        // The ask names promises + the derived size (a top-up).
+        // The target is bounded by the heap share the manager clamps a
+        // wire ask to (`grant_extents_wire_cap`, this mount's projection
+        // of the free heap) — an ask above it is answered verbatim, a
+        // verb for nothing.
+        let (due, want) = {
             let g = region.grant();
-            g.refill_due() && g.unclaimed() < derived
+            let promised = g.promised();
+            let cap = self.appenders.as_ref().map_or(u64::MAX, |set| {
+                super::super::appender::grant_extents_wire_cap(
+                    self.alloc.free_extents(),
+                    set.appenders_known.load(Ordering::Relaxed).max(1),
+                )
+            });
+            let target = derived
+                .saturating_add(promised)
+                .min(cap)
+                .max(derived.min(cap));
+            (
+                (g.refill_due() && g.unclaimed() < derived) || g.unclaimed() < target,
+                u32::try_from(target).unwrap_or(u32::MAX).max(1),
+            )
         };
         if due && !super::super::appender::test_manager_unreachable() {
-            let want = u32::try_from(derived).unwrap_or(u32::MAX).max(1);
             if let Err(e) = self.joined_extent_grant_at(want, Some(smo)).await {
                 log::warn!(
                     "meta volume {}: joined appender {}'s ExtentGrant refill deferred ({e})",

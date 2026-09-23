@@ -9262,10 +9262,11 @@ impl KvMetaBackend {
         // (`grant_extents_wire_cap`), the bound durable state puts on any
         // appender's grant. `want == 0` keeps the manager's own derivation
         // (a fresh join's floor).
+        let wire_explicit = matches!(class, super::alloc_ext_core::AllocClass::User)
+            && want != 0
+            && set.region(appender_id).is_none();
         let want = match class {
-            super::alloc_ext_core::AllocClass::User
-                if want != 0 && set.region(appender_id).is_none() =>
-            {
+            super::alloc_ext_core::AllocClass::User if wire_explicit => {
                 super::appender::clamp_grant_want(
                     want,
                     super::appender::grant_extents_wire_cap(
@@ -9436,6 +9437,25 @@ impl KvMetaBackend {
                 merged.encode()?,
             ),
         ));
+        // A WIRE appender's derived-size ask above the floor is what its
+        // identity's next join starts from (`appender_hint`, PR 13g) —
+        // the record rides this entry when the word grows.
+        if wire_explicit && want > super::appender::GRANT_EXTENTS_FLOOR {
+            if let Some(identity) = self.wire_appender_identity(appender_id).await? {
+                let hint = self
+                    .appender_hint_for(identity.node_token, identity.mount_slot)
+                    .await?;
+                if want > hint.grant_extents {
+                    recs.push(Self::appender_hint_put(
+                        identity,
+                        super::slot_state::AppenderHint {
+                            grant_extents: want,
+                            ..hint
+                        },
+                    ));
+                }
+            }
+        }
         if let Err(e) = self.write_control_entry(recs, EntryAdmission::Try).await {
             for c in claimed {
                 self.alloc.release_unpublished(c);
@@ -10031,10 +10051,15 @@ impl KvMetaBackend {
                 }
             };
             // The ring: whole extents, coalesced into ≤ RING_SEGMENTS_MAX
-            // segments (the open-time carve's law).
+            // segments (the open-time carve's law). A rejoining identity
+            // starts at the size its predecessor grew to (`appender_hint`, PR
+            // 13g) — never the floor again after a storm.
             let volume_len = self.sb.heap.end();
             let ring_bytes = if ring_want_bytes == 0 {
-                super::appender::resolve_sym_ring_bytes(0, volume_len)
+                let hint = self
+                    .appender_hint_for(identity.node_token, identity.mount_slot)
+                    .await?;
+                super::appender::resolve_sym_ring_bytes_hinted(hint.ring_bytes, volume_len)
             } else {
                 ring_want_bytes.clamp(
                     super::appender::SYM_RING_FLOOR_BYTES,
@@ -10171,8 +10196,22 @@ impl KvMetaBackend {
         // The initial grant — its own control entry, outside the join's
         // critical section (the verb mutex is not reentrant).
         let (id, page_addr, ring_segments, node_seq_base) = chosen;
-        // The grant writes the joiner's page with it.
-        let grant = self.manager_extent_grant(id, 0).await?;
+        // The grant writes the joiner's page with it. Its size is the
+        // JOIN's known cost class (PR 13g, F-R5): the rotor the joiner is
+        // about to mint (`M` slot trees, one image each — every one a
+        // first record under a storm) plus the SMO floor, or the larger
+        // pool the identity's predecessor asked (`appender_hint`) — so a
+        // storm's first cycle finds its images in the pool instead of
+        // asking one SMO's worth at a time (the box's onset burst).
+        let want = {
+            let hint = self
+                .appender_hint_for(identity.node_token, identity.mount_slot)
+                .await?;
+            let rotor = set.slot_leases().map_or(0, |p| p.mint_slots());
+            u32::try_from((super::appender::GRANT_EXTENTS_FLOOR + rotor).max(hint.grant_extents))
+                .unwrap_or(u32::MAX)
+        };
+        let grant = self.manager_extent_grant(id, want).await?;
         // The joiner's identity for the membership carriage (PR 4).
         if let Some(plane) = set.slot_leases() {
             plane.note_identity(id, identity.node_token, identity.mount_slot);
@@ -10185,6 +10224,207 @@ impl KvMetaBackend {
             already: false,
             node_seq_base,
         })
+    }
+
+    /// The durable `appender_hint` of identity `(node_token, mount_slot)`
+    /// — the ring size and the derived grant its predecessor incarnation
+    /// reached under load (PR 13g); zeros when none.
+    async fn appender_hint_for(
+        &self,
+        node_token: u64,
+        mount_slot: u32,
+    ) -> std::result::Result<super::slot_state::AppenderHint, KvError> {
+        let Some(control) = self.forest_control_tree() else {
+            return Ok(Default::default());
+        };
+        match control
+            .lookup(&super::slot_state::appender_hint_key(
+                node_token, mount_slot,
+            ))
+            .await?
+        {
+            Some(v) => super::slot_state::decode_appender_hint(&v),
+            None => Ok(Default::default()),
+        }
+    }
+
+    /// The identity a WIRE appender's `Live` page carries (`None` for an
+    /// in-process region, a `Free` page or an unknown id) — the hint's key.
+    async fn wire_appender_identity(
+        &self,
+        appender_id: u32,
+    ) -> std::result::Result<Option<super::appender::AppenderIdentity>, KvError> {
+        let entries = super::appender::read_directory(&self.path, &self.sb).await?;
+        Ok(entries
+            .iter()
+            .find(|e| e.appender_id == appender_id)
+            .and_then(|e| e.page.as_ref())
+            .filter(|p| p.state == super::appender::AppenderState::Live)
+            .map(|p| p.identity))
+    }
+
+    /// The `appender_hint` record's `Put` for `identity` at `hint` — a
+    /// record other control writers add to THEIR entry (`GrowRing`'s, a
+    /// wire appender's derived-size `ExtentGrant`'s); never its own write.
+    fn appender_hint_put(
+        identity: super::appender::AppenderIdentity,
+        hint: super::slot_state::AppenderHint,
+    ) -> (u8, Record) {
+        (
+            super::journal::tag_for(super::record::TREE_CONTROL, 0),
+            Record::put(
+                super::slot_state::appender_hint_key(identity.node_token, identity.mount_slot),
+                0,
+                super::slot_state::encode_appender_hint(hint),
+            ),
+        )
+    }
+
+    /// **`GrowRing { appender_id, want_bytes }`** (PR 13g, F-R5 — PR 2's
+    /// drain-then-grow over the wire; design §5.3.2): one more ring
+    /// segment for a JOINED appender whose ring is pressure-driven. The
+    /// page must be `Live` (the joiner's — one of this mount's own regions
+    /// is `Rejected`, a `Free` / recovering page too); the ask is CLAMPED
+    /// to the per-appender ceiling less the ring the page names (a wire
+    /// integer is never an allocation authority) and answers `None` when
+    /// the table is at `RING_SEGMENTS_MAX` or the clamp rounds to nothing.
+    /// The carve is the join's law made ONE contiguous run: `want`
+    /// internal-class claims, the LONGEST adjacent run kept, the rest
+    /// released (a fragmented heap answers a shorter segment — the joiner
+    /// asks again at its next cycle); the run must sit in no appender's
+    /// grant record; zeroed before anything names it (`zero_extents`);
+    /// its allocator deltas + the identity's `appender_hint` (the grown size —
+    /// the identity's next join starts there) as ONE control entry,
+    /// barriered. The JOINER's page names the segment (one writer per
+    /// page) — a joiner dying between this reply and that write leaves
+    /// the segment claimed by no page: the in-process growth's own
+    /// bits-before-page window, the bounded leak class (one segment) the
+    /// bitmap-vs-reachability census owes.
+    pub async fn manager_grow_ring_wire(
+        &self,
+        appender_id: u32,
+        want_bytes: u64,
+    ) -> std::result::Result<Option<super::superblock::ExtentRef>, KvError> {
+        use super::appender::{read_directory, AppenderState};
+        let set = self.manager_gate(false)?;
+        if set.owns_region(appender_id) {
+            set.verbs.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err(KvError::Rejected(format!(
+                "{}: GrowRing names appender {appender_id}, one of this mount's own regions",
+                self.path.display()
+            )));
+        }
+        let node_size = u64::from(self.sb.node_size);
+        let _g = self.manager_verbs.lock().await;
+        let entries = read_directory(&self.path, &self.sb).await?;
+        let page = entries
+            .iter()
+            .find(|e| e.appender_id == appender_id)
+            .and_then(|e| e.page.clone())
+            .filter(|p| p.state == AppenderState::Live)
+            .ok_or_else(|| {
+                set.verbs.rejected.fetch_add(1, Ordering::Relaxed);
+                KvError::Rejected(format!(
+                    "{}: GrowRing for appender {appender_id}, whose page is not Live",
+                    self.path.display()
+                ))
+            })?;
+        if page.segments.len() >= super::appender::RING_SEGMENTS_MAX {
+            return Ok(None);
+        }
+        let ceiling = super::appender::sym_ring_ceiling_bytes(self.sb.heap.end());
+        let room = ceiling.saturating_sub(page.ring_bytes());
+        let want_extents = want_bytes.min(room) / node_size;
+        if want_extents == 0 {
+            return Ok(None);
+        }
+        let mut claimed: Vec<u64> = Vec::with_capacity(want_extents as usize);
+        for _ in 0..want_extents {
+            match self.alloc.claim_internal() {
+                Ok(e) => claimed.push(e),
+                Err(KvError::NoSpace { free, reserve }) => {
+                    if claimed.is_empty() {
+                        return Err(KvError::NoSpace { free, reserve });
+                    }
+                    break;
+                }
+                Err(e) => {
+                    for c in claimed {
+                        self.alloc.release_unpublished(c);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        claimed.sort_unstable();
+        // The longest adjacent run is the segment; every other claim goes
+        // back.
+        let mut best: (usize, usize) = (0, 1);
+        let mut start = 0usize;
+        for i in 1..=claimed.len() {
+            if i == claimed.len() || claimed[i] != claimed[i - 1] + 1 {
+                if i - start > best.1 {
+                    best = (start, i - start);
+                }
+                start = i;
+            }
+        }
+        let run: Vec<u64> = claimed[best.0..best.0 + best.1].to_vec();
+        for c in claimed
+            .iter()
+            .filter(|c| !(run[0]..=run[run.len() - 1]).contains(c))
+        {
+            self.alloc.release_unpublished(*c);
+        }
+        let extent = super::superblock::ExtentRef {
+            start: self.sb.heap.start + run[0] * node_size,
+            len: run.len() as u64 * node_size,
+        };
+        let undo = |claims: &[u64]| {
+            for c in claims {
+                self.alloc.release_unpublished(*c);
+            }
+        };
+        if let Err(e) = self
+            .refuse_extents_held_elsewhere(appender_id, &run, "GrowRing's carve")
+            .await
+        {
+            undo(&run);
+            return Err(e);
+        }
+        if let Err(e) = super::appender::zero_extents(&self.path, &[extent]).await {
+            undo(&run);
+            return Err(e);
+        }
+        let grown_bytes = page.ring_bytes() + extent.len;
+        let mut recs: Vec<(u8, Record)> = run
+            .iter()
+            .map(|e| super::alloc_ext::alloc_record(*e, 0))
+            .collect();
+        let hint = self
+            .appender_hint_for(page.identity.node_token, page.identity.mount_slot)
+            .await?;
+        recs.push(Self::appender_hint_put(
+            page.identity,
+            super::slot_state::AppenderHint {
+                ring_bytes: grown_bytes.max(hint.ring_bytes),
+                ..hint
+            },
+        ));
+        if let Err(e) = self.write_control_entry(recs, EntryAdmission::Try).await {
+            undo(&run);
+            return Err(e);
+        }
+        self.sync_device().await.map_err(KvError::Io)?;
+        log::info!(
+            "meta volume {}: GrowRing — appender {appender_id}'s ring grows by one segment of {} \
+             bytes at {:#x} ({} → {grown_bytes} bytes; the identity's appender_hint follows)",
+            self.path.display(),
+            extent.len,
+            extent.start,
+            page.ring_bytes()
+        );
+        Ok(Some(extent))
     }
 
     /// Mint the next node-seq INCARNATION for a joiner (`kv::node_seq`,
@@ -19090,6 +19330,9 @@ impl KvMetaBackend {
             grant: Default::default(),
             smo_ewma_milli: AtomicU64::new(0),
             smos_this_cycle: AtomicU64::new(0),
+            commit_ewma_bytes_per_s: AtomicU64::new(0),
+            head_at_last_fold: AtomicU64::new(u64::MAX),
+            drained: squeezefs_ipc::sqz_notify::Notify::new(),
             dependency_stalls: AtomicU64::new(0),
             released: AtomicBool::new(false),
         }));
@@ -19337,6 +19580,9 @@ impl KvMetaBackend {
                 grant: Arc::new(std::sync::Mutex::new(grant)),
                 smo_ewma_milli: AtomicU64::new(0),
                 smos_this_cycle: AtomicU64::new(0),
+                commit_ewma_bytes_per_s: AtomicU64::new(0),
+                head_at_last_fold: AtomicU64::new(u64::MAX),
+                drained: squeezefs_ipc::sqz_notify::Notify::new(),
                 dependency_stalls: AtomicU64::new(0),
                 released: AtomicBool::new(false),
             }));
@@ -21070,6 +21316,7 @@ impl KvMetaBackend {
     fn region_window_settled(&self, region: u32) {
         if let Some(r) = self.declared_region(region) {
             r.windows_inflight.fetch_sub(1, Ordering::SeqCst);
+            r.note_window_left();
         }
     }
 
@@ -21343,6 +21590,7 @@ impl KvMetaBackend {
         self.run_batch_pipeline(&mut sentinel).await;
         if let Some(r) = &growth_gate {
             r.passes_inside.fetch_sub(1, Ordering::SeqCst);
+            r.note_window_left();
         }
         // The recalled commit APPLIED (or failed as a unit): grants on
         // its objects serve again — from the RAM-authoritative state the

@@ -908,6 +908,23 @@ pub fn resolve_sym_ring_bytes(ewma_commit_bytes_per_s: u64, volume_len: u64) -> 
     }
 }
 
+/// [`resolve_sym_ring_bytes`] for a REJOINING identity (PR 13g, F-R5):
+/// the knob verbatim when set (explicit wins), else the larger of the
+/// fresh derivation and the identity's durable `appender_hint` (the size its
+/// predecessor incarnation grew to under load — PR 3's owed "persisted
+/// commit-rate EWMA as the ring-size input"), clamped to the volume's
+/// floor / ceiling and page-aligned. A hint of 0 is no hint.
+pub fn resolve_sym_ring_bytes_hinted(hint_bytes: u64, volume_len: u64) -> u64 {
+    if crate::env_knobs::opt_int_knob::<u64>(SYM_RING_KB_ENV).is_some() {
+        return resolve_sym_ring_bytes(0, volume_len);
+    }
+    let ceiling = sym_ring_ceiling_bytes(volume_len);
+    let bytes = appender_ring_bytes_derived(0, volume_len)
+        .max(hint_bytes)
+        .clamp(SYM_RING_FLOOR_BYTES, ceiling);
+    bytes / APPENDER_PAGE_LEN as u64 * APPENDER_PAGE_LEN as u64
+}
+
 /// The ring budget of a volume with a heap of `heap_len` bytes:
 /// `heap / 16` (§1.6 "Ring budget per volume") — four times the solo
 /// ring's `volume/64` share, leaving a quarter of the heap for images at
@@ -2253,6 +2270,18 @@ pub struct AppenderRegion {
     pub smo_ewma_milli: std::sync::atomic::AtomicU64,
     /// SMOs of this region's slot trees since the last cycle's EWMA fold.
     pub smos_this_cycle: std::sync::atomic::AtomicU64,
+    /// The region's COMMIT rate, bytes journaled into its ring per second,
+    /// EWMA over checkpoint cycles ([`Self::fold_commit_rate`]) — the ring
+    /// derivation's measured input (`appender_ring_bytes_derived`; PR
+    /// 13g, F-R5: PR 2 joined every ring at the floor for want of it).
+    pub commit_ewma_bytes_per_s: std::sync::atomic::AtomicU64,
+    /// The ring head at the last commit-rate fold (positions are bytes;
+    /// `u64::MAX` = not yet primed — the first fold measures nothing).
+    pub head_at_last_fold: std::sync::atomic::AtomicU64,
+    /// Woken when a pass leaves this region's admit→handoff window or a
+    /// stage-B window reaches its terminal outcome WHILE `growing` stands
+    /// — the drain-then-grow's wait (PR 13g); no poll period to derive.
+    pub drained: squeezefs_ipc::sqz_notify::Notify,
     /// SMOs refused for want of a granted extent while the manager could
     /// not refill (`manager_dependency_stalls`, must-stay-0 at the sized
     /// grant).
@@ -2286,6 +2315,35 @@ impl AppenderRegion {
         let cur = self.smo_ewma_milli.load(Relaxed);
         self.smo_ewma_milli
             .store(cur - cur / 8 + rate_milli / 8, Relaxed);
+    }
+
+    /// Fold the bytes journaled into this region's ring since the last
+    /// fold into the commit-rate EWMA (`cycle_ms` = the wall since then):
+    /// `ewma = ewma × 7/8 + rate / 8`. The head is a byte position that
+    /// continues across a ring swap (`JournalRing::grown_with` keeps it),
+    /// so the difference is the cycle's journaled bytes on any table.
+    pub fn fold_commit_rate(&self, cycle_ms: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let head = self.ring().core().head();
+        let last = self.head_at_last_fold.swap(head, Relaxed);
+        if cycle_ms == 0 || last == u64::MAX {
+            return;
+        }
+        let rate = head.saturating_sub(last).saturating_mul(1000) / cycle_ms;
+        let cur = self.commit_ewma_bytes_per_s.load(Relaxed);
+        self.commit_ewma_bytes_per_s
+            .store(cur - cur / 8 + rate / 8, Relaxed);
+    }
+
+    /// The drain-then-grow's witnesses (PR 13g): wake a growth waiting
+    /// on this region's window to empty — called where a pass leaves the
+    /// window and where a stage-B window settles, both under `growing`
+    /// (one relaxed read when nothing grows).
+    pub fn note_window_left(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.growing.load(SeqCst) {
+            self.drained.notify_waiters();
+        }
     }
 
     /// Whether `slot`'s records journal into THIS region's ring.

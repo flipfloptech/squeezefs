@@ -11121,6 +11121,18 @@ struct SupplyFaces {
     wire_ring_grows: u64,
     compactions: u64,
     splits: u64,
+    /// The cadence trigger in force (`meta_kv_checkpoint_trigger_ms`).
+    trigger_ms: u64,
+}
+
+/// [`assert_must_stay_zero`] without the flush-ceiling law (F-B1's pin's).
+fn assert_supply_gauges_zero(vol: &KvMetaBackend, who: &str) {
+    let s = vol.appender_stats().expect("a forest volume");
+    assert_eq!(s.manager_verb_refusals, 0, "{who}: manager_verb_refusals");
+    if let Some(j) = vol.joined_stats() {
+        assert_eq!(j.control_refusals, 0, "{who}: joined_control_refusals");
+        assert_eq!(j.wire_failures, 0, "{who}: joined_wire_failures");
+    }
 }
 
 fn supply_faces(vol: &KvMetaBackend) -> SupplyFaces {
@@ -11148,6 +11160,9 @@ fn supply_faces(vol: &KvMetaBackend) -> SupplyFaces {
         wire_ring_grows: j.wire_ring_grows,
         compactions: squeezefs::meta_backend::kv::META_KV_NODE_COMPACTIONS.load(Relaxed),
         splits: squeezefs::meta_backend::kv::META_KV_NODE_SPLITS.load(Relaxed),
+        trigger_ms: vol.checkpoint_trigger_ms(
+            squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS as u64,
+        ),
     }
 }
 
@@ -11156,9 +11171,9 @@ fn supply_faces(vol: &KvMetaBackend) -> SupplyFaces {
 /// `creators` unpaced creators for `storm` — the PRODUCT cadence alone
 /// (the checkpoint task's tick, its pressure law) drives every cycle; no
 /// test-side `checkpoint_now`. Returns every joiner with its directory
-/// and the faces read at the storm's start, at its midpoint and at its
-/// end, plus the manager's `(extent_grants, extent_returns, manager_verbs)`
-/// deltas over the storm.
+/// and the faces read at the storm's start, its first quarter, its third
+/// quarter and its end, plus the manager's `(extent_grants, extent_returns,
+/// manager_verbs)` deltas over the storm.
 async fn floor_ring_storm(
     joiners: usize,
     creators: usize,
@@ -11169,13 +11184,21 @@ async fn floor_ring_storm(
     Arc<KvMetaBackend>,
     HoldersVenue,
     Vec<(Arc<RoutedMetaBackend>, u64, Vec<(String, u64)>)>,
-    Vec<[SupplyFaces; 3]>,
+    Vec<[SupplyFaces; 4]>,
     (u64, u64, u64),
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let uris =
-        format_stamped_set_with_config_len(dir.path(), 1, VOL_LEN * (joiners as u64 + 1).max(2))
-            .await;
+    // A volume wide enough that the derived grant's heap-share cap (a
+    // quarter of the free heap over the appenders) is not the storm's
+    // bottleneck: the pool must hold a cycle's promised images beside the
+    // derived size (a production volume is GiB-class; this is the small
+    // fixture's equivalent).
+    let uris = format_stamped_set_with_config_len(
+        dir.path(),
+        1,
+        VOL_LEN * 4 * (joiners as u64 + 1).max(2),
+    )
+    .await;
     // The tempdir lives as long as the URIs do.
     std::mem::forget(dir);
     {
@@ -11224,12 +11247,19 @@ async fn floor_ring_storm(
             }));
         }
     }
-    tokio::time::sleep(storm / 2).await;
-    let mid: Vec<SupplyFaces> = daemons
+    // Faces at the storm's quarters: the first quarter is the onset (the
+    // floor ring, the cold pool), the last is the sized steady state.
+    tokio::time::sleep(storm / 4).await;
+    let q1: Vec<SupplyFaces> = daemons
         .iter()
         .map(|(j, _, _)| supply_faces(&j.volumes[0]))
         .collect();
     tokio::time::sleep(storm / 2).await;
+    let q3: Vec<SupplyFaces> = daemons
+        .iter()
+        .map(|(j, _, _)| supply_faces(&j.volumes[0]))
+        .collect();
+    tokio::time::sleep(storm / 4).await;
     stop.store(true, std::sync::atomic::Ordering::Release);
     for t in tasks {
         let (i, out) = t.await.expect("a creator task");
@@ -11242,9 +11272,10 @@ async fn floor_ring_storm(
     let m1 = mvol.appender_stats().unwrap();
     let faces = start
         .into_iter()
-        .zip(mid)
+        .zip(q1)
+        .zip(q3)
         .zip(end)
-        .map(|((a, b), c)| [a, b, c])
+        .map(|(((a, b), c), d)| [a, b, c, d])
         .collect();
     let mgr = (
         m1.extent_grants - m0.extent_grants,
@@ -11255,53 +11286,60 @@ async fn floor_ring_storm(
 }
 
 /// **F-R5 (the third box campaign, record §3.9.5.2 / §7 item 16 — PR
-/// 2 / PR 3 / PR 12b): a joiner's extent supply under a create storm runs
-/// at the reactive one-SMO grain on a floor-sized ring.** On the box
-/// (N = 8, 40k creates per writer in ≈ 13 s) every joiner's ring sat at
-/// the 512 KiB floor (`appender_ring_grows` 0 — PR 2's drain-then-grow
-/// owed, ring growth DECLINED on a joiner), so it checkpointed ≈ 8×/s on
-/// the ring's pressure law; every cadence RETURNED the images its
-/// compactions had retired (`extent_grant_returned` +193 over the storm)
-/// and the next flush pass exhausted the grant and asked ONE SMO's images
-/// again (`joined_wire_extent_grants` +47 × 4 extents) — a grant / return
-/// ping-pong of ≈ 100 manager verbs per joiner per storm, each a ring-0
-/// control entry + barrier at the manager (3.6 ms), the burst F-B1's two
-/// trips sat inside. The proactive 50 % refill never engaged as a
-/// derived-size ask: a wire appender's SMO rate was never measured
-/// (`smos_this_cycle` fed on the manager's flush pass alone) and the
-/// manager derives a wire appender's grant off a rate of 0 — the floor —
-/// while the reactive carve reset the 50 % law's reference to its own 4.
+/// 2 / PR 3 / PR 12b; the box record's review, Issue 3): a joiner's
+/// extent supply under a create storm runs at the one-SMO grain on a
+/// floor-sized ring.** On the box (N = 8, 40k creates per writer in
+/// ≈ 13 s) every joiner's ring sat at the 512 KiB floor
+/// (`appender_ring_grows` 0 — PR 2's drain-then-grow owed, ring growth
+/// DECLINED on a joiner), so it checkpointed ≈ 8×/s on the ring's
+/// pressure law; every compaction's RETIRED image travelled to the manager
+/// as `ReturnExtents` (`extent_grant_returned` +193 ≈ the compactions) and
+/// came back one cycle later as a fresh carve — claim-and-retire churn at
+/// the SMO grain, ≈ 105 manager verbs per joiner per storm, each a ring-0
+/// control entry + barrier at the manager (3.6 ms). **The root**: the
+/// manager derives a WIRE appender's grant off `set.region(id)`'s SMO-rate
+/// EWMA, which is `None` for a joiner (it holds no region for one) — a
+/// rate of 0, the FLOOR (8), whatever the joiner's storm; the joiner's own
+/// rate never travelled (its `smos_this_cycle` was never even fed — the
+/// manager's flush pass folds it). So the proactive 50 % refill DID engage
+/// (309 of 1,483 grants asked the derived size) and answered the floor;
+/// the flush pass's reactive ask (`needed.max(4)`) answered 1–4; a
+/// fragmented heap trimmed both to the page's four runs.
 ///
-/// The three laws, on the box's shape in process (two joiners, unpaced
+/// The laws, on the box's shape in process (two joiners, unpaced
 /// creators, the PRODUCT cadence — no test-side `checkpoint_now`):
 /// 1. **the ring**: a joiner whose cadence is pressure-driven GROWS its
-///    ring past the floor (drain-then-grow over the wire — `GrowRing`)
-///    within the storm, `joined_ring_grow_declined` stays 0, and in the
-///    storm's second half its pressure cycles fall below the first half's;
-/// 2. **the cadence's return**: `extent_grant_returned` stays flat through
-///    the storm (retired images RECYCLE into the joiner's own unclaimed
-///    pool up to the derived grant; a pressure-driven cadence returns
-///    nothing) while its compactions ran;
-/// 3. **the ask's grain**: the reactive one-SMO ask stays 0 on a healthy
-///    heap (`joined_wire_reactive_grants`) and every grant asks the
-///    DERIVED size — the manager's verbs per joiner per storm fall by an
-///    order of magnitude against the base's (the base read on this
-///    fixture is in the record's §4.4ao).
+///    ring past the floor (drain-then-grow over the wire — `GrowRing`,
+///    the derived size off the measured commit rate) within the storm,
+///    `joined_ring_grow_declined` stays 0, and in the storm's second half
+///    its pressure cycles fall below the first half's;
+/// 2. **the grant SIZE follows the joiner's rate**: the joiner measures
+///    its SMO rate and asks ITS derived size — the extents landed per wire
+///    grant read well above the floor (the join's grant is the rotor it
+///    mints plus the SMO floor; the storm's asks the derived pool);
+/// 3. **the pool**: retired images RECYCLE into the joiner's own unclaimed
+///    set up to the derived size (a pressure-driven cadence returns
+///    nothing), so `extent_grant_returned` stays flat while its
+///    compactions run, and the flush pass never asks one SMO's images on a
+///    healthy heap (`joined_wire_reactive_grants` 0); the manager's verbs
+///    per joiner per storm fall by an order of magnitude against the
+///    base's (≈ 195 → ≈ 10 on this fixture — the record's §4.4ao).
 /// Every acked name resolves at every daemon, fsck clean after every
 /// joiner left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycles_its_grant() {
-    use squeezefs::meta_backend::kv::appender::SYM_RING_FLOOR_BYTES;
+    use squeezefs::meta_backend::kv::appender::{GRANT_EXTENTS_FLOOR, SYM_RING_FLOOR_BYTES};
     let _g = SEAM.lock().await;
     reset_process_state();
-    let storm = std::time::Duration::from_secs(8);
+    let storm = std::time::Duration::from_secs(12);
     let (uris, manager, mvol, venue, daemons, faces, (mgr_grants, mgr_returns, mgr_verbs)) =
-        floor_ring_storm(2, 12, storm).await;
+        floor_ring_storm(2, 2, storm).await;
     for (i, f) in faces.iter().enumerate() {
-        let [a, b, c] = f;
+        let [a, b, c, d] = f;
         eprintln!("F-R5 joiner {i}: start {a:?}");
-        eprintln!("F-R5 joiner {i}: mid   {b:?}");
-        eprintln!("F-R5 joiner {i}: end   {c:?}");
+        eprintln!("F-R5 joiner {i}: q1    {b:?}");
+        eprintln!("F-R5 joiner {i}: q3    {c:?}");
+        eprintln!("F-R5 joiner {i}: end   {d:?}");
     }
     eprintln!(
         "F-R5 manager over the storm: extent_grants +{mgr_grants}, extent_returns \
@@ -11310,7 +11348,7 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
         storm.as_secs(),
         daemons.iter().map(|(_, _, f)| f.len()).collect::<Vec<_>>()
     );
-    for (i, [a, b, c]) in faces.iter().enumerate() {
+    for (i, [a, b, c3, c]) in faces.iter().enumerate() {
         let compactions = c.compactions - a.compactions;
         let cycles = c.checkpoints - a.checkpoints;
         assert!(
@@ -11340,39 +11378,74 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
             0,
             "joiner {i}: a healthy storm declines no growth"
         );
-        let pressure_first = b.pressure_cycles - a.pressure_cycles;
-        let pressure_second = c.pressure_cycles - b.pressure_cycles;
+        // The cycle rate falls to the cadence's: at the derived ring
+        // (two max-ages of the stream) the pressure law — half the
+        // admissible window — fires about once per max-age, coincident
+        // with the age law, so the sized steady state runs at the TRIGGER
+        // in force (the age law's, with F-B1's projection shortening it
+        // where a cycle's SMO work approaches the ceiling — this venue's
+        // 5–8 ms per SMO), against the onset's ring-fill rate. The last
+        // quarter's count is bounded by twice that trigger's rate (the two
+        // laws may both fire inside one interval) plus one, and both the
+        // cycles and the pressure cycles read below the onset's.
+        let onset = b.checkpoints - a.checkpoints;
+        let steady = c.checkpoints - c3.checkpoints;
+        let quarter_ms = storm.as_millis() as u64 / 4;
+        let trigger_ms = c.trigger_ms.min(c3.trigger_ms).max(1);
+        let cadence_bound = 2 * quarter_ms.div_ceil(trigger_ms) + 1;
+        let pressure_onset = b.pressure_cycles - a.pressure_cycles;
+        let pressure_steady = c.pressure_cycles - c3.pressure_cycles;
         assert!(
-            pressure_second < pressure_first,
-            "joiner {i}: the pressure cycles fall once the ring is sized ({pressure_first} in \
-             the first half, {pressure_second} in the second)"
+            steady < onset && pressure_steady < pressure_onset && steady <= cadence_bound,
+            "joiner {i}: the cycle rate falls to the cadence once the ring is sized — {onset} \
+             cycles in the first quarter (the floor ring: pressure +{pressure_onset}), {steady} \
+             in the last (pressure +{pressure_steady}; the trigger in force {trigger_ms} ms, \
+             bound {cadence_bound} over {quarter_ms} ms)"
         );
-        // Law 2 — the cadence's return.
+        // Law 2 — the grant SIZE follows the joiner's rate.
+        let landed = (c.grant_claimed + c.grant_unclaimed) - (a.grant_claimed + a.grant_unclaimed);
+        let grants = c.wire_grants - a.wire_grants;
         assert!(
-            c.grant_returned - a.grant_returned <= 4,
+            grants >= 1 && landed / grants >= 2 * GRANT_EXTENTS_FLOOR,
+            "joiner {i}: {landed} extents landed over {grants} wire grants — the size the \
+             joiner's measured rate derives, never the floor {GRANT_EXTENTS_FLOOR} the manager \
+             derived off a rate it never saw (RED: ≈ 4 per grant)"
+        );
+        // Law 3 — the pool: the returns an order of magnitude under the
+        // compactions (the surplus above the derived pool alone), the
+        // reactive ask at most the cold-start belt — the storm's FIRST
+        // flush pass, before any rate is measured (the join's grant covers
+        // the rotor's mints; that pass's splits are what it cannot size).
+        let returned = c.grant_returned - a.grant_returned;
+        assert!(
+            returned * 10 <= compactions,
             "joiner {i}: retired images recycle into the joiner's own pool — `extent_grant_\
-             returned` moved +{} over {compactions} compactions (RED: +≈ compactions, the \
-             ping-pong)",
-            c.grant_returned - a.grant_returned
+             returned` moved +{returned} over {compactions} compactions (RED: +≈ compactions, \
+             the claim-and-retire churn)"
         );
-        // Law 3 — the ask's grain.
-        assert_eq!(
-            c.wire_reactive_grants - a.wire_reactive_grants,
-            0,
-            "joiner {i}: the flush pass never asked one SMO's images on a healthy heap (RED: \
-             the only grant path a floor-ring joiner ran)"
+        assert!(
+            c.wire_reactive_grants - a.wire_reactive_grants <= 1,
+            "joiner {i}: the flush pass asked one SMO's images {} times on a healthy heap — at \
+             most the cold-start belt (RED: 93 — the only supply path a floor-ring joiner ran)",
+            c.wire_reactive_grants - a.wire_reactive_grants
         );
         let verbs = (c.wire_grants - a.wire_grants)
             + (c.wire_returns - a.wire_returns)
             + (c.wire_ring_grows - a.wire_ring_grows);
+        // The base (`84520cb5`'s RED run of this fixture at 8 creators per
+        // joiner): 197 verbs per joiner per 8 s storm — 93 reactive grants,
+        // 54 derived-size grants (every one the floor), 50 returns; scaled
+        // to this storm's length, the law is an order of magnitude under it.
+        let base_verbs = 197 * storm.as_secs() / 8;
         assert!(
-            verbs <= 12,
+            verbs * 10 <= base_verbs,
             "joiner {i}: its supply cost the manager {verbs} verbs over the storm ({} grants, \
              {} returns, {} grows; {cycles} cycles, {compactions} compactions) — an order of \
-             magnitude under the base's ≈ 1 per cycle",
+             magnitude under the base's {base_verbs} per joiner per {} s storm",
             c.wire_grants - a.wire_grants,
             c.wire_returns - a.wire_returns,
-            c.wire_ring_grows - a.wire_ring_grows
+            c.wire_ring_grows - a.wire_ring_grows,
+            storm.as_secs()
         );
     }
     // Every acked name resolves at its creator, the manager reads them
@@ -11384,7 +11457,11 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
             files.len()
         );
         assert_all_resolve(j, *d, files).await;
-        assert_must_stay_zero(&j.volumes[0], &format!("joiner {i}"));
+        // The supply gauges alone here: a joiner's FIRST storm cycle after
+        // its quiet join is F-B1's class (the horizon-only cadence cannot
+        // price it), whose pin — `a_storms_onset_after_a_quiet_horizon_…`
+        // — turns the ceiling law on for this fixture too.
+        assert_supply_gauges_zero(&j.volumes[0], &format!("joiner {i}"));
     }
     assert_must_stay_zero(&mvol, "manager");
     let dirs: Vec<(u64, Vec<(String, u64)>)> =

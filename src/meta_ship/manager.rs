@@ -335,6 +335,21 @@ pub enum ManagerCall {
         appender_id: u32,
         roots: Vec<WireSlotRoot>,
     },
+    /// **`GrowRing`** (PR 13g, F-R5 — PR 2's drain-then-grow over the
+    /// wire, design §5.3.2): a joined appender whose ring is
+    /// pressure-driven asks ONE more ring segment of up to `want_bytes`.
+    /// The manager carves it from the heap as one CONTIGUOUS run
+    /// (internal class, the join's carve law), zeroes it, journals its
+    /// allocator deltas + the identity's `appender_hint` (the grown size — a
+    /// rejoin starts there) as one control entry, barriers, and answers
+    /// the segment; the JOINER, its ring drained under its growth gate,
+    /// writes its page naming the grown table into both directory slots
+    /// and swaps the ring (one writer per page). `want_bytes` is clamped
+    /// to the volume's per-appender ceiling less the ring's current size
+    /// — a wire integer is never an allocation authority. `RingGrown {
+    /// segment: None }` = the table is at `RING_SEGMENTS_MAX` or the ask
+    /// rounds to nothing (the joiner counts `joined_ring_grow_declined`).
+    GrowRing { appender_id: u32, want_bytes: u64 },
 }
 
 /// PR 12b's documented verb codes (the wire encodes the declaration index).
@@ -342,6 +357,8 @@ pub const VERB_CODE_LEAVE_APPENDER: u8 = 0xB0;
 pub const VERB_CODE_PUBLISH_ENDPOINT: u8 = 0xB1;
 pub const VERB_CODE_RESOLVE_ENDPOINT: u8 = 0xB2;
 pub const VERB_CODE_PUBLISH_ROOTS: u8 = 0xB3;
+/// PR 13g's documented verb code (appended after PR 12b's block).
+pub const VERB_CODE_GROW_RING: u8 = 0xB4;
 
 /// One published root on the wire (`PublishRoots`): the routing slot,
 /// the lease generation the lessee holds it at, and the tree's words.
@@ -438,6 +455,7 @@ impl ManagerCall {
             Self::PublishEndpoint { .. } => "publish_endpoint",
             Self::ResolveEndpoint { .. } => "resolve_endpoint",
             Self::PublishRoots { .. } => "publish_roots",
+            Self::GrowRing { .. } => "grow_ring",
         }
     }
 }
@@ -606,6 +624,12 @@ pub enum ManagerReply {
     RootsPublished {
         published: u32,
         already: u32,
+    },
+    /// `GrowRing` (PR 13g): the carved segment `(start, len)` bytes, or
+    /// `None` when the ring cannot grow (its table is full, or the ask
+    /// rounds to nothing under the ceiling).
+    RingGrown {
+        segment: Option<(u64, u64)>,
     },
 }
 
@@ -1242,6 +1266,16 @@ impl ManagerService {
                         .map(|(published, already)| ManagerReply::RootsPublished {
                             published,
                             already,
+                        }),
+                    ManagerCall::GrowRing {
+                        appender_id,
+                        want_bytes,
+                    } => self
+                        .volume
+                        .manager_grow_ring_wire(*appender_id, *want_bytes)
+                        .await
+                        .map(|segment| ManagerReply::RingGrown {
+                            segment: segment.map(|s| (s.start, s.len)),
                         }),
                 }
             };
@@ -2034,6 +2068,28 @@ impl ManagerClient {
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "ResolveEndpoint answered {other:?}"
+            ))),
+        }
+    }
+
+    /// `GrowRing` (PR 13g) — `Ok(Some((start, len)))` = the carved
+    /// segment, `Ok(None)` = the ring cannot grow.
+    pub async fn grow_ring(
+        &mut self,
+        appender_id: u32,
+        want_bytes: u64,
+    ) -> Result<Option<(u64, u64)>> {
+        match self
+            .call(ManagerCall::GrowRing {
+                appender_id,
+                want_bytes,
+            })
+            .await?
+        {
+            ManagerReply::RingGrown { segment } => Ok(segment),
+            ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            other => Err(SqueezefsError::InvalidOperation(format!(
+                "GrowRing answered {other:?}"
             ))),
         }
     }

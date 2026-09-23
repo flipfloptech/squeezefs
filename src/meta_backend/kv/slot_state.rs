@@ -326,6 +326,79 @@ pub fn decode_custody_quarantine(value: &[u8]) -> Result<u64, KvError> {
     Ok(u64::from_le_bytes(b))
 }
 
+// ---------------------------------------------------------------------------
+// The appender hint (PR 13g, F-R5 — PR 3's owed "persisted commit-rate
+// EWMA as the ring-size input", and the grant's twin): what an appender
+// IDENTITY's predecessor incarnation grew to under load — the ring size
+// its `GrowRing`s reached and the largest derived grant it asked — written
+// by the manager inside those verbs' own control entries and read at the
+// identity's next `JoinAppender`, so a rejoin after a storm starts at the
+// sized ring with the sized pool, never the floor of either. Keyed by
+// `(node_token, mount_slot)` — the identity's stable part; a `Free`
+// directory page is anybody's next.
+// ---------------------------------------------------------------------------
+
+/// Key prefix of every appender-hint record in tree 0.
+pub const APPENDER_HINT_KEY_PREFIX: &[u8] = b"appender_hint:";
+/// `prefix ‖ node_token: u64 BE ‖ mount_slot: u32 BE`.
+pub const APPENDER_HINT_KEY_LEN: usize = APPENDER_HINT_KEY_PREFIX.len() + 8 + 4;
+/// Record value version (byte 0).
+pub const APPENDER_HINT_VERSION: u8 = 1;
+/// `version ‖ ring_bytes: u64 LE ‖ grant_extents: u64 LE`.
+pub const APPENDER_HINT_LEN: usize = 1 + 8 + 8;
+
+/// The words an appender hint carries (0 = no hint for that word).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AppenderHint {
+    /// The ring size the identity last grew to, bytes.
+    pub ring_bytes: u64,
+    /// The largest derived grant the identity asked, extents.
+    pub grant_extents: u64,
+}
+
+/// The tree-0 key of identity `(node_token, mount_slot)`'s appender hint.
+pub fn appender_hint_key(node_token: u64, mount_slot: u32) -> Vec<u8> {
+    let mut k = Vec::with_capacity(APPENDER_HINT_KEY_LEN);
+    k.extend_from_slice(APPENDER_HINT_KEY_PREFIX);
+    k.extend_from_slice(&node_token.to_be_bytes());
+    k.extend_from_slice(&mount_slot.to_be_bytes());
+    k
+}
+
+/// Encode an appender-hint value.
+pub fn encode_appender_hint(hint: AppenderHint) -> Vec<u8> {
+    let mut v = Vec::with_capacity(APPENDER_HINT_LEN);
+    v.push(APPENDER_HINT_VERSION);
+    v.extend_from_slice(&hint.ring_bytes.to_le_bytes());
+    v.extend_from_slice(&hint.grant_extents.to_le_bytes());
+    v
+}
+
+/// Decode an appender-hint value; total over every byte string (a wrong
+/// length or version refuses).
+pub fn decode_appender_hint(value: &[u8]) -> Result<AppenderHint, KvError> {
+    if value.len() != APPENDER_HINT_LEN {
+        return Err(KvError::Corrupt(format!(
+            "appender_hint record must be {APPENDER_HINT_LEN} bytes, got {}",
+            value.len()
+        )));
+    }
+    if value[0] != APPENDER_HINT_VERSION {
+        return Err(KvError::Corrupt(format!(
+            "appender_hint record carries version {}, expected {APPENDER_HINT_VERSION}",
+            value[0]
+        )));
+    }
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&value[1..9]);
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&value[9..17]);
+    Ok(AppenderHint {
+        ring_bytes: u64::from_le_bytes(a),
+        grant_extents: u64::from_le_bytes(b),
+    })
+}
+
 /// Key prefix of every slot-tails record in tree 0.
 pub const SLOT_TAILS_KEY_PREFIX: &[u8] = b"slot_tails:";
 /// `prefix ‖ slot: u32 BE`.

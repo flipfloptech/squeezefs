@@ -4538,10 +4538,17 @@ leg_sym_foreign_touch() {
     # create that met an errno is one line `create <name>: <error>` on
     # stderr AND in $rowdir/touch-errors.txt — the leg judges the file at
     # its end (the box's one `ENOENT` mid-handover was on the leg's stderr
-    # alone and read as a finding, not a verdict).
+    # alone and read as a finding, not a verdict). The ledger is written
+    # SYNCHRONOUSLY (the creator's stderr captured, then appended) so the
+    # end-of-leg read never races a writer — a `>(tee …)` substitution
+    # nothing waited on made the verdict timing-dependent (review round 1,
+    # Issue 11).
     : >"$rowdir/touch-errors.txt"
     sym_touch_create() { # dir prefix count
-        sym_prefixed_create "$1" "$2" "$3" >/dev/null 2> >(tee -a "$rowdir/touch-errors.txt" >&2)
+        local err rc=0
+        err="$(sym_prefixed_create "$1" "$2" "$3" 2>&1 >/dev/null)" || rc=$?
+        [ -z "$err" ] || printf '%s\n' "$err" | tee -a "$rowdir/touch-errors.txt" >&2
+        return "$rc"
     }
 
     # Phase 2 — LIVE holder: A keeps creating in its tree while B touches

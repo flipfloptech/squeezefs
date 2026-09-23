@@ -1227,40 +1227,60 @@ pub fn appender_hint_frame_len() -> u64 {
 /// `delta_frame_len` bytes each, packed by [`super::journal::pack_entries`]
 /// under [`super::journal::MAX_ENTRY_LEN`] BESIDE the rewritten
 /// `extent_grant` record and `side_frame_len` bytes of other riders (the
-/// identity's hint put). The record's frame per chunk is bounded by
-/// `record_runs + the chunk's length` runs — every extent a chunk claims
-/// or frees adds at most one run (a claim that touches no run, a free
-/// that splits one) — so the packing is exact in O(count) and never a
-/// materialized record per candidate. Before it a carve past ≈ 5,200
-/// extents or a return past ≈ 3,900 was `EntryTooLarge` for ever: the
-/// joiner's derived ask at a storm's SMO rate on a heap with room.
+/// identity's hint put). Chunk `i`'s entry carries the record AS IT
+/// STANDS AFTER the chunk — `record ∪ deltas[..range.end]` — so its frame
+/// is bounded by `record_runs + range.end` runs, the CUMULATIVE count
+/// (every extent adds at most one run: a claim that touches no run, a
+/// free that splits one; review round 2, Issue 15 — a budget of `range.
+/// len()` under-counted every chunk past the first by `range.start` runs
+/// and refused chunk 2 of a fragmented carve `EntryTooLarge`) and capped
+/// at `record_runs_cap` (the tree-0 value cap's `extent_grant_max_runs` —
+/// the record can never carry more, the carve is cut and the return
+/// refused at it), so the packing is exact in O(count) and never a
+/// materialized record per candidate. Before the chunking a carve past
+/// ≈ 5,200 extents or a return past ≈ 3,900 was `EntryTooLarge` for ever:
+/// the joiner's derived ask at a storm's SMO rate on a heap with room.
 pub fn pack_grant_deltas(
     count: usize,
     delta_frame_len: u64,
     record_runs: usize,
+    record_runs_cap: usize,
     side_frame_len: u64,
 ) -> Vec<std::ops::Range<usize>> {
     let payloads = vec![delta_frame_len; count];
     super::journal::pack_entries(&payloads, |range| {
-        super::slot_state::extent_grant_frame_len(record_runs + range.len())
+        super::slot_state::extent_grant_frame_len((record_runs + range.end).min(record_runs_cap))
             .saturating_add(side_frame_len)
     })
 }
 
 /// The deltas ONE control entry carries beside a grant record of
-/// `record_runs` runs and `side_frame_len` bytes of riders — the first
-/// chunk [`pack_grant_deltas`] cuts, in closed form: `(payload cap −
-/// record frame(record_runs) − side) / (delta frame + one run)`. The
-/// derivation's face for the tie test and the operator's arithmetic.
+/// `record_runs` runs (capped at `record_runs_cap`) and `side_frame_len`
+/// bytes of riders — the first chunk [`pack_grant_deltas`] cuts, in
+/// closed form: `(payload cap − record frame(record_runs) − side) /
+/// (delta frame + one run)` while the record can still grow a run per
+/// delta, else `(payload cap − record frame(cap) − side) / delta frame`
+/// once it sits at the cap. The derivation's face for the tie test and
+/// the operator's arithmetic.
 pub fn grant_deltas_per_entry(
     delta_frame_len: u64,
     record_runs: usize,
+    record_runs_cap: usize,
     side_frame_len: u64,
 ) -> u64 {
+    let payload = super::journal::entry_payload_cap();
+    let growing = {
+        let fixed =
+            super::slot_state::extent_grant_frame_len(record_runs).saturating_add(side_frame_len);
+        payload.saturating_sub(fixed)
+            / delta_frame_len.saturating_add(super::slot_state::GRANT_RUN_LEN as u64)
+    };
+    if record_runs.saturating_add(growing as usize) <= record_runs_cap {
+        return growing;
+    }
     let fixed =
-        super::slot_state::extent_grant_frame_len(record_runs).saturating_add(side_frame_len);
-    super::journal::entry_payload_cap().saturating_sub(fixed)
-        / delta_frame_len.saturating_add(super::slot_state::GRANT_RUN_LEN as u64)
+        super::slot_state::extent_grant_frame_len(record_runs_cap).saturating_add(side_frame_len);
+    payload.saturating_sub(fixed) / delta_frame_len.max(1)
 }
 
 /// **The ring segments a join KEEPS of a fragmented carve** (PR 13g review

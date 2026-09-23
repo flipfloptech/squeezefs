@@ -3015,23 +3015,28 @@ fn grant_deltas_pack_under_the_journal_entry_cap() {
         grant_deltas_per_entry, pack_grant_deltas,
     };
     use squeezefs::meta_backend::kv::journal::{record_frame_len, ENTRY_HDR_LEN, MAX_ENTRY_LEN};
-    use squeezefs::meta_backend::kv::slot_state::extent_grant_frame_len;
+    use squeezefs::meta_backend::kv::slot_state::{extent_grant_frame_len, extent_grant_max_runs};
     assert_eq!(alloc_delta_frame_len(), record_frame_len(8, 1));
     assert_eq!(alloc_delta_frame_len(), 25);
     assert_eq!(free_delta_frame_len(), record_frame_len(8, 9));
     assert_eq!(free_delta_frame_len(), 33);
     let hint = appender_hint_frame_len();
-    let total = |k: u64, delta: u64, runs: usize, side: u64| {
-        ENTRY_HDR_LEN + k * delta + extent_grant_frame_len(runs + k as usize) + side
-    };
     // Chunk `i`'s entry carries the record as it stands AFTER the chunk —
     // `record ∪ claimed[..ch.end]`, up to `runs + ch.end` runs on a fully
     // fragmented carve (every extent its own run) — so the budget is the
     // CUMULATIVE record, never `runs + ch.len()` (review round 2, Issue 15:
     // chunk 2 of a fragmented carve was under-budgeted by `ch.start` runs
     // and refused `EntryTooLarge`, one chunk landing per verb).
+    // The record can never carry more runs than the tree-0 value cap
+    // names (`extent_grant_max_runs` — the carve is cut and the return
+    // refused at it), so the cumulative budget is capped there: past the
+    // cap the chunks stop shrinking.
+    let cap = extent_grant_max_runs(64 * 1024);
     let cumulative = |ch: &std::ops::Range<usize>, delta: u64, runs: usize, side: u64| {
-        ENTRY_HDR_LEN + ch.len() as u64 * delta + extent_grant_frame_len(runs + ch.end) + side
+        ENTRY_HDR_LEN
+            + ch.len() as u64 * delta
+            + extent_grant_frame_len((runs + ch.end).min(cap))
+            + side
     };
     for (delta, runs, side) in [
         (alloc_delta_frame_len(), 0usize, 0u64),
@@ -3041,33 +3046,29 @@ fn grant_deltas_pack_under_the_journal_entry_cap() {
         (free_delta_frame_len(), 5_000, 0),
     ] {
         let count = 20_000usize;
-        let chunks = pack_grant_deltas(count, delta, runs, side);
+        let chunks = pack_grant_deltas(count, delta, runs, cap, side);
         assert!(chunks.len() >= 3, "{count} deltas never fit two entries");
         let mut next = 0usize;
         for ch in &chunks {
             assert_eq!(ch.start, next, "the chunks are contiguous");
             assert!(
-                total(ch.len() as u64, delta, runs, side) <= MAX_ENTRY_LEN,
-                "chunk {ch:?} fits the entry cap"
-            );
-            assert!(
                 cumulative(ch, delta, runs, side) <= MAX_ENTRY_LEN,
                 "chunk {ch:?}'s entry with the CUMULATIVE record ({} runs) fits the cap: {} > {}",
-                runs + ch.end,
+                (runs + ch.end).min(cap),
                 cumulative(ch, delta, runs, side),
                 MAX_ENTRY_LEN
             );
             next = ch.end;
         }
         assert_eq!(next, count, "the chunks cover the count");
-        let per = grant_deltas_per_entry(delta, runs, side);
+        let per = grant_deltas_per_entry(delta, runs, cap, side);
         assert_eq!(
             chunks[0].len() as u64,
             per,
             "the closed form is the first chunk"
         );
         assert!(
-            total(per + 1, delta, runs, side) > MAX_ENTRY_LEN,
+            cumulative(&(0..per as usize + 1), delta, runs, side) > MAX_ENTRY_LEN,
             "one more delta would not fit"
         );
         // Later chunks shrink as the cumulative record grows — a later
@@ -3081,27 +3082,27 @@ fn grant_deltas_pack_under_the_journal_entry_cap() {
             );
         }
     }
-    let per_claim = grant_deltas_per_entry(alloc_delta_frame_len(), 1, hint);
+    let per_claim = grant_deltas_per_entry(alloc_delta_frame_len(), 1, cap, hint);
     assert!(
         (3_000..4_000).contains(&per_claim),
         "≈ 3,500 claim deltas per entry ({per_claim})"
     );
-    let per_free = grant_deltas_per_entry(free_delta_frame_len(), 1, 0);
+    let per_free = grant_deltas_per_entry(free_delta_frame_len(), 1, cap, 0);
     assert!(
         (2_500..3_200).contains(&per_free),
         "≈ 2,900 free deltas per entry ({per_free})"
     );
     assert_eq!(
-        pack_grant_deltas(8_300, alloc_delta_frame_len(), 1, hint).len(),
+        pack_grant_deltas(8_300, alloc_delta_frame_len(), 1, cap, hint).len(),
         3,
         "the derived ask at 92 SMO/s is three entries"
     );
     assert_eq!(
-        pack_grant_deltas(8, alloc_delta_frame_len(), 0, 0).len(),
+        pack_grant_deltas(8, alloc_delta_frame_len(), 0, cap, 0).len(),
         1,
         "the floor is one entry"
     );
-    assert!(pack_grant_deltas(0, alloc_delta_frame_len(), 0, 0).is_empty());
+    assert!(pack_grant_deltas(0, alloc_delta_frame_len(), 0, cap, 0).is_empty());
 }
 
 /// **A sized join on a fragmented heap keeps the largest runs that fit the

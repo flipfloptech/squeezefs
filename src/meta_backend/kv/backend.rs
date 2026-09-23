@@ -9546,6 +9546,7 @@ impl KvMetaBackend {
             claimed.len(),
             super::appender::alloc_delta_frame_len(),
             record.runs.len(),
+            max_runs,
             side,
         );
         let mut landed = 0usize;
@@ -9795,6 +9796,7 @@ impl KvMetaBackend {
             let per_entry = super::appender::grant_deltas_per_entry(
                 super::appender::free_delta_frame_len(),
                 record_runs,
+                max_runs,
                 0,
             )
             .max(1) as usize;

@@ -21,9 +21,11 @@
 # `[mwmatrix]`, the cloud driver's `[sym-rows]`; default `[sym-rows]`).
 
 # The symmetric must-stay-0 set on one daemon (the sym-storm set + the
-# cross-owner and token tripwires); `dlm_rpcs` is asserted ABSOLUTE by the
-# rows: an own-slot op never pays a lock round trip (gate 1's law on every
-# rung).
+# cross-owner and token tripwires; `xv_cross_owner_dangling_names` is PR
+# 13e's F-R3 arm — a cross-owner plan that dropped a count step — read on
+# every sym row, not the foreign-touch census alone); `dlm_rpcs` is
+# asserted ABSOLUTE by the rows: an own-slot op never pays a lock round
+# trip (gate 1's law on every rung).
 SYM_ZERO_KEYS="meta_kv_forest_key_violations appender_fence_breach foreign_frame_overwrite_detected \
     manager_verb_refusals meta_kv_replay_key_violations meta_kv_replay_lease_violations \
     meta_kv_replay_extent_violations fsck_slot_custody_conflicts slot_lease_conflicts \
@@ -31,7 +33,7 @@ SYM_ZERO_KEYS="meta_kv_forest_key_violations appender_fence_breach foreign_frame
     appender_flush_ceiling_overruns dead_member_write_deferrals data_alloc_bitmap_drift \
     joined_control_refusals xv_cross_owner_intents_stuck manager_dependency_stalls \
     dlm_token_custody_rejected invariant_tripwires data_dma_fence_refusals \
-    extent_grant_conflicts extent_return_live_refusals"
+    extent_grant_conflicts extent_return_live_refusals xv_cross_owner_dangling_names"
 
 # --- snapshot-file readers ---------------------------------------------------
 

@@ -3682,6 +3682,76 @@ sym_cpu_ticks() { # idx
     awk '{print $14 + $15}' "/proc/$pid/stat"
 }
 
+# The AGENTS write-amplification instrument on the sym legs' WRITE rows
+# (the box re-run's §3.9.4.5 owed item): the DATA namespaces' /proc/diskstats
+# read + write columns snapshotted per phase, and the row's device bytes ÷
+# user bytes and `wareq-sz` printed beside the daemons' ledgers. The fleet's
+# data namespaces are the devsub's nvmet-tcp host-side devices (the same
+# face gate 1's fio rows read on the fabric).
+sym_disk_snap() { # rowdir phase
+    local out="$1/disk_p$2.tsv" p
+    : >"$out"
+    local IFS=,
+    for p in $FORMAT_DATA_PATHS; do
+        awk -v d="$(basename "$p")" '$3==d {print "data", d, $4, $6, $8, $10}' /proc/diskstats >>"$out"
+    done
+}
+# Prints `dev_w/user=<x> wareq_kib=<k> dev_r/user=<y> dev_wbytes=<b>` from
+# the phase's two snapshots against `user_bytes` (the row's submitted user
+# bytes); a snapshot with no data device line prints `dev_w/user=n/a`.
+sym_disk_amp() { # rowdir phase user_bytes
+    python3 - "$1/disk_p${2}0.tsv" "$1/disk_p${2}1.tsv" "$3" <<'PYEOF'
+import sys
+def load(p):
+    d = {}
+    for line in open(p):
+        f = line.split()
+        if len(f) == 6 and f[0] == "data":
+            d[f[1]] = [int(x) for x in f[2:]]
+    return d
+a, b = load(sys.argv[1]), load(sys.argv[2])
+user = float(sys.argv[3])
+rios = wios = rsect = wsect = 0
+for dev, y in b.items():
+    x = a.get(dev, [0, 0, 0, 0])
+    rios += y[0] - x[0]; rsect += y[1] - x[1]; wios += y[2] - x[2]; wsect += y[3] - x[3]
+if not b:
+    print("dev_w/user=n/a wareq_kib=n/a dev_r/user=n/a dev_wbytes=0")
+else:
+    wb, rb = wsect * 512, rsect * 512
+    print(f"dev_w/user={wb/max(1.0,user):.3f} wareq_kib={(wb/1024/wios if wios else 0):.0f} "
+          f"dev_r/user={rb/max(1.0,user):.3f} dev_wbytes={wb}")
+PYEOF
+}
+
+# F-B1's faces per writer, read off the row's END snapshot (PR 13e, the
+# cadence derivation — `meta_kv_checkpoint_{term,trigger}_ms` beside the
+# audit's gauges): `overruns` Σ over volumes (must stay 0 — the row's law
+# reads it as a delta; this is the absolute), the anticipated term (max
+# over volumes) and the trigger in force (min), the excused Σ.
+sym_fb1_faces() { # rowdir label idx...
+    local rowdir="$1" label="$2"
+    shift 2
+    local idx
+    for idx in "$@"; do
+        python3 - "$rowdir/m${idx}_p${label}1.json" "$idx" <<'PYEOF'
+import json, sys
+def flat(d, out, pfx=""):
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+root = json.load(open(sys.argv[1]))
+d = flat(root.get("metrics", root), {})
+def arr(k):
+    v = d.get(k, 0)
+    return [x for x in v if isinstance(x, (int, float))] if isinstance(v, list) else [v] if isinstance(v, (int, float)) else [0]
+ov, term, trig, exc = arr("appender_flush_ceiling_overruns"), arr("meta_kv_checkpoint_term_ms"), arr("meta_kv_checkpoint_trigger_ms"), arr("appender_flush_ceiling_excused_ns")
+print(f"   F-B1 m{sys.argv[2]}: flush_ceiling_overruns={sum(ov)} checkpoint_term_ms={term} checkpoint_trigger_ms={trig} excused_ns={sum(exc)} ceiling_ms={d.get('appender_flush_ceiling_ms')}")
+PYEOF
+    done
+}
+
 # The quiet-box gate the measured rows share (the s10pl leg's).
 # SQZ_MWMATRIX_ALLOW_BUSY=1 turns the refusal into a loud WARN for a
 # mechanism-only SCOPING run (the row's numbers are then labelled busy and
@@ -3940,6 +4010,9 @@ print(int(b)-int(a))" 2>/dev/null || echo 0)"
         done
         creates_per_cpu_s="$(python3 -c "print(f'{$n*$SYM_FILES*1e9/max(1,$create_cpu_ns):.0f}')")"
         # The ingest row: 4 MiB blocks, conv=fsync, one file per writer.
+        # The data namespaces' /proc/diskstats bracket it (the write row's
+        # amplification columns — the AGENTS instrument).
+        sym_disk_snap "$rowdir" "in${n}0"
         pids=()
         t0="$(date +%s.%N)"
         for idx in "${writers[@]}"; do
@@ -3949,6 +4022,7 @@ print(int(b)-int(a))" 2>/dev/null || echo 0)"
         done
         for p in "${pids[@]}"; do wait "$p" || rc=1; done
         t1="$(date +%s.%N)"
+        sym_disk_snap "$rowdir" "in${n}1"
         [ "$rc" = "0" ] || die "sym-scale N=$n: an ingest dd FAILED (see $rowdir/ingest-n$n-w*.err)"
         local ingest_rate cpu1 mgr_cpu
         ingest_rate="$(python3 -c "print(f'{$n*$SYM_INGEST_MB/($t1-$t0):.0f}')")"
@@ -3992,6 +4066,13 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t_row0):.0f}')")"
         fi
         [ "$verdict" = "MET" ] || verdict_all=MISS
         sym_gate3_row_line "$n" "$create_rate" "$cr" "$creates_per_cpu_s" "$ingest_rate" "$ir" "$mgr_load" "$mgr_cpu" "$handovers" "$ships" "$rpcs" "$verdict" | tee -a "$rowdir/symscale-table.tsv"
+        # The write row's amplification columns (the ingest's user bytes =
+        # N × SYM_INGEST_MB) + F-B1's per-writer faces on the row's end
+        # snapshot — beside the table, never in its verdict.
+        {
+            echo "   N=$n ingest amplification (/proc/diskstats, data namespaces; user $((n * SYM_INGEST_MB)) MiB): $(sym_disk_amp "$rowdir" "in$n" $((n * SYM_INGEST_MB * 1024 * 1024)))"
+            sym_fb1_faces "$rowdir" "n$n" "${writers[@]}"
+        } | tee -a "$rowdir/symscale-faces.txt"
         # ACKED WRITES PRESENT: every writer's tree + its fsynced ingest file
         # read back through ANOTHER writer of the row (N ≥ 2) or the token
         # reader; at N = 1 with no reader the manager's own view stands.
@@ -4453,6 +4534,15 @@ leg_sym_foreign_touch() {
     own_rate_a="$(awk '{for(i=1;i<=NF;i++) if($i ~ /^ops_s=/) {sub("ops_s=","",$i); print $i}}' "$rowdir/own-w$a.txt")"
     local a_tree_on_b
     a_tree_on_b="$(mnt_of "$b")/job-w$a"
+    # Every touch's per-create status is kept (F-R4's verdict, PR 13e): a
+    # create that met an errno is one line `create <name>: <error>` on
+    # stderr AND in $rowdir/touch-errors.txt — the leg judges the file at
+    # its end (the box's one `ENOENT` mid-handover was on the leg's stderr
+    # alone and read as a finding, not a verdict).
+    : >"$rowdir/touch-errors.txt"
+    sym_touch_create() { # dir prefix count
+        sym_prefixed_create "$1" "$2" "$3" >/dev/null 2> >(tee -a "$rowdir/touch-errors.txt" >&2)
+    }
 
     # Phase 2 — LIVE holder: A keeps creating in its tree while B touches
     # it with bursts — ships, NEVER a handover.
@@ -4479,7 +4569,7 @@ leg_sym_foreign_touch() {
     local live_pid=$!
     local r
     for ((r = 1; r <= SYM_TOUCH_ROUNDS; r++)); do
-        sym_prefixed_create "$a_tree_on_b" "touch-live-r$r" "$burst" >/dev/null || die "sym-foreign-touch: a live touch failed"
+        sym_touch_create "$a_tree_on_b" "touch-live-r$r" "$burst" || die "sym-foreign-touch: a live touch failed"
         sleep "$(python3 -c "print($beat_ms/1000)")"
     done
     # The LIVE verdict is vacuous unless the holder's storm was ALIVE
@@ -4510,7 +4600,7 @@ leg_sym_foreign_touch() {
     local t_idle0 handed=0 rounds_used=0 t_hand
     t_idle0="$(date +%s.%N)"
     for ((r = 1; r <= SYM_TOUCH_ROUNDS * 4; r++)); do
-        sym_prefixed_create "$a_tree_on_b" "touch-idle-r$r" "$burst" >/dev/null || die "sym-foreign-touch: an idle touch failed"
+        sym_touch_create "$a_tree_on_b" "touch-idle-r$r" "$burst" || die "sym-foreign-touch: an idle touch failed"
         rounds_used="$r"
         sleep "$(python3 -c "print($beat_ms/1000)")"
         handed=0
@@ -4618,7 +4708,7 @@ leg_sym_foreign_touch() {
     local c_tree_on_b
     c_tree_on_b="$(mnt_of "$b")/job-w$c"
     for ((r = 1; r <= SYM_TOUCH_ROUNDS; r++)); do
-        sym_prefixed_create "$c_tree_on_b" "touch-paused-r$r" 1 >/dev/null || die "sym-foreign-touch: a paused-job touch failed"
+        sym_touch_create "$c_tree_on_b" "touch-paused-r$r" 1 || die "sym-foreign-touch: a paused-job touch failed"
         sleep "$(python3 -c "print($paused_beat_ms/1000)")"
     done
     # Resume and let the job COMPLETE its phase (SYM_FILES mkdirs — seconds
@@ -4657,9 +4747,21 @@ leg_sym_foreign_touch() {
     [ "$paused_dominated" = "0" ] || die "sym-foreign-touch PAUSED: slot_offers_dominated=+$paused_dominated at the holder — a live holder's slot was DOMINATED by a single touch per beat"
     log "sym-foreign-touch PAUSED: handovers=0, holder slot_offers_idle=+0, slot_offers_dominated=+0 (a paused live job's slot is never offered or moved by a touch)"
     echo "   PAUSED: $SYM_TOUCH_ROUNDS single touches over $SYM_TOUCH_ROUNDS beats: handovers=$paused_handovers holder idle offers=+$paused_idle dominated offers=+$paused_dominated — a paused live job's slot is never offered or moved" | tee -a "$rowdir/symtouch-table.txt"
+    sym_fb1_faces "$rowdir" paused "$a" "$b" "$c" | tee -a "$rowdir/symtouch-table.txt"
     for idx in "$a" "$b" "$c"; do
         sym_zero_set sym-foreign-touch "$idx"
     done
+    # F-R4's verdict (PR 13e): every touch of every phase landed — a
+    # `sym_prefixed_create` that met an errno printed `create <name>: …`
+    # on stderr and stopped its burst; the box read ONE `ENOENT` on the
+    # IDLE burst that moved the slot to the toucher (record §3.9.4.3). The
+    # LIVE / IDLE / PAUSED counts above are the ships' side; this is the
+    # application's.
+    local touch_errors
+    touch_errors="$(grep -c "^create touch-" "$rowdir/touch-errors.txt" 2>/dev/null || true)"
+    [ "${touch_errors:-0}" = "0" ] ||
+        die "sym-foreign-touch: $touch_errors touch create(s) answered an errno to the application (F-R4's class) — $rowdir/touch-errors.txt"
+    log "sym-foreign-touch: every touch create of every phase landed (0 errnos to the application — F-R4)"
     # The end-of-leg `rm -rf` is F-R3's shape (PR 13e; record §3.9.4.3):
     # every writer removes ITS job tree through ITS mount, and every child
     # another appender minted into it (the touches) is a cross-owner
@@ -5656,6 +5758,9 @@ leg_sym_walls() {
     local cpu0 t0 t1
     cpu0="$(sym_cpu_ticks 0)"
     # The REWRITE: every joiner overwrites every file in place, all at once.
+    # The data namespaces' /proc/diskstats bracket it (row (a)'s
+    # amplification columns — the box re-run stated them owed).
+    sym_disk_snap "$rowdir" "wa0"
     pids=()
     t0="$(date +%s.%N)"
     for j in "${joiners[@]}"; do
@@ -5667,6 +5772,7 @@ leg_sym_walls() {
     done
     for p in "${pids[@]}"; do wait "$p" || rc=1; done
     t1="$(date +%s.%N)"
+    sym_disk_snap "$rowdir" "wa1"
     [ "$rc" = "0" ] || die "sym-walls: a rewrite FAILED (see $rowdir/rewrite-w*.err)"
     local cpu1 wall
     cpu1="$(sym_cpu_ticks 0)"
@@ -5731,6 +5837,19 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t0):.0f}')")"
         printf '%-6s %-10s %-8s %-8s %-8s %-11s %-10s %-8s %-10s %-13s %-12s %s\n' N DISPLACED MINTED SHIPPED SERVED FREE_BLK_S REWRITE_S MGR_CPU MGR_VERBS SVC_TOTAL_NS SVC_EXEC_NS VERDICT
         printf '%-6s %-10s %-8s %-8s %-8s %-11s %-10s %-8s %-10s %-13s %-12s %s\n' "$n" "$displaced" "$minted" "$shipped" "$served" "$free_rate" "$wall" "${mgr_cpu}%" "$verbs" "$svc_total" "$svc_exec" "$verdict_a"
         echo "manager_load_pct=$mgr_load manager_verbs_per_s=$verbs_per_s free_ship_failures=+$failures free_refused_blocks=$(stat_sum 0 meta_ship_publish.free_refused_blocks)"
+        # The AGENTS amplification columns: the rewrite's user bytes (N ×
+        # files × MiB) against the data namespaces' device writes, beside
+        # the daemons' own ledger (Σ rewrite_device_write_bytes ÷ Σ
+        # rewrite_user_bytes — what the joiners SUBMITTED).
+        local ledger_dev=0 ledger_user=0
+        for j in "${joiners[@]}"; do
+            v="$(sym_delta "$rowdir" "$j" wa rewrite_device_write_bytes)"
+            ledger_dev=$((ledger_dev + v))
+            v="$(sym_delta "$rowdir" "$j" wa rewrite_user_bytes)"
+            ledger_user=$((ledger_user + v))
+        done
+        echo "amplification (/proc/diskstats, data namespaces; user $((displaced * 4)) MiB): $(sym_disk_amp "$rowdir" wa $((displaced * 4 * 1024 * 1024))) | ledger rewrite_device_write_bytes/rewrite_user_bytes=$(python3 -c "print(f'{$ledger_dev/max(1,$ledger_user):.3f}')") ($ledger_dev / $ledger_user)"
+        sym_fb1_faces "$rowdir" wa 0 "${joiners[@]}"
     } | tee "$rowdir/symwalls-a.txt"
     for j in "${joiners[@]}"; do rm -rf "$(mnt_of "$j")/walls-$run-w$j" 2>/dev/null || true; done
 
@@ -5814,6 +5933,7 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t0):.0f}')")"
         printf '%-6s %-12s %-10s %-12s %-9s %-14s %-12s %-12s %s\n' N JOIN_WALL_S MGR_VERBS SVC_TOTAL_NS MGR_CPU JOBS_SHIPPED JOBS_AT_MGR JOBS_LOCAL VERDICT
         printf '%-6s %-12s %-10s %-12s %-9s %-14s %-12s %-12s %s\n' "$n" "$join_wall" "$verbs_b" "$svc_b_total" "${mgr_cpu}%" "$shipped_b" "$steps" "$((n - shipped_b))" "$verdict_b"
         echo "manager_failover_bound_ms=$(stat_field 0 manager_failover_bound_ms | tr -d '[] ' | cut -d, -f1) appenders_known=$(stat_field 0 appenders_known | tr -d '[] ' | cut -d, -f1) served_fleet=$served_fleet dir_stripe_flips_during_storm=$flips_b (a flip of /jobs re-homes the later mkdirs' ships to the stripe holders)"
+        sym_fb1_faces "$rowdir" wb 0 "${joiners[@]}"
     } | tee "$rowdir/symwalls-b.txt"
     sym_oracle sym-walls "$rowdir"
     [ "$verdict_a" = "MET" ] && [ "$verdict_b" = "MET" ] ||

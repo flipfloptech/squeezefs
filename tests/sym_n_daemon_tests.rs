@@ -11914,6 +11914,117 @@ async fn a_sized_join_on_a_fragmented_heap_carves_what_fits_the_table_never_refu
 }
 
 // ---------------------------------------------------------------------------
+// PR 13g review round 1, Issue 5 — the pool SHRINKS on a quiet cadence to
+// its target; the ask fires on headroom alone.
+// ---------------------------------------------------------------------------
+
+/// **A quiet joiner's standing pool above its target returns the surplus
+/// at the cadence, smallest runs first, and asks for nothing while its
+/// headroom holds** (PR 13g review round 1, Issue 5). The recycle
+/// re-pooled released images only while `unclaimed < keep`, and NOTHING
+/// returned a standing pool above the derived size: the carve overshoots
+/// by the unnamed part (the page names ≤ 4 runs of a larger pool),
+/// pressure cycles inflate it, the join's hint starts a fresh incarnation
+/// at the last storm's size — the fleet row read 430–457 unclaimed beside
+/// 66–93 claimed on a quiet joiner for its lifetime, up to `free/(4N)`.
+/// And the due law `(refill_due && unclaimed < derived) || unclaimed <
+/// derived + promised` fired at every cadence a promise was outstanding
+/// against a pool the recycle had capped at `derived`. Now ONE target
+/// (`appender::joined_pool_target`: `max(derived + promised, the join's
+/// cost class FLOOR + M)`, cap-bounded) is the recycle's keep, the
+/// shrink's mark and the ask's size, and the ask fires on `headroom() <
+/// derived / 2` alone. The pin: the joiner's pool grown to 200 by an
+/// explicit ask, then three quiet cadences — the pool at the target (the
+/// join's own size, the rotor unminted), the manager's record shrunk with
+/// it, `ReturnExtents` issued once, no `ExtentGrant` issued. RED before
+/// the fix: the pool stays at 200 for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quiet_joiners_pool_above_its_target_shrinks_at_the_cadence_and_asks_for_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config_len(dir.path(), 1, 512 * 1024 * 1024).await;
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let joiner = join(&uris, &venue, &mvol, 3).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let id = jvol.appender_stats().unwrap().appender_id;
+    let faces = |vol: &KvMetaBackend| {
+        let s = vol.appender_stats().unwrap();
+        let own = s
+            .regions
+            .iter()
+            .find(|r| r.id == id)
+            .expect("the region")
+            .clone();
+        let j = vol.joined_stats().unwrap();
+        (
+            own.grant_unclaimed,
+            j.wire_extent_grants,
+            j.wire_extent_returns,
+        )
+    };
+    let rotor = jvol.slot_lease_stats().expect("the plane").rotor;
+    let pool_floor = squeezefs::meta_backend::kv::appender::GRANT_EXTENTS_FLOOR + rotor;
+    let (unclaimed0, _, _) = faces(&jvol);
+    assert_eq!(unclaimed0, pool_floor, "the join's grant is the pool floor");
+    // The pool grown well past every target: an explicit ask.
+    jvol.joined_extent_grant(200).await.unwrap();
+    let (grown, grants1, returns1) = faces(&jvol);
+    assert!(grown >= 200, "the pool grew ({grown})");
+    // Three QUIET cadences (the joiner's own cycles; nothing dirty, no
+    // pressure): the surplus returns, the pool settles at its target.
+    for _ in 0..3 {
+        jvol.checkpoint_now().await.unwrap();
+    }
+    let (settled, grants2, returns2) = faces(&jvol);
+    assert_eq!(
+        settled, pool_floor,
+        "a quiet pool shrinks to its target — the join's cost class (grown {grown})"
+    );
+    assert!(
+        returns2 > returns1,
+        "the surplus went back as ReturnExtents ({returns1} → {returns2})"
+    );
+    assert_eq!(grants2, grants1, "no ExtentGrant on a quiet cadence");
+    let record = mvol.extent_grant_record(id).await.unwrap();
+    let own = jvol
+        .appender_stats()
+        .unwrap()
+        .regions
+        .iter()
+        .find(|r| r.id == id)
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        record.len(),
+        own.grant_claimed + own.grant_unclaimed + own.grant_pending + own.grant_returnable,
+        "the manager's record shrank with the pool"
+    );
+    // Three more: nothing moves.
+    for _ in 0..3 {
+        jvol.checkpoint_now().await.unwrap();
+    }
+    let (still, grants3, returns3) = faces(&jvol);
+    assert_eq!(still, pool_floor);
+    assert_eq!(grants3, grants2, "still no ask");
+    assert_eq!(returns3, returns2, "nothing more to return");
+    assert_supply_gauges_zero(&jvol, "joiner");
+    shutdown(&joiner).await;
+    assert_must_stay_zero(&mvol, "manager");
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+// ---------------------------------------------------------------------------
 // PR 13g review round 1, Issue 3 — a carve or a return wider than ONE
 // control entry.
 // ---------------------------------------------------------------------------

@@ -705,6 +705,10 @@ enum ArbCall {
         appender_id: u32,
         roots: Vec<ArbRoot>,
     },
+    GrowRing {
+        appender_id: u32,
+        want_bytes: u64,
+    },
 }
 
 #[derive(Arbitrary, Debug, Clone, Copy)]
@@ -922,6 +926,13 @@ impl From<ArbCall> for ManagerCall {
                 appender_id,
                 roots: roots.into_iter().map(Into::into).collect(),
             },
+            ArbCall::GrowRing {
+                appender_id,
+                want_bytes,
+            } => ManagerCall::GrowRing {
+                appender_id,
+                want_bytes,
+            },
         }
     }
 }
@@ -1023,6 +1034,9 @@ enum ArbReply {
         published: u32,
         already: u32,
     },
+    RingGrown {
+        segment: Option<(u64, u64)>,
+    },
 }
 
 impl From<ArbReply> for ManagerReply {
@@ -1097,6 +1111,7 @@ impl From<ArbReply> for ManagerReply {
             ArbReply::RootsPublished { published, already } => {
                 ManagerReply::RootsPublished { published, already }
             }
+            ArbReply::RingGrown { segment } => ManagerReply::RingGrown { segment },
         }
     }
 }

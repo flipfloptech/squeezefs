@@ -60,9 +60,11 @@ use squeezefs::meta_backend::kv::record::{
     TREE_XATTRS, XATTR_KEY_LEN,
 };
 use squeezefs::meta_backend::kv::slot_state::{
-    custody_quarantine_key, decode_custody_quarantine, decode_custody_quarantine_key,
-    decode_slot_state_key, decode_slot_tails_key, encode_custody_quarantine, slot_state_key,
-    slot_tails_key, SlotState, SlotTails, SlotTailsRecord, TailsSpill, CUSTODY_QUARANTINE_KEY_LEN,
+    appender_hint_key, custody_quarantine_key, decode_appender_hint, decode_custody_quarantine,
+    decode_custody_quarantine_key, decode_slot_state_key, decode_slot_tails_key,
+    encode_appender_hint, encode_custody_quarantine, slot_state_key, slot_tails_key, AppenderHint,
+    SlotState, SlotTails, SlotTailsRecord, TailsSpill, APPENDER_HINT_KEY_LEN,
+    APPENDER_HINT_KEY_PREFIX, APPENDER_HINT_LEN, APPENDER_HINT_VERSION, CUSTODY_QUARANTINE_KEY_LEN,
     SLOT_STATE_KEY_LEN, SLOT_STATE_VERSION, SLOT_TAILS_KEY_LEN, SLOT_TAILS_VERSION, TAILS_SPILLED,
 };
 use squeezefs::meta_backend::kv::superblock::{ExtentRef, SuperblockV3};
@@ -754,8 +756,42 @@ proptest! {
             ),
         }
         if let Ok(until) = decode_custody_quarantine(&data) {
-            prop_assert_eq!(encode_custody_quarantine(until), data);
+            prop_assert_eq!(encode_custody_quarantine(until), data.clone());
         }
+        // PR 13g (F-R5): the appender-hint record is total and byte-exact.
+        match decode_appender_hint(&data) {
+            Ok(hint) => prop_assert_eq!(encode_appender_hint(hint), data),
+            Err(_) => prop_assert!(
+                data.len() != APPENDER_HINT_LEN || data[0] != APPENDER_HINT_VERSION
+            ),
+        }
+    }
+
+    /// The appender hint (PR 13g, F-R5): every word pair round-trips, the
+    /// key is the identity's stable part, a future version refuses.
+    #[test]
+    fn appender_hint_round_trips_over_the_encoders_domain(
+        ring_bytes in any::<u64>(),
+        grant_extents in any::<u64>(),
+        node_token in any::<u64>(),
+        mount_slot in any::<u32>(),
+    ) {
+        let hint = AppenderHint { ring_bytes, grant_extents };
+        let bytes = encode_appender_hint(hint);
+        prop_assert_eq!(bytes.len(), APPENDER_HINT_LEN);
+        prop_assert_eq!(decode_appender_hint(&bytes).expect("decodes"), hint);
+        let mut future = bytes.clone();
+        future[0] = APPENDER_HINT_VERSION.wrapping_add(1);
+        prop_assert!(decode_appender_hint(&future).is_err());
+        prop_assert!(decode_appender_hint(&bytes[..bytes.len() - 1]).is_err());
+        let key = appender_hint_key(node_token, mount_slot);
+        prop_assert_eq!(key.len(), APPENDER_HINT_KEY_LEN);
+        prop_assert!(key.starts_with(APPENDER_HINT_KEY_PREFIX));
+        prop_assert_eq!(
+            &key[APPENDER_HINT_KEY_PREFIX.len()..APPENDER_HINT_KEY_PREFIX.len() + 8],
+            &node_token.to_be_bytes()[..]
+        );
+        prop_assert_eq!(&key[APPENDER_HINT_KEY_PREFIX.len() + 8..], &mount_slot.to_be_bytes()[..]);
     }
 
     /// Every emittable `slot_state` record (both variants — fixed-size
@@ -1943,6 +1979,12 @@ fn arb_pr8_call() -> impl Strategy<Value = ManagerCall> {
             ),
         )
             .prop_map(|(appender_id, roots)| ManagerCall::PublishRoots { appender_id, roots }),
+        (any::<u32>(), any::<u64>()).prop_map(|(appender_id, want_bytes)| {
+            ManagerCall::GrowRing {
+                appender_id,
+                want_bytes,
+            }
+        }),
     ]
 }
 
@@ -2052,6 +2094,8 @@ fn arb_pr8_reply() -> impl Strategy<Value = ManagerReply> {
         (any::<u32>(), any::<u32>()).prop_map(|(published, already)| {
             ManagerReply::RootsPublished { published, already }
         }),
+        proptest::option::of((any::<u64>(), any::<u64>()))
+            .prop_map(|segment| ManagerReply::RingGrown { segment }),
     ]
 }
 

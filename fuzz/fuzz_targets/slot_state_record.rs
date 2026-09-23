@@ -32,10 +32,11 @@
 
 use libfuzzer_sys::fuzz_target;
 use squeezefs::meta_backend::kv::slot_state::{
-    custody_quarantine_key, custody_quarantine_key_range, decode_custody_quarantine,
-    decode_custody_quarantine_key, decode_slot_state_key, decode_slot_tails_key,
-    encode_custody_quarantine, slot_state_key, slot_state_key_range, slot_tails_key,
-    slot_tails_key_range, SlotState, SlotTails, SlotTailsRecord, TailsSpill,
+    custody_quarantine_key, custody_quarantine_key_range, decode_appender_hint,
+    decode_custody_quarantine, decode_custody_quarantine_key, decode_slot_state_key,
+    decode_slot_tails_key, encode_appender_hint, encode_custody_quarantine, slot_state_key,
+    slot_state_key_range, slot_tails_key, slot_tails_key_range, SlotState, SlotTails,
+    SlotTailsRecord, TailsSpill, APPENDER_HINT_LEN, APPENDER_HINT_VERSION,
     CUSTODY_QUARANTINE_KEY_LEN, CUSTODY_QUARANTINE_LEN, CUSTODY_QUARANTINE_VERSION, LEASED_LEN,
     SLOT_STATE_KEY_LEN, SLOT_STATE_VERSION, SLOT_TAILS_FIXED_LEN, SLOT_TAILS_KEY_LEN,
     SLOT_TAILS_VERSION, TAILS_SPILLED, TAIL_ENTRY_LEN, UNLEASED_LEN,
@@ -92,6 +93,19 @@ fuzz_target!(|data: &[u8]| {
         }
         Err(_) => assert!(
             data.len() != CUSTODY_QUARANTINE_LEN || data[0] != CUSTODY_QUARANTINE_VERSION,
+            "only a wrong length or version refuses"
+        ),
+    }
+    // PR 13g (F-R5): the appender-hint record — the rejoin's ring and
+    // grant words.
+    match decode_appender_hint(data) {
+        Ok(hint) => {
+            assert_eq!(data.len(), APPENDER_HINT_LEN);
+            assert_eq!(data[0], APPENDER_HINT_VERSION);
+            assert_eq!(encode_appender_hint(hint), data, "byte-exact");
+        }
+        Err(_) => assert!(
+            data.len() != APPENDER_HINT_LEN || data[0] != APPENDER_HINT_VERSION,
             "only a wrong length or version refuses"
         ),
     }

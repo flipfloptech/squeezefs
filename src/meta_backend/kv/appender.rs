@@ -949,6 +949,14 @@ pub fn ring_budget_remaining_bytes(heap_len: u64, rings_in_use: u64) -> u64 {
     ring_budget_bytes(heap_len).saturating_sub(rings_in_use)
 }
 
+/// **`GrowRing`'s room** (Issue 8): the smaller of the per-appender
+/// ceiling less the ring the page names and the set-wide budget's
+/// remainder — N rings grown toward the ceiling never exceed `heap/16`,
+/// the image heap the budget reserves.
+pub fn grow_ring_room_bytes(ceiling: u64, ring_bytes: u64, budget_remaining: u64) -> u64 {
+    ceiling.saturating_sub(ring_bytes).min(budget_remaining)
+}
+
 // ---- Extent grants (§5.3.3) -------------------------------------------------
 
 /// The images ONE SMO of a slot tree claims at most (physical): a

@@ -3157,6 +3157,50 @@ fn joined_pool_target_and_refill_law_tie_to_their_derivations() {
     );
 }
 
+/// **`GrowRing`'s room is the ring budget's** (PR 13g review round 1,
+/// Issue 8; `appender::{ring_budget_remaining_bytes, grow_ring_room_
+/// bytes}`): `heap/16` less every Live page's ring is what remains, and a
+/// growth step is the smaller of the per-appender ceiling less the page's
+/// ring and that remainder — N rings grown toward the ceiling never exceed
+/// the budget. Drift is red here.
+#[test]
+fn grow_ring_room_is_bounded_by_the_ring_budgets_remainder() {
+    use squeezefs::meta_backend::kv::appender::{
+        grow_ring_room_bytes, ring_budget_bytes, ring_budget_remaining_bytes,
+    };
+    let heap = 4u64 << 30;
+    assert_eq!(ring_budget_bytes(heap), 256 << 20);
+    assert_eq!(ring_budget_remaining_bytes(heap, 0), 256 << 20);
+    assert_eq!(ring_budget_remaining_bytes(heap, 200 << 20), 56 << 20);
+    assert_eq!(
+        ring_budget_remaining_bytes(heap, 300 << 20),
+        0,
+        "saturating"
+    );
+    let ceiling = 32u64 << 20;
+    // Under the budget: the ceiling less the ring.
+    assert_eq!(grow_ring_room_bytes(ceiling, 8 << 20, 256 << 20), 24 << 20);
+    // At the budget's edge: the remainder.
+    assert_eq!(grow_ring_room_bytes(ceiling, 8 << 20, 3 << 20), 3 << 20);
+    assert_eq!(grow_ring_room_bytes(ceiling, 8 << 20, 0), 0);
+    // A ring already at the ceiling grows by nothing whatever remains.
+    assert_eq!(grow_ring_room_bytes(ceiling, ceiling, 256 << 20), 0);
+    // Thirty-two rings at the ceiling would be 1 GiB against a 4 GiB heap's
+    // 256 MiB budget — the eighth ring is the last to grow there.
+    let mut in_use = 0u64;
+    let mut grown = 0;
+    for _ in 0..32 {
+        let room = grow_ring_room_bytes(ceiling, 0, ring_budget_remaining_bytes(heap, in_use));
+        if room == 0 {
+            break;
+        }
+        in_use += room;
+        grown += 1;
+    }
+    assert_eq!(grown, 8);
+    assert_eq!(in_use, ring_budget_bytes(heap));
+}
+
 /// The symmetric MANAGER's derivations (design-symmetric-metadata §5.3.3
 /// grant sizing, §5.9 the failover bound, §1.6 "Manager death"; PR 3):
 /// `grant_extents = clamp(2 × ewma_smo_rate × failover_bound_s, 8,

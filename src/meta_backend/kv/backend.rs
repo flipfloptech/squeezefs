@@ -10690,6 +10690,10 @@ impl KvMetaBackend {
         if page.segments.len() >= super::appender::RING_SEGMENTS_MAX {
             return Ok(None);
         }
+        // The room (Issue 8): the per-appender ceiling less this ring AND
+        // the set-wide budget's remainder over every Live page's ring —
+        // `heap/16` is the one hard resource, and N rings grown toward the
+        // ceiling must not eat the image heap it reserves.
         let ceiling = super::appender::sym_ring_ceiling_bytes(self.sb.heap.end());
         let remaining = super::appender::ring_budget_remaining_bytes(
             self.sb.heap.len,
@@ -10697,9 +10701,19 @@ impl KvMetaBackend {
         );
         set.ring_budget_remaining
             .store(remaining, Ordering::Relaxed);
-        let room = ceiling.saturating_sub(page.ring_bytes());
+        let room = super::appender::grow_ring_room_bytes(ceiling, page.ring_bytes(), remaining);
         let want_extents = want_bytes.min(room) / node_size;
         if want_extents == 0 {
+            log::info!(
+                "meta volume {}: GrowRing for appender {appender_id} declined — the ring budget \
+                 leaves {remaining} bytes ({} of {} in use) and the ceiling {} over the page's \
+                 {} (appender_ring_budget_remaining_bytes)",
+                self.path.display(),
+                super::appender::rings_in_use(&entries),
+                super::appender::ring_budget_bytes(self.sb.heap.len),
+                ceiling,
+                page.ring_bytes()
+            );
             return Ok(None);
         }
         let mut claimed: Vec<u64> = Vec::with_capacity(want_extents as usize);

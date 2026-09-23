@@ -2002,7 +2002,7 @@ Over the N = 8 create the manager's volume 1
 served **344 grants + 318 returns = 662 verbs in ≈ 13 s (≈ 51/s)** with
 `manager_service_ns.execute` **+2.36 s** (3.6 ms per verb — each a ring-0
 control entry + its barrier on the same journal lane the checkpoint
-cycle's barrier #1 queues on), volume 0 +0.47 s over 221 verbs;
+cycle's barrier #1 queues on), volume 0 +0.47 s over 167 verbs (+220 over the whole row, `pn80` → `pn81`);
 `manager_verbs` [824, 1229] → [991, 1891] (Σ since mount 2,935 by the
 leg's end, `extent_grants` [274, 702], `extent_returns` [208, 723]);
 `manager_load_pct` read [0, 1] — the load gauge's window does not see a

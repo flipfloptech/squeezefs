@@ -2939,6 +2939,15 @@ pub struct ManagerVerbLedger {
     /// return batch named while a LIVE node of this mount stood at them
     /// — kept claimed, never returned (the double-custody class).
     pub return_live_refusals: std::sync::atomic::AtomicU64,
+    /// PR 13g review round 2, Issue 21 (`extent_return_run_cap_refusals`):
+    /// `ReturnExtents` batches cut short because freeing the next extent
+    /// would SPLIT the caller's grant record past the tree-0 value cap's
+    /// run bound (`slot_state::extent_grant_max_runs`) — the record can
+    /// name no more fragments. A CAPACITY class: what the record could
+    /// name landed, the rest stays granted for the caller's retry; never
+    /// the witness class, so `manager_verb_refusals` keeps its
+    /// must-stay-0 meaning.
+    pub return_run_cap_refusals: std::sync::atomic::AtomicU64,
     /// PR 13 (`extent_grant_stale_page_words`): `ExtentGrant` asks whose
     /// page word named an extent the caller's record no longer held (a
     /// return landed after its last page write) — the word is intersected
@@ -3212,6 +3221,7 @@ impl AppenderSet {
             extent_grant_conflicts: self.verbs.grant_conflicts.load(Relaxed),
             extent_grant_stale_page_words: self.verbs.stale_page_words.load(Relaxed),
             extent_return_live_refusals: self.verbs.return_live_refusals.load(Relaxed),
+            extent_return_run_cap_refusals: self.verbs.return_run_cap_refusals.load(Relaxed),
             appenders_known: self.appenders_known.load(Relaxed),
             manager_verbs_per_s: self.verbs.verbs_per_s(),
             manager_load_pct: self.verbs.load_pct(now_ns),
@@ -3365,6 +3375,10 @@ pub struct AppenderStats {
     /// Return-batch extents kept claimed because a live node of this mount
     /// stood at them (`extent_return_live_refusals`, must-stay-0 — PR 13).
     pub extent_return_live_refusals: u64,
+    /// Return batches cut short at the grant record's run cap — the
+    /// CAPACITY class (`extent_return_run_cap_refusals` — PR 13g review
+    /// round 2, Issue 21; not the must-stay-0 witness class).
+    pub extent_return_run_cap_refusals: u64,
     /// The directory's `Live` count as last read (`appenders_known`) —
     /// the grant cap's appender term.
     pub appenders_known: u64,

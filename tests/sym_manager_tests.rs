@@ -2570,6 +2570,92 @@ async fn a_return_of_a_pending_extent_is_refused_until_the_tail_covers_its_free(
     }
 }
 
+/// PR 13g review round 2, Issue 21: a `ReturnExtents` whose next extent's
+/// removal would SPLIT the caller's grant record past the tree-0 value
+/// cap's run bound (`extent_grant_max_runs`) is a CAPACITY refusal — the
+/// record can name no more fragments — never a witness contradiction: it
+/// rides its own gauge `extent_return_run_cap_refusals`, and
+/// `manager_verb_refusals` keeps its must-stay-0 meaning. The shape: one
+/// carved run wide enough that returning every other extent fragments the
+/// record to the cap; the return LANDS what the record can name (the
+/// chunk cut to it) and refuses the extent that would split it once more,
+/// which stays granted (the RAM grant restored, PR 3's durable-vs-RAM law
+/// intact). RED before the fix: the refusal lands on
+/// `manager_verb_refusals` and the new gauge reads 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_returns_run_cap_refusal_is_the_capacity_class_on_its_own_gauge() {
+    use squeezefs::meta_backend::kv::node::record_value_cap;
+    use squeezefs::meta_backend::kv::slot_state::extent_grant_max_runs;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member_sized(dir.path(), "meta0", 512 * 1024 * 1024).await];
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let routed = open_with_partition(&uris, Some(PARTITION)).await;
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    let vol = Arc::clone(&routed.volumes[0]);
+    let cap = extent_grant_max_runs(record_value_cap(NODE_SIZE));
+    // One carve wide enough to fragment to the cap and one past it (the
+    // knob is the in-process region's derived size — the explicit ask is
+    // clamped to it; set for the one carve, cleared after).
+    let want = 2 * cap as u64 + 64;
+    let before = vol.extent_grant_record(1).await.unwrap();
+    std::env::set_var(SYM_GRANT_EXTENTS_ENV, want.to_string());
+    let carve = vol.manager_extent_grant(1, want as u32).await;
+    std::env::remove_var(SYM_GRANT_EXTENTS_ENV);
+    carve.unwrap();
+    let record = vol.extent_grant_record(1).await.unwrap();
+    let carved = ExtentGrantRecord::from_extents(record.extents().filter(|e| !before.contains(*e)));
+    let run = *carved.runs.iter().max_by_key(|r| r.len).unwrap();
+    assert!(
+        u64::from(run.len) >= 2 * cap as u64 + 1,
+        "the premise: one carved run of ≥ {} extents ({:?})",
+        2 * cap + 1,
+        carved.runs
+    );
+    // Every other extent from the run's second: k removals leave k + 1
+    // runs (the tail run stands), so the cap-th removal is the split past
+    // the cap.
+    let alternating: Vec<u64> = (0..cap as u64).map(|k| run.start + 1 + 2 * k).collect();
+    let s0 = stats(&vol);
+    let free0 = vol.free_extents();
+    let err = vol
+        .manager_return_extents(1, &alternating)
+        .await
+        .expect_err("the last removal splits the record past the cap");
+    assert!(
+        err.to_string().contains("-run cap"),
+        "the refusal names the capacity class: {err}"
+    );
+    let s1 = stats(&vol);
+    assert_eq!(
+        s1.manager_verb_refusals, s0.manager_verb_refusals,
+        "a capacity refusal is not the witness class (manager_verb_refusals must stay 0)"
+    );
+    assert_eq!(
+        s1.extent_return_run_cap_refusals,
+        s0.extent_return_run_cap_refusals + 1,
+        "the capacity class rides its own gauge"
+    );
+    assert_eq!(s1.manager_verb_rejected, s0.manager_verb_rejected);
+    let record = vol.extent_grant_record(1).await.unwrap();
+    assert_eq!(record.runs.len(), cap, "the record stands at the run cap");
+    assert_eq!(
+        vol.free_extents(),
+        free0 + cap as u64 - 1,
+        "what the record could name landed"
+    );
+    let refused = alternating[cap - 1];
+    assert!(record.contains(refused), "the refused extent stays granted");
+    assert!(
+        vol.grant_holds(1, refused),
+        "…and in the RAM grant (restored to the returnable batch)"
+    );
+    assert_durable_ram_grant_law(&vol, 1).await;
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
 /// Issue 18: the flush pass's REACTIVE refill of an exhausted grant asks
 /// the compaction reserve for ONE SMO's images (`SMO_IMAGES_MAX`), never
 /// the derived user grant (the floor 8): on a heap drained to its reserve

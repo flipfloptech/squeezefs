@@ -14117,6 +14117,10 @@ impl SqueezefsFilesystem {
                     "extent_return_live_refusals".into(),
                     appender(&|s| s.extent_return_live_refusals),
                 );
+                metrics.insert(
+                    "extent_return_run_cap_refusals".into(),
+                    appender(&|s| s.extent_return_run_cap_refusals),
+                );
                 metrics.insert("appenders_known".into(), appender(&|s| s.appenders_known));
                 metrics.insert(
                     "extent_grant_promised".into(),

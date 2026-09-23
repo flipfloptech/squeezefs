@@ -10602,9 +10602,13 @@ impl KvMetaBackend {
     /// nothing more), a page that names it clears the word, and a word of
     /// another incarnation is returned before this one's carve. The carve
     /// is the join's law made ONE contiguous run: `want` internal-class
-    /// claims, the LONGEST adjacent run kept, the rest released (a
-    /// fragmented heap answers a shorter segment — the joiner asks again
-    /// at its next cycle); the run must sit in no appender's grant record;
+    /// claims, the LONGEST adjacent run kept, the rest released — and a
+    /// run under the SEGMENT FLOOR (`grow_ring_segment_floor_extents`:
+    /// half the clamped ask; Issue 9) answers `None` with every claim
+    /// released, since the table's eight slots are spent only on runs of
+    /// the doubling class (`appender_grow_ring_short_declines`); the
+    /// joiner asks again at its next cycle. The run must sit in no
+    /// appender's grant record;
     /// zeroed before anything names it (`zero_extents`); its allocator
     /// deltas + the identity's `appender_hint` (the grown size — the
     /// identity's next join starts there — and the pending witness) as
@@ -10748,6 +10752,26 @@ impl KvMetaBackend {
             }
         }
         let run: Vec<u64> = claimed[best.0..best.0 + best.1].to_vec();
+        // The segment floor (Issue 9): a table slot is spent only on a
+        // run of the doubling class; a fragmented heap answers `None`
+        // with every claim released, the ring staying at its size.
+        let floor = super::appender::grow_ring_segment_floor_extents(want_extents);
+        if (run.len() as u64) < floor {
+            for c in claimed {
+                self.alloc.release_unpublished(c);
+            }
+            set.grow_ring_short_declines.fetch_add(1, Ordering::Relaxed);
+            log::info!(
+                "meta volume {}: GrowRing for appender {appender_id} declined — the heap's \
+                 longest adjacent run is {} extents against a floor of {floor} (half the ask of \
+                 {want_extents}); no table slot spent, the ring stays at {} bytes \
+                 (appender_grow_ring_short_declines)",
+                self.path.display(),
+                run.len(),
+                page.ring_bytes()
+            );
+            return Ok(None);
+        }
         for c in claimed
             .iter()
             .filter(|c| !(run[0]..=run[run.len() - 1]).contains(c))
@@ -19746,6 +19770,7 @@ impl KvMetaBackend {
                 sb.heap.len,
                 super::appender::rings_in_use(&entries),
             )),
+            grow_ring_short_declines: AtomicU64::new(0),
             cadence_pressure_seen: AtomicU64::new(0),
             joined: AtomicBool::new(false),
             join_refusal,

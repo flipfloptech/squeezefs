@@ -3201,6 +3201,30 @@ fn grow_ring_room_is_bounded_by_the_ring_budgets_remainder() {
     assert_eq!(in_use, ring_budget_bytes(heap));
 }
 
+/// **A `GrowRing` carve spends a table slot only on a run of the doubling
+/// class** (PR 13g review round 1, Issue 9; `appender::grow_ring_segment_
+/// floor_extents`): the floor is half the clamped ask rounded up, one
+/// extent when the ask is one — a fragmented heap whose longest run sits
+/// under it is answered `None` with the claims released. Drift is red.
+#[test]
+fn grow_ring_segment_floor_is_half_the_clamped_ask() {
+    use squeezefs::meta_backend::kv::appender::grow_ring_segment_floor_extents;
+    assert_eq!(grow_ring_segment_floor_extents(0), 1, "never below one");
+    assert_eq!(grow_ring_segment_floor_extents(1), 1);
+    assert_eq!(grow_ring_segment_floor_extents(2), 1);
+    assert_eq!(grow_ring_segment_floor_extents(3), 2, "rounded up");
+    assert_eq!(grow_ring_segment_floor_extents(32), 16);
+    assert_eq!(grow_ring_segment_floor_extents(33), 17);
+    // The pin's shape: a 2 MiB ask over 64 KiB extents is 32; a one-extent
+    // hole (the fragmented heap's longest run) sits under the floor of 16.
+    assert!(1 < grow_ring_segment_floor_extents((2 << 20) / (64 << 10)));
+    for want in 1..=4096u64 {
+        let floor = grow_ring_segment_floor_extents(want);
+        assert!(floor >= 1 && floor <= want, "{want} → {floor}");
+        assert!(2 * floor >= want, "{want} → {floor} is under half");
+    }
+}
+
 /// The symmetric MANAGER's derivations (design-symmetric-metadata §5.3.3
 /// grant sizing, §5.9 the failover bound, §1.6 "Manager death"; PR 3):
 /// `grant_extents = clamp(2 × ewma_smo_rate × failover_bound_s, 8,

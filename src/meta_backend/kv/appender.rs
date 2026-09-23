@@ -957,6 +957,18 @@ pub fn grow_ring_room_bytes(ceiling: u64, ring_bytes: u64, budget_remaining: u64
     ceiling.saturating_sub(ring_bytes).min(budget_remaining)
 }
 
+/// **A `GrowRing` carve's SEGMENT FLOOR** (PR 13g review round 1, Issue
+/// 9): the page's table holds `RING_SEGMENTS_MAX` segments, so a slot is
+/// spent only on a run of the DOUBLING class — at least half the clamped
+/// ask (`want_extents` after the room). A fragmented heap whose longest
+/// adjacent run is shorter answers `None` with every claim released: the
+/// ring stays at its size (pressure cycles keep it drained) and the next
+/// ask retries on a heap the cadence's returns may have healed. The
+/// floor is one extent when the ask itself is one.
+pub fn grow_ring_segment_floor_extents(want_extents: u64) -> u64 {
+    want_extents.div_ceil(2).max(1)
+}
+
 // ---- Extent grants (§5.3.3) -------------------------------------------------
 
 /// The images ONE SMO of a slot tree claims at most (physical): a
@@ -2693,6 +2705,10 @@ pub struct AppenderSet {
     /// (`appender_ring_budget_remaining_bytes` — the open, every join,
     /// leave and `GrowRing`; Issue 8).
     pub ring_budget_remaining: std::sync::atomic::AtomicU64,
+    /// `GrowRing` asks declined because the heap's longest adjacent run
+    /// was under the segment floor (`appender_grow_ring_short_declines`;
+    /// Issue 9) — the claims released whole, no table slot spent.
+    pub grow_ring_short_declines: std::sync::atomic::AtomicU64,
     /// `pressure_cycles` as the grant cadence last read it — a cadence
     /// that finds it moved ran on a PRESSURE-DRIVEN cycle (the ring is
     /// the bottleneck, not the heap) and returns nothing (PR 13g, F-R5).
@@ -3085,6 +3101,7 @@ impl AppenderSet {
             pending_segments_returned: self.pending_segments_returned.load(Relaxed),
             pool_restored_extents: self.pool_restored_extents.load(Relaxed),
             ring_budget_remaining_bytes: self.ring_budget_remaining.load(Relaxed),
+            grow_ring_short_declines: self.grow_ring_short_declines.load(Relaxed),
             manager_lease: self
                 .manager_lease
                 .lock()
@@ -3221,6 +3238,8 @@ pub struct AppenderStats {
     pub pool_restored_extents: u64,
     /// The ring budget's remainder (Issue 8).
     pub ring_budget_remaining_bytes: u64,
+    /// `GrowRing` asks declined under the segment floor (Issue 9).
+    pub grow_ring_short_declines: u64,
     /// The Manager family (§11, PR 3).
     pub manager_lease: ManagerLease,
     pub meta_pr_wero: bool,

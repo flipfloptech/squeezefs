@@ -2849,7 +2849,7 @@ fn sym_appender_ring_derives_from_the_reserve_and_the_solo_ring() {
 fn checkpoint_projection_prices_the_pending_work_from_measured_units() {
     use squeezefs::meta_backend::kv::checkpoint::{
         checkpoint_trigger_ms, flush_unit_ns, projected_flush_wall_ns, CycleTermWindow,
-        FlushPassSample, CHECKPOINT_MAX_AGE_MS, TERM_HORIZON_CYCLES,
+        FlushPassSample, CHECKPOINT_MAX_AGE_MS, FLUSH_UNIT_COUNT_FLOOR, TERM_HORIZON_CYCLES,
     };
     let ms = 1_000_000u64;
     // One pass's unit: the wall over the count; none without the class.
@@ -2860,6 +2860,27 @@ fn checkpoint_projection_prices_the_pending_work_from_measured_units() {
     );
     assert_eq!(flush_unit_ns(999 * ms, 0), None, "…whatever its wall");
     assert_eq!(flush_unit_ns(80 * ms, 40), Some(2 * ms));
+    // The unit's noise bound (review round 1, Issue 10b): a pass under one
+    // SMO's grain spreads its wall over the grain — a one-node pass with a
+    // 30 ms device hiccup moves the unit by 7.5 ms, never 30 — while a pass
+    // at or past the grain measures exactly. The grain IS `SMO_IMAGES_MAX`.
+    assert_eq!(
+        FLUSH_UNIT_COUNT_FLOOR,
+        u64::from(squeezefs::meta_backend::kv::appender::SMO_IMAGES_MAX)
+    );
+    assert_eq!(FLUSH_UNIT_COUNT_FLOOR, 4);
+    assert_eq!(flush_unit_ns(30 * ms, 1), Some(30 * ms / 4));
+    assert_eq!(
+        flush_unit_ns(30 * ms, 3),
+        Some(30 * ms / 4),
+        "under the grain the wall is spread over the grain, never the count"
+    );
+    assert_eq!(
+        flush_unit_ns(30 * ms, 4),
+        Some(30 * ms / 4),
+        "exact at the grain"
+    );
+    assert_eq!(flush_unit_ns(30 * ms, 5), Some(6 * ms), "…and past it");
     // The unit in force: the horizon maximum over the passes that ran the
     // class — a slow pass raises it at once, a quiet pass leaves it.
     let mut w = CycleTermWindow::new();

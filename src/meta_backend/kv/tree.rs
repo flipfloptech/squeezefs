@@ -3426,6 +3426,10 @@ impl KvTree {
                 return Err(e);
             }
         };
+        // The successor is one fresh image — the flush pass's image class
+        // (F-B1's unit) and the appender's SMO-rate input count it like a
+        // compaction's or a split's (PR 13g review round 1, Issue 10a).
+        ctx.images_written += 1;
         self.test_smo_build_pause(left.level(), false, true, left.min_key(), right.max_key())
             .await;
 

@@ -1607,6 +1607,11 @@ pub struct KvMetaBackend {
     )>,
     pub(super) checkpoint_node_unit_ns: AtomicU64,
     pub(super) checkpoint_image_unit_ns: AtomicU64,
+    /// The dirty-node count the cadence tick last read (`dirty_node_count`
+    /// stores every walk) — what the stats faces `checkpoint_trigger_ms` /
+    /// `checkpoint_projected_ms` serve instead of walking the node cache
+    /// per `.stats` read (review round 1, Issue 10c).
+    pub(super) checkpoint_last_dirty_count: AtomicU64,
     /// The volume's merge LAP across its trees (`run_merge_sweep`): which
     /// trees completed their lap since the last publish, and the exact
     /// candidate count they reported. Guarded by the SMO mutex's callers;
@@ -3244,6 +3249,7 @@ impl KvMetaBackend {
             )),
             checkpoint_node_unit_ns: AtomicU64::new(0),
             checkpoint_image_unit_ns: AtomicU64::new(0),
+            checkpoint_last_dirty_count: AtomicU64::new(0),
             merge_lap: std::sync::Mutex::new(VolumeLap::default()),
             merge_laps: AtomicU64::new(0),
             merge_candidates_tail: AtomicU64::new(0),
@@ -12254,8 +12260,8 @@ impl KvMetaBackend {
 
     /// The dirty nodes the next flush pass will write — one walk of the
     /// node cache (the cadence tick's own count, which it hands to
-    /// `checkpoint_due_by_age`; the stats face and the max-age trigger
-    /// walk here).
+    /// `checkpoint_due_by_age`); the count is kept for the stats faces,
+    /// which never walk (Issue 10c).
     pub fn dirty_node_count(&self) -> u64 {
         let mut dirty = 0u64;
         self.cache.for_each_node(|n| {
@@ -12263,7 +12269,16 @@ impl KvMetaBackend {
                 dirty += 1;
             }
         });
+        self.checkpoint_last_dirty_count
+            .store(dirty, Ordering::Relaxed);
         dirty
+    }
+
+    /// The dirty count as the cadence tick last read it — the stats
+    /// faces' input (`meta_kv_checkpoint_{trigger,projected}_ms` read the
+    /// tick's word, one relaxed load, never a cache walk per `.stats`).
+    pub fn checkpoint_last_dirty_count(&self) -> u64 {
+        self.checkpoint_last_dirty_count.load(Ordering::Relaxed)
     }
 
     /// **The LIVE projection of the next cycle's flush wall**, ms, for a
@@ -12279,10 +12294,10 @@ impl KvMetaBackend {
         ) / 1_000_000
     }
 
-    /// The projection at the dirty count of this instant
-    /// (`meta_kv_checkpoint_projected_ms`).
+    /// The projection at the dirty count the cadence tick last read
+    /// (`meta_kv_checkpoint_projected_ms`; the stats face — no cache walk).
     pub fn checkpoint_projected_ms(&self) -> u64 {
-        self.checkpoint_projected_ms_for(self.dirty_node_count())
+        self.checkpoint_projected_ms_for(self.checkpoint_last_dirty_count())
     }
 
     /// The anticipated landing term of this volume's checkpoint cycles —
@@ -12311,12 +12326,13 @@ impl KvMetaBackend {
     /// minus the measured cycle terms' maximum over the horizon, so the
     /// covering barrier lands inside the promise; a bit-17-ABSENT volume's
     /// trigger is the max age verbatim (the shipped cadence's decision —
-    /// PR 1's law).
+    /// PR 1's law). The stats face: the dirty count is the tick's last
+    /// read, never a cache walk here (Issue 10c).
     pub fn checkpoint_trigger_ms(&self, max_age_ms: u64) -> u64 {
         if self.appenders.is_none() {
             return max_age_ms;
         }
-        self.checkpoint_trigger_ms_for(max_age_ms, self.dirty_node_count())
+        self.checkpoint_trigger_ms_for(max_age_ms, self.checkpoint_last_dirty_count())
     }
 
     /// The trigger for a max age at a dirty count the caller already read

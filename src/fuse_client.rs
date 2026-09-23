@@ -14001,6 +14001,10 @@ impl SqueezefsFilesystem {
                     appender(&|s| s.stale_page_words_dropped),
                 );
                 metrics.insert(
+                    "appender_join_residue_returned".into(),
+                    appender(&|s| s.join_residue_returned),
+                );
+                metrics.insert(
                     "appender_directory_reads".into(),
                     serde_json::json!(crate::meta_backend::kv::appender::directory_reads()),
                 );

@@ -19906,6 +19906,7 @@ impl KvMetaBackend {
             )),
             grow_ring_short_declines: AtomicU64::new(0),
             stale_page_words_dropped: AtomicU64::new(0),
+            join_residue_returned: AtomicU64::new(0),
             cadence_pressure_seen: AtomicU64::new(0),
             joined: AtomicBool::new(false),
             join_refusal,

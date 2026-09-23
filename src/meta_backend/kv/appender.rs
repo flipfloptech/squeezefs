@@ -2811,6 +2811,13 @@ pub struct AppenderSet {
     /// return landed; the record is the manager's truth). ≈ 0 on a
     /// healthy fleet since the shrink rewrites the page before its return.
     pub stale_page_words_dropped: std::sync::atomic::AtomicU64,
+    /// Extents a FRESH join found in its id's `extent_grant` record under
+    /// a `Free` page and RETURNED before its own grant
+    /// (`appender_join_residue_returned`; review round 2, Issue 14): a
+    /// wire `ExtentGrant` carve whose reply was lost — the record is the
+    /// witness, the joiner's page word never learnt it, its leave returned
+    /// what it knew. ≈ 0 on a healthy fleet.
+    pub join_residue_returned: std::sync::atomic::AtomicU64,
     /// `pressure_cycles` as the grant cadence last read it — a cadence
     /// that finds it moved ran on a PRESSURE-DRIVEN cycle (the ring is
     /// the bottleneck, not the heap) and returns nothing (PR 13g, F-R5).
@@ -3214,6 +3221,7 @@ impl AppenderSet {
             ring_budget_remaining_bytes: self.ring_budget_remaining.load(Relaxed),
             grow_ring_short_declines: self.grow_ring_short_declines.load(Relaxed),
             stale_page_words_dropped: self.stale_page_words_dropped.load(Relaxed),
+            join_residue_returned: self.join_residue_returned.load(Relaxed),
             manager_lease: self
                 .manager_lease
                 .lock()
@@ -3362,6 +3370,9 @@ pub struct AppenderStats {
     /// Page-named extents a region open dropped as outside the record
     /// (review round 2, Issue 16a).
     pub stale_page_words_dropped: u64,
+    /// Record residue a fresh join returned before its grant (review round
+    /// 2, Issue 14 — a carve whose reply was lost).
+    pub join_residue_returned: u64,
     /// The Manager family (§11, PR 3).
     pub manager_lease: ManagerLease,
     pub meta_pr_wero: bool,

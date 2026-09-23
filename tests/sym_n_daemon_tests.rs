@@ -12275,6 +12275,124 @@ async fn a_quiet_joiners_pool_above_its_target_shrinks_at_the_cadence_and_asks_f
 }
 
 // ---------------------------------------------------------------------------
+// PR 13g review round 2, Issue 14 — a carve whose reply was lost is never a
+// fresh join's phantom claim.
+// ---------------------------------------------------------------------------
+
+/// **A wire `ExtentGrant` carve whose REPLY was lost is reconciled at the
+/// id's next FRESH join, never inherited as a phantom claim** (PR 13g
+/// review round 2, Issue 14). The verb's idempotency witness is the
+/// joiner's PAGE word (§5.3.5): a carve that lands while the reply is
+/// lost is in the record and in no page word; the joiner's RAM never
+/// learns it, its leave returns what it knows, and the record keeps the
+/// carve under a `Free` page. A fresh identity taking that page (the
+/// lowest Free) recovered its grant as `record ∖ page word` = CLAIMED —
+/// phantoms no tree reaches, no census at a fresh join (only an
+/// own-residue open runs one), extents lost to the heap for the id's
+/// life. The law: a fresh join over a `Free` page whose record is not
+/// empty RETURNS the residue before its own grant
+/// (`appender_join_residue_returned`), so the fresh joiner's grant is its
+/// grant alone and its RAM claims nothing. RED before the fix: the fresh
+/// joiner's `grant_claimed` reads the residue's count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_carve_whose_reply_was_lost_is_reconciled_at_the_ids_fresh_join() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let joiner = join(&uris, &venue, &mvol, 3).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let id = jvol.appender_stats().unwrap().appender_id;
+    let files = create_files(&joiner, shared, "x", 8).await;
+    jvol.checkpoint_now().await.unwrap();
+    let record0 = record_extents(&mvol, id).await;
+    // The LOST reply: the manager serves the joiner's wire ask (the served
+    // side, verbatim) and the reply never reaches the joiner — its RAM
+    // pool, and so its page word and its leave, never learn the carve.
+    let want = u32::try_from(record0.len() + 24).unwrap();
+    mvol.manager_extent_grant(id, want).await.unwrap();
+    let lost: std::collections::BTreeSet<u64> = record_extents(&mvol, id)
+        .await
+        .difference(&record0)
+        .copied()
+        .collect();
+    assert!(
+        !lost.is_empty(),
+        "the premise: the served ask carved extents the joiner never heard of"
+    );
+    let residue0 = mvol.appender_stats().unwrap().join_residue_returned;
+    // The joiner leaves: the ring back, the pool IT knows returned, the
+    // page Free — the lost carve stays in the record.
+    shutdown(&joiner).await;
+    drop(jvol);
+    let page = page_of(&uris[0], &mvol, id).await.unwrap();
+    assert_eq!(page.state, AppenderState::Free, "the joiner left");
+    let residue = record_extents(&mvol, id).await;
+    assert_eq!(
+        residue, lost,
+        "the premise: the leave returned what the joiner knew; the lost carve stands in the record"
+    );
+    for e in &lost {
+        assert!(
+            mvol.allocator().is_allocated(*e),
+            "held by the record ({e})"
+        );
+    }
+    // A FRESH identity joins and takes the Free page (the lowest).
+    let fresh = join(&uris, &venue, &mvol, 4).await;
+    let fvol = Arc::clone(&fresh.volumes[0]);
+    let fid = fvol.appender_stats().unwrap().appender_id;
+    assert_eq!(fid, id, "the premise: the fresh join reuses the Free page");
+    // The law: the record at the fresh join is the fresh grant alone — the
+    // residue returned first (a lost extent is free, or legitimately in
+    // the fresh grant by the carve's lowest-free-first), the fresh RAM
+    // claims nothing, the gauge names the residue.
+    let record_fresh = record_extents(&mvol, fid).await;
+    let fresh_stats = fvol.appender_stats().unwrap();
+    let region = fresh_stats
+        .regions
+        .iter()
+        .find(|r| r.id == fid)
+        .expect("the fresh joiner's own region");
+    assert_eq!(
+        region.grant_claimed, 0,
+        "a fresh join claims nothing — the residue is not its images ({region:?})"
+    );
+    assert_eq!(
+        record_fresh.len() as u64,
+        region.grant_claimed
+            + region.grant_unclaimed
+            + region.grant_pending
+            + region.grant_returnable,
+        "the record IS the fresh joiner's RAM sets (PR 3's law)"
+    );
+    for e in &lost {
+        assert!(
+            !mvol.allocator().is_allocated(*e) || record_fresh.contains(e),
+            "a lost extent is free or in the fresh grant, never a phantom ({e})"
+        );
+    }
+    assert_eq!(
+        mvol.appender_stats().unwrap().join_residue_returned - residue0,
+        lost.len() as u64,
+        "the residue's count on appender_join_residue_returned"
+    );
+    assert_all_resolve(&manager, shared, &files).await;
+    assert_supply_gauges_zero(&fvol, "the fresh joiner");
+    shutdown(&fresh).await;
+    assert_must_stay_zero(&mvol, "manager");
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+// ---------------------------------------------------------------------------
 // PR 13g review round 2, Issue 16 — the shrink's return never leaves a
 // stale page word, and a rejoin adopts the page word ∩ the record.
 // ---------------------------------------------------------------------------

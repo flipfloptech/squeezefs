@@ -2282,7 +2282,7 @@ impl KvMetaBackend {
     /// re-dial goes to the last known endpoint: under the forest's mint
     /// guard a projection refresh would take the SMO mutex the other way
     /// round from the census (SMO mutex → mint guard).
-    pub(super) async fn joined_extent_grant(&self, want: u32) -> Result<u64, KvError> {
+    pub async fn joined_extent_grant(&self, want: u32) -> Result<u64, KvError> {
         self.joined_extent_grant_at(want, None).await
     }
 

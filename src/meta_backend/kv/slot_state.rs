@@ -676,8 +676,24 @@ pub const EXTENT_GRANT_KEY_LEN: usize = EXTENT_GRANT_KEY_PREFIX.len() + 4;
 /// Record value version (byte 0).
 pub const EXTENT_GRANT_VERSION: u8 = 1;
 /// `version ‖ n_runs: u16` before the runs (`start: u64 ‖ len: u32` each).
-const EXTENT_GRANT_FIXED_LEN: usize = 1 + 2;
-const GRANT_RUN_LEN: usize = 8 + 4;
+pub const EXTENT_GRANT_FIXED_LEN: usize = 1 + 2;
+pub const GRANT_RUN_LEN: usize = 8 + 4;
+
+/// The framed bytes of an `extent_grant` record of `runs` runs inside a
+/// control entry (`journal::record_frame_len` over its key and value).
+pub fn extent_grant_frame_len(runs: usize) -> u64 {
+    super::journal::record_frame_len(
+        EXTENT_GRANT_KEY_LEN,
+        EXTENT_GRANT_FIXED_LEN + runs * GRANT_RUN_LEN,
+    )
+}
+
+/// The runs an `extent_grant` record may carry under a tree-0 value cap
+/// `value_cap` (`record_value_cap`) — the u16 count's ceiling is the
+/// record's own bound below it.
+pub fn extent_grant_max_runs(value_cap: usize) -> usize {
+    (value_cap.saturating_sub(EXTENT_GRANT_FIXED_LEN) / GRANT_RUN_LEN).min(u16::MAX as usize)
+}
 
 /// The tree-0 key of appender `appender_id`'s grant record.
 pub fn extent_grant_key(appender_id: u32) -> Vec<u8> {

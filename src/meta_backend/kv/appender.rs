@@ -1174,6 +1174,67 @@ pub fn grant_extents_wire_cap(free_heap: u64, appenders: u64) -> u64 {
     (free_heap / (4 * appenders.max(1))).max(GRANT_EXTENTS_FLOOR)
 }
 
+/// The framed bytes of one allocator CLAIM delta inside a control entry
+/// (`alloc_ext::alloc_record` — an 8-byte extent key, a 1-byte value).
+pub fn alloc_delta_frame_len() -> u64 {
+    super::journal::record_frame_len(super::alloc_ext::EXTENT_KEY_LEN, 1)
+}
+
+/// The framed bytes of one allocator FREE delta inside a control entry
+/// (`alloc_ext::free_record` — the tag and the retire seq).
+pub fn free_delta_frame_len() -> u64 {
+    super::journal::record_frame_len(super::alloc_ext::EXTENT_KEY_LEN, 9)
+}
+
+/// The framed bytes of an `appender_hint` put riding a grant's entry.
+pub fn appender_hint_frame_len() -> u64 {
+    super::journal::record_frame_len(
+        super::slot_state::APPENDER_HINT_KEY_LEN,
+        super::slot_state::APPENDER_HINT_LEN,
+    )
+}
+
+/// **The control entries a grant's deltas ride** (PR 13g review round 1,
+/// Issue 3 — PR 4's leave law for the extent grant): `count` deltas of
+/// `delta_frame_len` bytes each, packed by [`super::journal::pack_entries`]
+/// under [`super::journal::MAX_ENTRY_LEN`] BESIDE the rewritten
+/// `extent_grant` record and `side_frame_len` bytes of other riders (the
+/// identity's hint put). The record's frame per chunk is bounded by
+/// `record_runs + the chunk's length` runs — every extent a chunk claims
+/// or frees adds at most one run (a claim that touches no run, a free
+/// that splits one) — so the packing is exact in O(count) and never a
+/// materialized record per candidate. Before it a carve past ≈ 5,200
+/// extents or a return past ≈ 3,900 was `EntryTooLarge` for ever: the
+/// joiner's derived ask at a storm's SMO rate on a heap with room.
+pub fn pack_grant_deltas(
+    count: usize,
+    delta_frame_len: u64,
+    record_runs: usize,
+    side_frame_len: u64,
+) -> Vec<std::ops::Range<usize>> {
+    let payloads = vec![delta_frame_len; count];
+    super::journal::pack_entries(&payloads, |range| {
+        super::slot_state::extent_grant_frame_len(record_runs + range.len())
+            .saturating_add(side_frame_len)
+    })
+}
+
+/// The deltas ONE control entry carries beside a grant record of
+/// `record_runs` runs and `side_frame_len` bytes of riders — the first
+/// chunk [`pack_grant_deltas`] cuts, in closed form: `(payload cap −
+/// record frame(record_runs) − side) / (delta frame + one run)`. The
+/// derivation's face for the tie test and the operator's arithmetic.
+pub fn grant_deltas_per_entry(
+    delta_frame_len: u64,
+    record_runs: usize,
+    side_frame_len: u64,
+) -> u64 {
+    let fixed =
+        super::slot_state::extent_grant_frame_len(record_runs).saturating_add(side_frame_len);
+    super::journal::entry_payload_cap().saturating_sub(fixed)
+        / delta_frame_len.saturating_add(super::slot_state::GRANT_RUN_LEN as u64)
+}
+
 /// The runs a page NAMES of a remainder `runs` (ascending by start):
 /// every run when they fit the page's [`GRANT_RUNS_MAX`], else the
 /// LARGEST runs (ties: the lowest start), back in ascending order.

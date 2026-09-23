@@ -11545,8 +11545,9 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
 /// adds at most one run — over the delta's frame; PR 4's leave law), each
 /// chunk a consistent record state: a heap 4 GiB wide (the wire cap
 /// `free/(4 × appenders)` admits the ask), a wire joiner, ONE
-/// `ExtentGrant` for a third more than one entry's worth of deltas —
-/// answered whole in more than one entry, the grant closure exact — then
+/// `ExtentGrant` of its own for a third more than one entry's worth of
+/// deltas — answered whole in more than one entry, the grant closure
+/// exact, the pool holding it — then
 /// the joiner's clean leave returns the whole pool, the page `Free`, the
 /// record gone. RED before the fix: `EntryTooLarge`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -11589,11 +11590,13 @@ async fn a_carve_past_one_control_entry_lands_whole_and_the_leave_returns_it_who
         .find(|r| r.id == id)
         .expect("the joiner's region")
         .grant_unclaimed;
-    let runs = mvol
-        .manager_extent_grant(id, want as u32)
+    // The joiner's OWN ask over the wire (the cadence's and the reactive
+    // ladder's one function): the manager carves, the runs land in the
+    // joiner's pool.
+    let carved = jvol
+        .joined_extent_grant(want as u32)
         .await
         .expect("a carve wider than one control entry lands");
-    let carved: u64 = runs.iter().map(|r| u64::from(r.len)).sum();
     let after = mvol.appender_stats().expect("the manager's faces");
     assert_eq!(
         carved,

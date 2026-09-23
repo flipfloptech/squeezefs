@@ -9402,11 +9402,42 @@ impl KvMetaBackend {
         // as the remainder VERBATIM, and a maintenance refill that read
         // "landed" off a non-empty verbatim answer looped for ever on the
         // SMO it could not cover.
-        let union: std::collections::BTreeSet<u64> = remainder
-            .iter()
-            .flat_map(|r| r.start..r.start + u64::from(r.len))
-            .chain(claimed.iter().copied())
-            .collect();
+        //
+        // The RECORD's run cap is the one bound on the pool's shape (the
+        // tree-0 value cap, `extent_grant_max_runs`): a carve whose
+        // fragments would push the merged record past it is cut to what
+        // the record can name (the smallest tail of the carve released) —
+        // a heap so fragmented that no extent fits answers the remainder,
+        // loud, never a `ValueTooLarge` re-asked at every cadence.
+        let max_runs =
+            super::slot_state::extent_grant_max_runs(self.cache.config().layout.record_value_cap());
+        let fits = |k: usize| {
+            super::slot_state::ExtentGrantRecord::from_extents(
+                record.extents().chain(claimed[..k].iter().copied()),
+            )
+            .runs
+            .len()
+                <= max_runs
+        };
+        let mut keep = claimed.len();
+        while keep > 0 && !fits(keep) {
+            keep = (keep * 3 / 4).min(keep - 1);
+        }
+        if keep < claimed.len() {
+            log::warn!(
+                "meta volume {}: ExtentGrant to appender {appender_id} cut from {} to {keep} \
+                 extent(s) — the merged grant record would exceed its {max_runs}-run cap on \
+                 this heap's fragments (the pool tops up at the next cadence)",
+                self.path.display(),
+                claimed.len()
+            );
+            for c in claimed.drain(keep..) {
+                self.alloc.release_unpublished(c);
+            }
+            if claimed.is_empty() {
+                return Ok(remainder);
+            }
+        }
         // A carve the bitmap answered FREE that another appender's record
         // still names is a double custodian — refused, the claims undone.
         if let Err(e) = self
@@ -9442,32 +9473,17 @@ impl KvMetaBackend {
                 );
             }
         }
-        let runs = super::slot_state::ExtentGrantRecord::from_extents(claimed.iter().copied()).runs;
-        let mut recs: Vec<(u8, Record)> = claimed
-            .iter()
-            .map(|e| super::alloc_ext::alloc_record(*e, 0))
-            .collect();
-        let merged = super::slot_state::ExtentGrantRecord::from_extents(
-            record.extents().chain(claimed.iter().copied()),
-        );
-        recs.push((
-            super::journal::tag_for(super::record::TREE_CONTROL, 0),
-            Record::put(
-                super::slot_state::extent_grant_key(appender_id),
-                0,
-                merged.encode()?,
-            ),
-        ));
         // A WIRE appender's derived-size ask above the floor is what its
         // identity's next join starts from (`appender_hint`, PR 13g) —
-        // the record rides this entry when the word grows.
+        // the record rides the carve's LAST entry when the word grows.
+        let mut hint_put: Option<(u8, Record)> = None;
         if wire_explicit && want > super::appender::GRANT_EXTENTS_FLOOR {
             if let Some(identity) = self.wire_appender_identity(appender_id).await? {
                 let hint = self
                     .appender_hint_for(identity.node_token, identity.mount_slot)
                     .await?;
                 if want > hint.grant_extents {
-                    recs.push(Self::appender_hint_put(
+                    hint_put = Some(Self::appender_hint_put(
                         identity,
                         super::slot_state::AppenderHint {
                             grant_extents: want,
@@ -9477,12 +9493,70 @@ impl KvMetaBackend {
                 }
             }
         }
-        if let Err(e) = self.write_control_entry(recs, EntryAdmission::Try).await {
-            for c in claimed {
-                self.alloc.release_unpublished(c);
+        // The carve's deltas ride as many control entries as the entry
+        // cap needs (`pack_grant_deltas` — PR 13g review round 1, Issue 3:
+        // a derived-size carve past ≈ 5,200 extents was `EntryTooLarge`
+        // for ever), each with the grant record as it stands AFTER that
+        // chunk — every entry a consistent state, a kill between two the
+        // partial carve the record names. A chunk that fails to write
+        // releases the rest and keeps what landed: a partial carve is
+        // legal, the pool tops up at the next cadence.
+        let side = hint_put
+            .as_ref()
+            .map_or(0, |_| super::appender::appender_hint_frame_len());
+        let chunks = super::appender::pack_grant_deltas(
+            claimed.len(),
+            super::appender::alloc_delta_frame_len(),
+            record.runs.len(),
+            side,
+        );
+        let mut landed = 0usize;
+        for (i, ch) in chunks.iter().enumerate() {
+            let merged = super::slot_state::ExtentGrantRecord::from_extents(
+                record.extents().chain(claimed[..ch.end].iter().copied()),
+            );
+            let mut recs: Vec<(u8, Record)> = claimed[ch.clone()]
+                .iter()
+                .map(|e| super::alloc_ext::alloc_record(*e, 0))
+                .collect();
+            recs.push((
+                super::journal::tag_for(super::record::TREE_CONTROL, 0),
+                Record::put(
+                    super::slot_state::extent_grant_key(appender_id),
+                    0,
+                    merged.encode()?,
+                ),
+            ));
+            if i + 1 == chunks.len() {
+                if let Some(h) = hint_put.take() {
+                    recs.push(h);
+                }
             }
-            return Err(e);
+            match self.write_control_entry(recs, EntryAdmission::Try).await {
+                Ok(()) => landed = ch.end,
+                Err(e) => {
+                    for c in claimed.drain(landed..) {
+                        self.alloc.release_unpublished(c);
+                    }
+                    if landed == 0 {
+                        return Err(e);
+                    }
+                    log::warn!(
+                        "meta volume {}: ExtentGrant to appender {appender_id} landed {landed} \
+                         extent(s) in {i} control entr(y/ies) and its next entry failed ({e}) \
+                         — the rest released; the pool tops up at the next cadence",
+                        self.path.display()
+                    );
+                    break;
+                }
+            }
         }
+        let runs = super::slot_state::ExtentGrantRecord::from_extents(claimed.iter().copied()).runs;
+        let union: std::collections::BTreeSet<u64> = remainder
+            .iter()
+            .flat_map(|r| r.start..r.start + u64::from(r.len))
+            .chain(claimed.iter().copied())
+            .collect();
         set.extent_grants.fetch_add(1, Ordering::Relaxed);
         set.extent_grant_extents
             .fetch_add(claimed.len() as u64, Ordering::Relaxed);
@@ -9652,30 +9726,103 @@ impl KvMetaBackend {
                 )));
             }
         }
-        let remaining = super::slot_state::ExtentGrantRecord::from_extents(
-            record.extents().filter(|e| !granted.contains(e)),
-        );
-        let mut recs: Vec<(u8, Record)> = granted
-            .iter()
-            .map(|e| super::alloc_ext::free_record(*e, 0, 0))
-            .collect();
+        // The return's free deltas ride as many control entries as the
+        // entry cap needs (`pack_grant_deltas` — PR 13g review round 1,
+        // Issue 3: the leave's whole-pool return past ≈ 3,900 extents was
+        // `EntryTooLarge` and left the page `Live`), each with the record
+        // as it stands AFTER that chunk — a consistent state at every
+        // entry; the extents a landed chunk freed are released to the
+        // bitmap, a chunk that fails leaves the rest granted (the caller's
+        // retry finds the landed ones `already`, §5.3.5) and answers the
+        // error. The record's run cap is a free's second bound: a free
+        // that SPLITS a run can push a record at the cap past it — the
+        // chunk is cut to what the record can name, and one extent whose
+        // removal alone exceeds it is the loud refusal (a pool of more
+        // fragments than the tree-0 value cap names).
+        let max_runs =
+            super::slot_state::extent_grant_max_runs(self.cache.config().layout.record_value_cap());
         let key = super::slot_state::extent_grant_key(appender_id);
-        recs.push((
-            super::journal::tag_for(super::record::TREE_CONTROL, 0),
-            if remaining.is_empty() {
-                Record::delete(key, 0)
-            } else {
-                Record::put(key, 0, remaining.encode()?)
-            },
-        ));
-        if let Err(e) = self.write_control_entry(recs, EntryAdmission::Try).await {
-            if let Some(r) = set.region(appender_id) {
-                r.grant().restore_returnable(dropped_from_ram);
+        let remaining_after = |end: usize| {
+            let removed: std::collections::BTreeSet<u64> = granted[..end].iter().copied().collect();
+            super::slot_state::ExtentGrantRecord::from_extents(
+                record.extents().filter(|e| !removed.contains(e)),
+            )
+        };
+        let mut landed = 0usize;
+        let mut record_runs = record.runs.len();
+        let mut failure: Option<KvError> = None;
+        while landed < granted.len() {
+            // One entry's worth from here (the closed form of the packing,
+            // against the record as it stands after the chunks so far).
+            let per_entry = super::appender::grant_deltas_per_entry(
+                super::appender::free_delta_frame_len(),
+                record_runs,
+                0,
+            )
+            .max(1) as usize;
+            let mut end = (landed + per_entry).min(granted.len());
+            let mut remaining = remaining_after(end);
+            while remaining.runs.len() > max_runs && end > landed + 1 {
+                end = (landed + (end - landed) * 3 / 4).min(end - 1);
+                remaining = remaining_after(end);
             }
-            return Err(e);
+            if remaining.runs.len() > max_runs {
+                failure = Some(KvError::Busy(format!(
+                    "{}: ReturnExtents from appender {appender_id} refused — freeing extent {} \
+                     would split its grant record past the {max_runs}-run cap this volume's \
+                     tree-0 value cap names (manager_verb_refusals)",
+                    self.path.display(),
+                    granted[landed]
+                )));
+                set.verbs.refusals.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            let mut recs: Vec<(u8, Record)> = granted[landed..end]
+                .iter()
+                .map(|e| super::alloc_ext::free_record(*e, 0, 0))
+                .collect();
+            recs.push((
+                super::journal::tag_for(super::record::TREE_CONTROL, 0),
+                if remaining.is_empty() {
+                    Record::delete(key.clone(), 0)
+                } else {
+                    Record::put(key.clone(), 0, remaining.encode()?)
+                },
+            ));
+            match self.write_control_entry(recs, EntryAdmission::Try).await {
+                Ok(()) => {
+                    for e in &granted[landed..end] {
+                        self.alloc.release_unpublished(*e);
+                    }
+                    landed = end;
+                    record_runs = remaining.runs.len();
+                }
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
         }
-        for e in &granted {
-            self.alloc.release_unpublished(*e);
+        if landed < granted.len() {
+            if let Some(r) = set.region(appender_id) {
+                let unlanded: Vec<u64> = dropped_from_ram
+                    .iter()
+                    .copied()
+                    .filter(|e| granted[landed..].contains(e))
+                    .collect();
+                r.grant().restore_returnable(unlanded);
+            }
+            if landed > 0 {
+                set.extent_returns.fetch_add(1, Ordering::Relaxed);
+            }
+            return Err(failure.unwrap_or_else(|| {
+                KvError::Busy(format!(
+                    "{}: ReturnExtents from appender {appender_id} landed {landed} of {} \
+                     extent(s) — the rest stay granted for the caller's retry",
+                    self.path.display(),
+                    granted.len()
+                ))
+            }));
         }
         if set.region(appender_id).is_none() && !at_leave {
             // A wire joiner's page remainder drops the returned extents

@@ -2975,6 +2975,88 @@ fn threshold_drain_budget_is_the_passes_not_each_trees() {
     }
 }
 
+/// **A grant's control entries are bounded by the journal entry cap** (PR
+/// 13g review round 1, Issue 3; design §5.3.3 as built): a carve's claim
+/// deltas and a return's free deltas pack into entries under
+/// `MAX_ENTRY_LEN` BESIDE the rewritten `extent_grant` record — whose
+/// frame per chunk is bounded by the record's runs plus the chunk's length
+/// (every extent adds at most one run) — and the identity's hint put. The
+/// closed form `grant_deltas_per_entry` ≡ the packing's first chunk; every
+/// chunk fits; the chunks cover the count contiguously; one more delta
+/// would not fit. A 25-byte claim delta packs ≈ 3,500 per entry against an
+/// empty record, a 33-byte free delta ≈ 2,900 — the joiner's derived ask
+/// at a storm's SMO rate (≈ 8,300) is three entries, where one was
+/// `EntryTooLarge` for ever.
+#[test]
+fn grant_deltas_pack_under_the_journal_entry_cap() {
+    use squeezefs::meta_backend::kv::appender::{
+        alloc_delta_frame_len, appender_hint_frame_len, free_delta_frame_len,
+        grant_deltas_per_entry, pack_grant_deltas,
+    };
+    use squeezefs::meta_backend::kv::journal::{record_frame_len, ENTRY_HDR_LEN, MAX_ENTRY_LEN};
+    use squeezefs::meta_backend::kv::slot_state::extent_grant_frame_len;
+    assert_eq!(alloc_delta_frame_len(), record_frame_len(8, 1));
+    assert_eq!(alloc_delta_frame_len(), 25);
+    assert_eq!(free_delta_frame_len(), record_frame_len(8, 9));
+    assert_eq!(free_delta_frame_len(), 33);
+    let hint = appender_hint_frame_len();
+    let total = |k: u64, delta: u64, runs: usize, side: u64| {
+        ENTRY_HDR_LEN + k * delta + extent_grant_frame_len(runs + k as usize) + side
+    };
+    for (delta, runs, side) in [
+        (alloc_delta_frame_len(), 0usize, 0u64),
+        (alloc_delta_frame_len(), 1, hint),
+        (alloc_delta_frame_len(), 1_000, hint),
+        (free_delta_frame_len(), 3, 0),
+        (free_delta_frame_len(), 5_000, 0),
+    ] {
+        let count = 20_000usize;
+        let chunks = pack_grant_deltas(count, delta, runs, side);
+        assert!(chunks.len() >= 2, "{count} deltas never fit one entry");
+        let mut next = 0usize;
+        for ch in &chunks {
+            assert_eq!(ch.start, next, "the chunks are contiguous");
+            assert!(
+                total(ch.len() as u64, delta, runs, side) <= MAX_ENTRY_LEN,
+                "chunk {ch:?} fits the entry cap"
+            );
+            next = ch.end;
+        }
+        assert_eq!(next, count, "the chunks cover the count");
+        let per = grant_deltas_per_entry(delta, runs, side);
+        assert_eq!(
+            chunks[0].len() as u64,
+            per,
+            "the closed form is the first chunk"
+        );
+        assert!(
+            total(per + 1, delta, runs, side) > MAX_ENTRY_LEN,
+            "one more delta would not fit"
+        );
+    }
+    let per_claim = grant_deltas_per_entry(alloc_delta_frame_len(), 1, hint);
+    assert!(
+        (3_000..4_000).contains(&per_claim),
+        "≈ 3,500 claim deltas per entry ({per_claim})"
+    );
+    let per_free = grant_deltas_per_entry(free_delta_frame_len(), 1, 0);
+    assert!(
+        (2_500..3_200).contains(&per_free),
+        "≈ 2,900 free deltas per entry ({per_free})"
+    );
+    assert_eq!(
+        pack_grant_deltas(8_300, alloc_delta_frame_len(), 1, hint).len(),
+        3,
+        "the derived ask at 92 SMO/s is three entries"
+    );
+    assert_eq!(
+        pack_grant_deltas(8, alloc_delta_frame_len(), 0, 0).len(),
+        1,
+        "the floor is one entry"
+    );
+    assert!(pack_grant_deltas(0, alloc_delta_frame_len(), 0, 0).is_empty());
+}
+
 /// The symmetric MANAGER's derivations (design-symmetric-metadata §5.3.3
 /// grant sizing, §5.9 the failover bound, §1.6 "Manager death"; PR 3):
 /// `grant_extents = clamp(2 × ewma_smo_rate × failover_bound_s, 8,

@@ -11785,25 +11785,31 @@ async fn a_joiner_killed_with_a_pool_wider_than_its_page_names_rejoins_with_the_
     let s = avol.appender_stats().unwrap();
     assert_eq!(granted1, granted0, "the record is the grant");
     // The closure at the rejoin over EVERY pool state: the own-residue
-    // cover is a joiner cycle, and a quiet cycle queues the pool's surplus
-    // above its target for return (Issue 5) — queued, never leaked.
+    // cover is a joiner cycle, and a quiet cycle shrinks the pool's
+    // surplus above its target — queued for return, or already returned
+    // over the wire (Issue 5) — never leaked.
     assert_eq!(
         granted1,
         claimed1 + returned1 + unclaimed1 + queued1,
         "the closure holds at the rejoin"
     );
     assert_eq!(
-        unclaimed1 + queued1,
+        unclaimed1 + queued1 + returned1,
         unclaimed0,
-        "the pool is WHOLE at the rejoin — kept or queued to return, nothing claimed \
-         (claimed {claimed0} → {claimed1}; restored {})",
+        "the pool is WHOLE at the rejoin — kept, queued or returned by the cover's shrink, \
+         nothing claimed and nothing lost (claimed {claimed0} → {claimed1}; restored {})",
         s.pool_restored_extents
     );
     assert_eq!(claimed1, claimed0, "no pool extent reads claimed");
-    assert_eq!(
+    // The census restored AT LEAST the unnamed runs; beside them it may
+    // restore a pre-cycle lazy mint's image (a root the replay re-mints —
+    // its claim is journaled by the next cycle, which never ran, so no
+    // record names it: dead, back to the pool).
+    assert!(
+        s.pool_restored_extents >= unclaimed0 - named0,
+        "the census restored the unnamed runs ({} of at least {})",
         s.pool_restored_extents,
-        unclaimed0 - named0,
-        "the census restored exactly the unnamed runs"
+        unclaimed0 - named0
     );
     let orphans = avol.c13_orphan_image_extents().await.unwrap();
     assert!(

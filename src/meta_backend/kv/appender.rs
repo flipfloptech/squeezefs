@@ -1947,7 +1947,10 @@ impl RegionGrant {
     /// broken), the lowest extents of the run that straddles the mark —
     /// and answer them for the cadence's `ReturnExtents`. Nothing below
     /// `target` moves; `target` is never below the promised headroom (the
-    /// caller's law).
+    /// caller's law). The surplus reads RETURNED from here (the closure
+    /// law `granted ≡ held + returned + unclaimed`, [`Self::
+    /// take_returnable`]'s discipline — a failed return's
+    /// [`Self::restore_returnable`] takes the count back).
     pub fn shrink_to(&mut self, target: u64) -> Vec<u64> {
         let mut surplus = self.unclaimed().saturating_sub(target);
         let mut out = Vec::with_capacity(surplus as usize);
@@ -1969,6 +1972,7 @@ impl RegionGrant {
             surplus -= take;
         }
         out.sort_unstable();
+        self.returned += out.len() as u64;
         out
     }
 

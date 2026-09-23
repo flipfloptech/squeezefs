@@ -1272,7 +1272,7 @@ impl ManagerService {
                         want_bytes,
                     } => self
                         .volume
-                        .manager_grow_ring_wire(*appender_id, *want_bytes)
+                        .manager_grow_ring_wire(*appender_id, *want_bytes, &req.peer)
                         .await
                         .map(|segment| ManagerReply::RingGrown {
                             segment: segment.map(|s| (s.start, s.len)),

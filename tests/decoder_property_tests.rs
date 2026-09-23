@@ -63,7 +63,7 @@ use squeezefs::meta_backend::kv::slot_state::{
     appender_hint_key, custody_quarantine_key, decode_appender_hint, decode_custody_quarantine,
     decode_custody_quarantine_key, decode_slot_state_key, decode_slot_tails_key,
     encode_appender_hint, encode_custody_quarantine, slot_state_key, slot_tails_key, AppenderHint,
-    SlotState, SlotTails, SlotTailsRecord, TailsSpill, APPENDER_HINT_KEY_LEN,
+    PendingSegment, SlotState, SlotTails, SlotTailsRecord, TailsSpill, APPENDER_HINT_KEY_LEN,
     APPENDER_HINT_KEY_PREFIX, APPENDER_HINT_LEN, APPENDER_HINT_VERSION, CUSTODY_QUARANTINE_KEY_LEN,
     SLOT_STATE_KEY_LEN, SLOT_STATE_VERSION, SLOT_TAILS_KEY_LEN, SLOT_TAILS_VERSION, TAILS_SPILLED,
 };
@@ -758,25 +758,49 @@ proptest! {
         if let Ok(until) = decode_custody_quarantine(&data) {
             prop_assert_eq!(encode_custody_quarantine(until), data.clone());
         }
-        // PR 13g (F-R5): the appender-hint record is total and byte-exact.
+        // PR 13g (F-R5): the appender-hint record is total and byte-exact;
+        // a refusal is a wrong length or version, or a non-canonical
+        // pending segment (a flag past 1, words under a clear flag, an
+        // empty or overflowing segment — review round 1, Issue 1).
         match decode_appender_hint(&data) {
             Ok(hint) => prop_assert_eq!(encode_appender_hint(hint), data),
             Err(_) => prop_assert!(
-                data.len() != APPENDER_HINT_LEN || data[0] != APPENDER_HINT_VERSION
+                data.len() != APPENDER_HINT_LEN
+                    || data[0] != APPENDER_HINT_VERSION
+                    || data[17] > 1
+                    || (data[17] == 0 && data[18..].iter().any(|b| *b != 0))
+                    || (data[17] == 1
+                        && (data[38..46] == [0u8; 8]
+                            || u64::from_le_bytes(data[30..38].try_into().unwrap())
+                                .checked_add(u64::from_le_bytes(
+                                    data[38..46].try_into().unwrap()
+                                ))
+                                .is_none()))
             ),
         }
     }
 
-    /// The appender hint (PR 13g, F-R5): every word pair round-trips, the
-    /// key is the identity's stable part, a future version refuses.
+    /// The appender hint (PR 13g, F-R5 + review round 1's pending
+    /// segment): every word round-trips, the key is the identity's stable
+    /// part, a future version refuses.
     #[test]
     fn appender_hint_round_trips_over_the_encoders_domain(
         ring_bytes in any::<u64>(),
         grant_extents in any::<u64>(),
+        pending in proptest::option::of((any::<u32>(), any::<u64>(), 0u64..u64::MAX / 2, 1u64..u64::MAX / 2)),
         node_token in any::<u64>(),
         mount_slot in any::<u32>(),
     ) {
-        let hint = AppenderHint { ring_bytes, grant_extents };
+        let hint = AppenderHint {
+            ring_bytes,
+            grant_extents,
+            pending: pending.map(|(appender_id, term, start, len)| PendingSegment {
+                appender_id,
+                term,
+                start,
+                len,
+            }),
+        };
         let bytes = encode_appender_hint(hint);
         prop_assert_eq!(bytes.len(), APPENDER_HINT_LEN);
         prop_assert_eq!(decode_appender_hint(&bytes).expect("decodes"), hint);

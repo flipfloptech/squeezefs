@@ -2523,6 +2523,12 @@ pub struct AppenderSet {
     /// committer is drained by the next cadence tick, never by the
     /// ceiling. 0 on an unpartitioned mount by construction.
     pub pressure_cycles: std::sync::atomic::AtomicU64,
+    /// Ring segments a `GrowRing` carved that no page ever named — returned
+    /// by the identity's death, leave or clear, or superseded by a stale
+    /// pending word at its next ask (`appender_pending_segments_returned`;
+    /// PR 13g review round 1, Issue 1 — the detected form of the class
+    /// that was a leak no census saw). ≈ 0 on a healthy fleet.
+    pub pending_segments_returned: std::sync::atomic::AtomicU64,
     /// `pressure_cycles` as the grant cadence last read it — a cadence
     /// that finds it moved ran on a PRESSURE-DRIVEN cycle (the ring is
     /// the bottleneck, not the heap) and returns nothing (PR 13g, F-R5).
@@ -2912,6 +2918,7 @@ impl AppenderSet {
             flush_ceiling_ms: self.flush_ceiling_ms,
             flush_ceiling_service_cap_ms: self.flush_ceiling_service_cap_ms,
             pressure_cycles: self.pressure_cycles.load(Relaxed),
+            pending_segments_returned: self.pending_segments_returned.load(Relaxed),
             manager_lease: self
                 .manager_lease
                 .lock()
@@ -3039,6 +3046,8 @@ pub struct AppenderStats {
     pub flush_ceiling_service_cap_ms: u64,
     /// Cycles a declared region's ring pressure made due.
     pub pressure_cycles: u64,
+    /// `GrowRing` segments returned unnamed (PR 13g review round 1, Issue 1).
+    pub pending_segments_returned: u64,
     /// The Manager family (§11, PR 3).
     pub manager_lease: ManagerLease,
     pub meta_pr_wero: bool,

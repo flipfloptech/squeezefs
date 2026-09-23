@@ -344,8 +344,34 @@ pub const APPENDER_HINT_KEY_PREFIX: &[u8] = b"appender_hint:";
 pub const APPENDER_HINT_KEY_LEN: usize = APPENDER_HINT_KEY_PREFIX.len() + 8 + 4;
 /// Record value version (byte 0).
 pub const APPENDER_HINT_VERSION: u8 = 1;
-/// `version ‖ ring_bytes: u64 LE ‖ grant_extents: u64 LE`.
-pub const APPENDER_HINT_LEN: usize = 1 + 8 + 8;
+/// `version ‖ ring_bytes: u64 LE ‖ grant_extents: u64 LE ‖ pending: u8 ‖
+/// appender_id: u32 LE ‖ term: u64 LE ‖ start: u64 LE ‖ len: u64 LE` — the
+/// pending words read 0 when `pending` is 0.
+pub const APPENDER_HINT_LEN: usize = 1 + 8 + 8 + 1 + 4 + 8 + 8 + 8;
+
+/// **A ring segment `GrowRing` carved that no page names yet** (PR 13g
+/// review round 1, Issue 1 — §5.3.5's idempotency for the verb): written
+/// INTO the identity's hint in the SAME control entry as the carve's
+/// allocator deltas, so the carve has a durable owner-naming witness from
+/// its first instant. Bound to the incarnation that asked (`appender_id`,
+/// the page's `term`): a `GrowRing` from that incarnation whose page does
+/// not name the segment is answered it VERBATIM (a lost `RingGrown` reply
+/// re-asked through the retry door carves nothing more); a page that names
+/// it clears the word at the manager's next verb for the identity; an
+/// incarnation that dies, leaves or is cleared before its page named it
+/// has the segment RETURNED by that path (the death ledger's recovery, the
+/// leave, `appender clear`'s recovery) — a detected, bounded, self-healing
+/// class, never a leak no census sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingSegment {
+    /// The directory id of the incarnation that asked.
+    pub appender_id: u32,
+    /// Its page's term at the ask.
+    pub term: u64,
+    /// The segment's device offset (bytes) and length (bytes).
+    pub start: u64,
+    pub len: u64,
+}
 
 /// The words an appender hint carries (0 = no hint for that word).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -354,6 +380,8 @@ pub struct AppenderHint {
     pub ring_bytes: u64,
     /// The largest derived grant the identity asked, extents.
     pub grant_extents: u64,
+    /// A carved ring segment no page names yet (`GrowRing`'s witness).
+    pub pending: Option<PendingSegment>,
 }
 
 /// The tree-0 key of identity `(node_token, mount_slot)`'s appender hint.
@@ -365,17 +393,31 @@ pub fn appender_hint_key(node_token: u64, mount_slot: u32) -> Vec<u8> {
     k
 }
 
-/// Encode an appender-hint value.
+/// Encode an appender-hint value (canonical: an absent pending segment
+/// writes its words as zero).
 pub fn encode_appender_hint(hint: AppenderHint) -> Vec<u8> {
     let mut v = Vec::with_capacity(APPENDER_HINT_LEN);
     v.push(APPENDER_HINT_VERSION);
     v.extend_from_slice(&hint.ring_bytes.to_le_bytes());
     v.extend_from_slice(&hint.grant_extents.to_le_bytes());
+    let p = hint.pending.unwrap_or(PendingSegment {
+        appender_id: 0,
+        term: 0,
+        start: 0,
+        len: 0,
+    });
+    v.push(u8::from(hint.pending.is_some()));
+    v.extend_from_slice(&p.appender_id.to_le_bytes());
+    v.extend_from_slice(&p.term.to_le_bytes());
+    v.extend_from_slice(&p.start.to_le_bytes());
+    v.extend_from_slice(&p.len.to_le_bytes());
     v
 }
 
 /// Decode an appender-hint value; total over every byte string (a wrong
-/// length or version refuses).
+/// length or version refuses; the pending flag is a strict 0 / 1 and an
+/// absent segment's words must read zero, an empty or unaligned pending
+/// segment refuses — the image is canonical).
 pub fn decode_appender_hint(value: &[u8]) -> Result<AppenderHint, KvError> {
     if value.len() != APPENDER_HINT_LEN {
         return Err(KvError::Corrupt(format!(
@@ -389,13 +431,47 @@ pub fn decode_appender_hint(value: &[u8]) -> Result<AppenderHint, KvError> {
             value[0]
         )));
     }
-    let mut a = [0u8; 8];
-    a.copy_from_slice(&value[1..9]);
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&value[9..17]);
+    let ring_bytes = le64(value, 1);
+    let grant_extents = le64(value, 9);
+    let flag = value[17];
+    let appender_id = le32(value, 18);
+    let term = le64(value, 22);
+    let start = le64(value, 30);
+    let len = le64(value, 38);
+    let pending = match flag {
+        0 => {
+            if appender_id != 0 || term != 0 || start != 0 || len != 0 {
+                return Err(KvError::Corrupt(
+                    "appender_hint record names pending-segment words under a clear flag"
+                        .to_string(),
+                ));
+            }
+            None
+        }
+        1 => {
+            if len == 0 || start.checked_add(len).is_none() {
+                return Err(KvError::Corrupt(format!(
+                    "appender_hint record's pending segment ({start:#x}, {len}) is empty or \
+                     overflows"
+                )));
+            }
+            Some(PendingSegment {
+                appender_id,
+                term,
+                start,
+                len,
+            })
+        }
+        other => {
+            return Err(KvError::Corrupt(format!(
+                "appender_hint record's pending flag is {other}, expected 0 or 1"
+            )))
+        }
+    };
     Ok(AppenderHint {
-        ring_bytes: u64::from_le_bytes(a),
-        grant_extents: u64::from_le_bytes(b),
+        ring_bytes,
+        grant_extents,
+        pending,
     })
 }
 

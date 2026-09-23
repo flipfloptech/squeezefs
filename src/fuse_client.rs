@@ -13980,6 +13980,10 @@ impl SqueezefsFilesystem {
                     "appender_pressure_cycles".into(),
                     appender(&|s| s.pressure_cycles),
                 );
+                metrics.insert(
+                    "appender_pending_segments_returned".into(),
+                    appender(&|s| s.pending_segments_returned),
+                );
                 // THE MANAGER FAMILY (design-symmetric-metadata §11 — PR 3,
                 // dark): per volume; `vacant` / 0 on every bit-17-absent
                 // mount. `manager_lease` is the posture word — `held` (this

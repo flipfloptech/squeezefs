@@ -11525,6 +11525,138 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
 }
 
 // ---------------------------------------------------------------------------
+// PR 13g review round 1, Issue 1 — `GrowRing` is idempotent against a
+// DURABLE witness, its carve owner-named from its first instant.
+// ---------------------------------------------------------------------------
+
+/// **`GrowRing` re-asked after a lost reply carves ONCE; a segment no page
+/// ever names is RETURNED by the death path; a colleague's id is peer-
+/// bound** (PR 13g review round 1, Issue 1 — §5.3.5's law for the verb).
+/// The first build's carve was an alloc delta in ring 0 named by nobody
+/// durable until the JOINER's page wrote the grown table: a reply lost
+/// after the manager's carve (a manager crash, a dropped session) had
+/// the joiner's retry door re-ask and a SECOND segment carved, the first
+/// leaked for the volume's life; a joiner dying between the reply and
+/// its page write leaked the segment; and fsck C13 — the census the
+/// design named as the detector — walks grant-CLAIMED extents, so no
+/// census this binary has could see either. Now the carve's control entry
+/// writes the segment into the identity's `appender_hint` as a
+/// `PendingSegment` bound to `(appender_id, term)`: the same
+/// incarnation's re-ask whose page does not name it is answered VERBATIM
+/// (`manager_verb_replays`), and the leave, the death ledger's recovery
+/// (`appender clear`'s path too) and a rejoin RETURN a segment no page
+/// named (`appender_pending_segments_returned`). The pin drives the
+/// manager's verb directly (the joiner's retry door re-issues the same
+/// frame): ask, ask again — one carve, the same segment, the free heap
+/// moved once, the hint naming it; a frame from a session whose peer is
+/// ANOTHER member id is `Rejected`; the joiner dies with the segment
+/// unnamed and the recovery returns it — the hint cleared, the heap back.
+/// RED before the fix: the second ask carves a second segment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grow_ring_re_asked_after_a_lost_reply_carves_once_and_the_death_path_returns_an_unnamed_segment(
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let joiner = join(&uris, &venue, &mvol, 3).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let id = jvol.appender_stats().unwrap().appender_id;
+    let identity = jvol.joined_wire().unwrap().identity;
+    let files = create_files(&joiner, shared, "x", 8).await;
+    let node_size = NODE_SIZE as u64;
+    let want = 4 * node_size;
+    let free0 = mvol.free_extents();
+    let m0 = mvol.appender_stats().unwrap();
+    // The ask, from the joiner's own session (an ad-hoc peer keeps the
+    // page's witness laws).
+    let first = mvol
+        .manager_grow_ring_wire(id, want, &peer_of(&identity))
+        .await
+        .expect("the first GrowRing")
+        .expect("a segment");
+    assert_eq!(first.len, want, "the whole ask on a fresh heap");
+    let free1 = mvol.free_extents();
+    assert_eq!(free0 - free1, want / node_size, "one carve");
+    let hint = mvol
+        .appender_hint_for(identity.node_token, identity.mount_slot)
+        .await
+        .unwrap();
+    assert_eq!(
+        hint.pending.map(|p| (p.appender_id, p.start, p.len)),
+        Some((id, first.start, first.len)),
+        "the carve's own control entry names the segment for the identity ({hint:?})"
+    );
+    // The retry door's re-ask after a lost `RingGrown` reply: the joiner's
+    // page does not name the segment yet.
+    let second = mvol
+        .manager_grow_ring_wire(id, want, &peer_of(&identity))
+        .await
+        .expect("the re-asked GrowRing")
+        .expect("a segment");
+    assert_eq!(second, first, "the pending segment is answered VERBATIM");
+    assert_eq!(mvol.free_extents(), free1, "nothing more carved");
+    let m1 = mvol.appender_stats().unwrap();
+    assert_eq!(
+        m1.manager_verb_replays - m0.manager_verb_replays,
+        1,
+        "the re-ask is a replay"
+    );
+    // A frame from a session whose authenticated peer is ANOTHER member id
+    // names a colleague's page: rejected, nothing carved.
+    let other = squeezefs::cowriter::node_member_id_of(identity.node_token ^ 0x5a5a, 7);
+    let refused = mvol.manager_grow_ring_wire(id, want, &other).await;
+    assert!(
+        matches!(
+            refused,
+            Err(squeezefs::meta_backend::kv::KvError::Rejected(_))
+        ),
+        "a colleague's GrowRing is Rejected: {refused:?}"
+    );
+    assert_eq!(mvol.free_extents(), free1);
+    assert_eq!(
+        mvol.appender_stats().unwrap().manager_verb_rejected - m1.manager_verb_rejected,
+        1
+    );
+    // The joiner dies before its page names the segment; the death path
+    // returns it.
+    drop(jvol);
+    drop(joiner);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    assert!(!mvol.record_death_with_key(identity, 9, 0).await.unwrap());
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    let m2 = mvol.appender_stats().unwrap();
+    assert_eq!(
+        m2.pending_segments_returned, 1,
+        "the unnamed segment is returned by the recovery"
+    );
+    let hint = mvol
+        .appender_hint_for(identity.node_token, identity.mount_slot)
+        .await
+        .unwrap();
+    assert_eq!(hint.pending, None, "the witness is cleared ({hint:?})");
+    assert!(
+        mvol.free_extents() >= free1 + want / node_size,
+        "the segment's extents are back in the heap ({} → {})",
+        free1,
+        mvol.free_extents()
+    );
+    assert_all_resolve(&manager, shared, &files).await;
+    assert_must_stay_zero(&mvol, "manager");
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+// ---------------------------------------------------------------------------
 // PR 13g review round 1, Issue 3 — a carve or a return wider than ONE
 // control entry.
 // ---------------------------------------------------------------------------

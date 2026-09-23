@@ -105,8 +105,16 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(encode_appender_hint(hint), data, "byte-exact");
         }
         Err(_) => assert!(
-            data.len() != APPENDER_HINT_LEN || data[0] != APPENDER_HINT_VERSION,
-            "only a wrong length or version refuses"
+            data.len() != APPENDER_HINT_LEN
+                || data[0] != APPENDER_HINT_VERSION
+                || data[17] > 1
+                || (data[17] == 0 && data[18..].iter().any(|b| *b != 0))
+                || (data[17] == 1
+                    && (data[38..46] == [0u8; 8]
+                        || u64::from_le_bytes(data[30..38].try_into().unwrap())
+                            .checked_add(u64::from_le_bytes(data[38..46].try_into().unwrap()))
+                            .is_none())),
+            "only a wrong length or version, or a non-canonical pending segment, refuses"
         ),
     }
     if data.len() >= 4 {

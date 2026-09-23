@@ -10397,7 +10397,7 @@ impl KvMetaBackend {
     /// The durable `appender_hint` of identity `(node_token, mount_slot)`
     /// — the ring size and the derived grant its predecessor incarnation
     /// reached under load (PR 13g); zeros when none.
-    async fn appender_hint_for(
+    pub async fn appender_hint_for(
         &self,
         node_token: u64,
         mount_slot: u32,
@@ -10472,6 +10472,7 @@ impl KvMetaBackend {
         &self,
         appender_id: u32,
         want_bytes: u64,
+        _peer: &str,
     ) -> std::result::Result<Option<super::superblock::ExtentRef>, KvError> {
         use super::appender::{read_directory, AppenderState};
         let set = self.manager_gate(false)?;
@@ -19520,6 +19521,7 @@ impl KvMetaBackend {
             flush_ceiling_excused_ns: AtomicU64::new(0),
             flush_ceiling_excused_max_ms: AtomicU64::new(0),
             pressure_cycles: AtomicU64::new(0),
+            pending_segments_returned: AtomicU64::new(0),
             cadence_pressure_seen: AtomicU64::new(0),
             joined: AtomicBool::new(false),
             join_refusal,

@@ -10481,6 +10481,31 @@ impl KvMetaBackend {
         // The initial grant — its own control entry, outside the join's
         // critical section (the verb mutex is not reentrant).
         let (id, page_addr, ring_segments, node_seq_base) = chosen;
+        // A FRESH join over a `Free` page whose `extent_grant` record is
+        // not empty (review round 2, Issue 14): the residue is a wire
+        // `ExtentGrant` carve whose reply was LOST — the verb's witness is
+        // the joiner's page word, the carve is in the record and in no
+        // word, the predecessor's leave returned what it knew. Recovered
+        // as `record ∖ word` it would be this joiner's phantom CLAIMED
+        // (no tree reaches it, no census runs at a fresh join). Returned
+        // here, before the joiner's own grant: the record is then its
+        // grant alone. A predecessor's live image cannot be in it — the
+        // leave and the death path's release move a released tree's
+        // images out of the record before the page goes Free.
+        let residue = self.extent_grant_record(id).await?;
+        if !residue.is_empty() {
+            let extents: Vec<u64> = residue.extents().collect();
+            let (cleared, _) = self.return_extents_inner(id, &extents, true).await?;
+            set.join_residue_returned
+                .fetch_add(cleared, Ordering::Relaxed);
+            log::warn!(
+                "meta volume {}: appender {id}'s fresh join found {} extent(s) in its grant \
+                 record under a Free page — a carve whose reply was lost; returned before its \
+                 grant (appender_join_residue_returned)",
+                self.path.display(),
+                extents.len()
+            );
+        }
         // The grant writes the joiner's page with it. Its size is the
         // JOIN's known cost class (PR 13g, F-R5): the rotor the joiner is
         // about to mint (`M` slot trees, one image each — every one a

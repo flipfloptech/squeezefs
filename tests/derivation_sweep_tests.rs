@@ -3246,6 +3246,132 @@ fn grow_ring_segment_floor_is_half_the_clamped_ask() {
     }
 }
 
+/// **PR 13g's remaining bounds are tied** (review round 1, Issue 7).
+/// (a) `appender::grant_extents_wire_cap` IS `grant_extents_derived`'s
+/// third term — one definition: a runaway rate derives exactly the cap,
+/// the floor stands under it; (b) the join's initial grant is the pool's
+/// cost class `joined_pool_floor(M)` with `M` the PR-4 mint-slot
+/// derivation (`slot_lease_core::mint_slots_derived`) — a solo-census join
+/// carves `FLOOR + MINT_SPREAD`, the 12.5 k operating point `FLOOR + 2`;
+/// (c) `checkpoint::FIXPOINT_COVER_CYCLES_MAX` is two windows of the §4.7
+/// clause-b audit's bound (`PENDING_FREE_FORCE_CYCLES`) — the tail's and
+/// the bitmap's convergent terms, each the audit's. Drift is red here.
+#[test]
+fn pr13g_grant_cap_join_floor_and_fixpoint_bound_tie_to_their_derivations() {
+    use squeezefs::meta_backend::kv::appender::{
+        grant_extents_derived, grant_extents_wire_cap, joined_pool_floor, GRANT_EXTENTS_FLOOR,
+    };
+    use squeezefs::meta_backend::kv::checkpoint::{
+        FIXPOINT_COVER_CYCLES_MAX, PENDING_FREE_FORCE_CYCLES,
+    };
+    use squeezefs::meta_backend::DERIVED_ROUTING_WIDTH;
+    use squeezefs::slot_lease_core::{mint_slots_derived, MINT_SPREAD};
+    // (a) The wire cap is the derivation's own cap.
+    for (free, appenders) in [
+        (0u64, 1u64),
+        (4_096, 1),
+        (4_096, 4),
+        (1 << 20, 32),
+        (16, 512),
+    ] {
+        let cap = grant_extents_wire_cap(free, appenders);
+        assert_eq!(
+            cap,
+            (free / (4 * appenders)).max(GRANT_EXTENTS_FLOOR),
+            "a quarter of the free heap over the appenders, floored"
+        );
+        assert_eq!(
+            grant_extents_derived(u64::MAX / 4, 1_000, free, appenders),
+            cap,
+            "a runaway rate derives exactly the cap ({free} / {appenders})"
+        );
+        assert_eq!(
+            grant_extents_derived(0, 1_000, free, appenders),
+            GRANT_EXTENTS_FLOOR,
+            "a rate of 0 derives the floor"
+        );
+    }
+    assert_eq!(
+        grant_extents_wire_cap(4_096, 0),
+        grant_extents_wire_cap(4_096, 1),
+        "a census of 0 reads as 1"
+    );
+    // (b) The join's grant is the pool floor over the mint-slot derivation.
+    let w = u64::from(DERIVED_ROUTING_WIDTH);
+    assert_eq!(
+        joined_pool_floor(mint_slots_derived(w, 1)),
+        GRANT_EXTENTS_FLOOR + MINT_SPREAD,
+        "a solo-census join"
+    );
+    assert_eq!(
+        joined_pool_floor(mint_slots_derived(w, 12_500)),
+        GRANT_EXTENTS_FLOOR + 2,
+        "the operating point"
+    );
+    assert_eq!(
+        joined_pool_floor(0),
+        GRANT_EXTENTS_FLOOR,
+        "no plane: the floor"
+    );
+    // (c) The fixpoint bound: two audit windows.
+    assert_eq!(FIXPOINT_COVER_CYCLES_MAX, 2 * PENDING_FREE_FORCE_CYCLES);
+    assert_eq!(
+        FIXPOINT_COVER_CYCLES_MAX, 16,
+        "the shipped literal, derived"
+    );
+}
+
+/// **A rejoining identity's ring size** (PR 13g, F-R5; review round 1,
+/// Issue 7; `appender::resolve_sym_ring_bytes_hinted`): the LARGER of the
+/// fresh derivation (a rate of 0 — the floor) and the identity's durable
+/// hint, clamped to the volume's floor / ceiling and page-aligned; a hint
+/// of 0 is no hint; the knob wins verbatim when set (the registry gate's
+/// law — exercised through `resolve_sym_ring_bytes`, which this test does
+/// not set: the knob is process-global). Drift is red here.
+#[test]
+fn hinted_ring_size_is_the_larger_of_the_derivation_and_the_hint_clamped() {
+    use squeezefs::meta_backend::kv::appender::{
+        appender_ring_bytes_derived, resolve_sym_ring_bytes_hinted, sym_ring_ceiling_bytes,
+        APPENDER_PAGE_LEN, SYM_RING_FLOOR_BYTES,
+    };
+    assert!(
+        std::env::var_os("SQUEEZEFS_SYM_RING_KB").is_none(),
+        "the knob must be unset for this tie"
+    );
+    let vol = 2 * 1024 * GIB;
+    let ceiling = sym_ring_ceiling_bytes(vol);
+    let page = APPENDER_PAGE_LEN as u64;
+    // No hint: the fresh derivation (the floor at a rate of 0).
+    assert_eq!(
+        resolve_sym_ring_bytes_hinted(0, vol),
+        appender_ring_bytes_derived(0, vol)
+    );
+    assert_eq!(resolve_sym_ring_bytes_hinted(0, vol), SYM_RING_FLOOR_BYTES);
+    // A hint under the floor is the floor; one inside is itself, aligned.
+    assert_eq!(resolve_sym_ring_bytes_hinted(1, vol), SYM_RING_FLOOR_BYTES);
+    assert_eq!(
+        resolve_sym_ring_bytes_hinted(3 * SYM_RING_FLOOR_BYTES + 1, vol),
+        3 * SYM_RING_FLOOR_BYTES,
+        "page-aligned down"
+    );
+    assert_eq!(
+        resolve_sym_ring_bytes_hinted(3 * SYM_RING_FLOOR_BYTES + page, vol),
+        3 * SYM_RING_FLOOR_BYTES + page
+    );
+    // A hint past the ceiling is the ceiling.
+    assert_eq!(resolve_sym_ring_bytes_hinted(u64::MAX, vol), ceiling);
+    assert_eq!(resolve_sym_ring_bytes_hinted(ceiling + 1, vol), ceiling);
+    // Every answer sits inside the clamp and on a page boundary.
+    for hint in [0u64, 4_095, 1 << 20, 7 << 20, ceiling, u64::MAX / 2] {
+        let got = resolve_sym_ring_bytes_hinted(hint, vol);
+        assert!(
+            (SYM_RING_FLOOR_BYTES..=ceiling).contains(&got),
+            "{hint} → {got}"
+        );
+        assert_eq!(got % page, 0, "{hint} → {got} unaligned");
+    }
+}
+
 /// The symmetric MANAGER's derivations (design-symmetric-metadata §5.3.3
 /// grant sizing, §5.9 the failover bound, §1.6 "Manager death"; PR 3):
 /// `grant_extents = clamp(2 × ewma_smo_rate × failover_bound_s, 8,

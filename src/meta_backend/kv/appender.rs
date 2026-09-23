@@ -1016,7 +1016,8 @@ pub fn grant_extents_derived(
         .saturating_mul(2)
         .saturating_mul(failover_bound_ms)
         / 1_000_000;
-    let cap = (free_heap / (4 * appenders.max(1))).max(GRANT_EXTENTS_FLOOR);
+    // The third term IS the wire cap (one definition — Issue 7).
+    let cap = grant_extents_wire_cap(free_heap, appenders);
     want.clamp(GRANT_EXTENTS_FLOOR, cap)
 }
 

@@ -10448,7 +10448,7 @@ impl KvMetaBackend {
                 .appender_hint_for(identity.node_token, identity.mount_slot)
                 .await?;
             let rotor = set.slot_leases().map_or(0, |p| p.mint_slots());
-            u32::try_from((super::appender::GRANT_EXTENTS_FLOOR + rotor).max(hint.grant_extents))
+            u32::try_from(super::appender::joined_pool_floor(rotor).max(hint.grant_extents))
                 .unwrap_or(u32::MAX)
         };
         let grant = self.manager_extent_grant(id, want).await?;

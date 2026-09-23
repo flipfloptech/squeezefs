@@ -1321,12 +1321,19 @@ pub const PENDING_FREE_FORCE_CYCLES: u64 = 8;
 pub const COVER_CYCLES_MAX: u32 = 8 * PENDING_FREE_FORCE_CYCLES as u32;
 
 /// The cycles a cover-to-FIXPOINT loop runs before it gives up — the
-/// shutdown's "tail == head" convergence and (PR 13g) a joined appender's
-/// ring growth under its closed gate: a cycle's flush pass journals its
-/// SMOs past the head its tail was computed from and the next cycle
-/// covers them, so with nothing else arriving the term converges within
-/// the SMO cascade height; the bound is defensive.
-pub const FIXPOINT_COVER_CYCLES_MAX: u64 = 16;
+/// shutdown's "tail == head ∧ nothing dirty" convergence and (PR 13g) a
+/// joined appender's ring growth under its closed gate. The fixpoint has
+/// TWO convergent terms, each bounded by the §4.7 clause-b audit's own
+/// law: the TAIL (a cycle's flush pass journals its SMOs past the head
+/// its tail was computed from, the next cycle covers them, the parked
+/// frees it releases are the audit's — a resolvable pinned floor
+/// converges inside [`PENDING_FREE_FORCE_CYCLES`] or the volume fails
+/// loud) and the BITMAP (the frees a covering cycle releases dirty pages
+/// the next cycle writes — one more window of the same bound). Two
+/// windows: a loop still open past them is waiting on what the audit
+/// fail-stops, never on a legal schedule. Tie-tested in
+/// `tests/derivation_sweep_tests.rs`.
+pub const FIXPOINT_COVER_CYCLES_MAX: u64 = 2 * PENDING_FREE_FORCE_CYCLES;
 
 /// Spawn the per-volume checkpoint/writeback task (called by
 /// `KvMetaBackend::open`). The task holds a `Weak` backend reference —

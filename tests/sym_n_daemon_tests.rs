@@ -7113,7 +7113,11 @@ async fn a_joiners_free_target_follows_a_failover_the_grant_window_covered() {
 /// COMPLETE inside a bound (red before: never), re-dial ONCE to the
 /// successor, land the return there (the retired extent free in the
 /// successor's bitmap), and the joiner's ring must keep draining (a
-/// commit lands after it).
+/// commit lands after it). Under PR 13g's pool law a retired image
+/// RECYCLES into a pool below its target and the cadence ships nothing,
+/// so the pool is grown ABOVE its target while the manager lives — the
+/// quiet cadence's SHRINK is then the cycle's wire verb, and the retired
+/// image is surplus with it (PR 13g review round 1, Issue 5).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_joiners_checkpoint_cycle_meeting_a_dead_manager_completes_and_follows_the_successor() {
     let dir = tempfile::tempdir().unwrap();
@@ -7174,6 +7178,19 @@ async fn a_joiners_checkpoint_cycle_meeting_a_dead_manager_completes_and_follows
         "the retired inherited image is PARKED on the joiner's grant: before {before:?} after \
          {after:?}"
     );
+    // The pool above its target (the join's cost class): the cadence's
+    // shrink returns the surplus — and the retired image with it — as the
+    // cycle's `ReturnExtents`.
+    let got = jvol.joined_extent_grant(200).await.unwrap();
+    let pool_floor = squeezefs::meta_backend::kv::appender::joined_pool_floor(
+        jvol.slot_lease_stats().expect("the plane").rotor,
+    );
+    assert!(
+        got >= 16 && region_stats(&jvol).grant_unclaimed > pool_floor + 16,
+        "the pool stands above its target (got {got}, unclaimed {}, floor {pool_floor} — the \
+         heap-share cap bounds the ask on this small volume)",
+        region_stats(&jvol).grant_unclaimed
+    );
     let returns0 = jvol.joined_stats().unwrap().wire_extent_returns;
     assert_eq!(jvol.joined_stats().unwrap().wire_redials, 0);
 
@@ -7202,10 +7219,17 @@ async fn a_joiners_checkpoint_cycle_meeting_a_dead_manager_completes_and_follows
     let cycled = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         // Two cycles: the first's barrier parks the retirement past the
         // tail, the second's cadence returns it (the manager's own shape,
-        // `a_clean_remount_recovers_the_grant_from_tree_zero_…`).
+        // `a_clean_remount_recovers_the_grant_from_tree_zero_…`); the
+        // first cycle's shrink already ships the pool's surplus — the
+        // loop runs until the retired IMAGE itself left this mount's
+        // grant (the pool law: never break on the first return alone).
         for _ in 0..4 {
             jvol.checkpoint_now().await.unwrap();
-            if jvol.joined_stats().unwrap().wire_extent_returns > returns0 {
+            let r = region_stats(&jvol);
+            if jvol.joined_stats().unwrap().wire_extent_returns > returns0
+                && r.grant_pending == 0
+                && r.grant_returnable == 0
+            {
                 break;
             }
         }

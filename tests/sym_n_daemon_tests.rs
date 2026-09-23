@@ -11821,10 +11821,10 @@ async fn a_joiner_killed_with_a_pool_wider_than_its_page_names_rejoins_with_the_
 /// table when the half is under the floor, and releases the rest
 /// (`appender::ring_segments_that_fit`); a heap so fragmented that even
 /// eight runs are under the floor still joins at what fits. The pin:
-/// a joiner's pool of 64 contiguous extents, every other one returned
-/// (32 one-extent holes below every other free run), then a fresh
-/// identity's join asking a 2 MiB ring — 32 lowest-free extents in 32
-/// holes. RED before the fix: `Corrupt`.
+/// every other extent of a joiner's join grant returned (36 one-extent
+/// holes below every other free run), then a fresh identity's join
+/// asking a 2 MiB ring — 32 lowest-free extents in 32 holes. RED before
+/// the fix: `Corrupt`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sized_join_on_a_fragmented_heap_carves_what_fits_the_table_never_refusing() {
     use squeezefs::meta_backend::kv::appender::{
@@ -11844,34 +11844,24 @@ async fn a_sized_join_on_a_fragmented_heap_carves_what_fits_the_table_never_refu
     let joiner = join(&uris, &venue, &mvol, 3).await;
     let jvol = Arc::clone(&joiner.volumes[0]);
     let id = jvol.appender_stats().unwrap().appender_id;
-    // The joiner's pool: 64 contiguous extents past its initial grant.
-    let unclaimed = jvol
-        .appender_stats()
-        .unwrap()
-        .regions
-        .iter()
-        .find(|r| r.id == id)
-        .unwrap()
-        .grant_unclaimed;
-    let got = jvol
-        .joined_extent_grant(u32::try_from(unclaimed + 64).unwrap())
-        .await
-        .unwrap();
-    assert!(got >= 64, "the pool grew by {got}");
-    jvol.checkpoint_now().await.unwrap();
+    // Every other extent of the joiner's join grant returned by the
+    // manager: 36 one-extent holes at the bottom of the free heap (the
+    // pool a quiet cadence keeps — no shrink re-shapes the heap under the
+    // pin; the joiner stays idle).
     let record = mvol.extent_grant_record(id).await.unwrap();
     let extents: Vec<u64> = record.extents().collect();
-    // Every other extent of the pool returned: 32+ one-extent holes at the
-    // bottom of the free heap.
     let holes: Vec<GrantRun> = extents
         .iter()
-        .skip(extents.len() - 64)
         .step_by(2)
         .map(|e| GrantRun { start: *e, len: 1 })
         .collect();
-    assert_eq!(holes.len(), 32);
+    assert!(
+        holes.len() >= 32,
+        "the join grant leaves {} holes",
+        holes.len()
+    );
     let (cleared, _) = mvol.manager_return_runs(id, &holes).await.unwrap();
-    assert_eq!(cleared, 32, "the holes are free");
+    assert_eq!(cleared, holes.len() as u64, "the holes are free");
     // A fresh identity's SIZED join: a 2 MiB ring = 32 extents, carved
     // lowest-free-first into the 32 holes.
     let fresh = joiner_identity(&mvol, 7).await;
@@ -12104,6 +12094,87 @@ async fn a_grow_ring_never_carves_past_the_volumes_ring_budget() {
         .expect("GrowRing");
     assert_eq!(again, Some(seg), "the pending segment, verbatim");
     assert_eq!(mvol.free_extents(), free_before, "nothing more carved");
+    assert_must_stay_zero(&mvol, "manager");
+    shutdown(&joiner).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+// ---------------------------------------------------------------------------
+// PR 13g review round 1, Issue 9 — a short carve spends no table slot.
+// ---------------------------------------------------------------------------
+
+/// **`GrowRing` answers `None` for a run under half the ask, keeping the
+/// page's table for a doubling-class segment** (PR 13g review round 1,
+/// Issue 9). The verb keeps the LONGEST adjacent run of its claims; on a
+/// fragmented heap that is one extent, the joiner's table
+/// (`RING_SEGMENTS_MAX` = 8) is spent on eight such answers and the ring
+/// is pinned at floor + 2 MiB with `joined_ring_grow_declined` for its
+/// life. Now a run below half the ask (PR 2's doubling step — a segment
+/// of the ring's own size) is released and the ask answered `None`: the
+/// ring stays, the table stays, the joiner asks again at its next cycle
+/// (a heap that de-fragments answers it then; one that does not leaves
+/// the ring at its size under pressure cycles — the stated outcome). The
+/// pin: 36 one-extent holes at the bottom of the free heap (every other
+/// extent of the joiner's join grant, returned), a 2 MiB ask — `None`,
+/// nothing claimed, the page's table untouched. RED before the fix: one
+/// 64 KiB segment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grow_ring_on_a_fragmented_heap_spends_no_table_slot_on_a_short_run() {
+    use squeezefs::meta_backend::kv::appender::GrantRun;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config_len(dir.path(), 1, 512 * 1024 * 1024).await;
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let joiner = join(&uris, &venue, &mvol, 3).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let id = jvol.appender_stats().unwrap().appender_id;
+    let identity = jvol.joined_wire().unwrap().identity;
+    // The holes: every other extent of the joiner's join grant returned
+    // by the manager (the lowest free extents of the heap, one apart —
+    // the pool the joiner's quiet cadence keeps, so no shrink re-shapes
+    // the heap under the pin; the joiner stays idle).
+    let extents: Vec<u64> = mvol
+        .extent_grant_record(id)
+        .await
+        .unwrap()
+        .extents()
+        .collect();
+    let holes: Vec<GrantRun> = extents
+        .iter()
+        .step_by(2)
+        .map(|e| GrantRun { start: *e, len: 1 })
+        .collect();
+    assert!(
+        holes.len() >= 32,
+        "the join grant leaves {} holes",
+        holes.len()
+    );
+    let (cleared, _) = mvol.manager_return_runs(id, &holes).await.unwrap();
+    assert_eq!(cleared, holes.len() as u64);
+    let segments_before = page_of(&uris[0], &mvol, id).await.unwrap().segments.len();
+    let free_before = mvol.free_extents();
+    let out = mvol
+        .manager_grow_ring_wire(id, 2 * 1024 * 1024, &peer_of(&identity))
+        .await
+        .expect("GrowRing");
+    assert_eq!(out, None, "a run under half the ask spends no table slot");
+    assert_eq!(mvol.free_extents(), free_before, "nothing claimed");
+    assert_eq!(
+        page_of(&uris[0], &mvol, id).await.unwrap().segments.len(),
+        segments_before,
+        "the table is untouched"
+    );
     assert_must_stay_zero(&mvol, "manager");
     shutdown(&joiner).await;
     venue.tear_down();

@@ -265,13 +265,13 @@ fn a_grant_run_overlapping_held_extents_adds_only_the_extents_the_grant_does_not
         "four originals + the two genuinely new extents 104, 105"
     );
     assert_eq!(g.granted, g.held() + g.returned + g.unclaimed());
-    // A claim after the overlap answers the lowest UNCLAIMED extent —
-    // never the live image at 100.
+    // A claim after the overlap answers the lowest UNCLAIMED extent of
+    // the smallest run — never the live image at 100.
     assert_eq!(g.claim(), Some(102));
 }
 
 #[test]
-fn the_ram_grant_claims_lowest_first_parks_frees_on_its_tail_and_returns_past_it() {
+fn the_ram_grant_claims_the_smallest_run_first_parks_frees_on_its_tail_and_recycles_past_it() {
     let mut g = RegionGrant::default();
     g.add_runs(&[GrantRun { start: 100, len: 4 }]);
     assert_eq!((g.unclaimed(), g.claimed(), g.granted), (4, 0, 4));
@@ -286,20 +286,52 @@ fn the_ram_grant_claims_lowest_first_parks_frees_on_its_tail_and_returns_past_it
     assert_eq!((g.claimed(), g.pending()), (1, 1));
     assert_eq!(g.advance_durable(499), 0);
     assert_eq!(g.advance_durable(500), 1);
-    assert_eq!(g.take_returnable(), vec![100]);
+    // The cadence's recycle (PR 13g): a released image re-enters the pool
+    // while it is below the derived size — the `returned` its drain
+    // counted taken back — and ships as the surplus above it.
+    let released = g.take_returnable();
+    assert_eq!(released, vec![100]);
     assert_eq!(g.returned, 1);
-    // The page names the WHOLE unclaimed remainder as runs; the page
-    // writer fits it to GRANT_RUNS_MAX by moving the excess to the
-    // returnable batch (Issue 9), never by truncating.
+    assert_eq!(
+        g.recycle(released, 3),
+        Vec::<u64>::new(),
+        "below `keep`: recycled"
+    );
+    assert_eq!(g.returned, 0, "a recycled extent never left the grant");
+    assert_eq!(
+        g.unclaimed_runs(),
+        vec![
+            GrantRun { start: 100, len: 1 },
+            GrantRun { start: 102, len: 2 }
+        ]
+    );
+    // The smallest-run claim consumes the recycled single first.
+    assert_eq!(g.claim(), Some(100));
+    g.free_pending(100, 600);
+    g.advance_durable(600);
+    let released = g.take_returnable();
+    assert_eq!(
+        g.recycle(released, 2),
+        vec![100],
+        "at `keep`: the surplus ships"
+    );
+    assert_eq!(g.returned, 1);
+    // The page names the largest GRANT_RUNS_MAX runs of the remainder;
+    // the rest stay UNCLAIMED in RAM (PR 13g — PR 3's trim moved them to
+    // the returnable batch on every cadence).
     assert_eq!(g.unclaimed_runs(), vec![GrantRun { start: 102, len: 2 }]);
     g.add_runs(&[GrantRun { start: 200, len: 1 }]);
     g.add_runs(&[GrantRun { start: 300, len: 1 }]);
     g.add_runs(&[GrantRun { start: 400, len: 1 }]);
     g.add_runs(&[GrantRun { start: 500, len: 1 }]);
     assert_eq!(g.unclaimed_runs().len(), GRANT_RUNS_MAX + 1);
-    assert_eq!(g.trim_to_page_runs(), 1);
-    assert_eq!(g.unclaimed_runs().len(), GRANT_RUNS_MAX);
-    assert_eq!(g.returnable(), 1);
+    assert_eq!(g.page_runs().len(), GRANT_RUNS_MAX);
+    assert_eq!(
+        g.unclaimed_runs().len(),
+        GRANT_RUNS_MAX + 1,
+        "nothing moved"
+    );
+    assert_eq!(g.returnable(), 0);
     // Closure over every op so far: granted ≡ held + returned + unclaimed.
     assert_eq!(g.granted, g.held() + g.returned + g.unclaimed());
     // Recovery: the record's whole grant against the page's remainder.
@@ -1881,13 +1913,19 @@ async fn a_full_heap_on_a_leased_slot_is_the_space_class_not_a_manager_stall() {
     }
 }
 
-/// Issue 9: the page names the WHOLE unclaimed remainder. A RAM remainder
-/// in more runs than the page carries (`GRANT_RUNS_MAX`) trims its
-/// smallest runs into the returnable batch before the page is written,
-/// so a crash-class open never recovers legitimately unclaimed extents as
-/// claimed (a two-cycle C13 round trip).
+/// Issue 9 as built at PR 13g (F-R5): the page names the remainder's
+/// LARGEST `GRANT_RUNS_MAX` runs and the rest stay UNCLAIMED in RAM. PR 3
+/// trimmed the excess into the returnable batch so the page named every
+/// unclaimed extent (a crash-class open never recovering a legitimately
+/// unclaimed extent as claimed — a two-cycle C13 round trip on a CRASH);
+/// under a storm the recycled images are singles wherever their
+/// predecessors stood, and the trim made that round trip on EVERY live
+/// cadence. The unnamed extents are the pool the next flush pass's
+/// smallest-run claims consume first; a crash recovers them as claimed
+/// for the orphan census to return.
 #[test]
-fn the_page_remainder_is_never_truncated_the_excess_returns() {
+fn the_page_names_the_largest_runs_and_the_rest_stay_in_the_ram_pool() {
+    use squeezefs::meta_backend::kv::appender::page_runs_of;
     let mut g = RegionGrant::default();
     // Six single-extent runs (every other extent).
     g.add_runs(
@@ -1899,29 +1937,57 @@ fn the_page_remainder_is_never_truncated_the_excess_returns() {
             .collect::<Vec<_>>(),
     );
     assert_eq!(g.unclaimed(), 6);
-    let trimmed = g.trim_to_page_runs();
-    assert_eq!(trimmed, 6 - GRANT_RUNS_MAX as u64);
-    assert_eq!(g.unclaimed_runs().len(), GRANT_RUNS_MAX);
+    let named = g.page_runs();
+    assert_eq!(named.len(), GRANT_RUNS_MAX);
     assert_eq!(
-        g.unclaimed(),
-        GRANT_RUNS_MAX as u64,
-        "the page's runs ARE the remainder"
+        named,
+        (0..GRANT_RUNS_MAX as u64)
+            .map(|i| GrantRun {
+                start: 100 + 2 * i,
+                len: 1,
+            })
+            .collect::<Vec<_>>(),
+        "ties keep the lowest runs, ascending"
     );
-    assert_eq!(g.returnable(), trimmed, "the excess is returnable");
+    assert_eq!(g.unclaimed(), 6, "the pool is whole");
+    assert_eq!(g.returnable(), 0, "nothing moved to the return batch");
     assert_eq!(g.held() + g.unclaimed(), 6, "closure: nothing lost");
-    // The trim keeps the LARGEST runs.
-    let mut g = RegionGrant::default();
-    g.add_runs(&[
+    // The page keeps the LARGEST runs.
+    let runs = [
         GrantRun { start: 0, len: 4 },
         GrantRun { start: 10, len: 1 },
         GrantRun { start: 20, len: 3 },
         GrantRun { start: 30, len: 1 },
         GrantRun { start: 40, len: 2 },
-    ]);
-    assert_eq!(g.trim_to_page_runs(), 1);
-    assert_eq!(g.returnable(), 1, "one single-extent run trimmed");
-    assert_eq!(g.unclaimed(), 10);
-    assert_eq!(g.unclaimed_runs().len(), GRANT_RUNS_MAX);
+    ];
+    assert_eq!(
+        page_runs_of(&runs),
+        vec![
+            GrantRun { start: 0, len: 4 },
+            GrantRun { start: 10, len: 1 },
+            GrantRun { start: 20, len: 3 },
+            GrantRun { start: 40, len: 2 },
+        ]
+    );
+    assert_eq!(
+        page_runs_of(&runs[..3]),
+        runs[..3].to_vec(),
+        "a fitting remainder verbatim"
+    );
+    // The smallest-run claim consumes the fragments first, the whole runs
+    // stay whole.
+    let mut g = RegionGrant::default();
+    g.add_runs(&runs);
+    assert_eq!(g.claim(), Some(10));
+    assert_eq!(g.claim(), Some(30));
+    assert_eq!(g.claim(), Some(40));
+    assert_eq!(g.claim(), Some(41));
+    assert_eq!(
+        g.claim(),
+        Some(20),
+        "then the smallest whole run, lowest first"
+    );
+    assert_eq!(g.unclaimed_runs().len(), 2);
 }
 
 /// Issue 10: a leased slot's leaf promises its SMO's extents against the

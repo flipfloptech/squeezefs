@@ -9254,7 +9254,29 @@ impl KvMetaBackend {
         // (PR 4 review round 3 — a quiet appender's derived cap is the
         // floor, 8, and a fat overlay splits wider). Bounded by the free
         // heap below, as every carve is.
+        // A WIRE appender's explicit ask (PR 13g, F-R5): the manager
+        // measures no SMO rate for a region it does not flush, so `cap`
+        // reads the floor for it whatever the joiner's storm — the joiner
+        // derives its size off ITS measured rate and asks it, and the
+        // clamp is the derivation's heap-share term
+        // (`grant_extents_wire_cap`), the bound durable state puts on any
+        // appender's grant. `want == 0` keeps the manager's own derivation
+        // (a fresh join's floor).
         let want = match class {
+            super::alloc_ext_core::AllocClass::User
+                if want != 0 && set.region(appender_id).is_none() =>
+            {
+                super::appender::clamp_grant_want(
+                    want,
+                    super::appender::grant_extents_wire_cap(
+                        self.alloc.free_extents(),
+                        set.appenders_known
+                            .load(Ordering::Relaxed)
+                            .max(set.regions.len() as u64)
+                            .max(1),
+                    ),
+                )
+            }
             super::alloc_ext_core::AllocClass::User => super::appender::clamp_grant_want(want, cap),
             super::alloc_ext_core::AllocClass::Internal => u64::from(want.max(1)),
         };
@@ -9294,10 +9316,16 @@ impl KvMetaBackend {
             set.verbs.replays.fetch_add(1, Ordering::Relaxed);
             return Ok(remainder);
         }
-        // Bounded by the FREE heap, never by the wire.
+        // The carve TOPS the remainder UP to `want` (PR 13g): `want` is
+        // the size the caller's pool should hold — the derived grant, or
+        // an SMO's need — never an increment on top of what it already
+        // holds (a refill at 50 % consumption then lands the pool at the
+        // derived size, not at one and a half of it). Bounded by the FREE
+        // heap, never by the wire.
+        let carve = want.saturating_sub(remainder_extents).max(1);
         let mut claimed: Vec<u64> =
-            Vec::with_capacity(want.min(self.alloc.free_extents()) as usize);
-        for _ in 0..want {
+            Vec::with_capacity(carve.min(self.alloc.free_extents()) as usize);
+        for _ in 0..carve {
             let claim = match class {
                 super::alloc_ext_core::AllocClass::User => self.alloc.claim_user(),
                 super::alloc_ext_core::AllocClass::Internal => self.alloc.claim_internal(),
@@ -9421,21 +9449,22 @@ impl KvMetaBackend {
             // The page names the grant (§5.3.3) — one write; the next
             // checkpoint's barrier covers it, and a page lost before that
             // only over-states the claimed set (fsck C13's class). The
-            // page names the WHOLE remainder (Issue 9): an excess run
-            // moves to the returnable batch before the write.
+            // page names the remainder's largest runs
+            // (`RegionGrant::page_runs` — PR 13g: the rest stay in the
+            // RAM pool, unnamed).
             {
                 let mut g = r.grant();
                 g.add_runs(&runs);
-                g.trim_to_page_runs();
                 let mut page = r.page.lock().unwrap_or_else(|e| e.into_inner());
-                page.grant = g.unclaimed_runs();
+                page.grant = g.page_runs();
             }
             self.write_region_page(r).await?;
         } else {
             // A wire joiner's page: its remainder ∪ the carve, the union
             // the loop above fitted to the page.
-            let page_grant =
-                super::slot_state::ExtentGrantRecord::from_extents(union.iter().copied()).runs;
+            let page_grant = super::appender::page_runs_of(
+                &super::slot_state::ExtentGrantRecord::from_extents(union.iter().copied()).runs,
+            );
             self.write_wire_joiner_page_grant(appender_id, &page_grant)
                 .await?;
         }
@@ -10270,12 +10299,27 @@ impl KvMetaBackend {
         self.appenders.as_ref()
     }
 
-    /// **The grant cadence of one checkpoint cycle** (§5.3.3): fold every
-    /// region's SMO rate, ship the extents its tail released as
-    /// `ReturnExtents`, and refill a region at 50 % consumption — the
+    /// Whether the grant cadence about to run rides a PRESSURE-DRIVEN
+    /// cycle (PR 13g, F-R5): `pressure_cycles` moved since the cadence
+    /// last read it. The ring, not the heap, is then the bottleneck — a
+    /// cycle every ring-fill returns nothing and the released images stay
+    /// in the pool whatever its size (the surplus ships at the next
+    /// cadence the age law runs).
+    fn cadence_under_pressure(&self, set: &super::appender::AppenderSet) -> bool {
+        let now = set.pressure_cycles.load(Ordering::Relaxed);
+        let seen = set.cadence_pressure_seen.swap(now, Ordering::AcqRel);
+        now != seen
+    }
+
+    /// **The grant cadence of one checkpoint cycle** (§5.3.3 as built at
+    /// PR 13g): fold every region's SMO rate, RECYCLE the images its tail
+    /// released into its own pool up to the derived grant size
+    /// (`RegionGrant::recycle_released` — every image, on a pressure-driven
+    /// cycle), ship what remains as `ReturnExtents` (the surplus), and
+    /// refill a region at 50 % consumption below the derived size — the
     /// `alloc_lane` ahead-refill law. In PR 3 the manager is this
     /// process (the region's grant calls are local); the wire form rides
-    /// the same executors.
+    /// the same executors (`joined_grant_cadence`).
     pub(super) async fn grant_cadence(&self, cycle_ms: u64) -> std::result::Result<(), KvError> {
         let Some(set) = self.appenders.as_ref().filter(|a| a.is_partitioned()) else {
             return Ok(());
@@ -10283,10 +10327,17 @@ impl KvMetaBackend {
         if !set.joined.load(Ordering::Acquire) || self.read_only || self.non_writer {
             return Ok(());
         }
+        let pressure = self.cadence_under_pressure(set);
         for r in set.regions.iter().skip(1) {
             r.fold_smo_rate(cycle_ms);
-            let mut returnable = r.grant().take_returnable();
-            self.keep_live_images_claimed(r, &mut returnable);
+            let derived = self.grant_extents_for(set, r.id);
+            // The live-image belt runs BEFORE the recycle: an extent a
+            // live node of this mount stands at re-enters no pool.
+            let mut released = r.grant().take_returnable();
+            self.keep_live_images_claimed(r, &mut released);
+            let returnable = r
+                .grant()
+                .recycle(released, if pressure { u64::MAX } else { derived });
             if !returnable.is_empty() {
                 if let Err(e) = self.manager_return_extents(r.id, &returnable).await {
                     r.grant().restore_returnable(returnable);
@@ -10303,7 +10354,7 @@ impl KvMetaBackend {
             // idempotency — asking would only count a replay).
             let due = {
                 let g = r.grant();
-                g.refill_due() && g.unclaimed() < self.grant_extents_for(set, r.id)
+                g.refill_due() && g.unclaimed() < derived
             };
             if due && !super::appender::test_manager_unreachable() {
                 if let Err(e) = self.manager_extent_grant(r.id, 0).await {
@@ -10676,22 +10727,27 @@ impl KvMetaBackend {
                 } else {
                     // The grant's UNCLAIMED remainder (§5.3.3): recovery
                     // reads it against tree 0's record for the claimed
-                    // set, so the page names the WHOLE of it — a remainder
-                    // in more runs than the page carries moves its excess
-                    // to the returnable batch first (Issue 9), never a
-                    // truncation that recovery would read as claimed.
-                    let mut g = r.grant();
-                    let moved = g.trim_to_page_runs();
-                    if moved > 0 {
+                    // set. The page names its largest runs
+                    // (`RegionGrant::page_runs`, PR 13g); a remainder in
+                    // more runs than the page carries keeps the rest in
+                    // the RAM pool — recycled images the next flush pass
+                    // consumes first — which a crash-class open recovers
+                    // as claimed for the orphan census to return, where
+                    // PR 3's trim moved them to the returnable batch on
+                    // every live cadence (F-R5's churn).
+                    let g = r.grant();
+                    let runs = g.unclaimed_runs();
+                    if runs.len() > super::appender::GRANT_RUNS_MAX {
                         log::debug!(
-                            "meta volume {}: appender {}'s unclaimed remainder exceeded the \
-                             page's {} runs — {moved} extent(s) moved to the returnable batch",
+                            "meta volume {}: appender {}'s unclaimed remainder spans {} runs — the \
+                             page names its largest {}, the rest stay in the RAM pool",
                             self.path.display(),
                             r.id,
+                            runs.len(),
                             super::appender::GRANT_RUNS_MAX
                         );
                     }
-                    page.grant = g.unclaimed_runs();
+                    page.grant = super::appender::page_runs_of(&runs);
                 }
                 page.slots = entries.clone();
             }
@@ -11879,9 +11935,10 @@ impl KvMetaBackend {
     /// appender's reactive refill (§5.3.3 — the exhausted mint is the
     /// belt, the 50 % ask off the write path the steady state): a mint
     /// the region's grant cannot cover asks the manager over the wire for
-    /// one SMO's images and retries ONCE; the manager's own mints draw the
-    /// bitmap and never reach the arm, a declared region's keep PR 3's
-    /// EAGAIN (its refill is the cadence's).
+    /// the DERIVED grant (this mint's need at least — PR 13g) and retries
+    /// ONCE; the manager's own mints draw the bitmap and never reach the
+    /// arm, a declared region's keep PR 3's EAGAIN (its refill is the
+    /// cadence's).
     async fn slot_or_mint_refilled(
         &self,
         forest: &super::forest::SlotTrees,
@@ -11892,9 +11949,7 @@ impl KvMetaBackend {
             .await
         {
             Err(KvError::GrantExhausted { needed, .. }) if self.is_joined_appender() => {
-                let want = u32::try_from(needed)
-                    .unwrap_or(u32::MAX)
-                    .max(super::appender::SMO_IMAGES_MAX);
+                let want = self.joined_reactive_want(needed);
                 self.joined_extent_grant(want).await?;
                 forest
                     .slot_or_mint(slot, &self.mint_context_for(slot))
@@ -18949,6 +19004,7 @@ impl KvMetaBackend {
             flush_ceiling_excused_ns: AtomicU64::new(0),
             flush_ceiling_excused_max_ms: AtomicU64::new(0),
             pressure_cycles: AtomicU64::new(0),
+            cadence_pressure_seen: AtomicU64::new(0),
             joined: AtomicBool::new(false),
             join_refusal,
             flush_ceiling_ms: super::appender::appender_flush_ceiling_ms(

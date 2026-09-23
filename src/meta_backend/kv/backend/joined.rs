@@ -472,10 +472,9 @@ pub(super) async fn wire_extent_refill(
         return Ok(0);
     }
     let name_remainder_on_page = |region: &AppenderRegion| {
-        let mut g = region.grant();
-        g.trim_to_page_runs();
+        let g = region.grant();
         let mut page = region.page.lock().unwrap_or_else(|e| e.into_inner());
-        page.grant = g.unclaimed_runs();
+        page.grant = g.page_runs();
     };
     name_remainder_on_page(region);
     KvMetaBackend::write_region_page_at(path, region).await?;
@@ -1780,17 +1779,30 @@ impl KvMetaBackend {
         self.note_checkpoint_collected(crate::mono_core::monotonic_ns_u64());
         let mut deferred_for_grant = 0u64;
         let mut deferred_for_space = 0u64;
+        // The region's SMO rate — the grant derivation's measured input
+        // (PR 13g, F-R5: a joiner's rate was never folded, so the manager
+        // derived its grant off a rate of 0 — the floor — for the joiner's
+        // whole life).
+        let smo_counters = || {
+            use std::sync::atomic::Ordering::Relaxed;
+            super::super::META_KV_NODE_COMPACTIONS.load(Relaxed)
+                + super::super::META_KV_NODE_SPLITS.load(Relaxed)
+                + super::super::META_KV_NODE_MERGES.load(Relaxed)
+                + super::super::META_KV_ROOT_COLLAPSES.load(Relaxed)
+        };
         for node in dirty {
             let addr = node.addr();
             let tree = self.tree_of_node(&node)?;
+            let smos_before = smo_counters();
             let mut out = tree.checkpoint_flush_node(smo, addr).await;
             // The REACTIVE refill (§5.3.3) over the wire: the flush pass
-            // that exhausts the grant asks the manager for this SMO's own
-            // need and retries the node once.
+            // that exhausts the grant asks the manager for the DERIVED
+            // grant — this SMO's own need at least — and retries the node
+            // once (PR 13g: the one-SMO ask was the only supply path a
+            // floor-ring joiner ran under a storm; a grant answered at the
+            // steady-state grain is the last reactive ask of the storm).
             if let Err(KvError::GrantExhausted { needed, .. }) = &out {
-                let want = u32::try_from(*needed)
-                    .unwrap_or(u32::MAX)
-                    .max(super::super::appender::SMO_IMAGES_MAX);
+                let want = self.joined_reactive_want(*needed);
                 // The round trip is the PASS's own wall (PR 13c review
                 // round 1, Issue 1b): the pass holds the mutex and waits on
                 // a peer, so a slow manager lands these leaves late for
@@ -1812,6 +1824,10 @@ impl KvMetaBackend {
                         self.path.display()
                     ),
                 }
+            }
+            let smos = smo_counters().saturating_sub(smos_before);
+            if smos > 0 {
+                region.smos_this_cycle.fetch_add(smos, Ordering::Relaxed);
             }
             match out {
                 Ok(()) => {}
@@ -1952,6 +1968,33 @@ impl KvMetaBackend {
         self.joined_extent_grant_at(want, None).await
     }
 
+    /// The joined appender's DERIVED grant size (§5.3.3, PR 13g): the
+    /// manager's own derivation run HERE, over this region's measured SMO
+    /// rate (folded on ITS flush pass), the failover bound, this mount's
+    /// projection of the free heap and the directory's live count — the
+    /// size every ask of this joiner names explicitly (the manager
+    /// measures no rate for a region it does not flush and would derive
+    /// the floor). 0 before the join.
+    pub(super) fn joined_derived_grant(&self) -> u64 {
+        match (self.appenders.as_ref(), self.joined_region()) {
+            (Some(set), Ok(region)) => self.grant_extents_for(set, region.id),
+            _ => 0,
+        }
+    }
+
+    /// The REACTIVE ask's size (PR 13g, F-R5): the derived grant, never
+    /// less than the exhausted SMO's own `needed` or the one-SMO constant
+    /// — a refill at the steady-state grain, so the next SMOs of the
+    /// storm find their images in the pool instead of asking again.
+    pub(super) fn joined_reactive_want(&self, needed: u64) -> u32 {
+        let one_smo = u32::try_from(needed)
+            .unwrap_or(u32::MAX)
+            .max(super::super::appender::SMO_IMAGES_MAX);
+        u32::try_from(self.joined_derived_grant())
+            .unwrap_or(u32::MAX)
+            .max(one_smo)
+    }
+
     /// The §5.3.3 REACTIVE refill for the threshold maintenance pass
     /// (PR 13): a `GrantExhausted { appender, needed }` from an SMO the
     /// pass ran on one of this mount's OWN regions asks the manager for
@@ -1977,21 +2020,40 @@ impl KvMetaBackend {
         if !own || super::super::appender::test_manager_unreachable() {
             return false;
         }
-        let want = u32::try_from(needed)
+        let one_smo = u32::try_from(needed)
             .unwrap_or(u32::MAX)
             .max(super::super::appender::SMO_IMAGES_MAX);
         let landed = if self.is_joined_appender() {
-            self.joined_extent_grant_at(want, Some(smo))
+            self.joined_extent_grant_at(self.joined_reactive_want(needed), Some(smo))
                 .await
                 .map(|n| n > 0)
         } else {
-            self.manager_extent_grant_class(
-                appender,
-                want,
-                super::super::alloc_ext_core::AllocClass::Internal,
-            )
-            .await
-            .map(|runs| !runs.is_empty())
+            // The flush pass's ladder (PR 13g): the derived grant in the
+            // USER class, one SMO's images INTERNAL on the space class.
+            let derived = self
+                .appenders
+                .as_ref()
+                .map_or(u64::from(one_smo), |a| self.grant_extents_for(a, appender));
+            let want = u32::try_from(derived).unwrap_or(u32::MAX).max(one_smo);
+            match self
+                .manager_extent_grant_class(
+                    appender,
+                    want,
+                    super::super::alloc_ext_core::AllocClass::User,
+                )
+                .await
+            {
+                Ok(runs) if !runs.is_empty() => Ok(true),
+                Ok(_) | Err(KvError::NoSpace { .. }) => self
+                    .manager_extent_grant_class(
+                        appender,
+                        one_smo,
+                        super::super::alloc_ext_core::AllocClass::Internal,
+                    )
+                    .await
+                    .map(|runs| !runs.is_empty()),
+                Err(e) => Err(e),
+            }
         };
         match landed {
             Ok(landed) => landed,
@@ -2175,10 +2237,15 @@ impl KvMetaBackend {
         Ok(())
     }
 
-    /// The joined appender's grant cadence (§5.3.3): fold the SMO rate,
-    /// ship the extents this cycle's barrier released as `ReturnExtents`
-    /// over the wire, refill at 50 % consumption. `smo` is the cycle's
-    /// held guard: every wire verb here re-dials through it (F3).
+    /// The joined appender's grant cadence (§5.3.3 as built at PR 13g):
+    /// fold the SMO rate, RECYCLE the images this cycle's barrier released
+    /// into the own pool up to the derived grant (every image on a
+    /// pressure-driven cycle — the ring is the bottleneck, not the heap),
+    /// ship the surplus as `ReturnExtents` over the wire, refill at 50 %
+    /// consumption below the derived size — asking the derived size
+    /// EXPLICITLY (the manager derives a wire appender's off a rate of 0).
+    /// `smo` is the cycle's held guard: every wire verb here re-dials
+    /// through it (F3).
     async fn joined_grant_cadence(
         &self,
         cycle_ms: u64,
@@ -2189,6 +2256,10 @@ impl KvMetaBackend {
         })?);
         let region = self.joined_region()?;
         region.fold_smo_rate(cycle_ms);
+        let pressure = self
+            .appenders
+            .as_ref()
+            .is_some_and(|set| self.cadence_under_pressure(set));
         // The census in force (PR 12b review round 1, Issue 10): a
         // joiner's `appenders_known` was frozen at its join, so the
         // derived rotor size `M` never re-derived there — refreshed from
@@ -2216,8 +2287,14 @@ impl KvMetaBackend {
                 ),
             }
         }
-        let mut returnable = region.grant().take_returnable();
-        self.keep_live_images_claimed(region, &mut returnable);
+        let derived = self.joined_derived_grant();
+        // The live-image belt runs BEFORE the recycle: an extent a live
+        // node of this mount stands at re-enters no pool.
+        let mut released = region.grant().take_returnable();
+        self.keep_live_images_claimed(region, &mut released);
+        let returnable = region
+            .grant()
+            .recycle(released, if pressure { u64::MAX } else { derived });
         if !returnable.is_empty() {
             let runs = super::super::slot_state::ExtentGrantRecord::from_extents(
                 returnable.iter().copied(),
@@ -2251,12 +2328,15 @@ impl KvMetaBackend {
                 }
             }
         }
+        // Due at 50 % consumption AND below the derived size (the
+        // manager's own cadence law); the ask names the derived size.
         let due = {
             let g = region.grant();
-            g.refill_due()
+            g.refill_due() && g.unclaimed() < derived
         };
         if due && !super::super::appender::test_manager_unreachable() {
-            if let Err(e) = self.joined_extent_grant_at(0, Some(smo)).await {
+            let want = u32::try_from(derived).unwrap_or(u32::MAX).max(1);
+            if let Err(e) = self.joined_extent_grant_at(want, Some(smo)).await {
                 log::warn!(
                     "meta volume {}: joined appender {}'s ExtentGrant refill deferred ({e})",
                     self.path.display(),

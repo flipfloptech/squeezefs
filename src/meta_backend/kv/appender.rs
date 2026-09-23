@@ -1141,6 +1141,36 @@ pub fn clamp_grant_want(want: u32, cap: u64) -> u64 {
     }
 }
 
+/// The heap-share cap a WIRE appender's explicit `ExtentGrant { want }`
+/// is clamped to (PR 13g, F-R5): the derivation's own third term,
+/// `free_heap / (4 × appenders)` floored at [`GRANT_EXTENTS_FLOOR`] — a
+/// quarter of the free heap spread over the live appenders. The manager
+/// measures no SMO rate for an appender it does not flush (the rate is
+/// the appender's, folded on ITS flush pass), so its own derivation for
+/// one reads a rate of 0 and the floor, and a joiner under a storm
+/// could never be answered more than 8 extents however it asked — the
+/// grant / return ping-pong at the one-SMO grain. The joiner derives its
+/// size off its measured rate and asks it; the manager bounds the ask by
+/// what durable state allows the derivation to reach — a wire integer is
+/// still never an allocation authority.
+pub fn grant_extents_wire_cap(free_heap: u64, appenders: u64) -> u64 {
+    (free_heap / (4 * appenders.max(1))).max(GRANT_EXTENTS_FLOOR)
+}
+
+/// The runs a page NAMES of a remainder `runs` (ascending by start):
+/// every run when they fit the page's [`GRANT_RUNS_MAX`], else the
+/// LARGEST runs (ties: the lowest start), back in ascending order.
+pub fn page_runs_of(runs: &[GrantRun]) -> Vec<GrantRun> {
+    if runs.len() <= GRANT_RUNS_MAX {
+        return runs.to_vec();
+    }
+    let mut by_len: Vec<GrantRun> = runs.to_vec();
+    by_len.sort_by(|a, b| b.len.cmp(&a.len).then(a.start.cmp(&b.start)));
+    by_len.truncate(GRANT_RUNS_MAX);
+    by_len.sort_by_key(|r| r.start);
+    by_len
+}
+
 /// The highest record seq any ring of this volume can have stamped: half
 /// the `u64` space. A seq is a ring POSITION plus an offset, positions are
 /// journal bytes, and every offset raise sets a frontier at most one above
@@ -1469,17 +1499,35 @@ impl RegionGrant {
         g
     }
 
-    /// Claim the lowest unclaimed extent.
+    /// Claim the lowest extent of the SMALLEST unclaimed run (ties: the
+    /// lowest run) — PR 13g, F-R5: a recycled image (a single wherever
+    /// its predecessor stood) is consumed by the next SMO before it can
+    /// fragment the page's word, and the grant's contiguous runs stay
+    /// whole for as long as the pool holds a fragment. The lowest-first
+    /// claim of PR 3 kept the remainder "as few runs as the grants that
+    /// produced it" only while nothing ever re-entered the pool.
     pub fn claim(&mut self) -> Option<u64> {
-        let e = self.unclaimed.pop_first()?;
+        let runs = self.unclaimed_runs();
+        let e = runs
+            .iter()
+            .min_by_key(|r| (r.len, r.start))
+            .map(|r| r.start)?;
+        self.unclaimed.remove(&e);
         self.claimed.insert(e);
         Some(e)
     }
 
     /// Recovery fold of an in-window `alloc(extent)` record: the extent is
-    /// claimed whatever the page said (the page predates the claim).
+    /// claimed whatever the page said (the page predates the claim) — and
+    /// whatever an EARLIER `free(extent)` of the same window said: an
+    /// extent this region retired, recycled and claimed again inside one
+    /// window (PR 13g) folds to CLAIMED, never to pending AND claimed at
+    /// once (a park the next tail would have released while the image
+    /// stood).
     pub fn claim_exact(&mut self, extent: u64) {
         self.unclaimed.remove(&extent);
+        self.pending.retain(|(e, _)| *e != extent);
+        self.returnable.retain(|e| *e != extent);
         self.claimed.insert(extent);
     }
 
@@ -1621,9 +1669,8 @@ impl RegionGrant {
         }
     }
 
-    /// The unclaimed remainder as ascending runs — the WHOLE remainder;
-    /// the page writer calls [`Self::trim_to_page_runs`] first so the
-    /// page names every unclaimed extent (review round 1, Issue 9).
+    /// The unclaimed remainder as ascending runs — the WHOLE remainder
+    /// (the RAM pool); the page names [`Self::page_runs`] of it.
     pub fn unclaimed_runs(&self) -> Vec<GrantRun> {
         let mut runs: Vec<GrantRun> = Vec::new();
         for &e in &self.unclaimed {
@@ -1635,34 +1682,49 @@ impl RegionGrant {
         runs
     }
 
-    /// Fit the unclaimed remainder to the page's [`GRANT_RUNS_MAX`] runs
-    /// WITHOUT truncating it: the largest runs stay unclaimed, every
-    /// extent of the rest moves to the returnable batch (the cadence
-    /// returns them; a crash-class open recovers exactly the page's
-    /// remainder as unclaimed and the returned extents are back in the
-    /// heap — never a two-cycle C13 round trip over legitimately
-    /// unclaimed extents). Returns how many extents moved.
-    pub fn trim_to_page_runs(&mut self) -> u64 {
-        let runs = self.unclaimed_runs();
-        if runs.len() <= GRANT_RUNS_MAX {
-            return 0;
-        }
-        // Largest first; ties keep the lowest run (a stable sort on a
-        // sequence that is ascending by start).
-        let mut by_len: Vec<&GrantRun> = runs.iter().collect();
-        by_len.sort_by(|a, b| b.len.cmp(&a.len));
-        let mut moved = 0u64;
-        for r in &by_len[GRANT_RUNS_MAX..] {
-            for e in r.start..r.start + u64::from(r.len) {
-                if self.unclaimed.remove(&e) {
-                    self.returnable.push(e);
-                    moved += 1;
-                }
+    /// The runs the PAGE names: the whole remainder when it fits the
+    /// page's [`GRANT_RUNS_MAX`], else its largest runs
+    /// ([`page_runs_of`]). The rest stay UNCLAIMED in RAM, unnamed — the
+    /// transient pool a storm's recycled images form between one cadence
+    /// and the next flush pass (each a single wherever its predecessor
+    /// stood; the smallest-run claim consumes them first). On a
+    /// crash-class open an unnamed extent recovers as CLAIMED (tree 0's
+    /// record minus the page's word): the recoverer's orphan census
+    /// returns it on the death path (§5.9 step 8), fsck C13 on a rejoin
+    /// — a round trip on a CRASH, bounded by one cycle's retirements,
+    /// where PR 3's trim (review round 1, Issue 9: the excess moved to the
+    /// returnable batch so the page named every unclaimed extent) made
+    /// the same round trip on EVERY cadence of a live storm — F-R5's
+    /// churn (PR 13g).
+    pub fn page_runs(&self) -> Vec<GrantRun> {
+        page_runs_of(&self.unclaimed_runs())
+    }
+
+    /// **The recycle** (PR 13g, F-R5 — §5.3.3 as built): `released` is a
+    /// batch [`Self::take_returnable`] drained — the images this region
+    /// retired and its tail released, the live-image belt already run
+    /// over it — and the batch re-enters this region's OWN unclaimed pool,
+    /// lowest first, while the pool is below `keep` (the derived grant
+    /// size; `u64::MAX` on a pressure-driven cycle); what does not fit is
+    /// answered as the SURPLUS the cadence ships as `ReturnExtents`. A
+    /// compaction's claim + retire is then a net-zero move inside the
+    /// grant — before it every retired image travelled to the manager and
+    /// came back one cycle later as a fresh carve (a ring-0 control entry
+    /// + barrier each way). A recycled extent never left the grant: the
+    /// `returned` the drain counted for it is taken back; `granted` never
+    /// moves.
+    pub fn recycle(&mut self, released: Vec<u64>, keep: u64) -> Vec<u64> {
+        let mut released = released;
+        released.sort_unstable();
+        let mut surplus = Vec::with_capacity(released.len());
+        for e in released {
+            if self.unclaimed() < keep && !self.claimed.contains(&e) && self.unclaimed.insert(e) {
+                self.returned = self.returned.saturating_sub(1);
+            } else {
+                surplus.push(e);
             }
         }
-        // The 50 % law's reference follows the remainder it measures.
-        self.refill_reference = self.refill_reference.saturating_sub(moved);
-        moved
+        surplus
     }
 
     /// Grant headroom the §4.7 admission may promise against: the
@@ -2342,6 +2404,10 @@ pub struct AppenderSet {
     /// committer is drained by the next cadence tick, never by the
     /// ceiling. 0 on an unpartitioned mount by construction.
     pub pressure_cycles: std::sync::atomic::AtomicU64,
+    /// `pressure_cycles` as the grant cadence last read it — a cadence
+    /// that finds it moved ran on a PRESSURE-DRIVEN cycle (the ring is
+    /// the bottleneck, not the heap) and returns nothing (PR 13g, F-R5).
+    pub cadence_pressure_seen: std::sync::atomic::AtomicU64,
     /// Set by the writer's JOIN: only a joined mount writes pages (a
     /// guarded offline verb that opens writer-posture never joins).
     pub joined: std::sync::atomic::AtomicBool,

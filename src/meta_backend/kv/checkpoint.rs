@@ -2047,17 +2047,22 @@ impl KvMetaBackend {
             // region's grant asks the manager — this process, in PR 3 —
             // for more and retries the node once; only a manager that
             // cannot answer leaves the SMO deferred and counts the stall.
-            // The flush pass's SMOs are COMPACTIONS — the SMOs that return
-            // extents — so the grant is carved in the INTERNAL class and
-            // draws down to the compaction floor like the manager's own
-            // (Issue 6: the heap-full recovery must make progress on a
-            // leased slot tree too) — and for exactly ONE SMO's images
-            // (`SMO_IMAGES_MAX`), never the derived user grant: the
-            // reserve is the manager's recovery budget, drawn one image
-            // at a time (Issue 18); the USER-class cadence sizes the
-            // steady-state grant. A heap that cannot serve even that
-            // answers `NoSpace`, which is the SPACE class below — never
-            // the manager dependency.
+            // The ask is a LADDER (PR 13g, F-R5): on a healthy heap the
+            // DERIVED grant in the USER class — the SMO's own need at
+            // least (a constant ask was re-answered verbatim once the
+            // remainder held it while a fat overlay's split needed more;
+            // review round 3) — so an exhausted region is re-supplied at
+            // the steady-state grain, never one SMO at a time; only the
+            // SPACE class (a USER carve the reserve refuses) falls to the
+            // INTERNAL class for exactly ONE SMO's images
+            // (`SMO_IMAGES_MAX`): the flush pass's SMOs are COMPACTIONS —
+            // the SMOs that return extents — so that carve draws down to
+            // the compaction floor like the manager's own (Issue 6: the
+            // heap-full recovery must make progress on a leased slot tree
+            // too), one image at a time, never the derived grant (the
+            // reserve is the manager's recovery budget — Issue 18). A heap
+            // that cannot serve even that answers `NoSpace`, the SPACE
+            // class below — never the manager dependency.
             if let (
                 Err(KvError::GrantExhausted {
                     appender, needed, ..
@@ -2066,31 +2071,53 @@ impl KvMetaBackend {
             ) = (&out, region_id)
             {
                 if *appender == id && !super::appender::test_manager_unreachable() {
-                    // The ask is the SMO's OWN need (never less than the
-                    // one-SMO constant): a constant ask was re-answered
-                    // verbatim once the remainder held it while a fat
-                    // overlay's split needed more (review round 3).
-                    let want = u32::try_from(*needed)
+                    let one_smo = u32::try_from(*needed)
                         .unwrap_or(u32::MAX)
                         .max(super::appender::SMO_IMAGES_MAX);
+                    let derived = self
+                        .appenders()
+                        .map_or(u64::from(one_smo), |a| self.grant_extents_for(a, id));
+                    let want = u32::try_from(derived).unwrap_or(u32::MAX).max(one_smo);
                     match self
                         .manager_extent_grant_class(
                             id,
                             want,
-                            super::alloc_ext_core::AllocClass::Internal,
+                            super::alloc_ext_core::AllocClass::User,
                         )
                         .await
                     {
                         Ok(runs) if !runs.is_empty() => {
                             out = tree.checkpoint_flush_node(smo, addr).await;
                         }
-                        Ok(_) => {}
-                        Err(KvError::NoSpace { free, reserve }) => {
-                            out = Err(KvError::NoSpace { free, reserve });
-                        }
+                        Ok(_) | Err(KvError::NoSpace { .. }) => {}
                         Err(e) => log::warn!(
                             "checkpoint: appender {id}'s reactive ExtentGrant deferred ({e})"
                         ),
+                    }
+                    // Still short — the space class, or a split wider than
+                    // the clamped USER carve: one SMO's images, INTERNAL,
+                    // sized by the need and unclamped.
+                    if matches!(&out, Err(KvError::GrantExhausted { appender, .. }) if *appender == id)
+                    {
+                        match self
+                            .manager_extent_grant_class(
+                                id,
+                                one_smo,
+                                super::alloc_ext_core::AllocClass::Internal,
+                            )
+                            .await
+                        {
+                            Ok(runs) if !runs.is_empty() => {
+                                out = tree.checkpoint_flush_node(smo, addr).await;
+                            }
+                            Ok(_) => {}
+                            Err(KvError::NoSpace { free, reserve }) => {
+                                out = Err(KvError::NoSpace { free, reserve });
+                            }
+                            Err(e) => log::warn!(
+                                "checkpoint: appender {id}'s reactive ExtentGrant deferred ({e})"
+                            ),
+                        }
                     }
                 }
             }

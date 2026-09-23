@@ -10262,30 +10262,48 @@ impl KvMetaBackend {
                 }
             }
             ring_claimed.sort_unstable();
-            let mut segments: Vec<super::superblock::ExtentRef> = Vec::new();
-            for e in &ring_claimed {
-                let start = self.sb.heap.start + e * node_size;
-                match segments.last_mut() {
-                    Some(last) if last.end() == start => last.len += node_size,
-                    _ => segments.push(super::superblock::ExtentRef {
-                        start,
-                        len: node_size,
-                    }),
-                }
-            }
-            if segments.len() > super::appender::RING_SEGMENTS_MAX {
-                for e in claimed.iter().chain(ring_claimed.iter()) {
+            // The carve's runs, kept to what the page's table names
+            // (`ring_segments_that_fit` — PR 13g review round 1, Issue 4):
+            // a fragmented heap answers a smaller ring of the largest
+            // runs, the rest released, never a refusal on the crash-rejoin
+            // path the hint exists for.
+            let runs =
+                super::slot_state::ExtentGrantRecord::from_extents(ring_claimed.iter().copied())
+                    .runs;
+            let floor_extents = super::appender::SYM_RING_FLOOR_BYTES
+                .div_ceil(node_size)
+                .max(1);
+            let (kept, released) = super::appender::ring_segments_that_fit(&runs, floor_extents);
+            if !released.is_empty() {
+                log::warn!(
+                    "meta volume {}: a {ring_bytes}-byte ring for node {:#018x} / mount slot {:#x} \
+                     would take {} segments of this heap's free extents (the page names at most \
+                     {}) — carved as the {} largest ({} bytes), {} extent(s) released; the ring \
+                     grows later",
+                    self.path.display(),
+                    identity.node_token,
+                    identity.mount_slot,
+                    runs.len(),
+                    super::appender::RING_SEGMENTS_MAX,
+                    kept.len(),
+                    kept.iter().map(|r| u64::from(r.len)).sum::<u64>() * node_size,
+                    released.len()
+                );
+                for e in &released {
                     self.alloc.release_unpublished(*e);
                 }
-                return Err(KvError::Corrupt(format!(
-                    "{}: a {ring_bytes}-byte ring would take {} segments of this heap's free \
-                     extents (the page names at most {}) — lower {} or raise --meta-node-kib",
-                    self.path.display(),
-                    segments.len(),
-                    super::appender::RING_SEGMENTS_MAX,
-                    super::appender::SYM_RING_KB_ENV
-                )));
+                ring_claimed = kept
+                    .iter()
+                    .flat_map(|r| r.start..r.start + u64::from(r.len))
+                    .collect();
             }
+            let segments: Vec<super::superblock::ExtentRef> = kept
+                .iter()
+                .map(|r| super::superblock::ExtentRef {
+                    start: self.sb.heap.start + r.start * node_size,
+                    len: u64::from(r.len) * node_size,
+                })
+                .collect();
             claimed.extend(ring_claimed);
             // The carve (the directory extent + the ring) must sit in no
             // appender's grant record — a ring zeroed over another

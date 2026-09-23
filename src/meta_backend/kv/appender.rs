@@ -1235,6 +1235,45 @@ pub fn grant_deltas_per_entry(
         / delta_frame_len.saturating_add(super::slot_state::GRANT_RUN_LEN as u64)
 }
 
+/// **The ring segments a join KEEPS of a fragmented carve** (PR 13g review
+/// round 1, Issue 4): `runs` are the carve's claims coalesced into runs
+/// (ascending by start, in EXTENTS); `floor_extents` the ring floor. Every
+/// run when they fit the page's table (`RING_SEGMENTS_MAX`); else the
+/// LARGEST runs that fit HALF the table — a sized join leaves growth its
+/// room — when their total reaches the floor, else the largest that fit
+/// the whole table (a heap so fragmented that eight runs are under the
+/// floor still joins at what fits: the floor's extents are at most eight
+/// at any node size the format admits, so eight one-extent runs are the
+/// floor). Answers `(kept, released)`, both ascending by start — the
+/// released extents go back to the heap, the joiner grows later
+/// (`GrowRing`'s law). Before it the join REFUSED `Corrupt` naming a knob
+/// the operator never set, on the crash-rejoin path the hint exists for.
+pub fn ring_segments_that_fit(runs: &[GrantRun], floor_extents: u64) -> (Vec<GrantRun>, Vec<u64>) {
+    if runs.len() <= RING_SEGMENTS_MAX {
+        return (runs.to_vec(), Vec::new());
+    }
+    let mut by_len: Vec<GrantRun> = runs.to_vec();
+    by_len.sort_by(|a, b| b.len.cmp(&a.len).then(a.start.cmp(&b.start)));
+    let total = |n: usize| -> u64 { by_len.iter().take(n).map(|r| u64::from(r.len)).sum() };
+    let half = RING_SEGMENTS_MAX / 2;
+    let keep_n = if total(half) >= floor_extents {
+        half
+    } else {
+        RING_SEGMENTS_MAX
+    };
+    let (mut kept, dropped) = {
+        let (k, d) = by_len.split_at(keep_n);
+        (k.to_vec(), d.to_vec())
+    };
+    kept.sort_by_key(|r| r.start);
+    let mut released: Vec<u64> = dropped
+        .iter()
+        .flat_map(|r| r.start..r.start + u64::from(r.len))
+        .collect();
+    released.sort_unstable();
+    (kept, released)
+}
+
 /// The runs a page NAMES of a remainder `runs` (ascending by start):
 /// every run when they fit the page's [`GRANT_RUNS_MAX`], else the
 /// LARGEST runs (ties: the lowest start), back in ascending order.

@@ -3057,6 +3057,67 @@ fn grant_deltas_pack_under_the_journal_entry_cap() {
     assert!(pack_grant_deltas(0, alloc_delta_frame_len(), 0, 0).is_empty());
 }
 
+/// **A sized join on a fragmented heap keeps the largest runs that fit the
+/// page's table, never refusing** (PR 13g review round 1, Issue 4;
+/// `appender::ring_segments_that_fit`): runs within `RING_SEGMENTS_MAX`
+/// are kept whole; past it the LARGEST runs that fit HALF the table when
+/// they reach the floor (growth keeps its room), else the largest that fit
+/// the whole table; kept ascending, the released extents ascending and
+/// disjoint, nothing lost. Drift is red here.
+#[test]
+fn ring_segments_that_fit_keep_the_largest_runs_and_never_refuse() {
+    use squeezefs::meta_backend::kv::appender::{
+        ring_segments_that_fit, GrantRun, RING_SEGMENTS_MAX,
+    };
+    let run = |start: u64, len: u32| GrantRun { start, len };
+    let floor = 8u64;
+    // Within the table: kept whole, nothing released.
+    let whole: Vec<GrantRun> = (0..RING_SEGMENTS_MAX as u64)
+        .map(|i| run(i * 10, 1))
+        .collect();
+    let (kept, released) = ring_segments_that_fit(&whole, floor);
+    assert_eq!(kept, whole);
+    assert!(released.is_empty());
+    // Thirty-two one-extent holes (the pin's shape): the four largest are
+    // under the floor, so the whole table is spent — eight extents, the
+    // floor exactly — and 24 go back.
+    let holes: Vec<GrantRun> = (0..32u64).map(|i| run(i * 2, 1)).collect();
+    let (kept, released) = ring_segments_that_fit(&holes, floor);
+    assert_eq!(kept.len(), RING_SEGMENTS_MAX);
+    assert_eq!(kept.iter().map(|r| u64::from(r.len)).sum::<u64>(), floor);
+    assert_eq!(released.len(), 24);
+    assert!(
+        kept.windows(2).all(|w| w[0].start < w[1].start),
+        "kept ascending"
+    );
+    assert!(
+        released.windows(2).all(|w| w[0] < w[1]),
+        "released ascending"
+    );
+    for r in &kept {
+        assert!(
+            !released.contains(&r.start),
+            "kept and released are disjoint"
+        );
+    }
+    // Twelve runs where the four largest reach the floor: half the table
+    // is spent, growth keeps four slots.
+    let mut mixed: Vec<GrantRun> = (0..8u64).map(|i| run(i * 3, 1)).collect();
+    mixed.extend([run(100, 4), run(200, 3), run(300, 5), run(400, 2)]);
+    mixed.sort_by_key(|r| r.start);
+    let (kept, released) = ring_segments_that_fit(&mixed, floor);
+    assert_eq!(kept.len(), RING_SEGMENTS_MAX / 2);
+    assert_eq!(
+        kept.iter().map(|r| r.start).collect::<Vec<_>>(),
+        vec![100, 200, 300, 400],
+        "the four largest, ascending"
+    );
+    assert_eq!(released.len(), 8);
+    let total_in: u64 = mixed.iter().map(|r| u64::from(r.len)).sum();
+    let total_out: u64 = kept.iter().map(|r| u64::from(r.len)).sum::<u64>() + released.len() as u64;
+    assert_eq!(total_in, total_out, "nothing lost");
+}
+
 /// The symmetric MANAGER's derivations (design-symmetric-metadata §5.3.3
 /// grant sizing, §5.9 the failover bound, §1.6 "Manager death"; PR 3):
 /// `grant_extents = clamp(2 × ewma_smo_rate × failover_bound_s, 8,

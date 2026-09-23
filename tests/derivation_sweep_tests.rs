@@ -3249,6 +3249,72 @@ fn grow_ring_room_is_bounded_by_the_ring_budgets_remainder() {
     assert_eq!(in_use, ring_budget_bytes(heap));
 }
 
+/// **A join's ring under the ring budget** (PR 13g review round 2, Issue
+/// 18; `appender::join_ring_bytes_under_budget`): the count law admits a
+/// join one FLOOR ring; the ring it carves is `min(ask, remainder)` in
+/// whole extents, never below the floor — `grow_ring_room_bytes`'s law
+/// at the join, so N hinted joins toward the ceiling never exceed
+/// `heap/16` by more than the count law's floors.
+#[test]
+fn a_joins_ring_is_the_ask_under_the_ring_budgets_remainder() {
+    use squeezefs::meta_backend::kv::appender::{
+        join_ring_bytes_under_budget, ring_budget_bytes, ring_budget_remaining_bytes,
+        SYM_RING_FLOOR_BYTES,
+    };
+    let node = 64u64 << 10;
+    let floor = SYM_RING_FLOOR_BYTES;
+    // Under the remainder: the ask verbatim.
+    assert_eq!(
+        join_ring_bytes_under_budget(2 << 20, 8 << 20, node),
+        2 << 20
+    );
+    // Over it: the remainder in whole extents.
+    assert_eq!(
+        join_ring_bytes_under_budget(2 << 20, (1 << 20) + node / 2, node),
+        1 << 20
+    );
+    assert_eq!(
+        join_ring_bytes_under_budget(2 << 20, 983_040, node),
+        983_040,
+        "the fixture's remainder (15 extents of 64 KiB)"
+    );
+    // A remainder below the floor — the count law's floor, whatever the ask.
+    assert_eq!(
+        join_ring_bytes_under_budget(2 << 20, floor / 2, node),
+        floor
+    );
+    assert_eq!(join_ring_bytes_under_budget(2 << 20, 0, node), floor);
+    // An ask at or below the floor is the floor.
+    assert_eq!(join_ring_bytes_under_budget(floor, 8 << 20, node), floor);
+    assert_eq!(join_ring_bytes_under_budget(0, 8 << 20, node), floor);
+    // Whole extents: a 1 MiB node rounds the remainder down to it.
+    assert_eq!(
+        join_ring_bytes_under_budget(4 << 20, (3 << 20) - 1, 1 << 20),
+        2 << 20
+    );
+    // The composition with the count law: on a 4 GiB heap (256 MiB
+    // budget) the floor admits 512 joins; joins asking the 32 MiB ceiling
+    // take it while the budget holds, then the remainder, then the floor —
+    // Σ rings never past budget + one floor per join past the budget.
+    let heap = 4u64 << 30;
+    let budget = ring_budget_bytes(heap);
+    let mut in_use = 0u64;
+    let mut whole = 0;
+    for _ in 0..12 {
+        let r =
+            join_ring_bytes_under_budget(32 << 20, ring_budget_remaining_bytes(heap, in_use), node);
+        if r == 32 << 20 {
+            whole += 1;
+        }
+        in_use += r;
+    }
+    assert_eq!(whole, 8, "eight ceiling rings fill the 256 MiB budget");
+    assert!(
+        in_use <= budget + 4 * floor,
+        "the four joins past the budget took floors: {in_use} vs {budget}"
+    );
+}
+
 /// **A `GrowRing` carve spends a table slot only on a run of the doubling
 /// class** (PR 13g review round 1, Issue 9; `appender::grow_ring_segment_
 /// floor_extents`): the floor is half the clamped ask rounded up, one

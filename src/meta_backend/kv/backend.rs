@@ -10303,7 +10303,7 @@ impl KvMetaBackend {
                 .cloned();
             self.settle_pending_ring_segment(identity, last_page.as_ref(), "the identity's rejoin")
                 .await?;
-            let ring_bytes = if ring_want_bytes == 0 {
+            let ring_ask = if ring_want_bytes == 0 {
                 let hint = self
                     .appender_hint_for(identity.node_token, identity.mount_slot)
                     .await?;
@@ -10314,6 +10314,25 @@ impl KvMetaBackend {
                     super::appender::sym_ring_ceiling_bytes(volume_len),
                 )
             };
+            // The ask under the ring BUDGET (review round 2, Issue 18): the
+            // count law admitted this join one FLOOR ring; a hinted or
+            // explicit ask above it takes only what the budget's remainder
+            // still holds (`join_ring_bytes_under_budget` — `GrowRing`'s
+            // law at the join), and grows later under the same budget.
+            let budget_remaining = set.ring_budget_remaining.load(Ordering::Relaxed);
+            let ring_bytes = super::appender::join_ring_bytes_under_budget(
+                ring_ask,
+                budget_remaining,
+                node_size,
+            );
+            if ring_bytes < ring_ask {
+                log::info!(
+                    "meta volume {}: JoinAppender for node {:#018x} / mount slot {:#x} asked a                      {ring_ask}-byte ring; the ring budget's remainder is {budget_remaining} —                      carved {ring_bytes} (the floor at least), the ring grows later under the                      budget",
+                    self.path.display(),
+                    identity.node_token,
+                    identity.mount_slot
+                );
+            }
             let want_extents = ring_bytes.div_ceil(node_size).max(1);
             let mut ring_claimed: Vec<u64> = Vec::with_capacity(want_extents as usize);
             for _ in 0..want_extents {

@@ -3024,6 +3024,15 @@ fn grant_deltas_pack_under_the_journal_entry_cap() {
     let total = |k: u64, delta: u64, runs: usize, side: u64| {
         ENTRY_HDR_LEN + k * delta + extent_grant_frame_len(runs + k as usize) + side
     };
+    // Chunk `i`'s entry carries the record as it stands AFTER the chunk —
+    // `record ∪ claimed[..ch.end]`, up to `runs + ch.end` runs on a fully
+    // fragmented carve (every extent its own run) — so the budget is the
+    // CUMULATIVE record, never `runs + ch.len()` (review round 2, Issue 15:
+    // chunk 2 of a fragmented carve was under-budgeted by `ch.start` runs
+    // and refused `EntryTooLarge`, one chunk landing per verb).
+    let cumulative = |ch: &std::ops::Range<usize>, delta: u64, runs: usize, side: u64| {
+        ENTRY_HDR_LEN + ch.len() as u64 * delta + extent_grant_frame_len(runs + ch.end) + side
+    };
     for (delta, runs, side) in [
         (alloc_delta_frame_len(), 0usize, 0u64),
         (alloc_delta_frame_len(), 1, hint),
@@ -3033,13 +3042,20 @@ fn grant_deltas_pack_under_the_journal_entry_cap() {
     ] {
         let count = 20_000usize;
         let chunks = pack_grant_deltas(count, delta, runs, side);
-        assert!(chunks.len() >= 2, "{count} deltas never fit one entry");
+        assert!(chunks.len() >= 3, "{count} deltas never fit two entries");
         let mut next = 0usize;
         for ch in &chunks {
             assert_eq!(ch.start, next, "the chunks are contiguous");
             assert!(
                 total(ch.len() as u64, delta, runs, side) <= MAX_ENTRY_LEN,
                 "chunk {ch:?} fits the entry cap"
+            );
+            assert!(
+                cumulative(ch, delta, runs, side) <= MAX_ENTRY_LEN,
+                "chunk {ch:?}'s entry with the CUMULATIVE record ({} runs) fits the cap: {} > {}",
+                runs + ch.end,
+                cumulative(ch, delta, runs, side),
+                MAX_ENTRY_LEN
             );
             next = ch.end;
         }
@@ -3054,6 +3070,16 @@ fn grant_deltas_pack_under_the_journal_entry_cap() {
             total(per + 1, delta, runs, side) > MAX_ENTRY_LEN,
             "one more delta would not fit"
         );
+        // Later chunks shrink as the cumulative record grows — a later
+        // chunk is never wider than the one before it.
+        for pair in chunks.windows(2) {
+            assert!(
+                pair[1].len() <= pair[0].len(),
+                "chunk {:?} is wider than {:?}",
+                pair[1],
+                pair[0]
+            );
+        }
     }
     let per_claim = grant_deltas_per_entry(alloc_delta_frame_len(), 1, hint);
     assert!(

@@ -978,6 +978,94 @@ async fn a_join_past_appenders_capacity_refuses_naming_the_volume_count_lever() 
     }
 }
 
+/// PR 13g review round 2, Issue 18: a join's RING is bounded by the ring
+/// BUDGET's remainder, never admitted by the appender COUNT alone. The
+/// count law admits `heap/16 ÷ floor` appenders; a join asking (or
+/// hinted) a ring above the floor takes it only up to what the budget
+/// still holds — `min(ask, remaining)` page-aligned, never below the
+/// floor the count law budgets (`join_ring_bytes_under_budget`), the law
+/// `GrowRing` already obeys (`grow_ring_room_bytes`). On this 64 MiB
+/// volume (budget ≈ 3.9 MiB less the manager's 1 MiB fixed ring and the
+/// declared region's floor ring ≈ 2.4 MiB of remainder; ceiling 8 MiB)
+/// two 1.5 MiB asks exceed the remainder: the first lands whole, the
+/// second is cut to the remainder, the third — nothing left above the
+/// floor — takes the floor; Σ Live rings never exceeds the budget by more
+/// than the count law's floors. RED before the fix: the second join
+/// carves the whole 1.5 MiB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joins_ring_is_bounded_by_the_ring_budgets_remainder() {
+    use squeezefs::meta_backend::kv::appender::{
+        join_ring_bytes_under_budget, ring_budget_bytes, ring_budget_remaining_bytes, rings_in_use,
+        SYM_RING_FLOOR_BYTES,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let path = std::path::Path::new(&uris[0]);
+    let routed = open_with_partition(&uris, Some(PARTITION)).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let sb = vol.superblock().clone();
+    let budget = ring_budget_bytes(sb.heap.len);
+    let node = NODE_SIZE as u64;
+    let ask = 3u64 << 19;
+    let remaining = |entries: &[_]| ring_budget_remaining_bytes(sb.heap.len, rings_in_use(entries));
+    let r0 = remaining(&read_directory(path, &sb).await.unwrap());
+    assert!(
+        ask < r0 && 2 * ask > r0,
+        "the premise: one 1.5 MiB ask fits the remainder {r0} of the {budget} budget, two do not"
+    );
+    // The first ask lands whole.
+    let a = vol
+        .manager_join_appender(joiner_identity(300), ask)
+        .await
+        .unwrap();
+    let ring_a: u64 = a.ring_segments.iter().map(|s| s.len).sum();
+    assert_eq!(ring_a, ask, "the first ask fits and lands whole");
+    let r1 = remaining(&read_directory(path, &sb).await.unwrap());
+    assert_eq!(r1, r0 - ask, "the remainder fell by the ring");
+    assert!(
+        r1 >= SYM_RING_FLOOR_BYTES && r1 < ask,
+        "the premise: the second ask outruns the remainder {r1} (budget {budget}, r0 {r0}, \
+         floor {SYM_RING_FLOOR_BYTES})"
+    );
+    // The second is cut to the remainder (page-aligned, at or above the
+    // floor) — never the ask.
+    let b = vol
+        .manager_join_appender(joiner_identity(301), ask)
+        .await
+        .unwrap();
+    let ring_b: u64 = b.ring_segments.iter().map(|s| s.len).sum();
+    assert_eq!(
+        ring_b,
+        join_ring_bytes_under_budget(ask, r1, node),
+        "the second ring is min(ask, remainder) in whole extents — the budget's law"
+    );
+    assert!(ring_b <= r1 && ring_b >= SYM_RING_FLOOR_BYTES && ring_b < ask);
+    let r2 = remaining(&read_directory(path, &sb).await.unwrap());
+    assert!(
+        r2 < SYM_RING_FLOOR_BYTES,
+        "the budget is spent to below one floor ({r2})"
+    );
+    // The third — admitted by the count law (live < capacity) — takes the
+    // floor the count law budgets, nothing more.
+    let c = vol
+        .manager_join_appender(joiner_identity(302), ask)
+        .await
+        .unwrap();
+    let ring_c: u64 = c.ring_segments.iter().map(|s| s.len).sum();
+    assert_eq!(ring_c, SYM_RING_FLOOR_BYTES, "the floor, whatever the ask");
+    let entries = read_directory(path, &sb).await.unwrap();
+    assert!(
+        rings_in_use(&entries) <= budget + SYM_RING_FLOOR_BYTES,
+        "Σ Live rings {} exceeds the budget {budget} by more than one floor",
+        rings_in_use(&entries)
+    );
+    assert_eq!(stats(&vol).manager_verb_refusals, 0);
+    for v in &routed.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
 /// A join storm of 32 completes inside the bound and grows the directory
 /// chain past its first extent (7 pairs at 64 KiB nodes): every joiner
 /// gets a distinct page, ring and grant; the chain's headers link. A

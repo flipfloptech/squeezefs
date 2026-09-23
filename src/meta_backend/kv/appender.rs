@@ -949,6 +949,22 @@ pub fn ring_budget_remaining_bytes(heap_len: u64, rings_in_use: u64) -> u64 {
     ring_budget_bytes(heap_len).saturating_sub(rings_in_use)
 }
 
+/// **A join's ring under the ring budget** (PR 13g review round 2, Issue
+/// 18): the join is ADMITTED by the count law (`appenders_capacity` =
+/// `heap/16 ÷ floor` — every admitted appender is budgeted one FLOOR
+/// ring), and its ring is `ask` only as far as the budget's remainder
+/// holds it: `min(ask, remainder)` in whole extents (the ring is carved
+/// by the node), never below the floor the count law budgets —
+/// `grow_ring_room_bytes`'s law at the join. A hinted or explicit ask
+/// above the remainder lands the remainder and grows later (`GrowRing`,
+/// under the same budget).
+pub fn join_ring_bytes_under_budget(ask_bytes: u64, budget_remaining: u64, node_size: u64) -> u64 {
+    let node = node_size.max(1);
+    ask_bytes
+        .min(budget_remaining / node * node)
+        .max(SYM_RING_FLOOR_BYTES)
+}
+
 /// **`GrowRing`'s room** (Issue 8): the smaller of the per-appender
 /// ceiling less the ring the page names and the set-wide budget's
 /// remainder — N rings grown toward the ceiling never exceed `heap/16`,

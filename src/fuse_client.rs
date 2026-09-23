@@ -13392,6 +13392,10 @@ impl SqueezefsFilesystem {
                     load(&meta_kv::META_KV_NODE_REWRITE_BYTES),
                 );
                 metrics.insert(
+                    "meta_kv_node_images".into(),
+                    load(&meta_kv::META_KV_NODE_IMAGES),
+                );
+                metrics.insert(
                     "meta_kv_node_compactions".into(),
                     load(&meta_kv::META_KV_NODE_COMPACTIONS),
                 );
@@ -13801,6 +13805,24 @@ impl SqueezefsFilesystem {
                     per_volume(&|be| {
                         be.checkpoint_trigger_ms(meta_kv::checkpoint::CHECKPOINT_MAX_AGE_MS as u64)
                     }),
+                );
+                // PR 13g (F-B1): the cadence's LIVE projection beside the
+                // horizon term — the dirty nodes times the measured per-node
+                // append wall plus the images the pending commits promised
+                // times the measured per-image SMO wall (the trigger
+                // anticipates the larger of the two; a storm's first cycle
+                // after a quiet horizon is priced from its own pending work).
+                metrics.insert(
+                    "meta_kv_checkpoint_projected_ms".into(),
+                    per_volume(&|be| be.checkpoint_projected_ms()),
+                );
+                metrics.insert(
+                    "meta_kv_checkpoint_node_unit_ns".into(),
+                    per_volume(&|be| be.checkpoint_node_unit_ns()),
+                );
+                metrics.insert(
+                    "meta_kv_checkpoint_image_unit_ns".into(),
+                    per_volume(&|be| be.checkpoint_image_unit_ns()),
                 );
                 // LEAF-MERGE (design-cow-kv-metadata §4.6a (h)): the
                 // underfull-sibling SMO. `node_merges` = merges executed

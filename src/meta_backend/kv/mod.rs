@@ -400,6 +400,13 @@ pub static META_KV_NODE_APPEND_BYTES: AtomicU64 = AtomicU64::new(0);
 /// accounting. Surfaced as `meta_kv_node_rewrite_bytes` in PR K7.
 pub static META_KV_NODE_REWRITE_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Fresh node IMAGES written (every whole-node CoW rewrite `write_node`
+/// lands — compaction / split / merge successors, builder output): the
+/// count `META_KV_NODE_REWRITE_BYTES` sums the bytes of, and the unit the
+/// flush pass's per-image wall is measured in (PR 13g, F-B1 —
+/// `checkpoint::FlushPassSample`). Surfaced as `meta_kv_node_images`.
+pub static META_KV_NODE_IMAGES: AtomicU64 = AtomicU64::new(0);
+
 /// §4.6 pt 2 checkpoint cycles completed (ledger records written).
 /// Surfaced as `meta_kv_checkpoints` in PR K7.
 pub static META_KV_CHECKPOINTS: AtomicU64 = AtomicU64::new(0);

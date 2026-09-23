@@ -248,6 +248,20 @@ pub async fn format_stamped_set_with_config_len(
     n: usize,
     len: u64,
 ) -> Vec<String> {
+    format_stamped_set_with_ring_len(dir, n, len, RING_LEN).await
+}
+
+/// [`format_stamped_set_with_config_len`] at a chosen fixed-ring length:
+/// the fixtures' 1 MiB ring makes every manager cycle under a storm the
+/// ring-PRESSURE law's; a contract on the AGE law (the flush-ceiling
+/// cadence) formats the box's 32 MiB ring so the age decision is the one
+/// that fires.
+pub async fn format_stamped_set_with_ring_len(
+    dir: &std::path::Path,
+    n: usize,
+    len: u64,
+    ring_len: u64,
+) -> Vec<String> {
     let plan = plan_meta_slot_set(n).expect("derived plan");
     std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
     let mut uris = Vec::with_capacity(n);
@@ -256,6 +270,7 @@ pub async fn format_stamped_set_with_config_len(
         std::fs::File::create(&p).unwrap().set_len(len).unwrap();
         let opts = FormatV3Options {
             format_config_xattr: (i == 0).then(|| format_config_for(dir)),
+            journal_len_override: Some(ring_len),
             ..set_opts()
         };
         let r = format_v3_stamped(&p, len, &opts, plan.stamps[i].clone()).await;

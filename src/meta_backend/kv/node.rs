@@ -984,6 +984,7 @@ pub async fn write_node(
     // successors and builder/format output alike — every fresh image).
     super::META_KV_NODE_REWRITE_BYTES
         .fetch_add(bytes_written as u64, std::sync::atomic::Ordering::Relaxed);
+    super::META_KV_NODE_IMAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(WrittenNode {
         node_addr: params.node_addr,
         node_seq: params.node_seq,

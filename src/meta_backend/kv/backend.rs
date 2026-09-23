@@ -1587,6 +1587,24 @@ pub struct KvMetaBackend {
     /// for a cycle another path ran.
     pub(super) checkpoint_decision_late_ns: AtomicU64,
     pub(super) checkpoint_decision_tick_ns: AtomicU64,
+    /// The flush pass's two measured units, ns — the wall per dirty node
+    /// whose flush appended (no fresh image) and the wall per fresh IMAGE
+    /// the pass's SMOs wrote — each the MAXIMUM over the last horizon of
+    /// passes that ran its class (`checkpoint::flush_unit_ns`; the windows
+    /// under the mutex, the maxima cached for the tick's lock-free read):
+    /// what the cadence's LIVE projection multiplies the PENDING work by
+    /// (PR 13g, F-B1: a horizon of PAST terms cannot anticipate a cycle
+    /// whose work exceeds every cycle in it — a storm's first cycle after
+    /// a quiet horizon, a right-sized ring's larger intervals; the dirty
+    /// count is read at the tick and the §4.7 admission PROMISES every
+    /// SMO's images at commit, so the work the next cycle carries is known
+    /// before it runs). Published as `meta_kv_checkpoint_{node,image}_unit_ns`.
+    pub(super) checkpoint_flush_units: std::sync::Mutex<(
+        super::checkpoint::CycleTermWindow,
+        super::checkpoint::CycleTermWindow,
+    )>,
+    pub(super) checkpoint_node_unit_ns: AtomicU64,
+    pub(super) checkpoint_image_unit_ns: AtomicU64,
     /// The volume's merge LAP across its trees (`run_merge_sweep`): which
     /// trees completed their lap since the last publish, and the exact
     /// candidate count they reported. Guarded by the SMO mutex's callers;
@@ -3210,6 +3228,12 @@ impl KvMetaBackend {
             checkpoint_term_ns: AtomicU64::new(0),
             checkpoint_decision_late_ns: AtomicU64::new(0),
             checkpoint_decision_tick_ns: AtomicU64::new(0),
+            checkpoint_flush_units: std::sync::Mutex::new((
+                super::checkpoint::CycleTermWindow::new(),
+                super::checkpoint::CycleTermWindow::new(),
+            )),
+            checkpoint_node_unit_ns: AtomicU64::new(0),
+            checkpoint_image_unit_ns: AtomicU64::new(0),
             merge_lap: std::sync::Mutex::new(VolumeLap::default()),
             merge_laps: AtomicU64::new(0),
             merge_candidates_tail: AtomicU64::new(0),
@@ -11765,6 +11789,91 @@ impl KvMetaBackend {
             .store(anticipated, Ordering::Relaxed);
     }
 
+    /// Push one flush pass's measured work into the volume's two unit
+    /// windows and refresh the maxima in force (`checkpoint::flush_unit_ns`;
+    /// PR 13g, F-B1) — both flush passes call it with the sample their
+    /// loop split by class.
+    pub(super) fn note_flush_pass(&self, sample: super::checkpoint::FlushPassSample) {
+        let node = super::checkpoint::flush_unit_ns(sample.node_ns, sample.nodes);
+        let image = super::checkpoint::flush_unit_ns(sample.image_ns, sample.images);
+        if node.is_none() && image.is_none() {
+            return;
+        }
+        let mut w = self
+            .checkpoint_flush_units
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(unit) = node {
+            w.0.push(unit);
+            self.checkpoint_node_unit_ns
+                .store(w.0.anticipated_ns(), Ordering::Relaxed);
+        }
+        if let Some(unit) = image {
+            w.1.push(unit);
+            self.checkpoint_image_unit_ns
+                .store(w.1.anticipated_ns(), Ordering::Relaxed);
+        }
+    }
+
+    /// The flush-pass wall per appended dirty node in force — the horizon
+    /// maximum, ns (`meta_kv_checkpoint_node_unit_ns`; 0 before a pass
+    /// appended one).
+    pub fn checkpoint_node_unit_ns(&self) -> u64 {
+        self.checkpoint_node_unit_ns.load(Ordering::Relaxed)
+    }
+
+    /// The flush-pass wall per fresh SMO image in force — the horizon
+    /// maximum, ns (`meta_kv_checkpoint_image_unit_ns`; 0 before a pass
+    /// wrote one).
+    pub fn checkpoint_image_unit_ns(&self) -> u64 {
+        self.checkpoint_image_unit_ns.load(Ordering::Relaxed)
+    }
+
+    /// The SMO images the pending commits PROMISED and no flush pass has
+    /// consumed yet — the manager's heap promises plus every own region's
+    /// grant promises (a joined appender's leaves promise against its
+    /// grant alone).
+    fn promised_smo_extents(&self) -> u64 {
+        let heap = self.cache.heap_promised();
+        let regions = self.appenders.as_ref().map_or(0, |set| {
+            set.own_regions().map(|r| r.grant().promised()).sum()
+        });
+        heap.saturating_add(regions)
+    }
+
+    /// The dirty nodes the next flush pass will write — one walk of the
+    /// node cache (the cadence tick's own count, which it hands to
+    /// `checkpoint_due_by_age`; the stats face and the max-age trigger
+    /// walk here).
+    pub fn dirty_node_count(&self) -> u64 {
+        let mut dirty = 0u64;
+        self.cache.for_each_node(|n| {
+            if n.dirty_floor() != u64::MAX {
+                dirty += 1;
+            }
+        });
+        dirty
+    }
+
+    /// **The LIVE projection of the next cycle's flush wall**, ms, for a
+    /// dirty count the caller read (`checkpoint::projected_flush_wall_ns`
+    /// over the dirty nodes, the promised images and the two measured
+    /// units).
+    pub fn checkpoint_projected_ms_for(&self, dirty_nodes: u64) -> u64 {
+        super::checkpoint::projected_flush_wall_ns(
+            dirty_nodes,
+            self.checkpoint_node_unit_ns(),
+            self.promised_smo_extents(),
+            self.checkpoint_image_unit_ns(),
+        ) / 1_000_000
+    }
+
+    /// The projection at the dirty count of this instant
+    /// (`meta_kv_checkpoint_projected_ms`).
+    pub fn checkpoint_projected_ms(&self) -> u64 {
+        self.checkpoint_projected_ms_for(self.dirty_node_count())
+    }
+
     /// The anticipated landing term of this volume's checkpoint cycles —
     /// the measured terms' maximum over the horizon, ms
     /// (`meta_kv_checkpoint_term_ms`; 0 before the first cycle).
@@ -11796,6 +11905,17 @@ impl KvMetaBackend {
         if self.appenders.is_none() {
             return max_age_ms;
         }
+        self.checkpoint_trigger_ms_for(max_age_ms, self.dirty_node_count())
+    }
+
+    /// The trigger for a max age at a dirty count the caller already read
+    /// (the cadence tick's — it walks the cache once per tick; the count
+    /// is the live projection's input, `checkpoint_projected_ms_for`,
+    /// published beside the trigger and not yet anticipated by it).
+    pub(super) fn checkpoint_trigger_ms_for(&self, max_age_ms: u64, _dirty_nodes: u64) -> u64 {
+        if self.appenders.is_none() {
+            return max_age_ms;
+        }
         super::checkpoint::checkpoint_trigger_ms(max_age_ms, self.checkpoint_term_ms())
     }
 
@@ -11818,9 +11938,10 @@ impl KvMetaBackend {
         max_age_ms: u64,
         mutex_wait_ns: u64,
         now_ns: u64,
+        dirty_nodes: u64,
     ) -> Option<u64> {
         let since_ns = now_ns.saturating_sub(self.checkpoint_collected_ns.load(Ordering::Acquire));
-        let trigger_ms = self.checkpoint_trigger_ms(max_age_ms);
+        let trigger_ms = self.checkpoint_trigger_ms_for(max_age_ms, dirty_nodes);
         if since_ns / 1_000_000 < trigger_ms {
             return None;
         }
@@ -11829,11 +11950,14 @@ impl KvMetaBackend {
             .saturating_sub(mutex_wait_ns);
         log::debug!(
             "checkpoint: cycle due by age on {:?} — {} ms since the last collection ≥ the \
-             {trigger_ms} ms trigger (max age {max_age_ms}, anticipated term {} ms, decided {} ms \
-             past the trigger, the tick's wait for the SMO mutex {} ms left out)",
+             {trigger_ms} ms trigger (max age {max_age_ms}, anticipated term {} ms, projected {} \
+             ms over {dirty_nodes} dirty nodes + {} promised images, decided {} ms past the \
+             trigger, the tick's wait for the SMO mutex {} ms left out)",
             self.path,
             since_ns / 1_000_000,
             self.checkpoint_term_ms(),
+            self.checkpoint_projected_ms_for(dirty_nodes),
+            self.promised_smo_extents(),
             late_ns / 1_000_000,
             mutex_wait_ns / 1_000_000
         );

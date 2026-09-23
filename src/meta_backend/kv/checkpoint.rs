@@ -1107,6 +1107,92 @@ pub fn checkpoint_cycle_term_ns(
     prebarrier_wall_ns.saturating_add(late_ns.min(late_cap_ns).saturating_sub(tick_ns))
 }
 
+/// **One flush pass's measured work, split by its two cost classes** (PR
+/// 13g, F-B1): the wall spent flushing nodes whose flush wrote NO fresh
+/// image (an append of the frozen bset — `node_ns` over `nodes`) and the
+/// wall spent on the nodes whose flush ran an SMO (compaction / split /
+/// merge — `image_ns` over the fresh IMAGES those SMOs wrote, the unit
+/// §4.7's promise ledger counts in: a promised extent is one image).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FlushPassSample {
+    pub node_ns: u64,
+    pub nodes: u64,
+    pub image_ns: u64,
+    pub images: u64,
+    /// The nodes whose flush ran an SMO (the images' sources).
+    pub smo_nodes: u64,
+}
+
+impl FlushPassSample {
+    /// Fold another pass fragment's work into this one (a threshold pass
+    /// walks its trees one at a time; the unit is the whole pass's).
+    pub fn fold(&mut self, other: &Self) {
+        self.node_ns = self.node_ns.saturating_add(other.node_ns);
+        self.nodes = self.nodes.saturating_add(other.nodes);
+        self.image_ns = self.image_ns.saturating_add(other.image_ns);
+        self.images = self.images.saturating_add(other.images);
+        self.smo_nodes = self.smo_nodes.saturating_add(other.smo_nodes);
+    }
+
+    /// One node's flush: `images` fresh images written in `wall_ns` — SMO
+    /// work when any was, an append otherwise.
+    pub fn note(&mut self, wall_ns: u64, images: u64) {
+        if images > 0 {
+            self.image_ns = self.image_ns.saturating_add(wall_ns);
+            self.images = self.images.saturating_add(images);
+            self.smo_nodes += 1;
+        } else {
+            self.node_ns = self.node_ns.saturating_add(wall_ns);
+            self.nodes += 1;
+        }
+    }
+}
+
+/// **One flush pass's unit for a class** (PR 13g, F-B1): `wall_ns /
+/// count` when the pass ran the class, `None` when it did not — a pass
+/// without the class measures nothing and the unit in force keeps what
+/// the passes that ran it measured, which is what lets a storm's FIRST
+/// cycle after a quiet horizon be priced from the units the last storm
+/// measured. The unit in force is the MAXIMUM over the last
+/// [`TERM_HORIZON_CYCLES`] passes that ran the class (a
+/// [`CycleTermWindow`] per class — the term's own law: a ceiling is a
+/// BOUND, so the units it anticipates with must be bounds; a mean unit
+/// under-prices every above-mean pass, and a machine that slows under a
+/// storm raises the bound at the first slow pass instead of an eighth per
+/// pass).
+pub fn flush_unit_ns(wall_ns: u64, count: u64) -> Option<u64> {
+    (count > 0).then(|| wall_ns / count)
+}
+
+/// **The LIVE projection of the next cycle's flush wall** (PR 13g,
+/// F-B1): the dirty nodes the pass will write times the measured per-node
+/// append wall, plus the images the pending commits already PROMISED
+/// extents for (§4.7's admission — `heap_promised` on the manager's heap,
+/// a region grant's `promised` for its leased leaves) times the measured
+/// per-image SMO wall — the next cycle's own bound, read off its PENDING
+/// work at every tick, before the cycle runs. The cadence anticipates
+/// `max(horizon term, projection)`: the horizon carries what the last
+/// cycles COST (the fixed part — publish, pages, ledger — and the lateness
+/// law), the projection what the next one CARRIES; a storm's first cycle
+/// after a quiet horizon (the box's class — 199 quiet cycles had emptied
+/// the 64-cycle horizon of the previous row's 133 ms, the onset cycle
+/// tripped at 1,127 ms with 11 ms anticipated), or a cycle whose interval
+/// accumulated more work than any before it, is priced from its own
+/// pending work instead of a past that never saw it. A unit no pass has
+/// measured yet is 0 (a fresh mount's first storm cycle is the horizon's
+/// alone — the shipped posture until its first pass with the class); a
+/// measured unit is the horizon MAXIMUM ([`flush_unit_ns`]).
+pub fn projected_flush_wall_ns(
+    dirty_nodes: u64,
+    node_unit_ns: u64,
+    promised_extents: u64,
+    image_unit_ns: u64,
+) -> u64 {
+    dirty_nodes
+        .saturating_mul(node_unit_ns)
+        .saturating_add(promised_extents.saturating_mul(image_unit_ns))
+}
+
 /// **The cycle terms a forest volume's cadence anticipates over** — the
 /// last [`TERM_HORIZON_CYCLES`] samples; the anticipated term is their
 /// MAXIMUM (PR 13e, F-B1). A ceiling is a BOUND, so the term it
@@ -1482,12 +1568,17 @@ async fn maintenance_pass(
 ) -> Result<(), KvError> {
     let mut smo = be.smo.lock().await;
     // The trees this mount MAINTAINS (never a projection or a foreign
-    // lessee's — PR 13).
+    // lessee's — PR 13). The pass's items feed the cadence's unit windows
+    // like a flush pass's (PR 13g, F-B1).
+    let mut sample = FlushPassSample::default();
     for tree in be.maintainable_trees() {
         loop {
             let r = tree.run_maintenance_until(&mut smo, deadline).await;
             match r {
-                Ok(_) => break,
+                Ok(out) => {
+                    sample.fold(&out.sample);
+                    break;
+                }
                 Err(KvError::JournalReserveExhausted { .. } | KvError::PendingFreeFull { .. }) => {
                     be.checkpoint_cycle(&mut smo, true).await?;
                 }
@@ -1524,6 +1615,7 @@ async fn maintenance_pass(
             }
         }
     }
+    be.note_flush_pass(sample);
     Ok(())
 }
 
@@ -1609,10 +1701,15 @@ async fn tick(
     //    centralized progress audit (clause b) bounds genuine wedges.
     //    Over the trees this mount MAINTAINS (PR 13): a joined appender's
     //    projections of the manager's trees are never appended to here.
+    //    The pass's items feed the cadence's unit windows (PR 13g, F-B1).
+    let mut sample = FlushPassSample::default();
     for tree in be.maintainable_trees() {
         loop {
             match tree.run_maintenance_until(&mut smo, drain_deadline).await {
-                Ok(_) => break,
+                Ok(out) => {
+                    sample.fold(&out.sample);
+                    break;
+                }
                 Err(KvError::JournalReserveExhausted { .. } | KvError::PendingFreeFull { .. }) => {
                     be.checkpoint_cycle(&mut smo, true).await?;
                     *last_checkpoint = std::time::Instant::now();
@@ -1627,6 +1724,7 @@ async fn tick(
             }
         }
     }
+    be.note_flush_pass(sample);
 
     // 2. The deferred-mode flush barrier (the v2 flusher tick). Also
     //    drains the §4.6 pt 3 pending-reclaim for previously-written
@@ -1651,12 +1749,7 @@ async fn tick(
     // pins).
     let region_pressure = be.appenders().is_some_and(|a| a.ring_pressure());
     let ring_pressure = distance > core.geometry().logical_len() / 2 || region_pressure;
-    let mut dirty_nodes = 0u64;
-    be.node_cache().for_each_node(|n| {
-        if n.dirty_floor() != u64::MAX {
-            dirty_nodes += 1;
-        }
-    });
+    let dirty_nodes = be.dirty_node_count();
     // The freed-offset composite's ceiling in force replaces the constant
     // while a reader ask is live (`P/2` — every reader pass finds a new
     // root); `None` is the shipped decision verbatim. Compared against the
@@ -1683,6 +1776,7 @@ async fn tick(
             max_age_ms,
             mutex_wait_ns,
             crate::mono_core::monotonic_ns_u64(),
+            dirty_nodes,
         )
     } else {
         (last_checkpoint.elapsed().as_millis() >= u128::from(max_age_ms)).then_some(0)
@@ -2038,7 +2132,11 @@ impl KvMetaBackend {
                 + super::META_KV_NODE_MERGES.load(Ordering::Relaxed)
                 + super::META_KV_ROOT_COLLAPSES.load(Ordering::Relaxed)
         };
-        let smos_at_start = smo_counters();
+        // The pass's work split by class — the cadence's live projection's
+        // units (PR 13g, F-B1): a node whose flush wrote fresh images is
+        // SMO work priced per image, every other node an append priced
+        // per node.
+        let mut sample = FlushPassSample::default();
         for node in dirty {
             let addr = node.addr();
             let tree = self.tree_of_node(&node)?;
@@ -2050,6 +2148,8 @@ impl KvMetaBackend {
                 .map(|slot| self.region_of_slot(slot))
                 .filter(|id| *id != 0);
             let smos_before = smo_counters();
+            let images_before = smo.images_written();
+            let node_started = std::time::Instant::now();
             let mut out = tree.checkpoint_flush_node(smo, addr).await;
             // A REACTIVE refill (§5.3.3): the flush pass that exhausts a
             // region's grant asks the manager — this process, in PR 3 —
@@ -2137,6 +2237,10 @@ impl KvMetaBackend {
                     }
                 }
             }
+            sample.note(
+                node_started.elapsed().as_nanos() as u64,
+                smo.images_written().saturating_sub(images_before),
+            );
             match out {
                 Ok(()) => {}
                 Err(KvError::JournalReserveExhausted { needed }) => {
@@ -2217,6 +2321,9 @@ impl KvMetaBackend {
         }
 
         let t_flushed = std::time::Instant::now();
+        // The pass's measured work by class — the cadence's live
+        // projection's units (PR 13g, F-B1).
+        self.note_flush_pass(sample);
         // ---- Dirty bitmap pages, stamped with this checkpoint's seq
         // (§4.7: the generation the ledger record names).
         let ckpt_seq = self.checkpoint_seq.load(Ordering::Acquire) + 1;
@@ -2249,15 +2356,24 @@ impl KvMetaBackend {
         self.note_checkpoint_cycle_term(cycle_started.elapsed().as_nanos() as u64);
         log::debug!(
             "checkpoint: cycle on {:?} pre-barrier wall {} ms = publish {} + flush {} ({} dirty \
-             nodes, {} SMOs) + pages {} + barrier {}",
+             nodes: {} appended in {} ms, {} SMO'd writing {} images in {} ms) + pages {} + \
+             barrier {}; anticipated term {} ms, projected {} ms (units {} µs/node, {} µs/image)",
             self.device_path(),
             cycle_started.elapsed().as_millis(),
             (t_collected - cycle_started).as_millis(),
             (t_flushed - t_collected).as_millis(),
             dirty_count,
-            smo_counters().saturating_sub(smos_at_start),
+            sample.nodes,
+            sample.node_ns / 1_000_000,
+            sample.smo_nodes,
+            sample.images,
+            sample.image_ns / 1_000_000,
             (t_pages - t_flushed).as_millis(),
-            t_pages.elapsed().as_millis()
+            t_pages.elapsed().as_millis(),
+            self.checkpoint_term_ms(),
+            self.checkpoint_projected_ms(),
+            self.checkpoint_node_unit_ns() / 1_000,
+            self.checkpoint_image_unit_ns() / 1_000
         );
 
         // ---- The tail rule (module docs; §4.6 pt 2), plus the FIND-VS-A

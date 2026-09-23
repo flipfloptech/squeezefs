@@ -1804,10 +1804,17 @@ impl KvMetaBackend {
                 + super::super::META_KV_NODE_MERGES.load(Relaxed)
                 + super::super::META_KV_ROOT_COLLAPSES.load(Relaxed)
         };
+        let dirty_count = dirty.len();
+        let flush_started = std::time::Instant::now();
+        // The pass's work split by class — the cadence's live projection's
+        // units (PR 13g, F-B1).
+        let mut sample = super::super::checkpoint::FlushPassSample::default();
         for node in dirty {
             let addr = node.addr();
             let tree = self.tree_of_node(&node)?;
             let smos_before = smo_counters();
+            let images_before = smo.images_written();
+            let node_started = std::time::Instant::now();
             let mut out = tree.checkpoint_flush_node(smo, addr).await;
             // The REACTIVE refill (§5.3.3) over the wire: the flush pass
             // that exhausts the grant asks the manager for the DERIVED
@@ -1843,6 +1850,10 @@ impl KvMetaBackend {
             if smos > 0 {
                 region.smos_this_cycle.fetch_add(smos, Ordering::Relaxed);
             }
+            sample.note(
+                node_started.elapsed().as_nanos() as u64,
+                smo.images_written().saturating_sub(images_before),
+            );
             match out {
                 Ok(()) => {}
                 Err(KvError::JournalReserveExhausted { needed }) => {
@@ -1878,10 +1889,31 @@ impl KvMetaBackend {
         let ckpt_seq = self.checkpoint_seq.load(Ordering::Acquire) + 1;
         self.write_data_alloc_pages(ckpt_seq).await?;
 
+        let flush_ms = flush_started.elapsed().as_millis();
+        self.note_flush_pass(sample);
         // ---- Barrier #1: our node appends become durable.
+        let barrier_started = std::time::Instant::now();
         self.sync_device().await.map_err(KvError::Io)?;
         self.note_flush_ceiling(&had_dirty, crate::mono_core::monotonic_ns_u64());
         self.note_checkpoint_cycle_term(cycle_started.elapsed().as_nanos() as u64);
+        log::debug!(
+            "joined checkpoint: appender {own}'s cycle pre-barrier wall {} ms = flush {flush_ms} \
+             ({dirty_count} dirty: {} appended in {} ms, {} SMO'd writing {} images in {} ms) + \
+             barrier {} ms; anticipated term {} ms, projected {} ms (units {} µs/node, {} \
+             µs/image), trigger {} ms",
+            cycle_started.elapsed().as_millis(),
+            sample.nodes,
+            sample.node_ns / 1_000_000,
+            sample.smo_nodes,
+            sample.images,
+            sample.image_ns / 1_000_000,
+            barrier_started.elapsed().as_millis(),
+            self.checkpoint_term_ms(),
+            self.checkpoint_projected_ms(),
+            self.checkpoint_node_unit_ns() / 1_000,
+            self.checkpoint_image_unit_ns() / 1_000,
+            self.checkpoint_trigger_ms(super::super::checkpoint::CHECKPOINT_MAX_AGE_MS as u64)
+        );
 
         // ---- The page-budget overflow law's WIRE form (round 4, F9): the
         // roots the page below cannot name ride tree 0 through the

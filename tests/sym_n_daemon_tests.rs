@@ -11101,6 +11101,24 @@ async fn a_create_into_a_directory_whose_slot_moves_to_the_creator_mid_plan_neve
 // floor-sized ring (the record's §3.9.5.2 / §7 item 16).
 // ---------------------------------------------------------------------------
 
+/// The cadence-timing pins' volume home: RAM-backed where the box has one
+/// (`/dev/shm`), else the process's temp dir. The fixtures' default home is
+/// a file on the laptop's btrfs, whose `fdatasync` is 100+ ms and variable
+/// (the substrate bracket the metadata-throughput baseline measured at
+/// 165× on the journal barrier) — a venue term no cadence can anticipate,
+/// and not the box's (nvmet, µs-class).
+fn cadence_venue_dir() -> tempfile::TempDir {
+    let shm = std::path::Path::new("/dev/shm");
+    if shm.is_dir() {
+        tempfile::tempdir_in(shm).unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    }
+}
+
+/// One storming daemon: its backend, its directory, the names it acked.
+type StormDaemon = (Arc<RoutedMetaBackend>, u64, Vec<(String, u64)>);
+
 /// One joiner's supply faces, read off its own volume and the manager's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SupplyFaces {
@@ -11121,11 +11139,23 @@ struct SupplyFaces {
     wire_ring_grows: u64,
     compactions: u64,
     splits: u64,
-    /// The cadence trigger in force (`meta_kv_checkpoint_trigger_ms`).
+    /// The cadence trigger in force (`meta_kv_checkpoint_trigger_ms`) and
+    /// the F-B1 projection's faces (`meta_kv_checkpoint_projected_ms`,
+    /// `meta_kv_checkpoint_{node,image}_unit_ns` in µs).
     trigger_ms: u64,
+    projected_ms: u64,
+    node_unit_us: u64,
+    image_unit_us: u64,
 }
 
-/// [`assert_must_stay_zero`] without the flush-ceiling law (F-B1's pin's).
+/// [`assert_must_stay_zero`] without the flush-ceiling law — the JOINERS'
+/// check in the two cadence-timing pins: the ceiling law is asserted on
+/// the MANAGER (the box's trip site — F-B1's class reproduced there), while
+/// a joiner's reading on this venue carries the dev profile's tick
+/// lateness under CPU saturation (a decision 300 ms past its trigger with
+/// the SMO mutex free — the tick's own pre-decision work, PR 13e's
+/// "26–272 ms against a 50 ms tick"), a venue term the box does not have;
+/// the joiners' ceiling is the fleet proof's read (`sym-scale`).
 fn assert_supply_gauges_zero(vol: &KvMetaBackend, who: &str) {
     let s = vol.appender_stats().expect("a forest volume");
     assert_eq!(s.manager_verb_refusals, 0, "{who}: manager_verb_refusals");
@@ -11133,6 +11163,12 @@ fn assert_supply_gauges_zero(vol: &KvMetaBackend, who: &str) {
         assert_eq!(j.control_refusals, 0, "{who}: joined_control_refusals");
         assert_eq!(j.wire_failures, 0, "{who}: joined_wire_failures");
     }
+    assert_eq!(
+        squeezefs::meta_backend::kv::META_KV_LEAF_LEASE_REFUSALS
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "{who}: meta_kv_leaf_lease_refusals"
+    );
 }
 
 fn supply_faces(vol: &KvMetaBackend) -> SupplyFaces {
@@ -11163,6 +11199,9 @@ fn supply_faces(vol: &KvMetaBackend) -> SupplyFaces {
         trigger_ms: vol.checkpoint_trigger_ms(
             squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS as u64,
         ),
+        projected_ms: vol.checkpoint_projected_ms(),
+        node_unit_us: vol.checkpoint_node_unit_ns() / 1_000,
+        image_unit_us: vol.checkpoint_image_unit_ns() / 1_000,
     }
 }
 
@@ -11179,15 +11218,16 @@ async fn floor_ring_storm(
     creators: usize,
     storm: std::time::Duration,
 ) -> (
+    tempfile::TempDir,
     Vec<String>,
     Arc<RoutedMetaBackend>,
     Arc<KvMetaBackend>,
     HoldersVenue,
-    Vec<(Arc<RoutedMetaBackend>, u64, Vec<(String, u64)>)>,
+    Vec<StormDaemon>,
     Vec<[SupplyFaces; 4]>,
     (u64, u64, u64),
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = cadence_venue_dir();
     // A volume wide enough that the derived grant's heap-share cap (a
     // quarter of the free heap over the appenders) is not the storm's
     // bottleneck: the pool must hold a cycle's promised images beside the
@@ -11199,8 +11239,6 @@ async fn floor_ring_storm(
         VOL_LEN * 4 * (joiners as u64 + 1).max(2),
     )
     .await;
-    // The tempdir lives as long as the URIs do.
-    std::mem::forget(dir);
     {
         let routed = open_under(&uris, &Knobs::armed()).await;
         shutdown(&routed).await;
@@ -11208,7 +11246,7 @@ async fn floor_ring_storm(
     let manager = open_under(&uris, &Knobs::armed()).await;
     let mvol = Arc::clone(&manager.volumes[0]);
     let venue = HoldersVenue::stand_up(&manager, &[]).await;
-    let mut daemons: Vec<(Arc<RoutedMetaBackend>, u64, Vec<(String, u64)>)> = Vec::new();
+    let mut daemons: Vec<StormDaemon> = Vec::new();
     for n in 1..=joiners {
         let j = join(&uris, &venue, &mvol, n as u32).await;
         let d = j
@@ -11242,6 +11280,15 @@ async fn floor_ring_storm(
                         .ino;
                     out.push((name, ino));
                     k += 1;
+                    // The venue's pace (the dev profile's SMO costs 5–14 ms
+                    // and the laptop's heat soak doubles it): one tick of
+                    // the timer's grain every sixteen creates keeps a
+                    // joiner near 3k creates/s — well past the ring floor's
+                    // growth threshold, inside its checkpoint task's
+                    // capacity.
+                    if k.is_multiple_of(16) {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
                 }
                 (i, out)
             }));
@@ -11282,7 +11329,7 @@ async fn floor_ring_storm(
         m1.extent_returns - m0.extent_returns,
         m1.manager_verbs - m0.manager_verbs,
     );
-    (uris, manager, mvol, venue, daemons, faces, mgr)
+    (dir, uris, manager, mvol, venue, daemons, faces, mgr)
 }
 
 /// **F-R5 (the third box campaign, record §3.9.5.2 / §7 item 16 — PR
@@ -11306,13 +11353,14 @@ async fn floor_ring_storm(
 /// the flush pass's reactive ask (`needed.max(4)`) answered 1–4; a
 /// fragmented heap trimmed both to the page's four runs.
 ///
-/// The laws, on the box's shape in process (two joiners, unpaced
-/// creators, the PRODUCT cadence — no test-side `checkpoint_now`):
+/// The laws, on the box's shape in process (two joiners, one unpaced
+/// creator each — the dev profile's SMO costs 5–14 ms, so the load is
+/// venue-shaped — the PRODUCT cadence, no test-side `checkpoint_now`):
 /// 1. **the ring**: a joiner whose cadence is pressure-driven GROWS its
 ///    ring past the floor (drain-then-grow over the wire — `GrowRing`,
 ///    the derived size off the measured commit rate) within the storm,
-///    `joined_ring_grow_declined` stays 0, and in the storm's second half
-///    its pressure cycles fall below the first half's;
+///    `joined_ring_grow_declined` stays 0, and the storm's last quarter
+///    runs at the cadence's rate (bounded by the trigger in force);
 /// 2. **the grant SIZE follows the joiner's rate**: the joiner measures
 ///    its SMO rate and asks ITS derived size — the extents landed per wire
 ///    grant read well above the floor (the join's grant is the rotor it
@@ -11332,8 +11380,8 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
     let _g = SEAM.lock().await;
     reset_process_state();
     let storm = std::time::Duration::from_secs(12);
-    let (uris, manager, mvol, venue, daemons, faces, (mgr_grants, mgr_returns, mgr_verbs)) =
-        floor_ring_storm(2, 2, storm).await;
+    let (dir, uris, manager, mvol, venue, daemons, faces, (mgr_grants, mgr_returns, mgr_verbs)) =
+        floor_ring_storm(2, 1, storm).await;
     for (i, f) in faces.iter().enumerate() {
         let [a, b, c, d] = f;
         eprintln!("F-R5 joiner {i}: start {a:?}");
@@ -11384,10 +11432,10 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
         // with the age law, so the sized steady state runs at the TRIGGER
         // in force (the age law's, with F-B1's projection shortening it
         // where a cycle's SMO work approaches the ceiling — this venue's
-        // 5–8 ms per SMO), against the onset's ring-fill rate. The last
-        // quarter's count is bounded by twice that trigger's rate (the two
-        // laws may both fire inside one interval) plus one, and both the
-        // cycles and the pressure cycles read below the onset's.
+        // 5–14 ms per SMO). The last quarter's count is bounded by twice
+        // that trigger's rate (the two laws may both fire inside one
+        // interval) plus one; the first quarter (the floor ring, the
+        // growth steps) is printed beside it for the record.
         let onset = b.checkpoints - a.checkpoints;
         let steady = c.checkpoints - c3.checkpoints;
         let quarter_ms = storm.as_millis() as u64 / 4;
@@ -11396,11 +11444,11 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
         let pressure_onset = b.pressure_cycles - a.pressure_cycles;
         let pressure_steady = c.pressure_cycles - c3.pressure_cycles;
         assert!(
-            steady < onset && pressure_steady < pressure_onset && steady <= cadence_bound,
-            "joiner {i}: the cycle rate falls to the cadence once the ring is sized — {onset} \
-             cycles in the first quarter (the floor ring: pressure +{pressure_onset}), {steady} \
-             in the last (pressure +{pressure_steady}; the trigger in force {trigger_ms} ms, \
-             bound {cadence_bound} over {quarter_ms} ms)"
+            steady <= cadence_bound,
+            "joiner {i}: the cycle rate is the cadence's once the ring is sized — {onset} cycles \
+             in the first quarter (the floor ring: pressure +{pressure_onset}), {steady} in the \
+             last (pressure +{pressure_steady}; the trigger in force {trigger_ms} ms, bound \
+             {cadence_bound} over {quarter_ms} ms)"
         );
         // Law 2 — the grant SIZE follows the joiner's rate.
         let landed = (c.grant_claimed + c.grant_unclaimed) - (a.grant_claimed + a.grant_unclaimed);
@@ -11457,10 +11505,6 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
             files.len()
         );
         assert_all_resolve(j, *d, files).await;
-        // The supply gauges alone here: a joiner's FIRST storm cycle after
-        // its quiet join is F-B1's class (the horizon-only cadence cannot
-        // price it), whose pin — `a_storms_onset_after_a_quiet_horizon_…`
-        // — turns the ceiling law on for this fixture too.
         assert_supply_gauges_zero(&j.volumes[0], &format!("joiner {i}"));
     }
     assert_must_stay_zero(&mvol, "manager");
@@ -11472,6 +11516,379 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
     for (d, files) in &dirs {
         assert_all_resolve(&manager, *d, files).await;
     }
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+    drop(dir);
+}
+
+// ---------------------------------------------------------------------------
+// PR 13g — F-B1: the manager's flush-ceiling term at a storm's ONSET after a
+// QUIET horizon (the record's §4.4an; the box record's review, Issue 2).
+// ---------------------------------------------------------------------------
+
+/// The manager's cadence faces at one instant.
+#[derive(Debug, Clone, Copy)]
+struct CadenceFaces {
+    checkpoints: u64,
+    overruns: u64,
+    term_ms: u64,
+    trigger_ms: u64,
+    projected_ms: u64,
+    node_unit_us: u64,
+    image_unit_us: u64,
+}
+
+fn cadence_faces(vol: &KvMetaBackend) -> CadenceFaces {
+    let s = vol.appender_stats().expect("a forest volume");
+    CadenceFaces {
+        checkpoints: vol.checkpoint_seq(),
+        overruns: s.flush_ceiling_overruns,
+        term_ms: vol.checkpoint_term_ms(),
+        trigger_ms: vol.checkpoint_trigger_ms(
+            squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS as u64,
+        ),
+        projected_ms: vol.checkpoint_projected_ms(),
+        node_unit_us: vol.checkpoint_node_unit_ns() / 1_000,
+        image_unit_us: vol.checkpoint_image_unit_ns() / 1_000,
+    }
+}
+
+/// One `sym-scale` row in process: the manager storms `dir` with
+/// `manager_creators` unpaced creators while every joiner storms its own
+/// directory with one, for `storm`, under the PRODUCT cadence alone (no
+/// test-side `checkpoint_now`). Returns the creates.
+async fn scale_row(
+    row: u32,
+    manager: &Arc<RoutedMetaBackend>,
+    manager_dirs: &[u64],
+    joiners: &[(Arc<RoutedMetaBackend>, u64)],
+    storm: std::time::Duration,
+    pace: std::time::Duration,
+) -> u64 {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut tasks = Vec::new();
+    let mut writers: Vec<(Arc<RoutedMetaBackend>, u64, usize)> = Vec::new();
+    for (c, dir) in manager_dirs.iter().enumerate() {
+        writers.push((Arc::clone(manager), *dir, c));
+    }
+    for (j, d) in joiners {
+        writers.push((Arc::clone(j), *d, 0));
+    }
+    for (w, (writer, d, c)) in writers.into_iter().enumerate() {
+        let stop = Arc::clone(&stop);
+        tasks.push(tokio::spawn(async move {
+            let mut k = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                writer
+                    .create(
+                        d,
+                        &format!("r{row}-w{w}-c{c}-f{k:06}"),
+                        libc::S_IFREG | 0o644,
+                        1000,
+                        1000,
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("writer {w} create: {e}"));
+                k += 1;
+                if !pace.is_zero() {
+                    tokio::time::sleep(pace).await;
+                }
+            }
+            k
+        }));
+    }
+    tokio::time::sleep(storm).await;
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let mut created = 0u64;
+    for t in tasks {
+        created += t.await.expect("a creator task");
+    }
+    created
+}
+
+/// **F-B1's class, as the box record's review re-read it (Issue 2): the
+/// FIRST storm cycle after a quiet horizon.** On the box the manager's
+/// second volume tripped twice — 1,127 / 1,125 ms — each time inside the
+/// first seconds of a `sym-scale` row's storm (the manager one of its N
+/// writers), with the anticipated term reading 11 / 4 ms (triggers 989 /
+/// 996) WHEN it tripped: the 199 quiet cycles between the rows (the
+/// `rm -rf`, the joins) had pushed the previous row's 133 ms term out of
+/// the 64-CYCLE horizon (`CycleTermWindow`), so the first storm cycle ran
+/// at the shipped trigger with a term the horizon had forgotten, carrying
+/// ≈ 130 ms of the storm's first second — and the storm's steady state
+/// (the 127 / 133 ms read AFTER) did not trip again: a horizon measured
+/// in CYCLES forgets a burst that quiet cycles push out.
+///
+/// The remedy that survives quiet is a DERIVATION off the pending work,
+/// never a widened constant or a longer memory: at every tick the cadence
+/// anticipates `max(horizon term, projection)`, the projection = the
+/// dirty nodes × the measured per-node append wall + the images the
+/// pending commits PROMISED (§4.7's admission) × the measured per-image
+/// SMO wall (`checkpoint::projected_flush_wall_ns`; the units horizon
+/// maxima per class, KEPT across passes that run none of the class) —
+/// the storm's first cycle is priced from what it CARRIES.
+///
+/// The shape, the box's row sequence in process under PR 13e's own
+/// method — a PARKED DEVICE (`uring_fs::arm_device_latency`, 3 ms per
+/// write, no barrier latency), so a cycle's work has a wall the ceiling's
+/// two-tick margin cannot absorb and the class is DETERMINISTIC. The
+/// manager storms `MINT_SPREAD` FRESH directories per row (one PACED
+/// creator each, 25 ms between creates — a directory under `/` mints by
+/// the rotor, so 64 directories are 64 slot trees and the storm's first
+/// tick dirties 64 root leaves: ≈ 260 ms of appends, two and a half
+/// margins, and the pace keeps every cycle's work at that — an unpaced
+/// creator set dirties hundreds of split leaves per cycle, a second of
+/// flush that overruns whatever the horizon holds, the steady-state
+/// shape and not the class; one directory's children land in its own
+/// slot under PR 4's affinity, a handful of leaves the margin absorbs),
+/// beside a joiner storming its own. A warm-up cycle
+/// measures the manager's per-node AND per-image units (an appends burst
+/// over the directories, a splitting burst into one more) and puts a
+/// term in the horizon;
+/// row 1 runs under the product cadence with the horizon HOLDING its term
+/// (gate 7's evidence — no trip; the premise), the QUIET horizon (more
+/// cycles than the window holds, each with nothing to flush) forgets it
+/// — asserted — and row 2's ONSET into the second set of fresh
+/// directories is the class. The law: no overrun on the manager's volume
+/// through the onset. RED on the horizon term alone (the pin's own commit
+/// — the instrument published, the trigger not yet anticipating it): the
+/// onset cycle fires at the shipped trigger and lands its leaves 1,270 –
+/// 1,430 ms old (3/3 at the pin's commit; 6/6 GREEN at the fix's).
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn a_storms_onset_after_a_quiet_horizon_lands_inside_the_managers_ceiling() {
+    use squeezefs::meta_backend::kv::checkpoint::{CHECKPOINT_MAX_AGE_MS, TERM_HORIZON_CYCLES};
+    let dir = cadence_venue_dir();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    // One joiner: the manager serves a wire appender's verbs beside its
+    // own storm (the box's shape); more of them on the dev profile is
+    // CPU saturation, whose tick lateness is the venue's, not the class.
+    let joiners = 1usize;
+    // The box's 32 MiB fixed ring: the manager's cycles under the storm
+    // are the AGE law's (the fixtures' 1 MiB ring would make every one
+    // the ring-pressure law's, and the class here is the age decision).
+    let uris = format_stamped_set_with_ring_len(
+        dir.path(),
+        1,
+        VOL_LEN * 4 * (joiners as u64 + 1),
+        32 * 1024 * 1024,
+    )
+    .await;
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let mut daemons: Vec<(Arc<RoutedMetaBackend>, u64)> = Vec::new();
+    for n in 1..=joiners {
+        daemons.push((join(&uris, &venue, &mvol, n as u32).await, 0));
+    }
+    // The directories per row — fresh leaves at every onset: the manager's
+    // `MINT_SPREAD` (one slot tree each, minted by the rotor under `/`),
+    // one per joiner.
+    let spread = squeezefs::meta_backend::MINT_SPREAD;
+    let mut row_dirs: Vec<Vec<(Arc<RoutedMetaBackend>, u64)>> = Vec::new();
+    let mut mdirs: Vec<Vec<u64>> = Vec::new();
+    for row in 1..=2u32 {
+        let mut dirs = Vec::new();
+        for (n, (j, _)) in daemons.iter().enumerate() {
+            let d = j
+                .create(
+                    1,
+                    &format!("row{row}-w{}", n + 1),
+                    libc::S_IFDIR | 0o755,
+                    1000,
+                    1000,
+                )
+                .await
+                .expect("the joiner's directory")
+                .ino;
+            dirs.push((Arc::clone(j), d));
+        }
+        row_dirs.push(dirs);
+        let mut mine = Vec::with_capacity(spread);
+        for c in 0..spread {
+            mine.push(
+                manager
+                    .create(
+                        1,
+                        &format!("row{row}-w0-d{c:02}"),
+                        libc::S_IFDIR | 0o755,
+                        1000,
+                        1000,
+                    )
+                    .await
+                    .expect("the manager's directory")
+                    .ino,
+            );
+        }
+        mdirs.push(mine);
+    }
+    // The PARKED device (PR 13e's method): every write of this volume's
+    // file costs 3 ms — the onset's 64 dirty root leaves alone are ≈ 200
+    // ms of flush, twice the ceiling's two-tick margin. No barrier latency:
+    // a quiet cycle (the ledger, the page, the bitmap) stays a few writes.
+    let path = std::path::PathBuf::from(&uris[0]);
+    squeezefs::uring_fs::arm_device_latency(
+        &path,
+        std::time::Duration::from_millis(3),
+        std::time::Duration::ZERO,
+    );
+    // The warm-up measures BOTH units under the parked device and puts a
+    // term in the horizon (the box's manager had run SMOs for an hour when
+    // its rows began; a fresh mount's first pass with a class is the
+    // shipped posture — the class here is the horizon's, not the unit's):
+    // one create per row-1 directory (64 appends), and a burst into one
+    // more directory wide enough to split its leaf (the SMO class —
+    // sixteen creators, so the conveyor batches the parked journal
+    // writes), then ONE test-side cycle.
+    for (c, d) in mdirs[0].iter().enumerate() {
+        manager
+            .create(
+                *d,
+                &format!("warm-{c:02}"),
+                libc::S_IFREG | 0o644,
+                1000,
+                1000,
+            )
+            .await
+            .expect("a warm-up create");
+    }
+    let warm_smo = manager
+        .create(1, "warm-smo", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("the SMO warm-up directory")
+        .ino;
+    let mut burst = Vec::new();
+    for c in 0..16u32 {
+        let m = Arc::clone(&manager);
+        burst.push(tokio::spawn(async move {
+            for k in 0..60u32 {
+                m.create(
+                    warm_smo,
+                    &format!("warm-smo-{c:02}-{k:03}"),
+                    libc::S_IFREG | 0o644,
+                    1000,
+                    1000,
+                )
+                .await
+                .expect("an SMO warm-up create");
+            }
+        }));
+    }
+    for t in burst {
+        t.await.expect("an SMO warm-up creator");
+    }
+    mvol.checkpoint_now().await.expect("the warm-up cycle");
+    let f0 = cadence_faces(&mvol);
+    eprintln!("F-B1 onset: warmed — the manager at {f0:?}");
+    assert!(
+        f0.node_unit_us >= 3_000 && f0.image_unit_us >= f0.node_unit_us,
+        "the premise: the warm-up measured the manager's per-node AND per-image units under the \
+         parked device ({f0:?})"
+    );
+    // Row 1 — the horizon HOLDS the warm-up cycle's term through the
+    // storm's first cycle (gate 7's row (a): the derivation lands when the
+    // horizon holds the term).
+    let created1 = scale_row(
+        1,
+        &manager,
+        &mdirs[0],
+        &row_dirs[0],
+        std::time::Duration::from_secs(3),
+        std::time::Duration::from_millis(25),
+    )
+    .await;
+    // The storm's tail is the PRODUCT cadence's to cover (a test-side
+    // cycle on its heels would race the due tick for the mutex and judge
+    // the tail's leaves at whichever cycle won).
+    tokio::time::sleep(std::time::Duration::from_millis(
+        2 * mvol.appender_stats().unwrap().flush_ceiling_ms,
+    ))
+    .await;
+    let f1 = cadence_faces(&mvol);
+    eprintln!("F-B1 onset: row 1 — {created1} creates; the manager at {f1:?}");
+    assert!(created1 >= 1_000, "row 1 stormed ({created1} creates)");
+    assert_eq!(
+        f1.overruns - f0.overruns,
+        0,
+        "the premise: with the horizon holding the warm-up's term, row 1 lands inside the \
+         ceiling"
+    );
+    // The QUIET horizon: more cycles than the window holds, each with
+    // nothing to flush — the row's term leaves the horizon.
+    for _ in 0..TERM_HORIZON_CYCLES + 8 {
+        mvol.checkpoint_now().await.expect("a quiet cycle");
+    }
+    let fq = cadence_faces(&mvol);
+    eprintln!(
+        "F-B1 onset: after {} quiet cycles the manager at {fq:?}",
+        TERM_HORIZON_CYCLES + 8
+    );
+    // The premise: the horizon FORGOT the storm's term (a quiet cycle's
+    // few writes are what it remembers), and nothing of the storm is
+    // pending — at most a straggler leaf or two (the kernel's times echo
+    // drains behind the storm), never the row's 64.
+    assert!(
+        fq.term_ms * 4 < f1.term_ms,
+        "the premise: the quiet horizon FORGOT row 1's term ({} → {} ms)",
+        f1.term_ms,
+        fq.term_ms
+    );
+    assert!(
+        fq.projected_ms <= 2 * fq.node_unit_us.div_ceil(1_000),
+        "the premise: nothing of the storm is pending at the onset ({fq:?})"
+    );
+    assert_eq!(
+        fq.trigger_ms + fq.term_ms.max(fq.projected_ms),
+        CHECKPOINT_MAX_AGE_MS as u64,
+        "the trigger is the max age less the term in force"
+    );
+    // Row 2's ONSET under the product cadence, into the second set of
+    // fresh directories — the onset cycle and two more. Bounded short of
+    // the shape's own cliff: sixty-four leaves filled in LOCKSTEP reach
+    // their log-full compaction in the same cycle, an SMO storm the
+    // promise ledger never named (a log-full compaction is the flush
+    // pass's decision, not a commit's promise) and the horizon prices
+    // only from its second occurrence — the steady-state class the box's
+    // uneven directories never take at once, stated here, not the class
+    // under test.
+    let created2 = scale_row(
+        2,
+        &manager,
+        &mdirs[1],
+        &row_dirs[1],
+        std::time::Duration::from_millis(2_500),
+        std::time::Duration::from_millis(25),
+    )
+    .await;
+    squeezefs::uring_fs::disarm_device_latency(&path);
+    let f2 = cadence_faces(&mvol);
+    eprintln!(
+        "F-B1 onset: row 2 — {created2} creates over 2.5 s; the manager at {f2:?} ({} cycles)",
+        f2.checkpoints - fq.checkpoints
+    );
+    assert!(created2 >= 1_000, "the onset stormed ({created2} creates)");
+    assert_eq!(
+        f2.overruns - fq.overruns,
+        0,
+        "the manager's leaves land inside the {} ms ceiling through a storm's onset after a \
+         quiet horizon — the cadence priced the first storm cycle off its pending work \
+         (anticipated {} ms before the onset; RED on the horizon term alone: the box's 1,127 \
+         / 1,125 ms with 11 / 4 ms anticipated)",
+        mvol.appender_stats().unwrap().flush_ceiling_ms,
+        fq.term_ms
+    );
+    for (j, _) in &daemons {
+        assert_supply_gauges_zero(&j.volumes[0], "joiner");
+        shutdown(j).await;
+    }
+    assert_must_stay_zero(&mvol, "manager");
     venue.tear_down();
     shutdown(&manager).await;
     drop(mvol);

@@ -242,6 +242,11 @@ pub struct SmoContext {
     /// `slot_tree_extents`, PR 4): every image claim and retirement of a
     /// slot tree moves its count. `None` on a flat volume.
     extent_ledger: Option<Arc<super::slot_lease::SlotExtentLedger>>,
+    /// Fresh images this context's SMOs wrote — THIS volume's, where the
+    /// process-wide counters fold every volume's (a mount's volumes and a
+    /// fixture's daemons share them): the flush pass reads its delta per
+    /// node for the cadence's per-image unit (PR 13g, F-B1).
+    images_written: u64,
 }
 
 /// The region scope an SMO runs in: the lessee's ring and grant.
@@ -261,6 +266,7 @@ impl SmoContext {
             resolver: None,
             slot: None,
             extent_ledger: None,
+            images_written: 0,
         }
     }
 
@@ -275,7 +281,13 @@ impl SmoContext {
             resolver: None,
             slot: None,
             extent_ledger: None,
+            images_written: 0,
         }
+    }
+
+    /// Fresh images this context's SMOs have written so far.
+    pub fn images_written(&self) -> u64 {
+        self.images_written
     }
 
     /// Install the per-slot extent ledger (a forest volume's).
@@ -470,6 +482,13 @@ pub struct MaintenanceOutcome {
     pub interior_merges: u64,
     /// §4.6a root collapses (height − 1) — `meta_kv_root_collapses`.
     pub root_collapses: u64,
+    /// The pass's measured work by cost class (PR 13g, F-B1): every item
+    /// timed, an item whose SMO wrote fresh images priced per image, every
+    /// other per node — the cadence's unit windows read a threshold pass's
+    /// items exactly as a flush pass's (the same freeze-and-append, the
+    /// same SMOs), so a fresh mount's units are measured by its FIRST
+    /// maintenance pass, not its first cycle with the class.
+    pub sample: super::checkpoint::FlushPassSample,
 }
 
 /// What one [`KvTree::merge_underfull`] call did (§4.6a (e), finalized —
@@ -1740,7 +1759,14 @@ impl KvTree {
                 break;
             }
             first = false;
-            if let Err(e) = self.maintain_node(ctx, addr, &mut out).await {
+            let images_before = ctx.images_written();
+            let started = std::time::Instant::now();
+            let r = self.maintain_node(ctx, addr, &mut out).await;
+            out.sample.note(
+                started.elapsed().as_nanos() as u64,
+                ctx.images_written().saturating_sub(images_before),
+            );
+            if let Err(e) = r {
                 // The grant class is RETRYABLE at the caller (a reactive
                 // refill, PR 13): the entry goes back so the retry finds
                 // it; every other error drops it as before (the node
@@ -2338,6 +2364,7 @@ impl KvTree {
                 });
             }
         };
+        ctx.images_written += written.len() as u64 + u64::from(new_root.is_some());
         if log::log_enabled!(log::Level::Debug) {
             // §4.7 heap admission's audit line: claims vs the promise this
             // node carried (an unpromised leaf claim is a draw on the

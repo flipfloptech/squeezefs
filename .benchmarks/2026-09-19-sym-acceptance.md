@@ -1793,6 +1793,132 @@ the 3b shape, unplanned in the join storm).
 | **F-B2** — a LIVE holder recalled once by a 64-touch burst (`OfferDominated`, `N_floor` 2) | `ops_h` counts the holder's work on the slot's SUBTREE across volumes | **FIXED — a VERDICT**: 384 touches into a LIVE holder's tree over two fresh fleets at `N_floor` 2, **0 handovers** (§3.9.4.3); the IDLE arm still moves an idle tree in 4–5 bursts (6.7–7.5 ms). The PAUSED law was NOT exercised on the box (§4.4aj — its job never ran); it runs on the laptop with the fixed harness and is owed to the next box session. |
 | **F-B1** — `appender_flush_ceiling_overruns` tripped 4× in 12 min on PR 13b (1–32 ms past the 1,100 ms ceiling, no recovery in flight) | the audit EXCLUDES the SMO mutex's structural holds (an overlap-bounded exclusion, capped and published); **the MARGIN's derivation stays §7 item 3, PR 14's** | **NOT FIXED on the box — the tripwire still trips, and the exclusion excused NOTHING**: on PR 13c's binary the gauge moved **six increments on five writers in 45 minutes of fleet time**, each placed by its snapshots — the 8-writer scale fleet **four** (m0 [1, 1] between the rows at the N = 8 joins, m61 [0, 1] between the rows, m63 [0, 1] in N = 8's ingest — §3.9.4.2), the 8-writer touch fleet **one** (m60 at **1,116 ms**, in the QUIET window after the phases — §3.9.4.3), the 32-writer walls fleet **one** (m65 at **1,206 ms**, in the rewrite — above). **Two of the six have a WARN line** (m60 / m65 — the daemon logs kept since H-R2; both read `… exceeded the 1100 ms landing ceiling with every structural hold's capped overlap excluded`), so the AGE range 16 / 106 ms past the ceiling is theirs alone; **the scale fleet's four have NO age reading** (their logs died with the teardown). What every one of the six HAS is the `.stats` reading `appender_flush_ceiling_excused_ns` 0, `…_service_extensions` 0, `…_recovery_extensions` 0, `…_excused_max_ms` 0 on every writer of every fleet, `…_service_cap_ms` 1,100 published — so the conclusion holds for all six: **what the exclusion did NOT explain is EVERYTHING the box reads**, the class is not another actor's hold of the SMO mutex. **One of the six (m60) is established as NOT under a storm** — its snapshots and log place it in the quiet window after the phases; the other five are under load: m63's ingest, m65's rewrite, and the three "between the rows" trips (m0 ×2, m61) fall in `sym-scale`'s per-N teardown, where every writer `rm -rf`s its 20,000-file tree (`run_mw_matrix.sh`, the `scale-*-n$n-w$idx` removal — a 20k-unlink storm per writer) before the next row's joins, the joins themselves carrying the manager's grant / checkpoint work — so those three are under their own unlink storms + the m63..m66 joins, not quiet; the attribution "the pass's own wall OR the tick's / covering barrier's lateness" is by ELIMINATION, because **no pass-wall / checkpoint-cycle histogram exists in the stats** (no `checkpoint_phase_ns`-class key — the age at the covering barrier is the only word the audit records) — **that instrument is the first thing PR 13e's / §7 item 3's margin derivation must add: a margin "derived from the measured pass wall" needs the pass wall measured, per cycle, on every writer.** Until the derivation lands, every N-writer row set on the box stops at its first trip, as the counted-run law requires, and the design's gates 3 / 3c / 7 cannot read MET as row sets whatever their rates say. **The gauge's verdict on the flip: NOT YET.** |
 
+#### 3.9.5 The third pass — PR 13e / 13f's binary (`b377cbb8`) — `perf/sym-box-13e`, 2026-09-23 01:53 → (this section is filled per row; the closing time is the last row's): **gate 1 MET as the design states it — `rename` PAR (1.012 / 0.998) and `unlink` B AHEAD (1.054 / 1.042, both orders; the setattr / unlink future term of PR 13f is a VERDICT on the box), `rr4k` PAR, `rw4k` / `w_fresh` / remount within noise, `mount` +0.1 s on a 0.4 s event (within noise in bracket 1, DELTA by 0.03 over a 30 % band in bracket 2), a reproducible +0.5–0.9 s on the clean UNMOUNT after `rw4k` (the rig's own row, not a gate law — pre-13e/13f, priced for PR 14)**
+
+**The counted-run law**: every row set below ran FROM ZERO on PR 13e /
+13f's binary; nothing from §3.9.4 is creditable. Gates 2 / 3b / 5 (MET
+on the previous binaries) were NOT re-run (minimum count — they rerun
+once on PR 14's flip binary). The row sets: gate 1 (ONE A-B-B-A + the
+reversed bracket for the rows that read DELTA), gate 3 (`sym-scale`
+N = 1/2/4/8 as ONE row set, judged on F-B1), gate 3c (`sym-foreign-touch`
+×2 on fresh fleets — the PAUSED law's first real run on any venue, F-R3's
+and F-R4's verdicts), gate 7 (`sym-walls` at N = 32 ×2 on fresh fleets,
+the `/proc/diskstats` face on row (a) for the first time).
+
+**Venue (re-verified 01:53 UTC, 2026-09-23, before the first leg):**
+`squeeze-test` (`memp-s3ds-aqs-37`), 32-core Xeon, 251 GiB, Rocky 8.10,
+**kernel `6.19.14-sqz`** (the sqz series incl. patch 0031 — the per-queue
+bg budget, since 2026-09-06), up 1 d 0 h 45 at the first leg, load 0.00,
+no Lustre / lnet modules, docker inactive, lnet failed (inactive), no
+daemon, only `fusectl` mounted, no `/run/squeezefs-mwfleet*` /
+`-devsub-*` (`/run/squeezefs/` holds the box-rows rung's four stale IL
+sockets, as the re-run found them), no netns / veth / `pref 40` rules,
+246 G free on `/scratch`; the reset-v5 converged fabric (5 storage
+nodes × (1 meta + 2 data) memory-backed null_blk namespaces over
+nvme-tcp, the client's 15 controllers connected as the re-run left them;
+the storage nodes' `squeezefs 1.1.0` copies serve the reset script's
+`nvmeof` verbs — NOT refreshed, as before). Gate 1 ran on the fabric via
+the reset script; the N-writer gates on the box's own tcp devsub
+(nvmet-tcp on `127.0.0.1`, `resv_enable=1`, `lzo-rle` zram,
+`SQZ_MWFLEET_OSS_GB=16`, `--venue=box` on every leg). **Arms:** **A** =
+`3228fcb8` (reused — sha256 `993100757bde…d69b1` verified on the box);
+**B** = `b377cbb8` (= the code tip `7d8d9807` + PR 13f + 13d + PR 15's rig
++ the box re-run record; the batch `task check` GREEN on it) — built by
+the orchestrator (`task build:rocky8`, the `release` profile, from a
+detached checkout at that sha), staged at `/tmp/grok-justin/box-13e/arms/`,
+`sha256sum -c` OK on both sides: **`squeezefs 1.2.4 (b377cbb8696e /
+b377cbb8696ead8d45b483b2931620cbe86979d3) built 2026-09-23T01:43:06Z
+profile release`**, sha256
+`b0ec7d65ec7d9d657ca28863ab51e36d01ff8906a466e83139258cc025128435`
+(shim `6789dd591c3d…689fc5dd`), placed as
+`/scratch/tmp/sym-box/squeezefs-B-b377cbb8` and as `/scratch/tmp/squeezefs`
+(the reset script's client binary; `squeezefs-B-77f4da1d` and
+`squeezefs-B` kept beside it for provenance). Both arms `release` (the
+two-profile law). **Instrument:** PR 1's rig at its 2026-09-22 revision
+(RT = 60 s honoured, the ten data namespaces' `/proc/diskstats` per row),
+the reducer verbatim; `fio-3.36`, the box's standing job files (libaio,
+`direct=1`, 24 jobs, `ramp_time=10`); for the N-writer legs the driver
+`2026-09-21-sym-box-brackets.sh` + `run_mw_matrix.sh` at THIS branch's
+revision (`8c2da0dc`: the sym WRITE rows bracket their writes with the
+data namespaces' `/proc/diskstats` and print device ÷ user + `wareq-sz`;
+every sym row prints F-B1's faces per writer —
+`appender_flush_ceiling_overruns`, `meta_kv_checkpoint_{term,trigger}_ms`,
+the excused Σ; the foreign-touch leg keeps every touch's per-create
+status and dies on an errno to the application; `xv_cross_owner_
+dangling_names` joins `SYM_ZERO_KEYS`). The laptop stayed idle through
+the session (the batch gate on `b377cbb8` was running on it — nothing of
+this rung ran there).
+
+##### 3.9.5.1 Gate 1 — the solo re-gate, flat A vs flat B (01:59 → 02:31 UTC bracket 1, A B B A, all rows at RT = 60; 02:35 → 02:57 the reversed bracket, B A A B, `ROWS="mdstorm mount rw4k-kern remount"` — the shapes of the two rows that read DELTA): **`rename` 1.012 / 0.998 PAR and `unlink` 1.054 / 1.042 — B AHEAD in BOTH orders (every B above every A) — PR 13f's fix CLOSES the re-run's two DELTA rows on the box; `rr4k` 1.005 PAR; `rw4k` 0.984 / 1.015, `w_fresh` 0.991, remount 0.947 / 0.931, `mkdir` / `stat` / `manydirs` / `rmdir` within noise; `create` 0.981 / 0.972 within noise by the 3 % floor (a reproducible −1.9…−2.8 %, every B below every A); `mount` 1.251 (within a 31.5 % band) / 1.326 (DELTA by 0.03 over a 29.7 % band) — B's FIRST mount of a fresh set ≈ +0.1 s on a 0.4 s event; `umount` 1.109 / 1.388 DELTA in both brackets — the clean unmount after `rw4k` +0.5–0.9 s (B 8.1–8.5 s vs A 6.4–7.7 s outside the first-position outliers)**
+
+**Verdict table (the two brackets, PR 1's rule: within noise iff |B/A − 1| ≤ max(band, 3 %)):**
+
+| row | bracket 1 (A B B A) B/A · band | bracket 2 (B A A B) B/A · band | positions (bracket 1 ; bracket 2) | **verdict** |
+|---|---|---|---|---|
+| `wfresh-kern` MiB/s (60 s) | **0.991 · 3.0 %** | — | A 34,789 / 33,764 — B 33,591 / 34,375 | **within noise** (−0.9 %) |
+| `rr4k-kern` IOPS (60 s) | **1.005 · 0.5 %** | — | A 593,990 / 596,858 — B 598,916 / 598,049 | **PAR** (the re-run's 0.999 again; daemon 27.9–28.1 µs/op on both arms, the zc bridge hops identical to 0.1 µs) |
+| `rw4k-kern` IOPS (60 s) | **0.984 · 1.0 %** | **1.015 · 4.3 %** | A 538,061 / 535,956 ; 538,072 / 515,573 — B 525,563 / 531,051 ; 537,547 / 532,309 | **within noise** — the re-run's reproducible −3.0 % narrowed to −1.6 % in bracket 1 and did NOT reproduce in bracket 2 (B1 537.5k ≡ A2 538.1k; A3's 515.6k is the bracket's outlier); the `write` handler's future (20 KiB, PR 14's follow-on) reads as +0.4–0.6 µs/op of `fuse3-ur` in bracket 1 and 0 in bracket 2 |
+| `mount` s (first mount of the fresh set) | 1.251 · 31.5 % | **1.326 · 29.7 % DELTA** | A 0.382 / 0.525 ; 0.401 / 0.371 — B 0.533 / 0.602 ; 0.588 / 0.436 | within noise in bracket 1, DELTA by 0.03 over the band in bracket 2 — **B's first mount ≈ +0.10–0.12 s on a 0.4 s event** (B 0.44–0.60 s, A 0.37–0.53 s; the re-run read 1.13 on 0.41–0.59 s); a sub-second event the rig resolves at 30 % bands — stated, not convicted; PR 14's bracket reads it with a ms-grained mount tape if it stands |
+| `remount` s | 0.947 · 16.2 % | 0.931 · 12.9 % | 0.54–0.64 s both arms | within noise (B ahead) |
+| `umount` s (the clean unmount after `rw4k`) | **1.109 · 1.3 % DELTA** | **1.388 · 33.7 % DELTA** | A 7.617 / 7.602 ; 6.411 / 7.704 — B 8.385 / 8.497 ; 11.446 / 8.142 | **DELTA in both brackets** — outside the first-position outliers (B1 11.4 s here; the re-run's A1 13.5 s) B 8.1–8.5 s vs A 6.4–7.7 s, +0.5–0.9 s; the whole unmount is the `Force flushing all in-memory write buffers` step (8 → 9 s at the ladder's second precision; nothing else in the ladder moves); the same +0.8–1.0 s sat in the re-run's three non-outlier positions (A 7.6 vs B 8.6–8.7 on `77f4da1d`), so it is NOT 13e / 13f's term. Not a gate-1 law (the design names MOUNT time); the end-of-`rw4k` state is the same shape on both arms (`patch_ineligible_overlay` 5.4–5.7 M, 24 open rewrite epochs, `write_through_blocks` 4.4–4.8k, no parked extents) — the flush step has no phase instrument; PR 14 prices it |
+| `mdstorm mkdir` ops/s | 0.993 · 4.8 % | 0.983 · 1.6 % | A 6,505 / 6,775 ; 6,621 / 6,575 — B 6,755 / 6,436 ; 6,431 / 6,536 | within noise |
+| `mdstorm create` | 0.981 · 0.8 % | 0.972 · 0.9 % | A 5,871 / 5,883 ; 5,866 / 5,919 — B 5,787 / 5,743 ; 5,738 / 5,722 | within noise by the 3 % floor — **a reproducible −1.9 % / −2.8 %**, every B below every A (the re-run read 0.992 / 0.983; the fp legs there named `lock_stripe` +0.5 µs/op on create); the routed `create` phase 155–163 (B) vs 154–159 µs (A) |
+| `mdstorm stat` | 0.996 · 3.1 % | 1.004 · 2.7 % | 185–192k both arms | within noise |
+| `mdstorm rename` | **1.012 · 2.0 %** | **0.998 · 1.5 %** | A 4,447 / 4,472 ; 4,418 / 4,460 — B 4,560 / 4,468 ; 4,463 / 4,396 | **PAR in both orders — the re-run's 0.960 / 0.967 DELTA CLOSED**; the PR-4 rename lock-set fix's +1 guard STAYS (`dlm_guard_hold` 889.5–889.7k → 989.7–990.0k per storm, the routed `rename` phase 87–89 vs 83–86 µs — its priced ≈ +2.6 µs) inside a PAR row |
+| `mdstorm unlink` | **1.054 · 0.5 % DELTA (B ahead)** | **1.042 · 2.6 % DELTA (B ahead)** | A 5,195 / 5,220 ; 5,205 / 5,252 — B 5,497 / 5,482 ; 5,375 / 5,518 | **B FASTER by 5.4 % / 4.2 % in both orders, every B above every A — the re-run's 0.956 / 0.967 DELTA REVERSED** (the DELTA word is the reducer's — a change past the band; here in B's favour) |
+| `mdstorm manydirs` | 1.019 · 3.8 % | 0.981 · 2.0 % | 10.9–11.4k both arms | within noise |
+| `mdstorm rmdir` | 0.998 · 5.3 % | 0.976 · 1.7 % | 5.6–6.1k both arms | within noise |
+
+**Gate 1 as the design states it ("within noise of `dev` tip on mdstorm,
+rand-4k, `w_fresh`, and mount time; `dlm_rpcs == 0`") reads on PR 13e /
+13f's binary: `dlm_rpcs` 0 ✓ (all 16 mount legs + 8 mdstorm legs),
+mdstorm ✓ (`rename` PAR, `unlink` B ahead, `create` −2…−3 % at the floor,
+the rest within noise), rand-4k ✓ (`rr4k` PAR, `rw4k` within noise both
+orders), `w_fresh` ✓, mount time — within noise in bracket 1, DELTA by
+0.03 over a 30 % band in bracket 2 on a 0.4 s event (a +0.1 s mean shift
+on B's FIRST mount of a fresh set; remount PAR): **MET by the rule, with
+the mount row stated** — a single bracket never convicts and the two
+brackets disagree on it; it is named for PR 14's bracket. **The gate-1
+setattr term (§3.9.4.1's attribution) — the box's VERDICT: FIXED.** The
+kernel's SETATTR echo runs once per rename and unlink on both arms
+(`meta_kv_times_echo_absorbed` 299.3–299.9k per storm, both arms, both
+brackets), and the handler lanes read **`fuse3-tpc` 120.5 / 122.3 /
+121.5 / 120.6 µs per op on B against 125.6 / 125.2 / 125.5 / 126.0 on A**
+(B −4 µs/op; the re-run read B +3.2–5.0), the daemon 221.8–225.6 vs
+226.4–228.1 µs/op, with the conveyor pass (38.2–39.1 µs), the durability
+window (57.4–58.6), the journal lane (35.9–37.6) and the meta lanes
+(17.4–18.1) identical arm to arm and the metadata economy identical
+(`Δjournal_entries` 547.6–547.7k, checkpoints 70–71, node appends
+24.3–24.8k, splits 96–97, `Δfsck_findings` 0, tripwires 0, the five
+`meta_kv_forest_*` gauges 0 on every B mount — bit 17 absent on every
+meta volume of both arms). PR 13f's fix (setattr 26,016 → 896 B, unlink
+11,088 → 280 B, `commit_tx` 4,816 → 408 B) took out more than the PR-4
+guard's +2.6 µs put in.
+
+**Write-amplification columns (the AGENTS instrument — `/proc/diskstats`
+on the TEN data namespaces per row, ramp-inclusive — beside the daemon's
+ledger and the reclaim family):**
+
+| row / position | user GiB (60 s) | **device write ÷ user** | `wareq-sz` | device read ÷ user | ledger `rewrite_device_write_bytes` ÷ user | `patch_write_bytes` ÷ user | reclaim `commands` / `discards` / trim bytes ÷ user | `write_through_blocks` |
+|---|---|---|---|---|---|---|---|---|
+| `wfresh` A1 / A4 | 2,047 / 1,979 | **1.113 / 1.118** | 1,037 / 1,038 KiB | ≈ 0 | 1.019 / 1.021 | 0 | 27,096 / 27,469 / 0.052 ; 59,965 / 60,546 / 0.119 | 7,130 / 7,859 |
+| `wfresh` B2 / B3 | 1,978 / 2,021 | **1.113 / 1.115** | 1,038 / 1,038 KiB | ≈ 0 | 1.016 / 1.020 | 0 | 91,781 / 92,850 / 0.183 ; 10,490 / 10,620 / 0.021 | 8,010 / 8,046 |
+| `rw4k` A1 / A4 (bracket 1) | 123.2 / 122.7 | **1.139 / 1.142** | 5 KiB | 0.007 / 0.004 | 0.148 / 0.152 | **0.981 / 0.982** | 0 / 0 / 0 | 4,675 / 4,764 |
+| `rw4k` B2 / B3 (bracket 1) | 120.3 / 121.6 | **1.147 / 1.139** | 5 KiB | 0.006 / 0.009 | 0.153 / 0.145 | **0.984 / 0.981** | 0 / 0 / 0 | 4,701 / 4,514 |
+| `rr4k` A1 / A4 | 136.0 / 136.6 (reads) | 0 (no writes) | — | **1.171 / 1.168** (`rareq-sz` 4 KiB) | 0 | 0 | 29,833 / 11,806 (the prep's discards draining) | 0 |
+| `rr4k` B2 / B3 | 137.1 / 136.9 | 0 | — | **1.171 / 1.171** | 0 | 0 | 31,424 / 27,459 | 0 |
+
+Device write bytes ≡ user bytes on both arms and both write rows (the
+ramp explains the 1.11–1.15×; `wareq-sz` = the write size — 1 MiB on
+`wfresh`, the 4 KiB in-place W1 patch on `rw4k` — no request-size
+collapse), device read ≡ user on `rr4k`; the reclaim command counts on
+`wfresh` scatter by position on both arms (10–92k, 0.02–0.18× user in
+trim bytes — the elision's timing, not an arm term; the re-run read
+39–61k). Thermal: the hottest hwmon sensor 47–51 °C at every row start
+and end (no heat soak). Artifacts:
+`/scratch/tmp/sym-box/rows-gate1-13e-20260923-015902{,-rev}/` (+ `.log`,
+`REDUCED.md`).
+
 ## 4. Issues found (each with its PR and its red pin)
 
 ### 4.1 Fixed on this branch

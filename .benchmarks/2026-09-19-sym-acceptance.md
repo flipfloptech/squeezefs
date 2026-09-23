@@ -2024,6 +2024,51 @@ FUSE writes; the overlay stores each and settles with a ranged gap seed
 — the re-run's ledger read `flush_seed_read_bytes` 0.17× at N = 8), the
 same shape on every N, ≈ 1.1–1.2× device ÷ user.
 
+##### 3.9.5.3 Gate 3c — `sym-foreign-touch`, two positions on fresh fleets (03:20:50 → 03:33:59 UTC; `13e-nw-20260923-032027-foreign-touch/foreign-touch-r{1,2}`): **every law MET as a VERDICT in BOTH positions — LIVE 192 ships / 0 handovers ×2; IDLE moved after 4 bursts ×2 (17.9 / 17.6 ms); the PAUSED law's FIRST REAL RUN ON ANY VENUE — a live STOPPED job through the touches, resumed to its 40,000 mkdirs, handovers 0 / idle offers 0 / dominated offers 0 ×2; F-R3 FIXED — zero "no inode record" lines, `xv_cross_owner_dangling_names` 0 on every writer, the post-leave census AND the offline census (`current_era_exempted` 0, findings 0) clean ×2; F-R4 FIXED — 0 errnos on 897 / 900 touch creates ×2; F-B1 0 on the fleet, every position's oracle clean, `rc=0`**
+
+| position | LIVE (3 bursts × 64 into the live holder's tree) | IDLE (bursts of 64 at the 10 s beat until the handover) | `slot_handover_phase_ns` (the departing holder m60) | **PAUSED (3 single touches at 5 s over the half-window; the job STOPPED then resumed)** | own create rate (A) | **F-R3 / F-R4** | oracle + census |
+|---|---|---|---|---|---|---|---|
+| r1 (03:20) | **192 ships, 0 handovers** ✓ | handed over after **4 bursts** (50.9 s; 253 ships, 2 offers), 0.020 handovers/s | **17.94 ms** = flush 13.75 / tree 0 4.10 / page 0.10 / grant 0 | **MET** — the job a live STOPPED process (`State: T`) through the three touches, resumed and COMPLETED (`mkdir ops=40000 wall_s=23.330 ops_s=1715`), the holder's journal **+60,133**; **handovers 0, holder `slot_offers_idle` +0, `slot_offers_dominated` +0** | 5,320 c/s | zero `no inode record` lines in m0 / m60 / m61's logs after the `rm -rf`; `xv_cross_owner_dangling_names` 0 ×3, `xv_cross_owner_witness_refusals` 0 ×3 (m60 served 445 steps, m61 shipped 449); **0 touch creates answered an errno** (897 creates) | fsck 0, C8 0, must-stay-0 flat; **post-leave census** (every joiner left): inode plane 2 of 2 volumes, C9 = C10 = 0; **offline census** (the manager left too): covered 2 of 2, `current_era_exempted` **0**, `unreferenced_intent_exempted` 0, `inode_plane_slots_covered` 1,026, findings **0**; the manager's grace window waited out (44 s), every member re-admitted |
+| r2 (03:27, fresh fleet) | **192 ships, 0 handovers** ✓ | handed over after **4 bursts** (50.8 s; 256 ships, 2 offers), 0.020 handovers/s | **17.59 ms** = flush 14.06 / tree 0 3.40 / page 0.13 | **MET** — `mkdir ops=40000 wall_s=23.539`, journal **+60,131**; handovers 0 / idle +0 / dominated +0 | 5,369 c/s | zero lines; gauges 0 ×3 (served 448 / shipped 452); **0 errnos** (900 creates) | clean; post-leave 2 / 2, C9 = C10 = 0; offline covered 2 / 2, exempted 0, findings 0; grace 44 s |
+
+`N_floor(A)` seeded 2 on the box both positions, beat 10 s, `T_idle`
+45,000 ms (the PAUSED touches at 5 s — inside the holder's half window).
+The must-stay-0 set flat on all three writers through both positions,
+`appender_flush_ceiling_overruns` **0** on m0 / m60 / m61 (the F-B1 faces:
+terms 0–8 ms, triggers 992–1,000 — no storm on this fleet reaches the
+class §3.9.5.2 reads), `dlm_rpcs` 0, `invariant_tripwires` 0,
+`xv_cross_owner_intents_{open,stuck}` 0. **The PAUSED law (design §8 row
+3c's third law; §4.4aj's harness defect) is EXERCISED for the first time
+on any venue and reads MET twice**: the touched slot never read IDLE and
+never read DOMINATED while the holder's job stood SIGSTOPped — the
+subtree liveness credit (F-B2's fix, `install_liveness_ancestors`) held
+the slot for the phase's whole window. **F-R3 — the box's VERDICT on PR
+13e's fix: FIXED.** The re-run's leg logged 430 / 512 `no inode record —
+removing the dangling name` lines per position at the same `rm -rf`;
+this binary logs none, the must-stay-0 gauge reads 0 on every writer,
+and the two census arms that were VACUOUS for the joiner-minted class
+before PR 13e's era-floor fix (§4.4al, review round 1 Issue 2) now judge
+it: the OFFLINE probe covers every slot (`inode_plane_slots_covered`
+1,026) with NOTHING exempted and finds nothing. **F-R4 — the box's
+VERDICT: FIXED as far as this leg reaches** — the leg's new per-create
+ledger (`touch-errors.txt`) is EMPTY in both positions over 897 / 900
+touches, the IDLE handover included (the re-run's one `ENOENT` was on
+the IDLE burst that moved the slot); the slot-moved class is
+`xv_cross_owner_step_slot_moved_retries` (0 here — no create met the
+window in these two handovers, so the retry path was not exercised; the
+in-process pin is its proof). **The handover's cost grew**: 17.9 / 17.6
+ms against the re-run's 7.5 / 6.7 ms, all of it in the departing
+holder's FLUSH phase (13.75 / 14.06 ms vs 3.99 / 2.04; tree 0 3.4–4.1 and
+the page 0.1 unchanged) — the flush-then-transfer's `checkpoint_now`
+cycles until the region's tail passes the slot's frontier; on this
+binary the joiner's cadence is PR 13e's (the anticipated-term trigger)
+and the ring the 512 KiB floor's — the flush's cycle count is not
+instrumented per handover (a `slot_handover_phase_ns.flush` cycle count
+beside the wall is the instrument); at 0.02 handovers/s and 18 ms per
+handover the row's cost law (handovers/s × cost vs the node's own rate:
+5,320–5,369 c/s) stands — stated for PR 14's bracket. Gate 3c as the
+design states it reads **MET on all three laws, twice, on the box**.
+
 ## 4. Issues found (each with its PR and its red pin)
 
 ### 4.1 Fixed on this branch

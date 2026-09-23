@@ -13806,6 +13806,16 @@ impl SqueezefsFilesystem {
                         be.checkpoint_trigger_ms(meta_kv::checkpoint::CHECKPOINT_MAX_AGE_MS as u64)
                     }),
                 );
+                // PR 13g review round 2 (Issue 19): the age decision's raw
+                // lateness past its trigger, the horizon maximum — the
+                // tick's own wake term (the venue's), read beside an
+                // `appender_flush_ceiling_overruns` increment: a lateness
+                // past the ceiling's two-tick margin is the executor's
+                // scheduling, not the cadence's pricing.
+                metrics.insert(
+                    "meta_kv_checkpoint_late_max_ms".into(),
+                    per_volume(&|be| be.checkpoint_late_max_ms()),
+                );
                 // PR 13g (F-B1): the cadence's LIVE projection beside the
                 // horizon term — the dirty nodes times the measured per-node
                 // append wall plus the images the pending commits promised

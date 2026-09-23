@@ -1587,6 +1587,16 @@ pub struct KvMetaBackend {
     /// for a cycle another path ran.
     pub(super) checkpoint_decision_late_ns: AtomicU64,
     pub(super) checkpoint_decision_tick_ns: AtomicU64,
+    /// The age decision's RAW lateness past its trigger, the horizon
+    /// MAXIMUM over the cycles it fired (PR 13g review round 2, Issue 19)
+    /// — the tick's own wake term (the executor's scheduling under CPU
+    /// saturation, never the cycle's work), what an
+    /// `appender_flush_ceiling_overruns` increment is read beside: a
+    /// lateness past the ceiling's two-tick margin lands leaves past the
+    /// ceiling whatever the trigger anticipated — the VENUE's term, the
+    /// box's is the reading. Published as `meta_kv_checkpoint_late_max_ms`.
+    pub(super) checkpoint_lates: std::sync::Mutex<super::checkpoint::CycleTermWindow>,
+    pub(super) checkpoint_late_max_ns: AtomicU64,
     /// The flush pass's two measured units, ns — the wall per dirty node
     /// whose flush appended (no fresh image) and the wall per fresh IMAGE
     /// the pass's SMOs wrote — each the MAXIMUM over the last horizon of
@@ -3244,6 +3254,8 @@ impl KvMetaBackend {
             checkpoint_term_ns: AtomicU64::new(0),
             checkpoint_decision_late_ns: AtomicU64::new(0),
             checkpoint_decision_tick_ns: AtomicU64::new(0),
+            checkpoint_lates: std::sync::Mutex::new(super::checkpoint::CycleTermWindow::new()),
+            checkpoint_late_max_ns: AtomicU64::new(0),
             maintenance_rotor: AtomicUsize::new(0),
             checkpoint_flush_units: std::sync::Mutex::new((
                 super::checkpoint::CycleTermWindow::new(),
@@ -12314,6 +12326,18 @@ impl KvMetaBackend {
         };
         self.checkpoint_term_ns
             .store(anticipated, Ordering::Relaxed);
+        // The decision's RAW lateness over the same horizon — the venue's
+        // term, published beside the overrun it explains (Issue 19).
+        let late_max = {
+            let mut w = self
+                .checkpoint_lates
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            w.push(late_ns);
+            w.anticipated_ns()
+        };
+        self.checkpoint_late_max_ns
+            .store(late_max, Ordering::Relaxed);
     }
 
     /// A maintained tree's SMO images consume the grant of the REGION
@@ -12445,6 +12469,16 @@ impl KvMetaBackend {
     /// (`meta_kv_checkpoint_term_ms`; 0 before the first cycle).
     pub fn checkpoint_term_ms(&self) -> u64 {
         self.checkpoint_term_ns.load(Ordering::Relaxed) / 1_000_000
+    }
+
+    /// The age decision's raw lateness past its trigger, the maximum over
+    /// the horizon of cycles it fired, ms (`meta_kv_checkpoint_late_max_
+    /// ms`; PR 13g review round 2, Issue 19 — the tick's own wake term,
+    /// the venue's: an overrun beside a lateness past the ceiling's
+    /// two-tick margin is the executor's scheduling, not the cadence's
+    /// pricing).
+    pub fn checkpoint_late_max_ms(&self) -> u64 {
+        self.checkpoint_late_max_ns.load(Ordering::Relaxed) / 1_000_000
     }
 
     /// This volume's checkpoint seq as of the last cycle (a joined

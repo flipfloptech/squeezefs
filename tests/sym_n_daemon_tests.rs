@@ -13260,9 +13260,26 @@ async fn scale_row(
 /// — the instrument published, the trigger not yet anticipating it): the
 /// onset cycle fires at the shipped trigger and lands its leaves 1,270 –
 /// 1,430 ms old (3/3 at the pin's commit; 6/6 GREEN at the fix's).
+///
+/// **The venue's term, attributed INSIDE the pin** (review round 2, Issue
+/// 19 — the reshaped pin flaked 1/9 at HEAD: one overrun with the onset
+/// term 471 ms against a 557 ms projection and a 443 ms trigger, the age
+/// decision ≈ 190 ms late — the dev profile's tick under CPU saturation,
+/// a term the box does not have): an overrun beside a decision later
+/// than the ceiling's two-tick MARGIN (`meta_kv_checkpoint_late_max_ms`
+/// over the onset's cycles) lands its leaves past the ceiling whatever
+/// the trigger anticipated, so that sample is VOID — logged with its
+/// lateness and re-drawn into a fresh row (bounded at three draws, each
+/// behind its own quiet horizon; a run that draws no valid sample fails
+/// loud naming the venue) — and an overrun INSIDE the margin is the
+/// cadence's, the pin's failure. Never a silent retry: every void draw
+/// is stated with its rate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 async fn a_storms_onset_after_a_quiet_horizon_lands_inside_the_managers_ceiling() {
     use squeezefs::meta_backend::kv::checkpoint::{CHECKPOINT_MAX_AGE_MS, TERM_HORIZON_CYCLES};
+    /// The onset draws a run may take: the first is the sample, the rest
+    /// re-draws after a venue-voided one.
+    const DRAWS: u32 = 3;
     let dir = cadence_venue_dir();
     let _g = SEAM.lock().await;
     reset_process_state();
@@ -13297,7 +13314,7 @@ async fn a_storms_onset_after_a_quiet_horizon_lands_inside_the_managers_ceiling(
     let spread = squeezefs::meta_backend::MINT_SPREAD;
     let mut row_dirs: Vec<Vec<(Arc<RoutedMetaBackend>, u64)>> = Vec::new();
     let mut mdirs: Vec<Vec<u64>> = Vec::new();
-    for row in 1..=2u32 {
+    for row in 1..=1 + DRAWS {
         let mut dirs = Vec::new();
         for (n, (j, _)) in daemons.iter().enumerate() {
             let d = j
@@ -13423,70 +13440,117 @@ async fn a_storms_onset_after_a_quiet_horizon_lands_inside_the_managers_ceiling(
         "the premise: with the horizon holding the warm-up's term, row 1 lands inside the \
          ceiling"
     );
-    // The QUIET horizon: more cycles than the window holds, each with
-    // nothing to flush — the row's term leaves the horizon.
-    for _ in 0..TERM_HORIZON_CYCLES + 8 {
-        mvol.checkpoint_now().await.expect("a quiet cycle");
+    // The ceiling's two-tick MARGIN: a decision later than it lands leaves
+    // past the ceiling whatever the trigger anticipated — the venue's
+    // tick term, what voids a sample (Issue 19).
+    let ceiling_ms = mvol.appender_stats().unwrap().flush_ceiling_ms;
+    let late_bound_ms = ceiling_ms - CHECKPOINT_MAX_AGE_MS as u64;
+    let mut prev_term_ms = f1.term_ms;
+    let mut void_draws = 0u32;
+    let mut verdict: Option<u32> = None;
+    for draw in 0..DRAWS {
+        // The QUIET horizon: more cycles than the window holds, each with
+        // nothing to flush — the row's term leaves the horizon.
+        for _ in 0..TERM_HORIZON_CYCLES + 8 {
+            mvol.checkpoint_now().await.expect("a quiet cycle");
+        }
+        let fq = cadence_faces(&mvol);
+        eprintln!(
+            "F-B1 onset: draw {draw} — after {} quiet cycles the manager at {fq:?}",
+            TERM_HORIZON_CYCLES + 8
+        );
+        // The premise: the horizon FORGOT the storm's term (a quiet cycle's
+        // few writes are what it remembers), and nothing of the storm is
+        // pending — at most a straggler leaf or two (the kernel's times
+        // echo drains behind the storm), never the row's 64.
+        assert!(
+            fq.term_ms * 4 < prev_term_ms,
+            "the premise: the quiet horizon FORGOT the previous row's term ({} → {} ms)",
+            prev_term_ms,
+            fq.term_ms
+        );
+        assert!(
+            fq.projected_ms <= 2 * fq.node_unit_us.div_ceil(1_000),
+            "the premise: nothing of the storm is pending at the onset ({fq:?})"
+        );
+        assert_eq!(
+            fq.trigger_ms + fq.term_ms.max(fq.projected_ms),
+            CHECKPOINT_MAX_AGE_MS as u64,
+            "the trigger is the max age less the term in force"
+        );
+        // The ONSET under the product cadence, into a fresh set of
+        // directories — the onset cycle and two more. Bounded short of the
+        // shape's own cliff: sixty-four leaves filled in LOCKSTEP reach
+        // their log-full compaction in the same cycle, an SMO storm the
+        // promise ledger never named (a log-full compaction is the flush
+        // pass's decision, not a commit's promise) and the horizon prices
+        // only from its second occurrence — the steady-state class the
+        // box's uneven directories never take at once, stated here, not
+        // the class under test.
+        let row = 2 + draw;
+        let created2 = scale_row(
+            row,
+            &manager,
+            &mdirs[row as usize - 1],
+            &row_dirs[row as usize - 1],
+            std::time::Duration::from_millis(2_500),
+            std::time::Duration::from_millis(25),
+        )
+        .await;
+        let f2 = cadence_faces(&mvol);
+        let late_ms = mvol.checkpoint_late_max_ms();
+        eprintln!(
+            "F-B1 onset: draw {draw} (row {row}) — {created2} creates over 2.5 s; the manager \
+             at {f2:?} ({} cycles; the decision at most {late_ms} ms late, bound {late_bound_ms})",
+            f2.checkpoints - fq.checkpoints
+        );
+        assert!(created2 >= 1_000, "the onset stormed ({created2} creates)");
+        prev_term_ms = f2.term_ms;
+        if f2.overruns == fq.overruns {
+            verdict = Some(draw);
+            break;
+        }
+        if late_ms > late_bound_ms {
+            // The venue's term: the tick itself landed past the margin the
+            // ceiling gives it — no trigger lands such a cycle inside the
+            // ceiling. The sample is VOID, stated, and re-drawn.
+            void_draws += 1;
+            eprintln!(
+                "F-B1 onset: draw {draw} VOID — {} overrun(s) beside an age decision {late_ms} \
+                 ms late (the ceiling's margin is {late_bound_ms} ms): the executor's tick under \
+                 CPU saturation, the venue's term; re-drawn",
+                f2.overruns - fq.overruns
+            );
+            // The storm's tail is the product cadence's to cover before the
+            // next quiet horizon.
+            tokio::time::sleep(std::time::Duration::from_millis(2 * ceiling_ms)).await;
+            continue;
+        }
+        squeezefs::uring_fs::disarm_device_latency(&path);
+        panic!(
+            "the manager's leaves land inside the {ceiling_ms} ms ceiling through a storm's \
+             onset after a quiet horizon — the cadence priced the first storm cycle off its \
+             pending work (anticipated {} ms before the onset; {} overrun(s) with the decision \
+             at most {late_ms} ms late, inside the {late_bound_ms} ms margin: the cadence's, \
+             not the venue's; RED on the horizon term alone: the box's 1,127 / 1,125 ms with \
+             11 / 4 ms anticipated)",
+            fq.term_ms,
+            f2.overruns - fq.overruns
+        );
     }
-    let fq = cadence_faces(&mvol);
-    eprintln!(
-        "F-B1 onset: after {} quiet cycles the manager at {fq:?}",
-        TERM_HORIZON_CYCLES + 8
-    );
-    // The premise: the horizon FORGOT the storm's term (a quiet cycle's
-    // few writes are what it remembers), and nothing of the storm is
-    // pending — at most a straggler leaf or two (the kernel's times echo
-    // drains behind the storm), never the row's 64.
-    assert!(
-        fq.term_ms * 4 < f1.term_ms,
-        "the premise: the quiet horizon FORGOT row 1's term ({} → {} ms)",
-        f1.term_ms,
-        fq.term_ms
-    );
-    assert!(
-        fq.projected_ms <= 2 * fq.node_unit_us.div_ceil(1_000),
-        "the premise: nothing of the storm is pending at the onset ({fq:?})"
-    );
-    assert_eq!(
-        fq.trigger_ms + fq.term_ms.max(fq.projected_ms),
-        CHECKPOINT_MAX_AGE_MS as u64,
-        "the trigger is the max age less the term in force"
-    );
-    // Row 2's ONSET under the product cadence, into the second set of
-    // fresh directories — the onset cycle and two more. Bounded short of
-    // the shape's own cliff: sixty-four leaves filled in LOCKSTEP reach
-    // their log-full compaction in the same cycle, an SMO storm the
-    // promise ledger never named (a log-full compaction is the flush
-    // pass's decision, not a commit's promise) and the horizon prices
-    // only from its second occurrence — the steady-state class the box's
-    // uneven directories never take at once, stated here, not the class
-    // under test.
-    let created2 = scale_row(
-        2,
-        &manager,
-        &mdirs[1],
-        &row_dirs[1],
-        std::time::Duration::from_millis(2_500),
-        std::time::Duration::from_millis(25),
-    )
-    .await;
     squeezefs::uring_fs::disarm_device_latency(&path);
-    let f2 = cadence_faces(&mvol);
-    eprintln!(
-        "F-B1 onset: row 2 — {created2} creates over 2.5 s; the manager at {f2:?} ({} cycles)",
-        f2.checkpoints - fq.checkpoints
-    );
-    assert!(created2 >= 1_000, "the onset stormed ({created2} creates)");
-    assert_eq!(
-        f2.overruns - fq.overruns,
-        0,
-        "the manager's leaves land inside the {} ms ceiling through a storm's onset after a \
-         quiet horizon — the cadence priced the first storm cycle off its pending work \
-         (anticipated {} ms before the onset; RED on the horizon term alone: the box's 1,127 \
-         / 1,125 ms with 11 / 4 ms anticipated)",
-        mvol.appender_stats().unwrap().flush_ceiling_ms,
-        fq.term_ms
-    );
+    match verdict {
+        Some(draw) => eprintln!(
+            "F-B1 onset: GREEN at draw {draw} — {void_draws} of {} draw(s) voided by the venue's \
+             tick lateness",
+            draw + 1
+        ),
+        None => panic!(
+            "the venue produced no valid onset sample in {DRAWS} draws — every one overran with \
+             the age decision past the {late_bound_ms} ms margin (the dev profile's tick under \
+             CPU saturation); re-run on a quiet box"
+        ),
+    }
     for (j, _) in &daemons {
         assert_supply_gauges_zero(&j.volumes[0], "joiner");
         shutdown(j).await;

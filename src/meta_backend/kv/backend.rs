@@ -10223,6 +10223,13 @@ impl KvMetaBackend {
             // starts at the size its predecessor grew to (`appender_hint`, PR
             // 13g) — never the floor again after a storm.
             let volume_len = self.sb.heap.end();
+            // A pending GrowRing segment of the identity's PREVIOUS
+            // incarnation (dead or left before its page named it, and its
+            // death path never ran) is returned before this one's ring is
+            // carved — the rejoin is one of the witness's settle points
+            // (review round 1, Issue 1).
+            self.settle_pending_ring_segment(identity, None, "the identity's rejoin")
+                .await?;
             let ring_bytes = if ring_want_bytes == 0 {
                 let hint = self
                     .appender_hint_for(identity.node_token, identity.mount_slot)
@@ -10448,31 +10455,134 @@ impl KvMetaBackend {
         )
     }
 
+    /// **Settle an identity's PENDING ring segment against the page that
+    /// would name it** (PR 13g review round 1, Issue 1 — `GrowRing`'s
+    /// durable witness, `slot_state::PendingSegment`): a segment the page
+    /// NAMES has landed — the word is cleared (one hint put); a segment no
+    /// page names is RETURNED — its extents' free deltas + the hint without
+    /// the word as ONE control entry, then its bits released
+    /// (`appender_pending_segments_returned`) — `page` is `None` for an
+    /// identity with no page left. Answers `Some(extent)` for a return.
+    /// Called by the leave, the death ledger's recovery (step 8, and so by
+    /// `appender clear`), a rejoin, and by `GrowRing` itself for a stale
+    /// word (another incarnation's, or one the page already names) before
+    /// it carves. Under the caller's hold of `manager_verbs`.
+    async fn settle_pending_ring_segment(
+        &self,
+        identity: super::appender::AppenderIdentity,
+        page: Option<&super::appender::AppenderPage>,
+        why: &str,
+    ) -> std::result::Result<Option<super::superblock::ExtentRef>, KvError> {
+        let hint = self
+            .appender_hint_for(identity.node_token, identity.mount_slot)
+            .await?;
+        let Some(p) = hint.pending else {
+            return Ok(None);
+        };
+        let extent = super::superblock::ExtentRef {
+            start: p.start,
+            len: p.len,
+        };
+        let cleared = super::slot_state::AppenderHint {
+            pending: None,
+            ..hint
+        };
+        let named = page.is_some_and(|pg| {
+            pg.segments
+                .iter()
+                .any(|s| s.start == extent.start && s.len == extent.len)
+        });
+        if named {
+            self.write_control_entry(
+                vec![Self::appender_hint_put(identity, cleared)],
+                EntryAdmission::Try,
+            )
+            .await?;
+            return Ok(None);
+        }
+        let node_size = u64::from(self.sb.node_size);
+        let heap_start = self.sb.heap.start;
+        if extent.start < heap_start
+            || extent.len % node_size != 0
+            || (extent.start - heap_start) % node_size != 0
+            || extent.end() > self.sb.heap.end()
+        {
+            return Err(KvError::Corrupt(format!(
+                "{}: the appender hint of node {:#018x} / mount slot {:#x} names a pending ring \
+                 segment ({:#x}, {} bytes) outside this heap's extents",
+                self.path.display(),
+                identity.node_token,
+                identity.mount_slot,
+                extent.start,
+                extent.len
+            )));
+        }
+        let extents: Vec<u64> = (0..extent.len / node_size)
+            .map(|i| (extent.start - heap_start) / node_size + i)
+            .collect();
+        let mut recs: Vec<(u8, Record)> = extents
+            .iter()
+            .map(|e| super::alloc_ext::free_record(*e, 0, 0))
+            .collect();
+        recs.push(Self::appender_hint_put(identity, cleared));
+        self.write_control_entry(recs, EntryAdmission::Try).await?;
+        for e in &extents {
+            self.alloc.release_unpublished(*e);
+        }
+        if let Some(set) = self.appenders.as_ref() {
+            set.pending_segments_returned
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        log::warn!(
+            "meta volume {}: a GrowRing segment at {:#x} ({} bytes) carved for appender {} (term \
+             {}) of node {:#018x} / mount slot {:#x} was named by no page — RETURNED at {why} \
+             (appender_pending_segments_returned)",
+            self.path.display(),
+            extent.start,
+            extent.len,
+            p.appender_id,
+            p.term,
+            identity.node_token,
+            identity.mount_slot
+        );
+        Ok(Some(extent))
+    }
+
     /// **`GrowRing { appender_id, want_bytes }`** (PR 13g, F-R5 — PR 2's
     /// drain-then-grow over the wire; design §5.3.2): one more ring
     /// segment for a JOINED appender whose ring is pressure-driven. The
     /// page must be `Live` (the joiner's — one of this mount's own regions
-    /// is `Rejected`, a `Free` / recovering page too); the ask is CLAMPED
-    /// to the per-appender ceiling less the ring the page names (a wire
-    /// integer is never an allocation authority) and answers `None` when
-    /// the table is at `RING_SEGMENTS_MAX` or the clamp rounds to nothing.
-    /// The carve is the join's law made ONE contiguous run: `want`
-    /// internal-class claims, the LONGEST adjacent run kept, the rest
-    /// released (a fragmented heap answers a shorter segment — the joiner
-    /// asks again at its next cycle); the run must sit in no appender's
-    /// grant record; zeroed before anything names it (`zero_extents`);
-    /// its allocator deltas + the identity's `appender_hint` (the grown size —
-    /// the identity's next join starts there) as ONE control entry,
-    /// barriered. The JOINER's page names the segment (one writer per
-    /// page) — a joiner dying between this reply and that write leaves
-    /// the segment claimed by no page: the in-process growth's own
-    /// bits-before-page window, the bounded leak class (one segment) the
-    /// bitmap-vs-reachability census owes.
+    /// is `Rejected`, a `Free` / recovering page too) and, when the
+    /// session's peer is a member id, the page's identity must derive it
+    /// (`screen_identity_peer`'s law for an id-only verb — an appender
+    /// grows its own ring alone; review round 1, Issue 1); the ask is
+    /// CLAMPED to the per-appender ceiling less the ring the page names
+    /// (a wire integer is never an allocation authority) and answers
+    /// `None` when the table is at `RING_SEGMENTS_MAX` or the clamp
+    /// rounds to nothing. **Idempotent against DURABLE state (§5.3.5)**:
+    /// the identity's hint carries the segment the last `GrowRing` carved
+    /// (`PendingSegment`, written in the carve's own control entry) — an
+    /// ask from the same incarnation whose page does not yet name it is
+    /// answered that segment VERBATIM (`manager_verb_replays`; a lost
+    /// `RingGrown` reply re-asked through the joiner's retry door carves
+    /// nothing more), a page that names it clears the word, and a word of
+    /// another incarnation is returned before this one's carve. The carve
+    /// is the join's law made ONE contiguous run: `want` internal-class
+    /// claims, the LONGEST adjacent run kept, the rest released (a
+    /// fragmented heap answers a shorter segment — the joiner asks again
+    /// at its next cycle); the run must sit in no appender's grant record;
+    /// zeroed before anything names it (`zero_extents`); its allocator
+    /// deltas + the identity's `appender_hint` (the grown size — the
+    /// identity's next join starts there — and the pending witness) as
+    /// ONE control entry, barriered. The JOINER's page names the segment
+    /// (one writer per page); an incarnation dying between this reply and
+    /// that write has the segment returned by its death path
+    /// (`settle_pending_ring_segment`).
     pub async fn manager_grow_ring_wire(
         &self,
         appender_id: u32,
         want_bytes: u64,
-        _peer: &str,
+        peer: &str,
     ) -> std::result::Result<Option<super::superblock::ExtentRef>, KvError> {
         use super::appender::{read_directory, AppenderState};
         let set = self.manager_gate(false)?;
@@ -10498,6 +10608,51 @@ impl KvMetaBackend {
                     self.path.display()
                 ))
             })?;
+        // The peer binding (PR 12b round 1's precedent for the identity-
+        // carrying verbs, here for an id-only verb through the page's
+        // identity): a production appender's session peer IS its member
+        // id; a frame naming a colleague's id is REJECTED. An ad-hoc peer
+        // (the in-process contracts) keeps the page's own witness laws.
+        let derived =
+            crate::cowriter::node_member_id_of(page.identity.node_token, page.identity.mount_slot);
+        if derived != peer && crate::cowriter::parse_node_member_id(peer).is_some() {
+            set.verbs.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err(KvError::Rejected(format!(
+                "{}: GrowRing for appender {appender_id}, whose page's identity derives member \
+                 id '{derived}' while the session's authenticated peer is '{peer}' — an appender \
+                 grows its own ring alone",
+                self.path.display()
+            )));
+        }
+        // The durable witness FIRST (§5.3.5): this incarnation's pending
+        // segment the page does not name is the answer; a named or stale
+        // word is settled before any carve.
+        let hint = self
+            .appender_hint_for(page.identity.node_token, page.identity.mount_slot)
+            .await?;
+        if let Some(p) = hint.pending {
+            let named = page
+                .segments
+                .iter()
+                .any(|s| s.start == p.start && s.len == p.len);
+            if p.appender_id == appender_id && p.term == page.term && !named {
+                set.verbs.replays.fetch_add(1, Ordering::Relaxed);
+                log::info!(
+                    "meta volume {}: GrowRing for appender {appender_id} answered its pending \
+                     segment at {:#x} ({} bytes) VERBATIM — the page does not name it yet \
+                     (manager_verb_replays)",
+                    self.path.display(),
+                    p.start,
+                    p.len
+                );
+                return Ok(Some(super::superblock::ExtentRef {
+                    start: p.start,
+                    len: p.len,
+                }));
+            }
+            self.settle_pending_ring_segment(page.identity, Some(&page), "the next GrowRing")
+                .await?;
+        }
         if page.segments.len() >= super::appender::RING_SEGMENTS_MAX {
             return Ok(None);
         }
@@ -10570,6 +10725,8 @@ impl KvMetaBackend {
             .iter()
             .map(|e| super::alloc_ext::alloc_record(*e, 0))
             .collect();
+        // The hint as settled above (a stale word returned or cleared), now
+        // carrying THIS carve as the pending witness.
         let hint = self
             .appender_hint_for(page.identity.node_token, page.identity.mount_slot)
             .await?;
@@ -10577,6 +10734,12 @@ impl KvMetaBackend {
             page.identity,
             super::slot_state::AppenderHint {
                 ring_bytes: grown_bytes.max(hint.ring_bytes),
+                pending: Some(super::slot_state::PendingSegment {
+                    appender_id,
+                    term: page.term,
+                    start: extent.start,
+                    len: extent.len,
+                }),
                 ..hint
             },
         ));

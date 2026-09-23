@@ -2042,6 +2042,24 @@ impl KvMetaBackend {
                 ),
             }
         }
+        // A GrowRing segment the dead page names is released with its
+        // ring (`release_recovered_regions`); one the manager carved that
+        // the page never named — the incarnation died between the reply
+        // and its page write — is returned HERE (the witness's settle
+        // point on the death path; PR 13g review round 1, Issue 1).
+        {
+            let _g = self.manager_verbs.lock().await;
+            if let Err(e) = self
+                .settle_pending_ring_segment(identity, Some(&page), "the death ledger's recovery")
+                .await
+            {
+                log::warn!(
+                    "meta volume {}: appender {id}'s pending GrowRing segment could not be \
+                     settled ({e}) — the next verb for its identity retries",
+                    self.path.display()
+                );
+            }
+        }
         drop(smo);
         test_fail_at_step(8, id)?;
 

@@ -2205,8 +2205,10 @@ impl KvMetaBackend {
         }
         .await;
         if let Err(e) = written {
-            // The manager's carve stands durable, this page does not name
-            // it: the bounded leak class (one segment) — loud.
+            // The manager's carve stands durable under the identity's
+            // pending witness; this page does not name it — the next
+            // GrowRing is answered it verbatim, and the leave / the death
+            // path returns it (PR 13g review round 1, Issue 1). Loud.
             {
                 let mut page = region.page.lock().unwrap_or_else(|e| e.into_inner());
                 page.segments.pop();
@@ -2214,8 +2216,9 @@ impl KvMetaBackend {
             region.end_growth();
             log::error!(
                 "meta volume {}: joined appender {own}'s page could not name its grown ring \
-                 ({e}) — the segment at {:#x} ({} bytes) the manager carved is claimed by no page \
-                 until a bitmap-vs-reachability census returns it",
+                 ({e}) — the segment at {:#x} ({} bytes) the manager carved is named by no page; \
+                 the manager answers it again at the next GrowRing and returns it at this \
+                 identity's leave or death",
                 self.path.display(),
                 extent.start,
                 extent.len
@@ -2244,7 +2247,8 @@ impl KvMetaBackend {
                 log::error!(
                     "meta volume {}: joined appender {own}'s ring swap refused ({e}) after its \
                      page named the grown table — the page rewritten without it ({}); the \
-                     segment at {:#x} ({} bytes) is the bounded leak class",
+                     segment at {:#x} ({} bytes) stays under the identity's pending witness for \
+                     the manager's next verb to answer or return",
                     self.path.display(),
                     match undone {
                         Ok(()) => "ok".to_string(),
@@ -2926,6 +2930,11 @@ impl KvMetaBackend {
         let _smo = self.smo.lock().await;
         let _hold = self.service_hold();
         let _g = self.manager_verbs.lock().await;
+        // A GrowRing segment the page names goes with the ring below; one
+        // it never named is returned here (the witness's settle point at
+        // the leave — review round 1, Issue 1).
+        self.settle_pending_ring_segment(page.identity, Some(&page), "the leave")
+            .await?;
         let segments = std::mem::take(&mut page.segments);
         page.state = AppenderState::Free;
         page.slots.clear();

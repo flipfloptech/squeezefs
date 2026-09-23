@@ -922,6 +922,13 @@ impl KvMetaBackend {
         let _ = be.conveyor_self.set(Arc::downgrade(&be));
         let _ = be.joined.set(wire);
         be.trace_guard_event("joined_appender_admitted");
+        // The own-residue POOL census (PR 13g review round 1, Issue 2):
+        // a rejoin over own residue lands the record's unnamed pool
+        // CLAIMED — moved back before anything claims from the pool.
+        if let Err(e) = be.restore_own_pools().await {
+            be.abandon_joined_open().await;
+            return Err(e);
+        }
         if let Err(e) = be.join_joined_region(already).await {
             be.abandon_joined_open().await;
             return Err(e);

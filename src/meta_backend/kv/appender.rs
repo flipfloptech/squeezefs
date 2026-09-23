@@ -1511,6 +1511,9 @@ pub struct RegionGrant {
     pending: Vec<(u64, u64)>,
     /// Released past the tail, awaiting `ReturnExtents`.
     returnable: Vec<u64>,
+    /// The in-window `alloc` records the replay folded (`claim_exact`) —
+    /// the own-residue pool census's shield, taken once at the open.
+    window_claims: std::collections::BTreeSet<u64>,
     /// Extents ever granted to this region (`extent_grant_extents`).
     pub granted: u64,
     /// Extents returned to the manager (`returned` in the closure law).
@@ -1601,12 +1604,36 @@ impl RegionGrant {
     /// extent this region retired, recycled and claimed again inside one
     /// window (PR 13g) folds to CLAIMED, never to pending AND claimed at
     /// once (a park the next tail would have released while the image
-    /// stood).
+    /// stood). The claim is remembered as the WINDOW's
+    /// ([`Self::take_window_claims`]) — the own-residue pool census's
+    /// shield.
     pub fn claim_exact(&mut self, extent: u64) {
         self.unclaimed.remove(&extent);
         self.pending.retain(|(e, _)| *e != extent);
         self.returnable.retain(|e| *e != extent);
         self.claimed.insert(extent);
+        self.window_claims.insert(extent);
+    }
+
+    /// The in-window claims the replay folded ([`Self::claim_exact`]),
+    /// taken once by the own-residue pool census.
+    pub fn take_window_claims(&mut self) -> std::collections::BTreeSet<u64> {
+        std::mem::take(&mut self.window_claims)
+    }
+
+    /// **The own-residue POOL census's restore** (PR 13g review round 1,
+    /// Issue 2): a CLAIMED extent no tree of this mount reaches and no
+    /// in-window claim named is the POOL the page could not name (the
+    /// page names the remainder's largest `GRANT_RUNS_MAX` runs; the rest
+    /// stayed unclaimed in RAM and the crash-rejoin's `recover` landed
+    /// them claimed) — back to UNCLAIMED. Answers whether it moved.
+    pub fn unclaim(&mut self, extent: u64) -> bool {
+        if self.claimed.remove(&extent) {
+            self.unclaimed.insert(extent);
+            true
+        } else {
+            false
+        }
     }
 
     /// A claim whose build was abandoned before publication.

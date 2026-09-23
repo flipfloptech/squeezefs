@@ -71,7 +71,7 @@ use super::*;
 use crate::meta_backend::kv::alloc_lease::{note_dead_member_acted, DeadMemberRecord};
 use crate::meta_backend::kv::appender::{
     first_segment_ring_part, read_directory, AppenderEntry, AppenderIdentity, AppenderPage,
-    AppenderState, SlotEntryState,
+    AppenderRegion, AppenderState, SlotEntryState,
 };
 use crate::meta_backend::kv::journal::RingSegment;
 use crate::meta_backend::kv::superblock::ExtentRef;
@@ -2557,6 +2557,93 @@ impl KvMetaBackend {
                 let _ = plane.frame_tails.remove_sync(&s.slot);
             }
             record = rewrite.record;
+        }
+        Ok(())
+    }
+
+    /// **The own-residue POOL census** (PR 13g review round 1, Issue 2 —
+    /// the death path's orphan census run for THIS mount's OWN regions at
+    /// its open): `RegionGrant::recover` lands every record extent the
+    /// page does not name as CLAIMED, and since PR 13g the page names the
+    /// pool's largest `GRANT_RUNS_MAX` runs alone — a crash-rejoin's
+    /// unnamed pool (the recycled singles, every run past the four
+    /// largest: tens to a hundred-plus extents per crash per region on a
+    /// fragmented pool) read claimed, routed to by nothing, freed by
+    /// nothing, a C13 candidate only at an fsck run at the joiner, its
+    /// repair gated. PR 3 review round 1 Issue 9 had made the page name
+    /// EVERY unclaimed extent so no crash-class open recovered a pool as
+    /// claimed; the pool reverses it, and this census is what closes the
+    /// class again: a claimed extent no tree of this mount reaches
+    /// (`node_addrs_unloaded` — never a leaf load) and no in-window claim
+    /// named (the replay's `claim_exact` — a live image whose root install
+    /// the window carries) is the pool — back to UNCLAIMED, counted on
+    /// `appender_pool_restored_extents`. Runs for own regions that
+    /// RECOVERED own residue; a clean leave leaves nothing pooled. Under
+    /// the SMO mutex and the forest's mint guard (C13's own posture: an
+    /// SMO's successor before its route flip and a lazy mint's root before
+    /// the forest names it are never candidates) — at the open both are
+    /// free.
+    pub(in crate::meta_backend::kv) async fn restore_own_pools(
+        &self,
+    ) -> std::result::Result<(), KvError> {
+        let Some(set) = self.appenders.as_ref() else {
+            return Ok(());
+        };
+        let Some(forest) = self.forest() else {
+            return Ok(());
+        };
+        let own: Vec<Arc<AppenderRegion>> = set
+            .own_regions()
+            .filter(|r| r.id != 0 && r.self_recovered)
+            .cloned()
+            .collect();
+        if own.is_empty() {
+            return Ok(());
+        }
+        let _smo = self.smo.lock().await;
+        let _mint = forest.mint_guard().await;
+        let mut reachable: Option<std::collections::BTreeSet<u64>> = None;
+        for region in own {
+            let (claimed, window) = {
+                let mut g = region.grant();
+                (g.claimed_extents(), g.take_window_claims())
+            };
+            if claimed.is_empty() {
+                continue;
+            }
+            // Every tree this mount holds, walked once for all regions: a
+            // projection's tree can only KEEP an extent claimed (the leak
+            // direction, C13's), never restore a live one to the pool.
+            if reachable.is_none() {
+                let mut set = std::collections::BTreeSet::new();
+                for t in self.all_trees() {
+                    for addr in self.node_addrs_unloaded(&t).await?.iter() {
+                        set.insert(self.cache.addr_extent(addr));
+                    }
+                }
+                reachable = Some(set);
+            }
+            let reachable = reachable.as_ref().expect("computed above");
+            let mut restored = 0u64;
+            {
+                let mut g = region.grant();
+                for e in claimed {
+                    if !reachable.contains(&e) && !window.contains(&e) && g.unclaim(e) {
+                        restored += 1;
+                    }
+                }
+            }
+            if restored > 0 {
+                set.pool_restored_extents
+                    .fetch_add(restored, Ordering::Relaxed);
+                log::info!(
+                    "meta volume {}: appender {}'s own-residue open restored {restored} pool \
+                     extent(s) the page could not name — claimed by no tree, back to unclaimed \
+                     (appender_pool_restored_extents)",
+                    self.path.display(),
+                    region.id
+                );
+            }
         }
         Ok(())
     }

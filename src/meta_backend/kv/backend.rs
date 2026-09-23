@@ -2008,6 +2008,13 @@ impl KvMetaBackend {
             drop(be.guard_fd.lock().unwrap().take());
             return Err(e);
         }
+        // The own-residue POOL census (PR 13g review round 1, Issue 2) —
+        // before the first post-mount SMO claims from the pool.
+        if let Err(e) = be.restore_own_pools().await {
+            be.release_reservation().await;
+            drop(be.guard_fd.lock().unwrap().take());
+            return Err(e);
+        }
         if let Err(e) = be.cover_bring_up_residue().await {
             be.release_reservation().await;
             drop(be.guard_fd.lock().unwrap().take());

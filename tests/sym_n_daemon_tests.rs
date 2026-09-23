@@ -11095,3 +11095,309 @@ async fn a_create_into_a_directory_whose_slot_moves_to_the_creator_mid_plan_neve
     drop(manager);
     fsck_clean(&uris).await;
 }
+
+// ---------------------------------------------------------------------------
+// PR 13g — F-R5: the joiner's extent supply under a create storm on a
+// floor-sized ring (the record's §3.9.5.2 / §7 item 16).
+// ---------------------------------------------------------------------------
+
+/// One joiner's supply faces, read off its own volume and the manager's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SupplyFaces {
+    ring_bytes: u64,
+    ring_grows: u64,
+    grow_declined: u64,
+    stalls: u64,
+    pressure_cycles: u64,
+    checkpoints: u64,
+    /// The grant closure's terms of the joiner's own region.
+    grant_claimed: u64,
+    grant_unclaimed: u64,
+    grant_returned: u64,
+    /// The wire verbs this joiner issued for its supply.
+    wire_grants: u64,
+    wire_returns: u64,
+    wire_reactive_grants: u64,
+    wire_ring_grows: u64,
+    compactions: u64,
+    splits: u64,
+}
+
+fn supply_faces(vol: &KvMetaBackend) -> SupplyFaces {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = vol.appender_stats().expect("a forest volume");
+    let own = s
+        .regions
+        .iter()
+        .find(|r| r.id == s.appender_id)
+        .expect("the joiner's own region");
+    let j = vol.joined_stats().expect("a joined appender");
+    SupplyFaces {
+        ring_bytes: own.ring_bytes,
+        ring_grows: s.ring_grows,
+        grow_declined: j.ring_grow_declined,
+        stalls: own.stalls,
+        pressure_cycles: s.pressure_cycles,
+        checkpoints: vol.checkpoint_seq(),
+        grant_claimed: own.grant_claimed,
+        grant_unclaimed: own.grant_unclaimed,
+        grant_returned: s.grant_returned,
+        wire_grants: j.wire_extent_grants,
+        wire_returns: j.wire_extent_returns,
+        wire_reactive_grants: j.wire_reactive_grants,
+        wire_ring_grows: j.wire_ring_grows,
+        compactions: squeezefs::meta_backend::kv::META_KV_NODE_COMPACTIONS.load(Relaxed),
+        splits: squeezefs::meta_backend::kv::META_KV_NODE_SPLITS.load(Relaxed),
+    }
+}
+
+/// **The box's `sym-scale` shape in process**: `joiners` real joined
+/// appenders on one volume, each storming ITS OWN directory with
+/// `creators` unpaced creators for `storm` — the PRODUCT cadence alone
+/// (the checkpoint task's tick, its pressure law) drives every cycle; no
+/// test-side `checkpoint_now`. Returns every joiner with its directory
+/// and the faces read at the storm's start, at its midpoint and at its
+/// end, plus the manager's `(extent_grants, extent_returns, manager_verbs)`
+/// deltas over the storm.
+async fn floor_ring_storm(
+    joiners: usize,
+    creators: usize,
+    storm: std::time::Duration,
+) -> (
+    Vec<String>,
+    Arc<RoutedMetaBackend>,
+    Arc<KvMetaBackend>,
+    HoldersVenue,
+    Vec<(Arc<RoutedMetaBackend>, u64, Vec<(String, u64)>)>,
+    Vec<[SupplyFaces; 3]>,
+    (u64, u64, u64),
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let uris =
+        format_stamped_set_with_config_len(dir.path(), 1, VOL_LEN * (joiners as u64 + 1).max(2))
+            .await;
+    // The tempdir lives as long as the URIs do.
+    std::mem::forget(dir);
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let mut daemons: Vec<(Arc<RoutedMetaBackend>, u64, Vec<(String, u64)>)> = Vec::new();
+    for n in 1..=joiners {
+        let j = join(&uris, &venue, &mvol, n as u32).await;
+        let d = j
+            .create(1, &format!("storm-w{n}"), libc::S_IFDIR | 0o755, 1000, 1000)
+            .await
+            .expect("the joiner's directory")
+            .ino;
+        daemons.push((j, d, Vec::new()));
+    }
+    let m0 = mvol.appender_stats().unwrap();
+    let start: Vec<SupplyFaces> = daemons
+        .iter()
+        .map(|(j, _, _)| supply_faces(&j.volumes[0]))
+        .collect();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut tasks = Vec::new();
+    for (i, (j, d, _)) in daemons.iter().enumerate() {
+        for c in 0..creators {
+            let j = Arc::clone(j);
+            let d = *d;
+            let stop = Arc::clone(&stop);
+            tasks.push(tokio::spawn(async move {
+                let mut out = Vec::new();
+                let mut k = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let name = format!("c{c}-f{k:06}");
+                    let ino = j
+                        .create(d, &name, libc::S_IFREG | 0o644, 1000, 1000)
+                        .await
+                        .unwrap_or_else(|e| panic!("joiner {i} create {name}: {e}"))
+                        .ino;
+                    out.push((name, ino));
+                    k += 1;
+                }
+                (i, out)
+            }));
+        }
+    }
+    tokio::time::sleep(storm / 2).await;
+    let mid: Vec<SupplyFaces> = daemons
+        .iter()
+        .map(|(j, _, _)| supply_faces(&j.volumes[0]))
+        .collect();
+    tokio::time::sleep(storm / 2).await;
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    for t in tasks {
+        let (i, out) = t.await.expect("a creator task");
+        daemons[i].2.extend(out);
+    }
+    let end: Vec<SupplyFaces> = daemons
+        .iter()
+        .map(|(j, _, _)| supply_faces(&j.volumes[0]))
+        .collect();
+    let m1 = mvol.appender_stats().unwrap();
+    let faces = start
+        .into_iter()
+        .zip(mid)
+        .zip(end)
+        .map(|((a, b), c)| [a, b, c])
+        .collect();
+    let mgr = (
+        m1.extent_grants - m0.extent_grants,
+        m1.extent_returns - m0.extent_returns,
+        m1.manager_verbs - m0.manager_verbs,
+    );
+    (uris, manager, mvol, venue, daemons, faces, mgr)
+}
+
+/// **F-R5 (the third box campaign, record §3.9.5.2 / §7 item 16 — PR
+/// 2 / PR 3 / PR 12b): a joiner's extent supply under a create storm runs
+/// at the reactive one-SMO grain on a floor-sized ring.** On the box
+/// (N = 8, 40k creates per writer in ≈ 13 s) every joiner's ring sat at
+/// the 512 KiB floor (`appender_ring_grows` 0 — PR 2's drain-then-grow
+/// owed, ring growth DECLINED on a joiner), so it checkpointed ≈ 8×/s on
+/// the ring's pressure law; every cadence RETURNED the images its
+/// compactions had retired (`extent_grant_returned` +193 over the storm)
+/// and the next flush pass exhausted the grant and asked ONE SMO's images
+/// again (`joined_wire_extent_grants` +47 × 4 extents) — a grant / return
+/// ping-pong of ≈ 100 manager verbs per joiner per storm, each a ring-0
+/// control entry + barrier at the manager (3.6 ms), the burst F-B1's two
+/// trips sat inside. The proactive 50 % refill never engaged as a
+/// derived-size ask: a wire appender's SMO rate was never measured
+/// (`smos_this_cycle` fed on the manager's flush pass alone) and the
+/// manager derives a wire appender's grant off a rate of 0 — the floor —
+/// while the reactive carve reset the 50 % law's reference to its own 4.
+///
+/// The three laws, on the box's shape in process (two joiners, unpaced
+/// creators, the PRODUCT cadence — no test-side `checkpoint_now`):
+/// 1. **the ring**: a joiner whose cadence is pressure-driven GROWS its
+///    ring past the floor (drain-then-grow over the wire — `GrowRing`)
+///    within the storm, `joined_ring_grow_declined` stays 0, and in the
+///    storm's second half its pressure cycles fall below the first half's;
+/// 2. **the cadence's return**: `extent_grant_returned` stays flat through
+///    the storm (retired images RECYCLE into the joiner's own unclaimed
+///    pool up to the derived grant; a pressure-driven cadence returns
+///    nothing) while its compactions ran;
+/// 3. **the ask's grain**: the reactive one-SMO ask stays 0 on a healthy
+///    heap (`joined_wire_reactive_grants`) and every grant asks the
+///    DERIVED size — the manager's verbs per joiner per storm fall by an
+///    order of magnitude against the base's (the base read on this
+///    fixture is in the record's §4.4ao).
+/// Every acked name resolves at every daemon, fsck clean after every
+/// joiner left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycles_its_grant() {
+    use squeezefs::meta_backend::kv::appender::SYM_RING_FLOOR_BYTES;
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let storm = std::time::Duration::from_secs(8);
+    let (uris, manager, mvol, venue, daemons, faces, (mgr_grants, mgr_returns, mgr_verbs)) =
+        floor_ring_storm(2, 12, storm).await;
+    for (i, f) in faces.iter().enumerate() {
+        let [a, b, c] = f;
+        eprintln!("F-R5 joiner {i}: start {a:?}");
+        eprintln!("F-R5 joiner {i}: mid   {b:?}");
+        eprintln!("F-R5 joiner {i}: end   {c:?}");
+    }
+    eprintln!(
+        "F-R5 manager over the storm: extent_grants +{mgr_grants}, extent_returns \
+         +{mgr_returns}, manager_verbs +{mgr_verbs} ({} joiners, {} s, creates per joiner {:?})",
+        daemons.len(),
+        storm.as_secs(),
+        daemons.iter().map(|(_, _, f)| f.len()).collect::<Vec<_>>()
+    );
+    for (i, [a, b, c]) in faces.iter().enumerate() {
+        let compactions = c.compactions - a.compactions;
+        let cycles = c.checkpoints - a.checkpoints;
+        assert!(
+            a.ring_bytes == SYM_RING_FLOOR_BYTES,
+            "joiner {i} joined at the floor ring ({} B)",
+            a.ring_bytes
+        );
+        assert!(
+            cycles >= 8 && compactions >= 4,
+            "joiner {i}'s storm ran the cadence hard ({cycles} cycles, {compactions} \
+             compactions) — the fixture's premise"
+        );
+        // Law 1 — the ring.
+        assert!(
+            c.ring_bytes > SYM_RING_FLOOR_BYTES && c.ring_grows >= 1,
+            "joiner {i}: a pressure-driven cadence grows the ring past the floor (ring {} B, \
+             grows {}, declined {}, stalls {}, pressure cycles +{} over {cycles} cycles) — RED: \
+             the floor ring stood for the whole storm",
+            c.ring_bytes,
+            c.ring_grows,
+            c.grow_declined,
+            c.stalls - a.stalls,
+            c.pressure_cycles - a.pressure_cycles
+        );
+        assert_eq!(
+            c.grow_declined - a.grow_declined,
+            0,
+            "joiner {i}: a healthy storm declines no growth"
+        );
+        let pressure_first = b.pressure_cycles - a.pressure_cycles;
+        let pressure_second = c.pressure_cycles - b.pressure_cycles;
+        assert!(
+            pressure_second < pressure_first,
+            "joiner {i}: the pressure cycles fall once the ring is sized ({pressure_first} in \
+             the first half, {pressure_second} in the second)"
+        );
+        // Law 2 — the cadence's return.
+        assert!(
+            c.grant_returned - a.grant_returned <= 4,
+            "joiner {i}: retired images recycle into the joiner's own pool — `extent_grant_\
+             returned` moved +{} over {compactions} compactions (RED: +≈ compactions, the \
+             ping-pong)",
+            c.grant_returned - a.grant_returned
+        );
+        // Law 3 — the ask's grain.
+        assert_eq!(
+            c.wire_reactive_grants - a.wire_reactive_grants,
+            0,
+            "joiner {i}: the flush pass never asked one SMO's images on a healthy heap (RED: \
+             the only grant path a floor-ring joiner ran)"
+        );
+        let verbs = (c.wire_grants - a.wire_grants)
+            + (c.wire_returns - a.wire_returns)
+            + (c.wire_ring_grows - a.wire_ring_grows);
+        assert!(
+            verbs <= 12,
+            "joiner {i}: its supply cost the manager {verbs} verbs over the storm ({} grants, \
+             {} returns, {} grows; {cycles} cycles, {compactions} compactions) — an order of \
+             magnitude under the base's ≈ 1 per cycle",
+            c.wire_grants - a.wire_grants,
+            c.wire_returns - a.wire_returns,
+            c.wire_ring_grows - a.wire_ring_grows
+        );
+    }
+    // Every acked name resolves at its creator, the manager reads them
+    // too after the leaves, nothing lost.
+    for (i, (j, d, files)) in daemons.iter().enumerate() {
+        assert!(
+            files.len() >= 500,
+            "joiner {i} stormed ({} creates)",
+            files.len()
+        );
+        assert_all_resolve(j, *d, files).await;
+        assert_must_stay_zero(&j.volumes[0], &format!("joiner {i}"));
+    }
+    assert_must_stay_zero(&mvol, "manager");
+    let dirs: Vec<(u64, Vec<(String, u64)>)> =
+        daemons.iter().map(|(_, d, f)| (*d, f.clone())).collect();
+    for (j, _, _) in daemons {
+        shutdown(&j).await;
+    }
+    for (d, files) in &dirs {
+        assert_all_resolve(&manager, *d, files).await;
+    }
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}

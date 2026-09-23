@@ -11496,6 +11496,14 @@ impl KvMetaBackend {
         self.checkpoint_term_ns.load(Ordering::Relaxed) / 1_000_000
     }
 
+    /// This volume's checkpoint seq as of the last cycle (a joined
+    /// appender's page `ckpt_seq`; the ledger's on the manager) — the
+    /// per-volume cycle count the contracts read where the process-wide
+    /// `META_KV_CHECKPOINTS` folds every volume.
+    pub fn checkpoint_seq(&self) -> u64 {
+        self.checkpoint_seq.load(Ordering::Acquire)
+    }
+
     /// **The cadence TRIGGER in force for a MAX AGE `max_age_ms`** — the
     /// age the tick fires AT (`CHECKPOINT_MAX_AGE_MS` routinely, the
     /// elastic ceiling under a live reader ask), never the LANDING ceiling

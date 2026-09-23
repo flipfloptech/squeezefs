@@ -163,6 +163,13 @@ pub struct JoinedWire {
     /// Extent grants received / batches returned over the wire.
     pub extent_grants: AtomicU64,
     pub extent_returns: AtomicU64,
+    /// Grants the flush pass asked REACTIVELY on a `GrantExhausted`
+    /// (`joined_wire_reactive_grants`) — the one-SMO-grain ask F-R5 found
+    /// as a floor-ring joiner's only supply path under a storm.
+    pub reactive_grants: AtomicU64,
+    /// Ring segments this joiner grew by over the wire
+    /// (`joined_wire_ring_grows`).
+    pub ring_grows: AtomicU64,
     /// Verbs the wire could not complete (a refused / failed call — the
     /// caller's retry class; `joined_wire_failures`).
     pub failures: AtomicU64,
@@ -401,6 +408,13 @@ pub struct JoinedStats {
     pub wire_releases: u64,
     pub wire_extent_grants: u64,
     pub wire_extent_returns: u64,
+    /// The flush pass's REACTIVE asks — a `GrantExhausted` met inside a
+    /// cycle (`joined_wire_reactive_grants`; ≈ 0 while the proactive
+    /// refill keeps up on a healthy heap — PR 13g, F-R5).
+    pub wire_reactive_grants: u64,
+    /// `GrowRing` verbs that landed a segment (`joined_wire_ring_grows` —
+    /// PR 13g's drain-then-grow over the wire).
+    pub wire_ring_grows: u64,
     pub wire_failures: u64,
     pub control_refusals: u64,
     pub ring_grow_declined: u64,
@@ -875,6 +889,8 @@ impl KvMetaBackend {
             releases: AtomicU64::new(0),
             extent_grants: AtomicU64::new(0),
             extent_returns: AtomicU64::new(0),
+            reactive_grants: AtomicU64::new(0),
+            ring_grows: AtomicU64::new(0),
             failures: AtomicU64::new(0),
             control_refusals: AtomicU64::new(0),
             grow_declined: AtomicU64::new(0),
@@ -1099,6 +1115,8 @@ impl KvMetaBackend {
             wire_releases: w.releases.load(Ordering::Relaxed),
             wire_extent_grants: w.extent_grants.load(Ordering::Relaxed),
             wire_extent_returns: w.extent_returns.load(Ordering::Relaxed),
+            wire_reactive_grants: w.reactive_grants.load(Ordering::Relaxed),
+            wire_ring_grows: w.ring_grows.load(Ordering::Relaxed),
             wire_failures: w.failures.load(Ordering::Relaxed),
             control_refusals: w.control_refusals.load(Ordering::Relaxed),
             ring_grow_declined: w.grow_declined.load(Ordering::Relaxed),
@@ -1779,6 +1797,9 @@ impl KvMetaBackend {
                 // every consumer of the ceiling — the flush-ceiling audit
                 // counts it, never excuses it (a `Service` hold is another
                 // actor's hold of the mutex, not this pass waiting).
+                if let Some(w) = self.joined.get() {
+                    w.reactive_grants.fetch_add(1, Ordering::Relaxed);
+                }
                 let refill = self.joined_extent_grant_at(want, Some(&*smo)).await;
                 match refill {
                     Ok(n) if n > 0 => {

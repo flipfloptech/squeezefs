@@ -14254,6 +14254,18 @@ impl SqueezefsFilesystem {
                         "joined_wire_extent_returns".into(),
                         word(&|s| s.wire_extent_returns),
                     );
+                    // PR 13g (F-R5): the flush pass's reactive one-SMO asks
+                    // (≈ 0 while the derived-size proactive refill keeps up
+                    // on a healthy heap) and the ring segments grown over
+                    // the wire (drain-then-grow).
+                    metrics.insert(
+                        "joined_wire_reactive_grants".into(),
+                        word(&|s| s.wire_reactive_grants),
+                    );
+                    metrics.insert(
+                        "joined_wire_ring_grows".into(),
+                        word(&|s| s.wire_ring_grows),
+                    );
                     metrics.insert("joined_wire_failures".into(), word(&|s| s.wire_failures));
                     // Issue 6 (PR 13 review): `Joined.node_seq_base` words the
                     // joiner's screen refused — process-wide (a refused join

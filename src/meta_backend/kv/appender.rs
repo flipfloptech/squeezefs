@@ -2740,6 +2740,12 @@ pub struct AppenderSet {
     /// was under the segment floor (`appender_grow_ring_short_declines`;
     /// Issue 9) — the claims released whole, no table slot spent.
     pub grow_ring_short_declines: std::sync::atomic::AtomicU64,
+    /// Page-named unclaimed extents a region open DROPPED because the
+    /// grant record no longer granted them (`appender_stale_page_words_
+    /// dropped`; review round 2, Issue 16a — a word written before a
+    /// return landed; the record is the manager's truth). ≈ 0 on a
+    /// healthy fleet since the shrink rewrites the page before its return.
+    pub stale_page_words_dropped: std::sync::atomic::AtomicU64,
     /// `pressure_cycles` as the grant cadence last read it — a cadence
     /// that finds it moved ran on a PRESSURE-DRIVEN cycle (the ring is
     /// the bottleneck, not the heap) and returns nothing (PR 13g, F-R5).
@@ -3133,6 +3139,7 @@ impl AppenderSet {
             pool_restored_extents: self.pool_restored_extents.load(Relaxed),
             ring_budget_remaining_bytes: self.ring_budget_remaining.load(Relaxed),
             grow_ring_short_declines: self.grow_ring_short_declines.load(Relaxed),
+            stale_page_words_dropped: self.stale_page_words_dropped.load(Relaxed),
             manager_lease: self
                 .manager_lease
                 .lock()
@@ -3277,6 +3284,9 @@ pub struct AppenderStats {
     pub ring_budget_remaining_bytes: u64,
     /// `GrowRing` asks declined under the segment floor (Issue 9).
     pub grow_ring_short_declines: u64,
+    /// Page-named extents a region open dropped as outside the record
+    /// (review round 2, Issue 16a).
+    pub stale_page_words_dropped: u64,
     /// The Manager family (§11, PR 3).
     pub manager_lease: ManagerLease,
     pub meta_pr_wero: bool,

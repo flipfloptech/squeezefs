@@ -12088,6 +12088,279 @@ async fn a_quiet_joiners_pool_above_its_target_shrinks_at_the_cadence_and_asks_f
 }
 
 // ---------------------------------------------------------------------------
+// PR 13g review round 2, Issue 16 — the shrink's return never leaves a
+// stale page word, and a rejoin adopts the page word ∩ the record.
+// ---------------------------------------------------------------------------
+
+/// The extents appender `id`'s tree-0 grant record names at the manager.
+async fn record_extents(mvol: &KvMetaBackend, id: u32) -> std::collections::BTreeSet<u64> {
+    mvol.extent_grant_record(id)
+        .await
+        .unwrap()
+        .extents()
+        .collect()
+}
+
+/// **The shrink's return follows a page rewrite — the device page never
+/// names an extent the record no longer grants** (PR 13g review round 2,
+/// Issue 16b — the ordering half). The Issue 5 shrink took UNCLAIMED
+/// extents out of the pool and shipped them as `ReturnExtents` AFTER the
+/// cycle's page write had named the pool's largest runs: the manager
+/// cleared their bits and re-granted them lowest-free-first while the
+/// joiner's page still named them until its NEXT page write — a cycle
+/// away. A joiner killed inside that window rejoined over the stale word
+/// (`RegionGrant::recover` adopted the page word whole) able to CLAIM
+/// extents another appender already held: two custodians of one extent,
+/// a node image overwritten, acked loss. PR 3's trim never left the
+/// window — the page was set after the excess moved to the returnable
+/// batch. Now the shrink rewrites the page (the pool without the surplus,
+/// both directory slots, barriered) BEFORE `ReturnExtents` — the
+/// discipline `wire_extent_refill` keeps before every ask. The pin: a
+/// pool above its target, ONE quiet cadence whose shrink returns a batch
+/// R, then the DEVICE page's word ∩ R = ∅ and ⊆ the record; the joiner
+/// killed before its next page write, R re-granted to a second joiner,
+/// the identity rejoined — the rejoined pool holds none of R and the two
+/// grants are disjoint. RED before the fix: the page names R after the
+/// cadence, and the rejoin holds R beside the second joiner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shrinks_return_never_leaves_the_page_naming_a_returned_extent() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config_len(dir.path(), 1, 512 * 1024 * 1024).await;
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let joiner = join(&uris, &venue, &mvol, 3).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let id = jvol.appender_stats().unwrap().appender_id;
+    let own = joiner
+        .create(1, "own", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .unwrap()
+        .ino;
+    let files = create_files(&joiner, own, "f", 8).await;
+    jvol.checkpoint_now().await.unwrap();
+    // The pool above its target: an explicit ask (the refill's page write
+    // names the pool's largest runs — the returned extents among them).
+    let got = jvol.joined_extent_grant(200).await.unwrap();
+    assert!(got >= 64, "the pool grew by {got}");
+    let record0 = record_extents(&mvol, id).await;
+    let page0 = page_of(&uris[0], &mvol, id).await.unwrap();
+    let named0: std::collections::BTreeSet<u64> = page0
+        .grant
+        .iter()
+        .flat_map(|r| r.start..r.start + u64::from(r.len))
+        .collect();
+    assert!(
+        named0.is_subset(&record0),
+        "the page word is inside the record before the cadence"
+    );
+    let returns0 = jvol.joined_stats().unwrap().wire_extent_returns;
+    // ONE quiet cadence: the shrink returns the surplus.
+    jvol.checkpoint_now().await.unwrap();
+    assert!(
+        jvol.joined_stats().unwrap().wire_extent_returns > returns0,
+        "the shrink returned a batch"
+    );
+    let record1 = record_extents(&mvol, id).await;
+    let returned: std::collections::BTreeSet<u64> = record0.difference(&record1).copied().collect();
+    assert!(
+        returned.len() >= 32,
+        "the premise: the shrink returned {} extent(s)",
+        returned.len()
+    );
+    assert!(
+        named0.intersection(&returned).count() > 0,
+        "the premise: the pre-cadence page named some of the returned extents"
+    );
+    // The ordering law on the DEVICE: the page after the cadence names no
+    // returned extent, and every extent it names is the record's.
+    let page1 = page_of(&uris[0], &mvol, id).await.unwrap();
+    let named1: std::collections::BTreeSet<u64> = page1
+        .grant
+        .iter()
+        .flat_map(|r| r.start..r.start + u64::from(r.len))
+        .collect();
+    assert!(
+        named1.is_disjoint(&returned),
+        "the device page names {} returned extent(s) after the shrink's return — the stale word \
+         a crash-rejoin would adopt",
+        named1.intersection(&returned).count()
+    );
+    assert!(
+        named1.is_subset(&record1),
+        "the page word is inside the record"
+    );
+    // The kill — before the joiner's next page write.
+    drop(jvol);
+    drop(joiner);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    // The returned extents re-granted: a SECOND joiner's ask carves
+    // lowest-free-first.
+    let second = join(&uris, &venue, &mvol, 4).await;
+    let svol = Arc::clone(&second.volumes[0]);
+    let sid = svol.appender_stats().unwrap().appender_id;
+    assert_ne!(sid, id);
+    svol.joined_extent_grant(200).await.unwrap();
+    let second_record = record_extents(&mvol, sid).await;
+    assert!(
+        !second_record.is_disjoint(&returned),
+        "the premise: the second joiner was granted {} of the returned extents",
+        second_record.intersection(&returned).count()
+    );
+    // The identity's rejoin over its Live page: no returned extent in its
+    // RAM grant, the two grants disjoint.
+    let again = join(&uris, &venue, &mvol, 3).await;
+    let avol = Arc::clone(&again.volumes[0]);
+    assert_eq!(avol.appender_stats().unwrap().appender_id, id);
+    let held: Vec<u64> = returned
+        .iter()
+        .copied()
+        .filter(|e| avol.grant_holds(id, *e))
+        .collect();
+    assert!(
+        held.is_empty(),
+        "the rejoined joiner holds {} returned extent(s) another appender was granted — two \
+         custodians ({held:?})",
+        held.len()
+    );
+    let mine = record_extents(&mvol, id).await;
+    assert!(
+        mine.is_disjoint(&second_record),
+        "the two grant records are disjoint"
+    );
+    assert_all_resolve(&again, own, &files).await;
+    assert_supply_gauges_zero(&avol, "the rejoined joiner");
+    assert_supply_gauges_zero(&svol, "the second joiner");
+    shutdown(&again).await;
+    shutdown(&second).await;
+    assert_must_stay_zero(&mvol, "manager");
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+/// **A rejoin adopts the page word ∩ the record — a page-named extent the
+/// record no longer grants is DROPPED, counted** (PR 13g review round 2,
+/// Issue 16a — the structural belt). The record is the manager's truth
+/// (PR 3's law `record ⊆ claimed ∪ unclaimed ∪ pending ∪ returnable`);
+/// the manager already screens ITS answers against a stale word
+/// (`extent_grant_stale_page_words`), the joiner's own `recover` did not.
+/// The pin forges the window Issue 16b closes: after a shrink's return
+/// and the kill, the joiner's page is rewritten with its PRE-cadence word
+/// (naming the returned extents, now a second joiner's), the identity
+/// rejoins — none of them in its grant, `appender_stale_page_words_
+/// dropped` moved by their count, the record whole in the RAM sets. RED
+/// before the fix: the forged word's extents read UNCLAIMED at the
+/// rejoin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejoin_adopts_the_page_word_intersected_with_the_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config_len(dir.path(), 1, 512 * 1024 * 1024).await;
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let joiner = join(&uris, &venue, &mvol, 3).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let id = jvol.appender_stats().unwrap().appender_id;
+    let identity = jvol.joined_wire().unwrap().identity;
+    let own = joiner
+        .create(1, "own", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .unwrap()
+        .ino;
+    let files = create_files(&joiner, own, "f", 8).await;
+    jvol.checkpoint_now().await.unwrap();
+    jvol.joined_extent_grant(200).await.unwrap();
+    let record0 = record_extents(&mvol, id).await;
+    let stale_word = page_of(&uris[0], &mvol, id).await.unwrap().grant;
+    let stale_named: std::collections::BTreeSet<u64> = stale_word
+        .iter()
+        .flat_map(|r| r.start..r.start + u64::from(r.len))
+        .collect();
+    jvol.checkpoint_now().await.unwrap();
+    let record1 = record_extents(&mvol, id).await;
+    let returned: std::collections::BTreeSet<u64> = record0.difference(&record1).copied().collect();
+    let phantom: std::collections::BTreeSet<u64> =
+        stale_named.intersection(&returned).copied().collect();
+    assert!(
+        phantom.len() >= 16,
+        "the premise: the pre-cadence word names {} returned extent(s)",
+        phantom.len()
+    );
+    drop(jvol);
+    drop(joiner);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    let second = join(&uris, &venue, &mvol, 4).await;
+    let svol = Arc::clone(&second.volumes[0]);
+    let sid = svol.appender_stats().unwrap().appender_id;
+    svol.joined_extent_grant(200).await.unwrap();
+    let second_record = record_extents(&mvol, sid).await;
+    assert!(
+        !second_record.is_disjoint(&phantom),
+        "the premise: the second joiner holds {} of the phantom extents",
+        second_record.intersection(&phantom).count()
+    );
+    // The forged window: the identity's page with its PRE-cadence word.
+    rewrite_page(&uris[0], id, |p| {
+        p.identity = identity;
+        p.grant = stale_word.clone();
+    })
+    .await;
+    let dropped0 = mvol.appender_stats().unwrap().stale_page_words_dropped;
+    let again = join(&uris, &venue, &mvol, 3).await;
+    let avol = Arc::clone(&again.volumes[0]);
+    assert_eq!(avol.appender_stats().unwrap().appender_id, id);
+    let held: Vec<u64> = phantom
+        .iter()
+        .copied()
+        .filter(|e| avol.grant_holds(id, *e))
+        .collect();
+    assert!(
+        held.is_empty(),
+        "the rejoin adopted {} phantom extent(s) off the stale page word ({held:?})",
+        held.len()
+    );
+    let s = avol.appender_stats().unwrap();
+    assert_eq!(
+        s.stale_page_words_dropped - dropped0,
+        phantom.len() as u64,
+        "every phantom extent counted (appender_stale_page_words_dropped)"
+    );
+    // The record whole in the RAM sets (PR 3's law).
+    for e in record_extents(&mvol, id).await {
+        assert!(
+            avol.grant_holds(id, e),
+            "record extent {e} in the RAM grant"
+        );
+    }
+    assert_all_resolve(&again, own, &files).await;
+    shutdown(&again).await;
+    shutdown(&second).await;
+    assert_must_stay_zero(&mvol, "manager");
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+// ---------------------------------------------------------------------------
 // PR 13g review round 1, Issue 11 — the joiner's SMO rate reads its OWN
 // volume's images.
 // ---------------------------------------------------------------------------

@@ -9214,22 +9214,39 @@ impl KvMetaBackend {
 
     /// Appender `id`'s UNCLAIMED remainder as the durable state has it:
     /// an in-process region's RAM grant (the page mirrors it), a wire
-    /// joiner's page `grant` field (the manager writes it at every grant).
+    /// joiner's page `grant` field (the manager writes it at every grant)
+    /// — answered with the WIRE appender's directory ENTRY off the same
+    /// read (`None` for an in-process region, a `Free` page or an unknown
+    /// id): the hint put's identity and the page rewrite's offsets read
+    /// off it, so a wire grant walks the directory ONCE (PR 13g review
+    /// round 1, Issue 13 — the manager's verb wall is the F-B1 term).
     async fn unclaimed_remainder_of(
         &self,
         set: &super::appender::AppenderSet,
         appender_id: u32,
-    ) -> std::result::Result<Vec<super::appender::GrantRun>, KvError> {
+    ) -> std::result::Result<
+        (
+            Vec<super::appender::GrantRun>,
+            Option<super::appender::AppenderEntry>,
+        ),
+        KvError,
+    > {
         if let Some(r) = set.region(appender_id) {
-            return Ok(r.grant().unclaimed_runs());
+            return Ok((r.grant().unclaimed_runs(), None));
         }
         let entries = super::appender::read_directory(&self.path, &self.sb).await?;
         Ok(entries
-            .iter()
+            .into_iter()
             .find(|e| e.appender_id == appender_id)
-            .and_then(|e| e.page.as_ref())
-            .filter(|p| p.state == super::appender::AppenderState::Live)
-            .map(|p| p.grant.clone())
+            .filter(|e| {
+                e.page
+                    .as_ref()
+                    .is_some_and(|p| p.state == super::appender::AppenderState::Live)
+            })
+            .map(|e| {
+                let grant = e.page.as_ref().map(|p| p.grant.clone()).unwrap_or_default();
+                (grant, Some(e))
+            })
             .unwrap_or_default())
     }
 
@@ -9340,8 +9357,8 @@ impl KvMetaBackend {
         // answering it verbatim would hand the caller an extent it no
         // longer holds — a second custodian of whoever holds it now.
         let record = self.extent_grant_record(appender_id).await?;
+        let (word, wire_entry) = self.unclaimed_remainder_of(set, appender_id).await?;
         let remainder = {
-            let word = self.unclaimed_remainder_of(set, appender_id).await?;
             let named: u64 = word.iter().map(|r| u64::from(r.len)).sum();
             let kept = super::slot_state::ExtentGrantRecord::from_extents(
                 word.iter()
@@ -9482,10 +9499,15 @@ impl KvMetaBackend {
         }
         // A WIRE appender's derived-size ask above the floor is what its
         // identity's next join starts from (`appender_hint`, PR 13g) —
-        // the record rides the carve's LAST entry when the word grows.
+        // the record rides the carve's LAST entry when the word grows;
+        // the identity came off the remainder's directory read (Issue 13).
         let mut hint_put: Option<(u8, Record)> = None;
         if wire_explicit && want > super::appender::GRANT_EXTENTS_FLOOR {
-            if let Some(identity) = self.wire_appender_identity(appender_id).await? {
+            if let Some(identity) = wire_entry
+                .as_ref()
+                .and_then(|e| e.page.as_ref())
+                .map(|p| p.identity)
+            {
                 let hint = self
                     .appender_hint_for(identity.node_token, identity.mount_slot)
                     .await?;
@@ -9587,7 +9609,7 @@ impl KvMetaBackend {
             let page_grant = super::appender::page_runs_of(
                 &super::slot_state::ExtentGrantRecord::from_extents(union.iter().copied()).runs,
             );
-            self.write_wire_joiner_page_grant(appender_id, &page_grant)
+            self.write_wire_joiner_page_grant(wire_entry.as_ref(), &page_grant)
                 .await?;
         }
         log::info!(
@@ -9835,7 +9857,7 @@ impl KvMetaBackend {
             // A wire joiner's page remainder drops the returned extents
             // (its page is the manager's to write in PR 3; §5.3.5's
             // idempotency reads the remainder off it).
-            let remainder = self.unclaimed_remainder_of(set, appender_id).await?;
+            let (remainder, wire_entry) = self.unclaimed_remainder_of(set, appender_id).await?;
             let kept = super::slot_state::ExtentGrantRecord::from_extents(
                 remainder
                     .iter()
@@ -9843,7 +9865,7 @@ impl KvMetaBackend {
                     .filter(|e| !granted.contains(e)),
             )
             .runs;
-            self.write_wire_joiner_page_grant(appender_id, &kept)
+            self.write_wire_joiner_page_grant(wire_entry.as_ref(), &kept)
                 .await?;
         }
         set.extent_returns.fetch_add(1, Ordering::Relaxed);
@@ -10457,21 +10479,6 @@ impl KvMetaBackend {
         }
     }
 
-    /// The identity a WIRE appender's `Live` page carries (`None` for an
-    /// in-process region, a `Free` page or an unknown id) — the hint's key.
-    async fn wire_appender_identity(
-        &self,
-        appender_id: u32,
-    ) -> std::result::Result<Option<super::appender::AppenderIdentity>, KvError> {
-        let entries = super::appender::read_directory(&self.path, &self.sb).await?;
-        Ok(entries
-            .iter()
-            .find(|e| e.appender_id == appender_id)
-            .and_then(|e| e.page.as_ref())
-            .filter(|p| p.state == super::appender::AppenderState::Live)
-            .map(|p| p.identity))
-    }
-
     /// The `appender_hint` record's `Put` for `identity` at `hint` — a
     /// record other control writers add to THEIR entry (`GrowRing`'s, a
     /// wire appender's derived-size `ExtentGrant`'s); never its own write.
@@ -10911,36 +10918,32 @@ impl KvMetaBackend {
 
     /// A WIRE joiner's page names its grant — the manager writes it (an
     /// in-process region's page is written inside the grant itself).
+    /// `entry` is the joiner's directory entry off the caller's ONE read
+    /// (`unclaimed_remainder_of`; Issue 13) — `None` writes nothing.
     async fn write_wire_joiner_page_grant(
         &self,
-        appender_id: u32,
+        entry: Option<&super::appender::AppenderEntry>,
         grant: &[super::appender::GrantRun],
     ) -> std::result::Result<(), KvError> {
-        let Some(set) = self.appenders.as_ref() else {
+        let Some(e) = entry else {
             return Ok(());
         };
-        if set.region(appender_id).is_some() {
-            return Ok(());
-        }
-        let entries = super::appender::read_directory(&self.path, &self.sb).await?;
-        if let Some(e) = entries.iter().find(|e| e.appender_id == appender_id) {
-            if let Some(mut page) = e.page.clone() {
-                // ONE writer per page (PR 12 / PR 12b): a page the joiner's
-                // OWN writes own (`ckpt_seq ≥ 1` — its join stamps it) is
-                // never rewritten here; the grant's runs reach the joiner
-                // on the reply and ITS page write names them. A manager
-                // rewrite at a newer generation would stand between the
-                // joiner's RAM generation and the device, and the joiner's
-                // next page — its roots, its tail — would never be the
-                // newest image (found by the first two-daemon pin).
-                if page.ckpt_seq > 0 {
-                    return Ok(());
-                }
-                page.grant = grant.to_vec();
-                for off in e.dir_offsets {
-                    page.generation += 1;
-                    super::appender::write_page(&self.path, off, page.encode()?).await?;
-                }
+        if let Some(mut page) = e.page.clone() {
+            // ONE writer per page (PR 12 / PR 12b): a page the joiner's
+            // OWN writes own (`ckpt_seq ≥ 1` — its join stamps it) is
+            // never rewritten here; the grant's runs reach the joiner
+            // on the reply and ITS page write names them. A manager
+            // rewrite at a newer generation would stand between the
+            // joiner's RAM generation and the device, and the joiner's
+            // next page — its roots, its tail — would never be the
+            // newest image (found by the first two-daemon pin).
+            if page.ckpt_seq > 0 {
+                return Ok(());
+            }
+            page.grant = grant.to_vec();
+            for off in e.dir_offsets {
+                page.generation += 1;
+                super::appender::write_page(&self.path, off, page.encode()?).await?;
             }
         }
         Ok(())

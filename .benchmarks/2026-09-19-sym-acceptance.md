@@ -4332,20 +4332,27 @@ seconds of a JOINER CREATE STORM (the joiners m61 / m62's first storm at
 N = 4, m63..m66's at N = 8) while the manager served an `ExtentGrant`
 burst of **50–80 verbs per second** (62 grants logged in the second
 03:08:16; 69 / 83 / 50 per second at 03:10:51 / :57 / 11:00 — 1,483 in the
-leg, every one `4 extent(s)`, the reactive one-SMO refill class): over
+leg, every one ≤ 8 extents: 845 × 4 / 180 × 3 / 147 × 2 / 2 × 1 the
+reactive `needed.max(SMO_IMAGES_MAX)` asks and 103 × 5 / 54 × 6 / 44 × 7 /
+108 × 8 the cadence's proactive `refill_due()` asks answered the derived
+size, which is the FLOOR 8 for every wire joiner): over
 the N = 8 create the manager's volume 1 served 344 grants + 318 returns
 in ≈ 13 s with `manager_service_ns.execute` +2.36 s — 3.6 ms per verb,
 each a ring-0 control entry + its barrier on the journal lane the
-cycle's barrier #1 queues on. The joiners ask that often because their
-rings sit at the **512 KiB floor** (`appender_ring_bytes` 524,288,
-`appender_ring_grows` 0, `joined_ring_grow_declined` [0, 1] — PR 2's
-drain-then-grow bound, PR 12b's declined growth on a joiner), so a joiner
-checkpoints ≈ 8×/s under a 40k-file storm (m60 +109 checkpoints in 13 s,
-`appender_pressure_cycles` +79), returns its unclaimed remainder at every
-cadence (`extent_grant_returned` +193) and asks one SMO's images again
-(+47 grants × 4 extents) — **F-R5**, the grant / return churn at the
-one-SMO grain, ≈ 100 manager verbs per joiner per storm; the proactive
-50 % refill never engages. **On the fleets that run no joiner create
+cycle's barrier #1 queues on. The joiners ask that often because —
+**F-R5** (PR 13g the fix rung) — `grant_extents_for` derives a WIRE
+joiner's grant from `set.region(id).smo_ewma_milli`, `None` for a wire
+joiner → `ewma = 0` → §5.3.3's derivation is the floor 8 whatever the
+joiner's SMO rate (the EWMA the joiner folds locally never travels on
+`ExtentGrant`), and their rings sit at the **512 KiB floor**
+(`appender_ring_bytes` 524,288, `appender_ring_grows` 0,
+`joined_ring_grow_declined` [0, 1] — PR 2's drain-then-grow bound, PR
+12b's declined growth on a joiner), so a joiner checkpoints ≈ 8×/s under
+a 40k-file storm (m60 +109 checkpoints in 13 s, `appender_pressure_
+cycles` +79), returns the images each barrier RETIRED (`take_returnable`,
+`extent_grant_returned` +193) and re-claims at the SMO grain (+47 grants)
+— claim-and-retire churn, ≈ 100 manager verbs per joiner per storm. **On
+the fleets that run no joiner create
 storm the derivation priced every term**: 0 increments on the two
 3-writer touch fleets and the two 32-writer walls fleets (70
 writer-legs) — the walls rewrite's faces read 50–119 ms on the busiest

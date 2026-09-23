@@ -12064,6 +12064,96 @@ async fn a_quiet_joiners_pool_above_its_target_shrinks_at_the_cadence_and_asks_f
 }
 
 // ---------------------------------------------------------------------------
+// PR 13g review round 1, Issue 11 — the joiner's SMO rate reads its OWN
+// volume's images.
+// ---------------------------------------------------------------------------
+
+/// **A joiner's SMO-rate input is the images ITS OWN passes wrote — exact
+/// per volume** (PR 13g review round 1, Issue 11). The round-0 fold fed
+/// `smos_this_cycle` from the process-wide `META_KV_NODE_{COMPACTIONS,
+/// SPLITS,MERGES}` + `ROOT_COLLAPSES` deltas around each node's flush: a
+/// mount's OTHER volumes' concurrent SMOs inflated this volume's derived
+/// grant (the safe direction, bounded by the cap — and wrong), a split
+/// counted one for its two or three images, and the threshold
+/// maintenance pass's SMOs — the same grant's consumers — counted for
+/// nothing; `SmoContext::images_written`, added by this PR for exactly the
+/// per-volume attribution, is exact and is what a grant extent is
+/// consumed as. The pin: a joiner storms one directory past its leaf
+/// splits (its cadence running as it will — the storm's cycles do the
+/// SMOs), then one final cycle; Σ the counts its folds consumed
+/// (`smo_folded_total`) ≡ Σ the images its passes measured
+/// (`checkpoint_pass_images_total` — the flush pass and the maintenance
+/// pass alike), and the rate moved. RED before the fix: the folds summed
+/// SMOs — a split is one SMO writing two or three images, so the sums
+/// differ whenever the storm split a leaf (asserted: `meta_kv_node_
+/// splits` moved).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiners_smo_rate_reads_its_own_volumes_images() {
+    use squeezefs::meta_backend::kv::META_KV_NODE_SPLITS;
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let joiner = join(&uris, &venue, &mvol, 3).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let id = jvol.appender_stats().unwrap().appender_id;
+    let region = |vol: &KvMetaBackend| {
+        vol.appender_stats()
+            .unwrap()
+            .regions
+            .iter()
+            .find(|r| r.id == id)
+            .expect("the region")
+            .clone()
+    };
+    let own = joiner
+        .create(1, "own", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .unwrap()
+        .ino;
+    let splits0 = META_KV_NODE_SPLITS.load(Relaxed);
+    // The storm: enough dentries under one directory to split its leaf
+    // (the joiner's slot tree) more than once — the joiner's cycles run
+    // their SMOs as the storm goes.
+    let files = create_files(&joiner, own, "s", 6_000).await;
+    jvol.checkpoint_now().await.unwrap();
+    let r = region(&jvol);
+    let images = jvol.checkpoint_pass_images_total();
+    assert!(
+        META_KV_NODE_SPLITS.load(Relaxed) > splits0,
+        "the premise: the storm split a leaf"
+    );
+    assert!(
+        images >= 2,
+        "the premise: the passes wrote images ({images})"
+    );
+    assert_eq!(
+        r.smo_folded_total, images,
+        "the folds consumed exactly the images this volume's passes measured (last cycle {}, \
+         rate EWMA {} milli/s)",
+        r.smo_last_cycle, r.smo_ewma_milli
+    );
+    assert!(r.smo_ewma_milli > 0, "the rate moved");
+    assert_all_resolve(&joiner, own, &files).await;
+    assert_supply_gauges_zero(&jvol, "joiner");
+    shutdown(&joiner).await;
+    assert_must_stay_zero(&mvol, "manager");
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+// ---------------------------------------------------------------------------
 // PR 13g review round 1, Issue 13 — one directory read per wire grant.
 // ---------------------------------------------------------------------------
 

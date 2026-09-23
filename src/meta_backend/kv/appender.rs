@@ -2511,11 +2511,21 @@ pub struct AppenderRegion {
     /// The region's extent grant (§5.3.3) — empty for region 0, whose
     /// images come from the bitmap it owns.
     pub grant: std::sync::Arc<std::sync::Mutex<RegionGrant>>,
-    /// The region's SMO rate, milli-SMOs per second, EWMA over checkpoint
-    /// cycles — the grant derivation's measured input.
+    /// The region's SMO rate, milli-images per second (≈ SMOs — an SMO
+    /// writes one to `SMO_IMAGES_MAX` fresh images, and an image is what
+    /// a grant extent is consumed as), EWMA over checkpoint cycles — the
+    /// grant derivation's measured input. Read off the volume's OWN SMO
+    /// context (`SmoContext::images_written`, exact per volume), never the
+    /// process-wide SMO counters (PR 13g review round 1, Issue 11).
     pub smo_ewma_milli: std::sync::atomic::AtomicU64,
-    /// SMOs of this region's slot trees since the last cycle's EWMA fold.
+    /// Fresh images this region's slot trees' SMOs wrote since the last
+    /// cycle's EWMA fold.
     pub smos_this_cycle: std::sync::atomic::AtomicU64,
+    /// The count the last fold consumed (`smo_last_cycle` on the region's
+    /// stats) and Σ over every fold (`smo_folded_total`) — the witnesses
+    /// for the rate's per-volume input.
+    pub smos_last_cycle: std::sync::atomic::AtomicU64,
+    pub smos_folded_total: std::sync::atomic::AtomicU64,
     /// The region's COMMIT rate, bytes journaled into its ring per second,
     /// EWMA over checkpoint cycles ([`Self::fold_commit_rate`]) — the ring
     /// derivation's measured input (`appender_ring_bytes_derived`; PR
@@ -2549,11 +2559,13 @@ impl AppenderRegion {
         self.grant.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Fold this cycle's SMO count into the rate EWMA (`cycle_ms` = the
+    /// Fold this cycle's image count into the rate EWMA (`cycle_ms` = the
     /// wall since the last fold): `ewma = ewma × 7/8 + rate / 8`.
     pub fn fold_smo_rate(&self, cycle_ms: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         let n = self.smos_this_cycle.swap(0, Relaxed);
+        self.smos_last_cycle.store(n, Relaxed);
+        self.smos_folded_total.fetch_add(n, Relaxed);
         if cycle_ms == 0 {
             return;
         }
@@ -3175,6 +3187,8 @@ impl AppenderSet {
                         grant_returnable: grant.returnable(),
                         grant_promised: grant.promised(),
                         smo_ewma_milli: r.smo_ewma_milli.load(Relaxed),
+                        smo_last_cycle: r.smos_last_cycle.load(Relaxed),
+                        smo_folded_total: r.smos_folded_total.load(Relaxed),
                         dependency_stalls: r.dependency_stalls.load(Relaxed),
                     }
                 })
@@ -3209,8 +3223,12 @@ pub struct AppenderRegionStats {
     /// Extents the §4.7 admission promised against the grant for
     /// admitted-but-unflushed SMOs of this region's leaves (0 at quiesce).
     pub grant_promised: u64,
-    /// The region's SMO rate EWMA (milli-SMOs/s).
+    /// The region's SMO rate EWMA (milli-images/s — Issue 11).
     pub smo_ewma_milli: u64,
+    /// The image count the last fold consumed, and Σ over every fold
+    /// (Issue 11's witnesses).
+    pub smo_last_cycle: u64,
+    pub smo_folded_total: u64,
     pub dependency_stalls: u64,
 }
 

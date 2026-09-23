@@ -1612,6 +1612,8 @@ pub struct KvMetaBackend {
     /// `checkpoint_projected_ms` serve instead of walking the node cache
     /// per `.stats` read (review round 1, Issue 10c).
     pub(super) checkpoint_last_dirty_count: AtomicU64,
+    /// Σ SMO images every measured pass wrote (`checkpoint_pass_images_total`).
+    pub(super) checkpoint_pass_images_total: AtomicU64,
     /// The volume's merge LAP across its trees (`run_merge_sweep`): which
     /// trees completed their lap since the last publish, and the exact
     /// candidate count they reported. Guarded by the SMO mutex's callers;
@@ -3250,6 +3252,7 @@ impl KvMetaBackend {
             checkpoint_node_unit_ns: AtomicU64::new(0),
             checkpoint_image_unit_ns: AtomicU64::new(0),
             checkpoint_last_dirty_count: AtomicU64::new(0),
+            checkpoint_pass_images_total: AtomicU64::new(0),
             merge_lap: std::sync::Mutex::new(VolumeLap::default()),
             merge_laps: AtomicU64::new(0),
             merge_candidates_tail: AtomicU64::new(0),
@@ -12209,8 +12212,12 @@ impl KvMetaBackend {
     /// Push one flush pass's measured work into the volume's two unit
     /// windows and refresh the maxima in force (`checkpoint::flush_unit_ns`;
     /// PR 13g, F-B1) — both flush passes call it with the sample their
-    /// loop split by class.
+    /// loop split by class. `checkpoint_pass_images_total` sums the
+    /// images every pass measured (the Issue 11 pin's witness: a region's
+    /// folded rate input sums to the same per-volume count).
     pub(super) fn note_flush_pass(&self, sample: super::checkpoint::FlushPassSample) {
+        self.checkpoint_pass_images_total
+            .fetch_add(sample.images, Ordering::Relaxed);
         let node = super::checkpoint::flush_unit_ns(sample.node_ns, sample.nodes);
         let image = super::checkpoint::flush_unit_ns(sample.image_ns, sample.images);
         if node.is_none() && image.is_none() {
@@ -12230,6 +12237,12 @@ impl KvMetaBackend {
             self.checkpoint_image_unit_ns
                 .store(w.1.anticipated_ns(), Ordering::Relaxed);
         }
+    }
+
+    /// Σ fresh SMO images every flush and maintenance pass of this volume
+    /// measured (the per-volume image census the region rate is fed from).
+    pub fn checkpoint_pass_images_total(&self) -> u64 {
+        self.checkpoint_pass_images_total.load(Ordering::Relaxed)
     }
 
     /// The flush-pass wall per appended dirty node in force — the horizon
@@ -19876,6 +19889,8 @@ impl KvMetaBackend {
             grant: Default::default(),
             smo_ewma_milli: AtomicU64::new(0),
             smos_this_cycle: AtomicU64::new(0),
+            smos_last_cycle: AtomicU64::new(0),
+            smos_folded_total: AtomicU64::new(0),
             commit_ewma_bytes_per_s: AtomicU64::new(0),
             head_at_last_fold: AtomicU64::new(u64::MAX),
             drained: squeezefs_ipc::sqz_notify::Notify::new(),
@@ -20126,6 +20141,8 @@ impl KvMetaBackend {
                 grant: Arc::new(std::sync::Mutex::new(grant)),
                 smo_ewma_milli: AtomicU64::new(0),
                 smos_this_cycle: AtomicU64::new(0),
+                smos_last_cycle: AtomicU64::new(0),
+                smos_folded_total: AtomicU64::new(0),
                 commit_ewma_bytes_per_s: AtomicU64::new(0),
                 head_at_last_fold: AtomicU64::new(u64::MAX),
                 drained: squeezefs_ipc::sqz_notify::Notify::new(),

@@ -12015,6 +12015,82 @@ async fn a_quiet_joiners_pool_above_its_target_shrinks_at_the_cadence_and_asks_f
 }
 
 // ---------------------------------------------------------------------------
+// PR 13g review round 1, Issue 13 — one directory read per wire grant.
+// ---------------------------------------------------------------------------
+
+/// **A wire appender's derived-size `ExtentGrant` walks the appender
+/// directory ONCE** (PR 13g review round 1, Issue 13). The manager's verb
+/// wall is the F-B1 term this rung prices, and every whole-directory walk
+/// on a wire verb is a term of it: the round-0 grant read the directory
+/// for the caller's unclaimed remainder, AGAIN for the hint's identity
+/// (`wire_appender_identity`) and a third time to rewrite the wire page's
+/// grant word — three walks of the same pages. The pin: the process-wide
+/// census `appender::directory_reads()` moves by exactly one across a
+/// joiner's explicit ask above the floor (the hint path) that carves.
+/// RED before the fix: three.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wire_extent_grant_walks_the_appender_directory_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let joiner = join(&uris, &venue, &mvol, 3).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let id = jvol.appender_stats().unwrap().appender_id;
+    let unclaimed = |vol: &KvMetaBackend| {
+        vol.appender_stats()
+            .unwrap()
+            .regions
+            .iter()
+            .find(|r| r.id == id)
+            .expect("the region")
+            .grant_unclaimed
+    };
+    let before = unclaimed(&jvol);
+    let want = u32::try_from(before).unwrap() + 24;
+    assert!(
+        u64::from(want) > squeezefs::meta_backend::kv::appender::GRANT_EXTENTS_FLOOR,
+        "the ask rides the hint path"
+    );
+    let reads0 = squeezefs::meta_backend::kv::appender::directory_reads();
+    let got = jvol.joined_extent_grant(want).await.unwrap();
+    let reads1 = squeezefs::meta_backend::kv::appender::directory_reads();
+    assert!(got > 0, "the ask carved");
+    assert!(unclaimed(&jvol) > before, "the pool grew");
+    assert_eq!(
+        reads1 - reads0,
+        1,
+        "a wire ExtentGrant walks the directory once (appender_directory_reads)"
+    );
+    // The hint followed the ask (the path the second read served).
+    let identity = jvol.joined_wire().unwrap().identity;
+    let hint = mvol
+        .appender_hint_for(identity.node_token, identity.mount_slot)
+        .await
+        .unwrap();
+    assert_eq!(
+        hint.grant_extents,
+        u64::from(want),
+        "the hint rode the carve"
+    );
+    assert_supply_gauges_zero(&jvol, "joiner");
+    shutdown(&joiner).await;
+    assert_must_stay_zero(&mvol, "manager");
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+// ---------------------------------------------------------------------------
 // PR 13g review round 1, Issue 8 — `GrowRing` honours the set-wide ring
 // budget.
 // ---------------------------------------------------------------------------

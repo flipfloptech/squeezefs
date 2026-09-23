@@ -13996,6 +13996,10 @@ impl SqueezefsFilesystem {
                     "appender_grow_ring_short_declines".into(),
                     appender(&|s| s.grow_ring_short_declines),
                 );
+                metrics.insert(
+                    "appender_directory_reads".into(),
+                    serde_json::json!(crate::meta_backend::kv::appender::directory_reads()),
+                );
                 // THE MANAGER FAMILY (design-symmetric-metadata §11 — PR 3,
                 // dark): per volume; `vacant` / 0 on every bit-17-absent
                 // mount. `manager_lease` is the posture word — `held` (this

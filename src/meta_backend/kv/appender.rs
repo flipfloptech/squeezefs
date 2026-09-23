@@ -2208,6 +2208,19 @@ pub fn page_write_slots(mask: u8, generation: u64) -> Vec<usize> {
     }
 }
 
+/// Whole-directory walks this process performed (`appender_directory_
+/// reads`; PR 13g review round 1, Issue 13): every manager verb on a wire
+/// appender pays its page read here — a verb's count of them is a term
+/// of the manager's verb wall (F-B1), so a wire `ExtentGrant` performs
+/// exactly ONE (pinned).
+static APPENDER_DIRECTORY_READS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The process-wide census of [`read_directory`] walks.
+pub fn directory_reads() -> u64 {
+    APPENDER_DIRECTORY_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Walk the appender directory of a bit-17 volume: appender 0 from the
 /// fixed journal extent, appenders ≥ 1 from the chain
 /// `superblock.appender_dir` names. Every pair slot of every chain extent
@@ -2217,6 +2230,7 @@ pub async fn read_directory(
     path: &Path,
     sb: &super::superblock::SuperblockV3,
 ) -> Result<Vec<AppenderEntry>, KvError> {
+    APPENDER_DIRECTORY_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut out = Vec::new();
     // Appender 0: all four slots sit in the fixed extent.
     let offs0 = appender0_page_offsets(&sb.journal);

@@ -1732,33 +1732,38 @@ impl KvTree {
         &self,
         ctx: &mut SmoContext,
     ) -> Result<MaintenanceOutcome, KvError> {
-        self.run_maintenance_until(ctx, None).await
+        self.run_maintenance_until(ctx, &mut super::checkpoint::DrainBudget::unbounded())
+            .await
     }
 
-    /// [`Self::run_maintenance`] bounded by a deadline (finding 49): pops
-    /// until the queue is empty OR `deadline` has passed — always at least
-    /// one entry, so every pass makes progress. The checkpoint task runs
-    /// its threshold drains under its cadence period: a storm that
-    /// re-enqueues faster than the drain pops (every pop is a device
-    /// round trip; an SMO is several) would otherwise hold the drain open
-    /// indefinitely and the cadence tick — the only path to a ring-
-    /// pressure checkpoint — behind it. Work left queued is the caller's
-    /// to re-arm.
+    /// [`Self::run_maintenance`] under a PASS's drain budget (finding 49):
+    /// pops until the queue is empty OR the budget refuses — the budget
+    /// admits its first item unconditionally, so every pass makes
+    /// progress, and every later item only inside its deadline. The
+    /// checkpoint task runs its threshold drains under its cadence
+    /// period: a storm that re-enqueues faster than the drain pops (every
+    /// pop is a device round trip; an SMO is several) would otherwise hold
+    /// the drain open indefinitely and the cadence tick — the only path
+    /// to a ring-pressure checkpoint — behind it. Work left queued is the
+    /// caller's to re-arm. The budget is ONE per pass ACROSS the trees the
+    /// caller walks (PR 13g, F-B1): a per-tree "first item free" made the
+    /// pass's bound `period + trees × one item` on a forest — 64 rotor
+    /// slot trees each with one queued append put the cadence's age
+    /// decision 350 ms past its trigger at a storm's onset on a parked
+    /// device, the very cycle the projection had priced right.
     pub(crate) async fn run_maintenance_until(
         &self,
         ctx: &mut SmoContext,
-        deadline: Option<std::time::Instant>,
+        budget: &mut super::checkpoint::DrainBudget,
     ) -> Result<MaintenanceOutcome, KvError> {
         let mut out = MaintenanceOutcome::default();
-        let mut first = true;
         while let Some(entry) = self.maintenance.pop() {
             let addr = **entry;
-            if !first && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            if !budget.admits() {
                 // Past the budget: hand the entry back for the next pass.
                 self.maintenance.push(addr);
                 break;
             }
-            first = false;
             let images_before = ctx.images_written();
             let started = std::time::Instant::now();
             let r = self.maintain_node(ctx, addr, &mut out).await;

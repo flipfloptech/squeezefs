@@ -2831,6 +2831,150 @@ fn sym_appender_ring_derives_from_the_reserve_and_the_solo_ring() {
     );
 }
 
+/// **The cadence's LIVE projection (PR 13g, F-B1)** — the term the
+/// horizon cannot carry: a storm's first cycle after a quiet horizon (the
+/// box's 199 quiet cycles emptied the 64-cycle window of the previous
+/// row's 133 ms and the onset cycle tripped at 1,127 ms with 11 ms
+/// anticipated) is priced from the work it CARRIES — the dirty nodes ×
+/// the measured per-node append wall + the images the pending commits
+/// promised × the measured per-image SMO wall — read live at every tick;
+/// the trigger anticipates `max(horizon term, projection)`. A unit is one
+/// pass's wall over its count of the class, `None` for a pass that ran
+/// none (the unit in force KEEPS what the passes that ran it measured —
+/// what survives quiet), and the unit in force is the horizon MAXIMUM
+/// over those passes (a bound anticipated by a bound — the term's own
+/// law); a unit nothing has measured is 0 (the fresh mount's shipped
+/// posture). Drift is red here.
+#[test]
+fn checkpoint_projection_prices_the_pending_work_from_measured_units() {
+    use squeezefs::meta_backend::kv::checkpoint::{
+        checkpoint_trigger_ms, flush_unit_ns, projected_flush_wall_ns, CycleTermWindow,
+        FlushPassSample, CHECKPOINT_MAX_AGE_MS, TERM_HORIZON_CYCLES,
+    };
+    let ms = 1_000_000u64;
+    // One pass's unit: the wall over the count; none without the class.
+    assert_eq!(
+        flush_unit_ns(0, 0),
+        None,
+        "a pass without the class measures nothing"
+    );
+    assert_eq!(flush_unit_ns(999 * ms, 0), None, "…whatever its wall");
+    assert_eq!(flush_unit_ns(80 * ms, 40), Some(2 * ms));
+    // The unit in force: the horizon maximum over the passes that ran the
+    // class — a slow pass raises it at once, a quiet pass leaves it.
+    let mut w = CycleTermWindow::new();
+    assert_eq!(w.anticipated_ns(), 0, "nothing measured yet");
+    for unit in [
+        flush_unit_ns(80 * ms, 40),
+        flush_unit_ns(400 * ms, 40),
+        flush_unit_ns(0, 0),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        w.push(unit);
+    }
+    assert_eq!(
+        w.anticipated_ns(),
+        10 * ms,
+        "the slow pass is the unit in force"
+    );
+    for _ in 0..TERM_HORIZON_CYCLES - 1 {
+        w.push(2 * ms);
+    }
+    assert_eq!(
+        w.anticipated_ns(),
+        10 * ms,
+        "…for the whole horizon of class passes"
+    );
+    w.push(2 * ms);
+    assert_eq!(
+        w.anticipated_ns(),
+        2 * ms,
+        "…and forgotten when it leaves it"
+    );
+    // The sample's split by class: a node whose flush wrote images is SMO
+    // work, every other an append.
+    let mut s = FlushPassSample::default();
+    s.note(300_000, 0);
+    s.note(200_000, 0);
+    s.note(7 * ms, 1);
+    s.note(15 * ms, 3);
+    assert_eq!((s.nodes, s.node_ns), (2, 500_000));
+    assert_eq!((s.smo_nodes, s.images, s.image_ns), (2, 4, 22 * ms));
+    // The projection: dirty × per-node + promised × per-image, saturating.
+    assert_eq!(projected_flush_wall_ns(0, 250_000, 0, 2 * ms), 0);
+    assert_eq!(
+        projected_flush_wall_ns(100, 250_000, 40, 2 * ms),
+        100 * 250_000 + 40 * 2 * ms
+    );
+    assert_eq!(
+        projected_flush_wall_ns(100, 250_000, 40, 0),
+        140 * 250_000,
+        "an unmeasured image unit is floored at the node unit — an image is one node write at \
+         least"
+    );
+    assert_eq!(
+        projected_flush_wall_ns(100, 250_000, 40, 100_000),
+        140 * 250_000,
+        "…and so is an image unit measured below it"
+    );
+    assert_eq!(
+        projected_flush_wall_ns(u64::MAX, 2, 1, 1),
+        u64::MAX,
+        "saturating"
+    );
+    // The trigger anticipates the LARGER of the horizon term and the
+    // projection — the quiet horizon's 0 with 105 ms of pending work fires
+    // at 895 ms, never at the shipped 1,000.
+    let max_age = CHECKPOINT_MAX_AGE_MS as u64;
+    let projected_ms = projected_flush_wall_ns(100, 250_000, 40, 2 * ms) / ms;
+    assert_eq!(projected_ms, 105);
+    assert_eq!(checkpoint_trigger_ms(max_age, projected_ms), max_age - 105);
+    assert_eq!(
+        checkpoint_trigger_ms(max_age, 133u64.max(projected_ms)),
+        max_age - 133
+    );
+}
+
+/// **The threshold drain's budget is the PASS's** (PR 13g, F-B1; finding
+/// 49's bound restated): the first item of a pass is admitted whatever
+/// the deadline — progress — and every later one only while the deadline
+/// stands, whichever tree it belongs to, so a pass's bound is `period +
+/// one item's service time`. The per-tree form it replaces admitted one
+/// free item PER TREE, and a forest of 64 slot trees each with one queued
+/// append put the cadence's age decision 350 ms past its trigger at a
+/// storm's onset on a parked device — the cycle the projection had priced
+/// right. An unbounded budget admits everything.
+#[test]
+fn threshold_drain_budget_is_the_passes_not_each_trees() {
+    use squeezefs::meta_backend::kv::checkpoint::DrainBudget;
+    let passed = std::time::Instant::now() - std::time::Duration::from_millis(1);
+    let mut b = DrainBudget::new(Some(passed));
+    assert!(!b.progressed());
+    assert!(
+        b.admits(),
+        "the pass's first item runs whatever the deadline"
+    );
+    assert!(b.progressed());
+    for _ in 0..64 {
+        assert!(
+            !b.admits(),
+            "past the deadline every later item — every later TREE's first — waits for the next \
+             pass"
+        );
+    }
+    let ahead = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    let mut open = DrainBudget::new(Some(ahead));
+    for _ in 0..64 {
+        assert!(open.admits(), "inside the deadline every item runs");
+    }
+    let mut unbounded = DrainBudget::unbounded();
+    for _ in 0..64 {
+        assert!(unbounded.admits(), "the shutdown tick's drain is unbounded");
+    }
+}
+
 /// The symmetric MANAGER's derivations (design-symmetric-metadata §5.3.3
 /// grant sizing, §5.9 the failover bound, §1.6 "Manager death"; PR 3):
 /// `grant_extents = clamp(2 × ewma_smo_rate × failover_bound_s, 8,

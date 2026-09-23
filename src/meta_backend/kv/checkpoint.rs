@@ -1181,7 +1181,11 @@ pub fn flush_unit_ns(wall_ns: u64, count: u64) -> Option<u64> {
 /// pending work instead of a past that never saw it. A unit no pass has
 /// measured yet is 0 (a fresh mount's first storm cycle is the horizon's
 /// alone — the shipped posture until its first pass with the class); a
-/// measured unit is the horizon MAXIMUM ([`flush_unit_ns`]).
+/// measured unit is the horizon MAXIMUM ([`flush_unit_ns`]). The image
+/// unit is FLOORED at the node unit: an image is one node write at least,
+/// so a promised image no SMO pass has priced yet (the first storm after
+/// a mount, the fresh-tree shape — every promise is a first) is priced as
+/// the append it cannot cost less than, never at 0.
 pub fn projected_flush_wall_ns(
     dirty_nodes: u64,
     node_unit_ns: u64,
@@ -1190,7 +1194,7 @@ pub fn projected_flush_wall_ns(
 ) -> u64 {
     dirty_nodes
         .saturating_mul(node_unit_ns)
-        .saturating_add(promised_extents.saturating_mul(image_unit_ns))
+        .saturating_add(promised_extents.saturating_mul(image_unit_ns.max(node_unit_ns)))
 }
 
 /// **The cycle terms a forest volume's cadence anticipates over** — the
@@ -1314,6 +1318,48 @@ pub const FIXPOINT_COVER_CYCLES_MAX: u64 = 16;
 /// v2 flusher's sentinel discipline; pinned by
 /// `tests/dismount_teardown_tests.rs`) — plus an owned liveness token the
 /// teardown tests probe through `checkpoint_alive_probe`.
+/// **One threshold-drain pass's budget** (finding 49; PR 13g, F-B1): the
+/// first item of the PASS is admitted unconditionally — progress — and
+/// every later one only while the deadline stands, whatever tree it
+/// belongs to. The bound the cadence relies on is therefore `period +
+/// ONE item's service time` per pass: the previous per-tree form
+/// admitted one free item per tree and put a forest's tick `trees × one
+/// item` late. `None` is the unbounded form (the shutdown tick, the
+/// harnesses' `run_maintenance`).
+#[derive(Debug, Clone, Copy)]
+pub struct DrainBudget {
+    deadline: Option<std::time::Instant>,
+    progressed: bool,
+}
+
+impl DrainBudget {
+    /// A pass bounded at `deadline` (`None` = unbounded).
+    pub fn new(deadline: Option<std::time::Instant>) -> Self {
+        Self {
+            deadline,
+            progressed: false,
+        }
+    }
+
+    /// The unbounded pass.
+    pub fn unbounded() -> Self {
+        Self::new(None)
+    }
+
+    /// Whether the next item may run: the pass's first always, a later
+    /// one iff the deadline has not passed. Marks the pass progressed.
+    pub fn admits(&mut self) -> bool {
+        let admit = !self.progressed || self.deadline.is_none_or(|d| std::time::Instant::now() < d);
+        self.progressed = true;
+        admit
+    }
+
+    /// Whether the pass has run an item.
+    pub fn progressed(&self) -> bool {
+        self.progressed
+    }
+}
+
 pub(super) fn spawn_checkpoint_task(be: &Arc<KvMetaBackend>) {
     // PR M1 ordering pin (design-metadata-throughput §5.0 B2): the mount
     // gate committed + barriered the writer_claim BEFORE this call — the
@@ -1568,12 +1614,16 @@ async fn maintenance_pass(
 ) -> Result<(), KvError> {
     let mut smo = be.smo.lock().await;
     // The trees this mount MAINTAINS (never a projection or a foreign
-    // lessee's — PR 13). The pass's items feed the cadence's unit windows
-    // like a flush pass's (PR 13g, F-B1).
+    // lessee's — PR 13), in the pass's ROTATED order under ONE budget
+    // (PR 13g, F-B1): the budget bounds the pass at `period + one item`
+    // across every tree, and the rotation is what keeps a tree late in
+    // the order from starving behind the trees the budget reaches first
+    // under a storm that refills every queue.
+    let mut budget = DrainBudget::new(deadline);
     let mut sample = FlushPassSample::default();
-    for tree in be.maintainable_trees() {
+    for tree in be.maintainable_trees_rotated() {
         loop {
-            let r = tree.run_maintenance_until(&mut smo, deadline).await;
+            let r = tree.run_maintenance_until(&mut smo, &mut budget).await;
             match r {
                 Ok(out) => {
                     sample.fold(&out.sample);
@@ -1619,8 +1669,103 @@ async fn maintenance_pass(
     Ok(())
 }
 
-/// One task tick: maintenance (within `drain_deadline`) → deferred flush
-/// barrier → checkpoint when due. `final_cycle` (shutdown) drains
+/// The cadence tick's checkpoint decision (§4.6 pt 2): what made a cycle
+/// due — the ring's distance, a region's pressure, the dirty-node cap, the
+/// age law with the decision's lateness — and whether there is anything
+/// to cover.
+struct CheckpointDecision {
+    due: bool,
+    covers_something: bool,
+    ring_pressure: bool,
+    region_pressure: bool,
+    /// `Some(late)` = due by age on a forest volume (the lateness rides
+    /// the cycle it runs); the flat arm carries `Some(0)`.
+    age_late_ns: Option<u64>,
+}
+
+impl CheckpointDecision {
+    fn runs_a_cycle(&self) -> bool {
+        self.due && self.covers_something
+    }
+}
+
+/// Read the checkpoint decision's inputs and take it (PR 13g, F-B1 made
+/// it a function the tick calls before AND after its threshold drain).
+fn decide_checkpoint(
+    be: &Arc<KvMetaBackend>,
+    last_checkpoint: &std::time::Instant,
+    mutex_wait_ns: u64,
+    final_cycle: bool,
+    elastic_ceiling: Option<u64>,
+) -> CheckpointDecision {
+    let core = be.journal_ring().core();
+    let distance = core.head().saturating_sub(core.reusable_upto());
+    // Ring 0 keeps the shipped law verbatim (a flat mount is byte-
+    // identical); a DECLARED region's ring has its own (PR 2, `AppenderSet::
+    // ring_pressure`): a committer parked at a full region ring holds no
+    // node lock (§4.4 pt 5), so nothing is dirty and ring 0 is idle — read
+    // alone, this tick would never make a cycle due and nobody would
+    // advance that ring's `reusable_upto` (the wedge the pressure contract
+    // pins).
+    let region_pressure = be.appenders().is_some_and(|a| a.ring_pressure());
+    let ring_pressure = distance > core.geometry().logical_len() / 2 || region_pressure;
+    let dirty_nodes = be.dirty_node_count();
+    // The freed-offset composite's ceiling in force replaces the constant
+    // while a reader ask is live (`P/2` — every reader pass finds a new
+    // root); `None` is the shipped decision verbatim. Compared against the
+    // ELAPSED time, so a ceiling that tightens mid-interval fires at once
+    // — what lets an advertised ceiling be a promise about commits that
+    // preceded the grant, not only about the ones that follow it.
+    // The age law on a FOREST volume (PR 13e, F-B1 — the population the
+    // flush-ceiling audit judges): the elapsed time runs from the last
+    // cycle's COLLECTION (a leaf dirtied after it is this cycle's — the
+    // interval the landing ceiling bounds; a cycle's post-barrier work no
+    // longer eats the margin), against the TRIGGER in force — the MAX AGE
+    // minus the cycle's measured TERM (`checkpoint_trigger_ms`; the max
+    // age is what the tick fires AT, the landing ceiling is `max_age + 2
+    // × tick` — review round 1, Issue 7), so the covering barrier lands
+    // inside the promise the ceiling's consumers read; the tick in force
+    // is what one period of the decision's lateness is priced against. A
+    // FLAT volume keeps the shipped law verbatim: the max age elapsed
+    // since the last cycle's end.
+    let max_age_ms = elastic_ceiling.map_or(CHECKPOINT_MAX_AGE_MS as u64, |c| c);
+    // `Some(late)` = due by age on a forest volume, with the decision's
+    // lateness for the cycle it runs; the flat arm carries no lateness.
+    let age_late_ns = if be.appenders().is_some() {
+        be.checkpoint_due_by_age(
+            max_age_ms,
+            mutex_wait_ns,
+            crate::mono_core::monotonic_ns_u64(),
+            dirty_nodes,
+        )
+    } else {
+        (last_checkpoint.elapsed().as_millis() >= u128::from(max_age_ms)).then_some(0)
+    };
+    let due = final_cycle
+        || ring_pressure
+        // The cap is resolved ONCE at open (`KvMetaBackend::dirty_node_cap`
+        // — the backend-knob convention): this branch runs on every 50 ms
+        // cadence tick, and re-deriving here (env `CString`s + cgroup/
+        // sysinfo probes in `resolve_budget_now`) was an allocation stream
+        // that broke the op-economy allocation-free contract (2026-08-02).
+        || dirty_nodes > be.dirty_node_cap()
+        || age_late_ns.is_some();
+    // A declared region's uncovered ring counts as "something to cover"
+    // exactly as ring 0's `distance > 0` does (its tail lands a cycle
+    // after its flush, like the ledger's).
+    let regions_uncovered = be.appenders().is_some_and(|a| a.rings_uncovered());
+    CheckpointDecision {
+        due,
+        covers_something: final_cycle || dirty_nodes > 0 || distance > 0 || regions_uncovered,
+        ring_pressure,
+        region_pressure,
+        age_late_ns,
+    }
+}
+
+/// One task tick: checkpoint decision → maintenance (within
+/// `drain_deadline`, when no cycle is due) → deferred flush barrier →
+/// checkpoint when due (decided again after a drain). `final_cycle` (shutdown) drains
 /// in-flight commits first and forces a full cycle with an immediate
 /// post-ledger barrier, leaving `tail == head` — an empty replay window
 /// for the next mount. `elastic_ceiling` is the freed-offset composite's
@@ -1691,6 +1836,29 @@ async fn tick(
     let mut smo = be.smo.lock().await;
     let mutex_wait_ns = lock_requested.elapsed().as_nanos() as u64;
 
+    // The checkpoint DECISION is read BEFORE the threshold drain (PR 13g,
+    // F-B1): a cycle's flush pass appends every dirty node, so a drain
+    // ahead of a DUE cycle is work the cycle repeats — and its bound
+    // (`period + one item`) was a second period of decision lateness on
+    // top of the maintenance wake's own pass just before the tick, past
+    // the landing ceiling's two-tick margin by itself. A tick with no
+    // cycle due drains (step 1) and decides again after it: a trigger the
+    // drain crossed fires this tick, never the next. The shutdown tick
+    // keeps the drain FIRST and unbounded — its final cycle must see
+    // every queued append.
+    let mut decision = if final_cycle {
+        None
+    } else {
+        Some(decide_checkpoint(
+            be,
+            last_checkpoint,
+            mutex_wait_ns,
+            final_cycle,
+            elastic_ceiling,
+        ))
+    };
+    let run_drain = !decision.as_ref().is_some_and(|d| d.runs_a_cycle());
+
     // 1. Threshold maintenance (appends + SMOs, serialized here — §4.6),
     //    within the drain budget (finding 49: the checkpoint decision
     //    below must not sit behind an unbounded drain under a storm).
@@ -1701,30 +1869,38 @@ async fn tick(
     //    centralized progress audit (clause b) bounds genuine wedges.
     //    Over the trees this mount MAINTAINS (PR 13): a joined appender's
     //    projections of the manager's trees are never appended to here.
-    //    The pass's items feed the cadence's unit windows (PR 13g, F-B1).
-    let mut sample = FlushPassSample::default();
-    for tree in be.maintainable_trees() {
-        loop {
-            match tree.run_maintenance_until(&mut smo, drain_deadline).await {
-                Ok(out) => {
-                    sample.fold(&out.sample);
-                    break;
+    //    ONE budget across the trees, rotated (PR 13g, F-B1 — the age
+    //    decision sits behind this drain when it runs; its lateness is
+    //    bounded by the budget's `period + one item`, never by the
+    //    forest's width).
+    if run_drain {
+        let mut budget = DrainBudget::new(drain_deadline);
+        let mut sample = FlushPassSample::default();
+        for tree in be.maintainable_trees_rotated() {
+            loop {
+                match tree.run_maintenance_until(&mut smo, &mut budget).await {
+                    Ok(out) => {
+                        sample.fold(&out.sample);
+                        break;
+                    }
+                    Err(
+                        KvError::JournalReserveExhausted { .. } | KvError::PendingFreeFull { .. },
+                    ) => {
+                        be.checkpoint_cycle(&mut smo, true).await?;
+                        *last_checkpoint = std::time::Instant::now();
+                    }
+                    Err(e @ KvError::NoSpace { .. }) => {
+                        // §4.7 space class (see `maintenance_pass`): the
+                        // cycle below owns the retry.
+                        be.enter_heap_full(&format!("threshold maintenance: {e}"));
+                        break;
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(KvError::JournalReserveExhausted { .. } | KvError::PendingFreeFull { .. }) => {
-                    be.checkpoint_cycle(&mut smo, true).await?;
-                    *last_checkpoint = std::time::Instant::now();
-                }
-                Err(e @ KvError::NoSpace { .. }) => {
-                    // §4.7 space class (see `maintenance_pass`): the
-                    // cycle below owns the retry.
-                    be.enter_heap_full(&format!("threshold maintenance: {e}"));
-                    break;
-                }
-                Err(e) => return Err(e),
             }
         }
+        be.note_flush_pass(sample);
     }
-    be.note_flush_pass(sample);
 
     // 2. The deferred-mode flush barrier (the v2 flusher tick). Also
     //    drains the §4.6 pt 3 pending-reclaim for previously-written
@@ -1737,68 +1913,22 @@ async fn tick(
     }
 
     // 3. Checkpoint decision (§4.6 pt 2): cadence, journal distance,
-    //    dirty-node cap, shutdown.
-    let core = be.journal_ring().core();
-    let distance = core.head().saturating_sub(core.reusable_upto());
-    // Ring 0 keeps the shipped law verbatim (a flat mount is byte-
-    // identical); a DECLARED region's ring has its own (PR 2, `AppenderSet::
-    // ring_pressure`): a committer parked at a full region ring holds no
-    // node lock (§4.4 pt 5), so nothing is dirty and ring 0 is idle — read
-    // alone, this tick would never make a cycle due and nobody would
-    // advance that ring's `reusable_upto` (the wedge the pressure contract
-    // pins).
-    let region_pressure = be.appenders().is_some_and(|a| a.ring_pressure());
-    let ring_pressure = distance > core.geometry().logical_len() / 2 || region_pressure;
-    let dirty_nodes = be.dirty_node_count();
-    // The freed-offset composite's ceiling in force replaces the constant
-    // while a reader ask is live (`P/2` — every reader pass finds a new
-    // root); `None` is the shipped decision verbatim. Compared against the
-    // ELAPSED time, so a ceiling that tightens mid-interval fires at once
-    // — what lets an advertised ceiling be a promise about commits that
-    // preceded the grant, not only about the ones that follow it.
-    // The age law on a FOREST volume (PR 13e, F-B1 — the population the
-    // flush-ceiling audit judges): the elapsed time runs from the last
-    // cycle's COLLECTION (a leaf dirtied after it is this cycle's — the
-    // interval the landing ceiling bounds; a cycle's post-barrier work no
-    // longer eats the margin), against the TRIGGER in force — the MAX AGE
-    // minus the cycle's measured TERM (`checkpoint_trigger_ms`; the max
-    // age is what the tick fires AT, the landing ceiling is `max_age + 2
-    // × tick` — review round 1, Issue 7), so the covering barrier lands
-    // inside the promise the ceiling's consumers read; the tick in force
-    // is what one period of the decision's lateness is priced against. A
-    // FLAT volume keeps the shipped law verbatim: the max age elapsed
-    // since the last cycle's end.
-    let max_age_ms = elastic_ceiling.map_or(CHECKPOINT_MAX_AGE_MS as u64, |c| c);
-    // `Some(late)` = due by age on a forest volume, with the decision's
-    // lateness for the cycle it runs; the flat arm carries no lateness.
-    let age_late_ns = if be.appenders().is_some() {
-        be.checkpoint_due_by_age(
-            max_age_ms,
+    //    dirty-node cap, shutdown — read once more after a drain (or for
+    //    the first time on the shutdown tick).
+    if run_drain {
+        decision = Some(decide_checkpoint(
+            be,
+            last_checkpoint,
             mutex_wait_ns,
-            crate::mono_core::monotonic_ns_u64(),
-            dirty_nodes,
-        )
-    } else {
-        (last_checkpoint.elapsed().as_millis() >= u128::from(max_age_ms)).then_some(0)
-    };
-    let due_by_age = age_late_ns.is_some();
-    let due = final_cycle
-        || ring_pressure
-        // The cap is resolved ONCE at open (`KvMetaBackend::dirty_node_cap`
-        // — the backend-knob convention): this branch runs on every 50 ms
-        // cadence tick, and re-deriving here (env `CString`s + cgroup/
-        // sysinfo probes in `resolve_budget_now`) was an allocation stream
-        // that broke the op-economy allocation-free contract (2026-08-02).
-        || dirty_nodes > be.dirty_node_cap()
-        || due_by_age;
-    // A declared region's uncovered ring counts as "something to cover"
-    // exactly as ring 0's `distance > 0` does (its tail lands a cycle
-    // after its flush, like the ledger's).
-    let regions_uncovered = be.appenders().is_some_and(|a| a.rings_uncovered());
-    if due && (final_cycle || dirty_nodes > 0 || distance > 0 || regions_uncovered) {
+            final_cycle,
+            elastic_ceiling,
+        ));
+    }
+    let d = decision.expect("a checkpoint decision was taken on every arm");
+    if d.runs_a_cycle() {
         // Immediate post-ledger barrier under pressure or at shutdown:
         // reclamation must not lag a cycle when parkers wait on it.
-        if region_pressure {
+        if d.region_pressure {
             if let Some(a) = be.appenders() {
                 a.pressure_cycles.fetch_add(1, Ordering::Relaxed);
             }
@@ -1807,17 +1937,17 @@ async fn tick(
         // that one (PR 13e review round 1, Issue 1): a due tick that runs
         // no cycle records nothing.
         if be.appenders().is_some() {
-            if let Some(late_ns) = age_late_ns {
+            if let Some(late_ns) = d.age_late_ns {
                 be.note_checkpoint_decision(late_ns, tick_ms);
             }
         }
-        be.checkpoint_cycle(&mut smo, ring_pressure || final_cycle)
+        be.checkpoint_cycle(&mut smo, d.ring_pressure || final_cycle)
             .await?;
         *last_checkpoint = std::time::Instant::now();
         if elastic_ceiling.is_some() {
             crate::free_grace::note_elastic_checkpoint_cycle();
         }
-    } else if due_by_age && be.appenders().is_some() {
+    } else if d.age_late_ns.is_some() && be.appenders().is_some() {
         // An idle due tick with nothing to cover — nothing dirty, the ring
         // covered, no region uncovered — is an EMPTY COLLECTION: every leaf
         // dirtied from here is bounded from here, so the age law's

@@ -173,7 +173,7 @@ use crate::meta_backend::sync_coalescer::SyncCoalescer;
 use crate::meta_backend::{DirEntry, Ino, Inode, Metadata};
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 /// Symmetric PR 6: the cross-owner arms of this backend (the served
@@ -1599,6 +1599,8 @@ pub struct KvMetaBackend {
     /// count is read at the tick and the §4.7 admission PROMISES every
     /// SMO's images at commit, so the work the next cycle carries is known
     /// before it runs). Published as `meta_kv_checkpoint_{node,image}_unit_ns`.
+    /// The threshold drain's rotation counter (`maintainable_trees_rotated`).
+    pub(super) maintenance_rotor: AtomicUsize,
     pub(super) checkpoint_flush_units: std::sync::Mutex<(
         super::checkpoint::CycleTermWindow,
         super::checkpoint::CycleTermWindow,
@@ -3228,6 +3230,7 @@ impl KvMetaBackend {
             checkpoint_term_ns: AtomicU64::new(0),
             checkpoint_decision_late_ns: AtomicU64::new(0),
             checkpoint_decision_tick_ns: AtomicU64::new(0),
+            maintenance_rotor: AtomicUsize::new(0),
             checkpoint_flush_units: std::sync::Mutex::new((
                 super::checkpoint::CycleTermWindow::new(),
                 super::checkpoint::CycleTermWindow::new(),
@@ -5571,6 +5574,20 @@ impl KvMetaBackend {
             }
         }
         out
+    }
+
+    /// [`Self::maintainable_trees`] rotated by one position per call —
+    /// the threshold drain's walk order (PR 13g, F-B1): a pass runs under
+    /// ONE budget across the trees, so the tree that starts the walk
+    /// changes every pass and no tree waits behind the same trees for
+    /// ever under a storm that refills every queue.
+    pub(super) fn maintainable_trees_rotated(&self) -> Vec<Arc<KvTree>> {
+        let mut trees = self.maintainable_trees();
+        if trees.len() > 1 {
+            let start = self.maintenance_rotor.fetch_add(1, Ordering::Relaxed) % trees.len();
+            trees.rotate_left(start);
+        }
+        trees
     }
 
     /// This volume's superblock uuid as one word — the process-global
@@ -11909,14 +11926,22 @@ impl KvMetaBackend {
     }
 
     /// The trigger for a max age at a dirty count the caller already read
-    /// (the cadence tick's — it walks the cache once per tick; the count
-    /// is the live projection's input, `checkpoint_projected_ms_for`,
-    /// published beside the trigger and not yet anticipated by it).
-    pub(super) fn checkpoint_trigger_ms_for(&self, max_age_ms: u64, _dirty_nodes: u64) -> u64 {
+    /// (the cadence tick's — it walks the cache once per tick). The term in
+    /// force is the LARGER of what the horizon remembers and what the
+    /// pending work projects (PR 13g, F-B1): a horizon of past terms
+    /// forgets a burst that quiet cycles pushed out and never saw a burst
+    /// larger than every one before — the dirty nodes and the promised
+    /// images times their measured units are the next cycle's own bound,
+    /// read live at every tick.
+    pub(super) fn checkpoint_trigger_ms_for(&self, max_age_ms: u64, dirty_nodes: u64) -> u64 {
         if self.appenders.is_none() {
             return max_age_ms;
         }
-        super::checkpoint::checkpoint_trigger_ms(max_age_ms, self.checkpoint_term_ms())
+        super::checkpoint::checkpoint_trigger_ms(
+            max_age_ms,
+            self.checkpoint_term_ms()
+                .max(self.checkpoint_projected_ms_for(dirty_nodes)),
+        )
     }
 
     /// The cadence's age law (PR 13e, F-B1): a cycle is due when the time

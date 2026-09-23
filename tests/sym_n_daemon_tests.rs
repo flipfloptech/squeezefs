@@ -11708,8 +11708,8 @@ async fn a_joiner_killed_with_a_pool_wider_than_its_page_names_rejoins_with_the_
         .unwrap()
         .ino;
     let files = create_files(&joiner, shared, "x", 8).await;
-    // (claimed, unclaimed) of the joiner's region; (returned, granted) of
-    // its set — the joiner's one own region.
+    // (claimed, unclaimed, pending + returnable) of the joiner's region;
+    // (returned, granted) of its set — the joiner's one own region.
     let region_faces = |vol: &KvMetaBackend| {
         let s = vol.appender_stats().unwrap();
         let own = s
@@ -11721,6 +11721,7 @@ async fn a_joiner_killed_with_a_pool_wider_than_its_page_names_rejoins_with_the_
         (
             own.grant_claimed,
             own.grant_unclaimed,
+            own.grant_pending + own.grant_returnable,
             s.grant_returned,
             s.grant_granted,
         )
@@ -11728,7 +11729,7 @@ async fn a_joiner_killed_with_a_pool_wider_than_its_page_names_rejoins_with_the_
     // Six asks, the manager claiming between them: the pool grows by a
     // non-adjacent run each time.
     for round in 0..6u32 {
-        let (_, unclaimed, _, _) = region_faces(&jvol);
+        let (_, unclaimed, _, _, _) = region_faces(&jvol);
         let got = jvol
             .joined_extent_grant(u32::try_from(unclaimed + 16).unwrap())
             .await
@@ -11749,9 +11750,24 @@ async fn a_joiner_killed_with_a_pool_wider_than_its_page_names_rejoins_with_the_
         runs > squeezefs::meta_backend::kv::appender::GRANT_RUNS_MAX as u64,
         "the premise: the pool holds more runs than the page names ({runs})"
     );
-    jvol.checkpoint_now().await.unwrap();
-    let (claimed0, unclaimed0, _, granted0) = region_faces(&jvol);
+    // No quiet joiner cycle here: the class is a joiner killed with its
+    // storm's pool still standing — a quiet cadence would SHRINK the pool
+    // to its target first (Issue 5), returning the surplus durably. Every
+    // wire refill already wrote the page naming the pool's largest runs.
+    let (claimed0, unclaimed0, _, _, granted0) = region_faces(&jvol);
     assert!(unclaimed0 >= 16 * 5, "the pool: {unclaimed0}");
+    // What the page NAMES of the pool — the census must restore the rest.
+    let named0: u64 = page_of(&uris[0], &mvol, id)
+        .await
+        .unwrap()
+        .grant
+        .iter()
+        .map(|r| u64::from(r.len))
+        .sum();
+    assert!(
+        named0 < unclaimed0,
+        "the premise: the page names {named0} of a pool of {unclaimed0}"
+    );
     // The kill: dropped without its leave — its page stays Live.
     drop(jvol);
     drop(joiner);
@@ -11765,30 +11781,44 @@ async fn a_joiner_killed_with_a_pool_wider_than_its_page_names_rejoins_with_the_
         id,
         "the same region"
     );
-    let (claimed1, unclaimed1, returned1, granted1) = region_faces(&avol);
+    let (claimed1, unclaimed1, queued1, returned1, granted1) = region_faces(&avol);
     let s = avol.appender_stats().unwrap();
     assert_eq!(granted1, granted0, "the record is the grant");
+    // The closure at the rejoin over EVERY pool state: the own-residue
+    // cover is a joiner cycle, and a quiet cycle queues the pool's surplus
+    // above its target for return (Issue 5) — queued, never leaked.
     assert_eq!(
         granted1,
-        claimed1 + returned1 + unclaimed1,
+        claimed1 + returned1 + unclaimed1 + queued1,
         "the closure holds at the rejoin"
     );
     assert_eq!(
-        unclaimed1, unclaimed0,
-        "the pool is WHOLE at the rejoin (claimed {claimed0} → {claimed1}; restored {})",
+        unclaimed1 + queued1,
+        unclaimed0,
+        "the pool is WHOLE at the rejoin — kept or queued to return, nothing claimed \
+         (claimed {claimed0} → {claimed1}; restored {})",
         s.pool_restored_extents
     );
     assert_eq!(claimed1, claimed0, "no pool extent reads claimed");
-    assert!(
-        s.pool_restored_extents >= unclaimed0 - unclaimed1.min(unclaimed0)
-            && s.pool_restored_extents > 0,
-        "the census restored the unnamed runs ({})",
-        s.pool_restored_extents
+    assert_eq!(
+        s.pool_restored_extents,
+        unclaimed0 - named0,
+        "the census restored exactly the unnamed runs"
     );
     let orphans = avol.c13_orphan_image_extents().await.unwrap();
     assert!(
         orphans.is_empty(),
         "no C13 orphan at the rejoined joiner: {orphans:?}"
+    );
+    // At rest — one wire cadence returns the queued surplus — the
+    // three-term closure the review named holds against the record.
+    avol.checkpoint_now().await.unwrap();
+    let (claimed2, unclaimed2, queued2, returned2, granted2) = region_faces(&avol);
+    assert_eq!(queued2, 0, "the surplus went back");
+    assert_eq!(
+        granted2,
+        claimed2 + returned2 + unclaimed2,
+        "extent_grant_extents ≡ claimed + returned + unclaimed at rest"
     );
     assert_all_resolve(&again, shared, &files).await;
     assert_supply_gauges_zero(&avol, "the rejoined joiner");
@@ -11995,6 +12025,19 @@ async fn a_quiet_joiners_pool_above_its_target_shrinks_at_the_cadence_and_asks_f
         record.len(),
         own.grant_claimed + own.grant_unclaimed + own.grant_pending + own.grant_returnable,
         "the manager's record shrank with the pool"
+    );
+    // The published closure law holds across the shrink: what left the
+    // pool for the manager reads RETURNED (`extent_grant_extents ≡
+    // claimed + returned + unclaimed`, §11).
+    let s = jvol.appender_stats().unwrap();
+    assert_eq!(
+        s.grant_granted,
+        s.grant_claimed + s.grant_returned + s.grant_unclaimed,
+        "the shrink's surplus counts as returned (granted {}, held {}, returned {}, unclaimed {})",
+        s.grant_granted,
+        s.grant_claimed,
+        s.grant_returned,
+        s.grant_unclaimed
     );
     // Three more: nothing moves.
     for _ in 0..3 {

@@ -2653,8 +2653,43 @@ impl KvMetaBackend {
         // join's size never stands for the joiner's lifetime; a
         // pressure-driven cycle returns nothing (the ring is the
         // bottleneck, not the heap).
-        if !pressure {
-            returnable.extend(region.grant().shrink_to(target));
+        let shrunk = if pressure {
+            Vec::new()
+        } else {
+            region.grant().shrink_to(target)
+        };
+        // The ordering law (review round 2, Issue 16b): a shrunk extent is
+        // PAGE-NAMED (the cycle's page write named the pool's largest
+        // runs), and the manager re-grants a returned extent at once — so
+        // the page is rewritten WITHOUT the surplus and barriered BEFORE
+        // the return lands (`wire_extent_refill`'s discipline before every
+        // ask), and no device page ever names an extent the record no
+        // longer grants; a crash-rejoin's `recover` reads no stale word. A
+        // page write that fails UNDOES the shrink (the surplus back in the
+        // pool the old page still names truly) and returns the recycle's
+        // surplus alone (retired images — never page-named).
+        if !shrunk.is_empty() {
+            {
+                let g = region.grant();
+                let mut page = region.page.lock().unwrap_or_else(|e| e.into_inner());
+                page.grant = g.page_runs();
+            }
+            let written = match KvMetaBackend::write_region_page_at(&self.path, region).await {
+                Ok(()) => self.sync_device().await.map_err(KvError::Io),
+                Err(e) => Err(e),
+            };
+            match written {
+                Ok(()) => returnable.extend(shrunk),
+                Err(e) => {
+                    log::warn!(
+                        "meta volume {}: joined appender {}'s page write ahead of its shrink's \
+                         return failed ({e}) — the surplus stays for the next cycle",
+                        self.path.display(),
+                        region.id
+                    );
+                    region.grant().restore_unclaimed(shrunk);
+                }
+            }
         }
         if !returnable.is_empty() {
             let runs = super::super::slot_state::ExtentGrantRecord::from_extents(

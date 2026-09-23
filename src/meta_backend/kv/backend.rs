@@ -19856,6 +19856,7 @@ impl KvMetaBackend {
             joined_appender: joined.as_ref().map(|j| j.appender_id),
         };
         let mut regions: Vec<Arc<AppenderRegion>> = Vec::new();
+        let mut stale_page_words_dropped = 0u64;
 
         // ---- Region 0: the fixed ring, already replayed by the caller.
         let page0 = entries
@@ -20135,7 +20136,20 @@ impl KvMetaBackend {
                 Some(v) => super::slot_state::ExtentGrantRecord::decode(&v)?,
                 None => Default::default(),
             };
-            let grant = super::appender::RegionGrant::recover(record.extents(), &page.grant);
+            // The page word ∩ the record (review round 2, Issue 16a): a
+            // page-named extent the record no longer grants was returned
+            // after that page write — never adopted, counted.
+            let (grant, dropped) =
+                super::appender::RegionGrant::recover(record.extents(), &page.grant);
+            if dropped > 0 {
+                stale_page_words_dropped += dropped;
+                log::warn!(
+                    "meta volume {}: appender {id}'s page names {dropped} unclaimed extent(s) its \
+                     grant record no longer holds — returned after that page write; dropped, never \
+                     adopted (appender_stale_page_words_dropped)",
+                    path.display()
+                );
+            }
             regions.push(Arc::new(AppenderRegion {
                 id,
                 page_offsets,
@@ -20235,6 +20249,8 @@ impl KvMetaBackend {
             }
             Arc::new(plane)
         });
+        set.stale_page_words_dropped
+            .store(stale_page_words_dropped, Ordering::Relaxed);
         let set = AppenderSet {
             regions,
             leases,

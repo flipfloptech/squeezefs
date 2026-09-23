@@ -1672,22 +1672,39 @@ impl RegionGrant {
     }
 
     /// Recovery: the whole grant (tree 0's record) against the page's
-    /// unclaimed remainder — everything else is claimed.
-    pub fn recover(record_extents: impl IntoIterator<Item = u64>, unclaimed: &[GrantRun]) -> Self {
+    /// unclaimed remainder — everything else is claimed. **The page word
+    /// is adopted ∩ the record** (PR 13g review round 2, Issue 16a): the
+    /// record is the manager's truth (`record ⊆ claimed ∪ unclaimed ∪
+    /// pending ∪ returnable`, PR 3's law), and a page-named extent the
+    /// record no longer grants was RETURNED after that page write — the
+    /// manager may hold it in another appender's grant by now; adopting
+    /// it would make this region a second custodian. Answers the grant
+    /// and the count of page-named extents dropped
+    /// (`appender_stale_page_words_dropped`).
+    pub fn recover(
+        record_extents: impl IntoIterator<Item = u64>,
+        unclaimed: &[GrantRun],
+    ) -> (Self, u64) {
+        let record: std::collections::BTreeSet<u64> = record_extents.into_iter().collect();
         let mut g = Self::default();
+        let mut dropped = 0u64;
         for r in unclaimed {
             for e in r.start..r.start + u64::from(r.len) {
-                g.unclaimed.insert(e);
+                if record.contains(&e) {
+                    g.unclaimed.insert(e);
+                } else {
+                    dropped += 1;
+                }
             }
         }
-        for e in record_extents {
+        for e in record {
             g.granted += 1;
             if !g.unclaimed.contains(&e) {
                 g.claimed.insert(e);
             }
         }
         g.refill_reference = g.unclaimed.len() as u64;
-        g
+        (g, dropped)
     }
 
     /// Claim the lowest extent of the SMALLEST unclaimed run (ties: the
@@ -1975,6 +1992,18 @@ impl RegionGrant {
         out.sort_unstable();
         self.returned += out.len() as u64;
         out
+    }
+
+    /// Undo a [`Self::shrink_to`] whose page rewrite failed (review round
+    /// 2, Issue 16b): the surplus goes back into the pool — which the old
+    /// page word, still on the device, names truly — and the count the
+    /// shrink moved to `returned` comes back.
+    pub fn restore_unclaimed(&mut self, extents: Vec<u64>) {
+        for e in extents {
+            if self.unclaimed.insert(e) {
+                self.returned = self.returned.saturating_sub(1);
+            }
+        }
     }
 
     /// Grant headroom the §4.7 admission may promise against: the

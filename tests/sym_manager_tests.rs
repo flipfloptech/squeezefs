@@ -351,9 +351,19 @@ fn the_ram_grant_claims_the_smallest_run_first_parks_frees_on_its_tail_and_recyc
     // Closure over every op so far: granted ≡ held + returned + unclaimed.
     assert_eq!(g.granted, g.held() + g.returned + g.unclaimed());
     // Recovery: the record's whole grant against the page's remainder.
-    let r = RegionGrant::recover([10u64, 11, 12, 13], &[GrantRun { start: 12, len: 2 }]);
-    assert_eq!((r.unclaimed(), r.claimed()), (2, 2));
+    let (r, dropped) = RegionGrant::recover([10u64, 11, 12, 13], &[GrantRun { start: 12, len: 2 }]);
+    assert_eq!((r.unclaimed(), r.claimed(), dropped), (2, 2, 0));
     assert!(r.contains(10) && r.contains(13));
+    // A page word past the record (an extent returned after the page
+    // write — PR 13g review round 2, Issue 16a) is dropped, counted.
+    let (stale, dropped) =
+        RegionGrant::recover([10u64, 11, 12, 13], &[GrantRun { start: 12, len: 4 }]);
+    assert_eq!((stale.unclaimed(), stale.claimed(), dropped), (2, 2, 2));
+    assert!(!stale.contains(14) && !stale.contains(15));
+    assert_eq!(
+        stale.granted, 4,
+        "granted is the record's, never the word's"
+    );
     let mut r = r;
     r.claim_exact(12);
     r.free_exact(10, 77);

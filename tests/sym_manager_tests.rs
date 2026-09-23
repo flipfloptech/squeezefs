@@ -1154,11 +1154,13 @@ async fn crash_after_an_unpublished_root_swap(
 /// its bit (its replayed free is dropped, `meta_kv_replay_root_frees_
 /// dropped`); repair returns the orphan to the bitmap through the
 /// appender's own ring (a `free` gated on its tail, the ordinary SMO
-/// retirement shape — the cadence's `ReturnExtents` clears the bit and
-/// rewrites the grant record), the closure law holds throughout, a second
-/// sweep finds nothing, and the remount reads every acked record.
+/// retirement shape — the cadence then SETTLES it: recycled into the
+/// appender's pool below its target, or `ReturnExtents` clears the bit
+/// and rewrites the grant record — PR 13g, the grant is a pool), the
+/// closure law holds throughout, a second sweep finds nothing, and the
+/// remount reads every acked record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn c13_finds_exactly_the_unpublished_root_swaps_successor_and_repair_returns_it() {
+async fn c13_finds_exactly_the_unpublished_root_swaps_successor_and_repair_settles_it() {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     let tag = volume_tag("vol-0011223344556677");

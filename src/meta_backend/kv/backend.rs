@@ -9807,14 +9807,23 @@ impl KvMetaBackend {
                 remaining = remaining_after(end);
             }
             if remaining.runs.len() > max_runs {
+                // The CAPACITY class (review round 2, Issue 21): the record
+                // can name no more fragments — what it could name landed,
+                // the rest stays granted for the caller's retry. Never the
+                // witness class: `manager_verb_refusals` keeps its
+                // must-stay-0 meaning.
                 failure = Some(KvError::Busy(format!(
-                    "{}: ReturnExtents from appender {appender_id} refused — freeing extent {} \
+                    "{}: ReturnExtents from appender {appender_id} cut short — freeing extent {} \
                      would split its grant record past the {max_runs}-run cap this volume's \
-                     tree-0 value cap names (manager_verb_refusals)",
+                     tree-0 value cap names; {landed} of {} landed, the rest stay granted \
+                     (extent_return_run_cap_refusals)",
                     self.path.display(),
-                    granted[landed]
+                    granted[landed],
+                    granted.len()
                 )));
-                set.verbs.refusals.fetch_add(1, Ordering::Relaxed);
+                set.verbs
+                    .return_run_cap_refusals
+                    .fetch_add(1, Ordering::Relaxed);
                 break;
             }
             let mut recs: Vec<(u8, Record)> = granted[landed..end]

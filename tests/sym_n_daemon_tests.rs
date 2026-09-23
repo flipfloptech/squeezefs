@@ -11525,6 +11525,129 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
 }
 
 // ---------------------------------------------------------------------------
+// PR 13g review round 1, Issue 3 — a carve or a return wider than ONE
+// control entry.
+// ---------------------------------------------------------------------------
+
+/// **A derived-size carve past one control entry lands WHOLE, and the
+/// leave returns the whole pool** (PR 13g review round 1, Issue 3). An
+/// allocator delta frames at `record_frame_len(8, 1)` = 25 B and a
+/// control entry holds `MAX_ENTRY_LEN` = 128 KiB, so a carve past ≈ 5,200
+/// extents — the joiner's `derived + promised` ask at the pin's own 92
+/// SMO/s is ≈ 8,300 — was `EntryTooLarge`, undone, and re-asked at every
+/// cadence and by the reactive ladder: every refill failing on a heap
+/// with room (`free > 4N × 5,200` extents — production geometry), the
+/// grant exhausting, SMOs deferring, the ring filling — the EAGAIN class
+/// on a healthy heap. The leave's return of such a pool was one entry
+/// too, and left the page `Live`. Now the manager CHUNKS the carve and
+/// the return by `journal::pack_entries` under a derived per-entry bound
+/// (the entry cap less the rewritten grant record's frame — each extent
+/// adds at most one run — over the delta's frame; PR 4's leave law), each
+/// chunk a consistent record state: a heap 4 GiB wide (the wire cap
+/// `free/(4 × appenders)` admits the ask), a wire joiner, ONE
+/// `ExtentGrant` for a third more than one entry's worth of deltas —
+/// answered whole in more than one entry, the grant closure exact — then
+/// the joiner's clean leave returns the whole pool, the page `Free`, the
+/// record gone. RED before the fix: `EntryTooLarge`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_carve_past_one_control_entry_lands_whole_and_the_leave_returns_it_whole() {
+    use squeezefs::meta_backend::kv::journal::{entry_payload_cap, record_frame_len};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    // A SPARSE 4 GiB member: 65,536 extents of 64 KiB — the wire cap
+    // admits an ask past one entry's worth at two appenders.
+    let uris = format_stamped_set_with_config_len(dir.path(), 1, 4 * 1024 * 1024 * 1024).await;
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let joiner = join(&uris, &venue, &mvol, 1).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let js = jvol.appender_stats().expect("a joined appender");
+    let id = js.appender_id;
+    assert_ne!(id, 0, "the joiner is a wire appender");
+    let per_entry = entry_payload_cap() / record_frame_len(8, 1);
+    let want = per_entry + per_entry / 3;
+    let cap = squeezefs::meta_backend::kv::appender::grant_extents_wire_cap(mvol.free_extents(), 2);
+    assert!(
+        want < cap,
+        "the premise: the heap-share cap ({cap}) admits an ask of {want} extents"
+    );
+    let before = mvol.appender_stats().expect("the manager's faces");
+    let entries_before = mvol.journal_ring().written_entries();
+    // The joiner's page names its whole (contiguous) initial pool, so the
+    // manager's remainder word is the joiner's unclaimed count.
+    let remainder = jvol
+        .appender_stats()
+        .unwrap()
+        .regions
+        .iter()
+        .find(|r| r.id == id)
+        .expect("the joiner's region")
+        .grant_unclaimed;
+    let runs = mvol
+        .manager_extent_grant(id, want as u32)
+        .await
+        .expect("a carve wider than one control entry lands");
+    let carved: u64 = runs.iter().map(|r| u64::from(r.len)).sum();
+    let after = mvol.appender_stats().expect("the manager's faces");
+    assert_eq!(
+        carved,
+        want - remainder,
+        "the carve tops the pool up to the ask"
+    );
+    assert_eq!(
+        after.extent_grant_extents - before.extent_grant_extents,
+        carved,
+        "every carved extent is counted granted"
+    );
+    let entries = mvol.journal_ring().written_entries() - entries_before;
+    assert!(
+        entries >= 2,
+        "a carve of {carved} deltas past one entry's {per_entry} rides more than one control \
+         entry ({entries})"
+    );
+    let record = mvol
+        .extent_grant_record(id)
+        .await
+        .expect("the joiner's grant record");
+    assert_eq!(
+        record.len(),
+        want,
+        "the durable record names the whole pool"
+    );
+    // The joiner's leave returns the whole pool — more than one entry of
+    // free deltas — and the record goes with the page.
+    shutdown(&joiner).await;
+    let record = mvol
+        .extent_grant_record(id)
+        .await
+        .expect("the joiner's grant record after its leave");
+    assert!(
+        record.is_empty(),
+        "the leave returned the whole pool ({} extents still granted)",
+        record.len()
+    );
+    let m = mvol.appender_stats().unwrap();
+    assert_eq!(m.live, 1, "the joiner's page is Free");
+    assert_eq!(
+        m.grant_granted,
+        m.grant_claimed + m.grant_returned + m.grant_unclaimed,
+        "the grant closure holds at the manager"
+    );
+    assert_must_stay_zero(&mvol, "manager");
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+// ---------------------------------------------------------------------------
 // PR 13g — F-B1: the manager's flush-ceiling term at a storm's ONSET after a
 // QUIET horizon (the record's §4.4an; the box record's review, Issue 2).
 // ---------------------------------------------------------------------------

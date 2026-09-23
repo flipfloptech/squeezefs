@@ -1919,6 +1919,111 @@ and end (no heat soak). Artifacts:
 `/scratch/tmp/sym-box/rows-gate1-13e-20260923-015902{,-rev}/` (+ `.log`,
 `REDUCED.md`).
 
+##### 3.9.5.2 Gate 3 — `sym-scale` (B, the armed plane; N = 1/2/4/8 as ONE row set on fleet A, 03:05:59 → 03:15:26 UTC): **F-B1 TRIPPED TWICE on the manager — `appender_flush_ceiling_overruns` +1 in the N = 4 row and +1 in the N = 8 row, both on its second metadata volume, 1,127 / 1,125 ms (25–27 ms past the ceiling), with PR 13e's derivation ENGAGED (`meta_kv_checkpoint_term_ms` anticipating 127–133 ms, the trigger pulled to 867–873 ms) and nothing excused; the row set stopped at r1 (the counted-run law). Both trips sit inside the first seconds of a JOINER CREATE STORM while the manager served an `ExtentGrant` / `ReturnExtents` burst of 50–80 verbs/s — the joiners' 512 KiB floor rings checkpointing ≈ 8×/s under the storm and refilling at the one-SMO grain (4 extents per verb); the wall multiple 3.53× at N = 8 (a 4 s launch skew after `/` STRIPED at the row's mkdirs; per-writer storms 9.2–14.4 s), `C/CPU-S` 0.67×, ingest 5.50×**
+
+The A arm (`mw-scale`) was NOT re-run: its 0.07× (§3.9.4.2, F-R2) is the
+shipped posture's number and 13e / 13f change nothing on that path.
+Order: the fleet fresh (manager + 7 joined writers + 1 token reader,
+`create N=2 --symmetric --writers=7 --token-readers`), ONE row set.
+
+| N | **create/s · ×N=1** | `C/CPU-S` (create phase) | **ingest MiB/s · ×** | `MGR_LOAD` / `MGR_CPU` / handovers / ships / rpcs | ingest amplification (`/proc/diskstats`, the 2 data namespaces; user N × 1 GiB): device write ÷ user · `wareq-sz` · device read ÷ user | per-writer create storms (s) | verdict (the leg's) |
+|---|---|---|---|---|---|---|---|
+| 1 | **4,928 · 1.00×** | 4,133 | 1,327 · 1.00× | 3 % / 114 % / 0 / 0 / 0 | **1.239** · 1,518 KiB · 0.239 | 8.1 | MET |
+| 2 | **9,102 · 1.85×** | 3,860 (0.93×) | 2,406 · 1.81× | 1 % / 115 % / 0 / 1 / 0 | **1.194** · 1,366 KiB · 0.194 | 8.8 / 7.8 | MET |
+| 4 | **15,645 · 3.17×** | 3,241 (0.78×) | 4,613 · 3.48× | 0 % / 126 % / 0 / 3 / 0 | **1.139** · 1,308 KiB · 0.139 | 9.2–10.2 | the wall law MET (≥ 2.8×); **`MISS(must-stay-0: m0 appender_flush_ceiling_overruns +1)`** |
+| 8 | **17,415 · 3.53×** | 2,782 (0.67×) | **7,292 · 5.50×** | 0 % / 88 % / 0 / 4 / 0 | **1.129** · 1,266 KiB · 0.129 | 9.2–14.4 (2,770–4,346 c/s each) | the wall law MISS on creates (3.53× vs ≥ 5.6×), MET on ingest; **`MISS(must-stay-0: m0 +1)`** |
+
+**F-B1 — the box's VERDICT on PR 13e's derivation: NOT FIXED — the
+tripwire trips, twice, and the derivation was live when it did.** The
+manager's kept log (`13e-nw-20260923-030537-scale/scale-r1/daemon-logs/m0.log`):
+`03:08:22Z WARN … meta volume /dev/nvme31n1: flush ceiling OVERRUN —
+appender region(s) [(0, 1127)] … exceeded the 1100 ms landing ceiling with
+every structural hold's capped overlap excluded` and the same at
+`03:10:56Z` with `(0, 1125)` — region 0 (the manager's own), the SECOND
+metadata volume both times, 27 and 25 ms past the ceiling. The
+derivation's faces at the rows' ends (the leg's new per-writer F-B1
+line): m0 `meta_kv_checkpoint_term_ms` **[81, 133]** / trigger **[919,
+867]** after N = 4, **[36, 127]** / **[964, 873]** after N = 8 (volume 1
+anticipating a 127–133 ms term — the trigger pulled 130 ms early); the
+joiners' terms 4–136 ms (m61 [136, 9], m63 [5, 131], m66 [15, 120]),
+triggers 864–996; `appender_flush_ceiling_excused_ns` 0 /
+`…_service_extensions` 0 / `…_recovery_extensions` 0 on every writer,
+the ceiling 1,100 published. So the cycle that overran had a term
+≥ 100 ms ABOVE the horizon maximum of its previous 64 cycles — the
+"burst larger than any before" §4.4an says the tripwire is designed to
+catch, and which the derivation cannot anticipate BY CONSTRUCTION (it
+prices the past). **What the burst was (the kept log, second by second):**
+both trips fall in the first seconds of a joiner CREATE storm — the N = 4
+storm (the joiners m61 / m62's first storm, ≈ 03:08:15 → 03:08:26) and
+the N = 8 storm (m63..m66's first, ≈ 03:10:50 → 03:11:07) — while the
+manager served an **`ExtentGrant` burst: 62 grants logged in the second
+03:08:16, 85 over 03:08:16–19, 30 over 03:08:20–22 (the trip at :22);
+69 / 20 / 9 / 42 / 23 / 18 per second over 03:10:51–56 (the trip at :56),
+83 at 03:10:57, 50 at 03:11:00** — 1,483 grants in the leg, every one
+`4 extent(s)` (the reactive one-SMO refill class, `SMO_IMAGES_MAX`; never
+the derived grant size). Over the N = 8 create the manager's volume 1
+served **344 grants + 318 returns = 662 verbs in ≈ 13 s (≈ 51/s)** with
+`manager_service_ns.execute` **+2.36 s** (3.6 ms per verb — each a ring-0
+control entry + its barrier on the same journal lane the checkpoint
+cycle's barrier #1 queues on), volume 0 +0.47 s over 221 verbs;
+`manager_verbs` [824, 1229] → [991, 1891] (Σ since mount 2,935 by the
+leg's end, `extent_grants` [274, 702], `extent_returns` [208, 723]);
+`manager_load_pct` read [0, 1] — the load gauge's window does not see a
+13 s burst. **Why the joiners ask that often — a finding beside F-B1
+(F-R5, reported not fixed):** every joiner's ring is at the **512 KiB
+floor** on both volumes (`appender_ring_bytes` 524,288, `appender_ring_
+grows` 0, `joined_ring_grow_declined` [0, 1] — PR 2's drain-then-grow
+bound, PR 12b's "ring growth is DECLINED on a joiner"), so under a 40k-file
+create storm a joiner's ring fills every ≈ 120 ms: m60 ran
+**109 checkpoints in the 13 s N = 8 create** (`appender_pressure_cycles`
++79 on volume 1), each cycle RETURNING its unclaimed remainder at the
+cadence (`extent_grant_returned` [68, 896] → [68, 1,089], **+193**) and
+the next flush pass asking the manager for one SMO's images again
+(`joined_wire_extent_grants` +47 × 4 extents = +188; `extent_grant_
+claimed` 64 → 72, `unclaimed` 8 → 4) — a grant / return ping-pong at
+the one-SMO grain, 4 extents (1 MiB) per manager verb, ≈ 100 manager
+verbs per joiner per storm. The proactive 50 % refill never engages (the
+remainder is returned before it is half-consumed); the reactive
+INTERNAL-class refill is the ONLY grant path a floor-ring joiner runs
+under a storm. The manager's term under that service is F-B1's residue:
+§7 item 3's derivation prices the cycle's OWN past terms, not the verb
+service the joiners' cadence puts on ring 0 in the same second. Remedy
+shapes (PR 14): the joiner's ring past the floor (PR 2's owed
+drain-then-grow, or the EWMA-sized join), the reactive refill asking the
+DERIVED grant (not one SMO's images) once a storm is observed, and/or the
+manager's term folding the in-flight verb service — a margin derived
+from the pass wall alone cannot see a burst that starts inside the
+cycle.
+
+**The rates (the wall law re-read):** N = 2 / 4 MET (1.85× / 3.17×
+creates, 1.81× / 3.48× ingest); **N = 8 3.53× creates (MISS vs ≥ 5.6×) /
+5.50× ingest (MET)**. The create multiple is LOWER than the re-run's
+4.27× while the per-writer storms were FASTER: 9.2–14.4 s (2,770–4,346
+c/s each) against the re-run's uniform 13.5–14.9 s (2,687–2,973) — the
+leg's wall counts from the row's first `mkdir` to the last storm's end,
+and this row carried ≈ 4 s of launch skew: the eight `mkdir
+/scale-…-n8-w*` into `/` by eight creators are the 3b shape, and **the
+ROOT STRIPED at 03:10:48** (`directory 1 STRIPED into 64 stripes (3
+supplied by creators [1, 2, 3], 61 minted by the holder)`, migration
+complete at :48) two seconds before the storms began — the design's own
+striping arm engaging on the row's setup, a venue-of-the-harness term
+beside §3.9.3's co-located term (the storms' own concurrency, had they
+started together, reads 320,000 / 14.4 s = 22,200 c/s = 4.5×). The
+`C/CPU-S` face 4,133 → 3,860 → 3,241 → 2,782 (0.93× / 0.78× / 0.67× —
+the re-run read 0.92× / 0.77× / 0.61×). **The per-NODE law stays PR
+15's.** Engagement: handovers 0, ships 0 / 1 / 3 / 4 (≤ N), `dlm_rpcs` 0
+on every writer, `appenders_known` == N at every row, `manager_load_pct`
+≤ 3 %, `MGR_CPU` 88–126 %. Deleted-stays-deleted and the fsck oracle
+were NOT reached (the leg dies on the must-stay-0 set before them, as
+§3.9.4.2's did). **Amplification (the first `/proc/diskstats` read on an
+N-writer leg — the §3.9.4.5 owed item):** the ingest's device writes
+1.239× → 1.129× user from N = 1 to 8 with `wareq-sz` 1,518 → 1,266 KiB
+and device READS 0.24× → 0.13× of the user bytes — the device-overlay
+vehicle's kernel-split segments (a 4 MiB `dd` write arrives as ≤ 1 MiB
+FUSE writes; the overlay stores each and settles with a ranged gap seed
+— the re-run's ledger read `flush_seed_read_bytes` 0.17× at N = 8), the
+same shape on every N, ≈ 1.1–1.2× device ÷ user.
+
 ## 4. Issues found (each with its PR and its red pin)
 
 ### 4.1 Fixed on this branch

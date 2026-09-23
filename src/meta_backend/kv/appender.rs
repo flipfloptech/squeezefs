@@ -1274,6 +1274,38 @@ pub fn ring_segments_that_fit(runs: &[GrantRun], floor_extents: u64) -> (Vec<Gra
     (kept, released)
 }
 
+/// **The joined appender's POOL TARGET** (PR 13g review round 1, Issue 5
+/// — ONE size for the recycle's keep, the shrink's mark and the ask):
+/// `max(derived + promised, pool_floor)` bounded by `cap` (the heap-share
+/// cap a wire ask is clamped to — an ask above it is answered verbatim)
+/// and never below `promised` (the headroom the admitted SMOs already
+/// hold). `pool_floor` is the JOIN's cost class — `GRANT_EXTENTS_FLOOR +
+/// M` (the rotor the joiner mints lazily, one image each, none of them a
+/// promise): a quiet joiner's pool settles at the size its join carved,
+/// never at the derived floor that would make its first storm cycle ask
+/// one SMO at a time again, and never at the last storm's size for its
+/// lifetime.
+pub fn joined_pool_target(derived: u64, promised: u64, pool_floor: u64, cap: u64) -> u64 {
+    derived
+        .saturating_add(promised)
+        .max(pool_floor)
+        .min(cap)
+        .max(promised)
+}
+
+/// The join's cost class — the standing pool a quiet joiner keeps.
+pub fn joined_pool_floor(mint_slots: u64) -> u64 {
+    GRANT_EXTENTS_FLOOR + mint_slots
+}
+
+/// **The joined appender's refill law** (Issue 5b): an ask is due when the
+/// HEADROOM (unclaimed less promised) fell below half the derived size —
+/// the 50 % law over what the pool can still promise; the promises
+/// themselves are inside the target the ask names.
+pub fn joined_refill_due(headroom: u64, derived: u64) -> bool {
+    headroom < derived / 2
+}
+
 /// The runs a page NAMES of a remainder `runs` (ascending by start):
 /// every run when they fit the page's [`GRANT_RUNS_MAX`], else the
 /// LARGEST runs (ties: the lowest start), back in ascending order.
@@ -1869,6 +1901,37 @@ impl RegionGrant {
             }
         }
         surplus
+    }
+
+    /// **The pool's SHRINK** (PR 13g review round 1, Issue 5): take the
+    /// unclaimed extents above `target` out of the pool — the SMALLEST
+    /// runs first (the `claim()` order: a fragment leaves before a run is
+    /// broken), the lowest extents of the run that straddles the mark —
+    /// and answer them for the cadence's `ReturnExtents`. Nothing below
+    /// `target` moves; `target` is never below the promised headroom (the
+    /// caller's law).
+    pub fn shrink_to(&mut self, target: u64) -> Vec<u64> {
+        let mut surplus = self.unclaimed().saturating_sub(target);
+        let mut out = Vec::with_capacity(surplus as usize);
+        if surplus == 0 {
+            return out;
+        }
+        let mut runs = self.unclaimed_runs();
+        runs.sort_by(|a, b| a.len.cmp(&b.len).then(a.start.cmp(&b.start)));
+        for r in runs {
+            if surplus == 0 {
+                break;
+            }
+            let take = u64::from(r.len).min(surplus);
+            for e in r.start..r.start + take {
+                if self.unclaimed.remove(&e) {
+                    out.push(e);
+                }
+            }
+            surplus -= take;
+        }
+        out.sort_unstable();
+        out
     }
 
     /// Grant headroom the §4.7 admission may promise against: the

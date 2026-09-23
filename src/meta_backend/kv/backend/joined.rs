@@ -2629,13 +2629,41 @@ impl KvMetaBackend {
             }
         }
         let derived = self.joined_derived_grant();
+        // ONE target (review round 1, Issue 5 — `joined_pool_target`): the
+        // recycle's keep, the shrink's mark and the ask's size — the
+        // derived size plus the images the pending commits PROMISED, never
+        // below the join's cost class (FLOOR + M), bounded by the heap
+        // share the manager clamps a wire ask to (this mount's projection
+        // of the free heap).
+        let target = {
+            let g = region.grant();
+            let cap = self.appenders.as_ref().map_or(u64::MAX, |set| {
+                super::super::appender::grant_extents_wire_cap(
+                    self.alloc.free_extents(),
+                    set.appenders_known.load(Ordering::Relaxed).max(1),
+                )
+            });
+            let pool_floor = super::super::appender::joined_pool_floor(
+                self.slot_leases().map_or(0, |p| p.mint_slots()),
+            );
+            super::super::appender::joined_pool_target(derived, g.promised(), pool_floor, cap)
+        };
         // The live-image belt runs BEFORE the recycle: an extent a live
         // node of this mount stands at re-enters no pool.
         let mut released = region.grant().take_returnable();
         self.keep_live_images_claimed(region, &mut released);
-        let returnable = region
+        let mut returnable = region
             .grant()
-            .recycle(released, if pressure { u64::MAX } else { derived });
+            .recycle(released, if pressure { u64::MAX } else { target });
+        // The SHRINK (Issue 5a): a standing pool above the target on a
+        // quiet cadence returns the surplus — smallest runs first — so a
+        // carve's overshoot, a pressure cycle's inflation or a hinted
+        // join's size never stands for the joiner's lifetime; a
+        // pressure-driven cycle returns nothing (the ring is the
+        // bottleneck, not the heap).
+        if !pressure {
+            returnable.extend(region.grant().shrink_to(target));
+        }
         if !returnable.is_empty() {
             let runs = super::super::slot_state::ExtentGrantRecord::from_extents(
                 returnable.iter().copied(),
@@ -2669,32 +2697,18 @@ impl KvMetaBackend {
                 }
             }
         }
-        // Due at 50 % consumption AND below the derived size (the
-        // manager's own cadence law) — or when the images the pending
-        // commits already PROMISED (§4.7's admission against this grant)
-        // leave less than the derived pool as headroom: the next flush
-        // pass's demand is known before it runs, and a pool that covers
-        // the promises plus the derived size never meets it exhausted.
-        // The ask names promises + the derived size (a top-up).
-        // The target is bounded by the heap share the manager clamps a
-        // wire ask to (`grant_extents_wire_cap`, this mount's projection
-        // of the free heap) — an ask above it is answered verbatim, a
-        // verb for nothing.
+        // The ask (Issue 5b): due when the HEADROOM — the unclaimed pool
+        // less what the pending commits already promised against it —
+        // fell below half the derived size (`joined_refill_due`), and it
+        // names the target (a top-up covering the promises and the derived
+        // size). A pool at its target with promises outstanding asks for
+        // nothing — the first build's `unclaimed < derived + promised`
+        // fired a verb per cadence per joiner whenever the heap-share cap
+        // was not binding.
         let (due, want) = {
             let g = region.grant();
-            let promised = g.promised();
-            let cap = self.appenders.as_ref().map_or(u64::MAX, |set| {
-                super::super::appender::grant_extents_wire_cap(
-                    self.alloc.free_extents(),
-                    set.appenders_known.load(Ordering::Relaxed).max(1),
-                )
-            });
-            let target = derived
-                .saturating_add(promised)
-                .min(cap)
-                .max(derived.min(cap));
             (
-                (g.refill_due() && g.unclaimed() < derived) || g.unclaimed() < target,
+                super::super::appender::joined_refill_due(g.headroom(), derived),
                 u32::try_from(target).unwrap_or(u32::MAX).max(1),
             )
         };

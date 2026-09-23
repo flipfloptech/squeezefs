@@ -3118,6 +3118,45 @@ fn ring_segments_that_fit_keep_the_largest_runs_and_never_refuse() {
     assert_eq!(total_in, total_out, "nothing lost");
 }
 
+/// **The joined appender's pool laws** (PR 13g review round 1, Issue 5;
+/// `appender::{joined_pool_target, joined_pool_floor, joined_refill_due}`):
+/// ONE target — `max(derived + promised, the join's cost class FLOOR +
+/// M)` bounded by the heap-share cap and never below the promises — is
+/// the recycle's keep, the shrink's mark and the ask's size; the ask is
+/// due on `headroom < derived / 2` alone. Drift is red here.
+#[test]
+fn joined_pool_target_and_refill_law_tie_to_their_derivations() {
+    use squeezefs::meta_backend::kv::appender::{
+        joined_pool_floor, joined_pool_target, joined_refill_due, GRANT_EXTENTS_FLOOR,
+    };
+    assert_eq!(joined_pool_floor(64), GRANT_EXTENTS_FLOOR + 64);
+    assert_eq!(joined_pool_floor(0), GRANT_EXTENTS_FLOOR);
+    let floor = joined_pool_floor(64);
+    // A quiet joiner's target is the join's cost class.
+    assert_eq!(joined_pool_target(8, 0, floor, u64::MAX), floor);
+    // A storm's derived size above it wins, promises on top.
+    assert_eq!(joined_pool_target(500, 0, floor, u64::MAX), 500);
+    assert_eq!(joined_pool_target(500, 40, floor, u64::MAX), 540);
+    // The cap bounds it…
+    assert_eq!(joined_pool_target(500, 40, floor, 300), 300);
+    // …but never below the promises the admitted SMOs already hold.
+    assert_eq!(joined_pool_target(500, 400, floor, 300), 400);
+    assert_eq!(
+        joined_pool_target(u64::MAX, 1, floor, u64::MAX),
+        u64::MAX,
+        "saturating"
+    );
+    // The refill law: half the derived size of headroom.
+    assert!(!joined_refill_due(4, 8));
+    assert!(joined_refill_due(3, 8));
+    assert!(!joined_refill_due(250, 500));
+    assert!(joined_refill_due(249, 500));
+    assert!(
+        !joined_refill_due(0, 1),
+        "a derived size of 1 has no half to fall below"
+    );
+}
+
 /// The symmetric MANAGER's derivations (design-symmetric-metadata §5.3.3
 /// grant sizing, §5.9 the failover bound, §1.6 "Manager death"; PR 3):
 /// `grant_extents = clamp(2 × ewma_smo_rate × failover_bound_s, 8,

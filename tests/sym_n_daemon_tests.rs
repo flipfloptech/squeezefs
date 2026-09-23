@@ -12348,9 +12348,10 @@ async fn a_carve_whose_reply_was_lost_is_reconciled_at_the_ids_fresh_join() {
     let fid = fvol.appender_stats().unwrap().appender_id;
     assert_eq!(fid, id, "the premise: the fresh join reuses the Free page");
     // The law: the record at the fresh join is the fresh grant alone — the
-    // residue returned first (a lost extent is free, or legitimately in
-    // the fresh grant by the carve's lowest-free-first), the fresh RAM
-    // claims nothing, the gauge names the residue.
+    // residue returned first (a lost extent is then anybody's to claim
+    // lowest-free-first: the fresh grant's, the manager's own images'; a
+    // PHANTOM is one still in a grant record no RAM set answers for),
+    // the fresh RAM claims nothing, the gauge names the residue.
     let record_fresh = record_extents(&mvol, fid).await;
     let fresh_stats = fvol.appender_stats().unwrap();
     let region = fresh_stats
@@ -12370,10 +12371,18 @@ async fn a_carve_whose_reply_was_lost_is_reconciled_at_the_ids_fresh_join() {
             + region.grant_returnable,
         "the record IS the fresh joiner's RAM sets (PR 3's law)"
     );
+    let granted_elsewhere: std::collections::BTreeSet<u64> = mvol
+        .extent_grant_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|(id, _)| *id != fid)
+        .flat_map(|(_, r)| r.extents().collect::<Vec<_>>())
+        .collect();
     for e in &lost {
         assert!(
-            !mvol.allocator().is_allocated(*e) || record_fresh.contains(e),
-            "a lost extent is free or in the fresh grant, never a phantom ({e})"
+            !granted_elsewhere.contains(e),
+            "a lost extent was returned — it sits in no other appender's grant record ({e})"
         );
     }
     assert_eq!(

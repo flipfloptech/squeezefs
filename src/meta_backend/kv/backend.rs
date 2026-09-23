@@ -10132,6 +10132,15 @@ impl KvMetaBackend {
                         .is_some_and(|p| p.state == AppenderState::Live)
                 })
                 .count() as u64;
+            // The budget's remainder as this directory read has it (the
+            // join's ring comes off it below).
+            set.ring_budget_remaining.store(
+                super::appender::ring_budget_remaining_bytes(
+                    self.sb.heap.len,
+                    super::appender::rings_in_use(&entries),
+                ),
+                Ordering::Relaxed,
+            );
             if live >= set.capacity {
                 set.verbs.refusals.fetch_add(1, Ordering::Relaxed);
                 return Err(KvError::Busy(format!(
@@ -10682,6 +10691,12 @@ impl KvMetaBackend {
             return Ok(None);
         }
         let ceiling = super::appender::sym_ring_ceiling_bytes(self.sb.heap.end());
+        let remaining = super::appender::ring_budget_remaining_bytes(
+            self.sb.heap.len,
+            super::appender::rings_in_use(&entries),
+        );
+        set.ring_budget_remaining
+            .store(remaining, Ordering::Relaxed);
         let room = ceiling.saturating_sub(page.ring_bytes());
         let want_extents = want_bytes.min(room) / node_size;
         if want_extents == 0 {
@@ -10773,6 +10788,8 @@ impl KvMetaBackend {
             return Err(e);
         }
         self.sync_device().await.map_err(KvError::Io)?;
+        set.ring_budget_remaining
+            .store(remaining.saturating_sub(extent.len), Ordering::Relaxed);
         log::info!(
             "meta volume {}: GrowRing — appender {appender_id}'s ring grows by one segment of {} \
              bytes at {:#x} ({} → {grown_bytes} bytes; the identity's appender_hint follows)",
@@ -19711,6 +19728,10 @@ impl KvMetaBackend {
             pressure_cycles: AtomicU64::new(0),
             pending_segments_returned: AtomicU64::new(0),
             pool_restored_extents: AtomicU64::new(0),
+            ring_budget_remaining: AtomicU64::new(super::appender::ring_budget_remaining_bytes(
+                sb.heap.len,
+                super::appender::rings_in_use(&entries),
+            )),
             cadence_pressure_seen: AtomicU64::new(0),
             joined: AtomicBool::new(false),
             join_refusal,

@@ -12025,6 +12025,95 @@ async fn a_quiet_joiners_pool_above_its_target_shrinks_at_the_cadence_and_asks_f
 }
 
 // ---------------------------------------------------------------------------
+// PR 13g review round 1, Issue 8 — `GrowRing` honours the set-wide ring
+// budget.
+// ---------------------------------------------------------------------------
+
+/// **`GrowRing` is bounded by the volume's RING BUDGET, not the per-
+/// appender ceiling alone** (PR 13g review round 1, Issue 8; design §5.3.1
+/// / §1.6: `heap/16` is "the ONE hard resource a join refuses on" —
+/// `appenders_capacity`). The first build clamped the ask to `ceiling −
+/// the page's ring` and never to the budget: N rings grown toward the
+/// 32 MiB ceiling exceed `heap/16` (32 × 32 MiB against a 4 GiB heap's
+/// 256 MiB), eating the image heap the budget reserves. Now the room is
+/// `min(ceiling − ring, budget − Σ every Live page's ring)` and an ask
+/// past it answers `None`; the remainder is published
+/// (`appender_ring_budget_remaining_bytes`). The pin: on the 64 MiB
+/// fixture the budget is 3.75 MiB against the manager's 1 MiB fixed ring
+/// and the joiner's 512 KiB — an 8 MiB ask (the per-appender ceiling) is
+/// answered the budget's remainder, the next ask nothing. RED before the
+/// fix: the first ask carves 7.5 MiB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grow_ring_never_carves_past_the_volumes_ring_budget() {
+    use squeezefs::meta_backend::kv::appender::ring_budget_bytes;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let joiner = join(&uris, &venue, &mvol, 3).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let id = jvol.appender_stats().unwrap().appender_id;
+    let identity = jvol.joined_wire().unwrap().identity;
+    let budget = ring_budget_bytes(mvol.superblock().heap.len);
+    // Every Live page's ring: the manager's (its fixed ring less the page
+    // slots) and the joiner's.
+    let in_use =
+        mvol.appender_stats().unwrap().ring_bytes + jvol.appender_stats().unwrap().ring_bytes;
+    let remaining = budget.saturating_sub(in_use);
+    assert!(
+        remaining > 0 && remaining < 8 * 1024 * 1024,
+        "the premise: the budget ({budget}) leaves {remaining} bytes under the 8 MiB ceiling"
+    );
+    let seg = mvol
+        .manager_grow_ring_wire(id, 8 * 1024 * 1024, &peer_of(&identity))
+        .await
+        .expect("GrowRing")
+        .expect("the budget's remainder is carvable");
+    assert!(
+        seg.len <= remaining,
+        "the carve is bounded by the ring budget's remainder ({} ≤ {remaining})",
+        seg.len
+    );
+    assert!(
+        seg.len + 65_536 > remaining,
+        "…and takes it to the last extent ({} of {remaining})",
+        seg.len
+    );
+    let m = mvol.appender_stats().unwrap();
+    assert!(
+        m.ring_budget_remaining_bytes < 65_536,
+        "the published remainder reads the budget spent ({})",
+        m.ring_budget_remaining_bytes
+    );
+    // The joiner names the segment (as its own growth would) so the next
+    // ask is a fresh one, not the pending witness's replay…
+    // …which the pin cannot do from outside the joiner; the pending
+    // witness answers the same segment VERBATIM and the budget arithmetic
+    // holds either way: nothing more is carved.
+    let free_before = mvol.free_extents();
+    let again = mvol
+        .manager_grow_ring_wire(id, 8 * 1024 * 1024, &peer_of(&identity))
+        .await
+        .expect("GrowRing");
+    assert_eq!(again, Some(seg), "the pending segment, verbatim");
+    assert_eq!(mvol.free_extents(), free_before, "nothing more carved");
+    assert_must_stay_zero(&mvol, "manager");
+    shutdown(&joiner).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+// ---------------------------------------------------------------------------
 // PR 13g review round 1, Issue 3 — a carve or a return wider than ONE
 // control entry.
 // ---------------------------------------------------------------------------

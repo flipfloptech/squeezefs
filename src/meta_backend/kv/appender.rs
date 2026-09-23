@@ -942,6 +942,13 @@ pub fn appenders_capacity(heap_len: u64, ring_bytes: u64) -> u64 {
     ring_budget_bytes(heap_len) / ring_bytes
 }
 
+/// The ring budget's REMAINDER: `heap/16` less the ring bytes every
+/// `Live` page names (`appender_ring_budget_remaining_bytes`; PR 13g
+/// review round 1, Issue 8) — what a `GrowRing` may still carve.
+pub fn ring_budget_remaining_bytes(heap_len: u64, rings_in_use: u64) -> u64 {
+    ring_budget_bytes(heap_len).saturating_sub(rings_in_use)
+}
+
 // ---- Extent grants (§5.3.3) -------------------------------------------------
 
 /// The images ONE SMO of a slot tree claims at most (physical): a
@@ -1304,6 +1311,17 @@ pub fn joined_pool_floor(mint_slots: u64) -> u64 {
 /// themselves are inside the target the ask names.
 pub fn joined_refill_due(headroom: u64, derived: u64) -> bool {
     headroom < derived / 2
+}
+
+/// The ring bytes every `Live` page of a directory names — the budget's
+/// consumers (`ring_budget_remaining_bytes`'s input).
+pub fn rings_in_use(entries: &[AppenderEntry]) -> u64 {
+    entries
+        .iter()
+        .filter_map(|e| e.page.as_ref())
+        .filter(|p| p.state == AppenderState::Live)
+        .map(|p| p.ring_bytes())
+        .sum()
 }
 
 /// The runs a page NAMES of a remainder `runs` (ascending by start):
@@ -2663,6 +2681,10 @@ pub struct AppenderSet {
     /// 1, Issue 2 — the unnamed pool a crash-rejoin's `recover` lands
     /// claimed). 0 on every clean lifecycle.
     pub pool_restored_extents: std::sync::atomic::AtomicU64,
+    /// The ring budget's remainder as the last directory read left it
+    /// (`appender_ring_budget_remaining_bytes` — the open, every join,
+    /// leave and `GrowRing`; Issue 8).
+    pub ring_budget_remaining: std::sync::atomic::AtomicU64,
     /// `pressure_cycles` as the grant cadence last read it — a cadence
     /// that finds it moved ran on a PRESSURE-DRIVEN cycle (the ring is
     /// the bottleneck, not the heap) and returns nothing (PR 13g, F-R5).
@@ -3054,6 +3076,7 @@ impl AppenderSet {
             pressure_cycles: self.pressure_cycles.load(Relaxed),
             pending_segments_returned: self.pending_segments_returned.load(Relaxed),
             pool_restored_extents: self.pool_restored_extents.load(Relaxed),
+            ring_budget_remaining_bytes: self.ring_budget_remaining.load(Relaxed),
             manager_lease: self
                 .manager_lease
                 .lock()
@@ -3188,6 +3211,8 @@ pub struct AppenderStats {
     pub pending_segments_returned: u64,
     /// Pool extents the own-residue census restored (Issue 2).
     pub pool_restored_extents: u64,
+    /// The ring budget's remainder (Issue 8).
+    pub ring_budget_remaining_bytes: u64,
     /// The Manager family (§11, PR 3).
     pub manager_lease: ManagerLease,
     pub meta_pr_wero: bool,

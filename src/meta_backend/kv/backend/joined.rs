@@ -2892,6 +2892,13 @@ impl KvMetaBackend {
         let node_size = u64::from(self.sb.node_size);
         let _g = self.manager_verbs.lock().await;
         let entries = read_directory(&self.path, &self.sb).await?;
+        set.ring_budget_remaining.store(
+            super::super::appender::ring_budget_remaining_bytes(
+                self.sb.heap.len,
+                super::super::appender::rings_in_use(&entries),
+            ),
+            Ordering::Relaxed,
+        );
         let Some(entry) = entries.iter().find(|e| e.appender_id == appender_id) else {
             set.verbs.rejected.fetch_add(1, Ordering::Relaxed);
             return Err(KvError::Rejected(format!(
@@ -2980,6 +2987,10 @@ impl KvMetaBackend {
         // The bits + the ledger record the consumed seq names (PR 13,
         // defect 25).
         self.consume_checkpoint_seq_for_bitmap().await?;
+        set.ring_budget_remaining.fetch_add(
+            segments.iter().map(|s| s.len).sum::<u64>(),
+            Ordering::Relaxed,
+        );
         set.leaves.fetch_add(1, Ordering::Relaxed);
         let live = entries
             .iter()

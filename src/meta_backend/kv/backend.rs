@@ -9197,11 +9197,13 @@ impl KvMetaBackend {
             .await
     }
 
-    /// **`ExtentGrant { want }`** (§5.3.3 / §5.3.5): carve up to `want`
-    /// extents from the free heap in `class`, coalesced into ≤
-    /// `GRANT_RUNS_MAX` runs; journal their allocator deltas and the
-    /// appender's rewritten `extent_grant` record as ONE control entry;
-    /// barrier; answer the runs. `want == 0` = the derived size; an
+    /// **`ExtentGrant { want }`** (§5.3.3 / §5.3.5): carve the extents
+    /// that TOP the caller's pool UP to `want` from the free heap in
+    /// `class` (the whole carve, in as many runs as the heap gives — the
+    /// page names the pool's largest `GRANT_RUNS_MAX` runs, PR 13g);
+    /// journal their allocator deltas and the appender's rewritten
+    /// `extent_grant` record as ONE control entry; barrier; answer the
+    /// runs. `want == 0` = the derived size; an
     /// explicit `want` is CLAMPED to the derivation's cap — a wire integer
     /// is never an allocation authority (review round 1, Issue 2). The
     /// verb is idempotent against DURABLE state (§5.3.5): a caller whose
@@ -9348,44 +9350,22 @@ impl KvMetaBackend {
             }
         }
         claimed.sort_unstable();
-        // The page names ≤ GRANT_RUNS_MAX runs of the WHOLE remainder
-        // (Issue 9): the carve is coalesced with the caller's current
-        // remainder before it is decided, and while the union has more
-        // runs than the page carries, the smallest run made only of NEW
-        // claims is released (never granted) — a fragmented heap answers
-        // fewer extents rather than a remainder the page cannot name.
-        let mut new_set: std::collections::BTreeSet<u64> = claimed.iter().copied().collect();
-        let mut union: std::collections::BTreeSet<u64> = remainder
+        // The WHOLE carve is granted, however many runs the union makes
+        // (PR 13g, F-R5 — the grant is a POOL): the page names the
+        // remainder's largest `GRANT_RUNS_MAX` runs (`page_runs`) and the
+        // rest stay in the RAM pool, recovered as the dead appender's
+        // orphans by the record that names them (§5.9 step 8). PR 3's
+        // trim — releasing the smallest NEW run while the union exceeded
+        // the page's four — starved a recycled pool: its singles held the
+        // page's runs, every carve was released to nothing and answered
+        // as the remainder VERBATIM, and a maintenance refill that read
+        // "landed" off a non-empty verbatim answer looped for ever on the
+        // SMO it could not cover.
+        let union: std::collections::BTreeSet<u64> = remainder
             .iter()
             .flat_map(|r| r.start..r.start + u64::from(r.len))
+            .chain(claimed.iter().copied())
             .collect();
-        union.extend(new_set.iter().copied());
-        loop {
-            let runs =
-                super::slot_state::ExtentGrantRecord::from_extents(union.iter().copied()).runs;
-            if runs.len() <= super::appender::GRANT_RUNS_MAX {
-                break;
-            }
-            let Some(victim) = runs
-                .iter()
-                .filter(|r| (r.start..r.start + u64::from(r.len)).all(|e| new_set.contains(&e)))
-                .min_by_key(|r| r.len)
-                .cloned()
-            else {
-                break;
-            };
-            for e in victim.start..victim.start + u64::from(victim.len) {
-                union.remove(&e);
-                new_set.remove(&e);
-                self.alloc.release_unpublished(e);
-            }
-        }
-        claimed.retain(|e| new_set.contains(e));
-        if claimed.is_empty() {
-            // Nothing carvable fits beside the caller's fragmented
-            // remainder: the remainder, verbatim (a return coalesces it).
-            return Ok(remainder);
-        }
         // A carve the bitmap answered FREE that another appender's record
         // still names is a double custodian — refused, the claims undone.
         if let Err(e) = self
@@ -9480,8 +9460,8 @@ impl KvMetaBackend {
             }
             self.write_region_page(r).await?;
         } else {
-            // A wire joiner's page: its remainder ∪ the carve, the union
-            // the loop above fitted to the page.
+            // A wire joiner's page: the largest runs of its remainder ∪
+            // the carve (the joiner's own pool holds the rest).
             let page_grant = super::appender::page_runs_of(
                 &super::slot_state::ExtentGrantRecord::from_extents(union.iter().copied()).runs,
             );

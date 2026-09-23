@@ -2309,6 +2309,17 @@ impl KvMetaBackend {
         let one_smo = u32::try_from(needed)
             .unwrap_or(u32::MAX)
             .max(super::super::appender::SMO_IMAGES_MAX);
+        // "Landed" = the region's pool GREW (the caller `continue`s on it
+        // and re-runs the SMO): a verbatim answer of the remainder
+        // (§5.3.5's idempotency) is non-empty and grew nothing — read as
+        // landed it looped the threshold drain for ever on an SMO the
+        // pool could not cover.
+        let unclaimed = |id: u32| {
+            self.appenders
+                .as_ref()
+                .and_then(|a| a.region(id))
+                .map_or(0, |r| r.grant().unclaimed())
+        };
         let landed = if self.is_joined_appender() {
             self.joined_extent_grant_at(self.joined_reactive_want(needed), Some(smo))
                 .await
@@ -2321,6 +2332,7 @@ impl KvMetaBackend {
                 .as_ref()
                 .map_or(u64::from(one_smo), |a| self.grant_extents_for(a, appender));
             let want = u32::try_from(derived).unwrap_or(u32::MAX).max(one_smo);
+            let before = unclaimed(appender);
             match self
                 .manager_extent_grant_class(
                     appender,
@@ -2329,7 +2341,7 @@ impl KvMetaBackend {
                 )
                 .await
             {
-                Ok(runs) if !runs.is_empty() => Ok(true),
+                Ok(_) if unclaimed(appender) > before => Ok(true),
                 Ok(_) | Err(KvError::NoSpace { .. }) => self
                     .manager_extent_grant_class(
                         appender,
@@ -2337,7 +2349,7 @@ impl KvMetaBackend {
                         super::super::alloc_ext_core::AllocClass::Internal,
                     )
                     .await
-                    .map(|runs| !runs.is_empty()),
+                    .map(|_| unclaimed(appender) > before),
                 Err(e) => Err(e),
             }
         };

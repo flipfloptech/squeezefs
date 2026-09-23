@@ -130,6 +130,22 @@ fn refs(tag: u64, owner: u64, base: u64, n: u64) -> Vec<BlockRefOp> {
         .collect()
 }
 
+/// A retired image has LEFT its pending park (PR 13g, F-R5 — the grant
+/// is a POOL): it either RECYCLED into the region's own unclaimed set (the
+/// pool below the derived size — the bit stays set, the RAM grant holds it
+/// as unclaimed) or RETURNED to the bitmap (the surplus above the pool).
+/// Either way it is no pending-free and no claim.
+fn retired_image_settled(vol: &KvMetaBackend, appender_id: u32, extent: u64) -> bool {
+    let returned = !vol.allocator().is_allocated(extent);
+    let recycled = vol.grant_holds(appender_id, extent)
+        && vol.appenders_public().unwrap().regions[appender_id as usize]
+            .grant()
+            .unclaimed_runs()
+            .iter()
+            .any(|r| (r.start..r.start + u64::from(r.len)).contains(&extent));
+    returned || recycled
+}
+
 /// The grant closure law (§11): `granted ≡ claimed + returned + unclaimed`.
 fn assert_grant_closure(s: &AppenderStats) {
     assert_eq!(
@@ -1198,20 +1214,17 @@ async fn c13_finds_exactly_the_unpublished_root_swaps_successor_and_repair_retur
         "a second repair of the same extent is a no-op (verify-before-repair)"
     );
     let mut cycles = 0;
-    while va.allocator().is_allocated(new_ext) && cycles < 6 {
+    while !retired_image_settled(&va, 1, new_ext) && cycles < 6 {
         va.checkpoint_now().await.unwrap();
         cycles += 1;
     }
     assert!(
-        !va.allocator().is_allocated(new_ext),
-        "the cadence returned the orphan to the bitmap within {cycles} cycles"
-    );
-    assert!(
-        !va.extent_grant_record(1).await.unwrap().contains(new_ext),
-        "the grant record no longer names it"
+        retired_image_settled(&va, 1, new_ext),
+        "the cadence settled the orphan within {cycles} cycles — recycled into appender 1's \
+         pool or returned to the bitmap (PR 13g: the grant is a pool)"
     );
     let s = stats(&va);
-    assert!(s.extent_returns >= 1, "{s:?}");
+    assert_eq!(s.regions[1].grant_pending, 0, "{s:?}");
     assert_grant_closure(&s);
     assert!(
         va.allocator().is_allocated(old_ext),
@@ -1323,13 +1336,14 @@ async fn fsck_c13_reports_plans_and_repairs_the_orphan_image_extent() {
     );
     let va = &ra.volumes[0];
     let mut cycles = 0;
-    while va.allocator().is_allocated(new_ext) && cycles < 6 {
+    while !retired_image_settled(va, 1, new_ext) && cycles < 6 {
         va.checkpoint_now().await.unwrap();
         cycles += 1;
     }
     assert!(
-        !va.allocator().is_allocated(new_ext),
-        "returned to the bitmap"
+        retired_image_settled(va, 1, new_ext),
+        "settled — recycled into appender 1's pool or returned to the bitmap (PR 13g: the \
+         grant is a pool)"
     );
     let again = run(&ctx, &opts).await.expect("re-fsck");
     assert!(
@@ -1506,7 +1520,6 @@ async fn a_clean_remount_recovers_the_grant_from_tree_zero_and_pre_remount_image
         let tree = slot_tree(&va, 4);
         let old_root = tree.root();
         let old_ext = extent_of(&va, old_root.addr);
-        let returns_before = stats(&va).extent_returns;
         assert_eq!(
             va.defrag_compact_nodes(&[(0, old_root.addr)])
                 .await
@@ -1522,20 +1535,27 @@ async fn a_clean_remount_recovers_the_grant_from_tree_zero_and_pre_remount_image
             s.regions[1]
         );
         let mut cycles = 0;
-        while va.allocator().is_allocated(old_ext) && cycles < 6 {
+        while !retired_image_settled(&va, 1, old_ext) && cycles < 6 {
             va.checkpoint_now().await.unwrap();
             cycles += 1;
         }
         assert!(
-            !va.allocator().is_allocated(old_ext),
-            "cycle {cycle}: the retired pre-remount image {old_ext} returned to the bitmap \
-             within {cycles} cycles"
+            retired_image_settled(&va, 1, old_ext),
+            "cycle {cycle}: the retired pre-remount image {old_ext} settled within {cycles} \
+             cycles — recycled into appender 1's pool or returned (PR 13g: the grant is a pool; \
+             before the fix the free was DROPPED by a remount-forgotten grant)"
         );
-        assert!(
-            !va.extent_grant_record(1).await.unwrap().contains(old_ext),
-            "cycle {cycle}: the record dropped the returned extent"
+        assert_eq!(
+            va.allocator().is_allocated(old_ext),
+            va.extent_grant_record(1).await.unwrap().contains(old_ext),
+            "cycle {cycle}: the record names the extent iff the region still holds it (a \
+             returned extent left the record, a recycled one stays in it)"
         );
-        assert!(stats(&va).extent_returns > returns_before);
+        assert_eq!(
+            stats(&va).regions[1].grant_pending,
+            0,
+            "cycle {cycle}: nothing parked"
+        );
         assert_grant_closure(&stats(&va));
         assert_durable_ram_grant_law(&va, 1).await;
         assert!(va.c13_orphan_image_extents().await.unwrap().is_empty());
@@ -2520,16 +2540,18 @@ async fn a_return_of_a_pending_extent_is_refused_until_the_tail_covers_its_free(
     assert!(vol.grant_holds(1, old_ext), "it stays in the RAM grant");
     assert_eq!(stats(&vol).regions[1].grant_pending, 1);
     assert_eq!(stats(&vol).manager_verb_refusals, refusals_before + 1);
-    // The tail passes the free: the cadence returns it normally.
+    // The tail passes the free: the cadence settles it — recycled into the
+    // region's pool or returned (PR 13g: the grant is a pool).
     let mut cycles = 0;
-    while vol.allocator().is_allocated(old_ext) && cycles < 6 {
+    while !retired_image_settled(&vol, 1, old_ext) && cycles < 6 {
         vol.checkpoint_now().await.unwrap();
         cycles += 1;
     }
     assert!(
-        !vol.allocator().is_allocated(old_ext),
-        "returned by the cadence within {cycles} cycles once covered"
+        retired_image_settled(&vol, 1, old_ext),
+        "settled by the cadence within {cycles} cycles once covered"
     );
+    assert_eq!(stats(&vol).regions[1].grant_pending, 0);
     assert_grant_closure(&stats(&vol));
     for v in &routed.volumes {
         v.shutdown().await.unwrap();

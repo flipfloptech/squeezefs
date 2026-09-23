@@ -12209,6 +12209,26 @@ impl KvMetaBackend {
             .store(anticipated, Ordering::Relaxed);
     }
 
+    /// A maintained tree's SMO images consume the grant of the REGION
+    /// leasing its slot — fed to that region's rate input like the flush
+    /// pass's (`smos_this_cycle`; review round 1, Issue 11: ONE per-volume
+    /// image count for both passes — the threshold pass's SMOs were
+    /// counted by neither the process-wide fold nor the rate). Nothing
+    /// for a tree of the manager's own (region 0) or an unarmed volume.
+    pub(super) fn note_region_smo_images(&self, tree: &super::tree::KvTree, images: u64) {
+        if images == 0 {
+            return;
+        }
+        if let Some(r) = tree
+            .forest_slot()
+            .map(|slot| self.region_of_slot(slot))
+            .filter(|id| *id != 0)
+            .and_then(|id| self.appenders().and_then(|a| a.region(id)))
+        {
+            r.smos_this_cycle.fetch_add(images, Ordering::Relaxed);
+        }
+    }
+
     /// Push one flush pass's measured work into the volume's two unit
     /// windows and refresh the maxima in force (`checkpoint::flush_unit_ns`;
     /// PR 13g, F-B1) — both flush passes call it with the sample their

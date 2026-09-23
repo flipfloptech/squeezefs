@@ -1643,6 +1643,7 @@ async fn maintenance_pass(
             match r {
                 Ok(out) => {
                     sample.fold(&out.sample);
+                    be.note_region_smo_images(&tree, out.sample.images);
                     break;
                 }
                 Err(KvError::JournalReserveExhausted { .. } | KvError::PendingFreeFull { .. }) => {
@@ -1897,6 +1898,7 @@ async fn tick(
                 match tree.run_maintenance_until(&mut smo, &mut budget).await {
                     Ok(out) => {
                         sample.fold(&out.sample);
+                        be.note_region_smo_images(&tree, out.sample.images);
                         break;
                     }
                     Err(
@@ -2272,16 +2274,12 @@ impl KvMetaBackend {
         // not give (the manager's refill owed): deferred like the space
         // arm, counted on `manager_dependency_stalls`.
         let mut deferred_for_grant = 0u64;
-        let smo_counters = || {
-            super::META_KV_NODE_COMPACTIONS.load(Ordering::Relaxed)
-                + super::META_KV_NODE_SPLITS.load(Ordering::Relaxed)
-                + super::META_KV_NODE_MERGES.load(Ordering::Relaxed)
-                + super::META_KV_ROOT_COLLAPSES.load(Ordering::Relaxed)
-        };
         // The pass's work split by class — the cadence's live projection's
         // units (PR 13g, F-B1): a node whose flush wrote fresh images is
         // SMO work priced per image, every other node an append priced
-        // per node.
+        // per node. The same per-volume image count is a region's SMO-rate
+        // input (review round 1, Issue 11 — the process-wide SMO counters
+        // fold every volume's).
         let mut sample = FlushPassSample::default();
         for node in dirty {
             let addr = node.addr();
@@ -2293,7 +2291,6 @@ impl KvMetaBackend {
                 .forest_slot()
                 .map(|slot| self.region_of_slot(slot))
                 .filter(|id| *id != 0);
-            let smos_before = smo_counters();
             let images_before = smo.images_written();
             let node_started = std::time::Instant::now();
             let mut out = tree.checkpoint_flush_node(smo, addr).await;
@@ -2375,18 +2372,15 @@ impl KvMetaBackend {
                     }
                 }
             }
+            let images = smo.images_written().saturating_sub(images_before);
             if let Some(id) = region_id {
-                let n = smo_counters().saturating_sub(smos_before);
-                if n > 0 {
+                if images > 0 {
                     if let Some(r) = self.appenders().and_then(|a| a.region(id)) {
-                        r.smos_this_cycle.fetch_add(n, Ordering::Relaxed);
+                        r.smos_this_cycle.fetch_add(images, Ordering::Relaxed);
                     }
                 }
             }
-            sample.note(
-                node_started.elapsed().as_nanos() as u64,
-                smo.images_written().saturating_sub(images_before),
-            );
+            sample.note(node_started.elapsed().as_nanos() as u64, images);
             match out {
                 Ok(()) => {}
                 Err(KvError::JournalReserveExhausted { needed }) => {

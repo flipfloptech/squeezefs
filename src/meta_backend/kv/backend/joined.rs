@@ -1803,14 +1803,10 @@ impl KvMetaBackend {
         // The region's SMO rate — the grant derivation's measured input
         // (PR 13g, F-R5: a joiner's rate was never folded, so the manager
         // derived its grant off a rate of 0 — the floor — for the joiner's
-        // whole life).
-        let smo_counters = || {
-            use std::sync::atomic::Ordering::Relaxed;
-            super::super::META_KV_NODE_COMPACTIONS.load(Relaxed)
-                + super::super::META_KV_NODE_SPLITS.load(Relaxed)
-                + super::super::META_KV_NODE_MERGES.load(Relaxed)
-                + super::super::META_KV_ROOT_COLLAPSES.load(Relaxed)
-        };
+        // whole life) — read off THIS context's fresh images (review round
+        // 1, Issue 11: the process-wide SMO counters fold every volume's
+        // SMOs, and a mount's other volumes inflated this one's grant;
+        // an image is what the grant's extents are consumed as).
         let dirty_count = dirty.len();
         let flush_started = std::time::Instant::now();
         // The pass's work split by class — the cadence's live projection's
@@ -1819,7 +1815,6 @@ impl KvMetaBackend {
         for node in dirty {
             let addr = node.addr();
             let tree = self.tree_of_node(&node)?;
-            let smos_before = smo_counters();
             let images_before = smo.images_written();
             let node_started = std::time::Instant::now();
             let mut out = tree.checkpoint_flush_node(smo, addr).await;
@@ -1853,14 +1848,11 @@ impl KvMetaBackend {
                     ),
                 }
             }
-            let smos = smo_counters().saturating_sub(smos_before);
-            if smos > 0 {
-                region.smos_this_cycle.fetch_add(smos, Ordering::Relaxed);
+            let images = smo.images_written().saturating_sub(images_before);
+            if images > 0 {
+                region.smos_this_cycle.fetch_add(images, Ordering::Relaxed);
             }
-            sample.note(
-                node_started.elapsed().as_nanos() as u64,
-                smo.images_written().saturating_sub(images_before),
-            );
+            sample.note(node_started.elapsed().as_nanos() as u64, images);
             match out {
                 Ok(()) => {}
                 Err(KvError::JournalReserveExhausted { needed }) => {

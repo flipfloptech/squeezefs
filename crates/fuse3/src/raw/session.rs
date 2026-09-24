@@ -96,14 +96,21 @@ pub enum ReplyWriteVerdict {
 
 /// The reply task's classification of a failed out-frame write (PR 13h):
 /// `is_notify` = the frame is a daemon-initiated notification
-/// ([`crate::notify::frame_is_notify`]).
+/// ([`crate::notify::frame_is_notify`]). A notification the kernel
+/// answers `ENOENT` names an inode it does not hold — the EXPECTED
+/// outcome of a served mutation's invalidation + prune reaching objects
+/// the kernel already forgot (the fourth box pass: 272 k WARN lines per
+/// row set, ≈ 2 × `served_mutation_{invals,prunes}`) — counted, never
+/// logged; a notification's other errno is logged and never ends the
+/// task (it owes the kernel nothing). A request's reply keeps the shipped
+/// law: `ENOENT` = an interrupted request (the WARN), anything else fatal.
 #[doc(hidden)]
 pub fn reply_write_verdict(is_notify: bool, kind: ErrorKind) -> ReplyWriteVerdict {
-    let _ = is_notify;
-    if kind == ErrorKind::NotFound {
-        ReplyWriteVerdict::InterruptedRequest
-    } else {
-        ReplyWriteVerdict::Fatal
+    match (is_notify, kind) {
+        (true, ErrorKind::NotFound) => ReplyWriteVerdict::NotifyEnoent,
+        (true, _) => ReplyWriteVerdict::NotifyFailed,
+        (false, ErrorKind::NotFound) => ReplyWriteVerdict::InterruptedRequest,
+        (false, _) => ReplyWriteVerdict::Fatal,
     }
 }
 

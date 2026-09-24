@@ -12501,6 +12501,11 @@ impl SqueezefsFilesystem {
                 // The WRITE twin (transport-ingress campaign): the gauge
                 // is what keeps the in-place arm wired.
                 "fuse3_write_inplace_replies": fuse3::write_inplace_replies(),
+                // PR 13h: notifications (the served-mutation hook's
+                // FUSE_NOTIFY_INVAL_INODE / FUSE_NOTIFY_PRUNE) the kernel
+                // answered ENOENT — an inode it does not hold; the expected
+                // outcome, counted here instead of a WARN per call.
+                "fuse3_notify_enoent": fuse3::notify_enoent(),
                 // Write-commit-economy (2026-07-30): lever-1 coalescing
                 // engagement (blocks/batch = the live coalesce factor)
                 // and lever-2 layout-delta engagement (delta vs full
@@ -14120,6 +14125,15 @@ impl SqueezefsFilesystem {
                 metrics.insert(
                     "extent_grant_unclaimed".into(),
                     appender(&|s| s.grant_unclaimed),
+                );
+                // PR 13h: the closure's fourth term over this mount's own
+                // regions — on a joined appender the grants it RECEIVED,
+                // so `granted ≡ claimed + returned + unclaimed` reads per
+                // writer (the fourth box pass read it set-wide against the
+                // manager's `extent_grant_extents` for lack of this face).
+                metrics.insert(
+                    "extent_grant_granted".into(),
+                    appender(&|s| s.grant_granted),
                 );
                 metrics.insert(
                     "manager_vol0_unreachable".into(),

@@ -3747,9 +3747,99 @@ def arr(k):
     v = d.get(k, 0)
     return [x for x in v if isinstance(x, (int, float))] if isinstance(v, list) else [v] if isinstance(v, (int, float)) else [0]
 ov, term, trig, exc = arr("appender_flush_ceiling_overruns"), arr("meta_kv_checkpoint_term_ms"), arr("meta_kv_checkpoint_trigger_ms"), arr("appender_flush_ceiling_excused_ns")
-print(f"   F-B1 m{sys.argv[2]}: flush_ceiling_overruns={sum(ov)} checkpoint_term_ms={term} checkpoint_trigger_ms={trig} excused_ns={sum(exc)} ceiling_ms={d.get('appender_flush_ceiling_ms')}")
+# PR 13g's second term beside the horizon term: the LIVE projection off the
+# pending work, the decision's raw lateness, the measured units per class.
+proj, late = arr("meta_kv_checkpoint_projected_ms"), arr("meta_kv_checkpoint_late_max_ms")
+unode, uimg = arr("meta_kv_checkpoint_node_unit_ns"), arr("meta_kv_checkpoint_image_unit_ns")
+print(f"   F-B1 m{sys.argv[2]}: flush_ceiling_overruns={sum(ov)} checkpoint_term_ms={term} checkpoint_trigger_ms={trig} excused_ns={sum(exc)} ceiling_ms={d.get('appender_flush_ceiling_ms')}"
+      f" projected_ms={proj} late_max_ms={late} node_unit_us={[round(x/1000, 1) for x in unode]} image_unit_us={[round(x/1000, 1) for x in uimg]}")
 PYEOF
     done
+}
+
+# F-R5's faces per writer (PR 13g — the joiner's extent supply): the ring
+# above the 512 KiB floor (`appender_ring_bytes`, its grows / segments, the
+# declines), the grant as a POOL (`extent_grant_{claimed,returned,unclaimed}`
+# absolute — a joiner's `granted` is not a published face, so the closure
+# is read SET-WIDE against the manager's `extent_grant_extents`), and the
+# storm's wire economy as DELTAS over the phase `p<label>0 → p<label>1`:
+# returned vs the compactions (claim-and-retire churn reads returned ≈
+# compactions), the wire grants (≈ the derived asks, not ≈ 100 per storm),
+# the reactive asks, the pressure cycles vs the checkpoints; the new
+# must-stay-0 / hygiene gauges beside them. The manager's line carries its
+# verb / grant / return deltas and `manager_service_ns.execute` per volume.
+sym_fr5_faces() { # rowdir label idx...
+    local rowdir="$1" label="$2"
+    shift 2
+    local idx
+    for idx in "$@"; do
+        python3 - "$rowdir" "$idx" "$label" <<'PYEOF'
+import json, sys
+rowdir, idx, label = sys.argv[1:4]
+def flat(d, out=None, pfx=""):
+    out = {} if out is None else out
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+def load(ph):
+    root = json.load(open(f"{rowdir}/m{idx}_p{label}{ph}.json"))
+    return flat(root.get("metrics", root))
+a, b = load(0), load(1)
+def arr(d, k):
+    v = d.get(k, 0)
+    if isinstance(v, list): return [x for x in v if isinstance(x, (int, float))]
+    return [v] if isinstance(v, (int, float)) else [0]
+def delta(k): return [y - x for x, y in zip(arr(a, k), arr(b, k))] if len(arr(a, k)) == len(arr(b, k)) else [sum(arr(b, k)) - sum(arr(a, k))]
+def dsum(k): return sum(delta(k))
+def s(k): return arr(b, k)
+ring = s("appender_ring_bytes")
+line = (f"   F-R5 m{idx}: ring_kib={[x // 1024 for x in ring]} ring_grows={s('appender_ring_grows')} ring_segments={s('appender_ring_segments')}"
+        f" grow_declined={s('joined_ring_grow_declined')} short_declines={s('appender_grow_ring_short_declines')}"
+        f" pool[claimed,returned,unclaimed]={s('extent_grant_claimed')},{s('extent_grant_returned')},{s('extent_grant_unclaimed')}"
+        f" Δreturned={delta('extent_grant_returned')} Δcompactions={dsum('meta_kv_node_compactions')} Δnode_images={dsum('meta_kv_node_images')}"
+        f" Δwire_grants={delta('joined_wire_extent_grants')} Δreactive={delta('joined_wire_reactive_grants')} Δwire_returns={delta('joined_wire_extent_returns')} Δwire_ring_grows={delta('joined_wire_ring_grows')}"
+        f" Δpressure_cycles={delta('appender_pressure_cycles')} Δcheckpoints={dsum('meta_kv_checkpoints')}"
+        f" pool_restored={s('appender_pool_restored_extents')} pending_segs_returned={s('appender_pending_segments_returned')} join_residue={s('appender_join_residue_returned')}"
+        f" stale_page_words={s('appender_stale_page_words_dropped')} return_run_cap_refusals={s('extent_return_run_cap_refusals')} joined_control_refusals={s('joined_control_refusals')}")
+# The manager's terms (the joiner's wire asks land here): the verb wall.
+# `manager_service_ns` is a per-volume list of dicts, kept whole by `flat`.
+def svc(d):
+    v = d.get("manager_service_ns")
+    if isinstance(v, list): return [x.get("execute", 0) if isinstance(x, dict) else 0 for x in v]
+    return []
+ex_a, ex_b = svc(a), svc(b)
+dsvc = [round((y - x) / 1e9, 3) for x, y in zip(ex_a, ex_b)] if ex_a and len(ex_a) == len(ex_b) else []
+if idx == "0":
+    line += (f" | manager: Δmanager_verbs={delta('manager_verbs')} Δextent_grants={delta('extent_grants')} Δextent_grant_extents={delta('extent_grant_extents')}"
+             f" Δextent_returns={delta('extent_returns')} Δservice_execute_s={dsvc} Δdirectory_reads={dsum('appender_directory_reads')}"
+             f" appenders_known={s('appenders_known')} ring_budget_remaining_kib={[x // 1024 for x in s('appender_ring_budget_remaining_bytes')]}")
+print(line)
+PYEOF
+    done
+}
+
+# The create row's per-writer storm timeline off the stamps the spawn
+# loop wrote (`launch-n<N>.tsv` + each `create-n<N>-w<idx>.txt`'s
+# `launch_ts= end_ts=` line): `m<idx>[+launch, +end, wall]` in seconds
+# relative to the row's first mkdir.
+sym_scale_launch_offsets() { # rowdir n t0 idx...
+    local rowdir="$1" n="$2" t0="$3"
+    shift 3
+    python3 - "$rowdir" "$n" "$t0" "$@" <<'PYEOF'
+import re, sys
+rowdir, n, t0 = sys.argv[1], sys.argv[2], float(sys.argv[3])
+out = []
+for idx in sys.argv[4:]:
+    txt = open(f"{rowdir}/create-n{n}-w{idx}.txt").read()
+    m = re.search(r"launch_ts=([\d.]+) end_ts=([\d.]+)", txt)
+    w = re.search(r"wall_s=([\d.]+)", txt)
+    if not m:
+        out.append(f"m{idx}[?]")
+        continue
+    out.append(f"m{idx}[+{float(m.group(1))-t0:.2f}, +{float(m.group(2))-t0:.2f}, {w.group(1) if w else '?'}]")
+print(" ".join(out))
+PYEOF
 }
 
 # The quiet-box gate the measured rows share (the s10pl leg's).
@@ -3981,21 +4071,40 @@ leg_sym_scale() {
         local cpu0 t0 t1 t_row0
         cpu0="$(sym_cpu_ticks 0)"
         # The create row: every writer's storm at once, one directory each.
+        # Every storm's LAUNCH and END instants are stamped (the box's third
+        # pass INFERRED ≈ 3.9 s of launch skew at N = 8 from wall − the
+        # longest storm; the row's `mkdir -p` under `/` by N creators is
+        # the 3b shape, and a root flip can park the later ones) — the
+        # skew is MEASURED and printed beside the multiple, and the wall
+        # from the LAST launch gives the storms'-own-concurrency reading;
+        # the row's LAW keeps the leg's clock (t0 = the first mkdir).
         local -a pids=()
+        local t_last launch_tsv
+        launch_tsv="$rowdir/launch-n$n.tsv"
+        : >"$launch_tsv"
         t0="$(date +%s.%N)"
         t_row0="$t0"
         for idx in "${writers[@]}"; do
             mkdir -p "$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx"
-            "$SYM_STORM" "$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx" "$SYM_THREADS" "$SYM_FILES" create \
-                >"$rowdir/create-n$n-w$idx.txt" 2>&1 &
+            t_last="$(date +%s.%N)"
+            printf '%s\t%s\n' "$idx" "$t_last" >>"$launch_tsv"
+            (
+                "$SYM_STORM" "$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx" "$SYM_THREADS" "$SYM_FILES" create \
+                    >"$rowdir/create-n$n-w$idx.txt" 2>&1
+                src=$?
+                echo "launch_ts=$t_last end_ts=$(date +%s.%N)" >>"$rowdir/create-n$n-w$idx.txt"
+                exit "$src"
+            ) &
             pids+=($!)
         done
         local p rc=0
         for p in "${pids[@]}"; do wait "$p" || rc=1; done
         t1="$(date +%s.%N)"
         [ "$rc" = "0" ] || die "sym-scale N=$n: a create storm FAILED (see $rowdir/create-n$n-w*.txt)"
-        local create_rate
+        local create_rate launch_skew concurrent_rate
         create_rate="$(python3 -c "print(f'{$n*$SYM_FILES/($t1-$t0):.0f}')")"
+        launch_skew="$(python3 -c "print(f'{$t_last-$t0:.3f}')")"
+        concurrent_rate="$(python3 -c "print(f'{$n*$SYM_FILES/($t1-$t_last):.0f}')")"
         # The create phase's own daemon-CPU face (the snapshot between the
         # two phases — the ingest's CPU never pollutes it).
         for idx in "${writers[@]}"; do snap "$idx" "n${n}c" "$rowdir"; done
@@ -4070,8 +4179,15 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t_row0):.0f}')")"
         # N × SYM_INGEST_MB) + F-B1's per-writer faces on the row's end
         # snapshot — beside the table, never in its verdict.
         {
+            echo "   N=$n create launch skew (first→last storm launch) ${launch_skew}s; wall from the LAST launch → $concurrent_rate creates/s ($(python3 -c "print(f'{$concurrent_rate/$rate1:.2f}')")× the N=1 row's rate; the table's law keeps the first-mkdir clock); per writer [launch+s, end+s, storm wall_s]: $(sym_scale_launch_offsets "$rowdir" "$n" "$t0" "${writers[@]}")"
             echo "   N=$n ingest amplification (/proc/diskstats, data namespaces; user $((n * SYM_INGEST_MB)) MiB): $(sym_disk_amp "$rowdir" "in$n" $((n * SYM_INGEST_MB * 1024 * 1024)))"
             sym_fb1_faces "$rowdir" "n$n" "${writers[@]}"
+            # F-R5 over the whole row (pn<N>0 → pn<N>1) and over the CREATE
+            # phase alone (pn<N>0 → pn<N>c — the storm's wire economy).
+            sym_fr5_faces "$rowdir" "n$n" "${writers[@]}"
+            for idx in "${writers[@]}"; do cp "$rowdir/m${idx}_pn${n}c.json" "$rowdir/m${idx}_pc${n}1.json"; cp "$rowdir/m${idx}_pn${n}0.json" "$rowdir/m${idx}_pc${n}0.json"; done
+            echo "   (the create phase alone:)"
+            sym_fr5_faces "$rowdir" "c$n" "${writers[@]}"
         } | tee -a "$rowdir/symscale-faces.txt"
         # ACKED WRITES PRESENT: every writer's tree + its fsynced ingest file
         # read back through ANOTHER writer of the row (N ≥ 2) or the token

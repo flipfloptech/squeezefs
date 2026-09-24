@@ -482,6 +482,28 @@
 #                       dlm_custody_via_slot_holder > 0 at every mutator;
 #                       fsck + the must-stay-0 set after. LOCAL = "it
 #                       works" (the box prices the row).
+#   sym-reclaim-hint [--rh-files=F]  (PR 13h — the corpse-reclaimer law's
+#                       PRODUCTION wiring; needs --symmetric --writers >= 2,
+#                       the fleet created with SQUEEZEFS_SYM_AFFINITY_MAX_MB
+#                       set so a joiner's file mints into its DIRECTORY's
+#                       slot) three shapes: (A) the box's — a joiner reads
+#                       the manager's tree as a token client, the manager
+#                       `rm -rf`s it (recall → prune → FORGET → the hint to
+#                       the manager); (B) the MOVED-slot corpse — a joiner's
+#                       8 MiB file unlinked while OPEN, its directory's slot
+#                       handed to a second joiner by dominance, the close's
+#                       FORGET hinted to the NEW holder, which destroys it;
+#                       (C) the UNLEASED corpse — the same, then the new
+#                       holder LEAVES (the slot Unleased) before the close:
+#                       hinted to the MANAGER. Laws: Σ hint_inos_shipped ≡
+#                       Σ (served + forwarded + misrouted) across the
+#                       daemons, reclaim_hint_failures 0, reclaim_destroy_
+#                       refused_release_failed 0, no `corrupt KV encoding`
+#                       / `destroy WITHHELD` line, the corpses' blocks
+#                       released at the reclaimer (meta_kv_block_refs_
+#                       released) and cleared at the allocation holder
+#                       (data_alloc_bitmap_population), the post-leave +
+#                       offline census 0 / 0. LOCAL = "it works".
 #   s9-fanout [--mb=M]  (rung 10 — needs --multi-writer --cowriters=K;
 #                       design row S9-a) THE FAN-OUT ROW: K co-writers +
 #                       the authority writing DATA concurrently — the
@@ -848,6 +870,8 @@ SYM_WALLS_FILES="${SQZ_MWMATRIX_SYM_WALLS_FILES:-16}"
 SYM_WALLS_MB="${SQZ_MWMATRIX_SYM_WALLS_MB:-64}"
 # sym-foreign-file (PR 13b): files per writer a colleague mutates.
 SYM_FF_FILES="${SQZ_MWMATRIX_SYM_FF_FILES:-64}"
+# sym-reclaim-hint (PR 13h): the manager's tree a joiner instantiates, in files.
+SYM_RH_FILES="${SQZ_MWMATRIX_SYM_RH_FILES:-128}"
 SYM_VICTIMS=1
 SYM_XO=0
 SYM_STRIPED=0
@@ -873,6 +897,7 @@ for a in "$@"; do
     --walls-files=*) SYM_WALLS_FILES="${a#--walls-files=}" ;;
     --walls-mb=*) SYM_WALLS_MB="${a#--walls-mb=}" ;;
     --ff-files=*) SYM_FF_FILES="${a#--ff-files=}" ;;
+    --rh-files=*) SYM_RH_FILES="${a#--rh-files=}" ;;
     --victims=*) SYM_VICTIMS="${a#--victims=}" ;;
     --cross-owner) SYM_XO=1 ;;
     --striped) SYM_STRIPED=1 ;;
@@ -5283,6 +5308,309 @@ $(head -20 "$rowdir/lost.txt")"
     done
     sym_oracle sym-foreign-file "$rowdir"
     log "sym-foreign-file PUBLISHED (table + snapshots in $rowdir)"
+}
+
+# --- PR 13h: sym-reclaim-hint ------------------------------------------------
+# The corpse-reclaimer law on a real fleet (design §5.1.3; record §4.4ap —
+# review round 2, Issue 9): a FORGET whose ino lives in a slot this daemon
+# does not reclaim TRAVELS to the slot's reclaimer as a reclaim hint over the
+# production wire (rung 7's step shipper, the S8 listener, `main.rs`'s
+# sink). Three shapes, each on the production paths alone — no seam, no
+# in-process venue: (A) the box's LEASED-foreign shape (a token client's
+# forgets of the holder's corpses), (B) the MOVED-slot corpse (class ii),
+# (C) the UNLEASED corpse (class i — the manager sweeps unleased slots at
+# mount only and its kernel never held the ino, so without the hint it
+# leaked until a remount). The fleet is created with
+# `SQUEEZEFS_SYM_AFFINITY_MAX_MB` set (64 MiB — the registered static
+# affinity ceiling): a fresh joiner's derived `A_max` is `max(used/64,
+# node_size)` = one extent, and a one-extent directory tree sits exactly AT
+# it, so its files mint into the ROTOR and no storm into the directory
+# would move their slot; the leg asserts the premise off the published
+# `affinity_mints` — per create, because a directory's children mint
+# round-robin over the set's metadata VOLUMES and the affinity holds only
+# on the parent's (`sym_rh_make_corpse`). LOCAL = "it works" (the venue
+# ruling): no rate here is a verdict.
+sym_rh_logs_clean() { # label idx line0
+    local n
+    n="$(tail -n "+$(( $3 + 1 ))" "$STATE/m$2.log" 2>/dev/null | grep -c "corrupt KV encoding\|destroy WITHHELD" || true)"
+    [ "${n:-0}" = "0" ] ||
+        die "$1: $n 'corrupt KV encoding' / 'destroy WITHHELD' line(s) in m$2's log since the leg began (F-R6's shape) — $STATE/m$2.log"
+}
+sym_rh_hold_open() { # path -> pid of a process holding it open
+    # The holder's stdio is detached: a `$(…)` capture of this function
+    # would otherwise wait on the pipe the background process holds.
+    python3 - "$1" >/dev/null 2>&1 <<'PYEOF' &
+import os, signal, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+signal.pause()
+PYEOF
+    echo $!
+}
+sym_rh_handover() { # label holder_idx requester_idx dir_at_requester rowdir phase burst beat_ms
+    local label="$1" h="$2" q="$3" dir="$4" rowdir="$5" ph="$6" burst="$7" beat_ms="$8"
+    local r v handed=0 idx
+    for idx in "$h" "$q" 0; do snap "$idx" "${ph}0" "$rowdir"; done
+    for ((r = 1; r <= 12; r++)); do
+        sym_prefixed_create "$dir" "touch-$ph-r$r" "$burst" >/dev/null ||
+            die "$label: the requester's touch round $r into $dir failed"
+        sleep "$(python3 -c "print($beat_ms/1000)")"
+        handed=0
+        for idx in "$h" "$q" 0; do
+            snap "$idx" "${ph}1" "$rowdir"
+            v="$(sym_delta "$rowdir" "$idx" "$ph" slot_handovers)"
+            handed=$((handed + v))
+        done
+        [ "$handed" -ge 1 ] && break
+    done
+    [ "$handed" -ge 1 ] ||
+        die "$label: the directory's slot never moved from m$h to m$q in 12 dominating rounds (slot_handovers 0 — the handover premise)"
+    # The holder RELEASED (the manager counts the wire `ReleaseSlot` that
+    # spent its recall as the handover); the requester TAKES the slot at
+    # its next op into the directory — the offer stands 10 s while the
+    # holder's recall rides its 10 s renewal beat, so the offer routinely
+    # lapses before the release lands (`slot_offers_expired`) and a LIVE
+    # requester's next ship first-touches the unleased slot at the door.
+    # Keep the requester live until it holds the slot (its wire acquire).
+    local took=0 r2
+    for ((r2 = 0; r2 <= 6; r2++)); do
+        snap "$q" "${ph}1" "$rowdir"
+        took="$(sym_delta "$rowdir" "$q" "$ph" joined_wire_acquires)"
+        [ "$took" -ge 1 ] && break
+        sym_prefixed_create "$dir" "touch-$ph-take$r2" 8 >/dev/null ||
+            die "$label: the requester's first-touch round $r2 into $dir failed"
+        sleep 2
+    done
+    [ "$took" -ge 1 ] ||
+        die "$label: the requester m$q never took the released slot (joined_wire_acquires unmoved after the holder's release) — the leg's premise, the door's first touch"
+    log "$label: the directory's slot moved m$h → m$q after $r round(s) of $burst creates (slot_handovers +$handed; the requester's wire acquire +$took)"
+}
+# The corpse: a file whose record lives in its DIRECTORY's slot — the
+# parent-slot affinity mint (`affinity_mints` +1 at the creator). On a set
+# of V metadata volumes a directory's children mint round-robin over the
+# volumes (`pick_mint_volume`) and the affinity applies only when the child
+# lands on the parent's volume, so the create is tried up to 2 × V times
+# (empty — the mint decides at the create; the 8 MiB is written into the
+# one that took the affinity, the others removed). Echoes the path.
+sym_rh_make_corpse() { # label creator_idx dir
+    local label="$1" idx="$2" dir="$3" volumes k aff0 f
+    volumes="$(stat_field "$idx" symmetric_meta | python3 -c 'import ast,sys; v=ast.literal_eval(sys.stdin.read().strip() or "1"); print(len(v) if isinstance(v, list) else 1)')"
+    for ((k = 0; k < 2 * volumes; k++)); do
+        f="$dir/corpse-$k"
+        aff0="$(stat_sum "$idx" affinity_mints)"
+        : >"$f" || die "$label: the corpse's create failed ($f)"
+        if [ "$(( $(stat_sum "$idx" affinity_mints) - aff0 ))" -ge 1 ]; then
+            dd if=/dev/urandom of="$f" bs=1M count=8 conv=fsync status=none || die "$label: the corpse's write failed ($f)"
+            echo "$f"
+            return 0
+        fi
+        rm -f "$f"
+    done
+    die "$label: no create into $dir took the parent-slot affinity in $((2 * volumes)) tries — create the fleet with SQUEEZEFS_SYM_AFFINITY_MAX_MB=64 (m$idx a_max $(stat_first_sym "$idx" affinity_a_max_bytes) B)"
+}
+sym_rh_wait() { # label deadline_s cmd... (a shell condition string)
+    local label="$1" deadline="$2" cond="$3" t
+    for ((t = 0; t < deadline; t++)); do
+        eval "$cond" && return 0
+        sleep 1
+    done
+    die "$label: not within ${deadline}s — condition: $cond"
+}
+leg_sym_reclaim_hint() {
+    require_symmetric
+    local joiners
+    mapfile -t joiners < <(joiner_idxs)
+    [ "${#joiners[@]}" -ge 2 ] ||
+        die "sym-reclaim-hint needs ≥ 2 joined writers — create the fleet with: sudo SQUEEZEFS_SYM_AFFINITY_MAX_MB=64 tests/mw_fleet.sh create N=2 --symmetric --writers=3"
+    [[ "$SYM_RH_FILES" =~ ^[1-9][0-9]*$ ]] || die "--rh-files takes a positive integer (got '$SYM_RH_FILES')"
+    sym_quiet_or_die sym-reclaim-hint
+    local rowdir a b idx readers=() writers
+    rowdir="$STATE/rows/symrh-$(date +%s)"
+    mkdir -p "$rowdir"
+    a="${joiners[0]}"
+    b="${joiners[1]}"
+    writers=(0 "${joiners[@]}")
+    for idx in $(member_idxs); do [ "$(role_of "$idx")" = "reader" ] && readers+=("$idx"); done
+    local beat_ms n_floor burst
+    beat_ms="$(stat_field 0 membership_renew_cadence_ms)"
+    [ -n "$beat_ms" ] && [ "$beat_ms" != "0" ] || beat_ms=10000
+    n_floor="$(stat_first_sym "$a" slot_offer_n_floor)"
+    [ -n "$n_floor" ] && [ "$n_floor" -ge 2 ] || n_floor=2
+    burst=$((n_floor * 4))
+    [ "$burst" -ge 64 ] || burst=64
+    local block_size blocks
+    block_size="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["block_size"])' "$(mnt_of 0)/.config")"
+    [ -n "$block_size" ] && [ "$block_size" -gt 0 ] || die "sym-reclaim-hint: the manager's .config names no block_size"
+    blocks=$(( (8 * 1024 * 1024 + block_size - 1) / block_size ))
+    log "sym-reclaim-hint: manager m0, forgetter m$a, requester/new holder m$b, readers (${readers[*]:-none}); beat ${beat_ms} ms, burst $burst, block $block_size B (an 8 MiB corpse = $blocks block(s)); $SYM_RH_FILES files in the box shape"
+    # The log baselines and the closure's start snapshot.
+    declare -A log0
+    for idx in $(member_idxs); do log0[$idx]="$(wc -l <"$STATE/m$idx.log" 2>/dev/null || echo 0)"; done
+    for idx in "${writers[@]}" "${readers[@]}"; do snap "$idx" s0 "$rowdir"; done
+    local mmnt amnt bmnt
+    mmnt="$(mnt_of 0)"; amnt="$(mnt_of "$a")"; bmnt="$(mnt_of "$b")"
+
+    # ---- (A) the box's shape: a token client's forgets of the holder's corpses.
+    mkdir -p "$mmnt/rh-mgr" || die "sym-reclaim-hint A: mkdir rh-mgr at the manager failed"
+    local i
+    for ((i = 0; i < SYM_RH_FILES; i++)); do
+        printf 'rh:%05d' "$i" | dd of="$mmnt/rh-mgr/f$(printf '%05d' "$i")" conv=fsync status=none ||
+            die "sym-reclaim-hint A: the manager's write of f$i failed"
+    done
+    # The joiner (and every reader) instantiates every inode as a token
+    # client: lookup + getattr + read through its own mount.
+    find "$amnt/rh-mgr" -type f -exec cat {} + >/dev/null || die "sym-reclaim-hint A: m$a's read of the manager's tree failed"
+    for idx in "${readers[@]}"; do
+        find "$(mnt_of "$idx")/rh-mgr" -type f -exec cat {} + >/dev/null || die "sym-reclaim-hint A: reader m$idx's read of the manager's tree failed"
+    done
+    for idx in "${writers[@]}" "${readers[@]}"; do snap "$idx" a0 "$rowdir"; done
+    rm -rf "$mmnt/rh-mgr" || die "sym-reclaim-hint A: the manager's rm -rf failed"
+    # Every unreferenced inode the recall's prune left behind is evicted:
+    # the kernel FORGETs at every mount that held one.
+    sync; echo 2 >/proc/sys/vm/drop_caches 2>/dev/null || true
+    sleep 3
+    for idx in "${writers[@]}" "${readers[@]}"; do snap "$idx" a1 "$rowdir"; done
+    local v a_foreign a_shipped a_inos a_fail a_served
+    a_foreign="$(sym_delta "$rowdir" "$a" a reclaim_foreign_slot_forgets)"
+    a_shipped="$(sym_delta "$rowdir" "$a" a reclaim_hints_shipped)"
+    a_inos="$(sym_delta "$rowdir" "$a" a reclaim_hint_inos_shipped)"
+    a_fail="$(sym_delta "$rowdir" "$a" a reclaim_hint_failures)"
+    a_served="$(sym_delta "$rowdir" 0 a reclaim_hints_served)"
+    [ "$a_foreign" -ge 1 ] || die "sym-reclaim-hint A: m$a reclaim_foreign_slot_forgets +$a_foreign — the joiner's kernel forgot none of the manager's $SYM_RH_FILES corpses (no recall → prune → FORGET reached its reclaim)"
+    [ "$a_shipped" -ge 1 ] && [ "$a_inos" -ge "$a_foreign" ] || die "sym-reclaim-hint A: m$a shipped $a_shipped hint(s) / $a_inos ino(s) for $a_foreign foreign forgets"
+    [ "$a_fail" = "0" ] || die "sym-reclaim-hint A: m$a reclaim_hint_failures +$a_fail"
+    [ "$a_served" -ge 1 ] || die "sym-reclaim-hint A: the manager served $a_served hinted ino(s) — the joiner's hints reached no sink at the manager"
+    for idx in "${writers[@]}" "${readers[@]}"; do
+        v="$(sym_delta "$rowdir" "$idx" a reclaim_destroy_refused_release_failed)"
+        [ "$v" = "0" ] || die "sym-reclaim-hint A: m$idx withheld $v destroy(ies) (reclaim_destroy_refused_release_failed)"
+    done
+    for idx in "${readers[@]}"; do
+        v="$(sym_delta "$rowdir" "$idx" a reclaim_reader_forgets)"
+        [ "$v" -ge 1 ] || warn "sym-reclaim-hint A: reader m$idx reclaim_reader_forgets +$v (its kernel kept the inodes past the settle — no verdict)"
+        [ "$(sym_delta "$rowdir" "$idx" a reclaim_hints_shipped)" = "0" ] || die "sym-reclaim-hint A: reader m$idx shipped a hint — a reader hints nobody"
+    done
+    log "sym-reclaim-hint A: m$a forgot $a_foreign of the manager's corpses as a token client → $a_shipped hint(s) / $a_inos ino(s) → the manager served $a_served; nothing withheld anywhere"
+
+    # ---- (B) the MOVED-slot corpse (class ii).
+    local pop_b0 pop_b1 hold_pid refs_b0 free_b0 corpse
+    pop_b0="$(stat_sum 0 data_alloc_bitmap_population)"
+    mkdir -p "$amnt/rh-ja" || die "sym-reclaim-hint B: mkdir rh-ja at m$a failed"
+    corpse="$(sym_rh_make_corpse sym-reclaim-hint-B "$a" "$amnt/rh-ja")"
+    hold_pid="$(sym_rh_hold_open "$corpse")"
+    sleep 0.5
+    kill -0 "$hold_pid" 2>/dev/null || die "sym-reclaim-hint B: the holder process died"
+    rm "$corpse" || die "sym-reclaim-hint B: the unlink failed"
+    sleep 1
+    pop_b1="$(stat_sum 0 data_alloc_bitmap_population)"
+    sym_rh_handover sym-reclaim-hint-B "$a" "$b" "$bmnt/rh-ja" "$rowdir" hb "$burst" "$beat_ms"
+    for idx in "${writers[@]}"; do snap "$idx" b0 "$rowdir"; done
+    refs_b0="$(stat_sum "$b" meta_kv_block_refs_released)"
+    free_b0="$(stat_sum 0 meta_ship_publish.free_served_blocks)"
+    # The close: m$a's kernel FORGETs the corpse — its slot is m$b's now.
+    kill "$hold_pid" 2>/dev/null || true
+    wait "$hold_pid" 2>/dev/null || true
+    sym_rh_wait sym-reclaim-hint-B 90 "[ \$(( \$(stat_sum $b meta_kv_block_refs_released) - $refs_b0 )) -ge $blocks ]"
+    sym_rh_wait sym-reclaim-hint-B 90 "[ \$(( \$(stat_sum 0 meta_ship_publish.free_served_blocks) - $free_b0 )) -ge $blocks ]"
+    sym_rh_wait sym-reclaim-hint-B 90 "[ \$(stat_sum 0 data_alloc_bitmap_population) -le $(( pop_b1 - blocks )) ]"
+    for idx in "${writers[@]}"; do snap "$idx" b1 "$rowdir"; done
+    local b_foreign b_unleased b_shipped b_inos b_served
+    b_foreign="$(sym_delta "$rowdir" "$a" b reclaim_foreign_slot_forgets)"
+    b_unleased="$(sym_delta "$rowdir" "$a" b reclaim_unleased_slot_forgets)"
+    b_shipped="$(sym_delta "$rowdir" "$a" b reclaim_hints_shipped)"
+    b_inos="$(sym_delta "$rowdir" "$a" b reclaim_hint_inos_shipped)"
+    b_served="$(sym_delta "$rowdir" "$b" b reclaim_hints_served)"
+    [ "$b_foreign" -ge 1 ] || die "sym-reclaim-hint B: m$a counted the corpse's forget foreign $b_foreign time(s)"
+    [ "$b_shipped" -ge 1 ] && [ "$b_inos" -ge 1 ] || die "sym-reclaim-hint B: m$a shipped $b_shipped hint(s) / $b_inos ino(s)"
+    [ "$(sym_delta "$rowdir" "$a" b reclaim_hint_failures)" = "0" ] || die "sym-reclaim-hint B: m$a reclaim_hint_failures moved"
+    [ "$b_served" -ge 1 ] || die "sym-reclaim-hint B: the new holder m$b served $b_served hinted ino(s)"
+    for idx in "${writers[@]}"; do
+        v="$(sym_delta "$rowdir" "$idx" b reclaim_destroy_refused_release_failed)"
+        [ "$v" = "0" ] || die "sym-reclaim-hint B: m$idx withheld $v destroy(ies)"
+    done
+    log "sym-reclaim-hint B (the MOVED-slot corpse): m$a's close → FORGET counted foreign ($b_foreign; unleased $b_unleased) → $b_shipped hint / $b_inos ino → m$b served $b_served and destroyed it: m$b meta_kv_block_refs_released +$(( $(stat_sum "$b" meta_kv_block_refs_released) - refs_b0 )), the manager free_served_blocks +$(( $(stat_sum 0 meta_ship_publish.free_served_blocks) - free_b0 )), data_alloc_bitmap_population $pop_b1 → $(stat_sum 0 data_alloc_bitmap_population) (≥ $blocks block(s) cleared; before the corpse's create $pop_b0 — a joiner's grant window is SET whole at its carve, so the population moves by the window, never by the file)"
+
+    # ---- (C) the UNLEASED corpse (class i).
+    local pop_c1 hold2_pid refs_c0 pop_c0 corpse2
+    pop_c0="$(stat_sum 0 data_alloc_bitmap_population)"
+    mkdir -p "$amnt/rh-jb" || die "sym-reclaim-hint C: mkdir rh-jb at m$a failed"
+    corpse2="$(sym_rh_make_corpse sym-reclaim-hint-C "$a" "$amnt/rh-jb")"
+    hold2_pid="$(sym_rh_hold_open "$corpse2")"
+    sleep 0.5
+    kill -0 "$hold2_pid" 2>/dev/null || die "sym-reclaim-hint C: the holder process died"
+    rm "$corpse2" || die "sym-reclaim-hint C: the unlink failed"
+    sleep 1
+    pop_c1="$(stat_sum 0 data_alloc_bitmap_population)"
+    sym_rh_handover sym-reclaim-hint-C "$a" "$b" "$bmnt/rh-jb" "$rowdir" hc "$burst" "$beat_ms"
+    # The new holder LEAVES cleanly: its slots go Unleased at tree 0 — the
+    # corpse now sits in a tree nobody leases, at the manager. Its process
+    # counters restart at the remount, so its served / forwarded /
+    # misrouted words up to the leave are carried into the closure by hand.
+    local b_pre_served b_pre_fwd b_pre_mis
+    b_pre_served="$(stat_sum "$b" reclaim_hints_served)"
+    b_pre_fwd="$(stat_sum "$b" reclaim_hints_forwarded)"
+    b_pre_mis="$(stat_sum "$b" reclaim_hints_misrouted)"
+    "$MWFLEET" unmount "$b" || die "sym-reclaim-hint C: m$b's leave failed"
+    wait_for_unmounted "$bmnt"
+    sym_rh_wait sym-reclaim-hint-C 60 "[ \"\$(stat_all_eq 0 appenders_known ${#joiners[@]})\" = 1 ]"
+    for idx in 0 "$a"; do snap "$idx" c0 "$rowdir"; done
+    refs_c0="$(stat_sum 0 meta_kv_block_refs_released)"
+    kill "$hold2_pid" 2>/dev/null || true
+    wait "$hold2_pid" 2>/dev/null || true
+    sym_rh_wait sym-reclaim-hint-C 90 "[ \$(( \$(stat_sum 0 meta_kv_block_refs_released) - $refs_c0 )) -ge $blocks ]"
+    sym_rh_wait sym-reclaim-hint-C 90 "[ \$(stat_sum 0 data_alloc_bitmap_population) -le $(( pop_c1 - blocks )) ]"
+    for idx in 0 "$a"; do snap "$idx" c1 "$rowdir"; done
+    local c_unleased c_foreign c_shipped c_inos c_served
+    c_unleased="$(sym_delta "$rowdir" "$a" c reclaim_unleased_slot_forgets)"
+    c_foreign="$(sym_delta "$rowdir" "$a" c reclaim_foreign_slot_forgets)"
+    c_shipped="$(sym_delta "$rowdir" "$a" c reclaim_hints_shipped)"
+    c_inos="$(sym_delta "$rowdir" "$a" c reclaim_hint_inos_shipped)"
+    c_served="$(sym_delta "$rowdir" 0 c reclaim_hints_served)"
+    [ "$c_unleased" -ge 1 ] || die "sym-reclaim-hint C: m$a reclaim_unleased_slot_forgets +$c_unleased (foreign +$c_foreign) — the corpse's slot was not read UNLEASED at the forget"
+    [ "$c_shipped" -ge 1 ] && [ "$c_inos" -ge 1 ] || die "sym-reclaim-hint C: m$a shipped $c_shipped hint(s) / $c_inos ino(s)"
+    [ "$(sym_delta "$rowdir" "$a" c reclaim_hint_failures)" = "0" ] || die "sym-reclaim-hint C: m$a reclaim_hint_failures moved"
+    [ "$c_served" -ge 1 ] || die "sym-reclaim-hint C: the manager served $c_served hinted ino(s)"
+    for idx in 0 "$a"; do
+        v="$(sym_delta "$rowdir" "$idx" c reclaim_destroy_refused_release_failed)"
+        [ "$v" = "0" ] || die "sym-reclaim-hint C: m$idx withheld $v destroy(ies)"
+    done
+    log "sym-reclaim-hint C (the UNLEASED corpse): m$b left, m$a's close → FORGET counted unleased ($c_unleased) → $c_shipped hint / $c_inos ino → the manager served $c_served and destroyed it: meta_kv_block_refs_released +$(( $(stat_sum 0 meta_kv_block_refs_released) - refs_c0 )), data_alloc_bitmap_population $pop_c1 → $(stat_sum 0 data_alloc_bitmap_population) (≥ $blocks cleared; before the create $pop_c0)"
+    "$MWFLEET" mount "$b" || die "sym-reclaim-hint C: m$b's re-mount failed"
+    sym_rh_wait sym-reclaim-hint-C 60 "[ \"\$(stat_all_eq 0 appenders_known $(( ${#joiners[@]} + 1 )))\" = 1 ]"
+
+    # ---- The closure at rest, the logs, the oracle, the census.
+    rm -rf "$mmnt/rh-ja" "$mmnt/rh-jb" 2>/dev/null || true
+    sleep 3
+    local shipped_sum served_sum fwd_sum mis_sum fail_sum
+    sym_rh_closure() {
+        shipped_sum=0; served_sum=0; fwd_sum=0; mis_sum=0; fail_sum=0
+        local i
+        for i in "${writers[@]}"; do
+            snap "$i" s1 "$rowdir"
+            shipped_sum=$(( shipped_sum + $(sym_delta "$rowdir" "$i" s reclaim_hint_inos_shipped) ))
+            served_sum=$(( served_sum + $(sym_delta "$rowdir" "$i" s reclaim_hints_served) ))
+            fwd_sum=$(( fwd_sum + $(sym_delta "$rowdir" "$i" s reclaim_hints_forwarded) ))
+            mis_sum=$(( mis_sum + $(sym_delta "$rowdir" "$i" s reclaim_hints_misrouted) ))
+            fail_sum=$(( fail_sum + $(sym_delta "$rowdir" "$i" s reclaim_hint_failures) ))
+        done
+        # m$b's pre-leave words (its s1 snapshot is the REMOUNTED process's).
+        served_sum=$(( served_sum + b_pre_served ))
+        fwd_sum=$(( fwd_sum + b_pre_fwd ))
+        mis_sum=$(( mis_sum + b_pre_mis ))
+        [ "$shipped_sum" = "$(( served_sum + fwd_sum + mis_sum ))" ]
+    }
+    local t
+    for ((t = 0; t < 30; t++)); do sym_rh_closure && break; sleep 1; done
+    sym_rh_closure || die "sym-reclaim-hint: the family does not close at rest — Σ hint_inos_shipped $shipped_sum ≠ Σ served $served_sum + forwarded $fwd_sum + misrouted $mis_sum (failures $fail_sum)"
+    [ "$fail_sum" = "0" ] || die "sym-reclaim-hint: Σ reclaim_hint_failures = $fail_sum across the writers"
+    for idx in $(member_idxs); do sym_rh_logs_clean sym-reclaim-hint "$idx" "${log0[$idx]}"; done
+    local refused_sum=0
+    for idx in "${writers[@]}" "${readers[@]}"; do
+        v="$(sym_delta "$rowdir" "$idx" s reclaim_destroy_refused_release_failed 2>/dev/null || echo 0)"
+        refused_sum=$(( refused_sum + ${v:-0} ))
+    done
+    echo "== PR 13h sym-reclaim-hint: Σ reclaim_hint_inos_shipped=$shipped_sum ≡ Σ served=$served_sum + forwarded=$fwd_sum + misrouted=$mis_sum, reclaim_hint_failures=$fail_sum, reclaim_destroy_refused_release_failed=$refused_sum, 0 'corrupt KV encoding' / 'destroy WITHHELD' lines; A: m$a foreign +$a_foreign → manager served +$a_served; B (moved slot): foreign +$b_foreign → m$b served +$b_served, refs released ≥ $blocks, bitmap cleared ≥ $blocks; C (unleased): unleased +$c_unleased → manager served +$c_served, refs released ≥ $blocks, bitmap cleared ≥ $blocks$SYM_BUSY_ROW ==" | tee "$rowdir/symrh-table.txt"
+    sym_oracle sym-reclaim-hint "$rowdir"
+    sym_post_leave_census sym-reclaim-hint "$rowdir" "$(date +%s)" "${writers[@]}"
+    log "sym-reclaim-hint PUBLISHED (table + snapshots in $rowdir)"
 }
 
 # --- gate 5: sym-readers ----------------------------------------------------
@@ -10260,6 +10588,7 @@ mw-scale) leg_mw_scale ;;
 sym-shared-dir) leg_sym_shared_dir ;;
 sym-foreign-touch) leg_sym_foreign_touch ;;
 sym-foreign-file) leg_sym_foreign_file ;;
+sym-reclaim-hint) leg_sym_reclaim_hint ;;
 sym-readers) leg_sym_readers ;;
 sym-walls) leg_sym_walls ;;
 s8-serial-ab) leg_s8_serial_ab ;;
@@ -10285,5 +10614,5 @@ pv-rand4k-w1) leg_pv_rand4k_w1 ;;
 cowriters-admission) leg_cowriters_admission ;;
 vm-hostscope-validate) leg_vm_hostscope_validate ;;
 vm-multi-identity) leg_vm_multi_identity ;;
-*) die "unknown leg '$LEG' (pv-volume-scaling|smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|sym-crash|sym-storm|sym-tarx|sym-scale|sym-shared-dir|sym-foreign-touch|sym-readers|sym-walls|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s11-range|s11-subblock|s11-mpiio|s11-blockcyclic|s11-tiny|s11-killrange|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|pv-rewrite-funnel|pv-cross-owner|pv-rand4k-w1|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
+*) die "unknown leg '$LEG' (pv-volume-scaling|smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|sym-crash|sym-storm|sym-tarx|sym-scale|sym-shared-dir|sym-foreign-touch|sym-foreign-file|sym-reclaim-hint|sym-readers|sym-walls|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s11-range|s11-subblock|s11-mpiio|s11-blockcyclic|s11-tiny|s11-killrange|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|pv-rewrite-funnel|pv-cross-owner|pv-rand4k-w1|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
 esac

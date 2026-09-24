@@ -13863,6 +13863,27 @@ impl SqueezefsFilesystem {
                     "meta_kv_checkpoint_barrier_ms".into(),
                     per_volume(&|be| be.checkpoint_barrier_ms()),
                 );
+                // PR 13h (the box-pass review's instrument): the last
+                // cycle's TAPE per volume — the decision's words (dirty,
+                // promised, units, projection, trigger, lateness) and the
+                // cycle's paid walls (pre-start, publish, flush by class,
+                // pages, barrier, landing, term). An overrun's WARN line
+                // carries the same words; the two together attribute a
+                // trip with no snapshot to read on its right side.
+                metrics.insert(
+                    "meta_kv_checkpoint_last_cycle".into(),
+                    self.meta_backend
+                        .as_ref()
+                        .map(|mb| {
+                            serde_json::Value::Array(
+                                mb.volumes
+                                    .iter()
+                                    .map(|be| be.checkpoint_last_cycle().to_json())
+                                    .collect(),
+                            )
+                        })
+                        .unwrap_or_default(),
+                );
                 // LEAF-MERGE (design-cow-kv-metadata §4.6a (h)): the
                 // underfull-sibling SMO. `node_merges` = merges executed
                 // (the engagement gauge — moves on any delete-heavy

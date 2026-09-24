@@ -1250,6 +1250,147 @@ pub fn projected_cycle_wall_ns(flush_ns: u64, barriers: u64, barrier_unit_ns: u6
     flush_ns.saturating_add(barriers.saturating_mul(barrier_unit_ns))
 }
 
+/// **The per-cycle TAPE** (PR 13h — the fourth box pass's re-read of
+/// F-B1, review Issue 1): what the last checkpoint cycle of this volume
+/// DECIDED with and PAID, word by word, so an `appender_flush_ceiling_
+/// overruns` increment attributes itself from the WARN line it rides and
+/// from `.stats meta_kv_checkpoint_last_cycle`, with no snapshot to read
+/// on the right side of the trip. The box's one trip had no such tape:
+/// the record read a pre-trip snapshot (term 52 / projection 84 / late
+/// 15) as the trip's own words and filled the gap with a barrier no face
+/// measured; the faces that exist bound the trip cycle's wall in
+/// [52, 151] ms against a projection of 84, and which of `dirty_collected
+/// − dirty_at_decision`, `images − promised_at_decision`, the units
+/// against the pass's per-class walls, or the FIXED part (`publish +
+/// pages + barrier`) carried the excess is exactly what this tape says.
+/// Every wall is a monotonic-clock difference in ms; the decision words
+/// are the ones the trigger was computed from at that instant; `late_ms`
+/// / the decision words read 0 for a cycle no age decision fired (the
+/// ring-pressure, cap, hole and `checkpoint_now` cycles).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CycleTape {
+    /// This volume's checkpoint seq the cycle landed as.
+    pub seq: u64,
+    /// The age decision's raw lateness past its trigger.
+    pub late_ms: u64,
+    /// The decision → the cycle's first instruction (the due tick's
+    /// deferred-flush barrier sits here).
+    pub pre_start_ms: u64,
+    /// The root publication and the collection walk.
+    pub publish_ms: u64,
+    /// The flush pass.
+    pub flush_ms: u64,
+    /// The allocation bitmap pages (meta and data).
+    pub pages_ms: u64,
+    /// Barrier #1.
+    pub barrier_ms: u64,
+    /// The decision (else the start) → barrier #1 landed: the wall the
+    /// term is clocked from.
+    pub landing_ms: u64,
+    /// The term this cycle folded into the horizon
+    /// ([`checkpoint_cycle_term_ns`] of the landing wall and the lateness).
+    pub term_ms: u64,
+    /// The dirty nodes the decision COUNTED and the collection FOUND.
+    pub dirty_at_decision: u64,
+    pub dirty_collected: u64,
+    /// The pass's classes: nodes appended, nodes SMO'd, fresh images.
+    pub nodes_appended: u64,
+    pub smo_nodes: u64,
+    pub images: u64,
+    /// The SMO images the pending commits had PROMISED at the decision.
+    pub promised_at_decision: u64,
+    /// The pass's measured per-class walls this cycle, ms.
+    pub append_ms: u64,
+    pub image_ms: u64,
+    /// The units the projection multiplied by at the decision, µs.
+    pub node_unit_us: u64,
+    pub image_unit_us: u64,
+    /// The projection at the decision, the horizon term it competed with
+    /// and the trigger the decision fired at.
+    pub projected_ms: u64,
+    pub anticipated_ms: u64,
+    pub trigger_ms: u64,
+}
+
+impl CycleTape {
+    /// The `.stats` face — one object per volume.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "seq": self.seq,
+            "late_ms": self.late_ms,
+            "pre_start_ms": self.pre_start_ms,
+            "publish_ms": self.publish_ms,
+            "flush_ms": self.flush_ms,
+            "pages_ms": self.pages_ms,
+            "barrier_ms": self.barrier_ms,
+            "landing_ms": self.landing_ms,
+            "term_ms": self.term_ms,
+            "dirty_at_decision": self.dirty_at_decision,
+            "dirty_collected": self.dirty_collected,
+            "nodes_appended": self.nodes_appended,
+            "smo_nodes": self.smo_nodes,
+            "images": self.images,
+            "promised_at_decision": self.promised_at_decision,
+            "append_ms": self.append_ms,
+            "image_ms": self.image_ms,
+            "node_unit_us": self.node_unit_us,
+            "image_unit_us": self.image_unit_us,
+            "projected_ms": self.projected_ms,
+            "anticipated_ms": self.anticipated_ms,
+            "trigger_ms": self.trigger_ms,
+        })
+    }
+}
+
+impl std::fmt::Display for CycleTape {
+    /// The WARN line's form: the decision's words, then what the cycle
+    /// paid, so the excess names its own term.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cycle {} decided at trigger {} ms (anticipated {} ms, projected {} ms over {} dirty \
+             nodes × {} µs + {} promised images × {} µs) {} ms late; paid pre-start {} + publish \
+             {} + flush {} ({} found: {} appended in {} ms, {} SMO'd writing {} images in {} ms) \
+             + pages {} + barrier {} = landing {} ms, term {} ms",
+            self.seq,
+            self.trigger_ms,
+            self.anticipated_ms,
+            self.projected_ms,
+            self.dirty_at_decision,
+            self.node_unit_us,
+            self.promised_at_decision,
+            self.image_unit_us,
+            self.late_ms,
+            self.pre_start_ms,
+            self.publish_ms,
+            self.flush_ms,
+            self.dirty_collected,
+            self.nodes_appended,
+            self.append_ms,
+            self.smo_nodes,
+            self.images,
+            self.image_ms,
+            self.pages_ms,
+            self.barrier_ms,
+            self.landing_ms,
+            self.term_ms
+        )
+    }
+}
+
+/// The walls and counts a cycle hands its landing fold
+/// (`KvMetaBackend::note_checkpoint_cycle_term`) for the tape.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CycleWalls {
+    pub cycle_started_ns: u64,
+    pub collected_ns: u64,
+    pub flushed_ns: u64,
+    pub pages_ns: u64,
+    pub landed_ns: u64,
+    pub dirty_collected: u64,
+    pub sample: FlushPassSample,
+}
+
 /// **The cycle terms a forest volume's cadence anticipates over** — the
 /// last [`TERM_HORIZON_CYCLES`] samples; the anticipated term is their
 /// MAXIMUM (PR 13e, F-B1). A ceiling is a BOUND, so the term it
@@ -1746,6 +1887,10 @@ struct CheckpointDecision {
     /// clocks its landing term from here (PR 13h: the deferred-flush
     /// barrier between the decision and the cycle is inside it).
     decided_at_ns: u64,
+    /// The dirty count the decision priced its projection over and the
+    /// max age it decided against — the tape's decision words.
+    dirty_nodes: u64,
+    max_age_ms: u64,
 }
 
 impl CheckpointDecision {
@@ -1834,6 +1979,8 @@ fn decide_checkpoint(
         region_pressure,
         age_late_ns,
         decided_at_ns,
+        dirty_nodes,
+        max_age_ms,
     }
 }
 
@@ -2021,7 +2168,13 @@ async fn tick(
         // trip was that barrier's wall priced nowhere.
         if be.appenders().is_some() {
             if let Some(late_ns) = d.age_late_ns {
-                be.note_checkpoint_decision(late_ns, tick_ms, d.decided_at_ns);
+                be.note_checkpoint_decision(
+                    late_ns,
+                    tick_ms,
+                    d.decided_at_ns,
+                    d.dirty_nodes,
+                    d.max_age_ms,
+                );
             }
         }
         be.checkpoint_cycle(&mut smo, d.ring_pressure || final_cycle)
@@ -2556,13 +2709,23 @@ impl KvMetaBackend {
         // durable (the §4.6 pt 3 pending-reclaim drains inside).
         self.sync_device().await.map_err(KvError::Io)?;
         let landed_ns = crate::mono_core::monotonic_ns_u64();
-        self.note_flush_ceiling(&had_dirty, landed_ns);
         self.note_checkpoint_barrier(t_pages.elapsed().as_nanos() as u64);
-        // The landing wall the audit just measured against — from the age
+        // The landing wall the audit measures against — from the age
         // decision that fired this cycle (PR 13h), else its start — folded
         // with the decision's lateness into the term the cadence trigger
-        // anticipates (PR 13e, F-B1).
-        self.note_checkpoint_cycle_term(cycle_started_ns, landed_ns);
+        // anticipates (PR 13e, F-B1), and the cycle's TAPE written, BEFORE
+        // the audit: an overrun's WARN line carries this cycle's words.
+        let elapsed_ns = |i: std::time::Instant| i.duration_since(cycle_started).as_nanos() as u64;
+        self.note_checkpoint_cycle_term(CycleWalls {
+            cycle_started_ns,
+            collected_ns: cycle_started_ns + elapsed_ns(t_collected),
+            flushed_ns: cycle_started_ns + elapsed_ns(t_flushed),
+            pages_ns: cycle_started_ns + elapsed_ns(t_pages),
+            landed_ns,
+            dirty_collected: dirty_count as u64,
+            sample,
+        });
+        self.note_flush_ceiling(&had_dirty, landed_ns);
         log::debug!(
             "checkpoint: cycle on {:?} pre-barrier wall {} ms = publish {} + flush {} ({} dirty \
              nodes: {} appended in {} ms, {} SMO'd writing {} images in {} ms) + pages {} + \

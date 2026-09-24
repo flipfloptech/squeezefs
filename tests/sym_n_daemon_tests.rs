@@ -14121,6 +14121,104 @@ async fn a_deferred_flush_barrier_between_the_decision_and_its_cycle_is_priced_i
     fsck_clean(&uris).await;
 }
 
+/// **The per-cycle tape** (PR 13h — the box-pass review's Issue 1 named the
+/// instrument): `meta_kv_checkpoint_last_cycle` says what the LAST cycle
+/// decided with and paid, so a trip attributes itself from the WARN line
+/// that rides it. The fourth box pass's one trip had no such words: the
+/// record read a snapshot taken on the wrong side of the trip and filled
+/// the gap with a barrier no face measured. Pinned: a `checkpoint_now`
+/// cycle's tape carries NO decision words (no age decision fired it) and
+/// its paid walls sum to its landing; a CADENCE cycle's tape carries the
+/// decision's words (the trigger it fired at, the dirty count it priced,
+/// the projection) beside the same sum law, and the collection found what
+/// the decision counted. Each wall is a floor in ms, so the sum bounds
+/// the landing from below by construction and from above by the five
+/// roundings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_last_cycles_tape_names_the_decisions_words_and_what_the_cycle_paid() {
+    let dir = cadence_venue_dir();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_ring_len(dir.path(), 1, VOL_LEN * 8, 32 * 1024 * 1024).await;
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let d = manager
+        .create(1, "tape", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("the directory")
+        .ino;
+    let sum_law = |t: &squeezefs::meta_backend::kv::checkpoint::CycleTape| {
+        let parts = t.pre_start_ms + t.publish_ms + t.flush_ms + t.pages_ms + t.barrier_ms;
+        assert!(
+            (parts..=parts + 5).contains(&t.landing_ms),
+            "the paid walls sum to the landing (parts {parts}, landing {}): {t}",
+            t.landing_ms
+        );
+        assert_eq!(
+            t.dirty_collected,
+            t.nodes_appended + t.smo_nodes,
+            "every node the collection found was appended or SMO'd: {t}"
+        );
+    };
+    // A `checkpoint_now` cycle: no age decision fired it.
+    for i in 0..3 {
+        manager
+            .create(d, &format!("now-{i}"), libc::S_IFREG | 0o644, 1000, 1000)
+            .await
+            .expect("a create");
+    }
+    mvol.checkpoint_now().await.expect("the explicit cycle");
+    let now_tape = mvol.checkpoint_last_cycle();
+    eprintln!("tape (checkpoint_now): {now_tape}");
+    assert_eq!(
+        now_tape.seq,
+        mvol.checkpoint_seq(),
+        "the tape names the cycle's seq"
+    );
+    assert!(
+        now_tape.dirty_collected >= 1,
+        "the cycle flushed the creates: {now_tape}"
+    );
+    assert_eq!(
+        (
+            now_tape.trigger_ms,
+            now_tape.dirty_at_decision,
+            now_tape.projected_ms,
+            now_tape.late_ms
+        ),
+        (0, 0, 0, 0),
+        "an explicit cycle carries no decision words: {now_tape}"
+    );
+    sum_law(&now_tape);
+    // A CADENCE cycle: the age decision's words ride the tape.
+    let seq0 = mvol.checkpoint_seq();
+    manager
+        .create(d, "cadence", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("a create");
+    wait_until("the cadence's own cycle", || mvol.checkpoint_seq() > seq0).await;
+    let tape = mvol.checkpoint_last_cycle();
+    eprintln!("tape (cadence): {tape}");
+    assert_eq!(tape.seq, mvol.checkpoint_seq());
+    assert!(
+        tape.trigger_ms >= 1,
+        "the age decision's trigger rides the tape: {tape}"
+    );
+    assert!(
+        tape.dirty_at_decision >= 1 && tape.dirty_collected >= tape.dirty_at_decision,
+        "the decision counted the dirty leaf and the collection found it: {tape}"
+    );
+    assert!(
+        tape.node_unit_us >= 1 && tape.projected_ms <= tape.trigger_ms.max(1) * 1000,
+        "the projection's inputs ride the tape: {tape}"
+    );
+    sum_law(&tape);
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
 // ---------------------------------------------------------------------------
 // PR 13h — F-R6: a token client's FORGET-driven reclaim on a foreign slot
 // (the fourth box pass, the record's §3.9.6.3).

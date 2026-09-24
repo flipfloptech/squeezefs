@@ -1608,6 +1608,17 @@ pub struct KvMetaBackend {
     /// beside the horizon maximum — what a contract judging ONE cycle's
     /// landing attributes its verdict with; PR 13h).
     pub(super) checkpoint_last_late_ns: AtomicU64,
+    /// The age decision's words for the cycle it fires (PR 13h, the tape):
+    /// the dirty count it priced, the promised images, the units, the
+    /// projection and the trigger — stored by `note_checkpoint_decision`,
+    /// consumed by the cycle's landing fold. The checkpoint task's own
+    /// (one cycle at a time per volume); the std mutex is the `Sync` face.
+    pub(super) checkpoint_decision_words: std::sync::Mutex<super::checkpoint::CycleTape>,
+    /// **The last cycle's TAPE** (`meta_kv_checkpoint_last_cycle`; PR 13h):
+    /// what the last checkpoint cycle decided with and paid, word by word
+    /// — the instrument an overrun attributes itself with (its WARN line
+    /// carries the same words).
+    pub(super) checkpoint_last_cycle: std::sync::Mutex<super::checkpoint::CycleTape>,
     /// **The covering barrier's wall** — one device barrier of this
     /// volume's checkpoint path, ns: barrier #1 of every cycle and the
     /// deferred-flush barrier a due tick runs between its decision and
@@ -3280,6 +3291,10 @@ impl KvMetaBackend {
             checkpoint_lates: std::sync::Mutex::new(super::checkpoint::CycleTermWindow::new()),
             checkpoint_late_max_ns: AtomicU64::new(0),
             checkpoint_last_late_ns: AtomicU64::new(0),
+            checkpoint_decision_words: std::sync::Mutex::new(
+                super::checkpoint::CycleTape::default(),
+            ),
+            checkpoint_last_cycle: std::sync::Mutex::new(super::checkpoint::CycleTape::default()),
             checkpoint_barriers: std::sync::Mutex::new(super::checkpoint::CycleTermWindow::new()),
             checkpoint_barrier_ns: AtomicU64::new(0),
             maintenance_rotor: AtomicUsize::new(0),
@@ -11707,13 +11722,16 @@ impl KvMetaBackend {
         }
         set.flush_ceiling_overruns
             .fetch_add(over.len() as u64, Ordering::Relaxed);
+        // The cycle's tape rides the WARN (PR 13h): the trip attributes
+        // itself from this line, whatever snapshot a harness reads later.
         log::warn!(
             "meta volume {}: flush ceiling OVERRUN — appender region(s) {over:?} (id, oldest \
              dirty leaf's age in ms at the covering barrier) exceeded the {} ms landing \
              ceiling with every structural hold's capped overlap excluded \
-             (appender_flush_ceiling_overruns, must stay 0)",
+             (appender_flush_ceiling_overruns, must stay 0); the cycle's tape: {}",
             self.path.display(),
-            set.flush_ceiling_ms
+            set.flush_ceiling_ms,
+            self.checkpoint_last_cycle()
         );
     }
 
@@ -12336,8 +12354,12 @@ impl KvMetaBackend {
     /// happens, never a term to anticipate) — into the window the cadence
     /// trigger anticipates over (PR 13e, F-B1). The window's mutex is the
     /// checkpoint task's own (one cycle at a time per volume); the
-    /// published maximum is what the cadence reads.
-    pub(super) fn note_checkpoint_cycle_term(&self, cycle_started_ns: u64, now_ns: u64) {
+    /// published maximum is what the cadence reads. The cycle's TAPE
+    /// (`walls` + the decision's stored words) is written here, before
+    /// the flush-ceiling audit reads it for an overrun's WARN line.
+    pub(super) fn note_checkpoint_cycle_term(&self, walls: super::checkpoint::CycleWalls) {
+        let cycle_started_ns = walls.cycle_started_ns;
+        let now_ns = walls.landed_ns;
         let late_ns = self.checkpoint_decision_late_ns.swap(0, Ordering::AcqRel);
         let tick_ns = self.checkpoint_decision_tick_ns.swap(0, Ordering::AcqRel);
         let decided_at_ns = self.checkpoint_decision_at_ns.swap(0, Ordering::AcqRel);
@@ -12366,6 +12388,35 @@ impl KvMetaBackend {
         };
         self.checkpoint_term_ns
             .store(anticipated, Ordering::Relaxed);
+        // The tape (PR 13h): the decision's words — taken by the decision
+        // that fired this cycle, zero for another path's — and what the
+        // cycle paid. The seq is the one this cycle lands as.
+        let ms = |ns: u64| ns / 1_000_000;
+        let mut tape = std::mem::take(
+            &mut *self
+                .checkpoint_decision_words
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        tape.seq = self.checkpoint_seq.load(Ordering::Acquire) + 1;
+        tape.late_ms = ms(late_ns);
+        tape.pre_start_ms = ms(cycle_started_ns.saturating_sub(start_ns));
+        tape.publish_ms = ms(walls.collected_ns.saturating_sub(cycle_started_ns));
+        tape.flush_ms = ms(walls.flushed_ns.saturating_sub(walls.collected_ns));
+        tape.pages_ms = ms(walls.pages_ns.saturating_sub(walls.flushed_ns));
+        tape.barrier_ms = ms(now_ns.saturating_sub(walls.pages_ns));
+        tape.landing_ms = ms(now_ns.saturating_sub(start_ns));
+        tape.term_ms = ms(sample_ns);
+        tape.dirty_collected = walls.dirty_collected;
+        tape.nodes_appended = walls.sample.nodes;
+        tape.smo_nodes = walls.sample.smo_nodes;
+        tape.images = walls.sample.images;
+        tape.append_ms = ms(walls.sample.node_ns);
+        tape.image_ms = ms(walls.sample.image_ns);
+        *self
+            .checkpoint_last_cycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = tape;
         // The decision's RAW lateness over the same horizon — the venue's
         // term, published beside the overrun it explains (Issue 19) — and
         // this cycle's own word (PR 13h).
@@ -12665,7 +12716,14 @@ impl KvMetaBackend {
     /// cycle). The cycle consumes both in `note_checkpoint_cycle_term`;
     /// the SMO mutex the caller holds across the store and the cycle is
     /// what keeps another path's cycle from consuming them first.
-    pub(super) fn note_checkpoint_decision(&self, late_ns: u64, tick_ms: u64, decided_at_ns: u64) {
+    pub(super) fn note_checkpoint_decision(
+        &self,
+        late_ns: u64,
+        tick_ms: u64,
+        decided_at_ns: u64,
+        dirty_nodes: u64,
+        max_age_ms: u64,
+    ) {
         self.checkpoint_decision_late_ns
             .store(late_ns, Ordering::Release);
         self.checkpoint_decision_tick_ns
@@ -12675,6 +12733,22 @@ impl KvMetaBackend {
         // barrier, never this call's.
         self.checkpoint_decision_at_ns
             .store(decided_at_ns, Ordering::Release);
+        // The decision's words for the tape — read HERE, at the decision,
+        // before the cycle consumes the promises and moves the units.
+        let words = super::checkpoint::CycleTape {
+            dirty_at_decision: dirty_nodes,
+            promised_at_decision: self.promised_smo_extents(),
+            node_unit_us: self.checkpoint_node_unit_ns() / 1_000,
+            image_unit_us: self.checkpoint_image_unit_ns() / 1_000,
+            projected_ms: self.checkpoint_projected_ms_for(dirty_nodes),
+            anticipated_ms: self.checkpoint_term_ms(),
+            trigger_ms: self.checkpoint_trigger_ms_for(max_age_ms, dirty_nodes),
+            ..Default::default()
+        };
+        *self
+            .checkpoint_decision_words
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = words;
     }
 
     /// Drop a stored decision a FAILED cycle never folded (review round
@@ -12684,6 +12758,19 @@ impl KvMetaBackend {
         self.checkpoint_decision_late_ns.store(0, Ordering::Release);
         self.checkpoint_decision_tick_ns.store(0, Ordering::Release);
         self.checkpoint_decision_at_ns.store(0, Ordering::Release);
+        *self
+            .checkpoint_decision_words
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Default::default();
+    }
+
+    /// **The last cycle's tape** (`meta_kv_checkpoint_last_cycle`; PR 13h)
+    /// — what the last checkpoint cycle decided with and paid.
+    pub fn checkpoint_last_cycle(&self) -> super::checkpoint::CycleTape {
+        *self
+            .checkpoint_last_cycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// The sweep's per-cycle budget in force (ms) — `merge_sweep_budget_ms`

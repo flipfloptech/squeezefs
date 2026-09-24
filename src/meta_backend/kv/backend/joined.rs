@@ -1895,11 +1895,24 @@ impl KvMetaBackend {
         let barrier_started = std::time::Instant::now();
         self.sync_device().await.map_err(KvError::Io)?;
         let landed_ns = crate::mono_core::monotonic_ns_u64();
-        self.note_flush_ceiling(&had_dirty, landed_ns);
         self.note_checkpoint_barrier(barrier_started.elapsed().as_nanos() as u64);
         // The landing wall from the age decision that fired this cycle
-        // (PR 13h), else its start.
-        self.note_checkpoint_cycle_term(cycle_started_ns, landed_ns);
+        // (PR 13h), else its start — and the cycle's tape, written before
+        // the audit so an overrun's WARN line carries this cycle's words.
+        // A joiner publishes no roots and writes its data pages inside the
+        // flush span: its publish wall is the collection walk alone.
+        let elapsed_ns = |i: std::time::Instant| i.duration_since(cycle_started).as_nanos() as u64;
+        let flushed_ns = cycle_started_ns + elapsed_ns(barrier_started);
+        self.note_checkpoint_cycle_term(super::super::checkpoint::CycleWalls {
+            cycle_started_ns,
+            collected_ns: cycle_started_ns + elapsed_ns(flush_started),
+            flushed_ns,
+            pages_ns: flushed_ns,
+            landed_ns,
+            dirty_collected: dirty_count as u64,
+            sample,
+        });
+        self.note_flush_ceiling(&had_dirty, landed_ns);
         log::debug!(
             "joined checkpoint: appender {own}'s cycle pre-barrier wall {} ms = flush {flush_ms} \
              ({dirty_count} dirty: {} appended in {} ms, {} SMO'd writing {} images in {} ms) + \

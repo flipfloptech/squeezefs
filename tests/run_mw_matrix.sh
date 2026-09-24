@@ -4073,6 +4073,7 @@ leg_sym_scale() {
     # the WHOLE row (create + ingest) — the first build divided the
     # create + ingest CPU by the INGEST wall alone (1,322 % on the box was
     # 9.8 CPU-s ÷ 0.74 s).
+    log "sym-scale: the row's clock is the N STORMS' concurrent window (t0 after the row's setup mkdirs, the start snapshots and the manager's CPU baseline at t0; the setup's walls — the N mkdirs under /, the root's flip, a fresh joiner's first create into a striped root — are stamped and printed beside the multiple, never inside it)"
     sym_gate3_header | tee "$rowdir/symscale-table.tsv"
     local n rate1="" ingest1="" verdict_all=MET zero_miss_all=""
     # A per-run tag on every directory: a died run's residue never
@@ -4086,20 +4087,19 @@ leg_sym_scale() {
         sym_ensure_joiners "$n" "${writers[@]:1}"
         sleep 2
         local idx
-        for idx in "${writers[@]}"; do snap "$idx" "n${n}0" "$rowdir"; done
         local cpu0 t0 t1 t_row0
-        cpu0="$(sym_cpu_ticks 0)"
-        # The create row: every writer's storm at once, one directory each.
-        # The row's directories are created BEFORE the clock starts: the N
-        # `mkdir`s under `/` by N creators are the 3b shape, and the box's
-        # fourth pass MEASURED what the third had inferred — the root
-        # STRIPED at the fifth creator's mkdir and each later FRESH joiner's
-        # `mkdir -p` into the striped root took ≈ 3.0 s, a 9.1 s launch skew
-        # inside an 18 s wall (3.53× on the storms' clock against a
-        # Σ-of-per-writer-rates bound of 5.69×). The row measures the create
-        # STORMS; the setup's walls are stamped and stated on their own
-        # line. Every storm's LAUNCH and END instants are stamped too, so
-        # the skew that remains (the spawn loop's own) is MEASURED.
+        # THE ROW'S CLOCK (design §8 gate 3: "aggregate create/s … scale
+        # with N" — measured over the N STORMS' concurrent window). The
+        # row's SETUP — N `mkdir`s under the shared root (the 3b shape: the
+        # root flips at the fifth creator, and on the box each later FRESH
+        # joiner's `mkdir -p` into the striped root took ≈ 3.0 s — a 9.1 s
+        # skew inside an 18 s wall on the third pass's clock) — runs BEFORE
+        # t0, before `cpu0` and before the row's start snapshots, so
+        # neither the wall multiple nor `MGR_CPU` / `C/CPU-S` carry it (a
+        # job launching N fresh writers into one root pays it once; the
+        # finding states it). Every setup mkdir's wall, every storm's
+        # LAUNCH and END are stamped, so what remains inside the clock
+        # (the spawn loop's own skew) is MEASURED.
         local -a pids=()
         local t_last launch_tsv t_setup0 t_setup1 t_create0
         launch_tsv="$rowdir/launch-n$n.tsv"
@@ -4112,6 +4112,12 @@ leg_sym_scale() {
             printf 'mkdir\t%s\t%s\t%s\n' "$idx" "$t_mk0" "$(date +%s.%N)" >>"$launch_tsv"
         done
         t_setup1="$(date +%s.%N)"
+        # The start snapshots and the manager's CPU baseline AT the clock's
+        # start (review round 1, Issue 4: sampled before the setup they
+        # folded its CPU — the flip, the fresh joiners' waits — into
+        # `MGR_CPU` and `C/CPU-S` over the storms' wall alone).
+        for idx in "${writers[@]}"; do snap "$idx" "n${n}0" "$rowdir"; done
+        cpu0="$(sym_cpu_ticks 0)"
         t0="$(date +%s.%N)"
         t_row0="$t0"
         t_create0="$t0"

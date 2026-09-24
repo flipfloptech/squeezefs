@@ -2704,6 +2704,22 @@ fn sym_appender_ring_derives_from_the_reserve_and_the_solo_ring() {
             "the service cap is one landing ceiling of the cadence in force"
         );
     }
+    // PR 13g review round 3 (Issue 25): the FLAT volume's age verdict is
+    // the shipped `elapsed ≥ max_age`, a named function the tick's flat
+    // arm calls — no term, no projection, no lateness word in it.
+    use squeezefs::meta_backend::kv::checkpoint::flat_age_due;
+    let max_age = CHECKPOINT_MAX_AGE_MS as u64;
+    assert!(!flat_age_due(0, max_age));
+    assert!(!flat_age_due(u128::from(max_age) - 1, max_age));
+    assert!(
+        flat_age_due(u128::from(max_age), max_age),
+        "at the max age, due"
+    );
+    assert!(flat_age_due(u128::from(max_age) * 7, max_age));
+    assert!(
+        flat_age_due(500, 500) && !flat_age_due(499, 500),
+        "an elastic ceiling verbatim"
+    );
     // PR 13e (F-B1 — record §7 item 3, the margin derived from the
     // MEASURED cycle term): the cadence TRIGGER in force is the MAX AGE
     // minus the cycle's anticipated landing term, saturating — a term at

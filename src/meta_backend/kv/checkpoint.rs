@@ -1713,6 +1713,18 @@ impl CheckpointDecision {
     }
 }
 
+/// **The FLAT volume's age verdict — the shipped law verbatim** (PR 13g
+/// review round 3, Issue 25): a cycle is due by age when the max age has
+/// elapsed since the last cycle's END, and nothing else — the forest's
+/// term horizon, its live projection and the decision's lateness are
+/// never consulted on a bit-17-absent volume (`decide_checkpoint`'s flat
+/// arm). Tie-tested (`derivation_sweep_tests`); the backend-level
+/// contract (`kv_backend_tests`) reads the flat trigger word as the max
+/// age with a non-zero term in the horizon beside it.
+pub fn flat_age_due(elapsed_ms: u128, max_age_ms: u64) -> bool {
+    elapsed_ms >= u128::from(max_age_ms)
+}
+
 /// Read the checkpoint decision's inputs and take it (PR 13g, F-B1 made
 /// it a function the tick calls before AND after its threshold drain).
 fn decide_checkpoint(
@@ -1763,7 +1775,7 @@ fn decide_checkpoint(
             dirty_nodes,
         )
     } else {
-        (last_checkpoint.elapsed().as_millis() >= u128::from(max_age_ms)).then_some(0)
+        flat_age_due(last_checkpoint.elapsed().as_millis(), max_age_ms).then_some(0)
     };
     let due = final_cycle
         || ring_pressure

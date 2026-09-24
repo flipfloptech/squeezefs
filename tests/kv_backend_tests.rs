@@ -992,6 +992,73 @@ async fn v3_mount_replays_journal_window_into_the_cache() {
 }
 
 // ---------------------------------------------------------------------------
+// PR 13g review round 3, Issue 25 — a FLAT volume's cadence words.
+// ---------------------------------------------------------------------------
+
+/// **A FLAT volume's checkpoint cadence is the shipped age law, whatever
+/// the term bookkeeping measures beside it** (PR 13g review round 3,
+/// Issue 25 — the rail behind every "decision-identical" claim): on a
+/// bit-17-ABSENT volume there is no appender set, the cycle-term horizon
+/// and the flush units are still MEASURED (two stores and a max per
+/// cycle — under a parked device the term reads non-zero), and yet the
+/// trigger word is the max age VERBATIM (`checkpoint_trigger_ms`), the
+/// decision's lateness horizon reads 0 (the flat arm carries none), and
+/// the projection is a reading no decision consults. The flat arm itself
+/// is `checkpoint::flat_age_due` (tie-tested beside the trigger).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flat_volumes_cadence_trigger_is_the_max_age_whatever_the_term_measures() {
+    use squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS;
+    let file = NamedTempFile::new().unwrap();
+    file.as_file().set_len(V3_VOL_LEN).unwrap();
+    format_v3(file.path(), V3_VOL_LEN, &format_opts(false))
+        .await
+        .expect("flat format");
+    let be = KvMetaBackend::open(file.path()).await.expect("flat open");
+    assert!(
+        be.appender_stats().is_none(),
+        "a bit-17-absent volume has no appender set — the population the forest cadence judges"
+    );
+    // Work under a PARKED device: the cycle's pre-barrier wall is a term
+    // the horizon remembers (the bookkeeping runs on every layout).
+    squeezefs::uring_fs::arm_device_latency(
+        file.path(),
+        std::time::Duration::from_millis(2),
+        std::time::Duration::ZERO,
+    );
+    for i in 0..64 {
+        be.create(ROOT_INO, &format!("flat_{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("a create");
+    }
+    be.checkpoint_now().await.expect("a cycle with work");
+    squeezefs::uring_fs::disarm_device_latency(file.path());
+    let max_age = CHECKPOINT_MAX_AGE_MS as u64;
+    assert!(
+        be.checkpoint_term_ms() > 0,
+        "the premise: the term bookkeeping measured the cycle ({} ms)",
+        be.checkpoint_term_ms()
+    );
+    assert_eq!(
+        be.checkpoint_trigger_ms(max_age),
+        max_age,
+        "the flat trigger is the max age verbatim — the {} ms term is a reading, never a term \
+         of the decision",
+        be.checkpoint_term_ms()
+    );
+    assert_eq!(
+        be.checkpoint_trigger_ms(500),
+        500,
+        "an elastic ceiling verbatim too"
+    );
+    assert_eq!(
+        be.checkpoint_late_max_ms(),
+        0,
+        "the flat arm carries no decision lateness"
+    );
+    be.shutdown().await.expect("clean shutdown");
+}
+
+// ---------------------------------------------------------------------------
 // v3 format guards (the preflight contract carried over).
 // ---------------------------------------------------------------------------
 

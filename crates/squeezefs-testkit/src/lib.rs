@@ -417,56 +417,6 @@ pub fn o_direct(site: Site, dir: &Path) -> bool {
     true
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn class_tokens_are_stable_and_unique() {
-        // The harness scripts grep these; a rename is a breaking change.
-        let all = [
-            SkipClass::Mount,
-            SkipClass::Root,
-            SkipClass::NonRoot,
-            SkipClass::Sudo,
-            SkipClass::Hardware,
-            SkipClass::Toolchain,
-            SkipClass::Capability,
-            SkipClass::OptIn,
-        ];
-        let mut seen: Vec<&str> = all.iter().map(|c| c.as_str()).collect();
-        seen.sort_unstable();
-        let n = seen.len();
-        seen.dedup();
-        assert_eq!(n, seen.len(), "class tokens must be unique");
-        assert_eq!(SkipClass::Mount.as_str(), "mount");
-        assert_eq!(
-            SkipClass::Mount.require_var(),
-            "SQUEEZEFS_TEST_REQUIRE_MOUNT"
-        );
-    }
-
-    #[test]
-    fn json_escape_survives_quotes_and_control_bytes() {
-        assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
-        assert_eq!(json_escape("l1\nl2"), "l1\\nl2");
-        assert_eq!(json_escape("\u{1}"), "\\u0001");
-    }
-
-    #[test]
-    fn site_macro_names_the_enclosing_test() {
-        let s = site!();
-        assert!(
-            s.test.ends_with("site_macro_names_the_enclosing_test"),
-            "site! must name the enclosing fn, got {}",
-            s.test
-        );
-        assert_eq!(s.bin, "squeezefs_testkit");
-        assert!(s.file.ends_with("lib.rs"));
-        assert!(s.line > 0);
-    }
-}
-
 /// The host's clock CAP as a fraction of its hardware maximum — the venue
 /// word a CPU-contention-shaped timing contract reads before it judges.
 ///
@@ -516,4 +466,54 @@ pub const HOST_CLOCK_THROTTLED_BELOW: f64 = 0.85;
 /// absent.
 pub fn host_clock_throttled() -> bool {
     host_clock_cap_ratio().is_some_and(|r| r < HOST_CLOCK_THROTTLED_BELOW)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn class_tokens_are_stable_and_unique() {
+        // The harness scripts grep these; a rename is a breaking change.
+        let all = [
+            SkipClass::Mount,
+            SkipClass::Root,
+            SkipClass::NonRoot,
+            SkipClass::Sudo,
+            SkipClass::Hardware,
+            SkipClass::Toolchain,
+            SkipClass::Capability,
+            SkipClass::OptIn,
+        ];
+        let mut seen: Vec<&str> = all.iter().map(|c| c.as_str()).collect();
+        seen.sort_unstable();
+        let n = seen.len();
+        seen.dedup();
+        assert_eq!(n, seen.len(), "class tokens must be unique");
+        assert_eq!(SkipClass::Mount.as_str(), "mount");
+        assert_eq!(
+            SkipClass::Mount.require_var(),
+            "SQUEEZEFS_TEST_REQUIRE_MOUNT"
+        );
+    }
+
+    #[test]
+    fn json_escape_survives_quotes_and_control_bytes() {
+        assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(json_escape("l1\nl2"), "l1\\nl2");
+        assert_eq!(json_escape("\u{1}"), "\\u0001");
+    }
+
+    #[test]
+    fn site_macro_names_the_enclosing_test() {
+        let s = site!();
+        assert!(
+            s.test.ends_with("site_macro_names_the_enclosing_test"),
+            "site! must name the enclosing fn, got {}",
+            s.test
+        );
+        assert_eq!(s.bin, "squeezefs_testkit");
+        assert!(s.file.ends_with("lib.rs"));
+        assert!(s.line > 0);
+    }
 }

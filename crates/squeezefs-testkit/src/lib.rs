@@ -466,3 +466,54 @@ mod tests {
         assert!(s.line > 0);
     }
 }
+
+/// The host's clock CAP as a fraction of its hardware maximum — the venue
+/// word a CPU-contention-shaped timing contract reads before it judges.
+///
+/// A thermal governor (`thermald-ng` on the dev box) throttles by lowering
+/// every CPU's `scaling_max_freq` below `cpuinfo_max_freq`; a contract that
+/// prices a fixed burst against wall time reads a slower machine while the
+/// cap is on (the batch gate's compile burst heats the box exactly before
+/// the alphabetically-early suites run). Returns the MINIMUM over the CPUs
+/// of `scaling_max_freq / cpuinfo_max_freq`, or `None` where the sysfs
+/// faces are absent (a VM, a container) — an absent word is never a
+/// verdict.
+pub fn host_clock_cap_ratio() -> Option<f64> {
+    let cpus = std::fs::read_dir("/sys/devices/system/cpu").ok()?;
+    let mut min: Option<f64> = None;
+    for entry in cpus.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("cpu") || !name[3..].chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let dir = entry.path().join("cpufreq");
+        let read = |f: &str| -> Option<f64> {
+            std::fs::read_to_string(dir.join(f))
+                .ok()?
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| *v > 0.0)
+        };
+        let (Some(cap), Some(hw)) = (read("scaling_max_freq"), read("cpuinfo_max_freq")) else {
+            continue;
+        };
+        let ratio = cap / hw;
+        min = Some(min.map_or(ratio, |m: f64| m.min(ratio)));
+    }
+    min
+}
+
+/// The cap ratio below which the host counts as THROTTLED for a timing
+/// contract: the dev box's governor restores to ≈ 0.90 of hardware max and
+/// throttles to ≈ 0.80, so 0.85 separates the two states; a host whose
+/// governor never caps reads 1.0.
+pub const HOST_CLOCK_THROTTLED_BELOW: f64 = 0.85;
+
+/// `true` while the host's clock is capped below
+/// [`HOST_CLOCK_THROTTLED_BELOW`] of hardware max; `false` where the word is
+/// absent.
+pub fn host_clock_throttled() -> bool {
+    host_clock_cap_ratio().is_some_and(|r| r < HOST_CLOCK_THROTTLED_BELOW)
+}

@@ -3801,7 +3801,14 @@ line = (f"   F-R5 m{idx}: ring_kib={[x // 1024 for x in ring]} ring_grows={s('ap
         f" Δwire_grants={delta('joined_wire_extent_grants')} Δreactive={delta('joined_wire_reactive_grants')} Δwire_returns={delta('joined_wire_extent_returns')} Δwire_ring_grows={delta('joined_wire_ring_grows')}"
         f" Δpressure_cycles={delta('appender_pressure_cycles')} Δcheckpoints={dsum('meta_kv_checkpoints')}"
         f" pool_restored={s('appender_pool_restored_extents')} pending_segs_returned={s('appender_pending_segments_returned')} join_residue={s('appender_join_residue_returned')}"
-        f" stale_page_words={s('appender_stale_page_words_dropped')} return_run_cap_refusals={s('extent_return_run_cap_refusals')} joined_control_refusals={s('joined_control_refusals')}")
+        f" stale_page_words={s('appender_stale_page_words_dropped')} return_run_cap_refusals={s('extent_return_run_cap_refusals')} joined_control_refusals={s('joined_control_refusals')}"
+        # The hygiene faces the fourth box pass read moving OUTSIDE the
+        # must-stay-0 set (absolute at the snapshot): a reclaim whose
+        # destroy was WITHHELD on a failed pricing read, a frame the §5.8.2
+        # screen ended a log at, a projection root refreshed on a
+        # recycled extent (defect 18 / 34's class).
+        f" hygiene[reclaim_destroy_refused={s('reclaim_destroy_refused_release_failed')} foreign_frames_screened={s('foreign_frames_screened')}"
+        f" projection_root_refreshes={s('meta_kv_projection_root_refreshes')} xv_intents_open={s('xv_cross_owner_intents_open')}]")
 # The manager's terms (the joiner's wire asks land here): the verb wall.
 # `manager_service_ns` is a per-volume list of dicts, kept whole by `flat`.
 def svc(d):
@@ -3822,23 +3829,35 @@ PYEOF
 # The create row's per-writer storm timeline off the stamps the spawn
 # loop wrote (`launch-n<N>.tsv` + each `create-n<N>-w<idx>.txt`'s
 # `launch_ts= end_ts=` line): `m<idx>[+launch, +end, wall]` in seconds
-# relative to the row's first mkdir.
-sym_scale_launch_offsets() { # rowdir n t0 idx...
-    local rowdir="$1" n="$2" t0="$3"
-    shift 3
-    python3 - "$rowdir" "$n" "$t0" "$@" <<'PYEOF'
+# relative to the row's clock start, each setup mkdir's wall, and the
+# Σ of the per-writer storm rates — an UPPER bound on the storms' own
+# concurrency (exact when every storm ran the whole row beside the
+# others; a staggered storm ran part of its wall with fewer competitors),
+# beside the table's law, which reads the row's wall from its clock.
+sym_scale_launch_offsets() { # rowdir n t0 rate1 idx...
+    local rowdir="$1" n="$2" t0="$3" rate1="$4"
+    shift 4
+    python3 - "$rowdir" "$n" "$t0" "$rate1" "$@" <<'PYEOF'
 import re, sys
-rowdir, n, t0 = sys.argv[1], sys.argv[2], float(sys.argv[3])
-out = []
-for idx in sys.argv[4:]:
+rowdir, n, t0, rate1 = sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4])
+out, rates, mk = [], [], []
+for line in open(f"{rowdir}/launch-n{n}.tsv"):
+    f = line.split()
+    if len(f) == 4 and f[0] == "mkdir":
+        mk.append(f"m{f[1]} {float(f[3]) - float(f[2]):.3f}s")
+for idx in sys.argv[5:]:
     txt = open(f"{rowdir}/create-n{n}-w{idx}.txt").read()
     m = re.search(r"launch_ts=([\d.]+) end_ts=([\d.]+)", txt)
     w = re.search(r"wall_s=([\d.]+)", txt)
+    o = re.search(r"ops=(\d+)", txt)
+    if w and o and float(w.group(1)) > 0:
+        rates.append(int(o.group(1)) / float(w.group(1)))
     if not m:
         out.append(f"m{idx}[?]")
         continue
     out.append(f"m{idx}[+{float(m.group(1))-t0:.2f}, +{float(m.group(2))-t0:.2f}, {w.group(1) if w else '?'}]")
-print(" ".join(out))
+bound = sum(rates)
+print(" ".join(out) + f"; setup mkdir walls: {', '.join(mk) or 'n/a'}; Σ per-writer rates {bound:.0f} creates/s = {bound / max(rate1, 1):.2f}× the N=1 rate (an upper bound)")
 PYEOF
 }
 
@@ -4071,23 +4090,34 @@ leg_sym_scale() {
         local cpu0 t0 t1 t_row0
         cpu0="$(sym_cpu_ticks 0)"
         # The create row: every writer's storm at once, one directory each.
-        # Every storm's LAUNCH and END instants are stamped (the box's third
-        # pass INFERRED ≈ 3.9 s of launch skew at N = 8 from wall − the
-        # longest storm; the row's `mkdir -p` under `/` by N creators is
-        # the 3b shape, and a root flip can park the later ones) — the
-        # skew is MEASURED and printed beside the multiple, and the wall
-        # from the LAST launch gives the storms'-own-concurrency reading;
-        # the row's LAW keeps the leg's clock (t0 = the first mkdir).
+        # The row's directories are created BEFORE the clock starts: the N
+        # `mkdir`s under `/` by N creators are the 3b shape, and the box's
+        # fourth pass MEASURED what the third had inferred — the root
+        # STRIPED at the fifth creator's mkdir and each later FRESH joiner's
+        # `mkdir -p` into the striped root took ≈ 3.0 s, a 9.1 s launch skew
+        # inside an 18 s wall (3.53× on the storms' clock against a
+        # Σ-of-per-writer-rates bound of 5.69×). The row measures the create
+        # STORMS; the setup's walls are stamped and stated on their own
+        # line. Every storm's LAUNCH and END instants are stamped too, so
+        # the skew that remains (the spawn loop's own) is MEASURED.
         local -a pids=()
-        local t_last launch_tsv
+        local t_last launch_tsv t_setup0 t_setup1 t_create0
         launch_tsv="$rowdir/launch-n$n.tsv"
         : >"$launch_tsv"
+        t_setup0="$(date +%s.%N)"
+        for idx in "${writers[@]}"; do
+            local t_mk0
+            t_mk0="$(date +%s.%N)"
+            mkdir -p "$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx"
+            printf 'mkdir\t%s\t%s\t%s\n' "$idx" "$t_mk0" "$(date +%s.%N)" >>"$launch_tsv"
+        done
+        t_setup1="$(date +%s.%N)"
         t0="$(date +%s.%N)"
         t_row0="$t0"
+        t_create0="$t0"
         for idx in "${writers[@]}"; do
-            mkdir -p "$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx"
             t_last="$(date +%s.%N)"
-            printf '%s\t%s\n' "$idx" "$t_last" >>"$launch_tsv"
+            printf 'launch\t%s\t%s\n' "$idx" "$t_last" >>"$launch_tsv"
             (
                 "$SYM_STORM" "$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx" "$SYM_THREADS" "$SYM_FILES" create \
                     >"$rowdir/create-n$n-w$idx.txt" 2>&1
@@ -4101,10 +4131,10 @@ leg_sym_scale() {
         for p in "${pids[@]}"; do wait "$p" || rc=1; done
         t1="$(date +%s.%N)"
         [ "$rc" = "0" ] || die "sym-scale N=$n: a create storm FAILED (see $rowdir/create-n$n-w*.txt)"
-        local create_rate launch_skew concurrent_rate
+        local create_rate launch_skew setup_wall
         create_rate="$(python3 -c "print(f'{$n*$SYM_FILES/($t1-$t0):.0f}')")"
         launch_skew="$(python3 -c "print(f'{$t_last-$t0:.3f}')")"
-        concurrent_rate="$(python3 -c "print(f'{$n*$SYM_FILES/($t1-$t_last):.0f}')")"
+        setup_wall="$(python3 -c "print(f'{$t_setup1-$t_setup0:.3f}')")"
         # The create phase's own daemon-CPU face (the snapshot between the
         # two phases — the ingest's CPU never pollutes it).
         for idx in "${writers[@]}"; do snap "$idx" "n${n}c" "$rowdir"; done
@@ -4179,7 +4209,7 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t_row0):.0f}')")"
         # N × SYM_INGEST_MB) + F-B1's per-writer faces on the row's end
         # snapshot — beside the table, never in its verdict.
         {
-            echo "   N=$n create launch skew (first→last storm launch) ${launch_skew}s; wall from the LAST launch → $concurrent_rate creates/s ($(python3 -c "print(f'{$concurrent_rate/$rate1:.2f}')")× the N=1 row's rate; the table's law keeps the first-mkdir clock); per writer [launch+s, end+s, storm wall_s]: $(sym_scale_launch_offsets "$rowdir" "$n" "$t0" "${writers[@]}")"
+            echo "   N=$n create setup (the N mkdirs under /, before the clock) ${setup_wall}s; launch skew (first→last storm launch, inside the clock) ${launch_skew}s; per writer [launch+s, end+s, storm wall_s] + the Σ-of-per-writer-rates bound: $(sym_scale_launch_offsets "$rowdir" "$n" "$t_create0" "$rate1" "${writers[@]}")"
             echo "   N=$n ingest amplification (/proc/diskstats, data namespaces; user $((n * SYM_INGEST_MB)) MiB): $(sym_disk_amp "$rowdir" "in$n" $((n * SYM_INGEST_MB * 1024 * 1024)))"
             sym_fb1_faces "$rowdir" "n$n" "${writers[@]}"
             # F-R5 over the whole row (pn<N>0 → pn<N>1) and over the CREATE
@@ -4213,6 +4243,20 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t_row0):.0f}')")"
             rm -rf "$(mnt_of "$idx")/scale-$SYM_RUN-n$n-w$idx" 2>/dev/null || true
         done
     done
+    # The last row's removals are outside every per-row snapshot pair: one
+    # more snapshot of every writer after them (`pend0` = the last row's
+    # end, `pend1` = now) so the leg's faces cover the between-rows window
+    # the fourth box pass found the joiners' spurious reclaims in.
+    local maxn_idx
+    for maxn_idx in 0 "${joiners[@]:0:$((maxn - 1))}"; do
+        cp "$rowdir/m${maxn_idx}_pn${maxn}1.json" "$rowdir/m${maxn_idx}_pend0.json" 2>/dev/null || true
+        snap "$maxn_idx" "end" "$rowdir"
+    done
+    {
+        echo "   after the last row's removals (pn${maxn}1 → pend1):"
+        sym_fb1_faces "$rowdir" "end" 0 "${joiners[@]:0:$((maxn - 1))}"
+        sym_fr5_faces "$rowdir" "end" 0 "${joiners[@]:0:$((maxn - 1))}"
+    } | tee -a "$rowdir/symscale-faces.txt"
     sym_law_gate3_verdict_line "$verdict_all" | tee "$rowdir/symscale-verdict.txt"
     [ -z "$zero_miss_all" ] || die "sym-scale: a must-stay-0 gauge moved:$zero_miss_all (rows above; the leg is RED)"
     # DELETED STAYS DELETED across every joiner's CLEAN LEAVE (PR 13): every
@@ -4267,6 +4311,12 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t_row0):.0f}')")"
     # Every joiner back up for the legs that follow.
     sym_ensure_joiners $((${#joiners[@]} + 1)) "${joiners[@]}"
     sym_oracle sym-scale "$rowdir"
+    # The post-leave census (PR 13e's arm, the foreign-touch leg's): the
+    # online fsck above scopes every LIVE lessee's slots out of the inode
+    # plane, so a joiner's own trees are never judged while it runs; after
+    # every joiner leaves and then the manager, the offline probe judges
+    # the set whole (nothing exempted as current-era, findings 0).
+    sym_post_leave_census sym-scale "$rowdir" "$SYM_RUN" 0 "${joiners[@]}"
     log "sym-scale PUBLISHED (table + verdict + snapshots in $rowdir)"
 }
 

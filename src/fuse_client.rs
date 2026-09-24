@@ -6203,15 +6203,39 @@ pub struct Metrics {
     /// volume, never a leak (the pre-fix shape destroyed the record and
     /// orphaned every reference forever — permanent C8 drift).
     pub reclaim_destroy_refused_release_failed: Align64<AtomicU64>,
-    /// FORGETs of an ino whose forest slot this mount does NOT reclaim —
-    /// a slot another appender leases, or an unleased one on a joined
-    /// appender (symmetric PR 13h, F-R6): the kernel forgot an object this
-    /// mount merely cached as a TOKEN CLIENT, and the reclaim accounts
-    /// nothing for it (no layout / xattr / reference read, no destroy —
-    /// the holder's own reclaim is the lifecycle's). The box's joiner read
-    /// 6,782 `destroy WITHHELD` per row set pricing the manager's corpses
-    /// off its stale projection. 0 on every unarmed mount by construction.
+    /// FORGETs of an ino whose forest slot ANOTHER appender leases
+    /// (symmetric PR 13h, F-R6): the kernel forgot an object this mount
+    /// merely cached as a TOKEN CLIENT, and the reclaim accounts nothing
+    /// for it HERE (no layout / xattr / reference read, no destroy — the
+    /// box's joiner read 6,782 `destroy WITHHELD` per row set pricing the
+    /// manager's corpses off its stale projection); the forget travels to
+    /// the slot's holder as a reclaim HINT (`reclaim_hints_shipped`), whose
+    /// own FORGET-driven reclaim judges it. 0 on every unarmed mount by
+    /// construction.
     pub reclaim_foreign_slot_forgets: Align64<AtomicU64>,
+    /// FORGETs on a JOINED appender of an ino whose forest slot is
+    /// UNLEASED — nobody's but the manager's to reclaim (the corpse sweep's
+    /// law; PR 13h review round 1, Issue 1: a file unlinked while open
+    /// whose slot the cadence released before the close). Hinted to the
+    /// manager; a hint that cannot travel leaves the corpse to the
+    /// manager's mount-time sweep (`reclaim_hint_failures`).
+    pub reclaim_unleased_slot_forgets: Align64<AtomicU64>,
+    /// Reclaim hints this mount SHIPPED (one batch per reclaimer per
+    /// FORGET batch) and the inos they carried.
+    pub reclaim_hints_shipped: Align64<AtomicU64>,
+    pub reclaim_hint_inos_shipped: Align64<AtomicU64>,
+    /// Reclaim hints this mount could not deliver (the reclaimer
+    /// unreachable, or the wire failed): the corpses stay for their
+    /// reclaimer's mount-time sweep. Should stay 0 on a healthy fleet.
+    pub reclaim_hint_failures: Align64<AtomicU64>,
+    /// Hinted inos this mount's reclaim ADMITTED as its own FORGETs (the
+    /// served side; Σ over a fleet ≡ Σ `reclaim_hint_inos_shipped` −
+    /// misrouted at rest).
+    pub reclaim_hints_served: Align64<AtomicU64>,
+    /// Hinted inos whose slot this mount does not reclaim either (the slot
+    /// moved again between the peer's resolve and the serve) — dropped,
+    /// never read; the corpse's reclaimer is its next holder's sweep.
+    pub reclaim_hints_misrouted: Align64<AtomicU64>,
     /// Joint release+destroy entries committed (each carried ≥ 1
     /// reference release beside its inode/xattr `Delete`s) — the
     /// engagement instrument: a reclaim batch of N block-owning corpses
@@ -11814,6 +11838,12 @@ impl SqueezefsFilesystem {
                 // RECLAIM-ATOMIC
                 "reclaim_destroy_refused_release_failed": METRICS.reclaim_destroy_refused_release_failed.load(Ordering::Relaxed),
                 "reclaim_foreign_slot_forgets": METRICS.reclaim_foreign_slot_forgets.load(Ordering::Relaxed),
+                "reclaim_unleased_slot_forgets": METRICS.reclaim_unleased_slot_forgets.load(Ordering::Relaxed),
+                "reclaim_hints_shipped": METRICS.reclaim_hints_shipped.load(Ordering::Relaxed),
+                "reclaim_hint_inos_shipped": METRICS.reclaim_hint_inos_shipped.load(Ordering::Relaxed),
+                "reclaim_hint_failures": METRICS.reclaim_hint_failures.load(Ordering::Relaxed),
+                "reclaim_hints_served": METRICS.reclaim_hints_served.load(Ordering::Relaxed),
+                "reclaim_hints_misrouted": METRICS.reclaim_hints_misrouted.load(Ordering::Relaxed),
                 "reclaim_release_destroy_joint_commits": METRICS.reclaim_release_destroy_joint_commits.load(Ordering::Relaxed),
                 "reclaim_single_ino_chunked_destroys": METRICS.reclaim_single_ino_chunked_destroys.load(Ordering::Relaxed),
                 "block_live_free_refusals": METRICS.block_live_free_refusals.load(Ordering::Relaxed),
@@ -17613,6 +17643,24 @@ impl SqueezefsFilesystem {
                 kernel(ino, ServedMutation::Data);
             },
         ));
+    }
+
+    /// Install this FUSE layer's reclaim entry as the meta backend's
+    /// RECLAIM-HINT sink (symmetric PR 13h — review round 1, Issue 1): a
+    /// peer's FORGET of a corpse whose slot THIS mount reclaims arrives as
+    /// a served `ReclaimHint` and runs `queue_reclaim_inode` — this mount's
+    /// own FORGET-driven reclaim, with every admission re-check it makes
+    /// for a kernel FORGET (open count, the exact record's `nlink`, the
+    /// single-drive claim). Counted `reclaim_hints_served` per ino.
+    pub fn install_reclaim_hint_sink(&self) {
+        let Some(backend) = self.meta_backend.as_ref() else {
+            return;
+        };
+        let fs = self.clone();
+        backend.install_reclaim_hint_sink(std::sync::Arc::new(move |ino: u64| {
+            METRICS.reclaim_hints_served.fetch_add(1, Ordering::Relaxed);
+            fs.queue_reclaim_inode(ino);
+        }));
     }
 
     /// Drop a locally cached lease (e.g. after `FencingTokenExpired` or lock loss).

@@ -14764,3 +14764,359 @@ async fn a_forget_on_an_unarmed_mount_reclaims_every_corpse_as_shipped() {
         fsck_clean(std::slice::from_ref(&uri)).await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// PR 13h review round 1, Issue 1 — the corpse classes F-R6's gate left with
+// no live reclaimer: the reclaim HINT to the slot's reclaimer.
+// ---------------------------------------------------------------------------
+
+/// The reclaim family's faces, in one read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReclaimFaces {
+    refused: u64,
+    foreign: u64,
+    unleased: u64,
+    hints_shipped: u64,
+    hint_inos: u64,
+    hint_failures: u64,
+    served: u64,
+    misrouted: u64,
+}
+
+fn reclaim_faces_all() -> ReclaimFaces {
+    use std::sync::atomic::Ordering::Relaxed;
+    let m = &squeezefs::fuse_client::METRICS;
+    ReclaimFaces {
+        refused: m.reclaim_destroy_refused_release_failed.load(Relaxed),
+        foreign: m.reclaim_foreign_slot_forgets.load(Relaxed),
+        unleased: m.reclaim_unleased_slot_forgets.load(Relaxed),
+        hints_shipped: m.reclaim_hints_shipped.load(Relaxed),
+        hint_inos: m.reclaim_hint_inos_shipped.load(Relaxed),
+        hint_failures: m.reclaim_hint_failures.load(Relaxed),
+        served: m.reclaim_hints_served.load(Relaxed),
+        misrouted: m.reclaim_hints_misrouted.load(Relaxed),
+    }
+}
+
+/// Wait for `ino`'s record to be GONE at `at` (the reclaimer's destroy
+/// landed), bounded — the reclaim pool's cadence is a 20 ms batch window.
+async fn wait_destroyed(at: &Arc<RoutedMetaBackend>, ino: u64, what: &str) {
+    let started = std::time::Instant::now();
+    loop {
+        if at.getattr(ino).await.is_err() {
+            return;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{what}: ino {ino} still stands after 10 s — nobody reclaimed the corpse"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// The manager + one joiner with the reclaim wire between them: the
+/// joiner's step shipper (the ladder's rung 7) and, in front of each, the
+/// FUSE layer — the manager's installed as its reclaim-hint sink.
+struct HintFixture {
+    manager: Arc<RoutedMetaBackend>,
+    mvol: Arc<KvMetaBackend>,
+    mvenue: DaemonVenue,
+    joiner: Arc<RoutedMetaBackend>,
+    jvol: Arc<KvMetaBackend>,
+    jid: u32,
+    jf: FsFront,
+    mf: FsFront,
+}
+
+async fn hint_fixture(uris: &[String], venue_name: &str, slot_seed: u32) -> HintFixture {
+    let manager = open_under(uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mvenue = DaemonVenue::stand_up(&manager, true, venue_name).await;
+    mvol.checkpoint_now().await.unwrap();
+    let joiner = {
+        Knobs::armed().apply();
+        let r = open_routed_meta_set_joined(
+            uris,
+            &JoinedSetAdmission {
+                manager_endpoint: mvenue.endpoint.clone(),
+                secret: VENUE_SECRET.to_vec(),
+                peer_id: peer_of(&joiner_identity(&mvol, slot_seed).await),
+                identity: joiner_identity(&mvol, slot_seed).await,
+            },
+        )
+        .await;
+        Knobs::clear();
+        r.expect("the joined open")
+    };
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let jid = jvol.appender_stats().unwrap().appender_id;
+    let jidentity = jvol.joined_wire().unwrap().identity;
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(&joiner),
+            &peer_of(&jidentity),
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    let jf = fs_in_front_of(&joiner, &format!("vol-13h-hint-j-{slot_seed}")).await;
+    let mf = fs_in_front_of(&manager, &format!("vol-13h-hint-m-{slot_seed}")).await;
+    mf.fs.install_reclaim_hint_sink();
+    HintFixture {
+        manager,
+        mvol,
+        mvenue,
+        joiner,
+        jvol,
+        jid,
+        jf,
+        mf,
+    }
+}
+
+async fn tear_down_hint_fixture(fx: HintFixture, uris: &[String]) {
+    let HintFixture {
+        manager,
+        mvol,
+        mvenue,
+        joiner,
+        jvol,
+        jf,
+        mf,
+        ..
+    } = fx;
+    assert_must_stay_zero(&jvol, "joiner");
+    assert_must_stay_zero(&mvol, "manager");
+    squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
+    drop(jf);
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    drop(mf);
+    mvenue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(uris).await;
+}
+
+/// **Issue 1(a) — the UNLEASED corpse: a joiner's file, unlinked while
+/// OPEN (the tmpfile pattern), whose slot the cadence RELEASED before the
+/// close's FORGET.** F-R6's gate answers "not mine" for an unleased slot on
+/// a joiner and dropped the forget; the manager owns an unleased slot by
+/// the corpse sweep's law but sweeps only at MOUNT, and its kernel never
+/// FORGETs an inode it never held — so the record (and its blocks, on a
+/// data volume) leaked until the manager's next remount, where the
+/// pre-PR door's first touch had destroyed it (a legal schedule: the
+/// forced shrink of idle rotor slots as `writers_known` grows, the LRU
+/// release past the page budget, the region release). The law: a FORGET
+/// of a corpse in a slot this mount does not reclaim is SHIPPED as a
+/// reclaim HINT to the slot's reclaimer — the manager for an unleased slot
+/// — which runs it as its own FORGET (its admission, its plan, its destroy
+/// in its own ring under its own lease); counted `reclaim_unleased_slot_
+/// forgets` at the forgetter, `reclaim_hints_served` at the reclaimer.
+/// RED on `00edad1a`: the forget is counted FOREIGN, nothing ships, the
+/// corpse stands at the manager for ever. GREEN: destroyed within the
+/// manager's reclaim cadence (one 20 ms batch window), the joiner's divert
+/// reads it gone, the post-leave census clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiners_forget_of_a_corpse_in_a_released_slot_is_reclaimed_by_the_manager() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "jd")]).await;
+    let jd = dirs[0];
+    let fx = hint_fixture(&uris, "manager-13h-hint-a", 73).await;
+    // The joiner's file: its first touch of the seeded directory leases
+    // the slot over the wire.
+    let f = fx
+        .joiner
+        .create(jd, "tmp", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("the joiner's file")
+        .ino;
+    let jid = fx.jid;
+    // The file's record lives in the joiner's ROTOR (the creator's mint —
+    // the directory's slot took the dentry alone); that slot is the one
+    // the cadence releases.
+    let local = fx.joiner.route_ino(f).1;
+    let fslot = squeezefs::meta_backend::kv::record::forest_slot_of_ino(local);
+    assert!(
+        matches!(
+            tree0_state(&fx.mvol, fslot).await,
+            Some(SlotState::Leased { appender_id, .. }) if appender_id == jid
+        ),
+        "the premise: the joiner leases the file's slot {fslot}"
+    );
+    // Unlinked while OPEN: `nlink 0`, the kernel still holds the ino — no
+    // FORGET yet.
+    fx.joiner.unlink(jd, "tmp").await.expect("the unlink");
+    assert_eq!(fx.joiner.getattr(f).await.unwrap().nlink, 0);
+    fx.jvol.checkpoint_now().await.unwrap();
+    // The cadence releases the idle slot BEFORE the close (the forced
+    // shrink / LRU shape): unleased at tree 0.
+    fx.jvol
+        .release_slot_handover(jid, fslot)
+        .await
+        .expect("the cadence's release over the wire");
+    assert!(matches!(
+        tree0_state(&fx.mvol, fslot).await,
+        Some(SlotState::Unleased { .. })
+    ));
+    assert!(
+        !fx.jvol.inode_plane_owns_slot(local),
+        "the premise: an unleased slot is nobody's on a joiner"
+    );
+    assert!(
+        fx.mvol.inode_plane_owns_slot(local),
+        "the premise: an unleased slot is the manager's to reclaim"
+    );
+    assert_eq!(
+        fx.manager.getattr(f).await.unwrap().nlink,
+        0,
+        "the corpse stands at the manager, exact"
+    );
+    // The close → the joiner's kernel FORGETs → its reclaim path.
+    let f0 = reclaim_faces_all();
+    fx.jf.fs.reclaim_orphaned_batch(vec![f]).await;
+    let f1 = reclaim_faces_all();
+    assert_eq!(
+        f1.refused, f0.refused,
+        "nothing priced or withheld at the joiner"
+    );
+    assert_eq!(
+        f1.unleased - f0.unleased,
+        1,
+        "the forget of an UNLEASED slot's corpse is counted as such — never as a holder's \
+         (reclaim_unleased_slot_forgets); faces {f0:?} → {f1:?}"
+    );
+    assert_eq!(f1.foreign, f0.foreign, "…and never as a foreign holder's");
+    assert_eq!(
+        (
+            f1.hints_shipped - f0.hints_shipped,
+            f1.hint_inos - f0.hint_inos
+        ),
+        (1, 1),
+        "ONE reclaim hint carrying the ino travelled to the manager"
+    );
+    assert_eq!(f1.hint_failures, f0.hint_failures, "…and landed");
+    // The manager reclaims it as its own forget, within its reclaim pool's
+    // cadence.
+    wait_destroyed(
+        &fx.manager,
+        f,
+        "Issue 1(a): the manager reclaims the hinted corpse",
+    )
+    .await;
+    let f2 = reclaim_faces_all();
+    assert_eq!(
+        f2.served - f0.served,
+        1,
+        "the manager's reclaim admitted the hinted ino as its own forget (reclaim_hints_served)"
+    );
+    assert_eq!(f2.misrouted, f0.misrouted, "nothing misrouted");
+    assert_eq!(f2.refused, f0.refused, "the manager's destroy committed");
+    assert!(
+        fx.joiner.getattr(f).await.is_err(),
+        "the joiner's divert reads the corpse gone"
+    );
+    tear_down_hint_fixture(fx, &uris).await;
+}
+
+/// **Issue 1(b) — the MOVED-slot corpse: a slot handed over between the
+/// unlink and the close's FORGET.** The joiner unlinks its open file, its
+/// slot is released and the MANAGER first-touches it (a handover TO
+/// another appender — dominance, an offer, a peer's first touch are the
+/// same shape); the joiner's FORGET then names an ino in a slot ANOTHER
+/// appender leases — F-R6's foreign arm — and the new holder's kernel
+/// never held the ino, so nothing reclaimed it until the holder's next
+/// remount (pre-existing: the departing holder's destroy met `SlotBusy`
+/// at its door and was withheld). The hint travels to the slot's CURRENT
+/// holder, which reclaims it as its own forget. RED on `00edad1a`: the
+/// forget is counted foreign and dropped, the corpse stands at the holder
+/// for ever. GREEN: destroyed at the holder within its reclaim cadence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_corpse_whose_slot_moved_between_the_unlink_and_the_forget_is_reclaimed_by_its_new_holder(
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "jd")]).await;
+    let jd = dirs[0];
+    let fx = hint_fixture(&uris, "manager-13h-hint-b", 74).await;
+    let jid = fx.jid;
+    let f = fx
+        .joiner
+        .create(jd, "tmp", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("the joiner's file")
+        .ino;
+    fx.joiner.unlink(jd, "tmp").await.expect("the unlink");
+    fx.jvol.checkpoint_now().await.unwrap();
+    let local = fx.joiner.route_ino(f).1;
+    let fslot = squeezefs::meta_backend::kv::record::forest_slot_of_ino(local);
+    // The slot moves: released by the joiner, first-touched by the
+    // manager — a `chmod` of the unlinked-but-open file (its door's first
+    // touch of the released slot; any mutation of a record in it is the
+    // same act).
+    fx.jvol
+        .release_slot_handover(jid, fslot)
+        .await
+        .expect("the release over the wire");
+    fx.manager
+        .setattr(
+            f,
+            Some(libc::S_IFREG | 0o600),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("the manager's first touch of the released slot");
+    assert!(
+        matches!(
+            tree0_state(&fx.mvol, fslot).await,
+            Some(SlotState::Leased { appender_id: 0, .. })
+        ),
+        "the premise: slot {fslot} moved to the manager between the unlink and the forget"
+    );
+    assert!(!fx.jvol.inode_plane_owns_slot(local));
+    assert_eq!(fx.manager.getattr(f).await.unwrap().nlink, 0);
+    // The joiner's FORGET.
+    let f0 = reclaim_faces_all();
+    fx.jf.fs.reclaim_orphaned_batch(vec![f]).await;
+    let f1 = reclaim_faces_all();
+    assert_eq!(
+        f1.refused, f0.refused,
+        "nothing priced or withheld at the joiner"
+    );
+    assert_eq!(
+        f1.foreign - f0.foreign,
+        1,
+        "the forget of a slot another appender leases is counted foreign (reclaim_foreign_slot_forgets)"
+    );
+    assert_eq!(
+        (
+            f1.hints_shipped - f0.hints_shipped,
+            f1.hint_inos - f0.hint_inos
+        ),
+        (1, 1),
+        "ONE reclaim hint travelled to the slot's holder"
+    );
+    wait_destroyed(
+        &fx.manager,
+        f,
+        "Issue 1(b): the new holder reclaims the moved-slot corpse",
+    )
+    .await;
+    let f2 = reclaim_faces_all();
+    assert_eq!(
+        f2.served - f0.served,
+        1,
+        "the holder admitted the hinted ino"
+    );
+    assert_eq!(f2.refused, f0.refused, "the holder's destroy committed");
+    tear_down_hint_fixture(fx, &uris).await;
+}

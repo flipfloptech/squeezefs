@@ -7171,6 +7171,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // entry, the kernel's attrs and pages). Inert unarmed.
             if joined_mount || symmetric_set {
                 fs_engine.install_served_mutation_sink();
+                // PR 13h (F-R6): a peer's FORGET of a corpse in a slot
+                // this mount reclaims arrives as a reclaim hint and runs
+                // this mount's own FORGET-driven reclaim.
+                fs_engine.install_reclaim_hint_sink();
             }
 
             // Symmetric metadata PR 10 (design-symmetric-metadata §5.9,

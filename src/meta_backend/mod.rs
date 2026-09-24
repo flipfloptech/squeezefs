@@ -1219,7 +1219,18 @@ pub struct RoutedMetaBackend {
     /// cache, the flip trigger's foreign-creator census and the in-flight
     /// flips/migrations — inert on an unarmed mount.
     dir_stripes: dir_stripe::StripeState,
+    /// Symmetric PR 13h (F-R6, review round 1 Issue 1): the FUSE layer's
+    /// reclaim entry a SERVED reclaim hint feeds — a peer's FORGET of a
+    /// corpse whose slot THIS mount reclaims, handed to
+    /// `queue_reclaim_inode` as if this mount's own kernel had forgotten
+    /// it. Per backend (the in-process fixtures hold two); uninstalled on
+    /// a mount with no FUSE layer (a probe, a bare backend), where a hint
+    /// is counted and dropped.
+    reclaim_hint_sink: arc_swap::ArcSwapOption<ReclaimHintSink>,
 }
+
+/// See [`RoutedMetaBackend::install_reclaim_hint_sink`].
+pub type ReclaimHintSink = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
 
 /// The liveness ancestry walk's belt (PR 13c, F-B2): the deepest chain a
 /// path can address — `PATH_MAX / 2` components (each component is at
@@ -1462,6 +1473,7 @@ impl RoutedMetaBackend {
             map_run_stride: std::sync::OnceLock::new(),
             dir_parents: dir_parent_memo(),
             dir_stripes: dir_stripe::StripeState::new(),
+            reclaim_hint_sink: arc_swap::ArcSwapOption::empty(),
         }
     }
 
@@ -1525,6 +1537,7 @@ impl RoutedMetaBackend {
             map_run_stride: std::sync::OnceLock::new(),
             dir_parents: dir_parent_memo(),
             dir_stripes: dir_stripe::StripeState::new(),
+            reclaim_hint_sink: arc_swap::ArcSwapOption::empty(),
         })
     }
 
@@ -2933,6 +2946,42 @@ impl RoutedMetaBackend {
         self.volumes
             .get(v_idx)
             .is_some_and(|v| v.inode_plane_owns_slot(local_ino))
+    }
+
+    /// Install the FUSE layer's reclaim entry a served reclaim hint feeds
+    /// (PR 13h — review round 1, Issue 1): `sink(ino)` is
+    /// `SqueezefsFilesystem::queue_reclaim_inode`, so a peer's FORGET of a
+    /// corpse in a slot this mount reclaims runs this mount's own
+    /// FORGET-driven reclaim — its admission (open count, the exact
+    /// record's `nlink`, the single-drive claim), its plan, its destroy
+    /// with the references riding the same entry, in its own ring under
+    /// its own lease.
+    pub fn install_reclaim_hint_sink(&self, sink: ReclaimHintSink) {
+        self.reclaim_hint_sink
+            .store(Some(std::sync::Arc::new(sink)));
+    }
+
+    /// **The served side of a reclaim hint**: every ino of `inos` whose
+    /// slot THIS mount reclaims is handed to the installed sink (counted
+    /// on `reclaim_hints_served`); one this mount does not reclaim — the
+    /// slot moved again between the peer's resolve and the serve, or the
+    /// hint was routed to the wrong appender — is dropped and counted
+    /// (`reclaim_hints_misrouted`), never priced or read here. Returns
+    /// `(served, misrouted)`. A mount with no sink (no FUSE layer) counts
+    /// every ino misrouted: nothing here can reclaim.
+    pub fn serve_reclaim_hint(&self, inos: &[Ino]) -> (u64, u64) {
+        let sink = self.reclaim_hint_sink.load_full();
+        let (mut served, mut misrouted) = (0u64, 0u64);
+        for &ino in inos {
+            match sink.as_ref() {
+                Some(sink) if ino > 1 && self.owns_inode_reclaim(ino) => {
+                    sink(ino);
+                    served += 1;
+                }
+                _ => misrouted += 1,
+            }
+        }
+        (served, misrouted)
     }
 
     /// The journal payload `ino`'s destroy stages on its home volume —

@@ -6241,6 +6241,14 @@ pub struct Metrics {
     /// bound reached, or their reclaimer unreachable) — dropped, never
     /// read; the corpse's reclaimer is its next holder's sweep.
     pub reclaim_hints_misrouted: Align64<AtomicU64>,
+    /// FORGETs on a `-o ro` READER (PR 13h review round 1, Issue 2): a
+    /// reader owns no slot and reclaims nothing by posture (S5 — its
+    /// session writes ZERO bytes), so its forget drops the cache entry and
+    /// the side maps — as every FORGET's does — and accounts NOTHING: no
+    /// divert `getattr` (a Grant RPC per forgotten corpse at the holder),
+    /// no layout fetch, no destroy priced or withheld. 0 on every write
+    /// mount by construction; the holder's own FORGET reclaims the corpse.
+    pub reclaim_reader_forgets: Align64<AtomicU64>,
     /// Joint release+destroy entries committed (each carried ≥ 1
     /// reference release beside its inode/xattr `Delete`s) — the
     /// engagement instrument: a reclaim batch of N block-owning corpses
@@ -11850,6 +11858,7 @@ impl SqueezefsFilesystem {
                 "reclaim_hints_served": METRICS.reclaim_hints_served.load(Ordering::Relaxed),
                 "reclaim_hints_forwarded": METRICS.reclaim_hints_forwarded.load(Ordering::Relaxed),
                 "reclaim_hints_misrouted": METRICS.reclaim_hints_misrouted.load(Ordering::Relaxed),
+                "reclaim_reader_forgets": METRICS.reclaim_reader_forgets.load(Ordering::Relaxed),
                 "reclaim_release_destroy_joint_commits": METRICS.reclaim_release_destroy_joint_commits.load(Ordering::Relaxed),
                 "reclaim_single_ino_chunked_destroys": METRICS.reclaim_single_ino_chunked_destroys.load(Ordering::Relaxed),
                 "block_live_free_refusals": METRICS.block_live_free_refusals.load(Ordering::Relaxed),

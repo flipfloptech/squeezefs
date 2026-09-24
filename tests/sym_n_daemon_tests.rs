@@ -15129,3 +15129,145 @@ async fn a_corpse_whose_slot_moved_between_the_unlink_and_the_forget_is_reclaime
     assert_eq!(f2.refused, f0.refused, "the holder's destroy committed");
     tear_down_hint_fixture(fx, &uris).await;
 }
+
+// ---------------------------------------------------------------------------
+// PR 13h review round 1, Issue 2 — the `-o ro` token reader is inside the
+// law: a reader owns no slot and its FORGET reclaims nothing.
+// ---------------------------------------------------------------------------
+
+/// The process-wide READER posture (`-o ro` sets it at the mount), held
+/// for a contract's body and RESET on drop — a red assertion never leaks
+/// the posture into the suite's next test.
+struct ReaderPosture;
+
+impl ReaderPosture {
+    fn enter() -> Self {
+        squeezefs::fuse_client::set_read_only_mount(true);
+        Self
+    }
+}
+
+impl Drop for ReaderPosture {
+    fn drop(&mut self) {
+        squeezefs::fuse_client::set_read_only_mount(false);
+    }
+}
+
+/// **A `-o ro` token reader's FORGET of a corpse accounts NOTHING** (PR
+/// 13h, review round 1, Issue 2). The archetypal token client is the
+/// reader, and on a reader the lease gate is never armed, so F-R6's gate
+/// (`owns_inode_reclaim`) answered `true` for every ino and the FORGET-
+/// driven reclaim ran as shipped: the admission `getattr` DIVERTED to the
+/// holder's plane (the recall had retired the reader's entry, so every
+/// forgotten corpse was a fresh Grant RPC at the holder — `grants_served`
+/// moves), the plan fetched the layout, the pricing walked the reader's
+/// own KV image, and the read-only `destroy_inodes_releasing` was REFUSED
+/// into `destroy WITHHELD` (`reclaim_destroy_refused_release_failed` + a
+/// WARN) — under the holder's `rm -rf` of a tree the reader had cached,
+/// the wire storm the token deviation exists to avoid, plus the WARN
+/// storm, at the reader. The law: a reader reclaims nothing by POSTURE
+/// (S5 — its session writes ZERO bytes): its forget drops the cache entry
+/// and the side maps (the FORGET handler's own acts, before the reclaim
+/// entry) and stops — counted `reclaim_reader_forgets`, at
+/// `queue_reclaim_inode` (no pool spawned) and at the batch entry alike.
+/// RED on `da8542fc`: `grants_served` +1 at the holder and one withheld
+/// destroy per forgotten corpse. GREEN: `grants_served` unmoved, refused
+/// unmoved, the reader face +1 per forget; the corpse stands at the
+/// holder for its own FORGET path, exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_readers_forget_of_a_corpse_takes_no_grant_and_withholds_nothing() {
+    use squeezefs::meta_ship::token_plane::TokenClientConfig;
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mtokens = DaemonVenue::stand_up(&manager, true, "manager-13h-reader").await;
+    let victim = manager
+        .create(shared, "victim", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("the holder's file")
+        .ino;
+    mvol.checkpoint_now().await.expect("checkpoint");
+    // The reader: read-only, its token client armed at the manager's
+    // plane, the process in the READER posture (what `-o ro` sets).
+    let reader = squeezefs::meta_backend::open_routed_meta_set_read_only(&uris)
+        .await
+        .expect("read-only open");
+    let rv = Arc::clone(&reader.volumes[0]);
+    rv.arm_reader_revalidation(None).expect("arms");
+    rv.revalidate_reader().await.expect("poll");
+    let plane = rv
+        .arm_token_reader(TokenClientConfig {
+            endpoint: mtokens.endpoint.clone(),
+            secret: VENUE_SECRET.to_vec(),
+            client_id: "pr13h-reader-forget".to_string(),
+            volume: 0,
+        })
+        .expect("the manager's plane arms");
+    let _posture = ReaderPosture::enter();
+    // The reader instantiated the file (a token), then the holder unlinks
+    // it: the commit recalls the reader's token; the record stands at the
+    // holder with `nlink 0` (unlinked-but-open there, or simply not yet
+    // forgotten).
+    reader
+        .getattr(victim)
+        .await
+        .expect("served under a token from the manager");
+    assert_eq!(plane.stats().grants, 1);
+    manager.unlink(shared, "victim").await.expect("the unlink");
+    assert_eq!(manager.getattr(victim).await.unwrap().nlink, 0);
+    let holder = mvol.token_holder().expect("the manager holds tokens");
+    let rf = fs_in_front_of(&reader, "sqz-13h-reader").await;
+    let grants0 = holder.stats().grants_served;
+    let f0 = reclaim_faces_all();
+    let reader0 = squeezefs::fuse_client::METRICS
+        .reclaim_reader_forgets
+        .load(Relaxed);
+    // The reader's kernel FORGETs the corpse → its reclaim path, both
+    // entries: the FORGET handler's queue and the pool's batch.
+    rf.fs.queue_reclaim_inode(victim);
+    rf.fs.reclaim_orphaned_batch(vec![victim]).await;
+    // Anything the entries might have spawned has run by now (the pool's
+    // batch window is 20 ms).
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let f1 = reclaim_faces_all();
+    assert_eq!(
+        holder.stats().grants_served,
+        grants0,
+        "the reader's forget took NO grant at the holder (RED: a divert getattr per corpse)"
+    );
+    assert_eq!(
+        f1.refused, f0.refused,
+        "nothing priced or withheld at the reader (RED: destroy WITHHELD, read-only)"
+    );
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .reclaim_reader_forgets
+            .load(Relaxed)
+            - reader0,
+        2,
+        "both entries count the reader's forget (reclaim_reader_forgets)"
+    );
+    assert_eq!(
+        (f1.foreign, f1.unleased, f1.hints_shipped),
+        (f0.foreign, f0.unleased, f0.hints_shipped),
+        "a reader hints nobody — it owns no slot and the holder's own FORGET reclaims"
+    );
+    assert_eq!(
+        manager.getattr(victim).await.unwrap().nlink,
+        0,
+        "the corpse stands at the holder, exact, for its own FORGET path"
+    );
+    drop(rf);
+    for v in &reader.volumes {
+        v.shutdown().await.unwrap();
+    }
+    drop(rv);
+    drop(reader);
+    mtokens.tear_down();
+    shutdown(&manager).await;
+}

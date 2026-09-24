@@ -2241,7 +2241,7 @@ member 0 with the manager mounted (`6e9c602e`: the name up to the next
 space, the whole-word mountpoint kept; the teardown's stray sweep the
 same; the failed launch kept as `13e-nw-20260923-030202-scale.H1-pidanchor`).
 
-#### 3.9.6 The fourth pass — gate 3 on PR 13g's binary (`230e95dd`) — `perf/sym-box-13g`, 2026-09-24 04:05 → 04:57 UTC (the box left as found): **`sym-scale` N = 1/2/4/8 ran TWICE from zero on fresh fleets — the first row set is the FIRST gate-3 row set ever to complete to its ORACLE on the box (`appender_flush_ceiling_overruns` 0 on the manager and every joiner through all four rows, deleted-stays-deleted 0 / 3,000 ×2, fsck clean); the second (a harness re-run — the row's setup taken out of its clock) read ONE trip on the manager, 1,101 ms — 1 ms past the ceiling — at the N = 4 storm's END under NO verb service; F-R5's laws MET on every joiner in both sets (rings 768 KiB–2.3 MiB, returns ≪ compactions, 1–3 wire grants per joiner per row, reactive 0, the manager's verbs 10× and its service 26× down at N = 8); the launch skew MEASURED for the first time — 9.1 s at N = 8, three 3.0 s `mkdir`s by the fresh joiners into the freshly STRIPED root — and with the setup outside the clock N = 8 reads 4.61× creates (Σ per-writer rates 5.25×, the bound); one new armed-plane finding (F-R6: a joiner's FORGET-driven reclaim prices destroys for the HOLDER's inos through its stale projection — 6,782 / 7,266 withheld per set, defect 18 / 34's loop under it) and one log-volume finding (272 k `may reply interrupted fuse request` WARNs per set)**
+#### 3.9.6 The fourth pass — gate 3 on PR 13g's binary (`230e95dd`) — `perf/sym-box-13g`, 2026-09-24 04:05 → 04:57 UTC (the box left as found): **`sym-scale` N = 1/2/4/8 ran TWICE from zero on fresh fleets — the first row set is the FIRST gate-3 row set ever to complete to its ORACLE on the box (`appender_flush_ceiling_overruns` 0 on the manager and every joiner through all four rows, deleted-stays-deleted 0 / 3,000 ×2, fsck clean); the second (a harness re-run — the row's setup taken out of its clock) read ONE trip on the manager, 1,101 ms — 1 ms past the ceiling — at the N = 4 storm's END under NO verb service; F-R5's laws MET on every joiner in both sets (rings 768 KiB–2.3 MiB, returns ≪ compactions, 1–3 wire grants per joiner per row, reactive 0, the manager's verbs 10× and its service 26× down at N = 8); the launch skew MEASURED for the first time — 9.1 s at N = 8, three 3.0 s `mkdir`s by the fresh joiners into the freshly STRIPED root — and with the setup outside the clock N = 8 reads 4.61× creates (Σ per-writer rates 5.25×, the bound); one new armed-plane finding (F-R6: a joiner's FORGET-driven reclaim prices destroys for the HOLDER's inos through its stale projection — 6,782 / 7,266 withheld per set, defect 18 / 34's loop under it) and one log-volume finding (272 k / 275 k `may reply interrupted fuse request` WARNs per set — 21–46 % of the served invalidations, `session.rs:1092`)**
 
 **The counted-run law**: the brief's ONE row set ran from zero on PR 13g's
 binary and completed (`13g-nw-20260924-041135-scale`); it measured a
@@ -2552,15 +2552,22 @@ scale/scale-r1/daemon-logs/{m0,m60,m62,m63}.log`, the ino → slot
 arithmetic, `m60_pn{41,80}.json` / `m60_pend1.json`.
 
 **A log-volume finding (PR 13b's served-mutation kernel hook)**: **272,071
-/ 285,461 `WARN fuse3::raw::session may reply interrupted fuse request,
+/ 275,372 `WARN fuse3::raw::session may reply interrupted fuse request,
 ignore this error No such file or directory (os error 2)`** per set
 across the daemon logs (m0 222,423 / 223,831; m60 49,177 / 51,481; the
-other joiners 9–81 each) — ≈ 2 × `meta_ship.served_mutation_{invals,
-prunes}` (m60 114,716 + 114,716 by N = 8; the manager's recall-side
-invalidations): the hook's `FUSE_NOTIFY_INVAL_INODE` / `FUSE_NOTIFY_PRUNE`
-answer `ENOENT` for an inode the kernel does not hold (the expected "not
-cached" word) and the fork logs every one at WARN. A hygiene item (PR
-14): the notify's `ENOENT` is a counted outcome, never a WARN per call.
+other joiners 77–81 / 9–12 each). The site is `crates/fuse3/src/raw/
+session.rs:1092` (`reply_fuse`): the hook's detached notify frames
+(`Notify::invalid_inode_detached` / `prune_detached` → `ReplyTx::
+send_detached` → `write_vectored`) travel the reply channel, so a kernel
+`-ENOENT` on a `FUSE_NOTIFY_INVAL_INODE` / `FUSE_NOTIFY_PRUNE` for an inode
+it does not hold (the expected "not cached" word) lands on the reply
+path's "interrupted request" WARN. The WARNs are a SUBSET of the
+notifies, not a multiple: m0 222,423 against `meta_ship.served_mutation_
+{invals,prunes}` 243,806 + 243,806 = 487,612 (**46 %**), m60 49,177
+against 114,716 × 2 = 229,432 (**21 %**) at set 1's `pn81` (set 2: 46 % /
+22 %) — the fraction of the invalidations the kernel had already dropped
+the inode for. A hygiene item (PR 14): the notify's `ENOENT` is a counted
+outcome, never a WARN per call.
 
 **The fresh joiner's 3.0 s `mkdir` into a striped root** (above — the
 launch term, reproduced ×3 in both sets; an `OP_PROFILE` tape is its
@@ -5360,10 +5367,11 @@ number in §3 is a dev-box RATE reading, venue-attributed pending the box
    must-stay-0 set and the per-row snapshots) — fix shape: the reclaim
    path skips foreign-slot inos (a token client drops its cache entry
    and nothing else), defect 34's loop stays its own item; **the served-
-   mutation kernel hook's `ENOENT` at WARN** — 272 k / 285 k `may reply
-   interrupted fuse request` lines per set (≈ 2 × served invals + prunes;
-   the notify's "not cached" answer logged per call) — a counted outcome,
-   never a WARN; **a fresh joiner's first create into a STRIPED root costs
+   mutation kernel hook's `ENOENT` at WARN** — 272 k / 275 k `may reply
+   interrupted fuse request` lines per set (`crates/fuse3/src/raw/
+   session.rs:1092`, the detached notify frames on the reply channel; 46 %
+   of the manager's and 21 % of m60's invals + prunes — the inodes the
+   kernel had already dropped) — a counted outcome, never a WARN; **a fresh joiner's first create into a STRIPED root costs
    ≈ 3.0 s** (×3 in both sets; the per-holder token planes' 1 s first-round
    waits the hypothesis; an `OP_PROFILE` tape the instrument; a latency
    cliff on the flip's default path, not a throughput term); **the ingest
@@ -5574,7 +5582,7 @@ reduction; the laptop ran nothing of this rung but the reductions).
 > **Status (the FOURTH box pass — gate 3 on PR 13g's binary `230e95dd`, `perf/sym-box-13g`, 2026-09-24 04:05 → 04:57 UTC; §3.9.6 — the re-read the brief asked for). The decision stays NOT YET; the list shortens by one item and grows by one finding.** **Reading MET on the box on this binary:** **F-R5** — FIXED as a verdict on every joiner in two row sets (rings 768 KiB–2.3 MiB, 1–3 wire grants per joiner per row, reactive 0, returns ≪ compactions, the manager's N = 8 row 88 verbs / 0.114 s of service against the third pass's 892 / 2.93 s, the closure exact set-wide); **gate 3's ROW SET completes to its oracle on the box for the first time** (set 1: 0 trips through N = 1/2/4/8, deleted-stays-deleted 0 / 3,000 ×2, fsck clean); and from the third pass, not re-run — gate 1 (by the rule), gate 3c (all three laws ×2), gate 7@N=32 (×2), gate 2, gate 3b, gate 5. **The exact list that does NOT read MET:**
 > * **the must-stay-0 tripwire `appender_flush_ceiling_overruns`** — NOT closed: **0 in set 1 (8 writer-rows at the manager, 44 joiner-rows in the pass), +1 in set 2 — the manager's volume 1 at 1,101 ms, 1 ms past, at the N = 4 storm's END with ONE verb served on that volume across the row.** The third pass's class (the onset after a quiet horizon under the joiners' grant storm) is GONE — exercised at N = 2 / 4 in both sets (terms 6–7 ms at the storms' starts) and not tripped, the grant burst absent; what tripped is the derivation's RESIDUE: the LIVE projection under-priced the storm's END cycle by ≈ 65 ms (84 ms at the tick's decision against the cycle's ≈ 150 ms pre-barrier wall — the create-end snapshot preceded the trip with overruns 0; the cycle's own term 151 and lateness 35 entered the horizon after it; no barrier face reads above 2 ms), and with the 35 ms lateness the fixed two-tick margin was 1 ms short. §7 item 3's next piece (the projection's growth between the decision and the flush + the lateness term, with the per-cycle tape that discriminates) — a FLIP PRECONDITION still, now a 1-in-8-rows, 1 ms class with no service term behind it;
 > * **gate 3's WALL law at N = 8** — 4.61× creates on the storms' own clock (set 2, the setup outside the clock; per-writer storms 10.8–13.9 s, the launch skew 12 ms; Σ per-writer rates 5.25× the bound) vs ≥ 5.6× — the co-located venue's term (§3.9.3; `C/CPU-S` 0.66×), no longer a launch artifact: the third pass's inferred 3.9 s was a MEASURED 9.1 s of three fresh joiners' 3.0 s `mkdir`s into the freshly striped root, taken out of the row's clock; the ingest multiple is its sub-second N = 1 base's noise (the N = 8 absolute 7.3–7.6 GB/s across three passes) — **the per-NODE law UNMEASURED (PR 15's cloud row, its instrument)**;
-> * **F-R6 (new, §3.9.6.3 / §7 item 17)** — a joined writer's FORGET-driven reclaim prices destroys for the HOLDER's inos through its stale projection (6,782 / 7,266 withheld per set; nothing destroyed — the withhold; defect 18 / 34's 256-restart loop under it, PR 13b's "9/10" class in production shape) — a CPU + log storm on a path a token client must not take, invisible to the row's oracle; a PR 14 item beside the served-mutation hook's `ENOENT`-at-WARN (272 k lines per set) and the fresh joiner's 3.0 s first create into a striped root;
+> * **F-R6 (new, §3.9.6.3 / §7 item 17)** — a joined writer's FORGET-driven reclaim prices destroys for the HOLDER's inos through its stale projection (6,782 / 7,266 withheld per set; nothing destroyed — the withhold; defect 18 / 34's 256-restart loop under it, PR 13b's "9/10" class in production shape) — a CPU + log storm on a path a token client must not take, invisible to the row's oracle; a PR 14 item beside the served-mutation hook's `ENOENT`-at-WARN (272 k / 275 k lines per set — 21–46 % of the served invalidations, `session.rs:1092`) and the fresh joiner's 3.0 s first create into a striped root;
 > * **gate 4** — the kill matrix ×10 from zero on this binary: NOT RUN in this rung (LOCAL by the venue law; the counts restart on the flip binary).
 >
 > **The gates this pass does not move, placed: unchanged from the third pass's placement** — gate 6 RUN locally, VALID; gate 8 MET; gate 8b PASS 190 / 0; gate 9 NOT RUN (PR 15's).

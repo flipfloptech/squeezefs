@@ -11880,6 +11880,225 @@ async fn a_refused_death_path_settle_aborts_the_step_and_a_released_segment_is_f
 }
 
 // ---------------------------------------------------------------------------
+// PR 13g review round 3, Issue 23 — the death-path settle's DRAIN-AND-RETRY
+// arm: a transient admission refusal is healed by the recovery's own cover
+// cycles; one past the bound is the tail's class.
+// ---------------------------------------------------------------------------
+
+/// A joiner that GROWS its ring for real (a stall bumped, the cadence's
+/// drain-then-grow, the page naming the segment, the witness standing),
+/// then dies with its death recorded — the Issue 20 pin's premise, shared.
+/// Answers `(identity, appender id, the segment's extents)`.
+async fn grown_ring_then_death(
+    uris: &[String],
+    venue: &HoldersVenue,
+    mvol: &Arc<KvMetaBackend>,
+    n: u32,
+) -> (AppenderIdentity, u32, Vec<u64>) {
+    use std::sync::atomic::Ordering;
+    let joiner = join(uris, venue, mvol, n).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let id = jvol.appender_stats().unwrap().appender_id;
+    let identity = jvol.joined_wire().unwrap().identity;
+    jvol.checkpoint_now().await.unwrap();
+    let segments0 = page_of(&uris[0], mvol, id).await.unwrap().segments.len();
+    jvol.appenders_public()
+        .unwrap()
+        .region(id)
+        .unwrap()
+        .stalls
+        .fetch_add(1, Ordering::Relaxed);
+    jvol.checkpoint_now().await.unwrap();
+    let page = page_of(&uris[0], mvol, id).await.unwrap();
+    assert_eq!(
+        page.segments.len(),
+        segments0 + 1,
+        "the ring grew by one segment"
+    );
+    let segment = *page.segments.last().unwrap();
+    let hint = mvol
+        .appender_hint_for(identity.node_token, identity.mount_slot)
+        .await
+        .unwrap();
+    assert_eq!(
+        hint.pending.map(|p| (p.start, p.len)),
+        Some((segment.start, segment.len)),
+        "the premise: the pending witness names the segment the page names"
+    );
+    let node_size = NODE_SIZE as u64;
+    let heap_start = mvol.superblock().heap.start;
+    let extents: Vec<u64> = (0..segment.len / node_size)
+        .map(|i| (segment.start - heap_start) / node_size + i)
+        .collect();
+    drop(jvol);
+    drop(joiner);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    assert!(!mvol.record_death_with_key(identity, 9, 0).await.unwrap());
+    (identity, id, extents)
+}
+
+/// **The death-path settle's drain-and-retry arm, both sides** (PR 13g
+/// review round 3, Issue 23 — round 2's pin proved the ABORT on a refusal
+/// no cycle discharges; this one proves the arm the abort sits beside).
+/// A `JournalReserveExhausted` on the settle's admission — ring 0 full
+/// under the recovery's own hold of the SMO mutex, which the checkpoint
+/// task cannot drain for it — is healed by a barriered cover cycle of the
+/// recovery's OWN task and the settle retried (`admit_control_drain_and_
+/// retry`'s law): (a) TRANSIENT — two refusals (`TEST_RECOVERY_SETTLE_
+/// EXHAUST_N` = 2) → the settle lands at the third attempt in the SAME
+/// run (`recovered` 1, nothing aborted, the seam consumed, the ledger seq
+/// advanced by the cover cycles), the witness cleared, the page-named
+/// segment released with its ring ONCE (`appender_pending_segments_
+/// returned` unmoved; the extents free after the release, a rejoin frees
+/// nothing under whoever holds them next); (b) PERSISTENT — a count past
+/// `COVER_CYCLES_MAX` → every cycle of the bound run, the seam consumed to
+/// the bound, the step ABORTED by the tail's class (the page `Recovering`,
+/// the segment allocated), and the re-run with the seam clear completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transient_settle_admission_refusal_is_healed_by_the_recoverys_own_cover_cycles() {
+    use squeezefs::meta_backend::kv::backend::recovery::{
+        TEST_RECOVERY_SETTLE_EXHAUST_N, TEST_RECOVERY_SETTLE_REFUSE_N,
+    };
+    use squeezefs::meta_backend::kv::checkpoint::COVER_CYCLES_MAX;
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    TEST_RECOVERY_SETTLE_EXHAUST_N.store(0, Ordering::SeqCst);
+    TEST_RECOVERY_SETTLE_REFUSE_N.store(0, Ordering::SeqCst);
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let files = create_files(&manager, shared, "m", 4).await;
+    // (a) The TRANSIENT shape: two admission refusals, healed in one run.
+    let (identity_a, id_a, segment_a) = grown_ring_then_death(&uris, &venue, &mvol, 3).await;
+    let returned0 = mvol.appender_stats().unwrap().pending_segments_returned;
+    let seq0 = mvol.checkpoint_seq();
+    TEST_RECOVERY_SETTLE_EXHAUST_N.store(2, Ordering::SeqCst);
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(
+        TEST_RECOVERY_SETTLE_EXHAUST_N.load(Ordering::SeqCst),
+        0,
+        "both admission refusals were met — the settle was retried past them"
+    );
+    assert_eq!(
+        rep.recovered(),
+        1,
+        "a transient admission refusal never aborts the step — the recovery completes in ONE \
+         run ({rep:?})"
+    );
+    assert!(
+        mvol.checkpoint_seq() >= seq0 + 2,
+        "the arm ran a cover cycle per refusal ({} → {})",
+        seq0,
+        mvol.checkpoint_seq()
+    );
+    let hint = mvol
+        .appender_hint_for(identity_a.node_token, identity_a.mount_slot)
+        .await
+        .unwrap();
+    assert_eq!(
+        hint.pending, None,
+        "the witness is cleared by the settle ({hint:?})"
+    );
+    assert_eq!(
+        mvol.appender_stats().unwrap().pending_segments_returned,
+        returned0,
+        "a page-named segment is released with the ring, never 'returned'"
+    );
+    assert_eq!(
+        page_of(&uris[0], &mvol, id_a).await.unwrap().state,
+        AppenderState::Recovered
+    );
+    for e in &segment_a {
+        assert!(
+            mvol.allocator().is_allocated(*e),
+            "the segment goes back with the ring at the release, not before ({e})"
+        );
+    }
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(rep.regions_released, 1, "{rep:?}");
+    for e in &segment_a {
+        assert!(
+            !mvol.allocator().is_allocated(*e),
+            "released with the ring ({e})"
+        );
+    }
+    // Exactly once: the identity's rejoin over the Free page frees nothing
+    // (the word is clear; whoever carved the extents since keeps them).
+    let free_before_rejoin = mvol.free_extents();
+    let again = join(&uris, &venue, &mvol, 3).await;
+    let avol = Arc::clone(&again.volumes[0]);
+    assert_eq!(
+        mvol.appender_stats().unwrap().pending_segments_returned,
+        returned0,
+        "the rejoin returned nothing — no witness stood"
+    );
+    assert!(
+        mvol.free_extents() < free_before_rejoin,
+        "the rejoin only CLAIMED (its ring, its grant) — nothing of the old segment was freed \
+         a second time"
+    );
+    // (b) The PERSISTENT shape: a count past the bound — every cycle of the
+    // bound runs, then the tail's class aborts the step; the re-run with
+    // the seam clear completes.
+    let (identity_b, id_b, segment_b) = grown_ring_then_death(&uris, &venue, &mvol, 4).await;
+    let seq1 = mvol.checkpoint_seq();
+    TEST_RECOVERY_SETTLE_EXHAUST_N.store(COVER_CYCLES_MAX + 1, Ordering::SeqCst);
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(
+        TEST_RECOVERY_SETTLE_EXHAUST_N.load(Ordering::SeqCst),
+        0,
+        "the settle was attempted once per cycle of the bound, and once more"
+    );
+    assert_eq!(
+        rep.recovered(),
+        0,
+        "an admission refusal that outlives the bound ABORTS the step ({rep:?})"
+    );
+    assert!(
+        mvol.checkpoint_seq() >= seq1 + COVER_CYCLES_MAX as u64,
+        "the whole bound of cover cycles ran ({} → {})",
+        seq1,
+        mvol.checkpoint_seq()
+    );
+    assert_eq!(
+        page_of(&uris[0], &mvol, id_b).await.unwrap().state,
+        AppenderState::Recovering,
+        "the page stays Recovering for the re-run"
+    );
+    for e in &segment_b {
+        assert!(
+            mvol.allocator().is_allocated(*e),
+            "nothing released under a standing witness ({e})"
+        );
+    }
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "the re-run completes ({rep:?})");
+    let hint = mvol
+        .appender_hint_for(identity_b.node_token, identity_b.mount_slot)
+        .await
+        .unwrap();
+    assert_eq!(hint.pending, None, "{hint:?}");
+    assert_eq!(
+        mvol.appender_stats().unwrap().pending_segments_returned,
+        returned0
+    );
+    assert_all_resolve(&manager, shared, &files).await;
+    assert_supply_gauges_zero(&avol, "the rejoined joiner");
+    shutdown(&again).await;
+    assert_must_stay_zero(&mvol, "manager");
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+// ---------------------------------------------------------------------------
 // PR 13g review round 1, Issue 2 — the unnamed POOL survives a crash-rejoin.
 // ---------------------------------------------------------------------------
 

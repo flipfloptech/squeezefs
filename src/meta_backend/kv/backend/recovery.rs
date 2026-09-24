@@ -138,12 +138,21 @@ pub static TEST_RECOVERY_HELD: AtomicBool = AtomicBool::new(false);
 pub static TEST_RECOVERY_HOLD_RELEASE: squeezefs_ipc::sqz_notify::Notify =
     squeezefs_ipc::sqz_notify::Notify::new();
 /// Test seam (PR 13g review round 2, Issue 20): the death path's settle
-/// of the dead identity's pending `GrowRing` segment is REFUSED with the
-/// admission class this many times — the shape of ring 0 refusing the
-/// settle's admission under the recovery's own hold of the SMO mutex; a
-/// count past the drain-and-retry bound is the PERSISTENT shape (the
-/// step aborts, the page stays `Recovering`). Decremented per refusal.
+/// of the dead identity's pending `GrowRing` segment is REFUSED with a
+/// `KvError::Busy` this many times — a refusal NO cover cycle discharges
+/// (the class the step ABORTS on at its first occurrence: the page stays
+/// `Recovering`, the re-run resumes). Decremented per refusal.
 pub static TEST_RECOVERY_SETTLE_REFUSE_N: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+/// Test seam (PR 13g review round 3, Issue 23): the death path's settle
+/// is refused with the ADMISSION class (`KvError::JournalReserveExhausted`
+/// — ring 0 full under the recovery's own hold of the SMO mutex) this
+/// many times — the DRAIN-AND-RETRY arm's shape: a count within
+/// `COVER_CYCLES_MAX` is healed by that many cover cycles of the
+/// recovery's own task and the settle lands in the SAME run; a count past
+/// it is the persistent shape, classified by the tail's motion (`Busy`
+/// moved / `Corrupt` pinned) and aborted. Decremented per refusal.
+pub static TEST_RECOVERY_SETTLE_EXHAUST_N: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
 fn test_fail_at_step(step: u32, id: u32) -> std::result::Result<(), KvError> {
@@ -2353,7 +2362,14 @@ impl KvMetaBackend {
         for cycle in 0..=checkpoint::COVER_CYCLES_MAX {
             let settled = {
                 let _g = self.manager_verbs.lock().await;
-                if TEST_RECOVERY_SETTLE_REFUSE_N
+                if TEST_RECOVERY_SETTLE_EXHAUST_N
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+                {
+                    // The seam: the ADMISSION class (a full ring 0), the
+                    // drain-and-retry arm's shape.
+                    Err(KvError::JournalReserveExhausted { needed: 0 })
+                } else if TEST_RECOVERY_SETTLE_REFUSE_N
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                     .is_ok()
                 {

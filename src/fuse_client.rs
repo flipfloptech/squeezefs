@@ -25683,42 +25683,49 @@ impl SqueezefsFilesystem {
             // cadence released before the close has no kernel to FORGET it
             // there) — and this forget TRAVELS to it as a reclaim hint
             // (`ship_reclaim_hint`, batched below), which its own
-            // FORGET-driven reclaim judges. One relaxed load on every
-            // unarmed mount.
-            let home = match homes.entry(backend.reclaim_slot_key(ino)) {
-                std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(backend.reclaim_home(ino).await).clone()
-                }
-            };
-            match home {
-                crate::meta_backend::ReclaimHome::Local => {}
-                crate::meta_backend::ReclaimHome::Peer {
-                    reclaimer,
-                    unleased,
-                    endpoint,
-                } => {
-                    Self::note_peer_reclaim_forget(ino, reclaimer, unleased);
-                    match hints.iter_mut().find(|(r, _, _)| *r == reclaimer) {
-                        Some((_, _, list)) => list.push(ino),
-                        None => hints.push((reclaimer, endpoint, vec![ino])),
+            // FORGET-driven reclaim judges. An OWNED ino is one relaxed
+            // load (`owns_inode_reclaim` — every ino on an unarmed mount):
+            // the home map and the resolve are reached only by an ino this
+            // mount does not reclaim (review round 2, Issue 11).
+            if backend.owns_inode_reclaim(ino) {
+                // fall through to the admission below
+            } else {
+                let home = match homes.entry(backend.reclaim_slot_key(ino)) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(backend.reclaim_home(ino).await).clone()
                     }
-                    continue;
-                }
-                crate::meta_backend::ReclaimHome::Unreachable {
-                    reclaimer,
-                    unleased,
-                } => {
-                    Self::note_peer_reclaim_forget(ino, reclaimer, unleased);
-                    METRICS
-                        .reclaim_hint_failures
-                        .fetch_add(1, Ordering::Relaxed);
-                    debug!(
-                        "RECLAIM: ino = {ino}'s reclaimer (appender {reclaimer}) has no endpoint \
-                         bound here — the corpse stays for its mount-time sweep \
-                         (reclaim_hint_failures)"
-                    );
-                    continue;
+                };
+                match home {
+                    // The table moved under the resolve: this mount's after all.
+                    crate::meta_backend::ReclaimHome::Local => {}
+                    crate::meta_backend::ReclaimHome::Peer {
+                        reclaimer,
+                        unleased,
+                        endpoint,
+                    } => {
+                        Self::note_peer_reclaim_forget(ino, reclaimer, unleased);
+                        match hints.iter_mut().find(|(r, _, _)| *r == reclaimer) {
+                            Some((_, _, list)) => list.push(ino),
+                            None => hints.push((reclaimer, endpoint, vec![ino])),
+                        }
+                        continue;
+                    }
+                    crate::meta_backend::ReclaimHome::Unreachable {
+                        reclaimer,
+                        unleased,
+                    } => {
+                        Self::note_peer_reclaim_forget(ino, reclaimer, unleased);
+                        METRICS
+                            .reclaim_hint_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        debug!(
+                            "RECLAIM: ino = {ino}'s reclaimer (appender {reclaimer}) has no \
+                             endpoint bound here — the corpse stays for its mount-time sweep \
+                             (reclaim_hint_failures)"
+                        );
+                        continue;
+                    }
                 }
             }
             // OPEN/RECLAIM HANDSHAKE (fstests generic/795 — the destroy-

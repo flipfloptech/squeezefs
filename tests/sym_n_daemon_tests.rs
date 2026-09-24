@@ -14834,11 +14834,41 @@ async fn a_forget_on_an_unarmed_mount_reclaims_every_corpse_as_shipped() {
             assert_eq!(routed.getattr(*ino).await.expect("the corpse").nlink, 0);
         }
         let f = fs_in_front_of(&routed, tag).await;
-        let (refused0, foreign0) = reclaim_faces();
+        let f0 = reclaim_faces_all();
+        let reader0 = squeezefs::fuse_client::METRICS
+            .reclaim_reader_forgets
+            .load(std::sync::atomic::Ordering::Relaxed);
         f.fs.reclaim_orphaned_batch(inos.clone()).await;
-        let (refused1, foreign1) = reclaim_faces();
-        assert_eq!(refused1, refused0, "{tag}: every destroy commits");
-        assert_eq!(foreign1, foreign0, "{tag}: no forget reads as foreign");
+        let f1 = reclaim_faces_all();
+        assert_eq!(f1.refused, f0.refused, "{tag}: every destroy commits");
+        // The whole peer / reader family stays put (review round 2, Issue
+        // 11): no forget reads as foreign or unleased, nothing ships, the
+        // reader face is the reader posture's alone.
+        assert_eq!(
+            (
+                f1.foreign,
+                f1.unleased,
+                f1.hints_shipped,
+                f1.hint_inos,
+                f1.hint_failures
+            ),
+            (
+                f0.foreign,
+                f0.unleased,
+                f0.hints_shipped,
+                f0.hint_inos,
+                f0.hint_failures
+            ),
+            "{tag}: an unarmed mount's forgets are all its own — nothing counted foreign or \
+             unleased, no hint shipped; faces {f0:?} → {f1:?}"
+        );
+        assert_eq!(
+            squeezefs::fuse_client::METRICS
+                .reclaim_reader_forgets
+                .load(std::sync::atomic::Ordering::Relaxed),
+            reader0,
+            "{tag}: a write mount is no reader"
+        );
         for ino in &inos {
             assert!(
                 routed.getattr(*ino).await.is_err(),

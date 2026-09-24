@@ -14398,6 +14398,60 @@ async fn a_wave_of_promised_images_is_priced_at_the_per_image_cost_the_passes_me
                  re-opened for a fresh horizon"
             );
         }
+        if valid {
+            // The UPPER cycle bound AFTER the wave (review round 1, Issue
+            // 4 — the floor deletion's other direction): the wave's term
+            // and the `B_MS` image unit now sit in the horizon, so a paced
+            // trickle over the next window must run at the trigger those
+            // words derive — never a cycle per tick — and the unit in
+            // force reads the pass's per-image cost, not an outlier. The
+            // trickle's own commits are the promise-free class (a fresh
+            // xattr on the pilot below the drain), so the projection is
+            // the dirty nodes' alone.
+            let window_ms = 1_500u64;
+            let seq1 = mvol.checkpoint_seq();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let trickle = {
+                let m = Arc::clone(&manager);
+                let stop = Arc::clone(&stop);
+                tokio::spawn(async move {
+                    let mut i = 0u32;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        m.setxattr(pilot, &format!("user.t{i}"), b"1")
+                            .await
+                            .expect("a trickle put");
+                        i += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    i
+                })
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(window_ms)).await;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let puts = trickle.await.unwrap();
+            let cycles = mvol.checkpoint_seq() - seq1;
+            let (term, projected) = (mvol.checkpoint_term_ms(), mvol.checkpoint_projected_ms());
+            let bound = max_cadence_cycles(window_ms, term, projected);
+            eprintln!(
+                "F-B1 wave: attempt {attempt} — after the wave {cycles} cycles over {window_ms} \
+                 ms ({puts} puts), bound {bound} (term {term} ms, projected {projected} ms, \
+                 trigger {} ms, image unit {} µs)",
+                mvol.checkpoint_trigger_ms(CHECKPOINT_MAX_AGE_MS as u64),
+                mvol.checkpoint_image_unit_ns() / 1_000
+            );
+            assert!(puts >= 10, "the trickle ran ({puts} puts)");
+            assert!(
+                cycles <= bound,
+                "the cadence after the wave runs at its trigger, never a cycle per tick: \
+                 {cycles} cycles over {window_ms} ms against a bound of {bound} (term {term} ms, \
+                 projected {projected} ms) — an over-priced unit is bounded to the horizon, \
+                 and here the horizon holds the wave's own words"
+            );
+            assert!(
+                mvol.checkpoint_trigger_ms(CHECKPOINT_MAX_AGE_MS as u64) > 0,
+                "the trigger stands after the wave (term {term} ms, projected {projected} ms)"
+            );
+        }
         assert_must_stay_zero_with(&mvol, "manager", false);
         shutdown(&manager).await;
         drop(mvol);

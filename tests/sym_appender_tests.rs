@@ -2046,20 +2046,6 @@ async fn armed_one_leaf_fixture(
     (ra, va, path, d)
 }
 
-/// The cadence's UPPER cycle bound over a window: one cycle per trigger
-/// interval at the LOWEST trigger a bounded term admits, plus the two
-/// warm cycles a window's edges can straddle. A trigger collapsed to 0
-/// (a term the derivation read past the ceiling) runs a cycle per tick
-/// and lands an order of magnitude above it.
-fn max_cadence_cycles(window_ms: u64, term_ms: u64) -> u64 {
-    let trigger = squeezefs::meta_backend::kv::checkpoint::checkpoint_trigger_ms(
-        CHECKPOINT_MAX_AGE_MS as u64,
-        term_ms,
-    )
-    .max(checkpoint_tick_period_ms(50));
-    window_ms.div_ceil(trigger) + 2
-}
-
 /// **PR 13e review round 1, Issue 1 (F-B1's age law — the bug): an IDLE
 /// forest volume's whole idle span became the next cycle's "term".** The
 /// first build recorded the age decision's lateness on EVERY `due` tick —
@@ -2130,7 +2116,7 @@ async fn an_idle_span_is_never_a_cycles_term_so_the_first_burst_after_it_runs_at
         "the published term is the storm's own (barrier-free device: a few ms), never the \
          {idle_ms} ms idle span before it (term {term} ms, before the storm {term_before} ms)"
     );
-    let bound = max_cadence_cycles(window_ms, term);
+    let bound = common::sym::max_cadence_cycles(window_ms, term, va.checkpoint_projected_ms());
     assert!(
         cycles <= bound,
         "the first burst after an idle span runs at the cadence: {cycles} cycles over a \
@@ -2254,7 +2240,11 @@ async fn the_cadence_anticipates_the_measured_cycle_wall_so_a_slow_barrier_lands
     // The UPPER bound (review round 1, Issue 1): a trigger collapsed to 0
     // — a term the derivation read past the ceiling — passes the lower
     // bound and the overrun count both while running a cycle per tick.
-    let bound = max_cadence_cycles(window.as_millis() as u64, va.checkpoint_term_ms());
+    let bound = common::sym::max_cadence_cycles(
+        window.as_millis() as u64,
+        va.checkpoint_term_ms(),
+        va.checkpoint_projected_ms(),
+    );
     assert!(
         cycles <= bound,
         "the cadence ran at its trigger, never a cycle per tick ({cycles} cycles over {} ms, \

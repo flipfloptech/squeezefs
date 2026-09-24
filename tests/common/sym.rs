@@ -973,3 +973,22 @@ impl FuseRig {
         shutdown(&self.routed).await;
     }
 }
+
+/// **The cadence's UPPER cycle bound over a window** — the belt of PR 13e
+/// review round 1, Issue 1 (restated in PR 13h round 1, Issue 4 on the
+/// law's own word): one cycle per trigger interval at the LOWEST trigger
+/// the anticipated term admits — `checkpoint_trigger_ms(max_age,
+/// max(term, projection))`, the trigger's two inputs since PR 13g's live
+/// projection, floored at one tick — plus the two warm cycles a window's
+/// edges can straddle. A trigger collapsed to 0 (a term or a projection
+/// read at or past the ceiling) runs a cycle per tick and lands an order
+/// of magnitude above it; a bound keyed on the term alone would pass a
+/// saturated projection by the `+2` slack alone.
+pub fn max_cadence_cycles(window_ms: u64, term_ms: u64, projected_ms: u64) -> u64 {
+    use squeezefs::meta_backend::kv::checkpoint::{
+        checkpoint_tick_period_ms, checkpoint_trigger_ms, CHECKPOINT_MAX_AGE_MS,
+    };
+    let trigger = checkpoint_trigger_ms(CHECKPOINT_MAX_AGE_MS as u64, term_ms.max(projected_ms))
+        .max(checkpoint_tick_period_ms(50));
+    window_ms.div_ceil(trigger) + 2
+}

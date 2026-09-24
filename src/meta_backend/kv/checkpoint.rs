@@ -1182,7 +1182,16 @@ impl FlushPassSample {
 /// saturating to one cycle per tick when the unit is noise, the right act
 /// when the work is real; self-healing when the pass leaves the horizon)
 /// where the floor UNDER-priced the wave against the ceiling, which is
-/// the promise. The projection itself is NOT capped.
+/// the promise. The projection itself is NOT capped. **The over-pricing
+/// BOUND** (review round 1, Issue 4): an outlier is a horizon-MAX sample,
+/// remembered for exactly [`TERM_HORIZON_CYCLES`] pushes of its class's
+/// window — and every cycle the saturated projection makes due runs a
+/// pass that writes the promised images (or appends the dirty nodes), so
+/// every such cycle pushes a sample: at most 64 checkpoint-class cycles
+/// at one per tick (≈ 3.2 s at the 50 ms tick) before the outlier leaves
+/// the window and the trigger returns. Tie-tested
+/// (`derivation_sweep_tests::an_outlier_flush_unit_saturates_the_trigger_
+/// for_at_most_the_horizon`).
 pub fn flush_unit_ns(wall_ns: u64, count: u64) -> Option<u64> {
     (count > 0).then(|| wall_ns / count)
 }

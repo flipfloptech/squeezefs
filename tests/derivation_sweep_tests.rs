@@ -4152,3 +4152,58 @@ fn reclaim_hint_ino_cap_ties_to_the_forget_reclaim_batch_ceiling() {
         "one forward: the moved-once schedule"
     );
 }
+
+/// **The over-pricing bound the unit's grain-floor deletion exposes**
+/// (symmetric PR 13h, review round 1, Issue 4): with `flush_unit_ns =
+/// wall / count` one OUTLIER pass (count 1, a device hiccup of X ms) sets
+/// the horizon-MAX image unit to X, and `promised × X` at or past the max
+/// age saturates the trigger to 0 — a checkpoint-class cycle per tick.
+/// The bound: the outlier is REMEMBERED for exactly `TERM_HORIZON_CYCLES`
+/// pushes of the class's window (every saturated cycle's pass writes the
+/// promised images, so every such cycle pushes a sample), then leaves it
+/// and the trigger returns — ≤ 64 early cycles (≈ 3.2 s at the 50 ms
+/// tick), self-healing, never a widened ceiling. A projection is never
+/// capped: the saturation is the honest response when the work is real
+/// and a bounded cost when the unit was noise. Pinned on the pure
+/// functions: the outlier saturates; 63 sane pushes keep it (a maximum,
+/// not a mean); the 64th evicts it and the trigger is the sane unit's.
+#[test]
+fn an_outlier_flush_unit_saturates_the_trigger_for_at_most_the_horizon() {
+    use squeezefs::meta_backend::kv::checkpoint::{
+        checkpoint_trigger_ms, flush_unit_ns, projected_flush_wall_ns, CycleTermWindow,
+        CHECKPOINT_MAX_AGE_MS, TERM_HORIZON_CYCLES,
+    };
+    let ms = 1_000_000u64;
+    let max_age = CHECKPOINT_MAX_AGE_MS as u64;
+    let promised = 38u64; // the box's wave
+    let sane = flush_unit_ns(4 * ms, 1).expect("a pass with the class"); // 4 ms per image
+    let outlier = flush_unit_ns(200 * ms, 1).expect("one hiccup pass"); // 200 ms per image
+    let trigger_at = |image_unit: u64| {
+        let flush = projected_flush_wall_ns(0, 0, promised, image_unit);
+        checkpoint_trigger_ms(max_age, flush / ms)
+    };
+    // The sane unit prices the wave inside the age: a trigger stands.
+    assert!(trigger_at(sane) > 0, "38 × 4 ms = 152 ms leaves a trigger");
+    // The outlier saturates it.
+    let mut w = CycleTermWindow::new();
+    w.push(outlier);
+    assert_eq!(
+        trigger_at(w.anticipated_ns()),
+        0,
+        "38 × 200 ms past the max age: a cycle per tick"
+    );
+    // A MAXIMUM: 63 sane pushes keep the outlier in force.
+    for _ in 0..TERM_HORIZON_CYCLES - 1 {
+        w.push(sane);
+        assert_eq!(w.anticipated_ns(), outlier);
+    }
+    assert_eq!(trigger_at(w.anticipated_ns()), 0);
+    // The 64th push evicts it: the trigger returns to the sane unit's.
+    w.push(sane);
+    assert_eq!(w.anticipated_ns(), sane);
+    assert_eq!(trigger_at(w.anticipated_ns()), trigger_at(sane));
+    assert_eq!(
+        TERM_HORIZON_CYCLES, 64,
+        "the bound stated in the code: 64 pushes"
+    );
+}

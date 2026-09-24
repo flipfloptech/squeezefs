@@ -15393,6 +15393,35 @@ async fn a_readers_forget_of_a_corpse_takes_no_grant_and_withholds_nothing() {
         0,
         "the corpse stands at the holder, exact, for its own FORGET path"
     );
+    // …and that path is what reclaims it (review round 2, Issue 15; round
+    // 3, Issue 18 — the body the round-2 commit lost): the HOLDER's kernel
+    // FORGETs — the unlinker's forget, never a reader's — and its own
+    // reclaim destroys the corpse; a file only a reader had open leaks
+    // nothing.
+    // The posture word is PROCESS-wide (`-o ro` sets it at the mount): the
+    // holder's daemon is another process on a fleet, so its reclaim runs
+    // outside the reader posture here.
+    drop(_posture);
+    let mf = fs_in_front_of(&manager, "sqz-13h-reader-holder").await;
+    mf.fs.reclaim_orphaned_batch(vec![victim]).await;
+    wait_destroyed(
+        &manager,
+        victim,
+        "Issue 15: the holder's own FORGET path reclaims the corpse the reader forgot",
+    )
+    .await;
+    let f2 = reclaim_faces_all();
+    assert_eq!(f2.refused, f0.refused, "the holder's destroy committed");
+    assert_eq!(
+        (f2.served, f2.foreign, f2.unleased, f2.hints_shipped),
+        (f1.served, f1.foreign, f1.unleased, f1.hints_shipped),
+        "the holder's own forget is nobody's hint"
+    );
+    assert!(
+        reader.getattr(victim).await.is_err(),
+        "the reader reads the corpse gone at its next resolve (a divert to the holder)"
+    );
+    drop(mf);
     drop(rf);
     for v in &reader.volumes {
         v.shutdown().await.unwrap();

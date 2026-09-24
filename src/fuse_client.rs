@@ -10591,11 +10591,35 @@ impl SqueezefsFilesystem {
         if ino <= 1 || is_virtual_ino(ino) {
             return;
         }
+        if Self::reader_forget(ino) {
+            return;
+        }
         if self.is_open(ino) {
             return;
         }
         self.ensure_reclaim_pool();
         self.reclaim_enqueue.enqueue(ino);
+    }
+
+    /// **A `-o ro` reader's FORGET reclaims nothing** (symmetric PR 13h,
+    /// review round 1, Issue 2): a reader owns no slot and mutates no
+    /// plane (S5 — its session writes ZERO bytes), so the FORGET handler's
+    /// own acts — the attr-cache drop, the side maps — are the whole of
+    /// its forget, and the reclaim entry stops HERE: no divert `getattr`
+    /// (a Grant RPC per forgotten corpse at the holder under its `rm -rf`),
+    /// no layout fetch, no destroy priced and refused read-only into a
+    /// `destroy WITHHELD` WARN; the holder's own FORGET path reclaims the
+    /// corpse. Counted `reclaim_reader_forgets`; one relaxed load on every
+    /// write mount, where it answers `false`.
+    fn reader_forget(ino: u64) -> bool {
+        if !read_only_mount() {
+            return false;
+        }
+        METRICS
+            .reclaim_reader_forgets
+            .fetch_add(1, Ordering::Relaxed);
+        debug!("RECLAIM: ino = {ino} forgotten on a read-only mount — a reader reclaims nothing");
+        true
     }
 
     /// Spawn (or respawn) the inode-reclaim pool. The `reclaim_rx` slot
@@ -25634,6 +25658,11 @@ impl SqueezefsFilesystem {
         > = std::collections::HashMap::new();
         for ino in inos {
             if ino <= 1 || is_virtual_ino(ino) {
+                continue;
+            }
+            // A reader reclaims nothing by posture (Issue 2) — the batch
+            // entry's own gate, for the callers that reach it directly.
+            if Self::reader_forget(ino) {
                 continue;
             }
             // F-R6 (symmetric PR 13h; design §5.1 — the slot is the

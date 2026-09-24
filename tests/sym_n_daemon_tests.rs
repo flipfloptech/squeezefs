@@ -14515,11 +14515,20 @@ fn reclaim_faces() -> (u64, u64) {
 /// never prices, releases or destroys a foreign slot's object; a FORGET of
 /// one is a TOKEN CLIENT's forget — the attr cache goes (as every FORGET's
 /// does), the token stays under the plane's own recall / eviction law, and
-/// the reclaim accounts NOTHING (`reclaim_foreign_slot_forgets`, the
-/// dropped forgets); the holder's own reclaim is the lifecycle's. The
+/// the reclaim accounts NOTHING here (`reclaim_foreign_slot_forgets`);
+/// since review round 1 (Issue 1) the forget TRAVELS to the slot's holder
+/// as a reclaim hint the holder runs as its own FORGET — this fixture
+/// installs no hint sink at the manager, so the hint is counted misrouted
+/// there and the holder's own FORGET path below is what destroys the
+/// corpses (the hint law's own pins are the two after this one). The
 /// predicate is the mount-time corpse sweep's (`inode_plane_owns_slot` —
 /// leased here, or unleased on the manager), read at the reclaim's entry
-/// BEFORE any layout, xattr or reference read.
+/// BEFORE any layout, xattr or reference read; the witnesses that it was
+/// (Issue 7) are READ-side — the holder's `grants_served` unmoved across
+/// the batch (no divert getattr, no layout fetch) and
+/// `meta_kv_projection_walk_exhaustions` unmoved — beside the apply belt
+/// `meta_kv_leaf_lease_refusals`, which counts refused APPLIES and says
+/// only that no priced destroy reached a commit.
 ///
 /// Two sets of the manager's corpses, one reclaim batch at the joiner:
 /// the FRESH set — unlinked and checkpointed BEFORE the joiner opened, so
@@ -14660,10 +14669,30 @@ async fn a_joiners_forget_of_a_foreign_slots_ino_prices_no_destroy_and_reclaims_
         );
     }
 
-    // The joiner's kernel FORGETs every one → its reclaim path.
+    // The joiner's kernel FORGETs every one → its reclaim path. The
+    // read-side witnesses (review round 1, Issue 7): the manager's token
+    // plane serves NO grant across the batch — the admission `getattr`
+    // and the plan's layout read are divert round trips, so an unmoved
+    // `grants_served` says neither ran — and no projection walk exhausted
+    // its budget (the box's first face).
     let (refused0, foreign0) = reclaim_faces();
+    let grants_before = mholder.stats().grants_served;
+    let exhaustions0 = squeezefs::meta_backend::kv::META_KV_PROJECTION_WALK_EXHAUSTIONS
+        .load(std::sync::atomic::Ordering::Relaxed);
     jf.fs.reclaim_orphaned_batch(corpses.clone()).await;
     let (refused1, foreign1) = reclaim_faces();
+    assert_eq!(
+        mholder.stats().grants_served,
+        grants_before,
+        "the joiner's forgets took NO grant at the holder: no divert getattr, no layout fetch \
+         (the read-side witness — grants_served)"
+    );
+    assert_eq!(
+        squeezefs::meta_backend::kv::META_KV_PROJECTION_WALK_EXHAUSTIONS
+            .load(std::sync::atomic::Ordering::Relaxed),
+        exhaustions0,
+        "no projection walk ran to its budget (meta_kv_projection_walk_exhaustions)"
+    );
     assert_eq!(
         refused1 - refused0,
         0,
@@ -14688,11 +14717,14 @@ async fn a_joiners_forget_of_a_foreign_slots_ino_prices_no_destroy_and_reclaims_
             0
         );
     }
+    // The APPLY belt (`meta_kv_leaf_lease_refusals` counts a commit's apply
+    // refused at a leaf this mount does not lease — never a read): stays 0
+    // because no priced destroy reached the joiner's commit path either.
     assert_eq!(
         squeezefs::meta_backend::kv::META_KV_LEAF_LEASE_REFUSALS
             .load(std::sync::atomic::Ordering::Relaxed),
         0,
-        "no belt refusal: the foreign slot's tree was never touched"
+        "the apply belt never fired: no foreign destroy reached a commit"
     );
 
     // The HOLDER's own reclaim is the law: its FORGET path destroys them.

@@ -12575,6 +12575,7 @@ impl SqueezefsFilesystem {
                 // answered ENOENT — an inode it does not hold; the expected
                 // outcome, counted here instead of a WARN per call.
                 "fuse3_notify_enoent": fuse3::notify_enoent(),
+                "fuse3_notify_failed": fuse3::notify_failed(),
                 // Write-commit-economy (2026-07-30): lever-1 coalescing
                 // engagement (blocks/batch = the live coalesce factor)
                 // and lever-2 layout-delta engagement (delta vs full

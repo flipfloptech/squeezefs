@@ -102,9 +102,16 @@ pub enum ReplyWriteVerdict {
 /// the kernel already forgot (the fourth box pass: 272 k / 275 k WARN
 /// lines per row set, a 46 % / 21 % SUBSET of
 /// `served_mutation_{invals,prunes}`) — counted, never
-/// logged; a notification's other errno is logged and never ends the
-/// task (it owes the kernel nothing). A request's reply keeps the shipped
-/// law: `ENOENT` = an interrupted request (the WARN), anything else fatal.
+/// logged; a notification's other errno is counted per frame and
+/// announced once per errno class (`fuse3_notify_failed` — the post-abort
+/// `ENODEV` storm), and never ends the task (it owes the kernel nothing):
+/// **the notify arm takes no part in the session's teardown** — the
+/// dispatch task's read failure ends the session, and the reply task
+/// ends with it through the `select!`, never through a notification's
+/// outcome (before PR 13h an unexpected errno on a notification ended the
+/// reply task with the session's replies behind it). A request's reply
+/// keeps the shipped law: `ENOENT` = an interrupted request (the WARN),
+/// anything else fatal.
 #[doc(hidden)]
 pub fn reply_write_verdict(is_notify: bool, kind: ErrorKind) -> ReplyWriteVerdict {
     match (is_notify, kind) {
@@ -1134,7 +1141,18 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         continue;
                     }
                     ReplyWriteVerdict::NotifyFailed => {
-                        warn!("notify write to /dev/fuse failed {}", err);
+                        // Counted per frame, announced ONCE per errno class
+                        // (`fuse3_notify_failed`): after a connection abort
+                        // every detached notification answers ENODEV until
+                        // the daemon's teardown drops the planes.
+                        let errno = err.raw_os_error().unwrap_or(0);
+                        if crate::raw::read_phase::note_notify_failed(errno) {
+                            warn!(
+                                "notify write to /dev/fuse failed {} — counted from here on \
+                                 (fuse3_notify_failed), announced once per errno class",
+                                err
+                            );
+                        }
                         continue;
                     }
                     ReplyWriteVerdict::InterruptedRequest => {

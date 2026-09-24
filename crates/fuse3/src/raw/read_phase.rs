@@ -376,6 +376,50 @@ pub fn notify_enoent() -> u64 {
     NOTIFY_ENOENT.load(Ordering::Relaxed)
 }
 
+static NOTIFY_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// The errno classes a failed notification has ANNOUNCED — one WARN per
+/// class for the process's life (0 = an empty slot). Bounded: a
+/// notification's errnos are a handful (`ENODEV` after a connection
+/// abort, `EBADF`, `EINVAL`), so a full set means the class is counted
+/// and never announced — the storm stays a count either way.
+const NOTIFY_FAILED_CLASSES: usize = 8;
+static NOTIFY_FAILED_ANNOUNCED: [std::sync::atomic::AtomicI32; NOTIFY_FAILED_CLASSES] =
+    [const { std::sync::atomic::AtomicI32::new(0) }; NOTIFY_FAILED_CLASSES];
+
+/// Count one daemon-initiated notification the kernel answered with an
+/// errno other than `ENOENT` (symmetric PR 13h, review round 1, Issue 5),
+/// and say whether this is the FIRST of its errno class — the caller's
+/// one WARN per class (the announced-once precedent): after a
+/// FUSE-connection abort every detached notification until the daemon's
+/// teardown answers `ENODEV`, and the first build WARNed per frame. A
+/// full announced set answers `false` — counted, never announced.
+#[inline]
+pub(crate) fn note_notify_failed(errno: i32) -> bool {
+    NOTIFY_FAILED.fetch_add(1, Ordering::Relaxed);
+    let key = if errno == 0 { i32::MIN } else { errno };
+    for slot in &NOTIFY_FAILED_ANNOUNCED {
+        match slot.compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(cur) if cur == key => return false,
+            Err(_) => continue,
+        }
+    }
+    false
+}
+
+/// Notifications the kernel answered with an errno other than `ENOENT`
+/// (stats inode `fuse3_notify_failed`): `ENODEV` after a FUSE-connection
+/// abort until the daemon's teardown drops the planes (the expected
+/// shape), anything else a kernel that refused a well-formed
+/// notification. Counted per frame, announced once per errno class; a
+/// failed notification never ends the reply task — the notify arm takes
+/// no part in the session's teardown (the dispatch task's read failure
+/// does).
+pub fn notify_failed() -> u64 {
+    NOTIFY_FAILED.load(Ordering::Relaxed)
+}
+
 // ---------------------------------------------------------------------------
 // The FUSED-op timeline (write-IOPS campaign, 2026-08-11): three engaged
 // levers (guard convoy, pass funnel, purge economy) left rand-4k pinned at

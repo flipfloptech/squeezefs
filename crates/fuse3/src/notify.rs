@@ -610,4 +610,40 @@ mod tests {
         crate::raw::read_phase::note_notify_enoent();
         assert_eq!(crate::raw::read_phase::notify_enoent(), before + 1);
     }
+
+    /// **A notification's OTHER errno is counted per frame and announced
+    /// ONCE per errno class** (symmetric PR 13h, review round 1, Issue 5):
+    /// after a FUSE-connection abort the served-mutation hook's detached
+    /// notifications keep flowing until the daemon's teardown drops the
+    /// planes, each answered `ENODEV` — the first build WARNed per frame
+    /// (a storm of one line per notification). `note_notify_failed(errno)`
+    /// counts every call (`fuse3_notify_failed`) and answers `true` for the
+    /// FIRST call of each errno value — the announced-once precedent — and
+    /// `false` after; a second errno class announces once on its own; the
+    /// announced set is bounded (past its capacity a new class is counted,
+    /// never announced — the storm stays a count). RED before: no counter,
+    /// no once-word, a WARN per frame.
+    #[test]
+    fn a_notifications_other_errno_is_counted_per_frame_and_announced_once_per_class() {
+        use crate::raw::read_phase::{note_notify_failed, notify_failed};
+        let before = notify_failed();
+        // Two errno values no other test announces.
+        let a = 1_000_019;
+        let b = 1_000_023;
+        assert!(
+            note_notify_failed(a),
+            "the first ENODEV-class frame announces"
+        );
+        assert!(
+            !note_notify_failed(a),
+            "the second is counted, never announced"
+        );
+        assert!(!note_notify_failed(a));
+        assert!(
+            note_notify_failed(b),
+            "another errno class announces once on its own"
+        );
+        assert!(!note_notify_failed(b));
+        assert_eq!(notify_failed(), before + 5, "every frame is counted");
+    }
 }

@@ -1163,26 +1163,27 @@ impl FlushPassSample {
 /// BOUND, so the units it anticipates with must be bounds; a mean unit
 /// under-prices every above-mean pass, and a machine that slows under a
 /// storm raises the bound at the first slow pass instead of an eighth per
-/// pass). **The unit's noise bound** (review round 1, Issue 10b): a unit
-/// is a MEAN over one pass's count, so a pass of ONE node with a device
-/// hiccup would read that hiccup as the per-node cost of every node for
-/// the horizon — the wall is spread over at least
-/// [`FLUSH_UNIT_COUNT_FLOOR`] (one SMO's grain: below it a pass cannot
-/// separate a per-node cost from a per-pass one), so a short pass moves
-/// the unit by at most its wall over the grain, while a pass at or past
-/// the grain measures exactly. The projection itself is NOT capped —
-/// a projection at or past the max age saturates the trigger to 0, one
-/// cycle per tick, the right act when the work is real and the cost when
-/// the unit is noise: bounded to `1/grain` of a hiccup per node and
-/// self-healing when the pass leaves the horizon.
+/// pass). **The unit is the pass's mean per ITEM, over the count it ran**
+/// (PR 13h — the fourth box pass's trip, read off its own snapshots):
+/// PR 13g's build spread a short pass's wall over a grain of four (review
+/// round 1, Issue 10b — one node with a device hiccup would otherwise
+/// read the hiccup as every node's cost for the horizon), so a pass of
+/// two images read HALF its per-image cost and one image a QUARTER; under
+/// a create storm the passes that measure the image unit are the
+/// threshold drain's one-or-two-compaction ticks, while the 64 rotor
+/// leaves fill in lockstep and the cycle inherits the wave — the box's
+/// manager priced 38 promised images at 2.04 ms, its trip pass measured
+/// them at 3.97 (38 × 3.97 = 151 = the trip cycle's term). A bound must
+/// bound: the floor made the unit a FRACTION of what its own pass paid.
+/// The hiccup's cost now runs in the direction the law allows — a small
+/// pass with an outlier OVER-prices the horizon (an earlier trigger,
+/// saturating to one cycle per tick when the unit is noise, the right act
+/// when the work is real; self-healing when the pass leaves the horizon)
+/// where the floor UNDER-priced the wave against the ceiling, which is
+/// the promise. The projection itself is NOT capped.
 pub fn flush_unit_ns(wall_ns: u64, count: u64) -> Option<u64> {
-    (count > 0).then(|| wall_ns / count.max(FLUSH_UNIT_COUNT_FLOOR))
+    (count > 0).then(|| wall_ns / count)
 }
-
-/// The count a flush pass's unit is measured over at least — one SMO's
-/// grain, [`super::appender::SMO_IMAGES_MAX`] nodes / images (Issue 10b:
-/// a unit read off fewer writes is one write's outlier, spread here).
-pub const FLUSH_UNIT_COUNT_FLOOR: u64 = super::appender::SMO_IMAGES_MAX as u64;
 
 /// **The LIVE projection of the next cycle's flush wall** (PR 13g,
 /// F-B1): the dirty nodes the pass will write times the measured per-node

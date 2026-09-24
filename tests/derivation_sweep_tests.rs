@@ -2865,7 +2865,7 @@ fn sym_appender_ring_derives_from_the_reserve_and_the_solo_ring() {
 fn checkpoint_projection_prices_the_pending_work_from_measured_units() {
     use squeezefs::meta_backend::kv::checkpoint::{
         checkpoint_trigger_ms, flush_unit_ns, projected_flush_wall_ns, CycleTermWindow,
-        FlushPassSample, CHECKPOINT_MAX_AGE_MS, FLUSH_UNIT_COUNT_FLOOR, TERM_HORIZON_CYCLES,
+        FlushPassSample, CHECKPOINT_MAX_AGE_MS, TERM_HORIZON_CYCLES,
     };
     let ms = 1_000_000u64;
     // One pass's unit: the wall over the count; none without the class.
@@ -2876,27 +2876,24 @@ fn checkpoint_projection_prices_the_pending_work_from_measured_units() {
     );
     assert_eq!(flush_unit_ns(999 * ms, 0), None, "…whatever its wall");
     assert_eq!(flush_unit_ns(80 * ms, 40), Some(2 * ms));
-    // The unit's noise bound (review round 1, Issue 10b): a pass under one
-    // SMO's grain spreads its wall over the grain — a one-node pass with a
-    // 30 ms device hiccup moves the unit by 7.5 ms, never 30 — while a pass
-    // at or past the grain measures exactly. The grain IS `SMO_IMAGES_MAX`.
+    // The unit is the pass's mean per ITEM over the count it ran (PR 13h,
+    // the fourth box pass's trip): PR 13g's grain floor spread a short
+    // pass's wall over four, so a one-image pass read a quarter of its
+    // per-image cost and a two-image pass half — the box's manager priced
+    // a 38-image wave at 2.04 ms per image and paid 3.97. A bound must
+    // bound: one image at 30 ms IS 30 ms per image, three at 30 ms 10 each.
+    assert_eq!(flush_unit_ns(30 * ms, 1), Some(30 * ms));
+    assert_eq!(flush_unit_ns(30 * ms, 2), Some(15 * ms));
+    assert_eq!(flush_unit_ns(30 * ms, 3), Some(10 * ms));
+    assert_eq!(flush_unit_ns(30 * ms, 5), Some(6 * ms));
+    // The box's arithmetic on the fixed law: a two-image pass at 3.97 ms
+    // each prices a 38-image wave at its wall.
+    let unit = flush_unit_ns(2 * 3_970_000, 2).unwrap();
     assert_eq!(
-        FLUSH_UNIT_COUNT_FLOOR,
-        u64::from(squeezefs::meta_backend::kv::appender::SMO_IMAGES_MAX)
+        38 * unit / ms,
+        150,
+        "38 × 3.97 ms = the trip cycle's 151 ms term"
     );
-    assert_eq!(FLUSH_UNIT_COUNT_FLOOR, 4);
-    assert_eq!(flush_unit_ns(30 * ms, 1), Some(30 * ms / 4));
-    assert_eq!(
-        flush_unit_ns(30 * ms, 3),
-        Some(30 * ms / 4),
-        "under the grain the wall is spread over the grain, never the count"
-    );
-    assert_eq!(
-        flush_unit_ns(30 * ms, 4),
-        Some(30 * ms / 4),
-        "exact at the grain"
-    );
-    assert_eq!(flush_unit_ns(30 * ms, 5), Some(6 * ms), "…and past it");
     // The unit in force: the horizon maximum over the passes that ran the
     // class — a slow pass raises it at once, a quiet pass leaves it.
     let mut w = CycleTermWindow::new();

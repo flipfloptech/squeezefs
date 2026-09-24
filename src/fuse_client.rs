@@ -6203,6 +6203,15 @@ pub struct Metrics {
     /// volume, never a leak (the pre-fix shape destroyed the record and
     /// orphaned every reference forever — permanent C8 drift).
     pub reclaim_destroy_refused_release_failed: Align64<AtomicU64>,
+    /// FORGETs of an ino whose forest slot this mount does NOT reclaim —
+    /// a slot another appender leases, or an unleased one on a joined
+    /// appender (symmetric PR 13h, F-R6): the kernel forgot an object this
+    /// mount merely cached as a TOKEN CLIENT, and the reclaim accounts
+    /// nothing for it (no layout / xattr / reference read, no destroy —
+    /// the holder's own reclaim is the lifecycle's). The box's joiner read
+    /// 6,782 `destroy WITHHELD` per row set pricing the manager's corpses
+    /// off its stale projection. 0 on every unarmed mount by construction.
+    pub reclaim_foreign_slot_forgets: Align64<AtomicU64>,
     /// Joint release+destroy entries committed (each carried ≥ 1
     /// reference release beside its inode/xattr `Delete`s) — the
     /// engagement instrument: a reclaim batch of N block-owning corpses
@@ -11804,6 +11813,7 @@ impl SqueezefsFilesystem {
                 "block_release_skipped_no_record": METRICS.block_release_skipped_no_record.load(Ordering::Relaxed),
                 // RECLAIM-ATOMIC
                 "reclaim_destroy_refused_release_failed": METRICS.reclaim_destroy_refused_release_failed.load(Ordering::Relaxed),
+                "reclaim_foreign_slot_forgets": METRICS.reclaim_foreign_slot_forgets.load(Ordering::Relaxed),
                 "reclaim_release_destroy_joint_commits": METRICS.reclaim_release_destroy_joint_commits.load(Ordering::Relaxed),
                 "reclaim_single_ino_chunked_destroys": METRICS.reclaim_single_ino_chunked_destroys.load(Ordering::Relaxed),
                 "block_live_free_refusals": METRICS.block_live_free_refusals.load(Ordering::Relaxed),

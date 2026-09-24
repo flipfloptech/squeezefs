@@ -13852,3 +13852,271 @@ async fn a_storms_onset_after_a_quiet_horizon_lands_inside_the_managers_ceiling(
     drop(manager);
     fsck_clean(&uris).await;
 }
+
+// ---------------------------------------------------------------------------
+// PR 13h — F-R6: a token client's FORGET-driven reclaim on a foreign slot
+// (the fourth box pass, the record's §3.9.6.3).
+// ---------------------------------------------------------------------------
+
+fn reclaim_faces() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let m = &squeezefs::fuse_client::METRICS;
+    (
+        m.reclaim_destroy_refused_release_failed.load(Relaxed),
+        m.reclaim_foreign_slot_forgets.load(Relaxed),
+    )
+}
+
+/// **F-R6 (the fourth box pass, §3.9.6.3 — PR 12b's reclaim path × PR 5's
+/// token planes): a joined writer's FORGET-driven reclaim of an ino in a
+/// slot it does NOT lease reclaims NOTHING.** On the box m60 — a joiner
+/// whose kernel had instantiated 40 k of the MANAGER's inodes as a token
+/// client (the leg's acked-writes check read the manager's tree through
+/// it) — met the manager's `rm -rf`: the unlink commits recalled its
+/// tokens, its recall sink invalidated + pruned, the kernel FORGOT, and
+/// its reclaim ADMITTED every foreign ino (a divert read of the corpse at
+/// the holder answered `nlink 0`), PRICED its destroy off this daemon's
+/// own stale PROJECTION of the manager's trees (`destroy_entry_bytes`'s
+/// xattr walk — pointers into extents the holder had retired, freed and
+/// re-granted: zeros, rule-4-screened frames, defect 18 / 34's 256-restart
+/// loop on 60+ slots) and, where the pricing read anything, drove the
+/// destroy into its own commit path — `destroy_inodes`' live-nlink skip
+/// judged the corpse LIVE off the same stale projection, or the door
+/// refused the foreign slot (`SlotBusy`): 6,782 / 7,266 `destroy WITHHELD`
+/// WARNs per row set, `reclaim_destroy_refused_release_failed` +121 /
+/// +742 — nothing destroyed (the withhold is the fail-safe), a CPU + log
+/// storm on a path a token client must never take.
+///
+/// The law (design §5.1 — the slot is the ownership unit): a non-holder
+/// never prices, releases or destroys a foreign slot's object; a FORGET of
+/// one is a TOKEN CLIENT's forget — the attr cache goes (as every FORGET's
+/// does), the token stays under the plane's own recall / eviction law, and
+/// the reclaim accounts NOTHING (`reclaim_foreign_slot_forgets`, the
+/// dropped forgets); the holder's own reclaim is the lifecycle's. The
+/// predicate is the mount-time corpse sweep's (`inode_plane_owns_slot` —
+/// leased here, or unleased on the manager), read at the reclaim's entry
+/// BEFORE any layout, xattr or reference read.
+///
+/// Two sets of the manager's corpses, one reclaim batch at the joiner:
+/// the FRESH set — unlinked and checkpointed BEFORE the joiner opened, so
+/// its projection is exact and the base's pricing walk succeeds into the
+/// door, which refuses the foreign slot: the deterministic RED
+/// (`reclaim_destroy_refused_release_failed` +N, N `destroy WITHHELD`
+/// WARNs — the box's second face); and the TOKEN set — created after the
+/// join, read by the joiner through its divert (the manager's
+/// `grants_served` moves), unlinked at the holder (the recall), standing
+/// as `nlink 0` corpses there (this fixture has no kernel at the manager,
+/// so no FORGET reaches its reclaim — the window between the box's `rm
+/// -rf` and the manager's own FORGETs): the base's pricing walks the
+/// STALE projection and `destroy_inodes`' live-nlink skip reads the corpse
+/// as `nlink 1` there — nothing destroyed, nothing counted, the foreign
+/// tree WALKED (the box's first face, where that walk met recycled
+/// extents). GREEN: the refused gauge unmoved, `reclaim_foreign_slot_
+/// forgets` +2N, every corpse standing at the holder with `nlink 0` until
+/// the HOLDER's own reclaim destroys it; the joiner's OWN file's forget
+/// reclaims as before (its slot), the manager's own forgets never count as
+/// foreign.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiners_forget_of_a_foreign_slots_ino_prices_no_destroy_and_reclaims_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let mvenue = DaemonVenue::stand_up(&manager, true, "manager-custody-13h-forget").await;
+    // The manager's files in a slot IT leases (its first touch of the
+    // seeded directory takes it — the box's shape: the manager's rotor
+    // slots, never the joiner's). The FRESH set is unlinked before the
+    // join: `nlink 0` corpses the joiner's projection will name exactly.
+    let fresh = create_files(&manager, shared, "fresh", 8).await;
+    let token = create_files(&manager, shared, "tok", 8).await;
+    assert!(
+        matches!(
+            tree0_state(&mvol, SLOT_A).await,
+            Some(SlotState::Leased { appender_id: 0, .. })
+        ),
+        "the premise: the manager leases the files' slot"
+    );
+    for (name, _) in &fresh {
+        manager
+            .unlink(shared, name)
+            .await
+            .expect("the holder's unlink");
+    }
+    mvol.checkpoint_now().await.expect("checkpoint");
+
+    let joiner = {
+        Knobs::armed().apply();
+        let r = open_routed_meta_set_joined(
+            &uris,
+            &JoinedSetAdmission {
+                manager_endpoint: mvenue.endpoint.clone(),
+                secret: VENUE_SECRET.to_vec(),
+                peer_id: peer_of(&joiner_identity(&mvol, 71).await),
+                identity: joiner_identity(&mvol, 71).await,
+            },
+        )
+        .await;
+        Knobs::clear();
+        r.expect("the joined open")
+    };
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    assert!(
+        !jvol.inode_plane_owns_slot(joiner.route_ino(token[0].1).1),
+        "the premise: the files' slot is FOREIGN to the joiner's reclaim"
+    );
+    // The JOINER is this process's reading writer: PR 9's custody arm over
+    // ITS set (the mount path's `arm_mount_slot_custody`) — its divert
+    // dials the manager's token plane.
+    let sink = Arc::new(ProbeSink {
+        calls: std::sync::atomic::AtomicU64::new(0),
+    });
+    let for_arm = Arc::clone(&sink);
+    let _arm = squeezefs::data_grant::arm_slot_custody(
+        &joiner,
+        &squeezefs::cowriter::node_member_id_of(
+            jvol.joined_wire().unwrap().identity.node_token,
+            jvol.joined_wire().unwrap().identity.mount_slot,
+        ),
+        VENUE_SECRET.to_vec(),
+        0,
+        Arc::new(move |_volume| {
+            Arc::clone(&for_arm) as Arc<dyn squeezefs::meta_ship::token_plane::RecallDataSink>
+        }),
+    );
+    let mholder = mvol.token_holder().expect("the manager is a token holder");
+    let served0 = mholder.stats().grants_served;
+    // The joiner reads every TOKEN-set file through its divert — a token
+    // client of the manager's slot (the box: the acked-writes check
+    // through m60).
+    for (name, ino) in &token {
+        let got = joiner
+            .lookup(shared, name)
+            .await
+            .expect("the joiner's lookup");
+        assert_eq!(got.ino, *ino);
+        joiner.getattr(*ino).await.expect("the joiner's getattr");
+    }
+    assert!(
+        mholder.stats().grants_served > served0,
+        "the premise: the files came to the joiner as TOKENS ({} → {})",
+        served0,
+        mholder.stats().grants_served
+    );
+
+    // The FUSE layer in front of the JOINER: the FORGET path's reclaim.
+    let jf = fs_in_front_of(&joiner, "vol-13h-forget-j").await;
+
+    // The manager unlinks the TOKEN set: `nlink 0` corpses standing at the
+    // holder; the unlink commits recall the joiner's tokens.
+    let recalls0 = mholder.stats().recalls;
+    for (name, _) in &token {
+        manager
+            .unlink(shared, name)
+            .await
+            .expect("the holder's unlink");
+    }
+    assert!(
+        mholder.stats().recalls > recalls0,
+        "the unlinks recalled the joiner's tokens"
+    );
+    let corpses: Vec<u64> = fresh.iter().chain(&token).map(|(_, ino)| *ino).collect();
+    for ino in &corpses {
+        assert_eq!(
+            manager
+                .getattr(*ino)
+                .await
+                .expect("the corpse stands")
+                .nlink,
+            0,
+            "the premise: the unlinked record stands at the holder with nlink 0"
+        );
+    }
+
+    // The joiner's kernel FORGETs every one → its reclaim path.
+    let (refused0, foreign0) = reclaim_faces();
+    jf.fs.reclaim_orphaned_batch(corpses.clone()).await;
+    let (refused1, foreign1) = reclaim_faces();
+    assert_eq!(
+        refused1 - refused0,
+        0,
+        "F-R6: a joiner's FORGET of a FOREIGN slot's ino must never price or drive a destroy — \
+         the box's 6,782 `destroy WITHHELD` WARNs per row set were this reclaim reading its \
+         stale projection and then meeting its own door (SlotBusy) \
+         (reclaim_destroy_refused_release_failed)"
+    );
+    assert_eq!(
+        foreign1 - foreign0,
+        corpses.len() as u64,
+        "every foreign-slot forget is COUNTED and dropped (reclaim_foreign_slot_forgets)"
+    );
+    // Nothing destroyed by the joiner: the corpses stand at the holder.
+    for ino in &corpses {
+        assert_eq!(
+            manager
+                .getattr(*ino)
+                .await
+                .expect("the corpse still stands at the holder")
+                .nlink,
+            0
+        );
+    }
+    assert_eq!(
+        squeezefs::meta_backend::kv::META_KV_LEAF_LEASE_REFUSALS
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no belt refusal: the foreign slot's tree was never touched"
+    );
+
+    // The HOLDER's own reclaim is the law: its FORGET path destroys them.
+    let mf = fs_in_front_of(&manager, "vol-13h-forget-m").await;
+    mf.fs.reclaim_orphaned_batch(corpses.clone()).await;
+    let (refused2, foreign2) = reclaim_faces();
+    assert_eq!(refused2, refused1, "the holder's destroys commit");
+    assert_eq!(
+        foreign2, foreign1,
+        "the holder's own slot never counts as foreign"
+    );
+    for ino in &corpses {
+        assert!(
+            manager.getattr(*ino).await.is_err(),
+            "the holder destroyed its corpse"
+        );
+    }
+
+    // The joiner's OWN file (its rotor slot) reclaims as before.
+    let own = joiner
+        .create(1, "own", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("the joiner's own file")
+        .ino;
+    assert!(
+        jvol.inode_plane_owns_slot(joiner.route_ino(own).1),
+        "the joiner leases its own file's slot"
+    );
+    joiner.unlink(1, "own").await.expect("the joiner's unlink");
+    jf.fs.reclaim_orphaned_batch(vec![own]).await;
+    let (refused3, foreign3) = reclaim_faces();
+    assert_eq!(refused3, refused2, "an own-slot destroy commits");
+    assert_eq!(foreign3, foreign2, "an own-slot forget is never foreign");
+    assert!(
+        joiner.getattr(own).await.is_err(),
+        "the joiner destroyed its own corpse"
+    );
+    assert_must_stay_zero(&jvol, "joiner");
+    assert_must_stay_zero(&mvol, "manager");
+
+    squeezefs::data_grant::disarm_slot_custody().await;
+    drop(jf);
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    drop(mf);
+    mvenue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}

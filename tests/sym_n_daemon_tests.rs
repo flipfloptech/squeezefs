@@ -14643,6 +14643,48 @@ async fn a_joiners_forget_of_a_foreign_slots_ino_prices_no_destroy_and_reclaims_
     // The FUSE layer in front of the JOINER: the FORGET path's reclaim.
     let jf = fs_in_front_of(&joiner, "vol-13h-forget-j").await;
 
+    // **A close / forget of a colleague's LIVE file ships NO hint and asks
+    // the manager NOTHING** (review round 3, Issue 17): the joiner's
+    // STANDING TOKEN on each file reads `nlink 1` — an unlink at the
+    // holder recalls the token before it commits, so a standing token
+    // with `nlink ≥ 1` is proof the file is live and there is no corpse
+    // to reclaim; the RELEASE handler's unlink-while-open probe fires on
+    // every last close, and before the arm each such close of a foreign
+    // file resolved the slot off the manager (`ResolveSlot`, ≈ 1 manager
+    // verb per close over a 64-slot rotor) and shipped a hint the holder
+    // answered with a local read. RED on `6a5b0ff1`: hint_inos +N and
+    // the manager's `slot_resolve_rpcs` moving.
+    let live: Vec<u64> = token.iter().map(|(_, ino)| *ino).collect();
+    let l0 = reclaim_faces_all();
+    let resolves = || {
+        mvol.slot_leases()
+            .map(|p| p.resolve_rpcs.load(std::sync::atomic::Ordering::Relaxed))
+    };
+    let resolves0 = resolves();
+    jf.fs.reclaim_orphaned_batch(live.clone()).await;
+    let l1 = reclaim_faces_all();
+    assert_eq!(
+        (l1.hints_shipped, l1.hint_inos, l1.hint_failures),
+        (l0.hints_shipped, l0.hint_inos, l0.hint_failures),
+        "a live file is no corpse: the forget ships no hint (RED: {} inos hinted)",
+        l1.hint_inos - l0.hint_inos
+    );
+    assert_eq!(
+        resolves(),
+        resolves0,
+        "the forget asked the manager for no slot's lessee (slot_resolve_rpcs unmoved)"
+    );
+    assert_eq!(
+        l1.skipped_live - l0.skipped_live,
+        live.len() as u64,
+        "every live-file forget is counted on reclaim_hint_skipped_live"
+    );
+    assert_eq!(l1.refused, l0.refused, "nothing priced or withheld");
+    for (name, ino) in &token {
+        let got = joiner.lookup(shared, name).await.expect("still there");
+        assert_eq!(got.ino, *ino, "the live file stands at the holder");
+    }
+
     // The manager unlinks the TOKEN set: `nlink 0` corpses standing at the
     // holder; the unlink commits recall the joiner's tokens.
     let recalls0 = mholder.stats().recalls;
@@ -14900,6 +14942,7 @@ struct ReclaimFaces {
     served: u64,
     forwarded: u64,
     misrouted: u64,
+    skipped_live: u64,
 }
 
 fn reclaim_faces_all() -> ReclaimFaces {
@@ -14915,6 +14958,7 @@ fn reclaim_faces_all() -> ReclaimFaces {
         served: m.reclaim_hints_served.load(Relaxed),
         forwarded: m.reclaim_hints_forwarded.load(Relaxed),
         misrouted: m.reclaim_hints_misrouted.load(Relaxed),
+        skipped_live: m.reclaim_hint_skipped_live.load(Relaxed),
     }
 }
 

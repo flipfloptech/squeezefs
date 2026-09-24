@@ -6244,6 +6244,16 @@ pub struct Metrics {
     /// bound reached, or their reclaimer unreachable) — dropped, never
     /// read; the corpse's reclaimer is its next holder's sweep.
     pub reclaim_hints_misrouted: Align64<AtomicU64>,
+    /// FORGETs of a foreign-slot ino whose STANDING TOKEN here reads
+    /// `nlink ≥ 1` (PR 13h review round 3, Issue 17): the file is LIVE at
+    /// its holder — an unlink there recalls the token before it commits —
+    /// so there is no corpse and no hint; the RELEASE handler's
+    /// unlink-while-open probe fires on every last close, and before this
+    /// arm each such close of a colleague's file resolved the slot off
+    /// the manager (≈ one `ResolveSlot` per close over a 64-slot rotor)
+    /// and shipped a hint the holder answered with a local read. The
+    /// cache entry is dropped as on every forget; nothing travels.
+    pub reclaim_hint_skipped_live: Align64<AtomicU64>,
     /// FORGETs on a `-o ro` READER (PR 13h review round 1, Issue 2): a
     /// reader owns no slot and reclaims nothing by posture (S5 — its
     /// session writes ZERO bytes), so its forget drops the cache entry and
@@ -11886,6 +11896,7 @@ impl SqueezefsFilesystem {
                 "reclaim_hints_forwarded": METRICS.reclaim_hints_forwarded.load(Ordering::Relaxed),
                 "reclaim_hints_misrouted": METRICS.reclaim_hints_misrouted.load(Ordering::Relaxed),
                 "reclaim_reader_forgets": METRICS.reclaim_reader_forgets.load(Ordering::Relaxed),
+                "reclaim_hint_skipped_live": METRICS.reclaim_hint_skipped_live.load(Ordering::Relaxed),
                 "reclaim_release_destroy_joint_commits": METRICS.reclaim_release_destroy_joint_commits.load(Ordering::Relaxed),
                 "reclaim_single_ino_chunked_destroys": METRICS.reclaim_single_ino_chunked_destroys.load(Ordering::Relaxed),
                 "block_live_free_refusals": METRICS.block_live_free_refusals.load(Ordering::Relaxed),

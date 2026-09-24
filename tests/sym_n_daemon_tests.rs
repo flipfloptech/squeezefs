@@ -14273,6 +14273,10 @@ async fn a_wave_of_promised_images_is_priced_at_the_per_image_cost_the_passes_me
     /// Fill rounds before the wave forms are a fixture failure.
     const ROUNDS_MAX: u32 = 200;
     const MAX_ATTEMPTS: u32 = 3;
+    /// The pass's measured wall per image, µs (0 for a pass with none).
+    fn per_image_us(t: &squeezefs::meta_backend::kv::checkpoint::CycleTape) -> u64 {
+        (t.image_ms * 1000).checked_div(t.images).unwrap_or(0)
+    }
     let dir = cadence_venue_dir();
     let _g = SEAM.lock().await;
     reset_process_state();
@@ -14347,11 +14351,7 @@ async fn a_wave_of_promised_images_is_priced_at_the_per_image_cost_the_passes_me
         eprintln!(
             "F-B1 wave: attempt {attempt} — the pilot filled in {pilot_rounds} rounds; its pass: \
              {pilot_tape}; image unit in force {unit_us} µs against the pass's {} µs per image",
-            if pilot_tape.images > 0 {
-                pilot_tape.image_ms * 1000 / pilot_tape.images
-            } else {
-                0
-            }
+            per_image_us(&pilot_tape)
         );
         assert!(
             pilot_tape.images >= 1,
@@ -14380,11 +14380,7 @@ async fn a_wave_of_promised_images_is_priced_at_the_per_image_cost_the_passes_me
         eprintln!(
             "F-B1 wave: attempt {attempt} — the wave cycle's tape: {tape}; {overruns} overrun(s); \
              the pass's per-image wall {} µs against the unit it was priced at {} µs",
-            if tape.images > 0 {
-                tape.image_ms * 1000 / tape.images
-            } else {
-                0
-            },
+            per_image_us(&tape),
             tape.image_unit_us
         );
         squeezefs::uring_fs::disarm_device_latency(&path);
@@ -14420,11 +14416,7 @@ async fn a_wave_of_promised_images_is_priced_at_the_per_image_cost_the_passes_me
          trip cycle's term); the tape: {tape}",
         tape.promised_at_decision,
         tape.image_unit_us,
-        if tape.images > 0 {
-            tape.image_ms * 1000 / tape.images
-        } else {
-            0
-        }
+        per_image_us(&tape)
     );
     fsck_clean(&uris).await;
 }

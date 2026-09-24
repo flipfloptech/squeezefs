@@ -1010,9 +1010,16 @@ async fn a_flat_volumes_cadence_trigger_is_the_max_age_whatever_the_term_measure
     use squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS;
     let file = NamedTempFile::new().unwrap();
     file.as_file().set_len(V3_VOL_LEN).unwrap();
-    format_v3(file.path(), V3_VOL_LEN, &format_opts(false))
-        .await
-        .expect("flat format");
+    // The premise is the FLAT layout: under the matrix's stamped leg the
+    // seam stamps every format, so the seam is cleared around this one
+    // (the suite runs `--test-threads=1` there; `sym_convert_tests`' law).
+    let seam = std::env::var_os("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    let formatted = format_v3(file.path(), V3_VOL_LEN, &format_opts(false)).await;
+    if let Some(v) = seam {
+        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", v);
+    }
+    formatted.expect("flat format");
     let be = KvMetaBackend::open(file.path()).await.expect("flat open");
     assert!(
         be.appender_stats().is_none(),

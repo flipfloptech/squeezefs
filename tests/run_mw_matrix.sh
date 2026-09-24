@@ -4250,7 +4250,7 @@ print(f'{100*($cpu1-$cpu0)/hz/max(1e-9, $t1-$t_row0):.0f}')")"
     local maxn_idx
     for maxn_idx in 0 "${joiners[@]:0:$((maxn - 1))}"; do
         cp "$rowdir/m${maxn_idx}_pn${maxn}1.json" "$rowdir/m${maxn_idx}_pend0.json" 2>/dev/null || true
-        snap "$maxn_idx" "end" "$rowdir"
+        snap "$maxn_idx" "end1" "$rowdir"
     done
     {
         echo "   after the last row's removals (pn${maxn}1 → pend1):"

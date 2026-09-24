@@ -5318,6 +5318,12 @@ pub struct SlotCustodyArm {
     /// Endpoint → the holder's dial slot. A SHORT sync lock (insert /
     /// lookup only); every dial runs under the slot's own async mutex.
     holders: parking_lot::Mutex<HashMap<Arc<str>, Arc<HolderSlot>>>,
+    /// Every per-`(holder, volume)` token plane this arm dialed, in dial
+    /// order — the STANDING-token probe's census (review round 3, Issue
+    /// 17): a sync-locked list a FORGET batch walks without touching any
+    /// holder's async dial mutex; bounded by holders × volumes, a fenced
+    /// holder's plane answering nothing (its channel is dead).
+    planes: parking_lot::Mutex<Vec<(u16, Arc<crate::meta_ship::token_plane::TokenReaderPlane>)>>,
     /// The renewal loops' stop latch (the co-writer arm's own shape).
     stop: Arc<AtomicBool>,
 }
@@ -5366,6 +5372,7 @@ pub fn arm_slot_custody_with_clock(
         sink_for,
         clock,
         holders: parking_lot::Mutex::new(HashMap::new()),
+        planes: parking_lot::Mutex::new(Vec::new()),
         stop: Arc::new(AtomicBool::new(false)),
     });
     if let Some(previous) = SLOT_CUSTODY.swap(Some(Arc::clone(&arm))) {
@@ -5656,6 +5663,7 @@ impl SlotCustodyArm {
             task.run_recall_channel().await;
         });
         custody.planes.lock().insert(volume, Arc::clone(&plane));
+        self.planes.lock().push((volume, Arc::clone(&plane)));
         Ok((Arc::clone(&custody.client), plane))
     }
 
@@ -5732,6 +5740,35 @@ async fn bind_holder_home(arm: &SlotCustodyArm, ino: u64, holder: u32) -> Option
 /// process, the arm's routed set another daemon's). A holder with no
 /// bound endpoint REFUSES `EAGAIN`-class — the writer's stale projection
 /// of a foreign tree is never served in its place (KD-SYM-19, R-SYM-4).
+/// **The `nlink` a STANDING token on `object` (a LOCAL key ino of `vol`)
+/// reads at this writer** — the per-holder planes' cache probed, no fetch,
+/// no dial, no park (symmetric PR 13h, review round 3, Issue 17): `None`
+/// with no arm, an unknown volume, or no live token on the object. The
+/// FORGET-driven reclaim's law: a standing token with `nlink ≥ 1` names a
+/// LIVE file at its holder, so its forget is no corpse's and ships no
+/// hint.
+pub fn standing_token_nlink(
+    vol: &crate::meta_backend::kv::backend::KvMetaBackend,
+    object: u64,
+) -> Option<u32> {
+    let guard = SLOT_CUSTODY.load();
+    let arm = guard.as_ref()?;
+    let routed = arm.routed.upgrade()?;
+    let v = routed
+        .volumes
+        .iter()
+        .position(|x| std::ptr::eq(Arc::as_ptr(x), vol))?;
+    let volume = u16::try_from(v).ok()?;
+    let planes: Vec<_> = arm
+        .planes
+        .lock()
+        .iter()
+        .filter(|(vol_ord, _)| *vol_ord == volume)
+        .map(|(_, p)| Arc::clone(p))
+        .collect();
+    planes.iter().find_map(|p| p.standing_nlink(object))
+}
+
 pub async fn foreign_read_plane(
     vol: &crate::meta_backend::kv::backend::KvMetaBackend,
     object: u64,

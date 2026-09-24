@@ -497,8 +497,10 @@
 #                       holder LEAVES (the slot Unleased) before the close:
 #                       hinted to the MANAGER. Laws: Σ hint_inos_shipped ≡
 #                       Σ (served + forwarded + misrouted) across the
-#                       daemons, reclaim_hint_failures 0, reclaim_destroy_
-#                       refused_release_failed 0, no `corrupt KV encoding`
+#                       daemons, a LIVE file's close shipping nothing
+#                       (reclaim_hint_skipped_live), reclaim_hint_failures
+#                       0, reclaim_destroy_refused_release_failed 0, no
+#                       `corrupt KV encoding`
 #                       / `destroy WITHHELD` line, the corpses' blocks
 #                       released at the reclaimer (meta_kv_block_refs_
 #                       released) and cleared at the allocation holder
@@ -5462,7 +5464,43 @@ leg_sym_reclaim_hint() {
     for idx in "${readers[@]}"; do
         find "$(mnt_of "$idx")/rh-mgr" -type f -exec cat {} + >/dev/null || die "sym-reclaim-hint A: reader m$idx's read of the manager's tree failed"
     done
+    # The READ phase's closes (review round 3, Issue 17): every `cat`'s
+    # last close runs the RELEASE handler's unlink-while-open probe, and
+    # the joiner's STANDING TOKEN on each file reads `nlink 1` — no corpse,
+    # no hint, no resolve at the manager.
+    sleep 1
     for idx in "${writers[@]}" "${readers[@]}"; do snap "$idx" a0 "$rowdir"; done
+    local live_skipped live_inos live_resolves
+    live_skipped="$(python3 - "$rowdir" "$a" <<'PYEOF'
+import json, sys
+r, i = sys.argv[1], sys.argv[2]
+def m(ph):
+    d = json.load(open(f"{r}/m{i}_p{ph}.json")); return d.get("metrics", d)
+print(int(m("a0").get("reclaim_hint_skipped_live", 0)) - int(m("s0").get("reclaim_hint_skipped_live", 0)))
+PYEOF
+)"
+    live_inos="$(python3 - "$rowdir" "$a" <<'PYEOF'
+import json, sys
+r, i = sys.argv[1], sys.argv[2]
+def m(ph):
+    d = json.load(open(f"{r}/m{i}_p{ph}.json")); return d.get("metrics", d)
+print(int(m("a0").get("reclaim_hint_inos_shipped", 0)) - int(m("s0").get("reclaim_hint_inos_shipped", 0)))
+PYEOF
+)"
+    live_resolves="$(python3 - "$rowdir" 0 <<'PYEOF'
+import json, sys
+r, i = sys.argv[1], sys.argv[2]
+def m(ph):
+    d = json.load(open(f"{r}/m{i}_p{ph}.json")); v = d.get("metrics", d).get("slot_resolve_rpcs", 0)
+    return sum(x for x in v if isinstance(x, (int, float))) if isinstance(v, list) else int(v or 0)
+print(m("a0") - m("s0"))
+PYEOF
+)"
+    [ "$live_skipped" -ge "$SYM_RH_FILES" ] ||
+        die "sym-reclaim-hint A: m$a reclaim_hint_skipped_live +$live_skipped for $SYM_RH_FILES live-file closes — the standing-token arm did not read the files live"
+    [ "$live_inos" = "0" ] ||
+        die "sym-reclaim-hint A: m$a shipped $live_inos hinted ino(s) for the closes of LIVE files (a standing token reading nlink ≥ 1 is no corpse)"
+    log "sym-reclaim-hint A (the read phase): $SYM_RH_FILES live-file closes at m$a → reclaim_hint_skipped_live +$live_skipped, hinted inos +$live_inos, the manager's slot_resolve_rpcs +$live_resolves"
     rm -rf "$mmnt/rh-mgr" || die "sym-reclaim-hint A: the manager's rm -rf failed"
     # Every unreferenced inode the recall's prune left behind is evicted:
     # the kernel FORGETs at every mount that held one.
@@ -5607,7 +5645,7 @@ leg_sym_reclaim_hint() {
         v="$(sym_delta "$rowdir" "$idx" s reclaim_destroy_refused_release_failed 2>/dev/null || echo 0)"
         refused_sum=$(( refused_sum + ${v:-0} ))
     done
-    echo "== PR 13h sym-reclaim-hint: Σ reclaim_hint_inos_shipped=$shipped_sum ≡ Σ served=$served_sum + forwarded=$fwd_sum + misrouted=$mis_sum, reclaim_hint_failures=$fail_sum, reclaim_destroy_refused_release_failed=$refused_sum, 0 'corrupt KV encoding' / 'destroy WITHHELD' lines; A: m$a foreign +$a_foreign → manager served +$a_served; B (moved slot): foreign +$b_foreign → m$b served +$b_served, refs released ≥ $blocks, bitmap cleared ≥ $blocks; C (unleased): unleased +$c_unleased → manager served +$c_served, refs released ≥ $blocks, bitmap cleared ≥ $blocks$SYM_BUSY_ROW ==" | tee "$rowdir/symrh-table.txt"
+    echo "== PR 13h sym-reclaim-hint: Σ reclaim_hint_inos_shipped=$shipped_sum ≡ Σ served=$served_sum + forwarded=$fwd_sum + misrouted=$mis_sum, reclaim_hint_failures=$fail_sum, reclaim_destroy_refused_release_failed=$refused_sum, 0 'corrupt KV encoding' / 'destroy WITHHELD' lines; A-read: $SYM_RH_FILES live closes → skipped_live +$live_skipped, hinted +$live_inos, manager slot_resolve_rpcs +$live_resolves; A: m$a foreign +$a_foreign → manager served +$a_served; B (moved slot): foreign +$b_foreign → m$b served +$b_served, refs released ≥ $blocks, bitmap cleared ≥ $blocks; C (unleased): unleased +$c_unleased → manager served +$c_served, refs released ≥ $blocks, bitmap cleared ≥ $blocks$SYM_BUSY_ROW ==" | tee "$rowdir/symrh-table.txt"
     sym_oracle sym-reclaim-hint "$rowdir"
     sym_post_leave_census sym-reclaim-hint "$rowdir" "$(date +%s)" "${writers[@]}"
     log "sym-reclaim-hint PUBLISHED (table + snapshots in $rowdir)"

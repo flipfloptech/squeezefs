@@ -25704,6 +25704,18 @@ impl SqueezefsFilesystem {
             if backend.owns_inode_reclaim(ino) {
                 // fall through to the admission below
             } else {
+                // A STANDING token reading `nlink ≥ 1` names a LIVE file at
+                // its holder (review round 3, Issue 17): no corpse, no
+                // hint, no resolve — the RELEASE handler's unlink-while-
+                // open probe fires on every last close, and a colleague's
+                // tree read as a token client would otherwise cost a
+                // manager verb per close.
+                if backend.standing_token_nlink(ino).is_some_and(|n| n >= 1) {
+                    METRICS
+                        .reclaim_hint_skipped_live
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 let home = match homes.entry(backend.reclaim_slot_key(ino)) {
                     std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
                     std::collections::hash_map::Entry::Vacant(e) => {

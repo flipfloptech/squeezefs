@@ -2965,6 +2965,18 @@ impl RoutedMetaBackend {
             .is_some_and(|v| v.inode_plane_owns_slot(local_ino))
     }
 
+    /// **The `nlink` a STANDING token on GLOBAL `ino` reads at this mount**
+    /// (review round 3, Issue 17): the writer's per-holder planes probed
+    /// through [`crate::data_grant::standing_token_nlink`] — no fetch, no
+    /// dial. `Some(n ≥ 1)` = the file is LIVE at its holder (an unlink
+    /// there recalls the token before it commits): its FORGET is no
+    /// corpse's and ships no hint.
+    pub fn standing_token_nlink(&self, ino: Ino) -> Option<u32> {
+        let (v_idx, local) = self.route_ino(ino);
+        let vol = self.volumes.get(v_idx)?;
+        crate::data_grant::standing_token_nlink(vol, local)
+    }
+
     /// **Where the FORGET-driven reclaim of GLOBAL `ino` executes** (PR
     /// 13h — review round 1, Issue 1; design §5.1: the slot is the
     /// ownership unit, so a corpse's RECLAIMER is its slot's holder — the
@@ -2982,22 +2994,32 @@ impl RoutedMetaBackend {
         if vol.inode_plane_owns_slot(local) {
             return ReclaimHome::Local;
         }
-        // The slot's lessee — the MANAGER's word (`reresolve_slot_holder`:
-        // one `ResolveSlot` from a joiner, the table itself on the
-        // manager), never this mount's projection: a joiner's table lags
-        // a peer's grant by up to a checkpoint and can still name the
-        // departed lessee (this mount itself, after its own release), so
-        // a slot that moved to ANOTHER appender between the unlink and
-        // the forget is hinted to that appender. The FORGET batch asks
-        // once per slot (`reclaim_slot_key`).
+        // The slot's lessee — this mount's PROJECTION first, the MANAGER's
+        // word only where the projection cannot be trusted (review round
+        // 3, Issue 17 — a `ResolveSlot` per slot per batch was ≈ one
+        // manager verb per foreign close over a 64-slot rotor): a
+        // joiner's table lags a peer's grant by up to a checkpoint, so a
+        // word naming THIS mount (the stale-self case after its own
+        // release — `inode_plane_owns_slot` just said the lease is gone)
+        // or `Unleased` (a peer's first touch not yet projected) is asked
+        // of the manager (`reresolve_slot_holder`: one `ResolveSlot` from
+        // a joiner, the table itself on the manager); a THIRD-party word
+        // is trusted — if it is stale the served side's one forward hop
+        // (`serve_reclaim_hint`) carries the hint to the lessee tree 0
+        // names. The FORGET batch asks once per slot (`reclaim_slot_key`).
         let slot = kv::record::forest_slot_of_ino(local);
-        let lessee = match vol.reresolve_slot_holder(slot).await {
+        let foreign_word = |r: Option<crate::slot_lease_core::Resolved>| match r {
             Some(crate::slot_lease_core::Resolved::Holder { holder, .. })
                 if holder != vol.own_appender_id() && !vol.is_own_region(holder) =>
             {
                 Some(holder)
             }
             _ => None,
+        };
+        let projected = vol.slot_leases().map(|p| p.table.resolve(slot));
+        let lessee = match foreign_word(projected) {
+            Some(holder) => Some(holder),
+            None => foreign_word(vol.reresolve_slot_holder(slot).await),
         };
         match lessee {
             Some(_) => match crossvol_tx::step_home_bound(self, v_idx, local).await {

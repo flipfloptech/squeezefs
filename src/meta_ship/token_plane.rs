@@ -3155,6 +3155,27 @@ impl TokenReaderPlane {
         }
     }
 
+    /// **The `nlink` of a STANDING token on `object`** — a LIVE cache
+    /// entry under a live lease and a fresh recall channel — with no
+    /// fetch, no park and no gate: a pure cache probe (symmetric PR 13h,
+    /// review round 3, Issue 17). `None` when no such token stands
+    /// (absent, recalled, the plane fenced or its channel stale). A
+    /// standing token with `nlink ≥ 1` is PROOF the file is live at its
+    /// holder — an unlink there recalls the token before it commits, and
+    /// a channel fresh within the recall's delivery window is what makes
+    /// the absence of a recall mean something — so a FORGET of such an
+    /// object is no corpse's and reclaims nothing anywhere.
+    pub fn standing_nlink(&self, object: u64) -> Option<u32> {
+        if !self.lease_live() || !self.channel_fresh() {
+            return None;
+        }
+        self.cache
+            .read_sync(&object, |_, e| {
+                (e.state.load(Ordering::Acquire) == ENTRY_LIVE).then_some(e.attrs.nlink)
+            })
+            .flatten()
+    }
+
     /// Begin a serve of `object`: the cached entry under the serve gate,
     /// fetched on a miss (or when dentries are wanted and not yet held).
     pub async fn serve(&self, object: u64, wants: TokenWants) -> Result<Option<TokenServe>> {

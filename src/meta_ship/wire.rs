@@ -469,7 +469,11 @@ pub enum MetaCall {
     /// mount reclaims; each is judged by the served mount's own
     /// FORGET-driven reclaim (`MetaReply::Unit`). Bounded at
     /// [`RECLAIM_HINT_MAX_INOS`] per hint (the reclaim worker's batch cap):
-    /// a longer frame is rejected before anything proportional to it runs.
+    /// a longer frame is rejected at the served side before any EXECUTION
+    /// proportional to it — the decoder has already allocated the `Vec` up
+    /// to the CONTROL class cap (`decode_limit`, 1 MiB), which is what
+    /// bounds the ALLOCATION; the screen bounds the execution (PR 3's
+    /// "bounded codec = bounded execution").
     ReclaimHint {
         inos: Vec<u64>,
         /// Forwards this hint has taken: a served mount that is not an

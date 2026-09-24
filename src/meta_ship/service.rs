@@ -1573,7 +1573,9 @@ impl MetaShipService {
             // ino (open count, the exact record's nlink, the single-drive
             // claim). Bounded EXECUTION (PR 3's law): a hint past the
             // reclaim batch cap is rejected before anything proportional
-            // to it runs; an ino this mount does not reclaim is dropped and
+            // to it RUNS — its `Vec` is already decoded, bounded by the
+            // CONTROL class cap (`decode_limit`), which is the allocation's
+            // bound; an ino this mount does not reclaim is dropped and
             // counted, never read.
             MetaCall::ReclaimHint { inos, hops } => {
                 if inos.len() > super::wire::RECLAIM_HINT_MAX_INOS {

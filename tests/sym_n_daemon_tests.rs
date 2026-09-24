@@ -14105,10 +14105,11 @@ async fn a_deferred_flush_barrier_between_the_decision_and_its_cycle_is_priced_i
     );
     assert_eq!(
         trips, 0,
-        "F-B1's landing residue: a due tick's deferred-flush barrier ({BARRIER_MS} ms here) \
+        "the deferred-barrier gap: a due tick's deferred-flush barrier ({BARRIER_MS} ms here) \
          between its decision and its cycle must be inside the term the cadence anticipates \
-         — the box's 1,101 ms was that barrier priced nowhere; RED on the horizon term alone \
-         (the trigger ≈ 1000 − ({BARRIER_MS} + s), the leaf lands ≈ 1,150 + late old)"
+         — a real gap the term clocked from the cycle's start left priced nowhere (≈ 2 ms on \
+         the box); RED on the horizon term alone (the trigger ≈ 1000 − ({BARRIER_MS} + s), \
+         the leaf lands ≈ 1,150 + late old)"
     );
     // The tail: the product cadence covers whatever the last draw left.
     tokio::time::sleep(std::time::Duration::from_millis(2 * ceiling_ms)).await;

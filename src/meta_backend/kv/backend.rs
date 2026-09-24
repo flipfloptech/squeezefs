@@ -1591,8 +1591,8 @@ pub struct KvMetaBackend {
     /// The monotonic instant of that decision (PR 13h): the cycle it fired
     /// measures its landing term from HERE — the tick's deferred-flush
     /// barrier runs between the decision and the cycle's start, and a
-    /// term clocked from the start left it priced nowhere (F-B1's landing
-    /// residue). 0 for a cycle another path ran.
+    /// term clocked from the start left that gap priced nowhere (≈ 2 ms
+    /// on the box). 0 for a cycle another path ran.
     pub(super) checkpoint_decision_at_ns: AtomicU64,
     /// The age decision's RAW lateness past its trigger, the horizon
     /// MAXIMUM over the cycles it fired (PR 13g review round 2, Issue 19)

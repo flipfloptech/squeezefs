@@ -1894,6 +1894,7 @@ impl KvMetaBackend {
         let barrier_started = std::time::Instant::now();
         self.sync_device().await.map_err(KvError::Io)?;
         self.note_flush_ceiling(&had_dirty, crate::mono_core::monotonic_ns_u64());
+        self.note_checkpoint_barrier(barrier_started.elapsed().as_nanos() as u64);
         self.note_checkpoint_cycle_term(cycle_started.elapsed().as_nanos() as u64);
         log::debug!(
             "joined checkpoint: appender {own}'s cycle pre-barrier wall {} ms = flush {flush_ms} \

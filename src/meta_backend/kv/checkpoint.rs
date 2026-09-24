@@ -1946,7 +1946,11 @@ async fn tick(
         crate::fuse_client::METRICS
             .meta_flush_deferred
             .fetch_add(1, Ordering::Relaxed);
+        let barrier_started = std::time::Instant::now();
         be.sync_device().await.map_err(KvError::Io)?;
+        // One covering barrier's wall — the unit the projection prices
+        // the next cycle's barriers with (PR 13h).
+        be.note_checkpoint_barrier(barrier_started.elapsed().as_nanos() as u64);
     }
 
     // 3. Checkpoint decision (§4.6 pt 2): cadence, journal distance,
@@ -2509,6 +2513,7 @@ impl KvMetaBackend {
         // durable (the §4.6 pt 3 pending-reclaim drains inside).
         self.sync_device().await.map_err(KvError::Io)?;
         self.note_flush_ceiling(&had_dirty, crate::mono_core::monotonic_ns_u64());
+        self.note_checkpoint_barrier(t_pages.elapsed().as_nanos() as u64);
         // The pre-barrier wall the audit just measured against, folded with
         // the decision's lateness into the term the cadence trigger
         // anticipates (PR 13e, F-B1).

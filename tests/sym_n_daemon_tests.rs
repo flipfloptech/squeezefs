@@ -13854,6 +13854,275 @@ async fn a_storms_onset_after_a_quiet_horizon_lands_inside_the_managers_ceiling(
 }
 
 // ---------------------------------------------------------------------------
+// PR 13h — F-B1's LANDING residue: the deferred-flush barrier between the
+// age decision and its cycle (the fourth box pass, the record's §3.9.6.1).
+// ---------------------------------------------------------------------------
+
+/// **F-B1's landing residue (the fourth box pass, §3.9.6.1): the covering
+/// barrier a due tick runs BETWEEN its age decision and its cycle is
+/// priced by nothing.** The box read ONE trip in eight rows on PR 13g's
+/// binary — the manager's volume 1 at 1,101 ms, 1 ms past, at a storm's
+/// END under no verb service: the decision's lateness 15–35 ms, the
+/// cycle's wall 52 ms, and ≈ 40 ms of a barrier the record attributed to
+/// "the landing". In the code that barrier is the tick's step 2 — the
+/// deferred-mode flush barrier (`needs_flush`, set by every non-strict
+/// commit group) — which PR 13g's re-order put AFTER the decision (the
+/// decision is read before the threshold drain now) and which the cycle's
+/// clock (`cycle_started`, taken after it) never sees: `late` was measured
+/// before it, the term after it. A leaf dirtied right after the previous
+/// collection ages `trigger + late + B_deferred + cycle` while the horizon
+/// anticipates `cycle + (late − tick)⁺` — one barrier's wall is the
+/// residue, and under four storms' journal lanes on nvmet-tcp it was
+/// exactly the 40 ms the two-tick margin had left.
+///
+/// The law: the TERM is measured at the LANDING from the DECISION — the
+/// same instant `note_flush_ceiling` judges, from the instant the tick
+/// fired — so every barrier between the two is in the horizon; and the
+/// live projection prices the next cycle's COVERING BARRIERS from the
+/// measured barrier unit (`meta_kv_checkpoint_barrier_ms`, the horizon
+/// maximum of one barrier's wall) — two on a deferred-mode volume (the
+/// due tick's, then barrier #1), one strict — so a device whose barrier is
+/// slow at REST is priced before its first storm cycle. The ceiling never
+/// widens; a flat volume's age verdict is unchanged (`flat_age_due`).
+///
+/// The shape, deterministic under `uring_fs::arm_device_latency` on the
+/// BARRIER alone (150 ms per `fdatasync`, writes unparked): the manager
+/// creates ONE file the instant a cycle COLLECTS (the aged leaf, dirtied
+/// while that cycle's barriers run; its commit sets `needs_flush`, which
+/// the next quiet tick consumes) and ONE more 8 ms before the trigger
+/// fires (sets `needs_flush` for the DUE tick), so the due tick runs the
+/// deferred barrier, then its cycle with barrier #1: the leaf's age is
+/// `trigger + late + 2 × 150 + s`. RED on `230e95dd`: the horizon holds
+/// `150 + s` (a cycle's wall), the trigger is `≈ 850` and the leaf lands
+/// `≈ 1,150 + late` old — a trip by ≥ 150 ms on every cycle, whatever the
+/// tick's lateness. GREEN: the barrier unit read 150 ms at the warm-up,
+/// the projection prices `2 × 150 + s`, the trigger ≈ 700 and the leaf
+/// lands `≈ 1,000 + late` old — 0 trips. The draws PIPELINE: a draw's
+/// landing cycle is the next draw's reference collection (its verdict is
+/// read once its ledger record lands, after the next draw's aged create
+/// went out).
+///
+/// **The venue's term, attributed INSIDE the pin** (PR 13g's law): a cycle
+/// whose age decision was later than the ceiling's two-tick margin lands
+/// its leaves past the ceiling whatever the trigger anticipated — VOID,
+/// stated, re-drawn; and a draw whose deferred barrier did not land on
+/// the DUE tick (the late create's tick fell just before the trigger and
+/// barriered a non-due tick — the decision then a barrier late, past the
+/// margin; or no deferred barrier landed at all — `meta_flush_deferred`
+/// unmoved) did not form the shape — VOID too. Bounded at `DRAWS` valid
+/// samples in `DRAWS + 4` draws; a run that draws none fails loud naming
+/// the venue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_deferred_flush_barrier_between_the_decision_and_its_cycle_is_priced_into_the_term() {
+    use squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS;
+    use std::sync::atomic::Ordering::Relaxed;
+    /// The parked barrier: one `fdatasync` of the volume's file.
+    const BARRIER_MS: u64 = 150;
+    /// Valid samples the verdict needs, and the draws it may take.
+    const DRAWS: u32 = 3;
+    const MAX_DRAWS: u32 = DRAWS + 4;
+    let dir = cadence_venue_dir();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    // The box's 32 MiB fixed ring: the cycles are the AGE law's, never
+    // ring pressure's.
+    let uris = format_stamped_set_with_ring_len(dir.path(), 1, VOL_LEN * 8, 32 * 1024 * 1024).await;
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    // One idle joiner: the N-daemon shape (the manager serves a wire
+    // appender beside its own cadence).
+    let joiner = join(&uris, &venue, &mvol, 1).await;
+    // The manager's directory (its rotor slot — one leaf of its own).
+    let d = manager
+        .create(1, "landing", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("the manager's directory")
+        .ino;
+    let path = std::path::PathBuf::from(&uris[0]);
+    squeezefs::uring_fs::arm_device_latency(
+        &path,
+        std::time::Duration::ZERO,
+        std::time::Duration::from_millis(BARRIER_MS),
+    );
+    // The warm-up: two cycles under the parked barrier — the horizon holds
+    // a cycle's wall, the barrier unit is measured.
+    for _ in 0..2 {
+        mvol.checkpoint_now().await.expect("a warm-up cycle");
+    }
+    let f0 = cadence_faces(&mvol);
+    let barrier0 = mvol.checkpoint_barrier_ms();
+    eprintln!("F-B1 landing: warmed — the manager at {f0:?}, barrier unit {barrier0} ms");
+    assert!(
+        barrier0 >= BARRIER_MS,
+        "the premise: the warm-up measured the parked barrier ({barrier0} ms)"
+    );
+    let ceiling_ms = mvol.appender_stats().unwrap().flush_ceiling_ms;
+    let late_bound_ms = ceiling_ms - CHECKPOINT_MAX_AGE_MS as u64;
+    let deferred_face = || {
+        squeezefs::fuse_client::METRICS
+            .meta_flush_deferred
+            .load(Relaxed)
+    };
+    /// A finer poll than `wait_until` (1 ms): the aged create must land
+    /// while the reference cycle's barriers still run.
+    async fn poll_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let started = std::time::Instant::now();
+        while !cond() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "timed out waiting for: {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+    // Draw 0's reference cycle, started in the background so the aged
+    // create can land right after its collection.
+    let seed = {
+        let v = Arc::clone(&mvol);
+        tokio::spawn(async move { v.checkpoint_now().await.expect("the reference cycle") })
+    };
+    let mut collected_prev = mvol.checkpoint_collected_ns();
+    let mut seq_prev = mvol.checkpoint_seq();
+    let mut overruns_prev = mvol.appender_stats().unwrap().flush_ceiling_overruns;
+    let mut deferred_prev = deferred_face();
+    // The draw whose landing cycle is the NEXT collection: `(draw, the
+    // deferred count when its late create went out)`.
+    let mut in_flight: Option<(u32, u64)> = None;
+    let mut valid = 0u32;
+    let mut trips = 0u64;
+    let mut void_draws = 0u32;
+    for draw in 0..=MAX_DRAWS {
+        // The reference collection: the previous draw's landing cycle
+        // (draw 0's: the seeded cycle).
+        poll_until("a cycle's collection", || {
+            mvol.checkpoint_collected_ns() != collected_prev
+        })
+        .await;
+        let c0 = mvol.checkpoint_collected_ns();
+        collected_prev = c0;
+        let aged_at = squeezefs::mono_core::monotonic_ns_u64();
+        if draw < MAX_DRAWS && valid < DRAWS {
+            // The aged leaf, dirtied while the reference cycle's barriers
+            // run.
+            manager
+                .create(
+                    d,
+                    &format!("aged-{draw}"),
+                    libc::S_IFREG | 0o644,
+                    1000,
+                    1000,
+                )
+                .await
+                .expect("the aged create");
+        }
+        // The reference cycle LANDS (its audit, its term fold, its ledger
+        // record): the previous draw's verdict.
+        poll_until("the cycle's ledger record", || {
+            mvol.checkpoint_seq() > seq_prev
+        })
+        .await;
+        seq_prev = mvol.checkpoint_seq();
+        let overruns_now = mvol.appender_stats().unwrap().flush_ceiling_overruns;
+        if let Some((judged, deferred_at_late)) = in_flight.take() {
+            let f1 = cadence_faces(&mvol);
+            let late_ms = mvol.checkpoint_last_late_ms();
+            let deferred_since_late = deferred_face() - deferred_at_late;
+            let tripped = overruns_now - overruns_prev;
+            eprintln!(
+                "F-B1 landing: draw {judged} — the cycle landed (the manager at {f1:?}; the \
+                 decision {late_ms} ms late, bound {late_bound_ms}; {deferred_since_late} \
+                 deferred barrier(s) since the late create; barrier unit {} ms; {tripped} \
+                 overrun(s))",
+                mvol.checkpoint_barrier_ms()
+            );
+            if deferred_since_late == 0 || late_ms > late_bound_ms {
+                void_draws += 1;
+                eprintln!(
+                    "F-B1 landing: draw {judged} VOID — {} (the venue's tick / the shape's \
+                     timing, never the cadence's pricing); re-drawn",
+                    if deferred_since_late == 0 {
+                        "no deferred barrier landed on the due tick"
+                    } else {
+                        "the age decision was later than the ceiling's margin"
+                    }
+                );
+            } else {
+                valid += 1;
+                trips += tripped;
+            }
+        }
+        overruns_prev = overruns_now;
+        if draw == MAX_DRAWS || valid == DRAWS {
+            break;
+        }
+        // The trigger the due tick will read (the reference cycle's term
+        // folded).
+        let trigger_ms = mvol.checkpoint_trigger_ms(CHECKPOINT_MAX_AGE_MS as u64);
+        let fk = cadence_faces(&mvol);
+        eprintln!(
+            "F-B1 landing: draw {draw} — the aged create {} ms after the collection; trigger \
+             {trigger_ms} ms (the manager at {fk:?}, barrier unit {} ms)",
+            aged_at.saturating_sub(c0) / 1_000_000,
+            mvol.checkpoint_barrier_ms()
+        );
+        // The late create 8 ms before the trigger fires: its commit sets
+        // `needs_flush` for the DUE tick.
+        let fire_at_ns = c0 + trigger_ms.saturating_sub(8) * 1_000_000;
+        let now_ns = squeezefs::mono_core::monotonic_ns_u64();
+        if fire_at_ns > now_ns {
+            tokio::time::sleep(std::time::Duration::from_nanos(fire_at_ns - now_ns)).await;
+        }
+        deferred_prev = deferred_face();
+        manager
+            .create(
+                d,
+                &format!("late-{draw}"),
+                libc::S_IFREG | 0o644,
+                1000,
+                1000,
+            )
+            .await
+            .expect("the late create");
+        in_flight = Some((draw, deferred_prev));
+    }
+    seed.await.expect("the seeded cycle");
+    squeezefs::uring_fs::disarm_device_latency(&path);
+    assert_eq!(
+        valid, DRAWS,
+        "the venue produced {valid} valid landing samples in {MAX_DRAWS} draws ({void_draws} \
+         void) — re-run on a quiet box"
+    );
+    eprintln!(
+        "F-B1 landing: {trips} overrun(s) over {valid} valid cycles ({void_draws} void draws); \
+         the manager at {:?}, barrier unit {} ms",
+        cadence_faces(&mvol),
+        mvol.checkpoint_barrier_ms()
+    );
+    assert_eq!(
+        trips, 0,
+        "F-B1's landing residue: a due tick's deferred-flush barrier ({BARRIER_MS} ms here) \
+         between its decision and its cycle must be inside the term the cadence anticipates \
+         — the box's 1,101 ms was that barrier priced nowhere; RED on the horizon term alone \
+         (the trigger ≈ 1000 − ({BARRIER_MS} + s), the leaf lands ≈ 1,150 + late old)"
+    );
+    // The tail: the product cadence covers whatever the last draw left.
+    tokio::time::sleep(std::time::Duration::from_millis(2 * ceiling_ms)).await;
+    shutdown(&joiner).await;
+    drop(joiner);
+    assert_must_stay_zero_with(&mvol, "manager", false);
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+// ---------------------------------------------------------------------------
 // PR 13h — F-R6: a token client's FORGET-driven reclaim on a foreign slot
 // (the fourth box pass, the record's §3.9.6.3).
 // ---------------------------------------------------------------------------

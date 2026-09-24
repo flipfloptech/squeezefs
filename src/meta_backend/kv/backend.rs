@@ -1597,6 +1597,21 @@ pub struct KvMetaBackend {
     /// box's is the reading. Published as `meta_kv_checkpoint_late_max_ms`.
     pub(super) checkpoint_lates: std::sync::Mutex<super::checkpoint::CycleTermWindow>,
     pub(super) checkpoint_late_max_ns: AtomicU64,
+    /// The LAST age-fired cycle's raw lateness, ns (the per-cycle word
+    /// beside the horizon maximum — what a contract judging ONE cycle's
+    /// landing attributes its verdict with; PR 13h).
+    pub(super) checkpoint_last_late_ns: AtomicU64,
+    /// **The covering barrier's wall** — one device barrier of this
+    /// volume's checkpoint path, ns: barrier #1 of every cycle and the
+    /// deferred-flush barrier a due tick runs between its decision and
+    /// its cycle — the horizon MAXIMUM over the last `TERM_HORIZON_CYCLES`
+    /// barriers (PR 13h, F-B1's landing residue: the box's trip was that
+    /// deferred barrier's ≈ 40 ms, priced by neither the decision's
+    /// lateness nor the cycle's wall). The unit the cadence's live
+    /// projection prices the next cycle's covering barriers with.
+    /// Published as `meta_kv_checkpoint_barrier_ms`.
+    pub(super) checkpoint_barriers: std::sync::Mutex<super::checkpoint::CycleTermWindow>,
+    pub(super) checkpoint_barrier_ns: AtomicU64,
     /// The flush pass's two measured units, ns — the wall per dirty node
     /// whose flush appended (no fresh image) and the wall per fresh IMAGE
     /// the pass's SMOs wrote — each the MAXIMUM over the last horizon of
@@ -3256,6 +3271,9 @@ impl KvMetaBackend {
             checkpoint_decision_tick_ns: AtomicU64::new(0),
             checkpoint_lates: std::sync::Mutex::new(super::checkpoint::CycleTermWindow::new()),
             checkpoint_late_max_ns: AtomicU64::new(0),
+            checkpoint_last_late_ns: AtomicU64::new(0),
+            checkpoint_barriers: std::sync::Mutex::new(super::checkpoint::CycleTermWindow::new()),
+            checkpoint_barrier_ns: AtomicU64::new(0),
             maintenance_rotor: AtomicUsize::new(0),
             checkpoint_flush_units: std::sync::Mutex::new((
                 super::checkpoint::CycleTermWindow::new(),
@@ -12330,7 +12348,10 @@ impl KvMetaBackend {
         self.checkpoint_term_ns
             .store(anticipated, Ordering::Relaxed);
         // The decision's RAW lateness over the same horizon — the venue's
-        // term, published beside the overrun it explains (Issue 19).
+        // term, published beside the overrun it explains (Issue 19) — and
+        // this cycle's own word (PR 13h).
+        self.checkpoint_last_late_ns
+            .store(late_ns, Ordering::Relaxed);
         let late_max = {
             let mut w = self
                 .checkpoint_lates
@@ -12341,6 +12362,41 @@ impl KvMetaBackend {
         };
         self.checkpoint_late_max_ns
             .store(late_max, Ordering::Relaxed);
+    }
+
+    /// One covering barrier's measured wall (barrier #1 of a cycle, or the
+    /// deferred-flush barrier a due tick runs ahead of its cycle) folded
+    /// into the barrier window; the published maximum is the unit the
+    /// live projection prices the next cycle's barriers with (PR 13h).
+    pub(super) fn note_checkpoint_barrier(&self, wall_ns: u64) {
+        let unit = {
+            let mut w = self
+                .checkpoint_barriers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            w.push(wall_ns);
+            w.anticipated_ns()
+        };
+        self.checkpoint_barrier_ns.store(unit, Ordering::Relaxed);
+    }
+
+    /// The covering barrier's wall in force — the horizon maximum of one
+    /// device barrier on this volume's checkpoint path, ms
+    /// (`meta_kv_checkpoint_barrier_ms`; 0 before the first cycle).
+    pub fn checkpoint_barrier_ms(&self) -> u64 {
+        self.checkpoint_barrier_ns.load(Ordering::Relaxed) / 1_000_000
+    }
+
+    /// The last age-fired cycle's raw lateness past its trigger, ms — the
+    /// per-cycle attribution word beside [`Self::checkpoint_late_max_ms`].
+    pub fn checkpoint_last_late_ms(&self) -> u64 {
+        self.checkpoint_last_late_ns.load(Ordering::Relaxed) / 1_000_000
+    }
+
+    /// The monotonic instant of the last cycle's COLLECTION — the age
+    /// law's reference (`checkpoint_due_by_age` measures from it).
+    pub fn checkpoint_collected_ns(&self) -> u64 {
+        self.checkpoint_collected_ns.load(Ordering::Acquire)
     }
 
     /// A maintained tree's SMO images consume the grant of the REGION

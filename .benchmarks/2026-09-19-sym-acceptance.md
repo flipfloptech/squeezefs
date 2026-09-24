@@ -2380,7 +2380,7 @@ ms` 25–49 on the manager and 7–48 on the joiners (inside the 100 ms
 margin); the projection read 0–12 ms at every snapshot instant (a quiet
 tick's dirty count — the snapshots never catch a storm cycle); node units
 15–235 µs, image units 0.4–4.9 ms; `excused_ns` 0 everywhere; the
-joiners' end-of-row terms 4–136 ms with 0 trips (m60 [129, 12], m61 [71,
+joiners' end-of-row terms 4–129 ms with 0 trips (m60 [129, 12], m61 [71,
 0] at N = 8). Under the manager's volume 1 across the N = 8 create: ONE
 `ExtentGrant`-class verb per second at most — the grant burst of §3.9.5.2
 does not exist on this binary (F-R5 below).

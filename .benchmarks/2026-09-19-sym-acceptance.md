@@ -2288,7 +2288,15 @@ first set, `6108e8c1` (the row's directories created BEFORE the clock
 with their walls stamped; the Σ-of-per-writer-rates bound; the hygiene
 faces; an end-of-leg snapshot; PR 13e's post-leave census at the leg's
 end) for the second (its end-of-leg snapshot's label fixed after the
-run, `cea35691`). The laptop ran nothing of this rung.
+run, `cea35691`). **Neither the end-of-leg FACES nor the post-leave
+CENSUS has a reading on `230e95dd`** (review round 1, Issue 5): set 1
+predates `6108e8c1`, and set 2's leg died on the `pend1` label after its
+table, before both (and one line before the must-stay-0 die it would have
+taken) — the end-of-leg SNAPSHOTS themselves exist under the first
+build's names, `m*_pend.json` (set 2), and are cited where they are
+read; the faces and the census (0 exempted / findings 0 after every
+member's leave) are the flip binary's gate-3 row's. The laptop ran
+nothing of this rung.
 
 **The two row sets** (the row's clock law, stated once: the multiple is
 measured over the N STORMS' concurrent window — the design's "aggregate
@@ -2574,10 +2582,15 @@ polls). **The row's oracle cannot see this class**:
 the online census scopes live lessees' slots out, deleted-stays-deleted
 judges names, and the two gauges that moved sit outside the must-stay-0
 set and outside every per-row snapshot pair — the leg now prints them
-per row and once more after the last removals (`6108e8c1`), and ends
-with the post-leave census. Evidence: `13g-nw-20260924-0{41135,44235}-
-scale/scale-r1/daemon-logs/{m0,m60,m62,m63}.log`, the ino → slot
-arithmetic, `m60_pn{41,80}.json` / `m60_pend1.json`.
+per row and once more after the last removals and ends with the
+post-leave census (`6108e8c1` — landed AFTER set 1 and never reached in
+set 2, so neither has a reading on this binary: the flip binary's row's).
+Evidence: `13g-nw-20260924-0{41135,44235}-scale/scale-r1/daemon-logs/
+{m0,m60,m62,m63}.log`, the ino → slot arithmetic, `m60_pn{41,80}.json`
+(set 1: `reclaim_destroy_refused_release_failed` 0 → 121) and set 2's
+end-of-leg snapshot `m60_pend.json` (the first build's label: withheld
+**7,266**, `meta_kv_projection_root_refreshes` **79**,
+`foreign_frames_screened` **45**, `slot_door_refusals` [0, 0]).
 
 **A log-volume finding (PR 13b's served-mutation kernel hook)**: **272,071
 / 275,372 `WARN fuse3::raw::session may reply interrupted fuse request,
@@ -5566,7 +5579,7 @@ are the evidence and stay):**
 | `squeeze-test:/scratch/tmp/sym-box-13g-stage/` | the staging dir the `scp` / `rsync`s landed in before the root `install`s (the arm, the shim, `SHA256SUMS`, `repo/`) |
 | `squeeze-test:/scratch/tmp/sym-box/launch-13g-nw.sh` + `launch-13g-scale{,-2}.out` + `NW_13G_OUTS` | the N-writer launcher (`BIN=…squeezefs-B-230e95dd`, waits for load1 ≤ 1, one driver pass per gate) and its pointer file |
 | `squeeze-test:/scratch/tmp/sym-box/13g-nw-20260924-041135-scale/` (+ `.log`) | **row set 1** (fleet A; `scale-r1/symscale-1790223117/`: the table, `symscale-faces.txt` (the launch stamps, the amplification, the F-B1 and F-R5 faces per writer per row and per create phase), `symscale-verdict.txt`, `launch-n*.tsv`, `create-n*-w*.txt` (each with `launch_ts= end_ts=`), `disk_pin*.tsv`, `m*_pn*{0,c,1}.json` + the `pc*` copies, `removed-sample.txt`, `fsck-sym-scale.out`; `scale-r1/daemon-logs/m*.log` — m60's F-R6 windows, m0's `GrowRing` carves) — rc=0, the oracle reached |
-| `squeeze-test:/scratch/tmp/sym-box/13g-nw-20260924-044235-scale/` (+ `.log`) | **row set 2** (a fresh fleet A; the setup outside the clock; `scale-r1/symscale-1790224978/` — the same shape, `m*_pend0.json` copied; `daemon-logs/m0.log:22448` the 1,101 ms `OVERRUN` line) — RED on the trip; the leg died after its table on the end-of-leg snapshot's label (fixed `cea35691`), one line before the must-stay-0 die |
+| `squeeze-test:/scratch/tmp/sym-box/13g-nw-20260924-044235-scale/` (+ `.log`) | **row set 2** (a fresh fleet A; the setup outside the clock; `scale-r1/symscale-1790224978/` — the same shape, `m*_pend0.json` copied and the end-of-leg snapshots under the first build's label `m*_pend.json` — `m60_pend.json` withheld 7,266 / projection refreshes 79 / screened 45 — with no end-of-leg FACES and no post-leave CENSUS run; `daemon-logs/m0.log:22448` the 1,101 ms `OVERRUN` line) — RED on the trip; the leg died after its table on the end-of-leg snapshot's label (fixed `cea35691`), one line before the must-stay-0 die |
 | `/run/squeezefs-mwfleet`, `/run/squeezefs-devsub-tcp-mwfleet`, `/mnt/sqz-mwfleet/` mounts | **all removed** — both fleets torn down to zero residue (asserted by `mw_fleet.sh teardown`), verified at 04:57 UTC: 0 daemons, no fleet state, no netns, no `pref 40` rule, no `/dev/shm/sqz*`, nvmet configfs empty, the devsub's `nvmet_tcp` / `nvmet` / `zram` / `null_blk` UNLOADED (only `nvme_tcp nvme_fabrics nvme_core fuse` loaded, as found), the fabric's 15 namespaces connected as found, `/run/squeezefs/` the same four stale IL sockets, 243 G free; `/scratch/tmp/sym-box` 5.1 G |
 | the 5 storage nodes | **nothing placed**, nothing run (no gate-1 reset this pass) |
 

@@ -2290,7 +2290,12 @@ faces; an end-of-leg snapshot; PR 13e's post-leave census at the leg's
 end) for the second (its end-of-leg snapshot's label fixed after the
 run, `cea35691`). The laptop ran nothing of this rung.
 
-**The two row sets:**
+**The two row sets** (the row's clock law, stated once: the multiple is
+measured over the N STORMS' concurrent window — the design's "aggregate
+create/s scale with N" — and the row's SETUP, N creates into the shared
+root with the 3b flip it triggers and the fresh joiners' 3 s cliffs, is
+stamped and stated beside it, never inside it; a job launching N fresh
+writers into one root pays it once):
 
 | set / N | **create/s · ×N=1** | `C/CPU-S` (×) | **ingest MiB/s · ×** | `MGR_LOAD` / `MGR_CPU` / handovers / ships / rpcs | ingest amplification (`/proc/diskstats`, 2 data namespaces): device write ÷ user · `wareq-sz` · device read ÷ user | per-writer storms (s) · the launch term | verdict (the leg's) |
 |---|---|---|---|---|---|---|---|
@@ -2301,7 +2306,7 @@ run, `cea35691`). The laptop ran nothing of this rung.
 | **2** (`044235`, the mkdirs BEFORE the clock) · 1 | **4,981 · 1.00×** | 4,244 | 2,215 · 1.00× | 3 % / 112 % / 0 / 0 / 0 | 1.005 · 1,254 KiB · 0.005 | 8.0 · setup 0.007 s, skew 0.001 s | MET |
 | 2 · 2 | **9,270 · 1.86×** | 4,004 (0.94×) | 2,637 · 1.19× | 1 % / 112 % / 0 / 1 / 0 | 1.128 · 1,433 KiB · 0.128 | 7.8–8.6 · 0.015 / 0.003 s | the create law MET; ingest MISS against a 2,215 MiB/s base (below) |
 | 2 · 4 | **16,283 · 3.27×** | 3,488 (0.82×) | 4,105 · 1.85× | 0 % / 113 % / 0 / 3 / 0 | 1.107 · 1,284 KiB · 0.107 | 9.0–9.8 · 0.027 / 0.006 s | the create law MET; **`MISS(must-stay-0: m0 appender_flush_ceiling_overruns +1)`** — 1,101 ms at 04:45:22Z |
-| 2 · 8 | **22,941 · 4.61×** | 2,820 (0.66×) | **7,594 · 3.43×** | 0 % / 104 % / 0 / 4 / 0 | 1.090 · 1,263 KiB · 0.090 | 10.8–13.9 (2,871–3,697 c/s each; Σ 26,172 = **5.25×**, the bound) · **setup 9.120 s OUTSIDE the clock** (m64 3.021 / m65 3.018 / m66 3.014 s, m63 0.039 s, the other five 4–5 ms), skew inside the clock 0.012 s | MISS on both wall laws (creates 4.61× vs ≥ 5.6×; ingest 3.43×) |
+| 2 · 8 | **22,941 · 4.61×** | 2,820 (0.66×) | **7,594 · 3.43×** | 0 % / 104 % / 0 / 4 / 0 | 1.090 · 1,263 KiB · 0.090 | 10.8–13.9 (2,871–3,697 c/s each; Σ 26,172 = **5.25×**, the bound) · **setup 9.120 s OUTSIDE the clock** (m64 3.021 / m65 3.018 / m66 3.014 s, m63 0.039 s, the other five 4–5 ms), skew inside the clock 0.012 s | MISS on both wall laws (creates 4.61× vs ≥ 5.6×; ingest 3.43×); **set 2's `MGR_CPU` (104 %) and `C/CPU-S` (0.66×) still carry the setup's CPU** — the start snapshots and `cpu0` were sampled BEFORE the setup while `t0` followed it (review round 1, Issue 4; moved to `t0` on the branch after the run), so the manager's flip + the fresh joiners' waits sit in their numerators over the storms' wall alone (set 1's 70 % / 0.73× are the same two terms on the old clock) |
 
 **The wall law, re-read with the launch MEASURED.** The third pass
 INFERRED ≈ 3.9 s of skew at N = 8; the leg now stamps every storm's launch
@@ -2334,7 +2339,9 @@ s = 2,871–3,697 c/s each, launch skew 12 ms) against an upper bound of
 5.25× (Σ per-writer rates; exact only at zero skew) — **the wall law
 MISSES ≥ 5.6× on this venue by the storms' own concurrency, not by the
 launch** (§3.9.3's co-located term: eight daemons and eight 16-thread
-clients on 32 cores; `C/CPU-S` 4,244 → 2,820 = 0.66×). The per-NODE law
+clients on 32 cores; `C/CPU-S` 4,244 → 2,820 = 0.66× — set 2's CPU faces
+include the setup's CPU, Issue 4 above; the flip binary's row reads them
+clean). The per-NODE law
 stays PR 15's. **The ingest law's N = 1 base is a sub-second
 measurement**: one writer's 1 GiB `dd conv=fsync` lands in 0.46–0.77 s
 and read 1,327 / 1,506 / 2,215 MiB/s across the three box row sets on two
@@ -2608,7 +2615,9 @@ a staggered row's work runs before that instant; the hygiene faces; the
 end-of-leg snapshot; the post-leave census), `cea35691` (the end-of-leg
 snapshot's label — set 2's leg died on the missing `m0_pend1.json` after
 its table; it would have died on the must-stay-0 set one line later
-either way, so nothing of set 2 is lost to it). Artifacts:
+either way, so nothing of set 2 is lost to it), and after the review the
+start snapshots + `cpu0` moved to `t0` with the clock's law logged once
+(Issue 4). Artifacts:
 `/scratch/tmp/sym-box/13g-nw-20260924-0{41135,44235}-scale/` (+ `.log`s;
 per set `scale-r1/symscale-*/` — the table, `symscale-faces.txt`,
 `launch-n*.tsv`, `create-n*-w*.txt` with `launch_ts= end_ts=`,
@@ -5608,7 +5617,7 @@ reduction; the laptop ran nothing of this rung but the reductions).
 
 > **Status (the FOURTH box pass — gate 3 on PR 13g's binary `230e95dd`, `perf/sym-box-13g`, 2026-09-24 04:05 → 04:57 UTC; §3.9.6 — the re-read the brief asked for). The decision stays NOT YET; the list shortens by one item and grows by one finding.** **Reading MET on the box on this binary:** **F-R5** — FIXED as a verdict on every joiner in two row sets (rings 768 KiB–2.3 MiB, 1–3 wire grants per joiner per row, reactive 0, returns ≪ compactions, the manager's N = 8 row 88 verbs / 0.114 s of service against the third pass's 892 / 2.93 s, the closure exact set-wide); **gate 3's ROW SET completes to its oracle on the box for the first time** (set 1: 0 trips through N = 1/2/4/8, deleted-stays-deleted 0 / 3,000 ×2, fsck clean); and from the third pass, not re-run — gate 1 (by the rule), gate 3c (all three laws ×2), gate 7@N=32 (×2), gate 2, gate 3b, gate 5. **The exact list that does NOT read MET:**
 > * **the must-stay-0 tripwire `appender_flush_ceiling_overruns`** — NOT closed: **0 in set 1 (8 writer-rows at the manager, 44 joiner-rows in the pass), +1 in set 2 — the manager's volume 1 at 1,101 ms, 1 ms past, at the N = 4 storm's END with ONE verb served on that volume across the row.** The third pass's class (the onset after a quiet horizon under the joiners' grant storm) is GONE — exercised at N = 2 / 4 in both sets (terms 6–7 ms at the storms' starts) and not tripped, the grant burst absent; what tripped is the derivation's RESIDUE: the LIVE projection under-priced the storm's END cycle by ≈ 65 ms (84 ms at the tick's decision against the cycle's ≈ 150 ms pre-barrier wall — the create-end snapshot preceded the trip with overruns 0; the cycle's own term 151 and lateness 35 entered the horizon after it; no barrier face reads above 2 ms), and with the 35 ms lateness the fixed two-tick margin was 1 ms short. §7 item 3's next piece (the projection's growth between the decision and the flush + the lateness term, with the per-cycle tape that discriminates) — a FLIP PRECONDITION still, now a 1-in-8-rows, 1 ms class with no service term behind it;
-> * **gate 3's WALL law at N = 8** — 4.61× creates on the storms' own clock (set 2, the setup outside the clock; per-writer storms 10.8–13.9 s, the launch skew 12 ms; Σ per-writer rates 5.25× the bound) vs ≥ 5.6× — the co-located venue's term (§3.9.3; `C/CPU-S` 0.66×), no longer a launch artifact: the third pass's inferred 3.9 s was a MEASURED 9.1 s of three fresh joiners' 3.0 s `mkdir`s into the freshly striped root, taken out of the row's clock; the ingest multiple is its sub-second N = 1 base's noise (the N = 8 absolute 7.3–7.6 GB/s across three passes) — **the per-NODE law UNMEASURED (PR 15's cloud row, its instrument)**;
+> * **gate 3's WALL law at N = 8** — 4.61× creates on the storms' own clock (set 2, the setup outside the clock; per-writer storms 10.8–13.9 s, the launch skew 12 ms; Σ per-writer rates 5.25× the bound) vs ≥ 5.6× — the co-located venue's term (§3.9.3; `C/CPU-S` 0.66× — a reading that still folds the setup's CPU in, Issue 4), no longer a launch artifact: the third pass's inferred 3.9 s was a MEASURED 9.1 s of three fresh joiners' 3.0 s `mkdir`s into the freshly striped root, taken out of the row's clock; the ingest multiple is its sub-second N = 1 base's noise (the N = 8 absolute 7.3–7.6 GB/s across three passes) — **the per-NODE law UNMEASURED (PR 15's cloud row, its instrument)**;
 > * **F-R6 (new, §3.9.6.3 / §7 item 17)** — a joined writer's FORGET-driven reclaim prices destroys for the HOLDER's inos through its stale projection (6,782 / 7,266 withheld per set; nothing destroyed — the belt is the commit door's foreign-slot refusal, `slot_door_refusals` [0, 0] on m60 through the end of both legs; defect 18 / 34's 256-restart loop under it, PR 13b's "9/10" class in production shape; the fix sites `queue_reclaim_inode` / `reclaim_orphaned_batch` and `destroy_entry_bytes`) — a CPU + log storm on a path a token client must not take, invisible to the row's oracle; a PR 14 item beside the served-mutation hook's `ENOENT`-at-WARN (272 k / 275 k lines per set — 21–46 % of the served invalidations, `session.rs:1092`) and the fresh joiner's 3.0 s first create into a striped root;
 > * **gate 4** — the kill matrix ×10 from zero on this binary: NOT RUN in this rung (LOCAL by the venue law; the counts restart on the flip binary).
 >

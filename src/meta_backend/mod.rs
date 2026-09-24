@@ -2916,6 +2916,25 @@ impl RoutedMetaBackend {
         Ok(())
     }
 
+    /// **Does this mount's reclaim judge `ino`?** (symmetric PR 13h, F-R6
+    /// — design §5.1: the slot is the ownership unit). The mount-time
+    /// corpse sweep's law at the FORGET-driven reclaim's entry
+    /// ([`kv::backend::KvMetaBackend::inode_plane_owns_slot`]): `true` on
+    /// every unarmed mount (one relaxed load), for a slot this mount
+    /// leases, and for an unleased slot on the volume's manager; `false`
+    /// for a slot another appender leases and for an unleased slot on a
+    /// joined appender — an object this mount merely cached as a TOKEN
+    /// CLIENT, whose forget accounts nothing here (its layout, xattrs and
+    /// references are read at NO point: the box's joiner priced 6,782
+    /// destroys of the manager's corpses off its stale projection). A
+    /// volume the route cannot name is nobody's to reclaim.
+    pub fn owns_inode_reclaim(&self, ino: Ino) -> bool {
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.volumes
+            .get(v_idx)
+            .is_some_and(|v| v.inode_plane_owns_slot(local_ino))
+    }
+
     /// The journal payload `ino`'s destroy stages on its home volume —
     /// the inode `Delete` plus one per xattr, in the admission's own
     /// framing ([`kv::backend::KvMetaBackend::destroy_entry_bytes`]). The

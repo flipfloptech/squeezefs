@@ -13394,6 +13394,10 @@ impl SqueezefsFilesystem {
                     load(&meta_kv::META_KV_PROJECTION_ROOT_REFRESHES),
                 );
                 metrics.insert(
+                    "meta_kv_projection_walk_exhaustions".into(),
+                    load(&meta_kv::META_KV_PROJECTION_WALK_EXHAUSTIONS),
+                );
+                metrics.insert(
                     "meta_kv_node_append_bytes".into(),
                     load(&meta_kv::META_KV_NODE_APPEND_BYTES),
                 );
@@ -25465,6 +25469,10 @@ impl SqueezefsFilesystem {
     /// group-committed destroy transaction per volume (design §4.5, PR 5).
     ///
     /// Preserves today's per-ino split around the destroy:
+    /// - the slot-ownership gate FIRST (symmetric PR 13h, F-R6 —
+    ///   `RoutedMetaBackend::owns_inode_reclaim`): an ino in a forest slot
+    ///   this mount does not reclaim is a token client's forget, dropped
+    ///   and counted (`reclaim_foreign_slot_forgets`) before any read;
     /// - admission re-checks (reserved / open / getattr / nlink) per ino —
     ///   the drain-time complement of `queue_reclaim_inode`'s enqueue check;
     /// - the data-path teardown (`router.prepare_reclaim`) runs BEFORE the
@@ -25509,6 +25517,30 @@ impl SqueezefsFilesystem {
             Vec::new();
         for ino in inos {
             if ino <= 1 || is_virtual_ino(ino) {
+                continue;
+            }
+            // F-R6 (symmetric PR 13h; design §5.1 — the slot is the
+            // ownership unit): an ino in a forest slot this mount does not
+            // reclaim — another appender's lease, or an unleased slot on a
+            // JOINED appender — is an object this mount merely cached as a
+            // TOKEN CLIENT; its forget accounts NOTHING here. The gate sits
+            // BEFORE every read of the record: the admission getattr below
+            // is a divert round trip per forgotten ino, the plan's layout
+            // read another, and the destroy's pricing walked this daemon's
+            // stale PROJECTION of the holder's xattr tree (the box's
+            // joiner: 6,782 `destroy WITHHELD` per row set over recycled
+            // extents, defect 18 / 34's loop under it) before its own door
+            // refused the foreign slot. The holder's own FORGET reclaims
+            // its corpse; the mount-time corpse sweep takes the same
+            // predicate. One relaxed load on every unarmed mount.
+            if !backend.owns_inode_reclaim(ino) {
+                METRICS
+                    .reclaim_foreign_slot_forgets
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    "RECLAIM: ino = {ino} lives in a forest slot this mount does not reclaim \
+                     (a token client's forget) — dropped (reclaim_foreign_slot_forgets)"
+                );
                 continue;
             }
             // OPEN/RECLAIM HANDSHAKE (fstests generic/795 — the destroy-

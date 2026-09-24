@@ -1272,6 +1272,13 @@ impl KvTree {
             }
         }
         let root = self.root();
+        let is_projection = self.cache.is_projection(self.forest_slot);
+        if is_projection {
+            // The bounded refusal's count (PR 13h, F-R6): a projection walk
+            // that exhausted its budget is a read of another appender's
+            // tree this mount should not have taken locally.
+            super::META_KV_PROJECTION_WALK_EXHAUSTIONS.fetch_add(1, Ordering::Relaxed);
+        }
         Err(KvError::Corrupt(format!(
             "tree {} (slot {:?}, root {:#x}@{}{}): traversal retry budget exhausted descending \
              to level {target_level} (routing loop — SMO protocol bug) restarts \
@@ -1281,8 +1288,8 @@ impl KvTree {
             self.forest_slot,
             root.addr,
             root.seq,
-            if self.cache.is_projection(self.forest_slot) {
-                ", a PROJECTION here"
+            if is_projection {
+                ", a PROJECTION here (meta_kv_projection_walk_exhaustions)"
             } else {
                 ""
             }

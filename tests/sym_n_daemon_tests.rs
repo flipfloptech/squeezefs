@@ -13921,8 +13921,9 @@ async fn a_joiners_forget_of_a_foreign_slots_ino_prices_no_destroy_and_reclaims_
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
-    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared"), (SLOT_B, "mine")]).await;
     let shared = dirs[0];
+    let mine = dirs[1];
     let manager = open_under(&uris, &Knobs::armed()).await;
     let mvol = Arc::clone(&manager.volumes[0]);
     let mvenue = DaemonVenue::stand_up(&manager, true, "manager-custody-13h-forget").await;
@@ -14086,9 +14087,10 @@ async fn a_joiners_forget_of_a_foreign_slots_ino_prices_no_destroy_and_reclaims_
         );
     }
 
-    // The joiner's OWN file (its rotor slot) reclaims as before.
+    // The joiner's OWN file (its first touch of the second seeded
+    // directory takes that slot over the wire) reclaims as before.
     let own = joiner
-        .create(1, "own", libc::S_IFREG | 0o644, 1000, 1000)
+        .create(mine, "own", libc::S_IFREG | 0o644, 1000, 1000)
         .await
         .expect("the joiner's own file")
         .ino;
@@ -14096,7 +14098,10 @@ async fn a_joiners_forget_of_a_foreign_slots_ino_prices_no_destroy_and_reclaims_
         jvol.inode_plane_owns_slot(joiner.route_ino(own).1),
         "the joiner leases its own file's slot"
     );
-    joiner.unlink(1, "own").await.expect("the joiner's unlink");
+    joiner
+        .unlink(mine, "own")
+        .await
+        .expect("the joiner's unlink");
     jf.fs.reclaim_orphaned_batch(vec![own]).await;
     let (refused3, foreign3) = reclaim_faces();
     assert_eq!(refused3, refused2, "an own-slot destroy commits");
@@ -14119,4 +14124,75 @@ async fn a_joiners_forget_of_a_foreign_slots_ino_prices_no_destroy_and_reclaims_
     drop(mvol);
     drop(manager);
     fsck_clean(&uris).await;
+}
+
+/// **The unarmed law, byte-identical** (F-R6's other half): on a FLAT
+/// volume and on an UNARMED forest volume (the knob off — the PR 1–3
+/// forest, every slot the mount's) the reclaim's slot gate is one relaxed
+/// load answering "mine" for every ino: a FORGET-driven reclaim destroys
+/// every corpse exactly as shipped, `reclaim_foreign_slot_forgets` never
+/// moves, nothing is withheld.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forget_on_an_unarmed_mount_reclaims_every_corpse_as_shipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    // A FLAT member carrying the format config (the offline fsck's input),
+    // the seam cleared; an unarmed forest member beside it.
+    let flat = {
+        let p = dir.path().join("flat");
+        std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
+        let plan = squeezefs::meta_backend::plan_meta_slot_set(1).expect("derived plan");
+        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        let opts = squeezefs::meta_backend::kv::builder::FormatV3Options {
+            format_config_xattr: Some(format_config_for(dir.path())),
+            ..set_opts()
+        };
+        squeezefs::meta_backend::kv::builder::format_v3_stamped(
+            &p,
+            VOL_LEN,
+            &opts,
+            plan.stamps[0].clone(),
+        )
+        .await
+        .expect("format flat member");
+        p.display().to_string()
+    };
+    let forest_dir = tempfile::tempdir().unwrap();
+    let forest = format_stamped_set_with_config(forest_dir.path(), 1)
+        .await
+        .remove(0);
+    for (uri, tag) in [(flat, "vol-13h-flat"), (forest, "vol-13h-forest-unarmed")] {
+        let routed = open_under(std::slice::from_ref(&uri), &Knobs::unarmed()).await;
+        let vol = Arc::clone(&routed.volumes[0]);
+        let files = create_files(&routed, 1, "c", 8).await;
+        for (name, _) in &files {
+            routed.unlink(1, name).await.expect("unlink");
+        }
+        let inos: Vec<u64> = files.iter().map(|(_, ino)| *ino).collect();
+        for ino in &inos {
+            assert!(
+                routed.owns_inode_reclaim(*ino),
+                "{tag}: an unarmed mount reclaims every ino"
+            );
+            assert_eq!(routed.getattr(*ino).await.expect("the corpse").nlink, 0);
+        }
+        let f = fs_in_front_of(&routed, tag).await;
+        let (refused0, foreign0) = reclaim_faces();
+        f.fs.reclaim_orphaned_batch(inos.clone()).await;
+        let (refused1, foreign1) = reclaim_faces();
+        assert_eq!(refused1, refused0, "{tag}: every destroy commits");
+        assert_eq!(foreign1, foreign0, "{tag}: no forget reads as foreign");
+        for ino in &inos {
+            assert!(
+                routed.getattr(*ino).await.is_err(),
+                "{tag}: the corpse is destroyed by the FORGET path, as shipped"
+            );
+        }
+        drop(f);
+        shutdown(&routed).await;
+        drop(vol);
+        drop(routed);
+        fsck_clean(std::slice::from_ref(&uri)).await;
+    }
 }

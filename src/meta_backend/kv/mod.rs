@@ -374,6 +374,19 @@ pub static META_KV_FLUSH_FLOOR_KEPT: AtomicU64 = AtomicU64::new(0);
 /// manager and every flat mount.
 pub static META_KV_PROJECTION_ROOT_REFRESHES: AtomicU64 = AtomicU64::new(0);
 
+/// Traversals of a PROJECTION tree that EXHAUSTED the restart budget —
+/// every refresh re-adopted a root the holder had already moved past
+/// again, or found no newer ledger seq (defect 18 / 34's class in its
+/// terminal shape: the box's joiner read `restarts [root-seq] = 256` on
+/// 60+ of the manager's slots while pricing destroys it had no business
+/// pricing — symmetric PR 13h, F-R6). The walk is BOUNDED (the budget,
+/// each restart a yield) and refuses `Corrupt` to its caller; this is its
+/// count. Surfaced as `meta_kv_projection_walk_exhaustions`; 0 on the
+/// manager and every flat mount, and 0 on a joiner whose reads of a
+/// foreign slot all go through its holder's token plane — growth names a
+/// path that still reads a projection.
+pub static META_KV_PROJECTION_WALK_EXHAUSTIONS: AtomicU64 = AtomicU64::new(0);
+
 /// Ledger records written by a checkpoint-class durable step that
 /// CONSUMED a checkpoint seq outside a cycle — PR 2's ring growth, the
 /// appender leave, PR 10's region release (`KvMetaBackend::

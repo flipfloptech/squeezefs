@@ -14780,6 +14780,7 @@ struct ReclaimFaces {
     hint_inos: u64,
     hint_failures: u64,
     served: u64,
+    forwarded: u64,
     misrouted: u64,
 }
 
@@ -14794,6 +14795,7 @@ fn reclaim_faces_all() -> ReclaimFaces {
         hint_inos: m.reclaim_hint_inos_shipped.load(Relaxed),
         hint_failures: m.reclaim_hint_failures.load(Relaxed),
         served: m.reclaim_hints_served.load(Relaxed),
+        forwarded: m.reclaim_hints_forwarded.load(Relaxed),
         misrouted: m.reclaim_hints_misrouted.load(Relaxed),
     }
 }
@@ -14916,8 +14918,11 @@ async fn tear_down_hint_fixture(fx: HintFixture, uris: &[String]) {
 /// forgets` at the forgetter, `reclaim_hints_served` at the reclaimer.
 /// RED on `00edad1a`: the forget is counted FOREIGN, nothing ships, the
 /// corpse stands at the manager for ever. GREEN: destroyed within the
-/// manager's reclaim cadence (one 20 ms batch window), the joiner's divert
-/// reads it gone, the post-leave census clean.
+/// manager's reclaim cadence (one 20 ms batch window) — the record gone
+/// at the manager, its destroy committed (nothing withheld), the
+/// post-leave census clean. The fixture is metadata-only, so the record
+/// is the witness; the blocks a data-volume corpse holds ride the same
+/// destroy (the manager's own FORGET path, releases in the entry).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_joiners_forget_of_a_corpse_in_a_released_slot_is_reclaimed_by_the_manager() {
     let dir = tempfile::tempdir().unwrap();
@@ -15015,10 +15020,9 @@ async fn a_joiners_forget_of_a_corpse_in_a_released_slot_is_reclaimed_by_the_man
     );
     assert_eq!(f2.misrouted, f0.misrouted, "nothing misrouted");
     assert_eq!(f2.refused, f0.refused, "the manager's destroy committed");
-    assert!(
-        fx.joiner.getattr(f).await.is_err(),
-        "the joiner's divert reads the corpse gone"
-    );
+    // (The joiner's own read of the ino here is its PROJECTION — this
+    // fixture arms no custody divert; the manager's word above is the
+    // record's.)
     tear_down_hint_fixture(fx, &uris).await;
 }
 
@@ -15116,6 +15120,11 @@ async fn a_corpse_whose_slot_moved_between_the_unlink_and_the_forget_is_reclaime
         f2.served - f0.served,
         1,
         "the holder admitted the hinted ino"
+    );
+    assert_eq!(
+        (f2.forwarded, f2.misrouted),
+        (f0.forwarded, f0.misrouted),
+        "the forgetter asked the manager's word for the lessee: nothing forwarded, nothing dropped"
     );
     assert_eq!(f2.refused, f0.refused, "the holder's destroy committed");
     tear_down_hint_fixture(fx, &uris).await;

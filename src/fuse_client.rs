@@ -6232,9 +6232,14 @@ pub struct Metrics {
     /// served side; Σ over a fleet ≡ Σ `reclaim_hint_inos_shipped` −
     /// misrouted at rest).
     pub reclaim_hints_served: Align64<AtomicU64>,
-    /// Hinted inos whose slot this mount does not reclaim either (the slot
-    /// moved again between the peer's resolve and the serve) — dropped,
-    /// never read; the corpse's reclaimer is its next holder's sweep.
+    /// Hints this mount FORWARDED (one batch per reclaimer) for inos it
+    /// does not reclaim either — the slot moved again between the
+    /// forgetter's resolve and the serve — to the reclaimer its table
+    /// names, at most `RECLAIM_HINT_MAX_HOPS` times per hint.
+    pub reclaim_hints_forwarded: Align64<AtomicU64>,
+    /// Hinted inos this mount neither reclaims nor could forward (the hop
+    /// bound reached, or their reclaimer unreachable) — dropped, never
+    /// read; the corpse's reclaimer is its next holder's sweep.
     pub reclaim_hints_misrouted: Align64<AtomicU64>,
     /// Joint release+destroy entries committed (each carried ≥ 1
     /// reference release beside its inode/xattr `Delete`s) — the
@@ -11843,6 +11848,7 @@ impl SqueezefsFilesystem {
                 "reclaim_hint_inos_shipped": METRICS.reclaim_hint_inos_shipped.load(Ordering::Relaxed),
                 "reclaim_hint_failures": METRICS.reclaim_hint_failures.load(Ordering::Relaxed),
                 "reclaim_hints_served": METRICS.reclaim_hints_served.load(Ordering::Relaxed),
+                "reclaim_hints_forwarded": METRICS.reclaim_hints_forwarded.load(Ordering::Relaxed),
                 "reclaim_hints_misrouted": METRICS.reclaim_hints_misrouted.load(Ordering::Relaxed),
                 "reclaim_release_destroy_joint_commits": METRICS.reclaim_release_destroy_joint_commits.load(Ordering::Relaxed),
                 "reclaim_single_ino_chunked_destroys": METRICS.reclaim_single_ino_chunked_destroys.load(Ordering::Relaxed),
@@ -25608,6 +25614,15 @@ impl SqueezefsFilesystem {
         // work, never driven here.
         let mut owned_elsewhere: Vec<(u64, std::sync::Arc<squeezefs_ipc::sqz_notify::Notify>)> =
             Vec::new();
+        // Forgotten inos whose RECLAIMER is a peer, grouped by it — one
+        // reclaim hint per reclaimer per batch (PR 13h, Issue 1) — and the
+        // batch's reclaim homes, resolved ONCE per slot (a released slot's
+        // corpses arrive together; the resolve may be a wire word).
+        let mut hints: Vec<(u32, std::sync::Arc<str>, Vec<u64>)> = Vec::new();
+        let mut homes: std::collections::HashMap<
+            (usize, crate::meta_backend::kv::record::ForestSlot),
+            crate::meta_backend::ReclaimHome,
+        > = std::collections::HashMap::new();
         for ino in inos {
             if ino <= 1 || is_virtual_ino(ino) {
                 continue;
@@ -25623,18 +25638,49 @@ impl SqueezefsFilesystem {
             // stale PROJECTION of the holder's xattr tree (the box's
             // joiner: 6,782 `destroy WITHHELD` per row set over recycled
             // extents, defect 18 / 34's loop under it) before its own door
-            // refused the foreign slot. The holder's own FORGET reclaims
-            // its corpse; the mount-time corpse sweep takes the same
-            // predicate. One relaxed load on every unarmed mount.
-            if !backend.owns_inode_reclaim(ino) {
-                METRICS
-                    .reclaim_foreign_slot_forgets
-                    .fetch_add(1, Ordering::Relaxed);
-                debug!(
-                    "RECLAIM: ino = {ino} lives in a forest slot this mount does not reclaim \
-                     (a token client's forget) — dropped (reclaim_foreign_slot_forgets)"
-                );
-                continue;
+            // refused the foreign slot. The corpse's RECLAIMER is its
+            // slot's holder — the manager for a slot nobody leases (review
+            // round 1, Issue 1: an unlinked-but-open file whose slot the
+            // cadence released before the close has no kernel to FORGET it
+            // there) — and this forget TRAVELS to it as a reclaim hint
+            // (`ship_reclaim_hint`, batched below), which its own
+            // FORGET-driven reclaim judges. One relaxed load on every
+            // unarmed mount.
+            let home = match homes.entry(backend.reclaim_slot_key(ino)) {
+                std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(backend.reclaim_home(ino).await).clone()
+                }
+            };
+            match home {
+                crate::meta_backend::ReclaimHome::Local => {}
+                crate::meta_backend::ReclaimHome::Peer {
+                    reclaimer,
+                    unleased,
+                    endpoint,
+                } => {
+                    Self::note_peer_reclaim_forget(ino, reclaimer, unleased);
+                    match hints.iter_mut().find(|(r, _, _)| *r == reclaimer) {
+                        Some((_, _, list)) => list.push(ino),
+                        None => hints.push((reclaimer, endpoint, vec![ino])),
+                    }
+                    continue;
+                }
+                crate::meta_backend::ReclaimHome::Unreachable {
+                    reclaimer,
+                    unleased,
+                } => {
+                    Self::note_peer_reclaim_forget(ino, reclaimer, unleased);
+                    METRICS
+                        .reclaim_hint_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        "RECLAIM: ino = {ino}'s reclaimer (appender {reclaimer}) has no endpoint \
+                         bound here — the corpse stays for its mount-time sweep \
+                         (reclaim_hint_failures)"
+                    );
+                    continue;
+                }
             }
             // OPEN/RECLAIM HANDSHAKE (fstests generic/795 — the destroy-
             // under-a-live-fd race): claim the in-flight slot FIRST, then
@@ -25712,6 +25758,16 @@ impl SqueezefsFilesystem {
         if !admitted.is_empty() {
             self.reclaim_admitted_batch(admitted).await;
         }
+        // The peers' share of this batch: one hint per reclaimer, its
+        // batch cap the wire's (`RECLAIM_HINT_MAX_INOS` = this pool's own
+        // batch ceiling, so a batch never needs to split).
+        for (reclaimer, endpoint, list) in hints {
+            for chunk in list.chunks(crate::meta_ship::wire::RECLAIM_HINT_MAX_INOS) {
+                backend
+                    .ship_reclaim_hint(reclaimer, &endpoint, chunk.to_vec(), 0)
+                    .await;
+            }
+        }
         // Every claim this batch held is released above (both edges of
         // the destroy run the per-ino teardown), so waiting here can never
         // close a cycle with a batch that is itself waiting on us.
@@ -25731,6 +25787,27 @@ impl SqueezefsFilesystem {
                 released.await;
             }
         }
+    }
+
+    /// Count a FORGET whose reclaimer is a peer, by class (PR 13h, Issue 1
+    /// (b)): a slot another appender LEASES (`reclaim_foreign_slot_forgets`
+    /// — the box's token-client shape) or a slot nobody leases on a joined
+    /// appender (`reclaim_unleased_slot_forgets` — the released-slot
+    /// corpse, the manager's).
+    fn note_peer_reclaim_forget(ino: u64, reclaimer: u32, unleased: bool) {
+        let (gauge, class) = if unleased {
+            (&METRICS.reclaim_unleased_slot_forgets, "an UNLEASED slot")
+        } else {
+            (
+                &METRICS.reclaim_foreign_slot_forgets,
+                "a slot another appender leases",
+            )
+        };
+        gauge.fetch_add(1, Ordering::Relaxed);
+        debug!(
+            "RECLAIM: ino = {ino} lives in {class} (a token client's forget) — nothing read here; \
+             the forget travels to appender {reclaimer} as a reclaim hint"
+        );
     }
 
     /// Drop this batch's claim on `ino` and release anyone parked on it
@@ -33336,6 +33413,12 @@ async fn gather_reclaim_batch(
     batch
 }
 
+/// The FORGET-driven reclaim pool's batch ceiling (`SQUEEZEFS_INODE_RECLAIM_
+/// BATCH`'s clamp) — and, tie-tested, the most inos one reclaim HINT
+/// carries (`meta_ship::wire::RECLAIM_HINT_MAX_INOS`): a hint is one
+/// batch's foreign share.
+pub const INODE_RECLAIM_BATCH_MAX: usize = 1024;
+
 async fn run_reclaim_worker_pool(
     mut rx: squeezefs_ipc::sqz_channel::mpsc::Receiver<u64>,
     fs: SqueezefsFilesystem,
@@ -33353,7 +33436,7 @@ async fn run_reclaim_worker_pool(
     let batch_cap = std::env::var("SQUEEZEFS_INODE_RECLAIM_BATCH")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .map(|v| v.clamp(1, 1024))
+        .map(|v| v.clamp(1, INODE_RECLAIM_BATCH_MAX))
         .unwrap_or(64);
     let window_ms = std::env::var("SQUEEZEFS_INODE_RECLAIM_WINDOW_MS")
         .ok()

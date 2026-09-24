@@ -428,6 +428,14 @@ fn check_dir_stripe_bodies(data: &[u8]) {
                 id: 3,
                 call: MetaCall::DestroyStripe { stripe: dir },
             },
+            // PR 13h: the reclaim hint's ino list (bounded by the frame cap).
+            MetaOp {
+                id: 4,
+                call: MetaCall::ReclaimHint {
+                    inos: vec![dir, dir ^ u64::from(index), scope],
+                    hops: (index & 1) as u8,
+                },
+            },
         ],
     };
     let wire = encode_request(&frame).expect("a striping frame encodes");

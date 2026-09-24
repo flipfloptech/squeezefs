@@ -2822,6 +2822,8 @@ proptest! {
                 MetaOp { id: 1, call: MetaCall::SupplyStripeIno { dir, index, supplier } },
                 MetaOp { id: 2, call: MetaCall::IsEmpty { dir, scope } },
                 MetaOp { id: 3, call: MetaCall::DestroyStripe { stripe: dir } },
+                // PR 13h: the reclaim hint's ino list.
+                MetaOp { id: 4, call: MetaCall::ReclaimHint { inos: vec![dir, dir ^ u64::from(index), scope], hops: (index & 1) as u8 } },
             ],
         };
         let enc = encode_request(&frame).expect("encodes");

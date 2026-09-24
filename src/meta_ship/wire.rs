@@ -222,6 +222,14 @@ pub enum MetaVerb {
     /// Destroy a DYING (`nlink 0`, empty) stripe's record at its holder;
     /// idempotent — an absent record is `Unit`.
     DestroyStripe = 0x92,
+    // PR 13h (F-R6, review round 1 Issue 1): the block 0xA0–0xAF.
+    /// A peer's FORGET of corpses in slots THIS mount reclaims — handed
+    /// to this mount's own FORGET-driven reclaim as if its kernel had
+    /// forgotten them (design §5.1: the slot is the ownership unit; a
+    /// corpse's reclaimer is its slot's holder, the manager for an
+    /// unleased slot). Idempotent by nature: the reclaim's admission
+    /// re-checks every ino; a resend re-enqueues what the first drained.
+    ReclaimHint = 0xA0,
 }
 
 impl MetaVerb {
@@ -247,6 +255,7 @@ impl MetaVerb {
         MetaVerb::SupplyStripeIno,
         MetaVerb::IsEmpty,
         MetaVerb::DestroyStripe,
+        MetaVerb::ReclaimHint,
     ];
 
     /// The verb's wire code.
@@ -282,6 +291,7 @@ impl MetaVerb {
             MetaVerb::SupplyStripeIno => "supply_stripe_ino",
             MetaVerb::IsEmpty => "is_empty",
             MetaVerb::DestroyStripe => "destroy_stripe",
+            MetaVerb::ReclaimHint => "reclaim_hint",
         }
     }
 
@@ -299,7 +309,11 @@ impl MetaVerb {
             | MetaVerb::Getxattr
             | MetaVerb::Listxattr
             | MetaVerb::LookupExact
-            | MetaVerb::IsEmpty => false,
+            | MetaVerb::IsEmpty
+            // A hint writes nothing itself — the served reclaim it feeds
+            // re-checks every ino, so a resend is harmless; it takes no
+            // grant and rides no dedup window.
+            | MetaVerb::ReclaimHint => false,
             // A supply MINTS (a record in the supplier's slot) and a
             // destroy deletes one: both ride the dedup window.
             MetaVerb::SupplyStripeIno
@@ -450,7 +464,35 @@ pub enum MetaCall {
     DestroyStripe {
         stripe: u64,
     },
+    // PR 13h — appended (`MetaVerb` 0xA0–0xAF).
+    /// The peer's kernel FORGOT `inos` — GLOBAL inos in slots the served
+    /// mount reclaims; each is judged by the served mount's own
+    /// FORGET-driven reclaim (`MetaReply::Unit`). Bounded at
+    /// [`RECLAIM_HINT_MAX_INOS`] per hint (the reclaim worker's batch cap):
+    /// a longer frame is rejected before anything proportional to it runs.
+    ReclaimHint {
+        inos: Vec<u64>,
+        /// Forwards this hint has taken: a served mount that is not an
+        /// ino's reclaimer either (the slot moved again, a stale lessee
+        /// projection at the forgetter) FORWARDS it to the reclaimer tree
+        /// 0 names, at most [`RECLAIM_HINT_MAX_HOPS`] times; past that the
+        /// ino is dropped and counted (`reclaim_hints_misrouted`).
+        hops: u8,
+    },
 }
+
+/// The most inos one [`MetaCall::ReclaimHint`] carries — the FORGET-driven
+/// reclaim's own batch cap (`SQUEEZEFS_INODE_RECLAIM_BATCH`'s clamp
+/// ceiling, `fuse_client::INODE_RECLAIM_BATCH_MAX`; tie-tested): a hint is
+/// one reclaim batch's foreign share, never more.
+pub const RECLAIM_HINT_MAX_INOS: usize = 1024;
+
+/// The forwards a reclaim hint may take (its `hops` bound): the
+/// forgetter's resolve is the manager's word, so one forward — from a
+/// holder the slot left under the ship to the one tree 0 names now — is
+/// the legal schedule; a second stale answer drops the ino to its next
+/// holder's sweep. A count, so a lease ping-pong can never loop a hint.
+pub const RECLAIM_HINT_MAX_HOPS: u8 = 1;
 
 impl MetaCall {
     /// The verb this call is.
@@ -476,6 +518,7 @@ impl MetaCall {
             MetaCall::SupplyStripeIno { .. } => MetaVerb::SupplyStripeIno,
             MetaCall::IsEmpty { .. } => MetaVerb::IsEmpty,
             MetaCall::DestroyStripe { .. } => MetaVerb::DestroyStripe,
+            MetaCall::ReclaimHint { .. } => MetaVerb::ReclaimHint,
         }
     }
 
@@ -526,6 +569,7 @@ impl MetaCall {
             MetaCall::XvRelease { ino, .. } => *ino,
             MetaCall::SupplyStripeIno { dir, .. } | MetaCall::IsEmpty { dir, .. } => *dir,
             MetaCall::DestroyStripe { stripe } => *stripe,
+            MetaCall::ReclaimHint { inos, .. } => inos.first().copied().unwrap_or(0),
         }
     }
 
@@ -552,6 +596,7 @@ impl MetaCall {
                 .map(|(i, _)| *i)
                 .chain(dentries.iter().map(|(p, _, _)| *p))
                 .collect(),
+            MetaCall::ReclaimHint { inos, .. } => inos.clone(),
             other => vec![other.primary_ino()],
         }
     }

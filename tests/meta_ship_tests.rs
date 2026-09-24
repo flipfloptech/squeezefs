@@ -199,14 +199,16 @@ const DIR: u32 = libc::S_IFDIR | 0o755;
 /// check's exact read) and the travelling guard's pair `XvGuards` /
 /// `XvRelease` — verbs of the symmetric plane, not trait members.
 /// **Symmetric PR 7b** appended the striping block (0x90–0x9F):
-/// `SupplyStripeIno`, `IsEmpty`, `DestroyStripe`.
+/// `SupplyStripeIno`, `IsEmpty`, `DestroyStripe`. **Symmetric PR 13h**
+/// appended the reclaim block (0xA0–0xAF): `ReclaimHint` — a peer's FORGET
+/// of corpses in slots the served mount reclaims.
 #[test]
 fn the_wire_vocabulary_covers_every_shipped_trait_member() {
     assert_eq!(
         MetaVerb::ALL.len(),
-        20,
+        21,
         "13 wire verbs cover the trait's 13 required members, plus PR 6's four symmetric \
-         verbs and PR 7b's three striping verbs ({:?})",
+         verbs, PR 7b's three striping verbs and PR 13h's reclaim hint ({:?})",
         MetaVerb::ALL
     );
     assert_eq!(
@@ -217,6 +219,11 @@ fn the_wire_vocabulary_covers_every_shipped_trait_member() {
         ),
         (0x90, 0x91, 0x92),
         "PR 7b's block is 0x90–0x9F (the level-5 discriminant ranges)"
+    );
+    assert_eq!(
+        MetaVerb::ReclaimHint.code(),
+        0xA0,
+        "PR 13h's block is 0xA0–0xAF"
     );
     assert_eq!(
         (
@@ -271,6 +278,7 @@ fn the_wire_vocabulary_covers_every_shipped_trait_member() {
         (MetaVerb::SupplyStripeIno, true),
         (MetaVerb::IsEmpty, false),
         (MetaVerb::DestroyStripe, true),
+        (MetaVerb::ReclaimHint, false),
     ] {
         assert_eq!(
             verb.mutating(),
@@ -380,6 +388,10 @@ fn frames_round_trip_and_untrusted_bytes_refuse_loud() {
             scope: 0x51,
         },
         MetaCall::DestroyStripe { stripe: 9 },
+        MetaCall::ReclaimHint {
+            inos: vec![9, 4],
+            hops: 1,
+        },
     ]
     .into_iter()
     .enumerate()

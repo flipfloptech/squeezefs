@@ -4128,3 +4128,25 @@ fn membership_reassertion_wait_bound_is_two_renewal_beats() {
         "the re-assertion park is exactly 2 × renewal_beat_ms ({beat_ms} ms)"
     );
 }
+
+/// **A reclaim hint carries at most one FORGET batch** (symmetric PR 13h,
+/// review round 1, Issue 1): the wire's per-hint ino cap
+/// (`meta_ship::RECLAIM_HINT_MAX_INOS` — the served side REJECTS a longer
+/// frame before it allocates anything proportional to it) is the FORGET
+/// reclaim pool's own batch ceiling (`fuse_client::INODE_RECLAIM_BATCH_MAX`,
+/// the `SQUEEZEFS_INODE_RECLAIM_BATCH` clamp), so a batch's foreign share
+/// never needs to split and a legal hint is never rejected; a drift
+/// between the two words is red here. The forward budget is ONE hop — the
+/// legal schedule is a lease that moved once between the forgetter's
+/// resolve and the serve; a count, never a timer, so a lease ping-pong can
+/// never loop a hint.
+#[test]
+fn reclaim_hint_ino_cap_ties_to_the_forget_reclaim_batch_ceiling() {
+    use squeezefs::fuse_client::INODE_RECLAIM_BATCH_MAX;
+    use squeezefs::meta_ship::{RECLAIM_HINT_MAX_HOPS, RECLAIM_HINT_MAX_INOS};
+    assert_eq!(RECLAIM_HINT_MAX_INOS, INODE_RECLAIM_BATCH_MAX);
+    assert_eq!(
+        RECLAIM_HINT_MAX_HOPS, 1,
+        "one forward: the moved-once schedule"
+    );
+}

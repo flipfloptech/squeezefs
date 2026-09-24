@@ -1567,6 +1567,34 @@ impl MetaShipService {
                 self.inner.serve_destroy_stripe(*stripe).await?;
                 Ok(MetaReply::Unit)
             }
+            // PR 13h (F-R6, review round 1 Issue 1): a peer's FORGET of
+            // corpses in slots this mount reclaims — handed to this mount's
+            // own FORGET-driven reclaim, whose admission re-checks every
+            // ino (open count, the exact record's nlink, the single-drive
+            // claim). Bounded EXECUTION (PR 3's law): a hint past the
+            // reclaim batch cap is rejected before anything proportional
+            // to it runs; an ino this mount does not reclaim is dropped and
+            // counted, never read.
+            MetaCall::ReclaimHint { inos, hops } => {
+                if inos.len() > super::wire::RECLAIM_HINT_MAX_INOS {
+                    return Err(SqueezefsError::refused(
+                        libc::EINVAL,
+                        format!(
+                            "ReclaimHint: {} inos exceed the {} cap (one reclaim batch)",
+                            inos.len(),
+                            super::wire::RECLAIM_HINT_MAX_INOS
+                        ),
+                    ));
+                }
+                let (served, forwarded, misrouted) =
+                    self.inner.serve_reclaim_hint(inos, *hops).await;
+                log::debug!(
+                    "reclaim hint (hop {hops}): {served} ino(s) admitted as this mount's own \
+                     forgets, {forwarded} forwarded to the reclaimer tree 0 names, {misrouted} \
+                     dropped"
+                );
+                Ok(MetaReply::Unit)
+            }
         }
     }
 

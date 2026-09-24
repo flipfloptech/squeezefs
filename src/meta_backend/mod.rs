@@ -1232,6 +1232,23 @@ pub struct RoutedMetaBackend {
 /// See [`RoutedMetaBackend::install_reclaim_hint_sink`].
 pub type ReclaimHintSink = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
 
+/// Where a FORGET-driven reclaim executes ([`RoutedMetaBackend::reclaim_home`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReclaimHome {
+    /// This mount's own reclaim: every unarmed mount, a slot leased here,
+    /// an unleased slot on the volume's manager.
+    Local,
+    /// Appender `reclaimer` reclaims the slot — its lessee, or the manager
+    /// (appender 0, `unleased`) for a slot nobody leases — at `endpoint`.
+    Peer {
+        reclaimer: u32,
+        unleased: bool,
+        endpoint: std::sync::Arc<str>,
+    },
+    /// The reclaimer is known and this mount has no endpoint for it.
+    Unreachable { reclaimer: u32, unleased: bool },
+}
+
 /// The liveness ancestry walk's belt (PR 13c, F-B2): the deepest chain a
 /// path can address — `PATH_MAX / 2` components (each component is at
 /// least one byte plus its separator) — never a tuning constant; a
@@ -2948,6 +2965,118 @@ impl RoutedMetaBackend {
             .is_some_and(|v| v.inode_plane_owns_slot(local_ino))
     }
 
+    /// **Where the FORGET-driven reclaim of GLOBAL `ino` executes** (PR
+    /// 13h — review round 1, Issue 1; design §5.1: the slot is the
+    /// ownership unit, so a corpse's RECLAIMER is its slot's holder — the
+    /// manager for a slot nobody leases). [`Self::owns_inode_reclaim`]'s
+    /// `true` is [`ReclaimHome::Local`]; its `false` splits into the slot's
+    /// current lessee (the endpoint bound on demand, PR 6's
+    /// `step_home_bound`) and — on a joined appender — the manager for an
+    /// unleased slot (appender 0, bound at the join). The FORGET then
+    /// travels there as a reclaim HINT; this mount reads nothing.
+    pub async fn reclaim_home(&self, ino: Ino) -> ReclaimHome {
+        let (v_idx, local) = self.route_ino(ino);
+        let Some(vol) = self.volumes.get(v_idx) else {
+            return ReclaimHome::Local;
+        };
+        if vol.inode_plane_owns_slot(local) {
+            return ReclaimHome::Local;
+        }
+        // The slot's lessee — the MANAGER's word (`reresolve_slot_holder`:
+        // one `ResolveSlot` from a joiner, the table itself on the
+        // manager), never this mount's projection: a joiner's table lags
+        // a peer's grant by up to a checkpoint and can still name the
+        // departed lessee (this mount itself, after its own release), so
+        // a slot that moved to ANOTHER appender between the unlink and
+        // the forget is hinted to that appender. The FORGET batch asks
+        // once per slot (`reclaim_slot_key`).
+        let slot = kv::record::forest_slot_of_ino(local);
+        let lessee = match vol.reresolve_slot_holder(slot).await {
+            Some(crate::slot_lease_core::Resolved::Holder { holder, .. })
+                if holder != vol.own_appender_id() && !vol.is_own_region(holder) =>
+            {
+                Some(holder)
+            }
+            _ => None,
+        };
+        match lessee {
+            Some(_) => match crossvol_tx::step_home_bound(self, v_idx, local).await {
+                crossvol_tx::StepHome::Foreign { holder, endpoint } => ReclaimHome::Peer {
+                    reclaimer: holder,
+                    unleased: false,
+                    endpoint,
+                },
+                crossvol_tx::StepHome::Unreachable { holder } => ReclaimHome::Unreachable {
+                    reclaimer: holder,
+                    unleased: false,
+                },
+                // The table moved again under the bind: this mount's after all.
+                crossvol_tx::StepHome::Local => ReclaimHome::Local,
+            },
+            // Nobody leases the slot and this mount is not the manager:
+            // the manager's to reclaim (appender 0, bound at the join).
+            None => match vol.slot_leases().and_then(|p| p.holders.endpoint(0)) {
+                Some(endpoint) => ReclaimHome::Peer {
+                    reclaimer: 0,
+                    unleased: true,
+                    endpoint,
+                },
+                None => ReclaimHome::Unreachable {
+                    reclaimer: 0,
+                    unleased: true,
+                },
+            },
+        }
+    }
+
+    /// `ino`'s `(volume, forest slot)` — the key a FORGET batch resolves
+    /// its reclaim home under ONCE per slot (a released slot's corpses
+    /// arrive in one batch; the resolve is one wire word per slot, never
+    /// per ino).
+    pub fn reclaim_slot_key(&self, ino: Ino) -> (usize, kv::record::ForestSlot) {
+        let (v_idx, local) = self.route_ino(ino);
+        (v_idx, kv::record::forest_slot_of_ino(local))
+    }
+
+    /// **Ship one reclaim hint** — `inos` FORGOTTEN here, all reclaimed by
+    /// appender `reclaimer` at `endpoint` — as `MetaCall::ReclaimHint`
+    /// over the S8 wire (PR 6's `ship_meta_call`). Best-effort: a hint
+    /// that cannot travel is counted (`reclaim_hint_failures`) and the
+    /// corpses stay for their reclaimer's mount-time sweep — the shipped
+    /// posture's own hole, never a loss of acked data; nothing is retried
+    /// here (a FORGET is one event).
+    pub async fn ship_reclaim_hint(
+        &self,
+        reclaimer: u32,
+        endpoint: &str,
+        inos: Vec<Ino>,
+        hops: u8,
+    ) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let m = &crate::fuse_client::METRICS;
+        let n = inos.len() as u64;
+        m.reclaim_hints_shipped.fetch_add(1, Relaxed);
+        m.reclaim_hint_inos_shipped.fetch_add(n, Relaxed);
+        match crossvol_tx::ship_meta_call(
+            endpoint,
+            reclaimer,
+            crate::meta_ship::MetaCall::ReclaimHint { inos, hops },
+        )
+        .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                m.reclaim_hint_failures.fetch_add(1, Relaxed);
+                log::debug!(
+                    "reclaim hint of {n} ino(s) to appender {reclaimer} ({endpoint}) did not \
+                     travel ({e}); the corpses stay for its mount-time sweep \
+                     (reclaim_hint_failures)"
+                );
+                false
+            }
+        }
+    }
+
     /// Install the FUSE layer's reclaim entry a served reclaim hint feeds
     /// (PR 13h — review round 1, Issue 1): `sink(ino)` is
     /// `SqueezefsFilesystem::queue_reclaim_inode`, so a peer's FORGET of a
@@ -2965,23 +3094,61 @@ impl RoutedMetaBackend {
     /// slot THIS mount reclaims is handed to the installed sink (counted
     /// on `reclaim_hints_served`); one this mount does not reclaim — the
     /// slot moved again between the peer's resolve and the serve, or the
-    /// hint was routed to the wrong appender — is dropped and counted
-    /// (`reclaim_hints_misrouted`), never priced or read here. Returns
-    /// `(served, misrouted)`. A mount with no sink (no FUSE layer) counts
-    /// every ino misrouted: nothing here can reclaim.
-    pub fn serve_reclaim_hint(&self, inos: &[Ino]) -> (u64, u64) {
+    /// forgetter's lessee word was stale — is FORWARDED to the reclaimer
+    /// this mount's table names (the manager's is exact; a joiner's is its
+    /// projection) while `hops` is under
+    /// [`crate::meta_ship::RECLAIM_HINT_MAX_HOPS`], else dropped and
+    /// counted (`reclaim_hints_misrouted`) — never priced or read here.
+    /// Returns `(served, forwarded, misrouted)`. A mount with no sink (no
+    /// FUSE layer) reclaims nothing: every own ino counts misrouted.
+    pub async fn serve_reclaim_hint(&self, inos: &[Ino], hops: u8) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let m = &crate::fuse_client::METRICS;
         let sink = self.reclaim_hint_sink.load_full();
         let (mut served, mut misrouted) = (0u64, 0u64);
+        let mut forward: Vec<(u32, std::sync::Arc<str>, Vec<Ino>)> = Vec::new();
         for &ino in inos {
-            match sink.as_ref() {
-                Some(sink) if ino > 1 && self.owns_inode_reclaim(ino) => {
-                    sink(ino);
-                    served += 1;
+            if ino <= 1 {
+                misrouted += 1;
+                continue;
+            }
+            if self.owns_inode_reclaim(ino) {
+                match sink.as_ref() {
+                    Some(sink) => {
+                        sink(ino);
+                        served += 1;
+                    }
+                    None => misrouted += 1,
                 }
-                _ => misrouted += 1,
+                continue;
+            }
+            if hops >= crate::meta_ship::RECLAIM_HINT_MAX_HOPS {
+                misrouted += 1;
+                continue;
+            }
+            match self.reclaim_home(ino).await {
+                ReclaimHome::Peer {
+                    reclaimer,
+                    endpoint,
+                    ..
+                } => match forward.iter_mut().find(|(r, _, _)| *r == reclaimer) {
+                    Some((_, _, list)) => list.push(ino),
+                    None => forward.push((reclaimer, endpoint, vec![ino])),
+                },
+                ReclaimHome::Local | ReclaimHome::Unreachable { .. } => misrouted += 1,
             }
         }
-        (served, misrouted)
+        let mut forwarded = 0u64;
+        for (reclaimer, endpoint, list) in forward {
+            forwarded += list.len() as u64;
+            m.reclaim_hints_forwarded.fetch_add(1, Relaxed);
+            self.ship_reclaim_hint(reclaimer, &endpoint, list, hops + 1)
+                .await;
+        }
+        if misrouted > 0 {
+            m.reclaim_hints_misrouted.fetch_add(misrouted, Relaxed);
+        }
+        (served, forwarded, misrouted)
     }
 
     /// The journal payload `ino`'s destroy stages on its home volume —

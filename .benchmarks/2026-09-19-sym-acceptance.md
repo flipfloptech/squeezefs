@@ -5553,6 +5553,24 @@ the box's input to PR 14; the remaining box rows are the flip binary's.
    wall), or prod the holder's renewal at the acceptance (the free-grace
    prod's precedent), and restate or pin the closure law on the wire
    shape.
+19. **A reclaim hint whose resolved lessee is DEAD has no reclaimer until
+   the manager remounts (PR 13h review round 4, Issue 20; filed, not
+   fixed — PR 14):** from a lessee's death until PR 10's recovery releases
+   its slots (`T_owner` + the recovery bound) BOTH words — the joiner's
+   projection and the manager's table — name the dead appender, so the
+   forgetter's `step_home_bound` binds the dead endpoint, the dial fails
+   and `ship_reclaim_hint` counts `reclaim_hint_failures` per ino; after
+   the recovery the slots are UNLEASED at the manager, whose corpse sweep
+   runs only at ITS mount (the recovery runs no sweep over the trees it
+   releases) — the corpse and its blocks leak until the manager remounts.
+   Not a regression of PR 13h's law (the manager-first build shared the
+   death window) but a class the family's `failures` face names without a
+   reclaimer. The arm: a corpse sweep of the recovered slots inside PR 10's
+   recovery step (the mount-time sweep's body over
+   `release_recovered_slots`' trees), plus one re-resolve off the manager's
+   word on a failed ship (the forward hop's shape) to close the
+   ≤ one-refresh window after recovery. Beside design §5.1.3's class (iii).
+
 
 ## 8. Box footprint
 

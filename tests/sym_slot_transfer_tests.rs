@@ -2193,6 +2193,25 @@ async fn open_with_ring0_offset(uris: &[String], tag: u64, owner: u64) -> Arc<Ro
     routed
 }
 
+/// Parks the per-volume flush cadence (the checkpoint task and the
+/// pending-times drain task both run on it) for every backend opened
+/// while it is armed: `SQUEEZEFS_META_FLUSH_INTERVAL_MS` is read at the
+/// open. Used by the pins whose premise is "the next ring write is mine".
+struct ParkedCadence;
+
+impl ParkedCadence {
+    fn arm() -> Self {
+        std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+        Self
+    }
+}
+
+impl Drop for ParkedCadence {
+    fn drop(&mut self) {
+        std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    }
+}
+
 /// **Issue 20 (round 3): the §4.4 pt 4 rollback arms address the overlay
 /// by STAMPED seqs.** On a ring whose `seq_offset > 0` a member whose
 /// apply fails (the poison seam fires AFTER the apply) must be rolled OUT
@@ -2214,6 +2233,17 @@ async fn rollbacks_address_stamped_seqs_on_a_ring_with_an_offset() {
     let _cleanup = Cleanup;
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
+    // Arm 2 arms a fault on the sector at ring 0's HEAD and expects the
+    // next create's entry to land there. Two background writers share
+    // that head on the flush cadence — the checkpoint task's control /
+    // ledger entries and the pending-times drain task's Δtime commits —
+    // and one of them landing between the head read and the create
+    // consumes the faulted sector (its own write fails and is rolled
+    // back), so the create lands past it and SUCCEEDS: the batch gate on
+    // `453bbabd` read that 1-in-≈15 schedule. Every ring write below is
+    // this pin's: the cadence is parked for the mount's life (the env is
+    // read at the open; `SEAM` serializes the suite's env use).
+    let _cadence = ParkedCadence::arm();
     let uris = vec![format_stamped_member(dir.path(), "meta0").await];
     let tag = volume_tag("vol-0000000000000020");
     let owner = ino_in_slot(SLOT4, 5);

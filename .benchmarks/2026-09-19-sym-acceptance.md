@@ -2441,7 +2441,7 @@ the pass), and the lateness term (35 ms of the 100 ms margin) — never a
 widened constant.
 The tripwire's rate on this binary at this venue: 1 increment in 8 rows
 across two row sets (16 writer-rows at the manager, 44 joiner-rows), 1 ms
-past. Set 2's leg died on the must-stay-0 set after its table, before its
+past. Set 2's leg died on the `pend1` label one line before the must-stay-0 die, after its table and before its
 oracle (as the leg is built); nothing else moved on the set.
 
 ##### 3.9.6.2 F-R5 — the box's VERDICT on PR 13g's supply: **FIXED — every law MET on every joiner in both sets**

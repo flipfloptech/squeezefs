@@ -3041,7 +3041,8 @@ impl RoutedMetaBackend {
     /// **Ship one reclaim hint** — `inos` FORGOTTEN here, all reclaimed by
     /// appender `reclaimer` at `endpoint` — as `MetaCall::ReclaimHint`
     /// over the S8 wire (PR 6's `ship_meta_call`). Best-effort: a hint
-    /// that cannot travel is counted (`reclaim_hint_failures`) and the
+    /// that cannot travel is counted per INO it carried
+    /// (`reclaim_hint_failures` — the family's one unit) and the
     /// corpses stay for their reclaimer's mount-time sweep — the shipped
     /// posture's own hole, never a loss of acked data; nothing is retried
     /// here (a FORGET is one event).
@@ -3066,7 +3067,7 @@ impl RoutedMetaBackend {
         {
             Ok(_) => true,
             Err(e) => {
-                m.reclaim_hint_failures.fetch_add(1, Relaxed);
+                m.reclaim_hint_failures.fetch_add(n, Relaxed);
                 log::debug!(
                     "reclaim hint of {n} ino(s) to appender {reclaimer} ({endpoint}) did not \
                      travel ({e}); the corpses stay for its mount-time sweep \
@@ -3099,14 +3100,23 @@ impl RoutedMetaBackend {
     /// projection) while `hops` is under
     /// [`crate::meta_ship::RECLAIM_HINT_MAX_HOPS`], else dropped and
     /// counted (`reclaim_hints_misrouted`) — never priced or read here.
-    /// Returns `(served, forwarded, misrouted)`. A mount with no sink (no
-    /// FUSE layer) reclaims nothing: every own ino counts misrouted.
+    /// The forward's resolve runs ONCE per `(volume, slot)` like the
+    /// forgetter's (review round 2, Issue 12 — on a joiner it is a
+    /// `ResolveSlot` wire word, and a misrouted 1,024-ino hint must not be
+    /// 1,024 verbs at the manager from the service lane). Returns `(served,
+    /// forwarded, misrouted)`, every one in INOS — the family's one unit,
+    /// so `Σ reclaim_hint_inos_shipped ≡ Σ (served + forwarded + misrouted)`
+    /// closes across a fleet at rest with `reclaim_hint_failures` 0. A mount
+    /// with no sink (no FUSE layer) reclaims nothing: every own ino counts
+    /// misrouted.
     pub async fn serve_reclaim_hint(&self, inos: &[Ino], hops: u8) -> (u64, u64, u64) {
         use std::sync::atomic::Ordering::Relaxed;
         let m = &crate::fuse_client::METRICS;
         let sink = self.reclaim_hint_sink.load_full();
         let (mut served, mut misrouted) = (0u64, 0u64);
         let mut forward: Vec<(u32, std::sync::Arc<str>, Vec<Ino>)> = Vec::new();
+        let mut homes: std::collections::HashMap<(usize, kv::record::ForestSlot), ReclaimHome> =
+            std::collections::HashMap::new();
         for &ino in inos {
             if ino <= 1 {
                 misrouted += 1;
@@ -3126,7 +3136,13 @@ impl RoutedMetaBackend {
                 misrouted += 1;
                 continue;
             }
-            match self.reclaim_home(ino).await {
+            let home = match homes.entry(self.reclaim_slot_key(ino)) {
+                std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(self.reclaim_home(ino).await).clone()
+                }
+            };
+            match home {
                 ReclaimHome::Peer {
                     reclaimer,
                     endpoint,
@@ -3140,8 +3156,9 @@ impl RoutedMetaBackend {
         }
         let mut forwarded = 0u64;
         for (reclaimer, endpoint, list) in forward {
-            forwarded += list.len() as u64;
-            m.reclaim_hints_forwarded.fetch_add(1, Relaxed);
+            let n = list.len() as u64;
+            forwarded += n;
+            m.reclaim_hints_forwarded.fetch_add(n, Relaxed);
             self.ship_reclaim_hint(reclaimer, &endpoint, list, hops + 1)
                 .await;
         }

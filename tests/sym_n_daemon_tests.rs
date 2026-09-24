@@ -15138,6 +15138,11 @@ async fn a_joiners_forget_of_a_corpse_in_a_released_slot_is_reclaimed_by_the_man
     );
     assert_eq!(f2.misrouted, f0.misrouted, "nothing misrouted");
     assert_eq!(f2.refused, f0.refused, "the manager's destroy committed");
+    assert_eq!(
+        f2.hint_inos - f0.hint_inos,
+        (f2.served - f0.served) + (f2.forwarded - f0.forwarded) + (f2.misrouted - f0.misrouted),
+        "the family closes in one unit (inos): shipped ≡ served + forwarded + misrouted"
+    );
     // (The joiner's own read of the ino here is its PROJECTION — this
     // fixture arms no custody divert; the manager's word above is the
     // record's.)
@@ -15245,6 +15250,11 @@ async fn a_corpse_whose_slot_moved_between_the_unlink_and_the_forget_is_reclaime
         "the forgetter asked the manager's word for the lessee: nothing forwarded, nothing dropped"
     );
     assert_eq!(f2.refused, f0.refused, "the holder's destroy committed");
+    assert_eq!(
+        f2.hint_inos - f0.hint_inos,
+        (f2.served - f0.served) + (f2.forwarded - f0.forwarded) + (f2.misrouted - f0.misrouted),
+        "the family closes in one unit (inos)"
+    );
     tear_down_hint_fixture(fx, &uris).await;
 }
 

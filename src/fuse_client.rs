@@ -6224,18 +6224,21 @@ pub struct Metrics {
     /// FORGET batch) and the inos they carried.
     pub reclaim_hints_shipped: Align64<AtomicU64>,
     pub reclaim_hint_inos_shipped: Align64<AtomicU64>,
-    /// Reclaim hints this mount could not deliver (the reclaimer
-    /// unreachable, or the wire failed): the corpses stay for their
-    /// reclaimer's mount-time sweep. Should stay 0 on a healthy fleet.
+    /// Forgotten inos whose reclaim hint this mount could not deliver
+    /// (the reclaimer unreachable, or the wire failed): the corpses stay
+    /// for their reclaimer's mount-time sweep. Should stay 0 on a healthy
+    /// fleet. In INOS, the family's one unit.
     pub reclaim_hint_failures: Align64<AtomicU64>,
     /// Hinted inos this mount's reclaim ADMITTED as its own FORGETs (the
-    /// served side; Σ over a fleet ≡ Σ `reclaim_hint_inos_shipped` −
-    /// misrouted at rest).
+    /// served side). The family's closure at rest across a fleet:
+    /// `Σ reclaim_hint_inos_shipped ≡ Σ (served + forwarded + misrouted)`
+    /// with `reclaim_hint_failures` 0 (a forwarded ino is shipped again by
+    /// its forwarder and lands in the next hop's served / misrouted).
     pub reclaim_hints_served: Align64<AtomicU64>,
-    /// Hints this mount FORWARDED (one batch per reclaimer) for inos it
-    /// does not reclaim either — the slot moved again between the
+    /// Hinted inos this mount FORWARDED (one hint per reclaimer) for slots
+    /// it does not reclaim either — the slot moved again between the
     /// forgetter's resolve and the serve — to the reclaimer its table
-    /// names, at most `RECLAIM_HINT_MAX_HOPS` times per hint.
+    /// names, at most `RECLAIM_HINT_MAX_HOPS` times per hint. In inos.
     pub reclaim_hints_forwarded: Align64<AtomicU64>,
     /// Hinted inos this mount neither reclaims nor could forward (the hop
     /// bound reached, or their reclaimer unreachable) — dropped, never

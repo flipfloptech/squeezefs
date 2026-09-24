@@ -14219,6 +14219,216 @@ async fn the_last_cycles_tape_names_the_decisions_words_and_what_the_cycle_paid(
     fsck_clean(&uris).await;
 }
 
+/// **F-B1's box class, read off the fourth pass's own snapshots (record
+/// §3.9.6.1 re-read; the review's Issue 1): a WAVE of promised SMO images
+/// priced at a per-image unit the small passes before it UNDER-MEASURED.**
+/// `m0_pc41.json` (the create's end, taken < 1 s before the trip) reads
+/// volume 1 at `heap_promised` **38**, image unit **2.04 ms**, projection
+/// 84 (≈ 38 × 2.04 + 65 dirty × 0.093); `m0_pn41.json` (after the trip)
+/// reads the image unit **3.97 ms**, `node_compactions` +45 and the term
+/// **151** — and 38 × 3.97 = 151, the trip cycle's own wall: the wave cost
+/// what the trip pass then measured, twice what the projection had
+/// multiplied by. The under-measurement is the unit's GRAIN FLOOR
+/// (`flush_unit_ns` = `wall / max(count, 4)`, review round 1 Issue 10b's
+/// noise bound): a pass of two images reads HALF its per-image cost, one
+/// image a QUARTER — and under a create storm the passes that measure the
+/// image unit are the threshold DRAIN's, one or two compactions per tick,
+/// while the storm's 64 rotor leaves fill in LOCKSTEP (round-robin mints,
+/// equal bytes) and cross the node size within one interval: a wave the
+/// cycle inherits at 38 — priced at the halved unit. A bound must bound:
+/// the unit the horizon-max law multiplies by is the pass's mean per item,
+/// `wall / count`; a hiccup on a small pass then OVER-prices the horizon
+/// (earlier cycles — the shipped saturation posture's cost) where the
+/// floor UNDER-priced the wave (the ceiling — the promise). The ceiling
+/// never widens; the flat path is untouched.
+///
+/// The shape in process, deterministic under `uring_fs::arm_device_latency`
+/// on the BARRIER (every SMO barriers its successor image — §4.10 — so an
+/// image costs `B_MS` where an append costs a write; the box's 43× ratio
+/// between the two units): `LEAVES` files in `LEAVES` rotor slots, each
+/// leaf's log filled in LOCKSTEP by rounds of one sub-threshold same-key
+/// xattr put (below the drain's 4 KiB enqueue — the drain never visits;
+/// the cycle owns the compaction) + one explicit cycle, until the round
+/// whose puts PROMISE every leaf's compaction at once — the wave, staged
+/// for the CADENCE's next cycle. Before it a PILOT leaf, filled and
+/// compacted alone, is the small pass that measures the image unit: one
+/// image, `B_MS` of wall. RED on `bcf4ede5`: the pilot's pass reads a
+/// QUARTER unit, the projection prices the wave at it, the trigger sits
+/// ≈ 300 ms too late and the oldest wave leaf lands ≈ 1,250 ms old. GREEN:
+/// the pilot's pass reads the exact unit, the trigger anticipates the
+/// wave, the leaf lands well inside the ceiling. The judged cycle is the
+/// first wave cycle (its term then enters the horizon and every later
+/// cycle is anticipated from it — the box's class is the first wave after
+/// the horizon forgot); a void draw (the decision later than the ceiling's
+/// margin) re-opens the manager for a fresh horizon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_wave_of_promised_images_is_priced_at_the_per_image_cost_the_passes_measured() {
+    use squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS;
+    /// The parked barrier: one `fdatasync` of the volume's file.
+    const B_MS: u64 = 30;
+    /// The wave's leaves — one rotor slot each.
+    const LEAVES: usize = 12;
+    /// One fill put: below the drain's 4 KiB enqueue threshold.
+    const PUT: usize = 3 * 1024;
+    /// Fill rounds before the wave forms are a fixture failure.
+    const ROUNDS_MAX: u32 = 200;
+    const MAX_ATTEMPTS: u32 = 3;
+    let dir = cadence_venue_dir();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_ring_len(dir.path(), 1, VOL_LEN * 8, 32 * 1024 * 1024).await;
+    let path = std::path::PathBuf::from(&uris[0]);
+    let mut verdict: Option<(u64, squeezefs::meta_backend::kv::checkpoint::CycleTape)> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let manager = open_under(&uris, &Knobs::armed()).await;
+        let mvol = Arc::clone(&manager.volumes[0]);
+        // A file in its own rotor slot: the leaf `stat + layout + xattrs`
+        // share (its directory's slot by affinity).
+        let mint = |name: String| {
+            let m = Arc::clone(&manager);
+            async move {
+                let d = m
+                    .create(1, &name, libc::S_IFDIR | 0o755, 1000, 1000)
+                    .await
+                    .expect("a directory")
+                    .ino;
+                m.create(d, "f", libc::S_IFREG | 0o644, 1000, 1000)
+                    .await
+                    .expect("a file")
+                    .ino
+            }
+        };
+        let pilot = mint(format!("pilot-{attempt}")).await;
+        let mut leaves = Vec::with_capacity(LEAVES);
+        for i in 0..LEAVES {
+            leaves.push(mint(format!("wave-{attempt}-{i}")).await);
+        }
+        mvol.checkpoint_now().await.expect("the mints covered");
+        squeezefs::uring_fs::arm_device_latency(
+            &path,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(B_MS),
+        );
+        // Fill `files` in lockstep: one sub-threshold same-key put per
+        // leaf per round, an explicit cycle appending them, until the
+        // round whose puts promise every leaf's compaction.
+        let fill = |files: Vec<u64>| {
+            let m = Arc::clone(&manager);
+            let v = Arc::clone(&mvol);
+            async move {
+                let put = vec![0x5au8; PUT];
+                for round in 0..ROUNDS_MAX {
+                    let promised0 = v.heap_promised();
+                    for &f in &files {
+                        m.setxattr(f, "user.fill", &put).await.expect("a fill put");
+                    }
+                    let promised = v.heap_promised() - promised0;
+                    if promised > 0 {
+                        assert_eq!(
+                            promised,
+                            files.len() as u64,
+                            "the fill is lockstep: every leaf crosses the node size in the same \
+                             round (round {round})"
+                        );
+                        return round;
+                    }
+                    v.checkpoint_now().await.expect("a fill cycle");
+                }
+                panic!(
+                    "no promise after {ROUNDS_MAX} fill rounds — the fixture's leaf never filled"
+                );
+            }
+        };
+        // The pilot: the small pass that measures the image unit.
+        let pilot_rounds = fill(vec![pilot]).await;
+        mvol.checkpoint_now().await.expect("the pilot's compaction");
+        let pilot_tape = mvol.checkpoint_last_cycle();
+        let unit_us = mvol.checkpoint_image_unit_ns() / 1_000;
+        eprintln!(
+            "F-B1 wave: attempt {attempt} — the pilot filled in {pilot_rounds} rounds; its pass: \
+             {pilot_tape}; image unit in force {unit_us} µs against the pass's {} µs per image",
+            if pilot_tape.images > 0 {
+                pilot_tape.image_ms * 1000 / pilot_tape.images
+            } else {
+                0
+            }
+        );
+        assert!(
+            pilot_tape.images >= 1,
+            "the premise: the pilot's cycle compacted its leaf ({pilot_tape})"
+        );
+        // The wave: staged for the cadence's next cycle (the fill's own
+        // cycles precede the staging round; the seq is read after it).
+        let ceiling_ms = mvol.appender_stats().unwrap().flush_ceiling_ms;
+        let late_bound_ms = ceiling_ms - CHECKPOINT_MAX_AGE_MS as u64;
+        let wave_rounds = fill(leaves.clone()).await;
+        let staged_at = squeezefs::mono_core::monotonic_ns_u64();
+        let seq0 = mvol.checkpoint_seq();
+        let overruns0 = mvol.appender_stats().unwrap().flush_ceiling_overruns;
+        let trigger_ms = mvol.checkpoint_trigger_ms(CHECKPOINT_MAX_AGE_MS as u64);
+        eprintln!(
+            "F-B1 wave: attempt {attempt} — {LEAVES} leaves promised after {wave_rounds} rounds \
+             ({} ms after the last collection); trigger {trigger_ms} ms, projected {} ms, \
+             anticipated {} ms",
+            staged_at.saturating_sub(mvol.checkpoint_collected_ns()) / 1_000_000,
+            mvol.checkpoint_projected_ms(),
+            mvol.checkpoint_term_ms()
+        );
+        wait_until("the cadence's wave cycle", || mvol.checkpoint_seq() > seq0).await;
+        let tape = mvol.checkpoint_last_cycle();
+        let overruns = mvol.appender_stats().unwrap().flush_ceiling_overruns - overruns0;
+        eprintln!(
+            "F-B1 wave: attempt {attempt} — the wave cycle's tape: {tape}; {overruns} overrun(s); \
+             the pass's per-image wall {} µs against the unit it was priced at {} µs",
+            if tape.images > 0 {
+                tape.image_ms * 1000 / tape.images
+            } else {
+                0
+            },
+            tape.image_unit_us
+        );
+        squeezefs::uring_fs::disarm_device_latency(&path);
+        assert!(
+            tape.promised_at_decision >= LEAVES as u64 && tape.images >= LEAVES as u64,
+            "the premise: the cadence's cycle found the wave it was decided over ({tape})"
+        );
+        let valid = tape.late_ms <= late_bound_ms;
+        if !valid {
+            eprintln!(
+                "F-B1 wave: attempt {attempt} VOID — the age decision was later than the \
+                 ceiling's margin (the venue's tick, never the cadence's pricing); the manager is \
+                 re-opened for a fresh horizon"
+            );
+        }
+        assert_must_stay_zero_with(&mvol, "manager", false);
+        shutdown(&manager).await;
+        drop(mvol);
+        drop(manager);
+        if valid {
+            verdict = Some((overruns, tape));
+            break;
+        }
+    }
+    let (trips, tape) = verdict
+        .expect("the venue produced no valid wave cycle in 3 attempts — re-run on a quiet box");
+    assert_eq!(
+        trips,
+        0,
+        "F-B1's box class: a wave of {} promised images was priced at {} µs each and cost {} µs \
+         each — the unit's grain floor read the pilot's one-image pass at a quarter of its \
+         per-image cost (the box: 38 images at 2.04 ms projected, 3.97 ms paid, 151 ms = the \
+         trip cycle's term); the tape: {tape}",
+        tape.promised_at_decision,
+        tape.image_unit_us,
+        if tape.images > 0 {
+            tape.image_ms * 1000 / tape.images
+        } else {
+            0
+        }
+    );
+    fsck_clean(&uris).await;
+}
+
 // ---------------------------------------------------------------------------
 // PR 13h — F-R6: a token client's FORGET-driven reclaim on a foreign slot
 // (the fourth box pass, the record's §3.9.6.3).

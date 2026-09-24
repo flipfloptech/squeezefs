@@ -66,6 +66,8 @@ attribution, then the box.
 > is its instrument.
 >
 > **Re-read after the third box pass (PR 13e / 13f's binary `b377cbb8`, 2026-09-23 — §3.9.5):** gate 1 MET by the rule (the setattr term FIXED — `rename` PAR, `unlink` B ahead both orders), gate 3c MET on all three laws twice (the PAUSED law's first real run; F-R3 FIXED as a verdict and F-R4 FIXED as far as the leg reaches), gate 7 at N = 32 MET twice with 0 trips on 32 writers; **the ONE box item left before the flip is F-B1** — the manager's cadence overran twice inside `sym-scale` with PR 13e's derivation engaged but its 64-cycle horizon EMPTY (the term 11 / 4 ms at each joiner storm's start, the trip cycle's own 133 / 127 ms in the window only after; the steady state did not trip) — the first storm cycle after a quiet horizon, under the joiners' create-storm `ExtentGrant` burst (F-R5: a wire joiner's grant derives from an EWMA the manager never receives → the floor 8, on a 512 KiB floor ring) — §7 items 3 / 16, §9's blockquote.
+>
+> **Re-read after the fourth box pass (PR 13g's binary `230e95dd`, 2026-09-24 — gate 3 only, §3.9.6):** **F-R5 FIXED as a verdict** (every joiner's ring above the floor, 1–3 wire grants per row, reactive 0, the manager's N = 8 row 88 verbs / 0.114 s against 892 / 2.93 s) and **the third pass's F-B1 class GONE** — the first `sym-scale` row set ever to reach its oracle on the box read 0 trips through N = 1/2/4/8 with the onset class exercised at N = 2 / 4; **the tripwire is still not 0**: the second row set (a harness re-run with the row's setup outside its clock) read ONE trip on the manager at 1,101 ms — 1 ms past — at a storm's END under one served verb: the derivation's residue is the cycle's LANDING (the covering barrier's ≈ 40 ms wall + the decision's lateness over the pre-barrier term) against the fixed two-tick margin — §7 item 3's last piece. The launch skew is MEASURED (9.1 s at N = 8 = three fresh joiners' 3.0 s `mkdir`s into the freshly striped root) and taken out of the row's clock: N = 8 reads 4.61× creates on the storms' own clock (the co-located venue's term; per-NODE is PR 15's). One new armed-plane finding, F-R6 (a joiner's FORGET-driven reclaim pricing destroys for the holder's inos through its stale projection — nothing destroyed, a CPU + log storm, defect 18 / 34's loop under it), joins PR 14's list — §7 item 17, §9's fourth-pass blockquote.
 
 ## 1. Venue block
 
@@ -145,11 +147,13 @@ class). "dev" = scoping venue; "box" = squeeze-test.)_
 
 > **Status (the THIRD pass — PR 13e / 13f's binary `b377cbb8`, `perf/sym-box-13e`, 2026-09-23 01:53 → 03:52 UTC — §3.9.5; from zero, minimum count, gates 2 / 3b / 5 not re-run):** **gate 1 MET by the rule** — `rename` **1.012 / 0.998** PAR and `unlink` **1.054 / 1.042** B AHEAD in both orders (the setattr-future term FIXED on the box), `rr4k` 1.005, `rw4k` 0.984 / 1.015, `wfresh` 0.991, `mkdir` / `stat` / `manydirs` / `rmdir` within noise, `create` 0.981 / 0.972 at the floor, remount 0.95 / 0.93; two sub-second rows stated — `mount` 1.251 (within a 31.5 % band) / 1.326 (DELTA by 0.03 over 29.7 %: B's first mount of a fresh set +0.1 s on 0.4 s) and the post-`rw4k` clean `umount` 1.109 / 1.388 (+0.5–0.9 s — NEW on this binary, the re-run's B read faster there; unattributed, owed — §7 item 16; not a gate law); `dlm_rpcs` 0 ×24; **gate 3** — N = 1 4,928 c/s · 4,133 `C/CPU-S` · 1,327 MiB/s; N = 2 1.85× / 1.81×; N = 4 3.17× / 3.48×; **N = 8 3.53× creates (storms 9.2–14.4 s; an INFERRED ≈ 3.9 s of launch skew, the root's STRIPING at the row's mkdirs the hypothesised cause; ≤ 4.5× the storms' own bound) / 5.50× ingest**, `C/CPU-S` 0.67×; **F-B1 TRIPPED TWICE on the MANAGER with PR 13e's derivation ENGAGED but its horizon EMPTY (1,127 / 1,125 ms; the term 11 / 4 ms at each joiner storm's start, the trip cycle's own 133 / 127 ms only after; 199 quiet cycles between the rows; the steady state did not trip; 0 excused) — the FIRST cycle of a joiner create storm's `ExtentGrant` burst (50–80 verbs/s); the row set stopped at r1; F-R5 found (the manager derives a wire joiner's grant from `ewma = 0` → the floor 8 whatever its SMO rate; the 512 KiB floor rings checkpoint ≈ 8×/s under a storm and refill in ≤ 8-extent grants — PR 13g)**; **gate 3c MET on ALL THREE laws ×2** — LIVE 192 / 0, IDLE 4 bursts (17.9 / 17.6 ms), **PAUSED (its first real run on any venue) 0 handovers / 0 idle offers / 0 dominated offers**; **F-R3 FIXED** (zero dangling names, the offline census exempting 0, findings 0 ×2), **F-R4 FIXED as far as the leg reaches** (0 errnos on 451 / 451 touch creates — 902; the slot-moved retry class read 0, unexercised — the pin is its proof); **gate 7 at N = 32 MET ×2** — 1,269 / 1,344 frees/s with device ÷ user **1.000** (`/proc/diskstats` ≡ the ledger, `wareq-sz` 1.2 MiB), 32 mounts in 3.80 / 4.06 s, 263 / 291 verbs, **F-B1 0 on all 32 writers both launches**. §9's re-read: NOT YET — F-B1 (+ F-R5) is the one remaining flip precondition this pass leaves; the exact list is there.**
 
+> **Status (the FOURTH pass — gate 3 only, on PR 13g's binary `230e95dd`, `perf/sym-box-13g`, 2026-09-24 04:05 → 04:57 UTC — §3.9.6; two `sym-scale` row sets from zero on fresh fleets, the second a harness re-run with the row's setup outside its clock):** **set 1 is the first gate-3 row set to complete to its ORACLE on the box** — `appender_flush_ceiling_overruns` 0 on the manager and every joiner through N = 1/2/4/8 (the third pass's onset class exercised at N = 2 / 4 and not tripped), deleted-stays-deleted 0 / 3,000 ×2, fsck clean; N = 1 4,997 c/s · 4,216 `C/CPU-S` · 1,506 MiB/s, N = 8 3.53× creates / 4.84× ingest with a MEASURED 9.135 s launch skew (three 3.03 s `mkdir`s by the fresh joiners into the freshly STRIPED root); **set 2 (the setup before the clock): N = 8 22,941 c/s = 4.61× creates (Σ per-writer rates 5.25×, the bound; the co-located venue's term), `C/CPU-S` 0.66×, ingest 7,594 MiB/s (the N = 1 base 2,215 — a sub-second dd; the N = 8 absolute stable at 7.3–7.6 GB/s across three passes), and ONE trip — the manager's volume 1 at 1,101 ms (1 ms past) at the N = 4 storm's END with ONE verb served on that volume across the row: the residue is the cycle's LANDING (the covering barrier's wall + the decision's lateness over the pre-barrier term the horizon holds and the projection prices) against the fixed two-tick margin — §7 item 3's next piece.** **F-R5 FIXED as a verdict** (every joiner's ring 768 KiB–2.3 MiB, returns ≪ compactions, 1–3 wire grants per joiner per row, reactive 0; the manager 88 verbs / 0.114 s of service over the N = 8 row against 892 / 2.93 s; the closure exact set-wide). **F-R6 (new, reported)**: a joiner's FORGET-driven reclaim prices destroys for the HOLDER's inos through its stale projection (6,782 / 7,266 withheld per set, defect 18 / 34's loop under it; nothing destroyed). §9's re-read: NOT YET — the tripwire read 1 increment in 8 rows (1 ms past) on this binary; the exact list is there.**
+
 | Gate | Row | Venue | Verdict | Engagement (the law's gauges) |
 |---|---|---|---|---|
 | 1 | solo re-gate (flat A vs flat B: mdstorm, mount, w_fresh, rr4k, rw4k, remount) | box | **THIRD PASS 2026-09-23 on PR 13e / 13f's binary `b377cbb8` (§3.9.5.1, A B B A at RT = 60 + B A A B on mdstorm / rw4k / remount): `rename` 1.012 / 0.998 PAR, `unlink` 1.054 / 1.042 B AHEAD (both orders), `rr4k` 1.005, `rw4k` 0.984 / 1.015, `wfresh` 0.991, `mkdir` 0.993 / 0.983, `create` 0.981 / 0.972 (the 3 % floor), `stat` / `manydirs` / `rmdir` within noise, remount 0.947 / 0.931; `mount` 1.251 / 1.326 (0.4 s events, 30 % bands — B's first mount +0.1 s, stated), `umount` 1.109 / 1.388 (post-`rw4k`, +0.5–0.9 s — NEW on this binary (the re-run's B read faster), unattributed, owed §7 item 16; not a gate law) — MET by the rule; the setattr term FIXED on the box; `dlm_rpcs` 0 ×24.** **RE-RUN 2026-09-22 on PR 13c's binary `77f4da1d` (§3.9.4.1, A B B A + B A A B at RT = 60): `rr4k` PAR 0.999 (band 0.8 %; the −1.8 % residual GONE), `wfresh` 0.990 (0.9 %), `rw4k` 0.970 (0.8 % — the 3 % floor, a reproducible −3.0 %), mount 1.13 / remount 1.11 / umount 0.71 (0.4–0.7 s events), mdstorm `mkdir` 0.976 / 0.984 (the MISS CLOSED), `create` 0.992 / 0.983, `stat` 0.987 / 1.006, `manydirs` 0.999 / 0.997, `rmdir` 0.971 / 0.985 within noise, `rename` 0.960 (3.0 %) / 0.967 (0.1 %) DELTA, `unlink` 0.956 (1.2 %) / 0.967 (1.6 %) DELTA — MISS on those two, both orders, ATTRIBUTED (the PR-4 rename guard's priced +2.6 µs + the `handle_setattr` future's construction / lane move per op); `dlm_rpcs` 0 ×20.** The first pass (§3.9.1, PR 13b's binary): MISS on mdstorm mkdir/rename/unlink (−3.4…−5.8 %, both brackets), rand-4k within noise with a reproducible residual (rr4k −1.8 %, rw4k −2.5…−3.8 %), w_fresh/mount within noise. Before it: OWED to the flip binary (§8 — the flat path takes ONE behaviour change from PR 13: defect 6's shipped-bug fix (§4.3), pinned red-first flat, plus per-op atomic loads that are behaviour-identical (`KvTree::descend`'s `LeaseGate::is_armed`, `NodeSeqHandle::next`'s ceiling compare); every other change is behind bit 17 + the knob; PR 14's B arm is the default-on binary by definition) | `dlm_rpcs == 0` ✓ (×20), `meta_kv_forest_*` 0 on flat ✓, Δtripwires 0 ✓; the amplification columns (`/proc/diskstats`): `wfresh` 1.116× both arms at `wareq-sz` 1,037 KiB, `rw4k` 1.134–1.146× at 5 KiB, `rr4k` reads 1.17× at 4 KiB |
 | 2 | `sym-tarx` (N = 2, netem 250 µs, the extracting node NOT the manager) | dev → box | **Mechanism GREEN on every run** (verbs/entry 0.012, handovers 0, `dlm_rpcs` 0, oracle clean — §3.2). **Rate (box): MET — 1.04–1.07× of S0 (§3.9.2, two positions, both orders each)**; the laptop had read 0.85–1.02× (SCOPING) | `wire_verbs_per_entry` < 0.05 (0.0122 / 0.0000 on the box), `slot_handovers == 0` |
-| 3 | `sym-scale` N = 1/2/4/8 | dev → box | **Mechanism GREEN on every final-binary run** (every N completes, `appenders == N`, tripwires flat, fsck clean, deleted stays deleted through the widened arm — §3.1). **THIRD PASS on `b377cbb8` (§3.9.5.2): N = 1 4,928 c/s · 4,133 `C/CPU-S` · 1,327 MiB/s; N = 2 1.85× · 0.93× · 1.81×; N = 4 3.17× · 0.78× · 3.48×; N = 8 3.53× · 0.67× · 5.50× (per-writer storms 9.2–14.4 s; an INFERRED ≈ 3.9 s launch skew — the root's STRIPING at the row's mkdirs hypothesised; ≤ 4.5× the storms' own bound); handovers 0, ships ≤ 4, rpcs 0; ingest device ÷ user 1.24 → 1.13× at `wareq-sz` 1.5 → 1.3 MiB; F-B1 TRIPPED ×2 on the manager (1,127 / 1,125 ms; the derivation ENGAGED with its horizon EMPTY — the term 11 / 4 ms at each storm's start, 133 / 127 ms after; the steady state did not trip) at the FIRST cycle of the joiners' create-storm `ExtentGrant` bursts — the row set stopped at r1; F-R5 (a wire joiner's grant derived from `ewma = 0` = the floor 8; floor-ring claim-and-retire churn at the SMO grain — PR 13g).** **Rate (box, RE-RUN on `77f4da1d` — §3.9.4.2): B N = 8 4.27× creates / 5.37× ingest vs ≥ 5.6× — MISS on the wall law (N = 2 1.88× / 2.12×, N = 4 3.25× / 3.31× MET); `C/CPU-S` 4,281 → 3,944 → 3,314 → 2,627 (0.92× / 0.77× / 0.61×); the A arm (`mw-scale`, the SHIPPED authority + co-writers, measured for the first time) 351 / 343 / 391 creates/s = 0.07× at N = 2 / 4 / 8 (F-R2); F-B1 tripped 4× on the B fleet (0 ns excused) — the row set stopped at r1.** The first pass (§3.9.2): 4.27× / 5.33× at N = 8, F-B1 tripped; the laptop's 2.2–6.0× band was SCOPING | `appenders == N` ✓, `manager_load_pct` 0–3 % ✓, handovers 0 / ships ≤ N / rpcs 0 ✓ (re-run: ships 0 / 1 / 3 / 6); the A arm: shipped + intents ≡ served ✓ ×3, publish refusals 0, `local_commit_refusals` 0 |
+| 3 | `sym-scale` N = 1/2/4/8 | dev → box | **Mechanism GREEN on every final-binary run** (every N completes, `appenders == N`, tripwires flat, fsck clean, deleted stays deleted through the widened arm — §3.1). **FOURTH PASS on PR 13g's `230e95dd` (§3.9.6, two row sets from zero): set 1 — N = 1 4,997 c/s · 4,216 `C/CPU-S` · 1,506 MiB/s; N = 2 1.87× · 0.96× · 1.75×; N = 4 3.33× · 0.85× · 2.98×; N = 8 3.53× · 0.73× · 4.84× with a MEASURED 9.135 s launch skew (3 × 3.03 s fresh-joiner `mkdir`s into the freshly striped root; Σ per-writer rates 5.69×, the bound); F-B1 **0 on every writer through all four rows — the first gate-3 row set to reach its oracle on the box** (deleted-stays-deleted 0 / 3,000 ×2, fsck clean); set 2 (the setup outside the clock) — N = 8 **22,941 c/s = 4.61× creates** (per-writer storms 10.8–13.9 s, skew 12 ms; Σ rates 5.25×), `C/CPU-S` 2,820 = 0.66×, ingest 7,594 MiB/s (3.43× of a 2,215 MiB/s sub-second base), and **ONE trip on the manager at N = 4 — 1,101 ms, 1 ms past, at the storm's END under one served verb** (the landing's barrier + lateness over the pre-barrier term; §7 item 3); F-R5 FIXED on every joiner (rings 768 KiB–2.3 MiB, 1–3 wire grants per row, reactive 0, returns ≪ compactions; the manager 88 verbs / 0.114 s over the N = 8 row vs 892 / 2.93 s); handovers 0, ships ≤ 4, rpcs 0; ingest device ÷ user 1.09–1.23× at 1.25–1.65 MiB; F-R6 reported.** **THIRD PASS on `b377cbb8` (§3.9.5.2): N = 1 4,928 c/s · 4,133 `C/CPU-S` · 1,327 MiB/s; N = 2 1.85× · 0.93× · 1.81×; N = 4 3.17× · 0.78× · 3.48×; N = 8 3.53× · 0.67× · 5.50× (per-writer storms 9.2–14.4 s; an INFERRED ≈ 3.9 s launch skew — the root's STRIPING at the row's mkdirs hypothesised; ≤ 4.5× the storms' own bound); handovers 0, ships ≤ 4, rpcs 0; ingest device ÷ user 1.24 → 1.13× at `wareq-sz` 1.5 → 1.3 MiB; F-B1 TRIPPED ×2 on the manager (1,127 / 1,125 ms; the derivation ENGAGED with its horizon EMPTY — the term 11 / 4 ms at each storm's start, 133 / 127 ms after; the steady state did not trip) at the FIRST cycle of the joiners' create-storm `ExtentGrant` bursts — the row set stopped at r1; F-R5 (a wire joiner's grant derived from `ewma = 0` = the floor 8; floor-ring claim-and-retire churn at the SMO grain — PR 13g).** **Rate (box, RE-RUN on `77f4da1d` — §3.9.4.2): B N = 8 4.27× creates / 5.37× ingest vs ≥ 5.6× — MISS on the wall law (N = 2 1.88× / 2.12×, N = 4 3.25× / 3.31× MET); `C/CPU-S` 4,281 → 3,944 → 3,314 → 2,627 (0.92× / 0.77× / 0.61×); the A arm (`mw-scale`, the SHIPPED authority + co-writers, measured for the first time) 351 / 343 / 391 creates/s = 0.07× at N = 2 / 4 / 8 (F-R2); F-B1 tripped 4× on the B fleet (0 ns excused) — the row set stopped at r1.** The first pass (§3.9.2): 4.27× / 5.33× at N = 8, F-B1 tripped; the laptop's 2.2–6.0× band was SCOPING | `appenders == N` ✓, `manager_load_pct` 0–3 % ✓, handovers 0 / ships ≤ N / rpcs 0 ✓ (re-run: ships 0 / 1 / 3 / 6); the A arm: shipped + intents ≡ served ✓ ×3, publish refusals 0, `local_commit_refusals` 0 |
 | 3b | `sym-shared-dir` (+ `-ls`) | dev → box | **Mechanism GREEN on every run since defect 14** (one flip at the holder, `shipped ≡ served`, handovers 0; `-ls` = `K + C + 3` tokens, 0 data-leaf reads — §3.3). **Rate (box): 3,400–3,581 creates/s (8 × 5,000 into one directory), `ls -l` of 40,000 in 65.3 s — MET on every law, two positions (§3.9.2)**; the design's A arm (authority + co-writers) has no leg | `dir_stripe_flips == 1` ✓, `dir_stripe_ships ≡ foreign creates` ✓ (34,901 / 34,982 shipped ≡ served), `slot_handovers == 0` ✓; ls: `dlm_token_grants` = 40,067 = K + C + 3 ✓ |
 | 3c | `sym-foreign-touch` | dev → box | **Mechanism GREEN on every run since defect 10** (LIVE 192 ships / 0 handovers; IDLE moved after 1–2 bursts; PAUSED keeps its tree — §3.4 — **VOID: the PAUSED job never ran, §4.4aj**). **THIRD PASS on `b377cbb8` (§3.9.5.3): MET on ALL THREE laws ×2 — LIVE 192 ships / 0 handovers, IDLE moved after 4 bursts (17.94 / 17.59 ms — flush 13.8 / 14.1, tree 0 4.1 / 3.4, page 0.1), PAUSED (its FIRST real run on any venue — a live STOPPED job, resumed to 40,000 mkdirs) handovers 0 / idle offers 0 / dominated offers 0; F-R3 FIXED (zero `no inode record`, `xv_cross_owner_dangling_names` 0, the post-leave census C9 = C10 = 0 and the OFFLINE census `current_era_exempted` 0 / findings 0 ×2); F-R4 FIXED as far as the leg reaches (0 errnos on 451 / 451 touch creates = 902 — LIVE 192 + IDLE 256 + PAUSED 3 per position; `xv_cross_owner_step_slot_moved_retries` 0 — the slot-moved class not exercised, the pin its proof); F-B1 0; oracle clean ×2.** **Box RE-RUN on `77f4da1d` (§3.9.4.3): LIVE law MET as a VERDICT ×2 (192 ships / 0 handovers per fresh fleet at `N_floor` 2 — F-B2 FIXED); IDLE MET ×2 (moved after 4 / 5 bursts, `slot_handover_phase_ns` 7.48 / 6.67 ms); PAUSED NOT RUN — INVALID both positions (§4.4aj), owed to the next box session; position 2 RED at its oracle on F-B1 (m60, 1,116 ms); F-R3 / F-R4 found.** The first pass (§3.9.2): MISS (mechanism) — the LIVE phase's touches RECALLED the live holder once (`slot_handovers` 1, `slot_offers_dominated` 1 of 64 evaluations, handover 13.4 ms; `N_floor` seeded 2 on the box) — F-B2; the row set stopped | re-run: 0 handovers on 384 LIVE touches ✓; IDLE 0.016–0.020 handovers/s, `slot_handover_phase_ns` 7.48 / 6.67 ms (flush 3.99 / 2.04, tree 0 3.36 / 4.49, page 0.13); a paused live job keeps its tree — NOT EXERCISED (§4.4aj). First pass: 13.4 ms (flush 9.4 / tree 0 3.8 / page 0.14) |
 | 4 | `sym-crash` / `sym-storm` (a)–(f) ×10 from zero | dev (LOCAL by the venue law) | **`sym-crash` 10/10 GREEN on nine consecutive from-zero runs (attempts 7–15 — §3.8's attempt → binary list; their deleted arm read EIO as "deleted", §4.4ag); on the fix-round binaries 1/1 GREEN then 0/1 on the WIDENED arm (finding 2). `sym-storm` ×10 NOT REACHED: 7 + 3 GREEN rounds from zero under `--venue=laptop`, stopped by finding 1 (§4.4af — an acked-writes LOSS, open)** | must-stay-0 set (the flush-ceiling gauge venue-attributed on the laptop, Issue 2); `appender_recoveries ≡ regions of the killed nodes`; acked-loss 0 (VIOLATED once — §4.4af); `fsck_findings == 0`; C8/bitmap drift 0; `replay_dropped_torn == 0` |
@@ -2236,6 +2240,335 @@ anchor (`squeezefs mount .* <mnt>( |$)`) matched no arm-suffixed binary
 member 0 with the manager mounted (`6e9c602e`: the name up to the next
 space, the whole-word mountpoint kept; the teardown's stray sweep the
 same; the failed launch kept as `13e-nw-20260923-030202-scale.H1-pidanchor`).
+
+#### 3.9.6 The fourth pass — gate 3 on PR 13g's binary (`230e95dd`) — `perf/sym-box-13g`, 2026-09-24 04:05 → 04:57 UTC (the box left as found): **`sym-scale` N = 1/2/4/8 ran TWICE from zero on fresh fleets — the first row set is the FIRST gate-3 row set ever to complete to its ORACLE on the box (`appender_flush_ceiling_overruns` 0 on the manager and every joiner through all four rows, deleted-stays-deleted 0 / 3,000 ×2, fsck clean); the second (a harness re-run — the row's setup taken out of its clock) read ONE trip on the manager, 1,101 ms — 1 ms past the ceiling — at the N = 4 storm's END under NO verb service; F-R5's laws MET on every joiner in both sets (rings 768 KiB–2.3 MiB, returns ≪ compactions, 1–3 wire grants per joiner per row, reactive 0, the manager's verbs 10× and its service 26× down at N = 8); the launch skew MEASURED for the first time — 9.1 s at N = 8, three 3.0 s `mkdir`s by the fresh joiners into the freshly STRIPED root — and with the setup outside the clock N = 8 reads 4.61× creates (Σ per-writer rates 5.25×, the bound); one new armed-plane finding (F-R6: a joiner's FORGET-driven reclaim prices destroys for the HOLDER's inos through its stale projection — 6,782 / 7,266 withheld per set, defect 18 / 34's loop under it) and one log-volume finding (272 k `may reply interrupted fuse request` WARNs per set)**
+
+**The counted-run law**: the brief's ONE row set ran from zero on PR 13g's
+binary and completed (`13g-nw-20260924-041135-scale`); it measured a
+harness term — the N = 8 row's eight `mkdir`s under `/` ran INSIDE the
+storms' clock and three of them took 3.0 s each — so the leg was fixed
+(the setup before the clock, its walls stamped) and ONE more row set ran
+from zero on a fresh fleet (`13g-nw-20260924-044235-scale`). Both are
+reported; the second is the wall law's honest read, the first the
+oracle's. No third row set (the minimum-count law). Gates 1 / 2 / 3b / 3c
+/ 5 / 7 were NOT re-run (13g changes the joiner's supply and the
+manager's cadence; the third pass's rows on `b377cbb8` stand for the rest
+— they rerun once on PR 14's flip binary).
+
+**Venue (re-verified 04:05 UTC, 2026-09-24):** `squeeze-test`
+(`memp-s3ds-aqs-37`), 32-core Xeon, 251 GiB, Rocky 8.10, **kernel
+`6.19.14-sqz`** (the sqz series incl. patch 0031), up 2 d 2 h 58, load
+0.00, modules loaded = `nvme_tcp nvme_fabrics nvme_core fuse` only (no
+Lustre / lnet, the devsub's `nvmet` / `zram` / `null_blk` unloaded as the
+third pass left them), docker inactive, lnet failed (inactive), only
+`fusectl` mounted, no daemon, no `/run/squeezefs-mwfleet*` / `-devsub-*`
+(`/run/squeezefs/` = the box-rows rung's four stale IL sockets), no netns,
+0 `pref 40` rules, no `/dev/shm/sqz*`, 245 G free; the fabric's 15
+controllers connected as found. Both row sets on the box's own tcp devsub
+(nvmet-tcp on `127.0.0.1`, `resv_enable=1`, `lzo-rle` zram,
+`SQZ_MWFLEET_OSS_GB=16`, fleet A = `create N=2 --symmetric --writers=7
+--token-readers`, `--venue=box`, `REPEATS=1`). **Arm B** = `230e95dd`
+(= `dev`'s code tip: PR 13g over the third pass's record; the batch `task
+check` GREEN — 407 suites / 5,610 tests) — built by the orchestrator
+(`task build:rocky8`, the `release` profile, from a detached checkout at
+that sha), staged at `/tmp/grok-justin/box-13g/arms/`, `sha256sum -c` OK
+on both sides: **`squeezefs 1.2.4 (230e95dd57da /
+230e95dd57da324b03aab0646e00d275799e73d0) built 2026-09-24T03:58:38Z
+profile release`**, sha256
+`099477dcd1c919cdf492addeb1bcd61cd318187758001ff66318e63e7e49d8b2` (shim
+`fd4a02ac8cc88dec…1f1a82b7`), placed as
+`/scratch/tmp/sym-box/squeezefs-B-230e95dd` and as `/scratch/tmp/squeezefs`
+(the reset script's client binary; the earlier B arms kept beside it). No
+A arm this pass (gate 3's A arm — the shipped MW posture at 0.07× — is
+unchanged by 13g and cited from §3.9.4.2). **Instrument:** the driver
+`2026-09-21-sym-box-brackets.sh` + `run_mw_matrix.sh` at THIS branch's
+revision — `76028d5f` (every storm's LAUNCH and END stamped; F-R5's
+per-writer faces; F-B1's projection / lateness / unit faces) for the
+first set, `6108e8c1` (the row's directories created BEFORE the clock
+with their walls stamped; the Σ-of-per-writer-rates bound; the hygiene
+faces; an end-of-leg snapshot; PR 13e's post-leave census at the leg's
+end) for the second (its end-of-leg snapshot's label fixed after the
+run, `cea35691`). The laptop ran nothing of this rung.
+
+**The two row sets:**
+
+| set / N | **create/s · ×N=1** | `C/CPU-S` (×) | **ingest MiB/s · ×** | `MGR_LOAD` / `MGR_CPU` / handovers / ships / rpcs | ingest amplification (`/proc/diskstats`, 2 data namespaces): device write ÷ user · `wareq-sz` · device read ÷ user | per-writer storms (s) · the launch term | verdict (the leg's) |
+|---|---|---|---|---|---|---|---|
+| **1** (`041135`, the mkdirs inside the clock) · 1 | **4,997 · 1.00×** | 4,216 | 1,506 · 1.00× | 3 % / 115 % / 0 / 0 / 0 | 1.228 · 1,648 KiB · 0.228 | 8.0 · skew 0.005 s | MET |
+| 1 · 2 | **9,354 · 1.87×** | 4,027 (0.96×) | 2,632 · 1.75× | 1 % / 112 % / 0 / 1 / 0 | 1.147 · 1,338 KiB · 0.147 | 7.8–8.5 · 0.012 s | MET |
+| 1 · 4 | **16,620 · 3.33×** | 3,570 (0.85×) | 4,495 · 2.98× | 0 % / 113 % / 0 / 3 / 0 | 1.175 · 1,346 KiB · 0.175 | 8.4–9.6 · 0.025 s | MET |
+| 1 · 8 | **17,620 · 3.53×** | 3,061 (0.73×) | **7,294 · 4.84×** | 0 % / 70 % / 0 / 4 / 0 | 1.110 · 1,255 KiB · 0.110 | 9.0–13.6 (2,937–4,435 c/s each; Σ 28,424 = **5.69×**, the upper bound) · **skew 9.135 s** — m0, m60–m63 launched within 36 ms, m64 / m65 / m66 at +3.07 / +6.09 / +9.13 s (each `mkdir -p` 3.03 s) | MISS on both wall laws (creates 3.53×, ingest 4.84× vs ≥ 5.6×); **the must-stay-0 set held; the oracle reached: deleted-stays-deleted 0 / 3,000 at the manager, 0 / 3,000 at the remounted joiner, fsck clean** |
+| **2** (`044235`, the mkdirs BEFORE the clock) · 1 | **4,981 · 1.00×** | 4,244 | 2,215 · 1.00× | 3 % / 112 % / 0 / 0 / 0 | 1.005 · 1,254 KiB · 0.005 | 8.0 · setup 0.007 s, skew 0.001 s | MET |
+| 2 · 2 | **9,270 · 1.86×** | 4,004 (0.94×) | 2,637 · 1.19× | 1 % / 112 % / 0 / 1 / 0 | 1.128 · 1,433 KiB · 0.128 | 7.8–8.6 · 0.015 / 0.003 s | the create law MET; ingest MISS against a 2,215 MiB/s base (below) |
+| 2 · 4 | **16,283 · 3.27×** | 3,488 (0.82×) | 4,105 · 1.85× | 0 % / 113 % / 0 / 3 / 0 | 1.107 · 1,284 KiB · 0.107 | 9.0–9.8 · 0.027 / 0.006 s | the create law MET; **`MISS(must-stay-0: m0 appender_flush_ceiling_overruns +1)`** — 1,101 ms at 04:45:22Z |
+| 2 · 8 | **22,941 · 4.61×** | 2,820 (0.66×) | **7,594 · 3.43×** | 0 % / 104 % / 0 / 4 / 0 | 1.090 · 1,263 KiB · 0.090 | 10.8–13.9 (2,871–3,697 c/s each; Σ 26,172 = **5.25×**, the bound) · **setup 9.120 s OUTSIDE the clock** (m64 3.021 / m65 3.018 / m66 3.014 s, m63 0.039 s, the other five 4–5 ms), skew inside the clock 0.012 s | MISS on both wall laws (creates 4.61× vs ≥ 5.6×; ingest 3.43×) |
+
+**The wall law, re-read with the launch MEASURED.** The third pass
+INFERRED ≈ 3.9 s of skew at N = 8; the leg now stamps every storm's launch
+and end. Set 1 measured **9.135 s**: the five writers already mounted
+launched within 36 ms of the row's first `mkdir`, and the three joiners
+mounted FOR the row (m64 / m65 / m66 — the leg keeps exactly N appenders
+live) launched at +3.07 / +6.09 / +9.13 s because each one's `mkdir -p
+/scale-…-w6x` into `/` took **3.03 s** — right after the ROOT STRIPED at the
+fifth creator's mkdir (m0.log 04:16:02Z `directory 1 STRIPED into 64
+stripes (3 supplied by creators [1, 2, 3], 61 minted by the holder)`; at
+N = 4 the two fresh joiners' mkdirs took 6 ms with the root unstriped).
+Set 2, with the same eight mkdirs stamped BEFORE the clock, reproduced it
+to the millisecond: m64 3.021 s, m65 3.018 s, m66 3.014 s (m63's — the
+fifth, the flip's own — 39 ms; the other five 4–5 ms) — **a fresh joiner's
+first create into a STRIPED root costs ≈ 3.0 s on this binary** (three
+≈ 1 s waits by shape; the standing hypothesis is the lazily dialed
+per-holder token planes' first rounds — `TokenReaderPlane::
+await_channel_fresh` waits the standing recall poll's first round, which
+the holder parks for its whole `DELEG_PARK_DEFAULT_MS` = 1,000 ms window
+when nothing is recalled; the manager admitted three new sessions from
+m64 at 04:16:04 / :05 / :05, inside its mkdir; `xv_cross_owner_phase_ns
+.total` for the mkdir's own intent 1.7 ms — the 3 s is BEFORE the
+intent). An INFO log cannot split the three seconds; the instrument is
+`SQUEEZEFS_OP_PROFILE=1` on a fresh joiner's first create into a striped
+root (PR 14 / 15's item — a latency cliff on the flip's default path,
+paid once per fresh writer per striped directory's holder set, not a
+throughput term). With the setup outside the clock the storms' own
+multiple at N = 8 is **4.61×** (the leg's law; per-writer storms 10.8–13.9
+s = 2,871–3,697 c/s each, launch skew 12 ms) against an upper bound of
+5.25× (Σ per-writer rates; exact only at zero skew) — **the wall law
+MISSES ≥ 5.6× on this venue by the storms' own concurrency, not by the
+launch** (§3.9.3's co-located term: eight daemons and eight 16-thread
+clients on 32 cores; `C/CPU-S` 4,244 → 2,820 = 0.66×). The per-NODE law
+stays PR 15's. **The ingest law's N = 1 base is a sub-second
+measurement**: one writer's 1 GiB `dd conv=fsync` lands in 0.46–0.77 s
+and read 1,327 / 1,506 / 2,215 MiB/s across the three box row sets on two
+binaries, while the N = 8 aggregate is STABLE at 7,292 / 7,294 / 7,594
+MiB/s — the two-volume zram bus's ceiling — so the ingest multiple
+(5.50× / 4.84× / 3.43×) is the base's noise, not a scaling reading; the
+leg's `--ingest-mb` needs ≥ 4 GiB per writer for a base the law can
+divide by (a harness item, stated; the N = 8 absolute is the row's
+number). Engagement: handovers 0, ships 0 / 1 / 3 / 4 (≤ N), `dlm_rpcs` 0
+on every writer, `appenders_known` = N at every row, `manager_load_pct`
+≤ 3 %, `MGR_CPU` 70–115 %. Amplification: the ingest's device writes
+1.005–1.228× user at `wareq-sz` 1.2–1.6 MiB with device reads 0.005–
+0.228× user (the N = 1 row's short window scatters it; N = 8 reads
+1.090–1.110× at 1.25 MiB, the third pass's 1.129).
+
+##### 3.9.6.1 F-B1 — the box's VERDICT on PR 13g's projection: **the class the third pass read is GONE; the tripwire is NOT 0 on this binary**
+
+**Set 1: 0 increments on every writer at every N — the first gate-3 row
+set to run its four rows and reach its oracle on the box.** The faces on
+the manager (its two volumes): term [6, 4] ms at N = 1's end; **[24, 6] /
+trigger [976, 994] at N = 2's START and [26, 7] / [974, 993] at N = 4's
+START** — the third pass's class (an almost-empty horizon on volume 1
+when a joiner storm begins) exercised twice and NOT tripped; **[145,
+183] / [855, 817] at N = 8's START** (the between-rows `rm -rf` + join
+window put a real term in the window — 148 manager cycles between N = 4's
+end and N = 8's start); [14, 27] at the end; `meta_kv_checkpoint_late_max_
+ms` 25–49 on the manager and 7–48 on the joiners (inside the 100 ms
+margin); the projection read 0–12 ms at every snapshot instant (a quiet
+tick's dirty count — the snapshots never catch a storm cycle); node units
+15–235 µs, image units 0.4–4.9 ms; `excused_ns` 0 everywhere; the
+joiners' end-of-row terms 4–136 ms with 0 trips (m60 [129, 12], m61 [71,
+0] at N = 8). Under the manager's volume 1 across the N = 8 create: ONE
+`ExtentGrant`-class verb per second at most — the grant burst of §3.9.5.2
+does not exist on this binary (F-R5 below).
+
+**Set 2: +1 on the MANAGER's second metadata volume — `04:45:22Z WARN …
+meta volume /dev/nvme31n1: flush ceiling OVERRUN — appender region(s)
+[(0, 1101)] … exceeded the 1100 ms landing ceiling with every structural
+hold's capped overlap excluded`** — **1 ms past**, at the END of the N = 4
+create storm (the four storms ended 04:45:21.2–22.0; the manager's own
+last), 0 excused, no recovery / service extension. The faces (the row's
+three snapshots, `m0_pn4{0,c,1}.json`): at the row's START volume 1's
+term **6 ms** / trigger **994** / projection 0 (the quiet horizon — the
+class); at the CREATE's END (≈ 2 s after the trip) term **52** / trigger
+**916** / **projection 84 ms** / lateness 15 (the projection ENGAGED —
+84 ms off the tick's dirty count against node / image units of 92.9 µs /
+2.04 ms); at the row's END term **151** / trigger 849 / lateness 35 (the
+INGEST's cycle — four 1 GiB `conv=fsync` publishes — entered the horizon
+after the trip). Volume 1 served **one manager verb across the whole
+row** (`manager_verbs` 517 → 518; volume 0's 26 verbs = the N = 4 joiners'
+sizing asks: 68 / 69 / 107 / 141 extents in single runs at 04:45:12–13,
+two `GrowRing` carves) — **no verb service, no grant burst: the third
+pass's mechanism is absent at this trip.** What the age decomposes to:
+`age = (the decision's instant: the trigger + its lateness) + the pass's
+pre-barrier wall + the covering BARRIER's wall`; the term the horizon
+holds and the projection prices is the PRE-BARRIER wall (52 ms entered the
+window for this cycle), the ceiling is measured AT THE BARRIER — so with
+a trigger of 916–994 ms, a lateness of ≤ 15–35 ms and a pass of ≤ 52 ms,
+the covering barrier's own device wall (an fdatasync on nvmet-tcp
+null_blk under four storms' journal lanes, ≈ 40 ms here) is what the
+fixed two-tick margin had to absorb — and it was 1 ms short once in the
+eight rows of this pass (0 of 8 in set 1). **The verdict: PR 13g's
+derivation prices the STORM (every onset in both sets, every joiner's
+storm, the manager's own 40k-file storms, the walls' 50–119 ms terms of
+the third pass — 0 trips at every one); what it does not price is the
+cycle's LANDING — the covering barrier's wall (+ the decision's lateness)
+over the pre-barrier term, which the 100 ms margin covers at this venue
+by ≈ 0–10 ms.** §7 item 3's next piece is that residue: the term measured
+at the LANDING (the barrier included) rather than before it, or the
+margin derived from the measured barrier wall — never a widened constant.
+The tripwire's rate on this binary at this venue: 1 increment in 8 rows
+across two row sets (16 writer-rows at the manager, 44 joiner-rows), 1 ms
+past. Set 2's leg died on the must-stay-0 set after its table, before its
+oracle (as the leg is built); nothing else moved on the set.
+
+##### 3.9.6.2 F-R5 — the box's VERDICT on PR 13g's supply: **FIXED — every law MET on every joiner in both sets**
+
+The faces per joiner at the leg's end (set 1; set 2 in parentheses where
+it differs), the deltas over the N = 8 CREATE phase:
+
+| joiner | `appender_ring_bytes` KiB (grows) | Δ`joined_wire_extent_grants` · Δreactive | Δ`extent_grant_returned` vs Δcompactions | Δ`appender_pressure_cycles` vs Δcheckpoints | pool at the end claimed / returned / unclaimed | the new hygiene set |
+|---|---|---|---|---|---|---|
+| m60 | [1,280, 2,304] ([1, 2]) — set 2 [1,792, 1,792] ([2, 2]) | [1, 1] · 0 | [38, 0] vs 180 (set 2 [0, 0] vs 118) | [0, 6] vs 42 | [64, 77] / [240, 795] / [120, 106] | 0 |
+| m61 | [2,304, 768] ([2, 0]) — set 2 [1,280, 2,304] | [1, 0] · 0 | [13, 0] vs 184 | [8, 0] vs 44 | [78, 0] / [339, 0] / [115, 72] | 0 |
+| m62 | [2,048, 1,536] ([2, 2]) — set 2 [2,048, 768] | [1, 0] · 0 | [17, 0] vs 128 | [11, 0] vs 40 | [79, 64] / [261, 144] / [111, 72] | 0 |
+| m63 | [1,280, 1,280] ([1, 1]) — set 2 [768, 1,280] | [0, 2] · 0 | [0, 2] vs 119 | [1, 25] vs 53 | [66, 72] / [13, 2] / [81, 110] | 0 |
+| m64 | [768, 1,280] ([0, 1]) — set 2 [1,024, 1,280] ([1, 1], declined [2, 0]) | [0, 3] · 0 | [0, 5] vs 118 | [1, 25] vs 52 | [64, 83] / [0, 5] / [8, 107] | 0 |
+| m65 | [768, 1,792] ([0, 2]) | [0, 2] · 0 | [0, 9] vs 119 | [3, 25] vs 56 | [65, 72] / [0, 9] / [95, 105] | 0 |
+| m66 | [768, 1,280] ([0, 1], declined [0, 1]) | [0, 2] · 0 | [0, 5] vs 118 | [3, 25] vs 59 | [64, 72] / [0, 5] / [8, 103] | 0 |
+
+**Law 1 — the ring grows**: every joiner above the 512 KiB floor on both
+volumes at the leg's end in both sets (768 KiB is the join's DERIVED ring
+— `resolve_sym_ring_bytes_hinted` — not the floor; the fresh joiners
+m64–m66 grow it once to 1.25 MiB inside their first storm, the joiners
+with a hint start at 1.0–2.3 MiB); 30 / 33 `GrowRing` carves per leg,
+`joined_ring_grow_declined` 0 everywhere but m66 [0, 1] (set 1) and m64
+[2, 0] (set 2), `appender_grow_ring_short_declines` [0, 1] / [2, 0] at the
+manager — `GrowRing for appender 7 declined — the heap's longest adjacent
+run is 1 extents against a floor of 2 (half the ask of 4); no table slot
+spent` — counted, as built. **Law 2 — returns bounded**: `extent_grant_
+returned` +0…+38 over a joiner's N = 8 storm against 118–184 compactions
+(the third pass: +193 ≈ the compactions — claim-and-retire churn); the
+surplus above the pool's target returns at the quiet cadences between the
+rows (m60's volume 1: 501 extents in 16 `ReturnExtents` between N = 2 and
+N = 4, 795 by N = 8 — the shrink toward `joined_pool_target`), never inside
+a storm. **Law 3 — the ask is the joiner's**: `joined_wire_extent_grants`
+1–3 per joiner per row (the third pass: +47 per joiner per storm), every
+one a derived-size carve — 58 extents per grant at N = 8 (`extent grant to
+appender 4: 66 / 46 / 88 extent(s)`; the third pass's 845 × 4 … 108 × 8),
+`joined_wire_reactive_grants` 0 on every joiner in both sets (the third
+pass's reactive one-SMO asks were 93–96 per joiner in the pin's RED).
+**Law 4 — the cadence**: `appender_pressure_cycles` +0…+11 per storm on
+the sized rings, +25 on the fresh joiners' 768 KiB volume-1 rings (one
+growth inside the storm), against 40–63 checkpoints per 10–13 s storm
+(4–6/s; the third pass: +79 pressure of +109 checkpoints at ≈ 8/s).
+**The manager's economy (the verdict's number)**: over the N = 8 row
+Δ`manager_verbs` [67, 21] = **88** (set 2: 81) against the third pass's
+892, Δ`extent_grants` 15 carving 877 extents (13 / 730) against 449 grants
+of ≤ 8, Δ`extent_returns` 13 (9) against 387, Δ`manager_service_ns.execute`
+[0.072, 0.042] = **0.114 s** (0.114 s) against 2.93 s — **10× fewer verbs,
+26× less service**; the whole leg 276 / 244 verbs, 44 / 39 grants,
+0.49 s of execute (the third pass's leg: ≈ 2,700 verbs, 976 grants). **The
+must-stay-0 / hygiene set of PR 13g read 0 on every writer in both sets**:
+`extent_return_run_cap_refusals`, `appender_stale_page_words_dropped`,
+`appender_pool_restored_extents`, `appender_pending_segments_returned`,
+`appender_join_residue_returned`, `joined_control_refusals`,
+`joined_wire_failures`, `joined_wire_words_rejected`, `manager_verb_
+refusals`, `manager_verb_replays`, `manager_verb_rejected`, `dlm_rpcs`,
+`invariant_tripwires`, the PR 13e tripwires. **The closure holds
+EXACTLY, set-wide**: the manager's `extent_grant_extents` counts every
+carve including the seven first-incarnation join grants that LEFT with
+the N = 1 setup (the leg keeps N appenders live — every joiner leaves and
+rejoins; 7 × 72 = 504 per volume), so `[2,375, 2,579] − 504 = [1,871,
+2,075] ≡ Σ over the live joiners of claimed + returned + unclaimed =
+[1,871, 2,075]` at set 1's end (set 2: `[1,944, 2,579] − 504 = [1,440,
+2,075] ≡ [1,440, 2,075]`) — a joiner's own `granted` is not a published
+`.stats` face (the `AppenderStats` word exists; stated for PR 14's stats
+sweep), so the closure is read against the manager. The joiners' rejoin
+faces — `appender_pool_restored_extents`, `appender_pending_segments_
+returned`, `appender_join_residue_returned`, `appender_stale_page_words_
+dropped` — 0 on every one of the 14 rejoins the two legs ran (a clean
+lifecycle; the `appender_hint` sizing visible as the 1.0–2.3 MiB rings
+the rejoined m60–m62 start their later rows with).
+
+##### 3.9.6.3 Findings of this pass (each REPORTED with its evidence; none fixed here)
+
+**F-R6 (new — PR 12b's reclaim path × PR 5's token planes; the armed
+plane): a joined writer's FORGET-driven reclaim prices DESTROYS for inos
+in slots it does NOT lease, reading its own stale PROJECTION of the
+holder's trees.** Both sets: m60's log carries **6,782 / 7,266 `WARN
+squeezefs::routing reclaim of ino …: destroy WITHHELD — the entry
+carrying its 0 reference release(s) did not commit (pricing the destroy
+failed: … corrupt KV encoding …)`** lines (`reclaim_destroy_refused_
+release_failed` 0 → 121 / 742), every one for an ino of the MANAGER's
+rotor (ino 41025607 → routing slot 69, 59899929 → 23, 59834453 → 83 —
+forest 70 / 24 / 84, the even forest slots the manager mints in; never
+m60's own), in the between-rows windows where the MANAGER removes its
+own 40k-file tree. Three faces of one stale projection: (a) 04:14:52Z
+(set 1) node `0x2180000` read as ZEROS (`bad node magic 0x00000000`) — the
+extent the manager had carved into appender 3's ring at 04:14:17Z
+(`m0.log:20134 GrowRing — appender 3's ring grows … at 0x2180000`, zeroed by
+the carve) after its own leaf there retired; (b) 04:17:29–48Z `tree 0
+(slot Some(24) …, a PROJECTION here): traversal retry budget exhausted
+descending to level 0 (routing loop — SMO protocol bug) restarts
+[root-retired, root-seq, routing-hole, child-retired, child-seq] = [0,
+256, 0, 0, 0]` on 60+ of the manager's slots — 6,205 / 6,088 such lines:
+**defect 18 / 34's recycled-root class recurring, PR 13b's "9/10" loop in
+production shape** (the refresh finding no newer ledger seq); (c) 27 / 45
+CONSECUTIVE extents `0x1a40000 … 0x20c0000` `screened FOREIGN by rule 4
+(appender 4, slot generation 1; the lessee's current generation is 1) —
+the log ends before it` — the manager's former leaves re-granted to m63
+(appender 4), which wrote its frames there. The mechanism: the leg's
+acked-writes check reads the manager's tree THROUGH m60 (its kernel
+instantiates 40k of the manager's inodes), the manager's `rm -rf` recalls
+m60's tokens → m60's recall sink invalidates + PRUNES → the kernel FORGETs
+→ **m60's reclaim prices a destroy for a foreign-slot ino by reading its
+projection** — pointers into extents the holder has since retired, freed
+and re-granted. Nothing was destroyed (the WITHHOLD is the fail-safe;
+the holder's own reclaim is the lifecycle's law — the manager's log
+carries no corrupt read) and set 1's every acked-writes / deleted-stays-
+deleted / fsck arm passed; the cost is a CPU + log storm on the joiner (6,205 ×
+256 restarts, 6,782 WARN lines per window) on a path a token client must
+never take — a non-holder prices no destroy for an ino it merely cached
+— with defect 18 / 34's loop reachable under it. Fix shape (PR 14): the
+FORGET / reclaim path skips inos whose slot this mount does not lease
+(the holder's reclaim owns them; a token client drops its cache entry
+and nothing else), and defect 34's loop stays on its own item (its
+recipe here: a projection whose root the holder recycled between two
+of the joiner's ledger polls). **The row's oracle cannot see this class**:
+the online census scopes live lessees' slots out, deleted-stays-deleted
+judges names, and the two gauges that moved sit outside the must-stay-0
+set and outside every per-row snapshot pair — the leg now prints them
+per row and once more after the last removals (`6108e8c1`), and ends
+with the post-leave census. Evidence: `13g-nw-20260924-0{41135,44235}-
+scale/scale-r1/daemon-logs/{m0,m60,m62,m63}.log`, the ino → slot
+arithmetic, `m60_pn{41,80}.json` / `m60_pend1.json`.
+
+**A log-volume finding (PR 13b's served-mutation kernel hook)**: **272,071
+/ 285,461 `WARN fuse3::raw::session may reply interrupted fuse request,
+ignore this error No such file or directory (os error 2)`** per set
+across the daemon logs (m0 222,423 / 223,831; m60 49,177 / 51,481; the
+other joiners 9–81 each) — ≈ 2 × `meta_ship.served_mutation_{invals,
+prunes}` (m60 114,716 + 114,716 by N = 8; the manager's recall-side
+invalidations): the hook's `FUSE_NOTIFY_INVAL_INODE` / `FUSE_NOTIFY_PRUNE`
+answer `ENOENT` for an inode the kernel does not hold (the expected "not
+cached" word) and the fork logs every one at WARN. A hygiene item (PR
+14): the notify's `ENOENT` is a counted outcome, never a WARN per call.
+
+**The fresh joiner's 3.0 s `mkdir` into a striped root** (above — the
+launch term, reproduced ×3 in both sets; an `OP_PROFILE` tape is its
+instrument; PR 14 / 15). **The ingest law's sub-second N = 1 base**
+(above — `--ingest-mb` ≥ 4,096 on the box; a harness item). **Two
+`.stats` faces stated for PR 14's sweep**: a joiner's `granted`
+(`AppenderStats::grant_granted`) is not exported, so the pool closure is
+read set-wide; the writer's per-holder read planes report on no `dlm_
+token_reader_*` face (the `-o ro` reader's family), so a joiner's divert
+cost is visible only as `dlm_token_records_bytes` and `meta_ship.dlm_
+token_cache_grants`. **Harness (fixed on the branch, placed on the
+box)**: `76028d5f` (the launch / end stamps, F-R5's faces, F-B1's
+projection / lateness / unit faces), `6108e8c1` (the setup before the
+clock — its walls stamped; the "wall from the LAST launch" reading of the
+first commit REPLACED by the Σ-of-per-writer-rates bound, since most of
+a staggered row's work runs before that instant; the hygiene faces; the
+end-of-leg snapshot; the post-leave census), `cea35691` (the end-of-leg
+snapshot's label — set 2's leg died on the missing `m0_pend1.json` after
+its table; it would have died on the must-stay-0 set one line later
+either way, so nothing of set 2 is lost to it). Artifacts:
+`/scratch/tmp/sym-box/13g-nw-20260924-0{41135,44235}-scale/` (+ `.log`s;
+per set `scale-r1/symscale-*/` — the table, `symscale-faces.txt`,
+`launch-n*.tsv`, `create-n*-w*.txt` with `launch_ts= end_ts=`,
+`disk_pin*.tsv`, `m*_pn*.json`, `fsck-sym-scale.out` (set 1) — and
+`scale-r1/daemon-logs/m*.log`), pulled to
+`/tmp/grok-justin/box-13g/nw/` with `REDUCED.txt`.
+
 
 ## 4. Issues found (each with its PR and its red pin)
 
@@ -4384,9 +4717,13 @@ then; the row sets that do not (3c, 7) read clean.
 
 **PR 13g (F-B1, the third box campaign's re-read — `fix/sym-joiner-supply-and-manager-term`, 2026-09-23): the CLASS the derivation above could not price, and the second term that prices it.** The box record's review (Issue 2) re-timed the third campaign's two trips: at each trip the anticipated term read **11 / 4 ms** (triggers 989 / 996) — the 127–133 ms was the trip cycle's OWN term read after — and 199 quiet cycles between the rows had pushed the previous row's 133 ms out of the 64-CYCLE horizon; the storm's steady state (the term in the window) did NOT trip again. The class is **the FIRST storm cycle after a quiet horizon**: a horizon measured in CYCLES forgets a burst that quiet cycles push out, and no horizon of PAST terms can price a cycle whose work exceeds every cycle in it. **The remedy is a second DERIVATION beside the horizon term, never a widened constant or a longer memory:** at every tick the cadence anticipates `max(horizon term, LIVE projection)`, the projection = the dirty nodes the pass will write × the measured per-node append wall + the images the pending commits PROMISED (§4.7's admission — `heap_promised` on the manager's heap, a region grant's `promised` on a leased slot's leaves) × the measured per-image SMO wall (`checkpoint::projected_flush_wall_ns`; `KvMetaBackend::checkpoint_trigger_ms_for(max_age, dirty)` takes the tick's own dirty count — one walk per tick, `dirty_node_count`). The units are measured per flush pass by CLASS (`checkpoint::FlushPassSample` — a node whose flush wrote fresh images is SMO work priced per image, every other node an append priced per node; attributed PER VOLUME through `SmoContext::images_written`, because the process-wide SMO / image counters fold every volume's — a mount's volumes and a fixture's daemons share them), and the unit in force is the horizon MAXIMUM over the passes that ran the class (`CycleTermWindow` per class — the term's own law: a bound anticipated by a bound; a mean unit under-prices every above-mean pass, and a machine that slows under a storm raises the bound at the first slow pass); a pass that ran none of the class measures nothing and the unit KEEPS what the last passes measured — what survives quiet by construction; a unit nothing has measured is 0 (a fresh mount's first storm cycle is the horizon's alone, the shipped posture until its first pass with the class). The ceiling never widens; a bit-17-absent volume's trigger is the max age verbatim. Published `meta_kv_checkpoint_projected_ms`, `meta_kv_checkpoint_{node,image}_unit_ns`, `meta_kv_node_images`. **The pin reproduces THIS shape** (`sym_n_daemon_tests::a_storms_onset_after_a_quiet_horizon_lands_inside_the_managers_ceiling` — the box's row sequence in process on the box's 32 MiB ring, `format_stamped_set_with_ring_len`: the fixtures' 1 MiB ring made every manager cycle the PRESSURE law's, so the age law never decided there): a `sym-scale` row (the manager + three joiners, one unpaced creator each, 3 s — the manager's units measured, a term of 31–65 ms in the horizon), 72 quiet `checkpoint_now` cycles (the term → 0–2 ms, the premise asserted: the horizon FORGOT), then the next row's onset for 4 s under the product cadence. At that shape the pin read **RED 1/3 on the MANAGER's law** with the projection off (age 1,132 ms = 1,022 before the collection + 110 ms cycle: the box's exact shape, on one run; the other two runs tripped the JOINERS' onsets, a term the pin no longer asserts — review round 1, Issue 6). The pin was then RESHAPED to force the class deterministically under PR 13e's method (a PARKED device at 3 ms/write): the manager storms `MINT_SPREAD` = 64 fresh directories per row with one PACED creator each (64 slot trees → 64 dirty root leaves per storm tick ≈ 260 ms of appends, two and a half margins — unpaced creators dirty hundreds of split leaves per cycle, the steady-state shape rather than the class), one joiner, a warm-up that measures both units and puts a term in the horizon, row 1 with the horizon holding it (the premise, no trip), 72 quiet test-side cycles (asserted forgotten), row 2's onset into fresh directories: **RED 3/3 on the manager's law at the pin's commit** (the onset lands its leaves 1,426 / 1,266 / 1,299 ms old), **GREEN 6/6 + 3/3 at the fix's** (the onset decisions read the projection over the dirty nodes + the promised images, the onset cycles landing inside the ceiling) — **and 1 in 9 RED at the rebased HEAD `4fd1db2f` (review round 2, Issue 19): one overrun with the onset term 471 ms against a 557 ms projection and a 443 ms trigger, the age decision ≈ 190 ms past its trigger — the dev profile's tick under CPU saturation, past the ceiling's two-tick margin (100 ms), a term the box does not have.** The pin now attributes it INSIDE itself: the decision's raw lateness rides the horizon as `meta_kv_checkpoint_late_max_ms` (the same 64-cycle window as the term), an overrun beside a lateness past the margin VOIDS the sample — stated with its lateness, the row re-drawn behind its own quiet horizon into a fresh directory set, bounded at three draws, a run with no valid sample failing loud naming the venue — and an overrun INSIDE the margin is the cadence's, the pin's failure; never a silent retry. At the pin's reshape: GREEN 3/3 at the first draw, the decision at most 40–61 ms late (0 void of 3 samples). **The pins' venue, stated:** `cargo test` is the dev profile, whose SMO costs 5–14 ms and whose per-node append doubles under the laptop's heat soak (node units 200 → 750–1,300 µs across one afternoon); the two cadence-timing pins home their volume on `/dev/shm` where it exists (`cadence_venue_dir` — the fixtures' btrfs file's `fdatasync` is 100+ ms and variable, the 165× substrate bracket), pace their creators to the venue, and assert the ceiling law on the MANAGER (the box's trip site) with the joiners' supply gauges beside it — a joiner's reading here carried the dev profile's tick lateness under CPU saturation (a decision 328 ms past its trigger with the SMO mutex free — the tick's own pre-decision work, PR 13e's "26–272 ms against a 50 ms tick"), a venue term the box does not have; the joiners' ceiling is the fleet proof's read. Every timing here is the mechanism's — the box's bracket on the flip binary is what judges the derivation. **Found by the touched suites and fixed in its OWN commit (`39f35963` — split from F-R5's pool commit at review round 1, Issue 6):** PR 3's carve trim — releasing the smallest NEW run while the union exceeded the page's `GRANT_RUNS_MAX` — starved a recycled pool whose singles held the page's four runs: every carve was released to nothing and answered as the remainder VERBATIM, and `maintenance_grant_refill` read "landed" off the non-empty verbatim answer and `continue`d the threshold drain for ever on the SMO the pool could not cover (`sym_slot_transfer_tests::a_leased_leafs_split_wider_than_the_one_smo_constant_is_refilled_to_its_need` hung); the whole carve is granted (the page names the pool's largest runs, the rest stay in the RAM pool — recovered as a dead appender's orphans by the record that names them) and "landed" means the region's pool GREW.
 
+**Box verdict (the fourth pass, `230e95dd`, 2026-09-24 — §3.9.6 / §3.9.6.1): the third pass's CLASS is GONE; the tripwire is NOT 0 on this binary.** Two `sym-scale` row sets from zero on fresh fleets: set 1 read `appender_flush_ceiling_overruns` **0 on the manager and every joiner through N = 1/2/4/8** — the first gate-3 row set to reach its oracle on the box — with the onset class exercised (volume 1's term 6–7 ms / trigger 993–994 at N = 2's and N = 4's starts, the joiners' storms beginning) and not tripped, and N = 8's onset firing at 817–855 ms off a held between-rows term; set 2 read **+1 on the manager's volume 1 at 1,101 ms (1 ms past) at the N = 4 storm's END** — no verb service on that volume (one manager verb across the row; the grant burst of the third pass does not exist on this binary, F-R5's fix), the row's start term 6 ms (trigger 994), the projection ENGAGED at the create's end (84 ms, term 52, lateness 15), the term 151 by the row's end (the ingest's cycle). The age decomposes as the decision's instant (the trigger + its lateness ≤ 15–35 ms) + the pass's PRE-BARRIER wall (≤ 52 ms — the term the horizon took for this cycle) + **the covering BARRIER's own wall (≈ 40 ms on nvmet-tcp null_blk under four storms' journal lanes)**: the derivation prices the storm — every onset in both sets, the joiners' storms, the manager's own, the walls' 50–119 ms terms — and does not price the LANDING; the fixed two-tick margin covered the barrier + lateness by ≈ 0–10 ms at this venue and was 1 ms short once in eight rows. §7 item 3's next piece: the term measured at the landing (the barrier included) or the margin derived from the measured barrier wall.
+
 ### 4.4ao PR 13g — F-R5, FIXED (PR 2 / PR 3 / PR 12b, the armed plane): a joiner's extent supply under a create storm ran at the ONE-SMO grain on a floor-sized ring — the manager derived every wire joiner's grant off a rate it never saw
 
 **Found on the box (the third campaign, `sym-scale` N = 8, 40k creates per writer in ≈ 13 s):** every joiner's ring sat at the 512 KiB floor (`appender_ring_grows` 0, growth DECLINED on a joined appender — PR 2's drain-then-grow owed), so a storming joiner checkpointed ≈ 8×/s on the ring's pressure law; 1,483 `extent grant` lines in the manager's log (845 × 4, 180 × 3, 147 × 2, 103 × 5, 54 × 6, 44 × 7, 108 × 8 — the ≤ 4 class the flush pass's reactive one-SMO ask, the 5–8 class the cadence's proactive 50 % refill answered at the derived size, which was the FLOOR), `extent_grant_returned` +193 ≈ the compactions (claim-and-retire churn at the SMO grain — `take_returnable` ships RETIRED images), ≈ 105 manager verbs per joiner per storm, each a ring-0 control entry + barrier at the manager (3.6 ms), volume 1's `manager_service_ns.execute` +2.36 s. **The root (the box record's review, Issue 3 v):** `KvMetaBackend::grant_extents_for` derived the grant from `set.region(appender_id).smo_ewma_milli` — `None` for a WIRE joiner (the manager holds no `AppenderRegion` for it) — so `ewma = 0` and §5.3.3's derivation answered the floor (8) for every production joiner regardless of its SMO rate; the joiner folded its own EWMA locally and never fed `smos_this_cycle` on its own flush pass, and the rate never travelled on `ExtentGrant { appender_id, want }`. **RED (`a635cb5f`, `sym_n_daemon_tests::a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycles_its_grant` — two real joiners on one volume, unpaced creators, the PRODUCT cadence alone):** the box's shape in process — 56 cycles in 8 s (7/s), the floor ring standing (`ring_grows` 0, `joined_ring_grow_declined` 43–46), `extent_grant_returned` +525 / +542 against 1,052 compactions per joiner, 147 wire grants per joiner of which 93–96 REACTIVE, the manager +390 verbs in 8 s. **Fixed in three mechanisms, each red-first:** **(2 + 3, `568bcc91`) the grant is a POOL and the ask is the joiner's own** — the joiner feeds its SMO rate on ITS flush pass and every ask names ITS derived size explicitly (`ExtentGrant { want }` — screened at the manager against `grant_extents_wire_cap`, the heap-share cap, PR 3's bounded-execution law: clamping to "the derivation's cap as today" would be the floor again, since the manager's own derivation for a wire appender is rate 0), the carve tops the pool up to the derived size, retired images RECYCLE into the region's own unclaimed set up to the derived size (a pressure-driven cycle returns nothing; the surplus above the pool alone returns), and the flush pass's reactive ask is a LADDER (the derived grant in the USER class on a healthy heap; one SMO's images in the INTERNAL class on the space class alone); **(1, `d65a6bd1`) the ring** — a joiner whose cadence is pressure-driven derives its ring off the commit rate it measures (PR 2's `clamp(2 × ewma bytes/s × max_age, floor, ceiling)`) and asks the manager for the next SEGMENT over the new verb pair `ManagerCall::GrowRing` / `ManagerReply::RingGrown` (the manager carves the longest adjacent run of the ask, refuses a run another appender holds, ZEROES it — PR 3's re-carve law — and journals the alloc deltas with the identity's hint as one control entry); growth is a REPLACEMENT under the joiner's closed gate, one step at least a doubling toward the derived size (the table holds eight segments — EWMA-sized steps spent them on a ramp), the drain wait running cover cycles between its waits (a pass parked at ring admission needs a cycle of this task to advance the tail — the first build held the gate while a pass parked) bounded by one landing ceiling, the joiner's page naming the grown table in both directory slots BEFORE any position is written under the new map (the directory-first law), then `JournalRing::grown_with`; **the rejoin** — tree 0's per-identity `appender_hint:` record (ring bytes + the largest derived grant the manager served that identity; written by `GrowRing` and by every derived-size wire grant above the floor, read at `JoinAppender` — PR 3's owed "persisted EWMA as the ring-size input") so a joiner that dies and rejoins starts at the ring and the pool its storm earned; the join's initial grant is `GRANT_EXTENTS_FLOOR + mint_slots` (the rotor it mints at its first touches plus the SMO floor — the join's known cost class) floored at the hint; the cadence's refill is promise-aware (`derived + promised`, capped by the wire cap). **GREEN (the venue-shaped load — two joiners × one creator paced to the venue × 12 s, the volume on `/dev/shm`, the ceiling law on the manager with the joiners' supply gauges beside it — §4.4an's PR 13g paragraph states the venue; 10 of the last 11 runs GREEN, the one red the strict cadence law since relaxed to the trigger bound):** rings 512 KiB → 2.9–3.6 MiB (3 grows, `grow_declined` 0), the cycle rate falling to the trigger in force once the ring is sized, landed extents per wire grant ≥ 2 × the floor, `extent_grant_returned` +0…+3 against ≈ 1,900 compactions, reactive asks 0, wire grants 3–10 per joiner, **the manager +58…+73 verbs per 12 s for TWO joiners (≈ 30–36 per joiner) against the base's 197 per joiner per 8 s (≈ 295 per 12 s) — an order of magnitude**, every acked name resolving at every daemon, fsck clean after every joiner left. The `appender_hint` codec is fuzzed (`slot_state_record`) with its proptest mirror; `GrowRing` / `RingGrown` ride `manager_call_frame` + the mirror. **Found by the touched suites (its own commit `39f35963`, split from the F-B1 fix at review round 1, Issue 6):** the pool law and PR 3's carve trim conflicted — see §4.4an's PR 13g paragraph (the whole carve is granted; "landed" means the pool grew). **Owed to the box (the flip binary's bracket):** the fleet's `sym-scale` reads — `appender_ring_bytes` above the floor on every joiner, `extent_grant_returned` flat, `joined_wire_extent_grants` ≈ the derived asks, `appender_flush_ceiling_overruns` 0 — the laptop's fleet proof is "it works".
+
+**Box verdict (the fourth pass, `230e95dd`, 2026-09-24 — §3.9.6.2): FIXED on every joiner in both row sets.** Rings 768 KiB (the join's derived ring) to 2.3 MiB at the leg's end on every joiner and volume (30 / 33 `GrowRing` carves per leg; the fresh joiners grow once inside their first storm; `joined_ring_grow_declined` 0 but two counted short-run declines), `extent_grant_returned` +0…+38 over a joiner's N = 8 storm against 118–184 compactions (the third pass's +193 ≈ the compactions), `joined_wire_extent_grants` 1–3 per joiner per row at 58 extents per grant (the third pass's +47 at ≤ 8), `joined_wire_reactive_grants` 0, pressure cycles +0…+11 on the sized rings (+25 on a fresh joiner's first storm) against 40–63 checkpoints per storm; the manager's N = 8 row **88 verbs / 15 grants / 13 returns / 0.114 s of `manager_service_ns.execute`** against the third pass's 892 / 449 / 387 / 2.93 s; the PR 13g hygiene set (`extent_return_run_cap_refusals`, `appender_stale_page_words_dropped`, `appender_pool_restored_extents`, `appender_pending_segments_returned`, `appender_join_residue_returned`) 0 across 14 rejoins; the closure exact set-wide once the departed first incarnations' join grants are subtracted from the manager's `extent_grant_extents` (a joiner's `granted` is not a published face — PR 14's stats sweep).
 
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
@@ -4687,6 +5024,26 @@ counted decline, a bounded window or a stated venue):
    RED-first on the box's row sequence in process, GREEN with it; the
    ceiling unchanged. What stays for the box: the flip binary's bracket
    (every laptop timing here is the mechanism's).
+   **The fourth pass (§3.9.6.1, PR 13g's `230e95dd`, 2026-09-24 — two
+   `sym-scale` row sets from zero): the third pass's CLASS is GONE — set 1
+   read 0 on every writer through N = 1/2/4/8 (the first gate-3 row set
+   to reach its oracle on the box; the onset class exercised at N = 2 / 4
+   with volume 1's term 6–7 ms and not tripped), the joiners' storms 0
+   trips in 44 joiner-rows — and set 2 read ONE trip on the manager's
+   volume 1: 1,101 ms, 1 ms past, at the N = 4 storm's END with ONE verb
+   served on that volume across the row (no grant burst — F-R5's fix),
+   the projection engaged (84 ms at the create's end against a 52 ms
+   pre-barrier term), lateness 15–35 ms. The residue the derivation does
+   not price is the cycle's LANDING: the term (the horizon's and the
+   projection's) is the PRE-BARRIER wall, the ceiling is measured AT the
+   covering barrier, so the barrier's own device wall (≈ 40 ms on
+   nvmet-tcp null_blk under four storms' journal lanes) plus the
+   decision's lateness must fit the fixed two-tick margin — it did by
+   0–10 ms at this venue and was 1 ms short once in eight rows. THE NEXT
+   PIECE (PR 14): measure the term at the LANDING (the barrier included)
+   or derive the margin from the measured barrier wall — never a widened
+   constant; the tripwire's rate on this binary at this venue is 1 in 8
+   rows, 1 ms past.**
 3b. **`sym-storm` ×10 from zero on the final binary** (§3.8): re-run in
    fix round 1 under `--venue=laptop` — §3.8b carries the count and the
    per-round venue-attributed readings; whatever count stands there is
@@ -4946,7 +5303,48 @@ number in §3 is a dev-box RATE reading, venue-attributed pending the box
    cause, the root's STRIPING at the row's eight `mkdir`s, hypothesised)
    and the wall law's clock at the LAST storm's launch (3.53× read vs a
    storms'-own-concurrency upper bound of ≤ 4.5×); H-13E-1 (the fleet rig's daemon-pid anchor vs
-   arm-suffixed binaries) fixed on the branch.
+   arm-suffixed binaries) fixed on the branch. **The fourth pass
+   (§3.9.6) MEASURED the skew — 9.135 s at N = 8, three 3.03 s `mkdir`s
+   by the fresh joiners into the freshly striped root — and moved the
+   setup out of the clock (`6108e8c1`): 4.61× on the storms' own clock
+   (Σ per-writer rates 5.25×, the bound); F-R5 FIXED on the box
+   (§3.9.6.2) — item 16's F-R5 half is CLOSED.**
+
+17. **The fourth box pass's findings (§3.9.6, PR 13g's binary
+   `230e95dd`, 2026-09-24 — REPORTED, none fixed there):** **F-B1's
+   residue** (item 3 — the landing's barrier + lateness over the
+   pre-barrier term; 1 trip in 8 rows, 1 ms past); **F-R6 (new — PR 12b's
+   reclaim path × PR 5's token planes): a joined writer's FORGET-driven
+   reclaim prices DESTROYS for inos in slots it does not lease, reading
+   its stale PROJECTION of the holder's trees** — 6,782 / 7,266 `destroy
+   WITHHELD` WARNs on m60 per set (`reclaim_destroy_refused_release_
+   failed` 121 / 742), all for the MANAGER's rotor inos in the windows
+   where the manager removes its own tree (the leg's acked-writes check
+   had read that tree through m60; the manager's `rm -rf` recalls m60's
+   tokens, the recall sink prunes, the kernel FORGETs, the reclaim prices
+   a destroy off the projection): a zeroed ring segment (`0x2180000`,
+   carved for appender 3 at 04:14:17Z, read at 04:14:52Z), 27 / 45
+   consecutive extents re-granted to m63 and screened by rule 4, and
+   defect 18 / 34's 256-restart `root-seq` loop on 60+ slots (6,205 /
+   6,088 lines — PR 13b's "9/10" class in production shape); nothing
+   destroyed (the withhold; the holder's own reclaim is the law), the
+   oracle blind (live lessees scoped out; the gauges outside the
+   must-stay-0 set and the per-row snapshots) — fix shape: the reclaim
+   path skips foreign-slot inos (a token client drops its cache entry
+   and nothing else), defect 34's loop stays its own item; **the served-
+   mutation kernel hook's `ENOENT` at WARN** — 272 k / 285 k `may reply
+   interrupted fuse request` lines per set (≈ 2 × served invals + prunes;
+   the notify's "not cached" answer logged per call) — a counted outcome,
+   never a WARN; **a fresh joiner's first create into a STRIPED root costs
+   ≈ 3.0 s** (×3 in both sets; the per-holder token planes' 1 s first-round
+   waits the hypothesis; an `OP_PROFILE` tape the instrument; a latency
+   cliff on the flip's default path, not a throughput term); **the ingest
+   law's N = 1 base is a sub-second `dd`** (1,327 / 1,506 / 2,215 MiB/s
+   across three passes while N = 8 holds 7.3–7.6 GB/s — `--ingest-mb` ≥
+   4,096 on the box; a harness item); two `.stats` faces (a joiner's
+   `granted`; the writer's per-holder read planes) for PR 14's sweep.
+   Harness landed on the branch and placed on the box: `76028d5f`,
+   `6108e8c1`, `cea35691` (§3.9.6.3).
 
 Records the box owes (§8): after the re-run, NONE of gates 1 / 3 / 3c /
 5 / 7's rows is owed on PR 13c's binary — §3.9.4 carries them; the
@@ -4956,6 +5354,10 @@ After the THIRD pass (§3.9.5, PR 13e / 13f's binary): gates 1 / 3 / 3c /
 7@N=32 re-read on `b377cbb8` — none owed on it; the remaining box rows
 are PR 14's flip binary's (every gate, 2 / 3b / 5 included), after item 3
 (+ item 16's F-R5) lands.
+After the FOURTH pass (§3.9.6, PR 13g's binary): gate 3 re-read TWICE on
+`230e95dd` — nothing owed on it; F-R5's half of item 16 CLOSED on the box;
+item 3's remaining piece (the landing's residue) and item 17's F-R6 are
+the box's input to PR 14; the remaining box rows are the flip binary's.
 
 ## 8. Box footprint
 
@@ -5078,6 +5480,27 @@ Laptop-side: `/tmp/grok-justin/box-13e/{arms,stage,gate1,gate1-rev,nw/{scale,tou
 (the orchestrator's arm-B build + this rung's pulled artifacts; the
 laptop ran nothing of this rung — the batch gate on `b377cbb8` owned it).
 
+**The FOURTH pass (`perf/sym-box-13g`, 2026-09-24 04:05 → 04:57 UTC —
+gate 3 only) placed, all under `/scratch/tmp/` (root-owned; the artifacts
+are the evidence and stay):**
+
+| path | what |
+|---|---|
+| `squeeze-test:/scratch/tmp/sym-box/{squeezefs-B-230e95dd,libsqueezefs_il-B-230e95dd.so,SHA256SUMS.13g}` | arm B = PR 13g's landed tip (`230e95dd`, `release`, sha256 `099477dcd1c919cdf492addeb1bcd61cd318187758001ff66318e63e7e49d8b2`; the shim `fd4a02ac8cc88dec…1f1a82b7`), built by the orchestrator, `sha256sum -c` OK + `--version` verified on the box (`built 2026-09-24T03:58:38Z profile release`); the three earlier B arms kept beside it |
+| `squeeze-test:/scratch/tmp/squeezefs` | **REPLACED** by arm B `230e95dd` (the reset script's client binary; it was `b0ec7d65…` = `b377cbb8`) |
+| `squeeze-test:/scratch/tmp/sym-box/repo/{tests,.benchmarks/rigs}/` | refreshed from this worktree ×3 (471 / 91 files): `76028d5f` before the first row set, `6108e8c1` before the second, `cea35691` after it (`run_mw_matrix.sh` md5 `a9d6d337…` identical both sides at the end) |
+| `squeeze-test:/scratch/tmp/rigs/{2026-09-13-sym-pr1-solo-regate.sh,-reduce.py,2026-09-21-sym-box-brackets.sh,2026-09-22-sym-box-perf-phases.sh,2026-09-22-sym-box-perf-agg.py}` | re-placed, each `cmp`-identical to the repo copy (unchanged this rung) |
+| `squeeze-test:/scratch/tmp/sym-box-13g-stage/` | the staging dir the `scp` / `rsync`s landed in before the root `install`s (the arm, the shim, `SHA256SUMS`, `repo/`) |
+| `squeeze-test:/scratch/tmp/sym-box/launch-13g-nw.sh` + `launch-13g-scale{,-2}.out` + `NW_13G_OUTS` | the N-writer launcher (`BIN=…squeezefs-B-230e95dd`, waits for load1 ≤ 1, one driver pass per gate) and its pointer file |
+| `squeeze-test:/scratch/tmp/sym-box/13g-nw-20260924-041135-scale/` (+ `.log`) | **row set 1** (fleet A; `scale-r1/symscale-1790223117/`: the table, `symscale-faces.txt` (the launch stamps, the amplification, the F-B1 and F-R5 faces per writer per row and per create phase), `symscale-verdict.txt`, `launch-n*.tsv`, `create-n*-w*.txt` (each with `launch_ts= end_ts=`), `disk_pin*.tsv`, `m*_pn*{0,c,1}.json` + the `pc*` copies, `removed-sample.txt`, `fsck-sym-scale.out`; `scale-r1/daemon-logs/m*.log` — m60's F-R6 windows, m0's `GrowRing` carves) — rc=0, the oracle reached |
+| `squeeze-test:/scratch/tmp/sym-box/13g-nw-20260924-044235-scale/` (+ `.log`) | **row set 2** (a fresh fleet A; the setup outside the clock; `scale-r1/symscale-1790224978/` — the same shape, `m*_pend0.json` copied; `daemon-logs/m0.log:22448` the 1,101 ms `OVERRUN` line) — RED on the trip; the leg died after its table on the end-of-leg snapshot's label (fixed `cea35691`), one line before the must-stay-0 die |
+| `/run/squeezefs-mwfleet`, `/run/squeezefs-devsub-tcp-mwfleet`, `/mnt/sqz-mwfleet/` mounts | **all removed** — both fleets torn down to zero residue (asserted by `mw_fleet.sh teardown`), verified at 04:57 UTC: 0 daemons, no fleet state, no netns, no `pref 40` rule, no `/dev/shm/sqz*`, nvmet configfs empty, the devsub's `nvmet_tcp` / `nvmet` / `zram` / `null_blk` UNLOADED (only `nvme_tcp nvme_fabrics nvme_core fuse` loaded, as found), the fabric's 15 namespaces connected as found, `/run/squeezefs/` the same four stale IL sockets, 243 G free; `/scratch/tmp/sym-box` 5.1 G |
+| the 5 storage nodes | **nothing placed**, nothing run (no gate-1 reset this pass) |
+
+Laptop-side: `/tmp/grok-justin/box-13g/{arms,launch-13g-nw.sh,nw/{13g-nw-20260924-041135-scale,13g-nw-20260924-044235-scale,REDUCED.txt}}`
+(the orchestrator's arm-B build + this rung's pulled artifacts and the
+reduction; the laptop ran nothing of this rung but the reductions).
+
 ## 9. The flip decision (for PR 14)
 
 > **Status (PR 13b, 2026-09-21): the three PRODUCT blockers below are closed on `feat/sym-metanode-ship` (`cd85f701` defect 32, `cc642b6a` §4.4af, `53ffb626`+`31519ceb` §4.4ag); the box brackets remain the orchestrator's; the storm ×10 count is NOT MET on that branch (see §7's status line — two owed items, no acked loss in 19 seven-victim rounds). The decision text below is as recorded at PR 13.**
@@ -5118,6 +5541,16 @@ laptop ran nothing of this rung — the batch gate on `b377cbb8` owned it).
 > **What PR 14 flips on, restated once more:** F-B1's remaining term priced — the manager's anticipated term under the joiners' verb service (§7 item 3) with F-R5's supply grain fixed beside it — and `sym-scale` on the box reading 0 trips through N = 8 (the row set completing to its oracle for the first time on the box); the storm ×10 from zero on that binary; then the flip binary's box brackets of EVERY gate (2 / 3b / 5 included, at the minimum count). Gate 1's mount row and the unmount row are stated for that bracket's ms-grained tape; nothing else this pass found is a class the design did not state (F-R5 is PR 3's §5.3.3 derivation reading an EWMA the wire never carries — the floor for every joiner — meeting PR 2's own "drain-then-grow stays owed" on a storming joiner).
 >
 > **Status (PR 13g, `fix/sym-joiner-supply-and-manager-term`, 2026-09-23 — the third box campaign's two findings, both FIXED red-first; the box bracket on the flip binary owed):** **F-R5** (§4.4ao) — the joiner's extent supply: the manager derived every WIRE joiner's grant off a rate it never saw (the floor), the ring never grew, and the storm ran at the one-SMO grain (≈ 105 manager verbs per joiner per storm); now the joiner's own rate sizes its asks, the grant is a pool that recycles its retired images, the ring grows over the wire under the closed gate (PR 2's drain-then-grow), and a rejoin starts at the sized ring and pool (`appender_hint`) — the manager's verbs per joiner per storm fall an order of magnitude in process (≈ 30 per 12 s against ≈ 295). **F-B1** (§4.4an's PR 13g paragraph) — the class re-read as the FIRST storm cycle after a QUIET horizon (terms 11 / 4 ms at the trips), priced by the LIVE projection off the pending work beside the horizon term; RED-first on the box's row sequence in process. **The tripwire's box verdict is the flip binary's bracket** — every N-writer row set stops at its first trip, so gates 3 / 3c / 7 read MET as row sets only there.
+
+> **Status (the FOURTH box pass — gate 3 on PR 13g's binary `230e95dd`, `perf/sym-box-13g`, 2026-09-24 04:05 → 04:57 UTC; §3.9.6 — the re-read the brief asked for). The decision stays NOT YET; the list shortens by one item and grows by one finding.** **Reading MET on the box on this binary:** **F-R5** — FIXED as a verdict on every joiner in two row sets (rings 768 KiB–2.3 MiB, 1–3 wire grants per joiner per row, reactive 0, returns ≪ compactions, the manager's N = 8 row 88 verbs / 0.114 s of service against the third pass's 892 / 2.93 s, the closure exact set-wide); **gate 3's ROW SET completes to its oracle on the box for the first time** (set 1: 0 trips through N = 1/2/4/8, deleted-stays-deleted 0 / 3,000 ×2, fsck clean); and from the third pass, not re-run — gate 1 (by the rule), gate 3c (all three laws ×2), gate 7@N=32 (×2), gate 2, gate 3b, gate 5. **The exact list that does NOT read MET:**
+> * **the must-stay-0 tripwire `appender_flush_ceiling_overruns`** — NOT closed: **0 in set 1 (8 writer-rows at the manager, 44 joiner-rows in the pass), +1 in set 2 — the manager's volume 1 at 1,101 ms, 1 ms past, at the N = 4 storm's END with ONE verb served on that volume across the row.** The third pass's class (the onset after a quiet horizon under the joiners' grant storm) is GONE — exercised at N = 2 / 4 in both sets (terms 6–7 ms at the storms' starts) and not tripped, the grant burst absent; what tripped is the derivation's RESIDUE: the term is the pre-barrier wall, the ceiling is read at the covering barrier, and the barrier's own wall (≈ 40 ms here) + the decision's lateness (15–35 ms) fit the fixed two-tick margin by 0–10 ms at this venue. §7 item 3's next piece (the term at the landing, or the margin from the measured barrier wall) — a FLIP PRECONDITION still, now a 1-in-8-rows, 1 ms class with no service term behind it;
+> * **gate 3's WALL law at N = 8** — 4.61× creates on the storms' own clock (set 2, the setup outside the clock; per-writer storms 10.8–13.9 s, the launch skew 12 ms; Σ per-writer rates 5.25× the bound) vs ≥ 5.6× — the co-located venue's term (§3.9.3; `C/CPU-S` 0.66×), no longer a launch artifact: the third pass's inferred 3.9 s was a MEASURED 9.1 s of three fresh joiners' 3.0 s `mkdir`s into the freshly striped root, taken out of the row's clock; the ingest multiple is its sub-second N = 1 base's noise (the N = 8 absolute 7.3–7.6 GB/s across three passes) — **the per-NODE law UNMEASURED (PR 15's cloud row, its instrument)**;
+> * **F-R6 (new, §3.9.6.3 / §7 item 17)** — a joined writer's FORGET-driven reclaim prices destroys for the HOLDER's inos through its stale projection (6,782 / 7,266 withheld per set; nothing destroyed — the withhold; defect 18 / 34's 256-restart loop under it, PR 13b's "9/10" class in production shape) — a CPU + log storm on a path a token client must not take, invisible to the row's oracle; a PR 14 item beside the served-mutation hook's `ENOENT`-at-WARN (272 k lines per set) and the fresh joiner's 3.0 s first create into a striped root;
+> * **gate 4** — the kill matrix ×10 from zero on this binary: NOT RUN in this rung (LOCAL by the venue law; the counts restart on the flip binary).
+>
+> **The gates this pass does not move, placed: unchanged from the third pass's placement** — gate 6 RUN locally, VALID; gate 8 MET; gate 8b PASS 190 / 0; gate 9 NOT RUN (PR 15's).
+>
+> **What PR 14 flips on, restated:** F-B1's landing residue priced (§7 item 3 — the last term of the derivation, the box's 1 ms the input) and `sym-scale` on the box reading 0 trips through TWO row sets; F-R6's reclaim guard; the storm ×10 from zero on that binary; then the flip binary's box brackets of EVERY gate (2 / 3b / 5 included, at the minimum count) — gate 3's row with the setup outside its clock and an ingest base the law can divide by; the `umount` post-`rw4k` DELTA and the mount row's ms-grained tape ride that bracket; the per-NODE law is PR 15's.
 
 **Decision: NOT YET — four blockers, three of them product (§7's
 flip-blocking items (i)–(iii) + the box).** (0) **Fix-round

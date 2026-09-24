@@ -99,8 +99,9 @@ pub enum ReplyWriteVerdict {
 /// ([`crate::notify::frame_is_notify`]). A notification the kernel
 /// answers `ENOENT` names an inode it does not hold — the EXPECTED
 /// outcome of a served mutation's invalidation + prune reaching objects
-/// the kernel already forgot (the fourth box pass: 272 k WARN lines per
-/// row set, ≈ 2 × `served_mutation_{invals,prunes}`) — counted, never
+/// the kernel already forgot (the fourth box pass: 272 k / 275 k WARN
+/// lines per row set, a 46 % / 21 % SUBSET of
+/// `served_mutation_{invals,prunes}`) — counted, never
 /// logged; a notification's other errno is logged and never ends the
 /// task (it owes the kernel nothing). A request's reply keeps the shipped
 /// law: `ENOENT` = an interrupted request (the WARN), anything else fatal.

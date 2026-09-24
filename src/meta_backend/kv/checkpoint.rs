@@ -1079,9 +1079,11 @@ pub fn checkpoint_trigger_ms(max_age_ms: u64, anticipated_term_ms: u64) -> u64 {
 /// price (PR 13e, F-B1): the cycle's wall from its age DECISION to barrier
 /// #1's completion (PR 13h — the decision, not the cycle's start: the
 /// tick's deferred-flush barrier runs between the two since PR 13g read
-/// the decision ahead of the drain, and its ≈ 40 ms was the fourth box
-/// pass's one trip; a cycle no age decision fired measures from its own
-/// start) plus the age decision's lateness past the trigger BEYOND one
+/// the decision ahead of the drain — a real gap the term must carry, ≈ 2
+/// ms on the box, whose fourth-pass trip was the LIVE projection
+/// under-pricing a wave of promised compactions, not this barrier; a
+/// cycle no age decision fired measures from its own start) plus the age
+/// decision's lateness past the trigger BEYOND one
 /// tick — `wall + (late − tick)⁺`. One tick of lateness is the cadence's wake
 /// quantization, the ceiling's first tick; the excess is the tick's own
 /// device work ahead of its decision (the deferred-flush barrier, a
@@ -1240,13 +1242,16 @@ pub fn covering_barriers(strict: bool) -> u64 {
 /// plus the covering barriers ([`covering_barriers`]) at the measured
 /// barrier unit — the horizon MAXIMUM of one barrier's wall on this
 /// volume's checkpoint path (`meta_kv_checkpoint_barrier_ms`). The
-/// fourth box pass's one trip (1,101 ms, no service, the storm's END)
-/// was the deferred barrier's ≈ 40 ms sitting in neither the decision's
-/// lateness nor the cycle's wall — the same instant the flush-ceiling
-/// audit judges is where the term is measured now (`checkpoint_cycle_term_
-/// ns` from the decision), and this is what the projection prices ahead
-/// of it: a device whose barrier is slow at REST (the bring-up cycles
-/// measure it) is priced before its first storm cycle. Saturating.
+/// fourth box pass's trips (1,127 / 1,125 ms, no service, a storm's END)
+/// were the LIVE projection under-pricing a lockstep wave of promised
+/// compactions — 38 images priced at 2.04 ms and paid at 3.97 (the grain
+/// floor's half-reading, deleted) — with the deferred barrier a real but
+/// small gap beside it (≈ 2 ms on the box: `meta_barrier` mean 1.3–1.9
+/// ms, device 15 µs). The term is measured from the decision
+/// (`checkpoint_cycle_term_ns`), so the barrier between the decision and
+/// the cycle is priced here too: a device whose barrier is slow at REST
+/// (the bring-up cycles measure it) is priced before its first storm
+/// cycle. Saturating.
 pub fn projected_cycle_wall_ns(flush_ns: u64, barriers: u64, barrier_unit_ns: u64) -> u64 {
     flush_ns.saturating_add(barriers.saturating_mul(barrier_unit_ns))
 }
@@ -2165,8 +2170,9 @@ async fn tick(
         // no cycle records nothing. The decision's INSTANT rides with it
         // (PR 13h): the cycle's landing term is clocked from the decision,
         // so the deferred-flush barrier step 2 ran between the two is in
-        // the horizon the trigger anticipates — the fourth box pass's one
-        // trip was that barrier's wall priced nowhere.
+        // the horizon the trigger anticipates — a real gap (≈ 2 ms on the
+        // box) the term must carry; the box's trips themselves were the
+        // projection under-pricing a wave of promised compactions.
         if be.appenders().is_some() {
             if let Some(late_ns) = d.age_late_ns {
                 be.note_checkpoint_decision(

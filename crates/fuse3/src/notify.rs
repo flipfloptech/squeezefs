@@ -545,11 +545,13 @@ mod tests {
 
     /// **A notification's `ENOENT` is a counted outcome, never the
     /// "interrupted request" WARN** (symmetric PR 13h — the fourth box
-    /// pass read 272,071 / 285,461 `may reply interrupted fuse request,
-    /// ignore this error No such file or directory` lines per row set,
-    /// ≈ 2 × the served-mutation hook's `FUSE_NOTIFY_INVAL_INODE` +
-    /// `FUSE_NOTIFY_PRUNE`: the kernel answering "not cached" for an inode
-    /// it had already forgotten, logged per call). The classifier is the
+    /// pass read 272,071 / 275,372 `may reply interrupted fuse request,
+    /// ignore this error No such file or directory` lines per row set, a
+    /// 46 % / 21 % SUBSET of the served-mutation hook's
+    /// `FUSE_NOTIFY_INVAL_INODE` + `FUSE_NOTIFY_PRUNE` frames (m0 222,423
+    /// of 487,612; m60 49,177 of 229,432): the kernel answering "not
+    /// cached" for an inode it had already forgotten or never
+    /// instantiated, logged per frame). The classifier is the
     /// out header: every notification carries `unique == 0` and its
     /// notify code in `error` (positive); a request's reply carries its
     /// `unique` and `0` or `-errno`. The reply task's verdict: a

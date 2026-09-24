@@ -368,10 +368,10 @@ pub(crate) fn note_notify_enoent() {
 /// `fuse3_notify_enoent`): an EXPECTED outcome — a served mutation's
 /// invalidation + prune reaches every object the holder's peers touched,
 /// and the kernel holds only what it has not forgotten — counted, never
-/// logged per call (symmetric PR 13h: the fourth box pass read 272 k
-/// `may reply interrupted fuse request … ENOENT` WARN lines per row set,
-/// ≈ 2 × the served-mutation hook's `invals + prunes`). Any other errno on
-/// a notification still logs.
+/// logged per call (symmetric PR 13h: the fourth box pass read 272 k /
+/// 275 k `may reply interrupted fuse request … ENOENT` WARN lines per row
+/// set, a 46 % / 21 % SUBSET of the served-mutation hook's `invals +
+/// prunes`). Any other errno on a notification still logs.
 pub fn notify_enoent() -> u64 {
     NOTIFY_ENOENT.load(Ordering::Relaxed)
 }

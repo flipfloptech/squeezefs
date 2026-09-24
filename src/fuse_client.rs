@@ -13922,12 +13922,12 @@ impl SqueezefsFilesystem {
                     "meta_kv_checkpoint_image_unit_ns".into(),
                     per_volume(&|be| be.checkpoint_image_unit_ns()),
                 );
-                // PR 13h (F-B1's landing residue): the covering barrier's
-                // wall in force — one device barrier on the checkpoint path
-                // (barrier #1, the due tick's deferred-flush barrier), the
-                // horizon maximum; the unit the projection prices the next
-                // cycle's barriers with. The box's one trip was that
-                // deferred barrier's ≈ 40 ms, priced nowhere.
+                // PR 13h (F-B1): the covering barrier's wall in force — one
+                // device barrier on the checkpoint path (barrier #1, the due
+                // tick's deferred-flush barrier), the horizon maximum; the
+                // unit the projection prices the next cycle's barriers with
+                // (a real gap the term clocks — ≈ 2 ms on the box, whose
+                // trips were the projection's under-pricing of a wave).
                 metrics.insert(
                     "meta_kv_checkpoint_barrier_ms".into(),
                     per_volume(&|be| be.checkpoint_barrier_ms()),

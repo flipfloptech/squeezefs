@@ -2978,12 +2978,14 @@ fn checkpoint_projection_prices_the_pending_work_from_measured_units() {
 /// deferred-flush barrier ahead of it (`needs_flush`, set by every
 /// non-strict commit group), so TWO there and ONE on a strict volume —
 /// each at the horizon MAXIMUM of one barrier's wall
-/// (`meta_kv_checkpoint_barrier_ms`). The fourth box pass's one trip
-/// (1,101 ms, no service, a storm's END) was the deferred barrier's ≈ 40
-/// ms priced by neither the decision's lateness nor the cycle's wall; the
-/// term is clocked from the decision now, and the projection anticipates
-/// the barriers before the horizon has seen them (a device slow at rest
-/// is priced at its bring-up cycles). Saturating. Drift is red here.
+/// (`meta_kv_checkpoint_barrier_ms`). The deferred barrier between a due
+/// tick's decision and its cycle was priced by neither the decision's
+/// lateness nor the cycle's wall — a real gap, ≈ 2 ms on the box (the
+/// fourth pass's trips were the projection under-pricing a wave of
+/// promised compactions, the corrected attribution); the term is clocked
+/// from the decision now, and the projection anticipates the barriers
+/// before the horizon has seen them (a device slow at rest is priced at
+/// its bring-up cycles). Saturating. Drift is red here.
 #[test]
 fn checkpoint_projection_prices_the_covering_barriers_at_the_measured_unit() {
     use squeezefs::meta_backend::kv::checkpoint::{

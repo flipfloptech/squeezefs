@@ -13854,26 +13854,27 @@ async fn a_storms_onset_after_a_quiet_horizon_lands_inside_the_managers_ceiling(
 }
 
 // ---------------------------------------------------------------------------
-// PR 13h — F-B1's LANDING residue: the deferred-flush barrier between the
-// age decision and its cycle (the fourth box pass, the record's §3.9.6.1).
+// PR 13h — the deferred-flush barrier between the age decision and its
+// cycle is a real gap the landing term must carry (the fourth box pass,
+// the record's §3.9.6.1 / §4.4an).
 // ---------------------------------------------------------------------------
 
-/// **F-B1's landing residue (the fourth box pass, §3.9.6.1): the covering
-/// barrier a due tick runs BETWEEN its age decision and its cycle is
-/// priced by nothing.** The box read ONE trip in eight rows on PR 13g's
-/// binary — the manager's volume 1 at 1,101 ms, 1 ms past, at a storm's
-/// END under no verb service: the decision's lateness 15–35 ms, the
-/// cycle's wall 52 ms, and ≈ 40 ms of a barrier the record attributed to
-/// "the landing". In the code that barrier is the tick's step 2 — the
-/// deferred-mode flush barrier (`needs_flush`, set by every non-strict
-/// commit group) — which PR 13g's re-order put AFTER the decision (the
-/// decision is read before the threshold drain now) and which the cycle's
-/// clock (`cycle_started`, taken after it) never sees: `late` was measured
-/// before it, the term after it. A leaf dirtied right after the previous
-/// collection ages `trigger + late + B_deferred + cycle` while the horizon
-/// anticipates `cycle + (late − tick)⁺` — one barrier's wall is the
-/// residue, and under four storms' journal lanes on nvmet-tcp it was
-/// exactly the 40 ms the two-tick margin had left.
+/// **The covering barrier a due tick runs BETWEEN its age decision and
+/// its cycle was priced by nothing.** In the code that barrier is the
+/// tick's step 2 — the deferred-mode flush barrier (`needs_flush`, set by
+/// every non-strict commit group) — which PR 13g's re-order put AFTER the
+/// decision (the decision is read before the threshold drain now) and
+/// which the cycle's clock (`cycle_started`, taken after it) never saw:
+/// `late` was measured before it, the term after it. A leaf dirtied right
+/// after the previous collection ages `trigger + late + B_deferred +
+/// cycle` while the horizon anticipated `cycle + (late − tick)⁺` — one
+/// barrier's wall is the gap. On the box it is SMALL (the manager's
+/// `meta_barrier` mean 1.3–1.9 ms, device 15 µs): the fourth pass's trips
+/// (1,127 / 1,125 ms at a storm's END) were the LIVE projection
+/// under-pricing a lockstep wave of promised compactions (the record's
+/// corrected attribution — the wave pin below), and this gap is the
+/// second, smaller term the same re-read named; the record's first
+/// "≈ 40 ms barrier" reading was a pre-trip snapshot, RETRACTED.
 ///
 /// The law: the TERM is measured at the LANDING from the DECISION — the
 /// same instant `note_flush_ceiling` judges, from the instant the tick

@@ -1623,10 +1623,11 @@ pub struct KvMetaBackend {
     /// volume's checkpoint path, ns: barrier #1 of every cycle and the
     /// deferred-flush barrier a due tick runs between its decision and
     /// its cycle — the horizon MAXIMUM over the last `TERM_HORIZON_CYCLES`
-    /// barriers (PR 13h, F-B1's landing residue: the box's trip was that
-    /// deferred barrier's ≈ 40 ms, priced by neither the decision's
-    /// lateness nor the cycle's wall). The unit the cadence's live
-    /// projection prices the next cycle's covering barriers with.
+    /// barriers (PR 13h, F-B1: the deferred barrier between a due tick's
+    /// decision and its cycle is a real gap the term now clocks — ≈ 2 ms
+    /// on the box, whose trips were the projection under-pricing a wave
+    /// of promised compactions). The unit the cadence's live projection
+    /// prices the next cycle's covering barriers with.
     /// Published as `meta_kv_checkpoint_barrier_ms`.
     pub(super) checkpoint_barriers: std::sync::Mutex<super::checkpoint::CycleTermWindow>,
     pub(super) checkpoint_barrier_ns: AtomicU64,
@@ -12345,8 +12346,8 @@ impl KvMetaBackend {
     /// Fold a cycle's measured landing wall — from the age DECISION that
     /// fired it (PR 13h: the tick's deferred-flush barrier runs between
     /// the decision and the cycle's start, and a wall clocked from the
-    /// start left that barrier priced nowhere — F-B1's landing residue,
-    /// the fourth box pass's 1,101 ms), or from the cycle's own start
+    /// start left that gap priced nowhere — ≈ 2 ms on the box; the box's
+    /// trips were the projection's under-pricing), or from the cycle's own start
     /// `cycle_started_ns` when no decision fired it, to barrier #1's
     /// completion at `now_ns` — plus the decision's lateness beyond one
     /// tick, capped at the landing ceiling in force (the belt: a lateness

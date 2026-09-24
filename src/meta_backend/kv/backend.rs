@@ -10339,7 +10339,10 @@ impl KvMetaBackend {
             );
             if ring_bytes < ring_ask {
                 log::info!(
-                    "meta volume {}: JoinAppender for node {:#018x} / mount slot {:#x} asked a                      {ring_ask}-byte ring; the ring budget's remainder is {budget_remaining} —                      carved {ring_bytes} (the floor at least), the ring grows later under the                      budget",
+                    "meta volume {}: JoinAppender for node {:#018x} / mount slot {:#x} asked a \
+                     {ring_ask}-byte ring; the ring budget's remainder is {budget_remaining} — \
+                     carved {ring_bytes} (the floor at least), the ring grows later under the \
+                     budget",
                     self.path.display(),
                     identity.node_token,
                     identity.mount_slot

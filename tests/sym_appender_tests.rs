@@ -2274,7 +2274,11 @@ async fn the_cadence_anticipates_the_measured_cycle_wall_so_a_slow_barrier_lands
     );
     // The derivation's published faces: the anticipated term carries the
     // parked barrier (every cycle's barrier #1 waits it), and the trigger
-    // in force is the ceiling less that term (`checkpoint_trigger_ms`).
+    // in force is the ceiling less the LARGER of that term and the live
+    // projection (`checkpoint_trigger_ms`; PR 13g's projection, which
+    // since PR 13h prices the due tick's covering barriers — two here,
+    // where a creator paced at the tick lands its deferred barrier on the
+    // non-due tick and the measured term carries one).
     let term = va.checkpoint_term_ms();
     assert!(
         term >= barrier.as_millis() as u64,
@@ -2284,7 +2288,7 @@ async fn the_cadence_anticipates_the_measured_cycle_wall_so_a_slow_barrier_lands
         va.checkpoint_trigger_ms(CHECKPOINT_MAX_AGE_MS as u64),
         squeezefs::meta_backend::kv::checkpoint::checkpoint_trigger_ms(
             CHECKPOINT_MAX_AGE_MS as u64,
-            term
+            term.max(va.checkpoint_projected_ms())
         ),
         "the trigger in force is the derivation's"
     );

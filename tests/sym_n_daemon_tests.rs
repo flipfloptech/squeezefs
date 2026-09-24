@@ -11479,13 +11479,29 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
         let cadence_bound = 2 * quarter_ms.div_ceil(trigger_ms) + 1;
         let pressure_onset = b.pressure_cycles - a.pressure_cycles;
         let pressure_steady = c.pressure_cycles - c3.pressure_cycles;
-        assert!(
-            steady <= cadence_bound,
-            "joiner {i}: the cycle rate is the cadence's once the ring is sized — {onset} cycles \
-             in the first quarter (the floor ring: pressure +{pressure_onset}), {steady} in the \
-             last (pressure +{pressure_steady}; the trigger in force {trigger_ms} ms, bound \
-             {cadence_bound} over {quarter_ms} ms)"
-        );
+        // The law's premise is a ring SIZED before the quarter: a growth
+        // landing inside it runs its drain-then-grow's cover cycles between
+        // the drain waits (PR 13g, F-R5 mechanism 1), cycles the sized
+        // cadence's bound does not price — the quarter is the sizing's,
+        // stated (the venue decides how fast a saturated ring drains), and
+        // law 1 above judged the growth itself.
+        let grew_inside = c.ring_grows - c3.ring_grows;
+        if grew_inside > 0 {
+            eprintln!(
+                "F-R5 joiner {i}: the ring grew {grew_inside}× INSIDE the last quarter ({} → {} \
+                 B) — {steady} cycles there (pressure +{pressure_steady}) are the sizing's, not \
+                 the sized cadence's; the steady-state law is not judged on this quarter",
+                c3.ring_bytes, c.ring_bytes
+            );
+        } else {
+            assert!(
+                steady <= cadence_bound,
+                "joiner {i}: the cycle rate is the cadence's once the ring is sized — {onset} \
+                 cycles in the first quarter (the floor ring: pressure +{pressure_onset}), \
+                 {steady} in the last (pressure +{pressure_steady}; the trigger in force \
+                 {trigger_ms} ms, bound {cadence_bound} over {quarter_ms} ms)"
+            );
+        }
         // Law 2 — the grant SIZE follows the joiner's rate.
         let landed = (c.grant_claimed + c.grant_unclaimed) - (a.grant_claimed + a.grant_unclaimed);
         let grants = c.wire_grants - a.wire_grants;

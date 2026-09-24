@@ -2531,18 +2531,39 @@ instantiates 40k of the manager's inodes), the manager's `rm -rf` recalls
 m60's tokens → m60's recall sink invalidates + PRUNES → the kernel FORGETs
 → **m60's reclaim prices a destroy for a foreign-slot ino by reading its
 projection** — pointers into extents the holder has since retired, freed
-and re-granted. Nothing was destroyed (the WITHHOLD is the fail-safe;
-the holder's own reclaim is the lifecycle's law — the manager's log
-carries no corrupt read) and set 1's every acked-writes / deleted-stays-
-deleted / fsck arm passed; the cost is a CPU + log storm on the joiner (6,205 ×
+and re-granted. Nothing was destroyed — and the WITHHOLD is NOT the
+belt that proves it (review round 1, Issue 3): the withhold is the
+pricing read FAILING (`destroy_entry_bytes` walking an undecodable
+projection — `bad node magic`, the rule-4 screen, the 256-restart loop),
+an accident of staleness; a DECODABLE stale projection (a fresher one, or
+a record the holder had unlinked but not yet destroyed) prices the
+destroy and the tx reaches m60's commit DOOR, where PR 4 / 12b's
+foreign-slot refusal (`SlotBusy` → `slot_door_refusals`) is the
+structural belt. That belt is what proves the claim for this run:
+**`slot_door_refusals` [0, 0] on m60 at every snapshot in both sets,
+including set 2's end-of-leg `m60_pend.json`** — no priced foreign
+destroy reached the door — beside the refuse arm's own semantics
+(`refuse_reclaim` → `finish_reclaim(plan, ReclaimFreeGate::Nothing,
+false)`: no tx, nothing freed), the holder's own reclaim being the
+lifecycle's law (the manager's log carries no corrupt read), and set 1's
+every acked-writes / deleted-stays-deleted / fsck arm passing; the cost is
+a CPU + log storm on the joiner (6,205 ×
 256 restarts, 6,782 WARN lines per window) on a path a token client must
 never take — a non-holder prices no destroy for an ino it merely cached
-— with defect 18 / 34's loop reachable under it. Fix shape (PR 14): the
-FORGET / reclaim path skips inos whose slot this mount does not lease
-(the holder's reclaim owns them; a token client drops its cache entry
-and nothing else), and defect 34's loop stays on its own item (its
-recipe here: a projection whose root the holder recycled between two
-of the joiner's ledger polls). **The row's oracle cannot see this class**:
+— with defect 18 / 34's loop reachable under it. Fix shape (PR 14), the
+sites named: the gate belongs at `SqueezefsFilesystem::queue_reclaim_
+inode` / `reclaim_orphaned_batch` (`src/fuse_client.rs:10544` — every
+non-open FORGET enqueues a reclaim — / `:25489` — the `getattr` nlink-0
+gate, no slot check): a FORGET of an ino whose slot this mount does not
+lease enqueues no reclaim (PR 13f's sync `slot_is_foreign`,
+`src/meta_backend/record_ship.rs:321`, is the predicate; the holder's
+reclaim owns the lifecycle, a token client drops its cache entry and
+nothing else); and `KvMetaBackend::destroy_entry_bytes` (`kv/backend.rs:
+24087` — `range_kind(TREE_XATTRS, …)` on the LOCAL KV) is a second face,
+a read of a foreign slot's tree that never takes the writer's divert.
+Defect 34's loop stays on its own item (its recipe here: a projection
+whose root the holder recycled between two of the joiner's ledger
+polls). **The row's oracle cannot see this class**:
 the online census scopes live lessees' slots out, deleted-stays-deleted
 judges names, and the two gauges that moved sit outside the must-stay-0
 set and outside every per-row snapshot pair — the leg now prints them
@@ -5362,11 +5383,17 @@ number in §3 is a dev-box RATE reading, venue-attributed pending the box
    consecutive extents re-granted to m63 and screened by rule 4, and
    defect 18 / 34's 256-restart `root-seq` loop on 60+ slots (6,205 /
    6,088 lines — PR 13b's "9/10" class in production shape); nothing
-   destroyed (the withhold; the holder's own reclaim is the law), the
-   oracle blind (live lessees scoped out; the gauges outside the
-   must-stay-0 set and the per-row snapshots) — fix shape: the reclaim
-   path skips foreign-slot inos (a token client drops its cache entry
-   and nothing else), defect 34's loop stays its own item; **the served-
+   destroyed — the belt is the commit DOOR's foreign-slot refusal, not the
+   withhold: `slot_door_refusals` [0, 0] on m60 at every snapshot incl.
+   set 2's `m60_pend.json` (the refuse arm itself commits no tx; the
+   holder's own reclaim is the law) — the oracle blind (live lessees
+   scoped out; the gauges outside the must-stay-0 set and the per-row
+   snapshots) — fix sites: `queue_reclaim_inode` / `reclaim_orphaned_
+   batch` (`src/fuse_client.rs:10544` / `:25489` — a FORGET of an ino
+   whose slot this mount does not lease enqueues no reclaim; the
+   predicate `slot_is_foreign`) and `destroy_entry_bytes` (`kv/backend.
+   rs:24087` — a foreign slot's tree read without the divert), defect
+   34's loop its own item; **the served-
    mutation kernel hook's `ENOENT` at WARN** — 272 k / 275 k `may reply
    interrupted fuse request` lines per set (`crates/fuse3/src/raw/
    session.rs:1092`, the detached notify frames on the reply channel; 46 %
@@ -5582,7 +5609,7 @@ reduction; the laptop ran nothing of this rung but the reductions).
 > **Status (the FOURTH box pass — gate 3 on PR 13g's binary `230e95dd`, `perf/sym-box-13g`, 2026-09-24 04:05 → 04:57 UTC; §3.9.6 — the re-read the brief asked for). The decision stays NOT YET; the list shortens by one item and grows by one finding.** **Reading MET on the box on this binary:** **F-R5** — FIXED as a verdict on every joiner in two row sets (rings 768 KiB–2.3 MiB, 1–3 wire grants per joiner per row, reactive 0, returns ≪ compactions, the manager's N = 8 row 88 verbs / 0.114 s of service against the third pass's 892 / 2.93 s, the closure exact set-wide); **gate 3's ROW SET completes to its oracle on the box for the first time** (set 1: 0 trips through N = 1/2/4/8, deleted-stays-deleted 0 / 3,000 ×2, fsck clean); and from the third pass, not re-run — gate 1 (by the rule), gate 3c (all three laws ×2), gate 7@N=32 (×2), gate 2, gate 3b, gate 5. **The exact list that does NOT read MET:**
 > * **the must-stay-0 tripwire `appender_flush_ceiling_overruns`** — NOT closed: **0 in set 1 (8 writer-rows at the manager, 44 joiner-rows in the pass), +1 in set 2 — the manager's volume 1 at 1,101 ms, 1 ms past, at the N = 4 storm's END with ONE verb served on that volume across the row.** The third pass's class (the onset after a quiet horizon under the joiners' grant storm) is GONE — exercised at N = 2 / 4 in both sets (terms 6–7 ms at the storms' starts) and not tripped, the grant burst absent; what tripped is the derivation's RESIDUE: the LIVE projection under-priced the storm's END cycle by ≈ 65 ms (84 ms at the tick's decision against the cycle's ≈ 150 ms pre-barrier wall — the create-end snapshot preceded the trip with overruns 0; the cycle's own term 151 and lateness 35 entered the horizon after it; no barrier face reads above 2 ms), and with the 35 ms lateness the fixed two-tick margin was 1 ms short. §7 item 3's next piece (the projection's growth between the decision and the flush + the lateness term, with the per-cycle tape that discriminates) — a FLIP PRECONDITION still, now a 1-in-8-rows, 1 ms class with no service term behind it;
 > * **gate 3's WALL law at N = 8** — 4.61× creates on the storms' own clock (set 2, the setup outside the clock; per-writer storms 10.8–13.9 s, the launch skew 12 ms; Σ per-writer rates 5.25× the bound) vs ≥ 5.6× — the co-located venue's term (§3.9.3; `C/CPU-S` 0.66×), no longer a launch artifact: the third pass's inferred 3.9 s was a MEASURED 9.1 s of three fresh joiners' 3.0 s `mkdir`s into the freshly striped root, taken out of the row's clock; the ingest multiple is its sub-second N = 1 base's noise (the N = 8 absolute 7.3–7.6 GB/s across three passes) — **the per-NODE law UNMEASURED (PR 15's cloud row, its instrument)**;
-> * **F-R6 (new, §3.9.6.3 / §7 item 17)** — a joined writer's FORGET-driven reclaim prices destroys for the HOLDER's inos through its stale projection (6,782 / 7,266 withheld per set; nothing destroyed — the withhold; defect 18 / 34's 256-restart loop under it, PR 13b's "9/10" class in production shape) — a CPU + log storm on a path a token client must not take, invisible to the row's oracle; a PR 14 item beside the served-mutation hook's `ENOENT`-at-WARN (272 k / 275 k lines per set — 21–46 % of the served invalidations, `session.rs:1092`) and the fresh joiner's 3.0 s first create into a striped root;
+> * **F-R6 (new, §3.9.6.3 / §7 item 17)** — a joined writer's FORGET-driven reclaim prices destroys for the HOLDER's inos through its stale projection (6,782 / 7,266 withheld per set; nothing destroyed — the belt is the commit door's foreign-slot refusal, `slot_door_refusals` [0, 0] on m60 through the end of both legs; defect 18 / 34's 256-restart loop under it, PR 13b's "9/10" class in production shape; the fix sites `queue_reclaim_inode` / `reclaim_orphaned_batch` and `destroy_entry_bytes`) — a CPU + log storm on a path a token client must not take, invisible to the row's oracle; a PR 14 item beside the served-mutation hook's `ENOENT`-at-WARN (272 k / 275 k lines per set — 21–46 % of the served invalidations, `session.rs:1092`) and the fresh joiner's 3.0 s first create into a striped root;
 > * **gate 4** — the kill matrix ×10 from zero on this binary: NOT RUN in this rung (LOCAL by the venue law; the counts restart on the flip binary).
 >
 > **The gates this pass does not move, placed: unchanged from the third pass's placement** — gate 6 RUN locally, VALID; gate 8 MET; gate 8b PASS 190 / 0; gate 9 NOT RUN (PR 15's).

@@ -13989,7 +13989,6 @@ async fn a_deferred_flush_barrier_between_the_decision_and_its_cycle_is_priced_i
     let mut collected_prev = mvol.checkpoint_collected_ns();
     let mut seq_prev = mvol.checkpoint_seq();
     let mut overruns_prev = mvol.appender_stats().unwrap().flush_ceiling_overruns;
-    let mut deferred_prev = deferred_face();
     // The draw whose landing cycle is the NEXT collection: `(draw, the
     // deferred count when its late create went out)`.
     let mut in_flight: Option<(u32, u64)> = None;
@@ -14077,7 +14076,7 @@ async fn a_deferred_flush_barrier_between_the_decision_and_its_cycle_is_priced_i
         if fire_at_ns > now_ns {
             tokio::time::sleep(std::time::Duration::from_nanos(fire_at_ns - now_ns)).await;
         }
-        deferred_prev = deferred_face();
+        let deferred_at_late = deferred_face();
         manager
             .create(
                 d,
@@ -14088,7 +14087,7 @@ async fn a_deferred_flush_barrier_between_the_decision_and_its_cycle_is_priced_i
             )
             .await
             .expect("the late create");
-        in_flight = Some((draw, deferred_prev));
+        in_flight = Some((draw, deferred_at_late));
     }
     seed.await.expect("the seeded cycle");
     squeezefs::uring_fs::disarm_device_latency(&path);

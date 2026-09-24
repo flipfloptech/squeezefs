@@ -2974,6 +2974,64 @@ fn checkpoint_projection_prices_the_pending_work_from_measured_units() {
     );
 }
 
+/// **The projection prices the cycle's COVERING BARRIERS at the measured
+/// barrier unit** (PR 13h — F-B1's landing residue): the wall from the
+/// decision to the landing is the flush projection plus the barriers the
+/// cycle pays — barrier #1, and on a deferred-mode volume the due tick's
+/// deferred-flush barrier ahead of it (`needs_flush`, set by every
+/// non-strict commit group), so TWO there and ONE on a strict volume —
+/// each at the horizon MAXIMUM of one barrier's wall
+/// (`meta_kv_checkpoint_barrier_ms`). The fourth box pass's one trip
+/// (1,101 ms, no service, a storm's END) was the deferred barrier's ≈ 40
+/// ms priced by neither the decision's lateness nor the cycle's wall; the
+/// term is clocked from the decision now, and the projection anticipates
+/// the barriers before the horizon has seen them (a device slow at rest
+/// is priced at its bring-up cycles). Saturating. Drift is red here.
+#[test]
+fn checkpoint_projection_prices_the_covering_barriers_at_the_measured_unit() {
+    use squeezefs::meta_backend::kv::checkpoint::{
+        checkpoint_trigger_ms, covering_barriers, projected_cycle_wall_ns, projected_flush_wall_ns,
+        CHECKPOINT_MAX_AGE_MS,
+    };
+    let ms = 1_000_000u64;
+    assert_eq!(
+        covering_barriers(false),
+        2,
+        "deferred mode: the due tick's, then barrier #1"
+    );
+    assert_eq!(
+        covering_barriers(true),
+        1,
+        "strict: commits barrier themselves"
+    );
+    let flush = projected_flush_wall_ns(100, 250_000, 40, 2 * ms);
+    assert_eq!(
+        projected_cycle_wall_ns(flush, covering_barriers(false), 150 * ms),
+        flush + 300 * ms
+    );
+    assert_eq!(
+        projected_cycle_wall_ns(flush, covering_barriers(true), 150 * ms),
+        flush + 150 * ms
+    );
+    assert_eq!(
+        projected_cycle_wall_ns(0, 2, 0),
+        0,
+        "an unmeasured barrier unit is 0 — the shipped posture until the first barrier"
+    );
+    assert_eq!(
+        projected_cycle_wall_ns(u64::MAX - 1, 2, 150 * ms),
+        u64::MAX,
+        "saturating"
+    );
+    // The pin's shape: a 150 ms barrier at rest, a small pass — the trigger
+    // anticipates ≈ 300 ms before the horizon has seen a due cycle, so the
+    // first cycle after the bring-up lands inside the ceiling.
+    let max_age = CHECKPOINT_MAX_AGE_MS as u64;
+    let projected_ms = projected_cycle_wall_ns(2 * ms, covering_barriers(false), 150 * ms) / ms;
+    assert_eq!(projected_ms, 302);
+    assert_eq!(checkpoint_trigger_ms(max_age, projected_ms), max_age - 302);
+}
+
 /// **The threshold drain's budget is the PASS's** (PR 13g, F-B1; finding
 /// 49's bound restated): the first item of a pass is admitted whatever
 /// the deadline — progress — and every later one only while the deadline

@@ -1754,6 +1754,7 @@ impl KvMetaBackend {
         barrier_now: bool,
     ) -> Result<(), KvError> {
         let cycle_started = std::time::Instant::now();
+        let cycle_started_ns = crate::mono_core::monotonic_ns_u64();
         let set = self.appenders.as_ref().ok_or_else(|| {
             KvError::Busy(format!(
                 "{}: not a symmetric-forest volume",
@@ -1893,9 +1894,12 @@ impl KvMetaBackend {
         // ---- Barrier #1: our node appends become durable.
         let barrier_started = std::time::Instant::now();
         self.sync_device().await.map_err(KvError::Io)?;
-        self.note_flush_ceiling(&had_dirty, crate::mono_core::monotonic_ns_u64());
+        let landed_ns = crate::mono_core::monotonic_ns_u64();
+        self.note_flush_ceiling(&had_dirty, landed_ns);
         self.note_checkpoint_barrier(barrier_started.elapsed().as_nanos() as u64);
-        self.note_checkpoint_cycle_term(cycle_started.elapsed().as_nanos() as u64);
+        // The landing wall from the age decision that fired this cycle
+        // (PR 13h), else its start.
+        self.note_checkpoint_cycle_term(cycle_started_ns, landed_ns);
         log::debug!(
             "joined checkpoint: appender {own}'s cycle pre-barrier wall {} ms = flush {flush_ms} \
              ({dirty_count} dirty: {} appended in {} ms, {} SMO'd writing {} images in {} ms) + \

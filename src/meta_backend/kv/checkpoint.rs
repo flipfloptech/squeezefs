@@ -1076,9 +1076,13 @@ pub fn checkpoint_trigger_ms(max_age_ms: u64, anticipated_term_ms: u64) -> u64 {
 
 /// **One cycle's landing TERM**, ns — the interval between the trigger
 /// firing and the covering barrier that the ceiling's `2 × tick` does not
-/// price (PR 13e, F-B1): the cycle's pre-barrier wall (start → barrier #1)
-/// plus the age decision's lateness past the trigger BEYOND one tick —
-/// `wall + (late − tick)⁺`. One tick of lateness is the cadence's wake
+/// price (PR 13e, F-B1): the cycle's wall from its age DECISION to barrier
+/// #1's completion (PR 13h — the decision, not the cycle's start: the
+/// tick's deferred-flush barrier runs between the two since PR 13g read
+/// the decision ahead of the drain, and its ≈ 40 ms was the fourth box
+/// pass's one trip; a cycle no age decision fired measures from its own
+/// start) plus the age decision's lateness past the trigger BEYOND one
+/// tick — `wall + (late − tick)⁺`. One tick of lateness is the cadence's wake
 /// quantization, the ceiling's first tick; the excess is the tick's own
 /// device work ahead of its decision (the deferred-flush barrier, a
 /// maintenance item's SMO barrier past the drain deadline — the shape the
@@ -1211,6 +1215,39 @@ pub fn projected_flush_wall_ns(
     dirty_nodes
         .saturating_mul(node_unit_ns)
         .saturating_add(promised_extents.saturating_mul(image_unit_ns.max(node_unit_ns)))
+}
+
+/// **The covering barriers a due cycle pays between its age decision and
+/// its landing** (PR 13h, F-B1's landing residue): barrier #1 (every
+/// cycle), and on a DEFERRED-mode volume the tick's deferred-flush barrier
+/// — `needs_flush`, set by every non-strict commit group, consumed by the
+/// tick between its decision and its cycle: under any load a due tick
+/// finds it set, and pricing it on a due tick that does not (one create,
+/// then quiet) costs a trigger one barrier early, never a trip. A STRICT
+/// volume's commits barrier themselves and never set it. A count, never a
+/// clock: the projection multiplies it by the measured barrier unit.
+pub fn covering_barriers(strict: bool) -> u64 {
+    if strict {
+        1
+    } else {
+        2
+    }
+}
+
+/// **The LIVE projection of the next cycle's wall from its DECISION to its
+/// LANDING** (PR 13h): the flush projection ([`projected_flush_wall_ns`])
+/// plus the covering barriers ([`covering_barriers`]) at the measured
+/// barrier unit — the horizon MAXIMUM of one barrier's wall on this
+/// volume's checkpoint path (`meta_kv_checkpoint_barrier_ms`). The
+/// fourth box pass's one trip (1,101 ms, no service, the storm's END)
+/// was the deferred barrier's ≈ 40 ms sitting in neither the decision's
+/// lateness nor the cycle's wall — the same instant the flush-ceiling
+/// audit judges is where the term is measured now (`checkpoint_cycle_term_
+/// ns` from the decision), and this is what the projection prices ahead
+/// of it: a device whose barrier is slow at REST (the bring-up cycles
+/// measure it) is priced before its first storm cycle. Saturating.
+pub fn projected_cycle_wall_ns(flush_ns: u64, barriers: u64, barrier_unit_ns: u64) -> u64 {
+    flush_ns.saturating_add(barriers.saturating_mul(barrier_unit_ns))
 }
 
 /// **The cycle terms a forest volume's cadence anticipates over** — the
@@ -1705,6 +1742,10 @@ struct CheckpointDecision {
     /// `Some(late)` = due by age on a forest volume (the lateness rides
     /// the cycle it runs); the flat arm carries `Some(0)`.
     age_late_ns: Option<u64>,
+    /// The monotonic instant the decision was taken — the cycle it fires
+    /// clocks its landing term from here (PR 13h: the deferred-flush
+    /// barrier between the decision and the cycle is inside it).
+    decided_at_ns: u64,
 }
 
 impl CheckpointDecision {
@@ -1767,13 +1808,9 @@ fn decide_checkpoint(
     let max_age_ms = elastic_ceiling.map_or(CHECKPOINT_MAX_AGE_MS as u64, |c| c);
     // `Some(late)` = due by age on a forest volume, with the decision's
     // lateness for the cycle it runs; the flat arm carries no lateness.
+    let decided_at_ns = crate::mono_core::monotonic_ns_u64();
     let age_late_ns = if be.appenders().is_some() {
-        be.checkpoint_due_by_age(
-            max_age_ms,
-            mutex_wait_ns,
-            crate::mono_core::monotonic_ns_u64(),
-            dirty_nodes,
-        )
+        be.checkpoint_due_by_age(max_age_ms, mutex_wait_ns, decided_at_ns, dirty_nodes)
     } else {
         flat_age_due(last_checkpoint.elapsed().as_millis(), max_age_ms).then_some(0)
     };
@@ -1796,6 +1833,7 @@ fn decide_checkpoint(
         ring_pressure,
         region_pressure,
         age_late_ns,
+        decided_at_ns,
     }
 }
 
@@ -1976,10 +2014,14 @@ async fn tick(
         }
         // The age decision's lateness rides the cycle it RUNS, and only
         // that one (PR 13e review round 1, Issue 1): a due tick that runs
-        // no cycle records nothing.
+        // no cycle records nothing. The decision's INSTANT rides with it
+        // (PR 13h): the cycle's landing term is clocked from the decision,
+        // so the deferred-flush barrier step 2 ran between the two is in
+        // the horizon the trigger anticipates — the fourth box pass's one
+        // trip was that barrier's wall priced nowhere.
         if be.appenders().is_some() {
             if let Some(late_ns) = d.age_late_ns {
-                be.note_checkpoint_decision(late_ns, tick_ms);
+                be.note_checkpoint_decision(late_ns, tick_ms, d.decided_at_ns);
             }
         }
         be.checkpoint_cycle(&mut smo, d.ring_pressure || final_cycle)
@@ -2225,6 +2267,7 @@ impl KvMetaBackend {
         barrier_now: bool,
     ) -> Result<(), KvError> {
         let cycle_started = std::time::Instant::now();
+        let cycle_started_ns = crate::mono_core::monotonic_ns_u64();
         let h = self.journal_ring().core().head();
         // The wedged-tail progress audit's inputs (see the barrier_now
         // block at the end): captured before the cycle mutates anything.
@@ -2512,12 +2555,14 @@ impl KvMetaBackend {
         // journal write + any previously-written ledger record become
         // durable (the §4.6 pt 3 pending-reclaim drains inside).
         self.sync_device().await.map_err(KvError::Io)?;
-        self.note_flush_ceiling(&had_dirty, crate::mono_core::monotonic_ns_u64());
+        let landed_ns = crate::mono_core::monotonic_ns_u64();
+        self.note_flush_ceiling(&had_dirty, landed_ns);
         self.note_checkpoint_barrier(t_pages.elapsed().as_nanos() as u64);
-        // The pre-barrier wall the audit just measured against, folded with
-        // the decision's lateness into the term the cadence trigger
+        // The landing wall the audit just measured against — from the age
+        // decision that fired this cycle (PR 13h), else its start — folded
+        // with the decision's lateness into the term the cadence trigger
         // anticipates (PR 13e, F-B1).
-        self.note_checkpoint_cycle_term(cycle_started.elapsed().as_nanos() as u64);
+        self.note_checkpoint_cycle_term(cycle_started_ns, landed_ns);
         log::debug!(
             "checkpoint: cycle on {:?} pre-barrier wall {} ms = publish {} + flush {} ({} dirty \
              nodes: {} appended in {} ms, {} SMO'd writing {} images in {} ms) + pages {} + \

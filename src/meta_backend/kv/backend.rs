@@ -1569,11 +1569,12 @@ pub struct KvMetaBackend {
     pub(super) checkpoint_collected_ns: AtomicU64,
     /// The last `TERM_HORIZON_CYCLES` cycles' landing TERMS
     /// (`checkpoint::CycleTermWindow` over
-    /// `checkpoint::checkpoint_cycle_term_ns`): the pre-barrier wall —
-    /// cycle start → barrier #1's completion — plus the age decision's
-    /// lateness beyond one tick; exactly the interval the flush-ceiling
-    /// audit measures past the ceiling's priced ticks, and the term the
-    /// cadence trigger anticipates as their maximum
+    /// `checkpoint::checkpoint_cycle_term_ns`): the landing wall — the age
+    /// DECISION that fired the cycle (else its start; PR 13h) → barrier
+    /// #1's completion — plus the decision's lateness beyond one tick;
+    /// exactly the interval the flush-ceiling audit measures past the
+    /// ceiling's priced ticks, and the term the cadence trigger
+    /// anticipates as their maximum
     /// (`checkpoint::checkpoint_trigger_ms`). Fed by every cycle (the
     /// manager's and a joined appender's); the cadence's read is one
     /// relaxed load of the published maximum (`checkpoint_term_ns`).
@@ -1587,6 +1588,12 @@ pub struct KvMetaBackend {
     /// for a cycle another path ran.
     pub(super) checkpoint_decision_late_ns: AtomicU64,
     pub(super) checkpoint_decision_tick_ns: AtomicU64,
+    /// The monotonic instant of that decision (PR 13h): the cycle it fired
+    /// measures its landing term from HERE — the tick's deferred-flush
+    /// barrier runs between the decision and the cycle's start, and a
+    /// term clocked from the start left it priced nowhere (F-B1's landing
+    /// residue). 0 for a cycle another path ran.
+    pub(super) checkpoint_decision_at_ns: AtomicU64,
     /// The age decision's RAW lateness past its trigger, the horizon
     /// MAXIMUM over the cycles it fired (PR 13g review round 2, Issue 19)
     /// — the tick's own wake term (the executor's scheduling under CPU
@@ -3269,6 +3276,7 @@ impl KvMetaBackend {
             checkpoint_term_ns: AtomicU64::new(0),
             checkpoint_decision_late_ns: AtomicU64::new(0),
             checkpoint_decision_tick_ns: AtomicU64::new(0),
+            checkpoint_decision_at_ns: AtomicU64::new(0),
             checkpoint_lates: std::sync::Mutex::new(super::checkpoint::CycleTermWindow::new()),
             checkpoint_late_max_ns: AtomicU64::new(0),
             checkpoint_last_late_ns: AtomicU64::new(0),
@@ -12316,23 +12324,34 @@ impl KvMetaBackend {
             .store(now_ns, Ordering::Release);
     }
 
-    /// Fold a cycle's measured pre-barrier wall (cycle start → barrier
-    /// #1) — plus the lateness beyond one tick of the age decision that
-    /// fired it, if one did, capped at the landing ceiling in force (the
-    /// belt: a lateness past one ceiling is a stall the audit counts on
-    /// the cycle it happens, never a term to anticipate) — into the window
-    /// the cadence trigger anticipates over (PR 13e, F-B1). The window's
-    /// mutex is the checkpoint task's own (one cycle at a time per
-    /// volume); the published maximum is what the cadence reads.
-    pub(super) fn note_checkpoint_cycle_term(&self, prebarrier_wall_ns: u64) {
+    /// Fold a cycle's measured landing wall — from the age DECISION that
+    /// fired it (PR 13h: the tick's deferred-flush barrier runs between
+    /// the decision and the cycle's start, and a wall clocked from the
+    /// start left that barrier priced nowhere — F-B1's landing residue,
+    /// the fourth box pass's 1,101 ms), or from the cycle's own start
+    /// `cycle_started_ns` when no decision fired it, to barrier #1's
+    /// completion at `now_ns` — plus the decision's lateness beyond one
+    /// tick, capped at the landing ceiling in force (the belt: a lateness
+    /// past one ceiling is a stall the audit counts on the cycle it
+    /// happens, never a term to anticipate) — into the window the cadence
+    /// trigger anticipates over (PR 13e, F-B1). The window's mutex is the
+    /// checkpoint task's own (one cycle at a time per volume); the
+    /// published maximum is what the cadence reads.
+    pub(super) fn note_checkpoint_cycle_term(&self, cycle_started_ns: u64, now_ns: u64) {
         let late_ns = self.checkpoint_decision_late_ns.swap(0, Ordering::AcqRel);
         let tick_ns = self.checkpoint_decision_tick_ns.swap(0, Ordering::AcqRel);
+        let decided_at_ns = self.checkpoint_decision_at_ns.swap(0, Ordering::AcqRel);
+        let start_ns = if decided_at_ns != 0 && decided_at_ns < cycle_started_ns {
+            decided_at_ns
+        } else {
+            cycle_started_ns
+        };
         let ceiling_ns = self
             .appenders
             .as_ref()
             .map_or(u64::MAX, |a| a.flush_ceiling_ms.saturating_mul(1_000_000));
         let sample_ns = super::checkpoint::checkpoint_cycle_term_ns(
-            prebarrier_wall_ns,
+            now_ns.saturating_sub(start_ns),
             late_ns,
             tick_ns,
             ceiling_ns,
@@ -12504,16 +12523,24 @@ impl KvMetaBackend {
         self.checkpoint_last_dirty_count.load(Ordering::Relaxed)
     }
 
-    /// **The LIVE projection of the next cycle's flush wall**, ms, for a
-    /// dirty count the caller read (`checkpoint::projected_flush_wall_ns`
-    /// over the dirty nodes, the promised images and the two measured
-    /// units).
+    /// **The LIVE projection of the next cycle's wall from its decision to
+    /// its landing**, ms, for a dirty count the caller read: the flush
+    /// projection (`checkpoint::projected_flush_wall_ns` over the dirty
+    /// nodes, the promised images and the two measured units) plus the
+    /// covering barriers at the measured barrier unit
+    /// (`checkpoint::projected_cycle_wall_ns` — PR 13h: two on a
+    /// deferred-mode volume, one strict).
     pub fn checkpoint_projected_ms_for(&self, dirty_nodes: u64) -> u64 {
-        super::checkpoint::projected_flush_wall_ns(
+        let flush = super::checkpoint::projected_flush_wall_ns(
             dirty_nodes,
             self.checkpoint_node_unit_ns(),
             self.promised_smo_extents(),
             self.checkpoint_image_unit_ns(),
+        );
+        super::checkpoint::projected_cycle_wall_ns(
+            flush,
+            super::checkpoint::covering_barriers(self.strict),
+            self.checkpoint_barrier_ns.load(Ordering::Relaxed),
         ) / 1_000_000
     }
 
@@ -12638,11 +12665,16 @@ impl KvMetaBackend {
     /// cycle). The cycle consumes both in `note_checkpoint_cycle_term`;
     /// the SMO mutex the caller holds across the store and the cycle is
     /// what keeps another path's cycle from consuming them first.
-    pub(super) fn note_checkpoint_decision(&self, late_ns: u64, tick_ms: u64) {
+    pub(super) fn note_checkpoint_decision(&self, late_ns: u64, tick_ms: u64, decided_at_ns: u64) {
         self.checkpoint_decision_late_ns
             .store(late_ns, Ordering::Release);
         self.checkpoint_decision_tick_ns
             .store(tick_ms.saturating_mul(1_000_000), Ordering::Release);
+        // The instant the cycle's landing term is clocked from (PR 13h) —
+        // the decision's own, taken BEFORE the tick's deferred-flush
+        // barrier, never this call's.
+        self.checkpoint_decision_at_ns
+            .store(decided_at_ns, Ordering::Release);
     }
 
     /// Drop a stored decision a FAILED cycle never folded (review round
@@ -12651,6 +12683,7 @@ impl KvMetaBackend {
     pub(super) fn clear_checkpoint_decision(&self) {
         self.checkpoint_decision_late_ns.store(0, Ordering::Release);
         self.checkpoint_decision_tick_ns.store(0, Ordering::Release);
+        self.checkpoint_decision_at_ns.store(0, Ordering::Release);
     }
 
     /// The sweep's per-cycle budget in force (ms) — `merge_sweep_budget_ms`

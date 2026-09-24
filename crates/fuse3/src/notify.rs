@@ -84,6 +84,30 @@ pub fn prune_frame(inodes: &[u64]) -> Vec<u8> {
     data
 }
 
+/// Whether an out frame (its `fuse_out_header` first) is a daemon-initiated
+/// NOTIFICATION rather than a request's reply: a notification carries
+/// `unique == 0` and its `fuse_notify_code` in the header's `error` field
+/// (positive — every request reply's `error` is `0` or `-errno`). The
+/// reply task classifies the kernel's answer by it (PR 13h): a
+/// notification the kernel answers `ENOENT` names an inode it does not
+/// hold — an expected, counted outcome ([`crate::raw::read_phase::
+/// notify_enoent`]), never the "interrupted request" WARN a request
+/// reply's `ENOENT` is. A frame shorter than a header is no notification.
+///
+/// `pub` + `doc(hidden)` (the [`inval_inode_frame`] precedent): the fork's
+/// contracts drive it with the shipping encoders' frames.
+#[doc(hidden)]
+pub fn frame_is_notify(frame: &[u8]) -> bool {
+    if frame.len() < FUSE_OUT_HEADER_SIZE {
+        return false;
+    }
+    let error = i32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
+    let unique = u64::from_le_bytes([
+        frame[8], frame[9], frame[10], frame[11], frame[12], frame[13], frame[14], frame[15],
+    ]);
+    unique == 0 && error > 0
+}
+
 #[derive(Debug, Clone)]
 /// notify kernel there are something need to handle.
 pub struct Notify {
@@ -517,5 +541,71 @@ mod tests {
             .now_or_never()
             .expect("the async enqueue never suspends");
         assert_eq!(rx2.try_next_frame().expect("async prune frame"), frame);
+    }
+
+    /// **A notification's `ENOENT` is a counted outcome, never the
+    /// "interrupted request" WARN** (symmetric PR 13h — the fourth box
+    /// pass read 272,071 / 285,461 `may reply interrupted fuse request,
+    /// ignore this error No such file or directory` lines per row set,
+    /// ≈ 2 × the served-mutation hook's `FUSE_NOTIFY_INVAL_INODE` +
+    /// `FUSE_NOTIFY_PRUNE`: the kernel answering "not cached" for an inode
+    /// it had already forgotten, logged per call). The classifier is the
+    /// out header: every notification carries `unique == 0` and its
+    /// notify code in `error` (positive); a request's reply carries its
+    /// `unique` and `0` or `-errno`. The reply task's verdict: a
+    /// notification's `ENOENT` counts (`fuse3_notify_enoent`), its other
+    /// errnos log and never end the task (a notification owes nothing);
+    /// a request reply keeps the shipped law — `ENOENT` the interrupted
+    /// WARN, anything else fatal. RED on the fork before PR 13h: every
+    /// `ENOENT` read as an interrupted request.
+    #[test]
+    fn a_notifications_enoent_is_counted_never_the_interrupted_request_warn() {
+        use crate::raw::session::{reply_write_verdict, ReplyWriteVerdict};
+        use std::io::ErrorKind;
+        // The classifier over the shipping encoders' frames.
+        assert!(frame_is_notify(&inval_inode_frame(772, 0, 0)));
+        assert!(frame_is_notify(&inval_inode_frame(9, -1, 0)));
+        assert!(frame_is_notify(&prune_frame(&[772])));
+        assert!(frame_is_notify(&prune_frame(&[])));
+        // A request's reply: `unique` set, `error` 0 (success) or `-errno`.
+        let mut reply_ok = vec![0u8; FUSE_OUT_HEADER_SIZE];
+        reply_ok[0..4].copy_from_slice(&(FUSE_OUT_HEADER_SIZE as u32).to_le_bytes());
+        reply_ok[8..16].copy_from_slice(&42u64.to_le_bytes());
+        assert!(!frame_is_notify(&reply_ok));
+        let mut reply_err = reply_ok.clone();
+        reply_err[4..8].copy_from_slice(&(-libc::ENOENT).to_le_bytes());
+        assert!(!frame_is_notify(&reply_err));
+        // A notify code with a unique is no notification (the kernel's
+        // request replies never carry a positive error); a short frame is
+        // no notification.
+        let mut odd = reply_ok.clone();
+        odd[4..8].copy_from_slice(&(fuse_notify_code::FUSE_NOTIFY_PRUNE as i32).to_le_bytes());
+        assert!(!frame_is_notify(&odd));
+        assert!(!frame_is_notify(&reply_ok[..8]));
+        // The reply task's verdict.
+        assert_eq!(
+            reply_write_verdict(true, ErrorKind::NotFound),
+            ReplyWriteVerdict::NotifyEnoent,
+            "a notification's ENOENT is COUNTED — the kernel does not hold the inode"
+        );
+        assert_eq!(
+            reply_write_verdict(true, ErrorKind::InvalidInput),
+            ReplyWriteVerdict::NotifyFailed,
+            "a notification's other errno is logged and never ends the reply task"
+        );
+        assert_eq!(
+            reply_write_verdict(false, ErrorKind::NotFound),
+            ReplyWriteVerdict::InterruptedRequest,
+            "a request reply's ENOENT stays the interrupted-request WARN"
+        );
+        assert_eq!(
+            reply_write_verdict(false, ErrorKind::BrokenPipe),
+            ReplyWriteVerdict::Fatal,
+            "a request reply's other errno ends the reply task, as shipped"
+        );
+        // The counter moves once per counted outcome.
+        let before = crate::raw::read_phase::notify_enoent();
+        crate::raw::read_phase::note_notify_enoent();
+        assert_eq!(crate::raw::read_phase::notify_enoent(), before + 1);
     }
 }

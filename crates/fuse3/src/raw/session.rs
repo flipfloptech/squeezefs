@@ -75,6 +75,38 @@ use crate::{Errno, SetAttr};
 /// Modeled on `TpcScheduler::dispatch` (spec §8: dead-lane detection,
 /// re-dispatch, a counter, and failing loud rather than blackholing a
 /// request).
+/// What the reply task does with a failed device write of one out frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum ReplyWriteVerdict {
+    /// A daemon-initiated notification the kernel answered `ENOENT` —
+    /// an inode it does not hold: counted (`fuse3_notify_enoent`), never
+    /// logged.
+    NotifyEnoent,
+    /// A notification the kernel refused with any other errno: logged
+    /// once; a notification owes the kernel nothing, so the reply task
+    /// goes on.
+    NotifyFailed,
+    /// A request's reply the kernel answered `ENOENT`: the request was
+    /// interrupted — the shipped WARN, the reply task goes on.
+    InterruptedRequest,
+    /// Anything else on a request's reply: the reply task ends with it.
+    Fatal,
+}
+
+/// The reply task's classification of a failed out-frame write (PR 13h):
+/// `is_notify` = the frame is a daemon-initiated notification
+/// ([`crate::notify::frame_is_notify`]).
+#[doc(hidden)]
+pub fn reply_write_verdict(is_notify: bool, kind: ErrorKind) -> ReplyWriteVerdict {
+    let _ = is_notify;
+    if kind == ErrorKind::NotFound {
+        ReplyWriteVerdict::InterruptedRequest
+    } else {
+        ReplyWriteVerdict::Fatal
+    }
+}
+
 pub(crate) struct ReplyTx {
     inner: UnboundedSender<FuseReply>,
     slot: ReplySlot,
@@ -1082,23 +1114,33 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             // uring ent, not fpq->processing) and paid a pipe2 + write +
             // vmsplice + splice + 2×close + fcntl block per READ reply
             // before falling back here anyway.
+            let is_notify = crate::notify::frame_is_notify(&data);
             if let Err(err) = fuse_connection
                 .write_vectored(data, extend_data, slot)
                 .await
                 .1
             {
-                if err.kind() == ErrorKind::NotFound {
-                    warn!(
-                        "may reply interrupted fuse request, ignore this error {}",
-                        err
-                    );
-
-                    continue;
+                match reply_write_verdict(is_notify, err.kind()) {
+                    ReplyWriteVerdict::NotifyEnoent => {
+                        crate::raw::read_phase::note_notify_enoent();
+                        continue;
+                    }
+                    ReplyWriteVerdict::NotifyFailed => {
+                        warn!("notify write to /dev/fuse failed {}", err);
+                        continue;
+                    }
+                    ReplyWriteVerdict::InterruptedRequest => {
+                        warn!(
+                            "may reply interrupted fuse request, ignore this error {}",
+                            err
+                        );
+                        continue;
+                    }
+                    ReplyWriteVerdict::Fatal => {
+                        error!("reply fuse failed {}", err);
+                        return Err(err);
+                    }
                 }
-
-                error!("reply fuse failed {}", err);
-
-                return Err(err);
             }
 
             drop(backing);

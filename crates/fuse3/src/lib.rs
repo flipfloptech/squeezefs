@@ -50,11 +50,12 @@ pub use raw::{
     zc_write_store_qid_census, COMMIT_BATCH_LABELS,
 };
 pub use raw::{
-    fused_midpass_reaps, fused_passbottom_reaps, fused_timeline_snapshot, pin_scope_from_env,
-    read_inplace_replies, read_transport_phase_record, read_transport_phase_snapshot,
-    reap_gap_snapshot, reap_phase_record_n, scoped_affinity_cpus, write_inplace_replies,
-    write_transport_phase_record, write_transport_phase_snapshot, zc_bridge_phase_record_ns,
-    zc_bridge_phase_snapshot, PhaseSnapshot, PinScope, ReapPhase, TransportPhase, ZcBridgePhase,
+    fused_midpass_reaps, fused_passbottom_reaps, fused_timeline_snapshot, notify_enoent,
+    pin_scope_from_env, read_inplace_replies, read_transport_phase_record,
+    read_transport_phase_snapshot, reap_gap_snapshot, reap_phase_record_n, scoped_affinity_cpus,
+    write_inplace_replies, write_transport_phase_record, write_transport_phase_snapshot,
+    zc_bridge_phase_record_ns, zc_bridge_phase_snapshot, PhaseSnapshot, PinScope, ReapPhase,
+    TransportPhase, ZcBridgePhase,
 };
 #[cfg(feature = "tokio-runtime")]
 pub use raw::{tpc_lane_redispatches, tpc_spawn, tpc_spawn_on_node, tpc_thread_count};

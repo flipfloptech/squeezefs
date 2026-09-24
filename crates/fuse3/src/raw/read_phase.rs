@@ -354,6 +354,28 @@ pub fn write_inplace_replies() -> u64 {
     WRITE_INPLACE_REPLIES.load(Ordering::Relaxed)
 }
 
+static NOTIFY_ENOENT: AtomicU64 = AtomicU64::new(0);
+
+/// Count one daemon-initiated notification (`FUSE_NOTIFY_INVAL_INODE`,
+/// `FUSE_NOTIFY_PRUNE`, …) the kernel answered `ENOENT` — the inode is
+/// not in its cache (forgotten already, or never instantiated there).
+#[inline]
+pub(crate) fn note_notify_enoent() {
+    NOTIFY_ENOENT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Notifications the kernel answered `ENOENT` (stats inode
+/// `fuse3_notify_enoent`): an EXPECTED outcome — a served mutation's
+/// invalidation + prune reaches every object the holder's peers touched,
+/// and the kernel holds only what it has not forgotten — counted, never
+/// logged per call (symmetric PR 13h: the fourth box pass read 272 k
+/// `may reply interrupted fuse request … ENOENT` WARN lines per row set,
+/// ≈ 2 × the served-mutation hook's `invals + prunes`). Any other errno on
+/// a notification still logs.
+pub fn notify_enoent() -> u64 {
+    NOTIFY_ENOENT.load(Ordering::Relaxed)
+}
+
 // ---------------------------------------------------------------------------
 // The FUSED-op timeline (write-IOPS campaign, 2026-08-11): three engaged
 // levers (guard convoy, pass funnel, purge economy) left rand-4k pinned at

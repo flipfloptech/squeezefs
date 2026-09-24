@@ -15301,7 +15301,10 @@ impl Drop for ReaderPosture {
 /// RED on `da8542fc`: `grants_served` +1 at the holder and one withheld
 /// destroy per forgotten corpse. GREEN: `grants_served` unmoved, refused
 /// unmoved, the reader face +1 per forget; the corpse stands at the
-/// holder for its own FORGET path, exact.
+/// holder for its own FORGET path, exact — and that path DESTROYS it
+/// (review round 2, Issue 15): a reader never unlinks, so the reclaiming
+/// FORGET is always the unlinker's or the holder's own; a file only a
+/// reader had open leaks nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_readers_forget_of_a_corpse_takes_no_grant_and_withholds_nothing() {
     use squeezefs::meta_ship::token_plane::TokenClientConfig;

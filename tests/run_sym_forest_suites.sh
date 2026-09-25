@@ -205,6 +205,7 @@ DEFAULT_SUITES=(
   sym_mount_posture_tests
   sym_n_daemon_tests
   served_mutation_kernel_tests
+  meta_io_direct_tests
 )
 read -r -a SUITES <<<"${SQZ_SYM_SUITES:-${DEFAULT_SUITES[*]}}"
 RATIO_NOTE="${SQZ_SYM_RATIO_NOTE:-2.0}"

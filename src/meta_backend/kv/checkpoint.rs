@@ -1706,10 +1706,10 @@ async fn checkpoint_task(
     let period = std::time::Duration::from_millis(interval_ms);
     let mut next_tick = std::time::Instant::now() + period;
     loop {
-        let cadence = match squeezefs_ipc::sqz_time::timeout_at(next_tick, wake.notified()).await {
-            Ok(()) => std::time::Instant::now() >= next_tick,
-            Err(_) => true,
-        };
+        let woke = squeezefs_ipc::sqz_time::timeout_at(next_tick, wake.notified())
+            .await
+            .is_ok();
+        let mut cadence = !woke || std::time::Instant::now() >= next_tick;
         // The writer→member checkpoint composite (§6.8 item 3 adjudication
         // item 4): while the freed-offset valve is asking its readers to
         // answer sooner, the writer's checkpoint ceiling is the elastic one
@@ -1729,6 +1729,20 @@ async fn checkpoint_task(
         let Some(be) = weak.upgrade() else {
             return; // backend dropped without shutdown: exit, leak nothing
         };
+        // A wake under RING PRESSURE is a tick (PR 13i): a committer parked
+        // at ring admission kicks this task (`admit_user_budget`) and the
+        // drain it needs is a CYCLE with `barrier_now` — the maintenance
+        // pass below appends and reclaims nothing — so the park never
+        // waits out the cadence deadline (under the sector-pad law a
+        // serial commit occupies a whole page of ring on a 4 KiB-grain
+        // device: a 1 MiB ring fills in 192 commits, and a 60 s cadence
+        // took a parked pass through the D1.b escalation twice over).
+        // The decision itself stays `decide_checkpoint`'s: the pressure
+        // law is what makes the cycle due.
+        if woke && !cadence && ring_under_pressure(&be) {
+            cadence = true;
+            next_tick = std::time::Instant::now() + period_now;
+        }
         let shutting_down = be.is_shutting_down();
         // PR M1 (design-metadata-throughput §5.0, Issue 14): a FAILED
         // volume — fenced at a barrier (reservation conflict) or latched
@@ -1926,6 +1940,18 @@ pub fn flat_age_due(elapsed_ms: u128, max_age_ms: u64) -> bool {
     elapsed_ms >= u128::from(max_age_ms)
 }
 
+/// The tick's ring-pressure law, on its own so a parked committer's wake
+/// can read it (PR 13i): ring 0 past half its logical length un-reclaimed,
+/// or any declared region's ring past half its admissible window
+/// (`AppenderSet::ring_pressure`). Exactly the term `decide_checkpoint`
+/// folds into `due`.
+fn ring_under_pressure(be: &Arc<KvMetaBackend>) -> bool {
+    let core = be.journal_ring().core();
+    let distance = core.head().saturating_sub(core.reusable_upto());
+    distance > core.geometry().logical_len() / 2
+        || be.appenders().is_some_and(|a| a.ring_pressure())
+}
+
 /// Read the checkpoint decision's inputs and take it (PR 13g, F-B1 made
 /// it a function the tick calls before AND after its threshold drain).
 fn decide_checkpoint(
@@ -1943,9 +1969,9 @@ fn decide_checkpoint(
     // node lock (§4.4 pt 5), so nothing is dirty and ring 0 is idle — read
     // alone, this tick would never make a cycle due and nobody would
     // advance that ring's `reusable_upto` (the wedge the pressure contract
-    // pins).
+    // pins). `ring_under_pressure` is the same law, read by the wake.
     let region_pressure = be.appenders().is_some_and(|a| a.ring_pressure());
-    let ring_pressure = distance > core.geometry().logical_len() / 2 || region_pressure;
+    let ring_pressure = ring_under_pressure(be);
     let dirty_nodes = be.dirty_node_count();
     // The freed-offset composite's ceiling in force replaces the constant
     // while a reader ask is live (`P/2` — every reader pass finds a new

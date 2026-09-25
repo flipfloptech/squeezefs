@@ -85,11 +85,17 @@ use tempfile::NamedTempFile;
 // Backend sandbox (the meta_volume_full_tests shape).
 // ---------------------------------------------------------------------------
 
-/// A 24 MiB heap of 64 KiB extents is ≈ 360 leaves; the ring is small so
-/// the fill's checkpoints are frequent.
-const VOL_LEN: u64 = 24 * 1024 * 1024;
+/// A ≈ 24 MiB heap of 64 KiB extents is ≈ 360 leaves. The ring holds the
+/// suite's largest serial commit population WITHOUT a ring-pressure cycle
+/// (PR 13i's sector-pad law: on this kernel's 4 KiB-grain sandbox every
+/// serial commit is one page of ring, so 3,000 creates are ≈ 12 MiB —
+/// the pre-13i 1 MiB ring held them at ≈ 230 B each); these contracts
+/// drive every checkpoint by hand and read merge shapes off the cycles
+/// they drive, so a pressure cycle interleaving them is a changed
+/// premise, never the subject.
+const VOL_LEN: u64 = 40 * 1024 * 1024;
 const NODE_SIZE: usize = 64 * 1024;
-const RING_LEN: u64 = 1024 * 1024;
+const RING_LEN: u64 = 16 * 1024 * 1024;
 /// Under the 64 KiB node's `node_size/4` value cap (16 KiB): ~4 per leaf,
 /// so the xattr tree is the extent-dominant one and every few files split
 /// its rightmost leaf.

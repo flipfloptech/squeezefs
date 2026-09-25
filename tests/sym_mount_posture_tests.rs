@@ -1641,6 +1641,12 @@ async fn an_appenders_own_checkpoint_refreshes_its_page_and_the_release_bound_re
     let ring = region.ring();
     let ring_len = ring.core().geometry().logical_len();
     let start_head = ring.core().head();
+    // The ring's PHYSICAL size at the join — the word a wire joiner's page
+    // carried before PR 12 (the stale-hint arm below). Under the sector-
+    // pad law (PR 13i) the storm fills the region's ring fast enough for
+    // PR 2's stall-driven growth to REPLACE it mid-storm, so the join-time
+    // arithmetic reads the join-time length, never the grown page's.
+    let start_ring_bytes = ring.ring_bytes();
 
     // Journal PAST two laps of the region's ring (the storm rides the
     // declared region: every create under `shared` is slot B's, and slot
@@ -1656,6 +1662,8 @@ async fn an_appenders_own_checkpoint_refreshes_its_page_and_the_release_bound_re
         assert!(i < 200_000, "the ring must lap under the storm");
     }
     vol.checkpoint_now().await.expect("checkpoint");
+    // A growth mid-storm replaced the region's ring: read the LIVE one.
+    let ring = region.ring();
     let head = ring.core().head();
     let frontier = ring.seq_frontier();
     assert!(head >= start_head + 2 * ring_len, "> 2 laps journaled");
@@ -1686,7 +1694,7 @@ async fn an_appenders_own_checkpoint_refreshes_its_page_and_the_release_bound_re
     // …where the JOIN-TIME words (head_hint at the start, ckpt_seq 0 —
     // what a wire joiner's page carried before PR 12) would have refused
     // it, which is why the screen fell back to the sane cap there.
-    let join_time = release_seq_floor_bound(page.seq_offset, None, start_head, page_ring_len);
+    let join_time = release_seq_floor_bound(page.seq_offset, None, start_head, start_ring_bytes);
     assert!(
         join_time < frontier,
         "the stale hint's bound ({join_time}) sits below the frontier ({frontier})"

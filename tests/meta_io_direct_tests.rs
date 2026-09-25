@@ -14,13 +14,19 @@
 //! Suite runs `--test-threads=1` (the registry and the gauges are
 //! process-global).
 
+use squeezefs::meta_backend::kv::backend::KvMetaBackend;
+use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options, ROOT_INO};
 use squeezefs::meta_backend::kv::journal::{
     checkpoint_reserve_bytes, entry_len_for, JournalRing, JOURNAL_PAGE_DATA_LEN,
     JOURNAL_PAGE_HDR_LEN, JOURNAL_PAGE_LEN,
 };
 use squeezefs::meta_backend::kv::journal_core::{AdmissionClass, CoreGeometry, PAD_MIN};
-use squeezefs::meta_backend::kv::record::{inode_key, Record, TREE_INODES};
+use squeezefs::meta_backend::kv::record::{
+    forest_key, inode_key, xattr_key, xattr_name_hash56, Record, XattrValue, TREE_INODES,
+    TREE_XATTRS,
+};
 use squeezefs::meta_backend::kv::{META_KV_JOURNAL_PAD_BYTES, META_KV_JOURNAL_PAD_ENTRIES};
+use squeezefs::meta_backend::Metadata;
 use squeezefs::uring_fs::{
     self, clear_meta_devices, meta_io_grain, meta_io_mode, register_meta_device, AlignedBuf,
     META_IO_BOUNCE_BYTES, META_IO_BUFFERED_FALLBACK, META_IO_READ_WIDENED,
@@ -428,4 +434,177 @@ async fn the_buffered_seam_keeps_the_pre_pr_13i_posture() {
         &uring_fs::read_at(f.path(), 3, 3).await.unwrap()[..],
         b"abc"
     );
+}
+
+/// **A ring recovered within `max_pad` of 100 % full still opens for
+/// writing** (PR 13i review round 1, Issue 3). The writer's head
+/// alignment is the ring's FIRST write and needs `max_pad` of TOTAL ring
+/// space (reserve included); a ring the checkpoint class filled to its
+/// last bytes before the crash — a ring written UNPADDED by the binary
+/// before PR 13i, whose head therefore stands mid-sector — cannot admit
+/// it. The first build refused the open (`JournalReserveExhausted`) and
+/// every later open refused identically: nothing drains a ring no writer
+/// can open — the mount-refusal wedge face `preclaim_ring_recovery`
+/// exists to prevent (P2 2026-07-26 §9), which the pre-13i binary
+/// recovered from (its first pre-claim cycle needs no ring write). The
+/// law: the alignment's refused admission runs the pre-claim's guarded
+/// checkpoint cycles — each flushes the replayed dirt, writes the ledger
+/// and advances the tail without a ring write — until the pad admits,
+/// THEN pads, and the open proceeds with every replayed record present.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ring_recovered_within_max_pad_of_full_opens_through_the_guarded_cycles() {
+    clear_meta_devices();
+    const VOL_LEN: u64 = 64 * 1024 * 1024;
+    const RING_LEN: u64 = 512 * 1024;
+    let f = volume_file(VOL_LEN);
+    format_v3(
+        f.path(),
+        VOL_LEN,
+        &FormatV3Options {
+            node_size: 256 * 1024,
+            journal_len_override: Some(RING_LEN),
+            force: false,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .expect("format");
+    // The probe writes nothing and registers the path (every door does):
+    // the geometry and the grain the writer open below will pad to.
+    let (sb, mode) = {
+        let probe = KvMetaBackend::open_probe(f.path()).await.expect("probe");
+        let sb = probe.superblock().clone();
+        probe.shutdown().await.expect("probe shutdown");
+        (
+            sb,
+            meta_io_mode(f.path()).expect("the probe registered the path"),
+        )
+    };
+    if !mode.direct {
+        return;
+    }
+    let grain = mode.grain;
+    let max_pad = PAD_MIN + grain;
+
+    // The pre-13i binary's ring form: UNPADDED (an unregistered path is
+    // grain 1), filled in the CHECKPOINT class (reserve 0 — the wedged-
+    // tail escalation's form) until nothing admits, the last entries tiny
+    // so the head stands within a few bytes of the ring's end.
+    clear_meta_devices();
+    let ring_extent = KvMetaBackend::fixed_ring_extent(&sb);
+    let pages = ring_extent.len / JOURNAL_PAGE_LEN;
+    let old = JournalRing::new(
+        f.path(),
+        ring_extent.start,
+        pages,
+        checkpoint_reserve_bytes(ring_extent.len),
+    );
+    assert_eq!(old.grain(), 1, "the fixture writes the pre-13i bytes");
+    let journal_key = |kind: u8, legacy: &[u8]| -> Vec<u8> {
+        if sb.symmetric_forest_stamped() {
+            forest_key(kind, legacy).expect("forest key")
+        } else {
+            legacy.to_vec()
+        }
+    };
+    // Four xattr names re-put round-robin: the window folds to four
+    // records in RAM, so the guarded cycles' flush needs no split (no SMO
+    // record — the one ring write a flush pass ever makes).
+    const NAMES: [&str; 4] = ["user.pad0", "user.pad1", "user.pad2", "user.pad3"];
+    let xattr_records = |i: usize, value_len: usize, seq: u64| -> Vec<(u8, Record)> {
+        let name = NAMES[i % NAMES.len()];
+        let key = xattr_key(
+            ROOT_INO,
+            xattr_name_hash56(name.as_bytes(), sb.hash_seed),
+            0,
+        );
+        let value = XattrValue::encode_parts(name.as_bytes(), &vec![(i & 0xFF) as u8; value_len])
+            .expect("xattr value");
+        vec![(
+            TREE_XATTRS,
+            Record::put(journal_key(TREE_XATTRS, &key), seq, value),
+        )]
+    };
+    let mut planted = 0usize;
+    for value_len in [3900usize, 100, 1] {
+        loop {
+            let need = entry_len_for(&xattr_records(planted, value_len, 0)).unwrap();
+            let Some(adm) = old.try_admit(need, AdmissionClass::Checkpoint) else {
+                break;
+            };
+            let (res, seq_base) = old.reserve_registered(adm);
+            assert_eq!(res.pad, 0, "an unpadded ring pads nothing");
+            old.commit_entry(&res, &xattr_records(planted, value_len, seq_base))
+                .await
+                .expect("plant");
+            planted += 1;
+        }
+    }
+    let geo = *old.core().geometry();
+    let head = old.core().head();
+    let free = geo.logical_len() - head;
+    assert!(
+        free < max_pad,
+        "fixture: the ring must stand within max_pad ({max_pad}) of full — {free} B free"
+    );
+    let direct_geo = CoreGeometry { grain, ..geo };
+    assert!(
+        !direct_geo.sector_aligned(head),
+        "fixture: the recovered head must stand mid-sector at grain {grain} (head {head})"
+    );
+    uring_fs::fdatasync(f.path()).await.unwrap();
+    drop(old);
+    let pads0 = META_KV_JOURNAL_PAD_ENTRIES.load(Ordering::Relaxed);
+
+    // This binary's WRITER open: registers the path direct, recovers the
+    // window (the head mid-sector, the ring full), aligns its head THROUGH
+    // the guarded cycles and serves.
+    let be = KvMetaBackend::open(f.path()).await.expect(
+        "a ring recovered within max_pad of full opens for writing through the pre-claim's \
+         guarded cycles (review round 1, Issue 3) — a refusal here is the wedge face: every \
+         later open refuses the same way",
+    );
+    assert_eq!(
+        be.replay_stats().entries,
+        planted as u64,
+        "every planted entry replays"
+    );
+    assert_eq!(be.replay_stats().dropped_torn, 0);
+    assert!(
+        META_KV_JOURNAL_PAD_ENTRIES.load(Ordering::Relaxed) > pads0,
+        "the recovery pad was written once the cycles made room"
+    );
+    let rgeo = *be.journal_ring().core().geometry();
+    assert_eq!(rgeo.grain, grain);
+    assert!(
+        rgeo.sector_aligned(be.journal_ring().core().head()),
+        "the writer's head stands aligned after the open"
+    );
+    // The replayed records serve, and the writer writes.
+    for (i, name) in NAMES.iter().enumerate() {
+        let v = be
+            .getxattr(ROOT_INO, name)
+            .await
+            .expect("getxattr")
+            .unwrap_or_else(|| panic!("{name} replayed"));
+        assert!(!v.is_empty(), "{name} carries its last put ({i})");
+    }
+    let after = be
+        .create(ROOT_INO, "after", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("a user commit lands on the aligned ring")
+        .ino;
+    be.shutdown().await.expect("clean shutdown");
+    let re = KvMetaBackend::open(f.path()).await.expect("remount");
+    assert_eq!(
+        re.lookup(ROOT_INO, "after").await.expect("after").ino,
+        after
+    );
+    assert!(re
+        .getxattr(ROOT_INO, NAMES[0])
+        .await
+        .expect("getxattr")
+        .is_some());
+    re.shutdown().await.expect("shutdown");
 }

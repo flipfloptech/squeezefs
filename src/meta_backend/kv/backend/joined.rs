@@ -1002,6 +1002,14 @@ impl KvMetaBackend {
             be.abandon_joined_open().await;
             return Err(e);
         }
+        // A head alignment the region open DEFERRED on a full own ring
+        // (review round 1, Issue 3) lands here through the joiner's own
+        // guarded cycles — before the checkpoint task's first pass, the
+        // ring's first writer otherwise.
+        if let Err(e) = be.align_own_rings_for_writing().await {
+            be.abandon_joined_open().await;
+            return Err(e);
+        }
         super::super::checkpoint::spawn_checkpoint_task(&be);
         super::super::checkpoint::spawn_times_drain_task(&be);
         log::warn!(

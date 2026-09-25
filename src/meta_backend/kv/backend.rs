@@ -2621,7 +2621,7 @@ impl KvMetaBackend {
         // this binary). A joined appender's ring 0 is a PROJECTION it never
         // writes; a reader / probe / co-writer writes nothing.
         if posture == OpenPosture::Writer {
-            ring.align_head_for_writing().await?;
+            Self::align_ring_head_or_defer(path, &ring).await?;
         }
         let ring = Arc::new(ring);
 
@@ -17929,6 +17929,10 @@ impl KvMetaBackend {
     /// named cause — never a 30 s-per-rung silent park.
     async fn preclaim_ring_recovery(&self) -> std::result::Result<(), KvError> {
         use super::checkpoint::COVER_CYCLES_MAX;
+        // The head alignment a full ring deferred at the open (review
+        // round 1, Issue 3) lands FIRST — the ring's first write, before
+        // the preflight's own admission is even asked.
+        self.align_own_rings_for_writing().await?;
         // One max-size user entry, clamped to what this ring can EVER
         // admit (a floor-size ring's user slice is slightly under
         // MAX_ENTRY_LEN once page-header slots are excluded — the clamp
@@ -17977,6 +17981,146 @@ impl KvMetaBackend {
             self.path.display(),
             self.ring.core().head(),
             self.ring.core().reusable_upto(),
+        )))
+    }
+
+    /// The open's head alignment of a ring this mount writes (PR 13i
+    /// F-C1, [`JournalRing::align_head_for_writing`]) — landed when the
+    /// ring admits the pad, DEFERRED when it does not (review round 1,
+    /// Issue 3): a ring recovered within `max_pad` of 100 % full (the
+    /// checkpoint class consumed its whole reserve before the crash — the
+    /// wedged-tail escalation; a ring the binary before PR 13i wrote
+    /// unpadded, so its head stands mid-sector) cannot admit the pad,
+    /// and a refusal HERE was a refusal of every later open: nothing
+    /// drains a ring no writer can open (the mount-refusal wedge face
+    /// `preclaim_ring_recovery` exists to prevent, P2 2026-07-26 §9).
+    /// Deferring is safe because the same fullness admits NOTHING else —
+    /// every admission claims its entry plus the pad slack — so the
+    /// alignment stays the ring's first write by the arithmetic, and a
+    /// write that reached a mid-sector head would be refused loud by the
+    /// aligned form (`Corrupt`, never a misaligned device write). The
+    /// deferred pad lands through [`Self::align_own_rings_for_writing`]
+    /// once the guarded cycles have moved the tail. Every other error is
+    /// the caller's.
+    async fn align_ring_head_or_defer(
+        path: &Path,
+        ring: &JournalRing,
+    ) -> std::result::Result<(), KvError> {
+        match ring.align_head_for_writing().await {
+            Ok(_) => Ok(()),
+            Err(KvError::JournalReserveExhausted { needed }) => {
+                let core = ring.core();
+                log::warn!(
+                    "meta volume {}: the recovered ring stands within max_pad of full (head={}, \
+                     reusable_upto={}, capacity={}) and cannot admit its {needed} B recovery pad \
+                     yet — the alignment is DEFERRED to the pre-claim's guarded checkpoint \
+                     cycles, which free ring space without a ring write (the mount-refusal \
+                     wedge face, P2 2026-07-26 §9)",
+                    path.display(),
+                    core.head(),
+                    core.reusable_upto(),
+                    core.geometry().logical_len(),
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The rings THIS mount writes: the fixed ring on a writer (a joined
+    /// appender's ring 0 is a projection it never writes) and every own
+    /// region's — deduplicated, since region 0's ring IS the fixed ring.
+    fn own_writable_rings(&self) -> Vec<Arc<JournalRing>> {
+        let mut out: Vec<Arc<JournalRing>> = Vec::new();
+        if !self.is_joined_appender() {
+            out.push(Arc::clone(&self.ring));
+        }
+        if let Some(set) = self.appenders.as_ref() {
+            for r in set.own_regions() {
+                let ring = r.ring.load_full();
+                if !out.iter().any(|have| Arc::ptr_eq(have, &ring)) {
+                    out.push(ring);
+                }
+            }
+        }
+        out
+    }
+
+    /// Land every head alignment the open DEFERRED
+    /// ([`Self::align_ring_head_or_defer`], review round 1, Issue 3): try
+    /// each own ring's pad; while one is still refused, run the pre-
+    /// claim's guarded checkpoint cycles under the SMO mutex — each
+    /// flushes the replayed dirt into heap extents, writes the ledger (or
+    /// the page) and advances the ring's `reusable_upto`; a ring within
+    /// `max_pad` of full admits no SMO record either, so the cycle makes
+    /// no ring write ahead of the pad — and retry the pad after each,
+    /// bounded like the preflight (`COVER_CYCLES_MAX`; a tail that does
+    /// not move is the wedge class, loud with its numbers). A no-op — no
+    /// mutex, no cycle — when every own head already stands aligned,
+    /// which is every open but this face's.
+    pub(in crate::meta_backend::kv) async fn align_own_rings_for_writing(
+        &self,
+    ) -> std::result::Result<(), KvError> {
+        use super::checkpoint::COVER_CYCLES_MAX;
+        async fn try_align(
+            rings: Vec<Arc<JournalRing>>,
+        ) -> std::result::Result<Vec<Arc<JournalRing>>, KvError> {
+            let mut pending = Vec::new();
+            for ring in rings {
+                match ring.align_head_for_writing().await {
+                    Ok(_) => {}
+                    Err(KvError::JournalReserveExhausted { .. }) => pending.push(ring),
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(pending)
+        }
+        let mut pending = try_align(self.own_writable_rings()).await?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let describe = |rings: &[Arc<JournalRing>]| -> String {
+            rings
+                .iter()
+                .map(|r| {
+                    let c = r.core();
+                    format!(
+                        "{} (head={}, reusable_upto={}, capacity={})",
+                        r.path().display(),
+                        c.head(),
+                        c.reusable_upto(),
+                        c.geometry().logical_len()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        log::warn!(
+            "meta volume {}: {} ring(s) recovered within max_pad of full — running guarded \
+             checkpoint cycles until the recovery pad admits: {}",
+            self.path.display(),
+            pending.len(),
+            describe(&pending)
+        );
+        let mut smo = self.smo.lock().await;
+        for cycle in 0..COVER_CYCLES_MAX {
+            self.checkpoint_cycle(&mut smo, true).await?;
+            pending = try_align(pending).await?;
+            if pending.is_empty() {
+                log::info!(
+                    "meta volume {}: every deferred head alignment landed after {} guarded \
+                     cycle(s)",
+                    self.path.display(),
+                    cycle + 1
+                );
+                return Ok(());
+            }
+        }
+        Err(KvError::Corrupt(format!(
+            "{}: the recovered ring did not admit its recovery pad within {COVER_CYCLES_MAX} \
+             barriered cycles — the durable tail is wedged below the replay window: {}",
+            self.path.display(),
+            describe(&pending)
         )))
     }
 
@@ -20405,7 +20549,7 @@ impl KvMetaBackend {
                 );
                 // PR 13i: this ring is OURS (own residue or our fresh join)
                 // — its first reservation begins on a sector boundary.
-                ring.align_head_for_writing().await?;
+                Self::align_ring_head_or_defer(path, &ring).await?;
                 // A joined appender's FRESH join stands its ring up here
                 // too (the manager wrote the page Live, its window empty):
                 // nothing died, nothing is recovered — only a REJOIN over a

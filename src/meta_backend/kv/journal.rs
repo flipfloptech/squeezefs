@@ -1017,6 +1017,11 @@ impl JournalRing {
         &self.core
     }
 
+    /// The device path this ring writes.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Journal entries written into THIS ring since open — the per-volume
     /// attribution instrument (`meta_kv_journal_entries_per_volume`; see
     /// the field-conviction note on the struct field).
@@ -1401,8 +1406,13 @@ impl JournalRing {
     /// reservation open, the sector's prefix the durable image just
     /// replayed (single writer), read fresh off the device and rewritten
     /// byte-identical beside the pad. Answers the pad written (0 = the
-    /// head was aligned; every unpadded ring). A reader never calls this
-    /// — it writes nothing.
+    /// head was aligned; every unpadded ring), or
+    /// [`KvError::JournalReserveExhausted`] when the ring stands within
+    /// `max_pad` of full and admits nothing — the caller DEFERS the pad
+    /// to the guarded checkpoint cycles that move the tail
+    /// (`KvMetaBackend::align_own_rings_for_writing`, review round 1,
+    /// Issue 3); nothing is written on that answer. A reader never calls
+    /// this — it writes nothing.
     pub async fn align_head_for_writing(&self) -> Result<u64, KvError> {
         let geo = *self.core.geometry();
         let head = self.core.head();

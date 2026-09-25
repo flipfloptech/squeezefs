@@ -239,7 +239,9 @@ on-disk shape — every unit but one was already 4 KiB-granular; the journal
 ring pads each commit window's end to the next sector boundary with a
 checksummed PAD entry replay walks as a chain link. **What changes for an
 operator:** nothing on disk (a ring written by an older binary replays
-verbatim; the writer aligns its head with one recovery pad); `.stats` gains
+verbatim; the writer aligns its head with one recovery pad — deferred to the
+pre-claim's guarded checkpoint cycles when the recovered ring is too full to
+admit it, so no ring state refuses the open for ever); `.stats` gains
 the `meta_io` object (`meta_io_direct_paths`, `meta_io_buffered_fallback`
 — must stay 0 on any block device, `meta_io_unaligned_refusals` — must stay
 0, `meta_io_bounce_bytes`, `meta_io_read_widened`) and

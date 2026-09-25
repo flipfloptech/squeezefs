@@ -223,7 +223,11 @@ MW_MOUNT_EXTRA="--allow-other"             # NO --interception on MW mounts
 # posture = registrant`): the node's nvme-cli host identity
 # (/etc/nvme/hostnqn + hostid) is the registrant — assemble-sym asserts the
 # identities DISTINCT across the client nodes and regenerates a duplicate (a
-# baked AMI clones the file onto every node). No SQUEEZEFS_FLEET_SHARE (one
+# baked AMI clones the file onto every node), and BEFORE them /etc/machine-id
+# (the daemon's node token — src/writer_scope.rs — is derived from it: the
+# 2026-09-24 cloud row's first assemble failed at the mounts because every
+# joiner carried the manager's cloned `(node_token, mount_slot)`; a clone is
+# regenerated with systemd-machine-id-setup). No SQUEEZEFS_FLEET_SHARE (one
 # daemon per node owns its machine — the point of the venue). The set is
 # formatted CACHE-LESS (no --disk-cache-paths — tests/mw_fleet.sh's shape
 # for the box and local fleets): every beyond-inline file is a whole
@@ -322,7 +326,9 @@ subcommands:
              DIVERGING at the format into `format --symmetric` and at the
              mount into ONE symmetric writer PER CLIENT NODE: the MANAGER on
              client0, a JOINED writer on client1..N_CLIENT-1 (the join
-             ladder over the real wire — each node its OWN registrant), an
+             ladder over the real wire — each node its OWN registrant, its
+             /etc/machine-id and nvme host identity asserted DISTINCT and a
+             baked AMI's clone regenerated), an
              optional `--read-only` TOKEN reader on client0; posture gates
              read from every node's .stats (mount_posture writer,
              symmetric_join non-null, manager_lease held / joined_appender_id,
@@ -1623,9 +1629,10 @@ EOS
 # client1..N-1 through the join ladder (design-symmetric-metadata §7.3; PR
 # 12b's N-daemon posture on N real hosts), an optional `--read-only` TOKEN
 # reader on client0. Every node is its own registrant (the REMOTE posture):
-# its nvme-cli host identity, asserted DISTINCT across the client nodes.
-# Idempotent: re-running reaps every mount and rebuilds from scratch
-# (fresh format — data is destroyed).
+# its nvme-cli host identity, asserted DISTINCT across the client nodes —
+# and before it its /etc/machine-id, the daemon's node token's source
+# (a baked AMI's clone is regenerated). Idempotent: re-running reaps every
+# mount and rebuilds from scratch (fresh format — data is destroyed).
 # ---------------------------------------------------------------------------
 SYM_READER_MNT="$MOUNTPOINT-ro"
 
@@ -1943,7 +1950,7 @@ cmd_assemble_sym() {
   confirm "assemble-sym REFORMATS the cluster volumes (any prior benchmark data on $CID is destroyed) with format --symmetric and mounts ONE symmetric writer per client node ($n nodes: the manager on ${clients[0]}, joined writers on ${clients[*]:1})$reader_word."
 
   local c ip
-  log "assemble-sym 1/8: client kernel floor — FUSE-over-io_uring (v6.14+) on EVERY client node"
+  log "assemble-sym 1/9: client kernel floor — FUSE-over-io_uring (v6.14+) on EVERY client node"
   for c in "${clients[@]}"; do
     remote "$(node_pub "$c")" NODE="$c" <<'EOS'
 set -euo pipefail
@@ -1956,13 +1963,75 @@ echo "$NODE kernel $(uname -r): fuse.enable_uring present"
 EOS
   done
 
-  log "assemble-sym 2/8: client prologue on EVERY client node — unmount + disconnect survivors (idempotency)"
+  log "assemble-sym 2/9: client prologue on EVERY client node — unmount + disconnect survivors (idempotency)"
   for c in "${clients[@]}"; do
     remote "$(node_pub "$c")" SQZ="$REMOTE_DIR/squeezefs" MNT="$MOUNTPOINT" NQN_PREFIX="$NQN_PREFIX" \
       <<<"$CLIENT_PROLOGUE_SCRIPT"
   done
 
-  log "assemble-sym 3/8: host identities — every client node its OWN registrant (nvme-cli hostnqn AND hostid, each DISTINCT across the fleet)"
+  log "assemble-sym 3/9: node identities — /etc/machine-id DISTINCT across the client nodes (the daemon's node token is derived from it)"
+  # The daemon's node token — half of the KD-MW-2 `(node_token, mount_slot)`
+  # identity every appender page, claim-set entry and membership record
+  # carries — is derived from /etc/machine-id (src/writer_scope.rs). A
+  # baked AMI clones the file onto every node, so every joiner presented
+  # the MANAGER's `(node_token, mount_slot)` and the join ladder read its
+  # own Live page as a dead predecessor's (the 2026-09-24 cloud row's
+  # assemble attempt 1, failed at the mounts). The clone is regenerated
+  # here — the file truncated, `systemd-machine-id-setup` minting a fresh
+  # id — then re-read and re-asserted; a duplicate STILL standing after
+  # regeneration dies. Runs after the prologue (no daemon is up) and
+  # before any identity-bearing step. A dbus copy that is a regular file
+  # (not the usual symlink) is refreshed with it so the two never diverge.
+  local -A seen_mid=()
+  local mid
+  for c in "${clients[@]}"; do
+    ip="$(node_pub "$c")"
+    mid=""
+    if $DRY_RUN; then
+      remote "$ip" NODE="$c" REGEN=0 <<'EOS'
+set -euo pipefail
+if [ "$REGEN" = 1 ]; then
+  : >/etc/machine-id
+  systemd-machine-id-setup
+  if [ -f /var/lib/dbus/machine-id ] && [ ! -L /var/lib/dbus/machine-id ]; then
+    cp /etc/machine-id /var/lib/dbus/machine-id
+  fi
+fi
+[ -s /etc/machine-id ] || { echo "FATAL[$NODE]: /etc/machine-id is missing or empty" >&2; exit 1; }
+echo "MACHINE_ID $(tr -d '[:space:]' </etc/machine-id)"
+EOS
+      mid="dryrun-machine-id-$c"
+    else
+      local out try
+      for try in 1 2; do
+        out="$(remote "$ip" NODE="$c" REGEN="$([ "$try" = 2 ] && echo 1 || echo 0)" <<'EOS'
+set -euo pipefail
+if [ "$REGEN" = 1 ]; then
+  : >/etc/machine-id
+  systemd-machine-id-setup
+  if [ -f /var/lib/dbus/machine-id ] && [ ! -L /var/lib/dbus/machine-id ]; then
+    cp /etc/machine-id /var/lib/dbus/machine-id
+  fi
+fi
+[ -s /etc/machine-id ] || { echo "FATAL[$NODE]: /etc/machine-id is missing or empty" >&2; exit 1; }
+echo "MACHINE_ID $(tr -d '[:space:]' </etc/machine-id)"
+EOS
+)"
+        mid="$(awk '/^MACHINE_ID /{print $2}' <<<"$out")"
+        [[ "$mid" =~ ^[0-9a-f]{32}$ ]] || die "$c: could not read a well-formed /etc/machine-id (got '${mid:-nothing}')"
+        if [ -n "${seen_mid[$mid]:-}" ]; then
+          [ "$try" = 1 ] || die "$c: /etc/machine-id $mid duplicates ${seen_mid[$mid]}'s — STILL after regeneration (the daemon's node token would alias; every joiner would carry the manager's identity)"
+          warn "$c: /etc/machine-id $mid duplicates ${seen_mid[$mid]}'s (a baked AMI's clone); regenerating with systemd-machine-id-setup"
+          continue
+        fi
+        break
+      done
+    fi
+    seen_mid[$mid]="$c"
+    echo "  $c: machine-id $mid"
+  done
+
+  log "assemble-sym 4/9: host identities — every client node its OWN registrant (nvme-cli hostnqn AND hostid, each DISTINCT across the fleet)"
   # A baked AMI clones /etc/nvme/hostnqn + hostid onto every node; two
   # nodes with one identity ALIAS at the target (one registrant, the
   # fence blind to which host wrote). nvmet keys a PR registrant by the
@@ -2017,11 +2086,11 @@ EOS
     echo "  $c: hostnqn $nqn hostid $hid"
   done
 
-  log "assemble-sym 4/8: storage nodes — instance-store share + nvmet PR assert (resv_enable=1; v6.13+ floor)"
+  log "assemble-sym 5/9: storage nodes — instance-store share + nvmet PR assert (resv_enable=1; v6.13+ floor)"
   share_storage_nodes
   assert_storage_pr
 
-  log "assemble-sym 5/8: ${clients[0]} — single-path connect, PR verify, format --symmetric CACHE-LESS (no --disk-cache-paths: the box/local fleets' shape; the manager's node formats, nobody mounts yet)"
+  log "assemble-sym 6/9: ${clients[0]} — single-path connect, PR verify, format --symmetric CACHE-LESS (no --disk-cache-paths: the box/local fleets' shape; the manager's node formats, nobody mounts yet)"
   remote "$(node_pub "${clients[0]}")" \
     SQZ="$REMOTE_DIR/squeezefs" MNT="$MOUNTPOINT" CACHE="$CACHE_DIR" \
     META_SPECS="$SHARED_META_SPECS" DATA_SPECS="$SHARED_DATA_SPECS" \
@@ -2029,7 +2098,7 @@ EOS
     FORMAT_EXTRA_STR="--symmetric" FORMAT_CACHE=0 MW_PR_VERIFY=1 MW_SKIP_MOUNT=1 \
     <<<"$CLIENT_FABRIC_SCRIPT"
 
-  log "assemble-sym 6/8: ${clients[*]:1} — single-path connect + PR verify (no format: a joining node)"
+  log "assemble-sym 7/9: ${clients[*]:1} — single-path connect + PR verify (no format: a joining node)"
   for c in "${clients[@]:1}"; do
     echo "-- $c"
     remote "$(node_pub "$c")" \
@@ -2040,7 +2109,7 @@ EOS
       <<<"$CLIENT_FABRIC_SCRIPT"
   done
 
-  log "assemble-sym 7/8: mount the symmetric fleet — the MANAGER on ${clients[0]}, then a JOINED writer per node (${clients[*]:1})${reader_word:+, then$reader_word}"
+  log "assemble-sym 8/9: mount the symmetric fleet — the MANAGER on ${clients[0]}, then a JOINED writer per node (${clients[*]:1})${reader_word:+, then$reader_word}"
   local manager_out
   manager_out="$(sym_mount_node "${clients[0]}" manager)"
   echo "$manager_out"
@@ -2079,7 +2148,7 @@ echo \"  fleet gates: appenders_known=\$(stat_first \"\$MNT\" appenders_known) m
   # review round 2, Issue 14.) The manager's `pr_registrants_per_namespace`
   # — the daemon's own REGCTL read, refreshed on the guard's 10 s heartbeat
   # for the METADATA namespaces — is printed beside it as the record.
-  log "assemble-sym 7b/8: the device's registrant count — nvme resv-report -e on every namespace of the set reads $n distinct Host IDs (the manager + $((n - 1)) joined writers)"
+  log "assemble-sym 8b/9: the device's registrant count — nvme resv-report -e on every namespace of the set reads $n distinct Host IDs (the manager + $((n - 1)) joined writers)"
   remote "$(node_pub "${clients[0]}")" N="$n" MNT="$MOUNTPOINT" <<<"$SYM_STAT_HELPERS
 die() { echo \"FATAL: \$*\" >&2; exit 1; }
 set -euo pipefail
@@ -2106,7 +2175,7 @@ print(len({str(e.get(\"hostid\", \"\")).lower() for e in regs if str(e.get(\"hos
 done
 echo \"  manager pr_registrants_per_namespace (the daemon's REGCTL read, 10 s heartbeat on the metadata namespaces): \$(stat_field \"\$MNT\" pr_registrants_per_namespace)\""
 
-  log "assemble-sym 8/8: build_commit verification ritual on every node"
+  log "assemble-sym 9/9: build_commit verification ritual on every node"
   for c in "${clients[@]}"; do
     local mnts="$MOUNTPOINT"
     [ "$c" = "${clients[0]}" ] && [ "$SYM_TOKEN_READER" = "1" ] && mnts="$MOUNTPOINT,$SYM_READER_MNT"

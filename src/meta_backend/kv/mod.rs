@@ -1157,6 +1157,113 @@ pub enum KvError {
     HandoverDeferred(String),
 }
 
+/// A per-class clone for the conveyor's batch-failure fan-out (PR 13i
+/// F-C3 — the cloud row's `mkdir` → `EINVAL`): one pass failure is
+/// answered to EVERY member of the batch, and each member's class — and
+/// so its errno at the syscall — must be the pass's own. The retired
+/// `clone_kv_error` kept `Io` and `NoSpace` and flattened every other
+/// class into `Corrupt(other.to_string())`, so a joiner's `GrantExhausted`
+/// (EAGAIN, the FUSE layer's retry ladder) reached `mkdir(2)` as an
+/// invalid argument; `SlotBusy`, `GrantDeferred`, `Busy`,
+/// `ManagerUnreachable`, `LeaseDeferred` and `HandoverDeferred` lost
+/// their class the same way. The match is exhaustive ON PURPOSE — a new
+/// class fails to compile here rather than fall into a lossy arm. `Io`
+/// clones through [`crate::error::SqueezefsError`]'s own errno-preserving
+/// clone.
+impl Clone for KvError {
+    fn clone(&self) -> Self {
+        match self {
+            KvError::DentryChainOverflow => KvError::DentryChainOverflow,
+            KvError::ChecksumMismatch { stored, computed } => KvError::ChecksumMismatch {
+                stored: *stored,
+                computed: *computed,
+            },
+            KvError::Corrupt(m) => KvError::Corrupt(m.clone()),
+            KvError::InvalidReaddirCookie(c) => KvError::InvalidReaddirCookie(*c),
+            KvError::NameTooLong { len } => KvError::NameTooLong { len: *len },
+            KvError::ValueTooLarge { len, cap } => KvError::ValueTooLarge {
+                len: *len,
+                cap: *cap,
+            },
+            KvError::FreezeRefused { node_addr, refusal } => KvError::FreezeRefused {
+                node_addr: *node_addr,
+                refusal: *refusal,
+            },
+            KvError::NodeFull { needed, available } => KvError::NodeFull {
+                needed: *needed,
+                available: *available,
+            },
+            KvError::CheckpointCoveredBsetAfterTear {
+                node_addr,
+                bset_offset,
+                horizon,
+                durable_tail,
+            } => KvError::CheckpointCoveredBsetAfterTear {
+                node_addr: *node_addr,
+                bset_offset: *bset_offset,
+                horizon: *horizon,
+                durable_tail: *durable_tail,
+            },
+            KvError::EntryTooLarge { len, cap } => KvError::EntryTooLarge {
+                len: *len,
+                cap: *cap,
+            },
+            KvError::NoSpace { free, reserve } => KvError::NoSpace {
+                free: *free,
+                reserve: *reserve,
+            },
+            KvError::GrantExhausted {
+                appender,
+                unclaimed,
+                needed,
+            } => KvError::GrantExhausted {
+                appender: *appender,
+                unclaimed: *unclaimed,
+                needed: *needed,
+            },
+            KvError::SlotBusy { slot, holder, g } => KvError::SlotBusy {
+                slot: *slot,
+                holder: *holder,
+                g: *g,
+            },
+            KvError::RotorAtCap {
+                appender,
+                held,
+                want,
+                cap,
+            } => KvError::RotorAtCap {
+                appender: *appender,
+                held: *held,
+                want: *want,
+                cap: *cap,
+            },
+            KvError::GrantDeferred {
+                slot,
+                cycles,
+                frontier,
+                tail_start,
+                tail,
+            } => KvError::GrantDeferred {
+                slot: *slot,
+                cycles: *cycles,
+                frontier: *frontier,
+                tail_start: *tail_start,
+                tail: *tail,
+            },
+            KvError::Rejected(m) => KvError::Rejected(m.clone()),
+            KvError::JournalReserveExhausted { needed } => {
+                KvError::JournalReserveExhausted { needed: *needed }
+            }
+            KvError::PendingFreeFull { pending } => KvError::PendingFreeFull { pending: *pending },
+            KvError::Io(inner) => KvError::Io(inner.clone()),
+            KvError::Busy(m) => KvError::Busy(m.clone()),
+            KvError::ManagerUnreachable(m) => KvError::ManagerUnreachable(m.clone()),
+            KvError::LeaseDeferred(m) => KvError::LeaseDeferred(m.clone()),
+            KvError::HandoverDeferred(m) => KvError::HandoverDeferred(m.clone()),
+        }
+    }
+}
+
 /// Map KV-layer errors onto the crate error surface (mount / CLI / trait
 /// callers): device I/O passes through untouched; the refusals that owe
 /// userspace a specific errno carry it **structurally** (POSIX-6 — the

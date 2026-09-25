@@ -23241,9 +23241,9 @@ impl KvMetaBackend {
                     continue;
                 }
                 let outcome = match (&verdict, &hole_err, &barrier_out) {
-                    (Err(e), _, _) => Err(self.clone_kv_error(e)),
+                    (Err(e), _, _) => Err(e.clone()),
                     (Ok(()), Some(msg), _) => Err(KvError::Io(self.eio(msg))),
-                    (Ok(()), None, Err(e)) => Err(self.clone_kv_error(e)),
+                    (Ok(()), None, Err(e)) => Err(e.clone()),
                     (Ok(()), None, Ok(())) => {
                         // D4.a: one successful commit_tx = one journal
                         // entry against the tx's construction site.
@@ -23695,35 +23695,13 @@ impl KvMetaBackend {
 
     /// Fail every remaining batch member with (a clone of) one error —
     /// the batch-as-a-unit failure paths (pre-reserve). The outcomes are
-    /// terminal: nothing was reserved or applied for these members.
+    /// terminal: nothing was reserved or applied for these members. The
+    /// clone is CLASS-preserving (`KvError`'s own `Clone`, PR 13i F-C3):
+    /// a `GrantExhausted` pass answers every member EAGAIN, never the
+    /// `Corrupt` / EINVAL the retired per-class flattening produced.
     fn fail_batch(&self, s: &mut PassSentinel<'_>, e: &KvError) {
         for q in std::mem::take(&mut s.entries) {
-            let err = self.clone_kv_error(e);
-            s.outcomes.push((q, Err(err)));
-        }
-    }
-
-    /// Per-member error instances for fan-out (`KvError` is not `Clone`;
-    /// errno fidelity is preserved for the `Io` class, message fidelity
-    /// for the rest — these are terminal error paths, never hot).
-    fn clone_kv_error(&self, e: &KvError) -> KvError {
-        match e {
-            KvError::Io(crate::error::SqueezefsError::Io(ioe)) => {
-                KvError::Io(crate::error::SqueezefsError::Io(match ioe.raw_os_error() {
-                    Some(raw) => std::io::Error::from_raw_os_error(raw),
-                    None => std::io::Error::new(ioe.kind(), ioe.to_string()),
-                }))
-            }
-            KvError::Io(other) => KvError::Io(crate::error::SqueezefsError::Io(
-                std::io::Error::other(other.to_string()),
-            )),
-            // §4.7: the no-space class owes userspace ENOSPC (POSIX-6) —
-            // flattening it to `Corrupt` read as EINVAL.
-            KvError::NoSpace { free, reserve } => KvError::NoSpace {
-                free: *free,
-                reserve: *reserve,
-            },
-            other => KvError::Corrupt(other.to_string()),
+            s.outcomes.push((q, Err(e.clone())));
         }
     }
 

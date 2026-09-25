@@ -460,6 +460,132 @@ fn kv_io_passes_through_and_the_rest_stay_einval() {
     }
 }
 
+/// **PR 13i F-C3 — the conveyor's fan-out clone keeps EVERY class.** One
+/// pass failure is answered to every member of a batch through
+/// `KvError::clone()`; each clone must present the SAME errno (and the
+/// same typed `RefusalClass`) as the original — the retired
+/// `clone_kv_error` flattened every class but `Io`/`NoSpace` into
+/// `Corrupt`, so `GrantExhausted` read EINVAL at `mkdir(2)` on the cloud
+/// row. One instance of every `KvError` class; `SlotBusy`'s clone must
+/// still mint `RefusalClass::SlotMoved` with its slot and holder.
+#[test]
+fn every_kv_error_class_survives_the_fan_out_clone_with_its_errno() {
+    let one_of_each: Vec<KvError> = vec![
+        KvError::DentryChainOverflow,
+        KvError::ChecksumMismatch {
+            stored: 1,
+            computed: 2,
+        },
+        KvError::Corrupt("bad magic".into()),
+        KvError::InvalidReaddirCookie(0xdead),
+        KvError::NameTooLong { len: 300 },
+        KvError::ValueTooLarge {
+            len: 70_000,
+            cap: 65_536,
+        },
+        KvError::FreezeRefused {
+            node_addr: 0x1000,
+            refusal: squeezefs::meta_backend::kv::node_state_core::FreezeRefused::NotDirty,
+        },
+        KvError::NodeFull {
+            needed: 1,
+            available: 0,
+        },
+        KvError::CheckpointCoveredBsetAfterTear {
+            node_addr: 0x2000,
+            bset_offset: 64,
+            horizon: 7,
+            durable_tail: 9,
+        },
+        KvError::EntryTooLarge {
+            len: 1 << 20,
+            cap: 1 << 17,
+        },
+        KvError::NoSpace {
+            free: 3,
+            reserve: 8,
+        },
+        KvError::GrantExhausted {
+            appender: 1,
+            unclaimed: 0,
+            needed: 1,
+        },
+        KvError::SlotBusy {
+            slot: 4,
+            holder: 7,
+            g: 2,
+        },
+        KvError::RotorAtCap {
+            appender: 1,
+            held: 128,
+            want: 1,
+            cap: 128,
+        },
+        KvError::GrantDeferred {
+            slot: 4,
+            cycles: 64,
+            frontier: 10,
+            tail_start: 1,
+            tail: 5,
+        },
+        KvError::Rejected("a run outside the volume".into()),
+        KvError::JournalReserveExhausted { needed: 4096 },
+        KvError::PendingFreeFull { pending: 9 },
+        KvError::Io(SqueezefsError::Io(io::Error::from_raw_os_error(libc::EIO))),
+        KvError::Io(SqueezefsError::Io(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "staging full",
+        ))),
+        KvError::Io(SqueezefsError::refused(libc::EDQUOT, "quota")),
+        KvError::Busy("another writer holds the volume".into()),
+        KvError::ManagerUnreachable("dial failed".into()),
+        KvError::LeaseDeferred("home not recovered".into()),
+        KvError::HandoverDeferred("live custody".into()),
+    ];
+    for e in one_of_each {
+        let cloned = e.clone();
+        assert_eq!(
+            std::mem::discriminant(&cloned),
+            std::mem::discriminant(&e),
+            "the clone keeps the class: {e:?} → {cloned:?}"
+        );
+        assert_eq!(
+            cloned.to_string(),
+            e.to_string(),
+            "the clone keeps the words"
+        );
+        let (orig, dup): (SqueezefsError, SqueezefsError) = (e.into(), cloned.into());
+        assert_eq!(
+            dup.to_errno(),
+            orig.to_errno(),
+            "the clone presents the original's errno: {orig} vs {dup}"
+        );
+        assert_eq!(
+            dup.refusal_class(),
+            orig.refusal_class(),
+            "the clone keeps the typed retry class: {orig} vs {dup}"
+        );
+    }
+    // The cloud row's shape, spelled out: the grant's retry class is
+    // EAGAIN on both sides, and the foreign-slot door's clone still
+    // classifies as the slot-moved re-dispatch.
+    let grant = KvError::GrantExhausted {
+        appender: 1,
+        unclaimed: 0,
+        needed: 1,
+    };
+    assert_eq!(SqueezefsError::from(grant.clone()).to_errno(), libc::EAGAIN);
+    let busy = KvError::SlotBusy {
+        slot: 4,
+        holder: 7,
+        g: 2,
+    };
+    assert_eq!(
+        SqueezefsError::from(busy.clone()).refusal_class(),
+        Some(squeezefs::error::RefusalClass::SlotMoved { slot: 4, holder: 7 })
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 5. Producer side — the real backend still delivers EEXIST / EMLINK.
 // ---------------------------------------------------------------------------

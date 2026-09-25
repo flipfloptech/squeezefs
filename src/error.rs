@@ -1,7 +1,7 @@
 use std::io;
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Copy, Error)]
 #[error("Mock Metadata Error")]
 pub struct MockRedisError;
 
@@ -184,6 +184,57 @@ pub enum SqueezefsError {
 
     #[error("Timeout error")]
     Timeout,
+}
+
+/// A per-class clone for fan-out (PR 13i F-C3): the conveyor answers one
+/// batch failure to EVERY member, and each member's errno must be the
+/// class's own. `io::Error` is not `Clone`, so the `Io` arm is REBUILT —
+/// the raw OS errno verbatim when there is one, else the kind and the
+/// message — which is exactly what `to_errno` reads; every other arm
+/// clones its payload. The match is exhaustive on purpose: a new variant
+/// fails to compile here rather than falling into a lossy arm.
+impl Clone for SqueezefsError {
+    fn clone(&self) -> Self {
+        match self {
+            SqueezefsError::Io(e) => SqueezefsError::Io(match e.raw_os_error() {
+                Some(raw) => io::Error::from_raw_os_error(raw),
+                None => io::Error::new(e.kind(), e.to_string()),
+            }),
+            SqueezefsError::Redis(e) => SqueezefsError::Redis(*e),
+            SqueezefsError::LockFailed { reason } => SqueezefsError::LockFailed {
+                reason: reason.clone(),
+            },
+            SqueezefsError::FencingTokenExpired { token, expected } => {
+                SqueezefsError::FencingTokenExpired {
+                    token: *token,
+                    expected: *expected,
+                }
+            }
+            SqueezefsError::InvalidOperation(m) => SqueezefsError::InvalidOperation(m.clone()),
+            SqueezefsError::Refused { errno, msg } => SqueezefsError::Refused {
+                errno: *errno,
+                msg: msg.clone(),
+            },
+            SqueezefsError::WriterGuardFenced => SqueezefsError::WriterGuardFenced,
+            SqueezefsError::IndirectMapFormat { detail } => SqueezefsError::IndirectMapFormat {
+                detail: detail.clone(),
+            },
+            SqueezefsError::MembershipLeaseNotCustody(m) => {
+                SqueezefsError::MembershipLeaseNotCustody(m.clone())
+            }
+            SqueezefsError::PublishFailure { class, msg } => SqueezefsError::PublishFailure {
+                class: *class,
+                msg: msg.clone(),
+            },
+            SqueezefsError::Retryable { class, msg } => SqueezefsError::Retryable {
+                class: *class,
+                msg: msg.clone(),
+            },
+            SqueezefsError::GdsError(m) => SqueezefsError::GdsError(m.clone()),
+            SqueezefsError::CacheOverflow => SqueezefsError::CacheOverflow,
+            SqueezefsError::Timeout => SqueezefsError::Timeout,
+        }
+    }
 }
 
 impl SqueezefsError {

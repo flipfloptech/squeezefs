@@ -2652,6 +2652,43 @@ per set `scale-r1/symscale-*/` — the table, `symscale-faces.txt`,
 `scale-r1/daemon-logs/m*.log`), pulled to
 `/tmp/grok-justin/box-13g/nw/` with `REDUCED.txt`.
 
+### 3.10 The cloud row (PR 15 Phase B) — run 1, 2026-09-24: **LAUNCHED with the owner's expressed approval, ASSEMBLED on 8 real nodes after one failed attempt, FAILED on its FIRST row (gate 2 `sym-tarx`, arm sym-1 — the joined writer's `mkdir` under the root answered `EINVAL`) with THREE product findings, TORN DOWN at 26.5 min ≈ $5.2; the row is INCOMPLETE and UNMEASURED — no per-node number exists, the pulled evidence is LOST with the dev machine, and the re-run needs a NEW expressed owner approval after PR 13i lands**
+
+**The approved shape (the owner's approval recorded in the run log, `9fa066b0`, 2026-09-24 14:45 wall — "Owner APPROVED the PR 15 cloud launch: S2 + 8 oss (17 × i4i.2xlarge on-demand, ≈ $15–17, guard 4 h) — launching on `aad50a1f`'s artifact"):** `PRESET=mw SYMMETRIC=1 N_MDS=1 N_OSS=8 N_CLIENT=8 MAX_CLUSTER_HOURS=4` — **17 × i4i.2xlarge, us-east-1a, on-demand**, a cluster placement group: 1 metadata storage node, 8 data storage nodes (one 1,875 GB instance-store namespace each over nvmet-tcp, `resv_enable=1`), 8 client nodes = **one symmetric writer per node** (the MANAGER on `client0`, a JOINED writer on `client1..client7` through the join ladder over the real wire, a `--read-only` token reader on `client0`), the set formatted `--symmetric` CACHE-LESS. Cluster `sqzbench-20260924-150215`. **The owner rule stated 2026-09-24 21:20 UTC, after this run:** nothing runs on AWS until PR 13i has landed, and any later launch needs the owner's expressed permission AGAIN for that specific run — the AGENTS §Benchmarks mandate restated with the landing as its precondition; this branch touched `aws` only under `--dry-run`.
+
+**Timeline (UTC):**
+
+| instant | event |
+|---|---|
+| 19:02:14 | `launch` — 17 instances delivered, SSH-reachable, the deadline guard armed at +4 h |
+| ≈ 19:12 | `deploy` — the `aad50a1f` `release` artifact (`task build:ubuntu2604`) sha256-verified on every node; on a fresh node Ubuntu's unattended apt fired during the session (≈ 3 min of CPU on a writer node; its `unattended-upgrades` restarted `sshd`, which killed the driver's preflight once) → fixed on this branch: `deploy` stops `apt-daily*.timer` and masks `unattended-upgrades` on every node |
+| — | `assemble-sym` **attempt 1 — FAILED at the mounts** (step 7/8 of the rig as it then stood; step 8/9 since this branch's renumbering): the baked AMI had cloned `/etc/machine-id` onto every node, and the daemon's node token is derived from it (`src/writer_scope.rs`) — so every joiner presented the MANAGER's `(node_token, mount_slot)` (a JOINED open whose identity equals a `Live` page it did not write) and the mounts failed → fixed on this branch: a new step 3/9 asserts `/etc/machine-id` DISTINCT across the client nodes and regenerates a clone (`systemd-machine-id-setup`) before any identity-bearing step |
+| — | `assemble-sym` **attempt 2 — ASSEMBLED 8 real nodes** after the clones were regenerated live: at the manager `appenders_known 8` (the directory's Live-page count), `membership_writers 7`; the device's own word `nvme resv-report -e` **8 / 8 distinct registrant Host IDs on every namespace** (each REMOTE joiner its own registrant, `joined_registrant_posture registrant`); the token reader up; `build_commit` = `aad50a1f` on every mount. Attempt 2's `format` met attempt 1's superblock → fixed on this branch: the fabric script's `format` passes `--force` (the live-client refusal kept) |
+| ≈ 19:26 | `bench-sym` row 1 — **gate 2 `sym-tarx`, arm `sym-1`: FAILED.** The joined writer m60 (`client1`)'s `mkdir -p <mount>/s8a-sym-1` under the UNSTRIPED root answered **`EINVAL`**; the driver died on it (evidence before verdict: the per-node `.stats` and daemon logs were pulled) |
+| 19:28:44 | `teardown` — every instance terminated, SG / launch template / placement group deleted, the tag-scoped sweep clean; **nothing billing, verified ×3** (the sweep, `status`, a tag-key `describe-instances` across the region) |
+
+**Cost:** ≈ 26.5 min × 17 × ≈ $0.686/hr ≈ **$5.2** (the rig's own estimate at that shape UNDER-COUNTED — its typed-YES line priced `3 + N_CLIENT` = 11 nodes at ≈ $7.55/hr against the 17 launched → fixed on this branch: the symmetric shape's `EST_CLUSTER_HOURLY` prices every node, ≈ $11.66/hr here). No spot interruption; on-demand throughout.
+
+**Venue block:** AMI **`ami-0c40b68421a1fcd8e`** (the `squeezefs-bench-base=mw` baked base — Ubuntu 26.04 with the mw client set preinstalled; the clone of `/etc/machine-id` is that bake's), kernel **`7.0.0-1011-aws`** on every node (FUSE-over-io_uring present, nvmet `resv_enable` present — both floors probed by the rig), build **`aad50a1f` `release`** on every node (`squeezefs --version` ≡ every mount's `build_commit`), instance-store NVMe over nvmet-tcp on the private IPs, single NIC, **node-to-node RTT 0.168 / 0.179 / 0.190 ms** (the driver's `ping` from the writer node to the manager's fabric address — the box's netem 250 µs replaced by a real fabric). Instrument: `tests/cloud_bench_cluster.sh` @ the lost branch's head (this branch is its redo) + `tests/cloud_sym_rows.sh` (`--venue=cloud`, `--size-to-rt=auto`, `--rt=60`).
+
+**What failed, read off the pulled `.stats` and logs (the agent's contemporaneous summary — the numbers below are the only ones that survive):**
+
+* **m60's daemon log** carried, at the `mkdir`, **`appender 1's extent grant is exhausted (0 unclaimed, 1 needed) and the manager has not refilled it — retry (EAGAIN)`** — the retryable `KvError::GrantExhausted` — and the op surfaced to `mkdir(2)` as **`EINVAL`**, i.e. the class reached the FUSE layer as `Corrupt` → `InvalidOperation` (F-C3 below).
+* **m60's pre-row snapshot:** `extent_grant_granted 72 = claimed 72, unclaimed 0` — the joiner's whole grant CLAIMED at its join (its rotor mint) and nothing unclaimed left for the first user mint; `joined_wire_verbs 356` — one `ExtentGrant` ask per cadence tick since the join, every one answered as a verbatim REPLAY.
+* **The manager's pre-row snapshot:** `extent_grants 7` (one carve per joiner — the join's), `manager_verbs 2135` of which **`manager_verb_replays 2083`** — the seven joiners' asks answered idempotently under §5.3.5 (`unclaimed_remainder_of` answers the page's grant word — the remainder the manager itself had written; the reading of WHY the two sides disagreed is F-C1's) while every joiner's own RAM grant read empty: **all 7 joiners were write-dead from their join, the manager replaying every ask verbatim** — a shape no co-located venue (the laptop, squeeze-test, the 2026-09-12 cloud `mw` row — every one of them ONE kernel, ONE page cache) could show.
+
+**The three findings (each REPORTED here and in §4.4ar–at with its code site; every one routed to PR 13i `fix/sym-shared-lun-coherence`, the rung that gates PR 14's flip and this row's re-run):**
+
+* **F-C1 — DESIGN-LEVEL, a flip blocker: cross-host page-cache incoherence on the shared metadata LUN.** Every metadata read and write goes through `uring_fs` BUFFERED I/O — the opens carry `O_CLOEXEC` only (`src/uring_fs.rs:1368/1586/1609`); the data path alone opens `O_DIRECT` (`src/nvme_dev.rs:744`) — i.e. through each HOST's block-device page cache. Two hosts over nvme-tcp ⇒ a joiner reads ITS kernel's stale cache of a block the manager wrote: the appender page's two images (`Live` with the grant cleared at `backend.rs:10510–10514`, then the grant word via `write_wire_joiner_page_grant` ≈ `backend.rs:11096`, durable at the next barrier), and the same for the tree-0 / ring-0 projections, foreign slot-tree nodes, the appender directory and the ledger. Every co-located venue shared ONE cache and was structurally blind to it. **Remedy — the shared-LUN rule (GPFS / Lustre's):** `O_DIRECT` (or explicit invalidation) on every shared-LUN metadata read AND write on every host, with sector-aligned staging buffers for the ring's byte-positioned entries and the 4 KiB page / ledger writes on both paths.
+* **F-C2 — `open_joined_appender` DISCARDS the `Joined` reply's grant word.** `src/meta_backend/kv/backend/joined.rs:751` destructures `ManagerReply::Joined { appender_id, already, node_seq_base, .. }` and rebuilds the RAM grant from the DEVICE page (`RegionGrant::recover(record.extents(), &page.grant)`, `backend.rs` ≈ 20450–20465) — while the manager's own doc on `write_wire_joiner_page_grant` states the contract the joiner must honour (the grant's runs reach the joiner ON THE REPLY), and `unclaimed_remainder_of` (`backend.rs:9286`) reads the page word for the §5.3.5 replay. Under F-C1 the page the joiner reads is stale and empty → the joiner is write-dead from its join and the manager replays every ask verbatim.
+* **F-C3 — the conveyor's batch-failure fan-out flattens every error class but `Io` / `NoSpace` to `Corrupt`.** `clone_kv_error` (`backend.rs:23709–23727`) clones `Io` and `NoSpace` by class and turns EVERY other `KvError` into `KvError::Corrupt(other.to_string())` → `InvalidOperation` → `EINVAL`: the retryable `GrantExhausted` (EAGAIN) surfaced to `mkdir(2)` as `EINVAL`, and `SlotBusy`, `GrantDeferred`, `Busy` and `ManagerUnreachable` lose their class the same way.
+
+**The evidence, and its loss (stated for what it is):** the row pulled the per-node `.stats` snapshots and every node's daemon logs to `.benchmarks/cloud/2026-09-24-152527/` on the dev machine before the teardown — **that directory, the rig branch that carried it (`perf/sym-cloud-row-run` @ `3ce1395a`, never pushed) and its worktree were LOST when the dev machine was reinstalled the same evening** (the resume note `~/sym-run-state/RESUME-2026-09-24-omarchy.md`). The conclusions above rest on the agent's contemporaneous summary quoted in the run log row `b88bfa54` (2026-09-24 15:55 wall) and on the code sites, which are re-verified on this tree (`clone_kv_error` at `backend.rs:23709`, `unclaimed_remainder_of` at `:9286`, `write_wire_joiner_page_grant` at `:11096`, the three `O_CLOEXEC` opens and the one `O_DIRECT` open at the lines named). **No per-node number of this run exists; gate 2 has no ratio, gate 3 no multiple, gate 3b no reading — the row is INCOMPLETE, not a MISS and not a MET.** The re-run must pull its evidence again. This branch redoes the four rig fixes (§1–4 of its commits) and this record; the lost evidence is not reconstructible. **Every review-stage branch is pushed to `origin` as a backup ref from now on** (the law the loss added).
+
+**What the run PROVED (mechanism, not number):** the PR 15 instrument works end to end on 8 REAL nodes — launch / deploy / the fabric (17 nvmet-tcp namespaces, PR verified end to end) / `format --symmetric` on one node / the join ladder over a real wire on seven others (every joiner `joined_registrant_posture registrant`, the device's report 8 / 8 registrants) / the token reader / the build_commit ritual / the driver's preflight and node table — and the FIRST user mutation from a joined writer found a class every co-located venue was blind to. That is the venue doing its job.
+
+**Owed to the re-run (PR 15 Phase B, run 2 — after PR 13i lands, with a NEW expressed owner approval for that run, on the flip candidate's binary):** the three row sets from zero on the approved shape; the per-node law of gate 3 read as written; the evidence pulled and committed under `.benchmarks/cloud/<ts>/` BEFORE any verdict is written.
+
 
 ## 4. Issues found (each with its PR and its red pin)
 
@@ -4820,6 +4857,36 @@ then; the row sets that do not (3c, 7) read clean.
 
 **Found on the box (the fourth pass, §3.9.6.3 there):** **272,071 / 275,372 `WARN fuse3::raw::session may reply interrupted fuse request, ignore this error No such file or directory (os error 2)`** per row set (set 2: m0 223,831 + m60 51,481 + 9–12 on each of the rest) — a SUBSET of `meta_ship.served_mutation_{invals,prunes}`, never twice them: m0 222,423 WARNs against 243,806 + 243,806 = 487,612 notify frames (**46 %**), m60 49,177 against 114,716 × 2 = 229,432 (**21 %**) — the fraction of PR 13b's hook's `FUSE_NOTIFY_INVAL_INODE` + `FUSE_NOTIFY_PRUNE` answered `ENOENT` by the kernel for an inode it does not hold (already forgotten, or never instantiated there — the expected outcome of a served mutation's invalidation reaching every object the holder's peers touched), logged per frame at `crates/fuse3/src/raw/session.rs:1092` (`reply_fuse` — the detached notify frames travel the reply channel via `ReplyTx::send_detached`) by the reply task's one `NotFound` arm, which could not tell a notification from a request's reply. **The fix (the fork, `crates/fuse3`):** `notify::frame_is_notify` — the out header: every notification carries `unique == 0` and its notify code in `error` (positive); a request's reply carries its `unique` and `0` / `-errno`; a frame shorter than a header is none — and `session::reply_write_verdict(is_notify, kind)`: `NotifyEnoent` → counted (`read_phase::notify_enoent`, `.stats` **`fuse3_notify_enoent`**), `NotifyFailed` (any other errno on a notification) → one WARN and the reply task GOES ON — a notification owes the kernel nothing; before, an unexpected errno on a notification ENDED the reply task with the session's replies behind it — `InterruptedRequest` → the shipped WARN, `Fatal` → the shipped `return Err`. **The pin** (`crates/fuse3 notify::tests::a_notifications_enoent_is_counted_never_the_interrupted_request_warn`): the classifier over the shipping encoders' frames (`inval_inode_frame`, `prune_frame`, a request reply's success / `-ENOENT` headers, a notify code under a unique, a short frame) and the verdict's four arms; RED on the shipped verdict (`InterruptedRequest` for a notification's `ENOENT`), GREEN after; the fork's clippy clean. No mount-class contract added (`tests/served_mutation_kernel_tests.rs`'s frame-order / form pins stand; the reply task's law is a pure function). **The two `.stats` faces the fourth pass stated:** `extent_grant_granted` exported (the closure's fourth term, `AppenderStats::grant_granted` — trivial; the pass had read the closure set-wide against the manager for lack of it); the writer's per-holder read planes on the `dlm_token_reader_*` fold need a census API on `data_grant::SlotCustodyArm`'s holder slots — NOT trivial, PR 14's stats sweep.
 
+### 4.4ar PR 15 run 1 — F-C1, FOUND, NOT FIXED (DESIGN-LEVEL — the shared-LUN rule; a FLIP BLOCKER; routed to PR 13i): every metadata read and write is BUFFERED through each host's block-device page cache, so a joiner on a second host reads its own stale image of a block the manager wrote
+
+**Found by:** the cloud row (§3.10) — the first venue in the program where two KERNELS share one metadata LUN (17 × i4i.2xlarge, the metadata namespace over nvmet-tcp, one symmetric writer per node). Gate 2's first arm: the joined writer m60's `mkdir` under the root answered `EINVAL` with `appender 1's extent grant is exhausted (0 unclaimed, 1 needed) and the manager has not refilled it` in its log, `extent_grant_granted 72 = claimed 72, unclaimed 0` and `joined_wire_verbs 356` at m60, `manager_verb_replays 2083` of `manager_verbs 2135` at the manager — every joiner's grant read empty on ITS host while the manager's page word named the remainder on ITS. Every co-located venue (the laptop, squeeze-test, the 2026-09-12 cloud `mw` row — one kernel each) shared ONE page cache and was structurally blind to the class.
+
+**Mechanism:** all daemon metadata I/O goes through `uring_fs` buffered I/O — the file opens carry `O_CLOEXEC` only — while the data path alone opens `O_DIRECT`. A buffered read on host B is served from B's page cache whenever the page is resident, whatever host A has since written to the LUN; a buffered write on host A lands in A's cache and reaches the device at the barrier, invisible to a page B already holds. The appender page is the first casualty (the manager writes the joiner's page `Live` with the grant cleared, then the grant word — two images, the second durable at the next barrier — and the joiner re-reads the page through its own cache), and the same law governs the tree-0 / ring-0 projections, foreign slot-tree nodes, the appender directory and the ledger — every cross-host read of the symmetric plane.
+
+**Code site:** `src/uring_fs.rs:1368/1586/1609` (the three opens — `.custom_flags(libc::O_CLOEXEC)` only); `src/nvme_dev.rs:744` (the data path's `open_opts.custom_flags(libc::O_DIRECT)` — the posture the metadata path lacks); the appender page's two images at `src/meta_backend/kv/backend.rs:10510–10514` (`page.grant.clear()` … `write_page`) and `write_wire_joiner_page_grant` ≈ `backend.rs:11096`.
+
+**Fix routed to PR 13i (`fix/sym-shared-lun-coherence`), the DESIGN item:** the shared-LUN rule — `O_DIRECT` (or explicit invalidation) on every shared-LUN metadata read AND write on every host, with sector-aligned staging buffers on both paths (the ring's byte-positioned entries, the 4 KiB page / ledger writes); the red-first fixture is TWO kernels sharing one block device — a qemu/KVM guest as a second member, guest and host both mounting an nvmet-tcp namespace the laptop exports (network namespaces on one laptop share a page cache and cannot show it). A design-level item — PR 13i writes the rule into design §5.8 (the shared-disk premise's coherence law); §7 item 20 names it; §9 lists it as the flip's blocker.
+
+### 4.4as PR 15 run 1 — F-C2, FOUND, NOT FIXED (PR 12b's joined door × PR 3's grant contract; routed to PR 13i): `open_joined_appender` discards the `Joined` reply's grant word and rebuilds its RAM grant from the device page
+
+**Found by:** the cloud row (§3.10), read off the same snapshots as F-C1: every joiner's `unclaimed 0` from its join, one `ExtentGrant` ask per cadence tick (`joined_wire_verbs 356` at m60), every ask a verbatim replay at the manager (`manager_verb_replays 2083`) — **all 7 joiners write-dead from their join**.
+
+**Mechanism:** the manager's `JoinAppender` mints the joiner's initial grant and answers it ON THE REPLY — the contract its own doc on `write_wire_joiner_page_grant` states (the grant's runs reach the joiner on the reply; the page word is the §5.3.5 replay's witness, which `unclaimed_remainder_of` reads). The joiner's door destructures `ManagerReply::Joined { appender_id, already, node_seq_base, .. }` — the grant word dropped in the `..` — and recovers its RAM grant from the DEVICE page it then reads (`RegionGrant::recover(record.extents(), &page.grant)`). On one kernel the page is what the manager just wrote and the two agree; under F-C1 the page is stale and empty, and the joiner honours the wrong home of the word. A joiner that honoured the reply would have a grant whatever its page cache says — and the manager's replay answering the page word would agree with it.
+
+**Code site:** `src/meta_backend/kv/backend/joined.rs:751` (the `Joined` destructure); `src/meta_backend/kv/backend.rs` ≈ 20450–20465 (`RegionGrant::recover(record.extents(), &page.grant)` in the region open); `unclaimed_remainder_of` at `backend.rs:9286`; `write_wire_joiner_page_grant` at `backend.rs:11096` (the contract's doc).
+
+**Fix routed to PR 13i:** the joiner honours the reply — the `Joined` grant word installs the RAM grant (the page a witness, never the source), the re-join's `already` answer carrying the unclaimed remainder the same way; red-first on the two-backend fixture with the page image held stale (the F-C1 fixture's shape in process), then on the two-kernel fixture.
+
+### 4.4at PR 15 run 1 — F-C3, FOUND, NOT FIXED (the M7 conveyor's batch-failure fan-out, every layout; routed to PR 13i): `clone_kv_error` flattens every error class but `Io` / `NoSpace` to `Corrupt` — the retryable `GrantExhausted` (EAGAIN) surfaced to `mkdir(2)` as `EINVAL`
+
+**Found by:** the cloud row (§3.10): m60's log carried the retryable `GrantExhausted` line ("… — retry (EAGAIN)") and the application saw `EINVAL`. The class is every layout's — a batch member's failure is fanned out to the batch's other members through this clone.
+
+**Mechanism:** when a conveyor batch fails, the pass clones the failing `KvError` to every member's oneshot. `clone_kv_error` reproduces `Io` (by raw os error) and `NoSpace` (by class — §4.7's ENOSPC fix, the ONE class that had been rescued from this arm before) and maps EVERY other variant to `KvError::Corrupt(other.to_string())`, which the FUSE layer answers as `InvalidOperation` → `EINVAL`. So `GrantExhausted` (EAGAIN, the retryable class PR 3 minted), `SlotBusy` (EAGAIN, the door's "ship to the holder"), `GrantDeferred` / `HandoverDeferred` (EAGAIN, PR 4's and PR 9's retryable classes), `Busy` (EBUSY) and `ManagerUnreachable` (`EHOSTUNREACH`, defect 26's class) all reach the application as `EINVAL` — and every retry ladder keyed on the class (the slot-moved re-dispatch, the acquire ladder, the cadence's "not this tick") sees `Corrupt` instead.
+
+**Code site:** `src/meta_backend/kv/backend.rs:23709–23727` (`fn clone_kv_error` — the `other => KvError::Corrupt(other.to_string())` arm).
+
+**Fix routed to PR 13i (its first item — the smallest, and what let the row's EINVAL hide a retryable class):** clone every class by class (a `Clone`-shaped reproduction of each variant's words, or the typed `SqueezefsError::Retryable { class }` conversion at the fan-out), pinned red-first by a batch whose failing member answers `GrantExhausted` and whose siblings must read `EAGAIN`, never `EINVAL`; the pre-existing §4.7 `NoSpace` pin is the shape.
+
 ### 4.4m Defect 16's regression, caught by the same batch and narrowed
 
 `sym-shared-dir-ls` on the defect-16 binary read `meta_kv_node_cache_
@@ -5037,7 +5104,31 @@ counted decline, a bounded window or a stated venue):
    launch awaits the owner's expressed approval for that run (S1 =
    `N_CLIENT=3`, 6 × i4i.2xlarge ≈ $4.1/hr; S2 = `N_CLIENT=8`, 11 nodes
    ≈ $7.5/hr; the cost table is in the PR 15 summary), and only after the
-   squeeze-test re-run on the same binary reads clean.**
+   squeeze-test re-run on the same binary reads clean.** **PR 15 Phase B,
+   run 1 (2026-09-24, §3.10): the instrument is BUILT and was EXERCISED
+   on 8 REAL nodes** — the owner approved the S2 + 8 oss shape
+   (`N_MDS=1 N_OSS=8 N_CLIENT=8`, 17 × i4i.2xlarge), the cluster
+   launched, deployed, assembled on the second attempt (the first met the
+   baked AMI's cloned `/etc/machine-id` — the daemon's node token; four
+   rig fixes landed on the redo branch: the machine-id step, `format
+   --force`, the apt hygiene, the every-node cost estimate) with
+   `appenders_known 8` / `membership_writers 7` / 8 of 8 device
+   registrants — **and FAILED on its first row** (gate 2's `sym-1` arm:
+   the joined writer's `mkdir` under the root `EINVAL`) on three product
+   findings: **F-C1** (cross-host page-cache incoherence on the shared
+   metadata LUN — DESIGN-LEVEL, §4.4ar, item 20 below, a flip blocker),
+   **F-C2** (the joiner discards the `Joined` reply's grant word,
+   §4.4as), **F-C3** (the conveyor's fan-out flattens every retryable
+   class to `Corrupt` → `EINVAL`, §4.4at) — all three routed to **PR
+   13i** `fix/sym-shared-lun-coherence`. Torn down at 26.5 min ≈ $5.2,
+   nothing billing. **The per-NODE law stays UNMEASURED: the row is
+   INCOMPLETE — no per-node number exists, and the pulled evidence
+   (`.benchmarks/cloud/2026-09-24-152527/`) was LOST with the dev machine
+   the same evening.** **The row is owed to the RE-RUN — after PR 13i
+   lands, on the flip candidate's binary, with a NEW expressed owner
+   approval for that specific run (the owner rule of 2026-09-24 21:20:
+   nothing runs on AWS until PR 13i has landed, and any later launch
+   needs the owner's permission again for that run).**
 1. **`is_stripe`'s reverse dentry scan over projections** (PR 7b on a
    joiner): `find_parent_of_child` walks every slot tree of the flip
    candidate's volume — a projection on a joiner, defect 24's class once
@@ -5570,6 +5661,35 @@ the box's input to PR 14; the remaining box rows are the flip binary's.
    `release_recovered_slots`' trees), plus one re-resolve off the manager's
    word on a failed ship (the forward hop's shape) to close the
    ≤ one-refresh window after recovery. Beside design §5.1.3's class (iii).
+20. **The shared-LUN rule — F-C1 (§3.10, §4.4ar; DESIGN-LEVEL; a FLIP
+   BLOCKER; PR 13i `fix/sym-shared-lun-coherence`):** every metadata read
+   and write goes through `uring_fs` BUFFERED I/O — the opens carry
+   `O_CLOEXEC` only (`src/uring_fs.rs:1368/1586/1609`), the data path
+   alone opens `O_DIRECT` (`src/nvme_dev.rs:744`) — i.e. through each
+   HOST's block-device page cache. The symmetric plane's premise is N
+   hosts sharing one metadata LUN, and on two hosts a joiner reads ITS
+   kernel's stale image of a block the manager wrote (the appender page's
+   two images, `backend.rs:10510–10514` then `write_wire_joiner_page_grant`
+   ≈ `:11096`; the tree-0 / ring-0 projections; foreign slot-tree nodes;
+   the directory; the ledger). Every co-located venue — the laptop,
+   squeeze-test, the 2026-09-12 cloud `mw` row, ONE kernel each — shared
+   one cache and was structurally blind; the first two-kernel venue found
+   it on the first user mutation. **The rule (GPFS / Lustre's):**
+   `O_DIRECT` (or explicit invalidation) on EVERY shared-LUN metadata read
+   and write on EVERY host, with sector-aligned staging buffers on both
+   paths (the ring's byte-positioned entries, the 4 KiB page / ledger
+   writes) — PR 13i's fix: design §5.8 states it as the shared-disk
+   premise's coherence law and the `uring_fs` metadata opens take the
+   posture the data path already holds. **The fixture** is TWO kernels on one block device — a qemu/KVM guest as a
+   second member, guest and host both mounting an nvmet-tcp namespace the
+   laptop exports (network namespaces on one laptop share a page cache
+   and cannot show it); it is also where the flip binary is proven on two
+   hosts before the next paid cloud row. F-C2 (§4.4as — the joiner
+   honours the `Joined` reply's grant word) and F-C3 (§4.4at — the
+   conveyor's fan-out clones every class by class) ride the same rung,
+   F-C3 first (the smallest, and what hid the retryable class behind
+   `EINVAL`). PR 13i gates PR 14's flip AND the cloud re-run (a NEW
+   expressed owner approval for that run).
 
 
 ## 8. Box footprint
@@ -5767,6 +5887,14 @@ reduction; the laptop ran nothing of this rung but the reductions).
 >
 > **Status (PR 13h, `fix/sym-box-pass4-findings`, 2026-09-24 — the fourth box pass's three findings, each FIXED red-first; the box bracket on the flip binary owed):** **F-R6** (§4.4ap) — a joined writer's FORGET-driven reclaim priced and drove destroys for the manager's corpses off its own stale projection (6,782 / 7,266 `destroy WITHHELD` per row set on the box, defect 18 / 34's loop under it; the structural belt was the commit door's `SlotBusy` — `slot_door_refusals` [0, 0] on m60 through `m60_pend.json`); now a FORGET of an ino in a slot this mount does not reclaim is a token client's forget — dropped at the reclaim's entry before any read (`RoutedMetaBackend::owns_inode_reclaim`, the corpse sweep's law), counted `reclaim_foreign_slot_forgets`; since review round 1 (Issue 1, `edfd1852`) that forget TRAVELS to the slot's reclaimer (its holder — the manager for an unleased slot) as a reclaim hint (`MetaCall::ReclaimHint`) the reclaimer runs as its own FORGET, because the manager sweeps unleased slots only at mount and its kernel never FORGETs an inode it never held (the released-slot corpse leaked until a remount); the unarmed / flat law byte-identical. **F-B1's trip** (§4.4an's PR 13h paragraph) — read off `pc41` / `pn41`: a wave of 38 promised compactions priced at 2.04 ms per image and paid at 3.97 (38 × 3.97 = 151 = the trip cycle's term); the unit's grain floor (a half / quarter reading on the drain's small passes) is deleted — the unit is the pass's mean per item; the deferred-flush barrier between the decision and the cycle is priced too (≈ 2 ms on the box); every cycle's TAPE rides `.stats meta_kv_checkpoint_last_cycle` and the overrun WARN, so the next trip attributes itself; RED → GREEN in process. **The served-mutation hook's WARN storm** (§4.4aq) — a notification's `ENOENT` is counted (`fuse3_notify_enoent`), never the interrupted-request WARN (`session.rs:1092`); its other errnos never end the reply task. **What PR 14 flips on, restated:** `sym-scale` on the box reading 0 trips through TWO row sets on THIS binary (the tape read at any trip), the storm ×10 from zero on it, then the flip binary's brackets of every gate; the fresh joiner's 3.0 s first create into a striped root stays a PR 14 / 15 latency item.
 
+> **Status (PR 15 Phase B, run 1 — the cloud row, 2026-09-24; §3.10 — the FIRST venue where two kernels shared one metadata LUN). The decision stays NOT YET, and the list GAINS a design-level blocker.** The owner-approved S2 + 8 oss shape (17 × i4i.2xlarge, one symmetric writer per node) launched, deployed and — on its second assemble, after the baked AMI's cloned `/etc/machine-id` was regenerated — assembled 8 REAL nodes (`appenders_known 8`, `membership_writers 7`, 8 of 8 device registrants), then **FAILED on its first row**: gate 2's `sym-1` arm, the joined writer's `mkdir` under the root `EINVAL`, every joiner write-dead from its join with the manager replaying every grant ask verbatim (2,083 of 2,135 verbs). **The exact list that does NOT read MET, as this run leaves it:**
+> * **F-C1 — the shared-LUN rule (§4.4ar, §7 item 20): a FLIP BLOCKER of the DESIGN class.** Every metadata read and write is BUFFERED through each host's block-device page cache (`uring_fs` opens `O_CLOEXEC` only; the data path alone `O_DIRECT`), so on two hosts a joiner reads its own stale image of the manager's writes — the appender page, the projections, the directory, the ledger. Every co-located venue was structurally blind. A default cannot flip on a plane whose cross-host reads are incoherent by construction; the remedy (`O_DIRECT` or explicit invalidation on every shared-LUN metadata read and write, sector-aligned staging) and its two-kernel fixture (a qemu/KVM guest member over a laptop-exported nvmet-tcp namespace) are **PR 13i**'s, which now gates PR 14 ahead of everything above;
+> * **F-C2** (§4.4as — the joiner rebuilds its grant from the device page instead of the `Joined` reply's word) and **F-C3** (§4.4at — `clone_kv_error` flattens every retryable class to `Corrupt` → `EINVAL`, every layout) — PR 13i's, F-C3 first;
+> * **gate 9 / gate 3's per-NODE law — INCOMPLETE, UNMEASURED:** the run produced no per-node number (the first row died at its first `mkdir`), and the evidence it pulled (`.benchmarks/cloud/2026-09-24-152527/`) was LOST with the dev machine the same evening; the conclusions rest on the contemporaneous summary in the run log. The re-run is owed on the flip candidate's binary after PR 13i lands, **with a NEW expressed owner approval for that specific run (the owner rule of 2026-09-24 21:20: nothing runs on AWS until PR 13i has landed)**;
+> * everything the fourth box pass left standing (above) — `sym-scale` on the box through two row sets on PR 13h's binary, the storm ×10 from zero, then the flip binary's brackets of every gate.
+>
+> **What the run PROVED:** the PR 15 instrument end to end on 8 real nodes — the fabric (17 nvmet-tcp namespaces, PR verified end to end), the ladder over a real wire (every joiner `joined_registrant_posture registrant`), the device's 8 / 8 registrant report, the driver's preflight — and that the venue finds what no co-located venue can. Four rig defects it found are FIXED on the redo branch (the machine-id step, `format --force`, the apt hygiene, the every-node estimate); the row's cost was ≈ $5.2, nothing billing. **What PR 14 flips on, restated:** PR 13i landed (F-C3 → F-C2 → F-C1, red-first, F-C1 on the two-kernel fixture); then the list above as the fourth pass left it; then the cloud re-run's per-node reading of gate 3.
+
 **Decision: NOT YET — four blockers, three of them product (§7's
 flip-blocking items (i)–(iii) + the box).** (0) **Fix-round
 finding 1 (§4.4af)**: an acked-writes LOSS on the death path under the
@@ -5828,6 +5956,7 @@ Gates, exactly:
 | 7 walls | mechanism GREEN (row (a) `shipped ≡ served ≥ displaced`; row (b) `/jobs` ships 7/7) — the flush-ceiling gauge's +1 readings are the ruling's named venue reading (§4.5) | OWED (N = 32) — the laptop's ≈ 1,000 frees/s and 2.2–3.2 s join wall SCOPING, venue-attributed |
 | 8 SIM-1 | **MET** (§5) | n/a (tier (ii)) |
 | 8b fidelity | PASS = 190 / FAIL = 0 from zero on a quiet box (fix round 1; §3.7) | n/a |
+| 9 cloud (PR 15, the per-NODE law) | **run 1 (2026-09-24, §3.10): the instrument exercised on 8 REAL nodes — assembled on the second attempt, FAILED on its first row (F-C1 / F-C2 / F-C3 → PR 13i); the evidence lost with the dev machine** | **INCOMPLETE / UNMEASURED** — no per-node number exists; the re-run after PR 13i lands, with a NEW expressed owner approval for that run |
 
 What PR 14 flips on: **finding 1 attributed and fixed with the storm ×10
 GREEN from zero on its binary (§4.4af), defect 32's arm landed and

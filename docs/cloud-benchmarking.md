@@ -53,7 +53,7 @@ venue exists only for the final sustained verdict.
 | `i4i` (default) | `i4i.4xlarge` | ×6 (96 vCPU) | 1 × 3,750 GB Nitro NVMe | ~$12–17/hr on-demand, ~$3–4/hr spot | IOPS |
 | `i3en` | `i3en.12xlarge` | ×6 (288 vCPU) | 4 × 7,500 GB NVMe | ~$30–45/hr on-demand, ~$10–14/hr spot | throughput |
 | `mw` | `i4i.2xlarge` | ×4 (32 vCPU) | 1 × 1,875 GB Nitro NVMe | ~$2.7–2.8/hr on-demand, ~$0.5–0.8/hr spot | multi-writer MPI-IO (`s11-mpiio`) |
-| `mw` + `SYMMETRIC=1 N_CLIENT=n` | `i4i.2xlarge` | ×(3+n) — S1 n=3: ×6 (48 vCPU), S2 n=8: ×11 (88 vCPU) | 1 × 1,875 GB Nitro NVMe | ~$0.686/hr per node on-demand: S1 ~$4.1/hr, S2 ~$7.5/hr | symmetric gates 2 / 3 / 3b on N real nodes (PR 15) |
+| `mw` + `SYMMETRIC=1 N_CLIENT=n` | `i4i.2xlarge` | ×(N_MDS+N_OSS+n) — at the default 1 mds + 2 oss: S1 n=3: ×6 (48 vCPU), S2 n=8: ×11 (88 vCPU); S2 + `N_OSS=8` (the 2026-09-24 approved shape): ×17 (136 vCPU) | 1 × 1,875 GB Nitro NVMe | ~$0.686/hr per node on-demand, **every node bills**: S1 ~$4.1/hr, S2 ~$7.5/hr, S2 + 8 oss ~$11.7/hr (the rig's `EST_CLUSTER_HOURLY` prices `N_MDS + N_OSS + N_CLIENT + N_SPARE` — the 2026-09-24 run's typed-YES line had priced 11 of its 17 nodes) | symmetric gates 2 / 3 / 3b on N real nodes (PR 15) |
 | `custom` | `INSTANCE_TYPE` verbatim | — | — | — | (still burst-class-refused) |
 
 Roles are preset-dependent (an explicit `N_MDS`/`N_OSS`/`N_CLIENT`/`N_SPARE`
@@ -128,6 +128,17 @@ deltas stated where they happen:
 4. **build_commit ritual:** artifact sha256 is verified on every node at
    deploy, and after mount the `.stats` `build_commit` must appear in the
    deployed binary's `--version` — a mismatch fails the assemble.
+5. **Apt hygiene (deploy):** on every node `deploy` stops and disables
+   `apt-daily.timer` + `apt-daily-upgrade.timer` and masks
+   `unattended-upgrades` for the session (waiting out an upgrade already
+   running, never interrupting dpkg) — on a fresh Ubuntu node the
+   2026-09-24 run met an unattended upgrade inside a row: ≈ 3 min of CPU on
+   a writer node and an `sshd` restart that killed the driver's preflight.
+6. **Idempotent re-assemble:** the fabric script's `format` passes
+   `--force` — a re-assemble meets the previous assemble's superblock
+   (`wipefs -a` on the storage node does not know the METALV01 magic) and
+   every assemble is a declared reformat; `--force` keeps `format`'s
+   live-client refusal.
 
 `assemble-mw` (`PRESET=mw`) runs the same fabric steps and diverges at the
 mount into the `tests/cluster_reset_v5_mw.sh` multi-writer recipe: 1
@@ -214,7 +225,16 @@ verbatim into its claim-set entry, which every joiner's
 (the fifth door over the wire — its own ring, page, slot leases and
 checkpoint task), and, with `SYM_TOKEN_READER=1` (default), a `--read-only`
 **token reader** at `/scratch/mnt-ro` on `client0` (the `-ls` half of gate
-3b). Every node is its **own registrant** — the REMOTE posture: the node's
+3b). Every node is its **own identity**, asserted before any identity-bearing
+step: **`/etc/machine-id` distinct across the client nodes** — the daemon's
+node token, half of the `(node_token, mount_slot)` identity every appender
+page, claim-set entry and membership record carries, is derived from it
+(`src/writer_scope.rs`); a baked AMI clones the file onto every node, and
+the 2026-09-24 run's first assemble failed at the mounts because every
+joiner carried the manager's identity — a clone is regenerated
+(`systemd-machine-id-setup` after truncating the file), re-read and
+re-asserted, a duplicate still standing dies loud. Every node is also its
+**own registrant** — the REMOTE posture: the node's
 nvme-cli host identity (`/etc/nvme/hostnqn` + `hostid`), generated where
 missing and **asserted distinct across the client nodes — both words**
 (nvmet keys a PR registrant by the Host ID; a baked AMI clones both files
@@ -300,6 +320,53 @@ owner's expressed approval for **that** run; the free local pass
 (`tests/cloud_sym_rows.sh … manager=local:… writer=local:…` over a
 `tests/mw_fleet.sh create N=2 --symmetric --writers=3` fleet, with
 `--mount-hook="tests/cloud_sym_rows.sh fleet-hook"`) comes first.
+
+### The 2026-09-24 symmetric run (S2 + 8 oss) — what it cost, what it found, what it taught
+
+The first Phase B run (`.benchmarks/2026-09-24-sym-pr15-cloud-row.md`; the
+acceptance record's §3.10) launched the owner-approved shape
+`PRESET=mw SYMMETRIC=1 N_MDS=1 N_OSS=8 N_CLIENT=8 MAX_CLUSTER_HOURS=4` —
+17 × i4i.2xlarge, us-east-1a, on-demand — at 19:02:14 UTC, deployed
+`aad50a1f`, assembled 8 real nodes on its second attempt (`appenders_known
+8`, `membership_writers 7`, 8 / 8 device registrants), **failed on its first
+row** (gate 2's `sym-1` arm: the joined writer's `mkdir` under the root
+answered `EINVAL`) and was torn down at 19:28:44 UTC — **≈ 26.5 min,
+≈ $5.2, nothing billing (verified ×3)**.
+
+| item | reading |
+|---|---|
+| cluster / shape | `sqzbench-20260924-150215`; 1 mds + 8 oss + 8 client (one symmetric writer per client node + a token reader on `client0`) |
+| venue | AMI `ami-0c40b68421a1fcd8e` (the `squeezefs-bench-base=mw` bake), kernel `7.0.0-1011-aws`, build `aad50a1f` `release` on every node, node RTT 0.168 / 0.179 / 0.190 ms |
+| cost | ≈ 26.5 min × 17 × ~$0.686/hr ≈ **$5.2**; the typed-YES line had read ~$7.55/hr for 11 nodes (fixed: every node is priced) |
+| result | **INCOMPLETE — no per-node number**; three product findings routed to PR 13i (F-C1 cross-host page-cache incoherence on the shared metadata LUN — design-level; F-C2 the joiner discarding the `Joined` reply's grant word; F-C3 the conveyor's fan-out flattening every retryable class to `EINVAL`); the pulled evidence directory was lost with the dev machine the same evening |
+
+**Lessons, each landed in the rig:**
+
+- **A baked AMI must be identity-scrubbed.** The bake clones
+  `/etc/machine-id` (and `/etc/nvme/hostnqn` + `hostid`) onto every node;
+  the daemon's node token is derived from the former and the PR registrant
+  keyed on the latter. `assemble-sym` asserts all three distinct across the
+  client nodes and regenerates a clone before any identity-bearing step —
+  the machine-id first (`systemd-machine-id-setup`), then the nvme
+  identity. A re-bake should scrub them (`truncate -s0 /etc/machine-id`,
+  remove `/etc/nvme/host{nqn,id}`) before `create-image`; the rig's
+  assertion is the belt either way.
+- **Unattended apt is off for the session** (`deploy`), and **the
+  re-assemble's `format` passes `--force`** — see "What assemble builds".
+- **The estimate prices every node** — the max-spend guard is still the
+  protection, but the typed-YES line now says what the fleet costs.
+- **Two kernels on one LUN is a different venue.** Every co-located venue
+  (the laptop, squeeze-test, the 2026-09-12 cloud `mw` row) shares one
+  page cache; the first two-kernel venue found a design-level class on its
+  first user mutation. The rig's job is exactly that.
+
+**The rule for the re-run (the owner, 2026-09-24 21:20):** nothing runs on
+AWS until PR 13i (`fix/sym-shared-lun-coherence` — F-C3 → F-C2 → F-C1, the
+two-kernel fixture a qemu/KVM guest member over a laptop-exported nvmet-tcp
+namespace) has landed, and **the re-run needs a new expressed owner approval
+for that specific run** — the standing per-launch mandate with the landing
+as its precondition. Run 2 pulls and commits its evidence under
+`.benchmarks/cloud/<ts>/` before any verdict is written.
 
 ## Substrate-labeling rules (what makes a cloud row admissible)
 

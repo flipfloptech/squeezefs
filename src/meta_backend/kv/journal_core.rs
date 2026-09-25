@@ -93,12 +93,78 @@ pub struct CoreGeometry {
     /// `max(256 KiB, ring/64)` for production rings): admissible only by
     /// [`AdmissionClass::Checkpoint`], invisible to user admissions.
     pub reserve_bytes: u64,
+    /// The device's SECTOR grain the ring's writes align to (PR 13i F-C1,
+    /// design-symmetric-metadata §5.12 — `O_DIRECT` metadata I/O): every
+    /// reservation's end is padded so the next begins on a physical
+    /// sector boundary. `1` = no padding (the pre-PR-13i arithmetic, byte
+    /// for byte; the buffered posture). A power of two ≤ the physical
+    /// page (4096), so page boundaries are always aligned.
+    pub grain: u64,
 }
+
+/// The physical page header length the pad law accounts for (the I/O
+/// layer's `JOURNAL_PAGE_HDR_LEN`; a logical page-start maps to the byte
+/// AFTER it).
+pub const PAGE_HDR_LEN: u64 = 24;
+
+/// The smallest pad the ring can WRITE: a PAD entry is an entry header
+/// (20 B) plus at least its one marker byte. A gap shorter than this is
+/// padded to the boundary after the next.
+pub const PAD_MIN: u64 = 21;
 
 impl CoreGeometry {
     /// Total logical bytes per lap (`pages × page_data_len`).
     pub fn logical_len(&self) -> u64 {
         self.pages * self.page_data_len
+    }
+
+    /// Whether logical position `pos` sits on a physical sector boundary:
+    /// a page's first byte (its header starts the page — 4 KiB aligned by
+    /// construction) or an in-page offset whose physical form (`HDR +
+    /// off`) is a grain multiple. Always `true` on an unpadded ring.
+    pub fn sector_aligned(&self, pos: u64) -> bool {
+        if self.grain <= 1 {
+            return true;
+        }
+        let off = self.in_page_off(pos);
+        off == 0 || (PAGE_HDR_LEN + off) % self.grain == 0
+    }
+
+    /// The pad a reservation ending at `end` carries so the next begins
+    /// sector-aligned: 0 when `end` already is; else the distance to the
+    /// first aligned position at or after `end + PAD_MIN` (a pad must
+    /// hold a PAD entry). Bounded by [`Self::max_pad`].
+    pub fn pad_of(&self, end: u64) -> u64 {
+        if self.sector_aligned(end) {
+            return 0;
+        }
+        let target = end + PAD_MIN;
+        let off = self.in_page_off(target);
+        let next = if off == 0 {
+            target
+        } else {
+            let phys = PAGE_HDR_LEN + off;
+            let up = phys.div_ceil(self.grain) * self.grain;
+            if up >= PAGE_HDR_LEN + self.page_data_len {
+                // Past the page's data: the page end (the next page's
+                // header is aligned by construction).
+                target + (self.page_data_len - off)
+            } else {
+                target + (up - phys)
+            }
+        };
+        next - end
+    }
+
+    /// The largest pad any reservation carries (`PAD_MIN` short of a
+    /// boundary, then a whole grain to the next): the slack every
+    /// admission covers. 0 on an unpadded ring.
+    pub fn max_pad(&self) -> u64 {
+        if self.grain <= 1 {
+            0
+        } else {
+            PAD_MIN + self.grain
+        }
     }
 
     /// Which lap `pos` belongs to.
@@ -200,40 +266,77 @@ pub enum AdmissionClass {
 #[derive(Debug)]
 #[must_use = "admitted budget must be reserved or released, or the ring leaks"]
 pub struct Admission {
+    /// The ENTRY bytes admitted (what the caller asked for).
     len: u64,
+    /// The sector-pad slack admitted beside them ([`CoreGeometry::
+    /// max_pad`] at admission; 0 on an unpadded ring and on a split
+    /// remainder). `admitted` holds `len + slack` for every live
+    /// admission — the conservation law's term.
+    slack: u64,
 }
 
 impl Admission {
-    /// The admitted length in bytes.
+    /// The admitted ENTRY length in bytes.
     pub fn len(&self) -> u64 {
         self.len
     }
 
+    /// The pad slack this admission carries.
+    pub fn slack(&self) -> u64 {
+        self.slack
+    }
+
     /// Whether nothing was admitted (a zero-length split remainder).
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len == 0 && self.slack == 0
     }
 }
 
-/// A claimed journal range: `[start, start + len)` in logical byte space.
-/// `seq() == start` — see the module docs.
+/// A claimed journal range: `[start, start + len + pad)` in logical byte
+/// space. `seq() == start` — see the module docs. `[start, start + len)`
+/// is the ENTRY's range (the exact entry size, §4.4 pt 5); `[start + len,
+/// start + len + pad)` is the ring's SECTOR PAD behind it (PR 13i F-C1,
+/// design-symmetric-metadata §5.12) — bytes this reservation owns and
+/// writes as one PAD entry so the next reservation begins on a physical
+/// sector boundary. `pad` is 0 on an unpadded ring (every ring before
+/// PR 13i, the buffered posture).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reservation {
     /// Logical start position (== the entry seq).
     pub start: u64,
-    /// Reserved length in bytes (== the exact entry size, §4.4 pt 5).
+    /// The entry's length in bytes (== the exact entry size, §4.4 pt 5).
     pub len: u64,
+    /// The sector pad behind the entry (0 = none).
+    pub pad: u64,
 }
 
 impl Reservation {
+    /// A reservation with no pad (the pre-PR-13i shape).
+    pub fn unpadded(start: u64, len: u64) -> Self {
+        Self { start, len, pad: 0 }
+    }
+
     /// The entry seq this reservation carries (its start position).
     pub fn seq(&self) -> u64 {
         self.start
     }
 
-    /// One past the last logical byte (`start + len`).
+    /// One past the entry's last logical byte (`start + len`) — where the
+    /// pad entry (if any) begins.
     pub fn end(&self) -> u64 {
         self.start + self.len
+    }
+
+    /// One past the RESERVATION's last logical byte (`start + len + pad`)
+    /// — where the next reservation begins; the ring's coverage
+    /// arithmetic (completion, tails, the head) reads this.
+    pub fn padded_end(&self) -> u64 {
+        self.start + self.len + self.pad
+    }
+
+    /// The reservation's whole length (`len + pad`).
+    pub fn padded_len(&self) -> u64 {
+        self.len + self.pad
     }
 
     /// The POSITION-domain seq of this entry's `i`-th record — what a
@@ -355,6 +458,11 @@ impl JournalCore {
         };
         let capacity = self.geo.logical_len();
         debug_assert!(reserve < capacity, "reserve must leave admissible space");
+        // The sector pad's slack rides every admission on a padded ring
+        // (PR 13i): the reservation takes the exact pad and releases the
+        // rest, so the budget is never over-committed by a pad.
+        let slack = self.geo.max_pad();
+        let claim = len + slack;
         let mut adm = self.admitted.load(Ordering::Acquire);
         loop {
             // Read order matters: `admitted` BEFORE `head` (see module
@@ -362,16 +470,16 @@ impl JournalCore {
             let head = self.head.load(Ordering::Acquire);
             let reusable = self.reusable_upto.load(Ordering::Acquire);
             let claimed = head + adm;
-            if claimed + len + reserve > reusable + capacity {
+            if claimed + claim + reserve > reusable + capacity {
                 return None;
             }
             match self.admitted.compare_exchange(
                 adm,
-                adm + len,
+                adm + claim,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(Admission { len }),
+                Ok(_) => return Some(Admission { len, slack }),
                 Err(cur) => adm = cur,
             }
         }
@@ -379,10 +487,12 @@ impl JournalCore {
 
     /// Give admitted budget back (a transaction that failed before its
     /// reservation). Conservation: `admitted` decreases by exactly the
-    /// admission's length; `head` is untouched.
+    /// admission's claim (its length plus its pad slack); `head` is
+    /// untouched.
     pub fn release(&self, adm: Admission) {
-        let prev = self.admitted.fetch_sub(adm.len, Ordering::AcqRel);
-        debug_assert!(prev >= adm.len, "released more budget than admitted");
+        let claim = adm.len + adm.slack;
+        let prev = self.admitted.fetch_sub(claim, Ordering::AcqRel);
+        debug_assert!(prev >= claim, "released more budget than admitted");
     }
 
     /// Split an admission into `first` bytes and the remainder — pure
@@ -392,33 +502,71 @@ impl JournalCore {
     /// 3, Issue 24: the door's first-touch acquire admits its control
     /// entry before taking the manager's verb mutex, then reserves the
     /// exact length and releases the rest). `first` must not exceed the
-    /// admission.
+    /// admission. The pad slack stays with the FIRST piece (the one the
+    /// caller reserves); the remainder carries none.
     pub fn split_admission(&self, adm: Admission, first: u64) -> (Admission, Admission) {
         debug_assert!(first <= adm.len, "split past the admission");
         let first = first.min(adm.len);
         (
-            Admission { len: first },
+            Admission {
+                len: first,
+                slack: adm.slack,
+            },
             Admission {
                 len: adm.len - first,
+                slack: 0,
             },
         )
     }
 
     /// Transfer admitted budget to the head: the single `fetch_add` of
-    /// §4.4 pt 2. Never blocks and never fails — the budget was admitted
-    /// up front, so the head advance is claim-by-construction. Returns the
-    /// claimed range (its start doubles as the entry seq).
+    /// §4.4 pt 2 on an unpadded ring. Never blocks and never fails — the
+    /// budget was admitted up front, so the head advance is claim-by-
+    /// construction. Returns the claimed range (its start doubles as the
+    /// entry seq).
+    ///
+    /// On a SECTOR-PADDED ring (PR 13i F-C1) the claim is the entry plus
+    /// the pad its end position needs ([`CoreGeometry::pad_of`]) — a CAS
+    /// loop, since the pad depends on where the head stands — taken out
+    /// of the admission's slack; the unused slack is released in the same
+    /// step. Conservation holds either way: `head` grows by exactly the
+    /// padded length, `admitted` shrinks by exactly the admission's claim.
     ///
     /// Ordering: `head` is bumped BEFORE `admitted` is decremented, pairing
     /// with [`Self::try_admit`]'s admitted-then-head read order (module
     /// docs) so racing admissions never under-count the claim.
     pub fn reserve(&self, adm: Admission) -> Reservation {
-        let start = self.head.fetch_add(adm.len, Ordering::AcqRel);
-        let prev = self.admitted.fetch_sub(adm.len, Ordering::AcqRel);
-        debug_assert!(prev >= adm.len, "reserved more budget than admitted");
+        let claim = adm.len + adm.slack;
+        if self.geo.grain <= 1 {
+            let start = self.head.fetch_add(adm.len, Ordering::AcqRel);
+            let prev = self.admitted.fetch_sub(claim, Ordering::AcqRel);
+            debug_assert!(prev >= claim, "reserved more budget than admitted");
+            return Reservation::unpadded(start, adm.len);
+        }
+        let mut start = self.head.load(Ordering::Acquire);
+        let pad = loop {
+            // A pad past the slack cannot claim budget the ring never
+            // admitted: it is clamped (the next window's write then
+            // refuses misaligned — loud, never an overwrite). Unreachable
+            // by construction: only a split REMAINDER carries no slack,
+            // and no caller reserves one.
+            let pad = self.geo.pad_of(start + adm.len).min(adm.slack);
+            match self.head.compare_exchange(
+                start,
+                start + adm.len + pad,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break pad,
+                Err(cur) => start = cur,
+            }
+        };
+        let prev = self.admitted.fetch_sub(claim, Ordering::AcqRel);
+        debug_assert!(prev >= claim, "reserved more budget than admitted");
         Reservation {
             start,
             len: adm.len,
+            pad,
         }
     }
 

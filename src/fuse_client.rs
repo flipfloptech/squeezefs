@@ -12611,6 +12611,14 @@ impl SqueezefsFilesystem {
                 // reaped + wake sent) / wake_hop (sent → the durability
                 // lane observed it) / total. ALWAYS-ON, exact-sum.
                 "uring_fs_write_phase_ns": crate::uring_fs::uring_fs_write_phase_json(),
+                // Shared-LUN metadata I/O (PR 13i F-C1, design-symmetric-
+                // metadata §5.12): the registered metadata device paths'
+                // O_DIRECT posture — `meta_io_direct_paths`, the loud
+                // buffered fallback (`meta_io_buffered_fallback`, must-
+                // stay-0 on a block device), the unaligned-caller tripwire
+                // (`meta_io_unaligned_refusals`, must-stay-0), the write-
+                // buffer bounce bytes and the widened cold reads.
+                "meta_io": crate::uring_fs::meta_io_stats_json(),
                 "publish_base_dirty_serves": METRICS.publish_base_dirty_serves.load(Ordering::Relaxed),
                 "publish_base_fetches": METRICS.publish_base_fetches.load(Ordering::Relaxed),
                 "publish_base_ram_serves": METRICS.publish_base_ram_serves.load(Ordering::Relaxed),
@@ -13513,6 +13521,18 @@ impl SqueezefsFilesystem {
                 metrics.insert(
                     "meta_kv_journal_entries".into(),
                     load(&meta_kv::META_KV_JOURNAL_ENTRIES),
+                );
+                // PR 13i (design-symmetric-metadata §5.12): the sector-pad
+                // entries behind reservations on an O_DIRECT ring — the
+                // aligned form's ring-capacity cost, apart from the entry
+                // economy's counters. 0 on an unpadded (buffered) ring.
+                metrics.insert(
+                    "meta_kv_journal_pad_entries".into(),
+                    load(&meta_kv::META_KV_JOURNAL_PAD_ENTRIES),
+                );
+                metrics.insert(
+                    "meta_kv_journal_pad_bytes".into(),
+                    load(&meta_kv::META_KV_JOURNAL_PAD_BYTES),
                 );
                 // PR M7 (design-metadata-throughput §5.5/§9): conveyor
                 // group formation — txs per batch (exact 1–8 buckets so

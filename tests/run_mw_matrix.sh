@@ -2109,7 +2109,7 @@ JOBC
     log "vm-multi-identity GREEN (evidence in $rowdir)"
 }
 
-# --- PR 13i — the TWO-HOST fixture (design-symmetric-metadata §5.11) --------
+# --- PR 13i — the TWO-HOST fixture (design-symmetric-metadata §5.12) --------
 # `sym-two-host`: two KERNELS sharing one metadata LUN — the venue every
 # single-box fleet (netns members included) structurally cannot be: one
 # kernel is one page cache. Needs `create N=1 --symmetric --vm=1
@@ -2247,7 +2247,7 @@ print(next(r["generation"] for r in rows if r.get("appender_id") == 0 and r.get(
         die "page 0's generation did not move on the host ($g_gen1 → $h_gen) — the pin's premise (a host write after the guest's read) is unmet"
     echo "guest_gen_before=$g_gen1 guest_gen_after=$g_gen2 host_gen=$h_gen" >"$rowdir/pin.txt"
     [ "$g_gen2" = "$h_gen" ] ||
-        die "F-C1 PIN RED: the guest re-read page 0 at generation $g_gen2 while the host wrote it to $h_gen (the guest's first read left it at $g_gen1) — a second kernel served its own page cache of a block the manager rewrote: shared-LUN metadata I/O is not coherent (design-symmetric-metadata §5.11; evidence $rowdir)"
+        die "F-C1 PIN RED: the guest re-read page 0 at generation $g_gen2 while the host wrote it to $h_gen (the guest's first read left it at $g_gen1) — a second kernel served its own page cache of a block the manager rewrote: shared-LUN metadata I/O is not coherent (design-symmetric-metadata §5.12; evidence $rowdir)"
     log "F-C1 PIN GREEN: the guest's second read is the host's word (generation $h_gen)"
 
     # ---- job 3: the guest JOINS as a writer and creates ----

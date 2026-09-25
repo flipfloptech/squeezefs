@@ -162,6 +162,41 @@ pub const ENTRY_HDR_LEN: u64 = 20;
 /// dereferencing it).
 pub const MAX_ENTRY_LEN: u64 = 128 * 1024;
 
+/// The PAD entry's payload marker (PR 13i F-C1, design-symmetric-metadata
+/// §5.12): a tag byte no record ever carries (`untag` → tree 15, level 15
+/// — outside the §4.2 table at every level), followed by zeros to the pad's
+/// end. A pad entry is an ORDINARY checksummed entry (seq == position), so
+/// the chain-primary replay parses and skips it without knowing the
+/// writer's grain — a zero gap would break the chain and lose every
+/// later entry of the page to the resync.
+pub const PAD_TAG: u8 = 0xFF;
+
+/// The sector grain the ring at `path` pads to: the registered metadata
+/// device's (`crate::uring_fs::meta_io_grain` — `O_DIRECT`'s logical
+/// block size), `1` (no padding, the pre-PR-13i bytes) for an
+/// unregistered or buffered path. A grain is a power of two ≤ the page.
+pub fn ring_grain_for(path: &Path) -> u64 {
+    let g = crate::uring_fs::meta_io_grain(path);
+    if g.is_power_of_two() && g <= JOURNAL_PAGE_LEN {
+        g
+    } else {
+        1
+    }
+}
+
+/// The sector-pad SLACK every admission on the ring at `path` claims
+/// beside its entry bytes (`CoreGeometry::max_pad` for that ring's
+/// grain): what a "can this ever be admitted" clamp subtracts from the
+/// user-admissible capacity. 0 for an unpadded ring.
+pub fn ring_max_pad_for(path: &Path) -> u64 {
+    let grain = ring_grain_for(path);
+    if grain <= 1 {
+        0
+    } else {
+        super::journal_core::PAD_MIN + grain
+    }
+}
+
 /// The §4.4 pt 5 checkpoint-task ring reserve for a ring of `ring_len`
 /// physical bytes: `max(256 KiB, ring/64)`.
 pub fn checkpoint_reserve_bytes(ring_len: u64) -> u64 {
@@ -550,6 +585,9 @@ pub struct JournalRing {
     /// committed entry, headers included). Surfaced as
     /// `meta_kv_journal_bytes_per_volume`.
     written_bytes: std::sync::atomic::AtomicU64,
+    /// The sector-pad bytes written behind this ring's entries (PR 13i —
+    /// the aligned form's ring-capacity cost, per volume).
+    written_pad_bytes: std::sync::atomic::AtomicU64,
     /// **The ring's record-seq offset** (design-symmetric-metadata
     /// §5.1.4 / §5.8.2 — the seq-space law, PR 4 review round 2): a
     /// record's seq is its reservation's POSITION plus this offset. The
@@ -735,6 +773,7 @@ impl JournalRing {
                     page_data_len: JOURNAL_PAGE_DATA_LEN,
                     pages,
                     reserve_bytes,
+                    grain: ring_grain_for(path),
                 },
                 start,
                 start,
@@ -747,6 +786,7 @@ impl JournalRing {
             completion_notify: squeezefs_ipc::sqz_notify::Notify::new(),
             written_entries: std::sync::atomic::AtomicU64::new(0),
             written_bytes: std::sync::atomic::AtomicU64::new(0),
+            written_pad_bytes: std::sync::atomic::AtomicU64::new(0),
             seq_offset: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -831,6 +871,7 @@ impl JournalRing {
                     page_data_len: old.page_data_len,
                     pages,
                     reserve_bytes: old.reserve_bytes,
+                    grain: old.grain,
                 },
                 head,
                 head,
@@ -843,6 +884,7 @@ impl JournalRing {
             completion_notify: squeezefs_ipc::sqz_notify::Notify::new(),
             written_entries: std::sync::atomic::AtomicU64::new(self.written_entries()),
             written_bytes: std::sync::atomic::AtomicU64::new(self.written_bytes()),
+            written_pad_bytes: std::sync::atomic::AtomicU64::new(self.written_pad_bytes()),
             // The seq offset is the RING's: a grown ring keeps stamping above every
             // record its predecessor image holds.
             seq_offset: std::sync::atomic::AtomicU64::new(self.seq_offset()),
@@ -933,6 +975,7 @@ impl JournalRing {
             page_data_len: JOURNAL_PAGE_DATA_LEN,
             pages,
             reserve_bytes,
+            grain: ring_grain_for(path),
         };
         // One sequential read per segment (§3's mount budget; ONE for the
         // shipped ring). A short read (file smaller than the extent)
@@ -960,6 +1003,7 @@ impl JournalRing {
             completion_notify: squeezefs_ipc::sqz_notify::Notify::new(),
             written_entries: std::sync::atomic::AtomicU64::new(0),
             written_bytes: std::sync::atomic::AtomicU64::new(0),
+            written_pad_bytes: std::sync::atomic::AtomicU64::new(0),
             seq_offset: std::sync::atomic::AtomicU64::new(0),
         };
         Ok((ring, recovery))
@@ -988,6 +1032,18 @@ impl JournalRing {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Sector-pad bytes written behind this ring's entries since open
+    /// (PR 13i's aligned form; 0 on an unpadded ring).
+    pub fn written_pad_bytes(&self) -> u64 {
+        self.written_pad_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The sector grain this ring pads to (1 = unpadded).
+    pub fn grain(&self) -> u64 {
+        self.core.geometry().grain
+    }
+
     /// Non-parking admission (the checkpoint task's own records, §4.4
     /// pt 5: the task must never wait on ring space it is itself
     /// responsible for freeing — on `None` it runs a minimal drain and
@@ -1008,7 +1064,7 @@ impl JournalRing {
     pub fn reserve_registered(&self, adm: super::journal_core::Admission) -> (Reservation, u64) {
         let mut g = self.inflight.lock().unwrap();
         let res = self.core.reserve(adm);
-        g.open.insert(res.start, res.end());
+        g.open.insert(res.start, res.padded_end());
         // The entry's first record seq, stamped AT reservation (under the
         // same lock a raise takes): position + offset, so seq order is
         // reservation order within the ring whatever the offset does.
@@ -1146,14 +1202,14 @@ impl JournalRing {
     /// [`Self::submit_entries_batch`], so a conveyor batch member's bytes
     /// are **by construction** identical to a solo commit's (the §5.5
     /// batch-of-1 equivalence). `res.len` must equal [`entry_len_for`] of
-    /// `records`.
+    /// `records`. The entry's own bytes only — a reservation's PAD is a
+    /// separate entry ([`Self::pad_ops`]).
     fn entry_ops(
         &self,
         res: &Reservation,
         records: &[(u8, Record)],
         ops: &mut Vec<(u64, bytes::Bytes)>,
     ) -> Result<(), KvError> {
-        let geo = self.core.geometry();
         let payload = encode_entry_payload(records);
         let need = entry_len_for(records)?;
         if need != res.len {
@@ -1162,38 +1218,66 @@ impl JournalRing {
                 res.len
             )));
         }
+        self.framed_entry_ops(res.start, &payload, ops);
+        Ok(())
+    }
 
+    /// The PAD entry behind a reservation's entry (PR 13i F-C1): an
+    /// ordinary checksummed entry at `end` spanning `pad` bytes whose
+    /// payload is [`PAD_TAG`] + zeros — parsed and skipped by replay,
+    /// owning (and writing the headers of) the pages whose first byte it
+    /// covers exactly as an entry would. Nothing on an unpadded ring.
+    fn pad_ops(&self, end: u64, pad: u64, ops: &mut Vec<(u64, bytes::Bytes)>) {
+        if pad == 0 {
+            return;
+        }
+        debug_assert!(
+            pad >= super::journal_core::PAD_MIN,
+            "a pad below PAD_MIN: {pad}"
+        );
+        let mut payload = vec![0u8; (pad - ENTRY_HDR_LEN) as usize];
+        payload[0] = PAD_TAG;
+        self.framed_entry_ops(end, &payload, ops);
+    }
+
+    /// One framed entry (20 B header + `payload`) at logical `start`, as
+    /// page-segment ops plus the owned page headers — the shared body of
+    /// [`Self::entry_ops`] and [`Self::pad_ops`].
+    fn framed_entry_ops(&self, start: u64, payload: &[u8], ops: &mut Vec<(u64, bytes::Bytes)>) {
+        let geo = self.core.geometry();
+        let whole = ENTRY_HDR_LEN + payload.len() as u64;
         // Whole-entry bytes: 20 B header + payload, one buffer; the batch
         // ops below are refcounted slices of it (no copies).
-        let mut entry = Vec::with_capacity(need as usize);
+        let mut entry = Vec::with_capacity(whole as usize);
         let len = payload.len() as u32;
-        let sum = entry_checksum(res.seq(), len, std::iter::once(payload.as_slice()));
-        entry.extend_from_slice(&res.seq().to_le_bytes());
+        let sum = entry_checksum(start, len, std::iter::once(payload));
+        entry.extend_from_slice(&start.to_le_bytes());
         entry.extend_from_slice(&len.to_le_bytes());
         entry.extend_from_slice(&sum.to_le_bytes());
-        entry.extend_from_slice(&payload);
+        entry.extend_from_slice(payload);
         let entry = bytes::Bytes::from(entry);
+        let end = start + whole;
 
         // Payload segments first, then the owned page headers. The order
         // within one batch carries no durability meaning (unordered
         // writeback is the crash model either way); this order lets the
         // torn-batch shim exercise payload-landed/header-lost shapes.
         let mut consumed = 0usize;
-        for seg in geo.segments(res.start, res.len) {
+        for seg in geo.segments(start, whole) {
             let file_off = self.page_offset(seg.page) + JOURNAL_PAGE_HDR_LEN + seg.data_off;
             ops.push((file_off, entry.slice(consumed..consumed + seg.len as usize)));
             consumed += seg.len as usize;
         }
         debug_assert_eq!(consumed, entry.len(), "segments must cover the entry");
 
-        for page_start in geo.owned_page_starts(res.start, res.len) {
+        for page_start in geo.owned_page_starts(start, whole) {
             // §4.4 pt 2: the owner always has the local information
             // first_entry_off needs — its entry starts here, ends inside,
             // or spans the page entirely.
-            let feo = if res.start == page_start {
+            let feo = if start == page_start {
                 JOURNAL_PAGE_HDR_LEN as u16
-            } else if res.end() < page_start + geo.page_data_len {
-                (JOURNAL_PAGE_HDR_LEN + (res.end() - page_start)) as u16
+            } else if end < page_start + geo.page_data_len {
+                (JOURNAL_PAGE_HDR_LEN + (end - page_start)) as u16
             } else {
                 FIRST_ENTRY_NONE
             };
@@ -1204,11 +1288,82 @@ impl JournalRing {
                 bytes::Bytes::copy_from_slice(&hdr),
             ));
         }
-        Ok(())
+    }
+
+    /// **The ring's aligned form** (PR 13i F-C1, design-symmetric-metadata
+    /// §5.12): on a sector-padded ring the ops of one logical span
+    /// `[start, end)` — entries, their pad, the owned page headers — are
+    /// COALESCED into one aligned image per physically contiguous run
+    /// (pages adjacent within a segment; a segment boundary or the ring
+    /// wrap starts a new run), zero-filled where nothing was written (a
+    /// rolled-back member's hole, a page header no surviving part owns —
+    /// garbage to the chain either way, exactly as the unwritten bytes
+    /// were). The pad law makes every run's ends sector-aligned; a run
+    /// that is not is a protocol bug refused here, never a misaligned
+    /// device write. On an unpadded ring the ops pass through verbatim
+    /// (the pre-PR-13i bytes, op for op).
+    fn aligned_ops(
+        &self,
+        start: u64,
+        end: u64,
+        ops: Vec<(u64, bytes::Bytes)>,
+    ) -> Result<Vec<(u64, bytes::Bytes)>, KvError> {
+        let geo = self.core.geometry();
+        if geo.grain <= 1 || end <= start {
+            return Ok(ops);
+        }
+        let grain = geo.grain;
+        let mem_align =
+            crate::uring_fs::meta_io_mode(&self.path).map_or(grain as usize, |m| m.mem_align);
+        // The physical runs of the span.
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for seg in geo.segments(start, end - start) {
+            let page_base = self.page_offset(seg.page);
+            let lo = if seg.data_off == 0 {
+                page_base
+            } else {
+                page_base + JOURNAL_PAGE_HDR_LEN + seg.data_off
+            };
+            let hi = page_base + JOURNAL_PAGE_HDR_LEN + seg.data_off + seg.len;
+            match runs.last_mut() {
+                Some((_, prev_hi)) if *prev_hi == lo => *prev_hi = hi,
+                _ => runs.push((lo, hi)),
+            }
+        }
+        for (lo, hi) in &runs {
+            if lo % grain != 0 || hi % grain != 0 {
+                return Err(KvError::Corrupt(format!(
+                    "journal window [{start}, {end}) maps to the physical run [{lo:#x}, {hi:#x}) \
+                     which is not aligned to the {grain} B sector grain — the pad law was not \
+                     honoured (a protocol bug; the window is refused, nothing is written)"
+                )));
+            }
+        }
+        let mut out: Vec<(u64, bytes::Bytes)> = Vec::with_capacity(runs.len());
+        let mut sorted = ops;
+        sorted.sort_by_key(|(off, _)| *off);
+        for (lo, hi) in runs {
+            let mut image = crate::uring_fs::AlignedBuf::zeroed((hi - lo) as usize, mem_align);
+            let dst = image.as_mut_slice();
+            for (off, data) in sorted.iter().filter(|(off, _)| *off >= lo && *off < hi) {
+                let at = (*off - lo) as usize;
+                let take = data.len().min(dst.len() - at);
+                if take < data.len() {
+                    return Err(KvError::Corrupt(format!(
+                        "journal op at {off:#x} ({} B) overruns its physical run [{lo:#x}, {hi:#x})",
+                        data.len()
+                    )));
+                }
+                dst[at..at + take].copy_from_slice(&data[..take]);
+            }
+            out.push((lo, image.into_bytes()));
+        }
+        Ok(out)
     }
 
     /// Write one entry's bytes into its reserved range: the committer's own
-    /// bytes, one `uring_fs` submission (`write_at` for a page-local entry,
+    /// bytes (plus the reservation's pad entry on a padded ring), one
+    /// `uring_fs` submission (`write_at` for a page-local entry,
     /// `write_at_batch` for multi-page — §4.4 pt 3).
     pub async fn write_entry(
         &self,
@@ -1217,6 +1372,8 @@ impl JournalRing {
     ) -> Result<(), KvError> {
         let mut ops: Vec<(u64, bytes::Bytes)> = Vec::new();
         self.entry_ops(res, records, &mut ops)?;
+        self.pad_ops(res.end(), res.pad, &mut ops);
+        let mut ops = self.aligned_ops(res.start, res.padded_end(), ops)?;
         if ops.len() == 1 {
             let (off, data) = ops.pop().expect("one op");
             crate::uring_fs::write_at(&self.path, off, data).await?;
@@ -1231,7 +1388,118 @@ impl JournalRing {
             .fetch_add(res.len, std::sync::atomic::Ordering::Relaxed);
         self.written_entries
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.note_pad_written(res.pad);
         Ok(())
+    }
+
+    /// **Align the recovered head for writing** (PR 13i F-C1): a WRITER's
+    /// ring whose replayed head stands mid-sector — a window torn behind
+    /// its entry (the entry landed, its pad did not), or a ring written
+    /// buffered before this binary — writes ONE PAD entry from the head to
+    /// the next sector boundary so its first reservation begins aligned.
+    /// The one honest read-modify-write of the ring: at open, no
+    /// reservation open, the sector's prefix the durable image just
+    /// replayed (single writer), read fresh off the device and rewritten
+    /// byte-identical beside the pad. Answers the pad written (0 = the
+    /// head was aligned; every unpadded ring). A reader never calls this
+    /// — it writes nothing.
+    pub async fn align_head_for_writing(&self) -> Result<u64, KvError> {
+        let geo = *self.core.geometry();
+        let head = self.core.head();
+        let pad = geo.pad_of(head);
+        if pad == 0 {
+            return Ok(0);
+        }
+        let adm = self
+            .try_admit(0, AdmissionClass::Checkpoint)
+            .ok_or(KvError::JournalReserveExhausted { needed: pad })?;
+        let (res, _) = self.reserve_registered(adm);
+        debug_assert_eq!((res.start, res.len, res.pad), (head, 0, pad));
+        let mut ops: Vec<(u64, bytes::Bytes)> = Vec::new();
+        self.pad_ops(res.start, res.pad, &mut ops);
+        let out = self.rmw_unaligned_ops(ops).await;
+        self.complete(&res);
+        out?;
+        self.note_pad_written(pad);
+        log::info!(
+            "journal ring on {}: recovered head {head} stood mid-sector — a {pad} B pad entry \
+             aligns the first reservation to the {} B grain",
+            self.path.display(),
+            geo.grain
+        );
+        Ok(pad)
+    }
+
+    /// Land `ops` whose offsets need not be sector-aligned by rewriting
+    /// the covering aligned spans: each span is read fresh, the ops
+    /// overlaid, the span written whole. Only [`Self::align_head_for_
+    /// writing`]'s recovery pad uses it (see there for why that is
+    /// honest); every other ring write is aligned by construction.
+    async fn rmw_unaligned_ops(&self, ops: Vec<(u64, bytes::Bytes)>) -> Result<(), KvError> {
+        let mode = crate::uring_fs::meta_io_mode(&self.path);
+        let (grain, mem_align) = match mode.filter(|m| m.direct) {
+            Some(m) => (m.grain, m.mem_align),
+            None => {
+                // Buffered: the ops land as they are.
+                return if ops.len() == 1 {
+                    let (off, data) = ops.into_iter().next().expect("one op");
+                    crate::uring_fs::write_at(&self.path, off, data)
+                        .await
+                        .map_err(KvError::Io)
+                } else {
+                    crate::uring_fs::write_at_batch(&self.path, ops)
+                        .await
+                        .map_err(KvError::Io)
+                };
+            }
+        };
+        // Covering spans, merged.
+        let mut spans: Vec<(u64, u64)> = ops
+            .iter()
+            .map(|(off, d)| {
+                let lo = off - off % grain;
+                let hi = (off + d.len() as u64).div_ceil(grain) * grain;
+                (lo, hi)
+            })
+            .collect();
+        spans.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (lo, hi) in spans {
+            match merged.last_mut() {
+                Some((_, phi)) if lo <= *phi => *phi = (*phi).max(hi),
+                _ => merged.push((lo, hi)),
+            }
+        }
+        let mut writes: Vec<(u64, bytes::Bytes)> = Vec::with_capacity(merged.len());
+        for (lo, hi) in merged {
+            let len = (hi - lo) as usize;
+            let cur = crate::uring_fs::read_at(&self.path, lo, len).await?;
+            let mut image = crate::uring_fs::AlignedBuf::zeroed(len, mem_align);
+            let dst = image.as_mut_slice();
+            let n = cur.len().min(len);
+            dst[..n].copy_from_slice(&cur[..n]);
+            for (off, d) in ops.iter().filter(|(off, _)| *off >= lo && *off < hi) {
+                let at = (*off - lo) as usize;
+                dst[at..at + d.len()].copy_from_slice(d);
+            }
+            writes.push((lo, image.into_bytes()));
+        }
+        crate::uring_fs::write_at_batch(&self.path, writes)
+            .await
+            .map_err(KvError::Io)
+    }
+
+    /// The sector-pad accounting (`meta_kv_journal_pad_{entries,bytes}`):
+    /// the ring-capacity cost of the aligned form, kept apart from the
+    /// entry economy's counters so `journal_entries` per op keeps its
+    /// meaning.
+    fn note_pad_written(&self, pad: u64) {
+        if pad > 0 {
+            super::META_KV_JOURNAL_PAD_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            super::META_KV_JOURNAL_PAD_BYTES.fetch_add(pad, std::sync::atomic::Ordering::Relaxed);
+            self.written_pad_bytes
+                .fetch_add(pad, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// PR M7 (design-metadata-throughput §5.5 D5): write a conveyor
@@ -1251,11 +1519,14 @@ impl JournalRing {
     /// byte is submitted (the caller treats it exactly like a failed
     /// write: nothing landed, the range is an abandoned hole).
     ///
-    /// Parts must be non-overlapping and each sized exactly
-    /// ([`entry_len_for`] == `res.len`), but need not be contiguous —
-    /// a rolled-back member's sub-range is simply absent (the §4.4 pt 4
-    /// unwritten hole; its page headers are written iff some surviving
-    /// part owns the page's first byte).
+    /// `window` is the batch's ONE registered reservation (its span and
+    /// its sector pad — PR 13i: the pad entry is written with the batch,
+    /// whatever its last member's fate); `parts` are the surviving
+    /// members' sub-ranges inside it, non-overlapping and each sized
+    /// exactly ([`entry_len_for`] == `res.len`), not necessarily
+    /// contiguous — a rolled-back member's sub-range is simply absent
+    /// (the §4.4 pt 4 unwritten hole; its page headers are written iff
+    /// some surviving part owns the page's first byte).
     ///
     /// The caller owns registration/completion of the covering
     /// reservation (completed on BOTH outcomes once the write's outcome
@@ -1267,6 +1538,7 @@ impl JournalRing {
     /// itself; otherwise on the process pool.
     pub fn submit_entries_batch(
         &self,
+        window: &Reservation,
         parts: &[(Reservation, &[(u8, Record)])],
         lane: Option<&super::journal_lane::JournalLane>,
     ) -> Result<EntriesWriteInFlight, KvError> {
@@ -1274,6 +1546,8 @@ impl JournalRing {
         for (res, records) in parts {
             self.entry_ops(res, records, &mut ops)?;
         }
+        self.pad_ops(window.end(), window.pad, &mut ops);
+        let ops = self.aligned_ops(window.start, window.padded_end(), ops)?;
         let mut ops = Some(ops);
         let completion = match lane.and_then(|l| l.submit_write_at_batch(&self.path, &mut ops)) {
             Some(c) => c,
@@ -1291,6 +1565,7 @@ impl JournalRing {
             completion,
             entries: parts.len() as u64,
             bytes: parts.iter().map(|(r, _)| r.len).sum(),
+            pad: window.pad,
         })
     }
 
@@ -1328,6 +1603,8 @@ pub struct EntriesWriteInFlight {
     completion: crate::uring_fs::WriteCompletion,
     entries: u64,
     bytes: u64,
+    /// The window's sector pad (accounted apart from the entry bytes).
+    pad: u64,
     /// Submission instant (`meta_txpass_phase_ns.journal_ring_write` =
     /// submission → observed completion).
     pub submitted_at: std::time::Instant,
@@ -1350,11 +1627,12 @@ impl EntriesWriteInFlight {
         ring: &JournalRing,
         traced: &crate::op_trace::TracedBatch,
     ) -> Result<(), KvError> {
-        let (entries, bytes) = (self.entries, self.bytes);
+        let (entries, bytes, pad) = (self.entries, self.bytes, self.pad);
         let (out, stamps) = self.completion.wait_stamped().await;
         stamps.stamp(traced);
         out?;
         ring.note_entries_written(entries, bytes);
+        ring.note_pad_written(pad);
         Ok(())
     }
 }
@@ -1374,6 +1652,9 @@ fn read_logical(image: &[u8], geo: &CoreGeometry, pos: u64, len: u64, out: &mut 
 enum Parsed {
     /// A verified entry: `(records, end_pos)`.
     Entry(Vec<(u8, Record)>, u64),
+    /// A verified PAD entry (PR 13i — the sector pad behind a
+    /// reservation): a chain link carrying no records, `end_pos`.
+    Pad(u64),
     /// No valid entry at this position (torn/garbage/stale/end-of-log).
     Fail,
 }
@@ -1419,6 +1700,16 @@ fn parse_entry_at(image: &[u8], geo: &CoreGeometry, pos: u64, chain_end: u64) ->
     }
     let mut payload = Vec::with_capacity(len as usize);
     read_logical(image, geo, payload_pos, u64::from(len), &mut payload);
+    // A PAD entry (PR 13i): the marker byte then zeros to its end — a
+    // verified chain link with nothing to replay. Anything else behind
+    // the marker is a writer bug, dropped like an undecodable payload.
+    if payload.first() == Some(&PAD_TAG) {
+        return if payload[1..].iter().all(|b| *b == 0) {
+            Parsed::Pad(pos + whole)
+        } else {
+            Parsed::Fail
+        };
+    }
     match decode_entry_payload(&payload) {
         Ok(records) => Parsed::Entry(records, pos + whole),
         // The checksum verified but the records do not decode: a writer
@@ -1497,6 +1788,15 @@ fn replay_scan_image(
                     if pos >= tail {
                         entries.push(ReplayedEntry { seq: pos, records });
                     }
+                    cursor = Some(end);
+                }
+                Parsed::Pad(end) => {
+                    // A pad is a chain link like any entry — it confirms
+                    // the drops before it and moves the head — with
+                    // nothing to replay.
+                    dropped += pending;
+                    pending = 0;
+                    head_pos = end;
                     cursor = Some(end);
                 }
                 Parsed::Fail => {

@@ -339,6 +339,14 @@ pub static META_KV_JOURNAL_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Journal entries written (one whole transaction each, §4.1). Surfaced
 /// as `meta_kv_journal_entries` (design §10) in PR K7.
 pub static META_KV_JOURNAL_ENTRIES: AtomicU64 = AtomicU64::new(0);
+/// PAD entries written behind reservations on sector-padded rings (PR 13i
+/// F-C1, design-symmetric-metadata §5.12 — `O_DIRECT` metadata I/O): the
+/// aligned form's ring-capacity cost, kept apart from
+/// [`META_KV_JOURNAL_ENTRIES`] so the entry economy's per-op ratio keeps
+/// its meaning. 0 on an unpadded (buffered) ring.
+pub static META_KV_JOURNAL_PAD_ENTRIES: AtomicU64 = AtomicU64::new(0);
+/// Bytes those pad entries occupy (≤ `PAD_MIN + grain` per window).
+pub static META_KV_JOURNAL_PAD_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Bset frames appended to node tails by writeback (§4.6 pt 1). Surfaced
 /// as `meta_kv_node_appends` (design §10) in PR K7.

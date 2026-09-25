@@ -480,6 +480,11 @@ impl ImageBuilder {
     /// references a half-built image — the §6.2 flip discipline applied
     /// to format).
     pub async fn build(&self, path: &Path, volume_len: u64) -> Result<BuiltImage, KvError> {
+        // The image is shared-LUN metadata I/O from its first byte (PR 13i
+        // F-C1): the builder's own writes ride the same O_DIRECT posture
+        // every later door reads under, so a second host's page cache never
+        // holds a stale pre-format image of these sectors.
+        super::superblock::register_meta_device(path)?;
         let mut sb = SuperblockV3::plan(
             volume_len,
             self.cfg.node_size,
@@ -1392,6 +1397,10 @@ async fn format_v3_inner(
         f.set_len(volume_len)
             .map_err(crate::error::SqueezefsError::Io)?;
     }
+    // The image is shared-LUN metadata I/O from its first byte (PR 13i
+    // F-C1): registered before the wipe so the zeroing rides O_DIRECT too
+    // (`ImageBuilder::build` re-registers idempotently).
+    crate::uring_fs::register_meta_device(path)?;
 
     if opts.full_wipe {
         zero_range(path, 0, volume_len).await?;

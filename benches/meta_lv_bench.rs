@@ -848,6 +848,7 @@ fn bench_kv_journal(c: &mut Criterion) {
         page_data_len: JOURNAL_PAGE_DATA_LEN,
         pages: 2048,
         reserve_bytes: checkpoint_reserve_bytes(ring_len),
+        grain: 1,
     };
     let core = JournalCore::new(geo, 0, 0);
     let entry_len = entry_len_for(&create_records).expect("fits");

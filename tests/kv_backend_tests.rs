@@ -338,7 +338,7 @@ async fn version_gate_distinguishes_blank_v2_v3_foreign_future() {
     let mut legacy_sb = Vec::with_capacity(12);
     legacy_sb.extend_from_slice(b"METALV01");
     legacy_sb.extend_from_slice(&2u32.to_le_bytes());
-    squeezefs::uring_fs::write_at(v2.path(), 0, bytes::Bytes::from(legacy_sb))
+    squeezefs::uring_fs::patch_at(v2.path(), 0, bytes::Bytes::from(legacy_sb))
         .await
         .unwrap();
     assert!(matches!(
@@ -383,7 +383,7 @@ async fn version_gate_distinguishes_blank_v2_v3_foreign_future() {
     // Foreign magic: loud, named as foreign/corrupt — never "run format".
     let foreign = NamedTempFile::new().unwrap();
     foreign.as_file().set_len(8 * 1024 * 1024).unwrap();
-    squeezefs::uring_fs::write_at(
+    squeezefs::uring_fs::patch_at(
         foreign.path(),
         0,
         bytes::Bytes::from_static(b"EXT4SUPRJUNKJUNK"),
@@ -414,7 +414,7 @@ async fn version_gate_distinguishes_blank_v2_v3_foreign_future() {
     let future_backup = squeezefs::meta_backend::kv::superblock::backup_offset(V3_VOL_LEN)
         .expect("a fresh format reserves the backup slot");
     for off in [8u64, future_backup + 8] {
-        squeezefs::uring_fs::write_at(
+        squeezefs::uring_fs::patch_at(
             future.path(),
             off,
             bytes::Bytes::copy_from_slice(&99u32.to_le_bytes()),
@@ -448,7 +448,7 @@ async fn v3_superblock_checksum_covers_the_whole_sector() {
 
     // Flip one byte in the sector's zero padding, far past the struct
     // fields: the whole-sector checksum must still catch it.
-    squeezefs::uring_fs::write_at(file.path(), 900, bytes::Bytes::from_static(&[0xFF]))
+    squeezefs::uring_fs::patch_at(file.path(), 900, bytes::Bytes::from_static(&[0xFF]))
         .await
         .unwrap();
     // DUR-5 first: with only sector 0 damaged the redundant copy carries
@@ -460,7 +460,7 @@ async fn v3_superblock_checksum_covers_the_whole_sector() {
     );
     let backup = squeezefs::meta_backend::kv::superblock::backup_offset(V3_VOL_LEN)
         .expect("a fresh format reserves the backup slot");
-    squeezefs::uring_fs::write_at(
+    squeezefs::uring_fs::patch_at(
         file.path(),
         backup + 900,
         bytes::Bytes::from_static(&[0xFF]),
@@ -1412,7 +1412,7 @@ async fn v3_format_guards_match_the_preflight_contract() {
     let mut legacy_sb = Vec::with_capacity(12);
     legacy_sb.extend_from_slice(b"METALV01");
     legacy_sb.extend_from_slice(&2u32.to_le_bytes());
-    squeezefs::uring_fs::write_at(v2.path(), 0, bytes::Bytes::from(legacy_sb))
+    squeezefs::uring_fs::patch_at(v2.path(), 0, bytes::Bytes::from(legacy_sb))
         .await
         .unwrap();
     assert!(

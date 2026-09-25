@@ -1263,6 +1263,7 @@ mod models {
             page_data_len: 4,
             pages,
             reserve_bytes,
+            grain: 1,
         }
     }
 
@@ -1502,6 +1503,97 @@ mod models {
             );
             core.release(exact);
             assert_eq!(core.admitted(), 0);
+        });
+    }
+
+    /// Journal-core invariant #4 (PR 13i F-C1, design-symmetric-metadata
+    /// §5.12 — the PADDED ring): on a sector-grained geometry `reserve` is
+    /// a CAS loop whose pad depends on where the head stands. Two
+    /// committers racing admit+reserve receive disjoint, back-to-back
+    /// PADDED ranges (the second begins at the first's `padded_end`), every
+    /// reservation ends sector-aligned, every pad is inside `[0, max_pad]`
+    /// and within the admission's slack, the head equals the sum of the
+    /// padded lengths, and the admitted budget conserves to zero (each
+    /// admission's whole claim — entry + slack — is given back at reserve,
+    /// the pad taken out of the slack).
+    ///
+    /// Geometry: 64-byte pages, grain 8. With the 24 B page header
+    /// `(24 + off) % 8 == 0 ⇔ off % 8 == 0`, so the aligned positions of a
+    /// page are its 8-byte columns and its end; `max_pad = PAD_MIN + 8`.
+    /// Capacity 128 holds two admissions of `3 + 29` unconditionally.
+    #[test]
+    fn journal_core_padded_reserve_lands_every_end_sector_aligned() {
+        loom::model(|| {
+            let geo = journal_core::CoreGeometry {
+                page_data_len: 64,
+                pages: 2,
+                reserve_bytes: 0,
+                grain: 8,
+            };
+            assert_eq!(geo.max_pad(), journal_core::PAD_MIN + 8);
+            let core = Arc::new(journal_core::JournalCore::new(geo, 0, 0));
+
+            let t = {
+                let core = Arc::clone(&core);
+                thread::spawn(move || {
+                    let adm = core
+                        .try_admit(3, journal_core::AdmissionClass::User)
+                        .expect("3 + slack of 128 must admit");
+                    assert_eq!(
+                        adm.slack(),
+                        geo.max_pad(),
+                        "every admission carries the slack"
+                    );
+                    core.reserve(adm)
+                })
+            };
+            let adm = core
+                .try_admit(3, journal_core::AdmissionClass::User)
+                .expect("3 + slack more of 128 must admit");
+            let r_main = core.reserve(adm);
+            let r_thread = t.join().unwrap();
+
+            let (a, b) = if r_main.start < r_thread.start {
+                (r_main, r_thread)
+            } else {
+                (r_thread, r_main)
+            };
+            assert_eq!(a.start, 0, "the first reservation starts the ring");
+            assert_eq!(a.len, 3);
+            assert_eq!(
+                b.start,
+                a.padded_end(),
+                "the second begins where the first's PAD ends"
+            );
+            for r in [a, b] {
+                assert!(r.pad <= geo.max_pad(), "pad {} past max_pad", r.pad);
+                assert!(
+                    geo.sector_aligned(r.padded_end()),
+                    "reservation [{}, {}) + pad {} ends off a sector boundary",
+                    r.start,
+                    r.end(),
+                    r.pad
+                );
+                assert_eq!(
+                    r.pad,
+                    geo.pad_of(r.end()),
+                    "the pad is the law's for this end"
+                );
+                assert!(
+                    r.pad == 0 || r.pad >= journal_core::PAD_MIN,
+                    "a non-zero pad holds a PAD entry"
+                );
+            }
+            assert_eq!(
+                core.head(),
+                a.padded_len() + b.padded_len(),
+                "head == Σ padded lengths"
+            );
+            assert_eq!(
+                core.admitted(),
+                0,
+                "each admission's whole claim (entry + slack) returns at reserve"
+            );
         });
     }
 
@@ -6510,6 +6602,7 @@ mod conveyor_two_stage_models {
                 page_data_len: 4,
                 pages: 2,
                 reserve_bytes: 0,
+                grain: 1,
             };
             Self {
                 core: journal_core::JournalCore::new(geo, 0, 0),

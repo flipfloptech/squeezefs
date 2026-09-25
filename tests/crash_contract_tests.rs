@@ -561,9 +561,11 @@ fn kv_phys(ring: &JournalRing, pos: u64) -> u64 {
 }
 
 /// Post-hoc damage: overwrite `len` bytes at physical offset `off` with
-/// `0x5A` garbage via io_uring (the unordered-writeback tear model).
+/// `0x5A` garbage (the unordered-writeback tear model). Byte-planted
+/// through the harness primitive, which read-modify-writes the covering
+/// aligned span on a direct path (PR 13i).
 async fn kv_smash(path: &std::path::Path, off: u64, len: usize) {
-    uring_fs::write_at(path, off, vec![0x5Au8; len])
+    uring_fs::patch_at(path, off, vec![0x5Au8; len])
         .await
         .expect("fault injection write");
 }
@@ -733,7 +735,7 @@ async fn test_kv_journal_garbage_len_never_dereferenced() {
         let _c = kv_append(&ring, 3, 1000, 0xD3).await;
 
         // B's len field (logical bytes 8..12 of the entry) → 0xFFFFFFFF.
-        uring_fs::write_at(
+        uring_fs::patch_at(
             f.path(),
             kv_phys(&ring, b.start + 8),
             vec![0xFF, 0xFF, 0xFF, 0xFF],
@@ -757,7 +759,7 @@ async fn test_kv_journal_garbage_len_never_dereferenced() {
         let _c = kv_append(&ring, 3, 1000, 0xD6).await;
 
         // 100,000 < the cap, but far past the 4-page window.
-        uring_fs::write_at(
+        uring_fs::patch_at(
             f.path(),
             kv_phys(&ring, b.start + 8),
             100_000u32.to_le_bytes().to_vec(),
@@ -1755,10 +1757,10 @@ async fn kv_write_batch3(
         .try_admit(total, AdmissionClass::User)
         .expect("test ring must admit the batch");
     let batch = ring.core().reserve(adm);
-    let mut parts_res = [Reservation { start: 0, len: 0 }; 3];
+    let mut parts_res = [Reservation::unpadded(0, 0); 3];
     let mut cursor = batch.start;
     for (i, len) in lens.into_iter().enumerate() {
-        parts_res[i] = Reservation { start: cursor, len };
+        parts_res[i] = Reservation::unpadded(cursor, len);
         cursor += len;
     }
     let recs: Vec<Vec<(u8, Record)>> = (0..3)
@@ -1769,7 +1771,7 @@ async fn kv_write_batch3(
         .zip(&recs)
         .map(|(r, recs)| (*r, recs.as_slice()))
         .collect();
-    ring.submit_entries_batch(&parts, None)
+    ring.submit_entries_batch(&batch, &parts, None)
         .expect("clean batch submit")
         .finish(ring, &squeezefs::op_trace::TracedBatch::new())
         .await

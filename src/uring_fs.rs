@@ -540,6 +540,460 @@ fn map_io(e: std::io::Error) -> SqueezefsError {
 }
 
 // ---------------------------------------------------------------------------
+// Shared-LUN metadata devices — O_DIRECT (PR 13i F-C1; design-symmetric-
+// metadata §5.12).
+//
+// Every metadata read and write used to ride the issuing HOST's block-
+// device page cache. One box is one cache, which is every venue the
+// program had run on; two hosts over nvme-tcp are two caches of one LUN,
+// and the cloud row's joiner read its kernel's stale image of a page the
+// manager had rewritten (its appender page's grant word, tree 0, ring 0).
+// The law (GPFS's / Lustre's shared-LUN rule): a REGISTERED metadata
+// device path is opened `O_DIRECT` by every worker — every read of a
+// block another host may write bypasses the cache, and every write
+// reaches the device before it completes, which is also what makes the
+// DUR barrier's `fdatasync` honest (it flushes the device's cache, not a
+// host cache that never received the write).
+//
+// `O_DIRECT` needs `(offset, length, buffer)` aligned to the device's
+// logical block size — DERIVED per path (`statx(STATX_DIOALIGN)`, the
+// block device's sysfs `logical_block_size`, 4096 when neither answers),
+// never assumed. The worker gives every shape its aligned form:
+//   * reads: the span is widened to the grain into an aligned buffer and
+//     the caller's window is a refcounted slice of it (no copy);
+//   * writes: offset and length MUST be aligned — a misaligned direct
+//     write is a CALLER bug refused loud (`meta_io_unaligned_refusals`,
+//     must-stay-0), never a silent RMW; an unaligned BUFFER is bounced
+//     into an aligned copy (`meta_io_bounce_bytes` — the KV layer builds
+//     its images aligned so the hot paths pay none).
+// The KV layer's own aligned forms (the journal ring's sector pad, the
+// node append's tail-sector rewrite from its RAM image) live beside the
+// shapes they align — `journal.rs`, `node.rs` — and read the grain here.
+//
+// The buffered path survives for exactly one venue: a REGULAR FILE on a
+// filesystem that refuses `O_DIRECT` (tmpfs — the test sandboxes), a
+// fallback taken LOUD and counted (`meta_io_buffered_fallback`, must-
+// stay-0 on any block device), never on a block device, never silently;
+// and for the red pin's control arm through the harness seam
+// `SQUEEZEFS_TEST_META_BUFFERED=1`.
+// ---------------------------------------------------------------------------
+
+/// The I/O posture of one registered metadata device path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetaIoMode {
+    /// The alignment grain in bytes every direct read span, write offset
+    /// and write length obey — the device's logical block size. `1` on
+    /// the buffered posture (nothing to align; the KV layer pads nothing).
+    pub grain: u64,
+    /// Buffer alignment for direct I/O (statx's `stx_dio_mem_align`, else
+    /// the grain).
+    pub mem_align: usize,
+    /// `true` = `O_DIRECT`; `false` = the buffered fallback (a regular
+    /// file whose filesystem refuses direct I/O, or the harness seam).
+    pub direct: bool,
+}
+
+impl MetaIoMode {
+    /// The buffered posture: the pre-PR-13i behaviour verbatim.
+    pub const BUFFERED: MetaIoMode = MetaIoMode {
+        grain: 1,
+        mem_align: 1,
+        direct: false,
+    };
+}
+
+/// Registered metadata device paths → their posture. Keyed by the path
+/// as the KV layer names it AND by its canonical form, so every worker's
+/// open — whichever spelling reaches it — finds the same answer.
+static META_IO_MODES: Lazy<std::sync::RwLock<HashMap<PathBuf, MetaIoMode>>> =
+    Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
+
+/// Metadata device paths registered `O_DIRECT` (`meta_io_direct_paths`).
+pub static META_IO_DIRECT_PATHS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Registered metadata paths that fell back to BUFFERED I/O — a regular
+/// file on a filesystem refusing `O_DIRECT`, or the harness seam
+/// (`meta_io_buffered_fallback`; must-stay-0 on any block device, where
+/// the fallback is refused instead).
+pub static META_IO_BUFFERED_FALLBACK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Bytes of direct-write buffers COPIED into an aligned buffer because
+/// the caller's was not (`meta_io_bounce_bytes`) — the KV layer's images
+/// are built aligned, so growth names a caller that is not.
+pub static META_IO_BOUNCE_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Direct writes REFUSED for a misaligned offset or length
+/// (`meta_io_unaligned_refusals`, must-stay-0): a caller bug — the
+/// aligned form belongs beside the shape, never to a silent RMW here.
+pub static META_IO_UNALIGNED_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Direct reads whose caller window was widened to the grain
+/// (`meta_io_read_widened`) — the cold path's bounce-free slice; the
+/// hot metadata reads are RAM-authoritative (the node cache).
+pub static META_IO_READ_WIDENED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The grain every metadata volume pads to when the device does not
+/// say: the largest logical block size in the field (4Kn), so an
+/// unknown device is never under-aligned.
+pub const META_IO_DEFAULT_GRAIN: u64 = 4096;
+
+/// The harness seam: `SQUEEZEFS_TEST_META_BUFFERED=1` keeps every
+/// registered metadata path BUFFERED — the red pin's control arm.
+fn test_meta_buffered() -> bool {
+    crate::env_knobs::bool_knob("SQUEEZEFS_TEST_META_BUFFERED", false)
+}
+
+/// The posture of `path`, if registered.
+pub fn meta_io_mode(path: &Path) -> Option<MetaIoMode> {
+    let modes = META_IO_MODES.read().unwrap_or_else(|e| e.into_inner());
+    modes.get(path).copied().or_else(|| {
+        std::fs::canonicalize(path)
+            .ok()
+            .and_then(|c| modes.get(&c).copied())
+    })
+}
+
+/// The alignment grain the KV layer's aligned forms use for `path`: the
+/// registered posture's, `1` (no padding, the pre-PR-13i arithmetic) for
+/// an unregistered path.
+pub fn meta_io_grain(path: &Path) -> u64 {
+    meta_io_mode(path).map_or(1, |m| m.grain)
+}
+
+/// `(offset_align, mem_align)` from `statx(STATX_DIOALIGN)`, `None` when
+/// the kernel or filesystem does not report it.
+fn statx_dio_align(path: &Path) -> Option<(u64, usize)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: a zeroed `statx` out-buffer of the libc struct's size; the
+    // path is a valid NUL-terminated C string; flags/mask are constants.
+    let mut st: libc::statx = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            libc::AT_STATX_SYNC_AS_STAT,
+            libc::STATX_DIOALIGN,
+            &mut st,
+        )
+    };
+    if rc != 0 || (st.stx_mask & libc::STATX_DIOALIGN) == 0 || st.stx_dio_offset_align == 0 {
+        return None;
+    }
+    Some((
+        u64::from(st.stx_dio_offset_align),
+        st.stx_dio_mem_align.max(1) as usize,
+    ))
+}
+
+/// A block device's logical block size off sysfs (`/sys/dev/block/M:m/
+/// queue/logical_block_size`, the partition's parent when the node is a
+/// partition), `None` when unreadable.
+fn sysfs_logical_block_size(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let md = std::fs::metadata(path).ok()?;
+    if !md.file_type().is_block_device() {
+        return None;
+    }
+    let rdev = md.rdev();
+    let (major, minor) = (libc::major(rdev), libc::minor(rdev));
+    let dev = PathBuf::from(format!("/sys/dev/block/{major}:{minor}"));
+    for candidate in [
+        dev.join("queue/logical_block_size"),
+        dev.join("../queue/logical_block_size"),
+    ] {
+        if let Ok(s) = std::fs::read_to_string(&candidate) {
+            if let Ok(v) = s.trim().parse::<u64>() {
+                if v.is_power_of_two() && v <= META_IO_DEFAULT_GRAIN {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Register `path` as a shared-LUN metadata device: probe its direct-I/O
+/// alignment, prove the substrate serves `O_DIRECT`, and record the
+/// posture every later `uring_fs` open of the path takes. Idempotent (a
+/// registered path answers its recorded posture). Refuses a block device
+/// that cannot be opened `O_DIRECT` — the buffered fallback is a regular
+/// file's alone.
+pub fn register_meta_device(path: &Path) -> Result<MetaIoMode> {
+    if let Some(m) = meta_io_mode(path) {
+        return Ok(m);
+    }
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    let md = std::fs::metadata(path).map_err(|e| {
+        SqueezefsError::Io(std::io::Error::new(
+            e.kind(),
+            format!("metadata device {}: cannot stat: {e}", path.display()),
+        ))
+    })?;
+    let is_bdev = md.file_type().is_block_device();
+    if !is_bdev && !md.file_type().is_file() {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "metadata device {} is neither a block device nor a regular file",
+            path.display()
+        )));
+    }
+    let (grain, mem_align) = statx_dio_align(path)
+        .or_else(|| sysfs_logical_block_size(path).map(|g| (g, g as usize)))
+        .unwrap_or((META_IO_DEFAULT_GRAIN, META_IO_DEFAULT_GRAIN as usize));
+    // A grain the ring's page arithmetic can honour: a power of two no
+    // wider than the 4 KiB page (page boundaries are then always aligned).
+    let grain = if grain.is_power_of_two() && grain <= META_IO_DEFAULT_GRAIN {
+        grain
+    } else {
+        META_IO_DEFAULT_GRAIN
+    };
+    let mem_align = mem_align.max(grain as usize).next_power_of_two();
+    let mode = if test_meta_buffered() {
+        log::warn!(
+            "metadata device {}: SQUEEZEFS_TEST_META_BUFFERED=1 — BUFFERED metadata I/O (the \
+             harness seam; a second host's reads of this device are NOT coherent)",
+            path.display()
+        );
+        META_IO_BUFFERED_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        MetaIoMode::BUFFERED
+    } else {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECT)
+            .open(path)
+        {
+            Ok(_) => {
+                META_IO_DIRECT_PATHS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                log::info!(
+                    "metadata device {}: O_DIRECT (grain {grain} B, buffer alignment {mem_align} B) — \
+                     shared-LUN coherent metadata I/O (design-symmetric-metadata §5.12)",
+                    path.display()
+                );
+                MetaIoMode {
+                    grain,
+                    mem_align,
+                    direct: true,
+                }
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) && !is_bdev => {
+                META_IO_BUFFERED_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                log::warn!(
+                    "metadata volume {}: the filesystem refuses O_DIRECT ({e}) — falling back to \
+                     BUFFERED metadata I/O for this REGULAR FILE (a dev/test venue such as tmpfs; a \
+                     shared LUN is never a regular file, so no second host reads this volume). \
+                     meta_io_buffered_fallback counts it",
+                    path.display()
+                );
+                MetaIoMode::BUFFERED
+            }
+            Err(e) => {
+                return Err(SqueezefsError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "metadata device {}: O_DIRECT open failed ({e}); shared-LUN metadata I/O \
+                         must bypass the host page cache (design-symmetric-metadata §5.12) and a \
+                         block device that refuses it cannot serve a coherent set — REFUSING",
+                        path.display()
+                    ),
+                )));
+            }
+        }
+    };
+    let mut modes = META_IO_MODES.write().unwrap_or_else(|e| e.into_inner());
+    modes.insert(path.to_path_buf(), mode);
+    if let Ok(c) = std::fs::canonicalize(path) {
+        modes.insert(c, mode);
+    }
+    Ok(mode)
+}
+
+/// Forget every registered metadata path (the test harnesses' reset —
+/// a sandbox file's path is reused across suites in one process).
+pub fn clear_meta_devices() {
+    META_IO_MODES
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// A heap buffer with a guaranteed alignment — the direct-I/O staging
+/// form (`posix_memalign`-class, freed with the same layout).
+pub struct AlignedBuf {
+    ptr: std::ptr::NonNull<u8>,
+    len: usize,
+    layout: std::alloc::Layout,
+}
+
+// SAFETY: the buffer is uniquely owned heap memory; nothing about it is
+// thread-affine.
+unsafe impl Send for AlignedBuf {}
+unsafe impl Sync for AlignedBuf {}
+
+impl AlignedBuf {
+    /// `len` zeroed bytes at `align` (a power of two; `len` need not be a
+    /// multiple of it — the CALLER sizes direct I/O to the grain).
+    pub fn zeroed(len: usize, align: usize) -> Self {
+        let align = align.max(1).next_power_of_two();
+        let layout =
+            std::alloc::Layout::from_size_align(len.max(1), align).expect("aligned buffer layout");
+        // SAFETY: a non-zero-sized layout; the allocation is checked below.
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+        let ptr =
+            std::ptr::NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        Self { ptr, len, layout }
+    }
+
+    /// An aligned copy of `src`.
+    pub fn from_slice(src: &[u8], align: usize) -> Self {
+        let mut b = Self::zeroed(src.len(), align);
+        b.as_mut_slice().copy_from_slice(src);
+        b
+    }
+
+    /// The buffer's length.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The bytes, mutably.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `ptr` is a live allocation of `len` initialized (zeroed
+        // or copied) bytes, uniquely borrowed through `&mut self`.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+
+    /// Hand the buffer to a `Bytes` (zero-copy; the allocation frees with
+    /// the last reference).
+    pub fn into_bytes(self) -> bytes::Bytes {
+        if self.len == 0 {
+            return bytes::Bytes::new();
+        }
+        bytes::Bytes::from_owner(self)
+    }
+
+    /// Whether `ptr` satisfies `align`.
+    pub fn ptr_aligned(ptr: *const u8, align: usize) -> bool {
+        align <= 1 || (ptr as usize) % align == 0
+    }
+}
+
+impl AsRef<[u8]> for AlignedBuf {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: as in `as_mut_slice`, shared.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` came from `alloc_zeroed(self.layout)` and is freed
+        // exactly once here.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
+/// The direct-write preflight: a misaligned offset or length is REFUSED
+/// (the caller's bug — never a silent RMW here), an unaligned buffer is
+/// bounced into an aligned copy. `None` = buffered path, nothing to do.
+fn prepare_direct_write(
+    mode: Option<MetaIoMode>,
+    path: &Path,
+    offset: u64,
+    data: &mut bytes::Bytes,
+) -> Result<()> {
+    let Some(m) = mode.filter(|m| m.direct) else {
+        return Ok(());
+    };
+    let len = data.len() as u64;
+    if offset % m.grain != 0 || len % m.grain != 0 {
+        META_IO_UNALIGNED_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Err(SqueezefsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "direct metadata write at offset {offset} of {len} bytes to {} is not aligned to \
+                 the device grain ({} B) — a caller bug: the aligned form belongs beside the \
+                 shape (meta_io_unaligned_refusals)",
+                path.display(),
+                m.grain
+            ),
+        )));
+    }
+    if !AlignedBuf::ptr_aligned(data.as_ptr(), m.mem_align) {
+        META_IO_BOUNCE_BYTES.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+        *data = AlignedBuf::from_slice(data, m.mem_align).into_bytes();
+    }
+    Ok(())
+}
+
+/// Zero-extend `image` to a multiple of `path`'s I/O grain — the aligned
+/// form of a variable-length unit written into an extent it owns whole
+/// (the slot-tails spill, PR 13i): the consumer records the unit's exact
+/// length beside its address, so the trailing zeros are never read as
+/// content. A buffered path (grain 1) keeps the image verbatim.
+pub fn pad_to_grain(path: impl AsRef<Path>, mut image: Vec<u8>) -> bytes::Bytes {
+    let grain = meta_io_grain(path.as_ref()) as usize;
+    if grain > 1 {
+        let padded = image.len().div_ceil(grain) * grain;
+        image.resize(padded, 0);
+    }
+    bytes::Bytes::from(image)
+}
+
+/// **The harness's byte-planting primitive**: land `data` at ANY
+/// `offset` of `path` — on a direct path by read-modify-write of the
+/// covering aligned span (read fresh, patched, written whole), verbatim on
+/// a buffered one. The crash and corruption contracts plant torn headers,
+/// flipped padding bytes and smashed records at byte offsets; under the
+/// aligned discipline those are caller-bug refusals for the PRODUCT
+/// (`meta_io_unaligned_refusals`), so the harness names its intent here.
+/// Never on a product path — the product's aligned forms live beside
+/// their shapes.
+pub async fn patch_at(
+    path: impl AsRef<Path>,
+    offset: u64,
+    data: impl Into<bytes::Bytes>,
+) -> Result<()> {
+    let path = path.as_ref();
+    let data: bytes::Bytes = data.into();
+    if data.is_empty() {
+        return Ok(());
+    }
+    let Some(m) = meta_io_mode(path).filter(|m| m.direct) else {
+        return write_at(path, offset, data).await;
+    };
+    let lo = offset - offset % m.grain;
+    let hi = (offset + data.len() as u64).div_ceil(m.grain) * m.grain;
+    let len = (hi - lo) as usize;
+    let cur = read_at(path, lo, len).await?;
+    let mut image = AlignedBuf::zeroed(len, m.mem_align);
+    let dst = image.as_mut_slice();
+    let n = cur.len().min(len);
+    dst[..n].copy_from_slice(&cur[..n]);
+    let at = (offset - lo) as usize;
+    dst[at..at + data.len()].copy_from_slice(&data);
+    write_at(path, lo, image.into_bytes()).await
+}
+
+/// `meta_io_*` stats faces (surfaced UNGATED on the stats inode).
+pub fn meta_io_stats_json() -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    serde_json::json!({
+        "meta_io_direct_paths": META_IO_DIRECT_PATHS.load(Relaxed),
+        "meta_io_buffered_fallback": META_IO_BUFFERED_FALLBACK.load(Relaxed),
+        "meta_io_bounce_bytes": META_IO_BOUNCE_BYTES.load(Relaxed),
+        "meta_io_unaligned_refusals": META_IO_UNALIGNED_REFUSALS.load(Relaxed),
+        "meta_io_read_widened": META_IO_READ_WIDENED.load(Relaxed),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Fault-injection test support (design-wal-crash-consistency §4.7a).
 //
 // Live, test-exercised statics per the `nvme_dev.rs` precedent
@@ -988,7 +1442,12 @@ fn fault_eio(what: &str) -> SqueezefsError {
     )))
 }
 
-/// Whether the armed tear offset falls inside `[offset, offset + len)`.
+/// Whether the armed tear offset falls inside `[offset, offset + len)`;
+/// answers the armed `keep` — the bytes of THIS write (from its start)
+/// that persist. On a coalesced aligned run (PR 13i — one write per
+/// journal window) "this write" is the run: a tear inside it keeps the
+/// run's prefix, which is exactly what a sector-granular device does to
+/// one in-flight write.
 fn tear_hits(offset: u64, len: usize) -> Option<usize> {
     let armed = TORN_WRITE_FAULT
         .offset
@@ -1290,10 +1749,19 @@ impl UnitDone {
 enum Pending {
     Read {
         file: Rc<File>,
-        buf: Vec<u8>,
+        /// The read's destination — aligned for direct I/O; on a direct
+        /// path it covers the grain-widened span and the caller's window
+        /// is `[skip, skip + want)` of it.
+        buf: AlignedBuf,
+        /// The device offset the buffer's byte 0 reads.
         file_offset: u64,
         filled: usize,
+        /// The caller's window inside the buffer.
+        skip: usize,
         want: usize,
+        /// The direct grain (1 on a buffered path): a short read that
+        /// ends off the grain cannot continue under `O_DIRECT`.
+        grain: usize,
         tx: oneshot::Sender<Result<bytes::Bytes>>,
     },
     Write {
@@ -1311,7 +1779,10 @@ enum Pending {
 
 /// Per-worker open-file cache: path → (shared fd, last-use generation).
 struct FdCache {
-    map: HashMap<PathBuf, (Rc<File>, u64)>,
+    /// `(fd, LRU stamp, opened O_DIRECT)` — the posture travels with the
+    /// entry so a path registered AFTER its first (buffered) open is
+    /// re-opened direct at its next use, never served off the stale fd.
+    map: HashMap<PathBuf, (Rc<File>, u64, bool)>,
     gen: u64,
 }
 
@@ -1323,16 +1794,25 @@ impl FdCache {
         }
     }
 
-    fn touch(&mut self, path: &Path) -> Option<Rc<File>> {
+    /// The cached fd for `path` if one is open in the wanted posture; a
+    /// posture mismatch drops the entry (in-flight ops hold their own Rc).
+    fn touch(&mut self, path: &Path, direct: bool) -> Option<Rc<File>> {
         self.gen += 1;
         let gen = self.gen;
-        self.map.get_mut(path).map(|(f, g)| {
-            *g = gen;
-            f.clone()
-        })
+        match self.map.get_mut(path) {
+            Some((f, g, d)) if *d == direct => {
+                *g = gen;
+                Some(f.clone())
+            }
+            Some(_) => {
+                self.map.remove(path);
+                None
+            }
+            None => None,
+        }
     }
 
-    fn insert(&mut self, path: PathBuf, file: File) -> Rc<File> {
+    fn insert(&mut self, path: PathBuf, file: File, direct: bool) -> Rc<File> {
         self.gen += 1;
         if self.map.len() >= fd_cache_cap() {
             // Evict the least-recently-used entry. In-flight ops hold their
@@ -1340,22 +1820,24 @@ impl FdCache {
             if let Some(oldest) = self
                 .map
                 .iter()
-                .min_by_key(|(_, (_, g))| *g)
+                .min_by_key(|(_, (_, g, _))| *g)
                 .map(|(p, _)| p.clone())
             {
                 self.map.remove(&oldest);
             }
         }
         let rc = Rc::new(file);
-        self.map.insert(path, (rc.clone(), self.gen));
+        self.map.insert(path, (rc.clone(), self.gen, direct));
         rc
     }
 }
 
 /// Open `path` for cached O_RDWR use (create per `create`), via the cache.
+/// A registered metadata device opens `O_DIRECT` (module comment above).
 fn cached_open(cache: &mut FdCache, path: &Path, create: bool) -> Result<Rc<File>> {
     use std::os::unix::fs::OpenOptionsExt;
-    if let Some(f) = cache.touch(path) {
+    let direct = meta_io_mode(path).is_some_and(|m| m.direct);
+    if let Some(f) = cache.touch(path, direct) {
         return Ok(f);
     }
     // O_RDWR (not O_WRONLY): this fd is cached and may later be reused by a
@@ -1365,10 +1847,38 @@ fn cached_open(cache: &mut FdCache, path: &Path, create: bool) -> Result<Rc<File
         .read(true)
         .write(true)
         .create(create)
-        .custom_flags(libc::O_CLOEXEC)
+        .custom_flags(libc::O_CLOEXEC | if direct { libc::O_DIRECT } else { 0 })
         .open(path)
         .map_err(map_io)?;
-    Ok(cache.insert(path.to_path_buf(), f))
+    Ok(cache.insert(path.to_path_buf(), f, direct))
+}
+
+/// The read shape for `[offset, offset + size)` on `path`: on a direct
+/// path the span widened to the grain (`(span_offset, span_len, skip)`),
+/// verbatim otherwise. `grain` is 1 on a buffered path.
+fn read_span(path: &Path, offset: u64, size: usize) -> (u64, usize, usize, usize) {
+    match meta_io_mode(path).filter(|m| m.direct) {
+        Some(m) => {
+            let g = m.grain;
+            let start = offset - offset % g;
+            let end = (offset + size as u64).div_ceil(g) * g;
+            let skip = (offset - start) as usize;
+            if start != offset || end != offset + size as u64 {
+                META_IO_READ_WIDENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            (start, (end - start) as usize, skip, g as usize)
+        }
+        None => (offset, size, 0, 1),
+    }
+}
+
+/// The aligned destination for a read of `len` bytes on `path` (the
+/// grain's alignment on a direct path; a plain allocation otherwise).
+fn read_buf_for(path: &Path, len: usize) -> AlignedBuf {
+    let align = meta_io_mode(path)
+        .filter(|m| m.direct)
+        .map_or(1, |m| m.mem_align);
+    AlignedBuf::zeroed(len, align)
 }
 
 /// Reactor state for one worker thread.
@@ -1417,11 +1927,11 @@ impl Reactor {
                 buf,
                 file_offset,
                 filled,
-                want,
                 ..
             } => {
-                let ptr = buf[*filled..].as_ptr() as *mut u8;
-                opcode::Read::new(types::Fd(file.as_raw_fd()), ptr, (*want - *filled) as u32)
+                let total = buf.len();
+                let ptr = buf.as_ref()[*filled..].as_ptr() as *mut u8;
+                opcode::Read::new(types::Fd(file.as_raw_fd()), ptr, (total - *filled) as u32)
                     .offset(*file_offset + *filled as u64)
                     .build()
                     .user_data(i as u64)
@@ -1508,11 +2018,20 @@ impl Reactor {
                 return;
             }
         };
-        let entries: Vec<(u64, bytes::Bytes)> =
+        let mut entries: Vec<(u64, bytes::Bytes)> =
             ops.into_iter().filter(|(_, d)| !d.is_empty()).collect();
         if entries.is_empty() {
             send_now(tx, Ok(()));
             return;
+        }
+        // The direct-write preflight, per op: a misaligned op fails the
+        // whole logical commit before any byte is submitted.
+        let mode = meta_io_mode(&path);
+        for (offset, data) in entries.iter_mut() {
+            if let Err(e) = prepare_direct_write(mode, &path, *offset, data) {
+                send_now(tx, Err(e));
+                return;
+            }
         }
         let state = Rc::new(std::cell::RefCell::new(BatchState {
             remaining: entries.len(),
@@ -1586,7 +2105,9 @@ impl Reactor {
                         .custom_flags(libc::O_CLOEXEC)
                         .open(&path)
                         .map_err(map_io)?;
-                    Ok(self.cache.insert(path.clone(), f))
+                    // A whole-file rewrite is the control path's (config
+                    // records, never a metadata device): buffered posture.
+                    Ok(self.cache.insert(path.clone(), f, false))
                 })();
                 match opened {
                     Ok(file) => {
@@ -1614,10 +2135,12 @@ impl Reactor {
                     Ok((f, len)) => {
                         let i = self.claim_slot(Pending::Read {
                             file: Rc::new(f),
-                            buf: vec![0u8; len],
+                            buf: AlignedBuf::zeroed(len, 1),
                             file_offset: 0,
                             filled: 0,
+                            skip: 0,
                             want: len,
+                            grain: 1,
                             tx,
                         });
                         if len == 0 {
@@ -1641,12 +2164,15 @@ impl Reactor {
                 tx,
             } => match cached_open(&mut self.cache, &path, true) {
                 Ok(file) => {
+                    let (span_off, span_len, skip, grain) = read_span(&path, offset, size);
                     let i = self.claim_slot(Pending::Read {
                         file,
-                        buf: vec![0u8; size],
-                        file_offset: offset,
+                        buf: read_buf_for(&path, span_len),
+                        file_offset: span_off,
                         filled: 0,
+                        skip,
                         want: size,
+                        grain,
                         tx,
                     });
                     if size == 0 {
@@ -1664,12 +2190,18 @@ impl Reactor {
             FsReq::WriteAt {
                 path,
                 offset,
-                data,
+                mut data,
                 tx,
             } => match cached_open(&mut self.cache, &path, true) {
                 Ok(file) => {
                     if data.is_empty() {
                         send_now(tx, Ok(()));
+                        return;
+                    }
+                    if let Err(e) =
+                        prepare_direct_write(meta_io_mode(&path), &path, offset, &mut data)
+                    {
+                        send_now(tx, Err(e));
                         return;
                     }
                     let i = self.claim_slot(Pending::Write {
@@ -1710,14 +2242,18 @@ impl Reactor {
         let next = {
             let p = self.slots[i].as_mut().expect("completion for empty slot");
             match p {
-                Pending::Read { filled, want, .. } => {
+                Pending::Read {
+                    filled, buf, grain, ..
+                } => {
                     if res < 0 {
                         Next::Done
                     } else if res == 0 {
                         Next::Done // EOF: short read, truncate below
                     } else {
                         *filled += res as usize;
-                        if *filled < *want {
+                        // A direct continuation must resume on the grain;
+                        // a short read that ends off it is the file's end.
+                        if *filled < buf.len() && *filled % *grain == 0 {
                             Next::Resubmit
                         } else {
                             Next::Done
@@ -1746,16 +2282,26 @@ impl Reactor {
                 let p = self.release_slot(i);
                 match p {
                     Pending::Read {
-                        mut buf,
+                        buf,
                         filled,
+                        skip,
+                        want,
                         tx,
                         ..
                     } => {
                         if res < 0 {
                             let _ = tx.send(Err(map_io(std::io::Error::from_raw_os_error(-res))));
                         } else {
-                            buf.truncate(filled);
-                            let _ = tx.send(Ok(bytes::Bytes::from(buf)));
+                            // The caller's window out of the (possibly
+                            // widened) span — a refcounted slice, no copy;
+                            // a short read truncates it.
+                            let end = filled.min(skip + want);
+                            let out = if end <= skip {
+                                bytes::Bytes::new()
+                            } else {
+                                buf.into_bytes().slice(skip..end)
+                            };
+                            let _ = tx.send(Ok(out));
                         }
                     }
                     Pending::Write { done, .. } => {
@@ -2219,21 +2765,35 @@ fn blocking_fallback_loop(rx: crossbeam::channel::Receiver<FsReq>) {
                 size,
                 tx,
             } => {
+                use std::os::unix::fs::OpenOptionsExt;
+                let (span_off, span_len, skip, grain) = read_span(&path, offset, size);
+                let direct = meta_io_mode(&path).is_some_and(|m| m.direct);
                 let res = OpenOptions::new()
                     .read(true)
+                    .custom_flags(if direct { libc::O_DIRECT } else { 0 })
                     .open(&path)
                     .and_then(|f| {
-                        let mut buf = vec![0u8; size];
+                        let mut buf = read_buf_for(&path, span_len);
                         let mut filled = 0usize;
-                        while filled < size {
-                            let n = f.read_at(&mut buf[filled..], offset + filled as u64)?;
+                        while filled < span_len {
+                            let n = f.read_at(
+                                &mut buf.as_mut_slice()[filled..],
+                                span_off + filled as u64,
+                            )?;
                             if n == 0 {
                                 break;
                             }
                             filled += n;
+                            if filled % grain != 0 {
+                                break;
+                            }
                         }
-                        buf.truncate(filled);
-                        Ok(bytes::Bytes::from(buf))
+                        let end = filled.min(skip + size);
+                        Ok(if end <= skip {
+                            bytes::Bytes::new()
+                        } else {
+                            buf.into_bytes().slice(skip..end)
+                        })
                     })
                     .map_err(map_io);
                 let _ = tx.send(res);
@@ -2241,33 +2801,54 @@ fn blocking_fallback_loop(rx: crossbeam::channel::Receiver<FsReq>) {
             FsReq::WriteAt {
                 path,
                 offset,
-                data,
+                mut data,
                 tx,
             } => {
-                let res = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&path)
-                    .and_then(|f| f.write_all_at(&data, offset))
-                    .map_err(map_io);
+                use std::os::unix::fs::OpenOptionsExt;
+                let mode = meta_io_mode(&path);
+                let res = prepare_direct_write(mode, &path, offset, &mut data).and_then(|()| {
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .custom_flags(if mode.is_some_and(|m| m.direct) {
+                            libc::O_DIRECT
+                        } else {
+                            0
+                        })
+                        .open(&path)
+                        .and_then(|f| f.write_all_at(&data, offset))
+                        .map_err(map_io)
+                });
                 send_now(tx, res);
             }
-            FsReq::WriteAtBatch { path, ops, tx } => {
-                let res = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&path)
-                    .and_then(|f| {
-                        for (offset, data) in &ops {
-                            f.write_all_at(data, *offset)?;
-                        }
-                        Ok(())
-                    })
-                    .map_err(map_io);
+            FsReq::WriteAtBatch { path, mut ops, tx } => {
+                use std::os::unix::fs::OpenOptionsExt;
+                let mode = meta_io_mode(&path);
+                let res = ops
+                    .iter_mut()
+                    .try_for_each(|(off, d)| prepare_direct_write(mode, &path, *off, d))
+                    .and_then(|()| {
+                        OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .truncate(false)
+                            .custom_flags(if mode.is_some_and(|m| m.direct) {
+                                libc::O_DIRECT
+                            } else {
+                                0
+                            })
+                            .open(&path)
+                            .and_then(|f| {
+                                for (offset, data) in &ops {
+                                    f.write_all_at(data, *offset)?;
+                                }
+                                Ok(())
+                            })
+                            .map_err(map_io)
+                    });
                 send_now(tx, res);
             }
             FsReq::Fdatasync { path, tx } => {

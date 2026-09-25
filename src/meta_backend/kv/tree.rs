@@ -2490,7 +2490,7 @@ impl KvTree {
                 // The slot's record frontier: a release cycles until the
                 // region's tail passes this entry (Issue 11).
                 if let Some(slot) = self.forest_slot {
-                    self.cache.note_slot_record_frontier(slot, res.end());
+                    self.cache.note_slot_record_frontier(slot, res.padded_end());
                 }
                 (res, recs)
             });
@@ -3506,7 +3506,7 @@ impl KvTree {
                 // The slot's record frontier: a release cycles until the
                 // region's tail passes this entry (Issue 11).
                 if let Some(slot) = self.forest_slot {
-                    self.cache.note_slot_record_frontier(slot, res.end());
+                    self.cache.note_slot_record_frontier(slot, res.padded_end());
                 }
                 (res, recs)
             });
@@ -3717,7 +3717,7 @@ impl KvTree {
                 // The slot's record frontier: a release cycles until the
                 // region's tail passes this entry (Issue 11).
                 if let Some(slot) = self.forest_slot {
-                    self.cache.note_slot_record_frontier(slot, res.end());
+                    self.cache.note_slot_record_frontier(slot, res.padded_end());
                 }
                 (res, recs)
             });

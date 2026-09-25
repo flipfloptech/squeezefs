@@ -185,6 +185,7 @@ fn test_core_admission_reservation_budget_roundtrip() {
         page_data_len: 10,
         pages: 4,
         reserve_bytes: 8,
+        grain: 1,
     }; // capacity 40, user budget 32.
     let core = JournalCore::new(geo, 0, 0);
     assert_eq!(core.head(), 0);
@@ -248,6 +249,7 @@ fn test_core_geometry_lap_offset_segments() {
         page_data_len: JOURNAL_PAGE_DATA_LEN,
         pages: 8,
         reserve_bytes: 0,
+        grain: 1,
     };
     let l = geo.logical_len();
     assert_eq!(l, 8 * 4072);

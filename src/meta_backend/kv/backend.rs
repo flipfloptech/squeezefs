@@ -2610,6 +2610,13 @@ impl KvMetaBackend {
         // the shipped ring's seqs stay its positions); appender 0's page
         // raises it further once read (`open_appender_regions`).
         ring.recover_seq_offset(super::journal::seq_offset_of_window(&recovery.entries));
+        // PR 13i: the WRITER's first reservation begins on a sector
+        // boundary (a torn window's pad, a ring written buffered before
+        // this binary). A joined appender's ring 0 is a PROJECTION it never
+        // writes; a reader / probe / co-writer writes nothing.
+        if posture == OpenPosture::Writer {
+            ring.align_head_for_writing().await?;
+        }
         let ring = Arc::new(ring);
 
         // 4b. Allocator: newest-valid A/B pages + replayed deltas (§4.7).
@@ -3106,9 +3113,13 @@ impl KvMetaBackend {
         // user-admissible capacity (every individual entry ≤ the 128 KiB
         // whole-entry cap already fits by the ring-size floor).
         let batch_max_bytes = {
+            // The batch's admission also claims the sector-pad slack on a
+            // padded ring (PR 13i), so the capacity it must fit is the
+            // user slice less that slack.
             let user_capacity = (ring_extent.len / super::journal::JOURNAL_PAGE_LEN
                 * super::journal::JOURNAL_PAGE_DATA_LEN)
-                .saturating_sub(checkpoint_reserve_bytes(ring_extent.len));
+                .saturating_sub(checkpoint_reserve_bytes(ring_extent.len))
+                .saturating_sub(super::journal::ring_max_pad_for(&path));
             resolve_commit_batch_bytes(
                 std::env::var(COMMIT_BATCH_BYTES_ENV).ok().as_deref(),
                 user_capacity,
@@ -7323,10 +7334,15 @@ impl KvMetaBackend {
                 };
                 claimed.push(extent);
                 let addr = self.cache.extent_addr(extent);
+                // The run's exact entry count rides the record; the image
+                // is padded to the device grain (shared-LUN O_DIRECT).
                 if let Err(e) = crate::uring_fs::write_at(
                     &self.path,
                     addr,
-                    Bytes::from(super::slot_state::encode_tail_entries(chunk)),
+                    crate::uring_fs::pad_to_grain(
+                        &self.path,
+                        super::slot_state::encode_tail_entries(chunk),
+                    ),
                 )
                 .await
                 {
@@ -17870,8 +17886,14 @@ impl KvMetaBackend {
         // keeps the preflight satisfiable-by-drained-ring on every legal
         // geometry, so a healthy volume can never be refused here).
         let geo = self.ring.core().geometry();
-        let need =
-            super::journal::MAX_ENTRY_LEN.min(geo.logical_len().saturating_sub(geo.reserve_bytes));
+        // The admission claims `need + max_pad` on a sector-padded ring
+        // (PR 13i), so the clamp subtracts the slack too — else a floor-
+        // size ring's preflight is unsatisfiable on a DRAINED ring.
+        let need = super::journal::MAX_ENTRY_LEN.min(
+            geo.logical_len()
+                .saturating_sub(geo.reserve_bytes)
+                .saturating_sub(geo.max_pad()),
+        );
         let preflight = || self.ring.try_admit(need, AdmissionClass::User);
         if let Some(adm) = preflight() {
             self.ring.core().release(adm);
@@ -20331,6 +20353,9 @@ impl KvMetaBackend {
                     page.seq_offset
                         .max(super::journal::seq_offset_of_window(&rec.entries)),
                 );
+                // PR 13i: this ring is OURS (own residue or our fresh join)
+                // — its first reservation begins on a sector boundary.
+                ring.align_head_for_writing().await?;
                 // A joined appender's FRESH join stands its ring up here
                 // too (the manager wrote the page Live, its window empty):
                 // nothing died, nothing is recovered — only a REJOIN over a
@@ -23005,13 +23030,13 @@ impl KvMetaBackend {
                 if failed.iter().any(|(fi, _)| *fi == qi) {
                     continue;
                 }
-                parts.push((Reservation { start, len: q.len }, &q.recs));
+                parts.push((Reservation::unpadded(start, q.len), &q.recs));
             }
             if parts.is_empty() {
                 Ok(None)
             } else {
                 s.ring
-                    .submit_entries_batch(&parts, self.journal_lane().map(Arc::as_ref))
+                    .submit_entries_batch(&res, &parts, self.journal_lane().map(Arc::as_ref))
                     .map(Some)
             }
         };
@@ -23142,8 +23167,8 @@ impl KvMetaBackend {
             let mut waited: Vec<(Arc<JournalRing>, u64)> = Vec::new();
             for w in &s.windows {
                 match waited.iter_mut().find(|(r, _)| Arc::ptr_eq(r, &w.ring)) {
-                    Some((_, end)) => *end = (*end).max(w.res.end()),
-                    None => waited.push((Arc::clone(&w.ring), w.res.end())),
+                    Some((_, end)) => *end = (*end).max(w.res.padded_end()),
+                    None => waited.push((Arc::clone(&w.ring), w.res.padded_end())),
                 }
             }
             for (ring, end) in waited {
@@ -23161,8 +23186,8 @@ impl KvMetaBackend {
                     self.journal_failures.store(0, Ordering::Release);
                     if !w.failed.is_empty() {
                         match hole_end.iter_mut().find(|(r, _)| *r == w.region) {
-                            Some((_, h)) => *h = (*h).max(w.res.end()),
-                            None => hole_end.push((w.region, w.res.end())),
+                            Some((_, h)) => *h = (*h).max(w.res.padded_end()),
+                            None => hole_end.push((w.region, w.res.padded_end())),
                         }
                     }
                     any_ok = true;
@@ -23196,7 +23221,10 @@ impl KvMetaBackend {
                     // ring (§4.1 discovery loses same-page successors of a
                     // dead chain): checkpoint past it — zero ring bytes by
                     // the §4.4 pt 5 progress theorem.
-                    if let Err(ck) = self.checkpoint_past_region(w.region, w.res.end()).await {
+                    if let Err(ck) = self
+                        .checkpoint_past_region(w.region, w.res.padded_end())
+                        .await
+                    {
                         log::error!(
                             "meta volume {}: post-failure checkpoint could not drain the \
                              journal hole: {ck} (volume escalating)",
@@ -23395,6 +23423,16 @@ impl KvMetaBackend {
                     self.eio("commit aborted while parked for ring space"),
                 ));
             }
+            // A parked committer is the ring's pressure signal itself: wake
+            // the checkpoint task NOW rather than at its next cadence tick
+            // (the drain that frees ring space — §4.4 pt 5's liveness
+            // shape; the tick's own pressure law then makes the cycle due).
+            // Load-bearing under the sector-pad law (PR 13i): a serial
+            // commit occupies a whole page of ring on a 4 KiB-grain device,
+            // so a ring fills tens of times sooner than its byte count
+            // suggests and a park behind a long cadence would otherwise
+            // reach the D1.b escalation below.
+            self.kick_checkpoint();
             let since = *parked_since.get_or_insert_with(std::time::Instant::now);
             let until_crossing = threshold
                 .saturating_sub(since.elapsed())

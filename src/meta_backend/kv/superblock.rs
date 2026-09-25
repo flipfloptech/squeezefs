@@ -1302,6 +1302,14 @@ fn backup_slot_for(sb: &SuperblockV3, volume_len: u64) -> Option<u64> {
     backup_offset(volume_len).filter(|off| *off >= sb.heap.end())
 }
 
+/// [`crate::uring_fs::register_meta_device`] with its refusal on the KV
+/// error surface — the ONE registration point every KV open, format and
+/// probe passes (`classify_volume_slot`); the format path registers the
+/// file it is about to write the same way.
+pub fn register_meta_device(path: &Path) -> Result<crate::uring_fs::MetaIoMode, KvError> {
+    crate::uring_fs::register_meta_device(path).map_err(KvError::Io)
+}
+
 /// Read one 4 KiB sector, zero-extending a short read (a stub file
 /// smaller than the sector classifies as Blank, which is what it is).
 async fn read_sector(path: &Path, offset: u64) -> Result<Vec<u8>, KvError> {
@@ -1335,6 +1343,11 @@ pub async fn classify_volume_slot(path: &Path) -> Result<(VolumeFormat, Superblo
         KvError::Corrupt(msg) => KvError::Corrupt(format!("{}: {msg}", path.display())),
         other => other,
     };
+    // Every door's FIRST read of a metadata volume runs through here: the
+    // path is registered as a shared-LUN metadata device before any byte
+    // is read, so this read and every later one bypass the host page
+    // cache (PR 13i F-C1, design-symmetric-metadata §5.12). Idempotent.
+    register_meta_device(path)?;
     let primary = read_sector(path, 0).await?;
     let primary_res = classify_sector0(&primary);
 

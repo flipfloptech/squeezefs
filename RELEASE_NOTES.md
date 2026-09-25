@@ -247,7 +247,10 @@ conveyor's whole batch; ≤ 532 B on a 512-byte-grain device), so a serial
 one-transaction-per-window workload's ring runway is the ring's page count
 (8,192 windows on the 32 MiB default) and the cadence's ring-pressure law
 absorbs it — a committer parked at ring admission now wakes the checkpoint
-task at once instead of waiting for the next cadence tick; a manager verb
+task at once instead of waiting for the next cadence tick (the park's mark
+alone makes the cycle due — on the 512 KiB ring floor, whose reserve is
+half of it, the pressure law never fires, and a commit storm there drained
+at the 1 Hz cadence before: 116–181 s for R10's storm, 1–2 s now); a manager verb
 whose control entry finds ring 0 full for a beat is answered `Deferred`
 (the joiner's `EAGAIN` retry class, counted on `joined_wire_deferrals`) and
 kicks the manager's cycle, never a failure; and a joiner whose `GrowRing`

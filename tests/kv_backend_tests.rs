@@ -2260,6 +2260,89 @@ async fn v3_ring_full_liveness_storm_drains() {
     );
 }
 
+/// **R10's park is drained by its own kick, whatever the pressure law
+/// reads (PR 13i).** On a 512 KiB ring the §4.4 pt 5 reserve is HALF the
+/// ring (`checkpoint_reserve_bytes` = 256 KiB), so user admission parks
+/// at `distance ≈ logical_len / 2` and the cadence's pressure law
+/// (`distance > logical_len / 2`) is unreachable — a parked committer's
+/// wake gated on it was a wake with no cycle, and the park waited out the
+/// cadence (R10's storm drained at 1 Hz: 116–130 s flat, 179–181 s on the
+/// stamped leg under the sector-pad law — past its 180 s bound). The
+/// park's MARK is the proof the checkpoint task acts on: with the cadence
+/// parked at 60 s, a serial storm that fills the ring three laps over
+/// must drain in seconds through its own kicks — never reach the D1.b
+/// park escalation, never wait a tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v3_a_parked_committer_on_a_half_reserve_ring_is_drained_by_its_kick() {
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let body = async {
+        let file = NamedTempFile::new().unwrap();
+        file.as_file().set_len(V3_VOL_LEN).unwrap();
+        format_v3(
+            file.path(),
+            V3_VOL_LEN,
+            &FormatV3Options {
+                node_size: 64 * 1024,
+                journal_len_override: Some(512 * 1024),
+                force: false,
+                full_wipe: false,
+                format_config_xattr: None,
+            },
+        )
+        .await
+        .unwrap();
+        let backend = open_volume_for_mount(file.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let stalls_probe = backend.clone();
+        let routed = Arc::new(RoutedMetaBackend::new(vec![backend]));
+        let dir = routed
+            .create(ROOT_INO, "d", libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .unwrap()
+            .ino;
+        // ≈ 2.3 KiB per pair (a page per window under the pad law): three
+        // laps of the ring's ≈ 250 KiB user budget, serially — every park
+        // is this committer's alone.
+        let storm = async {
+            for i in 0..400u32 {
+                let f = routed
+                    .create(dir, &format!("f{i}"), libc::S_IFREG | 0o644, 0, 0)
+                    .await
+                    .expect("create must admit through the park's own cycle");
+                routed
+                    .setxattr(f.ino, "user.payload", &[0xEE; 2048])
+                    .await
+                    .expect("setxattr");
+            }
+        };
+        let t0 = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(25), storm)
+            .await
+            .expect(
+                "a parked committer on a half-reserve ring drains through its own kick — a \
+                 park that waits for the 60 s cadence is the shape this pins",
+            );
+        assert!(
+            stalls_probe.journal_full_stalls() > 0,
+            "the storm never filled the 512 KiB ring — grow the storm or shrink the ring"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(25),
+            "drained in {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(
+            routed.readdir(dir, 0, usize::MAX).await.unwrap().len(),
+            400,
+            "every acked create is listed"
+        );
+    };
+    let out = tokio::time::timeout(std::time::Duration::from_secs(60), body).await;
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    out.expect("the pin's body completes inside its bound");
+}
+
 /// fstests generic/020 repro-port (VL10 release gate): a full
 /// `XATTR_SIZE_MAX` (65,536-byte) VALUE must round-trip on a
 /// default-node-size volume — the Linux cap governs the VALUE; the

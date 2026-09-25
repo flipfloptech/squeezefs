@@ -1729,21 +1729,26 @@ async fn checkpoint_task(
         let Some(be) = weak.upgrade() else {
             return; // backend dropped without shutdown: exit, leak nothing
         };
-        // A PARKED committer's wake under RING PRESSURE is a tick (PR 13i):
-        // `admit_user_budget` kicks this task with the park's mark and the
-        // drain it needs is a CYCLE with `barrier_now` — the maintenance
-        // pass below appends and reclaims nothing — so the park never
-        // waits out the cadence deadline (under the sector-pad law a
-        // serial commit occupies a whole page of ring on a 4 KiB-grain
-        // device: a 1 MiB ring fills in 192 commits, and a 60 s cadence
-        // took a parked pass through the D1.b escalation twice over). A
-        // THRESHOLD wake never carries the mark, so the shipped cadence's
-        // pressure law fires where it did (a cycle per threshold wake past
-        // half a ring would be the checkpoint storm the fixed deadline
-        // exists to prevent). The decision itself stays
-        // `decide_checkpoint`'s: the pressure law is what makes it due.
+        // A PARKED committer's wake is a tick (PR 13i): `admit_user_budget`
+        // kicks this task with the park's mark and the drain it needs is a
+        // CYCLE with `barrier_now` — the maintenance pass below appends and
+        // reclaims nothing — so the park never waits out the cadence
+        // deadline (under the sector-pad law a serial commit occupies a
+        // whole page of ring on a 4 KiB-grain device: a 1 MiB ring fills
+        // in 192 commits, and a 60 s cadence took a parked pass through
+        // the D1.b escalation twice over). The MARK is the whole proof:
+        // a park means the admissible window is exhausted for that
+        // committer, and the pressure law (`distance > logical_len / 2`)
+        // is UNREACHABLE on a ring whose reserve is half of it — the
+        // 512 KiB floor (`checkpoint_reserve_bytes` = 256 KiB), where the
+        // first cut's `&& ring_under_pressure` left every park to the
+        // cadence and R10's storm to a 1 Hz drain. A THRESHOLD wake never
+        // carries the mark, so the shipped cadence's law fires where it
+        // did (a cycle per threshold wake would be the checkpoint storm
+        // the fixed deadline exists to prevent). The mark rides into the
+        // decision as its own `due` term.
         let park_kick = be.take_ring_park_kick();
-        if woke && !cadence && park_kick && ring_under_pressure(&be) {
+        if woke && !cadence && park_kick {
             cadence = true;
             next_tick = std::time::Instant::now() + period_now;
         }
@@ -1773,6 +1778,7 @@ async fn checkpoint_task(
                 drain_deadline,
                 elastic_ceiling,
                 period_now.as_millis() as u64,
+                park_kick,
             )
             .await
             {
@@ -1944,11 +1950,10 @@ pub fn flat_age_due(elapsed_ms: u128, max_age_ms: u64) -> bool {
     elapsed_ms >= u128::from(max_age_ms)
 }
 
-/// The tick's ring-pressure law, on its own so a parked committer's wake
-/// can read it (PR 13i): ring 0 past half its logical length un-reclaimed,
-/// or any declared region's ring past half its admissible window
-/// (`AppenderSet::ring_pressure`). Exactly the term `decide_checkpoint`
-/// folds into `due`.
+/// The tick's ring-pressure law (PR 13i made it a function): ring 0 past
+/// half its logical length un-reclaimed, or any declared region's ring
+/// past half its admissible window (`AppenderSet::ring_pressure`). The
+/// term `decide_checkpoint` folds into `due` beside the park's mark.
 fn ring_under_pressure(be: &Arc<KvMetaBackend>) -> bool {
     let core = be.journal_ring().core();
     let distance = core.head().saturating_sub(core.reusable_upto());
@@ -1964,6 +1969,7 @@ fn decide_checkpoint(
     mutex_wait_ns: u64,
     final_cycle: bool,
     elastic_ceiling: Option<u64>,
+    park_kick: bool,
 ) -> CheckpointDecision {
     let core = be.journal_ring().core();
     let distance = core.head().saturating_sub(core.reusable_upto());
@@ -2006,6 +2012,10 @@ fn decide_checkpoint(
     };
     let due = final_cycle
         || ring_pressure
+        // A committer PARKED at ring admission (PR 13i — the wake's mark):
+        // the admissible window is exhausted whatever the pressure law
+        // reads, and the cycle's barrier is what frees it.
+        || park_kick
         // The cap is resolved ONCE at open (`KvMetaBackend::dirty_node_cap`
         // — the backend-knob convention): this branch runs on every 50 ms
         // cadence tick, and re-deriving here (env `CString`s + cgroup/
@@ -2020,7 +2030,9 @@ fn decide_checkpoint(
     CheckpointDecision {
         due,
         covers_something: final_cycle || dirty_nodes > 0 || distance > 0 || regions_uncovered,
-        ring_pressure,
+        // A park's cycle barriers NOW like a pressure cycle: the parked
+        // committer waits on `reusable_upto`, which the barrier advances.
+        ring_pressure: ring_pressure || park_kick,
         region_pressure,
         age_late_ns,
         decided_at_ns,
@@ -2045,6 +2057,7 @@ async fn tick(
     drain_deadline: Option<std::time::Instant>,
     elastic_ceiling: Option<u64>,
     tick_ms: u64,
+    park_kick: bool,
 ) -> Result<(), KvError> {
     if final_cycle {
         // New mutations are already refused (`write_gate`); wait out the
@@ -2121,6 +2134,7 @@ async fn tick(
             mutex_wait_ns,
             final_cycle,
             elastic_ceiling,
+            park_kick,
         ))
     };
     let run_drain = !decision.as_ref().is_some_and(|d| d.runs_a_cycle());
@@ -2193,6 +2207,7 @@ async fn tick(
             mutex_wait_ns,
             final_cycle,
             elastic_ceiling,
+            park_kick,
         ));
     }
     let d = decision.expect("a checkpoint decision was taken on every arm");

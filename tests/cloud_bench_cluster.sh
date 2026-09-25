@@ -315,8 +315,10 @@ subcommands:
   launch     create placement group + SG + launch template, launch spot fleet,
              wait running + SSH-reachable, install teardown-at-deadline guard
   deploy     scp squeezefs/elbencho/shim artifacts to every node, verify sha256,
-             install runtime deps (fuse3), stop + mask Ubuntu's unattended
-             apt (apt-daily*.timer, unattended-upgrades) for the session
+             install runtime deps (fuse3), take Ubuntu's unattended apt off
+             the session (unattended-upgrades drained + masked, apt-daily*
+             timers off; a live apt/dpkg transaction waited for by its lock,
+             bounded, never killed)
   assemble   share instance-store NVMe from storage nodes (squeezefs nvmeof
              share, nvmet), connect from the client (single-path — one NIC),
              format, mount, build_commit verification
@@ -991,9 +993,9 @@ cmd_deadline_guard() {
 
 # ---------------------------------------------------------------------------
 # deploy — push artifacts + runtime deps, and take Ubuntu's unattended apt
-# off the session (the timers stopped, the upgrader masked — a background
-# upgrade mid-row costs a writer node minutes of CPU and an sshd restart).
-# Deploys only; never builds.
+# off the session (the upgrader drained then masked, the timers off; a
+# LIVE apt/dpkg transaction is waited for by its lock, bounded, never
+# killed — tests/cloud_bench_node_scripts.sh). Deploys only; never builds.
 # ---------------------------------------------------------------------------
 cmd_deploy() {
   require_local_tools

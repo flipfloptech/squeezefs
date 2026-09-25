@@ -21,24 +21,64 @@ APT_UPGRADE_WAIT_MAX_S="${APT_UPGRADE_WAIT_MAX_S:-600}"
 APT_UPGRADE_POLL_S="${APT_UPGRADE_POLL_S:-5}"
 
 # Env: NODE, APT_UPGRADE_WAIT_MAX_S, APT_UPGRADE_POLL_S.
+#
+# The law: a LIVE apt/dpkg transaction is detected by its LOCKS and by the
+# oneshot units that run apt (`apt-daily.service` / `apt-daily-upgrade
+# .service` read `activating` while `apt.systemd.daily` runs — `is-active`
+# would never see them) — NEVER by `unattended-upgrades.service`'s state,
+# which is `active` on every booted Ubuntu node (the long-lived
+# `unattended-upgrade-shutdown --wait-for-signal` waiter; review round 1,
+# Issue 1: the first build's `is-active` on it was always true and stalled
+# every deploy for the whole bound). The drain is `systemctl stop
+# unattended-upgrades.service` — its stop handler waits for a running
+# `unattended-upgrade` child under the unit's own stop timeout — run FIRST;
+# `apt-daily*.service` is never `stop`ped (a `stop` SIGTERMs the unit's
+# cgroup: apt.systemd.daily → unattended-upgrade → dpkg); a lock held past
+# the bound dies loud naming the node. On a quiet node the whole script is
+# a handful of systemctl calls: seconds.
 NODE_APT_HYGIENE_SCRIPT="$(cat <<'EOS'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 # cloud-init's own user-data apt (the package install) finishes first — the
 # same bounded wait the package verify takes; absent on a non-cloud host.
 command -v cloud-init >/dev/null 2>&1 && { cloud-init status --wait --long >/dev/null 2>&1 || true; }
+apt_busy() { # 0 while an apt/dpkg transaction may be live
+  # the LOCKS: dpkg's frontend + backend, apt's lists + archives
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -s /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null && return 0
+  elif command -v lslocks >/dev/null 2>&1; then
+    lslocks -n -o PATH 2>/dev/null | grep -qE '^/var/lib/dpkg/lock|^/var/lib/apt/lists/lock|^/var/cache/apt/archives/lock' && return 0
+  fi
+  # the oneshot units that run apt: in flight they read `activating`
+  local u s
+  for u in apt-daily.service apt-daily-upgrade.service; do
+    s="$(systemctl show -p ActiveState --value "$u" 2>/dev/null || true)"
+    case "$s" in activating|active|reloading|deactivating) return 0 ;; esac
+  done
+  # the upgrader process itself (comm is truncated to 15 chars)
+  pgrep -x unattended-upgr >/dev/null 2>&1 && return 0
+  return 1
+}
+# 1. the graceful drain: waits for a running unattended-upgrade to finish
+systemctl stop unattended-upgrades.service 2>/dev/null || true
+# 2. nothing re-fires for the session: the timers off, the upgrader masked
 systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
-systemctl mask unattended-upgrades.service 2>/dev/null || true
-if systemctl is-active --quiet apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null; then
-  echo "an unattended apt run is in progress — waiting for it before the deploy continues"
-  for _ in $(seq 1 60); do
-    systemctl is-active --quiet apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || break
-    sleep 5
-  done
-fi
-systemctl stop apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
-echo "apt hygiene: apt-daily*.timer stopped+disabled, unattended-upgrades masked"
+systemctl mask apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service 2>/dev/null || true
+# 3. wait ONLY while a transaction is live (apt-daily.service's update half,
+#    a straggler) — bounded, then die loud; dpkg is never killed
+deadline=$((SECONDS + APT_UPGRADE_WAIT_MAX_S))
+said=0
+while apt_busy; do
+  if [ "$SECONDS" -ge "$deadline" ]; then
+    echo "FATAL[$NODE]: an apt/dpkg transaction is still live after ${APT_UPGRADE_WAIT_MAX_S}s — NOT killed (a mid-dpkg kill leaves a half-configured node); let it finish, then re-run deploy" >&2
+    exit 1
+  fi
+  [ "$said" = 1 ] || echo "an apt/dpkg transaction is live on $NODE — waiting for it (bounded ${APT_UPGRADE_WAIT_MAX_S}s; never killed)"
+  said=1
+  sleep "$APT_UPGRADE_POLL_S"
+done
+echo "apt hygiene on $NODE: unattended-upgrades drained+masked, apt-daily*.timer stopped+disabled+masked, no apt/dpkg transaction live"
 EOS
 )"
 

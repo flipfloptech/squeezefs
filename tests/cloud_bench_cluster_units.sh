@@ -71,8 +71,13 @@ echo "systemctl $*" >>"$FAKE_LOG"
 state_of() { awk -v u="$1" '$1 == u {print $2}' "$FAKE_STATE/units"; }
 case "$1" in
   show)
-    # `show -p ActiveState --value <unit>`: the real word for one unit
-    u="${@: -1}"; s="$(state_of "$u")"; echo "${s:-inactive}"; exit 0 ;;
+    # `show -p ActiveState --value <unit>`: the real word for one unit. A
+    # unit tabled `activating` is the LIVE upgrade — it stays `activating`
+    # exactly while the fake lock is held and reads `inactive` once the
+    # transaction (the lock) is gone, as the real oneshot does.
+    u="${@: -1}"; s="$(state_of "$u")"
+    if [ "$s" = activating ] && [ "$(cat "$FAKE_STATE/lock_held_polls" 2>/dev/null || echo 0)" -le 0 ]; then s=inactive; fi
+    echo "${s:-inactive}"; exit 0 ;;
   is-active)
     # the real systemctl: 0 if AT LEAST ONE named unit is active/reloading
     shift; [ "${1:-}" = "--quiet" ] && shift

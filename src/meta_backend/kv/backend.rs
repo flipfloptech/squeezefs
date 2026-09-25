@@ -9287,12 +9287,18 @@ impl KvMetaBackend {
 
     /// Appender `id`'s UNCLAIMED remainder as the durable state has it:
     /// an in-process region's RAM grant (the page mirrors it), a wire
-    /// joiner's page `grant` field (the manager writes it at every grant)
-    /// — answered with the WIRE appender's directory ENTRY off the same
-    /// read (`None` for an in-process region, a `Free` page or an unknown
-    /// id): the hint put's identity and the page rewrite's offsets read
-    /// off it, so a wire grant walks the directory ONCE (PR 13g review
-    /// round 1, Issue 13 — the manager's verb wall is the F-B1 term).
+    /// joiner's page `grant` field (the manager writes it at every grant;
+    /// the JOINER writes it before every ask and after every carve —
+    /// `wire_extent_refill`) — answered with the WIRE appender's
+    /// directory ENTRY off the same read (`None` for an in-process
+    /// region, a `Free` page or an unknown id): the hint put's identity
+    /// and the page rewrite's offsets read off it, so a wire grant walks
+    /// the directory ONCE (PR 13g review round 1, Issue 13 — the manager's
+    /// verb wall is the F-B1 term). The page read is a DEVICE read of a
+    /// page another host writes (PR 13i F-C1): honest only because every
+    /// metadata device read is `O_DIRECT` — a page-cache read served the
+    /// manager its own stale image on the cloud row and every §5.3.5
+    /// replay answered a word the joiner had already spent.
     async fn unclaimed_remainder_of(
         &self,
         set: &super::appender::AppenderSet,
@@ -20458,11 +20464,27 @@ impl KvMetaBackend {
             // parked, never returned, invisible to C13 and to the closure
             // gauge — the silent leak on the ordinary clean lifecycle. The
             // ring window's alloc/free records refine both below. A joined
-            // appender's page is the manager's `JoinAppender` image — its
-            // grant word IS the unclaimed remainder the join minted, kept.
-            if !self_recovered && !is_joined {
-                page.grant.clear();
-            }
+            // appender's word is the `Joined` REPLY's (PR 13i F-C2): the
+            // manager writes the joiner's page twice — `Live` with the
+            // grant cleared, then the runs — and answers the runs on the
+            // reply; a page read that lands the first image (a second
+            // host's cache, F-C1) is a word the manager never meant, and
+            // recovering against it landed the whole record CLAIMED (the
+            // cloud row's `granted 72 = claimed 72, unclaimed 0`). The
+            // RAM copy of the page carries the reply's word too — the
+            // joiner's own page writes name it from here.
+            let word: Vec<super::appender::GrantRun> = match (&joined, is_joined) {
+                (Some(j), true) => {
+                    page.grant = j.grant.clone();
+                    j.grant.clone()
+                }
+                _ => {
+                    if !self_recovered {
+                        page.grant.clear();
+                    }
+                    page.grant.clone()
+                }
+            };
             let record = match forest
                 .control()
                 .lookup(&super::slot_state::extent_grant_key(id))
@@ -20471,11 +20493,10 @@ impl KvMetaBackend {
                 Some(v) => super::slot_state::ExtentGrantRecord::decode(&v)?,
                 None => Default::default(),
             };
-            // The page word ∩ the record (review round 2, Issue 16a): a
+            // The word ∩ the record (review round 2, Issue 16a): a
             // page-named extent the record no longer grants was returned
             // after that page write — never adopted, counted.
-            let (grant, dropped) =
-                super::appender::RegionGrant::recover(record.extents(), &page.grant);
+            let (grant, dropped) = super::appender::RegionGrant::recover(record.extents(), &word);
             if dropped > 0 {
                 stale_page_words_dropped += dropped;
                 log::warn!(

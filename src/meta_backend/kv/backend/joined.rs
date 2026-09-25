@@ -107,6 +107,27 @@ pub(in crate::meta_backend::kv) struct JoinedOpen {
     /// through it BEFORE the own-residue replay mints (a rejoin whose
     /// predecessor died with its grant consumed).
     pub wire: Arc<JoinedWire>,
+    /// The `Joined` reply's grant word — the UNCLAIMED remainder as the
+    /// manager answered it (a fresh join's whole initial grant; a rejoin's
+    /// page word as the manager reads it). The region open builds the RAM
+    /// grant from THIS, never from its own page read (PR 13i F-C2): the
+    /// manager writes the page twice — `Live` with the grant cleared, then
+    /// the runs — and the reply is the word that reaches the joiner
+    /// first; a page read that lands the first image (a second host's
+    /// cache on the cloud row, F-C1) is a word the manager never meant.
+    pub grant: Vec<GrantRun>,
+}
+
+/// What the wire `JoinAppender` handed back — the words the open installs.
+struct WireJoin {
+    client: ManagerClient,
+    /// The identity presented (the predecessor page's on a rejoin).
+    presented: AppenderIdentity,
+    appender_id: u32,
+    already: bool,
+    node_seq_base: u64,
+    /// The reply's grant word (see [`JoinedOpen::grant`]).
+    grant: Vec<GrantRun>,
 }
 
 impl std::fmt::Debug for JoinedOpen {
@@ -693,7 +714,7 @@ impl KvMetaBackend {
         admission: &JoinedAppenderAdmission,
         sb: &super::super::superblock::SuperblockV3,
         writer_id: u128,
-    ) -> Result<(ManagerClient, AppenderIdentity, u32, bool, u64), KvError> {
+    ) -> Result<WireJoin, KvError> {
         let entries = super::super::appender::read_directory(path, sb).await?;
         let predecessor = entries.iter().find_map(|e| {
             e.page.as_ref().filter(|p| {
@@ -740,7 +761,7 @@ impl KvMetaBackend {
         // The open's FIRST act: a transport failure here (the manager
         // died between the connect and its reply) is the same unreachable
         // class as the dial's — nothing of this join exists yet.
-        let (appender_id, already, node_seq_base) =
+        let (appender_id, already, node_seq_base, grant) =
             match client.join(presented, 0).await.map_err(|e| {
                 KvError::ManagerUnreachable(format!(
                     "{}: JoinAppender to the manager at {} failed over the wire: {e}",
@@ -752,8 +773,17 @@ impl KvMetaBackend {
                     appender_id,
                     already,
                     node_seq_base,
+                    grant,
                     ..
-                } => (appender_id, already, node_seq_base),
+                } => (
+                    appender_id,
+                    already,
+                    node_seq_base,
+                    grant
+                        .iter()
+                        .map(|&(start, len)| GrantRun { start, len })
+                        .collect::<Vec<_>>(),
+                ),
                 ManagerReply::Refused { reason } => {
                     return Err(KvError::Busy(format!(
                         "{}: the manager refused JoinAppender: {reason}",
@@ -779,7 +809,14 @@ impl KvMetaBackend {
                     ))
                 },
             )?;
-        Ok((client, presented, appender_id, already, node_seq_base))
+        Ok(WireJoin {
+            client,
+            presented,
+            appender_id,
+            already,
+            node_seq_base,
+            grant,
+        })
     }
 
     /// **Open one volume as a JOINED non-manager appender** (the fifth door
@@ -868,7 +905,14 @@ impl KvMetaBackend {
                 return Err(e);
             }
         };
-        let (client, presented, appender_id, already, node_seq_base) = joined;
+        let WireJoin {
+            client,
+            presented,
+            appender_id,
+            already,
+            node_seq_base,
+            grant,
+        } = joined;
         let wire = Arc::new(JoinedWire {
             client: crate::sqz_sync::SqzMutex::new(client),
             endpoint: std::sync::RwLock::new(admission.manager_endpoint.clone()),
@@ -906,6 +950,7 @@ impl KvMetaBackend {
                 already,
                 node_seq_base,
                 wire: Arc::clone(&wire),
+                grant,
             }),
         )
         .await

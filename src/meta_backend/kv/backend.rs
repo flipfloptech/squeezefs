@@ -16552,8 +16552,9 @@ impl KvMetaBackend {
     }
 
     /// A committer parked at ring admission wakes the checkpoint task with
-    /// the park's mark (PR 13i — see `ring_park_kick`).
-    fn kick_checkpoint_for_ring_park(&self) {
+    /// the park's mark (PR 13i — see `ring_park_kick`); the manager service
+    /// runs it for a wire verb whose control entry found ring 0 full.
+    pub fn kick_checkpoint_for_ring_park(&self) {
         self.ring_park_kick.store(true, Ordering::Release);
         self.checkpoint_wake().notify_one();
     }

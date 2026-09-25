@@ -1144,6 +1144,17 @@ pub enum KvError {
     #[error("{0}")]
     ManagerUnreachable(String),
 
+    /// A joined appender's wire verb the manager answered `Deferred`
+    /// (`STATUS_DEFERRED`): its ring 0 was full for a beat (PR 13i — a
+    /// verb's control entry may not park under the verb mutex, so the
+    /// manager kicks its own cycle and says "not now"), a grant's clearing
+    /// loop at its bound, a handover behind a live custody grant. The
+    /// cadence's next tick retries; `EAGAIN`, typed apart from the wire's
+    /// FAILURE class [`Self::Busy`] so a joiner's callers and gauges never
+    /// read a deferral as a failure (`joined_wire_deferrals`).
+    #[error("{0}")]
+    WireDeferred(String),
+
     // PR 8 (design-symmetric-metadata §5.5.1 — the allocation lease's
     // ordering law): a successor asked for a DEAD holder's allocation
     // lease before the dead holder's home region was recovered (no
@@ -1266,6 +1277,7 @@ impl Clone for KvError {
             KvError::Io(inner) => KvError::Io(inner.clone()),
             KvError::Busy(m) => KvError::Busy(m.clone()),
             KvError::ManagerUnreachable(m) => KvError::ManagerUnreachable(m.clone()),
+            KvError::WireDeferred(m) => KvError::WireDeferred(m.clone()),
             KvError::LeaseDeferred(m) => KvError::LeaseDeferred(m.clone()),
             KvError::HandoverDeferred(m) => KvError::HandoverDeferred(m.clone()),
         }
@@ -1301,6 +1313,9 @@ impl From<KvError> for crate::error::SqueezefsError {
             e @ KvError::ManagerUnreachable(_) => {
                 E::refused(libc::EHOSTUNREACH, format!("kv metadata: {e}"))
             }
+            // The manager's `Deferred` on a joiner's wire verb: EAGAIN —
+            // the cadence's next tick retries (PR 13i).
+            e @ KvError::WireDeferred(_) => E::refused(libc::EAGAIN, format!("kv metadata: {e}")),
             // Out of grant with the manager unreachable: EAGAIN — the
             // caller retries inside the published stall bound.
             e @ KvError::GrantExhausted { .. } => {

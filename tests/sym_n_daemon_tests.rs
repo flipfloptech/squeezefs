@@ -11284,6 +11284,11 @@ struct SupplyFaces {
     projected_ms: u64,
     node_unit_us: u64,
     image_unit_us: u64,
+    /// The heap-share cap a wire ask is clamped to at this instant
+    /// (`grant_extents_wire_cap(free heap, appenders known)`): the pool's
+    /// TARGET is bounded by it, so a pool at the cap returns its retired
+    /// images as the cap's — never the claim-and-retire churn's.
+    wire_cap: u64,
 }
 
 /// [`assert_must_stay_zero`] without the flush-ceiling law — the JOINERS'
@@ -11340,6 +11345,10 @@ fn supply_faces(vol: &KvMetaBackend) -> SupplyFaces {
         projected_ms: vol.checkpoint_projected_ms(),
         node_unit_us: vol.checkpoint_node_unit_ns() / 1_000,
         image_unit_us: vol.checkpoint_image_unit_ns() / 1_000,
+        wire_cap: squeezefs::meta_backend::kv::appender::grant_extents_wire_cap(
+            vol.free_extents(),
+            s.appenders_known.max(1),
+        ),
     }
 }
 
@@ -11610,12 +11619,32 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
         // stated (the venue decides how fast a saturated ring drains), and
         // law 1 above judged the growth itself.
         let grew_inside = c.ring_grows - c3.ring_grows;
+        // The ring at its per-appender CEILING is the other shape the
+        // sized-cadence law does not judge: the derived ring exceeds what
+        // the volume allows (under the sector-pad law, PR 13i, a serial
+        // create is one page of ring — this storm's ≈ 2,500 creates/s per
+        // joiner is ≈ 10 MB/s, twice the ceiling per max-age on this small
+        // volume), so the pressure law IS the steady state — one cycle per
+        // half ring of demand, the ring the bottleneck the ceiling made it.
+        let ceiling = squeezefs::meta_backend::kv::appender::sym_ring_ceiling_bytes(
+            daemons[i].0.volumes[0].superblock().heap.end(),
+        );
+        let node_size = u64::from(daemons[i].0.volumes[0].superblock().node_size);
+        let at_ceiling = c.ring_bytes + node_size >= ceiling;
         if grew_inside > 0 {
             eprintln!(
                 "F-R5 joiner {i}: the ring grew {grew_inside}× INSIDE the last quarter ({} → {} \
                  B) — {steady} cycles there (pressure +{pressure_steady}) are the sizing's, not \
                  the sized cadence's; the steady-state law is not judged on this quarter",
                 c3.ring_bytes, c.ring_bytes
+            );
+        } else if at_ceiling && pressure_steady > 0 {
+            eprintln!(
+                "F-R5 joiner {i}: the ring stands at its ceiling ({} B of {ceiling}) — {steady} \
+                 cycles in the last quarter (pressure +{pressure_steady}) are the pressure law's \
+                 steady state on a ring the volume's ceiling bounds below the storm's demand; \
+                 the sized-cadence law is not judged here",
+                c.ring_bytes
             );
         } else {
             assert!(
@@ -11641,11 +11670,22 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
         // flush pass, before any rate is measured (the join's grant covers
         // the rotor's mints; that pass's splits are what it cannot size).
         let returned = c.grant_returned - a.grant_returned;
+        // The pool's target is bounded by the heap-share cap (`free heap /
+        // (4 × appenders)`); a pool standing AT the cap returns its retired
+        // images as the CAP's surplus — the manager's bounded-execution
+        // law, never the claim-and-retire churn. Under the sector-pad law
+        // (PR 13i) the joiners' rings grow to the per-appender ceiling
+        // inside this storm (≈ 18× the byte-grain demand) and take that
+        // heap off this small volume's free set, so the cap binds here
+        // where PR 13g's run had it slack.
+        let pool = c.grant_claimed + c.grant_unclaimed;
+        let cap_bound = pool + GRANT_EXTENTS_FLOOR >= c.wire_cap;
         assert!(
-            returned * 10 <= compactions,
+            returned * 10 <= compactions || cap_bound,
             "joiner {i}: retired images recycle into the joiner's own pool — `extent_grant_\
-             returned` moved +{returned} over {compactions} compactions (RED: +≈ compactions, \
-             the claim-and-retire churn)"
+             returned` moved +{returned} over {compactions} compactions with the pool at {pool} \
+             under a cap of {} (RED: +≈ compactions, the claim-and-retire churn)",
+            c.wire_cap
         );
         assert!(
             c.wire_reactive_grants - a.wire_reactive_grants <= 1,

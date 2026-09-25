@@ -194,6 +194,11 @@ pub struct JoinedWire {
     /// Verbs the wire could not complete (a refused / failed call — the
     /// caller's retry class; `joined_wire_failures`).
     pub failures: AtomicU64,
+    /// Verbs the manager answered `Deferred` (EAGAIN — its ring 0 full at
+    /// that instant, a grant's clearing loop at its bound, a handover
+    /// behind a live custody grant): the cadence's next tick retries;
+    /// never a failure (`joined_wire_deferrals`, PR 13i).
+    pub deferrals: AtomicU64,
     /// **Must-stay-0**: a control write (a tree-0 put, an allocator delta,
     /// a manager verb's executor) reached this joined appender — a site
     /// that assumed "this mount is the manager".
@@ -320,7 +325,13 @@ impl JoinedWire {
                         );
                         continue;
                     }
-                    self.failures.fetch_add(1, Ordering::Relaxed);
+                    if e.to_errno() == libc::EAGAIN {
+                        // The manager's `Deferred` (STATUS_DEFERRED → EAGAIN):
+                        // the retryable class, the cadence's next tick.
+                        self.deferrals.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        self.failures.fetch_add(1, Ordering::Relaxed);
+                    }
                     return Err(wire_err(verb, e));
                 }
             }
@@ -437,6 +448,8 @@ pub struct JoinedStats {
     /// PR 13g's drain-then-grow over the wire).
     pub wire_ring_grows: u64,
     pub wire_failures: u64,
+    /// `joined_wire_deferrals` — the manager's `Deferred` answers (PR 13i).
+    pub wire_deferrals: u64,
     pub control_refusals: u64,
     pub ring_grow_declined: u64,
     /// Re-dials of the manager after a failed verb (`joined_wire_redials`;
@@ -457,7 +470,13 @@ fn unexpected(verb: &str, reply: &ManagerReply) -> KvError {
 }
 
 fn wire_err(verb: &str, e: crate::error::SqueezefsError) -> KvError {
-    KvError::Busy(format!("{verb} over the wire failed: {e}"))
+    if e.to_errno() == libc::EAGAIN {
+        // The manager's `Deferred` (STATUS_DEFERRED → EAGAIN): the
+        // retryable class, typed so no caller reads it as a failure.
+        KvError::WireDeferred(format!("{verb} deferred by the manager: {e}"))
+    } else {
+        KvError::Busy(format!("{verb} over the wire failed: {e}"))
+    }
 }
 
 /// **One extent refill over the wire** (§5.3.3): `ExtentGrant { own, want }`
@@ -935,6 +954,7 @@ impl KvMetaBackend {
             reactive_grants: AtomicU64::new(0),
             ring_grows: AtomicU64::new(0),
             failures: AtomicU64::new(0),
+            deferrals: AtomicU64::new(0),
             control_refusals: AtomicU64::new(0),
             grow_declined: AtomicU64::new(0),
             colocated,
@@ -1169,6 +1189,7 @@ impl KvMetaBackend {
             wire_reactive_grants: w.reactive_grants.load(Ordering::Relaxed),
             wire_ring_grows: w.ring_grows.load(Ordering::Relaxed),
             wire_failures: w.failures.load(Ordering::Relaxed),
+            wire_deferrals: w.deferrals.load(Ordering::Relaxed),
             control_refusals: w.control_refusals.load(Ordering::Relaxed),
             ring_grow_declined: w.grow_declined.load(Ordering::Relaxed),
             wire_redials: w.redials.load(Ordering::Relaxed),
@@ -2252,11 +2273,22 @@ impl KvMetaBackend {
             }
             Err(e) => {
                 region.end_growth();
-                log::warn!(
-                    "meta volume {}: joined appender {own}'s GrowRing deferred ({e}) — retried \
-                     next cycle",
-                    self.path.display()
-                );
+                // The manager's `Deferred` (its ring 0 full for a beat — the
+                // retryable class) is the cadence's business, logged at
+                // debug; anything else is the wire's failure, loud.
+                if matches!(e, KvError::WireDeferred(_)) {
+                    log::debug!(
+                        "meta volume {}: joined appender {own}'s GrowRing deferred by the manager \
+                         ({e}) — retried next cycle (joined_wire_deferrals)",
+                        self.path.display()
+                    );
+                } else {
+                    log::warn!(
+                        "meta volume {}: joined appender {own}'s GrowRing deferred ({e}) — retried \
+                         next cycle",
+                        self.path.display()
+                    );
+                }
                 return;
             }
         };

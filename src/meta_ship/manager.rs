@@ -1310,6 +1310,24 @@ impl ManagerService {
                 },
                 STATUS_DEFERRED,
             ),
+            // PR 13i: a verb whose ring-0 control entry found the user
+            // window FULL at that instant (`EntryAdmission::Try` — a verb
+            // holds the verb mutex and may not park, and under the sector-
+            // pad law the manager's own storm fills ring 0 a page per
+            // commit, so the window is full for a beat every cycle). The
+            // verb IS a committer parked at ring admission: the manager's
+            // checkpoint task is kicked with the park's mark (a cycle runs
+            // at once) and the joiner's cadence retries — the retryable
+            // class, never a wire FAILURE.
+            Err(e @ crate::meta_backend::kv::KvError::JournalReserveExhausted { .. }) => {
+                self.volume.kick_checkpoint_for_ring_park();
+                (
+                    ManagerReply::Deferred {
+                        reason: e.to_string(),
+                    },
+                    STATUS_DEFERRED,
+                )
+            }
             Err(e) => (
                 ManagerReply::Refused {
                     reason: e.to_string(),
@@ -1580,6 +1598,9 @@ impl ManagerClient {
         {
             ManagerReply::Granted { runs } => Ok(runs_from_wire(&runs)),
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            // PR 13i: the manager's `Deferred` (its ring 0 full for a beat) —
+            // the retryable class, EAGAIN, never an invalid operation.
+            ManagerReply::Deferred { reason } => Err(SqueezefsError::refused(libc::EAGAIN, reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "ExtentGrant answered {other:?}"
             ))),
@@ -1601,6 +1622,9 @@ impl ManagerClient {
         {
             ManagerReply::Returned { cleared, already } => Ok((cleared, already)),
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            // PR 13i: the manager's `Deferred` (its ring 0 full for a beat) —
+            // the retryable class, EAGAIN, never an invalid operation.
+            ManagerReply::Deferred { reason } => Err(SqueezefsError::refused(libc::EAGAIN, reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "ReturnExtents answered {other:?}"
             ))),
@@ -1694,6 +1718,9 @@ impl ManagerClient {
         {
             ManagerReply::Released { already } => Ok(already),
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            // PR 13i: the manager's `Deferred` (its ring 0 full for a beat) —
+            // the retryable class, EAGAIN, never an invalid operation.
+            ManagerReply::Deferred { reason } => Err(SqueezefsError::refused(libc::EAGAIN, reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "ReleaseSlot answered {other:?}"
             ))),
@@ -1712,6 +1739,9 @@ impl ManagerClient {
         {
             ManagerReply::RootsPublished { published, already } => Ok((published, already)),
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            // PR 13i: the manager's `Deferred` (its ring 0 full for a beat) —
+            // the retryable class, EAGAIN, never an invalid operation.
+            ManagerReply::Deferred { reason } => Err(SqueezefsError::refused(libc::EAGAIN, reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "PublishRoots answered {other:?}"
             ))),
@@ -1789,6 +1819,9 @@ impl ManagerClient {
         {
             ManagerReply::Shared { inserted, already } => Ok((inserted, already)),
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            // PR 13i: the manager's `Deferred` (its ring 0 full for a beat) —
+            // the retryable class, EAGAIN, never an invalid operation.
+            ManagerReply::Deferred { reason } => Err(SqueezefsError::refused(libc::EAGAIN, reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "ShareBlock answered {other:?}"
             ))),
@@ -1813,6 +1846,9 @@ impl ManagerClient {
         {
             ManagerReply::SharedReleased { shared, remaining } => Ok((shared, remaining)),
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            // PR 13i: the manager's `Deferred` (its ring 0 full for a beat) —
+            // the retryable class, EAGAIN, never an invalid operation.
+            ManagerReply::Deferred { reason } => Err(SqueezefsError::refused(libc::EAGAIN, reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "ReleaseShared answered {other:?}"
             ))),
@@ -1866,6 +1902,9 @@ impl ManagerClient {
             )),
             ManagerReply::BlocksFull => Ok(None),
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            // PR 13i: the manager's `Deferred` (its ring 0 full for a beat) —
+            // the retryable class, EAGAIN, never an invalid operation.
+            ManagerReply::Deferred { reason } => Err(SqueezefsError::refused(libc::EAGAIN, reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "BlockGrant answered {other:?}"
             ))),
@@ -1890,6 +1929,9 @@ impl ManagerClient {
         {
             ManagerReply::BlocksReturned { cleared } => Ok(cleared),
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            // PR 13i: the manager's `Deferred` (its ring 0 full for a beat) —
+            // the retryable class, EAGAIN, never an invalid operation.
+            ManagerReply::Deferred { reason } => Err(SqueezefsError::refused(libc::EAGAIN, reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "ReturnBlocks answered {other:?}"
             ))),
@@ -1942,6 +1984,9 @@ impl ManagerClient {
         {
             ManagerReply::Recorded { already } => Ok(already),
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            // PR 13i: the manager's `Deferred` (its ring 0 full for a beat) —
+            // the retryable class, EAGAIN, never an invalid operation.
+            ManagerReply::Deferred { reason } => Err(SqueezefsError::refused(libc::EAGAIN, reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "AllocLeaseBitmap answered {other:?}"
             ))),
@@ -1965,6 +2010,9 @@ impl ManagerClient {
         {
             ManagerReply::Recorded { already } => Ok(already),
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            // PR 13i: the manager's `Deferred` (its ring 0 full for a beat) —
+            // the retryable class, EAGAIN, never an invalid operation.
+            ManagerReply::Deferred { reason } => Err(SqueezefsError::refused(libc::EAGAIN, reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "AllocLeaseRelease answered {other:?}"
             ))),
@@ -1979,6 +2027,9 @@ impl ManagerClient {
         {
             ManagerReply::Recorded { already } => Ok(already),
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            // PR 13i: the manager's `Deferred` (its ring 0 full for a beat) —
+            // the retryable class, EAGAIN, never an invalid operation.
+            ManagerReply::Deferred { reason } => Err(SqueezefsError::refused(libc::EAGAIN, reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "RecordRecovered answered {other:?}"
             ))),
@@ -2003,6 +2054,9 @@ impl ManagerClient {
         {
             ManagerReply::Recorded { already } => Ok(already),
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            // PR 13i: the manager's `Deferred` (its ring 0 full for a beat) —
+            // the retryable class, EAGAIN, never an invalid operation.
+            ManagerReply::Deferred { reason } => Err(SqueezefsError::refused(libc::EAGAIN, reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "RecordDeath answered {other:?}"
             ))),
@@ -2026,6 +2080,9 @@ impl ManagerClient {
         {
             ManagerReply::Left { already } => Ok(already),
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            // PR 13i: the manager's `Deferred` (its ring 0 full for a beat) —
+            // the retryable class, EAGAIN, never an invalid operation.
+            ManagerReply::Deferred { reason } => Err(SqueezefsError::refused(libc::EAGAIN, reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "LeaveAppender answered {other:?}"
             ))),
@@ -2051,6 +2108,9 @@ impl ManagerClient {
         {
             ManagerReply::Published { already } => Ok(already),
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            // PR 13i: the manager's `Deferred` (its ring 0 full for a beat) —
+            // the retryable class, EAGAIN, never an invalid operation.
+            ManagerReply::Deferred { reason } => Err(SqueezefsError::refused(libc::EAGAIN, reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "PublishEndpoint answered {other:?}"
             ))),
@@ -2066,6 +2126,9 @@ impl ManagerClient {
         {
             ManagerReply::Endpoint { endpoint } => Ok(endpoint),
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            // PR 13i: the manager's `Deferred` (its ring 0 full for a beat) —
+            // the retryable class, EAGAIN, never an invalid operation.
+            ManagerReply::Deferred { reason } => Err(SqueezefsError::refused(libc::EAGAIN, reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "ResolveEndpoint answered {other:?}"
             ))),
@@ -2088,6 +2151,9 @@ impl ManagerClient {
         {
             ManagerReply::RingGrown { segment } => Ok(segment),
             ManagerReply::Refused { reason } => Err(SqueezefsError::InvalidOperation(reason)),
+            // PR 13i: the manager's `Deferred` (its ring 0 full for a beat) —
+            // the retryable class, EAGAIN, never an invalid operation.
+            ManagerReply::Deferred { reason } => Err(SqueezefsError::refused(libc::EAGAIN, reason)),
             other => Err(SqueezefsError::InvalidOperation(format!(
                 "GrowRing answered {other:?}"
             ))),

@@ -539,6 +539,7 @@ fn every_kv_error_class_survives_the_fan_out_clone_with_its_errno() {
         KvError::Io(SqueezefsError::refused(libc::EDQUOT, "quota")),
         KvError::Busy("another writer holds the volume".into()),
         KvError::ManagerUnreachable("dial failed".into()),
+        KvError::WireDeferred("the manager's ring 0 full for a beat".into()),
         KvError::LeaseDeferred("home not recovered".into()),
         KvError::HandoverDeferred("live custody".into()),
     ];

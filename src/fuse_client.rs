@@ -14494,6 +14494,10 @@ impl SqueezefsFilesystem {
                         word(&|s| s.wire_ring_grows),
                     );
                     metrics.insert("joined_wire_failures".into(), word(&|s| s.wire_failures));
+                    // PR 13i: the manager's `Deferred` answers (its ring 0
+                    // full for a beat, a clearing loop at its bound) — the
+                    // cadence's retry class, apart from the failures.
+                    metrics.insert("joined_wire_deferrals".into(), word(&|s| s.wire_deferrals));
                     // Issue 6 (PR 13 review): `Joined.node_seq_base` words the
                     // joiner's screen refused — process-wide (a refused join
                     // has no backend); must-stay-0.

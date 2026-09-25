@@ -1211,13 +1211,19 @@ if [ "${MW_SKIP_FORMAT:-0}" != 1 ]; then
   # publish; the shape tests/mw_fleet.sh formats the box and local fleets
   # with, so the symmetric rows price the same DMA the box priced). The
   # default keeps every other preset's staged format verbatim.
+  # --force: every assemble is a declared REFORMAT (the typed-YES text), and
+  # a RE-assemble meets the previous assemble's superblock — the storage
+  # node's `wipefs -a` does not know the METALV01 magic, so `format` refused
+  # it without --force (the 2026-09-24 cloud row's assemble attempt 2 met
+  # attempt 1's format). --force keeps the live-client refusal: a
+  # heartbeat-fresh registration still refuses the format loud.
   read -ra FEXTRA <<<"$(printf '%s' "${FORMAT_EXTRA_STR:-}" | tr ',' ' ')"
   if [ "${FORMAT_CACHE:-1}" = 0 ]; then
-    echo "format (CACHE-LESS): $META_URI $DATA_URI ${FEXTRA[*]:-}"
-    "$SQZ" format "$META_URI" "$DATA_URI" "${FEXTRA[@]}"
+    echo "format (CACHE-LESS): $META_URI $DATA_URI --force ${FEXTRA[*]:-}"
+    "$SQZ" format "$META_URI" "$DATA_URI" --force "${FEXTRA[@]}"
   else
-    echo "format: $META_URI $DATA_URI --disk-cache-paths $CACHE ${FEXTRA[*]:-}"
-    "$SQZ" format "$META_URI" "$DATA_URI" --disk-cache-paths "$CACHE" "${FEXTRA[@]}"
+    echo "format: $META_URI $DATA_URI --disk-cache-paths $CACHE --force ${FEXTRA[*]:-}"
+    "$SQZ" format "$META_URI" "$DATA_URI" --disk-cache-paths "$CACHE" --force "${FEXTRA[@]}"
   fi
 else
   # a JOINING node: the set is formatted by the manager's node — connect

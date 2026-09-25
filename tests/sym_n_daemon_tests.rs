@@ -11646,6 +11646,22 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
                  the sized-cadence law is not judged here",
                 c.ring_bytes
             );
+        } else if c.grow_declined > a.grow_declined && pressure_steady > 0 {
+            // The manager DECLINED this joiner's growth (PR 13g's `GrowRing`
+            // answers `None` at the set-wide `heap / 16` ring budget, which
+            // the storm's other joiner may have taken first on this small
+            // volume, or on a short heap run) and the latch
+            // (`grow_declined_at`) keeps the joiner at that size until a
+            // fresh stall — the same bound the ceiling is, reached through
+            // the budget: the pressure law is its steady state too.
+            eprintln!(
+                "F-R5 joiner {i}: the manager declined this ring's growth ({} declines, the ring \
+                 at {} B) — {steady} cycles in the last quarter (pressure +{pressure_steady}) \
+                 are the pressure law's steady state on a ring the set's budget bounds below \
+                 the storm's demand; the sized-cadence law is not judged here",
+                c.grow_declined - a.grow_declined,
+                c.ring_bytes
+            );
         } else {
             assert!(
                 steady <= cadence_bound,

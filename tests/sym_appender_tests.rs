@@ -2743,6 +2743,17 @@ async fn clean_partitioned_remounts_never_take_the_bitmap_generation_raise() {
 /// records frozen, the write failed, the lane PARKED before the rollback
 /// (`TEST_CONVEYOR_HOLD_PRE_ROLLBACK`) while two barriered cycles find the
 /// ring drained with a stall on record.
+///
+/// PR 13i re-read the schedule's PREMISES under the park-kick law (a
+/// committer parked at ring admission wakes the checkpoint task as a
+/// tick, so the storm's drain is the task's own cycles): growth is judged
+/// as a DELTA across the in-flight window (the storm's kick cycles may
+/// legally grow the ring before the doomed write — a stall on record and
+/// a drained ring at a cycle's end), the doomed write reserves under a
+/// test-held SMO mutex (a maintenance-pass SMO racing it for the head
+/// took the armed sector once in ~25 runs: the SMO's write was the one
+/// held, under the mutex the cycle needs — a hang), and the closing
+/// growth is driven by a SECOND storm (its own stall on record).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn growth_never_swaps_a_ring_with_a_stage_b_window_in_flight() {
     struct HoldGuard;
@@ -2765,38 +2776,56 @@ async fn growth_never_swaps_a_ring_with_a_stage_b_window_in_flight() {
     let ra = open_with_partition(&uris, Some(PARTITION)).await;
     let va = Arc::clone(&ra.volumes[0]);
     assert_eq!(stats(&va).regions[1].ring_bytes, 512 * 1024);
-    // A stall on record (the growth contract's storm; the test is the
-    // only drain), the ring NOT yet grown.
-    let committer = {
-        let v = Arc::clone(&va);
+    // A storm that stalls the small ring; the checkpoint task's park-kick
+    // cycles are its drain (the cadence is parked at 60 s).
+    let storm = |v: Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend>, base: u64| {
         tokio::spawn(async move {
             for i in 0..40u64 {
-                v.commit_block_refs(guest_owner, &refs(tag, guest_owner, i * 1000, 500))
+                v.commit_block_refs(guest_owner, &refs(tag, guest_owner, base + i * 1000, 500))
                     .await
                     .unwrap();
             }
         })
     };
+    let committer = storm(Arc::clone(&va), 0);
     let stall_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while stats(&va).regions[1].stalls == 0 {
         assert!(!committer.is_finished() && std::time::Instant::now() < stall_deadline);
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
-    while !committer.is_finished() {
-        va.checkpoint_now().await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
     committer.await.unwrap();
     let s = stats(&va);
     assert!(s.regions[1].stalls > 0);
-    assert_eq!(s.ring_grows, 0, "not grown yet: {:?}", s.regions[1]);
+    // Settle: the storm's dirty leaves flushed (their threshold SMOs run
+    // here, under the test's cycle, never racing the doomed write below)
+    // and room for one small entry — a cycle may grow the ring here; the
+    // law below is a delta.
+    for _ in 0..8 {
+        va.checkpoint_now().await.unwrap();
+        let ring = va.ring_of_region(1);
+        let core = ring.core();
+        let distance = core.head().saturating_sub(core.reusable_upto());
+        let admissible = core
+            .geometry()
+            .logical_len()
+            .saturating_sub(core.geometry().reserve_bytes);
+        if distance + 64 * 1024 < admissible {
+            break;
+        }
+    }
+    let grows_before = stats(&va).ring_grows;
     // The doomed write: held at the device, its stage-A records frozen
     // into a bset by a checkpoint, then failed on release with the lane
     // parked BEFORE its rollback — a stage-B window in flight, its
-    // reservation completed, its compensation not yet issued.
+    // reservation completed, its compensation not yet issued. The stall
+    // is armed at the ring's head; the SMO mutex is held while the doomed
+    // commit reserves so no maintenance-pass SMO takes that position.
     let ring1 = va.ring_of_region(1);
     let phys = ring1.physical_offset_of(ring1.core().head());
     let mut arrived = squeezefs::uring_fs::arm_write_stall(&path, phys, 8);
+    let smo_hold = va
+        .test_try_hold_smo()
+        .expect("the SMO mutex is free between cycles");
     let doomed = {
         let v = Arc::clone(&va);
         tokio::spawn(async move {
@@ -2804,10 +2833,11 @@ async fn growth_never_swaps_a_ring_with_a_stage_b_window_in_flight() {
                 .await
         })
     };
-    arrived
-        .recv()
+    tokio::time::timeout(std::time::Duration::from_secs(20), arrived.recv())
         .await
+        .expect("the doomed write reached the device shim within the bound")
         .expect("the doomed write reached the device shim");
+    drop(smo_hold);
     va.checkpoint_now().await.unwrap();
     TEST_CONVEYOR_HOLD_STAGE.store(TEST_CONVEYOR_HOLD_PRE_ROLLBACK, Ordering::SeqCst);
     squeezefs::uring_fs::arm_sector_write_error(phys);
@@ -2822,14 +2852,14 @@ async fn growth_never_swaps_a_ring_with_a_stage_b_window_in_flight() {
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
     // Two barriered cycles: the ring drains (the failed tx's leaves are
-    // flushed, the hole's tail lands) with the stall on record — the
+    // flushed, the hole's tail lands) with a stall on record — the
     // growth decision at each cycle's end must DECLINE while the window
     // is in flight.
     va.checkpoint_now().await.unwrap();
     va.checkpoint_now().await.unwrap();
     let s = stats(&va);
     assert_eq!(
-        s.ring_grows, 0,
+        s.ring_grows, grows_before,
         "growth never swaps a ring a stage-B window still names: {:?}",
         s.regions[1]
     );
@@ -2840,13 +2870,21 @@ async fn growth_never_swaps_a_ring_with_a_stage_b_window_in_flight() {
     let out = doomed.await.unwrap();
     assert!(out.is_err(), "the failed window fails its member: {out:?}");
     squeezefs::uring_fs::clear_faults();
-    // With the window settled, growth proceeds on the next drained cycle.
+    // With the window settled, growth proceeds: a second storm puts a
+    // fresh stall on record, two cycles drain the ring, the decision
+    // grows it.
+    storm(Arc::clone(&va), 200_000).await.unwrap();
     va.checkpoint_now().await.unwrap();
     va.checkpoint_now().await.unwrap();
     let s = stats(&va);
-    assert!(s.ring_grows >= 1, "{:?}", s.regions[1]);
+    assert!(
+        s.ring_grows > grows_before,
+        "growth proceeds once the window settled: {:?}",
+        s.regions[1]
+    );
     assert_eq!(va.block_ref_count(tag, 90_000).await.unwrap(), 0);
     assert_eq!(va.block_ref_count(tag, 17_007).await.unwrap(), 1);
+    assert_eq!(va.block_ref_count(tag, 217_007).await.unwrap(), 1);
     let live = digest_backend(&va).await.unwrap();
     drop(va);
     drop(ra);
@@ -2854,6 +2892,93 @@ async fn growth_never_swaps_a_ring_with_a_stage_b_window_in_flight() {
     assert_eq!(digest_backend(&rb.volumes[0]).await.unwrap(), live);
     assert_eq!(rb.volumes[0].block_ref_count(tag, 90_000).await.unwrap(), 0);
     for v in &rb.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+/// PR 13i (found by the growth contract above once the park-kick cycle
+/// ran the manager's reactive refill BESIDE the test's `stats` poll —
+/// 1 run in 25 hung for ever): `AppenderSet::stats` took a region's
+/// `page` mutex and THEN its `grant`, while every grant writer — the
+/// `ExtentGrant`'s page update (`manager_extent_grant_class`), the
+/// joiner's remainder naming — takes `grant` and THEN `page`. A
+/// lock-order inversion between the `.stats` reader (the operator's
+/// instrument, polled every second by every fleet leg) and the manager's
+/// checkpoint task: both parked in `Mutex::lock` for ever, the volume's
+/// cadence dead behind them. ONE order — `grant` before `page` — is the
+/// region's lock law now (`AppenderRegion`'s doc). The pin runs the two
+/// paths against each other: a std thread polls `appender_stats` in a
+/// tight loop while the manager carves and returns a one-extent grant a
+/// few hundred times; the base deadlocks within the first carves, the
+/// fixed order finishes. Bounded by a watchdog so a regression is a
+/// loud RED, never a hung suite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_stats_reader_never_deadlocks_against_a_grants_page_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let ra = open_with_partition(&uris, Some(PARTITION)).await;
+    let va = Arc::clone(&ra.volumes[0]);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let poller = {
+        let v = Arc::clone(&va);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut polls = 0u64;
+            while !stop.load(Ordering::Acquire) {
+                let _ = v
+                    .appender_stats()
+                    .expect("a forest volume has an appender set");
+                polls += 1;
+            }
+            polls
+        })
+    };
+    // Every ask after the first is a fresh carve — a grant→page update:
+    // the runs an ask answers (the carve, or on the first ask §5.3.5's
+    // verbatim remainder) are returned before the next ask, so the pool
+    // is empty at every carve and idempotency never answers verbatim.
+    let driver = {
+        let v = Arc::clone(&va);
+        async move {
+            for _ in 0..300u32 {
+                let granted = v.manager_extent_grant(1, 1).await.expect("ExtentGrant");
+                let back: Vec<u64> = granted
+                    .iter()
+                    .flat_map(|r| r.start..r.start + u64::from(r.len))
+                    .collect();
+                if !back.is_empty() {
+                    v.manager_return_extents(1, &back)
+                        .await
+                        .expect("ReturnExtents");
+                }
+            }
+        }
+    };
+    // Spawned: a deadlocked carve blocks ITS worker in `Mutex::lock`, and
+    // the watchdog below must be polled by a thread that is not it.
+    let driver = tokio::spawn(driver);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), driver).await;
+    stop.store(true, Ordering::Release);
+    if outcome.is_err() {
+        // A tokio worker is parked in `Mutex::lock` under the driver and
+        // the poller holds `page` for ever: the runtime's drop would join
+        // that worker and a panic would hang the suite instead of failing
+        // it. The verdict goes to the UNCAPTURED stderr and the process
+        // exits nonzero (the skip ledger's channel).
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(
+            "\nFAILED: the_stats_reader_never_deadlocks_against_a_grants_page_update — the \
+             stats reader and the manager's grant→page update DEADLOCKED (a lock-order \
+             inversion between AppenderSet::stats and the grant writers; one order: grant \
+             before page)\n"
+                .as_bytes(),
+        );
+        std::process::exit(101);
+    }
+    let polls = poller.join().expect("the poller thread");
+    assert!(polls > 0, "the poller ran beside the carves");
+    for v in &ra.volumes {
         v.shutdown().await.unwrap();
     }
 }

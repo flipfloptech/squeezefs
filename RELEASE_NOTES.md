@@ -252,7 +252,14 @@ whose control entry finds ring 0 full for a beat is answered `Deferred`
 (the joiner's `EAGAIN` retry class, counted on `joined_wire_deferrals`) and
 kicks the manager's cycle, never a failure; and a joiner whose `GrowRing`
 the manager declined at a ceiling or an exhausted budget asks again only
-once its ring changed or a fresh stall arrived. Two companions
+once its ring changed or a fresh stall arrived. **A SHIPPED deadlock found
+on the way (every layout that grants extents — a declared partition, every
+joined writer):** the `.stats` reader took an appender region's `page` mutex
+then its `grant` while the manager's extent-grant page update took them the
+other way round, so a `.stats` read landing inside a grant's page update
+parked BOTH the stats reader and the checkpoint task for ever (the cadence
+dead, no committer parked to escalate); one lock order now (`grant` before
+`page`), pinned by a stress contract. Two companions
 on the armed symmetric plane: **F-C2** — a joined writer honours the
 manager's `Joined` reply's grant word instead of rebuilding its grant from
 the page it reads next (under the old buffered posture the stale page —

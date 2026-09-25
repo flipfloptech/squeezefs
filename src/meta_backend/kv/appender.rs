@@ -2517,6 +2517,15 @@ pub fn declared_partition() -> Result<
 /// One appender region this mount holds: its page slots, the RAM copy of
 /// its page, its ring (swapped on growth — never in place) and the
 /// per-region ledger the checkpoint cycle maintains.
+///
+/// **Lock order (PR 13i):** a site that holds both takes `grant` BEFORE
+/// `page` — the grant writers name the remainder on the page under the
+/// grant guard (`manager_extent_grant_class`, the joiner's remainder
+/// naming), and the `.stats` reader follows them. The reverse order
+/// deadlocked the operator's stats poll against the manager's checkpoint
+/// task (found by the growth contract under the park-kick cycle; pinned
+/// by `the_stats_reader_never_deadlocks_against_a_grants_page_update`).
+/// Neither guard is ever held across an await.
 pub struct AppenderRegion {
     pub id: u32,
     /// `[A, B, R0, R1]` device offsets.
@@ -3267,8 +3276,9 @@ impl AppenderSet {
                 .iter()
                 .map(|r| {
                     let ring = r.ring();
-                    let page = r.page.lock().unwrap_or_else(|e| e.into_inner());
+                    // `grant` before `page` — the region's lock order.
                     let grant = r.grant();
+                    let page = r.page.lock().unwrap_or_else(|e| e.into_inner());
                     AppenderRegionStats {
                         id: r.id,
                         term: page.term,

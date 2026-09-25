@@ -2212,6 +2212,27 @@ PY
     [ "$stable" -ge 3 ] || die "the manager never quiesced (checkpoints kept moving for 120 s)"
     log "host wrote ≥ 2 checkpoint cycles and quiesced at $ck1 (guest's first read: page 0 at generation $g_gen1)"
 
+    # ---- the host's OWN word for the durable image, taken BEFORE the
+    # guest's second read (its cache is the writer's — coherent with its
+    # writes by construction). The pin compares the guest's read against
+    # the word the host had ALREADY written when the read began: a cycle
+    # that lands between the two listings (the forest's trailing root
+    # publications, the slot-lease cadence's page writes — none of them a
+    # `meta_kv_checkpoints` step the quiesce loop above counts) moves the
+    # host's page AFTER the guest read it, which is not incoherence. Under
+    # buffered I/O the guest's second read stands at its first (below the
+    # host's word); under O_DIRECT it is at least the host's word.
+    local h_gen
+    "$SQZ" appenders "sqmeta://$meta_path" --json >"$rowdir/host-appenders.json" 2>"$rowdir/host-appenders.err" ||
+        die "host appenders listing failed: $(tail -3 "$rowdir/host-appenders.err")"
+    h_gen="$(python3 -c '
+import json, sys
+rows = json.load(open(sys.argv[1]))
+print(next(r["generation"] for r in rows if r.get("appender_id") == 0 and r.get("state") == "live"))' "$rowdir/host-appenders.json")" ||
+        die "host listing carries no Live page 0"
+    [ "$h_gen" -gt "$g_gen1" ] ||
+        die "page 0's generation did not move on the host ($g_gen1 → $h_gen) — the pin's premise (a host write after the guest's read) is unmet"
+
     # ---- job 2: the guest lists AGAIN — the pin ----
     {
         guest_job_preamble
@@ -2233,22 +2254,18 @@ rows = json.loads(txt[start:txt.rindex(']') + 1])
 print(next(r["generation"] for r in rows if r.get("appender_id") == 0 and r.get("state") == "live"))
 PY
 )" || die "guest listing 2 carries no Live page 0"
-    # The host's OWN word for the same durable image (its cache is the
-    # writer's — coherent with its writes by construction).
-    local h_gen
-    "$SQZ" appenders "sqmeta://$meta_path" --json >"$rowdir/host-appenders.json" 2>"$rowdir/host-appenders.err" ||
-        die "host appenders listing failed: $(tail -3 "$rowdir/host-appenders.err")"
-    h_gen="$(python3 -c '
+    # The host's word AFTER the guest's read, for the evidence file (a
+    # cycle between the two listings shows here as h_gen_after > h_gen).
+    local h_gen_after
+    "$SQZ" appenders "sqmeta://$meta_path" --json >"$rowdir/host-appenders-after.json" 2>/dev/null &&
+        h_gen_after="$(python3 -c '
 import json, sys
 rows = json.load(open(sys.argv[1]))
-print(next(r["generation"] for r in rows if r.get("appender_id") == 0 and r.get("state") == "live"))' "$rowdir/host-appenders.json")" ||
-        die "host listing carries no Live page 0"
-    [ "$h_gen" -gt "$g_gen1" ] ||
-        die "page 0's generation did not move on the host ($g_gen1 → $h_gen) — the pin's premise (a host write after the guest's read) is unmet"
-    echo "guest_gen_before=$g_gen1 guest_gen_after=$g_gen2 host_gen=$h_gen" >"$rowdir/pin.txt"
-    [ "$g_gen2" = "$h_gen" ] ||
-        die "F-C1 PIN RED: the guest re-read page 0 at generation $g_gen2 while the host wrote it to $h_gen (the guest's first read left it at $g_gen1) — a second kernel served its own page cache of a block the manager rewrote: shared-LUN metadata I/O is not coherent (design-symmetric-metadata §5.12; evidence $rowdir)"
-    log "F-C1 PIN GREEN: the guest's second read is the host's word (generation $h_gen)"
+print(next(r["generation"] for r in rows if r.get("appender_id") == 0 and r.get("state") == "live"))' "$rowdir/host-appenders-after.json" 2>/dev/null)" || h_gen_after="?"
+    echo "guest_gen_before=$g_gen1 guest_gen_after=$g_gen2 host_gen_before_read=$h_gen host_gen_after_read=$h_gen_after" >"$rowdir/pin.txt"
+    [ "$g_gen2" -ge "$h_gen" ] ||
+        die "F-C1 PIN RED: the guest re-read page 0 at generation $g_gen2 while the host had written it to $h_gen BEFORE that read (the guest's first read left it at $g_gen1) — a second kernel served its own page cache of a block the manager rewrote: shared-LUN metadata I/O is not coherent (design-symmetric-metadata §5.12; evidence $rowdir)"
+    log "F-C1 PIN GREEN: the guest's second read ($g_gen2) is at least the host's word before it ($h_gen; the host's word after it: $h_gen_after)"
 
     # ---- job 3: the guest JOINS as a writer and creates ----
     # The guest mounts under ITS OWN per-mount identity (the pair job 1

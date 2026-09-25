@@ -133,16 +133,24 @@ deltas stated where they happen:
 5. **Apt hygiene (deploy):** on every node `deploy` takes Ubuntu's
    unattended apt off the session — `systemctl stop unattended-upgrades
    .service` first (its stop handler waits for a running upgrade child: the
-   graceful drain), then the `apt-daily*` timers stopped, disabled and
-   masked and the upgrader masked; a LIVE apt/dpkg transaction is detected
-   by its LOCKS (`fuser` on `/var/lib/dpkg/lock*` + the apt locks) and by
-   the oneshot units' `activating` state — never by `unattended-upgrades
-   .service`'s state, which is `active` on every booted Ubuntu node (the
-   `--wait-for-signal` waiter) — and waited for, bounded (10 min, then the
-   deploy dies loud naming the node); dpkg is never killed. Seconds per
-   quiet node. The 2026-09-24 run met an unattended apt run during the
-   session (the resume note lists the fix; what the run itself did is in no
-   surviving source). The node script and its pin:
+   graceful drain — a refused stop is reported loud and the hygiene
+   continues), then the `apt-daily*` timers stopped, disabled and masked and
+   the upgrader masked; a LIVE apt/dpkg transaction is detected by its LOCKS
+   (`fuser` on `/var/lib/dpkg/lock*` + the apt locks), by the oneshot units'
+   `activating` state, and by the UPGRADER's command line (`pgrep -f` on
+   `unattended-upgrade` — never the 15-char comm, which the always-running
+   `unattended-upgrade-shutdown --wait-for-signal` waiter shares, and never
+   `unattended-upgrades.service`'s state, which is `active` on every booted
+   Ubuntu node) — and waited for, bounded, then the deploy dies loud naming
+   the node; dpkg is never killed. **The bound, honestly:** the drain's
+   `systemctl stop` blocks for up to the unit's own `TimeoutStopSec`
+   (1800 s on Ubuntu's `--wait-for-signal` unit) while a live upgrade
+   finishes, THEN the lock loop's `APT_UPGRADE_WAIT_MAX_S` (600 s) — a
+   worst case of 40 min per node, paid only when an upgrade is genuinely
+   mid-flight; seconds per quiet node. The 2026-09-24 run met an unattended
+   apt run during the session (the resume note lists the fix; what the run
+   itself did is in no surviving source). The node script and its pin
+   (every arm of the busy probe pinned on its own — a deleted arm goes RED):
    `tests/cloud_bench_node_scripts.sh`, `tests/cloud_bench_cluster_units.sh`.
 6. **Idempotent re-assemble:** the fabric script's `format` passes
    `--force` — a re-assemble meets the previous assemble's superblock

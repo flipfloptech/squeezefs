@@ -34,8 +34,12 @@ APT_UPGRADE_POLL_S="${APT_UPGRADE_POLL_S:-5}"
 # `unattended-upgrade` child under the unit's own stop timeout — run FIRST;
 # `apt-daily*.service` is never `stop`ped (a `stop` SIGTERMs the unit's
 # cgroup: apt.systemd.daily → unattended-upgrade → dpkg); a lock held past
-# the bound dies loud naming the node. On a quiet node the whole script is
-# a handful of systemctl calls: seconds.
+# the bound dies loud naming the node. The third arm matches the UPGRADER's
+# command line, never the comm the waiter shares with it (Issue 11). The
+# worst case per node is the drain's stop timeout (the unit's
+# TimeoutStopSec, 1800 s on Ubuntu) + APT_UPGRADE_WAIT_MAX_S, paid only
+# while an upgrade is genuinely mid-flight; on a quiet node the whole
+# script is a handful of systemctl calls: seconds.
 NODE_APT_HYGIENE_SCRIPT="$(cat <<'EOS'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -55,12 +59,22 @@ apt_busy() { # 0 while an apt/dpkg transaction may be live
     s="$(systemctl show -p ActiveState --value "$u" 2>/dev/null || true)"
     case "$s" in activating|active|reloading|deactivating) return 0 ;; esac
   done
-  # the upgrader process itself (comm is truncated to 15 chars)
-  pgrep -x unattended-upgr >/dev/null 2>&1 && return 0
+  # the UPGRADER process itself, by its command line — never by comm: the
+  # upgrader `unattended-upgrade` and the always-running waiter
+  # `unattended-upgrade-shutdown --wait-for-signal` share the 15-char comm
+  # `unattended-upgr`, and a comm match read an idle waiter as a live
+  # transaction for the whole bound (review round 2, Issue 11)
+  pgrep -f '(^|/)unattended-upgrade( |$)' >/dev/null 2>&1 && return 0
   return 1
 }
-# 1. the graceful drain: waits for a running unattended-upgrade to finish
-systemctl stop unattended-upgrades.service 2>/dev/null || true
+# 1. the graceful drain: the unit's stop handler waits for a running
+#    unattended-upgrade to finish — for up to the unit's own TimeoutStopSec
+#    (1800 s on Ubuntu's --wait-for-signal unit), so the deploy's worst case
+#    is that stop timeout + APT_UPGRADE_WAIT_MAX_S. A refused stop is LOUD
+#    (the later arms presume the waiter is gone); the hygiene continues.
+if ! systemctl stop unattended-upgrades.service 2>/dev/null; then
+  echo "WARN[$NODE]: systemctl stop unattended-upgrades.service failed — the graceful drain did not run; continuing with the timers + mask (a running upgrade is still waited for by its lock)" >&2
+fi
 # 2. nothing re-fires for the session: the timers off, the upgrader masked
 systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true

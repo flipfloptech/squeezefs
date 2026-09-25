@@ -29,6 +29,14 @@
 #   apt-5  the PROCESS arm alone: the upgrader `unattended-upgrade` is in the
 #          process table for three probes, no lock, every unit inactive —
 #          exactly three polls.
+#   apt-6  the always-running WAITER `unattended-upgrade-shutdown
+#          --wait-for-signal` (comm `unattended-upgr` — the SAME 15-char comm
+#          as the upgrader) still in the process table (a `stop` the fake
+#          swallowed), no upgrade anywhere: NOT waited on — the process arm
+#          must match the UPGRADER's command line, never the comm.
+#   apt-7  a FAILED `systemctl stop unattended-upgrades.service` is LOUD in
+#          the script's output (the drain is what makes the later arms
+#          meaningful), the rest of the hygiene still runs.
 # Mutation law (state it in the commit that touches `apt_busy`): deleting the
 # lock arm → apt-2 + apt-3 RED; the unit-state arm → apt-4 RED; the process
 # arm → apt-5 RED. `CLOUD_NODE_SCRIPTS_LIB=<path>` points the pin at a
@@ -104,7 +112,12 @@ case "$1" in
       case "$(state_of "$u")" in active|reloading) exit 0 ;; esac
     done
     exit 3 ;;
-  stop|start|disable|enable|mask|unmask) exit 0 ;;
+  stop)
+    # a unit listed in `stop_fails` refuses its stop (a busy dbus, a renamed unit)
+    shift
+    for u in "$@"; do grep -qx -- "$u" "$FAKE_STATE/stop_fails" 2>/dev/null && exit 1; done
+    exit 0 ;;
+  start|disable|enable|mask|unmask) exit 0 ;;
   *) exit 0 ;;
 esac
 EOF
@@ -161,6 +174,7 @@ new_case() { # <name> — a fresh state dir + log; prints the case dir
   : >"$d/log"
   : >"$d/units"
   : >"$d/procs"
+  : >"$d/stop_fails"
   echo 0 >"$d/lock_held_polls"
   echo 0 >"$d/activating_polls"
   echo 0 >"$d/upgrader_polls"
@@ -230,6 +244,25 @@ assert_eq "apt-5 exit" 0 "$rc"
 assert_eq "apt-5 polls = the 3 probes that saw the upgrader" 3 "$(grep -c '^sleep ' "$d/log" || true)"
 assert_grep "apt-5 the process table was consulted" '^pgrep ' "$d/log"
 assert_no_grep "apt-5 never stops apt-daily-upgrade.service" '^systemctl stop .*apt-daily-upgrade\.service' "$d/log"
+
+echo "== apt-6: the always-running WAITER in the process table (same comm as the upgrader), no upgrade anywhere: not waited on"
+d="$(new_case apt6)"
+printf '%s\n' "unattended-upgrades.service active" "apt-daily-upgrade.service inactive" "apt-daily.service inactive" >"$d/units"
+echo "1717 unattended-upgr /usr/bin/python3 /usr/share/unattended-upgrades/unattended-upgrade-shutdown --wait-for-signal" >"$d/procs"
+rc=0; run_apt "$d" || rc=$?
+assert_eq "apt-6 exit" 0 "$rc"
+assert_eq "apt-6 polls with only the waiter present" 0 "$(grep -c '^sleep ' "$d/log" || true)"
+assert_grep "apt-6 the process table was consulted" '^pgrep ' "$d/log"
+
+echo "== apt-7: a FAILED stop of unattended-upgrades.service is loud; the rest of the hygiene still runs"
+d="$(new_case apt7)"
+printf '%s\n' "unattended-upgrades.service active" "apt-daily-upgrade.service inactive" "apt-daily.service inactive" >"$d/units"
+echo "unattended-upgrades.service" >"$d/stop_fails"
+rc=0; run_apt "$d" || rc=$?
+assert_eq "apt-7 exit (the hygiene completes — the failed drain is reported, not fatal on a quiet node)" 0 "$rc"
+assert_grep "apt-7 the failed drain is named on stderr" 'unattended-upgrades\.service.*(failed|refused|could not)' "$d/err"
+assert_grep "apt-7 the timers still go off" '^systemctl stop apt-daily\.timer apt-daily-upgrade\.timer' "$d/log"
+assert_grep "apt-7 the upgrader still masked" '^systemctl mask .*unattended-upgrades\.service' "$d/log"
 
 # --- the machine-id node script --------------------------------------------------
 run_mid() { # <casedir> <REGEN> — the node script under the fakes with MID_* in the case dir

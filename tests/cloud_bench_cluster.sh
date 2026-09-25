@@ -234,9 +234,11 @@ MW_MOUNT_EXTRA="--allow-other"             # NO --interception on MW mounts
 # identities DISTINCT across the client nodes and regenerates a duplicate (a
 # baked AMI clones the file onto every node), and BEFORE them /etc/machine-id
 # (the daemon's node token — src/writer_scope.rs — is derived from it: the
-# 2026-09-24 cloud row's first assemble failed at the mounts because every
-# joiner carried the manager's cloned `(node_token, mount_slot)`; a clone is
-# regenerated with systemd-machine-id-setup). No SQUEEZEFS_FLEET_SHARE (one
+# 2026-09-24 cloud row's first assemble "failed on the cloned
+# /etc/machine-id (= the node token)" — every joiner carried the manager's
+# `(node_token, mount_slot)`; a clone is regenerated with
+# systemd-machine-id-setup, a regular-file dbus id removed first). No
+# SQUEEZEFS_FLEET_SHARE (one
 # daemon per node owns its machine — the point of the venue). The set is
 # formatted CACHE-LESS (no --disk-cache-paths — tests/mw_fleet.sh's shape
 # for the box and local fleets): every beyond-inline file is a whole
@@ -1245,8 +1247,9 @@ if [ "${MW_SKIP_FORMAT:-0}" != 1 ]; then
   # a RE-assemble meets the previous assemble's superblock — the storage
   # node's `wipefs -a` does not know the METALV01 magic, so `format` refused
   # it without --force (the 2026-09-24 cloud row's assemble attempt 2 met
-  # attempt 1's format). --force keeps the live-client refusal: a
-  # heartbeat-fresh registration still refuses the format loud.
+  # attempt 1's format — derived: the run's re-assemble is in the record,
+  # the refusal is the preflight's law). --force keeps the live-client
+  # refusal: a heartbeat-fresh registration still refuses the format loud.
   read -ra FEXTRA <<<"$(printf '%s' "${FORMAT_EXTRA_STR:-}" | tr ',' ' ')"
   if [ "${FORMAT_CACHE:-1}" = 0 ]; then
     echo "format (CACHE-LESS): $META_URI $DATA_URI --force ${FEXTRA[*]:-}"

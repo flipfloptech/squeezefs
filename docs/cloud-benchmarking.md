@@ -128,12 +128,20 @@ deltas stated where they happen:
 4. **build_commit ritual:** artifact sha256 is verified on every node at
    deploy, and after mount the `.stats` `build_commit` must appear in the
    deployed binary's `--version` — a mismatch fails the assemble.
-5. **Apt hygiene (deploy):** on every node `deploy` stops and disables
-   `apt-daily.timer` + `apt-daily-upgrade.timer` and masks
-   `unattended-upgrades` for the session (waiting out an upgrade already
-   running, never interrupting dpkg) — on a fresh Ubuntu node the
-   2026-09-24 run met an unattended upgrade inside a row: ≈ 3 min of CPU on
-   a writer node and an `sshd` restart that killed the driver's preflight.
+5. **Apt hygiene (deploy):** on every node `deploy` takes Ubuntu's
+   unattended apt off the session — `systemctl stop unattended-upgrades
+   .service` first (its stop handler waits for a running upgrade child: the
+   graceful drain), then the `apt-daily*` timers stopped, disabled and
+   masked and the upgrader masked; a LIVE apt/dpkg transaction is detected
+   by its LOCKS (`fuser` on `/var/lib/dpkg/lock*` + the apt locks) and by
+   the oneshot units' `activating` state — never by `unattended-upgrades
+   .service`'s state, which is `active` on every booted Ubuntu node (the
+   `--wait-for-signal` waiter) — and waited for, bounded (10 min, then the
+   deploy dies loud naming the node); dpkg is never killed. Seconds per
+   quiet node. The 2026-09-24 run met an unattended apt run during the
+   session (the resume note lists the fix; what the run itself did is in no
+   surviving source). The node script and its pin:
+   `tests/cloud_bench_node_scripts.sh`, `tests/cloud_bench_cluster_units.sh`.
 6. **Idempotent re-assemble:** the fabric script's `format` passes
    `--force` — a re-assemble meets the previous assemble's superblock
    (`wipefs -a` on the storage node does not know the METALV01 magic) and
@@ -333,12 +341,19 @@ row** (gate 2's `sym-1` arm: the joined writer's `mkdir` under the root
 answered `EINVAL`) and was torn down at 19:28:44 UTC — **≈ 26.5 min,
 ≈ $5.2, nothing billing (verified ×3)**.
 
+The run's pulled evidence was LOST with the dev machine the same evening;
+every reading below is from the agent's contemporaneous summary (the run
+log's 2026-09-24 15:55 row; the resume note) or derived from the rig's own
+asserts — the record's §3.10 keeps the two apart line by line. Nothing that
+is in neither (the node kernel, the node RTT, the intermediate wall times)
+is stated.
+
 | item | reading |
 |---|---|
 | cluster / shape | `sqzbench-20260924-150215`; 1 mds + 8 oss + 8 client (one symmetric writer per client node + a token reader on `client0`) |
-| venue | AMI `ami-0c40b68421a1fcd8e` (the `squeezefs-bench-base=mw` bake), kernel `7.0.0-1011-aws`, build `aad50a1f` `release` on every node, node RTT 0.168 / 0.179 / 0.190 ms |
-| cost | ≈ 26.5 min × 17 × ~$0.686/hr ≈ **$5.2**; the typed-YES line had read ~$7.55/hr for 11 nodes (fixed: every node is priced) |
-| result | **INCOMPLETE — no per-node number**; three product findings routed to PR 13i (F-C1 cross-host page-cache incoherence on the shared metadata LUN — design-level; F-C2 the joiner discarding the `Joined` reply's grant word; F-C3 the conveyor's fan-out flattening every retryable class to `EINVAL`); the pulled evidence directory was lost with the dev machine the same evening |
+| venue | AMI `ami-0c40b68421a1fcd8e` (the newest `squeezefs-bench-base=mw` bake the rig prefers — recalled as the run's; the bake is named in `.benchmarks/2026-08-20-fabric-confirm-sessions.md`); build `aad50a1f` `release` on every node (the deploy's sha256 + `build_commit` asserts) |
+| cost | ≈ **$5.2** (the contemporaneous summary; 26.5 min × 17 × ~$0.686/hr agrees); the typed-YES line had read ~$7.55/hr for 11 nodes (fixed: every node is priced) |
+| result | **INCOMPLETE — no per-node number**; three product findings routed to PR 13i (F-C1 cross-host page-cache incoherence on the shared metadata LUN — design-level; F-C2 the joiner discarding the `Joined` reply's grant word; F-C3 the conveyor's fan-out flattening every retryable class to `EINVAL`); the evidence directory `.benchmarks/cloud/2026-09-24-152527/` lost |
 
 **Lessons, each landed in the rig:**
 
@@ -351,8 +366,10 @@ answered `EINVAL`) and was torn down at 19:28:44 UTC — **≈ 26.5 min,
   identity. A re-bake should scrub them (`truncate -s0 /etc/machine-id`,
   remove `/etc/nvme/host{nqn,id}`) before `create-image`; the rig's
   assertion is the belt either way.
-- **Unattended apt is off for the session** (`deploy`), and **the
-  re-assemble's `format` passes `--force`** — see "What assemble builds".
+- **Unattended apt is off for the session** (`deploy` — the graceful drain
+  first, a live transaction waited for by its lock and never killed; item 5
+  above), and **the re-assemble's `format` passes `--force`** — see "What
+  assemble builds".
 - **The estimate prices every node** — the max-spend guard is still the
   protection, but the typed-YES line now says what the fleet costs.
 - **Two kernels on one LUN is a different venue.** Every co-located venue

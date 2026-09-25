@@ -11590,6 +11590,35 @@ impl KvMetaBackend {
             }
             entries.sort_by_key(|e| e.slot);
             entries.dedup_by_key(|e| e.slot);
+            // The grant's UNCLAIMED remainder (§5.3.3), read under the
+            // grant guard BEFORE the page lock — the region's lock order
+            // (`AppenderRegion`: `grant` before `page`; the commit path's
+            // `name_remainder_on_page` and the `.stats` reader take them
+            // that way, and the reverse here deadlocked a joined writer's
+            // cadence against its own `.stats` poll — PR 13i fix round 1,
+            // Issue 1). Recovery reads the remainder against tree 0's
+            // record for the claimed set. The page names its largest runs
+            // (`RegionGrant::page_runs`, PR 13g); a remainder in more runs
+            // than the page carries keeps the rest in the RAM pool —
+            // recycled images the next flush pass consumes first — which
+            // a crash-class open recovers as claimed for the orphan census
+            // to return, where PR 3's trim moved them to the returnable
+            // batch on every live cadence (F-R5's churn).
+            let page_grant = (r.id != 0).then(|| {
+                let g = r.grant();
+                let runs = g.unclaimed_runs();
+                if runs.len() > super::appender::GRANT_RUNS_MAX {
+                    log::debug!(
+                        "meta volume {}: appender {}'s unclaimed remainder spans {} runs — the \
+                         page names its largest {}, the rest stay in the RAM pool",
+                        self.path.display(),
+                        r.id,
+                        runs.len(),
+                        super::appender::GRANT_RUNS_MAX
+                    );
+                }
+                super::appender::page_runs_of(&runs)
+            });
             {
                 let mut page = r.page.lock().unwrap_or_else(|e| e.into_inner());
                 page.ledger_tail_seq = tail;
@@ -11609,32 +11638,12 @@ impl KvMetaBackend {
                 // maintained at open and growth, never derived from the
                 // ring's page ranges. Appender 0's is the fixed extent past
                 // its page slots, as format wrote it.
-                if r.id == 0 {
-                    page.segments = vec![super::appender::appender0_ring_extent(&self.sb.journal)];
-                } else {
-                    // The grant's UNCLAIMED remainder (§5.3.3): recovery
-                    // reads it against tree 0's record for the claimed
-                    // set. The page names its largest runs
-                    // (`RegionGrant::page_runs`, PR 13g); a remainder in
-                    // more runs than the page carries keeps the rest in
-                    // the RAM pool — recycled images the next flush pass
-                    // consumes first — which a crash-class open recovers
-                    // as claimed for the orphan census to return, where
-                    // PR 3's trim moved them to the returnable batch on
-                    // every live cadence (F-R5's churn).
-                    let g = r.grant();
-                    let runs = g.unclaimed_runs();
-                    if runs.len() > super::appender::GRANT_RUNS_MAX {
-                        log::debug!(
-                            "meta volume {}: appender {}'s unclaimed remainder spans {} runs — the \
-                             page names its largest {}, the rest stay in the RAM pool",
-                            self.path.display(),
-                            r.id,
-                            runs.len(),
-                            super::appender::GRANT_RUNS_MAX
-                        );
+                match page_grant {
+                    None => {
+                        page.segments =
+                            vec![super::appender::appender0_ring_extent(&self.sb.journal)];
                     }
-                    page.grant = super::appender::page_runs_of(&runs);
+                    Some(runs) => page.grant = runs,
                 }
                 page.slots = entries.clone();
             }

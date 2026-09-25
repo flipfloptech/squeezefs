@@ -262,7 +262,10 @@ then its `grant` while the manager's extent-grant page update took them the
 other way round, so a `.stats` read landing inside a grant's page update
 parked BOTH the stats reader and the checkpoint task for ever (the cadence
 dead, no committer parked to escalate); one lock order now (`grant` before
-`page`), pinned by a stress contract. Two companions
+`page`) at every site — the `.stats` reader, the manager's extent grant, the
+checkpoint task's own page writer (the joined writer's face of the same
+deadlock, its cadence dead behind a stats read) — pinned by two stress
+contracts and a static source rail (`tests/appender_lock_order_tests.rs`).
 on the armed symmetric plane: **F-C2** — a joined writer honours the
 manager's `Joined` reply's grant word instead of rebuilding its grant from
 the page it reads next (under the old buffered posture the stale page —

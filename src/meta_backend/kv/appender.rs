@@ -2521,11 +2521,18 @@ pub fn declared_partition() -> Result<
 /// **Lock order (PR 13i):** a site that holds both takes `grant` BEFORE
 /// `page` — the grant writers name the remainder on the page under the
 /// grant guard (`manager_extent_grant_class`, the joiner's remainder
-/// naming), and the `.stats` reader follows them. The reverse order
-/// deadlocked the operator's stats poll against the manager's checkpoint
-/// task (found by the growth contract under the park-kick cycle; pinned
-/// by `the_stats_reader_never_deadlocks_against_a_grants_page_update`).
-/// Neither guard is ever held across an await.
+/// naming), the checkpoint task's page writer (`write_appender_pages`)
+/// reads the remainder under the grant guard before it locks the page,
+/// and the `.stats` reader follows them. The reverse order deadlocked the
+/// operator's stats poll against the manager's checkpoint task (F-C4,
+/// found by the growth contract under the park-kick cycle; pinned by
+/// `sym_appender_tests::the_stats_reader_never_deadlocks_against_a_grants_page_update`)
+/// and, at the page writer, a joined writer's cadence against its own
+/// stats poll (fix round 1, Issue 1; `sym_n_daemon_tests::a_joiners_stats_
+/// reader_never_deadlocks_against_its_own_checkpoint_page_writer`). The
+/// static rail `tests/appender_lock_order_tests.rs` refuses any `page`
+/// guard whose block acquires `grant`. Neither guard is ever held across
+/// an await.
 pub struct AppenderRegion {
     pub id: u32,
     /// `[A, B, R0, R1]` device offsets.

@@ -1464,6 +1464,95 @@ async fn a_joiner_honours_the_joined_replys_grant_word_not_its_page_read() {
     shutdown(&manager).await;
 }
 
+/// PR 13i fix round 1, Issue 1 (F-C4 at the JOINER): the checkpoint task's
+/// own page writer (`write_appender_pages`) took a region's `page` mutex
+/// and THEN its `grant` for every region but 0 — a joined writer's own
+/// region on EVERY checkpoint cycle — while the commit path's runtime
+/// refill (`wire_extent_refill` → `name_remainder_on_page`, on the
+/// conveyor pass under the mint guard) and the `.stats` reader take
+/// `grant` then `page`: F-C4's deadlock moved from the manager's
+/// `manager_extent_grant_class` to the joiner's page writer, the joiner's
+/// cadence dead behind a `.stats` poll. ONE order — `grant` before
+/// `page` — at every site is the region's lock law; the static rail
+/// `appender_lock_order_tests` keeps a fourth site from rotting it. The
+/// pin runs a joiner's checkpoint cycles and its commit path (creates
+/// that mint off its grant and refill over the wire) against a std thread
+/// polling its `appender_stats` in a tight loop, under the F-C4 pin's
+/// watchdog shape (the verdict on the UNCAPTURED stderr + `exit(101)` —
+/// a worker parked in `Mutex::lock` would hang the runtime's drop).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiners_stats_reader_never_deadlocks_against_its_own_checkpoint_page_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let j1 = join(&uris, &venue, &mvol, 1).await;
+    let jvol = Arc::clone(&j1.volumes[0]);
+    let jdir = j1
+        .create(1, "i1", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("the joiner's directory")
+        .ino;
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let poller = {
+        let v = Arc::clone(&jvol);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut polls = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                let _ = v.appender_stats().expect("a joined appender's set");
+                polls += 1;
+            }
+            polls
+        })
+    };
+    // The joiner's cycles (its page written every cycle) interleaved with
+    // creates (mints off its grant; the runtime refill over the wire when
+    // the pool runs short — the other grant→page site).
+    const ROUNDS: u32 = 200;
+    let driver = {
+        let j = Arc::clone(&j1);
+        let v = Arc::clone(&jvol);
+        tokio::spawn(async move {
+            for i in 0..ROUNDS {
+                j.create(jdir, &format!("f{i}"), libc::S_IFREG | 0o644, 1000, 1000)
+                    .await
+                    .expect("a joiner create");
+                v.checkpoint_now().await.expect("the joiner's cycle");
+            }
+        })
+    };
+    // Bounded by the pin's own work: ROUNDS × one generous cycle (a joiner
+    // cycle on this fixture is ≈ 10–50 ms; a deadlock never finishes).
+    let bound = std::time::Duration::from_millis(500) * ROUNDS;
+    let outcome = tokio::time::timeout(bound, driver).await;
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    if outcome.is_err() {
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(
+            "\nFAILED: a_joiners_stats_reader_never_deadlocks_against_its_own_checkpoint_page_writer \
+             — the joiner's page writer and its stats reader DEADLOCKED (a lock-order inversion \
+             between write_appender_pages and the grant→page sites; one order: grant before \
+             page)\n"
+                .as_bytes(),
+        );
+        std::process::exit(101);
+    }
+    let polls = poller.join().expect("the poller thread");
+    assert!(polls > 0, "the poller ran beside the cycles");
+    shutdown(&j1).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
 /// **A joined holder resolves a LATER joiner's slot to its holder at a
 /// served step** (PR 13 — found by the fleet's first joiner→joiner
 /// cross-owner create: `sym-shared-dir`, m61 creating into m60's

@@ -468,6 +468,54 @@ pub fn host_clock_throttled() -> bool {
     host_clock_cap_ratio().is_some_and(|r| r < HOST_CLOCK_THROTTLED_BELOW)
 }
 
+/// The package temperature the host's CPU sensor reports, in millidegrees
+/// C (hwmon `k10temp` Tctl / `zenpower` / `coretemp`'s first sensor), with
+/// the throttle point hwmon exposes beside it (`temp*_crit`, else
+/// `temp*_max`) — `None` where no such sensor exists (a VM, a container).
+/// The venue word [`host_clock_cap_ratio`] cannot see: a CPU that sheds
+/// clock ITSELF at its thermal limit leaves `scaling_max_freq` at hardware
+/// max (the dev box read 3.9 → 3.0 GHz between Tctl 93 and 100 °C with the
+/// cap untouched), so a rate-shaped contract judged after a compile burst
+/// needs the temperature, not the governor's cap.
+pub fn host_package_temp_millic() -> Option<(i64, Option<i64>)> {
+    let hwmon = std::fs::read_dir("/sys/class/hwmon").ok()?;
+    for entry in hwmon.flatten() {
+        let dir = entry.path();
+        let name = std::fs::read_to_string(dir.join("name")).unwrap_or_default();
+        if !matches!(name.trim(), "k10temp" | "zenpower" | "coretemp") {
+            continue;
+        }
+        let read = |f: &str| -> Option<i64> {
+            std::fs::read_to_string(dir.join(f))
+                .ok()?
+                .trim()
+                .parse::<i64>()
+                .ok()
+        };
+        let Some(input) = read("temp1_input") else {
+            continue;
+        };
+        let limit = read("temp1_crit").or_else(|| read("temp1_max"));
+        return Some((input, limit));
+    }
+    None
+}
+
+/// The throttle point assumed where hwmon exposes none (millidegrees C):
+/// AMD's Tctl is normalized so the package sheds clock approaching 100 °C
+/// — the dev box measured it from ≈ 93 °C — so 95 °C is the word's edge.
+pub const HOST_THERMAL_THROTTLE_MILLIC: i64 = 95_000;
+
+/// `Some(true)` while the host's package temperature stands at or past its
+/// throttle point (the sensor's own, else [`HOST_THERMAL_THROTTLE_MILLIC`])
+/// — a rate-shaped contract takes no verdict on such a host (the owner's
+/// venue ruling: no laptop number holds merit, a throttled row is
+/// venue-attributed); `Some(false)` when cool; `None` with no sensor.
+pub fn host_thermally_throttled() -> Option<bool> {
+    let (input, limit) = host_package_temp_millic()?;
+    Some(input >= limit.unwrap_or(HOST_THERMAL_THROTTLE_MILLIC))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

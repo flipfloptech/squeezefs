@@ -11729,11 +11729,48 @@ async fn floor_ring_storm(
 ///    base's (≈ 195 → ≈ 10 on this fixture — the record's §4.4ao).
 /// Every acked name resolves at every daemon, fsck clean after every
 /// joiner left.
+///
+/// Laws 3's ratio and the verbs-per-storm law are RATE laws on a
+/// venue-shaped storm: the owner's ruling (`51bf21e1`) makes a laptop
+/// reading of such a law venue-attributed, never a verdict, and this box
+/// sheds clock at its thermal limit with the governor's cap untouched
+/// (the matrix's compile burst soaks it to Tctl 100 °C before this suite
+/// runs; the same code read the ratio at 11–12 % of the compactions
+/// there and 3/3 under 10 % cool). The pin waits a bounded while for the
+/// host to cool, samples the thermal word around the storm, and judges
+/// the two rate laws only on a host that was not throttling — a throttled
+/// draw prints the reading as venue-attributed; the structural laws (the
+/// ring's growth, the bounded declines, the cadence, every acked name,
+/// the must-stay-0 gauges, fsck) judge on every host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycles_its_grant() {
     use squeezefs::meta_backend::kv::appender::{GRANT_EXTENTS_FLOOR, SYM_RING_FLOOR_BYTES};
     let _g = SEAM.lock().await;
     reset_process_state();
+    // A bounded cool-down: the box needs tens of seconds to fall from its
+    // limit once idle; a host that stays hot for the bound runs the storm
+    // and takes the venue reading.
+    let cool_wait = std::time::Instant::now();
+    while squeezefs_testkit::host_thermally_throttled() == Some(true)
+        && cool_wait.elapsed() < std::time::Duration::from_secs(60)
+    {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    let thermal = |tag: &str| -> (bool, String) {
+        match squeezefs_testkit::host_package_temp_millic() {
+            Some((t, limit)) => (
+                squeezefs_testkit::host_thermally_throttled() == Some(true),
+                format!(
+                    "{tag} Tctl {:.1} °C (throttle point {:.1} °C)",
+                    t as f64 / 1000.0,
+                    limit.unwrap_or(squeezefs_testkit::HOST_THERMAL_THROTTLE_MILLIC) as f64
+                        / 1000.0
+                ),
+            ),
+            None => (false, format!("{tag} no thermal sensor")),
+        }
+    };
+    let (hot_before, word_before) = thermal("before the storm");
     let storm = std::time::Duration::from_secs(12);
     let (
         dir,
@@ -11745,6 +11782,16 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
         faces,
         (mgr_grants, mgr_returns, mgr_verbs, mgr_short_declines),
     ) = floor_ring_storm(2, 1, storm).await;
+    let (hot_after, word_after) = thermal("after the storm");
+    let venue_hot = hot_before || hot_after;
+    eprintln!(
+        "F-R5 venue: {word_before}; {word_after}{}",
+        if venue_hot {
+            " — THROTTLED: the rate laws below are venue-attributed, not judged"
+        } else {
+            ""
+        }
+    );
     for (i, f) in faces.iter().enumerate() {
         let [a, b, c, d] = f;
         eprintln!("F-R5 joiner {i}: start {a:?}");
@@ -11903,13 +11950,22 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
         // where PR 13g's run had it slack.
         let pool = c.grant_claimed + c.grant_unclaimed;
         let cap_bound = pool + GRANT_EXTENTS_FLOOR >= c.wire_cap;
-        assert!(
-            returned * 10 <= compactions || cap_bound,
-            "joiner {i}: retired images recycle into the joiner's own pool — `extent_grant_\
-             returned` moved +{returned} over {compactions} compactions with the pool at {pool} \
-             under a cap of {} (RED: +≈ compactions, the claim-and-retire churn)",
-            c.wire_cap
-        );
+        if venue_hot {
+            eprintln!(
+                "F-R5 joiner {i}: VENUE-ATTRIBUTED — `extent_grant_returned` +{returned} over \
+                 {compactions} compactions, the pool at {pool} under a cap of {} (the law reads \
+                 returns × 10 ≤ compactions or the cap binding; no verdict on a throttled host)",
+                c.wire_cap
+            );
+        } else {
+            assert!(
+                returned * 10 <= compactions || cap_bound,
+                "joiner {i}: retired images recycle into the joiner's own pool — `extent_grant_\
+                 returned` moved +{returned} over {compactions} compactions with the pool at \
+                 {pool} under a cap of {} (RED: +≈ compactions, the claim-and-retire churn)",
+                c.wire_cap
+            );
+        }
         assert!(
             c.wire_reactive_grants - a.wire_reactive_grants <= 1,
             "joiner {i}: the flush pass asked one SMO's images {} times on a healthy heap — at \
@@ -11924,16 +11980,27 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
         // 54 derived-size grants (every one the floor), 50 returns; scaled
         // to this storm's length, the law is an order of magnitude under it.
         let base_verbs = 197 * storm.as_secs() / 8;
-        assert!(
-            verbs * 10 <= base_verbs,
-            "joiner {i}: its supply cost the manager {verbs} verbs over the storm ({} grants, \
-             {} returns, {} grows; {cycles} cycles, {compactions} compactions) — an order of \
-             magnitude under the base's {base_verbs} per joiner per {} s storm",
-            c.wire_grants - a.wire_grants,
-            c.wire_returns - a.wire_returns,
-            c.wire_ring_grows - a.wire_ring_grows,
-            storm.as_secs()
-        );
+        if venue_hot {
+            eprintln!(
+                "F-R5 joiner {i}: VENUE-ATTRIBUTED — {verbs} manager verbs over the storm ({} \
+                 grants, {} returns, {} grows) against the base's {base_verbs}; no verdict on a \
+                 throttled host",
+                c.wire_grants - a.wire_grants,
+                c.wire_returns - a.wire_returns,
+                c.wire_ring_grows - a.wire_ring_grows
+            );
+        } else {
+            assert!(
+                verbs * 10 <= base_verbs,
+                "joiner {i}: its supply cost the manager {verbs} verbs over the storm ({} grants, \
+                 {} returns, {} grows; {cycles} cycles, {compactions} compactions) — an order of \
+                 magnitude under the base's {base_verbs} per joiner per {} s storm",
+                c.wire_grants - a.wire_grants,
+                c.wire_returns - a.wire_returns,
+                c.wire_ring_grows - a.wire_ring_grows,
+                storm.as_secs()
+            );
+        }
     }
     // Every acked name resolves at its creator, the manager reads them
     // too after the leaves, nothing lost.

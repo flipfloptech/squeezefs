@@ -90,9 +90,11 @@ No other instant survives; ≈ 26.5 min is the two sourced instants' difference.
 
 - **F-C1 — DESIGN-LEVEL, a flip blocker: cross-host page-cache incoherence
   on the shared metadata LUN.** Every metadata read/write is `uring_fs`
-  BUFFERED (`O_CLOEXEC` only — `src/uring_fs.rs:1368/1586/1609`; the data
-  path alone `O_DIRECT`, `src/nvme_dev.rs:744`) = each host's block-device
-  page cache. Two hosts over nvme-tcp ⇒ a joiner reads ITS kernel's stale
+  BUFFERED (`O_CLOEXEC` only at the uring-path opens
+  `src/uring_fs.rs:1368/1586/1609`, no custom flags at the
+  `blocking_fallback_loop`'s `:2222/2247/2258/2274`; the DATA path opens
+  `O_DIRECT` at its four sites, `src/nvme_dev.rs:744` / 1576 / 1686 / 1717)
+  = each host's block-device page cache on both arms. Two hosts over nvme-tcp ⇒ a joiner reads ITS kernel's stale
   cache of a block the manager wrote (the appender page's two images:
   `Live` with the grant cleared at `backend.rs:10510–10514`, then the grant
   word via `write_wire_joiner_page_grant` ≈ `backend.rs:11096`, durable at

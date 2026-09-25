@@ -238,10 +238,17 @@ device's `logical_block_size` → 4096) and an aligned form for every
 on-disk shape — every unit but one was already 4 KiB-granular; the journal
 ring pads each commit window's end to the next sector boundary with a
 checksummed PAD entry replay walks as a chain link. **What changes for an
-operator:** nothing on disk (a ring written by an older binary replays
-verbatim; the writer aligns its head with one recovery pad — deferred to the
-pre-claim's guarded checkpoint cycles when the recovered ring is too full to
-admit it, so no ring state refuses the open for ever); `.stats` gains
+operator:** nothing in the FORMAT (no incompat bit; a ring written by an
+older binary replays verbatim; the writer aligns its head with one recovery
+pad — deferred to the pre-claim's guarded checkpoint cycles when the
+recovered ring is too full to admit it, so no ring state refuses the open for
+ever) — but the ring's BYTES change, and the reverse direction is bounded:
+a padded ring read by a pre-13i binary drops each pad as a torn entry and
+resyncs at the next page header, which is lossless on a 4 KiB-grain device
+(every window ends at a page end) and LOSSY on a 512 B-grain device (the
+pad's same-page successors are skipped). A cleanly unmounted volume carries
+an empty window either way; **never re-mount a CRASHED volume with a
+pre-13i binary — recover it with this one first.** `.stats` gains
 the `meta_io` object (`meta_io_direct_paths`, `meta_io_buffered_fallback`
 — must stay 0 on any block device, `meta_io_unaligned_refusals` — must stay
 0, `meta_io_bounce_bytes`, `meta_io_read_widened`) and

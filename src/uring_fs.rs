@@ -875,10 +875,19 @@ pub fn register_meta_device(path: &Path) -> Result<MetaIoMode> {
     // Both spellings, POSITIVE — overwriting a negative entry a read
     // before the registration left (`classify_volume_slot` registers at
     // the door's first read; the worker's fd cache re-opens the path in
-    // the new posture at its next use).
+    // the new posture at its next use) — and EVERY remembered negative
+    // dropped (review round 2, Issue 12): a negative remembered under an
+    // ALIAS spelling of this device (`/dev/disk/by-id/…` seen before the
+    // door registered `/dev/nvmeXnY`) would otherwise read BUFFERED for
+    // the process's life; registrations are rare, so a negative's next
+    // lookup re-resolving once is the cheap, complete form.
     let canonical = std::fs::canonicalize(path).ok();
     META_IO_MODES.rcu(|cur| {
-        let mut next: HashMap<PathBuf, Option<MetaIoMode>> = (**cur).clone();
+        let mut next: HashMap<PathBuf, Option<MetaIoMode>> = cur
+            .iter()
+            .filter(|(_, m)| m.is_some())
+            .map(|(p, m)| (p.clone(), *m))
+            .collect();
         next.insert(path.to_path_buf(), Some(mode));
         if let Some(c) = &canonical {
             next.insert(c.clone(), Some(mode));

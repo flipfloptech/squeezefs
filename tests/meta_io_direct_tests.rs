@@ -648,6 +648,47 @@ fn the_posture_lookup_resolves_a_path_once_and_never_on_a_hit() {
     }
     assert_eq!(META_IO_MODE_RESOLVES.load(Ordering::Relaxed), r2);
 
+    // An ALIAS seen BEFORE its device's registration (review round 2,
+    // Issue 12): the alias's remembered negative must not outlive the
+    // registration under the canonical path — the registration drops every
+    // remembered negative, so the alias re-resolves once and answers the
+    // device's posture.
+    let meta2 = dir.path().join("meta2");
+    std::fs::File::create(&meta2)
+        .and_then(|f| f.set_len(PAGES * JOURNAL_PAGE_LEN))
+        .unwrap();
+    let alias2 = dir.path().join("alias-to-meta2");
+    std::os::unix::fs::symlink(&meta2, &alias2).unwrap();
+    assert_eq!(
+        meta_io_mode(&alias2),
+        None,
+        "unregistered: a remembered negative"
+    );
+    let r3 = META_IO_MODE_RESOLVES.load(Ordering::Relaxed);
+    assert_eq!(meta_io_mode(&alias2), None);
+    assert_eq!(
+        META_IO_MODE_RESOLVES.load(Ordering::Relaxed),
+        r3,
+        "remembered"
+    );
+    let m3 = register_meta_device(&meta2).expect("register the canonical spelling");
+    // (The registration's own idempotency probe of the unseen canonical
+    // spelling is one resolve of its own; the alias's are counted from
+    // here.)
+    let r4 = META_IO_MODE_RESOLVES.load(Ordering::Relaxed);
+    assert_eq!(
+        meta_io_mode(&alias2),
+        Some(m3),
+        "the alias's negative did not survive the device's registration"
+    );
+    assert_eq!(
+        META_IO_MODE_RESOLVES.load(Ordering::Relaxed),
+        r4 + 1,
+        "the alias re-resolved exactly once"
+    );
+    assert_eq!(meta_io_mode(&alias2), Some(m3));
+    assert_eq!(META_IO_MODE_RESOLVES.load(Ordering::Relaxed), r4 + 1);
+
     // The reset forgets positives and negatives alike.
     clear_meta_devices();
     assert_eq!(meta_io_mode(&meta), None);

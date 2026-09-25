@@ -162,6 +162,17 @@ pub const ENTRY_HDR_LEN: u64 = 20;
 /// dereferencing it).
 pub const MAX_ENTRY_LEN: u64 = 128 * 1024;
 
+// The pad law's two constants live in `journal_core.rs` (which is
+// `#[path]`-shared into the loom models and cannot name this module);
+// they duplicate the I/O layer's framing and drift is refused here at
+// compile time: a logical page start maps to the byte AFTER the page
+// header, and the smallest PAD entry is an entry header plus its one
+// marker byte.
+const _: () = assert!(
+    super::journal_core::PAGE_HDR_LEN == JOURNAL_PAGE_HDR_LEN
+        && super::journal_core::PAD_MIN == ENTRY_HDR_LEN + 1
+);
+
 /// The PAD entry's payload marker (PR 13i F-C1, design-symmetric-metadata
 /// §5.12): a tag byte no record ever carries (`untag` → tree 15, level 15
 /// — outside the §4.2 table at every level), followed by zeros to the pad's

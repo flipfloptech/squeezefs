@@ -401,6 +401,49 @@ async fn a_ring_written_unpadded_replays_direct_and_the_writer_aligns_its_head()
     assert_eq!(rec2.head_pos, res.padded_end());
 }
 
+/// **A reported grain the ring's page arithmetic cannot honour REFUSES the
+/// registration — never a clamp under the device's grain** (PR 13i review
+/// round 1, Issue 5b). The first build clamped a grain > 4096 (or an odd
+/// one) to the 4096 default: an UNDER-aligned posture on such a device,
+/// every later write `EINVAL` with a misattributed message. The law is one
+/// pure function every source (statx, sysfs, the default) passes through:
+/// the two field grains and every power of two up to the page admit
+/// verbatim; a wider grain, a non-power-of-two and zero refuse naming the
+/// device, the source and the grain.
+#[test]
+fn a_grain_the_page_arithmetic_cannot_honour_refuses_the_registration() {
+    let path = std::path::Path::new("/dev/example-lun");
+    for g in [512u64, 1024, 2048, 4096, 1, 2, 4] {
+        assert_eq!(
+            uring_fs::admit_meta_io_grain(path, "statx(STATX_DIOALIGN)", g).expect("admitted"),
+            g,
+            "grain {g} admits verbatim"
+        );
+    }
+    for (g, source) in [
+        (8192u64, "statx(STATX_DIOALIGN)"),
+        (16384, "sysfs logical_block_size"),
+        (65536, "sysfs logical_block_size"),
+        (3072, "statx(STATX_DIOALIGN)"),
+        (520, "sysfs logical_block_size"),
+        (0, "statx(STATX_DIOALIGN)"),
+    ] {
+        let err = uring_fs::admit_meta_io_grain(path, source, g)
+            .expect_err("a grain the page arithmetic cannot honour is refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("example-lun")
+                && text.contains(source)
+                && text.contains(&format!("{g} B")),
+            "the refusal names the device, the source and the grain: {text}"
+        );
+        assert!(
+            text.contains("REFUSING") && !text.contains("clamp"),
+            "a refusal, never a clamp: {text}"
+        );
+    }
+}
+
 /// The harness seam keeps a registered path BUFFERED (the two-host pin's
 /// control arm): grain 1, nothing padded, the fallback gauge counts it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

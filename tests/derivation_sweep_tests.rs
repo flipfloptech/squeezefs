@@ -4207,3 +4207,46 @@ fn an_outlier_flush_unit_saturates_the_trigger_for_at_most_the_horizon() {
         "the bound stated in the code: 64 pushes"
     );
 }
+
+/// **The pad law's constants are ties, not free numbers** (PR 13i review
+/// round 1, Issue 5a). `journal_core::PAGE_HDR_LEN` and `PAD_MIN` duplicate
+/// the I/O layer's framing because `journal_core.rs` is `#[path]`-shared
+/// into the loom models and cannot name `journal.rs`: a logical page start
+/// maps to the byte AFTER the 24 B page header, and the smallest PAD entry
+/// is one entry header plus its one marker byte. `journal.rs` refuses
+/// drift at compile time; this is the sweep's drift-is-red face, and it
+/// pins the derived bound every admission claims beside its entry
+/// (`max_pad = PAD_MIN + grain`) for the two field grains.
+#[test]
+fn journal_pad_constants_tie_to_the_io_layers_framing() {
+    use squeezefs::meta_backend::kv::journal::{
+        ENTRY_HDR_LEN, JOURNAL_PAGE_DATA_LEN, JOURNAL_PAGE_HDR_LEN,
+    };
+    use squeezefs::meta_backend::kv::journal_core::{CoreGeometry, PAD_MIN, PAGE_HDR_LEN};
+    assert_eq!(
+        PAGE_HDR_LEN, JOURNAL_PAGE_HDR_LEN,
+        "the page header the pad law skips"
+    );
+    assert_eq!(
+        PAD_MIN,
+        ENTRY_HDR_LEN + 1,
+        "an entry header + one marker byte"
+    );
+    for (grain, max_pad) in [(512u64, 533u64), (4096, 4117)] {
+        let geo = CoreGeometry {
+            page_data_len: JOURNAL_PAGE_DATA_LEN,
+            pages: 8,
+            reserve_bytes: 0,
+            grain,
+        };
+        assert_eq!(geo.max_pad(), max_pad, "grain {grain}: PAD_MIN + grain");
+        assert_eq!(geo.max_pad(), PAD_MIN + grain);
+    }
+    let unpadded = CoreGeometry {
+        page_data_len: JOURNAL_PAGE_DATA_LEN,
+        pages: 8,
+        reserve_bytes: 0,
+        grain: 1,
+    };
+    assert_eq!(unpadded.max_pad(), 0, "an unpadded ring claims no slack");
+}

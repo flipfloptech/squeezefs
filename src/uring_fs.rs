@@ -707,13 +707,35 @@ fn sysfs_logical_block_size(path: &Path) -> Option<u64> {
     ] {
         if let Ok(s) = std::fs::read_to_string(&candidate) {
             if let Ok(v) = s.trim().parse::<u64>() {
-                if v.is_power_of_two() && v <= META_IO_DEFAULT_GRAIN {
-                    return Some(v);
-                }
+                // Reported VERBATIM: whether the ring's page arithmetic can
+                // honour it is `admit_meta_io_grain`'s verdict, a refusal —
+                // never a silent fall-through to the default, which would
+                // under-align every write on such a device.
+                return Some(v);
             }
         }
     }
     None
+}
+
+/// The one law over a device's reported I/O grain (PR 13i review round 1,
+/// Issue 5b): a power of two no wider than the 4 KiB ring page — page
+/// boundaries are then always aligned. Anything else is REFUSED naming the
+/// device and the grain: a wider or odd grain clamped to the default would
+/// leave every write under-aligned, each then `EINVAL` with a misattributed
+/// message. `source` names where the grain was read (the refusal's text).
+pub fn admit_meta_io_grain(path: &Path, source: &str, grain: u64) -> Result<u64> {
+    if grain.is_power_of_two() && grain <= META_IO_DEFAULT_GRAIN {
+        Ok(grain)
+    } else {
+        Err(SqueezefsError::InvalidOperation(format!(
+            "metadata device {}: {source} reports an I/O grain of {grain} B, which the journal \
+             ring's {META_IO_DEFAULT_GRAIN} B page arithmetic cannot honour (a power of two ≤ \
+             {META_IO_DEFAULT_GRAIN} is required) — REFUSING rather than under-aligning every \
+             write on this device (design-symmetric-metadata §5.12)",
+            path.display()
+        )))
+    }
 }
 
 /// Register `path` as a shared-LUN metadata device: probe its direct-I/O
@@ -740,16 +762,20 @@ pub fn register_meta_device(path: &Path) -> Result<MetaIoMode> {
             path.display()
         )));
     }
-    let (grain, mem_align) = statx_dio_align(path)
-        .or_else(|| sysfs_logical_block_size(path).map(|g| (g, g as usize)))
-        .unwrap_or((META_IO_DEFAULT_GRAIN, META_IO_DEFAULT_GRAIN as usize));
-    // A grain the ring's page arithmetic can honour: a power of two no
-    // wider than the 4 KiB page (page boundaries are then always aligned).
-    let grain = if grain.is_power_of_two() && grain <= META_IO_DEFAULT_GRAIN {
-        grain
-    } else {
-        META_IO_DEFAULT_GRAIN
+    let (source, grain, mem_align) = match statx_dio_align(path) {
+        Some((g, m)) => ("statx(STATX_DIOALIGN)", g, m),
+        None => match sysfs_logical_block_size(path) {
+            Some(g) => ("sysfs logical_block_size", g, g as usize),
+            None => (
+                "the default",
+                META_IO_DEFAULT_GRAIN,
+                META_IO_DEFAULT_GRAIN as usize,
+            ),
+        },
     };
+    // A grain the ring's page arithmetic can honour, or a refusal — never a
+    // clamp under the device's grain.
+    let grain = admit_meta_io_grain(path, source, grain)?;
     let mem_align = mem_align.max(grain as usize).next_power_of_two();
     let mode = if test_meta_buffered() {
         log::warn!(

@@ -38,6 +38,28 @@ use tempfile::NamedTempFile;
 const PAGES: u64 = 64;
 const BASE: u64 = 0;
 
+/// The direct posture's contracts DECLINE where the scratch filesystem
+/// refuses `O_DIRECT` (the registration took its loud buffered fallback)
+/// — through the testkit's ledger (TEST-2; review round 1, Issue 7a), so
+/// `SQUEEZEFS_TEST_REQUIRE_CAPABILITY=1` (the zc-capability gate, root on
+/// the sqz box) turns the decline into a FAILURE and a green run on a
+/// venue that never exercised the direct path is impossible. Expands at
+/// the gate call so the ledger names the test.
+macro_rules! require_direct {
+    ($mode:expr) => {
+        if !$mode.direct {
+            let _ = squeezefs_testkit::declare(
+                squeezefs_testkit::site!(),
+                squeezefs_testkit::SkipClass::Capability,
+                "the scratch filesystem refuses O_DIRECT (the registration took the loud \
+                 buffered fallback) — the direct posture's contract cannot run here; point \
+                 TMPDIR at a filesystem that serves it",
+            );
+            return;
+        }
+    };
+}
+
 /// A zero-filled volume file under `TMPDIR` (the matrix points it at a
 /// real filesystem; `/tmp`'s tmpfs accepts `O_DIRECT` on this kernel too).
 fn volume_file(len: u64) -> NamedTempFile {
@@ -121,8 +143,8 @@ async fn a_registered_metadata_file_opens_o_direct_with_a_derived_grain() {
         // refused O_DIRECT — loud and counted; never on a block device.
         assert_eq!(mode.grain, 1);
         assert!(META_IO_BUFFERED_FALLBACK.load(Ordering::Relaxed) >= 1);
-        return;
     }
+    require_direct!(mode);
     assert!(
         mode.grain.is_power_of_two() && mode.grain <= JOURNAL_PAGE_LEN,
         "{mode:?}"
@@ -151,9 +173,7 @@ async fn misaligned_direct_writes_refuse_and_misaligned_buffers_bounce_and_narro
     clear_meta_devices();
     let f = volume_file(PAGES * JOURNAL_PAGE_LEN);
     let mode = register_meta_device(f.path()).expect("register");
-    if !mode.direct {
-        return;
-    }
+    require_direct!(mode);
     let g = mode.grain as usize;
     let refusals0 = META_IO_UNALIGNED_REFUSALS.load(Ordering::Relaxed);
     let bounces0 = META_IO_BOUNCE_BYTES.load(Ordering::Relaxed);
@@ -256,9 +276,7 @@ async fn a_padded_ring_writes_aligned_runs_and_replay_walks_the_pads() {
     clear_meta_devices();
     let f = volume_file(PAGES * JOURNAL_PAGE_LEN);
     let mode = register_meta_device(f.path()).expect("register");
-    if !mode.direct {
-        return;
-    }
+    require_direct!(mode);
     let reserve = checkpoint_reserve_bytes(PAGES * JOURNAL_PAGE_LEN).min(64 * 1024);
     let ring = JournalRing::new(f.path(), BASE, PAGES, reserve);
     assert_eq!(
@@ -331,6 +349,126 @@ async fn a_padded_ring_writes_aligned_runs_and_replay_walks_the_pads() {
     );
 }
 
+/// **A PAD whose checksum fails is a TORN ENTRY** (review round 1, Issue
+/// 7b — the pad's own parse arm, pinned): the chain-primary walk stops at
+/// it, counts it as a pending drop and RESYNCS at the next page header
+/// (§4.1) — never a chain link, never a hole silently stepped over. Two
+/// shapes: (i) a torn pad with a LATER window behind it — the later entry
+/// is found by the resync (on a 4 KiB-grain ring every window ends at a
+/// page end, so nothing stands between the torn pad and the next header
+/// to be lost) and CONFIRMS the drop (`dropped_torn` = 1); (ii) the LAST
+/// window's pad torn — an unconfirmed trailing failure (`dropped_torn`
+/// = 0), the head resumes at the entry's UNPADDED end, mid-sector, and the
+/// writer's head alignment writes a fresh recovery pad there — the F-C1
+/// "torn window" shape, closed by the law that pads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pad_whose_checksum_fails_is_a_torn_entry_the_scan_resyncs_past() {
+    clear_meta_devices();
+    let f = volume_file(PAGES * JOURNAL_PAGE_LEN);
+    let mode = register_meta_device(f.path()).expect("register");
+    require_direct!(mode);
+    let reserve = checkpoint_reserve_bytes(PAGES * JOURNAL_PAGE_LEN).min(64 * 1024);
+    let ring = JournalRing::new(f.path(), BASE, PAGES, reserve);
+    let geo = *ring.core().geometry();
+    // Three windows, each an odd-sized entry plus its pad.
+    let sizes = [100usize, 700, 300];
+    let mut reservations = Vec::new();
+    for (i, v) in sizes.iter().enumerate() {
+        let probe = records(i as u64 + 1, *v, 0);
+        let need = entry_len_for(&probe).unwrap();
+        let adm = ring.try_admit(need, AdmissionClass::User).expect("room");
+        let (res, seq_base) = ring.reserve_registered(adm);
+        assert!(res.pad >= PAD_MIN, "every odd window pads: {res:?}");
+        ring.commit_entry(&res, &records(i as u64 + 1, *v, seq_base))
+            .await
+            .unwrap();
+        reservations.push(res);
+    }
+    uring_fs::fdatasync(f.path()).await.unwrap();
+    drop(ring);
+    // A pad entry's header is `seq | len | xxh3`; flipping a checksum byte
+    // leaves seq == position (the chain reaches it) and fails the verify.
+    let tear_pad_checksum = |res: &squeezefs::meta_backend::kv::journal_core::Reservation| {
+        let pad_pos = res.start + res.len;
+        let probe = JournalRing::new(f.path(), BASE, PAGES, reserve);
+        probe.physical_offset_of(pad_pos) + 12
+    };
+
+    // (i) The FIRST window's pad torn: the scan fails at it, resyncs at
+    // page 1's header (window 2 starts there), recovers windows 2 and 3
+    // and confirms the drop.
+    let off = tear_pad_checksum(&reservations[0]);
+    let orig = uring_fs::read_at(f.path(), off, 1).await.unwrap()[0];
+    uring_fs::patch_at(f.path(), off, vec![orig ^ 0xFF])
+        .await
+        .expect("plant");
+    let (rec_ring, rec) = JournalRing::recover(f.path(), BASE, PAGES, reserve, 0)
+        .await
+        .expect("recover");
+    assert_eq!(
+        rec.entries.len(),
+        3,
+        "the entry before the torn pad and both later windows recover"
+    );
+    assert_eq!(
+        rec.dropped_torn, 1,
+        "the torn pad is a confirmed drop, never a chain link"
+    );
+    assert_eq!(
+        rec.head_pos,
+        reservations[2].padded_end(),
+        "the head resumes at the last intact window's padded end"
+    );
+    assert!(geo.sector_aligned(rec_ring.core().head()));
+    assert_eq!(
+        rec_ring.align_head_for_writing().await.unwrap(),
+        0,
+        "an aligned head needs no recovery pad"
+    );
+    drop(rec_ring);
+    // Restore window 1's pad for shape (ii).
+    uring_fs::patch_at(f.path(), off, vec![orig]).await.unwrap();
+
+    // (ii) The LAST window's pad torn: an unconfirmed trailing failure —
+    // every entry recovers, nothing is counted dropped, the head stands at
+    // the last entry's UNPADDED end (mid-sector), and the writer pads it.
+    let off = tear_pad_checksum(&reservations[2]);
+    let orig = uring_fs::read_at(f.path(), off, 1).await.unwrap()[0];
+    uring_fs::patch_at(f.path(), off, vec![orig ^ 0xFF])
+        .await
+        .expect("plant");
+    let (rec_ring, rec) = JournalRing::recover(f.path(), BASE, PAGES, reserve, 0)
+        .await
+        .expect("recover");
+    assert_eq!(rec.entries.len(), 3);
+    assert_eq!(
+        rec.dropped_torn, 0,
+        "a trailing torn pad is unconfirmed (nothing behind it)"
+    );
+    let unpadded_end = reservations[2].start + reservations[2].len;
+    assert_eq!(rec.head_pos, unpadded_end, "the head is the entry's end");
+    assert!(
+        !geo.sector_aligned(unpadded_end),
+        "the torn window leaves the head mid-sector"
+    );
+    let pad = rec_ring
+        .align_head_for_writing()
+        .await
+        .expect("recovery pad");
+    assert_eq!(
+        pad, reservations[2].pad,
+        "the recovery pad is exactly the torn pad's length"
+    );
+    assert_eq!(rec_ring.core().head(), reservations[2].padded_end());
+    // The re-padded ring replays whole, nothing torn.
+    uring_fs::fdatasync(f.path()).await.unwrap();
+    let (_, rec2) = JournalRing::recover(f.path(), BASE, PAGES, reserve, 0)
+        .await
+        .unwrap();
+    assert_eq!((rec2.entries.len(), rec2.dropped_torn), (3, 0));
+    assert_eq!(rec2.head_pos, reservations[2].padded_end());
+}
+
 /// A ring written UNPADDED (a buffered binary before PR 13i — or an
 /// unregistered path, the same bytes) replays under the direct posture,
 /// and the WRITER's head alignment writes one recovery pad so its first
@@ -361,9 +499,7 @@ async fn a_ring_written_unpadded_replays_direct_and_the_writer_aligns_its_head()
 
     // The next binary registers the path (every open does) and recovers.
     let mode = register_meta_device(f.path()).expect("register");
-    if !mode.direct {
-        return;
-    }
+    require_direct!(mode);
     let (ring, rec) = JournalRing::recover(f.path(), BASE, PAGES, reserve, 0)
         .await
         .unwrap();
@@ -524,9 +660,7 @@ async fn a_ring_recovered_within_max_pad_of_full_opens_through_the_guarded_cycle
             meta_io_mode(f.path()).expect("the probe registered the path"),
         )
     };
-    if !mode.direct {
-        return;
-    }
+    require_direct!(mode);
     let grain = mode.grain;
     let max_pad = PAD_MIN + grain;
 

@@ -46,6 +46,11 @@ SUITES=(
   # nvme-cli — the sqz box has all three, so REQUIRE_CAPABILITY turns
   # its decline into a failure here.
   wero_rtype_tests
+  # PR 13i's direct-posture contracts (the O_DIRECT metadata path, the
+  # ring's sector-pad law): they decline where the scratch filesystem
+  # refuses O_DIRECT — this kernel's tmpfs serves it, so the decline is a
+  # failure here (review round 1, Issue 7a).
+  meta_io_direct_tests
 )
 
 LEDGER="${SQUEEZEFS_TEST_SKIP_LEDGER:-$PWD/target/skip-ledger-capability.jsonl}"

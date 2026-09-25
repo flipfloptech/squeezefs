@@ -545,12 +545,24 @@ impl JournalCore {
         }
         let mut start = self.head.load(Ordering::Acquire);
         let pad = loop {
-            // A pad past the slack cannot claim budget the ring never
-            // admitted: it is clamped (the next window's write then
-            // refuses misaligned — loud, never an overwrite). Unreachable
-            // by construction: only a split REMAINDER carries no slack,
-            // and no caller reserves one.
-            let pad = self.geo.pad_of(start + adm.len).min(adm.slack);
+            // A pad past the slack would claim budget the ring never
+            // admitted. Only a split REMAINDER carries no slack, and no
+            // caller reserves one: a debug build fails HERE (the caller's
+            // bug, at its reserve — review round 1, Issue 7c), a release
+            // build clamps (never an over-commit; the next window's write
+            // then refuses misaligned — loud, never an overwrite).
+            let need = self.geo.pad_of(start + adm.len);
+            debug_assert!(
+                adm.slack > 0 || need == 0,
+                "a reservation with no pad slack needs a {need} B pad: a split remainder \
+                 was reserved (only the first piece carries the slack)"
+            );
+            debug_assert!(
+                need <= adm.slack,
+                "pad {need} exceeds the admission's slack {}",
+                adm.slack
+            );
+            let pad = need.min(adm.slack);
             match self.head.compare_exchange(
                 start,
                 start + adm.len + pad,

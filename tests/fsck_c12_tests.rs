@@ -1073,14 +1073,39 @@ async fn a_healthy_packed_population_runs_c12_empty_ten_times_under_live_promoti
 
     // The storm: create + write + fsync — every fsync promotes into the
     // open pack (mid-flight tenants ride the in-flight registry, the pin
-    // rides the ledger) — while ten online passes run against it.
+    // rides the ledger) — while ten online passes run against it. The
+    // storm's LEAD over the census is bounded (`STORM_LEAD` files per fsck
+    // run — it yields until the next run completes): the online census
+    // pages the inode tree at 512 records a fetch with a `layout` read per
+    // ino, and a creator that outpaces that walk (≈ 760 files/s × 5
+    // forest records in the dev profile on a 32-core box) keeps every
+    // page's tail ahead of the cursor — the walk chases it for the
+    // storm's whole life (the stamped leg read 281 s for ONE run, the 4 GiB
+    // data volume filled, `ENOSPC`). The contract's law is C12 under LIVE
+    // promotion, which the lead keeps; the census's liveness under an
+    // unbounded creator is a product item of its own (PR 13i's record
+    // §4.4aw — bound the walk at its start watermark), not this pin's.
+    const STORM_LEAD: usize = 400;
     let stop = Arc::new(AtomicBool::new(false));
+    let runs_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let storm = {
         let fs = fx.fs.clone();
         let stop = stop.clone();
+        let runs_done = runs_done.clone();
         tokio::spawn(async move {
             let mut n = 0usize;
+            let mut run_seen = 0usize;
+            let mut n_at_run = 0usize;
             while !stop.load(Ordering::Relaxed) {
+                let run = runs_done.load(Ordering::Acquire);
+                if run != run_seen {
+                    run_seen = run;
+                    n_at_run = n;
+                }
+                if n - n_at_run >= STORM_LEAD {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    continue;
+                }
                 let name = format!("storm_{n:05}.bin");
                 let ino = fs
                     .create(req(), 1, OsStr::new(&name), libc::S_IFREG | 0o644, 0)
@@ -1109,6 +1134,7 @@ async fn a_healthy_packed_population_runs_c12_empty_ten_times_under_live_promoti
     let packed0 = metric(&METRICS.layout_promoted_packed);
     for run in 0..10 {
         let report = run_fsck(&fx.ctx(), &online_opts()).await.expect("fsck");
+        runs_done.fetch_add(1, Ordering::AcqRel);
         assert!(
             report.findings.is_empty(),
             "run {run}: an online fsck under live packing found something: {:?}",

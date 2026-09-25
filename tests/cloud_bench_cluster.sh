@@ -106,6 +106,12 @@
 #
 set -euo pipefail
 
+# The node-side scripts whose logic a --dry-run cannot exercise live in one
+# sourced lib the unit file tests/cloud_bench_cluster_units.sh runs against
+# fake system tools (the apt hygiene, the machine-id assertion).
+# shellcheck source=tests/cloud_bench_node_scripts.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cloud_bench_node_scripts.sh"
+
 # ============================ CONFIG ========================================
 # --- AWS placement --------------------------------------------------------
 AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -1016,6 +1022,13 @@ cmd_deploy() {
   for idx in "${!NODE_NAMES[@]}"; do
     name="${NODE_NAMES[$idx]}"; ip="${NODE_PUB[$idx]}"
     log "deploy: $name ($ip)"
+    # Ubuntu's unattended apt is OFF for the session's life (the run-1
+    # rig fix; the node script + its bounds are tests/cloud_bench_node_
+    # scripts.sh's, pinned by tests/cloud_bench_cluster_units.sh): first,
+    # so the package verify below never queues behind a background
+    # upgrade for the apt lock.
+    remote "$ip" NODE="$name" APT_UPGRADE_WAIT_MAX_S="$APT_UPGRADE_WAIT_MAX_S" APT_UPGRADE_POLL_S="$APT_UPGRADE_POLL_S" \
+      <<<"$NODE_APT_HYGIENE_SCRIPT"
     # Packages were installed by cloud-init user-data during boot (in
     # parallel, overlapped with launch waits) — deploy WAITS on cloud-init
     # (bounded) and verifies, falling back to a direct apt only if
@@ -1024,24 +1037,6 @@ cmd_deploy() {
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 cloud-init status --wait --long >/dev/null 2>&1 || true
-# Ubuntu's unattended apt is OFF for the session's life: on a fresh node
-# apt-daily-upgrade fired inside a row (3 min of CPU on a WRITER node) and
-# its unattended-upgrades restarted sshd, killing the driver's preflight
-# (the 2026-09-24 cloud row). The timers are stopped and disabled, the
-# upgrader masked; an upgrade already running is waited out (a masked
-# service is not interrupted mid-dpkg).
-systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
-systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
-systemctl mask unattended-upgrades.service 2>/dev/null || true
-if systemctl is-active --quiet apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null; then
-  echo "an unattended apt run is in progress — waiting for it before the deploy continues"
-  for _ in $(seq 1 60); do
-    systemctl is-active --quiet apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || break
-    sleep 5
-  done
-fi
-systemctl stop apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
-echo "apt hygiene: apt-daily*.timer stopped+disabled, unattended-upgrades masked"
 need="fuse3 nvme-cli"
 [ "$NEED_MW" = "1" ] && need="$need openmpi-bin libopenmpi-dev python3 curl gcc make attr"
 missing=""
@@ -2012,63 +2007,15 @@ EOS
   # The daemon's node token — half of the KD-MW-2 `(node_token, mount_slot)`
   # identity every appender page, claim-set entry and membership record
   # carries — is derived from /etc/machine-id (src/writer_scope.rs). A
-  # baked AMI clones the file onto every node, so every joiner presented
-  # the MANAGER's `(node_token, mount_slot)` and the join ladder read its
-  # own Live page as a dead predecessor's (the 2026-09-24 cloud row's
-  # assemble attempt 1, failed at the mounts). The clone is regenerated
-  # here — the file truncated, `systemd-machine-id-setup` minting a fresh
-  # id — then re-read and re-asserted; a duplicate STILL standing after
-  # regeneration dies. Runs after the prologue (no daemon is up) and
-  # before any identity-bearing step. A dbus copy that is a regular file
-  # (not the usual symlink) is refreshed with it so the two never diverge.
-  local -A seen_mid=()
-  local mid
-  for c in "${clients[@]}"; do
-    ip="$(node_pub "$c")"
-    mid=""
-    if $DRY_RUN; then
-      remote "$ip" NODE="$c" REGEN=0 <<'EOS'
-set -euo pipefail
-if [ "$REGEN" = 1 ]; then
-  : >/etc/machine-id
-  systemd-machine-id-setup
-  if [ -f /var/lib/dbus/machine-id ] && [ ! -L /var/lib/dbus/machine-id ]; then
-    cp /etc/machine-id /var/lib/dbus/machine-id
-  fi
-fi
-[ -s /etc/machine-id ] || { echo "FATAL[$NODE]: /etc/machine-id is missing or empty" >&2; exit 1; }
-echo "MACHINE_ID $(tr -d '[:space:]' </etc/machine-id)"
-EOS
-      mid="dryrun-machine-id-$c"
-    else
-      local out try
-      for try in 1 2; do
-        out="$(remote "$ip" NODE="$c" REGEN="$([ "$try" = 2 ] && echo 1 || echo 0)" <<'EOS'
-set -euo pipefail
-if [ "$REGEN" = 1 ]; then
-  : >/etc/machine-id
-  systemd-machine-id-setup
-  if [ -f /var/lib/dbus/machine-id ] && [ ! -L /var/lib/dbus/machine-id ]; then
-    cp /etc/machine-id /var/lib/dbus/machine-id
-  fi
-fi
-[ -s /etc/machine-id ] || { echo "FATAL[$NODE]: /etc/machine-id is missing or empty" >&2; exit 1; }
-echo "MACHINE_ID $(tr -d '[:space:]' </etc/machine-id)"
-EOS
-)"
-        mid="$(awk '/^MACHINE_ID /{print $2}' <<<"$out")"
-        [[ "$mid" =~ ^[0-9a-f]{32}$ ]] || die "$c: could not read a well-formed /etc/machine-id (got '${mid:-nothing}')"
-        if [ -n "${seen_mid[$mid]:-}" ]; then
-          [ "$try" = 1 ] || die "$c: /etc/machine-id $mid duplicates ${seen_mid[$mid]}'s — STILL after regeneration (the daemon's node token would alias; every joiner would carry the manager's identity)"
-          warn "$c: /etc/machine-id $mid duplicates ${seen_mid[$mid]}'s (a baked AMI's clone); regenerating with systemd-machine-id-setup"
-          continue
-        fi
-        break
-      done
-    fi
-    seen_mid[$mid]="$c"
-    echo "  $c: machine-id $mid"
-  done
+  # baked AMI clones the file onto every node, so every joiner of the
+  # 2026-09-24 cloud row carried the MANAGER's identity and assemble
+  # attempt 1 failed at the mounts (where in the ladder is not known — the
+  # evidence is lost; the identity equality is the derivation). The node
+  # script + the assert/regenerate loop are tests/cloud_bench_node_scripts.sh's
+  # (`sym_assert_machine_ids`), pinned by tests/cloud_bench_cluster_units.sh;
+  # runs after the prologue (no daemon is up) and before any
+  # identity-bearing step.
+  sym_assert_machine_ids "${clients[@]}"
 
   log "assemble-sym 4/9: host identities — every client node its OWN registrant (nvme-cli hostnqn AND hostid, each DISTINCT across the fleet)"
   # A baked AMI clones /etc/nvme/hostnqn + hostid onto every node; two

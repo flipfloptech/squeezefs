@@ -222,8 +222,13 @@ buffered I/O; the DATA path alone opened `O_DIRECT`). On one box that is
 the truth; on two hosts sharing one nvme-tcp LUN it is a stale copy — the
 first two-host cloud row (2026-09-24) found a joiner reading its appender
 page one generation behind the manager, and a qemu/KVM guest sharing the
-laptop's nvmet-tcp namespace reproduced it ×4 with `squeezefs appenders`
-(`tests/run_mw_matrix.sh sym-two-host`, the new two-kernel fixture).
+laptop's nvmet-tcp namespace reproduced both buffered faces with
+`squeezefs appenders` (`tests/run_mw_matrix.sh sym-two-host`, the new
+two-kernel fixture): the READER's stale cache — the guest, holding the
+device open like a daemon, re-read its own first image (8 → 8) while the
+host had written 12 — and the WRITER's write-behind — the host's page
+image dirty in its cache until a later cycle's barrier, a second kernel's
+device read one image behind (×5).
 Design [docs/design-symmetric-metadata.md §5.12](docs/design-symmetric-metadata.md);
 record [.benchmarks/2026-09-19-sym-acceptance.md](.benchmarks/2026-09-19-sym-acceptance.md)
 §3.10 / §4.4ar–at. Now every metadata device path is registered `O_DIRECT`

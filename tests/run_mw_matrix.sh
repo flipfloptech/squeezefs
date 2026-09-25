@@ -2118,14 +2118,20 @@ JOBC
 #
 #   1. THE PIN (RED on a buffered-metadata binary, GREEN under O_DIRECT —
 #      the F-C1 mechanism, product-verb-driven): the guest connects the
-#      fleet's meta NQN under its OWN identity and lists the appender
-#      directory (`squeezefs appenders --json` — its kernel caches the
-#      pages), the HOST manager takes ≥ 2 checkpoint cycles (page 0's
-#      generation moves), the guest lists AGAIN. Under buffered I/O the
-#      guest's second read is its own stale first image and page 0's
-#      generation stands where its first listing left it; under O_DIRECT
-#      it reads what the host wrote. The assertion compares the guest's
-#      word against the host's own listing.
+#      fleet's meta NQN under its OWN identity, a HOLDER process keeps the
+#      namespace's block device OPEN (Linux drops a bdev's page cache at
+#      its LAST close — `blkdev_put_whole` → `kill_bdev` — so two bare
+#      listings would read the device twice; the holder is what a
+#      long-lived daemon is), and lists the appender directory (`squeezefs
+#      appenders --json` — its kernel caches the pages), the HOST manager
+#      takes ≥ 2 checkpoint cycles (page 0's generation moves), the host
+#      takes its own listing, the guest lists AGAIN. Two buffered faces
+#      read RED here: the READER's stale cache (the guest's second read is
+#      its first image — the cloud row's joiner reading its own page one
+#      generation behind) and the WRITER's write-behind (the host's page
+#      image dirty in its cache until the next cycle's barrier — a second
+#      kernel reads the device one image behind); under O_DIRECT on both
+#      sides the guest reads at least the host's word taken before it.
 #   2. THE JOIN: the guest mounts as a JOINED writer over the wire (its
 #      listener on the tap, the manager's on the tap's host address),
 #      `mkdir` + creates + `rm -rf` land, the host reads every acked name
@@ -2165,6 +2171,14 @@ done
 [ -n "\$head" ] && [ -b "/dev/\$head" ] || { echo "FAIL: \$NQN resolved no openable head in-guest"; exit 1; }
 echo "GUEST_META_HEAD=\$head"
 echo "guest logical block size: \$(cat /sys/block/\$head/queue/logical_block_size)"
+# The bdev HOLDER: an fd on the namespace kept open across both listings
+# (the pin's premise — the guest's page cache of the device persists the
+# way a long-lived daemon's does; killed by job 2 after its listing).
+( exec 3</dev/\$head; exec sleep 3600 ) >/dev/null 2>&1 &
+echo \$! >/tmp/bdev-holder.pid
+sleep 0.3
+kill -0 "\$(cat /tmp/bdev-holder.pid)" 2>/dev/null || { echo "FAIL: the bdev holder did not start"; exit 1; }
+echo "GUEST_BDEV_HOLDER=\$(cat /tmp/bdev-holder.pid)"
 \$SQZ appenders "sqmeta:///dev/\$head" --json >/tmp/appenders-1.json 2>/tmp/appenders-1.err || { cat /tmp/appenders-1.err; echo "FAIL: appenders listing 1"; exit 1; }
 cat /tmp/appenders-1.json
 JOB1
@@ -2237,7 +2251,9 @@ print(next(r["generation"] for r in rows if r.get("appender_id") == 0 and r.get(
     {
         guest_job_preamble
         cat <<JOB2
+kill -0 "\$(cat /tmp/bdev-holder.pid)" 2>/dev/null || { echo "FAIL: the bdev holder died between the listings (the cache-persistence premise)"; exit 1; }
 \$SQZ appenders "sqmeta:///dev/$g_head" --json >/tmp/appenders-2.json 2>/tmp/appenders-2.err || { cat /tmp/appenders-2.err; echo "FAIL: appenders listing 2"; exit 1; }
+kill "\$(cat /tmp/bdev-holder.pid)" 2>/dev/null || true
 cat /tmp/appenders-2.json
 JOB2
     } >"$rowdir/job2.sh"
@@ -2264,7 +2280,7 @@ rows = json.load(open(sys.argv[1]))
 print(next(r["generation"] for r in rows if r.get("appender_id") == 0 and r.get("state") == "live"))' "$rowdir/host-appenders-after.json" 2>/dev/null)" || h_gen_after="?"
     echo "guest_gen_before=$g_gen1 guest_gen_after=$g_gen2 host_gen_before_read=$h_gen host_gen_after_read=$h_gen_after" >"$rowdir/pin.txt"
     [ "$g_gen2" -ge "$h_gen" ] ||
-        die "F-C1 PIN RED: the guest re-read page 0 at generation $g_gen2 while the host had written it to $h_gen BEFORE that read (the guest's first read left it at $g_gen1) — a second kernel served its own page cache of a block the manager rewrote: shared-LUN metadata I/O is not coherent (design-symmetric-metadata §5.12; evidence $rowdir)"
+        die "F-C1 PIN RED: the guest re-read page 0 at generation $g_gen2 while the host had written it to $h_gen BEFORE that read (the guest's first read left it at $g_gen1) — $([ "$g_gen2" = "$g_gen1" ] && echo "the READER's stale cache: the guest's kernel served its own first image of a block the manager rewrote" || echo "the WRITER's write-behind: the host's page image sat in its cache, barriered only by a later cycle, and the second kernel read the device one image behind"): shared-LUN metadata I/O is not coherent (design-symmetric-metadata §5.12; evidence $rowdir)"
     log "F-C1 PIN GREEN: the guest's second read ($g_gen2) is at least the host's word before it ($h_gen; the host's word after it: $h_gen_after)"
 
     # ---- job 3: the guest JOINS as a writer and creates ----

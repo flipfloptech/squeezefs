@@ -18069,6 +18069,19 @@ impl KvMetaBackend {
     /// not move is the wedge class, loud with its numbers). A no-op — no
     /// mutex, no cycle — when every own head already stands aligned,
     /// which is every open but this face's.
+    ///
+    /// The one corner the arithmetic does not cover (review round 2,
+    /// Issue 13): a ring writer INSIDE the guarded cycle that runs AFTER
+    /// its barrier moved `reusable_upto` — on a solo writer's ring 0 there
+    /// is none, and a wire joiner returns its extents over the wire; only
+    /// a PARTITIONED set's grant cadence (`ReturnExtents` as a ring-0
+    /// control entry — the declared-region test seam's shape) writes ring
+    /// 0 post-barrier in the same cycle. Such a write reaches the still
+    /// mid-sector head and is refused `Corrupt` by `aligned_ops` (loud,
+    /// never a misaligned device write); that open fails and the next open
+    /// retries the same ladder with the tail already moved, so the pad
+    /// admits before any cycle runs. A seam-only face, stated here rather
+    /// than hooked into the cycle's barrier step.
     pub(in crate::meta_backend::kv) async fn align_own_rings_for_writing(
         &self,
     ) -> std::result::Result<(), KvError> {

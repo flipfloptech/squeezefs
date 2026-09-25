@@ -90,9 +90,21 @@ set -euo pipefail
 ETC="${MID_ETC:-/etc/machine-id}"
 DBUS="${MID_DBUS:-/var/lib/dbus/machine-id}"
 if [ "$REGEN" = 1 ]; then
+  # systemd-machine-id-setup's FIRST source is the D-Bus machine id when it
+  # is a REGULAR FILE (a symlink — Debian's default — is skipped), so a
+  # regular-file clone must go BEFORE the setup or it is copied straight
+  # back (review round 1, Issue 2). Next source on EC2 Nitro: the
+  # SMBIOS/DMI product UUID — per instance, stable across a re-run. The
+  # removed copy is recreated after, carrying the new id (what a Debian
+  # `dbus-uuidgen --ensure` takes from /etc/machine-id).
+  dbus_was_file=0
+  if [ -f "$DBUS" ] && [ ! -L "$DBUS" ]; then
+    dbus_was_file=1
+    rm -f "$DBUS"
+  fi
   : >"$ETC"
   systemd-machine-id-setup
-  if [ -f "$DBUS" ] && [ ! -L "$DBUS" ]; then
+  if [ "$dbus_was_file" = 1 ]; then
     cp "$ETC" "$DBUS"
   fi
 fi

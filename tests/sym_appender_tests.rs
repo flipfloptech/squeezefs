@@ -1728,14 +1728,27 @@ async fn a_stalled_appender_ring_grows_a_segment_and_its_content_survives() {
         "the small ring stalled: {:?}",
         s.regions[1]
     );
-    // Two barriered cycles: the first covers the last entries (its tail
-    // may still sit under a dying leaf floor — reclamation lags a cycle by
-    // design); the second's barrier leaves the ring drained with stalls
-    // behind it, and the growth decision at that cycle's end grows it.
-    va.checkpoint_now().await.unwrap();
-    va.checkpoint_now().await.unwrap();
+    // Barriered cycles until the growth decision fires: the first covers
+    // the last entries (its tail may still sit under a dying leaf floor —
+    // reclamation lags a cycle by design), a later one's barrier leaves
+    // the ring drained with stalls behind it and the decision at that
+    // cycle's end grows it. Bounded, never counted: a cycle whose flush
+    // pass compacts a slot leaf writes ONE entry into this ring — a whole
+    // page under the sector-pad law (PR 13i) — so its own tail lags it by
+    // that entry, and "two cycles" is a premise the storm's leftover
+    // compactions decide, not the law (the matrix's own reading: 2 in
+    // most runs, more in ~1 of 15).
+    let mut cycles = 0u32;
+    while stats(&va).ring_grows == 0 && cycles < 16 {
+        va.checkpoint_now().await.unwrap();
+        cycles += 1;
+    }
     let s = stats(&va);
-    assert!(s.ring_grows >= 1, "{:?}", s.regions[1]);
+    assert!(
+        s.ring_grows >= 1,
+        "a stalled, drained ring grows within {cycles} cycles: {:?}",
+        s.regions[1]
+    );
     assert!(s.regions[1].segments >= 2 && s.regions[1].segments <= RING_SEGMENTS_MAX as u64);
     assert!(s.regions[1].ring_bytes > 512 * 1024);
     // The page names the grown segment table.
@@ -2871,15 +2884,19 @@ async fn growth_never_swaps_a_ring_with_a_stage_b_window_in_flight() {
     assert!(out.is_err(), "the failed window fails its member: {out:?}");
     squeezefs::uring_fs::clear_faults();
     // With the window settled, growth proceeds: a second storm puts a
-    // fresh stall on record, two cycles drain the ring, the decision
-    // grows it.
+    // fresh stall on record, cycles drain the ring (bounded — a cycle
+    // that compacts a slot leaf writes a page into this ring and lags its
+    // own tail by it), the decision grows it.
     storm(Arc::clone(&va), 200_000).await.unwrap();
-    va.checkpoint_now().await.unwrap();
-    va.checkpoint_now().await.unwrap();
+    let mut cycles = 0u32;
+    while stats(&va).ring_grows == grows_before && cycles < 16 {
+        va.checkpoint_now().await.unwrap();
+        cycles += 1;
+    }
     let s = stats(&va);
     assert!(
         s.ring_grows > grows_before,
-        "growth proceeds once the window settled: {:?}",
+        "growth proceeds once the window settled (within {cycles} cycles): {:?}",
         s.regions[1]
     );
     assert_eq!(va.block_ref_count(tag, 90_000).await.unwrap(), 0);

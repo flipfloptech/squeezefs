@@ -11274,6 +11274,13 @@ impl KvMetaBackend {
             if r.passes_inside.load(Ordering::SeqCst) != 0
                 || r.windows_inflight.load(Ordering::SeqCst) != 0
             {
+                log::debug!(
+                    "checkpoint: appender {}'s ring growth declined this cycle — a pass inside \
+                     ({}) or a stage-B window in flight ({}); the stall stays on record",
+                    r.id,
+                    r.passes_inside.load(Ordering::SeqCst),
+                    r.windows_inflight.load(Ordering::SeqCst)
+                );
                 r.end_growth();
                 continue;
             }
@@ -11281,6 +11288,14 @@ impl KvMetaBackend {
             let drained =
                 core.head() == core.reusable_upto() && ring.min_inflight_start() == u64::MAX;
             if !drained {
+                log::debug!(
+                    "checkpoint: appender {}'s ring growth declined this cycle — not drained \
+                     (head {} reusable_upto {} min_inflight_start {}); the stall stays on record",
+                    r.id,
+                    core.head(),
+                    core.reusable_upto(),
+                    ring.min_inflight_start()
+                );
                 r.end_growth();
                 continue;
             }
@@ -11304,6 +11319,11 @@ impl KvMetaBackend {
                 }
             }
             if claimed.is_empty() {
+                log::debug!(
+                    "checkpoint: appender {}'s ring growth found no internal-class extent to \
+                     claim; the stall is consumed (the heap, not the ring, is the bound)",
+                    r.id
+                );
                 r.end_growth();
                 r.stalls_at_last_grow.store(stalls, Ordering::Relaxed);
                 continue;

@@ -13,8 +13,9 @@
 #     ($SSH_KEY_FILE) readable by you.
 #   * Spot vCPU quota for the preset ("All Standard (A, C, D, H, I, M, R, T,
 #     Z) Spot Instance Requests"): i4i preset needs 96 vCPUs, i3en preset
-#     needs 288 vCPUs, mw preset needs 32 vCPUs (SYMMETRIC=1: 8 x (3 + N_CLIENT)
-#     — S1 N_CLIENT=3 48, S2 N_CLIENT=8 88).
+#     needs 288 vCPUs, mw preset needs 32 vCPUs (SYMMETRIC=1: 8 x EVERY node
+#     = 8 x (N_MDS + N_OSS + N_CLIENT) — S1 N_CLIENT=3 48, S2 N_CLIENT=8 88
+#     at the default 1 mds + 2 oss, 136 at S2 + N_OSS=8).
 #   * Pre-built artifacts in $ARTIFACT_DIR (this script DEPLOYS, it does not
 #     build): `squeezefs` (linux-gnu, glibc ≤ the AMI's — use the
 #     `task build:ubuntu2404` dist output; the mw preset rides the Ubuntu
@@ -33,8 +34,10 @@
 #   i3en    i3en.12xlarge   x6 (288 vCPU)      4 x 7,500 GB NVMe          ~$10-14/hr (the throughput venue)
 #   mw      i4i.2xlarge     x4 (32 vCPU)       1 x 1,875 GB Nitro NVMe    ~$0.5-0.8/hr (the MW MPI-IO venue;
 #                                                                          campaign ~2-3 h => ~$1.5-3 total)
-#   mw+SYMMETRIC=1 N_CLIENT=n: x(3+n) i4i.2xlarge, ~$0.686/hr on-demand per node —
-#           S1 (n=3)  x6  ~$4.1/hr on-demand   S2 (n=8)  x11  ~$7.5/hr on-demand   (n=2: x5 ~$3.4/hr, gates 2 + 3 only)
+#   mw+SYMMETRIC=1 N_CLIENT=n: x(N_MDS+N_OSS+n) i4i.2xlarge, ~$0.686/hr on-demand per node
+#           (EVERY node bills) — at the default 1 mds + 2 oss: S1 (n=3) x6 ~$4.1/hr,
+#           S2 (n=8) x11 ~$7.5/hr (n=2: x5 ~$3.4/hr, gates 2 + 3 only);
+#           S2 + N_OSS=8 (the 2026-09-24 approved shape) x17 ~$11.7/hr
 #
 # NO burst-class (t2/t3/t3a/t4g) instances, ever: CPU-credit throttling makes
 # a median a function of the credit balance (not the code under test), their
@@ -470,7 +473,8 @@ if [ "$PRESET" = "mw" ]; then
     N_CLIENT="${N_CLIENT:-2}"
     [[ "$N_CLIENT" =~ ^[0-9]+$ ]] && [ "$N_CLIENT" -ge 2 ] ||
       die "SYMMETRIC=1 needs N_CLIENT >= 2 writer nodes (a one-node symmetric set is the solo mount every local venue already measures; got: $N_CLIENT)"
-    EST_CLUSTER_HOURLY="~\$$(python3 -c "print(f'{0.686*(3+$N_CLIENT):.2f}')")/hr on-demand ($((3 + N_CLIENT)) x i4i.2xlarge at ~\$0.686/hr; planning number)"
+    # (EST_CLUSTER_HOURLY for this shape is set below, once N_TOTAL is known
+    # — it prices EVERY node, not 3 + N_CLIENT.)
   else
     N_CLIENT="${N_CLIENT:-1}"
   fi
@@ -496,6 +500,13 @@ case "$INSTANCE_TYPE" in
 esac
 
 N_TOTAL=$((N_MDS + N_OSS + N_CLIENT + N_SPARE))
+if [ "$PRESET" = "mw" ] && [ "$SYMMETRIC" = "1" ]; then
+  # EVERY node bills — N_MDS + N_OSS + N_CLIENT + N_SPARE. The previous
+  # `3 + N_CLIENT` priced the default 1 mds + 2 oss only: the 2026-09-24
+  # cloud row launched 17 nodes (N_OSS=8) while its typed-YES line read
+  # 11 x i4i.2xlarge.
+  EST_CLUSTER_HOURLY="~\$$(python3 -c "print(f'{0.686*$N_TOTAL:.2f}')")/hr on-demand ($N_TOTAL x i4i.2xlarge at ~\$0.686/hr = $N_MDS mds + $N_OSS oss + $N_CLIENT client + $N_SPARE spare; planning number)"
+fi
 ROLE_NAMES=()
 for ((i = 0; i < N_MDS; i++));    do ROLE_NAMES+=("mds$i");    done
 for ((i = 0; i < N_OSS; i++));    do ROLE_NAMES+=("oss$i");    done

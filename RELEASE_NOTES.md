@@ -283,7 +283,10 @@ contracts and a static source rail (`tests/appender_lock_order_tests.rs`).
 on the armed symmetric plane: **F-C2** — a joined writer honours the
 manager's `Joined` reply's grant word instead of rebuilding its grant from
 the page it reads next (under the old buffered posture the stale page —
-every cloud-row joiner was write-dead from its join); **F-C3** — the commit
+every cloud-row joiner was write-dead from its join), and its page names
+the largest four runs of a reply word wider than a page holds (a fresh
+join's carve over a churned heap — the first fix's verbatim copy refused
+the rejoin's first page write); **F-C3** — the commit
 conveyor's batch-failure fan-out keeps the failing error's CLASS (`KvError`
 / `SqueezefsError` are `Clone`; the helper that flattened every class but
 I/O and no-space into "corrupt" is deleted), so a retryable

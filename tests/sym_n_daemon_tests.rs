@@ -1464,6 +1464,124 @@ async fn a_joiner_honours_the_joined_replys_grant_word_not_its_page_read() {
     shutdown(&manager).await;
 }
 
+/// **PR 13i F-C2's second face (found by fix round 1's `sym-storm` round
+/// 2): a `Joined` reply whose grant word spans more runs than a page
+/// names.** The manager's fresh-join carve is a POOL of `want` extents in
+/// as many runs as the free bitmap gives (11 on the fleet's churned heap
+/// after a recovery); the F-C2 fix copied the reply's word into the RAM
+/// page's `grant` VERBATIM, and the joiner's first page write
+/// (`join_joined_region`) refused `appender page cannot name 11 grant
+/// runs (max 4)` — the rejoin FAILED, the mount refused. The law: the RAM
+/// grant is the WHOLE word (every extent unclaimed), the page names
+/// `page_runs_of(word)` — the largest `GRANT_RUNS_MAX` runs, the manager's
+/// own rule for the page it writes for the joiner — and the join lands.
+/// The seam fragments the reply's word into one-extent runs, the shape the
+/// storm produced. RED on the F-C2 build with the storm's exact text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joined_reply_word_wider_than_the_page_lands_whole_in_ram_and_largest_on_the_page() {
+    use squeezefs::meta_backend::kv::appender::{page_runs_of, read_directory, GRANT_RUNS_MAX};
+    use squeezefs::meta_backend::kv::backend::TEST_JOIN_FRAGMENT_REPLY_GRANT;
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            TEST_JOIN_FRAGMENT_REPLY_GRANT.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _cleanup = Cleanup;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+
+    TEST_JOIN_FRAGMENT_REPLY_GRANT.store(true, std::sync::atomic::Ordering::SeqCst);
+    let j1 = join(&uris, &venue, &mvol, 1).await;
+    TEST_JOIN_FRAGMENT_REPLY_GRANT.store(false, std::sync::atomic::Ordering::SeqCst);
+    let jvol = Arc::clone(&j1.volumes[0]);
+    let jid = jvol.appender_stats().unwrap().appender_id;
+    let record = mvol.extent_grant_record(jid).await.unwrap();
+    assert!(
+        record.len() > GRANT_RUNS_MAX as u64,
+        "the fixture's word must span more extents than a page names: {} ≤ {GRANT_RUNS_MAX}",
+        record.len()
+    );
+    let own = jvol
+        .appender_stats()
+        .unwrap()
+        .regions
+        .into_iter()
+        .find(|r| r.id == jid)
+        .expect("the joiner's own region");
+    assert_eq!(
+        (own.grant_unclaimed, own.grant_claimed),
+        (record.len(), 0),
+        "the RAM grant is the WHOLE reply word: {own:?}"
+    );
+    // (The RAM pool coalesces adjacent fragments back into runs — its
+    // EXTENT set is the word, asserted above; its run count is its own.)
+    // The joiner's page on the device names at most GRANT_RUNS_MAX runs —
+    // every extent it names inside the record, none of the record lost.
+    let sb = jvol.superblock().clone();
+    let entries = read_directory(std::path::Path::new(&uris[0]), &sb)
+        .await
+        .expect("directory");
+    let page = entries
+        .iter()
+        .find(|e| e.appender_id == jid)
+        .and_then(|e| e.page.clone())
+        .expect("the joiner's page");
+    assert!(
+        page.grant.len() <= GRANT_RUNS_MAX,
+        "the page names ≤ {GRANT_RUNS_MAX} runs: {:?}",
+        page.grant
+    );
+    assert!(
+        !page.grant.is_empty(),
+        "the page names the pool's largest runs"
+    );
+    let named: Vec<u64> = page
+        .grant
+        .iter()
+        .flat_map(|r| r.start..r.start + u64::from(r.len))
+        .collect();
+    let record_extents: std::collections::BTreeSet<u64> = record.extents().collect();
+    assert!(
+        named.iter().all(|e| record_extents.contains(e)),
+        "every extent the page names is the record's: {named:?}"
+    );
+    // The law's selection over the fragmented word is inside the cap too.
+    let word: Vec<_> = record
+        .extents()
+        .map(|e| squeezefs::meta_backend::kv::appender::GrantRun { start: e, len: 1 })
+        .collect();
+    assert!(page_runs_of(&word).len() <= GRANT_RUNS_MAX);
+    // And the joiner writes: its first create mints off the pool with no
+    // wire refill, its checkpoint cycle rewrites the page inside the cap.
+    let wire = jvol.joined_wire().expect("a joined appender");
+    let grants0 = wire
+        .extent_grants
+        .load(std::sync::atomic::Ordering::Relaxed);
+    j1.create(1, "fc2b", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("the joiner's first create lands off the pool");
+    jvol.checkpoint_now().await.expect("the joiner's cycle");
+    assert_eq!(
+        wire.extent_grants
+            .load(std::sync::atomic::Ordering::Relaxed),
+        grants0,
+        "no wire refill: the pool covered the mint"
+    );
+    shutdown(&j1).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
 /// PR 13i fix round 1, Issue 1 (F-C4 at the JOINER): the checkpoint task's
 /// own page writer (`write_appender_pages`) took a region's `page` mutex
 /// and THEN its `grant` for every region but 0 — a joined writer's own

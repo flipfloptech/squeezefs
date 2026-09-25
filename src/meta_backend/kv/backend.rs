@@ -435,6 +435,17 @@ pub static TEST_JOIN_HOLD_AFTER_PAGE: std::sync::atomic::AtomicBool =
 pub static TEST_JOIN_STALE_PAGE_READ: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test seam (PR 13i review round 1 — the storm's find on F-C2): the
+/// `Joined` reply's grant word arrives FRAGMENTED into one-extent runs —
+/// the shape a churned heap hands a fresh join, where the manager's carve
+/// of `want` extents lands in as many runs as the free bitmap gives (the
+/// fleet's round-2 rejoin read 11). The joiner's RAM grant is the whole
+/// word; its PAGE names the largest `GRANT_RUNS_MAX` (the manager's own
+/// law for the page it writes for the joiner). One relaxed load per joined
+/// open; `false` = off.
+pub static TEST_JOIN_FRAGMENT_REPLY_GRANT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Test seam (design-symmetric-metadata §5.3.4 row 5, PR 4): the holder
 /// DIES mid-handover after its page named the slot `Releasing` and before
 /// tree 0 was written — the next open of its identity completes the
@@ -20694,8 +20705,28 @@ impl KvMetaBackend {
             // joiner's own page writes name it from here.
             let word: Vec<super::appender::GrantRun> = match (&joined, is_joined) {
                 (Some(j), true) => {
-                    page.grant = j.grant.clone();
-                    j.grant.clone()
+                    let word: Vec<super::appender::GrantRun> =
+                        if TEST_JOIN_FRAGMENT_REPLY_GRANT.load(Ordering::Relaxed) {
+                            j.grant
+                                .iter()
+                                .flat_map(|r| {
+                                    (r.start..r.start + u64::from(r.len))
+                                        .map(|e| super::appender::GrantRun { start: e, len: 1 })
+                                })
+                                .collect()
+                        } else {
+                            j.grant.clone()
+                        };
+                    // The PAGE names the largest `GRANT_RUNS_MAX` runs of
+                    // the word (the manager's own law for the page it
+                    // writes for the joiner, PR 13g's pool); the RAM grant
+                    // below takes the whole word. Verbatim, a fresh join's
+                    // carve of `want` extents over a churned heap — as many
+                    // runs as the free bitmap gives — made the joiner's
+                    // first page write refuse `cannot name N grant runs`
+                    // and the rejoin fail (fix round 1's storm, round 2).
+                    page.grant = super::appender::page_runs_of(&word);
+                    word
                 }
                 _ => {
                     if !self_recovered {

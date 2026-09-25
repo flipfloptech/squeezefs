@@ -15744,3 +15744,65 @@ async fn a_readers_forget_of_a_corpse_takes_no_grant_and_withholds_nothing() {
     mtokens.tear_down();
     shutdown(&manager).await;
 }
+
+/// **The manager's `Deferred` answer to `JoinAppender` is the RETRYABLE
+/// class** (PR 13i review round 1, Issue 9b). A join whose ring-0 control
+/// entry finds the manager's user window full is answered `Deferred`
+/// (PR 13i's law: the verb IS a parked committer that may not park under
+/// the verb mutex); the first build let that reply fall into the
+/// unexpected-reply arm as `Busy` — the joiner's open then read a beat of
+/// ring pressure as a failure of the join. `classify_join_reply` types it
+/// `KvError::WireDeferred` (EAGAIN — `joined_wire_deferrals`' class),
+/// keeps `Refused` as the manager's verdict (`Busy`) and hands `Joined`'s
+/// words through verbatim.
+#[test]
+fn a_join_the_manager_defers_is_the_retryable_class_never_busy() {
+    use squeezefs::meta_backend::kv::appender::GrantRun;
+    use squeezefs::meta_backend::kv::backend::joined::classify_join_reply;
+    use squeezefs::meta_backend::kv::KvError;
+    use squeezefs::meta_ship::manager::ManagerReply;
+    let path = std::path::Path::new("/dev/meta0");
+    let deferred = classify_join_reply(
+        path,
+        ManagerReply::Deferred {
+            reason: "ring 0's user window is full for a beat".into(),
+        },
+    )
+    .expect_err("a deferred join is not a joined one");
+    assert!(
+        matches!(deferred, KvError::WireDeferred(_)),
+        "the retryable class, never Busy: {deferred:?}"
+    );
+    let errno = squeezefs::error::SqueezefsError::from(deferred).to_errno();
+    assert_eq!(errno, libc::EAGAIN, "EAGAIN on the wire");
+    let refused = classify_join_reply(
+        path,
+        ManagerReply::Refused {
+            reason: "appenders_capacity reached".into(),
+        },
+    )
+    .expect_err("refused");
+    assert!(matches!(refused, KvError::Busy(_)), "{refused:?}");
+    let joined = classify_join_reply(
+        path,
+        ManagerReply::Joined {
+            appender_id: 3,
+            page_addr: 0x1000,
+            ring_segments: vec![(0x40000, 0x80000)],
+            grant: vec![(7, 2), (12, 1)],
+            already: true,
+            node_seq_base: 1 << 40,
+        },
+    )
+    .expect("joined");
+    assert_eq!(joined.appender_id, 3);
+    assert!(joined.already);
+    assert_eq!(joined.node_seq_base, 1 << 40);
+    assert_eq!(
+        joined.grant,
+        vec![
+            GrantRun { start: 7, len: 2 },
+            GrantRun { start: 12, len: 1 }
+        ]
+    );
+}

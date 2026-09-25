@@ -256,7 +256,7 @@ the `meta_io` object (`meta_io_direct_paths`, `meta_io_buffered_fallback`
 that refuses `O_DIRECT` takes a LOUD buffered fallback (announced at the
 open, counted), a block device that refuses it refuses the mount. The ring
 pays a derived capacity cost: on a 4 KiB-grain device a commit WINDOW
-occupies whole pages (≤ 4,093 B of pad, ≈ 2 KiB mean — per window, the
+occupies whole pages (≤ 4,092 B of pad, ≈ 2 KiB mean — per window, the
 conveyor's whole batch; ≤ 532 B on a 512-byte-grain device), so a serial
 one-transaction-per-window workload's ring runway is the ring's page count
 (8,192 windows on the 32 MiB default) and the cadence's ring-pressure law

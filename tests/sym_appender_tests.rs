@@ -2927,15 +2927,41 @@ async fn growth_never_swaps_a_ring_with_a_stage_b_window_in_flight() {
 /// paths against each other: a std thread polls `appender_stats` in a
 /// tight loop while the manager carves and returns a one-extent grant a
 /// few hundred times; the base deadlocks within the first carves, the
-/// fixed order finishes. Bounded by a watchdog so a regression is a
-/// loud RED, never a hung suite.
+/// fixed order finishes. Bounded by a watchdog DERIVED from the pin's own
+/// work — a pilot round's measured wall × the rounds × a slack for a
+/// throttled box, floored at the venue's minimum (review round 1, Issue
+/// 9a) — so a regression is a loud RED, never a hung suite, and a slow
+/// venue never a false one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_stats_reader_never_deadlocks_against_a_grants_page_update() {
+    const ROUNDS: u32 = 300;
+    // Per round: one carve + one return, measured once on a quiet volume.
+    const ROUND_SLACK: u32 = 8;
+    const WATCHDOG_FLOOR: std::time::Duration = std::time::Duration::from_secs(60);
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     let uris = vec![format_stamped_member(dir.path(), "meta0").await];
     let ra = open_with_partition(&uris, Some(PARTITION)).await;
     let va = Arc::clone(&ra.volumes[0]);
+    // The pilot round (no poller beside it): the venue's per-round wall.
+    let pilot = {
+        let t0 = std::time::Instant::now();
+        let granted = va
+            .manager_extent_grant(1, 1)
+            .await
+            .expect("pilot ExtentGrant");
+        let back: Vec<u64> = granted
+            .iter()
+            .flat_map(|r| r.start..r.start + u64::from(r.len))
+            .collect();
+        if !back.is_empty() {
+            va.manager_return_extents(1, &back)
+                .await
+                .expect("pilot ReturnExtents");
+        }
+        t0.elapsed()
+    };
+    let watchdog = WATCHDOG_FLOOR.max(pilot * ROUNDS * ROUND_SLACK);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let poller = {
         let v = Arc::clone(&va);
@@ -2958,7 +2984,7 @@ async fn the_stats_reader_never_deadlocks_against_a_grants_page_update() {
     let driver = {
         let v = Arc::clone(&va);
         async move {
-            for _ in 0..300u32 {
+            for _ in 0..ROUNDS {
                 let granted = v.manager_extent_grant(1, 1).await.expect("ExtentGrant");
                 let back: Vec<u64> = granted
                     .iter()
@@ -2975,7 +3001,7 @@ async fn the_stats_reader_never_deadlocks_against_a_grants_page_update() {
     // Spawned: a deadlocked carve blocks ITS worker in `Mutex::lock`, and
     // the watchdog below must be polled by a thread that is not it.
     let driver = tokio::spawn(driver);
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), driver).await;
+    let outcome = tokio::time::timeout(watchdog, driver).await;
     stop.store(true, Ordering::Release);
     if outcome.is_err() {
         // A tokio worker is parked in `Mutex::lock` under the driver and
@@ -2990,6 +3016,13 @@ async fn the_stats_reader_never_deadlocks_against_a_grants_page_update() {
              inversion between AppenderSet::stats and the grant writers; one order: grant \
              before page)\n"
                 .as_bytes(),
+        );
+        let _ = std::io::stderr().write_all(
+            format!(
+                "  watchdog {watchdog:?} = max({WATCHDOG_FLOOR:?}, pilot {pilot:?} × {ROUNDS} \
+                 rounds × {ROUND_SLACK})\n"
+            )
+            .as_bytes(),
         );
         std::process::exit(101);
     }

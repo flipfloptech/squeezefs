@@ -469,6 +469,51 @@ fn unexpected(verb: &str, reply: &ManagerReply) -> KvError {
     KvError::Busy(format!("{verb} answered {reply:?}"))
 }
 
+/// The words a `Joined` reply hands the open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinedWord {
+    pub appender_id: u32,
+    pub already: bool,
+    pub node_seq_base: u64,
+    pub grant: Vec<GrantRun>,
+}
+
+/// The `JoinAppender` reply's class (review round 1, Issue 9b): `Joined`
+/// is the word, `Refused` the manager's verdict (`Busy` — the join is
+/// wrong, not early), and `Deferred` — the manager's ring 0 full for a
+/// beat (PR 13i's `Deferred` on a full user window) — the RETRYABLE class
+/// `KvError::WireDeferred` (EAGAIN), which the first build let fall into
+/// the unexpected-reply arm as `Busy`; anything else is that arm.
+pub fn classify_join_reply(path: &Path, reply: ManagerReply) -> Result<JoinedWord, KvError> {
+    match reply {
+        ManagerReply::Joined {
+            appender_id,
+            already,
+            node_seq_base,
+            grant,
+            ..
+        } => Ok(JoinedWord {
+            appender_id,
+            already,
+            node_seq_base,
+            grant: grant
+                .iter()
+                .map(|&(start, len)| GrantRun { start, len })
+                .collect(),
+        }),
+        ManagerReply::Refused { reason } => Err(KvError::Busy(format!(
+            "{}: the manager refused JoinAppender: {reason}",
+            path.display()
+        ))),
+        ManagerReply::Deferred { reason } => Err(KvError::WireDeferred(format!(
+            "{}: the manager deferred JoinAppender ({reason}) — its ring 0 is full for a beat; \
+             the join retries (EAGAIN class)",
+            path.display()
+        ))),
+        other => Err(unexpected("JoinAppender", &other)),
+    }
+}
+
 fn wire_err(verb: &str, e: crate::error::SqueezefsError) -> KvError {
     if e.to_errno() == libc::EAGAIN {
         // The manager's `Deferred` (STATUS_DEFERRED → EAGAIN): the
@@ -780,37 +825,19 @@ impl KvMetaBackend {
         // The open's FIRST act: a transport failure here (the manager
         // died between the connect and its reply) is the same unreachable
         // class as the dial's — nothing of this join exists yet.
-        let (appender_id, already, node_seq_base, grant) =
-            match client.join(presented, 0).await.map_err(|e| {
-                KvError::ManagerUnreachable(format!(
-                    "{}: JoinAppender to the manager at {} failed over the wire: {e}",
-                    path.display(),
-                    admission.manager_endpoint
-                ))
-            })? {
-                ManagerReply::Joined {
-                    appender_id,
-                    already,
-                    node_seq_base,
-                    grant,
-                    ..
-                } => (
-                    appender_id,
-                    already,
-                    node_seq_base,
-                    grant
-                        .iter()
-                        .map(|&(start, len)| GrantRun { start, len })
-                        .collect::<Vec<_>>(),
-                ),
-                ManagerReply::Refused { reason } => {
-                    return Err(KvError::Busy(format!(
-                        "{}: the manager refused JoinAppender: {reason}",
-                        path.display()
-                    )))
-                }
-                other => return Err(unexpected("JoinAppender", &other)),
-            };
+        let reply = client.join(presented, 0).await.map_err(|e| {
+            KvError::ManagerUnreachable(format!(
+                "{}: JoinAppender to the manager at {} failed over the wire: {e}",
+                path.display(),
+                admission.manager_endpoint
+            ))
+        })?;
+        let JoinedWord {
+            appender_id,
+            already,
+            node_seq_base,
+            grant,
+        } = classify_join_reply(path, reply)?;
         // The word decides this daemon's node-seq space: screened against
         // the volume's own base BEFORE anything is installed (Issue 6 —
         // PR 3's bounded-execution law). A refused word is a rejected

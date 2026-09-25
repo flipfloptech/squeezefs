@@ -2827,6 +2827,119 @@ async fn the_reactive_refill_asks_the_reserve_for_one_smos_images_not_the_derive
 }
 
 // ---------------------------------------------------------------------------
+// PR 13i F-C3 — the conveyor's batch-failure fan-out keeps the error CLASS.
+// ---------------------------------------------------------------------------
+
+/// **F-C3 (PR 13i — the cloud row's `mkdir` → `EINVAL`).** A conveyor
+/// batch that fails AS A UNIT at resolve — a declared region's lazy mint
+/// under a DRAINED grant, the joiner's first create on the cloud row —
+/// answers every member the pass's own class: `GrantExhausted` (EAGAIN,
+/// the FUSE layer's retry ladder), never `Corrupt` (EINVAL). The base's
+/// `clone_kv_error` fan-out flattened every class but `Io` / `NoSpace`
+/// into `Corrupt(other.to_string())`, so m60's `mkdir -p` read the grant's
+/// retry class as an invalid argument.
+///
+/// Region 1 leases forest slots 4 and 5; slot 4 is minted (the grant's
+/// first claim), the unclaimed remainder returned through `ReturnExtents`,
+/// the cadence parked (no refill). Four `setxattr` commits into the
+/// UN-MINTED slot 5 are held behind the pass (`TEST_CONVEYOR_HOLD_PRE_
+/// DRAIN`) so they form ONE batch; the release runs one pass whose
+/// `tree_for_record` mint refuses `GrantExhausted` and fails the batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_failed_at_resolve_by_grant_exhaustion_fans_out_the_grant_class_to_every_member() {
+    use squeezefs::meta_backend::kv::backend::{
+        test_conveyor_hold_release, TEST_CONVEYOR_HOLD_PRE_DRAIN, TEST_CONVEYOR_HOLD_STAGE,
+    };
+    let _ = env_logger::builder().is_test(true).try_init();
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+            TEST_CONVEYOR_HOLD_STAGE.store(0, Ordering::SeqCst);
+            test_conveyor_hold_release();
+        }
+    }
+    let _cleanup = Cleanup;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let ra = open_with_partition(&uris, Some("1:4,5")).await;
+    let va = Arc::clone(&ra.volumes[0]);
+
+    // Slot 4's tree minted (the grant's first claim), then region 1's
+    // grant DRAINED: every unclaimed extent returned to the manager.
+    va.setxattr_internal(guest_local_ino(3, 9), "user.mint", b"m")
+        .await
+        .unwrap();
+    let unclaimed = va.region_grant_unclaimed(1);
+    assert!(!unclaimed.is_empty(), "the join minted a grant");
+    va.manager_return_extents(1, &unclaimed).await.unwrap();
+    assert!(
+        va.region_grant_unclaimed(1).is_empty(),
+        "the grant is drained"
+    );
+
+    // Four commits into the UN-MINTED slot 5 form one batch behind the
+    // held pass.
+    TEST_CONVEYOR_HOLD_STAGE.store(TEST_CONVEYOR_HOLD_PRE_DRAIN, Ordering::SeqCst);
+    let mut tasks = Vec::new();
+    for i in 0..4u64 {
+        let v = Arc::clone(&va);
+        tasks.push(tokio::spawn(async move {
+            v.setxattr_internal(guest_local_ino(4, 20 + i), "user.fc3", b"x")
+                .await
+        }));
+        let want = i as usize + 1;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while va.conveyor_pending_len() < want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "committer {i} never enqueued behind the held pass"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+    TEST_CONVEYOR_HOLD_STAGE.store(0, Ordering::SeqCst);
+    test_conveyor_hold_release();
+
+    let mut outcomes = Vec::with_capacity(4);
+    for t in tasks {
+        outcomes.push(t.await.expect("committer task"));
+    }
+    for (i, out) in outcomes.into_iter().enumerate() {
+        let err = out.expect_err("the un-minted slot's commit cannot land without an extent");
+        // `GrantExhausted` maps to the structural EAGAIN refusal; the
+        // flattened `Corrupt` maps to `InvalidOperation` (EINVAL) with the
+        // corruption prefix in front of the grant's own words.
+        assert!(
+            !matches!(&err, squeezefs::error::SqueezefsError::InvalidOperation(_)),
+            "member {i}: the batch's own class fans out — GrantExhausted, never Corrupt: {err}"
+        );
+        assert!(
+            !err.to_string().contains("corrupt KV encoding"),
+            "member {i}: the grant's retry class wears no corruption prefix: {err}"
+        );
+        assert_eq!(
+            err.to_errno(),
+            libc::EAGAIN,
+            "member {i}: the syscall reads the retry class (EAGAIN), never EINVAL: {err}"
+        );
+    }
+    let s = stats(&va);
+    assert_eq!(s.manager_verb_refusals, 0, "no witness contradiction");
+    assert_eq!(
+        va.enospc_refusals(),
+        0,
+        "a grant stall is never the space class"
+    );
+    assert!(!va.is_failed(), "the volume stays healthy");
+    for v in &ra.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The negative contract: a bit-17-absent volume carries none of it.
 // ---------------------------------------------------------------------------
 

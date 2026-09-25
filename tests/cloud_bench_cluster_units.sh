@@ -15,13 +15,24 @@
 #          waited on: zero polls, and the drain is `systemctl stop
 #          unattended-upgrades.service` FIRST (its stop handler waits for a
 #          running child), then the timers off + masked.
-#   apt-2  a LIVE upgrade (`apt-daily-upgrade.service` = `activating`, the
-#          dpkg lock held for three polls) IS waited for — exactly until the
+#   apt-2  the LOCK arm alone: the dpkg lock held for three polls (every unit
+#          inactive, no upgrader process) IS waited for — exactly until the
 #          lock frees — and `apt-daily-upgrade.service` is NEVER `stop`ped
 #          (a `stop` SIGTERMs the unit's cgroup: apt.systemd.daily →
-#          unattended-upgrade → dpkg).
+#          unattended-upgrade → dpkg). Runs under a SHORT bound so a broken
+#          lock arm fails in seconds, never a real 600 s wait.
 #   apt-3  a lock held past the bound dies LOUD, nonzero, naming the node —
 #          never a `stop`/`kill` of the transaction.
+#   apt-4  the UNIT-STATE arm alone: `apt-daily-upgrade.service` reads
+#          `activating` for three probes with the lock never held and no
+#          upgrader process — exactly three polls, no `stop`.
+#   apt-5  the PROCESS arm alone: the upgrader `unattended-upgrade` is in the
+#          process table for three probes, no lock, every unit inactive —
+#          exactly three polls.
+# Mutation law (state it in the commit that touches `apt_busy`): deleting the
+# lock arm → apt-2 + apt-3 RED; the unit-state arm → apt-4 RED; the process
+# arm → apt-5 RED. `CLOUD_NODE_SCRIPTS_LIB=<path>` points the pin at a
+# mutant copy of the lib.
 #   mid-1  REGEN=1 with a REGULAR-FILE dbus id carrying the clone yields a NEW
 #          id (systemd-machine-id-setup seeds from that file first, so it must
 #          go BEFORE the setup) and the dbus file is recreated with the new id.
@@ -44,7 +55,7 @@ warn() { echo "WARN: $*" >&2; }
 node_pub() { echo "ip-$1"; }
 DRY_RUN=false
 # shellcheck source=tests/cloud_bench_node_scripts.sh
-. "$HERE/cloud_bench_node_scripts.sh"
+. "${CLOUD_NODE_SCRIPTS_LIB:-$HERE/cloud_bench_node_scripts.sh}"
 
 PASS=0
 FAIL=0
@@ -63,8 +74,12 @@ assert_no_grep() { # <label> <pattern> <file>
 # --- the fake system tools ---------------------------------------------------
 # Every fake logs its argv to $FAKE_LOG (one line per call) and answers off a
 # per-case state dir ($FAKE_STATE): `units` (unit -> ActiveState, one per
-# line), `lock_held_polls` (how many more `fuser`/`lslocks` probes read the
-# lock as HELD; decremented per probe).
+# line), `lock_held_polls` (how many more `fuser` probes read the lock as
+# HELD; decremented per probe), `activating_polls` (how many more `show`
+# queries of a unit tabled `activating` read it so — INDEPENDENT of the lock,
+# so the unit-state arm is pinned on its own), `procs` (the process table —
+# lines `<pid> <comm> <cmdline>` — and `upgrader_polls`, how many more
+# `pgrep` calls still see the `unattended-upgrade` upgrader in it).
 cat >"$FAKES/systemctl" <<'EOF'
 #!/usr/bin/env bash
 echo "systemctl $*" >>"$FAKE_LOG"
@@ -72,11 +87,15 @@ state_of() { awk -v u="$1" '$1 == u {print $2}' "$FAKE_STATE/units"; }
 case "$1" in
   show)
     # `show -p ActiveState --value <unit>`: the real word for one unit. A
-    # unit tabled `activating` is the LIVE upgrade — it stays `activating`
-    # exactly while the fake lock is held and reads `inactive` once the
-    # transaction (the lock) is gone, as the real oneshot does.
+    # unit tabled `activating` is the LIVE upgrade — it reads `activating`
+    # for `activating_polls` more queries (its own countdown, never the
+    # lock's) and `inactive` after, as the real oneshot does when its run
+    # ends.
     u="${@: -1}"; s="$(state_of "$u")"
-    if [ "$s" = activating ] && [ "$(cat "$FAKE_STATE/lock_held_polls" 2>/dev/null || echo 0)" -le 0 ]; then s=inactive; fi
+    if [ "$s" = activating ]; then
+      n="$(cat "$FAKE_STATE/activating_polls" 2>/dev/null || echo 0)"
+      if [ "$n" -gt 0 ]; then echo $((n - 1)) >"$FAKE_STATE/activating_polls"; else s=inactive; fi
+    fi
     echo "${s:-inactive}"; exit 0 ;;
   is-active)
     # the real systemctl: 0 if AT LEAST ONE named unit is active/reloading
@@ -96,10 +115,27 @@ n="$(cat "$FAKE_STATE/lock_held_polls" 2>/dev/null || echo 0)"
 if [ "$n" -gt 0 ]; then echo $((n - 1)) >"$FAKE_STATE/lock_held_polls"; exit 0; fi
 exit 1
 EOF
+# pgrep over the fake process table: `-x <comm>` matches the 15-char comm
+# exactly, `-f <regex>` the full command line (grep -E). The upgrader's line
+# is present while `upgrader_polls` > 0 (decremented per pgrep call); the
+# waiter's line, when tabled, is always present (it never exits on its own).
 cat >"$FAKES/pgrep" <<'EOF'
 #!/usr/bin/env bash
 echo "pgrep $*" >>"$FAKE_LOG"
-exit 1
+mode="$1"; pat="$2"
+n="$(cat "$FAKE_STATE/upgrader_polls" 2>/dev/null || echo 0)"
+table="$(cat "$FAKE_STATE/procs" 2>/dev/null || true)"
+if [ "$n" -gt 0 ]; then
+  echo $((n - 1)) >"$FAKE_STATE/upgrader_polls"
+  table="$table
+4242 unattended-upgr /usr/bin/python3 /usr/bin/unattended-upgrade"
+fi
+[ -n "$table" ] || exit 1
+case "$mode" in
+  -x) awk -v c="$pat" '$2 == c {found = 1} END {exit found ? 0 : 1}' <<<"$table" ;;
+  -f) cut -d' ' -f3- <<<"$table" | grep -qE -- "$pat" ;;
+  *) exit 1 ;;
+esac
 EOF
 cat >"$FAKES/sleep" <<'EOF'
 #!/usr/bin/env bash
@@ -124,11 +160,18 @@ new_case() { # <name> — a fresh state dir + log; prints the case dir
   mkdir -p "$d"
   : >"$d/log"
   : >"$d/units"
+  : >"$d/procs"
   echo 0 >"$d/lock_held_polls"
+  echo 0 >"$d/activating_polls"
+  echo 0 >"$d/upgrader_polls"
   echo "$d"
 }
+# Every apt case runs under a SHORT bound (10 s; the fakes' polls are
+# instant, so a healthy arm finishes in ms) — a regressed arm fails FAST
+# instead of spinning the production 600 s bound against the real clock.
+APT_PIN_WAIT_MAX_S=10
 run_apt() { # <casedir> [WAIT_MAX] [POLL] — the node script under the fakes
-  local d="$1" wait_max="${2:-600}" poll="${3:-5}"
+  local d="$1" wait_max="${2:-$APT_PIN_WAIT_MAX_S}" poll="${3:-5}"
   PATH="$FAKES:$PATH" FAKE_LOG="$d/log" FAKE_STATE="$d" \
     NODE=unit-node APT_UPGRADE_WAIT_MAX_S="$wait_max" APT_UPGRADE_POLL_S="$poll" \
     bash -c "$NODE_APT_HYGIENE_SCRIPT" >"$d/out" 2>"$d/err"
@@ -147,13 +190,14 @@ assert_grep "apt-1 timers stopped" '^systemctl stop apt-daily\.timer apt-daily-u
 assert_grep "apt-1 timers disabled" '^systemctl disable apt-daily\.timer apt-daily-upgrade\.timer' "$d/log"
 assert_grep "apt-1 the upgrader masked" '^systemctl mask .*unattended-upgrades\.service' "$d/log"
 
-echo "== apt-2: a LIVE upgrade (activating + the dpkg lock held for 3 polls) is waited for exactly, and never stopped"
+echo "== apt-2: the LOCK arm alone — the dpkg lock held for 3 polls (every unit inactive, no upgrader) is waited for exactly, and never stopped"
 d="$(new_case apt2)"
-printf '%s\n' "unattended-upgrades.service active" "apt-daily-upgrade.service activating" "apt-daily.service inactive" >"$d/units"
+printf '%s\n' "unattended-upgrades.service active" "apt-daily-upgrade.service inactive" "apt-daily.service inactive" >"$d/units"
 echo 3 >"$d/lock_held_polls"
-rc=0; run_apt "$d" 600 5 || rc=$?
+rc=0; run_apt "$d" || rc=$?
 assert_eq "apt-2 exit" 0 "$rc"
 assert_eq "apt-2 polls = the 3 held probes" 3 "$(grep -c '^sleep ' "$d/log" || true)"
+assert_eq "apt-2 the lock was probed (fuser) on every pass" 4 "$(grep -c '^fuser ' "$d/log" || true)"
 assert_no_grep "apt-2 never stops apt-daily-upgrade.service while/after the lock" '^systemctl stop .*apt-daily-upgrade\.service' "$d/log"
 assert_grep "apt-2 says it is waiting" 'waiting' "$d/out"
 
@@ -166,6 +210,26 @@ if [ "$rc" -ne 0 ]; then ok "apt-3 exit nonzero ($rc)"; else bad "apt-3 exited 0
 assert_grep "apt-3 names the node in its FATAL" 'FATAL\[unit-node\]' "$d/err"
 assert_no_grep "apt-3 never stops apt-daily-upgrade.service" '^systemctl stop .*apt-daily-upgrade\.service' "$d/log"
 assert_no_grep "apt-3 never kills" '^(systemctl kill|kill|pkill) ' "$d/log"
+
+echo "== apt-4: the UNIT-STATE arm alone — apt-daily-upgrade.service reads activating for 3 probes, the lock never held, no upgrader process"
+d="$(new_case apt4)"
+printf '%s\n' "unattended-upgrades.service active" "apt-daily-upgrade.service activating" "apt-daily.service inactive" >"$d/units"
+echo 3 >"$d/activating_polls"
+rc=0; run_apt "$d" || rc=$?
+assert_eq "apt-4 exit" 0 "$rc"
+assert_eq "apt-4 polls = the 3 activating probes" 3 "$(grep -c '^sleep ' "$d/log" || true)"
+assert_grep "apt-4 the unit state was consulted" '^systemctl show -p ActiveState --value apt-daily-upgrade\.service' "$d/log"
+assert_no_grep "apt-4 never stops apt-daily-upgrade.service" '^systemctl stop .*apt-daily-upgrade\.service' "$d/log"
+
+echo "== apt-5: the PROCESS arm alone — the upgrader unattended-upgrade is in the process table for 3 probes, no lock, every unit inactive"
+d="$(new_case apt5)"
+printf '%s\n' "unattended-upgrades.service active" "apt-daily-upgrade.service inactive" "apt-daily.service inactive" >"$d/units"
+echo 3 >"$d/upgrader_polls"
+rc=0; run_apt "$d" || rc=$?
+assert_eq "apt-5 exit" 0 "$rc"
+assert_eq "apt-5 polls = the 3 probes that saw the upgrader" 3 "$(grep -c '^sleep ' "$d/log" || true)"
+assert_grep "apt-5 the process table was consulted" '^pgrep ' "$d/log"
+assert_no_grep "apt-5 never stops apt-daily-upgrade.service" '^systemctl stop .*apt-daily-upgrade\.service' "$d/log"
 
 # --- the machine-id node script --------------------------------------------------
 run_mid() { # <casedir> <REGEN> — the node script under the fakes with MID_* in the case dir

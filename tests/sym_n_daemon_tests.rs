@@ -1362,6 +1362,108 @@ async fn two_joined_appenders_never_mint_an_equal_node_seq() {
     shutdown(&manager).await;
 }
 
+/// **PR 13i F-C2 — the joiner honours the `Joined` reply's grant word.**
+/// The manager's `JoinAppender` writes the joiner's page TWICE — `Live`
+/// with the grant cleared, then the grant word (`write_wire_joiner_page_
+/// grant`) — and answers the runs ON THE REPLY: "the grant's runs reach
+/// the joiner on the reply and ITS page write names them" is the
+/// manager's own contract. The base joiner DISCARDED the reply's word and
+/// rebuilt its RAM grant from the DEVICE page (`RegionGrant::recover
+/// (record, page.grant)`); on the cloud row's two-host fleet the joiner's
+/// kernel served the FIRST image (F-C1), so `recover` landed the whole
+/// record CLAIMED (m60: `extent_grant_granted 72 = claimed 72, unclaimed
+/// 0`), its first `mkdir` refused `GrantExhausted`, and every reactive
+/// refill was answered verbatim (356 verbs, all replays: the runs were in
+/// its RAM as claimed, so nothing read as fresh).
+///
+/// The seam `TEST_JOIN_STALE_PAGE_READ` makes the joined region open see
+/// the pre-grant image (the grant word cleared) — the one-process venue's
+/// way to read what the second kernel read. RED on the base: unclaimed 0,
+/// claimed = the whole record, the first create's mint asks the manager
+/// (`joined_wire_extent_grants` moves). GREEN: the RAM grant IS the
+/// reply's word — unclaimed = the record, claimed 0 — and the first create
+/// lands without a wire refill.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiner_honours_the_joined_replys_grant_word_not_its_page_read() {
+    use squeezefs::meta_backend::kv::backend::TEST_JOIN_STALE_PAGE_READ;
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            TEST_JOIN_STALE_PAGE_READ.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _cleanup = Cleanup;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        shutdown(&routed).await;
+    }
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+
+    TEST_JOIN_STALE_PAGE_READ.store(true, std::sync::atomic::Ordering::SeqCst);
+    let j1 = join(&uris, &venue, &mvol, 1).await;
+    TEST_JOIN_STALE_PAGE_READ.store(false, std::sync::atomic::Ordering::SeqCst);
+    let jvol = Arc::clone(&j1.volumes[0]);
+    let jid = jvol.appender_stats().unwrap().appender_id;
+    let record = mvol.extent_grant_record(jid).await.unwrap();
+    assert!(!record.is_empty(), "the join minted a grant record");
+    let own = jvol
+        .appender_stats()
+        .unwrap()
+        .regions
+        .into_iter()
+        .find(|r| r.id == jid)
+        .expect("the joiner's own region");
+    assert_eq!(
+        (own.grant_unclaimed, own.grant_claimed),
+        (record.len() as u64, 0),
+        "the joiner's RAM grant is the reply's word — the whole initial grant unclaimed, \
+         nothing claimed (a stale page read landed it all CLAIMED): {own:?}"
+    );
+
+    // The first create mints in the creator's rotor — one image off the
+    // grant — and needs NO wire refill (the reply's runs are in RAM).
+    let wire = jvol.joined_wire().expect("a joined appender");
+    let grants0 = wire
+        .extent_grants
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let reactive0 = wire
+        .reactive_grants
+        .load(std::sync::atomic::Ordering::Relaxed);
+    j1.create(1, "fc2", libc::S_IFDIR | 0o755, 1000, 1000)
+        .await
+        .expect("the joiner's first create lands off the reply's grant");
+    assert_eq!(
+        (
+            wire.extent_grants
+                .load(std::sync::atomic::Ordering::Relaxed),
+            wire.reactive_grants
+                .load(std::sync::atomic::Ordering::Relaxed)
+        ),
+        (grants0, reactive0),
+        "no wire refill for the first mint — the reply's grant covered it"
+    );
+    let own = jvol
+        .appender_stats()
+        .unwrap()
+        .regions
+        .into_iter()
+        .find(|r| r.id == jid)
+        .expect("the joiner's own region");
+    assert!(
+        own.grant_claimed >= 1 && own.grant_unclaimed + own.grant_claimed == record.len() as u64,
+        "the mint claimed off the reply's runs: {own:?}"
+    );
+    shutdown(&j1).await;
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
 /// **A joined holder resolves a LATER joiner's slot to its holder at a
 /// served step** (PR 13 — found by the fleet's first joiner→joiner
 /// cross-owner create: `sym-shared-dir`, m61 creating into m60's

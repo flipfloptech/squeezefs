@@ -425,6 +425,16 @@ pub static TEST_SHUTDOWN_FIXPOINT_CYCLES: AtomicU64 = AtomicU64::new(0);
 pub static TEST_JOIN_HOLD_AFTER_PAGE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test seam (PR 13i F-C2): a JOINED appender's region open reads its own
+/// page as the manager's FIRST image — `Live` with the grant word cleared,
+/// before `write_wire_joiner_page_grant` named the runs — the image a
+/// second host's page cache served on the cloud row (F-C1). The one-process
+/// venue's way to read what the second kernel read; the RAM grant must
+/// still be the `Joined` reply's word. One relaxed load per joined open;
+/// `false` = off.
+pub static TEST_JOIN_STALE_PAGE_READ: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Test seam (design-symmetric-metadata §5.3.4 row 5, PR 4): the holder
 /// DIES mid-handover after its page named the slot `Releasing` and before
 /// tree 0 was written — the next open of its identity completes the
@@ -20264,6 +20274,9 @@ impl KvMetaBackend {
                 .page
                 .clone()
                 .unwrap_or_else(|| AppenderPage::free(id, 0));
+            if is_joined && TEST_JOIN_STALE_PAGE_READ.load(Ordering::Relaxed) {
+                page.grant.clear();
+            }
             let own_live = matches!(page.state, AppenderState::Live | AppenderState::Recovering)
                 && mine(&page);
             // A joined appender's region was minted by the MANAGER's

@@ -618,8 +618,10 @@ pub static META_IO_DIRECT_PATHS: std::sync::atomic::AtomicU64 =
 pub static META_IO_BUFFERED_FALLBACK: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 /// Bytes of direct-write buffers COPIED into an aligned buffer because
-/// the caller's was not (`meta_io_bounce_bytes`) — the KV layer's images
-/// are built aligned, so growth names a caller that is not.
+/// the caller's was not (`meta_io_bounce_bytes`): the journal ring's runs
+/// are built aligned (`AlignedBuf`), the page / node / ledger images are
+/// heap `Vec`s and bounce — one copy per such write, the economy item
+/// PR 14 inherits (the hot conveyor path pays none).
 pub static META_IO_BOUNCE_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 /// Direct writes REFUSED for a misaligned offset or length

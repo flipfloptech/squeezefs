@@ -2251,18 +2251,36 @@ print(next(r["generation"] for r in rows if r.get("appender_id") == 0 and r.get(
     log "F-C1 PIN GREEN: the guest's second read is the host's word (generation $h_gen)"
 
     # ---- job 3: the guest JOINS as a writer and creates ----
+    # The guest mounts under ITS OWN per-mount identity (the pair job 1
+    # connected the meta NQN with — KD-MW-3): the DATA volume's device
+    # name is the HOST's (`/dev/nvmeXnY` from the format), so the guest's
+    # daemon must connect it itself off the durable `fabric_endpoint:`
+    # record (the tap's host address) and resolve the head under its own
+    # controller — the rung-2 daemon-owned connect, exactly what a second
+    # host does in the field.
     local mw_port="${MW_PORT:-45999}"
     {
         guest_job_preamble
         cat <<JOB3
 mkdir -p /mnt/j /etc/squeezefs
+# The FRESH-KERNEL premise (the fork fix this venue found): the guest has
+# never mounted, so \`fuse.enable_uring\` reads its default N here. Since
+# 7.2.4 the kernel creates a connection's FUSE ring at INIT-REPLY time iff
+# the parameter is Y THEN, so a daemon that flips it after the reply (the
+# pre-PR-13i fork) registers nothing — every REGISTER EINVAL, the mount
+# refused — and only its SECOND mount succeeds. The join below is the
+# guest's FIRST mount: it must arm FUSE-over-io_uring at the first attempt.
+eu=\$(cat /sys/module/fuse/parameters/enable_uring 2>/dev/null || echo '?')
+echo "GUEST_ENABLE_URING_BEFORE=\$eu"
 env SQUEEZEFS_SYMMETRIC_META=1 SQUEEZEFS_MW_BIND='$VM_TAP_GUEST_IP:$mw_port' \
-    \$SQZ mount "sqmeta:///dev/$g_head" /mnt/j --daemon --log-file /tmp/j.log >/tmp/j.mount.out 2>&1 || { cat /tmp/j.mount.out; cat /tmp/j.log 2>/dev/null | tail -30; echo "FAIL: guest joiner mount"; exit 1; }
+    \$SQZ mount "sqmeta:///dev/$g_head" /mnt/j -o 'hostnqn=$g_nqn,hostid=$g_id' --daemon --log-file /tmp/j.log >/tmp/j.mount.out 2>&1 || { cat /tmp/j.mount.out; cat /tmp/j.log 2>/dev/null | tail -30; echo "FAIL: guest joiner mount"; exit 1; }
 i=0
 while [ \$i -lt 240 ]; do grep -q " /mnt/j " /proc/mounts && break; i=\$((i + 1)); sleep 0.5; done
 grep -q " /mnt/j " /proc/mounts || { echo "FAIL: joiner never mounted"; tail -30 /tmp/j.log; exit 1; }
 grep -q "mounted as a JOINED symmetric appender" /tmp/j.log || { echo "FAIL: no joined-door line"; tail -30 /tmp/j.log; exit 1; }
-posture=\$(grep -o '"mount_posture": *"[a-z-]*"' /mnt/j/.stats | grep -o '"[a-z-]*"\$' | tr -d '"')
+grep -q "daemon-owned controller resolved" /tmp/j.log || { echo "FAIL: no daemon-owned data connect line (rung-2 engagement — the guest resolved the host's device name?)"; tail -30 /tmp/j.log; exit 1; }
+grep -q "FUSE-over-io_uring transport armed" /tmp/j.log || { echo "FAIL: the transport never armed on the guest's FIRST mount (enable_uring was \$eu before it)"; grep -n "REGISTER\|rejected\|enable_uring" /tmp/j.log | tail -8; exit 1; }
+posture=\$(grep -o '"mount_posture": *"[a-z-]*"' /mnt/j/.stats | head -1 | sed 's/.*"\([a-z-]*\)"\$/\1/')
 [ "\$posture" = "writer" ] || { echo "FAIL: guest posture \$posture"; exit 1; }
 jid=\$(grep -o '"joined_appender_id": *[0-9]*' /mnt/j/.stats | head -1 | grep -o '[0-9]*\$')
 echo "GUEST_APPENDER_ID=\$jid"
@@ -2330,10 +2348,15 @@ for f in r["findings"]:
     by_class[f["class"]] = by_class.get(f["class"], 0) + 1
 print(f"post-leave census: findings by class {by_class or {}}")
 assert not r["findings"], f"fsck findings: {by_class}"' "$rowdir/fsck.json" || die "post-leave fsck reports findings (evidence $rowdir/fsck.json)"
-    # Job 5: disconnect the guest's meta controller (zero residue).
+    # Job 5: disconnect the guest's controllers — the meta one job 1 made
+    # and the data one its daemon made (zero residue).
+    local data_nqns_all
+    data_nqns_all="$(echo "$DATA_NQNS" | tr ' ' '\n' | sed "s/^/disconnect_nqn '/; s/\$/'/")"
     {
         guest_job_preamble
-        echo "disconnect_nqn '$meta_nqn'; echo done"
+        echo "disconnect_nqn '$meta_nqn'"
+        echo "$data_nqns_all"
+        echo "echo done"
     } >"$rowdir/job5.sh"
     "$MWFLEET" vm-exec 0 "$rowdir/job5.sh" 120 >"$rowdir/job5.out" 2>&1 || warn "guest disconnect reported errors"
     log "sym-two-host GREEN (pin + join + $creates creates + rm -rf + leave + census; evidence in $rowdir)"

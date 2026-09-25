@@ -1930,6 +1930,31 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             .serialize_into(&mut data, &init_out)
             .expect("won't happened");
 
+        // 0) `fuse.enable_uring=Y` BEFORE the INIT reply lands. Since
+        //    7.2.4 (stable 303b6eeedf29 — "decouple fuse_ring creation from
+        //    ent registration") the kernel creates the connection's ring at
+        //    INIT-REPLY time iff the parameter reads Y then, and a later
+        //    REGISTER on a ring-less connection answers -EINVAL (the pre-
+        //    7.2.4 kernels created it lazily at the first REGISTER, which
+        //    is why `try_start`'s enable — after the reply — ever worked).
+        //    A fresh kernel's first mount (the parameter at its default N:
+        //    every boot of the two-host fixture's guest) registered nothing
+        //    and the required transport failed the mount; the SECOND mount
+        //    succeeded off the first's write. `try_start` keeps its own
+        //    call for the mounts that reach it another way (idempotent).
+        #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
+        {
+            match crate::raw::connection::fuse_over_uring::ensure_kernel_fuse_uring_enabled() {
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    "kernel fuse.enable_uring is off and could not be enabled before the INIT \
+                     reply — every REGISTER of this connection will be refused (need \
+                     CAP_SYS_ADMIN / root: echo Y > /sys/module/fuse/parameters/enable_uring)"
+                ),
+                Err(e) => warn!("fuse.enable_uring pre-INIT probe failed: {e}"),
+            }
+        }
+
         // 1) Classical INIT reply first. Kernel fuse_uring_cmd requires
         //    fch->initialized before REGISTER (returns -EAGAIN otherwise).
         if let Err(err) = fuse_connection
@@ -6916,6 +6941,35 @@ mod delivery_bounds_tests {
 #[cfg(test)]
 mod init_negotiation_tests {
     use super::*;
+
+    /// PR 13i's two-host venue (a qemu/KVM guest booting a fresh 7.2.x
+    /// kernel): since 7.2.4 the kernel creates a connection's FUSE ring at
+    /// INIT-REPLY time iff `fuse.enable_uring` reads Y then, and a REGISTER
+    /// on a ring-less connection answers -EINVAL — so the daemon's
+    /// auto-enable must precede the classical INIT reply in
+    /// `init_filesystem`, never sit inside the post-reply `try_start` alone
+    /// (where a fresh kernel's first mount registered nothing and only the
+    /// second succeeded). A static rail over the source order: the
+    /// pre-INIT enable call comes before the reply's classical write.
+    #[test]
+    fn the_kernel_uring_enable_precedes_the_init_reply() {
+        let src = include_str!("session.rs");
+        let body_start = src
+            .find("async fn init_filesystem(")
+            .expect("init_filesystem exists");
+        let body = &src[body_start..];
+        let enable = body
+            .find("ensure_kernel_fuse_uring_enabled()")
+            .expect("init_filesystem enables fuse.enable_uring itself");
+        let reply = body
+            .find("// 1) Classical INIT reply first.")
+            .expect("the INIT reply step is labelled");
+        assert!(
+            enable < reply,
+            "fuse.enable_uring must be set BEFORE the INIT reply lands (the 7.2.4+ kernel \
+             creates the ring at reply time): enable at {enable}, reply at {reply}"
+        );
+    }
 
     /// L3 transport-economy lever A: the daemon implements NO splice reply
     /// path — on an armed FUSE-over-io_uring session every classical splice

@@ -215,6 +215,62 @@ style (sync — no bucket is ever held across an await); the static rail
 loop is bounded by the shard lease (a wedged worker's shard is retired and
 re-run locally) so `squeezefs fsck` always returns.
 
+**Metadata device I/O is `O_DIRECT` on every host — shared-LUN coherent
+(symmetric PR 13i, F-C1; every layout).** Every metadata read and write
+used to ride the issuing host's block-device page cache (`uring_fs`
+buffered I/O; the DATA path alone opened `O_DIRECT`). On one box that is
+the truth; on two hosts sharing one nvme-tcp LUN it is a stale copy — the
+first two-host cloud row (2026-09-24) found a joiner reading its appender
+page one generation behind the manager, and a qemu/KVM guest sharing the
+laptop's nvmet-tcp namespace reproduced it ×4 with `squeezefs appenders`
+(`tests/run_mw_matrix.sh sym-two-host`, the new two-kernel fixture).
+Design [docs/design-symmetric-metadata.md §5.12](docs/design-symmetric-metadata.md);
+record [.benchmarks/2026-09-19-sym-acceptance.md](.benchmarks/2026-09-19-sym-acceptance.md)
+§3.10 / §4.4ar–at. Now every metadata device path is registered `O_DIRECT`
+at its first read (every door, every offline verb) and at `format`, with
+the I/O grain DERIVED from the device (`statx STATX_DIOALIGN` → the block
+device's `logical_block_size` → 4096) and an aligned form for every
+on-disk shape — every unit but one was already 4 KiB-granular; the journal
+ring pads each commit window's end to the next sector boundary with a
+checksummed PAD entry replay walks as a chain link. **What changes for an
+operator:** nothing on disk (a ring written by an older binary replays
+verbatim; the writer aligns its head with one recovery pad); `.stats` gains
+the `meta_io` object (`meta_io_direct_paths`, `meta_io_buffered_fallback`
+— must stay 0 on any block device, `meta_io_unaligned_refusals` — must stay
+0, `meta_io_bounce_bytes`, `meta_io_read_widened`) and
+`meta_kv_journal_pad_{entries,bytes}`; a file-backed volume on a filesystem
+that refuses `O_DIRECT` takes a LOUD buffered fallback (announced at the
+open, counted), a block device that refuses it refuses the mount. The ring
+pays a derived capacity cost: on a 4 KiB-grain device a commit WINDOW
+occupies whole pages (≤ 4,093 B of pad, ≈ 2 KiB mean — per window, the
+conveyor's whole batch; ≤ 532 B on a 512-byte-grain device), so a serial
+one-transaction-per-window workload's ring runway is the ring's page count
+(8,192 windows on the 32 MiB default) and the cadence's ring-pressure law
+absorbs it — a committer parked at ring admission now wakes the checkpoint
+task at once instead of waiting for the next cadence tick. Two companions
+on the armed symmetric plane: **F-C2** — a joined writer honours the
+manager's `Joined` reply's grant word instead of rebuilding its grant from
+the page it reads next (under the old buffered posture the stale page —
+every cloud-row joiner was write-dead from its join); **F-C3** — the commit
+conveyor's batch-failure fan-out keeps the failing error's CLASS (`KvError`
+/ `SqueezefsError` are `Clone`; the helper that flattened every class but
+I/O and no-space into "corrupt" is deleted), so a retryable
+`GrantExhausted` reaches `mkdir(2)` as `EAGAIN` and never `EINVAL`.
+
+**A fresh kernel's FIRST mount could fail to arm FUSE-over-io_uring (the
+fuse3 fork; every layout — found by PR 13i's two-host fixture).** The
+daemon's auto-enable of `fuse.enable_uring` ran AFTER the classical INIT
+reply; since kernel 7.2.4 the connection's FUSE ring is created at
+INIT-reply time iff the parameter reads Y then, and every later REGISTER
+on a ring-less connection answers `EINVAL` — so the first mount after a
+boot (the parameter at its default N) failed the required transport
+(`kernel rejected protocol err=22`, `FUSE_IO_URING_CMD_REGISTER failed
+err=-22` in dmesg) and only the second mount succeeded. Every earlier venue
+had the parameter at Y from a previous mount. The enable now precedes the
+INIT reply (`init_negotiation_tests::the_kernel_uring_enable_precedes_the_init_reply`
+is the rail); a host whose parameter cannot be written is announced loud
+before the reply, naming the remedy.
+
 ---
 
 # SqueezeFS 1.2.4

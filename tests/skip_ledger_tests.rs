@@ -148,9 +148,20 @@ fn require_flags_are_read_per_class_and_all_is_a_superset() {
         SkipClass::Toolchain,
         SkipClass::Capability,
         SkipClass::OptIn,
+        SkipClass::Venue,
     ] {
         assert!(testkit::required(c), "REQUIRE_ALL covers {}", c.as_str());
     }
+    // The venue class (review round 2, Issue 10 — a rate law's PARTIAL skip
+    // on a thermally throttling host) promotes on its own knob alone.
+    std::env::set_var("SQUEEZEFS_TEST_REQUIRE_VENUE", "1");
+    assert!(testkit::required(SkipClass::Venue));
+    assert!(
+        !testkit::required(SkipClass::Capability),
+        "REQUIRE_VENUE must not promote unrelated classes"
+    );
+    std::env::remove_var("SQUEEZEFS_TEST_REQUIRE_VENUE");
+    assert_eq!(SkipClass::Venue.as_str(), "venue");
     std::env::remove_var("SQUEEZEFS_TEST_REQUIRE_ALL");
 }
 

@@ -450,6 +450,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_M1_ROOT_DEV", Kind::Harness, "-", "Meta-slot migration suite device path."),
     k("SQUEEZEFS_M1_ROOT_VICTIM_KEY", Kind::Harness, "-", "Meta-slot migration suite victim key."),
     k("SQUEEZEFS_TEST_REQUIRE_CAPABILITY", Kind::Harness, "-", "Promote capability-class skips."),
+    k("SQUEEZEFS_TEST_REQUIRE_VENUE", Kind::Harness, "-", "Promote venue-class PARTIAL skips (a rate law left unjudged on a thermally throttling host) to failures — set on the box, where every rate law must judge."),
     k("SQUEEZEFS_RECLAIM_CRASH_CHILD", Kind::Harness, "-", "Block-reclaim crash-suite child marker."),
     k("SQUEEZEFS_RECLAIM_CRASH_DEV", Kind::Harness, "-", "Block-reclaim crash-suite device path."),
     k("SQUEEZEFS_RECLAIM_CRASH_LEDGER", Kind::Harness, "-", "Block-reclaim crash-suite ledger path."),

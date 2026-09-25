@@ -1765,6 +1765,7 @@ Every knob the tree reads, grouped as the registry groups them (`src/env_knobs.r
 | `SQUEEZEFS_M1_ROOT_DEV` | harness | `-` | Meta-slot migration suite device path. |
 | `SQUEEZEFS_M1_ROOT_VICTIM_KEY` | harness | `-` | Meta-slot migration suite victim key. |
 | `SQUEEZEFS_TEST_REQUIRE_CAPABILITY` | harness | `-` | Promote capability-class skips. |
+| `SQUEEZEFS_TEST_REQUIRE_VENUE` | harness | `-` | Promote venue-class PARTIAL skips (a rate law left unjudged on a thermally throttling host) to failures — set on the box, where every rate law must judge. |
 | `SQUEEZEFS_RECLAIM_CRASH_CHILD` | harness | `-` | Block-reclaim crash-suite child marker. |
 | `SQUEEZEFS_RECLAIM_CRASH_DEV` | harness | `-` | Block-reclaim crash-suite device path. |
 | `SQUEEZEFS_RECLAIM_CRASH_LEDGER` | harness | `-` | Block-reclaim crash-suite ledger path. |

@@ -11737,11 +11737,16 @@ async fn floor_ring_storm(
 /// (the matrix's compile burst soaks it to Tctl 100 °C before this suite
 /// runs; the same code read the ratio at 11–12 % of the compactions
 /// there and 3/3 under 10 % cool). The pin waits a bounded while for the
-/// host to cool, samples the thermal word around the storm, and judges
-/// the two rate laws only on a host that was not throttling — a throttled
-/// draw prints the reading as venue-attributed; the structural laws (the
-/// ring's growth, the bounded declines, the cadence, every acked name,
-/// the must-stay-0 gauges, fsck) judge on every host.
+/// host to cool, samples the thermal word around the storm (`temp1_crit`
+/// only — no exposed throttle point is NO word, and the laws judge), and
+/// judges the two rate laws only on a host that was not throttling; a
+/// throttled draw declares a LEDGERED partial skip (`SkipClass::Venue` —
+/// `##SQUEEZEFS-SKIP##` on the uncaptured handle with the Tctl reading and
+/// every unjudged reading in its reason, promoted to a FAILURE by
+/// `SQUEEZEFS_TEST_REQUIRE_VENUE=1` on the box, where the laws must
+/// judge; review round 2, Issue 10); the structural laws (the ring's
+/// growth, the bounded declines, the cadence, every acked name, the
+/// must-stay-0 gauges, fsck) judge on every host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycles_its_grant() {
     use squeezefs::meta_backend::kv::appender::{GRANT_EXTENTS_FLOOR, SYM_RING_FLOOR_BYTES};
@@ -11758,16 +11763,18 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
     }
     let thermal = |tag: &str| -> (bool, String) {
         match squeezefs_testkit::host_package_temp_millic() {
-            Some((t, limit)) => (
-                squeezefs_testkit::host_thermally_throttled() == Some(true),
+            Some((t, crit)) => (
+                t >= crit,
                 format!(
-                    "{tag} Tctl {:.1} °C (throttle point {:.1} °C)",
+                    "{tag} Tctl {:.1} °C (temp1_crit {:.1} °C)",
                     t as f64 / 1000.0,
-                    limit.unwrap_or(squeezefs_testkit::HOST_THERMAL_THROTTLE_MILLIC) as f64
-                        / 1000.0
+                    crit as f64 / 1000.0
                 ),
             ),
-            None => (false, format!("{tag} no thermal sensor")),
+            None => (
+                false,
+                format!("{tag} no exposed throttle point — the rate laws judge"),
+            ),
         }
     };
     let (hot_before, word_before) = thermal("before the storm");
@@ -11784,14 +11791,10 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
     ) = floor_ring_storm(2, 1, storm).await;
     let (hot_after, word_after) = thermal("after the storm");
     let venue_hot = hot_before || hot_after;
-    eprintln!(
-        "F-R5 venue: {word_before}; {word_after}{}",
-        if venue_hot {
-            " — THROTTLED: the rate laws below are venue-attributed, not judged"
-        } else {
-            ""
-        }
-    );
+    eprintln!("F-R5 venue: {word_before}; {word_after}");
+    // The readings the venue leaves unjudged — one ledger line names them
+    // all (declared after the loop, where an assertion would have stood).
+    let mut unjudged: Vec<String> = Vec::new();
     for (i, f) in faces.iter().enumerate() {
         let [a, b, c, d] = f;
         eprintln!("F-R5 joiner {i}: start {a:?}");
@@ -11951,12 +11954,12 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
         let pool = c.grant_claimed + c.grant_unclaimed;
         let cap_bound = pool + GRANT_EXTENTS_FLOOR >= c.wire_cap;
         if venue_hot {
-            eprintln!(
-                "F-R5 joiner {i}: VENUE-ATTRIBUTED — `extent_grant_returned` +{returned} over \
-                 {compactions} compactions, the pool at {pool} under a cap of {} (the law reads \
-                 returns × 10 ≤ compactions or the cap binding; no verdict on a throttled host)",
+            unjudged.push(format!(
+                "joiner {i} law 3 (returns × 10 ≤ compactions or the cap binding): \
+                 extent_grant_returned +{returned} over {compactions} compactions, pool {pool} \
+                 under cap {}",
                 c.wire_cap
-            );
+            ));
         } else {
             assert!(
                 returned * 10 <= compactions || cap_bound,
@@ -11981,14 +11984,13 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
         // to this storm's length, the law is an order of magnitude under it.
         let base_verbs = 197 * storm.as_secs() / 8;
         if venue_hot {
-            eprintln!(
-                "F-R5 joiner {i}: VENUE-ATTRIBUTED — {verbs} manager verbs over the storm ({} \
-                 grants, {} returns, {} grows) against the base's {base_verbs}; no verdict on a \
-                 throttled host",
+            unjudged.push(format!(
+                "joiner {i} verbs law (verbs × 10 ≤ the base's {base_verbs}): {verbs} manager \
+                 verbs ({} grants, {} returns, {} grows)",
                 c.wire_grants - a.wire_grants,
                 c.wire_returns - a.wire_returns,
                 c.wire_ring_grows - a.wire_ring_grows
-            );
+            ));
         } else {
             assert!(
                 verbs * 10 <= base_verbs,
@@ -12001,6 +12003,21 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
                 storm.as_secs()
             );
         }
+    }
+    if !unjudged.is_empty() {
+        // A PARTIAL skip: the rate laws above took no verdict on a
+        // throttling host and the ledger says so (promoted to a failure
+        // under SQUEEZEFS_TEST_REQUIRE_VENUE); the structural laws below
+        // still judge, so the test goes on.
+        let _ = squeezefs_testkit::declare(
+            squeezefs_testkit::site!(),
+            squeezefs_testkit::SkipClass::Venue,
+            &format!(
+                "the host was thermally throttling ({word_before}; {word_after}) — the F-R5 \
+                 storm's RATE laws took no verdict: {}",
+                unjudged.join("; ")
+            ),
+        );
     }
     // Every acked name resolves at its creator, the manager reads them
     // too after the leaves, nothing lost.

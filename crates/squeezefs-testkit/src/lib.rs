@@ -75,6 +75,13 @@ pub enum SkipClass {
     Capability,
     /// Opt-in scenario: the test only runs when an env var selects it.
     OptIn,
+    /// The VENUE cannot carry a verdict on a rate-shaped law: the host was
+    /// thermally throttling while the contract's storm ran (the owner's
+    /// ruling — a laptop number holds no merit; the box judges). A PARTIAL
+    /// skip by design: the contract's structural laws still judge, the
+    /// rate laws it names in the reason do not. **The class the box's
+    /// bracket refuses to tolerate** — every rate law must judge there.
+    Venue,
 }
 
 impl SkipClass {
@@ -90,6 +97,7 @@ impl SkipClass {
             SkipClass::Toolchain => "toolchain",
             SkipClass::Capability => "capability",
             SkipClass::OptIn => "opt-in",
+            SkipClass::Venue => "venue",
         }
     }
 
@@ -105,6 +113,7 @@ impl SkipClass {
             SkipClass::Toolchain => "SQUEEZEFS_TEST_REQUIRE_TOOLCHAIN",
             SkipClass::Capability => "SQUEEZEFS_TEST_REQUIRE_CAPABILITY",
             SkipClass::OptIn => "SQUEEZEFS_TEST_REQUIRE_OPT_IN",
+            SkipClass::Venue => "SQUEEZEFS_TEST_REQUIRE_VENUE",
         }
     }
 }
@@ -470,17 +479,26 @@ pub fn host_clock_throttled() -> bool {
 
 /// The package temperature the host's CPU sensor reports, in millidegrees
 /// C (hwmon `k10temp` Tctl / `zenpower` / `coretemp`'s first sensor), with
-/// the throttle point hwmon exposes beside it (`temp*_crit`, else
-/// `temp*_max`) — `None` where no such sensor exists (a VM, a container).
-/// The venue word [`host_clock_cap_ratio`] cannot see: a CPU that sheds
-/// clock ITSELF at its thermal limit leaves `scaling_max_freq` at hardware
-/// max (the dev box read 3.9 → 3.0 GHz between Tctl 93 and 100 °C with the
-/// cap untouched), so a rate-shaped contract judged after a compile burst
-/// needs the temperature, not the governor's cap.
-pub fn host_package_temp_millic() -> Option<(i64, Option<i64>)> {
-    let hwmon = std::fs::read_dir("/sys/class/hwmon").ok()?;
-    for entry in hwmon.flatten() {
-        let dir = entry.path();
+/// the THROTTLE POINT the sensor exposes as `temp1_crit` — `None` where no
+/// such sensor exists (a VM, a container) OR where it exposes no `crit`:
+/// `temp1_max` is NEVER read (k10temp fixes it at 70 °C for Tctl on many
+/// Zen parts — a fixed label, not a throttle point — under which a rate
+/// law would be excused at any load), and no venue word means no excuse
+/// (the contract judges). The word [`host_clock_cap_ratio`] cannot carry:
+/// a CPU that sheds clock ITSELF at its thermal limit leaves
+/// `scaling_max_freq` at hardware max (the dev box read 3.9 → 3.0 GHz
+/// between Tctl 93 and 100 °C with the cap untouched).
+pub fn host_package_temp_millic() -> Option<(i64, i64)> {
+    host_package_temp_millic_in(Path::new("/sys/class/hwmon"))
+}
+
+/// [`host_package_temp_millic`] over an hwmon tree rooted at `hwmon_root`
+/// (the unit pins drive it with fake trees).
+pub fn host_package_temp_millic_in(hwmon_root: &Path) -> Option<(i64, i64)> {
+    let hwmon = std::fs::read_dir(hwmon_root).ok()?;
+    let mut entries: Vec<PathBuf> = hwmon.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for dir in entries {
         let name = std::fs::read_to_string(dir.join("name")).unwrap_or_default();
         if !matches!(name.trim(), "k10temp" | "zenpower" | "coretemp") {
             continue;
@@ -495,25 +513,20 @@ pub fn host_package_temp_millic() -> Option<(i64, Option<i64>)> {
         let Some(input) = read("temp1_input") else {
             continue;
         };
-        let limit = read("temp1_crit").or_else(|| read("temp1_max"));
-        return Some((input, limit));
+        // `temp1_crit` ONLY — see the doc.
+        return read("temp1_crit").map(|crit| (input, crit));
     }
     None
 }
 
-/// The throttle point assumed where hwmon exposes none (millidegrees C):
-/// AMD's Tctl is normalized so the package sheds clock approaching 100 °C
-/// — the dev box measured it from ≈ 93 °C — so 95 °C is the word's edge.
-pub const HOST_THERMAL_THROTTLE_MILLIC: i64 = 95_000;
-
-/// `Some(true)` while the host's package temperature stands at or past its
-/// throttle point (the sensor's own, else [`HOST_THERMAL_THROTTLE_MILLIC`])
-/// — a rate-shaped contract takes no verdict on such a host (the owner's
-/// venue ruling: no laptop number holds merit, a throttled row is
-/// venue-attributed); `Some(false)` when cool; `None` with no sensor.
+/// `Some(true)` while the host's package temperature stands at or past
+/// the throttle point its sensor exposes (`temp1_crit`) — a rate-shaped
+/// contract declares a [`SkipClass::Venue`] partial skip for its rate laws
+/// on such a host; `Some(false)` when cool; `None` with no sensor or no
+/// exposed throttle point (the contract judges).
 pub fn host_thermally_throttled() -> Option<bool> {
-    let (input, limit) = host_package_temp_millic()?;
-    Some(input >= limit.unwrap_or(HOST_THERMAL_THROTTLE_MILLIC))
+    let (input, crit) = host_package_temp_millic()?;
+    Some(input >= crit)
 }
 
 #[cfg(test)]
@@ -532,6 +545,7 @@ mod tests {
             SkipClass::Toolchain,
             SkipClass::Capability,
             SkipClass::OptIn,
+            SkipClass::Venue,
         ];
         let mut seen: Vec<&str> = all.iter().map(|c| c.as_str()).collect();
         seen.sort_unstable();
@@ -543,6 +557,58 @@ mod tests {
             SkipClass::Mount.require_var(),
             "SQUEEZEFS_TEST_REQUIRE_MOUNT"
         );
+    }
+
+    /// The thermal word's reading law over fake hwmon trees (review round 2,
+    /// Issue 10): `temp1_crit` is the ONE throttle point — a tree exposing
+    /// only `temp1_max` (k10temp's fixed 70 °C label) answers `None`, and so
+    /// does a tree with neither or with no CPU sensor at all; a foreign
+    /// sensor (an NVMe drive's) is never the package word.
+    #[test]
+    fn thermal_probe_reads_temp1_crit_only() {
+        let root = std::env::temp_dir().join(format!("sqz-hwmon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mk = |name: &str, files: &[(&str, &str)]| {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            for (f, v) in files {
+                std::fs::write(d.join(f), v).unwrap();
+            }
+        };
+        // crit present: (input, crit) read verbatim.
+        mk(
+            "hwmon0",
+            &[
+                ("name", "nvme\n"),
+                ("temp1_input", "41000\n"),
+                ("temp1_crit", "85000\n"),
+            ],
+        );
+        mk(
+            "hwmon1",
+            &[
+                ("name", "k10temp\n"),
+                ("temp1_label", "Tctl\n"),
+                ("temp1_input", "96500\n"),
+                ("temp1_crit", "95000\n"),
+            ],
+        );
+        assert_eq!(host_package_temp_millic_in(&root), Some((96_500, 95_000)));
+        // max-only: NOT a throttle point — no word.
+        std::fs::remove_file(root.join("hwmon1/temp1_crit")).unwrap();
+        std::fs::write(root.join("hwmon1/temp1_max"), "70000\n").unwrap();
+        assert_eq!(
+            host_package_temp_millic_in(&root),
+            None,
+            "temp1_max is never read"
+        );
+        // neither: no word.
+        std::fs::remove_file(root.join("hwmon1/temp1_max")).unwrap();
+        assert_eq!(host_package_temp_millic_in(&root), None);
+        // no CPU sensor at all (the NVMe drive's crit is not the package's).
+        std::fs::remove_dir_all(root.join("hwmon1")).unwrap();
+        assert_eq!(host_package_temp_millic_in(&root), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

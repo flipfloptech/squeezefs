@@ -2902,7 +2902,12 @@ async fn a_striped_directory_in_a_dead_lessees_slot_recovers_with_its_map_and_c1
     reset_process_state();
     let (uris, shared) = seeded_volume(dir.path(), SLOT_A).await;
     let x = foreign(41);
-    let routed = open_under_retry(&uris, &Knobs::armed().partition("1:4"))
+    // The premise is an UNCOVERED window at the kill: the flip's map, the
+    // seed's migration and the 24 creates are ≈ 100 windows in the
+    // declared region's ring — a page each under the sector-pad law — so
+    // the ring is sized past the floor's 64, else a parked committer's
+    // kick covers the window before the kill (PR 13i).
+    let routed = open_under_retry(&uris, &Knobs::armed().partition("1:4").ring_kb("4096"))
         .await
         .expect("open with the partition");
     let venue = HoldersVenue::stand_up(&routed, &[1]).await;

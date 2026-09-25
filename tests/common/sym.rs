@@ -86,6 +86,13 @@ pub struct Knobs {
     pub mint_slots: Option<&'static str>,
     pub affinity_mb: Option<&'static str>,
     pub t_idle_ms: Option<&'static str>,
+    /// `SQUEEZEFS_SYM_RING_KB` — a declared region's ring, KiB. A fixture
+    /// whose premise is an UNCOVERED window at the kill sizes the ring for
+    /// its storm: under the sector-pad law (PR 13i) a serial commit is one
+    /// page of ring on a 4 KiB-grain sandbox, the floor ring holds 64 of
+    /// them, and a committer parked at a full ring kicks the cycle that
+    /// covers the window.
+    pub ring_kb: Option<&'static str>,
 }
 
 impl Knobs {
@@ -96,6 +103,7 @@ impl Knobs {
             mint_slots: None,
             affinity_mb: None,
             t_idle_ms: None,
+            ring_kb: None,
         }
     }
     pub fn unarmed() -> Self {
@@ -118,6 +126,10 @@ impl Knobs {
     }
     pub fn t_idle_ms(mut self, ms: &'static str) -> Self {
         self.t_idle_ms = Some(ms);
+        self
+    }
+    pub fn ring_kb(mut self, kb: &'static str) -> Self {
+        self.ring_kb = Some(kb);
         self
     }
     pub fn apply(&self) {
@@ -143,6 +155,10 @@ impl Knobs {
             Some(ms) => std::env::set_var(SYM_T_IDLE_MS_ENV, ms),
             None => std::env::remove_var(SYM_T_IDLE_MS_ENV),
         }
+        match self.ring_kb {
+            Some(kb) => std::env::set_var("SQUEEZEFS_SYM_RING_KB", kb),
+            None => std::env::remove_var("SQUEEZEFS_SYM_RING_KB"),
+        }
     }
     pub fn clear() {
         for k in [
@@ -152,6 +168,7 @@ impl Knobs {
             SYM_MINT_SLOTS_ENV,
             SYM_AFFINITY_MAX_MB_ENV,
             SYM_T_IDLE_MS_ENV,
+            "SQUEEZEFS_SYM_RING_KB",
         ] {
             std::env::remove_var(k);
         }

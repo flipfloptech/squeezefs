@@ -1729,17 +1729,21 @@ async fn checkpoint_task(
         let Some(be) = weak.upgrade() else {
             return; // backend dropped without shutdown: exit, leak nothing
         };
-        // A wake under RING PRESSURE is a tick (PR 13i): a committer parked
-        // at ring admission kicks this task (`admit_user_budget`) and the
+        // A PARKED committer's wake under RING PRESSURE is a tick (PR 13i):
+        // `admit_user_budget` kicks this task with the park's mark and the
         // drain it needs is a CYCLE with `barrier_now` — the maintenance
         // pass below appends and reclaims nothing — so the park never
         // waits out the cadence deadline (under the sector-pad law a
         // serial commit occupies a whole page of ring on a 4 KiB-grain
         // device: a 1 MiB ring fills in 192 commits, and a 60 s cadence
-        // took a parked pass through the D1.b escalation twice over).
-        // The decision itself stays `decide_checkpoint`'s: the pressure
-        // law is what makes the cycle due.
-        if woke && !cadence && ring_under_pressure(&be) {
+        // took a parked pass through the D1.b escalation twice over). A
+        // THRESHOLD wake never carries the mark, so the shipped cadence's
+        // pressure law fires where it did (a cycle per threshold wake past
+        // half a ring would be the checkpoint storm the fixed deadline
+        // exists to prevent). The decision itself stays
+        // `decide_checkpoint`'s: the pressure law is what makes it due.
+        let park_kick = be.take_ring_park_kick();
+        if woke && !cadence && park_kick && ring_under_pressure(&be) {
             cadence = true;
             next_tick = std::time::Instant::now() + period_now;
         }

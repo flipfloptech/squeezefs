@@ -11350,7 +11350,7 @@ fn supply_faces(vol: &KvMetaBackend) -> SupplyFaces {
 /// test-side `checkpoint_now`. Returns every joiner with its directory
 /// and the faces read at the storm's start, its first quarter, its third
 /// quarter and its end, plus the manager's `(extent_grants, extent_returns,
-/// manager_verbs)` deltas over the storm.
+/// manager_verbs, grow_ring_short_declines)` deltas over the storm.
 async fn floor_ring_storm(
     joiners: usize,
     creators: usize,
@@ -11363,7 +11363,7 @@ async fn floor_ring_storm(
     HoldersVenue,
     Vec<StormDaemon>,
     Vec<[SupplyFaces; 4]>,
-    (u64, u64, u64),
+    (u64, u64, u64, u64),
 ) {
     let dir = cadence_venue_dir();
     // A volume wide enough that the derived grant's heap-share cap (a
@@ -11466,6 +11466,7 @@ async fn floor_ring_storm(
         m1.extent_grants - m0.extent_grants,
         m1.extent_returns - m0.extent_returns,
         m1.manager_verbs - m0.manager_verbs,
+        m1.grow_ring_short_declines - m0.grow_ring_short_declines,
     );
     (dir, uris, manager, mvol, venue, daemons, faces, mgr)
 }
@@ -11518,8 +11519,16 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
     let _g = SEAM.lock().await;
     reset_process_state();
     let storm = std::time::Duration::from_secs(12);
-    let (dir, uris, manager, mvol, venue, daemons, faces, (mgr_grants, mgr_returns, mgr_verbs)) =
-        floor_ring_storm(2, 1, storm).await;
+    let (
+        dir,
+        uris,
+        manager,
+        mvol,
+        venue,
+        daemons,
+        faces,
+        (mgr_grants, mgr_returns, mgr_verbs, mgr_short_declines),
+    ) = floor_ring_storm(2, 1, storm).await;
     for (i, f) in faces.iter().enumerate() {
         let [a, b, c, d] = f;
         eprintln!("F-R5 joiner {i}: start {a:?}");
@@ -11559,10 +11568,23 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
             c.stalls - a.stalls,
             c.pressure_cycles - a.pressure_cycles
         );
-        assert_eq!(
-            c.grow_declined - a.grow_declined,
-            0,
-            "joiner {i}: a healthy storm declines no growth"
+        // Declines are BOUNDED, never a verb per cycle (PR 13i): on a 4 KiB-
+        // grain sandbox the sector-pad law makes a serial create one page
+        // of ring, so this storm's derived ring is ≈ 18× the byte-grain
+        // shape's and the asks reach the per-appender ceiling, the set-wide
+        // `heap/16` budget and the heap's run shape (PR 13g's short-run
+        // class) INSIDE the storm on this small volume — legitimate
+        // answers a joiner re-probes only on a fresh stall (`grow_declined_at`
+        // latches the ring size a decline named). The law reads the count
+        // against the stalls that re-probed plus the manager's short-run
+        // declines set-wide; the ring itself grew past the floor above.
+        let declines = c.grow_declined - a.grow_declined;
+        let stalls = c.stalls - a.stalls;
+        assert!(
+            declines <= stalls + mgr_short_declines + 1,
+            "joiner {i}: {declines} growth declines over the storm against {stalls} stalls + \
+             {mgr_short_declines} short-run declines set-wide — a joiner re-asked a limit the \
+             manager had already named (the pre-13i verb-per-cycle shape)"
         );
         // The cycle rate falls to the cadence's: at the derived ring
         // (two max-ages of the stream) the pressure law — half the

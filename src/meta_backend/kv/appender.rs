@@ -2547,6 +2547,13 @@ pub struct AppenderRegion {
     pub stalls: std::sync::atomic::AtomicU64,
     /// `stalls` as of the last growth decision — growth fires when it moved.
     pub stalls_at_last_grow: std::sync::atomic::AtomicU64,
+    /// The ring size at which the manager last DECLINED this region's
+    /// `GrowRing` (`u64::MAX` = none): a joiner asks again only once its
+    /// ring changed or a fresh stall arrived — never a verb per cycle at
+    /// a ceiling or an exhausted budget the manager already named
+    /// (PR 13i: the sector-pad law's ring demand reaches both inside one
+    /// storm on a small volume).
+    pub grow_declined_at: std::sync::atomic::AtomicU64,
     /// Growth events (`appender_ring_grows`).
     pub ring_grows: std::sync::atomic::AtomicU64,
     /// `(tail, barrier push epoch)` pushed per page write, drained by the

@@ -2103,6 +2103,13 @@ impl KvMetaBackend {
         if derived <= current && !stalled {
             return;
         }
+        // A decline the manager already gave at THIS ring size stands until
+        // the ring changes or a fresh stall arrives (the ceiling and the
+        // set-wide budget move with joins and leaves, which the next stall
+        // re-probes) — never a verb per cycle against a named limit.
+        if !stalled && region.grow_declined_at.load(Ordering::Relaxed) == current {
+            return;
+        }
         // One step is at least a DOUBLING (PR 2's law — a segment of the
         // ring's own size): the table holds `RING_SEGMENTS_MAX` segments,
         // so a ring that followed a converging EWMA by its increments
@@ -2120,6 +2127,7 @@ impl KvMetaBackend {
         }
         if ring.segments().len() >= super::super::appender::RING_SEGMENTS_MAX {
             region.stalls_at_last_grow.store(stalls, Ordering::Relaxed);
+            region.grow_declined_at.store(current, Ordering::Relaxed);
             wire.grow_declined.fetch_add(1, Ordering::Relaxed);
             log::debug!(
                 "meta volume {}: joined appender {}'s ring wants {target} bytes (derived {derived}, \
@@ -2231,6 +2239,7 @@ impl KvMetaBackend {
             Ok(Some((start, len))) => super::super::superblock::ExtentRef { start, len },
             Ok(None) => {
                 region.stalls_at_last_grow.store(stalls, Ordering::Relaxed);
+                region.grow_declined_at.store(current, Ordering::Relaxed);
                 region.end_growth();
                 wire.grow_declined.fetch_add(1, Ordering::Relaxed);
                 log::info!(
@@ -2327,6 +2336,7 @@ impl KvMetaBackend {
         region.ring.store(Arc::new(grown));
         region.ring_grows.fetch_add(1, Ordering::Relaxed);
         region.stalls_at_last_grow.store(stalls, Ordering::Relaxed);
+        region.grow_declined_at.store(u64::MAX, Ordering::Relaxed);
         wire.ring_grows.fetch_add(1, Ordering::Relaxed);
         region.end_growth();
         log::info!(

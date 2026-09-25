@@ -728,8 +728,15 @@ async fn an_armed_reader_observes_the_writer_advancing_and_purges_its_tiers() {
         .unwrap();
     writer.checkpoint_now().await.expect("checkpoint");
 
+    // The poller's clock is an argument (its seam): the second poll is
+    // placed one interval past the first, so the contract reads the
+    // OBSERVATION and never the wall the create + checkpoint took (under
+    // O_DIRECT on a tmpfs sandbox the pair completes inside 1 ms).
     let advanced = poller
-        .poll_at(&reader, std::time::Instant::now())
+        .poll_at(
+            &reader,
+            std::time::Instant::now() + std::time::Duration::from_millis(2),
+        )
         .await
         .expect("the poll must succeed")
         .expect("the poll was due");

@@ -1440,6 +1440,12 @@ pub struct KvMetaBackend {
     /// liveness probe (`Weak<()>` of the token the task owns).
     shutting_down: AtomicBool,
     ckpt_wake: Arc<squeezefs_ipc::sqz_notify::Notify>,
+    /// Set by a committer PARKED at ring admission before it wakes the
+    /// checkpoint task (PR 13i): the task reads a wake carrying it, under
+    /// ring pressure, as a tick — a cycle, never the maintenance pass
+    /// alone. A threshold wake never sets it, so the shipped cadence's
+    /// pressure law fires where it did.
+    ring_park_kick: AtomicBool,
     ckpt_join: std::sync::Mutex<Option<squeezefs_ipc::sqz_channel::oneshot::Receiver<bool>>>,
     ckpt_alive: std::sync::Mutex<Weak<()>>,
 
@@ -3270,6 +3276,7 @@ impl KvMetaBackend {
             barrier_durable: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
             ckpt_wake: Arc::new(squeezefs_ipc::sqz_notify::Notify::new()),
+            ring_park_kick: AtomicBool::new(false),
             ckpt_join: std::sync::Mutex::new(None),
             ckpt_alive: std::sync::Mutex::new(Weak::new()),
             pending_times: scc::HashMap::new(),
@@ -16544,6 +16551,18 @@ impl KvMetaBackend {
         self.checkpoint_wake().notify_one();
     }
 
+    /// A committer parked at ring admission wakes the checkpoint task with
+    /// the park's mark (PR 13i — see `ring_park_kick`).
+    fn kick_checkpoint_for_ring_park(&self) {
+        self.ring_park_kick.store(true, Ordering::Release);
+        self.checkpoint_wake().notify_one();
+    }
+
+    /// Consume the park mark a wake carried (the checkpoint task's read).
+    pub(super) fn take_ring_park_kick(&self) -> bool {
+        self.ring_park_kick.swap(false, Ordering::AcqRel)
+    }
+
     pub(super) fn checkpoint_wake(&self) -> Arc<squeezefs_ipc::sqz_notify::Notify> {
         self.ckpt_wake.clone()
     }
@@ -20260,6 +20279,7 @@ impl KvMetaBackend {
             durable_tail: AtomicU64::new(ledger.journal_tail_seq),
             stalls: AtomicU64::new(0),
             stalls_at_last_grow: AtomicU64::new(0),
+            grow_declined_at: AtomicU64::new(u64::MAX),
             ring_grows: AtomicU64::new(0),
             pending_reclaim: std::sync::Mutex::new(Vec::new()),
             passes_inside: std::sync::atomic::AtomicUsize::new(0),
@@ -20546,6 +20566,7 @@ impl KvMetaBackend {
                 leases_writer: std::sync::Mutex::new(()),
                 stalls: AtomicU64::new(0),
                 stalls_at_last_grow: AtomicU64::new(0),
+                grow_declined_at: AtomicU64::new(u64::MAX),
                 ring_grows: AtomicU64::new(0),
                 pending_reclaim: std::sync::Mutex::new(Vec::new()),
                 passes_inside: std::sync::atomic::AtomicUsize::new(0),
@@ -23426,13 +23447,13 @@ impl KvMetaBackend {
             // A parked committer is the ring's pressure signal itself: wake
             // the checkpoint task NOW rather than at its next cadence tick
             // (the drain that frees ring space — §4.4 pt 5's liveness
-            // shape; the tick's own pressure law then makes the cycle due).
-            // Load-bearing under the sector-pad law (PR 13i): a serial
-            // commit occupies a whole page of ring on a 4 KiB-grain device,
-            // so a ring fills tens of times sooner than its byte count
-            // suggests and a park behind a long cadence would otherwise
-            // reach the D1.b escalation below.
-            self.kick_checkpoint();
+            // shape; the task reads the park's mark under the pressure law
+            // as a tick). Load-bearing under the sector-pad law (PR 13i): a
+            // serial commit occupies a whole page of ring on a 4 KiB-grain
+            // device, so a ring fills tens of times sooner than its byte
+            // count suggests and a park behind a long cadence would
+            // otherwise reach the D1.b escalation below.
+            self.kick_checkpoint_for_ring_park();
             let since = *parked_since.get_or_insert_with(std::time::Instant::now);
             let until_crossing = threshold
                 .saturating_sub(since.elapsed())

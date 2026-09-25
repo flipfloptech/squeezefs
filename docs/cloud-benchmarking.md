@@ -238,10 +238,13 @@ step: **`/etc/machine-id` distinct across the client nodes** — the daemon's
 node token, half of the `(node_token, mount_slot)` identity every appender
 page, claim-set entry and membership record carries, is derived from it
 (`src/writer_scope.rs`); a baked AMI clones the file onto every node, and
-the 2026-09-24 run's first assemble failed at the mounts because every
-joiner carried the manager's identity — a clone is regenerated
-(`systemd-machine-id-setup` after truncating the file), re-read and
-re-asserted, a duplicate still standing dies loud. Every node is also its
+the 2026-09-24 run's first assemble "failed on the cloned `/etc/machine-id`
+(= the node token)" — every joiner carried the manager's identity (derived
+from the identity law; where in the join ladder it failed is not known) — a
+clone is regenerated (a regular-file `/var/lib/dbus/machine-id` removed
+first — `systemd-machine-id-setup` seeds from it — then the file truncated
+and the setup run, the dbus copy recreated), re-read and re-asserted, a
+duplicate still standing dies loud. Every node is also its
 **own registrant** — the REMOTE posture: the node's
 nvme-cli host identity (`/etc/nvme/hostnqn` + `hostid`), generated where
 missing and **asserted distinct across the client nodes — both words**

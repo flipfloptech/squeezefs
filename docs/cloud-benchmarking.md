@@ -53,7 +53,7 @@ venue exists only for the final sustained verdict.
 | `i4i` (default) | `i4i.4xlarge` | ×6 (96 vCPU) | 1 × 3,750 GB Nitro NVMe | ~$12–17/hr on-demand, ~$3–4/hr spot | IOPS |
 | `i3en` | `i3en.12xlarge` | ×6 (288 vCPU) | 4 × 7,500 GB NVMe | ~$30–45/hr on-demand, ~$10–14/hr spot | throughput |
 | `mw` | `i4i.2xlarge` | ×4 (32 vCPU) | 1 × 1,875 GB Nitro NVMe | ~$2.7–2.8/hr on-demand, ~$0.5–0.8/hr spot | multi-writer MPI-IO (`s11-mpiio`) |
-| `mw` + `SYMMETRIC=1 N_CLIENT=n` | `i4i.2xlarge` | ×(N_MDS+N_OSS+n) — at the default 1 mds + 2 oss: S1 n=3: ×6 (48 vCPU), S2 n=8: ×11 (88 vCPU); S2 + `N_OSS=8` (the 2026-09-24 approved shape): ×17 (136 vCPU) | 1 × 1,875 GB Nitro NVMe | ~$0.686/hr per node on-demand, **every node bills**: S1 ~$4.1/hr, S2 ~$7.5/hr, S2 + 8 oss ~$11.7/hr (the rig's `EST_CLUSTER_HOURLY` prices `N_MDS + N_OSS + N_CLIENT + N_SPARE` — the 2026-09-24 run's typed-YES line had priced 11 of its 17 nodes) | symmetric gates 2 / 3 / 3b on N real nodes (PR 15) |
+| `mw` + `SYMMETRIC=1 N_CLIENT=n` | `i4i.2xlarge` | ×(N_MDS + N_OSS + n + N_SPARE) — at the default 1 mds + 2 oss + 0 spare: S1 n=3: ×6 (48 vCPU), S2 n=8: ×11 (88 vCPU); S2 + `N_OSS=8` (the 2026-09-24 approved shape): ×17 (136 vCPU) | 1 × 1,875 GB Nitro NVMe | ~$0.686/hr per node on-demand, **every node bills**: S1 ~$4.1/hr, S2 ~$7.5/hr, S2 + 8 oss ~$11.7/hr (the rig's `EST_CLUSTER_HOURLY` prices `N_MDS + N_OSS + N_CLIENT + N_SPARE` — the 2026-09-24 run's typed-YES line had priced 11 of its 17 nodes) | symmetric gates 2 / 3 / 3b on N real nodes (PR 15) |
 | `custom` | `INSTANCE_TYPE` verbatim | — | — | — | (still burst-class-refused) |
 
 Roles are preset-dependent (an explicit `N_MDS`/`N_OSS`/`N_CLIENT`/`N_SPARE`

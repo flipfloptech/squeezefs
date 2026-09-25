@@ -14,8 +14,9 @@
 #   * Spot vCPU quota for the preset ("All Standard (A, C, D, H, I, M, R, T,
 #     Z) Spot Instance Requests"): i4i preset needs 96 vCPUs, i3en preset
 #     needs 288 vCPUs, mw preset needs 32 vCPUs (SYMMETRIC=1: 8 x EVERY node
-#     = 8 x (N_MDS + N_OSS + N_CLIENT) — S1 N_CLIENT=3 48, S2 N_CLIENT=8 88
-#     at the default 1 mds + 2 oss, 136 at S2 + N_OSS=8).
+#     = 8 x (N_MDS + N_OSS + N_CLIENT + N_SPARE) — S1 N_CLIENT=3 48, S2
+#     N_CLIENT=8 88 at the default 1 mds + 2 oss + 0 spare, 136 at S2 +
+#     N_OSS=8).
 #   * Pre-built artifacts in $ARTIFACT_DIR (this script DEPLOYS, it does not
 #     build): `squeezefs` (linux-gnu, glibc ≤ the AMI's — use the
 #     `task build:ubuntu2404` dist output; the mw preset rides the Ubuntu
@@ -34,8 +35,8 @@
 #   i3en    i3en.12xlarge   x6 (288 vCPU)      4 x 7,500 GB NVMe          ~$10-14/hr (the throughput venue)
 #   mw      i4i.2xlarge     x4 (32 vCPU)       1 x 1,875 GB Nitro NVMe    ~$0.5-0.8/hr (the MW MPI-IO venue;
 #                                                                          campaign ~2-3 h => ~$1.5-3 total)
-#   mw+SYMMETRIC=1 N_CLIENT=n: x(N_MDS+N_OSS+n) i4i.2xlarge, ~$0.686/hr on-demand per node
-#           (EVERY node bills) — at the default 1 mds + 2 oss: S1 (n=3) x6 ~$4.1/hr,
+#   mw+SYMMETRIC=1 N_CLIENT=n: x(N_MDS + N_OSS + n + N_SPARE) i4i.2xlarge, ~$0.686/hr on-demand
+#           per node (EVERY node bills) — at the default 1 mds + 2 oss + 0 spare: S1 (n=3) x6 ~$4.1/hr,
 #           S2 (n=8) x11 ~$7.5/hr (n=2: x5 ~$3.4/hr, gates 2 + 3 only);
 #           S2 + N_OSS=8 (the 2026-09-24 approved shape) x17 ~$11.7/hr
 #

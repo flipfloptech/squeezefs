@@ -146,7 +146,13 @@ deltas stated where they happen:
    `--force` — a re-assemble meets the previous assemble's superblock
    (`wipefs -a` on the storage node does not know the METALV01 magic) and
    every assemble is a declared reformat; `--force` keeps `format`'s
-   live-client refusal.
+   live-client refusal. **That refusal has a second, correct face:** a
+   mount that died WITHOUT a clean leave (a kill, a crashed node) keeps a
+   heartbeat-fresh `writer_claim` / `client:` record for
+   `CLIENT_STALE_TTL_SECS` (45 s, `src/fuse_client.rs`), and a re-assemble
+   inside that window is refused "actively mounted by clients" — by design,
+   not the superblock problem above. Wait the TTL out (the prologue's
+   unmount + disconnect does not shorten it) and re-run.
 
 `assemble-mw` (`PRESET=mw`) runs the same fabric steps and diverges at the
 mount into the `tests/cluster_reset_v5_mw.sh` multi-writer recipe: 1

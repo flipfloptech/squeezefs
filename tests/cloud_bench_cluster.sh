@@ -1250,7 +1250,10 @@ if [ "${MW_SKIP_FORMAT:-0}" != 1 ]; then
   # it without --force (the 2026-09-24 cloud row's assemble attempt 2 met
   # attempt 1's format — derived: the run's re-assemble is in the record,
   # the refusal is the preflight's law). --force keeps the live-client
-  # refusal: a heartbeat-fresh registration still refuses the format loud.
+  # refusal: a heartbeat-fresh registration still refuses the format loud —
+  # and a mount that died without a clean leave keeps one for
+  # CLIENT_STALE_TTL_SECS (45 s), so a re-assemble inside that window is
+  # refused "actively mounted" BY DESIGN: wait it out, re-run.
   read -ra FEXTRA <<<"$(printf '%s' "${FORMAT_EXTRA_STR:-}" | tr ',' ' ')"
   if [ "${FORMAT_CACHE:-1}" = 0 ]; then
     echo "format (CACHE-LESS): $META_URI $DATA_URI --force ${FEXTRA[*]:-}"

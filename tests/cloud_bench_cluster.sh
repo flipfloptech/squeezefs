@@ -306,7 +306,8 @@ subcommands:
   launch     create placement group + SG + launch template, launch spot fleet,
              wait running + SSH-reachable, install teardown-at-deadline guard
   deploy     scp squeezefs/elbencho/shim artifacts to every node, verify sha256,
-             install runtime deps (fuse3)
+             install runtime deps (fuse3), stop + mask Ubuntu's unattended
+             apt (apt-daily*.timer, unattended-upgrades) for the session
   assemble   share instance-store NVMe from storage nodes (squeezefs nvmeof
              share, nvmet), connect from the client (single-path — one NIC),
              format, mount, build_commit verification
@@ -972,7 +973,10 @@ cmd_deadline_guard() {
 }
 
 # ---------------------------------------------------------------------------
-# deploy — push artifacts + runtime deps. Deploys only; never builds.
+# deploy — push artifacts + runtime deps, and take Ubuntu's unattended apt
+# off the session (the timers stopped, the upgrader masked — a background
+# upgrade mid-row costs a writer node minutes of CPU and an sshd restart).
+# Deploys only; never builds.
 # ---------------------------------------------------------------------------
 cmd_deploy() {
   require_local_tools
@@ -1009,6 +1013,24 @@ cmd_deploy() {
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 cloud-init status --wait --long >/dev/null 2>&1 || true
+# Ubuntu's unattended apt is OFF for the session's life: on a fresh node
+# apt-daily-upgrade fired inside a row (3 min of CPU on a WRITER node) and
+# its unattended-upgrades restarted sshd, killing the driver's preflight
+# (the 2026-09-24 cloud row). The timers are stopped and disabled, the
+# upgrader masked; an upgrade already running is waited out (a masked
+# service is not interrupted mid-dpkg).
+systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+systemctl mask unattended-upgrades.service 2>/dev/null || true
+if systemctl is-active --quiet apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null; then
+  echo "an unattended apt run is in progress — waiting for it before the deploy continues"
+  for _ in $(seq 1 60); do
+    systemctl is-active --quiet apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || break
+    sleep 5
+  done
+fi
+systemctl stop apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
+echo "apt hygiene: apt-daily*.timer stopped+disabled, unattended-upgrades masked"
 need="fuse3 nvme-cli"
 [ "$NEED_MW" = "1" ] && need="$need openmpi-bin libopenmpi-dev python3 curl gcc make attr"
 missing=""

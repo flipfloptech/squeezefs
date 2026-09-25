@@ -33,6 +33,14 @@
 #   status            print what exists and the kernel release
 #
 # Env knobs (rig-local, scrubbed from product invocations by mw_fleet)
+#   SQZ_MWGUEST_KERNEL_SRC  rpm (default) — the sqz kernel RPMs below;
+#                         host — THIS host's running kernel (PR 13i's
+#                         two-host fixture: the guest boots the same
+#                         patched kernel the host runs — the bzImage from
+#                         /usr/lib/modules/<uname -r>/vmlinuz or the UKI's
+#                         `.linux` section under /boot/EFI/Linux, the module
+#                         tree from /usr/lib/modules/<uname -r>; built-in
+#                         modules (fuse on the omarchy build) need no copy)
 #   SQZ_MWGUEST_RPM_DIR   kernel RPM dir (default <repo>/dist/kernel-sqz)
 #   SQZ_MWGUEST_OUT       output dir (default <repo>/target/mw-guest —
 #                         a build product like target/release, cached
@@ -47,6 +55,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+KERNEL_SRC="${SQZ_MWGUEST_KERNEL_SRC:-rpm}"
 RPM_DIR="${SQZ_MWGUEST_RPM_DIR:-$REPO/dist/kernel-sqz}"
 OUT="${SQZ_MWGUEST_OUT:-$REPO/target/mw-guest}"
 BUSYBOX="${SQZ_MWGUEST_BUSYBOX:-/usr/lib/initcpio/busybox}"
@@ -80,6 +89,35 @@ find_kernel_rpm() { # -> path of the RPM carrying boot/vmlinuz*
     return 1
 }
 
+# The HOST kernel as the guest's (SQZ_MWGUEST_KERNEL_SRC=host): the
+# bzImage from the modules tree when the distro ships it there, else
+# carved out of the UKI's `.linux` section (Arch/omarchy: a unified
+# kernel image under /boot/EFI/Linux, root-readable). Prints the vmlinuz
+# path; the caller copies it.
+host_vmlinuz() {
+    local kver="$1" cand uki
+    cand="/usr/lib/modules/$kver/vmlinuz"
+    if [ -f "$cand" ]; then
+        echo "$cand"
+        return 0
+    fi
+    command -v objcopy >/dev/null 2>&1 || die "objcopy is required (UKI .linux extraction)"
+    for uki in /boot/EFI/Linux/*.efi /boot/efi/EFI/Linux/*.efi; do
+        [ -r "$uki" ] || continue
+        # The UKI's .uname section names the kernel it wraps — take the
+        # one matching the running kernel, never a stale sibling.
+        local uname_in
+        uname_in="$(objcopy -O binary --only-section=.uname "$uki" /dev/stdout 2>/dev/null | tr -d '\0')"
+        [ "$uname_in" = "$kver" ] || continue
+        rm -f "$OUT/vmlinuz.uki"
+        objcopy -O binary --only-section=.linux "$uki" "$OUT/vmlinuz.uki" ||
+            die "objcopy failed to carve .linux out of $uki"
+        echo "$OUT/vmlinuz.uki"
+        return 0
+    done
+    die "no bzImage for $kver: neither /usr/lib/modules/$kver/vmlinuz nor a readable UKI under /boot/EFI/Linux naming it (run as root — /boot is root-only — or set SQZ_MWGUEST_KERNEL_SRC=rpm)"
+}
+
 build_image() {
     local force=0
     [ "${1:-}" = "--force" ] && force=1
@@ -87,29 +125,41 @@ build_image() {
         log "boot pair exists at $OUT ($(cat "$OUT/kernel-release" 2>/dev/null || echo '?')) — use --force to rebuild"
         return 0
     fi
-    command -v bsdtar >/dev/null 2>&1 || die "bsdtar is required (RPM extraction)"
     command -v cpio >/dev/null 2>&1 || die "cpio is required (initramfs assembly)"
     [ -x "$BUSYBOX" ] || die "busybox not found at '$BUSYBOX' — install mkinitcpio (its /usr/lib/initcpio/busybox) or set SQZ_MWGUEST_BUSYBOX"
-    [ -d "$RPM_DIR" ] || die "no kernel RPM dir at $RPM_DIR — build the sqz kernel first: docker/kernel-sqz/build.sh (SERIES.md manifest, patch 0030 included)"
-    local rpm
-    rpm="$(find_kernel_rpm)" ||
-        die "no kernel RPM carrying boot/vmlinuz under $RPM_DIR — build the sqz kernel first: docker/kernel-sqz/build.sh"
-    log "kernel RPM: $rpm"
-
+    local vmlinuz kver moddir
     rm -rf "$OUT/extract" "$OUT/initrd"
     mkdir -p "$OUT/extract" "$OUT/initrd"
-
-    # --- extract the RPM (vmlinuz + /lib/modules tree) -----------------------
-    bsdtar -xf "$rpm" -C "$OUT/extract" || die "RPM extraction failed"
-    local vmlinuz kver moddir
-    vmlinuz="$(find "$OUT/extract" \( -path "*/boot/vmlinuz-*" -o -path "*/lib/modules/*/vmlinuz" \) -type f | head -1)"
-    [ -n "$vmlinuz" ] || die "no vmlinuz in the RPM payload"
-    moddir="$(find "$OUT/extract" -type d -path "*/lib/modules/*" -name "*-sqz" | head -1)"
-    [ -n "$moddir" ] || die "no /lib/modules/<ver>-sqz tree in the RPM payload"
-    kver="$(basename "$moddir")"
+    case "$KERNEL_SRC" in
+    rpm)
+        command -v bsdtar >/dev/null 2>&1 || die "bsdtar is required (RPM extraction)"
+        [ -d "$RPM_DIR" ] || die "no kernel RPM dir at $RPM_DIR — build the sqz kernel first: docker/kernel-sqz/build.sh (SERIES.md manifest, patch 0030 included) — or SQZ_MWGUEST_KERNEL_SRC=host to boot this host's kernel"
+        local rpm
+        rpm="$(find_kernel_rpm)" ||
+            die "no kernel RPM carrying boot/vmlinuz under $RPM_DIR — build the sqz kernel first: docker/kernel-sqz/build.sh"
+        log "kernel RPM: $rpm"
+        # --- extract the RPM (vmlinuz + /lib/modules tree) -------------------
+        bsdtar -xf "$rpm" -C "$OUT/extract" || die "RPM extraction failed"
+        vmlinuz="$(find "$OUT/extract" \( -path "*/boot/vmlinuz-*" -o -path "*/lib/modules/*/vmlinuz" \) -type f | head -1)"
+        [ -n "$vmlinuz" ] || die "no vmlinuz in the RPM payload"
+        moddir="$(find "$OUT/extract" -type d -path "*/lib/modules/*" -name "*-sqz" | head -1)"
+        [ -n "$moddir" ] || die "no /lib/modules/<ver>-sqz tree in the RPM payload"
+        kver="$(basename "$moddir")"
+        ;;
+    host)
+        kver="$(uname -r)"
+        moddir="/usr/lib/modules/$kver"
+        [ -d "$moddir" ] || die "no module tree at $moddir for the running kernel"
+        vmlinuz="$(host_vmlinuz "$kver")"
+        log "host kernel: $kver ($vmlinuz)"
+        ;;
+    *) die "SQZ_MWGUEST_KERNEL_SRC=$KERNEL_SRC: want rpm or host" ;;
+    esac
     log "kernel release: $kver"
     cp "$vmlinuz" "$OUT/vmlinuz"
+    rm -f "$OUT/vmlinuz.uki"
     echo "$kver" >"$OUT/kernel-release"
+    echo "$KERNEL_SRC" >"$OUT/kernel-source"
     rm -rf "$OUT/modules" && mkdir -p "$OUT/modules"
     cp -a "$moddir" "$OUT/modules/$kver"
 
@@ -141,13 +191,22 @@ build_image() {
         cp "$OUT/modules/$kver/$rel" "$root/lib/modules/$kver/$rel" ||
             die "module $rel missing from the RPM tree"
     }
+    local builtin="$OUT/modules/$kver/modules.builtin"
     for m in "${GUEST_MODULES[@]}"; do
-        # modules.dep matches with -/_ equivalence on the basename.
+        # A BUILT-IN module (the host kernel's fuse, `CONFIG_FUSE_FS=y`)
+        # needs no copy — the init's modprobe answers 0 for it.
+        if [ -f "$builtin" ] && grep -qE "/${m//-/[-_]}\.ko" "$builtin"; then
+            log "module closure: $m is built in"
+            continue
+        fi
+        # modules.dep matches with -/_ equivalence on the basename
+        # (`.ko` or the compressed `.ko.zst` / `.ko.xz` the distro ships).
         found=""
         while IFS= read -r line; do
             path="${line%%:*}"
             local base
-            base="$(basename "$path" .ko)"
+            base="$(basename "$path")"
+            base="${base%%.ko*}"
             if [ "${base//-/_}" = "${m//-/_}" ]; then
                 found="$line"
                 break
@@ -205,9 +264,20 @@ for m in virtio_net 9pnet_virtio 9p nvme-tcp fuse; do
 done
 ip link set lo up
 ip link set eth0 up
-# slirp user-net statics: guest 10.0.2.15/24, host gateway 10.0.2.2.
-ip addr add 10.0.2.15/24 dev eth0
-ip route add default via 10.0.2.2
+# slirp user-net statics: guest 10.0.2.15/24, host gateway 10.0.2.2 —
+# unless the cmdline names a tap-mode address pair (mwguest.ip=<cidr>
+# mwguest.gw=<ip>: PR 13i's two-host fixture, where the HOST must dial
+# the guest's listener too).
+GUEST_IP=10.0.2.15/24
+GUEST_GW=10.0.2.2
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+    mwguest.ip=*) GUEST_IP="${arg#mwguest.ip=}" ;;
+    mwguest.gw=*) GUEST_GW="${arg#mwguest.gw=}" ;;
+    esac
+done
+ip addr add "$GUEST_IP" dev eth0
+ip route add default via "$GUEST_GW"
 # The host share: cache=none is load-bearing — the job loop must see
 # host-written files immediately, and the host must see .rc/.out
 # without a cache flush.
@@ -247,7 +317,7 @@ INIT
 
 status_image() {
     if [ -f "$OUT/vmlinuz" ] && [ -f "$OUT/initramfs.img" ]; then
-        echo "[mwguest] boot pair at $OUT: $(cat "$OUT/kernel-release" 2>/dev/null || echo '?') ($(du -h "$OUT/initramfs.img" | cut -f1) initramfs)"
+        echo "[mwguest] boot pair at $OUT: $(cat "$OUT/kernel-release" 2>/dev/null || echo '?') from $(cat "$OUT/kernel-source" 2>/dev/null || echo rpm) ($(du -h "$OUT/initramfs.img" | cut -f1) initramfs)"
     else
         echo "[mwguest] no boot pair at $OUT — run: tests/mw_guest_image.sh build"
         return 1

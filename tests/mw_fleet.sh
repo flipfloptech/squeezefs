@@ -334,6 +334,20 @@ VM_GW="10.0.2.2" # the slirp gateway = the HOST, guest-domain address
 VM_MEM_MB="${SQZ_MWFLEET_VM_MEM_MB:-3072}"
 VM_CPUS="${SQZ_MWFLEET_VM_CPUS:-4}"
 GUEST_IMG_DIR="${SQZ_MWGUEST_OUT:-$REPO/target/mw-guest}"
+# PR 13i — THE TWO-HOST FIXTURE (`create … --vm=1 --vm-net=tap`): the guest
+# rides a host TAP interface instead of slirp, so the HOST can dial the
+# GUEST too (a joined WRITER's listener, the manager's PublishEndpoint /
+# token / cross-owner ships — slirp is one-way). The tap carries a
+# host-local /24 (never routed on the LAN): the host is .1, the guest .2,
+# the devsub's nvmet-tcp port binds the HOST address (so every
+# fabric_endpoint record names an address BOTH kernels dial), and the
+# guest's cmdline carries `mwguest.ip=`/`mwguest.gw=` (the initramfs init
+# reads them). The tap is fleet residue: created at create, removed at
+# teardown. Tap mode is one guest (V=1); a second guest needs a bridge.
+VM_NET="user"
+VM_TAP_IF="${SQZ_MWFLEET_VM_TAP_IF:-sqz-mwtap}"
+VM_TAP_HOST_IP="${SQZ_MWFLEET_VM_TAP_HOST_IP:-10.99.0.1}"
+VM_TAP_GUEST_IP="${SQZ_MWFLEET_VM_TAP_GUEST_IP:-10.99.0.2}"
 
 log() { echo "[mwfleet] $*"; }
 warn() { echo "[mwfleet] WARN: $*" >&2; }
@@ -625,6 +639,14 @@ vm_boot() {
     fi
     append="console=ttyS0 rdinit=/init panic=-1"
     [ "$hostscope" = "1" ] && append="$append nvme_core.fabrics_host_scoped_subsystems=Y"
+    # The NIC: slirp (one-way, the rung-6b default) or the two-host tap.
+    local netdev="user,id=n0"
+    if [ "${VM_NET:-user}" = "tap" ]; then
+        [ -d "/sys/class/net/$VM_TAP_IF" ] ||
+            die "guest $idx: tap $VM_TAP_IF is absent — create builds it (--vm-net=tap); a fleet created without tap mode boots slirp guests"
+        netdev="tap,id=n0,ifname=$VM_TAP_IF,script=no,downscript=no"
+        append="$append mwguest.ip=$VM_TAP_GUEST_IP/24 mwguest.gw=$VM_TAP_HOST_IP"
+    fi
     # shellcheck disable=SC2054 # commas live inside quoted qemu option strings
     local qemu_args=(-machine "q35,accel=$accel")
     [ "$accel" = "kvm" ] && qemu_args+=(-cpu host)
@@ -633,7 +655,7 @@ vm_boot() {
         -smp "$VM_CPUS" -m "$VM_MEM_MB"
         -kernel "$GUEST_IMG_DIR/vmlinuz" -initrd "$GUEST_IMG_DIR/initramfs.img"
         -append "$append"
-        -netdev user,id=n0 -device virtio-net-pci,netdev=n0
+        -netdev "$netdev" -device virtio-net-pci,netdev=n0
         -virtfs "local,path=$d/share,mount_tag=hostshare,security_model=none"
         -display none -serial "file:$d/console.log"
         -monitor "unix:$d/monitor.sock,server,nowait"
@@ -909,6 +931,12 @@ mount_member() { # idx [--netns[=<delay_ms>]]
         # format; `=1` is the arm — PR 4's knob).
         if [ "${SYMMETRIC:-0}" = "1" ]; then
             env_args+=("SQUEEZEFS_SYMMETRIC_META=1")
+            # PR 13i (the two-host fixture): the manager's listener binds
+            # the TAP's host address, so the guest joiner dials an address
+            # its kernel routes whatever the box's default route says.
+            if [ "${VM_NET:-user}" = "tap" ]; then
+                env_args+=("SQUEEZEFS_MW_BIND=$VM_TAP_HOST_IP:${SQZ_MWFLEET_MW_PORT:-${MW_PORT:-45999}}")
+            fi
         fi
         # Rung 9: the operator-declared co-writer roster (enrollment is the
         # AUTHORITY's durable act — ops.md §Multi-writer co-writer mounts).
@@ -1544,6 +1572,10 @@ create_fleet() {
         --require-host-scoped-subsys) require_hs=1 ;;
         --vm) die "--vm takes a value (--vm=V)" ;;
         --vm=*) vms="${a#--vm=}" ;;
+        # PR 13i: the two-host fixture's tap network (see VM_NET above).
+        --vm-net=tap) VM_NET="tap" ;;
+        --vm-net=user) VM_NET="user" ;;
+        --vm-net=*) die "--vm-net takes user (slirp, the default) or tap (got '${a#--vm-net=}')" ;;
         --membership) membership="auto" ;;
         --membership=*) membership="${a#--membership=}" ;;
         --lease-ttl-ms=*) lease_ttl_ms="${a#--lease-ttl-ms=}" ;;
@@ -1619,18 +1651,47 @@ create_fleet() {
             membership="auto"
             log "--symmetric implies --membership (the death ledger's writer is the S6 owner's eviction)"
         fi
+        # PR 13i tap mode: `auto` advertises the box's default-route
+        # address; the guest must dial the TAP's host address.
+        if [ "$VM_NET" = "tap" ] && [ "$membership" = "auto" ]; then
+            membership="$VM_TAP_HOST_IP:0"
+        fi
     fi
     [ -e "$CONF" ] && die "fleet state exists at $STATE — run 'sudo tests/mw_fleet.sh teardown' first"
     ensure_prereqs
     # --vm preflight FIRST (fail before any substrate exists): the boot
-    # pair must be buildable from the sqz kernel RPMs.
+    # pair must be buildable from the sqz kernel RPMs (or this host's
+    # kernel — SQZ_MWGUEST_KERNEL_SRC=host, the two-host fixture's guest).
     if [ "$vms" -gt 0 ]; then
         command -v qemu-system-x86_64 >/dev/null 2>&1 ||
             die "--vm=$vms: qemu-system-x86_64 is required"
         "$REPO/tests/mw_guest_image.sh" build ||
-            die "--vm=$vms: guest boot pair build failed (build the sqz kernel first: docker/kernel-sqz/build.sh)"
+            die "--vm=$vms: guest boot pair build failed (build the sqz kernel first: docker/kernel-sqz/build.sh — or SQZ_MWGUEST_KERNEL_SRC=host)"
         [ -w /dev/kvm ] ||
             warn "--vm=$vms: /dev/kvm unavailable — guests will run TCG (correctness legs only)"
+    fi
+    [ "$VM_NET" != "tap" ] || [ "$vms" -eq 1 ] ||
+        die "--vm-net=tap is the ONE-guest two-host fixture (got --vm=$vms); a second guest needs a bridge"
+    if [ "$VM_NET" = "tap" ]; then
+        # The tap BEFORE the devsub: its host address is where nvmet-tcp
+        # listens, so every fabric_endpoint record names an address both
+        # kernels dial. Idempotent over a leftover tap of a died fleet.
+        if [ ! -d "/sys/class/net/$VM_TAP_IF" ]; then
+            ip tuntap add "$VM_TAP_IF" mode tap || die "--vm-net=tap: cannot create tap $VM_TAP_IF"
+        fi
+        ip addr replace "$VM_TAP_HOST_IP/24" dev "$VM_TAP_IF" || die "--vm-net=tap: cannot address $VM_TAP_IF"
+        ip link set "$VM_TAP_IF" up || die "--vm-net=tap: cannot bring $VM_TAP_IF up"
+        # A host firewall with a DROP input policy (ufw on the omarchy dev
+        # box) silences the tap: admit the guest's /24 on THIS interface
+        # only (an iptables rule the teardown removes; nftables-only boxes
+        # are asked to admit it themselves).
+        if command -v iptables >/dev/null 2>&1; then
+            iptables -C INPUT -i "$VM_TAP_IF" -s "${VM_TAP_HOST_IP%.*}.0/24" -j ACCEPT 2>/dev/null ||
+                iptables -I INPUT 1 -i "$VM_TAP_IF" -s "${VM_TAP_HOST_IP%.*}.0/24" -j ACCEPT ||
+                warn "--vm-net=tap: could not admit $VM_TAP_IF in the host firewall — the guest may not reach the target"
+        fi
+        export SQZ_DEVSUB_TCP_ADDR="$VM_TAP_HOST_IP"
+        log "two-host tap $VM_TAP_IF up: host $VM_TAP_HOST_IP, guest $VM_TAP_GUEST_IP; nvmet-tcp binds the host address"
     fi
 
     # With guests, ONE EXTRA mds + oss namespace pair is RESERVED for the
@@ -1839,7 +1900,14 @@ create_fleet() {
         echo "CREATE_PID='$create_pid'"
         echo "HOST_SCOPED='$host_scoped'"
         echo "VM_COUNT='$vms'"
-        echo "VM_GW='$VM_GW'"
+        # In tap mode the guest reaches the host at the tap's host address
+        # (the slirp gateway otherwise); VM_NET/VM_TAP_* re-arm vm_boot and
+        # the teardown's tap removal on a later invocation.
+        echo "VM_GW='$([ "$VM_NET" = "tap" ] && echo "$VM_TAP_HOST_IP" || echo "$VM_GW")'"
+        echo "VM_NET='$VM_NET'"
+        echo "VM_TAP_IF='$VM_TAP_IF'"
+        echo "VM_TAP_HOST_IP='$VM_TAP_HOST_IP'"
+        echo "VM_TAP_GUEST_IP='$VM_TAP_GUEST_IP'"
         echo "GUEST_META_NQN='$guest_meta_nqn'"
         echo "GUEST_DATA_NQN='$guest_data_nqn'"
         echo "GUEST_META_PATH='$guest_meta_path'"
@@ -2135,6 +2203,25 @@ teardown_fleet() {
         SQZ_DEVSUB_TRANSPORT=tcp SQZ_DEVSUB_INSTANCE="$INSTANCE" \
             "$REPO/tests/dev_substrate.sh" teardown >/dev/null 2>&1 ||
             warn "devsub teardown reported errors"
+    fi
+    # PR 13i: the two-host tap is fleet residue — removed after the guest
+    # and the target that bound its address are gone.
+    if [ -f "$CONF" ]; then
+        local tap_if
+        tap_if="$(awk -F"'" '/^VM_TAP_IF=/ {print $2}' "$CONF")"
+        if [ "$(awk -F"'" '/^VM_NET=/ {print $2}' "$CONF")" = "tap" ] && [ -n "$tap_if" ]; then
+            local tap_host
+            tap_host="$(awk -F"'" '/^VM_TAP_HOST_IP=/ {print $2}' "$CONF")"
+            if command -v iptables >/dev/null 2>&1 && [ -n "$tap_host" ]; then
+                while iptables -C INPUT -i "$tap_if" -s "${tap_host%.*}.0/24" -j ACCEPT 2>/dev/null; do
+                    iptables -D INPUT -i "$tap_if" -s "${tap_host%.*}.0/24" -j ACCEPT || break
+                done
+            fi
+            if [ -d "/sys/class/net/$tap_if" ]; then
+                ip link del "$tap_if" 2>/dev/null || warn "tap $tap_if could not be removed"
+                log "two-host tap $tap_if removed"
+            fi
+        fi
     fi
     # --- zero-residue assertions (exit nonzero on ANY residue) --------------
     local s

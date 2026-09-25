@@ -2109,6 +2109,236 @@ JOBC
     log "vm-multi-identity GREEN (evidence in $rowdir)"
 }
 
+# --- PR 13i — the TWO-HOST fixture (design-symmetric-metadata §5.11) --------
+# `sym-two-host`: two KERNELS sharing one metadata LUN — the venue every
+# single-box fleet (netns members included) structurally cannot be: one
+# kernel is one page cache. Needs `create N=1 --symmetric --vm=1
+# --vm-net=tap` (SQZ_MWGUEST_KERNEL_SRC=host boots this host's kernel in
+# the guest). Two phases:
+#
+#   1. THE PIN (RED on a buffered-metadata binary, GREEN under O_DIRECT —
+#      the F-C1 mechanism, product-verb-driven): the guest connects the
+#      fleet's meta NQN under its OWN identity and lists the appender
+#      directory (`squeezefs appenders --json` — its kernel caches the
+#      pages), the HOST manager takes ≥ 2 checkpoint cycles (page 0's
+#      generation moves), the guest lists AGAIN. Under buffered I/O the
+#      guest's second read is its own stale first image and page 0's
+#      generation stands where its first listing left it; under O_DIRECT
+#      it reads what the host wrote. The assertion compares the guest's
+#      word against the host's own listing.
+#   2. THE JOIN: the guest mounts as a JOINED writer over the wire (its
+#      listener on the tap, the manager's on the tap's host address),
+#      `mkdir` + creates + `rm -rf` land, the host reads every acked name
+#      through the divert, the guest leaves clean, the post-leave census
+#      (online fsck on the manager) is clean.
+leg_sym_two_host() {
+    require_symmetric
+    require_vm_fleet
+    [ "${VM_NET:-user}" = "tap" ] ||
+        die "sym-two-host needs the TAP guest network (create … --vm=1 --vm-net=tap): the manager must dial the joiner's listener, which slirp cannot route"
+    local rowdir g_nqn g_id creates="${SQZ_MWMATRIX_TWOHOST_FILES:-200}"
+    rowdir="$STATE/rows/twohost-$(date +%s)"
+    mkdir -p "$rowdir"
+    g_nqn="$(guest_nqn 90)" g_id="$(guest_id 90)"
+    local meta_nqn meta_path
+    meta_nqn="$(echo "$META_NQNS" | awk '{print $1}')"
+    meta_path="$(echo "$FORMAT_META_PATHS" | cut -d, -f1)"
+    [ "$(echo "$META_NQNS" | wc -w)" = 1 ] ||
+        die "sym-two-host is the one-metadata-volume shape (SQZ_MWFLEET_MDS_COUNT=1; got '$META_NQNS')"
+
+    # ---- job 1: connect the fleet's meta NQN in-guest and list the directory ----
+    {
+        guest_job_preamble
+        cat <<JOB1
+NQN='$meta_nqn'
+# Idempotent over a previous run's controller (EALREADY = already connected).
+if ! \$SQZ nvmeof connect --ip "\$GW" --port "\$SVC" --subnqn "\$NQN" --hostnqn '$g_nqn' --hostid '$g_id' >/tmp/connect.out 2>&1; then
+    grep -q "already in progress" /tmp/connect.out || { cat /tmp/connect.out; echo "FAIL: guest meta connect"; exit 1; }
+fi
+head=""
+i=0
+while [ \$i -lt 40 ]; do
+    for s in \$(subsys_dirs_for_nqn "\$NQN"); do head=\$(head_of_dir "\$s") && break; done
+    [ -n "\$head" ] && [ -b "/dev/\$head" ] && break
+    i=\$((i + 1)); sleep 0.5
+done
+[ -n "\$head" ] && [ -b "/dev/\$head" ] || { echo "FAIL: \$NQN resolved no openable head in-guest"; exit 1; }
+echo "GUEST_META_HEAD=\$head"
+echo "guest logical block size: \$(cat /sys/block/\$head/queue/logical_block_size)"
+\$SQZ appenders "sqmeta:///dev/\$head" --json >/tmp/appenders-1.json 2>/tmp/appenders-1.err || { cat /tmp/appenders-1.err; echo "FAIL: appenders listing 1"; exit 1; }
+cat /tmp/appenders-1.json
+JOB1
+    } >"$rowdir/job1.sh"
+    "$MWFLEET" vm-exec 0 "$rowdir/job1.sh" 300 >"$rowdir/job1.out" 2>&1 ||
+        die "guest job 1 (connect + list) FAILED: $(tail -5 "$rowdir/job1.out")"
+    local g_head g_gen1
+    g_head="$(awk -F= '/^GUEST_META_HEAD=/ {print $2}' "$rowdir/job1.out" | tr -d '\r')"
+    [ -n "$g_head" ] || die "guest job 1 reported no head"
+    g_gen1="$(python3 - "$rowdir/job1.out" <<'PY'
+import json, sys
+txt = open(sys.argv[1]).read()
+# The JSON array starts at the first line that is exactly `[` (the job's
+# log lines above it carry bracketed timestamps).
+start = 0 if txt.startswith('[\n') else txt.index('\n[\n') + 1
+rows = json.loads(txt[start:txt.rindex(']') + 1])
+print(next(r["generation"] for r in rows if r.get("appender_id") == 0 and r.get("state") == "live"))
+PY
+)" || die "guest listing 1 carries no Live page 0"
+    log "guest listed the directory (head /dev/$g_head): page 0 at generation $g_gen1"
+
+    # ---- the host writes: ≥ 2 checkpoint cycles move page 0's generation ----
+    local mnt0 ck0 ck1 i
+    mnt0="$(mnt_of 0)"
+    ck0="$(stat_sum 0 meta_kv_checkpoints)"
+    mkdir -p "$mnt0/two-host-pin"
+    for i in $(seq 1 64); do
+        printf 'pin:%s\n' "$i" | dd of="$mnt0/two-host-pin/f$i" conv=fsync status=none
+    done
+    for i in $(seq 1 120); do
+        ck1="$(stat_sum 0 meta_kv_checkpoints)"
+        [ "$ck1" -ge "$((ck0 + 2))" ] && break
+        sleep 0.5
+    done
+    [ "$ck1" -ge "$((ck0 + 2))" ] || die "the manager took no two checkpoint cycles in 60 s ($ck0 → $ck1)"
+    # Quiesce the manager (no cycle for 3 s) so the two listings below
+    # compare one durable image, never a race with a late cycle.
+    local stable=0
+    for i in $(seq 1 120); do
+        sleep 1
+        ck0="$(stat_sum 0 meta_kv_checkpoints)"
+        if [ "$ck0" = "$ck1" ]; then stable=$((stable + 1)); else stable=0; ck1="$ck0"; fi
+        [ "$stable" -ge 3 ] && break
+    done
+    [ "$stable" -ge 3 ] || die "the manager never quiesced (checkpoints kept moving for 120 s)"
+    log "host wrote ≥ 2 checkpoint cycles and quiesced at $ck1 (guest's first read: page 0 at generation $g_gen1)"
+
+    # ---- job 2: the guest lists AGAIN — the pin ----
+    {
+        guest_job_preamble
+        cat <<JOB2
+\$SQZ appenders "sqmeta:///dev/$g_head" --json >/tmp/appenders-2.json 2>/tmp/appenders-2.err || { cat /tmp/appenders-2.err; echo "FAIL: appenders listing 2"; exit 1; }
+cat /tmp/appenders-2.json
+JOB2
+    } >"$rowdir/job2.sh"
+    "$MWFLEET" vm-exec 0 "$rowdir/job2.sh" 300 >"$rowdir/job2.out" 2>&1 ||
+        die "guest job 2 (second listing) FAILED: $(tail -5 "$rowdir/job2.out")"
+    local g_gen2
+    g_gen2="$(python3 - "$rowdir/job2.out" <<'PY'
+import json, sys
+txt = open(sys.argv[1]).read()
+# The JSON array starts at the first line that is exactly `[` (the job's
+# log lines above it carry bracketed timestamps).
+start = 0 if txt.startswith('[\n') else txt.index('\n[\n') + 1
+rows = json.loads(txt[start:txt.rindex(']') + 1])
+print(next(r["generation"] for r in rows if r.get("appender_id") == 0 and r.get("state") == "live"))
+PY
+)" || die "guest listing 2 carries no Live page 0"
+    # The host's OWN word for the same durable image (its cache is the
+    # writer's — coherent with its writes by construction).
+    local h_gen
+    "$SQZ" appenders "sqmeta://$meta_path" --json >"$rowdir/host-appenders.json" 2>"$rowdir/host-appenders.err" ||
+        die "host appenders listing failed: $(tail -3 "$rowdir/host-appenders.err")"
+    h_gen="$(python3 -c '
+import json, sys
+rows = json.load(open(sys.argv[1]))
+print(next(r["generation"] for r in rows if r.get("appender_id") == 0 and r.get("state") == "live"))' "$rowdir/host-appenders.json")" ||
+        die "host listing carries no Live page 0"
+    [ "$h_gen" -gt "$g_gen1" ] ||
+        die "page 0's generation did not move on the host ($g_gen1 → $h_gen) — the pin's premise (a host write after the guest's read) is unmet"
+    echo "guest_gen_before=$g_gen1 guest_gen_after=$g_gen2 host_gen=$h_gen" >"$rowdir/pin.txt"
+    [ "$g_gen2" = "$h_gen" ] ||
+        die "F-C1 PIN RED: the guest re-read page 0 at generation $g_gen2 while the host wrote it to $h_gen (the guest's first read left it at $g_gen1) — a second kernel served its own page cache of a block the manager rewrote: shared-LUN metadata I/O is not coherent (design-symmetric-metadata §5.11; evidence $rowdir)"
+    log "F-C1 PIN GREEN: the guest's second read is the host's word (generation $h_gen)"
+
+    # ---- job 3: the guest JOINS as a writer and creates ----
+    local mw_port="${MW_PORT:-45999}"
+    {
+        guest_job_preamble
+        cat <<JOB3
+mkdir -p /mnt/j /etc/squeezefs
+env SQUEEZEFS_SYMMETRIC_META=1 SQUEEZEFS_MW_BIND='$VM_TAP_GUEST_IP:$mw_port' \
+    \$SQZ mount "sqmeta:///dev/$g_head" /mnt/j --daemon --log-file /tmp/j.log >/tmp/j.mount.out 2>&1 || { cat /tmp/j.mount.out; cat /tmp/j.log 2>/dev/null | tail -30; echo "FAIL: guest joiner mount"; exit 1; }
+i=0
+while [ \$i -lt 240 ]; do grep -q " /mnt/j " /proc/mounts && break; i=\$((i + 1)); sleep 0.5; done
+grep -q " /mnt/j " /proc/mounts || { echo "FAIL: joiner never mounted"; tail -30 /tmp/j.log; exit 1; }
+grep -q "mounted as a JOINED symmetric appender" /tmp/j.log || { echo "FAIL: no joined-door line"; tail -30 /tmp/j.log; exit 1; }
+posture=\$(grep -o '"mount_posture": *"[a-z-]*"' /mnt/j/.stats | grep -o '"[a-z-]*"\$' | tr -d '"')
+[ "\$posture" = "writer" ] || { echo "FAIL: guest posture \$posture"; exit 1; }
+jid=\$(grep -o '"joined_appender_id": *[0-9]*' /mnt/j/.stats | head -1 | grep -o '[0-9]*\$')
+echo "GUEST_APPENDER_ID=\$jid"
+mkdir /mnt/j/two-host-guest || { echo "FAIL: mkdir under the root (the cloud row's shape) errno=\$?"; tail -20 /tmp/j.log; exit 1; }
+n=0
+i=0
+while [ \$i -lt $creates ]; do
+    printf 'guest:%s\n' "\$i" | dd of="/mnt/j/two-host-guest/g\$i" conv=fsync status=none && n=\$((n + 1))
+    i=\$((i + 1))
+done
+[ "\$n" = $creates ] || { echo "FAIL: \$n of $creates guest creates acked"; exit 1; }
+echo "GUEST_CREATES=\$n"
+grep -o '"joined_control_refusals": *[0-9]*' /mnt/j/.stats | head -1
+grep -o '"invariant_tripwires": *[0-9]*' /mnt/j/.stats | head -1
+echo "GUEST JOIN GREEN"
+JOB3
+    } >"$rowdir/job3.sh"
+    "$MWFLEET" vm-exec 0 "$rowdir/job3.sh" 900 >"$rowdir/job3.out" 2>&1 ||
+        die "guest job 3 (join + creates) FAILED: $(tail -15 "$rowdir/job3.out")"
+    grep -q "GUEST JOIN GREEN" "$rowdir/job3.out" || die "guest job 3 did not report GREEN"
+    # The host reads every acked name through the divert (the guest holds
+    # the slot; nothing here is a device read of the guest's tree).
+    local missing=0
+    for i in $(seq 0 $((creates - 1))); do
+        [ "$(cat "$mnt0/two-host-guest/g$i" 2>/dev/null)" = "guest:$i" ] || missing=$((missing + 1))
+    done
+    [ "$missing" = 0 ] || die "the host misses $missing of $creates guest-acked files (cross-kernel read through the divert)"
+    log "the host reads all $creates guest-acked files"
+
+    # ---- job 4: rm -rf from the guest, then the clean leave ----
+    {
+        guest_job_preamble
+        cat <<JOB4
+rm -rf /mnt/j/two-host-guest || { echo "FAIL: guest rm -rf"; exit 1; }
+[ ! -e /mnt/j/two-host-guest ] || { echo "FAIL: the directory survived its rm -rf"; exit 1; }
+\$SQZ umount /mnt/j >/tmp/j.umount.out 2>&1 || { cat /tmp/j.umount.out; umount -l /mnt/j 2>/dev/null; echo "FAIL: guest umount"; exit 1; }
+i=0
+while [ \$i -lt 120 ]; do grep -q " /mnt/j " /proc/mounts || break; i=\$((i + 1)); sleep 0.5; done
+grep -q " /mnt/j " /proc/mounts && { echo "FAIL: /mnt/j still mounted"; exit 1; }
+echo "GUEST LEAVE GREEN"
+JOB4
+    } >"$rowdir/job4.sh"
+    "$MWFLEET" vm-exec 0 "$rowdir/job4.sh" 600 >"$rowdir/job4.out" 2>&1 ||
+        die "guest job 4 (rm -rf + leave) FAILED: $(tail -10 "$rowdir/job4.out")"
+    [ ! -e "$mnt0/two-host-guest" ] || die "the host still sees the directory the guest removed"
+    # The post-leave census on the manager: the guest's region is Free on
+    # the DEVICE (a host read of a page the guest wrote), fsck clean.
+    "$SQZ" appenders "sqmeta://$meta_path" --json >"$rowdir/host-appenders-after.json" 2>"$rowdir/host-appenders-after.err" ||
+        die "host appenders listing (after the leave) failed: $(tail -3 "$rowdir/host-appenders-after.err")"
+    python3 - "$rowdir/host-appenders-after.json" <<'PY' || die "the guest's region is not Free at the host after its clean leave (a stale host read of the guest's page?)"
+import json, sys
+rows = json.load(open(sys.argv[1]))
+live = [r for r in rows if r.get("state") == "live"]
+assert len(live) == 1 and live[0]["appender_id"] == 0, f"live pages after the leave: {[(r['appender_id'], r['state']) for r in rows]}"
+PY
+    local frc=0
+    timeout 900 "$SQZ" fsck "$mnt0" --json >"$rowdir/fsck.json" 2>"$rowdir/fsck.err" || frc=$?
+    [ "$frc" != "124" ] || die "the post-leave online fsck HUNG past 900 s — $rowdir/fsck.err"
+    [ "$frc" = "0" ] || die "post-leave fsck failed (rc=$frc): $(tail -5 "$rowdir/fsck.err")"
+    python3 -c '
+import json, sys
+r = json.load(open(sys.argv[1]))
+by_class = {}
+for f in r["findings"]:
+    by_class[f["class"]] = by_class.get(f["class"], 0) + 1
+print(f"post-leave census: findings by class {by_class or {}}")
+assert not r["findings"], f"fsck findings: {by_class}"' "$rowdir/fsck.json" || die "post-leave fsck reports findings (evidence $rowdir/fsck.json)"
+    # Job 5: disconnect the guest's meta controller (zero residue).
+    {
+        guest_job_preamble
+        echo "disconnect_nqn '$meta_nqn'; echo done"
+    } >"$rowdir/job5.sh"
+    "$MWFLEET" vm-exec 0 "$rowdir/job5.sh" 120 >"$rowdir/job5.out" 2>&1 || warn "guest disconnect reported errors"
+    log "sym-two-host GREEN (pin + join + $creates creates + rm -rf + leave + census; evidence in $rowdir)"
+}
+
 # --- rung-7 S6 legs (design-full-multi-writer §7.2) ------------------------
 require_membership() {
     [ -n "${MEMBERSHIP:-}" ] ||
@@ -10652,5 +10882,6 @@ pv-rand4k-w1) leg_pv_rand4k_w1 ;;
 cowriters-admission) leg_cowriters_admission ;;
 vm-hostscope-validate) leg_vm_hostscope_validate ;;
 vm-multi-identity) leg_vm_multi_identity ;;
-*) die "unknown leg '$LEG' (pv-volume-scaling|smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|sym-crash|sym-storm|sym-tarx|sym-scale|sym-shared-dir|sym-foreign-touch|sym-foreign-file|sym-reclaim-hint|sym-readers|sym-walls|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s11-range|s11-subblock|s11-mpiio|s11-blockcyclic|s11-tiny|s11-killrange|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|pv-rewrite-funnel|pv-cross-owner|pv-rand4k-w1|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
+sym-two-host) leg_sym_two_host ;;
+*) die "unknown leg '$LEG' (pv-volume-scaling|smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|sym-crash|sym-storm|sym-tarx|sym-scale|sym-shared-dir|sym-foreign-touch|sym-foreign-file|sym-reclaim-hint|sym-readers|sym-walls|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s11-range|s11-subblock|s11-mpiio|s11-blockcyclic|s11-tiny|s11-killrange|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|pv-rewrite-funnel|pv-cross-owner|pv-rand4k-w1|cowriters-admission|vm-hostscope-validate|vm-multi-identity|sym-two-host)" ;;
 esac

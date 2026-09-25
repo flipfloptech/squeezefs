@@ -2587,8 +2587,57 @@ fn bench_write_handler_e2e(c: &mut Criterion) {
     group.finish();
 }
 
+/// PR 13i F-C1 (review round 1, Issue 8): `uring_fs::meta_io_mode` is on
+/// EVERY `uring_fs` open, read span and read buffer — the posture lookup
+/// the worker runs per I/O. Field shape: a registered metadata device
+/// path (the journal ring's writes, the node loads), a staging / cache
+/// file the worker touches that is NOT a metadata device (a MISS —
+/// remembered negative after its first resolution), and the cold first
+/// miss (the one `canonicalize(2)` the law allows per distinct path).
+/// The `RwLock` form this replaced paid three reader acquisitions and a
+/// `canonicalize(2)` on every miss.
+fn bench_meta_io_mode(c: &mut Criterion) {
+    use squeezefs::uring_fs::{clear_meta_devices, meta_io_mode, register_meta_device};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registered = dir.path().join("meta0");
+    std::fs::File::create(&registered)
+        .and_then(|f| f.set_len(1 << 20))
+        .expect("volume file");
+    let staging = dir.path().join("staging-segment-0");
+    std::fs::File::create(&staging).expect("staging file");
+    clear_meta_devices();
+    register_meta_device(&registered).expect("register");
+    let mut group = c.benchmark_group("meta_io_mode");
+    group.bench_function("registered_hit", |b| {
+        b.iter(|| black_box(meta_io_mode(black_box(&registered))))
+    });
+    // Warm the negative entry once, then measure the remembered miss.
+    let _ = meta_io_mode(&staging);
+    group.bench_function("remembered_miss", |b| {
+        b.iter(|| black_box(meta_io_mode(black_box(&staging))))
+    });
+    // The cold first miss: a fresh spelling per iteration (a symlink to the
+    // staging file — `canonicalize` resolves it, the map remembers it).
+    let mut n = 0u64;
+    group.bench_function("cold_first_miss", |b| {
+        b.iter_batched(
+            || {
+                n += 1;
+                let link = dir.path().join(format!("alias-{n}"));
+                std::os::unix::fs::symlink(&staging, &link).expect("symlink");
+                link
+            },
+            |link| black_box(meta_io_mode(black_box(&link))),
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+    clear_meta_devices();
+}
+
 criterion_group!(
     benches,
+    bench_meta_io_mode,
     bench_write_handler_counters,
     bench_write_handler_e2e,
     bench_writer_scope,

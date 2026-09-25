@@ -602,11 +602,46 @@ impl MetaIoMode {
     };
 }
 
-/// Registered metadata device paths → their posture. Keyed by the path
-/// as the KV layer names it AND by its canonical form, so every worker's
-/// open — whichever spelling reaches it — finds the same answer.
-static META_IO_MODES: Lazy<std::sync::RwLock<HashMap<PathBuf, MetaIoMode>>> =
-    Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
+/// Registered metadata device paths → their posture, plus the NEGATIVE
+/// entries (`None`) of paths resolved unregistered. Keyed by the path as
+/// the KV layer names it AND by its canonical form, so every worker's
+/// open — whichever spelling reaches it — finds the same answer. An
+/// `ArcSwap` (review round 1, Issue 8): the hot path — every `uring_fs`
+/// open, read span and read buffer of every path — pays ONE lock-free
+/// load and one hash probe; the `RwLock` it replaces cost three reader
+/// acquisitions and a `canonicalize(2)` per MISS per I/O (every staging
+/// segment, cache file and log the worker touches is a miss). The map is
+/// rebuilt whole on the rare write (a registration, a first-miss
+/// resolution, the harness reset).
+static META_IO_MODES: Lazy<arc_swap::ArcSwap<HashMap<PathBuf, Option<MetaIoMode>>>> =
+    Lazy::new(|| arc_swap::ArcSwap::from_pointee(HashMap::new()));
+
+/// Lookups that MISSED the registry and resolved the path's canonical
+/// spelling with a `canonicalize(2)` (once per distinct path — the
+/// answer, positive or negative, is remembered). The hot path's
+/// instrument: flat under a steady stream of I/O to known paths.
+pub static META_IO_MODE_RESOLVES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The negative cache's bound: the worker's open-file cache size (a path
+/// the worker cannot hold an fd for is not hot); past it a miss is
+/// resolved per call and remembered nowhere.
+fn meta_io_negative_cap() -> usize {
+    fd_cache_cap()
+}
+
+/// Remember `mode` for `path` (a resolution's answer) unless the path is
+/// already known or the negative cache is at its bound.
+fn remember_meta_io_mode(path: &Path, mode: Option<MetaIoMode>) {
+    META_IO_MODES.rcu(|cur| {
+        if cur.contains_key(path) || (mode.is_none() && cur.len() >= meta_io_negative_cap()) {
+            return std::sync::Arc::clone(cur);
+        }
+        let mut next: HashMap<PathBuf, Option<MetaIoMode>> = (**cur).clone();
+        next.insert(path.to_path_buf(), mode);
+        std::sync::Arc::new(next)
+    });
+}
 
 /// Metadata device paths registered `O_DIRECT` (`meta_io_direct_paths`).
 pub static META_IO_DIRECT_PATHS: std::sync::atomic::AtomicU64 =
@@ -646,14 +681,22 @@ fn test_meta_buffered() -> bool {
     crate::env_knobs::bool_knob("SQUEEZEFS_TEST_META_BUFFERED", false)
 }
 
-/// The posture of `path`, if registered.
+/// The posture of `path`, if registered: one lock-free load and one hash
+/// probe on every path the registry has seen (registered, or resolved
+/// unregistered before); a first-seen path resolves its canonical spelling
+/// ONCE (`META_IO_MODE_RESOLVES`) and the answer is remembered.
 pub fn meta_io_mode(path: &Path) -> Option<MetaIoMode> {
-    let modes = META_IO_MODES.read().unwrap_or_else(|e| e.into_inner());
-    modes.get(path).copied().or_else(|| {
-        std::fs::canonicalize(path)
-            .ok()
-            .and_then(|c| modes.get(&c).copied())
-    })
+    let modes = META_IO_MODES.load();
+    if let Some(known) = modes.get(path) {
+        return *known;
+    }
+    let resolved = std::fs::canonicalize(path)
+        .ok()
+        .and_then(|c| modes.get(&c).copied().flatten());
+    drop(modes);
+    META_IO_MODE_RESOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    remember_meta_io_mode(path, resolved);
+    resolved
 }
 
 /// The alignment grain the KV layer's aligned forms use for `path`: the
@@ -829,21 +872,27 @@ pub fn register_meta_device(path: &Path) -> Result<MetaIoMode> {
             }
         }
     };
-    let mut modes = META_IO_MODES.write().unwrap_or_else(|e| e.into_inner());
-    modes.insert(path.to_path_buf(), mode);
-    if let Ok(c) = std::fs::canonicalize(path) {
-        modes.insert(c, mode);
-    }
+    // Both spellings, POSITIVE — overwriting a negative entry a read
+    // before the registration left (`classify_volume_slot` registers at
+    // the door's first read; the worker's fd cache re-opens the path in
+    // the new posture at its next use).
+    let canonical = std::fs::canonicalize(path).ok();
+    META_IO_MODES.rcu(|cur| {
+        let mut next: HashMap<PathBuf, Option<MetaIoMode>> = (**cur).clone();
+        next.insert(path.to_path_buf(), Some(mode));
+        if let Some(c) = &canonical {
+            next.insert(c.clone(), Some(mode));
+        }
+        std::sync::Arc::new(next)
+    });
     Ok(mode)
 }
 
-/// Forget every registered metadata path (the test harnesses' reset —
-/// a sandbox file's path is reused across suites in one process).
+/// Forget every registered metadata path — and every remembered negative
+/// (the test harnesses' reset — a sandbox file's path is reused across
+/// suites in one process).
 pub fn clear_meta_devices() {
-    META_IO_MODES
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
+    META_IO_MODES.store(std::sync::Arc::new(HashMap::new()));
 }
 
 /// A heap buffer with a guaranteed alignment — the direct-I/O staging

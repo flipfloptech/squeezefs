@@ -580,6 +580,80 @@ fn a_grain_the_page_arithmetic_cannot_honour_refuses_the_registration() {
     }
 }
 
+/// **The posture lookup on the hot path is one load and one probe**
+/// (review round 1, Issue 8): `meta_io_mode` runs on every `uring_fs`
+/// open, read span and read buffer of every path. A registered path (both
+/// spellings) answers without resolving anything; a path the registry
+/// never saw resolves its canonical spelling ONCE and its NEGATIVE answer
+/// is remembered (`META_IO_MODE_RESOLVES` moves once per distinct path,
+/// never per I/O — the `RwLock` form paid a `canonicalize(2)` per miss
+/// per I/O); a registration OVERWRITES a remembered negative, and the
+/// harness reset forgets both.
+#[test]
+fn the_posture_lookup_resolves_a_path_once_and_never_on_a_hit() {
+    use squeezefs::uring_fs::META_IO_MODE_RESOLVES;
+    clear_meta_devices();
+    let dir = tempfile::tempdir().unwrap();
+    let meta = dir.path().join("meta0");
+    std::fs::File::create(&meta)
+        .and_then(|f| f.set_len(PAGES * JOURNAL_PAGE_LEN))
+        .unwrap();
+    let staging = dir.path().join("staging-0");
+    std::fs::File::create(&staging).unwrap();
+    let mode = register_meta_device(&meta).expect("register");
+    let canon = std::fs::canonicalize(&meta).unwrap();
+
+    // Hits resolve nothing, whichever registered spelling asks.
+    let r0 = META_IO_MODE_RESOLVES.load(Ordering::Relaxed);
+    for _ in 0..1_000 {
+        assert_eq!(meta_io_mode(&meta), Some(mode));
+        assert_eq!(meta_io_mode(&canon), Some(mode));
+    }
+    assert_eq!(
+        META_IO_MODE_RESOLVES.load(Ordering::Relaxed),
+        r0,
+        "a registered path's lookup never canonicalizes"
+    );
+
+    // An unregistered path resolves ONCE; the negative answer is remembered.
+    assert_eq!(meta_io_mode(&staging), None);
+    let r1 = META_IO_MODE_RESOLVES.load(Ordering::Relaxed);
+    assert_eq!(r1, r0 + 1, "the first miss resolves the path once");
+    for _ in 0..1_000 {
+        assert_eq!(meta_io_mode(&staging), None);
+    }
+    assert_eq!(
+        META_IO_MODE_RESOLVES.load(Ordering::Relaxed),
+        r1,
+        "a remembered miss is one probe, never a resolution"
+    );
+
+    // A registration overwrites the remembered negative.
+    let m2 = register_meta_device(&staging).expect("register the staging path too");
+    assert_eq!(meta_io_mode(&staging), Some(m2));
+    assert_eq!(META_IO_MODE_RESOLVES.load(Ordering::Relaxed), r1);
+
+    // An alias spelling of a registered path resolves once, then hits.
+    let alias = dir.path().join("alias-to-meta0");
+    std::os::unix::fs::symlink(&meta, &alias).unwrap();
+    assert_eq!(
+        meta_io_mode(&alias),
+        Some(mode),
+        "resolved through canonicalize"
+    );
+    let r2 = META_IO_MODE_RESOLVES.load(Ordering::Relaxed);
+    assert_eq!(r2, r1 + 1);
+    for _ in 0..100 {
+        assert_eq!(meta_io_mode(&alias), Some(mode));
+    }
+    assert_eq!(META_IO_MODE_RESOLVES.load(Ordering::Relaxed), r2);
+
+    // The reset forgets positives and negatives alike.
+    clear_meta_devices();
+    assert_eq!(meta_io_mode(&meta), None);
+    assert_eq!(meta_io_mode(&staging), None);
+}
+
 /// The harness seam keeps a registered path BUFFERED (the two-host pin's
 /// control arm): grain 1, nothing padded, the fallback gauge counts it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

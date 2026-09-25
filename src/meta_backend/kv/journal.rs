@@ -210,6 +210,20 @@ pub fn ring_max_pad_for(path: &Path) -> u64 {
 
 /// The §4.4 pt 5 checkpoint-task ring reserve for a ring of `ring_len`
 /// physical bytes: `max(256 KiB, ring/64)`.
+///
+/// Sized in RECORD bytes; under the sector-pad law (PR 13i, design-
+/// symmetric-metadata §5.12) it binds in WINDOWS: on a 4096-grain device
+/// every reservation occupies whole pages (its entry plus its pad to the
+/// page end) and the checkpoint task journals ONE entry per SMO
+/// (`smo_replace` reserves per record), so the reserve is
+/// `reserve / page_data_len` checkpoint-class SMO records per pass before
+/// the deferral class engages — 64 at the floor (256 KiB ÷ 4,072 B), 128
+/// on the 32 MiB ring (512 KiB); on a 512-grain device
+/// `reserve / (entry + max_pad)` ≈ 256 KiB ÷ (≈ 230 + 533 B) ≈ 340. The
+/// bytes are kept as the derivation (the record cost is the law's input;
+/// the grain multiplies it into a window count), and the economy that
+/// removes most of the term — one flush pass's SMO records in ONE window,
+/// one pad per pass — is PR 14's (the acceptance record §7 (f)).
 pub fn checkpoint_reserve_bytes(ring_len: u64) -> u64 {
     (256 * 1024).max(ring_len / 64)
 }

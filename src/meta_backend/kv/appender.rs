@@ -854,6 +854,19 @@ fn dir_checksum(img: &[u8]) -> u64 {
 /// legal transaction could never commit — 384 KiB — rounded UP to the
 /// power of two so the segment count is a whole number of the shipped
 /// 64 KiB–1 MiB extents: 512 KiB.
+///
+/// In WINDOWS under the sector-pad law (PR 13i, §5.12): a floor ring's
+/// user-admissible slice is `512 KiB − reserve − max_pad` ≈ 259 KiB, and on
+/// a 4096-grain device every conveyor window occupies whole pages whatever
+/// its bytes, so the slice is ≈ 63 windows (259,072 ÷ 4,072 B) — a SERIAL
+/// committer on a floor ring cycles the checkpoint every ≈ 63 commits (the
+/// park-kick law drains it at once; PR 13g's growth carries a busy joiner
+/// off the floor); on 512-grain `slice / (batch bytes + 533 B)`. The floor
+/// stays the ADMISSIBILITY law in bytes — one `MAX_ENTRY_LEN` window
+/// (128 KiB + `max_pad`) must admit beside the reserve, which 512 KiB
+/// satisfies at every legal grain — and the grain's cost is the window
+/// COUNT stated here, PR 14's SMO-window economy the item that shrinks
+/// it (the acceptance record §7 (f)).
 pub const SYM_RING_FLOOR_BYTES: u64 =
     (256 * 1024 + super::journal::MAX_ENTRY_LEN).next_power_of_two();
 

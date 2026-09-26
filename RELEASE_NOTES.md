@@ -87,6 +87,64 @@ mount is a read-token client whose metadata is exact at the next resolve
   [.benchmarks/2026-09-19-sym-acceptance.md](.benchmarks/2026-09-19-sym-acceptance.md)
   §7 / §9).
 
+**Shipped-bug fixes on EVERY layout made along the symmetric program (PR 3
+→ PR 13h; each red-first, each pinned — `--single-writer` volumes and the
+pre-program flat path included):**
+
+- **The NVMe Reservation Report was read into a FIXED 4 KiB buffer**
+  (`src/meta_backend/reservation.rs`), silently truncating at the 63rd
+  extended registrant; the read is two-step, sized by the report's own
+  REGCTL, and the registrant cap is DECLARED (`SQUEEZEFS_PR_REGISTRANT_CAP`)
+  or LEARNED from a device-answered REGISTER refusal that repeats at the
+  same count (gauges `pr_registrants_per_namespace`, `pr_report_bytes`,
+  `pr_registrant_cap`, `pr_registrant_cap_refusals`).
+- **A root swap journals no pointer record**, so a kill between the swap
+  (the D4 compaction nudge, the merge sweep's root collapse) and the next
+  ledger record replayed through the PREDECESSOR root while the mount gate
+  parked the swap's `free(old)` — the bring-up cover's tail then released
+  the LIVE root's extent and the next claim overwrote it with a fresh node
+  image. `ExtentAllocator::load` defers every replayed park and the mount
+  drops a free whose extent a mounted root names once every tree is open
+  (`meta_kv_replay_root_frees_dropped`, a WARN per drop).
+- **`rename` locked the two parents' keys only** and staged a ctime
+  `Delta` on the moved inode (and a `Put` on an overwritten destination) it
+  never locked, so a concurrent layout publish of the same inode co-queued
+  in one conveyor batch (a lost ctime in release, the pass's same-key
+  sentinel in debug); it runs the unlink path's two-phase lock law now
+  (`tests/rename_lock_set_tests.rs`).
+- **An offline PROBE's `shutdown` wrote a checkpoint** — every offline
+  `squeezefs fsck` wrote a ledger record from a "read-only probe";
+  content-equivalent on a flat volume, a LOSS on a forest whose writer died
+  with unpublished slot trees (the ledger advanced past window records the
+  probe's own replay skipped). A probe joins the no-write teardown arm.
+- **A clean unmount left claimed-but-unreachable extents** — the final
+  cycle's pending-free releases dirtied bitmap pages the shutdown fixpoint
+  never wrote (6 extents on a 60-file volume, 43 on a 50 k-file one, +1 per
+  idle mount cycle for the volume's life); the fixpoint converges on the
+  bitmap's dirty pages too, so a clean unmount of either layout leaves
+  `claimed ≡ reachable`.
+- **The daemon raises its soft `RLIMIT_NOFILE` to the hard limit at
+  startup** — for the cluster-wire listener caps alone (`uring_fs`'s open-
+  file cache derives from the limit AS FOUND, byte-identical to before);
+  the listener's connection cap derives from the raw core count
+  (`(cpus × 16).clamp(64, nofile / 8)`, `SQUEEZEFS_CLUSTER_WIRE_MAX_CONNS`
+  railed by the fd budget) and a dial that meets a listener accepting-and-
+  closing before its challenge retries then surfaces the typed
+  `ListenerRefused` (EAGAIN) instead of a first-EOF `InvalidOperation`.
+- **The fuse3 fork's reply task stormed `WARN … may reply interrupted fuse
+  request … ENOENT` once per kernel notification** whose inode the kernel
+  had already dropped: a notification's `ENOENT` is a counted outcome
+  (`fuse3_notify_enoent`), its other errnos counted per frame and announced
+  once per class (`fuse3_notify_failed`), never a WARN per frame and never
+  the end of the reply task. The fork also speaks `FUSE_NOTIFY_PRUNE` (uapi
+  7.45) where the kernel does.
+- **The checkpoint cadence tick's ORDER** (every layout): the age decision
+  is read before the threshold drain, a due cycle skips the drain (its
+  flush pass appends every dirty node), and the drain runs under ONE
+  pass-wide rotated budget — the same verdict off `last_checkpoint`, the
+  term bookkeeping beside it (the forest's cadence derives its trigger from
+  the measured cycle term; a flat volume's is decision-identical).
+
 **SPDK retired as an NVMe-oF target (forward-only).** Owner ruling
 R-SYM-8 (2026-09-12, [docs/design-symmetric-metadata.md](docs/design-symmetric-metadata.md)
 §5.8.1, KD-SYM-23; record

@@ -4989,6 +4989,17 @@ impl KvMetaBackend {
     /// partitioned open's commits EMPTY at the remount). The arm re-loads
     /// the table (idempotent) and its fence install is the refused second
     /// one.
+    ///
+    /// Primed at the writer's FIRST frame writer, which is the claim
+    /// gate's ring-recovery preflight, not the bring-up (PR 14 — the
+    /// kill-9 soak on the flipped default): a crash whose replay window
+    /// exhausts the ring runs `preclaim_ring_recovery`'s guarded cycles
+    /// BEFORE `writer_bring_up`, and their flush passes appended the
+    /// replayed records under `(0, 0)` — the same rule-3 shape, on the
+    /// dead writer's last acked creates (`sym_coherence_tests::
+    /// a_writer_recovering_an_exhausted_ring_inside_its_gate_stamps_the_
+    /// leases_generation`). Every caller is idempotent, so the bring-up's
+    /// prime stays for the offline verbs that never run the gate.
     async fn prime_frame_stamps(self: &Arc<Self>) -> std::result::Result<(), KvError> {
         let Some(plane) = self.appenders.as_ref().and_then(|a| a.slot_leases()) else {
             return Ok(());
@@ -17648,8 +17659,16 @@ impl KvMetaBackend {
     /// audited for progress (`checkpoint_cycle`'s clause-b rung), so a
     /// genuinely wedged tail fails loud long before the bound with a
     /// named cause — never a 30 s-per-rung silent park.
-    async fn preclaim_ring_recovery(&self) -> std::result::Result<(), KvError> {
+    async fn preclaim_ring_recovery(self: &Arc<Self>) -> std::result::Result<(), KvError> {
         use super::checkpoint::COVER_CYCLES_MAX;
+        // The guarded cycles below (and the deferred alignment's) are the
+        // open's FIRST frame writer on a forest: their flush passes
+        // append the replayed records to the slot-tree leaves, so the
+        // frame stamps are primed HERE — before any of them — or every
+        // such frame carries `(0, 0)` below the leaf's leased generation
+        // and rule 3 screens the crashed writer's acked records at the
+        // next load (PR 14, `prime_frame_stamps`'s doc).
+        self.prime_frame_stamps().await?;
         // The head alignment a full ring deferred at the open (review
         // round 1, Issue 3) lands FIRST — the ring's first write, before
         // the preflight's own admission is even asked.

@@ -66,6 +66,21 @@ mount is a read-token client whose metadata is exact at the next resolve
   per-slot ino watermarks it began with), so a creator that outpaces its
   walk can no longer keep an online `squeezefs fsck` chasing the tree's
   tail for the creator's whole life (the acceptance record's §4.4aw).
+- **An acked-writes loss on every forest volume's death path, fixed
+  red-first (the acceptance record's §4.4ax):** a writer whose kill-9 left a
+  replay window that exhausts the journal ring recovers the ring inside its
+  claim gate (bounded checkpoint cycles before the claim — the
+  mount-refusal wedge face), and those cycles flushed the dead writer's
+  replayed records into the slot-tree leaves before the frame fence was
+  primed — frames stamped `(0, 0)` below the leaf's leased generation, which
+  the §5.8.2 screen's rule 3 ended the log at on the NEXT open: the dead
+  writer's last acked creates were present on the recovering mount and gone
+  after its clean unmount. Reachable since PR 1 on any symmetric-forest
+  volume; the flip's matrix found it the first time the kill-9 soak's
+  volume was a forest. The frame stamps are primed at the open's first
+  frame writer now (`sym_coherence_tests::a_writer_recovering_an_exhausted_
+  ring_inside_its_gate_stamps_the_leases_generation`; the soak green ×5 from
+  zero). A `--single-writer` volume has no fence and is untouched.
 - **The flip lands after the owner's cloud decision**: the box brackets of
   every design §8 gate on the flip binary and the two-host / cloud rows are
   what that decision reads (the record

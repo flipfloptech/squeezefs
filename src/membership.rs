@@ -189,63 +189,6 @@ pub fn member_id_matches(entry: &str, client_id: &str) -> bool {
     false
 }
 
-/// **The live claim holder's durable identity** — the mechanism
-/// `docs/design-per-volume-claim-admission.md` §5.1.1's `recognizes`
-/// clause (a) needs and does not name (PR 3's correction box; supplied by
-/// PR 4 as KD-PV-17).
-///
-/// # The identity gap this closes
-///
-/// `WriterClaim.id` is a **per-mount uuid** (a fresh `Uuid::new_v4()` at
-/// every open) while `claim_set.owner` is a **durable KD-MW-2 member id**.
-/// Comparing them is the rung-9 finding #3 mistake that once refused every
-/// healthy fleet's first co-writer, so per-volume admission decides over a
-/// resolution of the live holder — and *"never adopt on silence"*
-/// (KD-PV-3) makes an unresolvable holder a refusal.
-///
-/// # Why the ATTESTATION lives here rather than anywhere else
-///
-/// Three candidate resolutions exist and only this one is cold-start-safe:
-///
-/// * a **membership-census lookup** answers *who is alive*, not *who wrote
-///   this claim*, and it needs the set authority reachable at the instant
-///   a peer mounts — mount ordering would become load-bearing beyond what
-///   §5.1.1 already requires, and a fleet whose census is still forming
-///   would refuse every peer volume;
-/// * a **rendezvous-record read** names one owner PER SET (and, since
-///   sweep row 17, only on the slot-0 volume), so it cannot name a
-///   per-volume holder at all;
-/// * the **claim-set holder attestation**, written by the holder itself,
-///   on the volume it claims, beside the claim it explains. It needs no
-///   peer, no network and no third record; a reader resolves it from
-///   bytes it already replays.
-///
-/// It is deliberately NOT a member-roster entry: KD-PV-4 requires the
-/// roster form to stay **pid-less** (`pid == 0`, empty `boot`) precisely
-/// so the rung-8 same-boot prune exempts it, and writing live pids into
-/// the roster would re-manufacture the assignment-vs-enrollment
-/// disagreement that precision exists to prevent.
-///
-/// # It is an attestation, never a second truth
-///
-/// A holder record proves nothing on its own: [`ClaimSet::resolve_holder`]
-/// admits it only when its `(writer_id, pid, boot)` triple matches the
-/// claim actually replayed, so a stale attestation from a dead incarnation
-/// is INERT (it resolves nothing and the open refuses) rather than
-/// misleading. The durable `owner` field still says who *should* append;
-/// this says which durable identity the current `writer_claim` belongs to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClaimHolder {
-    /// The holder's durable KD-MW-2 member id.
-    pub id: String,
-    /// The `WriterClaim.id` (per-mount uuid) this attestation is about.
-    pub writer_id: String,
-    /// The holder's pid, as the claim carries it.
-    pub pid: u32,
-    /// The holder's boot id, as the claim carries it.
-    pub boot: String,
-}
-
 /// Who a member is — the durable half of membership (identity survives a
 /// crash and must be recovered; liveness does not).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,28 +244,6 @@ pub struct ClaimSet {
     pub term: u64,
     /// The member writers.
     pub members: Vec<ClaimSetMember>,
-    /// **The durable member id that appends to THIS volume**
-    /// (`docs/design-per-volume-claim-admission.md` §5.2, KD-PV-2).
-    /// `None` = the legacy shape — the set's sole authority appends to
-    /// every volume — which is every set today: nothing in the product
-    /// writes this field yet (PR 7's offline `volume set-owners` verb is
-    /// the first writer) and nothing reads it to make a decision.
-    ///
-    /// Ownership lives on the volume it describes, beside that volume's
-    /// own `writer_claim`, precisely so that one record cannot disagree
-    /// with itself; a set-wide table would elevate a cache divergence
-    /// into durable state.
-    pub owner: Option<String>,
-    /// KD-PV-12 (opt-in): ordered, statically-declared adoption
-    /// candidates for this volume. Empty by default — **ownership does
-    /// not fail over**; a successor still has to be granted the claim by
-    /// the unchanged D0 ladder.
-    pub successors: Vec<String>,
-    /// **KD-PV-17**: the durable identity of the mount that currently
-    /// holds this volume's `writer_claim`, attested by that mount itself
-    /// (see [`ClaimHolder`]). `None` = unattested, which every set in the
-    /// field is and which a per-volume admission reads as SILENCE.
-    pub holder: Option<ClaimHolder>,
     /// `true` = decoded from the durable `claim_set` record; `false` = the
     /// projection of a singular `writer_claim`. Never serialized — it is a
     /// property of where the answer came from.
@@ -337,9 +258,6 @@ impl ClaimSet {
             v: 1,
             term,
             members: Vec::new(),
-            owner: None,
-            successors: Vec::new(),
-            holder: None,
             durable: false,
         }
     }
@@ -347,18 +265,10 @@ impl ClaimSet {
     /// The **projection** every un-engaged volume answers with: the
     /// singular `writer_claim` as a one-member set. Consumers therefore
     /// never branch on engagement.
-    ///
-    /// It never carries an `owner`: an un-engaged volume cannot hold an
-    /// assignment (the record it would live in is refused by
-    /// [`ClaimSet::store`]), so a projected owner would be an ownership
-    /// claim nothing wrote.
     pub fn from_writer_claim(claim: &WriterClaim) -> Self {
         Self {
             v: 1,
             term: claim.term,
-            owner: None,
-            successors: Vec::new(),
-            holder: None,
             members: vec![ClaimSetMember {
                 identity: MemberIdentity {
                     id: claim.id.clone(),
@@ -376,16 +286,14 @@ impl ClaimSet {
 
     /// Encode the durable record (compact JSON — the `writer_claim` /
     /// `client:{id}` family's format, so an operator can read it with the
-    /// same tools).
-    ///
-    /// `owner` and `successors` are emitted **only when non-empty**, so an
-    /// unassigned set's bytes are byte-identical to the pre-ownership
-    /// image — the law that keeps every volume in the field unchanged on
-    /// disk because this code exists
-    /// (design-per-volume-claim-admission §5.2.2, pinned against a frozen
-    /// literal in `tests/dlm_membership_tests.rs`).
+    /// same tools). The image is the pre-program record's, pinned against
+    /// a frozen literal in `tests/dlm_membership_tests.rs`: the retired
+    /// per-volume-owner recipe's `owner` / `successors` / `holder` keys
+    /// (PR 14) are never written — a pre-1.3.0 record carrying them
+    /// decodes with the assignment IGNORED and its next RMW writes this
+    /// image (`enable-symmetric` reports the assignment DROPPED, §7.3).
     pub fn encode(&self) -> Vec<u8> {
-        let mut obj = serde_json::json!({
+        let obj = serde_json::json!({
             "v": self.v,
             "term": self.term,
             "members": self.members.iter().map(|m| serde_json::json!({
@@ -398,33 +306,14 @@ impl ClaimSet {
                 "ts": m.ts,
             })).collect::<Vec<_>>(),
         });
-        if let Some(map) = obj.as_object_mut() {
-            if let Some(owner) = &self.owner {
-                map.insert("owner".to_string(), serde_json::json!(owner));
-            }
-            if !self.successors.is_empty() {
-                map.insert("successors".to_string(), serde_json::json!(self.successors));
-            }
-            // KD-PV-17: emitted only when attested, so an unassigned set's
-            // bytes stay byte-identical to the pre-ownership image.
-            if let Some(h) = &self.holder {
-                map.insert(
-                    "holder".to_string(),
-                    serde_json::json!({
-                        "id": h.id,
-                        "writer_id": h.writer_id,
-                        "pid": h.pid,
-                        "boot": h.boot,
-                    }),
-                );
-            }
-        }
         obj.to_string().into_bytes()
     }
 
     /// Decode a stored record. `None` for anything unparseable — a claim
     /// set we cannot attribute proves nothing, exactly like an
-    /// unparseable `writer_claim`.
+    /// unparseable `writer_claim`. Unknown keys (a pre-1.3.0 record's
+    /// `owner` / `successors` / `holder`) are ignored — the tolerant
+    /// `get(...).and_then(...)` law in both directions.
     pub fn decode(raw: &[u8]) -> Option<Self> {
         let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
         let mut members = Vec::new();
@@ -448,55 +337,19 @@ impl ClaimSet {
             v: v.get("v").and_then(|x| x.as_u64()).unwrap_or(1) as u32,
             term: v.get("term").and_then(|x| x.as_u64()).unwrap_or(0),
             members,
-            // Tolerant in BOTH directions (the existing
-            // `get(...).and_then(...)` law): a pre-ownership record
-            // decodes unassigned, and an assigned record written by a
-            // newer binary decodes here rather than refusing.
-            owner: v
-                .get("owner")
-                .and_then(|x| x.as_str())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
-            successors: v
-                .get("successors")
-                .and_then(|x| x.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|s| s.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
-            // A partial holder record decodes to `None`: an attestation
-            // that cannot name all four of its facts attests nothing, and
-            // silence refuses (KD-PV-3) rather than half-resolving.
-            holder: v.get("holder").and_then(|h| {
-                Some(ClaimHolder {
-                    id: h.get("id")?.as_str()?.to_string(),
-                    writer_id: h.get("writer_id")?.as_str()?.to_string(),
-                    pid: h.get("pid")?.as_u64()? as u32,
-                    boot: h.get("boot")?.as_str()?.to_string(),
-                })
-            }),
             durable: true,
         })
     }
 
-    /// **Resolve a live `writer_claim` to the durable member id of its
-    /// holder** (KD-PV-17) — `None` = unresolved, which every per-volume
-    /// admission reads as SILENCE and refuses on.
-    ///
-    /// The attestation is admitted only when it is about **this** claim:
-    /// the `(writer_id, pid, boot)` triple must match what the volume
-    /// actually replayed. A predecessor's leftover record therefore
-    /// resolves nothing instead of naming the wrong node, which is what
-    /// makes the field an attestation rather than a second truth able to
-    /// disagree with the claim beside it.
-    pub fn resolve_holder(&self, claim: &WriterClaim) -> Option<&str> {
-        let h = self.holder.as_ref()?;
-        (h.writer_id == claim.id && h.pid == claim.pid && h.boot == claim.boot && !h.id.is_empty())
-            .then_some(h.id.as_str())
+    /// A pre-1.3.0 record's `volume set-owners` assignment, if the raw
+    /// record still carries one — read for `enable-symmetric`'s DROPPED
+    /// report only (§7.3); nothing decides on it and nothing writes it.
+    pub fn retired_owner_assignment(raw: &[u8]) -> Option<String> {
+        let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
+        v.get("owner")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
     }
 
     /// Every non-zero NVMe registrant key in the set — the PR half of
@@ -589,66 +442,6 @@ async fn load_for_update(be: &KvMetaBackend, term: u64) -> Result<ClaimSet> {
     Ok(ClaimSet::empty(term))
 }
 
-/// **Attest this mount as the live holder of `be`'s `writer_claim`**
-/// (KD-PV-17, [`ClaimHolder`]) — the publisher half of the resolution a
-/// per-volume admission's rung 6 and `open_peer_owned` decide over.
-///
-/// Called ONLY by the partial-writer open, on volumes this mount OWNS and
-/// only after the D0 ladder committed their claims: a mount that has not
-/// declared a per-volume posture writes nothing here, so every set in the
-/// field keeps its exact `claim_set` bytes. Returns `false` (writing
-/// nothing) on a volume without bit 14 — the same law
-/// [`upsert_writer_member`] obeys — on a volume this mount holds no
-/// claim on, because attesting a claim we did not write would be the
-/// self-assertion the whole plane refuses, and on a volume with no
-/// durable claim set at all, because there is no assignment to resolve a
-/// holder against.
-///
-/// **The attestation never advances `set.term`** (the mw_fleet `--owners`
-/// finding, 2026-08-23): it is "an attestation about ONE claim, verified
-/// against that claim" (KD-PV-17) — not a membership change — and its era
-/// is implicit in the claim it names. The shipped `set.term.max(term)`
-/// stamped this mount's OWN new era into the record between the D0 gate
-/// and `arm_owner`'s predecessor read, so the set authority read its own
-/// stamp back as a newer predecessor and refused to arm against itself
-/// (`term <= prior_term`), deterministically, on every remount.
-pub async fn publish_claim_holder(be: &KvMetaBackend, member_id: &str, term: u64) -> Result<bool> {
-    if !claim_set_engaged(be.superblock().features_incompat) {
-        return Ok(false);
-    }
-    let Some(claim) = be.read_writer_claim().await else {
-        return Ok(false);
-    };
-    if claim.pid != std::process::id()
-        || claim.boot != crate::meta_backend::kv::backend::read_boot_id()
-    {
-        return Ok(false);
-    }
-    if !matches!(be.getxattr(1, CLAIM_SET_XATTR).await, Ok(Some(_))) {
-        return Ok(false); // no durable set — nothing to attest into
-    }
-    let holder = ClaimHolder {
-        id: member_id.to_string(),
-        writer_id: claim.id.clone(),
-        pid: claim.pid,
-        boot: claim.boot.clone(),
-    };
-    let mut set = load_for_update(be, term).await?;
-    if set.holder.as_ref() == Some(&holder) {
-        return Ok(false); // idempotent: a remount of the same claim writes nothing
-    }
-    set.holder = Some(holder);
-    ClaimSet::store(be, &set).await?;
-    log::info!(
-        "claim set on {}: attested '{member_id}' as the live holder of writer_claim '{}' \
-         (KD-PV-17 — a peer resolves the per-mount uuid to this durable identity, and an \
-         unattested holder is silence)",
-        be.device_path().display(),
-        claim.id
-    );
-    Ok(true)
-}
-
 /// Record `identity` as a member of `be`'s claim set (§6.2 **item 7**),
 /// preserving every other member's entry — ONE commit per membership
 /// CHANGE, never per beat.
@@ -666,10 +459,6 @@ pub async fn upsert_writer_member(
     if !claim_set_engaged(be.superblock().features_incompat) {
         return Ok(false);
     }
-    // The RMW read: fail-closed where an ownership assignment may exist,
-    // today's fallback everywhere else (`load_for_update`). The mutation
-    // below touches MEMBERS only, so `owner`/`successors` ride through
-    // the store untouched.
     let mut set = load_for_update(be, term).await?;
     set.term = set.term.max(term);
     // Rung-8 finding #3: PRUNE same-host provably-dead writer entries —
@@ -744,12 +533,8 @@ pub async fn withdraw_writer_member(be: &KvMetaBackend, id: &str) -> Result<bool
         return Ok(false);
     }
     // A departing LAST member deletes the record, so a departed set
-    // presents as unclaimed — unless the volume carries a per-volume
-    // ownership assignment. Under D19 that assignment is durable operator
-    // state which outlives every mount (only `volume set-owners --clear`
-    // removes it), so the memberless record is stored rather than
-    // deleted; unassigned sets vanish exactly as before.
-    if set.members.is_empty() && set.owner.is_none() && set.successors.is_empty() {
+    // presents as unclaimed.
+    if set.members.is_empty() {
         ClaimSet::clear(be).await?;
     } else {
         ClaimSet::store(be, &set).await?;
@@ -1663,22 +1448,6 @@ impl MembershipOwner {
     /// to classify an unacked recall as expired-with-lease or live.
     pub fn now_ms(&self) -> u64 {
         self.clock.now_ms()
-    }
-
-    /// The ids of every `Reader` member whose lease is live on this clock
-    /// — PR 5's recall-gated free reads it to tell a token client from an
-    /// S5 reader still enrolled on the set (design-symmetric-metadata
-    /// §5.7.3: the ring bypass applies only when NO S5 reader is live).
-    pub fn live_reader_ids(&self) -> Vec<String> {
-        let now = self.now_ms();
-        let mut out = Vec::new();
-        self.members.iter_sync(|id, st| {
-            if st.role == MemberRole::Reader && now < st.deadline_ms {
-                out.push(id.clone());
-            }
-            true
-        });
-        out
     }
 
     fn grant_for(&self, epoch: u64, now: u64) -> Grant {

@@ -6905,33 +6905,6 @@ pub struct Metrics {
     /// machineries composing correctly under flush-leg/ACK-path mixing;
     /// the counter existing at 0 on a pure-shadow workload is normal.
     pub rewrite_shadow_superseded: Align64<AtomicU64>,
-    // The supply-coupled epoch close on co-writer lanes (finding 15's
-    // parked-supply term — `.benchmarks/2026-09-07-rewrite-epoch-supply-close.md`;
-    // design-rewrite-program §5.3; `SQUEEZEFS_REWRITE_SUPPLY_CLOSE`;
-    // tests/rewrite_shadow_supply_close_tests.rs). ALL 0 on a
-    // single-writer / authority mount BY CONSTRUCTION (the sink installs
-    // only on a harvesting lane).
-    /// Epoch closes the refill tick fired because the lane's reachable
-    /// supply sat below its watermark (⊆ `rewrite_shadow_swaps`).
-    pub rewrite_shadow_supply_closes: Align64<AtomicU64>,
-    /// Parked A keys those closes released into the recycle loop — the
-    /// engagement instrument: a rewriting co-writer whose lane ENOSPCs
-    /// with this flat is parking its supply to the iteration boundary.
-    pub rewrite_shadow_supply_close_blocks: Align64<AtomicU64>,
-    /// Refill ticks that declined because the lane covered one loop
-    /// transit (`reachable ≥ watermark`, or a quiet writer's watermark 0)
-    /// — the healthy co-writer's per-tick beat. Growing beside lane
-    /// ENOSPC refusals = the watermark is not reading the starvation
-    /// (predicate rot).
-    pub rewrite_shadow_supply_close_declined_covered: Align64<AtomicU64>,
-    /// Starving ticks with no epoch parking anything — nothing to inject;
-    /// the KD-1.7-only shape.
-    pub rewrite_shadow_supply_close_declined_no_parked: Align64<AtomicU64>,
-    /// Candidate epochs a tick left open because larger ones already
-    /// covered the deficit (the storm bound engaging — many small epochs).
-    /// Growing beside lane ENOSPC refusals = the deficit under-reads the
-    /// need.
-    pub rewrite_shadow_supply_close_bounded: Align64<AtomicU64>,
     /// Write-commit-economy lever 1 (2026-07-30): publish-conveyor
     /// passes committed (one save each). With
     /// `layout_publish_batched_blocks` gives the live coalesce factor —
@@ -11703,16 +11676,14 @@ impl SqueezefsFilesystem {
                 "reader_revalidate_interval_ms": if self.revalidating_volume_count() > 0 {
                     crate::ro_coherence::reader_revalidate_interval().as_millis() as u64
                 } else { 0 },
-                // PR 5 (design-symmetric-metadata §5.7.2): under READ
-                // TOKENS the user-visible metadata bound is 0 — a foreign
-                // change is visible at the reader's next resolve after
-                // the recall; the gauge stays for tooling, at 0
-                // (`ro_coherence::metadata_staleness_bound_ms`).
-                "reader_staleness_bound_ms": if self.revalidating_volume_count() > 0 {
-                    crate::ro_coherence::metadata_staleness_bound_ms(
-                        self.meta_backend.as_ref().map_or(&[][..], |mb| &mb.volumes[..]),
-                    )
-                } else { 0 },
+                // PR 5 (design-symmetric-metadata §5.7.2) / PR 14: every
+                // `-o ro` mount is a READ-TOKEN client, so the user-visible
+                // metadata bound is 0 BY CONSTRUCTION — a foreign change is
+                // visible at the reader's next resolve after the recall;
+                // the gauge stays for tooling, at the literal 0
+                // (`ro_coherence::metadata_staleness_bound`). The poll's
+                // own cadence is `reader_revalidate_interval_ms` above.
+                "reader_staleness_bound_ms": 0,
                 // How many distinct OWNERS this mount's projection depends
                 // on (§5.11(a)'s tripwire pair, not a max): 0 on a write
                 // mount, 1 on today's reader/co-writer shape, K−1 on a
@@ -11859,11 +11830,6 @@ impl SqueezefsFilesystem {
                 // The supply-coupled epoch close on co-writer lanes
                 // (finding 15's parked-supply term; 0 on every
                 // single-writer / authority mount by construction).
-                "rewrite_shadow_supply_closes": METRICS.rewrite_shadow_supply_closes.load(Ordering::Relaxed),
-                "rewrite_shadow_supply_close_blocks": METRICS.rewrite_shadow_supply_close_blocks.load(Ordering::Relaxed),
-                "rewrite_shadow_supply_close_declined_covered": METRICS.rewrite_shadow_supply_close_declined_covered.load(Ordering::Relaxed),
-                "rewrite_shadow_supply_close_declined_no_parked": METRICS.rewrite_shadow_supply_close_declined_no_parked.load(Ordering::Relaxed),
-                "rewrite_shadow_supply_close_bounded": METRICS.rewrite_shadow_supply_close_bounded.load(Ordering::Relaxed),
                 // Residence decomposition (2026-07-31 write-wall
                 // campaign, conviction 2): ALWAYS-ON per-phase histograms
                 // — admission → detach → lock → crypto → allocate → DMA
@@ -14324,14 +14290,6 @@ impl SqueezefsFilesystem {
                 metrics.insert(
                     "free_grace_recall_timeout_deferrals".into(),
                     serde_json::json!(crate::free_grace::recall_timeout_deferrals()),
-                );
-                metrics.insert(
-                    "free_grace_s5_reader_deferrals".into(),
-                    serde_json::json!(crate::free_grace::s5_reader_deferrals()),
-                );
-                metrics.insert(
-                    "free_grace_s5_class_scans".into(),
-                    serde_json::json!(crate::free_grace::s5_class_scans()),
                 );
                 // The control-plane poll's economy (PR 5's predicted-slot-
                 // first ledger read): bytes ÷ `meta_kv_revalidate_polls` is

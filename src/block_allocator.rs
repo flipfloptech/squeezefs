@@ -1066,10 +1066,10 @@ impl BlockAllocator {
     /// the list empty and then reads `trim_claimed` must see the claim
     /// that emptied it (`await_trim_return` — the funnel's park on the
     /// window's return edge, `alloc_trim_window_parks`). The claim moves
-    /// membership only: the offset stays in [`Self::lane_reachable_blocks`]
-    /// (`LaneCountedSet::remove_for_trim`) because the funnel reaches it —
-    /// a §5.9 refresh or a watermark tick inside the window must not read
-    /// the batch as a deficit (`.benchmarks/2026-09-08-placement-refresh-race.md`).
+    /// membership only: the offset stays in [`Self::reachable_free_blocks`]
+    /// (`ReachableFreeSet::remove_for_trim`) because the funnel reaches it —
+    /// a §5.9 refresh inside the window must not read the batch as a
+    /// deficit (`.benchmarks/2026-09-08-placement-refresh-race.md`).
     pub fn claim_free_for_trim(self: &Arc<Self>, offset: u64) -> Option<InflightAllocGuard> {
         let idx = offset / self.chunk_size;
         self.trim_claimed.fetch_add(1, Ordering::SeqCst);
@@ -1472,13 +1472,9 @@ impl BlockAllocator {
     /// Snapshot the incarnation word for a fill. `None` while unstable
     /// (in-flight write or retired/free) — the fill must not publish. Offsets
     /// with no recorded incarnation (written before this process / by another
-    /// node) are treated as stable.
-    ///
-    /// On an AUTHORITY the recorded incarnations include every foreign-lane
-    /// offset it ever freed for a peer; those words are re-published by
-    /// the served publish that re-adopts the offset
-    /// ([`Self::witness_served_binding`]), so "unstable" here means
-    /// mid-transition on SOME node, never "this node cannot know".
+    /// node) are treated as stable: an incarnation word is this mount's own
+    /// transition ledger, and a peer's DMA under a block grant reaches this
+    /// mount only through the durable references its publish lands.
     pub fn fill_incarnation(&self, offset: u64) -> Option<u64> {
         match self
             .incarnations

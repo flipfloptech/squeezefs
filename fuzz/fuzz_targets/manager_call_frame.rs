@@ -531,13 +531,13 @@ fn check_identity_peer_screen(frame: &ManagerRequestFrame, peer_bytes: &[u8]) {
         );
         return;
     };
-    let own = squeezefs::cowriter::node_member_id_of(identity.node_token, identity.mount_slot);
+    let own = squeezefs::member_id::node_member_id_of(identity.node_token, identity.mount_slot);
     assert!(
         screen_identity_peer(&frame.call, &own).is_none(),
         "the identity's own member id always passes"
     );
     let strict = !matches!(frame.call, ManagerCall::JoinAppender { .. });
-    let foreign_member = squeezefs::cowriter::parse_node_member_id(&peer).is_some();
+    let foreign_member = squeezefs::member_id::parse_node_member_id(&peer).is_some();
     let expect_reject = peer != own && (strict || foreign_member);
     assert_eq!(verdict.is_some(), expect_reject, "peer={peer:?} own={own}");
     if let Some(reason) = verdict {

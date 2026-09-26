@@ -36,7 +36,7 @@ use libfuzzer_sys::fuzz_target;
 use squeezefs::meta_ship::publish::{
     decode_reply_frame, decode_request_frame, encode_reply_frame, encode_request_frame,
     FreeVerdict, PublishCall, PublishCallOutcome, PublishReply, PublishReplyFrame,
-    PublishRequestFrame, WireBlockRefOp, WireFreedBlock, WireLaneFree, PUBLISH_SCHEMA,
+    PublishRequestFrame, WireBlockRefOp, WireFreedBlock, PUBLISH_SCHEMA,
 };
 use squeezefs::meta_ship::wire::{WireDirEntry, WireError, WireInode};
 
@@ -165,24 +165,9 @@ enum ArbCall {
         offset: u64,
         max: u32,
     },
-    RaiseAllocLane {
-        vol_tag: u64,
-        lane: u16,
-        writers: u16,
-        upto: u64,
-        lease_epoch: u64,
-    },
     FreeBlocks {
         vol_tag: u64,
         blocks: Vec<u64>,
-        lease_epoch: u64,
-        request_id: u64,
-    },
-    HarvestLaneFree {
-        vol_tag: u64,
-        lane: u16,
-        writers: u16,
-        max: u64,
         lease_epoch: u64,
         request_id: u64,
     },
@@ -199,10 +184,6 @@ enum ArbCall {
         ino: u64,
         lease_epoch: u64,
         request_id: u64,
-    },
-    BlockRefPopulation {
-        vol_tag: u64,
-        block_idxs: Vec<u64>,
     },
     MigrateBlockMap {
         ino: u64,
@@ -299,19 +280,6 @@ impl From<ArbCall> for PublishCall {
             ArbCall::ReaddirStream { dir, offset, max } => {
                 PublishCall::ReaddirStream { dir, offset, max }
             }
-            ArbCall::RaiseAllocLane {
-                vol_tag,
-                lane,
-                writers,
-                upto,
-                lease_epoch,
-            } => PublishCall::RaiseAllocLane {
-                vol_tag,
-                lane,
-                writers,
-                upto,
-                lease_epoch,
-            },
             ArbCall::FreeBlocks {
                 vol_tag,
                 blocks,
@@ -320,21 +288,6 @@ impl From<ArbCall> for PublishCall {
             } => PublishCall::FreeBlocks {
                 vol_tag,
                 blocks,
-                lease_epoch,
-                request_id,
-            },
-            ArbCall::HarvestLaneFree {
-                vol_tag,
-                lane,
-                writers,
-                max,
-                lease_epoch,
-                request_id,
-            } => PublishCall::HarvestLaneFree {
-                vol_tag,
-                lane,
-                writers,
-                max,
                 lease_epoch,
                 request_id,
             },
@@ -363,13 +316,6 @@ impl From<ArbCall> for PublishCall {
                 ino,
                 lease_epoch,
                 request_id,
-            },
-            ArbCall::BlockRefPopulation {
-                vol_tag,
-                block_idxs,
-            } => PublishCall::BlockRefPopulation {
-                vol_tag,
-                block_idxs,
             },
             ArbCall::MigrateBlockMap {
                 ino,
@@ -428,15 +374,7 @@ enum ArbReply {
     },
     Cap(u64),
     Page(Vec<(u64, u64, String, u32)>),
-    LaneFrontier(u64),
     FreeVerdicts(Vec<u8>),
-    LaneFreeGrant {
-        blocks: Vec<u64>,
-        bound_age_ms: u64,
-        release_ages_ms: Vec<u64>,
-        grant_seq: u64,
-    },
-    Populations(Vec<u64>),
     MapMigrated {
         records: u64,
         record_bytes: u64,
@@ -445,15 +383,6 @@ enum ArbReply {
         freed: Vec<ArbFreed>,
         gen: u64,
     },
-}
-
-/// The schema-16 lane-free notice — the durable identity pair plus the
-/// grant-sequence witness.
-#[derive(Arbitrary, Debug)]
-struct ArbLaneFree {
-    vol_tag: u64,
-    block_idx: u64,
-    after_grants: u64,
 }
 
 #[derive(Arbitrary, Debug)]
@@ -473,9 +402,6 @@ struct ArbInput {
     client: String,
     calls: Vec<ArbCall>,
     outcomes: Vec<ArbOutcome>,
-    lane_frees: Vec<ArbLaneFree>,
-    // Schema 17: the co-writer pack-group flag.
-    pack_group: bool,
 }
 
 fn reply_from(r: ArbReply) -> PublishReply {
@@ -542,7 +468,6 @@ fn reply_from(r: ArbReply) -> PublishReply {
                 })
                 .collect(),
         ),
-        ArbReply::LaneFrontier(f) => PublishReply::LaneFrontier(f),
         // Picked by byte so every verdict arm is reachable without a
         // derive on the wire type.
         ArbReply::FreeVerdicts(vs) => PublishReply::FreeVerdicts(
@@ -554,18 +479,6 @@ fn reply_from(r: ArbReply) -> PublishReply {
                 })
                 .collect(),
         ),
-        ArbReply::LaneFreeGrant {
-            blocks,
-            bound_age_ms,
-            release_ages_ms,
-            grant_seq,
-        } => PublishReply::LaneFreeGrant {
-            blocks,
-            bound_age_ms,
-            release_ages_ms,
-            grant_seq,
-        },
-        ArbReply::Populations(p) => PublishReply::Populations(p),
         ArbReply::MapMigrated {
             records,
             record_bytes,
@@ -611,7 +524,6 @@ fuzz_target!(|data: &[u8]| {
         schema,
         client: input.client,
         calls: input.calls.into_iter().map(Into::into).collect(),
-        pack_group: input.pack_group,
     };
     // Past the CONTROL cap the encoder REFUSES (a layout that large rides
     // the indirect map blob, never the wire) — that refusal is the
@@ -633,15 +545,6 @@ fuzz_target!(|data: &[u8]| {
                 ArbOutcome::Refused { status, detail } => {
                     PublishCallOutcome::Refused { status, detail }
                 }
-            })
-            .collect(),
-        lane_frees: input
-            .lane_frees
-            .into_iter()
-            .map(|n| WireLaneFree {
-                vol_tag: n.vol_tag,
-                block_idx: n.block_idx,
-                after_grants: n.after_grants,
             })
             .collect(),
     };

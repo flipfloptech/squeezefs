@@ -2181,7 +2181,6 @@ impl KvMetaBackend {
         Ok(be)
     }
 
-
     /// This volume's durable `vol-{hex}` identity — see
     /// [`durable_volume_id_of`], which the mount path calls over the
     /// discovery's uuids before any backend exists.
@@ -4049,14 +4048,8 @@ impl KvMetaBackend {
     /// terminal free runs under the free-grace recall gate. Idempotent.
     pub fn arm_token_holder(&self) -> Arc<crate::meta_ship::token_plane::TokenHolderPlane> {
         let plane = self.tokens_holder.get_or_init(|| {
-            // The gate's reader-class law: a free bypasses the ring only
-            // when every live reader of the set is a token client of this
-            // holder. One holder counted per armed volume; the clean leave
+            // One holder counted per armed volume; the clean leave
             // (`shutdown`) uncounts it.
-            crate::free_grace::install_token_client_probe(crate::free_grace::TokenClientProbe {
-                is_client: Arc::new(crate::meta_ship::token_plane::is_token_client),
-                generation: Arc::new(crate::meta_ship::token_plane::token_clients_generation),
-            });
             crate::free_grace::arm_recall_gate();
             let plane = Arc::new(crate::meta_ship::token_plane::TokenHolderPlane::new());
             // The membership departure sweep reaches this holder.
@@ -11884,6 +11877,47 @@ impl KvMetaBackend {
         hi
     }
 
+    /// The per-slot exclusive ceilings on RAW local inos this volume's
+    /// keyspaces could have minted so far, keyed by FOREST slot (`0` the
+    /// native keyspace, `s + 1` guest slot `s` — the key ino's high bits):
+    /// [`Self::max_local_ino_watermark`] decomposed instead of folded.
+    /// A slot with no cursor here (a joined appender's, never hosted) is
+    /// absent — a reader bounds nothing there. The online census walks
+    /// each slot's records up to its ceiling as of the walk's START and
+    /// jumps to the next slot past it (PR 13i's record §4.4aw — a creator
+    /// that outpaces the walk kept every page's tail ahead of the cursor
+    /// for its whole life); a record minted past the ceiling is the next
+    /// census's, exactly like one minted behind a cursor that already
+    /// passed its key.
+    pub fn slot_ino_watermarks(
+        &self,
+    ) -> std::collections::BTreeMap<super::record::ForestSlot, u64> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut raise = |slot: super::record::ForestSlot, ceiling: u64| {
+            let e = out.entry(slot).or_insert(0);
+            *e = (*e).max(ceiling);
+        };
+        raise(0, self.next_ino());
+        self.guest_cursors.iter_sync(|slot, cursor| {
+            raise(
+                super::record::forest_slot_of_ino(crate::meta_backend::guest_local_ino(*slot, 0)),
+                cursor.snapshot(),
+            );
+            true
+        });
+        if let Some(plane) = self.slot_leases() {
+            for (slot, lease) in plane.table.snapshot() {
+                raise(slot, lease.words.cursor);
+            }
+        }
+        if let Some(words) = self.forest_slot_words.get() {
+            for (slot, w) in words {
+                raise(*slot, w.cursor);
+            }
+        }
+        out
+    }
+
     /// `true` ⇔ the record at EFFECTIVE local `local_ino` was minted
     /// **before this mount's writer era began** — fsck class C9's
     /// candidate filter (`src/fsck.rs`).
@@ -16130,9 +16164,7 @@ impl KvMetaBackend {
         // `sym_dir_stripe_tests::{an_offline_probes_shutdown_writes_nothing,
         // a_probe_over_a_live_page_records_no_inode_plane_verdict,
         // a_degraded_writers_shutdown_runs_its_whole_ladder}`.
-        if self.probe
-            || self.ro_cause == ReadOnlyCause::ReaderMount
-        {
+        if self.probe || self.ro_cause == ReadOnlyCause::ReaderMount {
             // PR 5: a token reader's clean leave RELEASES its grants at
             // the holder (a wire call, no device write) — a departed
             // reader whose tokens stayed would cost the holder a full
@@ -20065,6 +20097,11 @@ impl KvMetaBackend {
             native_slot,
             capacity,
             live_pages_at_mount,
+            page0_at_open: entries
+                .first()
+                .and_then(|e| e.page.as_ref())
+                .map(|p| p.identity)
+                .filter(|id| id.node_token != 0),
             joins: AtomicU64::new(0),
             leaves: AtomicU64::new(0),
             self_recoveries: AtomicU64::new(0),

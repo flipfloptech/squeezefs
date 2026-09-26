@@ -1,11 +1,15 @@
-//! **The co-writer ENOSPC wedge** — the fleet finding recorded in
-//! `.benchmarks/2026-09-06-cowriter-enospc-wedge.md` (evidence
-//! `.benchmarks/rows-d4-s11-20260905/m57.log`, `m50.stats.json`).
+//! **A write-path allocation refusal is TERMINAL for that write** — the
+//! fleet finding recorded in `.benchmarks/2026-09-06-cowriter-enospc-wedge.md`
+//! (evidence `.benchmarks/rows-d4-s11-20260905/m57.log`, `m50.stats.json`),
+//! re-shaped at PR 14 onto the one store every writer has: the co-writer's
+//! allocation LANE that found it retired with the posture (a joined
+//! writer's supply is PR 8's block grant, whose exhaustion the holder
+//! answers `Full` — `tests/sym_block_grant_tests.rs`), and the wedge's
+//! LAW is the allocator's, whatever fed it.
 //!
 //! On the s11-mpiio fleet (1 authority + 8 co-writers, 32 ior ranks on one
-//! shared file) every co-writer's allocation lane exhausted 23 s in. The
-//! refusal itself is correct (finding 15 — the free-grace recycle loop
-//! loses to the churn). What was WRONG is that the ENOSPC'd writes never
+//! shared file) every co-writer's supply exhausted 23 s in. The refusal
+//! itself was correct. What was WRONG is that the ENOSPC'd writes never
 //! terminated: 100 writes in flight for 30 minutes, 37k watchdog lines,
 //! the write-phase census naming `ov_alloc` and `write_checkout`, the
 //! lock-wait census naming a genuinely held stripe, a `cat .stats` in
@@ -17,58 +21,36 @@
 //! bounded-allocation park — held under the write's `BLOCK_FLUSH_LOCKS`
 //! guard (order 3, the `write_checkout` site) from
 //! `try_device_overlay_store` (phase `ov_alloc`) and every other write-path
-//! allocation site. Two compounding defects made "bounded" a lie:
-//!
-//! 1. `free_grace::pressure_park_wall_ms()` read `bound()` — the
-//!    **reallocation LABEL** (an owner-clock instant, `u64::MAX` on every
-//!    mount that is not a free-grace owner with members) — as if it were a
-//!    duration. The wall was `u64::MAX` ms on every co-writer, reader and
-//!    unarmed writer.
-//! 2. `reclaimable_supply_exists()` on a laned co-writer answered `true`
-//!    whenever a harvest SINK was installed — the existence of the wire,
-//!    not evidence of supply. The allocator therefore parked every
-//!    exhausted co-writer allocation forever, one authority harvest RPC per
-//!    50 ms slice (m50: 16,899 harvests for 16,769 refusals). (The per-
-//!    slice RPC itself was retired by the single-flight harvest — finding
-//!    15 phase B1, `SQUEEZEFS_ALLOC_LANE_HARVEST_SINGLE_FLIGHT`: a parked
-//!    retry declines on a fresh empty reply until a grant moves the
-//!    advertisement; the lever off is the shape above.)
+//! allocation site. `free_grace::pressure_park_wall_ms()` read `bound()` —
+//! the **reallocation LABEL** (an owner-clock instant, `u64::MAX` on every
+//! mount that is not a free-grace owner with members) — as if it were a
+//! duration, so the wall was `u64::MAX` ms on every mount that parked.
 //!
 //! # The contracts
 //!
-//! * the exact park ENDS: a laned allocator whose lane is exhausted refuses
-//!   `StorageFull` within the wall, whatever the authority reports;
-//! * an authority reporting nothing held is genuine exhaustion — the
-//!   co-writer refuses at once, exactly like the local empty-ring arm;
 //! * the wall is a DURATION derived from the plane's routine fence bound,
 //!   never the label;
-//! * the solo control: a full single-writer store refuses at once (today's
-//!   law, untouched);
-//! * at the mount: writes against an exhausted lane TERMINATE within a
-//!   bound, leave every block stripe free, leave the write pipeline with
-//!   nothing in flight, leave the mount answering `getattr` and `.stats`,
-//!   and surface the exhaustion honestly at the durability boundary;
+//! * a full store with nothing reclaimable refuses at once — no park;
+//! * at the mount: writes against a full store TERMINATE within a bound,
+//!   leave every block stripe free, leave the write pipeline with nothing
+//!   in flight, leave the mount answering `getattr` and `.stats`, and
+//!   surface the exhaustion honestly at the durability boundary;
 //! * error isolation, recovery once space returns, and the
 //!   `write_enospc_refusals` gauge.
-//!
-//! RED against `dev` (8168e26e): every test that reaches the park times
-//! out at its 10 s bound instead of returning `StorageFull`.
 
 use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
 use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
-use squeezefs::data_alloc_lane::{LaneHarvest, LaneHarvestSink};
 use squeezefs::dlm::DlmClient;
 use squeezefs::error::SqueezefsError;
 use squeezefs::free_grace;
-use squeezefs::fuse_client::{SqueezefsFilesystem, BLOCK_FLUSH_LOCKS, METRICS, STATS_INODE};
+use squeezefs::fuse_client::{SqueezefsFilesystem, BLOCK_FLUSH_LOCKS, STATS_INODE};
 use squeezefs::membership::{
     self, JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole, MembershipOwner,
 };
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder};
-use squeezefs::meta_backend::kv::journal::AppendPartition;
 use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
 use squeezefs::meta_backend::RoutedMetaBackend;
 use squeezefs::routing::DataRouter;
@@ -83,8 +65,8 @@ use tempfile::NamedTempFile;
 /// magnitude above the longest legal park on an unarmed plane (1 s wall).
 const BOUND: Duration = Duration::from_secs(10);
 
-/// Block size for the mount-level rig: striped at small sizes so the lane
-/// exhausts in a handful of blocks.
+/// Block size for the mount-level rig: striped at small sizes so the store
+/// fills in a handful of blocks.
 const BS: u64 = 65536;
 
 // ---------------------------------------------------------------------------
@@ -119,7 +101,6 @@ impl Drop for Restore {
         write_pipeline::set_depth_override(None);
         free_grace::reset_for_test();
         membership::uninstall();
-        squeezefs::block_allocator::test_clear_harvest_single_flight();
     }
 }
 
@@ -129,7 +110,7 @@ fn restore() -> Restore {
 }
 
 // ---------------------------------------------------------------------------
-// The allocator rig: a laned co-writer whose authority answers the harvest
+// The allocator rig: a store minted to capacity
 // ---------------------------------------------------------------------------
 
 async fn allocator(id: &str, capacity_blocks: u64) -> Arc<BlockAllocator> {
@@ -138,209 +119,13 @@ async fn allocator(id: &str, capacity_blocks: u64) -> Arc<BlockAllocator> {
     a
 }
 
-fn part(writers: u16, id: u16) -> AppendPartition {
-    AppendPartition::new(writers, id).expect("partition")
-}
-
-/// The authority as the co-writer's harvest sees it: an EMPTY grant (the
-/// lane's supply is gone) carrying the authority's live bound age. A
-/// nonzero `hint` is the field shape (m50 read 15,096 ms — the authority's
-/// ring held offsets under the storm); `0` is "nothing held".
-struct EmptyAuthority {
-    calls: AtomicU64,
-    hint_ms: AtomicU64,
-}
-
-impl EmptyAuthority {
-    fn new(hint_ms: u64) -> Arc<Self> {
-        Arc::new(Self {
-            calls: AtomicU64::new(0),
-            hint_ms: AtomicU64::new(hint_ms),
-        })
-    }
-
-    fn sink(self: &Arc<Self>) -> LaneHarvestSink {
-        let me = Arc::clone(self);
-        Arc::new(move |_max: u64| {
-            let me = Arc::clone(&me);
-            Box::pin(async move {
-                me.calls.fetch_add(1, Ordering::Relaxed);
-                Ok(LaneHarvest {
-                    blocks: Vec::new(),
-                    bound_age_hint_ms: me.hint_ms.load(Ordering::Relaxed),
-                    rtt_ms: 1,
-                    release_ages_ms: Vec::new(),
-                    grant_seq: 0,
-                })
-            })
-        })
-    }
-
-    fn calls(&self) -> u64 {
-        self.calls.load(Ordering::Relaxed)
-    }
-}
-
-/// A laned allocator (lane 1 of 2) with `capacity_blocks` of device, wired
-/// to `authority`, with its whole lane share already minted.
-async fn exhausted_co_writer(
-    id: &str,
-    capacity_blocks: u64,
-    authority: &Arc<EmptyAuthority>,
-) -> Arc<BlockAllocator> {
-    let a = allocator(id, capacity_blocks).await;
-    a.engage_alloc_lanes(part(2, 1))
-        .expect("engage lane 1 of 2");
-    a.set_lane_harvest_sink(authority.sink());
-    let share = squeezefs::data_alloc_lane::lane_capacity_blocks(capacity_blocks, 2, 1);
-    for i in 0..share {
-        let off = a
-            .allocate_block()
-            .await
-            .unwrap_or_else(|e| panic!("mint {i} of the lane share: {e}"));
-        assert_eq!(
-            (off / a.chunk_size()) % 2,
-            1,
-            "every mint is in this mount's residue class"
-        );
-    }
-    a
-}
-
 fn is_storage_full(e: &SqueezefsError) -> bool {
     matches!(e, SqueezefsError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull)
 }
 
 // ---------------------------------------------------------------------------
-// 1. The exact park ends
+// 1. The wall and the solo control
 // ---------------------------------------------------------------------------
-
-/// The field shape verbatim: the lane is exhausted, every harvest comes back
-/// empty, and the authority reports a held ring (nonzero bound age). The
-/// bounded allocation must PARK (finding 29's promise — the retries drive
-/// the authority's pressure fence) and then REFUSE at the wall. Against
-/// `dev` it never returns: the wall is `u64::MAX`.
-///
-/// The retries' harvests are single-flight with a fresh-empty decline
-/// (finding 15 phase B1, `SQUEEZEFS_ALLOC_LANE_HARVEST_SINGLE_FLIGHT`):
-/// with no grant arriving, the park re-issues NOTHING after the one empty
-/// reply — every slice's retry declines (`alloc_lane_harvest_declined_stale`)
-/// and the verdict lands at the same wall. The lever off restores one RPC
-/// per slice (the sibling test below).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_bounded_allocation_ends_on_an_exhausted_co_writer_lane() {
-    let _s = serial();
-    let _r = restore();
-    let authority = EmptyAuthority::new(15_096);
-    let a = exhausted_co_writer("f15-wedge-park", 8, &authority).await;
-
-    // The honest refusal the field logged, once per attempt.
-    let refusals0 = METRICS.alloc_lane_enospc_refusals.load(Ordering::Relaxed);
-    let e = a.allocate_block().await.expect_err("the lane is exhausted");
-    assert!(is_storage_full(&e), "lane exhaustion is StorageFull: {e}");
-    assert!(
-        METRICS.alloc_lane_enospc_refusals.load(Ordering::Relaxed) > refusals0,
-        "the refusal is counted on alloc_lane_enospc_refusals"
-    );
-    assert_eq!(authority.calls(), 1, "the exhausted allocation asked once");
-
-    let parks0 = free_grace::pressure_parks();
-    let declined0 = METRICS
-        .alloc_lane_harvest_declined_stale
-        .load(Ordering::Relaxed);
-    let wall = free_grace::pressure_park_wall_ms();
-    let t0 = Instant::now();
-    let verdict = tokio::time::timeout(BOUND, a.allocate_block_grace_bounded())
-        .await
-        .expect("THE WEDGE: the bounded allocation must end within the bound");
-    let elapsed = t0.elapsed();
-    let e = verdict.expect_err("the lane is still exhausted");
-    assert!(is_storage_full(&e), "the verdict stays StorageFull: {e}");
-    assert!(
-        free_grace::pressure_parks() > parks0,
-        "the park engaged (the retries are what drive the authority's fence)"
-    );
-    assert_eq!(
-        authority.calls(),
-        1,
-        "the empty reply stands until a grant moves the advertisement: no slice re-issued"
-    );
-    assert!(
-        METRICS
-            .alloc_lane_harvest_declined_stale
-            .load(Ordering::Relaxed)
-            > declined0,
-        "every slice's retry declined"
-    );
-    assert!(
-        elapsed.as_millis() as u64 <= wall + 2_000,
-        "the park ends at the wall ({wall} ms) — took {elapsed:?}"
-    );
-}
-
-/// The A/B control: `SQUEEZEFS_ALLOC_LANE_HARVEST_SINGLE_FLIGHT=0` is the
-/// shipped shape verbatim — each park slice re-runs the harvest (the m50
-/// storm's mechanism: 16,899 harvests for 16,769 refusals), and the park
-/// still ends at the wall.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_lever_off_re_runs_the_harvest_every_park_slice() {
-    let _s = serial();
-    let _r = restore();
-    squeezefs::block_allocator::test_set_harvest_single_flight(Some(false));
-    let authority = EmptyAuthority::new(15_096);
-    let a = exhausted_co_writer("f15-wedge-park-off", 8, &authority).await;
-    let _ = a.allocate_block().await.expect_err("the lane is exhausted");
-
-    let parks0 = free_grace::pressure_parks();
-    let harvests0 = authority.calls();
-    let wall = free_grace::pressure_park_wall_ms();
-    let t0 = Instant::now();
-    let verdict = tokio::time::timeout(BOUND, a.allocate_block_grace_bounded())
-        .await
-        .expect("the bounded allocation must end within the bound");
-    let elapsed = t0.elapsed();
-    let e = verdict.expect_err("the lane is still exhausted");
-    assert!(is_storage_full(&e), "the verdict stays StorageFull: {e}");
-    assert!(free_grace::pressure_parks() > parks0, "the park engaged");
-    assert!(
-        authority.calls() > harvests0 + 1,
-        "lever off: each park slice re-ran the harvest"
-    );
-    assert!(
-        elapsed.as_millis() as u64 <= wall + 2_000,
-        "the park ends at the wall ({wall} ms) — took {elapsed:?}"
-    );
-    assert!(squeezefs::block_allocator::test_clear_harvest_single_flight());
-}
-
-/// An authority reporting NOTHING held (bound age 0) is genuine exhaustion
-/// for the co-writer exactly as an empty local ring is for the authority:
-/// refuse at once, no park slices at all.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_authority_holding_nothing_refuses_the_co_writer_without_a_park() {
-    let _s = serial();
-    let _r = restore();
-    let authority = EmptyAuthority::new(0);
-    let a = exhausted_co_writer("f15-wedge-honest", 8, &authority).await;
-
-    let parks0 = free_grace::pressure_parks();
-    let t0 = Instant::now();
-    let verdict = tokio::time::timeout(BOUND, a.allocate_block_grace_bounded())
-        .await
-        .expect("THE WEDGE: the bounded allocation must end within the bound");
-    let elapsed = t0.elapsed();
-    let e = verdict.expect_err("genuine exhaustion refuses");
-    assert!(is_storage_full(&e), "the verdict stays StorageFull: {e}");
-    assert_eq!(
-        free_grace::pressure_parks(),
-        parks0,
-        "nothing reclaimable was reported — no park slice is taken"
-    );
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "genuine exhaustion refuses promptly — took {elapsed:?}"
-    );
-}
 
 /// The wall is a DURATION derived from the plane's routine fence bound —
 /// twice it, floored at one second — never the reallocation label. Against
@@ -407,10 +192,11 @@ async fn the_park_wall_is_a_duration_never_the_reallocation_label() {
     );
 }
 
-/// The single-writer control: a full solo store (no lanes, no grace ring)
-/// refuses through the bounded form at once — today's law, untouched.
+/// A full store with nothing reclaimable (no grace ring) refuses through
+/// the bounded form at once — the park is for supply the grace ring holds,
+/// never for genuine exhaustion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_solo_control_a_full_single_writer_store_refuses_at_once() {
+async fn a_full_store_with_nothing_reclaimable_refuses_at_once() {
     let _s = serial();
     let _r = restore();
     let a = allocator("f15-wedge-solo", 2).await;
@@ -435,7 +221,7 @@ async fn the_solo_control_a_full_single_writer_store_refuses_at_once() {
 }
 
 // ---------------------------------------------------------------------------
-// The mount-level rig: a cache-less striped mount over a laned allocator
+// The mount-level rig: a cache-less striped mount over a small store
 // ---------------------------------------------------------------------------
 
 struct H {
@@ -448,13 +234,8 @@ struct H {
 
 /// A cache-less mount (RAM tiers + direct block I/O — no staging detour, so
 /// the never-lossy ladder's terminal arm is "keep parked") whose allocator
-/// is lane 1 of 2 over `capacity_blocks`, harvesting from `authority`.
-async fn make(
-    uuid: [u8; 16],
-    alloc_ns: &str,
-    capacity_blocks: u64,
-    authority: &Arc<EmptyAuthority>,
-) -> H {
+/// holds `capacity_blocks` of device.
+async fn make(uuid: [u8; 16], alloc_ns: &str, capacity_blocks: u64) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
     // The accumulation machinery is under test (the field's holder sat in
     // the overlay's allocation under the same guard — the allocator park
@@ -473,9 +254,6 @@ async fn make(
     ));
     let ba = Arc::new(BlockAllocator::new(alloc_ns).await.unwrap());
     ba.set_capacity_bytes(capacity_blocks * ba.chunk_size());
-    ba.engage_alloc_lanes(part(2, 1))
-        .expect("engage lane 1 of 2");
-    ba.set_lane_harvest_sink(authority.sink());
     let cache = TieredCache::new(
         vec![],
         Some("64MB"),
@@ -586,13 +364,13 @@ async fn bounded_stats(h: &H) -> serde_json::Value {
     serde_json::from_slice(&reply.data).expect("stats JSON")
 }
 
-/// Fill the lane exactly: one striped file of `blocks` full blocks, durable.
-async fn fill_lane(h: &H, name: &str, blocks: u64) -> u64 {
+/// Fill the store exactly: one striped file of `blocks` full blocks, durable.
+async fn fill_store(h: &H, name: &str, blocks: u64) -> u64 {
     let ino = create(h, name).await;
     let data = pattern((blocks * BS) as usize, 0x11);
     let written = bounded_write(&h.fs, h.req, ino, 0, data)
         .await
-        .expect("the lane share fits");
+        .expect("the store's capacity fits");
     assert_eq!(written as u64, blocks * BS);
     bounded_fsync(h, ino).await.expect("the fill is durable");
     let m =
@@ -605,7 +383,7 @@ async fn fill_lane(h: &H, name: &str, blocks: u64) -> u64 {
         .alloc
         .allocate_block()
         .await
-        .expect_err("the lane is exhausted exactly");
+        .expect_err("the store is full exactly");
     assert!(is_storage_full(&e), "{e}");
     ino
 }
@@ -634,19 +412,18 @@ async fn await_pipeline_drained(h: &H) {
 
 /// The field's holder shape (`SQUEEZEFS_WRITE_PIPELINE_DEPTH_BLOCKS=0`:
 /// the write itself owns the write-through and its allocation under the
-/// held block guard): N concurrent whole-block writes past the exhausted
-/// lane. Every one TERMINATES within the bound; every block stripe is free
+/// held block guard): N concurrent whole-block writes past the full
+/// store. Every one TERMINATES within the bound; every block stripe is free
 /// afterwards; `getattr` and `.stats` answer during and after; the write
 /// pipeline holds nothing; and the durability boundary surfaces the
 /// exhaustion honestly (`fsync` → `ENOSPC`) instead of a hang.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn exhausted_lane_writes_terminate_and_the_mount_keeps_answering() {
+async fn full_store_writes_terminate_and_the_mount_keeps_answering() {
     let _s = serial();
     let _r = restore();
     write_pipeline::set_depth_override(Some(0));
-    let authority = EmptyAuthority::new(0);
-    let h = make([0xF1; 16], "f15_wedge_mount_sync", 8, &authority).await;
-    let ino = fill_lane(&h, "shared.bin", 4).await;
+    let h = make([0xF1; 16], "f15_wedge_mount_sync", 4).await;
+    let ino = fill_store(&h, "shared.bin", 4).await;
 
     // The storm: 4 concurrent whole-block writes to blocks 4..8, with a
     // getattr and a `.stats` read racing them.
@@ -695,7 +472,7 @@ async fn exhausted_lane_writes_terminate_and_the_mount_keeps_answering() {
         assert_eq!(
             fsync,
             Err(libc::ENOSPC),
-            "acked bytes with no lane to land in surface ENOSPC at fsync"
+            "acked bytes with no block to land in surface ENOSPC at fsync"
         );
     }
     // And the mount still answers afterwards.
@@ -719,9 +496,8 @@ async fn a_parked_pipeline_upload_returns_its_permit_within_the_bound() {
     let _s = serial();
     let _r = restore();
     write_pipeline::set_depth_override(None);
-    let authority = EmptyAuthority::new(0);
-    let h = make([0xF2; 16], "f15_wedge_mount_pipe", 8, &authority).await;
-    let ino = fill_lane(&h, "shared.bin", 4).await;
+    let h = make([0xF2; 16], "f15_wedge_mount_pipe", 4).await;
+    let ino = fill_store(&h, "shared.bin", 4).await;
 
     let inflight0 = h.fs.write_pipeline.inflight_bytes();
     assert_eq!(inflight0, 0, "quiet before the storm");
@@ -751,16 +527,15 @@ async fn a_parked_pipeline_upload_returns_its_permit_within_the_bound() {
 // ---------------------------------------------------------------------------
 
 /// Error isolation: the refused write does not poison a sibling write to
-/// another block of the same file that DOES have a lane block to land in —
+/// another block of the same file that DOES have a block to land in —
 /// the sibling's bytes are durable and read back exact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_enospc_write_does_not_poison_its_sibling_block() {
     let _s = serial();
     let _r = restore();
     write_pipeline::set_depth_override(Some(0));
-    let authority = EmptyAuthority::new(0);
-    // Lane share 4; fill 3 so exactly ONE lane block remains.
-    let h = make([0xF3; 16], "f15_wedge_isolation", 8, &authority).await;
+    // Capacity 4; fill 3 so exactly ONE block remains.
+    let h = make([0xF3; 16], "f15_wedge_isolation", 4).await;
     let ino = create(&h, "shared.bin").await;
     let base = pattern((3 * BS) as usize, 0x11);
     bounded_write(&h.fs, h.req, ino, 0, base)
@@ -768,8 +543,8 @@ async fn an_enospc_write_does_not_poison_its_sibling_block() {
         .expect("3 blocks fit");
     bounded_fsync(&h, ino).await.expect("durable");
 
-    // Two concurrent whole-block writes: one lands in the last lane block,
-    // the other has nowhere to go.
+    // Two concurrent whole-block writes: one lands in the last block, the
+    // other has nowhere to go.
     let want3 = pattern(BS as usize, 0x33);
     let want4 = pattern(BS as usize, 0x44);
     let (w3, w4) = tokio::join!(
@@ -798,7 +573,7 @@ async fn an_enospc_write_does_not_poison_its_sibling_block() {
     assert_eq!(
         landed.len(),
         1,
-        "exactly one lane block remained: one sibling landed, one could not (map {bm:?}, fsync {fsync:?})"
+        "exactly one block remained: one sibling landed, one could not (map {bm:?}, fsync {fsync:?})"
     );
     assert_eq!(
         fsync,
@@ -818,17 +593,16 @@ async fn an_enospc_write_does_not_poison_its_sibling_block() {
     assert_eq!(&got[..], &want[..], "the landed sibling reads back exact");
 }
 
-/// Recovery: once space returns to the lane (the fixture file is unlinked
-/// and its blocks freed), new writes land and fsync succeeds — no latched
-/// dead state survives the ENOSPC episode.
+/// Recovery: once space returns (the fixture file is unlinked and its
+/// blocks freed), new writes land and fsync succeeds — no latched dead
+/// state survives the ENOSPC episode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn freeing_space_after_enospc_lets_new_writes_land() {
     let _s = serial();
     let _r = restore();
     write_pipeline::set_depth_override(Some(0));
-    let authority = EmptyAuthority::new(0);
-    let h = make([0xF4; 16], "f15_wedge_recovery", 8, &authority).await;
-    let full = fill_lane(&h, "filler.bin", 4).await;
+    let h = make([0xF4; 16], "f15_wedge_recovery", 4).await;
+    let full = fill_store(&h, "filler.bin", 4).await;
 
     let victim = create(&h, "victim.bin").await;
     let data = pattern(BS as usize, 0x55);
@@ -840,7 +614,7 @@ async fn freeing_space_after_enospc_lets_new_writes_land() {
         Err(errno) => assert_eq!(errno, libc::ENOSPC),
     }
 
-    // Space returns: the filler's four lane blocks come back — unlink, the
+    // Space returns: the filler's four blocks come back — unlink, the
     // kernel's RELEASE + FORGET-driven reclaim, the reclaimer's drain (the
     // `statfs_live_accounting_tests` delete-and-drain shape), each bounded.
     tokio::time::timeout(BOUND, async {
@@ -878,18 +652,17 @@ async fn freeing_space_after_enospc_lets_new_writes_land() {
 }
 
 /// The gauge: `write_enospc_refusals` counts exactly the WRITE replies
-/// refused `ENOSPC` — a fresh file's first striped write against the
-/// exhausted lane (the promotion allocates synchronously, so the write
-/// itself is refused) counts one; writes the never-lossy ladder ACKs and
+/// refused `ENOSPC` — a fresh file's first striped write against the full
+/// store (the promotion allocates synchronously, so the write itself is
+/// refused) counts one; writes the never-lossy ladder ACKs and
 /// the fsync that later reports them count none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_write_enospc_refusals_gauge_counts_exactly_the_refused_writes() {
     let _s = serial();
     let _r = restore();
     write_pipeline::set_depth_override(Some(0));
-    let authority = EmptyAuthority::new(0);
-    let h = make([0xF5; 16], "f15_wedge_gauge", 8, &authority).await;
-    let _full = fill_lane(&h, "filler.bin", 4).await;
+    let h = make([0xF5; 16], "f15_wedge_gauge", 4).await;
+    let _full = fill_store(&h, "filler.bin", 4).await;
 
     // Read through the stats inode (the operator's surface): a missing
     // key is the gauge not existing, which is its own failure.

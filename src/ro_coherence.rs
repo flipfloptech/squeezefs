@@ -618,30 +618,17 @@ pub fn token_reader_requested() -> bool {
     crate::fuse_client::read_only_mount()
 }
 
-/// **The user-visible METADATA staleness bound** in force for this
-/// mount's caches (R-SYM-4): **zero** under tokens — a kernel or daemon
-/// cache may hold an entry exactly as long as freshness is proven, and
-/// under a token that is "until the recall", which no TTL can express, so
-/// every TTL derives to 0 and every resolve reaches the token cache — else
-/// the S5 posture's [`reader_staleness_bound`]. The poll keeps its own
-/// bound as the control-plane cadence.
+/// **The user-visible METADATA staleness bound** in force for a `-o ro`
+/// mount's caches (R-SYM-4): **zero by construction** since the PR-14 flip
+/// — every read-only mount is a token client, a kernel or daemon cache
+/// may hold an entry exactly as long as freshness is proven, and under a
+/// token that is "until the recall", which no TTL can express, so every
+/// TTL derives to 0 and every resolve reaches the token cache. The poll
+/// keeps [`reader_staleness_bound`] as its CONTROL-plane cadence (the
+/// ledger slot it reads, the free-grace ladder's qualify term); the stats
+/// face publishes `reader_staleness_bound_ms` as the literal 0.
 pub fn metadata_staleness_bound() -> Duration {
-    if token_reader_requested() {
-        Duration::ZERO
-    } else {
-        reader_staleness_bound()
-    }
-}
-
-/// [`metadata_staleness_bound`] as the stats face publishes it
-/// (`reader_staleness_bound_ms`): 0 under tokens — by the mount's request
-/// or by an armed plane on any volume (the contracts arm the plane
-/// directly) — else the S5 bound in ms.
-pub fn metadata_staleness_bound_ms(volumes: &[Arc<KvMetaBackend>]) -> u64 {
-    if token_reader_requested() || volumes.iter().any(|v| v.token_reader().is_some()) {
-        return 0;
-    }
-    reader_staleness_bound().as_millis() as u64
+    Duration::ZERO
 }
 
 /// **Explicit kernel TTLs on a token reader are refused** (review round

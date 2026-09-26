@@ -4594,9 +4594,9 @@ async fn the_renewal_grant_carries_the_members_slot_leases_recalls_and_offers() 
     let vol = Arc::clone(&routed.volumes[0]);
     let (host, mut client, joiner) = wire_joiner(&vol, 6).await;
     let ident = joiner_identity(6);
-    let member_id = squeezefs::cowriter::node_member_id_of(ident.node_token, ident.mount_slot);
+    let member_id = squeezefs::member_id::node_member_id_of(ident.node_token, ident.mount_slot);
     assert_eq!(
-        squeezefs::cowriter::parse_node_member_id(&member_id),
+        squeezefs::member_id::parse_node_member_id(&member_id),
         Some((ident.node_token, ident.mount_slot))
     );
     // The joiner leases routing slot 400.

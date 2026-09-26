@@ -279,10 +279,12 @@ tasks:
   check:sym-forest:
     desc: >-
       The slot-tree forest's parametrized gate (design-symmetric-metadata
-      PR 1): the pre-forest KV suites run BOTH ways — flat, then with the
-      SQUEEZEFS_TEST_STAMP_SYMMETRIC=1 seam formatting every volume as a
-      forest — so a contract that holds on the shipped layout and not on
-      the forest is a red leg, not a hand-found review finding.
+      PR 1, INVERTED at the PR-14 flip): the KV suites run BOTH ways —
+      `flat` with the SQUEEZEFS_TEST_FORMAT_FLAT=1 seam formatting every
+      DEFAULT-class volume as `--single-writer`, then `stamped` on the
+      plain default (the symmetric forest, armed) — so a contract that
+      holds on one layout and not on the other is a red leg, not a
+      hand-found review finding.
     cmds:
       - tests/run_sym_forest_suites.sh
 

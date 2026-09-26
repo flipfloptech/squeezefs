@@ -1727,15 +1727,16 @@ leg_sym_join_ladder() {
         return
     fi
 
-    # Rung 1 through the real binary: a retired posture knob beside the plane
-    # refuses at the startup gate, before anything is opened (no --daemon —
-    # the refusal is synchronous; the timeout is the belt against a mount
-    # that wrongly proceeds).
-    SQUEEZEFS_SYMMETRIC_META=1 SQUEEZEFS_MULTI_WRITER=1 \
+    # Rung 1 through the real binary: a RETIRED posture knob (PR 14 —
+    # `Kind::Retired`, any value) refuses at the startup gate naming its
+    # successor, before anything is opened (no --daemon — the refusal is
+    # synchronous; the timeout is the belt against a mount that wrongly
+    # proceeds).
+    SQUEEZEFS_MULTI_WRITER=1 \
         timeout 30 "$FIDELI_BIN" mount "sqmeta://$meta" "$mnt" --allow-other > "$STATE/legs/sym-join-rung1.txt" 2>&1
     rc=$?
-    if [ "$rc" -ne 0 ] && grep -q "RETIRED on a symmetric mount" "$STATE/legs/sym-join-rung1.txt"; then
-        ok "SYMJOIN: rung 1 — SQUEEZEFS_MULTI_WRITER beside the plane refused at the startup gate naming the ladder (rc=$rc)"
+    if [ "$rc" -ne 0 ] && grep -q "SQUEEZEFS_MULTI_WRITER='1' was RETIRED" "$STATE/legs/sym-join-rung1.txt"; then
+        ok "SYMJOIN: rung 1 — SQUEEZEFS_MULTI_WRITER refused at the startup gate as a RETIRED spelling naming the join ladder (rc=$rc)"
     else
         bad "SYMJOIN: rung 1 — rc=$rc; $(head -3 "$STATE/legs/sym-join-rung1.txt")"
         umount -l "$mnt" 2>/dev/null

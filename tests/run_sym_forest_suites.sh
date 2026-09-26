@@ -105,11 +105,10 @@
 # a leave, its page restamped a foreign node's), and its fsck legs run
 # the probe over BOTH layouts' walkers.
 # `sym_mount_posture_tests` (PR 12 — the join ladder, the retired posture
-# knobs and verb, plane_gate by the held lease, the Issue-31 page words)
-# rides the list the PR 4 way: its armed fixtures stamp under the seam
-# themselves and its flat pins (a bit-17-absent set arms nothing, the
-# knobs keep their shipped meaning, `set-owners` runs its shipped gates)
-# run on both legs.
+# knobs, plane_gate by the held lease, the Issue-31 page words) rides the
+# list the PR 4 way: its armed fixtures name the forest explicitly and its
+# flat pins (a `--single-writer` set arms nothing, the retired knobs refuse
+# at startup) run on both legs.
 # `served_mutation_kernel_tests` (PR 13b — the HOLDER's kernel after a
 # served mutation: the invalidation + FUSE_NOTIFY_PRUNE frames, and the
 # FLAT/unarmed law that a mount's OWN mutations never reach the sink —

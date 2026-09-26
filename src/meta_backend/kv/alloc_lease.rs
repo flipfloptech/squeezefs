@@ -3370,23 +3370,22 @@ async fn acquire_and_hold<I: Iterator<Item = u64>>(
                     return Err(KvError::Busy(why));
                 };
                 // The D0 flock this open holds proves dead exactly ONE
-                // same-node holder: the predecessor MANAGER (its page is
-                // page 0 — the flock holder's page). A same-node holder
-                // whose page is any other is a JOINED appender of this
-                // host (PR 12b — alive as readily as dead; its death is
-                // the ledger's, never the flock's), and every other node's
-                // is a live foreign holder: the arm joins neither.
-                let dead_by_flock =
-                    super::appender::read_directory(vol0.device_path(), vol0.superblock())
-                        .await?
-                        .iter()
-                        .any(|e| {
-                            e.appender_id == 0
-                                && e.page.as_ref().is_some_and(|p| {
-                                    p.identity
-                                        .is_mount(rec.holder.node_token, rec.holder.mount_slot)
-                                })
-                        });
+                // same-node holder: the predecessor MANAGER — the identity
+                // page 0 carried when this open READ it (the flock
+                // holder's page; our join has since rewritten it with our
+                // own identity, so the directory names nobody else now).
+                // A same-node holder whose page is any other is a JOINED
+                // appender of this host (PR 12b — alive as readily as
+                // dead; its death is the ledger's, never the flock's), and
+                // every other node's is a live foreign holder: the arm
+                // joins neither.
+                let dead_by_flock = vol0
+                    .appenders_public()
+                    .and_then(|set| set.page0_at_open)
+                    .is_some_and(|p| {
+                        p.owned_by_node(me.node_token)
+                            && p.is_mount(rec.holder.node_token, rec.holder.mount_slot)
+                    });
                 if !dead_by_flock {
                     return Err(KvError::Busy(format!(
                         "{why}; the holder is a live writer of another mount — a joined \

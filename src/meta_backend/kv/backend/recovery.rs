@@ -3327,7 +3327,8 @@ pub fn install_death_ledger_writer(routed: &Arc<RoutedMetaBackend>) {
         let Some(vol0) = vol0.upgrade() else {
             return;
         };
-        let Some((node_token, mount_slot)) = crate::member_id::parse_node_member_id(&dead.id) else {
+        let Some((node_token, mount_slot)) = crate::member_id::parse_node_member_id(&dead.id)
+        else {
             return; // a reader's uuid: holds no region
         };
         let identity = AppenderIdentity {

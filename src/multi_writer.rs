@@ -18,7 +18,7 @@
 //!
 //! The ladder's rungs (the substrate posture, the bind, the durable era,
 //! the cluster secret) are decided by the join ladder under its own law;
-//! [`arm_authority_planes`] refuses loud on what it is handed missing.
+//! `arm_authority_planes` refuses loud on what it is handed missing.
 
 use crate::data_custody::{self, WeroHold};
 use crate::data_grant::{self, AsyncVerbRouter, CustodyQuarantine, WriteCustodyOwner};
@@ -389,7 +389,7 @@ pub async fn publish_symmetric_endpoint(meta: &Arc<RoutedMetaBackend>, endpoint:
 }
 
 /// The ownership map a SYMMETRIC writer arms its planes over — all-local
-/// (see [`derive_ownership`]).
+/// (`OwnerMap::for_volumes` with no peers).
 pub async fn derive_symmetric_ownership(meta: &Arc<RoutedMetaBackend>) -> Result<Arc<OwnerMap>> {
     derive_ownership(meta).await
 }
@@ -437,10 +437,6 @@ impl MultiWriterArm {
         data_grant::uninstall_custody_client();
         data_grant::uninstall_custody_owner();
         publish::uninstall_client();
-        // The client half of the ownership plane dies with it: a stale
-        // router over a disarmed plane is inert (the armed load gates
-        // first), but leaving one installed would outlive its map.
-        crate::meta_ship::uninstall_daemon_verb_router();
         crate::meta_ship::uninstall_delegation_host();
         // Rung 14: the placement policy's vehicle dies with the authority
         // (its runtime state dies inside disarm_ownership).
@@ -452,6 +448,7 @@ impl MultiWriterArm {
         // (a served extent with no assembler refuses loud rather than
         // acking bytes nobody merges).
         publish::uninstall_free_executor();
+        publish::uninstall_released_block_probe();
         publish::uninstall_extent_merge_executor();
         publish::uninstall_extent_flush_executor();
         publish::uninstall_served_layout_invalidation();
@@ -543,6 +540,13 @@ pub(crate) async fn arm_authority_planes(
         publish::install_free_executor(crate::shipped_free::router_free_executor(
             Arc::clone(backend),
             Arc::clone(meta),
+        ));
+        // The served-publish SCREEN (design-small-file-packing §5.6 (2)): a
+        // peer's layout publish that would ADOPT a block this mount has
+        // RELEASED (free list / grace ring / quarantine) is refused before
+        // anything is staged — the belt under every served publish.
+        publish::install_released_block_probe(crate::shipped_free::router_released_block_probe(
+            Arc::clone(backend),
         ));
     }
 

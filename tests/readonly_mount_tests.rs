@@ -1312,9 +1312,13 @@ async fn a_token_readers_metadata_bound_is_zero_and_its_ttls_derive_from_it() {
         Duration::ZERO,
         "the daemon dentry/attr caches hold nothing across a recall"
     );
-    // The stats face agrees with the mount's request before any plane is
-    // armed (the two are one law, not two).
-    assert_eq!(squeezefs::ro_coherence::metadata_staleness_bound_ms(&[]), 0);
+    // The bound is zero BY CONSTRUCTION (PR 14: every read-only mount is a
+    // token client), while the poll keeps its own control-plane cadence.
+    assert_eq!(
+        squeezefs::ro_coherence::metadata_staleness_bound(),
+        Duration::ZERO
+    );
+    assert!(squeezefs::ro_coherence::reader_staleness_bound() > Duration::ZERO);
 }
 
 /// A `-o ro` mount of a bit-17-ABSENT volume (a `--single-writer` format)

@@ -1277,7 +1277,7 @@ async fn the_index_lives_in_tree0_and_never_pollutes_a_slot_trees_probe() {
 /// durable clause answers `SoleOwnerVerdict::NonHolder` BEFORE any probe
 /// and before the incarnation word is retired. Before it, the ladders ran
 /// on into `begin_patch_sole_owner`, whose `plane_gate` refused with one
-/// ERROR line + one `cowriter_accounting_refusals` per eligible overwrite
+/// ERROR line + one `accounting_plane_refusals` per eligible overwrite
 /// (the sym-walls rewrite row: a burst per joiner). The shipped
 /// allocator (no grant arm) and the holder keep the `Sole` verdict.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1333,7 +1333,7 @@ async fn the_w1_ladders_decline_a_non_holders_patch_as_a_counted_posture_decisio
     );
     let probes = BLOCK_REF_PROBES.load(Ordering::Relaxed);
     let refusals = squeezefs::fuse_client::METRICS
-        .cowriter_accounting_refusals
+        .accounting_plane_refusals
         .load(Ordering::Relaxed);
     assert_eq!(
         rig.router.sole_owner_verdict(f, &non_holder, offset).await,
@@ -1347,7 +1347,7 @@ async fn the_w1_ladders_decline_a_non_holders_patch_as_a_counted_posture_decisio
     );
     assert_eq!(
         squeezefs::fuse_client::METRICS
-            .cowriter_accounting_refusals
+            .accounting_plane_refusals
             .load(Ordering::Relaxed),
         refusals,
         "the allocator's ERROR-logging gate was never reached"
@@ -1358,7 +1358,7 @@ async fn the_w1_ladders_decline_a_non_holders_patch_as_a_counted_posture_decisio
     assert!(!non_holder.begin_patch_sole_owner(offset));
     assert_eq!(
         squeezefs::fuse_client::METRICS
-            .cowriter_accounting_refusals
+            .accounting_plane_refusals
             .load(Ordering::Relaxed),
         refusals + 1
     );

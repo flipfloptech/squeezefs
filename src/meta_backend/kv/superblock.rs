@@ -326,15 +326,14 @@ pub const FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING: u64 = 1 << WRITER_SCOPED_ST
 /// can never arm a device-enforced multi-writer data plane over a format
 /// whose recovery paths assume one writer.
 ///
-/// **Second consumer (S9 blocker #3, no new bit):** the *data-plane
-/// allocation partition* ([`crate::data_alloc_lane`],
-/// `docs/design-mw-data-alloc-partition.md`) gates on this bit too, because
-/// its durable per-lane reservation records (`alloc_lane:{vol}:{lane}` on
-/// ino 1) are precisely "the format's recovery paths expressed for more
-/// than one data-plane writer": a lane-unaware mount would mint DENSE
-/// offsets across every peer's lane and ignore the reservation frontier a
-/// live peer published ahead of the durable references. It takes no bit of
-/// its own — this program has already had five parallel claims.
+/// **Second consumer (S9 blocker #3, no new bit — RETIRED at PR 14):** the
+/// data-plane allocation partition (`docs/design-mw-data-alloc-partition.md`)
+/// gated on this bit too, because its durable per-lane reservation records
+/// were precisely "the format's recovery paths expressed for more than one
+/// data-plane writer". The symmetric default flip replaced the partition
+/// with PR 8's ranged block grants from a per-volume allocation lease
+/// (`crate::block_grant`, `crate::data_alloc_bitmap`); the join ladder's
+/// rung 2 reads this bit as one of the nine the forest presumes.
 ///
 /// **Presence is OPTIONAL** (ruling **D9**, the bit-7/8/9 posture):
 /// [`SuperblockV3::plan`] does not set it and mount does not set it.

@@ -79,7 +79,7 @@ use squeezefs::meta_ship::manager::{
 use squeezefs::meta_ship::publish::{
     decode_reply_frame, decode_request_frame, encode_reply_frame, encode_request_frame,
     PublishCall, PublishCallOutcome, PublishReply, PublishReplyFrame, PublishRequestFrame,
-    WireBlockRefOp, WireFreedBlock, WireLaneFree, PUBLISH_SCHEMA,
+    WireBlockRefOp, WireFreedBlock, PUBLISH_SCHEMA,
 };
 use squeezefs::meta_ship::wire::{
     decode_reclaim, decode_reply, decode_request, encode_reclaim, ReclaimFrame, WireError,
@@ -1437,9 +1437,9 @@ proptest! {
                 ring_want_bytes: 0,
             },
         };
-        let own = squeezefs::cowriter::node_member_id_of(node, slot);
+        let own = squeezefs::member_id::node_member_id_of(node, slot);
         prop_assert!(screen_identity_peer(&call, &own).is_none());
-        let foreign = squeezefs::cowriter::node_member_id_of(other_node, other_slot);
+        let foreign = squeezefs::member_id::node_member_id_of(other_node, other_slot);
         if foreign != own {
             prop_assert!(screen_identity_peer(&call, &foreign).is_some(), "another member id");
         }
@@ -1449,7 +1449,7 @@ proptest! {
         } else if verb == 2 {
             prop_assert_eq!(
                 adhoc_verdict.is_some(),
-                squeezefs::cowriter::parse_node_member_id(&adhoc).is_some(),
+                squeezefs::member_id::parse_node_member_id(&adhoc).is_some(),
                 "a join under an ad-hoc peer keeps the join's own laws"
             );
         } else {
@@ -1682,9 +1682,8 @@ proptest! {
     fn publish_request_frame_round_trips(
         client in "[a-z0-9:-]{1,24}",
         calls in prop::collection::vec(arb_publish_call(), 1..6),
-        pack_group in any::<bool>(),
     ) {
-        let frame = PublishRequestFrame { schema: PUBLISH_SCHEMA, client, calls, pack_group };
+        let frame = PublishRequestFrame { schema: PUBLISH_SCHEMA, client, calls };
         let enc = encode_request_frame(&frame).expect("encodes");
         prop_assert_eq!(decode_request_frame(&enc).expect("decodes"), frame);
     }
@@ -1716,18 +1715,12 @@ proptest! {
     }
 
     /// A publish reply frame round-trips one outcome per call, `MapMigrated
-    /// { recomputed, gen, … }` included, plus its lane-free notices.
+    /// { recomputed, gen, … }` included.
     #[test]
     fn publish_reply_frame_round_trips(
         outcomes in prop::collection::vec(arb_publish_outcome(), 0..6),
-        lane_frees in prop::collection::vec(
-            (any::<u64>(), any::<u64>(), any::<u64>()).prop_map(
-                |(vol_tag, block_idx, after_grants)| WireLaneFree { vol_tag, block_idx, after_grants }
-            ),
-            0..6,
-        ),
     ) {
-        let frame = PublishReplyFrame { schema: PUBLISH_SCHEMA, outcomes, lane_frees };
+        let frame = PublishReplyFrame { schema: PUBLISH_SCHEMA, outcomes };
         let enc = encode_reply_frame(&frame).expect("encodes");
         prop_assert_eq!(decode_reply_frame(&enc).expect("decodes"), frame);
     }

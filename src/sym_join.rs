@@ -302,9 +302,8 @@ pub async fn arm(
             return Err(e);
         }
     };
-    let arm =
-        crate::multi_writer::arm_authority_planes(meta, wero, bind, quarantine, backend, map)
-            .await?;
+    let arm = crate::multi_writer::arm_authority_planes(meta, wero, bind, quarantine, backend, map)
+        .await?;
     let Some(arm) = arm else {
         return Err(SqueezefsError::InvalidOperation(
             "symmetric join ladder rung 7 (planes) refuses: the authority planes did not arm"
@@ -482,9 +481,8 @@ pub async fn arm_joined(
             return Err(e);
         }
     };
-    let arm =
-        crate::multi_writer::arm_authority_planes(meta, wero, bind, quarantine, backend, map)
-            .await?;
+    let arm = crate::multi_writer::arm_authority_planes(meta, wero, bind, quarantine, backend, map)
+        .await?;
     let Some(arm) = arm else {
         return Err(SqueezefsError::InvalidOperation(
             "symmetric join ladder rung 7 (planes) refuses on a joined appender: the planes did \

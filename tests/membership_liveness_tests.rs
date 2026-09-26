@@ -424,7 +424,7 @@ async fn custody_heartbeat_rides_its_own_wire_session_not_the_acquire_storms() {
 // ---------------------------------------------------------------------------
 
 /// **The custody twin of contract 1** — same venue conviction, the REAL
-/// cadence loop (`cowriter::spawn_custody_renewal`): with every sqz-meta
+/// cadence loop (`data_grant::spawn_custody_renewal`): with every sqz-meta
 /// lane wedged past `T_self` by workload-class blocking polls, the
 /// co-writer's custody heartbeat must keep renewing on the dedicated
 /// `sqz-lease` lane — the authority never expires it, and nothing
@@ -471,7 +471,7 @@ async fn custody_renewal_loop_survives_meta_lane_occupancy_past_t_self() {
     .expect("the co-writer joins");
     let renewals_before = data_grant::stats().renewals;
     let stop = Arc::new(AtomicBool::new(false));
-    squeezefs::cowriter::spawn_custody_renewal(Arc::clone(&client), Arc::clone(&stop));
+    squeezefs::data_grant::spawn_custody_renewal(Arc::clone(&client), Arc::clone(&stop));
 
     // Prove the loop is alive before wedging the lanes.
     let alive_deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -606,7 +606,7 @@ async fn a_wedged_renewal_attempt_never_occupies_the_lease_venue_past_its_bound(
     .await
     .expect("the co-writer joins");
     let stop = Arc::new(AtomicBool::new(false));
-    squeezefs::cowriter::spawn_custody_renewal(Arc::clone(&custody), Arc::clone(&stop));
+    squeezefs::data_grant::spawn_custody_renewal(Arc::clone(&custody), Arc::clone(&stop));
 
     let fences_before = METRICS.membership_self_fences.load(Ordering::Relaxed);
     let arm = membership::join_as_writer_member(&rec, SECRET.to_vec(), "wedged-node", 0, None)
@@ -954,7 +954,7 @@ async fn a_custody_renewal_at_a_dead_authority_paces_its_dials_and_fences_at_t_s
         !squeezefs::data_custody::poisoned(),
         "the fixture starts unpoisoned"
     );
-    squeezefs::cowriter::spawn_custody_renewal(Arc::clone(&client), Arc::clone(&stop));
+    squeezefs::data_grant::spawn_custody_renewal(Arc::clone(&client), Arc::clone(&stop));
 
     // The loop lands its first heartbeat on the live authority.
     let alive_deadline = std::time::Instant::now() + Duration::from_secs(5);

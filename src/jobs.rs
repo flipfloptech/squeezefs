@@ -1307,10 +1307,10 @@ pub const INODE_PLANE_SHARD_BASE: u32 = 1 << 20;
 
 /// **KD-PV-14** (`docs/design-per-volume-claim-admission.md` §5.4b): the
 /// maintenance coordinator is the owner of the volume hosting **slot 0**
-/// — D20's set authority, which is also where the `job:` records live
-/// (they are written through the routed `setxattr(ROOT_INO, …)`, so
-/// `daemon_verb_router` already ships them there). One predicate over
-/// already-durable state; no election.
+/// — where the `job:` records live (written through the routed
+/// `setxattr(ROOT_INO, …)`). One predicate over already-durable state; no
+/// election. Under the symmetric plane the map is all-local and the
+/// coordinator is volume 0's manager (`symmetric_coordinator_refusal`).
 ///
 /// `None` = this node may coordinate, which is EVERY unarmed mount (the
 /// shipped posture: `owner_map()` is `None`, one relaxed load, and the

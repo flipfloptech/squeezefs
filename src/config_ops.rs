@@ -4232,10 +4232,10 @@ async fn inspect_for_symmetric(path: &str, ordered: &[String]) -> Result<SymInsp
                 .push(format!("{rest} (undecodable: {e})")),
         }
     }
-    out.owner = crate::membership::ClaimSet::load(&be)
-        .await
-        .filter(|s| s.durable)
-        .and_then(|s| s.owner);
+    out.owner = match be.getxattr(1, crate::membership::CLAIM_SET_XATTR).await? {
+        Some(raw) => crate::membership::ClaimSet::retired_owner_assignment(&raw),
+        None => None,
+    };
     if out.symmetric {
         return Ok(out);
     }

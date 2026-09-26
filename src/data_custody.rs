@@ -1376,7 +1376,10 @@ pub fn own_registered_key() -> Option<u64> {
 ///
 /// Otherwise `Ok(Some(hold))`, held for the mount lifetime. Blocking
 /// (reservation ioctls) — call via `spawn_blocking` from async paths.
-pub fn arm_data_plane(data_paths: &[PathBuf], multi_writer_stamped: bool) -> Result<Option<WeroHold>> {
+pub fn arm_data_plane(
+    data_paths: &[PathBuf],
+    multi_writer_stamped: bool,
+) -> Result<Option<WeroHold>> {
     for path in data_paths {
         if resolve_for_mount(path).is_none() {
             return Err(SqueezefsError::InvalidOperation(format!(

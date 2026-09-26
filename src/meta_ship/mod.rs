@@ -39,9 +39,10 @@
 //! * **No production arm — closed by S9 (2026-08-06).** [`arm_ownership`]
 //!   had no caller in `main`, `mount` or any knob, because *"a mount that
 //!   ships metadata but cannot ship data custody is not a product"*. Its
-//!   caller is now [`crate::multi_writer::arm_multi_writer`], which arms
-//!   ownership, the S7 data-plane fence and S9's remote write-custody plane
-//!   together or refuses naming the missing piece.
+//!   caller is `crate::multi_writer::arm_authority_planes` — the
+//!   symmetric join ladder's rung 7 (`crate::sym_join`), which arms the
+//!   all-local ownership map, the custody owner and the publish / meta /
+//!   manager / token services on ONE listener for every armed writer.
 //! * **The FUSE daemon is not switched onto the router**, and it still is
 //!   not: it holds `Arc<RoutedMetaBackend>` and uses the *non-trait*
 //!   capability surface (`create_with_rdev_size`, `readdir_stream`,
@@ -151,74 +152,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
-// The DAEMON VERB ROUTER (rung 9 — the S8 arm's client half).
-//
-// S8 shipped `MetaShipRouter` with no production consumer: the FUSE daemon
-// holds `Arc<RoutedMetaBackend>` and calls the `Metadata` trait verbs on it
-// directly, so on a co-writer every one of them met the local write gate
-// ("S8's un-routed-daemon gap"). The arm closes the gap at the ONE place no
-// call site can bypass — the trait impl itself (`meta_backend/mod.rs`)
-// consults [`daemon_verb_router`] at verb entry and delegates the foreign
-// ones to the router `cowriter::arm` installs here. Correct by
-// construction: a 25th call site cannot forget to route, exactly as the
-// per-ino deferred-op accumulator argument goes.
-//
-// Solo cost: `ownership_armed()` is one relaxed load and the FIRST check,
-// so every mount that ships today stops there (the solo re-gate's law).
-// ---------------------------------------------------------------------------
-
-static DAEMON_VERB_ROUTER: Lazy<arc_swap::ArcSwapOption<router::MetaShipRouter>> =
-    Lazy::new(arc_swap::ArcSwapOption::const_empty);
-
-/// Install the process-global daemon verb router (`cowriter::arm`'s act).
-pub fn install_daemon_verb_router(router: Arc<router::MetaShipRouter>) {
-    DAEMON_VERB_ROUTER.store(Some(router));
-}
-
-/// Remove it (`cowriter` disarm/teardown; a stale install with a DISARMED
-/// plane is inert — the armed load gates first).
-pub fn uninstall_daemon_verb_router() {
-    DAEMON_VERB_ROUTER.store(None);
-}
-
-/// The daemon-side S8 hook decision: the installed router, iff
-///
-/// 1. the ownership plane is ARMED (one relaxed load — the solo fast path),
-/// 2. a router is installed **and wraps exactly `be`** (a foreign
-///    instance — a probe set, a test sandbox — must never be re-routed
-///    through another mount's plane), and
-/// 3. at least one of `participants` routes to a volume with a FOREIGN
-///    owner (the same decision `MetaShipRouter::route_verb` makes, which
-///    is what keeps the pair recursion-free: the router's Local arm only
-///    ever executes when this function answered `None`).
-pub fn daemon_verb_router(
-    be: &crate::meta_backend::RoutedMetaBackend,
-    participants: &[u64],
-) -> Option<Arc<router::MetaShipRouter>> {
-    if !owners::ownership_armed() {
-        return None;
-    }
-    let r = DAEMON_VERB_ROUTER.load_full()?;
-    if !std::ptr::eq(Arc::as_ptr(r.inner()), be as *const _) {
-        return None;
-    }
-    if participants.iter().any(|&ino| {
-        let (v_idx, _) = be.route_ino(ino);
-        owners::owner_of_volume(v_idx).is_some()
-    }) {
-        Some(r)
-    } else {
-        None
-    }
-}
-
-// ---------------------------------------------------------------------------
 // The DELEGATION HOST (rung 12 — S10's owner half on this process).
 //
 // Installed by the multi-writer arm beside the S8 owner service (and by
 // the delegation suites); the RoutedMetaBackend mutation surface consults
-// [`deleg_mutation_gate`] at verb entry — the same one-place-no-bypass
-// argument as the daemon verb router above. Solo cost: one relaxed load.
+// [`deleg_mutation_gate`] at verb entry — the one-place-no-bypass
+// argument (no call site can forget it). Solo cost: one relaxed load.
 // ---------------------------------------------------------------------------
 
 /// Is a delegation host installed (the one-relaxed-load fast path).
@@ -228,7 +167,7 @@ static DELEG_HOST: Lazy<arc_swap::ArcSwapOption<service::MetaShipService>> =
     Lazy::new(arc_swap::ArcSwapOption::const_empty);
 
 /// Install the process-global delegation host (the multi-writer arm's
-/// act, beside `install_daemon_verb_router`).
+/// act).
 pub fn install_delegation_host(svc: Arc<service::MetaShipService>) {
     DELEG_HOST.store(Some(svc));
     DELEG_HOST_ARMED.store(true, Ordering::Release);

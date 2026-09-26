@@ -52,8 +52,8 @@
 //! 12. Lever OFF ⇒ `layout_promoted_packed = 0` and the block arm's shape
 //!     byte-identical (`bk:0:len`, its `+ref` staged).
 //!
-//! Plus the allocator's co-writer release arms, driven directly (PK2's
-//! co-writer posture never packs — the batch pack is PK4's).
+//! Plus the allocator's pack release, driven directly (the router ladder —
+//! PR 14 retired the co-writer's private-release column with the posture).
 //!
 //! Two venues: the mount-class contracts (1, 2, 7, 8, 12's mount face) run
 //! the real daemon on an unprivileged file-backed sandbox and self-skip
@@ -393,6 +393,33 @@ fn log_contains(log: &Path, needle: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The dismount pass's engagement line — how many open pack blocks it
+/// sealed. Under the armed default (PR 14) a pack is scoped per `(meta
+/// volume, forest slot)` (symmetric PR 7, §5.4.3 law 1: a pack block's
+/// tenants are inos of ONE slot, so the one-slot refcount probe is exact),
+/// and a population minted over the writer's rotor lands in one open pack
+/// PER SLOT it touched — at most `MINT_SPREAD + 1` on a solo mount.
+fn dismount_sealed_packs(log: &Path) -> u64 {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    text.lines()
+        .find_map(|l| {
+            let rest = l.split("dismount sealed ").nth(1)?;
+            rest.split_whitespace().next()?.parse::<u64>().ok()
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no \"dismount sealed N open pack block(s)\" line in {}",
+                log.display()
+            )
+        })
+}
+
+/// The open-pack COUNT bound on a solo armed writer: one scope per slot
+/// the mint spread reaches (the native slot + the rotor).
+fn pack_scopes_bound() -> u64 {
+    squeezefs::meta_backend::MINT_SPREAD as u64 + 1
+}
+
 /// Allocated chunks on the mounted set — `statvfs`'s used bytes are the
 /// allocator's `used_blocks × chunk` (RAM-maintained, no I/O).
 fn used_chunks(mnt: &Path) -> u64 {
@@ -559,9 +586,14 @@ fn a_clean_unmount_packs_the_population_into_shared_blocks_other_clients_read_ex
          log: {}",
         log.display()
     );
+    // The open packs seal at dismount, before "Dismount clean": one per
+    // pack SCOPE the population touched (PR 7's law 1 — per slot on the
+    // armed default; ONE on a `--single-writer` volume).
+    let sealed = dismount_sealed_packs(&log);
     assert!(
-        log_contains(&log, "dismount sealed 1 open pack block(s)"),
-        "the open pack seals at dismount, before \"Dismount clean\"; log: {}",
+        (1..=pack_scopes_bound()).contains(&sealed),
+        "the dismount sealed {sealed} open pack block(s) — one per touched slot, ≤ {}; log: {}",
+        pack_scopes_bound(),
         log.display()
     );
     assert!(log_contains(&log, "Dismount clean"));
@@ -587,14 +619,16 @@ fn a_clean_unmount_packs_the_population_into_shared_blocks_other_clients_read_ex
         "one durable reference per tenant + the anchor's blocks seeded the allocator"
     );
     // Contract 1's space law, read on the remount: the packed population
-    // occupies ≤ ceil(Σ ceil(image) / CHUNK) + one open-tail block.
+    // occupies ≤ ceil(Σ ceil(image) / CHUNK) + one open-tail block PER
+    // PACK SCOPE (the sealed count above — PR 7's per-slot scope under the
+    // armed default; the flat volume's one tail is the `sealed == 1` case).
     let used = used_chunks(&mnt2);
-    let bound = ANCHOR_BLOCKS + population_blocks() + 1;
+    let bound = ANCHOR_BLOCKS + population_blocks() + sealed;
     assert!(
         used <= bound,
         "{FILES} packed files + the anchor occupy {used} blocks; bound {bound} \
-         (= {ANCHOR_BLOCKS} anchor + ceil(Σ/CHUNK) = {} + 1 open tail) — one block per file \
-         would be {}",
+         (= {ANCHOR_BLOCKS} anchor + ceil(Σ/CHUNK) = {} + {sealed} open tail(s)) — one block \
+         per file would be {}",
         population_blocks(),
         ANCHOR_BLOCKS + FILES as u64
     );
@@ -735,10 +769,21 @@ fn a_plain_mount_packs_by_default() {
     let log2 = base.join("mount2.log");
     let mut mount2 = spawn_mount(&meta, &mnt2, &log2, &[("SQUEEZEFS_BLOCK_REFS_VERIFY", "1")]);
     assert_eq!(stat_u64(&mnt2, "meta_kv_block_refs_drift"), 0);
+    // One open pack per slot the rotor spread the population over (PR 7's
+    // law 1 under the armed default): the space law is the population's
+    // bytes plus one tail per sealed pack, and it beats the one-block-per-
+    // file law the dismount pass minted before PK7.
     let used = used_chunks(&mnt2);
+    let sealed = dismount_sealed_packs(&log);
     assert!(
-        used < ANCHOR_BLOCKS + FILES as u64 / 8,
-        "packed: {used} blocks for {FILES} files (+ {ANCHOR_BLOCKS} anchor) — the one-block-per-file law would read {}",
+        (1..=pack_scopes_bound()).contains(&sealed),
+        "the dismount sealed {sealed} open pack block(s), ≤ {}",
+        pack_scopes_bound()
+    );
+    assert!(
+        used <= ANCHOR_BLOCKS + population_blocks() + sealed && used < ANCHOR_BLOCKS + FILES as u64,
+        "packed: {used} blocks for {FILES} files (+ {ANCHOR_BLOCKS} anchor, {sealed} pack tail(s)) — \
+         the one-block-per-file law would read {}",
         ANCHOR_BLOCKS + FILES as u64
     );
     assert_eq!(verify_files(&mnt2), 0);
@@ -766,6 +811,29 @@ fn fsync_in_background(path: PathBuf) -> std::thread::JoinHandle<()> {
     h
 }
 
+/// A directory whose children all mint into ITS slot (gather mode —
+/// symmetric PR 7, KD-SYM-17: `setfattr -n user.squeezefs.gather -v 1`):
+/// under the armed default a pack is scoped per slot, so two tenants
+/// share ONE open pack iff they share a slot, and a gathered directory is
+/// the operator's lever for exactly that. Created through the mount at
+/// `mnt`.
+fn mkdir_gather(mnt: &Path, dir: &str) {
+    let d = mnt.join(dir);
+    std::fs::create_dir(&d).unwrap_or_else(|e| panic!("mkdir {}: {e}", d.display()));
+    let c = std::ffi::CString::new(d.to_str().unwrap()).unwrap();
+    let name = std::ffi::CString::new(squeezefs::GATHER_XATTR).unwrap();
+    // SAFETY: both strings are NUL-terminated for the call's duration; the
+    // value pointer/length name a live byte slice.
+    let rc = unsafe { libc::setxattr(c.as_ptr(), name.as_ptr(), b"1".as_ptr().cast(), 1, 0) };
+    assert_eq!(
+        rc,
+        0,
+        "setxattr gather on {}: {}",
+        d.display(),
+        std::io::Error::last_os_error()
+    );
+}
+
 /// Stage `files` as DURABLE staged-layout files: written and fsync'd on a
 /// mount with the promotion lever OFF (the fsync persists the staged layout
 /// — `file_type = staged`, `file_id`, size — and promotes nothing), then
@@ -780,8 +848,17 @@ fn fsync_in_background(path: PathBuf) -> std::thread::JoinHandle<()> {
 /// as size 0 afterwards. That is the POSIX "fsync never returned" case, not
 /// §5.4's: the crash contract is about a TENANT whose staged layout is
 /// durable and whose only copy is the ring.
-fn stage_durable(meta: &Path, mnt: &Path, log: &Path, files: &[(&str, usize, usize)]) {
+fn stage_durable(
+    meta: &Path,
+    mnt: &Path,
+    log: &Path,
+    gather_dir: Option<&str>,
+    files: &[(&str, usize, usize)],
+) {
     let mut m = spawn_mount(meta, mnt, log, &[(LEVER, "1")]);
+    if let Some(dir) = gather_dir {
+        mkdir_gather(mnt, dir);
+    }
     for (name, idx, len) in files {
         write_fsync(&mnt.join(name), &pattern(*idx, *len));
     }
@@ -819,7 +896,13 @@ fn kill9_inside_the_pack_windows_loses_nothing_and_leaks_nothing() {
     let mut m = spawn_mount(&meta, &mnt, &log_a0, &[(LEVER, "1")]);
     write_fsync(&mnt.join(ANCHOR), &anchor_bytes());
     m.kill9();
-    stage_durable(&meta, &mnt, &base.join("a1.log"), &[("a.bin", 1, a_len)]);
+    stage_durable(
+        &meta,
+        &mnt,
+        &base.join("a1.log"),
+        None,
+        &[("a.bin", 1, a_len)],
+    );
 
     let log_a = base.join("a.log");
     let mut m = spawn_mount(
@@ -887,12 +970,16 @@ fn kill9_inside_the_pack_windows_loses_nothing_and_leaks_nothing() {
 
     // ---- Leg B: between two tenants' commits ------------------------------
     // Tenant 2 and the bystander enter the leg with DURABLE staged layouts,
-    // ring-resident, un-promoted.
+    // ring-resident, un-promoted. The tenants live in ONE GATHERED
+    // directory: the leg's premise is two tenants of one open pack, and
+    // under the armed default a pack is scoped per slot (PR 7's law 1) —
+    // the gather xattr is what puts siblings in one slot.
     stage_durable(
         &meta,
         &mnt,
         &base.join("b0.log"),
-        &[("b2.bin", 3, b_len), ("c.bin", 4, c_len)],
+        Some("shared"),
+        &[("shared/b2.bin", 3, b_len), ("shared/c.bin", 4, c_len)],
     );
     let log_b = base.join("b.log");
     let mut m = spawn_mount(
@@ -907,7 +994,7 @@ fn kill9_inside_the_pack_windows_loses_nothing_and_leaks_nothing() {
     );
     let used1 = used_chunks(&mnt);
     // Tenant 1 commits (its fsync waits the stall out).
-    write_fsync(&mnt.join("b1.bin"), &pattern(2, b_len));
+    write_fsync(&mnt.join("shared/b1.bin"), &pattern(2, b_len));
     assert_eq!(
         stat_u64(&mnt, "layout_promoted_packed"),
         1,
@@ -916,7 +1003,7 @@ fn kill9_inside_the_pack_windows_loses_nothing_and_leaks_nothing() {
     assert_eq!(used_chunks(&mnt), used1 + 1, "one pack block opened");
     // Tenant 2 is DMA'd into the same open block and parked; the bystander
     // stays plain staged (never re-fsync'd).
-    let h = fsync_in_background(mnt.join("b2.bin"));
+    let h = fsync_in_background(mnt.join("shared/b2.bin"));
     assert_eq!(
         stat_u64(&mnt, "pack_blocks_opened"),
         1,
@@ -944,15 +1031,18 @@ fn kill9_inside_the_pack_windows_loses_nothing_and_leaks_nothing() {
          dead bytes inside it, never a leak and never a second block"
     );
     assert_eq!(
-        std::fs::read(mnt.join("b1.bin")).unwrap(),
+        std::fs::read(mnt.join("shared/b1.bin")).unwrap(),
         pattern(2, b_len)
     );
     assert_eq!(
-        std::fs::read(mnt.join("b2.bin")).unwrap(),
+        std::fs::read(mnt.join("shared/b2.bin")).unwrap(),
         pattern(3, b_len),
         "leg B: the mid-window tenant stays ring-resident"
     );
-    assert_eq!(std::fs::read(mnt.join("c.bin")).unwrap(), pattern(4, c_len));
+    assert_eq!(
+        std::fs::read(mnt.join("shared/c.bin")).unwrap(),
+        pattern(4, c_len)
+    );
     let report = online_fsck(&mnt);
     assert_eq!(
         report["counters"]["findings"], 0,
@@ -975,9 +1065,9 @@ fn kill9_inside_the_pack_windows_loses_nothing_and_leaks_nothing() {
     assert_eq!(stat_u64(&mnt3, "meta_kv_block_refs_drift"), 0);
     for (name, idx, len) in [
         ("a.bin", 1, a_len),
-        ("b1.bin", 2, b_len),
-        ("b2.bin", 3, b_len),
-        ("c.bin", 4, c_len),
+        ("shared/b1.bin", 2, b_len),
+        ("shared/b2.bin", 3, b_len),
+        ("shared/c.bin", 4, c_len),
     ] {
         assert_eq!(
             std::fs::read(mnt3.join(name)).unwrap(),
@@ -1052,9 +1142,14 @@ fn online_fsck_during_live_packing_reports_nothing_ten_times() {
     );
 
     // Quiet: the pin is the only discrepancy, excused exactly once per
-    // open pack.
+    // open pack — one per slot the storm's files were minted into (PR 7's
+    // law 1 under the armed default; exactly one on a flat volume).
     let open = stat_u64(&mnt, "pack_open_blocks");
-    assert_eq!(open, 1, "one open pack (one data volume)");
+    assert!(
+        (1..=pack_scopes_bound()).contains(&open),
+        "open packs: {open} (one per touched slot, ≤ {})",
+        pack_scopes_bound()
+    );
     let exempted0 = stat_u64(&mnt, "fsck_pack_ledger_exempted");
     let report = online_fsck(&mnt);
     assert_eq!(report["counters"]["findings"], 0, "quiet: {report}");
@@ -1070,9 +1165,14 @@ fn online_fsck_during_live_packing_reports_nothing_ten_times() {
 
     m.umount_timed();
     let text = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        dismount_sealed_packs(&log),
+        open,
+        "every open pack sealed at dismount"
+    );
     let seal = text
-        .find("dismount sealed 1 open pack block(s)")
-        .expect("the open pack sealed at dismount");
+        .find("dismount sealed ")
+        .expect("the open packs sealed at dismount");
     let clean = text.find("Dismount clean").expect("Dismount clean");
     assert!(seal < clean, "the seal precedes \"Dismount clean\"");
     let _ = std::fs::remove_dir_all(&base);
@@ -1827,10 +1927,10 @@ async fn a_sealed_pack_block_moves_as_a_unit_and_answers_a_peers_tenant_free_non
     assert_eq!(dst_bases.len(), 1, "moved as ONE block");
     assert!(fx.drift().await.is_empty());
 
-    // (b) a peer-shaped shipped free of ONE tenant on the authority's
-    // (moved, sealed) pack block: the co-writer's delete SHIPS its
-    // durable −ref first (served here as the owner would commit it), then
-    // `FreeBlocks` — which the authority answers NonTerminal (three
+    // (b) a peer-shaped shipped free of ONE tenant on the holder's
+    // (moved, sealed) pack block: a non-holder's delete SHIPS its
+    // durable −ref first (served here as the holder would commit it), then
+    // `FreeBlocks` — which the holder answers NonTerminal (three
     // references remain), never the finding-24 UNSTABLE refusal and never
     // finding 23's stale-duplicate refusal.
     let (moved_base, _, _) = fx.mapping(inos[3]);
@@ -1864,12 +1964,11 @@ async fn a_sealed_pack_block_moves_as_a_unit_and_answers_a_peers_tenant_free_non
     let live0 = metric(&METRICS.block_live_free_refusals);
     let tag = squeezefs::meta_backend::kv::block_refs::volume_tag(&survivor);
     let idx = moved_offset / survivor_alloc.chunk_size();
-    let verdicts = squeezefs::cowriter::execute_shipped_frees(
+    let verdicts = squeezefs::shipped_free::execute_shipped_frees(
         &fx.fs.router.backend_router,
         &fx.meta,
         tag,
         &[idx],
-        &squeezefs::cowriter::local_owner_view(),
     )
     .await
     .expect("the executor runs");
@@ -2130,108 +2229,39 @@ async fn lever_off_takes_the_block_arm_with_its_reference_staged() {
 }
 
 // ---------------------------------------------------------------------------
-// The allocator's co-writer release arms (driven directly)
+// The allocator's pack release (driven directly)
 // ---------------------------------------------------------------------------
 
-/// §5.3's co-writer column of `release_pack_reference`: nonterminal → a
-/// PRIVATE release (nothing ships, the word untouched); terminal + KNOWN →
-/// the never-published abandon; terminal + UNKNOWN → abandon WITHOUT
-/// recycle (the entry dropped, the offset NOT on this mount's free list,
-/// `cowriter_unpublished_abandons + 1`); untracked → a counted no-op.
+/// §5.3's `release_pack_reference` column after the flip (PR 14: every
+/// writer holds its own allocation plane — the co-writer's private-release
+/// / abandon-without-recycle arms retired with the posture): nonterminal →
+/// one reference released, the word untouched; terminal → the ROUTER
+/// ladder (the reclaim queue, the free list after the drain); untracked →
+/// a counted no-op.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn release_pack_reference_dispatches_on_the_cowriter_posture() {
-    use squeezefs::block_allocator::{PackPublishOutcome, PackRelease};
-    use squeezefs::fuse_client::{set_mount_posture, MountPosture};
+async fn release_pack_reference_runs_the_router_ladder() {
+    use squeezefs::block_allocator::PackRelease;
     let _g = serial().await;
     let _l = LeverGuard;
     let dir = tempfile::tempdir().unwrap();
-    let (_meta, fx) = open_fresh(dir.path(), 1, 4 << 30, "cowriter").await;
+    let (_meta, fx) = open_fresh(dir.path(), 1, 4 << 30, "release").await;
     let alloc = fx.alloc(0);
     let router = &fx.fs.router.backend_router;
     let be_id = fx.records[0].id.clone();
 
-    // Minted as the authority (a co-writer without a lane cannot mint).
-    let offset = alloc.allocate_block().await.unwrap();
-    alloc.publish_block(offset);
-    assert!(alloc.increment_refcount(offset), "a second reference");
-    let key = router.persist_block_key(&be_id, offset);
-    let idx = offset / alloc.chunk_size();
-
-    set_mount_posture(MountPosture::CoWriter);
-    // Nonterminal: private release, no ship, the word stays stable.
-    let v = alloc
-        .release_pack_reference(router, &key, PackPublishOutcome::Known)
-        .await
-        .unwrap();
-    assert_eq!(v, PackRelease::Nonterminal);
-    assert_eq!(alloc.refcount(offset), Some(1));
-    assert!(alloc.fill_incarnation(offset).is_some());
-    // Terminal + UNKNOWN: abandon without recycle.
-    let abandons0 = metric(&METRICS.cowriter_unpublished_abandons);
-    let v = alloc
-        .release_pack_reference(router, &key, PackPublishOutcome::Unknown)
-        .await
-        .unwrap();
-    assert_eq!(v, PackRelease::Terminal);
-    assert_eq!(alloc.refcount(offset), None, "the private entry is dropped");
-    assert!(
-        !alloc.free_list_contains(idx),
-        "NEVER recycled into this mount's free list"
-    );
-    assert_eq!(
-        metric(&METRICS.cowriter_unpublished_abandons) - abandons0,
-        1
-    );
-    // Untracked: a counted no-op.
-    let noops0 = metric(&METRICS.pack_release_untracked_noops);
-    let v = alloc
-        .release_pack_reference(router, &key, PackPublishOutcome::Known)
-        .await
-        .unwrap();
-    assert_eq!(v, PackRelease::UntrackedNoop);
-    assert_eq!(metric(&METRICS.pack_release_untracked_noops) - noops0, 1);
-    set_mount_posture(MountPosture::Writer);
-
-    // Terminal + KNOWN on a co-writer: the never-published abandon arm
-    // (lane-less here ⇒ the leak-safe quiet abandon; a laned co-writer's
-    // recycle is PK4's).
-    let offset2 = alloc.allocate_block().await.unwrap();
-    alloc.publish_block(offset2);
-    let key2 = router.persist_block_key(&be_id, offset2);
-    set_mount_posture(MountPosture::CoWriter);
-    let abandons1 = metric(&METRICS.cowriter_unpublished_abandons);
-    let v = alloc
-        .release_pack_reference(router, &key2, PackPublishOutcome::Known)
-        .await
-        .unwrap();
-    assert_eq!(v, PackRelease::Terminal);
-    assert_eq!(
-        metric(&METRICS.cowriter_unpublished_abandons) - abandons1,
-        1,
-        "the never-published arm's quiet abandon (no lane to recycle into)"
-    );
-    assert!(
-        !alloc.free_list_contains(offset2 / alloc.chunk_size()),
-        "never recycled without a lane"
-    );
-    set_mount_posture(MountPosture::Writer);
-
-    // The authority: the router ladder — nonterminal then terminal.
     let offset3 = alloc.allocate_block().await.unwrap();
     alloc.publish_block(offset3);
-    assert!(alloc.increment_refcount(offset3));
+    assert!(alloc.increment_refcount(offset3), "a second reference");
     let key3 = router.persist_block_key(&be_id, offset3);
-    let v = alloc
-        .release_pack_reference(router, &key3, PackPublishOutcome::Known)
-        .await
-        .unwrap();
+    let v = alloc.release_pack_reference(router, &key3).await.unwrap();
     assert_eq!(v, PackRelease::Nonterminal);
     assert_eq!(alloc.refcount(offset3), Some(1));
+    assert!(
+        alloc.fill_incarnation(offset3).is_some(),
+        "the word stays stable"
+    );
     let queued0 = metric(&METRICS.block_free_reclaim_queued);
-    let v = alloc
-        .release_pack_reference(router, &key3, PackPublishOutcome::Known)
-        .await
-        .unwrap();
+    let v = alloc.release_pack_reference(router, &key3).await.unwrap();
     assert_eq!(v, PackRelease::Terminal);
     assert_eq!(
         metric(&METRICS.block_free_reclaim_queued) - queued0,
@@ -2240,12 +2270,9 @@ async fn release_pack_reference_dispatches_on_the_cowriter_posture() {
     );
     router.reclaim_drain().await;
     assert!(alloc.free_list_contains(offset3 / alloc.chunk_size()));
-    // Untracked on the authority: the counted no-op (logged ERROR).
+    // Untracked: the counted no-op (logged ERROR).
     let noops1 = metric(&METRICS.pack_release_untracked_noops);
-    let v = alloc
-        .release_pack_reference(router, &key3, PackPublishOutcome::Known)
-        .await
-        .unwrap();
+    let v = alloc.release_pack_reference(router, &key3).await.unwrap();
     assert_eq!(v, PackRelease::UntrackedNoop);
     assert_eq!(metric(&METRICS.pack_release_untracked_noops) - noops1, 1);
     fx.close().await;

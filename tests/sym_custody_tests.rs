@@ -1946,10 +1946,10 @@ async fn a_deferred_handover_recalls_the_custody_and_completes_within_a_beat() {
 /// A bit-17-absent (`--single-writer`) volume is the shipped posture
 /// exactly, under either knob value: no slot-custody arm, every acquire
 /// the local arbiter, the `dlm_custody` family's two PR-9 gauges 0,
-/// `dlm_rpcs` 0 — and an armed symmetric mount ships NO `pack_group`
-/// frame (§5.4.3 — its promotions pack in its own slot's scope). (The
-/// `=0` forest is the writable open's refusal since PR 14, pinned in
-/// `sym_default_flip_tests`.)
+/// `dlm_rpcs` 0. (The `=0` forest is the writable open's refusal since
+/// PR 14, pinned in `sym_default_flip_tests`; the PK4 `pack_group` wire
+/// retired with the co-writer posture — every writer's promotions pack in
+/// its own slot's scope, §5.4.3, `sym_pack_tests`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn flat_mounts_arm_nothing_and_count_nothing() {
     let _g = SEAM.lock().await;
@@ -1958,11 +1958,6 @@ async fn flat_mounts_arm_nothing_and_count_nothing() {
     let data = sym_data_file();
     // Every gauge is process-global (other contracts of this binary moved
     // them): the law is read as DELTAS across each mount's life.
-    let frames = || {
-        squeezefs::fuse_client::METRICS
-            .pack_cowriter_frames
-            .load(Ordering::Relaxed)
-    };
     for (name, knobs) in [
         ("flat-off", Knobs::unarmed()),
         ("flat-default", Knobs::armed()),
@@ -1975,11 +1970,7 @@ async fn flat_mounts_arm_nothing_and_count_nothing() {
         );
         let f = rig.mk_file("f").await;
         assert!(data_grant::slot_holder_home(f).is_none());
-        let (rpcs0, s0, frames0) = (
-            squeezefs::dlm_slot::dlm_rpcs(),
-            data_grant::stats(),
-            frames(),
-        );
+        let (rpcs0, s0) = (squeezefs::dlm_slot::dlm_rpcs(), data_grant::stats());
         let lease = rig
             .router
             .dlm
@@ -2002,23 +1993,14 @@ async fn flat_mounts_arm_nothing_and_count_nothing() {
         let json = data_grant::stats_json();
         assert_eq!(json["dlm_custody_via_slot_holder"], s.via_slot_holder);
         assert_eq!(json["dlm_custody_token_carried"], s.token_carried);
-        assert_eq!(
-            frames(),
-            frames0,
-            "{name}: no pack_group frame left this mount"
-        );
         drop(lease);
         rig.shutdown().await;
     }
-    // The armed SOLO mount: every slot its own — no holder dialed, no
-    // pack_group frame, `dlm_rpcs` flat (gate 1's law).
+    // The armed SOLO mount: every slot its own — no holder dialed,
+    // `dlm_rpcs` flat (gate 1's law).
     let uris = vec![format_stamped_member(dir.path(), "solo").await];
     let rig = mount_data(&uris, data.path(), &Knobs::armed()).await;
-    let (rpcs0, s0, frames0) = (
-        squeezefs::dlm_slot::dlm_rpcs(),
-        data_grant::stats(),
-        frames(),
-    );
+    let (rpcs0, s0) = (squeezefs::dlm_slot::dlm_rpcs(), data_grant::stats());
     let f = rig.mk_file("f").await;
     assert!(data_grant::slot_holder_home(f).is_none());
     let lease = rig
@@ -2028,7 +2010,6 @@ async fn flat_mounts_arm_nothing_and_count_nothing() {
         .await
         .expect("local custody");
     let _ = rig.publish_block(f, 0).await;
-    assert_eq!(frames(), frames0);
     assert_eq!(
         squeezefs::dlm_slot::dlm_rpcs(),
         rpcs0,

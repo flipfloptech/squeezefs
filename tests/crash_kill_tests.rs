@@ -25,6 +25,20 @@ use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{digest_backend, format_v3, FormatV3Options};
 use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
 
+/// The replay window a CLEAN shutdown leaves behind: empty on a flat
+/// (`--single-writer`) volume; on the forest — the default since PR 14, the
+/// mount ARMED — the leave writes ONE control entry after its coverage
+/// verdict, the region's `Unleased` batch releasing every held slot to
+/// tree 0 (design-symmetric-metadata §5.1.3), barriered, root-free and
+/// replayed idempotently.
+fn clean_leave_entries(kv: &KvMetaBackend) -> u64 {
+    if kv.superblock().symmetric_forest_stamped() {
+        1
+    } else {
+        0
+    }
+}
+
 fn ledger_append(path: &std::path::Path, line: &str) {
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -471,8 +485,9 @@ async fn test_kill9_remount_soak_v3() {
             .unwrap_or_else(|e| panic!("round {round}: second v3 remount failed: {e}"));
         assert_eq!(
             m2.replay_stats().entries,
-            0,
-            "round {round}: a clean shutdown must leave an empty replay window"
+            clean_leave_entries(&m2),
+            "round {round}: a clean shutdown leaves the leave's own window — empty on a flat \
+             volume, the armed region's ONE release entry on the forest (§5.1.3)"
         );
         let d2 = digest_backend(&m2).await.unwrap();
         assert_eq!(
@@ -688,8 +703,9 @@ async fn test_kill9_remount_soak_v3_batched() {
             .unwrap_or_else(|e| panic!("round {round}: second remount failed: {e}"));
         assert_eq!(
             m2.replay_stats().entries,
-            0,
-            "round {round}: clean shutdown must leave an empty replay window"
+            clean_leave_entries(&m2),
+            "round {round}: a clean shutdown leaves the leave's own window — empty on a flat \
+             volume, the armed region's ONE release entry on the forest (§5.1.3)"
         );
         let d2 = digest_backend(&m2).await.unwrap();
         assert_eq!(d1, d2, "round {round}: replay-twice digests diverge");

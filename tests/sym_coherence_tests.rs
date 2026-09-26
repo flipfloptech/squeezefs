@@ -2767,6 +2767,140 @@ async fn commits_after_a_reopened_writers_join_survive_the_next_remount_unscreen
     // `fsck_clean` (its fixture carries the format config fsck needs).
 }
 
+/// **The pre-claim ring recovery's frames carry the slot's generation**
+/// (PR 14 — found by the kill-9 soak on the flipped default,
+/// `crash_kill_tests::test_kill9_remount_soak_v3`: an acked-writes LOSS
+/// on the death path, the frame-stamp class of the pin above at the
+/// open's FIRST frame writer). A writer whose crash left a replay window
+/// that exhausts the ring's user slice runs bounded checkpoint cycles
+/// INSIDE its claim gate (`preclaim_ring_recovery` — the mount-refusal
+/// wedge face), and those cycles' flush passes append the replayed
+/// records to the slot-tree leaves; the fence and tree 0's lease table
+/// were primed only at `writer_bring_up`, AFTER the gate, so every such
+/// frame carried the structural `(0, 0)` below the leaf's earlier frames'
+/// `g ≥ 1` — rule 3's non-monotone `g`. The recovering mount served the
+/// records from RAM; its clean leave recorded nothing wrong; the NEXT
+/// open screened the frame and ended the log before it: the crashed
+/// writer's last acked creates (and the root's times) gone, on the
+/// forest that is every default volume since the flip. Now the stamps
+/// are primed before the gate's preflight — every frame a writer's open
+/// writes carries its lease generation, the guarded cycles' included.
+///
+/// The shape: a writer commits (each acked) until one max-size user
+/// entry no longer admits, dies; the successor recovers the ring inside
+/// its gate and leaves cleanly; the third open resolves EVERY acked name
+/// and nothing was screened. RED on the first build: the successor's
+/// frame screened, the tail of the acked population absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_recovering_an_exhausted_ring_inside_its_gate_stamps_the_leases_generation() {
+    let _g = SEAM.lock().await;
+    // The cadence parked: the ring fills with acked commits nothing
+    // checkpoints away, and the successor's gate is what covers them.
+    struct Cadence;
+    impl Drop for Cadence {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let _cadence = Cadence;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "meta0").await;
+    let screened0 = META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed);
+
+    // Incarnation 1: acked creates until the gate's preflight would
+    // refuse (`preclaim_ring_recovery`'s own admission probe — one
+    // max-size user entry, clamped to the ring's user slice), then the
+    // in-process kill −9.
+    let writer = open_armed_writer(&path).await;
+    let kv = Arc::clone(&writer.volumes[0]);
+    let geo = kv.journal_ring().core().geometry();
+    let need = squeezefs::meta_backend::kv::journal::MAX_ENTRY_LEN.min(
+        geo.logical_len()
+            .saturating_sub(geo.reserve_bytes)
+            .saturating_sub(geo.max_pad()),
+    );
+    let mut acked: Vec<(String, u64)> = Vec::new();
+    while let Some(adm) = kv.journal_ring().try_admit(
+        need,
+        squeezefs::meta_backend::kv::journal_core::AdmissionClass::User,
+    ) {
+        kv.journal_ring().core().release(adm);
+        let name = format!("acked-{}", acked.len());
+        let ino = Metadata::create(writer.as_ref(), 1, &name, libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .unwrap()
+            .ino;
+        kv.sync_device().await.unwrap();
+        acked.push((name, ino));
+        assert!(
+            acked.len() < 4096,
+            "the ring never approached its user slice under serial acked commits"
+        );
+    }
+    assert!(
+        acked.len() > 8,
+        "the fixture's window is a real population ({} creates)",
+        acked.len()
+    );
+    drop(kv);
+    drop(writer);
+
+    // Incarnation 2: the successor's gate recovers the exhausted ring
+    // (bounded cycles under its own flock), serves every acked name,
+    // leaves cleanly.
+    let mut successor = None;
+    for _ in 0..200 {
+        std::env::set_var("SQUEEZEFS_SYM_ALLOW_NON_PR", "1");
+        let r = open_routed_meta_set(&[path.display().to_string()]).await;
+        std::env::remove_var("SQUEEZEFS_SYM_ALLOW_NON_PR");
+        match r {
+            Ok(r) => {
+                successor = Some(r);
+                break;
+            }
+            Err(e) if e.to_string().contains("flock") || e.to_string().contains("writer lock") => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("the successor's open refused: {e}"),
+        }
+    }
+    let successor = successor.expect("the successor opened over the crashed incarnation");
+    for (name, ino) in &acked {
+        assert_eq!(
+            Metadata::lookup(successor.as_ref(), 1, name)
+                .await
+                .unwrap_or_else(|e| panic!("{name} lost at the successor: {e}"))
+                .ino,
+            *ino
+        );
+    }
+    shutdown(&successor).await;
+    drop(successor);
+
+    // Incarnation 3: every acked name resolves after the successor's
+    // clean leave, and nothing a legitimate writer wrote was screened.
+    let third = open_armed_writer(&path).await;
+    for (name, ino) in &acked {
+        assert_eq!(
+            Metadata::lookup(third.as_ref(), 1, name)
+                .await
+                .unwrap_or_else(|e| panic!(
+                    "{name} lost after the successor's clean leave (the pre-claim recovery's \
+                     frame screened): {e}"
+                ))
+                .ino,
+            *ino
+        );
+    }
+    assert_eq!(
+        META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed),
+        screened0,
+        "nothing a legitimate writer wrote was screened"
+    );
+    shutdown(&third).await;
+}
+
 /// **A forest volume takes no writer without the plane** (review round
 /// 3, Issue 25 — the frame-stamp class of the pin above on the OTHER
 /// legal transition; since PR 14 the law is every stamped volume's, not

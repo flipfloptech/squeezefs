@@ -4370,7 +4370,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         // act, never piecemeal (`--symmetric` is that
                         // default's accepted no-op spelling);
                         // `--single-writer` is the explicit opt-out that
-                        // formats the flat unstamped class.
+                        // formats the flat unstamped class. The binary
+                        // takes the EXPLICIT forest builder: the matrix's
+                        // flat seam turns a test's default-class request
+                        // flat and must never reach a production format
+                        // (PR 14 review fix round 1, Issue 7 — pinned
+                        // through the binary).
                         if single_writer {
                             squeezefs::meta_backend::kv::builder::format_v3_stamped_single_writer(
                                 Path::new(&path),
@@ -4381,7 +4386,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             .await
                             .map(|_| ())
                         } else {
-                            squeezefs::meta_backend::kv::builder::format_v3_stamped(
+                            squeezefs::meta_backend::kv::builder::format_v3_stamped_symmetric(
                                 Path::new(&path),
                                 volume_len,
                                 &opts,

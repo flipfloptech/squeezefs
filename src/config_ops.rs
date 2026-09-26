@@ -2617,8 +2617,11 @@ pub async fn add_meta_volume_with(
             // the new member to match AS PART OF THE ADD — the fresh-format
             // arm (one plan, one superblock write; no marker needed, a
             // fresh volume has no prior state to sequence through). Since
-            // the rung-10b flip this is also just the default class.
-            crate::meta_backend::kv::builder::format_v3_stamped(
+            // the rung-10b flip this is also just the default class — taken
+            // through the EXPLICIT forest builder, like `squeezefs format`:
+            // a production formatter never reads the matrix's flat seam
+            // (PR 14 review fix round 1, Issue 7).
+            crate::meta_backend::kv::builder::format_v3_stamped_symmetric(
                 Path::new(device),
                 volume_len,
                 &opts,

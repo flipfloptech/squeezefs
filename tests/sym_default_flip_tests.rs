@@ -169,6 +169,79 @@ async fn the_default_image_is_the_forest_builders_image_byte_for_byte() {
     assert_ne!(f & FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST, 0);
 }
 
+/// **The production `format` ignores the matrix's flat seam** (PR 14
+/// review fix round 1, Issue 7): `SQUEEZEFS_TEST_FORMAT_FLAT` turns a
+/// DEFAULT-class request flat for the inverted matrix's flat leg — a
+/// test's builder — and nothing pinned that the BINARY's `format`
+/// (`squeezefs format`) does not read it. The CLI's default arm takes the
+/// explicit forest class, so a plain `format` under the exported seam
+/// stamps bit 17 exactly as it does without it; `--single-writer` stays
+/// the one flat arm.
+#[test]
+fn the_binarys_format_stamps_the_forest_whatever_the_flat_seam_says() {
+    use squeezefs::meta_backend::kv::builder::FORMAT_FLAT_SEAM;
+    let dir = tempfile::tempdir().unwrap();
+    let format_through_binary = |name: &str, seam: bool, single_writer: bool| -> u64 {
+        let meta = dir.path().join(format!("{name}-meta"));
+        let data = dir.path().join(format!("{name}-data"));
+        std::fs::File::create(&meta)
+            .unwrap()
+            .set_len(256 * 1024 * 1024)
+            .unwrap();
+        std::fs::File::create(&data)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_squeezefs"));
+        cmd.arg("format")
+            .arg(format!("sqmeta://{}", meta.display()))
+            .arg(format!("sqdata://{}", data.display()))
+            .arg("--force");
+        if single_writer {
+            cmd.arg("--single-writer");
+        }
+        if seam {
+            cmd.env(FORMAT_FLAT_SEAM, "1");
+        } else {
+            cmd.env_remove(FORMAT_FLAT_SEAM);
+        }
+        let out = cmd.output().expect("run squeezefs format");
+        assert!(
+            out.status.success(),
+            "format {name} failed: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(features_of(&meta))
+    };
+    let plain = format_through_binary("plain", false, false);
+    let seamed = format_through_binary("seamed", true, false);
+    assert_ne!(
+        plain & FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST,
+        0,
+        "a plain format stamps the forest"
+    );
+    assert_ne!(
+        seamed & FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST,
+        0,
+        "…and so does one under the exported seam — the binary never reads it"
+    );
+    assert_eq!(
+        plain, seamed,
+        "the feature word is the same with and without the seam"
+    );
+    let single = format_through_binary("single", true, true);
+    assert_eq!(
+        single & FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA,
+        0,
+        "--single-writer is the one flat arm"
+    );
+}
+
 /// **Presence-required** (§7.2's bit-17-absent row): a multi-writer-class
 /// volume WITHOUT the forest — every default format between the rung-10b
 /// flip and PR 14 — refuses a WRITABLE open loud, naming `squeezefs volume
@@ -176,6 +249,10 @@ async fn the_default_image_is_the_forest_builders_image_byte_for_byte() {
 /// offline probe (fsck's door) read it as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_multi_writer_class_volume_without_the_forest_refuses_a_writable_open_naming_the_verb() {
+    // The process env is shared: every contract that sets or clears the
+    // plane knob holds the seam lock (the `=0` contract's `set_var` raced
+    // this one's `remove_var` — 2 of 3 runs red before the lock).
+    let _g = SEAM.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let flat = format_multi_writer_flat(dir.path(), "flat").await;
     let uris = vec![flat.display().to_string()];
@@ -213,6 +290,7 @@ async fn a_multi_writer_class_volume_without_the_forest_refuses_a_writable_open_
 /// single-writer guard's refusal, never a join.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_single_writer_volume_mounts_flat_under_the_default() {
+    let _g = SEAM.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let single = format_single_writer(dir.path(), "single").await;
     let uris = vec![single.display().to_string()];
@@ -249,6 +327,7 @@ async fn a_single_writer_volume_mounts_flat_under_the_default() {
 /// lease held, the native slot plus the rotor leased.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn symmetric_meta_zero_on_a_stamped_volume_refuses_the_writable_open_and_writes_nothing() {
+    let _g = SEAM.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let stamped = format_default(dir.path(), "stamped").await;
     let uris = vec![stamped.display().to_string()];

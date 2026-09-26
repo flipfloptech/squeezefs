@@ -1392,8 +1392,13 @@ pub async fn format_v3_stamped_multi_writer_flat(
 /// volume instead, so every KV contract that formats "the default" runs
 /// on the one flat writable class as well as on the forest. The EXPLICIT
 /// builders ([`format_v3_stamped_symmetric`], the single-writer and the
-/// pre-flip multi-writer forms) ignore it. Registered (`Kind::Bool`,
-/// default off); never set in production.
+/// pre-flip multi-writer forms) ignore it — and so do the PRODUCTION
+/// formatters (`squeezefs format`'s default arm, `volume add-meta`'s
+/// stamp-to-match arm), which take [`format_v3_stamped_symmetric`]: the
+/// seam changes a TEST builder's class, never the binary's (PR 14 review
+/// fix round 1, Issue 7 — `sym_default_flip_tests::the_binarys_format_
+/// stamps_the_forest_whatever_the_flat_seam_says`). Registered
+/// (`Kind::Bool`, default off); never set in production.
 pub const FORMAT_FLAT_SEAM: &str = "SQUEEZEFS_TEST_FORMAT_FLAT";
 
 /// The format CLASS a public formatter builds.

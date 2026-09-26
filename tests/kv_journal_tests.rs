@@ -241,6 +241,104 @@ fn test_core_admission_reservation_budget_roundtrip() {
     );
 }
 
+/// PR 14 §4.4be — the checkpoint class KEEPS one SMO record's claim
+/// (`CoreGeometry::smo_keep`) so the class can never be consumed below
+/// what the next cycle's tail-pinning node needs: on a padded ring a
+/// keep-honouring admission refuses while a keep-free one of the same
+/// length admits, the keep is exactly one page's data plus the pad
+/// slack, and the reserve-less flat arithmetic (`keep = 0`) is the
+/// shipped `try_admit` verbatim. Found by the 95k-create storm a frozen
+/// ring handle drove `sym_mount_posture_tests` into: the pass ate ring
+/// 0's class down to one free page (4,072 B) and the one dirty node
+/// left — the tail's own — needed 123 + 4,117 B for ever.
+#[test]
+fn a_checkpoint_class_admission_keeps_one_smo_claim_of_class_space() {
+    // Production page geometry, 8 pages, a 2-page reserve, the 4 KiB grain.
+    let geo = CoreGeometry {
+        page_data_len: JOURNAL_PAGE_DATA_LEN,
+        pages: 8,
+        reserve_bytes: 2 * JOURNAL_PAGE_DATA_LEN,
+        grain: 4096,
+    };
+    let keep = geo.smo_keep();
+    assert_eq!(
+        keep,
+        JOURNAL_PAGE_DATA_LEN + geo.max_pad(),
+        "the keep is one SMO record's worst-case claim: a page of data + the pad slack"
+    );
+    // Fill the ring to exactly ONE free page: user admissions stop at the
+    // reserve; the checkpoint class walks the reserve one record a page
+    // (every reservation on a 4 KiB-grain ring starts and ends on a page).
+    let core = JournalCore::new(geo, 0, 0);
+    let cap = geo.logical_len();
+    while cap - core.head() > JOURNAL_PAGE_DATA_LEN {
+        let adm = core
+            .try_admit(123, AdmissionClass::Checkpoint)
+            .expect("two or more free pages admit a record");
+        let res = core.reserve(adm);
+        assert_eq!(
+            res.len + res.pad,
+            JOURNAL_PAGE_DATA_LEN,
+            "one record per page"
+        );
+    }
+    assert_eq!(
+        cap - core.head(),
+        JOURNAL_PAGE_DATA_LEN,
+        "exactly one free page"
+    );
+    // The shipped claim (`len + max_pad`) is one page + 45 B: the last free
+    // page admits nothing to a keep-free admission either — the deadlock's
+    // arithmetic, kept as the record of why the keep sits ABOVE the last
+    // page: the class must stop while a whole record still fits.
+    assert!(core.try_admit(123, AdmissionClass::Checkpoint).is_none());
+    // Now the keep: with TWO free pages the keep-honouring admission
+    // refuses (it would leave less than one record's claim) while the
+    // keep-free one admits.
+    core.advance_reusable_upto(JOURNAL_PAGE_DATA_LEN);
+    assert_eq!(
+        cap - (core.head() - core.reusable_upto()),
+        2 * JOURNAL_PAGE_DATA_LEN
+    );
+    assert!(
+        core.try_admit_keeping(123, AdmissionClass::Checkpoint, keep)
+            .is_none(),
+        "two free pages: the record's claim ({}) plus the keep ({keep}) exceeds them",
+        123 + geo.max_pad()
+    );
+    let adm = core
+        .try_admit_keeping(123, AdmissionClass::Checkpoint, 0)
+        .expect("the keep-exempt admission (the pass's oldest node) takes the page");
+    core.release(adm);
+    // Four free pages: the keep-honouring admission lands and leaves the
+    // kept claim behind it (the record's claim + the keep = 12,429 B, over
+    // three pages' 12,216 and under four's 16,288).
+    core.advance_reusable_upto(2 * JOURNAL_PAGE_DATA_LEN);
+    assert!(
+        core.try_admit_keeping(123, AdmissionClass::Checkpoint, keep)
+            .is_none(),
+        "three free pages: still short of the record plus the keep"
+    );
+    core.advance_reusable_upto(3 * JOURNAL_PAGE_DATA_LEN);
+    let adm = core
+        .try_admit_keeping(123, AdmissionClass::Checkpoint, keep)
+        .expect("four free pages hold a record and the keep");
+    let res = core.reserve(adm);
+    assert!(
+        cap - (core.head() - core.reusable_upto()) >= keep,
+        "after the admission the kept claim is still free (res {}+{})",
+        res.len,
+        res.pad
+    );
+    // `keep = 0` is `try_admit` verbatim: the same answer on the same ring.
+    let a = core.try_admit(123, AdmissionClass::Checkpoint);
+    let b = core.try_admit_keeping(123, AdmissionClass::Checkpoint, 0);
+    assert_eq!(a.is_some(), b.is_some());
+    for adm in [a, b].into_iter().flatten() {
+        core.release(adm);
+    }
+}
+
 /// Logical→physical mapping at production geometry: laps, page indices,
 /// contiguous multi-page segments, owned page-first-byte positions.
 #[test]

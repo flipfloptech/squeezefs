@@ -141,6 +141,20 @@ mount is a read-token client whose metadata is exact at the next resolve
   latent hole where a joined writer rejoining as its own residue minted a
   colliding ino in a slot whose last mints were covered before its last
   checkpoint. `--single-writer` (flat) volumes keep the stamp verbatim.
+- **A volume FAIL-STOP under a lockstep compaction wave, fixed red-first
+  on EVERY layout (the acceptance record's §4.4be):** the checkpoint
+  task's flush pass visited its dirty nodes in hash order and its SMO
+  records consumed the journal ring's checkpoint class — 64 padded records
+  per pass on the 256 KiB reserve since the 1.3.0 `O_DIRECT` pad law — on
+  nodes that discharged nothing while the one node pinning the ring's tail
+  came last and found a single free page too small for its record's
+  admission; the ring could never drain and the §4.7 wedge audit marked
+  the volume FAILED. A create storm into one directory on a symmetric
+  volume (its 64-slot rotor compacts in lockstep) is the shape that
+  reaches it. The flush pass runs OLDEST FLOOR FIRST per ring now, and
+  every checkpoint-class admission but the ring's oldest node keeps one
+  SMO record's claim of class space, so every cycle flushes the node that
+  moves each ring's tail.
 - **The flip lands after the owner's cloud decision**: the box brackets of
   every design §8 gate on the flip binary and the two-host / cloud rows are
   what that decision reads (the record

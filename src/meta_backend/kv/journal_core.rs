@@ -167,6 +167,17 @@ impl CoreGeometry {
         }
     }
 
+    /// The class space a checkpoint-class admission KEEPS behind it
+    /// ([`JournalCore::try_admit_keeping`]): one SMO record's worst-case
+    /// claim — a page of entry bytes (every SMO entry is under one page:
+    /// a split's pointers, its alloc records and the frees) plus the pad
+    /// slack. The flush pass's oldest node per ring is exempt; every other
+    /// checkpoint-class consumer leaves this much, so that node always
+    /// admits at the next cycle's start and the tail moves (PR 14 §4.4be).
+    pub fn smo_keep(&self) -> u64 {
+        self.page_data_len + self.max_pad()
+    }
+
     /// Which lap `pos` belongs to.
     pub fn lap(&self, pos: u64) -> u64 {
         pos / self.logical_len()
@@ -452,9 +463,28 @@ impl JournalCore {
     /// on `admitted` that retries only when a concurrent
     /// admission/release/transfer moved it.
     pub fn try_admit(&self, len: u64, class: AdmissionClass) -> Option<Admission> {
+        self.try_admit_keeping(len, class, 0)
+    }
+
+    /// [`Self::try_admit`] that refuses unless `keep` bytes of the class's
+    /// space stay free BEHIND the admission — the checkpoint class's
+    /// liveness law (PR 14 §4.4be): every SMO record but the flush pass's
+    /// oldest-per-ring node keeps [`CoreGeometry::smo_keep`], so the class
+    /// can never be consumed below what the one node that can move the
+    /// tail needs. Without it the pass ate the class to a single free
+    /// page and the tail's own node's 123 B record — claiming `len +
+    /// max_pad` = one page + 45 B — could never admit: a full ring whose
+    /// every byte above the tail is live, the deadlock the §4.7 audit
+    /// fail-stops. `keep = 0` is `try_admit` verbatim.
+    pub fn try_admit_keeping(
+        &self,
+        len: u64,
+        class: AdmissionClass,
+        keep: u64,
+    ) -> Option<Admission> {
         let reserve = match class {
             AdmissionClass::User => self.geo.reserve_bytes,
-            AdmissionClass::Checkpoint => 0,
+            AdmissionClass::Checkpoint => keep,
         };
         let capacity = self.geo.logical_len();
         debug_assert!(reserve < capacity, "reserve must leave admissible space");

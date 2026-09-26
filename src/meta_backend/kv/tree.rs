@@ -247,6 +247,12 @@ pub struct SmoContext {
     /// fixture's daemons share them): the flush pass reads its delta per
     /// node for the cadence's per-image unit (PR 13g, F-B1).
     images_written: u64,
+    /// The next SMO entry's admission may take the class's kept space
+    /// (`CoreGeometry::smo_keep`): set by the flush pass for the OLDEST
+    /// dirty node of each ring — the one node whose flush moves the tail —
+    /// and consumed by that node's own SMO (PR 14 §4.4be). Every other
+    /// checkpoint-class admission keeps.
+    keep_exempt: bool,
 }
 
 /// The region scope an SMO runs in: the lessee's ring and grant.
@@ -267,6 +273,7 @@ impl SmoContext {
             slot: None,
             extent_ledger: None,
             images_written: 0,
+            keep_exempt: false,
         }
     }
 
@@ -282,6 +289,7 @@ impl SmoContext {
             slot: None,
             extent_ledger: None,
             images_written: 0,
+            keep_exempt: false,
         }
     }
 
@@ -356,6 +364,29 @@ impl SmoContext {
             (None, Some(j)) => Some(Arc::clone(&j.ring)),
             (_, None) => None,
         }
+    }
+
+    /// Let the NEXT SMO entry take the class's kept space (the flush
+    /// pass's oldest node per ring — PR 14 §4.4be); the node's own SMO
+    /// consumes the exemption ([`KvTree::checkpoint_flush_node`]).
+    pub fn set_keep_exempt(&mut self, exempt: bool) {
+        self.keep_exempt = exempt;
+    }
+
+    /// The SMO entry's checkpoint-class admission in the ring in scope:
+    /// keeps one record's claim of class space unless the flush pass
+    /// exempted this node as its ring's oldest (PR 14 §4.4be — the
+    /// liveness law: the class can never be consumed below what the
+    /// tail-pinning node needs at the next cycle's start).
+    fn admit_smo_entry(&self, len: u64) -> Result<Option<super::journal_core::Admission>, KvError> {
+        let ring = self.smo_ring().ok_or_else(|| {
+            KvError::Corrupt("an SMO entry admission without a journal ring".to_string())
+        })?;
+        Ok(if self.keep_exempt {
+            ring.try_admit(len, super::journal_core::AdmissionClass::Checkpoint)
+        } else {
+            ring.try_admit_checkpoint_keeping(len)
+        })
     }
 
     /// Claim one image extent (internal class): from the region's grant
@@ -1893,6 +1924,9 @@ impl KvTree {
             self.smo_replace(ctx, &node, &mut o, true).await
         }
         .await;
+        // The keep exemption was this node's own SMO's (PR 14 §4.4be):
+        // the opportunistic merge below and every later SMO keep.
+        ctx.set_keep_exempt(false);
         if out.is_err() {
             node.restore_dirty_floor(floor);
         }
@@ -2445,11 +2479,7 @@ impl KvTree {
             let retire_tag = j.retire_seq.load(Ordering::Acquire);
             recs.push(free_record(old_extent, retire_tag, 0));
             let len = entry_len_for(&recs)?;
-            match ctx
-                .smo_ring()
-                .expect("the hooks name a ring")
-                .try_admit(len, super::journal_core::AdmissionClass::Checkpoint)
-            {
+            match ctx.admit_smo_entry(len)? {
                 Some(adm) => Some((adm, recs)),
                 None => {
                     for e in &claimed_extents {
@@ -3469,11 +3499,7 @@ impl KvTree {
                 free_record(old_r, retire_tag, 0),
             ];
             let len = entry_len_for(&recs)?;
-            match ctx
-                .smo_ring()
-                .expect("the hooks name a ring")
-                .try_admit(len, super::journal_core::AdmissionClass::Checkpoint)
-            {
+            match ctx.admit_smo_entry(len)? {
                 Some(adm) => Some((adm, recs)),
                 None => {
                     ctx.release_unpublished(extent);
@@ -3694,11 +3720,7 @@ impl KvTree {
             let retire_tag = j.retire_seq.load(Ordering::Acquire);
             let recs: Vec<(u8, Record)> = vec![free_record(old_extent, retire_tag, 0)];
             let len = entry_len_for(&recs)?;
-            match ctx
-                .smo_ring()
-                .expect("the hooks name a ring")
-                .try_admit(len, super::journal_core::AdmissionClass::Checkpoint)
-            {
+            match ctx.admit_smo_entry(len)? {
                 Some(adm) => Some((adm, recs)),
                 None => return Err(KvError::JournalReserveExhausted { needed: len }),
             }

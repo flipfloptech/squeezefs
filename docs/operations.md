@@ -1902,7 +1902,20 @@ act with these laws (`docs/design-symmetric-metadata.md` §7.2 / §7.3, row 14):
   cursor cells this mount holds (≈ `slot_leases_held`), no longer an
   encoding-budget pressure gauge — the "migrate cursor-bearing slots off
   this volume" remedy in the refusal text belongs to `--single-writer`
-  (flat) volumes alone, where the stamp is unchanged.
+  (flat) volumes alone, where the stamp is unchanged. And **the
+  checkpoint class's liveness law** (§4.4be, every layout): the checkpoint
+  task's flush pass visits its dirty nodes OLDEST FLOOR FIRST per journal
+  ring, and every checkpoint-class admission but that ring's oldest node
+  keeps one SMO record's claim of class space behind it — before it a
+  lockstep compaction wave wider than the reserve's record budget (64
+  padded SMO records per pass on the 256 KiB reserve; the 64-slot rotor's
+  own shape under a create storm into one directory) could consume the
+  class down to one free page on nodes that moved nothing while the tail's
+  own node could never admit, and the §4.7 wedge audit fail-stopped the
+  volume. A `pending-free retirements wedged … 8 consecutive barriered
+  checkpoint cycles neither released one nor advanced the ledger tail`
+  line on a volume with a free heap now names a genuine wedge, never the
+  class's exhaustion.
 * **What is owed past the flip** (the PR 14b board): the manager's zero-census
   open (the bitmap as the terminal-free engine), PR 7's un-share of a
   surviving sole owner, the SMO-record window economy (one pad per flush

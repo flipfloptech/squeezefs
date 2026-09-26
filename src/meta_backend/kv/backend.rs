@@ -8891,11 +8891,13 @@ impl KvMetaBackend {
                 .ring
                 .try_admit(len, AdmissionClass::User)
                 .ok_or(KvError::JournalReserveExhausted { needed: len })?,
-            EntryAdmission::TryCheckpoint => {
-                self.ring
-                    .try_admit(len, AdmissionClass::Checkpoint)
-                    .ok_or(KvError::JournalReserveExhausted { needed: len })?
-            }
+            // The checkpoint class KEEPS one SMO claim behind every control
+            // entry (PR 14 §4.4be): a publication is deferrable, the
+            // tail-pinning node's SMO at the next cycle's start is not.
+            EntryAdmission::TryCheckpoint => self
+                .ring
+                .try_admit_checkpoint_keeping(len)
+                .ok_or(KvError::JournalReserveExhausted { needed: len })?,
             // A pre-admission (the door's, taken PARKING before the verb
             // mutex — Issue 24) for at least this entry: split to the
             // exact length, the remainder released. A shorter one is a
@@ -10052,8 +10054,9 @@ impl KvMetaBackend {
         let recs = vec![super::alloc_ext::free_record(extent, retire_tag, 0)];
         let len = super::journal::entry_len_for(&recs)?;
         let ring = region.ring();
+        // Keeps one SMO claim of the region ring's class (PR 14 §4.4be).
         let adm = ring
-            .try_admit(len, super::journal_core::AdmissionClass::Checkpoint)
+            .try_admit_checkpoint_keeping(len)
             .ok_or(KvError::JournalReserveExhausted { needed: len })?;
         let (res, seq_base) = ring.reserve_registered(adm);
         let mut recs = recs;
@@ -21671,7 +21674,10 @@ impl KvMetaBackend {
         {
             return Err(KvError::JournalReserveExhausted { needed: len });
         }
-        let Some(adm) = self.ring.try_admit(len, AdmissionClass::Checkpoint) else {
+        // Keeps one SMO claim of class space (PR 14 §4.4be): a deferred
+        // publication clamps the tail through its root floor and lands
+        // next cycle; the flush pass's oldest node has no such retry.
+        let Some(adm) = self.ring.try_admit_checkpoint_keeping(len) else {
             return Err(KvError::JournalReserveExhausted { needed: len });
         };
         // The named images first (see the doc): one barrier covers every
@@ -24080,6 +24086,10 @@ impl KvMetaBackend {
             super::node::debug_audit_records(*tree_id, 0, std::slice::from_ref(r));
         }
         let len = entry_len_for(&recs)?;
+        // No keep here (PR 14 §4.4be): the compensation of a FAILED window
+        // write is the §4.4 pt 4 correctness step, and refusing it for
+        // the class's kept space would leave the window's apply
+        // uncompensated; the keep is every DEFERRABLE consumer's.
         let Some(adm) = ring.try_admit(len, AdmissionClass::Checkpoint) else {
             return Err(KvError::JournalReserveExhausted { needed: len });
         };

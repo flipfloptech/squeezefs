@@ -1986,11 +1986,15 @@ impl KvMetaBackend {
         // The pass's work split by class — the cadence's live projection's
         // units (PR 13g, F-B1).
         let mut sample = super::super::checkpoint::FlushPassSample::default();
-        for node in dirty {
+        // Oldest floor first, the oldest node keep-exempt (PR 14 §4.4be —
+        // the joiner's ring has the same class and the same law).
+        let oldest = super::super::checkpoint::order_flush_pass(self, &mut dirty);
+        for (node, is_oldest) in dirty.into_iter().zip(oldest) {
             let addr = node.addr();
             let tree = self.tree_of_node(&node)?;
             let images_before = smo.images_written();
             let node_started = std::time::Instant::now();
+            smo.set_keep_exempt(is_oldest);
             let mut out = tree.checkpoint_flush_node(smo, addr).await;
             // The REACTIVE refill (§5.3.3) over the wire: the flush pass
             // that exhausts the grant asks the manager for the DERIVED

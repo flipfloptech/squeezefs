@@ -1564,9 +1564,14 @@ async fn an_appenders_own_checkpoint_refreshes_its_page_and_the_release_bound_re
     // Journal PAST two laps of the region's ring (the storm rides the
     // declared region: every create under `shared` is slot B's, and slot
     // B is region 1's) — the checkpoint cadence covers the window as it
-    // fills.
+    // fills. The bound reads the LIVE ring every iteration: PR 2's
+    // stall-driven growth REPLACES the region's ring (`grown_with` mints
+    // a new `JournalCore` whose head continues while the replaced
+    // handle's freezes), and a handle captured before the loop froze the
+    // bound whenever growth landed mid-storm — the storm then ran to its
+    // 200k belt and drove ring 0 into the §4.4be class deadlock (PR 14).
     let mut i = 0u64;
-    while ring.core().head() < start_head + 2 * ring_len + ring_len / 4 {
+    while region.ring().core().head() < start_head + 2 * ring_len + ring_len / 4 {
         routed
             .create(shared, &format!("f{i}"), libc::S_IFREG | 0o644, 0, 0)
             .await

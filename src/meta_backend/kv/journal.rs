@@ -1086,6 +1086,18 @@ impl JournalRing {
         self.core.try_admit(len, class)
     }
 
+    /// A checkpoint-class admission that keeps [`CoreGeometry::smo_keep`]
+    /// of class space free behind it — every checkpoint-class consumer's
+    /// form but the flush pass's oldest node per ring
+    /// ([`super::journal_core::JournalCore::try_admit_keeping`]).
+    pub fn try_admit_checkpoint_keeping(&self, len: u64) -> Option<super::journal_core::Admission> {
+        self.core.try_admit_keeping(
+            len,
+            AdmissionClass::Checkpoint,
+            self.core.geometry().smo_keep(),
+        )
+    }
+
     /// Transfer admitted budget to the head **and register the
     /// reservation in-flight** — one mutex section so the completed-prefix
     /// watermark can never observe a head past an unregistered

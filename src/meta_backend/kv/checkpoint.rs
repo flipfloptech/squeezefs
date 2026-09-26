@@ -2377,6 +2377,77 @@ pub fn test_release_checkpoint_park() {
     TEST_CHECKPOINT_PARK_NOTIFY.notify_waiters();
 }
 
+/// TEST seam ONLY (`None` in production, one relaxed load on the flush
+/// pass's entry): the ORDER a flush pass visits its dirty nodes in, as
+/// `(region, dirty floor)` per node — the pin of PR 14 §4.4be's
+/// oldest-floor-first law (`tests/sym_appender_tests.rs`). Armed by
+/// [`test_arm_flush_pass_tape`], read by [`test_take_flush_pass_tape`].
+static TEST_FLUSH_PASS_TAPE: std::sync::Mutex<Option<Vec<(u32, u64)>>> =
+    std::sync::Mutex::new(None);
+static TEST_FLUSH_PASS_TAPE_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arm [`TEST_FLUSH_PASS_TAPE`]: every flush pass from here appends its
+/// visit order.
+pub fn test_arm_flush_pass_tape() {
+    *TEST_FLUSH_PASS_TAPE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+    TEST_FLUSH_PASS_TAPE_ARMED.store(true, Ordering::Release);
+}
+
+/// Take the recorded visit order and disarm the tape.
+pub fn test_take_flush_pass_tape() -> Vec<(u32, u64)> {
+    TEST_FLUSH_PASS_TAPE_ARMED.store(false, Ordering::Release);
+    TEST_FLUSH_PASS_TAPE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_default()
+}
+
+/// **The flush pass's visit order (PR 14 §4.4be — the liveness law's
+/// first half).** Dirty nodes are flushed OLDEST FLOOR FIRST: a floor is
+/// a position in the node's ring, so the sort orders each ring's nodes by
+/// age (rings interleave, harmlessly — a sort by one key keeps every
+/// subset ordered by it), and the pass's first node per ring — the one
+/// whose flush moves that ring's tail — is marked so its own SMO may take
+/// the class's kept space. The scc-hash order it replaces let the class
+/// (the 256 KiB reserve = 64 padded SMO records per pass under PR 13i's
+/// pad law) be consumed by nodes that discharged nothing while the tail's
+/// own node came last and found no page. Returns, per node, whether it is
+/// its ring's oldest.
+pub(super) fn order_flush_pass(be: &KvMetaBackend, dirty: &mut [Arc<CachedNode>]) -> Vec<bool> {
+    dirty.sort_by_key(|n| n.dirty_floor());
+    let mut seen: Vec<u32> = Vec::new();
+    let oldest: Vec<bool> = dirty
+        .iter()
+        .map(|n| {
+            let region = be.region_of_node(n);
+            if seen.contains(&region) {
+                false
+            } else {
+                seen.push(region);
+                true
+            }
+        })
+        .collect();
+    if TEST_FLUSH_PASS_TAPE_ARMED.load(Ordering::Relaxed) {
+        if let Some(tape) = TEST_FLUSH_PASS_TAPE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            tape.extend(
+                dirty
+                    .iter()
+                    .map(|n| (be.region_of_node(n), n.dirty_floor())),
+            );
+        }
+    }
+    oldest
+}
+
 impl KvMetaBackend {
     /// **A checkpoint-class durable step CONSUMES a checkpoint seq — and
     /// writes the ledger record that seq names** (symmetric PR 13, defect
@@ -2561,7 +2632,10 @@ impl KvMetaBackend {
         // input (review round 1, Issue 11 — the process-wide SMO counters
         // fold every volume's).
         let mut sample = FlushPassSample::default();
-        for node in dirty {
+        // Oldest floor first, the ring's oldest node keep-exempt (PR 14
+        // §4.4be — `order_flush_pass`).
+        let oldest = order_flush_pass(self, &mut dirty);
+        for (node, is_oldest) in dirty.into_iter().zip(oldest) {
             let addr = node.addr();
             let tree = self.tree_of_node(&node)?;
             // A leased slot tree's SMOs journal into its lessee's ring and
@@ -2573,6 +2647,7 @@ impl KvMetaBackend {
                 .filter(|id| *id != 0);
             let images_before = smo.images_written();
             let node_started = std::time::Instant::now();
+            smo.set_keep_exempt(is_oldest);
             let mut out = tree.checkpoint_flush_node(smo, addr).await;
             // A REACTIVE refill (§5.3.3): the flush pass that exhausts a
             // region's grant asks the manager — this process, in PR 3 —

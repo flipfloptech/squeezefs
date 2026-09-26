@@ -1628,6 +1628,87 @@ async fn a_changed_declared_partition_is_a_wish_list_and_the_crash_window_replay
 /// logical_len / 2` is unreachable on a floor-sized ring anyway (its
 /// reserve IS half the ring): the region's law is half its ADMISSIBLE
 /// window. Found attributing the growth contract's 1-in-20 stall race.
+/// **PR 14 §4.4be — the flush pass visits its dirty nodes OLDEST FLOOR
+/// FIRST, per ring, and marks each ring's oldest.** A node's dirty floor
+/// is a position in its ring; the checkpoint class (the reserve — 64
+/// padded SMO records per pass on the 256 KiB reserve under PR 13i's pad
+/// law) is what the pass's SMOs consume, and the tail moves only when the
+/// OLDEST floor's node flushes. The scc-hash order the pass used let the
+/// class go to nodes that discharged nothing while the tail's own node
+/// came last and found no page — the deadlock a 95k-create storm drove
+/// ring 0 into (a frozen ring handle in `sym_mount_posture_tests` ran the
+/// storm; the §4.7 audit fail-stopped the volume after 8 cycles with ONE
+/// dirty node left, its 123 B record refused for ever). Pinned through
+/// the pass's visit tape: 2 × MINT_SPREAD block-reference commits dirty
+/// every rotor leaf in commit order, and the next cycle's tape reads
+/// non-decreasing floors within every region. RED on the hash order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flush_pass_visits_its_dirty_nodes_oldest_floor_first_per_ring() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    // A long cadence: the contract's own `checkpoint_now` is the pass.
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "600000");
+    let ra = open_with_partition(&uris, None).await;
+    std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+    let va = Arc::clone(&ra.volumes[0]);
+    let tag = volume_tag("vol-0011223344556677");
+    // The arm's own control records: covered before the dirtying below.
+    va.checkpoint_now().await.unwrap();
+    let mut minted = 0u64;
+    for _ in 0..(2 * squeezefs::meta_backend::MINT_SPREAD) {
+        let (local, _global) = ra.allocate_local_ino(0).unwrap();
+        let Some((_routing, raw)) = squeezefs::meta_backend::split_guest_local(local) else {
+            continue;
+        };
+        va.commit_block_refs(local, &refs(tag, local, 70_000 + raw * 4, 1))
+            .await
+            .unwrap();
+        minted += 1;
+    }
+    assert!(
+        minted >= squeezefs::meta_backend::MINT_SPREAD as u64,
+        "premise: the rotor minted into every rotor slot ({minted})"
+    );
+    squeezefs::meta_backend::kv::checkpoint::test_arm_flush_pass_tape();
+    va.checkpoint_now().await.unwrap();
+    let tape = squeezefs::meta_backend::kv::checkpoint::test_take_flush_pass_tape();
+    assert!(
+        tape.len() >= squeezefs::meta_backend::MINT_SPREAD,
+        "premise: the pass visited every dirtied rotor leaf ({} visits)",
+        tape.len()
+    );
+    let mut last: std::collections::BTreeMap<u32, u64> = Default::default();
+    let mut firsts: std::collections::BTreeMap<u32, u64> = Default::default();
+    for (i, (region, floor)) in tape.iter().enumerate() {
+        firsts.entry(*region).or_insert(*floor);
+        if let Some(prev) = last.get(region) {
+            assert!(
+                floor >= prev,
+                "visit {i}: region {region} floor {floor} after {prev} — the pass is not \
+                 oldest-floor-first (tape {tape:?})"
+            );
+        }
+        last.insert(*region, *floor);
+    }
+    for (region, first) in &firsts {
+        let min = tape
+            .iter()
+            .filter(|(r, _)| r == region)
+            .map(|(_, f)| *f)
+            .min()
+            .unwrap();
+        assert_eq!(
+            *first, min,
+            "region {region}: the first visited node is the ring's oldest"
+        );
+    }
+    drop(va);
+    for v in &ra.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_full_declared_ring_kicks_the_next_cadence_tick_not_the_ceiling() {
     let dir = tempfile::tempdir().unwrap();

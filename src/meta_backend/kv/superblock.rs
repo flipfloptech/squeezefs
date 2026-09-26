@@ -571,13 +571,13 @@ pub const FEATURE_INCOMPAT_KV_BLOCK_MAP_TREE: u64 = 1 << 16;
 /// gate — exactly right: they would read a slot tree's 9-byte inode keys
 /// as corruption.
 ///
-/// **Never stamped by [`SuperblockV3::plan`]** and stamped by NOTHING in
-/// PR 1 but the test seam `SQUEEZEFS_TEST_STAMP_SYMMETRIC=1` (the
-/// `SQUEEZEFS_TEST_STAMP_BLOCK_REFS` precedent, read by the image
-/// builder): `format --symmetric` and the offline `volume
-/// enable-symmetric` conversion are PR 11's, the default flip PR 14's
-/// (§7.1: the bit is never partially stamped — it means the COMPLETE
-/// forest format).
+/// **Never stamped by [`SuperblockV3::plan`]**: the image builder stamps
+/// it for the DEFAULT format class since PR 14 (the flip — every `format`
+/// but the `--single-writer` opt-out), and the offline `volume
+/// enable-symmetric` conversion stamps it onto a pre-flip multi-writer-
+/// class volume (PR 11); §7.1: the bit is never partially stamped — it
+/// means the COMPLETE forest format — and since the flip it is
+/// PRESENCE-REQUIRED for a writable mount of the multi-writer class.
 ///
 /// **Bit 17** — 0..=16 are claimed; the
 /// `incompat_bits_are_single_bit_and_pairwise_disjoint` union clause is
@@ -845,6 +845,17 @@ impl SuperblockV3 {
     /// every forest-vs-per-kind decision reads.
     pub fn symmetric_forest_stamped(&self) -> bool {
         self.features_incompat & FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST != 0
+    }
+
+    /// Whether this volume is of the MULTI-WRITER format class — bit 11
+    /// (`KV_MULTI_WRITER_DATA`, the class's TERMINAL stamp: "bit 11 set ⇒
+    /// all nine set", [`MULTI_WRITER_FORMAT_BITS`]). Since PR 14 the class
+    /// is writable only under the forest (presence-required: a
+    /// multi-writer-class volume without bit 17 is a pre-flip default
+    /// format that `squeezefs volume enable-symmetric` converts); a
+    /// `--single-writer` volume is neither and mounts flat.
+    pub fn multi_writer_class(&self) -> bool {
+        self.features_incompat & FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA != 0
     }
 
     /// Encode into a checksummed whole-sector image (generation 0 — the

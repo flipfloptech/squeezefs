@@ -11,9 +11,11 @@
 //! 2. Under `SQUEEZEFS_SYMMETRIC_META=1` the four posture knobs are
 //!    RETIRED spellings — refused in the registry's own form, naming the
 //!    successor; without the knob they are not.
-//! 3. `volume set-owners` is refused on a symmetric-forest set (ownership
-//!    is a slot LEASE), verbatim on a flat set.
-//! 4. Rung 2 names the missing bit; rung 3 names the membership plane.
+//! 3. (retired at PR 14 with `volume set-owners` — ownership is a slot
+//!    LEASE on every armed set; the verb is gone, `sym_default_flip_tests`
+//!    pins the class law.)
+//! 4. Rung 2 names the lowest missing bit of a `--single-writer` set; rung
+//!    3 names the membership plane.
 //! 5. **The headline**: a solo armed mount walks the ladder to its planes
 //!    — the WERO joined on a PR-capable data namespace, the custody owner
 //!    installed, the listener up, `manager_lease == held`, the report's
@@ -67,7 +69,12 @@ struct Restore;
 impl Drop for Restore {
     fn drop(&mut self) {
         Knobs::clear();
-        for (k, _) in squeezefs::sym_join::RETIRED_ON_ARMED {
+        for k in [
+            "SQUEEZEFS_MULTI_WRITER",
+            "SQUEEZEFS_MW_ROLE",
+            "SQUEEZEFS_MW_AUTHORITY",
+            "SQUEEZEFS_MW_MEMBERS",
+        ] {
             std::env::remove_var(k);
         }
         std::env::remove_var("SQUEEZEFS_MEMBERSHIP_BIND");
@@ -120,16 +127,15 @@ async fn a_plain_mount_of_a_bit17_absent_set_arms_nothing() {
         .expect("the ladder answers Ok on an unarmed set");
     assert!(armed.is_none(), "and arms NOTHING (the shipped posture)");
     assert!(squeezefs::sym_join::report().is_none(), "no report exists");
-    // The posture knobs keep their shipped meaning: no retired refusal
-    // without the plane's knob, whatever they say.
-    std::env::set_var("SQUEEZEFS_MULTI_WRITER", "1");
-    std::env::set_var("SQUEEZEFS_MW_ROLE", "co-writer");
+    // The posture knobs are RETIRED spellings since PR 14, on every class
+    // (the registry's startup gate — `sym_default_flip_tests` pins the
+    // four).
     assert!(
-        squeezefs::sym_join::retired_knob_refusal().is_none(),
-        "the retirement fires only beside SQUEEZEFS_SYMMETRIC_META=1"
+        !squeezefs::env_knobs::validate_vars([("SQUEEZEFS_MULTI_WRITER", "1")])
+            .errors
+            .is_empty(),
+        "a retired knob refuses at startup whatever the volume's class"
     );
-    std::env::remove_var("SQUEEZEFS_MULTI_WRITER");
-    std::env::remove_var("SQUEEZEFS_MW_ROLE");
     assert_eq!(
         squeezefs::fuse_client::mount_posture().as_str(),
         "writer",
@@ -148,142 +154,6 @@ async fn a_plain_mount_of_a_bit17_absent_set_arms_nothing() {
 }
 
 // ===========================================================================
-// 2. The retired posture knobs
-// ===========================================================================
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_retired_posture_knobs_refuse_only_beside_the_plane_naming_the_successor() {
-    let _g = SEAM.lock().await;
-    let _restore = Restore;
-    std::env::set_var(SYMMETRIC_META_ENV, "1");
-    assert!(
-        squeezefs::sym_join::retired_knob_refusal().is_none(),
-        "the plane alone refuses nothing"
-    );
-    for (key, successor) in squeezefs::sym_join::RETIRED_ON_ARMED {
-        std::env::set_var(key, "1");
-        let refusal = squeezefs::sym_join::retired_knob_refusal()
-            .unwrap_or_else(|| panic!("{key} beside the plane must refuse"));
-        assert!(refusal.contains(key), "names the knob: {refusal}");
-        assert!(
-            refusal.contains("RETIRED") && refusal.contains("forward-only"),
-            "the registry's retired-spelling form: {refusal}"
-        );
-        assert!(
-            refusal.contains(successor),
-            "names the successor: {refusal}"
-        );
-        assert!(
-            refusal.contains("design-symmetric-metadata"),
-            "cites the law: {refusal}"
-        );
-        std::env::remove_var(key);
-    }
-    // Every offender at once (the registry gate's law).
-    std::env::set_var("SQUEEZEFS_MULTI_WRITER", "1");
-    std::env::set_var("SQUEEZEFS_MW_ROLE", "set-authority");
-    let refusal = squeezefs::sym_join::retired_knob_refusal().expect("refuses");
-    assert!(refusal.contains("SQUEEZEFS_MULTI_WRITER") && refusal.contains("SQUEEZEFS_MW_ROLE"));
-    // An EMPTY value is unset (the ONE knob convention).
-    std::env::set_var("SQUEEZEFS_MW_AUTHORITY", "   ");
-    std::env::remove_var("SQUEEZEFS_MULTI_WRITER");
-    std::env::remove_var("SQUEEZEFS_MW_ROLE");
-    assert!(squeezefs::sym_join::retired_knob_refusal().is_none());
-    // The BOOL knob at an OFF spelling asks for nothing — the knob law reads
-    // `0` / `false` / `no` / `off` as DISABLED, i.e. absent (a fleet env that
-    // writes the shipped default out is not a posture declaration; review
-    // round 1, Issue 19). Every ON spelling is the retired spelling.
-    for off in ["0", "false", "no", "OFF", " off "] {
-        std::env::set_var("SQUEEZEFS_MULTI_WRITER", off);
-        assert!(
-            squeezefs::sym_join::retired_knob_refusal().is_none(),
-            "SQUEEZEFS_MULTI_WRITER={off:?} beside the plane is the absent knob"
-        );
-    }
-    for on in ["1", "true", "yes", "ON"] {
-        std::env::set_var("SQUEEZEFS_MULTI_WRITER", on);
-        let refusal = squeezefs::sym_join::retired_knob_refusal()
-            .unwrap_or_else(|| panic!("SQUEEZEFS_MULTI_WRITER={on:?} beside the plane refuses"));
-        assert!(
-            refusal.contains("OFF spelling"),
-            "the refusal says the OFF spelling is admitted, so the operator reads a law, not a \
-             bug: {refusal}"
-        );
-    }
-    std::env::remove_var("SQUEEZEFS_MULTI_WRITER");
-    // The ROLE enum has no off spelling: its default word `authority` is a
-    // role, and there are no roles under the plane.
-    std::env::set_var("SQUEEZEFS_MW_ROLE", "authority");
-    assert!(squeezefs::sym_join::retired_knob_refusal().is_some());
-    std::env::remove_var("SQUEEZEFS_MW_ROLE");
-    // `SQUEEZEFS_MW_BIND` is NOT retired: every writer serves, and the
-    // bind is where (§6.1 retires the four, never the bind).
-    std::env::remove_var("SQUEEZEFS_MW_AUTHORITY");
-    std::env::set_var("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
-    assert!(squeezefs::sym_join::retired_knob_refusal().is_none());
-    std::env::remove_var(SYMMETRIC_META_ENV);
-    std::env::set_var("SQUEEZEFS_MULTI_WRITER", "1");
-    assert!(
-        squeezefs::sym_join::retired_knob_refusal().is_none(),
-        "without the plane the knobs keep their shipped meaning"
-    );
-}
-
-// ===========================================================================
-// 3. volume set-owners on a symmetric-forest set
-// ===========================================================================
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn volume_set_owners_is_refused_on_a_symmetric_forest_set_naming_the_lease() {
-    let _g = SEAM.lock().await;
-    let _restore = Restore;
-    let dir = tempfile::tempdir().unwrap();
-    let stamped = vec![format_stamped_member(dir.path(), "sym0").await];
-    // The set's durable volume id, off a probe (the verb keys on it).
-    let routed = open_under(&stamped, &Knobs::unarmed()).await;
-    let vol_id = squeezefs::meta_backend::kv::backend::durable_volume_id_of(
-        &routed.volumes[0].superblock().uuid,
-    );
-    shutdown(&routed).await;
-    drop(routed);
-    let specs = vec![squeezefs::config_ops::OwnerAssignSpec {
-        volume_id: vol_id.clone(),
-        owner: "node_0123456789abcdef".to_string(),
-        successors: Vec::new(),
-        subtree_root: None,
-    }];
-    let opts = squeezefs::config_ops::SetOwnersOptions::default();
-    let err = squeezefs::config_ops::set_owners(&stamped, &specs, &opts)
-        .await
-        .expect_err("set-owners on a bit-17 set is refused");
-    let msg = err.to_string();
-    assert!(msg.contains("RETIRED"), "the retired-spelling form: {msg}");
-    assert!(msg.contains("incompat bit 17"), "names the bit: {msg}");
-    assert!(msg.contains("slot LEASE"), "names the successor: {msg}");
-    assert!(
-        msg.contains("SQUEEZEFS_SYMMETRIC_META=1"),
-        "and the remedy: {msg}"
-    );
-
-    // A FLAT multi-writer-class set never sees that text: the verb runs
-    // its shipped gates verbatim (here it reaches the durable-id check,
-    // since the spec names the stamped set's volume).
-    let flat = vec![format_flat_member(dir.path(), "flat0").await];
-    let err = squeezefs::config_ops::set_owners(&flat, &specs, &opts)
-        .await
-        .expect_err("a spec naming another set's volume is refused by the shipped gate");
-    let msg = err.to_string();
-    assert!(
-        !msg.contains("RETIRED for a symmetric-forest set"),
-        "a flat set keeps the verb's shipped meaning: {msg}"
-    );
-    assert!(
-        msg.contains("no volume of this set carries the durable id"),
-        "the shipped gate's own text: {msg}"
-    );
-}
-
-// ===========================================================================
 // 4. The rungs' refusals name themselves
 // ===========================================================================
 
@@ -292,14 +162,24 @@ async fn rung_2_names_the_missing_bit_and_rung_3_the_membership_plane() {
     let _g = SEAM.lock().await;
     let _restore = Restore;
     let dir = tempfile::tempdir().unwrap();
-    // A flat multi-writer-class set carries every bit but 17.
+    // The flat class since PR 14 is `--single-writer`: the LOWEST missing
+    // bit of the multi-writer class is named, with the default `format` as
+    // the act (the class is a declaration — no offline verb re-stamps it).
     let flat = vec![format_flat_member(dir.path(), "flat0").await];
     let routed = open_under(&flat, &Knobs::unarmed()).await;
-    let err = squeezefs::sym_join::check_bits(&routed).expect_err("bit 17 missing");
+    let err = squeezefs::sym_join::check_bits(&routed).expect_err("the flat class fails rung 2");
     let msg = err.to_string();
     assert!(msg.contains("rung 2 (bits)"), "names the rung: {msg}");
-    assert!(msg.contains("incompat bit 17"), "names the bit: {msg}");
-    assert!(msg.contains("enable-symmetric"), "names the act: {msg}");
+    let missing =
+        squeezefs::sym_join::required_bits() & !routed.volumes[0].superblock().features_incompat;
+    assert!(
+        msg.contains(&format!("incompat bit {}", missing.trailing_zeros())),
+        "names the lowest missing bit: {msg}"
+    );
+    assert!(
+        msg.contains("default `format`") && msg.contains("--single-writer"),
+        "names the act and the class: {msg}"
+    );
     shutdown(&routed).await;
 
     // A stamped, ARMED set passes rung 2 and meets rung 3: the membership
@@ -379,17 +259,19 @@ async fn rung_3_refuses_an_explicit_membership_off_and_arms_auto_only_when_unset
     shutdown(&routed).await;
 }
 
-/// A SECOND RW mount of an ARMED set is refused at the D0 gate — loud, at
-/// the OPEN, before any page goes `Live` or any claim-set entry is written
-/// (nothing half-joins — witnessed on the DEVICE directory) — and the
-/// refusal NAMES the posture it met: the MANY-writer posture (N unbounded
-/// by design — the second daemon is only what meets the gate first) is PR
-/// 12b; until it lands the D0 guard applies to RW mounts and `-o ro`
-/// readers join as token clients (review rounds 1/2, Issues 6, 21, 25).
-/// Without the plane the same refusal is the shipped single-writer text
-/// verbatim.
+/// A SECOND RW open of an ARMED set through the PLAIN writer door
+/// (`open_routed_meta_set` — the D0 ladder, never the mount path's join
+/// target) is refused at the D0 gate — loud, at the OPEN, before any page
+/// goes `Live` or any claim-set entry is written (nothing half-joins —
+/// witnessed on the DEVICE directory) — and the refusal NAMES the posture
+/// the class has: a second RW MOUNT joins the manager as a writer over
+/// the wire (PR 12b; the mount path re-reads the join target when the D0
+/// claim is refused), `-o ro` readers join as token clients, and a
+/// `--single-writer` volume has one writer by format class. Since PR 14
+/// the note is the CLASS's, so `SQUEEZEFS_SYMMETRIC_META=0` reads the
+/// same text at Layer A (the flock is taken before any door law).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_second_rw_mount_of_an_armed_set_is_refused_naming_the_plane_and_pr_12b() {
+async fn a_second_rw_open_through_the_plain_door_is_refused_at_d0_naming_the_join() {
     let _g = SEAM.lock().await;
     let _restore = Restore;
     let dir = tempfile::tempdir().unwrap();
@@ -397,49 +279,51 @@ async fn a_second_rw_mount_of_an_armed_set_is_refused_naming_the_plane_and_pr_12
     let first = open_under(&uris, &Knobs::armed()).await;
     let pages_before = live_pages_on_device(&uris[0], &first).await;
 
-    // Armed: refused, naming the plane and PR 12b; nothing half-joined
-    // (`open_under` clears the knobs after its open — the second mount
-    // declares the plane itself, as a second daemon would).
+    // The default posture: refused, naming the join; nothing half-joined
+    // (`open_under` clears the knobs after its open — the second open
+    // declares nothing, as a second daemon would).
     Knobs::armed().apply();
     let err = squeezefs::meta_backend::open_routed_meta_set(&uris)
         .await
         .err()
         .map(|e| e.to_string())
-        .expect("a second RW mount of an armed set is refused at the D0 gate");
+        .expect("a second RW open of an armed set is refused at the D0 gate");
     assert!(
         err.contains("single-writer guard"),
         "the D0 guard's own text stands: {err}"
     );
     assert!(
-        err.contains("symmetric plane armed") && err.contains("PR 12b"),
-        "names the posture and the rung that lands it: {err}"
+        err.contains("symmetric plane") && err.contains("JOINS the manager as a WRITER"),
+        "names the posture a second RW mount takes: {err}"
     );
     assert!(
-        err.contains("many-writer") && err.contains("N unbounded"),
-        "the posture is the MANY-writer one, N unbounded by design — the second daemon is \
-         only what meets the gate first: {err}"
+        err.contains("re-reads the join target") && err.contains("-o ro"),
+        "names the mount path's arm and the reader's: {err}"
     );
     assert!(
-        err.contains("-o ro") && err.contains("joins as a WRITER once PR 12b"),
-        "names what a second mount may be today and will be: {err}"
+        err.contains("--single-writer"),
+        "names the one class with a single writer by declaration: {err}"
     );
     assert_eq!(
         live_pages_on_device(&uris[0], &first).await,
         pages_before,
-        "the refused mount left no Live page ON THE DEVICE — nothing half-joined"
+        "the refused open left no Live page ON THE DEVICE — nothing half-joined"
     );
 
-    // Unarmed: the shipped text, verbatim — the note is the plane's alone.
-    std::env::remove_var(SYMMETRIC_META_ENV);
+    // `=0`: Layer A refuses first, with the same class note — the knob
+    // names no posture (its own refusal is the door's, `sym_default_flip_
+    // tests`), so it changes nothing here.
+    std::env::set_var(SYMMETRIC_META_ENV, "0");
     let err = squeezefs::meta_backend::open_routed_meta_set(&uris)
         .await
         .err()
         .map(|e| e.to_string())
         .expect("refused");
+    std::env::remove_var(SYMMETRIC_META_ENV);
     assert!(err.contains("single-writer guard"), "{err}");
     assert!(
-        !err.contains("PR 12b") && !err.contains("symmetric plane"),
-        "an unarmed refusal is the shipped text: {err}"
+        err.contains("symmetric plane"),
+        "the note is the class's, whatever the knob says: {err}"
     );
     shutdown(&first).await;
 }
@@ -641,19 +525,20 @@ async fn the_ladder_on_a_non_pr_substrate_is_detection_grade_only_under_the_lab_
     fsck_clean(&uris).await;
 }
 
-/// §5.8.1 on the PRODUCT shape: the knob-armed writer — no declared test
-/// partition, the shape every field mount takes — holds WERO (rtype 3) on
-/// a PR-capable METADATA namespace, so a second host's appender can
-/// REGISTER under it to write its own ring and be fenced by a preempt of
-/// its key. PR 3 keyed the posture on PR 2's declared partition alone, so
-/// the knob-armed manager held the shipped rtype 1 (found by the fidelity
-/// tier's `sym-join-ladder` leg on the real nvmet target: `meta_pr_wero=0`,
-/// device rtype 1, beside `data_plane_fence_mode=1`). The unarmed forest
-/// keeps rtype 1 verbatim, and the knob-armed writer on a NON-PR namespace
-/// is the detection-grade lab posture under the opt-in (KD-SYM-13),
-/// refused without it.
+/// §5.8.1 on the PRODUCT shape: the default writer — no declared test
+/// partition, no knob, the shape every field mount takes since PR 14 —
+/// holds WERO (rtype 3) on a PR-capable METADATA namespace, so a second
+/// host's appender can REGISTER under it to write its own ring and be
+/// fenced by a preempt of its key. PR 3 keyed the posture on PR 2's
+/// declared partition alone, so the knob-armed manager held the shipped
+/// rtype 1 (found by the fidelity tier's `sym-join-ladder` leg on the
+/// real nvmet target: `meta_pr_wero=0`, device rtype 1, beside
+/// `data_plane_fence_mode=1`). A `--single-writer` volume keeps rtype 1
+/// verbatim (one writer by format class), and the default writer on a
+/// NON-PR block device is the detection-grade lab posture under the
+/// opt-in (KD-SYM-13), refused without it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_knob_armed_writer_holds_wero_on_a_pr_capable_metadata_namespace() {
+async fn a_default_writer_holds_wero_on_a_pr_capable_metadata_namespace() {
     let _g = SEAM.lock().await;
     let _restore = Restore;
     let dir = tempfile::tempdir().unwrap();
@@ -664,25 +549,35 @@ async fn a_knob_armed_writer_holds_wero_on_a_pr_capable_metadata_namespace() {
         &meta,
         FakeReservationClient::new(Arc::clone(&ns), "nqn.pr12.meta", "pr12-meta-host"),
     );
-    // Unarmed (the knob off): the shipped Write Exclusive, rtype 1.
+    // The flat class (`--single-writer`): the shipped Write Exclusive,
+    // rtype 1 — there is no plane to register a peer under.
     {
-        let routed = open_under(&uris, &Knobs::unarmed()).await;
-        let s = routed.volumes[0].appender_stats().expect("a forest volume");
-        assert!(!s.meta_pr_wero, "an unarmed forest keeps rtype 1: {s:?}");
-        let report = FakeReservationClient::new(Arc::clone(&ns), "nqn.probe", "probe")
+        let flat = vec![format_flat_member(dir.path(), "flat0").await];
+        let flat_ns = FakeNvmeNamespace::lenient_register();
+        install_override(
+            &flat[0],
+            FakeReservationClient::new(Arc::clone(&flat_ns), "nqn.pr12.flat", "pr12-flat-host"),
+        );
+        let routed = open_under(&flat, &Knobs::armed()).await;
+        assert!(
+            routed.volumes[0].appender_stats().is_none(),
+            "a single-writer volume has no appender region"
+        );
+        let report = FakeReservationClient::new(Arc::clone(&flat_ns), "nqn.probe", "probe")
             .report()
             .expect("report");
         assert_eq!(report.rtype, 1, "the shipped Write Exclusive");
         shutdown(&routed).await;
+        clear_override(&flat[0]);
     }
-    // Armed by the knob alone (no partition): WERO, rtype 3 — the device
+    // The default (no knob, no partition): WERO, rtype 3 — the device
     // can fence a registered peer appender.
     {
         let routed = open_under(&uris, &Knobs::armed()).await;
         let s = routed.volumes[0].appender_stats().expect("a forest volume");
         assert!(
             s.meta_pr_wero,
-            "the knob-armed manager holds WERO on the metadata namespace: {s:?}"
+            "the default manager holds WERO on the metadata namespace: {s:?}"
         );
         assert_eq!(s.manager_lease.word(), "held");
         assert_eq!(routed.volumes[0].writer_guard_mode(), "flock+pr");
@@ -698,8 +593,11 @@ async fn a_knob_armed_writer_holds_wero_on_a_pr_capable_metadata_namespace() {
         );
     }
     clear_override(&meta);
-    // The same knob-armed writer on a NON-PR namespace: refused without the
-    // opt-in, detection-grade with it (the in-process suites' posture).
+    // The same default writer on a NON-PR BLOCK DEVICE (the fake models
+    // one over the file — `reservation::single_kernel_substrate` reads an
+    // installed override as the device it models): refused without the
+    // opt-in, detection-grade with it (the fleet rig's loop / null_blk
+    // posture under the lab opt-in).
     let ns_nonpr = FakeNvmeNamespace::without_pr_support();
     install_override(
         &meta,
@@ -712,7 +610,7 @@ async fn a_knob_armed_writer_holds_wero_on_a_pr_capable_metadata_namespace() {
             .await
             .err()
             .map(|e| e.to_string())
-            .expect("an armed writer on a non-PR metadata namespace refuses without the opt-in");
+            .expect("a writer on a non-PR metadata block device refuses without the opt-in");
         assert!(
             err.contains("SQUEEZEFS_SYM_ALLOW_NON_PR") && err.contains("KD-SYM-13"),
             "names the opt-in and the rule: {err}"
@@ -725,6 +623,21 @@ async fn a_knob_armed_writer_holds_wero_on_a_pr_capable_metadata_namespace() {
         shutdown(&routed).await;
     }
     clear_override(&meta);
+    // A regular FILE with no device modelled over it is the sandbox
+    // class: one kernel by construction, admitted without the opt-in and
+    // holding nothing (the in-process suites' posture since PR 14).
+    {
+        Knobs::armed().apply();
+        std::env::remove_var("SQUEEZEFS_SYM_ALLOW_NON_PR");
+        let routed = squeezefs::meta_backend::open_routed_meta_set(&uris)
+            .await
+            .expect("a file-backed metadata volume needs no opt-in");
+        Knobs::clear();
+        let s = routed.volumes[0].appender_stats().expect("a forest volume");
+        assert!(!s.meta_pr_wero, "nothing to hold on a file");
+        assert_eq!(s.manager_lease.word(), "held");
+        shutdown(&routed).await;
+    }
     fsck_clean(&uris).await;
 }
 

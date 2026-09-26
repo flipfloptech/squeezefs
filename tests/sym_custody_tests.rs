@@ -1943,14 +1943,15 @@ async fn a_deferred_handover_recalls_the_custody_and_completes_within_a_beat() {
     rig.shutdown().await;
 }
 
-/// `SQUEEZEFS_SYMMETRIC_META=0` is the shipped posture exactly, and a
-/// bit-17-absent volume takes it verbatim: no slot-custody arm, every
-/// acquire the local arbiter, the `dlm_custody` family's two PR-9 gauges
-/// 0, `dlm_rpcs` 0, and an armed symmetric mount ships NO `pack_group`
-/// frame (§5.4.3 — its promotions pack in its own slot's scope; the PK4
-/// wire is the unarmed co-writer's, which is why it stays).
+/// A bit-17-absent (`--single-writer`) volume is the shipped posture
+/// exactly, under either knob value: no slot-custody arm, every acquire
+/// the local arbiter, the `dlm_custody` family's two PR-9 gauges 0,
+/// `dlm_rpcs` 0 — and an armed symmetric mount ships NO `pack_group`
+/// frame (§5.4.3 — its promotions pack in its own slot's scope). (The
+/// `=0` forest is the writable open's refusal since PR 14, pinned in
+/// `sym_default_flip_tests`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unarmed_and_flat_mounts_arm_nothing_and_count_nothing() {
+async fn flat_mounts_arm_nothing_and_count_nothing() {
     let _g = SEAM.lock().await;
     let _restore = Restore;
     let dir = tempdir().unwrap();
@@ -1962,13 +1963,12 @@ async fn unarmed_and_flat_mounts_arm_nothing_and_count_nothing() {
             .pack_cowriter_frames
             .load(Ordering::Relaxed)
     };
-    for (name, stamped) in [("flat", false), ("dark", true)] {
-        let uris = vec![if stamped {
-            format_stamped_member(dir.path(), name).await
-        } else {
-            common::sym::format_flat_member(dir.path(), name).await
-        }];
-        let rig = mount_data(&uris, data.path(), &Knobs::unarmed()).await;
+    for (name, knobs) in [
+        ("flat-off", Knobs::unarmed()),
+        ("flat-default", Knobs::armed()),
+    ] {
+        let uris = vec![common::sym::format_flat_member(dir.path(), name).await];
+        let rig = mount_data(&uris, data.path(), &knobs).await;
         assert!(
             !data_grant::slot_custody_armed(),
             "{name}: nothing armed the slot-custody plane"

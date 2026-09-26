@@ -6,6 +6,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
 
 - [Versioning & releases](#versioning--releases)
   - [Verifying a build (`task check`)](#verifying-a-build-task-check)
+- [Prerequisites — the memlock limit](#prerequisites--the-memlock-limit-rlimit_memlock)
 - [Durability & crash contract](#durability--crash-contract)
   - [Metadata Durability (crash contract)](#metadata-durability-crash-contract)
   - [Single-writer mount guard (guarantee classes)](#single-writer-mount-guard-guarantee-classes)
@@ -125,6 +126,30 @@ Mechanics and edges:
 `--all-features` compiles `dhat-on`, which replaces the jemalloc allocator: correct for a correctness gate, never valid for a measurement. Measurement builds are `cargo build --release` (default features), and tagged releases ship from the `dist` profile via `task dist:<distro>`. The release-only legs beyond `task check` — the external POSIX suites (pjdfstest, LTP, fstests), `task check:require-mount`, the zc-capability gate, fuzzing, the bench baseline compare and the scoreboard — are tiered in [AGENTS.md](../AGENTS.md) §Testing.
 
 ---
+
+## Prerequisites — the memlock limit (`RLIMIT_MEMLOCK`)
+
+FUSE-over-io_uring on a kernel with the kmbuf surface (the sqz kernel series and any kernel carrying `IORING_REGISTER_KMBUF_RING`) registers **kernel-managed payload buffers** per queue: `IORING_REGISTER_KMBUF_RING` pins `entries × buf_size` bytes for each of the mount's queues, one queue per **possible CPU**, at mount time. An unprivileged daemon's pins are bounded by its `RLIMIT_MEMLOCK` soft limit — **8 MiB on most distributions** — so on a fresh install the first mount can refuse at its FIRST queue's registration with `ENOMEM` (the daemon's bounded retry exhausts and the refusal names the limit and the three places to raise it; found on a fresh Omarchy install, PR 14). Root and a daemon holding `CAP_IPC_LOCK` are exempt.
+
+**The need is DERIVED, never declared:** `queues × entries × buf_size`, where `queues` = the kernel's possible CPUs (`SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES` is testing-only), `entries` = the per-queue depth (`SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH`, default 32 degraded to the payload-buffer cap, floor 4) and `buf_size` = the negotiated payload size (`transport_max_write` + the header, ≈ 1 MiB at the shipped `max_write`). At the defaults:
+
+| possible CPUs | queues × 32 × 1 MiB | raise `memlock` to |
+|---|---|---|
+| 4 | 128 MiB | ≥ 128 MiB (or `unlimited`) |
+| 8 | 256 MiB | ≥ 256 MiB |
+| 16 | 512 MiB | ≥ 512 MiB |
+| 32 | 1 GiB | ≥ 1 GiB |
+| 64 | 2 GiB | ≥ 2 GiB |
+
+The pinned arena is also gauged live as `transport_payload_buffer_bytes` and attributed to the memory budget as the `transport_payload_buffers` component, so a running mount's real need is readable off `.stats`.
+
+**Three places to raise it** (the refusal names all three):
+
+1. The mounting shell — `ulimit -l unlimited` (or `sudo prlimit --pid $$ --memlock=unlimited:unlimited` where the hard limit binds), before `squeezefs mount`.
+2. Login sessions — `/etc/security/limits.d/squeezefs.conf`: `<user>  -  memlock  unlimited` (new sessions only).
+3. systemd units and user sessions — `DefaultLimitMEMLOCK=infinity` in `/etc/systemd/system.conf.d/` and `/etc/systemd/user.conf.d/` (new sessions only; a mount unit may set `LimitMEMLOCK=infinity` directly).
+
+The release gate's require-mount leg (`tests/run_require_mount_gate.sh`) runs the same derivation as a preflight and refuses to start below the derived need (root and `unlimited` pass), so a box that cannot mount is named before a suite self-skips on it.
 
 ## Durability & crash contract
 

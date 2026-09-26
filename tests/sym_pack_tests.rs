@@ -301,12 +301,11 @@ async fn an_armed_set_packs_per_slot_and_an_unarmed_mount_keeps_pk2s_one_scope()
         assert_eq!(rig.router.packer.open_scopes(), 0);
         rig.shutdown().await;
     }
-    // Unarmed: ONE scope — two inos' tenants share one block. On a
-    // never-armed volume: a set the plane has stamped takes no writer
-    // without the plane (PR 5 review round 3, Issue 25 — the frame-stamp
-    // law has no unarmed writer), and this half's law is the POSTURE's.
+    // Unarmed — the `--single-writer` class, the one unarmed writable
+    // posture since PR 14: ONE scope — two inos' tenants share one block
+    // (PK2's law verbatim).
     {
-        let uris = vec![format_stamped_member(dir.path(), "meta-unarmed").await];
+        let uris = vec![format_flat_member(dir.path(), "meta-flat").await];
         let rig = mount_data(&uris, data.path(), &Knobs::unarmed()).await;
         let a = rig.mk_file("ua").await;
         let b = rig.mk_file("ub").await;
@@ -597,13 +596,14 @@ async fn a_gather_mode_directorys_children_live_in_its_slot_past_the_cap_and_nev
     shutdown(&routed).await;
 }
 
-/// The unarmed forest never reads the opt-in: children of a gather
-/// directory take the shared rotor exactly as before and the gauge stays 0.
+/// An unarmed mount (the `--single-writer` class since PR 14) never reads
+/// the opt-in: children of a gather directory take the shared rotor
+/// exactly as before and the gauge stays 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unarmed_mount_ignores_the_gather_xattr_and_the_gauge_stays_zero() {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
-    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let uris = vec![format_flat_member(dir.path(), "meta0").await];
     let routed = open_under(&uris, &Knobs::unarmed()).await;
     let vol = Arc::clone(&routed.volumes[0]);
     assert!(vol.slot_lease_stats().is_none(), "no plane unarmed");

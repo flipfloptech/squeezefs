@@ -37,7 +37,9 @@ use squeezefs::meta_backend::dir_stripe::{
 };
 use squeezefs::meta_backend::kv::appender::TEST_APPENDER_SLOTS_ENV;
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
-use squeezefs::meta_backend::kv::builder::{format_v3_stamped, FormatV3Options, ROOT_INO};
+use squeezefs::meta_backend::kv::builder::{
+    format_v3_stamped_single_writer, format_v3_stamped_symmetric, FormatV3Options, ROOT_INO,
+};
 use squeezefs::meta_backend::kv::record::{dentry_name_hash54, ForestSlot};
 use squeezefs::meta_backend::kv::slot_lease::SYMMETRIC_META_ENV;
 use squeezefs::meta_backend::{
@@ -136,22 +138,25 @@ async fn format_member(dir: &std::path::Path, name: &str, stamped: bool) -> Stri
         .set_len(vol_len())
         .unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
-    if stamped {
-        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
+    // The forest EXPLICITLY (the default class since PR 14) or the flat
+    // `--single-writer` class — the builder is told, never the environment.
+    let r = if stamped {
+        format_v3_stamped_symmetric(&p, vol_len(), &set_opts(dir), plan.stamps[0].clone()).await
     } else {
-        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
-    }
-    let r = format_v3_stamped(&p, vol_len(), &set_opts(dir), plan.stamps[0].clone()).await;
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        format_v3_stamped_single_writer(&p, vol_len(), &set_opts(dir), plan.stamps[0].clone()).await
+    };
     r.expect("format member");
     p.display().to_string()
 }
 
 fn apply_knobs(armed: bool, partition: Option<&str>) {
+    // The plane is the default since PR 14: `armed` leaves the knob at its
+    // default (unset), `!armed` sets `=0` EXPLICITLY — the refusal on a
+    // forest volume, inert on a `--single-writer` one.
     if armed {
-        std::env::set_var(SYMMETRIC_META_ENV, "1");
-    } else {
         std::env::remove_var(SYMMETRIC_META_ENV);
+    } else {
+        std::env::set_var(SYMMETRIC_META_ENV, "0");
     }
     std::env::set_var("SQUEEZEFS_SYM_ALLOW_NON_PR", "1");
     match partition {
@@ -2519,19 +2524,23 @@ async fn a_degraded_writers_shutdown_runs_its_whole_ladder() {
     drop(degraded);
 }
 
-/// The shipped postures: `SQUEEZEFS_SYMMETRIC_META=0` on a bit-17 volume
-/// and a flat volume carry no striping — the flip refuses, `readdir`
-/// takes the volume's page verbatim, every gauge is 0.
+/// The shipped flat posture: a `--single-writer` volume carries no
+/// striping under either knob value — the flip refuses, `readdir` takes
+/// the volume's page verbatim, every gauge is 0. (The `=0` forest is the
+/// writable open's refusal since PR 14, pinned in
+/// `sym_default_flip_tests`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_unarmed_and_flat_paths_stripe_nothing() {
+async fn the_flat_paths_stripe_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     let before = stripe_stats();
-    for stamped in [true, false] {
-        let sub = dir.path().join(if stamped { "stamped" } else { "flat" });
+    for armed in [false, true] {
+        let sub = dir
+            .path()
+            .join(if armed { "flat-default" } else { "flat-off" });
         std::fs::create_dir_all(&sub).unwrap();
-        let uris = vec![format_member(&sub, "meta0", stamped).await];
-        let routed = open_under(&uris, false, None).await;
+        let uris = vec![format_member(&sub, "meta0", false).await];
+        let routed = open_under(&uris, armed, None).await;
         let work = routed
             .create(ROOT_INO, "work", libc::S_IFDIR | 0o755, 0, 0)
             .await

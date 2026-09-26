@@ -7854,11 +7854,11 @@ async fn a_wire_holder_releases_a_slot_on_the_managers_notice_and_accepts_an_off
     fsck_clean(&uris).await;
 }
 
-/// **The refusals**: a joined open needs the plane (`SQUEEZEFS_SYMMETRIC_
-/// META=1`) — without it the D0 guard's refusal stands, never a join; a
-/// joiner's control writes refuse loud (the must-stay-0 gauge moves
-/// nowhere on a healthy joiner); a `LeaveAppender` naming a page still
-/// leasing slots is `Busy`.
+/// **The refusals**: a joined open needs the plane — `SQUEEZEFS_SYMMETRIC_
+/// META=0` names no posture since PR 14 and the door refuses it, never a
+/// join; a joiner's control writes refuse loud (the must-stay-0 gauge
+/// moves nowhere on a healthy joiner); a `LeaveAppender` naming a page
+/// still leasing slots is `Busy`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_joined_door_refuses_without_the_plane_and_never_writes_a_control_entry() {
     let dir = tempfile::tempdir().unwrap();
@@ -7884,8 +7884,8 @@ async fn the_joined_door_refuses_without_the_plane_and_never_writes_a_control_en
     Knobs::clear();
     let err = r.err().map(|e| e.to_string()).expect("refused");
     assert!(
-        err.contains("SQUEEZEFS_SYMMETRIC_META=1"),
-        "names the plane: {err}"
+        err.contains("SQUEEZEFS_SYMMETRIC_META=0") && err.contains("PR 14"),
+        "names the knob and the flip: {err}"
     );
 
     // A joiner's manager verbs refuse as a control write.
@@ -15296,28 +15296,28 @@ async fn a_joiners_forget_of_a_foreign_slots_ino_prices_no_destroy_and_reclaims_
 }
 
 /// **The unarmed law, byte-identical** (F-R6's other half): on a FLAT
-/// volume and on an UNARMED forest volume (the knob off — the PR 1–3
-/// forest, every slot the mount's) the reclaim's slot gate is one relaxed
-/// load answering "mine" for every ino: a FORGET-driven reclaim destroys
-/// every corpse exactly as shipped, `reclaim_foreign_slot_forgets` never
-/// moves, nothing is withheld.
+/// (`--single-writer`) volume the reclaim's slot gate is one relaxed load
+/// answering "mine" for every ino, and on the SOLO armed forest (PR 14's
+/// default — every slot the mount leases) it answers the same for every
+/// corpse the mount minted: a FORGET-driven reclaim destroys every corpse
+/// exactly as shipped, `reclaim_foreign_slot_forgets` never moves,
+/// nothing is withheld.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_forget_on_an_unarmed_mount_reclaims_every_corpse_as_shipped() {
+async fn a_forget_on_a_flat_or_solo_mount_reclaims_every_corpse_as_shipped() {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
-    // A FLAT member carrying the format config (the offline fsck's input),
-    // the seam cleared; an unarmed forest member beside it.
+    // A FLAT (`--single-writer`) member carrying the format config (the
+    // offline fsck's input).
     let flat = {
         let p = dir.path().join("flat");
         std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
         let plan = squeezefs::meta_backend::plan_meta_slot_set(1).expect("derived plan");
-        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
         let opts = squeezefs::meta_backend::kv::builder::FormatV3Options {
             format_config_xattr: Some(format_config_for(dir.path())),
             ..set_opts()
         };
-        squeezefs::meta_backend::kv::builder::format_v3_stamped(
+        squeezefs::meta_backend::kv::builder::format_v3_stamped_single_writer(
             &p,
             VOL_LEN,
             &opts,
@@ -15327,12 +15327,18 @@ async fn a_forget_on_an_unarmed_mount_reclaims_every_corpse_as_shipped() {
         .expect("format flat member");
         p.display().to_string()
     };
+    // The forest beside it: the SOLO armed writer (PR 14's default) owns
+    // every slot it leases, so its reclaim gate answers "mine" the same
+    // way for the corpses it minted.
     let forest_dir = tempfile::tempdir().unwrap();
     let forest = format_stamped_set_with_config(forest_dir.path(), 1)
         .await
         .remove(0);
-    for (uri, tag) in [(flat, "vol-13h-flat"), (forest, "vol-13h-forest-unarmed")] {
-        let routed = open_under(std::slice::from_ref(&uri), &Knobs::unarmed()).await;
+    for (uri, tag, knobs) in [
+        (flat, "vol-13h-flat", Knobs::unarmed()),
+        (forest, "vol-13h-forest-solo", Knobs::armed()),
+    ] {
+        let routed = open_under(std::slice::from_ref(&uri), &knobs).await;
         let vol = Arc::clone(&routed.volumes[0]);
         let files = create_files(&routed, 1, "c", 8).await;
         for (name, _) in &files {
@@ -15342,7 +15348,7 @@ async fn a_forget_on_an_unarmed_mount_reclaims_every_corpse_as_shipped() {
         for ino in &inos {
             assert!(
                 routed.owns_inode_reclaim(*ino),
-                "{tag}: an unarmed mount reclaims every ino"
+                "{tag}: a flat or solo mount reclaims every ino it minted"
             );
             assert_eq!(routed.getattr(*ino).await.expect("the corpse").nlink, 0);
         }
@@ -15372,7 +15378,7 @@ async fn a_forget_on_an_unarmed_mount_reclaims_every_corpse_as_shipped() {
                 f0.hint_inos,
                 f0.hint_failures
             ),
-            "{tag}: an unarmed mount's forgets are all its own — nothing counted foreign or \
+            "{tag}: a flat or solo mount's forgets are all its own — nothing counted foreign or \
              unleased, no hint shipped; faces {f0:?} → {f1:?}"
         );
         assert_eq!(

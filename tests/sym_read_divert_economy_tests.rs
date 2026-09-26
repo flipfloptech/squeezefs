@@ -154,13 +154,14 @@ async fn read_window(routed: &Arc<RoutedMetaBackend>, label: &str) -> u64 {
 /// `getattr` + `lookup`** — the forest codec's 9 (PR 1's kind-routed key
 /// framing, stated, not this rung's). The divert adds none: the first
 /// build read 12 (one box per `token_serve` call — `getattr` 1, `lookup`
-/// 2), on the armed writer's own object AND on the `=0` forest alike.
+/// 2) on the armed writer's own object.
 const FOREST_READ_EXCESS_PER_ROUND: u64 = 9;
 
-/// **An armed solo writer's own-object read verbs — and every read verb
-/// of a `=0` forest — allocate exactly the forest codec's excess over a
-/// flat volume and nothing for the divert**, whose "read locally" verdict
-/// is sync and whose box is never reached for them.
+/// **An armed solo writer's own-object read verbs allocate exactly the
+/// forest codec's excess over a flat volume and nothing for the divert**,
+/// whose "read locally" verdict is sync and whose box is never reached
+/// for them. (PR 14 retired the `=0` forest arm this pin also read: that
+/// open is the door's refusal now.)
 #[tokio::test(flavor = "current_thread")]
 async fn an_armed_writers_own_object_read_verbs_pay_nothing_for_the_divert() {
     let _g = SEAM.lock().await;
@@ -177,14 +178,6 @@ async fn an_armed_writers_own_object_read_verbs_pay_nothing_for_the_divert() {
         shutdown(&routed).await;
         n
     };
-    let unarmed = {
-        let uris = vec![format_stamped_member(dir.path(), "unarmed").await];
-        let routed = open_under(&uris, &Knobs::unarmed()).await;
-        assert!(!routed.volumes[0].slot_lease_armed());
-        let n = read_window(&routed, "=0 forest").await;
-        shutdown(&routed).await;
-        n
-    };
     let flat = {
         let uris = vec![format_flat_member(dir.path(), "flat").await];
         let routed = open_under(&uris, &Knobs::unarmed()).await;
@@ -194,9 +187,8 @@ async fn an_armed_writers_own_object_read_verbs_pay_nothing_for_the_divert() {
     };
     println!(
         "read-verb allocations over {OPS} × (getattr + lookup): armed own-object {armed}, \
-         =0 forest {unarmed}, flat {flat} — forest excess per round: armed {}, =0 {}",
+         flat {flat} — forest excess per round: {}",
         (armed.saturating_sub(flat)) as f64 / OPS as f64,
-        (unarmed.saturating_sub(flat)) as f64 / OPS as f64,
     );
     // The window is 2 × OPS verbs; a whole allocation per verb reads as
     // +2 × OPS. The slack is one stray housekeeping allocation per 100
@@ -209,15 +201,5 @@ async fn an_armed_writers_own_object_read_verbs_pay_nothing_for_the_divert() {
          a ceiling of {ceiling} (flat {flat} + the forest codec's {FOREST_READ_EXCESS_PER_ROUND} \
          per round) — the divert allocates per verb again (the sync `writer_reads_locally` \
          verdict must run BEFORE `token_serve`'s box)"
-    );
-    assert!(
-        unarmed <= ceiling,
-        "the =0 forest's read verbs allocate {unarmed} over {OPS} rounds against a ceiling \
-         of {ceiling} — a forest arm allocates per verb on the unarmed path"
-    );
-    assert!(
-        armed.abs_diff(unarmed) <= slack,
-        "the armed writer's own-object reads ({armed}) and the =0 forest's ({unarmed}) must \
-         allocate alike — the plane adds a per-verb term to one of them"
     );
 }

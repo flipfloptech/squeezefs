@@ -12,7 +12,9 @@
 #![allow(dead_code)]
 
 use squeezefs::meta_backend::kv::appender::TEST_APPENDER_SLOTS_ENV;
-use squeezefs::meta_backend::kv::builder::{format_v3_stamped, FormatV3Options};
+use squeezefs::meta_backend::kv::builder::{
+    format_v3_stamped_single_writer, format_v3_stamped_symmetric, FormatV3Options,
+};
 use squeezefs::meta_backend::kv::record::{forest_slot_of_ino, ForestSlot};
 use squeezefs::meta_backend::kv::slot_lease::{
     SYMMETRIC_META_ENV, SYM_AFFINITY_MAX_MB_ENV, SYM_MINT_SLOTS_ENV, SYM_T_IDLE_MS_ENV,
@@ -37,43 +39,43 @@ pub fn set_opts() -> FormatV3Options {
     }
 }
 
-/// One member formatted under the bit-17 seam.
+/// One member formatted with the DEFAULT class — the bit-17 forest since
+/// the PR-14 flip.
 pub async fn format_stamped_member(dir: &std::path::Path, name: &str) -> String {
     let p = dir.join(name);
     std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
-    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-    let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
-    r.expect("format stamped member");
+    format_v3_stamped_symmetric(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone())
+        .await
+        .expect("format stamped member");
     p.display().to_string()
 }
 
-/// A SET of `names.len()` members formatted under the bit-17 seam (one
+/// A SET of `names.len()` members formatted with the default class (one
 /// plan, one stamp per member — the routed open needs the members to
 /// agree on the slot map).
 pub async fn format_stamped_set(dir: &std::path::Path, names: &[&str]) -> Vec<String> {
     let plan = plan_meta_slot_set(names.len()).expect("derived plan");
     let mut uris = Vec::with_capacity(names.len());
-    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
     for (i, name) in names.iter().enumerate() {
         let p = dir.join(name);
         std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
-        let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[i].clone()).await;
+        let r = format_v3_stamped_symmetric(&p, VOL_LEN, &set_opts(), plan.stamps[i].clone()).await;
         r.expect("format stamped set member");
         uris.push(p.display().to_string());
     }
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
     uris
 }
 
-/// One member formatted FLAT (the seam cleared).
+/// One member formatted FLAT — the `--single-writer` class, the one flat
+/// WRITABLE class after the PR-14 flip (the pre-flip multi-writer class
+/// without the forest refuses a writable open; the conversion contracts
+/// build it through `format_v3_stamped_multi_writer_flat`).
 pub async fn format_flat_member(dir: &std::path::Path, name: &str) -> String {
     let p = dir.join(name);
     std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
-    format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone())
+    format_v3_stamped_single_writer(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone())
         .await
         .expect("format flat member");
     p.display().to_string()
@@ -133,10 +135,13 @@ impl Knobs {
         self
     }
     pub fn apply(&self) {
+        // The plane is the default since PR 14: `armed` leaves the knob at
+        // its default (unset), `unarmed` sets `=0` EXPLICITLY — the refusal
+        // on a stamped volume, inert on a `--single-writer` one.
         if self.armed {
-            std::env::set_var(SYMMETRIC_META_ENV, "1");
-        } else {
             std::env::remove_var(SYMMETRIC_META_ENV);
+        } else {
+            std::env::set_var(SYMMETRIC_META_ENV, "0");
         }
         std::env::set_var("SQUEEZEFS_SYM_ALLOW_NON_PR", "1");
         match self.partition {
@@ -280,7 +285,6 @@ pub async fn format_stamped_set_with_ring_len(
     ring_len: u64,
 ) -> Vec<String> {
     let plan = plan_meta_slot_set(n).expect("derived plan");
-    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
     let mut uris = Vec::with_capacity(n);
     for i in 0..n {
         let p = dir.join(format!("meta{i}"));
@@ -290,14 +294,11 @@ pub async fn format_stamped_set_with_ring_len(
             journal_len_override: Some(ring_len),
             ..set_opts()
         };
-        let r = format_v3_stamped(&p, len, &opts, plan.stamps[i].clone()).await;
-        if r.is_err() {
-            std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
-        }
-        r.expect("format set member");
+        format_v3_stamped_symmetric(&p, len, &opts, plan.stamps[i].clone())
+            .await
+            .expect("format set member");
         uris.push(p.display().to_string());
     }
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
     uris
 }
 

@@ -432,6 +432,83 @@ fn register_with_retry(mut attempt: impl FnMut() -> io::Result<()>) -> io::Resul
     unreachable!("the loop returns on Ok, terminal Err, or the last ENOMEM")
 }
 
+/// What the process may pin: `RLIMIT_MEMLOCK`'s soft limit in bytes
+/// (`None` = unlimited), and whether the limit binds it at all (root or
+/// `CAP_IPC_LOCK` is exempt — `mm/mlock.c`'s `can_do_mlock`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemlockPosture {
+    pub soft_limit_bytes: Option<u64>,
+    pub exempt: bool,
+}
+
+impl MemlockPosture {
+    /// Read off the process: `getrlimit(RLIMIT_MEMLOCK)` and the effective
+    /// uid / `CapEff` bit 14 (`CAP_IPC_LOCK`) in `/proc/self/status`.
+    pub fn of_process() -> Self {
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: a plain getrlimit into an owned, initialized struct.
+        let soft_limit_bytes = if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl) } == 0 {
+            if rl.rlim_cur == libc::RLIM_INFINITY {
+                None
+            } else {
+                Some(rl.rlim_cur)
+            }
+        } else {
+            None
+        };
+        // SAFETY: geteuid has no preconditions.
+        let root = unsafe { libc::geteuid() } == 0;
+        let cap_ipc_lock = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|st| {
+                st.lines()
+                    .find_map(|l| l.strip_prefix("CapEff:"))
+                    .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+            })
+            .is_some_and(|caps| caps & (1u64 << 14) != 0);
+        Self {
+            soft_limit_bytes,
+            exempt: root || cap_ipc_lock,
+        }
+    }
+}
+
+/// The kmbuf registration's `ENOMEM` on exhaustion, EXPLAINED (PR 14 —
+/// the fresh-install finding): `IORING_REGISTER_KMBUF_RING` pins
+/// `entries × buf_size` per queue, one queue per possible CPU, and an
+/// unprivileged daemon's pins are bounded by `RLIMIT_MEMLOCK` (8 MiB on
+/// most distributions — 32 × 1 MiB refuses at the FIRST queue). The
+/// daemon already refuses loud within the retry budget; this names the
+/// limit and the three places to raise it, so the operator reads a
+/// prerequisite instead of a memory error. `None` when the limit cannot
+/// explain the refusal (root / `CAP_IPC_LOCK`, an unlimited limit, or a
+/// pin inside the limit — a genuine allocation failure). Pure over the
+/// injected posture (`test_memlock_refusal_names_the_limit_and_remedy`).
+pub fn memlock_refusal_note(pinned_bytes: u64, posture: MemlockPosture) -> Option<String> {
+    if posture.exempt {
+        return None;
+    }
+    let soft = posture.soft_limit_bytes?;
+    if pinned_bytes <= soft {
+        return None;
+    }
+    let mib = |b: u64| b.div_ceil(1024 * 1024);
+    Some(format!(
+        "this queue pins {} MiB of kernel-managed payload buffers (entries × buf_size) and the \
+         daemon's RLIMIT_MEMLOCK soft limit is {} MiB — an unprivileged daemon cannot pin past \
+         it (root or CAP_IPC_LOCK is exempt). FUSE-over-io_uring needs every queue's pin (one \
+         queue per possible CPU): raise the limit before mounting — `ulimit -l unlimited` in \
+         the mounting shell, `<user> - memlock unlimited` in /etc/security/limits.d/, or \
+         `DefaultLimitMEMLOCK=infinity` in /etc/systemd/{{system,user}}.conf.d/ (new sessions \
+         only) — docs/operations.md §Prerequisites",
+        mib(pinned_bytes),
+        mib(soft)
+    ))
+}
+
 /// The pure ladder decision table (unit-tested with injected outcomes):
 /// first Confirmed rung wins and short-circuits; every other outcome
 /// falls through; all rungs exhausted ⇒ Absent.
@@ -1247,10 +1324,19 @@ impl KmbufQueue {
         }) {
             // SAFETY: error-path unmap of our own mapping.
             unsafe { libc::munmap(headers_base as *mut libc::c_void, headers_span) };
+            let memlock = if e.raw_os_error() == Some(libc::ENOMEM) {
+                memlock_refusal_note(
+                    u64::from(ring_entries) * payload_sz as u64,
+                    MemlockPosture::of_process(),
+                )
+                .map_or_else(String::new, |n| format!(" — {n}"))
+            } else {
+                String::new()
+            };
             return Err(io::Error::other(format!(
                 "IORING_REGISTER_KMBUF_RING(op={}, bgid={FUSE_URING_RINGBUF_GROUP}, \
                  buf_size={payload_sz}, entries={ring_entries}) failed: {e} \
-                 — surface probed Present ({}); refusing (no silent downgrade)",
+                 — surface probed Present ({}); refusing (no silent downgrade){memlock}",
                 ops.register, ops.track
             )));
         }
@@ -1921,6 +2007,75 @@ mod tests {
         const {
             assert!(PROBE_ARG_SPAN >= 128);
         }
+    }
+
+    /// **The memlock finding** (PR 14 — a fresh Omarchy install refused
+    /// EVERY unprivileged mount at `IORING_REGISTER_KMBUF_RING(entries=32,
+    /// buf_size=1 MiB)` → `ENOMEM` under the OS default `RLIMIT_MEMLOCK`
+    /// of 8 MiB, and the refusal named neither the limit nor the remedy):
+    /// the exhausted-ENOMEM refusal carries a note naming the queue's pin,
+    /// the limit in force and the three places to raise it — for an
+    /// unprivileged daemon whose pin exceeds the soft limit; a root /
+    /// `CAP_IPC_LOCK` daemon, an unlimited limit or a pin inside the limit
+    /// is a genuine allocation failure and gets no note. Pure over the
+    /// injected posture.
+    #[test]
+    fn test_memlock_refusal_names_the_limit_and_remedy() {
+        let mib = 1024 * 1024u64;
+        let queue = 32 * mib; // 32 entries × 1 MiB
+        let unprivileged_8mib = MemlockPosture {
+            soft_limit_bytes: Some(8 * mib),
+            exempt: false,
+        };
+        let note = memlock_refusal_note(queue, unprivileged_8mib)
+            .expect("32 MiB pinned against an 8 MiB limit is the finding");
+        assert!(note.contains("32 MiB"), "{note}");
+        assert!(note.contains("8 MiB"), "{note}");
+        assert!(note.contains("RLIMIT_MEMLOCK"), "{note}");
+        assert!(note.contains("ulimit -l"), "{note}");
+        assert!(note.contains("limits.d"), "{note}");
+        assert!(note.contains("DefaultLimitMEMLOCK"), "{note}");
+        assert!(note.contains("CAP_IPC_LOCK"), "{note}");
+        // Exempt (root / CAP_IPC_LOCK): the limit does not bind.
+        assert!(memlock_refusal_note(
+            queue,
+            MemlockPosture {
+                soft_limit_bytes: Some(8 * mib),
+                exempt: true,
+            }
+        )
+        .is_none());
+        // Unlimited: not the explanation.
+        assert!(memlock_refusal_note(
+            queue,
+            MemlockPosture {
+                soft_limit_bytes: None,
+                exempt: false,
+            }
+        )
+        .is_none());
+        // A pin inside the limit: a genuine allocation failure.
+        assert!(memlock_refusal_note(
+            queue,
+            MemlockPosture {
+                soft_limit_bytes: Some(64 * mib),
+                exempt: false,
+            }
+        )
+        .is_none());
+        assert!(
+            memlock_refusal_note(
+                queue,
+                MemlockPosture {
+                    soft_limit_bytes: Some(queue),
+                    exempt: false,
+                }
+            )
+            .is_none(),
+            "at the limit exactly the pin fits"
+        );
+        // The process posture reads without panicking on any host.
+        let _ = MemlockPosture::of_process();
     }
 
     /// The register-retry policy over injected outcomes (the 2026-08-10

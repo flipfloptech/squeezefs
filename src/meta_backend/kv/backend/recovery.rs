@@ -810,10 +810,18 @@ impl KvMetaBackend {
                 return Err(KvError::Io(crate::error::SqueezefsError::Io(e)));
             }
         };
-        let mut inner = Self::open_inner(path, OpenPosture::Writer, None).await?;
+        let open_started = std::time::Instant::now();
+        let mut inner = Self::open_inner(path, OpenPosture::Writer, None, false).await?;
         *inner.guard_fd.get_mut().unwrap_or_else(|e| e.into_inner()) = Some(guard_fd);
+        inner.writer_id = uuid::Uuid::new_v4().to_string();
         let be = Arc::new(inner);
         let _ = be.conveyor_self.set(Arc::downgrade(&be));
+        // The writer's bring-up (the join — what makes the planted
+        // record's frame legal on a forest, PR 14).
+        if let Err(e) = be.writer_bring_up(open_started).await {
+            drop(be.guard_fd.lock().unwrap_or_else(|e| e.into_inner()).take());
+            return Err(e);
+        }
         be.setxattr_internal(1, WRITER_CLAIM_XATTR, &claim.encode())
             .await?;
         be.sync_device().await.map_err(KvError::Io)?;
@@ -3098,7 +3106,7 @@ impl KvMetaBackend {
         // it: `None` = no claim ever written.
         let mut manager_claim_age_secs: Option<u64> = None;
         for p in claim_volumes {
-            let probe = Self::open_inner(p, OpenPosture::NonWriter, None).await?;
+            let probe = Self::open_inner(p, OpenPosture::NonWriter, None, false).await?;
             if let Ok(Some(raw)) = probe.getxattr(1, WRITER_CLAIM_XATTR).await {
                 if let Some(c) = WriterClaim::decode(&raw) {
                     if p == vol0_path {
@@ -3119,7 +3127,7 @@ impl KvMetaBackend {
                 }
             }
         }
-        let mut inner = Self::open_inner(path, OpenPosture::Writer, None).await?;
+        let mut inner = Self::open_inner(path, OpenPosture::Writer, None, false).await?;
         *inner.guard_fd.get_mut().unwrap_or_else(|e| e.into_inner()) = Some(guard_fd);
         let be = Arc::new(inner);
         let _ = be.conveyor_self.set(Arc::downgrade(&be));
@@ -3254,7 +3262,7 @@ impl KvMetaBackend {
             be.sync_device().await.map_err(KvError::Io)?;
             be.checkpoint_now().await?;
         } else {
-            let mut v0 = Self::open_inner(vol0_path, OpenPosture::Writer, None).await?;
+            let mut v0 = Self::open_inner(vol0_path, OpenPosture::Writer, None, false).await?;
             *v0.guard_fd.get_mut().unwrap_or_else(|e| e.into_inner()) = vol0_guard;
             let v0 = Arc::new(v0);
             let _ = v0.conveyor_self.set(Arc::downgrade(&v0));

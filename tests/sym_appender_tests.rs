@@ -9,10 +9,9 @@
 //! ring live with the format-time fixed ring; appenders ≥ 1 live in the
 //! appender DIRECTORY, an extent chain the superblock names.
 //!
-//! **Bit 17 stays DARK**: the only stamp is the PR-1 seam
-//! `SQUEEZEFS_TEST_STAMP_SYMMETRIC=1`, and a bit-17-absent volume is
-//! byte-for-byte the shipped format — the negative contract every
-//! positive one here rides beside.
+//! **Bit 17 is the DEFAULT since PR 14**; a `--single-writer` (bit-17-
+//! absent) volume is byte-for-byte the shipped flat format — the negative
+//! contract every positive one here rides beside.
 //!
 //! Contracts pinned (the PR-2 row of the design's PR plan):
 //! - the page codec round-trips at every bound and its decode is TOTAL;
@@ -40,7 +39,9 @@ use squeezefs::meta_backend::kv::appender::{
     APPENDER_PAGE_LEN, APPENDER_PAGE_SLOTS, GRANT_RUNS_MAX, RING_SEGMENTS_MAX, SLOT_ENTRY_LEN,
     SLOT_PAGE_BUDGET, SYM_RING_FLOOR_BYTES,
 };
-use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder, ROOT_INO};
+use squeezefs::meta_backend::kv::builder::{
+    format_v3_stamped_symmetric, BuilderConfig, ImageBuilder, ROOT_INO,
+};
 use squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS;
 use squeezefs::meta_backend::kv::journal::{
     checkpoint_reserve_bytes, detect_appender_violations, entry_len_for, tag_for,
@@ -98,15 +99,16 @@ fn describe() -> (ImageBuilder, HashMap<&'static str, u64>) {
 
 async fn build_image(file: &NamedTempFile, symmetric: bool) -> HashMap<&'static str, u64> {
     file.as_file().set_len(VOL_LEN).unwrap();
-    let (b, inos) = describe();
+    let (mut b, inos) = describe();
     let _g = SEAM.lock().await;
+    // The DEFAULT class since PR 14 (the forest beside the nine mw bits)
+    // or the flat `--single-writer` image — the builder is told, never
+    // the environment.
     if symmetric {
-        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-    } else {
-        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        b.set_multi_writer();
+        b.set_symmetric();
     }
     let built = b.build(file.path(), VOL_LEN).await;
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
     built.expect("build image");
     inos
 }
@@ -526,7 +528,7 @@ async fn format_without_the_seam_leaves_the_directory_and_the_fixed_ring_untouch
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn format_under_the_seam_writes_appender_zeros_page_pair_and_the_first_directory_extent() {
+async fn the_default_format_writes_appender_zeros_page_pair_and_the_first_directory_extent() {
     let file = NamedTempFile::new().unwrap();
     build_image(&file, true).await;
     let sb = superblock_of(&file).await;
@@ -979,7 +981,7 @@ use squeezefs::meta_backend::kv::backend::{
     test_conveyor_hold_release, TEST_CONVEYOR_HOLD_PRE_ROLLBACK, TEST_CONVEYOR_HOLD_STAGE,
 };
 use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
-use squeezefs::meta_backend::kv::builder::{digest_backend, format_v3_stamped, FormatV3Options};
+use squeezefs::meta_backend::kv::builder::{digest_backend, FormatV3Options};
 use squeezefs::meta_backend::kv::checkpoint::{
     checkpoint_landing_ceiling_ms, checkpoint_tick_period_ms, read_newest_ledger,
 };
@@ -1015,9 +1017,7 @@ async fn format_stamped_member(dir: &std::path::Path, name: &str) -> String {
     let p = dir.join(name);
     std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
-    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-    let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    let r = format_v3_stamped_symmetric(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
     r.expect("format stamped member");
     p.display().to_string()
 }
@@ -1553,8 +1553,17 @@ async fn two_appenders_commit_into_two_rings_and_replay_to_the_union_digest() {
     }
 }
 
+/// The declared partition is a WISH-LIST the arm reconciles against tree
+/// 0 (PR 4; every writer's plane since PR 14): a region's leases are the
+/// durable `Leased` records, so a crash with slot 4's records in ring 1's
+/// window and a re-open declaring `1:9000` instead replays them LEGAL —
+/// tree 0 still leases slot 4 to appender 1 — and the region holds slot
+/// 9000 (an unleased slot outside the manager's rotor) beside it; the
+/// `Lease` violation class (`detect_appender_violations`, pinned at the
+/// unit level above) never fires. Before the plane the partition WAS the
+/// lease set and the same re-open refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_changed_lease_set_refuses_the_mount_as_a_lease_violation() {
+async fn a_changed_declared_partition_is_a_wish_list_and_the_crash_window_replays_legal() {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     let uris = vec![format_stamped_member(dir.path(), "meta0").await];
@@ -1578,19 +1587,37 @@ async fn a_changed_lease_set_refuses_the_mount_as_a_lease_violation() {
     drop(va);
     drop(ra);
     let before = META_KV_REPLAY_LEASE_VIOLATIONS.load(Ordering::Relaxed);
-    std::env::set_var(TEST_APPENDER_SLOTS_ENV, "1:9");
-    std::env::set_var("SQUEEZEFS_SYM_ALLOW_NON_PR", "1");
-    let r = open_routed_meta_set(&uris).await;
-    std::env::remove_var(TEST_APPENDER_SLOTS_ENV);
-    std::env::remove_var("SQUEEZEFS_SYM_ALLOW_NON_PR");
-    let err = match r {
-        Ok(_) => panic!("ring 1 holds records for slot 4, which appender 1 no longer leases"),
-        Err(e) => e.to_string(),
-    };
-    assert!(err.contains("does not lease"), "{err}");
-    assert!(META_KV_REPLAY_LEASE_VIOLATIONS.load(Ordering::Relaxed) > before);
+    let again = open_with_partition(&uris, Some("1:9000")).await;
+    let v = &again.volumes[0];
+    assert_eq!(
+        META_KV_REPLAY_LEASE_VIOLATIONS.load(Ordering::Relaxed),
+        before,
+        "tree 0 leases slot 4 to appender 1: its window records are legal"
+    );
     assert_eq!(META_KV_REPLAY_KEY_VIOLATIONS.load(Ordering::Relaxed), 0);
     assert_eq!(META_KV_REPLAY_EXTENT_VIOLATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        v.block_ref_count(tag, 0).await.unwrap(),
+        1,
+        "the window's record folded"
+    );
+    let leases = v
+        .appenders_public()
+        .expect("forest")
+        .region(1)
+        .expect("the declared region")
+        .leases();
+    assert!(
+        leases.contains(&4),
+        "slot 4 stays region 1's (tree 0's word)"
+    );
+    assert!(
+        leases.contains(&9000),
+        "and slot 9000's wish landed: {leases:?}"
+    );
+    for v in &again.volumes {
+        v.shutdown().await.unwrap();
+    }
 }
 
 /// §4.6 pt 2's ring-pressure trigger, per REGION: a committer parked at a
@@ -2027,8 +2054,7 @@ async fn armed_one_leaf_fixture(
     let p = dir.join("meta0");
     std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
-    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-    let r = format_v3_stamped(
+    let r = format_v3_stamped_symmetric(
         &p,
         VOL_LEN,
         &FormatV3Options {
@@ -2039,7 +2065,6 @@ async fn armed_one_leaf_fixture(
         plan.stamps[0].clone(),
     )
     .await;
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
     r.expect("format");
     let uris = vec![p.display().to_string()];
     let path = std::path::PathBuf::from(&uris[0]);

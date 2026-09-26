@@ -39,7 +39,9 @@ use squeezefs::meta_backend::crossvol_tx::{
 };
 use squeezefs::meta_backend::kv::appender::TEST_APPENDER_SLOTS_ENV;
 use squeezefs::meta_backend::kv::backend::{AcquireSlotReply, KvMetaBackend};
-use squeezefs::meta_backend::kv::builder::{format_v3_stamped, FormatV3Options, ROOT_INO};
+use squeezefs::meta_backend::kv::builder::{
+    format_v3_stamped_single_writer, format_v3_stamped_symmetric, FormatV3Options, ROOT_INO,
+};
 use squeezefs::meta_backend::kv::record::ForestSlot;
 use squeezefs::meta_backend::kv::slot_lease::SYMMETRIC_META_ENV;
 use squeezefs::meta_backend::{
@@ -122,7 +124,6 @@ fn set_opts(dir: &std::path::Path) -> FormatV3Options {
 /// rides volume 0.
 async fn format_stamped_set(dir: &std::path::Path, n: usize) -> Vec<String> {
     let plan = plan_meta_slot_set(n).expect("derived plan");
-    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
     let mut uris = Vec::with_capacity(n);
     for i in 0..n {
         let p = dir.join(format!("meta{i}"));
@@ -131,14 +132,11 @@ async fn format_stamped_set(dir: &std::path::Path, n: usize) -> Vec<String> {
             format_config_xattr: (i == 0).then(|| format_config_for(dir)),
             ..set_opts(dir)
         };
-        let r = format_v3_stamped(&p, VOL_LEN, &opts, plan.stamps[i].clone()).await;
-        if r.is_err() {
-            std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
-        }
-        r.expect("format set member");
+        format_v3_stamped_symmetric(&p, VOL_LEN, &opts, plan.stamps[i].clone())
+            .await
+            .expect("format set member");
         uris.push(p.display().to_string());
     }
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
     uris
 }
 
@@ -146,22 +144,25 @@ async fn format_member(dir: &std::path::Path, name: &str, stamped: bool) -> Stri
     let p = dir.join(name);
     std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
-    if stamped {
-        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
+    // The forest EXPLICITLY (the default class since PR 14) or the flat
+    // `--single-writer` class — the builder is told, never the environment.
+    let r = if stamped {
+        format_v3_stamped_symmetric(&p, VOL_LEN, &set_opts(dir), plan.stamps[0].clone()).await
     } else {
-        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
-    }
-    let r = format_v3_stamped(&p, VOL_LEN, &set_opts(dir), plan.stamps[0].clone()).await;
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        format_v3_stamped_single_writer(&p, VOL_LEN, &set_opts(dir), plan.stamps[0].clone()).await
+    };
     r.expect("format member");
     p.display().to_string()
 }
 
 fn apply_knobs(armed: bool, partition: Option<&str>) {
+    // The plane is the default since PR 14: `armed` leaves the knob at its
+    // default (unset), `!armed` sets `=0` EXPLICITLY — the refusal on a
+    // forest volume, inert on a `--single-writer` one.
     if armed {
-        std::env::set_var(SYMMETRIC_META_ENV, "1");
-    } else {
         std::env::remove_var(SYMMETRIC_META_ENV);
+    } else {
+        std::env::set_var(SYMMETRIC_META_ENV, "0");
     }
     std::env::set_var("SQUEEZEFS_SYM_ALLOW_NON_PR", "1");
     match partition {
@@ -1558,9 +1559,11 @@ async fn the_lock_verbs_reject_a_foreign_unlock_a_dead_id_and_any_volume_but_zer
 // The shipped posture, byte-identical.
 // ---------------------------------------------------------------------------
 
-/// `SQUEEZEFS_SYMMETRIC_META=0` (a bit-17 volume) and a bit-17-ABSENT
-/// volume take the S3.5 paths verbatim: intents key on ino 0, no step
+/// A bit-17-ABSENT (`--single-writer`) volume takes the S3.5 paths
+/// verbatim under either knob value: intents key on ino 0, no step
 /// ships, no lock is taken, every Cross-owner gauge stays where it was.
+/// (The `=0` forest is the writable open's refusal since PR 14, pinned
+/// in `sym_default_flip_tests`.)
 /// PR 13e (F-R3): the plan's inode WITNESS on such a mount is the local
 /// record read itself — `read_inode_witness` answers what
 /// `read_inode_value_routed` answers, byte for byte, at every step (the
@@ -1569,12 +1572,12 @@ async fn the_lock_verbs_reject_a_foreign_unlock_a_dead_id_and_any_volume_but_zer
 /// belt's refusal): no dangling name, no witness refusal, both F-R3
 /// gauges 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_unarmed_and_flat_paths_ship_nothing_and_lock_nothing() {
+async fn the_flat_paths_ship_nothing_and_lock_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
-    for (name, stamped) in [("flat", false), ("dark", true)] {
-        let uris = vec![format_member(dir.path(), name, stamped).await];
-        let routed = open_under(&uris, false, None).await;
+    for (name, armed) in [("flat-off", false), ("flat-default", true)] {
+        let uris = vec![format_member(dir.path(), name, false).await];
+        let routed = open_under(&uris, armed, None).await;
         let before = cross_owner_stats();
         let a = routed
             .create(ROOT_INO, "a", libc::S_IFDIR | 0o755, 0, 0)

@@ -3,13 +3,14 @@
 //! gate 1; PR 12 — `feat/sym-mount-posture`).
 //!
 //! The co-writer's five admission rungs and the per-volume owner's seven
-//! become ONE ladder a plain `mount` walks when `SQUEEZEFS_SYMMETRIC_META=1`
-//! names a bit-17 set — no role knob, no authority endpoint, no roster,
-//! no offline assignment:
+//! became ONE ladder a plain `mount` walks on a bit-17 set — the DEFAULT
+//! since PR 14: no role knob, no authority endpoint, no roster, no
+//! offline assignment (the four posture knobs are `Kind::Retired` in the
+//! registry — any value refuses at startup naming the ladder):
 //!
 //! | Rung | What | Where it runs | Refuses naming |
 //! |---|---|---|---|
-//! | 1 **declaration** | the knob, and NONE of the retired posture knobs beside it | [`retired_knob_refusal`] at the top of the mount path, before any volume is opened | the retired knob and its successor (the plane) |
+//! | 1 **declaration** | the plane is the default; `SQUEEZEFS_SYMMETRIC_META=0` on a stamped volume refuses the writable open | the KV door (`open_inner`) | the knob (`-o ro` is the read posture) |
 //! | 2 **bits** | every volume carries 7/9/10/11/13/14/15/16 **and 17** | [`check_bits`] right after the routed open | the volume, the bit, the verb that stamps it |
 //! | 3 **membership** | this mount is a member of its HOME shard — the shard's S6 owner when it holds the manager lease | the mount path's membership arm, at `auto` when the operator declared no bind | `SQUEEZEFS_MEMBERSHIP_BIND` |
 //! | 4 **registrant** | WERO on the metadata namespaces (PR 3's `meta_wero`, taken at the open — since PR 12 for the knob-armed shape too) AND the data namespaces (S7's hold, joined here); the registrant cap is probed on a registrant JOIN (PR 3's `join_wero_as_registrant`, PR 12b's joiner path) — the solo HOLDER's own REGISTER learns it (`pr_registrant_cap`) | [`arm`] | the namespace, the cap, `SQUEEZEFS_SYM_ALLOW_NON_PR` |
@@ -17,15 +18,15 @@
 //! | 6 **`AcquireSlots`** | the native slot + `M` rotor slots (PR 4's arm, at the open) | the open | the manager |
 //! | 7 **the planes** | the custody owner, the publish/meta/manager/token services on ONE listener, the ownership plane, the cadence — what a co-writer used to dial and what a solo mount never stood up | [`arm`] → `multi_writer::arm_authority_planes` | `SQUEEZEFS_MW_BIND=off` |
 //!
-//! `mount_posture` reads `writer` on every RW mount of an armed set; WHICH
-//! leases it holds is what the role gauges say (`manager_lease`,
-//! `alloc_lease`, `slot_leases_held`, `membership_mode`). The shipped
+//! `mount_posture` reads `writer` on every RW mount of a symmetric-forest
+//! set; WHICH leases it holds is what the role gauges say (`manager_lease`,
+//! `alloc_lease`, `slot_leases_held`, `membership_mode`). The retired
 //! roles — authority / set-authority / partial-authority / co-writer — and
-//! their knobs CEASE on an armed mount: they are refused as RETIRED
-//! spellings (the `Kind::Enum { retired }` law PR 16 introduced, applied
-//! conditionally, because the SAME knobs keep their shipped meaning on an
-//! UNARMED mount until the PR-14 flip deletes them — the byte-identical law
-//! for `=0` and every bit-17-absent volume).
+//! their knobs (`SQUEEZEFS_MULTI_WRITER`, `SQUEEZEFS_MW_ROLE`,
+//! `SQUEEZEFS_MW_AUTHORITY`, `SQUEEZEFS_MW_MEMBERS`) are `Kind::Retired`
+//! since PR 14, refused at startup naming their successor; a
+//! `--single-writer` (flat) volume has one writer by format class and
+//! walks no ladder.
 //!
 //! **What this rung delivers, and what it states** (the note's ledger):
 //! the ladder as built is walked in full by the SOLO armed mount — the
@@ -46,90 +47,23 @@ use crate::meta_backend::RoutedMetaBackend;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// The posture knobs that CEASE on an armed mount, each with the successor
-/// the refusal names. `SQUEEZEFS_MW_BIND` is deliberately NOT here: under
-/// the plane every writer serves, and the bind is where (§6.1 retires the
-/// four below; `off` on an armed mount is refused by rung 7 instead).
-pub const RETIRED_ON_ARMED: &[(&str, &str)] = &[
-    (
-        "SQUEEZEFS_MULTI_WRITER",
-        "every RW mount of a symmetric set is a writer by the join ladder \
-         (design-symmetric-metadata §7.3) — the plane arms the device-enforced class itself",
-    ),
-    (
-        "SQUEEZEFS_MW_ROLE",
-        "there are no roles under the symmetric plane: `mount_posture` reads `writer` on \
-         every RW mount and the lease gauges say what it holds (§11)",
-    ),
-    (
-        "SQUEEZEFS_MW_AUTHORITY",
-        "there is no set authority to dial: a foreign object's holder is resolved through \
-         tree 0's lessee and the membership census (§5.1.6)",
-    ),
-    (
-        "SQUEEZEFS_MW_MEMBERS",
-        "no roster: a writer is enrolled by joining (the membership lease is its \
-         admission, §7.3)",
-    ),
-];
-
-/// `Some(refusal)` when the plane is requested AND a retired posture knob
-/// is set beside it — the ladder's rung 1, phrased in the registry's own
-/// retired-spelling form so an operator reads ONE law. `None` on every
-/// unarmed process (the knobs keep their shipped meaning there), so the
-/// refusal fires only where the successor exists.
-pub fn retired_knob_refusal() -> Option<String> {
-    if !crate::meta_backend::kv::slot_lease::symmetric_meta_requested() {
-        return None;
-    }
-    let mut lines = Vec::new();
-    for (key, successor) in RETIRED_ON_ARMED {
-        let Ok(raw) = std::env::var(key) else {
-            continue;
-        };
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        // The BOOL knob at an OFF spelling (`0` / `false` / `no` / `off`)
-        // asks for nothing: the knob law reads it as DISABLED, i.e. absent
-        // — a fleet env that writes the shipped default out declares no
-        // posture (review round 1, Issue 19). A malformed value never
-        // reaches here (the registry gate refused the process first). The
-        // enum / string knobs have no off spelling: `authority` is a role.
-        if *key == "SQUEEZEFS_MULTI_WRITER" && !crate::env_knobs::bool_knob(key, false) {
-            continue;
-        }
-        lines.push(format!(
-            "{key}='{raw}' was RETIRED on a symmetric mount (forward-only — never a silent \
-             alias): {successor}"
-        ));
-    }
-    if lines.is_empty() {
-        return None;
-    }
-    let mut s = String::from(
-        "refusing to mount: SQUEEZEFS_SYMMETRIC_META=1 with retired posture knob(s) — the \
-         symmetric join ladder replaces the multi-writer postures (design-symmetric-metadata \
-         §6.1 / §7.3; PR 12)\n",
-    );
-    for l in &lines {
-        s.push_str("  - ");
-        s.push_str(l);
-        s.push('\n');
-    }
-    s.push_str(
-        "  (unset them — SQUEEZEFS_MULTI_WRITER at an OFF spelling (`0`/`false`/`no`/`off`) is \
-         the absent knob and is admitted; on an UNARMED mount — SQUEEZEFS_SYMMETRIC_META unset \
-         — they keep their shipped meaning until the PR-14 flip)",
-    );
-    Some(s)
+/// Every data volume is a SINGLE-KERNEL substrate
+/// (`reservation::single_kernel_substrate` — a regular file with no device
+/// modelled over it): KD-SYM-13's sandbox arm (PR 14) — no shared LUN, so
+/// no second host's DMA exists for a device to reject and the fence is the
+/// kernel's. `false` for an empty set (nothing decided by absence).
+fn data_paths_are_regular_files(data_paths: &[PathBuf]) -> bool {
+    !data_paths.is_empty()
+        && data_paths
+            .iter()
+            .all(|p| crate::meta_backend::reservation::single_kernel_substrate(p))
 }
 
 /// The capability bits the ladder's rung 2 demands on EVERY volume: the
 /// multi-writer class (7/9/10/11/13/14/15/16 — `multi_writer`'s
-/// `REQUIRED_INCOMPAT`) plus the forest (17). `format --symmetric` stamps
-/// all of them; `enable-symmetric` converts a multi-writer-class set.
+/// `REQUIRED_INCOMPAT`) plus the forest (17). A default `format` stamps
+/// all of them (PR 14); `enable-symmetric` converts a pre-flip
+/// multi-writer-class set.
 pub fn required_bits() -> u64 {
     crate::multi_writer::REQUIRED_INCOMPAT
         | crate::meta_backend::kv::superblock::FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST
@@ -151,10 +85,11 @@ pub fn check_bits(meta: &Arc<RoutedMetaBackend>) -> Result<()> {
         if missing != 0 {
             let bit = missing.trailing_zeros();
             let remedy = if bit == 17 {
-                "`squeezefs volume enable-symmetric <sqmeta-uri>` (offline) or `format --symmetric`"
+                "`squeezefs volume enable-symmetric <sqmeta-uri>` (offline; a default `format` \
+                 stamps it since PR 14)"
             } else {
-                "`squeezefs volume enable-multi-writer <sqmeta-uri>` (offline) or a default \
-                 `format` (multi-writer-capable since the rung-10b flip)"
+                "a default `format` (the symmetric class, multi-writer-capable) — a \
+                 `--single-writer` volume is the flat class by declaration and never arms"
             };
             return Err(SqueezefsError::InvalidOperation(format!(
                 "symmetric join ladder rung 2 (bits) refuses: metadata volume {} does not carry \
@@ -310,6 +245,14 @@ pub async fn arm(
         })?;
         report.data_namespaces_registered = data_paths.len();
         hold
+    } else if data_paths_are_regular_files(data_paths) {
+        log::info!(
+            "symmetric join ladder rung 4 (registrant): {} FILE-backed data volume(s) — one \
+             kernel by construction, no shared LUN, nothing for a device to fence (KD-SYM-13's \
+             regular-file arm, PR 14)",
+            data_paths.len()
+        );
+        None
     } else if allow_non_pr {
         report.detection_grade = true;
         log::warn!(
@@ -505,6 +448,14 @@ pub async fn arm_joined(
         })?;
         report.data_namespaces_registered = data_paths.len();
         Some(joined.hold().clone())
+    } else if data_paths_are_regular_files(data_paths) {
+        log::info!(
+            "symmetric join ladder rung 4 (registrant), joined appender: {} FILE-backed data \
+             volume(s) — one kernel by construction, nothing for a device to fence \
+             (KD-SYM-13's regular-file arm, PR 14)",
+            data_paths.len()
+        );
+        None
     } else if allow_non_pr {
         report.detection_grade = true;
         log::warn!(

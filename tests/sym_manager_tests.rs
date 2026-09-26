@@ -26,7 +26,8 @@ use squeezefs::meta_backend::kv::appender::{
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
 use squeezefs::meta_backend::kv::builder::{
-    digest_backend, format_v3_stamped, FormatV3Options, ROOT_INO,
+    digest_backend, format_v3_stamped_single_writer, format_v3_stamped_symmetric, FormatV3Options,
+    ROOT_INO,
 };
 use squeezefs::meta_backend::kv::slot_state::{
     decode_extent_grant_key, extent_grant_key, ExtentGrantRecord, EXTENT_GRANT_KEY_LEN,
@@ -75,9 +76,7 @@ async fn format_stamped_member_sized(dir: &std::path::Path, name: &str, len: u64
     let p = dir.join(name);
     std::fs::File::create(&p).unwrap().set_len(len).unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
-    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-    let r = format_v3_stamped(&p, len, &set_opts(), plan.stamps[0].clone()).await;
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    let r = format_v3_stamped_symmetric(&p, len, &set_opts(), plan.stamps[0].clone()).await;
     r.expect("format stamped member");
     p.display().to_string()
 }
@@ -86,8 +85,7 @@ async fn format_flat_member(dir: &std::path::Path, name: &str) -> String {
     let p = dir.join(name);
     std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
-    format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone())
+    format_v3_stamped_single_writer(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone())
         .await
         .expect("format flat member");
     p.display().to_string()
@@ -794,16 +792,19 @@ async fn join_appender_over_the_wire_allocates_a_page_ring_and_grant_and_replays
     assert!(!segments.is_empty() && segments.len() <= 8);
     let ring_bytes: u64 = segments.iter().map(|s| s.len).sum();
     assert!(ring_bytes >= squeezefs::meta_backend::kv::appender::SYM_RING_FLOOR_BYTES);
+    // The join's grant is its cost class (PR 13g): the SMO floor plus the
+    // rotor the joiner is about to mint — `M` = 64 under the armed default
+    // (PR 14: every writer's plane).
+    let join_grant = squeezefs::meta_backend::kv::appender::joined_pool_floor(
+        vol.slot_lease_stats().expect("armed").rotor,
+    );
     assert_eq!(
         grant.iter().map(|(_, l)| u64::from(*l)).sum::<u64>(),
-        GRANT_EXTENTS_FLOOR
+        join_grant
     );
     // The heap paid for the ring and the grant.
     let ring_extents = ring_bytes / NODE_SIZE as u64;
-    assert_eq!(
-        vol.free_extents(),
-        free_before - ring_extents - GRANT_EXTENTS_FLOOR
-    );
+    assert_eq!(vol.free_extents(), free_before - ring_extents - join_grant);
     // The directory: page 2 Live under the joiner, its ring and grant named.
     let sb = vol.superblock().clone();
     let entries = read_directory(path, &sb).await.unwrap();
@@ -927,6 +928,10 @@ async fn a_join_replayed_against_a_successor_manager_answers_already() {
         "the successor holds the role"
     );
     assert_eq!(s.self_recoveries, 2, "its own two regions' residue");
+    // The successor's own arm replays too (its regions' covered grant
+    // asks, its re-acquired leases — the armed default's, PR 14): the
+    // join's replay is ONE more.
+    let replays_before = s.manager_verb_replays;
     let again = vol.manager_join_appender(me, 0).await.unwrap();
     assert!(
         again.already,
@@ -935,7 +940,7 @@ async fn a_join_replayed_against_a_successor_manager_answers_already() {
     assert_eq!(again.appender_id, id);
     assert_eq!(again.ring_segments, segments);
     assert_eq!(again.grant, grant, "the grant record survived the failover");
-    assert_eq!(stats(&vol).manager_verb_replays, 1);
+    assert_eq!(stats(&vol).manager_verb_replays, replays_before + 1);
     assert_eq!(stats(&vol).manager_verb_refusals, 0);
     for v in &routed.volumes {
         v.shutdown().await.unwrap();

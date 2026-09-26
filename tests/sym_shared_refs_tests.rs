@@ -429,13 +429,14 @@ async fn mark_shared_is_idempotent_against_the_durable_witness_and_gone_aborts_t
     rig.shutdown().await;
 }
 
-/// The unarmed forest and the flat mount are the shipped clone verbatim:
-/// no mark, no index entry, no gate, every gauge 0.
+/// The unarmed mount — the `--single-writer` class since PR 14 — is the
+/// shipped clone verbatim: no mark, no index entry, no gate, every gauge
+/// 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unarmed_mount_clones_plain_and_every_gauge_stays_zero() {
     let dir = tempdir().unwrap();
     let _g = SEAM.lock().await;
-    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let uris = vec![common::sym::format_flat_member(dir.path(), "meta0").await];
     let data = data_file();
     let rig = mount(&uris, data.path(), &Knobs::unarmed()).await;
     assert!(!rig.router.symmetric_armed());
@@ -449,8 +450,10 @@ async fn an_unarmed_mount_clones_plain_and_every_gauge_stays_zero() {
     let dst = rig.mk_file("dst").await;
     let offset = rig.publish_block(src, 0).await;
     rig.clone(src, dst).await.expect("clone");
-    assert_eq!(flag(&rig, src, offset, 0).await, Some(false));
-    assert_eq!(flag(&rig, dst, offset, 0).await, Some(false));
+    // A `--single-writer` volume carries no durable reference ledger (bit
+    // 9): no record, so no flag to read — the RAM refcount is the truth.
+    assert_eq!(flag(&rig, src, offset, 0).await, None);
+    assert_eq!(flag(&rig, dst, offset, 0).await, None);
     assert!(!rig.alloc.is_shared(offset));
     assert_eq!(rig.alloc.shared_blocks(), 0);
     assert_eq!(rig.alloc.refcount(offset), Some(2));
@@ -458,7 +461,9 @@ async fn an_unarmed_mount_clones_plain_and_every_gauge_stays_zero() {
     assert_eq!(MARK_SHARED_CALLS.load(Ordering::Relaxed), marks);
     assert_eq!(SHARE_BLOCK_CALLS.load(Ordering::Relaxed), shares);
     assert_eq!(RELEASE_SHARED_CALLS.load(Ordering::Relaxed), releases);
-    assert!(rig.drift().await.is_empty());
+    // The C8 oracle judges a volume with the durable ledger ENGAGED (bit
+    // 9 — fsck's own gate); the `--single-writer` class carries none.
+    assert!(!rig.vol().block_refs_engaged());
     assert_eq!(rig.router.pack_scope_of(src), 0, "PK2's one scope");
     rig.shutdown().await;
 }
@@ -643,10 +648,9 @@ async fn the_w1_predicate_confirms_sole_ownership_in_the_inos_slot_tree_on_an_ar
         rig.shutdown().await;
     }
     {
-        // The unarmed half's law is the POSTURE's, on a never-armed
-        // volume: a set the plane has stamped takes no writer without the
-        // plane (PR 5 review round 3, Issue 25).
-        let uris = vec![format_stamped_member(dir.path(), "meta-unarmed").await];
+        // The unarmed half's law is the POSTURE's: the `--single-writer`
+        // class (the one unarmed writable posture since PR 14).
+        let uris = vec![common::sym::format_flat_member(dir.path(), "meta-flat").await];
         let rig = mount(&uris, data.path(), &Knobs::unarmed()).await;
         let f = rig.mk_file("u").await;
         let offset = rig.publish_block(f, 0).await;

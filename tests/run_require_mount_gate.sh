@@ -81,6 +81,48 @@ echo "   enable_uring:     $(cat /sys/module/fuse/parameters/enable_uring 2>/dev
 echo "   fusermount3:      $(command -v fusermount3 || echo MISSING)"
 echo "   fusectl:          $([[ -d /sys/fs/fuse/connections ]] && echo mounted || echo MISSING)"
 
+# The memlock PREFLIGHT (PR 14 — the fresh-install finding): a mounted
+# daemon pins one kmbuf ring per FUSE queue (one queue per possible CPU) of
+# `q_depth × buf_size` — 32 × 1 MiB at the shipped geometry — and an
+# unprivileged daemon's pins are bounded by RLIMIT_MEMLOCK (8 MiB on most
+# distributions). Every suite here would run into that wall and fail at
+# its first mount; refuse to START instead, naming the derived need and
+# the fix. Root (and CAP_IPC_LOCK) is exempt.
+memlock_preflight() {
+  if [[ "$(id -u)" == "0" ]]; then
+    echo "   memlock:          root (RLIMIT_MEMLOCK does not bind)"
+    return 0
+  fi
+  local soft; soft="$(ulimit -l)"
+  if [[ "$soft" == "unlimited" ]]; then
+    echo "   memlock:          unlimited"
+    return 0
+  fi
+  # ulimit -l reports KiB. The need is DERIVED: queues (possible CPUs) ×
+  # entries (the shipped q_depth 32) × buf_size (1 MiB — the transport's
+  # max_write payload) — the same arithmetic the daemon pins.
+  local cpus depth=32 buf_mib=1 need_kib
+  cpus="$(getconf _NPROCESSORS_CONF 2>/dev/null || nproc)"
+  need_kib=$(( cpus * depth * buf_mib * 1024 ))
+  if (( soft < need_kib )); then
+    cat >&2 <<EOF_MEMLOCK
+!! require-mount gate refuses to start: RLIMIT_MEMLOCK soft limit is ${soft} KiB and a
+   mounted daemon on this box pins ${need_kib} KiB of kmbuf rings (${cpus} queues × ${depth}
+   entries × ${buf_mib} MiB) — IORING_REGISTER_KMBUF_RING would refuse ENOMEM at the first
+   queue and every live-mount suite would fail at its first mount (the daemon refuses loud,
+   naming this limit). Raise it in the shell that runs the gate:
+     sudo -n prlimit --pid \$\$ --memlock=unlimited:unlimited      # this shell, now
+     ulimit -l unlimited                                           # if the hard limit allows
+   or persistently (NEW sessions): '<user> - memlock unlimited' in /etc/security/limits.d/,
+   DefaultLimitMEMLOCK=infinity in /etc/systemd/{system,user}.conf.d/ — docs/operations.md
+   §Prerequisites.
+EOF_MEMLOCK
+    return 1
+  fi
+  echo "   memlock:          ${soft} KiB (need ${need_kib} KiB for ${cpus} queues × ${depth} × ${buf_mib} MiB)"
+}
+memlock_preflight || exit 2
+
 rc=0
 for t in "${TESTS[@]}"; do
   echo "-- cargo test --test $t"

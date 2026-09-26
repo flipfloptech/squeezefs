@@ -47,7 +47,9 @@ use squeezefs::meta_backend::kv::backend::{
     test_conveyor_hold_release, KvMetaBackend, TEST_CONVEYOR_HOLD_PRE_FANOUT,
     TEST_CONVEYOR_HOLD_STAGE,
 };
-use squeezefs::meta_backend::kv::builder::{format_v3_stamped, FormatV3Options, ROOT_INO};
+use squeezefs::meta_backend::kv::builder::{
+    format_v3_stamped_single_writer, format_v3_stamped_symmetric, FormatV3Options, ROOT_INO,
+};
 use squeezefs::meta_backend::kv::checkpoint::TEST_CHECKPOINT_HALT_AFTER_LEDGER;
 use squeezefs::meta_backend::kv::slot_lease::SYMMETRIC_META_ENV;
 use squeezefs::meta_backend::kv::superblock::ExtentRef;
@@ -97,9 +99,7 @@ async fn format_stamped_member(dir: &std::path::Path, name: &str) -> String {
     let p = dir.join(name);
     std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
-    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-    let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    let r = format_v3_stamped_symmetric(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
     r.expect("format stamped member");
     p.display().to_string()
 }
@@ -108,8 +108,7 @@ async fn format_flat_member(dir: &std::path::Path, name: &str) -> String {
     let p = dir.join(name);
     std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
-    format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone())
+    format_v3_stamped_single_writer(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone())
         .await
         .expect("format flat member");
     p.display().to_string()
@@ -125,9 +124,7 @@ async fn format_stamped_set(dir: &std::path::Path, n: usize) -> Vec<String> {
     for (i, stamp) in plan.stamps.iter().enumerate() {
         let p = dir.join(format!("meta{i}"));
         std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
-        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-        let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), stamp.clone()).await;
-        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        let r = format_v3_stamped_symmetric(&p, VOL_LEN, &set_opts(), stamp.clone()).await;
         r.expect("format stamped member");
         uris.push(p.display().to_string());
     }
@@ -172,9 +169,15 @@ async fn open_armed(uris: &[String]) -> Arc<RoutedMetaBackend> {
     r.expect("open armed set")
 }
 
-async fn open_unarmed(uris: &[String]) -> Arc<RoutedMetaBackend> {
+/// The DEFAULT open (PR 14: the knob unset IS the armed plane): the slot
+/// leases arm, the ALLOCATION plane does not — that is the mount path's
+/// separate `arm_symmetric_allocation`, which these contracts call
+/// themselves — so the "pre-arm era" of the data plane is this open.
+async fn open_default(uris: &[String]) -> Arc<RoutedMetaBackend> {
     std::env::remove_var(SYMMETRIC_META_ENV);
-    open_routed_meta_set(uris).await.expect("open unarmed set")
+    open_routed_meta_set(uris)
+        .await
+        .expect("open the set under the default")
 }
 
 async fn shutdown(routed: &RoutedMetaBackend) {
@@ -1504,11 +1507,13 @@ async fn arming_a_populated_forest_set_seeds_from_the_refs_union_and_refuses_an_
     let _g = SEAM.lock().await;
     reset_process_state();
     let uris = format_stamped_set(dir.path(), 2).await;
-    // The pre-arm era: an UNARMED routed set, blocks minted by the shipped
-    // loop and published as striped layouts with their durable references.
+    // The pre-arm era of the DATA plane: the default routed set (its slot
+    // leases armed, its allocation plane not yet), blocks minted by the
+    // shipped loop and published as striped layouts with their durable
+    // references.
     let mut referenced = std::collections::BTreeSet::new();
     {
-        let routed = open_unarmed(&uris).await;
+        let routed = open_default(&uris).await;
         let a0 = data_allocator(DATA_ID).await;
         for i in 0..6 {
             let ino = routed
@@ -2845,21 +2850,26 @@ async fn the_wire_serves_pr8s_verbs_and_record_death() {
 // The negative contract — `=0` and a flat volume are the shipped posture
 // ---------------------------------------------------------------------------
 
-/// `SQUEEZEFS_SYMMETRIC_META=0` (the dark forest) and a bit-17-absent
-/// volume: no holding, no park posture, no coordinator home, no shard,
-/// every gauge 0/absent — the S9 lane path untouched.
+/// A bit-17-absent (`--single-writer`) volume under either knob value: no
+/// holding, no park posture, no coordinator home, no shard, every gauge
+/// 0/absent — the shipped allocation path untouched. (The `=0` forest —
+/// PR 8's "dark forest" — is the writable open's refusal since PR 14,
+/// pinned in `sym_default_flip_tests`; a forest before its allocation arm
+/// is `arming_a_populated_forest_set_seeds_from_the_refs_union…`'s
+/// pre-arm era.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn symmetric_meta_off_is_the_shipped_allocation_plane() {
+async fn an_unarmed_allocation_plane_is_the_shipped_one() {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
-    for (name, stamped) in [("forest0", true), ("flat0", false)] {
-        let uris = vec![if stamped {
-            format_stamped_member(dir.path(), name).await
-        } else {
-            format_flat_member(dir.path(), name).await
-        }];
-        let routed = open_unarmed(&uris).await;
+    for (name, knob) in [("flat0", None), ("flat1", Some("0"))] {
+        let uris = vec![format_flat_member(dir.path(), name).await];
+        match knob {
+            Some(v) => std::env::set_var(SYMMETRIC_META_ENV, v),
+            None => std::env::remove_var(SYMMETRIC_META_ENV),
+        }
+        let routed = open_routed_meta_set(&uris).await.expect("open");
+        std::env::remove_var(SYMMETRIC_META_ENV);
         let vol = Arc::clone(&routed.volumes[0]);
         assert!(holdings().is_empty());
         assert!(!park_gate::symmetric_appender_armed());

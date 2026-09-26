@@ -11,12 +11,11 @@
 //! non-native slot tree; the fixed ledger names tree 0 and the native
 //! slot tree.
 //!
-//! **Bit 17 lands DARK**: nothing stamps it but the test seam
-//! `SQUEEZEFS_TEST_STAMP_SYMMETRIC=1` (the `SQUEEZEFS_TEST_STAMP_BLOCK_REFS`
-//! precedent) — `format --symmetric` is PR 11's and the default flip PR
-//! 14's. The most important contract here is therefore the negative one:
-//! a volume WITHOUT the bit is byte-for-byte the shipped format and takes
-//! the shipped code path.
+//! **Bit 17 is the DEFAULT since PR 14** (every `format` but the
+//! `--single-writer` opt-out stamps it). The negative contract survives on
+//! the flat class: a `--single-writer` volume — the one flat writable
+//! class after the flip — is byte-for-byte the shipped flat format and
+//! takes the shipped code path.
 //!
 //! Contracts pinned (the PR-1 row of the design's PR plan):
 //! - the kind bytes ARE the tree ids; `TREE_CONTROL = 8`,
@@ -41,11 +40,13 @@
 //!   tree pins the checkpoint floor until the ledger's tree-0 root names
 //!   the new root (the dying-floor law, one tree at a time).
 
+use squeezefs::meta_backend::kv::appender::SLOT_PAGE_BUDGET;
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::block_map::block_map_key;
 use squeezefs::meta_backend::kv::block_refs::{block_ref_key, BlockRef, BlockRefOp};
 use squeezefs::meta_backend::kv::builder::{
-    digest_backend, format_v3_stamped, BuilderConfig, FormatV3Options, ImageBuilder, ROOT_INO,
+    digest_backend, format_v3_stamped_symmetric, BuilderConfig, FormatV3Options, ImageBuilder,
+    ROOT_INO,
 };
 use squeezefs::meta_backend::kv::checkpoint::read_newest_ledger;
 use squeezefs::meta_backend::kv::journal::{
@@ -128,15 +129,16 @@ fn describe() -> (ImageBuilder, HashMap<&'static str, u64>) {
 /// Build the population image at `file`, stamped iff `symmetric`.
 async fn build_image(file: &NamedTempFile, symmetric: bool) -> HashMap<&'static str, u64> {
     file.as_file().set_len(VOL_LEN).unwrap();
-    let (b, inos) = describe();
+    let (mut b, inos) = describe();
     let _g = SEAM.lock().await;
+    // The DEFAULT class since PR 14 (the forest beside the nine mw bits)
+    // or the flat `--single-writer` image — the builder is told, never
+    // the environment.
     if symmetric {
-        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-    } else {
-        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        b.set_multi_writer();
+        b.set_symmetric();
     }
     let built = b.build(file.path(), VOL_LEN).await;
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
     built.expect("build image");
     inos
 }
@@ -545,17 +547,6 @@ fn bit_17_is_the_symmetric_forest_and_is_known_to_this_binary() {
     );
 }
 
-#[test]
-fn the_test_seam_is_a_registered_bool_knob() {
-    // Its siblings (`TEST_STAMP_BLOCK_REFS` / `TEST_STAMP_WRITER_SCOPE`)
-    // are `Kind::Bool`, so a malformed value refuses the process at
-    // startup instead of silently keeping the default.
-    let knob = squeezefs::env_knobs::lookup("SQUEEZEFS_TEST_STAMP_SYMMETRIC")
-        .expect("ENG-10: every knob a site reads is registered");
-    assert_eq!(knob.kind, squeezefs::env_knobs::Kind::Bool);
-    assert_eq!(knob.default, "0");
-}
-
 // ---------------------------------------------------------------------------
 // Tree 0 — `slot_state` records (kv/slot_state.rs).
 // ---------------------------------------------------------------------------
@@ -704,7 +695,7 @@ async fn format_without_the_seam_stamps_nothing_and_names_the_shipped_roots() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn format_under_the_seam_stamps_bit_17_and_names_tree_zero_and_the_native_slot_root() {
+async fn the_default_format_stamps_bit_17_and_names_tree_zero_and_the_native_slot_root() {
     let file = NamedTempFile::new().unwrap();
     build_image(&file, true).await;
     let sb = superblock_of(&file).await;
@@ -854,8 +845,12 @@ async fn forest_mutations_commit_checkpoint_and_replay_to_the_same_digest() {
         .unwrap();
     let dir = churn(&b, 64).await;
     let live_digest = digest_backend(&b).await.unwrap();
-    // A CLEAN shutdown: checkpoint → tail == head; the next mount replays
-    // nothing and must fold to the same digest from the leaf images alone.
+    // A CLEAN shutdown: checkpoint → every user record under a durable
+    // root; the next mount folds to the same digest from the leaf images
+    // alone. Under the ARMED plane (PR 14's default) the leave writes ONE
+    // control entry after its coverage verdict — the region's `Unleased`
+    // batch releasing every held slot to tree 0 (§5.1.3) — barriered,
+    // root-free, replayed idempotently: the window holds exactly it.
     b.shutdown().await.expect("shutdown");
     drop(b);
     let again = open_volume_for_mount(file.path().to_str().unwrap())
@@ -863,9 +858,10 @@ async fn forest_mutations_commit_checkpoint_and_replay_to_the_same_digest() {
         .unwrap();
     assert_eq!(
         again.replay_stats().entries,
-        0,
-        "clean shutdown ⇒ empty replay window"
+        1,
+        "clean shutdown ⇒ the window holds the leave's one release entry"
     );
+    assert_eq!(again.replay_stats().dropped_torn, 0);
     assert_eq!(digest_backend(&again).await.unwrap(), live_digest);
     // The population is still served through the forest after remount.
     assert_eq!(again.lookup(ROOT_INO, "storm").await.unwrap().ino, dir);
@@ -944,9 +940,7 @@ async fn stamped_forest_set(dir: &std::path::Path) -> Vec<String> {
     let plan = plan_meta_slot_set(1).expect("derived plan");
     {
         let _g = SEAM.lock().await;
-        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-        let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
-        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        let r = format_v3_stamped_symmetric(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
         r.expect("format stamped forest member");
     }
     vec![p.display().to_string()]
@@ -992,23 +986,26 @@ async fn a_stamped_set_mints_into_guest_slot_trees_whose_roots_ride_tree_zero() 
     );
     let live = digest_backend(vol).await.unwrap();
 
-    // Checkpoint: every guest slot tree's root is published into tree 0
-    // (one `slot_state` record per minted slot), and the ledger names
-    // tree 0 + the native root only.
+    // Checkpoint: every guest slot tree's root is published (a leased
+    // slot's on its lessee's page, KD-SYM-3 — PR 14's default is the
+    // ARMED plane: the solo writer is the manager leasing its native slot
+    // plus the `MINT_SPREAD` rotor slots, §5.1.2's rotor EXCLUDING the
+    // native), and the ledger names tree 0 + the native root only.
     vol.checkpoint_now().await.expect("checkpoint");
     let published = vol.forest_census().expect("forest");
     // MINT_SPREAD rotor slots + the native slot: 2 × MINT_SPREAD files
     // spread over every rotor slot (the mint-spread law), one tree each,
     // one extent each — the per-slot extent floor §1.6 names.
     assert_eq!(
-        published.slot_trees as usize, MINT_SPREAD,
-        "every rotor slot minted its tree"
+        published.slot_trees as usize,
+        MINT_SPREAD + 1,
+        "every rotor slot minted its tree beside the native one"
     );
-    assert_eq!(published.minted as usize, MINT_SPREAD - 1);
+    assert_eq!(published.minted as usize, MINT_SPREAD);
     assert_eq!(
         published.control_records,
         published.slot_trees - 1,
-        "tree 0 names every guest slot tree's root (the native root rides the ledger)"
+        "every guest slot tree's root is published (the native root rides the ledger)"
     );
     let sb = vol.superblock().clone();
     let ledger = read_newest_ledger(std::path::Path::new(&uris[0]), sb.root_ledger.start)
@@ -1164,9 +1161,7 @@ async fn stamped_forest_set_width(dir: &std::path::Path, width: u32) -> Vec<Stri
     let plan = plan_meta_slot_set_with_width(1, width).expect("derived plan");
     {
         let _g = SEAM.lock().await;
-        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-        let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
-        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        let r = format_v3_stamped_symmetric(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
         r.expect("format stamped forest member");
     }
     vec![p.display().to_string()]
@@ -1343,12 +1338,19 @@ async fn a_rightmost_leaf_smo_in_the_window_replays_into_its_own_tree_not_a_phan
 /// Issue 4: when the tree-0 publication is DEFERRED (checkpoint reserve
 /// exhausted), the cycle's ledger record must not let the tail pass the
 /// unpublished roots — a fresh guest tree's records stay in the replay
-/// window until tree 0 names the root. Pinned through the publication
-/// deferral seam: one deferred cycle, crash, every acked record served.
+/// window until tree 0 names the root. Under PR 14's armed default a
+/// LEASED slot's root is PAGE-homed (KD-SYM-3) and the page names
+/// `SLOT_PAGE_BUDGET` slots, so tree 0 is the home of exactly the roots
+/// past the budget — PR 13b's page-budget overflow law: the manager holds
+/// its native slot + the `MINT_SPREAD` rotor, and first-touching enough
+/// further slots puts the highest of them off the page. Pinned through
+/// the publication deferral seam on THAT shape: one deferred cycle, the
+/// overflow roots unpublished, crash, every acked record served; the
+/// next undeferred cycle publishes them into tree 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_deferred_root_publication_keeps_the_unpublished_roots_in_the_window() {
     let dir = tempfile::tempdir().unwrap();
-    let uris = stamped_forest_set_width(dir.path(), 8).await;
+    let uris = stamped_forest_set(dir.path()).await;
     let routed = open_routed_meta_set(&uris).await.expect("open");
     let vol = &routed.volumes[0];
     let d = routed
@@ -1366,15 +1368,44 @@ async fn a_deferred_root_publication_keeps_the_unpublished_roots_in_the_window()
         routed.setxattr(f, "user.k", b"v").await.unwrap();
         children.push(f);
     }
-    assert!(
-        vol.forest_census().unwrap().slot_trees > 1,
-        "guest trees were minted"
+    let creates = vol.forest_census().unwrap();
+    assert!(creates.slot_trees > 1, "guest trees were minted");
+    // The first touches past the page: a leased slot with NO tree has
+    // nothing to name and is the first the page drops (with the native
+    // slot, whose root is the ledger's), so the budget binds on the slots
+    // WITH trees — `extra` first touches, each with one block-reference
+    // record in its own tree, take the region's tree-bearing slots to
+    // `SLOT_PAGE_BUDGET + overflow`; the `overflow` highest page slots are
+    // off the page, their only home tree 0.
+    let overflow = 8usize;
+    let guest_trees_now = creates.slot_trees as usize - 1;
+    let extra = SLOT_PAGE_BUDGET - guest_trees_now + overflow;
+    let tag = squeezefs::meta_backend::kv::block_refs::volume_tag("vol-0011223344556677");
+    let mut refs = Vec::new();
+    for m in 0..extra {
+        let owner = guest_local_ino(9_000 + m as u16, 1);
+        let reference = BlockRef {
+            vol_tag: tag,
+            block_idx: 100 + m as u64,
+            owner_ino: owner,
+            block_index: 0,
+        };
+        vol.commit_block_refs(owner, &[BlockRefOp::taken(reference)])
+            .await
+            .expect("first touch");
+        refs.push(reference);
+    }
+    let touched = vol.forest_census().unwrap();
+    assert_eq!(
+        touched.slot_trees,
+        creates.slot_trees + extra as u64,
+        "one tree per first-touched slot"
     );
     let live = digest_backend(vol).await.unwrap();
-    // The seam: EVERY publication attempt answers JournalReserveExhausted
-    // until cleared (the background tick must not publish behind the
-    // test's back before the crash). The guard clears it on every exit
-    // path — the seam is process-global.
+    // The seam: EVERY tree-0 publication attempt answers
+    // JournalReserveExhausted until cleared (the background tick must not
+    // publish behind the test's back before the crash). The guard clears
+    // it on every exit path — the seam is process-global.
     struct DeferSeam;
     impl Drop for DeferSeam {
         fn drop(&mut self) {
@@ -1388,10 +1419,15 @@ async fn a_deferred_root_publication_keeps_the_unpublished_roots_in_the_window()
     vol.checkpoint_now()
         .await
         .expect("a deferred publication is not an error");
+    let deferred = vol.forest_census().unwrap();
     assert_eq!(
-        vol.forest_census().unwrap().control_records,
-        0,
-        "nothing was published this cycle"
+        deferred.control_records as usize, SLOT_PAGE_BUDGET,
+        "the page published exactly its budget of guest roots; nothing reached tree 0 this cycle"
+    );
+    assert_eq!(
+        (deferred.slot_trees - 1 - deferred.control_records) as usize,
+        overflow,
+        "exactly the off-page roots stay unpublished"
     );
     // Crash-equivalent: barriered, dropped without another checkpoint.
     vol.sync_device().await.unwrap();
@@ -1418,6 +1454,21 @@ async fn a_deferred_root_publication_keeps_the_unpublished_roots_in_the_window()
             Some(b"v".to_vec())
         );
     }
+    for r in &refs {
+        assert_eq!(
+            vol.block_ref_count(tag, r.block_idx).await.unwrap(),
+            1,
+            "the window's reference in an off-page slot tree folded back"
+        );
+    }
+    // The next undeferred cycle publishes the overflow roots into tree 0.
+    vol.checkpoint_now().await.unwrap();
+    let published = vol.forest_census().unwrap();
+    assert_eq!(
+        published.control_records,
+        published.slot_trees - 1,
+        "every guest root has a durable home again"
+    );
     for v in &again.volumes {
         v.shutdown().await.unwrap();
     }
@@ -1904,15 +1955,27 @@ async fn heap_full_crash_with_unpublished_mints(
         assert!(i < 100_000, "a 24 MiB heap absorbed 100k payloads");
     }
     assert!(vol.heap_full(), "the refused create latched the posture");
+    // The refusal fires with the refused create's own need still free:
+    // park that slack too, so the checkpoint lands the bitmap at EXACTLY
+    // the reserve (the durable image the crash below is judged against).
+    let mut held = held;
+    while alloc.free_extents() > reserve {
+        held.push(alloc.claim_internal().expect("park the slack"));
+    }
     vol.checkpoint_now().await.unwrap();
     let published = vol.forest_census().unwrap().control_records;
 
-    // From here every publication is deferred (the seam). The parked
-    // extents come back, `mints` more slot trees are minted by journaled
-    // commits from that room (the runtime mint is USER growth), then the
-    // room is taken back down to the reserve and landed.
-    squeezefs::meta_backend::kv::backend::TEST_FOREST_PUBLISH_DEFER
-        .store(u32::MAX, Ordering::SeqCst);
+    // From here NO cycle runs (the cadence is parked): under PR 14's
+    // armed default a first-touched slot is LEASED at the door and its
+    // root's home is the manager's PAGE, which every checkpoint writes —
+    // so the shape "a mint the crash finds unpublished" is the mint
+    // BETWEEN two checkpoints, no deferral seam needed. The parked extents
+    // come back (a RAM release — the durable bitmap, landed by the
+    // checkpoint above, keeps them claimed), `mints` more slot trees are
+    // minted by journaled commits from that room (the runtime mint is
+    // USER growth; the alloc deltas ride the window), then the RAM heap is
+    // taken back down to the reserve — the durable image already sits
+    // there.
     for ext in held {
         alloc.release_unpublished(ext);
     }
@@ -1938,7 +2001,6 @@ async fn heap_full_crash_with_unpublished_mints(
     while alloc.free_extents() > reserve {
         alloc.claim_internal().expect("drain to the reserve");
     }
-    vol.checkpoint_now().await.unwrap();
     assert_eq!(
         vol.forest_census().unwrap().control_records,
         published,
@@ -1954,7 +2016,6 @@ async fn heap_full_crash_with_unpublished_mints(
     // its flock on the original).
     let crash = NamedTempFile::new().unwrap();
     std::fs::copy(&uris[0], crash.path()).unwrap();
-    squeezefs::meta_backend::kv::backend::TEST_FOREST_PUBLISH_DEFER.store(0, Ordering::SeqCst);
     HeapFullCrash {
         crash,
         tag,
@@ -1965,8 +2026,9 @@ async fn heap_full_crash_with_unpublished_mints(
 }
 
 /// Review round 3, Issue 19: a forest volume in the `heap_full` posture
-/// that crashes with an UNPUBLISHED slot in its window (the publication
-/// deferred, the mint's extent durable in the bitmap) REMOUNTS. The replay
+/// that crashes with an UNPUBLISHED slot in its window (minted after the
+/// last checkpoint — its root on no page and in no tree-0 record — the
+/// mint's extent durable in the bitmap) REMOUNTS. The replay
 /// re-mints the slot tree — a RECOVERY act — from the compaction reserve
 /// (`claim_internal`, the flat bit-9/16 mount-time mints' class), never
 /// the user class the runtime mint uses (refused at the growth floor —
@@ -1977,8 +2039,6 @@ async fn a_heap_full_forest_with_an_unpublished_mint_in_the_window_remounts() {
     impl Drop for Cleanup {
         fn drop(&mut self) {
             std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
-            squeezefs::meta_backend::kv::backend::TEST_FOREST_PUBLISH_DEFER
-                .store(0, Ordering::SeqCst);
         }
     }
     std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
@@ -2007,8 +2067,8 @@ async fn a_heap_full_forest_with_an_unpublished_mint_in_the_window_remounts() {
 /// Review round 3, Issue 24: the writer's replay re-mints EVERY slot tree
 /// the window holds records for and tree 0 does not name — one
 /// recovery-class extent each, the originals orphaned in the bitmap until
-/// the hygiene sweep — so a crash behind a deferred publication with MORE
-/// unpublished mints than the compaction reserve holds (`reserve + 1`
+/// the hygiene sweep — so a crash with MORE unpublished mints in its
+/// window than the compaction reserve holds (`reserve + 1`
 /// here; a first-touch burst is bounded by `MINT_SPREAD` rotor slots plus
 /// the explicitly targeted ones, against a reserve of `max(8, 2 %)` of the
 /// heap) cannot mount from the reserve. The refusal is the SPACE class
@@ -2023,8 +2083,6 @@ async fn a_heap_full_forest_with_more_unpublished_mints_than_the_reserve_refuses
     impl Drop for Cleanup {
         fn drop(&mut self) {
             std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
-            squeezefs::meta_backend::kv::backend::TEST_FOREST_PUBLISH_DEFER
-                .store(0, Ordering::SeqCst);
         }
     }
     std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");

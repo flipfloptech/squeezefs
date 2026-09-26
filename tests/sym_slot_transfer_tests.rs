@@ -30,7 +30,8 @@ use squeezefs::meta_backend::kv::backend::{
 };
 use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
 use squeezefs::meta_backend::kv::builder::{
-    digest_backend, format_v3_stamped, FormatV3Options, ROOT_INO,
+    digest_backend, format_v3_stamped_single_writer, format_v3_stamped_symmetric, FormatV3Options,
+    ROOT_INO,
 };
 use squeezefs::meta_backend::kv::record::{
     forest_slot_of_ino, guest_forest_slot, ForestSlot, NATIVE_FOREST_SLOT,
@@ -92,9 +93,7 @@ async fn format_stamped_member(dir: &std::path::Path, name: &str) -> String {
     let p = dir.join(name);
     std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
-    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-    let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    let r = format_v3_stamped_symmetric(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
     r.expect("format stamped member");
     p.display().to_string()
 }
@@ -103,8 +102,7 @@ async fn format_flat_member(dir: &std::path::Path, name: &str) -> String {
     let p = dir.join(name);
     std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
-    format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone())
+    format_v3_stamped_single_writer(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone())
         .await
         .expect("format flat member");
     p.display().to_string()
@@ -152,10 +150,13 @@ impl Knobs {
         self
     }
     fn apply(&self) {
+        // The plane is the default since PR 14: `armed` leaves the knob at
+        // its default (unset), `unarmed` sets `=0` EXPLICITLY — the refusal
+        // on a forest volume, inert on a `--single-writer` one.
         if self.armed {
-            std::env::set_var(SYMMETRIC_META_ENV, "1");
-        } else {
             std::env::remove_var(SYMMETRIC_META_ENV);
+        } else {
+            std::env::set_var(SYMMETRIC_META_ENV, "0");
         }
         std::env::set_var("SQUEEZEFS_SYM_ALLOW_NON_PR", "1");
         match self.partition {
@@ -343,84 +344,64 @@ async fn a_solo_armed_mount_leases_its_native_slot_and_sixty_four_rotor_slots() 
         |(_, st)| matches!(st, SlotState::Unleased { last_written, .. } if *last_written > 0)
     ));
     drop(probe);
-    // And the `=0` WRITER is refused loud, naming the knob.
+    // And the `=0` WRITER is refused loud, naming the knob (PR 14: the
+    // door's law on every forest volume).
     Knobs::unarmed().apply();
     let refused = open_routed_meta_set(&uris).await;
     Knobs::clear();
     let Err(e) = refused else {
-        panic!("a =0 writer of a once-armed volume refuses");
+        panic!("a =0 writer of a forest volume refuses");
     };
-    assert!(e.to_string().contains("SQUEEZEFS_SYMMETRIC_META=1"), "{e}");
+    assert!(e.to_string().contains("SQUEEZEFS_SYMMETRIC_META=0"), "{e}");
 }
 
-/// `SQUEEZEFS_SYMMETRIC_META=0` is the PR 1–3 forest exactly: no plane,
-/// `dlm_mode` = `solo`, tree 0 holds only the checkpoint's `Unleased`
-/// roots at `g = 0`, page 0's entries carry `g = 0`, and the Slot-lease
-/// family is absent.
+/// The shipped FLAT posture since PR 14 is the `--single-writer` class:
+/// no plane, `dlm_mode` = `solo`, no appender region, no tree 0, the
+/// Slot-lease family absent, the lease gate inert, the ring stamping its
+/// positions — whatever `SQUEEZEFS_SYMMETRIC_META` says (the knob is read
+/// at a FOREST's door alone). The PR 1–3 "dark forest" (`=0` on a stamped
+/// volume) is RETIRED: that open is the door's refusal, pinned in
+/// `a_solo_armed_mount_leases_its_native_slot_and_sixty_four_rotor_slots`
+/// and `sym_default_flip_tests`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn symmetric_meta_off_is_the_shipped_dark_forest() {
-    let dir = tempfile::tempdir().unwrap();
-    let _g = SEAM.lock().await;
-    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
-    let routed = open_under(&uris, &Knobs::unarmed()).await;
-    let vol = Arc::clone(&routed.volumes[0]);
-    let refusals_before = META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed);
-    assert!(!vol.slot_lease_armed());
-    assert!(vol.slot_lease_stats().is_none());
-    assert_eq!(squeezefs::dlm_slot::dlm_mode(), "solo");
-    // A create mints through the shared rotor and publishes Unleased roots.
-    for i in 0..8 {
-        routed
-            .create(ROOT_INO, &format!("f{i}"), libc::S_IFREG | 0o644, 0, 0)
-            .await
-            .unwrap();
-    }
-    vol.checkpoint_now().await.unwrap();
-    let states = tree0_states(&vol).await;
-    assert!(!states.is_empty());
-    assert!(
-        states
-            .iter()
-            .all(|(_, st)| matches!(st, SlotState::Unleased { g: 0, .. })),
-        "{states:?}"
-    );
-    let entries = read_directory(std::path::Path::new(&uris[0]), vol.superblock())
-        .await
-        .unwrap();
-    let page0 = entries[0].page.clone().expect("page 0");
-    assert!(page0
-        .slots
-        .iter()
-        .all(|e| e.g == 0 && e.slot_tree_extents == 0));
-    assert_eq!(
-        META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed),
-        refusals_before,
-        "the gate is inert unarmed"
-    );
-    // The seq-space law is inert here: the ring stamps its positions.
-    assert_eq!(vol.journal_ring().seq_offset(), 0);
-    shutdown(&routed).await;
-}
-
-/// `SQUEEZEFS_SYMMETRIC_META=1` on a bit-17-ABSENT volume refuses the
-/// writer's open loud, naming `enable-symmetric`; the flat volume is
-/// untouched.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn symmetric_meta_on_a_flat_volume_refuses_naming_enable_symmetric() {
+async fn a_single_writer_volume_is_the_shipped_flat_posture_whatever_the_knob_says() {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     let uris = vec![format_flat_member(dir.path(), "meta0").await];
-    Knobs::armed().apply();
-    let r = open_routed_meta_set(&uris).await;
-    Knobs::clear();
-    let e = r.err().expect("refused").to_string();
-    assert!(e.contains("enable-symmetric"), "{e}");
-    assert!(e.contains("bit 17"), "{e}");
-    // Unarmed, the flat volume mounts as ever.
-    let routed = open_under(&uris, &Knobs::unarmed()).await;
-    assert!(routed.volumes[0].appender_stats().is_none());
-    assert!(routed.volumes[0].slot_lease_stats().is_none());
-    shutdown(&routed).await;
+    for knobs in [Knobs::unarmed(), Knobs::armed()] {
+        let routed = open_under(&uris, &knobs).await;
+        let vol = Arc::clone(&routed.volumes[0]);
+        let refusals_before = META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed);
+        assert!(!vol.slot_lease_armed());
+        assert!(vol.slot_lease_stats().is_none());
+        assert!(
+            vol.appender_stats().is_none(),
+            "no appender region on the flat class"
+        );
+        assert!(!vol.symmetric_forest());
+        assert_eq!(squeezefs::dlm_slot::dlm_mode(), "solo");
+        for i in 0..8 {
+            routed
+                .create(
+                    ROOT_INO,
+                    &format!("f{}-{i}", u8::from(knobs.armed)),
+                    libc::S_IFREG | 0o644,
+                    0,
+                    0,
+                )
+                .await
+                .unwrap();
+        }
+        vol.checkpoint_now().await.unwrap();
+        assert_eq!(
+            META_KV_LEAF_LEASE_REFUSALS.load(Ordering::Relaxed),
+            refusals_before,
+            "the gate is inert on the flat class"
+        );
+        // The seq-space law is inert here: the ring stamps its positions.
+        assert_eq!(vol.journal_ring().seq_offset(), 0);
+        shutdown(&routed).await;
+    }
 }
 
 /// The four knobs' derivations and ranges (the derivation law's tie): `M
@@ -1944,9 +1925,7 @@ async fn a_holder_live_below_a_directory_on_another_volume_keeps_the_directorys_
     for (i, name) in ["meta0", "meta1"].iter().enumerate() {
         let p = dir.path().join(name);
         std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
-        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-        let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[i].clone()).await;
-        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        let r = format_v3_stamped_symmetric(&p, VOL_LEN, &set_opts(), plan.stamps[i].clone()).await;
         r.expect("format stamped member");
         uris.push(p.display().to_string());
     }
@@ -2024,15 +2003,17 @@ async fn a_holder_live_below_a_directory_on_another_volume_keeps_the_directorys_
 /// acceptance.md` §3.9.1c): the directory-parent memo is an ARMED set's
 /// hint — its every reader (the set-wide rename lock's ancestor walk, the
 /// stripe check, the subtree liveness resolver) runs behind the plane —
-/// so an UNARMED mount feeds it nothing (no moka insert, no `Arc<str>` per
-/// `mkdir`), while an armed one feeds every directory mint. RED before: the
-/// unarmed mount held one entry per mkdir.
+/// so an UNARMED mount (the `--single-writer` class since PR 14) feeds it
+/// nothing (no moka insert, no `Arc<str>` per `mkdir`), while an armed
+/// one feeds every directory mint. RED before: the unarmed mount held one
+/// entry per mkdir.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unarmed_mount_feeds_the_directory_parent_memo_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
+    let flat = vec![format_flat_member(dir.path(), "flat0").await];
     let uris = vec![format_stamped_member(dir.path(), "meta0").await];
-    let routed = open_under(&uris, &Knobs::unarmed()).await;
+    let routed = open_under(&flat, &Knobs::unarmed()).await;
     assert!(!routed.volumes[0].slot_lease_armed());
     for i in 0..200u32 {
         routed
@@ -2487,9 +2468,7 @@ async fn format_stamped_member_sized(
         journal_len_override: Some(ring),
         ..set_opts()
     };
-    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-    let r = format_v3_stamped(&p, len, &opts, plan.stamps[0].clone()).await;
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    let r = format_v3_stamped_symmetric(&p, len, &opts, plan.stamps[0].clone()).await;
     r.expect("format stamped member");
     p.display().to_string()
 }
@@ -4793,9 +4772,7 @@ async fn two_armed_volumes_each_with_a_wire_joiner_compose_one_owner_table() {
     for (i, name) in ["meta0", "meta1"].iter().enumerate() {
         let p = dir.path().join(name);
         std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
-        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-        let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[i].clone()).await;
-        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        let r = format_v3_stamped_symmetric(&p, VOL_LEN, &set_opts(), plan.stamps[i].clone()).await;
         r.expect("format stamped member");
         uris.push(p.display().to_string());
     }

@@ -610,13 +610,12 @@ pub fn reader_staleness_bound() -> Duration {
 }
 
 /// Whether this `-o ro` mount is a READ-TOKEN client (PR 5,
-/// design-symmetric-metadata §5.7.2): the read-only latch AND
-/// `SQUEEZEFS_SYMMETRIC_META=1` — the reader's own declaration, the same
-/// knob that arms the writer's plane, read once at the open. `=0` is the
-/// S5 poller verbatim. The volume gate (bit 17) is the arm's to refuse.
+/// design-symmetric-metadata §5.7.2 — EVERY read-only mount since the
+/// PR-14 flip: the S5 bounded-staleness posture retired with it; R-SYM-4
+/// names tokens the ONLY foreign-read method). The volume gate (bit 17) is
+/// the arm's to refuse, naming `enable-symmetric`.
 pub fn token_reader_requested() -> bool {
     crate::fuse_client::read_only_mount()
-        && crate::meta_backend::kv::slot_lease::symmetric_meta_requested()
 }
 
 /// **The user-visible METADATA staleness bound** in force for this
@@ -679,11 +678,11 @@ pub fn refuse_explicit_ttls_under_tokens(
         return Ok(());
     }
     Err(format!(
-        "SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount with an explicit non-zero kernel cache TTL \
-         ({}): under read tokens every kernel TTL derives to 0 — a dentry or attribute the \
-         kernel keeps past a recall is a bounded-staleness read method, which \
-         design-symmetric-metadata R-SYM-4 forbids. Drop the option, or mount with \
-         SQUEEZEFS_SYMMETRIC_META=0",
+        "a -o ro mount with an explicit non-zero kernel cache TTL ({}): a read-only mount is a \
+         READ-TOKEN client (every one since the PR-14 flip) and under read tokens every kernel \
+         TTL derives to 0 — a dentry or attribute the kernel keeps past a recall is a \
+         bounded-staleness read method, which design-symmetric-metadata R-SYM-4 forbids. Drop \
+         the option",
         nonzero.join(", ")
     ))
 }
@@ -694,8 +693,9 @@ pub fn refuse_explicit_ttls_under_tokens(
 /// of the set arms its [`crate::meta_ship::token_plane::TokenReaderPlane`]
 /// against the volume's holder with the mount's data-plane recall sink
 /// (the in-flight serve drain + the R-6 purge before every ack). Returns
-/// the number of volumes armed — `Ok(0)` under `=0`, the shipped S5 reader
-/// verbatim.
+/// the number of volumes armed — every read-only volume, since the PR-14
+/// flip made the token client the ONE `-o ro` posture (no knob value
+/// names another).
 ///
 /// Refused LOUD (the mount fails), naming the remedy, when anything the
 /// posture needs is absent: a bit-17-absent volume (no holder exists to
@@ -723,12 +723,14 @@ pub async fn arm_token_readers(
     for v in volumes {
         if !v.symmetric_forest() {
             return Err(format!(
-                "{}: SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount, but this volume does not \
-                 carry the symmetric forest (incompat bit 17) — no holder exists to grant a \
-                 read token on it, and a reader that fell back to the bounded-staleness poll \
-                 would be the second read method design-symmetric-metadata R-SYM-4 forbids. \
-                 Convert the set offline with `squeezefs volume enable-symmetric`, or mount \
-                 with SQUEEZEFS_SYMMETRIC_META=0",
+                "{}: a -o ro mount of a volume that does not carry the symmetric forest \
+                 (incompat bit 17 — a `--single-writer` format, or a pre-flip volume not yet \
+                 converted): no holder exists to grant a read token on it, and a reader that \
+                 fell back to the bounded-staleness poll would be the second read method \
+                 design-symmetric-metadata R-SYM-4 forbids (the S5 projection retired with the \
+                 PR-14 flip). A `--single-writer` volume has ONE writer by format class and no \
+                 coherent reader; a pre-flip multi-writer-class set converts offline with \
+                 `squeezefs volume enable-symmetric`",
                 v.device_path().display()
             ));
         }
@@ -742,41 +744,35 @@ pub async fn arm_token_readers(
     // whatever the S5 cadence task decided.
     if !drain_observed_enabled() {
         return Err(
-            "SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount with SQUEEZEFS_FREE_GRACE_DRAIN_OBSERVED=0: \
-             a token reader acks a recall only after the OBSERVED drain of its in-flight serves, \
-             and no timer stands behind that ack (R-SYM-4 — no bounded second method); the lever \
-             governs the SQUEEZEFS_SYMMETRIC_META=0 reader alone. Unset it, or mount with \
-             SQUEEZEFS_SYMMETRIC_META=0"
+            "a -o ro mount with SQUEEZEFS_FREE_GRACE_DRAIN_OBSERVED=0: a token reader acks a \
+             recall only after the OBSERVED drain of its in-flight serves, and no timer stands \
+             behind that ack (R-SYM-4 — no bounded second method). Unset the lever"
                 .to_string(),
         );
     }
     if !drain_epoch_stamp_enabled() {
         return Err(
-            "SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount with SQUEEZEFS_FREE_GRACE_DRAIN_EPOCH_STAMP=0: \
-             a recall steps the reader's layout cache and every pre-step layout must miss, and \
-             no timer stands behind that miss (R-SYM-4 — no bounded second method); the lever \
-             governs the SQUEEZEFS_SYMMETRIC_META=0 reader alone. Unset it, or mount with \
-             SQUEEZEFS_SYMMETRIC_META=0"
+            "a -o ro mount with SQUEEZEFS_FREE_GRACE_DRAIN_EPOCH_STAMP=0: a recall steps the \
+             reader's layout cache and every pre-step layout must miss, and no timer stands \
+             behind that miss (R-SYM-4 — no bounded second method). Unset the lever"
                 .to_string(),
         );
     }
     arm_serve_ledger();
     let Some(member) = crate::membership::installed_member() else {
         return Err(
-            "SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount, but this reader holds no membership \
-             lease: a token client IS a member-reader (design-symmetric-metadata §5.7.2) — the \
-             holder judges an unacked recall by the reader's lease, so a leaseless reader would \
-             be treated as dead at every recall while serving from its cache. Arm \
-             SQUEEZEFS_MEMBERSHIP_BIND on the writer (and its cluster listener, \
-             SQUEEZEFS_JOB_WIRE_BIND) so this mount joins as member-reader, or mount with \
-             SQUEEZEFS_SYMMETRIC_META=0"
+            "a -o ro mount whose reader holds no membership lease: a token client IS a \
+             member-reader (design-symmetric-metadata §5.7.2) — the holder judges an unacked \
+             recall by the reader's lease, so a leaseless reader would be treated as dead at \
+             every recall while serving from its cache. Arm SQUEEZEFS_MEMBERSHIP_BIND on the \
+             writer (and its cluster listener, SQUEEZEFS_JOB_WIRE_BIND) so this mount joins as \
+             member-reader"
                 .to_string(),
         );
     };
     let Some(secret) = crate::membership::cluster_secret(first).await else {
         return Err(format!(
-            "{}: SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount, but the volume set carries no \
-             job:enroll record — the cluster wire's root of trust (possession of volume access \
+            "{}: a -o ro mount of a volume set that carries no job:enroll record — the cluster wire's root of trust (possession of volume access \
              IS cluster membership, ruling D2). Enable the writer's cluster listener \
              (SQUEEZEFS_JOB_WIRE_BIND) so the secret exists",
             first.device_path().display()
@@ -801,12 +797,11 @@ pub async fn arm_token_readers(
                 Some(e) => e,
                 None => {
                     return Err(format!(
-                        "{}: SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount, but the volume's \
-                         manager (appender 0) has published no listener — its claim-set entry \
-                         carries no endpoint. The writer must be mounted under \
-                         SQUEEZEFS_SYMMETRIC_META=1 (its join ladder publishes the S8 listener \
-                         every token, custody and shipped step rides — design-symmetric-metadata \
-                         §5.1.6 / §7.3); a reader dials no declared authority",
+                        "{}: a -o ro mount of a volume whose manager (appender 0) has published \
+                         no listener — its claim-set entry carries no endpoint. The writer must \
+                         be mounted (its join ladder publishes the S8 listener every token, \
+                         custody and shipped step rides — design-symmetric-metadata §5.1.6 / \
+                         §7.3); a reader dials no declared authority",
                         v.device_path().display()
                     ));
                 }
@@ -835,10 +830,10 @@ pub async fn arm_token_readers(
         // reader that mounted anyway would answer EIO to every resolve.
         if let Err(e) = plane.probe().await {
             return Err(format!(
-                "{}: SQUEEZEFS_SYMMETRIC_META=1 on a -o ro mount, but the holder at {endpoint} \
-                 does not serve read tokens for volume {ordinal} ({e}) — the writer must be \
-                 mounted with SQUEEZEFS_SYMMETRIC_META=1 (its join ladder's listener carries \
-                 the token verbs; the endpoint it published is what this reader dialed)",
+                "{}: a -o ro mount whose holder at {endpoint} does not serve read tokens for \
+                 volume {ordinal} ({e}) — the writer must be mounted (its join ladder's \
+                 listener carries the token verbs; the endpoint it published is what this \
+                 reader dialed)",
                 v.device_path().display()
             ));
         }

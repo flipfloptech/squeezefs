@@ -325,6 +325,11 @@ static XV_CO_GUARD_STALE_RERESOLVES: AtomicU64 = AtomicU64::new(0);
 /// plan and the apply) and the initiator re-resolved and re-dispatched
 /// (PR 13, defect 29; `xv_cross_owner_step_slot_moved_retries`).
 static XV_CO_STEP_SLOT_MOVED_RETRIES: AtomicU64 = AtomicU64::new(0);
+/// Shipped steps a holder refused for a STALE writer era (it failed over;
+/// the lane relearned the successor's era from the refusal) and the
+/// initiator retried on the relearned era (PR 14, §4.4bb;
+/// `xv_cross_owner_step_stale_era_retries`).
+static XV_CO_STEP_STALE_ERA_RETRIES: AtomicU64 = AtomicU64::new(0);
 /// Local steps whose slot moved TO this initiator mid-plan (the guards
 /// travelled to the old holder) and that took their OWN guards for the
 /// apply in the non-parking canonical form (PR 13b;
@@ -633,6 +638,9 @@ pub struct CrossOwnerStats {
     /// PR 13 (defect 29): shipped steps re-dispatched after a holder's
     /// `SlotBusy` (the slot moved between the plan and the apply).
     pub step_slot_moved_retries: u64,
+    /// PR 14 (§4.4bb): shipped ops resent once after a holder refused them
+    /// whole for a stale writer era (the lane relearned the successor's).
+    pub step_stale_era_retries: u64,
     /// PR 13b: local steps re-dispatched after their slot moved TO this
     /// initiator that took their own guards for the apply.
     pub step_late_guards: u64,
@@ -671,6 +679,7 @@ pub fn cross_owner_stats() -> CrossOwnerStats {
         guard_rpcs: XV_CO_GUARD_RPCS.load(Ordering::Relaxed),
         guard_stale_reresolves: XV_CO_GUARD_STALE_RERESOLVES.load(Ordering::Relaxed),
         step_slot_moved_retries: XV_CO_STEP_SLOT_MOVED_RETRIES.load(Ordering::Relaxed),
+        step_stale_era_retries: XV_CO_STEP_STALE_ERA_RETRIES.load(Ordering::Relaxed),
         step_late_guards: XV_CO_STEP_LATE_GUARDS.load(Ordering::Relaxed),
         step_late_guard_refusals: XV_CO_STEP_LATE_GUARD_REFUSALS.load(Ordering::Relaxed),
         op_slot_moved_redispatches: XV_CO_OP_SLOT_MOVED_REDISPATCHES.load(Ordering::Relaxed),
@@ -735,6 +744,10 @@ pub fn cross_owner_stats_json() -> serde_json::Map<String, serde_json::Value> {
     out.insert(
         "xv_cross_owner_step_slot_moved_retries".into(),
         s.step_slot_moved_retries.into(),
+    );
+    out.insert(
+        "xv_cross_owner_step_stale_era_retries".into(),
+        s.step_stale_era_retries.into(),
     );
     out.insert(
         "xv_cross_owner_step_late_guards".into(),
@@ -1297,7 +1310,7 @@ async fn acquire_guards_leased_once(
              table taken first: {local_taken})",
             peer.endpoint
         );
-        let acquired = match router.ship_ops(&peer, vec![op]).await {
+        let acquired = match ship_ops_relearning_era(&router, &peer, vec![op]).await {
             Ok(mut results) => match results.pop() {
                 Some(r) => r
                     .outcome
@@ -1360,7 +1373,7 @@ fn spawn_scope_release(
                 ino: release_ino,
             },
         };
-        if let Err(e) = router.ship_ops(&peer, vec![op]).await {
+        if let Err(e) = ship_ops_relearning_era(&router, &peer, vec![op]).await {
             log::warn!(
                 "cross-owner guards: releasing scope {scope:#x} at {} failed ({e}) — the \
                  holder's lease-expiry sweep releases it",
@@ -2349,7 +2362,7 @@ pub async fn lookup_exact(
             name: name.to_string(),
         },
     };
-    let mut results = router.ship_ops(&peer, vec![op]).await?;
+    let mut results = ship_ops_relearning_era(&router, &peer, vec![op]).await?;
     let result = results.pop().ok_or_else(|| {
         SqueezefsError::InvalidOperation(
             "exact lookup: the holder returned an empty result set for a one-op batch".into(),
@@ -2385,13 +2398,46 @@ pub(crate) async fn ship_meta_call(
         id: router.next_request_id(),
         call,
     };
-    let mut results = router.ship_ops(&peer, vec![op]).await?;
+    let mut results = ship_ops_relearning_era(&router, &peer, vec![op]).await?;
     let result = results.pop().ok_or_else(|| {
         SqueezefsError::InvalidOperation(format!(
             "{verb}: the holder returned an empty result set for a one-op batch"
         ))
     })?;
     result.outcome.map_err(|e| e.into_error())
+}
+
+/// [`crate::meta_ship::MetaShipRouter::ship_ops`] with the ONE retry a
+/// stale-era refusal earns (PR 14, the record's §4.4bb): the holder failed
+/// over, its successor is in a new era and refused the frame WHOLE
+/// (`RefusalClass::StaleOwnerEra` — nothing applied), and the lane learned
+/// the new era from the refusal, so the same ops — same request ids, the
+/// owner's dedup window making the resend exactly-once — are admissible at
+/// once. Every cross-owner ship (a travelling guard, a step, a record verb)
+/// rides this door; before it a joiner's first shipped step after a manager
+/// failover surfaced the refusal as the op's error (`mkdir(2)` → `EINVAL`).
+async fn ship_ops_relearning_era(
+    router: &crate::meta_ship::MetaShipRouter,
+    peer: &Arc<crate::meta_ship::PeerOwner>,
+    ops: Vec<crate::meta_ship::MetaOp>,
+) -> Result<Vec<crate::meta_ship::MetaOpResult>> {
+    match router.ship_ops(peer, ops.clone()).await {
+        Err(e)
+            if matches!(
+                e.refusal_class(),
+                Some(crate::error::RefusalClass::StaleOwnerEra)
+            ) =>
+        {
+            XV_CO_STEP_STALE_ERA_RETRIES.fetch_add(1, Ordering::Relaxed);
+            log::debug!(
+                "cross-owner ship to {}: refused for a stale writer era ({e}); the lane \
+                 relearned it — resending the same request ids",
+                peer.endpoint
+            );
+            router.ship_ops(peer, ops).await
+        }
+        other => other,
+    }
 }
 
 /// Ship one step to its holder through the installed shipper.
@@ -2421,7 +2467,7 @@ async fn ship_step(
     };
     let t = std::time::Instant::now();
     XV_CO_STEPS_SHIPPED.fetch_add(1, Ordering::Relaxed);
-    let mut results = router.ship_ops(&peer, vec![op]).await?;
+    let mut results = ship_ops_relearning_era(&router, &peer, vec![op]).await?;
     phase_record(XvPhase::ShipRtt, t);
     let result = results.pop().ok_or_else(|| {
         SqueezefsError::InvalidOperation(

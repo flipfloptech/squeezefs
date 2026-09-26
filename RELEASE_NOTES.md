@@ -93,6 +93,23 @@ mount is a read-token client whose metadata is exact at the next resolve
   reserved. A JOINED writer's `df` still reads its own arithmetic (the
   holder's population does not yet travel on the grant reply — a 1.3.x
   item); `--single-writer` volumes are untouched.
+- **Two defects the flip binary's fleet legs found after a manager
+  FAILOVER, each fixed red-first (the acceptance record's §4.4ba / §4.4bb):**
+  the bounded online census (§4.4aw above) bounded a JOINER's slot at the
+  grant-time cursor word the manager holds for it, so the successor's
+  `squeezefs fsck` skipped every ino a joiner minted since and read the
+  joiners' live files' blocks as false C2 "leaked" (report-only, nothing
+  freed; the census's watermarks name only the keyspaces this mount holds a
+  LIVE cursor for now — a slot another appender leases is walked whole); and
+  a joiner's first shipped step after the SECOND failover failed `EINVAL` —
+  the S8 lane presented the dead manager's writer era at the successor (the
+  set's one manager address is the same lane), the owner refused the frame
+  whole and the cross-owner ladder surfaced the refusal instead of retrying
+  it (the first failover never shows it: a fresh lane's era `0` is
+  admitted). The refusal is the typed retryable class `StaleOwnerEra` and
+  every cross-owner ship resends ONCE on the era the lane relearned (gauge
+  `xv_cross_owner_step_stale_era_retries`; `meta_ship.era_relearns` +1 per
+  failover per lane is the healthy reading).
 - **The flip lands after the owner's cloud decision**: the box brackets of
   every design §8 gate on the flip binary and the two-host / cloud rows are
   what that decision reads (the record

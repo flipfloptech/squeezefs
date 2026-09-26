@@ -1856,6 +1856,25 @@ act with these laws (`docs/design-symmetric-metadata.md` §7.2 / §7.3, row 14):
   law at scale is unchanged; `setfattr -n user.squeezefs.gather -v 1 <dir>`
   is the lever that puts a directory's children into one slot (one pack).
   The memlock prerequisite above applies to every mount.
+* **What the flip binary's fleet legs found and fixed (each red-first,
+  record §4.4ax–bb).** An acked-writes LOSS on the death path of every
+  forest volume (the D0 gate's ring-recovery preflight flushed a crashed
+  writer's replayed records under an unprimed frame stamp — screened at the
+  next open); `df`'s used count on an armed writer only ever grew (the
+  single-writer arithmetic on a grant-armed allocator — the used count
+  follows the bitmap now); the manager's online census bounded a JOINER's
+  slot at its grant-time cursor and read the joiner's live files as false
+  C2 after a failover (the watermarks name only the keyspaces this mount
+  holds a live cursor for); and **a joiner's first shipped step after the
+  SECOND manager failover failed `EINVAL`** — the S8 lane presented the
+  dead manager's writer era at the successor (the fleet's one manager
+  address is the same lane), the owner refused the frame whole and the
+  cross-owner ladder surfaced the refusal; it is the typed retryable class
+  `StaleOwnerEra` now and every cross-owner ship resends ONCE on the era
+  the lane relearned (`xv_cross_owner_step_stale_era_retries`, beside the
+  slot-moved retries; a second refusal is the `EAGAIN` the application
+  sees; `meta_ship.era_relearns` +1 per failover per lane is the healthy
+  reading, `stale_term_refusals` at the successor its mirror).
 * **What is owed past the flip** (the PR 14b board): the manager's zero-census
   open (the bitmap as the terminal-free engine), PR 7's un-share of a
   surviving sole owner, the SMO-record window economy (one pad per flush

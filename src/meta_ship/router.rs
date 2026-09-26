@@ -843,13 +843,23 @@ impl ShipLane {
                 // — an adoption by a declared successor is followed, a
                 // holder the assignment set does not name POISONS.
                 owners::note_era_relearn(&self.peer.peer_id);
-                Err(SqueezefsError::InvalidOperation(format!(
-                    "S8: owner {} refused the batch — it named a stale writer era; the owner is \
-                     now in era {} (a successor bumps `term` durably before arming, so every \
-                     old-era request is stale by construction). Nothing was applied.",
-                    self.peer.endpoint,
-                    self.term.load(Ordering::Acquire)
-                )))
+                // The TYPED retryable class (PR 14, §4.4bb): the lane now
+                // holds the successor's era, so the caller's retry of the
+                // same request is admissible — a cross-owner step retries
+                // it once; an unretried caller surfaces EAGAIN, never the
+                // EINVAL a joiner's `mkdir` read after every second manager
+                // failover on the flip binary's fleet.
+                Err(SqueezefsError::retryable(
+                    crate::error::RefusalClass::StaleOwnerEra,
+                    format!(
+                        "S8: owner {} refused the batch — it named a stale writer era; the owner \
+                         is now in era {} (a successor bumps `term` durably before arming, so \
+                         every old-era request is stale by construction). Nothing was applied; \
+                         the lane holds the new era — retry",
+                        self.peer.endpoint,
+                        self.term.load(Ordering::Acquire)
+                    ),
+                ))
             }
             STATUS_IN_GRACE => Err(SqueezefsError::busy(format!(
                 "S8: owner {} is inside its failover grace window and refuses fresh mutations \

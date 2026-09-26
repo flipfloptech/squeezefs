@@ -346,6 +346,15 @@ fn stat_u64(mnt: &Path, key: &str) -> u64 {
         .unwrap_or_else(|| panic!("{key} exported on the stats inode"))
 }
 
+/// Whether the mount's allocators run under PR 8's allocation lease
+/// (ranged block grants from a durable bitmap — every armed writer since
+/// the PR-14 flip): the `alloc_lease` face lists a held lease.
+fn grant_armed(mnt: &Path) -> bool {
+    stats_json(mnt)["metrics"]["alloc_lease"]
+        .as_array()
+        .is_some_and(|a| !a.is_empty())
+}
+
 fn log_contains(log: &Path, needle: &str) -> bool {
     std::fs::read_to_string(log)
         .map(|t| t.contains(needle))
@@ -514,10 +523,28 @@ fn a_released_corpses_stale_free_never_touches_a_live_files_block() {
         want,
         "premise: the live file reads back on the writing mount"
     );
-    assert!(
-        stat_u64(&mnt, "alloc_from_freelist") >= 1,
-        "premise: the live file re-minted at least one of the corpse's freed offsets"
-    );
+    // Where the live file's blocks sit is the allocator's law: the flat
+    // (`--single-writer`) class serves the free list before any fresh
+    // mint, so the live file RE-MINTED the corpse's freed offsets — the
+    // strongest shape, a stale free would hit LIVE data; on a grant-armed
+    // allocator (the default since PR 14) the grant window is the ONE
+    // mint source and a hole below the grant frontier is re-carved only
+    // once fresh space is exhausted (`BlockGrantLedger::carve`), so the
+    // live file minted FRESH blocks and the corpse's offsets stay clear.
+    // The law under test — the stale releases skipped BEFORE the free
+    // funnel — is the same either way.
+    if grant_armed(&mnt) {
+        assert_eq!(
+            stat_u64(&mnt, "alloc_from_freelist"),
+            0,
+            "premise: a grant-armed allocator mints from its window, never the free list"
+        );
+    } else {
+        assert!(
+            stat_u64(&mnt, "alloc_from_freelist") >= 1,
+            "premise: the live file re-minted at least one of the corpse's freed offsets"
+        );
+    }
     m2.umount_timed();
 
     // Mount 3: the ledger seeds the live file's TWO references; the sweep

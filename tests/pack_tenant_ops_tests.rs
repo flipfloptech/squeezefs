@@ -323,6 +323,34 @@ fn log_contains(log: &Path, needle: &str) -> bool {
 
 /// Allocated chunks on the mounted set — `statvfs`'s used bytes are the
 /// allocator's `used_blocks × chunk` (RAM-maintained, no I/O).
+/// The clip contract's tenants live in one GATHERED directory (symmetric
+/// PR 7, KD-SYM-17 — `setfattr -n user.squeezefs.gather -v 1`): under the
+/// armed default (PR 14) a pack is scoped per `(writer, slot, data
+/// volume)`, and a gathered directory's children share its slot — the
+/// operator's lever for "these files share one pack".
+const TENANT_DIR: &str = "tenants";
+
+fn tenant(mnt: &Path, i: usize) -> PathBuf {
+    mnt.join(TENANT_DIR).join(format!("t{i}.bin"))
+}
+
+fn mkdir_gather(mnt: &Path, dir: &str) {
+    let d = mnt.join(dir);
+    std::fs::create_dir(&d).unwrap_or_else(|e| panic!("mkdir {}: {e}", d.display()));
+    let c = std::ffi::CString::new(d.to_str().unwrap()).unwrap();
+    let name = std::ffi::CString::new(squeezefs::GATHER_XATTR).unwrap();
+    // SAFETY: both strings are NUL-terminated for the call's duration; the
+    // value pointer/length name a live byte slice.
+    let rc = unsafe { libc::setxattr(c.as_ptr(), name.as_ptr(), b"1".as_ptr().cast(), 1, 0) };
+    assert_eq!(
+        rc,
+        0,
+        "setxattr gather on {}: {}",
+        d.display(),
+        std::io::Error::last_os_error()
+    );
+}
+
 fn used_chunks(mnt: &Path) -> u64 {
     let c = std::ffi::CString::new(mnt.to_str().unwrap()).unwrap();
     // SAFETY: a zeroed statvfs is a valid out-parameter; the return is checked.
@@ -420,10 +448,16 @@ fn passthrough_truncate_shrink_of_packed_tenants_clips_the_mapping_with_no_data_
     assert_eq!(stats_json(&mnt)["small_file_packing"], true);
 
     write_fsync(&mnt.join(ANCHOR), &anchor_bytes());
+    // The tenants share ONE slot (a gathered directory — symmetric PR 7,
+    // KD-SYM-17): under the armed default a pack is scoped per slot (PR
+    // 7's law 1), so six root-level tenants the rotor spreads over six
+    // slots would take six packs; one slot, one pack — the contract's
+    // premise. A flat volume accepts the name and packs as before.
+    mkdir_gather(&mnt, TENANT_DIR);
     const N: usize = 6;
     let len = 16 * KIB;
     for i in 0..N {
-        write_fsync(&mnt.join(format!("t{i}.bin")), &pattern(i, len));
+        write_fsync(&tenant(&mnt, i), &pattern(i, len));
     }
     assert_eq!(
         stat_u64(&mnt, "layout_promoted_packed"),
@@ -441,10 +475,10 @@ fn passthrough_truncate_shrink_of_packed_tenants_clips_the_mapping_with_no_data_
 
     let clips: [(usize, usize); 3] = [(0, 10_000), (1, 8_192), (2, 5_000)];
     for &(i, new_len) in &clips {
-        truncate_path(&mnt.join(format!("t{i}.bin")), new_len as u64);
+        truncate_path(&tenant(&mnt, i), new_len as u64);
     }
     for &(i, new_len) in &clips {
-        let got = std::fs::read(mnt.join(format!("t{i}.bin"))).unwrap();
+        let got = std::fs::read(tenant(&mnt, i)).unwrap();
         assert_eq!(got.len(), new_len, "t{i}: the clipped size");
         assert_eq!(
             got,
@@ -454,7 +488,7 @@ fn passthrough_truncate_shrink_of_packed_tenants_clips_the_mapping_with_no_data_
     }
     for i in 3..N {
         assert_eq!(
-            std::fs::read(mnt.join(format!("t{i}.bin"))).unwrap(),
+            std::fs::read(tenant(&mnt, i)).unwrap(),
             pattern(i, len),
             "sibling t{i} untouched"
         );
@@ -489,9 +523,9 @@ fn passthrough_truncate_shrink_of_packed_tenants_clips_the_mapping_with_no_data_
     assert_eq!(used_chunks(&mnt), used0, "no block allocated");
 
     // Contract 3's mount face: truncate-UP of a clipped tenant is size-only.
-    truncate_path(&mnt.join("t0.bin"), len as u64);
+    truncate_path(&tenant(&mnt, 0), len as u64);
     assert_eq!(
-        std::fs::read(mnt.join("t0.bin")).unwrap(),
+        std::fs::read(tenant(&mnt, 0)).unwrap(),
         clipped_then_zero(0, 10_000, len),
         "t0 re-extended: the kept prefix, then an implicit-zero tail"
     );
@@ -524,21 +558,18 @@ fn passthrough_truncate_shrink_of_packed_tenants_clips_the_mapping_with_no_data_
     );
     assert_eq!(used_chunks(&mnt2), ANCHOR_BLOCKS + 1);
     assert_eq!(
-        std::fs::read(mnt2.join("t0.bin")).unwrap(),
+        std::fs::read(tenant(&mnt2, 0)).unwrap(),
         clipped_then_zero(0, 10_000, len)
     );
     for &(i, new_len) in &clips[1..] {
         assert_eq!(
-            std::fs::read(mnt2.join(format!("t{i}.bin"))).unwrap(),
+            std::fs::read(tenant(&mnt2, i)).unwrap(),
             pattern(i, new_len),
             "t{i} byte-exact elsewhere at its clipped size"
         );
     }
     for i in 3..N {
-        assert_eq!(
-            std::fs::read(mnt2.join(format!("t{i}.bin"))).unwrap(),
-            pattern(i, len)
-        );
+        assert_eq!(std::fs::read(tenant(&mnt2, i)).unwrap(), pattern(i, len));
     }
     assert_eq!(std::fs::read(mnt2.join(ANCHOR)).unwrap(), anchor_bytes());
     assert_eq!(stat_u64(&mnt2, "staged_payload_lost_reads"), 0);

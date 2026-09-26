@@ -420,7 +420,12 @@ async fn force_gate_over_refused_superblock_buries_all_residue_classes() {
         VolumeFormat::V3(sb) => sb,
         other => panic!("expected v3 before the forge, got {other:?}"),
     };
-    let ring = gen1_sb.journal;
+    // The RING is what replay reads: the whole journal extent on a flat
+    // volume; on the forest (the default since PR 14) the extent past
+    // appender 0's four page slots, whose first slot the format writes
+    // `Free` — a page, never a journal entry (`fixed_ring_extent`, the
+    // one place the mount reads the geometry).
+    let ring = KvMetaBackend::fixed_ring_extent(&gen1_sb);
     let image = std::fs::read(meta.path()).unwrap();
     assert!(
         image[ring.start as usize..ring.end() as usize]
@@ -456,7 +461,8 @@ async fn force_gate_over_refused_superblock_buries_all_residue_classes() {
         "the reformatted volume must carry the watermark bit"
     );
     assert_eq!(
-        gen2_sb.journal, ring,
+        KvMetaBackend::fixed_ring_extent(&gen2_sb),
+        ring,
         "identical knobs must re-plan identical geometry"
     );
 

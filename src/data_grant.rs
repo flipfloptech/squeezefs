@@ -4713,9 +4713,10 @@ pub fn validate_free(client: &str, lease_epoch: u64) -> std::result::Result<(), 
         return Err(format!(
             "S9: refusing a displaced-block free from '{client}': this node serves the publish \
              vocabulary but has no custody authority armed, so lease epoch {lease_epoch} cannot \
-             be verified as live custody. Arm the multi-writer authority \
-             (SQUEEZEFS_MULTI_WRITER=1 + SQUEEZEFS_MW_BIND) — a free executed for an \
-             unverifiable era is a fenced zombie's free"
+             be verified as live custody. Every armed writer's join ladder installs its \
+             custody owner beside the publish service (rung 7, `SQUEEZEFS_MW_BIND` names \
+             where it listens) — a free executed for an unverifiable era is a fenced \
+             zombie's free"
         ));
     };
     owner.check_free(client, lease_epoch)
@@ -4737,9 +4738,10 @@ pub fn validate_publish_era(client: &str, lease_epoch: u64) -> std::result::Resu
         return Err(format!(
             "S9: refusing a shipped publish from '{client}': this node serves the publish \
              vocabulary but has no custody authority armed, so lease epoch {lease_epoch} cannot \
-             be verified as live custody. Arm the multi-writer authority \
-             (SQUEEZEFS_MULTI_WRITER=1 + SQUEEZEFS_MW_BIND) — a publish applied for an \
-             unverifiable era is a fenced zombie's publish (design-mw-layout-versions §6a)"
+             be verified as live custody. Every armed writer's join ladder installs its \
+             custody owner beside the publish service (rung 7, `SQUEEZEFS_MW_BIND` names \
+             where it listens) — a publish applied for an unverifiable era is a fenced \
+             zombie's publish (design-mw-layout-versions §6a)"
         ));
     };
     owner.check_publish_era(client, lease_epoch)
@@ -4877,8 +4879,9 @@ pub async fn acquire_remote_range(
             "S11: lock object inode_{ino} homes on slot {slot}, which this node's lock \
              authority does not own, and no remote write-custody client is armed — refusing \
              the range acquire [{},{}) rather than granting custody the owner never issued. \
-             Arm the multi-writer mount (SQUEEZEFS_MULTI_WRITER=1 with a PR-capable substrate \
-             and a stamped format) so the acquire can travel",
+             A foreign object's custody travels to its slot holder under the symmetric plane \
+             (every RW mount of a default-format set on a PR-capable substrate arms it); \
+             this mount armed no custody client",
             required.0, required.1
         );
         log::error!("{reason}");
@@ -4905,9 +4908,10 @@ pub async fn acquire_remote(
         let reason = format!(
             "S9: lock object inode_{ino} homes on slot {slot}, which this node's lock authority \
              does not own, and no remote write-custody client is armed — refusing {span:?} \
-             {mode:?} rather than granting custody the owner never issued. Arm the multi-writer \
-             mount (SQUEEZEFS_MULTI_WRITER=1 with a PR-capable substrate and a stamped format) \
-             so the acquire can travel"
+             {mode:?} rather than granting custody the owner never issued. A foreign object's \
+             custody travels to its slot holder under the symmetric plane (every RW mount of a \
+             default-format set on a PR-capable substrate arms it); this mount armed no \
+             custody client"
         );
         log::error!("{reason}");
         return Err(SqueezefsError::LockFailed { reason });

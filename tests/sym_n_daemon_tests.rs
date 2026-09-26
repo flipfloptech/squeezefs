@@ -4768,6 +4768,9 @@ impl squeezefs::meta_ship::token_plane::RecallDataSink for ProbeSink {
 struct DaemonVenue {
     host: Arc<squeezefs::cluster_wire::RpcListener>,
     endpoint: String,
+    /// The daemon's custody owner (the shipped-free contracts install it
+    /// process-wide — `validate_free`'s era gate — and revoke through it).
+    owner: Arc<squeezefs::data_grant::WriteCustodyOwner>,
 }
 
 impl DaemonVenue {
@@ -4819,7 +4822,11 @@ impl DaemonVenue {
         )
         .expect("listener");
         let endpoint = host.endpoint().to_string();
-        Self { host, endpoint }
+        Self {
+            host,
+            endpoint,
+            owner,
+        }
     }
 
     fn tear_down(self) {
@@ -16844,4 +16851,400 @@ async fn a_joiner_carrying_the_managers_node_token_from_another_host_refuses_nam
     drop(jvol);
     venue.tear_down();
     shutdown(&manager).await;
+}
+
+// ---------------------------------------------------------------------------
+// The shipped-free wire's VERDICT laws on the armed default (PR 14 fix
+// round 1, Issue 2 — re-shaped from the retired co-writer suite
+// `mw_cowriter_free_tests`: the served `FreeBlocks` arm, its executor and
+// its gauges are every armed writer's — a JOINER's terminal frees ship to
+// the data volume's allocation-lease HOLDER, whose executor runs the ladder
+// against its bitmap; the co-writer posture that first carried them is
+// gone, the laws are not).
+// ---------------------------------------------------------------------------
+
+/// The shipped-free wire between a JOINER and the HOLDER: the manager
+/// holds the data volume's allocation lease (PR 8 — its bitmap IS the free
+/// list a terminal free clears) behind a [`DaemonVenue`] whose custody
+/// owner is the process's (`data_grant::validate_free`, the era gate every
+/// `FreeBlocks` passes before the dedup window) and whose publish service
+/// serves the verb through the shipped-free executor over the manager's
+/// data-plane router (`arm_authority_planes`' install); the joiner holds a
+/// custody lease at the holder (the epoch every shipped free presents) and
+/// ships under its member id (the production joiner's publish client is
+/// installed under its custody owner's id — one id on both halves).
+struct FreeWire {
+    manager: Arc<RoutedMetaBackend>,
+    mvol: Arc<KvMetaBackend>,
+    venue: DaemonVenue,
+    alloc: Arc<squeezefs::block_allocator::BlockAllocator>,
+    br: Arc<squeezefs::routing::BackendRouter>,
+    joiner: Arc<RoutedMetaBackend>,
+    client: Arc<squeezefs::data_grant::WriteCustodyClient>,
+    client_id: String,
+    data_tag: u64,
+}
+
+impl FreeWire {
+    async fn stand_up(dir: &std::path::Path, uris: &[String], n: u32) -> Self {
+        use squeezefs::block_allocator::BlockAllocator;
+        use squeezefs::meta_backend::kv::alloc_lease;
+        use squeezefs::meta_ship::publish;
+        let manager = open_under(uris, &Knobs::armed()).await;
+        let mvol = Arc::clone(&manager.volumes[0]);
+        let venue = DaemonVenue::stand_up(&manager, true, "free-holder").await;
+        squeezefs::data_grant::install_custody_owner(Arc::clone(&venue.owner));
+        let data_id = "vol-shipped-free-verdicts";
+        let data_tag = squeezefs::meta_backend::kv::block_refs::volume_tag(data_id);
+        let alloc = Arc::new(BlockAllocator::new(data_id).await.unwrap());
+        alloc.set_capacity_bytes(4096 * alloc.chunk_size());
+        assert_eq!(
+            alloc_lease::arm_symmetric_allocation(&manager, &[Arc::clone(&alloc)])
+                .await
+                .unwrap(),
+            1,
+            "the manager holds the data volume's allocation lease"
+        );
+        // A sparse file the terminal free's reclaim punches into.
+        let dev = dir.join("shipped-free.dev");
+        std::fs::File::create(&dev)
+            .unwrap()
+            .set_len(2 << 30)
+            .unwrap();
+        let nvme = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
+            dev.to_str().unwrap(),
+        ));
+        let br = Arc::new(squeezefs::routing::BackendRouter::new(
+            Arc::clone(&alloc),
+            nvme,
+            Arc::new(std::sync::atomic::AtomicU64::new(alloc.chunk_size())),
+        ));
+        publish::install_free_executor(squeezefs::shipped_free::router_free_executor(
+            Arc::clone(&br),
+            Arc::clone(&manager),
+        ));
+        let identity = joiner_identity(&mvol, n).await;
+        let client_id = peer_of(&identity);
+        Knobs::armed().apply();
+        let joiner = open_routed_meta_set_joined(
+            uris,
+            &JoinedSetAdmission {
+                manager_endpoint: venue.endpoint.clone(),
+                secret: VENUE_SECRET.to_vec(),
+                peer_id: client_id.clone(),
+                identity,
+            },
+        )
+        .await;
+        Knobs::clear();
+        let joiner = joiner.expect("the joined open");
+        publish::install_client(publish::PublishClient::new(
+            &client_id,
+            VENUE_SECRET.to_vec(),
+        ));
+        let client = squeezefs::data_grant::WriteCustodyClient::connect(
+            &venue.endpoint,
+            VENUE_SECRET,
+            &client_id,
+        )
+        .await
+        .expect("the joiner's custody lease at the holder");
+        Self {
+            manager,
+            mvol,
+            venue,
+            alloc,
+            br,
+            joiner,
+            client,
+            client_id,
+            data_tag,
+        }
+    }
+
+    /// A block the HOLDER minted and one of its files durably references
+    /// (RAM refcount 1, the incarnation word stable — a completed DMA's
+    /// shape), returned as `(offset, block index, ino)`.
+    async fn referenced_block(&self, name: &str) -> (u64, u64, u64) {
+        use squeezefs::meta_backend::kv::block_refs::{BlockRef, BlockRefOp};
+        let off = self.alloc.allocate_block().await.expect("the holder mints");
+        self.alloc.publish_block(off);
+        let idx = off / self.alloc.chunk_size();
+        let ino = self
+            .manager
+            .create_with_rdev(1, name, libc::S_IFREG | 0o644, 0, 0, 0)
+            .await
+            .expect("the holder's file")
+            .ino;
+        squeezefs::meta_ship::publish::commit_block_refs(
+            &self.manager,
+            ino,
+            &[BlockRefOp::taken(BlockRef {
+                vol_tag: self.data_tag,
+                block_idx: idx,
+                owner_ino: ino,
+                block_index: 0,
+            })],
+        )
+        .await
+        .expect("the durable reference");
+        assert_eq!(self.alloc.refcount(off), Some(1));
+        assert!(self.bit_set(idx), "the mint SET its bit");
+        (off, idx, ino)
+    }
+
+    /// [`Self::referenced_block`] DISPLACED: its reference released durably
+    /// (the displacing publish is the durable ordering point) — the shape
+    /// whose terminal free the displacer ships.
+    async fn displaced_block(&self, name: &str) -> (u64, u64) {
+        use squeezefs::meta_backend::kv::block_refs::{BlockRef, BlockRefOp};
+        let (off, idx, ino) = self.referenced_block(name).await;
+        squeezefs::meta_ship::publish::commit_block_refs(
+            &self.manager,
+            ino,
+            &[BlockRefOp::released(BlockRef {
+                vol_tag: self.data_tag,
+                block_idx: idx,
+                owner_ino: ino,
+                block_index: 0,
+            })],
+        )
+        .await
+        .expect("the displacing release");
+        (off, idx)
+    }
+
+    /// The joiner ships `FreeBlocks` for `idxs` under its lease epoch at
+    /// the holder and `request_id` — the wire call `ship_displaced_frees`
+    /// makes.
+    async fn ship(
+        &self,
+        idxs: Vec<u64>,
+        request_id: u64,
+    ) -> squeezefs::error::Result<Vec<squeezefs::meta_ship::publish::FreeVerdict>> {
+        squeezefs::meta_ship::publish::ship_free_blocks(
+            &self.venue.endpoint,
+            self.data_tag,
+            idxs,
+            self.client.lease_epoch(),
+            request_id,
+        )
+        .await
+    }
+
+    /// The holder's bitmap bit for `idx` — SET while referenced or granted,
+    /// CLEAR once a terminal free landed.
+    fn bit_set(&self, idx: u64) -> bool {
+        squeezefs::meta_backend::kv::alloc_lease::holding(self.data_tag)
+            .expect("the manager's holding")
+            .bitmap
+            .is_set(idx)
+    }
+
+    async fn tear_down(self) {
+        squeezefs::meta_ship::publish::uninstall_free_executor();
+        squeezefs::meta_ship::publish::uninstall_client();
+        squeezefs::data_grant::uninstall_custody_owner();
+        shutdown(&self.joiner).await;
+        drop(self.joiner);
+        drop(self.client);
+        self.venue.tear_down();
+        shutdown(&self.manager).await;
+        drop(self.mvol);
+        drop(self.manager);
+        drop(self.br);
+        drop(self.alloc);
+    }
+}
+
+/// **The dedup replay** (the wire's exactly-once witness — `(lease_epoch,
+/// request_id)` on the holder's window): a joiner's retry after a lost
+/// reply, carrying the SAME epoch and id, answers the winner's cached
+/// verdicts — ONE ladder run, the block's bit cleared once, `free_replays`
+/// +1, `free_served_blocks` +1 (not +2), `block_double_frees` unmoved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replayed_shipped_free_is_absorbed_by_the_holders_dedup_window() {
+    use squeezefs::fuse_client::METRICS;
+    use squeezefs::meta_ship::publish::{self, FreeVerdict};
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, _dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let w = FreeWire::stand_up(dir.path(), &uris, 81).await;
+    let (off, idx) = w.displaced_block("replayed.bin").await;
+    let replays0 = publish::stats().free_replays;
+    let served0 = publish::stats().free_served_blocks;
+    let doubles0 = METRICS.block_double_frees.load(Relaxed);
+    let first = w.ship(vec![idx], 0xF00D).await.expect("the free executes");
+    assert_eq!(first, vec![FreeVerdict::Freed]);
+    let second = w
+        .ship(vec![idx], 0xF00D)
+        .await
+        .expect("the replay is ANSWERED, never re-applied");
+    assert_eq!(first, second, "the winner's own cached verdicts");
+    let s = publish::stats();
+    assert_eq!(s.free_replays - replays0, 1, "counted as a dedup hit");
+    assert_eq!(
+        s.free_served_blocks - served0,
+        1,
+        "one ladder run for two calls"
+    );
+    w.br.reclaim_drain().await;
+    assert!(!w.bit_set(idx), "the terminal free cleared the bit — once");
+    assert_eq!(
+        w.alloc.refcount(off),
+        None,
+        "the holder retired its tracking"
+    );
+    assert_eq!(
+        METRICS.block_double_frees.load(Relaxed),
+        doubles0,
+        "no double free under replay"
+    );
+    w.tear_down().await;
+}
+
+/// **The double release** (the tripwire keeps its teeth on the wire): a
+/// SECOND free of the same block under a FRESH request id is not a replay
+/// but the double-release lineage — the holder's executor answers
+/// `Refused` (its bit already CLEAR in the allocation bitmap), routes the
+/// act through the UNSEEDED ladder so the existing untracked-free tripwire
+/// fires, counts `free_refused_blocks`, and the bit stays clear (never a
+/// second free, never a re-set).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_shipped_free_of_a_freed_block_is_refused_on_the_double_release_tripwire() {
+    use squeezefs::fuse_client::METRICS;
+    use squeezefs::meta_ship::publish::{self, FreeVerdict};
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, _dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let w = FreeWire::stand_up(dir.path(), &uris, 82).await;
+    let (_off, idx) = w.displaced_block("doubled.bin").await;
+    assert_eq!(
+        w.ship(vec![idx], 1).await.unwrap(),
+        vec![FreeVerdict::Freed]
+    );
+    w.br.reclaim_drain().await;
+    assert!(!w.bit_set(idx));
+    let refused0 = publish::stats().free_refused_blocks;
+    let served0 = publish::stats().free_served_blocks;
+    let untracked0 = METRICS.block_untracked_free_refusals.load(Relaxed);
+    let second = w
+        .ship(vec![idx], 2)
+        .await
+        .expect("the verb is served — its VERDICT is the refusal");
+    assert_eq!(second, vec![FreeVerdict::Refused]);
+    let s = publish::stats();
+    assert_eq!(s.free_refused_blocks - refused0, 1, "free_refused_blocks");
+    assert_eq!(s.free_served_blocks - served0, 0, "nothing freed twice");
+    assert!(
+        METRICS.block_untracked_free_refusals.load(Relaxed) > untracked0,
+        "the EXISTING tripwire fires — the shipped path never bypasses it"
+    );
+    w.br.reclaim_drain().await;
+    assert!(!w.bit_set(idx), "the bit stays clear");
+    w.tear_down().await;
+}
+
+/// **The stale lease era** (the pull-based revocation law at the free
+/// verb): a joiner whose lease the holder REVOKED ships a free under the
+/// dead epoch — refused BEFORE the dedup window (`free_stale_refusals`
+/// +1), nothing freed: the holder's RAM reference and the block's bit are
+/// untouched (the leak-safe direction — the durable ledger owns the
+/// displaced block and the next derivation returns it), and no replay of
+/// a dead era is ever answered from the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shipped_free_under_a_revoked_lease_epoch_is_refused_by_era_and_frees_nothing() {
+    use squeezefs::meta_ship::publish;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, _dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let w = FreeWire::stand_up(dir.path(), &uris, 83).await;
+    let (off, idx) = w.displaced_block("fenced.bin").await;
+    let stale0 = publish::stats().free_stale_refusals;
+    let served0 = publish::stats().free_served_blocks;
+    let replays0 = publish::stats().free_replays;
+    // The holder revokes the joiner (the eviction / lease-loss shape).
+    w.venue
+        .owner
+        .revoke_client(&w.client_id, "test: revoked mid-free");
+    let err = w
+        .ship(vec![idx], 7)
+        .await
+        .expect_err("a free under a dead lease epoch is refused by era");
+    // The era refusal surfaces in the FENCE class at the shipper (finding
+    // #6's law at the publish round trip); on a JOINER no set-authority
+    // client stands to compose the whole-mount fence from it — its
+    // per-holder lease's death reaches it as the `unknown lease` word at
+    // its next renewal (PR 9's scoped fence, the record's §4.4bc) — so the
+    // process custody is NOT poisoned here.
+    assert!(
+        matches!(err, squeezefs::error::SqueezefsError::WriterGuardFenced),
+        "the era refusal surfaces in the fence class: {err}"
+    );
+    assert!(
+        !squeezefs::data_custody::poisoned(),
+        "a joiner's process custody is never poisoned by a per-holder era refusal"
+    );
+    let s = publish::stats();
+    assert_eq!(s.free_stale_refusals - stale0, 1, "free_stale_refusals");
+    assert_eq!(s.free_served_blocks - served0, 0, "nothing freed");
+    assert_eq!(
+        s.free_replays - replays0,
+        0,
+        "the era gate runs BEFORE the window"
+    );
+    w.br.reclaim_drain().await;
+    assert_eq!(
+        w.alloc.refcount(off),
+        Some(1),
+        "the holder's tracking is untouched — the leak-safe direction"
+    );
+    assert!(w.bit_set(idx), "the block's bit stays SET");
+    w.tear_down().await;
+}
+
+/// **The ledger-justified refusal** (finding 23's SHIELD): a shipped free
+/// naming a block whose every RAM reference the durable ledger still
+/// justifies (`population ≥ refcount` — no displacing release landed) is
+/// a stale duplicate of a DEAD lifetime of a freed-and-reallocated offset
+/// (the wire carries indices, no incarnation witness): the executor
+/// answers `Refused` (`block_live_free_refusals` +1, `free_refused_blocks`
+/// +1) and the live block is untouched — its reference and its bit stand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shipped_free_the_durable_ledger_still_justifies_is_refused() {
+    use squeezefs::fuse_client::METRICS;
+    use squeezefs::meta_ship::publish::{self, FreeVerdict};
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, _dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let w = FreeWire::stand_up(dir.path(), &uris, 84).await;
+    // Referenced, NOT displaced: the ledger justifies the RAM reference.
+    let (off, idx, _ino) = w.referenced_block("live.bin").await;
+    let live0 = METRICS.block_live_free_refusals.load(Relaxed);
+    let refused0 = publish::stats().free_refused_blocks;
+    let served0 = publish::stats().free_served_blocks;
+    let verdicts = w
+        .ship(vec![idx], 11)
+        .await
+        .expect("the verb is served — its VERDICT is the refusal");
+    assert_eq!(verdicts, vec![FreeVerdict::Refused]);
+    assert_eq!(
+        METRICS.block_live_free_refusals.load(Relaxed) - live0,
+        1,
+        "block_live_free_refusals"
+    );
+    let s = publish::stats();
+    assert_eq!(s.free_refused_blocks - refused0, 1, "free_refused_blocks");
+    assert_eq!(s.free_served_blocks - served0, 0);
+    w.br.reclaim_drain().await;
+    assert_eq!(w.alloc.refcount(off), Some(1), "the live reference stands");
+    assert!(w.bit_set(idx), "the live block's bit stands");
+    w.tear_down().await;
 }

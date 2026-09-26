@@ -701,6 +701,75 @@ async fn a_clean_flat_unmount_leaves_no_claimed_extent_its_roots_do_not_reach() 
     assert_eq!(claimed, reachable + 1);
 }
 
+/// **The half-converted set's PLAIN writer door names the marker's remedy**
+/// (PR 14 review fix round 1, Issue 6). A volume still flat under its
+/// `sym_upgrade:` marker (an interrupted `enable-symmetric`) is the
+/// pre-flip multi-writer class, and the flip's presence-required door
+/// refused it first — "run `squeezefs volume enable-symmetric`" — which
+/// the verb then refused in turn ("a marker without `--resume` /
+/// `--abort`"): two hops, nothing written, the operator sent the wrong
+/// way. The plain door (no admission, the mount's) reads the marker on
+/// its refusal path and names `--resume` / `--abort`; the conversion's
+/// own door and a probe are untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_half_converted_volumes_plain_writer_door_names_the_resume_not_the_conversions_first_run()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let (uris, _digests, _pop) = populated_flat_set(dir.path(), 2, 20).await;
+    let hooks = EnableSymHooks {
+        crash_after: Some(EnableSymCrash::AfterMarker),
+    };
+    enable_symmetric_with(&uris, &EnableSymOptions::default(), &hooks)
+        .await
+        .expect_err("the injected crash aborts the verb");
+    assert!(marker_present(&uris[0]).await && marker_present(&uris[1]).await);
+    assert!(
+        !is_symmetric(&superblock_of(&uris[0]).await),
+        "still flat under the marker"
+    );
+    // The PLAIN single-volume door.
+    let err = KvMetaBackend::open(Path::new(&uris[0]))
+        .await
+        .err()
+        .expect("a half-converted volume refuses the plain writer door");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--resume") && msg.contains("--abort"),
+        "the plain door names the marker's remedy, not the conversion's first run: {msg}"
+    );
+    assert!(
+        msg.contains(&uris[0]),
+        "the refusal names the volume: {msg}"
+    );
+    // The PLAIN routed door — the mount's.
+    let err = open_routed_meta_set(&uris)
+        .await
+        .err()
+        .expect("the routed writer door refuses too");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--resume") && msg.contains("--abort"),
+        "the routed door names the marker's remedy: {msg}"
+    );
+    // A probe and the conversion's own door still read the volume.
+    assert!(marker_present(&uris[0]).await);
+    let report = enable_symmetric(
+        &uris,
+        &EnableSymOptions {
+            resume: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the resume completes the conversion");
+    assert_eq!(report.rows[0].outcome, ConversionOutcome::Resumed);
+    assert!(!marker_present(&uris[0]).await);
+    let routed = open_routed_meta_set(&uris).await.expect("forest mount");
+    for v in &routed.volumes {
+        v.shutdown().await.expect("clean shutdown");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The crash-window matrix.
 // ---------------------------------------------------------------------------

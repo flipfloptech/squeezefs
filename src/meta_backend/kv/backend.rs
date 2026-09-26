@@ -271,6 +271,39 @@ pub fn admit_pre_flip_writers() -> PreFlipAdmission {
     PreFlipAdmission(())
 }
 
+/// The presence-required door's refusal (PR 14, design-symmetric-metadata
+/// §7.2): a multi-writer-class volume without bit 17 is a pre-flip default
+/// format that converts offline and never mounts writable. `marker` is
+/// the volume's `sym_upgrade:` word when the plain writer door read one
+/// (review fix round 1, Issue 6 — the HALF-CONVERTED face): an
+/// interrupted `enable-symmetric` left the volume flat under its marker,
+/// and the remedy is the verb's `--resume` / `--abort`, never its first
+/// run (which refuses a marker without either).
+fn presence_required_refusal(path: &Path, marker: Option<&str>) -> KvError {
+    match marker {
+        Some(named) => KvError::Corrupt(format!(
+            "{}: not symmetric-forest capable (incompat bit 17 absent) AND a symmetric-forest \
+             conversion marker (`{}`) stands on it {named} — a `squeezefs volume \
+             enable-symmetric` run crashed mid-conversion with this volume still flat. Re-run \
+             `squeezefs volume enable-symmetric <sqmeta-uri> --resume` (idempotent, continues \
+             from the crash point) or `--abort` (undoes the crashed run on every volume still \
+             flat); a plain re-run refuses the marker, and a writable mount of this class is \
+             presence-required on the forest. Read-only mounts, probes and fsck read it as \
+             before",
+            path.display(),
+            crate::SYM_UPGRADE_MARKER_XATTR
+        )),
+        None => KvError::Corrupt(format!(
+            "{}: not symmetric-forest capable (incompat bit 17 absent) — a multi-writer-class \
+             volume formatted before the symmetric default flip (PR 14). Run `squeezefs volume \
+             enable-symmetric <sqmeta-uri>` offline (design-symmetric-metadata §7.2), or \
+             `format --force` a fresh set; a writable mount of this class is presence-required \
+             on the forest. Read-only mounts, probes and fsck read it as before",
+            path.display()
+        )),
+    }
+}
+
 /// Test seam (design-symmetric-metadata PR 1, review Issue 4): make the
 /// next N tree-0 root publications answer `JournalReserveExhausted` —
 /// the deferral arm a full checkpoint reserve produces — so a suite can
@@ -1895,7 +1928,8 @@ impl KvMetaBackend {
                      (`{}`) is present on this volume {named}: a `squeezefs volume \
                      enable-symmetric` run crashed mid-conversion. Re-run `squeezefs volume \
                      enable-symmetric <sqmeta-uri> --resume` (idempotent, continues from \
-                     the crash point); read-only mounts keep serving",
+                     the crash point) or `--abort` (undoes the crashed run on every volume \
+                     still flat); read-only mounts keep serving",
                     path.display(),
                     crate::SYM_UPGRADE_MARKER_XATTR
                 )))
@@ -1987,6 +2021,36 @@ impl KvMetaBackend {
             );
         }
 
+        // (1c) The presence-required door's HALF-CONVERTED face (PR 14
+        // review fix round 1, Issue 6): a pre-flip multi-writer-class
+        // volume that `open_inner` would refuse below is read ONCE through
+        // a probe for its `sym_upgrade:` marker — an interrupted
+        // conversion's volume, still flat — so the refusal names the
+        // marker's remedy (`--resume` / `--abort`) instead of the
+        // conversion's first run, which refuses a marker in turn. The
+        // refusal path alone pays the probe's bootstrap; the conversion's
+        // own door (`tolerate_sym_upgrade`) and the process-scoped
+        // admission take the class as before.
+        if !tolerate_sym_upgrade && PRE_FLIP_WRITERS_ADMITTED.load(Ordering::Acquire) == 0 {
+            if let VolumeFormat::V3(sb) = classify_volume(path).await? {
+                if sb.multi_writer_class() && !sb.symmetric_forest_stamped() {
+                    let marker = match Self::open_probe(path).await {
+                        Ok(probe) => match probe.getxattr(1, crate::SYM_UPGRADE_MARKER_XATTR).await
+                        {
+                            Ok(Some(raw)) => {
+                                Some(match crate::config_ops::SymUpgradeMarker::decode(&raw) {
+                                    Ok(m) => format!("(covering volumes {:?})", m.volumes),
+                                    Err(e) => format!("(marker undecodable: {e})"),
+                                })
+                            }
+                            _ => None,
+                        },
+                        Err(_) => None,
+                    };
+                    return Err(presence_required_refusal(path, marker.as_deref()));
+                }
+            }
+        }
         // (2) Bootstrap replay (sets `boot_id` — shared with probes).
         let mut inner =
             Self::open_inner(path, OpenPosture::Writer, None, tolerate_sym_upgrade).await?;
@@ -2279,15 +2343,10 @@ impl KvMetaBackend {
             let pre_flip_admitted =
                 admit_pre_flip || PRE_FLIP_WRITERS_ADMITTED.load(Ordering::Acquire) > 0;
             if sb.multi_writer_class() && !sb.symmetric_forest_stamped() && !pre_flip_admitted {
-                return Err(KvError::Corrupt(format!(
-                    "{}: not symmetric-forest capable (incompat bit 17 absent) — a multi-writer-\
-                     class volume formatted before the symmetric default flip (PR 14). Run \
-                     `squeezefs volume enable-symmetric <sqmeta-uri>` offline (design-symmetric-\
-                     metadata §7.2), or `format --force` a fresh set; a writable mount of this \
-                     class is presence-required on the forest. Read-only mounts, probes and \
-                     fsck read it as before",
-                    path.display()
-                )));
+                // The plain writer door's marker read ran in `open_writer`
+                // (the half-converted face); a door reaching this line
+                // states the class alone.
+                return Err(presence_required_refusal(path, None));
             }
             if sb.symmetric_forest_stamped() && !super::slot_lease::symmetric_meta_requested() {
                 return Err(KvError::Corrupt(format!(

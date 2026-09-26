@@ -81,6 +81,18 @@ mount is a read-token client whose metadata is exact at the next resolve
   frame writer now (`sym_coherence_tests::a_writer_recovering_an_exhausted_
   ring_inside_its_gate_stamps_the_leases_generation`; the soak green ×5 from
   zero). A `--single-writer` volume has no fence and is untouched.
+- **`df` on an armed writer never recovered after deletes, fixed red-first
+  (the acceptance record's §4.4ay):** the allocator's used count was the
+  single-writer arithmetic `highest − free_list`, and on a grant-armed
+  allocator the bitmap IS the free list — a terminal free clears its bit
+  and never enters the local list — so `statfs`'s used, the placement
+  table's fill ratio and a drain's capacity preflight only ever grew.
+  A mount holding the volume's allocation lease (every solo default
+  mount, the manager of a set) reads its bitmap's population minus its
+  own unconsumed grant window now; other writers' open windows count as
+  reserved. A JOINED writer's `df` still reads its own arithmetic (the
+  holder's population does not yet travel on the grant reply — a 1.3.x
+  item); `--single-writer` volumes are untouched.
 - **The flip lands after the owner's cloud decision**: the box brackets of
   every design §8 gate on the flip binary and the two-host / cloud rows are
   what that decision reads (the record

@@ -10,9 +10,10 @@
 //!
 //! Mount-class: self-skips through the testkit where a mount is not
 //! possible and rides the require-mount gate. Layout-blind like its
-//! in-process sibling: the source is formatted through the plain `format`
-//! verb (no seam is read by the binary's format arm), the verb is what
-//! stamps.
+//! in-process sibling: the source is formatted `--single-writer` through
+//! the binary (the ONE flat writable class since the PR-14 flip; no seam
+//! is read by the binary's format arm), and the two operator verbs —
+//! `enable-multi-writer`, then `enable-symmetric` — are what stamp.
 
 use squeezefs_testkit::{mount_supported, site};
 use std::io::Write as _;
@@ -78,8 +79,8 @@ fn format_flat(base: &Path, staging: &Path) -> PathBuf {
         .set_len(2 * 1024 * 1024 * 1024)
         .expect("size data file");
     std::fs::create_dir_all(staging).expect("create staging dir");
-    // The binary's format arm reads the seam: clear it so the source is
-    // FLAT whichever leg of the matrix runs this suite (the verb stamps).
+    // `--single-writer`: the flat source whichever leg of the matrix runs
+    // this suite (the verbs stamp).
     run_ok(
         Command::new(bin())
             .arg("format")
@@ -344,7 +345,20 @@ fn a_populated_flat_set_converts_and_reads_back_byte_exact_through_a_forest_moun
     );
     writer.umount_clean();
 
-    // The conversion, through the binary. A dry run first, writing nothing.
+    // The conversion, through the binary — the operator's two verbs on a
+    // `--single-writer` volume (the ONE flat writable class since the
+    // flip; a pre-1.3.0 default volume already carries the nine
+    // multi-writer bits and skips the first): `enable-multi-writer`
+    // stamps the nine bits the forest presumes (design §6.2, the join
+    // ladder's rung 2), then `enable-symmetric` — a dry run first, writing
+    // nothing.
+    run_ok(
+        Command::new(bin())
+            .arg("volume")
+            .arg("enable-multi-writer")
+            .arg(format!("sqmeta://{}", meta.display())),
+        "squeezefs volume enable-multi-writer",
+    );
     let dry = run_ok(
         Command::new(bin())
             .arg("volume")

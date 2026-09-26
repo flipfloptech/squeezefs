@@ -2749,7 +2749,27 @@ impl BlockAllocator {
         })
     }
 
+    /// Blocks in use on this data volume — `statfs`, the placement table's
+    /// fill, the drain preflight's `avail`. On a grant-armed allocator
+    /// whose allocation lease THIS process holds, the bitmap IS the free
+    /// list (PR 8: a terminal free clears its bit and never enters the
+    /// local list), so used = the bitmap's population — every referenced
+    /// block plus every open grant, the other writers' windows counted as
+    /// reserved — minus this writer's own unconsumed window. The
+    /// `--single-writer` arithmetic (`highest − free_list`) read a used
+    /// count that only ever GREW on every armed default mount (PR 14:
+    /// `df` never recovering after deletes). A grant-armed NON-holder (a
+    /// joined writer) keeps the arithmetic: its truth is at the holder,
+    /// carried by no word it reads yet.
     pub fn get_used_blocks(&self) -> u64 {
+        if let Some(vol_tag) = self.block_grant_vol_tag() {
+            if let Some(h) = crate::meta_backend::kv::alloc_lease::holding(vol_tag) {
+                return h
+                    .bitmap
+                    .population()
+                    .saturating_sub(self.block_grant_remaining());
+            }
+        }
         let highest = self.highest_block.load(Ordering::Relaxed);
         let free = self.free_blocks.len() as u64;
         highest.saturating_sub(free)

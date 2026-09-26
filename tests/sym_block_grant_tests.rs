@@ -1680,6 +1680,86 @@ async fn an_armed_holders_supply_terms_read_the_window_and_the_clear_population(
     reset_process_state();
 }
 
+/// **An armed holder's USED count follows the bitmap** (PR 14 — found by
+/// the require-mount gate on the flipped default: `statfs_tests` read
+/// `df`'s free never recovering after delete + reclaim, `pack_compaction_
+/// tests` read 50 used chunks after 24 legacy blocks were compacted into
+/// packs). `BlockAllocator::get_used_blocks` was the `--single-writer`
+/// arithmetic `highest − free_list.len()`: on a grant-armed allocator the
+/// bitmap IS the free list — a terminal free clears its bit and never
+/// enters the local list (PR 8) — so every default mount's `df`, the
+/// placement table's fill ratio and the drain preflight's `avail` read a
+/// used count that only ever GREW. Now a holder's used count is its
+/// bitmap's population (referenced blocks ∪ every open grant, the other
+/// writers' windows counted as reserved) minus its OWN unconsumed window;
+/// the unarmed allocator keeps the shipped arithmetic byte-identically.
+/// RED on the first build at the frees: used stayed at the whole volume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_armed_holders_used_count_follows_its_bitmap_not_the_single_writer_arithmetic() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set(dir.path(), 1).await;
+    let routed = open_armed(&uris).await;
+    let a = data_allocator(DATA_ID).await;
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&routed, &[Arc::clone(&a)])
+            .await
+            .unwrap(),
+        1
+    );
+    let holding = alloc_lease::holding(DATA_TAG).expect("held");
+    // A fresh armed volume: nothing referenced, the window's blocks are
+    // granted but unconsumed — used reads 0 (the window is reserved for
+    // THIS writer, not spent).
+    assert_eq!(
+        a.get_used_blocks(),
+        0,
+        "a fresh armed volume has nothing used"
+    );
+    // Mint the whole volume through grants.
+    let mut minted = Vec::with_capacity(DATA_BLOCKS as usize);
+    for _ in 0..DATA_BLOCKS {
+        minted.push(a.allocate_block().await.unwrap());
+    }
+    assert_eq!(holding.bitmap.population(), DATA_BLOCKS);
+    assert_eq!(
+        a.get_used_blocks(),
+        DATA_BLOCKS,
+        "every block minted is used"
+    );
+    // 100 terminal frees: the bits clear at the holder — and used FALLS
+    // by them, with the freed holes the next carve re-grants counted as
+    // the window's (reserved, not used) once a top-up lands.
+    for off in &minted[..100] {
+        assert!(a.begin_free(*off));
+        a.finish_free(*off);
+    }
+    wait_until("the proactive top-up has landed", || {
+        !a.block_grant_topup_inflight()
+    })
+    .await;
+    assert_eq!(
+        a.free_blocks_count(),
+        0,
+        "the flat list never sees a grant-armed free"
+    );
+    assert_eq!(
+        a.get_used_blocks(),
+        DATA_BLOCKS - 100,
+        "used follows the bitmap: {} set, {} in this writer's window",
+        holding.bitmap.population(),
+        a.block_grant_remaining()
+    );
+    assert_eq!(
+        a.get_used_blocks() + a.free_supply_blocks(),
+        DATA_BLOCKS,
+        "used + the reachable supply is the volume"
+    );
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
 /// PR 12b review round 3, Issue 30 — PR 3's bounded-execution law on the
 /// NEW wire word: a peer's declared block-grant window (`WindowDecl`, on
 /// its membership renewal) is judged against the volume's DURABLE block

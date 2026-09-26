@@ -1821,8 +1821,34 @@ fn file_len(idx: usize) -> usize {
     SIZES_KIB[idx % SIZES_KIB.len()] * KIB
 }
 
+/// The legacy population's directory: GATHERED (symmetric PR 7,
+/// KD-SYM-17 — `setfattr -n user.squeezefs.gather -v 1`), so every tenant
+/// mints into ITS slot: under the armed default (PR 14) a pack is scoped
+/// per `(writer, slot, data volume)` (PR 7's law 1) and the compaction
+/// re-packs each tenant into ITS slot's pack — 24 tenants the rotor spread
+/// over 24 slots would compact into 24 packs; one slot, ONE pack, the
+/// contract's law. A flat volume accepts the name and packs as before.
+const LEGACY_DIR: &str = "legacy";
+
 fn file_name(idx: usize) -> String {
-    format!("legacy_{idx:04}.bin")
+    format!("{LEGACY_DIR}/legacy_{idx:04}.bin")
+}
+
+fn mkdir_gather(mnt: &Path, dir: &str) {
+    let d = mnt.join(dir);
+    std::fs::create_dir(&d).unwrap_or_else(|e| panic!("mkdir {}: {e}", d.display()));
+    let c = std::ffi::CString::new(d.to_str().unwrap()).unwrap();
+    let name = std::ffi::CString::new(squeezefs::GATHER_XATTR).unwrap();
+    // SAFETY: both strings are NUL-terminated for the call's duration; the
+    // value pointer/length name a live byte slice.
+    let rc = unsafe { libc::setxattr(c.as_ptr(), name.as_ptr(), b"1".as_ptr().cast(), 1, 0) };
+    assert_eq!(
+        rc,
+        0,
+        "setxattr gather on {}: {}",
+        d.display(),
+        std::io::Error::last_os_error()
+    );
 }
 
 fn population_bytes() -> u64 {
@@ -2083,6 +2109,7 @@ fn syncfs(mnt: &Path) {
 /// Write the population (open → write → close, no fsync) and wait for it
 /// to settle as N staged-layout files with no active-block custody.
 fn populate_staged_files(mnt: &Path) {
+    mkdir_gather(mnt, LEGACY_DIR);
     for idx in 0..FILES {
         write_close(&mnt.join(file_name(idx)), &pattern(idx, file_len(idx)));
     }

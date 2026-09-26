@@ -476,6 +476,13 @@ impl MemlockPosture {
     }
 }
 
+/// The bytes of kernel-managed payload buffers this PROCESS has pinned
+/// through `IORING_REGISTER_KMBUF_RING` — Σ over every live [`KmbufQueue`]
+/// the kernel path registered (a `sim_anon` queue pins nothing). The
+/// memlock note's cumulative term: `RLIMIT_MEMLOCK` binds the process's
+/// pins, not a queue's.
+static KMBUF_PINNED_BYTES: AtomicU64 = AtomicU64::new(0);
+
 /// The kmbuf registration's `ENOMEM` on exhaustion, EXPLAINED (PR 14 —
 /// the fresh-install finding): `IORING_REGISTER_KMBUF_RING` pins
 /// `entries × buf_size` per queue, one queue per possible CPU, and an
@@ -483,28 +490,60 @@ impl MemlockPosture {
 /// most distributions — 32 × 1 MiB refuses at the FIRST queue). The
 /// daemon already refuses loud within the retry budget; this names the
 /// limit and the three places to raise it, so the operator reads a
-/// prerequisite instead of a memory error. `None` when the limit cannot
-/// explain the refusal (root / `CAP_IPC_LOCK`, an unlimited limit, or a
-/// pin inside the limit — a genuine allocation failure). Pure over the
-/// injected posture (`test_memlock_refusal_names_the_limit_and_remedy`).
-pub fn memlock_refusal_note(pinned_bytes: u64, posture: MemlockPosture) -> Option<String> {
+/// prerequisite instead of a memory error. **The limit binds the
+/// process's CUMULATIVE pins** (review fix round 1, Issue 4): `already`
+/// is what the queues registered before this one pin, and the comparison
+/// is `already + this_queue` against the limit — a 512 MiB limit on a
+/// 32-queue box registers 16 queues and refuses the 17th, whose own pin
+/// is inside the limit; the note names the queue's ordinal, the pins
+/// before it and the total the registration would reach. `None` when the
+/// limit cannot explain the refusal (root / `CAP_IPC_LOCK`, an unlimited
+/// limit, or a cumulative pin inside the limit — a genuine allocation
+/// failure). Pure over the injected posture
+/// (`test_memlock_refusal_names_the_limit_and_remedy`,
+/// `test_memlock_refusal_attributes_the_nth_queue_against_the_cumulative_pin`).
+pub fn memlock_refusal_note(
+    already: u64,
+    this_queue: u64,
+    posture: MemlockPosture,
+) -> Option<String> {
     if posture.exempt {
         return None;
     }
     let soft = posture.soft_limit_bytes?;
-    if pinned_bytes <= soft {
+    let total = already.saturating_add(this_queue);
+    if total <= soft {
         return None;
     }
     let mib = |b: u64| b.div_ceil(1024 * 1024);
+    let which = if already == 0 {
+        "the FIRST queue".to_string()
+    } else {
+        let n = already.div_ceil(this_queue.max(1)) + 1;
+        let suffix = match (n % 10, n % 100) {
+            (1, c) if c != 11 => "st",
+            (2, c) if c != 12 => "nd",
+            (3, c) if c != 13 => "rd",
+            _ => "th",
+        };
+        format!(
+            "the {n}{suffix} queue — the queues registered before it already pin {} MiB, so \
+             this registration would take the daemon to {} MiB",
+            mib(already),
+            mib(total)
+        )
+    };
     Some(format!(
         "this queue pins {} MiB of kernel-managed payload buffers (entries × buf_size) and the \
-         daemon's RLIMIT_MEMLOCK soft limit is {} MiB — an unprivileged daemon cannot pin past \
-         it (root or CAP_IPC_LOCK is exempt). FUSE-over-io_uring needs every queue's pin (one \
-         queue per possible CPU): raise the limit before mounting — `ulimit -l unlimited` in \
-         the mounting shell, `<user> - memlock unlimited` in /etc/security/limits.d/, or \
-         `DefaultLimitMEMLOCK=infinity` in /etc/systemd/{{system,user}}.conf.d/ (new sessions \
-         only) — docs/operations.md §Prerequisites",
-        mib(pinned_bytes),
+         daemon's RLIMIT_MEMLOCK soft limit is {} MiB, which binds the process's CUMULATIVE \
+         pins — this is {which}; an unprivileged daemon cannot pin past the limit (root or \
+         CAP_IPC_LOCK is exempt). FUSE-over-io_uring needs every queue's pin (one queue per \
+         possible CPU — the whole mount needs queues × entries × buf_size): raise the limit \
+         before mounting — `ulimit -l unlimited` in the mounting shell, `<user> - memlock \
+         unlimited` in /etc/security/limits.d/, or `DefaultLimitMEMLOCK=infinity` in \
+         /etc/systemd/{{system,user}}.conf.d/ (new sessions only) — docs/operations.md \
+         §Prerequisites",
+        mib(this_queue),
         mib(soft)
     ))
 }
@@ -1180,6 +1219,10 @@ pub struct KmbufQueue {
     /// queue worker at delivery, read by `get_payload_buffer` (handler
     /// tasks) — release/acquire pairs with the inbound-queue handoff.
     attached: Vec<AtomicU64>,
+    /// What this queue's registration added to [`KMBUF_PINNED_BYTES`]
+    /// (`entries × buf_size` on the kernel path, 0 for a `sim_anon` queue)
+    /// — subtracted at drop.
+    pinned_bytes: u64,
 }
 
 // SAFETY: raw region pointers are plain integers here; access discipline
@@ -1299,6 +1342,11 @@ impl KmbufQueue {
             ring_entries,
             FUSE_URING_RINGBUF_GROUP,
         );
+        let this_pin = u64::from(ring_entries) * payload_sz as u64;
+        // The process's pins BEFORE this registration — the memlock
+        // note's cumulative term (the limit binds the process, not a
+        // queue).
+        let already_pinned = KMBUF_PINNED_BYTES.load(Ordering::Acquire);
         // The registration allocates `entries × buf_size` of
         // kernel-managed memory in one call — transiently refusable
         // under page-cache churn even with ample `available` RAM, so
@@ -1325,11 +1373,8 @@ impl KmbufQueue {
             // SAFETY: error-path unmap of our own mapping.
             unsafe { libc::munmap(headers_base as *mut libc::c_void, headers_span) };
             let memlock = if e.raw_os_error() == Some(libc::ENOMEM) {
-                memlock_refusal_note(
-                    u64::from(ring_entries) * payload_sz as u64,
-                    MemlockPosture::of_process(),
-                )
-                .map_or_else(String::new, |n| format!(" — {n}"))
+                memlock_refusal_note(already_pinned, this_pin, MemlockPosture::of_process())
+                    .map_or_else(String::new, |n| format!(" — {n}"))
             } else {
                 String::new()
             };
@@ -1365,6 +1410,7 @@ impl KmbufQueue {
             )));
         }
 
+        KMBUF_PINNED_BYTES.fetch_add(this_pin, Ordering::AcqRel);
         Ok(Self {
             headers_base,
             headers_span,
@@ -1373,6 +1419,7 @@ impl KmbufQueue {
             buf_size: payload_sz,
             ring_entries,
             attached: (0..depth).map(|_| AtomicU64::new(NO_BUF)).collect(),
+            pinned_bytes: this_pin,
         })
     }
 
@@ -1438,6 +1485,7 @@ impl KmbufQueue {
             buf_size: payload_sz,
             ring_entries,
             attached: (0..depth).map(|_| AtomicU64::new(NO_BUF)).collect(),
+            pinned_bytes: 0,
         })
     }
 
@@ -1520,6 +1568,7 @@ impl Drop for KmbufQueue {
             libc::munmap(self.region_base as *mut libc::c_void, self.region_span);
             libc::munmap(self.headers_base as *mut libc::c_void, self.headers_span);
         }
+        KMBUF_PINNED_BYTES.fetch_sub(self.pinned_bytes, Ordering::AcqRel);
     }
 }
 
@@ -1618,6 +1667,7 @@ mod tests {
             buf_size: 4096,
             ring_entries: 8,
             attached: (0..4).map(|_| AtomicU64::new(NO_BUF)).collect(),
+            pinned_bytes: 0,
         };
         assert_eq!(q.header_ptr(0) as usize, 0x10_0000);
         assert_eq!(q.header_ptr(3) as usize, 0x10_0000 + 3 * REQ_HEADER_SZ);
@@ -2027,7 +2077,7 @@ mod tests {
             soft_limit_bytes: Some(8 * mib),
             exempt: false,
         };
-        let note = memlock_refusal_note(queue, unprivileged_8mib)
+        let note = memlock_refusal_note(0, queue, unprivileged_8mib)
             .expect("32 MiB pinned against an 8 MiB limit is the finding");
         assert!(note.contains("32 MiB"), "{note}");
         assert!(note.contains("8 MiB"), "{note}");
@@ -2036,8 +2086,13 @@ mod tests {
         assert!(note.contains("limits.d"), "{note}");
         assert!(note.contains("DefaultLimitMEMLOCK"), "{note}");
         assert!(note.contains("CAP_IPC_LOCK"), "{note}");
+        assert!(
+            note.contains("FIRST queue"),
+            "the first queue's refusal says so: {note}"
+        );
         // Exempt (root / CAP_IPC_LOCK): the limit does not bind.
         assert!(memlock_refusal_note(
+            0,
             queue,
             MemlockPosture {
                 soft_limit_bytes: Some(8 * mib),
@@ -2047,6 +2102,7 @@ mod tests {
         .is_none());
         // Unlimited: not the explanation.
         assert!(memlock_refusal_note(
+            0,
             queue,
             MemlockPosture {
                 soft_limit_bytes: None,
@@ -2056,6 +2112,7 @@ mod tests {
         .is_none());
         // A pin inside the limit: a genuine allocation failure.
         assert!(memlock_refusal_note(
+            0,
             queue,
             MemlockPosture {
                 soft_limit_bytes: Some(64 * mib),
@@ -2065,6 +2122,7 @@ mod tests {
         .is_none());
         assert!(
             memlock_refusal_note(
+                0,
                 queue,
                 MemlockPosture {
                     soft_limit_bytes: Some(queue),
@@ -2076,6 +2134,54 @@ mod tests {
         );
         // The process posture reads without panicking on any host.
         let _ = MemlockPosture::of_process();
+    }
+
+    /// **The limit binds the process's CUMULATIVE pins** (PR 14 review fix
+    /// round 1, Issue 4): with a limit raised to 512 MiB on a 32-queue box
+    /// the first 16 queues (16 × 32 MiB) register and the 17th refuses
+    /// `ENOMEM` — its OWN pin (32 MiB) is inside the limit, so a per-queue
+    /// comparison read it as a genuine allocation failure and the docs'
+    /// derived table (`queues × entries × buf_size`) was exactly what the
+    /// note failed to apply. The note compares `already + this` against
+    /// the limit and names the queue's ordinal, the pins before it and
+    /// the total the registration would reach.
+    #[test]
+    fn test_memlock_refusal_attributes_the_nth_queue_against_the_cumulative_pin() {
+        let mib = 1024 * 1024u64;
+        let queue = 32 * mib;
+        let limit_512 = MemlockPosture {
+            soft_limit_bytes: Some(512 * mib),
+            exempt: false,
+        };
+        // Sixteen queues already pinned: 512 MiB exactly — the 17th is
+        // what the limit refuses.
+        let note = memlock_refusal_note(16 * queue, queue, limit_512)
+            .expect("the 17th queue's 32 MiB pushes the process past 512 MiB");
+        assert!(note.contains("17th queue"), "the ordinal: {note}");
+        assert!(
+            note.contains("512 MiB"),
+            "the pins before it / the limit: {note}"
+        );
+        assert!(
+            note.contains("544 MiB"),
+            "the total the registration would reach: {note}"
+        );
+        assert!(note.contains("32 MiB"), "this queue's own pin: {note}");
+        assert!(!note.contains("FIRST queue"), "{note}");
+        assert!(note.contains("ulimit -l"), "{note}");
+        // Fifteen already: the 16th fits exactly — a genuine allocation
+        // failure, no note.
+        assert!(memlock_refusal_note(15 * queue, queue, limit_512).is_none());
+        // Exempt: the cumulative pin never binds either.
+        assert!(memlock_refusal_note(
+            16 * queue,
+            queue,
+            MemlockPosture {
+                soft_limit_bytes: Some(512 * mib),
+                exempt: true,
+            }
+        )
+        .is_none());
     }
 
     /// The register-retry policy over injected outcomes (the 2026-08-10

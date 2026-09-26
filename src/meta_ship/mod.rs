@@ -393,8 +393,6 @@ pub(crate) static STALE_TERM_REFUSALS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static ERA_RELEARNS: AtomicU64 = AtomicU64::new(0);
 /// Frames refused because this node holds no authority over a target.
 pub(crate) static NOT_OWNER_REFUSALS: AtomicU64 = AtomicU64::new(0);
-/// Verbs refused because their participants span two owners (S3.5).
-pub(crate) static CROSS_OWNER_REFUSALS: AtomicU64 = AtomicU64::new(0);
 /// Reclaims admitted (spec §6.9's `dlm_grace_reclaims`).
 pub(crate) static GRACE_RECLAIMS: AtomicU64 = AtomicU64::new(0);
 /// Fresh mutations refused inside a grace window (spec §6.9's
@@ -417,31 +415,6 @@ static OWNER_DISPATCH_INLINE: AtomicU64 = AtomicU64::new(0);
 /// Owner-side dispatches that HOPPED onto the shared `sqz-meta` lanes and
 /// were joined from the connection thread (the shipped default).
 static OWNER_DISPATCH_HOPS: AtomicU64 = AtomicU64::new(0);
-/// Volume ownership records WRITTEN by the offline `volume set-owners`
-/// verb (§11.1). 0 on every mount by construction — a mount never
-/// assigns; only the verb's own process moves this.
-static OWNER_ASSIGNMENTS: AtomicU64 = AtomicU64::new(0);
-/// `volume set-owners` invocations refused, each naming its cause.
-static OWNER_ASSIGN_REFUSALS: AtomicU64 = AtomicU64::new(0);
-/// KD-PV-15's ledger: subtree roots the verb minted. `0` beside a nonzero
-/// `volumes_owned` on a peer is the Issue-23 shape (risk R16) — a node
-/// owning a volume but no work.
-static SUBTREE_ROOTS_MINTED: AtomicU64 = AtomicU64::new(0);
-
-/// One volume's ownership record was written by the assignment verb.
-pub fn note_owner_assignment() {
-    OWNER_ASSIGNMENTS.fetch_add(1, Ordering::Relaxed);
-}
-
-/// One `volume set-owners` invocation was refused.
-pub fn note_owner_assign_refusal() {
-    OWNER_ASSIGN_REFUSALS.fetch_add(1, Ordering::Relaxed);
-}
-
-/// One subtree root was minted (KD-PV-15).
-pub fn note_subtree_root_minted() {
-    SUBTREE_ROOTS_MINTED.fetch_add(1, Ordering::Relaxed);
-}
 
 /// The shipped-vs-local ledger, the pipelining factor, the idempotency
 /// window and the failover ledger — one snapshot.
@@ -461,29 +434,11 @@ pub struct ShipStatsSnapshot {
     pub stale_term_refusals: u64,
     pub era_relearns: u64,
     pub not_owner_refusals: u64,
-    pub cross_owner_refusals: u64,
     pub grace_reclaims: u64,
     pub grace_conflicts: u64,
     pub owner_panics: u64,
     pub dlm_rpcs_meta: u64,
     pub mint_redirects: u64,
-    /// GAUGE (**must stay 0**): volumes whose ownership entry the runtime
-    /// re-derivation POISONED — §5.10's fail-closed law engaging.
-    pub owner_map_poisoned_volumes: u64,
-    /// GAUGE, **not a tripwire and not a liveness monitor**: peer-owned
-    /// volumes that had NO appender when this mount DERIVED its map —
-    /// owners that had not started yet (a cold fleet) or were down.
-    /// `volumes_peer_owned` minus this is how many of the set's other
-    /// owners were present at that instant; the set authority mounts
-    /// first by the documented order, so it reports `K − 1` for the life
-    /// of the mount. `squeezefs volume get-owners` is the live instrument.
-    pub volumes_peer_unclaimed: u64,
-    /// The `volume set-owners` ledger (§11.1) — volume records written,
-    /// invocations refused, and KD-PV-15 roots minted. All three are 0 on
-    /// every mount: the verb is an offline process of its own.
-    pub owner_assignments: u64,
-    pub owner_assign_refusals: u64,
-    pub subtree_roots_minted: u64,
     /// D-5: owner-side dispatches (S8 frames, S9 publish calls / groups /
     /// frees / harvests) executed on the accepting connection's thread vs
     /// hopped onto the `sqz-meta` lanes. `inline + hops` ≡
@@ -509,17 +464,11 @@ pub fn stats() -> ShipStatsSnapshot {
         stale_term_refusals: STALE_TERM_REFUSALS.load(Ordering::Relaxed),
         era_relearns: ERA_RELEARNS.load(Ordering::Relaxed),
         not_owner_refusals: NOT_OWNER_REFUSALS.load(Ordering::Relaxed),
-        cross_owner_refusals: CROSS_OWNER_REFUSALS.load(Ordering::Relaxed),
         grace_reclaims: GRACE_RECLAIMS.load(Ordering::Relaxed),
         grace_conflicts: GRACE_CONFLICTS.load(Ordering::Relaxed),
         owner_panics: OWNER_PANICS.load(Ordering::Relaxed),
         dlm_rpcs_meta: DLM_RPCS_META.load(Ordering::Relaxed),
         mint_redirects: MINT_REDIRECTS.load(Ordering::Relaxed),
-        owner_map_poisoned_volumes: owners::poisoned_volumes(),
-        volumes_peer_unclaimed: owners::unclaimed_peer_volumes(),
-        owner_assignments: OWNER_ASSIGNMENTS.load(Ordering::Relaxed),
-        owner_assign_refusals: OWNER_ASSIGN_REFUSALS.load(Ordering::Relaxed),
-        subtree_roots_minted: SUBTREE_ROOTS_MINTED.load(Ordering::Relaxed),
         owner_dispatch_inline: OWNER_DISPATCH_INLINE.load(Ordering::Relaxed),
         owner_dispatch_hops: OWNER_DISPATCH_HOPS.load(Ordering::Relaxed),
     }
@@ -545,20 +494,8 @@ pub fn stats_json() -> serde_json::Value {
         "stale_term_refusals": s.stale_term_refusals,
         "era_relearns": s.era_relearns,
         "not_owner_refusals": s.not_owner_refusals,
-        "cross_owner_refusals": s.cross_owner_refusals,
         "owner_panics": s.owner_panics,
         "mint_redirects": s.mint_redirects,
-        "owner_map_poisoned_volumes": s.owner_map_poisoned_volumes,
-        // The DEGRADED-set gauge (§11.1): how many peer-owned volumes had
-        // no appender when this map was derived. Nonzero is a set running
-        // with an owner missing — those subtrees refuse loud at the ship
-        // site — never a fault in this mount.
-        "volumes_peer_unclaimed": s.volumes_peer_unclaimed,
-        // The offline verb's ledger (§11.1). A mount never assigns, so
-        // all three staying 0 on a live mount is the law, not the load.
-        "owner_assignments": s.owner_assignments,
-        "owner_assign_refusals": s.owner_assign_refusals,
-        "subtree_roots_minted": s.subtree_roots_minted,
         // D-5: which venue served the owner's dispatches (both planes).
         // `hops` ≡ every dispatch on the default; `inline` carries them
         // under SQUEEZEFS_META_SHIP_INLINE_SERVE=1.
@@ -943,33 +880,6 @@ where
 // Refusals — one phrasing each, so an operator meets the same text
 // wherever the shape is met (the v2-refusal precedent).
 // ---------------------------------------------------------------------------
-
-/// The cross-OWNER refusal: `EXDEV`, naming **S3.5**.
-///
-/// `EXDEV` is the errno POSIX already gives a caller for "these two names
-/// are not on the same filesystem object graph", which is what a rename or
-/// link across two independently-committing authorities is until the
-/// cross-volume transaction machinery exists.
-pub fn cross_owner_error(verb: MetaVerb, ino: u64, detail: &str) -> SqueezefsError {
-    let msg = format!(
-        "S8: {} spans two metadata OWNERS (ino {ino}: {detail}) — refused. A cross-owner \
-         mutation needs the S3.5 cross-volume transaction machinery (intent record + \
-         compensation + crash recovery; execution-plan ruling D4, spec DUR-7), which is not \
-         built. Shipping this op to one owner would be non-atomic across the other with no \
-         compensation record and no single D0 guard over both halves — strictly worse than \
-         refusing.",
-        verb.name()
-    );
-    log::error!("{msg}");
-    SqueezefsError::refused(libc::EXDEV, msg)
-}
-
-/// [`cross_owner_error`] plus the ledger increment (the client-side
-/// routing refusal).
-pub(crate) fn cross_owner_refusal(verb: MetaVerb, ino: u64, detail: &str) -> SqueezefsError {
-    CROSS_OWNER_REFUSALS.fetch_add(1, Ordering::Relaxed);
-    cross_owner_error(verb, ino, detail)
-}
 
 /// A reply that does not match its verb's shape: a protocol violation, not
 /// a filesystem error, so it is loud and never coerced into an errno an

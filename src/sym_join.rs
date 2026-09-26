@@ -231,11 +231,7 @@ pub async fn arm(
     let wero = if pr_capable {
         let paths = data_paths.to_vec();
         let hold = squeezefs_ipc::sqz_blocking::run_blocking(move || {
-            crate::data_custody::arm_data_plane(
-                crate::data_custody::CustodyPosture::MultiWriter,
-                &paths,
-                true,
-            )
+            crate::data_custody::arm_data_plane(&paths, true)
         })
         .await
         .map_err(|e| {
@@ -283,11 +279,7 @@ pub async fn arm(
     // blocking — the declared arm's law on each of its paths); a `?` here
     // would drop the hold at scope exit and run the release inline on the
     // `sqz-meta` lane (review round 1, Issue 11).
-    let prelude: Result<(
-        std::net::SocketAddr,
-        String,
-        Arc<crate::meta_ship::OwnerMap>,
-    )> = async {
+    let prelude: Result<(std::net::SocketAddr, Arc<crate::meta_ship::OwnerMap>)> = async {
         let Some(bind) = crate::multi_writer::resolve_bind_public()? else {
             return Err(SqueezefsError::InvalidOperation(format!(
                 "symmetric join ladder rung 7 (planes) refuses: {}=off — every writer of a \
@@ -297,12 +289,11 @@ pub async fn arm(
                 crate::multi_writer::MW_BIND_ENV
             )));
         };
-        let node_id = crate::cowriter::node_member_id()?;
-        let map = crate::multi_writer::derive_symmetric_ownership(meta, &node_id).await?;
-        Ok((bind, node_id, map))
+        let map = crate::multi_writer::derive_symmetric_ownership(meta).await?;
+        Ok((bind, map))
     }
     .await;
-    let (bind, node_id, map) = match prelude {
+    let (bind, map) = match prelude {
         Ok(v) => v,
         Err(e) => {
             if let Some(hold) = wero {
@@ -311,17 +302,9 @@ pub async fn arm(
             return Err(e);
         }
     };
-    let arm = crate::multi_writer::arm_authority_planes(
-        meta,
-        wero,
-        bind,
-        Vec::new(),
-        quarantine,
-        backend,
-        map,
-        node_id,
-    )
-    .await?;
+    let arm =
+        crate::multi_writer::arm_authority_planes(meta, wero, bind, quarantine, backend, map)
+            .await?;
     let Some(arm) = arm else {
         return Err(SqueezefsError::InvalidOperation(
             "symmetric join ladder rung 7 (planes) refuses: the authority planes did not arm"
@@ -477,11 +460,7 @@ pub async fn arm_joined(
     report
         .rungs
         .extend(["registrant", "join_appender", "acquire_slots"]);
-    let prelude: Result<(
-        std::net::SocketAddr,
-        String,
-        Arc<crate::meta_ship::OwnerMap>,
-    )> = async {
+    let prelude: Result<(std::net::SocketAddr, Arc<crate::meta_ship::OwnerMap>)> = async {
         let Some(bind) = crate::multi_writer::resolve_bind_public()? else {
             return Err(SqueezefsError::InvalidOperation(format!(
                 "symmetric join ladder rung 7 (planes) refuses on a joined appender: {}=off — \
@@ -490,12 +469,11 @@ pub async fn arm_joined(
                 crate::multi_writer::MW_BIND_ENV
             )));
         };
-        let node_id = crate::cowriter::node_member_id()?;
-        let map = crate::multi_writer::derive_symmetric_ownership(meta, &node_id).await?;
-        Ok((bind, node_id, map))
+        let map = crate::multi_writer::derive_symmetric_ownership(meta).await?;
+        Ok((bind, map))
     }
     .await;
-    let (bind, node_id, map) = match prelude {
+    let (bind, map) = match prelude {
         Ok(v) => v,
         Err(e) => {
             if let Some(hold) = wero {
@@ -504,17 +482,9 @@ pub async fn arm_joined(
             return Err(e);
         }
     };
-    let arm = crate::multi_writer::arm_authority_planes(
-        meta,
-        wero,
-        bind,
-        Vec::new(),
-        quarantine,
-        backend,
-        map,
-        node_id,
-    )
-    .await?;
+    let arm =
+        crate::multi_writer::arm_authority_planes(meta, wero, bind, quarantine, backend, map)
+            .await?;
     let Some(arm) = arm else {
         return Err(SqueezefsError::InvalidOperation(
             "symmetric join ladder rung 7 (planes) refuses on a joined appender: the planes did \
@@ -563,7 +533,7 @@ pub async fn arm_joined(
 /// holder's identity → its endpoint from the membership census"): appender
 /// `appender_id`'s directory page names its KD-MW-2 identity, the
 /// identity is the member id every plane knows the node by
-/// (`cowriter::node_member_id_of`), and the volume's durable claim set
+/// (`member_id::node_member_id_of`), and the volume's durable claim set
 /// carries that member's published listener — the endpoint the join
 /// ladder's rung 7 writes into its own entry (`publish_owner_endpoint`).
 /// `None` = no page, or the holder has not published (a joiner whose
@@ -648,7 +618,7 @@ pub fn resolve_holder_endpoint_from(
     set: &crate::membership::ClaimSet,
 ) -> Option<String> {
     let member =
-        crate::cowriter::node_member_id_of(page.identity.node_token, page.identity.mount_slot);
+        crate::member_id::node_member_id_of(page.identity.node_token, page.identity.mount_slot);
     set.members
         .iter()
         .find(|m| crate::membership::member_id_matches(&m.identity.id, &member))
@@ -672,7 +642,7 @@ async fn install_step_shipper(meta: &Arc<RoutedMetaBackend>, endpoint: &str) {
         );
         return;
     };
-    let Ok(node_id) = crate::cowriter::node_member_id() else {
+    let Ok(node_id) = crate::member_id::node_member_id() else {
         return;
     };
     crate::meta_backend::crossvol_tx::install_xv_shipper(crate::meta_ship::MetaShipRouter::new(
@@ -724,7 +694,7 @@ pub async fn bind_live_appender_endpoints(meta: &Arc<RoutedMetaBackend>) -> usiz
         for (appender_id, page) in live {
             plane.holders.set_member_id(
                 appender_id,
-                &crate::cowriter::node_member_id_of(
+                &crate::member_id::node_member_id_of(
                     page.identity.node_token,
                     page.identity.mount_slot,
                 ),

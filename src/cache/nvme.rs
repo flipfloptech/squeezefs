@@ -2227,21 +2227,18 @@ impl NvmeStaging {
         router.packer.begin_promotion_batch();
 
         let mut seen = std::collections::HashSet::new();
-        let items: Vec<crate::routing::StagedPromotionItem> = batch
+        let items: Vec<PendingStagedWrite> = batch
             .drain(..)
             .filter(|item| seen.insert(item.file_id.clone()))
-            .map(|item| crate::routing::StagedPromotionItem {
-                file_path: item.file_path,
-                file_id: item.file_id,
-                fencing_token: item.fencing_token,
-            })
             .collect();
         crate::coz_progress!("nvme_staged_promotion");
-        // The batch driver (design-small-file-packing §5.6, PK4): the per-
-        // file composition on an authority; on a co-writer the batch is
-        // partitioned by (owner, home volume) into group packs.
-        let outcomes = router.promote_staged_batch(items.clone()).await;
-        for (item, out) in items.iter().zip(outcomes) {
+        // The per-file composition (design-small-file-packing §5.6), in
+        // order: every promotion runs the ONE primitive, which dispatches
+        // on size (inline / packed / block).
+        for item in items {
+            let out = router
+                .promote_staged_file(&item.file_path, &item.file_id, item.fencing_token)
+                .await;
             match out {
                 Ok(Some(into)) => info!(
                     "NVMe Staging: promoted staged file {} (ID: {}) {}",

@@ -64,7 +64,8 @@ pub(crate) mod cow_core;
 // shipped to the authority, data read-write under a granted custody lease —
 // and the five-rung admission ladder that is the only way to reach it.
 // Plain comments, not doc comments (see the `data_custody` note below).
-pub mod cowriter;
+pub mod member_id;
+pub mod shipped_free;
 pub mod cpu;
 pub mod crypto_compress;
 pub mod daemon_cpu;
@@ -86,7 +87,6 @@ pub mod data_grant;
 // durable per-lane reservation watermarks. (Plain comments, not doc
 // comments: an outer doc comment here merges into the crate root's link
 // scope — see the `data_custody` note above.)
-pub mod data_alloc_lane;
 // DLM stage S9: the allocation-lane GRANT — the admission the partition above
 // was left waiting for. One lane per enrolled writer, derived by the authority
 // from the DURABLE claim set and carried to each co-writer on its custody
@@ -94,7 +94,6 @@ pub mod data_alloc_lane;
 // and committed BY the authority ahead of every hand-out. (Plain comments,
 // not doc comments: an outer doc comment here merges into the crate root's
 // link scope — see the `data_custody` note above.)
-pub mod alloc_lane_grant;
 // Symmetric metadata program PR 8 (design-symmetric-metadata §5.5, KD-SYM-9):
 // the ARMED plane's data allocation — ranged block grants carved by each
 // data volume's floating allocation-lease holder from a durable per-volume
@@ -214,7 +213,6 @@ pub mod overlay_core;
 // whether this mount is the appender or a peer is — the co-writer ladder
 // EXTENDED, never forked. The decision is unforgeable and the partial open
 // that consumes it is the next rung of the program.
-pub mod partial_authority;
 pub(crate) mod patch_clone_core;
 pub(crate) mod placed_core;
 pub(crate) mod placed_sever;

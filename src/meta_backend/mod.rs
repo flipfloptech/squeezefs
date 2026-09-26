@@ -106,16 +106,6 @@ pub struct DirEntry {
     pub file_type: u32,
 }
 
-/// What a layout publish GROUP commit answered
-/// ([`RoutedMetaBackend::set_layout_and_size_pack_group`]).
-pub enum LayoutGroupCommit {
-    /// One outcome per item, input order.
-    Committed(Vec<Result<()>>),
-    /// PK4's single-volume law refused the set after the slot gate: the
-    /// members route to `volumes` home meta volumes. Nothing committed.
-    Split { volumes: usize },
-}
-
 /// One member of a [`RoutedMetaBackend::set_layout_and_size_group`]: the
 /// single verb's arguments, owned (the group stages its members
 /// concurrently, so each carries its own bytes).
@@ -326,21 +316,6 @@ pub async fn open_meta_volume_set(
     Ok(opened)
 }
 
-/// The §5.4a M1 pre-check's test seam (the `TEST_XV_SEAM_AFTER_STEPS`
-/// precedent — a suite arms and disarms it per case, so it cannot be an
-/// env knob): `true` bypasses the check, which is the ONLY way to
-/// exercise the pre-M1 behaviour the repro exists to record. Nothing in
-/// the product ever sets it.
-static TEST_DISABLE_CROSS_OWNER_PRECHECK: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Arm/disarm the M1 seam above — see
-/// `tests/pv_partial_open_tests.rs::the_pre_check_absent_shape_is_what_fail_stops_two_volumes`,
-/// the negative twin that records why the pre-check exists.
-pub fn test_disable_cross_owner_precheck(on: bool) {
-    TEST_DISABLE_CROSS_OWNER_PRECHECK.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// The kernel's SETATTR times ECHO on a FOREIGN-slot file (a read's
 /// `write_inode` — `FATTR_MTIME|FATTR_CTIME` carrying the times the kernel
 /// got from us; PR M6's absorber class) answered from the holder's exact
@@ -360,14 +335,12 @@ pub const OPEN_WRITE_INTENT: u32 =
 
 /// The **offline-bracket probes** every writable mount runs on the slot-0
 /// volume before it serves: `mw_upgrade:` (KD-MW-1 §6.2 mechanism i) and
-/// its sibling `owner_assign:` (per-volume claim admission §5.2.1 / sweep
-/// row 2, KD-PV-2 — *"the `MW_UPGRADE_MARKER_XATTR` pattern verbatim"*).
+/// the pre-1.3.0 `owner_assign:` bracket the retired `volume set-owners`
+/// verb wrote first and deleted last.
 ///
-/// Both mark an offline verb that is mid-act: an interrupted
-/// `enable-multi-writer` upgrade, or an interrupted `volume set-owners`
-/// assignment. A writable mount refuses while either exists, naming the
-/// idempotent re-run; read-only mounts keep serving. A probe that cannot
-/// be READ refuses too — never guess about a bracket.
+/// Both mark an offline verb that was mid-act. A writable mount refuses
+/// while either exists, naming the remedy; read-only mounts keep serving.
+/// A probe that cannot be READ refuses too — never guess about a bracket.
 ///
 /// `None` = clear, which is every set that is not mid-verb.
 async fn open_intent_marker_refusal(
@@ -398,110 +371,21 @@ async fn open_intent_marker_refusal(
         }
     }
     match be.getxattr(1, crate::OWNER_ASSIGN_MARKER_XATTR).await {
-        Ok(Some(raw)) => {
-            let named = match crate::config_ops::OwnerAssignMarker::decode(&raw) {
-                Ok(m) => format!(
-                    "covering volumes {:?}",
-                    m.assignments
-                        .iter()
-                        .map(|a| a.volume_id.as_str())
-                        .collect::<Vec<_>>()
-                ),
-                Err(e) => format!("(marker undecodable: {e})"),
-            };
-            refuse(format!(
-                "refusing a writable mount: a per-volume ownership-assignment intent marker \
-                 (`{}`) is present on the slot-0 volume {named} — a `squeezefs volume \
-                 set-owners` run crashed mid-assignment, so some volumes may name an owner \
-                 and others may not. Re-run `squeezefs volume set-owners <sqmeta-uri> …` \
-                 (idempotent, resumes from the crash point) or `--clear` it; read-only \
-                 mounts keep serving",
-                crate::OWNER_ASSIGN_MARKER_XATTR
-            ))
-        }
+        Ok(Some(_)) => refuse(format!(
+            "refusing a writable mount: a per-volume ownership-assignment intent marker \
+             (`{}`) is present on the slot-0 volume — a pre-1.3.0 `squeezefs volume \
+             set-owners` run crashed mid-assignment. The verb is RETIRED (every RW mount of \
+             a symmetric set is a writer; ownership is the slot lease): convert the set with \
+             `squeezefs volume enable-symmetric <sqmeta-uri>`, which drops the assignment \
+             and the bracket; read-only mounts keep serving",
+            crate::OWNER_ASSIGN_MARKER_XATTR
+        )),
         Ok(None) => None,
         Err(e) => refuse(format!(
             "refusing a writable mount: the ownership-assignment intent marker probe on the \
              slot-0 volume failed ({e})"
         )),
     }
-}
-
-/// **Per-volume claim admission — open a set this mount appends to only
-/// PART of** (`docs/design-per-volume-claim-admission.md` §5.4, PR 4):
-/// [`open_meta_volume_set`]'s partial twin, one mode per volume.
-///
-/// `vol_ids` are the DURABLE `vol-{hex}` identities of `ordered` in the
-/// same order (KD-5 — the mode is resolved by identity, never by
-/// position: an index-keyed vector plus a permuted URI list would take
-/// the full D0 ladder on a volume a peer owns, the worst outcome in the
-/// program, reached by an off-by-permutation rather than a race).
-///
-/// The `admission` is carried rather than a `&[VolumeMode]` (the design's
-/// §6.3 sketch) for one reason: [`kv::backend::KvMetaBackend::open_peer_owned`]
-/// re-checks the decision itself, and `VolumeMode` is a plain public enum
-/// any caller could build — passing modes alone would make the peer door
-/// reachable with a fabricated mode vector, which is exactly what
-/// `SetAdmission`'s private fields exist to prevent.
-///
-/// **The rollback ladder releases exactly what it took.** An `Own` volume
-/// holds a flock, a `writer_claim` and (on a PR namespace) a reservation,
-/// released by its `shutdown()`; a `Peer` volume holds none of the three,
-/// so its shutdown is a no-op — correct, and pinned in both directions.
-pub async fn open_meta_volume_set_partial(
-    ordered: &[String],
-    vol_ids: &[String],
-    admission: &crate::partial_authority::SetAdmission,
-) -> Result<Vec<std::sync::Arc<kv::backend::KvMetaBackend>>> {
-    if ordered.len() != vol_ids.len() {
-        return Err(crate::error::SqueezefsError::InvalidOperation(format!(
-            "partial set open: {} volume paths against {} durable ids — the mode of a volume \
-             is keyed on its identity, so a mismatched pairing cannot be interpreted",
-            ordered.len(),
-            vol_ids.len()
-        )));
-    }
-    let mut opened: Vec<std::sync::Arc<kv::backend::KvMetaBackend>> = Vec::new();
-    for (path, vol_id) in ordered.iter().zip(vol_ids) {
-        let out = match admission.mode_for(vol_id) {
-            Some(crate::partial_authority::VolumeMode::Own) => {
-                open_volume_for_mount(path).await.map_err(|e| {
-                    // The own-mode arm is the shipped D0 ladder, verbatim.
-                    e
-                })
-            }
-            Some(crate::partial_authority::VolumeMode::Peer { .. }) => {
-                kv::backend::KvMetaBackend::open_peer_owned(
-                    std::path::Path::new(path),
-                    admission,
-                    vol_id,
-                )
-                .await
-                .map_err(Into::into)
-            }
-            None => Err(crate::error::SqueezefsError::InvalidOperation(format!(
-                "partial set open: the admission does not name metadata volume {path} \
-                 ({vol_id}). A volume a decision does not cover is a refusal, never a \
-                 default — re-run `squeezefs volume set-owners` over the WHOLE set"
-            ))),
-        };
-        match out {
-            Ok(be) => opened.push(be),
-            Err(e) => {
-                for prior in &opened {
-                    if let Err(te) = prior.shutdown().await {
-                        log::warn!(
-                            "releasing guard on {:?} after a failed partial set open failed \
-                             too: {te}",
-                            prior.device_path()
-                        );
-                    }
-                }
-                return Err(e);
-            }
-        }
-    }
-    Ok(opened)
 }
 
 /// Open a whole metadata volume set as the routed backend (PR VL5a): the
@@ -609,47 +493,6 @@ pub async fn open_routed_meta_set_read_only(
     let mut vols = Vec::with_capacity(disc.ordered_paths.len());
     for path in &disc.ordered_paths {
         vols.push(open_volume_read_only(path).await?);
-    }
-    Ok(std::sync::Arc::new(
-        RoutedMetaBackend::with_slot_map_and_natives(
-            vols,
-            disc.routing_width,
-            disc.slot_to_volume,
-            disc.native_slots,
-        )?,
-    ))
-}
-
-/// **DLM S9** — [`open_routed_meta_set`]'s **co-writer** twin
-/// (`SQUEEZEFS_MW_ROLE=co-writer`, past the five-rung admission ladder):
-/// the same §5.5.1a stamp discovery, the same canonical member ordering and
-/// slot-map validation, opened through [`kv::backend::KvMetaBackend::open_co_writer`] per
-/// volume.
-///
-/// No guard is taken on any member, so — exactly as for a reader — the
-/// whole rollback ladder [`open_meta_volume_set`] needs is structurally
-/// absent.
-///
-/// `crossvol_tx::recover_open_intents` is deliberately NOT run: rolling an
-/// open cross-volume intent forward is a WRITE, and it belongs to the
-/// authority's own open (which already ran it, or will). A co-writer that
-/// recovered intents would append to trees it has no authority over.
-pub async fn open_routed_meta_set_co_writer(
-    paths: &[String],
-    admission: &crate::cowriter::CoWriterAdmission,
-) -> Result<std::sync::Arc<RoutedMetaBackend>> {
-    let disc = discover_meta_set(paths).await?;
-    validate_slot_map(
-        disc.ordered_paths.len(),
-        disc.routing_width,
-        &disc.slot_to_volume,
-    )?;
-    let mut vols = Vec::with_capacity(disc.ordered_paths.len());
-    for path in &disc.ordered_paths {
-        vols.push(
-            kv::backend::KvMetaBackend::open_co_writer(std::path::Path::new(path), admission)
-                .await?,
-        );
     }
     Ok(std::sync::Arc::new(
         RoutedMetaBackend::with_slot_map_and_natives(
@@ -864,14 +707,14 @@ pub async fn symmetric_join_target(paths: &[String]) -> Result<Option<JoinedSetA
         kv::backend::SharedProbe::LocalExclusiveHolder
     ) || matches!(
         probe.claim_standing().await,
-        crate::partial_authority::ClaimStanding::Fresh
+        kv::backend::ClaimStanding::Fresh
     );
     if !live_manager {
         return Ok(None);
     }
     let endpoint = crate::sym_join::resolve_holder_endpoint(&probe, 0).await;
     let secret = crate::membership::cluster_secret(&probe).await;
-    let peer_id = crate::cowriter::node_member_id()?;
+    let peer_id = crate::member_id::node_member_id()?;
     drop(probe);
     let (Some(endpoint), Some(secret)) = (endpoint, secret) else {
         return Err(crate::error::SqueezefsError::InvalidOperation(format!(
@@ -896,131 +739,6 @@ pub async fn symmetric_join_target(paths: &[String]) -> Result<Option<JoinedSetA
             writer_id: 0,
         },
     }))
-}
-
-/// **Per-volume claim admission — [`open_routed_meta_set`]'s PARTIAL twin
-/// and the mount path's entry point** (§5.4 sweep row 18, PR 4), modeled
-/// on [`open_routed_meta_set_co_writer`]:
-///
-/// discovery → canonical order → resolve each volume's mode by its
-/// DURABLE id → the partial set open (rollback ladder included) → the two
-/// offline-bracket probes → **ownership-scoped** intent recovery → the
-/// bring-up cover on OWNED volumes only → the KD-PV-17 holder attestation
-/// → `RoutedMetaBackend`.
-///
-/// Four of those differ from the write twin, each because a peer's volume
-/// is not this mount's to touch:
-///
-/// * **row 3** — `recover_open_intents` becomes
-///   [`crossvol_tx::recover_open_intents_scoped`]: roll forward what we
-///   own, skip what a peer owns, refuse loud on an intent spanning two
-///   owners;
-/// * **row 4** — `cover_bring_up_residue` WRITES, so it runs on owned
-///   volumes only;
-/// * **row 2** — the `owner_assign:` probe joins `mw_upgrade:`;
-/// * KD-PV-17 — each owned volume's claim gets its holder attestation, the
-///   durable fact that lets a PEER resolve this mount's per-mount claim
-///   uuid to its enrollment identity.
-pub async fn open_routed_meta_set_partial(
-    paths: &[String],
-    admission: &crate::partial_authority::SetAdmission,
-) -> Result<std::sync::Arc<RoutedMetaBackend>> {
-    let disc = discover_meta_set(paths).await?;
-    validate_slot_map(
-        disc.ordered_paths.len(),
-        disc.routing_width,
-        &disc.slot_to_volume,
-    )?;
-    refuse_mixed_multi_writer_set(&disc.ordered_paths).await?;
-    if !admission.covers(&disc.ordered_paths) {
-        return Err(crate::error::SqueezefsError::InvalidOperation(format!(
-            "refusing a partial-writer mount: the admission was decided over {:?}, but this \
-             set's canonical membership is {:?}. An admission is per-SET — bit 14 and a \
-             durable claim set on every volume, one complete assignment map, one set \
-             authority — so it may never be carried across sets",
-            admission.volumes(),
-            disc.ordered_paths
-        )));
-    }
-    // KD-5, and the reason discovery runs FIRST: modes are keyed on the
-    // durable identity, resolved against the CANONICAL order rather than
-    // the caller's URI order.
-    let vol_ids: Vec<String> = disc
-        .uuids
-        .iter()
-        .map(kv::backend::durable_volume_id_of)
-        .collect();
-    let backends = open_meta_volume_set_partial(&disc.ordered_paths, &vol_ids, admission).await?;
-    let owned: Vec<bool> = vol_ids
-        .iter()
-        .map(|id| admission.mode_for(id) == Some(&crate::partial_authority::VolumeMode::Own))
-        .collect();
-
-    if let Some(err) = open_intent_marker_refusal(&backends[0]).await {
-        for be in &backends {
-            if let Err(te) = be.shutdown().await {
-                log::warn!(
-                    "releasing guard on {:?} after an intent-marker refusal failed: {te}",
-                    be.device_path()
-                );
-            }
-        }
-        return Err(err);
-    }
-    let routed = std::sync::Arc::new(RoutedMetaBackend::with_slot_map_and_natives(
-        backends,
-        disc.routing_width,
-        disc.slot_to_volume,
-        disc.native_slots,
-    )?);
-    let mut bring_up: Result<()> = crossvol_tx::recover_open_intents_scoped(&routed, &owned)
-        .await
-        .map(|_| ());
-    if bring_up.is_ok() {
-        for (vol, mine) in routed.volumes.iter().zip(&owned) {
-            if *mine {
-                bring_up = vol.cover_bring_up_residue().await.map_err(Into::into);
-                if bring_up.is_err() {
-                    break;
-                }
-            }
-        }
-    }
-    if let Err(e) = bring_up {
-        for be in &routed.volumes {
-            if let Err(te) = be.shutdown().await {
-                log::warn!(
-                    "releasing guard on {:?} after a partial bring-up failure: {te}",
-                    be.device_path()
-                );
-            }
-        }
-        return Err(e);
-    }
-    // KD-PV-17, last: the attestation names a claim this mount now holds,
-    // so it can only be written after the D0 ladder committed it — and
-    // only on volumes we own, where we are the appender.
-    for (vol, mine) in routed.volumes.iter().zip(&owned) {
-        if !*mine {
-            continue;
-        }
-        if let Err(e) = crate::membership::publish_claim_holder(
-            vol,
-            admission.node_id(),
-            crate::dlm::durable_term(),
-        )
-        .await
-        {
-            log::warn!(
-                "meta volume {}: publishing this mount's holder attestation failed ({e}) — \
-                 peers will read an unresolvable holder for this volume and REFUSE it \
-                 (KD-PV-17: silence never adopts), so this mount serves but the fleet cannot \
-                 grow until it succeeds",
-                vol.device_path().display()
-            );
-        }
-    }
-    Ok(routed)
 }
 
 /// [`open_routed_meta_set`]'s **read-only probe** twin (the clients/df/
@@ -1754,66 +1472,6 @@ impl RoutedMetaBackend {
             .await
     }
 
-    /// **§5.4a M1 — the local cross-owner pre-check** (KD-PV-11,
-    /// correctness-class, landed unconditionally).
-    ///
-    /// `route_verb` inspects a call's **named** inos only, and
-    /// `MetaCall::named_inos` answers the PARENT ALONE for `Unlink`: the
-    /// child and rename's moved/overwritten inodes are DISCOVERED under
-    /// guards, so no router can see them. Without this check an ordinary
-    /// `rm` of a peer-owned child builds an `XvPlan`, commits step 0 (the
-    /// dentry removal, carrying the intent record) on the parent's volume,
-    /// and refuses the child's half at the peer-owned write gate —
-    /// `escalate_midplan` then fail-stops BOTH volumes and leaves a
-    /// durable intent spanning two owners that no process in the fleet can
-    /// roll forward. One `rm`, two volumes offline, the next mount
-    /// refused.
-    ///
-    /// So the refusal happens **before any plan is minted**: `EXDEV`, no
-    /// durable effect, no intent, no fail-stop. It mirrors the owner-side
-    /// post-discovery checks (`meta_ship::service`) so the two paths
-    /// cannot drift.
-    ///
-    /// Unarmed — every mount that ships — this is `owns_volume`'s single
-    /// relaxed load per participant feeding a never-taken branch.
-    fn refuse_cross_owner_participants(
-        &self,
-        verb: crate::meta_ship::MetaVerb,
-        participants: &[Ino],
-    ) -> Result<()> {
-        if !crate::meta_ship::owners::ownership_armed()
-            || TEST_DISABLE_CROSS_OWNER_PRECHECK.load(std::sync::atomic::Ordering::Relaxed)
-            // Executing AS THE OWNER for a shipping client: the authority
-            // in force is the owner service's own per-volume vector, and
-            // its post-discovery cross-owner checks have already run on
-            // this very call. A dual-role node is both client and owner
-            // (which is what the S8 service is designed for), so reading
-            // the CLIENT-side map here would refuse verbs the owner half
-            // is authoritative for — pinned by `tests/meta_ship_tests.rs`,
-            // which is exactly that shape in one process.
-            || crate::meta_ship::executing_for_ship_client()
-        {
-            return Ok(());
-        }
-        for ino in participants {
-            let (v_idx, _) = self.route_ino(*ino);
-            if let Some(owner) = crate::meta_ship::owners::owner_of_volume(v_idx) {
-                return Err(crate::meta_ship::cross_owner_refusal(
-                    verb,
-                    *ino,
-                    &format!(
-                        "it lives on metadata volume {v_idx}, which peer '{}' appends to, \
-                         while this node executes the operation. The participant was \
-                         DISCOVERED under this op's guards, so the router could not see it \
-                         (§5.4a M1)",
-                        owner.peer_id
-                    ),
-                ));
-            }
-        }
-        Ok(())
-    }
-
     /// §4.4 pt 4 escalation mirror: after any mutation error, latch the
     /// volume into `disabled_volumes` iff its backend has fail-stopped
     /// (repeated journal write failures) — the existing mechanism
@@ -2033,10 +1691,6 @@ impl RoutedMetaBackend {
         // declared before any 4a acquisition (and before route
         // derivation: a park can span a flip).
         let _gate = self.slot_gate_enter(&[ino, new_parent]).await;
-        // §5.4a M1: `link`'s participants ARE named, so `route_verb` and
-        // the owner side already refuse a shipped one — this is the same
-        // refusal on the LOCAL path, where no router runs.
-        self.refuse_cross_owner_participants(crate::meta_ship::MetaVerb::Link, &[ino, new_parent])?;
         let (parent_v_idx, local_parent) = self.route_ino(new_parent);
         let (child_v_idx, local_child) = self.route_ino(ino);
         self.check_volume_enabled(parent_v_idx)?;
@@ -2407,7 +2061,7 @@ impl RoutedMetaBackend {
     ) -> Option<u32> {
         let plane = vol.slot_leases()?;
         let own = vol.own_appender_id();
-        if let Some((node_token, mount_slot)) = crate::cowriter::parse_node_member_id(client) {
+        if let Some((node_token, mount_slot)) = crate::member_id::parse_node_member_id(client) {
             if let Some(id) = plane.appender_of_identity(node_token, mount_slot) {
                 return (id != own).then_some(id);
             }
@@ -4883,23 +4537,6 @@ impl RoutedMetaBackend {
             self.refuse_dying_parent(new_parent).await?;
         }
 
-        // **§5.4a M1**, with the PLURAL participant set the owner side
-        // already uses (`service.rs`'s loop over both `(parent, name)`
-        // pairs): the moved ino, the overwrite victim, and — under
-        // `RENAME_EXCHANGE` — both participants. The parents themselves
-        // are named, so `route_verb` covered them; these are the
-        // discovered ones no router can see.
-        {
-            let mut discovered = Vec::new();
-            if let Some((c, _)) = old_dentry_opt {
-                discovered.push(c);
-            }
-            if let Some((c, _)) = new_dentry_opt {
-                discovered.push(c);
-            }
-            self.refuse_cross_owner_participants(crate::meta_ship::MetaVerb::Rename, &discovered)?;
-        }
-
         // Symmetric PR 6 (§5.6.4, KD-SYM-14): on an armed mount EVERY
         // rename whose source is a DIRECTORY runs under the set-wide
         // lease — same-slot ones too — and checks ancestry on exact data
@@ -5900,14 +5537,6 @@ impl RoutedMetaBackend {
             }
         };
 
-        // **§5.4a M1** — the DISCOVERED participant the router could not
-        // see (`named_inos` answers the parent alone for `Unlink`), pinned
-        // here rather than at the plan: refuse before any durable effect.
-        self.refuse_cross_owner_participants(
-            crate::meta_ship::MetaVerb::Unlink,
-            &[global_child_ino],
-        )?;
-
         let is_dir = file_type == libc::S_IFDIR;
         // Symmetric PR 6: a parent or child in another appender's slot
         // takes the transaction path below — its steps route by slot.
@@ -6086,47 +5715,11 @@ impl RoutedMetaBackend {
     /// is refused loud (its later occurrence) rather than serialized: two
     /// staged txs for one ino in one group would race on the RAM view.
     pub async fn set_layout_and_size_group(&self, items: Vec<LayoutPublish>) -> Vec<Result<()>> {
-        match self.set_layout_and_size_group_inner(items, false).await {
-            LayoutGroupCommit::Committed(results) => results,
-            // Unreachable: the single-volume law is only asked for.
-            LayoutGroupCommit::Split { volumes } => {
-                vec![Err(crate::error::SqueezefsError::InvalidOperation(
-                    format!(
-                        "layout publish group reported a {volumes}-volume split without the \
-                     single-volume law (unreachable)"
-                    ),
-                ))]
-            }
-        }
-    }
 
-    /// **[`Self::set_layout_and_size_group`] under the PACK-GROUP law**
-    /// (design-small-file-packing §5.6, PK4): the items must route to ONE
-    /// home meta volume, judged AFTER the §5.5.2a slot gate — the gate's own
-    /// law ("parks can span a flip, so callers must re-derive routes taken
-    /// before the call") is exactly the window an online `migrate-meta-slot`
-    /// cutover can land in between a co-writer's partition and this serve.
-    /// A frame whose members bucket into two volumes would be two
-    /// independently committed sub-groups, i.e. the publish-after-terminal-
-    /// free window the law closes — so it commits NOTHING and answers
-    /// [`LayoutGroupCommit::Split`] (the owner refuses the frame
-    /// `PUBLISH_PACK_GROUP_SPLIT`). One check, after routing, under the gate.
-    pub async fn set_layout_and_size_pack_group(
-        &self,
-        items: Vec<LayoutPublish>,
-    ) -> LayoutGroupCommit {
-        self.set_layout_and_size_group_inner(items, true).await
-    }
-
-    async fn set_layout_and_size_group_inner(
-        &self,
-        items: Vec<LayoutPublish>,
-        single_home_volume: bool,
-    ) -> LayoutGroupCommit {
         let n = items.len();
         let mut results: Vec<Option<Result<()>>> = (0..n).map(|_| None).collect();
         if n == 0 {
-            return LayoutGroupCommit::Committed(Vec::new());
+            return Vec::new();
         }
         let inos: Vec<Ino> = items.iter().map(|it| it.ino).collect();
         // S10 coherence law (rung 12) — the single verb's gate over the
@@ -6170,14 +5763,6 @@ impl RoutedMetaBackend {
                 .or_default()
                 .push((i, local_ino, item));
         }
-        // PK4: the post-gate single-volume check — the routes above are the
-        // re-derived ones (taken after the gate admitted the set).
-        if single_home_volume && per_volume.len() > 1 {
-            return LayoutGroupCommit::Split {
-                volumes: per_volume.len(),
-            };
-        }
-
         // Every volume's sub-group runs independently and concurrently: a
         // volume's members hold only THAT volume's guards (cross-volume
         // lock sets stay in ascending volume order by never being held
@@ -6235,20 +5820,18 @@ impl RoutedMetaBackend {
                 results[i] = Some(out);
             }
         }
-        LayoutGroupCommit::Committed(
-            results
-                .into_iter()
-                .map(|slot| {
-                    slot.unwrap_or_else(|| {
-                        Err(crate::error::SqueezefsError::InvalidOperation(
-                            "layout publish group: a member reached no outcome (unreachable — \
-                             every member is refused, staged-and-failed, or committed)"
-                                .to_string(),
-                        ))
-                    })
+        results
+            .into_iter()
+            .map(|slot| {
+                slot.unwrap_or_else(|| {
+                    Err(crate::error::SqueezefsError::InvalidOperation(
+                        "layout publish group: a member reached no outcome (unreachable — \
+                         every member is refused, staged-and-failed, or committed)"
+                            .to_string(),
+                    ))
                 })
-                .collect(),
-        )
+            })
+            .collect()
     }
 
     /// Spec §6.2 item 1: commit a standalone durable block-reference

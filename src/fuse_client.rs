@@ -663,7 +663,7 @@ fn inplace_overwrite_cell() -> &'static std::sync::atomic::AtomicBool {
 /// cloned. The CoW path is the correct answer there, and it is the one a
 /// co-writer takes.
 pub fn inplace_overwrite_enabled() -> bool {
-    !read_only_mount() && !co_writer_mount() && inplace_overwrite_cell().load(Ordering::Relaxed)
+    !read_only_mount() && inplace_overwrite_cell().load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -691,41 +691,6 @@ pub fn inplace_overwrite_enabled() -> bool {
 /// item 1's list).
 static READ_ONLY_MOUNT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// DLM **S9**: the CO-WRITER latch, deliberately a SECOND word rather than
-/// a third state of `READ_ONLY_MOUNT`.
-///
-/// `read_only_mount()` means exactly one thing across eleven call sites —
-/// *this mount is an S5 reader* (EROFS at the FUSE door, reader TTLs,
-/// no writer engines, no `client:` beat) — and a co-writer is none of
-/// those: it writes data. Folding the postures into one word would have
-/// changed every one of those sites' meaning at once, which is the
-/// opposite of what a safety-critical split wants. So the reader latch is
-/// untouched and this one is additive: `false` on every reader and every
-/// writer, so both keep their exact shape.
-static CO_WRITER_MOUNT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// **Per-volume claim admission** (§5.1.3, KD-PV-5): the PARTIAL-METADATA
-/// latch — this mount appends to SOME volumes of the set and ships the
-/// rest.
-///
-/// A third additive word, for the S9 reason restated one rung on: the two
-/// latches above have exactly one meaning each across their ~40 consumers,
-/// and a partial-writer mount is a different shape from both. It is read
-/// **only** by [`mount_posture`] and the per-volume metadata gate; every
-/// data-plane consumer is unedited, so:
-///
-/// * a `set-authority` latches NEITHER of the other two, and its data
-///   plane is byte-identical to `writer`'s — the W1 in-place patch, the
-///   ownership recovery walk, direct reclaim, the grace ring;
-/// * a `partial-authority` latches `CO_WRITER`, so `plane_gate` and
-///   `alloc_plane_gate` keep their exact classes and texts.
-///
-/// A blanket co-writer latch across the fleet would leave NO node
-/// performing the W1 patch or the recovery walk — `plane_gate`'s own
-/// comment states the production assumption it would break.
-static PARTIAL_META_MOUNT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// Which posture this mount took — the `mount_posture` stats gauge and the
 /// one word the data-plane gates classify against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -734,24 +699,6 @@ pub enum MountPosture {
     Writer,
     /// DLM S5: a coherent reader. No authority over any plane.
     Reader,
-    /// DLM S9: a co-writer. No metadata authority (mutations ship), data
-    /// authority under a granted custody lease, and NO ownership-accounting
-    /// authority (the authority's ledger owns every device offset).
-    CoWriter,
-    /// Per-volume claim admission (§5.1.3): this mount appends to the
-    /// volume hosting **slot 0**, which under D20 makes it the SET
-    /// AUTHORITY — it assigns allocation lanes, serves the S9 custody
-    /// endpoint, owns the only freed-offset grace ring, coordinates
-    /// maintenance and homes ino 1. Its DATA plane is byte-identical to
-    /// [`MountPosture::Writer`]'s; its metadata plane is local on the
-    /// volumes it owns and shipped on the rest.
-    SetAuthority,
-    /// Per-volume claim admission (§5.1.3): this mount appends to a
-    /// SUBSET of the set that does not include the slot-0 volume. Its
-    /// data plane is the co-writer class (custody + a granted lane;
-    /// terminal frees SHIP), and its metadata plane is local on the
-    /// volumes it owns.
-    PartialAuthority,
 }
 
 impl MountPosture {
@@ -760,9 +707,6 @@ impl MountPosture {
         match self {
             MountPosture::Writer => "writer",
             MountPosture::Reader => "reader",
-            MountPosture::CoWriter => "co-writer",
-            MountPosture::SetAuthority => "set-authority",
-            MountPosture::PartialAuthority => "partial-authority",
         }
     }
 }
@@ -779,36 +723,13 @@ pub fn read_only_mount() -> bool {
     READ_ONLY_MOUNT.load(Ordering::Relaxed)
 }
 
-/// DLM **S9**: whether this mount is a CO-WRITER (metadata read-only
-/// locally with mutations shipped, data read-write under custody).
-#[inline]
-pub fn co_writer_mount() -> bool {
-    CO_WRITER_MOUNT.load(Ordering::Relaxed)
-}
-
-/// Per-volume claim admission (§5.1.3): whether this mount holds metadata
-/// authority over only PART of its volume set. Read by [`mount_posture`]
-/// and the per-volume metadata gate — never by a data-plane consumer.
-#[inline]
-pub fn partial_meta_mount() -> bool {
-    PARTIAL_META_MOUNT.load(Ordering::Relaxed)
-}
-
-/// This mount's posture.
+/// This mount's posture (PR 14: a WRITER of the symmetric plane, or the
+/// `-o ro` READER — the co-writer and per-volume-owner postures retired
+/// with the default flip).
 #[inline]
 pub fn mount_posture() -> MountPosture {
     if read_only_mount() {
         MountPosture::Reader
-    } else if partial_meta_mount() {
-        // The additive latch decides the metadata shape; the co-writer
-        // latch then says which DATA plane rides with it (§5.1.3).
-        if co_writer_mount() {
-            MountPosture::PartialAuthority
-        } else {
-            MountPosture::SetAuthority
-        }
-    } else if co_writer_mount() {
-        MountPosture::CoWriter
     } else {
         MountPosture::Writer
     }
@@ -821,24 +742,9 @@ pub fn set_read_only_mount(on: bool) {
 }
 
 /// Latch this mount's posture. Called ONCE from the mount path before any
-/// volume is opened (and by tests, which restore it). The two latches are
-/// set together so no window exists in which a mount is both.
+/// volume is opened (and by tests, which restore it).
 pub fn set_mount_posture(posture: MountPosture) {
     READ_ONLY_MOUNT.store(posture == MountPosture::Reader, Ordering::Relaxed);
-    CO_WRITER_MOUNT.store(
-        matches!(
-            posture,
-            MountPosture::CoWriter | MountPosture::PartialAuthority
-        ),
-        Ordering::Relaxed,
-    );
-    PARTIAL_META_MOUNT.store(
-        matches!(
-            posture,
-            MountPosture::SetAuthority | MountPosture::PartialAuthority
-        ),
-        Ordering::Relaxed,
-    );
 }
 
 /// The standard refusal for a data-plane mutation attempted on a reader.
@@ -852,56 +758,25 @@ pub(crate) fn read_only_refusal(what: &str) -> crate::error::SqueezefsError {
     ))
 }
 
-/// DLM **S9** — the standard refusal for **ownership accounting** attempted
-/// on a co-writer (block allocation, terminal frees, the W1 incarnation
-/// retire, the ownership recovery walk).
-///
-/// Deliberately NOT the reader text: a co-writer is not read-only, and
-/// telling an operator to "mount without -o ro" would be a lie. What it has
-/// is data authority without accounting authority — the durable truth of
-/// which offsets are owned lives in the authority's `TREE_BLOCK_REFS`, so
-/// mutating a LOCAL refcount map here would be one node inventing an answer
-/// about shared hardware. One text, so every plane's refusal names the same
-/// cause and the same remedy.
-///
-/// **Fresh allocation is no longer on this list** (DLM S9's allocation-lane
-/// grant — `crate::alloc_lane_grant`): a co-writer allocates from the residue
-/// class its authority granted on the custody lease, with the covering
-/// reservation committed BY that authority before the offset is handed out.
-/// So an allocation arm reaching this text means this mount holds **no lane**
-/// on that volume, which is exactly what an authority that has enrolled no
-/// co-writer grants.
-///
-/// **Terminal frees are no longer on the PRODUCT path's list either** (DLM
-/// S9's co-writer free path — `crate::cowriter::ship_displaced_frees`): the
-/// router-level free SHIPS to the authority, which runs the whole ladder.
-///
-/// The allocator-level arms below the router keep refusing here as
-/// defense-in-depth — but they ARE reachable by the error-cleanup class
-/// (a pipeline upload whose DMA or publish failed, the RES-9 mint guard,
-/// the lane-reservation give-back, the staged flush/fold/promotion/spill
-/// undos: never-published offsets no map names, which the router's
-/// key-routed ship seam cannot carry), and the
-/// 2026-08-19 mw-fleet capture proved a custody loss turns that class
-/// into an ERROR-per-block storm through this refusal. Those arms'
-/// sanctioned exit is
-/// [`crate::block_allocator::BlockAllocator::abandon_unpublished_offset`]
-/// (quiet, counted `cowriter_unpublished_abandons` — the leak-safe
-/// abandon the `free_ship_failures` pattern states). So this counter's
-/// steady state is the arms that stay local by DECISION — the specific
-/// claim, the W1 incarnation retire (whose product ladders decline
-/// upstream as `patch_ineligible_posture`), the recovery walk, direct
-/// device reclaim — plus any free arm not yet routed through either
-/// sanctioned exit, which is a bug worth the loud error.
 /// Symmetric PR 12 — the standard refusal for **ownership accounting** on
 /// a data volume whose ALLOCATION LEASE this armed writer does not hold
 /// (design-symmetric-metadata §5.5 / §7.3): the bitmap, the terminal
 /// free, the grace ring and the quarantine are the holder's, and a
-/// non-holder's frees SHIP to it. Counted on the co-writer accounting
-/// gauge — it is the same class one lease finer.
+/// non-holder's frees SHIP to it. The allocator-level arms below the
+/// router keep refusing here as defense-in-depth — the error-cleanup
+/// class (a pipeline upload whose DMA or publish failed, the RES-9 mint
+/// guard, the staged flush/fold/promotion/spill undos: never-published
+/// offsets no map names) exits through
+/// [`crate::block_allocator::BlockAllocator::abandon_unpublished_offset`]
+/// (quiet, counted `unpublished_mint_abandons`), so this counter's steady
+/// state is the arms that stay local by DECISION — the specific claim, the
+/// W1 incarnation retire (whose ladders decline upstream as
+/// `patch_ineligible_posture`), the recovery walk, direct device reclaim
+/// — plus any free arm routed through neither sanctioned exit, which is a
+/// bug worth the loud error (`accounting_plane_refusals`).
 pub(crate) fn lease_refusal(what: &str, vol_tag: u64) -> crate::error::SqueezefsError {
     METRICS
-        .cowriter_accounting_refusals
+        .accounting_plane_refusals
         .fetch_add(1, Ordering::Relaxed);
     crate::error::SqueezefsError::InvalidOperation(format!(
         "{what} refused: this armed symmetric writer does not hold the ALLOCATION LEASE of \
@@ -911,29 +786,6 @@ pub(crate) fn lease_refusal(what: &str, vol_tag: u64) -> crate::error::Squeezefs
          holds). Fresh allocation is admitted from the block GRANTS the holder carves; a \
          terminal free is admitted by SHIPPING to the holder — an accounting arm reaching this \
          text came through neither sanctioned exit."
-    ))
-}
-
-pub(crate) fn co_writer_refusal(what: &str) -> crate::error::SqueezefsError {
-    METRICS
-        .cowriter_accounting_refusals
-        .fetch_add(1, Ordering::Relaxed);
-    crate::error::SqueezefsError::InvalidOperation(format!(
-        "{what} refused: this mount is a CO-WRITER (DLM S9 — metadata read-only locally with \
-         mutations shipped to the authority, data read-write under a granted custody lease). A \
-         co-writer holds DATA authority, not ownership-ACCOUNTING authority: which device \
-         offsets are OWNED is durable metadata (TREE_BLOCK_REFS) on volumes this mount cannot \
-         commit to, so retiring an incarnation or claiming a named block here would be this \
-         node inventing an answer about shared hardware. Fresh ALLOCATION is admitted from the \
-         data-plane allocation LANE the authority grants on the custody lease \
-         (docs/design-mw-data-alloc-partition.md) — so if this was an allocation, this mount \
-         holds no lane on this volume. A TERMINAL FREE is admitted too, by SHIPPING: the \
-         router-level free travels as a publish verb and the authority runs the ladder — and a \
-         minted-but-never-published offset's error cleanup is admitted through the quiet \
-         abandon arm (abandon_unpublished_offset, counted cowriter_unpublished_abandons) — so \
-         a free reaching this text came through an allocator-level arm routed through neither \
-         sanctioned exit. Mount this node as the authority (unset SQUEEZEFS_MW_ROLE) to own \
-         the accounting here."
     ))
 }
 
@@ -6046,11 +5898,6 @@ pub struct Metrics {
     /// stay 0 on single-writer rows** — on the authority the pin's own
     /// reference keeps the entry alive until the seal releases it.
     pub pack_release_untracked_noops: Align64<AtomicU64>,
-    /// Promotions a CO-WRITER ran one-block-per-file because its membership
-    /// grant does not advertise pack groups (`Grant::pack_group_available`
-    /// — the set authority's D-1c lever posture, PK4). The never-wrong
-    /// fallback, counted; 0 on a same-commit fleet with the default lever.
-    pub pack_cowriter_group_unavailable: Align64<AtomicU64>,
     // PK3 (design-small-file-packing §5.7 / §5.11 — the tenant ops + the
     // mover interplay).
     /// Passthrough truncate-shrinks of a size-carrying mapping that
@@ -6075,43 +5922,6 @@ pub struct Metrics {
     pub pack_blocks_sealed_drain: Align64<AtomicU64>,
     // PK4 — the co-writer per-(owner, home volume) group pack
     // (design-small-file-packing §5.6, §10).
-    /// Co-writer batch packs sealed at their frame reply (§5.3 (c)).
-    pub pack_blocks_sealed_batch: Align64<AtomicU64>,
-    /// Co-writer promotion BATCHES the group driver ran
-    /// (`DataRouter::promote_staged_batch` on the co-writer posture).
-    pub pack_cowriter_batches: Align64<AtomicU64>,
-    /// Every `pack_group` frame a co-writer shipped — served or refused
-    /// (a transport resend of the same frame is not a second frame).
-    pub pack_cowriter_frames: Align64<AtomicU64>,
-    /// `pack_group` frames whose group LANDED, and the tenants they
-    /// committed: `tenants ÷ frames` is the live pack width on a co-writer
-    /// (a frame per tenant means the batch driver regressed to per-file
-    /// commits).
-    pub pack_batch_frames: Align64<AtomicU64>,
-    pub pack_batch_tenants: Align64<AtomicU64>,
-    /// The `(owner endpoint, home meta volume)` partitions a co-writer batch
-    /// was split into, counted only when there was more than one (≈ meta
-    /// volumes per batch on a round-robin-minted population — the stated
-    /// pack-ratio cost, §5.6).
-    pub pack_batch_volume_splits: Align64<AtomicU64>,
-    /// Promotions a co-writer ran one-block-per-file because the owner
-    /// refused a `pack_group` frame `PUBLISH_PACK_GROUP_UNAVAILABLE` (the
-    /// `SQUEEZEFS_PUBLISH_CONVEYOR_GROUP=0` control arm or an older owner;
-    /// the endpoint is latched until the next grant). 0 on a same-commit
-    /// fleet with the default lever.
-    pub pack_cowriter_group_refusals: Align64<AtomicU64>,
-    /// Promotions a co-writer ran one-block-per-file because a `pack_group`
-    /// frame was refused `PUBLISH_PACK_GROUP_SPLIT` a SECOND time (a
-    /// migration still in flight) — the first SPLIT re-`prepare`s every
-    /// tenant into fresh packs (`pack_blocks_abandoned` ticks with it). 0
-    /// with no `migrate-meta-slot` in flight.
-    pub pack_cowriter_group_splits: Align64<AtomicU64>,
-    /// The owner side: `pack_group` frames received; refused SPLIT (the
-    /// post-gate route re-derivation found two home volumes); refused
-    /// UNAVAILABLE (this owner's D-1c lever is `0`).
-    pub served_pack_group_frames: Align64<AtomicU64>,
-    pub served_pack_group_splits: Align64<AtomicU64>,
-    pub served_pack_group_unavailable: Align64<AtomicU64>,
     /// The authority's served-publish SCREEN (§5.6 (2)) refused a publish
     /// adopting a block it holds RELEASED (free list / grace / quarantine)
     /// — `PUBLISH_FREE_BLOCK_REFUSED`. **Must stay 0**: the belt catching
@@ -6527,19 +6337,6 @@ pub struct Metrics {
     /// a per-write cost — steady-state picks leave this flat (pinned in
     /// tests/placement_tests.rs).
     pub placement_table_refreshes: Align64<AtomicU64>,
-    /// Lane-aware placement on a laned co-writer
-    /// (`.benchmarks/2026-09-07-cowriter-lane-aware-placement.md`;
-    /// `BackendRouter::allocate_placed_block`): placed allocations that
-    /// landed on a volume OTHER than the §5.9 pick because the pick's lane
-    /// refused `StorageFull` and a sibling's lane had supply. 0 on every
-    /// single-writer / authority mount and under
-    /// `SQUEEZEFS_COWRITER_LANE_PLACEMENT=0` by construction.
-    pub backend_placement_lane_failovers: Align64<AtomicU64>,
-    /// Picks that landed on a volume whose lane-reachable supply was 0
-    /// while another eligible volume's was not — the lane-aware pick's
-    /// miss ledger. ≈ 0 by construction (the pick reads the same O(1)
-    /// counters); growth = predicate rot.
-    pub backend_placement_lane_exhausted_picks: Align64<AtomicU64>,
     /// PR VL6a `fsck_*` family (design-volume-lifecycle §10, §5.6):
     /// cumulative across runs on this daemon. **`fsck_findings` must be
     /// 0 on a healthy volume — the tripwire.**
@@ -6567,13 +6364,11 @@ pub struct Metrics {
     /// one per open pack — the tenants' transient references ride
     /// `fsck_inflight_exempted`.
     pub fsck_pack_ledger_exempted: Align64<AtomicU64>,
-    /// DLM S9 (rung-10 finding #5): block-plane verdicts declined because
-    /// the object lives in an allocation LANE this mount does not own —
-    /// C2's foreign-lane exemptions plus C6's whole-census decline under
-    /// an engaged partition (a live peer's blocks are structurally
-    /// untracked by this mount's own-lane census; C8 stays the
-    /// multi-writer oracle). 0 on every unpartitioned mount.
-    pub fsck_foreign_lane_exempted: Align64<AtomicU64>,
+    /// C6's whole-census decline on a grant-armed allocator whose
+    /// allocation lease this process does not hold (a joined writer's data
+    /// volume): the holder's bitmap oracle is the census; C8 stays the
+    /// multi-writer oracle. 0 on every holder and every unarmed mount.
+    pub fsck_alloc_census_declined: Align64<AtomicU64>,
     /// C11 (kvmap, design-kvmap-block-map-tree §3 fsck + §5 gauges):
     /// verified orphan tree-7 map records — records whose owner ino has
     /// no live inode record, or whose head is not kvmap-class (crossing
@@ -6946,183 +6741,33 @@ pub struct Metrics {
     /// `data_dma_epoch_refusals`, whose growth it explains. **0 on every
     /// single-writer mount** — nothing revokes custody there.
     pub dlm_custody_epoch_advances: Align64<AtomicU64>,
-    // DLM **S9** blocker #3 — the data-plane allocation partition
-    // (`crate::data_alloc_lane`, docs/design-mw-data-alloc-partition.md).
-    // Every field is 0 on a single-writer mount BY CONSTRUCTION: a solo
-    // partition installs nothing at all.
-    /// Lanes the block-index space is partitioned into (`W`). **0 = no
-    /// partition**, which is every mount today — the whole machinery is
-    /// then structurally inert (one `OnceLock` probe on the allocation
-    /// path, none on the free path).
-    pub alloc_lane_writers: Align64<AtomicU64>,
-    /// This mount's own lane id (`w` of `W`); 0 when unpartitioned.
-    pub alloc_lane_id: Align64<AtomicU64>,
-    /// Lanes this mount may mint in — its own plus every lane ADOPTED
-    /// under a drain proof. `1` on an engaged partition that has adopted
-    /// nothing; 0 when unpartitioned.
-    pub alloc_lanes_owned: Align64<AtomicU64>,
-    /// Durable reservation raises: one metadata commit per
-    /// `data_alloc_lane::reserve_grain_blocks` FRESH blocks per lane
-    /// (free-list reuse never reserves). Raises ÷ fresh blocks is the live
-    /// amortization factor; growth proportional to allocations means the
-    /// grain collapsed.
-    pub alloc_lane_reservations: Align64<AtomicU64>,
-    /// Reservation raises that **travelled** to the authority instead of
-    /// committing locally (DLM S9's co-writer allocation lane —
-    /// `crate::alloc_lane_grant`). This is the CO-WRITER engagement
-    /// instrument: a co-writer's raises are all shipped (it holds no metadata
-    /// authority), so on an admitted co-writer this tracks
-    /// `alloc_lane_reservations`, and **0 with a nonzero `alloc_lane_id`
-    /// means the mount is committing its own frontier** — which only an
-    /// authority may do. 0 on every authority and every single-writer mount.
-    pub alloc_lane_shipped_reservations: Align64<AtomicU64>,
-    /// Reservation raises **refused** — by the authority (the lane is not the
-    /// one it assigned, the width is not this era's, or the presented lease is
-    /// not custody) or by the transport. **Must stay 0**: a refused raise
-    /// means an offset was NOT handed out (a co-writer's write stalls loudly
-    /// rather than using an uncovered offset), and a lane/width refusal means
-    /// two mounts disagree about who owns a residue class.
-    pub alloc_lane_raise_refusals: Align64<AtomicU64>,
-    /// Lanes adopted after their holder was proven dead (the ENOSPC/fairness
-    /// answer — the witness is S7's `DeadEpoch`, the same drain proof
-    /// `release_quarantine` demands). 0 on a healthy set.
-    pub alloc_lane_adoptions: Align64<AtomicU64>,
-    /// Allocations refused `StorageFull` **because this lane is exhausted**
-    /// — the refusal names how many free blocks belong to lanes this mount
-    /// does not own. **Must stay 0**: growth means a writer is starving
-    /// while the set has space, i.e. the partition width or the load skew
-    /// needs the operator's attention (`docs/operations.md` §Multi-writer
-    /// capacity planning).
-    pub alloc_lane_enospc_refusals: Align64<AtomicU64>,
-    /// The **published stranding bound**: bytes of this mount's data
-    /// volumes that belong to lanes it does not own
-    /// (`data_alloc_lane::stranded_blocks_bound × chunk_size`, summed as
-    /// each volume engages). This is the number capacity planning uses;
-    /// adopting a lane lowers it.
-    pub alloc_lane_stranded_bytes: Align64<AtomicU64>,
-    /// Stale `alloc_lane:` records **pruned** by the arm-time hygiene pass
-    /// (rung 10 — rung-8 finding #4's residual): records whose width belongs
-    /// to no live claim-set era. Nonzero once per affected volume set, then
-    /// flat — steady growth means something keeps minting retired-era
-    /// frontiers (`data_alloc_lane::prune_stale_lane_records`).
-    pub alloc_lane_stale_records_pruned: Align64<AtomicU64>,
-    /// The subset of pruned records whose frontier was FOLDED into every
-    /// current-width lane record first (the partitioned arm — clause-3
-    /// protection carried through the delete). 0 under a solo era.
-    pub alloc_lane_stale_records_folded: Align64<AtomicU64>,
-    /// Lane free HARVEST attempts (rung 10, residual 2): a co-writer's
-    /// allocation funnel asking the authority for its lane's freed supply
-    /// at lane exhaustion. 0 on every non-co-writer mount by construction.
-    /// The RPC count: with the two below, `harvests + coalesced +
-    /// declined_stale` accounts for every would-be call.
-    pub alloc_lane_harvests: Align64<AtomicU64>,
-    /// The single-flight harvest's join ledger (finding 15 phase B1,
-    /// `SQUEEZEFS_ALLOC_LANE_HARVEST_SINGLE_FLIGHT`): callers — parked
-    /// allocations, the ahead/pushed ticks — that found a harvest RPC in
-    /// flight on their allocator and awaited ITS outcome instead of
-    /// issuing their own. Growth under a park is the lever working (each
-    /// one is an RPC the authority's serve plane never saw); 0 with the
-    /// lever off by construction.
-    pub alloc_lane_harvest_coalesced: Align64<AtomicU64>,
-    /// The single-flight harvest's decline ledger: callers that found the
-    /// last reply EMPTY with the authority's advertisement unmoved since
-    /// (no grant, no wake, no owed `Freed`) and took the `0` without a
-    /// wire trip. One per park slice per parked allocation on a starved
-    /// lane; the next grant ends the window for exactly one RPC. 0 with
-    /// the lever off by construction.
-    pub alloc_lane_harvest_declined_stale: Align64<AtomicU64>,
-    /// Block indices ADOPTED from lane free harvests into this mount's own
-    /// free list — the reuse-engagement instrument beside the publish
-    /// ledger's `harvest_shipped_blocks` (a sustained-rewrite row past the
-    /// lane share must grow both, or the mount is burning frontier).
-    pub alloc_lane_harvested_blocks: Align64<AtomicU64>,
     /// Sustain campaign §8 (**the attribution split PR 1 exists for**):
     /// allocations served from the FREE LIST at `try_allocate_block`'s
-    /// reuse exit. With `alloc_fresh_mints` and
-    /// `alloc_lane_harvested_blocks` these decompose every allocation's
-    /// source, so a capture can name which stream is recycle-bound.
+    /// reuse exit. With `alloc_fresh_mints` these decompose every
+    /// allocation's source, so a capture can name which stream is
+    /// recycle-bound.
     pub alloc_from_freelist: Align64<AtomicU64>,
     /// The split's other arm: virgin-tail mints at the fresh exit.
     pub alloc_fresh_mints: Align64<AtomicU64>,
-    /// §5.5 (PR 4): the SUM of the per-allocator owed words — blocks this
-    /// mount's SHIPPED frees' `Freed` verdicts left on authorities' free
-    /// lists, not yet harvested back: the explicit-ship arm's face, a
-    /// strict subset of the authority's advertised lane supply
-    /// (`free_grace_lane_supply_hint`) and NOT the refill gate since
-    /// 2026-09-07 (`BlockAllocator::lane_owed`).
-    pub alloc_lane_owed_blocks: Align64<AtomicU64>,
-    /// Ahead-of-stall harvests fired by the watermark task (0 under
-    /// `SQUEEZEFS_ALLOC_LANE_HARVEST_AHEAD=0` — the ENOSPC-only shape).
-    pub alloc_lane_ahead_harvests: Align64<AtomicU64>,
-    /// PUSHED harvests (finding 15 term 2, `SQUEEZEFS_FREE_GRACE_LANE_PUSH`):
-    /// refills a renewal grant's lane-supply hint woke — the co-writer
-    /// engagement instrument beside `free_grace_lane_push_wakes` (0 with
-    /// the lever off, and on every mount that is not a laned co-writer).
-    pub alloc_lane_pushed_harvests: Align64<AtomicU64>,
-    /// The refill-hint gate's engagement (2026-09-07,
-    /// `.benchmarks/2026-09-07-lane-refill-hint-gate.md`): proactive
-    /// harvests (ahead + pushed) that fired with the owed word at 0 — the
-    /// ones the retired owed-only gate would have declined, i.e. supply the
-    /// authority's publish recompute put on its list. ⊆ `ahead + pushed`;
-    /// 0 under `SQUEEZEFS_ALLOC_LANE_REFILL_HINT=0` by construction.
-    pub alloc_lane_hint_refills: Align64<AtomicU64>,
-    /// The per-volume hint's engagement (finding 15's fpp residue,
-    /// `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT` — `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`):
-    /// pushed decisions a volume DECLINED because the grant's vector
-    /// advertised 0 for it while the mount sum — the sibling's share —
-    /// would have fired the shipped decision: each is one empty harvest
-    /// RPC the vector saved (≈ 20 % of a fpp co-writer's harvests on the
-    /// s11 fleet). 0 under `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT=0` by
-    /// construction.
-    pub alloc_lane_volume_hint_skips: Align64<AtomicU64>,
-    /// The derived watermark in force (blocks; `ceil(rate × horizon)`
-    /// capped at lane-share/4 — derived, never a knob).
-    pub alloc_lane_harvest_watermark: Align64<AtomicU64>,
-    /// Harvest replies that carried a nonzero bound-age hint (OQ 2). 0
-    /// with harvests flowing = the fallback derivation is the horizon.
-    pub alloc_lane_horizon_hints: Align64<AtomicU64>,
-    /// The refill horizon in force, ms (the `depth_target` publication
-    /// precedent: the measured composition when hinted).
-    pub alloc_lane_harvest_horizon_ms: Align64<AtomicU64>,
-    /// The capacity law, published (hold-time campaign): the blocks this
-    /// lane needs — `ceil(claim rate × refill horizon) + live` — against
-    /// its `cap/W` share, and the headroom `(share − needed) ÷ share` in
-    /// percent (saturating at 0). A lane exhausts exactly when the
-    /// headroom reaches 0. Last-sampled volume's, like the watermark.
-    pub alloc_lane_share_needed_blocks: Align64<AtomicU64>,
-    pub alloc_lane_headroom_pct: Align64<AtomicU64>,
-    // DLM **S9** (spec §6.2 item 7's consumer half): the CO-WRITER mount
-    // posture. All four are 0 on every shipped mount — the posture is
-    // opt-in twice over (`SQUEEZEFS_MULTI_WRITER=1` +
-    // `SQUEEZEFS_MW_ROLE=co-writer`) and nothing stamps the capability
-    // bits it requires (ruling D9).
-    /// Co-writer admissions GRANTED by the five-rung ladder
-    /// (`cowriter::classify_admission`). One per admitted mount, so on a
-    /// healthy co-writer this reads 1 and never grows again.
-    pub cowriter_admissions: Align64<AtomicU64>,
-    /// Co-writer admissions REFUSED, whatever the rung. Growth on a node
-    /// that should be admitted is the operator's signal to read the log:
-    /// every refusal names its rung, what is missing, and the remedy.
-    pub cowriter_admission_refusals: Align64<AtomicU64>,
-    /// Ownership-ACCOUNTING mutations refused on a co-writer. Since the
-    /// allocation-lane grant AND the shipped free path landed, the arms
-    /// this counts are the ones that stay local by DECISION: the specific
-    /// claim (`allocate_specific_block` — lane-blind), the **W1
-    /// incarnation retire** (a lifetime retire is durable ownership state
-    /// and the §5.1 fence is process-local — a co-writer's small
-    /// overwrite rides CoW-rewrite + shipped free instead; the product
-    /// W1 ladders decline UPSTREAM as `patch_ineligible_posture` and
-    /// never reach this counter), the ownership recovery walk, direct
-    /// device reclaim, and any ALLOCATOR-level free a surface reaches
-    /// without the router (the product write path never does — its
-    /// displaced frees SHIP, `meta_ship_publish.free_shipped_blocks`, and
-    /// its never-published error cleanups exit through
-    /// `BlockAllocator::abandon_unpublished_offset`, counted apart as
-    /// `cowriter_unpublished_abandons`). **Steady growth on a rewriting
-    /// co-writer is therefore a bug again**, not the honest gap it used
-    /// to be.
-    pub cowriter_accounting_refusals: Align64<AtomicU64>,
-    /// Never-published block offsets a co-writer ABANDONED leak-safe
+    // The shipped-free wire's non-holder faces (symmetric PR 8/12b — a
+    // writer that is not a data volume's allocation-lease HOLDER ships its
+    // terminal frees there; the retired co-writer posture's counters left
+    // with it at 1.3.0).
+    /// Ownership-ACCOUNTING mutations refused on a mount that holds no
+    /// allocation lease on the volume (`BlockAllocator::plane_gate`): the
+    /// specific claim (`allocate_specific_block`), the **W1 incarnation
+    /// retire** (a lifetime retire is durable ownership state — a
+    /// non-holder's small overwrite rides CoW-rewrite + the shipped free;
+    /// the W1 ladders decline UPSTREAM as `patch_ineligible_posture`), the
+    /// ownership recovery walk, direct device reclaim, and any
+    /// ALLOCATOR-level free a surface reaches without the router (the
+    /// product write path never does — its displaced frees SHIP,
+    /// `meta_ship_publish.free_shipped_blocks`, and its never-published
+    /// error cleanups exit through `abandon_unpublished_offset`, counted
+    /// apart as `unpublished_mint_abandons`). **Steady growth on a
+    /// rewriting joined writer is a bug.**
+    pub accounting_plane_refusals: Align64<AtomicU64>,
+    /// Never-published block offsets a non-holder ABANDONED leak-safe
     /// instead of freeing — the error-cleanup arms' one sanctioned exit
     /// ([`crate::block_allocator::BlockAllocator::abandon_unpublished_offset`]:
     /// a pipeline upload whose DMA or publish failed, the RES-9 mint
@@ -7136,18 +6781,10 @@ pub struct Metrics {
     /// design's recovery owns it: it stays durably unreferenced and the
     /// next derivation (mount recovery / fsck C6) returns it to the free
     /// supply — the `free_ship_failures` pattern. Expected nonzero ONLY
-    /// around custody loss (poison / self-fence / authority failover),
-    /// when every in-flight upload's publish refuses at once; steady
-    /// growth on a healthy co-writer means an upload path keeps failing
-    /// its publishes.
-    pub cowriter_unpublished_abandons: Align64<AtomicU64>,
-    /// Finding 15: never-published mints a LIVE co-writer returned to its
-    /// OWN lane free list instead of abandoning (the superseded overlay
-    /// destination, a failed-publish upload — no ledger anywhere ever
-    /// named them). The healthy-co-writer twin of
-    /// `cowriter_unpublished_abandons`, which now grows only around custody
-    /// loss or on an offset outside this mount's lanes.
-    pub cowriter_unpublished_recycles: Align64<AtomicU64>,
+    /// around custody loss (poison / self-fence / holder failover), when
+    /// every in-flight upload's publish refuses at once; steady growth on
+    /// a healthy writer means an upload path keeps failing its publishes.
+    pub unpublished_mint_abandons: Align64<AtomicU64>,
     /// Symmetric PR 13: a JOINED appender's never-published mint (a
     /// superseded overlay destination, a failed-publish upload) given
     /// back to its own grant WINDOW (`GrantWindow::give_back`) — the
@@ -7155,89 +6792,14 @@ pub struct Metrics {
     /// co-writer's lane list does not exist and the allocator's terminal
     /// free is the holder's act. 0 on every holder and every unarmed mount.
     pub block_grant_window_recycles: Align64<AtomicU64>,
-    /// Displaced-block frees this co-writer SHIPPED for an offset in its
-    /// OWN lane that it no longer tracked locally — a lifetime this mount
-    /// already released once (the first displacement retired the entry),
-    /// re-displaced by a key a stale layout refetch resurrected. Each is
-    /// answered `Refused` on the authority's untracked tripwire when the
-    /// first free's offset still sits in grace, so this is the co-writer
-    /// face of the fleet's residual `block_untracked_free_refusals`
-    /// (`.benchmarks/2026-09-06-cowriter-free-residual-lineage.md` §6).
-    /// Foreign-lane keys (predecessors another writer minted) are
-    /// untracked here by construction and are not counted.
-    pub cowriter_free_ship_own_lane_untracked: Align64<AtomicU64>,
-    /// Parked rewrite-epoch keys whose LOCAL tracking this co-writer
-    /// retired on a served publish reply's `freed` set (publish schema
-    /// 15) — the recompute arm's hygiene, run at the covering publish
-    /// instead of the epoch close (`.benchmarks/2026-09-07-cowriter-claim-
-    /// anomaly-lineage.md`: a block the authority freed by recompute
-    /// mid-epoch came back through the lane harvest and was re-claimed
-    /// while the entry still lingered — the fpp phases' `CLAIM ANOMALY`).
-    /// The explicit-ship arm's twin is the `Freed`-verdict retire inside
-    /// `ship_displaced_frees`, which this counter never sees.
-    pub cowriter_recomputed_retires: Align64<AtomicU64>,
-    /// Local tracking entries this co-writer released on the AUTHORITY's
-    /// lane-free notices (publish schema 16): blocks of this mount's lane
-    /// the authority displaced and freed through its OWN publishes — the
-    /// assembler's fold of this mount's shipped extents on the s11 fleet
-    /// (`.benchmarks/2026-09-07-cowriter-claim-anomaly-population.md`) —
-    /// a free no reply to this mount ever named, so the entry lingered
-    /// until the lane harvest handed the offset back and `claim_block_idx`
-    /// tripped (`block_claim_anomalies`, ≈ the authority's `fold_passes`
-    /// per fpp phase). Every reply frame the authority sends this client
-    /// carries the notices queued since the last one, so the frame that
-    /// hands an offset back can never precede its notice.
-    pub cowriter_lane_free_notices: Align64<AtomicU64>,
-    /// Lane-free notices that named an offset this mount had ALREADY
-    /// re-minted from a later harvest grant (the notice's `after_grants`
-    /// below the offset's grant sequence — a reply reordered across the
-    /// ship depth's sessions): the live lifetime was touched by nobody.
-    /// ≈ 0 in steady state; growth is the reorder race engaging, never a
-    /// correctness fault.
-    pub cowriter_lane_free_notices_reminted: Align64<AtomicU64>,
-    /// LOCAL metadata commits refused on a co-writer — the mutations that
-    /// reached the backend's write gate instead of the shipped publish
-    /// path. **Should stay 0 on a healthy co-writer**: a nonzero value
-    /// means a daemon surface still commits directly rather than routing
-    /// through `meta_ship`, i.e. S8's "the daemon is not switched onto the
-    /// router" gap reaching a real workload.
-    pub cowriter_local_commit_refusals: Align64<AtomicU64>,
-    // Per-volume claim admission (`docs/design-per-volume-claim-admission.md`
-    // §11.1): the two top-level counters of the partial-writer open. Both
-    // are 0 on every shipped mount, because the posture is opt-in twice
-    // over and nothing selects it until PR 5.
-    /// LOCAL metadata commits refused on a **peer-owned** volume — the
-    /// mutations that reached the backend's write gate instead of the
-    /// shipped path. **MUST STAY 0**: distinct from
-    /// `cowriter_local_commit_refusals` because a partial authority DOES
-    /// hold metadata authority (over the volumes it owns), so the two
-    /// classes name different bugs and folding them would rot both.
-    pub peer_volume_local_commit_refusals: Align64<AtomicU64>,
-    /// Mount-open refusals on a peer-owned volume whose CLAIM cannot be
-    /// reconciled with the assignment: a TTL-stale claim that attributes
-    /// to nobody, or to a node the record does not entitle (§5.1.1's
-    /// `Peer` column). Something appended there that the record cannot
-    /// account for, so the mount fails closed and the remedy is
-    /// `squeezefs claim clear` or an offline re-assignment.
-    ///
-    /// A volume with NO claim is NOT this class any more — that is the
-    /// degraded not-yet-up state, which admits and is counted by
-    /// `peer_volume_unclaimed_admits`.
-    pub peer_volume_unclaimed_refusals: Align64<AtomicU64>,
-    /// Peer-owned volumes ADMITTED with no appender: nothing claims them,
-    /// so their owner has not started yet (every volume of a cold fleet)
-    /// or is down. Not a tripwire — it is the number of subtrees this
-    /// mount came up DEGRADED over, and `meta_ship.volumes_peer_unclaimed`
-    /// is the same reading as a gauge. Both are mount-time facts, never
-    /// liveness: `squeezefs volume get-owners` answers who is appending
-    /// now.
-    pub peer_volume_unclaimed_admits: Align64<AtomicU64>,
-    /// Open cross-volume intents found at mount whose steps span two
-    /// metadata OWNERS (§5.4a case (c)). **MUST STAY 0** — the M1
-    /// cross-owner pre-check is what keeps it there; a nonzero value means
-    /// a cross-owner mutation escaped that check and half-committed, which
-    /// no process in the fleet can roll forward.
-    pub xv_cross_owner_intents: Align64<AtomicU64>,
+    /// Parked rewrite-epoch keys whose LOCAL tracking this writer retired
+    /// on a served publish reply's `freed` set (publish schema 15) — the
+    /// recompute arm's hygiene, run at the covering publish instead of the
+    /// epoch close (`.benchmarks/2026-09-07-cowriter-claim-anomaly-
+    /// lineage.md`). The explicit-ship arm's twin is the `Freed`-verdict
+    /// retire inside `shipped_free::ship_displaced_frees`, which this
+    /// counter never sees.
+    pub recomputed_retires: Align64<AtomicU64>,
     // DLM **S6** (pre-RC spec §6.5 item 3, §6.9 S6): the membership plane.
     // Liveness is RAM state renewed over `cluster_wire`, so these are the
     // instruments that say so — the gauges (`membership_mode`,
@@ -8126,7 +7688,7 @@ pub struct Metrics {
     /// overwrite rides CoW-rewrite + shipped free instead. Counted as a
     /// DECISION here, before any allocator arm runs, so the probe never
     /// reaches `plane_gate`'s ERROR-per-attempt refusal (which moves
-    /// `cowriter_accounting_refusals`, a must-stay-≈0 bug tripwire on
+    /// `accounting_plane_refusals`, a must-stay-≈0 bug tripwire on
     /// rewriting co-writers) and never pollutes `patch_ineligible_shared`
     /// with its fallback. Symmetric PR 13 gave it a PER-VOLUME face: a
     /// JOINED appender holding no ALLOCATION LEASE for the block's data
@@ -10061,23 +9623,6 @@ impl SqueezefsFilesystem {
             .unwrap_or(0)
     }
 
-    /// `volumes_peer_owned` — the volumes of this set a PEER authority
-    /// appends to (§11.1's partition-at-a-glance gauge).
-    fn peer_owned_volume_count(&self) -> usize {
-        self.meta_backend
-            .as_ref()
-            .map(|r| {
-                r.volumes
-                    .iter()
-                    .filter(|v| {
-                        v.read_only_cause()
-                            == crate::meta_backend::kv::backend::ReadOnlyCause::PeerOwnedVolume
-                    })
-                    .count()
-            })
-            .unwrap_or(0)
-    }
-
     /// `reader_staleness_bound_owners` — how many distinct OWNERS the
     /// mount's projection depends on. `0` when it depends on none;
     /// otherwise the ownership plane's peer count when armed, and 1
@@ -11570,14 +11115,6 @@ impl SqueezefsFilesystem {
             .collect();
         let placement_obj = serde_json::json!({
             "backend_fill_spread": placement_table.fill_spread,
-            // Lane-aware placement on a laned co-writer: both 0 on every
-            // other posture by construction.
-            "backend_placement_lane_failovers": METRICS
-                .backend_placement_lane_failovers
-                .load(Ordering::Relaxed),
-            "backend_placement_lane_exhausted_picks": METRICS
-                .backend_placement_lane_exhausted_picks
-                .load(Ordering::Relaxed),
             "backends": placement_backends,
         });
 
@@ -11854,24 +11391,11 @@ impl SqueezefsFilesystem {
                 "pack_partial_frees": METRICS.pack_partial_frees.load(Ordering::Relaxed),
                 "pack_terminal_frees": METRICS.pack_terminal_frees.load(Ordering::Relaxed),
                 "pack_release_untracked_noops": METRICS.pack_release_untracked_noops.load(Ordering::Relaxed),
-                "pack_cowriter_group_unavailable": METRICS.pack_cowriter_group_unavailable.load(Ordering::Relaxed),
                 // PK3
                 "pack_mapping_clips": METRICS.pack_mapping_clips.load(Ordering::Relaxed),
                 "pack_mover_open_defers": METRICS.pack_mover_open_defers.load(Ordering::Relaxed),
                 "pack_mover_resident_defers": METRICS.pack_mover_resident_defers.load(Ordering::Relaxed),
                 "pack_blocks_sealed_drain": METRICS.pack_blocks_sealed_drain.load(Ordering::Relaxed),
-                // PK4
-                "pack_blocks_sealed_batch": METRICS.pack_blocks_sealed_batch.load(Ordering::Relaxed),
-                "pack_cowriter_batches": METRICS.pack_cowriter_batches.load(Ordering::Relaxed),
-                "pack_cowriter_frames": METRICS.pack_cowriter_frames.load(Ordering::Relaxed),
-                "pack_batch_frames": METRICS.pack_batch_frames.load(Ordering::Relaxed),
-                "pack_batch_tenants": METRICS.pack_batch_tenants.load(Ordering::Relaxed),
-                "pack_batch_volume_splits": METRICS.pack_batch_volume_splits.load(Ordering::Relaxed),
-                "pack_cowriter_group_refusals": METRICS.pack_cowriter_group_refusals.load(Ordering::Relaxed),
-                "pack_cowriter_group_splits": METRICS.pack_cowriter_group_splits.load(Ordering::Relaxed),
-                "served_pack_group_frames": METRICS.served_pack_group_frames.load(Ordering::Relaxed),
-                "served_pack_group_splits": METRICS.served_pack_group_splits.load(Ordering::Relaxed),
-                "served_pack_group_unavailable": METRICS.served_pack_group_unavailable.load(Ordering::Relaxed),
                 "served_publish_free_block_refusals": METRICS.served_publish_free_block_refusals.load(Ordering::Relaxed),
                 // PK6
                 "frag_d1_pack_occupancy": crate::defrag::decode_ratio(METRICS.frag_d1_pack_occupancy.load(Ordering::Relaxed)),
@@ -12054,7 +11578,7 @@ impl SqueezefsFilesystem {
                 "fsck_inflight_exempted": METRICS.fsck_inflight_exempted.load(Ordering::Relaxed),
                 "fsck_mover_ledger_exempted": METRICS.fsck_mover_ledger_exempted.load(Ordering::Relaxed),
                 "fsck_pack_ledger_exempted": METRICS.fsck_pack_ledger_exempted.load(Ordering::Relaxed),
-                "fsck_foreign_lane_exempted": METRICS.fsck_foreign_lane_exempted.load(Ordering::Relaxed),
+                "fsck_alloc_census_declined": METRICS.fsck_alloc_census_declined.load(Ordering::Relaxed),
                 "fsck_dentry_refs_indexed": METRICS.fsck_dentry_refs_indexed.load(Ordering::Relaxed),
                 "fsck_current_era_exempted": METRICS.fsck_current_era_exempted.load(Ordering::Relaxed),
                 "fsck_unreferenced_intent_exempted": METRICS.fsck_unreferenced_intent_exempted.load(Ordering::Relaxed),
@@ -12163,22 +11687,6 @@ impl SqueezefsFilesystem {
                 "writeback_stale_token_retries": METRICS.writeback_stale_token_retries.load(Ordering::Relaxed),
                 "writeback_orphan_discards": METRICS.writeback_orphan_discards.load(Ordering::Relaxed),
                 "writeback_fence_noops": METRICS.writeback_fence_noops.load(Ordering::Relaxed),
-                // Per-volume claim admission (§11.1): four top-level
-                // counters, all 0 on every shipped mount.
-                // `peer_volume_local_commit_refusals` and
-                // `xv_cross_owner_intents` are MUST-STAY-0 tripwires;
-                // `peer_volume_unclaimed_refusals` is a claim the
-                // assignment cannot account for; `peer_volume_unclaimed_admits`
-                // is R13's operational face — this set came up with an
-                // owner absent, and only that owner's subtree is degraded.
-                "peer_volume_local_commit_refusals": METRICS.peer_volume_local_commit_refusals.load(Ordering::Relaxed),
-                "peer_volume_unclaimed_refusals": METRICS.peer_volume_unclaimed_refusals.load(Ordering::Relaxed),
-                "peer_volume_unclaimed_admits": METRICS.peer_volume_unclaimed_admits.load(Ordering::Relaxed),
-                "xv_cross_owner_intents": METRICS.xv_cross_owner_intents.load(Ordering::Relaxed),
-                // The partition at a glance: how many of this set's
-                // volumes a PEER authority appends to (0 on every posture
-                // but the two partial-writer ones).
-                "volumes_peer_owned": self.peer_owned_volume_count(),
                 // DLM S5 — the reader-coherence family (0 on write mounts).
                 "read_only_mount": read_only_mount(),
                 // The reader's two DERIVED numbers, machine-readable so the
@@ -12266,88 +11774,13 @@ impl SqueezefsFilesystem {
                 // `data_dma_epoch_refusals` growth is measured against.
                 "dlm_custody_generation": crate::data_custody::custody_generation(),
                 "dlm_custody_epoch_advances": METRICS.dlm_custody_epoch_advances.load(Ordering::Relaxed),
-                // DLM S9 blocker #3: the data-plane allocation partition.
-                // `alloc_lane_writers == 0` IS the statement "this mount is
-                // unpartitioned" (every mount today), and then every field
-                // below is 0 by construction. `alloc_lane_enospc_refusals`
-                // is a must-stay-0 tripwire — a writer starving while the
-                // set has free space — and `alloc_lane_stranded_bytes` is
-                // the published capacity-planning bound.
-                "alloc_lane_writers": METRICS.alloc_lane_writers.load(Ordering::Relaxed),
-                "alloc_lane_id": METRICS.alloc_lane_id.load(Ordering::Relaxed),
-                "alloc_lanes_owned": METRICS.alloc_lanes_owned.load(Ordering::Relaxed),
-                "alloc_lane_reservations": METRICS.alloc_lane_reservations.load(Ordering::Relaxed),
-                "alloc_lane_shipped_reservations": METRICS
-                    .alloc_lane_shipped_reservations
-                    .load(Ordering::Relaxed),
-                "alloc_lane_raise_refusals": METRICS
-                    .alloc_lane_raise_refusals
-                    .load(Ordering::Relaxed),
-                "alloc_lane_adoptions": METRICS.alloc_lane_adoptions.load(Ordering::Relaxed),
-                "alloc_lane_enospc_refusals": METRICS.alloc_lane_enospc_refusals.load(Ordering::Relaxed),
-                "alloc_lane_stranded_bytes": METRICS.alloc_lane_stranded_bytes.load(Ordering::Relaxed),
-                "alloc_lane_stale_records_pruned": METRICS
-                    .alloc_lane_stale_records_pruned
-                    .load(Ordering::Relaxed),
-                "alloc_lane_stale_records_folded": METRICS
-                    .alloc_lane_stale_records_folded
-                    .load(Ordering::Relaxed),
-                "alloc_lane_harvests": METRICS.alloc_lane_harvests.load(Ordering::Relaxed),
-                // The single-flight ledger (finding 15 phase B1): harvests
-                // + coalesced + declined_stale = every would-be call.
-                "alloc_lane_harvest_coalesced": METRICS
-                    .alloc_lane_harvest_coalesced
-                    .load(Ordering::Relaxed),
-                "alloc_lane_harvest_declined_stale": METRICS
-                    .alloc_lane_harvest_declined_stale
-                    .load(Ordering::Relaxed),
-                "alloc_lane_harvested_blocks": METRICS
-                    .alloc_lane_harvested_blocks
-                    .load(Ordering::Relaxed),
                 // The sustain campaign's allocation-source split (§8):
                 // always-on per-process counters at try_allocate_block's
-                // two exits (alloc_lane_reachable_blocks — the engagement-
-                // gated gauge — is inserted post-macro below).
+                // two exits.
                 "alloc_from_freelist": METRICS.alloc_from_freelist.load(Ordering::Relaxed),
                 "alloc_fresh_mints": METRICS.alloc_fresh_mints.load(Ordering::Relaxed),
-                // §5.5 (PR 4): the ahead-of-stall lane refill's ledger —
-                // owed = the sum of the per-allocator words; the watermark
-                // and horizon are the derived numbers in force.
-                "alloc_lane_owed_blocks": METRICS.alloc_lane_owed_blocks.load(Ordering::Relaxed),
-                "alloc_lane_ahead_harvests": METRICS
-                    .alloc_lane_ahead_harvests
-                    .load(Ordering::Relaxed),
-                "alloc_lane_pushed_harvests": METRICS
-                    .alloc_lane_pushed_harvests
-                    .load(Ordering::Relaxed),
-                "alloc_lane_hint_refills": METRICS
-                    .alloc_lane_hint_refills
-                    .load(Ordering::Relaxed),
-                "alloc_lane_volume_hint_skips": METRICS
-                    .alloc_lane_volume_hint_skips
-                    .load(Ordering::Relaxed),
-                "alloc_lane_harvest_watermark": METRICS
-                    .alloc_lane_harvest_watermark
-                    .load(Ordering::Relaxed),
-                "alloc_lane_horizon_hints": METRICS
-                    .alloc_lane_horizon_hints
-                    .load(Ordering::Relaxed),
-                "alloc_lane_harvest_horizon_ms": METRICS
-                    .alloc_lane_harvest_horizon_ms
-                    .load(Ordering::Relaxed),
-                "alloc_lane_share_needed_blocks": METRICS
-                    .alloc_lane_share_needed_blocks
-                    .load(Ordering::Relaxed),
-                "alloc_lane_headroom_pct": METRICS
-                    .alloc_lane_headroom_pct
-                    .load(Ordering::Relaxed),
-                // DLM S9 (spec §6.2 item 7's consumer half): the mount
-                // POSTURE and the co-writer ledger. `mount_posture` is the
-                // one word that says which of the three shapes this daemon
-                // is; the `cowriter` object's counters are all 0 on every
-                // shipped mount, and `local_commit_refusals` is the one to
-                // watch — nonzero means a daemon surface still commits
-                // metadata directly instead of shipping it.
+                // The mount POSTURE — `writer` or `reader` (PR 14: every RW
+                // mount of a symmetric set is a writer).
                 "mount_posture": mount_posture().as_str(),
                 // Symmetric PR 12 (design-symmetric-metadata §7.3 / §11): the
                 // join ladder's report — the rungs a writer of an ARMED set
@@ -12364,7 +11797,7 @@ impl SqueezefsFilesystem {
                 // state at a first foreign act (an appender that joined
                 // after this mount's ladder ran); 0 on a solo mount.
                 "sym_holder_binds_on_demand": crate::sym_join::holder_binds_on_demand(),
-                "cowriter": crate::cowriter::stats_json(),
+                "shipped_free": crate::shipped_free::stats_json(),
                 // DLM S6 (spec §6.5 item 3): the membership plane's
                 // counters. `membership_renewals` is the beat that used to
                 // be a journal transaction — it grows while
@@ -13386,28 +12819,12 @@ impl SqueezefsFilesystem {
                     metrics.insert(k.clone(), v.clone());
                 }
             }
-            // Sustain campaign §8/KD-FG-10: the lane-reachable supply —
-            // exported only when a lane partition or the grace plane is
-            // engaged (the alloc_lane_* family's solo-inert convention;
-            // absent otherwise, keeping the every-gauge-0-unarmed law
+            // Sustain campaign §8/KD-FG-10: the reachable free supply —
+            // exported only when the grace plane is engaged (absent
+            // otherwise, keeping the every-gauge-0-unarmed law
             // exception-free).
-            if let Some(reachable) = self.router.backend_router.lane_reachable_blocks_sum() {
-                metrics.insert("alloc_lane_reachable_blocks".to_string(), reachable.into());
-                // Finding 15 term 2 — the lane-visible decomposition
-                // (released → served → visible) and the lane-push lever's
-                // co-writer faces, under the same engagement gate; plus
-                // the authority's held-for-peers supply (foreign-lane
-                // free-listed blocks — what the co-writers' next harvests
-                // will take).
-                if let Some(gauges) = crate::free_grace::lane_visible_stats().as_object() {
-                    for (k, v) in gauges {
-                        metrics.insert(k.clone(), v.clone());
-                    }
-                }
-                metrics.insert(
-                    "alloc_lane_supply_blocks".to_string(),
-                    self.router.backend_router.lane_supply_blocks_sum().into(),
-                );
+            if let Some(reachable) = self.router.backend_router.reachable_free_blocks_sum() {
+                metrics.insert("alloc_reachable_blocks".to_string(), reachable.into());
             }
             // D-3: the stripe-collision census — every striped lock
             // table's width + false-sharing vs same-key contended
@@ -14731,17 +14148,17 @@ impl SqueezefsFilesystem {
                     // 3: the `sym-crash` leg's post-failover arm read the
                     // successor's grants flat while the joiner minted from
                     // the window the dead manager had granted).
-                    let lane_allocators = self.router.backend_router.lane_allocators();
+                    let allocators = self.router.backend_router.distinct_allocators();
                     metrics.insert(
                         "block_grant_topups".into(),
-                        serde_json::json!(lane_allocators
+                        serde_json::json!(allocators
                             .iter()
                             .map(|a| a.block_grant_topups())
                             .sum::<u64>()),
                     );
                     metrics.insert(
                         "block_grant_window_remaining".into(),
-                        serde_json::json!(lane_allocators
+                        serde_json::json!(allocators
                             .iter()
                             .map(|a| a.block_grant_remaining())
                             .sum::<u64>()),
@@ -14779,7 +14196,7 @@ impl SqueezefsFilesystem {
                     let rings: Vec<serde_json::Value> = self
                         .router
                         .backend_router
-                        .lane_allocators()
+                        .distinct_allocators()
                         .iter()
                         .map(|a| {
                             let r = a.grace_ring();
@@ -14797,7 +14214,7 @@ impl SqueezefsFilesystem {
                         serde_json::json!(self
                             .router
                             .backend_router
-                            .lane_allocators()
+                            .distinct_allocators()
                             .iter()
                             .map(|a| a.grace_ring().timeout_deferrals())
                             .sum::<u64>()),
@@ -16452,16 +15869,6 @@ impl SqueezefsFilesystem {
         // window-exact read-back is the verifier — a direct DMA under
         // write verification would silently skip it.
         if crate::write_verification_enabled() {
-            return Err(I::Shape);
-        }
-        // DLM S9 posture screen — the W1 posture clause's dd face: a
-        // CO-WRITER never patches in place (authority-only BY DECISION),
-        // so its dd write is never patch-eligible. Decline QUIET here (one
-        // relaxed load; the op rides the handler descent, whose ladder
-        // counts `patch_ineligible_posture`) instead of letting the
-        // submit's §5.1 fence step reach the allocator's ERROR-logging
-        // accounting gate per shim write.
-        if co_writer_mount() {
             return Err(I::Shape);
         }
         // Passthrough only (a compressed/encrypted image cannot be
@@ -18717,23 +18124,6 @@ impl SqueezefsFilesystem {
         file_path: &str,
         fencing_token: u64,
     ) -> Result<bool, SqueezefsError> {
-        // DLM S9 posture clause (the 2026-08-19 mw-fleet storm fix): W1
-        // stays AUTHORITY-ONLY BY DECISION — the patch retires a LIFETIME
-        // (durable ownership state, §6.2 item 6) and the §5.1 clone/patch
-        // fence is process-local — so on a CO-WRITER the eligible shape is
-        // a counted DECISION in this ladder, never an accounting refusal:
-        // decline FIRST, before any allocator arm can reach `plane_gate`'s
-        // ERROR-per-attempt refusal (one log line + one
-        // `cowriter_accounting_refusals` per eligible overwrite in the
-        // field capture, with the fallback misattributed to
-        // `patch_ineligible_shared`). The write falls through to the
-        // accumulation path — CoW-rewrite + shipped free.
-        if co_writer_mount() {
-            METRICS
-                .patch_ineligible_posture
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(false);
-        }
         // Clause 7 (DLM S11 — spec §6.7): the patch requires whole-inode
         // exclusive custody. Under byte-range custody the writer must own
         // the whole block's bytes; a foreign overlapping range (or its own
@@ -22826,20 +22216,6 @@ impl SqueezefsFilesystem {
         pipeline_t0: std::time::Instant,
         space_pressure: bool,
     ) -> Result<bool, SqueezefsError> {
-        // DLM S9 posture clause — the whole-block face of
-        // `try_sole_owner_patch`'s first predicate (same bucket, the
-        // `patch_ineligible_range_shared` reuse precedent): a CO-WRITER
-        // never rewrites in place (the retire is durable ownership state),
-        // so both arms — the opt-in eligible-overwrite lever and the
-        // contract-9 brim — decline as a counted DECISION instead of
-        // reaching the allocator's ERROR-logging gate. The caller's CoW /
-        // StorageFull ladder continues exactly as on any other decline.
-        if co_writer_mount() {
-            METRICS
-                .patch_ineligible_posture
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(false);
-        }
         // Passthrough only: an in-place image must occupy exactly the
         // undecorated mapping's whole-block window; a transformed image's
         // stored length varies with content.
@@ -25152,38 +24528,13 @@ impl SqueezefsFilesystem {
         let mut promoted_bytes = 0u64;
         let mut promoted_inline = 0u64;
         let mut promoted_packed = 0u64;
-        // PK4: a CO-WRITER's dismount pass is ONE batch through the group
-        // driver (`DataRouter::promote_staged_batch` — partitioned by
-        // (owner, home volume) into group packs, sequenced by the driver);
-        // the authority keeps its concurrent per-file pass (its shared pack
-        // is pinned authoritatively and spans the whole pass).
-        // Per file: `Err(panic)` (a joined task unwound) or the promotion's
-        // own outcome with the entry's padded size.
+        // The concurrent per-file pass: the mount's shared pack is pinned
+        // authoritatively and spans the whole pass. Per file: `Err(panic)`
+        // (a joined task unwound) or the promotion's own outcome with the
+        // entry's padded size.
         type Promoted = Result<(Option<crate::routing::PromotedInto>, u64), SqueezefsError>;
         let mut results: Vec<Result<Promoted, String>> = Vec::new();
-        if crate::routing::small_file_packing_enabled() && co_writer_mount() {
-            let sizes: Vec<u64> = pending.iter().map(|item| item.padded_size).collect();
-            let items: Vec<crate::routing::StagedPromotionItem> = pending
-                .into_iter()
-                .map(|item| {
-                    let ino = crate::routing::parse_inode_from_path(&item.file_path);
-                    crate::routing::StagedPromotionItem {
-                        fencing_token: self.dlm.get_fencing_token_ino(ino),
-                        file_path: item.file_path,
-                        file_id: item.file_id,
-                    }
-                })
-                .collect();
-            for (out, bytes) in self
-                .router
-                .promote_staged_batch(items)
-                .await
-                .into_iter()
-                .zip(sizes)
-            {
-                results.push(Ok(out.map(|promoted| (promoted, bytes))));
-            }
-        } else {
+        {
             let sem = std::sync::Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(
                 crate::bg_admit::striped_block_concurrency(),
             ));
@@ -27148,18 +26499,8 @@ impl Filesystem for SqueezefsFilesystem {
         // worse — run a mount-time sweep that MUTATES: the extent-record
         // recovery pass adopts/discards `active_block_ext:` records, and
         // the reclaim pool issues device discards.
-        //
-        // DLM S9: a CO-WRITER skips the same engines, for the adjacent
-        // reason — each of them mutates ownership ACCOUNTING it has no
-        // authority over (the extent-record sweep adopts/discards staged
-        // records, the reclaim pool deallocates offsets, the writeback
-        // flusher publishes layouts and frees displaced blocks). Its
-        // metadata mutations ship instead, and its allocator arms refuse
-        // loudly (`fuse_client::co_writer_refusal`), so an armed engine
-        // here would only produce refusals on a channel it cannot serve.
         let reader_mount = read_only_mount();
-        let co_writer = co_writer_mount();
-        if reader_mount || co_writer {
+        if reader_mount {
             info!(
                 "{} mount: writeback flusher, extent-record recovery, fold worker \
                  and reclaim pool are NOT armed (nothing here can be dirty, staged \
@@ -27169,7 +26510,7 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         // Start background active writes flusher task
-        if !reader_mount && !co_writer {
+        if !reader_mount {
             let mut rx_guard = self.writeback_rx.lock().unwrap();
             if let Some(writeback_rx) = rx_guard.take() {
                 let router = self.router.clone();
@@ -27198,27 +26539,10 @@ impl Filesystem for SqueezefsFilesystem {
         // the item-2 DECLARATION (every volume becomes a coherent reader
         // and the R-6 purge sink is installed; the poll is illegal before
         // it), then the cadence task that drives the landed poller. These
-        // replace the writer engines skipped above.
-        //
-        // DLM S9: a CO-WRITER arms the SAME three, and that is the point of
-        // requirement 6 — its metadata view is a snapshot of the
-        // authority's checkpoints exactly as a reader's is, so it needs the
-        // §6.8 item-2 revalidation cadence and the item-5 purge or it would
-        // serve bytes for offsets the authority has since reallocated. The
-        // data-plane lockdown arm is right for it too: a co-writer frees
-        // nothing and deallocates nothing (its accounting ships).
-        //
-        // Per-volume claim admission (§5.4 sweep row 15, risk R18) SPLITS
-        // the two arms, because the mount-level predicate is wrong in both
-        // directions once a mount can append to part of its set. The
-        // DATA-plane lockdown keeps the latch test verbatim — a
-        // partial-authority latches `CO_WRITER` and needs it, a
-        // set-authority latches neither and must NOT have it (its data
-        // plane is `writer`'s) — while the coherence + cadence arms move
-        // to the volumes this mount does not append to, decided by each
-        // volume's own read-only cause. On a reader or a co-writer that is
-        // every volume, so their behaviour is unchanged.
-        if reader_mount || co_writer {
+        // replace the writer engines skipped above. The coherence + cadence
+        // arms are decided per volume by its own read-only cause; on a
+        // reader that is every volume.
+        if reader_mount {
             crate::ro_coherence::arm_reader_data_plane(&self.router);
         }
         if let Some(routed) = self.meta_backend.as_ref() {
@@ -27256,13 +26580,13 @@ impl Filesystem for SqueezefsFilesystem {
         // W2 (§5.2): mount-time extent-record sweep — validate + loudly
         // report kill-9 residue (clean shutdowns drain every record), and
         // arm the background fold worker.
-        if !reader_mount && !co_writer {
+        if !reader_mount {
             self.recover_extent_records().await;
             self.ensure_fold_worker();
         }
 
         // Start background GC/reclaim worker pool
-        if !reader_mount && !co_writer {
+        if !reader_mount {
             self.ensure_reclaim_pool();
         }
 

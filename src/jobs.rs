@@ -3719,11 +3719,7 @@ impl JobFabric {
                         .tenant
                         .pack
                         .allocator
-                        .release_pack_reference(
-                            br,
-                            &repacked.base_key,
-                            crate::block_allocator::PackPublishOutcome::Known,
-                        )
+                        .release_pack_reference(br, &repacked.base_key)
                         .await;
                 }
                 router.abandon_repacked_window(repacked).await;
@@ -3802,11 +3798,7 @@ impl JobFabric {
                     .tenant
                     .pack
                     .allocator
-                    .release_pack_reference(
-                        br,
-                        &repacked.base_key,
-                        crate::block_allocator::PackPublishOutcome::Known,
-                    )
+                    .release_pack_reference(br, &repacked.base_key)
                     .await;
             }
             if published == 0 {

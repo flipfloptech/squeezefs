@@ -3361,69 +3361,6 @@ pub async fn roll_forward_open_intents(routed: &RoutedMetaBackend) -> Result<usi
     Ok(rolled)
 }
 
-/// **Ownership-scoped recovery** (per-volume claim admission §5.4 sweep
-/// row 3): [`recover_open_intents`] for a mount that appends to only PART
-/// of the set. `owned[v]` is `true` for a volume this mount holds the D0
-/// claim on.
-///
-/// The three arms are §5.4a's, unchanged in substance:
-///
-/// * an intent wholly inside volumes THIS node owns → rolled forward;
-/// * wholly inside a peer's → **skipped and logged once**, because
-///   rolling it forward is a WRITE to trees this mount has no authority
-///   over; its owner's own mount recovers it;
-/// * spanning two owners → **refuse the mount loud**, and count it.
-///   `xv_cross_owner_intents` is a must-stay-0 tripwire: the M1 pre-check
-///   is what keeps it 0, so a nonzero value means a cross-owner mutation
-///   escaped that check and half-committed (case (c) is reachable-by-bug,
-///   not unreachable).
-pub async fn recover_open_intents_scoped(
-    routed: &RoutedMetaBackend,
-    owned: &[bool],
-) -> Result<usize> {
-    let open = scan_open(routed).await?;
-    if open.is_empty() {
-        return Ok(0);
-    }
-    let mine = |v: usize| owned.get(v).copied().unwrap_or(false);
-    let mut rolled = 0usize;
-    for o in open {
-        let mut vols: Vec<usize> = o.rec.steps.iter().map(|s| localise(routed, s).0).collect();
-        vols.push(o.host);
-        vols.sort_unstable();
-        vols.dedup();
-        let ours = vols.iter().filter(|v| mine(**v)).count();
-        if ours == vols.len() {
-            if recover_one(routed, &o).await? {
-                rolled += 1;
-            }
-        } else if ours == 0 {
-            log::warn!(
-                "cross-volume transaction {:016x} is wholly inside volumes {vols:?}, which a \
-                 PEER authority of this set appends to — SKIPPED at this mount. Rolling it \
-                 forward would be a write to trees this node has no authority over; its \
-                 owner's own mount recovers it",
-                o.rec.tx_id
-            );
-        } else {
-            crate::fuse_client::METRICS
-                .xv_cross_owner_intents
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(SqueezefsError::InvalidOperation(format!(
-                "refusing to mount: open cross-volume transaction {:016x} ({:?}) spans two \
-                 metadata OWNERS (volumes {vols:?}) — no process in this fleet can roll it \
-                 forward, because each half needs the D0 claim of a different node. This is \
-                 reachable only by a bug in the M1 cross-owner pre-check \
-                 (xv_cross_owner_intents, a must-stay-0 counter): the remedy is the offline \
-                 whole-set pass — unmount every owner and run `squeezefs fsck` — never a \
-                 partial roll-forward",
-                o.rec.tx_id, o.rec.op
-            )));
-        }
-    }
-    Ok(rolled)
-}
-
 /// Roll ONE intent forward. `Ok(true)` = retired; `Ok(false)` = a shipped
 /// step could not reach its holder and the intent stays open (armed
 /// plane), or the record was gone under the guards (retired meanwhile —

@@ -571,18 +571,9 @@ impl ClaimSet {
 }
 
 /// The read half of every claim-set **read-modify-write**: the durable
-/// record when one decodes, an empty set when there is none — and a loud
-/// **refusal** when the record is undecodable on a volume that may carry
-/// a per-volume ownership assignment.
-///
-/// That last arm is the fail-closed direction
-/// (design-per-volume-claim-admission §5.2.2, Issue 16). The plain
-/// fallback rewrites the record from an empty set, which on an assigned
-/// volume drops `owner` and converts a multi-owner volume into the legacy
-/// "one authority appends to everything" shape — an ownership loss that
-/// reads as a legitimate posture rather than as damage. Where no
-/// assignment can exist, the fallback is unchanged: an unattributable
-/// record proves nothing and this member's own set replaces it.
+/// record when one decodes, an empty set when there is none or the record
+/// is undecodable (an unattributable record proves nothing and this
+/// member's own set replaces it).
 async fn load_for_update(be: &KvMetaBackend, term: u64) -> Result<ClaimSet> {
     let Ok(Some(raw)) = be.getxattr(1, CLAIM_SET_XATTR).await else {
         return Ok(ClaimSet::empty(term));
@@ -590,76 +581,12 @@ async fn load_for_update(be: &KvMetaBackend, term: u64) -> Result<ClaimSet> {
     if let Some(set) = ClaimSet::decode(&raw) {
         return Ok(set);
     }
-    if assignment_evidence(be).await {
-        return Err(SqueezefsError::InvalidOperation(format!(
-            "refusing to rewrite the undecodable claim_set record on {}: this volume may \
-             carry a per-volume ownership assignment (an ownership plane is armed, or an \
-             owner_assign: bracket is open), and resetting the record would silently drop \
-             its owner — converting a peer-owned volume into the legacy shape. Resolve the \
-             record (re-run `squeezefs volume set-owners`, which rewrites it under the \
-             offline coordinator) before mounting",
-            be.device_path().display()
-        )));
-    }
     log::warn!(
-        "claim_set record on {} is undecodable and this volume carries no ownership \
-         assignment evidence — replacing it with this member's own set (an unattributable \
-         set proves nothing)",
+        "claim_set record on {} is undecodable — replacing it with this member's own set (an \
+         unattributable set proves nothing)",
         be.device_path().display()
     );
     Ok(ClaimSet::empty(term))
-}
-
-/// Could this volume's `claim_set` carry a per-volume ownership
-/// assignment? Read only when the record itself cannot answer, because
-/// it is undecodable.
-///
-/// The two evidences are the design's (§5.2.2): an **armed ownership
-/// plane** — this process is running under a multi-owner map — or an open
-/// **`owner_assign:` bracket**, the intent marker the offline assignment
-/// verb writes first and deletes last. Neither can exist on a
-/// single-writer mount, which is why [`load_for_update`]'s fallback stays
-/// exactly today's behaviour for every set in the field.
-async fn assignment_evidence(be: &KvMetaBackend) -> bool {
-    if crate::meta_ship::owners::ownership_armed() {
-        return true;
-    }
-    matches!(
-        be.getxattr(1, crate::OWNER_ASSIGN_MARKER_XATTR).await,
-        Ok(Some(_))
-    )
-}
-
-/// Record (or, with `owner = None`, clear) **this volume's** per-volume
-/// ownership assignment, preserving the member roster
-/// (design-per-volume-claim-admission §5.2, KD-PV-2).
-///
-/// The only caller today is the test suite: under **D19** ownership is
-/// assigned by an operator verb and stays put, and that verb — the
-/// offline, D0-guarded `squeezefs volume set-owners` — is PR 7. Refuses
-/// on a volume without incompat bit 14 (through [`ClaimSet::store`]), and
-/// clearing restores the unassigned record byte-identically.
-pub async fn set_volume_owner(
-    be: &KvMetaBackend,
-    owner: Option<&str>,
-    successors: &[String],
-    term: u64,
-) -> Result<()> {
-    let mut set = load_for_update(be, term).await?;
-    set.term = set.term.max(term);
-    set.owner = owner.filter(|o| !o.is_empty()).map(str::to_string);
-    set.successors = successors
-        .iter()
-        .filter(|s| !s.is_empty())
-        .cloned()
-        .collect();
-    if set.owner.is_none() {
-        // `--clear` restores the unassigned record byte-identically, and
-        // a holder attestation is meaningless without an assignment to
-        // resolve against (KD-PV-17).
-        set.holder = None;
-    }
-    ClaimSet::store(be, &set).await
 }
 
 /// **Attest this mount as the live holder of `be`'s `writer_claim`**
@@ -1243,16 +1170,6 @@ pub struct Grant {
     /// member NEVER anchors on a foreign clock's value; it anchors on its
     /// own send instant).
     pub granted_at_owner_ms: u64,
-    /// **The lane-supply hint** (finding 15 term 2, the lane-push lever):
-    /// on a RENEWAL grant to a co-writer, the blocks of that member's
-    /// data-plane allocation lane sitting on the authority's free lists —
-    /// released from the freed-offset grace period, unserved, reachable by
-    /// that member alone. A nonzero hint wakes the member's lane refill at
-    /// once ([`crate::free_grace::note_lane_supply_hint`]). 0 on a join
-    /// grant, to a reader, with the lever off, and on every authority
-    /// that runs no partition. A HINT, never a grant: the blocks travel
-    /// only on the harvest verb, under the lane checks it already runs.
-    pub lane_supply_blocks: u64,
     /// **The writer's checkpoint ceiling in force**, ms (the writer→member
     /// checkpoint composite, §6.8 item 3 adjudication item 4 — user
     /// decision 2026-09-06): the PROMISE that every commit before this
@@ -1267,31 +1184,6 @@ pub struct Grant {
     /// advertised (an owner with no grace plane): the member falls back to
     /// `CHECKPOINT_MAX_AGE_MS`. Rides the `CLUSTER_WIRE_SCHEMA` 2 grant.
     pub checkpoint_ceiling_ms: u64,
-    /// **The lane-supply hint PER DATA VOLUME** (finding 15's fpp residue,
-    /// `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`):
-    /// `(vol_tag, blocks)` for every data volume the authority routes —
-    /// the addends of `lane_supply_blocks`, named. A co-writer's decline
-    /// and pushed refill are per allocator, i.e. per volume, and the sum
-    /// cannot say which volume holds the supply: on the s11 fleet the
-    /// volume the authority held nothing for asked on every wake because
-    /// its sibling made the sum nonzero. Empty wherever the sum is 0 by
-    /// construction (a join grant, a reader, the lever off, no partition).
-    /// `vol_tag` per KD-5 — the durable `vol-{16 hex}` decode, never a
-    /// path. Rides the `CLUSTER_WIRE_SCHEMA` 3 grant.
-    pub lane_supply_volumes: Vec<(u64, u64)>,
-    /// **Whether this authority serves co-writer PACK GROUPS**
-    /// (design-small-file-packing §5.6 (a), PR PK4): its D-1c
-    /// conveyor-group lever (`SQUEEZEFS_PUBLISH_CONVEYOR_GROUP`) in force
-    /// at the grant — the `checkpoint_ceiling_ms` precedent for "a decision
-    /// in force, carried on the lease". A co-writer whose grant does not
-    /// advertise it runs the FIXED block arm for every promotion (one block
-    /// per file, byte-identical to PK2) and counts
-    /// `pack_cowriter_group_unavailable`. The grant is the SET authority's
-    /// (the slot-0 owner mints every lease, D20), so on a K-owner fleet a
-    /// PARTIAL authority's lever is covered by the frame refusal alone
-    /// (`PUBLISH_PACK_GROUP_UNAVAILABLE`). Rides the `CLUSTER_WIRE_SCHEMA`
-    /// 4 grant.
-    pub pack_group_available: bool,
     /// **The slot-lease carriage** (design-symmetric-metadata §5.1.4 /
     /// §5.9, PR 4 — the `ack_free_epoch` carriage precedent: a slot lease
     /// lives as long as the membership lease). The manager's attestation
@@ -1798,15 +1690,12 @@ impl MembershipOwner {
             d_purge_ms: self.clocks.d_purge.as_millis() as u64,
             renew_ms: self.clocks.renew_interval.as_millis() as u64,
             granted_at_owner_ms: now,
-            lane_supply_blocks: 0,
             // The composite's wire half: the writer's checkpoint ceiling in
             // force, and the promise its advertisement makes (a few relaxed
             // atomics — KD-FG-4's no-scan-in-renew law stands).
             checkpoint_ceiling_ms: crate::free_grace::advertise_checkpoint_ceiling(),
-            lane_supply_volumes: Vec::new(),
             // PK4: the set authority's pack-group posture (one relaxed knob
             // read — KD-FG-4's no-scan-in-renew law stands).
-            pack_group_available: crate::meta_ship::publish::conveyor_group_enabled(),
             slot_leases_ack: SlotLeasesAck::default(),
             slot_release_notices: Vec::new(),
             offered_slots: Vec::new(),
@@ -2057,17 +1946,6 @@ impl MembershipOwner {
         if let Some(prod_ms) = crate::free_grace::take_prod_cadence(seen_acked) {
             grant.renew_ms = prod_ms;
         }
-        // The lane-push lever's wire half (finding 15 term 2): this
-        // member's lane supply on the authority's free lists — O(1) per
-        // volume through the installed source, never a scan (KD-FG-4);
-        // empty on every mount that is not a partitioned authority. The
-        // vector names each volume's share; the sum is the mount word.
-        let volumes = crate::free_grace::lane_supply_for_member(id);
-        grant.lane_supply_blocks = volumes
-            .iter()
-            .map(|(_, n)| *n)
-            .fold(0u64, u64::saturating_add);
-        grant.lane_supply_volumes = volumes;
         // PR 4: the slot-lease carriage — this member's leases attested,
         // the manager's recalls, the offers standing for it; O(held) off
         // the plane's RAM table.
@@ -2612,15 +2490,10 @@ pub struct MemberSession {
     /// against nothing — the ceiling and the label are read together only
     /// by the revalidation task, which learns both from one grant.
     checkpoint_ceiling_ms: AtomicU64,
-    /// PK4: whether the set authority serves pack groups, as the LATEST
-    /// grant (join, routine or carriage renewal) advertised — the
-    /// co-writer's batch driver reads it before every packed promotion.
-    pack_group_available: AtomicBool,
 }
 
-/// PK4: grants adopted by ANY member session in this process (the join,
-/// every renewal) — process-monotone, so the batch driver's UNAVAILABLE
-/// latch keyed on it lapses at the next grant and never survives a re-join
+/// Grants adopted by ANY member session in this process (the join, every
+/// renewal) — process-monotone
 /// ("until the next grant says otherwise" is a counter compare, never a
 /// timer).
 static GRANT_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -2649,7 +2522,6 @@ impl MemberSession {
             ),
             clock,
             checkpoint_ceiling_ms: AtomicU64::new(grant.checkpoint_ceiling_ms),
-            pack_group_available: AtomicBool::new(grant.pack_group_available),
         };
         note_grant_adopted();
         // The §6.8 item-3 label space is the OWNER's clock: a grant from a
@@ -2687,8 +2559,6 @@ impl MemberSession {
         // (one grant, one act) — the ladder's input beside the label.
         self.checkpoint_ceiling_ms
             .store(grant.checkpoint_ceiling_ms, Ordering::Relaxed);
-        self.pack_group_available
-            .store(grant.pack_group_available, Ordering::Relaxed);
         note_grant_adopted();
         // L2b (design-free-grace-sustain §5.2b, OQ 3): the grant's
         // `renew_ms` IS the pass-cadence ask — a prodded (shortened) value
@@ -2704,8 +2574,6 @@ impl MemberSession {
         // The lane-push lever (finding 15 term 2): the grant's lane-supply
         // hint wakes this co-writer's refill at once — the per-volume
         // vector FIRST (what the wake's pushed ticks read), then the sum.
-        crate::free_grace::note_lane_supply_volumes(&grant.lane_supply_volumes);
-        crate::free_grace::note_lane_supply_hint(grant.lane_supply_blocks);
         deliver_slot_carriage(grant);
     }
 
@@ -2725,16 +2593,12 @@ impl MemberSession {
             anchor_ms,
         );
         // The pack-group posture is a decision about NOW, like the ask.
-        self.pack_group_available
-            .store(grant.pack_group_available, Ordering::Relaxed);
         note_grant_adopted();
         crate::free_grace::note_prodded_renewal(
             grant.renew_ms,
             grant.checkpoint_ceiling_ms,
             anchor_ms,
         );
-        crate::free_grace::note_lane_supply_volumes(&grant.lane_supply_volumes);
-        crate::free_grace::note_lane_supply_hint(grant.lane_supply_blocks);
         deliver_slot_carriage(grant);
     }
 
@@ -2771,12 +2635,6 @@ impl MemberSession {
     /// The grant's clock-skew bound, ms (the ladder's qualification term).
     pub fn skew_max_ms(&self) -> u64 {
         self.words.skew_max_ms()
-    }
-
-    /// PK4: does the set authority serve co-writer pack groups, per the
-    /// latest grant ([`Grant::pack_group_available`])?
-    pub fn pack_group_available(&self) -> bool {
-        self.pack_group_available.load(Ordering::Relaxed)
     }
 
     /// The grant's `D_purge`, ms (the ladder's drain term).
@@ -3088,7 +2946,7 @@ fn note_departure(id: &str) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeadMember {
     /// The member's census id (the KD-MW-2 `<node>:<slot>` form when it is
-    /// a mount — [`crate::cowriter::parse_node_member_id`] reads it).
+    /// a mount — [`crate::member_id::parse_node_member_id`] reads it).
     pub id: String,
     /// The lease epoch that died (`0` = the predecessor's grant, unknown
     /// to the successor owner).
@@ -3181,19 +3039,6 @@ pub fn installed_member_session() -> Option<Arc<MemberSession>> {
 /// S9 co-writer admission's rung-4 evidence field.
 pub fn installed_member_epoch() -> u64 {
     installed_member_session().map(|s| s.epoch()).unwrap_or(0)
-}
-
-/// PK4: does this member's LATEST grant advertise pack groups
-/// ([`Grant::pack_group_available`])? `false` with no member session — a
-/// co-writer whose lease does not say so runs the block arm (never-wrong).
-pub fn pack_group_available() -> bool {
-    installed_member_session().is_some_and(|s| s.pack_group_available())
-}
-
-/// PK4: the process's grant generation (every membership grant any member
-/// session adopted) — a latch keyed on it lapses at the next grant.
-pub fn pack_group_grant_generation() -> u64 {
-    GRANT_GENERATION.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -3347,20 +3192,10 @@ impl MembershipArm {
 /// `on_purge` is the reader's fail-stop action (drop every cached block —
 /// `ro_coherence::purge_reader_block_keys`), invoked if the member ever
 /// misses its own `T_self` deadline.
-/// **Sweep row 17 (per-volume claim admission §5.4): the volumes the
-/// membership RENDEZVOUS record lives on.**
-///
-/// Today an owner publishes its record to EVERY volume and a member picks
-/// the highest-term record across all of them. Under a per-volume posture
-/// only the set authority may write, so peer-owned volumes would retain
-/// **stale** `membership_owner` records that nobody can remove (they are
-/// pinned against slot travel) and that max-term selection may pick —
-/// pointing members at a dead endpoint.
-///
-/// So while this mount runs a per-volume posture, the rendezvous is the
-/// **slot-0 volume alone** (D20: its owner IS the set authority, and ino 1
-/// homes there by `route_ino_width`). Every other posture is unchanged:
-/// the whole set, exactly as shipped.
+/// The volumes the membership RENDEZVOUS record lives on: an owner
+/// publishes its record to EVERY volume and a member picks the highest-term
+/// record across all of them — except a symmetric APPENDER, whose
+/// rendezvous is its HOME volume's shard (PR 8, KD-SYM-15).
 fn rendezvous_volumes(
     meta: &Arc<crate::meta_backend::RoutedMetaBackend>,
 ) -> Vec<Arc<KvMetaBackend>> {
@@ -3376,27 +3211,7 @@ fn rendezvous_volumes(
             return vec![Arc::clone(v)];
         }
     }
-    if !crate::fuse_client::partial_meta_mount() {
-        return meta.volumes.clone();
-    }
-    let slot_0 = meta.route_ino(1).0;
-    match meta.volumes.get(slot_0) {
-        Some(v) => vec![Arc::clone(v)],
-        // Unreachable through the routed backend's own invariants; falling
-        // back to the whole set keeps a member joinable rather than
-        // silently invisible.
-        None => meta.volumes.clone(),
-    }
-}
-
-/// Does this mount APPEND to the volume hosting slot 0 — i.e. is it the
-/// SET AUTHORITY (D20)? Read from the volume's own posture rather than
-/// from a declared role, so it cannot disagree with the open that took
-/// (or did not take) the claim.
-fn owns_slot_0_volume(meta: &Arc<crate::meta_backend::RoutedMetaBackend>) -> bool {
-    meta.volumes
-        .get(meta.route_ino(1).0)
-        .is_some_and(|v| !v.is_read_only())
+    meta.volumes.clone()
 }
 
 /// The rendezvous records a member would actually SELECT from, in the
@@ -3459,24 +3274,6 @@ pub async fn arm_mount_membership_at(
             secret,
             MemberRole::Reader,
             0,
-            on_purge,
-        )
-        .await;
-    }
-    // **Sweep row 8** (per-volume claim admission §5.4, D20): the "write
-    // mount ⇒ lease AUTHORITY" branch keys on owning the SLOT-0 volume,
-    // not on being writable. Under a per-volume posture every partial
-    // authority is a write mount, so the shipped predicate would arm K
-    // owners of one plane — members holding leases from one node while
-    // custody, lane assignment and the grace ring live on another. The
-    // test is the volume's own posture: a set authority APPENDS to the
-    // slot-0 volume; a partial authority reads it as peer-owned.
-    if crate::fuse_client::partial_meta_mount() && !owns_slot_0_volume(meta) {
-        return arm_member(
-            &rendezvous_volumes(meta),
-            secret,
-            MemberRole::Writer,
-            crate::data_custody::live_wero_key().unwrap_or(0),
             on_purge,
         )
         .await;
@@ -3709,7 +3506,7 @@ async fn arm_owner(
 /// same-host dead-pid prune), but guessing a node token would misclassify
 /// staged custody, which is worse.
 pub fn owner_claim_identity(incarnation: &str) -> String {
-    match crate::cowriter::node_member_id() {
+    match crate::member_id::node_member_id() {
         Ok(nid) => nid,
         Err(e) => {
             log::warn!(
@@ -3742,7 +3539,7 @@ pub async fn arm_joined_member(
     let Some(secret) = cluster_secret(first).await else {
         return Ok(None);
     };
-    let node_id = crate::cowriter::node_member_id()?;
+    let node_id = crate::member_id::node_member_id()?;
     let volumes = rendezvous_volumes(meta);
     let mut best: Option<(OwnerRecord, std::sync::Weak<KvMetaBackend>)> = None;
     for be in &volumes {

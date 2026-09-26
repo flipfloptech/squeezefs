@@ -197,7 +197,6 @@ DEFAULT_SUITES=(
   writer_scoped_staging_tests
   readonly_mount_tests
   meta_slot_migration_tests
-  pv_coordinator_tests
   kv_smo_crash_completeness_tests
   kv_freeze_wedge_tests
   sym_appender_tests

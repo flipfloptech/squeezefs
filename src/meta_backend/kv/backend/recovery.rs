@@ -601,7 +601,7 @@ impl KvMetaBackend {
                 ));
             }
         }
-        let id = crate::cowriter::node_member_id_of(member.node_token, member.mount_slot);
+        let id = crate::member_id::node_member_id_of(member.node_token, member.mount_slot);
         let owner = crate::membership::installed_owner();
         if let Some(owner) = owner.as_ref() {
             if owner.member_is_live(&id) {
@@ -1340,7 +1340,7 @@ impl KvMetaBackend {
         }
         if let Some(owner) = crate::membership::installed_owner() {
             let member =
-                crate::cowriter::node_member_id_of(identity.node_token, identity.mount_slot);
+                crate::member_id::node_member_id_of(identity.node_token, identity.mount_slot);
             if owner.member_is_live(&member) {
                 // The incarnation check (Issue 9): a member the owner lists
                 // LIVE again holds a newer lease epoch than the record's —
@@ -3210,7 +3210,7 @@ impl KvMetaBackend {
         // and) a fresh `client:` registration naming the appender's node
         // inside the TTL — it may be alive.
         let member =
-            crate::cowriter::node_member_id_of(page.identity.node_token, page.identity.mount_slot);
+            crate::member_id::node_member_id_of(page.identity.node_token, page.identity.mount_slot);
         if let Ok(attrs) = be.listxattr(1).await {
             for k in attrs.iter().filter(|k| k.starts_with("client:")) {
                 if !k[7..].starts_with(&member) {
@@ -3327,7 +3327,7 @@ pub fn install_death_ledger_writer(routed: &Arc<RoutedMetaBackend>) {
         let Some(vol0) = vol0.upgrade() else {
             return;
         };
-        let Some((node_token, mount_slot)) = crate::cowriter::parse_node_member_id(&dead.id) else {
+        let Some((node_token, mount_slot)) = crate::member_id::parse_node_member_id(&dead.id) else {
             return; // a reader's uuid: holds no region
         };
         let identity = AppenderIdentity {

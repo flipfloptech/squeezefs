@@ -324,7 +324,6 @@ pub struct ServiceStats {
     pub grace_reclaims: u64,
     pub grace_conflicts: u64,
     pub not_owner_refusals: u64,
-    pub cross_owner_refusals: u64,
     /// **Must stay 0**: an owner-side execution unwound.
     pub panics: u64,
 }
@@ -347,7 +346,6 @@ pub struct MetaShipService {
     grace_reclaims: AtomicU64,
     grace_conflicts: AtomicU64,
     not_owner: AtomicU64,
-    cross_owner: AtomicU64,
     panics: AtomicU64,
     /// The S10 delegation host state (rung 12).
     deleg: DelegHost,
@@ -462,7 +460,6 @@ impl MetaShipService {
             grace_reclaims: AtomicU64::new(0),
             grace_conflicts: AtomicU64::new(0),
             not_owner: AtomicU64::new(0),
-            cross_owner: AtomicU64::new(0),
             panics: AtomicU64::new(0),
             deleg: DelegHost::default(),
             self_ref: std::sync::OnceLock::new(),
@@ -553,7 +550,6 @@ impl MetaShipService {
             grace_reclaims: self.grace_reclaims.load(Ordering::Relaxed),
             grace_conflicts: self.grace_conflicts.load(Ordering::Relaxed),
             not_owner_refusals: self.not_owner.load(Ordering::Relaxed),
-            cross_owner_refusals: self.cross_owner.load(Ordering::Relaxed),
             panics: self.panics.load(Ordering::Relaxed),
         }
     }
@@ -1302,18 +1298,6 @@ impl MetaShipService {
         }
     }
 
-    /// The cross-owner refusal for a DISCOVERED participant (see the
-    /// module docs on why this is resolve-then-execute).
-    fn cross_owner(&self, verb: MetaVerb, ino: u64) -> SqueezefsError {
-        self.cross_owner.fetch_add(1, Ordering::Relaxed);
-        super::CROSS_OWNER_REFUSALS.fetch_add(1, Ordering::Relaxed);
-        super::cross_owner_error(
-            verb,
-            ino,
-            "a participant discovered under the operation's guards",
-        )
-    }
-
     async fn execute_inner(
         &self,
         call: &MetaCall,
@@ -1367,11 +1351,6 @@ impl MetaShipService {
                 Ok(MetaReply::Inode(WireInode::from(&inode)))
             }
             MetaCall::Unlink { parent, name } => {
-                if let Some((child, _)) = self.inner.lookup_dentry(*parent, name).await? {
-                    if !self.has_authority(child) {
-                        return Err(self.cross_owner(MetaVerb::Unlink, child));
-                    }
-                }
                 Ok(MetaReply::Ino(self.inner.unlink(*parent, name).await?))
             }
             MetaCall::Link {
@@ -1379,9 +1358,6 @@ impl MetaShipService {
                 new_parent,
                 new_name,
             } => {
-                if !self.has_authority(*ino) {
-                    return Err(self.cross_owner(MetaVerb::Link, *ino));
-                }
                 let inode = self.inner.link(*ino, *new_parent, new_name).await?;
                 Ok(MetaReply::Inode(WireInode::from(&inode)))
             }
@@ -1392,16 +1368,6 @@ impl MetaShipService {
                 new_name,
                 flags,
             } => {
-                if !self.has_authority(*new_parent) {
-                    return Err(self.cross_owner(MetaVerb::Rename, *new_parent));
-                }
-                for (parent, name) in [(old_parent, old_name), (new_parent, new_name)] {
-                    if let Some((participant, _)) = self.inner.lookup_dentry(*parent, name).await? {
-                        if !self.has_authority(participant) {
-                            return Err(self.cross_owner(MetaVerb::Rename, participant));
-                        }
-                    }
-                }
                 self.inner
                     .rename(*old_parent, old_name, *new_parent, new_name, *flags)
                     .await?;

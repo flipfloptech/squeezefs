@@ -3055,8 +3055,8 @@ impl KvMetaBackend {
     /// next mount's C14 settle); the next mount recovers it before serving
     /// (C15). Audited (`appender_clear_runs`).
     ///
-    /// **Every writer open of the verb walks [`Self::writer_bring_up`]
-    /// before its first write** (PR 14 fix round 1, Issue 1 — the record's
+    /// **Every writer open of the verb walks `writer_bring_up` (the
+    /// mount's bring-up ladder, `backend.rs`) before its first write** (PR 14 fix round 1, Issue 1 — the record's
     /// §4.4bf): the verb is usable only once the manager's claim is stale,
     /// i.e. after the manager CRASHED, so its open replays the dead
     /// manager's uncovered ring-0 window and its `checkpoint_now` FLUSHES

@@ -728,11 +728,10 @@ async fn a_half_converted_volumes_plain_writer_door_names_the_resume_not_the_con
         "still flat under the marker"
     );
     // The PLAIN single-volume door.
-    let err = KvMetaBackend::open(Path::new(&uris[0]))
-        .await
-        .err()
-        .expect("a half-converted volume refuses the plain writer door");
-    let msg = err.to_string();
+    let msg = match KvMetaBackend::open(Path::new(&uris[0])).await {
+        Ok(_) => panic!("a half-converted volume refuses the plain writer door"),
+        Err(e) => e.to_string(),
+    };
     assert!(
         msg.contains("--resume") && msg.contains("--abort"),
         "the plain door names the marker's remedy, not the conversion's first run: {msg}"
@@ -742,11 +741,10 @@ async fn a_half_converted_volumes_plain_writer_door_names_the_resume_not_the_con
         "the refusal names the volume: {msg}"
     );
     // The PLAIN routed door — the mount's.
-    let err = open_routed_meta_set(&uris)
-        .await
-        .err()
-        .expect("the routed writer door refuses too");
-    let msg = err.to_string();
+    let msg = match open_routed_meta_set(&uris).await {
+        Ok(_) => panic!("the routed writer door refuses too"),
+        Err(e) => e.to_string(),
+    };
     assert!(
         msg.contains("--resume") && msg.contains("--abort"),
         "the routed door names the marker's remedy: {msg}"

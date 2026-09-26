@@ -2026,11 +2026,8 @@ squeezefs volume migrate-meta-slot <mountpoint> <slot> <volume-index>      # ONL
 squeezefs volume repair-set <sqmeta-uri>                # reconcile membership stamps after a crashed change
 squeezefs volume enable-multi-writer <sqmeta-uri>       # OFFLINE: stamp a pre-flip / --single-writer set multi-writer-capable
 squeezefs volume enable-symmetric <sqmeta-uri> [--dry-run|--resume|--abort]
-                                                        # OFFLINE: convert the set to the symmetric slot-tree forest (bit 17; DARK program)
-squeezefs volume set-owners <sqmeta-uri> <vol-id>=<member-id>[+<successor>][:/subtree/root] ...
-                                                        # OFFLINE, whole fleet unmounted: assign per-volume metadata owners
-squeezefs volume get-owners <sqmeta-uri|mountpoint>     # owners beside live claims (the drift view)
-squeezefs volume locate <sqmeta-uri|mountpoint> <path>  # which volume hosts this path's inode, and who owns it
+                                                        # OFFLINE: convert a pre-flip (bit-17-absent) multi-writer set to the symmetric slot-tree forest — the DEFAULT format since PR 14
+squeezefs volume locate <sqmeta-uri|mountpoint> <path>  # which volume hosts this path's inode, its forest slot and the slot's live lessee (`set-owners` / `get-owners` are hard errors since PR 14)
 ```
 
 - Metadata routing granularity: **format anywhere, grow forever, no knobs** (dynamic meta routing, 2026-08-02). Every format freezes the DERIVED virtual width (65536 slots — never chosen) and spreads minting across 64 slots per metadata volume, so any volume's existing metadata is divisible into ≥ 64 movable slices from birth: a single-metadata-volume filesystem grows to two (or two hundred) by `volume add-meta --take-slots …` / `migrate-meta-slot` with no format-time planning. The retired `format --meta-slots` flag is a hard error naming these verbs; volumes formatted under the old frozen-width scheme refuse loud (reformat required — forward-only).

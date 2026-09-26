@@ -2387,8 +2387,8 @@ static TEST_FLUSH_PASS_TAPE: std::sync::Mutex<Option<Vec<(u32, u64)>>> =
 static TEST_FLUSH_PASS_TAPE_ARMED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Arm [`TEST_FLUSH_PASS_TAPE`]: every flush pass from here appends its
-/// visit order.
+/// Arm the flush-pass visit tape (`TEST_FLUSH_PASS_TAPE`): every flush
+/// pass from here appends its visit order.
 pub fn test_arm_flush_pass_tape() {
     *TEST_FLUSH_PASS_TAPE
         .lock()

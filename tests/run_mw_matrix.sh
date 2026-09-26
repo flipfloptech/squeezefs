@@ -5731,11 +5731,39 @@ sym_crash_round_asserts() { # round rowdir
         [ "$(stat_sum "$j" membership_self_fences)" = "0" ] ||
             die "round $round: joined writer m$j membership_self_fences != 0 across the manager's death"
         f="$jm/after-failover-r$round-m$j"
+        local verbs0
+        verbs0="$(stat_sum "$j" joined_wire_verbs)"
         mkdir -p "$f" || die "round $round: joined writer m$j could not create after the manager failover"
         echo "r$round" >"$f/mark" || die "round $round: joined writer m$j could not write after the manager failover"
-        v="$(stat_sum "$j" joined_wire_redials)"
-        [ "$v" -ge 1 ] 2>/dev/null ||
-            die "round $round: joined writer m$j joined_wire_redials=$v — its wire never re-dialed the successor"
+        # The re-dial is judged on the joiner's FIRST manager verb since
+        # the failover — and a `mkdir` under `/` with a file in it needs
+        # none (the dentry ships as a cross-owner step on the S8 lane, the
+        # mints land in slots the joiner already leases: PR 14's fleet on
+        # the flip binary read `manager_verbs 0` at the successor with the
+        # mkdir landed). So the law is conditional on a verb: a joiner that
+        # asked the successor anything since the kill (`joined_wire_verbs`
+        # advanced — the extent refill, a first-touch acquire, a slot
+        # release) reached it through a re-dialed wire (`joined_wire_
+        # redials ≥ 1`), with no wire failure; one that asked nothing has
+        # nothing to re-dial and says so. (A create BURST forces the verb
+        # — 512 inline creates spread over the rotor eat the `8 + M` grant
+        # — but its leaf compactions MOVE the joiner's slot roots, and the
+        # successor's block-plane census reads those slots through its
+        # PROJECTIONS, stale at the grant-time root: 10 false C2 "leaked"
+        # findings on live 5 MiB files — the acceptance record's §4.4ba,
+        # PR 14b's; the burst stays out of this leg until the census is
+        # scoped.)
+        v="$(stat_sum "$j" joined_wire_verbs)"
+        if [ "${v:-0}" -gt "${verbs0:-0}" ] 2>/dev/null; then
+            v="$(stat_sum "$j" joined_wire_redials)"
+            [ "$v" -ge 1 ] 2>/dev/null ||
+                die "round $round: joined writer m$j joined_wire_redials=$v — its wire never re-dialed the successor (joined_wire_verbs $verbs0 → $(stat_sum "$j" joined_wire_verbs))"
+            log "round $round: joined writer m$j's first manager verb since the kill landed through a re-dialed wire (joined_wire_redials=$v)"
+        else
+            log "round $round: joined writer m$j asked the successor nothing since the kill (joined_wire_verbs $verbs0) — nothing to re-dial; the data plane below proves the venue"
+        fi
+        [ "$(stat_sum "$j" joined_wire_failures)" = "0" ] ||
+            die "round $round: joined writer m$j joined_wire_failures=$(stat_sum "$j" joined_wire_failures) across the manager's death"
         [ "$(cat "$(mnt_of 0)/after-failover-r$round-m$j/mark" 2>/dev/null)" = "r$round" ] ||
             die "round $round: the successor does not read joined writer m$j's post-failover name"
         # PR 12b review round 1, Issue 2 — the DATA plane follows too: a

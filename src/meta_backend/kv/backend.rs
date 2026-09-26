@@ -11891,9 +11891,16 @@ impl KvMetaBackend {
     /// The per-slot exclusive ceilings on RAW local inos this volume's
     /// keyspaces could have minted so far, keyed by FOREST slot (`0` the
     /// native keyspace, `s + 1` guest slot `s` — the key ino's high bits):
-    /// [`Self::max_local_ino_watermark`] decomposed instead of folded.
-    /// A slot with no cursor here (a joined appender's, never hosted) is
-    /// absent — a reader bounds nothing there. The online census walks
+    /// [`Self::max_local_ino_watermark`] decomposed instead of folded —
+    /// with one difference: the fold takes every word as an UPPER bound,
+    /// this map names only the keyspaces whose LIVE cursor this mount
+    /// holds (the native, its guest cursors, its own leases, tree 0's
+    /// unleased words). A slot another appender leases is absent — its
+    /// word here is the grant-time cursor and every ino the lessee minted
+    /// since sits past it — so the census walks it whole (PR 14, §4.4ba:
+    /// the first build bounded the joiners' slots at those words and read
+    /// their live blocks as C2 "leaked" after a manager failover). A
+    /// reader bounds nothing it holds no cursor for. The online census walks
     /// each slot's records up to its ceiling as of the walk's START and
     /// jumps to the next slot past it (PR 13i's record §4.4aw — a creator
     /// that outpaces the walk kept every page's tail ahead of the cursor
@@ -11903,8 +11910,35 @@ impl KvMetaBackend {
     pub fn slot_ino_watermarks(
         &self,
     ) -> std::collections::BTreeMap<super::record::ForestSlot, u64> {
+        // The slots ANOTHER appender leases (KD-SYM-3 — the lessee's
+        // cursor travels with its lease; every word this mount holds for
+        // such a slot — a guest cursor left from before the grant, the
+        // table's grant-time word, tree 0's `Leased` snapshot — predates
+        // the lessee's mints), so bounding one would skip every ino the
+        // lessee minted since: the census's referencer walk lost the
+        // joiners' files and read their live blocks as C2 "leaked" after
+        // a manager failover (PR 14, the record's §4.4ba). Absent from the
+        // map ⇒ walked whole.
+        let mut foreign = std::collections::BTreeSet::new();
+        let mut own_leases: Vec<(super::record::ForestSlot, u64)> = Vec::new();
+        if let Some(plane) = self.slot_leases() {
+            let own = self.own_appender_id();
+            for (slot, lease) in plane.table.snapshot() {
+                if lease.state == crate::slot_lease_core::LeaseState::Unleased {
+                    continue;
+                }
+                if lease.holder == own {
+                    own_leases.push((slot, lease.words.cursor));
+                } else {
+                    foreign.insert(slot);
+                }
+            }
+        }
         let mut out = std::collections::BTreeMap::new();
         let mut raise = |slot: super::record::ForestSlot, ceiling: u64| {
+            if foreign.contains(&slot) {
+                return;
+            }
             let e = out.entry(slot).or_insert(0);
             *e = (*e).max(ceiling);
         };
@@ -11916,14 +11950,18 @@ impl KvMetaBackend {
             );
             true
         });
-        if let Some(plane) = self.slot_leases() {
-            for (slot, lease) in plane.table.snapshot() {
-                raise(slot, lease.words.cursor);
-            }
+        for (slot, cursor) in own_leases {
+            raise(slot, cursor);
         }
+        // Tree 0's UNLEASED words: nobody mints into an unleased slot, so
+        // the recorded cursor is exact for it; a LEASED word is its
+        // lessee's grant-time cursor — the table above has the live one
+        // for our own leases, a foreign lessee's stays absent.
         if let Some(words) = self.forest_slot_words.get() {
             for (slot, w) in words {
-                raise(*slot, w.cursor);
+                if w.unleased {
+                    raise(*slot, w.cursor);
+                }
             }
         }
         out

@@ -1778,7 +1778,7 @@ async fn appender_clear_refuses_a_fresh_writer_claim_on_volume_0() {
     let uris = format_stamped_set_with_config(dir.path(), 2).await;
     // A clean writer over both volumes (every claim removed at its leave)…
     {
-        let routed = open_under(&uris, &Knobs::unarmed()).await;
+        let routed = open_under(&uris, &Knobs::armed()).await;
         let d = routed
             .create(ROOT_INO, "d", libc::S_IFDIR | 0o755, 1000, 1000)
             .await
@@ -2031,17 +2031,18 @@ async fn a_c14_conflict_is_reported_refused_and_cleared_by_the_attestation() {
 // The routed Issue 1 (PR 2's base tree): the own page one root ahead
 // ---------------------------------------------------------------------------
 
-/// A kill on an UNARMED stamped writer between a checkpoint's page write
-/// and the next cycle's tree-0 publication: the flush pass split a guest
-/// slot's root leaf (a create storm), so region 0's page names the NEW
-/// root while tree 0 still names the pre-split one — the shape every
-/// post-PR-14 default mount has under write load. The remount opens the
-/// guest at the newest durable root (the page's) through the WRITER-legal
-/// install and serves every acked name; before the fix `adopt_root`
-/// refused the remount ("this mount has not armed reader revalidation" —
+/// A kill on the DEFAULT writer (PR 14: the armed plane) between a
+/// checkpoint's page write and the next cycle's tree-0 publication: the
+/// flush pass split a guest slot's root leaf (a create storm), so region
+/// 0's page names the NEW root while tree 0 still names the pre-split one
+/// — the shape every default mount has under write load (a leased slot's
+/// root is page-homed, KD-SYM-3). The remount opens the guest at the
+/// newest durable root (the page's) through the WRITER-legal install and
+/// serves every acked name; before the fix `adopt_root` refused the
+/// remount ("this mount has not armed reader revalidation" —
 /// `corpse_sweep_tests` stamped 1-in-4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_kill_between_a_page_write_and_the_next_publication_remounts_an_unarmed_forest() {
+async fn a_kill_between_a_page_write_and_the_next_publication_remounts_the_forest() {
     struct Cleanup;
     impl Drop for Cleanup {
         fn drop(&mut self) {
@@ -2056,7 +2057,7 @@ async fn a_kill_between_a_page_write_and_the_next_publication_remounts_an_unarme
     // The cadence parked: the TWO cycles below are the test's, so the
     // second flush pass's root move lands on the page and nowhere else.
     std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
-    let routed = open_under(&uris, &Knobs::unarmed()).await;
+    let routed = open_under(&uris, &Knobs::armed()).await;
     // A GUEST slot's directory (the native slot's root rides the ledger,
     // never tree 0 or the page — KD-SYM-3).
     let slot = hosted_slot_on(&routed, 0, 7);
@@ -2124,7 +2125,7 @@ async fn a_kill_between_a_page_write_and_the_next_publication_remounts_an_unarme
     drop(routed);
     park_gate::test_reset();
     std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
-    let again = open_under_retry(&uris, &Knobs::unarmed())
+    let again = open_under_retry(&uris, &Knobs::armed())
         .await
         .expect("the remount opens the guest at the page's root");
     for (name, ino) in &files {
@@ -4299,23 +4300,27 @@ async fn a_deferred_death_record_lands_at_the_next_ledger_poll() {
 }
 
 /// **Issue 13 — the unarmed pin the AGENTS paragraph claims.** On a FLAT
-/// volume and on an UNARMED forest the driver is inert: `recovery::arm`
+/// (`--single-writer`) volume — under either knob value, the one unarmed
+/// writable posture since PR 14 — the driver is inert: `recovery::arm`
 /// installs nothing and recovers nothing, the projection is empty, the
-/// published bound reads 0 on flat, every Recovery gauge stays where it
-/// was, and fsck's foreign-window scoping has nothing to scope.
+/// published bound reads 0, every Recovery gauge stays where it was, and
+/// fsck's foreign-window scoping has nothing to scope. (The `=0` forest
+/// is the writable open's refusal, pinned in `sym_default_flip_tests`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_flat_volume_and_an_unarmed_forest_arm_no_recovery_driver() {
+async fn a_flat_volume_arms_no_recovery_driver() {
     let dir = tempfile::tempdir().unwrap();
     let _g = SEAM.lock().await;
     reset_process_state();
     let before = recovery_stats();
     let polls0 = before.ledger_polls;
-    // (a) flat — the seam cleared.
-    {
-        let p = dir.path().join("flat");
+    for (name, knobs) in [
+        ("flat-off", Knobs::unarmed()),
+        ("flat-default", Knobs::armed()),
+    ] {
+        let p = dir.path().join(name);
         std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
         let plan = squeezefs::meta_backend::plan_meta_slot_set(1).unwrap();
-        squeezefs::meta_backend::kv::builder::format_v3_stamped(
+        squeezefs::meta_backend::kv::builder::format_v3_stamped_single_writer(
             &p,
             VOL_LEN,
             &set_opts(),
@@ -4324,9 +4329,10 @@ async fn a_flat_volume_and_an_unarmed_forest_arm_no_recovery_driver() {
         .await
         .unwrap();
         let uris = vec![p.display().to_string()];
-        let routed = open_under(&uris, &Knobs::unarmed()).await;
+        let routed = open_under(&uris, &knobs).await;
         let vol = Arc::clone(&routed.volumes[0]);
         assert!(!vol.superblock().symmetric_forest_stamped());
+        assert!(!vol.slot_lease_armed());
         let rep = recovery::arm(&routed).await.unwrap();
         assert_eq!(rep, recovery::RecoverySetReport::default());
         assert_eq!(vol.appender_recovery_bound_ms(), 0);
@@ -4338,32 +4344,12 @@ async fn a_flat_volume_and_an_unarmed_forest_arm_no_recovery_driver() {
         assert!(vol.dead_member_records().await.unwrap().is_empty());
         shutdown(&routed).await;
     }
-    // (b) an unarmed forest.
-    {
-        let fdir = dir.path().join("forest");
-        std::fs::create_dir_all(&fdir).unwrap();
-        let uris = format_stamped_set_with_config(&fdir, 1).await;
-        let routed = open_under(&uris, &Knobs::unarmed()).await;
-        let vol = Arc::clone(&routed.volumes[0]);
-        assert!(!vol.slot_lease_armed());
-        let rep = recovery::arm(&routed).await.unwrap();
-        assert_eq!(rep, recovery::RecoverySetReport::default());
-        assert!(vol
-            .foreign_window_inos(routed.routing_width())
-            .await
-            .unwrap()
-            .is_empty());
-        let rep = recover_dead_appenders_set(&routed).await.unwrap();
-        assert_eq!(rep.recovered(), 0);
-        shutdown(&routed).await;
-    }
     let after = recovery_stats();
     assert_eq!(after.recoveries, before.recoveries);
     assert_eq!(after.preempts, before.preempts);
     assert_eq!(after.regions_released, before.regions_released);
     assert_eq!(after.intents_rolled_forward, before.intents_rolled_forward);
-    // The unarmed forest's explicit projection counted one poll; the arm
-    // counted none (inert).
-    assert_eq!(after.ledger_polls, polls0 + 1);
+    // The arm counted no poll on either flat mount (inert).
+    assert_eq!(after.ledger_polls, polls0);
     reset_process_state();
 }

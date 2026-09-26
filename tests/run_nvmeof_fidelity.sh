@@ -1288,10 +1288,10 @@ leg_sym_manager_failover() {
     dd if=/dev/zero of="$meta" bs=1M count=16 oflag=direct status=none
     dd if=/dev/zero of="$data" bs=1M count=16 oflag=direct status=none
 
-    # A bit-17 volume: the seam at format (PR 11's `format --symmetric` is
-    # not built), the partition seam at mount (PR 4's lease gate).
-    if SQUEEZEFS_TEST_STAMP_SYMMETRIC=1 "$FIDELI_BIN" format "sqmeta://$meta" "sqdata://$data" --force >> "$out" 2>&1; then
-        ok "SYMMGR: stamped format (bit 17 through the seam)"
+    # A bit-17 volume: the DEFAULT format class since PR 14; the partition
+    # seam at mount (PR 4's lease gate).
+    if "$FIDELI_BIN" format "sqmeta://$meta" "sqdata://$data" --force >> "$out" 2>&1; then
+        ok "SYMMGR: stamped format (bit 17 — the default class)"
     else
         bad "SYMMGR: format failed"
         return

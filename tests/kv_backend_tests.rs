@@ -36,7 +36,8 @@ use squeezefs::meta_backend::atomicity::{
 };
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{
-    digest_backend, format_v3, BuilderConfig, FormatV3Options, ImageBuilder, ROOT_INO,
+    digest_backend, format_v3, format_v3_single_writer, BuilderConfig, FormatV3Options,
+    ImageBuilder, ROOT_INO,
 };
 use squeezefs::meta_backend::kv::journal::{checkpoint_reserve_bytes, entry_len_for, JournalRing};
 use squeezefs::meta_backend::kv::journal_core::AdmissionClass;
@@ -692,12 +693,18 @@ async fn builder_output_is_deterministic_and_digest_stable() {
     let (f2, img2) = build_once().await;
 
     assert_eq!(img1.nodes_written, img2.nodes_written);
-    // One extent per node — plus, on a forest image, the appender
-    // directory's first extent (design-symmetric-metadata §5.3.1).
-    let forest_extents = u64::from(squeezefs::env_knobs::bool_knob(
-        "SQUEEZEFS_TEST_STAMP_SYMMETRIC",
-        false,
-    ));
+    // One extent per node — plus, on a forest image (the default class
+    // since PR 14), the appender directory's first extent
+    // (design-symmetric-metadata §5.3.1).
+    let forest_extents = match squeezefs::meta_backend::kv::superblock::classify_volume(f1.path())
+        .await
+        .expect("classify")
+    {
+        squeezefs::meta_backend::kv::superblock::VolumeFormat::V3(sb) => {
+            u64::from(sb.symmetric_forest_stamped())
+        }
+        other => panic!("{other:?}"),
+    };
     assert_eq!(
         img1.extents_allocated,
         img1.nodes_written + forest_extents,
@@ -1010,16 +1017,11 @@ async fn a_flat_volumes_cadence_trigger_is_the_max_age_whatever_the_term_measure
     use squeezefs::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS;
     let file = NamedTempFile::new().unwrap();
     file.as_file().set_len(V3_VOL_LEN).unwrap();
-    // The premise is the FLAT layout: under the matrix's stamped leg the
-    // seam stamps every format, so the seam is cleared around this one
-    // (the suite runs `--test-threads=1` there; `sym_convert_tests`' law).
-    let seam = std::env::var_os("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
-    let formatted = format_v3(file.path(), V3_VOL_LEN, &format_opts(false)).await;
-    if let Some(v) = seam {
-        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", v);
-    }
-    formatted.expect("flat format");
+    // The premise is the FLAT layout — the `--single-writer` class, the
+    // one flat writable class since PR 14 (the default formats a forest).
+    format_v3_single_writer(file.path(), V3_VOL_LEN, &format_opts(false))
+        .await
+        .expect("flat format");
     let be = KvMetaBackend::open(file.path()).await.expect("flat open");
     assert!(
         be.appender_stats().is_none(),

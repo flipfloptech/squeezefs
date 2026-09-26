@@ -851,9 +851,6 @@ pub fn join_dial_failed(e: &crate::error::SqueezefsError) -> bool {
 }
 
 pub async fn symmetric_join_target(paths: &[String]) -> Result<Option<JoinedSetAdmission>> {
-    if !kv::slot_lease::symmetric_meta_requested() {
-        return Ok(None);
-    }
     let disc = discover_meta_set(paths).await?;
     let Some(first) = disc.ordered_paths.first() else {
         return Ok(None);

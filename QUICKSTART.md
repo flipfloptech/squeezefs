@@ -13,6 +13,7 @@ You can run and test SqueezeFS on any Linux machine using pre-allocated files as
 sudo apt update && sudo apt install -y \
     build-essential pkg-config libfuse3-dev fuse3 clang libclang-dev
 ```
+> **The memlock limit.** On a kernel with the kmbuf surface (the sqz kernel series) FUSE-over-io_uring pins `queues × entries × ~1 MiB` of kernel-managed payload buffers at mount — one queue per possible CPU, 32 entries by default: 1 GiB on a 32-CPU box — and an unprivileged mount is bounded by `RLIMIT_MEMLOCK` (8 MiB on most distributions), so a fresh install's first mount can refuse `ENOMEM` at its first queue. Raise it before mounting — `ulimit -l unlimited` in the mounting shell, or persistently through `/etc/security/limits.d/` / `DefaultLimitMEMLOCK=infinity` (new sessions only); root and `CAP_IPC_LOCK` are exempt. The derivation table and the three places are in [docs/operations.md → Prerequisites](docs/operations.md#prerequisites--the-memlock-limit-rlimit_memlock).
 
 ### Step 1: Build
 ```bash

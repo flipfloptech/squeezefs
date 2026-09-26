@@ -797,11 +797,19 @@ async fn test_pr_acquired_at_mount_released_at_clean_unmount() {
 }
 
 /// `RESCAP == 0` (no reservation support) degrades to detection grade —
-/// `flock+claim` — and the mount proceeds (never fails on a non-PR
-/// namespace).
+/// `flock+claim` — and the mount proceeds on the `--single-writer` class
+/// (one writer by declaration: never fails on a non-PR namespace). The
+/// DEFAULT class since PR 14 is the armed symmetric plane, whose
+/// KD-SYM-13 law REFUSES a non-PR block device without the loud opt-in
+/// (`sym_fence_tests`); the refusal names `--single-writer` as the
+/// single-host remedy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_rescap_zero_degrades_to_detection_grade() {
-    let vol = fresh_volume().await;
+    let vol = NamedTempFile::new().unwrap();
+    vol.as_file().set_len(VOL_LEN).unwrap();
+    squeezefs::meta_backend::kv::builder::format_v3_single_writer(vol.path(), VOL_LEN, &opts())
+        .await
+        .expect("format the single-writer volume");
     let ns = FakeNvmeNamespace::without_pr_support();
     reservation::install_override(
         vol.path(),
@@ -813,6 +821,25 @@ async fn test_rescap_zero_degrades_to_detection_grade() {
     assert_eq!(ns.holder(), None, "no reservation is taken without RESCAP");
     be.shutdown().await.unwrap();
     reservation::clear_override(vol.path());
+
+    // The default class on the same substrate: refused, naming the class
+    // that admits it.
+    let forest = fresh_volume().await;
+    let ns = FakeNvmeNamespace::without_pr_support();
+    reservation::install_override(
+        forest.path(),
+        FakeReservationClient::new(ns.clone(), "nqn.2026-07.io.squeezefs:host-b", "hostid-b"),
+    );
+    let err = KvMetaBackend::open(forest.path())
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .expect("the default class refuses a non-PR block device without the opt-in");
+    assert!(
+        err.contains("KD-SYM-13") && err.contains("--single-writer"),
+        "names the law and the single-host remedy: {err}"
+    );
+    reservation::clear_override(forest.path());
 }
 
 /// Acquire-conflict arbitration, fresh holder: another registrant holds

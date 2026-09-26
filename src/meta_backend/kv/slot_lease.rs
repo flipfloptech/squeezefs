@@ -27,10 +27,11 @@ pub const SYM_AFFINITY_MAX_MB_ENV: &str = "SQUEEZEFS_SYM_AFFINITY_MAX_MB";
 /// The handover window `T_idle`, ms (derived `T_owner`).
 pub const SYM_T_IDLE_MS_ENV: &str = "SQUEEZEFS_SYM_T_IDLE_MS";
 
-/// Whether the operator asked for the plane (the knob alone — the volume
-/// gate is the open's).
+/// Whether the plane is requested — the knob alone, DEFAULT ON since PR 14
+/// (the volume gate is the open's: a stamped volume's writer refuses at
+/// `=0`, a `--single-writer` volume arms nothing whatever the knob says).
 pub fn symmetric_meta_requested() -> bool {
-    crate::env_knobs::bool_knob(SYMMETRIC_META_ENV, false)
+    crate::env_knobs::bool_knob(SYMMETRIC_META_ENV, true)
 }
 
 /// The rotor size in force: the knob verbatim, else

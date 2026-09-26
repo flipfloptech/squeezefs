@@ -88,7 +88,7 @@ fn format_flat(base: &Path, staging: &Path) -> PathBuf {
             .arg("--disk-cache-paths")
             .arg(staging)
             .arg("--force")
-            .env_remove("SQUEEZEFS_TEST_STAMP_SYMMETRIC"),
+            .arg("--single-writer"),
         "squeezefs format",
     );
     meta

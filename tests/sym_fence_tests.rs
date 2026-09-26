@@ -10,20 +10,25 @@
 //! - a declared registrant cap (`SQUEEZEFS_PR_REGISTRANT_CAP`) refuses
 //!   the next join LOUD, naming the count, the namespace and the remedy;
 //!   `pr_registrant_cap_refusals` counts it;
-//! - KD-SYM-13: the symmetric arm refuses to arm on a non-PR substrate
-//!   unless `SQUEEZEFS_SYM_ALLOW_NON_PR=1`, announced loudly;
+//! - KD-SYM-13: the symmetric plane refuses to arm on a non-PR BLOCK
+//!   DEVICE unless `SQUEEZEFS_SYM_ALLOW_NON_PR=1`, announced loudly (a
+//!   regular file with no device modelled over it is one kernel by
+//!   construction and needs no opt-in — PR 14's sandbox arm);
 //!   `SQUEEZEFS_META_PR_WERO=0` is refused on a PR-capable substrate
 //!   without the same opt-in;
 //! - the manager holds WERO (rtype 3) on the metadata namespace and
-//!   `manager_lease` reads `held`; a flat mount's reservation posture is
-//!   byte-for-byte today's (Write Exclusive, rtype 1).
+//!   `manager_lease` reads `held` — the solo default writer included
+//!   (PR 14); a `--single-writer` mount's reservation posture is
+//!   byte-for-byte the shipped one (Write Exclusive, rtype 1).
 
 use squeezefs::meta_backend::kv::appender::{
     appender0_page_offsets, write_page, AppenderIdentity, AppenderPage, AppenderState,
     ManagerLease, TEST_APPENDER_SLOTS_ENV,
 };
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
-use squeezefs::meta_backend::kv::builder::{format_v3_stamped, FormatV3Options};
+use squeezefs::meta_backend::kv::builder::{
+    format_v3_stamped_single_writer, format_v3_stamped_symmetric, FormatV3Options,
+};
 use squeezefs::meta_backend::kv::superblock::{classify_volume, VolumeFormat};
 use squeezefs::meta_backend::reservation::{
     install_override, parse_reservation_report, report_len_for, FakeNvmeNamespace,
@@ -54,13 +59,13 @@ async fn format_member(dir: &std::path::Path, name: &str, stamped: bool) -> Stri
     let p = dir.join(name);
     std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
-    if stamped {
-        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
+    // The forest EXPLICITLY (the default class since PR 14) or the flat
+    // `--single-writer` class — the builder is told, never the environment.
+    let r = if stamped {
+        format_v3_stamped_symmetric(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await
     } else {
-        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
-    }
-    let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        format_v3_stamped_single_writer(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await
+    };
     r.expect("format member");
     p.display().to_string()
 }
@@ -101,41 +106,39 @@ async fn the_symmetric_arm_refuses_a_non_pr_substrate_without_the_loud_opt_in() 
     let dir = tempfile::tempdir().unwrap();
     let _g = ENV.lock().await;
     let uris = vec![format_member(dir.path(), "meta0", true).await];
-    // A file-backed volume advertises no reservation support: the arm
-    // (a declared partition) refuses to arm, naming the knob.
-    let err = {
-        let _e = ArmEnv::set(Some(PARTITION), None, None);
-        match open_routed_meta_set(&uris).await {
-            Ok(_) => panic!("the symmetric arm mounted on a non-PR substrate without the opt-in"),
-            Err(e) => e.to_string(),
-        }
-    };
-    assert!(
-        err.contains("SQUEEZEFS_SYM_ALLOW_NON_PR") && err.contains("KD-SYM-13"),
-        "names the opt-in and the rule: {err}"
+    let meta = std::path::PathBuf::from(&uris[0]);
+    // A BLOCK DEVICE advertising no reservation support (the fake models
+    // one over the file — `reservation::single_kernel_substrate` reads an
+    // installed override as the device it models): the armed plane —
+    // every writer's since PR 14, solo or partitioned — refuses to arm,
+    // naming the knob.
+    let ns = FakeNvmeNamespace::without_pr_support();
+    install_override(
+        &meta,
+        FakeReservationClient::new(Arc::clone(&ns), "nqn.nonpr", "nonpr-host"),
     );
-    assert!(
-        err.contains("detection-grade"),
-        "says what the substrate gives — detection-grade, not loss-free: {err}"
-    );
-    // The solo stamped mount (no partition, no join) is NOT the arm: it
-    // mounts on any substrate exactly as PR 1/2 left it.
-    {
-        let _e = ArmEnv::set(None, None, None);
-        let routed = open_routed_meta_set(&uris)
-            .await
-            .expect("a solo forest mount is unarmed");
-        let s = routed.volumes[0].appender_stats().unwrap();
-        assert_eq!(s.manager_lease, ManagerLease::Held);
+    for partition in [Some(PARTITION), None] {
+        let err = {
+            let _e = ArmEnv::set(partition, None, None);
+            match open_routed_meta_set(&uris).await {
+                Ok(_) => {
+                    panic!(
+                        "the symmetric plane mounted on a non-PR block device without the opt-in"
+                    )
+                }
+                Err(e) => e.to_string(),
+            }
+        };
         assert!(
-            !s.meta_pr_wero,
-            "no reservation at all on a file-backed volume"
+            err.contains("SQUEEZEFS_SYM_ALLOW_NON_PR") && err.contains("KD-SYM-13"),
+            "names the opt-in and the rule: {err}"
         );
-        for v in &routed.volumes {
-            v.shutdown().await.unwrap();
-        }
+        assert!(
+            err.contains("detection-grade"),
+            "says what the substrate gives — detection-grade, not loss-free: {err}"
+        );
     }
-    // The loud opt-in arms it.
+    // The loud opt-in arms it, detection-grade.
     {
         let _e = ArmEnv::set(Some(PARTITION), Some("1"), None);
         let routed = open_routed_meta_set(&uris)
@@ -144,6 +147,29 @@ async fn the_symmetric_arm_refuses_a_non_pr_substrate_without_the_loud_opt_in() 
         let s = routed.volumes[0].appender_stats().unwrap();
         assert_eq!(s.live, 2);
         assert!(!s.meta_pr_wero);
+        for v in &routed.volumes {
+            v.shutdown().await.unwrap();
+        }
+    }
+    squeezefs::meta_backend::reservation::clear_override(&meta);
+    // A regular FILE with no device over it is one kernel by construction
+    // (the sandbox class): the solo default mount arms and holds nothing,
+    // no opt-in asked.
+    {
+        let _e = ArmEnv::set(None, None, None);
+        let routed = open_routed_meta_set(&uris)
+            .await
+            .expect("a file-backed forest volume needs no opt-in");
+        let s = routed.volumes[0].appender_stats().unwrap();
+        assert_eq!(s.manager_lease, ManagerLease::Held);
+        assert!(
+            !s.meta_pr_wero,
+            "no reservation at all on a file-backed volume"
+        );
+        assert!(
+            routed.volumes[0].slot_lease_armed(),
+            "and the plane IS armed"
+        );
         for v in &routed.volumes {
             v.shutdown().await.unwrap();
         }
@@ -272,17 +298,19 @@ async fn the_manager_holds_wero_on_the_metadata_namespace_and_a_flat_mount_keeps
             v.shutdown().await.unwrap();
         }
     }
-    // The solo stamped mount — unarmed — keeps rtype 1 too.
+    // The solo stamped mount is the SAME armed writer since PR 14 (no
+    // partition, no knob): WERO too — the second host's appender can
+    // register under it.
     {
         let _e = ArmEnv::set(None, None, None);
         let routed = open_routed_meta_set(std::slice::from_ref(&stamped))
             .await
             .expect("solo");
-        assert!(!routed.volumes[0].appender_stats().unwrap().meta_pr_wero);
+        assert!(routed.volumes[0].appender_stats().unwrap().meta_pr_wero);
         let report = FakeReservationClient::new(Arc::clone(&ns_stamped), "nqn.probe", "probe")
             .report()
             .unwrap();
-        assert_eq!(report.rtype, 1);
+        assert_eq!(report.rtype, 3, "the solo default writer holds WERO");
         for v in &routed.volumes {
             v.shutdown().await.unwrap();
         }

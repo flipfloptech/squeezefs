@@ -3,13 +3,21 @@
 # PR 1: "every existing KV contract green on the forest — suites
 # parametrized over the stamp").
 #
-# The forest (incompat bit 17) is stamped ONLY through the test seam
-# `SQUEEZEFS_TEST_STAMP_SYMMETRIC=1`, which the image builder reads at
-# format time — so the same test binary formats FLAT volumes without it
-# and FOREST volumes with it. This script runs the pre-forest KV suites
-# BOTH ways (`flat`, then `stamped`) and fails on the first red leg: a
-# contract that holds on the shipped layout and not on the forest is
-# exactly what review round 1 of PR 1 found by hand (Issues 1-3).
+# INVERTED at the PR-14 default flip: the forest (incompat bit 17) IS the
+# default format class, so the `stamped` leg runs the suites as they are
+# (no seam), and the `flat` leg sets the test seam
+# `SQUEEZEFS_TEST_FORMAT_FLAT=1`, which the public formatters read at
+# format time — every DEFAULT-class format request builds the
+# `--single-writer` volume, the one flat WRITABLE class after the flip;
+# a fixture whose premise is the forest names it explicitly
+# (`format_v3_stamped_symmetric`, the `tests/common/sym.rs` helpers) and is
+# seam-blind. This script runs the KV suites BOTH ways (`flat`, then
+# `stamped`) and fails on the first red leg: a contract that holds on one
+# layout and not on the other is exactly what review round 1 of PR 1
+# found by hand (Issues 1-3). Before the flip the seam was
+# `SQUEEZEFS_TEST_STAMP_SYMMETRIC=1` on the stamped leg; the paragraphs
+# below describe each suite's two legs in that era's terms — "stamps
+# under the seam themselves" reads as "names the forest explicitly" now.
 #
 # The suites listed drive the KV backend directly (format → mount →
 # commit → checkpoint → replay), the tree and node layers, the durable
@@ -249,8 +257,8 @@ trap 'rm -f "$SUITE_LOG"' EXIT
 
 for leg in "${LEGS[@]}"; do
   case "$leg" in
-    flat) unset SQUEEZEFS_TEST_STAMP_SYMMETRIC ;;
-    stamped) export SQUEEZEFS_TEST_STAMP_SYMMETRIC=1 ;;
+    flat) export SQUEEZEFS_TEST_FORMAT_FLAT=1 ;;
+    stamped) unset SQUEEZEFS_TEST_FORMAT_FLAT ;;
     *) echo "unknown leg '$leg' (flat|stamped)" >&2; exit 2 ;;
   esac
   echo "=== sym-forest suites: $leg leg (${#SUITES[@]} suites) ==="

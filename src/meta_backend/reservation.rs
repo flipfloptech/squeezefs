@@ -738,6 +738,20 @@ pub fn override_for(path: &Path) -> Option<Arc<dyn ReservationClient>> {
     overrides().lock().unwrap().get(path).cloned()
 }
 
+/// Whether the volume at `path` is a SINGLE-KERNEL substrate — a REGULAR
+/// FILE (a sandbox, a loopless file-backed volume) with no reservation
+/// client installed to model a device over it. KD-SYM-13's premise is a
+/// LUN a second HOST can open; a file has one kernel by construction (the
+/// D0 flock is that kernel's exclusion, every in-process daemon of one
+/// file shares its page cache and its flock), so no zombie of another
+/// host exists for a device to refuse and the armed plane's non-PR
+/// refusal does not apply. An installed override says "judge me as the
+/// device I model" and keeps the refusal. `false` on a block device and
+/// on an unreadable path (the refusal stands where the class is unknown).
+pub fn single_kernel_substrate(path: &Path) -> bool {
+    override_for(path).is_none() && std::fs::metadata(path).is_ok_and(|m| m.file_type().is_file())
+}
+
 /// Resolve the reservation client the mount guard will drive for `path`
 /// (design §5.0 B1): the test override wins; otherwise probe the real
 /// device. Returns `Some` only when the namespace advertises reservation

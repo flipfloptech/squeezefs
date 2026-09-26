@@ -726,6 +726,17 @@ impl KvMetaBackend {
             .await
         };
         let allow_non_pr = crate::env_knobs::bool_knob("SQUEEZEFS_SYM_ALLOW_NON_PR", false);
+        if !pr_capable && crate::meta_backend::reservation::single_kernel_substrate(path) {
+            // One kernel by construction (KD-SYM-13's regular-file arm,
+            // PR 14): the manager's flock is the fence; nothing to register
+            // under.
+            log::info!(
+                "meta volume {}: joined appender on a FILE-backed metadata volume — one kernel, \
+                 the manager's flock is the fence; no registrant",
+                path.display()
+            );
+            return Ok((None, 0));
+        }
         if !pr_capable {
             if !allow_non_pr {
                 return Err(KvError::Busy(format!(
@@ -913,9 +924,9 @@ impl KvMetaBackend {
     ) -> Result<Arc<Self>, KvError> {
         if !super::super::slot_lease::symmetric_meta_requested() {
             return Err(KvError::Busy(format!(
-                "{}: a joined-appender open needs the symmetric plane (SQUEEZEFS_SYMMETRIC_META=1) \
-                 — a second RW mount without it is the D0 single-writer guard's refusal, never a \
-                 join (design-symmetric-metadata §7.3)",
+                "{}: a joined-appender open needs the symmetric plane, which SQUEEZEFS_SYMMETRIC_\
+                 META=0 refuses — the knob names no posture since the default flip (PR 14, \
+                 design-symmetric-metadata §7.2 / §7.3); unset it",
                 path.display()
             )));
         }
@@ -952,7 +963,8 @@ impl KvMetaBackend {
         if !sb.symmetric_forest_stamped() {
             return Err(KvError::Corrupt(format!(
                 "{}: not symmetric-forest capable (incompat bit 17 absent) — a joined appender \
-                 needs the forest; run `squeezefs volume enable-symmetric` or format `--symmetric`",
+                 needs the forest; run `squeezefs volume enable-symmetric` offline (a \
+                 `--single-writer` volume has one writer by format class)",
                 path.display()
             )));
         }
@@ -1047,6 +1059,7 @@ impl KvMetaBackend {
                 wire: Arc::clone(&wire),
                 grant,
             }),
+            false,
         )
         .await
         {

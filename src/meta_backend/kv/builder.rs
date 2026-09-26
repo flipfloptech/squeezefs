@@ -125,15 +125,17 @@ pub struct ImageBuilder {
     /// set on the planned superblock — ONE plan, ONE superblock write,
     /// no ordering problem. The BUILDER default stays `false` (its
     /// determinism contract — the low-level image is the unstamped
-    /// class); since the rung-10b Phase-B flip the PUBLIC formatters
-    /// (`format_v3`/`format_v3_stamped`) set it, and the single-writer
-    /// opt-out variants are what withhold it.
+    /// class); the PUBLIC formatters (`format_v3`/`format_v3_stamped`)
+    /// set it together with `symmetric` since the PR-14 default flip, and
+    /// the single-writer opt-out variants are what withhold it.
     multi_writer: bool,
-    /// `format --symmetric` (design-symmetric-metadata §6.2, PR 11): build
-    /// the slot-tree FOREST and stamp incompat bit 17 — the product arm of
-    /// the image the `SQUEEZEFS_TEST_STAMP_SYMMETRIC` seam builds; the
-    /// two are one code path, so their images are byte-identical for one
-    /// description.
+    /// The slot-tree FOREST under incompat bit 17 (design-symmetric-
+    /// metadata §6.2 / §7.1) — the DEFAULT format class since PR 14: the
+    /// public formatters set it beside `multi_writer`; the builder's
+    /// default stays `false` (the low-level image is the unstamped class),
+    /// and the PRE-FLIP multi-writer class — nine bits, no forest, what
+    /// `enable-symmetric` converts — is built by setting `multi_writer`
+    /// alone.
     symmetric: bool,
 }
 
@@ -200,11 +202,10 @@ impl ImageBuilder {
     }
 
     /// Make the built image a slot-tree FOREST under incompat bit 17
-    /// (`format --symmetric`, design-symmetric-metadata §6.2 / §7.1): tree
-    /// 0, the native slot tree, appender 0's page and the appender
-    /// directory — everything a bit-17 mount expects, in the one planned
-    /// superblock write. The same image the
-    /// `SQUEEZEFS_TEST_STAMP_SYMMETRIC` seam builds.
+    /// (design-symmetric-metadata §6.2 / §7.1 — the default format class
+    /// since PR 14): tree 0, the native slot tree, appender 0's page and
+    /// the appender directory — everything a bit-17 mount expects, in the
+    /// one planned superblock write.
     pub fn set_symmetric(&mut self) {
         self.symmetric = true;
     }
@@ -548,14 +549,12 @@ impl ImageBuilder {
         }
 
         // Incompat bit 17 (the slot-tree FOREST, docs/design-symmetric-
-        // metadata.md §7.1): `format --symmetric` ([`Self::set_symmetric`])
-        // or the **test seam** `SQUEEZEFS_TEST_STAMP_SYMMETRIC=1` (the
-        // suites' way, so a flat-shaped harness formats a forest without
-        // knowing it). Either way the image is built as the forest below
-        // (tree 0 + the native slot tree + the appender region), never as
-        // the three per-kind trees plus a bit.
-        let symmetric =
-            self.symmetric || crate::env_knobs::bool_knob("SQUEEZEFS_TEST_STAMP_SYMMETRIC", false);
+        // metadata.md §7.1): the default class since PR 14
+        // ([`Self::set_symmetric`] — the public formatters' every image
+        // but the `--single-writer` opt-out's). The image is built as the
+        // forest below (tree 0 + the native slot tree + the appender
+        // region), never as the three per-kind trees plus a bit.
+        let symmetric = self.symmetric;
         if symmetric {
             sb.features_incompat |= super::superblock::FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST;
         }
@@ -1284,7 +1283,7 @@ pub async fn format_v3(
     volume_len: u64,
     opts: &FormatV3Options,
 ) -> Result<BuiltImage, crate::error::SqueezefsError> {
-    format_v3_inner(path, volume_len, opts, None, FormatClass::MultiWriter).await
+    format_v3_inner(path, volume_len, opts, None, FormatClass::Symmetric).await
 }
 
 /// [`format_v3`] through the `--single-writer` opt-out (rung 10b): the
@@ -1317,14 +1316,7 @@ pub async fn format_v3_stamped(
     opts: &FormatV3Options,
     stamp: super::checkpoint::MembershipStamp,
 ) -> Result<BuiltImage, crate::error::SqueezefsError> {
-    format_v3_inner(
-        path,
-        volume_len,
-        opts,
-        Some(stamp),
-        FormatClass::MultiWriter,
-    )
-    .await
+    format_v3_inner(path, volume_len, opts, Some(stamp), FormatClass::Symmetric).await
 }
 
 /// [`format_v3_stamped`] through the `--single-writer` opt-out (see
@@ -1349,32 +1341,77 @@ pub async fn format_v3_stamped_single_writer(
     .await
 }
 
-/// [`format_v3_stamped`] under `format --symmetric`
-/// (design-symmetric-metadata §6.2, PR 11): the multi-writer-capable
-/// class PLUS incompat bit 17 — one set member built as a slot-tree
-/// forest (tree 0, the native slot tree, appender 0's page, the appender
-/// directory) in the one planned superblock write. The same image the
-/// `SQUEEZEFS_TEST_STAMP_SYMMETRIC` seam builds; dark until the PR-14
-/// default flip. The single-writer opt-out has no symmetric form: the
-/// forest presumes the nine multi-writer bits.
+/// [`format_v3_stamped`] as the EXPLICIT forest: the default class since
+/// PR 14, built whatever the matrix's flat-leg seam says
+/// ([`FORMAT_FLAT_SEAM`] — the seam turns the DEFAULT request flat; a
+/// fixture whose premise is the forest names it here). The one code path
+/// with the default's, so the images are byte-identical for one
+/// description.
 pub async fn format_v3_stamped_symmetric(
     path: &Path,
     volume_len: u64,
     opts: &FormatV3Options,
     stamp: super::checkpoint::MembershipStamp,
 ) -> Result<BuiltImage, crate::error::SqueezefsError> {
-    format_v3_inner(path, volume_len, opts, Some(stamp), FormatClass::Symmetric).await
+    format_v3_inner(
+        path,
+        volume_len,
+        opts,
+        Some(stamp),
+        FormatClass::SymmetricExplicit,
+    )
+    .await
 }
+
+/// [`format_v3_stamped`]'s PRE-FLIP class (design-symmetric-metadata
+/// §7.2's "bit 17 absent" row): the nine multi-writer bits WITHOUT the
+/// forest — every default-format volume between the rung-10b flip
+/// (2026-08-16) and PR 14, and what `squeezefs volume enable-multi-writer`
+/// still produces from a `--single-writer` volume. A writable mount of
+/// this class REFUSES since PR 14 (presence-required — `squeezefs volume
+/// enable-symmetric` is the remedy), so no CLI arm builds it; the
+/// conversion contracts build their source volumes through it.
+pub async fn format_v3_stamped_multi_writer_flat(
+    path: &Path,
+    volume_len: u64,
+    opts: &FormatV3Options,
+    stamp: super::checkpoint::MembershipStamp,
+) -> Result<BuiltImage, crate::error::SqueezefsError> {
+    format_v3_inner(
+        path,
+        volume_len,
+        opts,
+        Some(stamp),
+        FormatClass::MultiWriterFlat,
+    )
+    .await
+}
+
+/// **The matrix's flat-leg seam** (`tests/run_sym_forest_suites.sh
+/// flat`): a DEFAULT-class format request builds the `--single-writer`
+/// volume instead, so every KV contract that formats "the default" runs
+/// on the one flat writable class as well as on the forest. The EXPLICIT
+/// builders ([`format_v3_stamped_symmetric`], the single-writer and the
+/// pre-flip multi-writer forms) ignore it. Registered (`Kind::Bool`,
+/// default off); never set in production.
+pub const FORMAT_FLAT_SEAM: &str = "SQUEEZEFS_TEST_FORMAT_FLAT";
 
 /// The format CLASS a public formatter builds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FormatClass {
-    /// The nine multi-writer bits (the default since the rung-10b flip).
-    MultiWriter,
-    /// None of them (`--single-writer`).
-    SingleWriter,
-    /// The multi-writer class plus the bit-17 forest (`--symmetric`).
+    /// The nine multi-writer bits plus the bit-17 forest — the DEFAULT
+    /// since PR 14 (design-symmetric-metadata §7.2 / PR-plan row 14); the
+    /// one class [`FORMAT_FLAT_SEAM`] turns flat.
     Symmetric,
+    /// The forest named EXPLICITLY (a fixture's premise) — the same image
+    /// as [`Self::Symmetric`], seam-blind.
+    SymmetricExplicit,
+    /// None of them (`--single-writer`) — the flat solo posture, the only
+    /// flat WRITABLE class after the flip.
+    SingleWriter,
+    /// The nine bits without the forest — the pre-flip default class,
+    /// writable-refused since PR 14 until `enable-symmetric` converts it.
+    MultiWriterFlat,
 }
 
 async fn format_v3_inner(
@@ -1443,13 +1480,19 @@ async fn format_v3_inner(
         builder.set_xattr(ROOT_INO, FORMAT_CONFIG_XATTR, cfg)?;
     }
     builder.set_membership_stamp(stamp);
+    let class = match class {
+        FormatClass::Symmetric if crate::env_knobs::bool_knob(FORMAT_FLAT_SEAM, false) => {
+            FormatClass::SingleWriter
+        }
+        c => c,
+    };
     match class {
-        FormatClass::MultiWriter => builder.set_multi_writer(),
-        FormatClass::SingleWriter => {}
-        FormatClass::Symmetric => {
+        FormatClass::Symmetric | FormatClass::SymmetricExplicit => {
             builder.set_multi_writer();
             builder.set_symmetric();
         }
+        FormatClass::SingleWriter => {}
+        FormatClass::MultiWriterFlat => builder.set_multi_writer(),
     }
     Ok(builder.build(path, volume_len).await?)
 }

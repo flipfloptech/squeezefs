@@ -100,32 +100,35 @@ enum Commands {
         /// opt-out is `--single-writer`.
         #[arg(long)]
         multi_writer: bool,
-        /// Format the single-writer (unstamped) class — the explicit
+        /// Format the single-writer (unstamped, FLAT) class — the explicit
         /// opt-out
         ///
-        /// Withholds the nine multi-writer incompat bits, producing the
-        /// pre-flip format class: readable by pre-multi-writer binaries
-        /// — e.g. a recovery scratch volume. The compatibility boundary
-        /// is the one real difference: a stamped volume mounts solo
-        /// verbatim, and repair/fsck verbs run against either class, so
-        /// fixing a filesystem never requires this. Upgrade later with
-        /// `squeezefs volume enable-multi-writer`. Conflicts with
-        /// `--multi-writer`: the two declare contradictory format
-        /// classes, and formatting either silently would produce the
-        /// class the operator did not ask for.
-        #[arg(long, conflicts_with = "multi_writer")]
+        /// Withholds the nine multi-writer incompat bits AND the symmetric
+        /// forest (bit 17), producing the flat solo class: one writer, no
+        /// readers, no joiners — readable by pre-multi-writer binaries,
+        /// e.g. a recovery scratch volume. Since the symmetric default
+        /// flip (PR 14) this is the ONLY flat class a writer may mount;
+        /// repair/fsck verbs run against either class, so fixing a
+        /// filesystem never requires it. Upgrade later with `squeezefs
+        /// volume enable-multi-writer` then `enable-symmetric`. Conflicts
+        /// with `--multi-writer` and `--symmetric`: the flags declare
+        /// contradictory format classes, and formatting either silently
+        /// would produce the class the operator did not ask for.
+        #[arg(long, conflicts_with_all = ["multi_writer", "symmetric"])]
         single_writer: bool,
-        /// Format the symmetric slot-tree forest (incompat bit 17)
+        /// Format the symmetric slot-tree forest (incompat bit 17) — the
+        /// DEFAULT since PR 14
         ///
         /// Every metadata volume is built as one mixed-kind tree per
         /// routing slot with a control tree and an appender directory —
         /// the on-disk shape of the symmetric shared-disk metadata
-        /// program, in which every mount is an equal metadata authority.
-        /// Dark until that program's default flip: a plain `format` never
-        /// stamps the bit, and pre-symmetric binaries refuse this set.
-        /// Existing sets convert offline with `squeezefs volume
-        /// enable-symmetric`. Conflicts with `--single-writer`: the
-        /// forest presumes the multi-writer format class.
+        /// program, in which every RW mount is an equal metadata
+        /// authority. A plain `format` stamps the bit; this flag survives
+        /// as the accepted, no-effect forward spelling from its opt-in
+        /// era (like `--multi-writer`). Pre-symmetric binaries refuse this
+        /// set; existing multi-writer-class sets convert offline with
+        /// `squeezefs volume enable-symmetric`. Conflicts with
+        /// `--single-writer`: the forest presumes the multi-writer class.
         #[arg(long, conflicts_with = "single_writer")]
         symmetric: bool,
         /// Force formatting even if a squeezefs volume is already detected
@@ -2974,15 +2977,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Error: {report}");
         std::process::exit(1);
     }
-    // Symmetric PR 12 — the join ladder's rung 1 (design-symmetric-metadata
-    // §6.1 / §7.3): under SQUEEZEFS_SYMMETRIC_META=1 the multi-writer
-    // posture knobs are RETIRED spellings — refused here in the registry's
-    // own form, naming the successor. Fires only on an ARMED process; an
-    // unarmed one keeps their shipped meaning until the PR-14 flip.
-    if let Some(report) = squeezefs::sym_join::retired_knob_refusal() {
-        eprintln!("Error: {report}");
-        std::process::exit(1);
-    }
 
     // KD-MW-14 rung 3c: feed squeezefs-ipc's blocking pool the fleet-
     // share-DIVIDED sizing root before its first offload (the crate
@@ -4374,10 +4368,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // here: clap refuses the contradictory pair loud.)
             if single_writer {
                 println!(
-                    "Single-writer: formatting the unstamped class (none of the nine \
-                     multi-writer format bits) — readable by pre-multi-writer \
-                     binaries, e.g. a recovery scratch volume. Upgrade later with \
-                     `squeezefs volume enable-multi-writer`."
+                    "Single-writer: formatting the unstamped FLAT class (none of the nine \
+                     multi-writer format bits, no symmetric forest) — one writer, no \
+                     readers or joiners; readable by pre-multi-writer binaries, e.g. a \
+                     recovery scratch volume. Upgrade later with `squeezefs volume \
+                     enable-multi-writer` then `enable-symmetric`."
                 );
             } else {
                 if multi_writer {
@@ -4386,20 +4381,20 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                          the flag is accepted and has no effect."
                     );
                 }
-                println!(
-                    "Multi-writer-capable (the default): stamping the nine multi-writer \
-                     format bits (7,8,9,10,11,12,13,14,15) on every metadata volume — \
-                     one act (KD-MW-1). Pre-multi-writer binaries refuse this set loud; \
-                     solo mounts behave identically (opt out with --single-writer)."
-                );
                 if symmetric {
                     println!(
-                        "Symmetric forest (--symmetric): every metadata volume is built as \
-                         one tree per routing slot with a control tree and an appender \
-                         directory, and stamps incompat bit 17. Pre-symmetric binaries \
-                         refuse this set loud; there is no downgrade verb."
+                        "Note: --symmetric is the default since the symmetric flip (PR 14) — \
+                         the flag is accepted and has no effect."
                     );
                 }
+                println!(
+                    "Symmetric forest (the default): stamping the nine multi-writer format \
+                     bits (7,8,9,10,11,12,13,14,15) and the forest bit (17) on every \
+                     metadata volume — one act (KD-MW-1, KD-SYM-12): one tree per routing \
+                     slot, a control tree and an appender directory; every RW mount is an \
+                     equal metadata authority. Pre-symmetric binaries refuse this set loud; \
+                     there is no downgrade verb (opt out at format with --single-writer)."
+                );
             }
 
             let requested_block_size = parse_human_readable_size(&block_size)?;
@@ -4567,22 +4562,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             full_wipe: !quick,
                             format_config_xattr: config_xattr,
                         };
-                        // KD-MW-1 (design-full-multi-writer §6.2 pt 1,
-                        // rung 10b): the DEFAULT stamps the nine mw bits
-                        // at plan time — one act, never piecemeal;
+                        // KD-MW-1 / KD-SYM-12: the DEFAULT stamps the nine
+                        // mw bits AND the forest bit at plan time — one
+                        // act, never piecemeal (`--symmetric` is that
+                        // default's accepted no-op spelling);
                         // `--single-writer` is the explicit opt-out that
-                        // formats the unstamped class.
+                        // formats the flat unstamped class.
                         if single_writer {
                             squeezefs::meta_backend::kv::builder::format_v3_stamped_single_writer(
-                                Path::new(&path),
-                                volume_len,
-                                &opts,
-                                stamp,
-                            )
-                            .await
-                            .map(|_| ())
-                        } else if symmetric {
-                            squeezefs::meta_backend::kv::builder::format_v3_stamped_symmetric(
                                 Path::new(&path),
                                 volume_len,
                                 &opts,
@@ -8731,9 +8718,9 @@ async fn run_appenders_report(
         if !sb.symmetric_forest_stamped() {
             return Err(format!(
                 "{path}: not a symmetric-forest volume (incompat bit 17 absent) — it has no \
-                 appender directory. Until `squeezefs volume enable-symmetric` / `format \
-                 --symmetric` land (design-symmetric-metadata PR 11), only the test seam \
-                 SQUEEZEFS_TEST_STAMP_SYMMETRIC=1 stamps the bit at format"
+                 appender directory. A `--single-writer` volume never has one; a pre-flip \
+                 multi-writer-class volume gains one through `squeezefs volume \
+                 enable-symmetric` (design-symmetric-metadata §7.2)"
             )
             .into());
         }

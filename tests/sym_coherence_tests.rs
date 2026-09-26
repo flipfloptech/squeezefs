@@ -536,7 +536,9 @@ use squeezefs::meta_backend::kv::backend::{
     test_conveyor_hold_parked, test_conveyor_hold_release, KvMetaBackend,
     TEST_CONVEYOR_HOLD_PRE_DRAIN, TEST_CONVEYOR_HOLD_PRE_ROLLBACK, TEST_CONVEYOR_HOLD_STAGE,
 };
-use squeezefs::meta_backend::kv::builder::{format_v3_stamped, FormatV3Options};
+use squeezefs::meta_backend::kv::builder::{
+    format_v3_stamped_single_writer, format_v3_stamped_symmetric, FormatV3Options,
+};
 use squeezefs::meta_backend::kv::slot_lease::SYMMETRIC_META_ENV;
 use squeezefs::meta_backend::{
     open_routed_meta_set, open_routed_meta_set_read_only, plan_meta_slot_set, Metadata,
@@ -574,9 +576,7 @@ async fn format_stamped(dir: &std::path::Path, name: &str) -> std::path::PathBuf
     let p = dir.join(name);
     std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
-    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-    let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    let r = format_v3_stamped_symmetric(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone()).await;
     r.expect("format stamped volume");
     p
 }
@@ -2767,38 +2767,49 @@ async fn commits_after_a_reopened_writers_join_survive_the_next_remount_unscreen
     // `fsck_clean` (its fixture carries the format config fsck needs).
 }
 
-/// **The once-armed volume takes no writer without the plane** (review
-/// round 3, Issue 25 — the frame-stamp class of the pin above on the
-/// OTHER legal transition). An armed session leaves its native-slot
+/// **A forest volume takes no writer without the plane** (review round
+/// 3, Issue 25 — the frame-stamp class of the pin above on the OTHER
+/// legal transition; since PR 14 the law is every stamped volume's, not
+/// the once-armed one's alone). An armed session leaves its native-slot
 /// leaves with frames at `g ≥ 1` and generation `g`'s recorded tails; a
 /// `SQUEEZEFS_SYMMETRIC_META=0` WRITER session on the same bit-17 volume
-/// has no lease plane and no legitimate stamp for the leaves it appends
-/// to (its first commit is the `writer_claim` on ino 1's leaf): `(0, 0)`
-/// is rule 3's non-monotone `g` on itself and rule 2's zombie shape past
-/// the recorded tail on the next armed session — its acked commits gone
-/// at the next load, silently. The law ("a slot's generations are ONE
-/// sequence owned by its lease") has no unarmed writer, so the `=0`
-/// writable open of a once-armed volume REFUSES loud, naming the knob,
-/// before anything is written; readers and probes open as before; a
-/// never-armed stamped volume (every slot at `g = 0` — the PR 1–3 shape)
-/// opens `=0` exactly as shipped. The `Ok` arm below is the defect's own
-/// shape — RED on the tree this lands on by the LOSS it demands be absent
-/// — and the fix takes the `Err` arm.
+/// would have no lease plane and no legitimate stamp for the leaves it
+/// appends to (its first commit is the `writer_claim` on ino 1's leaf):
+/// `(0, 0)` is rule 3's non-monotone `g` on itself and rule 2's zombie
+/// shape past the recorded tail on the next armed session — its acked
+/// commits gone at the next load, silently. The law ("a slot's
+/// generations are ONE sequence owned by its lease") has no unarmed
+/// writer, so the `=0` writable open of a forest volume REFUSES loud,
+/// naming the knob, before anything is written — on a FRESH volume as on
+/// a once-armed one (the unarmed-forest posture retired with the flip);
+/// readers and probes open as before, and nothing is lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_once_armed_volume_refuses_a_writer_without_the_plane_and_loses_nothing() {
+async fn a_forest_volume_refuses_a_writer_without_the_plane_and_loses_nothing() {
     let _g = SEAM.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let path = format_stamped(dir.path(), "meta0").await;
     let uris = vec![path.display().to_string()];
     let screened0 = META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed);
-    // A never-armed stamped volume opens `=0` writable: the shipped PR
-    // 1–3 posture, untouched by the gate.
-    std::env::remove_var(SYMMETRIC_META_ENV);
-    let fresh = open_routed_meta_set(&uris)
+    // A FRESH stamped volume refuses `=0` writable at the door, naming
+    // the knob; the refused open writes nothing.
+    std::env::set_var(SYMMETRIC_META_ENV, "0");
+    let image_fresh = device_digest(&path);
+    let msg = open_routed_meta_set(&uris)
         .await
-        .expect("=0 on a never-armed forest");
-    assert!(fresh.volumes[0].slot_lease_stats().is_none());
-    shutdown(&fresh).await;
+        .err()
+        .map(|e| e.to_string())
+        .expect("=0 on a forest volume is the writable open's refusal");
+    std::env::remove_var(SYMMETRIC_META_ENV);
+    assert!(msg.contains("SQUEEZEFS_SYMMETRIC_META=0"), "{msg}");
+    assert!(
+        msg.contains("default flip") && msg.contains("-o ro"),
+        "{msg}"
+    );
+    assert_eq!(
+        device_digest(&path),
+        image_fresh,
+        "the refused open left the fresh image byte-identical"
+    );
 
     let mut expected = Vec::new();
     let writer = open_armed_writer(&path).await;
@@ -2813,36 +2824,23 @@ async fn a_once_armed_volume_refuses_a_writer_without_the_plane_and_loses_nothin
     shutdown(&writer).await;
 
     // The `=0` WRITER on the once-armed volume — bracketed by the device
-    // image's digest (sector 0, the ledger, every node): a REFUSED open
-    // writes NOTHING (review round 4, Issue 30).
-    std::env::remove_var(SYMMETRIC_META_ENV);
+    // image's digest (sector 0, the ledger, every node): the same
+    // refusal, and a REFUSED open writes NOTHING (review round 4, Issue
+    // 30).
+    std::env::set_var(SYMMETRIC_META_ENV, "0");
     let image_before = device_digest(&path);
-    match open_routed_meta_set(&uris).await {
-        Err(e) => {
-            let msg = e.to_string();
-            assert!(msg.contains("SQUEEZEFS_SYMMETRIC_META=1"), "{msg}");
-            assert!(msg.contains("generation"), "{msg}");
-            assert_eq!(
-                device_digest(&path),
-                image_before,
-                "the refused open left the image byte-identical"
-            );
-        }
-        Ok(unarmed) => {
-            // The defect's shape: the open succeeded, so its commits must
-            // survive every later mount — they do not on the tree this
-            // pin lands on.
-            for i in 0..4 {
-                let name = format!("unarmed-{i}");
-                let ino = Metadata::create(unarmed.as_ref(), 1, &name, libc::S_IFREG | 0o644, 0, 0)
-                    .await
-                    .unwrap()
-                    .ino;
-                expected.push((name, ino));
-            }
-            shutdown(&unarmed).await;
-        }
-    }
+    let msg = open_routed_meta_set(&uris)
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .expect("=0 on a once-armed forest volume is the same refusal");
+    std::env::remove_var(SYMMETRIC_META_ENV);
+    assert!(msg.contains("SQUEEZEFS_SYMMETRIC_META=0"), "{msg}");
+    assert_eq!(
+        device_digest(&path),
+        image_before,
+        "the refused open left the image byte-identical"
+    );
     // Every acked record of every session is present at the next armed
     // open and at a read-only open, and nothing was screened.
     let armed = open_armed_writer(&path).await;
@@ -2912,9 +2910,7 @@ async fn a_displacing_publishs_recall_completes_before_the_holders_free_clears_t
     for (i, stamp) in plan.stamps.iter().enumerate() {
         let p = dir.path().join(format!("meta{i}"));
         std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
-        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-        let r = format_v3_stamped(&p, VOL_LEN, &set_opts(), stamp.clone()).await;
-        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+        let r = format_v3_stamped_symmetric(&p, VOL_LEN, &set_opts(), stamp.clone()).await;
         r.expect("format stamped member");
         uris.push(p.display().to_string());
     }
@@ -3282,9 +3278,7 @@ async fn a_cross_owner_create_recalls_the_parents_token_before_its_shipped_step_
         format_config_xattr: Some(serde_json::to_vec(&cfg).unwrap()),
         ..set_opts()
     };
-    std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-    let r = format_v3_stamped(&p, VOL_LEN, &opts, plan.stamps[0].clone()).await;
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
+    let r = format_v3_stamped_symmetric(&p, VOL_LEN, &opts, plan.stamps[0].clone()).await;
     r.expect("format stamped member");
     let uris = vec![p.display().to_string()];
 
@@ -4078,38 +4072,46 @@ async fn an_objects_xattrs_are_paged_under_the_grant_budget_and_never_resent() {
     shutdown(&writer).await;
 }
 
-/// The negative contract: `SQUEEZEFS_SYMMETRIC_META=0` and a flat volume
-/// carry NO token plane — no holder, no reader, the recall gate off, the
-/// Token family 0 — and an unarmed forest's frames are v2 under the
-/// manager's stamp with nothing screened.
+/// The negative contract: a `--single-writer` (flat) volume carries NO
+/// token plane — no holder, no reader, the recall gate off, the Token
+/// family 0, the S5 bound standing — whatever the knob says (`=0` and the
+/// default alike: the knob is read at a FOREST's door alone, where `=0`
+/// is the writable open's refusal — PR 14; `a_forest_volume_refuses_a_
+/// writer_without_the_plane_and_loses_nothing`), and its frames are v1
+/// with nothing screened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn symmetric_meta_off_carries_no_token_plane() {
+async fn a_single_writer_volume_carries_no_token_plane() {
     let _g = SEAM.lock().await;
     free_grace::reset_for_test();
     let screened0 = META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed);
     let gated0 = free_grace::recall_gated_frees();
     let deferred0 = free_grace::recall_timeout_deferrals();
     let dir = tempfile::tempdir().unwrap();
-    let stamped = format_stamped(dir.path(), "meta0").await;
     let flat = dir.path().join("flat");
     std::fs::File::create(&flat)
         .unwrap()
         .set_len(VOL_LEN)
         .unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
-    format_v3_stamped(&flat, VOL_LEN, &set_opts(), plan.stamps[0].clone())
+    format_v3_stamped_single_writer(&flat, VOL_LEN, &set_opts(), plan.stamps[0].clone())
         .await
         .unwrap();
-    std::env::remove_var(SYMMETRIC_META_ENV);
-    for p in [&stamped, &flat] {
+    for knob in [Some("0"), None] {
+        let p = &flat;
+        match knob {
+            Some(v) => std::env::set_var(SYMMETRIC_META_ENV, v),
+            None => std::env::remove_var(SYMMETRIC_META_ENV),
+        }
         let w = KvMetaBackend::open(p).await.unwrap();
+        std::env::remove_var(SYMMETRIC_META_ENV);
         assert!(w.token_holder().is_none(), "{}", p.display());
         assert!(w.token_reader().is_none());
         assert_eq!(
             free_grace::recall_gate_verdict(),
             free_grace::RecallGate::Off
         );
-        Metadata::create(w.as_ref(), 1, "x", libc::S_IFREG | 0o644, 0, 0)
+        let name = format!("x{}", knob.map_or("default", |_| "off"));
+        Metadata::create(w.as_ref(), 1, &name, libc::S_IFREG | 0o644, 0, 0)
             .await
             .unwrap();
         w.checkpoint_now().await.unwrap();
@@ -4121,7 +4123,7 @@ async fn symmetric_meta_off_carries_no_token_plane() {
             ro_coherence::reader_staleness_bound().as_millis() as u64,
             "the S5 bound stands where no token plane exists"
         );
-        let _ = Metadata::lookup(r.as_ref(), 1, "x").await.unwrap();
+        let _ = Metadata::lookup(r.as_ref(), 1, &name).await.unwrap();
     }
     assert_eq!(
         META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed),

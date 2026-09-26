@@ -5293,9 +5293,14 @@ pub struct EnableSymReport {
 /// concurrent invocation refuses at Layer A instead of racing the
 /// inspection into the same extents), then one write-free inspection
 /// per volume through a probe: the layout bit and the marker, the
-/// membership stamp, the bit-8 partition record, the replay window
-/// (a flat volume not cleanly unmounted is refused while a mount can
-/// still fix it), the open cross-volume intents and in-flight jobs,
+/// membership stamp, the bit-8 partition record, the replay window,
+/// the open cross-volume intents (a set the field left as a crash did —
+/// a window past the tail, an open intent, a non-solo partition record
+/// — is QUIESCED by the verb itself first, the mount's own crash
+/// recovery through the routed writer door under the conversion's
+/// admission: since PR 14 that door refuses the pre-flip class
+/// presence-required for everyone else; `--dry-run` names the quiesce it
+/// would run and writes nothing) and in-flight jobs,
 /// the record collection (the codec's slot-range refusals fire here),
 /// the bitmap-vs-reachability census and the **capacity preflight**
 /// (the build plan, `extents_needed` / `extents_available` on the row):
@@ -5500,6 +5505,10 @@ struct BuildPlan {
 /// One volume's durable state as the verb finds it (write-free).
 struct SymInspection {
     symmetric: bool,
+    /// The volume is NOT of the multi-writer class (a `--single-writer`
+    /// format): the forest presumes the nine bits (the join ladder's rung
+    /// 2), so the conversion refuses naming `enable-multi-writer` first.
+    single_writer_class: bool,
     marker: Option<SymUpgradeMarker>,
     /// The newest ledger record carries a NON-SOLO bit-8 partition.
     partition_non_solo: bool,
@@ -5558,6 +5567,7 @@ async fn inspect_for_symmetric(path: &str, ordered: &[String]) -> Result<SymInsp
     let partition_solo_record = ledger.append_partition.is_some_and(|part| part.is_solo());
     let mut out = SymInspection {
         symmetric: sb.symmetric_forest_stamped(),
+        single_writer_class: !sb.multi_writer_class(),
         marker: None,
         partition_non_solo,
         partition_solo_record,
@@ -5810,6 +5820,46 @@ pub async fn enable_symmetric_with(
         inspections.push(inspect_for_symmetric(path, &ordered).await?);
     }
 
+    // ---- the QUIESCE (PR 14, §7.2): a pre-flip set the field left as a
+    // crash did — a replay window past the tail, an open cross-volume
+    // intent, a non-solo bit-8 partition record — was told "mount it once
+    // and unmount cleanly" while the mount's writer door still admitted
+    // the class; since the flip that door refuses it presence-required,
+    // so the verb runs that mount itself: the ordinary routed writer open
+    // (the replay, the intents rolled forward, the solo re-checkpoint),
+    // one checkpoint per volume, the clean leave — the mount's own crash
+    // recovery, not conversion state (no marker is written; the three
+    // refusals below stand as belts for what a quiesce cannot cure). A
+    // dry run writes nothing and names the quiesce it would run.
+    let needs_quiesce: Vec<&String> = ordered
+        .iter()
+        .zip(&inspections)
+        .filter(|(_, i)| {
+            !i.symmetric
+                && i.marker.is_none()
+                && (i.window_entries > 0 || !i.open_intents.is_empty() || i.partition_non_solo)
+        })
+        .map(|(p, _)| p)
+        .collect();
+    if !needs_quiesce.is_empty() && !opts.abort {
+        if opts.dry_run {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "volume enable-symmetric --dry-run: {needs_quiesce:?} was not cleanly \
+                 unmounted (a replay window past the checkpoint tail, an open cross-volume \
+                 intent, or a non-solo partition record) — a run without --dry-run QUIESCES \
+                 the set first (the mount's own crash recovery: replay, intents rolled \
+                 forward, one checkpoint per volume, a clean unmount; nothing of the \
+                 conversion is written) and plans against the quiesced volumes; a dry run \
+                 writes nothing and cannot plan against a window"
+            )));
+        }
+        quiesce_set_for_symmetric(&ordered, &mut flocks).await?;
+        inspections.clear();
+        for path in &ordered {
+            inspections.push(inspect_for_symmetric(path, &ordered).await?);
+        }
+    }
+
     // ---- refusals FIRST, loud, naming the remedy ----------------------
     let markers: Vec<&String> = ordered
         .iter()
@@ -5861,10 +5911,10 @@ pub async fn enable_symmetric_with(
         }
         if ins.partition_non_solo {
             return Err(SqueezefsError::InvalidOperation(format!(
-                "volume enable-symmetric: {path} carries a bit-8 NON-SOLO partition record (its \
-                 newest ledger record was written by a multi-appender era) — the conversion \
-                 reads one appender's structures. Mount the set solo once (a solo mount \
-                 re-checkpoints the ledger in its solo form) and unmount cleanly, then re-run \
+                "volume enable-symmetric: {path} still carries a bit-8 NON-SOLO partition \
+                 record after the verb's own solo quiesce (its newest ledger record was \
+                 written by a multi-appender era and the solo re-checkpoint did not replace \
+                 it) — the conversion reads one appender's structures; refusing \
                  (design-symmetric-metadata §7.2)"
             )));
         }
@@ -5874,21 +5924,29 @@ pub async fn enable_symmetric_with(
                  dynamic-routing set member (reformat required)"
             )));
         }
+        if ins.single_writer_class {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "volume enable-symmetric: {path} is a `--single-writer` (flat, unstamped) volume \
+                 — the forest presumes the nine multi-writer format bits (design-symmetric-\
+                 metadata §6.2; the join ladder's rung 2 demands them on every volume). Run \
+                 `squeezefs volume enable-multi-writer <sqmeta-uri>` offline first, then re-run"
+            )));
+        }
         if ins.window_entries > 0 && ins.marker.is_none() {
             return Err(SqueezefsError::InvalidOperation(format!(
-                "volume enable-symmetric: {path} was not cleanly unmounted — {} journal \
-                 entr(ies) sit past its checkpoint tail, so its trees are not the whole truth \
-                 and the census the conversion runs is not exact. Mount the set once and \
-                 unmount cleanly, then re-run",
+                "volume enable-symmetric: {path} still holds {} journal entr(ies) past its \
+                 checkpoint tail after the verb's own quiesce (the routed open's replay + \
+                 checkpoint + clean unmount), so its trees are not the whole truth and the \
+                 census the conversion runs is not exact; refusing",
                 ins.window_entries
             )));
         }
         if !ins.open_intents.is_empty() {
             return Err(SqueezefsError::InvalidOperation(format!(
-                "volume enable-symmetric: {path} carries {} open cross-volume intent(s) (tx \
-                 {:?}) — converting now would strand a half-applied transaction across two \
-                 layouts. Mount the set once so the intents roll forward at open, unmount \
-                 cleanly, then re-run",
+                "volume enable-symmetric: {path} still carries {} open cross-volume intent(s) \
+                 (tx {:?}) after the verb's own quiesce rolled the set's intents forward — \
+                 converting now would strand a half-applied transaction across two layouts; \
+                 refusing (a holder the roll-forward could not reach keeps the intent open)",
                 ins.open_intents.len(),
                 ins.open_intents
             )));
@@ -6239,6 +6297,58 @@ async fn abort_volume_conversion(path: &str, vi: usize, flocks: &mut VerbFlocks)
     }
     remove_sym_marker(path, vi, flocks).await?;
     Ok(reclaimed)
+}
+
+/// The verb's QUIESCE of a pre-flip set (PR 14): the ordinary routed
+/// writer open under the conversion's process-scoped admission
+/// ([`crate::meta_backend::kv::backend::admit_pre_flip_writers`] — the
+/// mount's own door refuses the class presence-required), which replays
+/// every volume's window and rolls the set's open cross-volume intents
+/// forward at bring-up; then one checkpoint per volume (a solo mount's
+/// ledger record — the bit-8 non-solo record's remedy) and the clean
+/// leave. Every verb flock is released for the open and re-taken after
+/// it. Nothing of the conversion is written.
+async fn quiesce_set_for_symmetric(ordered: &[String], flocks: &mut VerbFlocks) -> Result<()> {
+    for vi in 0..ordered.len() {
+        flocks.release(vi);
+    }
+    let body = async {
+        let _admit = crate::meta_backend::kv::backend::admit_pre_flip_writers();
+        let routed = crate::meta_backend::open_routed_meta_set(ordered)
+            .await
+            .map_err(|e| {
+                SqueezefsError::InvalidOperation(format!(
+                    "volume enable-symmetric: the quiesce of the set (the mount's own crash \
+                     recovery before the conversion) refused to open it: {e}"
+                ))
+            })?;
+        let mut first_err: Option<SqueezefsError> = None;
+        for vol in &routed.volumes {
+            if let Err(e) = vol.checkpoint_now().await {
+                first_err.get_or_insert(SqueezefsError::InvalidOperation(format!(
+                    "volume enable-symmetric: the quiesce checkpoint on {} failed: {e}",
+                    vol.device_path().display()
+                )));
+            }
+        }
+        for vol in &routed.volumes {
+            if let Err(e) = vol.shutdown().await {
+                first_err.get_or_insert(SqueezefsError::InvalidOperation(format!(
+                    "volume enable-symmetric: the quiesce's clean leave of {} failed: {e}",
+                    vol.device_path().display()
+                )));
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+    .await;
+    for vi in 0..ordered.len() {
+        flocks.retake(vi).await?;
+    }
+    body
 }
 
 /// Write the marker on `path` through its guarded (marker-tolerant) open:

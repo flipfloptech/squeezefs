@@ -238,6 +238,39 @@ const JOURNAL_FAILURE_LATCH: u64 = 3;
 /// stall IS the scenario under test, not a coordination primitive).
 pub static TEST_COMMIT_ADMITTED_STALL_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Live [`PreFlipAdmission`] guards in this process (PR 14): while one
+/// stands, the WRITABLE doors admit a pre-flip multi-writer-class volume
+/// (bit 17 absent) that the mount's writer door otherwise refuses
+/// presence-required.
+static PRE_FLIP_WRITERS_ADMITTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The offline conversion's admission (PR 14, design-symmetric-metadata
+/// §7.2): `squeezefs volume enable-symmetric` QUIESCES a pre-flip set
+/// through the ordinary routed writer door — the mount's own crash
+/// recovery: the replay, the open cross-volume intents rolled forward,
+/// the solo re-checkpoint, the clean leave — before it inspects the set,
+/// and that door is presence-required on the forest for everyone else.
+/// The guard is process-scoped (the verb IS its own process; a contract
+/// standing in for the pre-PR-14 binary holds one around the opens that
+/// populate its fixture) and composes: the doors admit while any guard
+/// lives.
+#[must_use = "the admission lasts exactly as long as the guard lives"]
+pub struct PreFlipAdmission(());
+
+impl Drop for PreFlipAdmission {
+    fn drop(&mut self) {
+        PRE_FLIP_WRITERS_ADMITTED.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Admit pre-flip multi-writer-class volumes at this process's writable
+/// doors for the guard's lifetime ([`PreFlipAdmission`]).
+pub fn admit_pre_flip_writers() -> PreFlipAdmission {
+    PRE_FLIP_WRITERS_ADMITTED.fetch_add(1, Ordering::AcqRel);
+    PreFlipAdmission(())
+}
+
 /// Test seam (design-symmetric-metadata PR 1, review Issue 4): make the
 /// next N tree-0 root publications answer `JournalReserveExhausted` —
 /// the deferral arm a full checkpoint reserve produces — so a suite can
@@ -1874,76 +1907,6 @@ impl KvMetaBackend {
         }
     }
 
-    /// **The once-armed gate** (design-symmetric-metadata §5.8.2 / §7.2;
-    /// PR 5 review round 3, Issue 25): a WRITER without the slot-lease
-    /// plane (`SQUEEZEFS_SYMMETRIC_META` unset) refuses a bit-17 volume
-    /// whose tree 0 records any slot generation `g ≥ 1` — a generation
-    /// the plane minted.
-    ///
-    /// The frame-stamp law is "a slot's generations are ONE sequence
-    /// owned by its lease; a frame is legitimate under the lease that
-    /// wrote it". Every append to an EXISTING leaf on an armed volume is
-    /// its slot's lessee's at the slot's current generation (a user
-    /// commit acquires the slot first-touch; the manager's structural
-    /// `(0, g)` lands on fresh SMO images only). A writer holding no lease
-    /// has NO legitimate stamp: `(0, g)` sits past the generation's
-    /// recorded tail (rule 2's zombie shape — the release recorded `g`'s
-    /// tails), `(0, g + 1)` pre-empts a generation tree 0 never granted
-    /// (rule 1's breach on every slot the next arm does not acquire; rule
-    /// 4's when a wire joiner takes it), and moving tree 0's generation
-    /// IS the plane — the first-touch acquire and the release's tails.
-    /// So the honest answer is the refusal: `=0` on a PR 1–3-shaped volume
-    /// (every slot at `g = 0`, §7.1 — the shape the seam, `format
-    /// --symmetric` and `enable-symmetric` all produce) stays the shipped
-    /// posture exactly; a volume the plane has stamped stays under the
-    /// plane until the PR-14 flip. Readers, probes and co-writers append
-    /// nothing and open as before. One tree-0 range scan — the arm's own
-    /// `load_slot_leases` walk, paid once per writer open.
-    async fn refuse_unarmed_writer_of_an_armed_forest(
-        &self,
-        path: &Path,
-    ) -> std::result::Result<(), KvError> {
-        let Some(control) = self.forest_control_tree() else {
-            return Ok(());
-        };
-        let (mut cursor, end) = super::slot_state::slot_state_key_range();
-        let mut armed_slots = 0u64;
-        let mut g_max = 0u32;
-        loop {
-            let page = control.range(&cursor, &end, 512).await?;
-            let Some((last, _)) = page.last() else {
-                break;
-            };
-            cursor = key_successor(last);
-            for (_, v) in &page {
-                let g = match super::slot_state::SlotState::decode(v)? {
-                    super::slot_state::SlotState::Unleased { g, .. }
-                    | super::slot_state::SlotState::Leased { g, .. } => g,
-                };
-                if g >= 1 {
-                    armed_slots += 1;
-                    g_max = g_max.max(g);
-                }
-            }
-            if page.len() < 512 {
-                break;
-            }
-        }
-        if armed_slots == 0 {
-            return Ok(());
-        }
-        Err(KvError::Busy(format!(
-            "{}: refusing a writable mount without SQUEEZEFS_SYMMETRIC_META=1 — this \
-             symmetric-forest volume has been mounted under the slot-lease plane ({armed_slots} \
-             slot(s) at generation ≥ 1, highest {g_max}), and a writer without the plane stamps \
-             frames no lease backs (design-symmetric-metadata §5.8.2: the screen would drop its \
-             acked commits at the next load). Once armed, a set stays armed until the PR-14 \
-             flip: mount with SQUEEZEFS_SYMMETRIC_META=1 (an offline writable verb too); \
-             read-only mounts, probes and co-writers open without it",
-            path.display()
-        )))
-    }
-
     async fn open_writer(
         path: &Path,
         tolerate_sym_upgrade: bool,
@@ -2023,19 +1986,13 @@ impl KvMetaBackend {
         }
 
         // (2) Bootstrap replay (sets `boot_id` — shared with probes).
-        let mut inner = Self::open_inner(path, OpenPosture::Writer, None).await?;
+        let mut inner =
+            Self::open_inner(path, OpenPosture::Writer, None, tolerate_sym_upgrade).await?;
         *inner.guard_fd.get_mut().unwrap() = Some(guard_fd);
         // (2b) The `sym_upgrade:` marker gate — before the claim, so a
         // refusal drops `inner` (and its flock) with nothing written.
         if !tolerate_sym_upgrade {
             inner.refuse_sym_upgrade_marker(path).await?;
-        }
-        // (2c) The once-armed gate (PR 5, §5.8.2's frame-stamp law): a
-        // writer without the slot-lease plane on a volume whose slots
-        // carry a generation the plane minted — same place in the ladder,
-        // same "nothing written" shape.
-        if !super::slot_lease::symmetric_meta_requested() {
-            inner.refuse_unarmed_writer_of_an_armed_forest(path).await?;
         }
         inner.writer_id = uuid::Uuid::new_v4().to_string();
         // Layer B1 resolution: test override first, then the real RESCAP
@@ -2081,41 +2038,13 @@ impl KvMetaBackend {
             return Err(e);
         }
 
-        // (6) Cover the bring-up residue BEFORE the volume serves (and
-        // before the cadence task exists — same inline-guarded-cycles
-        // posture as `preclaim_ring_recovery`): the claim tx just
-        // committed above must not sit committed-but-uncovered, or its
-        // bytes become the D1.b wedge-crumb (see
-        // [`Self::cover_bring_up_residue`]). A refusal tears down like a
-        // gate refusal: the claim record stays (crash-equivalent — the
+        // (6)+(7) The bring-up cover and the appender JOIN — ONE ladder
+        // every writer of the volume walks, the offline verbs included
+        // ([`Self::writer_bring_up`]). A refusal tears down like a gate
+        // refusal: the claim record stays (crash-equivalent — the
         // same-host dead-pid proof reclaims it instantly), the PR and
         // flock release deterministically.
-        if let Err(e) = be.prime_frame_stamps().await {
-            be.release_reservation().await;
-            drop(be.guard_fd.lock().unwrap().take());
-            return Err(e);
-        }
-        // The own-residue POOL census (PR 13g review round 1, Issue 2) —
-        // before the first post-mount SMO claims from the pool.
-        if let Err(e) = be.restore_own_pools().await {
-            be.release_reservation().await;
-            drop(be.guard_fd.lock().unwrap().take());
-            return Err(e);
-        }
-        if let Err(e) = be.cover_bring_up_residue().await {
-            be.release_reservation().await;
-            drop(be.guard_fd.lock().unwrap().take());
-            return Err(e);
-        }
-
-        // (7) The appender JOIN (design-symmetric-metadata §5.3.2, PR 2):
-        // every region of ours goes Live under this mount's identity in
-        // one barriered cycle — a no-op on a flat volume. A refusal tears
-        // down like the gate's.
-        if let Err(e) = be
-            .join_appender_regions(open_started.elapsed().as_millis() as u64)
-            .await
-        {
+        if let Err(e) = be.writer_bring_up(open_started).await {
             be.release_reservation().await;
             drop(be.guard_fd.lock().unwrap().take());
             return Err(e);
@@ -2126,6 +2055,38 @@ impl KvMetaBackend {
         Ok(be)
     }
 
+    /// **The writer's bring-up after its door** — steps (6) and (7) of
+    /// [`Self::open_writer`], shared with every OFFLINE writable verb
+    /// (`claim clear`, `appender clear`, the harness's claim planter):
+    /// prime the frame stamps, restore the own-residue pools, cover the
+    /// bring-up residue BEFORE the volume serves (and before the cadence
+    /// task exists — same inline-guarded-cycles posture as
+    /// `preclaim_ring_recovery`: a tx committed at the door must not sit
+    /// committed-but-uncovered, or its bytes become the D1.b wedge-crumb —
+    /// [`Self::cover_bring_up_residue`]), then the appender JOIN
+    /// (design-symmetric-metadata §5.3.2, PR 2): every region of ours goes
+    /// Live under this mount's identity in one barriered cycle — a no-op on
+    /// a flat volume. On a forest volume the join is what makes this
+    /// writer's frames LEGAL (PR 14 — every writer's plane): a slot's
+    /// generations are ONE sequence owned by its lease, so a writer that
+    /// commits without acquiring the native slot stamps `(0, g + 1)` on a
+    /// generation tree 0 never granted — screened at the next load, its
+    /// acked record gone (the `claim clear` of a once-armed volume wrote a
+    /// claim removal nobody could read). The caller owns the flock and the
+    /// teardown on `Err`.
+    pub(super) async fn writer_bring_up(
+        self: &Arc<Self>,
+        open_started: std::time::Instant,
+    ) -> std::result::Result<(), KvError> {
+        self.prime_frame_stamps().await?;
+        // The own-residue POOL census (PR 13g review round 1, Issue 2) —
+        // before the first post-mount SMO claims from the pool.
+        self.restore_own_pools().await?;
+        self.cover_bring_up_residue().await?;
+        self.join_appender_regions(open_started.elapsed().as_millis() as u64)
+            .await
+    }
+
     /// Open for a **read-only probe** (the format-preflight guard and
     /// volume-status reads): the full mount bootstrap — SB → ledger →
     /// bitmap → RAM journal replay — but NO checkpoint/writeback task is
@@ -2133,7 +2094,7 @@ impl KvMetaBackend {
     /// process has live-mounted therefore cannot corrupt it. Dropping the
     /// returned backend releases everything (there is no task to join).
     pub async fn open_probe(path: &Path) -> std::result::Result<Arc<Self>, KvError> {
-        let mut inner = Self::open_inner(path, OpenPosture::NonWriter, None).await?;
+        let mut inner = Self::open_inner(path, OpenPosture::NonWriter, None, false).await?;
         inner.probe = true;
         let be = Arc::new(inner);
         // PR M7: probes never mutate, but the conveyor identity is part
@@ -2198,7 +2159,7 @@ impl KvMetaBackend {
             ),
             SharedProbe::Unknown => {}
         }
-        let mut inner = Self::open_inner(path, OpenPosture::NonWriter, None).await?;
+        let mut inner = Self::open_inner(path, OpenPosture::NonWriter, None, false).await?;
         // The mount-option cause OVERRIDES the §4.11 one only in its
         // reporting: `read_only` is already true when unknown-ro bits are
         // present, and a reader is read-only either way.
@@ -2281,7 +2242,7 @@ impl KvMetaBackend {
             ),
             SharedProbe::Unknown => {}
         }
-        let mut inner = Self::open_inner(path, OpenPosture::NonWriter, None).await?;
+        let mut inner = Self::open_inner(path, OpenPosture::NonWriter, None, false).await?;
         inner.read_only = true;
         inner.ro_cause = ReadOnlyCause::CoWriterMount;
         let be = Arc::new(inner);
@@ -2378,7 +2339,7 @@ impl KvMetaBackend {
             ),
             SharedProbe::Unknown => {}
         }
-        let mut inner = Self::open_inner(path, OpenPosture::NonWriter, None).await?;
+        let mut inner = Self::open_inner(path, OpenPosture::NonWriter, None, false).await?;
         inner.read_only = true;
         inner.ro_cause = ReadOnlyCause::PeerOwnedVolume;
         let be = Arc::new(inner);
@@ -2555,11 +2516,17 @@ impl KvMetaBackend {
     /// `joined` is the JOINED non-manager appender's wire outcome (PR 12b —
     /// `Some` under [`OpenPosture::JoinedAppender`] alone): the region the
     /// manager minted for this identity over the wire, stood up beside the
-    /// manager's projection by `open_appender_regions`.
+    /// manager's projection by `open_appender_regions`. `admit_pre_flip`
+    /// is the OFFLINE verbs' door (PR 14): `enable-symmetric`'s own opens
+    /// and `claim clear` open a pre-flip multi-writer-class volume
+    /// WRITABLE — the conversion and the stale-claim remedy are exactly
+    /// what the presence-required refusal names — where the mount's
+    /// writer door refuses it.
     async fn open_inner(
         path: &Path,
         posture: OpenPosture,
         joined: Option<joined::JoinedOpen>,
+        admit_pre_flip: bool,
     ) -> std::result::Result<Self, KvError> {
         let t0 = std::time::Instant::now();
 
@@ -2579,17 +2546,50 @@ impl KvMetaBackend {
                 )))
             }
         };
-        if matches!(posture, OpenPosture::Writer | OpenPosture::JoinedAppender)
-            && super::slot_lease::symmetric_meta_requested()
-            && !sb.symmetric_forest_stamped()
-        {
-            return Err(KvError::Corrupt(format!(
-                "{}: SQUEEZEFS_SYMMETRIC_META=1 but this volume is not symmetric-forest capable \
-                 (incompat bit 17 absent) — run `squeezefs volume enable-symmetric <sqmeta-uri>` \
-                 offline (design-symmetric-metadata §7.2, PR 11), or format it `--symmetric`; \
-                 the plane arms nothing on a bit-17-absent volume",
-                path.display()
-            )));
+        // The default flip's two door laws (PR 14, design-symmetric-
+        // metadata §7.2 — a WRITABLE open only; readers, probes, fsck and
+        // `enable-symmetric`'s own door read either class):
+        // (a) PRESENCE-REQUIRED — a multi-writer-class volume without the
+        //     forest is a pre-flip default format (every `format` between
+        //     the rung-10b flip and PR 14): it converts offline, it never
+        //     mounts writable (the `KV_DYNAMIC_ROUTING` precedent). A
+        //     `--single-writer` volume is neither class and mounts FLAT.
+        // (b) `SQUEEZEFS_SYMMETRIC_META=0` on a stamped volume names no
+        //     posture a writer could run under — the unarmed-forest
+        //     posture retired with the flip; the reader / probe posture is
+        //     `-o ro`, never a knob value (PR 5 round 4 Issue 30, confirmed
+        //     by PR 14).
+        if matches!(posture, OpenPosture::Writer | OpenPosture::JoinedAppender) {
+            // The offline verbs' doors admit the pre-flip class (the
+            // stale-claim remedy, the conversion's per-volume opens), and
+            // so does every writable door while the conversion's
+            // process-scoped [`PreFlipAdmission`] stands (its quiesce is
+            // the routed writer door — the contracts populating a
+            // pre-flip fixture hold one too).
+            let pre_flip_admitted =
+                admit_pre_flip || PRE_FLIP_WRITERS_ADMITTED.load(Ordering::Acquire) > 0;
+            if sb.multi_writer_class() && !sb.symmetric_forest_stamped() && !pre_flip_admitted {
+                return Err(KvError::Corrupt(format!(
+                    "{}: not symmetric-forest capable (incompat bit 17 absent) — a multi-writer-\
+                     class volume formatted before the symmetric default flip (PR 14). Run \
+                     `squeezefs volume enable-symmetric <sqmeta-uri>` offline (design-symmetric-\
+                     metadata §7.2), or `format --force` a fresh set; a writable mount of this \
+                     class is presence-required on the forest. Read-only mounts, probes and \
+                     fsck read it as before",
+                    path.display()
+                )));
+            }
+            if sb.symmetric_forest_stamped() && !super::slot_lease::symmetric_meta_requested() {
+                return Err(KvError::Corrupt(format!(
+                    "{}: SQUEEZEFS_SYMMETRIC_META=0 on a symmetric-forest volume — the knob names \
+                     no posture a writer could run under since the default flip (PR 14, design-\
+                     symmetric-metadata §7.2: the unarmed-forest posture is retired; a writer \
+                     without the slot-lease plane stamps frames no lease backs, §5.8.2). Mount \
+                     with the default (the knob unset or `=1`); the read-only posture is `-o ro`, \
+                     never a knob value. Nothing was written",
+                    path.display()
+                )));
+            }
         }
         if sb.unknown_ro() != 0 {
             // §4.11: read-only feature bits from a future format. K6a's
@@ -17071,25 +17071,20 @@ pub enum SharedProbe {
     Unknown,
 }
 
-/// Compose the `(claim: id=…, pid=…, boot=…, age=…s)` holder suffix for
-/// refusal messages (design §6: refusals name the holder).
-/// The sentence a D0 refusal appends when the symmetric plane is REQUESTED
-/// (`SQUEEZEFS_SYMMETRIC_META=1` — PR 12, review round 1 Issue 6): the
-/// manual says every RW mount of an armed set is a writer, so a second or
-/// later RW mount's refusal must name the posture it met and the rung
-/// that lands it — the MANY-writer posture, N unbounded by design (PR
-/// 12b) — instead of reading as the single-writer guard alone. Empty on
-/// an unarmed process — the shipped text verbatim.
+/// The sentence a D0 refusal appends (PR 12, review round 1 Issue 6; the
+/// default since PR 14): the manual says every RW mount of a symmetric-
+/// forest set is a writer, so a second or later RW mount's refusal names
+/// the posture it should have taken — the join over the wire — instead of
+/// reading as the single-writer guard alone.
 fn symmetric_second_writer_note() -> &'static str {
-    if super::slot_lease::symmetric_meta_requested() {
-        " (symmetric plane armed: a second or later RW mount joins as a WRITER once PR 12b \
-         — the many-writer posture, N unbounded by design — lands; until then the D0 guard \
-         applies to RW mounts and `-o ro` readers join as token clients)"
-    } else {
-        ""
-    }
+    " (symmetric plane: a second or later RW mount of a symmetric-forest set JOINS the \
+     manager as a WRITER over the wire — the mount path re-reads the join target when the \
+     D0 claim is refused — and `-o ro` readers join as token clients; a `--single-writer` \
+     volume has one writer by format class)"
 }
 
+/// Compose the `(claim: id=…, pid=…, boot=…, age=…s)` holder suffix for
+/// refusal messages (design §6: refusals name the holder).
 fn holder_suffix(holder: &Option<(WriterClaim, u64)>) -> String {
     match holder {
         Some((c, now)) => format!(
@@ -18211,28 +18206,29 @@ impl KvMetaBackend {
     }
 
     /// Whether the symmetric PLANE is armed on this volume (KD-SYM-13's
-    /// subject): a declared appender partition — or, from PR 4, a join or
-    /// a lease. A solo forest mount is NOT the arm.
+    /// subject): every bit-17 volume's writer since the PR-14 flip
+    /// (`appenders` is `Some` only under bit 17, and a writer without the
+    /// plane is refused at the door — a `--single-writer` volume never
+    /// reaches the posture decision). The real-device leg found the
+    /// knob-armed manager holding the shipped rtype 1 on its metadata
+    /// namespace: no second host's appender could ever have registered
+    /// to write its own ring (§5.8.1).
     pub fn symmetric_arm_engaged(&self) -> bool {
-        // PR 3's shape (a declared test partition) OR PR 12's (the plane
-        // requested by the knob on a bit-17 volume — `appenders` is `Some`
-        // only under bit 17, so a flat volume never reaches the posture
-        // decision through the knob). The real-device leg found the
-        // knob-armed manager holding the shipped rtype 1 on its metadata
-        // namespace: no second host's appender could ever have registered
-        // to write its own ring (§5.8.1).
-        self.appenders
-            .as_ref()
-            .is_some_and(|a| a.is_partitioned() || super::slot_lease::symmetric_meta_requested())
+        self.appenders.is_some()
     }
 
     /// KD-SYM-13: decide the metadata namespace's fence posture for this
     /// open. Returns whether the manager holds WERO. Refuses loud (a) an
-    /// armed plane on a non-PR substrate and (b) `SQUEEZEFS_META_PR_WERO=0`
-    /// on a PR-capable one, unless `SQUEEZEFS_SYM_ALLOW_NON_PR=1` — which
-    /// is announced at every mount that uses it, never a default. An
-    /// unarmed mount (flat, or a solo forest) keeps the shipped posture
-    /// verbatim and reads none of the knobs.
+    /// armed plane on a non-PR BLOCK DEVICE and (b) `SQUEEZEFS_META_PR_
+    /// WERO=0` on a PR-capable one, unless `SQUEEZEFS_SYM_ALLOW_NON_PR=1`
+    /// — which is announced at every mount that uses it, never a default.
+    /// A metadata volume on a SINGLE-KERNEL substrate
+    /// (`reservation::single_kernel_substrate` — a regular file with no
+    /// device modelled over it) is admitted without the opt-in (PR 14 —
+    /// the flip made the armed plane every writer's): no second host's
+    /// zombie exists for a device to refuse — the sandbox class, announced
+    /// once. A `--single-writer` volume (no forest) keeps the shipped
+    /// posture verbatim and reads none of the knobs.
     fn decide_meta_fence_posture(&self) -> std::result::Result<bool, KvError> {
         if !self.symmetric_arm_engaged() {
             return Ok(false);
@@ -18240,18 +18236,27 @@ impl KvMetaBackend {
         let allow_non_pr = crate::env_knobs::bool_knob("SQUEEZEFS_SYM_ALLOW_NON_PR", false);
         let wero_wanted = crate::env_knobs::bool_knob("SQUEEZEFS_META_PR_WERO", true);
         let pr_capable = self.reservations.is_some();
+        if !pr_capable && crate::meta_backend::reservation::single_kernel_substrate(&self.path) {
+            log::info!(
+                "meta volume {}: symmetric plane armed on a FILE-backed metadata volume — one \
+                 kernel by construction, no shared LUN, no second host: the fence is the \
+                 kernel's flock (KD-SYM-13's block-device refusal does not apply)",
+                self.path.display()
+            );
+            return Ok(false);
+        }
         if !pr_capable {
             if !allow_non_pr {
                 return Err(KvError::Busy(format!(
-                    "{}: the symmetric metadata plane is armed (SQUEEZEFS_SYMMETRIC_META=1, or a \
-                     declared appender partition) but this namespace advertises no NVMe \
-                     Persistent Reservations (RESCAP=0 or \
-                     not an NVMe namespace) — fencing between appenders would be \
-                     detection-grade only, and detection-grade is not loss-free (a zombie's \
-                     frame past the recorded tail is an ACKED-loss class, \
-                     design-symmetric-metadata §5.8.2). KD-SYM-13 refuses to arm here; set \
-                     SQUEEZEFS_SYM_ALLOW_NON_PR=1 to opt in LOUDLY (lab use), or use a \
-                     PR-capable namespace (the kernel nvmet target)",
+                    "{}: the symmetric metadata plane is armed (every writer's since the PR-14 \
+                     default flip) but this block device advertises no NVMe Persistent \
+                     Reservations (RESCAP=0 or not an NVMe namespace) — fencing between \
+                     appenders would be detection-grade only, and detection-grade is not \
+                     loss-free (a zombie's frame past the recorded tail is an ACKED-loss class, \
+                     design-symmetric-metadata §5.8.2). KD-SYM-13 refuses to arm here: use a \
+                     PR-capable namespace (the kernel nvmet target), format `--single-writer` \
+                     for a single-host volume with one writer by declaration, or set \
+                     SQUEEZEFS_SYM_ALLOW_NON_PR=1 to opt in LOUDLY (lab use)",
                     self.path.display()
                 )));
             }
@@ -18680,8 +18685,10 @@ impl KvMetaBackend {
                 return Err(KvError::Io(crate::error::SqueezefsError::Io(e)));
             }
         };
-        let mut inner = Self::open_inner(path, OpenPosture::Writer, None).await?;
+        let open_started = std::time::Instant::now();
+        let mut inner = Self::open_inner(path, OpenPosture::Writer, None, true).await?;
         *inner.guard_fd.get_mut().unwrap() = Some(guard_fd);
+        inner.writer_id = uuid::Uuid::new_v4().to_string();
         let be = Arc::new(inner);
         // PR M7: conveyor identity before the clear's removexattr commit
         // (every `Arc::new(Self)` site wires it — the commit path fails
@@ -18737,11 +18744,19 @@ impl KvMetaBackend {
             }
         }
         // Stale (or unattributable — clearable by the same attestation):
-        // remove durably: commit + barrier + checkpoint (this backend has
-        // no checkpoint task; drive the cycle explicitly).
+        // the writer's bring-up FIRST (every refusal above read RAM alone;
+        // on a forest the join is what makes the removal's frame legal —
+        // `writer_bring_up`), then remove durably: commit + barrier +
+        // checkpoint (this backend has no checkpoint task; drive the cycle
+        // explicitly) and the clean leave.
+        if let Err(e) = be.writer_bring_up(open_started).await {
+            drop(be.guard_fd.lock().unwrap().take());
+            return Err(e);
+        }
         be.removexattr_internal(1, WRITER_CLAIM_XATTR).await?;
         be.sync_device().await.map_err(KvError::Io)?;
         be.checkpoint_now().await?;
+        be.shutdown().await?;
         log::info!(
             "meta volume {}: writer claim cleared by operator attestation{}",
             path.display(),
@@ -20308,7 +20323,9 @@ impl KvMetaBackend {
         // empty and fills from the real acquire path. A joined appender
         // opens under the plane by construction (the door refused the
         // admission without it).
-        let armed = (is_writer || is_joined) && super::slot_lease::symmetric_meta_requested();
+        // The door refused a writer without the plane (PR 14): a writer
+        // or a joined appender of a forest volume IS armed.
+        let armed = is_writer || is_joined;
         // The volume length the ring derivation clamps against: the heap's
         // end (the superblock stores no volume length; the redundant
         // superblock copy sits in the one sector past it).

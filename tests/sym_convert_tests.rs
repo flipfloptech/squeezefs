@@ -4,10 +4,13 @@
 //! §6.2, §7.1–§7.3, §5.2.1/§5.2.2, §5.1.8, KD-SYM-12).
 //!
 //! This suite is **layout-blind by construction**: its stamping is the
-//! VERB (or the `--symmetric` format arm), never the test seam — a
-//! flat volume goes in, a forest comes out, and the seam's presence or
-//! absence in the environment changes nothing it asserts. It rides
-//! `tests/run_sym_forest_suites.sh`'s list so both legs run it.
+//! VERB — a PRE-FLIP multi-writer-class volume (nine bits, no forest —
+//! built through `format_v3_stamped_multi_writer_flat`, the class every
+//! field volume formatted between the rung-10b flip and PR 14 carries)
+//! goes in, a forest comes out. Since PR 14 the default `format` IS the
+//! forest, so the suite's source volumes are the one class the verb
+//! exists for. It rides `tests/run_sym_forest_suites.sh`'s list so both
+//! legs run it.
 //!
 //! Contracts pinned (the PR-11 row of the design's PR plan):
 //! - a converted volume's post-fold digest EQUALS the source's, and every
@@ -25,8 +28,9 @@
 //!   open cross-volume intent, an in-flight `job:` record, a live client,
 //!   a marker without `--resume`, `--resume` with nothing to resume, and
 //!   `--symmetric --single-writer` at the CLI;
-//! - `format --symmetric` builds the image the seam builds, byte for
-//!   byte; a default `format` is untouched (no bit, no directory);
+//! - the default `format` builds the forest (PR 14; the flip's own pins
+//!   are `sym_default_flip_tests`); the FLAT images of the fixed
+//!   description digest to their pre-PR-11 goldens;
 //! - `--dry-run` writes nothing (sector 0 + the ledger extent unchanged);
 //! - a 4-volume set converts every volume in one invocation, and a
 //!   half-converted set refuses writable mounts naming the volume.
@@ -38,8 +42,8 @@ use squeezefs::config_ops::{
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
 use squeezefs::meta_backend::kv::builder::{
-    digest_backend, digest_backend_kind_set, format_v3_stamped, format_v3_stamped_symmetric,
-    BuilderConfig, FormatV3Options, ImageBuilder, ROOT_INO,
+    digest_backend, digest_backend_kind_set, format_v3_stamped,
+    format_v3_stamped_multi_writer_flat, BuilderConfig, FormatV3Options, ImageBuilder, ROOT_INO,
 };
 use squeezefs::meta_backend::kv::checkpoint::{read_newest_ledger, write_ledger_slot};
 use squeezefs::meta_backend::kv::journal::AppendPartition;
@@ -62,6 +66,7 @@ use squeezefs::meta_backend::{
 use squeezefs::SYM_UPGRADE_MARKER_XATTR;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -74,8 +79,9 @@ const RING_LEN: u64 = 1024 * 1024;
 const TEST_SEED: u64 = 0x5EED_C0DE_0000_0011;
 const TEST_UUID: [u8; 16] = *b"sym-convert-test";
 
-/// The seam is process-global; the one contract that compares the seam's
-/// image against the flag's serializes its two builds through it.
+/// The golden-digest contract serializes its builds (the builder's
+/// determinism holds per description; two builds racing on one
+/// description is a harness shape, not a product one).
 static SEAM: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn set_opts() -> FormatV3Options {
@@ -125,11 +131,29 @@ fn format_config_for(dir: &Path) -> Vec<u8> {
     serde_json::to_vec(&cfg).unwrap()
 }
 
-/// Format an `n`-member derived-width set of the DEFAULT (multi-writer-
-/// capable, bit-17-absent) class — the shape every field volume has. The
-/// seam is cleared for the build (and restored): this suite's source
-/// volumes are FLAT whatever leg of the matrix runs it — the verb is what
-/// stamps.
+/// A WRITABLE open of the pre-flip class — what the pre-PR-14 binary did
+/// to every field volume the verb converts; since the flip the mount's
+/// door refuses it (presence-required), so the conversion's own
+/// process-scoped admission (`admit_pre_flip_writers` — the guard the
+/// verb holds around its quiesce) stands in for that binary around
+/// exactly these opens.
+async fn open_pre_flip_writer(uris: &[String]) -> squeezefs::error::Result<Arc<RoutedMetaBackend>> {
+    let _admit = squeezefs::meta_backend::kv::backend::admit_pre_flip_writers();
+    open_routed_meta_set(uris).await
+}
+
+/// [`open_pre_flip_writer`]'s single-volume form (the plain writer door).
+async fn open_pre_flip_backend(
+    path: &str,
+) -> Result<Arc<KvMetaBackend>, squeezefs::meta_backend::kv::KvError> {
+    let _admit = squeezefs::meta_backend::kv::backend::admit_pre_flip_writers();
+    KvMetaBackend::open(Path::new(path)).await
+}
+
+/// Format an `n`-member derived-width set of the PRE-FLIP multi-writer-
+/// capable, bit-17-absent class — the shape every field volume formatted
+/// before PR 14 has: this suite's source volumes are FLAT whatever leg of
+/// the matrix runs it — the verb is what stamps.
 async fn format_flat_set(dir: &Path, n: usize) -> Vec<String> {
     format_flat_set_sized(dir, n, VOL_LEN).await
 }
@@ -139,9 +163,6 @@ async fn format_flat_set(dir: &Path, n: usize) -> Vec<String> {
 async fn format_flat_set_sized(dir: &Path, n: usize, vol_len: u64) -> Vec<String> {
     let plan = plan_meta_slot_set(n).expect("derived plan");
     let mut uris = Vec::with_capacity(n);
-    let _g = SEAM.lock().await;
-    let prior = std::env::var_os("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
     for i in 0..n {
         let p = dir.join(format!("meta{i}"));
         std::fs::File::create(&p).unwrap().set_len(vol_len).unwrap();
@@ -149,17 +170,13 @@ async fn format_flat_set_sized(dir: &Path, n: usize, vol_len: u64) -> Vec<String
             format_config_xattr: (i == 0).then(|| format_config_for(dir)),
             ..set_opts()
         };
-        let r = format_v3_stamped(&p, vol_len, &opts, plan.stamps[i].clone()).await;
-        if r.is_err() {
-            if let Some(v) = &prior {
-                std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", v);
-            }
-        }
-        r.expect("format flat member");
+        // The PRE-FLIP multi-writer class (nine bits, no forest) — what the
+        // verb converts; since PR 14 the default `format` builds the forest
+        // and this class is built by no CLI arm.
+        format_v3_stamped_multi_writer_flat(&p, vol_len, &opts, plan.stamps[i].clone())
+            .await
+            .expect("format flat member");
         uris.push(p.display().to_string());
-    }
-    if let Some(v) = prior {
-        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", v);
     }
     uris
 }
@@ -206,11 +223,17 @@ async fn extent_census(path: &str) -> (u64, u64) {
     let be = KvMetaBackend::open_probe(Path::new(path))
         .await
         .expect("probe open");
+    // The census is exact only over a window the probe's replay folds
+    // whole: a flat volume's clean unmount leaves it EMPTY; a forest's
+    // armed leave (PR 14's default) leaves exactly its one control entry
+    // — the region's `Unleased` release batch, tree-0 records the probe
+    // replays before the walk (§5.1.3; no alloc delta rides it).
     assert_eq!(
         be.replay_stats().entries,
-        0,
-        "the census is exact only over an empty replay window"
+        u64::from(be.symmetric_forest()),
+        "the window holds nothing but a forest leave's release entry"
     );
+    assert_eq!(be.replay_stats().dropped_torn, 0);
     let sb = be.superblock().clone();
     let mut reachable = std::collections::BTreeSet::new();
     for tree in be.all_trees() {
@@ -411,7 +434,7 @@ async fn populated_flat_set(
     files: u32,
 ) -> (Vec<String>, Vec<u64>, Population) {
     let uris = format_flat_set(dir, n).await;
-    let routed = open_routed_meta_set(&uris).await.expect("open flat set");
+    let routed = open_pre_flip_writer(&uris).await.expect("open flat set");
     let pop = churn(&routed, files).await;
     let mut digests = Vec::with_capacity(n);
     for vol in &routed.volumes {
@@ -426,7 +449,7 @@ async fn populated_flat_set(
 
 /// The writable set refuses with the sym-upgrade marker's message.
 async fn assert_writable_refuses(uris: &[String]) -> String {
-    match open_routed_meta_set(uris).await {
+    match open_pre_flip_writer(uris).await {
         Ok(routed) => {
             for v in &routed.volumes {
                 let _ = v.shutdown().await;
@@ -650,9 +673,10 @@ async fn a_clean_flat_unmount_leaves_no_claimed_extent_its_roots_do_not_reach() 
         claimed0, reachable0,
         "the populated volume's clean unmount left every claimed extent reachable"
     );
-    // Idle mount cycles: no records change, and the claimed count holds.
+    // Idle mount cycles (the pre-flip binary's, under the admission): no
+    // records change, and the claimed count holds.
     for _ in 0..3 {
-        let routed = open_routed_meta_set(&uris).await.expect("mount");
+        let routed = open_pre_flip_writer(&uris).await.expect("mount");
         for v in &routed.volumes {
             v.shutdown().await.unwrap();
         }
@@ -821,9 +845,9 @@ async fn an_already_symmetric_set_is_refused() {
     let p = dir.path().join("meta0");
     std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
     let plan = plan_meta_slot_set(1).unwrap();
-    format_v3_stamped_symmetric(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone())
+    format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone())
         .await
-        .expect("format --symmetric");
+        .expect("the default (forest) format");
     let uris = vec![p.display().to_string()];
     let err = enable_symmetric(&uris, &EnableSymOptions::default())
         .await
@@ -831,8 +855,13 @@ async fn an_already_symmetric_set_is_refused() {
     assert!(err.to_string().contains("already symmetric"), "{err}");
 }
 
+/// A bit-8 NON-SOLO partition record (the shape a multi-appender era
+/// leaves behind): a dry run names the quiesce and writes nothing; the
+/// real run's quiesce IS the solo mount the pre-flip remedy named (PR
+/// 14) — its checkpoint writes the solo-form record — and the verb
+/// converts (Issue 12's law, kept: `…_and_the_verb_converts` below).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_bit_8_non_solo_partition_record_is_refused_naming_the_solo_mount() {
+async fn a_bit_8_non_solo_partition_record_is_quiesced_solo_by_the_verb() {
     let dir = tempfile::tempdir().unwrap();
     let (uris, _d, _p) = populated_flat_set(dir.path(), 1, 20).await;
     let sb = superblock_of(&uris[0]).await;
@@ -850,13 +879,24 @@ async fn a_bit_8_non_solo_partition_record_is_refused_naming_the_solo_mount() {
     squeezefs::uring_fs::fdatasync(Path::new(&uris[0]))
         .await
         .unwrap();
-    let err = enable_symmetric(&uris, &EnableSymOptions::default())
-        .await
-        .expect_err("refused");
+    let before = fixed_region_of(&uris[0]).await;
+    let err = enable_symmetric(
+        &uris,
+        &EnableSymOptions {
+            dry_run: true,
+            ..EnableSymOptions::default()
+        },
+    )
+    .await
+    .expect_err("a dry run cannot plan against a non-solo record");
     let msg = err.to_string();
     assert!(
-        msg.contains("partition") && msg.contains("solo"),
-        "names the bit-8 record and the solo-mount remedy: {msg}"
+        msg.contains("non-solo partition record") && msg.contains("QUIESCES"),
+        "names the bit-8 record and the quiesce: {msg}"
+    );
+    assert!(
+        before == fixed_region_of(&uris[0]).await,
+        "a dry run writes nothing"
     );
     assert!(!is_symmetric(&superblock_of(&uris[0]).await));
 }
@@ -867,9 +907,7 @@ async fn an_open_cross_volume_intent_is_refused() {
     let (uris, _d, _p) = populated_flat_set(dir.path(), 1, 20).await;
     // Plant an intent record on the reserved intent ino (what a crashed
     // cross-volume transaction leaves behind), through the guarded open.
-    let be = KvMetaBackend::open(Path::new(&uris[0]))
-        .await
-        .expect("open");
+    let be = open_pre_flip_backend(&uris[0]).await.expect("open");
     let key = xattr_key(
         squeezefs::meta_backend::crossvol_tx::XV_INTENT_INO,
         0x1234 & HASH56_MAX,
@@ -887,19 +925,22 @@ async fn an_open_cross_volume_intent_is_refused() {
     be.checkpoint_now().await.unwrap();
     be.shutdown().await.unwrap();
     drop(be);
+    // The verb's quiesce (PR 14) runs the routed open, whose bring-up
+    // rolls open intents forward — an unreadable one refuses that open,
+    // and the verb refuses with it: nothing converted, no marker.
     let err = enable_symmetric(&uris, &EnableSymOptions::default())
         .await
         .expect_err("refused");
     assert!(err.to_string().contains("cross-volume intent"), "{err}");
+    assert!(!is_symmetric(&superblock_of(&uris[0]).await));
+    assert!(!marker_present(&uris[0]).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_in_flight_job_record_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let (uris, _d, _p) = populated_flat_set(dir.path(), 1, 20).await;
-    let be = KvMetaBackend::open(Path::new(&uris[0]))
-        .await
-        .expect("open");
+    let be = open_pre_flip_backend(&uris[0]).await.expect("open");
     let (name, bytes) = squeezefs::jobs::durable_queued_job_xattr(
         &squeezefs::jobs::JobType::Noop {
             tasks: 4,
@@ -923,7 +964,7 @@ async fn an_in_flight_job_record_is_refused() {
 async fn a_live_client_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let (uris, _d, _p) = populated_flat_set(dir.path(), 1, 20).await;
-    let live = open_routed_meta_set(&uris).await.expect("live writer");
+    let live = open_pre_flip_writer(&uris).await.expect("live writer");
     let err = enable_symmetric(&uris, &EnableSymOptions::default())
         .await
         .expect_err("refused under a live client");
@@ -1015,41 +1056,15 @@ fn describe() -> ImageBuilder {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn format_symmetric_builds_the_image_the_seam_builds_byte_for_byte() {
-    let flag = tempfile::NamedTempFile::new().unwrap();
-    flag.as_file().set_len(VOL_LEN).unwrap();
-    let seam = tempfile::NamedTempFile::new().unwrap();
-    seam.as_file().set_len(VOL_LEN).unwrap();
-    {
-        let _g = SEAM.lock().await;
-        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
-        let mut b = describe();
-        b.set_symmetric();
-        b.build(flag.path(), VOL_LEN)
-            .await
-            .expect("build --symmetric");
-        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", "1");
-        let r = describe().build(seam.path(), VOL_LEN).await;
-        std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
-        r.expect("build under the seam");
-    }
-    let a = std::fs::read(flag.path()).unwrap();
-    let b = std::fs::read(seam.path()).unwrap();
-    assert!(a == b, "the flag and the seam build byte-identical images");
-    let sb = superblock_of(flag.path().to_str().unwrap()).await;
-    assert!(is_symmetric(&sb));
-    assert!(sb.appender_dir.len != 0);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_public_symmetric_formatter_mounts_as_a_forest() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("meta0");
     std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
     let plan = plan_meta_slot_set(1).unwrap();
-    format_v3_stamped_symmetric(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone())
+    // The DEFAULT class since PR 14 (`--symmetric` is its no-op spelling).
+    format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone())
         .await
-        .expect("format --symmetric");
+        .expect("the default format");
     let uris = vec![p.display().to_string()];
     let sb = superblock_of(&uris[0]).await;
     assert!(is_symmetric(&sb));
@@ -1323,7 +1338,7 @@ async fn fixed_region_of(path: &str) -> Vec<u8> {
 async fn the_capacity_preflight_refuses_a_volume_that_cannot_hold_the_forest_before_any_marker() {
     let dir = tempfile::tempdir().unwrap();
     let uris = format_flat_set_sized(dir.path(), 1, SMALL_VOL_LEN).await;
-    let routed = open_routed_meta_set(&uris).await.expect("open");
+    let routed = open_pre_flip_writer(&uris).await.expect("open");
     let pop = churn(&routed, 20).await;
     fill_with_large_xattrs(&routed, 480, 15_000).await;
     let digest = digest_backend(&routed.volumes[0]).await.unwrap();
@@ -1381,7 +1396,7 @@ async fn the_capacity_preflight_refuses_a_volume_that_cannot_hold_the_forest_bef
         digest,
         "the records are untouched"
     );
-    let routed = open_routed_meta_set(&uris)
+    let routed = open_pre_flip_writer(&uris)
         .await
         .expect("a writer mounts the refused volume");
     assert_population(&routed, &pop).await;
@@ -1531,7 +1546,7 @@ async fn abort_after(window: EnableSymCrash) {
         "every claimed extent is reachable again — the aborted build left nothing"
     );
 
-    let routed = open_routed_meta_set(&uris)
+    let routed = open_pre_flip_writer(&uris)
         .await
         .expect("a writer mounts the aborted volume");
     assert_population(&routed, &pop).await;
@@ -1783,7 +1798,7 @@ async fn the_resume_floors_its_node_seqs_above_every_reclaimed_extents_residue()
 async fn a_slot_emptied_before_conversion_never_remints_after_it() {
     let dir = tempfile::tempdir().unwrap();
     let uris = format_flat_set(dir.path(), 1).await;
-    let routed = open_routed_meta_set(&uris).await.expect("open");
+    let routed = open_pre_flip_writer(&uris).await.expect("open");
     let gone = routed
         .create(ROOT_INO, "gone", libc::S_IFDIR | 0o755, 0, 0)
         .await
@@ -1886,10 +1901,11 @@ async fn a_slot_emptied_before_conversion_never_remints_after_it() {
     }
 }
 
-/// **Issue 12.** The non-solo bit-8 refusal's remedy — "mount the set solo
-/// once" — is true: a solo mount of a volume whose newest ledger record
-/// carries a 2-way partition re-checkpoints the ledger in its solo form,
-/// after which the verb converts it.
+/// **Issue 12.** The non-solo bit-8 remedy — "mount the set solo once" —
+/// is the verb's OWN quiesce since PR 14 (the mount's door refuses the
+/// pre-flip class): its solo open re-checkpoints the ledger in solo form,
+/// and the verb converts in the same invocation; the converted volume's
+/// digest is the source's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_solo_mount_of_a_non_solo_record_volume_leaves_a_solo_record_and_the_verb_converts() {
     let dir = tempfile::tempdir().unwrap();
@@ -1906,39 +1922,33 @@ async fn a_solo_mount_of_a_non_solo_record_volume_leaves_a_solo_record_and_the_v
         .await
         .expect("write");
     squeezefs::uring_fs::fdatasync(p).await.unwrap();
-    enable_symmetric(&uris, &EnableSymOptions::default())
+    let report = enable_symmetric(&uris, &EnableSymOptions::default())
         .await
-        .expect_err("refused under the non-solo record");
-    // The remedy.
-    let routed = open_routed_meta_set(&uris).await.expect("a solo mount");
-    for v in &routed.volumes {
-        v.checkpoint_now().await.unwrap();
-        v.shutdown().await.unwrap();
-    }
-    drop(routed);
+        .expect("the verb's quiesce is the solo mount; then it converts");
+    assert_eq!(report.rows[0].outcome, ConversionOutcome::Converted);
+    assert!(is_symmetric(&superblock_of(&uris[0]).await));
     let after = read_newest_ledger(p, sb.root_ledger.start)
         .await
         .unwrap()
         .expect("ledger");
     assert!(
         after.append_partition.is_none_or(|part| part.is_solo()),
-        "the solo mount's checkpoint wrote a solo-form record: {:?}",
+        "the quiesce's checkpoint wrote a solo-form record: {:?}",
         after.append_partition
     );
-    let report = enable_symmetric(&uris, &EnableSymOptions::default())
-        .await
-        .expect("converts after the solo mount");
-    assert_eq!(report.rows[0].outcome, ConversionOutcome::Converted);
     assert_eq!(digest_of(&uris[0]).await, digests[0]);
 }
 
 /// A flat volume whose ring holds entries past its checkpoint tail (a
 /// crashed writer whose claim has aged out — within the 45 s TTL the
-/// live-client gate refuses it first) refuses BEFORE any marker, naming
-/// the mount that fixes it — the census the conversion runs is exact only
-/// over an empty window, and the remedy must be reachable.
+/// live-client gate refuses it first) is QUIESCED by the verb itself
+/// before any marker (PR 14: the mount that used to be the remedy
+/// refuses the pre-flip class presence-required, so the verb runs the
+/// mount's own crash recovery under its admission — the census the
+/// conversion runs is exact only over an empty window, and the remedy
+/// must be reachable); a dry run names the quiesce and writes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_volume_not_cleanly_unmounted_refuses_before_any_marker() {
+async fn a_volume_not_cleanly_unmounted_is_quiesced_by_the_verb_before_any_marker() {
     use squeezefs::meta_backend::kv::journal::{
         checkpoint_reserve_bytes, entry_len_for, JournalRing, JOURNAL_PAGE_LEN,
     };
@@ -1997,34 +2007,47 @@ async fn a_volume_not_cleanly_unmounted_refuses_before_any_marker() {
     .expect("write the entry");
     squeezefs::uring_fs::fdatasync(p).await.unwrap();
     drop(ring);
+    // A dry run writes nothing and names the quiesce it would run (the
+    // remedy the pre-flip binary's mount used to be: since PR 14 the
+    // mount's writer door refuses the class, so the verb IS the remedy).
     let before = fixed_region_of(&uris[0]).await;
-    let err = enable_symmetric(&uris, &EnableSymOptions::default())
-        .await
-        .expect_err("refused");
+    let err = enable_symmetric(
+        &uris,
+        &EnableSymOptions {
+            dry_run: true,
+            ..EnableSymOptions::default()
+        },
+    )
+    .await
+    .expect_err("a dry run cannot plan against a window");
     let msg = err.to_string();
     assert!(
-        msg.contains("not cleanly unmounted") && msg.contains("unmount cleanly"),
-        "names the state and the remedy: {msg}"
+        msg.contains("not cleanly unmounted") && msg.contains("QUIESCES"),
+        "names the state and what the real run does: {msg}"
     );
     assert!(before == fixed_region_of(&uris[0]).await, "nothing written");
     assert!(!marker_present(&uris[0]).await);
-    // The remedy.
-    let routed = open_routed_meta_set(&uris)
+    // The real run quiesces the set itself — the window's record folded
+    // into the trees by the replay, checkpointed, the clean leave — then
+    // converts: the uncheckpointed xattr is in the forest.
+    enable_symmetric(&uris, &EnableSymOptions::default())
         .await
-        .expect("mount replays the window");
+        .expect("converts after its own quiesce");
+    let routed = open_routed_meta_set(&uris).await.expect("forest mount");
     assert_population(&routed, &pop).await;
-    routed
-        .removexattr(ROOT_INO, "user.uncheckpointed")
-        .await
-        .expect("remove");
+    assert_eq!(
+        routed
+            .getxattr(ROOT_INO, "user.uncheckpointed")
+            .await
+            .unwrap(),
+        Some(b"x".to_vec()),
+        "the window's record survived the quiesce into the forest"
+    );
     for v in &routed.volumes {
         v.shutdown().await.unwrap();
     }
     drop(routed);
-    enable_symmetric(&uris, &EnableSymOptions::default())
-        .await
-        .expect("converts after the clean unmount");
-    assert_eq!(digest_of(&uris[0]).await, digests[0]);
+    let _ = digests;
 }
 
 /// **Issue 13.** The default `format` is untouched, as a TEST: the flat
@@ -2037,8 +2060,6 @@ async fn the_flat_image_of_the_fixed_description_digests_to_the_pre_pr_golden() 
     const GOLDEN_SINGLE_WRITER: u64 = 0xd132_9394_4543_ef28;
     const GOLDEN_MULTI_WRITER: u64 = 0x4358_b34f_3970_f9c9;
     let _g = SEAM.lock().await;
-    let prior = std::env::var_os("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
-    std::env::remove_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC");
     let single = tempfile::NamedTempFile::new().unwrap();
     single.as_file().set_len(VOL_LEN).unwrap();
     let multi = tempfile::NamedTempFile::new().unwrap();
@@ -2047,9 +2068,6 @@ async fn the_flat_image_of_the_fixed_description_digests_to_the_pre_pr_golden() 
     let mut mw = describe();
     mw.set_multi_writer();
     let r2 = mw.build(multi.path(), VOL_LEN).await;
-    if let Some(v) = prior {
-        std::env::set_var("SQUEEZEFS_TEST_STAMP_SYMMETRIC", v);
-    }
     r1.expect("build the single-writer flat image");
     r2.expect("build the multi-writer flat image");
     let d1 = xxhash_rust::xxh3::xxh3_64(&std::fs::read(single.path()).unwrap());
@@ -2080,7 +2098,7 @@ async fn the_flat_image_of_the_fixed_description_digests_to_the_pre_pr_golden() 
 async fn rename_and_a_layout_publish_of_one_ino_never_co_queue_a_delta_and_a_put_unguarded() {
     let dir = tempfile::tempdir().unwrap();
     let uris = format_flat_set(dir.path(), 1).await;
-    let routed = open_routed_meta_set(&uris).await.expect("open");
+    let routed = open_pre_flip_writer(&uris).await.expect("open");
     let d = routed
         .create(ROOT_INO, "race", libc::S_IFDIR | 0o755, 0, 0)
         .await
@@ -2305,7 +2323,7 @@ async fn the_abort_raises_the_flat_watermark_above_every_reclaimed_extents_resid
 
     // A later flat mount mints its SMOs into the reclaimed extents: every
     // node it writes is stamped above the residue's ceiling.
-    let routed = open_routed_meta_set(&uris).await.expect("flat mount");
+    let routed = open_pre_flip_writer(&uris).await.expect("flat mount");
     fill_with_large_xattrs(&routed, 120, 15_000).await;
     for v in &routed.volumes {
         v.shutdown().await.unwrap();

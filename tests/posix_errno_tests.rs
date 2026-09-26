@@ -230,6 +230,7 @@ fn a_retryable_refusal_is_classified_by_its_typed_class_never_its_text() {
         RefusalClass::HolderUnreachable { holder: 9 },
         RefusalClass::MembershipPending,
         RefusalClass::ListenerRefused,
+        RefusalClass::StaleOwnerEra,
     ] {
         let w = WireError::from_error(&SqueezefsError::retryable(class, "any words"));
         assert_eq!(w.class, class.to_wire());

@@ -565,6 +565,131 @@ async fn the_managers_census_watermarks_never_bound_a_slot_a_joiner_leases() {
     fsck_clean(&uris).await;
 }
 
+/// **A joiner's first SHIPPED step after a manager failover lands** (PR 14
+/// — found by the `sym-crash` leg on the flip binary: every joiner's
+/// `mkdir` under `/` after the SECOND failover failed `EINVAL`, once). A
+/// cross-owner step to the manager's slot rides the S8 lane, which
+/// presents the writer ERA it learned from the dead manager's replies;
+/// the successor — at the fleet's ONE stable manager address, so the
+/// SAME lane — bumped `term` durably before arming and refuses the frame
+/// whole (`STATUS_STALE_TERM`, nothing applied), the lane learns the new
+/// era ("so the caller's retry is admissible", the router's own words) —
+/// and the step's caller surfaced the refusal as the op's error instead
+/// of retrying it. The first failover never showed it: a lane that had
+/// shipped nothing yet presents `0` ("unknown, tell me"), which the gate
+/// admits. Now the stale-era refusal is the typed retryable class
+/// (`RefusalClass::StaleOwnerEra`) and the cross-owner step retries it
+/// ONCE on the relearned era: one relearn counted, no error, the
+/// successor reads the name. RED on the first build: `EINVAL` at the
+/// second create with `era_relearns` 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiners_first_shipped_step_after_a_failover_retries_the_stale_era_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, _dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    enroll_manager(&mvol, &venue.endpoint()).await;
+    let endpoint = venue.endpoint();
+    let joiner = join(&uris, &venue, &mvol, 72).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    // A cross-owner create under `/` — the manager's native slot — ships
+    // its dentry step; the lane learns era T from the reply.
+    let before = create_files(&joiner, 1, "xo-before", 1).await;
+    assert_eq!(
+        jvol.slot_leases().unwrap().holders.endpoint(0).as_deref(),
+        Some(endpoint.as_str())
+    );
+    let relearns0 = squeezefs::meta_ship::stats().era_relearns;
+
+    // The manager leaves (the joiner's shipper — its lanes, its learned
+    // era — outlives it as another daemon's would); the SUCCESSOR stands
+    // up at the SAME address (the fleet's one manager port) in era T + 1.
+    venue.tear_down_keep_shipper();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    let successor = open_under(&uris, &Knobs::armed()).await;
+    let svol = Arc::clone(&successor.volumes[0]);
+    let venue2 = HoldersVenue::stand_up_at(&successor, &[], &endpoint, false).await;
+    assert_eq!(
+        venue2.endpoint(),
+        endpoint,
+        "the successor at the predecessor's address"
+    );
+    squeezefs::multi_writer::publish_symmetric_endpoint(&successor, &endpoint).await;
+    svol.checkpoint_now()
+        .await
+        .expect("the successor's checkpoint");
+    assert_eq!(svol.appender_stats().unwrap().manager_lease.word(), "held");
+
+    // The joiner's first shipped step since: the lane presents era T, the
+    // successor refuses it stale and names T + 1 — the step retries on the
+    // relearned era and LANDS.
+    let retries0 = squeezefs::meta_backend::crossvol_tx::cross_owner_stats().step_stale_era_retries;
+    let after = create_files(&joiner, 1, "xo-after", 1).await;
+    assert_eq!(
+        squeezefs::meta_ship::stats().era_relearns,
+        relearns0 + 1,
+        "the lane relearned the successor's era exactly once"
+    );
+    assert_eq!(
+        squeezefs::meta_backend::crossvol_tx::cross_owner_stats().step_stale_era_retries,
+        retries0 + 1,
+        "the refused ship was resent exactly once on the relearned era"
+    );
+    // The dentries landed at the successor (the shipped step's holder);
+    // the records are the joiner's — its own slot — and resolve there
+    // (this fixture arms no custody plane, so the successor's read divert
+    // of a live joiner's record is the mount path's, never read here).
+    let names_at_successor = |files: Vec<(String, u64)>| {
+        let successor = &successor;
+        async move {
+            for (name, ino) in files {
+                let found = successor
+                    .lookup_dentry(1, &name)
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: the successor's dentry read: {e}"))
+                    .unwrap_or_else(|| panic!("{name}: the successor names the acked create"));
+                assert_eq!(found.0, ino, "{name}: the dentry names the joiner's inode");
+            }
+        }
+    };
+    names_at_successor(before.clone()).await;
+    names_at_successor(after.clone()).await;
+    // The joiner reads `/` off its projection of the successor's native
+    // slot here (no divert without the custody arm): the successor's
+    // cycle publishes the root, the joiner refreshes, then resolves.
+    svol.checkpoint_now().await.unwrap();
+    jvol.refresh_control_projection().await.unwrap();
+    assert_all_resolve(&joiner, 1, &before).await;
+    assert_all_resolve(&joiner, 1, &after).await;
+    // The second shipped step presents the relearned era: no refusal.
+    let again = create_files(&joiner, 1, "xo-again", 1).await;
+    assert_eq!(squeezefs::meta_ship::stats().era_relearns, relearns0 + 1);
+    assert_eq!(
+        squeezefs::meta_backend::crossvol_tx::cross_owner_stats().step_stale_era_retries,
+        retries0 + 1
+    );
+    names_at_successor(again.clone()).await;
+    svol.checkpoint_now().await.unwrap();
+    jvol.refresh_control_projection().await.unwrap();
+    assert_all_resolve(&joiner, 1, &again).await;
+    assert_must_stay_zero(&jvol, "joiner");
+    assert_must_stay_zero(&svol, "successor");
+
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    venue2.tear_down();
+    shutdown(&successor).await;
+    drop(svol);
+    drop(successor);
+    fsck_clean(&uris).await;
+}
+
 /// **PR 13 (found by the `sym-scale` leg's N ladder — a PR 12b defect)**: a
 /// joiner that LEAVES cleanly and REJOINS under the same identity keeps
 /// committing — the manager never grants it an extent a live slot-tree
@@ -6956,7 +7081,6 @@ async fn a_live_joiner_follows_a_manager_failover_to_the_successors_listener() {
     );
     assert_all_resolve(&joiner, other, &more).await;
     assert_all_resolve(&joiner, shared, &files).await;
-
     // The joiner's DATA plane after the failover: enough mints to exhaust
     // the window the dead manager granted — the ask fails at the dead
     // venue once, re-resolves the holder to the successor and lands there;

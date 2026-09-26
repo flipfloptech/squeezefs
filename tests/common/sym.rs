@@ -427,6 +427,21 @@ pub const VENUE_SECRET: &[u8] = b"sym-common-holders-venue-enroll-secret";
 
 impl HoldersVenue {
     pub async fn stand_up(routed: &Arc<RoutedMetaBackend>, appenders: &[u32]) -> Self {
+        Self::stand_up_at(routed, appenders, "127.0.0.1:0", true).await
+    }
+
+    /// [`Self::stand_up`] bound at `bind_addr` — a SUCCESSOR standing up at
+    /// its predecessor's address (the fleet's shape: one stable manager
+    /// port), so a client's lane keyed by endpoint meets the new era on
+    /// the OLD lane. `install_shipper = false` keeps the process's
+    /// installed step shipper (the JOINER's, whose lanes and learned eras
+    /// survive the manager's death exactly as another daemon's would).
+    pub async fn stand_up_at(
+        routed: &Arc<RoutedMetaBackend>,
+        appenders: &[u32],
+        bind_addr: &str,
+        install_shipper: bool,
+    ) -> Self {
         use squeezefs::cluster_wire as cw;
         use squeezefs::data_grant::AsyncVerbRouter;
         use squeezefs::meta_backend::crossvol_tx::install_xv_shipper;
@@ -439,7 +454,7 @@ impl HoldersVenue {
         );
         let host = cw::RpcListener::start_async(
             cw::RpcListenerConfig {
-                bind_addr: "127.0.0.1:0".parse().expect("literal addr"),
+                bind_addr: bind_addr.parse().expect("literal addr"),
                 service_threads: 2,
                 ..cw::RpcListenerConfig::default()
             },
@@ -454,11 +469,13 @@ impl HoldersVenue {
                 plane.holders.set_endpoint(*id, &endpoint);
             }
         }
-        install_xv_shipper(MetaShipRouter::new(
-            Arc::clone(routed),
-            "node-b",
-            VENUE_SECRET.to_vec(),
-        ));
+        if install_shipper {
+            install_xv_shipper(MetaShipRouter::new(
+                Arc::clone(routed),
+                "node-b",
+                VENUE_SECRET.to_vec(),
+            ));
+        }
         Self { host }
     }
 
@@ -469,6 +486,13 @@ impl HoldersVenue {
 
     pub fn tear_down(self) {
         squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
+        self.host.shutdown();
+    }
+
+    /// The listener dies, the process's step shipper STAYS — a manager's
+    /// death as a live joiner in the same process sees it (its lanes and
+    /// learned eras outlive the manager exactly as another daemon's would).
+    pub fn tear_down_keep_shipper(self) {
         self.host.shutdown();
     }
 }

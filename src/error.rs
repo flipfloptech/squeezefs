@@ -37,6 +37,14 @@ pub enum RefusalClass {
     /// when a served verb's own dial was the refusal (a manager forwarding
     /// a step, a holder re-dialing) — wire word 5.
     ListenerRefused,
+    /// An S8 owner refused a MUTATING frame whole because the client's lane
+    /// presented a stale writer era (`STATUS_STALE_TERM` — the owner failed
+    /// over and its successor bumped `term` durably before arming); the
+    /// lane learned the new era from the refusal, so the SAME request is
+    /// admissible on the retry and nothing was applied (PR 14, the record's
+    /// §4.4bb: a joiner's first shipped step after a manager failover read
+    /// `EINVAL` at `mkdir(2)`). Wire word 6.
+    StaleOwnerEra,
 }
 
 impl RefusalClass {
@@ -48,6 +56,7 @@ impl RefusalClass {
             RefusalClass::HolderUnreachable { .. } => 3,
             RefusalClass::MembershipPending => 4,
             RefusalClass::ListenerRefused => 5,
+            RefusalClass::StaleOwnerEra => 6,
         }
     }
 
@@ -61,6 +70,7 @@ impl RefusalClass {
             3 => Some(RefusalClass::HolderUnreachable { holder: 0 }),
             4 => Some(RefusalClass::MembershipPending),
             5 => Some(RefusalClass::ListenerRefused),
+            6 => Some(RefusalClass::StaleOwnerEra),
             _ => None,
         }
     }

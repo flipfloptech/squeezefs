@@ -5503,11 +5503,18 @@ number in §3 is a dev-box RATE reading, venue-attributed pending the box
    CONTROL SESSION` markers against `MEMBER_CONTROL_SESSIONS`; the
    census should count the dial SITES themselves (the `RpcClient::connect`
    / `ManagerClient::connect` call sites reaching the S8 listener) so a
-   new standing session cannot land un-marked. PR 14.
+   new standing session cannot land un-marked. **LANDED — PR 14 Step 0
+   (d), `2144b121`:** every `RpcClient::connect` / `connect_sync` /
+   `MuxSession::connect` / `ManagerClient::connect` site in `src/` carries
+   a census class marker and `derivation_sweep_tests::every_cluster_wire_
+   dial_site_is_classified_for_the_session_census` is the rail.
 12. **PR 13c review nit (routed to the board): tie `handshake_timeout ≡
    DIAL_TIMEOUT`** in `derivation_sweep_tests` — the refused-dial retry's
    clip and the listener's pre-authentication reaper are stated as one
-   bound; the tie test is what keeps them one. PR 14.
+   bound; the tie test is what keeps them one. **LANDED — PR 14 Step 0
+   (d), `2144b121`:** `DIAL_TIMEOUT` is `pub` and `derivation_sweep_tests::
+   the_listeners_handshake_deadline_is_the_dial_bound` ties
+   `RpcListenerConfig::default().handshake_timeout ≡ DIAL_TIMEOUT`.
 13. **The box re-run's findings (§3.9.4, PR 13c's binary — each REPORTED,
    none fixed there):** **F-B1 stands** — six increments on five writers
    in 45 min across three fleets (one of them — m60, a quiet joiner —
@@ -5703,7 +5710,8 @@ the box's input to PR 14; the remaining box rows are the flip binary's.
    the `dlm_token_reader_*` fold (PR 14's stats sweep).
 
 18. **The offer's stand cannot outlast the wire recall's delivery bound
-   (PR 4 × PR 12b — PR 13h review round 3, Issue 16; filed, not fixed):**
+   (PR 4 × PR 12b — PR 13h review round 3, Issue 16; filed at PR 13h —
+   LANDED in PR 14, below):**
    PR 4's offer stands `min(10 s, T_idle / 3)`, derived for the in-process
    model where the requester's acceptance ran the handover directly; under
    PR 12b the HOLDER learns the accepted offer's RECALL only on its renewal
@@ -5726,10 +5734,19 @@ the box's input to PR 14; the remaining box rows are the flip binary's.
    the wire recall's delivery bound (≥ the renewal beat + the handover
    wall), or prod the holder's renewal at the acceptance (the free-grace
    prod's precedent), and restate or pin the closure law on the wire
-   shape.
+   shape. **LANDED — PR 14 Step 0 (a), `2144b121`:** the offer's stand
+   derives from the recall's delivery bound on the wire
+   (`slot_lease_core::wire_offer_stand_ms` = 3 beats + the handover
+   bound), the release keeps the recall's requester memo through the
+   release (`SlotLeaseTable::release_reserving`) and a lapse withdraws the
+   recall so one offer never counts twice; the closure law `slot_offers ≡
+   slot_handovers + slot_offers_expired` is pinned on the wire shape
+   (`sym_n_daemon_tests::{an_accepted_offers_slot_lands_at_the_wire_
+   requester_off_its_next_carriage, an_offer_that_lapses_under_a_standing_
+   recall_is_expired_once_never_also_a_handover}`).
 19. **A reclaim hint whose resolved lessee is DEAD has no reclaimer until
-   the manager remounts (PR 13h review round 4, Issue 20; filed, not
-   fixed — PR 14):** from a lessee's death until PR 10's recovery releases
+   the manager remounts (PR 13h review round 4, Issue 20; filed at PR 13h —
+   LANDED in PR 14, below):** from a lessee's death until PR 10's recovery releases
    its slots (`T_owner` + the recovery bound) BOTH words — the joiner's
    projection and the manager's table — name the dead appender, so the
    forgetter's `step_home_bound` binds the dead endpoint, the dial fails
@@ -5744,6 +5761,14 @@ the box's input to PR 14; the remaining box rows are the flip binary's.
    `release_recovered_slots`' trees), plus one re-resolve off the manager's
    word on a failed ship (the forward hop's shape) to close the
    ≤ one-refresh window after recovery. Beside design §5.1.3's class (iii).
+   **LANDED — PR 14 Step 0 (b), `2144b121`:** the recovery sweeps the
+   corpses of the slots it releases (`RoutedMetaBackend::note_recovered_
+   slots` fed by `recover_dead_appenders_set`, `DataRouter::sweep_recovered_
+   slots` — `recovery_corpses_swept`) and `ship_reclaim_hint` re-resolves
+   ONCE off the manager's word on a failed ship (`reclaim_hint_reresolves`);
+   pins `sym_n_daemon_tests::{a_dead_lessees_corpses_are_swept_by_the_
+   recovery_that_releases_its_slots, a_hint_whose_first_ship_fails_lands_
+   after_one_reresolve_off_the_managers_word}`.
 20. **The shared-LUN rule — F-C1 (§3.10, §4.4ar; DESIGN-LEVEL; a FLIP
    BLOCKER; PR 13i `fix/sym-shared-lun-coherence`):** every metadata read
    and write goes through `uring_fs` BUFFERED I/O — the uring-path opens

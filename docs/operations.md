@@ -1127,7 +1127,7 @@ Every knob the tree reads, grouped as the registry groups them (`src/env_knobs.r
 | Knob | Accepts | Default | Purpose |
 |---|---|---|---|
 | `SQUEEZEFS_CLUSTER_WIRE_SVC_THREADS` | int 1..4096 | `derived clamp(cpus/8, 1, 8)` | Owner-side cluster-wire RPC lanes (pinned service threads, never the conveyor's task); absolute override, clamped to the core count. |
-| `SQUEEZEFS_MW_BIND` | string | `auto` | Where this mount serves the write-custody and publish authority: `auto` (0.0.0.0:0, the default), an explicit `addr:port`, or `off` (refuses a multi-writer arm rather than arming an inert one). Read when `SQUEEZEFS_MULTI_WRITER` is on, and by the symmetric join ladder's rung 7 (PR 12 — NOT retired: every symmetric writer serves, and this is where; `off` refuses the join). |
+| `SQUEEZEFS_MW_BIND` | string | `auto` | Where this mount serves the write-custody and publish authority: `auto` (0.0.0.0:0, the default), an explicit `addr:port`, or `off` (refuses a multi-writer arm rather than arming an inert one). Read by the symmetric join ladder's rung 7 on every armed writer (PR 12 — NOT retired at the flip: every RW mount of a default-format set serves, and this is where; `off` refuses the join). `SQUEEZEFS_MULTI_WRITER`, the knob that once gated it, is retired. |
 
 **Metadata function shipping**
 

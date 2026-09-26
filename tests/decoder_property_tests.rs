@@ -1028,7 +1028,7 @@ proptest! {
     }
 
     /// The symmetric manager's frames (design-symmetric-metadata §6.3,
-    /// `MANAGER_SCHEMA` 1 under `CLUSTER_WIRE_SCHEMA` 5 — a joiner's bytes
+    /// `MANAGER_SCHEMA` 1 under `CLUSTER_WIRE_SCHEMA` 6 (5 until the PR-14 retirement's ONE bump) — a joiner's bytes
     /// at the node holding the manager lease, and the manager's bytes at
     /// every appender) are total over arbitrary bytes, and whatever
     /// decodes re-encodes canonically to an equal frame.

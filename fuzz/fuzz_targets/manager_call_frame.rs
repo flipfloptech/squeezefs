@@ -1,6 +1,6 @@
 //! Fuzz the **symmetric manager wire** (`src/meta_ship/manager.rs`,
 //! design-symmetric-metadata §6.3, `MANAGER_SCHEMA` 1 under
-//! `CLUSTER_WIRE_SCHEMA` 5): the `ManagerRequestFrame` an appender ships
+//! `CLUSTER_WIRE_SCHEMA` 6 (5 until the PR-14 retirement's ONE bump)): the `ManagerRequestFrame` an appender ships
 //! to the volume's manager (`JoinAppender` / `ExtentGrant` /
 //! `ReturnExtents`) and the `ManagerReplyFrame` the manager answers
 //! (`Joined` / `Granted` / `Returned` / `Refused`).

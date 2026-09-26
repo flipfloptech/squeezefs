@@ -60,7 +60,12 @@ mount is a read-token client whose metadata is exact at the next resolve
   `SQUEEZEFS_MW_AUTHORITY`, `SQUEEZEFS_MW_MEMBERS` and the eight S9 lane
   knobs (`SQUEEZEFS_ALLOC_LANE_*`, `SQUEEZEFS_COWRITER_LANE_PLACEMENT`,
   `SQUEEZEFS_FREE_GRACE_LANE_PUSH`, `SQUEEZEFS_REWRITE_SUPPLY_CLOSE`) refuse
-  at startup as RETIRED spellings naming the join ladder; `squeezefs volume
+  at startup as RETIRED spellings naming the join ladder — **ANY value
+  refuses, the OFF spellings included** (`SQUEEZEFS_MULTI_WRITER=0` in a
+  unit file refuses the mount: the standing registry law for a retired
+  knob; 1.2.x's "the OFF spelling is the absent knob" reading of these
+  four is reversed, since the knobs are dead on every format class);
+  `squeezefs volume
   set-owners` / `get-owners` are hard errors naming `enable-symmetric`
   (ownership is a slot LEASE); the co-writer, set-authority and
   partial-authority mount postures, the S9 allocation-lane partition, the
@@ -80,6 +85,21 @@ mount is a read-token client whose metadata is exact at the next resolve
   blocks where the flat class packed into one (`setfattr -n
   user.squeezefs.gather -v 1 <dir>` puts a directory's children into one
   slot); the memlock prerequisite applies to every mount.
+- **The memlock prerequisite (`RLIMIT_MEMLOCK`)**: FUSE-over-io_uring on a
+  kernel with the kmbuf surface pins `entries × buf_size` of kernel-managed
+  payload buffers PER QUEUE (one queue per possible CPU) at mount, and an
+  unprivileged daemon's pins are bounded by its soft `RLIMIT_MEMLOCK` — 8
+  MiB on most distributions, so a fresh install's first mount refused
+  `ENOMEM` at the first queue's registration (found on a fresh Omarchy
+  install). The fork's refusal names the limit, the pin and the three
+  places to raise it (`ulimit -l unlimited` in the mounting shell; `<user> -
+  memlock unlimited` in `/etc/security/limits.d/`; `DefaultLimitMEMLOCK=
+  infinity` in `/etc/systemd/{system,user}.conf.d/`), and it attributes a
+  refusal against the process's CUMULATIVE pin (the 17th queue on a 512 MiB
+  limit, not "this queue's 32 MiB fits"); root and `CAP_IPC_LOCK` are
+  exempt. The need is derived (`queues × entries × buf_size` — 1 GiB on a
+  32-CPU box at the defaults) and tabled in `docs/operations.md`
+  §Prerequisites; the require-mount gate refuses to start below it.
 - **Two defects the flip's mount-class migration found, each fixed
   red-first:** the allocation lease's same-node takeover judged "the
   predecessor is page 0" off a directory read taken after this open's join

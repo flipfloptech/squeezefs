@@ -1,6 +1,6 @@
 //! Fuzz the **read-token wire** (`src/meta_ship/token_plane.rs`,
 //! design-symmetric-metadata §5.7 / §6.3, `TOKEN_SCHEMA` 1 under
-//! `CLUSTER_WIRE_SCHEMA` 5 — PR 5, review round 1 Issue 9): the
+//! `CLUSTER_WIRE_SCHEMA` 6 (5 until the PR-14 retirement's ONE bump) — PR 5, review round 1 Issue 9): the
 //! `TokenRequestFrame` a reader ships to its holder (`Grant` / `Recall` /
 //! `RecallAck` / `Release`; since PR 9 the writer's `CustodyGrant`) and the
 //! `TokenReplyFrame` the holder answers (`Granted` with the object's

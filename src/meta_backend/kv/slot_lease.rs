@@ -6,9 +6,11 @@
 //! every durable act (tree 0's `slot_state`, the page entries) is
 //! `KvMetaBackend`'s.
 //!
-//! Armed by `SQUEEZEFS_SYMMETRIC_META=1` at a writer's open of a bit-17
-//! volume; absent, the PR 1–3 forest runs verbatim (every slot the
-//! mount's, the shared mint rotor, `dlm_mode` = `solo`).
+//! Armed at EVERY writer's open of a bit-17 volume — the DEFAULT since PR
+//! 14 (`SQUEEZEFS_SYMMETRIC_META` defaults to `1`; `=0` on a stamped volume
+//! REFUSES the writable open, the unarmed-forest posture retired with the
+//! flip); a `--single-writer` volume has no forest and arms nothing (every
+//! slot the mount's, the shared mint rotor, `dlm_mode` = `solo`).
 
 use super::record::ForestSlot;
 use crate::slot_lease_core::{
@@ -18,7 +20,8 @@ use crate::slot_lease_core::{
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// Arms the plane (bool, default 0).
+/// The plane's knob (bool, default 1 since PR 14; `=0` refuses a stamped
+/// volume's writable open).
 pub const SYMMETRIC_META_ENV: &str = "SQUEEZEFS_SYMMETRIC_META";
 /// The explicit rotor size (int 1..=`MINT_SPREAD`, derived).
 pub const SYM_MINT_SLOTS_ENV: &str = "SQUEEZEFS_SYM_MINT_SLOTS";

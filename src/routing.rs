@@ -1503,57 +1503,6 @@ pub fn set_rewrite_shadow(on: bool) {
     rewrite_shadow_cell().store(on, Ordering::Relaxed);
 }
 
-/// `SQUEEZEFS_REWRITE_SUPPLY_CLOSE` cell (default ON; `0` = the shipped
-/// KD-1.6/1.7 triggers only — the A/B lever for the fleet row). The
-/// supply-coupled epoch close on co-writer lanes (finding 15's
-/// parked-supply term, `.benchmarks/2026-09-07-rewrite-epoch-supply-close.md`).
-fn rewrite_supply_close_cell() -> &'static std::sync::atomic::AtomicBool {
-    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
-    CELL.get_or_init(|| {
-        let on = crate::env_knobs::bool_knob("SQUEEZEFS_REWRITE_SUPPLY_CLOSE", true);
-        std::sync::atomic::AtomicBool::new(on)
-    })
-}
-
-/// Whether a co-writer's refill tick may close open rewrite epochs on the
-/// lane-supply signal.
-pub fn rewrite_supply_close_enabled() -> bool {
-    rewrite_supply_close_cell().load(Ordering::Relaxed)
-}
-
-/// Set the supply-close lever (tests / A-B acceptance runs).
-pub fn set_rewrite_supply_close(on: bool) {
-    rewrite_supply_close_cell().store(on, Ordering::Relaxed);
-}
-
-/// **The supply-coupled close's PLAN** (pure — the product's decision and
-/// the closed-loop model's, one function): given the lane's deficit in
-/// blocks and the open epochs as `(ino, parked blocks)`, the inos to close
-/// in order and the count left open. Largest parked count first (ties by
-/// ino), closing until the accumulated yield covers the deficit — the
-/// fewest publishes for the most supply. Every candidate yields ≥ 1, so
-/// the closes per tick are bounded by the deficit itself (≤ the
-/// watermark ≤ share/4): a storm would need that many distinct open
-/// epochs each parking a single block, the shape on which the un-shadowed
-/// path would already have published once per block. Epochs parking
-/// nothing are never candidates; a zero deficit closes nothing.
-pub fn supply_close_plan(deficit_blocks: u64, mut candidates: Vec<(u64, u64)>) -> (Vec<u64>, u64) {
-    candidates.retain(|&(_, parked)| parked > 0);
-    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let mut close = Vec::new();
-    let mut yielded = 0u64;
-    let mut left = 0u64;
-    for (ino, parked) in candidates {
-        if yielded >= deficit_blocks {
-            left += 1;
-            continue;
-        }
-        close.push(ino);
-        yielded = yielded.saturating_add(parked);
-    }
-    (close, left)
-}
-
 /// Coarse monotonic milliseconds since process start (the epoch idle
 /// clock — the sweeper's input).
 fn epoch_coarse_ms() -> u64 {
@@ -4420,7 +4369,9 @@ impl BackendRouter {
     /// — the first-volume bare-key invariant), so the un-deduplicated list
     /// would arm that volume twice
     /// (`.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`).
-    pub fn distinct_allocators(&self) -> Vec<std::sync::Arc<crate::block_allocator::BlockAllocator>> {
+    pub fn distinct_allocators(
+        &self,
+    ) -> Vec<std::sync::Arc<crate::block_allocator::BlockAllocator>> {
         let mut allocs = vec![std::sync::Arc::clone(&self.default_allocator)];
         for be in self.backends.iter() {
             let a = &be.value().block_allocator;
@@ -5187,8 +5138,7 @@ impl BackendRouter {
     pub async fn free_blocks(&self, block_keys: &[&str]) -> Result<()> {
         // DLM S9: the batch form ships ONE free verb per data volume
         // instead of one per displaced block (see `free_block` above).
-        if (false
-            || block_keys.iter().any(|k| self.frees_ship_to_holder(k)))
+        if (false || block_keys.iter().any(|k| self.frees_ship_to_holder(k)))
             && !crate::shipped_free::authority_accounting_scope_active()
         {
             let _ = crate::shipped_free::ship_displaced_frees(self, block_keys).await;
@@ -16242,96 +16192,13 @@ impl DataRouter {
     ///   — bindings stay in RAM + registry; the next close trigger
     ///   retries).
     pub async fn close_rewrite_epoch(&self, ino: u64, fencing_token: u64) -> Result<bool> {
-        self.close_rewrite_epoch_counted(ino, fencing_token)
-            .await
-            .map(|closed| closed.is_some())
-    }
-
-    /// **The recompute arm's local hygiene, at the covering publish**
-    /// (`.benchmarks/2026-09-07-cowriter-claim-anomaly-lineage.md`): a
-    /// served layout publish that COVERED this ino's open rewrite epoch
-    /// (any save ships the current RAM map, which no longer names the
-    /// parked predecessors) came back with the offsets the owner's
-    /// recompute ladder free-listed (`freed`, publish schema 15). Every
-    /// parked key naming one of them leaves the park NOW and retires its
-    /// local tracking under the `Freed`-verdict discipline
-    /// (`retire_shipped_free_tracking`: refcount entry gone, incarnation
-    /// word retired and republished under a new generation, read tiers
-    /// purged) — the same act `ship_displaced_frees` performs at an
-    /// explicit free's `Freed` reply. Before this, the parked keys waited
-    /// for the epoch CLOSE (`retire_displaced_locally` on `epoch.displaced`),
-    /// and on the fleet the authority's grace ring → the lane harvest → the
-    /// claim beat the close: `claim_block_idx` found the entry lingering
-    /// (`block_claim_anomalies`, 1,156–1,402 per fpp phase Σ 8 co-writers,
-    /// ~1 % of every recompute-freed block, `free_shipped_blocks` flat).
-    ///
-    /// The inverse guard (a lifetime, never an offset): a parked key whose
-    /// stamp is no longer the offset's LIVE incarnation names a lifetime
-    /// this mount has already re-minted (the harvest beat a delayed reply)
-    /// — the live owner's entry and word are untouched, and the dead key
-    /// leaves the park uncounted (its close-time free would have refused
-    /// on the dead incarnation anyway). Keys the owner did not free stay
-    /// parked for the close, so a NonTerminal / refused / out-of-custody
-    /// predecessor keeps the close's existing arm verbatim.
-    ///
-    /// Runs under the caller's held `INODE_META_LOCKS(ino)` (every save
-    /// body does) — the same lock every shadow record parks under, so the
-    /// pop/re-push walk sees a stable park. No device I/O, no free list:
-    /// hygiene only. Leaving the park also un-counts the key from the
-    /// supply-coupled close's yield estimate (`parked_bytes`), which had
-    /// been counting blocks the authority already held free. A no-op on
-    /// an empty `freed` (every local arm, every un-recomputed reply) and
-    /// on an ino with no open epoch (the close removed it before its own
-    /// save; its `deferred` list keeps the close-time arm).
-    pub(crate) fn retire_recomputed_parked(
-        &self,
-        ino: u64,
-        freed: &[crate::meta_ship::publish::WireFreedBlock],
-    ) {
-        if freed.is_empty() {
-            return;
-        }
-        let Some(epoch) = self.inner.rewrite_epochs.read_sync(&ino, |_, e| e.clone()) else {
-            return;
-        };
-        let mut parked: Vec<String> = Vec::new();
-        while let Some(k) = epoch.displaced.pop() {
-            parked.push(k);
-        }
-        if parked.is_empty() {
-            return;
-        }
-        let bs = self.block_size.load(Ordering::Relaxed);
-        let mut left_park = 0u64;
-        for key in parked {
-            match crate::shipped_free::retire_recomputed_parked_key(&self.backend_router, &key, freed) {
-                crate::shipped_free::RecomputedRetire::Kept => epoch.displaced.push(key),
-                crate::shipped_free::RecomputedRetire::Retired
-                | crate::shipped_free::RecomputedRetire::DeadLifetime => left_park += 1,
-            }
-        }
-        if left_park > 0 {
-            let bytes = left_park.saturating_mul(bs);
-            crate::gauge_core::sub_saturating(&epoch.parked_bytes, bytes);
-            crate::gauge_core::sub_saturating(&METRICS.rewrite_shadow_parked_bytes, bytes);
-        }
-    }
-
-    /// [`Self::close_rewrite_epoch`] returning `Some(parked A keys the
-    /// swap released)` when an epoch closed — the supply-coupled close's
-    /// yield instrument (`rewrite_shadow_supply_close_blocks`).
-    async fn close_rewrite_epoch_counted(
-        &self,
-        ino: u64,
-        fencing_token: u64,
-    ) -> Result<Option<u64>> {
         if self
             .inner
             .rewrite_epochs
             .read_sync(&ino, |_, _| ())
             .is_none()
         {
-            return Ok(None);
+            return Ok(false);
         }
         let map_guard = meta_lock_acquire(ino).await;
         // Resolve the entry WHILE the epoch is still registered (a cache
@@ -16341,7 +16208,7 @@ impl DataRouter {
             None => self.fetch_metadata_from_backend(ino).await?,
         };
         let Some((_, epoch)) = self.inner.rewrite_epochs.remove_sync(&ino) else {
-            return Ok(None);
+            return Ok(false);
         };
         // Finding 36: the close's frees follow the verdict of the publish
         // that COVERED the recorded bindings — this save's own on the
@@ -16427,19 +16294,17 @@ impl DataRouter {
                 // shipped-free ladder post-guard (RES-1), post-commit
                 // (§5.2).
                 if !local_released.is_empty() {
-                    crate::meta_ship::publish::free_recomputed_releases(ino, local_released)
-                        .await;
+                    crate::meta_ship::publish::free_recomputed_releases(ino, local_released).await;
                 }
                 // Finding 36 (half 2, the epoch face): a covering publish
                 // whose accounting was recomputed owns these device frees
                 // — local hygiene only, never a frame-derived free.
-                let released = deferred.len() as u64;
                 if owner_recomputed {
                     crate::shipped_free::retire_displaced_locally(&self.backend_router, &deferred);
                 } else {
                     self.free_deferred_keys(deferred).await;
                 }
-                Ok(Some(released))
+                Ok(true)
             }
             Err(e @ SqueezefsError::WriterGuardFenced) => {
                 while epoch.displaced.pop().is_some() {}
@@ -16468,6 +16333,80 @@ impl DataRouter {
                 );
                 Err(e)
             }
+        }
+    }
+
+    /// **The recompute arm's local hygiene, at the covering publish**
+    /// (`.benchmarks/2026-09-07-cowriter-claim-anomaly-lineage.md`): a
+    /// served layout publish that COVERED this ino's open rewrite epoch
+    /// (any save ships the current RAM map, which no longer names the
+    /// parked predecessors) came back with the offsets the owner's
+    /// recompute ladder free-listed (`freed`, publish schema 15). Every
+    /// parked key naming one of them leaves the park NOW and retires its
+    /// local tracking under the `Freed`-verdict discipline
+    /// (`retire_shipped_free_tracking`: refcount entry gone, incarnation
+    /// word retired and republished under a new generation, read tiers
+    /// purged) — the same act `ship_displaced_frees` performs at an
+    /// explicit free's `Freed` reply. Before this, the parked keys waited
+    /// for the epoch CLOSE (`retire_displaced_locally` on `epoch.displaced`),
+    /// and on the fleet the authority's grace ring → the lane harvest → the
+    /// claim beat the close: `claim_block_idx` found the entry lingering
+    /// (`block_claim_anomalies`, 1,156–1,402 per fpp phase Σ 8 co-writers,
+    /// ~1 % of every recompute-freed block, `free_shipped_blocks` flat).
+    ///
+    /// The inverse guard (a lifetime, never an offset): a parked key whose
+    /// stamp is no longer the offset's LIVE incarnation names a lifetime
+    /// this mount has already re-minted (the harvest beat a delayed reply)
+    /// — the live owner's entry and word are untouched, and the dead key
+    /// leaves the park uncounted (its close-time free would have refused
+    /// on the dead incarnation anyway). Keys the owner did not free stay
+    /// parked for the close, so a NonTerminal / refused / out-of-custody
+    /// predecessor keeps the close's existing arm verbatim.
+    ///
+    /// Runs under the caller's held `INODE_META_LOCKS(ino)` (every save
+    /// body does) — the same lock every shadow record parks under, so the
+    /// pop/re-push walk sees a stable park. No device I/O, no free list:
+    /// hygiene only. Leaving the park also un-counts the key from the
+    /// supply-coupled close's yield estimate (`parked_bytes`), which had
+    /// been counting blocks the authority already held free. A no-op on
+    /// an empty `freed` (every local arm, every un-recomputed reply) and
+    /// on an ino with no open epoch (the close removed it before its own
+    /// save; its `deferred` list keeps the close-time arm).
+    pub(crate) fn retire_recomputed_parked(
+        &self,
+        ino: u64,
+        freed: &[crate::meta_ship::publish::WireFreedBlock],
+    ) {
+        if freed.is_empty() {
+            return;
+        }
+        let Some(epoch) = self.inner.rewrite_epochs.read_sync(&ino, |_, e| e.clone()) else {
+            return;
+        };
+        let mut parked: Vec<String> = Vec::new();
+        while let Some(k) = epoch.displaced.pop() {
+            parked.push(k);
+        }
+        if parked.is_empty() {
+            return;
+        }
+        let bs = self.block_size.load(Ordering::Relaxed);
+        let mut left_park = 0u64;
+        for key in parked {
+            match crate::shipped_free::retire_recomputed_parked_key(
+                &self.backend_router,
+                &key,
+                freed,
+            ) {
+                crate::shipped_free::RecomputedRetire::Kept => epoch.displaced.push(key),
+                crate::shipped_free::RecomputedRetire::Retired
+                | crate::shipped_free::RecomputedRetire::DeadLifetime => left_park += 1,
+            }
+        }
+        if left_park > 0 {
+            let bytes = left_park.saturating_mul(bs);
+            crate::gauge_core::sub_saturating(&epoch.parked_bytes, bytes);
+            crate::gauge_core::sub_saturating(&METRICS.rewrite_shadow_parked_bytes, bytes);
         }
     }
 
@@ -17599,7 +17538,10 @@ impl DataRouter {
                     // mounts, no resolver armed) keep the caller stream
                     // verbatim.
                     let payload = if owner_recomputed {
-                        crate::shipped_free::retire_displaced_locally(&self.backend_router, &o.payload);
+                        crate::shipped_free::retire_displaced_locally(
+                            &self.backend_router,
+                            &o.payload,
+                        );
                         Vec::new()
                     } else {
                         o.payload

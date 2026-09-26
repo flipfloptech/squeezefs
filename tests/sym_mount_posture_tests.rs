@@ -1166,7 +1166,7 @@ async fn a_token_reader_follows_a_manager_failover_to_the_successors_listener() 
                   endpoint: String| async move {
         use squeezefs::membership::{MemberIdentity, MemberRole};
         let identity = MemberIdentity {
-            id: squeezefs::cowriter::node_member_id().expect("this node's member id"),
+            id: squeezefs::member_id::node_member_id().expect("this node's member id"),
             role: MemberRole::Writer,
             pid: std::process::id(),
             boot: squeezefs::meta_backend::kv::backend::read_boot_id(),
@@ -1371,7 +1371,7 @@ async fn plane_gate_keys_on_the_allocation_lease_of_a_grant_armed_allocator() {
     // still passes on the grant window.
     let dropped = alloc_lease::drop_holding(tag).expect("the holding");
     let refusals_before = squeezefs::fuse_client::METRICS
-        .cowriter_accounting_refusals
+        .accounting_plane_refusals
         .load(std::sync::atomic::Ordering::Relaxed);
     let minted = rig
         .alloc
@@ -1396,7 +1396,7 @@ async fn plane_gate_keys_on_the_allocation_lease_of_a_grant_armed_allocator() {
     );
     assert!(
         squeezefs::fuse_client::METRICS
-            .cowriter_accounting_refusals
+            .accounting_plane_refusals
             .load(std::sync::atomic::Ordering::Relaxed)
             > refusals_before,
         "the refusal rides the accounting gauge"

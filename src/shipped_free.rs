@@ -617,6 +617,30 @@ pub async fn execute_shipped_frees(
     .await
 }
 
+/// The served-publish SCREEN's probe over this writer's data router
+/// ([`crate::meta_ship::publish::ReleasedBlockProbe`], design-small-file-
+/// packing §5.6 (2)): `(vol_tag, block_idx)` → does THIS mount hold the
+/// block released — on its free list, in its freed-offset grace ring or in
+/// S7 quarantine? A served layout publish whose frame TAKES such a block is
+/// refused before anything is staged (`served_publish_free_block_refusals`,
+/// must-stay-0): this mount released that lifetime, and adopting it would
+/// make the peer's tenant a second owner of an offset the next mint hands
+/// out. Installed by `multi_writer::arm_authority_planes` on every armed
+/// writer with a data plane.
+pub fn router_released_block_probe(
+    backend: Arc<crate::routing::BackendRouter>,
+) -> crate::meta_ship::publish::ReleasedBlockProbe {
+    Arc::new(move |vol_tag: u64, block_idx: u64| {
+        let Some((_, alloc)) = backend.allocator_for_volume_tag(vol_tag) else {
+            return false;
+        };
+        let offset = block_idx.saturating_mul(alloc.chunk_size());
+        alloc.free_list_contains(block_idx)
+            || alloc.grace_holds(offset)
+            || alloc.is_quarantined(offset)
+    })
+}
+
 /// A [`crate::meta_ship::publish::FreeExecutor`] over this holder's data
 /// router + metadata set — what `multi_writer::arm_authority_planes`
 /// installs on every armed writer (and the rigs install directly).

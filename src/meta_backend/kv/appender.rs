@@ -2781,6 +2781,17 @@ pub struct AppenderSet {
     /// `Live` pages the directory held at mount (foreign ones included —
     /// what a non-writer open reports; a writer refuses on a foreign one).
     pub live_pages_at_mount: u64,
+    /// The identity page 0 carried as this open READ it — before the
+    /// writer's join rewrote the page with its own (`None`: a page never
+    /// written since format). The predecessor MANAGER's identity,
+    /// whatever its state at the read: a `Free` page after its clean
+    /// leave keeps it, a `Live` one after its death does too. The one
+    /// witness of "who held page 0 before us" once the join has run —
+    /// the allocation arm's same-node takeover judges the lease record's
+    /// holder against it (PR 14: a clean unmount then a mount at another
+    /// mount point of the same host is a different mount slot, and a
+    /// directory read after the join names only ourselves).
+    pub page0_at_open: Option<AppenderIdentity>,
     pub joins: std::sync::atomic::AtomicU64,
     pub leaves: std::sync::atomic::AtomicU64,
     pub self_recoveries: std::sync::atomic::AtomicU64,

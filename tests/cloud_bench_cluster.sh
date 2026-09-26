@@ -13,10 +13,9 @@
 #     ($SSH_KEY_FILE) readable by you.
 #   * Spot vCPU quota for the preset ("All Standard (A, C, D, H, I, M, R, T,
 #     Z) Spot Instance Requests"): i4i preset needs 96 vCPUs, i3en preset
-#     needs 288 vCPUs, mw preset needs 32 vCPUs (SYMMETRIC=1: 8 x EVERY node
-#     = 8 x (N_MDS + N_OSS + N_CLIENT + N_SPARE) — S1 N_CLIENT=3 48, S2
-#     N_CLIENT=8 88 at the default 1 mds + 2 oss + 0 spare, 136 at S2 +
-#     N_OSS=8).
+#     needs 288 vCPUs, mw preset 8 x EVERY node = 8 x (N_MDS + N_OSS +
+#     N_CLIENT + N_SPARE) — S1 N_CLIENT=3 48, S2 N_CLIENT=8 88 at the
+#     default 1 mds + 2 oss + 0 spare, 136 at S2 + N_OSS=8).
 #   * Pre-built artifacts in $ARTIFACT_DIR (this script DEPLOYS, it does not
 #     build): `squeezefs` (linux-gnu, glibc ≤ the AMI's — use the
 #     `task build:ubuntu2404` dist output; the mw preset rides the Ubuntu
@@ -33,9 +32,7 @@
 #   ------  --------------  -----------------  -------------------------  --------------
 #   i4i     i4i.4xlarge     x6 (96 vCPU)       1 x 3,750 GB Nitro NVMe    ~$3-4/hr   (the IOPS venue)
 #   i3en    i3en.12xlarge   x6 (288 vCPU)      4 x 7,500 GB NVMe          ~$10-14/hr (the throughput venue)
-#   mw      i4i.2xlarge     x4 (32 vCPU)       1 x 1,875 GB Nitro NVMe    ~$0.5-0.8/hr (the MW MPI-IO venue;
-#                                                                          campaign ~2-3 h => ~$1.5-3 total)
-#   mw+SYMMETRIC=1 N_CLIENT=n: x(N_MDS + N_OSS + n + N_SPARE) i4i.2xlarge, ~$0.686/hr on-demand
+#   mw      i4i.2xlarge     x(N_MDS + N_OSS + N_CLIENT + N_SPARE), ~$0.686/hr on-demand (the symmetric fleet venue)
 #           per node (EVERY node bills) — at the default 1 mds + 2 oss + 0 spare: S1 (n=3) x6 ~$4.1/hr,
 #           S2 (n=8) x11 ~$7.5/hr (n=2: x5 ~$3.4/hr, gates 2 + 3 only);
 #           S2 + N_OSS=8 (the 2026-09-24 approved shape) x17 ~$11.7/hr
@@ -59,30 +56,26 @@
 #   tests/cloud_bench_cluster.sh status
 #   tests/cloud_bench_cluster.sh teardown
 #
-# The MULTI-WRITER MPI-IO arm (the cheapest adequate venue for the
-# shared-vs-disjoint s11-mpiio ior row over a REAL nvme-tcp network — see
-# docs/field-mpiio-runbook.md §Cloud venue). Pass PRESET=mw (or --preset mw)
-# on EVERY subcommand: the preset selects the role shape, the AMI and the
-# artifact defaults, and only the node list persists in cluster state:
-#
-#   MAX_CLUSTER_HOURS=3 PRESET=mw tests/cloud_bench_cluster.sh launch
-#   PRESET=mw tests/cloud_bench_cluster.sh deploy       # needs dist/ubuntu2604
-#   PRESET=mw tests/cloud_bench_cluster.sh assemble-mw
-#   PRESET=mw tests/cloud_bench_cluster.sh bench-mw     # rows -> .benchmarks/cloud/<ts>/
-#   tests/cloud_bench_cluster.sh teardown
+# The mw preset (the cheapest adequate multi-node venue over a REAL nvme-tcp
+# network). Pass PRESET=mw (or --preset mw) on EVERY subcommand: the preset
+# selects the role shape, the AMI and the artifact defaults, and only the
+# node list persists in cluster state. Since the symmetric default flip
+# (PR 14) the preset has ONE fleet shape — the symmetric one below; the
+# retired authority + co-writer recipe (`assemble-mw` / `bench-mw`,
+# tests/cluster_reset_v5_mw.sh) refuses loud naming it.
 #
 # The SYMMETRIC fleet shape (design-symmetric-metadata §8 gates 2 / 3 / 3b
 # on REAL nodes — PR 15, the program's only multi-node venue): PRESET=mw
-# SYMMETRIC=1 (or --symmetric) makes N_CLIENT the WRITER NODE COUNT — one
-# symmetric writer per client node (the MANAGER on client0 = the D0 winner,
-# a JOINED writer on every other client node through the join ladder), the
-# storage nodes as today. Pass PRESET=mw SYMMETRIC=1 N_CLIENT=<n> on EVERY
-# subcommand:
+# makes N_CLIENT the WRITER NODE COUNT — one symmetric writer per client
+# node (the MANAGER on client0 = the D0 winner, a JOINED writer on every
+# other client node through the join ladder), the storage nodes as today
+# (`SYMMETRIC=1` / `--symmetric` is the shape's recorded word and the
+# default). Pass PRESET=mw N_CLIENT=<n> on EVERY subcommand:
 #
-#   MAX_CLUSTER_HOURS=3 PRESET=mw SYMMETRIC=1 N_CLIENT=2 tests/cloud_bench_cluster.sh launch
-#   PRESET=mw SYMMETRIC=1 N_CLIENT=2 tests/cloud_bench_cluster.sh deploy
-#   PRESET=mw SYMMETRIC=1 N_CLIENT=2 tests/cloud_bench_cluster.sh assemble-sym
-#   PRESET=mw SYMMETRIC=1 N_CLIENT=2 tests/cloud_bench_cluster.sh bench-sym  # rows -> .benchmarks/cloud/<ts>/sym-rows/
+#   MAX_CLUSTER_HOURS=3 PRESET=mw N_CLIENT=2 tests/cloud_bench_cluster.sh launch
+#   PRESET=mw N_CLIENT=2 tests/cloud_bench_cluster.sh deploy
+#   PRESET=mw N_CLIENT=2 tests/cloud_bench_cluster.sh assemble-sym
+#   PRESET=mw N_CLIENT=2 tests/cloud_bench_cluster.sh bench-sym  # rows -> .benchmarks/cloud/<ts>/sym-rows/
 #   tests/cloud_bench_cluster.sh teardown
 #
 #   shape S1 = N_CLIENT=3 (6 x i4i.2xlarge: gates 2 + 3b + gate 3 at N <= 3;
@@ -133,9 +126,9 @@ MARKET="${MARKET:-on-demand}"
 # --- Instance preset ------------------------------------------------------
 # i4i    = i4i.4xlarge  x N  (~$3-4/hr cluster on spot)   — the IOPS venue
 # i3en   = i3en.12xlarge x N (~$10-14/hr cluster on spot) — the throughput venue
-# mw     = i4i.2xlarge  x 4  (~$0.5-0.8/hr cluster on spot) — the CHEAPEST
-#          adequate venue for the multi-writer s11-mpiio MPI-IO row
-#          (assemble-mw / bench-mw); Ubuntu 26.04 AMI + dist/ubuntu2604
+# mw     = i4i.2xlarge  x N  (~$0.686/hr per node on-demand) — the CHEAPEST
+#          adequate multi-node venue for the symmetric fleet rows
+#          (assemble-sym / bench-sym); Ubuntu 26.04 AMI + dist/ubuntu2604
 #          artifacts by default (the MW kernel floors — see AMI below)
 # custom = use INSTANCE_TYPE below verbatim (still burst-class-refused)
 PRESET="${PRESET:-i4i}"
@@ -168,10 +161,10 @@ MAX_CLUSTER_HOURS="${MAX_CLUSTER_HOURS:-}"
 # i4i/i3en/custom ride Ubuntu 24.04 (unchanged). mw needs TWO kernel floors
 # the 24.04 GA kernel lacks — client FUSE-over-io_uring
 # (/sys/module/fuse/parameters/enable_uring, mainline v6.14+) and
-# storage-node nvmet Persistent Reservations (resv_enable, v6.13+; the S9
-# multi-writer arm refuses non-PR substrates) — so it defaults to Ubuntu
-# 26.04 LTS. The floor is NEVER trusted from the AMI: assemble-mw probes
-# both and refuses loud with the remedy.
+# storage-node nvmet Persistent Reservations (resv_enable, v6.13+; the join
+# ladder's rung 4 refuses a second host on a non-PR substrate) — so it
+# defaults to Ubuntu 26.04 LTS. The floor is NEVER trusted from the AMI:
+# assemble-sym probes both and refuses loud with the remedy.
 AMI_SSM_PARAM="${AMI_SSM_PARAM:-}"
 
 # --- Artifacts to deploy (built elsewhere; this script never builds) ---------
@@ -188,43 +181,13 @@ MOUNTPOINT="/scratch/mnt"
 CACHE_DIR="/scratch/cache"
 MOUNT_EXTRA="--interception --allow-other --log-file /tmp/sqz.log"
 
-# --- Multi-writer fleet shape (PRESET=mw: assemble-mw / bench-mw) ------------
-# CO-LOCATED (docs/operations.md §Multi-writer co-writer mounts): the
-# authority and every co-writer mount on client0 and share the box's default
-# NVMe host identity — the proven tests/cluster_reset_v5_mw.sh field recipe.
-MW_COWRITERS="${MW_COWRITERS:-2}"   # co-writer mounts at $MOUNTPOINT-cw1..K.
-                                    # 2 = the s11-mpiio leg's floor, sized for
-                                    # the cheap 8-vCPU client (1 authority +
-                                    # 2 co-writer daemons + 2x4 ior ranks);
-                                    # the field/design shape is 8 — raise it
-                                    # together with the client instance size.
-MW_PORT="${MW_PORT:-45999}"         # authority custody/publish bind — STABLE
-                                    # (the mw_fleet rung-10 finding: `auto`
-                                    # mints a fresh ephemeral port per
-                                    # incarnation, so a remounted authority
-                                    # would be undialable by the recorded
-                                    # endpoint forever)
-MW_MEMBERSHIP_BIND="${MW_MEMBERSHIP_BIND:-auto}"  # the S9 arm's rung 4
-                                                  # requires the membership
-                                                  # plane armed
-MW_RANGE_CUSTODY="${MW_RANGE_CUSTODY:-1}"  # on every co-writer — the
-                                           # s11-mpiio row REQUIRES it (the
-                                           # product default stays OFF; the
-                                           # leg's engagement gate convicts
-                                           # an unarmed fleet at probe time)
-MW_FLEET_SHARE="${MW_FLEET_SHARE:-}"       # SQUEEZEFS_FLEET_SHARE per daemon;
-                                           # EMPTY = derived 1+MW_COWRITERS
-                                           # (KD-MW-14: N co-located daemons
-                                           # divide the machine)
-MW_IOR_PROCS="${MW_IOR_PROCS:-4}"          # ior procs per co-writer mount
-                                           # (the leg's --procs, 1..16)
-MW_MOUNT_EXTRA="--allow-other"             # NO --interception on MW mounts
-                                           # (the proven mw_fleet/v5-mw
-                                           # recipe — the MPI-IO row drives
-                                           # the kernel FUSE path); per-mount
+# --- The mw preset's mount posture --------------------------------------------
+MW_MOUNT_EXTRA="--allow-other"             # NO --interception on the fleet's mounts
+                                           # (the proven mw_fleet recipe — the rows
+                                           # drive the kernel FUSE path); per-mount
                                            # --log-file is appended per daemon
 
-# --- Symmetric fleet shape (PRESET=mw SYMMETRIC=1: assemble-sym / bench-sym) -
+# --- The symmetric fleet shape (PRESET=mw: assemble-sym / bench-sym) ---------
 # ONE symmetric writer PER CLIENT NODE (design-symmetric-metadata §7.3 — the
 # join ladder; PR 12b's N-daemon posture made multi-node): client0 mounts
 # first and wins the D0 ladder (the MANAGER); client1..N-1 join it over the
@@ -244,10 +207,13 @@ MW_MOUNT_EXTRA="--allow-other"             # NO --interception on MW mounts
 # formatted CACHE-LESS (no --disk-cache-paths — tests/mw_fleet.sh's shape
 # for the box and local fleets): every beyond-inline file is a whole
 # striped block at its publish, so gate 2 prices the DMA the box priced.
-SYMMETRIC="${SYMMETRIC:-0}"
+SYMMETRIC="${SYMMETRIC:-1}"                # 1 = the ONLY mw shape since PR 14
+                                           # (the knob survives as the rows'
+                                           # recorded word; 0 refuses)
 SYM_PORT="${SYM_PORT:-45999}"              # every writer's listener: <node private ip>:SYM_PORT
                                            # — an EXPLICIT bind (advertised verbatim); a
-                                           # STABLE port for the same reason MW_PORT is
+                                           # STABLE port (a remounted manager stays
+                                           # dialable by the recorded endpoint)
 SYM_MEMBERSHIP_BIND="${SYM_MEMBERSHIP_BIND:-auto}"  # the manager's S6 shard (the joiners are
                                                     # its members — rung 3 of their ladder)
 SYM_TOKEN_READER="${SYM_TOKEN_READER:-1}"  # 1 = also mount a `--read-only` TOKEN reader at
@@ -325,20 +291,10 @@ subcommands:
   assemble   share instance-store NVMe from storage nodes (squeezefs nvmeof
              share, nvmet), connect from the client (single-path — one NIC),
              format, mount, build_commit verification
-  assemble-mw  (PRESET=mw) the same fabric steps as assemble, DIVERGING at
-             the mount into the tests/cluster_reset_v5_mw.sh multi-writer
-             fleet recipe: 1 authority + $MW_COWRITERS co-writers co-located
-             on client0 (rung-3 enrollment harvest, roster re-arm, posture
-             gates), nvmet PR assert per storage node + nvme resv-report per
-             data namespace, both MW kernel floors probed loud
   bench      run the standing elbencho battery; results land in
              .benchmarks/cloud/<timestamp>/ with full row labeling
-  bench-mw   (PRESET=mw) run the s11-mpiio shared-vs-disjoint MPI-IO ior row
-             (tests/run_mw_matrix.sh external-mounts mode) over the MW fleet;
-             rows -> .benchmarks/cloud/<timestamp>/ (cloud rows are a THIRD
-             substrate class — never spliced into devsub medians)
-  assemble-sym (PRESET=mw SYMMETRIC=1) the same fabric steps as assemble-mw,
-             DIVERGING at the format into `format --symmetric` and at the
+  assemble-sym (PRESET=mw) the same fabric steps as assemble, DIVERGING at
+             the format into the default (symmetric) class and at the
              mount into ONE symmetric writer PER CLIENT NODE: the MANAGER on
              client0, a JOINED writer on client1..N_CLIENT-1 (the join
              ladder over the real wire — each node its OWN registrant, its
@@ -348,7 +304,7 @@ subcommands:
              read from every node's .stats (mount_posture writer,
              symmetric_join non-null, manager_lease held / joined_appender_id,
              appenders_known == N, the membership census)
-  bench-sym  (PRESET=mw SYMMETRIC=1) the three symmetric row sets — gate 2
+  bench-sym  (PRESET=mw) the three symmetric row sets — gate 2
              sym-tarx (a JOINED node's tar -x vs the manager-local S0), gate
              3 sym-scale (N = 1/2/4/8 writer NODES — the per-node law), gate
              3b sym-shared-dir (+ -ls) — driven from THIS box over ssh by
@@ -363,8 +319,9 @@ subcommands:
              cancel the deadline guard, tag-scoped final sweep (fails loudly
              on any still-billing resource). Idempotent.
   full       launch -> deploy -> assemble -> bench -> teardown
-             (PRESET=mw: launch -> deploy -> assemble-mw -> bench-mw -> teardown;
-              PRESET=mw SYMMETRIC=1: … -> assemble-sym -> bench-sym -> teardown)
+             (PRESET=mw: launch -> deploy -> assemble-sym -> bench-sym -> teardown;
+              assemble-mw / bench-mw — the retired authority + co-writer
+              recipe — refuse loud since the PR-14 flip)
 
 flags:
   --dry-run          print every aws/ssh command instead of executing (no
@@ -374,7 +331,7 @@ flags:
   --cluster-id ID    operate on a specific cluster (default: the one recorded
                      in .cloud-bench/current)
   --preset P         i4i | i3en | mw | custom (overrides $PRESET)
-  --symmetric        the symmetric fleet shape (PRESET=mw only; = SYMMETRIC=1)
+  --symmetric        the symmetric fleet shape — the mw preset's only one since PR 14 (= SYMMETRIC=1, the default; accepted as the rows' recorded word)
 
 The max-spend guard: launch/full refuse unless MAX_CLUSTER_HOURS is a
 positive integer. See the header quickstart for the cost table.
@@ -443,22 +400,20 @@ case "$PRESET" in
     # i4i.2xlarge client) would need a second template + fleet and complicate
     # the teardown/guard surface for ~$0.2/hr of savings at this node count.
     # i4i.2xlarge: 8 vCPU, 1 x 1,875 GB instance-store Nitro NVMe, "up to
-    # 12.5 Gbps" network. The client runs the whole co-located fleet
-    # (1 authority + MW_COWRITERS co-writer daemons + the ior ranks); the
-    # storage nodes idle at one nvmet target each.
+    # 12.5 Gbps" network. Every client node runs ONE symmetric writer (the
+    # manager on client0, a joined writer elsewhere); the storage nodes
+    # idle at one nvmet target each.
     #
     # Small-instance "up to N Gbps" network baselines are BURST-shaped too
-    # (unlike CPU credits, not refused): the s11-mpiio row survives because
-    # it is a same-substrate shared-vs-disjoint RATIO with internal A-B-B-A
-    # brackets, and the leg's flatness/self-sizing gates catch credit sag —
-    # but the row stamp records the instance types so the label stays honest.
+    # (unlike CPU credits, not refused): the symmetric rows are same-
+    # substrate RATIOS with internal A-B-B-A brackets, and the legs'
+    # flatness/self-sizing gates catch credit sag — but the row stamp
+    # records the instance types so the label stays honest.
     #
-    # INSTANCE_TYPE is an OVERRIDE here (the one preset that honors it):
-    # the 8-co-writer field/design shape needs a bigger client (the comment
-    # on MW_COWRITERS above — "raise it together with the client instance
-    # size"), and the fleet stays UNIFORM one-type by the same one-template
-    # rationale. i4i.4xlarge (16 vCPU) matches the proven local venue;
-    # i4i.8xlarge (32 vCPU) removes the client CPU-starvation question.
+    # INSTANCE_TYPE is an OVERRIDE here (the one preset that honors it);
+    # the fleet stays UNIFORM one-type by the same one-template rationale.
+    # i4i.4xlarge (16 vCPU) matches the proven local venue; i4i.8xlarge
+    # (32 vCPU) removes the client CPU-starvation question.
     INSTANCE_TYPE="${INSTANCE_TYPE:-i4i.2xlarge}"
     EST_CLUSTER_HOURLY="~\$2.7-2.8/hr on-demand at the i4i.2xlarge default / ~\$11/hr at i4i.8xlarge (4 nodes; planning numbers)"
     ;;
@@ -471,24 +426,17 @@ esac
 
 # Preset-dependent defaults (an explicit env value always wins — see the
 # config block notes on roles, AMI kernel floors, and artifact glibc).
-[ "$SYMMETRIC" = "0" ] || [ "$SYMMETRIC" = "1" ] || die "SYMMETRIC must be 0 or 1 (got: $SYMMETRIC)"
-if [ "$SYMMETRIC" = "1" ] && [ "$PRESET" != "mw" ]; then
-  die "SYMMETRIC=1 is the mw preset's shape (PRESET=mw SYMMETRIC=1 N_CLIENT=<writer nodes>)"
-fi
+[ "$SYMMETRIC" = "1" ] || die "SYMMETRIC=$SYMMETRIC: the symmetric fleet is the mw preset's ONLY shape since the PR-14 flip (the authority + co-writer recipe is retired) — leave SYMMETRIC unset or 1"
 if [ "$PRESET" = "mw" ]; then
   N_MDS="${N_MDS:-1}"
   N_OSS="${N_OSS:-2}"
-  if [ "$SYMMETRIC" = "1" ]; then
-    # N_CLIENT = the WRITER NODE COUNT (one symmetric writer per node);
-    # the smallest multi-node shape is the default.
-    N_CLIENT="${N_CLIENT:-2}"
-    [[ "$N_CLIENT" =~ ^[0-9]+$ ]] && [ "$N_CLIENT" -ge 2 ] ||
-      die "SYMMETRIC=1 needs N_CLIENT >= 2 writer nodes (a one-node symmetric set is the solo mount every local venue already measures; got: $N_CLIENT)"
-    # (EST_CLUSTER_HOURLY for this shape is set below, once N_TOTAL is known
-    # — it prices EVERY node, not 3 + N_CLIENT.)
-  else
-    N_CLIENT="${N_CLIENT:-1}"
-  fi
+  # N_CLIENT = the WRITER NODE COUNT (one symmetric writer per node);
+  # the smallest multi-node shape is the default.
+  N_CLIENT="${N_CLIENT:-2}"
+  [[ "$N_CLIENT" =~ ^[0-9]+$ ]] && [ "$N_CLIENT" -ge 2 ] ||
+    die "PRESET=mw needs N_CLIENT >= 2 writer nodes (a one-node symmetric set is the solo mount every local venue already measures; got: $N_CLIENT)"
+  # (EST_CLUSTER_HOURLY for this shape is set below, once N_TOTAL is known
+  # — it prices EVERY node, not 3 + N_CLIENT.)
   N_SPARE="${N_SPARE:-0}"
   AMI_SSM_PARAM="${AMI_SSM_PARAM:-/aws/service/canonical/ubuntu/server/26.04/stable/current/amd64/hvm/ebs-gp3/ami-id}"
   ARTIFACT_DIR="${ARTIFACT_DIR:-dist/ubuntu2604}"
@@ -511,7 +459,7 @@ case "$INSTANCE_TYPE" in
 esac
 
 N_TOTAL=$((N_MDS + N_OSS + N_CLIENT + N_SPARE))
-if [ "$PRESET" = "mw" ] && [ "$SYMMETRIC" = "1" ]; then
+if [ "$PRESET" = "mw" ]; then
   # EVERY node bills — N_MDS + N_OSS + N_CLIENT + N_SPARE. The previous
   # `3 + N_CLIENT` priced the default 1 mds + 2 oss only: the 2026-09-24
   # cloud row launched 17 nodes (N_OSS=8) while its typed-YES line read
@@ -730,14 +678,6 @@ role_of() { # role_of <name> -> mds|oss|client|spare
   esac
 }
 
-mw_shape_check() { # the MW fleet knobs, validated before anything costly
-  [ "$SYMMETRIC" = "1" ] && return 0   # the symmetric shape has no co-writers (sym_shape_check)
-  [[ "$MW_COWRITERS" =~ ^[0-9]+$ ]] && [ "$MW_COWRITERS" -ge 2 ] \
-    || die "MW_COWRITERS must be an integer >= 2 (the s11-mpiio leg's floor; got: $MW_COWRITERS)"
-  [[ "$MW_IOR_PROCS" =~ ^[0-9]+$ ]] && [ "$MW_IOR_PROCS" -ge 1 ] && [ "$MW_IOR_PROCS" -le 16 ] \
-    || die "MW_IOR_PROCS must be 1..16 (the leg's --procs range; got: $MW_IOR_PROCS)"
-}
-
 # ---------------------------------------------------------------------------
 # Global EXIT trap — one handler covers launch (partial-resource cleanup),
 # full (best-effort teardown on mid-run failure), and bench (spot-monitor
@@ -782,11 +722,7 @@ launch_preflight() {
     fi
   fi
   if [ "$PRESET" = "mw" ]; then
-    if [ "$SYMMETRIC" = "1" ]; then
-      sym_preflight
-    else
-      mw_shape_check
-    fi
+    sym_preflight
   fi
 }
 
@@ -1012,7 +948,7 @@ cmd_deploy() {
       if [ "$PRESET" = "mw" ]; then
         # The MW row's instrument is the pinned ior the s11-mpiio leg builds
         # ON the client — elbencho only matters if you also run `bench`.
-        warn "no dynamic elbencho at $ELBENCHO_BIN — the elbencho battery (bench) is unavailable on this cluster; bench-mw is unaffected"
+        warn "no dynamic elbencho at $ELBENCHO_BIN — the elbencho battery (bench) is unavailable on this cluster; bench-sym is unaffected"
       else
         die "elbencho artifact missing: $ELBENCHO_BIN (must be a DYNAMIC build)"
       fi
@@ -1088,7 +1024,7 @@ EOS
 
 # ---------------------------------------------------------------------------
 # Shared assemble machinery — ONE copy each of the fabric-step scripts, so
-# assemble and assemble-mw can never diverge on them. Every script is
+# assemble and assemble-sym can never diverge on them. Every script is
 # parameterized purely via env and fed to `remote` from a variable, so the
 # dry-run print and the real run can never diverge either.
 # ---------------------------------------------------------------------------
@@ -1425,248 +1361,8 @@ cmd_assemble() {
 }
 
 # ---------------------------------------------------------------------------
-# assemble-mw — the MULTI-WRITER fleet shape (PRESET=mw): the same fabric
-# steps as assemble (prologue, instance-store shares, single-path connect,
-# format with client instance-store staging), DIVERGING at the mount into
-# the tests/cluster_reset_v5_mw.sh recipe — 1 authority at $MOUNTPOINT +
-# $MW_COWRITERS co-writers at $MOUNTPOINT-cw1..K, CO-LOCATED on client0
-# (default NVMe host identity: no per-mount hostnqn/hostid, no
-# fabric_endpoint records, no host-scoped-subsystem kernel — patch 0030 is
-# multi-identity-only). Two hard kernel floors, both probed loud (never
-# trusted from the AMI): client FUSE-over-io_uring (mainline v6.14+) and
-# storage-node nvmet Persistent Reservations (v6.13+ — the S9 arm refuses
-# non-PR substrates). Idempotent: re-running reaps the fleet and rebuilds
-# from scratch (fresh format — data is destroyed).
-# ---------------------------------------------------------------------------
-cmd_assemble_mw() {
-  require_local_tools
-  load_state --placeholder-ok
-  mw_shape_check
-  local fleet_share
-  fleet_share="${MW_FLEET_SHARE:-$((1 + MW_COWRITERS))}"
-  confirm "assemble-mw REFORMATS the cluster volumes (any prior benchmark data on $CID is destroyed) and mounts 1 authority + $MW_COWRITERS co-writer daemons on client0."
-
-  local client_ip
-  client_ip="$(node_pub client0)"
-
-  log "assemble-mw 1/6: client kernel floor — FUSE-over-io_uring (v6.14+)"
-  remote "$client_ip" <<'EOS'
-set -euo pipefail
-modprobe fuse 2>/dev/null || true
-[ -e /sys/module/fuse/parameters/enable_uring ] || {
-  echo "FATAL: client kernel $(uname -r) lacks FUSE-over-io_uring (no /sys/module/fuse/parameters/enable_uring; mainline v6.14+ needed) — every SqueezeFS mount requires the transport. Remedy: launch with the mw preset's default Ubuntu 26.04 AMI (AMI_SSM_PARAM) or any v6.14+ kernel." >&2
-  exit 1
-}
-echo "client kernel $(uname -r): fuse.enable_uring present"
-EOS
-
-  log "assemble-mw 2/6: client prologue — unmount fleet + disconnect survivors (idempotency)"
-  remote "$client_ip" SQZ="$REMOTE_DIR/squeezefs" MNT="$MOUNTPOINT" NQN_PREFIX="$NQN_PREFIX" \
-    <<<"$CLIENT_PROLOGUE_SCRIPT"
-
-  log "assemble-mw 3/6: storage nodes — instance-store share + nvmet PR assert (resv_enable=1; v6.13+ floor)"
-  share_storage_nodes
-  assert_storage_pr
-
-  log "assemble-mw 4/6: client — single-path connect, PR verify (nvme resv-report per data namespace), format"
-  remote "$client_ip" \
-    SQZ="$REMOTE_DIR/squeezefs" MNT="$MOUNTPOINT" CACHE="$CACHE_DIR" \
-    META_SPECS="$SHARED_META_SPECS" DATA_SPECS="$SHARED_DATA_SPECS" \
-    MOUNT_EXTRA_STR="$(printf '%s' "$MW_MOUNT_EXTRA" | tr ' ' ',')" \
-    MW_PR_VERIFY=1 MW_SKIP_MOUNT=1 \
-    <<<"$CLIENT_FABRIC_SCRIPT"
-
-  log "assemble-mw 5/6: mount the multi-writer fleet — authority + $MW_COWRITERS co-writers (FLEET_SHARE=$fleet_share, MW port $MW_PORT)"
-  # The v5-mw §5 recipe, co-located on client0: authority phase-1 arm (no
-  # roster) -> per-co-writer enrollment-id probes (each mount attempt is
-  # REFUSED at rung 3; the refusal prints the durable id the roster needs;
-  # gather_admission mutates nothing before rung 5, so the probe is
-  # side-effect-free) -> re-arm the authority with the harvested roster
-  # (enrollment is the AUTHORITY's durable act, a new era) -> mount the
-  # admitted co-writers. SUDO_* is scrubbed from every daemon launch so the
-  # daemon posture (mount ownership, admin-lane identity) is
-  # root-deterministic regardless of sudo-vs-root-shell (the admin lane
-  # admits peercred uid 0 — src/ipc_host.rs). Every mount readiness-gates on
-  # its own log lines + .stats posture — a silently-degraded arm is
-  # contractually impossible.
-  remote "$client_ip" \
-    SQZ="$REMOTE_DIR/squeezefs" MNT="$MOUNTPOINT" \
-    COWRITERS="$MW_COWRITERS" FLEET_SHARE="$fleet_share" \
-    MW_PORT="$MW_PORT" MEMBERSHIP_BIND="$MW_MEMBERSHIP_BIND" \
-    RANGE_CUSTODY="$MW_RANGE_CUSTODY" \
-    MOUNT_EXTRA_STR="$(printf '%s' "$MW_MOUNT_EXTRA" | tr ' ' ',')" <<'EOS'
-set -euo pipefail
-die() { echo "FATAL: $*" >&2; exit 1; }
-[ -s /etc/squeezefs-bench-meta-uri ] || die "no recorded meta URI — the connect/format step did not run"
-META_URI="$(cat /etc/squeezefs-bench-meta-uri)"
-read -ra EXTRA <<<"$(printf '%s' "$MOUNT_EXTRA_STR" | tr ',' ' ')"
-AUTH_LOG=/tmp/sqz-mw-authority.log
-
-# One flattened stats-inode field (the JSON nests under "metrics") — the
-# v5-mw / mw_fleet stat_field helper verbatim.
-stat_field() { # mountpoint key -> value
-  cat "$1/.stats" | python3 -c '
-import json, sys
-def flat(d, out, pfx=""):
-    for k, v in d.items():
-        if isinstance(v, dict): flat(v, out, pfx + k + ".")
-        else: out[pfx + k] = v
-    return out
-root = json.load(sys.stdin)
-print(flat(root.get("metrics", root), {}).get(sys.argv[1], ""))' "$2"
-}
-
-wait_for() { # description tries cmd...
-  local what="$1" tries="$2" i
-  shift 2
-  for ((i = 0; i < tries; i++)); do
-    "$@" >/dev/null 2>&1 && return 0
-    sleep 0.5
-  done
-  die "timed out waiting for $what"
-}
-
-poll_stat() { # mountpoint key want tries what
-  local mnt="$1" key="$2" want="$3" tries="$4" what="$5" v i
-  v=""
-  for ((i = 0; i < tries; i++)); do
-    v="$(stat_field "$mnt" "$key" 2>/dev/null || true)"
-    [ "$v" = "$want" ] && return 0
-    sleep 0.5
-  done
-  die "$what: $key='$v' (want $want)"
-}
-
-unmount_and_reap() { # mountpoint (idempotent — v5-mw verbatim)
-  local mnt="$1" pid t
-  pid="$(pgrep -f "squeezefs mount .* $mnt( |$)" | head -1 || true)"
-  if awk -v m="$mnt" '$2==m {f=1} END {exit !f}' /proc/mounts; then
-    env -u SUDO_UID -u SUDO_GID -u SUDO_USER "$SQZ" umount "$mnt" >/dev/null 2>&1 || true
-  fi
-  if awk -v m="$mnt" '$2==m {f=1} END {exit !f}' /proc/mounts; then
-    umount -l "$mnt" 2>/dev/null || true
-  fi
-  wait_for "unmount of $mnt" 60 bash -c "! awk -v m='$mnt' '\$2==m {f=1} END {exit !f}' /proc/mounts"
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    for ((t = 0; t < 20; t++)); do
-      kill -0 "$pid" 2>/dev/null || break
-      sleep 0.5
-    done
-    kill -9 "$pid" 2>/dev/null || true
-  fi
-}
-
-MW_ENDPOINT=""
-mount_authority() { # [roster] — phase-1 arm, or the roster re-arm (a new era)
-  local roster="${1:-}"
-  local env_args=(env -u SUDO_UID -u SUDO_GID -u SUDO_USER
-    "SQUEEZEFS_FLEET_SHARE=$FLEET_SHARE"
-    "SQUEEZEFS_IPC_ALLOW_DEV=1"
-    "SQUEEZEFS_MEMBERSHIP_BIND=$MEMBERSHIP_BIND"
-    "SQUEEZEFS_MULTI_WRITER=1"
-    "SQUEEZEFS_MW_BIND=0.0.0.0:$MW_PORT")
-  [ -n "$roster" ] && env_args+=("SQUEEZEFS_MW_MEMBERS=$roster")
-  mkdir -p "$MNT"
-  "${env_args[@]}" "$SQZ" mount "$META_URI" "$MNT" \
-    --daemon "${EXTRA[@]}" --log-file "$AUTH_LOG" \
-    >/tmp/sqz-mw-authority.mount.out 2>&1 ||
-    die "authority mount failed: $(cat /tmp/sqz-mw-authority.mount.out)"
-  wait_for "authority mountpoint" 120 mountpoint -q "$MNT"
-  wait_for "authority stats inode" 120 test -s "$MNT/.stats"
-  # Rung-8 engagement gates (mw_fleet mount_member verbatim): the WERO hold
-  # must stand (fence-mode gauge + the acquire log line) and the S6 plane
-  # must own — a silently-degraded arm is contractually impossible, so a
-  # miss here is a refusal we somehow did not see; die loud either way.
-  poll_stat "$MNT" data_plane_fence_mode 1 120 \
-    "authority: the S7 WERO hold did not engage (log: $AUTH_LOG)"
-  grep -q "data-plane WERO (rtype 3) acquired" "$AUTH_LOG" ||
-    die "authority log carries no 'data-plane WERO (rtype 3) acquired' line (log: $AUTH_LOG)"
-  poll_stat "$MNT" membership_mode owner 120 \
-    "authority: the S6 membership plane did not engage (log: $AUTH_LOG)"
-  MW_ENDPOINT="$(sed -n 's/.*MULTI-WRITER ARMED (DLM S9) on \(.*\): era.*/\1/p' "$AUTH_LOG" | tail -1)"
-  [ -n "$MW_ENDPOINT" ] ||
-    die "authority log carries no 'MULTI-WRITER ARMED (DLM S9) on <endpoint>' line (log: $AUTH_LOG)"
-  echo "  authority up at $MNT (WERO held, membership owner, MW endpoint $MW_ENDPOINT)"
-}
-
-cowriter_env() { # -> the co-writer daemon env (v5-mw / mw_fleet verbatim)
-  echo env -u SUDO_UID -u SUDO_GID -u SUDO_USER \
-    "SQUEEZEFS_FLEET_SHARE=$FLEET_SHARE" \
-    "SQUEEZEFS_IPC_ALLOW_DEV=1" \
-    "SQUEEZEFS_MULTI_WRITER=1" \
-    "SQUEEZEFS_MW_ROLE=co-writer" \
-    "SQUEEZEFS_MW_AUTHORITY=$MW_ENDPOINT" \
-    "$([ "$RANGE_CUSTODY" = "1" ] && echo SQUEEZEFS_RANGE_CUSTODY=1 || echo SQUEEZEFS_RANGE_CUSTODY=0)"
-}
-
-probe_cowriter_id() { # mountpoint probe-out probe-log -> echoes the enrollment id
-  local mnt="$1" out="$2" plog="$3" id
-  mkdir -p "$mnt"
-  # A co-writer mount against a roster that does not name it is REFUSED at
-  # rung 3, and the refusal prints this mountpoint's durable enrollment id
-  # (KD-MW-2 node_{16 hex}.m{8 hex}). gather_admission mutates nothing
-  # before rung 5 — the probe is side-effect-free. cowriter_env is a
-  # deliberate word list.
-  if $(cowriter_env) "$SQZ" mount "$META_URI" "$mnt" \
-    --daemon "${EXTRA[@]}" --log-file "$plog" >"$out" 2>&1; then
-    die "co-writer PROBE mount at $mnt was ADMITTED against an empty roster — rung 3 did not engage (out: $out)"
-  fi
-  id="$(grep -o "Add 'node_[0-9a-f.m]*'" "$out" | head -1 | sed "s/^Add '//; s/'$//")"
-  [ -n "$id" ] || die "co-writer probe refusal at $mnt carries no enrollment id (want the rung-3 \"Add 'node_...'\" remedy; out: $out)"
-  echo "$id"
-}
-
-mount_cowriter() { # idx
-  local i="$1" mnt clog
-  mnt="$MNT-cw$i"
-  clog="/tmp/sqz-mw-cw$i.log"
-  mkdir -p "$mnt"
-  # Rung-9 engagement (v5-mw verbatim): the five-rung ladder ADMITTED and
-  # the mount is the co-writer posture, never a silently-degraded one.
-  $(cowriter_env) "$SQZ" mount "$META_URI" "$mnt" \
-    --daemon "${EXTRA[@]}" --log-file "$clog" \
-    >"/tmp/sqz-mw-cw$i.mount.out" 2>&1 ||
-    die "co-writer $i mount failed: $(cat "/tmp/sqz-mw-cw$i.mount.out")"
-  wait_for "co-writer $i mountpoint" 120 mountpoint -q "$mnt"
-  wait_for "co-writer $i stats inode" 120 test -s "$mnt/.stats"
-  grep -q "CO-WRITER ADMITTED" "$clog" ||
-    die "co-writer $i log carries no 'CO-WRITER ADMITTED' line — the admission ladder did not engage (log: $clog)"
-  poll_stat "$mnt" mount_posture co-writer 40 "co-writer $i posture (log: $clog)"
-  poll_stat "$mnt" membership_mode member 120 "co-writer $i: the S6 join did not engage (log: $clog)"
-  echo "  co-writer $i up at $mnt (ADMITTED, posture=co-writer, membership=member)"
-}
-
-mount_authority
-ROSTER=""
-for ((i = 1; i <= COWRITERS; i++)); do
-  id="$(probe_cowriter_id "$MNT-cw$i" "/tmp/sqz-mw-cw$i.probe.out" "/tmp/sqz-mw-cw$i.probe.log")"
-  echo "  co-writer $i enrollment id harvested: $id"
-  ROSTER="${ROSTER:+$ROSTER,}$id"
-done
-echo "  re-arming the authority with the roster (a new era): $ROSTER"
-unmount_and_reap "$MNT"
-mount_authority "$ROSTER"
-for ((i = 1; i <= COWRITERS; i++)); do
-  mount_cowriter "$i"
-done
-MOUNT_LIST="$MNT"
-for ((i = 1; i <= COWRITERS; i++)); do MOUNT_LIST="$MOUNT_LIST,$MNT-cw$i"; done
-echo "MW fleet ready: SQZ_MWMATRIX_MOUNTS=$MOUNT_LIST"
-EOS
-
-  log "assemble-mw 6/6: build_commit verification ritual across ALL mounts"
-  local mounts_csv i
-  mounts_csv="$MOUNTPOINT"
-  for ((i = 1; i <= MW_COWRITERS; i++)); do mounts_csv="$mounts_csv,$MOUNTPOINT-cw$i"; done
-  verify_build_commit "$client_ip" "$mounts_csv"
-  echo
-  echo "MW fleet assembled: authority $MOUNTPOINT + $MW_COWRITERS co-writers ($MOUNTPOINT-cw1..cw$MW_COWRITERS) on client0."
-  echo "Next: PRESET=mw tests/cloud_bench_cluster.sh bench-mw"
-}
-
-# ---------------------------------------------------------------------------
-# assemble-sym — the SYMMETRIC fleet shape (PRESET=mw SYMMETRIC=1): the same
-# fabric steps as assemble-mw, DIVERGING at the format into
+# assemble-sym — the SYMMETRIC fleet shape (PRESET=mw): the same
+# fabric steps as assemble, DIVERGING at the format into
 # `format --symmetric` and at the mount into ONE symmetric writer PER CLIENT
 # NODE — the MANAGER on client0 (the D0 winner), a JOINED writer on
 # client1..N-1 through the join ladder (design-symmetric-metadata §7.3; PR
@@ -1687,7 +1383,6 @@ sym_client_names() { # every client node name, client0 first
 }
 
 sym_shape_check() {
-  [ "$SYMMETRIC" = "1" ] || die "this subcommand is the symmetric shape's — pass SYMMETRIC=1 (or --symmetric) with PRESET=mw N_CLIENT=<writer nodes>"
   [[ "$SYM_PORT" =~ ^[0-9]+$ ]] && [ "$SYM_PORT" -ge 1024 ] && [ "$SYM_PORT" -le 65535 ] \
     || die "SYM_PORT must be a port in 1024..65535 (got: $SYM_PORT)"
   [ "$SYM_TOKEN_READER" = "0" ] || [ "$SYM_TOKEN_READER" = "1" ] || die "SYM_TOKEN_READER must be 0 or 1"
@@ -2181,7 +1876,7 @@ echo \"  manager pr_registrants_per_namespace (the daemon's REGCTL read, 10 s he
   fi
   echo
   echo "Symmetric fleet assembled: manager ${clients[0]}:$MOUNTPOINT (serving on $mgr_ep) + $((n - 1)) joined writer(s) on ${clients[*]:1}$([ "$SYM_TOKEN_READER" = "1" ] && echo " + token reader ${clients[0]}:$SYM_READER_MNT")."
-  echo "Next: PRESET=mw SYMMETRIC=1 N_CLIENT=$N_CLIENT tests/cloud_bench_cluster.sh bench-sym"
+  echo "Next: PRESET=mw N_CLIENT=$N_CLIENT tests/cloud_bench_cluster.sh bench-sym"
 }
 
 # ---------------------------------------------------------------------------
@@ -2556,127 +2251,6 @@ EOS
 }
 
 # ---------------------------------------------------------------------------
-# bench-mw — the s11-mpiio shared-vs-disjoint MPI-IO ior row over the MW
-# fleet (assemble-mw first). Pushes tests/run_mw_matrix.sh to the client
-# under a repo-shaped dir and drives its EXTERNAL-MOUNTS mode as root: the
-# leg builds the pinned ior 4.0.0 on the client (sha256-checked, from
-# github over the client's internet), self-sizes a >=60 s sustained window,
-# gates shared >= 0.8x disjoint in BOTH internal A-B-B-A brackets, verifies
-# engagement exactly, and runs the warm fsck/C8 oracle. Rows are pulled
-# back under $RESULTS_ROOT/<ts>/ with the house labeling: a cloud row is
-# measured-real over a real nvme-tcp network but a THIRD substrate class —
-# never spliced into devsub loop/tcp medians (docs/rc-manifest.md tiers).
-# ---------------------------------------------------------------------------
-cmd_bench_mw() {
-  require_local_tools
-  load_state --placeholder-ok
-  mw_shape_check
-  CLIENT_IP="$(node_pub client0)"
-
-  local ts
-  ts="$(date +%Y-%m-%d-%H%M%S)"
-  BENCH_DIR="$RESULTS_ROOT/$ts"
-  if $DRY_RUN; then
-    echo "(dry-run: results would land in $BENCH_DIR — nothing is written)"
-  else
-    mkdir -p "$BENCH_DIR"
-  fi
-
-  local mounts_csv i
-  mounts_csv="$MOUNTPOINT"
-  for ((i = 1; i <= MW_COWRITERS; i++)); do mounts_csv="$mounts_csv,$MOUNTPOINT-cw$i"; done
-
-  log "bench-mw: fleet-liveness + client toolchain preflight"
-  remote "$CLIENT_IP" MNTS="$mounts_csv" <<'EOS'
-set -euo pipefail
-IFS=, read -ra MS <<<"$MNTS"
-for m in "${MS[@]}"; do
-  mountpoint -q "$m" || { echo "MW fleet not assembled: $m is not mounted (run assemble-mw)" >&2; exit 1; }
-done
-for t in mpirun mpicc curl gcc make python3; do
-  command -v "$t" >/dev/null 2>&1 || { echo "client lacks $t — re-run: PRESET=mw tests/cloud_bench_cluster.sh deploy" >&2; exit 1; }
-done
-echo "fleet live (${#MS[@]} mounts), MPI toolchain present"
-EOS
-
-  log "bench-mw: push tests/run_mw_matrix.sh (repo-shaped: the leg derives REPO from its own dirname/.. and builds ior into REPO/target/mw-ior)"
-  push "$(dirname "$SCRIPT_PATH")/run_mw_matrix.sh" "$CLIENT_IP" "$REMOTE_DIR/repo/tests/run_mw_matrix.sh"
-
-  local row_cmd
-  row_cmd="SQZ_BIN=$REMOTE_DIR/squeezefs SQZ_MWMATRIX_MOUNTS=$mounts_csv SQZ_MWMATRIX_ROWDIR=$REMOTE_DIR/mw-rows bash $REMOTE_DIR/repo/tests/run_mw_matrix.sh s11-mpiio --procs=$MW_IOR_PROCS"
-  mw_manifest() {
-    echo "cluster=$CID preset=$PRESET instance_type=$INSTANCE_TYPE az=$AWS_AZ region=$AWS_REGION market=$MARKET placement=$PLACEMENT_STRATEGY"
-    echo "row=s11-mpiio shared-vs-disjoint (tests/run_mw_matrix.sh external-mounts mode)"
-    echo "fleet: 1 authority + $MW_COWRITERS co-writers co-located on client0; mounts=$mounts_csv; procs/mount=$MW_IOR_PROCS"
-    echo "instrument=pinned ior 4.0.0 + mpirun (exact versions printed by the leg in the row output)"
-    echo "substrate=aws-$MARKET/$INSTANCE_TYPE/$AWS_AZ (instance-store NVMe over nvmet-tcp, single NIC) — cloud substrate, a THIRD class: never spliced into devsub loop/tcp medians (docs/rc-manifest.md tiers)"
-    echo "repo_commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
-    echo "discipline: spot interruption mid-row => COUNT ABORTED, restart from zero (never splice)"
-    echo "ts=$ts"
-  }
-  mw_row_stamp() { # the house labeling discipline, MW face
-    echo "# row=s11-mpiio-shared-vs-disjoint"
-    echo "# order=$BENCH_ORDER"
-    echo "# instrument=pinned ior 4.0.0 + mpirun (exact versions in the leg output below)"
-    echo "# substrate=aws-$MARKET/$INSTANCE_TYPE/$AWS_AZ/pg-$PLACEMENT_STRATEGY (instance-store NVMe over nvmet-tcp, single NIC) — cloud substrate (third class — never spliced into devsub medians)"
-    echo "# venue=cloud-bench-cluster/$PRESET cluster=$CID cowriters=$MW_COWRITERS procs=$MW_IOR_PROCS"
-    echo "# ts=$(date -u +%FT%TZ)"
-    echo "# cmd=$row_cmd"
-  }
-
-  log "bench-mw: s11-mpiio row -> $BENCH_DIR"
-  spot_monitor_start
-  assert_fleet_running
-  BENCH_ORDER=1
-  local rowfile="$BENCH_DIR/01-s11-mpiio-shared-vs-disjoint.txt"
-  if $DRY_RUN; then
-    echo "-- manifest.txt would contain:"; mw_manifest | sed 's/^/   /'
-    mw_row_stamp                                    # shown, not written
-    printf '  (row output would be captured to %s)\n' "$rowfile"
-    remote "$CLIENT_IP" <<EOS
-set -euo pipefail
-mkdir -p "$REMOTE_DIR/mw-rows" "$REMOTE_DIR/repo/target"
-$row_cmd
-EOS
-  else
-    mw_manifest >"$BENCH_DIR/manifest.txt"
-    mw_row_stamp >"$rowfile"
-    # EVIDENCE BEFORE VERDICT (2026-08-19 lesson: a failing row died under
-    # set -e before the pull below ever ran, and the teardown then
-    # destroyed the on-cluster A1.out that named the failure): capture the
-    # row's rc, pull the artifacts UNCONDITIONALLY, and only then fail.
-    row_rc=0
-    remote "$CLIENT_IP" <<EOS | tee -a "$rowfile" || row_rc=$?
-set -euo pipefail
-mkdir -p "$REMOTE_DIR/mw-rows" "$REMOTE_DIR/repo/target"
-$row_cmd
-EOS
-  fi
-  spot_monitor_stop
-
-  log "bench-mw: pull rows + fleet logs"
-  if ! $DRY_RUN; then
-    # --log-file is 0600 root (VAL-7h): stage world-readable copies inside
-    # the rows dir so the unprivileged scp below can carry everything home.
-    remote "$CLIENT_IP" ROWDIR="$REMOTE_DIR/mw-rows" <<'EOS'
-set -euo pipefail
-mkdir -p "$ROWDIR/logs"
-for f in /tmp/sqz-mw-*.log /tmp/sqz-mw-*.mount.out /tmp/sqz-mw-*.probe.out; do
-  [ -f "$f" ] && install -m 0644 "$f" "$ROWDIR/logs/" || true
-done
-chmod -R a+rX "$ROWDIR"
-EOS
-  fi
-  run scp -r "${SSH_OPTS[@]}" -i "$SSH_KEY_FILE" \
-    "$REMOTE_USER@$CLIENT_IP:$REMOTE_DIR/mw-rows" "$BENCH_DIR/mw-rows"
-  [ "${row_rc:-0}" -eq 0 ] \
-    || die "s11-mpiio row FAILED (rc=$row_rc) — artifacts pulled to $BENCH_DIR/mw-rows before this verdict (evidence before verdict)"
-  assert_fleet_running   # the row counts only if the fleet survived it
-  echo
-  echo "s11-mpiio row complete. Results: $BENCH_DIR (stamped row + manifest; per-phase ior outputs, stats snapshots and fsck report under mw-rows/; fleet verified running end-to-end — count valid)"
-}
-
-# ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------
 cmd_status() {
@@ -2822,7 +2396,7 @@ cmd_teardown() {
 
 # ---------------------------------------------------------------------------
 # full — launch -> deploy -> assemble -> bench -> teardown (PRESET=mw swaps
-# in assemble-mw/bench-mw). The global EXIT trap best-effort-tears-down on
+# in assemble-sym/bench-sym). The global EXIT trap best-effort-tears-down on
 # any failure past a successful launch.
 # ---------------------------------------------------------------------------
 cmd_full() {
@@ -2830,12 +2404,9 @@ cmd_full() {
   cmd_launch
   ASSUME_YES=true       # the cost confirmation already happened at launch
   cmd_deploy
-  if [ "$PRESET" = "mw" ] && [ "$SYMMETRIC" = "1" ]; then
+  if [ "$PRESET" = "mw" ]; then
     cmd_assemble_sym
     cmd_bench_sym
-  elif [ "$PRESET" = "mw" ]; then
-    cmd_assemble_mw
-    cmd_bench_mw
   else
     cmd_assemble
     cmd_bench
@@ -2851,10 +2422,10 @@ case "$SUBCMD" in
   launch)            cmd_launch ;;
   deploy)            cmd_deploy ;;
   assemble)          cmd_assemble ;;
-  assemble-mw)       cmd_assemble_mw ;;
+  assemble-mw | bench-mw)
+    die "$SUBCMD: RETIRED at the symmetric default flip (PR 14) — the authority + co-writer recipe (tests/cluster_reset_v5_mw.sh, SQUEEZEFS_MULTI_WRITER / SQUEEZEFS_MW_ROLE / SQUEEZEFS_MW_AUTHORITY / SQUEEZEFS_MW_MEMBERS) is gone; every RW mount of a set is a WRITER through the join ladder. Use assemble-sym / bench-sym (PRESET=mw N_CLIENT=<writer nodes>)" ;;
   assemble-sym)      cmd_assemble_sym ;;
   bench)             cmd_bench ;;
-  bench-mw)          cmd_bench_mw ;;
   bench-sym)         cmd_bench_sym ;;
   sym-hook)          cmd_sym_hook ;;
   status)            cmd_status ;;

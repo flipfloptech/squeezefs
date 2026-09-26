@@ -475,7 +475,7 @@ impl MetaShipService {
 
     /// The backend this owner executes against (the mutation gate's
     /// ptr-eq identity — a foreign instance must never be gated by
-    /// another mount's host, the `daemon_verb_router` law).
+    /// another mount's host).
     pub(crate) fn inner(&self) -> &Arc<RoutedMetaBackend> {
         &self.inner
     }

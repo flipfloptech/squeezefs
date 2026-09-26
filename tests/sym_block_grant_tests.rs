@@ -808,7 +808,7 @@ async fn a_death_record_revokes_the_dead_writers_grants_into_the_quarantine() {
 /// GRANTED WINDOW — the production arm acquires the data volume's
 /// allocation lease first-come and installs the grant arm; a second
 /// writer's allocator (its window fed by the holder over the wire) mints
-/// disjoint ranges; `block_grants` > 0, the S9 lane family flat; a writer's
+/// disjoint ranges; `block_grants` > 0; a writer's
 /// terminal free clears the bit at the holder (the holder's own allocator
 /// has no local free list under the plane — the bitmap IS the free list),
 /// and a wire writer's frees are re-homed to the holder's endpoint.
@@ -829,9 +829,6 @@ async fn an_armed_two_writer_set_allocates_disjoint_ranges_from_grants() {
         1
     );
     assert!(a.block_grant_armed(), "the armed mount mints from grants");
-    let lanes = &squeezefs::fuse_client::METRICS;
-    let lane_writers = lanes.alloc_lane_writers.load(Ordering::Relaxed);
-    let lane_reservations = lanes.alloc_lane_reservations.load(Ordering::Relaxed);
     let holding = alloc_lease::holding(DATA_TAG).expect("held");
     // Writer B: another daemon's allocator on the same data volume, its
     // window topped up through the manager's wire venue.
@@ -871,16 +868,6 @@ async fn an_armed_two_writer_set_allocates_disjoint_ranges_from_grants() {
     for blk in mine_a.iter().chain(mine_b.iter()) {
         assert!(holding.bitmap.is_set(*blk), "minted block {blk} not SET");
     }
-    assert_eq!(
-        lanes.alloc_lane_writers.load(Ordering::Relaxed),
-        lane_writers,
-        "the S9 partition stays disengaged"
-    );
-    assert_eq!(
-        lanes.alloc_lane_reservations.load(Ordering::Relaxed),
-        lane_reservations,
-        "the lane family stays flat"
-    );
     // A's terminal free clears the bit at the holder and never lands on a
     // local free list: the next mint is a GRANTED block, never the freed
     // one off the list with its bit clear.
@@ -891,7 +878,7 @@ async fn an_armed_two_writer_set_allocates_disjoint_ranges_from_grants() {
     let next = a.allocate_block().await.unwrap() / a.chunk_size();
     assert!(holding.bitmap.is_set(next), "a mint whose bit is CLEAR");
     // B's frees are re-homed: the free target for this data volume is the
-    // holder's venue (what `cowriter::ship_displaced_frees` ships to).
+    // holder's venue (what `shipped_free::ship_displaced_frees` ships to).
     assert_eq!(
         free_target_for(DATA_TAG).as_deref(),
         Some(endpoint.as_str())
@@ -1641,7 +1628,7 @@ async fn an_armed_holders_supply_terms_read_the_window_and_the_clear_population(
     assert_eq!(a.free_blocks_count(), 0);
     assert_eq!(holding.bitmap.population(), DATA_BLOCKS);
     assert_eq!(a.free_supply_blocks(), 0, "genuinely full");
-    assert_eq!(a.lane_reachable_blocks(), 0);
+    assert_eq!(a.reachable_free_blocks(), 0);
     // 100 terminal frees: the bits clear at the holder — that IS the
     // supply, though the flat list stays empty and the tail stays 0.
     for off in &minted[..100] {
@@ -1666,7 +1653,7 @@ async fn an_armed_holders_supply_terms_read_the_window_and_the_clear_population(
         100,
         "the clear population is the supply"
     );
-    assert_eq!(a.lane_reachable_blocks(), 100);
+    assert_eq!(a.reachable_free_blocks(), 100);
     // One mint carves a grant into the holes (or consumes the one the
     // proactive ask carved): supply = the window's remainder + the clear
     // population, exactly one block fewer — and the window's ask reached
@@ -2404,7 +2391,7 @@ async fn sim1_at_the_operating_point_12500_members_over_64_shards() {
 /// the route for a volume the plane does not name), and on the holder a
 /// terminal free clears the bit at `finish_free` — journaled as a CLEAR
 /// delta at once, written to the pages at the checkpoint, which then
-/// COVERS it. (The production route — `cowriter::ship_displaced_frees`
+/// COVERS it. (The production route — `shipped_free::ship_displaced_frees`
 /// to the holder's venue, the allocator's own terminal free — is driven
 /// by `an_armed_two_writer_set_allocates_disjoint_ranges_from_grants`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2912,6 +2899,91 @@ fn the_data_bitmap_is_thirty_two_kib_per_tib() {
     assert_eq!(squeezefs::data_alloc_bitmap::pages_for(DATA_BLOCKS), 1);
 }
 
+/// **PR 14 (the default flip's mount-class migration)**: every plain mount
+/// is an armed writer, so a clean `umount` followed by a mount of the SAME
+/// volume at ANOTHER mount point on the same host — a different KD-MW-2
+/// mount slot, the shape every mount-class suite takes with its `mnt` /
+/// `mnt2` pair — is a same-node SUCCESSOR of the allocation lease. The
+/// record survives a clean leave by design (the same identity re-holds
+/// it), so the successor takes the same-node takeover: the D0 flock this
+/// open holds proves the predecessor MANAGER dead, whatever mount slot it
+/// carried. The takeover judged "the predecessor is page 0's identity"
+/// off a directory read taken AFTER this open's join had rewritten page 0
+/// with its OWN identity — so the record's holder matched nothing and
+/// the arm refused `Busy` ("a live writer of another mount") for every
+/// remount at a new mount point. The witness is the identity page 0
+/// carried at OPEN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clean_leave_then_a_mount_at_another_mount_point_of_the_same_host_arms() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let a = data_allocator(DATA_ID).await;
+    let uris = format_stamped_set(dir.path(), 1).await;
+    let slot_before = squeezefs::writer_scope::mount_slot();
+    squeezefs::writer_scope::set_mount_identity(0x1401, "/mnt/pr14-a");
+    let routed = open_armed(&uris).await;
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&routed, &[Arc::clone(&a)])
+            .await
+            .unwrap(),
+        1
+    );
+    let holder_a = identity_of(&routed.volumes[0]);
+    assert_eq!(holder_a.mount_slot, 0x1401);
+    let first = a.allocate_block().await.unwrap() / a.chunk_size();
+    // The CLEAN leave: the record stays (the same identity re-holds it),
+    // the holdings are forgotten.
+    shutdown(&routed).await;
+    park_gate::test_reset();
+    test_clear_holdings();
+    let rec = routed.volumes[0]
+        .alloc_lease_record(DATA_TAG)
+        .await
+        .unwrap()
+        .expect("the record survives a clean leave");
+    assert_eq!(rec.holder, holder_a);
+    drop(routed);
+
+    // The same host, ANOTHER mount point: a different mount slot.
+    squeezefs::writer_scope::set_mount_identity(0x1402, "/mnt/pr14-b");
+    let a2 = data_allocator(DATA_ID).await;
+    let routed2 = open_armed(&uris).await;
+    let me2 = identity_of(&routed2.volumes[0]);
+    assert_eq!(me2.mount_slot, 0x1402);
+    assert_ne!(me2.mount_slot, holder_a.mount_slot);
+    let armed = alloc_lease::arm_symmetric_allocation(&routed2, &[Arc::clone(&a2)])
+        .await
+        .unwrap_or_else(|e| {
+            panic!("the successor at another mount point must arm (the predecessor is dead by the flock): {e}")
+        });
+    assert_eq!(armed, 1);
+    let rec2 = routed2.volumes[0]
+        .alloc_lease_record(DATA_TAG)
+        .await
+        .unwrap()
+        .expect("the successor's record");
+    assert_eq!(rec2.holder, me2, "the lease moved to the successor");
+    assert!(
+        rec2.term > rec.term,
+        "a successor term: {} > {}",
+        rec2.term,
+        rec.term
+    );
+    let h2 = alloc_lease::holding(DATA_TAG).expect("held by the successor");
+    // The predecessor's minted-but-unpublished block is the LEAK the
+    // re-hold releases; the successor mints again from the same floor.
+    let again = a2.allocate_block().await.unwrap() / a2.chunk_size();
+    assert!(h2.bitmap.is_set(again));
+    assert!(
+        again <= first + 1,
+        "the successor mints from the derived floor: {again} vs {first}"
+    );
+    shutdown(&routed2).await;
+    squeezefs::writer_scope::set_mount_identity(slot_before, "/mnt/pr14-a");
+    reset_process_state();
+}
+
 /// PR 10 (found by the `sym-crash` fleet leg's first round — PR 8's crash
 /// path): a crashed incarnation's grant window is RAM, so after a kill
 /// its granted-but-unminted tail and its minted-but-unpublished blocks
@@ -3002,7 +3074,7 @@ async fn a_crashed_incarnations_window_remainder_is_released_at_the_rehold() {
 /// superseded overlay destination / failed-publish upload through
 /// `abandon_unpublished_offset`; before it the arm fell through to the
 /// allocator's `free_block`, whose `plane_gate` refused with one ERROR +
-/// one `cowriter_accounting_refusals` per abandoned mint (the sym-walls
+/// one `accounting_plane_refusals` per abandoned mint (the sym-walls
 /// rewrite row) and left the block SET in the holder's bitmap for the
 /// deferred leak release. Now: `GrantWindow::give_back` — the block is
 /// unconsumed again (the next lowest-first mint takes it, the leave's
@@ -3036,14 +3108,14 @@ async fn a_joined_appenders_never_published_mint_returns_to_its_grant_window() {
     assert_eq!(second / chunk, 101);
     assert_eq!(b.block_grant_remaining(), 2);
     let m = &squeezefs::fuse_client::METRICS;
-    let refusals = m.cowriter_accounting_refusals.load(Ordering::Relaxed);
+    let refusals = m.accounting_plane_refusals.load(Ordering::Relaxed);
     let recycles = m.block_grant_window_recycles.load(Ordering::Relaxed);
-    let abandons = m.cowriter_unpublished_abandons.load(Ordering::Relaxed);
+    let abandons = m.unpublished_mint_abandons.load(Ordering::Relaxed);
     // The never-published FIRST mint is abandoned: back into the window,
     // merged onto the unconsumed range's low side.
     b.abandon_unpublished_offset(first).await.unwrap();
     assert_eq!(
-        m.cowriter_accounting_refusals.load(Ordering::Relaxed),
+        m.accounting_plane_refusals.load(Ordering::Relaxed),
         refusals,
         "the allocator's gate was never reached"
     );
@@ -3066,7 +3138,7 @@ async fn a_joined_appenders_never_published_mint_returns_to_its_grant_window() {
         recycles + 1
     );
     assert_eq!(
-        m.cowriter_unpublished_abandons.load(Ordering::Relaxed),
+        m.unpublished_mint_abandons.load(Ordering::Relaxed),
         abandons + 1
     );
     // The recycled block is the next lowest-first mint; the window then

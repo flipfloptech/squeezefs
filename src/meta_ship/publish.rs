@@ -136,7 +136,7 @@ use std::sync::Arc;
 ///
 /// **7 since the owner-partitioned block-ref population read landed**
 /// (finding 13, per-volume claim admission PR 8): `BlockRefPopulation` +
-/// [`PublishReply::Populations`] joined — the shipped-free validation
+/// `PublishReply::Populations` joined (both retired at 18) — the shipped-free validation
 /// reads the ledger where the ledger LIVES (each volume's owner), because
 /// a 6-speaker set authority answered a peer's shipped free from its own
 /// lagged snapshot of the peer's volume (the `NonTerminal` strand / false
@@ -249,11 +249,13 @@ use std::sync::Arc;
 /// mismatch refuses loud at the first frame (KD-7 same-commit fleets).
 ///
 /// **18 since PR 14 (the symmetric default flip)**: the request frame's
-/// PK4 `pack_group` flag, the reply frame's lane-free notices and the
-/// lane verbs (`RaiseAllocLane`, `LaneHarvest`) left with the co-writer
-/// posture — a 17-speaker would decode the frame one field short and
-/// misread every call after it; the mismatch refuses loud instead (KD-7
-/// same-commit fleets).
+/// PK4 `pack_group` flag, the reply frame's lane-free notices, the lane
+/// verbs (`RaiseAllocLane`, `LaneHarvest`) and the owner-partitioned
+/// `BlockRefPopulation` read (a D20 recipe's — every armed writer counts a
+/// block's references over the trees it MAINTAINS) left with the co-writer
+/// and per-volume-owner postures — a 17-speaker would decode the frame one
+/// field short and misread every call after it; the mismatch refuses loud
+/// instead (KD-7 same-commit fleets).
 pub const PUBLISH_SCHEMA: u32 = 18;
 
 /// First verb of S9's publish block. S3's ping is 0, S8's metadata verbs
@@ -514,30 +516,6 @@ pub enum PublishCall {
         /// The witness's other half.
         request_id: u64,
     },
-    /// **The durable reference population of blocks, answered from the
-    /// volumes the SERVING node owns** — the owner-partitioned read half
-    /// of the shipped-free validation (finding 13, per-volume claim
-    /// admission PR 8; contracts `tests/pv_shipped_free_ledger_tests.rs`).
-    ///
-    /// Under D20 the `TREE_BLOCK_REFS` ledger is DISTRIBUTED: a partial
-    /// authority's layout publishes commit on its OWN volumes, so a peer's
-    /// copy of those volumes is a lagged reader snapshot, and validating a
-    /// shipped free against it answers from state the owner has already
-    /// moved — a released reference still counted (`NonTerminal` forever,
-    /// the leg's ship=128/serve=0 strand) or a fresh reference invisible
-    /// (a false `Freed`, §6.3's destructive face). The read therefore
-    /// SHIPS to each volume's owner, and the serve answers for its OWNED
-    /// volumes only — the reply is scoped, never refused, which is why
-    /// this verb names no inos.
-    ///
-    /// Pure read (the `XattrValueCap`/`ReaddirStream` class): no era
-    /// gate, no witness, transport-resend-safe.
-    BlockRefPopulation {
-        /// The durable data-volume identity (KD-5, as above).
-        vol_tag: u64,
-        /// Dense block indices — `TREE_BLOCK_REFS`'s own key grain.
-        block_idxs: Vec<u64>,
-    },
     /// **The kvmap crossing train, shipped** (PB-class files PR 2 —
     /// design-kvmap-block-map-tree §3/A4, the finding-36b whole-claim-set
     /// law): a co-writer cannot commit metadata, so its beyond-inline
@@ -604,7 +582,6 @@ impl PublishCall {
             Self::FreeBlocks { .. } => "free_blocks",
             Self::WriteExtent { .. } => "write_extent",
             Self::FlushExtents { .. } => "flush_extents",
-            Self::BlockRefPopulation { .. } => "block_ref_population",
             Self::MigrateBlockMap { .. } => "migrate_block_map",
         }
     }
@@ -627,9 +604,7 @@ impl PublishCall {
             | Self::WriteExtent { lease_epoch, .. }
             | Self::FlushExtents { lease_epoch, .. }
             | Self::MigrateBlockMap { lease_epoch, .. } => Some(*lease_epoch),
-            Self::XattrValueCap { .. }
-            | Self::ReaddirStream { .. }
-            | Self::BlockRefPopulation { .. } => None,
+            Self::XattrValueCap { .. } | Self::ReaddirStream { .. } => None,
         }
     }
 
@@ -696,10 +671,7 @@ impl PublishCall {
         self.witness().is_some()
             || matches!(
                 self,
-                Self::FreeBlocks { .. }
-                    | Self::XattrValueCap { .. }
-                    | Self::ReaddirStream { .. }
-                    | Self::BlockRefPopulation { .. }
+                Self::FreeBlocks { .. } | Self::XattrValueCap { .. } | Self::ReaddirStream { .. }
             )
     }
 
@@ -764,10 +736,6 @@ impl PublishCall {
             Self::FreeBlocks { .. } => {
                 vec![1]
             }
-            // The reply is SCOPED to the serving node's owned volumes by
-            // construction (finding 13), so the authority screen is
-            // inapplicable: any owner answers for what it owns.
-            Self::BlockRefPopulation { .. } => Vec::new(),
         }
     }
 }
@@ -828,9 +796,6 @@ pub enum PublishReply {
     Page(Vec<(u64, WireDirEntry)>),
     /// `free_blocks`: one verdict per shipped block, in request order.
     FreeVerdicts(Vec<FreeVerdict>),
-    /// `block_ref_population`: per-index reference populations summed over
-    /// the SERVING node's owned volumes, in request order.
-    Populations(Vec<u64>),
     /// `migrate_block_map` (kvmap PR 2): the served train's accounting —
     /// the shipper's ledger counters read the OWNER's truth, and
     /// `preexisting` is the A1 resumed verdict's input. Since schema 12
@@ -924,9 +889,6 @@ impl PublishCall {
                 }
                 Self::WriteExtent { data, .. } => 5 * INT_HINT + bytes(data.len()),
                 Self::FlushExtents { .. } => 3 * INT_HINT,
-                Self::BlockRefPopulation { block_idxs, .. } => {
-                    INT_HINT + INT_HINT + block_idxs.len() * INT_HINT
-                }
                 Self::MigrateBlockMap {
                     layout,
                     entries,
@@ -1091,11 +1053,11 @@ fn lose_reply_for_test(frame: &PublishRequestFrame) -> bool {
         return false;
     }
     let layout_class = frame.calls.iter().all(|c| {
-            matches!(
-                c,
-                PublishCall::SetLayoutAndSize { .. } | PublishCall::MergeLayoutAndSize { .. }
-            )
-        });
+        matches!(
+            c,
+            PublishCall::SetLayoutAndSize { .. } | PublishCall::MergeLayoutAndSize { .. }
+        )
+    });
     if !layout_class {
         return false;
     }
@@ -1528,7 +1490,8 @@ impl PublishClient {
         // so a saturated authority backpressures its clients instead of
         // growing a queue without limit; a stuck one surfaces as the
         // wire's reply timeout on the frame, never as unbounded queueing.
-        let (tx, rx) = squeezefs_ipc::sqz_channel::mpsc::channel::<Submission>(frame_call_cap() * 8);
+        let (tx, rx) =
+            squeezefs_ipc::sqz_channel::mpsc::channel::<Submission>(frame_call_cap() * 8);
         let lane = Arc::new(PublishLane { tx });
         let spawn_drain = || {
             let shared = Arc::new(LaneShared {
@@ -1605,7 +1568,6 @@ impl PublishClient {
             ))
         })?
     }
-
 }
 
 /// One lane's drain: form frames from whatever is queued the moment a
@@ -3288,11 +3250,12 @@ fn free_executor() -> Option<FreeExecutor> {
 /// block on its free list, in the freed-offset grace ring or in S7
 /// quarantine — the probes `execute_shipped_frees` already composes. A
 /// served layout publish whose frame TAKES such a block is refused
-/// [`PUBLISH_FREE_BLOCK_REFUSED`] before anything is staged: the authority
-/// has released that lifetime, and adopting it would make a co-writer's
-/// tenant a second owner of an offset the next mint hands out. Installed by
-/// the multi-writer AUTHORITY arm beside the binding witness; absent = no
-/// data plane wired (nothing to screen against).
+/// [`PUBLISH_FREE_BLOCK_REFUSED`] before anything is staged: this mount
+/// has released that lifetime, and adopting it would make a peer's tenant
+/// a second owner of an offset the next mint hands out. Installed by
+/// `multi_writer::arm_authority_planes` on every armed writer with a data
+/// plane (`shipped_free::router_released_block_probe`); absent = no data
+/// plane wired (nothing to screen against).
 pub type ReleasedBlockProbe = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
 
 static RELEASED_BLOCK_PROBE: Lazy<arc_swap::ArcSwapOption<ReleasedBlockProbe>> =
@@ -3620,49 +3583,6 @@ pub async fn ship_free_blocks(
             "free_blocks",
             &format!("{other:?}"),
             "per-block free verdicts",
-        )),
-    }
-}
-
-/// **Ship one block-ref population read** to the owner at `endpoint` —
-/// the owner-partitioned half of
-/// [`crate::cowriter::durable_block_refcounts_with`] (finding 13): the
-/// answer is the peer's LIVE-tree count over the volumes it owns, in
-/// request order.
-///
-/// Pure read, transport-resend-safe; a failure is returned loud — the
-/// shipped-free serve that needed it refuses rather than validating
-/// against a lagged local snapshot (the caller's retry ladder owns the
-/// leak-safe abandon).
-pub async fn ship_block_ref_population(
-    endpoint: &str,
-    vol_tag: u64,
-    block_idxs: Vec<u64>,
-) -> Result<Vec<u64>> {
-    let expected = block_idxs.len();
-    let Some(client) = CLIENT.load_full() else {
-        return Err(SqueezefsError::InvalidOperation(format!(
-            "S9: a block-reference population read for vol_tag {vol_tag:#016x} cannot be \
-             shipped — no publish client is installed. Answering from the local lagged \
-             snapshot instead would validate a free against state the volume's owner has \
-             already moved (finding 13), so this refuses"
-        )));
-    };
-    let call = PublishCall::BlockRefPopulation {
-        vol_tag,
-        block_idxs,
-    };
-    match client.ship(endpoint, call).await? {
-        PublishReply::Populations(counts) if counts.len() == expected => Ok(counts),
-        PublishReply::Populations(counts) => Err(SqueezefsError::InvalidOperation(format!(
-            "S9: the owner at {endpoint} answered {} population(s) for {expected} block \
-             index(es) — refusing a reply that cannot be paired with its request",
-            counts.len()
-        ))),
-        other => Err(protocol_error(
-            "block_ref_population",
-            &format!("{other:?}"),
-            "per-index reference populations",
         )),
     }
 }
@@ -4651,7 +4571,10 @@ impl PublishService {
                 })
             })
             .collect();
-        LayoutGroupRun { outcomes, committed }
+        LayoutGroupRun {
+            outcomes,
+            committed,
+        }
     }
 
     /// Serve one [`PublishCall::FreeBlocks`] through the dedup window: the
@@ -6118,31 +6041,6 @@ impl PublishService {
             }
             PublishCall::XattrValueCap { ino } => {
                 Ok(PublishReply::Cap(self.inner.xattr_value_cap(ino) as u64))
-            }
-            PublishCall::BlockRefPopulation {
-                vol_tag,
-                block_idxs,
-            } => {
-                // Finding 13: answered from the volumes THIS node holds
-                // authority over — its own peer-owned copies are lagged
-                // snapshots whose truth belongs to their owners, so they
-                // are deliberately not counted here.
-                let mut out = vec![0u64; block_idxs.len()];
-                for (v_idx, kv) in self.inner.volumes.iter().enumerate() {
-                    if !self.authority.get(v_idx).copied().unwrap_or(false) {
-                        continue;
-                    }
-                    for (slot, idx) in block_idxs.iter().enumerate() {
-                        out[slot] += kv.block_ref_count(vol_tag, *idx).await.map_err(|e| {
-                            SqueezefsError::InvalidOperation(format!(
-                                "S9: the block-reference population read failed on {} while \
-                                 serving a shipped-free validation: {e}",
-                                kv.device_path().display()
-                            ))
-                        })? as u64;
-                    }
-                }
-                Ok(PublishReply::Populations(out))
             }
             PublishCall::ReaddirStream { dir, offset, max } => {
                 let rows = self.inner.readdir_stream(dir, offset, max as usize).await?;

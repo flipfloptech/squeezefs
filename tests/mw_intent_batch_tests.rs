@@ -82,7 +82,6 @@ struct ArmGuard;
 
 impl Drop for ArmGuard {
     fn drop(&mut self) {
-        ship::uninstall_daemon_verb_router();
         ship::uninstall_delegation_host();
         ship::disarm_ownership();
         data_grant::uninstall_custody_client();
@@ -126,12 +125,11 @@ fn opts() -> squeezefs::meta_backend::kv::builder::FormatV3Options {
 struct Fixture {
     _dir: tempfile::TempDir,
     owner_be: Arc<RoutedMetaBackend>,
-    client_be: Arc<RoutedMetaBackend>,
     listener: Arc<cw::RpcListener>,
     svc: Arc<MetaShipService>,
     custody_client: Arc<WriteCustodyClient>,
     endpoint: String,
-    _router: Arc<MetaShipRouter>,
+    router: Arc<MetaShipRouter>,
     _arm: ArmGuard,
 }
 
@@ -144,7 +142,7 @@ async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let plan = plan_meta_slot_set(1).expect("derived plan");
     let p = make_file(dir.path(), "meta0", VOL_LEN);
-    squeezefs::meta_backend::kv::builder::format_v3_stamped(
+    squeezefs::meta_backend::kv::builder::format_v3_stamped_single_writer(
         &p,
         VOL_LEN,
         &opts(),
@@ -226,16 +224,14 @@ async fn fixture() -> Fixture {
     data_grant::install_custody_client(Arc::clone(&custody_client));
 
     let router = MetaShipRouter::new(Arc::clone(&client_be), NODE, SECRET.to_vec());
-    ship::install_daemon_verb_router(Arc::clone(&router));
     Fixture {
         _dir: dir,
         owner_be,
-        client_be,
         listener,
         svc,
         custody_client,
         endpoint,
-        _router: router,
+        router,
         _arm,
     }
 }
@@ -276,7 +272,7 @@ async fn earn_update(fx: &Fixture, dirname: &str) -> (u64, u64) {
     // its reply (the intent-lock law: acquisition rides the RPC the
     // client was already issuing).
     let grants0 = istats().update_grants;
-    let f0 = Metadata::create(fx.client_be.as_ref(), d, "f0", FILE, 0, 0)
+    let f0 = Metadata::create(fx.router.as_ref(), d, "f0", FILE, 0, 0)
         .await
         .expect("the grant-earning shipped create")
         .ino;
@@ -461,7 +457,7 @@ async fn an_update_grant_rides_the_first_shipped_create_and_mints_answer_locally
     // Local mints: no wire.
     let mut minted = Vec::new();
     for n in 0..8 {
-        let ino = Metadata::create(fx.client_be.as_ref(), d, &format!("m{n}"), FILE, 0, 0)
+        let ino = Metadata::create(fx.router.as_ref(), d, &format!("m{n}"), FILE, 0, 0)
             .await
             .expect("local mint")
             .ino;
@@ -486,18 +482,18 @@ async fn an_update_grant_rides_the_first_shipped_create_and_mints_answer_locally
     // Read-your-own-mints: lookup + getattr serve the pending image with
     // zero wire.
     let ship1 = ship::stats().shipped_verbs;
-    let looked = Metadata::lookup(fx.client_be.as_ref(), d, "m3")
+    let looked = Metadata::lookup(fx.router.as_ref(), d, "m3")
         .await
         .expect("pending lookup serves locally");
     assert_eq!(looked.ino, minted[3]);
-    let got = Metadata::getattr(fx.client_be.as_ref(), minted[3])
+    let got = Metadata::getattr(fx.router.as_ref(), minted[3])
         .await
         .expect("pending getattr serves locally");
     assert_eq!(got.ino, minted[3]);
     // The census-backed authoritative NEGATIVE (exclusivity makes it
     // exact): an absent name answers ENOENT with zero wire.
     let neg0 = istats().local_negatives;
-    let err = Metadata::lookup(fx.client_be.as_ref(), d, "never-created")
+    let err = Metadata::lookup(fx.router.as_ref(), d, "never-created")
         .await
         .expect_err("census negative");
     assert_eq!(
@@ -544,7 +540,7 @@ async fn an_update_grant_rides_the_first_shipped_create_and_mints_answer_locally
     }
     // Post-flush, the applied name still resolves for the minter (the
     // census remembers applied names; the serve ships — owner-current).
-    let looked = Metadata::lookup(fx.client_be.as_ref(), d, "m0")
+    let looked = Metadata::lookup(fx.router.as_ref(), d, "m0")
         .await
         .expect("applied name resolves for the minter");
     assert_eq!(looked.ino, minted[0]);
@@ -569,7 +565,7 @@ async fn supply_exhaustion_declines_to_ship_and_refills_on_flush() {
 
     // Two mints drain the pinned 2-ino chunk.
     for n in 0..2 {
-        Metadata::create(fx.client_be.as_ref(), d, &format!("s{n}"), FILE, 0, 0)
+        Metadata::create(fx.router.as_ref(), d, &format!("s{n}"), FILE, 0, 0)
             .await
             .expect("supplied mint");
     }
@@ -577,7 +573,7 @@ async fn supply_exhaustion_declines_to_ship_and_refills_on_flush() {
     // The third create DECLINES to mint (supply dry) and ships.
     let declines0 = istats().declines;
     let ship0 = ship::stats().shipped_verbs;
-    Metadata::create(fx.client_be.as_ref(), d, "s2", FILE, 0, 0)
+    Metadata::create(fx.router.as_ref(), d, "s2", FILE, 0, 0)
         .await
         .expect("the declined create ships and succeeds");
     assert!(istats().declines > declines0, "the dry pool declines");
@@ -589,7 +585,7 @@ async fn supply_exhaustion_declines_to_ship_and_refills_on_flush() {
     // (order: a shipped mutation naming a dir with pending intents flushes
     // before it ships), and the flush's supply_request refilled the pool.
     wait_for("the flush-carried refill", || istats().supply_remaining > 0).await;
-    Metadata::create(fx.client_be.as_ref(), d, "s3", FILE, 0, 0)
+    Metadata::create(fx.router.as_ref(), d, "s3", FILE, 0, 0)
         .await
         .expect("post-refill mint");
     shutdown(&fx).await;
@@ -612,7 +608,7 @@ async fn two_clients_racing_o_excl_holder_minted_first_never_double_acks() {
     let (d, _f0) = earn_update(&fx, "race-a").await;
 
     // A mints (the local O_EXCL ack).
-    let a_ino = Metadata::create(fx.client_be.as_ref(), d, "race", FILE, 0, 0)
+    let a_ino = Metadata::create(fx.router.as_ref(), d, "race", FILE, 0, 0)
         .await
         .expect("A's local mint acks")
         .ino;
@@ -695,7 +691,7 @@ async fn two_clients_racing_o_excl_recall_first_never_double_acks() {
         !intents::holds_update_authority(d)
     })
     .await;
-    let err = Metadata::create(fx.client_be.as_ref(), d, "race", FILE, 0, 0)
+    let err = Metadata::create(fx.router.as_ref(), d, "race", FILE, 0, 0)
         .await
         .expect_err("A's create of B's name must refuse");
     assert_eq!(
@@ -725,7 +721,7 @@ async fn an_injected_apply_enospc_surfaces_at_fsync_dir_and_destroys_the_local_m
     let fx = fixture().await;
     let (d, _f0) = earn_update(&fx, "enospc").await;
 
-    let ino = Metadata::create(fx.client_be.as_ref(), d, "doomed", FILE, 0, 0)
+    let ino = Metadata::create(fx.router.as_ref(), d, "doomed", FILE, 0, 0)
         .await
         .expect("the provisional ack")
         .ino;
@@ -752,13 +748,13 @@ async fn an_injected_apply_enospc_surfaces_at_fsync_dir_and_destroys_the_local_m
     // The destroyed mint no longer serves: the lookup misses the image
     // (and the owner never applied the name).
     assert!(
-        Metadata::lookup(fx.client_be.as_ref(), d, "doomed")
+        Metadata::lookup(fx.router.as_ref(), d, "doomed")
             .await
             .is_err(),
         "a stale local name must not survive the refusal"
     );
     assert!(
-        Metadata::getattr(fx.client_be.as_ref(), ino).await.is_err(),
+        Metadata::getattr(fx.router.as_ref(), ino).await.is_err(),
         "the destroyed image must not serve by ino"
     );
     assert!(
@@ -818,14 +814,14 @@ async fn a_foreign_negative_lookup_goes_positive_after_fsync_dir_within_the_publ
 
     // Earn the grant, then MINT the name locally.
     let grants0 = istats().update_grants;
-    Metadata::create(fx.client_be.as_ref(), d, "f0", FILE, 0, 0)
+    Metadata::create(fx.router.as_ref(), d, "f0", FILE, 0, 0)
         .await
         .expect("the grant-earning shipped create");
     wait_for("the UPDATE grant", || {
         istats().update_grants > grants0 && intents::holds_update_authority(d)
     })
     .await;
-    let ino = Metadata::create(fx.client_be.as_ref(), d, "appears", FILE, 0, 0)
+    let ino = Metadata::create(fx.router.as_ref(), d, "appears", FILE, 0, 0)
         .await
         .expect("the local mint")
         .ino;
@@ -882,7 +878,7 @@ async fn red_half_without_the_read_gate_a_foreign_lookup_misses_acked_names() {
     let (d, _f0) = earn_update(&fx, "oq2-red").await;
 
     ship::TEST_INTENT_READ_GATE.store(false, Ordering::SeqCst);
-    Metadata::create(fx.client_be.as_ref(), d, "hidden", FILE, 0, 0)
+    Metadata::create(fx.router.as_ref(), d, "hidden", FILE, 0, 0)
         .await
         .expect("the local ack");
     let results = ship_raw(
@@ -922,7 +918,7 @@ async fn a_foreign_read_recalls_the_update_grant_and_forces_the_flush() {
     let fx = fixture().await;
     let (d, _f0) = earn_update(&fx, "oq2").await;
 
-    let ino = Metadata::create(fx.client_be.as_ref(), d, "forced", FILE, 0, 0)
+    let ino = Metadata::create(fx.router.as_ref(), d, "forced", FILE, 0, 0)
         .await
         .expect("the local ack")
         .ino;
@@ -979,7 +975,7 @@ async fn a_replayed_intent_batch_answers_the_winner_and_never_double_applies() {
 
     // Reserve one supply ino through the real machinery: mint, then
     // capture the pending op's identity by flushing RAW twice.
-    let ino = Metadata::create(fx.client_be.as_ref(), d, "once", FILE, 0, 0)
+    let ino = Metadata::create(fx.router.as_ref(), d, "once", FILE, 0, 0)
         .await
         .expect("mint")
         .ino;
@@ -1199,14 +1195,14 @@ async fn a_setattr_on_a_pending_ino_defers_into_the_batch_and_applies_in_order()
     let fx = fixture().await;
     let (d, _f0) = earn_update(&fx, "utime").await;
 
-    let ino = Metadata::create(fx.client_be.as_ref(), d, "timed", FILE, 0, 0)
+    let ino = Metadata::create(fx.router.as_ref(), d, "timed", FILE, 0, 0)
         .await
         .expect("mint")
         .ino;
     let ship0 = ship::stats().shipped_verbs;
     let def0 = istats().deferred_setattrs;
     let updated = Metadata::setattr(
-        fx.client_be.as_ref(),
+        fx.router.as_ref(),
         ino,
         None,
         None,
@@ -1241,12 +1237,12 @@ async fn a_shipped_mutation_naming_pending_state_flushes_first() {
     let fx = fixture().await;
     let (d, _f0) = earn_update(&fx, "barrier").await;
 
-    let ino = Metadata::create(fx.client_be.as_ref(), d, "ephemeral", FILE, 0, 0)
+    let ino = Metadata::create(fx.router.as_ref(), d, "ephemeral", FILE, 0, 0)
         .await
         .expect("mint")
         .ino;
     let flushes0 = istats().flush_forces;
-    let gone = Metadata::unlink(fx.client_be.as_ref(), d, "ephemeral")
+    let gone = Metadata::unlink(fx.router.as_ref(), d, "ephemeral")
         .await
         .expect("the unlink barriers, flushes, then applies");
     assert_eq!(gone, ino, "the unlink removed the minted child");
@@ -1274,7 +1270,7 @@ async fn a_create_into_a_pending_directory_flushes_then_earns_its_own_grant() {
     let (d, _f0) = earn_update(&fx, "subtree").await;
 
     // The mkdir MINTS (a directory intent under D's grant).
-    let sub = Metadata::create(fx.client_be.as_ref(), d, "sub", DIR, 0, 0)
+    let sub = Metadata::create(fx.router.as_ref(), d, "sub", DIR, 0, 0)
         .await
         .expect("the mkdir intent")
         .ino;
@@ -1288,7 +1284,7 @@ async fn a_create_into_a_pending_directory_flushes_then_earns_its_own_grant() {
     );
     // The first create INTO the pending directory barriers + ships +
     // earns.
-    let f = Metadata::create(fx.client_be.as_ref(), sub, "first", FILE, 0, 0)
+    let f = Metadata::create(fx.router.as_ref(), sub, "first", FILE, 0, 0)
         .await
         .expect("the barriered create into the flushed directory")
         .ino;
@@ -1299,7 +1295,7 @@ async fn a_create_into_a_pending_directory_flushes_then_earns_its_own_grant() {
     .await;
     // Subsequent creates in the subdirectory mint locally.
     let ship0 = ship::stats().shipped_verbs;
-    Metadata::create(fx.client_be.as_ref(), sub, "second", FILE, 0, 0)
+    Metadata::create(fx.router.as_ref(), sub, "second", FILE, 0, 0)
         .await
         .expect("the local mint in the earned subdirectory");
     assert_eq!(ship::stats().shipped_verbs, ship0, "zero wire");
@@ -1327,7 +1323,7 @@ async fn an_unflushed_batch_dies_with_the_client_and_a_flushed_batch_is_durable(
     let (d, _f0) = earn_update(&fx, "mw8").await;
 
     // Flushed half: durable.
-    Metadata::create(fx.client_be.as_ref(), d, "durable", FILE, 0, 0)
+    Metadata::create(fx.router.as_ref(), d, "durable", FILE, 0, 0)
         .await
         .expect("mint");
     intents::fsync_dir_barrier(d)
@@ -1335,7 +1331,7 @@ async fn an_unflushed_batch_dies_with_the_client_and_a_flushed_batch_is_durable(
         .expect("the contract point");
 
     // Un-flushed half: acked, then the client DIES (state dropped).
-    Metadata::create(fx.client_be.as_ref(), d, "lost", FILE, 0, 0)
+    Metadata::create(fx.router.as_ref(), d, "lost", FILE, 0, 0)
         .await
         .expect("the provisional ack");
     intents::test_clear_intents(); // the process-death analog
@@ -1383,7 +1379,7 @@ async fn the_grant_ping_pong_storm_engages_the_valve_before_fanout_hurts() {
         if intents::holds_update_authority(d) {
             minted_rounds += 1;
         }
-        Metadata::create(fx.client_be.as_ref(), d, &format!("a{round}"), FILE, 0, 0)
+        Metadata::create(fx.router.as_ref(), d, &format!("a{round}"), FILE, 0, 0)
             .await
             .expect("A's storm create");
         let results = ship_raw(
@@ -1430,7 +1426,7 @@ async fn the_grant_ping_pong_storm_engages_the_valve_before_fanout_hurts() {
     );
     // Post-demotion the directory still WORKS — creates ship, exactly one
     // ack per name (the demoted posture is owner-served, never wedged).
-    Metadata::create(fx.client_be.as_ref(), d, "post-demotion", FILE, 0, 0)
+    Metadata::create(fx.router.as_ref(), d, "post-demotion", FILE, 0, 0)
         .await
         .expect("the demoted directory still serves");
     shutdown(&fx).await;
@@ -1506,7 +1502,7 @@ async fn the_lever_off_keeps_the_armed_plane_shipping_creates() {
     let grants0 = istats().update_grants;
     let ship0 = ship::stats().shipped_verbs;
     for n in 0..4 {
-        Metadata::create(fx.client_be.as_ref(), d, &format!("f{n}"), FILE, 0, 0)
+        Metadata::create(fx.router.as_ref(), d, &format!("f{n}"), FILE, 0, 0)
             .await
             .expect("the lever-off create ships");
     }

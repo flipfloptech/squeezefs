@@ -178,14 +178,14 @@ use std::time::Duration;
 /// mismatch is a loud handshake refusal rather than a member running the
 /// constant against a writer that advertised half of it. **3 since the
 /// grant carries the lane-supply hint PER DATA VOLUME**
-/// ([`crate::membership::Grant::lane_supply_volumes`], finding 15's fpp
+/// (the grant's `lane_supply_volumes`, finding 15's fpp
 /// residue, 2026-09-07): a 2-speaker's member would read the sum and never
 /// the vector — every volume falling back to the mount-wide law, the
 /// shipped shape, silently — and a 3-speaker's member against a 2-speaker
 /// authority would decode a trailing `Vec` from EOF; the mismatch refuses
 /// loud at the handshake (KD-7 same-commit fleets). **4 since the grant
 /// advertises the set authority's pack-group posture**
-/// ([`crate::membership::Grant::pack_group_available`], small-file packing
+/// (the grant's `pack_group_available`, small-file packing
 /// PR PK4): a 3-speaker's co-writer would read the flag as absent and run
 /// one-block-per-file for ever — the shipped PK2 shape, silently — and a
 /// 4-speaker against a 3-speaker authority would decode the trailing bool

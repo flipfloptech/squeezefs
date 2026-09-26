@@ -4953,7 +4953,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         println!(
                             "{}  ino {}  slot {}  volume {} (index {})",
-                            report.path, report.ino, report.slot, report.volume_id, report.volume_idx,
+                            report.path,
+                            report.ino,
+                            report.slot,
+                            report.volume_id,
+                            report.volume_idx,
                         );
                         match report.lessee {
                             Some(w) => println!(
@@ -6475,37 +6479,36 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // A SET authority arms here as the plane's OWNER — under D20 it is
             // the membership owner, which is why its own preflight only READ
             // the rendezvous record.
-            let mut membership_arm: Option<squeezefs::membership::MembershipArm> =
-                if joined_mount {
-                    // Symmetric PR 12b — rung 3 on a JOINED appender: a
-                    // WRITER MEMBER of the manager's shard, never an owner
-                    // (the manager is the set's S6 owner; a second owner
-                    // would be a second lease plane over one set).
-                    let arm = squeezefs::membership::arm_joined_member(
-                        &routed_meta_backend,
-                        Some(membership_purge.clone()),
-                    )
-                    .await
-                    .map_err(|e| format!("membership plane refused to arm: {e}"))?;
-                    if arm.is_none() {
-                        return Err("symmetric join ladder rung 3 (membership) refuses on a \
+            let mut membership_arm: Option<squeezefs::membership::MembershipArm> = if joined_mount {
+                // Symmetric PR 12b — rung 3 on a JOINED appender: a
+                // WRITER MEMBER of the manager's shard, never an owner
+                // (the manager is the set's S6 owner; a second owner
+                // would be a second lease plane over one set).
+                let arm = squeezefs::membership::arm_joined_member(
+                    &routed_meta_backend,
+                    Some(membership_purge.clone()),
+                )
+                .await
+                .map_err(|e| format!("membership plane refused to arm: {e}"))?;
+                if arm.is_none() {
+                    return Err("symmetric join ladder rung 3 (membership) refuses on a \
                                     joined appender: the manager serves no membership plane \
                                     on this set (its own ladder arms one at `auto`; \
                                     SQUEEZEFS_MEMBERSHIP_BIND=off on the manager is refused \
                                     there) — a writer that cannot be SEEN cannot be EVICTED"
-                            .to_string()
-                            .into());
-                    }
-                    arm
-                } else {
-                    squeezefs::membership::arm_mount_membership(
-                        &routed_meta_backend,
-                        reader_mount,
-                        Some(membership_purge.clone()),
-                    )
-                    .await
-                    .map_err(|e| format!("membership plane refused to arm: {e}"))?
-                };
+                        .to_string()
+                        .into());
+                }
+                arm
+            } else {
+                squeezefs::membership::arm_mount_membership(
+                    &routed_meta_backend,
+                    reader_mount,
+                    Some(membership_purge.clone()),
+                )
+                .await
+                .map_err(|e| format!("membership plane refused to arm: {e}"))?
+            };
             // Symmetric PR 12 — the join ladder's rung 3: an ARMED set whose
             // operator declared no membership bind arms its shard at `auto`
             // (the death ledger's writer is the S6 eviction — PR 10; an

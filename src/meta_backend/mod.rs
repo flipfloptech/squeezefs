@@ -4917,26 +4917,11 @@ impl RoutedMetaBackend {
 
 #[async_trait::async_trait]
 impl Metadata for RoutedMetaBackend {
-    // Rung 9 (the S8 arm): every verb of this impl consults the daemon
-    // verb-router hook (`meta_ship::daemon_verb_router`) at entry and
-    // delegates to the installed `MetaShipRouter` when the participant's
-    // volume has a FOREIGN owner — the co-writer daemon's mutations SHIP
-    // instead of refusing at the write gate, and its reads are
-    // owner-current (read-your-own-shipped-writes; S8 raw's honest RTT
-    // cost, spec §6.10 R1 — S10's delegation is the recovery). The hook is
-    // one relaxed load on every unarmed mount, and it lives HERE so no
-    // call site can bypass it (the S8-b falsifier is "any un-routed local
-    // commit"). Recursion-free by construction: the hook delegates exactly
-    // when the router would answer `Ship`, so the router's Local arm only
-    // executes when the hook answered `None` — with ONE deliberate
-    // carve-out, `".."` lookups, which both layers keep local (the
-    // reverse-dentry walk is not expressible on the wire until S10).
+    // Under the symmetric plane a foreign object's mutation is PR 6's
+    // intent (namespace verbs) or PR 13b's record ship (`record_ship`),
+    // both dispatched inside the verb bodies below; the retired co-writer
+    // daemon's verb-router hook (S8 rung 9) left with its posture (PR 14).
     async fn lookup(&self, parent: Ino, name: &str) -> Result<Inode> {
-        if name != ".." {
-            if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[parent]) {
-                return r.lookup(parent, name).await;
-            }
-        }
         // ".." — the FUSE_EXPORT_SUPPORT directory-handle reconnect path
         // (fstests generic/467): no parent pointer exists in the inode
         // record, so the parent resolves by reverse dentry scan — cold
@@ -5024,24 +5009,15 @@ impl Metadata for RoutedMetaBackend {
         gid: u32,
         rdev: u32,
     ) -> Result<Inode> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[parent]) {
-            return r.create_with_rdev(parent, name, mode, uid, gid, rdev).await;
-        }
         self.create_with_rdev_size(parent, name, mode, uid, gid, rdev, 0)
             .await
     }
 
     async fn unlink(&self, parent: Ino, name: &str) -> Result<Ino> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[parent]) {
-            return r.unlink(parent, name).await;
-        }
         self.redispatch_once_on_slot_moved("unlink", move || self.unlink_body(parent, name))
             .await
     }
     async fn link(&self, ino: Ino, new_parent: Ino, new_name: &str) -> Result<Inode> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino, new_parent]) {
-            return r.link(ino, new_parent, new_name).await;
-        }
         self.redispatch_once_on_slot_moved("link", move || {
             self.link_body(ino, new_parent, new_name)
         })
@@ -5055,11 +5031,6 @@ impl Metadata for RoutedMetaBackend {
         new_name: &str,
         flags: u32,
     ) -> Result<()> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[old_parent, new_parent]) {
-            return r
-                .rename(old_parent, old_name, new_parent, new_name, flags)
-                .await;
-        }
         if flags & (libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE)
             == (libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE)
         {
@@ -5169,9 +5140,6 @@ impl Metadata for RoutedMetaBackend {
     }
 
     async fn readdir(&self, dir: Ino, offset: u64, max: usize) -> Result<Vec<DirEntry>> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[dir]) {
-            return r.readdir(dir, offset, max).await;
-        }
         // Rung 13 — the OQ-2 read gate's LOCAL face (see the trait
         // lookup's note).
         crate::meta_ship::deleg_read_gate(self, dir).await;
@@ -5181,9 +5149,6 @@ impl Metadata for RoutedMetaBackend {
     // Takes a SHARED 4a lease internally — see the trait-level doc note
     // (VL8 item 6): exclusive-lease holders on the same stripe self-deadlock.
     async fn getattr(&self, ino: Ino) -> Result<Inode> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
-            return r.getattr(ino).await;
-        }
         self.getattr_local(ino).await
     }
 
@@ -5198,11 +5163,6 @@ impl Metadata for RoutedMetaBackend {
         mtime: Option<u64>,
         ctime: Option<u64>,
     ) -> Result<Inode> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
-            return r
-                .setattr(ino, mode, uid, gid, size, atime, mtime, ctime)
-                .await;
-        }
         // PR 13b: a foreign-slot record's mutation SHIPS to its slot holder
         // (the kernel's times echo excepted — answered from the holder's
         // exact record, never a wire trip for a no-op). The sync predicate
@@ -5246,9 +5206,6 @@ impl Metadata for RoutedMetaBackend {
     }
 
     async fn getxattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
-            return r.getxattr(ino, name).await;
-        }
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_ino).await;
@@ -5256,9 +5213,6 @@ impl Metadata for RoutedMetaBackend {
     }
 
     async fn setxattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
-            return r.setxattr(ino, name, value).await;
-        }
         // PR 13b: a foreign-slot record's xattr SHIPS to its slot holder.
         if self
             .ship_foreign_slot_xattr_verb(
@@ -5299,9 +5253,6 @@ impl Metadata for RoutedMetaBackend {
     }
 
     async fn removexattr(&self, ino: Ino, name: &str) -> Result<()> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
-            return r.removexattr(ino, name).await;
-        }
         // PR 13b: a foreign-slot record's xattr SHIPS to its slot holder.
         if self
             .ship_foreign_slot_xattr_verb(
@@ -5340,9 +5291,6 @@ impl Metadata for RoutedMetaBackend {
     }
 
     async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
-            return r.listxattr(ino).await;
-        }
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_ino).await;
@@ -5350,9 +5298,6 @@ impl Metadata for RoutedMetaBackend {
     }
 
     async fn destroy_inode(&self, ino: Ino) -> Result<()> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
-            return r.destroy_inode(ino).await;
-        }
         // S10 coherence law (rung 12): a destroyed record must not stay
         // servable under a grant (the unlink already recalled the parent;
         // this covers the object itself).
@@ -5715,7 +5660,6 @@ impl RoutedMetaBackend {
     /// is refused loud (its later occurrence) rather than serialized: two
     /// staged txs for one ino in one group would race on the RAM view.
     pub async fn set_layout_and_size_group(&self, items: Vec<LayoutPublish>) -> Vec<Result<()>> {
-
         let n = items.len();
         let mut results: Vec<Option<Result<()>>> = (0..n).map(|_| None).collect();
         if n == 0 {
@@ -5891,16 +5835,6 @@ impl RoutedMetaBackend {
         ino: Ino,
         refs: &[crate::meta_backend::kv::block_refs::BlockRef],
     ) -> Result<Vec<crate::meta_backend::kv::shared_refs::MarkOutcome>> {
-        if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
-            let owner = r
-                .owner_for_ino(ino)
-                .map(|o| o.endpoint.clone())
-                .unwrap_or_else(|| "a peer".to_string());
-            return Err(crate::error::SqueezefsError::InvalidOperation(format!(
-                "MarkShared: ino {ino} is owned by {owner} — the wire MarkShared at a foreign \
-                 slot holder lands with the symmetric program's PR 12"
-            )));
-        }
         let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
         let _gate = self.slot_gate_enter(&[ino]).await;
         let (v_idx, _local_ino) = self.route_ino(ino);

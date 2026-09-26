@@ -61,7 +61,7 @@ fn reset_process_state() {
 async fn enroll_manager(vol: &KvMetaBackend, endpoint: &str) {
     use squeezefs::membership::{MemberIdentity, MemberRole};
     let identity = MemberIdentity {
-        id: squeezefs::cowriter::node_member_id().expect("this node's member id"),
+        id: squeezefs::member_id::node_member_id().expect("this node's member id"),
         role: MemberRole::Writer,
         pid: std::process::id(),
         boot: squeezefs::meta_backend::kv::backend::read_boot_id(),
@@ -77,11 +77,11 @@ async fn enroll_manager(vol: &KvMetaBackend, endpoint: &str) {
 /// The joiner's identity: the manager's NODE (one host) at its own mount
 /// slot `n` — what tells N daemons' pages apart on one box.
 /// The session peer id a production joiner dials with — its MEMBER id
-/// derived from its identity (`cowriter::node_member_id()`); the manager's
+/// derived from its identity (`member_id::node_member_id()`); the manager's
 /// identity-carrying verbs bind the frame's identity to it (review round
 /// 1, Issue 6).
 fn peer_of(identity: &AppenderIdentity) -> String {
-    squeezefs::cowriter::node_member_id_of(identity.node_token, identity.mount_slot)
+    squeezefs::member_id::node_member_id_of(identity.node_token, identity.mount_slot)
 }
 
 async fn joiner_identity(manager: &KvMetaBackend, n: u32) -> AppenderIdentity {
@@ -1833,7 +1833,7 @@ async fn a_foreign_create_into_a_striped_directory_reads_the_stripes_record_at_i
     let j2vol = Arc::clone(&j2.volumes[0]);
     let _arm = squeezefs::data_grant::arm_slot_custody(
         &j2,
-        &squeezefs::cowriter::node_member_id_of(
+        &squeezefs::member_id::node_member_id_of(
             j2vol.joined_wire().unwrap().identity.node_token,
             j2vol.joined_wire().unwrap().identity.mount_slot,
         ),
@@ -2007,7 +2007,7 @@ async fn a_joiners_stat_of_a_striped_directory_folds_the_stripes_at_their_holder
     let j2vol = Arc::clone(&j2.volumes[0]);
     let _arm = squeezefs::data_grant::arm_slot_custody(
         &j2,
-        &squeezefs::cowriter::node_member_id_of(
+        &squeezefs::member_id::node_member_id_of(
             j2vol.joined_wire().unwrap().identity.node_token,
             j2vol.joined_wire().unwrap().identity.mount_slot,
         ),
@@ -2109,7 +2109,7 @@ async fn a_striped_directorys_stat_at_the_holder_survives_a_suppliers_death() {
     let for_arm = Arc::clone(&sink);
     let _arm = squeezefs::data_grant::arm_slot_custody(
         &manager,
-        &squeezefs::cowriter::node_member_id().expect("this node's member id"),
+        &squeezefs::member_id::node_member_id().expect("this node's member id"),
         VENUE_SECRET.to_vec(),
         0,
         Arc::new(move |_volume| {
@@ -2596,7 +2596,7 @@ async fn ships_into_a_striped_directory_feed_no_dominance_window() {
     let j2vol = Arc::clone(&j2.volumes[0]);
     let _arm = squeezefs::data_grant::arm_slot_custody(
         &j2,
-        &squeezefs::cowriter::node_member_id_of(
+        &squeezefs::member_id::node_member_id_of(
             j2vol.joined_wire().unwrap().identity.node_token,
             j2vol.joined_wire().unwrap().identity.mount_slot,
         ),
@@ -3878,7 +3878,7 @@ async fn the_managers_c1_walk_skips_the_slot_trees_a_live_joiner_leases() {
     let joiner = join_knobs(&knobs, &uris, &venue, &mvol, 92).await;
     let jvol = Arc::clone(&joiner.volumes[0]);
     let identity = jvol.joined_wire().unwrap().identity;
-    let member = squeezefs::cowriter::node_member_id_of(identity.node_token, identity.mount_slot);
+    let member = squeezefs::member_id::node_member_id_of(identity.node_token, identity.mount_slot);
     let JoinOutcome::Granted(_) = owner.join(JoinRequest {
         id: member.clone(),
         role: MemberRole::Writer,
@@ -4701,7 +4701,7 @@ async fn a_joiner_reads_foreign_slots_through_tokens_and_serves_the_managers_shi
     let for_arm = Arc::clone(&sink);
     let _arm = squeezefs::data_grant::arm_slot_custody(
         &joiner,
-        &squeezefs::cowriter::node_member_id_of(
+        &squeezefs::member_id::node_member_id_of(
             jvol.joined_wire().unwrap().identity.node_token,
             jvol.joined_wire().unwrap().identity.mount_slot,
         ),
@@ -4926,7 +4926,7 @@ async fn a_dead_joiners_half_applied_cross_owner_unlink_is_rolled_forward_at_the
     let for_arm = Arc::clone(&sink);
     let _arm = squeezefs::data_grant::arm_slot_custody(
         &joiner,
-        &squeezefs::cowriter::node_member_id_of(identity.node_token, identity.mount_slot),
+        &squeezefs::member_id::node_member_id_of(identity.node_token, identity.mount_slot),
         VENUE_SECRET.to_vec(),
         0,
         Arc::new(move |_volume| {
@@ -5020,7 +5020,7 @@ async fn arm_publish_writer(
     writer: &Arc<RoutedMetaBackend>,
     identity: &AppenderIdentity,
 ) -> Arc<squeezefs::data_grant::SlotCustodyArm> {
-    let member = squeezefs::cowriter::node_member_id_of(identity.node_token, identity.mount_slot);
+    let member = squeezefs::member_id::node_member_id_of(identity.node_token, identity.mount_slot);
     let sink = Arc::new(ProbeSink {
         calls: std::sync::atomic::AtomicU64::new(0),
     });
@@ -6114,7 +6114,7 @@ async fn a_roll_forwards_local_step_refused_slot_busy_past_the_bound_leaves_the_
     let for_arm = Arc::clone(&sink);
     let _arm = squeezefs::data_grant::arm_slot_custody(
         &joiner,
-        &squeezefs::cowriter::node_member_id_of(identity.node_token, identity.mount_slot),
+        &squeezefs::member_id::node_member_id_of(identity.node_token, identity.mount_slot),
         VENUE_SECRET.to_vec(),
         0,
         Arc::new(move |_volume| {
@@ -6241,7 +6241,7 @@ async fn a_daemon_that_joined_after_anothers_ladder_is_bound_on_demand_at_its_fi
     let for_arm = Arc::clone(&sink);
     let _arm = squeezefs::data_grant::arm_slot_custody(
         &j2,
-        &squeezefs::cowriter::node_member_id_of(
+        &squeezefs::member_id::node_member_id_of(
             j2vol.joined_wire().unwrap().identity.node_token,
             j2vol.joined_wire().unwrap().identity.mount_slot,
         ),
@@ -6383,7 +6383,8 @@ async fn a_peers_lookup_through_a_dead_holder_is_refused_inside_the_bound_and_ex
     let enroll = |ident: AppenderIdentity| {
         let owner = Arc::clone(&owner);
         move || {
-            let member = squeezefs::cowriter::node_member_id_of(ident.node_token, ident.mount_slot);
+            let member =
+                squeezefs::member_id::node_member_id_of(ident.node_token, ident.mount_slot);
             let JoinOutcome::Granted(_) = owner.join(JoinRequest {
                 id: member.clone(),
                 role: MemberRole::Writer,
@@ -6433,7 +6434,7 @@ async fn a_peers_lookup_through_a_dead_holder_is_refused_inside_the_bound_and_ex
     let for_arm = Arc::clone(&sink);
     let _arm = squeezefs::data_grant::arm_slot_custody(
         &j2,
-        &squeezefs::cowriter::node_member_id_of(
+        &squeezefs::member_id::node_member_id_of(
             j2vol.joined_wire().unwrap().identity.node_token,
             j2vol.joined_wire().unwrap().identity.mount_slot,
         ),
@@ -7042,7 +7043,7 @@ async fn a_re_holds_deferred_leaks_converge_on_the_live_peers_declared_windows()
     let joiner = join(&uris, &venue, &mvol, 72).await;
     let jvol = Arc::clone(&joiner.volumes[0]);
     let jwire = Arc::clone(jvol.joined_wire().expect("joined"));
-    let writer = squeezefs::cowriter::node_member_id_of(
+    let writer = squeezefs::member_id::node_member_id_of(
         jwire.identity.node_token,
         jwire.identity.mount_slot,
     );
@@ -7749,7 +7750,7 @@ async fn a_wire_holder_releases_a_slot_on_the_managers_notice_and_accepts_an_off
     let for_arm = Arc::clone(&sink);
     let _arm = squeezefs::data_grant::arm_slot_custody(
         &manager,
-        &squeezefs::cowriter::node_member_id_of(ident.node_token, 0),
+        &squeezefs::member_id::node_member_id_of(ident.node_token, 0),
         VENUE_SECRET.to_vec(),
         0,
         Arc::new(move |_volume| {
@@ -8325,7 +8326,7 @@ async fn the_managers_published_claim_set_entry_names_its_live_data_registrant_k
     let manager = open_under(&uris, &Knobs::armed()).await;
     let mvol = Arc::clone(&manager.volumes[0]);
     // Rung 3's shape: the node enrolled with NO key (no hold stands yet).
-    let node = squeezefs::cowriter::node_member_id().unwrap();
+    let node = squeezefs::member_id::node_member_id().unwrap();
     squeezefs::membership::upsert_writer_member(
         &mvol,
         &MemberIdentity {
@@ -8377,19 +8378,16 @@ async fn the_managers_published_claim_set_entry_names_its_live_data_registrant_k
     drop(manager);
 }
 
-/// **The manager's custody owner admits a joiner's JOIN with NO lane**
+/// **The manager's custody owner admits a joiner's JOIN with no lane word**
 /// (found by the fidelity tier's first real second daemon: every op on
 /// the joiner's mount answered EAGAIN because the owner's join gate read
-/// it as "not in this era's allocation partition"). Under the armed plane
-/// the S9 lane partition is SUPERSEDED by PR 8's block grants, so the
-/// owner runs NO partition at all — `arm_authority_planes` installs no
-/// lane map — and answers `(0, 1)` (SOLO, no partition) to every member;
-/// a map naming nobody (the first build's "SOLO") refused everyone. The
-/// owner's law pinned at its own door: with no map installed the join
-/// lands SOLO; with an empty map installed it refuses naming the
-/// partition.
+/// it as "not in this era's allocation partition"). Under the plane the
+/// S9 lane partition is gone — PR 8's block grants are every writer's
+/// allocation, and PR 14 deleted the partition with the co-writer posture,
+/// so the custody wire carries no lane pair (`CUSTODY_SCHEMA` 9): the
+/// owner has no map to refuse on and every member's JOIN lands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_custody_owner_with_no_lane_map_admits_every_joiner_solo() {
+async fn a_custody_owner_admits_every_joiner_with_no_lane_word() {
     use squeezefs::data_grant::{JoinFrame, WriteCustodyOwner, CUSTODY_SCHEMA};
     use squeezefs::membership::{LeaseClock, LeaseClocks};
     let clocks = LeaseClocks::with_params(
@@ -8415,22 +8413,26 @@ async fn a_custody_owner_with_no_lane_map_admits_every_joiner_solo() {
     };
     let lease = owner
         .join(&join("node_joiner.m1"))
-        .expect("no partition: every member joins SOLO");
-    assert_eq!(
-        (lease.writer_lane, lease.writers),
-        (0, 1),
-        "SOLO — no partition"
-    );
-    // The first build's shape: a map naming NOBODY refuses everyone.
-    owner.install_lane_assignment(
-        squeezefs::alloc_lane_grant::LaneAssignment::derive("", &[]).expect("derives"),
-    );
-    let err = owner
+        .expect("every member joins — there is no partition to refuse on");
+    assert_eq!(lease.term, 7);
+    let lease2 = owner
         .join(&join("node_joiner.m2"))
-        .err()
-        .map(|e| e.to_string())
-        .expect("an empty map refuses");
-    assert!(err.contains("allocation partition"), "{err}");
+        .expect("a second member joins the same way");
+    assert!(
+        lease2.epoch > lease.epoch,
+        "lease epochs mint monotonically"
+    );
+    assert_eq!(
+        serde_json::to_value(lease)
+            .expect("the frame serializes")
+            .as_object()
+            .expect("an object")
+            .keys()
+            .filter(|k| k.contains("lane") || k.as_str() == "writers")
+            .count(),
+        0,
+        "the custody lease carries no lane word"
+    );
 }
 
 /// Restore the process-global reservation overrides after a contract.
@@ -8771,7 +8773,7 @@ async fn the_managers_census_takes_no_verdict_over_a_live_joiners_stale_projecte
         membership::install_owner(Arc::clone(&owner));
         let ident = jvol.joined_wire().unwrap().identity;
         let JoinOutcome::Granted(_) = owner.join(JoinRequest {
-            id: squeezefs::cowriter::node_member_id_of(ident.node_token, ident.mount_slot),
+            id: squeezefs::member_id::node_member_id_of(ident.node_token, ident.mount_slot),
             role: MemberRole::Writer,
             endpoint: None,
             pid: std::process::id(),
@@ -10187,7 +10189,7 @@ async fn a_cold_ls_of_a_striped_directory_at_a_token_reader_pays_one_token_per_s
     let for_arm = Arc::clone(&sink);
     let _arm = squeezefs::data_grant::arm_slot_custody(
         &manager,
-        &squeezefs::cowriter::node_member_id().expect("this node's member id"),
+        &squeezefs::member_id::node_member_id().expect("this node's member id"),
         VENUE_SECRET.to_vec(),
         0,
         Arc::new(move |_volume| {
@@ -12131,7 +12133,7 @@ async fn a_grow_ring_re_asked_after_a_lost_reply_carves_once_and_the_death_path_
     );
     // A frame from a session whose authenticated peer is ANOTHER member id
     // names a colleague's page: rejected, nothing carved.
-    let other = squeezefs::cowriter::node_member_id_of(identity.node_token ^ 0x5a5a, 7);
+    let other = squeezefs::member_id::node_member_id_of(identity.node_token ^ 0x5a5a, 7);
     let refused = mvol.manager_grow_ring_wire(id, want, &other).await;
     assert!(
         matches!(
@@ -15081,7 +15083,7 @@ async fn a_joiners_forget_of_a_foreign_slots_ino_prices_no_destroy_and_reclaims_
     let for_arm = Arc::clone(&sink);
     let _arm = squeezefs::data_grant::arm_slot_custody(
         &joiner,
-        &squeezefs::cowriter::node_member_id_of(
+        &squeezefs::member_id::node_member_id_of(
             jvol.joined_wire().unwrap().identity.node_token,
             jvol.joined_wire().unwrap().identity.mount_slot,
         ),

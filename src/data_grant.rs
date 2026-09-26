@@ -5285,10 +5285,7 @@ impl SlotCustodyArm {
                             if let Some(resolver) = self.holder_resolver_for(endpoint) {
                                 client.install_holder_resolver(resolver);
                             }
-                            spawn_custody_renewal(
-                                Arc::clone(&client),
-                                Arc::clone(&self.stop),
-                            );
+                            spawn_custody_renewal(Arc::clone(&client), Arc::clone(&self.stop));
                             let h = Arc::new(HolderCustody {
                                 client,
                                 planes: parking_lot::Mutex::new(HashMap::new()),
@@ -6389,10 +6386,7 @@ pub async fn arm_mount_slot_custody(
 ///
 /// Public so the liveness contracts can drive the REAL cadence loop
 /// against an in-process authority.
-pub fn spawn_custody_renewal(
-    client: Arc<WriteCustodyClient>,
-    stop: Arc<AtomicBool>,
-) {
+pub fn spawn_custody_renewal(client: Arc<WriteCustodyClient>, stop: Arc<AtomicBool>) {
     crate::meta_exec::spawn_lease("custody_renewal", async move {
         loop {
             // Rung-10 finding #1: the due distance is the CLIENT's own

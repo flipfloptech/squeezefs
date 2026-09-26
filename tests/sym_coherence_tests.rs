@@ -812,13 +812,13 @@ async fn a_foreign_create_is_visible_at_the_readers_next_resolve() {
     );
 
     assert_eq!(
-        ro_coherence::metadata_staleness_bound_ms(&reader.volumes),
-        0,
+        ro_coherence::metadata_staleness_bound(),
+        std::time::Duration::ZERO,
         "reader_staleness_bound_ms is 0 for metadata under tokens"
     );
     assert!(
         ro_coherence::reader_staleness_bound().as_millis() > 0,
-        "the S5 control-plane bound keeps its own number"
+        "the control-plane poll keeps its own cadence"
     );
     plane.stop().await;
     host.shutdown();
@@ -4117,11 +4117,9 @@ async fn a_single_writer_volume_carries_no_token_plane() {
         w.checkpoint_now().await.unwrap();
         w.shutdown().await.unwrap();
         let r = KvMetaBackend::open_read_only(p).await.unwrap();
-        assert!(r.token_reader().is_none());
-        assert_eq!(
-            ro_coherence::metadata_staleness_bound_ms(&[Arc::clone(&r)]),
-            ro_coherence::reader_staleness_bound().as_millis() as u64,
-            "the S5 bound stands where no token plane exists"
+        assert!(
+            r.token_reader().is_none(),
+            "a backend RO open of a flat volume (a probe's shape) arms no token plane"
         );
         let _ = Metadata::lookup(r.as_ref(), 1, &name).await.unwrap();
     }
@@ -4330,8 +4328,8 @@ async fn a_ro_mount_under_the_knob_arms_the_token_client_and_writes_nothing() {
     })
     .await;
     assert_eq!(
-        ro_coherence::metadata_staleness_bound_ms(&reader.volumes),
-        0,
+        ro_coherence::metadata_staleness_bound(),
+        std::time::Duration::ZERO,
         "user-visible metadata is exact under tokens"
     );
     let hit = reader

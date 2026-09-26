@@ -250,7 +250,6 @@ impl OwnerMap {
     pub fn set_authority(&self) -> Option<&Arc<PeerOwner>> {
         self.owner_of_volume(self.slot_0_volume)
     }
-
 }
 
 /// The installed map, or `None` = **solo**: this node owns every volume

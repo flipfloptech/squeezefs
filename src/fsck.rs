@@ -340,7 +340,7 @@ use crate::meta_backend::{Metadata, RoutedMetaBackend};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -354,6 +354,27 @@ pub const FSCK_REPORT_SCHEMA: u32 = 1;
 /// Census page size (records per tree-range fetch) — also the throttle
 /// duty-cycle unit for the scan.
 const SCAN_PAGE: usize = 512;
+
+/// Test seam (PR 13i's record §4.4aw, PR 14): park the census walk after
+/// its FIRST inode page until [`test_census_hold_release`], so a contract
+/// can mint past the per-slot watermarks the walk began with. Off = one
+/// relaxed load per page.
+pub static TEST_CENSUS_HOLD_AFTER_FIRST_PAGE: AtomicBool = AtomicBool::new(false);
+static TEST_CENSUS_HOLD_NOTIFY: squeezefs_ipc::sqz_notify::Notify =
+    squeezefs_ipc::sqz_notify::Notify::new();
+static TEST_CENSUS_HOLDS: AtomicU64 = AtomicU64::new(0);
+
+/// Census walks that reached the seam's park (the contract's witness that
+/// the walk is parked before it mints).
+pub fn test_census_holds() -> u64 {
+    TEST_CENSUS_HOLDS.load(Ordering::Relaxed)
+}
+
+/// Release a walk parked on [`TEST_CENSUS_HOLD_AFTER_FIRST_PAGE`] (store
+/// `false` first; the notify wakes the register-recheck loop).
+pub fn test_census_hold_release() {
+    TEST_CENSUS_HOLD_NOTIFY.notify_waiters();
+}
 /// Scrub throttle batch (blocks per duty-cycle unit).
 const SCRUB_BATCH: usize = 8;
 /// Staged-custody scan bound (staging dirs are thousands of files).
@@ -2014,15 +2035,6 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         // referenced set still feeds the census merge — while an OWNER
         // shard evaluates it over the volumes it appends to (KD-PV-16),
         // and `run_fleet` merges the two through the §5.8.2 predicate.
-        //
-        // §5.9.2's freeze precondition is checked FIRST and it is
-        // self-certifying: a monotone checkpoint-consistent projection
-        // that shows a peer volume's own `owner` field shows every commit
-        // that preceded it there, including every cross-owner dentry that
-        // will ever exist. Unassigned ⇒ the cross-owner reference set is
-        // not frozen ⇒ no verdict (the existing incomplete-pass law), not
-        // a verdict taken over a set that may still be growing names.
-        let frozen = !opts.multi_owner || peer_volumes_are_assigned(ctx, opts).await;
         // The inode plane's TWO completeness laws on a forest, composed
         // (the verdict gate the PR 7b / PR 10 rebase names):
         //
@@ -2063,7 +2075,7 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
             referenced
                 .as_ref()
                 .filter(|_| opts.inode_plane)
-                .filter(|_| frozen && window_inos.is_some()),
+                .filter(|_| window_inos.is_some()),
             census.live.truncated(),
         ) {
             (Some(refs), false) => {
@@ -2176,44 +2188,6 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         // VIEW (`to_bounded_json`) mints a nonzero count.
         findings_elided: 0,
     })
-}
-
-/// §5.9.2's **freeze precondition**, read as ONE durable observable fact
-/// per peer-owned volume: does its (monotone, checkpoint-consistent)
-/// projection carry a durable `claim_set.owner`?
-///
-/// While a multi-owner plane is armed no cross-owner dentry can be
-/// created (M2 constrains `create`, M1 refuses cross-owner
-/// `link`/`rename`/`unlink`/`rmdir`, row 13 refuses cross-owner slot
-/// migration), so the cross-owner reference set is FIXED at the
-/// assignment instant. A projection showing the assignment therefore
-/// shows every cross-owner name that will ever exist on that volume —
-/// which is what makes an owner's plane pass read only records it
-/// appends to plus records that CANNOT change. No barrier verb, no ack
-/// ledger, no timeout: one fact, monotone thereafter.
-///
-/// `false` ⇒ the plane records NO verdict for this run (the existing
-/// incomplete-pass law).
-async fn peer_volumes_are_assigned(ctx: &FsckCtx, opts: &FsckOptions) -> bool {
-    for (v_idx, kv) in ctx.meta.volumes.iter().enumerate() {
-        if opts.owns_volume(v_idx) {
-            continue;
-        }
-        let assigned = crate::membership::ClaimSet::load(kv)
-            .await
-            .is_some_and(|s| s.durable && s.owner.is_some());
-        if !assigned {
-            log::warn!(
-                "fsck C9/C10: peer-owned volume {v_idx} ({}) shows no durable ownership \
-                 assignment in this mount's projection — the cross-owner reference set is \
-                 not yet frozen (design-per-volume-claim-admission §5.9.2), so the \
-                 inode-plane classes record NO verdict for this run",
-                kv.device_path().display()
-            );
-            return false;
-        }
-    }
-    true
 }
 
 /// Union shard reports (`--shards k/N` outputs): findings dedupe by
@@ -2937,12 +2911,11 @@ pub async fn run_fleet(
             // empty-head nominations (the merged shard census cannot —
             // shards collect no kvmap head info).
             evaluate_c11_empty_heads(&ip_census, &mut fin_counters, &mut fin_suspects, &ctx.meta);
-            let frozen = !fin_opts.multi_owner || peer_volumes_are_assigned(ctx, &fin_opts).await;
             // The foreign-window scoping (Issue 12) — the same exclusion the
             // unsharded pass takes; an unreadable ring = no verdict.
             let window_inos = foreign_window_inos(ctx).await;
             match (
-                ip_refs.as_ref().filter(|_| frozen && window_inos.is_some()),
+                ip_refs.as_ref().filter(|_| window_inos.is_some()),
                 ip_census.live.truncated(),
             ) {
                 (Some(refs), false) => {
@@ -3512,6 +3485,26 @@ async fn walk_census(
     for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
         let mut cursor: Vec<u8> = inode_key(1).to_vec();
         let end = inode_key(u64::MAX - 1);
+        // The walk's BOUND (PR 13i's record §4.4aw): the census is the
+        // population AS OF ITS START — the per-slot ino watermarks read
+        // here. A record minted past its slot's watermark is skipped, and
+        // a page whose last record lies at or past it has reached that
+        // slot's population — the cursor jumps to the next slot instead of
+        // paging through what a creator minted since (a walk paged at
+        // SCAN_PAGE with a `layout` read per ino never caught a creator
+        // that outpaced it). A post-start record is the next census's,
+        // exactly the class a record minted behind a cursor that had
+        // already passed its key was: invisible to `live` and the block
+        // census, judged by the zero-FP ladder's era floor, fresh re-read
+        // and allocation-epoch exemptions. A slot with no watermark (a
+        // keyspace this mount holds no cursor for) is walked whole.
+        let watermarks = kv.slot_ino_watermarks();
+        let past_watermark = |local: u64| {
+            let slot = crate::meta_backend::kv::record::forest_slot_of_ino(local);
+            let raw = local & (crate::meta_backend::GUEST_NS_BASE - 1);
+            watermarks.get(&slot).is_some_and(|&ceiling| raw >= ceiling)
+        };
+        let mut pages = 0u64;
         loop {
             if opts.cancel.load(Ordering::Relaxed) {
                 out.complete = false;
@@ -3539,11 +3532,35 @@ async fn walk_census(
             let Some((last_key, _)) = page.last() else {
                 break;
             };
+            pages += 1;
+            if pages == 1 && TEST_CENSUS_HOLD_AFTER_FIRST_PAGE.load(Ordering::Relaxed) {
+                TEST_CENSUS_HOLDS.fetch_add(1, Ordering::AcqRel);
+                while TEST_CENSUS_HOLD_AFTER_FIRST_PAGE.load(Ordering::Relaxed) {
+                    let notified = TEST_CENSUS_HOLD_NOTIFY.notified();
+                    if !TEST_CENSUS_HOLD_AFTER_FIRST_PAGE.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    notified.await;
+                }
+            }
             cursor = crate::meta_backend::kv::node::key_successor(last_key);
+            if let Ok(last_local) = decode_inode_key(last_key) {
+                if past_watermark(last_local) {
+                    let slot = crate::meta_backend::kv::record::forest_slot_of_ino(last_local);
+                    if slot >= crate::meta_backend::kv::record::FOREST_SLOT_MAX {
+                        break;
+                    }
+                    cursor = inode_key(u64::from(slot + 1) << crate::meta_backend::GUEST_NS_SHIFT)
+                        .to_vec();
+                }
+            }
             for (k, v) in &page {
                 let Ok(local_ino) = decode_inode_key(k) else {
                     continue; // C1's business
                 };
+                if past_watermark(local_ino) {
+                    continue; // minted after this census began — the next one's
+                }
                 let Ok(val) = InodeValue::decode(v) else {
                     continue;
                 };

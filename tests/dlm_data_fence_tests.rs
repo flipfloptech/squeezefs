@@ -678,11 +678,8 @@ fn multi_writer_refuses_to_arm_on_a_non_pr_substrate() {
     // Multi-writer: REFUSED, loudly, naming the substrate (§6.7 "On
     // external consensus" — the repo's own loop substrate is exactly this
     // shape).
-    let err = data_custody::arm_data_plane(
-        std::slice::from_ref(&path),
-        true,
-    )
-    .expect_err("multi-writer must refuse a detection-grade substrate");
+    let err = data_custody::arm_data_plane(std::slice::from_ref(&path), true)
+        .expect_err("multi-writer must refuse a detection-grade substrate");
     let msg = err.to_string();
     assert!(
         msg.contains(&path.display().to_string()),
@@ -714,11 +711,8 @@ fn multi_writer_refuses_a_format_without_the_s7_incompat_bit() {
     );
     // PR-capable, but the format does not carry bit 11 — which is EVERY
     // volume today (ruling D9: the bit is built, never stamped).
-    let err = data_custody::arm_data_plane(
-        std::slice::from_ref(&path),
-        false,
-    )
-    .expect_err("multi-writer must refuse an unstamped format");
+    let err = data_custody::arm_data_plane(std::slice::from_ref(&path), false)
+        .expect_err("multi-writer must refuse an unstamped format");
     let msg = err.to_string();
     assert!(
         msg.contains("multi-writer data capability") && msg.contains("single-writer"),

@@ -1073,18 +1073,15 @@ async fn a_healthy_packed_population_runs_c12_empty_ten_times_under_live_promoti
 
     // The storm: create + write + fsync — every fsync promotes into the
     // open pack (mid-flight tenants ride the in-flight registry, the pin
-    // rides the ledger) — while ten online passes run against it. The
-    // storm's LEAD over the census is bounded (`STORM_LEAD` files per fsck
-    // run — it yields until the next run completes): the online census
-    // pages the inode tree at 512 records a fetch with a `layout` read per
-    // ino, and a creator that outpaces that walk (≈ 760 files/s × 5
-    // forest records in the dev profile on a 32-core box) keeps every
-    // page's tail ahead of the cursor — the walk chases it for the
-    // storm's whole life (the stamped leg read 281 s for ONE run, the 4 GiB
-    // data volume filled, `ENOSPC`). The contract's law is C12 under LIVE
-    // promotion, which the lead keeps; the census's liveness under an
-    // unbounded creator is a product item of its own (PR 13i's record
-    // §4.4aw — bound the walk at its start watermark), not this pin's.
+    // rides the ledger) — while ten online passes run against it. Each
+    // pass is the population AS OF ITS START (PR 14 — the per-slot ino
+    // watermarks; the contract below), so a creator can no longer keep a
+    // pass chasing the tree's tail; the storm's LEAD over the census is
+    // still capped (`STORM_LEAD` files per pass — it yields until the
+    // next pass completes) because ten passes over a population a
+    // creator DOUBLES between passes is the harness's own arithmetic
+    // (uncapped, the tenth pass read 348 s and filled the 4 GiB data
+    // volume, `ENOSPC`), never the census's liveness law.
     const STORM_LEAD: usize = 400;
     let stop = Arc::new(AtomicBool::new(false));
     let runs_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1160,5 +1157,98 @@ async fn a_healthy_packed_population_runs_c12_empty_ten_times_under_live_promoti
         &run_fsck(&fx.ctx(), &offline_opts()).await.expect("fsck"),
         "the sealed packed population (offline)",
     );
+    fx.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// The census's liveness under a creator (PR 13i's record §4.4aw, landed in
+// PR 14)
+// ---------------------------------------------------------------------------
+
+/// An ONLINE census walks the inode tree a page at a time with a `layout`
+/// read per ino, so a creator that outpaces it kept every page's tail
+/// ahead of the cursor and the walk chased the tree for the creator's
+/// whole life (contract 6c caps its storm's lead per pass — the harness's
+/// own wall bound, stated there). The
+/// census is the population AS OF ITS START — bounded at the per-slot ino
+/// watermarks it began with: a record minted past its slot's watermark is
+/// skipped (the next census's) and the cursor jumps to the next slot once a
+/// page reaches it. Pinned with the seam that parks the walk after
+/// its first page while 2,000 inodes mint past every watermark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_online_census_is_bounded_at_the_ino_watermarks_it_started_with() {
+    use squeezefs::fsck::{test_census_hold_release, TEST_CENSUS_HOLD_AFTER_FIRST_PAGE};
+    let _g = serial().await;
+    let _l = arm_promotion(true);
+    let dir = tempfile::tempdir().unwrap();
+    let fx = open_fresh(dir.path(), "census-bound").await;
+    const BEFORE: usize = 700;
+    const DURING: usize = 2_000;
+    for n in 0..BEFORE {
+        fx.fs
+            .create(
+                req(),
+                1,
+                OsStr::new(&format!("b{n:05}")),
+                libc::S_IFREG | 0o644,
+                0,
+            )
+            .await
+            .expect("create");
+    }
+    let base = run_fsck(&fx.ctx(), &online_opts()).await.expect("fsck");
+    assert_eq!(
+        base.counters.inodes_scanned,
+        BEFORE as u64 + 1,
+        "the root + the population"
+    );
+
+    TEST_CENSUS_HOLD_AFTER_FIRST_PAGE.store(true, Ordering::SeqCst);
+    let ctx = fx.ctx();
+    let census = tokio::spawn(async move { run_fsck(&ctx, &online_opts()).await });
+    // The walk is parked past its first page; the creator mints past every
+    // watermark the walk began with.
+    for _ in 0..600 {
+        if squeezefs::fsck::test_census_holds() > 0 {
+            break;
+        }
+        squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        squeezefs::fsck::test_census_holds() > 0,
+        "the walk parked after its first page"
+    );
+    for n in 0..DURING {
+        fx.fs
+            .create(
+                req(),
+                1,
+                OsStr::new(&format!("d{n:05}")),
+                libc::S_IFREG | 0o644,
+                0,
+            )
+            .await
+            .expect("create");
+    }
+    TEST_CENSUS_HOLD_AFTER_FIRST_PAGE.store(false, Ordering::SeqCst);
+    test_census_hold_release();
+    let report = tokio::time::timeout(std::time::Duration::from_secs(120), census)
+        .await
+        .expect("the parked census completes once released — it never chases the creator")
+        .expect("join")
+        .expect("fsck");
+    // The census is the population AS OF ITS START: the root + the 700.
+    assert_eq!(
+        report.counters.inodes_scanned,
+        BEFORE as u64 + 1,
+        "the census scanned {} inodes: it is the {} that existed when it began (the {DURING} \
+         minted past its watermarks are the next census's)",
+        report.counters.inodes_scanned,
+        BEFORE + 1
+    );
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+    // The next pass sees everything.
+    let after = run_fsck(&fx.ctx(), &online_opts()).await.expect("fsck");
+    assert_eq!(after.counters.inodes_scanned, (BEFORE + DURING) as u64 + 1);
     fx.close().await;
 }

@@ -98,6 +98,7 @@ impl Drop for Restore {
         data_grant::uninstall_custody_client();
         data_grant::uninstall_custody_owner();
         publish::uninstall_client();
+        publish::uninstall_released_block_probe();
         ship::disarm_ownership();
         data_custody::test_reset_custody_generation();
         data_custody::test_clear_poison();
@@ -748,4 +749,107 @@ async fn the_solo_publish_path_is_structurally_untouched() {
     );
 
     shutdown(&be).await;
+}
+
+// ===========================================================================
+// 6. The served-publish SCREEN: a released block is never re-adopted
+// ===========================================================================
+
+/// Contract (design-small-file-packing §5.6 (2), the belt PR 14 installs
+/// on every armed writer through `arm_authority_planes`): a served layout
+/// publish whose frame TAKES a data block the serving mount holds
+/// RELEASED (free list / grace ring / quarantine — the installed
+/// `ReleasedBlockProbe`'s word) is refused `PUBLISH_FREE_BLOCK_REFUSED`
+/// before anything is staged — nothing applied, no journal entry, the
+/// refusal counted on `served_publish_free_block_refusals` — and never
+/// re-claimed (a re-claim would race a concurrent mint of the offset). A
+/// frame taking a block the probe does not name lands as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_served_publish_adopting_a_released_block_refuses_and_applies_nothing() {
+    use squeezefs::error::PublishFailureClass;
+    use squeezefs::meta_backend::kv::block_refs::{BlockRef, BlockRefOp};
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let (owner_be, _p) = sandbox(dir.path(), "own", false).await;
+    let (client_be, _p2) = sandbox(dir.path(), "cli", false).await;
+    let auth = start_authority(Arc::clone(&owner_be));
+    let (_client, _pc) = arm_client(&auth, &client_be).await;
+    const RELEASED: (u64, u64) = (0x5EED_0000_0000_0001, 41);
+    publish::install_released_block_probe(Arc::new(|vol_tag: u64, block_idx: u64| {
+        (vol_tag, block_idx) == RELEASED
+    }));
+
+    let ino = publish::create_with_rdev_size(
+        &client_be,
+        1,
+        "screened.bin",
+        libc::S_IFREG | 0o644,
+        0,
+        0,
+        0,
+        0,
+    )
+    .await
+    .expect("a shipped create lands")
+    .ino;
+    let refusals0 = METRICS
+        .served_publish_free_block_refusals
+        .load(Ordering::Relaxed);
+    let journal0 = journal_entries();
+    let taken = |block_idx: u64| {
+        BlockRefOp::taken(BlockRef {
+            vol_tag: RELEASED.0,
+            block_idx,
+            owner_ino: ino,
+            block_index: 0,
+        })
+    };
+    let err = publish::set_layout_and_size(
+        &client_be,
+        ino,
+        &base_layout_bytes(4096),
+        4096,
+        &[taken(RELEASED.1)],
+    )
+    .await
+    .expect_err("a frame adopting a RELEASED block is refused");
+    match err {
+        SqueezefsError::PublishFailure {
+            class: PublishFailureClass::CallRefused(status),
+            ..
+        } => assert_eq!(status, publish::PUBLISH_FREE_BLOCK_REFUSED),
+        other => panic!("the refusal is the screen's own status: {other:?}"),
+    }
+    assert_eq!(
+        METRICS
+            .served_publish_free_block_refusals
+            .load(Ordering::Relaxed),
+        refusals0 + 1,
+        "counted on the must-stay-0 gauge"
+    );
+    assert_eq!(journal_entries(), journal0, "nothing was staged");
+    assert_eq!(owner_size(&owner_be, ino).await, 0, "nothing was applied");
+
+    // A block the probe does not name lands as before.
+    publish::set_layout_and_size(
+        &client_be,
+        ino,
+        &base_layout_bytes(8192),
+        8192,
+        &[taken(RELEASED.1 + 1)],
+    )
+    .await
+    .expect("a clean frame lands");
+    assert_eq!(owner_size(&owner_be, ino).await, 8192);
+    assert_eq!(
+        METRICS
+            .served_publish_free_block_refusals
+            .load(Ordering::Relaxed),
+        refusals0 + 1
+    );
+
+    auth.listener.shutdown();
+    shutdown(&owner_be).await;
+    shutdown(&client_be).await;
 }

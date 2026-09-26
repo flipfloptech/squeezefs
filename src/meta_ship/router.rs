@@ -1136,11 +1136,11 @@ impl MetaShipRouter {
         if !pg.dir() || !pg.view_current(self.inner.view_watermark_of(parent)) {
             return DelegLookup::Miss;
         }
-        // `lookup_dentry`/`getattr_local`, NEVER the trait verbs: on an
-        // armed co-writer a trait body consults the daemon verb router,
-        // which routes right back into this serve — the live-rig
-        // recursion (rung-12 finding #1, a fuse3 lane stack overflow on
-        // the first fleet mount).
+        // `lookup_dentry`/`getattr_local`, NEVER the trait verbs: a trait
+        // body's own dispatch (a foreign slot's ship, a stripe route) must
+        // not route back into this serve — the live-rig recursion class
+        // (rung-12 finding #1, a fuse3 lane stack overflow on the first
+        // fleet mount).
         match self.inner.lookup_dentry(parent, name).await {
             Ok(Some((child, _ft))) => {
                 let Some(cg) = tokens::deleg_serve_begin(child, endpoint) else {

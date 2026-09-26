@@ -64,11 +64,11 @@ pub(crate) mod cow_core;
 // shipped to the authority, data read-write under a granted custody lease —
 // and the five-rung admission ladder that is the only way to reach it.
 // Plain comments, not doc comments (see the `data_custody` note below).
-pub mod member_id;
-pub mod shipped_free;
 pub mod cpu;
 pub mod crypto_compress;
 pub mod daemon_cpu;
+pub mod member_id;
+pub mod shipped_free;
 // DLM stage S7 (pre-RC spec §6.9 / §6.7 / RES-6): the data plane's
 // custody-epoch fence — ONE authorization point for every DMA submission —
 // the dead-epoch allocation quarantine, and the shared WERO hold on data
@@ -1112,19 +1112,14 @@ pub const MW_UPGRADE_MARKER_XATTR: &str = "mw_upgrade:intent";
 /// binary began an upgrade this one cannot reason about.
 pub const MW_UPGRADE_MARKER_VERSION: u8 = 1;
 
-/// The durable **per-volume ownership assignment intent marker** record
-/// name (KD-PV-2, `docs/design-per-volume-claim-admission.md` §5.2.1/§7):
-/// the [`MW_UPGRADE_MARKER_XATTR`] mechanism verbatim, one namespace over.
-/// `squeezefs volume set-owners` writes one
-/// [`config_ops::OwnerAssignMarker`] on **ino 1 of the slot-0 volume**
-/// (the KD-2 plane — whole-tx atomic, torn-immune, offline
-/// probe-readable; VAL-2-allowlist-invisible like `mw_upgrade:` / `job:` /
-/// `alloc_lane:` / `fabric_endpoint:`) as its FIRST act and deletes it as
-/// its LAST, so an interrupted assignment is resumable and a writable
-/// mount refuses while a set is half-assigned. Per-volume ownership takes
-/// **no incompat bit** — it is gated on bit 14 — so this bracket plus the
-/// admission ladder, not the format, is what keeps a partial assignment
-/// unmountable.
+/// The pre-1.3.0 **per-volume ownership assignment intent marker** record
+/// name: the retired `squeezefs volume set-owners` verb (PR 14 — ownership
+/// is the slot lease under the symmetric forest, D19 reversed) wrote it on
+/// ino 1 of the slot-0 volume as its FIRST act and deleted it as its LAST,
+/// the [`MW_UPGRADE_MARKER_XATTR`] mechanism one namespace over. A
+/// writable mount still refuses while one stands (a pre-1.3.0 run crashed
+/// mid-assignment) naming `squeezefs volume enable-symmetric`, which
+/// removes the bracket with the assignment it bracketed.
 pub const OWNER_ASSIGN_MARKER_XATTR: &str = "owner_assign:intent";
 
 /// The durable **symmetric-forest conversion marker** record name

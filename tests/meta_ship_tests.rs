@@ -31,9 +31,9 @@
 //!    executed), the successor's grace window admits reclaim and refuses
 //!    fresh mutations, and a fencing READ on a foreign-home object never
 //!    serves the local view (**the S4 contract #2 this stage owes**).
-//! 6. **Cross-OWNER shapes refuse loud naming S3.5** (ruling D4's
-//!    cross-volume transaction machinery, which is NOT built) — never a
-//!    second distributed-tx mechanism invented here.
+//! 6. (Cross-OWNER shapes: the S3.5 refusal of the per-volume-owner recipe
+//!    retired with it at PR 14 — under the symmetric plane a cross-holder
+//!    op is ONE intent with shipped steps, `tests/sym_cross_owner_tests.rs`.)
 //! 7. **Ownership granularity is the VOLUME** (spec §6.10 R4). An
 //!    intra-volume split is *unrepresentable* in the API, because one
 //!    volume still has one journal ring, one bitmap, one root ledger
@@ -1159,105 +1159,6 @@ async fn the_grace_window_admits_reclaim_and_refuses_fresh_mutations() {
     listener.shutdown();
     shutdown(&client_be).await;
     shutdown(&owner_be).await;
-}
-
-// ---------------------------------------------------------------------------
-// 8. Cross-owner shapes — the S3.5 refusal
-// ---------------------------------------------------------------------------
-
-/// Contract (requirement 4): a verb whose participants live on volumes
-/// owned by DIFFERENT owners is refused **loud, naming S3.5** — the
-/// cross-volume intent-record/compensation machinery (ruling D4) that is
-/// not built. Inventing a second distributed-tx mechanism here is
-/// forbidden, and shipping the op to one of the two owners would be
-/// strictly worse than today: it would be non-atomic across owners with
-/// no compensation record and no D0 guard covering both halves.
-///
-/// The same shape with ONE owner is not refused — it is today's
-/// (non-atomic, DUR-7-tracked) cross-volume path, executed on the owner
-/// exactly as it executes today.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cross_owner_verbs_refuse_loud_naming_s3_5() {
-    let _serial = OWNERSHIP.write().await;
-    let dir = tempfile::tempdir().unwrap();
-    let client_be = sandbox(dir.path(), "client2v", 2).await;
-
-    // Volume 0 → owner A, volume 1 → owner B. Nothing listens: the
-    // refusal must happen BEFORE any round trip.
-    let map = OwnerMap::for_volumes(
-        &client_be,
-        vec![
-            (0, PeerOwner::new("owner-a", "127.0.0.1:1")),
-            (1, PeerOwner::new("owner-b", "127.0.0.1:2")),
-        ],
-    )
-    .expect("volume-aligned two-owner map");
-    let _armed = arm(map);
-    let r = router(client_be.clone(), "client-1");
-    let before = ship::stats();
-
-    // Two inos on different volumes (the derived width stripes
-    // consecutive inos across slots, hence across volumes).
-    let (v_a, v_b) = (0usize, 1usize);
-    let ino_a = ino_on_volume(&client_be, v_a);
-    let ino_b = ino_on_volume(&client_be, v_b);
-
-    let err = r
-        .route_verb(&MetaCall::Link {
-            ino: ino_a,
-            new_parent: ino_b,
-            new_name: "x".into(),
-        })
-        .expect_err("a cross-owner link must refuse");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("S3.5"),
-        "the refusal must name the machinery it needs: {msg}"
-    );
-    assert_eq!(
-        squeezefs::error::SqueezefsError::to_errno(&err),
-        libc::EXDEV,
-        "a cross-owner shape presents EXDEV"
-    );
-
-    assert!(r
-        .route_verb(&MetaCall::Rename {
-            old_parent: ino_a,
-            old_name: "a".into(),
-            new_parent: ino_b,
-            new_name: "b".into(),
-            flags: 0,
-        })
-        .is_err());
-    assert_eq!(
-        ship::stats().cross_owner_refusals - before.cross_owner_refusals,
-        2,
-        "both refusals are counted"
-    );
-
-    // Same shape, one owner: routable, not refused.
-    let same = OwnerMap::for_volumes(
-        &client_be,
-        vec![
-            (0, PeerOwner::new("owner-a", "127.0.0.1:1")),
-            (1, PeerOwner::new("owner-a", "127.0.0.1:1")),
-        ],
-    )
-    .expect("one owner, two volumes");
-    ship::arm_ownership(same);
-    match r
-        .route_verb(&MetaCall::Link {
-            ino: ino_a,
-            new_parent: ino_b,
-            new_name: "x".into(),
-        })
-        .expect("one owner must be routable")
-    {
-        VerbRoute::Ship(peer) => assert_eq!(peer.peer_id, "owner-a"),
-        VerbRoute::Local => panic!("both volumes are foreign here"),
-    }
-
-    shutdown(&client_be).await;
 }
 
 /// The lowest ino that routes to `v_idx` on this set (the routed map is

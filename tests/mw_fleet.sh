@@ -119,81 +119,16 @@
 #   (SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS — a measurement lever for the
 #   fence rows; the S6-a journal row runs the shipped 45 s clocks).
 #
-# MULTI-WRITER ARMING (rung 8 — the S7 rows; design-full-multi-writer §7.2):
-#   `create --multi-writer` arms the DLM S7 data-plane custody fence on the
-#   WRITER: SQUEEZEFS_MULTI_WRITER=1 demands the DEVICE-ENFORCED guarantee
-#   class — the mount takes a WERO (rtype 3) reservation on EVERY data
-#   namespace (data_plane_fence_mode=1) and REFUSES loud on a non-PR
-#   substrate or an unstamped format (this fleet's tcp devsub is nvmet
-#   resv_enable=1 and the DEFAULT format stamps the nine bits since the
-#   rung-10b flip, so both rungs hold). The arm's rung 4 requires the
-#   membership plane, so
-#   --multi-writer IMPLIES --membership (auto) when not given explicitly.
-#   Engagement is asserted per mount: data_plane_fence_mode=1 read from
-#   the stats inode + the WERO acquire line in the writer log. SCOPE
-#   (rung 8): the AUTHORITY arm only — the S7 rows fence the WRITER itself.
-#
-# CO-WRITER MEMBERS (rung 9 — the S8 rows; design-full-multi-writer §7.2):
-#   `create --cowriters=K` (which implies the --multi-writer ARM — the
-#   rig flag stays accepted as the explicit spelling) mounts K CO-LOCATED co-writer
-#   members on the index slice 50.. (COWRITER_BASE): the DLM S9 posture —
-#   metadata read-only locally with EVERY metadata verb SHIPPED to the
-#   authority (the REAL S8 shipping client), data DMA its own under a
-#   granted custody lease. Bring-up is the ops.md flow mechanized: each
-#   mountpoint's durable enrollment id (`node_….m…` — KD-MW-2) is
-#   harvested from its rung-3 refusal (probe_cowriter_id, side-effect
-#   free), the AUTHORITY is re-armed with SQUEEZEFS_MW_MEMBERS=<roster>
-#   (enrollment is the authority's durable act — a new era), then the
-#   co-writers mount with SQUEEZEFS_MW_ROLE=co-writer +
-#   SQUEEZEFS_MW_AUTHORITY=<the recorded MW_ENDPOINT>. CO-LOCATED shape
-#   (ops.md §Multi-writer co-writer mounts, the honest residual): they
-#   share the box's PR host identity — no explicit hostnqn, no 5b kernel
-#   needed; their WERO registrant key rides the default host association.
-#   A co-writer may mount in a netns (`mount 50 --netns[=<delay>]`) so its
-#   SHIPPING wire is netem-shapeable — the S8-a RTT-sweep venue (netem now
-#   accepts `<N>us` grain). Engagement asserted per mount: the
-#   'CO-WRITER ADMITTED' log line + mount_posture=co-writer.
-#
-# MULTI-OWNER MEMBERS (PR 8 — per-volume claim admission; the acceptance
-# rung's fleet: docs/design-per-volume-claim-admission.md D20/§5.7,
-# docs/operations.md §Bringing a multi-owner fleet up):
-#   `create --owners=K` (implies --multi-writer, hence --membership) builds
-#   the K-OWNER shape: ONE volume set whose metadata volumes are assigned
-#   per-volume owners by the offline `squeezefs volume set-owners` verb.
-#   Member 0 owns the SLOT-0 volume and is therefore the SET AUTHORITY
-#   (D20: lane assignment, the S9 custody endpoint, the one WERO hold, the
-#   one grace ring, maintenance, ino 1); members 20.. (PARTIAL_BASE) are
-#   PARTIAL AUTHORITIES — they append to their own volumes and ship every
-#   other volume's verbs, custody and terminal frees to the set authority.
-#   Mutually exclusive with --cowriters (two different fleet shapes).
-#
-#   Bring-up is the ops.md sequence mechanized, and its ORDER is forced:
-#     1. member 0 mounts as a plain MW authority — this is what writes the
-#        durable claim sets every later rung reads;
-#     2. each prospective owner's durable member id (KD-MW-2
-#        `node_{16 hex}.m{8 hex}`) is harvested. Partial mountpoints use
-#        the rung-3 co-writer refusal (probe_cowriter_id — side-effect
-#        free); member 0's own id is composed from the harvested NODE half
-#        and its OWN `client_slot` gauge, because a probe cannot run at a
-#        mountpoint that is currently mounted;
-#     3. the whole set goes DOWN (set-owners is offline by ruling D19 — it
-#        is momentarily the sole authority of every volume);
-#     4. `volume set-owners` assigns each volume an owner AND mints that
-#        owner's subtree root (`:<path>` — KD-PV-15, WITHOUT which a node
-#        owns a volume but no work and PR 8's gate row is meaningless by
-#        construction). The M3 cross-owner census is read from a --dry-run
-#        and acknowledged verbatim — never guessed;
-#     5. the SET AUTHORITY mounts FIRST (a partial authority's rung 4
-#        demands a live membership lease and the set authority owns that
-#        plane), then every partial authority, each on its OWN known MW
-#        port (never `auto`: peers resolve a published endpoint, and an
-#        ephemeral port moves on every restart).
-#   Verified per ops.md's list, loudly, before create returns:
-#   mount_posture, meta_ship.armed, not_owner_refusals == 0,
-#   owner_panics == 0, ONE alloc_lane_writers width fleet-wide,
-#   alloc_lane_raise_refusals == 0. A partial authority may mount in a
-#   netns (`mount 20 --netns[=<delay>]`) — the PR 8 tar-x gate's venue.
-#   `owners` prints the recorded assignment.
+# THE DATA PLANE (PR 14 — every fleet's writer since the symmetric default
+# flip): a plain `create` formats the DEFAULT (the symmetric forest — bit 17
+# + the nine multi-writer bits) and the writer's join ladder ARMS the
+# device-enforced guarantee class at its rung 4 — a WERO (rtype 3)
+# reservation on EVERY data namespace (data_plane_fence_mode=1), refused
+# loud on a non-PR substrate (this fleet's tcp devsub is nvmet
+# resv_enable=1). The retired `--multi-writer` / `--cowriters=K` /
+# `--owners=K` shapes (the S9 co-writer and the per-volume-owner recipes)
+# REFUSE at create naming the joined-writer shape: a second RW mount is
+# `--writers=K` — a full writer through the join ladder, no posture knob.
 #
 # NETNS / NETEM / PARTITION (rung 7 — the S6-b venue; stubs retired):
 #   A READER member can be mounted inside its OWN network namespace
@@ -210,17 +145,17 @@
 #   zero netns/veth residue.
 #
 # Verbs
-#   create [N|N=<n>] [--cowriters K] [--owners=K] [--vm=V]
-#          [--require-host-scoped-subsys]
-#          [--membership[=auto|addr:port]] [--lease-ttl-ms=N] [--multi-writer]
-#          [--symmetric [--writers=K] [--token-readers]]
+#   create [N|N=<n>] [--vm=V] [--require-host-scoped-subsys]
+#          [--membership[=auto|addr:port]] [--lease-ttl-ms=N]
+#          [--writers=K] [--token-readers]
 #                 build substrate + format + records + mount the fleet
 #                 (refuses if state exists — run teardown first); --vm=V
-#                 boots V sqz-kernel guests after the fleet is up;
-#                 --symmetric formats bit 17 (the forest + the appender
-#                 region) and arms the writer's SQUEEZEFS_SYMMETRIC_META
-#                 (implies --membership — the death ledger's writer), the
-#                 `run_mw_matrix.sh sym-crash` leg's fleet (PR 10);
+#                 boots V sqz-kernel guests after the fleet is up; the
+#                 format is the DEFAULT — the symmetric forest (bit 17 +
+#                 the appender region), every RW mount an armed writer
+#                 (PR 14; `--symmetric` is accepted as the default's
+#                 spelling), membership implied (the death ledger's
+#                 writer), the `run_mw_matrix.sh sym-crash` leg's fleet;
 #                 --writers=K (PR 12b) mounts K more RW daemons of the
 #                 armed set — JOINED WRITERS (indices 60..) through the
 #                 join ladder, no posture knob, N unbounded by design —
@@ -235,8 +170,6 @@
 #                 in ≈ 7 s on the dev box, inside the randomized kill
 #                 phase; zram stores zeros for free)
 #   status        member table + capability verdict + identity map + VMs
-#   owners        the recorded per-volume ownership assignment (ids,
-#                 volumes, subtree roots, MW ports) — PR 8's legs read it
 #   mount <idx> [--netns[=<delay_ms>]]   (re)mount one member (readers may
 #                 mount inside their own netns — see NETNS above)
 #   unmount <idx>   product umount
@@ -313,8 +246,8 @@ N_DEFAULT="${SQZ_MWFLEET_N:-2}"
 MDS_COUNT="${SQZ_MWFLEET_MDS_COUNT:-2}"
 OSS_COUNT="${SQZ_MWFLEET_OSS_COUNT:-2}"
 OSS_GB="${SQZ_MWFLEET_OSS_GB:-4}"
-# Rung 18: create-recorded like RANGE_CUSTODY (remount-stable — a member
-# remounted mid-leg must keep the fleet's publish-group posture).
+# Rung 18: create-recorded (remount-stable — a member remounted mid-leg
+# must keep the fleet's publish-group posture).
 PUBLISH_GROUP_MAX="${SQZ_MWFLEET_PUBLISH_GROUP_MAX:-}"
 INSTANCE="${SQZ_MWFLEET_INSTANCE:-mwfleet}"
 STATE="${SQZ_MWFLEET_STATE_DIR:-/run/squeezefs-mwfleet}"
@@ -469,42 +402,18 @@ member_hostnqn() { echo "nqn.2014-08.org.nvmexpress:uuid:$(member_hostid "$1" "$
 
 mnt_of() { echo "$MNT_ROOT/m$1"; }
 
-# Rung 9: co-writer members live on their own index slice (the VM-slice
-# precedent — readers keep 1..N-1 untouched).
-COWRITER_BASE=50
-# PR 8: PARTIAL AUTHORITIES take their own slice between the readers and
-# the co-writers, so a multi-owner fleet reads at a glance and member 0
-# stays the set authority every leg's oracle already snapshots.
-PARTIAL_BASE=20
-# Symmetric PR 12b: the JOINED WRITERS of a `--symmetric --writers=K`
-# fleet — every non-manager RW mount of the armed set, N unbounded by
-# design — take the slice above the co-writers (60..).
+# The reader slice is 1..READER_MAX (the retired co-writer slice began at
+# 50; the index law stays so every leg's snapshots read identically).
+READER_MAX=49
+# Symmetric PR 12b: the JOINED WRITERS of a `--writers=K` fleet — every
+# non-manager RW mount of the armed set, N unbounded by design — take the
+# slice at 60...
 JOINER_BASE=60
 
 # The joined-writer member indices of a symmetric fleet (empty on every
 # other shape).
 joiner_idxs() {
     awk -F'\t' '$2=="joiner" {print $1}' "$MEMBERS" 2>/dev/null | sort -n
-}
-
-# The partial-authority member indices of a multi-owner fleet (empty on
-# every other shape).
-partial_idxs() {
-    awk -F'\t' '$2=="partial-authority" {print $1}' "$MEMBERS" 2>/dev/null | sort -n
-}
-
-# One recorded per-owner field (`OWNER_ID_20`, `OWNER_ROOT_0`, …) —
-# indirect expansion so an absent one is empty rather than a set -u abort.
-owner_field() { # field idx
-    local var="OWNER_${1}_${2}"
-    echo "${!var-}"
-}
-
-# Every owner index of a multi-owner fleet, the SET AUTHORITY first (which
-# is also the order everything mounts in).
-owner_idxs() {
-    echo 0
-    partial_idxs
 }
 
 # /proc/mounts-based liveness: `mountpoint -q` errors (ENOTCONN) on a mount
@@ -867,14 +776,9 @@ mount_member() { # idx [--netns[=<delay_ms>]]
     # scrub of the rig's own SQZ_* control variables — they are not
     # SqueezeFS knobs and would trip the registry's typo announcement.
     local env_args=("${SCRUB_ENV[@]}")
-    # KD-MW-14's root divisor. It should be the number of CO-LOCATED
-    # daemons; the shape-specific `FLEET_SHARE` a multi-owner create
-    # records counts the partial authorities, which `FLEET_N` (the
-    # reader-slice width) does not. Other shapes keep `FLEET_N` verbatim
-    # — changing their divisor would move every existing leg's R5 budget,
-    # which is a different rung's decision (the co-writer shape's own
-    # under-count is named in PR 8's evidence note, not fixed here).
-    env_args+=("SQUEEZEFS_FLEET_SHARE=${FLEET_SHARE:-$FLEET_N}") # options before assignments
+    # KD-MW-14's root divisor: `FLEET_N` (the reader-slice width) verbatim
+    # — changing it would move every existing leg's R5 budget.
+    env_args+=("SQUEEZEFS_FLEET_SHARE=$FLEET_N") # options before assignments
     # Rung 18 (the width-N conveyor-composition standing-red's A/B lever):
     # SQZ_MWFLEET_PUBLISH_GROUP_MAX=N at create rides into every daemon as
     # SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX — `1` is the registered
@@ -890,12 +794,6 @@ mount_member() { # idx [--netns[=<delay_ms>]]
     env_args+=("SQUEEZEFS_IPC_ALLOW_DEV=1")
     if [ "$idx" -eq 0 ]; then
         role="writer"
-        # PR 8: once the offline assignment stands, member 0 is the owner
-        # of the SLOT-0 volume and therefore the SET AUTHORITY (D20). The
-        # posture is DECLARED — the ladder verifies the declaration
-        # against the durable assignment and refuses a wrong one naming
-        # the posture that should have been declared.
-        [ "${OWNERS_ASSIGNED:-0}" = "1" ] && role="set-authority"
         [ "$netns" = "0" ] ||
             die "the writer/owner never mounts in a netns — members must dial its advertised endpoint (see the NETNS header note)"
         # Rung 7: the membership arm rides the WRITER (the lease
@@ -905,46 +803,22 @@ mount_member() { # idx [--netns[=<delay_ms>]]
             [ -n "${MEMBERSHIP_LEASE_TTL_MS:-}" ] &&
                 env_args+=("SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS=$MEMBERSHIP_LEASE_TTL_MS")
         fi
-        # Rung 8: the S7/S9 AUTHORITY arm — the device-enforced guarantee
-        # class (WERO rtype 3 on every data namespace). Rung 9: the bind is
-        # a STABLE rig port (SQZ_MWFLEET_MW_PORT, default 45999), because
-        # the S8-b era split needs a SUCCESSOR authority the old era's
-        # frames can still reach — `auto` mints a fresh ephemeral port per
-        # incarnation, so old-era clients would dial a dead endpoint
-        # forever and the stale-term/era-relearn split could never engage.
-        # (Field topology is the same: operators bind a known port.)
-        if [ "${MW:-0}" = "1" ]; then
-            env_args+=("SQUEEZEFS_MULTI_WRITER=1")
-            # Rung-10 rig finding: the port must be CONF-persistent, not
-            # ambient — a successor remounted from a LATER invocation
-            # (matrix legs, operators) that lacks SQZ_MWFLEET_MW_PORT in
-            # its environment would otherwise re-arm on the DEFAULT port
-            # while every co-writer keeps dialing the recorded
-            # MW_ENDPOINT: re-admission then refuses 'Connection refused'
-            # forever (the s9-failover first run's shape).
+        # The manager's S8 listener binds a STABLE rig port
+        # (SQZ_MWFLEET_MW_PORT, default 45999): a SUCCESSOR manager must be
+        # reachable at the address the joiners and readers recorded —
+        # `auto` mints a fresh ephemeral port per incarnation (the
+        # s9-failover first run's shape). The port is CONF-persistent, not
+        # ambient (a later invocation without SQZ_MWFLEET_MW_PORT would
+        # otherwise re-arm on the default). PR 13i (the two-host fixture):
+        # on the tap network the listener binds the TAP's host address, so
+        # the guest joiner dials an address its kernel routes whatever the
+        # box's default route says. The plane itself needs no knob: the
+        # default format is the forest and SQUEEZEFS_SYMMETRIC_META
+        # defaults to 1 (PR 14).
+        if [ "${VM_NET:-user}" = "tap" ]; then
+            env_args+=("SQUEEZEFS_MW_BIND=$VM_TAP_HOST_IP:${SQZ_MWFLEET_MW_PORT:-${MW_PORT:-45999}}")
+        else
             env_args+=("SQUEEZEFS_MW_BIND=0.0.0.0:${SQZ_MWFLEET_MW_PORT:-${MW_PORT:-45999}}")
-        fi
-        if [ "$role" = "set-authority" ]; then
-            env_args+=("SQUEEZEFS_MW_ROLE=set-authority")
-        fi
-        # PR 10: the symmetric plane on the manager (bit 17 was stamped at
-        # format; `=1` is the arm — PR 4's knob).
-        if [ "${SYMMETRIC:-0}" = "1" ]; then
-            env_args+=("SQUEEZEFS_SYMMETRIC_META=1")
-            # PR 13i (the two-host fixture): the manager's listener binds
-            # the TAP's host address, so the guest joiner dials an address
-            # its kernel routes whatever the box's default route says.
-            if [ "${VM_NET:-user}" = "tap" ]; then
-                env_args+=("SQUEEZEFS_MW_BIND=$VM_TAP_HOST_IP:${SQZ_MWFLEET_MW_PORT:-${MW_PORT:-45999}}")
-            fi
-        fi
-        # Rung 9: the operator-declared co-writer roster (enrollment is the
-        # AUTHORITY's durable act — ops.md §Multi-writer co-writer mounts).
-        # A multi-owner fleet never sets it: `volume set-owners` enrolled
-        # every member on every volume in its own offline bracket (KD-PV-4),
-        # and an empty roster is the arm's no-op.
-        if [ -n "${MW_ROSTER:-}" ]; then
-            env_args+=("SQUEEZEFS_MW_MEMBERS=$MW_ROSTER")
         fi
         # The proven N=1 explicit-identity shape: data plane daemon-owned
         # from the fabric_endpoint records. (The KD-MW-3 ENGAGED stdout
@@ -957,21 +831,16 @@ mount_member() { # idx [--netns[=<delay_ms>]]
             die "writer mount failed: $(cat "$STATE/m0.mount.out")"
     elif [ "$idx" -ge "$JOINER_BASE" ]; then
         # Symmetric PR 12b: a JOINED WRITER — a second (third, …) RW mount
-        # of the ARMED set. No posture knob (SQUEEZEFS_MULTI_WRITER /
-        # SQUEEZEFS_MW_ROLE / SQUEEZEFS_MW_AUTHORITY are RETIRED spellings
-        # beside the plane): the mount walks the join ladder off durable
-        # state — a live manager (its flock on this host, its fresh claim),
-        # its published listener (the claim set), the set's secret — and
-        # JOINS as a full writer: its own page, ring, slot leases and
-        # checkpoint task; tree 0 a projection; foreign slots read through
-        # their holders' tokens. CO-LOCATED (one head, one association):
-        # rung 4 ADOPTS the manager's holds (KD-SYM-22), registering
-        # nothing. The mount point derives its `(node, mount slot)`
-        # identity — the same point rejoins its own region.
+        # of the set. No posture knob: the mount walks the join ladder off
+        # durable state — a live manager (its flock on this host, its
+        # fresh claim), its published listener (the claim set), the set's
+        # secret — and JOINS as a full writer: its own page, ring, slot
+        # leases and checkpoint task; tree 0 a projection; foreign slots
+        # read through their holders' tokens. CO-LOCATED (one head, one
+        # association): rung 4 ADOPTS the manager's holds (KD-SYM-22),
+        # registering nothing. The mount point derives its `(node, mount
+        # slot)` identity — the same point rejoins its own region.
         role="joiner"
-        [ "${SYMMETRIC:-0}" = "1" ] ||
-            die "joined writers need a --symmetric fleet (create ... --symmetric --writers=K)"
-        env_args+=("SQUEEZEFS_SYMMETRIC_META=1")
         # N full writers on ONE box each register 32 queues × 32 × 1 MiB
         # of kernel-managed kmbuf rings (the shipped transport geometry —
         # never downgraded); the fifth daemon of the first create met the
@@ -995,83 +864,15 @@ mount_member() { # idx [--netns[=<delay_ms>]]
             >"$STATE/m${idx}.mount.out" 2>&1 ||
             die "joined writer $idx mount failed: $(cat "$STATE/m${idx}.mount.out")"
         [ -n "$netem_ms" ] && netem_set "$idx" "$netem_ms"
-    elif [ "$idx" -ge "$COWRITER_BASE" ]; then
-        # Rung 9 (the S8 arm): a CO-WRITER member — the DLM S9 posture, the
-        # REAL S8 shipping client (every metadata verb ships to the
-        # authority; data DMA is its own under a granted custody lease).
-        # CO-LOCATED shape (docs/operations.md §Multi-writer co-writer
-        # mounts, the stated honest residual): it shares the box's PR host
-        # identity, so it mounts with NO explicit hostnqn — its WERO
-        # registrant key rides the default host association, distinct from
-        # the writer's explicit member-0 identity. No 5b kernel needed.
-        role="cowriter"
-        [ "${MW:-0}" = "1" ] || die "co-writer members need a multi-writer-ARMED fleet (create ... --cowriters=K arms it automatically)"
-        [ -n "${MW_ENDPOINT:-}" ] || die "no MW_ENDPOINT recorded — the writer's 'MULTI-WRITER ARMED' line was not parsed (writer log: $STATE/m0.log)"
-        env_args+=("SQUEEZEFS_MULTI_WRITER=1")
-        env_args+=("SQUEEZEFS_MW_ROLE=co-writer")
-        env_args+=("SQUEEZEFS_MW_AUTHORITY=$MW_ENDPOINT")
-        # Rung 15: the fleet's recorded range-custody posture (see the
-        # CONF block) — explicit-arm only, never ambient.
-        [ "${RANGE_CUSTODY:-0}" = "1" ] && env_args+=("SQUEEZEFS_RANGE_CUSTODY=1")
-        local launch=(env "${env_args[@]}" "$SQZ")
-        if [ "$netns" = "1" ]; then
-            netns_setup "$idx"
-            launch=(nsenter "--net=/run/netns/$(ns_name "$idx")" env "${env_args[@]}" "$SQZ")
-        fi
-        "${launch[@]}" mount "sqmeta://$META_PATHS" "$mnt" \
-            --daemon --allow-other --log-file "$log" \
-            >"$STATE/m${idx}.mount.out" 2>&1 ||
-            die "co-writer $idx mount failed: $(cat "$STATE/m${idx}.mount.out")"
-        [ -n "$netem_ms" ] && netem_set "$idx" "$netem_ms"
-    elif [ "$idx" -ge "$PARTIAL_BASE" ] && [ "${OWNERS_ASSIGNED:-0}" = "1" ]; then
-        # PR 8: a PARTIAL AUTHORITY — the only posture that is a CLIENT and
-        # an OWNER at once — on an --owners fleet ALONE: every other shape's
-        # indices 20..49 are READERS (PR 13c: the 32-member token-reader
-        # fleet died at member 20 here, a harness shape the box never
-        # reached behind F-B3's 64-connection cap). Client halves toward
-        # the SET authority (custody
-        # lease, the lane that lease carries, the publish client, the
-        # shipped verbs); an owner half over the volumes this node was
-        # ASSIGNED, served on its OWN bind. CO-LOCATED, like the
-        # co-writers: no explicit hostnqn, so its WERO registrant key rides
-        # the box's default host association under the set authority's
-        # standing hold (D20 — one holder, N registrants).
-        role="partial-authority"
-        [ -n "${MW_ENDPOINT:-}" ] ||
-            die "no MW_ENDPOINT recorded — the set authority's 'MULTI-WRITER ARMED' line was not parsed (log: $STATE/m0.log)"
-        local p_port
-        p_port="$(owner_field PORT "$idx")"
-        [ -n "$p_port" ] || die "member $idx has no recorded MW port (was it created by --owners?)"
-        env_args+=("SQUEEZEFS_MULTI_WRITER=1")
-        env_args+=("SQUEEZEFS_MW_ROLE=partial-authority")
-        env_args+=("SQUEEZEFS_MW_AUTHORITY=$MW_ENDPOINT")
-        # A KNOWN port, never `auto` (ops.md's bring-up rule 2): this mount
-        # PUBLISHES where it serves into the claim-set record of the
-        # volumes it owns, and its peers dial what they read there — an
-        # ephemeral port moves on every restart, so a remounted partial
-        # authority would be undialable until every peer remounted too.
-        env_args+=("SQUEEZEFS_MW_BIND=0.0.0.0:$p_port")
-        local launch=(env "${env_args[@]}" "$SQZ")
-        if [ "$netns" = "1" ]; then
-            netns_setup "$idx"
-            launch=(nsenter "--net=/run/netns/$(ns_name "$idx")" env "${env_args[@]}" "$SQZ")
-        fi
-        "${launch[@]}" mount "sqmeta://$META_PATHS" "$mnt" \
-            --daemon --allow-other --log-file "$log" \
-            >"$STATE/m${idx}.mount.out" 2>&1 ||
-            die "partial-authority $idx mount failed: $(cat "$STATE/m${idx}.mount.out")"
-        [ -n "$netem_ms" ] && netem_set "$idx" "$netem_ms"
     else
         role="reader"
-        # PR 13 (PR 5's §5.7.2 posture): a `--token-readers` fleet's
-        # readers declare the plane — member-reader + token client, every
-        # kernel TTL derived to 0, the manager's published listener dialed
-        # off durable state (never a declared authority). The arm refuses
-        # loud on anything missing (bit 17, the lease, the secret, the
-        # listener), so a token reader that mounted IS one.
-        if [ "${TOKEN_READERS:-0}" = "1" ]; then
-            env_args+=("SQUEEZEFS_SYMMETRIC_META=1")
-        fi
+        # PR 13 (PR 5's §5.7.2 posture) / PR 14: every `--read-only` mount
+        # of the set is a member-reader + token client — every kernel TTL
+        # derived to 0, the manager's published listener dialed off
+        # durable state (never a declared authority). The arm refuses loud
+        # on anything missing (the lease, the secret, the listener), so a
+        # reader that mounted IS a token reader; `--token-readers` is the
+        # legs' recorded posture word.
         # Rung 7 (the S6-b venue): a reader may mount inside its own netns
         # so its membership wire is shapeable (netem/partition) — block
         # devices and the FUSE mount are namespace-blind.
@@ -1083,7 +884,7 @@ mount_member() { # idx [--netns[=<delay_ms>]]
             # the FUSE mount would land invisible to the root mount ns.
             launch=(nsenter "--net=/run/netns/$(ns_name "$idx")" env "${env_args[@]}" "$SQZ")
         fi
-        # DLM S5 reader: no identity, no claim, no registrant (POSTURE).
+        # A reader: no identity, no claim, no registrant (POSTURE).
         "${launch[@]}" mount "sqmeta://$META_PATHS" "$mnt" \
             --read-only --daemon --allow-other --log-file "$log" \
             >"$STATE/m${idx}.mount.out" 2>&1 ||
@@ -1092,17 +893,6 @@ mount_member() { # idx [--netns[=<delay_ms>]]
     fi
     wait_for "member $idx mountpoint" 40 mountpoint -q "$mnt"
     wait_for "member $idx stats inode" 40 test -s "$mnt/.stats"
-    if [ "$role" = "cowriter" ]; then
-        # Rung 9 engagement: the five-rung ladder ADMITTED and the mount is
-        # the co-writer posture (never a silently-degraded authority/reader).
-        grep -q "CO-WRITER ADMITTED" "$log" ||
-            die "co-writer $idx log carries no 'CO-WRITER ADMITTED' line — the admission ladder did not engage (log: $log)"
-        local posture
-        posture="$(stat_field "$mnt" mount_posture)"
-        [ "$posture" = "co-writer" ] ||
-            die "co-writer $idx mount_posture='$posture' (want co-writer) — log: $log"
-        log "member $idx co-writer posture engaged (CO-WRITER ADMITTED, mount_posture=co-writer)"
-    fi
     if [ "$role" = "reader" ] && [ "${TOKEN_READERS:-0}" = "1" ]; then
         # PR 13 engagement: the token arm's own line (it refuses the mount
         # otherwise) and the R-SYM-4 posture word — a reader that fell back
@@ -1141,55 +931,27 @@ mount_member() { # idx [--netns[=<delay_ms>]]
             die "joined writer $idx slot_leases_held='$held' (want ≥ 1) — log: $log"
         log "member $idx joined-writer posture engaged (appender $jid, manager_lease=$lease, $held slot(s), registrant adopted)"
     fi
-    if [ "$role" = "partial-authority" ] || [ "$role" = "set-authority" ]; then
-        # PR 8 / ops.md §Bringing a multi-owner fleet up, item 4 — asserted
-        # PER MOUNT: a posture that silently degraded to a full authority
-        # would take the D0 ladder on volumes a peer appends to, which is
-        # the outcome the whole ladder exists to prevent.
-        local posture armed ptry
-        posture="$(stat_field "$mnt" mount_posture)"
-        [ "$posture" = "$role" ] ||
-            die "member $idx mount_posture='$posture' (want $role) — the per-volume posture did not engage (log: $log)"
-        armed=""
-        for ((ptry = 0; ptry < 60; ptry++)); do
-            # The stats inode answers a JSON bool; python renders it `True`.
-            armed="$(stat_field "$mnt" meta_ship.armed)"
-            case "$armed" in
-            True | true) break ;;
-            esac
-            sleep 0.5
-        done
-        case "$armed" in
-        True | true) : ;;
-        *) die "member $idx meta_ship.armed='$armed' (want true) — the ownership plane did not arm (log: $log)" ;;
-        esac
-        grep -q "PARTIAL AUTHORITY ARMED\|MULTI-WRITER ARMED" "$log" ||
-            die "member $idx log carries no arm line — the $role arm did not run (log: $log)"
-        log "member $idx $role posture engaged (mount_posture=$role, meta_ship.armed=true)"
-    fi
     if [ "$idx" -eq 0 ]; then
         # Rung-2 engagement, half 1: the daemon's own log names each data
         # volume's daemon-owned controller (half 2 — sysfs — runs in create).
         grep -q "daemon-owned controller resolved" "$log" ||
             die "writer log carries no 'daemon-owned controller resolved' line — the rung-2 connect path did not engage (log: $log)"
-        # Rung 8 engagement: the MW arm must have taken the WERO hold on
-        # every data namespace — the fence-mode gauge is the instrument
+        # The join ladder's rung 4 (PR 14 — every writer): the WERO hold
+        # on every data namespace — the fence-mode gauge is the instrument
         # (0 would mean the mount silently degraded to detection grade,
         # which the arm is contractually forbidden to do: it refuses).
-        if [ "${MW:-0}" = "1" ]; then
-            local fm ftry
-            fm=""
-            for ((ftry = 0; ftry < 40; ftry++)); do
-                fm="$(stat_field "$mnt" data_plane_fence_mode)"
-                [ "$fm" = "1" ] && break
-                sleep 0.5
-            done
-            [ "$fm" = "1" ] ||
-                die "writer data_plane_fence_mode='$fm' (want 1) — the S7 WERO hold did not engage (log: $log)"
-            grep -q "data-plane WERO (rtype 3) acquired" "$log" ||
-                die "writer log carries no 'data-plane WERO (rtype 3) acquired' line — the S7 arm did not engage (log: $log)"
-            log "member 0 multi-writer data plane engaged (data_plane_fence_mode=1, WERO held)"
-        fi
+        local fm ftry
+        fm=""
+        for ((ftry = 0; ftry < 40; ftry++)); do
+            fm="$(stat_field "$mnt" data_plane_fence_mode)"
+            [ "$fm" = "1" ] && break
+            sleep 0.5
+        done
+        [ "$fm" = "1" ] ||
+            die "writer data_plane_fence_mode='$fm' (want 1) — the WERO hold did not engage (log: $log)"
+        grep -q "data-plane WERO (rtype 3) acquired" "$log" ||
+            die "writer log carries no 'data-plane WERO (rtype 3) acquired' line — rung 4 did not engage (log: $log)"
+        log "member 0 device-enforced data plane engaged (data_plane_fence_mode=1, WERO held)"
     fi
     # Rung 7: membership engagement is asserted PER MOUNT when armed — an
     # owner that did not arm or a reader that could not join is residue,
@@ -1258,45 +1020,6 @@ mount_reader_verified() { # idx
         die "reader $idx: meta_kv_revalidate_dirty_skips=$skips — the FIXED rung-6 pinned-node finding regressed (must stay 0 on every posture; see the FINDINGS note in the header)"
 }
 
-# Rung 9: parse the writer's ADVERTISED custody+publish endpoint (what a
-# co-writer dials — SQUEEZEFS_MW_AUTHORITY) from its MW arm line, and
-# persist/refresh it in the fleet config (append wins on re-source).
-record_mw_endpoint() {
-    local ep
-    ep="$(sed -n 's/.*MULTI-WRITER ARMED (DLM S9) on \(.*\): era.*/\1/p' "$STATE/m0.log" | tail -1)"
-    [ -n "$ep" ] || die "writer log carries no 'MULTI-WRITER ARMED (DLM S9) on <endpoint>' line (log: $STATE/m0.log)"
-    echo "MW_ENDPOINT='$ep'" >>"$CONF"
-    MW_ENDPOINT="$ep"
-    log "multi-writer authority endpoint: $ep"
-}
-
-# Rung 9, the enrollment harvest (ops.md §Multi-writer co-writer mounts,
-# "Bringing one up" steps 2-3, mechanized): a co-writer mount attempt
-# against an authority whose roster does not name it is REFUSED at rung 3,
-# and the refusal prints this mountpoint's durable enrollment id
-# (`node_{16 hex}.m{8 hex}` — KD-MW-2's (node, mount_slot) pair, stable per
-# mount point). The probe expects exactly that refusal and echoes the id;
-# gather_admission mutates nothing before rung 5, so the probe is
-# side-effect-free.
-probe_cowriter_id() { # idx -> echoes the durable enrollment id
-    local idx="$1" mnt out id
-    mnt="$(mnt_of "$idx")"
-    out="$STATE/m${idx}.probe.out"
-    mkdir -p "$mnt"
-    if env "${SCRUB_ENV[@]}" "SQUEEZEFS_FLEET_SHARE=$FLEET_N" \
-        "SQUEEZEFS_IPC_ALLOW_DEV=1" \
-        "SQUEEZEFS_MULTI_WRITER=1" "SQUEEZEFS_MW_ROLE=co-writer" \
-        "SQUEEZEFS_MW_AUTHORITY=$MW_ENDPOINT" \
-        "$SQZ" mount "sqmeta://$META_PATHS" "$mnt" \
-        --daemon --allow-other --log-file "$STATE/m${idx}.probe.log" \
-        >"$out" 2>&1; then
-        die "co-writer $idx PROBE mount was ADMITTED against a roster that does not name it — rung 3 did not engage (out: $out)"
-    fi
-    id="$(grep -o "Add 'node_[0-9a-f.m]*'" "$out" | head -1 | sed "s/^Add '//; s/'$//")"
-    [ -n "$id" ] || die "co-writer $idx probe refusal carries no enrollment id (want the rung-3 \"Add 'node_…'\" remedy; out: $out)"
-    echo "$id"
-}
-
 unmount_member() { # idx
     require_state
     local idx="$1" mnt pid
@@ -1335,240 +1058,32 @@ unmount_member() { # idx
     log "member $idx unmounted"
 }
 
-# PR 8, harvest step 2a: the NODE half of every co-located member id.
-# `probe_cowriter_id` answers `node_{16 hex}.m{8 hex}` for the mountpoint
-# it probed; every mount on this box shares the node half (KD-MW-2 — the
-# slot half is `xxh3_64(canonical mountpoint)`), so one probe names the
-# node and each mount's own `client_slot` gauge names its slot.
-node_half_of() { # member-id -> node_{16 hex}
-    local id="$1"
-    case "$id" in
-    *.m*) echo "${id%.m*}" ;;
-    *) echo "$id" ;;
-    esac
-}
-
-# PR 8, harvest step 2b: a MOUNTED member's own durable id. A probe cannot
-# run at an occupied mountpoint, and the stats inode does not publish the
-# id — but it publishes `client_slot` (`m{8 hex}`), which is exactly the
-# slot half, so the id is the composition. Verified against the peers'
-# harvested node half rather than assumed.
-mounted_member_id() { # idx node_half -> node_{16 hex}.m{8 hex}
-    local idx="$1" node="$2" slot
-    slot="$(stat_field "$(mnt_of "$idx")" client_slot)"
-    [[ "$slot" =~ ^m[0-9a-f]{8}$ ]] ||
-        die "member $idx client_slot='$slot' is not the KD-MW-2 slot form (m{8 hex}) — the fleet cannot name it in an ownership assignment"
-    echo "${node}.${slot}"
-}
-
-# The set's metadata volumes in CANONICAL order, as `vol-id<TAB>0|1`
-# (1 = hosts slot 0). Offline, read with the product verb — never derived
-# from device order (KD-5: the durable id is the identity).
-meta_volume_rows() {
-    sqz volume get-owners "sqmeta://$META_PATHS" --json |
-        python3 -c '
-import json, sys
-for r in json.load(sys.stdin):
-    print("%s\t%d" % (r["volume_id"], 1 if r["hosts_slot_0"] else 0))'
-}
-
-# PR 8, the ASSIGNMENT PLAN — pure, so it is exercisable without a fleet
-# (`bash -c '. tests/mw_fleet.sh; …'`). Reads `vol-id<TAB>hosts_slot_0`
-# rows and prints, one line per volume:
-#
-#     owner_slot <TAB> member_idx <TAB> vol-id <TAB> root|- <TAB> spec
-#
-# The three rules it encodes, each of which the verb would otherwise
-# refuse or the fleet would silently get wrong:
-#   * the SLOT-0 volume goes to owner slot 0 = member 0, because its owner
-#     IS the set authority (D20) and the rig mounts member 0 first;
-#   * EVERY volume is named — a partial map is refused, since a volume
-#     nobody is assigned to belongs to everyone and to nobody and would
-#     refuse every subsequent mount — so a set wider than K round-robins;
-#   * each owner's FIRST volume carries its `:<subtree-root>`, the half
-#     without which a node owns a volume but no WORK (§5.5.1/KD-PV-15)
-#     and PR 8's gate row measures the shipped path by construction.
-plan_owner_assignment() { # K id0 id1 … < vol-rows
-    # `python3 -c`, never a stdin heredoc: the ROWS are stdin.
-    python3 -c '
-import sys
-base, k, ids = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3:]
-if len(ids) != k:
-    sys.exit(f"plan_owner_assignment: {k} owners but {len(ids)} member id(s)")
-rows = [l.split("\t") for l in sys.stdin.read().split("\n") if l.strip()]
-vols = [r[0] for r in rows]
-slot0 = [r[0] for r in rows if len(r) > 1 and r[1] == "1"]
-if len(slot0) != 1:
-    sys.exit(f"plan_owner_assignment: {len(slot0)} volume(s) report hosting slot 0 "
-             "— D20 needs exactly one set authority to name")
-ordered = slot0 + [v for v in vols if v != slot0[0]]
-if len(ordered) < k:
-    sys.exit(f"plan_owner_assignment: {k} owners need at least {k} metadata volumes, "
-             f"this set has {len(ordered)}")
-rooted = set()
-for i, vol in enumerate(ordered):
-    o = i % k
-    member = 0 if o == 0 else base + o - 1
-    root = "-"
-    if o not in rooted:
-        rooted.add(o)
-        root = f"/owner-m{member}"
-    spec = f"{vol}={ids[o]}" + (f":{root}" if root != "-" else "")
-    print("\t".join((str(o), str(member), vol, root, spec)))
-' "$PARTIAL_BASE" "$@"
-}
-
-# PR 8: the multi-owner bring-up (ops.md §Bringing a multi-owner fleet up,
-# mechanized). Entered with member 0 mounted as a plain MW authority —
-# which is what wrote the durable claim sets — and left with the whole
-# fleet up, verified.
-bring_up_owner_fleet() { # K
-    local k="$1" i idx ids=() node="" specs=() vol
-    record_mw_endpoint
-
-    # ---- 1. harvest every prospective owner's durable member id --------
-    for ((i = 1; i < k; i++)); do
-        idx=$((PARTIAL_BASE + i - 1))
-        ids[i]="$(probe_cowriter_id "$idx")"
-        log "owner $idx enrollment id harvested: ${ids[i]}"
-        [ -n "$node" ] || node="$(node_half_of "${ids[i]}")"
-        [ "$(node_half_of "${ids[i]}")" = "$node" ] ||
-            die "member $idx's node half '$(node_half_of "${ids[i]}")' differs from '$node' on the same box — the KD-MW-2 node identity is not stable, and an assignment written against it would name a node no mount matches"
-    done
-    ids[0]="$(mounted_member_id 0 "$node")"
-    log "set authority (member 0) id: ${ids[0]}"
-
-    # ---- 2. the set goes DOWN: set-owners is offline by ruling D19 -----
-    unmount_member 0
-
-    # ---- 3. the plan (plan_owner_assignment — pure, testable) ----------
-    local plan owner_slot member_idx spec root rooted=()
-    plan="$(meta_volume_rows | plan_owner_assignment "$k" "${ids[@]}")" ||
-        die "the ownership plan could not be built (see the refusal above)"
-    while IFS=$'\t' read -r owner_slot member_idx vol root spec; do
-        [ -n "$spec" ] || continue
-        specs+=("$spec")
-        [ "$root" = "-" ] || rooted[$owner_slot]="$root"
-        local var="OWNER_VOLS_${member_idx}"
-        printf -v "$var" '%s' "${!var:+${!var} }${vol}"
-    done <<<"$plan"
-    log "assignment plan: ${specs[*]}"
-
-    # ---- 4. the M3 census, read from a DRY RUN and acknowledged --------
-    # Never guessed: the verb refuses unless the number matches exactly,
-    # and acknowledging a population you did not count is how an operator
-    # pays the whole cross-owner refusal cost by accident.
-    sqz volume set-owners "sqmeta://$META_PATHS" "${specs[@]}" --dry-run \
-        >"$STATE/set-owners.dry.out" 2>&1 ||
-        die "volume set-owners --dry-run failed: $(tail -5 "$STATE/set-owners.dry.out")"
-    local census
-    census="$(sed -n 's/^Cross-owner names: \([0-9][0-9]*\) .*/\1/p' "$STATE/set-owners.dry.out" | head -1)"
-    [ -n "$census" ] ||
-        die "volume set-owners --dry-run printed no cross-owner census (out: $STATE/set-owners.dry.out)"
-    log "M3 cross-owner name census at assignment: $census"
-    local apply=(volume set-owners "sqmeta://$META_PATHS" "${specs[@]}")
-    [ "$census" != "0" ] && apply+=(--accept-cross-owner-names "$census")
-    sqz "${apply[@]}" >"$STATE/set-owners.out" 2>&1 ||
-        die "volume set-owners failed: $(tail -5 "$STATE/set-owners.out")"
-    grep -q "SET AUTHORITY" "$STATE/set-owners.out" ||
-        die "volume set-owners printed no D20 set-authority announcement (out: $STATE/set-owners.out)"
-    log "ownership assigned ($(grep -c '^Minted subtree root' "$STATE/set-owners.out") subtree root(s) minted)"
-
-    # ---- 5. persist, then mount in the FORCED order --------------------
-    {
-        echo "OWNERS_ASSIGNED='1'"
-        echo "OWNER_CENSUS_AT_ASSIGNMENT='$census'"
-        echo "OWNER_ID_0='${ids[0]}'"
-        echo "OWNER_ROOT_0='${rooted[0]}'"
-        echo "OWNER_PORT_0='${MW_PORT:-45999}'"
-        echo "OWNER_VOLS_0='$(owner_field VOLS 0)'"
-        for ((i = 1; i < k; i++)); do
-            idx=$((PARTIAL_BASE + i - 1))
-            echo "OWNER_ID_${idx}='${ids[i]}'"
-            echo "OWNER_ROOT_${idx}='${rooted[$i]}'"
-            echo "OWNER_PORT_${idx}='$((${MW_PORT:-45999} + i))'"
-            echo "OWNER_VOLS_${idx}='$(owner_field VOLS "$idx")'"
-        done
-    } >>"$CONF"
-    # shellcheck disable=SC1090 # just appended above
-    . "$CONF"
-
-    # The SET AUTHORITY first, always: a partial authority's rung 4 demands
-    # a LIVE membership lease and the set authority owns that plane (D20),
-    # so it cannot even open the set before it.
-    mount_member 0
-    record_mw_endpoint
-    for ((i = 1; i < k; i++)); do
-        mount_member $((PARTIAL_BASE + i - 1))
-    done
-    verify_owner_fleet
-}
-
-# ops.md §Bringing a multi-owner fleet up, item 4 — the whole list, once
-# the fleet is up. Per-mount posture and arm are asserted at mount time;
-# these are the FLEET-WIDE ones, taken after a settle because item 3's
-# endpoint-refresh window is real and bounded.
-verify_owner_fleet() {
-    local idx mnt width="" w lanes refusals panics notowner
-    sleep 3
-    while IFS= read -r idx; do
-        [ -n "$idx" ] || continue
-        mnt="$(mnt_of "$idx")"
-        notowner="$(stat_field "$mnt" meta_ship.not_owner_refusals)"
-        panics="$(stat_field "$mnt" meta_ship.owner_panics)"
-        refusals="$(stat_field "$mnt" alloc_lane_raise_refusals)"
-        lanes="$(stat_field "$mnt" alloc_lane_writers)"
-        [ "$notowner" = "0" ] ||
-            die "member $idx meta_ship.not_owner_refusals=$notowner after bring-up — a verb reached a node that holds no authority over its target (bounded refusals DURING the endpoint refresh are expected; standing ones are not)"
-        [ "$panics" = "0" ] ||
-            die "member $idx meta_ship.owner_panics=$panics — must stay 0"
-        [ "$refusals" = "0" ] ||
-            die "member $idx alloc_lane_raise_refusals=$refusals — must stay 0 (a refused raise means an offset was NOT handed out)"
-        [ -n "$width" ] || width="$lanes"
-        [ "$lanes" = "$width" ] ||
-            die "member $idx alloc_lane_writers=$lanes but the fleet's width is $width — two writers deriving different partitions is the collision the partition exists to prevent"
-        log "member $idx verified (lanes=$lanes, not_owner=0, panics=0, raise_refusals=0)"
-    done < <(owner_idxs)
-    [ -n "$width" ] && [ "$width" != "0" ] ||
-        die "alloc_lane_writers=$width fleet-wide — 0 means UNPARTITIONED, which a multi-owner fleet never is"
-    w="$(owner_idxs | wc -l)"
-    log "multi-owner fleet verified: $w owner(s), allocation-lane width $width"
-}
-
 create_fleet() {
-    local n="$N_DEFAULT" cowriters=0 owners=0 require_hs=0 vms=0 mw=0 symmetric=0 writers=0 token_readers=0 a
+    local n="$N_DEFAULT" require_hs=0 vms=0 writers=0 token_readers=0 a
     local membership="${SQZ_MWFLEET_MEMBERSHIP:-}" lease_ttl_ms="${SQZ_MWFLEET_LEASE_TTL_MS:-}"
     for a in "$@"; do
         case "$a" in
         N=*) n="${a#N=}" ;;
-        # Symmetric PR 10: format `--symmetric` (incompat bit 17, the
-        # forest + the appender region) and arm the WRITER with
-        # SQUEEZEFS_SYMMETRIC_META=1 — the manager of a one-appender
-        # symmetric set (N daemons on one volume is PR 12's). The kill
-        # legs then exercise the death path this binary HAS: the D0
-        # successor's own-residue recovery, the frame screen, the C14/C15
-        # census and the ledger's driver (`run_mw_matrix.sh sym-crash`).
-        --symmetric) symmetric=1 ;;
+        # PR 14: the symmetric forest IS the default format and every RW
+        # mount arms the plane (SQUEEZEFS_SYMMETRIC_META defaults to 1) —
+        # `--symmetric` is accepted as the default's spelling, `--multi-
+        # writer` too (the writer's WERO hold is the join ladder's rung 4).
+        --symmetric | --multi-writer) log "$a: the default since the PR-14 flip (accepted, no-op)" ;;
         # Symmetric PR 12b: K JOINED WRITERS beside the manager — every one
         # a full RW mount of the armed set through the join ladder (N
         # unbounded by design; the rig's slice starts at JOINER_BASE).
         --writers) die "--writers takes a value (--writers=K)" ;;
         --writers=*) writers="${a#--writers=}" ;;
         # Symmetric PR 13 (gate 5 / the recalled-reader crash leg): the
-        # fleet's `--read-only` members mount as READ-TOKEN clients
-        # (`SQUEEZEFS_SYMMETRIC_META=1` on the reader — PR 5's §5.7.2
-        # posture: member-reader + a token plane per slot holder, exact at
-        # the next resolve, `reader_staleness_bound_ms == 0`). Without it
-        # the readers are the S5 bounded-staleness pollers PR 10–12b's kill
-        # legs were adjudicated on; recorded in the CONF so a remount
-        # keeps the posture.
+        # legs that judge the readers' token gauges (`sym-readers`) ask for
+        # it; since PR 14 every `--read-only` member IS a read-token
+        # client (PR 5's §5.7.2 posture: member-reader + a token plane per
+        # slot holder, exact at the next resolve,
+        # `reader_staleness_bound_ms == 0`), so the word records the ask.
         --token-readers) token_readers=1 ;;
-        --cowriters)
-            die "--cowriters takes a value (--cowriters K)"
+        --cowriters | --cowriters=* | --owners | --owners=*)
+            die "$a: RETIRED at the symmetric default flip (PR 14) — the S9 co-writer and the per-volume-owner recipes are gone (SQUEEZEFS_MULTI_WRITER / SQUEEZEFS_MW_ROLE / SQUEEZEFS_MW_AUTHORITY / SQUEEZEFS_MW_MEMBERS refuse at the daemon's startup gate; \`volume set-owners\` is a hard error). A second RW mount of the set is a JOINED WRITER through the join ladder: create ... --writers=K"
             ;;
-        --cowriters=*) cowriters="${a#--cowriters=}" ;;
-        --owners) die "--owners takes a value (--owners=K)" ;;
-        --owners=*) owners="${a#--owners=}" ;;
         --require-host-scoped-subsys) require_hs=1 ;;
         --vm) die "--vm takes a value (--vm=V)" ;;
         --vm=*) vms="${a#--vm=}" ;;
@@ -1579,83 +1094,30 @@ create_fleet() {
         --membership) membership="auto" ;;
         --membership=*) membership="${a#--membership=}" ;;
         --lease-ttl-ms=*) lease_ttl_ms="${a#--lease-ttl-ms=}" ;;
-        --multi-writer) mw=1 ;;
         [0-9]*) n="$a" ;;
         *) die "unknown create argument '$a'" ;;
         esac
     done
     [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] || die "N must be a positive integer (got '$n')"
-    # The reader slice is 1..N-1 below the co-writer slice; a wider N would
-    # dispatch its tail as co-writers (PR 13c: the 32-member token-reader
-    # fleet's readers 20..31 sit inside the partial-authority slice, which
-    # exists on an --owners fleet ALONE — `mount_member` reads the shape).
-    [ "$n" -le "$COWRITER_BASE" ] ||
-        die "N=$n exceeds the reader slice (indices 1..$((COWRITER_BASE - 1)); the co-writer slice starts at $COWRITER_BASE)"
+    # The reader slice is 1..READER_MAX (the joined writers start at 60).
+    [ "$n" -le "$((READER_MAX + 1))" ] ||
+        die "N=$n exceeds the reader slice (indices 1..$READER_MAX; the joined-writer slice starts at $JOINER_BASE)"
     [[ "$vms" =~ ^[0-9]+$ ]] || die "--vm=V needs a non-negative integer (got '$vms')"
     [ -z "$lease_ttl_ms" ] || [[ "$lease_ttl_ms" =~ ^[0-9]+$ ]] ||
         die "--lease-ttl-ms takes milliseconds (got '$lease_ttl_ms')"
-    [ -z "$lease_ttl_ms" ] || [ -n "$membership" ] || [ "$mw" = "1" ] || [ "$symmetric" = "1" ] ||
-        die "--lease-ttl-ms is the OWNER's membership lease knob — it needs --membership"
-    [[ "$cowriters" =~ ^[0-9]+$ ]] || die "--cowriters=K needs a non-negative integer (got '$cowriters')"
     [[ "$writers" =~ ^[0-9]+$ ]] || die "--writers=K needs a non-negative integer (got '$writers')"
-    [ "$writers" -eq 0 ] || [ "$symmetric" = "1" ] ||
-        die "--writers=$writers: joined writers are the SYMMETRIC plane's posture (create ... --symmetric --writers=K) — under the per-volume-owner recipe a second RW mount is --owners; under the S9 recipe a data-only peer is --cowriters"
-    [ "$token_readers" -eq 0 ] || [ "$symmetric" = "1" ] ||
-        die "--token-readers: a read-token client needs the symmetric forest (create ... --symmetric --token-readers) — on a bit-17-absent set the reader's arm refuses loud naming enable-symmetric"
-    # PR 8 — the MULTI-OWNER shape's own preconditions, all before anything
-    # costly exists.
-    [[ "$owners" =~ ^[0-9]+$ ]] || die "--owners=K needs a non-negative integer (got '$owners')"
-    if [ "$owners" -gt 0 ]; then
-        [ "$owners" -ge 2 ] ||
-            die "--owners=$owners: a multi-owner fleet is two or more owners. One owner IS the shipped single-authority set — mount it with no role at all"
-        [ "$owners" -le 16 ] ||
-            die "--owners=$owners exceeds MAX_LANES=16: the journal admits at most 16 appenders and 'volume set-owners' refuses a wider assignment (design §5.7's lane-width table)"
-        [ "$cowriters" -eq 0 ] ||
-            die "--owners=$owners with --cowriters=$cowriters: these are two different fleet SHAPES. A co-writer holds no metadata authority at all; a partial authority appends to its own volumes. Build one or the other"
-        [ "$n" -le "$PARTIAL_BASE" ] ||
-            die "--owners needs N <= $PARTIAL_BASE (reader indices must stay below the partial-authority slice; got N=$n)"
-        if [ "$MDS_COUNT" -lt "$owners" ]; then
-            log "--owners=$owners: raising SQZ_MWFLEET_MDS_COUNT $MDS_COUNT -> $owners (every owner must be assigned at least one metadata volume, and a partial map is refused)"
-            MDS_COUNT="$owners"
-        fi
-        if [ "$mw" != "1" ]; then
-            mw=1
-            log "--owners implies --multi-writer (the per-volume ladder's rung 1 demands the opt-in, rung 5 the device registrant)"
-        fi
-    fi
-    if [ "$cowriters" -gt 0 ] && [ "$mw" != "1" ]; then
-        # A co-writer's admission rung 1 demands the opt-in on BOTH halves.
-        mw=1
-        log "--cowriters implies --multi-writer (the admission ladder's rung 1)"
-    fi
-    if [ "$mw" = "1" ] && [ -z "$membership" ]; then
-        # The MW arm's rung 4 refuses with membership off (a co-writer that
-        # cannot be SEEN cannot be EVICTED) — imply the default arm loudly.
+    if [ -z "$membership" ]; then
+        # The death ledger's PRODUCTION writer is the S6 owner's eviction
+        # (PR 10): a fleet without the plane records no death and recovers
+        # nothing but its own residue — the join ladder's rung 3 arms it
+        # `auto` on every writer, and the rig records the same default.
         membership="auto"
-        log "--multi-writer implies --membership (the S9 arm's rung 4 refuses with the plane off)"
+        log "membership implied (the death ledger's writer is the S6 owner's eviction; the join ladder's rung 3)"
     fi
-    if [ "$symmetric" = "1" ]; then
-        [ "$owners" -eq 0 ] ||
-            die "--symmetric with --owners=$owners: the per-volume-owner recipe and the symmetric forest are two different metadata planes (design-symmetric-metadata §7.3 — set-owners assignments are DROPPED by the conversion)"
-        # PR 12: the posture knobs are RETIRED spellings beside
-        # SQUEEZEFS_SYMMETRIC_META=1 (the daemon refuses them at its startup
-        # gate naming the plane) — every RW mount of a symmetric set is a
-        # writer through the join ladder; there is no authority to declare
-        # and no co-writer to admit.
-        [ "$mw" != "1" ] && [ "$cowriters" -eq 0 ] ||
-            die "--symmetric with --multi-writer / --cowriters: under the symmetric plane SQUEEZEFS_MULTI_WRITER and SQUEEZEFS_MW_ROLE are RETIRED spellings (design-symmetric-metadata §6.1 / §7.3, PR 12) — every RW mount is a writer through the join ladder; drop them"
-        if [ -z "$membership" ]; then
-            # The death ledger's PRODUCTION writer is the S6 owner's
-            # eviction (PR 10): a symmetric fleet without the plane records
-            # no death and recovers nothing but its own residue.
-            membership="auto"
-            log "--symmetric implies --membership (the death ledger's writer is the S6 owner's eviction)"
-        fi
-        # PR 13i tap mode: `auto` advertises the box's default-route
-        # address; the guest must dial the TAP's host address.
-        if [ "$VM_NET" = "tap" ] && [ "$membership" = "auto" ]; then
-            membership="$VM_TAP_HOST_IP:0"
-        fi
+    # PR 13i tap mode: `auto` advertises the box's default-route
+    # address; the guest must dial the TAP's host address.
+    if [ "$VM_NET" = "tap" ] && [ "$membership" = "auto" ]; then
+        membership="$VM_TAP_HOST_IP:0"
     fi
     [ -e "$CONF" ] && die "fleet state exists at $STATE — run 'sudo tests/mw_fleet.sh teardown' first"
     ensure_prereqs
@@ -1785,13 +1247,11 @@ create_fleet() {
         echo "${data_paths[*]}"
     )"
 
-    # --- format (multi-writer-capable is the DEFAULT class since the
-    # rung-10b Phase-B flip — no flag needed) + the durable endpoint
-    # records (rung 2, product verb) ------------------------------------------
-    local fmt_args=(--force)
-    [ "$symmetric" = "1" ] && fmt_args+=(--symmetric)
-    log "format (default = multi-writer-capable$([ "$symmetric" = "1" ] && echo ' + --symmetric: bit 17')) over sqmeta://$meta_uri sqdata://$data_uri"
-    sqz format "sqmeta://$meta_uri" "sqdata://$data_uri" "${fmt_args[@]}" \
+    # --- format (the DEFAULT class: the symmetric forest — bit 17 + the
+    # nine multi-writer bits — since the PR-14 flip; no flag) + the durable
+    # endpoint records (rung 2, product verb) -----------------------------
+    log "format (default = the symmetric forest, bit 17) over sqmeta://$meta_uri sqdata://$data_uri"
+    sqz format "sqmeta://$meta_uri" "sqdata://$data_uri" --force \
         >"$STATE/format.out" 2>&1 || die "format failed: $(tail -3 "$STATE/format.out")"
 
     # vol ids from the PRODUCT verb (never assumed): id -> backing map.
@@ -1875,16 +1335,6 @@ create_fleet() {
     if [ "$require_hs" = "1" ] && [ "$host_scoped" != "1" ]; then
         die "--require-host-scoped-subsys: this kernel merges fabric subsystems across host identities (nvme_core.multipath=Y). Remedy: the rung-5b sqz kernel (docs/design-full-multi-writer.md rung 5b), or the documented stock-kernel workaround nvme_core.multipath=N (boot parameter)"
     fi
-    if [ "$cowriters" != "0" ]; then
-        # Rung 9: CO-LOCATED co-writers need no 5b kernel — they share the
-        # box's PR host identity (the ops.md honest residual: on this shape
-        # the metadata read-only half is enforced by the mount's own code,
-        # not by the device), so no second fabric identity is created and
-        # the merged-head POSTURE note does not apply. Multi-IDENTITY
-        # (cross-host-shaped) co-writers stay gated on 5b / the VM leg.
-        log "--cowriters=$cowriters: CO-LOCATED co-writers (shared PR host identity — the ops.md honest-residual shape; device-enforced co-writer fencing rows stay 5b/VM territory)"
-    fi
-
     # --- persist config, mount the fleet -------------------------------------
     {
         echo "FLEET_N='$n'"
@@ -1914,33 +1364,16 @@ create_fleet() {
         echo "GUEST_DATA_PATH='$guest_data_path'"
         echo "MEMBERSHIP='$membership'"
         echo "MEMBERSHIP_LEASE_TTL_MS='$lease_ttl_ms'"
-        echo "MW='$mw'"
         echo "MW_PORT='${SQZ_MWFLEET_MW_PORT:-45999}'"
-        echo "COWRITERS='$cowriters'"
-        # PR 10: the symmetric forest (bit 17) + the armed plane on the
-        # writer; `run_mw_matrix.sh sym-crash` requires it.
-        echo "SYMMETRIC='$symmetric'"
+        # PR 14: every fleet is the symmetric forest with the plane armed
+        # on every RW mount (the legs' `require_symmetric` reads it).
+        echo "SYMMETRIC='1'"
         # PR 12b: the joined writers (indices JOINER_BASE..).
         echo "WRITERS='$writers'"
-        # PR 13: the readers' posture (1 = read-token clients).
+        # PR 13: the readers' posture word (every `--read-only` mount is a
+        # read-token client since PR 14; `1` = the legs that judge the
+        # readers' token gauges were asked for).
         echo "TOKEN_READERS='$token_readers'"
-        # PR 8: the multi-owner shape. `OWNERS_ASSIGNED` flips to 1 only
-        # when `volume set-owners` has actually written the assignment —
-        # the per-volume mount branches read it, so a create that died
-        # mid-bracket cannot mount a posture the durable state does not
-        # support.
-        echo "OWNERS='$owners'"
-        echo "OWNERS_ASSIGNED='0'"
-        # The honest divisor for THIS shape: a K-owner fleet runs K
-        # daemons on one box, and FLEET_N counts only the reader slice.
-        [ "$owners" -gt 0 ] && echo "FLEET_SHARE='$((n + owners - 1))'"
-        # Rung 15 (KD-MW-7): SQZ_MWFLEET_RANGE_CUSTODY=1 at create arms
-        # SQUEEZEFS_RANGE_CUSTODY on every co-writer mount (the lever
-        # ships default-OFF until rungs 16/17 land the concurrent same-ino
-        # publish composition — the 2026-08-17 adjudication; the s11-range
-        # leg requires an armed fleet and is that composition's
-        # acceptance surface).
-        echo "RANGE_CUSTODY='${SQZ_MWFLEET_RANGE_CUSTODY:-0}'"
         echo "PUBLISH_GROUP_MAX='${SQZ_MWFLEET_PUBLISH_GROUP_MAX:-}'"
     } >"$CONF"
     : >"$VMS"
@@ -1989,16 +1422,7 @@ create_fleet() {
     # the rung-6 finding #1 fix (the declaration absolves the replayed
     # residue) — mount_reader_verified asserts the tripwire stays 0.
 
-    # PR 8: the MULTI-OWNER bring-up (ops.md §Bringing a multi-owner fleet
-    # up) runs BEFORE the readers, because its step 2 takes the whole set
-    # DOWN — `volume set-owners` is offline by ruling D19 and refuses any
-    # volume a live node holds. Readers join the ASSIGNED set afterwards,
-    # which is also the field order.
     local idx
-    if [ "$owners" -gt 0 ]; then
-        bring_up_owner_fleet "$owners"
-    fi
-
     for ((idx = 1; idx < n; idx++)); do
         mount_reader_verified "$idx"
     done
@@ -2010,38 +1434,12 @@ create_fleet() {
         mount_member $((JOINER_BASE + idx))
     done
 
-    # Rung 9: the co-writer bring-up — the ops.md "Bringing one up" flow,
-    # mechanized. Phase 1 harvests each mountpoint's durable enrollment id
-    # from its rung-3 refusal; phase 2 re-arms the AUTHORITY with the
-    # roster (enrollment is the authority's durable act — a new era);
-    # phase 3 mounts the admitted co-writers.
-    if [ "$cowriters" -gt 0 ]; then
-        record_mw_endpoint
-        local roster="" cid cw_idx
-        for ((idx = 0; idx < cowriters; idx++)); do
-            cw_idx=$((COWRITER_BASE + idx))
-            cid="$(probe_cowriter_id "$cw_idx")"
-            log "co-writer $cw_idx enrollment id harvested: $cid"
-            roster="${roster:+$roster,}$cid"
-        done
-        echo "MW_ROSTER='$roster'" >>"$CONF"
-        MW_ROSTER="$roster"
-        export MW_ROSTER
-        log "re-arming the authority with the roster (a new era): $roster"
-        unmount_member 0
-        mount_member 0
-        record_mw_endpoint
-        for ((idx = 0; idx < cowriters; idx++)); do
-            mount_member $((COWRITER_BASE + idx))
-        done
-    fi
-
     # Rung-6b guests LAST (they dial the target the fleet already rides;
     # they hold no member role this rung — the in-guest legs drive them).
     for ((idx = 0; idx < vms; idx++)); do
         vm_boot "$idx"
     done
-    log "fleet up: 1 writer + $((n - 1)) reader(s) + $cowriters co-writer(s) + $writers joined writer(s) + $([ "$owners" -gt 0 ] && echo "$((owners - 1))" || echo 0) partial-authorit(y/ies) + $vms guest(s), SQUEEZEFS_FLEET_SHARE=$n per daemon"
+    log "fleet up: 1 manager + $((n - 1)) reader(s) + $writers joined writer(s) + $vms guest(s), SQUEEZEFS_FLEET_SHARE=$n per daemon"
     status_fleet
 }
 
@@ -2069,30 +1467,6 @@ status_fleet() {
             printf '%-4s %-7s %-6s %-6s %-10s %s\n' "$vidx" "$vaccel" "$vpid" "$vlive" "$vhs" "$vdir"
         done <"$VMS"
     fi
-}
-
-# PR 8: the recorded assignment, as the legs and the operator read it.
-# Assignment BESIDE evidence is `squeezefs volume get-owners`' job — this
-# prints what the RIG assigned and where each owner serves, so a leg can
-# name a node's own subtree root without re-deriving it.
-owners_fleet() {
-    require_state
-    [ "${OWNERS:-0}" != "0" ] ||
-        die "this fleet has no per-volume ownership assignment (create it with: sudo tests/mw_fleet.sh create N=1 --owners=K)"
-    echo "[mwfleet] owners=$OWNERS assigned=${OWNERS_ASSIGNED:-0} cross-owner names at assignment=${OWNER_CENSUS_AT_ASSIGNMENT:-?}"
-    printf '%-4s %-16s %-34s %-14s %-7s %s\n' IDX POSTURE MEMBER_ID SUBTREE_ROOT MW_PORT VOLUMES
-    local idx posture
-    while IFS= read -r idx; do
-        [ -n "$idx" ] || continue
-        if [ "$idx" = "0" ]; then posture="set-authority"; else posture="partial-authority"; fi
-        printf '%-4s %-16s %-34s %-14s %-7s %s\n' \
-            "$idx" "$posture" "$(owner_field ID "$idx")" \
-            "$(owner_field ROOT "$idx")" "$(owner_field PORT "$idx")" \
-            "$(owner_field VOLS "$idx")"
-    done < <(owner_idxs)
-    echo "[mwfleet] set authority endpoint (SQUEEZEFS_MW_AUTHORITY): ${MW_ENDPOINT:-?}"
-    sqz volume get-owners "$(mnt_of 0)" 2>/dev/null ||
-        warn "live get-owners unavailable (is member 0 mounted?)"
 }
 
 kill_member() {
@@ -2295,7 +1669,6 @@ ensure_root "$VERB" "$@"
 case "$VERB" in
 create) create_fleet "$@" ;;
 status) status_fleet ;;
-owners) owners_fleet ;;
 mount) mount_member "${1:?mount needs a member index}" "${2:-}" ;;
 unmount) unmount_member "${1:?unmount needs a member index}" ;;
 kill)
@@ -2337,5 +1710,5 @@ partition)
     require_state
     partition_set "${1:?partition needs a member index}" "${2:?partition needs on|off}"
     ;;
-*) die "unknown verb '$VERB' (create|status|owners|mount|unmount|kill|netem|partition|probe-host-scoped|vm-boot|vm-exec|vm-stop|pause|resume|teardown)" ;;
+*) die "unknown verb '$VERB' (create|status|mount|unmount|kill|netem|partition|probe-host-scoped|vm-boot|vm-exec|vm-stop|pause|resume|teardown)" ;;
 esac

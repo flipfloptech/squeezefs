@@ -642,16 +642,11 @@ pub const CUSTODY_MODE_REGULAR_FILE: u32 = libc::S_IFREG;
 /// never grow it past the live population.
 static TOKEN_CLIENTS: once_cell::sync::Lazy<scc::HashSet<String>> =
     once_cell::sync::Lazy::new(scc::HashSet::new);
-/// Bumped when a NEW token client is noted (review round 2, Issue 22:
-/// the recall gate's reader-class verdict caches against it, beside the
-/// membership census generation).
-static TOKEN_CLIENTS_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Record `client` as a token client of this holder.
 pub fn note_token_client(client: &str) {
-    if !TOKEN_CLIENTS.contains_sync(client) && TOKEN_CLIENTS.insert_sync(client.to_string()).is_ok()
-    {
-        TOKEN_CLIENTS_GENERATION.fetch_add(1, Ordering::Release);
+    if !TOKEN_CLIENTS.contains_sync(client) {
+        let _ = TOKEN_CLIENTS.insert_sync(client.to_string());
     }
 }
 
@@ -660,15 +655,9 @@ pub fn is_token_client(client: &str) -> bool {
     TOKEN_CLIENTS.contains_sync(client)
 }
 
-/// The token-client registry's generation (monotone).
-pub fn token_clients_generation() -> u64 {
-    TOKEN_CLIENTS_GENERATION.load(Ordering::Acquire)
-}
-
 /// Test seam: forget every token client (a fresh holder).
 pub fn test_clear_token_clients() {
     TOKEN_CLIENTS.clear_sync();
-    TOKEN_CLIENTS_GENERATION.fetch_add(1, Ordering::Release);
 }
 
 /// Every armed holder plane in the process (weak — a dropped backend
@@ -712,9 +701,7 @@ fn note_member_departed(client: &str) {
     for plane in planes {
         plane.sweep_departed(client);
     }
-    if TOKEN_CLIENTS.remove_sync(client).is_some() {
-        TOKEN_CLIENTS_GENERATION.fetch_add(1, Ordering::Release);
-    }
+    TOKEN_CLIENTS.remove_sync(client);
 }
 
 /// The holder's side of the token plane for ONE volume.

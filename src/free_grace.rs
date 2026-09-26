@@ -212,45 +212,22 @@
 //! three levers (`SQUEEZEFS_FREE_GRACE_{QUALIFY_CEILING,DRAIN_EPOCH_STAMP,
 //! DRAIN_OBSERVED}`) restores its retired term verbatim.
 //!
-//! # Term 2 — the fleet-only `min_acked→released` hop, and the lane behind it
+//! # Term 2 — the fleet-only `min_acked→released` hop (retired with the lane)
 //!
 //! The fleet row (`.benchmarks/2026-09-06-free-grace-hold-time.md` §6) read
-//! a 2,500 ms MEAN on `min_acked→released` where the model read 9 ms.
-//! `released` IS the harvest's pop, and the harvest is DEMAND-driven — a
-//! terminal free landing, an allocation, a co-writer's harvest RPC — so the
-//! stage is the wait for the next demand event after the cover; in the
-//! fleet's quiet phases (a close, a fsync wedge) the cover comes from the
-//! owner's 10 s sweep and the release from the next iteration's first
-//! demand. Behind it sits a hop no ledger saw: a released CO-WRITER-lane
-//! block is on the AUTHORITY's list, reachable only by that co-writer's
-//! next harvest RPC — its ENOSPC park slices, or the watermark tick, which
-//! never fires while the co-writer holds supply above its watermark.
-//! `alloc_lane_visible_phase_ns` (`released_served` on the authority's
-//! clock, `served_visible` = the co-writer's round trip, exact-sum) is the
-//! instrument ([`mark_lane_release`] / [`take_lane_release`] /
-//! [`note_lane_visible`]); the reply carries each block's age (publish
-//! schema 14). The lever `SQUEEZEFS_FREE_GRACE_LANE_PUSH` (default on):
-//! **release on ack** — a binding member's advancing acknowledgement
-//! harvests every ring to its uncovered front through the installed
-//! [`ReleaseHook`], rate-limited by lever (d)'s law — and **the lane-supply
-//! hint** — the renewal grant carries the member's lane population on the
-//! authority's lists (per-lane counters, never a scan), and a co-writer
-//! learning a nonzero hint wakes its refill at once
-//! ([`lane_supply_wake`]). Model at the fleet cadences (3 s write / 21 s
-//! close): `min_acked→released` 3,408 → 0 ms, the lane hop 30.7 → 1.5 s,
-//! the hold 22.6 → 14.7 s; `.benchmarks/2026-09-06-free-grace-lane-visible.md`.
-//!
-//! **The hint IS the refill gate** (2026-09-07,
-//! `.benchmarks/2026-09-07-lane-refill-hint-gate.md`): both proactive
-//! arms — the pushed refill and the allocator's watermark tick — used to
-//! arm on the OWED ledger (+1 per `Freed` verdict of an explicitly shipped
-//! free), and on the s11 fleet ≈ 90 % of a co-writer's displaced blocks
-//! return through the authority's publish RECOMPUTE, which notes nothing
-//! owed — so both arms sat dark with the authority advertising hundreds of
-//! the lane's blocks, and every refill ran from inside an ENOSPC park.
-//! [`lane_supply_witnessed`] is the one predicate: the advertised supply
-//! or the owed ledger; `SQUEEZEFS_ALLOC_LANE_REFILL_HINT=0` is the retired
-//! owed-only gate (the A/B control).
+//! a 2,500 ms MEAN on `min_acked→released` where the model read 9 ms:
+//! `released` IS the harvest's pop, the harvest is DEMAND-driven, and
+//! behind it sat a hop no ledger saw — a released CO-WRITER-lane block on
+//! the AUTHORITY's list, reachable only by that co-writer's next harvest
+//! RPC. The instrument (`alloc_lane_visible_phase_ns`), the lever
+//! (`SQUEEZEFS_FREE_GRACE_LANE_PUSH` — release on ack + the lane-supply
+//! hint) and the refill gate (`SQUEEZEFS_ALLOC_LANE_REFILL_HINT`) were the
+//! S9 lane partition's, and left with it at the PR-14 flip: under the
+//! symmetric plane a writer's supply is PR 8's block grant from its data
+//! volume's allocation-lease holder, and a freed block returns to the
+//! holder's bitmap — no lane, no hop (`.benchmarks/2026-09-06-free-grace-
+//! lane-visible.md` and `.benchmarks/2026-09-07-lane-refill-hint-gate.md`
+//! are the retired mechanism's record).
 //!
 //! # Cost when unarmed (the shipped default)
 //!
@@ -438,139 +415,6 @@ static PROMISED_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 /// checkpoint ceiling advertised on the grant that carried the ask in
 /// `PASS_PROD_MS` (`0` = none advertised — the routine constant applies).
 static PASS_FLOOR_MS: AtomicU64 = AtomicU64::new(0);
-
-// -- the lane-visible decomposition (finding 15 term 2, 2026-09-06) ----------
-//
-// Where a RELEASED offset goes before a co-writer can mint it: a released
-// co-writer-lane block lands on the AUTHORITY's free list (`released` — the
-// harvest's pop and the free-list publish are one synchronous act, so the
-// hold ledger's `min_acked→released` already ends at the publish), waits
-// there until that lane's next harvest RPC takes it (`released→served`,
-// authority clock), and becomes visible to the co-writer's allocator when
-// the reply is adopted (`served→visible`, the round trip — the co-writer's
-// clock, the serve having happened inside it). The two clocks never mix:
-// the authority stamps the age it measured into the reply, the co-writer
-// stamps that age beside its own RTT, and `total ≡ released_served +
-// served_visible` per sample by construction.
-
-/// `(vol_tag, block_idx)` → owner-clock ms of the free-list publish, for
-/// every grace-released block of a lane THIS mount does not own (the
-/// co-writers' supply on the authority's list). Inserted at the publish,
-/// removed at the lane harvest that takes the block — a subset of the
-/// free list's foreign-lane population, so it is bounded by it. Only ever
-/// touched on an armed plane with a partition engaged.
-static LANE_RELEASE_MARKS: once_cell::sync::Lazy<scc::HashMap<(u64, u64), u64>> =
-    once_cell::sync::Lazy::new(scc::HashMap::new);
-/// The per-stage histograms (`alloc_lane_visible_phase_ns`).
-static LANE_VISIBLE_PHASES: once_cell::sync::Lazy<
-    [crate::fuse_client::LatencyHistogram; LANE_VISIBLE_PHASES_N],
-> = once_cell::sync::Lazy::new(|| {
-    std::array::from_fn(|_| crate::fuse_client::LatencyHistogram::default())
-});
-/// Served lane blocks with no release mark (`alloc_lane_visible_unplaced`):
-/// a block that reached the free list other than through a grace release
-/// on this plane (the mount-time derivation, a release before the plane
-/// armed). The exact-sum law reads over the placed population.
-static LANE_VISIBLE_UNPLACED: AtomicU64 = AtomicU64::new(0);
-
-const LANE_VISIBLE_PHASES_N: usize = 3;
-/// The stage names, in loop order; the JSON keys of
-/// `alloc_lane_visible_phase_ns`.
-pub const LANE_VISIBLE_PHASE_NAMES: [&str; LANE_VISIBLE_PHASES_N] =
-    ["released_served", "served_visible", "total"];
-const LANE_VISIBLE_RELEASED_SERVED: usize = 0;
-const LANE_VISIBLE_SERVED_VISIBLE: usize = 1;
-const LANE_VISIBLE_TOTAL: usize = 2;
-
-// -- the lane-push lever (`SQUEEZEFS_FREE_GRACE_LANE_PUSH`) --------------------
-
-/// Cached knob: 0 = unread, 1 = on, 2 = off (the `ACK_RENEWAL` shape).
-static LANE_PUSH: AtomicU64 = AtomicU64::new(0);
-/// The authority's release hook — every allocator's grace ring harvested
-/// to its uncovered front — installed by the multi-writer arm (`None` on
-/// every other mount, which makes the release-on-ack arm structurally
-/// inert there).
-static RELEASE_HOOK: once_cell::sync::Lazy<ArcSwapOption<ReleaseHook>> =
-    once_cell::sync::Lazy::new(ArcSwapOption::empty);
-/// Release-on-ack runs (`free_grace_lane_push_releases`): binding acks
-/// whose arrival harvested the rings instead of leaving the covered
-/// offsets to the next demand event.
-static LANE_PUSH_RELEASES: AtomicU64 = AtomicU64::new(0);
-/// The authority's per-member lane-supply source (member id → blocks of
-/// that member's lane on this mount's free lists), installed by the
-/// multi-writer arm beside the hook.
-static LANE_SUPPLY_SOURCE: once_cell::sync::Lazy<ArcSwapOption<LaneSupplySource>> =
-    once_cell::sync::Lazy::new(ArcSwapOption::empty);
-/// Renewal grants that carried a nonzero lane-supply hint
-/// (`free_grace_lane_push_hints`, authority side).
-static LANE_PUSH_HINTS: AtomicU64 = AtomicU64::new(0);
-/// The last hint this member's renewal learned (co-writer side): blocks of
-/// its lane on the authority's free lists, summed over the mount's data
-/// volumes — the SUPPLY WITNESS both proactive refill arms gate on
-/// ([`lane_push_wants_harvest`], `BlockAllocator::should_harvest_ahead`).
-static LANE_SUPPLY_HINT: AtomicU64 = AtomicU64::new(0);
-/// The ADVERTISEMENT generation (the single-flight harvest's decline
-/// witness, `.benchmarks/2026-09-07-lane-harvest-single-flight.md`): +1
-/// per grant that reached this member — the value's change or not, the
-/// lane-push lever or not — so "the authority's advertisement moved" is
-/// one compare, and a decline stamped at one generation ends at the next
-/// grant. Bounded by the renewal cadence by construction; never a timer.
-static LANE_SUPPLY_HINT_GEN: AtomicU64 = AtomicU64::new(0);
-/// Cached knob `SQUEEZEFS_ALLOC_LANE_REFILL_HINT`: 0 = unread, 1 = on,
-/// 2 = off (the `LANE_PUSH` shape). Off = the retired owed-only gate.
-static REFILL_HINT: AtomicU64 = AtomicU64::new(0);
-/// Cached knob `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT`: 0 = unread, 1 = on,
-/// 2 = off (the `LANE_PUSH` shape). Off = every per-volume reader answers
-/// the mount sum / the mount-wide arrival generation verbatim.
-static VOLUME_HINT: AtomicU64 = AtomicU64::new(0);
-/// **The per-volume advertisement** (co-writer side, finding 15's fpp
-/// residue): `vol_tag` → what the authority's latest grant said about THIS
-/// lane's supply on that volume. A decline and a pushed refill are per
-/// allocator, i.e. per volume, and the mount sum cannot say which volume
-/// holds the supply.
-static LANE_SUPPLY_VOLUMES: once_cell::sync::Lazy<scc::HashMap<u64, VolumeHint>> =
-    once_cell::sync::Lazy::new(scc::HashMap::new);
-/// The vector arrival count (+1 per [`note_lane_supply_volumes`]) — the
-/// stamp that says which entries the LATEST vector named.
-static LANE_SUPPLY_VOLUMES_GEN: AtomicU64 = AtomicU64::new(0);
-/// A vector arrived since the last mount-sum arrival (the two halves of
-/// one grant land vector-first): the sum's arrival then advances only the
-/// entries that vector did NOT name — the fallback law for a volume the
-/// authority does not advertise.
-static LANE_SUPPLY_VOLUMES_PENDING: AtomicBool = AtomicBool::new(false);
-/// Hints that woke a parked refill (`free_grace_lane_push_wakes`,
-/// co-writer side).
-static LANE_PUSH_WAKES: AtomicU64 = AtomicU64::new(0);
-/// The co-writer's refill wake: the ahead-refill task and the bounded
-/// allocation park wait on it beside their own cadence, so a hint ends
-/// the wait at once.
-static LANE_SUPPLY_WAKE: squeezefs_ipc::sqz_notify::Notify =
-    squeezefs_ipc::sqz_notify::Notify::new();
-
-/// One volume's row of the per-volume advertisement.
-struct VolumeHint {
-    /// Blocks of this lane on the authority's list for the volume, as the
-    /// latest grant naming it said.
-    blocks: AtomicU64,
-    /// The vector generation that last named this volume
-    /// (`== LANE_SUPPLY_VOLUMES_GEN` ⇔ the latest vector did).
-    named_at: AtomicU64,
-    /// This volume's decline witness: +1 per grant that advertised
-    /// NONZERO supply for it, and +1 per grant whose vector did not name
-    /// it (the mount-wide law, so an un-advertised volume is never
-    /// declined for longer than one cadence). Seeded from the mount-wide
-    /// generation at first naming so the two scales never alias.
-    gen: AtomicU64,
-}
-
-/// The authority-side release hook: harvest every ring to its uncovered
-/// front (RAM only — ring locks, free-list inserts, the mark ledgers).
-pub type ReleaseHook = Arc<dyn Fn() + Send + Sync>;
-/// The authority-side lane-supply source: a member id → `(vol_tag, blocks)`
-/// per data volume, the blocks of that member's lane on this mount's free
-/// list for that volume (empty for a member with no lane). The grant
-/// carries the vector and its sum.
-pub type LaneSupplySource = Arc<dyn Fn(&str) -> Vec<(u64, u64)> + Send + Sync>;
 
 const HOLD_PHASES_N: usize = 4;
 /// The stage names, in loop order; the JSON keys of
@@ -1198,461 +1042,6 @@ pub fn hold_phase_json() -> serde_json::Value {
 /// population).
 pub fn hold_unplaced() -> u64 {
     HOLD_UNPLACED.load(Ordering::Relaxed)
-}
-
-// ---------------------------------------------------------------------------
-// The lane-visible decomposition (finding 15 term 2): released → served →
-// visible, and the lane-push lever
-// ---------------------------------------------------------------------------
-
-/// **The authority's release mark**: a grace-released block of a lane this
-/// mount does not own reached the free list NOW. Called by the allocator's
-/// harvest publish for foreign-lane blocks only (a block of this mount's
-/// own lane is visible to its allocator the instant it is published, so
-/// there is no hop to measure). No plane ⇒ nothing recorded.
-pub fn mark_lane_release(vol_tag: u64, block_idx: u64) {
-    let Some(now) = owner_now_ms() else {
-        return;
-    };
-    let _ = LANE_RELEASE_MARKS.insert_sync((vol_tag, block_idx), now);
-}
-
-/// **The lane harvest took the block** (authority side): the age of its
-/// release mark, ms on the owner clock, stamped into `released_served`
-/// and returned so the reply can carry it. `None` ⇔ no mark (counted on
-/// `alloc_lane_visible_unplaced`; the reply carries `u64::MAX`).
-pub fn take_lane_release(vol_tag: u64, block_idx: u64) -> Option<u64> {
-    let released_at = LANE_RELEASE_MARKS
-        .remove_sync(&(vol_tag, block_idx))
-        .map(|(_, at)| at);
-    let (Some(released_at), Some(now)) = (released_at, owner_now_ms()) else {
-        LANE_VISIBLE_UNPLACED.fetch_add(1, Ordering::Relaxed);
-        return None;
-    };
-    let age = now.saturating_sub(released_at);
-    LANE_VISIBLE_PHASES[LANE_VISIBLE_RELEASED_SERVED].record(Duration::from_millis(age));
-    Some(age)
-}
-
-/// The sentinel a reply carries for a served block with no release mark.
-pub const LANE_RELEASE_AGE_UNPLACED: u64 = u64::MAX;
-
-/// **The co-writer adopted the block** (co-writer side): stamp the three
-/// stages of one served block — `released_served` as the authority
-/// measured it (carried on the reply), `served_visible` as this mount's
-/// own round trip, `total` their sum — so the family closes exactly per
-/// sample. An unplaced age stamps nothing and counts on
-/// `alloc_lane_visible_unplaced` here too.
-pub fn note_lane_visible(released_served_ms: u64, served_visible_ms: u64) {
-    if released_served_ms == LANE_RELEASE_AGE_UNPLACED {
-        LANE_VISIBLE_UNPLACED.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    LANE_VISIBLE_PHASES[LANE_VISIBLE_RELEASED_SERVED]
-        .record(Duration::from_millis(released_served_ms));
-    LANE_VISIBLE_PHASES[LANE_VISIBLE_SERVED_VISIBLE]
-        .record(Duration::from_millis(served_visible_ms));
-    LANE_VISIBLE_PHASES[LANE_VISIBLE_TOTAL].record(Duration::from_millis(
-        released_served_ms.saturating_add(served_visible_ms),
-    ));
-}
-
-/// `alloc_lane_visible_phase_ns`: the per-stage histograms, keyed by
-/// [`LANE_VISIBLE_PHASE_NAMES`]. On an authority only `released_served`
-/// has samples (it measures the wait on its own list); on a co-writer all
-/// three, exact-sum.
-pub fn lane_visible_phase_json() -> serde_json::Value {
-    let mut out = serde_json::Map::new();
-    for (i, name) in LANE_VISIBLE_PHASE_NAMES.iter().enumerate() {
-        out.insert((*name).to_string(), LANE_VISIBLE_PHASES[i].to_json());
-    }
-    serde_json::Value::Object(out)
-}
-
-/// Served lane blocks the release ledger could not place
-/// (`alloc_lane_visible_unplaced`).
-pub fn lane_visible_unplaced() -> u64 {
-    LANE_VISIBLE_UNPLACED.load(Ordering::Relaxed)
-}
-
-/// Release marks outstanding: grace-released foreign-lane blocks on this
-/// authority's free lists that no lane harvest has taken yet.
-pub fn lane_release_marks() -> u64 {
-    LANE_RELEASE_MARKS.len() as u64
-}
-
-/// `SQUEEZEFS_FREE_GRACE_LANE_PUSH` (default on), read once and cached
-/// (the free path and the renewal path may not pay a getenv).
-pub fn lane_push_enabled() -> bool {
-    match LANE_PUSH.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = crate::env_knobs::bool_knob("SQUEEZEFS_FREE_GRACE_LANE_PUSH", true);
-            LANE_PUSH.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// Test seam (the `test_set_ack_pipeline` shape).
-pub fn test_set_lane_push(on: Option<bool>) {
-    LANE_PUSH.store(
-        match on {
-            Some(true) => 1,
-            Some(false) => 2,
-            None => 0,
-        },
-        Ordering::Relaxed,
-    );
-}
-
-/// Test seam: `true` ⇔ a preset was in force.
-pub fn test_clear_lane_push() -> bool {
-    LANE_PUSH.swap(0, Ordering::Relaxed) != 0
-}
-
-/// `SQUEEZEFS_ALLOC_LANE_REFILL_HINT` (default on), read once and cached:
-/// the two proactive lane refills arm on the authority's advertised lane
-/// supply ([`lane_supply_hint`]); `0` = the retired gate, which armed them
-/// on the explicit-ship arm's owed ledger alone
-/// (`.benchmarks/2026-09-07-lane-refill-hint-gate.md`).
-pub fn refill_hint_enabled() -> bool {
-    match REFILL_HINT.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = crate::env_knobs::bool_knob("SQUEEZEFS_ALLOC_LANE_REFILL_HINT", true);
-            REFILL_HINT.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// Test seam (the `test_set_lane_push` shape).
-pub fn test_set_refill_hint(on: Option<bool>) {
-    REFILL_HINT.store(
-        match on {
-            Some(true) => 1,
-            Some(false) => 2,
-            None => 0,
-        },
-        Ordering::Relaxed,
-    );
-}
-
-/// Test seam: `true` ⇔ a preset was in force.
-pub fn test_clear_refill_hint() -> bool {
-    REFILL_HINT.swap(0, Ordering::Relaxed) != 0
-}
-
-/// `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT` (default on), read once and cached:
-/// the co-writer's per-volume readers ([`lane_supply_hint_for`],
-/// [`lane_supply_hint_gen_for`]) answer the volume's own entry of the
-/// grant's vector; `0` = the mount sum and the mount-wide arrival
-/// generation for every volume — the shipped shape
-/// (`.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`).
-pub fn volume_hint_enabled() -> bool {
-    match VOLUME_HINT.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = crate::env_knobs::bool_knob("SQUEEZEFS_ALLOC_LANE_VOLUME_HINT", true);
-            VOLUME_HINT.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// Test seam (the `test_set_lane_push` shape).
-pub fn test_set_volume_hint(on: Option<bool>) {
-    VOLUME_HINT.store(
-        match on {
-            Some(true) => 1,
-            Some(false) => 2,
-            None => 0,
-        },
-        Ordering::Relaxed,
-    );
-}
-
-/// **The refill's supply witness** (co-writer side): is there supply of
-/// this lane to harvest from the authority? The renewal grant's hint is
-/// the authority's OWN count of the lane's blocks on its free lists —
-/// per MOUNT (summed over its data volumes), fresh within one renewal
-/// cadence — and the explicit-ship arm's owed ledger is a strict subset
-/// of it (a block the authority RECOMPUTED when it served the co-writer's
-/// layout publish is on its list with nothing noted owed: ≈ 90 % of a
-/// rewriting co-writer's displaced blocks on the s11 fleet). Either
-/// witness arms a refill; `SQUEEZEFS_ALLOC_LANE_REFILL_HINT=0` keeps the
-/// owed ledger as the only one.
-pub fn lane_supply_witnessed(hint_blocks: u64, owed_blocks: u64) -> bool {
-    owed_blocks > 0 || (refill_hint_enabled() && hint_blocks > 0)
-}
-
-/// Install the authority's release hook (the multi-writer arm; the rigs).
-pub fn install_release_hook(hook: ReleaseHook) {
-    RELEASE_HOOK.store(Some(Arc::new(hook)));
-}
-
-/// Uninstall it (disarm / unmount / test teardown).
-pub fn uninstall_release_hook() {
-    RELEASE_HOOK.store(None);
-}
-
-/// **Release on ack** (the lever's authority half): a BINDING member's
-/// acknowledgement just advanced (lever (d)'s one-compare gate), so the
-/// covered offsets are released NOW — every ring harvested to its
-/// uncovered front through the installed hook — instead of at the next
-/// demand event (a free, an allocation, a harvest RPC), which on a fleet
-/// whose writers are the ones parked may be seconds away. Rate-limited by
-/// exactly lever (d)'s law (`refresh_on_ack_interval_ms`, sharing its
-/// refresh instant): the hook's harvest runs the recompute, so the two
-/// arms are one act at one cadence.
-fn release_on_ack() {
-    let Some(hook) = RELEASE_HOOK.load_full() else {
-        return;
-    };
-    let plane = PLANE.load();
-    let Some(plane) = plane.as_ref() else {
-        return;
-    };
-    let now = plane.clock.now_ms();
-    // The floor in force (under the composite the members answer twice
-    // as often, so the min can change twice as often — the limit follows).
-    let floor_ms = live_prod_floor_ms(plane);
-    let members = MEMBERS.load(Ordering::Relaxed);
-    let scan_ms = BOUND_SCAN_EWMA_NS
-        .load(Ordering::Relaxed)
-        .div_ceil(1_000_000);
-    let interval = refresh_on_ack_interval_ms(floor_ms, members, scan_ms);
-    if now.saturating_sub(LAST_BOUND_REFRESH_MS.load(Ordering::Relaxed)) < interval {
-        return;
-    }
-    LANE_PUSH_RELEASES.fetch_add(1, Ordering::Relaxed);
-    hook();
-}
-
-/// Release-on-ack runs (`free_grace_lane_push_releases`).
-pub fn lane_push_releases() -> u64 {
-    LANE_PUSH_RELEASES.load(Ordering::Relaxed)
-}
-
-/// Install the authority's lane-supply source (the multi-writer arm; the
-/// rigs).
-pub fn install_lane_supply_source(src: LaneSupplySource) {
-    LANE_SUPPLY_SOURCE.store(Some(Arc::new(src)));
-}
-
-/// Uninstall it (disarm / unmount / test teardown).
-pub fn uninstall_lane_supply_source() {
-    LANE_SUPPLY_SOURCE.store(None);
-}
-
-/// **The renewal grant's lane-supply hint** (the lever's wire half, owner
-/// side): the blocks of `member_id`'s lane sitting on this authority's
-/// free lists — released, unserved, reachable by that member alone — PER
-/// DATA VOLUME as `(vol_tag, blocks)` (the grant carries the vector and
-/// its sum). O(1) per volume through the installed source (per-lane
-/// counters maintained inside the free set's insert/remove); empty with
-/// the lever off, no source (every mount that is not a multi-writer
-/// authority), or a member with no lane (a reader). Never a scan in the
-/// renewal hot op (KD-FG-4).
-pub fn lane_supply_for_member(member_id: &str) -> Vec<(u64, u64)> {
-    if !lane_push_enabled() {
-        return Vec::new();
-    }
-    let Some(src) = LANE_SUPPLY_SOURCE.load_full() else {
-        return Vec::new();
-    };
-    let volumes = src(member_id);
-    if volumes.iter().any(|(_, n)| *n > 0) {
-        LANE_PUSH_HINTS.fetch_add(1, Ordering::Relaxed);
-    }
-    volumes
-}
-
-/// Grants that carried a nonzero hint (`free_grace_lane_push_hints`).
-pub fn lane_push_hints() -> u64 {
-    LANE_PUSH_HINTS.load(Ordering::Relaxed)
-}
-
-/// **The member learned a hint** (co-writer side, from the adopted grant):
-/// the value is kept for the refill decision, and a nonzero one wakes
-/// every parked refill (the ahead task, a bounded allocation park) so the
-/// lane harvest runs on THIS round trip's heels rather than at its own
-/// cadence. The value and the wake are the lever's; the ARRIVAL
-/// ([`lane_supply_hint_gen`]) is counted regardless — a grant reached
-/// this member, which is what ends a single-flight harvest's decline.
-pub fn note_lane_supply_hint(blocks: u64) {
-    // The per-volume witnesses' fallback half (finding 15's fpp residue):
-    // a grant that did not advertise a volume is, for that volume, an
-    // arrival like any other — its decline ends at this cadence. Every
-    // known volume advances unless the vector that landed just before
-    // this sum named it (then its own nonzero-advertisement rule ruled).
-    let vector_landed = LANE_SUPPLY_VOLUMES_PENDING.swap(false, Ordering::AcqRel);
-    let vec_gen = LANE_SUPPLY_VOLUMES_GEN.load(Ordering::Acquire);
-    LANE_SUPPLY_VOLUMES.iter_sync(|_, v| {
-        if !vector_landed || v.named_at.load(Ordering::Acquire) != vec_gen {
-            v.gen.fetch_add(1, Ordering::Release);
-        }
-        true
-    });
-    LANE_SUPPLY_HINT_GEN.fetch_add(1, Ordering::Release);
-    if !lane_push_enabled() {
-        return;
-    }
-    LANE_SUPPLY_HINT.store(blocks, Ordering::Relaxed);
-    if blocks > 0 {
-        LANE_PUSH_WAKES.fetch_add(1, Ordering::Relaxed);
-        LANE_SUPPLY_WAKE.notify_waiters();
-    }
-}
-
-/// **The member learned the grant's per-volume vector** (co-writer side,
-/// finding 15's fpp residue — `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`):
-/// `(vol_tag, blocks)` per data volume of the authority. Lands BEFORE the
-/// grant's mount sum ([`note_lane_supply_hint`] — whose wake runs the
-/// pushed ticks that read these entries). A volume advertised NONZERO
-/// advances its own decline witness; a volume advertised 0 does not (a
-/// decline on it holds until the authority says its list moved); a
-/// volume the vector does not name falls back to the mount-wide law at
-/// the sum's arrival. First naming seeds the witness from the mount-wide
-/// generation, so a volume that switches between the two scales never
-/// reads a stale stamp as fresh or a fresh one as stale.
-pub fn note_lane_supply_volumes(volumes: &[(u64, u64)]) {
-    let vec_gen = LANE_SUPPLY_VOLUMES_GEN.fetch_add(1, Ordering::AcqRel) + 1;
-    let mount_gen = LANE_SUPPLY_HINT_GEN.load(Ordering::Acquire);
-    for (tag, blocks) in volumes {
-        let advance = u64::from(*blocks > 0);
-        let seen = LANE_SUPPLY_VOLUMES
-            .read_sync(tag, |_, v| {
-                v.blocks.store(*blocks, Ordering::Relaxed);
-                v.named_at.store(vec_gen, Ordering::Release);
-                v.gen.fetch_add(advance, Ordering::Release);
-            })
-            .is_some();
-        if !seen {
-            match LANE_SUPPLY_VOLUMES.entry_sync(*tag) {
-                scc::hash_map::Entry::Occupied(occ) => {
-                    let v = occ.get();
-                    v.blocks.store(*blocks, Ordering::Relaxed);
-                    v.named_at.store(vec_gen, Ordering::Release);
-                    v.gen.fetch_add(advance, Ordering::Release);
-                }
-                scc::hash_map::Entry::Vacant(vac) => {
-                    vac.insert_entry(VolumeHint {
-                        blocks: AtomicU64::new(*blocks),
-                        named_at: AtomicU64::new(vec_gen),
-                        gen: AtomicU64::new(mount_gen + advance),
-                    });
-                }
-            }
-        }
-    }
-    LANE_SUPPLY_VOLUMES_PENDING.store(true, Ordering::Release);
-}
-
-/// The last learned hint (co-writer side; 0 = the authority's list holds
-/// nothing for this lane, or no hint has arrived).
-pub fn lane_supply_hint() -> u64 {
-    LANE_SUPPLY_HINT.load(Ordering::Relaxed)
-}
-
-/// **This volume's advertised supply** (co-writer side): the blocks of the
-/// lane on the authority's list for `vol_tag` as the latest grant's vector
-/// said — or the mount sum when the latest vector did not name the volume,
-/// no vector has arrived, or `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT=0` (the
-/// shipped reading). The pushed decision's and the ahead witness's input.
-pub fn lane_supply_hint_for(vol_tag: u64) -> u64 {
-    if !volume_hint_enabled() || !lane_push_enabled() {
-        return lane_supply_hint();
-    }
-    let vec_gen = LANE_SUPPLY_VOLUMES_GEN.load(Ordering::Acquire);
-    LANE_SUPPLY_VOLUMES
-        .read_sync(&vol_tag, |_, v| {
-            (v.named_at.load(Ordering::Acquire) == vec_gen)
-                .then(|| v.blocks.load(Ordering::Relaxed))
-        })
-        .flatten()
-        .unwrap_or_else(lane_supply_hint)
-}
-
-/// Grants that have carried the authority's advertisement to this member
-/// (the single-flight harvest's decline witness — see
-/// [`note_lane_supply_hint`]). Monotonic; equality with a stamped value
-/// means no grant has arrived since.
-pub fn lane_supply_hint_gen() -> u64 {
-    LANE_SUPPLY_HINT_GEN.load(Ordering::Acquire)
-}
-
-/// **This volume's decline witness** (co-writer side): grants that
-/// advertised NONZERO supply for `vol_tag` plus grants that did not name it
-/// (see [`note_lane_supply_volumes`]) — the mount-wide generation for a
-/// volume no vector ever named, and for every volume under
-/// `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT=0`. Monotonic; equality with a stamped
-/// value means nothing the authority said about THIS volume has moved.
-pub fn lane_supply_hint_gen_for(vol_tag: u64) -> u64 {
-    if !volume_hint_enabled() {
-        return lane_supply_hint_gen();
-    }
-    LANE_SUPPLY_VOLUMES
-        .read_sync(&vol_tag, |_, v| v.gen.load(Ordering::Acquire))
-        .unwrap_or_else(lane_supply_hint_gen)
-}
-
-/// Hints that woke a refill (`free_grace_lane_push_wakes`).
-pub fn lane_push_wakes() -> u64 {
-    LANE_PUSH_WAKES.load(Ordering::Relaxed)
-}
-
-/// The co-writer's refill wake (see [`note_lane_supply_hint`]).
-pub fn lane_supply_wake() -> &'static squeezefs_ipc::sqz_notify::Notify {
-    &LANE_SUPPLY_WAKE
-}
-
-/// **The pushed-refill decision** (co-writer side, pure): harvest now ⇔
-/// the lever is on and the authority's last hint says the lane has supply
-/// on its lists — the push exists because the authority said so, and the
-/// hint is the sufficient condition ([`lane_supply_witnessed`]; the owed
-/// ledger stays a second witness under `SQUEEZEFS_ALLOC_LANE_REFILL_HINT=0`,
-/// the retired gate that left every recomputed block reachable only from
-/// an ENOSPC park). The watermark plays no part — a quiet lane's
-/// rate-derived watermark decays to 0, which is exactly when the routine
-/// ahead tick goes dark while the supply sits on the authority.
-pub fn lane_push_wants_harvest(hint_blocks: u64, owed_blocks: u64) -> bool {
-    lane_push_enabled() && hint_blocks > 0 && lane_supply_witnessed(hint_blocks, owed_blocks)
-}
-
-/// **The pushed-refill decision, per VOLUME** — the form the pushed tick
-/// runs (the two-volume law,
-/// `.benchmarks/2026-09-07-cowriter-lane-aware-placement.md`, composed
-/// with the hint gate, `.benchmarks/2026-09-07-lane-refill-hint-gate.md`):
-/// the hint is SUMMED over the authority's volumes, so it cannot name the
-/// one holding the supply — and a peer's rewrites of this lane's blocks
-/// put supply on a list no owed ledger here knows about. This volume
-/// harvests ⇔ the lever is on, the hint is nonzero, and EITHER this
-/// allocator is owed blocks (the shipped decision) OR — with the hint gate
-/// armed — its lane-reachable stock is LOW: dry, or below the ahead
-/// tick's own watermark (`rate × refill horizon`, the blocks one loop
-/// transit consumes; 0 on a quiet lane, where "low" reduces to "dry").
-/// A low volume asking is one RPC that either refills it or proves the
-/// supply is its sibling's (which the lane-aware placement carries
-/// meanwhile). A stocked volume owed nothing never asks (no wasted RTT) —
-/// the per-volume refinement of the mount-level [`lane_push_wants_harvest`]
-/// witness, whose "hint alone suffices" is exactly right for the mount
-/// and one RTT too eager for a volume that covers its next transit.
-pub fn lane_push_wants_harvest_on_volume(
-    hint_blocks: u64,
-    owed_blocks: u64,
-    reachable_blocks: u64,
-    watermark_blocks: u64,
-) -> bool {
-    lane_push_enabled()
-        && hint_blocks > 0
-        && (owed_blocks > 0
-            || (refill_hint_enabled()
-                && (reachable_blocks == 0 || reachable_blocks < watermark_blocks)))
 }
 
 // ---------------------------------------------------------------------------
@@ -2419,11 +1808,6 @@ pub(crate) fn note_member_ack_advanced(previous_acked: u64) {
     }
     if previous_acked <= bound() {
         BOUND_DIRTY.store(true, Ordering::Relaxed);
-        // The lane-push lever's authority half: the release follows the
-        // ack, not the next demand event (finding 15 term 2).
-        if lane_push_enabled() {
-            release_on_ack();
-        }
     }
 }
 
@@ -3920,26 +3304,6 @@ pub fn stats_snapshot() -> serde_json::Value {
         // Lever (d)'s engagement and the scan cost its rate limit floors on.
         "free_grace_bound_refreshes_on_ack": bound_refreshes_on_ack(),
         "free_grace_bound_scan_ms": bound_scan_ms(),
-        // The lane-push lever's authority half (finding 15 term 2):
-        // binding acks that harvested the rings on arrival, and grants
-        // that carried a lane-supply hint.
-        "free_grace_lane_push_releases": lane_push_releases(),
-        "free_grace_lane_push_hints": lane_push_hints(),
-    })
-}
-
-/// The lane-visible block of the stats inode — merged by `fuse_client`
-/// under the `alloc_lane_*` family's engagement gate (a partition or the
-/// grace plane engaged), because its samples exist on BOTH postures: the
-/// authority stamps `released_served`, the co-writer all three stages plus
-/// the wakes the hint produced.
-pub fn lane_visible_stats() -> serde_json::Value {
-    serde_json::json!({
-        "alloc_lane_visible_phase_ns": lane_visible_phase_json(),
-        "alloc_lane_visible_unplaced": lane_visible_unplaced(),
-        "alloc_lane_release_marks": lane_release_marks(),
-        "free_grace_lane_push_wakes": lane_push_wakes(),
-        "free_grace_lane_supply_hint": lane_supply_hint(),
     })
 }
 
@@ -4024,13 +3388,6 @@ pub fn reset_for_test() {
         &ACK_RENEWALS,
         &BOUND_REFRESHES_ON_ACK,
         &BOUND_SCAN_EWMA_NS,
-        &LANE_VISIBLE_UNPLACED,
-        &LANE_PUSH_RELEASES,
-        &LANE_PUSH_HINTS,
-        &LANE_SUPPLY_HINT,
-        &LANE_SUPPLY_HINT_GEN,
-        &LANE_SUPPLY_VOLUMES_GEN,
-        &LANE_PUSH_WAKES,
         &QUALIFY_LAG_MS,
         &DRAIN_LAG_MS,
         &DRAIN_OBSERVED,
@@ -4043,8 +3400,6 @@ pub fn reset_for_test() {
         c.store(0, Ordering::Relaxed);
     }
     BOUND_DIRTY.store(false, Ordering::Relaxed);
-    LANE_SUPPLY_VOLUMES_PENDING.store(false, Ordering::Relaxed);
-    LANE_SUPPLY_VOLUMES.clear_sync();
     test_set_ack_renewal(None);
     test_set_caught_up_relax(None);
     test_set_refresh_on_ack(None);
@@ -4052,20 +3407,11 @@ pub fn reset_for_test() {
     crate::ro_coherence::reset_for_test();
     test_set_demand(None);
     test_set_pass_elastic(None);
-    test_set_lane_push(None);
-    test_set_refill_hint(None);
-    test_set_volume_hint(None);
     test_set_checkpoint_composite(None);
-    uninstall_release_hook();
-    uninstall_lane_supply_source();
     RESIDENCE_MS.reset();
     for h in HOLD_PHASES.iter() {
         h.reset();
     }
-    for h in LANE_VISIBLE_PHASES.iter() {
-        h.reset();
-    }
-    LANE_RELEASE_MARKS.clear_sync();
     CHECKPOINT_MARKS.lock().clear();
     BOUND_ADVANCES.lock().clear();
     RUNWAY_MS.store(u64::MAX, Ordering::Relaxed);
@@ -4090,10 +3436,10 @@ pub fn reset_for_test() {
 // live` class), frees ride the ring exactly as before (`free_grace_
 // recall_timeout_deferrals`), released by the ring's own law — the epoch-ack
 // bound the membership plane still composes, and the fence that evicts
-// the non-acker at `T_owner`. The epoch fan-in itself stays LIVE code:
-// it is the flat / unarmed posture's mechanism until the PR-14 flip, and
-// the ring's release law under the token plane — its retirement as the
-// QUALIFICATION is this arm; its deletion is the flip's.
+// the non-acker at `T_owner`. Since the PR-14 flip EVERY `-o ro` mount is
+// a token client (the S5 projection reader retired with the flip), so the
+// epoch fan-in is the ring's release law on that timeout path alone —
+// never a free's qualification.
 //
 // One relaxed load on every mount without an armed token holder.
 
@@ -4115,47 +3461,15 @@ static TIMEOUT_DEFERRALS: AtomicU64 = AtomicU64::new(0);
 /// — past it its tokens are dead by the S6 law). 0 = no window open.
 static RECALL_UNACKED_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 
-/// Frees that rode the ring because a LIVE `Reader` member of the set is
-/// NOT a token client — an S5 (`SQUEEZEFS_SYMMETRIC_META=0`) reader whose
-/// protection is the epoch acknowledgement (review round 1, Issue 3: the
-/// ring bypass applies only when every live reader is a token client).
-static S5_READER_DEFERRALS: AtomicU64 = AtomicU64::new(0);
-/// The source that answers "is this member id a token client of this
-/// holder?" — installed by the token plane; absent = nobody is.
-static TOKEN_CLIENT_PROBE: once_cell::sync::Lazy<ArcSwapOption<TokenClientProbe>> =
-    once_cell::sync::Lazy::new(ArcSwapOption::empty);
-
-/// The token plane's client registry, installed at the holder's arm:
-/// "is this member id a token client of this holder?" and the registry's
-/// generation (bumped per new client — the reader-class cache's second
-/// key beside the membership census generation).
-pub struct TokenClientProbe {
-    pub is_client: Arc<dyn Fn(&str) -> bool + Send + Sync>,
-    pub generation: Arc<dyn Fn() -> u64 + Send + Sync>,
-}
-
-/// The reader-class verdict CACHED against `(census generation, token-
-/// client generation)` (review round 2, Issue 22): one word — the census
-/// generation's low 32 bits `<< 32`, the token generation's low 31 bits
-/// `<< 1`, the verdict bit; `u64::MAX` = never computed. The O(members)
-/// scan runs when either generation moved, never per free.
-static S5_CLASS_CACHE: AtomicU64 = AtomicU64::new(u64::MAX);
-/// Scans the cache missed on (`free_grace_s5_class_scans`) — ≈ the number
-/// of census changes, never the number of frees.
-static S5_CLASS_SCANS: AtomicU64 = AtomicU64::new(0);
-
 /// The recall gate's verdict for one terminal free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecallGate {
     /// No token holder armed: the shipped path (the ring's own gate).
     Off,
-    /// Every recall of the freeing publish completed and every live
-    /// reader of the set is a token client: publish the offset to the
-    /// free list directly.
+    /// Every recall of the freeing publish completed: publish the offset
+    /// to the free list directly.
     Gated,
-    /// A live member's recall is unacked inside its lease, or a live
-    /// reader is NOT a token client (its protection is the epoch
-    /// acknowledgement): the ring.
+    /// A live member's recall is unacked inside its lease: the ring.
     Deferred,
 }
 
@@ -4188,50 +3502,9 @@ pub fn recall_gate_armed() -> bool {
     RECALL_GATE.load(Ordering::Relaxed)
 }
 
-/// Install the token-client probe (the token holder's arm).
-pub fn install_token_client_probe(probe: TokenClientProbe) {
-    TOKEN_CLIENT_PROBE.store(Some(Arc::new(probe)));
-}
-
-/// Is a LIVE `Reader` member of the set enrolled that is NOT a token
-/// client? Such a reader's freed-offset protection is the epoch
-/// acknowledgement — the ring must hold the free for it. With no
-/// membership plane no reader is a member, and an S5 reader without a
-/// plane has no protection under S5 either; the answer is `false`.
-fn s5_reader_enrolled() -> bool {
-    let Some(owner) = crate::membership::installed_owner() else {
-        return false;
-    };
-    let probe = TOKEN_CLIENT_PROBE.load();
-    // The generations are read BEFORE the scan and stored with its
-    // verdict: a change landing mid-scan leaves the OLD key behind, so
-    // the next free recomputes.
-    let census = crate::membership::census_generation();
-    let tokens = probe.as_deref().map_or(0, |p| (p.generation)());
-    let key = (u64::from(census as u32) << 32) | ((u64::from(tokens as u32) & 0x7FFF_FFFF) << 1);
-    let cached = S5_CLASS_CACHE.load(Ordering::Acquire);
-    if cached != u64::MAX && cached & !1 == key {
-        return cached & 1 == 1;
-    }
-    S5_CLASS_SCANS.fetch_add(1, Ordering::Relaxed);
-    let verdict = owner
-        .live_reader_ids()
-        .iter()
-        .any(|id| !probe.as_deref().is_some_and(|p| (p.is_client)(id)));
-    S5_CLASS_CACHE.store(key | u64::from(verdict), Ordering::Release);
-    verdict
-}
-
-/// `free_grace_s5_class_scans`.
-pub fn s5_class_scans() -> u64 {
-    S5_CLASS_SCANS.load(Ordering::Relaxed)
-}
-
 /// **The verdict** (`BlockAllocator::finish_free`'s first gate): one
 /// relaxed load unarmed; armed, the ring while a live-timeout window is
-/// open OR while a live reader that is not a token client is enrolled
-/// (its protection is the ring's epoch law); `Gated` otherwise. Counts
-/// its own engagement per class.
+/// open, `Gated` otherwise. Counts its own engagement per class.
 pub fn recall_gate_verdict() -> RecallGate {
     if !RECALL_GATE.load(Ordering::Relaxed) {
         return RecallGate::Off;
@@ -4244,17 +3517,8 @@ pub fn recall_gate_verdict() -> RecallGate {
     if until != 0 {
         RECALL_UNACKED_UNTIL_MS.store(0, Ordering::Relaxed);
     }
-    if s5_reader_enrolled() {
-        S5_READER_DEFERRALS.fetch_add(1, Ordering::Relaxed);
-        return RecallGate::Deferred;
-    }
     RECALL_GATED_FREES.fetch_add(1, Ordering::Relaxed);
     RecallGate::Gated
-}
-
-/// `free_grace_s5_reader_deferrals`.
-pub fn s5_reader_deferrals() -> u64 {
-    S5_READER_DEFERRALS.load(Ordering::Relaxed)
 }
 
 /// A recall of a LIVE member went unacked past the bound (the token
@@ -4300,7 +3564,4 @@ fn reset_recall_gate_for_test() {
     RECALL_UNACKED_UNTIL_MS.store(0, Ordering::Relaxed);
     RECALL_GATED_FREES.store(0, Ordering::Relaxed);
     TIMEOUT_DEFERRALS.store(0, Ordering::Relaxed);
-    S5_READER_DEFERRALS.store(0, Ordering::Relaxed);
-    S5_CLASS_CACHE.store(u64::MAX, Ordering::Relaxed);
-    S5_CLASS_SCANS.store(0, Ordering::Relaxed);
 }

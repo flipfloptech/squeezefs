@@ -73,7 +73,6 @@ struct ArmGuard;
 
 impl Drop for ArmGuard {
     fn drop(&mut self) {
-        ship::uninstall_daemon_verb_router();
         ship::uninstall_delegation_host();
         ship::disarm_ownership();
         data_grant::uninstall_custody_client();
@@ -118,13 +117,12 @@ fn opts() -> squeezefs::meta_backend::kv::builder::FormatV3Options {
 struct Fixture {
     _dir: tempfile::TempDir,
     owner_be: Arc<RoutedMetaBackend>,
-    client_be: Arc<RoutedMetaBackend>,
     listener: Arc<cw::RpcListener>,
     svc: Arc<MetaShipService>,
     /// Held for the custody plane's lifetime (the era gate's authority).
     _custody_client: Arc<WriteCustodyClient>,
     endpoint: String,
-    _router: Arc<MetaShipRouter>,
+    router: Arc<MetaShipRouter>,
     _arm: ArmGuard,
 }
 
@@ -135,7 +133,7 @@ async fn fixture(vols: usize, client_owned: &[(usize, &str)]) -> Fixture {
     let mut paths = Vec::new();
     for (i, stamp) in plan.stamps.iter().enumerate().take(vols) {
         let p = make_file(dir.path(), &format!("meta{i}"), VOL_LEN);
-        squeezefs::meta_backend::kv::builder::format_v3_stamped(
+        squeezefs::meta_backend::kv::builder::format_v3_stamped_single_writer(
             &p,
             VOL_LEN,
             &opts(),
@@ -221,16 +219,14 @@ async fn fixture(vols: usize, client_owned: &[(usize, &str)]) -> Fixture {
     data_grant::install_custody_client(Arc::clone(&custody_client));
 
     let router = MetaShipRouter::new(Arc::clone(&client_be), NODE, SECRET.to_vec());
-    ship::install_daemon_verb_router(Arc::clone(&router));
     Fixture {
         _dir: dir,
         owner_be,
-        client_be,
         listener,
         svc,
         _custody_client: custody_client,
         endpoint,
-        _router: router,
+        router,
         _arm,
     }
 }
@@ -267,7 +263,7 @@ async fn earn_update(fx: &Fixture, dirname: &str) -> (u64, u64) {
         .expect("owner mkdir")
         .ino;
     let grants0 = intents::intent_stats().update_grants;
-    let f0 = Metadata::create(fx.client_be.as_ref(), d, "f0", FILE, 0, 0)
+    let f0 = Metadata::create(fx.router.as_ref(), d, "f0", FILE, 0, 0)
         .await
         .expect("the grant-earning shipped create")
         .ino;
@@ -309,7 +305,7 @@ async fn dark_posture_an_unarmed_mount_has_no_placement_state() {
     let dir = tempfile::tempdir().expect("tempdir");
     let plan = plan_meta_slot_set(1).expect("plan");
     let p = make_file(dir.path(), "meta0", VOL_LEN);
-    squeezefs::meta_backend::kv::builder::format_v3_stamped(
+    squeezefs::meta_backend::kv::builder::format_v3_stamped_single_writer(
         &p,
         VOL_LEN,
         &opts(),
@@ -345,7 +341,7 @@ async fn the_lever_off_control_is_dark_on_an_armed_mount() {
     let fx = fixture(1, &[]).await;
     placement::TEST_PLACEMENT_OVERRIDE.store(2, Ordering::SeqCst);
     let (d, _f0) = earn_update(&fx, "pl-off").await;
-    let child = Metadata::create(fx.client_be.as_ref(), d, "c0", FILE, 0, 0)
+    let child = Metadata::create(fx.router.as_ref(), d, "c0", FILE, 0, 0)
         .await
         .expect("local mint")
         .ino;
@@ -384,7 +380,7 @@ async fn a_placement_armed_clients_mints_land_in_its_dedicated_slot_stably() {
     for i in 0..6 {
         let name = format!("c{i}");
         let mints0 = intents::intent_stats().mints;
-        let child = Metadata::create(fx.client_be.as_ref(), d, &name, FILE, 0, 0)
+        let child = Metadata::create(fx.router.as_ref(), d, &name, FILE, 0, 0)
             .await
             .expect("create under the grant")
             .ino;
@@ -435,7 +431,7 @@ async fn two_placement_armed_clients_get_distinct_dedicated_slots() {
     let _plane = PLANE.lock().await;
     let fx = fixture(1, &[]).await;
     let (d, _f0) = earn_update(&fx, "pl-two").await;
-    let child_a = Metadata::create(fx.client_be.as_ref(), d, "a0", FILE, 0, 0)
+    let child_a = Metadata::create(fx.router.as_ref(), d, "a0", FILE, 0, 0)
         .await
         .expect("client A mints")
         .ino;
@@ -537,7 +533,7 @@ async fn the_migration_half_is_disarmed_under_multi_owner() {
     // threshold: mint through the real machinery, fsync forcing each
     // refill.
     for i in 0..10 {
-        let _ = Metadata::create(fx.client_be.as_ref(), d, &format!("c{i}"), FILE, 0, 0).await;
+        let _ = Metadata::create(fx.router.as_ref(), d, &format!("c{i}"), FILE, 0, 0).await;
         intents::fsync_dir_barrier(d).await.expect("flush");
     }
     wait_for("the candidate inversion to fire", || {
@@ -624,7 +620,7 @@ async fn the_policy_stays_dark_when_no_client_owned_volume_exists() {
     ship::TEST_INTENT_SUPPLY_CHUNK.store(2, Ordering::SeqCst);
     let (d, _f0) = earn_update(&fx, "pl-dark").await;
     for i in 0..8 {
-        let _ = Metadata::create(fx.client_be.as_ref(), d, &format!("c{i}"), FILE, 0, 0).await;
+        let _ = Metadata::create(fx.router.as_ref(), d, &format!("c{i}"), FILE, 0, 0).await;
         intents::fsync_dir_barrier(d).await.expect("flush");
     }
     let s = pstats();
@@ -746,7 +742,7 @@ async fn a_fenced_clients_placement_state_dies_with_its_incarnation() {
     let _plane = PLANE.lock().await;
     let fx = fixture(1, &[]).await;
     let (d, _f0) = earn_update(&fx, "pl-fence").await;
-    let _ = Metadata::create(fx.client_be.as_ref(), d, "c0", FILE, 0, 0)
+    let _ = Metadata::create(fx.router.as_ref(), d, "c0", FILE, 0, 0)
         .await
         .expect("mint");
     intents::fsync_dir_barrier(d).await.expect("flush");

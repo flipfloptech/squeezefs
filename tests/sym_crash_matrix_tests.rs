@@ -545,7 +545,7 @@ async fn the_owners_eviction_and_the_grace_deadline_write_the_ledger_never_a_rec
     let t_owner = clocks.t_owner.as_millis() as u64;
     let grace = clocks.grace.as_millis() as u64;
     let join = |n: u64, prior: Option<u64>| JoinRequest {
-        id: squeezefs::cowriter::node_member_id_of(0xA11C_0000_0000_0000 | n, 0x3000 + n as u32),
+        id: squeezefs::member_id::node_member_id_of(0xA11C_0000_0000_0000 | n, 0x3000 + n as u32),
         role: MemberRole::Writer,
         endpoint: None,
         pid: 1,
@@ -1000,7 +1000,7 @@ async fn a_dead_wire_lessees_slots_grant_and_dir_rename_lock_are_released_by_the
         squeezefs::membership::install_owner(Arc::clone(&owner));
         let live = foreign(51);
         let JoinOutcome::Granted(_) = owner.join(JoinRequest {
-            id: squeezefs::cowriter::node_member_id_of(live.node_token, live.mount_slot),
+            id: squeezefs::member_id::node_member_id_of(live.node_token, live.mount_slot),
             role: MemberRole::Writer,
             endpoint: None,
             pid: 1,
@@ -1302,7 +1302,7 @@ async fn appender_clear_refuses_a_live_lease_and_attests_a_dead_one() {
     reset_process_state();
     let (uris, shared) = seeded_volume(dir.path(), SLOT_A).await;
     let x = foreign(70);
-    let member = squeezefs::cowriter::node_member_id_of(x.node_token, x.mount_slot);
+    let member = squeezefs::member_id::node_member_id_of(x.node_token, x.mount_slot);
     let files = kill_with_region_one_live(&uris, "1:4", &[(0, shared)], 5, x).await;
     let path = std::path::Path::new(&uris[0]);
     let clear = || KvMetaBackend::appender_clear(path, path, 1);
@@ -4175,7 +4175,7 @@ async fn a_rejoined_member_is_never_recovered_and_its_record_is_retired() {
     )
     .unwrap();
     squeezefs::membership::install_owner(Arc::clone(&owner));
-    let member = squeezefs::cowriter::node_member_id_of(fx.x.node_token, fx.x.mount_slot);
+    let member = squeezefs::member_id::node_member_id_of(fx.x.node_token, fx.x.mount_slot);
     let JoinOutcome::Granted(_) = owner.join(JoinRequest {
         id: member.clone(),
         role: MemberRole::Writer,

@@ -446,6 +446,15 @@ pub static TEST_JOIN_STALE_PAGE_READ: std::sync::atomic::AtomicBool =
 pub static TEST_JOIN_FRAGMENT_REPLY_GRANT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test seam (PR 14 Step 0 — the cloned-identity door): the joined open
+/// reads itself as NOT co-located with the manager (no local flock holder,
+/// a foreign boot id) whatever the probe says — the one-process venue's way
+/// to stand a joiner on "another host" whose node token equals the
+/// manager's (the cloud row's baked AMI: one `/etc/machine-id` on every
+/// node). One relaxed load per joined open; `false` = off.
+pub static TEST_JOIN_NOT_COLOCATED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Test seam (design-symmetric-metadata §5.3.4 row 5, PR 4): the holder
 /// DIES mid-handover after its page named the slot `Releasing` and before
 /// tree 0 was written — the next open of its identity completes the
@@ -5116,14 +5125,22 @@ impl KvMetaBackend {
         self.ring.core().head()
     }
 
-    /// The expiry of an offer made now: one renewal beat past it (§5.1.4)
-    /// — `min(the shipped 10 s beat, T_idle / 3)`, the membership plane's
-    /// own renewal law over the window in force.
-    fn offer_expiry_ns(&self, plane: &super::slot_lease::SlotLeasePlane) -> u64 {
-        let beat_ms = (crate::fuse_client::CLIENT_HEARTBEAT_INTERVAL_SECS * 1000)
-            .min(plane.t_idle_ms / 3)
-            .max(1);
-        crate::mono_core::monotonic_ns_u64().saturating_add(beat_ms.saturating_mul(1_000_000))
+    /// The expiry of an offer made now (§5.1.4): between in-process
+    /// regions one renewal beat — `min(the shipped 10 s beat, T_idle /
+    /// 3)`, the membership plane's own renewal law over the window in
+    /// force; between WIRE appenders the recall's DELIVERY bound
+    /// ([`crate::slot_lease_core::wire_offer_stand_ms`] — acceptance
+    /// record §7 item 18: the requester's and the holder's renewal beats,
+    /// the handover, the requester's re-acquire beat), since a wire
+    /// holder learns the accept only on its renewal.
+    fn offer_expiry_ns(&self, plane: &super::slot_lease::SlotLeasePlane, wire: bool) -> u64 {
+        let beat_ms = crate::fuse_client::CLIENT_HEARTBEAT_INTERVAL_SECS * 1000;
+        let stand_ms = if wire {
+            crate::slot_lease_core::wire_offer_stand_ms(beat_ms, plane.handover_bound_ms())
+        } else {
+            crate::slot_lease_core::offer_stand_ms(beat_ms, plane.t_idle_ms)
+        };
+        crate::mono_core::monotonic_ns_u64().saturating_add(stand_ms.saturating_mul(1_000_000))
     }
 
     /// The directory-slot-A offset of appender `id`'s page: an in-process
@@ -6514,7 +6531,7 @@ impl KvMetaBackend {
                 Ok(AcquireSlotReply::Granted(g))
             }
             LeaseState::Offered if now >= lease.offer_expires_ns => {
-                plane.table.expire_offers(now);
+                plane.lapse_offers(now);
                 Ok(AcquireSlotReply::Refused {
                     holder: lease.holder,
                     g: lease.g,
@@ -6587,7 +6604,10 @@ impl KvMetaBackend {
                 self.path.display()
             ))
         })?;
-        let expires = self.offer_expiry_ns(plane);
+        // A holder or a requester that is no region of this mount is a
+        // WIRE appender: the stand is the recall's delivery bound.
+        let wire = set.region(appender_id).is_none() || set.region(to).is_none();
+        let expires = self.offer_expiry_ns(plane, wire);
         plane
             .table
             .offer(slot, appender_id, to, expires)
@@ -6787,10 +6807,27 @@ impl KvMetaBackend {
         let recalled = plane.recalls_of(appender_id).contains(&slot);
         plane.clear_recall(appender_id, slot);
         plane.holders.forget(slot);
-        match plane
-            .table
-            .release(slot, appender_id, g, words, last_written)
-        {
+        // A recall's requester is a wire appender that learns the slot
+        // moved only through the carriage (§7 item 18): the memo naming
+        // it survives the release for one more renewal beat plus the
+        // handover bound, so its re-acquire lands at `g + 1` instead of
+        // the slot standing `Unleased` until somebody's first touch.
+        let outcome = if recalled {
+            let beat_ms = crate::fuse_client::CLIENT_HEARTBEAT_INTERVAL_SECS * 1000;
+            let until = crate::mono_core::monotonic_ns_u64().saturating_add(
+                beat_ms
+                    .saturating_add(plane.handover_bound_ms())
+                    .saturating_mul(1_000_000),
+            );
+            plane
+                .table
+                .release_reserving(slot, appender_id, g, words, last_written, until)
+        } else {
+            plane
+                .table
+                .release(slot, appender_id, g, words, last_written)
+        };
+        match outcome {
             crate::slot_lease_core::ReleaseOutcome::Released => {
                 if recalled {
                     plane.handovers.fetch_add(1, Ordering::Relaxed);
@@ -8517,10 +8554,7 @@ impl KvMetaBackend {
             return Ok(());
         }
         let now = crate::mono_core::monotonic_ns_u64();
-        let expired = plane.table.expire_offers(now);
-        for slot in &expired {
-            plane.gate.end_release(*slot);
-        }
+        plane.lapse_offers(now);
         // Forced shrink (§5.1.3): the derived M over the census in force;
         // idle rotor slots beyond it released, least-recently-written
         // first, after a covering flush (the handover's own sequence).

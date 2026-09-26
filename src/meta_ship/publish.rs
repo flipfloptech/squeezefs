@@ -2298,6 +2298,7 @@ impl LaneShared {
         let mut session = match pooled {
             Some(s) if !s.dead_on_arrival() => s,
             _ => {
+                // S8-LISTENER POOL SESSION (member_session_demand_from's census: the publish pool term, publish_ship_depth)
                 let c =
                     RpcClient::connect(&self.endpoint, &self.secret, &self.peer_id, None).await?;
                 SHIP_SESSION_DIALS.fetch_add(1, Ordering::Relaxed);
@@ -2324,6 +2325,7 @@ impl LaneShared {
         let session = match live {
             Some(s) => s,
             None => {
+                // S8-LISTENER POOL SESSION (member_session_demand_from's census: the publish pool's multiplexed form)
                 let fresh = crate::cluster_wire::MuxSession::connect(
                     &self.endpoint,
                     &self.secret,

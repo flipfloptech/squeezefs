@@ -15496,6 +15496,9 @@ async fn hint_fixture(uris: &[String], venue_name: &str, slot_seed: u32) -> Hint
     let jf = fs_in_front_of(&joiner, &format!("vol-13h-hint-j-{slot_seed}")).await;
     let mf = fs_in_front_of(&manager, &format!("vol-13h-hint-m-{slot_seed}")).await;
     mf.fs.install_reclaim_hint_sink();
+    // The mount path installs both sinks together (PR 14 Step 0, §7 item
+    // 19): the recovery's corpse sweep beside the reclaim-hint entry.
+    mf.fs.install_recovered_slots_sink();
     HintFixture {
         manager,
         mvol,
@@ -16007,4 +16010,630 @@ fn a_join_the_manager_defers_is_the_retryable_class_never_busy() {
             GrantRun { start: 12, len: 1 }
         ]
     );
+}
+
+/// **§7 item 18 (PR 14 Step 0): an accepted offer's slot LANDS at the wire
+/// requester off its NEXT carriage, and the offer's stand covers the wire
+/// recall's delivery bound.** PR 4 derived the offer's stand `min(10 s,
+/// T_idle / 3)` for the in-process model, where the accept ran the
+/// handover directly; under PR 12b the holder learns the accepted offer's
+/// RECALL on its renewal beat and releases after its flush-then-transfer,
+/// and the requester learns the slot moved only through the manager's
+/// carriage — which the release CLEARED, so the requester's acquire never
+/// ran again, the slot sat `Unleased`, and it landed only if the requester
+/// shipped once more (the `sym-reclaim-hint` leg's first run). Pinned on
+/// the wire shape: the manager's stand for an offer between two WIRE
+/// appenders is the derived delivery bound (`wire_offer_stand_ms` — the
+/// requester's beat, the holder's beat, the handover, the requester's
+/// re-acquire beat), the accept recalls the holder, the holder releases,
+/// and the manager's FRESH carriage for the requester STILL names the
+/// slot: the requester's next renewal acts on it and holds the slot at
+/// `g + 1`; the closure `slot_offers ≡ slot_handovers + slot_offers_expired`
+/// holds on the manager's plane. RED on the base at the fresh carriage
+/// (empty) and at the stand (one beat).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_accepted_offers_slot_lands_at_the_wire_requester_off_its_next_carriage() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "a")]).await;
+    let a = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let holder = join(&uris, &venue, &mvol, 1).await;
+    let hvol = Arc::clone(&holder.volumes[0]);
+    let own = create_files(&holder, a, "own", 2).await;
+    let g_lease = match tree0_state(&mvol, SLOT_A).await {
+        Some(SlotState::Leased {
+            appender_id: 1, g, ..
+        }) => g,
+        other => panic!("joiner 1 holds the directory's slot: {other:?}"),
+    };
+    let requester = join(&uris, &venue, &mvol, 2).await;
+    let rvol = Arc::clone(&requester.volumes[0]);
+    let rident = rvol.joined_wire().unwrap().identity;
+    let hident = hvol.joined_wire().unwrap().identity;
+    let mplane = Arc::clone(mvol.slot_leases().expect("armed"));
+    let routing_a = squeezefs::meta_backend::kv::appender::page_slot_of_forest_slot(
+        SLOT_A,
+        mvol.appender_stats().unwrap().native_slot,
+    )
+    .unwrap();
+    // The holder's OWN offer of the slot to the requester, over the wire
+    // (what the dominance rule's served ships would raise).
+    let before = squeezefs::mono_core::monotonic_ns_u64();
+    hvol.joined_offer_slot(SLOT_A, 2)
+        .await
+        .expect("the wire OfferSlot lands at the manager");
+    let entry = mplane.table.get(SLOT_A).expect("the slot has an entry");
+    assert_eq!(entry.offered_to, 2, "offered to the requester");
+    let beat_ms = squeezefs::membership::renewal_beat_ms();
+    let stand_ns = entry.offer_expires_ns.saturating_sub(before);
+    let wire_stand_ms =
+        squeezefs::slot_lease_core::wire_offer_stand_ms(beat_ms, mplane.handover_bound_ms());
+    assert!(
+        stand_ns >= wire_stand_ms.saturating_mul(1_000_000),
+        "an offer between two wire appenders stands for the recall's delivery bound: \
+         {} ms ≥ {wire_stand_ms} ms (beat {beat_ms} ms)",
+        stand_ns / 1_000_000
+    );
+    assert!(
+        wire_stand_ms >= 3 * beat_ms,
+        "the delivery bound covers three renewal beats (learn, recall, re-acquire): \
+         {wire_stand_ms} ≥ 3 × {beat_ms}"
+    );
+    // The requester learns the offer on its renewal and accepts: the
+    // wire holder is RECALLED (no push channel), the requester answered
+    // "retry after the release".
+    let carriage = mplane.carriage_for(rident.node_token, rident.mount_slot);
+    assert_eq!(carriage.offered, vec![(routing_a, g_lease)]);
+    let (_, accepted) = requester.act_on_slot_carriage(&[], &carriage.offered).await;
+    assert_eq!(accepted, 0, "the accept recalls the wire holder first");
+    let hcarriage = mplane.carriage_for(hident.node_token, hident.mount_slot);
+    assert_eq!(hcarriage.release_notices, vec![routing_a]);
+    // The holder's renewal carries the recall: flush-then-transfer +
+    // `ReleaseSlot` — the manager counts the handover.
+    let handovers0 = mplane.handovers.load(Relaxed);
+    let (released, _) = holder
+        .act_on_slot_carriage(&hcarriage.release_notices, &[])
+        .await;
+    assert_eq!(released, 1);
+    assert_eq!(mplane.handovers.load(Relaxed), handovers0 + 1);
+    // THE PIN: the manager's FRESH carriage for the requester still names
+    // the slot — the requester's next renewal acts on it.
+    let fresh = mplane.carriage_for(rident.node_token, rident.mount_slot);
+    assert_eq!(
+        fresh.offered,
+        vec![(routing_a, g_lease)],
+        "the released slot stays on the requester's carriage until it lands"
+    );
+    let (_, accepted) = requester.act_on_slot_carriage(&[], &fresh.offered).await;
+    assert_eq!(accepted, 1, "the requester's next renewal takes the slot");
+    match tree0_state(&mvol, SLOT_A).await {
+        Some(SlotState::Leased { appender_id, g, .. }) => {
+            assert_eq!(appender_id, 2, "the requester holds the slot");
+            assert_eq!(g, g_lease + 1, "at the next generation");
+        }
+        other => panic!("tree 0 after the handover: {other:?}"),
+    }
+    // The memo is spent with the grant: nothing stands offered.
+    let after = mplane.carriage_for(rident.node_token, rident.mount_slot);
+    assert!(after.offered.is_empty(), "{:?}", after.offered);
+    assert_eq!(mplane.table.get(SLOT_A).unwrap().offered_to, 0);
+    let (offers, expired) = mplane.table.offer_counts();
+    assert_eq!(
+        offers,
+        mplane.handovers.load(Relaxed) + expired,
+        "the closure law on the wire shape (offers {offers}, handovers {}, expired {expired})",
+        mplane.handovers.load(Relaxed)
+    );
+    assert_eq!(expired, 0, "nothing lapsed");
+    for (name, ino) in &own {
+        assert_eq!(
+            requester
+                .lookup_dentry_exact_unguarded(a, name)
+                .await
+                .expect("the new holder reads the transferred tree")
+                .map(|(i, _)| i),
+            Some(*ino),
+            "{name} travelled with the slot"
+        );
+    }
+    shutdown(&requester).await;
+    drop(rvol);
+    shutdown(&holder).await;
+    drop(hvol);
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
+/// **§7 item 18's closure half: an offer that LAPSES under a standing
+/// recall is counted `expired` ONCE — never also a handover.** Before the
+/// fix the cadence's lapse put the slot back to `Leased` and counted
+/// `slot_offers_expired` while the manager's recall of the wire holder
+/// STOOD; the holder's later release then spent that recall and counted a
+/// `slot_handover` too — one offer, two outcomes, the closure law broken.
+/// Pinned: the accept recalls the holder, the offer lapses at the plane
+/// (`lapse_offers` — the cadence's arm at a clock past the stand), the
+/// recall is WITHDRAWN with it (the holder's carriage no longer names it),
+/// and the holder's release (on the notice it read before the lapse) is a
+/// plain release: `handovers` unmoved, `expired` 1, closure exact. RED on
+/// the base: `handovers` +1 beside `expired` +1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_offer_that_lapses_under_a_standing_recall_is_expired_once_never_also_a_handover() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "a")]).await;
+    let a = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let holder = join(&uris, &venue, &mvol, 1).await;
+    let hvol = Arc::clone(&holder.volumes[0]);
+    let _own = create_files(&holder, a, "own", 2).await;
+    let requester = join(&uris, &venue, &mvol, 2).await;
+    let rvol = Arc::clone(&requester.volumes[0]);
+    let rident = rvol.joined_wire().unwrap().identity;
+    let hident = hvol.joined_wire().unwrap().identity;
+    let mplane = Arc::clone(mvol.slot_leases().expect("armed"));
+    hvol.joined_offer_slot(SLOT_A, 2).await.expect("OfferSlot");
+    let carriage = mplane.carriage_for(rident.node_token, rident.mount_slot);
+    let (_, accepted) = requester.act_on_slot_carriage(&[], &carriage.offered).await;
+    assert_eq!(accepted, 0, "the accept recalls the wire holder");
+    let hcarriage = mplane.carriage_for(hident.node_token, hident.mount_slot);
+    assert_eq!(hcarriage.release_notices.len(), 1, "the recall stands");
+    // The stand lapses (the holder did not release within the delivery
+    // bound — a parked or dead holder): the offer expires ONCE and the
+    // recall is withdrawn with it.
+    let lapsed = mplane.lapse_offers(u64::MAX);
+    assert_eq!(lapsed, vec![SLOT_A], "the offer lapsed");
+    let (offers, expired) = mplane.table.offer_counts();
+    assert_eq!((offers, expired), (1, 1));
+    assert!(
+        mplane
+            .carriage_for(hident.node_token, hident.mount_slot)
+            .release_notices
+            .is_empty(),
+        "the lapse withdrew the recall from the holder's carriage"
+    );
+    assert!(
+        mplane
+            .carriage_for(rident.node_token, rident.mount_slot)
+            .offered
+            .is_empty(),
+        "nothing stands offered to the requester"
+    );
+    // The holder acts on the notice it read BEFORE the lapse: a plain
+    // release — no handover.
+    let handovers0 = mplane.handovers.load(Relaxed);
+    let (released, _) = holder
+        .act_on_slot_carriage(&hcarriage.release_notices, &[])
+        .await;
+    assert_eq!(released, 1, "the holder released on its stale notice");
+    assert_eq!(
+        mplane.handovers.load(Relaxed),
+        handovers0,
+        "a release after the lapse is not a handover"
+    );
+    let (offers, expired) = mplane.table.offer_counts();
+    assert_eq!(
+        offers,
+        mplane.handovers.load(Relaxed) + expired,
+        "the closure law (offers {offers}, handovers {}, expired {expired})",
+        mplane.handovers.load(Relaxed)
+    );
+    assert!(matches!(
+        tree0_state(&mvol, SLOT_A).await,
+        Some(SlotState::Unleased { .. })
+    ));
+    shutdown(&requester).await;
+    drop(rvol);
+    shutdown(&holder).await;
+    drop(hvol);
+    venue.tear_down();
+    shutdown(&manager).await;
+}
+
+/// A second joiner against the hint fixture's manager venue, with its own
+/// FUSE front — the FORGETTER whose projection lags the manager's word.
+async fn second_joiner(
+    uris: &[String],
+    fx: &HintFixture,
+    slot_seed: u32,
+) -> (Arc<RoutedMetaBackend>, Arc<KvMetaBackend>, FsFront) {
+    Knobs::armed().apply();
+    let r = open_routed_meta_set_joined(
+        uris,
+        &JoinedSetAdmission {
+            manager_endpoint: fx.mvenue.endpoint.clone(),
+            secret: VENUE_SECRET.to_vec(),
+            peer_id: peer_of(&joiner_identity(&fx.mvol, slot_seed).await),
+            identity: joiner_identity(&fx.mvol, slot_seed).await,
+        },
+    )
+    .await;
+    Knobs::clear();
+    let j2 = r.expect("the second joined open");
+    let j2vol = Arc::clone(&j2.volumes[0]);
+    let ident = j2vol.joined_wire().unwrap().identity;
+    // The process-global step shipper is the FORGETTER's from here.
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(&j2),
+            &peer_of(&ident),
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    let jf2 = fs_in_front_of(&j2, &format!("vol-14-hint-j2-{slot_seed}")).await;
+    (j2, j2vol, jf2)
+}
+
+/// **§7 item 19 (PR 14 Step 0), arm 1: a dead lessee's corpses are swept
+/// by the RECOVERY that releases its slots.** From a lessee's death until
+/// PR 10's recovery releases its slots, both words — a peer's projection
+/// and the manager's table — name the dead appender, so a peer's reclaim
+/// hint dials a dead endpoint and fails; after the recovery the slots are
+/// UNLEASED at the manager, whose corpse sweep ran only at ITS mount and
+/// whose kernel never FORGETs an inode it never held — the `nlink 0`
+/// records (and their blocks, on a data volume) leaked until the manager's
+/// next remount. Pinned on the hint fixture: the joiner unlinks three of
+/// its files (corpses in its own slots), checkpoints and DIES (the S6
+/// eviction's `record_death_with_key`); a second joiner's FORGET of one of
+/// them inside the death window ships to the dead endpoint, is re-resolved
+/// ONCE off the manager's word (`reclaim_hint_reresolves` +1) — which still
+/// names the dead lessee — and is counted on `reclaim_hint_failures`, the
+/// corpse standing; then ONE recovery pass releases the slots and the
+/// installed sink sweeps every corpse at the manager within its cadence
+/// (`recovery_corpses_swept` +3). RED on the base: the three records stand
+/// at the manager after the recovery for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_lessees_corpses_are_swept_by_the_recovery_that_releases_its_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "jd")]).await;
+    let jd = dirs[0];
+    let fx = hint_fixture(&uris, "manager-14-hint-recovery", 81).await;
+    let jid = fx.jid;
+    let jidentity = fx.jvol.joined_wire().unwrap().identity;
+    let mut corpses = Vec::new();
+    for name in ["c1", "c2", "c3"] {
+        let f = fx
+            .joiner
+            .create(jd, name, libc::S_IFREG | 0o644, 1000, 1000)
+            .await
+            .expect("the joiner's file")
+            .ino;
+        fx.joiner.unlink(jd, name).await.expect("the unlink");
+        assert_eq!(fx.joiner.getattr(f).await.unwrap().nlink, 0);
+        corpses.push(f);
+    }
+    fx.jvol.checkpoint_now().await.unwrap();
+    fx.mvol.checkpoint_now().await.unwrap();
+    for f in &corpses {
+        let local = fx.joiner.route_ino(*f).1;
+        let fslot = squeezefs::meta_backend::kv::record::forest_slot_of_ino(local);
+        assert!(
+            matches!(
+                tree0_state(&fx.mvol, fslot).await,
+                Some(SlotState::Leased { appender_id, .. }) if appender_id == jid
+            ),
+            "the premise: the joiner leases every corpse's slot"
+        );
+    }
+    // The second joiner: its projection names the dead lessee for every
+    // corpse slot (tree 0 read at its open, after the checkpoint above).
+    let (j2, j2vol, jf2) = second_joiner(&uris, &fx, 82).await;
+    let j2plane = Arc::clone(j2vol.slot_leases().expect("armed"));
+    // The lessee DIES: its process gone, its endpoint dead (a closed port
+    // at the forgetter), the S6 eviction records the death.
+    let HintFixture {
+        manager,
+        mvol,
+        mvenue,
+        joiner,
+        jvol,
+        jf,
+        mf,
+        ..
+    } = fx;
+    drop(jf);
+    drop(jvol);
+    drop(joiner);
+    park_gate::test_reset();
+    squeezefs::meta_backend::kv::alloc_lease::test_clear_holdings();
+    j2plane.holders.set_endpoint(jid, "127.0.0.1:1");
+    assert!(!mvol.record_death_with_key(jidentity, 9, 0).await.unwrap());
+    // The death window: the forgetter's hint dials the dead lessee, fails,
+    // re-resolves once off the manager — which still names the dead
+    // lessee — and counts the failure; the corpse stands.
+    let f0 = reclaim_faces_all();
+    let r0 = squeezefs::fuse_client::METRICS
+        .reclaim_hint_reresolves
+        .load(std::sync::atomic::Ordering::Relaxed);
+    jf2.fs.reclaim_orphaned_batch(vec![corpses[0]]).await;
+    let f1 = reclaim_faces_all();
+    assert_eq!(
+        (
+            f1.hints_shipped - f0.hints_shipped,
+            f1.hint_inos - f0.hint_inos
+        ),
+        (1, 1),
+        "one hint, counted once"
+    );
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .reclaim_hint_reresolves
+            .load(std::sync::atomic::Ordering::Relaxed),
+        r0 + 1,
+        "the failed ship re-resolved once off the manager's word"
+    );
+    assert_eq!(
+        f1.hint_failures - f0.hint_failures,
+        1,
+        "inside the death window nobody reclaims: counted, never lost"
+    );
+    // (The corpses' records sit in the dead lessee's trees and ring — the
+    // manager's read of a slot another appender leases is its divert to
+    // that holder, dead here; the recovery below installs the trees.)
+    // ONE recovery pass releases the dead lessee's slots — and the sink
+    // sweeps their corpses. The witness is the sweep's own count (the
+    // records are destroyed by it, so a read after it finds nothing
+    // whichever way the race went).
+    let swept0 = squeezefs::fuse_client::METRICS
+        .recovery_corpses_swept
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let rep = recover_dead_appenders_set(&manager).await.unwrap();
+    assert_eq!(rep.recovered(), 1, "{rep:?}");
+    let released: Vec<_> = rep.per_volume[0].1.recovered[0].slots.clone();
+    for f in &corpses {
+        let local = manager.route_ino(*f).1;
+        let fslot = squeezefs::meta_backend::kv::record::forest_slot_of_ino(local);
+        assert!(
+            released.contains(&fslot),
+            "the recovery released the corpse's slot {fslot}: {released:?}"
+        );
+    }
+    let started = std::time::Instant::now();
+    loop {
+        let swept = squeezefs::fuse_client::METRICS
+            .recovery_corpses_swept
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - swept0;
+        if swept >= 3 {
+            assert_eq!(swept, 3, "recovery_corpses_swept counts exactly the three");
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "§7 item 19: the recovery's sweep destroyed {swept} of 3 corpses in 10 s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    for f in &corpses {
+        assert!(
+            manager.getattr(*f).await.is_err(),
+            "the corpse {f} is gone at the manager"
+        );
+    }
+    assert_must_stay_zero(&mvol, "manager");
+    squeezefs::meta_backend::crossvol_tx::uninstall_xv_shipper();
+    drop(jf2);
+    shutdown(&j2).await;
+    drop(j2vol);
+    drop(j2);
+    drop(mf);
+    mvenue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
+/// **§7 item 19, arm 2: a hint whose first ship fails LANDS after one
+/// re-resolve off the manager's word.** The forgetter's projection names a
+/// lessee that RELEASED the slot (the cadence's release, a handover, a
+/// recovery) while the manager's table already reads `Unleased` — the
+/// projection lags by up to a checkpoint — and the bound endpoint is dead:
+/// the first ship fails, the slot is re-learnt from the manager, the corpse
+/// re-homed on the manager (the unleased slot's reclaimer) and shipped
+/// there, where it is destroyed as the manager's own forget. RED on the
+/// base: `reclaim_hint_failures` +1 and the corpse stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hint_whose_first_ship_fails_lands_after_one_reresolve_off_the_managers_word() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "jd")]).await;
+    let jd = dirs[0];
+    let fx = hint_fixture(&uris, "manager-14-hint-reresolve", 83).await;
+    let jid = fx.jid;
+    let f = fx
+        .joiner
+        .create(jd, "tmp", libc::S_IFREG | 0o644, 1000, 1000)
+        .await
+        .expect("the joiner's file")
+        .ino;
+    fx.joiner.unlink(jd, "tmp").await.expect("the unlink");
+    let local = fx.joiner.route_ino(f).1;
+    let fslot = squeezefs::meta_backend::kv::record::forest_slot_of_ino(local);
+    fx.jvol.checkpoint_now().await.unwrap();
+    fx.mvol.checkpoint_now().await.unwrap();
+    // The forgetter joins now: its projection names the lessee.
+    let (j2, j2vol, jf2) = second_joiner(&uris, &fx, 84).await;
+    let j2plane = Arc::clone(j2vol.slot_leases().expect("armed"));
+    assert!(
+        matches!(
+            j2plane.table.resolve(fslot),
+            squeezefs::slot_lease_core::Resolved::Holder { holder, .. } if holder == jid
+        ),
+        "the premise: the forgetter's projection names the lessee"
+    );
+    // The lessee RELEASES the slot (the cadence's shape): `Unleased` at the
+    // manager; the forgetter's projection is not refreshed.
+    fx.jvol
+        .release_slot_handover(jid, fslot)
+        .await
+        .expect("the release over the wire");
+    assert!(matches!(
+        tree0_state(&fx.mvol, fslot).await,
+        Some(SlotState::Unleased { .. })
+    ));
+    assert!(
+        matches!(
+            j2plane.table.resolve(fslot),
+            squeezefs::slot_lease_core::Resolved::Holder { holder, .. } if holder == jid
+        ),
+        "the premise: the forgetter's projection still names the lessee"
+    );
+    // The lessee's endpoint is dead at the forgetter (its listener gone).
+    j2plane.holders.set_endpoint(jid, "127.0.0.1:1");
+    let f0 = reclaim_faces_all();
+    let r0 = squeezefs::fuse_client::METRICS
+        .reclaim_hint_reresolves
+        .load(std::sync::atomic::Ordering::Relaxed);
+    jf2.fs.reclaim_orphaned_batch(vec![f]).await;
+    let f1 = reclaim_faces_all();
+    assert_eq!(
+        (
+            f1.hints_shipped - f0.hints_shipped,
+            f1.hint_inos - f0.hint_inos
+        ),
+        (1, 1),
+        "one hint, counted once whatever its ships"
+    );
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .reclaim_hint_reresolves
+            .load(std::sync::atomic::Ordering::Relaxed),
+        r0 + 1,
+        "the failed ship re-resolved once"
+    );
+    assert_eq!(
+        f1.hint_failures, f0.hint_failures,
+        "…and the re-homed hint landed (no failure)"
+    );
+    wait_destroyed(
+        &fx.manager,
+        f,
+        "§7 item 19: the manager reclaims the re-homed corpse",
+    )
+    .await;
+    let f2 = reclaim_faces_all();
+    assert_eq!(
+        f2.served - f0.served,
+        1,
+        "served at the manager as its own forget"
+    );
+    assert_eq!(
+        f2.hint_inos - f0.hint_inos,
+        (f2.served - f0.served)
+            + (f2.forwarded - f0.forwarded)
+            + (f2.misrouted - f0.misrouted)
+            + (f2.hint_failures - f0.hint_failures),
+        "the family closes in one unit: shipped ≡ served + forwarded + misrouted + failures"
+    );
+    // The fixture's own shipper back for its tear-down.
+    squeezefs::meta_backend::crossvol_tx::install_xv_shipper(
+        squeezefs::meta_ship::MetaShipRouter::new(
+            Arc::clone(&fx.joiner),
+            &peer_of(&fx.jvol.joined_wire().unwrap().identity),
+            VENUE_SECRET.to_vec(),
+        ),
+    );
+    drop(jf2);
+    shutdown(&j2).await;
+    drop(j2vol);
+    drop(j2);
+    tear_down_hint_fixture(fx, &uris).await;
+}
+
+/// **The cloned-identity door** (PR 14 Step 0 — the cloud row's first
+/// assemble, acceptance record §3.10): every node of the S2 + 8 oss
+/// cluster booted the same baked image and carried the MANAGER's
+/// `/etc/machine-id` — the daemon's node token — so every joiner's
+/// `(node_token, mount_slot)` collided with the manager's mounts and with
+/// every other joiner's, and a `Live` page a joiner never wrote read as
+/// its own residue. The door: a JOINED open whose node token equals the
+/// manager's page-0 token while the two are NOT co-located (no local
+/// writer-lock holder, a foreign boot id) refuses LOUD naming the machine
+/// id and the remedy, BEFORE rung 4 and before any wire act — the
+/// directory never gains a page for it. Pinned on the fixture, whose
+/// joiners carry the manager's token by construction (one host): with the
+/// probe reading co-located the join lands (the fixture's own premise);
+/// under `TEST_JOIN_NOT_COLOCATED` the same join refuses naming
+/// `/etc/machine-id`, the directory unchanged. The pure verdict is pinned
+/// on its four cases.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiner_carrying_the_managers_node_token_from_another_host_refuses_naming_the_machine_id()
+{
+    use squeezefs::meta_backend::kv::backend::joined::cloned_identity_refusal;
+    use squeezefs::meta_backend::kv::backend::TEST_JOIN_NOT_COLOCATED;
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, _dirs) = seeded_volume(dir.path(), &[(SLOT_A, "a")]).await;
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let pages_before = read_directory(mvol.device_path(), mvol.superblock())
+        .await
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            e.page
+                .as_ref()
+                .is_some_and(|p| p.state == AppenderState::Live)
+        })
+        .count();
+    // The pure verdict.
+    let ident = joiner_identity(&mvol, 5).await;
+    assert!(cloned_identity_refusal(&ident, Some(ident.node_token), true).is_none());
+    assert!(cloned_identity_refusal(&ident, Some(ident.node_token ^ 1), false).is_none());
+    assert!(cloned_identity_refusal(&ident, None, false).is_none());
+    let text = cloned_identity_refusal(&ident, Some(ident.node_token), false)
+        .expect("the same token from another host refuses");
+    assert!(text.contains("/etc/machine-id"), "{text}");
+    assert!(text.contains("systemd-machine-id-setup"), "{text}");
+    // The door at the open: "another host" with the manager's token.
+    TEST_JOIN_NOT_COLOCATED.store(true, Relaxed);
+    let refused = try_join(&uris, &venue, &mvol, 5).await;
+    TEST_JOIN_NOT_COLOCATED.store(false, Relaxed);
+    let err = match refused {
+        Ok(_) => panic!("a cloned identity never joins"),
+        Err(e) => e,
+    };
+    assert!(err.contains("/etc/machine-id"), "{err}");
+    assert!(err.contains("CLONED NODE IDENTITY"), "{err}");
+    let pages_after = read_directory(mvol.device_path(), mvol.superblock())
+        .await
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            e.page
+                .as_ref()
+                .is_some_and(|p| p.state == AppenderState::Live)
+        })
+        .count();
+    assert_eq!(
+        pages_after, pages_before,
+        "the refused join wrote no page — nothing was adopted"
+    );
+    // The same identity from THIS host (co-located) is the fixture's own
+    // premise: it joins.
+    let joiner = join(&uris, &venue, &mvol, 5).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    assert_eq!(
+        jvol.joined_wire().unwrap().identity.node_token,
+        ident.node_token
+    );
+    shutdown(&joiner).await;
+    drop(jvol);
+    venue.tear_down();
+    shutdown(&manager).await;
 }

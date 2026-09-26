@@ -4829,6 +4829,7 @@ impl WriteCustodyClient {
             *guard = None;
         }
         if guard.is_none() {
+            // S8-LISTENER REDIAL (member_session_demand_from's census: re-establishes the counted custody session)
             *guard = Some(RpcClient::connect(&self.endpoint, &self.secret, &self.id, None).await?);
         }
         RPCS.fetch_add(1, Ordering::Relaxed);

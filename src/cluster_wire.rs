@@ -1546,7 +1546,7 @@ impl Default for RpcListenerConfig {
             bind_addr: "0.0.0.0:0".parse().expect("literal addr"),
             security: None,
             max_connections: default_max_connections(),
-            handshake_timeout: Duration::from_secs(10),
+            handshake_timeout: DIAL_TIMEOUT,
             frame_body_timeout: Duration::from_secs(30),
             session_idle_timeout: Duration::from_secs(60),
             enroll_freshness: Duration::from_secs(30),
@@ -3045,8 +3045,13 @@ impl std::fmt::Debug for RpcClient {
     }
 }
 
-/// Bound on the dial-side connect + handshake and on one call's reply.
-const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on the dial-side connect + handshake and on one call's reply —
+/// and the LISTENER's handshake deadline (`RpcListenerConfig::default().
+/// handshake_timeout`): ONE bound, because the refused-dial retry clips its
+/// waits to it on the premise that a pre-authentication straggler holding
+/// a connection slot is reaped by the listener at the same instant (PR 13c
+/// nit 12; tied in `derivation_sweep_tests`).
+pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One dial attempt's outcome class (`RpcClient::connect_once`): the
 /// listener closed before its challenge — the cap's shape, retried by
@@ -3095,6 +3100,7 @@ impl RpcClient {
         let peer_id = peer_id.to_string();
         let security = security.cloned();
         squeezefs_ipc::sqz_blocking::run_blocking(move || {
+            // S8-LISTENER DIAL PRIMITIVE (member_session_demand_from's census: the dial itself)
             Self::connect_sync(&endpoint, &secret, &peer_id, security.as_ref())
         })
         .await
@@ -3419,6 +3425,7 @@ impl MuxSession {
         peer_id: &str,
         security: Option<&ClusterSecurityConfig>,
     ) -> Result<Arc<Self>> {
+        // S8-LISTENER DIAL PRIMITIVE (member_session_demand_from's census: a wrapper its call sites classify)
         let client = RpcClient::connect(endpoint, secret, peer_id, security).await?;
         client.into_mux()
     }
@@ -3675,6 +3682,7 @@ pub async fn measure_rtt(
     samples: usize,
     payload_bytes: usize,
 ) -> Result<RttReport> {
+    // S8-LISTENER ONE-SHOT DIAL (member_session_demand_from's census: the RTT probe, not a standing session)
     let mut client = RpcClient::connect(endpoint, secret, peer_id, None).await?;
     let body = vec![0xa5u8; payload_bytes];
     // One discarded warm-up: the first call pays TCP/TLS window and page

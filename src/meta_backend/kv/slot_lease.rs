@@ -706,6 +706,36 @@ impl SlotLeasePlane {
         }
     }
 
+    /// **Lapse every offer past `now_ns`** (the cadence's arm): the table's
+    /// expiry, the gate's release state ended on each lapsed slot, and —
+    /// acceptance record §7 item 18 — the RECALL a lapsed offer's accept
+    /// raised on a wire holder WITHDRAWN with it, so the holder's later
+    /// release is a plain release and one offer never counts as `expired`
+    /// AND as a `handover`. Returns the lapsed slots.
+    pub fn lapse_offers(&self, now_ns: u64) -> Vec<ForestSlot> {
+        let lapsed = self.table.expire_offers(now_ns);
+        for slot in &lapsed {
+            self.gate.end_release(*slot);
+            if let Some(entry) = self.table.get(*slot) {
+                self.clear_recall(entry.holder, *slot);
+            }
+        }
+        lapsed
+    }
+
+    /// The handover WALL a wire offer's stand anticipates (§7 item 18):
+    /// twice the measured `ewma_handover_ns` — a bound anticipated by a
+    /// measured mean, the KD-SYM-10 cadence's own pattern — in ms, at
+    /// least 1.
+    pub fn handover_bound_ms(&self) -> u64 {
+        (self
+            .ewma_handover_ns
+            .load(Ordering::Relaxed)
+            .saturating_mul(2)
+            / 1_000_000)
+            .max(1)
+    }
+
     /// The pending recalls of `holder` (forest slots).
     pub fn recalls_of(&self, holder: u32) -> Vec<ForestSlot> {
         self.recalls

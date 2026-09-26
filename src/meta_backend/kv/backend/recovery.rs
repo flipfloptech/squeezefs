@@ -3424,6 +3424,7 @@ pub async fn recover_dead_appenders_set(
         }
     }
     let mut recovered_any = false;
+    let mut released_slots: Vec<(usize, record::ForestSlot)> = Vec::new();
     for (i, vol) in routed.volumes.iter().enumerate() {
         let ordinal = u16::try_from(i).unwrap_or(u16::MAX);
         // The release law runs BEFORE this projection's recoveries: a
@@ -3433,8 +3434,15 @@ pub async fn recover_dead_appenders_set(
         out.regions_released += vol.release_recovered_regions(vol0, ordinal).await?;
         let report = vol.recover_dead_appenders(vol0, ordinal).await?;
         recovered_any |= !report.recovered.is_empty();
+        for region in &report.recovered {
+            released_slots.extend(region.slots.iter().map(|s| (i, *s)));
+        }
         out.per_volume.push((ordinal, report));
     }
+    // The dead lessees' corpses (acceptance record §7 item 19): the slots
+    // just released are UNLEASED — this manager's to sweep — and nothing
+    // else reclaims their `nlink 0` records before its next remount.
+    routed.note_recovered_slots(released_slots);
     // The retirement sweep (§5.5.2): a record past `2 × T_owner` whose
     // regions on EVERY volume of this set are recovered (no `Live` /
     // `Recovering` page of the identity left) and that no lease names.

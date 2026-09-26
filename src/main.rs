@@ -7175,6 +7175,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // this mount reclaims arrives as a reclaim hint and runs
                 // this mount's own FORGET-driven reclaim.
                 fs_engine.install_reclaim_hint_sink();
+                // PR 14 Step 0 (§7 item 19): the slots a recovery releases
+                // from a dead lessee are swept for its corpses at once —
+                // BEFORE `recovery::arm` below, whose mount-path C15 pass
+                // is the sink's first caller.
+                fs_engine.install_recovered_slots_sink();
             }
 
             // Symmetric metadata PR 10 (design-symmetric-metadata §5.9,

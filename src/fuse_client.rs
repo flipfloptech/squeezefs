@@ -6244,6 +6244,16 @@ pub struct Metrics {
     /// bound reached, or their reclaimer unreachable) — dropped, never
     /// read; the corpse's reclaimer is its next holder's sweep.
     pub reclaim_hints_misrouted: Align64<AtomicU64>,
+    /// Reclaim hints that did NOT travel at their first ship and were
+    /// RE-RESOLVED once off the manager's word (acceptance record §7 item
+    /// 19 — a dead lessee's slots released to the manager while this
+    /// mount's projection still named it); the re-homed inos ship to the
+    /// new reclaimer, the rest count on `reclaim_hint_failures`.
+    pub reclaim_hint_reresolves: Align64<AtomicU64>,
+    /// Corpses destroyed by the RECOVERY's corpse sweep (§7 item 19): the
+    /// `nlink 0` records of a dead lessee's released slots, which had no
+    /// reclaimer between its death and the manager's next remount.
+    pub recovery_corpses_swept: Align64<AtomicU64>,
     /// FORGETs of a foreign-slot ino whose STANDING TOKEN here reads
     /// `nlink ≥ 1` (PR 13h review round 3, Issue 17): the file is LIVE at
     /// its holder — an unlink there recalls the token before it commits —
@@ -11895,6 +11905,8 @@ impl SqueezefsFilesystem {
                 "reclaim_hints_served": METRICS.reclaim_hints_served.load(Ordering::Relaxed),
                 "reclaim_hints_forwarded": METRICS.reclaim_hints_forwarded.load(Ordering::Relaxed),
                 "reclaim_hints_misrouted": METRICS.reclaim_hints_misrouted.load(Ordering::Relaxed),
+                "reclaim_hint_reresolves": METRICS.reclaim_hint_reresolves.load(Ordering::Relaxed),
+                "recovery_corpses_swept": METRICS.recovery_corpses_swept.load(Ordering::Relaxed),
                 "reclaim_reader_forgets": METRICS.reclaim_reader_forgets.load(Ordering::Relaxed),
                 "reclaim_hint_skipped_live": METRICS.reclaim_hint_skipped_live.load(Ordering::Relaxed),
                 "reclaim_release_destroy_joint_commits": METRICS.reclaim_release_destroy_joint_commits.load(Ordering::Relaxed),
@@ -17739,6 +17751,33 @@ impl SqueezefsFilesystem {
             METRICS.reclaim_hints_served.fetch_add(1, Ordering::Relaxed);
             fs.queue_reclaim_inode(ino);
         }));
+    }
+
+    /// Install the router's corpse sweep as the meta backend's RECOVERED-
+    /// SLOTS sink (acceptance record §7 item 19): the slots PR 10's driver
+    /// releases from a dead lessee are swept for their `nlink 0` corpses
+    /// on a contained lane — off the driver's mutexes — the moment the
+    /// recovery hands them over, instead of at this manager's next
+    /// remount. Counted `recovery_corpses_swept`.
+    pub fn install_recovered_slots_sink(&self) {
+        let Some(backend) = self.meta_backend.as_ref() else {
+            return;
+        };
+        let router = self.router.clone();
+        backend.install_recovered_slots_sink(std::sync::Arc::new(
+            move |slots: Vec<(usize, crate::meta_backend::kv::record::ForestSlot)>| {
+                let router = router.clone();
+                crate::meta_exec::spawn_meta_contained("sym_recovered_corpse_sweep", async move {
+                    if let Err(e) = router.sweep_recovered_slots(&slots).await {
+                        log::warn!(
+                            "recovery: the corpse sweep of {} released slot(s) failed ({e}); the \
+                             corpses stay for the next mount's sweep",
+                            slots.len()
+                        );
+                    }
+                });
+            },
+        ));
     }
 
     /// Drop a locally cached lease (e.g. after `FencingTokenExpired` or lock loss).

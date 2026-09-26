@@ -124,6 +124,23 @@ mount is a read-token client whose metadata is exact at the next resolve
   counts it — 0 only on a fleet with no failover), and a fence RELEASES
   the planes' tokens at the holder instead of orphaning them (a dead
   holder's transport error ends the release as before).
+- **A volume FAIL-STOP under a burst of first touches, fixed red-first
+  (the acceptance record's §4.4bd):** every leased slot's mint cursor rode
+  the ledger record's membership stamp, whose 256-cursor budget is the
+  FLAT volume's (its 64-slot rotor plus travelling migration cursors); a
+  manager that first-touched three recovered writers' released slots in
+  one burst held 281 leases and every durable act on the volume refused
+  `corrupt KV encoding: membership stamp carries 279 slot cursors — at
+  most 256` — the checkpoint and the slot release that cycles one — until
+  the journal ring filled and the volume was marked FAILED (`EIO`). A
+  forest volume's ledger stamp carries no per-slot cursors now (a slot's
+  cursor lives with its lease: the lessee's appender page at every
+  checkpoint, tree 0 at the grant, the release and — new — whenever an
+  off-page slot's cursor moved without a root move), and the recorded
+  cursor floors the slot's cell at every re-adoption, which also closes a
+  latent hole where a joined writer rejoining as its own residue minted a
+  colliding ino in a slot whose last mints were covered before its last
+  checkpoint. `--single-writer` (flat) volumes keep the stamp verbatim.
 - **The flip lands after the owner's cloud decision**: the box brackets of
   every design §8 gate on the flip binary and the two-host / cloud rows are
   what that decision reads (the record

@@ -1154,6 +1154,8 @@ pub(super) struct ForestSlotWord {
     /// The slot's ino cursor as tree 0 records it (the release's for an
     /// unleased slot, the grant's for a leased one).
     pub cursor: u64,
+    /// The lessee tree 0 names (`None` unleased).
+    pub holder: Option<u32>,
 }
 
 pub struct KvMetaBackend {
@@ -3076,6 +3078,53 @@ impl KvMetaBackend {
                 );
             }
         }
+        // A forest's page-named slots: OUR regions' `Live` page entries
+        // name each held slot's cursor as of the last checkpoint (PR 14,
+        // §4.4bd — the ledger stamp carries none there). Seeded HERE, before
+        // the bring-up's join checkpoint rewrites the pages from the live
+        // cells: seeded at the lease arm's settle instead, that rewrite
+        // named every page-named slot at cursor 0, and a mount that died
+        // before its next page write left the successor minting from 2
+        // in slots the predecessor had filled (a colliding create over a
+        // live record — the crash matrix's recoverer row found it).
+        be.snapshot_forest_slot_words().await?;
+        if let Some(set) = be.appenders.as_ref() {
+            for r in set.own_regions() {
+                let page = r.page.lock().unwrap_or_else(|e| e.into_inner());
+                if page.state != super::appender::AppenderState::Live {
+                    continue;
+                }
+                for e in page
+                    .slots
+                    .iter()
+                    .filter(|e| e.state == super::appender::SlotEntryState::Live && e.cursor != 0)
+                {
+                    let fslot = super::appender::forest_slot_of_page_slot(e.slot, set.native_slot);
+                    if fslot == super::record::NATIVE_FOREST_SLOT {
+                        continue;
+                    }
+                    if let Ok(routing) = be.routing_slot_of_forest(fslot) {
+                        be.install_guest_cursor(routing, e.cursor);
+                    }
+                }
+            }
+            // And tree 0's `Leased` words for OUR regions' slots — an
+            // overflow slot's cursor home (the cursor law's record).
+            let own: Vec<u32> = set.own_regions().map(|r| r.id).collect();
+            if let Some(words) = be.forest_slot_words.get() {
+                for (fslot, w) in words {
+                    if w.cursor == 0
+                        || *fslot == super::record::NATIVE_FOREST_SLOT
+                        || !w.holder.is_some_and(|h| own.contains(&h))
+                    {
+                        continue;
+                    }
+                    if let Ok(routing) = be.routing_slot_of_forest(*fslot) {
+                        be.install_guest_cursor(routing, w.cursor);
+                    }
+                }
+            }
+        }
         // Replayed guest records for a slot the stamp carries no cursor
         // for (crash between the guest commit and the next checkpoint's
         // extended stamp): the replay fold is authoritative.
@@ -3099,8 +3148,26 @@ impl KvMetaBackend {
             guest_floors.insert(*slot, cursor.snapshot());
             true
         });
+        // A forest's ledger stamp seeds no cells (PR 14, §4.4bd — a slot's
+        // cursor lives with its lease), so the era floors of its slots are
+        // tree 0's recorded cursors folded with the replay maxima: a
+        // record below its slot's recorded cursor is a prior era's, one
+        // above it is judged current (the page-named slots' fresher page
+        // words are the lease arm's — a LOWER floor exempts, never
+        // convicts). A probe's floors, C9's forest law (PR 13e) and the
+        // flat volume's seeding are unchanged.
+        if let Some(words) = be.forest_slot_words.get() {
+            for (fslot, w) in words {
+                if *fslot == super::record::NATIVE_FOREST_SLOT || w.cursor == 0 {
+                    continue;
+                }
+                if let Ok(r) = be.routing_slot_of_forest(*fslot) {
+                    let floor = guest_floors.entry(r).or_insert(0);
+                    *floor = (*floor).max(w.cursor);
+                }
+            }
+        }
         let _ = be.era_ino_floor_guest.set(guest_floors);
-        be.snapshot_forest_slot_words().await?;
         Ok(be)
     }
 
@@ -3124,10 +3191,16 @@ impl KvMetaBackend {
                     super::slot_state::SlotState::Unleased { cursor, .. } => ForestSlotWord {
                         unleased: true,
                         cursor,
+                        holder: None,
                     },
-                    super::slot_state::SlotState::Leased { cursor, .. } => ForestSlotWord {
+                    super::slot_state::SlotState::Leased {
+                        cursor,
+                        appender_id,
+                        ..
+                    } => ForestSlotWord {
                         unleased: false,
                         cursor,
+                        holder: Some(appender_id),
                     },
                 };
                 words.insert(slot, word);
@@ -3149,6 +3222,8 @@ impl KvMetaBackend {
                 return Some(ForestSlotWord {
                     unleased: lease.state == crate::slot_lease_core::LeaseState::Unleased,
                     cursor: lease.words.cursor,
+                    holder: (lease.state != crate::slot_lease_core::LeaseState::Unleased)
+                        .then_some(lease.holder),
                 });
             }
         }
@@ -5038,9 +5113,13 @@ impl KvMetaBackend {
             for slot in plane.table.held_by(r.id) {
                 // A re-adoption reads what the forest holds; the record's
                 // seq floor is the one word the install must still carry
-                // (the lessee's ring is raised above it again).
+                // (the lessee's ring is raised above it again) — and its
+                // CURSOR (PR 14, §4.4bd): tree 0's word is an overflow
+                // slot's only per-checkpoint home for it, floored here
+                // like the grant's.
                 let words = crate::slot_lease_core::SlotWords {
                     seq_floor: plane.table.get(slot).map_or(0, |l| l.words.seq_floor),
+                    cursor: plane.table.get(slot).map_or(0, |l| l.words.cursor),
                     ..Default::default()
                 };
                 self.install_lease(set, plane, r.id, slot, words, false)
@@ -5260,6 +5339,22 @@ impl KvMetaBackend {
                         && plane.extents.get(slot) == 0
                     {
                         plane.extents.set(slot, u64::from(se.slot_tree_extents));
+                    }
+                    // OUR surviving attestation's CURSOR is the slot's
+                    // mint floor (PR 14, §4.4bd): the page names every
+                    // held slot's cursor at every checkpoint, and with the
+                    // forest's ledger stamp carrying none it is a page-
+                    // named slot's only per-checkpoint home for it — a
+                    // re-adopted slot minting from a fresh cell collided
+                    // with the covered records.
+                    if in_process.contains(appender_id)
+                        && l.holder == *appender_id
+                        && se.cursor != 0
+                        && slot != super::record::NATIVE_FOREST_SLOT
+                    {
+                        if let Ok(r) = self.routing_slot_of_forest(slot) {
+                            self.install_guest_cursor(r, se.cursor);
+                        }
                     }
                 }
             }
@@ -5543,7 +5638,7 @@ impl KvMetaBackend {
                         forest.adopt_guest(slot, Arc::new(tree));
                     }
                 }
-                forest.note_published(slot, root);
+                forest.note_published_with_cursor(slot, root, words.cursor);
             }
         }
         if fresh && words.extents != 0 {
@@ -5556,7 +5651,10 @@ impl KvMetaBackend {
                 plane.extents.set(slot, n);
             }
         }
-        if fresh && words.cursor != 0 {
+        // The cursor is a FLOOR at every install — the grant's word and
+        // (PR 14, §4.4bd) a re-adoption's recorded one alike
+        // (`install_guest_cursor` never regresses a fresher cell).
+        if words.cursor != 0 {
             if let Ok(r) = self.routing_slot_of_forest(slot) {
                 if slot != super::record::NATIVE_FOREST_SLOT {
                     self.install_guest_cursor(r, words.cursor);
@@ -7369,7 +7467,7 @@ impl KvMetaBackend {
             return self.wire_publish_roots(plane, region, slots, cycle).await;
         }
         let mut recs: Vec<(u8, Record)> = Vec::with_capacity(slots.len());
-        let mut written: Vec<(super::record::ForestSlot, RootPtr)> =
+        let mut written: Vec<(super::record::ForestSlot, RootPtr, u64)> =
             Vec::with_capacity(slots.len());
         let tag = super::journal::tag_for(super::record::TREE_CONTROL, 0);
         for slot in slots {
@@ -7399,7 +7497,7 @@ impl KvMetaBackend {
                 tag,
                 Record::put(super::slot_state::slot_state_key(*slot), 0, value),
             ));
-            written.push((*slot, root));
+            written.push((*slot, root, words.cursor));
         }
         if recs.is_empty() {
             return Ok(());
@@ -7410,8 +7508,8 @@ impl KvMetaBackend {
             EntryAdmission::Try
         };
         self.write_control_entry(recs, admit).await?;
-        for (slot, root) in written {
-            forest.note_published(slot, root);
+        for (slot, root, cursor) in written {
+            forest.note_published_with_cursor(slot, root, cursor);
         }
         log::debug!(
             "meta volume {}: appender {}'s page dropped {} page-homed slot(s) — their roots \
@@ -11324,47 +11422,66 @@ impl KvMetaBackend {
                     }
                     Err(e) => return Err(e),
                 };
-            } else if r.id == 0 {
-                for (slot, tree) in &trees {
-                    if set.region_of_slot(*slot) != 0 {
-                        continue;
-                    }
-                    if entries.len() >= super::appender::SLOT_PAGE_BUDGET {
-                        break; // the rest ride tree 0 until PR 4's LRU release
-                    }
-                    let Ok(page_slot) =
-                        super::appender::page_slot_of_forest_slot(*slot, set.native_slot)
-                    else {
-                        continue;
-                    };
-                    let root = tree.root();
-                    entries.push(super::appender::SlotEntry {
-                        slot: page_slot,
-                        state: super::appender::SlotEntryState::Live,
-                        g: 0,
-                        slot_tree_extents: 0,
-                        root,
-                        cursor: 0,
-                    });
-                }
             } else {
-                for slot in r.leases().iter() {
-                    let Ok(page_slot) =
-                        super::appender::page_slot_of_forest_slot(*slot, set.native_slot)
-                    else {
-                        continue;
-                    };
-                    let root = forest
-                        .tree(*slot)
-                        .map_or(RootPtr { addr: 0, seq: 0 }, |t| t.root());
-                    entries.push(super::appender::SlotEntry {
-                        slot: page_slot,
-                        state: super::appender::SlotEntryState::Live,
-                        g: 0,
-                        slot_tree_extents: 0,
-                        root,
-                        cursor: 0,
-                    });
+                // The plane is not armed yet — the bring-up's cycles before
+                // `arm_slot_leases` (a re-mount's join checkpoint). The
+                // page's `g` words are the settle's business (a `Live`
+                // entry below tree 0's `g` is stale residue there), but its
+                // CURSOR words are a page-named slot's per-checkpoint home
+                // (PR 14, §4.4bd): named from the live cell — seeded at the
+                // open from the page as loaded — never 0, which this arm
+                // wrote over the predecessor's words at every re-mount
+                // (masked while the ledger stamp carried the cells; a
+                // mount that died before its next page write then left
+                // its successor minting from 2 in filled slots).
+                let cursor_of = |slot: super::record::ForestSlot| {
+                    self.routing_slot_of_forest(slot)
+                        .ok()
+                        .and_then(|r| self.guest_cursor_snapshot(r))
+                        .unwrap_or(0)
+                };
+                if r.id == 0 {
+                    for (slot, tree) in &trees {
+                        if set.region_of_slot(*slot) != 0 {
+                            continue;
+                        }
+                        if entries.len() >= super::appender::SLOT_PAGE_BUDGET {
+                            break; // the rest ride tree 0 until PR 4's LRU release
+                        }
+                        let Ok(page_slot) =
+                            super::appender::page_slot_of_forest_slot(*slot, set.native_slot)
+                        else {
+                            continue;
+                        };
+                        let root = tree.root();
+                        entries.push(super::appender::SlotEntry {
+                            slot: page_slot,
+                            state: super::appender::SlotEntryState::Live,
+                            g: 0,
+                            slot_tree_extents: 0,
+                            root,
+                            cursor: cursor_of(*slot),
+                        });
+                    }
+                } else {
+                    for slot in r.leases().iter() {
+                        let Ok(page_slot) =
+                            super::appender::page_slot_of_forest_slot(*slot, set.native_slot)
+                        else {
+                            continue;
+                        };
+                        let root = forest
+                            .tree(*slot)
+                            .map_or(RootPtr { addr: 0, seq: 0 }, |t| t.root());
+                        entries.push(super::appender::SlotEntry {
+                            slot: page_slot,
+                            state: super::appender::SlotEntryState::Live,
+                            g: 0,
+                            slot_tree_extents: 0,
+                            root,
+                            cursor: cursor_of(*slot),
+                        });
+                    }
                 }
             }
             entries.sort_by_key(|e| e.slot);
@@ -11672,8 +11789,25 @@ impl KvMetaBackend {
     /// (the loom-modeled `slot_cursor_core` publication edge: every mint
     /// whose record the flush pass covered is strictly below its
     /// published cursor).
+    ///
+    /// **On a forest (bit 17) the stamp carries NO per-slot cursors** (PR
+    /// 14, §4.4bd): a slot's cursor lives with its LEASE — the lessee's
+    /// page names it every checkpoint, tree 0's record names it at the
+    /// grant, the release and (the cursor law) whenever an overflow slot's
+    /// cursor moved — and the leased population is bounded by nothing the
+    /// 4 KiB ledger slot can hold (N × 64 rotors, the page budget's
+    /// overflow). The flat stamp's `STAMP_MAX_CURSORS` = 256 was its
+    /// MINT_SPREAD rotor plus travelling migration cursors; a manager that
+    /// first-touched three dead joiners' released slots in one burst held
+    /// 281 and every durable act on the volume refused `corrupt KV
+    /// encoding` — the checkpoint AND the cadence whose LRU release would
+    /// have shrunk the set — until the ring filled and the volume failed.
     pub(super) fn membership_stamp_for_ledger(&self) -> Option<super::checkpoint::MembershipStamp> {
         let mut stamp = self.membership_stamp.lock().unwrap().clone()?;
+        if self.forest().is_some() {
+            stamp.slot_cursors.clear();
+            return Some(stamp);
+        }
         let mut cursors: Vec<(u16, u64)> = Vec::new();
         self.guest_cursors.iter_sync(|slot, cursor| {
             cursors.push((*slot, cursor.snapshot()));
@@ -19543,7 +19677,7 @@ impl KvMetaBackend {
         // `appender::page_is_own`).
         let (own_node_token, own_mount_slot) = Self::appender_identity_scope(&read_boot_id());
         let writer_open = posture == OpenPosture::Writer;
-        let mut guests: Vec<(ForestSlot, Arc<KvTree>, RootPtr)> = Vec::new();
+        let mut guests: Vec<(ForestSlot, Arc<KvTree>, RootPtr, u64)> = Vec::new();
         let (mut cursor, end) = slot_state_key_range();
         loop {
             let page = control.range(&cursor, &end, 512).await?;
@@ -19566,66 +19700,74 @@ impl KvMetaBackend {
                 // skipping leased slots by law, would clamp ring 0's tail
                 // for the mount's life (the wedge). Such a slot opens at
                 // its page root PUBLISHED.
-                let (root, recorded, publication_ours) = match SlotState::decode(v)? {
-                    // An UNLEASED slot's live root is tree 0's — or a
-                    // newer one this NODE's own page names (region 0's
-                    // page names every guest root one cycle ahead of tree
-                    // 0's publication on an unarmed forest; PR 10, the
-                    // routed Issue 1): the open takes the max, so the
-                    // page-root pass below has nothing to adopt.
-                    SlotState::Unleased { root, .. } => (
-                        Self::unleased_root_from_directory(
-                            &directory,
-                            native_routing_slot,
-                            (own_node_token, own_mount_slot, writer_open),
-                            slot,
-                            root,
-                        ),
-                        root,
-                        true,
-                    ),
-                    SlotState::Leased {
-                        appender_id,
-                        root,
-                        g,
-                        ..
-                    } => {
-                        // A LEASED slot's live root is the lessee's page
-                        // entry (§5.2.2); the record's grant-time root is
-                        // the floor a page not yet written leaves. A
-                        // FOREIGN lessee's `Recovering` page is a recovery
-                        // in flight (Issue 31): the dead recoverer's
-                        // records for the slot sit in ring 0's window, so
-                        // the slot takes the HOLD (the bring-up covers down
-                        // to it — `cover_bring_up_residue`) until the
-                        // re-run's tree-0 step lifts it.
-                        let lessee_page = directory
-                            .iter()
-                            .find(|e| e.appender_id == appender_id)
-                            .and_then(|e| e.page.as_ref());
-                        let ours = lessee_page.is_none_or(|p| {
-                            super::appender::page_is_own(
-                                appender_id,
-                                &p.identity,
-                                own_node_token,
-                                own_mount_slot,
-                                writer_open,
-                            ) || p.state == super::appender::AppenderState::Recovering
-                        });
-                        (
-                            Self::leased_root_from_directory(
+                let (root, recorded, publication_ours, published_cursor) =
+                    match SlotState::decode(v)? {
+                        // An UNLEASED slot's live root is tree 0's — or a
+                        // newer one this NODE's own page names (region 0's
+                        // page names every guest root one cycle ahead of tree
+                        // 0's publication on an unarmed forest; PR 10, the
+                        // routed Issue 1): the open takes the max, so the
+                        // page-root pass below has nothing to adopt.
+                        SlotState::Unleased { root, .. } => (
+                            Self::unleased_root_from_directory(
                                 &directory,
                                 native_routing_slot,
-                                appender_id,
-                                g,
+                                (own_node_token, own_mount_slot, writer_open),
                                 slot,
                                 root,
                             ),
                             root,
-                            ours,
-                        )
-                    }
-                };
+                            true,
+                            u64::MAX,
+                        ),
+                        SlotState::Leased {
+                            appender_id,
+                            root,
+                            g,
+                            cursor,
+                            ..
+                        } => {
+                            // A LEASED slot's live root is the lessee's page
+                            // entry (§5.2.2); the record's grant-time root is
+                            // the floor a page not yet written leaves. A
+                            // FOREIGN lessee's `Recovering` page is a recovery
+                            // in flight (Issue 31): the dead recoverer's
+                            // records for the slot sit in ring 0's window, so
+                            // the slot takes the HOLD (the bring-up covers down
+                            // to it — `cover_bring_up_residue`) until the
+                            // re-run's tree-0 step lifts it.
+                            let lessee_page = directory
+                                .iter()
+                                .find(|e| e.appender_id == appender_id)
+                                .and_then(|e| e.page.as_ref());
+                            let ours = lessee_page.is_none_or(|p| {
+                                super::appender::page_is_own(
+                                    appender_id,
+                                    &p.identity,
+                                    own_node_token,
+                                    own_mount_slot,
+                                    writer_open,
+                                ) || p.state == super::appender::AppenderState::Recovering
+                            });
+                            (
+                                Self::leased_root_from_directory(
+                                    &directory,
+                                    native_routing_slot,
+                                    appender_id,
+                                    g,
+                                    slot,
+                                    root,
+                                ),
+                                root,
+                                ours,
+                                // The record's cursor — the cursor law's word
+                                // for this publication (PR 14, §4.4bd): a live
+                                // cursor above it republishes at the first
+                                // checkpoint.
+                                cursor,
+                            )
+                        }
+                    };
                 if slot == NATIVE_FOREST_SLOT {
                     // The native slot's record is the LEASE plane's
                     // (KD-SYM-2 — the manager leases it; the clean leave
@@ -19663,7 +19805,7 @@ impl KvMetaBackend {
                     seq.raise_to(root.seq);
                     (tree, root)
                 };
-                guests.push((slot, Arc::new(tree), published));
+                guests.push((slot, Arc::new(tree), published, published_cursor));
             }
             if page.len() < 512 {
                 break;
@@ -21338,7 +21480,7 @@ impl KvMetaBackend {
         // `Unleased` here: the recovery's tree-0 step is that root's
         // publication, with the lease's `g`; the `None` arm below would
         // write `Unleased { g: 0 }` over a live generation.
-        let pending: Vec<(super::record::ForestSlot, RootPtr)> = forest
+        let mut pending: Vec<(super::record::ForestSlot, RootPtr)> = forest
             .roots_to_publish()
             .into_iter()
             .filter(|(slot, _)| {
@@ -21352,6 +21494,23 @@ impl KvMetaBackend {
                 })
             })
             .collect();
+        // The cursor law (PR 14, §4.4bd): an overflow slot whose tree-0
+        // record named a cursor below its live one is republished with
+        // the root it has — the record is that cursor's only
+        // per-checkpoint home on a forest (the ledger stamp carries none),
+        // and mints move no root.
+        if let Some(p) = plane {
+            for slot in &overflow {
+                if p.gate.is_releasing(*slot) || pending.iter().any(|(s, _)| s == slot) {
+                    continue;
+                }
+                let live = self.slot_words_now(p, *slot).cursor;
+                if let Some(root) = forest.cursor_stale_root(*slot, live) {
+                    pending.push((*slot, root));
+                }
+            }
+            pending.sort_by_key(|(s, _)| *s);
+        }
         if pending.is_empty() {
             return Ok(());
         }
@@ -21363,7 +21522,7 @@ impl KvMetaBackend {
         // and noting it published anyway lifted its floor with no durable
         // publication (a `Recovering` page's hold, Issue 31, or an own
         // region's root a cycle early).
-        let mut written: Vec<(super::record::ForestSlot, RootPtr)> =
+        let mut written: Vec<(super::record::ForestSlot, RootPtr, u64)> =
             Vec::with_capacity(pending.len());
         for (slot, root) in &pending {
             if overflow.contains(slot) {
@@ -21389,7 +21548,7 @@ impl KvMetaBackend {
                     tag,
                     Record::put(super::slot_state::slot_state_key(*slot), 0, value),
                 ));
-                written.push((*slot, *root));
+                written.push((*slot, *root, words.cursor));
                 continue;
             }
             // The UNARMED forest (PR 1–3): one appender, one cursor — the
@@ -21492,7 +21651,7 @@ impl KvMetaBackend {
                 tag,
                 Record::put(super::slot_state::slot_state_key(*slot), 0, value),
             ));
-            written.push((*slot, *root));
+            written.push((*slot, *root, u64::MAX));
         }
         if recs.is_empty() {
             // Every pending root was a leased slot's this mount may not
@@ -21548,8 +21707,12 @@ impl KvMetaBackend {
             self.note_journal_failure();
             return Err(e);
         }
-        for (slot, root) in written {
-            forest.note_published(slot, root);
+        for (slot, root, cursor) in written {
+            if cursor == u64::MAX {
+                forest.note_published(slot, root);
+            } else {
+                forest.note_published_with_cursor(slot, root, cursor);
+            }
             // The RAM table's unleased words follow the record (a later
             // grant hands the requester the root the record names).
             if let Some(p) = plane {

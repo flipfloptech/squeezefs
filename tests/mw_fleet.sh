@@ -859,10 +859,31 @@ mount_member() { # idx [--netns[=<delay_ms>]]
             netns_setup "$idx"
             launch=(nsenter "--net=/run/netns/$(ns_name "$idx")" env "${env_args[@]}" "$SQZ")
         fi
-        "${launch[@]}" mount "sqmeta://$META_PATHS" "$mnt" \
-            --daemon --allow-other --log-file "$log" \
-            >"$STATE/m${idx}.mount.out" 2>&1 ||
+        # PR 14 (the storm's third round of three joiner remounts on a
+        # page-cache-churned laptop): compaction alone left the kmbuf
+        # registration short of 1 MiB chunks — `ENOMEM` from
+        # IORING_REGISTER_KMBUF_RING, the product refusing loud as it
+        # must. Still the single-box venue's class: drop the page cache,
+        # compact again and retry, twice, before the harness dies.
+        local attempt=0
+        while :; do
+            if "${launch[@]}" mount "sqmeta://$META_PATHS" "$mnt" \
+                --daemon --allow-other --log-file "$log" \
+                >"$STATE/m${idx}.mount.out" 2>&1; then
+                break
+            fi
+            attempt=$((attempt + 1))
+            if [ "$attempt" -le 2 ] &&
+                grep -q "Cannot allocate memory" "$STATE/m${idx}.mount.out"; then
+                log "joined writer $idx: kmbuf ring registration met ENOMEM (the venue's contiguous-chunk supply) — dropping the page cache, compacting, retrying ($attempt/2)"
+                sync
+                echo 3 >/proc/sys/vm/drop_caches 2>/dev/null || true
+                echo 1 >/proc/sys/vm/compact_memory 2>/dev/null || true
+                sleep 1
+                continue
+            fi
             die "joined writer $idx mount failed: $(cat "$STATE/m${idx}.mount.out")"
+        done
         [ -n "$netem_ms" ] && netem_set "$idx" "$netem_ms"
     else
         role="reader"

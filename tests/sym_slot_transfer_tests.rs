@@ -1437,6 +1437,230 @@ async fn a_region_past_its_page_budget_publishes_the_overflow_roots_into_tree0()
     shutdown(&routed).await;
 }
 
+/// **PR 14 (§4.4bd) — a region holding more leased slots than the FLAT
+/// stamp's cursor budget keeps checkpointing.** Found by the `sym-storm`
+/// leg on the flip binary: after round 3's three recoveries released
+/// ≈ 380 slots to tree 0, the manager's storm ops first-touched them in
+/// one burst (281 leases, then 463) and EVERY durable act on the volume
+/// refused — `corrupt KV encoding: membership stamp carries 462 slot
+/// cursors — at most 256` at the checkpoint tick AND at the slot-lease
+/// cadence whose LRU release would have shrunk the set (the release cycles
+/// a checkpoint); the ring filled, the conveyor parked 30 s, three
+/// failures marked the volume FAILED and every op read `EIO`. The 256 is
+/// the flat volume's ledger-slot encoding budget for its MINT_SPREAD
+/// rotor plus travelling migration cursors; on a forest a slot's cursor
+/// lives with its lease (the lessee's page, tree 0 — KD-SYM-3, §5.1.8),
+/// and the leased population is bounded by nothing the ledger slot can
+/// hold (N × 64 rotors, the page budget's overflow). The forest's ledger
+/// stamp carries NO per-slot cursors now. Pinned: 260 first-touched slots
+/// (325 leases), three checkpoints land, the volume never fails, a crash
+/// remount resolves every record. RED on the first build at the first
+/// checkpoint with the fleet's exact text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_region_past_the_flat_stamps_cursor_budget_keeps_checkpointing() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let tag = 0xB0D7;
+    let touched: Vec<ForestSlot> = (2_000..2_260).collect();
+    // Every touch MINTS through the slot's cursor (a create's shape — the
+    // cursor cell the flat stamp would carry), then commits the record.
+    for s in &touched {
+        let routing = (*s - 1) as u16;
+        let raw = vol.allocate_guest_ino(routing).unwrap();
+        let owner = squeezefs::meta_backend::guest_local_ino(routing, raw);
+        vol.commit_block_refs(owner, &refs(tag, owner, u64::from(*s), 1))
+            .await
+            .unwrap();
+    }
+    assert!(
+        vol.appender_stats().unwrap().regions[0].leases as usize
+            > squeezefs::meta_backend::kv::checkpoint::STAMP_MAX_CURSORS,
+        "premise: the leased population is past the flat stamp's cursor budget"
+    );
+    assert!(
+        vol.guest_cursor_count() > squeezefs::meta_backend::kv::checkpoint::STAMP_MAX_CURSORS,
+        "premise: more live cursor cells than the flat stamp encodes"
+    );
+    for _ in 0..3 {
+        vol.checkpoint_now()
+            .await
+            .expect("a forest's ledger record carries no per-slot cursors — the checkpoint lands");
+    }
+    assert!(!vol.is_failed(), "never the fail-stop");
+    // Crash remount: the newest ledger record names no slot cursors (the
+    // forest's law), every record resolves, no lease conflict.
+    drop(vol);
+    drop(routed);
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert!(
+        vol.mounted_ledger()
+            .membership_stamp
+            .as_ref()
+            .is_none_or(|s| s.slot_cursors.is_empty()),
+        "a forest's ledger stamp carries no per-slot cursors"
+    );
+    for s in &touched {
+        assert_eq!(vol.block_ref_count(tag, u64::from(*s)).await.unwrap(), 1);
+    }
+    assert_eq!(lease_stats(&vol).conflicts, 0);
+    shutdown(&routed).await;
+}
+
+/// **PR 14 (§4.4bd, the second half) — an OVERFLOW slot's mint cursor is
+/// durable at every checkpoint through tree 0.** With the forest's ledger
+/// stamp carrying no cursors, a slot the page cannot name has exactly one
+/// per-checkpoint home for its cursor: its tree-0 `Leased` record — which
+/// the overflow publication rewrote only when the ROOT moved. Mints that
+/// land in an existing leaf move no root, so a crash after the checkpoint
+/// that covered them reopened the slot at the record's stale cursor and
+/// the next mint COLLIDED with a live ino (a create overwriting an
+/// existing record). The publication rewrites the record when the cursor
+/// moved too. Pinned: an off-page slot mints 24 more inos with no SMO,
+/// a checkpoint covers them, the mount dies, the reopened cursor is above
+/// every minted ino. RED with the stamp's cursors gone and the root-only
+/// publication (the reopened cursor read the grant-time word).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_overflow_slots_cursor_survives_a_crash_between_root_moves() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let tag = 0xB0D8;
+    let touched: Vec<ForestSlot> = (3_000..3_120).collect();
+    for s in &touched {
+        let owner = ino_in_slot(*s, 9);
+        vol.commit_block_refs(owner, &refs(tag, owner, u64::from(*s), 1))
+            .await
+            .unwrap();
+    }
+    vol.checkpoint_now().await.unwrap();
+    // An off-page slot of the burst (the page names 108 by rank).
+    let entries = read_directory(std::path::Path::new(&uris[0]), vol.superblock())
+        .await
+        .unwrap();
+    let named: std::collections::BTreeSet<ForestSlot> = entries[0]
+        .page
+        .clone()
+        .unwrap()
+        .slots
+        .iter()
+        .map(|e| guest_forest_slot(e.slot))
+        .collect();
+    let slot = *touched
+        .iter()
+        .find(|s| !named.contains(s))
+        .expect("the burst has slots past the page budget");
+    let routing = (slot - 1) as u16;
+    let root_before = vol.slot_tree(slot).expect("the slot's tree").root();
+    // 24 mints into the slot's existing leaf: records land, no SMO, no
+    // root move — then the checkpoint covers them.
+    let mut minted = Vec::new();
+    for _ in 0..24 {
+        let raw = vol.allocate_guest_ino(routing).unwrap();
+        let owner = squeezefs::meta_backend::guest_local_ino(routing, raw);
+        vol.commit_block_refs(owner, &refs(tag, owner, 50_000 + raw, 1))
+            .await
+            .unwrap();
+        minted.push(raw);
+    }
+    let top = *minted.iter().max().unwrap();
+    vol.checkpoint_now().await.unwrap();
+    assert_eq!(
+        vol.slot_tree(slot).expect("the slot's tree").root(),
+        root_before,
+        "premise: the mints moved no root (the shape the root-only publication missed)"
+    );
+    // The cursor law: tree 0's record names the live cursor at the
+    // checkpoint (the root unmoved).
+    let recorded = tree0_states(&vol)
+        .await
+        .into_iter()
+        .find(|(s, _)| *s == slot)
+        .map(|(_, st)| st);
+    assert!(
+        matches!(recorded, Some(SlotState::Leased { cursor, .. }) if cursor > top),
+        "slot {slot}: tree 0 names the moved cursor beside the unmoved root: {recorded:?}          (top minted {top})"
+    );
+    // The mount dies; the successor reopens its own residue.
+    drop(vol);
+    drop(routed);
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let next = vol.allocate_guest_ino(routing).unwrap();
+    assert!(
+        next > top,
+        "slot {slot}: the reopened cursor minted {next} at or below a live ino ({top}) — \
+         the overflow slot's cursor was not durable at the checkpoint"
+    );
+    for raw in &minted {
+        assert_eq!(vol.block_ref_count(tag, 50_000 + raw).await.unwrap(), 1);
+    }
+    shutdown(&routed).await;
+}
+
+/// **PR 14 (§4.4bd, the third half) — a page-named slot's cursor survives
+/// TWO crashes in a row.** The re-mount of a dead manager's identity runs
+/// its bring-up (the join's checkpoint rewrites page 0 from the LIVE
+/// cells) BEFORE the lease arm's settle installs anything, so cells seeded
+/// only at the settle left that page write naming every held slot at
+/// cursor 0 — and a mount that died before its next page write left its
+/// successor minting from 2 in slots the first incarnation had filled
+/// (the crash matrix's recoverer row read a C10 collision: two names on
+/// one ino). The cells are seeded from OUR page's `Live` entries and tree
+/// 0's `Leased` words at the open, ahead of the bring-up. Pinned: mints in
+/// the rotor, a checkpoint, a death, a re-mount that does nothing but
+/// come up, a second death, a third mount whose next mint in every rotor
+/// slot is above the first incarnation's. RED with the settle-time seeding
+/// alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_named_slots_cursor_survives_a_remount_that_dies_before_its_next_page_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let tag = 0xB0D9;
+    // Mints through the rotor: every rotor slot's cell moves.
+    let mut top: std::collections::BTreeMap<u64, u64> = Default::default();
+    for _ in 0..(2 * squeezefs::meta_backend::MINT_SPREAD) {
+        let (local, _global) = routed.allocate_local_ino(0).unwrap();
+        let Some((routing, raw)) = squeezefs::meta_backend::split_guest_local(local) else {
+            continue; // the native slot's mint
+        };
+        vol.commit_block_refs(local, &refs(tag, local, 60_000 + raw, 1))
+            .await
+            .unwrap();
+        let e = top.entry(u64::from(routing)).or_insert(0);
+        *e = (*e).max(raw);
+    }
+    assert!(!top.is_empty(), "premise: the rotor minted");
+    vol.checkpoint_now().await.unwrap();
+    // Death 1; the re-mount comes up (its bring-up rewrites page 0) and
+    // dies at once — no further checkpoint.
+    drop(vol);
+    drop(routed);
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    drop(routed);
+    // Death 2; the third mount mints above every first-incarnation raw.
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    for (routing, first_top) in &top {
+        let next = vol.allocate_guest_ino(*routing as u16).unwrap();
+        assert!(
+            next > *first_top,
+            "routing slot {routing}: the third mount minted {next} at or below a live ino \
+             ({first_top}) — the page named the slot's cursor at 0 after the second mount's \
+             bring-up"
+        );
+    }
+    shutdown(&routed).await;
+}
+
 // ---------------------------------------------------------------------------
 // §5.1.4 — handover: flush-then-transfer between two live appenders, the
 // one-ring-per-key invariant, dominance, the crowd, the cooldown.

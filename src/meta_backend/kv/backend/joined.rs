@@ -1481,8 +1481,11 @@ impl KvMetaBackend {
         // without a write (its records replayed as own residue above).
         let mut held = 0usize;
         for slot in plane.table.held_by(own) {
+            // Tree 0's cursor floors the re-adopted slot's cell (PR 14,
+            // §4.4bd — an overflow slot's only per-checkpoint home for it).
             let words = crate::slot_lease_core::SlotWords {
                 seq_floor: plane.table.get(slot).map_or(0, |l| l.words.seq_floor),
+                cursor: plane.table.get(slot).map_or(0, |l| l.words.cursor),
                 ..Default::default()
             };
             self.install_lease(set, &plane, own, slot, words, false)
@@ -1611,6 +1614,18 @@ impl KvMetaBackend {
                             && plane.extents.get(slot) == 0
                         {
                             plane.extents.set(slot, u64::from(se.slot_tree_extents));
+                        }
+                        // Our page's cursor floors the re-adopted slot's
+                        // cell (PR 14, §4.4bd — a page-named slot's only
+                        // per-checkpoint home for it).
+                        if l.holder == own
+                            && l.state != crate::slot_lease_core::LeaseState::Unleased
+                            && se.cursor != 0
+                            && slot != super::super::record::NATIVE_FOREST_SLOT
+                        {
+                            if let Ok(r) = self.routing_slot_of_forest(slot) {
+                                self.install_guest_cursor(r, se.cursor);
+                            }
                         }
                     }
                 }
@@ -2693,9 +2708,6 @@ impl KvMetaBackend {
             forest.roots_to_publish().into_iter().collect();
         let mut roots: Vec<(ForestSlot, crate::meta_ship::manager::WireSlotRoot)> = Vec::new();
         for slot in slots {
-            let Some(root) = stale.get(slot) else {
-                continue;
-            };
             let Some(lease) = plane.table.get(*slot).filter(|l| {
                 l.holder == region.id && l.state != crate::slot_lease_core::LeaseState::Unleased
             }) else {
@@ -2705,6 +2717,17 @@ impl KvMetaBackend {
                 continue;
             };
             let words = self.slot_words_now(plane, *slot);
+            // A moved root, or (PR 14, §4.4bd — the cursor law) a root the
+            // record names at a cursor below the live one: tree 0 is the
+            // overflow slot's only per-checkpoint home for the cursor.
+            let Some(root) = stale
+                .get(slot)
+                .copied()
+                .or_else(|| forest.cursor_stale_root(*slot, words.cursor))
+            else {
+                continue;
+            };
+            let root = &root;
             roots.push((
                 *slot,
                 crate::meta_ship::manager::WireSlotRoot {
@@ -2746,12 +2769,13 @@ impl KvMetaBackend {
             // again meanwhile stays stale (its NEW root's publication is
             // the next cycle's).
             for (slot, w) in chunk {
-                forest.note_published(
+                forest.note_published_with_cursor(
                     *slot,
                     RootPtr {
                         addr: w.root.0,
                         seq: w.root.1,
                     },
+                    w.cursor,
                 );
             }
             plane

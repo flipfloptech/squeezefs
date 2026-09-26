@@ -1889,7 +1889,20 @@ act with these laws (`docs/design-symmetric-metadata.md` §7.2 / §7.3, row 14):
   after a failover `dlm_custody_holder_fences` reads +1 per joiner per
   failover — the healthy reading (it is 0 only on a fleet that never
   failed over); `dlm_custody_unknown_leases` +1 beside it; the successor's
-  `dlm_token_recall_timeouts_live` stays 0.
+  `dlm_token_recall_timeouts_live` stays 0. And **the ledger stamp's
+  cursor budget under the plane** (§4.4bd): every leased slot's mint
+  cursor rode the ledger record's membership stamp, whose 256-cursor cap
+  is the FLAT volume's; a manager that first-touched three recovered
+  writers' released slots in one burst held 281 leases and every durable
+  act refused `corrupt KV encoding: membership stamp carries N slot
+  cursors — at most 256` until the ring filled and the volume was marked
+  FAILED. A forest volume's ledger stamp carries no per-slot cursors now
+  (the cursor lives with the lease — the page, tree 0); so on a
+  symmetric-forest volume `meta_slot_stamp_cursors_max` reads the LIVE
+  cursor cells this mount holds (≈ `slot_leases_held`), no longer an
+  encoding-budget pressure gauge — the "migrate cursor-bearing slots off
+  this volume" remedy in the refusal text belongs to `--single-writer`
+  (flat) volumes alone, where the stamp is unchanged.
 * **What is owed past the flip** (the PR 14b board): the manager's zero-census
   open (the bitmap as the terminal-free engine), PR 7's un-share of a
   surviving sole owner, the SMO-record window economy (one pad per flush

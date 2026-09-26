@@ -83,6 +83,14 @@ pub enum PublicationHome {
 struct Publication {
     root: RootPtr,
     home: PublicationHome,
+    /// The mint cursor the publication NAMED beside the root (PR 14,
+    /// §4.4bd): a tree-0 `Leased` record is an overflow slot's only
+    /// per-checkpoint home for its cursor once the forest's ledger stamp
+    /// carries none, and mints move no root — so a publication whose
+    /// cursor fell behind the live one is stale like a moved root.
+    /// `u64::MAX` = no cursor law for this publication (an unleased
+    /// slot's record, a page-homed root, a recovery's install).
+    cursor: u64,
 }
 
 /// A routed record: the slot tree holding it and its forest key.
@@ -144,17 +152,18 @@ impl SlotTrees {
     pub fn new(
         control: Arc<KvTree>,
         native: Arc<KvTree>,
-        guests: Vec<(ForestSlot, Arc<KvTree>, RootPtr)>,
+        guests: Vec<(ForestSlot, Arc<KvTree>, RootPtr, u64)>,
     ) -> Self {
         let map = scc::HashMap::new();
         let published = scc::HashMap::new();
-        for (slot, tree, published_root) in guests {
+        for (slot, tree, published_root, cursor) in guests {
             let _ = map.insert_sync(slot, tree);
             let _ = published.insert_sync(
                 slot,
                 Publication {
                     root: published_root,
                     home: PublicationHome::Tree0,
+                    cursor,
                 },
             );
         }
@@ -410,6 +419,7 @@ impl SlotTrees {
             Publication {
                 root,
                 home: PublicationHome::Tree0,
+                cursor: u64::MAX,
             },
         );
     }
@@ -807,11 +817,47 @@ impl SlotTrees {
 
     /// Note that `slot`'s root `root` has been published into tree 0.
     pub fn note_published(&self, slot: ForestSlot, root: RootPtr) {
-        self.note_published_at(slot, root, PublicationHome::Tree0);
+        self.note_published_at(slot, root, PublicationHome::Tree0, u64::MAX);
     }
 
-    fn note_published_at(&self, slot: ForestSlot, root: RootPtr, home: PublicationHome) {
-        let _ = self.published.upsert_sync(slot, Publication { root, home });
+    /// [`Self::note_published`] for a LEASED slot's tree-0 record that
+    /// named `cursor` beside the root (the grant's record, the overflow
+    /// publication, a joined appender's acked `PublishRoots`) — the
+    /// cursor law of [`Self::cursor_stale_root`] applies from here.
+    pub fn note_published_with_cursor(&self, slot: ForestSlot, root: RootPtr, cursor: u64) {
+        self.note_published_at(slot, root, PublicationHome::Tree0, cursor);
+    }
+
+    /// **The cursor law** (PR 14, §4.4bd): the live root of a slot whose
+    /// tree-0 publication named a cursor BELOW `live_cursor` — the
+    /// checkpoint republishes it (root unmoved, cursor moved), so a crash
+    /// after the checkpoint that covered the mints reopens the slot above
+    /// them instead of at the record's stale word (a colliding mint over
+    /// a live ino). `None` for a slot with no publication, a page-homed
+    /// or cursor-less one, or a cursor that did not move.
+    pub fn cursor_stale_root(&self, slot: ForestSlot, live_cursor: u64) -> Option<RootPtr> {
+        let stale = self
+            .published
+            .read_sync(&slot, |_, p| {
+                p.home == PublicationHome::Tree0 && p.cursor != u64::MAX && p.cursor < live_cursor
+            })
+            .unwrap_or(false);
+        if !stale {
+            return None;
+        }
+        self.tree(slot).map(|t| t.root())
+    }
+
+    fn note_published_at(
+        &self,
+        slot: ForestSlot,
+        root: RootPtr,
+        home: PublicationHome,
+        cursor: u64,
+    ) {
+        let _ = self
+            .published
+            .upsert_sync(slot, Publication { root, home, cursor });
         self.publishes.fetch_add(1, Ordering::Relaxed);
         super::META_KV_FOREST_ROOT_PUBLISHES.fetch_add(1, Ordering::Relaxed);
     }
@@ -827,7 +873,7 @@ impl SlotTrees {
             .read_sync(&slot, |_, p| p.root != root)
             .unwrap_or(true);
         if moved {
-            self.note_published_at(slot, root, PublicationHome::Page);
+            self.note_published_at(slot, root, PublicationHome::Page, u64::MAX);
         }
     }
 }

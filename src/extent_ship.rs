@@ -360,7 +360,7 @@ pub async fn ship_extent(
         }
         return Ok(());
     }
-    let request_id = crate::cowriter::next_ship_request_id();
+    let request_id = crate::shipped_free::next_ship_request_id();
     // The read-overlay key: the mount's live block geometry (one relaxed
     // load; extents are minted against the same geometry the write path
     // split them with).
@@ -433,7 +433,7 @@ pub async fn reship_all(be: &Arc<RoutedMetaBackend>) -> Result<usize> {
     });
     let mut shipped = 0usize;
     for (ino, r) in work {
-        let request_id = crate::cowriter::next_ship_request_id();
+        let request_id = crate::shipped_free::next_ship_request_id();
         crate::meta_ship::publish::write_extent(
             be,
             ino,

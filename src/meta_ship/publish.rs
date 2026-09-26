@@ -108,7 +108,7 @@ use std::sync::Arc;
 /// authority's next recovery.
 ///
 /// **4 since the lane free HARVEST landed** (`HarvestLaneFree` +
-/// [`PublishReply::LaneFreeGrant`] joined — rung 10, residual 2): a peer
+/// `PublishReply::LaneFreeGrant` joined — rung 10, residual 2): a peer
 /// that speaks 3 cannot hand a co-writer its lane's freed supply back, and
 /// a co-writer whose harvests silently vanished would starve `StorageFull`
 /// on a store with free space.
@@ -144,7 +144,7 @@ use std::sync::Arc;
 ///
 /// **8 since the harvest reply carries the authority's bound age** (the
 /// free-grace sustain campaign PR 4, OQ 2 — user decision 2026-08-25):
-/// [`PublishReply::LaneFreeGrant`] became a struct variant whose
+/// `PublishReply::LaneFreeGrant` became a struct variant whose
 /// `bound_age_ms` is the authority's live loop latency, so the
 /// co-writer's ahead-refill horizon is a MEASUREMENT instead of a
 /// derivation. A 7-speaker cannot decode the widened reply — the
@@ -208,7 +208,7 @@ use std::sync::Arc;
 ///
 /// **14 since the harvest reply carries each granted block's release age**
 /// (finding 15 term 2, `.benchmarks/2026-09-06-free-grace-lane-visible.md`):
-/// [`PublishReply::LaneFreeGrant`] gained `release_ages_ms` — per block,
+/// `PublishReply::LaneFreeGrant` gained `release_ages_ms` — per block,
 /// the ms it sat on the authority's free list since its grace release,
 /// measured on the AUTHORITY's clock — so the co-writer can stamp the
 /// `released_served` stage of `alloc_lane_visible_phase_ns` beside its
@@ -237,27 +237,24 @@ use std::sync::Arc;
 /// all — it is the authority's OWN publishes displacing a co-writer's
 /// blocks (the assembler's fold of the co-writer's shipped slices), frees
 /// no served reply can carry because no call of the co-writer's produced
-/// them. [`PublishReplyFrame::lane_frees`] drains, per reply, the
-/// [`WireLaneFree`] notices queued for the frame's client since its last
+/// them. `PublishReplyFrame::lane_frees` drains, per reply, the
+/// `WireLaneFree` notices queued for the frame's client since its last
 /// reply — queued BEFORE the authority's ladder runs, so the reply that
 /// hands an offset back through a harvest was built after its notice was
-/// queued and carries it — and [`PublishReply::LaneFreeGrant`] gained
+/// queued and carries it — and `PublishReply::LaneFreeGrant` gained
 /// `grant_seq`, the per-client grant sequence a notice's `after_grants` is
 /// ordered against (a notice below an offset's grant sequence names a
 /// lifetime the co-writer already re-minted, and touches nothing). A
 /// 15-speaker would read the notices as absent and keep the lineage — the
 /// mismatch refuses loud at the first frame (KD-7 same-commit fleets).
 ///
-/// **17 since the request frame carries the `pack_group` flag**
-/// (design-small-file-packing §5.6, PR PK4): a co-writer's pack of
-/// small-file tenants ships its `SetLayoutAndSize` calls as ONE flagged
-/// frame the owner must serve as ONE conveyor group on ONE home volume —
-/// or refuse ([`PUBLISH_PACK_GROUP_UNAVAILABLE`] /
-/// [`PUBLISH_PACK_GROUP_SPLIT`]). A 16-speaker would decode the flag as
-/// absent and serve the frame per chain, silently reopening the
-/// publish-after-terminal-free window the flag exists to close — the
-/// mismatch refuses loud instead.
-pub const PUBLISH_SCHEMA: u32 = 17;
+/// **18 since PR 14 (the symmetric default flip)**: the request frame's
+/// PK4 `pack_group` flag, the reply frame's lane-free notices and the
+/// lane verbs (`RaiseAllocLane`, `LaneHarvest`) left with the co-writer
+/// posture — a 17-speaker would decode the frame one field short and
+/// misread every call after it; the mismatch refuses loud instead (KD-7
+/// same-commit fleets).
+pub const PUBLISH_SCHEMA: u32 = 18;
 
 /// First verb of S9's publish block. S3's ping is 0, S8's metadata verbs
 /// are 16/17, S6's membership owns `0x0100..=0x01FF`, S9's custody
@@ -280,10 +277,6 @@ pub const PUBLISH_MALFORMED: u16 = 0x52;
 pub const PUBLISH_NOT_OWNER: u16 = 0x53;
 /// Status: the owner-side execution PANICKED (must stay 0).
 pub const PUBLISH_PANIC: u16 = 0x54;
-/// Status: a reservation raise named a lane this client was not assigned, a
-/// width the authority does not run, or a lease that is not custody — the
-/// **must-stay-0** class (`alloc_lane_raise_refusals`).
-pub const PUBLISH_LANE_REFUSED: u16 = 0x55;
 /// Status: a FREE verb presented a lease epoch that is not custody on this
 /// authority (revoked, swept, or minted by a previous era) — the fencing
 /// refusal of the co-writer free path (`free_stale_refusals`). Refused
@@ -291,20 +284,6 @@ pub const PUBLISH_LANE_REFUSED: u16 = 0x55;
 /// answered from a cached outcome, and a dead era's first attempt must
 /// never execute.
 pub const PUBLISH_STALE_LEASE: u16 = 0x56;
-/// Status (frame-level, PK4): a `pack_group` frame reached an owner whose
-/// D-1c conveyor-group lever is `0` (or one too old to know the flag).
-/// Serving it per chain would silently reopen the publish-after-terminal-
-/// free window (design-small-file-packing §5.6 (1)), so the owner refuses
-/// the WHOLE frame: nothing applied, KNOWN. The co-writer abandons the
-/// never-published pack and promotes those tenants one-block-per-file.
-pub const PUBLISH_PACK_GROUP_UNAVAILABLE: u16 = 0x57;
-/// Status (frame-level, PK4): the owner's post-slot-gate route
-/// re-derivation found a `pack_group` frame's tenants on MORE THAN ONE home
-/// meta volume — an online `migrate-meta-slot` cutover landed between the
-/// co-writer's partition and this serve. Two per-volume sub-groups would
-/// be the window itself, so the frame is refused whole: nothing applied,
-/// KNOWN. The co-writer abandons the pack and re-`prepare`s every tenant.
-pub const PUBLISH_PACK_GROUP_SPLIT: u16 = 0x58;
 /// Status (per call, PK4 — the authority's served-publish SCREEN, §5.6
 /// (2)): a served layout publish would ADOPT a data block this authority
 /// holds on its free list, in the freed-offset grace ring or in S7
@@ -362,27 +341,6 @@ impl From<WireBlockRefOp> for BlockRefOp {
 pub struct WireFreedBlock {
     pub vol_tag: u64,
     pub block_idx: u64,
-}
-
-/// One **lane-free notice** (schema 16): a block of the receiving client's
-/// LANE whose reference the authority's OWN publish released — a free the
-/// authority performs on the client's behalf that no served reply can
-/// name (the assembler's fold of the client's shipped slices; a peer's
-/// explicit free of a block the client minted). The client releases its
-/// local tracking of the offset — the non-accounting hygiene, the
-/// `retire_displaced_locally` decrement — unless the offset's harvest grant
-/// sequence is ABOVE `after_grants` (the client re-minted it from a grant
-/// the authority served after queuing this notice; the reply carrying the
-/// notice was reordered behind the grant's), in which case the live
-/// lifetime is untouched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WireLaneFree {
-    pub vol_tag: u64,
-    pub block_idx: u64,
-    /// The client's [`PublishReply::LaneFreeGrant`] sequence at the moment
-    /// the notice was queued: every grant that can hand this offset back
-    /// was served after, so it carries a higher `grant_seq`.
-    pub after_grants: u64,
 }
 
 /// The finding-36 verdict a shipped layout publish answers with, as the
@@ -478,33 +436,6 @@ pub enum PublishCall {
         offset: u64,
         max: u32,
     },
-    /// **Raise (or OPEN) a data-plane allocation lane's durable reservation**
-    /// — DLM S9's co-writer allocation seam
-    /// (`docs/design-mw-data-alloc-partition.md` §3).
-    ///
-    /// The client names a **lane**, never a record: the owner derives the
-    /// record's name from `(vol_tag, lane)` itself
-    /// ([`crate::data_alloc_lane::lane_record_name`]), so this verb cannot
-    /// address `writer_claim`, `claim_set`, `job:` or any other internal
-    /// name — and it validates the lane against the assignment IT made
-    /// before committing anything.
-    ///
-    /// `upto == 0` is the OPEN: commit nothing, answer the frontier this
-    /// lane must resume at (the reply's [`PublishReply::LaneFrontier`]).
-    RaiseAllocLane {
-        /// The durable data-volume identity (KD-5's `vol-{hex}` as
-        /// `block_refs::volume_tag` decodes it) — never a path, an ordinal
-        /// or a set position.
-        vol_tag: u64,
-        lane: u16,
-        writers: u16,
-        upto: u64,
-        /// The custody lease epoch the caller holds — minted by this
-        /// authority, monotone, never reused, and handed only to the member
-        /// it names. It is what makes the lane claim checkable rather than
-        /// self-asserted.
-        lease_epoch: u64,
-    },
     /// **Release displaced blocks' ACCOUNTING** — the co-writer FREE path
     /// (DLM S9; contracts `tests/mw_cowriter_free_tests.rs`).
     ///
@@ -515,7 +446,7 @@ pub enum PublishCall {
     /// `finish_free`, with the §6.8 item-3 grace ring and S7's quarantine
     /// composing inside `finish_free` exactly as they do for a local
     /// free). Frees are lane-blind (`b % W` derives the owner), so unlike
-    /// `RaiseAllocLane` there is no lane check — the owner-side validation
+    /// a lane-granted mint there is no lane check — the owner-side validation
     /// is the DURABLE LEDGER itself: a block the ledger still references
     /// is answered `NonTerminal` and nothing moves.
     ///
@@ -535,44 +466,6 @@ pub enum PublishCall {
         blocks: Vec<u64>,
         /// The custody lease epoch the caller holds — the era gate's input
         /// and half of the idempotence witness.
-        lease_epoch: u64,
-        /// Client-chosen, monotone per process — the witness's other half.
-        request_id: u64,
-    },
-    /// **Harvest the caller's lane's freed supply** — rung 10's residual-2
-    /// seam, the reuse half of the co-writer FREE path.
-    ///
-    /// A shipped free re-enters "the free supply of lane `b % W`" — the
-    /// AUTHORITY's free list, whose own allocation funnel is lane-filtered.
-    /// Without this verb that supply is reachable by NOBODY: the co-writer's
-    /// allocator is frontier-monotone (the rung-9 named residual), so
-    /// sustained rewrite leaks toward ENOSPC on a store with free space.
-    ///
-    /// The owner hands back up to `max` free-listed block indices of the
-    /// CALLER's lane, **removing them from its own free list** (exactly-once
-    /// — nobody can receive an offset twice), draining its reclaim queue
-    /// first when the lane's supply is still queued, and recording every
-    /// handout against `lease_epoch` so an epoch that dies with the
-    /// reference not yet durable quarantines them (the §3.1 zombie window
-    /// closed for REUSED offsets the way the durable frontier closes it for
-    /// fresh mints; the record discharges on the offset's next shipped
-    /// free). Lane + lease are validated against the assignment THIS
-    /// authority made, exactly as `RaiseAllocLane`'s are.
-    ///
-    /// **Retried like `FreeBlocks` and only like it**: the owner keys the
-    /// same dedup-window pattern on `(lease_epoch, request_id)` — a resend
-    /// after a lost reply answers the winner's own grant, and a retry never
-    /// re-keys across a re-join.
-    HarvestLaneFree {
-        /// The durable data-volume identity (KD-5, as above).
-        vol_tag: u64,
-        lane: u16,
-        writers: u16,
-        /// Handout cap, blocks (the caller's reservation grain — derived,
-        /// never a knob).
-        max: u64,
-        /// The custody lease epoch the caller holds — the era gate's input,
-        /// half of the idempotence witness, and the handout ledger's key.
         lease_epoch: u64,
         /// Client-chosen, monotone per process — the witness's other half.
         request_id: u64,
@@ -708,9 +601,7 @@ impl PublishCall {
             Self::CreateWithRdevSize { .. } => "create_with_rdev_size",
             Self::XattrValueCap { .. } => "xattr_value_cap",
             Self::ReaddirStream { .. } => "readdir_stream",
-            Self::RaiseAllocLane { .. } => "raise_alloc_lane",
             Self::FreeBlocks { .. } => "free_blocks",
-            Self::HarvestLaneFree { .. } => "harvest_lane_free",
             Self::WriteExtent { .. } => "write_extent",
             Self::FlushExtents { .. } => "flush_extents",
             Self::BlockRefPopulation { .. } => "block_ref_population",
@@ -732,9 +623,7 @@ impl PublishCall {
             | Self::ParkWriteTimes { lease_epoch, .. }
             | Self::DestroyInodes { lease_epoch, .. }
             | Self::CreateWithRdevSize { lease_epoch, .. }
-            | Self::RaiseAllocLane { lease_epoch, .. }
             | Self::FreeBlocks { lease_epoch, .. }
-            | Self::HarvestLaneFree { lease_epoch, .. }
             | Self::WriteExtent { lease_epoch, .. }
             | Self::FlushExtents { lease_epoch, .. }
             | Self::MigrateBlockMap { lease_epoch, .. } => Some(*lease_epoch),
@@ -797,9 +686,6 @@ impl PublishCall {
     ///   request_id)` window absorbs a duplicate (design §6a law 2);
     /// * **`FreeBlocks`** — the RETRIED class by rung 9's law (its own
     ///   dedup window + per-block verdicts);
-    /// * **`RaiseAllocLane` / `HarvestLaneFree`** — MONOTONE: the
-    ///   frontier only rises and a harvest re-serves from the authority's
-    ///   own free list, so a duplicate re-answers the standing state;
     /// * the **pure reads** (`XattrValueCap` / `ReaddirStream`) — they
     ///   mutate nothing.
     ///
@@ -811,8 +697,6 @@ impl PublishCall {
             || matches!(
                 self,
                 Self::FreeBlocks { .. }
-                    | Self::RaiseAllocLane { .. }
-                    | Self::HarvestLaneFree { .. }
                     | Self::XattrValueCap { .. }
                     | Self::ReaddirStream { .. }
                     | Self::BlockRefPopulation { .. }
@@ -874,15 +758,10 @@ impl PublishCall {
             Self::DestroyInodes { inos, .. } => inos.clone(),
             Self::CreateWithRdevSize { parent, .. } => vec![*parent],
             Self::ReaddirStream { dir, .. } => vec![*dir],
-            // The reservation record lives on ino 1 (KD-2's plane), so the
-            // authority check is the same check every other verb gets: the
-            // node serving it must hold authority over the volume ino 1
-            // routes to. The FREE verb keys on the same plane: block
-            // ownership accounting is set-level state, and the node that
-            // owns ino 1's volume is the D0 claim holder whose ladder runs.
-            Self::RaiseAllocLane { .. }
-            | Self::FreeBlocks { .. }
-            | Self::HarvestLaneFree { .. } => {
+            // The FREE verb keys on ino 1's plane (KD-2): block ownership
+            // accounting is set-level state, and the node that owns ino
+            // 1's volume is the D0 claim holder whose ladder runs.
+            Self::FreeBlocks { .. } => {
                 vec![1]
             }
             // The reply is SCOPED to the serving node's owned volumes by
@@ -947,33 +826,8 @@ pub enum PublishReply {
     Cap(u64),
     /// `readdir_stream`: `(resume cookie, entry)` pairs.
     Page(Vec<(u64, WireDirEntry)>),
-    /// `raise_alloc_lane`: the durable reservation frontier now in force for
-    /// that lane — an exclusive block-index bound this lane may mint below.
-    LaneFrontier(u64),
     /// `free_blocks`: one verdict per shipped block, in request order.
     FreeVerdicts(Vec<FreeVerdict>),
-    /// `harvest_lane_free`: the handed-out block indices — free-listed
-    /// offsets of the CALLER's lane, removed from the authority's own
-    /// list (exactly-once) and recorded against the caller's lease epoch.
-    /// Since schema 8 the reply also carries the authority's live
-    /// `free_grace_bound_age_ms` (0 = nothing held), so the co-writer's
-    /// refill horizon reads the loop latency actually in force (OQ 2).
-    /// Since schema 14 it also carries, per granted block in `blocks`
-    /// order, the ms that block sat on the authority's free list since
-    /// its grace release (`release_ages_ms`,
-    /// [`crate::free_grace::LANE_RELEASE_AGE_UNPLACED`] = no mark) — the
-    /// lane-visible ledger's `released_served` stage, measured on the
-    /// authority's clock and stamped by the co-writer beside its own
-    /// round trip (finding 15 term 2). Since schema 16 `grant_seq` is the
-    /// authority's per-client grant sequence this grant was served at —
-    /// the ordering witness a [`WireLaneFree`] notice's `after_grants` is
-    /// compared against.
-    LaneFreeGrant {
-        blocks: Vec<u64>,
-        bound_age_ms: u64,
-        release_ages_ms: Vec<u64>,
-        grant_seq: u64,
-    },
     /// `block_ref_population`: per-index reference populations summed over
     /// the SERVING node's owned volumes, in request order.
     Populations(Vec<u64>),
@@ -1009,12 +863,6 @@ pub struct PublishRequestFrame {
     /// The frame's calls, in submission order; the reply answers one
     /// [`PublishCallOutcome`] per call in the same order. Never empty.
     pub calls: Vec<PublishCall>,
-    /// Schema 17 (PK4): the frame is a co-writer PACK GROUP — every call a
-    /// `SetLayoutAndSize` on a distinct ino, all on ONE home meta volume,
-    /// to be served as ONE conveyor group or refused whole
-    /// ([`PUBLISH_PACK_GROUP_UNAVAILABLE`] / [`PUBLISH_PACK_GROUP_SPLIT`]).
-    /// Never served per chain.
-    pub pack_group: bool,
 }
 
 /// One call's answer inside a [`PublishReplyFrame`] (schema 13): the
@@ -1029,15 +877,11 @@ pub enum PublishCallOutcome {
     Refused { status: u16, detail: String },
 }
 
-/// A publish reply frame: one outcome per call, in call order, plus the
-/// lane-free notices queued for the frame's client since its last reply
-/// (schema 16 — see [`WireLaneFree`]; empty on every frame to a client
-/// whose lane blocks no authority publish displaced).
+/// A publish reply frame: one outcome per call, in call order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishReplyFrame {
     pub schema: u32,
     pub outcomes: Vec<PublishCallOutcome>,
-    pub lane_frees: Vec<WireLaneFree>,
 }
 
 /// The upper bound the frame-forming drain uses for one call's encoded
@@ -1075,11 +919,9 @@ impl PublishCall {
                 Self::CreateWithRdevSize { name, .. } => 7 * INT_HINT + bytes(name.len()),
                 Self::XattrValueCap { .. } => INT_HINT,
                 Self::ReaddirStream { .. } => 3 * INT_HINT,
-                Self::RaiseAllocLane { .. } => 5 * INT_HINT,
                 Self::FreeBlocks { blocks, .. } => {
                     3 * INT_HINT + INT_HINT + blocks.len() * INT_HINT
                 }
-                Self::HarvestLaneFree { .. } => 6 * INT_HINT,
                 Self::WriteExtent { data, .. } => 5 * INT_HINT + bytes(data.len()),
                 Self::FlushExtents { .. } => 3 * INT_HINT,
                 Self::BlockRefPopulation { block_idxs, .. } => {
@@ -1180,10 +1022,6 @@ static FREE_RECOMPUTED_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static FREE_REPLAYS: AtomicU64 = AtomicU64::new(0);
 static FREE_STALE_REFUSALS: AtomicU64 = AtomicU64::new(0);
 static FREE_SHIP_FAILURES: AtomicU64 = AtomicU64::new(0);
-static HARVEST_SHIPPED_BLOCKS: AtomicU64 = AtomicU64::new(0);
-static HARVEST_SERVED_BLOCKS: AtomicU64 = AtomicU64::new(0);
-static HARVEST_REPLAYS: AtomicU64 = AtomicU64::new(0);
-static HARVEST_REFUSALS: AtomicU64 = AtomicU64::new(0);
 // Rung 17 — the extent-assembler ledger (design §13's
 // `publish.extent_*` family; shipped ≡ served is the engagement law).
 static EXTENT_SHIPPED: AtomicU64 = AtomicU64::new(0);
@@ -1232,32 +1070,14 @@ static FRAME_GROUPS: AtomicU64 = AtomicU64::new(0);
 /// contract can flip it in-process.
 pub const CONVEYOR_GROUP_ENV: &str = "SQUEEZEFS_PUBLISH_CONVEYOR_GROUP";
 
-/// The D-1c lever in force. `pub(crate)`: the membership grant advertises
-/// it as `Grant::pack_group_available` (PK4 — the set authority's
-/// posture, carried on the lease so a co-writer never ships a pack group
-/// an owner would refuse).
+/// The D-1c lever in force.
 pub(crate) fn conveyor_group_enabled() -> bool {
     crate::env_knobs::bool_knob(CONVEYOR_GROUP_ENV, true)
 }
 
-/// **Test seam** (PK4 contract 8): a hook the owner runs on every
-/// `pack_group` frame it accepts past the lever check, BEFORE the serve —
-/// the injection point for a slot cutover landing between the co-writer's
-/// partition and the owner's route re-derivation. Returns the undo the
-/// owner runs after the frame's outcome is decided. `None` = no hook.
-pub type PackGroupServeHook = Arc<dyn Fn() -> Option<Box<dyn FnOnce() + Send>> + Send + Sync>;
-
-static TEST_PACK_GROUP_SERVE_HOOK: Lazy<arc_swap::ArcSwapOption<PackGroupServeHook>> =
-    Lazy::new(arc_swap::ArcSwapOption::empty);
-
-/// Install / clear the owner's pack-group serve hook (tests only).
-pub fn test_install_pack_group_serve_hook(hook: Option<PackGroupServeHook>) {
-    TEST_PACK_GROUP_SERVE_HOOK.store(hook.map(Arc::new));
-}
-
 /// **Test seam** (PK4 contract 9, FIND-PK-4): the client LOSES this many
-/// LAYOUT-PUBLISH frame replies (a `pack_group` frame, or a frame whose
-/// every call is `SetLayoutAndSize` / `MergeLayoutAndSize`) after the owner
+/// LAYOUT-PUBLISH frame replies (a frame whose every call is
+/// `SetLayoutAndSize` / `MergeLayoutAndSize`) after the owner
 /// answered — the sent-then-lost ambiguity, made deterministic. Each lost
 /// reply is one transport failure to the witnessed resend ladder (the
 /// owner's window answers the resend from cache); past the ladder the
@@ -1270,8 +1090,7 @@ fn lose_reply_for_test(frame: &PublishRequestFrame) -> bool {
     if TEST_LOSE_LAYOUT_PUBLISH_REPLIES.load(Ordering::Relaxed) == 0 {
         return false;
     }
-    let layout_class = frame.pack_group
-        || frame.calls.iter().all(|c| {
+    let layout_class = frame.calls.iter().all(|c| {
             matches!(
                 c,
                 PublishCall::SetLayoutAndSize { .. } | PublishCall::MergeLayoutAndSize { .. }
@@ -1376,29 +1195,6 @@ pub struct PublishStats {
     /// derivation (mount recovery / fsck C6) — the leak-safe direction,
     /// but **≈ 0** is the healthy reading.
     pub free_ship_failures: u64,
-    /// Block indices a co-writer received back through the lane free
-    /// HARVEST (client side) — the rung-10 reuse-engagement instrument: a
-    /// sustained-rewrite row whose displaced blocks exceed the lane share
-    /// must grow this, or the mount is burning frontier.
-    pub harvest_shipped_blocks: u64,
-    /// Block indices HANDED OUT by this authority (owner side) — each one
-    /// removed from its own free list and recorded against the caller's
-    /// lease epoch until discharged by the offset's next shipped free.
-    pub harvest_served_blocks: u64,
-    /// Lane-free notices queued for co-writers (schema 16): blocks of a
-    /// co-writer's lane an authority publish displaced — the assembler's
-    /// folds on the fleet. ≈ the authority's `fold_passes` on a fpp row.
-    pub lane_free_notices_queued: u64,
-    /// Notices drained into reply frames; `queued − shipped` at quiesce is
-    /// the backlog of clients that sent no frame since.
-    pub lane_free_notices_shipped: u64,
-    /// Harvest verbs answered from the dedup window (the lost-reply retry
-    /// landing here is the mechanism working).
-    pub harvest_replays: u64,
-    /// Harvest verbs refused — stale era, a lane the caller was not
-    /// assigned, or a width this era does not run. **Must stay 0** on a
-    /// healthy fleet; growth around a revocation is the gate composing.
-    pub harvest_refusals: u64,
     /// Extents SHIPPED to an authority (client side) — the sub-block
     /// exception row's engagement instrument: every sub-block write to a
     /// shared block must account here (both holders — the demotion is
@@ -1499,12 +1295,6 @@ pub fn stats() -> PublishStats {
         free_replays: FREE_REPLAYS.load(Ordering::Relaxed),
         free_stale_refusals: FREE_STALE_REFUSALS.load(Ordering::Relaxed),
         free_ship_failures: FREE_SHIP_FAILURES.load(Ordering::Relaxed),
-        harvest_shipped_blocks: HARVEST_SHIPPED_BLOCKS.load(Ordering::Relaxed),
-        harvest_served_blocks: HARVEST_SERVED_BLOCKS.load(Ordering::Relaxed),
-        lane_free_notices_queued: LANE_FREE_NOTICES_QUEUED.load(Ordering::Relaxed),
-        lane_free_notices_shipped: LANE_FREE_NOTICES_SHIPPED.load(Ordering::Relaxed),
-        harvest_replays: HARVEST_REPLAYS.load(Ordering::Relaxed),
-        harvest_refusals: HARVEST_REFUSALS.load(Ordering::Relaxed),
         extent_shipped: EXTENT_SHIPPED.load(Ordering::Relaxed),
         extent_served: EXTENT_SERVED.load(Ordering::Relaxed),
         extent_replays: EXTENT_REPLAYS.load(Ordering::Relaxed),
@@ -1549,12 +1339,6 @@ pub fn stats_json() -> serde_json::Value {
         "free_replays": s.free_replays,
         "free_stale_refusals": s.free_stale_refusals,
         "free_ship_failures": s.free_ship_failures,
-        "harvest_shipped_blocks": s.harvest_shipped_blocks,
-        "harvest_served_blocks": s.harvest_served_blocks,
-        "lane_free_notices_queued": s.lane_free_notices_queued,
-        "lane_free_notices_shipped": s.lane_free_notices_shipped,
-        "harvest_replays": s.harvest_replays,
-        "harvest_refusals": s.harvest_refusals,
         "extent_shipped": s.extent_shipped,
         "extent_served": s.extent_served,
         "extent_replays": s.extent_replays,
@@ -1673,44 +1457,9 @@ struct Submission {
     queued_at: std::time::Instant,
 }
 
-/// One queued PACK GROUP (PK4, [`PublishClient::ship_group`]): N witnessed
-/// `SetLayoutAndSize` calls that travel as ONE `pack_group` frame — never
-/// split, never mixed with other calls — and are answered as one (the
-/// outer `Result` is the frame's fate, the inner one each call's).
-struct GroupSubmission {
-    calls: Vec<PublishCall>,
-    reply: squeezefs_ipc::sqz_channel::oneshot::Sender<Result<Vec<Result<PublishReply>>>>,
-    queued_at: std::time::Instant,
-}
-
-/// What the lane queue carries: an ordinary call, or an indivisible group.
-enum Queued {
-    Call(Submission),
-    PackGroup(GroupSubmission),
-}
-
 /// One endpoint's lane: the bounded submission queue its drain serves.
 struct PublishLane {
-    tx: squeezefs_ipc::sqz_channel::mpsc::Sender<Queued>,
-}
-
-/// The largest co-writer pack (design-small-file-packing §5.6 "Batch
-/// sizing"): `min(frame_call_cap, frame_byte_budget ÷ one tenant call's
-/// wire hint)` — both DERIVED from the wire, never a constant. A tenant's
-/// `SetLayoutAndSize` is one staged layout (its inline map is one
-/// mapping; the wire hint takes the layout wire's own framing headroom,
-/// `LAYOUT_INLINE_HEADROOM`) plus at most two reference ops (the take and
-/// a displaced older copy's release). A pack sized by this never refuses
-/// at submission; the submission-time refusal is the belt.
-pub fn pack_group_tenant_cap() -> usize {
-    let tenant_hint = 4 * INT_HINT
-        + INT_HINT
-        + crate::routing::LAYOUT_INLINE_HEADROOM
-        + INT_HINT
-        + 2 * (4 * INT_HINT + 1);
-    let client_len = CLIENT.load_full().map(|c| c.peer_id.len()).unwrap_or(0);
-    let by_bytes = frame_byte_budget(client_len) / tenant_hint;
-    frame_call_cap().min(by_bytes).max(1)
+    tx: squeezefs_ipc::sqz_channel::mpsc::Sender<Submission>,
 }
 
 /// What every frame shipper on one lane shares: the endpoint, the
@@ -1779,7 +1528,7 @@ impl PublishClient {
         // so a saturated authority backpressures its clients instead of
         // growing a queue without limit; a stuck one surfaces as the
         // wire's reply timeout on the frame, never as unbounded queueing.
-        let (tx, rx) = squeezefs_ipc::sqz_channel::mpsc::channel::<Queued>(frame_call_cap() * 8);
+        let (tx, rx) = squeezefs_ipc::sqz_channel::mpsc::channel::<Submission>(frame_call_cap() * 8);
         let lane = Arc::new(PublishLane { tx });
         let spawn_drain = || {
             let shared = Arc::new(LaneShared {
@@ -1837,13 +1586,13 @@ impl PublishClient {
         let lane = self.lane(endpoint);
         let (tx, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
         lane.tx
-            .send(Queued::Call(Submission {
+            .send(Submission {
                 resend_safe: call.transport_resend_safe(),
                 size_hint: call.wire_size_hint(),
                 call,
                 reply: tx,
                 queued_at: std::time::Instant::now(),
-            }))
+            })
             .await
             .map_err(|_| {
                 SqueezefsError::InvalidOperation(format!(
@@ -1857,75 +1606,6 @@ impl PublishClient {
         })?
     }
 
-    /// Ship a co-writer PACK GROUP to `endpoint` (design-small-file-packing
-    /// §5.6, PK4): `calls` — witnessed `SetLayoutAndSize` calls on distinct
-    /// inos, all routing to ONE home meta volume of ONE owner — join the
-    /// lane as ONE push (the `enqueue_many` shape mirrored on the client:
-    /// no drain ever sees a partial group), travel as ONE frame flagged
-    /// `pack_group` that carries nothing else, and are answered as one.
-    /// The frame is refused at SUBMISSION when it would not fit the wire
-    /// (past the frame call cap or the byte budget) — the batch driver
-    /// sizes packs by [`pack_group_tenant_cap`], so this is the belt.
-    ///
-    /// The outer `Result` is the FRAME's fate, typed
-    /// ([`SqueezefsError::PublishFailure`]): a transport failure is
-    /// `TransportOutcomeUnknown`, an owner's frame-level refusal
-    /// `FrameRefused(status)`, an unusable reply `Protocol`; the inner
-    /// results are the per-call outcomes (a per-call refusal is
-    /// `CallRefused(status)`, an era refusal `WriterGuardFenced`).
-    pub async fn ship_group(
-        &self,
-        endpoint: &str,
-        calls: Vec<PublishCall>,
-    ) -> Result<Vec<Result<PublishReply>>> {
-        if calls.is_empty() {
-            return Ok(Vec::new());
-        }
-        let cap = frame_call_cap();
-        let bytes: usize = calls.iter().map(PublishCall::wire_size_hint).sum();
-        if calls.len() > cap || bytes > frame_byte_budget(self.peer_id.len()) {
-            return Err(SqueezefsError::PublishFailure {
-                class: PublishFailureClass::Protocol,
-                msg: format!(
-                    "S9: a {}-call pack group ({bytes} B) exceeds one publish frame (cap {cap} \
-                     calls / {} B) — the batch driver must size packs by pack_group_tenant_cap",
-                    calls.len(),
-                    frame_byte_budget(self.peer_id.len())
-                ),
-            });
-        }
-        if let Some(bad) = calls
-            .iter()
-            .find(|c| !matches!(c, PublishCall::SetLayoutAndSize { .. }) || c.witness().is_none())
-        {
-            return Err(SqueezefsError::PublishFailure {
-                class: PublishFailureClass::Protocol,
-                msg: format!(
-                    "S9: a pack group carries only witnessed SetLayoutAndSize calls, not {}",
-                    bad.name()
-                ),
-            });
-        }
-        let lane = self.lane(endpoint);
-        let (tx, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
-        lane.tx
-            .send(Queued::PackGroup(GroupSubmission {
-                calls,
-                reply: tx,
-                queued_at: std::time::Instant::now(),
-            }))
-            .await
-            .map_err(|_| {
-                SqueezefsError::InvalidOperation(format!(
-                    "S9: the publish lane to {endpoint} is gone"
-                ))
-            })?;
-        rx.await.map_err(|_| {
-            SqueezefsError::InvalidOperation(format!(
-                "S9: the publish lane to {endpoint} dropped a pack group's outcomes"
-            ))
-        })?
-    }
 }
 
 /// One lane's drain: form frames from whatever is queued the moment a
@@ -1944,9 +1624,9 @@ impl PublishClient {
 /// group and a per-call neighbour can never split it.
 async fn lane_drain(
     shared: Arc<LaneShared>,
-    mut rx: squeezefs_ipc::sqz_channel::mpsc::Receiver<Queued>,
+    mut rx: squeezefs_ipc::sqz_channel::mpsc::Receiver<Submission>,
 ) {
-    let mut carry: Option<Queued> = None;
+    let mut carry: Option<Submission> = None;
     loop {
         let first = match carry.take() {
             Some(s) => s,
@@ -1974,29 +1654,11 @@ async fn lane_drain(
                             "S9: the publish lane to {} lost its depth bound",
                             shared.endpoint
                         );
-                        match first {
-                            Queued::Call(s) => {
-                                let _ = s.reply.send(Err(SqueezefsError::InvalidOperation(msg)));
-                            }
-                            Queued::PackGroup(g) => {
-                                let _ = g.reply.send(Err(SqueezefsError::InvalidOperation(msg)));
-                            }
-                        }
+                        let _ = first.reply.send(Err(SqueezefsError::InvalidOperation(msg)));
                         return;
                     }
                 }
             }
-        };
-        let first = match first {
-            Queued::PackGroup(group) => {
-                let shared = Arc::clone(&shared);
-                crate::meta_exec::spawn_meta("meta_ship_publish_pack_group", async move {
-                    ship_pack_group_frame(&shared, group).await;
-                    drop(permit);
-                });
-                continue;
-            }
-            Queued::Call(s) => s,
         };
         let cap = frame_call_cap();
         let budget = frame_byte_budget(shared.peer_id.len());
@@ -2005,13 +1667,9 @@ async fn lane_drain(
         let mut frame = vec![first];
         while frame.len() < cap {
             match rx.try_recv() {
-                Ok(Queued::PackGroup(g)) => {
-                    carry = Some(Queued::PackGroup(g));
-                    break;
-                }
-                Ok(Queued::Call(next)) => {
+                Ok(next) => {
                     if next.resend_safe != class || bytes.saturating_add(next.size_hint) > budget {
-                        carry = Some(Queued::Call(next));
+                        carry = Some(next);
                         break;
                     }
                     bytes += next.size_hint;
@@ -2106,9 +1764,8 @@ async fn exchange_frame(
         return Err((
             PublishFailureClass::TransportOutcomeUnknown,
             format!(
-                "S9: the reply to a {n}-call publish frame (pack_group = {}) from {} was LOST \
-                 (test seam)",
-                frame.pack_group, shared.endpoint
+                "S9: the reply to a {n}-call publish frame from {} was LOST (test seam)",
+                shared.endpoint
             ),
         ));
     }
@@ -2154,44 +1811,6 @@ async fn exchange_frame(
     Ok(decoded)
 }
 
-/// Ship one PACK GROUP as its own flagged frame and answer the group
-/// (PK4). The frame is resend-safe by construction (every call is
-/// witnessed).
-async fn ship_pack_group_frame(shared: &LaneShared, group: GroupSubmission) {
-    super::phase_record(super::ShipPhase::QueueWait, group.queued_at);
-    let n = group.calls.len();
-    SHIP_FRAMES.fetch_add(1, Ordering::Relaxed);
-    SHIP_FRAMED_CALLS.fetch_add(n as u64, Ordering::Relaxed);
-    let names: Vec<&'static str> = group.calls.iter().map(PublishCall::name).collect();
-    let presented: Vec<Option<u64>> = group
-        .calls
-        .iter()
-        .map(PublishCall::presented_epoch)
-        .collect();
-    let frame = PublishRequestFrame {
-        schema: PUBLISH_SCHEMA,
-        client: shared.peer_id.to_string(),
-        calls: group.calls,
-        pack_group: true,
-    };
-    let out = match exchange_frame(shared, frame, true).await {
-        Ok(decoded) => {
-            crate::cowriter::apply_lane_free_notices(&decoded.lane_frees);
-            Ok(decoded
-                .outcomes
-                .into_iter()
-                .zip(names)
-                .zip(presented)
-                .map(|((outcome, name), presented)| {
-                    interpret_outcome(shared, name, presented, outcome)
-                })
-                .collect())
-        }
-        Err((class, msg)) => Err(SqueezefsError::PublishFailure { class, msg }),
-    };
-    let _ = group.reply.send(out);
-}
-
 /// Ship one formed frame and fan every call's outcome back to its caller.
 async fn ship_frame(shared: &LaneShared, frame: Vec<Submission>) {
     let n = frame.len();
@@ -2213,7 +1832,6 @@ async fn ship_frame(shared: &LaneShared, frame: Vec<Submission>) {
         schema: PUBLISH_SCHEMA,
         client: shared.peer_id.to_string(),
         calls,
-        pack_group: false,
     };
     let decoded = match exchange_frame(shared, frame, resend_safe).await {
         Ok(d) => d,
@@ -2226,7 +1844,6 @@ async fn ship_frame(shared: &LaneShared, frame: Vec<Submission>) {
     // reaches its caller — a harvest grant in this frame is adopted only
     // after the notices its blocks' frees queued have released this mount's
     // stale tracking of them.
-    crate::cowriter::apply_lane_free_notices(&decoded.lane_frees);
     for (w, outcome) in waiters.into_iter().zip(decoded.outcomes) {
         let out = interpret_outcome(shared, w.name, w.presented, outcome);
         let _ = w.reply.send(out);
@@ -2857,53 +2474,6 @@ async fn ship_witnessed(target: &PublishTarget, call: PublishCall) -> Result<Pub
     }
 }
 
-/// [`ship_witnessed`] for a PACK GROUP (PK4): the SAME frame — same
-/// request ids, same payload — resent under the bounded epoch-stable
-/// ladder on a TRANSPORT failure only (the owner's witness window answers
-/// a resend from cache, so the group applies at most once); a definite
-/// frame-level refusal, an unusable reply and an era move end the ladder
-/// at once. Past the budget the failure IS `TransportOutcomeUnknown` — the
-/// class the co-writer's pack release abandons WITHOUT recycle on.
-async fn ship_group_witnessed(
-    peer: &Arc<super::PeerOwner>,
-    calls: Vec<PublishCall>,
-) -> Result<Vec<Result<PublishReply>>> {
-    let Some(client) = CLIENT.load_full() else {
-        REFUSALS.fetch_add(1, Ordering::Relaxed);
-        let msg = format!(
-            "S9: a {}-call pack group on volumes owned by {} cannot be published — the \
-             ownership plane is armed but no publish client is installed",
-            calls.len(),
-            peer.peer_id
-        );
-        log::error!("{msg}");
-        return Err(SqueezefsError::InvalidOperation(msg));
-    };
-    let epoch = calls
-        .first()
-        .and_then(PublishCall::presented_epoch)
-        .unwrap_or(0);
-    let mut attempt = 0u32;
-    loop {
-        match client.ship_group(&peer.endpoint, calls.clone()).await {
-            Ok(outcomes) => return Ok(outcomes),
-            Err(
-                e @ SqueezefsError::PublishFailure {
-                    class: PublishFailureClass::TransportOutcomeUnknown,
-                    ..
-                },
-            ) => {
-                attempt += 1;
-                if current_lease_epoch() != epoch || attempt >= PUBLISH_SHIP_ATTEMPTS {
-                    return Err(e);
-                }
-                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
 fn expect_unit(reply: PublishReply, what: &str) -> Result<()> {
     match reply {
         PublishReply::Unit => Ok(()),
@@ -2953,7 +2523,7 @@ pub async fn set_layout_and_size(
                 size,
                 refs: wire_refs(refs),
                 lease_epoch: t.epoch(),
-                request_id: crate::cowriter::next_ship_request_id(),
+                request_id: crate::shipped_free::next_ship_request_id(),
             },
         )
         .await;
@@ -2986,92 +2556,6 @@ pub async fn set_layout_and_size(
             }
         }
     }
-}
-
-/// One tenant of a co-writer PACK GROUP publish
-/// ([`set_layout_and_size_pack_group`]): the staged layout wire and its
-/// accounting frame, exactly [`set_layout_and_size`]'s arguments, owned.
-pub struct PackGroupItem {
-    pub ino: Ino,
-    pub layout: Vec<u8>,
-    pub size: u64,
-    pub refs: Vec<BlockRefOp>,
-}
-
-/// **Ship a co-writer pack's tenant publishes as ONE `pack_group` frame**
-/// (design-small-file-packing §5.6, PK4): every item must route to the
-/// SAME foreign owner (the batch driver partitioned by `(owner endpoint,
-/// home volume)`; a local-home or mixed-owner group refuses HERE, nothing
-/// shipped — a co-writer never commits a layout locally). Runs the S10
-/// intent barrier over the whole set, mints one witness per call, ships
-/// through the witnessed group ladder, and answers one [`OwnerVerdict`] per
-/// item in input order. The outer `Err` is the frame's typed fate.
-pub async fn set_layout_and_size_pack_group(
-    be: &Arc<RoutedMetaBackend>,
-    items: Vec<PackGroupItem>,
-) -> Result<Vec<Result<OwnerVerdict>>> {
-    if items.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut peer: Option<Arc<super::PeerOwner>> = None;
-    for it in &items {
-        match owner_of(be, it.ino)? {
-            None => {
-                return Err(SqueezefsError::InvalidOperation(format!(
-                    "S9: pack group tenant ino {} routes to a LOCAL volume — a co-writer pack \
-                     group ships to one foreign owner; the batch driver's partition is broken",
-                    it.ino
-                )));
-            }
-            Some(p) => match &peer {
-                None => peer = Some(p),
-                Some(first) if first.endpoint == p.endpoint => {}
-                Some(first) => {
-                    return Err(SqueezefsError::InvalidOperation(format!(
-                        "S9: pack group tenants route to two owners ({} and {}) — the batch \
-                         driver's (owner, home volume) partition is broken",
-                        first.endpoint, p.endpoint
-                    )));
-                }
-            },
-        }
-    }
-    let Some(peer) = peer else {
-        // Unreachable by construction (a non-empty set either resolved an
-        // owner or refused above); a refusal, never a panic, in a handler.
-        return Err(SqueezefsError::InvalidOperation(
-            "S9: pack group resolved no owner for a non-empty tenant set".into(),
-        ));
-    };
-    let inos: Vec<Ino> = items.iter().map(|it| it.ino).collect();
-    intent_barrier_inos(&inos).await?;
-    let epoch = current_lease_epoch();
-    let calls: Vec<PublishCall> = items
-        .into_iter()
-        .map(|it| PublishCall::SetLayoutAndSize {
-            ino: it.ino,
-            layout: it.layout,
-            size: it.size,
-            refs: wire_refs(&it.refs),
-            lease_epoch: epoch,
-            request_id: crate::cowriter::next_ship_request_id(),
-        })
-        .collect();
-    let outcomes = ship_group_witnessed(&peer, calls).await?;
-    Ok(outcomes
-        .into_iter()
-        .map(|o| match o {
-            Ok(PublishReply::PutDone { recomputed, freed }) => {
-                Ok(OwnerVerdict { recomputed, freed })
-            }
-            Ok(other) => Err(protocol_error(
-                "set_layout_and_size (pack group)",
-                &format!("{other:?}"),
-                "a Put acknowledgement",
-            )),
-            Err(e) => Err(e),
-        })
-        .collect())
 }
 
 /// Routed [`RoutedMetaBackend::merge_layout_and_size`]. Returns
@@ -3153,7 +2637,7 @@ pub async fn merge_layout_and_size(
             size,
             refs: wire_refs(&refs),
             lease_epoch: t.epoch(),
-            request_id: crate::cowriter::next_ship_request_id(),
+            request_id: crate::shipped_free::next_ship_request_id(),
         };
         match ship_witnessed(&t, call).await {
             // The OWNER freed its recompute's releases (finding 36):
@@ -3261,7 +2745,7 @@ pub async fn flush_extents(be: &Arc<RoutedMetaBackend>, ino: Ino) -> Result<u64>
             let call = PublishCall::FlushExtents {
                 ino,
                 lease_epoch: current_lease_epoch(),
-                request_id: crate::cowriter::next_ship_request_id(),
+                request_id: crate::shipped_free::next_ship_request_id(),
             };
             match ship_witnessed(&PublishTarget::owner(peer), call).await? {
                 PublishReply::FlushDone { covering_version } => {
@@ -3331,7 +2815,7 @@ async fn ship_commit_block_refs(
             ino,
             refs: wire_refs(refs),
             lease_epoch: target.epoch(),
-            request_id: crate::cowriter::next_ship_request_id(),
+            request_id: crate::shipped_free::next_ship_request_id(),
         },
     )
     .await
@@ -3506,7 +2990,7 @@ pub async fn migrate_block_map(
                 refs: wire_refs(&refs),
                 base_gen,
                 lease_epoch: target.epoch(),
-                request_id: crate::cowriter::next_ship_request_id(),
+                request_id: crate::shipped_free::next_ship_request_id(),
             };
             let reply = match ship_witnessed(&target, call).await {
                 Ok(reply) => reply,
@@ -3762,103 +3246,20 @@ pub async fn xattr_value_cap(be: &Arc<RoutedMetaBackend>, ino: Ino) -> Result<us
 }
 
 // ---------------------------------------------------------------------------
-// DLM S9 — the co-writer's allocation lane (docs/design-mw-data-alloc-partition.md
-// §3; contracts tests/mw_cowriter_lane_tests.rs). Kept in its own block: the
-// verb is the ONLY metadata commit a co-writer's DATA path performs, and it
-// is the one place a remote caller's value reaches a durable record.
-// ---------------------------------------------------------------------------
-
-/// **Raise (or OPEN) one allocation lane's durable reservation** — routed.
-///
-/// * **we hold the authority** (every mount that ships): the local commit,
-///   monotone, exactly as [`crate::data_alloc_lane::commit_lane_raise`]
-///   defines it, with no open floor (this mount's own recovery established
-///   its floor);
-/// * **a peer holds it** (a co-writer): the raise SHIPS, and the peer commits
-///   it after checking that the lane is the one it assigned to us. That is
-///   the whole answer to *"a lane reservation is a metadata commit and a
-///   co-writer has no metadata authority"*: the co-writer does not write the
-///   record — it asks the node that can, and the offset the record covers is
-///   handed out only after the reply lands
-///   (`BlockAllocator::hand_out_reserved`).
-///
-/// Returns the frontier now in force. `upto == 0` is the OPEN: it commits
-/// nothing and answers where this lane must resume — the number a mount that
-/// runs no ownership-recovery walk cannot compute for itself.
-pub async fn raise_alloc_lane(
-    be: &Arc<RoutedMetaBackend>,
-    vol_tag: u64,
-    lane: u16,
-    writers: u16,
-    upto: u64,
-) -> Result<u64> {
-    match owner_of(be, 1)? {
-        None => {
-            note_local();
-            crate::data_alloc_lane::commit_lane_raise(be, vol_tag, lane, writers, upto, None).await
-        }
-        Some(peer) => {
-            // The lease epoch is this node's proof that the lane it names is
-            // the lane it was granted: the authority minted it, it is
-            // monotone and never reused, and it was handed only to us.
-            let lease_epoch = crate::data_grant::custody_client()
-                .map(|c| c.lease_epoch())
-                .unwrap_or(0);
-            let call = PublishCall::RaiseAllocLane {
-                vol_tag,
-                lane,
-                writers,
-                upto,
-                lease_epoch,
-            };
-            let out = ship(&peer, call).await;
-            match out {
-                Ok(PublishReply::LaneFrontier(f)) => {
-                    crate::fuse_client::METRICS
-                        .alloc_lane_shipped_reservations
-                        .fetch_add(1, Ordering::Relaxed);
-                    Ok(f)
-                }
-                Ok(other) => Err(protocol_error(
-                    "raise_alloc_lane",
-                    &format!("{other:?}"),
-                    "a lane frontier",
-                )),
-                Err(e) => {
-                    crate::fuse_client::METRICS
-                        .alloc_lane_raise_refusals
-                        .fetch_add(1, Ordering::Relaxed);
-                    log::error!(
-                        "S9: the authority at {} refused this mount's allocation-lane raise \
-                         (lane {lane} of {writers}, vol_tag {vol_tag:#016x}, upto {upto}): {e} — \
-                         no offset is handed out, because an offset whose reservation is not \
-                         durable is an offset a successor of this lane may mint again \
-                         (alloc_lane_raise_refusals)",
-                        peer.endpoint
-                    );
-                    Err(e)
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// DLM S9 — the co-writer FREE path (contracts tests/mw_cowriter_free_tests.rs;
-// operator story docs/operations.md §Multi-writer co-writer mounts). Kept in
-// its own block like the lane raise above: the free verb is the SECOND
-// metadata-plane act a co-writer's data path performs, and — unlike every
-// other call here — it is RETRIED, which only the dedup window makes safe.
+// The shipped-free wire (`crate::shipped_free`): a non-holder's displaced
+// terminal frees travel to the data volume's allocation-lease holder as the
+// FREE verb — the one call here that is RETRIED, which only the dedup window
+// makes safe.
 // ---------------------------------------------------------------------------
 
 /// The owner-side FREE executor: `(vol_tag, block indices)` → one verdict
 /// per block, produced by running the AUTHORITY's own free ladder
-/// ([`crate::cowriter::execute_shipped_frees`] over its data-plane router).
+/// ([`crate::shipped_free::execute_shipped_frees`] over its data-plane router).
 ///
-/// Installed by the multi-writer AUTHORITY arm beside the frontier source
-/// (`crate::multi_writer::arm_multi_writer`); a served free with no
-/// executor refuses loud — the ownership plane armed without its free half
-/// is the same class as the missing-publish-client refusal below.
+/// Installed by `crate::multi_writer::arm_authority_planes` on every armed
+/// writer; a served free with no executor refuses loud — the ownership
+/// plane armed without its free half is the same class as the
+/// missing-publish-client refusal below.
 pub type FreeExecutor = Arc<
     dyn Fn(u64, Vec<u64>) -> Pin<Box<dyn Future<Output = Result<Vec<FreeVerdict>>> + Send>>
         + Send
@@ -3880,178 +3281,6 @@ pub fn uninstall_free_executor() {
 
 fn free_executor() -> Option<FreeExecutor> {
     FREE_EXECUTOR.load_full().map(|e| (*e).clone())
-}
-
-// ---------------------------------------------------------------------------
-// The authority's per-client lane-free notice ledger (schema 16)
-// ---------------------------------------------------------------------------
-
-/// One client's ledger: the grants served to it (the ordering witness) and
-/// the notices queued for it since its last reply frame, deduped on the
-/// block (a later release of a re-minted lifetime supersedes an earlier,
-/// undrained one — safe because the grant that re-minted it was a reply
-/// build, which drained the earlier notice first), so the backlog is
-/// bounded by the client's lane blocks, never by time.
-#[derive(Default)]
-struct ClientLaneLedger {
-    grants: AtomicU64,
-    notices: std::sync::Mutex<std::collections::HashMap<(u64, u64), u64>>,
-}
-
-static LANE_LEDGERS: Lazy<scc::HashMap<String, Arc<ClientLaneLedger>>> =
-    Lazy::new(scc::HashMap::new);
-static LANE_FREE_NOTICES_QUEUED: AtomicU64 = AtomicU64::new(0);
-static LANE_FREE_NOTICES_SHIPPED: AtomicU64 = AtomicU64::new(0);
-
-fn client_lane_ledger(client: &str) -> Arc<ClientLaneLedger> {
-    if let Some(l) = LANE_LEDGERS.read_sync(client, |_, l| Arc::clone(l)) {
-        return l;
-    }
-    match LANE_LEDGERS.entry_sync(client.to_string()) {
-        scc::hash_map::Entry::Occupied(occ) => Arc::clone(occ.get()),
-        scc::hash_map::Entry::Vacant(vac) => {
-            let l = Arc::new(ClientLaneLedger::default());
-            let _ = vac.insert_entry(Arc::clone(&l));
-            l
-        }
-    }
-}
-
-/// The enrolled owner of the lane `block_idx` sits in — `None` for the
-/// authority's own lane, an unassigned lane, or an unpartitioned era.
-fn lane_owner_of(block_idx: u64) -> Option<String> {
-    let assignment = crate::data_grant::custody_owner()?.lane_assignment()?;
-    let lane = crate::data_alloc_lane::block_lane_of(block_idx, assignment.writers());
-    if lane == 0 {
-        return None;
-    }
-    assignment
-        .co_writers()
-        .get(usize::try_from(lane - 1).ok()?)
-        .cloned()
-}
-
-/// **Queue lane-free notices** for the owners of the lanes `blocks` sit in
-/// — BEFORE the ladder that frees them runs (the ordering the harvest's
-/// carriage guarantee rests on: a reply built after this point carries
-/// the notice, and no reply built before it can hand the block back). The
-/// requester of a served publish is skipped: its own blocks travel on the
-/// per-call `freed` set, so a notice would be a second delivery. `None`
-/// requester = the authority's own publish (every block is someone
-/// else's).
-pub(crate) fn note_lane_frees(requester: Option<&str>, vol_tag: u64, blocks: &[u64]) {
-    for &block_idx in blocks {
-        let Some(owner) = lane_owner_of(block_idx) else {
-            continue;
-        };
-        if requester == Some(owner.as_str()) {
-            continue;
-        }
-        let ledger = client_lane_ledger(&owner);
-        let after_grants = ledger.grants.load(Ordering::Acquire);
-        let mut notices = ledger.notices.lock().unwrap_or_else(|p| p.into_inner());
-        notices.insert((vol_tag, block_idx), after_grants);
-        LANE_FREE_NOTICES_QUEUED.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// Drain the notices queued for `client` into its reply frame.
-fn take_lane_frees(client: &str) -> Vec<WireLaneFree> {
-    let Some(ledger) = LANE_LEDGERS.read_sync(client, |_, l| Arc::clone(l)) else {
-        return Vec::new();
-    };
-    let drained: Vec<WireLaneFree> = {
-        let mut notices = ledger.notices.lock().unwrap_or_else(|p| p.into_inner());
-        notices
-            .drain()
-            .map(|((vol_tag, block_idx), after_grants)| WireLaneFree {
-                vol_tag,
-                block_idx,
-                after_grants,
-            })
-            .collect()
-    };
-    LANE_FREE_NOTICES_SHIPPED.fetch_add(drained.len() as u64, Ordering::Relaxed);
-    drained
-}
-
-/// The next grant sequence for `client` — bumped once per served harvest,
-/// strictly after its executor handed the blocks out.
-fn next_grant_seq(client: &str) -> u64 {
-    client_lane_ledger(client)
-        .grants
-        .fetch_add(1, Ordering::AcqRel)
-        + 1
-}
-
-/// The owner-side lane-free HARVEST executor (rung 10, residual 2):
-/// `(vol_tag, lane, writers, max, lease_epoch)` → the handed-out block
-/// indices, each with its release age (ms on the authority's list since
-/// its grace release — the lane-visible ledger's `released_served` stage,
-/// finding 15 term 2; [`crate::free_grace::LANE_RELEASE_AGE_UNPLACED`] =
-/// no mark) — [`crate::cowriter::execute_lane_harvest_aged`] over the
-/// authority's data-plane router.
-///
-/// Installed by the multi-writer AUTHORITY arm beside the free executor —
-/// the two are halves of one rewrite economy: the free RETURNS a co-writer's
-/// displaced offset to the lane's supply, the harvest is what makes that
-/// supply REACHABLE again.
-pub type HarvestExecutor = Arc<
-    dyn Fn(u64, u16, u16, u64, u64) -> Pin<Box<dyn Future<Output = Result<Vec<(u64, u64)>>> + Send>>
-        + Send
-        + Sync,
->;
-
-static HARVEST_EXECUTOR: Lazy<arc_swap::ArcSwapOption<HarvestExecutor>> =
-    Lazy::new(arc_swap::ArcSwapOption::empty);
-
-/// Install the process's lane-harvest executor (the authority arm's act).
-pub fn install_harvest_executor(exec: HarvestExecutor) {
-    HARVEST_EXECUTOR.store(Some(Arc::new(exec)));
-}
-
-/// Uninstall it (disarm / unmount / test teardown).
-pub fn uninstall_harvest_executor() {
-    HARVEST_EXECUTOR.store(None);
-}
-
-fn harvest_executor() -> Option<HarvestExecutor> {
-    HARVEST_EXECUTOR.load_full().map(|e| (*e).clone())
-}
-
-/// The owner-side BINDING WITNESS (finding 51,
-/// `.benchmarks/2026-09-07-read-settle-lost-serialized-authority.md`): the
-/// data-plane reaction to a SERVED layout commit — called with the DATA
-/// references the commit TOOK, after the commit landed. The authority's
-/// router publishes its incarnation word for every foreign-lane block
-/// among them ([`crate::routing::BackendRouter::witness_served_bindings`]):
-/// a co-writer publishes strictly after its DMA, so the serve is the one
-/// event on the authority that witnesses the peer's device write behind a
-/// key the authority can never mint — and without it the authority's word
-/// for a RECYCLED co-writer block (retired by its own `begin_free` of the
-/// previous lifetime) stayed unstable for ever, failing every later fill
-/// of the key (the s11-mpiio row's `read_settle_lost_serialized` storm and
-/// fsync EIOs).
-///
-/// Installed by the multi-writer AUTHORITY arm beside the free executor —
-/// the free RETIRES a displaced offset's word, the witness RE-PUBLISHES it
-/// when a peer's publish adopts the offset again: the two halves of one
-/// lifetime, both on the authority's own data plane. Absent = no data
-/// plane wired (solo mounts serve no publishes; a test rig without one
-/// keeps the pre-f51 words).
-pub type BindingWitness = Arc<dyn Fn(&[BlockRef]) + Send + Sync>;
-
-static BINDING_WITNESS: Lazy<arc_swap::ArcSwapOption<BindingWitness>> =
-    Lazy::new(arc_swap::ArcSwapOption::empty);
-
-/// Install the process's served-binding witness (the authority arm's act).
-pub fn install_binding_witness(witness: BindingWitness) {
-    BINDING_WITNESS.store(Some(Arc::new(witness)));
-}
-
-/// Uninstall it (disarm / unmount / test teardown).
-pub fn uninstall_binding_witness() {
-    BINDING_WITNESS.store(None);
 }
 
 /// **The served-publish SCREEN's probe** (design-small-file-packing §5.6
@@ -4090,27 +3319,6 @@ fn released_block_taken(refs: &[WireBlockRefOp]) -> Option<u64> {
         })
         .find(|r| (*probe)(r.vol_tag, r.block_idx))
         .map(|r| r.block_idx)
-}
-
-/// The DATA references a refs frame TAKES (map-blob custody excluded — a
-/// blob is this authority's own lifecycle, never a peer's DMA).
-fn taken_data_refs(refs: &[BlockRefOp]) -> Vec<BlockRef> {
-    refs.iter()
-        .filter(|o| o.take && !o.reference.is_map_blob())
-        .map(|o| o.reference)
-        .collect()
-}
-
-/// Hand a committed serve's taken data references to the installed
-/// witness. Called strictly AFTER the commit landed: a refused or failed
-/// serve adopted nothing, so it witnesses nothing.
-fn witness_taken(taken: &[BlockRef]) {
-    if taken.is_empty() {
-        return;
-    }
-    if let Some(w) = BINDING_WITNESS.load_full() {
-        (*w)(taken);
-    }
 }
 
 /// One shipped extent as the owner-side assembler executor receives it
@@ -4279,88 +3487,9 @@ fn extent_flush_executor() -> Option<ExtentFlushExec> {
     EXTENT_FLUSH_EXEC.load_full().map(|e| (*e).clone())
 }
 
-/// **Ship one lane-free harvest** to the authority at `endpoint` and return
-/// the granted block indices.
-///
-/// The idempotence witness travels verbatim, exactly as
-/// [`ship_free_blocks`]'s does: `(lease_epoch, request_id)` is the owner's
-/// dedup key — a resend after a lost reply answers the winner's own grant,
-/// and a retry never re-keys across a re-join.
-/// Returns the grant: the handed-out block indices, the authority's
-/// bound-age hint in ms (schema 8's OQ 2 field — 0 = the authority's ring
-/// holds nothing; the caller falls back to its derivation) and, since
-/// schema 14, each block's release age on the authority's list.
-pub async fn ship_harvest_lane_free(
-    endpoint: &str,
-    vol_tag: u64,
-    lane: u16,
-    writers: u16,
-    max: u64,
-    lease_epoch: u64,
-    request_id: u64,
-) -> Result<LaneFreeGrant> {
-    let Some(client) = CLIENT.load_full() else {
-        REFUSALS.fetch_add(1, Ordering::Relaxed);
-        let msg = format!(
-            "S9: a lane free harvest for vol_tag {vol_tag:#016x} cannot be published — no \
-             publish client is installed (arm the co-writer mount, which installs both halves)"
-        );
-        log::error!("{msg}");
-        return Err(SqueezefsError::InvalidOperation(msg));
-    };
-    let call = PublishCall::HarvestLaneFree {
-        vol_tag,
-        lane,
-        writers,
-        max,
-        lease_epoch,
-        request_id,
-    };
-    match client.ship(endpoint, call).await? {
-        PublishReply::LaneFreeGrant {
-            blocks,
-            bound_age_ms,
-            release_ages_ms,
-            grant_seq,
-        } => {
-            HARVEST_SHIPPED_BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
-            Ok(LaneFreeGrant {
-                blocks,
-                bound_age_ms,
-                release_ages_ms,
-                grant_seq,
-            })
-        }
-        other => Err(protocol_error(
-            "harvest_lane_free",
-            &format!("{other:?}"),
-            "a lane free grant",
-        )),
-    }
-}
-
-/// A shipped lane-free harvest's answer ([`ship_harvest_lane_free`]): the
-/// [`PublishReply::LaneFreeGrant`] fields, owned.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LaneFreeGrant {
-    /// The handed-out block indices of the caller's lane.
-    pub blocks: Vec<u64>,
-    /// The authority's live `free_grace_bound_age_ms` (0 = nothing held).
-    pub bound_age_ms: u64,
-    /// Per block in `blocks` order: ms on the authority's free list since
-    /// its grace release ([`crate::free_grace::LANE_RELEASE_AGE_UNPLACED`]
-    /// = no mark).
-    pub release_ages_ms: Vec<u64>,
-    /// The authority's per-client grant sequence this grant was served
-    /// under (schema 16) — the tag every adopted block carries so a later
-    /// lane-free notice with a lower `after_grants` is recognised as naming
-    /// the offset's PREVIOUS lifetime.
-    pub grant_seq: u64,
-}
-
 /// Count `blocks` abandoned shipped frees (`free_ship_failures` — the
 /// leak-safe direction, loud). The one caller is
-/// [`crate::cowriter::ship_displaced_frees`]'s abandon arm.
+/// [`crate::shipped_free::ship_displaced_frees`]'s abandon arm.
 pub(crate) fn note_free_ship_failure(blocks: u64) {
     FREE_SHIP_FAILURES.fetch_add(blocks, Ordering::Relaxed);
 }
@@ -4382,20 +3511,9 @@ pub(crate) fn note_free_ship_failure(blocks: u64) {
 /// are durably unreferenced (the commit already released them), nothing
 /// travels (nothing was free-listed), and the authority's next derivation
 /// returns them.
-///
-/// `requester` is the served publish's client (`None` = the authority's
-/// own publish — the assembler's fold, the episode compose). Every released
-/// block in ANOTHER co-writer's lane is queued as a lane-free notice for
-/// that lane's owner BEFORE the ladder runs ([`note_lane_frees`], schema
-/// 16): the requester learns its own blocks from the returned `freed` set;
-/// the lane owner of a block the requester's (or the authority's) publish
-/// displaced has no reply to read it from, and its local tracking would
-/// otherwise linger until the lane harvest handed the offset back — the
-/// fleet's `block_claim_anomalies` population.
 pub(crate) async fn free_recomputed_releases(
     ino: u64,
     released: Vec<BlockRef>,
-    requester: Option<&str>,
 ) -> Vec<WireFreedBlock> {
     // Dedup on the durable identity: one transition can release the same
     // device block at two map indexes — its free runs once.
@@ -4409,9 +3527,6 @@ pub(crate) async fn free_recomputed_releases(
     let mut freed_blocks: Vec<WireFreedBlock> = Vec::new();
     if by_vol.is_empty() {
         return freed_blocks;
-    }
-    for (vol_tag, blocks) in &by_vol {
-        note_lane_frees(requester, *vol_tag, blocks);
     }
     let Some(exec) = free_executor() else {
         log::error!(
@@ -4459,7 +3574,7 @@ pub(crate) async fn free_recomputed_releases(
 /// the owner's dedup key, so a caller MAY resend this exact call after a
 /// lost reply — and MUST NOT re-key it (a fresh id, or the same id under a
 /// fresh epoch, is a new act; the retry ladder in
-/// [`crate::cowriter::ship_displaced_frees`] is the one sanctioned caller).
+/// [`crate::shipped_free::ship_displaced_frees`] is the one sanctioned caller).
 pub async fn ship_free_blocks(
     endpoint: &str,
     vol_tag: u64,
@@ -4624,10 +3739,6 @@ struct LayoutPostCommit {
     /// Finding 36b: the scoped compose's released DATA blocks — freed
     /// through this authority's own ladder strictly after commit Ok.
     released_data: Vec<BlockRef>,
-    /// Finding 51: the DATA blocks the commit TAKES — handed to the binding
-    /// witness strictly after commit Ok (the peer's DMA behind each is
-    /// complete; the serve is the authority's witness of it).
-    taken_data: Vec<BlockRef>,
     /// Finding 51, phase B1: the map indices the commit DISPLACED —
     /// handed to the served-displacement screen strictly after commit Ok,
     /// before the recompute frees their old bindings.
@@ -4679,12 +3790,10 @@ impl Drop for WitnessLease {
 }
 
 /// What [`PublishService::run_layout_group`] answers: one outcome per
-/// member (input order), whether a group was committed, and — PK4 — whether
-/// a `single_volume` group was refused SPLIT (nothing applied).
+/// member (input order) and whether a group was committed.
 struct LayoutGroupRun {
     outcomes: Vec<std::result::Result<PublishReply, WireError>>,
     committed: bool,
-    split: bool,
 }
 
 /// One claimed member of a round's layout group: its frame slot, the
@@ -4738,12 +3847,6 @@ pub struct PublishService {
     /// instead of re-applying (the divergent-chain mint, closed). Its own
     /// window — outcomes are [`PublishReply`]s, not free verdicts.
     publish_dedup: DedupWindow<std::result::Result<PublishReply, WireError>>,
-    /// The HARVEST verb's exactly-once witness — the same pattern, its own
-    /// window (a grant and a verdict list are different outcomes; sharing
-    /// one window would make their id spaces collide). The cached outcome
-    /// is the aged block list plus the grant sequence it was served under
-    /// (schema 16), so a replay re-answers the same sequence.
-    harvest_dedup: DedupWindow<std::result::Result<(Vec<(u64, u64)>, u64), WireError>>,
     /// PR 13b: the S9 custody authority the era gate and the custody-
     /// scoped compose judge a served publish by — this service's own when
     /// set, else the process-installed owner (`data_grant::custody_owner`).
@@ -4804,7 +3907,6 @@ impl PublishService {
             inner,
             authority,
             free_dedup: DedupWindow::new(crate::meta_ship::service::dedup_cap()),
-            harvest_dedup: DedupWindow::new(crate::meta_ship::service::dedup_cap()),
             publish_dedup: DedupWindow::new(crate::meta_ship::service::dedup_cap()),
             custody_owner,
             self_ref: std::sync::OnceLock::new(),
@@ -4914,11 +4016,6 @@ impl PublishService {
         SERVED_FRAMES.fetch_add(1, Ordering::Relaxed);
         SERVED_FRAME_CALLS.fetch_add(n as u64, Ordering::Relaxed);
         let client: Arc<str> = Arc::from(frame.client.as_str());
-        if frame.pack_group {
-            return self
-                .serve_pack_group_frame(req.id, &client, frame.calls)
-                .await;
-        }
         let named: Vec<Vec<u64>> = frame.calls.iter().map(PublishCall::named_inos).collect();
         let chains = super::service::chains_by_named_inos(&named);
         let chain_count = chains.iter().copied().max().map_or(0, |m| m + 1);
@@ -5009,7 +4106,6 @@ impl PublishService {
         let reply = PublishReplyFrame {
             schema: PUBLISH_SCHEMA,
             outcomes,
-            lane_frees: take_lane_frees(&client),
         };
         match encode_reply_frame(&reply) {
             Ok(body) => RpcResponse {
@@ -5018,127 +4114,6 @@ impl PublishService {
                 body,
             },
             Err(e) => Self::refuse_frame(req.id, PUBLISH_MALFORMED, format!("reply encode: {e}")),
-        }
-    }
-
-    /// Serve a `pack_group` frame (design-small-file-packing §5.6, PK4): a
-    /// co-writer pack's tenant publishes, to be served as ONE conveyor
-    /// group on ONE home meta volume — or refused WHOLE, nothing applied:
-    ///
-    /// * [`PUBLISH_PACK_GROUP_UNAVAILABLE`] — this owner's D-1c lever is
-    ///   `0`: serving per chain would silently reopen the window the flag
-    ///   exists to close, and overriding the lever for flagged frames would
-    ///   perturb the owner's A/B row;
-    /// * [`PUBLISH_MALFORMED`] — a call that is not a witnessed
-    ///   `SetLayoutAndSize`, or two calls naming one ino;
-    /// * [`PUBLISH_PACK_GROUP_SPLIT`] — the post-slot-gate route
-    ///   re-derivation ([`RoutedMetaBackend::set_layout_and_size_pack_group`])
-    ///   found the tenants on more than one home volume (an online
-    ///   `migrate-meta-slot` cutover between partition and serve).
-    ///
-    /// Otherwise the calls run the D-1c group path exactly as a round's
-    /// layout calls do (screen, witness claim, one dispatch, one
-    /// `lock_many`, one `commit_tx_group`), with the single-volume
-    /// precondition enforced INSIDE the gate.
-    async fn serve_pack_group_frame(
-        &self,
-        id: u64,
-        client: &Arc<str>,
-        calls: Vec<PublishCall>,
-    ) -> RpcResponse {
-        crate::fuse_client::METRICS
-            .served_pack_group_frames
-            .fetch_add(1, Ordering::Relaxed);
-        if !conveyor_group_enabled() {
-            crate::fuse_client::METRICS
-                .served_pack_group_unavailable
-                .fetch_add(1, Ordering::Relaxed);
-            return Self::refuse_frame(
-                id,
-                PUBLISH_PACK_GROUP_UNAVAILABLE,
-                format!(
-                    "a {}-call pack_group frame from {client} reached an owner whose \
-                     {CONVEYOR_GROUP_ENV} lever is 0 — a pack group is served as ONE conveyor \
-                     group or not at all (design-small-file-packing §5.6); the co-writer \
-                     promotes those tenants one-block-per-file",
-                    calls.len()
-                ),
-            );
-        }
-        let mut seen = std::collections::HashSet::with_capacity(calls.len());
-        for call in &calls {
-            let ok = matches!(call, PublishCall::SetLayoutAndSize { .. })
-                && call.witness().is_some()
-                && call
-                    .named_inos()
-                    .first()
-                    .is_some_and(|ino| seen.insert(*ino));
-            if !ok {
-                return Self::refuse_frame(
-                    id,
-                    PUBLISH_MALFORMED,
-                    format!(
-                        "a pack_group frame carries witnessed SetLayoutAndSize calls on distinct \
-                         inos only; got {}",
-                        call.name()
-                    ),
-                );
-            }
-        }
-        // The cutover-injection seam (contract 8): a hook may flip this
-        // owner's slot map now — between the co-writer's partition and the
-        // route re-derivation below — and undo it once the frame is judged.
-        let undo = TEST_PACK_GROUP_SERVE_HOOK.load_full().and_then(|h| (*h)());
-        let inline = super::inline_serve_enabled();
-        let indexed: Vec<(usize, PublishCall)> = calls.into_iter().enumerate().collect();
-        let n = indexed.len();
-        let (mut out, committed, split) = self
-            .serve_layout_group_with(client, indexed, inline, true)
-            .await;
-        if let Some(undo) = undo {
-            undo();
-        }
-        if split {
-            crate::fuse_client::METRICS
-                .served_pack_group_splits
-                .fetch_add(1, Ordering::Relaxed);
-            return Self::refuse_frame(
-                id,
-                PUBLISH_PACK_GROUP_SPLIT,
-                format!(
-                    "a {n}-call pack_group frame from {client} names tenants on more than one \
-                     home meta volume after this owner's route re-derivation (an online \
-                     migrate-meta-slot cutover landed between the co-writer's partition and \
-                     this serve) — refused whole, nothing applied; the co-writer abandons the \
-                     pack and re-prepares every tenant"
-                ),
-            );
-        }
-        if committed {
-            FRAME_GROUPS.fetch_add(1, Ordering::Relaxed);
-        }
-        out.sort_unstable_by_key(|(idx, _)| *idx);
-        let outcomes: Vec<PublishCallOutcome> = out.into_iter().map(|(_, o)| o).collect();
-        if outcomes.len() != n {
-            return Self::refuse_frame(
-                id,
-                PUBLISH_MALFORMED,
-                "S9 publish owner: a pack group's outcomes do not cover its calls (unreachable)"
-                    .into(),
-            );
-        }
-        let reply = PublishReplyFrame {
-            schema: PUBLISH_SCHEMA,
-            outcomes,
-            lane_frees: take_lane_frees(client),
-        };
-        match encode_reply_frame(&reply) {
-            Ok(body) => RpcResponse {
-                id,
-                status: PUBLISH_OK,
-                body,
-            },
-            Err(e) => Self::refuse_frame(id, PUBLISH_MALFORMED, format!("reply encode: {e}")),
         }
     }
 
@@ -5235,53 +4210,9 @@ impl PublishService {
                 .serve_layout_publish(epoch, request_id, client.to_string(), call, inline)
                 .await;
         }
-        // DLM S9's allocation-lane seam: the ONE verb whose argument reaches a
-        // durable record from a REMOTE caller, so it is validated here —
-        // against the assignment this authority itself made — before anything
-        // is dispatched. The client names a lane; only the authority decides
-        // whose lane it is.
-        if let PublishCall::RaiseAllocLane {
-            lane,
-            writers,
-            lease_epoch,
-            ..
-        } = &call
-        {
-            if let Err(reason) =
-                crate::data_grant::validate_lane_raise(client, *lease_epoch, *lane, *writers)
-            {
-                crate::fuse_client::METRICS
-                    .alloc_lane_raise_refusals
-                    .fetch_add(1, Ordering::Relaxed);
-                return Self::refuse(PUBLISH_LANE_REFUSED, reason);
-            }
-        }
-        // The lane free HARVEST (rung 10, residual 2): validated exactly as
-        // the raise is — the lane against the assignment THIS authority
-        // made, under the lease epoch it minted — then served through its
-        // own dedup window (it is retried, like the free and only like it).
-        if let PublishCall::HarvestLaneFree {
-            lane,
-            writers,
-            lease_epoch,
-            request_id,
-            ..
-        } = &call
-        {
-            if let Err(reason) =
-                crate::data_grant::validate_lane_raise(client, *lease_epoch, *lane, *writers)
-            {
-                HARVEST_REFUSALS.fetch_add(1, Ordering::Relaxed);
-                return Self::refuse(PUBLISH_LANE_REFUSED, reason);
-            }
-            return self
-                .serve_harvest(client, *lease_epoch, *request_id, call, inline)
-                .await;
-        }
-        // The co-writer FREE path: retried (like the harvest above and only
-        // it), served through the era gate and then the dedup window —
-        // never through the generic dispatch below, whose no-retry law it
-        // would otherwise weaken.
+        // The shipped FREE path: retried, served through the era gate and
+        // then the dedup window — never through the generic dispatch below,
+        // whose no-retry law it would otherwise weaken.
         if let PublishCall::FreeBlocks {
             lease_epoch,
             request_id,
@@ -5297,7 +4228,7 @@ impl PublishService {
                 return Self::refuse(PUBLISH_STALE_LEASE, reason);
             }
             return self
-                .serve_free(client, *lease_epoch, *request_id, call, inline)
+                .serve_free(*lease_epoch, *request_id, call, inline)
                 .await;
         }
         let Some(me) = self.owned() else {
@@ -5492,27 +4423,9 @@ impl PublishService {
         calls: Vec<(usize, PublishCall)>,
         inline: bool,
     ) -> (Vec<(usize, PublishCallOutcome)>, bool) {
-        let (out, committed, _split) = self
-            .serve_layout_group_with(client, calls, inline, false)
-            .await;
-        (out, committed)
-    }
-
-    /// [`Self::serve_layout_group`] with the PACK-GROUP law (PK4):
-    /// `single_volume` makes the group commit refuse — nothing applied —
-    /// when the members' post-gate routes span more than one home meta
-    /// volume; the third element reports that verdict (`false` on the
-    /// round path, where a frame legitimately spans volumes).
-    async fn serve_layout_group_with(
-        &self,
-        client: &Arc<str>,
-        calls: Vec<(usize, PublishCall)>,
-        inline: bool,
-        single_volume: bool,
-    ) -> (Vec<(usize, PublishCallOutcome)>, bool, bool) {
         let mut out = Vec::with_capacity(calls.len());
         if calls.is_empty() {
-            return (out, false, false);
+            return (out, false);
         }
         let mut members: Vec<GroupMember> = Vec::with_capacity(calls.len());
         let mut serial: Vec<(usize, PublishCall)> = Vec::new();
@@ -5543,13 +4456,13 @@ impl PublishService {
             let client = Arc::clone(client);
             async move { (idx, self.serve_call(&client, call, inline).await) }
         }));
-        let (serial_out, (group_out, committed, split)) = futures::join!(
+        let (serial_out, (group_out, committed)) = futures::join!(
             serial_fut,
-            self.execute_layout_group(client, members, inline, single_volume)
+            self.execute_layout_group(client, members, inline)
         );
         out.extend(serial_out);
         out.extend(group_out);
-        (out, committed, split)
+        (out, committed)
     }
 
     /// Execute the claimed members of a round as one group: ONE dispatch
@@ -5565,10 +4478,9 @@ impl PublishService {
         client: &Arc<str>,
         members: Vec<GroupMember>,
         inline: bool,
-        single_volume: bool,
-    ) -> (Vec<(usize, PublishCallOutcome)>, bool, bool) {
+    ) -> (Vec<(usize, PublishCallOutcome)>, bool) {
         if members.is_empty() {
-            return (Vec::new(), false, false);
+            return (Vec::new(), false);
         }
         let mut out = Vec::with_capacity(members.len());
         let Some(me) = self.owned() else {
@@ -5583,7 +4495,7 @@ impl PublishService {
                     ),
                 ));
             }
-            return (out, false, false);
+            return (out, false);
         };
         let mut idxs = Vec::with_capacity(members.len());
         let mut leases = Vec::with_capacity(members.len());
@@ -5599,14 +4511,13 @@ impl PublishService {
         let requester = client.to_string();
         let client = client.to_string();
         let (joined, _) = super::owner_dispatch("meta_ship_publish_group", inline, async move {
-            me.run_layout_group(&client, work, single_volume).await
+            me.run_layout_group(&client, work).await
         })
         .await;
         match joined {
             Ok(LayoutGroupRun {
                 outcomes,
                 committed,
-                split,
             }) => {
                 for (((idx, lease), outcome), ino) in
                     idxs.into_iter().zip(leases).zip(outcomes).zip(group_inos)
@@ -5617,7 +4528,7 @@ impl PublishService {
                         .await;
                     out.push((idx, PublishCallOutcome::Done(outcome)));
                 }
-                (out, committed, split)
+                (out, committed)
             }
             Err(e) => {
                 // RES-7/RES-8: the unwind is recorded — and CACHED per
@@ -5633,7 +4544,7 @@ impl PublishService {
                     SERVED.fetch_add(1, Ordering::Relaxed);
                     out.push((idx, PublishCallOutcome::Done(failure.clone())));
                 }
-                (out, false, false)
+                (out, false)
             }
         }
     }
@@ -5655,46 +4566,12 @@ impl PublishService {
     /// Returns one outcome per member (input order) and whether a group
     /// was committed.
     ///
-    /// **PK4 — `single_volume`** (a `pack_group` frame): the members must
-    /// share ONE home meta volume. A cheap pre-check before the prepare
-    /// half spares the work in the common split case; the AUTHORITATIVE
-    /// check runs inside the commit, after the §5.5.2a slot gate
-    /// ([`RoutedMetaBackend::set_layout_and_size_pack_group`] — a park can
-    /// span a flip, so routes taken before the gate are re-derived). A
-    /// split commits NOTHING: every member's outcome is the refusal, the
-    /// prepared posts drop (a fresh blob's guard drops armed and frees it),
-    /// and `split` reports the frame-level verdict.
-    async fn run_layout_group(
-        &self,
-        client: &str,
-        work: Vec<PublishCall>,
-        single_volume: bool,
-    ) -> LayoutGroupRun {
+    async fn run_layout_group(&self, client: &str, work: Vec<PublishCall>) -> LayoutGroupRun {
         let n = work.len();
         let inos: Vec<u64> = work
             .iter()
             .map(|c| c.named_inos().first().copied().unwrap_or(0))
             .collect();
-        let split_run = |why: &str| {
-            let e = WireError::from_error(&SqueezefsError::PublishFailure {
-                class: PublishFailureClass::FrameRefused(PUBLISH_PACK_GROUP_SPLIT),
-                msg: why.to_string(),
-            });
-            LayoutGroupRun {
-                outcomes: (0..n).map(|_| Err(e.clone())).collect(),
-                committed: false,
-                split: true,
-            }
-        };
-        if single_volume {
-            let homes: std::collections::BTreeSet<usize> =
-                inos.iter().map(|&i| self.inner.route_ino(i).0).collect();
-            if homes.len() > 1 {
-                return split_run(
-                    "pack group tenants route to more than one home meta volume (pre-gate)",
-                );
-            }
-        }
         // (stripe, ino): dedup by stripe keeps the FIRST member as the
         // stripe's census identity — an in-group collision is one acquire,
         // never a self-collision.
@@ -5745,22 +4622,9 @@ impl PublishService {
         }
         let committed = !items.is_empty();
         if committed {
-            let results = if single_volume {
-                match self.inner.set_layout_and_size_pack_group(items).await {
-                    crate::meta_backend::LayoutGroupCommit::Committed(results) => results,
-                    crate::meta_backend::LayoutGroupCommit::Split { volumes } => {
-                        drop(stripe_guards);
-                        return split_run(&format!(
-                            "pack group tenants route to {volumes} home meta volumes after the \
-                             slot gate"
-                        ));
-                    }
-                }
-            } else {
-                self.inner.set_layout_and_size_group(items).await
-            };
+            let results = self.inner.set_layout_and_size_group(items).await;
             for ((i, post), committed) in item_slots.into_iter().zip(posts).zip(results) {
-                let out = Self::finish_layout_publish(client, inos[i], committed, post).await;
+                let out = Self::finish_layout_publish(inos[i], committed, post).await;
                 if out.is_ok() {
                     invalidate.push(inos[i]);
                 }
@@ -5787,11 +4651,7 @@ impl PublishService {
                 })
             })
             .collect();
-        LayoutGroupRun {
-            outcomes,
-            committed,
-            split: false,
-        }
+        LayoutGroupRun { outcomes, committed }
     }
 
     /// Serve one [`PublishCall::FreeBlocks`] through the dedup window: the
@@ -5802,7 +4662,6 @@ impl PublishService {
     /// ran in [`Self::serve_call`].
     async fn serve_free(
         &self,
-        client: &str,
         lease_epoch: u64,
         request_id: u64,
         call: PublishCall,
@@ -5830,13 +4689,6 @@ impl PublishService {
         let (slot, owns) = self.free_dedup.slot((lease_epoch, request_id));
         if !owns {
             FREE_REPLAYS.fetch_add(1, Ordering::Relaxed);
-        }
-        if owns {
-            // Schema 16: a block in ANOTHER co-writer's lane (a predecessor
-            // that peer minted, which this shipper's rewrite displaced) is
-            // noticed to its lane owner before the ladder frees it — the
-            // shipper retires its own view on the verdicts it gets back.
-            note_lane_frees(Some(client), vol_tag, &blocks);
         }
         let outcome = slot
             .get_or_init(|| async move {
@@ -5881,102 +4733,6 @@ impl PublishService {
             .clone();
         SERVED.fetch_add(1, Ordering::Relaxed);
         PublishCallOutcome::Done(outcome.map(PublishReply::FreeVerdicts))
-    }
-
-    /// Serve one [`PublishCall::HarvestLaneFree`] through its dedup window
-    /// — the [`Self::serve_free`] pattern verbatim: the winner of
-    /// `(lease_epoch, request_id)` executes on the sqz-meta pool under the
-    /// installed [`HarvestExecutor`]; every duplicate awaits the winner's
-    /// own grant and is counted (`harvest_replays`). The lane + era gate
-    /// already ran in [`Self::serve_call`].
-    async fn serve_harvest(
-        &self,
-        client: &str,
-        lease_epoch: u64,
-        request_id: u64,
-        call: PublishCall,
-        inline: bool,
-    ) -> PublishCallOutcome {
-        let PublishCall::HarvestLaneFree {
-            vol_tag,
-            lane,
-            writers,
-            max,
-            ..
-        } = call
-        else {
-            return Self::refuse(
-                PUBLISH_MALFORMED,
-                "serve_harvest dispatched a non-harvest call".into(),
-            );
-        };
-        let Some(exec) = harvest_executor() else {
-            return Self::refuse(
-                PUBLISH_MALFORMED,
-                "S9: a lane free harvest arrived but no harvest executor is installed — the \
-                 ownership plane is armed without its reuse half. Handing out offsets without \
-                 the allocator that owns the free list would mint two owners for one block; \
-                 arm the multi-writer authority (which installs the executor beside the free \
-                 executor)"
-                    .to_string(),
-            );
-        };
-        let (slot, owns) = self.harvest_dedup.slot((lease_epoch, request_id));
-        if !owns {
-            HARVEST_REPLAYS.fetch_add(1, Ordering::Relaxed);
-        }
-        let client_owned = client.to_string();
-        let outcome = slot
-            .get_or_init(|| async move {
-                // The dispatch door (D-5), as `serve_free`.
-                let (joined, _) = super::owner_dispatch(
-                    "shipped_lane_harvest",
-                    inline,
-                    exec(vol_tag, lane, writers, max, lease_epoch),
-                )
-                .await;
-                match joined {
-                    Ok(Ok(aged)) => {
-                        HARVEST_SERVED_BLOCKS.fetch_add(aged.len() as u64, Ordering::Relaxed);
-                        // Schema 16: the grant's sequence — bumped strictly
-                        // AFTER the executor handed the blocks out, so a
-                        // lane-free notice queued before any of them could
-                        // be free-listed reads a lower `after_grants`. Part
-                        // of the cached outcome: a replay answers the same
-                        // grant under the same sequence.
-                        let grant_seq = next_grant_seq(&client_owned);
-                        Ok((aged, grant_seq))
-                    }
-                    Ok(Err(e)) => Err(WireError::from_error(&e)),
-                    Err(e) => {
-                        // RES-7/RES-8: recorded — and CACHED, so a replay
-                        // answers the same loud failure instead of handing
-                        // out half a grant twice.
-                        PANICS.fetch_add(1, Ordering::Relaxed);
-                        log::error!("S9 publish owner-side harvest execution unwound: {e}");
-                        Err(WireError::from_error(&SqueezefsError::InvalidOperation(
-                            format!("S9 lane-harvest execution panicked: {e}"),
-                        )))
-                    }
-                }
-            })
-            .await
-            .clone();
-        SERVED.fetch_add(1, Ordering::Relaxed);
-        // OQ 2 (schema 8): the reply carries the authority's LIVE bound
-        // age — the loop latency in force — so the co-writer's refill
-        // horizon is a measurement (0 = nothing held, and the ship side
-        // then keeps its derivation). Schema 14: each block's release age
-        // beside it (the lane-visible ledger's authority-clock stage).
-        PublishCallOutcome::Done(outcome.map(|(aged, grant_seq)| {
-            let (blocks, release_ages_ms) = aged.into_iter().unzip();
-            PublishReply::LaneFreeGrant {
-                blocks,
-                bound_age_ms: crate::free_grace::bound_age_ms(),
-                release_ages_ms,
-                grant_seq,
-            }
-        }))
     }
 
     /// PR 5b items 3+4 — the custody verdict for a kvmap-headed serve's
@@ -6230,7 +4986,7 @@ impl PublishService {
                 if !o.released.is_empty() {
                     MAP_RECOMPUTED_RELEASES.fetch_add(released, Ordering::Relaxed);
                     note_served_displacements(ino, &displaced_indices_of(ino, &o.released));
-                    freed = free_recomputed_releases(ino, o.released, Some(client)).await;
+                    freed = free_recomputed_releases(ino, o.released).await;
                 }
                 Ok(Some(PublishReply::PutDone {
                     recomputed: o.recomputed,
@@ -6397,7 +5153,7 @@ impl PublishService {
                     if !o.released.is_empty() {
                         MAP_RECOMPUTED_RELEASES.fetch_add(released, Ordering::Relaxed);
                         note_served_displacements(ino, &displaced_indices_of(ino, &o.released));
-                        freed = free_recomputed_releases(ino, o.released, Some(client)).await;
+                        freed = free_recomputed_releases(ino, o.released).await;
                     }
                     Ok(PublishReply::MapMigrated {
                         records: o.records,
@@ -7011,10 +5767,9 @@ impl PublishService {
             .try_scoped_kvmap_put(client, ino, &layout, size, &refs)
             .await?
         {
-            // Finding 51: the train committed the caller's claimed takes
-            // and displaced its claimed releases.
+            // Finding 51 (phase B1): the train displaced the caller's
+            // claimed releases.
             note_served_displacements(ino, &displaced_indices(ino, &refs));
-            witness_taken(&taken_data_refs(&refs));
             return Ok(LayoutPrepare::Done(reply));
         }
         let ScopedLayout {
@@ -7067,11 +5822,9 @@ impl PublishService {
         // report-only fsck C8 residue (space-safe, data-safe) — f38's law
         // verbatim, moved to the node whose journal admits the commit.
         const SERVE_REF_TX_CHUNK: usize = 512;
-        // Finding 51: the whole frame's takes (chunked or not) are the
-        // commit's adopted data blocks — witnessed once the LAYOUT lands;
-        // its releases (the recompute's, or the caller's on a verbatim
-        // arm) are the indices the commit displaces — screened then too.
-        let taken_data = taken_data_refs(&refs);
+        // Finding 51 (phase B1): the frame's releases (the recompute's, or
+        // the caller's on a verbatim arm) are the indices the commit
+        // displaces — screened once the LAYOUT lands.
         let mut displaced = displaced_indices(ino, &refs);
         displaced.extend(displaced_indices_of(ino, &released_data));
         displaced.sort_unstable();
@@ -7091,7 +5844,6 @@ impl PublishService {
             post: LayoutPostCommit {
                 blob_custody,
                 released_data,
-                taken_data,
                 displaced,
                 was_recomputed,
             },
@@ -7107,10 +5859,9 @@ impl PublishService {
     /// compose's released data blocks run this authority's own free
     /// ladder strictly after commit Ok (finding 36b, half 1 — the reply's
     /// `recomputed` stands the caller's frame stream down), and the taken
-    /// data blocks reach the binding witness (finding 51) — the serve's
-    /// two data-plane reactions, retire and re-publish, both post-commit.
+    /// displaced indices reach the served-displacement screen (finding 51,
+    /// phase B1) post-commit.
     async fn finish_layout_publish(
-        client: &str,
         ino: u64,
         committed: Result<()>,
         post: LayoutPostCommit,
@@ -7118,7 +5869,6 @@ impl PublishService {
         let LayoutPostCommit {
             mut blob_custody,
             released_data,
-            taken_data,
             displaced,
             was_recomputed,
         } = post;
@@ -7127,7 +5877,6 @@ impl PublishService {
         // captured old binding this commit displaced is superseded
         // before that binding's offset can be freed and re-minted.
         note_served_displacements(ino, &displaced);
-        witness_taken(&taken_data);
         if let Some(g) = blob_custody.fresh.as_mut() {
             g.disarm();
         }
@@ -7141,7 +5890,7 @@ impl PublishService {
         let freed = if released_data.is_empty() {
             Vec::new()
         } else {
-            free_recomputed_releases(ino, released_data, Some(client)).await
+            free_recomputed_releases(ino, released_data).await
         };
         Ok(PublishReply::PutDone {
             recomputed: was_recomputed,
@@ -7167,7 +5916,7 @@ impl PublishService {
                         .inner
                         .set_layout_and_size(item.ino, &item.layout, item.size, &item.block_refs)
                         .await;
-                    Self::finish_layout_publish(client, ino, committed, post).await
+                    Self::finish_layout_publish(ino, committed, post).await
                 }
             },
             PublishCall::MergeLayoutAndSize {
@@ -7205,11 +5954,9 @@ impl PublishService {
                     full_layout
                 };
                 let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
-                // Finding 51: the caller's claimed takes are the blocks it
-                // DMA'd — witnessed once the chained merge commits; its
-                // claimed releases (plus the merge's own recompute below)
-                // are the displaced indices the screen sees.
-                let taken_data = taken_data_refs(&refs);
+                // Finding 51 (phase B1): the caller's claimed releases (plus
+                // the merge's own recompute below) are the displaced indices
+                // the screen sees.
                 let mut displaced = displaced_indices(ino, &refs);
                 // Rung 17 (KD-MW-8's composition law): a SHIPPED merge
                 // CHAINS ONTO THE DURABLE HEAD — the claim re-stamps
@@ -7236,7 +5983,6 @@ impl PublishService {
                     displaced.dedup();
                 }
                 note_served_displacements(ino, &displaced);
-                witness_taken(&taken_data);
                 // Finding 36 (half 1): the recompute-released DATA blocks
                 // run this authority's OWN free ladder strictly AFTER
                 // commit Ok (the displaced-blob post-commit pattern) —
@@ -7245,7 +5991,7 @@ impl PublishService {
                 // Err the `?` above already returned: nothing is freed.
                 let recomputed = released.is_some();
                 let freed = match released {
-                    Some(released) => free_recomputed_releases(ino, released, Some(client)).await,
+                    Some(released) => free_recomputed_releases(ino, released).await,
                     None => Vec::new(),
                 };
                 Ok(PublishReply::DeltaUsed {
@@ -7313,7 +6059,6 @@ impl PublishService {
                 let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
                 self.inner.commit_block_refs(ino, &refs).await?;
                 note_served_displacements(ino, &displaced_indices(ino, &refs));
-                witness_taken(&taken_data_refs(&refs));
                 Ok(PublishReply::Unit)
             }
             PublishCall::MigrateBlockMap {
@@ -7326,13 +6071,11 @@ impl PublishService {
                 ..
             } => {
                 let frame: Vec<BlockRefOp> = refs.iter().copied().map(BlockRefOp::from).collect();
-                let taken_data = taken_data_refs(&frame);
                 let displaced = displaced_indices(ino, &frame);
                 let reply = self
                     .serve_map_train(client, ino, layout, size, entries, refs, base_gen)
                     .await?;
                 note_served_displacements(ino, &displaced);
-                witness_taken(&taken_data);
                 Ok(reply)
             }
             PublishCall::ParkWriteTimes {
@@ -7409,59 +6152,12 @@ impl PublishService {
                         .collect(),
                 ))
             }
-            PublishCall::RaiseAllocLane {
-                vol_tag,
-                lane,
-                writers,
-                upto,
-                lease_epoch: _,
-            } => {
-                // The lane was validated in `serve`. The floor is the
-                // recovery rule's answer computed HERE, from state only a
-                // node with metadata authority (and a live cursor) has: the
-                // durable reference ledger's dense frontier, this mount's own
-                // cursor for that data volume, and every `alloc_lane:` record
-                // the volume carries. A peer that never walks the tree cannot
-                // compute it, which is why the OPEN exists.
-                let floor = crate::data_alloc_lane::lane_open_floor(
-                    &self.inner,
-                    vol_tag,
-                    lane,
-                    writers,
-                    crate::alloc_lane_grant::local_dense_frontier(vol_tag).unwrap_or(0),
-                )
-                .await?;
-                let frontier = crate::data_alloc_lane::commit_lane_raise(
-                    &self.inner,
-                    vol_tag,
-                    lane,
-                    writers,
-                    upto,
-                    floor,
-                )
-                .await?;
-                log::debug!(
-                    "S9: served an allocation-lane raise for lane {lane} of {writers} on \
-                     vol_tag {vol_tag:#016x} (asked {upto}, frontier now {frontier})"
-                );
-                Ok(PublishReply::LaneFrontier(frontier))
-            }
             PublishCall::FreeBlocks { .. } => {
-                // Unreachable by construction: `serve` routes every free
-                // through `serve_free`'s era gate + dedup window. Refusing
-                // (never executing) keeps that construction a fact rather
-                // than a convention.
+                // Served only through the dedup window (`serve_free`) —
+                // dispatching it here would bypass the exactly-once witness.
                 Err(SqueezefsError::InvalidOperation(
                     "S9: free_blocks is served only through the dedup window (serve_free) — \
                      dispatching it here would bypass the exactly-once witness"
-                        .to_string(),
-                ))
-            }
-            PublishCall::HarvestLaneFree { .. } => {
-                // Same construction as the free above: only serve_harvest.
-                Err(SqueezefsError::InvalidOperation(
-                    "S9: harvest_lane_free is served only through the dedup window \
-                     (serve_harvest) — dispatching it here would bypass the exactly-once witness"
                         .to_string(),
                 ))
             }

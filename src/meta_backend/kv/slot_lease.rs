@@ -876,7 +876,7 @@ pub fn unregister_carriage_plane(plane: &Arc<SlotLeasePlane>) {
 /// The installed source: the member id → `(node_token, mount_slot)`
 /// (`cowriter::parse_node_member_id`), merged over every armed plane.
 fn carriage_for_member(member_id: &str) -> crate::membership::SlotLeaseCarriage {
-    let Some((node_token, mount_slot)) = crate::cowriter::parse_node_member_id(member_id) else {
+    let Some((node_token, mount_slot)) = crate::member_id::parse_node_member_id(member_id) else {
         return Default::default();
     };
     let planes: Vec<Arc<SlotLeasePlane>> = CARRIAGE_PLANES

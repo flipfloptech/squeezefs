@@ -3294,7 +3294,7 @@ impl KvMetaBackend {
             )));
         }
         let member_id =
-            crate::cowriter::node_member_id_of(identity.node_token, identity.mount_slot);
+            crate::member_id::node_member_id_of(identity.node_token, identity.mount_slot);
         let already = crate::membership::ClaimSet::load(self)
             .await
             .and_then(|s| {
@@ -3327,7 +3327,7 @@ impl KvMetaBackend {
             plane.holders.set_endpoint(appender_id, endpoint);
             plane.holders.set_member_id(
                 appender_id,
-                &crate::cowriter::node_member_id_of(identity.node_token, identity.mount_slot),
+                &crate::member_id::node_member_id_of(identity.node_token, identity.mount_slot),
             );
         }
         if already {

@@ -1468,80 +1468,13 @@ enum VolumeActions {
         /// Target metadata volume index (canonical member order)
         target_volume: usize,
     },
-    // Anchors: design-per-volume-claim-admission §5.6/§6.1 (PR 7),
-    // KD-PV-15 (the subtree-root mint), rulings D19/D20. Offline
-    // D0-guarded coordinator, bracketed by the ownership-intent marker.
-    /// Assign per-volume metadata owners across a fleet
-    ///
-    /// Records which node appends to each metadata volume, so several
-    /// nodes can be metadata authorities for one volume set (one
-    /// appender per volume, a different node per volume). Each
-    /// assignment is <vol-id>=<member-id>[+<successor-id>...]
-    /// [:<subtree-root-path>]; the whole set must be named in one
-    /// invocation.
-    ///
-    /// The subtree root is what makes the recipe work: the verb creates
-    /// that directory with its inode on the volume being assigned, and
-    /// everything created under it inherits that owner. A volume
-    /// assigned without one owns no new work.
-    ///
-    /// Inside a subtree everything is ordinary POSIX. Across subtrees,
-    /// rename and link return EXDEV and the roots cannot be removed in
-    /// place; existing names that would span two owners are counted and
-    /// must be acknowledged with --accept-cross-owner-names.
-    ///
-    /// Offline verb: unmount every node first and pass the sqmeta://
-    /// URI. The coordinator takes the exclusive writer guard on every
-    /// volume, and a writable mount refuses while the assignment is
-    /// incomplete. Idempotent and crash-resumable: re-run with the same
-    /// arguments.
-    SetOwners {
-        /// sqmeta:// URI of the metadata volume set
-        target: String,
-        /// Per-volume assignments, one per volume of the set
-        ///
-        /// Each is <vol-id>=<member-id>, optionally +<successor-id> for
-        /// each declared adoption candidate and :<absolute-path> for the
-        /// owner's subtree root — for example
-        /// vol-0a1b2c3d4e5f6071=node_00000000deadbeef.m00000001:/projects/a
-        #[arg(value_name = "ASSIGNMENT")]
-        assignments: Vec<String>,
-        /// Unassign every volume, restoring the single-authority set
-        #[arg(long, conflicts_with = "assignments")]
-        clear: bool,
-        /// Print the plan and the cross-owner name census; write nothing
-        #[arg(long)]
-        dry_run: bool,
-        /// Acknowledge the counted cross-owner name population
-        ///
-        /// The number must match the count the verb reports. Those
-        /// names cannot be unlinked, renamed or relinked in place while
-        /// the assignment stands.
-        #[arg(long, value_name = "N")]
-        accept_cross_owner_names: Option<u64>,
-    },
-    /// Print each metadata volume's owner beside its live claim
-    ///
-    /// The drift instrument: an assigned volume nobody is claiming, or
-    /// one claimed by a node the record does not name, is reported in
-    /// words. Read-only; safe on a mounted set.
-    GetOwners {
-        /// sqmeta:// URI of the metadata volume set
-        target: String,
-        /// Also run the cross-owner name census (one pass over every
-        /// directory entry in the set)
-        #[arg(long)]
-        census: bool,
-        /// Emit machine-readable JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show which metadata volume hosts a path, and who owns it
+    /// Show where a path lives on the symmetric forest
     ///
     /// Answers where a directory or file's inode lives: its routing
-    /// slot, the hosting volume's durable id, and that volume's
-    /// assigned owner. Use it to confirm a subtree root landed where it
-    /// was meant to, and when cross-owner refusals appear.
+    /// slot, the hosting volume's durable id, tree 0's word on the slot
+    /// (the leasing appender and the lease generation `g`), and the
+    /// stripe count of a striped directory. Read-only; safe on a mounted
+    /// set (a live mountpoint answers with the CURRENT ino).
     Locate {
         /// Live mountpoint or sqmeta:// URI
         target: String,
@@ -2059,136 +1992,6 @@ fn meta_uri_of_live_mount(mountpoint: &str) -> Result<Vec<String>, String> {
         )
     })?;
     parse_block_uri(uri, "sqmeta://")
-}
-
-/// The M3 census, printed the way a refusal prints it: the number the
-/// operator acknowledges, where the names live, and a bounded sample.
-fn print_cross_owner_census(census: &squeezefs::config_ops::CrossOwnerCensus) {
-    println!(
-        "Cross-owner names: {} ({} already in the tree + {} subtree root(s) this run mints) \
-         over {} directory entries",
-        census.total, census.existing, census.roots, census.dentries_scanned
-    );
-    let by_volume: Vec<String> = census
-        .per_volume
-        .iter()
-        .filter(|(_, n)| *n > 0)
-        .map(|(v, n)| format!("{v}={n}"))
-        .collect();
-    if !by_volume.is_empty() {
-        println!("  by parent volume: {}", by_volume.join(" "));
-    }
-    for s in &census.sample {
-        println!("  {s}");
-    }
-    if census.total > 0 {
-        println!(
-            "  These names return EXDEV on unlink/rmdir/rename/link while the assignment \
-             stands (there is no copy+unlink fallback for unlink)."
-        );
-    }
-}
-
-/// What `volume set-owners` did (or, with --dry-run, would do).
-fn print_owner_assignment(report: &squeezefs::config_ops::SetOwnersReport) {
-    let verb = match (report.dry_run, report.cleared) {
-        (true, true) => "WOULD unassign",
-        (true, false) => "WOULD assign",
-        (false, true) => "Unassigned",
-        (false, false) => "Assigned",
-    };
-    for row in &report.volumes {
-        println!(
-            "{verb} {}{}{}{}{}",
-            row.volume_id,
-            match &row.owner {
-                Some(owner) => format!(" → {owner}"),
-                None => String::new(),
-            },
-            if row.successors.is_empty() {
-                String::new()
-            } else {
-                format!("  successors: {}", row.successors.join(","))
-            },
-            match &row.subtree_root {
-                Some(p) => format!("  subtree root: {p}"),
-                None => String::new(),
-            },
-            if row.hosts_slot_0 { "  [slot 0]" } else { "" }
-        );
-        if row.previous_owner.is_some() && row.previous_owner != row.owner {
-            println!(
-                "    was: {}",
-                row.previous_owner.as_deref().unwrap_or("(unassigned)")
-            );
-        }
-    }
-    for root in &report.roots {
-        match (root.minted_ino, root.existing_ino) {
-            (Some(ino), _) => println!(
-                "Minted subtree root {} (ino {ino}) on {} for {}",
-                root.path, root.volume_id, root.owner
-            ),
-            (None, Some(ino)) => println!(
-                "Subtree root {} (ino {ino}) already homes on {} — adopted",
-                root.path, root.volume_id
-            ),
-            (None, None) => println!(
-                "WOULD mint subtree root {} on {} for {}",
-                root.path, root.volume_id, root.owner
-            ),
-        }
-    }
-    if !report.cleared {
-        // A cleared set has one owner again, so the cross-owner
-        // population it would create is zero by construction — printing
-        // the census here would be noise, not information.
-        print_cross_owner_census(&report.census);
-    }
-    if let Some(owner) = &report.set_authority {
-        println!(
-            "{}",
-            squeezefs::config_ops::set_authority_announcement(&report.set_authority_volume, owner)
-        );
-    }
-    for w in &report.warnings {
-        println!("WARNING: {w}");
-    }
-    if report.dry_run {
-        if report.census.total > 0 {
-            println!(
-                "--dry-run: nothing was written. Re-run without it and with \
-                 --accept-cross-owner-names {} to apply.",
-                report.census.total
-            );
-        } else {
-            println!("--dry-run: nothing was written. Re-run without it to apply.");
-        }
-    } else if report.records_written == 0 {
-        println!(
-            "{}",
-            if report.cleared {
-                "Nothing to do: this set carries no ownership assignment."
-            } else {
-                "Nothing to do: this assignment is already in force."
-            }
-        );
-    } else if report.cleared {
-        println!(
-            "Unassigned {} volume(s). The set has ONE metadata authority again: mount it \
-             exactly as before, with no multi-writer role. Subtree roots the assignment \
-             minted are ordinary directories and were left in place.",
-            report.records_written
-        );
-    } else {
-        println!(
-            "Wrote {} volume ownership record(s), enrolled {} member(s) on every volume, \
-             minted {} subtree root(s). Mount each node with SQUEEZEFS_MULTI_WRITER=1 and \
-             SQUEEZEFS_MW_ROLE=set-authority (the slot-0 volume's owner) or \
-             partial-authority; verify placement with `squeezefs volume locate`.",
-            report.records_written, report.members_enrolled, report.roots_minted
-        );
-    }
 }
 
 fn admin_roundtrip(mountpoint: &str, verb: &str, arg: &str) -> Result<String, String> {
@@ -5116,142 +4919,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                          the SURVIVOR URI — listing the victim refuses loud."
                     );
                 }
-                VolumeActions::SetOwners {
-                    target,
-                    assignments,
-                    clear,
-                    dry_run,
-                    accept_cross_owner_names,
-                } => {
-                    if live(&target) {
-                        return Err("volume set-owners is an OFFLINE verb \
-                             (design-per-volume-claim-admission §5.6, ruling D19: the \
-                             assignment runs under a D0-guarded coordinator that is \
-                             momentarily the sole authority of every volume): unmount EVERY \
-                             node of the fleet and pass the sqmeta:// URI"
-                            .into());
-                    }
-                    let meta_lvs = parse_block_uri(&target, "sqmeta://")?;
-                    let mut specs = Vec::new();
-                    for a in &assignments {
-                        specs.push(squeezefs::config_ops::parse_owner_assign_spec(a)?);
-                    }
-                    let opts = squeezefs::config_ops::SetOwnersOptions {
-                        clear,
-                        dry_run,
-                        accept_cross_owner_names,
-                    };
-                    let report =
-                        squeezefs::config_ops::set_owners(&meta_lvs, &specs, &opts).await?;
-                    print_owner_assignment(&report);
-                }
-                VolumeActions::GetOwners {
-                    target,
-                    census,
-                    json,
-                } => {
-                    let meta_lvs = if live(&target) {
-                        meta_uri_of_live_mount(&target)?
-                    } else {
-                        parse_block_uri(&target, "sqmeta://")?
-                    };
-                    let rows = squeezefs::config_ops::get_owners(&meta_lvs).await?;
-                    if json {
-                        let out: Vec<serde_json::Value> = rows
-                            .iter()
-                            .map(|r| {
-                                serde_json::json!({
-                                    "volume_id": r.volume_id,
-                                    "path": r.path,
-                                    "hosts_slot_0": r.hosts_slot_0,
-                                    "owner": r.owner,
-                                    "successors": r.successors,
-                                    "holder": r.holder,
-                                    "claim_id": r.claim_id,
-                                    "term": r.term,
-                                    "claim_age_secs": r.claim_age_secs,
-                                    "claim_fresh": r.claim_fresh,
-                                    "drift": r.drift,
-                                })
-                            })
-                            .collect();
-                        println!("{}", serde_json::to_string_pretty(&out)?);
-                    } else {
-                        for r in &rows {
-                            println!(
-                                "{}{}  owner={}  succ={}  claim={}{}  term={}",
-                                r.volume_id,
-                                if r.hosts_slot_0 {
-                                    "  slot 0 (SET AUTHORITY)"
-                                } else {
-                                    "                       "
-                                },
-                                r.owner.as_deref().unwrap_or("(unassigned)"),
-                                if r.successors.is_empty() {
-                                    "-".to_string()
-                                } else {
-                                    r.successors.join(",")
-                                },
-                                r.holder
-                                    .as_deref()
-                                    .or(r.claim_id.as_deref())
-                                    .unwrap_or("(none)"),
-                                match r.claim_age_secs {
-                                    Some(age) if r.claim_fresh => format!(" fresh {age}s"),
-                                    Some(age) => format!(" STALE {age}s"),
-                                    None => String::new(),
-                                },
-                                r.term
-                            );
-                            if let Some(drift) = &r.drift {
-                                println!("    {drift}");
-                            }
-                        }
-                        if rows.iter().all(|r| r.owner.is_none()) {
-                            println!(
-                                "No per-volume owners assigned: this set has ONE metadata \
-                                 authority (`squeezefs volume set-owners` assigns them)."
-                            );
-                        }
-                    }
-                    if census {
-                        if live(&target) {
-                            return Err("volume get-owners --census walks every directory \
-                                 entry in the set and needs the D0-guarded offline \
-                                 coordinator: unmount and pass the sqmeta:// URI"
-                                .into());
-                        }
-                        let specs: Vec<squeezefs::config_ops::OwnerAssignSpec> = rows
-                            .iter()
-                            .filter_map(|r| {
-                                r.owner
-                                    .as_ref()
-                                    .map(|o| squeezefs::config_ops::OwnerAssignSpec {
-                                        volume_id: r.volume_id.clone(),
-                                        owner: o.clone(),
-                                        successors: r.successors.clone(),
-                                        subtree_root: None,
-                                    })
-                            })
-                            .collect();
-                        if specs.len() != rows.len() {
-                            return Err("volume get-owners --census: this set is not fully \
-                                 assigned, so there is no owner partition to measure \
-                                 against"
-                                .into());
-                        }
-                        let report = squeezefs::config_ops::set_owners(
-                            &meta_lvs,
-                            &specs,
-                            &squeezefs::config_ops::SetOwnersOptions {
-                                dry_run: true,
-                                ..Default::default()
-                            },
-                        )
-                        .await?;
-                        print_cross_owner_census(&report.census);
-                    }
-                }
                 VolumeActions::Locate { target, path, json } => {
                     let report = if live(&target) {
                         // A live mount answers with the CURRENT ino via
@@ -5278,33 +4945,30 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 "slot": report.slot,
                                 "volume_id": report.volume_id,
                                 "volume_index": report.volume_idx,
-                                "hosts_slot_0": report.hosts_slot_0,
-                                "owner": report.owner,
-                                "holder": report.holder,
+                                "lessee": report.lessee.and_then(|w| w.lessee),
+                                "g": report.lessee.map(|w| w.g),
+                                "stripes": report.stripes,
                             }))?
                         );
                     } else {
                         println!(
-                            "{}  ino {}  slot {}  volume {} (index {}){}",
-                            report.path,
-                            report.ino,
-                            report.slot,
-                            report.volume_id,
-                            report.volume_idx,
-                            if report.hosts_slot_0 {
-                                "  [hosts slot 0 — its owner is the SET AUTHORITY]"
-                            } else {
-                                ""
-                            }
+                            "{}  ino {}  slot {}  volume {} (index {})",
+                            report.path, report.ino, report.slot, report.volume_id, report.volume_idx,
                         );
-                        println!(
-                            "  owner: {}   live claim holder: {}",
-                            report
-                                .owner
-                                .as_deref()
-                                .unwrap_or("(unassigned — one authority appends to every volume)"),
-                            report.holder.as_deref().unwrap_or("(none attested)")
-                        );
+                        match report.lessee {
+                            Some(w) => println!(
+                                "  lessee: {}   g: {}",
+                                w.lessee.map_or_else(
+                                    || "(unleased — the manager maintains the tree)".to_string(),
+                                    |id| format!("appender {id}")
+                                ),
+                                w.g
+                            ),
+                            None => println!("  lessee: (tree 0 names no record for this slot)"),
+                        }
+                        if let Some(k) = report.stripes {
+                            println!("  striped directory: {k} stripes");
+                        }
                     }
                 }
                 VolumeActions::List { target, json } => {
@@ -5693,91 +5357,21 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         return Err(e.into());
                     }
                 };
-            // DLM S9 — the CO-WRITER posture, resolved in the same breath and
-            // for the same reason: it decides which open runs
-            // (`open_routed_meta_set_co_writer` takes no Layer-A lock, writes
-            // no writer_claim and registers no metadata-namespace PR key) and
-            // every data-plane gate downstream reads the latch. Declared, never
-            // inferred: `SQUEEZEFS_MW_ROLE=co-writer` without
-            // `SQUEEZEFS_MULTI_WRITER=1` refuses rather than mounting as a
-            // second authority.
-            let co_writer_mount = match squeezefs::cowriter::co_writer_requested() {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("\x1b[91mERROR\x1b[0m mount refused: {e}");
-                    return Err(e.into());
-                }
-            };
-            if co_writer_mount && reader_mount {
-                let msg = "mount refused: -o ro / --read-only with                            SQUEEZEFS_MW_ROLE=co-writer. A reader takes no lease and mutates no                            plane (DLM S5); a co-writer holds write custody. They are different                            postures, not a spectrum — pick one.";
-                eprintln!("\x1b[91mERROR\x1b[0m {msg}");
-                return Err(msg.into());
-            }
-            // **Per-volume claim admission (PR 5): the mount path selects
-            // the posture.** A mount that DECLARED `set-authority` or
-            // `partial-authority` takes the partial door — the D0 gate is
-            // untouched for everybody else, which is R12's solo re-gate
-            // law. The posture is never inferred from the durable
-            // assignment: an operator who typed nothing and got a
-            // per-volume open would learn nothing.
-            let pv_posture = squeezefs::partial_authority::requested();
-            // PR 7b: the PARTIAL authority is a CLIENT posture as well as
-            // an owner one, so every mount-path site that exists because a
-            // client must not act on the set's singular planes — the WERO
-            // acquire, the ownership-recovery walk, the maintenance
-            // coordinator, the membership OWNER arm — reads this beside
-            // `co_writer_mount`. A SET authority reads none of them: it IS
-            // those planes (D20).
-            let partial_authority_mount = pv_posture
-                && squeezefs::cowriter::requested_role()
-                    == squeezefs::cowriter::MwRole::PartialAuthority;
-            let mw_client_mount = co_writer_mount || partial_authority_mount;
+            // PR 14: every RW mount is a WRITER of the symmetric plane (the
+            // co-writer / per-volume-owner postures retired with the flip —
+            // their knobs refuse at startup). Two postures remain, and the
+            // read-only one is a mount option, never a knob value.
             squeezefs::fuse_client::set_mount_posture(if reader_mount {
                 squeezefs::fuse_client::MountPosture::Reader
-            } else if co_writer_mount {
-                squeezefs::fuse_client::MountPosture::CoWriter
-            } else if pv_posture {
-                match squeezefs::cowriter::requested_role() {
-                    squeezefs::cowriter::MwRole::SetAuthority => {
-                        squeezefs::fuse_client::MountPosture::SetAuthority
-                    }
-                    _ => squeezefs::fuse_client::MountPosture::PartialAuthority,
-                }
             } else {
                 squeezefs::fuse_client::MountPosture::Writer
             });
             if reader_mount {
                 println!(
-                    "Mounting READ-ONLY (DLM stage S5): this mount takes no write lease, \
-                     writes no writer_claim and mutates no plane. One writer plus N \
-                     readers is the supported shape; see docs/operations.md \
-                     §Read-only coherent mounts for the guarantee class and the \
-                     staleness bound."
-                );
-            }
-            if co_writer_mount {
-                println!(
-                    "Mounting as a CO-WRITER (DLM stage S9): this mount holds NO metadata \
-                     authority — every metadata mutation ships to the authority that holds the \
-                     D0 claim — and writes data only under custody that authority grants. \
-                     Admission runs a five-rung ladder and refuses loudly naming the rung; see \
-                     docs/operations.md §Multi-writer co-writer mounts."
-                );
-            }
-            if pv_posture {
-                println!(
-                    "Mounting as a {} (per-volume claim admission, ruling D20): this mount \
-                     appends to the volumes the durable assignment gives it and ships every \
-                     other volume's metadata to that volume's owner. Admission runs a \
-                     seven-rung ladder over an ASSIGNMENT an operator made offline (`squeezefs \
-                     volume set-owners`) and refuses loudly naming the rung; the mount order of \
-                     a fleet is not optional — see docs/operations.md §Bringing a multi-owner \
-                     fleet up.",
-                    if partial_authority_mount {
-                        "PARTIAL AUTHORITY"
-                    } else {
-                        "SET AUTHORITY"
-                    }
+                    "Mounting READ-ONLY: this mount takes no write lease, writes no writer_claim \
+                     and mutates no plane; it reads every object under a READ TOKEN from the \
+                     slot holder that writes it (design-symmetric-metadata §5.7.2 — exact at \
+                     the next resolve). See docs/operations.md §Read-only coherent mounts."
                 );
             }
 
@@ -6380,99 +5974,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // namespaces write wall).
             router.backend_router.arm_io_lanes();
 
-            // Mount every volume through the sector-0 version gate
-            // (design-cow-kv-metadata §6.1): v3 mounts read-write (the
-            // §4.4 commit pipeline + §4.6 checkpoint task are live);
-            // blank and legacy-v2 volumes refuse loud. The whole set
-            // opens through the D0 single-writer guard in set order
-            // (design-metadata-throughput §5.0): a refusal on volume k
-            // releases the guards taken on volumes 0..k and fails the
-            // mount LOUD — the refusal text names the holder and the
-            // remedy (dead-pid auto-reclaim / wait for the claim TTL /
-            // `squeezefs claim clear`).
-            // PR VL5a: the routed open runs the §5.5.1a stamp discovery
-            // first — stamped sets mount in canonical member_position
-            // order with their frozen routing width + slot map regardless
-            // of URI order; legacy sets keep URI order verbatim.
-            // Disagreements (torn epochs, missing members, duplicate
-            // positions) refuse LOUD naming the volumes.
-            // DLM S5: a reader opens the same discovered, canonically
-            // ordered, slot-map-validated set — through the reader open,
-            // which is where the §6.4 `LOCK_EX`-before-classification and
-            // the Layer-B2 `FreshForeign` refusal are bypassed. The write
-            // path below is byte-identical to what it always was.
-            // DLM S9: a CO-WRITER runs the five-rung admission ladder BEFORE
-            // it opens anything for real. The preflight reads its evidence
-            // through probe opens (never blocked by the authority's flock,
-            // never writing), joins the membership plane as a writer member
-            // (the liveness proof), and registers this node's key under the
-            // data namespaces' standing WERO hold (the fenceability proof) —
-            // in that order, so nothing mutates before every declarative rung
-            // has passed. A refusal names its rung and its remedy.
-            //
-            // The D0 gate itself is UNTOUCHED: an authority mount below still
-            // takes Layer A, still classifies the claim, and still refuses a
-            // fresh foreign holder on every substrate.
-            let co_writer_preflight = if co_writer_mount {
-                let purge: std::sync::Arc<dyn Fn() + Send + Sync> = {
-                    let router = router.clone();
-                    std::sync::Arc::new(move || {
-                        let purged =
-                            squeezefs::ro_coherence::purge_reader_block_keys(&router.cache);
-                        log::warn!(
-                            "co-writer self-fence: dropped {purged} cached block key(s) before \
-                             the authority's TTL could re-grant them"
-                        );
-                    })
-                };
-                match squeezefs::cowriter::gather_admission(
-                    &meta_lvs,
-                    &resolved_data_lvs
-                        .iter()
-                        .map(std::path::PathBuf::from)
-                        .collect::<Vec<_>>(),
-                    Some(purge),
-                )
-                .await
-                {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        eprintln!("\x1b[91mERROR\x1b[0m mount refused: {e}");
-                        return Err(e.into());
-                    }
-                }
-            } else {
-                None
-            };
-
-            // Per-volume claim admission (PR 5): the DECLARED per-volume
-            // posture runs the seven-rung ladder before it opens anything
-            // for real, exactly as the co-writer preflight above does. Its
-            // rungs 1–3 read the environment and probe opens only, so on
-            // every set no operator has assigned — which is every set in
-            // the field until PR 7's `squeezefs volume set-owners` verb
-            // exists — it refuses here, before any device or membership
-            // mutation, naming that verb.
-            let pv_preflight = if pv_posture {
-                match squeezefs::partial_authority::gather_set_admission(
-                    &meta_lvs,
-                    &resolved_data_lvs
-                        .iter()
-                        .map(std::path::PathBuf::from)
-                        .collect::<Vec<_>>(),
-                )
-                .await
-                {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        eprintln!("\x1b[91mERROR\x1b[0m mount refused: {e}");
-                        return Err(e.into());
-                    }
-                }
-            } else {
-                None
-            };
-
             // Symmetric PR 12b — the join ladder's TERMINAL decision
             // (design-symmetric-metadata §7.3): under the plane, a set with
             // a LIVE manager is JOINED (rungs 5–6 over the wire, the
@@ -6481,7 +5982,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // the manager. Two mounts racing for an unclaimed set: the D0
             // loser re-reads the target and joins the winner. `None` on
             // every unarmed process — the shipped open exactly.
-            let mut joined_admission = if reader_mount || mw_client_mount {
+            let mut joined_admission = if reader_mount {
                 None
             } else {
                 match squeezefs::meta_backend::symmetric_join_target(&meta_lvs).await {
@@ -6494,12 +5995,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
             let routed_meta_backend = match if reader_mount {
                 squeezefs::meta_backend::open_routed_meta_set_read_only(&meta_lvs).await
-            } else if let Some(pre) = co_writer_preflight.as_ref() {
-                squeezefs::meta_backend::open_routed_meta_set_co_writer(&meta_lvs, &pre.admission)
-                    .await
-            } else if let Some(pre) = pv_preflight.as_ref() {
-                squeezefs::meta_backend::open_routed_meta_set_partial(&meta_lvs, &pre.admission)
-                    .await
             } else if let Some(adm) = joined_admission.take() {
                 match squeezefs::meta_backend::open_routed_meta_set_joined(&meta_lvs, &adm).await {
                     Ok(r) => {
@@ -6624,38 +6119,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .await
                 .map_err(|e| format!("shared-block index arm failed: {e}"))?;
 
-            // DLM S7 (pre-RC spec §6.9 / §6.7 / RES-6): arm the data
-            // plane's custody posture. Single-writer (the default) states
-            // the class and takes no reservation — the D0 guard arbitrates
+            // The data plane's device-enforced WERO hold is the symmetric join
+            // ladder's rung 4 (`sym_join`, below); a `--single-writer` volume
+            // takes no data-namespace reservation — the D0 guard arbitrates
             // and the custody epoch fences the data plane locally.
-            // `SQUEEZEFS_MULTI_WRITER=1` demands the DEVICE-enforced class
-            // and REFUSES the mount loud when the substrate or the format
-            // cannot provide it. The hold lives as long as the mount.
-            //
-            // DLM S9: a CO-WRITER does NOT arm this — its device presence is a
-            // REGISTRATION under the authority's standing WERO hold, taken in
-            // the admission preflight (rung 5) and held for the mount's life.
-            // Calling the authority's arm here would try to ACQUIRE a second
-            // reservation on namespaces the authority already holds.
-            //
-            // PR 7b: a PARTIAL AUTHORITY is the same shape — its preflight
-            // took `join_wero_as_registrant` (rung 5), and under D20 the ONE
-            // reservation is the set authority's. A SET authority's preflight
-            // took the hold itself, so it skips this arm's acquire path by
-            // joining the standing hold instead (`arm_multi_writer`'s rung 3).
-            let _data_plane_fence = if mw_client_mount {
-                None
-            } else {
-                squeezefs::data_custody::arm_mount_data_plane(
-                    &routed_meta_backend,
-                    resolved_data_lvs
-                        .iter()
-                        .map(std::path::PathBuf::from)
-                        .collect(),
-                )
-                .await
-                .map_err(|e| format!("{e}"))?
-            };
 
             // Block-allocator ownership recovery before serving FUSE.
             //
@@ -6696,7 +6163,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // would declare every gap below the cursor free over offsets its
             // peers own.
             let mut verify_block_refs_after_sweep = false;
-            if reader_mount || mw_client_mount || joined_mount {
+            if reader_mount || joined_mount {
                 // PR 12b: a JOINED appender mints from the holder's ranged
                 // grants and ships its terminal frees — the holder's bitmap
                 // is the free list, so its open performs ZERO by-block
@@ -6829,7 +6296,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // `job:` xattrs on ino 1 — the coordinator role belongs to the
             // D0 writer-claim holder by definition (VL2/VL2b), which a
             // reader is not and must never appear to be.
-            if reader_mount || mw_client_mount || joined_mount {
+            if reader_mount || joined_mount {
                 // Rung-9 finding #4: a CO-WRITER took the coordinator arm
                 // here and died at mount — JobWireHost::start writes
                 // `job:enroll` and the fabric's crash-resume adoption
@@ -7009,12 +6476,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // the membership owner, which is why its own preflight only READ
             // the rendezvous record.
             let mut membership_arm: Option<squeezefs::membership::MembershipArm> =
-                if mw_client_mount {
-                    // The preflight's arm is carried inside the posture's own
-                    // preflight and handed to its arm, whose disarm leaves the
-                    // plane.
-                    None
-                } else if joined_mount {
+                if joined_mount {
                     // Symmetric PR 12b — rung 3 on a JOINED appender: a
                     // WRITER MEMBER of the manager's shard, never an owner
                     // (the manager is the set's S6 owner; a second owner
@@ -7050,7 +6512,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // armed set without the plane would record no death). An
             // explicit bind above wins verbatim; unarmed sets are untouched.
             let symmetric_set = !reader_mount
-                && !mw_client_mount
                 && !joined_mount
                 && squeezefs::sym_join::set_armed(&routed_meta_backend);
             if symmetric_set && membership_arm.is_none() {
@@ -7120,27 +6581,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("symmetric join ladder refused: {e}"))?
                 .map(|(arm, _report)| arm)
             } else {
-                squeezefs::multi_writer::arm_mount_multi_writer(
-                    &routed_meta_backend,
-                    &data_lv_paths,
-                    reader_mount,
-                    Some(mw_quarantine),
-                    // DLM S9 blocker #3's admission: the authority engages its
-                    // OWN allocation lane (lane 0 of the era's width) on these
-                    // allocators, and serves every co-writer's lane OPEN from
-                    // their live cursors. An arm that enrolls co-writers
-                    // without it refuses, rather than minting dense offsets
-                    // across their residue classes.
-                    Some(&fs_engine.router.backend_router),
-                    // Per-volume claim admission: the decision the partial
-                    // open was taken under. It supplies the SET authority's
-                    // declared endpoint and this node's registrant key —
-                    // never the ownership itself, which the arm DERIVES from
-                    // the durable records (KD-PV-3).
-                    pv_preflight.as_ref().map(|p| &p.admission),
-                )
-                .await
-                .map_err(|e| format!("multi-writer refused to arm: {e}"))?
+                // A `--single-writer` (flat) set arms no ownership plane:
+                // the D0 guard arbitrates and the data plane is fenced
+                // locally by the custody epoch. The S10 delegation lever
+                // is announced inert here (it engages on an armed plane).
+                squeezefs::multi_writer::announce_delegation_inert();
+                None
             };
 
             // Rung 17 (KD-MW-8): the AUTHORITY's extent ASSEMBLER — the
@@ -7214,7 +6660,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let routed_for_venue = std::sync::Arc::clone(&routed_meta_backend);
                 let manager_endpoint = adm.manager_endpoint.clone();
                 let armed = squeezefs::meta_backend::kv::alloc_lease::arm_joined_allocation(
-                    &fs_engine.router.backend_router.lane_allocators(),
+                    &fs_engine.router.backend_router.distinct_allocators(),
                     &|vol_tag| {
                         squeezefs::sym_join::joined_holder_venue(
                             &routed_for_venue,
@@ -7233,7 +6679,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 let held = squeezefs::meta_backend::kv::alloc_lease::arm_symmetric_allocation(
                     &routed_meta_backend,
-                    &fs_engine.router.backend_router.lane_allocators(),
+                    &fs_engine.router.backend_router.distinct_allocators(),
                 )
                 .await
                 .map_err(|e| format!("symmetric allocation lease refused to arm: {e}"))?;
@@ -7266,62 +6712,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 fs_engine.install_slot_custody_hooks();
             }
 
-            // DLM S9: the CO-WRITER's own arm — the client halves of the same
-            // three planes the authority serves. It installs the ownership map
-            // (the authority owns EVERY volume, so every metadata verb ships),
-            // the publish client, the custody client, and the renewal cadence
-            // whose failure self-fences this node BEFORE the authority may
-            // re-grant. Deliberately AFTER the authority arm's `Ok(None)`
-            // above: the two are mutually exclusive postures, and the ladder
-            // that decided this one already ran.
-            let co_writer_arm = match co_writer_preflight {
-                Some(pre) => Some(
-                    squeezefs::cowriter::arm(&routed_meta_backend, &fs_engine.router, pre)
-                        .await
-                        .map_err(|e| format!("co-writer refused to arm: {e}"))?,
-                ),
-                None => None,
-            };
-
-            // **PR 7b — the PARTIAL AUTHORITY's own arm** (§5.7's rev-6
-            // correction 2): the co-writer client halves toward the SET
-            // authority composed with an OWNER half serving only the volumes
-            // this node appends to. Deliberately here, beside the two arms it
-            // is made of and after both answered for their own postures: the
-            // authority arm returned `Ok(None)` naming this one, and a
-            // co-writer preflight cannot coexist with a per-volume one (the
-            // roles are mutually exclusive at rung 1).
-            //
-            // The preflight is MOVED in: the arm owns the membership lease and
-            // the device registration its admission took, so one disarm
-            // releases the whole posture.
-            let (pv_preflight, partial_authority_arm) = match pv_preflight {
-                Some(pre) if partial_authority_mount => (
-                    None,
-                    Some(
-                        squeezefs::multi_writer::arm_partial_authority(
-                            &routed_meta_backend,
-                            &fs_engine.router,
-                            pre,
-                        )
-                        .await
-                        .map_err(|e| format!("partial authority refused to arm: {e}"))?,
-                    ),
-                ),
-                other => (other, None),
-            };
-
-            // Rung 17 (KD-MW-8): the CO-WRITER's extent hooks — the
-            // demotion quiesce barrier and the coverage-release cache
-            // invalidation (read-your-writes hands off to the covering
-            // publish the moment retention releases). A partial authority
-            // takes them for the same reason it takes the rest of the client
-            // half: on the volumes it does not own, its write path IS a
-            // co-writer's.
-            if co_writer_arm.is_some() || partial_authority_arm.is_some() {
-                fs_engine.install_cowriter_extent_hooks();
-            }
-
             // KD-MW-16 (rung 10c, docs/design-mw-fleet-jobs.md §2): a
             // READER/CO-WRITER member serves fleet READ shards. Workers
             // arrive BY MEMBERSHIP (the joined S6 session is the
@@ -7338,11 +6728,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // (KD-PV-7 scopes the candidate set to volumes the evaluating node
             // OWNS).
             let mut fleet_worker_arm: Option<squeezefs::fleet_worker::FleetWorkerArm> =
-                if (reader_mount || mw_client_mount)
+                if reader_mount
                     && squeezefs::env_knobs::fleet_jobs_enabled()
                     && squeezefs::membership::installed_member_session().is_some()
                 {
-                    match squeezefs::cowriter::node_member_id() {
+                    match squeezefs::member_id::node_member_id() {
                         Ok(worker_id) => match squeezefs::fleet_worker::spawn_fleet_worker(
                             routed_meta_backend.clone(),
                             fs_engine.router.clone(),
@@ -7444,18 +6834,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Symmetric PR 12: the join ladder's report leaves with its
             // planes (the stats inode's `symmetric_join` reads `null`).
             squeezefs::sym_join::clear_report();
-            // DLM S9: the CO-WRITER's teardown, in the same
-            // outside-in order and for the same reason — stop holding
-            // custody and stop shipping BEFORE this node stops being a
-            // member, so no window exists where an authority believes it
-            // holds custody granted to a mount that has already gone. Its
-            // disarm also unregisters this node's key from the data
-            // namespaces' WERO hold (zero device residue; the authority's
-            // reservation is untouched) and leaves the membership plane it
-            // joined in the admission preflight.
-            if let Some(co) = co_writer_arm {
-                co.disarm().await;
-            }
             // Symmetric PR 9: the slot-holder custody plane's leave, in the
             // same outside-in order — every carried token and every custody
             // grant this mount holds from any slot holder is RELEASED at
@@ -7465,32 +6843,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // holder's next commit on those files runs a dead-client
             // recall to its deadline. A no-op on every unarmed mount.
             squeezefs::data_grant::disarm_slot_custody().await;
-            // PR 7b: the PARTIAL AUTHORITY's teardown, in the same
-            // outside-in order — it stops SERVING the volumes it owns, then
-            // stops holding custody and shipping, then leaves the membership
-            // plane it joined in its admission preflight and unregisters its
-            // key from the standing WERO hold.
-            if let Some(pa) = partial_authority_arm {
-                pa.disarm().await;
-            }
             if let Some(membership) = membership_arm {
                 membership.disarm().await;
-            }
-            // A SET authority's per-volume preflight still holds what its
-            // own rung 5 took — the standing WERO hold (the partial arm
-            // above consumed the other posture's). Released OFF-RUNTIME
-            // rather than dropped at scope end: the reservation ioctls are
-            // blocking.
-            if let Some(pre) = pv_preflight {
-                if let Some(arm) = pre.membership {
-                    arm.disarm().await;
-                }
-                if let Some(hold) = pre.hold {
-                    squeezefs::data_custody::release_hold(hold).await;
-                }
-                if let Some(join) = pre.registrant {
-                    squeezefs_ipc::sqz_blocking::run_blocking(move || drop(join)).await;
-                }
             }
             mount_result?;
         }

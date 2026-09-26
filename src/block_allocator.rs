@@ -1,5 +1,5 @@
 use crate::error::Result;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// RES-19 (pre-RC spec §7): retention of the free-forensics tape.
@@ -103,29 +103,6 @@ pub fn free_forensics_enabled() -> bool {
     *ON.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_FREE_FORENSICS", false))
 }
 
-/// One warn-level line per co-writer abandon BURST at most (the storm
-/// shape is hundreds of in-flight cleanups landing together after a
-/// custody loss — the 2026-08-19 field capture logged one ERROR per
-/// in-flight block): suppress repeat warns inside a 5 s window; the
-/// per-offset detail rides debug. Race-benign — a lost CAS at the window
-/// edge costs at most one extra warn, never a storm.
-fn abandon_warn_due() -> bool {
-    static LAST_WARN_MS: AtomicU64 = AtomicU64::new(0);
-    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let now_ms = EPOCH
-        .get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_millis() as u64
-        + 1; // +1: 0 stays the never-warned sentinel
-    let last = LAST_WARN_MS.load(Ordering::Relaxed);
-    if last != 0 && now_ms.saturating_sub(last) < 5_000 {
-        return false;
-    }
-    LAST_WARN_MS
-        .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-        .is_ok()
-}
-
 /// Physical allocation stride of every data-volume allocator: block
 /// offsets are minted as `block_idx * CHUNK_SIZE`, so a stored block
 /// image longer than this tramples the NEXT chunk's bytes on the device
@@ -202,25 +179,10 @@ pub enum PinOutcome {
     Refused,
 }
 
-/// Outcome of [`BlockAllocator::apply_lane_free_notice`] (publish schema
-/// 16).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LaneFreeNotice {
-    /// The offset's local tracking released (`cowriter.lane_free_notices`).
-    Released,
-    /// The offset was re-minted here from a grant served AFTER the notice
-    /// was queued — the live lifetime is untouched
-    /// (`cowriter.lane_free_notices_reminted`).
-    ReMinted,
-    /// No local tracking existed (a foreign predecessor, or a lifetime some
-    /// other arm already retired).
-    Untracked,
-}
-
 pub struct BlockAllocator {
     _volume_id: Box<str>,
     chunk_size: u64,
-    free_blocks: LaneCountedSet,
+    free_blocks: ReachableFreeSet,
     highest_block: AtomicU64,
     /// Device capacity in whole chunks (0 = unbounded: offline tools /
     /// tests without a real device). Set at mount registration from the
@@ -381,67 +343,6 @@ pub struct BlockAllocator {
     /// them. Untouched (one relaxed load) on every mount without a reader
     /// plane, which is every mount by default.
     grace: crate::free_grace::GraceRing,
-    // --- The ahead-of-stall lane refill (design-free-grace-sustain §5.5,
-    // PR 4) — all zero-cost words on unpartitioned mounts. ---
-    /// **The explicit-ship arm's face**: blocks this mount's SHIPPED
-    /// displaced frees left on the authority's list — +1 per `Freed`
-    /// verdict `crate::cowriter::ship_displaced_frees` brings back, −1 per
-    /// harvest adoption (clamped). Per-allocator BY CONSTRUCTION (the
-    /// two-volume law: a global number cannot say which volume's authority
-    /// holds supply); published as the sum `alloc_lane_owed_blocks`.
-    ///
-    /// NOT the refill gate (2026-09-07,
-    /// `.benchmarks/2026-09-07-lane-refill-hint-gate.md`): a displaced
-    /// block the authority RECOMPUTES when it serves this mount's layout
-    /// publish reaches its list with nothing noted here — ≈ 90 % of a
-    /// rewriting co-writer's displaced blocks on the s11 fleet — so this
-    /// word is a strict subset of the authority's own count, which the
-    /// renewal grant carries (`crate::free_grace::lane_supply_hint`). The
-    /// proactive refills gate on either witness
-    /// (`crate::free_grace::lane_supply_witnessed`); this word alone would
-    /// leave every recomputed block reachable only from an ENOSPC park.
-    lane_owed: AtomicU64,
-    /// Publish schema 16: per harvested block index, the authority's
-    /// per-client grant sequence it was adopted under
-    /// ([`Self::adopt_lane_free_grant_at`]) — the ordering witness a
-    /// lane-free notice's `after_grants` is compared against
-    /// ([`Self::apply_lane_free_notice`]). An entry lives as long as the
-    /// lifetime it tags: pruned when the local tracking retires, releases
-    /// to zero, or recycles. Fresh mints carry no tag (a fresh offset was
-    /// never handed out, so no notice can be ordered after its grant).
-    harvest_grants: scc::HashMap<u64, u64>,
-    /// Owed-ledger ARRIVALS (+1 per [`Self::note_owed_freed`]) — this
-    /// allocator's half of the single-flight harvest's decline witness
-    /// ([`Self::supply_witness_gen`]): the owed word itself falls at
-    /// adoption, so a monotonic arrival count is what "the owed ledger
-    /// moved" compares on.
-    owed_arrivals: AtomicU64,
-    /// The COMPOSED measured refill horizon (`hint + RTT + one refresh
-    /// floor`), 0 = use the member-local derivation (OQ 2's fallback —
-    /// the pre-first-reply state, a zero hint, and a refused reply all
-    /// land here).
-    horizon_composed_ms: AtomicU64,
-    /// Allocation claims (the rate EWMA's input — every funnel exit).
-    alloc_claims: AtomicU64,
-    rate_last_sample_ms: AtomicU64,
-    rate_last_claims: AtomicU64,
-    /// EWMA allocation rate, milli-blocks/s.
-    rate_mblk_per_s: AtomicU64,
-    /// `ceil(rate × horizon)` capped at lane-share/4 — derived, never a
-    /// knob (the A/B lever disarms the mechanism, not the number).
-    harvest_watermark: AtomicU64,
-    /// The capacity law's two published faces (hold-time campaign):
-    /// `share_needed = ceil(rate × horizon) + live` and the headroom
-    /// percentage against this lane's share; re-derived with the
-    /// watermark at every rate sample.
-    share_needed_blocks: AtomicU64,
-    headroom_pct: AtomicU64,
-    /// DLM **S9** blocker #3: this volume's **allocation partition**
-    /// ([`crate::data_alloc_lane`]) — `None` on every mount today AND on
-    /// every solo mount forever, which is what makes single-writer
-    /// allocation not merely equivalent to the shipped path but literally
-    /// it ([`Self::engage_alloc_lanes`] installs nothing at `writers == 1`).
-    lanes: std::sync::OnceLock<LanePartition>,
     /// PR 8 (design-symmetric-metadata §5.5, KD-SYM-9): the ARMED
     /// symmetric plane's fresh-mint source — ranged block grants from
     /// this data volume's allocation-lease holder (`crate::block_grant`).
@@ -504,209 +405,12 @@ struct BlockGrantArm {
     me: std::sync::Weak<BlockAllocator>,
 }
 
-/// One mount's data-plane allocation partition (see
-/// [`BlockAllocator::engage_alloc_lanes`]).
-struct LanePartition {
-    /// The appender descriptor — the SAME identity incompat bit 8's
-    /// partitioned journal/bitmap/ledger and §6.2 item 5's ino lanes carry,
-    /// so a volume never holds two disagreeing notions of "who is writer 2".
-    part: crate::meta_backend::kv::journal::AppendPartition,
-    /// Lane bitmask this mount may mint in: its own lane always, plus any
-    /// lane [`BlockAllocator::adopt_lane`] has adopted under a drain proof.
-    owned: AtomicU64,
-    /// The durable reservation frontier (exclusive, **dense** block index) —
-    /// raised through [`Self::sink`] for every owned lane before any mint
-    /// reaches it, so a successor's
-    /// [`crate::data_alloc_lane::recover_lane_floor`] starts above every
-    /// index this mount could have minted.
-    reserved_upto: AtomicU64,
-    /// Fresh blocks one raise covers
-    /// ([`crate::data_alloc_lane::reserve_grain_blocks`], resolved once at
-    /// engagement — never per allocation).
-    grain: u64,
-    /// The durable sink. Absent on offline tools and unit fixtures: the
-    /// reservation is then RAM-only and recovery falls back to the derived
-    /// floor, which is exactly the pre-partition posture.
-    sink: std::sync::OnceLock<crate::data_alloc_lane::LaneReserveSink>,
-    /// The lane free HARVEST sink (rung 10, residual 2) — wired only on
-    /// co-writer engagements ([`crate::alloc_lane_grant`]): at lane
-    /// exhaustion, ask the authority for this lane's freed supply. Absent
-    /// on the authority (its own free list already carries lane-0's
-    /// supply) and everywhere unpartitioned.
-    harvest: std::sync::OnceLock<crate::data_alloc_lane::LaneHarvestSink>,
-    /// The supply-coupled rewrite-epoch close (finding 15's parked-supply
-    /// term, design-rewrite-program §5.3) — installed only where a
-    /// harvest sink is (a co-writer's lane): the refill tick closes the
-    /// mount's open epochs when this lane's reachable supply sits below
-    /// the watermark, so the parked A keys enter the recycle loop ahead
-    /// of the `StorageFull` instead of at the iteration boundary.
-    supply_close: std::sync::OnceLock<crate::data_alloc_lane::SupplyCloseSink>,
-    /// The single-flight harvest rendezvous (finding 15 phase B1,
-    /// `.benchmarks/2026-09-07-lane-harvest-single-flight.md`): one
-    /// in-flight harvest RPC per allocator; every concurrent caller joins
-    /// its outcome. Zero-cost words until a harvest runs.
-    flight: HarvestFlight,
-}
-
-/// **The single-flight harvest rendezvous** — one per laned allocator
-/// (finding 15 phase B1: on the 8-co-writer fleet every parked
-/// allocation issued its OWN harvest per park slice — 124k RPCs in 9.5
-/// min, half empty — and the authority's liveness serves queued behind
-/// them). Latch-free: the leader is whoever wins `inflight`'s CAS; joiners
-/// register on `notify` BEFORE re-reading `done_gen` (the enable-then-check
-/// ordering — a leader completing between the failed CAS and the
-/// registration is caught by the generation, one after it by the wake),
-/// and read the outcome from `last_adopted` after the generation moved.
-/// No lock is held across the RPC.
-///
-/// `empty_at_witness` is the DECLINE: the supply witness generation
-/// ([`BlockAllocator::supply_witness_gen`]) at which the last reply came
-/// back EMPTY (`u64::MAX` = none). While the witness has not moved —
-/// no grant, no wake, no owed `Freed` — a fresh empty answer is the
-/// answer, and a caller declines without a wire trip; the next grant
-/// (the renewal cadence, ≤ 500 ms under an ask) ends the window for
-/// exactly one RPC. An RPC FAILURE stamps nothing (it is not an answer).
-struct HarvestFlight {
-    inflight: AtomicBool,
-    /// +1 at every flight's terminal outcome.
-    done_gen: AtomicU64,
-    /// The last flight's adopted count, published before `done_gen` moves.
-    last_adopted: AtomicU64,
-    empty_at_witness: AtomicU64,
-    notify: squeezefs_ipc::sqz_notify::Notify,
-}
-
-impl HarvestFlight {
-    const fn new() -> Self {
-        Self {
-            inflight: AtomicBool::new(false),
-            done_gen: AtomicU64::new(0),
-            last_adopted: AtomicU64::new(0),
-            empty_at_witness: AtomicU64::new(u64::MAX),
-            notify: squeezefs_ipc::sqz_notify::Notify::new(),
-        }
-    }
-}
-
-/// The `SQUEEZEFS_ALLOC_LANE_HARVEST_SINGLE_FLIGHT` lever's latch (the
-/// `HARVEST_AHEAD` shape): one in-flight harvest RPC per allocator with
-/// the fresh-empty decline. `0` = one RPC per caller, the shipped shape —
-/// the fleet A/B control.
-static HARVEST_SINGLE_FLIGHT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-fn harvest_single_flight_enabled() -> bool {
-    match HARVEST_SINGLE_FLIGHT.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on =
-                crate::env_knobs::bool_knob("SQUEEZEFS_ALLOC_LANE_HARVEST_SINGLE_FLIGHT", true);
-            HARVEST_SINGLE_FLIGHT.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// Test seam (the `test_set_harvest_ahead` shape).
-pub fn test_set_harvest_single_flight(on: Option<bool>) {
-    HARVEST_SINGLE_FLIGHT.store(
-        match on {
-            Some(true) => 1,
-            Some(false) => 2,
-            None => 0,
-        },
-        Ordering::Relaxed,
-    );
-}
-
-/// Test seam: `true` ⇔ a preset was in force.
-pub fn test_clear_harvest_single_flight() -> bool {
-    HARVEST_SINGLE_FLIGHT.swap(0, Ordering::Relaxed) != 0
-}
-
-/// The `SQUEEZEFS_ALLOC_LANE_HARVEST_AHEAD` lever's latch (the free-grace
-/// campaign's `ACK_PIPELINE` pattern): the ahead-of-stall lane refill
-/// (design-free-grace-sustain §5.5). `0` = ENOSPC-triggered harvests
-/// only, the shipped shape verbatim.
-static HARVEST_AHEAD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-fn harvest_ahead_enabled() -> bool {
-    match HARVEST_AHEAD.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = crate::env_knobs::bool_knob("SQUEEZEFS_ALLOC_LANE_HARVEST_AHEAD", true);
-            HARVEST_AHEAD.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// Test seam (the `free_grace::test_set_ack_pipeline` shape).
-pub fn test_set_harvest_ahead(on: Option<bool>) {
-    HARVEST_AHEAD.store(
-        match on {
-            Some(true) => 1,
-            Some(false) => 2,
-            None => 0,
-        },
-        Ordering::Relaxed,
-    );
-}
-
-/// Test seam: `true` ⇔ a preset was in force.
-pub fn test_clear_harvest_ahead() -> bool {
-    HARVEST_AHEAD.swap(0, Ordering::Relaxed) != 0
-}
-
-/// The `SQUEEZEFS_COWRITER_LANE_PLACEMENT` lever's latch (same shape):
-/// lane-aware write placement + allocation failover on a laned co-writer
-/// (`.benchmarks/2026-09-07-cowriter-lane-aware-placement.md`). `0` = the
-/// shipped device-fill pick and no failover, the fleet A/B control.
-static COWRITER_LANE_PLACEMENT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-/// Whether a laned co-writer's placement is lane-governed (one relaxed
-/// load after the first read).
-pub fn cowriter_lane_placement_enabled() -> bool {
-    match COWRITER_LANE_PLACEMENT.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = crate::env_knobs::bool_knob("SQUEEZEFS_COWRITER_LANE_PLACEMENT", true);
-            COWRITER_LANE_PLACEMENT.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// Test seam (the `test_set_harvest_ahead` shape).
-pub fn test_set_cowriter_lane_placement(on: Option<bool>) {
-    COWRITER_LANE_PLACEMENT.store(
-        match on {
-            Some(true) => 1,
-            Some(false) => 2,
-            None => 0,
-        },
-        Ordering::Relaxed,
-    );
-}
-
-/// Test seam: `true` ⇔ a preset was in force.
-pub fn test_clear_cowriter_lane_placement() -> bool {
-    COWRITER_LANE_PLACEMENT.swap(0, Ordering::Relaxed) != 0
-}
-
-/// **The lane-counted free set** (sustain campaign KD-FG-10,
-/// design-free-grace-sustain §5.4): the free list plus a lane-owned
-/// population maintained INSIDE insert/remove — one modulo per mutation —
-/// so the LANE-REACHABLE supply (the quantity that actually troughs on a
-/// recycle-bound stream, where the global count accumulates foreign-lane
-/// releases nobody here can consume) is correct by construction across
-/// the full ten-site mutation census (the `pending_block_refs`
-/// deferred-op-accumulator precedent; an eleventh site cannot drift).
-/// Unpartitioned mounts (`writers == 0`) count everything, so the two
-/// quantities coincide there. The fsck C6 per-lane recount is the drift
-/// tripwire (`tests/mw_cowriter_free_tests.rs`).
+/// **The counted free set** (sustain campaign KD-FG-10,
+/// design-free-grace-sustain §5.4): the free list plus a REACHABLE
+/// population maintained INSIDE insert/remove, so the supply the
+/// allocation funnel can reach is correct by construction across the full
+/// mutation census (the `pending_block_refs` deferred-op-accumulator
+/// precedent; a new site cannot drift).
 ///
 /// The two trim edges (KD-4.4 — `remove_for_trim` … `insert_from_trim`)
 /// move MEMBERSHIP but not the reachable count: a claimed offset leaves
@@ -717,61 +421,24 @@ pub fn test_clear_cowriter_lane_placement() -> bool {
 /// command's duration and a §5.9 refresh inside the window banded the
 /// restocked volume's sibling alone.
 #[derive(Debug, Default)]
-struct LaneCountedSet {
+struct ReachableFreeSet {
     set: dashmap::DashSet<u64>,
-    /// Blocks in lanes this mount owns that the allocation funnel can
-    /// REACH: free-listed, or inside an open trim claim window. One load
-    /// serves `lane_reachable_blocks`; the membership-exact lane-owned
-    /// count is derived (`lane_owned`) by subtracting the owned windows.
-    reachable_owned: AtomicU64,
-    /// The open trim claim windows' block indices — the recount's input
-    /// (a windowed block is a member of nothing else) and the return
-    /// edge's witness that a claim preceded it.
+    /// Blocks the allocation funnel can REACH: free-listed, or inside an
+    /// open trim claim window. One load serves `reachable_free_blocks`.
+    reachable: AtomicU64,
+    /// The open trim claim windows' block indices — the return edge's
+    /// witness that a claim preceded it.
     trim_windowed: dashmap::DashSet<u64>,
-    /// Free-listed blocks PER LANE (finding 15 term 2 — the lane-supply
-    /// hint's O(1) input: a co-writer's renewal grant carries its lane's
-    /// count, so this is what keeps the count out of the renewal hot op
-    /// and off the free-list scan). Membership-exact — the trim edges move
-    /// it; meaningful only when `writers > 0`.
-    per_lane: [AtomicU64; crate::alloc_lane_grant::MAX_LANES as usize],
-    /// Partition width in force (0 = unpartitioned — everything is ours).
-    writers: AtomicU64,
-    /// Owned-lane bitmask (meaningful only when `writers > 0`).
-    owned_mask: AtomicU64,
 }
 
-impl LaneCountedSet {
-    /// The lane of `idx` under the partition in force (`None` when
-    /// unpartitioned).
-    #[inline]
-    fn lane_of(&self, idx: u64) -> Option<usize> {
-        let writers = self.writers.load(Ordering::Acquire);
-        if writers == 0 {
-            return None;
-        }
-        Some(crate::data_alloc_lane::block_lane_of(idx, writers as u16) as usize)
-    }
-
-    #[inline]
-    fn is_ours(&self, idx: u64) -> bool {
-        match self.lane_of(idx) {
-            None => true,
-            Some(lane) => self.owned_mask.load(Ordering::Acquire) & (1u64 << lane) != 0,
-        }
-    }
-
+impl ReachableFreeSet {
     /// `DashSet::insert` shape: `true` ⇔ newly inserted (and then, and only
-    /// then, the lane counts move — each mutator adjusts by exactly its own
-    /// membership delta, so the counts stay exact under races).
+    /// then, the count moves — each mutator adjusts by exactly its own
+    /// membership delta, so the count stays exact under races).
     fn insert(&self, idx: u64) -> bool {
         let new = self.set.insert(idx);
         if new {
-            if let Some(lane) = self.lane_of(idx) {
-                self.per_lane[lane].fetch_add(1, Ordering::AcqRel);
-            }
-            if self.is_ours(idx) {
-                self.reachable_owned.fetch_add(1, Ordering::AcqRel);
-            }
+            self.reachable.fetch_add(1, Ordering::AcqRel);
         }
         new
     }
@@ -780,12 +447,7 @@ impl LaneCountedSet {
     fn remove(&self, idx: &u64) -> Option<u64> {
         let out = self.set.remove(idx);
         if out.is_some() {
-            if let Some(lane) = self.lane_of(*idx) {
-                self.per_lane[lane].fetch_sub(1, Ordering::AcqRel);
-            }
-            if self.is_ours(*idx) {
-                self.reachable_owned.fetch_sub(1, Ordering::AcqRel);
-            }
+            self.reachable.fetch_sub(1, Ordering::AcqRel);
         }
         out
     }
@@ -797,46 +459,26 @@ impl LaneCountedSet {
     fn remove_for_trim(&self, idx: &u64) -> Option<u64> {
         let out = self.set.remove(idx);
         if out.is_some() {
-            if let Some(lane) = self.lane_of(*idx) {
-                self.per_lane[lane].fetch_sub(1, Ordering::AcqRel);
-            }
             self.trim_windowed.insert(*idx);
         }
         out
     }
 
     /// The trim RETURN: membership back, the reachable count untouched
-    /// for a block the window (or the recount that ran across it) already
-    /// counts. `true` ⇔ a claim window closed. Without a preceding claim
-    /// this is a plain `insert` — the accumulation shape the seeding
-    /// contracts use — and no window ends.
+    /// for a block the window already counts. `true` ⇔ a claim window
+    /// closed. Without a preceding claim this is a plain `insert` — the
+    /// accumulation shape the seeding contracts use — and no window ends.
     fn insert_from_trim(&self, idx: u64) -> bool {
         let windowed = self.trim_windowed.remove(&idx).is_some();
         let new = self.set.insert(idx);
-        if new {
-            if let Some(lane) = self.lane_of(idx) {
-                self.per_lane[lane].fetch_add(1, Ordering::AcqRel);
-            }
-        }
-        if self.is_ours(idx) {
-            if !windowed && new {
-                self.reachable_owned.fetch_add(1, Ordering::AcqRel);
-            } else if windowed && !new {
-                // Re-listed mid-window (a plain insert already counted the
-                // member): the window's share leaves with the window.
-                self.reachable_owned.fetch_sub(1, Ordering::AcqRel);
-            }
+        if !windowed && new {
+            self.reachable.fetch_add(1, Ordering::AcqRel);
+        } else if windowed && !new {
+            // Re-listed mid-window (a plain insert already counted the
+            // member): the window's share leaves with the window.
+            self.reachable.fetch_sub(1, Ordering::AcqRel);
         }
         windowed
-    }
-
-    /// The free-listed population of one lane (0 unpartitioned).
-    #[inline]
-    fn lane_count(&self, lane: u16) -> u64 {
-        self.per_lane
-            .get(lane as usize)
-            .map(|c| c.load(Ordering::Acquire))
-            .unwrap_or(0)
     }
 
     #[inline]
@@ -854,56 +496,10 @@ impl LaneCountedSet {
         self.set.iter()
     }
 
-    /// (Re)declare the partition in force and RECOUNT — the two
-    /// control-plane sites (`engage_alloc_lanes`, `adopt_lane`) call this
-    /// after moving the mask; mutations racing the recount converge on the
-    /// next one (both sites are rare, and the tripwire contract pins the
-    /// quiescent equality).
-    fn set_partition(&self, writers: u16, owned_mask: u64) {
-        self.writers.store(u64::from(writers), Ordering::Release);
-        self.owned_mask.store(owned_mask, Ordering::Release);
-        let mut per_lane = [0u64; crate::alloc_lane_grant::MAX_LANES as usize];
-        let mut owned = 0u64;
-        for idx in self.set.iter() {
-            if let Some(lane) = self.lane_of(*idx) {
-                per_lane[lane] += 1;
-            }
-            if self.is_ours(*idx) {
-                owned += 1;
-            }
-        }
-        for (c, n) in self.per_lane.iter().zip(per_lane) {
-            c.store(n, Ordering::Release);
-        }
-        // A windowed block is on its way back to the list under the mask
-        // in force NOW (an adoption mid-trim owns it from here), and its
-        // return moves nothing — so the recount counts it here.
-        let windowed_owned = self.windowed_owned();
-        self.reachable_owned
-            .store(owned + windowed_owned, Ordering::Release);
-    }
-
-    /// The owned blocks inside open trim claim windows (the recount's and
-    /// the derived membership count's term; a scan of ≤ one trim batch).
-    fn windowed_owned(&self) -> u64 {
-        self.trim_windowed
-            .iter()
-            .filter(|idx| self.is_ours(**idx))
-            .count() as u64
-    }
-
-    /// The lane-owned REACHABLE population (free-listed + windowed) — the
-    /// counting half of the lane-reachable supply, one load.
+    /// The REACHABLE population (free-listed + windowed), one load.
     #[inline]
-    fn reachable_owned(&self) -> u64 {
-        self.reachable_owned.load(Ordering::Acquire)
-    }
-
-    /// The lane-owned FREE-LISTED population (membership-exact — the
-    /// KD-FG-10 drift tripwire's quantity): the reachable count less the
-    /// owned windows. A diagnostic read, never on the pick path.
-    fn lane_owned(&self) -> u64 {
-        self.reachable_owned().saturating_sub(self.windowed_owned())
+    fn reachable(&self) -> u64 {
+        self.reachable.load(Ordering::Acquire)
     }
 }
 
@@ -938,7 +534,7 @@ impl BlockAllocator {
         Ok(Self {
             _volume_id: volume_id.to_string().into_boxed_str(),
             chunk_size: CHUNK_SIZE,
-            free_blocks: LaneCountedSet::default(),
+            free_blocks: ReachableFreeSet::default(),
             highest_block: AtomicU64::new(0),
             capacity_blocks: AtomicU64::new(0),
             refcounts: scc::HashMap::new(),
@@ -958,18 +554,6 @@ impl BlockAllocator {
             incarnation_minter: std::sync::OnceLock::new(),
             quarantine: crate::data_custody::BlockQuarantine::new(),
             grace: crate::free_grace::GraceRing::derived(),
-            lane_owed: AtomicU64::new(0),
-            harvest_grants: scc::HashMap::new(),
-            owed_arrivals: AtomicU64::new(0),
-            horizon_composed_ms: AtomicU64::new(0),
-            alloc_claims: AtomicU64::new(0),
-            rate_last_sample_ms: AtomicU64::new(0),
-            rate_last_claims: AtomicU64::new(0),
-            rate_mblk_per_s: AtomicU64::new(0),
-            harvest_watermark: AtomicU64::new(0),
-            share_needed_blocks: AtomicU64::new(0),
-            headroom_pct: AtomicU64::new(0),
-            lanes: std::sync::OnceLock::new(),
             block_grant: std::sync::OnceLock::new(),
         })
     }
@@ -1187,321 +771,6 @@ impl BlockAllocator {
     }
 
     // -----------------------------------------------------------------
-    // DLM S9 blocker #3 — the data-plane allocation partition
-    // (`crate::data_alloc_lane`; contracts in
-    // tests/mw_data_alloc_lane_tests.rs). Fresh allocation is a residue
-    // class per writer; FREES ARE UNTOUCHED — the owning lane is derivable
-    // from the offset, so a writer frees a peer's block with no ownership
-    // lookup, no message and no record.
-    // -----------------------------------------------------------------
-
-    /// Engage the allocation partition: this mount mints only lane
-    /// `part.writer_id()` of `part.writers()`.
-    ///
-    /// **A solo partition installs nothing** and returns `Ok(())`: lane 0
-    /// of 1 owns every index at stride 1, so installing state would only
-    /// create a way for the shipped path to differ from itself. That is the
-    /// single-writer byte-identity proof, made structural rather than
-    /// argued.
-    ///
-    /// Idempotent — the first non-solo call wins, so a re-registration can
-    /// never move a live mount's lane out from under offsets it has minted.
-    pub fn engage_alloc_lanes(
-        &self,
-        part: crate::meta_backend::kv::journal::AppendPartition,
-    ) -> Result<()> {
-        if part.is_solo() {
-            return Ok(());
-        }
-        if u32::from(part.writers()) > u64::BITS {
-            return Err(crate::error::SqueezefsError::InvalidOperation(format!(
-                "allocation partition width {} exceeds the {} lanes a lane mask can hold",
-                part.writers(),
-                u64::BITS
-            )));
-        }
-        let cap = self.capacity_blocks.load(Ordering::Relaxed);
-        let installed = LanePartition {
-            part,
-            owned: AtomicU64::new(1u64 << part.writer_id()),
-            // The frontier a fresh engagement starts from is the derived
-            // one: `install_lane_floor` raises it from the durable records
-            // when recovery has read them.
-            reserved_upto: AtomicU64::new(self.highest_block.load(Ordering::Relaxed)),
-            grain: crate::data_alloc_lane::reserve_grain_blocks(cap, part.writers()),
-            sink: std::sync::OnceLock::new(),
-            harvest: std::sync::OnceLock::new(),
-            supply_close: std::sync::OnceLock::new(),
-            flight: HarvestFlight::new(),
-        };
-        let grain = installed.grain;
-        if self.lanes.set(installed).is_err() {
-            return Ok(());
-        }
-        // KD-FG-10: the counting-set learns the partition and recounts —
-        // from here the lane-owned population is the lane-reachable
-        // supply's free-list half.
-        self.free_blocks
-            .set_partition(part.writers(), 1u64 << part.writer_id());
-        let metrics = &crate::fuse_client::METRICS;
-        metrics
-            .alloc_lane_writers
-            .store(u64::from(part.writers()), Ordering::Relaxed);
-        metrics
-            .alloc_lane_id
-            .store(u64::from(part.writer_id()), Ordering::Relaxed);
-        metrics.alloc_lanes_owned.store(1, Ordering::Relaxed);
-        // Summed across this mount's data volumes (each engages once);
-        // `adopt_lane` subtracts the lane share it reclaims.
-        metrics.alloc_lane_stranded_bytes.fetch_add(
-            crate::data_alloc_lane::stranded_blocks_bound(
-                cap,
-                part.writers(),
-                1u64 << part.writer_id(),
-            )
-            .saturating_mul(self.chunk_size),
-            Ordering::Relaxed,
-        );
-        log::info!(
-            "data-plane allocation partition engaged on volume '{}': lane {} of {}, reservation \
-             grain {grain} blocks, {} block(s) of this device belong to other lanes \
-             (alloc_lane_stranded_bytes)",
-            self._volume_id,
-            part.writer_id(),
-            part.writers(),
-            crate::data_alloc_lane::stranded_blocks_bound(
-                cap,
-                part.writers(),
-                1u64 << part.writer_id()
-            ),
-        );
-        Ok(())
-    }
-
-    /// Wire the durable reservation sink (set once by the owning
-    /// `BackendRouter`, exactly like [`Self::set_space_pressure_valve`]).
-    /// Without it the reservation is RAM-only — the offline-tool posture.
-    pub fn set_lane_reserve_sink(&self, sink: crate::data_alloc_lane::LaneReserveSink) {
-        if let Some(lanes) = self.lanes.get() {
-            let _ = lanes.sink.set(sink);
-        }
-    }
-
-    /// Wire the lane free HARVEST sink (rung 10 — co-writer engagements
-    /// only; see `LanePartition::harvest`).
-    pub fn set_lane_harvest_sink(&self, sink: crate::data_alloc_lane::LaneHarvestSink) {
-        if let Some(lanes) = self.lanes.get() {
-            let _ = lanes.harvest.set(sink);
-        }
-    }
-
-    /// Wire the supply-coupled rewrite-epoch close
-    /// ([`crate::routing::DataRouter::arm_rewrite_supply_close`]). Installs
-    /// ONLY on a harvesting (co-writer) lane and returns whether it did:
-    /// the authority's own lane and every unpartitioned mount keep the
-    /// shipped KD-1.6/1.7 triggers exactly — the scope is enforced here,
-    /// in one place, not at each caller.
-    pub fn set_lane_supply_close_sink(
-        &self,
-        sink: crate::data_alloc_lane::SupplyCloseSink,
-    ) -> bool {
-        let Some(lanes) = self.lanes.get() else {
-            return false;
-        };
-        if lanes.harvest.get().is_none() {
-            return false;
-        }
-        lanes.supply_close.set(sink).is_ok()
-    }
-
-    /// Whether a supply-coupled close is wired on this allocator (the
-    /// scope contract's instrument).
-    pub fn lane_supply_close_installed(&self) -> bool {
-        self.lanes
-            .get()
-            .is_some_and(|l| l.supply_close.get().is_some())
-    }
-
-    /// This mount's partition, `None` ⇔ unpartitioned (every mount today).
-    pub fn lane_partition(&self) -> Option<crate::meta_backend::kv::journal::AppendPartition> {
-        self.lanes.get().map(|l| l.part)
-    }
-
-    /// The lane mask this mount may mint in (own + adopted). `None` ⇔
-    /// unpartitioned.
-    pub fn owned_lane_mask(&self) -> Option<u64> {
-        self.lanes.get().map(|l| l.owned.load(Ordering::Acquire))
-    }
-
-    /// The durable reservation frontier (exclusive, dense block index).
-    pub fn lane_reserved_upto(&self) -> Option<u64> {
-        self.lanes
-            .get()
-            .map(|l| l.reserved_upto.load(Ordering::Acquire))
-    }
-
-    /// Raise the mint floor from recovery's answer
-    /// ([`crate::data_alloc_lane::recover_lane_floor`]): monotone
-    /// (`fetch_max`, so a stale floor can never regress a fresher mint) and
-    /// idempotent under re-seeding.
-    ///
-    /// Both halves move together — the dense cursor (so no index below the
-    /// floor is minted) and the reservation frontier (so the floor a
-    /// predecessor durably claimed is not re-reserved).
-    pub fn install_lane_floor(&self, floor: u64) {
-        let Some(lanes) = self.lanes.get() else {
-            return;
-        };
-        self.highest_block.fetch_max(floor, Ordering::AcqRel);
-        lanes.reserved_upto.fetch_max(floor, Ordering::AcqRel);
-    }
-
-    /// **Adopt a lane whose holder is proven dead** — the ENOSPC/fairness
-    /// answer (see the module docs and `docs/operations.md`): the adopted
-    /// lane's free blocks and virgin share become allocatable here.
-    ///
-    /// The witness is S7's [`crate::data_custody::DeadEpoch`], i.e. the
-    /// SAME drain proof [`Self::release_quarantine`] demands — a landed
-    /// WERO preempt of the dead lane's host on a PR substrate, recovery's
-    /// proof of death otherwise. Adoption needs **no new durable
-    /// structure** because the reservation watermark is keyed on the LANE,
-    /// not the holder: `Self::reserve_lane_frontier` declares the dense
-    /// frontier for every owned lane, so any future holder of an adopted
-    /// lane recovers above the indices we minted in it.
-    ///
-    /// The adopted lane's frontier starts from OUR dense cursor rather than
-    /// from the dead holder's record, which can write that lane's record
-    /// backwards. That is sound precisely because adoption demands a proof
-    /// of death: nothing the dead holder minted can still be written, and
-    /// our own subsequent raises dominate our own mints. It is also why a
-    /// LIVE peer's lane is never adoptable.
-    ///
-    /// `false` ⇔ nothing changed (unpartitioned, own lane, out of range, or
-    /// already adopted).
-    pub fn adopt_lane(&self, lane: u16, proof: crate::data_custody::DeadEpoch) -> bool {
-        let Some(lanes) = self.lanes.get() else {
-            log::error!(
-                "refusing to adopt lane {lane} on volume '{}': no allocation partition is \
-                 engaged, so there are no lanes to adopt",
-                self._volume_id
-            );
-            return false;
-        };
-        if lane >= lanes.part.writers() || lane == lanes.part.writer_id() {
-            return false;
-        }
-        let bit = 1u64 << lane;
-        let prev = lanes.owned.fetch_or(bit, Ordering::AcqRel);
-        if prev & bit != 0 {
-            return false;
-        }
-        let owned = prev | bit;
-        // KD-FG-10: the adopted lane's free blocks join the lane-owned
-        // population — recount under the new mask.
-        self.free_blocks.set_partition(lanes.part.writers(), owned);
-        let metrics = &crate::fuse_client::METRICS;
-        metrics
-            .alloc_lanes_owned
-            .store(u64::from(owned.count_ones()), Ordering::Relaxed);
-        metrics.alloc_lane_adoptions.fetch_add(1, Ordering::Relaxed);
-        // The adopted lane's share stops being stranded (exact, so the
-        // gauge stays closed across volumes and adoptions).
-        metrics.alloc_lane_stranded_bytes.fetch_sub(
-            crate::data_alloc_lane::lane_capacity_blocks(
-                self.capacity_blocks.load(Ordering::Relaxed),
-                lanes.part.writers(),
-                lane,
-            )
-            .saturating_mul(self.chunk_size),
-            Ordering::Relaxed,
-        );
-        log::warn!(
-            "lane {lane} ADOPTED on volume '{}' under {proof} (its holder is proven dead): its \
-             free blocks and virgin share are now allocatable here — alloc_lanes_owned={}",
-            self._volume_id,
-            owned.count_ones()
-        );
-        true
-    }
-
-    /// Free blocks this mount can never hand out because they belong to
-    /// lanes it does not own — the number the ENOSPC refusal prints, and
-    /// what an operator reads when "the device has space but writes fail".
-    /// `0` when unpartitioned. On an authority this is also the supply it
-    /// holds FOR its co-writers (`alloc_lane_supply_blocks`) — read off the
-    /// free set's maintained counts (plus the ≤ one-trim-batch window scan
-    /// the membership-exact owned count subtracts), never a free-list scan.
-    pub fn foreign_lane_free_blocks(&self) -> u64 {
-        if self.lanes.get().is_none() {
-            return 0;
-        }
-        (self.free_blocks.len() as u64).saturating_sub(self.free_blocks.lane_owned())
-    }
-
-    /// `true` ⇔ `block_idx` is in a lane this mount may mint in (always
-    /// `true` when unpartitioned — the shipped answer).
-    pub(crate) fn lane_is_ours(&self, block_idx: u64) -> bool {
-        match self.lanes.get() {
-            None => true,
-            Some(lanes) => {
-                let lane = crate::data_alloc_lane::block_lane_of(block_idx, lanes.part.writers());
-                lanes.owned.load(Ordering::Acquire) & (1u64 << lane) != 0
-            }
-        }
-    }
-
-    /// Raise the durable reservation so it covers `block_idx`, **before that
-    /// offset is handed to a caller**. One `await`ed commit per
-    /// [`crate::data_alloc_lane::reserve_grain_blocks`] fresh blocks **per
-    /// owned lane**; free-list reuse never reaches here (a freed index is
-    /// dominated by the derived floor, so it needs no new watermark) — which
-    /// is what keeps the rewrite hot path at zero reservation work.
-    ///
-    /// The frontier is a **dense** index bound, and a raise declares the same
-    /// bound for **every lane this mount owns** — so an adopted lane's future
-    /// holder also recovers above the indices we minted in it. One commit on
-    /// the shipped shape (a mount owns exactly its own lane); an adopting
-    /// mount pays one per adopted lane per grain, which is the price of
-    /// reaching a dead writer's space.
-    async fn reserve_lane_frontier(&self, block_idx: u64) -> Result<()> {
-        let Some(lanes) = self.lanes.get() else {
-            return Ok(());
-        };
-        if block_idx < lanes.reserved_upto.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let want = block_idx.saturating_add(lanes.grain).saturating_add(1);
-        let owned = lanes.owned.load(Ordering::Acquire);
-        match lanes.sink.get() {
-            Some(sink) => {
-                for lane in 0..lanes.part.writers() {
-                    if owned & (1u64 << lane) == 0 {
-                        continue;
-                    }
-                    sink(lane, want).await?;
-                    crate::fuse_client::METRICS
-                        .alloc_lane_reservations
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            None => {
-                // No durable sink (offline tools, unit fixtures): the
-                // frontier is RAM-only and recovery falls back to the
-                // derived floor — the pre-partition posture, stated rather
-                // than pretended.
-                log::debug!(
-                    "lane reservation for volume '{}' lane {} raised to {want} in RAM only (no \
-                     durable sink wired)",
-                    self._volume_id,
-                    lanes.part.writer_id()
-                );
-            }
-        }
-        lanes.reserved_upto.fetch_max(want, Ordering::AcqRel);
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------
     // DLM S5 + S9 — the OWNERSHIP-ACCOUNTING gate (pre-RC engineering spec
     // §6.8 item 1: "the write gate extended past metadata to cover the
     // block allocator, the reclaim queue, W1 and in-place overwrite, and
@@ -1528,12 +797,12 @@ impl BlockAllocator {
     /// |---|---|---|---|
     /// | writer | local | local | passes |
     /// | reader (S5) | none — EROFS at the FUSE door | none | refuses, `read_only_refusal` (unchanged text, unchanged sites) |
-    /// | co-writer (S9) | **yes**, under a granted custody lease — authorized at [`crate::data_custody::authorize_dma`], NOT here | none: the durable answer is the authority's `TREE_BLOCK_REFS` | refuses, `co_writer_refusal` — naming the data-plane allocation partition |
+    /// | armed writer, non-holder of the volume's allocation lease | **yes**, under a granted custody lease — authorized at [`crate::data_custody::authorize_dma`], NOT here | none: the durable answer is the holder's bitmap + `TREE_BLOCK_REFS` | refuses, `lease_refusal` |
     ///
     /// The distinction that makes this coherent: a device offset's
-    /// OWNERSHIP is metadata, and metadata authority is what a co-writer
-    /// lacks. Writing bytes into an offset it was granted is a different
-    /// question, asked at a different door.
+    /// OWNERSHIP is metadata, and metadata authority over the volume's
+    /// allocation is what a non-holder lacks. Writing bytes into an offset
+    /// it was granted is a different question, asked at a different door.
     ///
     /// **Under the ARMED symmetric plane the gate keys on a held LEASE**
     /// (design-symmetric-metadata §7.3, PR 12 — "`plane_gate` keys on 'do
@@ -1561,27 +830,13 @@ impl BlockAllocator {
         }
         if let Some(vol_tag) = self.block_grant_vol_tag() {
             if crate::meta_backend::kv::alloc_lease::holding(vol_tag).is_none()
-                && !crate::cowriter::authority_accounting_scope_active()
+                && !crate::shipped_free::authority_accounting_scope_active()
             {
                 let e = crate::fuse_client::lease_refusal(what, vol_tag);
                 log::error!("{e}");
                 return Err(e);
             }
             return Ok(());
-        }
-        // DLM S9 free path: the scope probe runs only INSIDE the co-writer
-        // branch (a write mount never pays it). It marks the ONE venue that
-        // legitimately runs this gate's arms while the process latch says
-        // co-writer — the shipped-free EXECUTOR, i.e. the authority's own
-        // accounting act for the set (`crate::cowriter::
-        // with_authority_accounting`; in production the authority's posture
-        // is `writer` and the probe never fires).
-        if crate::fuse_client::co_writer_mount()
-            && !crate::cowriter::authority_accounting_scope_active()
-        {
-            let e = crate::fuse_client::co_writer_refusal(what);
-            log::error!("{e}");
-            return Err(e);
         }
         Ok(())
     }
@@ -1595,7 +850,7 @@ impl BlockAllocator {
     /// this data volume answers `false` and the W1 ladders DECLINE
     /// upstream as the counted `patch_ineligible_posture` decision —
     /// before `begin_patch_sole_owner` can reach the gate's refusal, one
-    /// ERROR + one `cowriter_accounting_refusals` per eligible overwrite
+    /// ERROR + one `accounting_plane_refusals` per eligible overwrite
     /// (the sym-walls rewrite row on N = 7 joiners). Every unarmed
     /// allocator answers `true` (the posture-word arms are the shipped
     /// ladders' own clauses).
@@ -1604,55 +859,21 @@ impl BlockAllocator {
         match self.block_grant_vol_tag() {
             Some(vol_tag) => {
                 crate::meta_backend::kv::alloc_lease::holding(vol_tag).is_some()
-                    || crate::cowriter::authority_accounting_scope_active()
+                    || crate::shipped_free::authority_accounting_scope_active()
             }
             None => true,
         }
     }
 
-    /// [`Self::plane_gate`] for the **ALLOCATION** arms only (DLM S9 blocker
-    /// #3's admission — `docs/design-mw-data-alloc-partition.md`,
-    /// `crate::alloc_lane_grant`).
-    ///
-    /// A reader is refused exactly as before, with its own text and at every
-    /// site. A **co-writer with an engaged lane** now PASSES, and nothing else
-    /// about its posture moved:
-    ///
-    /// | Arm | Co-writer | Why |
-    /// |---|---|---|
-    /// | fresh allocation / free-list reuse / the two picks | **allowed with a lane** | its lane is a residue class no other writer mints in, and the durable reservation covering the offset is committed by the authority BEFORE the hand-out ([`Self::hand_out_reserved`]) |
-    /// | the same, with NO lane | refused, unchanged | without a lane there is no disjointness: this mount's cursor and free list are a private opinion about shared hardware |
-    /// | terminal free / `free_block` | refused, unchanged | a free's durable effect is the authority's `TREE_BLOCK_REFS` delete, and the device reclaim that follows is ceased on this posture |
-    /// | `allocate_specific_block` | refused, unchanged | deliberately lane-BLIND (a clone/recovery path naming an index it already owns durably), which on a co-writer means claiming an offset in a lane it may not hold |
-    /// | the W1 incarnation retire | refused, unchanged | it retires a LIFETIME, which is durable ownership state (§6.2 item 6) |
-    /// | the ownership recovery walk | refused, unchanged | it declares gaps free from the tree it happened to see |
-    ///
-    /// Keyed on the ALLOCATOR's lane rather than on a mount-wide word, and
-    /// that is not a drift from `plane_gate`'s "the posture is the MOUNT's"
-    /// discipline: the mount-wide partition
-    /// ([`crate::data_alloc_lane::mount_partition`]) is what a lane is
-    /// engaged FROM, and this asks the narrower question the allocation arm
-    /// actually needs — *is THIS volume's index space partitioned for me* —
-    /// which is per-volume state by construction (each volume engages its
-    /// own).
-    ///
-    /// **Armed (PR 12)**: the allocation plane's lease is the GRANT WINDOW
-    /// — a grant-armed allocator mints from ranges its data volume's
-    /// holder carved (PR 8), so the arm passes on the arm's existence and
-    /// asks the posture word nothing; the posture arms below are the
-    /// unarmed allocator's, byte-identical.
+    /// [`Self::plane_gate`] for the **ALLOCATION** arms only: a reader is
+    /// refused with its own text at every site; every writer allocates —
+    /// on a grant-armed allocator from the ranges its data volume's holder
+    /// carved (PR 8), else from its own cursor and free list (the
+    /// `--single-writer` volume's shipped loop).
     #[inline]
     fn alloc_plane_gate(&self, what: &str) -> Result<()> {
         if crate::fuse_client::read_only_mount() {
             let e = crate::fuse_client::read_only_refusal(what);
-            log::error!("{e}");
-            return Err(e);
-        }
-        if self.block_grant_armed() {
-            return Ok(());
-        }
-        if crate::fuse_client::co_writer_mount() && self.lanes.get().is_none() {
-            let e = crate::fuse_client::co_writer_refusal(what);
             log::error!("{e}");
             return Err(e);
         }
@@ -1825,28 +1046,13 @@ impl BlockAllocator {
     /// The never-minted (virgin) tail in bytes — the KD-4.6 watermark's
     /// derivation input. Unbounded allocators (capacity 0: offline
     /// tools / tests) report an infinite tail: pressure never fires.
-    ///
-    /// DLM S9: under an engaged partition only the OWNED lanes' share of
-    /// that tail is this mount's to mint, so the answer is scaled by the
-    /// owned-lane count. Reporting the dense tail would tell the discard
-    /// watermark there is `W`× more virgin supply than this writer can
-    /// reach — the same class of lie the stranded-capacity gauge exists to
-    /// prevent.
     pub fn virgin_bytes(&self) -> u64 {
         let cap = self.capacity_blocks.load(Ordering::Relaxed);
         if cap == 0 {
             return u64::MAX;
         }
         let cursor = self.highest_block.load(Ordering::Relaxed).min(cap);
-        let tail = cap - cursor;
-        let tail = match self.lanes.get() {
-            None => tail,
-            Some(lanes) => {
-                let owned = lanes.owned.load(Ordering::Acquire).count_ones() as u64;
-                tail / u64::from(lanes.part.writers()) * owned
-            }
-        };
-        tail.saturating_mul(self.chunk_size)
+        (cap - cursor).saturating_mul(self.chunk_size)
     }
 
     /// Trim claim (KD-4.4): take `offset` OUT of the free list — the
@@ -2011,51 +1217,20 @@ impl BlockAllocator {
         self.free_blocks.len() as u64
     }
 
-    /// The LANE-OWNED free-list population (sustain campaign KD-FG-10 —
-    /// membership-exact: a block inside a trim claim window is not
-    /// listed; equals `free_blocks_count` on unpartitioned mounts). The
-    /// drift contract asserts it against the C6-style per-lane recount.
-    pub fn lane_owned_free_blocks(&self) -> u64 {
-        self.free_blocks.lane_owned()
-    }
-
-    /// The free-listed population of one lane (finding 15 term 2 — the
-    /// lane-supply hint's input): on an authority, lane `w`'s count is the
-    /// supply released to co-writer `w` that its next harvest RPC will
-    /// take. 0 unpartitioned.
-    pub fn lane_free_count(&self, lane: u16) -> u64 {
-        self.free_blocks.lane_count(lane)
-    }
-
-    /// This volume's durable tag (the lane-visible ledger's key half).
-    fn vol_tag(&self) -> u64 {
-        crate::meta_backend::kv::block_refs::volume_tag(&self._volume_id)
-    }
-
-    /// Publish one grace-released offset to the free list and, when it is
-    /// a co-writer's (a lane this mount does not own), mark its release
-    /// for the lane-visible ledger (`alloc_lane_visible_phase_ns`): the
-    /// block now waits on THIS list for that co-writer's harvest RPC.
+    /// Publish one grace-released offset to the free list.
     fn publish_grace_release(&self, offset: u64) {
         self.publish_free_list(offset);
-        let idx = offset / self.chunk_size;
-        if self.lanes.get().is_some() && !self.lane_is_ours(idx) {
-            crate::free_grace::mark_lane_release(self.vol_tag(), idx);
-        }
     }
 
-    /// **The lane-reachable supply** (design-free-grace-sustain §5.4/§8):
-    /// exactly `allocate_block`'s own reachable set — the lane-owned
-    /// free-list population, the lane-owned blocks inside an open trim
-    /// claim window (KD-4.4: the funnel parks on the window's return edge,
-    /// so they are pending supply — `.benchmarks/2026-09-08-placement-
-    /// refresh-race.md`), plus the lane-scoped virgin remainder
-    /// (`virgin_bytes` already divides by the partition width). This is
-    /// the quantity that troughs on a recycle-bound stream; the
-    /// passed-global `free_supply_blocks` accumulates foreign-lane
-    /// releases and provably never did on the motivating row.
-    /// `u64::MAX` on an unbounded allocator (space is not a constraint).
-    pub fn lane_reachable_blocks(&self) -> u64 {
+    /// **The reachable supply** (design-free-grace-sustain §5.4/§8):
+    /// exactly `allocate_block`'s own reachable set — the free-list
+    /// population, the blocks inside an open trim claim window (KD-4.4:
+    /// the funnel parks on the window's return edge, so they are pending
+    /// supply — `.benchmarks/2026-09-08-placement-refresh-race.md`), plus
+    /// the virgin remainder; on a grant-armed allocator the window's
+    /// remainder plus the holder's clear population. `u64::MAX` on an
+    /// unbounded allocator (space is not a constraint).
+    pub fn reachable_free_blocks(&self) -> u64 {
         if let Some(armed) = self.grant_supply_blocks() {
             return armed;
         }
@@ -2063,42 +1238,7 @@ impl BlockAllocator {
         if virgin == u64::MAX {
             return u64::MAX;
         }
-        (virgin / self.chunk_size).saturating_add(self.free_blocks.reachable_owned())
-    }
-
-    /// **Lane-governed placement** (`.benchmarks/2026-09-07-cowriter-lane-
-    /// aware-placement.md`): `true` ⇔ this is a laned CO-WRITER's allocator
-    /// — a partition engaged AND the lane free harvest wired (only the
-    /// co-writer engagement wires it, `alloc_lane_grant::
-    /// engage_allocator_lane`) — with `SQUEEZEFS_COWRITER_LANE_PLACEMENT`
-    /// on. The §5.9 placement table then weighs this volume by its
-    /// lane-reachable supply instead of the device fill, and the write
-    /// path's allocation fails over to a sibling before it parks. Every
-    /// single-writer and authority allocator answers `false` in one
-    /// `OnceLock` probe, which is what keeps their placement byte-identical.
-    pub fn lane_placement_governed(&self) -> bool {
-        match self.lanes.get() {
-            Some(lanes) if lanes.harvest.get().is_some() => cowriter_lane_placement_enabled(),
-            _ => false,
-        }
-    }
-
-    /// The blocks of this device the owned lanes hold in total (the
-    /// lane-reachable supply's denominator — `lane_reachable_blocks ×
-    /// 1000 ÷ lane_share_blocks` is the lane-governed placement weight).
-    /// 0 unpartitioned or unbounded.
-    pub fn lane_share_blocks(&self) -> u64 {
-        let Some(lanes) = self.lanes.get() else {
-            return 0;
-        };
-        let cap = self.capacity_blocks.load(Ordering::Relaxed);
-        let owned = lanes.owned.load(Ordering::Acquire);
-        (0..lanes.part.writers())
-            .filter(|lane| owned & (1u64 << lane) != 0)
-            .map(|lane| {
-                crate::data_alloc_lane::lane_capacity_blocks(cap, lanes.part.writers(), lane)
-            })
-            .fold(0u64, u64::saturating_add)
+        (virgin / self.chunk_size).saturating_add(self.free_blocks.reachable())
     }
 
     /// PR VL6b (design-volume-lifecycle §5.6a, C3 **recount-and-set** /
@@ -2139,14 +1279,6 @@ impl BlockAllocator {
         let mut frees_completed = 0u64;
         let mut free_list_evictions = 0u64;
         for idx in 0..highest {
-            // DLM S9: a foreign lane's index is not this writer's to
-            // reconcile. Under a partition the dense cursor spans peers'
-            // indices, and "untracked and not free-listed" is the NORMAL
-            // state of a peer's live block here — completing its free would
-            // publish another writer's block into this one's free list.
-            if !self.lane_is_ours(idx) {
-                continue;
-            }
             let offset = idx * self.chunk_size;
             let tracked = self.refcounts.read_sync(&offset, |_, _| ()).is_some();
             let free_listed = self.free_blocks.contains(&idx);
@@ -2337,56 +1469,6 @@ impl BlockAllocator {
         }
     }
 
-    /// **The served publish's DMA witness for a FOREIGN-lane offset**
-    /// (finding 51, `.benchmarks/2026-09-07-read-settle-lost-serialized-
-    /// authority.md`): the authority just committed a peer's layout publish
-    /// that binds `block_idx`, so the peer's device write behind it is
-    /// complete (a co-writer publishes strictly after its DMA) — publish
-    /// this allocator's word for the offset exactly as the local writer's
-    /// DMA-complete [`Self::publish_block`] would. Returns `true` ⇔ the
-    /// word was published.
-    ///
-    /// Why the authority needs it: the incarnation seqlock is per PROCESS.
-    /// A co-writer's displaced block is freed THROUGH the authority
-    /// ([`Self::begin_free`] retires the authority's word), returns to the
-    /// lane's supply, is harvested by the co-writer and minted again — and
-    /// the co-writer's own `publish_block` stabilizes the co-writer's word,
-    /// never this one. The authority can never claim a foreign-lane
-    /// offset, so without this witness its word stayed retired for ever
-    /// and every later fill of the recycled key failed validation: the
-    /// s11-mpiio row's 326 `read_settle_lost_serialized` tripwires and 101
-    /// fsync EIOs, every one a co-writer block the authority had freed once.
-    ///
-    /// The two edges it keeps: between the authority's free of the offset
-    /// and this witness the word stays RETIRED (a straggler fill of the
-    /// dead lifetime during the co-writer's DMA must not publish into the
-    /// authority's tiers — the seqlock's whole purpose), and an OWN-lane
-    /// offset is never touched (`false`): its word belongs to the local
-    /// claim → DMA → publish protocol, and a peer's publish naming one is
-    /// either a clone of a block already stable or a stale view the compose
-    /// dropped. Unpartitioned allocators own every lane, so a solo mount
-    /// never reaches the publish.
-    ///
-    /// What it does NOT touch — the cell's lifetime STAMP (`live_incarnation`,
-    /// the number `incarnation_ok` compares a key's `@stamp` against). The
-    /// seqlock word and the stamp are two fields: this publishes the word's
-    /// stable bit and leaves the stamp exactly as the authority's own mints
-    /// (`claim_block_idx`) or the mount walk (`seed_incarnation`) left it —
-    /// for a foreign-lane offset on a fresh fleet that is `INCARNATION_NONE`,
-    /// which `incarnation_ok` reads as "unknown, accept" (§6.3) before and
-    /// after this witness. The phase-B1 `STALE BLOCK-KEY BINDING` storm
-    /// (`.benchmarks/2026-09-07-read-settle-lost-serialized-authority.md`
-    /// §8) was therefore never this function's: every refused offset was
-    /// LANE 0 — the authority's own mints, whose stamps this function never
-    /// reaches (`lane_is_ours` returns before the publish).
-    pub fn witness_served_binding(&self, block_idx: u64) -> bool {
-        if self.lane_is_ours(block_idx) {
-            return false;
-        }
-        self.publish_block(block_idx.saturating_mul(self.chunk_size));
-        true
-    }
-
     /// Snapshot the incarnation word for a fill. `None` while unstable
     /// (in-flight write or retired/free) — the fill must not publish. Offsets
     /// with no recorded incarnation (written before this process / by another
@@ -2461,8 +1543,7 @@ impl BlockAllocator {
     }
 
     // -----------------------------------------------------------------
-    // DLM S9 — the co-writer FREE path's two allocator seams
-    // (`crate::cowriter`; contracts tests/mw_cowriter_free_tests.rs).
+    // The shipped-free wire's allocator seams (`crate::shipped_free`).
     // -----------------------------------------------------------------
 
     /// `true` ⇔ `block_idx` is on the free list — the shipped-free
@@ -2475,19 +1556,17 @@ impl BlockAllocator {
     }
 
     /// **Seed ONE reference for a peer-minted block whose terminal free
-    /// this authority is about to execute** (the shipped-free executor's
-    /// untracked arm): the co-writer minted the offset in its own lane, so
-    /// this allocator never tracked it — and `begin_free`'s untracked
-    /// refusal (correct everywhere else: it is the double-release
-    /// tripwire) would otherwise refuse a legitimate first release.
+    /// this holder is about to execute** (the shipped-free executor's
+    /// untracked arm): the peer minted the offset from its grant, so this
+    /// allocator never tracked it — and `begin_free`'s untracked refusal
+    /// (correct everywhere else: it is the double-release tripwire) would
+    /// otherwise refuse a legitimate first release.
     ///
     /// Deliberately NOT [`Self::recover_block`]: its gap-filling arm
-    /// free-lists every index between the cursor and the target, and on a
-    /// partitioned device those gaps are LIVE PEERS' residue classes —
-    /// declaring a live co-writer's minted-but-unpublished tail "free" is
-    /// exactly the §3.1 zombie window the lane reservation exists to
-    /// close. This seeds the one entry and nothing else: no cursor move,
-    /// no gap fill.
+    /// free-lists every index between the cursor and the target, and those
+    /// gaps are LIVE PEERS' granted ranges — declaring a live writer's
+    /// minted-but-unpublished tail "free" is the §3.1 zombie window. This
+    /// seeds the one entry and nothing else: no cursor move, no gap fill.
     ///
     /// `true` ⇔ seeded; `false` ⇔ an entry already exists (a racing seed
     /// or a live count — the caller's `begin_free` arbitrates).
@@ -2497,625 +1576,9 @@ impl BlockAllocator {
             .is_ok()
     }
 
-    /// **Claim one free-listed block for a lane-harvest handout** (rung 10,
-    /// residual 2 — the AUTHORITY side of
-    /// [`crate::cowriter::execute_lane_harvest`]): remove it from this
-    /// allocator's free list so no path here can ever hand it out again —
-    /// the receiving lane holder is its one next owner. Free-list
-    /// membership already implies not-quarantined / not-graced /
-    /// not-inflight (quarantine admission and the grace ring both pull
-    /// offsets OUT of the list), which is the same invariant
-    /// `try_allocate_block` stands on. The claim-cancels-debt law applies
-    /// (KD-4.3): the new owner's write-before-publish rewrites the range,
-    /// so it owes no discard. `true` ⇔ this call won the removal.
-    pub fn take_free_for_lane_grant(&self, block_idx: u64) -> bool {
-        if self.free_blocks.remove(&block_idx).is_none() {
-            return false;
-        }
-        self.cancel_elided_debt(block_idx * self.chunk_size);
-        true
-    }
-
-    /// **Adopt a lane-free grant** (rung 10 — the CO-WRITER side): insert
-    /// harvested block indices into this mount's own free list, where the
-    /// ordinary free-list-first allocation funnel serves them back with the
-    /// full claim discipline (refcount, fresh incarnation — the co-writer's
-    /// own lane-partitioned minter, so the new lifetime stamp can collide
-    /// with nobody's). A foreign-lane index is refused loud (the authority
-    /// mis-serving a lane is exactly the collision the partition forbids);
-    /// a duplicate is refused loud (a double handout is the two-owners
-    /// lineage). Returns the count adopted. The untagged form (grant
-    /// sequence 0 — a lifetime no lane-free notice can ever be ordered
-    /// after); the harvest RPC adopts through
-    /// [`Self::adopt_lane_free_grant_at`].
-    pub fn adopt_lane_free_grant(&self, block_idxs: &[u64]) -> u64 {
-        self.adopt_lane_free_grant_at(block_idxs, 0)
-    }
-
-    /// [`Self::adopt_lane_free_grant`] under the authority's per-client
-    /// `grant_seq` (publish schema 16): every adopted block is tagged with
-    /// it BEFORE it reaches the free list, so a lane-free notice whose
-    /// `after_grants` is below the tag is recognised as naming the offset's
-    /// PREVIOUS lifetime — the one this grant replaced — and touches
-    /// nothing ([`Self::apply_lane_free_notice`]). A tag of 0 records
-    /// nothing.
-    pub fn adopt_lane_free_grant_at(&self, block_idxs: &[u64], grant_seq: u64) -> u64 {
-        let mut adopted = 0u64;
-        for idx in block_idxs {
-            if !self.lane_is_ours(*idx) {
-                log::error!(
-                    "refusing to adopt harvested block {idx} on volume '{}': its lane is not \
-                     this mount's — a mis-served harvest would mint two owners for one offset",
-                    self._volume_id
-                );
-                continue;
-            }
-            if grant_seq != 0 {
-                match self.harvest_grants.entry_sync(*idx) {
-                    scc::hash_map::Entry::Occupied(mut occ) => *occ.get_mut() = grant_seq,
-                    scc::hash_map::Entry::Vacant(vac) => {
-                        let _ = vac.insert_entry(grant_seq);
-                    }
-                }
-            }
-            if !self.free_blocks.insert(*idx) {
-                log::error!(
-                    "refusing to adopt harvested block {idx} on volume '{}': it is already on \
-                     this mount's free list — the double-handout lineage",
-                    self._volume_id
-                );
-                continue;
-            }
-            adopted += 1;
-        }
-        if adopted > 0 {
-            let m = &crate::fuse_client::METRICS;
-            m.alloc_lane_harvested_blocks
-                .fetch_add(adopted, Ordering::Relaxed);
-            // §5.5: the adoption pays the owed ledger down (clamped — the
-            // ENOSPC path can adopt supply the ledger never counted, e.g.
-            // frees shipped before this binary), mirroring the actually
-            // subtracted amount into the process sum gauge.
-            let paid = loop {
-                let owed = self.lane_owed.load(Ordering::Acquire);
-                let pay = owed.min(adopted);
-                if self
-                    .lane_owed
-                    .compare_exchange(owed, owed - pay, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    break pay;
-                }
-            };
-            if paid > 0 {
-                m.alloc_lane_owed_blocks.fetch_sub(paid, Ordering::Relaxed);
-            }
-        }
-        adopted
-    }
-
-    /// §5.5 (the owed ledger's increment): `n` of this mount's shipped
-    /// displaced frees came back `Freed` — the authority's list now holds
-    /// supply this mount is owed. Called by
-    /// `crate::cowriter::ship_displaced_frees` per acknowledged group —
-    /// the explicit-ship arm ONLY (see the `lane_owed` field doc).
-    pub fn note_owed_freed(&self, n: u64) {
-        if n == 0 {
-            return;
-        }
-        self.lane_owed.fetch_add(n, Ordering::AcqRel);
-        self.owed_arrivals.fetch_add(1, Ordering::Release);
-        crate::fuse_client::METRICS
-            .alloc_lane_owed_blocks
-            .fetch_add(n, Ordering::Relaxed);
-    }
-
-    /// **The supply witness generation** — the single-flight harvest's
-    /// decline compares on it: the sum of two monotonic arrival counts,
-    /// the grants that moved the authority's advertisement of THIS
-    /// VOLUME's lane supply ([`crate::free_grace::lane_supply_hint_gen_for`]
-    /// — a nonzero advertisement of it, or a grant that did not name it;
-    /// the mount-wide arrival count under `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT=0`)
-    /// and this allocator's owed `Freed` arrivals. Either moving moves the
-    /// sum; neither moving means the authority has told this mount nothing
-    /// new about its lane's supply ON THIS VOLUME, so a fresh empty
-    /// harvest reply still stands — a grant that only moved the sibling's
-    /// share re-arms no RPC here
-    /// (`.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`).
-    fn supply_witness_gen(&self) -> u64 {
-        crate::free_grace::lane_supply_hint_gen_for(self.vol_tag())
-            .wrapping_add(self.owed_arrivals.load(Ordering::Acquire))
-    }
-
-    /// Blocks this mount's SHIPPED frees left on the authority's free list
-    /// (§5.5 — the explicit-ship arm's face, see the `lane_owed` field doc).
-    pub fn lane_owed_blocks(&self) -> u64 {
-        self.lane_owed.load(Ordering::Acquire)
-    }
-
-    /// The authority's advertised lane supply ON THIS VOLUME — the grant
-    /// vector's entry for it ([`crate::free_grace::lane_supply_hint_for`]),
-    /// the mount sum when no vector names it or under
-    /// `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT=0`.
-    fn lane_supply_hint(&self) -> u64 {
-        crate::free_grace::lane_supply_hint_for(self.vol_tag())
-    }
-
-    /// The refill's supply witness for this allocator: the authority's
-    /// advertised lane supply on this volume (`lane_supply_hint_for`)
-    /// or this allocator's owed word
-    /// ([`crate::free_grace::lane_supply_witnessed`]).
-    fn lane_supply_witnessed(&self) -> bool {
-        crate::free_grace::lane_supply_witnessed(
-            self.lane_supply_hint(),
-            self.lane_owed.load(Ordering::Acquire),
-        )
-    }
-
-    /// The hint-refill ledger (`alloc_lane_hint_refills`): a proactive
-    /// harvest fired with the owed word at 0 is one the retired owed gate
-    /// would have declined — the hint armed it.
-    fn note_proactive_harvest_witness(&self) {
-        if self.lane_owed.load(Ordering::Acquire) == 0 {
-            crate::fuse_client::METRICS
-                .alloc_lane_hint_refills
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// One refresh-floor beat, ms — the horizon's slack term (the reader's
-    /// own pass-cadence floor; §5.5's `+ one ack_refresh_floor`).
-    pub fn horizon_floor_ms(&self) -> u64 {
-        (crate::ro_coherence::reader_revalidate_interval().as_millis() as u64).max(1)
-    }
-
-    /// The member-local horizon derivation — OQ 2's FALLBACK (the
-    /// pre-first-reply state, a zero hint, and every refused reply):
-    /// `qualify_lag + drain_lag + 2 × refresh floor`, from the same
-    /// published numbers the ack ladder runs on (session clock terms when
-    /// a member session exists; the staleness bound alone otherwise).
-    fn fallback_horizon_ms(&self) -> u64 {
-        let staleness = crate::ro_coherence::reader_staleness_bound().as_millis() as u64;
-        let (skew, d_purge) = match crate::membership::installed_member() {
-            Some(s) => (s.skew_max_ms(), s.d_purge_ms()),
-            None => (0, staleness),
-        };
-        (staleness + skew) + (staleness + d_purge) + 2 * self.horizon_floor_ms()
-    }
-
-    /// §5.5 (OQ 2): deposit a harvest reply's horizon inputs. A nonzero
-    /// hint composes `hint + RTT + one refresh floor` and is COUNTED
-    /// (`alloc_lane_horizon_hints`); a zero hint (nothing held) clears the
-    /// word back to the derivation — a quiet ring is never over-trusted.
-    pub fn note_harvest_hint(&self, bound_age_hint_ms: u64, rtt_ms: u64) {
-        if bound_age_hint_ms == 0 {
-            self.horizon_composed_ms.store(0, Ordering::Relaxed);
-            return;
-        }
-        let composed = bound_age_hint_ms
-            .saturating_add(rtt_ms)
-            .saturating_add(self.horizon_floor_ms());
-        self.horizon_composed_ms.store(composed, Ordering::Relaxed);
-        let m = &crate::fuse_client::METRICS;
-        m.alloc_lane_horizon_hints.fetch_add(1, Ordering::Relaxed);
-        m.alloc_lane_harvest_horizon_ms
-            .store(composed, Ordering::Relaxed);
-    }
-
-    /// The refill horizon in force, ms: the composed measurement when a
-    /// hinted reply set one, the member-local derivation otherwise.
-    pub fn harvest_horizon_ms(&self) -> u64 {
-        match self.horizon_composed_ms.load(Ordering::Relaxed) {
-            0 => self.fallback_horizon_ms(),
-            v => v,
-        }
-    }
-
-    /// §5.5: fold one rate sample (claims since the last sample ÷ elapsed)
-    /// into the EWMA and re-derive the watermark —
-    /// `ceil(rate × horizon)` capped at lane-share/4. Called by the
-    /// ahead-refill task each tick (and by the contracts directly).
-    pub fn sample_alloc_rate(&self, now_ms: u64) {
-        let claims = self.alloc_claims.load(Ordering::Relaxed);
-        let last_ms = self.rate_last_sample_ms.swap(now_ms, Ordering::Relaxed);
-        let last_claims = self.rate_last_claims.swap(claims, Ordering::Relaxed);
-        if last_ms == 0 || now_ms <= last_ms {
-            return; // the first sample only seeds the snapshots
-        }
-        let dt_ms = now_ms - last_ms;
-        let inst_mblk = claims.saturating_sub(last_claims).saturating_mul(1_000_000) / dt_ms;
-        // EWMA α = 1/4: three parts memory, one part instant. The decay
-        // divides CEILING-wise so a quiet writer's rate reaches exactly 0
-        // (a floor division wedges the integer EWMA at 3 forever).
-        let old = self.rate_mblk_per_s.load(Ordering::Relaxed);
-        let ewma = old.saturating_sub(old.div_ceil(4)) + inst_mblk / 4;
-        self.rate_mblk_per_s.store(ewma, Ordering::Relaxed);
-        // watermark = ceil(rate × horizon), capped at lane-share/4 (the
-        // partitioned share; 0 unpartitioned — the task never runs there).
-        let Some(lanes) = self.lanes.get() else {
-            self.harvest_watermark.store(0, Ordering::Relaxed);
-            return;
-        };
-        let share = crate::data_alloc_lane::lane_capacity_blocks(
-            self.capacity_blocks.load(Ordering::Relaxed),
-            lanes.part.writers(),
-            lanes.part.writer_id(),
-        );
-        // blocks = (milli-blocks/s × ms) / 1e6; ceil so a slow-but-live
-        // writer keeps a nonzero watermark. A zero rate derives zero.
-        let horizon = self.harvest_horizon_ms();
-        let inflight = if ewma == 0 {
-            0
-        } else {
-            ewma.saturating_mul(horizon).div_ceil(1_000_000)
-        };
-        let want = inflight.min(share / 4);
-        self.harvest_watermark.store(want, Ordering::Relaxed);
-        let m = &crate::fuse_client::METRICS;
-        m.alloc_lane_harvest_watermark
-            .store(want, Ordering::Relaxed);
-        // The capacity law (hold-time campaign): the lane holds `live`
-        // blocks in use (its share less what is reachable here or owed
-        // back from the authority) and needs `churn × hold` more in flight
-        // through the grace loop; it exhausts exactly when the sum exceeds
-        // the share — the headroom is the published distance from that.
-        // The owed word is the explicit-ship arm's face (a per-allocator
-        // number); the mount-summed hint cannot enter a per-volume law, so
-        // `live` over-reads by the recomputed supply the authority holds.
-        let live = share.saturating_sub(self.lane_reachable_blocks() + self.lane_owed_blocks());
-        let needed = inflight.saturating_add(live);
-        let headroom_pct = if share == 0 {
-            0
-        } else {
-            share.saturating_sub(needed).saturating_mul(100) / share
-        };
-        self.share_needed_blocks.store(needed, Ordering::Relaxed);
-        self.headroom_pct.store(headroom_pct, Ordering::Relaxed);
-        m.alloc_lane_share_needed_blocks
-            .store(needed, Ordering::Relaxed);
-        m.alloc_lane_headroom_pct
-            .store(headroom_pct, Ordering::Relaxed);
-    }
-
-    /// The blocks this lane needs to sustain its churn through the grace
-    /// loop plus what it holds live (`alloc_lane_share_needed_blocks`;
-    /// 0 unpartitioned).
-    pub fn lane_share_needed_blocks(&self) -> u64 {
-        self.share_needed_blocks.load(Ordering::Relaxed)
-    }
-
-    /// `(share − needed) ÷ share` in percent, saturating at 0
-    /// (`alloc_lane_headroom_pct`; 0 unpartitioned).
-    pub fn lane_headroom_pct(&self) -> u64 {
-        self.headroom_pct.load(Ordering::Relaxed)
-    }
-
-    /// The derived watermark in force (blocks).
-    pub fn watermark_blocks(&self) -> u64 {
-        self.harvest_watermark.load(Ordering::Relaxed)
-    }
-
-    /// §5.5's decision: harvest ahead ⇔ the lever is armed, supply of this
-    /// lane is WITNESSED on the authority (the renewal grant's hint, or
-    /// this allocator's owed word — `lane_supply_witnessed`; never
-    /// the owed word alone, `.benchmarks/2026-09-07-lane-refill-hint-gate.md`),
-    /// and its lane-reachable stock sits below the watermark. `Some(ask)`
-    /// = the grain batch to request — the grain, never fewer (the serve is
-    /// bounded by what the authority holds, so a smaller ask against a
-    /// one-cadence-stale, mount-summed hint could only under-harvest);
-    /// `None` = nothing to do (no witness / stocked / quiet / lever off).
-    ///
-    /// The witness is THIS VOLUME's advertised share (the grant vector's
-    /// entry — `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`), so
-    /// a low volume the authority holds nothing for does not ask; under
-    /// `SQUEEZEFS_ALLOC_LANE_VOLUME_HINT=0` the mount sum stands in and
-    /// every low volume asks — the volume that got nothing has paid one
-    /// RTT, and its stock stays where the lane-aware placement can see it
-    /// (`.benchmarks/2026-09-07-cowriter-lane-aware-placement.md`).
-    pub fn should_harvest_ahead(&self) -> Option<u64> {
-        if !harvest_ahead_enabled() {
-            return None;
-        }
-        let lanes = self.lanes.get()?;
-        if !self.lane_supply_witnessed() {
-            return None;
-        }
-        let watermark = self.harvest_watermark.load(Ordering::Relaxed);
-        if watermark == 0 || self.lane_reachable_blocks() >= watermark {
-            return None;
-        }
-        Some(lanes.grain.max(1))
-    }
-
-    /// One ahead-refill tick (§5.5's background single-flight task body —
-    /// `crate::alloc_lane_grant` spawns one per laned co-writer
-    /// engagement): sample the rate, and when the decision fires run the
-    /// SAME harvest the ENOSPC arm runs (sink → adopt → hint deposit).
-    pub async fn ahead_refill_tick(&self, now_ms: u64) -> u64 {
-        self.sample_alloc_rate(now_ms);
-        let adopted = if self.should_harvest_ahead().is_some() {
-            crate::fuse_client::METRICS
-                .alloc_lane_ahead_harvests
-                .fetch_add(1, Ordering::Relaxed);
-            self.note_proactive_harvest_witness();
-            self.harvest_lane_supply().await
-        } else {
-            0
-        };
-        // After the harvest, so a grant that just restocked the lane reads
-        // as covered.
-        self.supply_close_tick().await;
-        adopted
-    }
-
-    /// **The supply-coupled epoch close's decision** (finding 15's
-    /// parked-supply term, design-rewrite-program §5.3 — the KD-1.7
-    /// early-close made AHEAD of the `StorageFull`): `Some(deficit)` when
-    /// the lever is on, this is a co-writer's lane with the close wired,
-    /// and the lane's reachable supply sits below the watermark — the same
-    /// `rate × horizon` threshold the ahead harvest fires on, i.e. the
-    /// blocks one loop transit consumes. The deficit `watermark −
-    /// reachable` is what the closes must yield to restore the lane to one
-    /// transit's cover (at exhaustion it IS the watermark), and it is the
-    /// per-tick bound: every close yields ≥ 1 block, so a tick never
-    /// publishes more epochs than blocks it is short (≤ share/4).
-    ///
-    /// `None` with `rewrite_shadow_supply_close_declined_covered` counted
-    /// when the lane covers its transit (a quiet writer's watermark decays
-    /// to 0 — nothing to protect); `None` uncounted when the lever is off
-    /// or the close is not wired (the shipped shape, byte-identical).
-    pub fn supply_close_deficit(&self) -> Option<u64> {
-        if !crate::routing::rewrite_supply_close_enabled() {
-            return None;
-        }
-        self.lanes.get()?.supply_close.get()?;
-        let watermark = self.harvest_watermark.load(Ordering::Relaxed);
-        let reachable = self.lane_reachable_blocks();
-        if watermark == 0 || reachable >= watermark {
-            crate::fuse_client::METRICS
-                .rewrite_shadow_supply_close_declined_covered
-                .fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-        Some(watermark - reachable)
-    }
-
-    /// Run the supply-coupled close for this tick's deficit (the sink
-    /// closes largest-first until the yield covers it). Returns the parked
-    /// blocks released; 0 = declined or nothing wired.
-    async fn supply_close_tick(&self) -> u64 {
-        let Some(deficit) = self.supply_close_deficit() else {
-            return 0;
-        };
-        let Some(sink) = self.lanes.get().and_then(|l| l.supply_close.get()) else {
-            return 0;
-        };
-        sink(deficit).await
-    }
-
-    /// **The PUSHED refill** (finding 15 term 2, the lane-push lever's
-    /// co-writer half): the authority's renewal grant said this lane has
-    /// supply on its list — harvest NOW, on the wake, instead of at the
-    /// next watermark tick (which a quiet lane's decayed rate turns dark)
-    /// or the next ENOSPC. The SAME harvest (sink → adopt → hint deposit);
-    /// the decision is
-    /// [`crate::free_grace::lane_push_wants_harvest_on_volume`] over THIS
-    /// VOLUME's advertised share (`lane_supply_hint_for` on its `vol_tag`): the hint
-    /// alone suffices (the owed word is the retired gate's witness), and a
-    /// DRY volume asks even when owed nothing — but a volume the authority
-    /// advertises 0 for does not, however large the sibling's share made
-    /// the mount sum (`alloc_lane_volume_hint_skips` counts the decisions
-    /// the sum would have fired: the empty RPCs the vector saves). Returns
-    /// the count adopted (0 = the decision declined, or an empty grant).
-    pub async fn pushed_refill_tick(&self, now_ms: u64) -> u64 {
-        self.sample_alloc_rate(now_ms);
-        if self.lanes.get().and_then(|l| l.harvest.get()).is_none() {
-            return 0;
-        }
-        let (owed, reachable, watermark) = (
-            self.lane_owed_blocks(),
-            self.lane_reachable_blocks(),
-            self.harvest_watermark.load(Ordering::Relaxed),
-        );
-        let adopted = if crate::free_grace::lane_push_wants_harvest_on_volume(
-            self.lane_supply_hint(),
-            owed,
-            reachable,
-            watermark,
-        ) {
-            crate::fuse_client::METRICS
-                .alloc_lane_pushed_harvests
-                .fetch_add(1, Ordering::Relaxed);
-            self.note_proactive_harvest_witness();
-            self.harvest_lane_supply().await
-        } else {
-            if crate::free_grace::lane_push_wants_harvest_on_volume(
-                crate::free_grace::lane_supply_hint(),
-                owed,
-                reachable,
-                watermark,
-            ) {
-                crate::fuse_client::METRICS
-                    .alloc_lane_volume_hint_skips
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            0
-        };
-        self.supply_close_tick().await;
-        adopted
-    }
-
-    /// **The lane free harvest** (rung 10): when this mount's lane is
-    /// exhausted, ask the authority for the lane's freed supply — the
-    /// offsets this mount's own shipped frees returned to "the free supply
-    /// of lane `b % W`", which live on the AUTHORITY's free list and are
-    /// reachable by nobody else. One sink call per exhaustion episode
-    /// (bounded by the reservation grain), adopted straight into the local
-    /// free list. Returns the count adopted; `0` when no partition, no
-    /// sink, or an empty supply — and errors are ABSORBED into `0` (the
-    /// caller's honest `StorageFull` stands; a harvest failure must never
-    /// mask the diagnosis).
-    /// Finding 29: does a RECLAIMABLE supply exist that a bounded
-    /// allocation should wait for? Two shapes: the local grace ring
-    /// (the authority's own displaced offsets), and — on a co-writer —
-    /// the REMOTE lane supply behind the harvest sink (its shipped
-    /// frees land on the authority's list/ring; each bounded retry's
-    /// `allocate_block` re-runs the harvest, whose serve-side pass 3
-    /// evaluates the pressure fence at the authority — once per grant
-    /// under the single-flight decline, not once per slice per parked
-    /// allocation). The field re-measure convicted the local-ring-only
-    /// condition: co-writer stalls parked ZERO times while their supply
-    /// sat remote.
-    ///
-    /// The remote shape needs EVIDENCE, not a wire: the harvest reply's
-    /// `bound_age_hint_ms` is the authority's live bound age — nonzero iff
-    /// its ring holds offsets a fence can still release (`0` = nothing
-    /// held, no plane, or nothing owed). `harvest_lane_supply` deposits
-    /// every reply's hint before the verdict, so the word read here is
-    /// this pass's. The sink's mere presence made every exhausted
-    /// co-writer allocation park (the 2026-09-05 s11 fleet wedge).
-    pub(crate) fn reclaimable_supply_exists(&self) -> bool {
-        if !self.grace.is_empty() {
-            return true;
-        }
-        self.lanes.get().is_some_and(|l| l.harvest.get().is_some())
-            && self.horizon_composed_ms.load(Ordering::Relaxed) != 0
-    }
-
-    ///
-    /// **Single-flight per allocator** (finding 15 phase B1,
-    /// `SQUEEZEFS_ALLOC_LANE_HARVEST_SINGLE_FLIGHT`, default on): every
-    /// caller — an ENOSPC-path allocation, a parked retry, the ahead or
-    /// pushed tick — goes through [`HarvestFlight`]: one RPC in flight,
-    /// concurrent callers join its outcome (`alloc_lane_harvest_coalesced`)
-    /// and retry their own funnel against the refilled list, and a fresh
-    /// EMPTY reply declines re-issue (`alloc_lane_harvest_declined_stale`)
-    /// until the supply witness moves ([`Self::supply_witness_gen`]). A
-    /// joiner's wait is bounded by the park wall
-    /// ([`crate::free_grace::pressure_park_wall_ms`]): past it the joiner
-    /// takes its verdict with `0`, so no parked allocation waits longer
-    /// than it would have on its own RPC. `alloc_lane_harvests` stays the
-    /// RPC count, so `harvests + coalesced + declined_stale` accounts for
-    /// every would-be call. Lever off = [`Self::issue_lane_harvest`] per
-    /// caller, the shipped shape verbatim.
-    async fn harvest_lane_supply(&self) -> u64 {
-        let Some(lanes) = self.lanes.get() else {
-            return 0;
-        };
-        let Some(sink) = lanes.harvest.get() else {
-            return 0;
-        };
-        if !harvest_single_flight_enabled() {
-            return self
-                .issue_lane_harvest(lanes.grain, sink)
-                .await
-                .unwrap_or(0);
-        }
-        let flight = &lanes.flight;
-        let m = &crate::fuse_client::METRICS;
-        // The decline: the last reply was EMPTY and nothing the authority
-        // advertises has moved since — a wire trip would return the same
-        // answer. Read BEFORE the CAS so a leader's stamp names the witness
-        // its reply answered; a grant landing mid-flight makes the stamp
-        // stale at once (one conservative extra RPC, never a missed one).
-        let witness = self.supply_witness_gen();
-        if flight.empty_at_witness.load(Ordering::Acquire) == witness {
-            m.alloc_lane_harvest_declined_stale
-                .fetch_add(1, Ordering::Relaxed);
-            return 0;
-        }
-        let done0 = flight.done_gen.load(Ordering::Acquire);
-        if flight
-            .inflight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            // The leader: one RPC, the outcome published to every joiner.
-            let outcome = self.issue_lane_harvest(lanes.grain, sink).await;
-            let adopted = outcome.unwrap_or(0);
-            flight.empty_at_witness.store(
-                if outcome == Some(0) {
-                    witness
-                } else {
-                    u64::MAX
-                },
-                Ordering::Release,
-            );
-            flight.last_adopted.store(adopted, Ordering::Release);
-            flight.done_gen.fetch_add(1, Ordering::AcqRel);
-            flight.inflight.store(false, Ordering::Release);
-            flight.notify.notify_waiters();
-            return adopted;
-        }
-        // A joiner: register FIRST (`notified()` registers at creation),
-        // then re-read the generation — a leader that finished between
-        // the failed CAS and the registration already moved it; one that
-        // finishes later wakes the registered waiter.
-        m.alloc_lane_harvest_coalesced
-            .fetch_add(1, Ordering::Relaxed);
-        let woken = flight.notify.notified();
-        if flight.done_gen.load(Ordering::Acquire) == done0 {
-            let wall = crate::free_grace::pressure_park_wall_ms();
-            if squeezefs_ipc::sqz_time::timeout(std::time::Duration::from_millis(wall), woken)
-                .await
-                .is_err()
-            {
-                // The leader's RPC outlived the wall: take the verdict now
-                // (the caller's park refuses at the same wall it always
-                // did); the leader's own outcome is untouched.
-                return 0;
-            }
-        }
-        flight.last_adopted.load(Ordering::Acquire)
-    }
-
-    /// **One harvest RPC** (the wire act [`Self::harvest_lane_supply`]
-    /// single-flights): ask the sink for a grain, deposit the reply's
-    /// horizon hint, adopt the blocks, stamp the lane-visible ledger.
-    /// `Some(adopted)` on a reply (`Some(0)` = the authority holds nothing
-    /// of this lane right now — an ANSWER, the decline's input); `None` on
-    /// a failure, which is absorbed into the caller's `0` (the honest
-    /// `StorageFull` stands; a harvest failure must never mask the
-    /// diagnosis) and stamps no decline.
-    async fn issue_lane_harvest(
-        &self,
-        grain: u64,
-        sink: &crate::data_alloc_lane::LaneHarvestSink,
-    ) -> Option<u64> {
-        crate::fuse_client::METRICS
-            .alloc_lane_harvests
-            .fetch_add(1, Ordering::Relaxed);
-        match sink(grain.max(1)).await {
-            Ok(harvest) => {
-                // OQ 2: every harvest reply refreshes the refill horizon —
-                // the measured loop latency plus this trip's own RTT.
-                self.note_harvest_hint(harvest.bound_age_hint_ms, harvest.rtt_ms);
-                let adopted = self.adopt_lane_free_grant_at(&harvest.blocks, harvest.grant_seq);
-                // The lane-visible ledger's co-writer half (finding 15
-                // term 2): each adopted block's wait on the authority's
-                // list (as the authority measured it) beside this trip's
-                // own round trip — the instant of adoption is the instant
-                // the allocator can mint it.
-                for age in &harvest.release_ages_ms {
-                    crate::free_grace::note_lane_visible(*age, harvest.rtt_ms);
-                }
-                Some(adopted)
-            }
-            Err(e) => {
-                log::warn!(
-                    "lane free harvest failed on volume '{}' ({e}) — the allocation verdict \
-                     stands (StorageFull if nothing else frees); the lane's supply stays on \
-                     the authority's list",
-                    self._volume_id
-                );
-                None
-            }
-        }
-    }
-
-    /// **Retire a co-writer's LOCAL view of a displaced block whose free
+    /// **Retire a writer's LOCAL view of a displaced block whose free
     /// SHIPPED and was answered `Freed`**
-    /// (`crate::cowriter::ship_displaced_frees`, after the authority's
+    /// (`crate::shipped_free::ship_displaced_frees`, after the authority's
     /// acknowledgement): drop the local refcount entry (the accounting
     /// lives on the authority now) and retire the local incarnation word,
     /// so a straggler validated fill of the dead binding fails its seqlock
@@ -3130,9 +1593,6 @@ impl BlockAllocator {
     /// [`Self::release_shipped_free_tracking`].
     pub fn retire_shipped_free_tracking(&self, offset: u64) {
         let _ = self.refcounts.remove_sync(&offset);
-        let _ = self
-            .harvest_grants
-            .remove_sync(&(offset / self.chunk_size.max(1)));
         self.mark_incarnation_unstable(offset);
         // Finding 30: restore stability under a NEW generation (the W1
         // patch-fence idiom) — the poison above already invalidated every
@@ -3164,51 +1624,7 @@ impl BlockAllocator {
             .unwrap_or(false);
         if drop_entry {
             let _ = self.refcounts.remove_sync(&offset);
-            let _ = self
-                .harvest_grants
-                .remove_sync(&(offset / self.chunk_size.max(1)));
         }
-    }
-
-    /// **Apply one lane-free notice** (publish schema 16 — the AUTHORITY
-    /// freed a block of this mount's lane through its OWN publish, a free no
-    /// served reply names: the assembler's fold of this mount's shipped
-    /// slices on the fleet). The offset's reference this mount held is gone
-    /// on the authority, so its local tracking releases — the
-    /// `retire_displaced_locally` decrement, never the incarnation word
-    /// (the notice precedes the ladder's verdict, and a NonTerminal block's
-    /// word must stay). The one guard is the LIFETIME: an offset whose
-    /// harvest-grant tag is ABOVE `after_grants` was re-minted here from a
-    /// grant the authority served after queuing the notice (the reply
-    /// carrying the notice was reordered behind the grant's) — the live
-    /// lifetime is touched by nobody.
-    pub fn apply_lane_free_notice(&self, block_idx: u64, after_grants: u64) -> LaneFreeNotice {
-        let offset = block_idx.saturating_mul(self.chunk_size);
-        let tag = self
-            .harvest_grants
-            .read_sync(&block_idx, |_, g| *g)
-            .unwrap_or(0);
-        if tag > after_grants {
-            log::debug!(
-                "lane-free notice for block {block_idx} on volume '{}' names a previous \
-                 lifetime (re-minted under grant {tag} > notice's {after_grants}); the live \
-                 lifetime is untouched",
-                self._volume_id
-            );
-            return LaneFreeNotice::ReMinted;
-        }
-        if self.refcount(offset).is_none() {
-            return LaneFreeNotice::Untracked;
-        }
-        self.release_shipped_free_tracking(offset);
-        LaneFreeNotice::Released
-    }
-
-    /// The harvest-grant tag block `block_idx`'s live lifetime carries
-    /// (`None` = a fresh mint or an untagged adoption) — the instrument the
-    /// notice pins read.
-    pub fn harvest_grant_tag(&self, block_idx: u64) -> Option<u64> {
-        self.harvest_grants.read_sync(&block_idx, |_, g| *g)
     }
 
     /// W1 patch fence, steps 1a+1b of the §5.1 mechanism (the normative
@@ -3250,7 +1666,7 @@ impl BlockAllocator {
         // whole-block twin in `try_inplace_rewrite`, and the dd shape
         // probe — the 2026-08-19 mw-fleet storm fix: this gate's
         // ERROR-per-attempt refusal fired per eligible overwrite and
-        // moved the `cowriter_accounting_refusals` tripwire), and a JOINED
+        // moved the `accounting_plane_refusals` tripwire), and a JOINED
         // appender under the armed plane declines the same way through
         // `holds_ownership_plane` (`SoleOwnerVerdict::NonHolder`, PR 13 —
         // the sym-walls rewrite row re-found the class on N = 7 joiners).
@@ -3471,15 +1887,7 @@ impl BlockAllocator {
         let cap = self.capacity_blocks.load(Ordering::Relaxed);
         loop {
             let cur = self.highest_block.load(Ordering::Relaxed);
-            let idx = match self.lanes.get() {
-                None => cur,
-                Some(lanes) => crate::data_alloc_lane::next_owned_index_at_or_above(
-                    cur,
-                    lanes.owned.load(Ordering::Acquire),
-                    lanes.part.writers(),
-                )
-                .unwrap_or(cur),
-            };
+            let idx = cur;
             if cap != 0 && idx >= cap {
                 return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
                     std::io::ErrorKind::StorageFull,
@@ -3497,88 +1905,6 @@ impl BlockAllocator {
                 return Ok(idx);
             }
         }
-    }
-
-    /// Enrich a `StorageFull` refusal with the lane diagnosis — *this lane is
-    /// out of blocks, N free blocks belong to other lanes, and the way to
-    /// reach them is a proven-dead lane adoption* (`docs/operations.md`
-    /// §Multi-writer capacity planning) — and count it.
-    ///
-    /// Runs **once per refused allocation**, at the single exit of
-    /// [`Self::allocate_block`], never inside `next_fresh_block`: the ENOSPC
-    /// pressure valve retries up to `ENOSPC_VALVE_MAX_ATTEMPTS` times, and
-    /// the free-list scan this performs is exactly the wrong thing to repeat
-    /// on a store whose free supply is large but foreign. The
-    /// [`std::io::ErrorKind::StorageFull`] class is preserved verbatim, so
-    /// the valve, the reclaim ladder and every caller behave identically.
-    fn refuse_lane_enospc(&self, e: crate::error::SqueezefsError) -> crate::error::SqueezefsError {
-        let Some(lanes) = self.lanes.get() else {
-            return e;
-        };
-        let foreign = self.foreign_lane_free_blocks();
-        crate::fuse_client::METRICS
-            .alloc_lane_enospc_refusals
-            .fetch_add(1, Ordering::Relaxed);
-        let msg = format!(
-            "{e} — lane {} of {} is exhausted while {foreign} free block(s) belong to lanes this \
-             mount does not own (alloc_lane_enospc_refusals; reach them by adopting a lane whose \
-             holder is proven dead, or grow the volume set — docs/operations.md §Multi-writer \
-             capacity planning)",
-            lanes.part.writer_id(),
-            lanes.part.writers()
-        );
-        // Finding 29: the bounded-allocation retries hit this refusal once
-        // per park slice — a storm wrote 30k identical lines per row. One
-        // loud line per second per allocator; the counter keeps the rate.
-        static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let last = LAST_LOG_MS.load(Ordering::Relaxed);
-        if now_ms.saturating_sub(last) >= 1_000
-            && LAST_LOG_MS
-                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            log::error!("{msg}");
-        } else {
-            log::debug!("{msg}");
-        }
-        crate::error::SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::StorageFull, msg))
-    }
-
-    /// The reservation gate between a claimed index and its caller (DLM S9
-    /// blocker #3): an offset is handed out only once the own lane's durable
-    /// watermark covers it, so no successor of this lane can re-mint it.
-    ///
-    /// `None` partition (every mount today) ⇒ one `OnceLock` probe and the
-    /// value straight through. A failed reservation **gives the offset
-    /// back** rather than handing out an un-covered one: nothing durable and
-    /// no device byte has touched it yet, which is exactly the
-    /// begin+finish-with-nothing-between contract [`Self::free_block`]
-    /// states.
-    async fn hand_out_reserved(&self, claimed: Result<u64>) -> Result<u64> {
-        let Ok(offset) = claimed else { return claimed };
-        if self.lanes.get().is_none() {
-            return Ok(offset);
-        }
-        if let Err(e) = self.reserve_lane_frontier(offset / self.chunk_size).await {
-            log::error!(
-                "returning freshly claimed offset {offset} on volume '{}': its lane reservation \
-                 could not be made durable ({e}) — handing out an unreserved offset would let a \
-                 successor of this lane mint it again (DLM S9)",
-                self._volume_id
-            );
-            // The give-back is co-writer-aware: a laned mount IS a
-            // co-writer, whose local free would refuse at the plane gate
-            // (loud, per offset). The un-covered offset abandons quietly —
-            // exactly the recovery the failed reservation implies: the
-            // frontier never covered it, so a successor may re-mint it.
-            let _ = self.abandon_unpublished_offset(offset).await;
-            return Err(e);
-        }
-        Ok(offset)
     }
 
     /// Finding 29: the WRITE PATH's allocation — [`Self::allocate_block`]
@@ -3622,6 +1948,13 @@ impl BlockAllocator {
         }
     }
 
+    /// Is there supply a park can wait for — offsets held in THIS mount's
+    /// grace ring (the finding-29 park: a pressure fence can still release
+    /// them)? An empty ring makes a `StorageFull` refusal terminal.
+    pub(crate) fn reclaimable_supply_exists(&self) -> bool {
+        !self.grace.is_empty()
+    }
+
     /// One park decision of the bounded allocation
     /// ([`Self::allocate_block_grace_bounded`]), shared with the
     /// router-level placed allocation (`BackendRouter::allocate_placed_block`
@@ -3643,37 +1976,21 @@ impl BlockAllocator {
         if waited_ms >= wall {
             log::error!(
                 "bounded allocation refusing StorageFull after {waited_ms} ms parked with {} \
-                 offset(s) still in grace locally (lane harvest horizon {} ms): the pressure \
-                 deadline never fenced within the wall backstop ({wall} ms). The refusal is \
-                 honest and terminal for this write; investigate the membership plane \
-                 (finding 29)",
+                 offset(s) still in grace locally: the pressure deadline never fenced within \
+                 the wall backstop ({wall} ms). The refusal is honest and terminal for this \
+                 write; investigate the membership plane (finding 29)",
                 self.grace.len(),
-                self.horizon_composed_ms.load(Ordering::Relaxed),
             );
             return Err(e);
         }
         let slice = crate::free_grace::pressure_park_slice_ms();
         crate::free_grace::note_pressure_park();
-        // The lane-push lever (finding 15 term 2): a renewal grant's
-        // lane-supply hint ends the slice at once, so the retry's harvest
-        // runs on the hint's heels rather than at the slice's own cadence.
-        // Inert with the lever off (nothing ever notifies) and on every
-        // mount that is not a co-writer.
-        let _ = squeezefs_ipc::sqz_time::timeout(
-            std::time::Duration::from_millis(slice),
-            crate::free_grace::lane_supply_wake().notified(),
-        )
-        .await;
+        squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(slice)).await;
         Ok(())
     }
 
     pub async fn allocate_block(&self) -> Result<u64> {
-        match self.allocate_block_inner().await {
-            // DLM S9: the lane diagnosis is attached ONCE, here, at the
-            // single exit — never inside the valve's retry loop.
-            Err(e) if is_storage_full(&e) => Err(self.refuse_lane_enospc(e)),
-            other => other,
-        }
+        self.allocate_block_inner().await
     }
 
     async fn allocate_block_inner(&self) -> Result<u64> {
@@ -3682,7 +1999,7 @@ impl BlockAllocator {
         }
         let first = self.try_allocate_block();
         if first.is_ok() {
-            return self.hand_out_reserved(first).await;
+            return first;
         }
         let Err(e) = first else { return first };
         // Spec §6.8 item 3's pressure arm, BEFORE the reclaim valve's early
@@ -3702,18 +2019,6 @@ impl BlockAllocator {
             }
             if !self.grace.is_empty() {
                 crate::free_grace::note_alloc_stall(self.grace.len(), self.grace.bytes());
-            }
-        }
-        // Rung 10 (residual 2) — the lane free HARVEST, before the verdict:
-        // on a co-writer the lane's freed supply lives on the AUTHORITY's
-        // free list (its shipped frees put it there, and the authority's
-        // own lane-filtered funnel can never reach it), so lane exhaustion
-        // asks for it back — grain-batched, adopted into the local free
-        // list, retried through the ordinary funnel. Absent sink/partition
-        // = one OnceLock probe and fall through (every mount today).
-        if is_storage_full(&e) && self.harvest_lane_supply().await > 0 {
-            if let ok @ Ok(_) = self.try_allocate_block() {
-                return self.hand_out_reserved(ok).await;
             }
         }
         // PR 8: a grant-armed writer's exhausted window asks its holder
@@ -3774,7 +2079,7 @@ impl BlockAllocator {
         // liveness floor: past it the verdict stands, loudly.
         for _attempt in 0..ENOSPC_VALVE_MAX_ATTEMPTS {
             if let ok @ Ok(_) = self.try_allocate_block() {
-                return self.hand_out_reserved(ok).await;
+                return ok;
             }
             if self.await_trim_return().await {
                 continue;
@@ -3793,7 +2098,7 @@ impl BlockAllocator {
                 if last.is_err() && self.trim_claimed.load(Ordering::SeqCst) > 0 {
                     continue;
                 }
-                return self.hand_out_reserved(last).await;
+                return last;
             }
         }
         log::error!(
@@ -3805,7 +2110,7 @@ impl BlockAllocator {
              block_free_reclaim_fence_halts)"
         );
         let last = self.try_allocate_block();
-        self.hand_out_reserved(last).await
+        last
     }
 
     /// One allocation attempt (free list, then fresh mint) — the body
@@ -3844,17 +2149,7 @@ impl BlockAllocator {
             return Ok(self.claim_block_idx(block_idx));
         }
         loop {
-            // DLM S9: reuse obeys the same residue class as a fresh mint —
-            // a free block in a peer's lane is that peer's to reuse, which
-            // is what makes reuse arbitration-free (and is the source of
-            // the stranding bound). Unpartitioned mounts take the first
-            // candidate, unchanged.
-            let Some(idx) = self
-                .free_blocks
-                .iter()
-                .map(|item| *item)
-                .find(|idx| self.lane_is_ours(*idx))
-            else {
+            let Some(idx) = self.free_blocks.iter().map(|item| *item).next() else {
                 break;
             };
             if self.free_blocks.remove(&idx).is_some() {
@@ -3887,9 +2182,6 @@ impl BlockAllocator {
     /// PR VL6a fsck epoch-latch record. Returns the byte offset.
     fn claim_block_idx(&self, block_idx: u64) -> u64 {
         let offset = block_idx * self.chunk_size;
-        // The ahead-refill rate EWMA's input (§5.5): one relaxed add per
-        // funnel exit.
-        self.alloc_claims.fetch_add(1, Ordering::Relaxed);
         // Claim-cancels-debt (Idea 4, KD-4.3): the new owner's
         // write-before-publish rewrites the range — it owes no discard.
         self.cancel_elided_debt(offset);
@@ -3975,7 +2267,7 @@ impl BlockAllocator {
             .free_blocks
             .iter()
             .map(|i| *i)
-            .filter(|i| *i < below_idx && self.lane_is_ours(*i))
+            .filter(|i| *i < below_idx)
             .collect();
         cands.sort_unstable();
         for idx in cands {
@@ -4000,7 +2292,7 @@ impl BlockAllocator {
             .free_blocks
             .iter()
             .map(|i| *i)
-            .filter(|i| *i >= min_idx && self.lane_is_ours(*i))
+            .filter(|i| *i >= min_idx)
             .collect();
         cands.sort_unstable();
         for idx in cands {
@@ -4009,24 +2301,6 @@ impl BlockAllocator {
             }
         }
         let idx = self.next_fresh_block()?;
-        // DLM S9: this pick is SYNCHRONOUS, so it cannot await a
-        // reservation raise. A fresh mint past the durable frontier is
-        // therefore refused loud rather than handed out uncovered — the
-        // caller (a VL4/VL7 mover) defers, and the async write path's next
-        // allocation raises the frontier. Unpartitioned mounts never reach
-        // the branch.
-        if let Some(lanes) = self.lanes.get() {
-            if idx >= lanes.reserved_upto.load(Ordering::Acquire) {
-                return Err(crate::error::SqueezefsError::InvalidOperation(format!(
-                    "volume '{}': the ascending pick would mint fresh block {idx}, past this \
-                     lane's durable reservation frontier {} — refusing (a synchronous pick \
-                     cannot raise the frontier; the write path's next allocation will, and this \
-                     mover should defer)",
-                    self._volume_id,
-                    lanes.reserved_upto.load(Ordering::Acquire)
-                )));
-            }
-        }
         Ok(self.claim_block_idx(idx))
     }
 
@@ -4254,7 +2528,7 @@ impl BlockAllocator {
         // verbatim (the lever's restore-exactly contract). Site 0's
         // conjunct always reads the lane-reachable number.
         let supply = self.grace_supply_blocks();
-        let lane_reachable = self.lane_reachable_blocks();
+        let lane_reachable = self.reachable_free_blocks();
         for offset in
             self.grace
                 .harvest_with_supply(crate::free_grace::HARVEST_BATCH, supply, lane_reachable)
@@ -4263,72 +2537,12 @@ impl BlockAllocator {
         }
     }
 
-    /// **The release-on-ack harvest** (finding 15 term 2, the lane-push
-    /// lever's authority half — `crate::free_grace::ReleaseHook`): the
-    /// routine harvest repeated until the ring's front is uncovered, so a
-    /// binding acknowledgement releases EVERY offset it covered, not the
-    /// first batch. Bounded by the covered population (each pass pops ≤
-    /// `HARVEST_BATCH`, and a pass that pops fewer has reached the front).
-    pub fn harvest_grace_to_front(&self) {
-        loop {
-            if self.grace.is_empty() {
-                return;
-            }
-            let supply = self.grace_supply_blocks();
-            let lane_reachable = self.lane_reachable_blocks();
-            let released = self.grace.harvest_with_supply(
-                crate::free_grace::HARVEST_BATCH,
-                supply,
-                lane_reachable,
-            );
-            let n = released.len();
-            for offset in released {
-                self.publish_grace_release(offset);
-            }
-            if n < crate::free_grace::HARVEST_BATCH {
-                return;
-            }
-        }
-    }
-
-    /// **Take up to `max` free-listed blocks of lane `lane`/`writers` for a
-    /// lane-harvest handout** (the AUTHORITY side of
-    /// `crate::cowriter::execute_lane_harvest`, one pass): lowest-first
-    /// (deterministic, and as dense as a strided lane allows), each removed
-    /// through [`Self::take_free_for_lane_grant`] (exactly-once), each with
-    /// its release AGE for the lane-visible ledger — ms the block sat on
-    /// this list since its grace release, or
-    /// [`crate::free_grace::LANE_RELEASE_AGE_UNPLACED`] for a block that
-    /// reached the list some other way.
-    pub fn take_lane_free_blocks(&self, lane: u16, writers: u16, max: usize) -> Vec<(u64, u64)> {
-        let mut candidates: Vec<u64> = self
-            .free_blocks
-            .iter()
-            .map(|item| *item)
-            .filter(|idx| crate::data_alloc_lane::block_lane_of(*idx, writers) == u64::from(lane))
-            .collect();
-        candidates.sort_unstable();
-        let vol_tag = self.vol_tag();
-        let mut out = Vec::new();
-        for idx in candidates {
-            if out.len() >= max {
-                break;
-            }
-            if self.take_free_for_lane_grant(idx) {
-                let age = crate::free_grace::take_lane_release(vol_tag, idx)
-                    .unwrap_or(crate::free_grace::LANE_RELEASE_AGE_UNPLACED);
-                out.push((idx, age));
-            }
-        }
-        out
-    }
-
     /// The supply number the grace runway reads (KD-FG-10's re-base):
     /// lane-reachable under the `DEMAND` lever, the passed-global
     /// pre-campaign number under `DEMAND=0`.
     pub fn grace_supply_blocks(&self) -> u64 {
         if crate::free_grace::demand_enabled() {
-            self.lane_reachable_blocks()
+            self.reachable_free_blocks()
         } else {
             self.free_supply_blocks()
         }
@@ -4439,50 +2653,13 @@ impl BlockAllocator {
         Ok(())
     }
 
-    /// **The co-writer-aware cleanup arm for a minted-but-NEVER-PUBLISHED
-    /// offset** (DLM S9 — the 2026-08-19 post-fence storm fix). The
-    /// error-cleanup class — a pipeline upload whose DMA or publish
-    /// failed, the RES-9 mint guard, the lane-reservation give-back, the
-    /// mover's destination undo, and (the follow-up sweep of d575be03's
-    /// named residual) the staged legs: the fsync/dismount flush funnel
-    /// (`upload_active_block_bytes` / `fold_upload_block` /
-    /// `flush_one_active_block`), the staged promotion's commit undo, the
-    /// rider-fold / staged-clone durable-spill undos, the truncate
-    /// durable-clip undo and `write_striped`'s stored-image-fits refusal
-    /// — holds an offset NO map names, and calls the allocator directly
-    /// by offset (the router's ship seam routes KEYS, which these offsets
-    /// never earned).
-    ///
-    /// On the **authority / solo** (and reader) postures this is
-    /// [`Self::free_block`] verbatim. On a **CO-WRITER** it ABANDONS the
-    /// offset leak-safe instead of storming the plane gate: the design's
-    /// answer ([`crate::data_grant`]'s `check_free` refusal text, the
-    /// `free_ship_failures` pattern) is that a co-writer's unfreeable
-    /// offset *stays durably unreferenced and the next derivation (mount
-    /// recovery / fsck C6) returns it to the free supply* — so the arm
-    /// counts `cowriter_unpublished_abandons` (expected nonzero ONLY
-    /// around custody loss, when every in-flight upload's publish refuses
-    /// at once), logs at most ONE warn per burst (per-offset detail at
-    /// debug), and touches neither the free list nor the refusal
-    /// tripwire. Never wire the HAPPY displaced-free path through this —
-    /// published keys ship via
-    /// [`crate::cowriter::ship_displaced_frees`].
-    ///
-    /// **Finding 15 (the recycle arm):** on a LIVE co-writer whose engaged
-    /// lane OWNS the offset, a never-published mint goes straight back to
-    /// this mount's own free list. Nothing durable ever named it, so no
-    /// ledger on any node moves — the act is the co-writer's private view
-    /// of its own lane supply, exactly what [`Self::adopt_lane_free_grant`]
-    /// performs for a harvested offset — and the next allocation serves it
-    /// with the full claim discipline (fresh refcount, fresh lifetime
-    /// stamp). Before it, every superseded overlay destination and every
-    /// failed-publish upload on a healthy co-writer was "abandoned to the
-    /// next derivation" — one block per event gone from the lane until a
-    /// remount, a steady leak on a fleet that never remounts (counted
-    /// `cowriter_unpublished_recycles`). The quiet abandon stays for the
-    /// shapes it was built for: a poisoned/fenced custody era (the
-    /// 2026-08-19 post-fence storm) and an offset outside this mount's
-    /// lanes.
+    /// **Abandon a never-published offset** (a pipeline upload whose DMA
+    /// or publish failed, the RES-9 mint guard, the mover's destination
+    /// undo, the staged flush funnel's undos): on a mount that holds the
+    /// volume's allocation plane the offset frees through the router
+    /// ladder verbatim; on a JOINED appender it goes back into the grant
+    /// window (below); under a fenced era it is left, counted, to the
+    /// holder's leak release (`unpublished_mint_abandons`).
     pub async fn abandon_unpublished_offset(&self, offset: u64) -> Result<()> {
         // Symmetric PR 13 (the recycle arm's GRANT-WINDOW face): a JOINED
         // appender mints from the holder's grants and holds no ownership
@@ -4503,7 +2680,7 @@ impl BlockAllocator {
                 self.mark_incarnation_unstable(offset);
                 if crate::data_custody::poisoned() {
                     crate::fuse_client::METRICS
-                        .cowriter_unpublished_abandons
+                        .unpublished_mint_abandons
                         .fetch_add(1, Ordering::Relaxed);
                     log::debug!(
                         "joined appender abandon: never-published offset {offset} on volume \
@@ -4523,129 +2700,26 @@ impl BlockAllocator {
                     log::error!(
                         "joined appender recycle REFUSED: never-published offset {offset} on \
                          volume '{}' is already unconsumed in this mount's grant window — the \
-                         double-handout lineage (cowriter_unpublished_abandons)",
+                         double-handout lineage (unpublished_mint_abandons)",
                         self._volume_id
                     );
                     crate::fuse_client::METRICS
-                        .cowriter_unpublished_abandons
+                        .unpublished_mint_abandons
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 return Ok(());
             }
-        }
-        if crate::fuse_client::co_writer_mount()
-            && !crate::cowriter::authority_accounting_scope_active()
-        {
-            let idx = offset / self.chunk_size;
-            if self.lanes.get().is_some()
-                && self.lane_is_ours(idx)
-                && !crate::data_custody::poisoned()
-            {
-                let _ = self.refcounts.remove_sync(&offset);
-                let _ = self.harvest_grants.remove_sync(&idx);
-                self.mark_incarnation_unstable(offset);
-                if self.free_blocks.insert(idx) {
-                    crate::fuse_client::METRICS
-                        .cowriter_unpublished_recycles
-                        .fetch_add(1, Ordering::Relaxed);
-                    log::debug!(
-                        "co-writer recycle: never-published offset {offset} on volume '{}' back \
-                         on this mount's own lane free list",
-                        self._volume_id
-                    );
-                } else {
-                    log::error!(
-                        "co-writer recycle REFUSED: never-published offset {offset} on volume \
-                         '{}' is already on this mount's free list — the double-handout lineage \
-                         (cowriter_unpublished_abandons)",
-                        self._volume_id
-                    );
-                    crate::fuse_client::METRICS
-                        .cowriter_unpublished_abandons
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                return Ok(());
-            }
-            crate::fuse_client::METRICS
-                .cowriter_unpublished_abandons
-                .fetch_add(1, Ordering::Relaxed);
-            if abandon_warn_due() {
-                log::warn!(
-                    "co-writer: abandoning never-published block offset(s) leak-safe (volume \
-                     '{}', first offset {offset}): the publish that would have named them \
-                     failed or refused, and a co-writer may not mutate ownership accounting — \
-                     the next derivation (mount recovery / fsck C6) returns them to the free \
-                     supply (cowriter_unpublished_abandons; further offsets at debug level)",
-                    self._volume_id
-                );
-            } else {
-                log::debug!(
-                    "co-writer abandon: never-published offset {offset} on volume '{}' left \
-                     to the next derivation",
-                    self._volume_id
-                );
-            }
-            return Ok(());
         }
         self.free_block(offset).await
-    }
-
-    /// [`Self::abandon_unpublished_offset`] keyed on the publish OUTCOME
-    /// class (design-small-file-packing §5.3, FIND-PK-4 — PK4): a
-    /// never-published offset whose shipped publish had a KNOWN outcome
-    /// (refused, or never sent) takes the lane recycle; one whose transport
-    /// failed against an owner that MAY have applied it (`Unknown`) is
-    /// abandoned WITHOUT recycle — durable layouts may name it there, and
-    /// recycling it into this lane would mint a double owner. On every
-    /// posture but a live co-writer's the class is moot (the free is local).
-    pub async fn abandon_unpublished_offset_with(
-        &self,
-        offset: u64,
-        outcome: PackPublishOutcome,
-    ) -> Result<()> {
-        if outcome == PackPublishOutcome::Unknown
-            && crate::fuse_client::co_writer_mount()
-            && !crate::cowriter::authority_accounting_scope_active()
-        {
-            self.abandon_without_recycle(offset);
-            return Ok(());
-        }
-        self.abandon_unpublished_offset(offset).await
-    }
-
-    /// The quiet leak-safe abandon arm of [`Self::abandon_unpublished_offset`]
-    /// WITHOUT the finding-15 lane recycle: the private entry is dropped,
-    /// the word left unstable, and the offset stays out of every local
-    /// allocation path until a harvest or remount re-derives it from the
-    /// ledger. The disposition for a co-writer pack whose publishes have an
-    /// UNKNOWN outcome (§5.3 — FIND-PK-4's closure): durable layouts MAY
-    /// name the block on the owner, so recycling it into this mount's lane
-    /// free list would mint a double owner. Counted
-    /// `cowriter_unpublished_abandons`.
-    fn abandon_without_recycle(&self, offset: u64) {
-        let idx = offset / self.chunk_size;
-        let _ = self.refcounts.remove_sync(&offset);
-        let _ = self.harvest_grants.remove_sync(&idx);
-        self.mark_incarnation_unstable(offset);
-        crate::fuse_client::METRICS
-            .cowriter_unpublished_abandons
-            .fetch_add(1, Ordering::Relaxed);
-        log::debug!(
-            "co-writer abandon (outcome unknown): offset {offset} on volume '{}' left to the \
-             next derivation, never recycled",
-            self._volume_id
-        );
     }
 
     /// **The pack block's ONE release primitive**
     /// (design-small-file-packing §5.3): the packer's pin at the seal, a
     /// refused tenant's reference and a failed DMA's reference all release
     /// through here. Runs OUTSIDE every 3.5 guard (RES-1 — the terminal
-    /// arm's reclaim enqueue parks at the reclaim cap) and dispatches on
-    /// posture, on the entry's state and on whether the pack's publishes
-    /// have a KNOWN outcome:
+    /// arm's reclaim enqueue parks at the reclaim cap):
     ///
-    /// * **authority / solo**: the ROUTER ladder
+    /// * the ROUTER ladder
     ///   ([`crate::routing::BackendRouter::free_block`]) for nonterminal
     ///   and terminal alike — a pack block's end of life is byte-identical
     ///   to a striped block's (read-tier purge, incarnation retire,
@@ -4654,59 +2728,22 @@ impl BlockAllocator {
     ///   Untracked is unreachable here (the pin keeps the entry alive until
     ///   this release) — counted `pack_release_untracked_noops`, logged
     ///   ERROR.
-    /// * **co-writer**: nonterminal → a PRIVATE release of the mount's own
-    ///   view (nothing ships — nothing durable ever named the pin);
-    ///   terminal + KNOWN → [`Self::abandon_unpublished_offset`] (the
-    ///   never-published arm: the lane recycle); terminal + UNKNOWN →
-    ///   `abandon_without_recycle`; untracked → a counted no-op
-    ///   (the last committed tenant's shipped `Freed` already ran
-    ///   `retire_shipped_free_tracking` — the authority owns the offset
-    ///   now, and a terminal arm here would hand it to this lane a SECOND
-    ///   time). The co-writer's batch-scoped pack (PK4,
-    ///   `DataRouter::promote_staged_batch`) seals through these arms at
-    ///   its frame reply with the frame's typed outcome class.
     /// * a **reader** promotes nothing and never reaches this.
     pub async fn release_pack_reference(
         &self,
         router: &crate::routing::BackendRouter,
         block_key: &str,
-        outcome: PackPublishOutcome,
     ) -> Result<PackRelease> {
         let offset = router.block_key_offset(block_key)?;
-        let Some(count) = self.refcount(offset) else {
+        if self.refcount(offset).is_none() {
             crate::fuse_client::METRICS
                 .pack_release_untracked_noops
                 .fetch_add(1, Ordering::Relaxed);
-            if crate::fuse_client::co_writer_mount()
-                && !crate::cowriter::authority_accounting_scope_active()
-            {
-                log::debug!(
-                    "packing: release of untracked pack block {block_key} on a co-writer — the \
-                     last committed tenant's shipped free retired it; no-op"
-                );
-            } else {
-                log::error!(
-                    "packing: release of UNTRACKED pack block {block_key} on the authority — \
-                     the pin's own reference should have kept the entry alive; no-op \
-                     (pack_release_untracked_noops)"
-                );
-            }
+            log::error!(
+                "packing: release of UNTRACKED pack block {block_key} — the pin's own reference \
+                 should have kept the entry alive; no-op (pack_release_untracked_noops)"
+            );
             return Ok(PackRelease::UntrackedNoop);
-        };
-        if crate::fuse_client::co_writer_mount()
-            && !crate::cowriter::authority_accounting_scope_active()
-        {
-            if count > 1 {
-                self.release_shipped_free_tracking(offset);
-                return Ok(PackRelease::Nonterminal);
-            }
-            match outcome {
-                PackPublishOutcome::Known => {
-                    self.abandon_unpublished_offset(offset).await?;
-                }
-                PackPublishOutcome::Unknown => self.abandon_without_recycle(offset),
-            }
-            return Ok(PackRelease::Terminal);
         }
         let terminal = router.free_block_verdict(block_key).await?;
         Ok(if terminal {
@@ -5242,20 +3279,6 @@ pub(crate) struct LayoutWalkSummary {
     pub(crate) checked: u64,
     pub(crate) valid_inodes: u64,
     pub(crate) layouts_found: u64,
-}
-
-/// Whether a pack block's publishes have a KNOWN outcome when its
-/// reference releases (design-small-file-packing §5.3): an authority's
-/// commit is local — always `Known`; on a co-writer a shipped commit
-/// whose transport failed past the resend ladder against an owner that
-/// MAY have applied it is `Unknown` (FIND-PK-4 — minted from the typed
-/// publish outcome `PublishFailureClass::TransportOutcomeUnknown`, never
-/// from a message string), and the terminal arm then abandons WITHOUT
-/// the lane recycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PackPublishOutcome {
-    Known,
-    Unknown,
 }
 
 /// What [`BlockAllocator::release_pack_reference`] did.

@@ -460,19 +460,6 @@ impl BlockQuarantine {
 // WERO on data namespaces — one shared hold
 // ---------------------------------------------------------------------------
 
-/// Which custody posture a mount arms the data plane in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CustodyPosture {
-    /// The shipped posture: the D0 guard is the arbiter, the data plane is
-    /// fenced locally by the custody epoch, and no data-namespace
-    /// reservation is taken. Never refuses.
-    SingleWriter,
-    /// The S7 opt-in (`SQUEEZEFS_MULTI_WRITER=1`): the data plane must be
-    /// **device-enforced**. Refuses a substrate without reservation
-    /// support and a format without the S7 incompat bit.
-    MultiWriter,
-}
-
 /// Which half of a WERO (rtype 3) hold this process owns.
 ///
 /// The distinction is the whole of DLM S9's co-writer admission rung 5:
@@ -949,13 +936,31 @@ fn unregister_partial(clients: &[Arc<dyn ReservationClient>], key: u64) {
     }
 }
 
-/// A CO-WRITER's registration under the authority's standing WERO hold,
-/// plus the device-side evidence its admission rung 5 consumes. Dropping
+/// The device's answer about the standing WERO hold on the data namespaces
+/// (gathered by [`join_wero_as_registrant`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistrantEvidence {
+    /// Every namespace advertises reservation support.
+    pub pr_capable: bool,
+    /// The held reservation is Write Exclusive – **Registrants Only**.
+    pub wero: bool,
+    /// A reservation is held at all (by the manager).
+    pub reservation_held: bool,
+    /// OUR key appears among the device's registrants.
+    pub registered: bool,
+    /// This node's registrant key (`0` = none).
+    pub key: u64,
+    /// Namespaces the join covered.
+    pub namespaces: usize,
+}
+
+/// A joining writer's registration under the manager's standing WERO hold,
+/// plus the device-side evidence the join ladder's rung 4 consumes. Dropping
 /// it unregisters this process's key on every namespace and leaves the
 /// authority's reservation standing (zero residue, no fence loss).
 pub struct WeroRegistrantJoin {
     hold: WeroHold,
-    evidence: crate::cowriter::RegistrantEvidence,
+    evidence: RegistrantEvidence,
 }
 
 impl std::fmt::Debug for WeroRegistrantJoin {
@@ -971,7 +976,7 @@ impl WeroRegistrantJoin {
     /// The device-side evidence: PR capability, the standing hold's type,
     /// whether a reservation is held at all, and whether OUR key is a
     /// registrant.
-    pub fn evidence(&self) -> crate::cowriter::RegistrantEvidence {
+    pub fn evidence(&self) -> RegistrantEvidence {
         self.evidence
     }
 
@@ -1033,7 +1038,7 @@ pub fn adopt_wero_colocated(
         let namespaces = existing.paths.len();
         return Ok(WeroRegistrantJoin {
             hold: WeroHold { inner: existing },
-            evidence: crate::cowriter::RegistrantEvidence {
+            evidence: RegistrantEvidence {
                 pr_capable: true,
                 wero: true,
                 reservation_held: true,
@@ -1115,7 +1120,7 @@ pub fn adopt_wero_colocated(
     );
     Ok(WeroRegistrantJoin {
         hold: WeroHold { inner },
-        evidence: crate::cowriter::RegistrantEvidence {
+        evidence: RegistrantEvidence {
             pr_capable: true,
             wero: true,
             reservation_held: true,
@@ -1188,7 +1193,7 @@ pub fn join_wero_as_registrant_keyed(
         );
         return Ok(WeroRegistrantJoin {
             hold: WeroHold { inner: existing },
-            evidence: crate::cowriter::RegistrantEvidence {
+            evidence: RegistrantEvidence {
                 pr_capable: true,
                 wero: true,
                 reservation_held: true,
@@ -1296,7 +1301,7 @@ pub fn join_wero_as_registrant_keyed(
     );
     Ok(WeroRegistrantJoin {
         hold: WeroHold { inner },
-        evidence: crate::cowriter::RegistrantEvidence {
+        evidence: RegistrantEvidence {
             pr_capable: true,
             wero: true,
             reservation_held: true,
@@ -1358,97 +1363,50 @@ pub fn own_registered_key() -> Option<u64> {
         .next()
 }
 
-/// `true` ⇔ this mount was asked to arm the multi-writer data plane
-/// (`SQUEEZEFS_MULTI_WRITER=1`).
-pub fn multi_writer_requested() -> bool {
-    crate::env_knobs::bool_knob("SQUEEZEFS_MULTI_WRITER", false)
-}
-
-/// Arm the data plane in `posture` over `data_paths`.
+/// Arm the device-enforced data plane over `data_paths` — the symmetric
+/// join ladder's rung 4 ([`crate::sym_join`]). Refuses, in this order:
 ///
-/// * [`CustodyPosture::SingleWriter`] — never refuses and takes no
-///   reservation: the D0 guard is the arbiter and the custody-epoch fence
-///   is the data plane's local face. `Ok(None)`.
-/// * [`CustodyPosture::MultiWriter`] — refuses, in this order:
-///   1. any namespace that advertises no reservation support, **naming
-///      it** (detection-grade substrates cannot enforce a decision — the
-///      repo's own loop substrate included, §6.7 "On external
-///      consensus");
-///   2. a format that does not carry the S7 incompat bit
-///      (`multi_writer_stamped == false`, which is every volume today —
-///      ruling D9);
-///   3. a WERO acquire that did not land on every namespace.
-///   Otherwise `Ok(Some(hold))`, held for the mount lifetime.
+/// 1. any namespace that advertises no reservation support, **naming it**
+///    (detection-grade substrates cannot enforce a decision — the repo's
+///    own loop substrate included, §6.7 "On external consensus"; the
+///    ladder decides the regular-file and lab-opt-in arms BEFORE calling);
+/// 2. a format that does not carry the multi-writer data capability
+///    (`multi_writer_stamped == false`);
+/// 3. a WERO acquire that did not land on every namespace.
 ///
-/// Blocking (reservation ioctls) — call via `spawn_blocking` from async
-/// paths.
-pub fn arm_data_plane(
-    posture: CustodyPosture,
-    data_paths: &[PathBuf],
-    multi_writer_stamped: bool,
-) -> Result<Option<WeroHold>> {
-    if posture == CustodyPosture::SingleWriter {
-        log::info!(
-            "data plane armed single-writer: custody {} fenced locally (no data-namespace \
-             reservation — the D0 writer guard is the arbiter; set SQUEEZEFS_MULTI_WRITER=1 \
-             to demand a device-enforced WERO hold)",
-            current_epoch()
-        );
-        return Ok(None);
-    }
+/// Otherwise `Ok(Some(hold))`, held for the mount lifetime. Blocking
+/// (reservation ioctls) — call via `spawn_blocking` from async paths.
+pub fn arm_data_plane(data_paths: &[PathBuf], multi_writer_stamped: bool) -> Result<Option<WeroHold>> {
     for path in data_paths {
         if resolve_for_mount(path).is_none() {
             return Err(SqueezefsError::InvalidOperation(format!(
-                "multi-writer data plane refuses to arm: data namespace {} advertises no \
-                 NVMe reservation support (RESCAP=0), so a fenced writer's DMA can only be \
-                 DETECTED, never rejected — spec §6.7 requires enforcement for multi-writer \
-                 (this is the shape of every loop-device substrate, including the repo's own \
-                 tests/dev_substrate.sh default). Use a PR-capable namespace or unset \
-                 SQUEEZEFS_MULTI_WRITER.",
+                "the data plane refuses to arm: data namespace {} advertises no NVMe \
+                 reservation support (RESCAP=0), so a fenced writer's DMA can only be DETECTED, \
+                 never rejected — spec §6.7 requires enforcement for a shared LUN (this is the \
+                 shape of every loop-device substrate, including the repo's own \
+                 tests/dev_substrate.sh default). Use a PR-capable namespace, format \
+                 `--single-writer` for a single-host volume, or SQUEEZEFS_SYM_ALLOW_NON_PR=1 \
+                 for a detection-grade lab set.",
                 path.display()
             )));
         }
     }
     if !multi_writer_stamped {
         return Err(SqueezefsError::InvalidOperation(
-            "multi-writer data plane refuses to arm: the metadata format does not carry the \
-             multi-writer data capability (incompat bit 11). Nothing stamps it today (ruling \
-             D9: the bit is built, not stamped) — the capability lands with DLM S8/S9. Unset \
-             SQUEEZEFS_MULTI_WRITER."
+            "the data plane refuses to arm: the metadata format does not carry the \
+             multi-writer data capability (incompat bit 11) — a `--single-writer` volume."
                 .to_string(),
         ));
     }
     let hold = acquire_wero(data_paths).ok_or_else(|| {
         SqueezefsError::InvalidOperation(
-            "multi-writer data plane refuses to arm: the WERO (rtype 3) acquire did not land \
-             on every data namespace — a partial fence is not a fence (the acquire log names \
-             the namespace that refused)"
+            "the data plane refuses to arm: the WERO (rtype 3) acquire did not land on every \
+             data namespace — a partial fence is not a fence (the acquire log names the \
+             namespace that refused)"
                 .to_string(),
         )
     })?;
     Ok(Some(hold))
-}
-
-/// Mount-path arming (`main`'s mount verb, after the meta backend is
-/// wired): resolve the posture from `SQUEEZEFS_MULTI_WRITER`, read the S7
-/// capability off every meta volume's superblock, and arm off-runtime.
-pub async fn arm_mount_data_plane(
-    meta: &Arc<crate::meta_backend::RoutedMetaBackend>,
-    data_paths: Vec<PathBuf>,
-) -> Result<Option<WeroHold>> {
-    let posture = if multi_writer_requested() {
-        CustodyPosture::MultiWriter
-    } else {
-        CustodyPosture::SingleWriter
-    };
-    let stamped = !meta.volumes.is_empty()
-        && meta.volumes.iter().all(|v| {
-            v.superblock().features_incompat
-                & crate::meta_backend::kv::superblock::FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA
-                != 0
-        });
-    squeezefs_ipc::sqz_blocking::run_blocking(move || arm_data_plane(posture, &data_paths, stamped))
-        .await
 }
 
 /// Release a hold off the async runtime (the reservation ioctls are

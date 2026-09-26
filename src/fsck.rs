@@ -890,7 +890,7 @@ pub struct FsckCounters {
     /// exemptions + C6's whole-census decline under an engaged
     /// partition). The cross-writer oracle stays C8; the lane-aligned
     /// fleet-parallel fsck is rung 10c's (KD-MW-16).
-    pub foreign_lane_exempted: u64,
+    pub alloc_census_declined: u64,
     /// Symmetric PR 8/10 — C6's bitmap oracle on a grant-armed allocator:
     /// SET bits no reference, no open grant and no in-flight registration
     /// names — a dead incarnation's window remainder the next (re-)hold
@@ -2269,7 +2269,7 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         counters.inflight_exempted += r.counters.inflight_exempted;
         counters.mover_ledger_exempted += r.counters.mover_ledger_exempted;
         counters.pack_ledger_exempted += r.counters.pack_ledger_exempted;
-        counters.foreign_lane_exempted += r.counters.foreign_lane_exempted;
+        counters.alloc_census_declined += r.counters.alloc_census_declined;
         counters.alloc_bitmap_leak_candidates += r.counters.alloc_bitmap_leak_candidates;
         counters.alloc_bitmap_tracked_exempted += r.counters.alloc_bitmap_tracked_exempted;
         counters.map_orphan_records += r.counters.map_orphan_records;
@@ -2349,7 +2349,7 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     dst.inflight_exempted += fin.inflight_exempted;
     dst.mover_ledger_exempted += fin.mover_ledger_exempted;
     dst.pack_ledger_exempted += fin.pack_ledger_exempted;
-    dst.foreign_lane_exempted += fin.foreign_lane_exempted;
+    dst.alloc_census_declined += fin.alloc_census_declined;
     dst.alloc_bitmap_leak_candidates += fin.alloc_bitmap_leak_candidates;
     dst.alloc_bitmap_tracked_exempted += fin.alloc_bitmap_tracked_exempted;
     // C11 runs ONLY in the finalize (shards skip the map plane, so the
@@ -3178,7 +3178,7 @@ fn fold_worker_counters(dst: &mut FsckCounters, src: &FsckCounters) {
     dst.inflight_exempted += src.inflight_exempted;
     dst.mover_ledger_exempted += src.mover_ledger_exempted;
     dst.pack_ledger_exempted += src.pack_ledger_exempted;
-    dst.foreign_lane_exempted += src.foreign_lane_exempted;
+    dst.alloc_census_declined += src.alloc_census_declined;
     dst.alloc_bitmap_leak_candidates += src.alloc_bitmap_leak_candidates;
     dst.alloc_bitmap_tracked_exempted += src.alloc_bitmap_tracked_exempted;
     dst.tenant_overlap_findings += src.tenant_overlap_findings;
@@ -5276,25 +5276,6 @@ fn evaluate_allocator_classes(
         let tracked: HashMap<u64, u32> = v.alloc.tracked_offsets().into_iter().collect();
         let capacity = v.alloc.capacity_bytes();
         let chunk = v.alloc.chunk_size();
-        // DLM S9 (rung-10 finding #5): under an ENGAGED allocation
-        // partition this mount's allocator census covers only the lanes it
-        // OWNS. A live peer writer's blocks are durably referenced and
-        // structurally untracked HERE — untracked across every scan epoch,
-        // which is exactly what the settle ladder cannot clear — so a
-        // foreign-lane offset is a PEER's to adjudicate, never a lost
-        // finding on this mount (exempt, counted). The cross-writer
-        // oracle stays C8 (the durable ledger census); the lane-aligned
-        // fleet-parallel fsck is rung 10c's (KD-MW-16).
-        let lane_view = v
-            .alloc
-            .lane_partition()
-            .map(|p| (p.writers(), v.alloc.owned_lane_mask().unwrap_or(1)));
-        let foreign_lane = |off: u64| match lane_view {
-            None => false,
-            Some((w, owned)) => {
-                owned & (1u64 << crate::data_alloc_lane::offset_lane_of(off, chunk, w)) == 0
-            }
-        };
         // Symmetric PR 13 (defect 27): on a grant-armed allocator whose
         // allocation lease THIS process holds, the RAM refcount map knows
         // this mount's own mints and its mount-time census alone — a block
@@ -5372,9 +5353,7 @@ fn evaluate_allocator_classes(
                     "offset not aligned to the {chunk} B allocator chunk"
                 )));
             } else if !sharded && !tracked.contains_key(&off) {
-                if foreign_lane(off) {
-                    counters.foreign_lane_exempted += 1;
-                } else if bitmap_tracked(off) {
+                if bitmap_tracked(off) {
                     counters.alloc_bitmap_tracked_exempted += 1;
                 } else {
                     suspects.push(lost(
@@ -5393,24 +5372,7 @@ fn evaluate_allocator_classes(
         // spans whole foreground-busy periods (the deferred reclaim
         // backlog), so the old settle-window absorption can no longer
         // cover it (the 2026-07-31 iteration-loop FP).
-        if !sharded && lane_view.is_some() {
-            // Rung-10 finding #5, the C6 half: the used-vs-tracked
-            // arithmetic is SINGLE-WRITER by construction — `highest −
-            // free − inflight − graced` spans every lane while `tracked`
-            // spans only this mount's, so on any engaged partition the
-            // census reads drift the size of the peers' whole population.
-            // C6 therefore DECLINES here (the doctrine that already
-            // declines foreign-lane reconciliation), counted on the same
-            // exemption gauge; C8 remains the multi-writer capacity oracle.
-            counters.foreign_lane_exempted += 1;
-            log::info!(
-                "fsck C6: capacity census declined on '{}' — a {}-way allocation partition is \
-                 engaged and the used-vs-tracked arithmetic is single-writer by construction \
-                 (fsck_foreign_lane_exempted; C8 is the multi-writer oracle)",
-                v.id,
-                lane_view.map(|(w, _)| w).unwrap_or(1),
-            );
-        } else if !sharded && v.alloc.block_grant_armed() {
+        if !sharded && v.alloc.block_grant_armed() {
             // Symmetric PR 8/10: on a grant-armed allocator the bitmap IS
             // the free list — the local list was drained into it at the
             // arm and a freed block returns only through a carve — so
@@ -5465,11 +5427,11 @@ fn evaluate_allocator_classes(
                     // A grant-armed allocator whose holding this process
                     // does not keep (a wire writer's — PR 12's venue): no
                     // bitmap to judge against; declined, counted.
-                    counters.foreign_lane_exempted += 1;
+                    counters.alloc_census_declined += 1;
                     log::info!(
                         "fsck C6: capacity census declined on '{}' — the allocator mints from \
                          ranged block grants and this process holds no allocation lease for it \
-                         (fsck_foreign_lane_exempted; the holder's bitmap oracle is the census)",
+                         (fsck_alloc_census_declined; the holder's bitmap oracle is the census)",
                         v.id
                     );
                 }
@@ -7421,8 +7383,8 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.mover_ledger_exempted, Ordering::Relaxed);
     m.fsck_pack_ledger_exempted
         .fetch_add(c.pack_ledger_exempted, Ordering::Relaxed);
-    m.fsck_foreign_lane_exempted
-        .fetch_add(c.foreign_lane_exempted, Ordering::Relaxed);
+    m.fsck_alloc_census_declined
+        .fetch_add(c.alloc_census_declined, Ordering::Relaxed);
     m.fsck_alloc_bitmap_leak_candidates
         .fetch_add(c.alloc_bitmap_leak_candidates, Ordering::Relaxed);
     m.fsck_alloc_bitmap_tracked_exempted

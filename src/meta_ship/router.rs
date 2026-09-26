@@ -234,10 +234,6 @@ impl MetaShipRouter {
 
     /// **The routing decision** — lock-free, allocation-free, and one
     /// relaxed load on an unarmed mount.
-    ///
-    /// Refuses loud when the verb's named participants live on volumes
-    /// owned by DIFFERENT nodes: that shape needs S3.5's cross-volume
-    /// transaction machinery (ruling D4), which is not built.
     pub fn route_verb(&self, call: &MetaCall) -> Result<VerbRoute> {
         let t = Instant::now();
         let route = self.route_verb_inner(call);
@@ -249,53 +245,16 @@ impl MetaShipRouter {
         if !owners::ownership_armed() {
             return Ok(VerbRoute::Local);
         }
+        // Under the symmetric plane the map is all-local: every named
+        // participant answers `None` and the verb stays local. A peer entry
+        // — the migration-while-armed re-arm's — ships the verb there; two
+        // different peers over one call is the retired per-volume-owner
+        // recipe's shape and cannot arise from an all-local derivation.
         let mut owner: Option<Arc<PeerOwner>> = None;
-        let mut have_local = false;
         for ino in call.named_inos() {
             let (v_idx, _) = self.inner.route_ino(ino);
-            // §5.10: a POISONED entry answers neither "local" nor "ship
-            // there" — both would be a guess about who may append — so
-            // the verb refuses loud here.
-            match owners::route_volume(v_idx)? {
-                None => {
-                    if let Some(peer) = &owner {
-                        return Err(super::cross_owner_refusal(
-                            call.verb(),
-                            ino,
-                            &format!(
-                                "this node owns one participant's volume and {} owns another's",
-                                peer.peer_id
-                            ),
-                        ));
-                    }
-                    have_local = true;
-                }
-                Some(peer) => {
-                    if have_local {
-                        return Err(super::cross_owner_refusal(
-                            call.verb(),
-                            ino,
-                            &format!(
-                                "{} owns this participant's volume and this node owns another's",
-                                peer.peer_id
-                            ),
-                        ));
-                    }
-                    match &owner {
-                        None => owner = Some(peer),
-                        Some(first) if first.endpoint == peer.endpoint => {}
-                        Some(first) => {
-                            return Err(super::cross_owner_refusal(
-                                call.verb(),
-                                ino,
-                                &format!(
-                                    "participants are owned by two different nodes ({} and {})",
-                                    first.peer_id, peer.peer_id
-                                ),
-                            ));
-                        }
-                    }
-                }
+            if let Some(peer) = owners::route_volume(v_idx)? {
+                owner.get_or_insert(peer);
             }
         }
         Ok(match owner {

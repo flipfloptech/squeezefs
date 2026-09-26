@@ -246,90 +246,6 @@ struct DeviceImage {
     image: bytes::Bytes,
 }
 
-/// One staged-layout file for [`DataRouter::promote_staged_batch`].
-#[derive(Debug, Clone)]
-pub struct StagedPromotionItem {
-    pub file_path: String,
-    pub file_id: String,
-    pub fencing_token: u64,
-}
-
-/// A pack-group tenant re-checked and composed under the group's guards,
-/// awaiting the save body's `stage`/`ship`/`finish` halves.
-struct StagedTenant {
-    /// The item's index in the batch.
-    i: usize,
-    prepared: PreparedDevicePromotion,
-    updated: CachedMetadata,
-    refs: Vec<crate::meta_backend::kv::block_refs::BlockRefOp>,
-    /// The older durable mapping this commit displaces, if any.
-    displaced: Option<String>,
-}
-
-/// What a pack's group commit hands the driver: done (every tenant
-/// answered), or a frame-level refusal with the item indices to re-drive.
-enum PackGroupFate {
-    Done,
-    /// `PUBLISH_PACK_GROUP_UNAVAILABLE`: one-block-per-file, the endpoint
-    /// latched until the next grant.
-    Unavailable(Vec<usize>),
-    /// `PUBLISH_PACK_GROUP_SPLIT`: re-`prepare` into fresh packs once, then
-    /// one-block-per-file.
-    Split(Vec<usize>),
-}
-
-impl PreparedDevicePromotion {
-    /// The packed arm's reserved slot handle, for a tenant whose commit did
-    /// not land (the block arm's site is abandoned by its own path).
-    fn into_pack_tenant(self) -> Option<crate::pack::PackTenant> {
-        match self.site {
-            PreparedSite::Packed(t) => Some(t),
-            PreparedSite::Block { .. } => None,
-        }
-    }
-}
-
-// PK4: outcome-class arms begin
-/// The publish OUTCOME class a failed layout save leaves a never-published
-/// landing in (design-small-file-packing §5.3, FIND-PK-4): only a transport
-/// failure past the witnessed ladder — the owner MAY have applied the
-/// layout — is `Unknown`; every decoded refusal, protocol error and local
-/// failure is `Known`. Keyed on the typed class, never a message string.
-fn pack_publish_outcome(err: &SqueezefsError) -> crate::block_allocator::PackPublishOutcome {
-    match err {
-        SqueezefsError::PublishFailure {
-            class: crate::error::PublishFailureClass::TransportOutcomeUnknown,
-            ..
-        } => crate::block_allocator::PackPublishOutcome::Unknown,
-        _ => crate::block_allocator::PackPublishOutcome::Known,
-    }
-}
-// PK4: outcome-class arms end
-
-/// The UNAVAILABLE latch (design-small-file-packing §5.6 (b)): owner
-/// endpoints that refused a `pack_group` frame under the CURRENT membership
-/// grant, keyed on the typed status at the refusal — never a message
-/// string. A latched endpoint gets one-block-per-file until the next grant
-/// ([`crate::membership::pack_group_grant_generation`] moves), which may
-/// say otherwise.
-static PACK_GROUP_UNAVAILABLE: once_cell::sync::Lazy<
-    parking_lot::Mutex<std::collections::HashMap<String, u64>>,
-> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-
-fn pack_group_endpoint_latched(endpoint: &str) -> bool {
-    PACK_GROUP_UNAVAILABLE
-        .lock()
-        .get(endpoint)
-        .is_some_and(|gen| *gen == crate::membership::pack_group_grant_generation())
-}
-
-fn latch_pack_group_endpoint(endpoint: &str) {
-    PACK_GROUP_UNAVAILABLE.lock().insert(
-        endpoint.to_string(),
-        crate::membership::pack_group_grant_generation(),
-    );
-}
-
 /// The device arm's prepared state: the transformed image is on the
 /// device (its block's incarnation word published), `block_key` is the
 /// size-carrying mapping the commit publishes, and the site holds the
@@ -592,13 +508,6 @@ pub enum PackTrace {
         pack: u64,
         base_key: String,
         ino: u64,
-    },
-    /// A `pack_group` frame naming `base_key`'s tenants left the mount
-    /// (refused or served alike — recorded at the ship, before any reply).
-    FrameDeparture {
-        pack: u64,
-        base_key: String,
-        inos: Vec<u64>,
     },
     /// A layout entry published into the RAM cache.
     RamPublish { ino: u64 },
@@ -1458,25 +1367,6 @@ pub fn health_effective(device_health: u32, fill_ratio: f64, set_mean_fill: f64)
     device_health.saturating_sub(balance_penalty(fill_ratio, set_mean_fill))
 }
 
-/// A laned co-writer's placement weight for one volume
-/// (`.benchmarks/2026-09-07-cowriter-lane-aware-placement.md`): the
-/// lane-reachable fraction of the lane share on `health_effective`'s
-/// 0..1000 scale — `reachable × 1000 ÷ share`, clamped to 1000 (an
-/// unbounded allocator reports `u64::MAX` reachable: space is not a
-/// constraint there), 0 for a lane with no share.
-pub fn lane_placement_weight(lane_reachable_blocks: u64, lane_share_blocks: u64) -> u32 {
-    if lane_reachable_blocks == u64::MAX {
-        return 1000;
-    }
-    if lane_share_blocks == 0 {
-        return 0;
-    }
-    if lane_reachable_blocks >= lane_share_blocks {
-        return 1000;
-    }
-    (lane_reachable_blocks.saturating_mul(1000) / lane_share_blocks) as u32
-}
-
 /// One backend row of the [`PlacementTable`] snapshot (design-
 /// volume-lifecycle §5.9/§10): the per-backend placement gauges plus the
 /// Arcs a pick hands to the write path.
@@ -1538,18 +1428,6 @@ impl PlacementTable {
     /// INSTANT even against a stale snapshot). Takes ONLY the snapshot —
     /// structurally no router, no filesystem, no syscalls.
     ///
-    /// **Lane-governed rows** (a laned co-writer's volumes,
-    /// `BlockAllocator::lane_placement_governed`) add the two events the
-    /// refresh cadence is too slow for, read off the allocator's O(1)
-    /// counters — never a rebuild: a banded volume whose lane-reachable
-    /// supply an allocation just drained is skipped (pass 1), and an
-    /// out-of-band volume a harvest just refilled is reached (pass 2,
-    /// entered only when pass 1 found nothing). Pass 3 is the shipped
-    /// round-robin verbatim — a dry set still places, so the picked
-    /// volume's ENOSPC harvest and the failover/park run there. On every
-    /// unpartitioned row `lane_supply_admits` is one `OnceLock` probe, so
-    /// single-writer and authority mounts pay one acquire load per
-    /// candidate and take pass 1's first healthy row exactly as before.
     pub fn pick<F: Fn(&str) -> bool>(
         &self,
         healthy: F,
@@ -1565,57 +1443,11 @@ impl PlacementTable {
         let start = self.rr.fetch_add(1, Ordering::Relaxed);
         for i in 0..n {
             let row = &self.rows[self.band[start.wrapping_add(i) % n]];
-            if healthy(&row.id) && row.lane_supply_admits() {
-                return Some(row.take());
-            }
-        }
-        for row in &self.rows {
-            if row.eligible
-                && healthy(&row.id)
-                && row.allocator.lane_placement_governed()
-                && row.allocator.lane_reachable_blocks() > 0
-            {
-                return Some(row.take());
-            }
-        }
-        for i in 0..n {
-            let row = &self.rows[self.band[start.wrapping_add(i) % n]];
             if healthy(&row.id) {
                 return Some(row.take());
             }
         }
         None
-    }
-
-    /// The eligible, healthy rows other than `picked` — the placed
-    /// allocation's failover order: lane-governed rows that still hold
-    /// lane-reachable supply first, then the rest (whose ENOSPC harvest
-    /// may still reach supply the authority holds for them). A cold path:
-    /// entered only after the picked volume refused `StorageFull`.
-    fn failover_candidates<F: Fn(&str) -> bool>(
-        &self,
-        picked: &str,
-        healthy: F,
-    ) -> Vec<(
-        String,
-        std::sync::Arc<crate::block_allocator::BlockAllocator>,
-        std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
-    )> {
-        let mut stocked = Vec::new();
-        let mut dry = Vec::new();
-        for row in &self.rows {
-            if row.id == picked || !row.eligible || !healthy(&row.id) {
-                continue;
-            }
-            if row.allocator.lane_placement_governed() && row.allocator.lane_reachable_blocks() == 0
-            {
-                dry.push(row.take());
-            } else {
-                stocked.push(row.take());
-            }
-        }
-        stocked.extend(dry);
-        stocked
     }
 }
 
@@ -1630,14 +1462,6 @@ impl PlacementRow {
     ) {
         self.picks.fetch_add(1, Ordering::Relaxed);
         (self.id.clone(), self.allocator.clone(), self.device.clone())
-    }
-
-    /// Pass-1 admission: an ungoverned row always admits; a lane-governed
-    /// row admits while its lane has reachable supply (two atomic loads +
-    /// one `OnceLock` probe on the allocator's maintained counters).
-    #[inline]
-    fn lane_supply_admits(&self) -> bool {
-        !self.allocator.lane_placement_governed() || self.allocator.lane_reachable_blocks() > 0
     }
 }
 
@@ -2978,23 +2802,10 @@ impl BackendRouter {
                 // The device/health score: the free-fraction × 1000 the
                 // write path has always ranked on, census-sourced.
                 let device_health = ((1.0 - fill_ratio).max(0.0) * 1000.0) as u32;
-                let weight = if !c.eligible {
-                    0
-                } else if c.allocator.lane_placement_governed() {
-                    // A laned co-writer's volume: the device fill says
-                    // nothing about THIS mount's lane on it (its share
-                    // exhausts and refills per volume, independently of
-                    // the device), so the weight is the lane-reachable
-                    // fraction of the lane share on the same 0..1000
-                    // scale — an exhausted lane leaves the band. No
-                    // balance penalty: the set-mean term is a device
-                    // statement too.
-                    lane_placement_weight(
-                        c.allocator.lane_reachable_blocks(),
-                        c.allocator.lane_share_blocks(),
-                    )
-                } else {
+                let weight = if c.eligible {
                     health_effective(device_health, fill_ratio, set_mean)
+                } else {
+                    0
                 };
                 let picks = self
                     .placement_picks
@@ -3586,30 +3397,8 @@ impl BackendRouter {
     /// allocation on the picked volume — `(be_id, allocator, device,
     /// offset)`. Every fresh-block site (write-through, overlay, flush and
     /// fold uploads, spills, blobs) calls this instead of pairing the two
-    /// itself.
-    ///
-    /// On a mount whose picked allocator is NOT lane-governed
-    /// (`BlockAllocator::lane_placement_governed` — every single-writer and
-    /// authority mount, and every co-writer under
-    /// `SQUEEZEFS_COWRITER_LANE_PLACEMENT=0`) this IS the shipped pair,
-    /// instruction for instruction: the pick, then that allocator's
-    /// `allocate_block_grace_bounded`. "Full" is full there — every
-    /// volume's whole free list is this mount's.
-    ///
-    /// On a laned co-writer (`.benchmarks/2026-09-07-cowriter-lane-aware-
-    /// placement.md`) the lane's share exhausts and refills PER VOLUME, so a
-    /// `StorageFull` from the picked volume says nothing about its sibling:
-    /// the remaining eligible volumes are tried IN THE SAME ATTEMPT (each
-    /// `allocate_block` runs its own ENOSPC harvest against the authority,
-    /// so supply the authority holds for this lane on ANY volume is reached
-    /// here), and only when every volume refused does the allocation park —
-    /// the same bounded park as today (`park_for_reclaimable_supply`, with
-    /// the set's reclaimable verdict), retrying the whole set each slice.
-    /// Ledger: `backend_placement_lane_failovers` (allocations that landed
-    /// on a volume other than the pick) and
-    /// `backend_placement_lane_exhausted_picks` (picks that landed on a
-    /// lane-exhausted volume while a sibling had lane supply — ≈ 0 by
-    /// construction of the pick; growth = predicate rot).
+    /// itself. "Full" is full: every volume's whole free list (or, on an
+    /// armed writer, its grant window) is this mount's.
     pub async fn allocate_placed_block(
         &self,
     ) -> Result<(
@@ -3619,53 +3408,8 @@ impl BackendRouter {
         u64,
     )> {
         let (be_id, allocator, device) = self.get_active_backend()?;
-        if !allocator.lane_placement_governed() {
-            let offset = allocator.allocate_block_grace_bounded().await?;
-            return Ok((be_id, allocator, device, offset));
-        }
-        let metrics = &crate::fuse_client::METRICS;
-        let siblings = self
-            .placement_table
-            .load()
-            .failover_candidates(&be_id, |id| self.is_backend_healthy(id));
-        if allocator.lane_reachable_blocks() == 0
-            && siblings
-                .iter()
-                .any(|(_, a, _)| a.lane_reachable_blocks() > 0)
-        {
-            metrics
-                .backend_placement_lane_exhausted_picks
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        let started = std::time::Instant::now();
-        loop {
-            let e = match allocator.allocate_block().await {
-                Ok(offset) => return Ok((be_id, allocator, device, offset)),
-                Err(e) if crate::block_allocator::is_storage_full(&e) => e,
-                Err(e) => return Err(e),
-            };
-            for (sib_id, sib_alloc, sib_dev) in &siblings {
-                match sib_alloc.allocate_block().await {
-                    Ok(offset) => {
-                        metrics
-                            .backend_placement_lane_failovers
-                            .fetch_add(1, Ordering::Relaxed);
-                        return Ok((sib_id.clone(), sib_alloc.clone(), sib_dev.clone(), offset));
-                    }
-                    Err(e) if crate::block_allocator::is_storage_full(&e) => continue,
-                    Err(e) => return Err(e),
-                }
-            }
-            // No volume has supply: the park is for exactly this, and it
-            // is bounded by the same wall as the single-volume form.
-            let reclaimable = allocator.reclaimable_supply_exists()
-                || siblings
-                    .iter()
-                    .any(|(_, a, _)| a.reclaimable_supply_exists());
-            allocator
-                .park_for_reclaimable_supply(e, started, reclaimable)
-                .await?;
-        }
+        let offset = allocator.allocate_block_grace_bounded().await?;
+        Ok((be_id, allocator, device, offset))
     }
 
     /// The VL4 mover's destination pick (design-volume-lifecycle
@@ -4666,62 +4410,17 @@ impl BackendRouter {
                 indices.iter().copied(),
             );
         }
-        // DLM S9 blocker #3: the derived cursor is now seeded, so the lane
-        // floors can be raised past every index a predecessor of this lane
-        // durably RESERVED (not merely published). Structurally inert while
-        // no allocator is partitioned — one `OnceLock` probe per volume.
-        self.recover_alloc_lane_floors(routed).await?;
         Ok(Some(total))
     }
 
-    /// DLM **S9** blocker #3: engage the data-plane allocation partition on
-    /// every allocator this router owns and wire each one's durable
-    /// reservation sink (`crate::data_alloc_lane`).
-    ///
-    /// A **solo** partition engages nothing (that is the single-writer
-    /// byte-identity property, made structural), so this is a no-op on every
-    /// mount today — exactly like `engage_incarnation_keys`, whose gate it
-    /// sits beside.
-    pub fn engage_data_alloc_lanes(
-        &self,
-        part: crate::meta_backend::kv::journal::AppendPartition,
-        meta: std::sync::Arc<crate::meta_backend::RoutedMetaBackend>,
-    ) -> Result<()> {
-        let engage =
-            |alloc: &std::sync::Arc<crate::block_allocator::BlockAllocator>| -> Result<()> {
-                alloc.engage_alloc_lanes(part)?;
-                if alloc.lane_partition().is_some() {
-                    alloc.set_lane_reserve_sink(crate::data_alloc_lane::routed_reserve_sink(
-                        std::sync::Arc::clone(&meta),
-                        alloc.volume_id(),
-                        part.writers(),
-                    ));
-                }
-                Ok(())
-            };
-        engage(&self.default_allocator)?;
-        for be in self.backends.iter() {
-            engage(&be.value().block_allocator)?;
-        }
-        Ok(())
-    }
-
     /// Every DISTINCT allocator this router owns — the default slot's plus
-    /// one per data volume, each named ONCE. The list the
-    /// allocation-partition paths iterate
-    /// ([`Self::recover_alloc_lane_floors`],
-    /// [`crate::alloc_lane_grant::engage_co_writer_lanes`] and its authority
-    /// twin, the supply-close arm, the authority's lane-supply source and
-    /// the dense-frontier source a served lane OPEN reads).
-    ///
-    /// On a real mount the default slot ALIASES the first registered
-    /// volume's allocator (`build_backend` on the default device — the
-    /// first-volume bare-key invariant), so the un-deduplicated list
-    /// engaged that volume twice: two ahead-refill tasks on one allocator,
-    /// three pushed decisions per renewal wake on a two-volume co-writer
-    /// and a claim-rate EWMA sampled twice per tick
+    /// one per data volume, each named ONCE (the allocation-lease arms
+    /// iterate it). On a real mount the default slot ALIASES the first
+    /// registered volume's allocator (`build_backend` on the default device
+    /// — the first-volume bare-key invariant), so the un-deduplicated list
+    /// would arm that volume twice
     /// (`.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md`).
-    pub fn lane_allocators(&self) -> Vec<std::sync::Arc<crate::block_allocator::BlockAllocator>> {
+    pub fn distinct_allocators(&self) -> Vec<std::sync::Arc<crate::block_allocator::BlockAllocator>> {
         let mut allocs = vec![std::sync::Arc::clone(&self.default_allocator)];
         for be in self.backends.iter() {
             let a = &be.value().block_allocator;
@@ -4730,42 +4429,6 @@ impl BackendRouter {
             }
         }
         allocs
-    }
-
-    /// DLM **S9** blocker #3: raise every partitioned allocator's mint floor
-    /// from its volume's durable lane reservations
-    /// ([`crate::data_alloc_lane::recover_lane_floor`]).
-    ///
-    /// Runs AFTER the durable-reference seed, because the rule is
-    /// `max(reservation, derived dense floor)` and the derived half is what
-    /// that seed produces. Nothing to do (and no metadata read) when no
-    /// allocator is partitioned, which is every mount today.
-    pub async fn recover_alloc_lane_floors(
-        &self,
-        routed: &crate::meta_backend::RoutedMetaBackend,
-    ) -> Result<()> {
-        for alloc in self.lane_allocators() {
-            let Some(part) = alloc.lane_partition() else {
-                continue;
-            };
-            let records =
-                crate::data_alloc_lane::load_lane_reservations(routed, alloc.volume_id()).await?;
-            let floor = crate::data_alloc_lane::recover_lane_floor(
-                &records,
-                alloc.highest_block_index(),
-                part,
-            );
-            alloc.install_lane_floor(floor);
-            log::info!(
-                "allocation lane {} of {} on volume '{}' resumes at block {floor} \
-                 ({} durable reservation record(s) read)",
-                part.writer_id(),
-                part.writers(),
-                alloc.volume_id(),
-                records.len()
-            );
-        }
-        Ok(())
     }
 
     /// **Backfill** the durable reference ledger from the layout walk (spec
@@ -5126,39 +4789,24 @@ impl BackendRouter {
 
     /// The `(be_id, allocator)` pair whose volume decodes to the durable
     /// `vol_tag` (KD-5) — DLM S9's owner-side resolution for a shipped
-    /// free (`crate::cowriter::execute_shipped_frees`): the wire carries
+    /// free (`crate::shipped_free::execute_shipped_frees`): the wire carries
     /// the tag `TREE_BLOCK_REFS` keys on, never a path or an ordinal.
-    /// **The lane-reachable free supply, summed across this router's
-    /// distinct allocators** — the `alloc_lane_reachable_blocks` gauge
-    /// (design-free-grace-sustain §8/KD-FG-10). `None` when neither a lane
-    /// partition nor the freed-offset grace plane is engaged: the gauge is
-    /// then ABSENT from the stats JSON (the `alloc_lane_*` family's
-    /// solo-inert convention), so a plain mount exports nothing new.
-    /// Unbounded allocators (space not a constraint) saturate the sum.
-    pub fn lane_reachable_blocks_sum(&self) -> Option<u64> {
-        let allocs = self.lane_allocators();
-        let engaged =
-            crate::free_grace::armed() || allocs.iter().any(|a| a.lane_partition().is_some());
-        if !engaged {
+    /// **The reachable free supply, summed across this router's distinct
+    /// allocators** — the `alloc_reachable_blocks` gauge
+    /// (design-free-grace-sustain §8/KD-FG-10). `None` when the freed-offset
+    /// grace plane is not engaged: the gauge is then ABSENT from the stats
+    /// JSON, so a plain mount exports nothing new. Unbounded allocators
+    /// (space not a constraint) saturate the sum.
+    pub fn reachable_free_blocks_sum(&self) -> Option<u64> {
+        if !crate::free_grace::armed() {
             return None;
         }
         Some(
-            allocs
+            self.distinct_allocators()
                 .iter()
-                .map(|a| a.lane_reachable_blocks())
+                .map(|a| a.reachable_free_blocks())
                 .fold(0u64, u64::saturating_add),
         )
-    }
-
-    /// Free-listed blocks in lanes this mount does NOT own, summed over
-    /// its allocators (deduplicated like [`Self::lane_reachable_blocks_sum`])
-    /// — on an authority, the supply it holds FOR its co-writers
-    /// (`alloc_lane_supply_blocks`, finding 15 term 2). 0 unpartitioned.
-    pub fn lane_supply_blocks_sum(&self) -> u64 {
-        self.lane_allocators()
-            .iter()
-            .map(|a| a.foreign_lane_free_blocks())
-            .fold(0u64, u64::saturating_add)
     }
 
     pub fn allocator_for_volume_tag(
@@ -5197,34 +4845,6 @@ impl BackendRouter {
     /// validated cache fills may now publish bytes for it.
     pub fn publish_block(&self, block_key: &str) {
         self.with_allocator_for_key(block_key, |alloc, offset| alloc.publish_block(offset));
-    }
-
-    /// A SERVED layout publish committed the durable references `taken`
-    /// (finding 51): publish this authority's incarnation word for every
-    /// FOREIGN-lane block among them — the peer's DMA behind each is
-    /// complete, and the serve is the only event on this node that
-    /// witnesses it ([`crate::block_allocator::BlockAllocator::
-    /// witness_served_binding`]). Own-lane and unknown-volume references
-    /// are skipped. Returns the number of words published (the
-    /// `served_binding_witnesses` engagement gauge).
-    pub fn witness_served_bindings(
-        &self,
-        taken: &[crate::meta_backend::kv::block_refs::BlockRef],
-    ) -> u64 {
-        let mut published = 0u64;
-        for r in taken {
-            if let Some((_, alloc)) = self.allocator_for_volume_tag(r.vol_tag) {
-                if alloc.witness_served_binding(r.block_idx) {
-                    published += 1;
-                }
-            }
-        }
-        if published > 0 {
-            crate::fuse_client::METRICS
-                .served_binding_witnesses
-                .fetch_add(published, std::sync::atomic::Ordering::Relaxed);
-        }
-        published
     }
 
     /// Incarnation snapshot for a validated cache fill (None = unstable, do not
@@ -5285,7 +4905,7 @@ impl BackendRouter {
     /// [`Self::free_block`] with the verdict: `true` ⇔ the release was the
     /// block's TERMINAL one (the destructive reclaim window opened). A
     /// co-writer's shipped free answers `false` here — its verdict is the
-    /// authority's (`crate::cowriter::ship_displaced_frees`).
+    /// authority's (`crate::shipped_free::ship_displaced_frees`).
     ///
     /// The tenant-release ledger rides here (design-small-file-packing
     /// §10): a release of a TENANT-shaped key — a size-carrying mapping,
@@ -5301,10 +4921,10 @@ impl BackendRouter {
         // freed anywhere, forever). The scope check keeps the owner-side
         // executor's own ladder — which runs THROUGH this function — off
         // the ship branch (`crate::cowriter` owns both halves).
-        if (crate::fuse_client::co_writer_mount() || self.frees_ship_to_holder(block_key))
-            && !crate::cowriter::authority_accounting_scope_active()
+        if (false || self.frees_ship_to_holder(block_key))
+            && !crate::shipped_free::authority_accounting_scope_active()
         {
-            crate::cowriter::ship_displaced_frees(self, &[block_key]).await?;
+            crate::shipped_free::ship_displaced_frees(self, &[block_key]).await?;
             return Ok(false);
         }
         // Decoration-tolerant: size-carrying mappings (`bk:off:len` — see
@@ -5407,7 +5027,7 @@ impl BackendRouter {
         if !tracked
             && allocator.block_grant_armed()
             && allocator.holds_ownership_plane()
-            && !crate::cowriter::authority_accounting_scope_active()
+            && !crate::shipped_free::authority_accounting_scope_active()
         {
             if let Some(gate) = self.untracked_free_gate.get() {
                 let vol_tag =
@@ -5567,11 +5187,11 @@ impl BackendRouter {
     pub async fn free_blocks(&self, block_keys: &[&str]) -> Result<()> {
         // DLM S9: the batch form ships ONE free verb per data volume
         // instead of one per displaced block (see `free_block` above).
-        if (crate::fuse_client::co_writer_mount()
+        if (false
             || block_keys.iter().any(|k| self.frees_ship_to_holder(k)))
-            && !crate::cowriter::authority_accounting_scope_active()
+            && !crate::shipped_free::authority_accounting_scope_active()
         {
-            let _ = crate::cowriter::ship_displaced_frees(self, block_keys).await;
+            let _ = crate::shipped_free::ship_displaced_frees(self, block_keys).await;
             return Ok(());
         }
         for &block_key in block_keys {
@@ -7920,36 +7540,6 @@ impl DataRouter {
         // every peer's lane and ignores the reservation frontier a live peer
         // published ahead of the durable references.
         //
-        // The lane itself comes from `data_alloc_lane::mount_partition()`,
-        // which is `SOLO` until an admission installs one (§6.9 S9's custody
-        // lease — the named residual in the design record's §7). A solo
-        // partition engages NOTHING, so this is inert on every mount today
-        // twice over: no volume carries bit 11, and no mount is a co-writer.
-        let part = crate::data_alloc_lane::mount_partition();
-        if !part.is_solo()
-            && !meta_backend.volumes.is_empty()
-            && meta_backend.volumes.iter().all(|v| {
-                v.superblock().features_incompat
-                    & crate::meta_backend::kv::superblock::FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA
-                    != 0
-            })
-        {
-            match self
-                .backend_router
-                .engage_data_alloc_lanes(part, std::sync::Arc::clone(&meta_backend))
-            {
-                Ok(()) => log::info!(
-                    "data-plane allocation partition engaged: lane {} of {} — fresh block \
-                     allocation is this writer's residue class, frees stay lane-blind",
-                    part.writer_id(),
-                    part.writers()
-                ),
-                Err(e) => log::error!(
-                    "data-plane allocation partition NOT engaged: {e} — this mount would mint \
-                     offsets across every peer's lane, so the multi-writer arm must refuse"
-                ),
-            }
-        }
         // PR 3 (kvmap, Rev 1.3 #3): the tree-7 record encoder — the
         // round-trip law needs this router's volume census, so the
         // wiring point where router and meta backend meet installs it.
@@ -8080,14 +7670,9 @@ impl DataRouter {
                         // Teardown: nothing decides — the shipped refusal.
                         return Ok(crate::meta_ship::publish::FreeVerdict::Refused);
                     };
-                    let verdicts = crate::cowriter::execute_shipped_frees(
-                        &br,
-                        &mb,
-                        vol_tag,
-                        &[block_idx],
-                        &crate::cowriter::live_owner_view(),
-                    )
-                    .await?;
+                    let verdicts =
+                        crate::shipped_free::execute_shipped_frees(&br, &mb, vol_tag, &[block_idx])
+                            .await?;
                     Ok(verdicts
                         .into_iter()
                         .next()
@@ -8875,8 +8460,8 @@ impl DataRouter {
     /// with the durable head's foreign view and nothing ever discarded
     /// it). Capacity/idle eviction remains the fsck-C2 backstop.
     fn reclaim_own_mint_blob(&self, ino: u64, m: &CachedMetadata, why: &'static str) {
-        if crate::fuse_client::co_writer_mount()
-            && !crate::cowriter::authority_accounting_scope_active()
+        if false
+            && !crate::shipped_free::authority_accounting_scope_active()
             && crate::meta_ship::tokens::range_episode(ino)
         {
             {
@@ -9524,7 +9109,7 @@ impl DataRouter {
         // durable predecessor's blob rather than the snapshot's belief.
         // Solo mounts and non-episode inos take the body verbatim (one
         // relaxed probe).
-        let episode_compose = !crate::fuse_client::co_writer_mount()
+        let episode_compose = !false
             && crate::data_grant::custody_owner().is_some()
             && crate::dlm::ino_has_range_custody(ino)
             && m.block_map.is_some()
@@ -10337,8 +9922,8 @@ impl DataRouter {
         // blob — its MAP_BLOB record releases IN the flip tx and the
         // device block frees on the existing post-commit tail. The
         // finding-23/24 foreign-lifecycle skip applies verbatim.
-        let foreign_blob_lifecycle = crate::fuse_client::co_writer_mount()
-            && !crate::cowriter::authority_accounting_scope_active()
+        let foreign_blob_lifecycle = false
+            && !crate::shipped_free::authority_accounting_scope_active()
             && crate::meta_ship::tokens::range_episode(ino)
             && !m.block_map_id_own_mint;
         let mut old_indirect_to_free = None;
@@ -10915,8 +10500,8 @@ impl DataRouter {
         // EPISODE, never the live-grant hull — the trim/doubling churn
         // retires an ino's whole grant set for an instant, and a save in
         // that gap re-opened the duplicate free (attempt 5's residual).
-        let foreign_blob_lifecycle = crate::fuse_client::co_writer_mount()
-            && !crate::cowriter::authority_accounting_scope_active()
+        let foreign_blob_lifecycle = false
+            && !crate::shipped_free::authority_accounting_scope_active()
             && crate::meta_ship::tokens::range_episode(ino)
             && !m.block_map_id_own_mint;
 
@@ -11449,7 +11034,7 @@ impl DataRouter {
         // it again (the second free came back `Refused` on the
         // authority's untracked tripwire, one per re-arm).
         if let Some(ref old_key) = old_indirect_to_free {
-            if m.block_map_id_own_mint && crate::fuse_client::co_writer_mount() {
+            if m.block_map_id_own_mint && false {
                 self.note_own_mint_reclaimed(ino, old_key);
             }
         }
@@ -14858,7 +14443,7 @@ impl DataRouter {
                              BLOCK_FLUSH_LOCKS + INODE_META_LOCKS (key '{cur_key}' — {}; \
                              co_writer {})",
                             self.backend_router.binding_move_diagnosis(&cur_key),
-                            crate::fuse_client::co_writer_mount(),
+                            false,
                         ),
                     );
                 }
@@ -15421,21 +15006,6 @@ impl DataRouter {
         file_id: &str,
         fencing_token: u64,
     ) -> Result<Option<PromotedInto>> {
-        // A CO-WRITER's per-file promotion is the batch driver's degenerate
-        // batch of one (design-small-file-packing §5.2/§5.6): its packed
-        // arm is the batch-scoped group pack, never the shared open pack
-        // (whose pin is not authoritative there).
-        if small_file_packing_enabled() && crate::fuse_client::co_writer_mount() {
-            return self
-                .promote_cowriter_batch(vec![StagedPromotionItem {
-                    file_path: file_path.to_string(),
-                    file_id: file_id.to_string(),
-                    fencing_token,
-                }])
-                .await
-                .pop()
-                .unwrap_or(Ok(None));
-        }
         self.promote_staged_file_per_file(file_path, file_id, fencing_token)
             .await
     }
@@ -15486,7 +15056,7 @@ impl DataRouter {
                 METRICS
                     .pack_own_block_promotions
                     .fetch_add(1, Ordering::Relaxed);
-            } else if !crate::fuse_client::co_writer_mount() {
+            } else if !false {
                 return self.prepare_packed_promotion(img).await;
             }
         }
@@ -15661,7 +15231,7 @@ impl DataRouter {
     /// `prepare` composes the same two arms with its promotion counters and
     /// its resident-and-counted answer to a stopped arm.
     async fn land_stored_image(&self, ino: u64, image: bytes::Bytes) -> Result<LandedImage> {
-        if small_file_packing_enabled() && !crate::fuse_client::co_writer_mount() {
+        if small_file_packing_enabled() && !false {
             let slot = pack_slot_len(image.len() as u64);
             if slot <= pack_max_slot_bytes() {
                 if let Some(landed) = self.land_packed_image(ino, image.clone(), slot).await? {
@@ -15686,30 +15256,19 @@ impl DataRouter {
         }
     }
 
-    /// A landed image whose mapping never took the layout (the commit was
-    /// refused, failed, or a racing publish won): the own-block arm's
-    /// offset is never-published — the co-writer-aware abandon (d575be03
-    /// sweep) keyed on the publish OUTCOME class (FIND-PK-4,
-    /// design-small-file-packing §5.3: a co-writer recycles the offset into
-    /// its lane only when the shipped save's outcome is KNOWN; a transport
-    /// failure past the ladder MAY have applied the layout on the owner, so
-    /// that class abandons without recycle); the packed arm's tenant
-    /// reference releases through the allocator's one release primitive
-    /// (§5.2 step 6). OUTSIDE every 3.5 guard (RES-1 — the packed release
-    /// is terminal when the pack sealed and every sibling was deleted, and a
-    /// terminal free's reclaim enqueue parks at the cap).
-    async fn release_landed_site(
-        &self,
-        site: PreparedSite,
-        outcome: crate::block_allocator::PackPublishOutcome,
-    ) {
+    /// Release a PREPARED landing whose promotion did not commit: the block
+    /// arm's never-published offset is abandoned
+    /// (`BlockAllocator::abandon_unpublished_offset`); the packed arm's
+    /// tenant reference releases through the allocator's one release
+    /// primitive (§5.2 step 6). OUTSIDE every 3.5 guard (RES-1 — the packed
+    /// release is terminal when the pack sealed and every sibling was
+    /// deleted, and a terminal free's reclaim enqueue parks at the cap).
+    async fn release_landed_site(&self, site: PreparedSite) {
         match site {
             PreparedSite::Block {
                 allocator, offset, ..
             } => {
-                let _ = allocator
-                    .abandon_unpublished_offset_with(offset, outcome)
-                    .await;
+                let _ = allocator.abandon_unpublished_offset(offset).await;
             }
             PreparedSite::Packed(tenant) => self.release_pack_tenant(tenant).await,
         }
@@ -15845,11 +15404,7 @@ impl DataRouter {
         if let Err(e) = tenant
             .pack
             .allocator
-            .release_pack_reference(
-                &self.backend_router,
-                &tenant.pack.base_key,
-                crate::block_allocator::PackPublishOutcome::Known,
-            )
+            .release_pack_reference(&self.backend_router, &tenant.pack.base_key)
             .await
         {
             log::error!(
@@ -15998,617 +15553,6 @@ impl DataRouter {
                         .is_some_and(|fid| self.cache.nvme.staged_len(fid).is_some())
             })
             .unwrap_or(false)
-    }
-
-    /// **The promotion BATCH driver** (design-small-file-packing §5.6, PR
-    /// PK4) — the entry every batch promoter runs (the merge worker's
-    /// `promote_batch`, the dismount pass; the fsync lever and every other
-    /// per-file call reach it as a batch of one on a co-writer). Returns one
-    /// outcome per item, input order.
-    ///
-    /// On an authority / solo writer it is the per-file composition
-    /// verbatim (the shared open pack's pin is authoritative there; the
-    /// pack may span batches and meta volumes). On a **CO-WRITER** under the
-    /// lever it is the batch-scoped group pack: every packable tenant's
-    /// image is read and transformed, the tenants are PARTITIONED by
-    /// `(owner endpoint, route_ino(ino).0)`, each partition fills
-    /// successive PRIVATE packs (≤ [`crate::meta_ship::publish::pack_group_tenant_cap`]
-    /// tenants and one chunk each), every tenant DMAs BEFORE any publish,
-    /// and each pack commits as ONE `pack_group` frame the owner serves as
-    /// ONE conveyor group on ONE home volume — or refuses whole. A refused
-    /// pack is ABANDONED (KNOWN → the lane recycle) and its tenants are
-    /// re-`prepare`d into FRESH packs (SPLIT, once — new partition, new
-    /// reservation, new DMA, one new frame per pack) or promoted
-    /// one-block-per-file (UNAVAILABLE, a second SPLIT): **at most ONE
-    /// `pack_group` frame ever names a given pack block** (KD-4). A
-    /// transport failure past the resend ladder (`TransportOutcomeUnknown`)
-    /// abandons the pack WITHOUT recycle (FIND-PK-4).
-    pub async fn promote_staged_batch(
-        &self,
-        items: Vec<StagedPromotionItem>,
-    ) -> Vec<Result<Option<PromotedInto>>> {
-        if !(small_file_packing_enabled() && crate::fuse_client::co_writer_mount()) {
-            let mut out = Vec::with_capacity(items.len());
-            for it in &items {
-                out.push(
-                    self.promote_staged_file_per_file(&it.file_path, &it.file_id, it.fencing_token)
-                        .await,
-                );
-            }
-            return out;
-        }
-        self.promote_cowriter_batch(items).await
-    }
-
-    /// The co-writer arm of [`Self::promote_staged_batch`]: two passes of
-    /// [`Self::drive_cowriter_pack_batch`] — the second is the ONE retry a
-    /// SPLIT refusal buys.
-    async fn promote_cowriter_batch(
-        &self,
-        items: Vec<StagedPromotionItem>,
-    ) -> Vec<Result<Option<PromotedInto>>> {
-        METRICS
-            .pack_cowriter_batches
-            .fetch_add(1, Ordering::Relaxed);
-        let n = items.len();
-        let mut results: Vec<Option<Result<Option<PromotedInto>>>> = (0..n).map(|_| None).collect();
-        let first_pass: Vec<usize> = (0..n).collect();
-        let split_retry = self
-            .drive_cowriter_pack_batch(&items, first_pass, &mut results, true)
-            .await;
-        if !split_retry.is_empty() {
-            // The ONE retry after a SPLIT refusal: fresh packs on the
-            // now-current routes; a second SPLIT inside falls back
-            // one-block-per-file (`allow_split_retry = false`).
-            let again = self
-                .drive_cowriter_pack_batch(&items, split_retry, &mut results, false)
-                .await;
-            debug_assert!(again.is_empty(), "the second pass never asks for a third");
-        }
-        results.into_iter().map(|r| r.unwrap_or(Ok(None))).collect()
-    }
-
-    /// One pass of the co-writer driver over `idxs` (a subset of `items`):
-    /// read + dispatch every item (inline and own-block classes commit
-    /// per-file at once), partition the packable tenants, commit each
-    /// partition's packs. Returns the item indices a SPLIT refusal handed
-    /// back for the one retry (empty when `allow_split_retry` is false —
-    /// those fell back one-block-per-file inside).
-    async fn drive_cowriter_pack_batch(
-        &self,
-        items: &[StagedPromotionItem],
-        idxs: Vec<usize>,
-        results: &mut [Option<Result<Option<PromotedInto>>>],
-        allow_split_retry: bool,
-    ) -> Vec<usize> {
-        let grant_ok = crate::membership::pack_group_available();
-        let mut partitions: std::collections::BTreeMap<(String, usize), Vec<(usize, DeviceImage)>> =
-            std::collections::BTreeMap::new();
-        for i in idxs {
-            let it = &items[i];
-            let img = match self.read_promotion_image(&it.file_path, &it.file_id).await {
-                Err(e) => {
-                    results[i] = Some(Err(e));
-                    continue;
-                }
-                Ok(None) => {
-                    results[i] = Some(Ok(None));
-                    continue;
-                }
-                Ok(Some(PromotionImage::Inline(inline))) => {
-                    results[i] = Some(
-                        self.commit_promotion(PreparedPromotion::Inline(inline), it.fencing_token)
-                            .await,
-                    );
-                    continue;
-                }
-                Ok(Some(PromotionImage::Device(img))) => img,
-            };
-            if img.slot > pack_max_slot_bytes() {
-                METRICS
-                    .pack_own_block_promotions
-                    .fetch_add(1, Ordering::Relaxed);
-                results[i] = Some(self.promote_image_own_block(img, it.fencing_token).await);
-                continue;
-            }
-            if !grant_ok {
-                // The grant does not advertise pack groups (§5.6 (a)): the
-                // FIXED block arm, byte-identical to PK2, counted.
-                METRICS
-                    .pack_cowriter_group_unavailable
-                    .fetch_add(1, Ordering::Relaxed);
-                results[i] = Some(self.promote_image_own_block(img, it.fencing_token).await);
-                continue;
-            }
-            let home = self
-                .inner
-                .meta_backend
-                .get()
-                .map(|be| be.route_ino(img.ino).0);
-            let owner = home.and_then(crate::meta_ship::owner_of_volume);
-            let (Some(v_idx), Some(owner)) = (home, owner) else {
-                // A local-home ino on a co-writer (no owner routes it): the
-                // per-file arm's own refusal law governs — never a pack.
-                results[i] = Some(self.promote_image_own_block(img, it.fencing_token).await);
-                continue;
-            };
-            if pack_group_endpoint_latched(&owner.endpoint) {
-                // The owner refused a pack group as UNAVAILABLE under the
-                // current grant: one-block-per-file until the next grant.
-                METRICS
-                    .pack_cowriter_group_refusals
-                    .fetch_add(1, Ordering::Relaxed);
-                results[i] = Some(self.promote_image_own_block(img, it.fencing_token).await);
-                continue;
-            }
-            partitions
-                .entry((owner.endpoint.clone(), v_idx))
-                .or_default()
-                .push((i, img));
-        }
-        if partitions.len() > 1 {
-            METRICS
-                .pack_batch_volume_splits
-                .fetch_add(partitions.len() as u64, Ordering::Relaxed);
-        }
-        let mut split_retry = Vec::new();
-        for ((endpoint, _), members) in partitions {
-            split_retry.extend(
-                self.promote_partition(items, &endpoint, members, results, allow_split_retry)
-                    .await,
-            );
-        }
-        split_retry
-    }
-
-    /// The FIXED block arm for one prepared image (the co-writer's
-    /// never-wrong fallback): its own block, `bk:0:len`, the per-file commit.
-    async fn promote_image_own_block(
-        &self,
-        img: DeviceImage,
-        fencing_token: u64,
-    ) -> Result<Option<PromotedInto>> {
-        let prepared = self.prepare_block_from_image(img).await?;
-        self.commit_promotion(prepared, fencing_token).await
-    }
-
-    /// One-block-per-file for an item whose pack was refused: the ring
-    /// entry is still resident (nothing committed), so the image is re-read
-    /// and the item runs the per-file composition from the start.
-    async fn promote_item_own_block(
-        &self,
-        it: &StagedPromotionItem,
-    ) -> Result<Option<PromotedInto>> {
-        match self
-            .read_promotion_image(&it.file_path, &it.file_id)
-            .await?
-        {
-            None => Ok(None),
-            Some(PromotionImage::Inline(inline)) => {
-                self.commit_promotion(PreparedPromotion::Inline(inline), it.fencing_token)
-                    .await
-            }
-            Some(PromotionImage::Device(img)) => {
-                self.promote_image_own_block(img, it.fencing_token).await
-            }
-        }
-    }
-
-    /// One `(owner endpoint, home volume)` partition: fill successive
-    /// private packs (the frame cap, the chunk), each tenant DMA'd at its
-    /// reservation, then commit every pack as its own group and seal it.
-    /// Returns the item indices handed back for the SPLIT retry.
-    async fn promote_partition(
-        &self,
-        items: &[StagedPromotionItem],
-        endpoint: &str,
-        members: Vec<(usize, DeviceImage)>,
-        results: &mut [Option<Result<Option<PromotedInto>>>],
-        allow_split_retry: bool,
-    ) -> Vec<usize> {
-        let cap = crate::meta_ship::publish::pack_group_tenant_cap().max(1);
-        let mut packs: Vec<(
-            std::sync::Arc<crate::pack::OpenPack>,
-            Vec<(usize, PreparedDevicePromotion)>,
-        )> = Vec::new();
-        let mut current: Option<(
-            std::sync::Arc<crate::pack::OpenPack>,
-            Vec<(usize, PreparedDevicePromotion)>,
-        )> = None;
-        let mut queue: std::collections::VecDeque<(usize, DeviceImage)> = members.into();
-        while let Some((i, img)) = queue.pop_front() {
-            let need_new = match &current {
-                None => true,
-                Some((_, tenants)) => tenants.len() >= cap,
-            };
-            if need_new {
-                if let Some(done) = current.take() {
-                    packs.push(done);
-                }
-                match self.packer.open_private(&self.backend_router).await {
-                    Ok(Some(pack)) => current = Some((pack, Vec::new())),
-                    Ok(None) => {
-                        // OQ-1: StorageFull stops the arm — this tenant and
-                        // every remaining one stay resident, counted.
-                        results[i] = Some(Ok(None));
-                        METRICS
-                            .pack_arm_stopped_promotions
-                            .fetch_add(1 + queue.len() as u64, Ordering::Relaxed);
-                        for (j, _) in queue.drain(..) {
-                            results[j] = Some(Ok(None));
-                        }
-                        break;
-                    }
-                    Err(e) => {
-                        results[i] = Some(Err(e));
-                        continue;
-                    }
-                }
-            }
-            let Some((pack, tenants)) = current.as_mut() else {
-                continue;
-            };
-            match crate::pack::Packer::reserve_in(pack, img.slot) {
-                Some(tenant) => {
-                    let DeviceImage {
-                        ino,
-                        file_id,
-                        gen,
-                        raw_len,
-                        slot,
-                        image,
-                    } = img;
-                    // The one landing primitive the shared pack uses too.
-                    match self.land_tenant(tenant, ino, image, slot).await {
-                        Ok(LandedImage { block_key, site }) => tenants.push((
-                            i,
-                            PreparedDevicePromotion {
-                                ino,
-                                file_id,
-                                gen,
-                                raw_len,
-                                block_key,
-                                site,
-                            },
-                        )),
-                        Err(e) => results[i] = Some(Err(e)),
-                    }
-                }
-                None => {
-                    // This pack is full: it closes here; the tenant heads
-                    // the next one.
-                    if let Some(done) = current.take() {
-                        packs.push(done);
-                    }
-                    queue.push_front((i, img));
-                }
-            }
-        }
-        if let Some(done) = current.take() {
-            packs.push(done);
-        }
-        let mut split_retry = Vec::new();
-        for (pack, tenants) in packs {
-            match self.commit_pack_group(items, &pack, tenants, results).await {
-                PackGroupFate::Done => {}
-                PackGroupFate::Unavailable(idxs) => {
-                    latch_pack_group_endpoint(endpoint);
-                    for i in idxs {
-                        METRICS
-                            .pack_cowriter_group_refusals
-                            .fetch_add(1, Ordering::Relaxed);
-                        results[i] = Some(self.promote_item_own_block(&items[i]).await);
-                    }
-                }
-                PackGroupFate::Split(idxs) => {
-                    if allow_split_retry {
-                        split_retry.extend(idxs);
-                    } else {
-                        for i in idxs {
-                            METRICS
-                                .pack_cowriter_group_splits
-                                .fetch_add(1, Ordering::Relaxed);
-                            results[i] = Some(self.promote_item_own_block(&items[i]).await);
-                        }
-                    }
-                }
-            }
-        }
-        split_retry
-    }
-
-    /// **`commit_group`** for one private pack (design-small-file-packing
-    /// §5.2/§5.6, KD-10): the tenants' 3.5 guards as ONE canonical
-    /// acquisition ([`meta_lock_acquire_many`]), every tenant re-checked and
-    /// its layout STAGED under them by the save body's `stage` half (no RAM
-    /// entry published — the FIFO argument's one line), the N calls shipped
-    /// as ONE `pack_group` frame, every reply `finish`ed (the RAM publish,
-    /// the displaced older copy's purge, the ring-entry release — leg 5,
-    /// inside the guarded section), then — after the guards drop — the
-    /// displaced keys freed and every uncommitted tenant's reference
-    /// released (RES-1), the pre-seal seam, and the SEAL with the frame's
-    /// typed outcome class. A frame-level UNAVAILABLE / SPLIT refusal hands
-    /// every tenant back to the driver.
-    async fn commit_pack_group(
-        &self,
-        items: &[StagedPromotionItem],
-        pack: &std::sync::Arc<crate::pack::OpenPack>,
-        tenants: Vec<(usize, PreparedDevicePromotion)>,
-        results: &mut [Option<Result<Option<PromotedInto>>>],
-    ) -> PackGroupFate {
-        let nvme = &self.cache.nvme;
-        let mut fate = PackGroupFate::Done;
-        let mut outcome = crate::block_allocator::PackPublishOutcome::Known;
-        // RES-1: displaced keys and refused tenants' references leave the
-        // guarded section and settle after it.
-        let mut deferred: Vec<String> = Vec::new();
-        let mut give_back: Vec<crate::pack::PackTenant> = Vec::new();
-        let mut staged: Vec<StagedTenant> = Vec::with_capacity(tenants.len());
-        // Per staged tenant: its layout committed (the reference is the
-        // layout's now; everything else gives its reference back).
-        let mut committed: Vec<bool> = Vec::new();
-        let guards = if tenants.is_empty() {
-            Vec::new()
-        } else {
-            let inos: Vec<u64> = tenants.iter().map(|(_, t)| t.ino).collect();
-            let guards = meta_lock_acquire_many(&inos).await;
-            pack_trace(|| PackTrace::GuardsHeld {
-                stripes: guards.len(),
-            });
-            // Re-check + compose every tenant's layout under the guards.
-            for (i, prepared) in tenants {
-                let ino = prepared.ino;
-                let fid = prepared.file_id.as_str();
-                let current = match self.metadata_cache.get(&ino) {
-                    Some(m) => Some(m),
-                    None => match self.fetch_metadata_from_backend(ino).await {
-                        Ok(m) => m,
-                        Err(e) => {
-                            results[i] = Some(Err(e));
-                            give_back.extend(prepared.into_pack_tenant());
-                            continue;
-                        }
-                    },
-                };
-                let Some(current) = current else {
-                    results[i] = Some(Ok(None));
-                    give_back.extend(prepared.into_pack_tenant());
-                    continue;
-                };
-                if current.file_type != "staged"
-                    || current.file_id.as_deref() != Some(fid)
-                    || nvme.staged_generation(fid).await != Some(prepared.gen)
-                {
-                    results[i] = Some(Ok(None));
-                    give_back.extend(prepared.into_pack_tenant());
-                    continue;
-                }
-                let mut updated = current.clone();
-                let mut block_map = updated.block_map.take().unwrap_or_default();
-                let displaced =
-                    std::sync::Arc::make_mut(&mut block_map).insert(0, prepared.block_key.clone());
-                updated.block_map = Some(block_map);
-                updated.size = updated.size.max(prepared.raw_len as u64);
-                updated.layout_dirty = false;
-                updated.cached_at = std::time::Instant::now();
-                let refs = self.block_ref_ops_for_map_swap(
-                    ino,
-                    current.block_map.as_deref(),
-                    updated.block_map.as_deref(),
-                );
-                staged.push(StagedTenant {
-                    i,
-                    prepared,
-                    updated,
-                    refs,
-                    displaced,
-                });
-            }
-            committed = vec![false; staged.len()];
-            // `stage` × N — nothing here touches the RAM layout cache.
-            let mut pendings: Vec<Option<Box<PendingLayoutSave<'_>>>> =
-                Vec::with_capacity(staged.len());
-            for t in &staged {
-                let token = items[t.i].fencing_token;
-                match self
-                    .stage_layout_save(t.prepared.ino, &t.updated, token, None, &t.refs)
-                    .await
-                {
-                    Ok(StagedLayoutSave::Pending(p)) => pendings.push(Some(p)),
-                    Ok(StagedLayoutSave::Done(_)) => {
-                        // The kvmap train served the save whole — committed
-                        // (unreachable for a one-mapping staged file).
-                        pendings.push(None);
-                        committed[pendings.len() - 1] = true;
-                    }
-                    Err(e) => {
-                        pendings.push(None);
-                        results[t.i] = Some(Err(e));
-                    }
-                }
-            }
-            // `ship_group`: the pending saves as ONE frame.
-            let mut group_items = Vec::new();
-            let mut group_k: Vec<usize> = Vec::new();
-            let mut refills: Vec<Vec<crate::meta_backend::kv::block_refs::BlockRefOp>> = Vec::new();
-            for (k, p) in pendings.iter_mut().enumerate() {
-                if let Some(p) = p.as_mut() {
-                    debug_assert!(
-                        p.delta.is_none(),
-                        "a promotion save is never delta-eligible (publish_entries = None)"
-                    );
-                    let refs = std::mem::take(&mut p.refs);
-                    refills.push(refs.clone());
-                    group_items.push(crate::meta_ship::publish::PackGroupItem {
-                        ino: p.ino,
-                        layout: std::mem::take(&mut p.bytes),
-                        size: p.m.size,
-                        refs,
-                    });
-                    group_k.push(k);
-                }
-            }
-            let shipped: Result<Vec<Result<crate::meta_ship::publish::OwnerVerdict>>> =
-                if group_items.is_empty() {
-                    Ok(Vec::new())
-                } else {
-                    match self.inner.meta_backend.get() {
-                        None => Err(SqueezefsError::InvalidOperation(
-                            "Metadata backend not initialized".to_string(),
-                        )),
-                        Some(backend) => {
-                            pack_trace(|| PackTrace::FrameDeparture {
-                                pack: pack.seq(),
-                                base_key: pack.base_key.clone(),
-                                inos: group_items.iter().map(|g| g.ino).collect(),
-                            });
-                            METRICS.pack_cowriter_frames.fetch_add(1, Ordering::Relaxed);
-                            crate::meta_ship::publish::set_layout_and_size_pack_group(
-                                backend,
-                                group_items,
-                            )
-                            .await
-                        }
-                    }
-                };
-            let t_commit = std::time::Instant::now();
-            // `finish` × N under the still-held guards.
-            match shipped {
-                Ok(verdicts) => {
-                    for ((k, refill), verdict) in group_k.into_iter().zip(refills).zip(verdicts) {
-                        let t = &staged[k];
-                        let Some(pending) = pendings[k].take() else {
-                            continue;
-                        };
-                        match verdict {
-                            Ok(v) => {
-                                self.retire_recomputed_parked(t.prepared.ino, &v.freed);
-                                let shipped_save = ShippedLayoutSave {
-                                    delta_used: false,
-                                    minted_version: pending.minted_version,
-                                    owner_recomputed: v.recomputed,
-                                    local_released: Vec::new(),
-                                    t_commit,
-                                };
-                                let _ = self.finish_layout_save(*pending, shipped_save).await;
-                                committed[k] = true;
-                            }
-                            Err(e) => {
-                                // The never-lossy refill (the drained notes
-                                // stay owed) MINUS this promotion's own ops:
-                                // its block is abandoned and no map names it.
-                                self.note_block_ref_ops(t.prepared.ino, refill);
-                                self.retract_block_ref_ops(t.prepared.ino, &t.refs);
-                                self.reset_layout_provenance(t.prepared.ino);
-                                results[t.i] = Some(Err(e));
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    for (k, refill) in group_k.into_iter().zip(refills) {
-                        let t = &staged[k];
-                        pendings[k] = None;
-                        self.note_block_ref_ops(t.prepared.ino, refill);
-                        self.retract_block_ref_ops(t.prepared.ino, &t.refs);
-                        self.reset_layout_provenance(t.prepared.ino);
-                    }
-                    let handed_back: Vec<usize> = staged.iter().map(|t| t.i).collect();
-                    // PK4: outcome-class arms begin
-                    match &e {
-                        SqueezefsError::PublishFailure {
-                            class: crate::error::PublishFailureClass::FrameRefused(status),
-                            ..
-                        } if *status
-                            == crate::meta_ship::publish::PUBLISH_PACK_GROUP_UNAVAILABLE =>
-                        {
-                            fate = PackGroupFate::Unavailable(handed_back);
-                        }
-                        SqueezefsError::PublishFailure {
-                            class: crate::error::PublishFailureClass::FrameRefused(status),
-                            ..
-                        } if *status == crate::meta_ship::publish::PUBLISH_PACK_GROUP_SPLIT => {
-                            fate = PackGroupFate::Split(handed_back);
-                        }
-                        SqueezefsError::PublishFailure { class, msg } => {
-                            if *class == crate::error::PublishFailureClass::TransportOutcomeUnknown
-                            {
-                                outcome = crate::block_allocator::PackPublishOutcome::Unknown;
-                            }
-                            for i in handed_back {
-                                results[i] = Some(Err(SqueezefsError::PublishFailure {
-                                    class: *class,
-                                    msg: msg.clone(),
-                                }));
-                            }
-                        }
-                        // PK4: outcome-class arms end
-                        other => {
-                            for i in handed_back {
-                                results[i] = Some(Err(SqueezefsError::InvalidOperation(format!(
-                                    "packing: the pack group's publish failed: {other}"
-                                ))));
-                            }
-                        }
-                    }
-                }
-            }
-            // The committed tenants' post-actions: the displaced older
-            // copy's purge (its free after the guards), the ring-entry
-            // release INSIDE the guarded section (leg 5), the ledger rows.
-            for (k, t) in staged.iter().enumerate() {
-                if !committed[k] {
-                    continue;
-                }
-                if let Some(prev) = t.displaced.as_ref() {
-                    if *prev != t.prepared.block_key {
-                        self.cache.purge_block_key(prev);
-                        deferred.push(prev.clone());
-                    }
-                }
-                let _ = nvme
-                    .remove_staged_if_generation_async(t.prepared.file_id.clone(), t.prepared.gen)
-                    .await;
-                self.note_landed_tenant_committed(&t.prepared.site);
-                results[t.i] = Some(Ok(Some(PromotedInto::Packed)));
-            }
-            drop(pendings);
-            guards
-        };
-        // RES-1: the guards drop with the section; every release below runs
-        // with none held.
-        drop(guards);
-        pack_trace(|| PackTrace::GuardsDropped);
-        self.free_deferred_keys(deferred).await;
-        let committed_n = committed.iter().filter(|c| **c).count() as u64;
-        for (k, t) in staged.into_iter().enumerate() {
-            if committed[k] {
-                // The layout owns the reference; the in-flight registration
-                // drops with the handle here, after the publish is visible.
-                drop(t.prepared);
-            } else {
-                give_back.extend(t.prepared.into_pack_tenant());
-            }
-        }
-        for tenant in give_back {
-            self.release_pack_tenant_reference(tenant).await;
-        }
-        if committed_n > 0 {
-            METRICS.pack_batch_frames.fetch_add(1, Ordering::Relaxed);
-            METRICS
-                .pack_batch_tenants
-                .fetch_add(committed_n, Ordering::Relaxed);
-        }
-        if let Some(hook) = PACK_PRE_SEAL_HOOK.load_full() {
-            (*hook)(pack.base_key.clone()).await;
-        }
-        pack_trace(|| PackTrace::PinRelease {
-            base_key: pack.base_key.clone(),
-        });
-        self.packer
-            .seal_private(&self.backend_router, pack, outcome)
-            .await;
-        fate
     }
 
     /// The `commit` half of [`Self::promote_staged_file`]: the layout
@@ -16778,16 +15722,7 @@ impl DataRouter {
                 Ok(Some(into))
             }
             outcome => {
-                // FIND-PK-4 (design-small-file-packing §5.3): the block
-                // arm's never-published offset is recycled into a
-                // co-writer's lane only when the shipped save's outcome is
-                // KNOWN (`pack_publish_outcome`); the packed arm's tenant
-                // reference releases either way.
-                let publish_outcome = match &outcome {
-                    Err(e) => pack_publish_outcome(e),
-                    Ok(_) => crate::block_allocator::PackPublishOutcome::Known,
-                };
-                self.release_landed_site(site, publish_outcome).await;
+                self.release_landed_site(site).await;
                 outcome
             }
         }
@@ -17369,10 +16304,10 @@ impl DataRouter {
         let bs = self.block_size.load(Ordering::Relaxed);
         let mut left_park = 0u64;
         for key in parked {
-            match crate::cowriter::retire_recomputed_parked_key(&self.backend_router, &key, freed) {
-                crate::cowriter::RecomputedRetire::Kept => epoch.displaced.push(key),
-                crate::cowriter::RecomputedRetire::Retired
-                | crate::cowriter::RecomputedRetire::DeadLifetime => left_park += 1,
+            match crate::shipped_free::retire_recomputed_parked_key(&self.backend_router, &key, freed) {
+                crate::shipped_free::RecomputedRetire::Kept => epoch.displaced.push(key),
+                crate::shipped_free::RecomputedRetire::Retired
+                | crate::shipped_free::RecomputedRetire::DeadLifetime => left_park += 1,
             }
         }
         if left_park > 0 {
@@ -17492,7 +16427,7 @@ impl DataRouter {
                 // shipped-free ladder post-guard (RES-1), post-commit
                 // (§5.2).
                 if !local_released.is_empty() {
-                    crate::meta_ship::publish::free_recomputed_releases(ino, local_released, None)
+                    crate::meta_ship::publish::free_recomputed_releases(ino, local_released)
                         .await;
                 }
                 // Finding 36 (half 2, the epoch face): a covering publish
@@ -17500,7 +16435,7 @@ impl DataRouter {
                 // — local hygiene only, never a frame-derived free.
                 let released = deferred.len() as u64;
                 if owner_recomputed {
-                    crate::cowriter::retire_displaced_locally(&self.backend_router, &deferred);
+                    crate::shipped_free::retire_displaced_locally(&self.backend_router, &deferred);
                 } else {
                     self.free_deferred_keys(deferred).await;
                 }
@@ -17568,114 +16503,6 @@ impl DataRouter {
             }
         }
         closed
-    }
-
-    /// **The supply-coupled epoch close** (finding 15's parked-supply term
-    /// — `.benchmarks/2026-09-06-free-grace-term1-fleet.md` §3; the lever
-    /// `.benchmarks/2026-09-07-rewrite-epoch-supply-close.md`;
-    /// design-rewrite-program §5.3, the KD-1.7 amendment): a CO-WRITER's
-    /// refill tick found its lane `deficit_blocks` short of the watermark
-    /// (`rate × horizon` — one loop transit's consumption), so the parked
-    /// A keys of this mount's open epochs are injected into the recycle
-    /// loop NOW, while there is still headroom for them to come back.
-    /// KD-1.7's own early-close fires only after the `StorageFull`, and on
-    /// a co-writer the keys it frees do not return for one whole loop
-    /// transit (ship → grace ring → lane list → harvest RPC), so its
-    /// "retry once" finds nothing: structurally late on this posture.
-    ///
-    /// The close is [`Self::close_rewrite_epoch`] verbatim — one whole-tx
-    /// publish + the deferred frees under the §5.2 law — so every §5.6
-    /// crash window stays true; nothing new is durable. Largest epoch
-    /// first until the yield covers the deficit ([`supply_close_plan`]),
-    /// the rest left open and counted (`rewrite_shadow_supply_close_bounded`).
-    /// Never under the D0 fence (a fenced close is the W5 arm — the fence
-    /// tripwires own that story) and idempotent against the dismount's own
-    /// closes (the epoch registry's `remove_sync` under the meta lock).
-    ///
-    /// **Mount-wide by law** (finding 15's fpp re-attribution,
-    /// `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md` §8): parked
-    /// keys are counted across the mount's volumes and each returns to the
-    /// lane of the volume it lives on — which is the MOUNT's supply, because
-    /// the lane-aware placement equalizes the volumes' stocks (the §5.9
-    /// band + the failover) so a key restocking either volume takes the
-    /// next write. The per-volume plan the residue landing tried
-    /// (candidates = the keys parked on the asking volume, a "covered"
-    /// sibling's tick declining) stranded the keys parked on the covered
-    /// volume to the iteration boundary — the D row released 14 % of its
-    /// displaced keys through the routine closes against 0.3–1 % on both C
-    /// rows — and was retired the same day. Returns the parked blocks
-    /// released.
-    pub(crate) async fn supply_close_epochs(&self, deficit_blocks: u64) -> u64 {
-        if crate::data_custody::poisoned() {
-            return 0;
-        }
-        let bs = self.block_size.load(Ordering::Relaxed).max(1);
-        let mut candidates: Vec<(u64, u64)> = Vec::new();
-        self.inner.rewrite_epochs.iter_sync(|ino, e| {
-            candidates.push((*ino, e.parked_bytes.load(Ordering::Relaxed) / bs));
-            true
-        });
-        let (to_close, left) = supply_close_plan(deficit_blocks, candidates);
-        if to_close.is_empty() {
-            METRICS
-                .rewrite_shadow_supply_close_declined_no_parked
-                .fetch_add(1, Ordering::Relaxed);
-            return 0;
-        }
-        let mut released = 0u64;
-        for ino in to_close {
-            let token = self.inner.dlm.get_fencing_token_ino(ino);
-            match self.close_rewrite_epoch_counted(ino, token).await {
-                Ok(Some(n)) => {
-                    METRICS
-                        .rewrite_shadow_supply_closes
-                        .fetch_add(1, Ordering::Relaxed);
-                    METRICS
-                        .rewrite_shadow_supply_close_blocks
-                        .fetch_add(n, Ordering::Relaxed);
-                    released += n;
-                }
-                Ok(None) => {} // closed by another trigger meanwhile
-                Err(e) => {
-                    log::warn!(
-                        "supply-coupled rewrite epoch close for ino {ino} failed ({e:?}); \
-                         the epoch keeps its routine triggers"
-                    );
-                }
-            }
-        }
-        if left > 0 {
-            METRICS
-                .rewrite_shadow_supply_close_bounded
-                .fetch_add(left, Ordering::Relaxed);
-        }
-        released
-    }
-
-    /// Wire the supply-coupled close on every harvesting (co-writer) lane
-    /// this router allocates from — `cowriter::install_client_halves`
-    /// calls it right after the lane engagement. The allocator's setter
-    /// enforces the scope (a harvest sink must be installed), so an
-    /// authority's lane-0 allocators and every unpartitioned mount are
-    /// left exactly as shipped. The sink holds the router WEAKLY: the
-    /// allocator outlives nothing here, and a tick after teardown no-ops.
-    pub fn arm_rewrite_supply_close(&self) {
-        for alloc in self.backend_router.lane_allocators() {
-            let weak = std::sync::Arc::downgrade(&self.inner);
-            let sink: crate::data_alloc_lane::SupplyCloseSink =
-                std::sync::Arc::new(move |deficit_blocks: u64| {
-                    let weak = weak.clone();
-                    Box::pin(async move {
-                        let Some(inner) = weak.upgrade() else {
-                            return 0;
-                        };
-                        DataRouter { inner }
-                            .supply_close_epochs(deficit_blocks)
-                            .await
-                    })
-                });
-            alloc.set_lane_supply_close_sink(sink);
-        }
     }
 
     /// Arm the idle-close sweeper (KD-1.6, lazily on the first epoch —
@@ -18285,10 +17112,10 @@ impl DataRouter {
         // guard dropped (RES-1) and strictly after the commit (§5.2).
         let (owner_recomputed, local_released) = save_res?;
         if !local_released.is_empty() {
-            crate::meta_ship::publish::free_recomputed_releases(ino, local_released, None).await;
+            crate::meta_ship::publish::free_recomputed_releases(ino, local_released).await;
         }
         if owner_recomputed {
-            crate::cowriter::retire_displaced_locally(&self.backend_router, &displaced);
+            crate::shipped_free::retire_displaced_locally(&self.backend_router, &displaced);
             return Ok(Some(Vec::new()));
         }
         Ok(Some(displaced))
@@ -18772,7 +17599,7 @@ impl DataRouter {
                     // mounts, no resolver armed) keep the caller stream
                     // verbatim.
                     let payload = if owner_recomputed {
-                        crate::cowriter::retire_displaced_locally(&self.backend_router, &o.payload);
+                        crate::shipped_free::retire_displaced_locally(&self.backend_router, &o.payload);
                         Vec::new()
                     } else {
                         o.payload
@@ -18794,7 +17621,7 @@ impl DataRouter {
         // shipped-free ladder strictly after the 3.5 guard dropped
         // (RES-1) and strictly after the commit (§5.2).
         if !local_released.is_empty() {
-            crate::meta_ship::publish::free_recomputed_releases(ino, local_released, None).await;
+            crate::meta_ship::publish::free_recomputed_releases(ino, local_released).await;
         }
     }
 
@@ -22293,11 +21120,7 @@ impl DataRouter {
                     // arm's reclaim enqueue parks at the cap) — never under
                     // the 3.5 guard.
                     drop(meta_guard);
-                    self.release_landed_site(
-                        site,
-                        crate::block_allocator::PackPublishOutcome::Known,
-                    )
-                    .await;
+                    self.release_landed_site(site).await;
                     return Ok(false);
                 }
                 let mut block_map = std::collections::HashMap::new();
@@ -22329,8 +21152,7 @@ impl DataRouter {
                     // guard (RES-1), keyed on the publish outcome class.
                     self.retract_block_ref_ops(ino, &refs);
                     drop(meta_guard);
-                    self.release_landed_site(site, pack_publish_outcome(&e))
-                        .await;
+                    self.release_landed_site(site).await;
                     return Err(e);
                 }
                 self.publish_layout_cache_entry(ino, updated_meta);
@@ -22883,12 +21705,11 @@ impl DataRouter {
         // derivation). No 3.5 guard is held here.
         match (&saved, spill_site.take()) {
             (Ok(_), Some(site)) => self.note_landed_tenant_committed(&site),
-            (Err(e), Some(site)) => {
+            (Err(_), Some(site)) => {
                 // The failed save's refill re-noted the clone's own ops,
                 // which no dest map names (PK4's retraction).
                 self.retract_block_ref_ops(dest_ino, &clone_refs);
-                self.release_landed_site(site, pack_publish_outcome(e))
-                    .await;
+                self.release_landed_site(site).await;
             }
             (_, None) => {}
         }
@@ -23488,11 +22309,7 @@ impl DataRouter {
                     // promotion won, or the mapping was pruned): release
                     // its site — after the guard (RES-1).
                     Some(DurableClip::Image { landed, .. }) => {
-                        self.release_landed_site(
-                            landed.site,
-                            crate::block_allocator::PackPublishOutcome::Known,
-                        )
-                        .await;
+                        self.release_landed_site(landed.site).await;
                     }
                     _ => {}
                 }
@@ -23500,8 +22317,7 @@ impl DataRouter {
             }
             Err(e) => {
                 if let Some(DurableClip::Image { landed, .. }) = clip {
-                    self.release_landed_site(landed.site, pack_publish_outcome(&e))
-                        .await;
+                    self.release_landed_site(landed.site).await;
                 }
                 Err(e)
             }

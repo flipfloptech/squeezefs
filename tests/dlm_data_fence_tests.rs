@@ -91,7 +91,7 @@
 
 use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::block_reclaim::{ReclaimEntry, ReclaimQueue};
-use squeezefs::data_custody::{self, declare_dead_epoch, CustodyPosture, DeadEpoch};
+use squeezefs::data_custody::{self, declare_dead_epoch, DeadEpoch};
 use squeezefs::error::SqueezefsError;
 use squeezefs::fuse_client::METRICS;
 use squeezefs::meta_backend::kv::superblock::{
@@ -679,7 +679,6 @@ fn multi_writer_refuses_to_arm_on_a_non_pr_substrate() {
     // external consensus" — the repo's own loop substrate is exactly this
     // shape).
     let err = data_custody::arm_data_plane(
-        CustodyPosture::MultiWriter,
         std::slice::from_ref(&path),
         true,
     )
@@ -690,22 +689,12 @@ fn multi_writer_refuses_to_arm_on_a_non_pr_substrate() {
         "the refusal must NAME the namespace: {msg}"
     );
     assert!(
-        msg.contains("multi-writer") && msg.contains("reservation"),
+        msg.contains("data plane refuses") && msg.contains("reservation"),
         "the refusal must say what it refused and why: {msg}"
     );
-
-    // Single-writer on the same substrate: no refusal — the D0 guard
-    // already governs and the documented class is detection grade.
-    let hold = data_custody::arm_data_plane(
-        CustodyPosture::SingleWriter,
-        std::slice::from_ref(&path),
-        false,
-    )
-    .expect("single-writer never refuses on a non-PR substrate");
-    assert!(
-        hold.is_none(),
-        "no WERO hold on a detection-grade substrate"
-    );
+    // A `--single-writer` volume arms no data-namespace reservation at all
+    // (PR 14: the arm is the join ladder's rung 4, never reached there), so
+    // the documented class stays detection grade with no hold taken.
     assert_eq!(data_custody::wero_mode(), "detection");
     clear_override(&path);
 }
@@ -726,14 +715,13 @@ fn multi_writer_refuses_a_format_without_the_s7_incompat_bit() {
     // PR-capable, but the format does not carry bit 11 — which is EVERY
     // volume today (ruling D9: the bit is built, never stamped).
     let err = data_custody::arm_data_plane(
-        CustodyPosture::MultiWriter,
         std::slice::from_ref(&path),
         false,
     )
     .expect_err("multi-writer must refuse an unstamped format");
     let msg = err.to_string();
     assert!(
-        msg.contains("multi-writer") && msg.contains("format"),
+        msg.contains("multi-writer data capability") && msg.contains("single-writer"),
         "the refusal must name the missing format capability: {msg}"
     );
     assert_eq!(ns.holder(), None, "a refused arm takes no reservation");
@@ -757,7 +745,7 @@ fn the_data_plane_wero_hold_is_shared_not_forked() {
 
     // The mount arms (multi-writer posture, stamped format): WERO held,
     // guarantee class pr.
-    let mount_hold = data_custody::arm_data_plane(CustodyPosture::MultiWriter, &paths, true)
+    let mount_hold = data_custody::arm_data_plane(&paths, true)
         .expect("PR-capable + stamped arms")
         .expect("a WERO hold");
     let key = ns.holder().expect("WERO reservation held");

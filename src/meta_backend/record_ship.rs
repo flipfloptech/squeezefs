@@ -455,7 +455,7 @@ pub async fn note_served_slot_ship(
     let Some(plane) = vol.slot_leases() else {
         return;
     };
-    let Some((node_token, mount_slot)) = crate::cowriter::parse_node_member_id(client) else {
+    let Some((node_token, mount_slot)) = crate::member_id::parse_node_member_id(client) else {
         return;
     };
     let Some(requester) = plane.appender_of_identity(node_token, mount_slot) else {

@@ -196,8 +196,6 @@ pub enum SealKind {
     /// The drain mover found the pack open on its victim volume (PK3,
     /// §5.11): sealed so the next re-plan moves it as a unit.
     Drain,
-    /// A co-writer's batch-scoped pack at its frame reply (§5.3 (c), PK4).
-    Batch,
 }
 
 /// A pack table key: the data volume the block was placed on and the
@@ -457,78 +455,6 @@ impl Packer {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// **A co-writer's PRIVATE pack** (design-small-file-packing §5.6, PK4):
-    /// a fresh block that never enters the per-volume table — batch-scoped
-    /// to ONE `(owner endpoint, home meta volume)` partition, filled by
-    /// [`Self::reserve_in`], sealed by [`Self::seal_private`] at the frame
-    /// reply. `Ok(None)` = `StorageFull` (the arm stops for the batch,
-    /// OQ-1); any other allocation error propagates.
-    pub async fn open_private(&self, router: &BackendRouter) -> Result<Option<Arc<OpenPack>>> {
-        if self.stopped.load(Ordering::Relaxed) {
-            return Ok(None);
-        }
-        // A private pack is batch-scoped, never in the table: the scope
-        // word is not its key.
-        match self.open_block(router, 0).await {
-            Ok(pack) => {
-                METRICS.pack_blocks_opened.fetch_add(1, Ordering::Relaxed);
-                Ok(Some(pack))
-            }
-            Err(e) if crate::block_allocator::is_storage_full(&e) => {
-                self.stop_for_batch();
-                Ok(None)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Reserve a `slot`-byte slot in a GIVEN (private) pack — the tenant's
-    /// registration and reference ride the handle exactly as
-    /// [`Self::reserve`]'s. `None` = the pack is full (the caller opens the
-    /// next one; the overflowing reservation is not a seal here — the
-    /// batch driver seals at the frame reply).
-    pub fn reserve_in(pack: &Arc<OpenPack>, slot: u64) -> Option<PackTenant> {
-        let off = pack.try_reserve(slot)?;
-        let inflight = pack.allocator.inflight_register(pack.base);
-        // The pin is this driver's own private reference, so the count can
-        // never have reached 0 under it; a refusal is a structural bug.
-        if !pack.allocator.increment_refcount(pack.base) {
-            crate::note_invariant_tripwire(
-                "pack_private_reserve_refused",
-                &format!(
-                    "a private pack block {} lost its pin before its batch sealed",
-                    pack.base_key
-                ),
-            );
-            return None;
-        }
-        Some(PackTenant {
-            pack: Arc::clone(pack),
-            off,
-            _inflight: inflight,
-        })
-    }
-
-    /// Seal a private pack at its frame reply (§5.3 (c)) with the frame's
-    /// typed outcome class: the pin releases through the allocator's one
-    /// release primitive — nonterminal while committed tenants live,
-    /// terminal + `Known` = the lane recycle (every tenant refused or
-    /// abandoned), terminal + `Unknown` = the leak-safe abandon without
-    /// recycle (FIND-PK-4), untracked = the counted no-op (a tenant deleted
-    /// between the landing and this seal retired the entry). OUTSIDE every
-    /// 3.5 guard (RES-1).
-    pub async fn seal_private(
-        &self,
-        router: &BackendRouter,
-        pack: &Arc<OpenPack>,
-        outcome: crate::block_allocator::PackPublishOutcome,
-    ) {
-        if pack.seal() {
-            self.run_seal_release(router, pack, SealKind::Batch, outcome)
-                .await;
-        }
-    }
-
     /// Install a freshly opened pack under its volume's slot. A slot that
     /// already holds an UNSEALED pack keeps it — the fresh block is
     /// abandoned (never published, nothing durable named it) and the
@@ -576,30 +502,16 @@ impl Packer {
     /// its commit; ≈ 0).
     async fn run_seal(&self, router: &BackendRouter, pack: &Arc<OpenPack>, kind: SealKind) {
         self.vacate(pack);
-        self.run_seal_release(
-            router,
-            pack,
-            kind,
-            crate::block_allocator::PackPublishOutcome::Known,
-        )
-        .await;
+        self.run_seal_release(router, pack, kind).await;
     }
 
     /// The seal's release half — the pin through the allocator's one release
-    /// primitive with the pack's publish OUTCOME class (an authority's is
-    /// always `Known`; a co-writer's batch pack carries the typed frame
-    /// fate), then the pack-open ledger exit and the `pack_blocks_sealed_*`
-    /// row.
-    async fn run_seal_release(
-        &self,
-        router: &BackendRouter,
-        pack: &Arc<OpenPack>,
-        kind: SealKind,
-        outcome: crate::block_allocator::PackPublishOutcome,
-    ) {
+    /// primitive, then the pack-open ledger exit and the
+    /// `pack_blocks_sealed_*` row.
+    async fn run_seal_release(&self, router: &BackendRouter, pack: &Arc<OpenPack>, kind: SealKind) {
         let verdict = pack
             .allocator
-            .release_pack_reference(router, &pack.base_key, outcome)
+            .release_pack_reference(router, &pack.base_key)
             .await;
         crate::jobs::pack_ledger_remove(&pack.base_key);
         match kind {
@@ -611,9 +523,6 @@ impl Packer {
                 .fetch_add(1, Ordering::Relaxed),
             SealKind::Drain => METRICS
                 .pack_blocks_sealed_drain
-                .fetch_add(1, Ordering::Relaxed),
-            SealKind::Batch => METRICS
-                .pack_blocks_sealed_batch
                 .fetch_add(1, Ordering::Relaxed),
         };
         match verdict {

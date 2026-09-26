@@ -196,8 +196,12 @@ use std::time::Duration;
 /// `JoinAppender` with `RPC_UNKNOWN_VERB` after admitting the session;
 /// the mismatch refuses loud at the handshake instead (KD-7 same-commit
 /// fleets). Bumped ONCE for the program's wire — the later rungs extend
-/// the enum under it while the wire is unreleased.
-pub const CLUSTER_WIRE_SCHEMA: u32 = 5;
+/// the enum under it while the wire is unreleased. **6 since PR 14 (the
+/// symmetric default flip)**: the retired co-writer posture's words left
+/// the `Grant` frame — `lane_supply_blocks`, `lane_supply_volumes`,
+/// `pack_group_available` — so a 5-speaker would decode a 6-speaker's grant
+/// three fields short; the mismatch refuses loud at the handshake.
+pub const CLUSTER_WIRE_SCHEMA: u32 = 6;
 
 /// The **pre-authentication** frame class cap: a challenge/proof pair is a
 /// few hundred bytes, so this is all an unauthenticated peer gets to

@@ -2514,7 +2514,7 @@ impl KvMetaBackend {
                     let Some(page) = e.page.as_ref() else {
                         continue;
                     };
-                    let member = crate::cowriter::node_member_id_of(
+                    let member = crate::member_id::node_member_id_of(
                         page.identity.node_token,
                         page.identity.mount_slot,
                     );
@@ -2831,7 +2831,7 @@ pub fn wire_block_grant_sink(
                     // The writer's MEMBER id — the one peer id an appender
                     // speaks under (the manager's identity verbs bind to it).
                     let peer =
-                        crate::cowriter::node_member_id_of(writer.node_token, writer.mount_slot);
+                        crate::member_id::node_member_id_of(writer.node_token, writer.mount_slot);
                     // The wire block-grant sink's client, kept in its slot.
                     // S8-LISTENER CONTROL SESSION (member_session_demand_from's census)
                     match crate::meta_ship::manager::ManagerClient::connect(
@@ -3149,7 +3149,7 @@ async fn live_peer_writers(vol: &KvMetaBackend) -> Vec<String> {
                     .as_ref()
                     .filter(|p| p.state == super::appender::AppenderState::Live)
                     .map(|p| {
-                        crate::cowriter::node_member_id_of(
+                        crate::member_id::node_member_id_of(
                             p.identity.node_token,
                             p.identity.mount_slot,
                         )

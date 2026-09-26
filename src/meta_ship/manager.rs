@@ -1387,11 +1387,11 @@ pub fn screen_identity_peer(call: &ManagerCall, peer: &str) -> Option<String> {
         ManagerCall::JoinAppender { identity, .. } => ("JoinAppender", identity, false),
         _ => return None,
     };
-    let derived = crate::cowriter::node_member_id_of(identity.node_token, identity.mount_slot);
+    let derived = crate::member_id::node_member_id_of(identity.node_token, identity.mount_slot);
     if derived == peer {
         return None;
     }
-    if !strict && crate::cowriter::parse_node_member_id(peer).is_none() {
+    if !strict && crate::member_id::parse_node_member_id(peer).is_none() {
         return None;
     }
     Some(format!(

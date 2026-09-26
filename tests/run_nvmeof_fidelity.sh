@@ -1829,11 +1829,11 @@ leg_sym_join_ladder() {
     [ "${shipped:-0}" = "0" ] && [ "${rpcs:-x}" = "0" ] && ok "SYMJOIN: dlm_rpcs=0 and xv_cross_owner_steps_shipped=0 after 200 creates (the solo armed mount ships nothing)" || bad "SYMJOIN: dlm_rpcs=$rpcs shipped=$shipped"
     local ms0 v
     ms0=""
-    for k in manager_verb_refusals manager_dependency_stalls meta_kv_replay_key_violations meta_kv_replay_lease_violations meta_kv_replay_extent_violations meta_kv_leaf_lease_refusals slot_lease_conflicts data_dma_fence_refusals cowriter.accounting_refusals cowriter.local_commit_refusals; do
+    for k in manager_verb_refusals manager_dependency_stalls meta_kv_replay_key_violations meta_kv_replay_lease_violations meta_kv_replay_extent_violations meta_kv_leaf_lease_refusals slot_lease_conflicts data_dma_fence_refusals shipped_free.accounting_refusals; do
         v=$(stats "$mnt" "$k")
         [ "${v:-0}" = "0" ] || ms0="$ms0 $k=$v"
     done
-    [ -z "$ms0" ] && ok "SYMJOIN: the must-stay-0 set is 0 under load (verbs/stalls/replay classes/lease gate/DMA fence/accounting/local-commit)" || bad "SYMJOIN: must-stay-0 moved:$ms0"
+    [ -z "$ms0" ] && ok "SYMJOIN: the must-stay-0 set is 0 under load (verbs/stalls/replay classes/lease gate/DMA fence/shipped-free accounting — the co-writer faces retired at PR 14)" || bad "SYMJOIN: must-stay-0 moved:$ms0"
 
     # The reader: `--read-only` under the plane = member-reader + token
     # client (§5.7.2). It joins the membership plane off the rendezvous

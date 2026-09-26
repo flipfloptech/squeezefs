@@ -3466,6 +3466,35 @@ impl TokenReaderPlane {
         self.drop_all();
     }
 
+    /// **The plane is RETIRED while its holder may be alive** (PR 14,
+    /// §4.4bc — the scoped custody fence by the holder's own word): serves
+    /// stop NOW (the arm forgot the holder; a read in flight re-resolves
+    /// onto a fresh plane), the held tokens are RELEASED at the holder
+    /// through the clean leave's path (the recall's drain + purge, then
+    /// `Release`), and the channel task stops. A fence that stopped the
+    /// plane DEAD here left the holder a registration nobody would ever
+    /// ack: its next commit on the object waited the whole recall
+    /// deadline and fired `dlm_token_recall_timeout_live`. A holder that
+    /// is in fact dead answers the release with a transport error, which
+    /// the best-effort release drops — the dead-holder shape costs one
+    /// bounded call and ends exactly as [`Self::stop_dead`].
+    pub async fn stop_released(&self) {
+        self.channel_ok.store(false, Ordering::Release);
+        let mut held: Vec<RecalledObject> = Vec::new();
+        self.cache.iter_sync(|ino, e| {
+            held.push(RecalledObject {
+                ino: *ino,
+                entry: Some(Arc::clone(e)),
+            });
+            true
+        });
+        if !held.is_empty() && self.channel_alive.load(Ordering::Acquire) {
+            self.release_retired(held).await;
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        self.drop_all();
+    }
+
     /// The reader-side Token family snapshot.
     pub fn stats(&self) -> TokenReaderStats {
         TokenReaderStats {

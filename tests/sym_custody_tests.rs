@@ -1697,6 +1697,166 @@ async fn a_dead_holders_t_self_fence_is_scoped_to_its_own_custody_and_driven_by_
     rig.shutdown().await;
 }
 
+/// **PR 14 (§4.4bc) — a holder's `unknown lease` word fences the scoped
+/// client AT ONCE, and the fence RELEASES its tokens at the live holder.**
+/// Found by the `sym-crash` leg on the flip binary: after every manager
+/// failover (the successor at the SAME address, in a new era) each
+/// joiner's per-holder custody client at the manager paced its refused
+/// renewals to `T_self` (≈ 13 s, one custody-generation advance each —
+/// 42 per joiner over three failovers), then fenced and stopped its token
+/// planes DEAD under a holder that was alive — every token it had fetched
+/// from the successor since re-asserting stayed REGISTERED there with no
+/// poll to hand a recall to, and the successor's next commit on `/`
+/// waited the whole 15 s and fired `dlm_token_recall_timeout_live`
+/// (`invariant_tripwires` 1 on the round-3 successor). The word is
+/// definitive (a renewal never re-creates a lease), so: the fence runs on
+/// the FIRST refusal with `renew_retries` unmoved and `T_self` never
+/// reached (the manual clock stands still — a fence here can only be the
+/// word's), the plane's held token is RELEASED at the holder (its
+/// outstanding count falls, its `releases` rises), and the holder's later
+/// commit on the file recalls nobody — it completes at once with
+/// `timeouts_live` 0. Holder B and the mount are untouched, exactly as
+/// the `T_self` contract above states. RED on the first build at the
+/// fence wait (the loop paced its retries for the whole bound).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_holders_unknown_lease_word_fences_the_client_at_once_and_releases_its_tokens() {
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let (uris, inos) = holders_volume(
+        dir.path(),
+        data.path(),
+        &[(SLOT_B, "a-file"), (SLOT_C, "b-file")],
+        0,
+    )
+    .await;
+    let (file_a, file_b) = (inos[0], inos[1]);
+    let rig = mount_data(&uris, data.path(), &Knobs::armed().partition(THREE_HOLDERS)).await;
+    let (a, b, _ms, arm) = two_live_holders(&rig).await;
+    let (_v, local_a) = rig.routed.route_ino(file_a);
+    let holder_plane = rig.routed.volumes[0].token_holder().unwrap().clone();
+    let lease_a = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(file_a), None, Duration::from_secs(2))
+        .await
+        .expect("custody from holder A");
+    let lease_b = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(file_b), None, Duration::from_secs(2))
+        .await
+        .expect("custody from holder B");
+    let client_a = arm.holder_client(&a.endpoint).await.expect("A dialed");
+    let tokens_a = arm.token_plane(&a.endpoint, 0).await.expect("A's plane");
+    assert!(tokens_a.holds(local_a));
+    wait_until("A's recall channel completes its first round", || {
+        tokens_a.stats().channel_fresh
+    })
+    .await;
+    let s0 = data_grant::stats();
+    let h0 = holder_plane.stats();
+    assert!(
+        h0.outstanding >= 1,
+        "premise: the writer's token is registered at the holder"
+    );
+    let gen0 = data_custody::custody_generation();
+
+    // Holder A stays UP at its address and answers the next renewal
+    // `unknown lease` — the successor-in-a-new-era shape, minted here by
+    // the authority's own revocation of the client.
+    a.owner
+        .revoke_client(WRITER, "the authority's word: this lease is gone");
+    wait_until(
+        "the client fences on the holder's word, not at T_self",
+        || client_a.fenced(),
+    )
+    .await;
+    let s1 = data_grant::stats();
+    assert_eq!(
+        s1.renew_retries, s0.renew_retries,
+        "no paced retry of an epoch the authority declared gone"
+    );
+    assert_eq!(
+        s1.holder_fences,
+        s0.holder_fences + 1,
+        "the scoped fence, once"
+    );
+    assert_eq!(s1.self_fences, s0.self_fences, "never the poison");
+    assert!(!data_custody::poisoned(), "the mount lives");
+    assert!(
+        data_custody::custody_generation() > gen0,
+        "the lost lease's DMA authorizations are retired"
+    );
+    assert!(!lease_a.is_held().await, "A's grant is dead on this side");
+    assert!(
+        arm.holder_client(&a.endpoint).await.is_none(),
+        "the arm forgot the holder"
+    );
+    // The retired plane RELEASED its token at the live holder.
+    wait_until(
+        "A's plane released the writer's token at the holder",
+        || {
+            let h = holder_plane.stats();
+            h.releases > h0.releases && h.outstanding < h0.outstanding
+        },
+    )
+    .await;
+    assert!(!tokens_a.holds(local_a), "the retired plane serves nothing");
+
+    // The holder's commit on the file finds no registration to recall:
+    // it completes at once — the fleet's 15 s park and tripwire never
+    // happen.
+    let before = holder_plane.stats();
+    let commit = tokio::time::timeout(
+        Duration::from_secs(2),
+        Metadata::setattr(
+            rig.routed.as_ref(),
+            file_a,
+            Some(libc::S_IFREG | 0o600),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("the holder's commit never waits on a recall of a released token");
+    commit.expect("the holder's setattr");
+    let after = holder_plane.stats();
+    assert_eq!(
+        after.timeouts_live, 0,
+        "no recall timed out at a live member"
+    );
+    assert_eq!(after.expired_with_lease, 0);
+    assert_eq!(
+        after.recalls, before.recalls,
+        "nothing left to recall for this object"
+    );
+
+    // Holder B is untouched and a fresh acquire against the SAME address
+    // joins A's authority anew (the successor's era, in the fleet).
+    assert!(lease_b.is_held().await, "B's custody is untouched");
+    let via0 = data_grant::stats().via_slot_holder;
+    let lease_a2 = rig
+        .router
+        .dlm
+        .acquire_lock(&lock_path(file_a), None, Duration::from_secs(2))
+        .await
+        .expect("a fresh JOIN at the live holder's address");
+    assert!(lease_a2.is_held().await);
+    assert_eq!(data_grant::stats().via_slot_holder, via0 + 1);
+    drop(lease_a);
+    drop(lease_a2);
+    drop(lease_b);
+    data_grant::disarm_slot_custody().await;
+    assert_eq!(b.owner.held(), 0, "the clean leave released B's grants");
+    rig.shutdown().await;
+}
+
 /// Review round 2, Issue 8 — a carried token whose INSTALL fails after
 /// custody was granted keeps the custody: the caller adopts the lease it
 /// was granted (the holder holds exactly that grant), the failure is

@@ -110,6 +110,20 @@ mount is a read-token client whose metadata is exact at the next resolve
   every cross-owner ship resends ONCE on the era the lane relearned (gauge
   `xv_cross_owner_step_stale_era_retries`; `meta_ship.era_relearns` +1 per
   failover per lane is the healthy reading).
+- **A third failover defect, fixed red-first (the acceptance record's
+  §4.4bc):** after a manager failover at its own address every joiner's
+  per-holder custody client at the manager was answered `unknown lease`
+  and paced its retries to `T_self` (≈ 13 s, one custody-generation
+  advance each), then stopped its token planes DEAD under a successor that
+  was alive — the tokens it had fetched there since re-asserting stayed
+  registered with no poll to hand a recall to, and the successor's next
+  commit on `/` waited the whole 15 s recall deadline
+  (`dlm_token_recall_timeouts_live` +1, `invariant_tripwires` +1). The
+  authority's `unknown lease` word is definitive: the client fences on the
+  first refusal (`dlm_custody_renew_retries` unmoved; `dlm_custody_holder_fences`
+  counts it — 0 only on a fleet with no failover), and a fence RELEASES
+  the planes' tokens at the holder instead of orphaning them (a dead
+  holder's transport error ends the release as before).
 - **The flip lands after the owner's cloud decision**: the box brackets of
   every design §8 gate on the flip binary and the two-host / cloud rows are
   what that decision reads (the record

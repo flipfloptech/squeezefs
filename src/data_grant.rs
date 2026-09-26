@@ -705,10 +705,13 @@ static TOKEN_CARRIED_PAGES: AtomicU64 = AtomicU64::new(0);
 /// lease is kept, the next serve fetches; ≈ 0.
 static TOKEN_CARRY_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// PR 9 (review round 2, Issue 10): slot-holder custody clients that
-/// reached `T_self` and fenced THEIR OWN custody — that holder's grants
-/// marked dead, the process generation advanced, that holder's token
-/// planes stopped — never the whole mount's poison
-/// (`dlm_custody_holder_fences`, must-stay-0 on a healthy fleet).
+/// fenced THEIR OWN custody — at `T_self`, on a MOVED holder, or on the
+/// holder's own `unknown lease` word (PR 14, §4.4bc: a manager failover
+/// at the same address fences every joiner's client this way, once) —
+/// that holder's grants marked dead, the process generation advanced,
+/// that holder's token planes retired releasing — never the whole
+/// mount's poison (`dlm_custody_holder_fences`; 0 on a fleet with no
+/// failover).
 static HOLDER_FENCES: AtomicU64 = AtomicU64::new(0);
 /// PR 9 (review round 2, Issues 5/9): handover recall notices this
 /// writer absorbed — each one a grant released once its ino's pipeline
@@ -831,8 +834,13 @@ pub struct ClientStats {
     pub token_carried_pages: u64,
     /// PR 9: carried installs that failed after custody was granted.
     pub token_carry_failures: u64,
-    /// PR 9: slot-holder clients that fenced their own custody at `T_self`.
+    /// PR 9: slot-holder clients that fenced their own custody — at
+    /// `T_self`, on a MOVED holder, or (PR 14, §4.4bc) on the holder's own
+    /// `unknown lease` word.
     pub holder_fences: u64,
+    /// PR 12b round 4 (Issue 22): failed renewals retried at the paced
+    /// cadence (`dlm_custody_renew_retries`).
+    pub renew_retries: u64,
     /// PR 9: handover recall notices absorbed (grants released for a
     /// slot's move).
     pub recalls_absorbed: u64,
@@ -858,6 +866,7 @@ pub fn stats() -> ClientStats {
         token_carried_pages: TOKEN_CARRIED_PAGES.load(Ordering::Relaxed),
         token_carry_failures: TOKEN_CARRY_FAILURES.load(Ordering::Relaxed),
         holder_fences: HOLDER_FENCES.load(Ordering::Relaxed),
+        renew_retries: RENEW_RETRIES.load(Ordering::Relaxed),
         recalls_absorbed: RECALLS_ABSORBED.load(Ordering::Relaxed),
         recalled: CUSTODY_RECALLED.load(Ordering::Relaxed),
         stale_holder_grants: STALE_HOLDER_GRANTS.load(Ordering::Relaxed),
@@ -877,7 +886,7 @@ pub fn stats_json() -> serde_json::Value {
         "dlm_custody_conflicts": c.conflicts,
         "dlm_custody_unknown_leases": c.unknown_leases,
         "dlm_custody_self_fences": c.self_fences,
-        "dlm_custody_renew_retries": RENEW_RETRIES.load(Ordering::Relaxed),
+        "dlm_custody_renew_retries": c.renew_retries,
         "dlm_custody_holder_moves": HOLDER_MOVES.load(Ordering::Relaxed),
         "dlm_rpcs_custody": c.rpcs,
         "dlm_revokes_issued": REVOKES.load(Ordering::Relaxed),
@@ -3159,6 +3168,14 @@ pub struct WriteCustodyClient {
     fenced: AtomicBool,
     /// PR 9: the fence's entry latch (ONE fencer runs the work).
     fencing: AtomicBool,
+    /// PR 14 (§4.4bc): the authority ANSWERED `unknown lease` to a renewal
+    /// — its word that this lease is gone (revoked, swept, or granted by a
+    /// predecessor era: a manager that failed over at its own address).
+    /// A retry of the same epoch can never succeed, so a `SlotHolder`
+    /// client fences on the word at once instead of pacing retries to
+    /// `T_self` (13 s of generation advances per failover per joiner, and
+    /// a token plane stopped DEAD under a LIVE holder at the end of them).
+    lease_gone_by_word: AtomicBool,
     /// PR 9: this client's own `Arc` (set once at connect) — the recall
     /// absorb spawns its settle loop from a `&self` method.
     weak_self: std::sync::OnceLock<std::sync::Weak<WriteCustodyClient>>,
@@ -3317,6 +3334,7 @@ impl WriteCustodyClient {
             scope,
             fenced: AtomicBool::new(false),
             fencing: AtomicBool::new(false),
+            lease_gone_by_word: AtomicBool::new(false),
             weak_self: std::sync::OnceLock::new(),
             holder_resolver: arc_swap::ArcSwapOption::empty(),
         });
@@ -3542,6 +3560,12 @@ impl WriteCustodyClient {
     /// PR 9: did this slot-holder client fence its own custody?
     pub fn fenced(&self) -> bool {
         self.fenced.load(Ordering::Acquire)
+    }
+
+    /// PR 14 (§4.4bc): the authority answered `unknown lease` — the
+    /// renewal loop's word to fence a `SlotHolder` client at once.
+    pub fn lease_gone_by_word(&self) -> bool {
+        self.lease_gone_by_word.load(Ordering::Acquire)
     }
 
     /// **PR 9 — the clean leave's custody half** (review round 2, Issue
@@ -4130,6 +4154,9 @@ impl WriteCustodyClient {
         if reply.status != CUSTODY_OK {
             let detail = String::from_utf8_lossy(&reply.body).to_string();
             self.note_lease_lost(&detail);
+            if reply.status == CUSTODY_UNKNOWN_LEASE {
+                self.lease_gone_by_word.store(true, Ordering::Release);
+            }
             return Err(SqueezefsError::LockFailed {
                 reason: format!(
                     "S9: renewal refused by the custody authority at {} ({}) — this node's \
@@ -5124,11 +5151,19 @@ pub fn slot_custody_armed() -> bool {
     SLOT_CUSTODY.load().is_some()
 }
 
-/// The dead-holder fence's arm half (review round 2, Issue 10): the
-/// holder at `endpoint` is forgotten — its dial slot dropped (the next
-/// acquire re-dials, meeting the dead holder's refusal or PR 10's
-/// re-leased slot) and its token planes STOPPED DEAD (no release travels
-/// to a holder that answers nothing; every cached entry dropped).
+/// The scoped fence's arm half (review round 2, Issue 10): the holder at
+/// `endpoint` is forgotten — its dial slot dropped (the next acquire
+/// re-dials, meeting the dead holder's refusal, PR 10's re-leased slot, or
+/// the successor at the same address) and its token planes retired.
+///
+/// PR 14 (§4.4bc): the planes are retired RELEASING
+/// ([`TokenReaderPlane::stop_released`]), never stopped dead — the fence
+/// runs by the holder's own `unknown lease` word as readily as at
+/// `T_self`, and the holder that spoke it is alive: a plane stopped dead
+/// there left it registrations nobody would ack, and its next recall of
+/// the object ran to the whole deadline (`dlm_token_recall_timeout_live`).
+/// A dead holder answers the best-effort release with a transport error
+/// and the plane ends as it did.
 fn holder_fenced(endpoint: &str) {
     let guard = SLOT_CUSTODY.load();
     let Some(arm) = guard.as_ref() else {
@@ -5141,30 +5176,35 @@ fn holder_fenced(endpoint: &str) {
     // The slot's dial state is retired UNDER ITS OWN MUTEX (round 3, Issue
     // 27): a concurrent `holder()` that still holds this slot sees
     // `retired` and re-looks the endpoint up instead of re-dialing on an
-    // orphan; the planes stop dead through the custody the fenced client
+    // orphan; the planes retire through the custody the fenced client
     // belongs to. A dial in flight holds the mutex (toward the dead
     // holder — it fails on its own bound): the retire runs behind it.
-    let retire = |dial: &mut HolderDial| {
-        dial.retired = true;
-        if let Some(h) = dial.custody.take() {
-            for plane in h.planes.lock().values() {
-                plane.stop_dead();
-            }
+    let retire =
+        |dial: &mut HolderDial| -> Vec<Arc<crate::meta_ship::token_plane::TokenReaderPlane>> {
+            dial.retired = true;
+            dial.custody
+                .take()
+                .map(|h| h.planes.lock().values().cloned().collect())
+                .unwrap_or_default()
+        };
+    let release_planes = |planes: Vec<Arc<crate::meta_ship::token_plane::TokenReaderPlane>>| {
+        if planes.is_empty() {
+            return;
         }
+        crate::meta_exec::spawn_meta("slot_custody_planes_released", async move {
+            for plane in planes {
+                plane.stop_released().await;
+            }
+        });
     };
     if let Ok(mut dial) = slot.dial.try_lock() {
-        retire(&mut dial);
+        release_planes(retire(&mut dial));
         return;
     }
     let slot = Arc::clone(&slot);
     crate::meta_exec::spawn_meta("slot_custody_holder_fenced", async move {
         let mut dial = slot.dial.lock().await;
-        dial.retired = true;
-        if let Some(h) = dial.custody.take() {
-            for plane in h.planes.lock().values() {
-                plane.stop_dead();
-            }
-        }
+        release_planes(retire(&mut dial));
     });
 }
 
@@ -6408,6 +6448,26 @@ pub fn spawn_custody_renewal(client: Arc<WriteCustodyClient>, stop: Arc<AtomicBo
                 Ok(Err(e)) => {
                     if client.self_fence_due() {
                         client.self_fence(&format!("custody renewal failed: {e}"));
+                        return;
+                    }
+                    // PR 14 (§4.4bc): a LIVE holder that answered `unknown
+                    // lease` has said this lease is gone (a successor in a
+                    // new era at the same address, a revocation) — the same
+                    // word the MOVED arm below acts on. A retry of the same
+                    // epoch never succeeds, so the scoped fence runs now:
+                    // before it, every joiner paced refused renewals to
+                    // `T_self` (≈ 13 s, one custody-generation advance each)
+                    // and then stopped its token planes DEAD under a holder
+                    // that was alive, orphaning every token it had fetched
+                    // there since — the holder's next recall of `/` timed
+                    // out at 15 s on `dlm_token_recall_timeout_live`.
+                    if client.scope() == CustodyScope::SlotHolder && client.lease_gone_by_word() {
+                        client.self_fence(&format!(
+                            "custody renewal refused ({e}) — the holder at {} answered UNKNOWN \
+                             LEASE: its word that this lease is gone; fenced by the word now, \
+                             never retried to T_self",
+                            client.endpoint()
+                        ));
                         return;
                     }
                     // PR 12b round 4 (Issue 22): a failed renewal re-resolves

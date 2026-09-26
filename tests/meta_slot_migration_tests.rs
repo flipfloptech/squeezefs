@@ -104,6 +104,49 @@ fn uris(metas: &[PathBuf]) -> Vec<String> {
     metas.iter().map(|p| p.display().to_string()).collect()
 }
 
+/// Mint a directory under the root whose ino routes to ROUTING slot
+/// `slot` (a preset ino routes itself) — the contracts below need a
+/// directory IN the migrating slot, and where a mint lands is the mint
+/// POLICY's, not the fixture's: the flat class rotates `/`'s children
+/// over each volume's hosted slots, the armed forest (the default since
+/// PR 14) keeps a child in its parent's slot under the affinity cap and
+/// spills to the volume's ROTOR — a two-volume width-4 set's slot 1 is
+/// volume 1's native slot, which no rotor ever names, so no `mkdir`
+/// under `/` reaches it there. The local is minted from the slot's own
+/// cursor (`allocate_local_ino_in_slot`: the native watermark for the
+/// volume's legacy slot, the guest cursor otherwise), so it can never
+/// collide with a policy mint.
+async fn seed_dir_in_routing_slot(routed: &RoutedMetaBackend, slot: u64, name: &str) -> u64 {
+    use squeezefs::meta_backend::kv::backend::KvMetaBackend;
+    use squeezefs::meta_backend::{make_global_ino_width, IntentCreatePreset};
+    let width = routed.routing_width();
+    // Which volume hosts the slot: route any global ino of the slot.
+    let (vol_idx, _) = routed.route_ino(make_global_ino_width(2, slot, width));
+    let (_, global) = routed
+        .allocate_local_ino_in_slot(vol_idx, slot)
+        .expect("a cursor for the slot");
+    let ino = routed
+        .create_with_rdev_preset(
+            1,
+            name,
+            libc::S_IFDIR | 0o755,
+            1000,
+            1000,
+            0,
+            0,
+            Some(IntentCreatePreset {
+                global_ino: global,
+                ts_ns: KvMetaBackend::now_ns_pub(),
+            }),
+        )
+        .await
+        .expect("seed dir")
+        .ino;
+    assert_eq!(ino, global);
+    assert_eq!(route_ino_width(ino, width).0, slot);
+    ino
+}
+
 async fn shutdown_routed(routed: &Arc<RoutedMetaBackend>) {
     for vol in &routed.volumes {
         vol.shutdown().await.unwrap();
@@ -111,7 +154,10 @@ async fn shutdown_routed(routed: &Arc<RoutedMetaBackend>) {
 }
 
 /// Populate the set with a mixed dataset: files under root (slot-0
-/// keyspace), directories striped across volumes with files + xattrs
+/// keyspace), directories STRIPED across the routing slots — `dir{d}`
+/// routes to slot `d % W` by preset ([`seed_dir_in_routing_slot`]: the
+/// contracts migrate slot 1 and need a populated directory there, and
+/// the mint policy decides nothing for a fixture) — with files + xattrs
 /// inside them (populating every volume's native slot). Returns
 /// `(name → ino)` for stability assertions.
 async fn populate(
@@ -129,13 +175,10 @@ async fn populate(
             .ino;
         made.push((name, ino));
     }
+    let width = routed.routing_width();
     for d in 0..dirs {
         let dname = format!("dir{d}");
-        let dino = routed
-            .create(1, &dname, libc::S_IFDIR | 0o755, 1000, 1000)
-            .await
-            .expect("mkdir")
-            .ino;
+        let dino = seed_dir_in_routing_slot(routed, d as u64 % width, &dname).await;
         made.push((dname.clone(), dino));
         for i in 0..files {
             let fname = format!("{dname}/f{i}");
@@ -463,16 +506,15 @@ async fn test_delta_tee_captures_concurrent_writes_values_reread() {
 
     // Mutations to the MIGRATING slot (slot 1) while the engine is
     // parked: a new file, an xattr rewrite (twice — values re-read
-    // means the SECOND value must win), and an unlink.
-    let mut dino = None;
-    for d in 0..4 {
-        let ino = routed.lookup(1, &format!("dir{d}")).await.expect("dir").ino;
-        if route_ino_width(ino, 4).0 == 1 {
-            dino = Some(ino);
-            break;
-        }
-    }
-    let dino = dino.expect("a slot-1 directory exists among dir0..dir3");
+    // means the SECOND value must win), and an unlink. `dir1` IS the
+    // slot-1 directory (`populate` stripes its directories over the
+    // routing slots by preset).
+    let dino = routed.lookup(1, "dir1").await.expect("dir1").ino;
+    assert_eq!(
+        route_ino_width(dino, 4).0,
+        1,
+        "dir1 routes to the migrating slot"
+    );
     let fresh = routed
         .create(dino, "teed_create", libc::S_IFREG | 0o644, 0, 0)
         .await
@@ -565,36 +607,15 @@ async fn test_delta_overflow_fresh_snapshot_fallback_and_triple_abort() {
     let routed2 = routed.clone();
     let mig = tokio::spawn(async move { migrate_slot(&routed2, 1, 0, &opts_small, &hooks).await });
     hold.entered().await;
-    let mut dino = None;
-    for d in 0..2 {
-        let ino = routed.lookup(1, &format!("dir{d}")).await.expect("dir").ino;
-        if route_ino_width(ino, 4).0 == 1 {
-            dino = Some(ino);
-            break;
-        }
-    }
-    // populate() striped only 2 dirs — if neither landed on slot 1,
-    // mint fresh dirs until one does (health round-robin alternates).
-    let dino = match dino {
-        Some(i) => i,
-        None => {
-            // The engine is parked at the hold — creates still flow (the
-            // gate is open during snapshot passes).
-            let mut found = None;
-            for i in 0..8 {
-                let ino = routed
-                    .create(1, &format!("ovdir{i}"), libc::S_IFDIR | 0o755, 0, 0)
-                    .await
-                    .expect("mkdir")
-                    .ino;
-                if route_ino_width(ino, 4).0 == 1 {
-                    found = Some(ino);
-                    break;
-                }
-            }
-            found.expect("a slot-1 dir within 8 mkdirs")
-        }
-    };
+    // `dir1` IS the slot-1 directory (`populate` stripes its directories
+    // over the routing slots by preset); the engine is parked at the hold
+    // and creates still flow (the gate is open during snapshot passes).
+    let dino = routed.lookup(1, "dir1").await.expect("dir1").ino;
+    assert_eq!(
+        route_ino_width(dino, 4).0,
+        1,
+        "dir1 routes to the migrating slot"
+    );
     for i in 0..32 {
         routed
             .create(dino, &format!("ov{i}"), libc::S_IFREG | 0o644, 0, 0)
@@ -635,21 +656,7 @@ async fn test_delta_overflow_fresh_snapshot_fallback_and_triple_abort() {
     format_stamped_set(&metas_b, 4).await;
     let paths_b = uris(&metas_b);
     let routed = open_routed_meta_set(&paths_b).await.expect("open b");
-    let slot1_dir = {
-        let mut found = None;
-        for i in 0..8 {
-            let ino = routed
-                .create(1, &format!("abortdir{i}"), libc::S_IFDIR | 0o755, 0, 0)
-                .await
-                .expect("mkdir")
-                .ino;
-            if route_ino_width(ino, 4).0 == 1 {
-                found = Some(ino);
-                break;
-            }
-        }
-        found.expect("a slot-1 directory materializes within 8 mkdirs")
-    };
+    let slot1_dir = seed_dir_in_routing_slot(&routed, 1, "abortdir").await;
     let hold = Arc::new(PhaseHold::new(MigrationPhase::AfterBulkCopy));
     let hold_for_writer = hold.clone();
     let hooks = MigrationTestHooks {
@@ -688,7 +695,7 @@ async fn test_delta_overflow_fresh_snapshot_fallback_and_triple_abort() {
         "an aborted migration must never escalate to disabled_volumes"
     );
     routed
-        .lookup(1, "abortdir0")
+        .lookup(1, "abortdir")
         .await
         .expect("the old map still serves after the abort");
     shutdown_routed(&routed).await;
@@ -711,49 +718,18 @@ async fn test_cutover_gate_parks_cross_slot_rename_with_zero_guards() {
     let routed = open_routed_meta_set(&paths).await.expect("open");
     populate(&routed, 4, 2).await;
 
-    // Find a directory hosted on slot 1 (the migrating slot) and one on
-    // slot 0 — the cross-slot rename spans them. Mint spread rotates
-    // fresh inos across each volume's mint set, so mint dirs until both
-    // slots are covered (bounded).
-    let mut src_dir = None;
-    let mut dst_dir = None;
-    for d in 0..4 {
-        let ino = routed.lookup(1, &format!("dir{d}")).await.expect("dir").ino;
-        let (slot, _) = route_ino_width(ino, 4);
-        if slot == 1 && src_dir.is_none() {
-            src_dir = Some(ino);
-        }
-        if slot == 0 && dst_dir.is_none() {
-            dst_dir = Some(ino);
-        }
-    }
-    for extra in 0..64 {
-        if src_dir.is_some() && dst_dir.is_some() {
-            break;
-        }
-        let ino = routed
-            .create(
-                1,
-                &format!("gatedir{extra}"),
-                libc::S_IFDIR | 0o755,
-                1000,
-                1000,
-            )
-            .await
-            .expect("mint an extra dir")
-            .ino;
-        let (slot, _) = route_ino_width(ino, 4);
-        if slot == 1 && src_dir.is_none() {
-            src_dir = Some(ino);
-        }
-        if slot == 0 && dst_dir.is_none() {
-            dst_dir = Some(ino);
-        }
-    }
-    let (src_dir, dst_dir) = (
-        src_dir.expect("a slot-1 directory exists"),
-        dst_dir.expect("a slot-0 directory exists"),
+    // A directory hosted on slot 1 (the migrating slot) and one on slot 0
+    // — the cross-slot rename spans them: `populate` stripes `dir{d}`
+    // over the routing slots by preset (where a policy mint lands is the
+    // policy's, `seed_dir_in_routing_slot`).
+    let src_dir = routed.lookup(1, "dir1").await.expect("dir1").ino;
+    let dst_dir = routed.lookup(1, "dir0").await.expect("dir0").ino;
+    assert_eq!(
+        route_ino_width(src_dir, 4).0,
+        1,
+        "dir1 routes to the migrating slot"
     );
+    assert_eq!(route_ino_width(dst_dir, 4).0, 0, "dir0 routes to slot 0");
 
     let parked_before = squeezefs::fuse_client::METRICS
         .meta_slot_gate_parked_commits

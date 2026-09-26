@@ -378,10 +378,32 @@ impl SmoContext {
     /// exempted this node as its ring's oldest (PR 14 §4.4be — the
     /// liveness law: the class can never be consumed below what the
     /// tail-pinning node needs at the next cycle's start).
+    ///
+    /// **The keep's premise is a rail here** (review fix round 1, Issue
+    /// 5): the keep holds ONE SMO entry's worst claim — `len + max_pad ≤
+    /// smo_keep`, the entry inside a page. An entry wider than that would
+    /// leave the next cycle's tail-pinning node unable to admit into the
+    /// space this admission kept — the very deadlock the keep prevents —
+    /// so it is refused LOUD (`Corrupt`, nothing reserved) instead of
+    /// admitted under a silent under-keep. Unreachable by the fold's
+    /// arithmetic (`derivation_sweep_tests` ties the widest split's entry
+    /// at a fraction of the page); a wider record class fails the tie
+    /// before it fails here.
     fn admit_smo_entry(&self, len: u64) -> Result<Option<super::journal_core::Admission>, KvError> {
         let ring = self.smo_ring().ok_or_else(|| {
             KvError::Corrupt("an SMO entry admission without a journal ring".to_string())
         })?;
+        let geometry = *ring.core().geometry();
+        if len.saturating_add(geometry.max_pad()) > geometry.smo_keep() {
+            return Err(KvError::Corrupt(format!(
+                "an SMO entry of {len} B (+ {} B pad slack) exceeds the checkpoint class's kept \
+                 claim of {} B — a page of entry bytes; the keep presumes every SMO entry fits \
+                 one page (PR 14 §4.4be), and an entry past it would leave the next cycle's \
+                 tail-pinning node unable to admit. Refused before any reservation",
+                geometry.max_pad(),
+                geometry.smo_keep()
+            )));
+        }
         Ok(if self.keep_exempt {
             ring.try_admit(len, super::journal_core::AdmissionClass::Checkpoint)
         } else {

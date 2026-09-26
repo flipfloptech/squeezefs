@@ -4383,3 +4383,125 @@ fn journal_pad_constants_tie_to_the_io_layers_framing() {
     };
     assert_eq!(unpadded.max_pad(), 0, "an unpadded ring claims no slack");
 }
+
+/// **The checkpoint class's kept claim holds every SMO entry** (PR 14
+/// §4.4be; review fix round 1, Issue 5). `CoreGeometry::smo_keep` = a page
+/// of entry bytes + the pad slack — one SMO record's worst claim — rests on
+/// the premise that every SMO entry fits one page: `tree.rs` builds them
+/// from `smo_replace` (a split's `parts` interior pointers at the widest
+/// slot-prefixed separator + `parts + 1` alloc deltas — the parts and a
+/// new root — + the old image's free delta), `try_merge_node` (a pointer
+/// put + a pointer delete + one alloc + two frees) and
+/// `collapse_root_chain` (one free). The tie: the record sets built here
+/// exactly as `tree.rs` builds them, at the widest interior journal key
+/// the forest frames (`FOREST_SLOT_MAX` ‖ `KEY_SPACE_MAX`), fit under
+/// `smo_keep − max_pad` = `page_data_len` with the margin stated — the
+/// `SMO_IMAGES_MAX` split at a small fraction of the page, and a split
+/// wider than any fold can produce (`partition_records` over one node's
+/// log + its frozen delta) still inside it — and `admit_smo_entry`
+/// refuses an entry past the keep LOUD, so a wider record class fails
+/// this tie before it can under-keep. The multi-record oldest-node case
+/// (a root swap or a merge behind a split on ONE node inside one cycle)
+/// is STATED, not pinned: the second admission keeps, a ring left at
+/// exactly one keep defers that node to the next cycle, whose exemption
+/// covers it again — one extra cycle, never the deadlock.
+#[test]
+fn the_checkpoint_class_keep_holds_every_smo_entry_the_tree_builds() {
+    use squeezefs::meta_backend::kv::alloc_ext::{alloc_record, free_record};
+    use squeezefs::meta_backend::kv::appender::SMO_IMAGES_MAX;
+    use squeezefs::meta_backend::kv::forest::interior_journal_key;
+    use squeezefs::meta_backend::kv::journal::{
+        checkpoint_reserve_bytes, entry_len_for, tag_for, JOURNAL_PAGE_DATA_LEN,
+    };
+    use squeezefs::meta_backend::kv::journal_core::CoreGeometry;
+    use squeezefs::meta_backend::kv::record::{Record, FOREST_SLOT_MAX, KIND_INTERIOR};
+    use squeezefs::meta_backend::kv::tree::{encode_interior_value, KEY_SPACE_MAX};
+    // The production ring's geometry at the 4 KiB grain (this LUN's,
+    // every 4 KiB-formatted namespace's) and at 512.
+    let ring_len = 32 * 1024 * 1024u64;
+    let geometries: Vec<CoreGeometry> = [512u64, 4096]
+        .into_iter()
+        .map(|grain| CoreGeometry {
+            page_data_len: JOURNAL_PAGE_DATA_LEN,
+            pages: ring_len / 4096,
+            reserve_bytes: checkpoint_reserve_bytes(ring_len),
+            grain,
+        })
+        .collect();
+    // The widest interior journal key the forest frames: the top guest
+    // slot's prefix ‖ the rightmost separator.
+    let widest_key = || interior_journal_key(FOREST_SLOT_MAX, &KEY_SPACE_MAX);
+    let interior_tag = tag_for(KIND_INTERIOR, 1);
+    let split_entry = |parts: usize| -> u64 {
+        let mut recs: Vec<(u8, Record)> = Vec::new();
+        for _ in 0..parts {
+            recs.push((
+                interior_tag,
+                Record::put(widest_key(), 0, encode_interior_value(u64::MAX, u64::MAX)),
+            ));
+        }
+        // The parts' images and a new root's.
+        for e in 0..=parts as u64 {
+            recs.push(alloc_record(u64::MAX - e, 0));
+        }
+        recs.push(free_record(u64::MAX, u64::MAX, 0));
+        entry_len_for(&recs).expect("under MAX_ENTRY_LEN")
+    };
+    let merge_entry = {
+        let recs: Vec<(u8, Record)> = vec![
+            (
+                interior_tag,
+                Record::put(widest_key(), 0, encode_interior_value(u64::MAX, u64::MAX)),
+            ),
+            (interior_tag, Record::delete(widest_key(), 0)),
+            alloc_record(u64::MAX, 0),
+            free_record(u64::MAX, u64::MAX, 0),
+            free_record(u64::MAX - 1, u64::MAX, 0),
+        ];
+        entry_len_for(&recs).expect("under MAX_ENTRY_LEN")
+    };
+    let collapse_entry = entry_len_for(&[free_record(u64::MAX, u64::MAX, 0)]).unwrap();
+    for geo in &geometries {
+        let keep = geo.smo_keep();
+        assert_eq!(
+            keep,
+            geo.page_data_len + geo.max_pad(),
+            "grain {}: the keep is a page of entry bytes + the pad slack",
+            geo.grain
+        );
+        let fits = |len: u64| len + geo.max_pad() <= keep;
+        // The physical split (`SMO_IMAGES_MAX` images = the parts + a root).
+        let widest_split = split_entry(SMO_IMAGES_MAX as usize - 1);
+        assert!(
+            fits(widest_split),
+            "grain {}: the SMO_IMAGES_MAX split's entry ({widest_split} B) fits the keep ({keep})",
+            geo.grain
+        );
+        assert!(
+            widest_split * 8 <= geo.page_data_len,
+            "the widest physical split's entry ({widest_split} B) is under an eighth of the \
+             page ({}) — the stated margin",
+            geo.page_data_len
+        );
+        assert!(fits(merge_entry), "grain {}: the merge's entry", geo.grain);
+        assert!(
+            fits(collapse_entry),
+            "grain {}: the root collapse's entry",
+            geo.grain
+        );
+        // The slack in PARTS: how wide a split the keep still holds. A fold
+        // partitions one node's log + its frozen delta at the ¾ fill, so a
+        // three-part split is the physical ceiling; the keep holds a split
+        // an order of magnitude wider.
+        let mut parts = SMO_IMAGES_MAX as usize;
+        while fits(split_entry(parts + 1)) {
+            parts += 1;
+        }
+        assert!(
+            parts >= 32,
+            "grain {}: the keep holds a {parts}-way split's entry — at least 32 parts of slack \
+             over the physical three",
+            geo.grain
+        );
+    }
+}

@@ -596,6 +596,7 @@ impl MembershipPlane {
 /// the backstop when the wire is already gone). A second leave for the
 /// same id is a no-op at the owner.
 pub async fn leave_once(endpoint: &str, secret: &[u8], id: &str) -> Result<bool> {
+    // NOT-S8 LISTENER DIAL (member_session_demand_from's census: the membership plane's own listener)
     let mut rpc = RpcClient::connect(endpoint, secret, id, None).await?;
     let reply = rpc
         .call(
@@ -646,6 +647,7 @@ impl MemberClient {
     ) -> Result<Self> {
         let id = req.id.clone();
         let role = req.role;
+        // NOT-S8 LISTENER DIAL (member_session_demand_from's census: the membership plane's own listener)
         let mut rpc = RpcClient::connect(endpoint, secret, &id, None).await?;
         let anchor = clock.now_ms();
         let reply = rpc.call(VERB_MEMBERSHIP_JOIN, encode(&req)?).await?;
@@ -925,6 +927,7 @@ impl CensusProbe {
     /// Dial and authenticate, without joining.
     pub async fn connect(endpoint: &str, secret: &[u8], probe_id: &str) -> Result<Self> {
         Ok(Self {
+            // NOT-S8 LISTENER DIAL (member_session_demand_from's census: the membership plane's own listener)
             rpc: RpcClient::connect(endpoint, secret, probe_id, None).await?,
         })
     }

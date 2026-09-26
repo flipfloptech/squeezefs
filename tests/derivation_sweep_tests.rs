@@ -2060,6 +2060,124 @@ fn s8_listener_control_session_sites() -> usize {
         .sum()
 }
 
+/// **The dial-site census as a TOKEN census** (PR 13c review nit 11,
+/// acceptance record §7 item 11 — PR 14 Step 0): the constant above is
+/// tied to the MARKERS, and a marker is what a new dial site could omit.
+/// This walks every CALL SITE of the primitives that reach a cluster-wire
+/// listener — `RpcClient::connect` / `connect_sync`, `MuxSession::connect`,
+/// `ManagerClient::connect` — in `src/` and requires each to carry ONE
+/// classification marker in the four lines above it: the counted
+/// `CONTROL SESSION`, a `POOL SESSION` (the per-volume terms the demand
+/// law prices separately), a `REDIAL` (re-establishing a counted session),
+/// a `DELEGATION CHANNEL` (a remote owner's, excluded by the constant's
+/// doc), a `ONE-SHOT DIAL`, a `DIAL PRIMITIVE` (a wrapper its callers
+/// classify) or a `NOT-S8 LISTENER DIAL` (the membership / job wire's own
+/// listener). An unclassified site is RED here, so no standing session
+/// lands un-marked. Doc comments, string literals and `fn` signatures are
+/// not sites.
+#[test]
+fn every_cluster_wire_dial_site_is_classified_for_the_session_census() {
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rust_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    const CLASSES: [&str; 7] = [
+        "// S8-LISTENER CONTROL SESSION (member_session_demand_from's census)",
+        "// S8-LISTENER POOL SESSION (member_session_demand_from's census:",
+        "// S8-LISTENER REDIAL (member_session_demand_from's census:",
+        "// S8-LISTENER DELEGATION CHANNEL (member_session_demand_from's census:",
+        "// S8-LISTENER ONE-SHOT DIAL (member_session_demand_from's census:",
+        "// S8-LISTENER DIAL PRIMITIVE (member_session_demand_from's census:",
+        "// NOT-S8 LISTENER DIAL (member_session_demand_from's census:",
+    ];
+    let primitives = [
+        "RpcClient::connect(",
+        "RpcClient::connect_sync(",
+        "Self::connect_sync(",
+        "MuxSession::connect(",
+        "ManagerClient::connect(",
+    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    let mut sites = 0usize;
+    let mut standing = 0usize;
+    let mut unclassified: Vec<String> = Vec::new();
+    for f in &files {
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            let Some(pos) = primitives.iter().find_map(|p| line.find(p)) else {
+                continue;
+            };
+            // A mention inside a string literal (a knob's purpose text)
+            // or a definition is not a site.
+            if line[..pos].contains('"')
+                || trimmed.starts_with("pub fn")
+                || trimmed.starts_with("fn ")
+            {
+                continue;
+            }
+            sites += 1;
+            let above = lines[i.saturating_sub(4)..i].join("\n");
+            let class = CLASSES.iter().find(|c| above.contains(*c));
+            match class {
+                Some(c) if *c == CLASSES[0] => standing += 1,
+                Some(_) => {}
+                None => unclassified.push(format!("{}:{}: {}", f.display(), i + 1, line.trim())),
+            }
+        }
+    }
+    assert!(
+        unclassified.is_empty(),
+        "every cluster-wire dial site carries a census class marker in the 4 lines above it; \
+         unclassified:\n{}",
+        unclassified.join("\n")
+    );
+    assert!(sites >= 15, "the census walked the dial sites: {sites}");
+    assert_eq!(
+        standing,
+        squeezefs::cluster_wire::MEMBER_CONTROL_SESSIONS,
+        "the standing sites at the dial primitives ≡ MEMBER_CONTROL_SESSIONS"
+    );
+    assert_eq!(
+        standing,
+        s8_listener_control_session_sites(),
+        "…and ≡ the marker census (one law, two reads)"
+    );
+}
+
+/// **`handshake_timeout ≡ DIAL_TIMEOUT`** (PR 13c review nit 12, acceptance
+/// record §7 item 12 — PR 14 Step 0): the refused-dial retry clips its
+/// waits to the dial bound on the premise that a pre-authentication
+/// straggler holding a connection slot is reaped by the listener's
+/// handshake deadline at the same instant — two spellings of ONE bound,
+/// tied here.
+#[test]
+fn the_listeners_handshake_deadline_is_the_dial_bound() {
+    use squeezefs::cluster_wire::{RpcListenerConfig, DIAL_TIMEOUT};
+    assert_eq!(
+        RpcListenerConfig::default().handshake_timeout,
+        DIAL_TIMEOUT,
+        "the listener reaps a slot-holding straggler exactly when a refused dialer stops retrying"
+    );
+}
+
 #[test]
 fn a_32_member_fleets_session_demand_fits_the_listener_cap_at_share_32() {
     use squeezefs::cluster_wire::{max_connections_from, member_session_demand_from};
@@ -3666,6 +3784,21 @@ fn sym_slot_lease_rotor_ceiling_floor_and_window_derive_from_the_width_and_the_l
     assert_eq!(n_floor(10, 3), 4);
     assert_eq!(n_floor(1_000, 0), 1_000, "a ship of 0 ns reads as 1");
     assert_eq!(handover_cold_start_ns(100, 10), 430);
+    // The offer's two stands (§5.1.4; acceptance record §7 item 18): the
+    // in-process stand is one beat bounded by `T_idle / 3`; the wire
+    // stand is the recall's delivery bound — three renewal beats (the
+    // requester learns, the holder learns the recall, the requester
+    // re-acquires) plus the handover bound — never shorter than the
+    // in-process one, never shorter than the beats.
+    {
+        use squeezefs::slot_lease_core::{offer_stand_ms, wire_offer_stand_ms};
+        let beat = squeezefs::fuse_client::CLIENT_HEARTBEAT_INTERVAL_SECS * 1000;
+        assert_eq!(offer_stand_ms(beat, 45_000), beat.min(15_000));
+        assert_eq!(offer_stand_ms(beat, 3), 1, "floored at 1 ms");
+        assert_eq!(wire_offer_stand_ms(beat, 7), 3 * beat + 7);
+        assert_eq!(wire_offer_stand_ms(0, 0), 1, "floored at 1 ms");
+        assert!(wire_offer_stand_ms(beat, 0) >= offer_stand_ms(beat, u64::MAX));
+    }
     // The registry ranges tie to the constants.
     let lookup = |k: &str| squeezefs::env_knobs::lookup(k).expect("registered");
     assert!(matches!(

@@ -376,6 +376,7 @@ impl JoinedWire {
                 endpoint = e;
             }
         }
+        // S8-LISTENER REDIAL (member_session_demand_from's census: re-establishes the counted JoinedWire session)
         match ManagerClient::connect(&endpoint, &self.secret, &self.peer_id, self.volume).await {
             Ok(fresh) => {
                 *c = fresh;
@@ -467,6 +468,37 @@ pub struct JoinedStats {
 /// The one-line error a wire verb's unexpected reply becomes.
 fn unexpected(verb: &str, reply: &ManagerReply) -> KvError {
     KvError::Busy(format!("{verb} answered {reply:?}"))
+}
+
+/// **The cloned-identity door** (PR 14 Step 0 — the cloud row's first
+/// assemble, acceptance record §3.10): a JOINED open whose node token
+/// equals the MANAGER's while the two are NOT co-located (no local flock
+/// holder, a foreign boot id) is a second HOST carrying the same
+/// `/etc/machine-id` — a baked image cloned onto every node. Its identity
+/// `(node_token, mount_slot)` would collide with the manager's own mounts
+/// and with every other clone's, so a `Live` page it never wrote reads as
+/// its own residue and two live daemons adopt one ring. Refused LOUD
+/// naming the remedy; never a join. `None` = admissible. Pure; the open
+/// wires it before rung 4.
+pub fn cloned_identity_refusal(
+    joiner: &AppenderIdentity,
+    manager_node_token: Option<u64>,
+    colocated: bool,
+) -> Option<String> {
+    let manager = manager_node_token?;
+    if colocated || manager != joiner.node_token {
+        return None;
+    }
+    Some(format!(
+        "CLONED NODE IDENTITY — this host's node token {:#018x} equals the MANAGER's while the \
+         manager is on ANOTHER host (no local writer lock, a foreign boot id): the two share one \
+         `/etc/machine-id` (a baked image cloned onto every node). A joined appender's identity \
+         `(node token, mount slot {:#x})` would collide with the manager's mounts and every \
+         other clone's, and a `Live` page this host never wrote would read as its own residue. \
+         Refusing the join. Remedy: regenerate the machine id on every cloned host (`rm \
+         /etc/machine-id && systemd-machine-id-setup`, then reboot) and mount again",
+        joiner.node_token, joiner.mount_slot
+    ))
 }
 
 /// The words a `Joined` reply hands the open.
@@ -777,9 +809,9 @@ impl KvMetaBackend {
         path: &Path,
         admission: &JoinedAppenderAdmission,
         sb: &super::super::superblock::SuperblockV3,
+        entries: Vec<super::super::appender::AppenderEntry>,
         writer_id: u128,
     ) -> Result<WireJoin, KvError> {
-        let entries = super::super::appender::read_directory(path, sb).await?;
         let predecessor = entries.iter().find_map(|e| {
             e.page.as_ref().filter(|p| {
                 p.identity.node_token == admission.identity.node_token
@@ -932,17 +964,33 @@ impl KvMetaBackend {
             let probe = crate::meta_backend::open_volume_probe(&path.to_string_lossy()).await?;
             probe.read_writer_claim().await
         };
-        let colocated = local_flock
+        let colocated = (local_flock
             || claim
                 .as_ref()
-                .is_some_and(|c| !c.boot.is_empty() && c.boot == super::read_boot_id());
+                .is_some_and(|c| !c.boot.is_empty() && c.boot == super::read_boot_id()))
+            && !super::TEST_JOIN_NOT_COLOCATED.load(Ordering::Relaxed);
+        // The cloned-identity door (PR 14 Step 0 — the cloud row's first
+        // assemble): BEFORE any registration or wire act, the directory
+        // is read once and this identity judged against it.
+        let entries = super::super::appender::read_directory(path, &sb).await?;
+        let manager_token = entries
+            .iter()
+            .find(|e| e.appender_id == 0)
+            .and_then(|e| e.page.as_ref())
+            .map(|p| p.identity.node_token);
+        if let Some(refusal) =
+            cloned_identity_refusal(&admission.identity, manager_token, colocated)
+        {
+            return Err(KvError::Corrupt(format!("{}: {refusal}", path.display())));
+        }
         let (meta_hold, registrant_key) =
             Self::joined_meta_registrant(path, admission, colocated, claim.as_ref()).await?;
         // Rung 5 — the wire join. Every refusal from here releases rung
         // 4's hold off-runtime (a registrant's key never outlives a
         // refused join).
         let writer_id = uuid::Uuid::new_v4().as_u128();
-        let joined = match Self::wire_join_appender(path, admission, &sb, writer_id).await {
+        let joined = match Self::wire_join_appender(path, admission, &sb, entries, writer_id).await
+        {
             Ok(j) => j,
             Err(e) => {
                 if let Some(hold) = meta_hold {
@@ -1693,11 +1741,7 @@ impl KvMetaBackend {
     /// `Ok(false)` = the manager's legal `Busy` (an offer already standing
     /// on the slot — a second dominating ship before the accept; PR 13e:
     /// before it the answer was counted on `joined_wire_failures`).
-    pub(super) async fn joined_offer_slot(
-        &self,
-        slot: ForestSlot,
-        to: u32,
-    ) -> Result<bool, KvError> {
+    pub async fn joined_offer_slot(&self, slot: ForestSlot, to: u32) -> Result<bool, KvError> {
         let wire = Arc::clone(self.joined.get().ok_or_else(|| {
             KvError::Corrupt(format!("{}: joined wire unset", self.path.display()))
         })?);

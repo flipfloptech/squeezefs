@@ -3020,6 +3020,7 @@ impl JobWireWorker {
     pub async fn connect(endpoint: &str, secret: &[u8], opts: WorkerOptions) -> Result<Self> {
         let endpoint = endpoint.to_string();
         let secret = secret.to_vec();
+        // NOT-S8 LISTENER DIAL (member_session_demand_from's census: the job wire's own listener)
         sqz_blocking::run_blocking(move || Self::connect_sync(&endpoint, &secret, opts)).await
     }
 

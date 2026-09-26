@@ -9087,6 +9087,43 @@ impl DataRouter {
     /// its references (counted, one WARN) and retried by the next mount.
     /// Returns the number of corpses destroyed.
     pub async fn sweep_unlinked_corpses(&self) -> Result<u64> {
+        self.sweep_corpses_in(None).await
+    }
+
+    /// **The recovery's corpse sweep** (acceptance record §7 item 19):
+    /// [`Self::sweep_unlinked_corpses`]' body over exactly the `(volume
+    /// ordinal, forest slot)` pairs PR 10's driver released from a dead
+    /// lessee to `Unleased`. Between the lessee's death and this manager's
+    /// next remount those slots' `nlink 0` corpses had NO reclaimer: the
+    /// mount-time sweep had run while the dead lessee still leased them,
+    /// the manager's kernel never FORGETs an inode it never held, and a
+    /// peer's reclaim hint dialled the dead endpoint. Runs OFF the driver
+    /// (its mutexes dropped) on the installed sink; counted on
+    /// `recovery_corpses_swept`.
+    pub async fn sweep_recovered_slots(
+        &self,
+        slots: &[(usize, crate::meta_backend::kv::record::ForestSlot)],
+    ) -> Result<u64> {
+        let n = self.sweep_corpses_in(Some(slots)).await?;
+        if n > 0 {
+            crate::fuse_client::METRICS
+                .recovery_corpses_swept
+                .fetch_add(n, Ordering::Relaxed);
+            log::info!(
+                "recovery: {n} unlinked inode(s) of a dead lessee's {} released slot(s) \
+                 destroyed (references released, blocks freed) — recovery_corpses_swept",
+                slots.len()
+            );
+        }
+        Ok(n)
+    }
+
+    /// The corpse sweep's body: every owned slot (`None`) or the named
+    /// `(volume, slot)` pairs alone.
+    async fn sweep_corpses_in(
+        &self,
+        scope: Option<&[(usize, crate::meta_backend::kv::record::ForestSlot)]>,
+    ) -> Result<u64> {
         use crate::meta_backend::kv::journal::{entry_payload_cap, record_frame_len};
         use crate::meta_backend::kv::record::INODE_KEY_LEN;
         let Some(backend) = self.inner.meta_backend.get() else {
@@ -9117,10 +9154,20 @@ impl DataRouter {
             // may mutate — its leased ones, plus the unleased ones on the
             // manager (`inode_plane_owns_slot`, the C9/C10 shard law). An
             // unarmed volume owns every slot.
+            let in_scope = |local: u64| match scope {
+                None => true,
+                Some(pairs) => {
+                    let slot = crate::meta_backend::kv::record::forest_slot_of_ino(local);
+                    pairs.iter().any(|(v, s)| *v == v_idx && *s == slot)
+                }
+            };
+            if scope.is_some_and(|pairs| !pairs.iter().any(|(v, _)| *v == v_idx)) {
+                continue;
+            }
             let corpses: Vec<u64> = crate::block_allocator::collect_corpse_inos(be)
                 .await?
                 .into_iter()
-                .filter(|local| be.inode_plane_owns_slot(*local))
+                .filter(|local| in_scope(*local) && be.inode_plane_owns_slot(*local))
                 .filter_map(|local| {
                     let global = backend.try_make_global_ino(local, v_idx);
                     if global.is_none() {

@@ -611,6 +611,7 @@ impl MetaShipRouter {
 
     /// Dial one authenticated session to `peer` on the S3 wire.
     async fn connect(&self, peer: &Arc<PeerOwner>) -> Result<crate::cluster_wire::RpcClient> {
+        // S8-LISTENER ONE-SHOT DIAL (member_session_demand_from's census: the grace-window reclaim's dial, not a standing session)
         crate::cluster_wire::RpcClient::connect(&peer.endpoint, &self.secret, &self.peer_id, None)
             .await
     }
@@ -939,6 +940,7 @@ async fn deleg_channel_run(
             return;
         }
         if session.is_none() {
+            // S8-LISTENER DELEGATION CHANNEL (member_session_demand_from's census: a REMOTE owner's channel — the symmetric arm's ownership map is all-local, not counted)
             match crate::cluster_wire::RpcClient::connect(&ep, &secret, &peer_id, None).await {
                 Ok(c) => {
                     session = Some(c);

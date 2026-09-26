@@ -2417,6 +2417,7 @@ impl TokenReaderPlane {
     async fn dial(&self) -> Result<(u64, RpcClient)> {
         let gen = self.endpoint_gen.load(Ordering::Acquire);
         let endpoint = self.endpoint();
+        // S8-LISTENER POOL SESSION (member_session_demand_from's census: the per-volume token pool + recall channel term)
         let client = RpcClient::connect(
             endpoint.as_str(),
             &self.cfg.secret,

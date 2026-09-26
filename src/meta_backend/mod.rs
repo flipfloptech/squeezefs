@@ -1227,10 +1227,25 @@ pub struct RoutedMetaBackend {
     /// a mount with no FUSE layer (a probe, a bare backend), where a hint
     /// is counted and dropped.
     reclaim_hint_sink: arc_swap::ArcSwapOption<ReclaimHintSink>,
+    /// PR 14 Step 0 (acceptance record §7 item 19): the router's corpse
+    /// sweep a RECOVERY feeds — the slots PR 10's driver released from a
+    /// dead lessee to `Unleased`, whose `nlink 0` corpses have no
+    /// reclaimer between the lessee's death and this manager's next
+    /// remount (its mount-time sweep ran before the slots were its to
+    /// sweep; its kernel never FORGETs an inode it never held). Installed
+    /// by the FUSE layer beside the reclaim-hint sink; uninstalled on a
+    /// bare backend, where the recovered slots are logged and left to the
+    /// next mount's sweep.
+    recovered_slots_sink: arc_swap::ArcSwapOption<RecoveredSlotsSink>,
 }
 
 /// See [`RoutedMetaBackend::install_reclaim_hint_sink`].
 pub type ReclaimHintSink = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
+
+/// See [`RoutedMetaBackend::install_recovered_slots_sink`]: `(volume
+/// ordinal, forest slot)` per slot a recovery released.
+pub type RecoveredSlotsSink =
+    std::sync::Arc<dyn Fn(Vec<(usize, kv::record::ForestSlot)>) + Send + Sync>;
 
 /// Where a FORGET-driven reclaim executes ([`RoutedMetaBackend::reclaim_home`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1491,6 +1506,7 @@ impl RoutedMetaBackend {
             dir_parents: dir_parent_memo(),
             dir_stripes: dir_stripe::StripeState::new(),
             reclaim_hint_sink: arc_swap::ArcSwapOption::empty(),
+            recovered_slots_sink: arc_swap::ArcSwapOption::empty(),
         }
     }
 
@@ -1555,6 +1571,7 @@ impl RoutedMetaBackend {
             dir_parents: dir_parent_memo(),
             dir_stripes: dir_stripe::StripeState::new(),
             reclaim_hint_sink: arc_swap::ArcSwapOption::empty(),
+            recovered_slots_sink: arc_swap::ArcSwapOption::empty(),
         })
     }
 
@@ -3062,12 +3079,21 @@ impl RoutedMetaBackend {
 
     /// **Ship one reclaim hint** — `inos` FORGOTTEN here, all reclaimed by
     /// appender `reclaimer` at `endpoint` — as `MetaCall::ReclaimHint`
-    /// over the S8 wire (PR 6's `ship_meta_call`). Best-effort: a hint
-    /// that cannot travel is counted per INO it carried
-    /// (`reclaim_hint_failures` — the family's one unit) and the
-    /// corpses stay for their reclaimer's mount-time sweep — the shipped
-    /// posture's own hole, never a loss of acked data; nothing is retried
-    /// here (a FORGET is one event).
+    /// over the S8 wire (PR 6's `ship_meta_call`). A hint that does not
+    /// travel is RE-RESOLVED ONCE off the MANAGER's word (acceptance record
+    /// §7 item 19 — the forward hop's shape at the forgetter): the
+    /// resolved lessee may be DEAD, its slots released by PR 10's recovery
+    /// to the manager (or re-leased) while this mount's projection still
+    /// named it; every slot of the hint is re-learnt from the manager
+    /// (`reresolve_slot_holder`), the inos re-homed, and those whose home
+    /// MOVED are shipped there (a home that became this mount's runs the
+    /// installed sink). What still has no reachable reclaimer — the
+    /// manager naming the dead lessee inside its death window — is counted
+    /// per INO (`reclaim_hint_failures`, the family's one unit) and the
+    /// corpses are the recovery's sweep's (`install_recovered_slots_sink`)
+    /// — never a loss of acked data. The shipped faces count ONCE per
+    /// logical hint, so `Σ inos_shipped ≡ Σ (served + forwarded + misrouted
+    /// + failures)` closes at rest.
     pub async fn ship_reclaim_hint(
         &self,
         reclaimer: u32,
@@ -3080,24 +3106,69 @@ impl RoutedMetaBackend {
         let n = inos.len() as u64;
         m.reclaim_hints_shipped.fetch_add(1, Relaxed);
         m.reclaim_hint_inos_shipped.fetch_add(n, Relaxed);
-        match crossvol_tx::ship_meta_call(
-            endpoint,
-            reclaimer,
-            crate::meta_ship::MetaCall::ReclaimHint { inos, hops },
-        )
-        .await
+        if self
+            .try_ship_reclaim_hint(reclaimer, endpoint, inos.clone(), hops)
+            .await
         {
-            Ok(_) => true,
-            Err(e) => {
-                m.reclaim_hint_failures.fetch_add(n, Relaxed);
-                log::debug!(
-                    "reclaim hint of {n} ino(s) to appender {reclaimer} ({endpoint}) did not \
-                     travel ({e}); the corpses stay for its mount-time sweep \
-                     (reclaim_hint_failures)"
-                );
-                false
+            return true;
+        }
+        m.reclaim_hint_reresolves.fetch_add(1, Relaxed);
+        let mut homes: std::collections::HashMap<(usize, kv::record::ForestSlot), ReclaimHome> =
+            std::collections::HashMap::new();
+        let mut regroup: Vec<(u32, std::sync::Arc<str>, Vec<Ino>)> = Vec::new();
+        let mut stuck = 0u64;
+        let sink = self.reclaim_hint_sink.load_full();
+        for ino in inos {
+            let key = self.reclaim_slot_key(ino);
+            let home = match homes.entry(key) {
+                std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    if let Some(vol) = self.volumes.get(key.0) {
+                        let _ = vol.reresolve_slot_holder(key.1).await;
+                    }
+                    e.insert(self.reclaim_home(ino).await).clone()
+                }
+            };
+            match home {
+                ReclaimHome::Peer {
+                    reclaimer: r,
+                    endpoint: ep,
+                    ..
+                } if r != reclaimer || &*ep != endpoint => {
+                    match regroup.iter_mut().find(|(x, _, _)| *x == r) {
+                        Some((_, _, list)) => list.push(ino),
+                        None => regroup.push((r, ep, vec![ino])),
+                    }
+                }
+                // The slot moved to THIS mount under the re-resolve: its
+                // own reclaim (the served hint's law).
+                ReclaimHome::Local => match sink.as_ref() {
+                    // The FUSE layer's sink counts `reclaim_hints_served`.
+                    Some(sink) => sink(ino),
+                    None => stuck += 1,
+                },
+                ReclaimHome::Peer { .. } | ReclaimHome::Unreachable { .. } => stuck += 1,
             }
         }
+        let mut travelled = true;
+        for (r, ep, list) in regroup {
+            let k = list.len() as u64;
+            if !self.try_ship_reclaim_hint(r, &ep, list, hops).await {
+                stuck += k;
+                travelled = false;
+            }
+        }
+        if stuck > 0 {
+            m.reclaim_hint_failures.fetch_add(stuck, Relaxed);
+            log::debug!(
+                "reclaim hint: {stuck} of {n} ino(s) first homed on appender {reclaimer} \
+                 ({endpoint}) have no reachable reclaimer after one re-resolve off the \
+                 manager's word; the corpses stay for the recovery's or the next mount's sweep \
+                 (reclaim_hint_failures)"
+            );
+            return false;
+        }
+        travelled
     }
 
     /// Install the FUSE layer's reclaim entry a served reclaim hint feeds
@@ -3111,6 +3182,59 @@ impl RoutedMetaBackend {
     pub fn install_reclaim_hint_sink(&self, sink: ReclaimHintSink) {
         self.reclaim_hint_sink
             .store(Some(std::sync::Arc::new(sink)));
+    }
+
+    /// Install the corpse sweep a RECOVERY feeds (acceptance record §7
+    /// item 19): `sink(slots)` runs the router's mount-time sweep body over
+    /// exactly the `(volume ordinal, forest slot)` pairs PR 10's driver
+    /// just released to `Unleased` — the dead lessee's corpses, which had
+    /// no reclaimer until this manager's next remount.
+    pub fn install_recovered_slots_sink(&self, sink: RecoveredSlotsSink) {
+        self.recovered_slots_sink
+            .store(Some(std::sync::Arc::new(sink)));
+    }
+
+    /// The recovery driver's hand-off of the slots it released (§7 item
+    /// 19): the installed sink sweeps their corpses; a bare backend logs
+    /// them for the next mount's sweep.
+    pub fn note_recovered_slots(&self, slots: Vec<(usize, kv::record::ForestSlot)>) {
+        if slots.is_empty() {
+            return;
+        }
+        match self.recovered_slots_sink.load_full() {
+            Some(sink) => sink(slots),
+            None => log::info!(
+                "recovery: {} slot(s) released from a dead lessee on a mount with no corpse \
+                 sweep installed — their corpses wait for the next mount's sweep",
+                slots.len()
+            ),
+        }
+    }
+
+    /// One reclaim-hint ship, UNCOUNTED (the caller keeps the family's
+    /// ledger): `true` when it travelled.
+    async fn try_ship_reclaim_hint(
+        &self,
+        reclaimer: u32,
+        endpoint: &str,
+        inos: Vec<Ino>,
+        hops: u8,
+    ) -> bool {
+        match crossvol_tx::ship_meta_call(
+            endpoint,
+            reclaimer,
+            crate::meta_ship::MetaCall::ReclaimHint { inos, hops },
+        )
+        .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                log::debug!(
+                    "reclaim hint to appender {reclaimer} ({endpoint}) did not travel ({e})"
+                );
+                false
+            }
+        }
     }
 
     /// **The served side of a reclaim hint**: every ino of `inos` whose

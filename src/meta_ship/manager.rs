@@ -1525,6 +1525,7 @@ impl ManagerClient {
         peer_id: &str,
         volume: u16,
     ) -> Result<Self> {
+        // S8-LISTENER DIAL PRIMITIVE (member_session_demand_from's census: a wrapper its call sites classify)
         let rpc = RpcClient::connect(endpoint, secret, peer_id, None).await?;
         Ok(Self {
             rpc,

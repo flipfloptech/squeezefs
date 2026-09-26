@@ -710,13 +710,15 @@ impl SlotLeaseTable {
                 entry.g = entry.g.wrapping_add(1);
                 entry.state = LeaseState::Leased;
                 entry.holder = requester;
-                entry.offered_to = 0;
-                entry.offer_expires_ns = 0;
                 entry.rotor = rotor;
                 let out = AcquireOutcome::Granted {
                     g: entry.g,
                     words: entry.words,
                 };
+                // A memo reserving the slot for a recall's requester (the
+                // handover's last step, `release_reserving`) is spent by
+                // the grant — whoever lands it — with its index.
+                m.clear_offer(slot);
                 m.index_hold(slot, requester);
                 out
             }
@@ -785,23 +787,32 @@ impl SlotLeaseTable {
     }
 
     /// Lapse every offer past `now_ns`: the holder is unchanged. Returns
-    /// the slots whose offers expired. O(offers) off the offer index.
+    /// the slots whose offers expired. O(offers) off the offer index. A
+    /// RESERVATION memo on an `Unleased` slot (a handed-over slot waiting
+    /// for its requester's re-acquire) that lapses is cleared silently —
+    /// its offer's outcome was the handover, already counted.
     pub fn expire_offers(&self, now_ns: u64) -> Vec<Slot> {
         let mut m = self.lock();
         let offered: Vec<Slot> = m.offered.values().flatten().copied().collect();
         let mut out = Vec::new();
         for slot in offered {
-            let lapsed = m.slots.get(&slot).is_some_and(|entry| {
-                entry.state == LeaseState::Offered && now_ns >= entry.offer_expires_ns
-            });
-            if !lapsed {
+            let Some(entry) = m.slots.get(&slot).copied() else {
+                continue;
+            };
+            if now_ns < entry.offer_expires_ns {
                 continue;
             }
-            if let Some(entry) = m.slots.get_mut(&slot) {
-                entry.state = LeaseState::Leased;
+            match entry.state {
+                LeaseState::Offered => {
+                    if let Some(entry) = m.slots.get_mut(&slot) {
+                        entry.state = LeaseState::Leased;
+                    }
+                    m.clear_offer(slot);
+                    out.push(slot);
+                }
+                LeaseState::Unleased => m.clear_offer(slot),
+                LeaseState::Leased | LeaseState::Releasing => {}
             }
-            m.clear_offer(slot);
-            out.push(slot);
         }
         out.sort_unstable();
         self.offers_expired
@@ -878,6 +889,47 @@ impl SlotLeaseTable {
             entry.last_written = now_seq;
             entry.words = words;
             entry.rotor = false;
+        }
+        ReleaseOutcome::Released
+    }
+
+    /// [`Self::release`] for a release that SPENDS a standing recall (a
+    /// wire holder's half of a handover — acceptance record §7 item 18):
+    /// the slot goes `Unleased` but the offer memo naming the recall's
+    /// requester is KEPT, its stand moved to `until_ns`, so the manager's
+    /// carriage keeps advertising the slot to that requester until its
+    /// re-acquire lands (the grant spends the memo) or the memo lapses
+    /// (silently — the handover was the offer's outcome). A wire
+    /// requester learns the slot moved through nothing else: before it
+    /// the release cleared the memo and the requester's acquire never
+    /// ran again.
+    pub fn release_reserving(
+        &self,
+        slot: Slot,
+        holder: AppenderId,
+        g: u32,
+        words: SlotWords,
+        now_seq: u64,
+        until_ns: u64,
+    ) -> ReleaseOutcome {
+        let mut m = self.lock();
+        let Some(entry) = m.slots.get(&slot).copied() else {
+            return ReleaseOutcome::Refused { holder: 0, g: 0 };
+        };
+        match Self::release_verdict(&entry, holder, g, words) {
+            ReleaseOutcome::Released => {}
+            other => return other,
+        }
+        m.unindex_hold(slot, entry.holder);
+        if let Some(entry) = m.slots.get_mut(&slot) {
+            entry.state = LeaseState::Unleased;
+            entry.holder = 0;
+            entry.last_written = now_seq;
+            entry.words = words;
+            entry.rotor = false;
+            if entry.offered_to != 0 {
+                entry.offer_expires_ns = until_ns;
+            }
         }
         ReleaseOutcome::Released
     }
@@ -1005,7 +1057,9 @@ impl SlotLeaseTable {
     }
 
     /// Every slot offered to `to` with its `g`, ascending — O(offered)
-    /// off the offer index.
+    /// off the offer index: the `Offered` slots and the `Unleased` ones
+    /// RESERVED for `to` by a handover's release ([`Self::release_
+    /// reserving`]), which its re-acquire lands at `g + 1`.
     pub fn offered_to(&self, to: AppenderId) -> Vec<(Slot, u32)> {
         let m = self.lock();
         m.offered.get(&to).map_or_else(Vec::new, |set| {
@@ -1013,7 +1067,10 @@ impl SlotLeaseTable {
                 .filter_map(|s| {
                     m.slots
                         .get(s)
-                        .filter(|e| e.state == LeaseState::Offered)
+                        .filter(|e| {
+                            e.offered_to == to
+                                && matches!(e.state, LeaseState::Offered | LeaseState::Unleased)
+                        })
                         .map(|e| (*s, e.g))
                 })
                 .collect()
@@ -1276,6 +1333,29 @@ pub fn handover_cold_start_ns(ewma_barrier_ns: u64, ewma_ship_rtt_ns: u64) -> u6
     ewma_barrier_ns
         .saturating_mul(4)
         .saturating_add(ewma_ship_rtt_ns.saturating_mul(3))
+}
+
+/// The stand of an offer whose requester and holder are IN-PROCESS regions
+/// (§5.1.4): one renewal beat past it — `min(beat, T_idle / 3)`, floored
+/// at 1 ms (the accept runs the handover directly, so the requester needs
+/// only its beat to learn the offer).
+pub fn offer_stand_ms(beat_ms: u64, t_idle_ms: u64) -> u64 {
+    beat_ms.min(t_idle_ms / 3).max(1)
+}
+
+/// The stand of an offer between WIRE appenders — the recall's DELIVERY
+/// bound (acceptance record §7 item 18): the requester learns the offer
+/// on its renewal (≤ 1 beat), its accept turns into a RECALL the holder
+/// learns on ITS renewal (≤ 1 beat — a wire holder serves no push
+/// channel), the holder runs its flush-then-transfer (the handover
+/// bound), and the requester's re-acquire rides its next renewal (≤ 1
+/// beat). An offer standing shorter than this can never land at the
+/// requester on the wire, whatever the dominance rule decided.
+pub fn wire_offer_stand_ms(beat_ms: u64, handover_bound_ms: u64) -> u64 {
+    beat_ms
+        .saturating_mul(3)
+        .saturating_add(handover_bound_ms)
+        .max(1)
 }
 
 /// The mint decision (KD-SYM-11 / KD-SYM-16, §5.1.2).

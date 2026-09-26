@@ -1874,7 +1874,22 @@ act with these laws (`docs/design-symmetric-metadata.md` §7.2 / §7.3, row 14):
   the lane relearned (`xv_cross_owner_step_stale_era_retries`, beside the
   slot-moved retries; a second refusal is the `EAGAIN` the application
   sees; `meta_ship.era_relearns` +1 per failover per lane is the healthy
-  reading, `stale_term_refusals` at the successor its mirror).
+  reading, `stale_term_refusals` at the successor its mirror). And **the
+  per-holder custody client's fence under a live successor** (§4.4bc):
+  after the same failover each joiner's custody client at the manager was
+  answered `unknown lease`, paced its retries to `T_self` (≈ 13 s, one
+  custody-generation advance each) and then stopped its token planes DEAD
+  under a holder that was alive — the tokens it had fetched from the
+  successor since re-asserting stayed registered with no poll to hand a
+  recall to, and the successor's next commit on `/` waited the whole 15 s
+  deadline (`dlm_token_recall_timeouts_live` +1, `invariant_tripwires`
+  +1). The word is definitive now: the client fences on the FIRST
+  `unknown lease` (`dlm_custody_renew_retries` unmoved), and a fence
+  RELEASES the planes' tokens at the holder before it stops them. So
+  after a failover `dlm_custody_holder_fences` reads +1 per joiner per
+  failover — the healthy reading (it is 0 only on a fleet that never
+  failed over); `dlm_custody_unknown_leases` +1 beside it; the successor's
+  `dlm_token_recall_timeouts_live` stays 0.
 * **What is owed past the flip** (the PR 14b board): the manager's zero-census
   open (the bitmap as the terminal-free engine), PR 7's un-share of a
   surviving sole owner, the SMO-record window economy (one pad per flush

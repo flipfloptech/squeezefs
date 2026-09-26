@@ -152,6 +152,10 @@ fn require_flags_are_read_per_class_and_all_is_a_superset() {
     ] {
         assert!(testkit::required(c), "REQUIRE_ALL covers {}", c.as_str());
     }
+    // REQUIRE_ALL promotes every class by definition, so it must be OFF
+    // before the per-class isolation below is judged (the batch gate on
+    // 8cda2d25 read this assert red with REQUIRE_ALL still set).
+    std::env::remove_var("SQUEEZEFS_TEST_REQUIRE_ALL");
     // The venue class (review round 2, Issue 10 — a rate law's PARTIAL skip
     // on a thermally throttling host) promotes on its own knob alone.
     std::env::set_var("SQUEEZEFS_TEST_REQUIRE_VENUE", "1");
@@ -162,7 +166,6 @@ fn require_flags_are_read_per_class_and_all_is_a_superset() {
     );
     std::env::remove_var("SQUEEZEFS_TEST_REQUIRE_VENUE");
     assert_eq!(SkipClass::Venue.as_str(), "venue");
-    std::env::remove_var("SQUEEZEFS_TEST_REQUIRE_ALL");
 }
 
 // ---------------------------------------------------------------------------

@@ -44,7 +44,7 @@ use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::block_map::MapEntry;
 use squeezefs::meta_backend::kv::block_refs::volume_tag;
 use squeezefs::meta_backend::kv::builder::{
-    format_v3, BuilderConfig, FormatV3Options, ImageBuilder,
+    format_v3, format_v3_stamped_symmetric, BuilderConfig, FormatV3Options, ImageBuilder,
 };
 use squeezefs::meta_backend::kv::revalidate::{BracketVerdict, FetchBracket};
 use squeezefs::meta_backend::kv::superblock::{
@@ -56,7 +56,7 @@ use squeezefs::meta_backend::kv::{
     META_KV_BLOCK_MAP_LEAF_READS, META_KV_BLOCK_MAP_LOOKUP_EXACT, META_KV_BLOCK_MAP_LOOKUP_RANGE,
     META_KV_BLOCK_MAP_PUTS, META_KV_NODE_CACHE_EVICTIONS, META_KV_NODE_CACHE_MISSES,
 };
-use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
+use squeezefs::meta_backend::{plan_meta_slot_set, Metadata, RoutedMetaBackend};
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::{BlockMapOp, DataRouter, LayoutFlip};
 use std::ffi::OsStr;
@@ -511,7 +511,11 @@ async fn decorated_keys_still_ride_string_verbatim() {
 
 /// The incarnation-era composition (spec §6.2 item 6, PR 6a — design
 /// §12 superseding Rev 1.4 #1's STRING interim): on a bit-13 volume —
-/// the DEFAULT format since the rung-10b flip — persisted keys carry the
+/// the multi-writer class, EXPLICITLY the symmetric (default) shape here so
+/// the contract is blind to the layout seam (a `SQUEEZEFS_TEST_FORMAT_FLAT`
+/// default request builds `--single-writer`, which carries no bit 13; the
+/// nine-bit flat class is presence-required at the writer's door since
+/// PR 14) — persisted keys carry the
 /// offset's lifetime stamp, and since PR 6a the stamp rides the compact
 /// forms VERBATIM: consecutive mints coalesce into RUN2 (stride-1
 /// lane_seqs proven per stamp by the emitter), and the stamps decode
@@ -522,8 +526,9 @@ async fn decorated_keys_still_ride_string_verbatim() {
 async fn incarnation_engaged_eras_ride_stamped_compact_forms() {
     let _serial = serial();
     let meta = NamedTempFile::new().unwrap();
-    // The default-format shape: strip ONLY the 9/16 seams, keep bit 13.
-    format_v3(meta.path(), META_LEN, &opts())
+    // The default (symmetric) shape: strip ONLY the 9/16 seams, keep bit 13.
+    let plan = plan_meta_slot_set(1).expect("derived plan");
+    format_v3_stamped_symmetric(meta.path(), META_LEN, &opts(), plan.stamps[0].clone())
         .await
         .expect("format v3 meta volume");
     let VolumeFormat::V3(mut sb) = classify_volume(meta.path()).await.expect("classify") else {

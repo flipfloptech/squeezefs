@@ -164,7 +164,7 @@ deltas stated where they happen:
    not the superblock problem above. Wait the TTL out (the prologue's
    unmount + disconnect does not shorten it) and re-run.
 
-`assemble-mw` (`PRESET=mw`) runs the same fabric steps and diverges at the
+`assemble-mw` (`PRESET=mw`) — **RETIRED at PR 14 (the symmetric default flip): it refuses loud naming `assemble-sym` / `bench-sym`, the mw preset's ONE shape, and `tests/cluster_reset_v5_mw.sh` is deleted; the paragraph below is history** — ran the same fabric steps and diverged at the
 mount into the `tests/cluster_reset_v5_mw.sh` multi-writer recipe: 1
 authority at `/scratch/mnt` plus `MW_COWRITERS` co-writer mounts
 (`/scratch/mnt-cw1..K`) on `client0`, kernel FUSE (no `--interception`),

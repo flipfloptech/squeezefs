@@ -140,6 +140,13 @@ async fn format_meta_node(meta: &Path, data_lvs: &[&Path], node_size: usize) {
     )
     .await
     .expect("format v3 meta volume");
+    // The C8 contracts presume the durable block-reference ledger (bit 9):
+    // the default class carries it; under the inverted matrix's flat seam
+    // a default request builds `--single-writer`, so stamp it explicitly
+    // there (the seam's law — bit 9 in isolation on a flat base).
+    squeezefs::meta_backend::kv::superblock::set_block_refcounts_bit(meta)
+        .await
+        .expect("stamp bit 9");
 }
 
 async fn format_meta(meta: &Path, data_lvs: &[&Path]) {

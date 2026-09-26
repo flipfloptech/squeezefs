@@ -679,11 +679,11 @@ fn joiner_identity(n: u64) -> AppenderIdentity {
 }
 
 #[test]
-fn the_manager_call_frames_round_trip_and_the_wire_schema_is_five() {
+fn the_manager_call_frames_round_trip_and_the_wire_schema_is_six() {
     assert_eq!(
         cw::CLUSTER_WIRE_SCHEMA,
-        5,
-        "bumped ONCE for the program's wire"
+        6,
+        "5 = bumped ONCE for the program's wire (PR 3); 6 = PR 14's ONE bump for the Grant's three retired words"
     );
     assert_eq!(VERB_MANAGER_CALL, 0x0500, "its own verb block");
     let req = ManagerRequestFrame {

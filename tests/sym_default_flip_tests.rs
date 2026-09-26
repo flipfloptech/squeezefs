@@ -18,7 +18,6 @@ use common::sym::*;
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{
     format_v3_stamped, format_v3_stamped_multi_writer_flat, format_v3_stamped_single_writer,
-    ImageBuilder,
 };
 use squeezefs::meta_backend::kv::slot_lease::{symmetric_meta_requested, SYMMETRIC_META_ENV};
 use squeezefs::meta_backend::kv::superblock::{
@@ -117,56 +116,97 @@ async fn a_plain_format_stamps_the_forest_beside_the_multi_writer_class() {
     );
 }
 
-/// **The default image is the forest builder's image** — ONE code path:
-/// the public formatter's default class and an `ImageBuilder` with
-/// `set_multi_writer` + `set_symmetric` build byte-identical images for
-/// one description (the law `format --symmetric` was pinned to before
-/// the flag became the default's no-op spelling).
+/// **The default class IS the explicit forest — ONE code path, pinned at
+/// the PUBLIC-FORMATTER level** (PR 14 review fix round 1, Issue 9: the
+/// first build compared two `ImageBuilder`s — a determinism tautology).
+/// `format_v3_stamped` (the default class — `squeezefs format`'s arm) and
+/// `format_v3_stamped_symmetric` (the explicit forest — `--symmetric`'s
+/// spelling, the matrix's seam-blind builder) are RUN for one description
+/// under one stamp: the decoded superblocks are equal once the per-format
+/// volume uuid is normalised (the feature word with bit 17, the geometry,
+/// the appender directory), the ledgers name the same tree roots, page 0
+/// of the appender directory is the same `Free` page, and the §4.10
+/// content digest is equal. Byte identity of the whole image is the
+/// BUILDER's law (a public format mints its own uuid and node-seq base),
+/// pinned where the builder is driven directly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_default_image_is_the_forest_builders_image_byte_for_byte() {
-    use squeezefs::meta_backend::kv::builder::BuilderConfig;
+async fn the_default_class_is_the_explicit_forest_through_the_public_formatters() {
+    use squeezefs::meta_backend::kv::appender::read_directory;
+    use squeezefs::meta_backend::kv::builder::{digest_backend, format_v3_stamped_symmetric};
+    use squeezefs::meta_backend::kv::checkpoint::read_newest_ledger;
     let dir = tempfile::tempdir().unwrap();
     let plan = plan_meta_slot_set(1).expect("derived plan");
     let stamp = plan.stamps[0].clone();
     let a = dir.path().join("a");
     std::fs::File::create(&a).unwrap().set_len(VOL_LEN).unwrap();
-    // The public default, with the builder's determinism inputs held
-    // (root owner 0:0 — the formatter stamps the invoking user, so the
-    // comparison runs the builder for both arms under one description).
-    let mut builder = ImageBuilder::new(BuilderConfig {
-        node_size: NODE_SIZE,
-        journal_len_override: Some(RING_LEN),
-        hash_seed: xxhash_rust::xxh3::xxh3_64(&stamp.set_uuid),
-        uuid: [7u8; 16],
-    })
-    .unwrap();
-    builder.set_membership_stamp(stamp.clone());
-    builder.set_multi_writer();
-    builder.set_symmetric();
-    builder.build(&a, VOL_LEN).await.expect("the forest image");
+    format_v3_stamped(&a, VOL_LEN, &set_opts(), stamp.clone())
+        .await
+        .expect("the default format");
     let b = dir.path().join("b");
     std::fs::File::create(&b).unwrap().set_len(VOL_LEN).unwrap();
-    let mut builder = ImageBuilder::new(BuilderConfig {
-        node_size: NODE_SIZE,
-        journal_len_override: Some(RING_LEN),
-        hash_seed: xxhash_rust::xxh3::xxh3_64(&stamp.set_uuid),
-        uuid: [7u8; 16],
-    })
-    .unwrap();
-    builder.set_membership_stamp(stamp);
-    builder.set_multi_writer();
-    builder.set_symmetric();
-    builder
-        .build(&b, VOL_LEN)
+    format_v3_stamped_symmetric(&b, VOL_LEN, &set_opts(), stamp)
         .await
-        .expect("the forest image again");
+        .expect("the explicit forest format");
+    let (sb_a, sb_b) = match (
+        classify_volume(&a).await.expect("classify a"),
+        classify_volume(&b).await.expect("classify b"),
+    ) {
+        (VolumeFormat::V3(x), VolumeFormat::V3(y)) => (x, y),
+        other => panic!("not two v3 volumes: {other:?}"),
+    };
+    assert_ne!(sb_a.uuid, sb_b.uuid, "the volume uuid is per format");
+    let mut normalised = sb_b.clone();
+    normalised.uuid = sb_a.uuid;
     assert_eq!(
-        device_digest(&a),
-        device_digest(&b),
-        "one description, one image (the builder's determinism contract holds on the forest)"
+        sb_a, normalised,
+        "the superblocks agree in everything but the per-format uuid"
     );
-    let f = features_of(&a).await;
-    assert_ne!(f & FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST, 0);
+    assert_ne!(
+        sb_a.features_incompat & FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST,
+        0
+    );
+    assert!(sb_a.appender_dir.len > 0, "the forest's appender directory");
+    // The same tree roots (ids, in order) in the bootstrap ledger.
+    let roots = |sb: &squeezefs::meta_backend::kv::superblock::SuperblockV3, p: &Path| {
+        let start = sb.root_ledger.start;
+        let p = p.to_path_buf();
+        async move {
+            read_newest_ledger(&p, start)
+                .await
+                .expect("ledger")
+                .expect("a bootstrap record")
+                .tree_roots
+                .iter()
+                .map(|r| r.tree_id)
+                .collect::<Vec<u8>>()
+        }
+    };
+    assert_eq!(roots(&sb_a, &a).await, roots(&sb_b, &b).await);
+    // The same appender directory: page 0 `Free`, the same segment table.
+    let page0 = |p: &Path, sb: &squeezefs::meta_backend::kv::superblock::SuperblockV3| {
+        let p = p.to_path_buf();
+        let sb = sb.clone();
+        async move {
+            read_directory(&p, &sb)
+                .await
+                .expect("directory")
+                .into_iter()
+                .find(|e| e.appender_id == 0)
+                .and_then(|e| e.page)
+                .map(|pg| (pg.state, pg.appender_id, pg.segments.clone(), pg.term))
+        }
+    };
+    let (p0a, p0b) = (page0(&a, &sb_a).await, page0(&b, &sb_b).await);
+    assert!(p0a.is_some(), "page 0 exists");
+    assert_eq!(p0a, p0b, "the same Free page 0");
+    // The same §4.10 content.
+    let da = KvMetaBackend::open_probe(&a).await.expect("probe a");
+    let db = KvMetaBackend::open_probe(&b).await.expect("probe b");
+    assert_eq!(
+        digest_backend(&da).await.expect("digest a"),
+        digest_backend(&db).await.expect("digest b"),
+        "one description, one content digest"
+    );
 }
 
 /// **The production `format` ignores the matrix's flat seam** (PR 14

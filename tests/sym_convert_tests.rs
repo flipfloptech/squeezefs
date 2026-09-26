@@ -1154,12 +1154,26 @@ async fn the_public_symmetric_formatter_mounts_as_a_forest() {
     }
 }
 
+/// **The PRE-FLIP class carries no forest** — the shape the verb converts
+/// (PR 14 review fix round 1, Issue 9: this contract pinned "a default
+/// format never carries bit 17" while the DEFAULT stamps it since the
+/// flip; `format_flat_set` builds the pre-flip multi-writer class, built
+/// by no CLI arm any more, and THAT is the law here): the nine
+/// multi-writer bits, no bit 17, no appender directory, no forest root in
+/// the ledger — every default format between the rung-10b flip and PR 14.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_default_format_stamps_no_bit_and_names_no_directory() {
+async fn the_pre_flip_multi_writer_class_carries_no_forest_bit_and_names_no_directory() {
     let dir = tempfile::tempdir().unwrap();
     let uris = format_flat_set(dir.path(), 1).await;
     let sb = superblock_of(&uris[0]).await;
-    assert!(!is_symmetric(&sb), "a default format never carries bit 17");
+    assert!(
+        sb.multi_writer_class(),
+        "the pre-flip class: the nine multi-writer bits"
+    );
+    assert!(
+        !is_symmetric(&sb),
+        "the pre-flip class never carries bit 17 — the conversion stamps it"
+    );
     assert_eq!(sb.appender_dir.len, 0);
     assert_eq!(sb.appender_dir.start, 0);
     let ledger = read_newest_ledger(Path::new(&uris[0]), sb.root_ledger.start)
@@ -1171,7 +1185,7 @@ async fn a_default_format_stamps_no_bit_and_names_no_directory() {
             .tree_roots
             .iter()
             .all(|r| r.tree_id != TREE_CONTROL && r.tree_id != KIND_INTERIOR),
-        "a default format names no forest root"
+        "the pre-flip class names no forest root"
     );
 }
 

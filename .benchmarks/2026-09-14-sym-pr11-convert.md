@@ -55,7 +55,7 @@ The design row says "converts the three shared trees into slot trees by key pref
 | `the_marker_round_trips_and_refuses_a_torn_image` | codec + torn/truncated/empty |
 | `format_symmetric_builds_the_image_the_seam_builds_byte_for_byte` | whole 64 MiB images equal |
 | `the_public_symmetric_formatter_mounts_as_a_forest` | mw bits + bit 17; mounts as a forest; churn |
-| `a_default_format_stamps_no_bit_and_names_no_directory` | the untouched default |
+| `a_default_format_stamps_no_bit_and_names_no_directory` — since PR 14 `the_pre_flip_multi_writer_class_carries_no_forest_bit_and_names_no_directory` (the DEFAULT stamps bit 17 since the flip; the contract pins the PRE-FLIP class the verb converts) | the untouched default (at PR 11) |
 | `a_dry_run_writes_nothing` | fixed region byte-identical; no marker; digest unchanged |
 | `a_four_volume_set_converts_every_volume_in_one_invocation` | the 46-volume shape scaled down: four volumes, mints spread across them, every volume converted, per-volume digests equal, storm, fsck |
 | `a_half_converted_set_refuses_writable_mounts_naming_the_volume` | crash at `AfterStamp { volume: 1 }`: 0 done, 1 stamped under its marker, 2/3 flat under theirs; the refusal names volume 1; readers serve; resume: `[AlreadySymmetric, Resumed, Resumed, Resumed]` |

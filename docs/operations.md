@@ -142,6 +142,8 @@ FUSE-over-io_uring on a kernel with the kmbuf surface (the sqz kernel series and
 
 The pinned arena is also gauged live as `transport_payload_buffer_bytes` and attributed to the memory budget as the `transport_payload_buffers` component, so a running mount's real need is readable off `.stats`.
 
+**The limit binds the process's CUMULATIVE pins, not a queue's** (PR 14 review fix round 1, Issue 4): with a limit raised to 512 MiB on a 32-CPU box the first 16 queues register and the 17th refuses `ENOMEM` although its own 32 MiB is inside the limit. The refusal's note compares what the queues registered before it already pin plus this queue against the limit and names the queue's ordinal, the pins before it and the total the registration would reach ("the 17th queue — the queues registered before it already pin 512 MiB, so this registration would take the daemon to 544 MiB"); a first-queue refusal says "the FIRST queue". Read the table above as the WHOLE mount's need.
+
 **Three places to raise it** (the refusal names all three):
 
 1. The mounting shell — `ulimit -l unlimited` (or `sudo prlimit --pid $$ --memlock=unlimited:unlimited` where the hard limit binds), before `squeezefs mount`.
@@ -1819,7 +1821,29 @@ act with these laws (`docs/design-symmetric-metadata.md` §7.2 / §7.3, row 14):
   opt-out** — the ONLY flat writable posture after the flip, for a volume
   that will never see a second host (it carries none of the multi-writer bits
   and mounts exactly the shipped solo posture). The pre-flip default (the
-  nine bits, no bit 17) is built by no CLI arm any more.
+  nine bits, no bit 17) is built by no CLI arm any more. **A `--single-writer`
+  volume has ONE writer and NO `-o ro` mount**: every read-only mount is a
+  read-TOKEN client of the volume's slot holders (R-SYM-4 — the only
+  foreign-read method; the S5 bounded-staleness projection is deleted), a
+  flat volume has no holder to grant a token, so `mount -o ro` of one refuses
+  at the token arm naming the class; read it through its writer's own mount
+  (a flat volume is one kernel by declaration), or format the default and
+  mount its readers `-o ro`.
+* **The default needs a substrate that can FENCE.** A plain `mount` of a
+  default-format metadata volume on a **non-PR block device** — a loop
+  device, an LVM logical volume, a raw SATA / SAS / virtio disk, an NVMe
+  namespace whose `RESCAP` reads 0 — REFUSES loud (KD-SYM-13): the mount
+  arms the symmetric plane, whose fence between writers is the namespace's
+  Write-Exclusive reservation (§5.8.1), and a plane that can only DETECT a
+  zombie's frame is an acked-loss class (§5.8.2). Before the flip the same
+  `format` + `mount` was the shipped solo posture. The refusal names the
+  three remedies: a PR-capable namespace (the kernel nvmet target —
+  `tests/dev_substrate.sh` on a dev box), `format --single-writer` for a
+  single-host volume with one writer by declaration, or
+  `SQUEEZEFS_SYM_ALLOW_NON_PR=1` — the LAB opt-in, announced at every mount
+  that uses it ("detection-grade only"), never a default. A metadata volume
+  on a REGULAR FILE is one kernel by construction and arms with no opt-in.
+  The guarantee rows are the mount guard's table above.
 * **Presence-required door.** A multi-writer-class volume WITHOUT bit 17 (a
   set formatted between the rung-10b flip and PR 14) refuses the writer's
   door loud — "not symmetric-forest capable — run `squeezefs volume

@@ -21,7 +21,31 @@ mount is a read-token client whose metadata is exact at the next resolve
   after the flip, for a volume that will never see a second host; it
   carries none of the multi-writer bits and mounts exactly the shipped solo
   posture. `--symmetric` is accepted as the default's spelling (a no-op,
-  like `--multi-writer`).
+  like `--multi-writer`). **A `--single-writer` volume has ONE writer and
+  NO `-o ro` mount**: every read-only mount is a read-TOKEN client of the
+  volume's slot holders (R-SYM-4 — the only foreign-read method; the S5
+  bounded-staleness projection it would have fallen back to is deleted),
+  and a flat volume has no holder to grant a token, so `mount -o ro` of
+  one refuses at the token arm naming the class. The alternatives: read
+  through the writer's own mount (the flat volume's one kernel), or format
+  the default and mount readers as `-o ro` token clients.
+- **The DEFAULT format needs a substrate that can FENCE — a plain `mount`
+  of a default-format metadata volume on a non-PR BLOCK DEVICE REFUSES**
+  (a loop device, an LVM logical volume, a raw SATA / SAS / virtio disk, an
+  NVMe namespace whose `RESCAP` reads 0 — anything that is not an NVMe
+  namespace advertising Persistent Reservations). Before the flip the same
+  `format` + `mount` was the shipped solo posture; since it the mount arms
+  the symmetric plane, whose fence between appenders is the device's
+  Write-Exclusive reservation (KD-SYM-13, design §5.8.1), and a plane that
+  can only DETECT a zombie's frame is an acked-loss class (§5.8.2), so the
+  open refuses loud naming its three remedies: a PR-capable namespace (the
+  kernel nvmet target, `tests/dev_substrate.sh` on a dev box), `format
+  --single-writer` for a single-host volume with one writer by
+  declaration, or `SQUEEZEFS_SYM_ALLOW_NON_PR=1` — the LAB opt-in,
+  announced at every mount that uses it ("detection-grade only"), never a
+  default. A metadata volume on a REGULAR FILE (the sandbox class) is one
+  kernel by construction and arms with no opt-in. The guarantee rows are
+  in `docs/operations.md` → the single-writer mount guard's table.
 - **A multi-writer-class volume WITHOUT bit 17** (formatted between the
   rung-10b flip of 2026-08-16 and this release) **refuses the writer's door
   loud** — *"not symmetric-forest capable — run `squeezefs volume
